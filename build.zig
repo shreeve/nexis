@@ -59,6 +59,14 @@ pub fn build(b: *std.Build) void {
     eq_mod.addImport("value", value_mod);
     eq_mod.addImport("hash", hash_mod);
 
+    const intern_mod = b.createModule(.{
+        .root_source_file = b.path("src/intern.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    intern_mod.addImport("value", value_mod);
+    intern_mod.addImport("hash", hash_mod);
+
     // -------------------------------------------------------------------------
     // Phase 0: reader unit tests (src/reader.zig has its own test { ... }
     // blocks; depends on src/parser.zig + src/nexis.zig which live in the
@@ -84,6 +92,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "hash", .path = "src/hash.zig" },
         .{ .name = "value", .path = "src/value.zig" },
         .{ .name = "eq", .path = "src/eq.zig" },
+        .{ .name = "intern", .path = "src/intern.zig" },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
@@ -117,6 +126,18 @@ pub fn build(b: *std.Build) void {
 
     const prop_primitive_tests = b.addTest(.{ .root_module = prop_primitive_mod });
     const run_prop_primitive_tests = b.addRunArtifact(prop_primitive_tests);
+
+    const prop_intern_mod = b.createModule(.{
+        .root_source_file = b.path("test/prop/intern.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prop_intern_mod.addImport("hash", hash_mod);
+    prop_intern_mod.addImport("value", value_mod);
+    prop_intern_mod.addImport("intern", intern_mod);
+
+    const prop_intern_tests = b.addTest(.{ .root_module = prop_intern_mod });
+    const run_prop_intern_tests = b.addRunArtifact(prop_intern_tests);
 
     // -------------------------------------------------------------------------
     // Golden test runner (src/golden.zig)
@@ -152,6 +173,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all Phase 0/1 tests (unit + property + golden)");
     for (runtime_test_runs) |r| test_step.dependOn(&r.step);
     test_step.dependOn(&run_prop_primitive_tests.step);
+    test_step.dependOn(&run_prop_intern_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);
 
