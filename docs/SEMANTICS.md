@@ -191,12 +191,21 @@ Choices here are frozen so that §2 equality and §3 hash cannot drift:
     `0x7FF8000000000000`.
   - Otherwise, hash is xxHash3-32 over the IEEE 754 bits.
 - **`string`** — xxHash3-32 over the raw UTF-8 bytes.
-- **`keyword`** — xxHash3-32 over the fully-qualified textual form
-  (`"ns/name"` or just `"name"`), XORed with the domain offset
-  `0x9E3779B9` (golden-ratio constant, PLAN §8.4) to separate the keyword
-  hash domain from the symbol hash domain.
-- **`symbol`** — xxHash3-32 over the fully-qualified textual form. No
-  domain offset.
+- **`keyword`** — xxHash3-64 over the intern id (textual form on codec
+  serialize; see §6.1). Separated from symbol hashes by the generic
+  `mixKindDomain` mechanism below (each `Kind` byte lands in a distinct
+  high-entropy region of `u64` space). This subsumes Clojure's
+  keyword-specific `^ 0x9E3779B9` offset into a single cross-kind
+  separation story.
+- **`symbol`** — xxHash3-64 over the intern id (textual form on codec
+  serialize). Kind-domain-mixed (see below).
+- **Kind-domain mixing.** Every `Value.hashValue()` output has the per-
+  kind offset `kind_byte * 0x9E3779B97F4A7C15` folded in before return.
+  This prevents `fixnum(65)` / `symbol(65)` / `char(65)` / `keyword(65)`
+  from sharing a hash merely because their raw payloads hash to the same
+  u64. Clojure doesn't need this because the JVM gives each heap type
+  its own `hashCode()` dispatch; in our single-flat-hash world the mixer
+  replaces that discipline.
 - **Sequential collections** — ordered combine:
   `h = 1; for each x: h = 31 * h + hasheq(x); finalize h with count`.
 - **Map collections** — unordered combine:
