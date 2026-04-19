@@ -1,0 +1,21 @@
+.{
+    .name = .nexis,
+    .fingerprint = 0xcb09f0806daea9ef,
+    .version = "0.0.0-phase0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "stdlib",
+        "docs",
+        "test",
+        "examples",
+        "nexis.grammar",
+        "README.md",
+        "PLAN.md",
+        "CLOJURE-REVIEW.md",
+        "LICENSE",
+        "AGENTS.md",
+    },
+}
