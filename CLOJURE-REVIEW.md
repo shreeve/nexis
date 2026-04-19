@@ -180,6 +180,121 @@ All already rejected in PLAN.md §4 non-goals. Source review didn't change that 
 
 ---
 
+## 4. Reader construct map: Clojure vs nexis
+
+A compact comparison for Clojure programmers reading nexis source (and vice
+versa). This is **design-rationale, not reference** — PLAN §7.2 and
+`docs/FORMS.md` hold the authoritative nexis reader contract.
+
+Compared against `misc/clojure/src/jvm/clojure/lang/LispReader.java`
+(1702 lines) and the Clojure reader reference documentation. Citations are
+per subsection, not per row.
+
+### 4.1 Broadly identical surface
+
+Syntax that reads the same in both systems (subject to §4.2 / §4.3 caveats):
+
+- Collection literals: `(a b c)`, `[1 2 3]`, `{:k v}`, `#{x y}`.
+- Quoting family: `'x`, `` `x ``, `~x`, `~@x`.
+- Deref: `@r`. Anonymous fn: `#(+ %1 %2)` with positional placeholders `%`, `%N`, `%&`.
+- Discard: `#_ x` (including stacked `#_ #_ x y z`).
+- Metadata sugar: `^:kw x`, `^{:a 1} x`, `^Type x` (with the one canonical
+  `^` spelling — see §4.2).
+- Keywords `:foo`, `:ns/foo`; symbols `foo`, `ns/foo`, `+`, `->>`, `set!`, etc.
+- Chars `\a`, `\newline`, `\space`, `\tab`, `\return`, `\formfeed`,
+  `\backspace` (named set).
+- Strings `"..."` with the common escapes (`\n \t \r \\ \"`).
+- `;` line comments. `(comment ...)` block-comment macro.
+- Commas are whitespace. `nil`, `true`, `false` are immediates.
+
+Symbol character class is the same (alphanumerics + `! * + - _ ? < > = & $ . % /`)
+with the same `/`-as-namespace-separator rule (at most one `/`, neither
+side empty, `/` alone is the division symbol).
+
+### 4.2 Deliberate reader-level divergences
+
+Places where the reader accepts *something different*. Rationale is short;
+the long version lives in PLAN §23 frozen decisions and `docs/FORMS.md` §8.
+
+| Construct | Clojure | nexis | Rationale |
+|---|---|---|---|
+| **Numeric literals** | | | |
+| Radix integer | `2r101`, `16rFF`, `36rZZ` | none — `0x`, `0b`, decimal only | simpler grammar |
+| Leading `+` on a number | `+42` → integer `42` | `+42` → symbol | no sign-variant tokenization |
+| Ratio | `22/7` → `Ratio` | unsupported | number tower is int+bignum+f64 only (§23 #10) |
+| BigInt suffix | `42N` | unsupported | Phase 1 auto-promotion |
+| BigDecimal suffix | `3.14M` | unsupported | no decimal tower (§23 #10) |
+| NaN / ±Inf literal | `##NaN`, `##Inf`, `##-Inf` | unsupported | Phase 3 reader extension |
+| `##`-dispatch in general | symbolic values | unsupported | as above |
+| **Chars and strings** | | | |
+| Char unicode escape | `\u2603` (exactly 4 hex) | `\u{2603}` (variable, braced) | unified escape language (§23 #26) |
+| String unicode escape | `"\uHHHH"` | `"\u{HEX}"` | same |
+| Octal char | `\o377` | unsupported | `\u{HEX}` subsumes |
+| Multi-line strings | allowed | rejected | narrower surface (§7.2) |
+| String escape set | `\0 \b \f \n \t \r \\ \" \uHHHH` + octal | `\n \t \r \\ \" \u{HEX}` | narrower surface |
+| **Dispatch under `#`** | | | |
+| Var-quote | `#'foo` → `(var foo)` | unsupported — write `(var foo)` | minimal reader |
+| Namespaced map | `#:ns{:a 1}` | unsupported | deferred; use plain map |
+| Auto-resolved keyword | `::k`, `::ns/k` | unsupported | no current-ns at read time |
+| Reader conditional | `#?(:clj ...)`, `#?@(...)` | unsupported | single target (§4) |
+| Tagged literal | `#inst "..."`, `#uuid ...`, user-ext | unsupported | v1 non-goal (§4) |
+| Regex literal | `#"pattern"` | unsupported | library call (§4) |
+| Read-time eval | `#=(form)` (gated by `*read-eval*`) | unsupported | no ambient execution at parse |
+| Unreadable marker | `#<...>` always errors at read | unsupported | compat surface only |
+| Old-style metadata | `#^{...} x` (still parsed) | unsupported | one canonical `^` spelling |
+| `#!` comment | comment to end of line, anywhere | unsupported | no shebang interop |
+
+Complete `#`-dispatch inventory in nexis v1: **`#{}` (set)**, **`#(...)`
+(anon-fn)**, **`#_` (discard)**. Nothing else is recognized; any other
+byte after `#` is a lexer error.
+
+**Error-reporting contract.** Both readers reject the same set of ill-
+formed inputs — duplicate literal keys in maps and sets, odd-count maps,
+multi-slash qualified names, nested `#(...)`, bare `~`/`~@` outside
+syntax-quote. Clojure surfaces these as `IllegalArgumentException` /
+`RuntimeException` with ad-hoc messages (`PersistentArrayMap.java:75`,
+`LispReader.java:1360`). nexis surfaces them as stable
+kebab-case kinds (`:duplicate-literal-key`, `:map-odd-count`,
+`:invalid-symbol`, `:nested-anon-fn`, `:unquote-outside-syntax-quote`)
+for tooling pattern-matching. See FORMS.md §3 for the full error table.
+
+### 4.3 Same surface, different semantics
+
+Syntax that parses identically but produces different values / behavior.
+These are the semantic traps a Clojure programmer will hit.
+
+| Expression | Clojure | nexis | Pin |
+|---|---|---|---|
+| `(= 1 1.0)` | `true` | `false` | PLAN §23 #11 (cross-type `=` deferred to v2 `==`) |
+| `(= Double/NaN Double/NaN)` | `false` | `true` (canonical bit pattern) | SEMANTICS §2.2 |
+| Integer overflow | auto-promotes to `BigInteger` | Phase 0 rejects; Phase 1 auto-promotes | PLAN §21 Phase 1 gate |
+| Syntax-quote expansion | at read time, auto-qualifies + auto-gensyms | reader emits marker only; macroexpander qualifies | PLAN §14.2 (see §2.6 above) |
+
+### 4.4 Explicit omissions (by PLAN §4 non-goals)
+
+These are not "deferred" — they are committed absences for v1. Each has a
+frozen rationale in PLAN §4 / §23.
+
+- **Protocols** (`defprotocol`, `extend-type`) — pick a built-in
+  polymorphism story first.
+- **Multimethods** (`defmulti`, `defmethod`) — overkill before type
+  universe is stable.
+- **Software transactional memory** (`ref`, `dosync`, `alter`) — emdb
+  transactions are the language tx story (§15).
+- **Atoms** (in-memory CAS) — durable refs fill the identity role.
+- **Agents** (`send`, `send-off`) — JVM-era artifact; isolates later.
+- **`core.async`** — huge scheduling sink.
+- **Full hygienic macros** — auto-gensym + syntax-quote qualification only.
+- **Lazy sequences everywhere** — eager by default; explicit streams in v2.
+- **Regex / reader conditionals / tagged literals** — see §4.2.
+- **Rationals / BigDecimal** — see §4.2.
+- **Multi-target compilation** — Zig-native only.
+
+When a Clojure programmer asks "where's X?", the answer for everything
+in this list is *"on purpose — see PLAN §4."*
+
+---
+
 ## Things I didn't study deeply but should track
 
 GPT-5.4 explicitly flagged these as pending design decisions worth studying before Phase 1:
