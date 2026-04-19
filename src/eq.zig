@@ -104,11 +104,20 @@ pub fn equal(a: Value, b: Value) bool {
     };
 }
 
-/// Per-kind heap equality. Each heap module registers here as it lands.
-/// Until then, any heap value hitting `equal` is a Phase 1 scoping bug
-/// — constructing a heap Value requires the heap module to exist.
-fn heapEq(_: Value, _: Value) bool {
-    @panic("eq.heapEq: heap kind equality not implemented in this commit — wire up when the kind's module lands");
+/// Per-kind heap equality. **Panics here** — same reason
+/// `value.hashImmediate` is partial: putting the per-kind dispatcher
+/// in this module would create a circular module graph that Zig's
+/// test runner can't resolve when any of the cycle files is a test-
+/// binary root. The full dispatcher lives in `src/dispatch.zig` as
+/// `dispatch.equal(a, b)`. Callers that need equality over any Value
+/// use that entry point; callers that know they hold immediates or
+/// different-kind values still use `eq.equal` directly (the cross-
+/// kind rule + fast paths here handle everything short of same-kind
+/// heap comparison).
+fn heapEq(a: Value, b: Value) bool {
+    _ = a;
+    _ = b;
+    @panic("eq.heapEq: heap-kind structural compare — use dispatch.equal instead");
 }
 
 // -----------------------------------------------------------------------------
@@ -238,7 +247,7 @@ test "equal ⇒ hash equal (the bedrock invariant)" {
     for (samples) |a| {
         for (samples) |b| {
             if (equal(a, b)) {
-                try std.testing.expectEqual(a.hashValue(), b.hashValue());
+                try std.testing.expectEqual(a.hashImmediate(), b.hashImmediate());
             }
         }
     }

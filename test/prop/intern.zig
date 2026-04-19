@@ -120,7 +120,7 @@ test "I4: kw/sym table disjointness — Values differ under = and hash" {
         try std.testing.expect(kw.kind() == .keyword);
         try std.testing.expect(sym.kind() == .symbol);
         try std.testing.expect(!kw.identicalTo(sym));
-        try std.testing.expect(kw.hashValue() != sym.hashValue());
+        try std.testing.expect(kw.hashImmediate() != sym.hashImmediate());
     }
 }
 

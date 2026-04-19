@@ -128,7 +128,7 @@ test "P4: = ⇒ hash equal — the bedrock" {
         const a = randValue(r);
         const b = randValue(r);
         if (eq.equal(a, b)) {
-            try std.testing.expectEqual(a.hashValue(), b.hashValue());
+            try std.testing.expectEqual(a.hashImmediate(), b.hashImmediate());
         }
     }
 }
@@ -154,7 +154,7 @@ test "P5: hash is a pure function of the Value bits (modulo the -0.0/+0.0 collap
             .symbol => value.fromSymbolId(a.asSymbolId()),
             else => unreachable,
         };
-        try std.testing.expectEqual(a.hashValue(), b.hashValue());
+        try std.testing.expectEqual(a.hashImmediate(), b.hashImmediate());
     }
 }
 
@@ -189,7 +189,7 @@ test "P7: NaN canonicalization — arbitrary NaN bits behave identically" {
         const v = value.fromFloat(@bitCast(bits));
 
         try std.testing.expect(eq.equal(v, canonical));
-        try std.testing.expectEqual(v.hashValue(), canonical.hashValue());
+        try std.testing.expectEqual(v.hashImmediate(), canonical.hashImmediate());
         // And bit-level: all NaN inputs collapse to the canonical bit pattern.
         try std.testing.expectEqual(hash.canonical_nan_bits, v.payload);
     }

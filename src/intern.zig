@@ -308,7 +308,7 @@ test "internKeywordValue / internSymbolValue: Value-level plumbing" {
     try testing.expectEqual(@as(u32, 0), v_sym.asSymbolId());
     // Same text in disjoint tables: hashes differ by Value-layer
     // kind-domain mixing (SEMANTICS §3.2).
-    try testing.expect(v_kw.hashValue() != v_sym.hashValue());
+    try testing.expect(v_kw.hashImmediate() != v_sym.hashImmediate());
 }
 
 test "transient input slice: interner holds its own copy" {

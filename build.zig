@@ -74,6 +74,30 @@ pub fn build(b: *std.Build) void {
     });
     heap_mod.addImport("value", value_mod);
 
+    const string_mod = b.createModule(.{
+        .root_source_file = b.path("src/string.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    string_mod.addImport("value", value_mod);
+    string_mod.addImport("heap", heap_mod);
+    string_mod.addImport("hash", hash_mod);
+
+    const dispatch_mod = b.createModule(.{
+        .root_source_file = b.path("src/dispatch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dispatch_mod.addImport("value", value_mod);
+    dispatch_mod.addImport("eq", eq_mod);
+    dispatch_mod.addImport("heap", heap_mod);
+    dispatch_mod.addImport("hash", hash_mod);
+    dispatch_mod.addImport("string", string_mod);
+    // dispatch is a one-way terminal: nothing depends on it. value
+    // and eq deliberately stay low-level (panicking on heap kinds)
+    // so the module graph remains acyclic and every test-binary
+    // root resolves cleanly.
+
     // -------------------------------------------------------------------------
     // Phase 0: reader unit tests (src/reader.zig has its own test { ... }
     // blocks; depends on src/parser.zig + src/nexis.zig which live in the
@@ -95,12 +119,39 @@ pub fn build(b: *std.Build) void {
     // above.
     // -------------------------------------------------------------------------
 
-    const runtime_test_files = [_]struct { name: []const u8, path: []const u8 }{
-        .{ .name = "hash", .path = "src/hash.zig" },
-        .{ .name = "value", .path = "src/value.zig" },
-        .{ .name = "eq", .path = "src/eq.zig" },
-        .{ .name = "intern", .path = "src/intern.zig" },
-        .{ .name = "heap", .path = "src/heap.zig" },
+    // Per-file test configuration. Each entry lists the sibling
+    // modules the test binary needs as named imports. A file is
+    // deliberately omitted from its own import list — Zig rejects a
+    // source file appearing both as the test binary's `root` module
+    // and as a named import of the same graph.
+    const AllSiblings = struct {
+        hash: *std.Build.Module,
+        value: *std.Build.Module,
+        eq: *std.Build.Module,
+        heap: *std.Build.Module,
+        string: *std.Build.Module,
+    };
+    const siblings: AllSiblings = .{
+        .hash = hash_mod,
+        .value = value_mod,
+        .eq = eq_mod,
+        .heap = heap_mod,
+        .string = string_mod,
+    };
+
+    const RuntimeTest = struct {
+        name: []const u8,
+        path: []const u8,
+        imports: []const []const u8,
+    };
+    const runtime_test_files = [_]RuntimeTest{
+        .{ .name = "hash", .path = "src/hash.zig", .imports = &.{} },
+        .{ .name = "value", .path = "src/value.zig", .imports = &.{"hash"} },
+        .{ .name = "eq", .path = "src/eq.zig", .imports = &.{ "value", "hash" } },
+        .{ .name = "intern", .path = "src/intern.zig", .imports = &.{ "value", "hash" } },
+        .{ .name = "heap", .path = "src/heap.zig", .imports = &.{"value"} },
+        .{ .name = "string", .path = "src/string.zig", .imports = &.{ "value", "heap", "hash" } },
+        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
@@ -110,10 +161,16 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        // Wire in-module siblings so each file's tests can use the same
-        // `@import("hash")` / `@import("value")` paths as production code.
-        m.addImport("hash", hash_mod);
-        m.addImport("value", value_mod);
+        for (f.imports) |imp_name| {
+            const mod: *std.Build.Module =
+                if (std.mem.eql(u8, imp_name, "hash")) siblings.hash
+                else if (std.mem.eql(u8, imp_name, "value")) siblings.value
+                else if (std.mem.eql(u8, imp_name, "eq")) siblings.eq
+                else if (std.mem.eql(u8, imp_name, "heap")) siblings.heap
+                else if (std.mem.eql(u8, imp_name, "string")) siblings.string
+                else @panic("unknown sibling import");
+            m.addImport(imp_name, mod);
+        }
 
         const t = b.addTest(.{ .root_module = m });
         runtime_test_runs[i] = b.addRunArtifact(t);
@@ -158,6 +215,20 @@ pub fn build(b: *std.Build) void {
     const prop_heap_tests = b.addTest(.{ .root_module = prop_heap_mod });
     const run_prop_heap_tests = b.addRunArtifact(prop_heap_tests);
 
+    const prop_string_mod = b.createModule(.{
+        .root_source_file = b.path("test/prop/string.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prop_string_mod.addImport("value", value_mod);
+    prop_string_mod.addImport("heap", heap_mod);
+    prop_string_mod.addImport("hash", hash_mod);
+    prop_string_mod.addImport("string", string_mod);
+    prop_string_mod.addImport("dispatch", dispatch_mod);
+
+    const prop_string_tests = b.addTest(.{ .root_module = prop_string_mod });
+    const run_prop_string_tests = b.addRunArtifact(prop_string_tests);
+
     // -------------------------------------------------------------------------
     // Golden test runner (src/golden.zig)
     // -------------------------------------------------------------------------
@@ -194,6 +265,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_primitive_tests.step);
     test_step.dependOn(&run_prop_intern_tests.step);
     test_step.dependOn(&run_prop_heap_tests.step);
+    test_step.dependOn(&run_prop_string_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);
 

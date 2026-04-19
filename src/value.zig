@@ -233,13 +233,22 @@ pub const Value = extern struct {
 
     // ---- Hash (immediates only in this commit) ----
 
-    /// Semantic hash matching `=` equality. Collapses `-0.0 / +0.0`,
-    /// treats canonical NaN as reflexive, applies the keyword-domain
-    /// offset, and mixes the kind byte so coincidentally-equal raw
-    /// payload hashes (`fixnum(65)` vs `symbol(65)` vs `char(65)`)
-    /// land in disjoint regions of the 64-bit hash space. Heap kinds
-    /// plug into this via kind-dispatch in a later commit.
-    pub fn hashValue(self: Value) u64 {
+    /// Immediate-kind semantic hash. Collapses `-0.0 / +0.0`, treats
+    /// canonical NaN as reflexive, and mixes the kind byte so
+    /// coincidentally-equal raw payload hashes (`fixnum(65)` vs
+    /// `symbol(65)` vs `char(65)`) land in disjoint regions of the
+    /// 64-bit hash space.
+    ///
+    /// **Partial function — heap kinds panic.** The method name carries
+    /// the contract: "immediate" = "no heap allocation underneath."
+    /// Full hashing over any Value kind goes through
+    /// `dispatch.hashValue(v)`, which routes immediates here and heap
+    /// kinds through per-kind hashers. `value.zig` stays low-level and
+    /// does not import the heap-kind modules; placing the dispatcher
+    /// here would create a circular module graph that Zig's test
+    /// runner cannot resolve when any cycle member is used as a
+    /// test-binary root.
+    pub fn hashImmediate(self: Value) u64 {
         const k = self.kind();
         const kind_byte: u8 = @intFromEnum(k);
         const base: u64 = switch (k) {
@@ -255,11 +264,9 @@ pub const Value = extern struct {
             .symbol => hash.hashU64(@as(u64, self.asSymbolId())),
             // Keyword domain separation is handled by the generic
             // `mixKindDomain` below — keyword's kind byte differs from
-            // symbol's, so same-id kw and sym never collide. No extra
-            // kw-specific offset needed (PLAN §8.4 / CLOJURE-REVIEW §1.7
-            // goal met via the broader mechanism).
+            // symbol's, so same-id kw and sym never collide.
             .keyword => hash.hashU64(@as(u64, self.asKeywordId())),
-            else => @panic("value.hash: heap / sentinel kinds not implemented in this commit"),
+            else => @panic("value.hashImmediate: heap / sentinel kind — use dispatch.hashValue instead"),
         };
         return hash.mixKindDomain(base, kind_byte);
     }
@@ -406,7 +413,7 @@ test "fromFloat: -0.0 and +0.0 are distinct bit patterns but equal-hashed" {
     // +0.0 at storage time, only at hash time. This matches the
     // SEMANTICS §2.2 rule: `identical?` distinguishes, `=` collapses.
     try std.testing.expect(pos.payload != neg.payload);
-    try std.testing.expectEqual(pos.hashValue(), neg.hashValue());
+    try std.testing.expectEqual(pos.hashImmediate(), neg.hashImmediate());
 }
 
 test "keyword and same-named symbol hash into different domains" {
@@ -415,10 +422,10 @@ test "keyword and same-named symbol hash into different domains" {
     // keyword and symbol kind bytes differ, so their final hashes do too.
     const kw = fromKeywordId(7);
     const sy = fromSymbolId(7);
-    try std.testing.expect(kw.hashValue() != sy.hashValue());
+    try std.testing.expect(kw.hashImmediate() != sy.hashImmediate());
     // Within-kind: same id ⇒ same hash.
-    try std.testing.expectEqual(fromKeywordId(7).hashValue(), fromKeywordId(7).hashValue());
-    try std.testing.expectEqual(fromSymbolId(7).hashValue(), fromSymbolId(7).hashValue());
+    try std.testing.expectEqual(fromKeywordId(7).hashImmediate(), fromKeywordId(7).hashImmediate());
+    try std.testing.expectEqual(fromSymbolId(7).hashImmediate(), fromSymbolId(7).hashImmediate());
 }
 
 test "kind predicates cover the immediate family" {
@@ -444,10 +451,10 @@ test "coincidentally-equal payload values hash disjointly across kinds" {
     // fixnum(65), char(65), symbol(65), keyword(65) all hash from a
     // u64-looking `65`, but per-kind domain mixing must keep them
     // distinct to protect mixed-key HAMTs from degenerate collisions.
-    const fx = fromFixnum(65).?.hashValue();
-    const ch = fromChar(65).?.hashValue();
-    const sy = fromSymbolId(65).hashValue();
-    const kw = fromKeywordId(65).hashValue();
+    const fx = fromFixnum(65).?.hashImmediate();
+    const ch = fromChar(65).?.hashImmediate();
+    const sy = fromSymbolId(65).hashImmediate();
+    const kw = fromKeywordId(65).hashImmediate();
     try std.testing.expect(fx != ch);
     try std.testing.expect(fx != sy);
     try std.testing.expect(fx != kw);
@@ -463,5 +470,5 @@ test "signed zero: identical? distinguishes, = folds, hash matches =" {
     try std.testing.expect(pos.payload != neg.payload);
     try std.testing.expect(!pos.identicalTo(neg));
     // Equality folds (tested in eq.zig) — hash must agree with =.
-    try std.testing.expectEqual(pos.hashValue(), neg.hashValue());
+    try std.testing.expectEqual(pos.hashImmediate(), neg.hashImmediate());
 }
