@@ -147,6 +147,17 @@ pub fn build(b: *std.Build) void {
     const prop_intern_tests = b.addTest(.{ .root_module = prop_intern_mod });
     const run_prop_intern_tests = b.addRunArtifact(prop_intern_tests);
 
+    const prop_heap_mod = b.createModule(.{
+        .root_source_file = b.path("test/prop/heap.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prop_heap_mod.addImport("value", value_mod);
+    prop_heap_mod.addImport("heap", heap_mod);
+
+    const prop_heap_tests = b.addTest(.{ .root_module = prop_heap_mod });
+    const run_prop_heap_tests = b.addRunArtifact(prop_heap_tests);
+
     // -------------------------------------------------------------------------
     // Golden test runner (src/golden.zig)
     // -------------------------------------------------------------------------
@@ -182,6 +193,7 @@ pub fn build(b: *std.Build) void {
     for (runtime_test_runs) |r| test_step.dependOn(&r.step);
     test_step.dependOn(&run_prop_primitive_tests.step);
     test_step.dependOn(&run_prop_intern_tests.step);
+    test_step.dependOn(&run_prop_heap_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);
 
