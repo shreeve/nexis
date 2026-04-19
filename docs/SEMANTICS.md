@@ -199,13 +199,35 @@ Choices here are frozen so that §2 equality and §3 hash cannot drift:
   separation story.
 - **`symbol`** — xxHash3-64 over the intern id (textual form on codec
   serialize). Kind-domain-mixed (see below).
-- **Kind-domain mixing.** Every `Value.hashValue()` output has the per-
-  kind offset `kind_byte * 0x9E3779B97F4A7C15` folded in before return.
-  This prevents `fixnum(65)` / `symbol(65)` / `char(65)` / `keyword(65)`
-  from sharing a hash merely because their raw payloads hash to the same
-  u64. Clojure doesn't need this because the JVM gives each heap type
-  its own `hashCode()` dispatch; in our single-flat-hash world the mixer
-  replaces that discipline.
+- **Equality-category domain mixing.** Every full hash output has a
+  **per-equality-category** offset `domain_byte * 0x9E3779B97F4A7C15`
+  folded in before return. The `domain_byte` is chosen so the bedrock
+  invariant `(= x y) ⇒ (hash x) = (hash y)` holds across kinds whose
+  equality rule spans multiple physical kinds (§2.6 cross-category
+  rule). Specifically:
+    - **Kind-local equality** — every kind whose equality rule is
+      confined to its own kind (nil, bool, char, fixnum, float, bignum,
+      string, keyword, symbol, byte-vector, typed-vector, durable-ref,
+      function, var, transient, error, meta-symbol, persistent-set):
+      `domain_byte = @intFromEnum(Kind)`.
+    - **Sequential category** (list, persistent-vector, and any future
+      lazy-seq / cons / sequential kind): all members share
+      `domain_byte = 0xF0`. Without this shared byte, `(list 1 2 3)`
+      and `[1 2 3]` \u2014 required to be `=` \u2014 would hash to different
+      values after domain mixing, breaking the bedrock invariant.
+    - **Associative category** (persistent-map, including the
+      array-map subkind): members share `domain_byte = 0xF1`. v1's
+      array-map is a subkind of kind `persistent_map`, so the bytes
+      coincide today; the category byte is reserved for future
+      cross-kind associative equality.
+  
+  Scalar kinds that coincidentally share a raw payload hash
+  (`fixnum(65)` / `symbol(65)` / `char(65)` / `keyword(65)`) still
+  separate through the kind-local domain mixer exactly as before.
+  Clojure doesn't need this machinery because the JVM gives each
+  heap type its own `hashCode()` dispatch; in our single-flat-hash
+  world the domain mixer replaces that discipline, with the cross-
+  kind-equality categories carved out.
 - **Sequential collections** — ordered combine:
   `h = 1; for each x: h = 31 * h + hasheq(x); finalize h with count`.
 - **Map collections** — unordered combine:

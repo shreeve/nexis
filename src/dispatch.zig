@@ -24,25 +24,31 @@
 //!     ├─ @import("value")        (Value + Kind + v.hashImmediate path)
 //!     ├─ @import("eq")           (cross-kind rule + immediate equality)
 //!     ├─ @import("heap")         (*HeapHeader + Heap.asHeapHeader)
-//!     ├─ @import("hash")         (mixKindDomain)
-//!     └─ @import("string")       (per-kind hashHeader + bytesEqual) [+ future kinds]
+//!     ├─ @import("hash")         (combineOrdered + mixKindDomain)
+//!     ├─ @import("string")       (hashHeader + bytesEqual)
+//!     └─ @import("list")         (hashSeq + equalSeq, fn-pointer plumbing)
+//!       [+ future kinds: bignum, persistent_map, persistent_vector, …]
 //!
-//! No heap-kind module imports `dispatch.zig`. Every kind's own
-//! module provides `hashHeader(*HeapHeader) u32` and a per-kind
-//! equality function (`bytesEqual` for strings; `structuralEqual`,
-//! `limbsEqual`, etc. for future kinds); `dispatch.zig` is the only
-//! place those per-kind functions are composed with `mixKindDomain`
-//! and the cross-kind dispatch switch.
+//! No heap-kind module imports `dispatch.zig`. Collection kinds whose
+//! hash/equal is recursive over their elements (list, future
+//! vector/map/set) take the element callback as a function pointer:
+//! `hashSeq(h, &hashValue)` / `equalSeq(a, b, &equal)`. That keeps
+//! the dependency graph acyclic while letting collection modules
+//! recurse through the full dispatcher.
 //!
 //! Public API:
 //!   - `hashValue(v)`: full hash for any Value. Immediates go through
 //!     `value.hashImmediate`; heap kinds go through `heapHashBase` +
-//!     `mixKindDomain` here.
-//!   - `equal(a, b)`: full equality. Cross-kind + immediates go
-//!     through `eq.equal`; same-kind-heap routes here to `heapEqual`.
+//!     the **equality-category** domain mixer (SEMANTICS §3.2).
+//!   - `equal(a, b)`: full equality. Bit-identity fast path, then
+//!     equality-category check (cross-category → false; within a
+//!     cross-kind category → dispatch by category; kind-local →
+//!     same-kind routes through `heapEqual` or `eq.equal`).
 //!   - `heapHashBase(v)` / `heapEqual(a, b)`: low-level entry points
 //!     exposed for tests and advanced callers who have already
 //!     established they hold heap-kind Values.
+//!   - `eqCategory(k)`: the equality category a kind belongs to.
+//!     Drives both the hash domain byte and the equality dispatch.
 
 const std = @import("std");
 const value = @import("value");
@@ -50,10 +56,60 @@ const eq = @import("eq");
 const heap_mod = @import("heap");
 const hash_mod = @import("hash");
 const string = @import("string");
+const list = @import("list");
 
 const Value = value.Value;
 const Kind = value.Kind;
 const Heap = heap_mod.Heap;
+
+// =============================================================================
+// Equality categories (SEMANTICS.md §2.6 + §3.2)
+// =============================================================================
+
+/// Equality category a kind belongs to. Values in different categories
+/// are always unequal (even among heap kinds). Values in the same
+/// cross-kind category (e.g. `.sequential`) may be `=` even when their
+/// physical kinds differ.
+pub const EqCategory = enum(u8) {
+    kind_local,
+    sequential,
+    associative,
+    set,
+};
+
+/// Maps a `Kind` to its equality category. Amended whenever a new
+/// cross-kind equality category gains a member. Today `.list` is the
+/// only sequential kind; `.persistent_vector` will join when it ships.
+pub fn eqCategory(k: Kind) EqCategory {
+    return switch (k) {
+        .list, .persistent_vector => .sequential,
+        .persistent_map => .associative,
+        .persistent_set => .set,
+        else => .kind_local,
+    };
+}
+
+/// Shared domain bytes for cross-kind equality categories. Chosen
+/// outside the 0..29 valid-Kind range so they can never collide with
+/// a real kind byte used by kind-local mixing. Frozen; changing these
+/// invalidates any already-serialized hashes (future codec concern).
+pub const sequential_domain_byte: u8 = 0xF0;
+pub const associative_domain_byte: u8 = 0xF1;
+pub const set_domain_byte: u8 = 0xF2;
+
+/// The domain byte fed into `mixKindDomain` for a given kind. For
+/// kind-local equality, it's the kind byte itself; for cross-kind
+/// categories it's the shared category byte so two different kinds
+/// in the same category fold to the same hash when their base hashes
+/// match. Pinned in SEMANTICS.md §3.2.
+pub fn domainByteForKind(k: Kind) u8 {
+    return switch (eqCategory(k)) {
+        .kind_local => @intFromEnum(k),
+        .sequential => sequential_domain_byte,
+        .associative => associative_domain_byte,
+        .set => set_domain_byte,
+    };
+}
 
 // =============================================================================
 // Hash dispatch
@@ -61,30 +117,34 @@ const Heap = heap_mod.Heap;
 
 /// Full hash for any Value. Routes immediates to `value.hashImmediate`
 /// (the immediate-kind fast path) and heap kinds through
-/// `heapHashBase` + `mixKindDomain`. Result satisfies the bedrock
-/// `(= x y) ⇒ (hash x) = (hash y)` invariant end-to-end.
+/// `heapHashBase` + the equality-category domain mixer. Result
+/// satisfies the bedrock `(= x y) ⇒ (hash x) = (hash y)` invariant
+/// end-to-end, including across cross-kind equality categories
+/// (sequential collections today; associative / set when those land).
 pub fn hashValue(v: Value) u64 {
     const k = v.kind();
     if (k.isHeap()) {
         const base = heapHashBase(v);
-        return hash_mod.mixKindDomain(base, @intFromEnum(k));
+        return hash_mod.mixKindDomain(base, domainByteForKind(k));
     }
     // Sentinels (`unbound`, `undef`) panic inside value.hashImmediate
-    // via its default switch arm.
+    // via its default switch arm. Immediates are all kind-local in v1.
     return v.hashImmediate();
 }
 
 /// Pre-mix heap-kind hash base. Resolves the `*HeapHeader`, switches
-/// on kind to the per-kind `hashHeader`, extends the `u32` result to
-/// `u64`. Does **not** apply `mixKindDomain` — `hashValue` above owns
-/// that final step so heap kinds go through exactly one mixer.
+/// on kind to the per-kind hasher, extends narrow results to `u64`.
+/// Does **not** apply the domain mixer — `hashValue` above owns that
+/// final step so every heap kind goes through exactly one mixer
+/// with the correct category byte.
 pub fn heapHashBase(v: Value) u64 {
     std.debug.assert(v.kind().isHeap());
     const k = v.kind();
     const h = Heap.asHeapHeader(v);
-    const base: u32 = switch (k) {
-        .string => string.hashHeader(h),
-        // Future: .bignum, .list, .persistent_map, .persistent_set,
+    return switch (k) {
+        .string => @as(u64, string.hashHeader(h)),
+        .list => list.hashSeq(h, &hashValue),
+        // Future: .bignum, .persistent_map, .persistent_set,
         // .persistent_vector, .byte_vector, .typed_vector, .function,
         // .var_, .durable_ref, .transient, .error_, .meta_symbol.
         else => std.debug.panic(
@@ -92,34 +152,60 @@ pub fn heapHashBase(v: Value) u64 {
             .{@tagName(k)},
         ),
     };
-    return @as(u64, base);
 }
 
 // =============================================================================
 // Equality dispatch
 // =============================================================================
 
-/// Full equality for any two Values. Handles the bit-identity fast
-/// path inline (so the common case skips both `eq.equal` and the
-/// kind switch here), routes cross-kind and immediate-kind
-/// comparisons through `eq.equal`, and handles same-kind-heap
-/// structural compare through `heapEqual`.
+/// Full equality for any two Values. Category-aware: two Values in
+/// different equality categories are always unequal; within a cross-
+/// kind category (e.g. `.sequential`) two Values with different kinds
+/// can still be `=`. Handles the bit-identity fast path inline.
 pub fn equal(a: Value, b: Value) bool {
-    // Identical bits -> trivially equal for every immediate kind and
+    // Identical bits → trivially equal for every immediate kind and
     // for heap kinds when the payload is the same *HeapHeader.
     if (a.tag == b.tag and a.payload == b.payload) return true;
     const ka = a.kind();
     const kb = b.kind();
-    if (ka != kb) return false;
-    if (ka.isHeap()) return heapEqual(a, b);
-    // Immediate same-kind: let eq.equal handle it (covers signed-zero
-    // float case, keyword/symbol id compare, etc.).
-    return eq.equal(a, b);
+    const cat_a = eqCategory(ka);
+    const cat_b = eqCategory(kb);
+    if (cat_a != cat_b) return false;
+    // Cross-kind category paths. Today only `.sequential` has members;
+    // `.associative` / `.set` join as those kinds ship.
+    switch (cat_a) {
+        .sequential => return sequentialEqual(a, b),
+        .associative, .set, .kind_local => {
+            // Kind-local: must be the same kind to compare further.
+            // `.associative` / `.set` end up here in v1 because each
+            // category has only one kind today; the switch arm grows
+            // when a second associative/set kind lands.
+            if (ka != kb) return false;
+            if (ka.isHeap()) return heapEqual(a, b);
+            return eq.equal(a, b);
+        },
+    }
+}
+
+/// Cross-kind sequential equality. Both operands are known to be in
+/// the `.sequential` category but may have different kinds. Today the
+/// only sequential kind is `.list`; when `.persistent_vector` ships
+/// this function grows a walk that iterates one side as a list and
+/// the other as a vector, using a common element-callback shape.
+fn sequentialEqual(a: Value, b: Value) bool {
+    std.debug.assert(eqCategory(a.kind()) == .sequential);
+    std.debug.assert(eqCategory(b.kind()) == .sequential);
+    // v1: both sequential kinds are `.list`. When vector lands, add
+    // cross-kind arms here (list-vs-vector, vector-vs-list,
+    // vector-vs-vector) that walk via a unified element iterator.
+    return list.equalSeq(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &equal);
 }
 
 /// Same-kind heap structural compare. Caller (`equal` above, or
-/// advanced code that has already done its own cross-kind checks)
-/// has established `a.kind() == b.kind()` and `a.kind().isHeap()`.
+/// advanced code that has already done its own kind checks) has
+/// established `a.kind() == b.kind()`, `a.kind().isHeap()`, and that
+/// the category is `.kind_local` (cross-kind categories route through
+/// `sequentialEqual` and friends instead).
 pub fn heapEqual(a: Value, b: Value) bool {
     std.debug.assert(a.kind() == b.kind());
     std.debug.assert(a.kind().isHeap());
@@ -128,6 +214,7 @@ pub fn heapEqual(a: Value, b: Value) bool {
     const bh = Heap.asHeapHeader(b);
     return switch (k) {
         .string => string.bytesEqual(ah, bh),
+        .list => list.equalSeq(ah, bh, &equal),
         else => std.debug.panic(
             "dispatch.heapEqual: kind {s} not implemented",
             .{@tagName(k)},
@@ -248,6 +335,125 @@ test "equal ⇒ hashValue equal: bedrock invariant end-to-end (string)" {
     const b = try string.fromBytes(&heap, "bedrock-string-invariant");
     try testing.expect(equal(a, b));
     try testing.expectEqual(hashValue(a), hashValue(b));
+}
+
+// ---- List kind end-to-end dispatch ----
+
+const list_mod = @import("list");
+
+test "hashValue / equal: empty list round-trip" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const a = try list_mod.empty(&heap);
+    const b = try list_mod.empty(&heap);
+    try testing.expect(equal(a, b));
+    try testing.expectEqual(hashValue(a), hashValue(b));
+}
+
+test "hashValue / equal: (list 1 2 3) across two allocations" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const elems = [_]Value{
+        value.fromFixnum(1).?,
+        value.fromFixnum(2).?,
+        value.fromFixnum(3).?,
+    };
+    const a = try list_mod.fromSlice(&heap, &elems);
+    const b = try list_mod.fromSlice(&heap, &elems);
+    try testing.expect(equal(a, b));
+    try testing.expectEqual(hashValue(a), hashValue(b));
+}
+
+test "hashValue / equal: nested lists recurse through dispatch" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    // Outer list whose first element is itself a list; hashes and
+    // equality must walk both levels through the dispatch callback.
+    const inner_a = try list_mod.fromSlice(&heap, &.{
+        value.fromFixnum(7).?,
+        value.fromFixnum(8).?,
+    });
+    const inner_b = try list_mod.fromSlice(&heap, &.{
+        value.fromFixnum(7).?,
+        value.fromFixnum(8).?,
+    });
+    const outer_a = try list_mod.fromSlice(&heap, &.{ inner_a, value.fromFixnum(99).? });
+    const outer_b = try list_mod.fromSlice(&heap, &.{ inner_b, value.fromFixnum(99).? });
+
+    try testing.expect(equal(outer_a, outer_b));
+    try testing.expectEqual(hashValue(outer_a), hashValue(outer_b));
+}
+
+test "equal: empty list is NOT equal to nil (cross-category)" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const e = try list_mod.empty(&heap);
+    const n = value.nilValue();
+    // nil is kind_local (.nil), list is sequential → cross-category.
+    try testing.expect(!equal(e, n));
+    try testing.expect(!equal(n, e));
+}
+
+test "hashValue: sequential domain differs from string's kind domain" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    // Construct a list and a string whose base hashes might coincide;
+    // verify the full hashValue outputs differ because their domain
+    // bytes differ.
+    const lst = try list_mod.empty(&heap);
+    const s = try string.fromBytes(&heap, "");
+
+    // Base hashes are independent streams. We only assert the domain
+    // mixer fully separates the kinds under hashValue.
+    try testing.expect(hashValue(lst) != hashValue(s));
+
+    // domainByteForKind returns the sequential byte for list, the
+    // kind byte for string. Confirm directly.
+    try testing.expectEqual(sequential_domain_byte, domainByteForKind(.list));
+    try testing.expectEqual(@intFromEnum(Kind.string), domainByteForKind(.string));
+}
+
+test "eqCategory + domainByteForKind: exhaustive table matches SEMANTICS §2.6/§3.2" {
+    // Exhaustive table over every Kind in v1. This test is the
+    // primary defense against silent drift between the equality-
+    // category rule and the hash-domain rule; a missed entry here
+    // would create a subtle `(= x y) ⇒ hash(x) = hash(y)` bug.
+    const cases = [_]struct {
+        kind: Kind,
+        cat: EqCategory,
+        domain: u8,
+    }{
+        // Immediates — all kind-local in v1.
+        .{ .kind = .nil, .cat = .kind_local, .domain = 0 },
+        .{ .kind = .false_, .cat = .kind_local, .domain = 1 },
+        .{ .kind = .true_, .cat = .kind_local, .domain = 2 },
+        .{ .kind = .char, .cat = .kind_local, .domain = 3 },
+        .{ .kind = .fixnum, .cat = .kind_local, .domain = 4 },
+        .{ .kind = .float, .cat = .kind_local, .domain = 5 },
+        .{ .kind = .keyword, .cat = .kind_local, .domain = 6 },
+        .{ .kind = .symbol, .cat = .kind_local, .domain = 7 },
+        // Heap kinds — most are kind-local; sequentials share 0xF0,
+        // associative shares 0xF1, set shares 0xF2.
+        .{ .kind = .string, .cat = .kind_local, .domain = 16 },
+        .{ .kind = .bignum, .cat = .kind_local, .domain = 17 },
+        .{ .kind = .persistent_map, .cat = .associative, .domain = associative_domain_byte },
+        .{ .kind = .persistent_set, .cat = .set, .domain = set_domain_byte },
+        .{ .kind = .persistent_vector, .cat = .sequential, .domain = sequential_domain_byte },
+        .{ .kind = .list, .cat = .sequential, .domain = sequential_domain_byte },
+        .{ .kind = .byte_vector, .cat = .kind_local, .domain = 22 },
+        .{ .kind = .typed_vector, .cat = .kind_local, .domain = 23 },
+        .{ .kind = .function, .cat = .kind_local, .domain = 24 },
+        .{ .kind = .var_, .cat = .kind_local, .domain = 25 },
+        .{ .kind = .durable_ref, .cat = .kind_local, .domain = 26 },
+        .{ .kind = .transient, .cat = .kind_local, .domain = 27 },
+        .{ .kind = .error_, .cat = .kind_local, .domain = 28 },
+        .{ .kind = .meta_symbol, .cat = .kind_local, .domain = 29 },
+    };
+    for (cases) |c| {
+        try testing.expectEqual(c.cat, eqCategory(c.kind));
+        try testing.expectEqual(c.domain, domainByteForKind(c.kind));
+    }
 }
 
 test "equal rejects cross-kind heap Values before payload interpretation" {
