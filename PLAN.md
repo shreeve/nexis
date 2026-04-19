@@ -4,6 +4,70 @@
 
 ---
 
+## 🚨 Start here — for a fresh AI implementation session
+
+**Read this block before anything else. Everything below assumes you have.**
+
+### What this document is
+
+`PLAN.md` is the **authoritative design specification** for nexis. It is the product of deep iterative review (including 10 rounds of adversarial critique with a peer AI and a direct read of ~30k lines of Clojure source). Commitments in §23 (Hard Decisions) require an amendment to this document to change. Everything else may be refined during implementation but should respect the architecture laid out here.
+
+### Required reading (in order)
+
+1. **This document** (`PLAN.md`) — end to end. It's long (~2400 lines) but every section exists for a reason. Budget 60–90 minutes.
+2. **`CLOJURE-REVIEW.md`** (at repo root) — documents what we take / adapt / reject from Clojure's actual source code, and why. Explains the rationale behind many decisions in this PLAN.
+3. **`ZIG-0.16.0-REFERENCE.md`** and **`ZIG-0.16.0-QUICKSTART.md`** (at repo root) — **mandatory** before writing any Zig. 30+ stdlib APIs changed between 0.15 and 0.16 in ways that will silently break code from training data.
+
+### Local resources available to you (absolute paths)
+
+| Path | What it is | How to use it |
+|---|---|---|
+| `misc/clojure/` (in this repo) | **Full Clojure source code** — 42k lines of Java + 8k lines of `core.clj` | Read freely. We take architectural ideas, not code. The files studied in CLOJURE-REVIEW.md are listed there with line counts. |
+| `/Users/shreeve/Data/Code/nexus/` | **Parser generator** — produces `src/parser.zig` from `nexis.grammar` | Read `README.md` and `nexus.grammar` there for the grammar DSL. Study `test/zag/zag.grammar` and `test/slash/slash.grammar` for real-world examples. em's `mumps.grammar` is also a high-quality reference. |
+| `/Users/shreeve/Data/Code/emdb/` | **Storage engine** — mmap'd B+ tree, MVCC, named trees | Read `README.md` and `SPEC.md`. This is what nexis uses for durable refs (§15). |
+| `/Users/shreeve/Data/Code/em/` | **MUMPS engine** — template for compiler/bytecode/runtime | Read `docs/architecture/ISA.md` for the 64-bit bytecode format we inherit. `src/mumps.zig` shows the `@lang` module contract. `src/mumps.grammar` shows a real production grammar. |
+
+### Companion documents (some exist, some to produce)
+
+| Doc | Status | Purpose |
+|---|---|---|
+| `CLOJURE-REVIEW.md` | ✅ exists at repo root | Source review findings (230 lines) |
+| `docs/SEMANTICS.md` | **to produce in Phase 0** | Numeric corner cases (NaN, -0.0, ±Inf, overflow), print/read contract, cross-type equality examples, nil/empty semantics, metadata matrix (§8.5) |
+| `docs/FORMS.md` | **to produce in Phase 0** | Canonical Form schema (lift from Appendix C §28 for easy reference), reader-to-Form normalization rules, reader/normalizer/macroexpander responsibility boundaries |
+| `docs/CODEC.md` (stub) | **to produce in Phase 0** | Serializability matrix (from §15.10), wire format, round-trip invariants |
+| `AGENTS.md` | **to produce in Phase 0** | Short routing guide: "read PLAN.md end-to-end, then CLOJURE-REVIEW.md, then ZIG-0.16.0-REFERENCE.md; follow §23 frozen decisions; see §24 for open questions." |
+
+### Your Phase 0 deliverables
+
+Detailed in §21, but summarized:
+
+- `nexis.grammar`, `src/nexis.zig`, `build.zig`, `build.zig.zon` — the parser and build wiring
+- `docs/SEMANTICS.md`, `docs/FORMS.md`, `docs/CODEC.md` (stub)
+- `test/golden/basic.{nx,sexp}`, `test/golden/reader-literals.{nx,sexp}`, `test/golden/errors/*`
+- `README.md` updated, `AGENTS.md` created
+- Directory layout per §22
+
+**Exit**: grammar parses, forms match Appendix C shapes, SEMANTICS.md is reviewed, all golden tests pass.
+
+### How to navigate this document
+
+- **TOC below** is 28 sections + 3 appendices.
+- **Appendix C (§28)** is the single most important artifact for Phase 0 — the canonical Form schema with worked examples.
+- **§23 Hard Decisions** is the list of 38 frozen commitments. If you're about to do something that contradicts one, STOP and ask.
+- **§24 Open Questions** is what's deliberately not decided yet — those are your call, guided by the design principles (§3).
+- **§25 Risk Register** — 17 named risks with mitigations. Refer to this when tempted to shortcut.
+
+### Non-negotiable discipline
+
+1. **Do not break the three-representations boundary** (§5): Form, Value, Durable Encoded are distinct layers. They never fuse except through explicit codec operations.
+2. **Respect the SCVU operand-kind encoding** (§12.2): hot-path S/C/V/U, context-local I/J/E.
+3. **Do not widen the v1 non-goals list** (§4) without writing an amendment.
+4. **Do not expose benchmarks publicly** until Phase 6 runs real numbers (§19.7). The plan intentionally under-promises and over-delivers.
+
+If any of this conflicts with what you believe the user wants, **ask**. Do not silently deviate from frozen decisions.
+
+---
+
 ## Table of Contents
 
 0. [Executive Summary](#0-executive-summary)
@@ -34,6 +98,7 @@
 25. [Risk Register](#25-risk-register)
 26. [Appendix A — Comparison With Clojure](#26-appendix-a--comparison-with-clojure)
 27. [Appendix B — Worked Examples](#27-appendix-b--worked-examples)
+28. [Appendix C — Canonical Form Schema](#28-appendix-c--canonical-form-schema) — the authoritative parser/reader contract
 
 ---
 
@@ -65,17 +130,17 @@ You can:
 
 Nothing more; nothing less. If v1 does only this, but does it elegantly and fast, nexis is already differentiated.
 
-### The performance promise
+### The performance aspiration
 
-nexis is positioned to be **the fastest interpreter-tier Lisp ever shipped**. Every architectural decision in this document either directly enables or preserves a concrete performance win — see §19.6 for the full tier-structured analysis. Highlights:
+Every architectural decision in this document either directly enables or preserves a concrete performance win. See §19.6 for the full tier-structured analysis. The **targets** (not promises) we aim for, in defined benchmark suites, against current Clojure on the JVM:
 
-- **10–50× faster cold start** than Clojure on the JVM (mmap'd bytecode, no class-loading, no JIT warmup).
-- **2–4× faster arithmetic** (16-byte tagged Value vs JVM Object reference + heap header).
-- **2–3× faster map lookup** on medium-sized maps (SIMD CHAMP nodes).
-- **10–50× faster database reads** of large strings/blobs (zero-copy directly from emdb mmap).
-- **20–100× faster large-vector numerics** (native `@Vector(N, T)` SIMD kernels on typed homogeneous vectors).
+- **Dramatically lower cold start** (mmap'd bytecode, no class-loading, no JIT warmup) — measured target in `bench-startup.nx`.
+- **Lower per-op arithmetic overhead** (16-byte tagged Value vs JVM Object reference + heap header) — measured target in `bench-vm.nx`.
+- **Competitive or better map lookup** on medium maps once SIMD CHAMP nodes are in place — measured target in `bench-collections.nx`.
+- **Substantially faster database reads** of large strings/blobs via zero-copy paths from emdb mmap — measured target in `bench-db.nx`.
+- **Very high throughput on typed-vector numerics** via native `@Vector(N, T)` SIMD kernels — measured target in `bench-simd.nx`.
 
-These are not stretch goals. Tier 1 wins are baked into the architecture; Tier 2 wins are committed Phase 6 targets. When a copy-and-patch JIT lands in v2, the gap to LuaJIT / V8 / HotSpot-tier performance closes substantially further.
+Specific multiplier claims are **withheld until Phase 6 benchmarks against Clojure produce real numbers**; the numbers in §19.7 are projections based on well-understood structural advantages, published alongside v1 with honest side-by-side comparisons. We intend the phrase *"fastest interpreter-tier Lisp ever shipped"* as an aspirational north star, not a shipping commitment.
 
 ---
 
@@ -298,18 +363,27 @@ Only `nil` and `false` are falsy. Everything else (including `0`, `""`, empty co
 
 ### 6.3 Equality and hashing
 
-Three levels of equality, with frozen semantics:
+Two levels of equality, with frozen semantics:
 
-- `identical?` — pointer/identity equality. `(identical? x x) => true`. Used rarely, mostly for performance tests.
-- `=` — value equality. Structural for collections, semantic for numbers (cross-type: `(= 1 1.0)` is **false** in v1; see §8.3), identity-based for vars and durable refs.
-- (no third level in v1 — Clojure's `==` for numeric equality is deferred).
+- `identical?` — pointer/identity equality. `(identical? x x) => true`. Used rarely, mostly for performance tests and ref comparisons.
+- `=` — value equality:
+  - **Numeric**: within-type structural (`(= 1 1)` true), cross-type `false` in v1 (`(= 1 1.0)` false — see §8.3).
+  - **Collections**: structural within equality category (see §6.6 — sequential, map, set — with cross-category always false).
+  - **Vars and durable refs**: identity-based (see §13.3, §15.2).
+  - **Metadata**: **never** participates.
+
+Clojure's `==` for cross-type numeric equality is deferred to v2; v1 users who want `(= 1 1.0)` → true must explicitly cast.
 
 Hashing:
 
 - `hash(x) = hash(y)` whenever `(= x y)`. Non-negotiable.
 - `hash` is stable across the lifetime of a process; not necessarily stable across processes unless the value is serialized (in which case the codec fixes the hash).
-- Metadata **never** affects equality or hash.
-- A value's hash is cached on the heap object where cheap.
+- Metadata **never** affects hash.
+- A value's hash is cached on the heap object where cheap (heap header `hash: u32`).
+- **One user-visible semantic hash function**, not two. (Clojure exposes `hashCode` and `hasheq` because of JVM interop; we have no such obligation.)
+- Collection hash construction is per-category to satisfy the equality invariant:
+  - **Sequential** (list, vector, lazy-seq, cons): ordered hash `h = 31*h + hasheq(x)` per element, finalized with count.
+  - **Map / set**: unordered hash `h += hasheq(entry)`, finalized with count. Order-independent by construction.
 
 ### 6.4 Error model
 
@@ -532,7 +606,29 @@ This split is intentional: keywords are the compact, metadata-less, lookup-orien
 - Metadata is a `persistent-map` reachable via the heap header's `meta` slot.
 - Set via `with-meta`, read via `meta`.
 - Metadata does not affect equality, hash, `print`, or serialization (unless explicitly requested).
-- Only kinds that carry `has_meta` in their flags can have metadata: collections, symbols, functions, vars. Immediates (nil/bool/char/fixnum/keyword/symbol-id/float) cannot carry metadata — attempting `with-meta` on an immediate throws `:no-metadata-on-immediate`. (Note: `symbol` the heap kind can have metadata; the immediate symbol-id representation cannot.)
+
+#### Metadata attachability matrix (v1 — frozen)
+
+| Kind | Can carry metadata? | Notes |
+|---|---|---|
+| `nil` | ❌ | Singleton immediate. `(with-meta nil m)` → throws `:no-metadata-on-immediate` |
+| `bool` | ❌ | Singleton per value |
+| `char` | ❌ | Unicode scalar immediate |
+| `fixnum` | ❌ | Number tower |
+| `bignum` | ❌ | Number tower (implementation-detail heap kind, but numeric-semantic) |
+| `float` | ❌ | Number tower |
+| `keyword` | ❌ | By design — keywords are metadata-less lookup atoms (§8.4) |
+| `string` | ❌ | v1 decision; may revisit if needed |
+| **`symbol`** | ✅ | Plain symbol is interned; attaching metadata yields a heap-wrapped symbol (§8.4) |
+| **`persistent-map`, `persistent-set`, `persistent-vector`, `list`** | ✅ | All persistent collections |
+| **`byte-vector`, `typed-vector`** | ✅ | Specialized homogeneous vectors |
+| **`function` / closure** | ✅ | For `:arglists`, `:doc`, `:macro`, `:static`, etc. |
+| **`var`** | ✅ | The primary carrier for `:macro`, `:dynamic`, `:private`, `:tag`, `:doc` |
+| `durable-ref` | ❌ | v1 decision; metadata would confuse identity semantics |
+| `transient` | ❌ | Mutable by definition; no metadata |
+| `error` | ✅ (implicit) | An exception value IS a map; its "metadata" is its payload |
+
+Attempting `with-meta` on a non-attachable kind throws `:no-metadata-on-immediate`. This matrix is frozen; adding a kind to the "yes" column requires a PLAN.md amendment.
 
 ### 8.6 Durable refs (summary; §15 for full semantics)
 
@@ -711,13 +807,15 @@ Loaded routine
 
 ### 11.2 Stage responsibilities
 
-1. **Parser** (generated): source → `Sexp`. Pure lexer+LALR, no semantic logic.
-2. **Reader**: `Sexp` → `Form`. Attaches origin, user metadata. Handles reader macros (`'`, `` ` ``, `~`, `~@`, `@`, `#(...)`, `^...`, `#_`).
-3. **Macroexpander**: `Form` → `Form`. Looks up macros in the current namespace's Var table. Expands outermost-first, iterates to fixpoint. Recurses into sub-forms after outer expansion settles.
-4. **Resolver**: `Form` → `Resolved`. Binds each symbol reference to one of: local slot, upvalue, Var handle, special form, or error (unbound). Detects shadowing.
-5. **Analyzer**: `Resolved` → `IR`. Assigns slots, identifies closures/upvalues, marks tail positions, folds constants, lifts literals to the pool.
-6. **Codegen**: `IR` → bytecode. Emits 64-bit instructions, per-function literal/var tables, source maps.
-7. **Linker**: attaches compiled function to a Var, makes it callable, optionally caches an on-disk `.no` (nexis object) file.
+Stage boundaries are **strict**. A fresh implementation session must not let work drift across stages. Appendix C §28.4 is the authoritative ownership table; summarized here:
+
+1. **Parser** (generated from `nexis.grammar`): source → raw `Sexp` tree with `.src` spans. Pure lexer + LALR(1). No semantic logic.
+2. **Reader / normalizer** (`src/reader.zig`): raw `Sexp` → canonical `Form` tree (Appendix C §28.2). Attaches origin + user metadata. Normalizes metadata sugar (`^:kw` → `{:kw true}`, merges multiple metas). Lowers `#(...)` to `(#%anon-fn body)`. Emits `(syntax-quote f)` markers *without* expansion. Discards `#_` forms. Rejects duplicate statically-detectable literal map/set keys, odd map arity, nested anon-fn, bare unquote outside syntax-quote.
+3. **Macroexpander** (`src/macroexpand.zig`): canonical `Form` → expanded `Form`. Looks up macros in the current namespace's Var table. **Expands `syntax-quote` forms** (auto-qualification, auto-gensym, unquote/splice handling) as an early sub-pass. **Resolves `(#%anon-fn body)`** to `(fn* [%1 %2 ...] body)` by scanning for positional-arg symbols. Expands user macros outermost-first, to fixpoint, with `&form` and `&env` injected. Recursion limit enforced.
+4. **Resolver** (`src/resolve.zig`): expanded `Form` → `Resolved` AST. Binds each symbol reference to one of: local slot, upvalue, Var handle, special form, or error (unbound). Detects shadowing. Resolution order: **special form → lexical local (let/fn/loop binding) → namespace-qualified → alias-qualified → current-namespace mapping**.
+5. **Analyzer** (`src/analyze.zig`): `Resolved` → `IR`. Assigns slots, identifies closures/upvalues, marks tail positions, folds constants, lifts literals to the pool.
+6. **Codegen** (`src/compile.zig`): `IR` → bytecode. Emits 64-bit instructions, per-function literal/var tables, source maps.
+7. **Linker** (`src/loader.zig`): attaches compiled function to a Var, makes it callable, optionally caches an on-disk `.nx.o` file.
 
 ### 11.3 Tail calls — the contract
 
@@ -1028,15 +1126,20 @@ Adapted directly from em:
 
 ### 14.2 Syntax-quote
 
-Inside `` `form ``:
+**Stage ownership**: the reader (see §11.2 and Appendix C §28.4) emits a `(syntax-quote form)` marker without expansion. Expansion happens in the **macroexpander** as a distinct early sub-pass before ordinary macro fixpoint. This keeps the reader stateless and puts all symbol resolution in the stage that already knows the current namespace.
 
-- Lists become `(list ...)` expressions.
-- Vectors become `(vector ...)`.
-- Maps become `(hash-map ...)` (error on odd count).
-- Sets become `(hash-set ...)`.
+Inside `` `form `` (processed by the macroexpander):
+
+- Lists become `(seq (concat (list ...) (list ...)))` expressions.
+- Vectors become `(apply vector (seq (concat ...)))`.
+- Maps become `(apply hash-map (seq (concat ...)))` (error on odd count).
+- Sets become `(apply hash-set (seq (concat ...)))`.
 - Unqualified symbols are **auto-qualified** via the current namespace's lookup rules (shadowing special forms).
-- `~x` unquotes; `~@x` unquote-splices.
+- `~x` unquotes; `~@x` unquote-splices (inside list positions).
 - Symbols ending in `#` (e.g. `x#`) are **auto-gensyms**: within one syntax-quote scope, every occurrence of `x#` resolves to the same fresh symbol; across scopes, they are distinct. This eliminates the most common macro hygiene failure without full Scheme-style hygiene.
+- Keywords, numbers, strings, chars are self-evaluating and kept as-is.
+
+**Macroexpand-1 vs macroexpand-fixpoint**: the REPL exposes both `/macroexpand-1 'form` (one step) and `/macroexpand 'form` (to fixpoint) for tooling. A hard recursion limit (e.g. 256 nested expansions) throws `:macro-expansion-runaway` to prevent infinite macros.
 
 ### 14.3 Namespaces
 
@@ -1598,11 +1701,11 @@ Based on a reasonable implementation of **Tier 1 + Tier 2** (not yet Tier 3), ne
 
 Once we add the Tier 3 **copy-and-patch JIT** in v2, the arithmetic-loop gap to LuaJIT closes to within ~20–50%, while we keep every collection and database advantage.
 
-### The headline positioning
+#### Headline positioning (aspirational)
 
-> **nexis is designed to be the fastest interpreter-tier Lisp ever shipped.** Against Clojure specifically, it should feel dramatically crisper on cold start, noticeably faster on collection work, and *dramatically* faster on database-integrated workloads. When JIT support lands in v2, the remaining gap to LuaJIT / V8 / HotSpot-tier performance closes substantially.
+> **nexis aims to be the fastest interpreter-tier Lisp ever shipped.** Against Clojure specifically, we expect it to feel dramatically crisper on cold start, competitive-to-faster on collection work, and substantially faster on database-integrated workloads. When JIT support lands in v2, the remaining gap to LuaJIT / V8 / HotSpot-tier performance is expected to narrow substantially.
 
-No hand-waving: every single Tier 1 and Tier 2 win above maps to a specific, committed PLAN.md section and a phase where it lands. The headline is ambitious but the implementation path is concrete.
+This is an aspiration, not a shipping guarantee. Every Tier 1 and Tier 2 win above maps to a specific, committed PLAN.md section. **Headline performance claims will be published alongside v1 with honest measured numbers** — not asserted in advance.
 
 ### 19.8 Performance gates
 
@@ -1696,15 +1799,39 @@ Each phase has a crisp entry criterion (previous gate passed) and exit criterion
 
 ### Phase 0 — Foundations (weeks 1–2)
 
-**Goal**: commit to semantics before code.
+**Goal**: commit to semantics before code. Land the minimum artifacts a fresh implementation session needs to begin Phase 1 without ambiguity.
 
-- [ ] Freeze this document's §5–§16 (values, collections, reader, VM).
-- [ ] Write `nexis.grammar` covering the full reader (§7.2).
-- [ ] Stand up `build.zig` with subcommands `zig build parser` (runs nexus), `zig build test`.
-- [ ] Write `docs/SEMANTICS.md` — pinned short spec of equality/hash/nil behavior for every kind.
+**Deliverables**:
+
+- [ ] `nexis.grammar` — the full reader grammar covering §7.2, designed to produce canonical Form shapes (see Appendix C).
+- [ ] `src/nexis.zig` — the `@lang` module: Tag enum, any lexer wrapper (expected minimal/none), plus re-exports nexus needs.
+- [ ] `build.zig` with `zig build parser` (runs `../nexus/bin/nexus nexis.grammar src/parser.zig`), `zig build test`, `zig build golden`.
+- [ ] `build.zig.zon` pinning Zig 0.16.0 and emdb version.
+- [ ] `docs/SEMANTICS.md` — pinned short spec covering:
+  - equality rules for every value kind (cross-type collection equality from §6.6, numeric corner cases including NaN / -0.0 / ±Inf / overflow promotion, metadata non-interference)
+  - hash consistency invariants
+  - nil propagation rules (§6.5)
+  - cross-type equality examples with expected results
+  - truthiness (§6.2)
+  - print/read round-trip contract for each serializable kind
+- [ ] `docs/FORMS.md` — canonical Form schema (Appendix C lifted into its own doc for easy reference), reader-to-Form normalization rules, reader/normalizer/macroexpander responsibility boundaries.
+- [ ] `docs/CODEC.md` (stub) — serializability matrix (from §15.10), wire-format specification, round-trip invariants.
+- [ ] `test/golden/basic.{nx,sexp}` — canonical reader round-trip over a representative source file.
+- [ ] `test/golden/reader-literals.{nx,sexp}` — explicit coverage of every reader construct: numbers (int/hex/binary/real, negative), strings with all escapes, chars (named + `\u{HEX}`), keywords (with and without namespace), symbols (same), maps/vectors/sets/lists, quote/syntax-quote/unquote/splice, `@deref`, metadata sugar (`^:kw`, `^{...}`, `^sym`), `#_` discard, `#(...)` anon-fn.
+- [ ] `test/golden/errors/` — negative reader tests:
+  - odd map arity
+  - duplicate statically-detectable literal keys in maps/sets
+  - nested `#(...)` (must reject)
+  - `~@` outside a syntax-quote context
+- [ ] `README.md` updated with mission statement, status, and pointers to PLAN.md / CLOJURE-REVIEW.md.
+- [ ] `AGENTS.md` — AI/contributor routing guide: "read PLAN.md, FORMS.md, SEMANTICS.md; ZIG-0.16.0-REFERENCE.md is mandatory before writing Zig."
 - [ ] Directory layout established (§22).
 
-**Exit**: source parses, Forms come out, semantics document reviewed and sign-off'd.
+**Exit**:
+- Source parses via `zig build parser && zig build test`.
+- Forms come out matching Appendix C / FORMS.md canonical shapes.
+- `docs/SEMANTICS.md` is reviewed and signed off — every semantic corner case has an explicit decision.
+- All golden tests pass byte-for-byte.
 
 ### Phase 1 — Runtime core, no compiler (weeks 3–8) — **critical**
 
@@ -1927,7 +2054,7 @@ The following are architectural decisions committed to now, before code is writt
 35. **`seq` is a core v1 abstraction** (§6.6), not a deferred niceness — confirmed by reading Clojure source. Direct fast paths on maps/vectors/typed-vectors bypass seq when that's clearer.
 36. **Cross-type sequential equality** (§6.7): list, vector, lazy-seq, and cons are mutually equal if element-wise equal. Map and set are their own equality categories. Hashes are constructed so the invariant holds by design.
 37. **CHAMP is the committed persistent-map target** (§9.1), not a stretch goal. Separate data/node bitmaps, canonical layout. Classic HAMT is a fallback only if CHAMP implementation hits a specific blocker.
-38. **Performance is a first-class goal, not a v2 concern.** Tier 1 wins (§19.6) are baked into v1 by architecture. Tier 2 wins are committed Phase 6 targets. nexis aims to be the fastest interpreter-tier Lisp ever shipped at v1 launch.
+38. **Performance is a first-class goal, not a v2 concern.** Tier 1 wins (§19.6) are baked into v1 by architecture. Tier 2 wins are committed Phase 6 targets with specific, named mechanisms. Headline performance claims are published only alongside v1 with measured benchmarks, not asserted in advance.
 
 ---
 
@@ -2128,6 +2255,189 @@ user=> (g 5)                   ; g sees new f on next call
 
 ---
 
+## 28. Appendix C — Canonical Form Schema
+
+**The single most important artifact for Phase 0 implementation.** This is the authoritative contract between the `nexis.grammar` parser output and the `src/reader.zig` Form tree that macros/compiler consume.
+
+### 28.1 Form shape
+
+A `Form` is a recursive heap-resident wrapper:
+
+```zig
+pub const Form = struct {
+    datum: Datum,                // see §28.2
+    origin: ?SrcSpan,            // { file_id: u32, pos: u32, len: u16 }
+    user_meta: ?*PersistentMap,  // user-attached via `^:kw`, `^{...}`, `^sym`
+    ann: ?*Annotation,           // compiler-injected: macro provenance, resolved ns/sym info
+};
+```
+
+- `datum` is the form's actual content (atom or compound).
+- `origin` comes from the parser's `Sexp.src`.
+- `user_meta` is always a normalized map (reader converts `^:kw` → `{:kw true}` before attaching).
+- `ann` is invisible to user code; the compiler writes to it, user code can only observe `user_meta` via `(meta x)`.
+
+### 28.2 Canonical datum shapes
+
+```
+;; Atoms (leaves; Form's datum is an Atom variant)
+nil                                  ;; nil
+true, false                          ;; bool
+42, 0x2A, 0b101                      ;; int (normalized from any radix)
+3.14, 1e9, 1.5e-3                    ;; real (f64)
+"hello"                              ;; string
+\a, \newline, \u{2603}               ;; char (Unicode scalar)
+:foo, :ns/foo                        ;; keyword (interned, no metadata)
+foo, ns/foo, set!, ->>               ;; symbol
+
+;; Compounds (Form's datum is a Compound variant with a tag + children)
+(list   f1 f2 f3)                    ;; (...)
+(vector f1 f2 f3)                    ;; [...]
+(map    k1 v1 k2 v2)                 ;; {...}  — flat key/value alternation
+(set    f1 f2 f3)                    ;; #{...}
+
+;; Reader macros (user-visible conventional tags)
+(quote             f)                ;; 'f
+(syntax-quote      f)                ;; `f
+(unquote           f)                ;; ~f
+(unquote-splicing  f)                ;; ~@f
+(deref             f)                ;; @f
+
+;; Metadata
+(with-meta TARGET META-MAP)          ;; ^meta x  —  META-MAP-first-in-source, TARGET-first-in-Form
+
+;; Internal-only (reader-normalizer output; not user-addressable names)
+(#%anon-fn f1 f2 ...)                ;; #(...) body, lowered post-parse but pre-macroexpand
+```
+
+### 28.3 Reader-normalization rules (authoritative)
+
+These transformations happen between the raw `Sexp` parser output and the `Form` tree that macros see. They are part of the reader/normalizer stage, **before** macroexpansion.
+
+| Source | Canonical Form |
+|---|---|
+| `^:kw x` | `(with-meta x {:kw true})` |
+| `^{:a 1} x` | `(with-meta x {:a 1})` |
+| `^sym x` | `(with-meta x {:tag sym})` |
+| `#_ x y` | the `x` form is discarded; only `y` appears in output |
+| `#(body)` | `(#%anon-fn body)` — `%`/`%1`/`%2`/`%&` left as ordinary symbols; macro-stage pass later resolves to a `(fn* [...] body)` |
+| `` `x `` | `(syntax-quote x)` — Clojure-equivalent expansion is a *separate* post-parse pass, NOT done by the reader |
+| `{:a 1 :a 2}` | **reader-normalization ERROR**: `:duplicate-literal-key :a` (statically detected) |
+| `{:a}` | **reader ERROR**: `:map-odd-count` |
+| `#{1 1 2}` | **reader-normalization ERROR**: `:duplicate-literal-element 1` |
+| `#(#(inc %))` | **reader-normalization ERROR**: `:nested-anon-fn` |
+| `~@x` outside `` `...` `` | **reader-normalization ERROR**: `:unquote-splice-outside-syntax-quote` |
+
+### 28.4 Stage ownership (who does what)
+
+A fresh implementation session **must** respect these stage boundaries:
+
+| Stage | Input | Output | Responsibilities |
+|---|---|---|---|
+| **Parser** (nexus-generated, `src/parser.zig`) | source text | raw `Sexp` tree with `.src` spans | Tokenization + LALR(1) parse. No semantic validation beyond grammar. No normalization. |
+| **Reader / normalizer** (`src/reader.zig`) | raw `Sexp` | canonical `Form` tree | Wraps each Sexp into a Form. Attaches source spans. Normalizes metadata sugar → map form. Lowers `#(...)` → `(#%anon-fn ...)`. Emits `(syntax-quote f)` markers. Discards `#_` forms. Rejects duplicate literal keys / odd map arity / nested anon-fn / bare unquote. |
+| **Macroexpander** (`src/macroexpand.zig`) | canonical `Form` | expanded `Form` | Expands macros to fixpoint. Expands `syntax-quote` forms (auto-qualifies symbols, auto-gensym `x#`, handles unquote/splice). Resolves `#%anon-fn` to `(fn* [%1 %2 ...] body)`. Passes `&form` and `&env` to user macros. |
+| **Resolver** (`src/resolve.zig`) | expanded `Form` | `Resolved` AST | Symbols → slot / upvalue / var handle / special form. Errors on unbound. |
+
+**Important**: `syntax-quote` expansion happens in the **macroexpander**, not the reader. The reader only marks syntax-quoted forms with the `(syntax-quote f)` tag. This lets tooling inspect raw reader output without losing the backtick-form structure.
+
+### 28.5 Worked examples (source → canonical Form)
+
+#### Example 1 — simple metadata
+
+```
+Source:      ^:private (defn foo [x] x)
+Form:        (with-meta (list (sym defn) (sym foo) (vector (sym x)) (sym x)) {:private true})
+```
+
+#### Example 2 — nested metadata
+
+```
+Source:      ^:dynamic ^{:doc "a var"} *out*
+Form:        (with-meta (sym *out*) {:dynamic true, :doc "a var"})
+```
+
+Reader merges multiple metadata annotations into a single map. Rightmost wins on duplicate keys, matching Clojure.
+
+#### Example 3 — syntax-quote with unquote
+
+```
+Source:      `(if ~cond :yes :no)
+Form:        (syntax-quote (list (sym if) (unquote (sym cond)) (keyword :yes) (keyword :no)))
+```
+
+Note the `syntax-quote` is a structural marker. The macroexpander later rewrites this to the Clojure-equivalent `(seq (concat (list (quote nexis.core/if)) (list cond) (list :yes) (list :no)))`.
+
+#### Example 4 — anonymous function
+
+```
+Source:      #(+ %1 %2)
+Form:        (#%anon-fn (list (sym +) (sym %1) (sym %2)))
+```
+
+The `%1`, `%2` are ordinary symbols at this stage. The macroexpander rewrites `#%anon-fn` to `(fn* [%1 %2] body)` after scanning the body for positional-arg references.
+
+#### Example 5 — collection literal with keyword keys
+
+```
+Source:      {:a 1 :b 2}
+Form:        (map (keyword :a) (int 1) (keyword :b) (int 2))
+```
+
+Flat key/value alternation. Odd counts rejected at the reader. Duplicate literal keys (`{:a 1 :a 2}`) rejected at the reader.
+
+#### Example 6 — discard
+
+```
+Source:      (+ #_(expensive-thing) 1 2)
+Form:        (list (sym +) (int 1) (int 2))
+```
+
+The `#_` form is completely absent from the output.
+
+#### Example 7 — deref sugar
+
+```
+Source:      @some-ref
+Form:        (deref (sym some-ref))
+```
+
+#### Example 8 — char literals
+
+```
+Source:      [\a \newline \u{2603}]
+Form:        (vector (char 'a') (char '\n') (char 0x2603))
+```
+
+Character `datum` stores the Unicode scalar value directly.
+
+#### Example 9 — quote vs syntax-quote
+
+```
+Source A:    'foo
+Form A:      (quote (sym foo))
+
+Source B:    `foo
+Form B:      (syntax-quote (sym foo))
+```
+
+`quote` and `syntax-quote` are distinct Form tags — not the same node type with a flag. Separate handling throughout compiler.
+
+#### Example 10 — negative integer literal
+
+```
+Source:      (+ -1 2)
+Form:        (list (sym +) (int -1) (int 2))
+```
+
+The reader parses `-1` as a numeric literal, not as `(- 1)`. Grammar rule: a digit immediately following `-` with no intervening whitespace and `-` in token-start position produces a negative-number token.
+
+### 28.6 Golden test contract
+
+`test/golden/reader-literals.{nx,sexp}` MUST pass byte-for-byte. A diff against the expected `.sexp` output is a reader regression. This file is the authoritative executable specification of the schema in §28.2–§28.3.
+
+---
+
 ## Final Word
 
 **Be less ambitious in representation unification, and more ambitious in semantic clarity.**
@@ -2150,6 +2460,8 @@ It fails if it feels like:
 
 ---
 
-*Document version: 1.0 — Initial plan, reviewed with peer AI (GPT-5.4), ready to drive implementation.*
+*Document version: 1.1 — Finalized after exhaustive Clojure source review and 8 rounds of peer-AI (GPT-5.4) adversarial critique. Ready to drive Phase 0 implementation.*
+
+*Companion documents: `CLOJURE-REVIEW.md` (source review findings), `docs/SEMANTICS.md` (Phase 0 deliverable — numeric corner cases, nil/empty semantics, print contract), `docs/FORMS.md` (Phase 0 deliverable — canonical Form schema).*
 
 *Last updated: 2026-04-19*
