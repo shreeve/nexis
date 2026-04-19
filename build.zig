@@ -67,6 +67,13 @@ pub fn build(b: *std.Build) void {
     intern_mod.addImport("value", value_mod);
     intern_mod.addImport("hash", hash_mod);
 
+    const heap_mod = b.createModule(.{
+        .root_source_file = b.path("src/heap.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    heap_mod.addImport("value", value_mod);
+
     // -------------------------------------------------------------------------
     // Phase 0: reader unit tests (src/reader.zig has its own test { ... }
     // blocks; depends on src/parser.zig + src/nexis.zig which live in the
@@ -93,6 +100,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "value", .path = "src/value.zig" },
         .{ .name = "eq", .path = "src/eq.zig" },
         .{ .name = "intern", .path = "src/intern.zig" },
+        .{ .name = "heap", .path = "src/heap.zig" },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
