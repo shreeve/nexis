@@ -1,8 +1,18 @@
-//! eq.zig — `identical?` and `=` for the Value layer.
+//! eq.zig — `identical?` and **immediate-only** `=` for the Value layer.
 //!
-//! Phase 1 commit 1 scope: immediates only. Heap-kind equality plugs in
-//! kind-by-kind as those modules land, via the `heapEq` hook (`@panic`
-//! placeholder until then).
+//! This module is deliberately narrow: it implements the equivalence
+//! relation on immediate kinds (nil, bool, char, fixnum, float, keyword,
+//! symbol) plus the bit-identity fast path. Heap-kind equality lives in
+//! `src/dispatch.zig` as `dispatch.equal(a, b)`, which is the canonical
+//! full-Value entry point.
+//!
+//! The split is an architectural consequence (peer-AI review
+//! conversation `nexis-phase-1` turns 3+5): putting the dispatcher in
+//! this module would create a module-graph cycle that Zig's test
+//! runner cannot resolve when any cycle member is used as a test-
+//! binary root. Rather than hide the partial-ness behind a total-
+//! looking API, the function name carries the contract: `equalImmediate`.
+//! Symmetric to `Value.hashImmediate`.
 //!
 //! Authoritative spec: `docs/SEMANTICS.md` §2. Non-negotiable invariants:
 //!
@@ -13,14 +23,14 @@
 //!   - `=` is cross-type **false** between disjoint numeric kinds
 //!     (PLAN §23 #11: `(= 1 1.0)` is `false`). No implicit coercion.
 //!   - `=` on canonical NaN is **true** (reflexive — SEMANTICS §2.2).
-//!   - `=` on `-0.0` and `+0.0` is **true** (IEEE numeric equality
-//!     for zero — SEMANTICS §2.2), even though `identical?` is false.
+//!   - `=` on `-0.0` and `+0.0` is **true** (IEEE numeric equality for
+//!     zero — SEMANTICS §2.2), even though `identical?` is false.
 //!   - Metadata never affects equality (PLAN §23 #12). Not exercised
 //!     here — no metadata paths on immediates.
 //!
-//! Design note: both `identical?` and `=` are pure functions of the two
-//! `Value` words, no allocator argument. Heap-kind extension will add a
-//! context parameter once hash caching / interning state is needed.
+//! Design note: `identical` and `equalImmediate` are both pure
+//! functions of the two `Value` words. No allocator, no I/O, no
+//! mutation.
 
 const std = @import("std");
 const value = @import("value");
@@ -37,87 +47,82 @@ const Kind = value.Kind;
 ///
 /// `(identical? 0.0 -0.0)` is `false` here — their bit patterns differ
 /// even after `canonicalizeFloat` (which intentionally does not collapse
-/// signed zero). Use `equal` if you want the `=` semantics instead.
+/// signed zero). Use `dispatch.equal` if you want the `=` semantics.
 pub inline fn identical(a: Value, b: Value) bool {
     return a.identicalTo(b);
 }
 
 // -----------------------------------------------------------------------------
-// =
+// = (immediate-only)
 // -----------------------------------------------------------------------------
 
-/// Value equality per SEMANTICS §2. Pure function; no allocation, no
-/// I/O, no mutation. Heap-kind extension lives in `heapEq` below.
-pub fn equal(a: Value, b: Value) bool {
-    // Fast path: bit-identical ⇒ equal. Catches most immediate-immediate
-    // comparisons without looking at kinds twice.
-    //
-    // IMPORTANT: this fast path is correct for `nil`, `bool`, `char`,
-    // `fixnum`, `keyword`, `symbol`, and CANONICAL floats (including
-    // the single canonical-NaN bit pattern). The only immediate case it
-    // MISSES is the `-0.0 == +0.0` rule — those have distinct bit
-    // patterns and fall through to the kind-dispatched tail below.
+/// Immediate-kind value equality per SEMANTICS §2. **Panics on heap
+/// kinds** — callers that may hold a heap Value must go through
+/// `dispatch.equal(a, b)`, which routes through the bit-identity fast
+/// path, the cross-kind / cross-category rule, and the per-kind
+/// structural comparators.
+///
+/// In debug builds, an early assert trips loudly with a clear message
+/// rather than letting the unreachable arm at the bottom panic with a
+/// less informative payload.
+pub fn equalImmediate(a: Value, b: Value) bool {
+    if (std.debug.runtime_safety) {
+        if (a.kind().isHeap() or b.kind().isHeap()) {
+            std.debug.panic(
+                "eq.equalImmediate: called with heap kind {s} / {s} — use dispatch.equal instead",
+                .{ @tagName(a.kind()), @tagName(b.kind()) },
+            );
+        }
+    }
+
+    // Fast path: bit-identical ⇒ equal for every immediate kind and
+    // for canonical floats (including the single canonical-NaN bit
+    // pattern). The one immediate case it MISSES is the `-0.0 == +0.0`
+    // rule; those have distinct bit patterns and fall through to the
+    // float arm below.
     if (a.tag == b.tag and a.payload == b.payload) return true;
 
     const ka = a.kind();
     const kb = b.kind();
-
-    // Cross-kind rule. The one wrinkle is the signed-zero case inside
-    // `float`: `pos.tag == neg.tag` (same kind), but payloads differ —
-    // handled by the float branch below.
     if (ka != kb) return false;
 
     return switch (ka) {
-        .nil, .false_, .true_ => true, // singletons — handled by the fast path above, but kept for completeness.
+        .nil, .false_, .true_ => true, // singletons (already matched bit-id; kept for completeness)
         .char => a.asChar() == b.asChar(),
         .fixnum => a.asFixnum() == b.asFixnum(),
         .float => blk: {
-            // Canonical NaN on both sides: fast path matched. Here we
-            // land on either (a) two NaNs that somehow differ in bits
-            // (shouldn't happen post-canonicalization — assert in Debug)
-            // or (b) the signed-zero case. IEEE equality on `f64` folds
-            // signed-zero to true and NaN to false; since post-
-            // canonicalization we never have a bit-distinct NaN pair,
-            // the IEEE comparison gives the right answer.
+            // Canonical NaN on both sides would have matched the fast
+            // path. Here we land on either (a) two NaNs that differ in
+            // bits (shouldn't happen post-canonicalization) or (b) the
+            // signed-zero case. IEEE equality on `f64` folds signed-
+            // zero to true and NaN to false; post-canonicalization we
+            // never have a bit-distinct NaN pair, so the IEEE compare
+            // is correct.
             const fa = a.asFloat();
             const fb = b.asFloat();
             if (std.debug.runtime_safety) {
                 if (std.math.isNan(fa) and std.math.isNan(fb)) {
-                    // Two canonical NaNs would have matched the fast path; if
-                    // we're here with both NaN, someone bypassed the
-                    // canonical constructor.
-                    std.debug.panic("eq: non-canonical NaN reached equal()", .{});
+                    std.debug.panic(
+                        "eq.equalImmediate: non-canonical NaN reached float arm",
+                        .{},
+                    );
                 }
             }
             break :blk fa == fb;
         },
         .keyword => a.asKeywordId() == b.asKeywordId(),
         .symbol => a.asSymbolId() == b.asSymbolId(),
-        // Heap kinds hand off.
-        .string, .bignum, .persistent_map, .persistent_set, .persistent_vector, .list, .byte_vector, .typed_vector, .function, .var_, .durable_ref, .transient, .error_, .meta_symbol => heapEq(a, b),
-        .unbound, .undef => {
-            std.debug.panic("eq: runtime sentinel escaped to equal(): {s}", .{@tagName(ka)});
-        },
-        _ => {
-            std.debug.panic("eq: unknown kind {d}", .{@intFromEnum(ka)});
-        },
+        .unbound, .undef => std.debug.panic(
+            "eq.equalImmediate: runtime sentinel {s} escaped",
+            .{@tagName(ka)},
+        ),
+        // Heap kinds are precluded by the entry assert; the dispatcher
+        // owns them. This arm exists so the switch is total.
+        else => std.debug.panic(
+            "eq.equalImmediate: kind {s} is not an immediate — use dispatch.equal",
+            .{@tagName(ka)},
+        ),
     };
-}
-
-/// Per-kind heap equality. **Panics here** — same reason
-/// `value.hashImmediate` is partial: putting the per-kind dispatcher
-/// in this module would create a circular module graph that Zig's
-/// test runner can't resolve when any of the cycle files is a test-
-/// binary root. The full dispatcher lives in `src/dispatch.zig` as
-/// `dispatch.equal(a, b)`. Callers that need equality over any Value
-/// use that entry point; callers that know they hold immediates or
-/// different-kind values still use `eq.equal` directly (the cross-
-/// kind rule + fast paths here handle everything short of same-kind
-/// heap comparison).
-fn heapEq(a: Value, b: Value) bool {
-    _ = a;
-    _ = b;
-    @panic("eq.heapEq: heap-kind structural compare — use dispatch.equal instead");
 }
 
 // -----------------------------------------------------------------------------
@@ -127,59 +132,59 @@ fn heapEq(a: Value, b: Value) bool {
 
 test "identical and equal agree on simple immediates" {
     try std.testing.expect(identical(value.nilValue(), value.nilValue()));
-    try std.testing.expect(equal(value.nilValue(), value.nilValue()));
+    try std.testing.expect(equalImmediate(value.nilValue(), value.nilValue()));
 
     const t = value.fromBool(true);
     const f = value.fromBool(false);
     try std.testing.expect(identical(t, t));
-    try std.testing.expect(equal(t, t));
+    try std.testing.expect(equalImmediate(t, t));
     try std.testing.expect(!identical(t, f));
-    try std.testing.expect(!equal(t, f));
+    try std.testing.expect(!equalImmediate(t, f));
 
-    try std.testing.expect(!equal(t, value.nilValue())); // nil != false
+    try std.testing.expect(!equalImmediate(t, value.nilValue())); // nil != false
 }
 
 test "fixnum and float are never equal (cross-type rule)" {
     const i = value.fromFixnum(1).?;
     const f = value.fromFloat(1.0);
-    try std.testing.expect(!equal(i, f));
-    try std.testing.expect(!equal(f, i));
+    try std.testing.expect(!equalImmediate(i, f));
+    try std.testing.expect(!equalImmediate(f, i));
 }
 
 test "canonical NaN is reflexive under =" {
     const nan1 = value.fromFloat(std.math.nan(f64));
     const nan2 = value.fromFloat(@bitCast(@as(u64, 0x7FFF_FFFF_FFFF_FFFF)));
     try std.testing.expect(identical(nan1, nan2)); // both canonicalized
-    try std.testing.expect(equal(nan1, nan2));
+    try std.testing.expect(equalImmediate(nan1, nan2));
 }
 
 test "-0.0 and +0.0: identical? distinguishes, = folds" {
     const pos = value.fromFloat(0.0);
     const neg = value.fromFloat(-0.0);
     try std.testing.expect(!identical(pos, neg)); // distinct bit patterns
-    try std.testing.expect(equal(pos, neg)); // IEEE: 0.0 == -0.0
+    try std.testing.expect(equalImmediate(pos, neg)); // IEEE: 0.0 == -0.0
 }
 
 test "keyword / symbol with same id are NOT equal (different kinds)" {
     const kw = value.fromKeywordId(7);
     const sy = value.fromSymbolId(7);
-    try std.testing.expect(!equal(kw, sy));
+    try std.testing.expect(!equalImmediate(kw, sy));
     try std.testing.expect(!identical(kw, sy));
 }
 
 test "keyword / symbol within-kind equality on intern ids" {
-    try std.testing.expect(equal(value.fromKeywordId(7), value.fromKeywordId(7)));
-    try std.testing.expect(!equal(value.fromKeywordId(7), value.fromKeywordId(8)));
-    try std.testing.expect(equal(value.fromSymbolId(7), value.fromSymbolId(7)));
-    try std.testing.expect(!equal(value.fromSymbolId(7), value.fromSymbolId(8)));
+    try std.testing.expect(equalImmediate(value.fromKeywordId(7), value.fromKeywordId(7)));
+    try std.testing.expect(!equalImmediate(value.fromKeywordId(7), value.fromKeywordId(8)));
+    try std.testing.expect(equalImmediate(value.fromSymbolId(7), value.fromSymbolId(7)));
+    try std.testing.expect(!equalImmediate(value.fromSymbolId(7), value.fromSymbolId(8)));
 }
 
 test "char equality" {
     const a = value.fromChar('a').?;
     const a2 = value.fromChar('a').?;
     const b = value.fromChar('b').?;
-    try std.testing.expect(equal(a, a2));
-    try std.testing.expect(!equal(a, b));
+    try std.testing.expect(equalImmediate(a, a2));
+    try std.testing.expect(!equalImmediate(a, b));
 }
 
 test "equivalence-relation laws on immediates" {
@@ -205,31 +210,28 @@ test "equivalence-relation laws on immediates" {
         value.fromSymbolId(2),
     };
 
-    // Reflexivity.
     for (samples) |s| {
-        try std.testing.expect(equal(s, s));
+        try std.testing.expect(equalImmediate(s, s));
     }
 
-    // Symmetry.
     for (samples) |a| {
         for (samples) |b| {
-            try std.testing.expectEqual(equal(a, b), equal(b, a));
+            try std.testing.expectEqual(equalImmediate(a, b), equalImmediate(b, a));
         }
     }
 
-    // Transitivity — when (= a b) and (= b c) then (= a c).
     for (samples) |a| {
         for (samples) |b| {
-            if (!equal(a, b)) continue;
+            if (!equalImmediate(a, b)) continue;
             for (samples) |c| {
-                if (!equal(b, c)) continue;
-                try std.testing.expect(equal(a, c));
+                if (!equalImmediate(b, c)) continue;
+                try std.testing.expect(equalImmediate(a, c));
             }
         }
     }
 }
 
-test "equal ⇒ hash equal (the bedrock invariant)" {
+test "equal ⇒ hash equal (the bedrock invariant, immediates)" {
     const samples = [_]Value{
         value.nilValue(),
         value.fromBool(true),
@@ -246,7 +248,7 @@ test "equal ⇒ hash equal (the bedrock invariant)" {
     };
     for (samples) |a| {
         for (samples) |b| {
-            if (equal(a, b)) {
+            if (equalImmediate(a, b)) {
                 try std.testing.expectEqual(a.hashImmediate(), b.hashImmediate());
             }
         }

@@ -97,12 +97,12 @@ test "P2: = is reflexive, symmetric, (pairwise) transitive" {
         const c = randValue(r);
 
         // Reflexive.
-        try std.testing.expect(eq.equal(a, a));
+        try std.testing.expect(eq.equalImmediate(a, a));
         // Symmetric.
-        try std.testing.expectEqual(eq.equal(a, b), eq.equal(b, a));
+        try std.testing.expectEqual(eq.equalImmediate(a, b), eq.equalImmediate(b, a));
         // Transitive — only interesting when both halves hold.
-        if (eq.equal(a, b) and eq.equal(b, c)) {
-            try std.testing.expect(eq.equal(a, c));
+        if (eq.equalImmediate(a, b) and eq.equalImmediate(b, c)) {
+            try std.testing.expect(eq.equalImmediate(a, c));
         }
     }
 }
@@ -115,7 +115,7 @@ test "P3: identical? ⇒ =" {
         const a = randValue(r);
         const b = randValue(r);
         if (eq.identical(a, b)) {
-            try std.testing.expect(eq.equal(a, b));
+            try std.testing.expect(eq.equalImmediate(a, b));
         }
     }
 }
@@ -127,7 +127,7 @@ test "P4: = ⇒ hash equal — the bedrock" {
     while (i < iterations_per_property) : (i += 1) {
         const a = randValue(r);
         const b = randValue(r);
-        if (eq.equal(a, b)) {
+        if (eq.equalImmediate(a, b)) {
             try std.testing.expectEqual(a.hashImmediate(), b.hashImmediate());
         }
     }
@@ -165,7 +165,7 @@ test "P6: cross-kind = is false (except within {true_, false_} / {keyword×keywo
     while (i < iterations_per_property) : (i += 1) {
         const a = randValue(r);
         const b = randValue(r);
-        if (a.kind() != b.kind() and eq.equal(a, b)) {
+        if (a.kind() != b.kind() and eq.equalImmediate(a, b)) {
             // There are zero legitimate cross-kind equalities in v1.
             // (Cross-type numeric `==` is v2 work — PLAN §23 #11.)
             try std.testing.expect(false);
@@ -188,7 +188,7 @@ test "P7: NaN canonicalization — arbitrary NaN bits behave identically" {
         const bits: u64 = sign | (@as(u64, 0x7FF) << 52) | @as(u64, mantissa);
         const v = value.fromFloat(@bitCast(bits));
 
-        try std.testing.expect(eq.equal(v, canonical));
+        try std.testing.expect(eq.equalImmediate(v, canonical));
         try std.testing.expectEqual(v.hashImmediate(), canonical.hashImmediate());
         // And bit-level: all NaN inputs collapse to the canonical bit pattern.
         try std.testing.expectEqual(hash.canonical_nan_bits, v.payload);

@@ -43,7 +43,7 @@
 //!   - `equal(a, b)`: full equality. Bit-identity fast path, then
 //!     equality-category check (cross-category → false; within a
 //!     cross-kind category → dispatch by category; kind-local →
-//!     same-kind routes through `heapEqual` or `eq.equal`).
+//!     same-kind routes through `heapEqual` or `eq.equalImmediate`).
 //!   - `heapHashBase(v)` / `heapEqual(a, b)`: low-level entry points
 //!     exposed for tests and advanced callers who have already
 //!     established they hold heap-kind Values.
@@ -182,7 +182,7 @@ pub fn equal(a: Value, b: Value) bool {
             // when a second associative/set kind lands.
             if (ka != kb) return false;
             if (ka.isHeap()) return heapEqual(a, b);
-            return eq.equal(a, b);
+            return eq.equalImmediate(a, b);
         },
     }
 }
@@ -307,14 +307,14 @@ test "equal: bit-identity fast path returns true without dispatch" {
     try testing.expect(equal(fx, fx));
 }
 
-test "equal: cross-kind is false, same-kind immediate delegates to eq.equal" {
+test "equal: cross-kind is false; same-kind immediate delegates to eq.equalImmediate" {
     const n = value.nilValue();
     const f = value.fromBool(false);
     try testing.expect(!equal(n, f)); // nil != false
     const pos = value.fromFloat(0.0);
     const neg = value.fromFloat(-0.0);
-    // Signed-zero case: eq.equal returns true, bit-identity doesn't
-    // match. Covered via dispatch.
+    // Signed-zero case: eq.equalImmediate returns true; bit-identity
+    // doesn't match. Covered via dispatch.
     try testing.expect(equal(pos, neg));
 }
 

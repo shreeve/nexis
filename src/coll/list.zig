@@ -343,8 +343,8 @@ fn callbackHashImmediateOnly(v: Value) u64 {
 }
 
 fn callbackEqImmediateOnly(a: Value, b: Value) bool {
-    // Cross-kind rule + bit identity for immediates. Mirrors eq.equal's
-    // scope for same-kind immediate comparison.
+    // Cross-kind rule + bit identity for immediates. Mirrors
+    // eq.equalImmediate's scope for same-kind immediate comparison.
     if (a.tag == b.tag and a.payload == b.payload) return true;
     if (a.kind() != b.kind()) return false;
     return switch (a.kind()) {
