@@ -1725,6 +1725,27 @@ Benchmarks live in `test/bench/`:
 
 These gates are **informational in v1, not blocking**. Phase gates (§20) focus on correctness. But we commit to publishing honest performance numbers at ship time.
 
+**Methodology contract (frozen).** Every comparative performance
+claim nexis publishes — especially in comparison to Clojure —
+follows the discipline pinned in `docs/BENCH.md`. That document
+covers the four fairness standards (numerical / accurate / fair /
+relevant), the benchmark category taxonomy (startup / warm micro /
+steady-state / collection / memory / database / macro), the
+statistical reporting rules (median + p5/p95/p99; no arithmetic
+mean over GC pauses; no speedup multiples without absolute
+numbers), the Clojure-community conventions we adopt (`criterium`,
+`*warn-on-reflection*`, tiered arithmetic idioms, transients where
+the community uses them, stock JDK flags), the reproducibility
+contract (source + raw data + versions + hermeticity script), and
+the honesty clause (scenarios where Clojure wins are published,
+not omitted). Pre-publication review by at least one Clojure
+practitioner outside the nexis team is required before any
+comparative benchmark report ships. See `docs/BENCH.md` §11 for the
+summary sentence every such report must survive. Landing that
+document before any benchmark code is intentional — the commitments
+it makes are strongest when they cannot be retrofitted against
+favorable measurements.
+
 ---
 
 ## 20. Testing Strategy & Phase Gates
