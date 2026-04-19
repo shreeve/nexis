@@ -184,7 +184,6 @@ const Block = extern struct {
     }
 };
 
-const block_prefix_size: usize = @sizeOf(Block) - @sizeOf(HeapHeader);
 const header_and_body_offset: usize = @sizeOf(Block);
 
 /// Debug sentinel written to `block.header.kind` at free time, used to
@@ -311,6 +310,14 @@ pub const Heap = struct {
 
     pub fn asHeapHeader(v: value.Value) *HeapHeader {
         std.debug.assert(v.kind().isHeap());
+        // Heap-kind Values must carry a non-zero, 16-byte-aligned
+        // pointer in their payload (HEAP.md §1 invariant 1). Catching
+        // corruption here gives a line-level diagnosis; without these
+        // asserts a corrupted Value manifests as an alignment trap or
+        // null-deref on the first body/header access, far from the
+        // cause.
+        std.debug.assert(v.payload != 0);
+        std.debug.assert((v.payload & 0xF) == 0);
         return @ptrFromInt(v.payload);
     }
 
@@ -323,13 +330,37 @@ pub const Heap = struct {
         return n;
     }
 
-    /// Invoke `visitor.visit(*HeapHeader)` for every live block. The
-    /// visitor is **allowed to free the currently-visited block** (the
-    /// iterator captures `next` before calling), but must not otherwise
-    /// mutate the live-list shape — freeing a different block or
-    /// allocating can still invalidate pointers held by the iterator.
-    /// For mutation-heavy walks, use `sweepUnmarked` instead.
+    /// Read-only traversal. Invokes `visitor.visit(*HeapHeader)` for
+    /// every live block, strictly for observation — diagnostics, GC
+    /// mark-phase tracing, stats collection. The visitor must NOT call
+    /// `heap.free` / `heap.alloc` / `heap.sweepUnmarked` during the
+    /// walk; mutation invalidates the iterator. Use `forEachLiveMut`
+    /// if you need to free the currently-visited block.
     pub fn forEachLive(self: *const Heap, visitor: anytype) void {
+        var cur = self.live_head;
+        while (cur) |b| {
+            const next = b.next;
+            visitor.visit(&b.header);
+            cur = next;
+        }
+    }
+
+    /// Mutation-aware traversal. The visitor is permitted to call
+    /// `heap.free(h)` on the **currently-visited block only** — the
+    /// iterator captures `next` before the callback so the current
+    /// block's storage becoming invalid mid-walk is safe.
+    ///
+    /// **NOT guaranteed safe:**
+    ///   - Freeing a different live block during the walk (breaks the
+    ///     iterator's `prev → next` chain).
+    ///   - Allocating a new block during the walk (the new block
+    ///     prepends to `live_head`; whether it's visited this walk is
+    ///     unspecified).
+    ///   - Calling `sweepUnmarked` from inside a visitor.
+    ///
+    /// Use `sweepUnmarked` directly when you want bulk mutation driven
+    /// by the mark bits.
+    pub fn forEachLiveMut(self: *Heap, visitor: anytype) void {
         var cur = self.live_head;
         while (cur) |b| {
             const next = b.next;
@@ -712,15 +743,41 @@ test "sweepUnmarked: pinned + marked stays pinned, mark clears" {
     try testing.expect(!h.isMarked());
 }
 
-test "forEachLive: visitor may free the currently-visited block" {
+test "forEachLive: read-only traversal is callable through *const Heap" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
 
-    const a = try heap.alloc(.string, 0);
+    _ = try heap.alloc(.string, 0);
+    _ = try heap.alloc(.bignum, 0);
+    _ = try heap.alloc(.list, 0);
+
+    // Read-only visitor: counts observed blocks and sums their kind
+    // bytes. No heap mutation.
+    const ReadOnlyCounter = struct {
+        count: usize = 0,
+        sum_kind: u32 = 0,
+        pub fn visit(self: *@This(), h: *HeapHeader) void {
+            self.count += 1;
+            self.sum_kind += h.kind;
+        }
+    };
+
+    // Intentionally pass via *const to prove the receiver is truly
+    // read-only at the type level.
+    const heap_ref: *const Heap = &heap;
+    var counter: ReadOnlyCounter = .{};
+    heap_ref.forEachLive(&counter);
+    try testing.expectEqual(@as(usize, 3), counter.count);
+    try testing.expect(counter.sum_kind > 0);
+}
+
+test "forEachLiveMut: visitor may free the currently-visited block" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    _ = try heap.alloc(.string, 0);
     const b = try heap.alloc(.bignum, 0);
-    const c = try heap.alloc(.list, 0);
-    _ = a;
-    _ = c;
+    _ = try heap.alloc(.list, 0);
 
     // Visitor that frees one specific block during the walk.
     const Killer = struct {
@@ -735,7 +792,7 @@ test "forEachLive: visitor may free the currently-visited block" {
     };
 
     var killer: Killer = .{ .heap_ptr = &heap, .target = b };
-    heap.forEachLive(&killer);
+    heap.forEachLiveMut(&killer);
     try testing.expectEqual(@as(usize, 3), killer.visited);
     try testing.expectEqual(@as(usize, 2), heap.liveCount());
 }

@@ -165,30 +165,44 @@ Private; subject to change without amendment so long as §1–§3 hold.
 
 ```zig
 const Table = struct {
-    by_name: std.StringHashMapUnmanaged(u32),   // name -> id
+    by_name: std.StringHashMapUnmanaged(u32),    // name -> id
     names:   std.ArrayListUnmanaged([]const u8), // id -> duped name
 };
 ```
 
-Insertion sequence (lookup-then-insert, with cleanup on failure):
+Insertion sequence in `internInto` (lookup-then-insert, with errdefer
+cleanup on allocator failure):
 
-1. `by_name.getOrPut(name)` — if found, return the existing id.
-2. Else: `dup := gpa.dupe(u8, name)` (`errdefer gpa.free(dup)`).
-3. Reserve `names` capacity, `names.appendAssumeCapacity(dup)`
-   (`errdefer _ = names.pop()`).
-4. Ensure `by_name` has room (`ensureUnusedCapacity` pre-step), then
-   `by_name.putAssumeCapacityNoClobber(dup, id)`.
-5. Commit the id.
+1. Reject empty name: `if (name.len == 0) return error.EmptyName`.
+2. Existing-id fast path: `if (by_name.get(name)) |id| return id`.
+   `StringHashMap` hashes by byte content, so the caller's transient
+   slice finds the entry even when the stored key points at duped bytes.
+3. Bound check: `if (names.items.len >= maxInt(u32)) return
+   error.InternTableFull`, so the subsequent `@intCast` to `u32`
+   cannot truncate.
+4. `dup := gpa.dupe(u8, name)` with `errdefer gpa.free(dup)`.
+5. `names.append(gpa, dup)` with `errdefer _ = names.pop()`.
+6. `by_name.put(gpa, dup, id)` — on failure, the two `errdefer`s
+   above unwind in reverse order: pop the `names` entry, then free
+   the dup. No state change escapes.
+7. Debug assert `by_name.count() == names.items.len` before returning.
 
-The errdefer chain ensures we never leak a duped slice on a mid-insert
-allocator failure. The map's key is a slice into the duped buffer (not
-into `names`'s backing storage), which is stable for the interner's
-lifetime.
+The map's key `dup` points at the interner-owned byte buffer (NOT into
+`names.items`'s backing array, which may relocate on growth), so the
+key stays valid for the interner's lifetime. This is exercised by the
+`"by_name lookups survive names reallocation"` inline test.
 
-`deinit` frees every duped name, clears both containers.
+Two hash-map probes occur on the insert path (one `get`, one `put`);
+on the hit path only one. A single-probe `getOrPut` refactor that
+also carries the caller's transient slice into the new-entry branch
+and then overwrites the key pointer with `dup` is deliberately
+deferred — the intern table is cold outside startup, and the simpler
+code is easier to audit for errdefer correctness.
 
-**Debug invariant**: `by_name.count() == names.items.len` is asserted
-after every successful intern and at entry to every public accessor.
+`deinit` frees every duped name, then clears both containers, after
+asserting the lockstep invariant one more time so a corrupted
+mutation path (if one ever slipped in) fails at teardown rather than
+silently leaking.
 
 ---
 
