@@ -1681,6 +1681,60 @@ pub fn mapIter(m: Value) MapIter {
 }
 
 // =============================================================================
+// GC trace — map (GC.md §5)
+//
+// Walks the map rooted at `h` (subkind 0 or 1). Subkind 0 holds
+// entries inline in the root body; subkind 1 delegates to a
+// subkind-2/3 tree which is walked via `visitor.markInternal` for
+// every node visited. External Value references (keys, values) route
+// through `visitor.markValue`. Internal nodes have no metadata
+// (CHAMP.md §8.2 invariant).
+// =============================================================================
+
+/// Walk a user-facing map Value's heap-referencing children.
+pub fn traceMap(h: *HeapHeader, visitor: anytype) void {
+    const sk = inferRootSubkind(h);
+    switch (sk) {
+        subkind_array_map => {
+            // Entries stored inline in the array-map body.
+            for (arrayMapEntries(h)) |e| {
+                visitor.markValue(e.key);
+                visitor.markValue(e.value);
+            }
+        },
+        subkind_champ_root => {
+            // Root holds a pointer to the CHAMP tree. At shift 0 the
+            // node is an interior; collision nodes only appear at
+            // shift > MAX_TRIE_SHIFT.
+            const root_body = champRootBodyConst(h);
+            traceMapNode(root_body.root_node, 0, visitor);
+        },
+        else => unreachable,
+    }
+}
+
+fn traceMapNode(node: *HeapHeader, shift: u8, visitor: anytype) void {
+    if (!visitor.markInternal(node)) return;
+    if (shift > MAX_TRIE_SHIFT) {
+        // Collision node: sequence of entries sharing the same hash.
+        for (collisionEntries(node)) |e| {
+            visitor.markValue(e.key);
+            visitor.markValue(e.value);
+        }
+        return;
+    }
+    // Interior node.
+    for (champInteriorEntries(node)) |e| {
+        visitor.markValue(e.key);
+        visitor.markValue(e.value);
+    }
+    const next_shift: u8 = shift + branch_bits;
+    for (champInteriorChildren(node)) |child| {
+        traceMapNode(child, next_shift, visitor);
+    }
+}
+
+// =============================================================================
 // =============================================================================
 // PART 2 — Persistent set (parallel to persistent_map)
 //
@@ -2868,6 +2922,43 @@ pub const SetIter = struct {
 
 pub fn setIter(s: Value) SetIter {
     return SetIter.init(s);
+}
+
+// =============================================================================
+// GC trace — set (GC.md §5)
+//
+// Parallel to traceMap. Walks the set rooted at `h` (subkind 0 or 1).
+// External Value references (elements) route through
+// `visitor.markValue`; internal CHAMP nodes via `visitor.markInternal`.
+// =============================================================================
+
+pub fn traceSet(h: *HeapHeader, visitor: anytype) void {
+    const sk = inferSetRootSubkind(h);
+    switch (sk) {
+        subkind_array_map => {
+            for (arraySetElements(h)) |e| visitor.markValue(e);
+        },
+        subkind_champ_root => {
+            const root_body = champSetRootBodyConst(h);
+            traceSetNode(root_body.root_node, 0, visitor);
+        },
+        else => unreachable,
+    }
+}
+
+fn traceSetNode(node: *HeapHeader, shift: u8, visitor: anytype) void {
+    if (!visitor.markInternal(node)) return;
+    if (shift > MAX_TRIE_SHIFT) {
+        // Collision node: sequence of elements sharing the same hash.
+        for (setCollisionElements(node)) |e| visitor.markValue(e);
+        return;
+    }
+    // Interior node.
+    for (setInteriorElements(node)) |e| visitor.markValue(e);
+    const next_shift: u8 = shift + branch_bits;
+    for (setInteriorChildren(node)) |child| {
+        traceSetNode(child, next_shift, visitor);
+    }
 }
 
 // =============================================================================

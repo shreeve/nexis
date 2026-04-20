@@ -7,9 +7,11 @@ the 16-byte `HeapHeader` freeze pinned in VALUE.md.
 
 This is the module that makes every heap kind possible. It is deliberately
 tiny: allocation, free, object enumeration, and a minimal `sweepUnmarked`
-that validates the mark-sweep storage strategy. Full GC (root enumeration,
-precise tracing, trigger policy) lands later in `src/gc.zig`; this file is
-the bedrock that collector will build on.
+that implements the sweep half of mark-sweep. Full GC (root enumeration,
+precise tracing, explicit `collect(roots)` driver) ships in `src/gc.zig`
+and is specified in `docs/GC.md`. This file is the allocator + sweep
+bedrock the collector builds on; the kind dispatch + mark phase live
+in `gc.zig`.
 
 Risk-register entries #1 (three-reps boundary), #2 (GC bugs), and #3
 (eq/hash inconsistency) are the three this module is most responsible for
@@ -120,9 +122,11 @@ pub const Heap = struct {
     // Minimal sweep — free every block whose `mark` bit is clear; on
     // survivors, clear the `mark` bit so the next cycle starts fresh.
     // Returns the number of blocks freed. Does NOT enumerate roots or
-    // trace reachability (that's `gc.zig`'s job). The caller is expected
-    // to have marked the live set some other way (hand-marking in tests;
-    // future root+trace walk in gc.zig).
+    // trace reachability (that's `src/gc.zig`'s job; see `docs/GC.md`).
+    // Callers that want a full collection should use
+    // `gc.Collector.collect(roots)` instead of driving this primitive
+    // directly; `sweepUnmarked` is exposed only as the sweep half of
+    // the mark-sweep pair.
     pub fn sweepUnmarked(self: *Heap) usize;
 };
 
@@ -198,11 +202,12 @@ flag_hash_cached is reserved and not operationally used yet.
   not on this heap). The `meta_symbol` heap kind (future) will point at
   a base symbol id from the interner plus a `*HeapHeader` metadata map
   allocated on this heap.
-- **GC (future `src/gc.zig`).** Will register roots (intern tables, VM
-  frames, durable-ref handles), perform precise tracing from those roots
-  to set `marked`, then call `sweepUnmarked`. The `forEachLive` API is
-  available for diagnostics. The trace seam on `Interner` is already a
-  no-op hook.
+- **GC (`src/gc.zig`, see `docs/GC.md`).** Collector.collect(roots)
+  drives a full cycle: mark each root via per-kind `trace` functions
+  (each heap kind exports `pub fn trace(h, visitor)`), then call
+  `sweepUnmarked`. The collector is explicit-only and non-reentrant in
+  v1. `forEachLive` remains available for diagnostics. The trace seam
+  on `Interner` is a no-op (intern-owned storage is not heap-managed).
 - **Codec (future `src/codec.zig`).** Does not allocate directly on this
   heap; instead uses per-kind `decode` helpers that do. The heap module
   is codec-unaware.
@@ -213,9 +218,11 @@ flag_hash_cached is reserved and not operationally used yet.
 
 - **Per-kind body layouts** (string body, CHAMP node, RRB trie node,
   bignum limbs). Those are each their own module's concern, documented
-  alongside the module (`docs/STRING.md`, `docs/COLL.md`, etc. — pending).
-- **Root enumeration and the real mark-sweep loop.** Future `docs/GC.md`
-  pins that, landing with `src/gc.zig`.
+  alongside the module (`docs/STRING.md`, `docs/CHAMP.md`, `docs/VECTOR.md`,
+  etc.).
+- **Root enumeration and the real mark-sweep driver.** `docs/GC.md`
+  and `src/gc.zig` own this. HEAP.md only owns the allocator + the
+  sweep primitive + the mark-bit layout.
 - **Allocation performance** (slab allocator, size-class bins, large-object
   direct-mmap). PLAN §10.4 describes the target v3+ shape; Phase 6 is
   where the optimization work lives (`PLAN §19.6` T2.6 generational,

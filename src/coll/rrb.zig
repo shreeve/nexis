@@ -425,6 +425,49 @@ pub fn equalSeq(
 }
 
 // =============================================================================
+// GC trace (GC.md §5)
+//
+// Vector trace walks the trie (internal subkinds 2/3/4) directly via
+// `visitor.markInternal`. External Value references (leaf/tail
+// elements) route through `visitor.markValue`. Internal nodes have
+// no metadata (VECTOR.md §3 invariant), so `markInternal` skips the
+// meta chain.
+// =============================================================================
+
+/// Walk the vector rooted at `h` (subkind 1). `h` itself is already
+/// marked by the collector. Walks: tail_node (internal) + its leaf
+/// values; root_node recursively (interior/leaf subkinds) + every
+/// leaf's values.
+pub fn trace(h: *HeapHeader, visitor: anytype) void {
+    const body = rootBodyConst(h);
+    if (body.tail_node) |tn| {
+        if (visitor.markInternal(tn)) {
+            // Tail node body is [tail_len] Value — walk and mark
+            // heap-kind children.
+            for (tailValuesConst(tn)) |elem| visitor.markValue(elem);
+        }
+    }
+    if (body.root_node) |rn| traceTrie(rn, body.shift, visitor);
+}
+
+/// Recursively walk a trie subtree. `shift == 0` means `node` is a
+/// leaf (32 Values); `shift > 0` means `node` is an interior (32
+/// child pointers).
+fn traceTrie(node: *HeapHeader, shift: u32, visitor: anytype) void {
+    if (!visitor.markInternal(node)) return;
+    if (shift == 0) {
+        // Leaf: 32 Value slots.
+        for (leafValues(node)) |elem| visitor.markValue(elem);
+    } else {
+        // Interior: 32 ?*HeapHeader child slots.
+        const next_shift: u32 = shift - branch_bits;
+        for (interiorChildren(node)) |child_opt| {
+            if (child_opt) |c| traceTrie(c, next_shift, visitor);
+        }
+    }
+}
+
+// =============================================================================
 // Cursor — streaming ordered iteration for cross-kind walking
 //
 // Peer-AI turn-7: cross-kind `sequentialEqual` uses cursor-based walks
