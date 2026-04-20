@@ -248,8 +248,24 @@ Choices here are frozen so that §2 equality and §3 hash cannot drift:
   kind-equality categories carved out.
 - **Sequential collections** — ordered combine:
   `h = 1; for each x: h = 31 * h + hasheq(x); finalize h with count`.
-- **Map collections** — unordered combine:
-  `h = 0; for each [k v]: h += hasheq(list(k, v)); finalize h with count`.
+- **Map collections** — unordered combine over ordered (k, v) pairs:
+  - Per-entry: `entry_h = 31 * (31 * 1 + hasheq(k)) + hasheq(v)` (i.e.
+    `combineOrdered(combineOrdered(ordered_init, hasheq(k)), hasheq(v))`
+    — two ordered combines, **no sequential finalize, no sequential
+    domain byte**; the aggregate gets its own associative domain byte
+    below).
+  - Aggregate: `h = 0; for each entry: h += entry_h; finalize h with count`.
+  - Rationale: ordered combine within each entry keeps hash sensitive
+    to swapped key/value positions (stronger than Clojure's
+    order-insensitive XOR); unordered combine across entries preserves
+    the map's entry-order-insensitive equality. Entry hashes do not
+    route through the full sequential hash pipeline — that pipeline
+    would fold in the `0xF0` sequential domain byte, which is
+    irrelevant for a map-internal pair and would waste a `mixKindDomain`
+    call per entry. This clarification (amended 2026-04-19 during the
+    CHAMP spec draft; originally wrote `h += hasheq(list(k, v))` as
+    informal pseudocode that strict-read would double-domain-mix and
+    finalize-with-count-2 per entry).
 - **Set collections** — unordered combine:
   `h = 0; for each x: h += hasheq(x); finalize h with count`.
 - **`durable-ref`** — xxHash3-32 over `store-id ++ tree-id-bytes ++

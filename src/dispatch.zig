@@ -28,8 +28,9 @@
 //!     ├─ @import("string")       (hashHeader + bytesEqual)
 //!     ├─ @import("bignum")       (hashHeader + limbsEqual)
 //!     ├─ @import("list")         (hashSeq + equalSeq + Cursor)
-//!     └─ @import("vector")       (hashSeq + equalSeq + Cursor; cross-kind sequential)
-//!       [+ future kinds: persistent_map, persistent_set, …]
+//!     ├─ @import("vector")       (hashSeq + equalSeq + Cursor; cross-kind sequential)
+//!     └─ @import("hamt")         (hashMap + equalMap; associative category)
+//!       [+ future kinds: persistent_set, …]
 //!
 //! No heap-kind module imports `dispatch.zig`. Collection kinds whose
 //! hash/equal is recursive over their elements (list, future
@@ -61,6 +62,7 @@ const string = @import("string");
 const list = @import("list");
 const vector = @import("vector");
 const bignum = @import("bignum");
+const hamt = @import("hamt");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -150,9 +152,10 @@ pub fn heapHashBase(v: Value) u64 {
         .bignum => @as(u64, bignum.hashHeader(h)),
         .list => list.hashSeq(h, &hashValue),
         .persistent_vector => vector.hashSeq(h, &hashValue),
-        // Future: .persistent_map, .persistent_set, .byte_vector,
-        // .typed_vector, .function, .var_, .durable_ref,
-        // .transient, .error_, .meta_symbol.
+        .persistent_map => hamt.hashMap(h, &hashValue),
+        // Future: .persistent_set, .byte_vector, .typed_vector,
+        // .function, .var_, .durable_ref, .transient, .error_,
+        // .meta_symbol.
         else => std.debug.panic(
             "dispatch.heapHashBase: kind {s} not implemented",
             .{@tagName(k)},
@@ -177,20 +180,42 @@ pub fn equal(a: Value, b: Value) bool {
     const cat_a = eqCategory(ka);
     const cat_b = eqCategory(kb);
     if (cat_a != cat_b) return false;
-    // Cross-kind category paths. Today only `.sequential` has members;
-    // `.associative` / `.set` join as those kinds ship.
+    // Cross-kind category paths. `.sequential` and `.associative` have
+    // v1 runtime members; `.set` lands with commit 2 of CHAMP.
     switch (cat_a) {
         .sequential => return sequentialEqual(a, b),
-        .associative, .set, .kind_local => {
-            // Kind-local: must be the same kind to compare further.
-            // `.associative` / `.set` end up here in v1 because each
-            // category has only one kind today; the switch arm grows
-            // when a second associative/set kind lands.
+        .associative => return associativeEqual(a, b),
+        .set, .kind_local => {
+            // `.set` is empty of members until CHAMP commit 2 lands;
+            // routing it here reduces to the kind-local path (with
+            // `ka != kb` always true when there are 0 members, so
+            // this branch returns false vacuously). When
+            // `persistent_set` ships, `.set` gets its own arm
+            // analogous to `associativeEqual`.
             if (ka != kb) return false;
             if (ka.isHeap()) return heapEqual(a, b);
             return eq.equalImmediate(a, b);
         },
     }
+}
+
+/// Cross-kind associative equality. Today only `persistent_map` lives
+/// in the `.associative` category so this reduces to kind-local
+/// dispatch; the shape parallels `sequentialEqual` so a future
+/// second associative member (sorted-map in v2+) slots in naturally.
+///
+/// Semantic strategy is provided by `hamt.equalMap` which handles all
+/// four subkind-pair combinations (array-map × array-map, array-map ×
+/// CHAMP, CHAMP × array-map, CHAMP × CHAMP) per CHAMP.md §6.3 / §6.4.
+fn associativeEqual(a: Value, b: Value) bool {
+    std.debug.assert(eqCategory(a.kind()) == .associative);
+    std.debug.assert(eqCategory(b.kind()) == .associative);
+    if (a.kind() != b.kind()) {
+        // v1: only `.persistent_map` in category. Second kind would
+        // add an arm here.
+        return false;
+    }
+    return hamt.equalMap(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &hashValue, &equal);
 }
 
 /// Cross-kind sequential equality. Both operands are known to be in
@@ -269,13 +294,14 @@ pub fn heapEqual(a: Value, b: Value) bool {
     return switch (k) {
         .string => string.bytesEqual(ah, bh),
         .bignum => bignum.limbsEqual(ah, bh),
-        // Sequential kinds (.list, .persistent_vector) are handled
-        // by `sequentialEqual` via the category branch in `equal`;
-        // they should never reach here in practice. The arms below
-        // exist only for defensive routing if a caller bypasses the
-        // category dispatch and lands on `heapEqual` directly.
+        // Category kinds (sequential / associative) are normally
+        // handled by `sequentialEqual` / `associativeEqual` via the
+        // category branch in `equal`; the arms below exist for
+        // defensive routing if a caller bypasses the category
+        // dispatch and lands on `heapEqual` directly.
         .list => list.equalSeq(ah, bh, &equal),
         .persistent_vector => vector.equalSeq(ah, bh, &equal),
+        .persistent_map => hamt.equalMap(ah, bh, &hashValue, &equal),
         else => std.debug.panic(
             "dispatch.heapEqual: kind {s} not implemented",
             .{@tagName(k)},
@@ -764,18 +790,11 @@ test "cross-kind: empty list/vector is NOT equal to nil (different categories)" 
 }
 
 test "equal rejects cross-kind heap Values before payload interpretation" {
-    // White-box test: deliberately forges an "incomplete" Value of
-    // kind `.persistent_map` by tagging a raw heap allocation with
-    // that kind byte. The `persistent_map` kind has no implementation
-    // yet — calling `hashValue` or `heapEqual` on such a value would
-    // panic at the dispatcher's `else` arm. The whole point is to
-    // prove that `dispatch.equal` short-circuits on the cross-kind
-    // rule BEFORE it ever reaches kind-specific dispatch, so this
-    // forgery never gets interpreted as a real map.
-    //
-    // Pattern is intentional for this single invariant test; do NOT
-    // extend it to other coverage — once a second heap kind ships,
-    // cross-kind tests should use two real kinds.
+    // White-box test: forges a fake map Value to prove `dispatch.equal`
+    // short-circuits on the cross-CATEGORY rule (string is
+    // .kind_local, persistent_map is .associative) BEFORE it reaches
+    // kind-specific dispatch. The forgery is never interpreted as a
+    // real map.
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     const s = try string.fromBytes(&heap, "cross");
@@ -785,4 +804,145 @@ test "equal rejects cross-kind heap Values before payload interpretation" {
         .payload = @intFromPtr(h),
     };
     try testing.expect(!equal(s, fake_map));
+}
+
+// ---- Persistent map (CHAMP) kind end-to-end dispatch ----
+
+const hamt_mod = @import("hamt");
+
+test "hashValue / equal: empty map round-trip (two separate allocations)" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const a = try hamt_mod.mapEmpty(&heap);
+    const b = try hamt_mod.mapEmpty(&heap);
+    try testing.expect(equal(a, b));
+    try testing.expectEqual(hashValue(a), hashValue(b));
+}
+
+test "hashValue / equal: {:k1 1 :k2 2} across two insertion orders" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const k1 = value.fromKeywordId(1);
+    const k2 = value.fromKeywordId(2);
+    const v1 = value.fromFixnum(10).?;
+    const v2 = value.fromFixnum(20).?;
+
+    var a = try hamt_mod.mapEmpty(&heap);
+    a = try hamt_mod.mapAssoc(&heap, a, k1, v1, &hashValue, &equal);
+    a = try hamt_mod.mapAssoc(&heap, a, k2, v2, &hashValue, &equal);
+
+    var b = try hamt_mod.mapEmpty(&heap);
+    b = try hamt_mod.mapAssoc(&heap, b, k2, v2, &hashValue, &equal);
+    b = try hamt_mod.mapAssoc(&heap, b, k1, v1, &hashValue, &equal);
+
+    try testing.expect(equal(a, b));
+    try testing.expectEqual(hashValue(a), hashValue(b));
+}
+
+test "equal: map vs non-associative kinds is always false (cross-category)" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const m = try hamt_mod.mapEmpty(&heap);
+    const s = try string.fromBytes(&heap, "");
+    const l = try list_mod.empty(&heap);
+    const v = try vector_mod.empty(&heap);
+    const nil = value.nilValue();
+    const fx = value.fromFixnum(0).?;
+    try testing.expect(!equal(m, s));
+    try testing.expect(!equal(m, l));
+    try testing.expect(!equal(m, v));
+    try testing.expect(!equal(m, nil));
+    try testing.expect(!equal(m, fx));
+    // Cross-direction same.
+    try testing.expect(!equal(l, m));
+    try testing.expect(!equal(v, m));
+    try testing.expect(!equal(nil, m));
+}
+
+test "hashValue: map hash uses associative-category domain byte (0xF1)" {
+    // Two logically-identical maps and lists hash differently at the
+    // final `mixKindDomain` step because their domain bytes differ.
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const m = try hamt_mod.mapEmpty(&heap);
+    const l = try list_mod.empty(&heap);
+    try testing.expect(hashValue(m) != hashValue(l));
+    try testing.expectEqual(associative_domain_byte, domainByteForKind(.persistent_map));
+    // The pre-mix bases may coincidentally match; the final hashValue
+    // must still differ because of the domain-byte folding.
+    const final_m = hashValue(m);
+    const final_l = hashValue(l);
+    const base_m = heapHashBase(m);
+    const base_l = heapHashBase(l);
+    try testing.expectEqual(
+        hash_mod.mixKindDomain(base_m, associative_domain_byte),
+        final_m,
+    );
+    try testing.expectEqual(
+        hash_mod.mixKindDomain(base_l, sequential_domain_byte),
+        final_l,
+    );
+}
+
+test "equal: cross-subkind (array-map vs CHAMP) with the same entries" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    // Build an 8-entry array-map `am` and a CHAMP `ch` that holds the
+    // same 8 entries (via grow-to-9-then-dissoc). Cross-subkind
+    // equality must recognize them as equal via semantic associative
+    // compare (CHAMP.md §6.4).
+    var am = try hamt_mod.mapEmpty(&heap);
+    var i: u32 = 0;
+    while (i < 8) : (i += 1) {
+        am = try hamt_mod.mapAssoc(&heap, am, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &hashValue, &equal);
+    }
+    var ch = am;
+    ch = try hamt_mod.mapAssoc(&heap, ch, value.fromKeywordId(100), value.fromFixnum(100).?, &hashValue, &equal);
+    ch = try hamt_mod.mapDissoc(&heap, ch, value.fromKeywordId(100), &hashValue, &equal);
+
+    try testing.expect(am.subkind() == 0); // array-map
+    try testing.expect(ch.subkind() == 1); // CHAMP (no demote)
+    try testing.expect(equal(am, ch));
+    try testing.expectEqual(hashValue(am), hashValue(ch));
+}
+
+test "nested map as value: dispatch recurses correctly" {
+    // Outer map `{:outer inner}` where `inner = {:a 1 :b 2}`. Hash
+    // and equality must walk both levels via the element callbacks.
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var inner_a = try hamt_mod.mapEmpty(&heap);
+    inner_a = try hamt_mod.mapAssoc(&heap, inner_a, value.fromKeywordId(1), value.fromFixnum(1).?, &hashValue, &equal);
+    inner_a = try hamt_mod.mapAssoc(&heap, inner_a, value.fromKeywordId(2), value.fromFixnum(2).?, &hashValue, &equal);
+
+    var inner_b = try hamt_mod.mapEmpty(&heap);
+    inner_b = try hamt_mod.mapAssoc(&heap, inner_b, value.fromKeywordId(2), value.fromFixnum(2).?, &hashValue, &equal);
+    inner_b = try hamt_mod.mapAssoc(&heap, inner_b, value.fromKeywordId(1), value.fromFixnum(1).?, &hashValue, &equal);
+
+    const k_outer = value.fromKeywordId(100);
+    const outer_a = try hamt_mod.mapAssoc(&heap, try hamt_mod.mapEmpty(&heap), k_outer, inner_a, &hashValue, &equal);
+    const outer_b = try hamt_mod.mapAssoc(&heap, try hamt_mod.mapEmpty(&heap), k_outer, inner_b, &hashValue, &equal);
+
+    try testing.expect(equal(outer_a, outer_b));
+    try testing.expectEqual(hashValue(outer_a), hashValue(outer_b));
+}
+
+test "equal ⇒ hashValue equal: bedrock invariant end-to-end (map)" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    // Build two identical 50-entry maps in different insertion
+    // orders. Equality must hold and hashes must match.
+    var a = try hamt_mod.mapEmpty(&heap);
+    var b = try hamt_mod.mapEmpty(&heap);
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        a = try hamt_mod.mapAssoc(&heap, a, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &hashValue, &equal);
+    }
+    i = 49;
+    while (true) : (i -|= 1) {
+        b = try hamt_mod.mapAssoc(&heap, b, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &hashValue, &equal);
+        if (i == 0) break;
+    }
+    try testing.expect(equal(a, b));
+    try testing.expectEqual(hashValue(a), hashValue(b));
 }

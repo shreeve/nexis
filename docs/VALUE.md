@@ -111,9 +111,9 @@ Payload = `u64` pointer to a heap object with a standard `HeapHeader`
 |---|---|---|---|
 | 16 | `string` | UTF-8 string | 0 = inline short string (≤ 15 bytes, bytes live in payload + aux); 1 = heap string; 2 = zero-copy slice over mmap page (Phase 6 T2.2) |
 | 17 | `bignum` | arbitrary-precision integer | 0 = limbs stored in heap object |
-| 18 | `persistent_map` | CHAMP map | 0 = array-map (inline ≤8 entries); 1 = CHAMP node tree |
-| 19 | `persistent_set` | CHAMP set | same as map |
-| 20 | `persistent_vector` | 32-way persistent vector | 0 = inline (≤32); 1 = trie + tail |
+| 18 | `persistent_map` | CHAMP map | 0 = array-map (inline ≤8 entries, user-facing); 1 = CHAMP root (user-facing); 2 = CHAMP interior node (internal, never escapes as a user Value); 3 = collision node (internal) |
+| 19 | `persistent_set` | CHAMP set | Parallel subkind numbering to map: 0 = array-set; 1 = CHAMP root; 2 = CHAMP interior; 3 = collision. Pinned in `docs/CHAMP.md` §3. |
+| 20 | `persistent_vector` | 32-way persistent vector | 0 = reserved (future small-vector inline optimization); 1 = root (user-facing); 2 = interior trie node (internal); 3 = leaf trie node (internal, always 32 Values); 4 = tail node (internal, 0..32 Values). Taxonomy pinned in `docs/VECTOR.md` §2. |
 | 21 | `list` | cons list | 0 = normal cons; 1 = empty singleton |
 | 22 | `byte_vector` | packed u8 slice | |
 | 23 | `typed_vector` | homogeneous numeric slice | 0 = i32, 1 = i64, 2 = f32, 3 = f64 |
