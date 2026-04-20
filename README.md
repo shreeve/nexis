@@ -32,6 +32,7 @@ zig build golden      # reader golden tests alone
 | [`docs/FORMS.md`](docs/FORMS.md) | Canonical Form schema + pretty-printer spec |
 | [`docs/SEMANTICS.md`](docs/SEMANTICS.md) | Equality, hash, numeric edge cases (frozen) |
 | [`docs/CODEC.md`](docs/CODEC.md) | Serialization scope (stub; locked in Phase 4) |
+| [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) | Post-v1 Datomic-class database architecture on nexis + emdb |
 | [`nexis.grammar`](nexis.grammar) | Reader grammar — source of truth |
 | [`src/nexis.zig`](src/nexis.zig) | `@lang` module — Tag enum + Lexer wrapper |
 | [`src/reader.zig`](src/reader.zig) | Sexp → Form normalizer + pretty-printer |

@@ -27,7 +27,10 @@ runtime, no compiler, no collections — those are Phase 1+ (`PLAN.md` §21).
    the pretty-printer spec and stage-ownership table.
 4. **`docs/SEMANTICS.md`** — equality/hash/numeric-edge-case spec (frozen).
 5. **`docs/CODEC.md`** — serialization stub (scope frozen, bytes TBD Phase 4).
-6. **`ZIG-0.16.0-REFERENCE.md`** + **`ZIG-0.16.0-QUICKSTART.md`** — mandatory
+6. **`docs/NEXTOMIC.md`** — post-v1 Datomic-class database architecture on
+   nexis + emdb. Not a v1 deliverable; read only when Nextomic is being
+   scoped or when a v1 decision might preclude it.
+7. **`ZIG-0.16.0-REFERENCE.md`** + **`ZIG-0.16.0-QUICKSTART.md`** — mandatory
    before writing any Zig. 30+ stdlib APIs changed between 0.15 and 0.16 in
    ways that silently break training-data code.
 

@@ -1328,6 +1328,14 @@ This is the Phase 1 gate property test #5, exercised on 10k+ randomized values.
 
 ### 15.11 The "Nextomic" opportunity — a Datomic-class database inside nexis
 
+> **Authoritative architecture for Nextomic now lives in
+> [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md).** This section remains the
+> opportunity statement and the v1-side commitments that do not
+> preclude the Nextomic path. Anything implementation-shaped
+> (storage layout, key encodings, Relation type, query pipeline,
+> schema, risks) belongs in `docs/NEXTOMIC.md` and is binding once
+> Nextomic is actually scoped as a project.
+
 **Beyond v1, the same substrate that powers durable refs could host a full Datomic-class database as a nexis library.** This is not a v1 deliverable, but it's worth naming because it shapes long-term direction.
 
 #### What Datomic actually is
@@ -1386,15 +1394,49 @@ A working sketch:
 (d/q query (d/as-of (d/db conn) yesterday-snapshot))  ; time travel
 ```
 
-Implementation estimate:
+Implementation estimate (revised in `docs/NEXTOMIC.md` §10 after deeper review):
 
-- **Datom encoding and four indexes**: ~1,500 LOC. Direct emdb usage with named trees.
-- **Schema + unique/indexed/ref attribute handling**: ~500 LOC.
-- **Datalog query engine** (naive nested-loop join, no optimizer): ~1,500 LOC. Can grow into a real optimizer over time.
+- **Datom encoding and four indexes + tx-log**: ~1,500 LOC.
+- **Schema + unique/indexed/ref attribute handling**: ~800 LOC (revised up from 500 — schema machinery is easy to underscope).
+- **Internal `Relation` type + column kernels**: ~600 LOC (new line item — see §15.11.1 below).
+- **Datalog query compiler (macro → IR)**: ~500 LOC.
+- **Runtime planner (IR → plan)**: ~800 LOC.
+- **Executor + cursor drivers**: ~900 LOC.
 - **Pull syntax**: ~500 LOC.
 - **Temporal operators** (`as-of`, `since`, `history`): ~300 LOC, mostly riding on §15.7.
+- **`datom` heap kind + accessors**: ~200 LOC.
 
-**Total: ~4–5k LOC of nexis as a library.** Feasible as a post-v1 side project; could ship as `nexis-nextomic` without changes to the core language.
+**Revised total: ~6.1k LOC of nexis as a library.** Still feasible as a post-v1 side project; could ship as `nexis-nextomic` without changes to the core language, to emdb, or to em.
+
+#### 15.11.1 Frozen-once-scoped architectural decisions
+
+After a two-round peer-AI architectural review (GPT-5.4 via the
+`user-ai` MCP, conversation `nextomic-on-nexis-emdb`), six
+architectural decisions were identified as the separators between
+"serious 2026+-class contender" and "beautiful proof-of-concept."
+Full rationale is in [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) §3;
+these become binding in the same way PLAN §23 decisions bind v1,
+but only when Nextomic is actually scoped as an active project.
+
+| # | Decision | Short rationale |
+|---|---|---|
+| NX-1 | **Integer entity ids** (fixnum), NOT durable-refs. Attr ids = `u32` keyword intern ids. Durable-refs stay the `nexis.db` handle type but are NOT Nextomic's entity identity. | Fitting eids into the Value payload is 8 bytes vs ~40; lex-sort is one instruction; entity identity must not encode storage topology. |
+| NX-2 | **Internal Relation type** — column-oriented, backed by existing `typed_vector` Value kinds. API results stay persistent-set-of-persistent-vector; the engine does NOT use that representation internally. | Generic persistent collections all the way is correct and slow. This is the single highest-leverage decision Nextomic will make. |
+| NX-3 | **Macro → IR → runtime-plan split.** Macro compiles query literal to IR (embedded as a bytecode constant). Runtime planner lowers IR to a plan using current schema + bound inputs. | Macros alone cannot plan (schema and bindings are runtime). Runtime alone pays parse cost per call. The split is roughly 40 / 30 / 30 between the three stages. |
+| NX-4 | **tx-in-key filtering for history, NOT emdb snapshot pinning.** Datoms are append-only with `tx` in the key; `as-of T` is a range filter. emdb snapshots are reserved for operational reproducibility, not semantic history. | Pinned snapshots prevent page reclamation; tx-in-key does not. Datomic semantics demand history-as-data, not history-as-page-retention. |
+| NX-5 | **`datom` as a new heap Value kind** — five accessors (`.e .a .v .tx .added?`), user-facing projection only. Execution operates on `Relation` columns, not on datom values. Serializes via projection to existing §15.10 kinds; no codec amendment. | Nicer ergonomics and cheaper accessors than vector-of-five-Values, without leaking into the hot execution path. |
+| NX-6 | **One named sub-DB per concern** (`:nextomic/txlog`, `:nextomic/eavt`, `:nextomic/aevt`, `:nextomic/avet`, `:nextomic/vaet`, `:nextomic/schema`, `:nextomic/idents`, `:nextomic/sys`). Keys are binary-sortable byte strings; emdb default lex comparator is exactly the needed order. Index values are empty — the key IS the datom. | Atomic multi-index commit falls out of emdb's single meta-page flip. Branch-page prefix compression (G=1/G>1/G<0) compresses composite EAVT keys maximally. |
+
+**Three things `docs/NEXTOMIC.md` explicitly rejects as temptations:**
+
+1. Extending the §15.10 codec matrix for query plans or compiled
+   rules. Layer 2 and Layer 3 must not fuse.
+2. Adding Nextomic-specific features to emdb. The temptation list
+   is captured in [`../emdb/NEXTOMIC.md`](../emdb/NEXTOMIC.md).
+3. Falling back to persistent-set-of-persistent-vector as the
+   internal relation representation. This is the single
+   architectural failure mode that would turn Nextomic into a
+   proof-of-concept.
 
 #### Why it matters strategically
 
