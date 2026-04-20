@@ -110,7 +110,7 @@ test "V2: reduce(conj, empty, elems) ≡ fromSlice(elems)" {
 // V3. Cross-kind list ↔ vector — THE retirement receipt
 // -----------------------------------------------------------------------------
 
-test "V3: 500 random sequences produce list↔vector equal+hash-equal (retirement receipt)" {
+test "V3: 2000 random sequences produce list↔vector equal+hash-equal (retirement receipt, gate #1 scaled)" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -119,7 +119,7 @@ test "V3: 500 random sequences produce list↔vector equal+hash-equal (retiremen
     const r = prng.random();
 
     var i: usize = 0;
-    while (i < 500) : (i += 1) {
+    while (i < 2000) : (i += 1) {
         const len = r.uintLessThan(usize, 48);
         const elems = try gpa.alloc(Value, len);
         defer gpa.free(elems);
@@ -177,7 +177,7 @@ test "V4: equal is reflexive, symmetric, pairwise transitive on random vectors" 
 // V5. Bedrock: equal ⇒ hashValue equal
 // -----------------------------------------------------------------------------
 
-test "V5: 500 identically-sequenced vector pairs across allocations share hashValue" {
+test "V5: 2000 identically-sequenced vector pairs across allocations share hashValue (gate #1 scaled)" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -186,7 +186,7 @@ test "V5: 500 identically-sequenced vector pairs across allocations share hashVa
     const r = prng.random();
 
     var i: usize = 0;
-    while (i < 500) : (i += 1) {
+    while (i < 2000) : (i += 1) {
         const len = r.uintLessThan(usize, 40);
         const elems = try gpa.alloc(Value, len);
         defer gpa.free(elems);

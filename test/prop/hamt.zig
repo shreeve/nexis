@@ -289,15 +289,15 @@ test "M5: equality laws (reflexive, symmetric, pairwise transitive)" {
 // M6. Cross-subkind hash equivalence — THE RETIREMENT RECEIPT
 // -----------------------------------------------------------------------------
 
-test "M6: cross-subkind (array-map vs CHAMP) same entries hash AND equal" {
+test "M6: cross-subkind (array-map vs CHAMP) same entries hash AND equal (2000 trials)" {
     // Parallel to test/prop/vector.zig V3 for the associative category.
-    // For each of 500 random ≤8-entry key-value sets we build two
+    // For each of 2000 random ≤8-entry key-value sets we build two
     // maps: `am` that stays as array-map, `ch` that grows to 9 entries
     // and dissocs one back out (forcing CHAMP subkind). Both must be
     // `dispatch.equal` and produce identical `dispatch.hashValue`
     // outputs, proving the associative-category architecture holds
     // across subkinds. This retires the fault line analogous to
-    // V3 for sequential.
+    // V3 for sequential. Bumped 500 → 2000 for gate #1 scaling.
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -305,7 +305,7 @@ test "M6: cross-subkind (array-map vs CHAMP) same entries hash AND equal" {
     var prng = std.Random.DefaultPrng.init(prng_seed +% 6);
     const r = prng.random();
 
-    const trials: usize = 500;
+    const trials: usize = 2000;
     var trial: usize = 0;
     while (trial < trials) : (trial += 1) {
         // 1..8 distinct keys for array-map path.
@@ -535,7 +535,7 @@ test "M10: collision node stress — ≥5 distinct keys sharing an indexing hash
 // M11 (bonus): bedrock `equal ⇒ hashValue equal` over a large random pool
 // -----------------------------------------------------------------------------
 
-test "M11: equal ⇒ hashValue equal over 500 random map pairs" {
+test "M11: equal ⇒ hashValue equal over 2000 random map pairs (gate #1 scaled)" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -543,7 +543,7 @@ test "M11: equal ⇒ hashValue equal over 500 random map pairs" {
     const r = prng.random();
 
     var trial: usize = 0;
-    while (trial < 500) : (trial += 1) {
+    while (trial < 2000) : (trial += 1) {
         // Build identical maps in two different insertion orders.
         const n = r.intRangeAtMost(usize, 0, 30);
         const entries = try gpa.alloc(hamt.Entry, n);
@@ -718,7 +718,7 @@ test "S4: set equality laws (reflexive, symmetric, pairwise transitive)" {
     }
 }
 
-test "S5: cross-subkind (array-set vs CHAMP) retirement receipt (500 trials)" {
+test "S5: cross-subkind (array-set vs CHAMP) retirement receipt (2000 trials, gate #1 scaled)" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -726,7 +726,7 @@ test "S5: cross-subkind (array-set vs CHAMP) retirement receipt (500 trials)" {
     var prng = std.Random.DefaultPrng.init(prng_seed +% 0x55);
     const r = prng.random();
 
-    const trials: usize = 500;
+    const trials: usize = 2000;
     var trial: usize = 0;
     while (trial < trials) : (trial += 1) {
         const n = r.intRangeAtMost(u32, 1, 8);

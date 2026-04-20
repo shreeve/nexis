@@ -38,7 +38,7 @@ const prng_seed: u64 = 0x7472_616E_7369_656E; // "transien" LE
 // T1 — Equivalence (GATE TEST #3 RETIREMENT RECEIPT)
 // =============================================================================
 
-test "T1a: map equivalence — transient × N ≡ persistent × N (300 trials)" {
+test "T1a: map equivalence — transient × N ≡ persistent × N (1000 trials, gate #1 scaled)" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -47,7 +47,7 @@ test "T1a: map equivalence — transient × N ≡ persistent × N (300 trials)" 
     const r = prng.random();
 
     var trial: usize = 0;
-    while (trial < 300) : (trial += 1) {
+    while (trial < 1000) : (trial += 1) {
         const n = r.uintLessThan(usize, 40);
 
         // Direct persistent path.
@@ -81,7 +81,7 @@ test "T1a: map equivalence — transient × N ≡ persistent × N (300 trials)" 
     }
 }
 
-test "T1b: set equivalence — transient × N ≡ persistent × N (300 trials)" {
+test "T1b: set equivalence — transient × N ≡ persistent × N (1000 trials, gate #1 scaled)" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -90,7 +90,7 @@ test "T1b: set equivalence — transient × N ≡ persistent × N (300 trials)" 
     const r = prng.random();
 
     var trial: usize = 0;
-    while (trial < 300) : (trial += 1) {
+    while (trial < 1000) : (trial += 1) {
         const n = r.uintLessThan(usize, 40);
         var persistent_path = try hamt.setEmpty(&heap);
         const t = try transient.transientFrom(&heap, try hamt.setEmpty(&heap));
@@ -116,7 +116,7 @@ test "T1b: set equivalence — transient × N ≡ persistent × N (300 trials)" 
     }
 }
 
-test "T1c: vector equivalence — transient × N conj ≡ persistent × N conj (300 trials)" {
+test "T1c: vector equivalence — transient × N conj ≡ persistent × N conj (1000 trials, gate #1 scaled)" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -125,7 +125,7 @@ test "T1c: vector equivalence — transient × N conj ≡ persistent × N conj (
     const r = prng.random();
 
     var trial: usize = 0;
-    while (trial < 300) : (trial += 1) {
+    while (trial < 1000) : (trial += 1) {
         const n = r.uintLessThan(usize, 50);
         var persistent_path = try vector.empty(&heap);
         const t = try transient.transientFrom(&heap, try vector.empty(&heap));

@@ -3,8 +3,11 @@
 //!
 //! Properties (CODEC.md §7):
 //!
-//!   C1. **10k randomized Values round-trip** (GATE #5 RECEIPT):
-//!       for every serializable kind, nested up to depth 4,
+//!   C1. **100k randomized Values round-trip** (GATE #5 RECEIPT
+//!       + GATE #1 PRIMARY RECEIPT — scaled 10k → 100k in commit
+//!       post-codec to satisfy PLAN §20.2 test #1 "100k+ randomized
+//!       equality/hash tests across all value kinds"): for every
+//!       serializable kind, nested up to depth 4,
 //!       `dispatch.equal(v, decode(encode(v)))` AND
 //!       `dispatch.hashValue(v) == dispatch.hashValue(decode(encode(v)))`.
 //!   C2. **Re-encode byte-equality** for canonical-order kinds
@@ -188,15 +191,18 @@ const TestCtx = struct {
 // C1. 10k randomized round-trip (GATE #5 RECEIPT)
 // =============================================================================
 
-test "C1: 10000 random Values round-trip equal + hash-equal (GATE #5)" {
+/// Shared body for the C1 partitioned round-trip test. Each partition
+/// uses a distinct PRNG seed offset so the 10 sub-tests cover
+/// independent value populations, aggregating to 100k unique trials.
+fn runC1Partition(seed_offset: u64, trials: usize) !void {
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    var prng = std.Random.DefaultPrng.init(prng_seed +% 1);
+    var prng = std.Random.DefaultPrng.init(prng_seed +% seed_offset);
     var gen = Gen{ .ctx = &ctx, .r = prng.random() };
 
     var trial: usize = 0;
-    while (trial < 10_000) : (trial += 1) {
+    while (trial < trials) : (trial += 1) {
         const depth = gen.r.intRangeAtMost(u8, 0, 4);
         const v = try gen.container(depth);
 
@@ -207,6 +213,45 @@ test "C1: 10000 random Values round-trip equal + hash-equal (GATE #5)" {
         try std.testing.expect(dispatch.equal(v, got));
         try std.testing.expectEqual(dispatch.hashValue(v), dispatch.hashValue(got));
     }
+}
+
+// C1 is partitioned into 10 × 10_000 sub-tests so each sub-test
+// completes within any reasonable per-test timeout (the Zig test
+// runner + build system kills individual tests that run too long).
+// Aggregate = 100,000 random trials, satisfying PLAN §20.2 gate
+// test #1 "100k+ randomized equality/hash tests across all value
+// kinds" — each trial encodes a random Value, decodes, and asserts
+// both structural equality AND hash preservation.
+
+test "C1a: 10000 random Values round-trip (partition 1/10)" {
+    try runC1Partition(1, 10_000);
+}
+test "C1b: 10000 random Values round-trip (partition 2/10)" {
+    try runC1Partition(2, 10_000);
+}
+test "C1c: 10000 random Values round-trip (partition 3/10)" {
+    try runC1Partition(3, 10_000);
+}
+test "C1d: 10000 random Values round-trip (partition 4/10)" {
+    try runC1Partition(4, 10_000);
+}
+test "C1e: 10000 random Values round-trip (partition 5/10)" {
+    try runC1Partition(5, 10_000);
+}
+test "C1f: 10000 random Values round-trip (partition 6/10)" {
+    try runC1Partition(6, 10_000);
+}
+test "C1g: 10000 random Values round-trip (partition 7/10)" {
+    try runC1Partition(7, 10_000);
+}
+test "C1h: 10000 random Values round-trip (partition 8/10)" {
+    try runC1Partition(8, 10_000);
+}
+test "C1i: 10000 random Values round-trip (partition 9/10)" {
+    try runC1Partition(9, 10_000);
+}
+test "C1j: 10000 random Values round-trip (partition 10/10, closes GATE #1 aggregate to 100k)" {
+    try runC1Partition(10, 10_000);
 }
 
 // =============================================================================
