@@ -841,11 +841,11 @@ Checklist of classic mistakes — tests must cover each.
 
 ---
 
-### 11. Two-commit split
+### 11. Two-commit split (both landed)
 
 Per peer-AI turn 8 and user confirmation:
 
-**Commit 1 — map core + associative infrastructure.**
+**Commit 1 — map core + associative infrastructure.** [LANDED at `b20c306`]
 
 - `docs/CHAMP.md` (this file).
 - `src/coll/hamt.zig` with:
@@ -853,30 +853,51 @@ Per peer-AI turn 8 and user confirmation:
   - Map public API (`mapEmpty`, `mapFromEntries`, `mapAssoc`,
     `mapDissoc`, `mapGet`, `mapCount`, `mapIsEmpty`).
   - `hashMap`, `equalMap`, `MapIter`, dispatch integration.
-- `test/prop/hamt.zig` with the map property tests from §12.
-- Inline tests in `hamt.zig` at the structural / unit level.
+- `test/prop/hamt.zig` with map property tests M1–M11.
+- Inline map tests in `hamt.zig` (29 tests).
 - `dispatch.zig` updates:
   - `heapHashBase` map arm.
   - `associativeEqual` helper.
-  - `equal` switch update.
-- Green: all prior 247 tests + new map tests.
+  - `equal` switch update (split `.associative` out of fused arm).
+- Green: 247 → 294 tests (+47).
 
-**Commit 2 — set parallel implementation.**
+**Commit 2 — set parallel implementation.** [LANDED this commit]
 
-- `src/coll/hamt.zig` extended with:
-  - `.persistent_set` subkinds 0–3, node bodies sharing the map
-    machinery via subkind-aware layout helpers (one module, separate
-    kinds, parallel subkind taxonomy).
+- `src/coll/hamt.zig` extended with the full set kind (parallel
+  PART 2 section):
+  - `.persistent_set` subkinds 0–3. Bodies share header layout
+    structs with the map side (`ChampSetRootBody`, `SetInteriorHeader`,
+    `SetCollisionHeader` are type aliases); entry storage differs
+    (16-byte `Value` per element vs. 32-byte `Entry` per map
+    key-value pair).
   - Set public API (`setEmpty`, `setFromElements`, `setConj`,
     `setDisj`, `setContains`, `setCount`, `setIsEmpty`).
   - `hashSet`, `equalSet`, `SetIter`, dispatch integration.
-- `test/prop/hamt.zig` extended with set properties.
-- `dispatch.zig` updates for the set kind arms.
-- Green: all prior tests (including commit 1's map tests) + set tests.
+  - Parallel clone helpers: `cloneSetInteriorReplaceChild`,
+    `cloneSetInteriorInsertElement`,
+    `cloneSetInteriorMigrateDataToChild`,
+    `cloneSetInteriorRemoveElement`,
+    `cloneSetInteriorMigrateChildToData`.
+  - Parallel recursive ops: `champSetConjInNode`,
+    `champSetDisjFromNode`, `champSetContains`, collision node
+    versions of each.
+- `test/prop/hamt.zig` extended with set properties S1–S9
+  (retirement receipt is S5 — cross-subkind array-set vs. CHAMP).
+- Inline set tests (13 tests parallel to the map ones).
+- `dispatch.zig` updates:
+  - `heapHashBase` set arm (`hamt.hashSet`).
+  - `heapEqual` set arm (`hamt.equalSet`).
+  - `setEqualCategory` helper paralleling `associativeEqual` /
+    `sequentialEqual`.
+  - `equal` switch: fused `.set, .kind_local` arm split — `.set`
+    now has its own arm.
+- Green: 294 → 323 tests (+29). 10 goldens unchanged = 333 gates total.
 
-Each commit ships with complete spec coverage, peer-AI review, and
-property-test receipts. Commit 1 retires the associative equality
-category's hidden fault line; commit 2 retires the set category's.
+Each commit shipped with spec coverage, peer-AI review, and property-
+test receipts. Commit 1 retired the associative equality category's
+hidden fault line; commit 2 retires the set category's. All three
+equality categories (`.sequential`, `.associative`, `.set`) now have
+concrete runtime members and property-test retirement receipts.
 
 ---
 

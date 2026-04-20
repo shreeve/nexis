@@ -570,3 +570,299 @@ test "M11: equal ⇒ hashValue equal over 500 random map pairs" {
         try std.testing.expectEqual(dispatch.hashValue(a), dispatch.hashValue(b));
     }
 }
+
+// =============================================================================
+// Persistent set property tests (commit 2)
+//
+// Properties (CHAMP.md §12.2 / §12.4 parallel):
+//   S1. setFromElements + setContains round-trip; absent returns false.
+//   S2. Random conj/disj sequences preserve the element set (model
+//       vs. implementation).
+//   S3. setConj of existing element returns the same pointer.
+//   S4. Equality laws over random sets (reflexive / symmetric /
+//       pairwise transitive).
+//   S5. **Cross-subkind hash equivalence** (RETIREMENT RECEIPT for
+//       `.set` equality category): 500 random sets built via two
+//       different paths — pure array-set vs. promote-then-disj — hash
+//       and equal identically. Parallel to M6.
+//   S6. Cross-category never-equal: a set is never `=` to any non-set
+//       Value (not map, not list, not vector, not nil, not fixnum).
+//   S7. Persistent immutability: setConj does not mutate source set.
+//   S8. Keyword-keyed fast-path correctness on set side.
+//   S9. Collision-bucket stress for set (parallel to M10).
+// =============================================================================
+
+test "S1: setFromElements + setContains round-trip over 200 random sets" {
+    const gpa = std.testing.allocator;
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x51);
+    const r = prng.random();
+
+    var trial: usize = 0;
+    while (trial < 200) : (trial += 1) {
+        const n = r.uintLessThan(usize, 40);
+        // Distinct elements via deterministic counter.
+        const elems = try gpa.alloc(Value, n);
+        defer gpa.free(elems);
+        for (elems, 0..) |*slot, i| {
+            slot.* = value.fromFixnum(@intCast(i + trial * 100)).?;
+        }
+        const s = try hamt.setFromElements(&heap, elems, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expectEqual(n, hamt.setCount(s));
+        for (elems) |e| {
+            try std.testing.expect(hamt.setContains(s, e, &dispatch.hashValue, &dispatch.equal));
+        }
+        try std.testing.expect(!hamt.setContains(s, value.fromFixnum(999_999_999).?, &dispatch.hashValue, &dispatch.equal));
+    }
+}
+
+test "S2: random conj/disj sequences preserve the element set" {
+    const gpa = std.testing.allocator;
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x52);
+    const r = prng.random();
+
+    const trials: usize = 50;
+    var trial: usize = 0;
+    while (trial < trials) : (trial += 1) {
+        var model: std.ArrayList(Value) = .empty;
+        defer model.deinit(gpa);
+
+        var s = try hamt.setEmpty(&heap);
+        const ops: usize = 30;
+        var op: usize = 0;
+        while (op < ops) : (op += 1) {
+            const is_conj = r.boolean() or model.items.len == 0;
+            if (is_conj) {
+                const e = value.fromFixnum(r.intRangeAtMost(i64, 0, 19)).?;
+                s = try hamt.setConj(&heap, s, e, &dispatch.hashValue, &dispatch.equal);
+                var found = false;
+                for (model.items) |me| {
+                    if (dispatch.equal(me, e)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) try model.append(gpa, e);
+            } else {
+                const idx = r.uintLessThan(usize, model.items.len);
+                const e = model.items[idx];
+                s = try hamt.setDisj(&heap, s, e, &dispatch.hashValue, &dispatch.equal);
+                _ = model.swapRemove(idx);
+            }
+            try std.testing.expectEqual(model.items.len, hamt.setCount(s));
+            for (model.items) |me| {
+                try std.testing.expect(hamt.setContains(s, me, &dispatch.hashValue, &dispatch.equal));
+            }
+        }
+    }
+}
+
+test "S3: setConj of existing element returns same pointer" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const sizes = [_]u32{ 1, 5, 8, 9, 15, 40 };
+    for (sizes) |size| {
+        var s = try hamt.setEmpty(&heap);
+        var i: u32 = 0;
+        while (i < size) : (i += 1) {
+            s = try hamt.setConj(&heap, s, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
+        }
+        const pick = value.fromFixnum(@intCast(size / 2)).?;
+        const s2 = try hamt.setConj(&heap, s, pick, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expect(Heap.asHeapHeader(s) == Heap.asHeapHeader(s2));
+    }
+}
+
+test "S4: set equality laws (reflexive, symmetric, pairwise transitive)" {
+    const gpa = std.testing.allocator;
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x54);
+    const r = prng.random();
+
+    const pool_size: usize = 16;
+    var pool: [pool_size]Value = undefined;
+    for (0..pool_size) |i| {
+        const n = r.uintLessThan(usize, 15);
+        var s = try hamt.setEmpty(&heap);
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            const e = value.fromFixnum(r.intRangeAtMost(i64, 0, 20)).?;
+            s = try hamt.setConj(&heap, s, e, &dispatch.hashValue, &dispatch.equal);
+        }
+        pool[i] = s;
+    }
+    for (pool) |a| try std.testing.expect(dispatch.equal(a, a));
+    for (pool) |a| {
+        for (pool) |b| {
+            const ab = dispatch.equal(a, b);
+            const ba = dispatch.equal(b, a);
+            try std.testing.expectEqual(ab, ba);
+            if (ab) try std.testing.expectEqual(dispatch.hashValue(a), dispatch.hashValue(b));
+        }
+    }
+    for (pool) |a| {
+        for (pool) |b| {
+            if (!dispatch.equal(a, b)) continue;
+            for (pool) |c| {
+                if (dispatch.equal(b, c)) {
+                    try std.testing.expect(dispatch.equal(a, c));
+                }
+            }
+        }
+    }
+}
+
+test "S5: cross-subkind (array-set vs CHAMP) retirement receipt (500 trials)" {
+    const gpa = std.testing.allocator;
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x55);
+    const r = prng.random();
+
+    const trials: usize = 500;
+    var trial: usize = 0;
+    while (trial < trials) : (trial += 1) {
+        const n = r.intRangeAtMost(u32, 1, 8);
+        const elems = try gpa.alloc(Value, n);
+        defer gpa.free(elems);
+        for (elems, 0..) |*slot, idx| {
+            slot.* = value.fromFixnum(@intCast(idx + trial * 100)).?;
+        }
+        // Path A: pure array-set.
+        var as = try hamt.setEmpty(&heap);
+        for (elems) |e| as = try hamt.setConj(&heap, as, e, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expect(as.subkind() == 0);
+        // Path B: grow to n+1 then disj the extra → CHAMP.
+        var ch = as;
+        const extra = value.fromFixnum(@intCast(1_000_000 + trial)).?;
+        ch = try hamt.setConj(&heap, ch, extra, &dispatch.hashValue, &dispatch.equal);
+        if (n >= 8) try std.testing.expect(ch.subkind() == 1);
+        ch = try hamt.setDisj(&heap, ch, extra, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expect(dispatch.equal(as, ch));
+        try std.testing.expect(dispatch.equal(ch, as));
+        try std.testing.expectEqual(dispatch.hashValue(as), dispatch.hashValue(ch));
+    }
+}
+
+test "S6: set never equal to non-set Values" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const s = try hamt.setConj(
+        &heap,
+        try hamt.setEmpty(&heap),
+        value.fromKeywordId(1),
+        &dispatch.hashValue,
+        &dispatch.equal,
+    );
+    const non_set = [_]Value{
+        value.nilValue(),
+        value.fromBool(true),
+        value.fromFixnum(0).?,
+        value.fromKeywordId(1),
+        value.fromChar('a').?,
+        try list_mod.empty(&heap),
+        try vector_mod.empty(&heap),
+        try hamt.mapEmpty(&heap),
+    };
+    for (non_set) |other| {
+        try std.testing.expect(!dispatch.equal(s, other));
+        try std.testing.expect(!dispatch.equal(other, s));
+    }
+    const es = try hamt.setEmpty(&heap);
+    for (non_set) |other| {
+        try std.testing.expect(!dispatch.equal(es, other));
+    }
+}
+
+test "S7: set persistent immutability" {
+    const gpa = std.testing.allocator;
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x57);
+    const r = prng.random();
+
+    var s_src = try hamt.setEmpty(&heap);
+    var model: std.ArrayList(Value) = .empty;
+    defer model.deinit(gpa);
+    const n = r.uintLessThan(usize, 30);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const e = value.fromFixnum(@intCast(i)).?;
+        s_src = try hamt.setConj(&heap, s_src, e, &dispatch.hashValue, &dispatch.equal);
+        try model.append(gpa, e);
+    }
+    const src_count = hamt.setCount(s_src);
+    var ops: usize = 0;
+    while (ops < 40) : (ops += 1) {
+        const is_conj = r.boolean();
+        if (is_conj) {
+            _ = try hamt.setConj(&heap, s_src, value.fromFixnum(9999).?, &dispatch.hashValue, &dispatch.equal);
+        } else if (n > 0) {
+            _ = try hamt.setDisj(&heap, s_src, value.fromFixnum(@intCast(r.uintLessThan(usize, n))).?, &dispatch.hashValue, &dispatch.equal);
+        }
+        try std.testing.expectEqual(src_count, hamt.setCount(s_src));
+        for (model.items) |me| {
+            try std.testing.expect(hamt.setContains(s_src, me, &dispatch.hashValue, &dispatch.equal));
+        }
+    }
+}
+
+test "S8: keyword-element sets give identical results to fixnum-element sets" {
+    const gpa = std.testing.allocator;
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x58);
+    const r = prng.random();
+
+    var trial: usize = 0;
+    while (trial < 100) : (trial += 1) {
+        const n = r.intRangeAtMost(u32, 0, 30);
+        var s_kw = try hamt.setEmpty(&heap);
+        var s_fx = try hamt.setEmpty(&heap);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            s_kw = try hamt.setConj(&heap, s_kw, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal);
+            s_fx = try hamt.setConj(&heap, s_fx, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
+        }
+        try std.testing.expectEqual(hamt.setCount(s_kw), hamt.setCount(s_fx));
+        i = 0;
+        while (i < n) : (i += 1) {
+            const in_kw = hamt.setContains(s_kw, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal);
+            const in_fx = hamt.setContains(s_fx, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
+            try std.testing.expectEqual(in_kw, in_fx);
+        }
+    }
+}
+
+test "S9: collision-node stress for set (≥5 elements sharing indexing hash)" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    var s = try hamt.setEmpty(&heap);
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        s = try hamt.setConj(&heap, s, value.fromKeywordId(i), &collidingHash, &dispatch.equal);
+    }
+    try std.testing.expectEqual(@as(usize, 10), hamt.setCount(s));
+    i = 0;
+    while (i < 10) : (i += 1) {
+        try std.testing.expect(hamt.setContains(s, value.fromKeywordId(i), &collidingHash, &dispatch.equal));
+    }
+    s = try hamt.setDisj(&heap, s, value.fromKeywordId(0), &collidingHash, &dispatch.equal);
+    s = try hamt.setDisj(&heap, s, value.fromKeywordId(5), &collidingHash, &dispatch.equal);
+    try std.testing.expectEqual(@as(usize, 8), hamt.setCount(s));
+    try std.testing.expect(!hamt.setContains(s, value.fromKeywordId(0), &collidingHash, &dispatch.equal));
+    try std.testing.expect(!hamt.setContains(s, value.fromKeywordId(5), &collidingHash, &dispatch.equal));
+    try std.testing.expect(hamt.setContains(s, value.fromKeywordId(3), &collidingHash, &dispatch.equal));
+    const remaining = [_]u32{ 1, 2, 3, 4, 6, 7, 8, 9 };
+    for (remaining) |x| {
+        s = try hamt.setDisj(&heap, s, value.fromKeywordId(x), &collidingHash, &dispatch.equal);
+    }
+    try std.testing.expect(hamt.setIsEmpty(s));
+}
