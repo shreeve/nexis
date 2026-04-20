@@ -45,18 +45,36 @@ collection↔string coercion, no keyword↔symbol coercion.
 **Cross-type is always false in v1** (PLAN §23 decision 11):
 
 - `(= 1 1.0)` → `false`.
-- `(= 1 (bignum 1))` → `true` only when the bignum is within fixnum range
-  **and** a runtime invariant holds: bignums within ±2⁴⁷−1 are canonicalized
-  to fixnum on construction. Out-of-range bignums are never `=` to any
-  fixnum. This invariant guarantees that two integer values compare `=` iff
-  they are mathematically equal within the integer tower.
+- `(= 1 (bignum 1))` — this specific call is not observable because of
+  the canonicalization invariant below: constructing a bignum whose
+  magnitude fits in the fixnum range returns a `fixnum`, not a bignum.
+  Phrased as an invariant: **for integers, the runtime guarantees
+  that two mathematically-equal integers are always represented by
+  exactly one runtime kind/value form in v1.** Equality and hash are
+  consistent across the fixnum↔bignum boundary *by construction*, not
+  by a cross-kind rule.
+
+**Fixnum range is i48**, inclusive on both ends:
+
+- `min = -(2⁴⁷) = -140_737_488_355_328`
+- `max =  2⁴⁷ - 1 = 140_737_488_355_327`
+- Canonicalization must fold any integer in `[min, max]` to `fixnum`.
+  The asymmetric lower bound (one below the symmetric `±(2⁴⁷−1)`
+  statement previous versions of this document carried) is
+  deliberate: it matches the authoritative `src/value.zig` constants
+  `fixnum_min` / `fixnum_max` and the standard signed-i48
+  two's-complement range. Bignum construction that sees a magnitude
+  equal to `2⁴⁷` with negative sign must canonicalize to
+  `fixnum(-2⁴⁷)`, not a bignum.
 
 Integer tower (`fixnum` + `bignum`):
 
-- Arithmetic that overflows a fixnum promotes to bignum. Arithmetic that
-  would underflow into fixnum range canonicalizes back to fixnum. Equality
-  and hash are consistent across this boundary by construction.
+- Arithmetic that overflows a fixnum promotes to bignum. Arithmetic
+  that would underflow into fixnum range canonicalizes back to fixnum.
+  Equality and hash are consistent across this boundary by construction.
 - `(= 0 -0)` → `true`. There is no signed zero in the integer tower.
+  Canonicalization must treat any zero magnitude as `fixnum(0)`
+  regardless of sign input; a "negative zero bignum" is unrepresentable.
 
 Float (`f64`):
 

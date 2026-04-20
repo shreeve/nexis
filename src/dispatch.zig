@@ -26,8 +26,9 @@
 //!     ├─ @import("heap")         (*HeapHeader + Heap.asHeapHeader)
 //!     ├─ @import("hash")         (combineOrdered + mixKindDomain)
 //!     ├─ @import("string")       (hashHeader + bytesEqual)
+//!     ├─ @import("bignum")       (hashHeader + limbsEqual)
 //!     └─ @import("list")         (hashSeq + equalSeq, fn-pointer plumbing)
-//!       [+ future kinds: bignum, persistent_map, persistent_vector, …]
+//!       [+ future kinds: persistent_map, persistent_vector, …]
 //!
 //! No heap-kind module imports `dispatch.zig`. Collection kinds whose
 //! hash/equal is recursive over their elements (list, future
@@ -57,6 +58,7 @@ const heap_mod = @import("heap");
 const hash_mod = @import("hash");
 const string = @import("string");
 const list = @import("list");
+const bignum = @import("bignum");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -143,8 +145,9 @@ pub fn heapHashBase(v: Value) u64 {
     const h = Heap.asHeapHeader(v);
     return switch (k) {
         .string => @as(u64, string.hashHeader(h)),
+        .bignum => @as(u64, bignum.hashHeader(h)),
         .list => list.hashSeq(h, &hashValue),
-        // Future: .bignum, .persistent_map, .persistent_set,
+        // Future: .persistent_map, .persistent_set,
         // .persistent_vector, .byte_vector, .typed_vector, .function,
         // .var_, .durable_ref, .transient, .error_, .meta_symbol.
         else => std.debug.panic(
@@ -214,6 +217,7 @@ pub fn heapEqual(a: Value, b: Value) bool {
     const bh = Heap.asHeapHeader(b);
     return switch (k) {
         .string => string.bytesEqual(ah, bh),
+        .bignum => bignum.limbsEqual(ah, bh),
         .list => list.equalSeq(ah, bh, &equal),
         else => std.debug.panic(
             "dispatch.heapEqual: kind {s} not implemented",
@@ -335,6 +339,80 @@ test "equal ⇒ hashValue equal: bedrock invariant end-to-end (string)" {
     const b = try string.fromBytes(&heap, "bedrock-string-invariant");
     try testing.expect(equal(a, b));
     try testing.expectEqual(hashValue(a), hashValue(b));
+}
+
+// ---- Bignum kind end-to-end dispatch ----
+
+const bignum_mod = @import("bignum");
+
+test "hashValue / equal: bignum round-trip across distinct allocations" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const big: u64 = @as(u64, 1) << 60;
+    const a = try bignum_mod.fromLimbs(&heap, false, &[_]u64{ big, 7 });
+    const b = try bignum_mod.fromLimbs(&heap, false, &[_]u64{ big, 7 });
+    try testing.expect(a.kind() == .bignum and b.kind() == .bignum);
+    try testing.expect(equal(a, b));
+    try testing.expectEqual(hashValue(a), hashValue(b));
+}
+
+test "equal: bignum is never equal to a fixnum (cross-kind, canonical form prevents overlap)" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    // Large bignum that can't canonicalize to fixnum.
+    const big = try bignum_mod.fromLimbs(&heap, false, &[_]u64{ 1, 1 });
+    try testing.expect(big.kind() == .bignum);
+
+    // Every fixnum. Cross-kind (both are kind-local, different kinds).
+    const small_fx = value.fromFixnum(42).?;
+    const zero_fx = value.fromFixnum(0).?;
+    try testing.expect(!equal(big, small_fx));
+    try testing.expect(!equal(big, zero_fx));
+    try testing.expect(hashValue(big) != hashValue(small_fx));
+}
+
+test "fromI64 integer-tower boundary: fixnum_max vs fixnum_max + 1 dispatch cleanly" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const at = try bignum_mod.fromI64(&heap, value.fixnum_max);
+    const over = try bignum_mod.fromI64(&heap, value.fixnum_max + 1);
+    try testing.expect(at.kind() == .fixnum);
+    try testing.expect(over.kind() == .bignum);
+    // Definitely NOT equal — they differ mathematically by 1.
+    try testing.expect(!equal(at, over));
+    try testing.expect(hashValue(at) != hashValue(over));
+}
+
+test "fromI64 integer-tower boundary: fixnum_min is representable as fixnum (asymmetric i48)" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const v = try bignum_mod.fromI64(&heap, value.fixnum_min);
+    try testing.expect(v.kind() == .fixnum);
+    try testing.expectEqual(value.fixnum_min, v.asFixnum());
+}
+
+test "equal: bignum sign flip breaks equality" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const big: u64 = @as(u64, 1) << 60;
+    const pos = try bignum_mod.fromLimbs(&heap, false, &[_]u64{ big, 1 });
+    const neg = try bignum_mod.fromLimbs(&heap, true, &[_]u64{ big, 1 });
+    try testing.expect(!equal(pos, neg));
+    try testing.expect(hashValue(pos) != hashValue(neg));
+}
+
+test "canonicalization invariant: fromLimbs with trailing zeros + fixnum-range tail folds to fixnum" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    // Input has a real fixnum-range limb and trailing zeros; must
+    // canonicalize to a fixnum Value, not a bignum.
+    const v = try bignum_mod.fromLimbs(&heap, false, &[_]u64{ 42, 0, 0 });
+    try testing.expect(v.kind() == .fixnum);
+    try testing.expectEqual(@as(i64, 42), v.asFixnum());
+    // Equality against a directly-constructed fixnum.
+    const direct = value.fromFixnum(42).?;
+    try testing.expect(equal(v, direct));
+    try testing.expectEqual(hashValue(v), hashValue(direct));
 }
 
 // ---- List kind end-to-end dispatch ----
