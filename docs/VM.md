@@ -171,7 +171,15 @@ three operands to fill unused slots.
 
 A **routine** is the compiled code of one `fn*` (or the implicit
 top-level form). Runtime representation is a heap value of kind
-`function` (VALUE.md kind 22).
+`function` (VALUE.md kind 22) in the final runtime model.
+
+> **Staged realization** (peer-AI turn 31): early Phase 2 commits
+> may materialize routines as plain Zig structs — not heap Values
+> — until closure / function heap objects land. This is acceptable
+> because routines are not user-visible in isolation; they become
+> observable only through the closures that wrap them. The
+> architectural destination (kind-22 heap Value) is preserved;
+> implementation order puts it behind closures.
 
 **Routine contents** (logical; Zig layout flexible):
 
@@ -298,9 +306,16 @@ given current instruction:
 
 **Contract** (not code):
 
-- Dispatch is **tail-call threaded**: each handler ends with a
-  tail call to the central dispatch function, which in turn
-  tail-calls the next handler. No stack growth from dispatch.
+- Dispatch is **tail-call threaded** in the final runtime model:
+  each handler ends with a tail call to the central dispatch
+  function, which in turn tail-calls the next handler. No stack
+  growth from dispatch.
+- **Staged realization** (peer-AI turn 31): early Phase 2 commits
+  may implement dispatch as a structured two-level switch (per
+  PLAN §12.5 fallback) while opcode semantics stabilize. The
+  semantic contract above is independent of dispatch style; the
+  tail-call-threaded upgrade lands when the opcode set is
+  stable enough that the dispatch loop's shape stops churning.
 - PC increment happens before handler entry (dispatch advances
   past the current instruction; handlers see the already-
   advanced PC when emitting jumps).
@@ -468,7 +483,8 @@ keyword; renames are breaking changes.
 | `:uncaught-throw` | `ctrl:throw` with no handler up the frame chain | Halts VM with error report |
 | `:extension-decode-failure` | Primary instruction expects extension but extension bytes malformed | Programming error; halts VM |
 | `:transient-frozen` | `transient_mod.*Bang` op on a finalized transient | Recoverable |
-| `:bytecode-corruption` | Invalid opcode group/variant | Programming error; halts VM |
+| `:invalid-operand-kind` | Operand's kind byte is incompatible with opcode context (e.g., `resolve` on an `.unused` operand, `store` to a constant operand) | Handler bug; distinct from index-OOB and from corrupted encoding |
+| `:bytecode-corruption` | Unrecognized opcode group / variant / operand-kind bit pattern | Programming error; halts VM |
 
 All errors are structured `Value`s (map with `:kind`, `:msg`,
 `:span` keys minimally) so user code can pattern-match.

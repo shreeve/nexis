@@ -174,6 +174,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const vm_mod = b.createModule(.{
+        .root_source_file = b.path("src/vm.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vm_mod.addImport("value", value_mod);
+
     const db_mod = b.createModule(.{
         .root_source_file = b.path("src/db.zig"),
         .target = target,
@@ -254,6 +261,7 @@ pub fn build(b: *std.Build) void {
         db: *std.Build.Module,
         emdb: *std.Build.Module,
         pool: *std.Build.Module,
+        vm: *std.Build.Module,
     };
     const siblings: AllSiblings = .{
         .hash = hash_mod,
@@ -272,6 +280,7 @@ pub fn build(b: *std.Build) void {
         .db = db_mod,
         .emdb = emdb_mod,
         .pool = pool_mod,
+        .vm = vm_mod,
     };
 
     const RuntimeTest = struct {
@@ -296,6 +305,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "hamt", "transient", "db" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "hamt", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
+        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{"value"} },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
@@ -323,6 +333,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "db")) siblings.db
                 else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb
                 else if (std.mem.eql(u8, imp_name, "pool")) siblings.pool
+                else if (std.mem.eql(u8, imp_name, "vm")) siblings.vm
                 else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
         }
