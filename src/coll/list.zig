@@ -210,6 +210,35 @@ pub fn equalSeq(
 }
 
 // =============================================================================
+// Cursor — streaming ordered iteration for cross-kind sequential equality
+// =============================================================================
+//
+// Peer-AI turn-7 review settled the cross-kind walker pattern as
+// streaming ordered traversal rather than random-access-by-index. This
+// cursor is consumed by `dispatch.sequentialEqual` when walking a list
+// against a vector (or any future sequential kind). Not part of the
+// language-surface API.
+
+pub const Cursor = struct {
+    /// The tail of the list still to be yielded. Always `.list` kind.
+    /// Empty list → `next()` returns null.
+    current: Value,
+
+    pub fn init(v: Value) Cursor {
+        std.debug.assert(v.kind() == .list);
+        return .{ .current = v };
+    }
+
+    pub fn next(self: *Cursor) ?Value {
+        if (isEmpty(self.current)) return null;
+        const h = Heap.asHeapHeader(self.current);
+        const body: *const ConsBody = @ptrCast(@alignCast(Heap.bodyBytes(h).ptr));
+        self.current = body.tail;
+        return body.head;
+    }
+};
+
+// =============================================================================
 // Private helpers
 // =============================================================================
 
@@ -455,6 +484,29 @@ test "equalSeq: identity short-circuit on same *HeapHeader" {
     defer heap.deinit();
     const a = try fromSlice(&heap, &.{value.fromFixnum(42).?});
     try testing.expect(equalSeq(Heap.asHeapHeader(a), Heap.asHeapHeader(a), &callbackEqImmediateOnly));
+}
+
+test "Cursor: streaming iteration yields head-to-tail, null on empty" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    // Empty list: init + next returns null immediately.
+    const e = try empty(&heap);
+    var ce = Cursor.init(e);
+    try testing.expectEqual(@as(?Value, null), ce.next());
+
+    // Non-empty list: yields 1, 2, 3, then null.
+    const lst = try fromSlice(&heap, &.{
+        value.fromFixnum(1).?,
+        value.fromFixnum(2).?,
+        value.fromFixnum(3).?,
+    });
+    var c = Cursor.init(lst);
+    try testing.expectEqual(@as(i64, 1), c.next().?.asFixnum());
+    try testing.expectEqual(@as(i64, 2), c.next().?.asFixnum());
+    try testing.expectEqual(@as(i64, 3), c.next().?.asFixnum());
+    try testing.expectEqual(@as(?Value, null), c.next());
+    try testing.expectEqual(@as(?Value, null), c.next()); // still null
 }
 
 test "count: flat list with 100 elements" {

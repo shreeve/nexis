@@ -92,6 +92,15 @@ pub fn build(b: *std.Build) void {
     list_mod.addImport("heap", heap_mod);
     list_mod.addImport("hash", hash_mod);
 
+    const vector_mod = b.createModule(.{
+        .root_source_file = b.path("src/coll/rrb.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vector_mod.addImport("value", value_mod);
+    vector_mod.addImport("heap", heap_mod);
+    vector_mod.addImport("hash", hash_mod);
+
     const bignum_mod = b.createModule(.{
         .root_source_file = b.path("src/bignum.zig"),
         .target = target,
@@ -112,6 +121,7 @@ pub fn build(b: *std.Build) void {
     dispatch_mod.addImport("hash", hash_mod);
     dispatch_mod.addImport("string", string_mod);
     dispatch_mod.addImport("list", list_mod);
+    dispatch_mod.addImport("vector", vector_mod);
     dispatch_mod.addImport("bignum", bignum_mod);
     // dispatch is a one-way terminal: nothing depends on it. value
     // and eq deliberately stay low-level (panicking on heap kinds)
@@ -151,6 +161,7 @@ pub fn build(b: *std.Build) void {
         heap: *std.Build.Module,
         string: *std.Build.Module,
         list: *std.Build.Module,
+        vector: *std.Build.Module,
         bignum: *std.Build.Module,
     };
     const siblings: AllSiblings = .{
@@ -160,6 +171,7 @@ pub fn build(b: *std.Build) void {
         .heap = heap_mod,
         .string = string_mod,
         .list = list_mod,
+        .vector = vector_mod,
         .bignum = bignum_mod,
     };
 
@@ -176,8 +188,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "heap", .path = "src/heap.zig", .imports = &.{"value"} },
         .{ .name = "string", .path = "src/string.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "list", .path = "src/coll/list.zig", .imports = &.{ "value", "heap", "hash" } },
+        .{ .name = "vector", .path = "src/coll/rrb.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "bignum", .path = "src/bignum.zig", .imports = &.{ "value", "heap", "hash" } },
-        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "bignum" } },
+        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
@@ -195,6 +208,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "heap")) siblings.heap
                 else if (std.mem.eql(u8, imp_name, "string")) siblings.string
                 else if (std.mem.eql(u8, imp_name, "list")) siblings.list
+                else if (std.mem.eql(u8, imp_name, "vector")) siblings.vector
                 else if (std.mem.eql(u8, imp_name, "bignum")) siblings.bignum
                 else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
@@ -285,6 +299,21 @@ pub fn build(b: *std.Build) void {
     const prop_bignum_tests = b.addTest(.{ .root_module = prop_bignum_mod });
     const run_prop_bignum_tests = b.addRunArtifact(prop_bignum_tests);
 
+    const prop_vector_mod = b.createModule(.{
+        .root_source_file = b.path("test/prop/vector.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prop_vector_mod.addImport("value", value_mod);
+    prop_vector_mod.addImport("heap", heap_mod);
+    prop_vector_mod.addImport("hash", hash_mod);
+    prop_vector_mod.addImport("list", list_mod);
+    prop_vector_mod.addImport("vector", vector_mod);
+    prop_vector_mod.addImport("dispatch", dispatch_mod);
+
+    const prop_vector_tests = b.addTest(.{ .root_module = prop_vector_mod });
+    const run_prop_vector_tests = b.addRunArtifact(prop_vector_tests);
+
     // -------------------------------------------------------------------------
     // Golden test runner (src/golden.zig)
     // -------------------------------------------------------------------------
@@ -324,6 +353,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_string_tests.step);
     test_step.dependOn(&run_prop_list_tests.step);
     test_step.dependOn(&run_prop_bignum_tests.step);
+    test_step.dependOn(&run_prop_vector_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);
 
