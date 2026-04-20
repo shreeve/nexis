@@ -168,6 +168,12 @@ pub fn build(b: *std.Build) void {
     gc_mod.addImport("hamt", hamt_mod);
     gc_mod.addImport("transient", transient_mod);
 
+    const pool_mod = b.createModule(.{
+        .root_source_file = b.path("src/pool.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const db_mod = b.createModule(.{
         .root_source_file = b.path("src/db.zig"),
         .target = target,
@@ -247,6 +253,7 @@ pub fn build(b: *std.Build) void {
         codec: *std.Build.Module,
         db: *std.Build.Module,
         emdb: *std.Build.Module,
+        pool: *std.Build.Module,
     };
     const siblings: AllSiblings = .{
         .hash = hash_mod,
@@ -264,6 +271,7 @@ pub fn build(b: *std.Build) void {
         .codec = codec_mod,
         .db = db_mod,
         .emdb = emdb_mod,
+        .pool = pool_mod,
     };
 
     const RuntimeTest = struct {
@@ -287,6 +295,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "hamt", "transient", "db" } },
         .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "hamt", "transient", "db" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "hamt", "emdb" } },
+        .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
@@ -313,6 +322,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "codec")) siblings.codec
                 else if (std.mem.eql(u8, imp_name, "db")) siblings.db
                 else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb
+                else if (std.mem.eql(u8, imp_name, "pool")) siblings.pool
                 else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
         }
@@ -548,6 +558,7 @@ pub fn build(b: *std.Build) void {
     bench_runner_mod.addImport("dispatch", dispatch_mod);
     bench_runner_mod.addImport("db", db_mod);
     bench_runner_mod.addImport("emdb", emdb_mod);
+    bench_runner_mod.addImport("pool", pool_mod);
 
     const bench_exe = b.addExecutable(.{
         .name = "nexis-bench",

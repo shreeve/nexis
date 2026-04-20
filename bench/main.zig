@@ -48,6 +48,7 @@ const codec_mod = @import("codec");
 const dispatch = @import("dispatch");
 const db = @import("db");
 const emdb = @import("emdb");
+const pool_mod = @import("pool");
 
 const Value = value_mod.Value;
 const Heap = heap_mod.Heap;
@@ -144,47 +145,58 @@ var raw_hash_sink: u64 = 0;
 // -----------------------------------------------------------------------------
 
 const BuildCtx = struct {
-    heap: *Heap,
+    // Per-invocation heap backing (so each bench run gets a fresh
+    // Heap and releases all blocks via heap.deinit()). Prevents
+    // unbounded memory growth across inner_reps. Keys/vals are
+    // immediates (interned keyword ids + fixnums); they don't
+    // reference the per-invocation heap.
+    alloc: std.mem.Allocator,
     interner: *Interner,
     n: usize,
-    // Pre-generated keys / values (for maps / sets) so generation
-    // cost doesn't pollute the benchmark.
     keys: []Value,
     vals: []Value,
 };
 
 fn benchListConj(ctx: *BuildCtx) anyerror!void {
-    var lst = try list_mod.empty(ctx.heap);
+    var heap = Heap.init(ctx.alloc);
+    defer heap.deinit();
+    var lst = try list_mod.empty(&heap);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
-        lst = try list_mod.cons(ctx.heap, ctx.vals[i], lst);
+        lst = try list_mod.cons(&heap, ctx.vals[i], lst);
     }
     std.mem.doNotOptimizeAway(lst);
 }
 
 fn benchVectorConj(ctx: *BuildCtx) anyerror!void {
-    var v = try vector_mod.empty(ctx.heap);
+    var heap = Heap.init(ctx.alloc);
+    defer heap.deinit();
+    var v = try vector_mod.empty(&heap);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
-        v = try vector_mod.conj(ctx.heap, v, ctx.vals[i]);
+        v = try vector_mod.conj(&heap, v, ctx.vals[i]);
     }
     std.mem.doNotOptimizeAway(v);
 }
 
 fn benchMapAssoc(ctx: *BuildCtx) anyerror!void {
-    var m = try hamt.mapEmpty(ctx.heap);
+    var heap = Heap.init(ctx.alloc);
+    defer heap.deinit();
+    var m = try hamt.mapEmpty(&heap);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
-        m = try hamt.mapAssoc(ctx.heap, m, ctx.keys[i], ctx.vals[i], &dispatch.hashValue, &dispatch.equal);
+        m = try hamt.mapAssoc(&heap, m, ctx.keys[i], ctx.vals[i], &dispatch.hashValue, &dispatch.equal);
     }
     std.mem.doNotOptimizeAway(m);
 }
 
 fn benchSetConj(ctx: *BuildCtx) anyerror!void {
-    var s = try hamt.setEmpty(ctx.heap);
+    var heap = Heap.init(ctx.alloc);
+    defer heap.deinit();
+    var s = try hamt.setEmpty(&heap);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
-        s = try hamt.setConj(ctx.heap, s, ctx.keys[i], &dispatch.hashValue, &dispatch.equal);
+        s = try hamt.setConj(&heap, s, ctx.keys[i], &dispatch.hashValue, &dispatch.equal);
     }
     std.mem.doNotOptimizeAway(s);
 }
@@ -194,33 +206,39 @@ fn benchSetConj(ctx: *BuildCtx) anyerror!void {
 // -----------------------------------------------------------------------------
 
 fn benchTransientVectorConj(ctx: *BuildCtx) anyerror!void {
-    const base = try vector_mod.empty(ctx.heap);
-    var t = try transient_mod.transientFrom(ctx.heap, base);
+    var heap = Heap.init(ctx.alloc);
+    defer heap.deinit();
+    const base = try vector_mod.empty(&heap);
+    var t = try transient_mod.transientFrom(&heap, base);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
-        t = try transient_mod.vectorConjBang(ctx.heap, t, ctx.vals[i]);
+        t = try transient_mod.vectorConjBang(&heap, t, ctx.vals[i]);
     }
     const v = try transient_mod.persistentBang(t);
     std.mem.doNotOptimizeAway(v);
 }
 
 fn benchTransientMapAssoc(ctx: *BuildCtx) anyerror!void {
-    const base = try hamt.mapEmpty(ctx.heap);
-    var t = try transient_mod.transientFrom(ctx.heap, base);
+    var heap = Heap.init(ctx.alloc);
+    defer heap.deinit();
+    const base = try hamt.mapEmpty(&heap);
+    var t = try transient_mod.transientFrom(&heap, base);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
-        t = try transient_mod.mapAssocBang(ctx.heap, t, ctx.keys[i], ctx.vals[i], &dispatch.hashValue, &dispatch.equal);
+        t = try transient_mod.mapAssocBang(&heap, t, ctx.keys[i], ctx.vals[i], &dispatch.hashValue, &dispatch.equal);
     }
     const m = try transient_mod.persistentBang(t);
     std.mem.doNotOptimizeAway(m);
 }
 
 fn benchTransientSetConj(ctx: *BuildCtx) anyerror!void {
-    const base = try hamt.setEmpty(ctx.heap);
-    var t = try transient_mod.transientFrom(ctx.heap, base);
+    var heap = Heap.init(ctx.alloc);
+    defer heap.deinit();
+    const base = try hamt.setEmpty(&heap);
+    var t = try transient_mod.transientFrom(&heap, base);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
-        t = try transient_mod.setConjBang(ctx.heap, t, ctx.keys[i], &dispatch.hashValue, &dispatch.equal);
+        t = try transient_mod.setConjBang(&heap, t, ctx.keys[i], &dispatch.hashValue, &dispatch.equal);
     }
     const s = try transient_mod.persistentBang(t);
     std.mem.doNotOptimizeAway(s);
@@ -361,6 +379,7 @@ pub fn main(init: std.process.Init) !u8 {
     var out_path: ?[]const u8 = null;
     var note: []const u8 = "";
     var filter: ?[]const u8 = null;
+    var allocator_choice: []const u8 = "pool"; // POOL.md §9 default
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const a = args[ai];
@@ -373,8 +392,31 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, a, "--filter") and ai + 1 < args.len) {
             ai += 1;
             filter = args[ai];
+        } else if (std.mem.eql(u8, a, "--allocator") and ai + 1 < args.len) {
+            ai += 1;
+            allocator_choice = args[ai];
         }
     }
+
+    // Backing allocator for the size-class pool itself. Must be
+    // a real general-purpose allocator — `page_allocator` is NOT
+    // suitable here because it rounds every allocation up to a
+    // page, which under the bench workload OOMs quickly.
+    const backing = init.gpa;
+
+    // Heap-backing allocator under measurement. POOL.md §9:
+    // pool is the default; --allocator std selects the process
+    // GPA directly (matches commit 7e5bb1a's baseline).
+    var pool: pool_mod.PoolAllocator = undefined;
+    var heap_backing: std.mem.Allocator = undefined;
+    const use_pool = std.mem.eql(u8, allocator_choice, "pool");
+    if (use_pool) {
+        pool = pool_mod.PoolAllocator.init(backing);
+        heap_backing = pool.allocator();
+    } else {
+        heap_backing = init.gpa;
+    }
+    defer if (use_pool) pool.deinit();
 
     // ---- Runner ----
     var runner = try Runner.init(alloc, .{});
@@ -383,7 +425,10 @@ pub fn main(init: std.process.Init) !u8 {
     // ---- Shared interner + heap for non-DB benches ----
     var interner = Interner.init(alloc);
     defer interner.deinit();
-    var heap = makeHeap(alloc);
+    // Heap is what the pool allocator actually backs for the A/B:
+    // the vast majority of allocations under measurement come from
+    // `heap.alloc()`.
+    var heap = makeHeap(heap_backing);
     defer heap.deinit();
 
     const include = struct {
@@ -426,7 +471,7 @@ pub fn main(init: std.process.Init) !u8 {
             const kv = try populateKeysAndVals(alloc, &interner, n);
             defer alloc.free(kv.keys);
             defer alloc.free(kv.vals);
-            var bctx = BuildCtx{ .heap = &heap, .interner = &interner, .n = n, .keys = kv.keys, .vals = kv.vals };
+            var bctx = BuildCtx{ .alloc = heap_backing, .interner = &interner, .n = n, .keys = kv.keys, .vals = kv.vals };
             const np: i64 = @intCast(n);
             try runner.bench("list_cons_n", "collection-construction", np, &bctx, benchListConj);
             try runner.bench("vector_conj_n", "collection-construction", np, &bctx, benchVectorConj);
@@ -442,7 +487,7 @@ pub fn main(init: std.process.Init) !u8 {
             const kv = try populateKeysAndVals(alloc, &interner, n);
             defer alloc.free(kv.keys);
             defer alloc.free(kv.vals);
-            var bctx = BuildCtx{ .heap = &heap, .interner = &interner, .n = n, .keys = kv.keys, .vals = kv.vals };
+            var bctx = BuildCtx{ .alloc = heap_backing, .interner = &interner, .n = n, .keys = kv.keys, .vals = kv.vals };
             const np: i64 = @intCast(n);
             try runner.bench("transient_vector_conjbang_n", "transient-construction", np, &bctx, benchTransientVectorConj);
             try runner.bench("transient_map_assocbang_n", "transient-construction", np, &bctx, benchTransientMapAssoc);
@@ -545,6 +590,7 @@ pub fn main(init: std.process.Init) !u8 {
     // to a file via the standard fs.cwd().createFile path.
 
     {
+        std.debug.print("\n(allocator: {s})\n", .{allocator_choice});
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
         try runner.writeTable(&aw.writer);
@@ -554,13 +600,15 @@ pub fn main(init: std.process.Init) !u8 {
     if (out_path) |p| {
         var jw: std.Io.Writer.Allocating = .init(alloc);
         defer jw.deinit();
+        var note_buf: [256]u8 = undefined;
+        const decorated_note = try std.fmt.bufPrint(&note_buf, "{s} | allocator={s}", .{ note, allocator_choice });
         try runner.writeJson(&jw.writer, .{
             .cpu = builtin_cpu_model_str,
             .os = @tagName(@import("builtin").os.tag),
             .ram = "",
             .zig_version = @import("builtin").zig_version_string,
             .optimize_mode = @tagName(@import("builtin").mode),
-            .note = note,
+            .note = decorated_note,
         });
         var file = try std.Io.Dir.cwd().createFile(io, p, .{});
         defer file.close(io);

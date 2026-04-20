@@ -6,3 +6,8 @@ bin/
 *.dSYM/
 .DS_Store
 notes.txt
+
+# Bench JSON artifacts are per-machine run outputs. Numbers of
+# record live inline in docs/PERF.md; regenerate locally with
+# `zig build bench -- --out bench/baseline.json`.
+bench/*.json
