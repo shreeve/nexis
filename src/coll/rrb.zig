@@ -176,6 +176,18 @@ fn valueFromRoot(h: *HeapHeader) Value {
     };
 }
 
+/// Public reconstruction helper for the transient module (TRANSIENT.md
+/// §8). Builds a persistent-vector user Value from a raw root
+/// `*HeapHeader`. The transient wrapper's `inner_header` is always a
+/// subkind-1 vector root in v1 (no other vector subkind is
+/// user-facing), so no subkind inference is needed.
+pub fn valueFromVectorHeader(h: *HeapHeader) Value {
+    if (std.debug.runtime_safety) {
+        std.debug.assert(h.kind == @intFromEnum(Kind.persistent_vector));
+    }
+    return valueFromRoot(h);
+}
+
 fn rootHeader(v: Value) *HeapHeader {
     std.debug.assert(v.kind() == .persistent_vector);
     std.debug.assert(v.subkind() == subkind_root);

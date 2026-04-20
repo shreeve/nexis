@@ -119,6 +119,16 @@ pub fn build(b: *std.Build) void {
     hamt_mod.addImport("heap", heap_mod);
     hamt_mod.addImport("hash", hash_mod);
 
+    const transient_mod = b.createModule(.{
+        .root_source_file = b.path("src/coll/transient.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    transient_mod.addImport("value", value_mod);
+    transient_mod.addImport("heap", heap_mod);
+    transient_mod.addImport("hamt", hamt_mod);
+    transient_mod.addImport("vector", vector_mod);
+
     const gc_mod = b.createModule(.{
         .root_source_file = b.path("src/gc.zig"),
         .target = target,
@@ -131,6 +141,7 @@ pub fn build(b: *std.Build) void {
     gc_mod.addImport("list", list_mod);
     gc_mod.addImport("vector", vector_mod);
     gc_mod.addImport("hamt", hamt_mod);
+    gc_mod.addImport("transient", transient_mod);
 
     const dispatch_mod = b.createModule(.{
         .root_source_file = b.path("src/dispatch.zig"),
@@ -146,6 +157,7 @@ pub fn build(b: *std.Build) void {
     dispatch_mod.addImport("vector", vector_mod);
     dispatch_mod.addImport("bignum", bignum_mod);
     dispatch_mod.addImport("hamt", hamt_mod);
+    dispatch_mod.addImport("transient", transient_mod);
     // dispatch is a one-way terminal: nothing depends on it. value
     // and eq deliberately stay low-level (panicking on heap kinds)
     // so the module graph remains acyclic and every test-binary
@@ -187,6 +199,7 @@ pub fn build(b: *std.Build) void {
         vector: *std.Build.Module,
         bignum: *std.Build.Module,
         hamt: *std.Build.Module,
+        transient: *std.Build.Module,
         gc: *std.Build.Module,
     };
     const siblings: AllSiblings = .{
@@ -199,6 +212,7 @@ pub fn build(b: *std.Build) void {
         .vector = vector_mod,
         .bignum = bignum_mod,
         .hamt = hamt_mod,
+        .transient = transient_mod,
         .gc = gc_mod,
     };
 
@@ -218,8 +232,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "vector", .path = "src/coll/rrb.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "bignum", .path = "src/bignum.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "hamt", .path = "src/coll/hamt.zig", .imports = &.{ "value", "heap", "hash" } },
-        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "hamt" } },
-        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "hamt" } },
+        .{ .name = "transient", .path = "src/coll/transient.zig", .imports = &.{ "value", "heap", "hamt", "vector" } },
+        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "hamt", "transient" } },
+        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "hamt", "transient" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
@@ -240,6 +255,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "vector")) siblings.vector
                 else if (std.mem.eql(u8, imp_name, "bignum")) siblings.bignum
                 else if (std.mem.eql(u8, imp_name, "hamt")) siblings.hamt
+                else if (std.mem.eql(u8, imp_name, "transient")) siblings.transient
                 else if (std.mem.eql(u8, imp_name, "gc")) siblings.gc
                 else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
@@ -379,6 +395,23 @@ pub fn build(b: *std.Build) void {
     const prop_gc_tests = b.addTest(.{ .root_module = prop_gc_mod });
     const run_prop_gc_tests = b.addRunArtifact(prop_gc_tests);
 
+    const prop_transient_mod = b.createModule(.{
+        .root_source_file = b.path("test/prop/transient.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prop_transient_mod.addImport("value", value_mod);
+    prop_transient_mod.addImport("heap", heap_mod);
+    prop_transient_mod.addImport("hash", hash_mod);
+    prop_transient_mod.addImport("hamt", hamt_mod);
+    prop_transient_mod.addImport("vector", vector_mod);
+    prop_transient_mod.addImport("transient", transient_mod);
+    prop_transient_mod.addImport("dispatch", dispatch_mod);
+    prop_transient_mod.addImport("gc", gc_mod);
+
+    const prop_transient_tests = b.addTest(.{ .root_module = prop_transient_mod });
+    const run_prop_transient_tests = b.addRunArtifact(prop_transient_tests);
+
     // -------------------------------------------------------------------------
     // Golden test runner (src/golden.zig)
     // -------------------------------------------------------------------------
@@ -421,6 +454,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_vector_tests.step);
     test_step.dependOn(&run_prop_hamt_tests.step);
     test_step.dependOn(&run_prop_gc_tests.step);
+    test_step.dependOn(&run_prop_transient_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);
 

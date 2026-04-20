@@ -120,7 +120,7 @@ Payload = `u64` pointer to a heap object with a standard `HeapHeader`
 | 24 | `function` | compiled routine + upvalues | 0 = fn, 1 = closure, 2 = macro-valued var callee |
 | 25 | `var_` | namespace var cell | |
 | 26 | `durable_ref` | emdb identity triple | |
-| 27 | `transient` | mutable wrapper | subkind mirrors the inner collection kind |
+| 27 | `transient` | mutable wrapper | 0 = transient map, 1 = transient set, 2 = transient vector (local enum, pinned in `docs/TRANSIENT.md` §2; peer-AI turn 17 flagged the original "mirrors inner collection kind" phrasing as pulling external kind numbering into the transient namespace) |
 | 28 | `error_` | exception value | |
 | 29 | `meta_symbol` | metadata-bearing symbol wrapper | wraps base-symbol id + meta map (PLAN §8.4) |
 

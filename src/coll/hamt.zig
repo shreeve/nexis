@@ -312,6 +312,22 @@ fn mapHeader(v: Value) *HeapHeader {
     return Heap.asHeapHeader(v);
 }
 
+/// Public reconstruction helper for the transient module (TRANSIENT.md
+/// §8). Given a raw `*HeapHeader` of kind `.persistent_map`, builds a
+/// user-facing Value with the correct subkind inferred from the body
+/// size. Used by transient.zig to round-trip between mutable wrapper
+/// state and persistent ops.
+pub fn valueFromMapHeader(h: *HeapHeader) Value {
+    if (std.debug.runtime_safety) {
+        std.debug.assert(h.kind == @intFromEnum(Kind.persistent_map));
+    }
+    const sk = inferRootSubkind(h);
+    return .{
+        .tag = @as(u64, @intFromEnum(Kind.persistent_map)) | (@as(u64, sk) << 16),
+        .payload = @intFromPtr(h),
+    };
+}
+
 // =============================================================================
 // Key equivalence — keyword-keyed fast path (CHAMP.md §6.5).
 //
@@ -1918,6 +1934,20 @@ fn setHeader(v: Value) *HeapHeader {
     const sk = v.subkind();
     std.debug.assert(sk == subkind_array_map or sk == subkind_champ_root);
     return Heap.asHeapHeader(v);
+}
+
+/// Public reconstruction helper for the transient module (parallel
+/// to `valueFromMapHeader`). Used by transient.zig to round-trip
+/// between mutable wrapper state and persistent set ops.
+pub fn valueFromSetHeader(h: *HeapHeader) Value {
+    if (std.debug.runtime_safety) {
+        std.debug.assert(h.kind == @intFromEnum(Kind.persistent_set));
+    }
+    const sk = inferSetRootSubkind(h);
+    return .{
+        .tag = @as(u64, @intFromEnum(Kind.persistent_set)) | (@as(u64, sk) << 16),
+        .payload = @intFromPtr(h),
+    };
 }
 
 // -----------------------------------------------------------------------------

@@ -44,6 +44,7 @@ const bignum = @import("bignum");
 const list = @import("list");
 const vector = @import("vector");
 const hamt = @import("hamt");
+const transient_mod = @import("transient");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -99,6 +100,7 @@ pub const Collector = struct {
             .persistent_vector => vector.trace(h, self),
             .persistent_map => hamt.traceMap(h, self),
             .persistent_set => hamt.traceSet(h, self),
+            .transient => transient_mod.trace(h, self),
             // Reserved heap kinds without implementations in v1.
             // PANIC, not silent no-op, per GC.md §5 / peer-AI turn 14:
             // a silent no-op on a kind that SHOULD trace would create
@@ -108,7 +110,6 @@ pub const Collector = struct {
             .function,
             .var_,
             .durable_ref,
-            .transient,
             .error_,
             .meta_symbol,
             => std.debug.panic(

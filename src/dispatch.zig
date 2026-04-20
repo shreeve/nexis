@@ -63,6 +63,7 @@ const list = @import("list");
 const vector = @import("vector");
 const bignum = @import("bignum");
 const hamt = @import("hamt");
+const transient = @import("transient");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -154,8 +155,19 @@ pub fn heapHashBase(v: Value) u64 {
         .persistent_vector => vector.hashSeq(h, &hashValue),
         .persistent_map => hamt.hashMap(h, &hashValue),
         .persistent_set => hamt.hashSet(h, &hashValue),
+        // Transients are not hashable per SEMANTICS §3.2 / PLAN §9.4:
+        // "transient — throws `:no-hash-on-transient`". Using a
+        // transient as a map key or set element is a programming error.
+        // Explicit panic arm rather than fast-path fallthrough per
+        // peer-AI turn 17 (equality/hash semantics pinned at
+        // dispatch, not emergent).
+        .transient => std.debug.panic(
+            "dispatch.hashValue: transients are not hashable (SEMANTICS §3.2). " ++
+                "Call persistentBang first, or avoid using transients as map keys / set elements.",
+            .{},
+        ),
         // Future: .byte_vector, .typed_vector, .function, .var_,
-        // .durable_ref, .transient, .error_, .meta_symbol.
+        // .durable_ref, .error_, .meta_symbol.
         else => std.debug.panic(
             "dispatch.heapHashBase: kind {s} not implemented",
             .{@tagName(k)},
@@ -311,6 +323,15 @@ pub fn heapEqual(a: Value, b: Value) bool {
         .persistent_vector => vector.equalSeq(ah, bh, &equal),
         .persistent_map => hamt.equalMap(ah, bh, &hashValue, &equal),
         .persistent_set => hamt.equalSet(ah, bh, &hashValue, &equal),
+        // Transient equality is bit-identity on the wrapper header
+        // (TRANSIENT.md §9, SEMANTICS §2.6). Two transient wrappers
+        // are equal iff they are the same allocation. The top-level
+        // `equal` function's bit-identity fast path (`a.tag == b.tag
+        // and a.payload == b.payload`) already catches this before
+        // reaching here; the arm is documented defensively per
+        // peer-AI turn 17 so transient identity semantics are visible
+        // in the dispatch table rather than a fast-path accident.
+        .transient => ah == bh,
         else => std.debug.panic(
             "dispatch.heapEqual: kind {s} not implemented",
             .{@tagName(k)},
