@@ -511,6 +511,69 @@ pub fn build(b: *std.Build) void {
     const run_prop_db_tests = b.addRunArtifact(prop_db_tests);
 
     // -------------------------------------------------------------------------
+    // Benchmark harness (src/bench.zig) + benchmark runner (bench/main.zig).
+    //
+    // `zig build bench` produces + runs a ReleaseFast binary that
+    // writes a table to stdout and (via --out) baseline JSON.
+    //
+    // The harness file is also compiled as a runtime test binary
+    // so its inline tests (Stats, Runner) run under `zig build test`.
+    // -------------------------------------------------------------------------
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const bench_runner_mod = b.createModule(.{
+        .root_source_file = b.path("bench/main.zig"),
+        .target = target,
+        // Bench runs in ReleaseFast so the numbers are
+        // meaningful. Override with `-Doptimize=Debug` if the
+        // intent is to sanity-check the bench plumbing itself.
+        .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+    });
+    bench_runner_mod.addImport("bench", bench_mod);
+    bench_runner_mod.addImport("value", value_mod);
+    bench_runner_mod.addImport("heap", heap_mod);
+    bench_runner_mod.addImport("intern", intern_mod);
+    bench_runner_mod.addImport("hash", hash_mod);
+    bench_runner_mod.addImport("string", string_mod);
+    bench_runner_mod.addImport("list", list_mod);
+    bench_runner_mod.addImport("vector", vector_mod);
+    bench_runner_mod.addImport("hamt", hamt_mod);
+    bench_runner_mod.addImport("transient", transient_mod);
+    bench_runner_mod.addImport("codec", codec_mod);
+    bench_runner_mod.addImport("dispatch", dispatch_mod);
+    bench_runner_mod.addImport("db", db_mod);
+    bench_runner_mod.addImport("emdb", emdb_mod);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "nexis-bench",
+        .root_module = bench_runner_mod,
+    });
+    const install_bench = b.addInstallArtifact(bench_exe, .{
+        .dest_dir = .{ .override = .{ .custom = ".." } },
+        .dest_sub_path = "bin/nexis-bench",
+    });
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| run_bench.addArgs(args);
+    run_bench.step.dependOn(&install_bench.step);
+
+    const bench_step = b.step("bench", "Run baseline benchmark suite (ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
+
+    const bench_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bench_tests = b.addTest(.{ .root_module = bench_tests_mod });
+    const run_bench_tests = b.addRunArtifact(bench_tests);
+
+    // -------------------------------------------------------------------------
     // Golden test runner (src/golden.zig)
     // -------------------------------------------------------------------------
 
@@ -555,6 +618,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_transient_tests.step);
     test_step.dependOn(&run_prop_codec_tests.step);
     test_step.dependOn(&run_prop_db_tests.step);
+    test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);
 

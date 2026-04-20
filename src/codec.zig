@@ -467,9 +467,11 @@ fn decodeValue(
             if (sign != 0 and sign != 1) return CodecError.MalformedPayload;
             const limb_count_u64 = try readUleb128(bytes, cursor);
             const limb_count: usize = std.math.cast(usize, limb_count_u64) orelse return CodecError.InvalidLeb128;
-            // Read limbs into a temporary buffer.
-            const limbs = try std.testing.allocator.alloc(u64, limb_count);
-            defer std.testing.allocator.free(limbs);
+            // Read limbs into a temporary buffer (uses the Heap's
+            // backing allocator — the Heap is the authoritative
+            // runtime allocator source for this decode).
+            const limbs = try heap.backing.alloc(u64, limb_count);
+            defer heap.backing.free(limbs);
             for (limbs) |*slot| slot.* = try readU64Le(bytes, cursor);
             // Canonicalize via bignum.fromLimbs (CODEC.md §2.6
             // — decode accepts non-canonical and normalizes).
@@ -480,8 +482,8 @@ fn decodeValue(
             const n: usize = std.math.cast(usize, count_u64) orelse return CodecError.InvalidLeb128;
             // Build list right-to-left: read all elements into a
             // scratch array, then fold via `cons` from the tail.
-            const elems = try std.testing.allocator.alloc(Value, n);
-            defer std.testing.allocator.free(elems);
+            const elems = try heap.backing.alloc(Value, n);
+            defer heap.backing.free(elems);
             for (elems) |*slot| {
                 slot.* = try decodeValue(heap, interner, bytes, cursor, elementHash, elementEq);
             }

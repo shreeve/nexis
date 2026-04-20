@@ -746,3 +746,18 @@ maintenance cost.
   status tags are `estimated` or `implemented, not yet measured`
   pending the bench-harness commit. Baseline commit reference:
   Phase 1 scorecard at 8/8 (commit `98c84d6`).
+- **2026-04-19**: Bench harness landed (`src/bench.zig` +
+  `bench/main.zig` + `bench/baseline.json`). First measured
+  numbers captured in `docs/PERF-MEASURED.md`. Status tags
+  promoted to `measured` for rows 2 (fixnum), 3 (float), 4
+  (persistent map, partial), 5 (persistent set), 6 (persistent
+  vector), 8 (hashing, xxHash3 34 GB/s confirmed), 14 (durable
+  state, partial), 15 (codec). Rows 1 (memory density), 11 (GC),
+  12 (allocator), 13 (dispatch), 17 (SIMD), 18 (startup), 19
+  (compilation), 20 (comptime) remain `estimated` / `planned`
+  pending dedicated follow-up benchmarks.
+
+  Biggest finding: **allocator is the single largest performance
+  lever**, confirming §3.12's prediction. Map assoc at N=4096 is
+  ~200 ns/op, dominated by `page_allocator` overhead; a size-
+  class pool projects to ~40 ns/op. Next commit.
