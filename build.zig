@@ -129,6 +129,24 @@ pub fn build(b: *std.Build) void {
     transient_mod.addImport("hamt", hamt_mod);
     transient_mod.addImport("vector", vector_mod);
 
+    const codec_mod = b.createModule(.{
+        .root_source_file = b.path("src/codec.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    codec_mod.addImport("value", value_mod);
+    codec_mod.addImport("heap", heap_mod);
+    codec_mod.addImport("intern", intern_mod);
+    codec_mod.addImport("hash", hash_mod);
+    codec_mod.addImport("string", string_mod);
+    codec_mod.addImport("bignum", bignum_mod);
+    codec_mod.addImport("list", list_mod);
+    codec_mod.addImport("vector", vector_mod);
+    codec_mod.addImport("hamt", hamt_mod);
+    // codec's inline tests import transient to exercise the
+    // UnserializableKind error path for transient Values.
+    codec_mod.addImport("transient", transient_mod);
+
     const gc_mod = b.createModule(.{
         .root_source_file = b.path("src/gc.zig"),
         .target = target,
@@ -194,6 +212,7 @@ pub fn build(b: *std.Build) void {
         value: *std.Build.Module,
         eq: *std.Build.Module,
         heap: *std.Build.Module,
+        intern: *std.Build.Module,
         string: *std.Build.Module,
         list: *std.Build.Module,
         vector: *std.Build.Module,
@@ -201,12 +220,14 @@ pub fn build(b: *std.Build) void {
         hamt: *std.Build.Module,
         transient: *std.Build.Module,
         gc: *std.Build.Module,
+        codec: *std.Build.Module,
     };
     const siblings: AllSiblings = .{
         .hash = hash_mod,
         .value = value_mod,
         .eq = eq_mod,
         .heap = heap_mod,
+        .intern = intern_mod,
         .string = string_mod,
         .list = list_mod,
         .vector = vector_mod,
@@ -214,6 +235,7 @@ pub fn build(b: *std.Build) void {
         .hamt = hamt_mod,
         .transient = transient_mod,
         .gc = gc_mod,
+        .codec = codec_mod,
     };
 
     const RuntimeTest = struct {
@@ -233,6 +255,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bignum", .path = "src/bignum.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "hamt", .path = "src/coll/hamt.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "transient", .path = "src/coll/transient.zig", .imports = &.{ "value", "heap", "hamt", "vector" } },
+        .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "hamt", "transient" } },
         .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "hamt", "transient" } },
         .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "hamt", "transient" } },
     };
@@ -254,9 +277,11 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "list")) siblings.list
                 else if (std.mem.eql(u8, imp_name, "vector")) siblings.vector
                 else if (std.mem.eql(u8, imp_name, "bignum")) siblings.bignum
+                else if (std.mem.eql(u8, imp_name, "intern")) siblings.intern
                 else if (std.mem.eql(u8, imp_name, "hamt")) siblings.hamt
                 else if (std.mem.eql(u8, imp_name, "transient")) siblings.transient
                 else if (std.mem.eql(u8, imp_name, "gc")) siblings.gc
+                else if (std.mem.eql(u8, imp_name, "codec")) siblings.codec
                 else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
         }
@@ -412,6 +437,27 @@ pub fn build(b: *std.Build) void {
     const prop_transient_tests = b.addTest(.{ .root_module = prop_transient_mod });
     const run_prop_transient_tests = b.addRunArtifact(prop_transient_tests);
 
+    const prop_codec_mod = b.createModule(.{
+        .root_source_file = b.path("test/prop/codec.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prop_codec_mod.addImport("value", value_mod);
+    prop_codec_mod.addImport("heap", heap_mod);
+    prop_codec_mod.addImport("hash", hash_mod);
+    prop_codec_mod.addImport("intern", intern_mod);
+    prop_codec_mod.addImport("string", string_mod);
+    prop_codec_mod.addImport("bignum", bignum_mod);
+    prop_codec_mod.addImport("list", list_mod);
+    prop_codec_mod.addImport("vector", vector_mod);
+    prop_codec_mod.addImport("hamt", hamt_mod);
+    prop_codec_mod.addImport("transient", transient_mod);
+    prop_codec_mod.addImport("codec", codec_mod);
+    prop_codec_mod.addImport("dispatch", dispatch_mod);
+
+    const prop_codec_tests = b.addTest(.{ .root_module = prop_codec_mod });
+    const run_prop_codec_tests = b.addRunArtifact(prop_codec_tests);
+
     // -------------------------------------------------------------------------
     // Golden test runner (src/golden.zig)
     // -------------------------------------------------------------------------
@@ -455,6 +501,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_hamt_tests.step);
     test_step.dependOn(&run_prop_gc_tests.step);
     test_step.dependOn(&run_prop_transient_tests.step);
+    test_step.dependOn(&run_prop_codec_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);
 
