@@ -17,6 +17,13 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const update_golden = b.option(bool, "update", "rewrite golden expected files in-place") orelse false;
 
+    // External dependency: emdb (path dep per build.zig.zon).
+    const emdb_dep = b.dependency("emdb", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const emdb_mod = emdb_dep.module("emdb");
+
     // -------------------------------------------------------------------------
     // Parser generation (via the external nexus tool at ../nexus/bin/nexus)
     // -------------------------------------------------------------------------
@@ -161,6 +168,22 @@ pub fn build(b: *std.Build) void {
     gc_mod.addImport("hamt", hamt_mod);
     gc_mod.addImport("transient", transient_mod);
 
+    const db_mod = b.createModule(.{
+        .root_source_file = b.path("src/db.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    db_mod.addImport("value", value_mod);
+    db_mod.addImport("heap", heap_mod);
+    db_mod.addImport("intern", intern_mod);
+    db_mod.addImport("hash", hash_mod);
+    db_mod.addImport("codec", codec_mod);
+    db_mod.addImport("list", list_mod);
+    db_mod.addImport("hamt", hamt_mod);
+    db_mod.addImport("emdb", emdb_mod);
+
+    gc_mod.addImport("db", db_mod);
+
     const dispatch_mod = b.createModule(.{
         .root_source_file = b.path("src/dispatch.zig"),
         .target = target,
@@ -176,6 +199,7 @@ pub fn build(b: *std.Build) void {
     dispatch_mod.addImport("bignum", bignum_mod);
     dispatch_mod.addImport("hamt", hamt_mod);
     dispatch_mod.addImport("transient", transient_mod);
+    dispatch_mod.addImport("db", db_mod);
     // dispatch is a one-way terminal: nothing depends on it. value
     // and eq deliberately stay low-level (panicking on heap kinds)
     // so the module graph remains acyclic and every test-binary
@@ -221,6 +245,8 @@ pub fn build(b: *std.Build) void {
         transient: *std.Build.Module,
         gc: *std.Build.Module,
         codec: *std.Build.Module,
+        db: *std.Build.Module,
+        emdb: *std.Build.Module,
     };
     const siblings: AllSiblings = .{
         .hash = hash_mod,
@@ -236,6 +262,8 @@ pub fn build(b: *std.Build) void {
         .transient = transient_mod,
         .gc = gc_mod,
         .codec = codec_mod,
+        .db = db_mod,
+        .emdb = emdb_mod,
     };
 
     const RuntimeTest = struct {
@@ -256,8 +284,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "hamt", .path = "src/coll/hamt.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "transient", .path = "src/coll/transient.zig", .imports = &.{ "value", "heap", "hamt", "vector" } },
         .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "hamt", "transient" } },
-        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "hamt", "transient" } },
-        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "hamt", "transient" } },
+        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "hamt", "transient", "db" } },
+        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "hamt", "transient", "db" } },
+        .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "hamt", "emdb" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
@@ -282,6 +311,8 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "transient")) siblings.transient
                 else if (std.mem.eql(u8, imp_name, "gc")) siblings.gc
                 else if (std.mem.eql(u8, imp_name, "codec")) siblings.codec
+                else if (std.mem.eql(u8, imp_name, "db")) siblings.db
+                else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb
                 else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
         }
@@ -458,6 +489,27 @@ pub fn build(b: *std.Build) void {
     const prop_codec_tests = b.addTest(.{ .root_module = prop_codec_mod });
     const run_prop_codec_tests = b.addRunArtifact(prop_codec_tests);
 
+    const prop_db_mod = b.createModule(.{
+        .root_source_file = b.path("test/prop/db.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prop_db_mod.addImport("value", value_mod);
+    prop_db_mod.addImport("heap", heap_mod);
+    prop_db_mod.addImport("hash", hash_mod);
+    prop_db_mod.addImport("intern", intern_mod);
+    prop_db_mod.addImport("string", string_mod);
+    prop_db_mod.addImport("bignum", bignum_mod);
+    prop_db_mod.addImport("list", list_mod);
+    prop_db_mod.addImport("vector", vector_mod);
+    prop_db_mod.addImport("hamt", hamt_mod);
+    prop_db_mod.addImport("codec", codec_mod);
+    prop_db_mod.addImport("db", db_mod);
+    prop_db_mod.addImport("dispatch", dispatch_mod);
+
+    const prop_db_tests = b.addTest(.{ .root_module = prop_db_mod });
+    const run_prop_db_tests = b.addRunArtifact(prop_db_tests);
+
     // -------------------------------------------------------------------------
     // Golden test runner (src/golden.zig)
     // -------------------------------------------------------------------------
@@ -502,6 +554,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_gc_tests.step);
     test_step.dependOn(&run_prop_transient_tests.step);
     test_step.dependOn(&run_prop_codec_tests.step);
+    test_step.dependOn(&run_prop_db_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);
 

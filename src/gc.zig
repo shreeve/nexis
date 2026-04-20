@@ -45,6 +45,7 @@ const list = @import("list");
 const vector = @import("vector");
 const hamt = @import("hamt");
 const transient_mod = @import("transient");
+const db_mod = @import("db");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -101,6 +102,11 @@ pub const Collector = struct {
             .persistent_map => hamt.traceMap(h, self),
             .persistent_set => hamt.traceSet(h, self),
             .transient => transient_mod.trace(h, self),
+            // Durable refs have no heap children — store_id,
+            // tree_name, key_bytes are all inline body bytes; the
+            // advisory `conn` pointer is NOT heap-managed (per
+            // DB.md §7.3 / peer-AI turn 23).
+            .durable_ref => db_mod.trace(h, self),
             // Reserved heap kinds without implementations in v1.
             // PANIC, not silent no-op, per GC.md §5 / peer-AI turn 14:
             // a silent no-op on a kind that SHOULD trace would create
@@ -109,7 +115,6 @@ pub const Collector = struct {
             .typed_vector,
             .function,
             .var_,
-            .durable_ref,
             .error_,
             .meta_symbol,
             => std.debug.panic(

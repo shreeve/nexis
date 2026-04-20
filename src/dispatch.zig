@@ -64,6 +64,7 @@ const vector = @import("vector");
 const bignum = @import("bignum");
 const hamt = @import("hamt");
 const transient = @import("transient");
+const db = @import("db");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -155,6 +156,11 @@ pub fn heapHashBase(v: Value) u64 {
         .persistent_vector => vector.hashSeq(h, &hashValue),
         .persistent_map => hamt.hashMap(h, &hashValue),
         .persistent_set => hamt.hashSet(h, &hashValue),
+        // Durable refs hash on the identity triple only
+        // (store_id ++ tree_name ++ key_bytes) per PLAN §15.2 and
+        // SEMANTICS.md §3.2. The advisory `conn` pointer is NOT
+        // part of the hash (DB.md §7.2).
+        .durable_ref => @as(u64, db.hashHeader(h)),
         // Transients are not hashable per SEMANTICS §3.2 / PLAN §9.4:
         // "transient — throws `:no-hash-on-transient`". Using a
         // transient as a map key or set element is a programming error.
@@ -323,6 +329,13 @@ pub fn heapEqual(a: Value, b: Value) bool {
         .persistent_vector => vector.equalSeq(ah, bh, &equal),
         .persistent_map => hamt.equalMap(ah, bh, &hashValue, &equal),
         .persistent_set => hamt.equalSet(ah, bh, &hashValue, &equal),
+        // Durable refs compare on the identity triple only
+        // (store_id ++ tree_name ++ key_bytes) per PLAN §15.2,
+        // SEMANTICS.md §2.6, and DB.md §7.1. The advisory `conn`
+        // pointer is NOT part of equality — two refs to the same
+        // (store, tree, key) from different Connection objects
+        // compare equal.
+        .durable_ref => db.refsEqual(ah, bh),
         // Transient equality is bit-identity on the wrapper header
         // (TRANSIENT.md §9, SEMANTICS §2.6). Two transient wrappers
         // are equal iff they are the same allocation. The top-level
