@@ -165,6 +165,36 @@ method indices, etc.
 `FFFF` = missing operand. Used when an opcode takes fewer than
 three operands to fill unused slots.
 
+#### 4.5 Raw-index / immediate operand convention (peer-AI turn 35)
+
+Several opcodes carry a 12-bit operand whose `index` value is
+**the data itself** rather than an index into a table — for
+example, `call:call`'s `B = argc` and `closure:make`'s `B =
+capture_descriptor_index`. The 64-bit instruction format does
+not have a dedicated "immediate" operand kind, and adding one
+would require amending PLAN §12.2.
+
+**Convention**: for operand positions documented in §10 as
+"immediate" or "raw index", the handler **ignores the
+operand kind bits** and reads only the 12-bit `index`.
+Assemblers MUST encode the kind as `.slot` for canonical
+bytecode. Verifier/strict-mode VMs MAY reject non-`.slot`
+encodings as `:invalid-operand-kind`; lenient VMs treat any
+kind as valid for these operand positions.
+
+This convention applies to:
+- `call:call B=argc` and friends (`call:tailcall`,
+  `call:apply`)
+- `closure:make B=capture_descriptor_index`
+- Any future opcode with documented argc / count / table-
+  index operand semantics
+
+The `imm` operand kind is reserved for a future PLAN
+amendment if the encoding pressure justifies it; until then,
+this convention is the v1 mechanism. The disassembler
+renders these positions as `imm:N` in opcode-aware mode and
+`s:N` in raw mode (matching the assembler's encoding).
+
 ---
 
 ### 5. Routine
@@ -181,23 +211,40 @@ top-level form). Runtime representation is a heap value of kind
 > architectural destination (kind-22 heap Value) is preserved;
 > implementation order puts it behind closures.
 
-**Routine contents** (logical; Zig layout flexible):
+**Routine contents** (logical; Zig layout flexible). Updated
+in turn 35 to split the previously-conflated "upvalue
+descriptors" into two distinct concepts:
 
 - **Code**: array of 64-bit instructions.
 - **Constant pool** (`consts`): array of runtime `Value`s.
+  May include `function-proto` entries — references to
+  child routines that this routine's `closure:make`
+  instructions construct closures for.
 - **Var table** (`vars`): array of pointers to namespace Vars
   the code references.
-- **Upvalue descriptors**: for each upvalue slot in this routine,
-  how to locate the source cell when a closure is created from
-  the enclosing frame.
-- **Entry points** per arity: offset where each supported arity
-  starts executing. Multi-arity `fn*` is macro-lowered to
-  separate `fn*` nodes pre-compiler, but the routine may still
-  carry multiple entry points for variadic dispatch.
+- **Upvalue layout** (peer-AI turn 35): the count and order
+  of upvalue cells the routine's body expects. When a
+  closure carrying this routine is invoked, the callee
+  frame's `upvalues` array has exactly this length, and U
+  operands inside the body index into it. This is metadata
+  ABOUT the routine, not metadata used BY the routine.
+- **Capture-descriptor table** (peer-AI turn 35): a list of
+  capture descriptors used by this routine's `closure:make`
+  instructions to construct CHILD closures. Each
+  `closure:make` references a descriptor by index (operand
+  B). Each descriptor lists the source of every upvalue cell
+  in the child closure being constructed (per §6: each
+  source is `local_cell_slot(s)` or `inherited_upvalue(u)`).
+  This is metadata USED BY the routine to construct other
+  closures.
+- **Entry points** per arity: offset where each supported
+  arity starts executing. Multi-arity `fn*` is macro-lowered
+  to separate `fn*` nodes pre-compiler, but the routine may
+  still carry multiple entry points for variadic dispatch.
 - **Source-span map**: table mapping instruction offsets to
   `SrcSpan` for error reporting + disassembly.
-- **Metadata**: name, doc, `:arglists`, `:line`, etc. — a map
-  attached for tooling.
+- **Metadata**: name, doc, `:arglists`, `:line`, etc. — a
+  map attached for tooling.
 
 **Routine identity**: two routines compiled from the same source
 are NOT required to be `identical?`. Structural equality between
@@ -219,45 +266,340 @@ is empty).
 
 **UpvalCell**:
 - Heap object (counted toward GC).
-- Carries exactly one `Value` slot.
-- Written once at binding time; subsequent mutation depends on
-  future `set!` / `volatile!` semantics (not part of Phase 2).
+- Carries exactly one `Value` slot, plus an `initialized: bool`
+  flag (peer-AI turn 34) so that placeholder cells (used for
+  `letfn*` mutual recursion) can be detected when read before
+  init.
+- Written once at binding time; subsequent rewrite is forbidden
+  in v1 for ordinary lexical locals (PLAN §6.1's `set!` is
+  scoped to dynamic-Var bindings only). Rewrite for mutable
+  cells (`volatile!`, future) is a post-v1 extension.
 - Multiple closures sharing the same upvalue cell observe each
-  other's writes (when writes are permitted).
+  other's writes (when writes are eventually permitted).
+- **CRITICAL** (peer-AI turn 34): **`recur` does NOT mutate
+  captured loop-binding cells**. Each iteration of a captured
+  loop binding gets a **fresh cell**. Otherwise closures
+  created in earlier iterations would observe later iterations'
+  values, which violates Clojure-equivalent immutable lexical
+  binding semantics. See §6 "recur on captured loop bindings"
+  below.
 
-**Closure creation** (`closure:make-closure`):
+#### `closure:make A=prototype_const B=capture_desc C=result_slot`
 
-- Operand A = result slot.
-- Operand B = constant-pool index of the routine.
-- Operand C = upvalue descriptor (interpreted via the routine's
-  upvalue table).
-- Effect: allocate the closure; populate upvalues from the
-  current frame's captured cells; store the closure reference
-  into operand-A slot.
+(Peer-AI turn 34, **descriptor-based** rather than range-style.)
 
-**Closure invocation** (`call:call`, `call:tailcall`,
-`call:apply`):
-- Operand A = closure slot (must be a closure).
-- Operand B = arg list (encoding group-specific).
-- Operand C = result slot (for `call`) or ignored (for
-  `tailcall`).
-- Effect: set up a new frame, pass args into the callee's
-  parameter slots, point `frame.upvalues` at the closure's
-  upvalue array, dispatch into the callee's entry point.
+The compiler statically knows every closure's capture set —
+both the count and the source of each upvalue. This makes
+capture a side-table problem, not a runtime-staging problem.
+Range-style staging (the call-ABI shape from §6 above) would
+force extra `mov:move`s to materialize raw cell pointers
+through slots, conflicting with the U-operand cell-deref
+semantics. Descriptor-based encoding sidesteps that.
 
-**Logical calling convention** (peer-AI turn 30):
-- The callee receives its arguments in its local slot space
-  in the declared parameter order, starting from slot 0.
-- Arity checking (including variadic rest-arg) happens BEFORE
-  control transfers to the callee. A failed arity check raises
-  `:arity-mismatch` from the caller's PC.
-- Caller and callee slots do NOT alias. The caller may
-  continue to hold its own slot values after the callee
-  returns (for `call:call`; `call:tailcall` deliberately
-  overwrites the caller's frame in place).
-- Physical realization of this contract (dedicated arg area
-  vs in-place slot copy vs remap) is an implementation choice
-  under `frame-stack storage strategy` (§7).
+- `A` is a constant-pool index referencing the **child
+  routine prototype** (constant pool kind `function-proto`).
+- `B` is an index into the **current routine's
+  capture-descriptor table**. Each descriptor names the
+  source of every upvalue cell to be captured.
+- `C` (slot) is the destination slot for the new closure.
+
+**Capture descriptor shape** (logical):
+
+```zig
+const CaptureSource = union(enum) {
+    // Read raw cell pointer from current frame's slot.
+    // The slot must already hold an UpvalCell* (boxed via
+    // closure:box-local or closure:new-cell).
+    local_cell_slot: u16,
+    // Copy raw cell pointer from current closure's
+    // upvalues[index]. Used when an outer-enclosing capture
+    // needs to be re-captured by an inner closure.
+    inherited_upvalue: u16,
+};
+
+const CaptureDescriptor = struct {
+    sources: []const CaptureSource,
+};
+```
+
+**Execution**:
+- Allocate a closure heap object of kind `function`
+  (VALUE.md kind 22) with an `[N]UpvalCell*` array, where
+  `N = descriptor.sources.len`.
+- For each `source[i]`:
+  - `local_cell_slot(s)`: read `slot[s]` as `UpvalCell*` and
+    copy the pointer into `closure.upvalues[i]`. Trap as
+    `:expected-cell` if `slot[s]` does not hold an
+    `UpvalCell*`.
+  - `inherited_upvalue(u)`: copy
+    `current_frame.upvalues[u]` into `closure.upvalues[i]`.
+    Trap as `:upvalue-out-of-range` if `u` exceeds the
+    current closure's upvalue count.
+- Store the new closure reference into `slot[C]`.
+
+**Note on raw cell pointers vs cell contents**: this opcode
+copies **raw cell pointers**, NOT cell contents. Multiple
+closures capturing the same source cell share the same
+underlying cell — that's how mutual closures see each
+other's writes (when writes are permitted) and how `letfn*`
+recursive bindings see each other after init.
+
+#### `closure:box-local A=slot _ _`
+
+(Peer-AI turn 34.) Wraps a non-captured local's value into a
+fresh `UpvalCell` so that subsequent `closure:make` operations
+can capture it.
+
+- `A` (slot) currently holds a plain `Value v`.
+- Effect: allocate a fresh `UpvalCell` with `value = v` and
+  `initialized = true`. Replace `slot[A]` contents with the
+  cell pointer.
+
+The compiler emits this at binding time for every local that
+capture analysis identified as captured by an enclosing
+closure. After emission, future reads of the local in the
+defining frame must use `closure:get-cell` (or any opcode
+through which a U-operand resolves to cell contents).
+
+**Errors**:
+- `:invalid-cell-state` if `slot[A]` already holds an
+  `UpvalCell*` (double-box). Indicates compiler bug; trap
+  rather than no-op so corruption surfaces.
+
+#### `closure:new-cell A=dst_slot _ _`
+
+(Peer-AI turn 34, required for `letfn*`.) Allocates an
+**uninitialized** `UpvalCell` and stores the cell pointer in
+`slot[A]`. Used to create placeholder cells for mutually
+recursive closures so that closures referring to each other
+can be constructed before either has its final value.
+
+- `A` (slot) is the destination for the new cell pointer.
+- Effect: allocate `UpvalCell{ value: undefined, initialized:
+  false }`. Store the pointer in `slot[A]`.
+
+#### `closure:init-cell A=cell_slot B=value_operand _`
+
+(Peer-AI turn 34.) Initializes an uninitialized cell with a
+value. Used to fill in `letfn*` placeholder cells once their
+final closure values exist.
+
+- `A` (slot) holds an `UpvalCell*` whose `initialized = false`.
+- `B` is any operand kind that `resolve()` accepts.
+- Effect: write `resolve(B)` into the cell's value slot;
+  flip `initialized = true`.
+
+**Errors**:
+- `:expected-cell` if `slot[A]` does not hold an
+  `UpvalCell*`.
+- `:invalid-cell-state` if the cell is already initialized.
+
+#### `closure:get-cell A=dst_slot B=cell_slot _`
+
+(Peer-AI turn 34, required for reading boxed locals in the
+defining frame.) Reads the contents of an `UpvalCell` whose
+pointer is in a frame slot. Necessary because slot operands
+default to "the value in the slot" — they do NOT auto-deref
+cells, since the same slot might also be used to hold an
+already-stored `UpvalCell*` for descriptor-based capture.
+
+- `A` (slot) is the destination.
+- `B` (slot) holds an `UpvalCell*`.
+- Effect: dereference the cell; write its value into
+  `slot[A]`.
+
+**Errors**:
+- `:expected-cell` if `slot[B]` does not hold an
+  `UpvalCell*`.
+- `:uninitialized-cell` if the cell has `initialized =
+  false`.
+
+#### Reading captured upvalues from inside a closure body
+
+Inside a closure body, captured upvalues are accessed via the
+**U operand kind** (PLAN §12.2). `resolve(u:N)` returns
+`current_frame.upvalues[N].value` — i.e., it deref's the cell.
+
+This means **no dedicated `closure:read-upval` opcode is
+needed**. Existing opcodes work directly:
+
+```
+mov:move  s0, u:0          ; s0 := upvalue 0's cell contents
+math:add  s0, u:0, c:1     ; s0 := upvalue 0's value + 1
+```
+
+**Important distinction** (peer-AI turn 34): `U` is a
+**cell-contents** operand, NOT a raw-cell operand. Closure
+construction needs **raw cell pointers** and goes through the
+descriptor mechanism (`local_cell_slot` /
+`inherited_upvalue`) on `closure:make`. Do NOT conflate the
+two — making `U` raw-pointer-on-some-paths and value-on-other-
+paths is a semantic footgun.
+
+**Writes to captured upvalues** are forbidden in v1 for
+ordinary lexical locals (`set!` is scoped to `^:dynamic` Vars
+per PLAN §6.1). The U-kind store path is reserved but not
+implemented in v1; `store(u:N, ...)` returns
+`:unsupported-write`. When dynamic-binding rebinding (Phase 3)
+or mutable cells (post-v1) land, the reserved path becomes
+implemented.
+
+#### `recur` on captured loop bindings (CRITICAL)
+
+(Peer-AI turn 34, semantic correctness.) When a `loop*`
+binding is captured by a closure within the loop body, naive
+implementation would mutate the captured cell on each
+iteration. **This is wrong.**
+
+```clojure
+(loop [i 0 acc []]
+  (if (< i 3)
+    (recur (+ i 1) (conj acc (fn [] i)))
+    acc))
+;; Expected: closures capture 0, 1, 2 — NOT 3, 3, 3.
+```
+
+If `recur` mutated a single shared cell for `i`, the closures
+created in earlier iterations would all observe the final
+value `3`. This violates immutable lexical binding semantics.
+
+**Correct lowering** for `recur` of captured loop bindings:
+the recur-prelude allocates a **fresh cell** per iteration,
+not mutates the existing one. Sketch:
+
+```
+; compute new value into a temp slot
+math:add        s_new_i, s_i_value, c1   ; new_i := i + 1
+; old slot[s_i_cell] held the previous iteration's cell
+; create a fresh cell holding the new value
+mov:move        s_tmp, s_new_i            ; stage value
+closure:box-local s_tmp                    ; s_tmp := fresh cell
+mov:move        s_i_cell, s_tmp            ; install new cell
+jump:jmp        L_loop
+```
+
+For NON-captured loop bindings (the common case), `recur`
+remains the simple `mov:move + jump:jmp` lowering from
+COMPILER.md §5.6 — no cell allocation, no opcode-overhead per
+iteration.
+
+The analyzer is responsible for detecting which loop
+bindings are captured (capture-analysis output) and emitting
+the appropriate `recur` lowering: cell-fresh-per-iteration
+for captured, slot-rewrite for non-captured.
+
+**`recur` does NOT use the U-store path.** That path remains
+reserved for the future dynamic-binding-rebinding /
+mutable-cell features.
+
+**Closure invocation — range-call ABI** (peer-AI turn 32,
+modeled on Lua 5.x `CALL A B C`):
+
+The compiler stages the closure plus its arguments in a
+**contiguous call block** in the caller's slot space, then
+emits a single `call:call` / `call:tailcall` / `call:apply`
+referencing the block's base slot. This eliminates the
+arg-list encoding problem (the 64-bit instruction has only
+three 16-bit operands; arbitrary arg lists do not fit) and
+enables a one-instruction call fast path.
+
+#### `call:call A=call_base B=argc C=result_slot`
+
+- `A` (slot) is the **call_base**: the slot containing the
+  closure.
+- `B` is the **argument count** (encoded as an immediate-style
+  index — `B.kind` is `.slot` purely for encoding uniformity;
+  the index value IS the argc, not a slot index).
+- `C` (slot) is the **result slot**.
+
+**Preconditions**:
+- `slot[A]` is a closure (kind `function`, VALUE.md kind 22).
+- `slot[A + 1 + i]` is argument `i`, for `i ∈ [0, argc)`.
+- The block `[A .. A + argc]` is fully populated by the
+  caller before this instruction executes.
+
+**Semantics**:
+- Validate `slot[A]` is callable; otherwise raise
+  `:not-callable`.
+- Validate `argc` against the closure's routine metadata;
+  otherwise raise `:arity-mismatch`.
+- Construct a callee frame whose slot 0 is sourced from
+  caller `slot[A + 1]`, slot 1 from `slot[A + 2]`, and so on
+  through `slot[A + argc]`.
+- Point `callee.upvalues` at the closure's upvalue array.
+- Dispatch into the callee's entry point.
+- On callee `return v`: write `v` to caller `slot[C]` and
+  resume caller at the next instruction.
+
+**Compiler invariant — call-clobbered region**: caller values
+that must be live across the call **must reside in slots
+strictly below `A`**. Slots at and above `A` are
+call-clobbered, because the callee's frame may window into
+the backing stack starting at `A + 1` and extend through
+`callee.routine.slot_count`. Storage strategies that do NOT
+window (e.g., per-frame independent slot arrays) still
+treat the region as clobbered, to preserve a single rule
+the compiler can rely on.
+
+#### `call:tailcall A=call_base B=argc C=ignored`
+
+- Operands A, B as for `call:call`. C is unused (encoded as
+  `.unused` sentinel).
+
+**Preconditions** identical to `call:call`.
+
+**Semantics**:
+- Validate as for `call:call`.
+- **Replace the current frame in place** with the callee
+  frame: the callee's slot 0 receives `slot[A + 1]`, slot 1
+  receives `slot[A + 2]`, etc., **copied/slid down** into
+  `slot[0 .. argc)` of the (now-callee) frame, then
+  `routine` and `pc` switch to the callee.
+- The slide MAY require parallel-assignment semantics when
+  the source range overlaps the destination; the v1
+  implementation uses a small temporary buffer for `argc <=
+  16`, falling back to a heap-allocated temp for larger
+  arities. Compiler-emitted `recur` (which has the same
+  parallel-assignment requirement) uses the same machinery.
+
+**Why the slide is mandatory**: a tailcall MUST keep
+backing-stack usage bounded across mutual tail-recursion
+chains. If the implementation merely advanced `frame_base`
+by `A + 1` on each tailcall, mutual recursion would leak
+backing-stack memory upward without growing logical frame
+depth — incorrect. The slide-into-place behavior preserves
+the constant-space guarantee that PLAN §11.3 promises for
+`recur` and that this opcode promises for general
+tail-position calls.
+
+(`recur` itself does NOT execute `call:tailcall` — see VM.md
+§11. `recur` is a `mov:move` + `jump:jmp` lowering with no
+call-op or arity revalidation. `call:tailcall` is for
+explicit user-level tail-position calls to a different
+function, when those become a Phase 3+ feature; the v1
+compiler may emit `call:tailcall` at the codegen's
+discretion when an opcode-emitted call is in tail position.)
+
+#### `call:apply A=call_base B=argc C=result_slot`
+
+Same encoding as `call:call`, but the LAST argument
+(`slot[A + argc]`) is treated as a **sequence to splat** into
+the callee's parameter positions starting at index `argc - 1`.
+Used for `(apply f x y rest)`. Phase 3+ feature; deferred
+beyond Phase 2 step #5. The opcode encoding is reserved here
+for forward compatibility.
+
+**Variadic rest-arg construction**:
+- The closure's routine metadata carries `fixed_arity` and
+  `is_variadic` flags.
+- For variadic closures: when an incoming call delivers
+  `argc > fixed_arity` arguments, the call/prologue
+  machinery (NOT the caller's bytecode) constructs a list
+  from `incoming_args[fixed_arity .. argc)` and writes it to
+  callee `slot[fixed_arity]`. When `argc == fixed_arity`,
+  the empty list is written to that slot.
+- Range-call makes this clean because the overflow args are
+  already contiguous in the source range — no gather step.
 
 ---
 
@@ -282,13 +624,31 @@ A **frame** represents one invocation of a routine.
   allocated).
 - Destroyed on `call:return`.
 
-**Storage strategy** (intentionally flexible per peer-AI turn 28):
+**Storage strategy** (peer-AI turn 28 + turn 32 refinement):
 - v1 may use a contiguous growable stack, a slab chain, or
-  segmented frames. The spec requires only that:
+  segmented frames. The spec requires:
   - Frames are accessible by the VM in O(1).
   - Arbitrary depth is supported (bounded only by memory).
   - Stack overflow produces a recoverable error
     (`:stack-overflow`), not a crash.
+  - The frame model **MUST support the §6 range-call ABI**:
+    arg materialization in caller's slot block at `[A+1 ..
+    A+argc]` followed by callee construction whose slot 0
+    aliases or copies-from caller `slot[A+1]`. Per-frame
+    independent slot arrays (the current `src/vm.zig`
+    skeleton) are correct but copy on every call; a backing
+    value-stack with frame-base pointers (em-style) avoids
+    the copy on non-tail calls. v1 may ship either; the
+    semantic contract is identical.
+
+**Implementation note for the current skeleton** (peer-AI
+turn 32): the existing `src/vm.zig` `Frame` carries `slots:
+[]Value` owned per-frame. This is fine for the single-frame
+runtime and for step #2 (math:add for `(+ 1 2)` with no
+calls). When step #5 (functions + closures) lands, the
+frame model evolves to a backing value-stack + frame-base
+pointers so that `call:call` can window without copying.
+The visible interface in this spec is unchanged either way.
 
 ---
 
@@ -357,8 +717,12 @@ Future (precise liveness):
 ### 10. Opcode groups (v1)
 
 Per PLAN §12.3. Each group ships with its semantic contract
-documented here; exact variant-level specs live next to the
-implementation per group.
+documented here. Variant numbers and semantic contracts are
+authoritative in this document for every variant **reserved
+in Phase 2** (peer-AI turn 35: implementation comments may
+repeat them but are not authoritative). Variants reserved
+beyond Phase 2 are listed but their semantic contract
+crystallizes when their phase arrives.
 
 | # | Group | Phase | Notes |
 |---|---|---|---|
@@ -367,7 +731,7 @@ implementation per group.
 | 2 | `math` | 2 | Integer + float arithmetic. Fixnum fast path + bignum promotion. |
 | 3 | `mov` | 2 | Data movement, load-const, load-true/false/nil, load-keyword/symbol (via I operands). |
 | 4 | `call` | 2 | Function invocation (`call`, `tailcall`, `invoke-var`, `apply`, `return`). |
-| 5 | `closure` | 2 | Closure creation + upvalue access. |
+| 5 | `closure` | 2 | Closure creation + upvalue cell management. v1 variants: `make` (descriptor-based, §6), `box-local`, `new-cell`, `init-cell`, `get-cell`. Upvalue **reads** go through the U operand kind on existing opcodes (no dedicated `read-upval`). Upvalue **writes** are reserved (Phase 3+). See §6. |
 | 6 | `var` | 2 | Var load / store / dynamic binding. |
 | 7 | `coll` | 2 | Collection primitives (map/vector/set/list). Delegates to `src/coll/*.zig`. |
 | 8 | `transient` | 2 | Transient lifecycle (`transient!` / `persistent!` / `*!`). Delegates to `src/coll/transient.zig`. |
@@ -380,6 +744,65 @@ implementation per group.
 Groups 2, 4, 5, 6, 7, 8, 9, 11, 12 are the Phase 2 critical
 path. Groups 10 and 13 are reserved but not implemented in
 Phase 2.
+
+#### 10.1 `mov` group variants
+
+| Var | Name | Status | Operands | Semantics |
+|---|---|---|---|---|
+| 0 | `mov:move` | step #1 | A=slot, B=any-resolvable, _ | `slot[A] := resolve(B)` |
+| 1 | `mov:load-const` | step #1 | A=slot, B=constant, _ | `slot[A] := consts[B.index]` |
+| 2 | `mov:load-nil` | step #1 | A=slot, _, _ | `slot[A] := nil` |
+| 3 | `mov:load-true` | step #1 | A=slot, _, _ | `slot[A] := true` |
+| 4 | `mov:load-false` | step #1 | A=slot, _, _ | `slot[A] := false` |
+| 5 | `mov:load-keyword` | reserved | A=slot, B=intern, _ | `slot[A] := intern.lookup(B.index)` (keyword) |
+| 6 | `mov:load-symbol` | reserved | A=slot, B=intern, _ | `slot[A] := intern.lookup(B.index)` (symbol) |
+
+#### 10.2 `call` group variants
+
+| Var | Name | Status | Operands | Semantics |
+|---|---|---|---|---|
+| 0 | `call:call` | reserved (step #5) | A=call_base, B=argc-imm, C=result_slot | Range-call ABI per §6 |
+| 1 | `call:tailcall` | reserved (step #5/6) | A=call_base, B=argc-imm, C=ignored | Tail-call slide-into-place per §6 |
+| 2 | `call:return` | step #1 | A=slot, _, _ | `result := slot[A]; halt or return to caller` |
+| 3 | `call:return-nil` | step #1 | _, _, _ | `result := nil; halt or return to caller` |
+| 4 | `call:apply` | reserved (Phase 3+) | A=call_base, B=argc-imm, C=result_slot | Last arg splatted; per §6 |
+| 5 | `call:invoke-var` | reserved | A=var-imm, B=call_base, C=result_slot | Direct Var-call fast path; descriptor TBD |
+
+#### 10.3 `math` group variants
+
+| Var | Name | Status | Operands | Semantics |
+|---|---|---|---|---|
+| 0 | `math:add` | step #2 | A=slot, B=any, C=any | `slot[A] := resolve(B) + resolve(C)`. v1: fixnum+fixnum only. Errors: `:integer-overflow`, `:kind-mismatch` |
+| 1 | `math:sub` | reserved | A=slot, B=any, C=any | subtraction |
+| 2 | `math:mul` | reserved | A=slot, B=any, C=any | multiplication |
+| 3 | `math:div` | reserved | A=slot, B=any, C=any | division (true) |
+| 4 | `math:idiv` | reserved | A=slot, B=any, C=any | integer division |
+| 5 | `math:mod` | reserved | A=slot, B=any, C=any | modulo |
+| 6 | `math:pow` | reserved | A=slot, B=any, C=any | exponentiation |
+| 7 | `math:neg` | reserved | A=slot, B=any, _ | unary negation |
+| 8 | `math:abs` | reserved | A=slot, B=any, _ | absolute value |
+
+#### 10.4 `closure` group variants
+
+| Var | Name | Status | Operands | Semantics |
+|---|---|---|---|---|
+| 0 | `closure:make` | reserved (step #5) | A=prototype-const, B=cap_desc-imm, C=slot | Descriptor-based closure construction per §6 |
+| 1 | `closure:box-local` | reserved (step #5) | A=slot, _, _ | Wrap `slot[A]`'s value in a fresh `UpvalCell{initialized=true}` |
+| 2 | `closure:new-cell` | reserved (step #5) | A=slot, _, _ | Allocate uninitialized `UpvalCell{initialized=false}`; store ptr in `slot[A]` |
+| 3 | `closure:init-cell` | reserved (step #5) | A=cell_slot, B=any, _ | Fill an uninitialized cell with `resolve(B)`; flip `initialized=true` |
+| 4 | `closure:get-cell` | reserved (step #5) | A=slot, B=cell_slot, _ | `slot[A] := *(slot[B] as *UpvalCell)` |
+
+#### 10.5 `jump` group variants
+
+| Var | Name | Status | Operands | Semantics |
+|---|---|---|---|---|
+| 0 | `jump:jmp` | reserved (step #3) | A=jump-target, _, _ | `pc := A.index` |
+| 1 | `jump:if-true` | reserved (step #3) | A=jump-target, B=any, _ | `if truthy(resolve(B)) then pc := A.index` |
+| 2 | `jump:if-false` | reserved (step #3) | A=jump-target, B=any, _ | `if falsy(resolve(B)) then pc := A.index` (per PLAN §6.2: only nil and false are falsy) |
+
+(Variant tables for `cmp`, `var`, `coll`, `transient`, `hash`,
+`ctrl`, `io` populate when their respective steps land. The
+implementation Zig enums use these variant numbers verbatim.)
 
 ---
 
@@ -397,25 +820,45 @@ WITHOUT growing the call stack.
 - `recur`'s arity MUST match the target's binding count.
 - Errors: `:recur-outside-tail`, `:recur-arity-mismatch`.
 
-**Codegen lowering** (per `COMPILER.md` §5.6):
+**Codegen lowering** (per `COMPILER.md` §5.6, amended in
+turn 35 to spell out the captured-binding case):
 - Evaluate each `arg` into a temporary slot.
-- Emit `mov:move` to copy temporaries into the target's binding
-  slots.
+- Move temporaries into the target's binding slots using
+  **parallel-assignment semantics** (a naive sequential move
+  corrupts arguments when the target slots alias an earlier
+  source — same hazard as `call:tailcall`'s arg slide).
+- For NON-captured loop bindings: the move is a plain
+  `mov:move` per binding.
+- For CAPTURED loop bindings: each iteration allocates a
+  **fresh `UpvalCell`** holding the new value and installs
+  the cell pointer into the binding's slot. The shared cell
+  is NOT mutated — that would break Clojure-equivalent
+  immutable lexical binding semantics. See COMPILER.md §5.6
+  for the full lowering and §6 above for the canonical
+  `(loop [i 0 acc []] ...)` hazard.
 - Emit `jump:jmp` to the target's entry label.
 - **No `call` opcode is emitted**.
 
 **VM runtime**:
 - `jump:jmp` is a plain PC update + tail-call-to-dispatch.
-- No frame allocation, no stack growth, no GC safepoint
-  mandatory (a GC may still safepoint voluntarily, but `recur`
-  does not force one).
+- No frame allocation, no logical stack growth, no GC
+  safepoint mandatory (a GC may still safepoint voluntarily,
+  but `recur` does not force one).
 
-**Guarantee**: a `recur`-driven loop runs in **constant** stack
-space and **constant** heap space per iteration (apart from
-allocations the body itself performs).
+**Guarantee** (peer-AI turn 35 amendment to remove a
+contradiction with §6):
+- **Constant stack space** is guaranteed unconditionally.
+- **Constant heap space per iteration** is guaranteed for
+  non-captured loop bindings only. For captured loop
+  bindings, fresh-cell-per-iteration allocations are
+  semantically required (per §6) and represent O(1) per
+  captured binding per iteration — bounded, not zero.
+  Allocations the body itself performs are user-observable
+  and not part of this guarantee either way.
 
 **Tested by Phase 2 gate #2** (`COMPILER.md` §9.4): a 10k-
-iteration `recur` loop maintains constant stack high-water mark.
+iteration `recur` loop maintains constant stack high-water
+mark. Heap behavior is body-dependent and tested separately.
 
 ---
 
@@ -485,9 +928,28 @@ keyword; renames are breaking changes.
 | `:transient-frozen` | `transient_mod.*Bang` op on a finalized transient | Recoverable |
 | `:invalid-operand-kind` | Operand's kind byte is incompatible with opcode context (e.g., `resolve` on an `.unused` operand, `store` to a constant operand) | Handler bug; distinct from index-OOB and from corrupted encoding |
 | `:bytecode-corruption` | Unrecognized opcode group / variant / operand-kind bit pattern | Programming error; halts VM |
+| `:call-block-out-of-range` | `call:call` / `call:tailcall` references a `call_base` slot such that `slot[A + argc]` exceeds the frame's slot count | Programming error; indicates compiler bug — call block was not allocated within the routine's `slot_count` |
+| `:upvalue-out-of-range` | `U` operand index exceeds the current closure's upvalue count, OR `closure:make` descriptor's `inherited_upvalue` source exceeds it | Programming error; halts VM |
+| `:expected-cell` | An opcode that requires an `UpvalCell*` (e.g., `closure:get-cell`, `closure:init-cell`, `closure:make`'s `local_cell_slot` source) found a different value kind in the slot | Programming error; halts VM |
+| `:invalid-cell-state` | `closure:box-local` on an already-boxed slot (double-box), or `closure:init-cell` on an already-initialized cell | Programming error; halts VM |
+| `:uninitialized-cell` | `closure:get-cell` (or U-operand resolve) on a cell with `initialized = false` — placeholder not yet filled | Recoverable in principle but typically a compiler-emitted-out-of-order bug |
+| `:unsupported-write` | `store(u:N, ...)` attempted in v1 (writes to captured upvalues are reserved for Phase 3+ dynamic-binding rebinding) | Recoverable; user code shouldn't see this in v1 unless attempting a future feature |
+| `:integer-overflow` | Fixnum arithmetic overflowed i48 range AND bignum promotion is not yet wired for the offending opcode. Temporary trap (peer-AI turn 35) until bignum-arithmetic Scope B lands; remains useful afterward for bounded-integer ops, byte conversions, FFI, and unchecked-math variants | Recoverable |
 
 All errors are structured `Value`s (map with `:kind`, `:msg`,
 `:span` keys minimally) so user code can pattern-match.
+
+**Staged-implementation traps** (peer-AI turn 35): early
+Phase 2 commits also surface internal Zig errors that aren't
+in this user-facing taxonomy yet — `OperandOutOfRange`,
+`BytecodeExhausted`, `UnimplementedOpcode`, and the Halt
+control-flow signal. These are NOT stable user-facing error
+kinds; they exist to help debugging the in-progress VM and
+are mapped into the structured `Value` runtime-error layer
+when the latter lands (likely with the `ctrl:throw` /
+try-handler implementation). Phase 2 gate tests treat these
+internal errors as "VM rejected the bytecode" without
+asserting a specific kind keyword.
 
 ---
 
@@ -534,8 +996,19 @@ Three layers, paralleling `COMPILER.md` §9:
   divide-by-zero.
 - `coll` group: map get/assoc, vector conj/nth, set
   contains/conj, list first/rest, cross-kind errors.
-- `closure` group: creation, upvalue read/write, nested
-  closures, shared-upvalue mutation visibility.
+- `closure` group (peer-AI turn 35 amendment to match v1
+  semantics): `closure:make` (descriptor sources from
+  `local_cell_slot` and `inherited_upvalue`), `closure:box-local`
+  + double-box trap, `closure:get-cell` + `:expected-cell` /
+  `:uninitialized-cell` traps, `closure:new-cell` /
+  `closure:init-cell` placeholder lifecycle, nested closures,
+  `letfn*` mutual recursion via placeholder cells, named `fn*`
+  self-reference via single placeholder cell, captured loop
+  bindings get fresh cells per iteration (the canonical
+  `(loop [i 0 acc []] ...)` test from §6 — closures capture
+  0/1/2, not 3/3/3), `store(u:N, ...)` returns
+  `:unsupported-write` (not "shared-upvalue mutation
+  visibility" — writes are reserved for Phase 3+).
 - `call` group: `call` vs `tailcall` (frame reuse verified),
   `apply`, variadic arity.
 - `ctrl` group: try/catch/throw with various match patterns,
@@ -609,3 +1082,87 @@ Per peer-AI turn 28:
 - **2026-04-19** (spec commit): Initial draft. All contracts
   `proposed`. No implementation yet. Peer-AI turn 28 decisions
   embedded.
+- **2026-05-15** (§6 / §10 / §13 amendment): **Closure group
+  opcode set pinned** (peer-AI turn 34). The previous
+  one-line `closure:make-closure A=result B=routine_const
+  C=upvalue_descriptor` was underspecified in three
+  load-bearing ways:
+  (1) **My initial proposal** to mirror the call-ABI's
+  range-style for closure construction was wrong — it
+  missed the routine prototype operand (a closure is
+  `(routine, upvalues[])`, not just upvalues), forced extra
+  bytecode to materialize raw cell pointers through slots,
+  and conflicted with U-operand cell-deref semantics.
+  Replaced with a **descriptor-based** encoding:
+  `closure:make A=prototype_const B=capture_desc
+  C=result_slot`, with descriptor entries naming each
+  upvalue source as either `local_cell_slot` (raw cell
+  pointer in current frame) or `inherited_upvalue` (raw
+  cell pointer from current closure's upvalue array).
+  (2) **`letfn*` mutual recursion** required placeholder
+  cells that exist before either closure is constructed.
+  Added `closure:new-cell` and `closure:init-cell` opcodes
+  with an `initialized` flag on `UpvalCell`. The v1 v1
+  closure-group surface is now: `make`, `box-local`,
+  `new-cell`, `init-cell`, `get-cell` (5 variants).
+  (3) **`recur` on captured loop bindings** requires
+  fresh cell allocation per iteration, NOT mutation of the
+  shared cell. Pinned in §6 with the canonical example
+  `(loop [i 0 acc []] (if (< i 3) (recur (+ i 1) (conj
+  acc (fn [] i))) acc))` — closures must capture 0/1/2,
+  not 3/3/3. Cell-mutation lowering for captured `recur`
+  would have silently broken Clojure-equivalent immutable
+  lexical binding semantics; the spec now requires the
+  analyzer to emit cell-fresh-per-iteration for captured
+  bindings and slot-rewrite for non-captured.
+  (4) The U operand kind is **cell-contents-on-resolve**,
+  NOT raw-cell-pointer. Capture construction goes through
+  descriptors; reads inside closure bodies use U directly
+  on existing opcodes (no dedicated `closure:read-upval`).
+  U-store path reserved (`:unsupported-write`) until Phase
+  3+ dynamic-binding rebinding.
+
+  Five new error kinds added to §13:
+  `:upvalue-out-of-range`, `:expected-cell`,
+  `:invalid-cell-state`, `:uninitialized-cell`,
+  `:unsupported-write`. None are user-language-level
+  errors — all indicate compiler bugs or v1-feature gaps;
+  they trap to surface corruption rather than silently
+  proceed.
+
+  Surfaced by a hand-trace of `(defn make-adder [x] (fn
+  [y] (+ x y)))` which exercised closure capture for the
+  first time end-to-end. Peer-AI turn 34 review caught
+  three load-bearing bugs in the initial proposal before
+  any code was written.
+
+- **2026-05-15** (§6 / §7 / §13 amendment): **Range-call ABI
+  pinned** (peer-AI turn 32). The previous "encoding
+  group-specific" handwave for `call:call` operand B was
+  replaced with a concrete Lua-5.x-style range-call ABI:
+  `A` = call_base slot containing the closure, `slot[A+1..]`
+  = arguments, `B` = argc, `C` = result slot. `call:tailcall`
+  pinned to slide-into-place semantics (NOT base-slide,
+  which would leak backing stack across mutual tail
+  recursion). `call:apply` reserved for Phase 3+. Variadic
+  rest-list construction pinned to call/prologue machinery,
+  not caller bytecode. Frame storage strategy refined to
+  require backing-stack-with-frame-base evolution when
+  step #5 (functions + closures) lands; current per-frame
+  owned-slot model in `src/vm.zig` is fine for the single-
+  frame skeleton and for step #2 (math:add). New error kind
+  `:call-block-out-of-range` added to §13.
+
+  Surfaced by a hand-trace of `(defn fact [n] (loop [n n
+  acc 1] (if (< n 2) acc (recur (- n 1) (* n acc)))))`
+  which exposed that the existing spec had no syntactic
+  room to encode arg lists in the 64-bit instruction. Peer-
+  AI turn 32 review explicitly compared against Lua 5.x,
+  Dalvik invoke/range, descriptor-based calls, Wasm/CPython
+  stack-machine, and BEAM argument registers; range-call
+  selected for one-instruction fast path + clean tail-call
+  semantics + minimal new ISA surface. Compiler is permitted
+  to ship early codegen with `mov:move` prelude staging
+  (Option-1-like behavior); later allocator work targets
+  arg-evaluation results directly into the call block to
+  eliminate the moves. The ISA does not change either way.

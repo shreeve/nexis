@@ -213,10 +213,30 @@ implementation choices, NOT part of the spec.
   - Shadow rules: inner bindings shadow outer; symbols bound in
     a destructuring pattern shadow enclosing scope within the
     binding's body but not the binding expression itself.
-  - `let*` / `loop*` bindings are sequential — each subsequent
-    binding sees the earlier ones.
-  - Duplicate bindings within a single `let*` / `loop*` /
-    parameter list raise `:duplicate-binding`.
+  - `let*` / `loop*` bindings are sequential with **strict
+    left-of-self visibility** (peer-AI turn 32 hand-trace):
+    binding-i's RHS sees bindings `1..i-1` but does **NOT** see
+    binding-i's own LHS. Binding-i's LHS shadows from
+    binding-i+1 onward and throughout the body. Concrete:
+    `(let* [n n] body)` reads the outer `n` for the RHS, then
+    binds the loop/let `n` for use in subsequent bindings and
+    `body`. `(let* [x e1 x e2] body)` is well-formed: `e2` sees
+    the first `x` binding; the first `x` is shadowed by the
+    second from `body` onward (NOT a `:duplicate-binding` —
+    duplicate binding only fires across positions in a single
+    parameter list, where there's no sequential semantics).
+  - `fn*` self-name (the optional `name?` in
+    `(fn* name? [params...] body...)`) binds as a **lexical
+    local** in scope across the function body, bound to the
+    closure value itself (peer-AI turn 32 hand-trace). This
+    makes recursive self-calls work without requiring a `def`
+    to have completed and without paying for Var indirection on
+    the recursive path. Resolution priority for the self-name
+    inside the body follows rule #2 (lexical local) ahead of
+    rules #4–#7. Equivalent to Clojure's `(fn name [...] ...)`
+    semantics.
+  - Duplicate bindings within a single parameter list (`fn*`
+    params, `catch` binding) raise `:duplicate-binding`.
   - `recur` in resolver is a special-form marker; tail-position
     validation happens in analyzer.
 
@@ -252,6 +272,18 @@ implementation choices, NOT part of the spec.
     generated temporary gets a slot number. Slots are reused
     across disjoint lifetimes (classic register allocator
     pattern; liveness-based).
+  - **Capture-cell slot liveness** (peer-AI turn 35): a slot
+    holding an `UpvalCell*` (boxed local, or a placeholder
+    cell allocated for `letfn*` / named `fn*` self-reference)
+    is an ordinary live value for slot-allocation purposes.
+    If the cell is needed after a function call (per the
+    range-call ABI's call-clobbered region in `VM.md §6`) or
+    by a later `closure:make` descriptor's `local_cell_slot`
+    source, its slot MUST NOT be placed in the call-clobbered
+    region at or above any `call_base`. Concrete hazard:
+    `(let* [x 1, f (g), h (fn [] x)] h)` — if `x`'s cell slot
+    is allocated inside the call block for `(g)`, the
+    subsequent `closure:make` for `h` reads garbage.
   - Literal lifting: every literal that does not fit as an
     inline immediate (small fixnum, nil, true, false) is lifted
     into the routine's constant pool. Fully-static collection
@@ -379,12 +411,50 @@ entirely — no dead code emitted.
 
 #### 5.5 `(fn* name? [params...] body...)`
 
+(Peer-AI turn 35 holistic-review amendment: previous wording
+referenced the obsolete `closure:make-closure` opcode name and
+under-specified the named-fn self-reference lowering.)
+
 - Create a new routine for this `fn*`. Compile it recursively.
-- Emit `closure:make-closure` with a reference to the compiled
-  routine and the enclosing frame's captured-cell addresses for
-  each upvalue.
-- The result is a closure value (VALUE.md kind 22) carrying
-  the routine + upvalue cells.
+  The routine is registered in the **current** routine's
+  constant pool as a `function-proto` entry; its constant-pool
+  index becomes operand A of the eventual `closure:make`.
+- Capture analysis on the body identifies which enclosing-frame
+  locals the body references. For each, build a capture
+  descriptor entry: `local_cell_slot(s)` if the captured
+  binding is a local of the immediate enclosing frame,
+  `inherited_upvalue(u)` if it's a capture inherited from an
+  outer closure currently being compiled. Register the
+  descriptor in the current routine's capture-descriptor
+  table; its index becomes operand B.
+- Emit `closure:make A=proto_const B=cap_desc C=result_slot`
+  per `VM.md §6`. The result is a closure value (VALUE.md
+  kind 22).
+
+**Named `fn*` self-name** (peer-AI turn 35; the §4.3 amendment
+pinned the resolver semantics; this pins the lowering):
+
+A named `fn*` whose body refers to itself recursively requires
+a placeholder cell exactly like single-binding `letfn*`,
+because at `closure:make` time the closure value does not yet
+exist:
+
+```
+; for (fn* fact [n] ... (fact (- n 1)))
+closure:new-cell  s_self_cell
+; the routine for fact is compiled with one upvalue:
+;   capture descriptor [local_cell_slot s_self_cell]
+;   so inside the body, fact resolves to u:0 → cell deref
+closure:make      proto(fact-body), cap_desc, s_closure
+closure:init-cell s_self_cell, s_closure
+; s_closure now holds the fully-formed closure;
+; s_self_cell's cell now holds the closure value;
+; recursive calls inside fact's body see fact via u:0
+```
+
+If the body never references the self-name, the placeholder
+cell can be elided and `closure:make` emitted with an empty
+capture descriptor (zero sources).
 
 - Multi-arity `(fn* ([[a] ...] [[a b] ...]))` is **macro-
   lowered** before reaching the compiler; `fn*` takes a single
@@ -392,12 +462,116 @@ entirely — no dead code emitted.
 
 #### 5.6 `(recur args...)`
 
+(Peer-AI turn 35 holistic-review amendment: previous wording
+described only the non-captured case, contradicting the
+captured-loop-binding rule that `VM.md §6` now pins.)
+
+**Common skeleton** (both captured and non-captured cases):
 - Lower each `arg` into a temporary slot.
-- Emit `mov:move` instructions to copy the temporaries into the
-  target's binding slots.
+- Move temporaries into the target's binding slots using
+  **parallel-assignment semantics** (peer-AI turn 35: a naive
+  sequential move corrupts arguments when the target slots
+  alias an earlier source — e.g., `(loop* [a b, b a] (recur b
+  a))`). Implementation MAY use a small temporary buffer (the
+  same machinery `call:tailcall` uses for its arg slide per
+  `VM.md §6`).
 - Emit `jump:jmp` to the target's entry label.
-- **Invariant**: no `call` opcode is emitted. Constant-space
+- **Invariant**: no `call` opcode is emitted. Constant-stack
   guaranteed per PLAN §11.3.
+
+**For non-captured loop bindings** (the common case):
+- The slot move is the entire rebind.
+- No heap allocation per iteration.
+
+**For captured loop bindings** (peer-AI turn 35, semantically
+mandatory): the analyzer MUST emit cell-fresh-per-iteration,
+NOT cell mutation. The canonical hazard is:
+
+```clojure
+(loop [i 0 acc []]
+  (if (< i 3)
+    (recur (+ i 1) (conj acc (fn [] i)))
+    acc))
+;; Closures must capture 0, 1, 2 — NOT 3, 3, 3.
+```
+
+If `recur` mutated a single shared `UpvalCell` for `i`,
+closures created in earlier iterations would observe the
+final value. That breaks Clojure-equivalent immutable
+lexical binding semantics.
+
+Lowering for a captured loop binding's recur step:
+
+```
+; compute new value into a temp slot
+math:add        s_new_value, ...
+; allocate a fresh initialized cell holding the new value
+mov:move        s_tmp, s_new_value
+closure:box-local s_tmp                ; s_tmp := fresh cell
+mov:move        s_binding_slot, s_tmp  ; install fresh cell
+                                       ;   into binding slot
+jump:jmp        L_loop
+```
+
+The fresh cell is heap-allocated; this iteration cost is
+**semantically required** (not optional), and the
+constant-heap-per-iteration guarantee from earlier wording
+applies only to non-captured bindings. See `VM.md §11`
+amendment for the runtime-side phrasing.
+
+`recur` does NOT use the U-store path (`store(u:N, ...)` is
+reserved for Phase 3+ dynamic-binding rebinding per `VM.md
+§6`). The fresh-cell pattern above is the only correct
+mechanism in v1.
+
+#### 5.6b `(letfn* [name1 (fn* ...) name2 (fn* ...) ...] body...)`
+
+(Peer-AI turn 35 holistic-review amendment: `letfn*` is in
+PLAN §6.1's primitive-core list but was missing from
+COMPILER.md's lowering rules. This section closes the gap.)
+
+`letfn*` establishes mutually-recursive function bindings.
+Unlike `let*`, all bindings on the LHS are visible to ALL
+RHSs (and to the body), enabling functions to refer to each
+other.
+
+**Lowering** (mirrors `VM.md §6` `closure:new-cell` /
+`closure:init-cell` discipline):
+
+1. **Allocate placeholder cells**: for each binding `name_i`,
+   emit `closure:new-cell s_name_i_cell`. After this phase,
+   each name's slot holds an uninitialized `UpvalCell*`.
+2. **Compile each `(fn* ...)` body**: each function's
+   capture descriptor lists ALL `letfn*` names it references
+   (including itself), each as a `local_cell_slot(s_name_j_cell)`
+   source in the current frame.
+3. **Construct each closure**: for each binding, emit
+   `closure:make proto_i, cap_desc_i, s_closure_i`. At this
+   point each closure exists, capturing the cells that other
+   closures will fill in.
+4. **Initialize the cells**: emit `closure:init-cell
+   s_name_i_cell, s_closure_i` for each binding. After this
+   phase, each cell holds its final closure value, and all
+   the closures observe each other through their captured cells.
+5. **Lower body** as `do`. Body references to `name_i`
+   resolve to the cells via the same capture machinery.
+
+**Resolution invariant** (per §4.3 + this lowering): all
+`letfn*` names are visible to ALL RHSs. The classic Clojure
+example `(letfn [(even? [n] (if (zero? n) true (odd? (dec n))))
+(odd? [n] (if (zero? n) false (even? (dec n))))] (even? 10))`
+relies on this.
+
+**Slot allocation**: the placeholder cell slots must remain
+live across the `closure:make` calls (per §4.4 capture-cell
+liveness rule) AND across the `closure:init-cell` calls. The
+analyzer treats them as standard live-across-call values.
+
+**Errors**: a `letfn*` body that calls a `name` BEFORE the
+corresponding `init-cell` runs would surface
+`:uninitialized-cell` at runtime. The compiler's lowering
+sequence above (allocate-all → make-all → init-all) rules
+this out for ordinary `letfn*` use.
 
 #### 5.7 `(loop* [b1 v1 b2 v2 ...] body...)`
 
@@ -444,23 +618,51 @@ entirely — no dead code emitted.
 
 ### 6. Closure and upvalue contract
 
-Captured-only boxing (peer-AI turn 28 Q2):
+Captured-only boxing (peer-AI turn 28 Q2; descriptor-based
+construction + cell access opcodes per turn 34; reads/writes
+wording corrected per turn 35).
 
 - A local is **captured** iff any nested `fn*` body references
   it. Captured classification is computed by the analyzer.
 - **Non-captured locals**: plain frame slots. Read / write via
   SCVU slot operands. Zero per-op overhead.
 - **Captured locals**: at the binding point, the compiler emits
-  an allocation for an `UpvalCell` heap object (VM.md §6) and
-  initializes the cell with the bound value. The local's slot
-  in the frame holds the cell pointer, not the direct value.
-  Reads / writes dereference the cell.
-- **Closure creation**: `closure:make-closure` takes a routine
-  reference + an array of `UpvalCell` pointers sourced from
-  the enclosing frame's captured-binding slots.
-- **Closure invocation**: the callee's frame is prepared with an
-  upvalue pointer array copied from the closure; U# operands
-  resolve via the callee frame's upvalue array.
+  `closure:box-local` to wrap the bound value in a fresh
+  `UpvalCell` (VM.md §6). The local's slot thereafter holds
+  the **cell pointer**, not the direct value.
+  - **Reads in the defining frame** use `closure:get-cell
+    A=dst_slot B=cell_slot` to dereference and copy the
+    cell's contents into a value slot. Plain slot operands
+    do NOT auto-deref cells (peer-AI turn 34: making them do
+    so would conflate cell-pointer storage with cell-content
+    storage and break descriptor-based capture).
+  - **Reads inside a child closure body** use the U operand
+    kind on existing opcodes — e.g., `mov:move s0, u:0`,
+    `math:add s0, u:0, c:1`. `resolve(u:N)` dereferences the
+    cell automatically.
+  - **Writes are forbidden in v1** for ordinary captured
+    locals. PLAN §6.1 scopes `set!` to dynamic-Var rebinding,
+    not lexical-local mutation. The U-store path is reserved
+    (`store(u:N, ...)` returns `:unsupported-write`); the
+    only mechanism by which a captured loop-binding cell
+    "changes" across iterations is the fresh-cell-per-
+    iteration pattern documented in §5.6 — which allocates a
+    NEW cell rather than mutating the existing one.
+- **Closure creation** uses `closure:make A=prototype_const
+  B=capture_desc C=result_slot` (VM.md §6, descriptor-based).
+  Sources in the descriptor name each upvalue cell as either
+  `local_cell_slot(s)` (raw cell pointer in current frame's
+  slot `s`) or `inherited_upvalue(u)` (raw cell pointer from
+  current closure's `upvalues[u]`).
+- **Mutually-recursive closures (`letfn*`, named `fn*`
+  self-reference)**: use `closure:new-cell` to allocate
+  uninitialized placeholder cells, construct each closure
+  capturing those cells, then `closure:init-cell` to fill in
+  each placeholder with its final closure value. See §5.5
+  (named `fn*` self-name) and §5.x (`letfn*`).
+- **Closure invocation**: the callee's frame is prepared with
+  an upvalue pointer array copied from the closure; U#
+  operands resolve via the callee frame's upvalue array.
 
 **Invariants**:
 - `UpvalCell` is a **heap object**, traced by the GC like any
@@ -588,6 +790,18 @@ Commit sequence (rough, not binding):
    enough to lower `(+ 1 2)` with a single hard-wired `+`
    primitive. This flushes out VM interface issues before the
    VM grows further.
+   - **Bootstrap exception note** (peer-AI turn 35): the
+     tiny compiler may emit `math:add c0, c1` for `(+ 1 2)`
+     even though §4.4's minimal constant-folding rule would
+     fold the same source form to the literal `3`. The
+     purpose of step #2 is to exercise the VM/compiler
+     bytecode interface end-to-end, not to demonstrate the
+     analyzer's folding (which doesn't exist until
+     resolver/analyzer commits land). When the real
+     analyzer arrives, `(+ 1 2)` folds at compile time and
+     `math:add` is no longer emitted for it; tests that
+     pinned bytecode shape against the bootstrap compiler
+     are expected to be rewritten then.
 
 3. **Conditionals**. Add `jump:*` opcodes + `if` lowering.
 
@@ -660,3 +874,19 @@ from code contact:
 - **2026-04-19** (spec commit): Initial draft. All contracts
   `proposed`. No implementation yet. Peer-AI turn 28 decisions
   embedded.
+- **2026-05-15** (§4.3 amendment): Two clarifications surfaced
+  by a hand-trace of `(defn fact [n] (loop [n n acc 1] (if
+  (< n 2) acc (recur (- n 1) (* n acc)))))` through the full
+  pipeline before any compiler code was written.
+  (1) `let*` / `loop*` binding sequentiality tightened to
+  spell out left-of-self visibility — binding-i's RHS sees
+  bindings `1..i-1` but NOT binding-i's own LHS. The `[n n]`
+  pattern depends on this; tracing exposed that the prior
+  one-line statement was ambiguous.
+  (2) `fn*` self-name binding pinned as a lexical local
+  carrying the closure value itself (Clojure semantics).
+  Without this, `(fn* fact [n] ... (fact ...))` patterns
+  would have been forced through Var indirection or required
+  `def` to have completed first. Both amendments are
+  no-implementation-cost; they pin behavior the implementation
+  was going to need anyway.
