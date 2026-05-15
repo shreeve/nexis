@@ -1,40 +1,52 @@
-//! vm.zig — Phase 2 VM kernel (first implementation commit).
+//! vm.zig — Phase 2 VM kernel.
 //!
 //! Authoritative spec: `docs/VM.md`. Adapted from `../em/src/{bytecode,
 //! runtime}.zig` per the user's latitude to lift + modify em freely.
 //!
-//! **This commit lands the skeleton only.** Coverage here:
+//! **Currently implemented** (COMPILER.md §10 steps #1–#2):
 //!
 //!   - 64-bit instruction encoding + operand packing (VM.md §3, §4).
-//!   - `Routine` (compiled code + constants; plain Zig struct, not a
-//!     heap Value yet — heap-kind promotion lands with closures).
-//!   - `Frame` (slots + pc + routine pointer); single-frame runtime
-//!     for this commit. Multi-frame comes with the `call` opcode
-//!     in a subsequent commit.
-//!   - `VM` with two-level-switch dispatch (per em; tail-call-threaded
-//!     upgrade is deferred).
-//!   - 5 opcodes: `mov:load-const`, `mov:move`, `mov:load-nil`,
-//!     `mov:load-true`, `mov:load-false`, `call:return`.
-//!   - Hand-assembled bytecode tests.
+//!   - `Routine` (compiled code + constants; plain Zig struct,
+//!     not a heap Value yet — heap-kind promotion lands with
+//!     closures per VM.md §5 staged-realization note).
+//!   - `Frame` (slots + pc + routine pointer); single-frame runtime.
+//!     Multi-frame comes with `call:call` / `call:tailcall` per
+//!     the range-call ABI in VM.md §6.
+//!   - `VM` with two-level-switch dispatch. Tail-call-threaded
+//!     upgrade is deferred per VM.md §8 staged-realization note.
+//!   - 6 opcodes wired across 3 groups:
+//!       mov: load-const, move, load-nil, load-true, load-false
+//!       call: return, return-nil
+//!       math: add (fixnum+fixnum, traps overflow as IntegerOverflow,
+//!             traps non-fixnum as KindMismatch)
+//!   - Hand-assembled bytecode tests. The `src/compile.zig` tiny
+//!     compiler lowers `(+ 1 2)`-style forms directly to math:add
+//!     bytecode and the `Tiny` form representation.
 //!
-//! What this commit does NOT do:
+//! What's NOT here yet (deferred per COMPILER.md §10):
 //!
-//!   - No compiler. Bytecode is hand-assembled in tests.
-//!   - No `call:call` / `call:tailcall`. Only `call:return` (which
-//!     halts the VM with the top-of-frame result slot).
-//!   - No closures, no upvalues. Routines run directly; no wrapping.
-//!   - No `coll:*`, no `math:*`, no `jump:*`. Those land as
-//!     discrete commits per COMPILER.md §10.
-//!   - No GC integration yet. Frames + routines use caller-supplied
-//!     allocator directly.
+//!   - `call:call` / `call:tailcall` — step #5 (range-call ABI per
+//!     VM.md §6 amendment). Requires the multi-frame backing-stack
+//!     evolution noted in VM.md §7.
+//!   - `closure:*` group (`make`, `box-local`, `new-cell`,
+//!     `init-cell`, `get-cell`) — step #5.
+//!   - `jump:*` group + `if` lowering — step #3.
+//!   - `cmp:*` group — step #3.
+//!   - `var:*` group + `def` lowering — step #7.
+//!   - `coll:*` / `transient:*` / `hash:*` groups — Phase 2 mid-late.
+//!   - `ctrl:*` (try/catch/throw) — step #9.
+//!   - `tx:*` group — Phase 4.
+//!   - `simd:*` group — Phase 6.
+//!   - GC root enumeration from frames — lands when the multi-frame
+//!     stack does.
 //!
-//! Implementation sequence recap (COMPILER.md §10):
-//!   1. VM kernel (this commit) ← we are here
-//!   2. Tiny compiler for (+ 1 2) with math:add
-//!   3. Conditionals (jump:*, if lowering)
+//! Implementation sequence (COMPILER.md §10):
+//!   1. VM kernel skeleton (mov, call:return)            ✓ done
+//!   2. Tiny compiler for (+ 1 2) + math:add             ✓ done
+//!   3. Conditionals (jump:*, if lowering)               ← next
 //!   4. Locals + let*
-//!   5. Functions + closures
-//!   6. recur + loop*
+//!   5. Functions + closures (range-call ABI + closure:*)
+//!   6. recur + loop* (with captured-binding fresh cells per VM.md §6)
 //!   7. Vars + def
 //!   8. Macroexpand + syntax-quote + #%anon-fn
 //!   9. try/catch/throw
@@ -149,6 +161,26 @@ pub const Call = enum(u6) {
     _,
 };
 
+/// Variants for the `math` group. Per PLAN §12.3 / VM.md §10.
+/// Step #2 (COMPILER.md §10 #2) wires `add` only — the absolute
+/// minimum needed to lower `(+ 1 2)` end-to-end. The remaining
+/// variants are listed here so dispatch can distinguish
+/// "known opcode, not yet wired" (UnimplementedOpcode) from
+/// "unrecognized bit pattern" (BytecodeCorruption) per the
+/// turn-31 split (peer-AI turn 33 confirmation).
+pub const Math = enum(u6) {
+    add = 0,
+    sub = 1,
+    mul = 2,
+    div = 3,
+    idiv = 4,
+    mod = 5,
+    pow = 6,
+    neg = 7,
+    abs = 8,
+    _,
+};
+
 /// Packed 64-bit instruction. Field order matches PLAN §12.1:
 /// [kind:4][group:6][variant:6][opA:16][opB:16][opC:16].
 pub const Inst = packed struct(u64) {
@@ -222,9 +254,10 @@ pub const Frame = struct {
 
 pub const VmError = error{
     /// Known opcode / group / variant / operand kind that this VM
-    /// commit hasn't wired yet (e.g., math:add before the math
-    /// commit; upvalue operand before closures land). Distinct
-    /// from corruption — the encoding IS a recognized shape.
+    /// commit hasn't wired yet (e.g., upvalue operand before
+    /// closures land, cross-type math operands before promotion).
+    /// Distinct from corruption — the encoding IS a recognized
+    /// shape.
     UnimplementedOpcode,
     /// Operand index out of range for the operand's kind (e.g.,
     /// constant index >= routine.consts.len, slot index >=
@@ -248,6 +281,23 @@ pub const VmError = error{
     /// bytecode corruption or bytecode from a newer nexis VM
     /// that this VM doesn't understand.
     BytecodeCorruption,
+    /// `math:*` (or other kind-sensitive op) received an operand
+    /// whose kind the current implementation doesn't support
+    /// (e.g., float when fixnum-only is wired). Mirrors the
+    /// `:kind-mismatch` user-visible error kind from VM.md §13;
+    /// reusing the existing taxonomy avoids a parallel
+    /// "type-error" category drifting in (peer-AI turn 33).
+    /// Step #2 wires fixnum+fixnum for math:add; floats /
+    /// bignums / cross-type all surface this. Subsequent commits
+    /// widen the supported set; the ultimate behavior (per PLAN
+    /// §6.3) is fixnum→bignum promotion on overflow and an
+    /// arithmetic exception on non-numeric operands.
+    KindMismatch,
+    /// fixnum + fixnum overflowed i48. The eventual behavior is
+    /// promotion to bignum (PLAN §6.3 + §8.3); until bignum
+    /// arithmetic Scope B lands, this surfaces as a hard error
+    /// so we don't silently lose precision.
+    IntegerOverflow,
 };
 
 // =============================================================================
@@ -306,20 +356,34 @@ pub const VM = struct {
         };
     }
 
-    /// Write a `Value` into a slot operand. Only `.slot` is a valid
-    /// destination in this commit; other kinds would be writes to
-    /// constants/vars/etc., handled by dedicated opcodes later.
+    /// Write a `Value` into a destination operand.
+    ///
+    /// Only `.slot` is a valid destination for the generic store
+    /// path. Other kinds split into two categories per VM.md §13
+    /// (peer-AI turn 35 alignment with the published taxonomy):
+    ///
+    ///   - `.upvalue`: future-valid destination (Phase 3+ dynamic-
+    ///     binding rebinding will write through cells via the U
+    ///     store path). Returns `UnimplementedOpcode` for now.
+    ///   - `.constant`, `.intern`, `.jump`, `.durable`: read-only
+    ///     operand kinds; writing to them is invalid in this
+    ///     opcode context, NOT "not yet wired." Surface
+    ///     `InvalidOperandKind` per VM.md §13's `:invalid-operand-
+    ///     kind` row.
+    ///   - `.var_`: var writes go through `var:store-var` (a
+    ///     dedicated opcode), not the generic store path. Generic
+    ///     store with a `.var_` destination is a handler bug.
+    ///     Surface `InvalidOperandKind`.
+    ///   - `.unused`: invalid in any context with a destination
+    ///     operand.
     fn store(self: *VM, op: Operand, v: Value) VmError!void {
         switch (op.kind) {
             .slot => {
                 if (op.index >= self.frame.slots.len) return VmError.OperandOutOfRange;
                 self.frame.slots[op.index] = v;
             },
-            // Other kinds are reserved for specific opcode groups
-            // (constant pool is read-only; var writes go through
-            // `var:store-var`; upvalue writes through `closure:`).
-            .constant, .var_, .upvalue, .intern, .jump, .durable => return VmError.UnimplementedOpcode,
-            .unused => return VmError.InvalidOperandKind,
+            .upvalue => return VmError.UnimplementedOpcode,
+            .constant, .var_, .intern, .jump, .durable, .unused => return VmError.InvalidOperandKind,
             _ => return VmError.BytecodeCorruption,
         }
     }
@@ -352,8 +416,9 @@ pub const VM = struct {
         switch (g) {
             .mov => try self.execMov(inst),
             .call => try self.execCall(inst),
+            .math => try self.execMath(inst),
             // Known but not yet implemented in this commit.
-            .jump, .cmp, .math, .closure, .var_, .coll, .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
+            .jump, .cmp, .closure, .var_, .coll, .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
             // Unrecognized group byte — bytecode corruption.
             _ => return VmError.BytecodeCorruption,
         }
@@ -410,7 +475,65 @@ pub const VM = struct {
             _ => return VmError.UnimplementedOpcode,
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Group `math` (VM.md §10 #3 — PLAN §12.3 group 2)
+    //
+    // Step #2 (COMPILER.md §10 #2): wires `math:add` for fixnum+fixnum
+    // only. Floats, bignums, and cross-type promotion are deferred to
+    // subsequent commits.
+    // -------------------------------------------------------------------------
+
+    fn execMath(self: *VM, inst: Inst) VmError!void {
+        const variant: Math = @enumFromInt(inst.variant);
+        switch (variant) {
+            .add => {
+                // math:add a b c   ;  slot[a] = resolve(b) + resolve(c)
+                // Resolve BOTH source operands BEFORE storing so that
+                // dst/src aliasing (e.g., math:add s0, s0, c0) is
+                // correct (peer-AI turn 33).
+                const lhs = try self.resolve(inst.b);
+                const rhs = try self.resolve(inst.c);
+                const sum = try addNumbers(lhs, rhs);
+                try self.store(inst.a, sum);
+            },
+            // Known but not yet implemented in this commit.
+            .sub, .mul, .div, .idiv, .mod, .pow, .neg, .abs => return VmError.UnimplementedOpcode,
+            _ => return VmError.BytecodeCorruption,
+        }
+    }
 };
+
+/// Numeric addition for the math:add opcode. Step #2 supports
+/// only fixnum+fixnum; widening lands in subsequent commits.
+///
+/// Future-target factoring (peer-AI turn 33): when math:sub and
+/// friends land, this and its siblings extract into a `src/numeric.zig`
+/// module that both vm.zig and dispatch.zig can call. Avoiding a
+/// vm→dispatch dependency now keeps the import graph clean and
+/// matches the "low-level semantics shared by VM + dispatch" target
+/// shape.
+///
+/// Returns:
+///   - `IntegerOverflow` if the i64-extended sum exceeds the i48
+///     fixnum range. Bignum promotion (PLAN §6.3) is the eventual
+///     behavior; until bignum arithmetic Scope B lands, the trap
+///     is preferable to silent precision loss.
+///   - `KindMismatch` if either operand is not a fixnum (in v1
+///     this includes float — float + fixnum support arrives with
+///     the float-arithmetic commit). Reuses VM.md §13's existing
+///     `:kind-mismatch` taxonomy rather than introducing a parallel
+///     `:type-error` category.
+fn addNumbers(lhs: value_mod.Value, rhs: value_mod.Value) VmError!value_mod.Value {
+    if (!lhs.isFixnum() or !rhs.isFixnum()) return VmError.KindMismatch;
+    const a = lhs.asFixnum();
+    const b = rhs.asFixnum();
+    // i64 add never overflows from i48-range operands (max sum is
+    // 2 * (2^47 - 1) which fits comfortably in i64). The fixnum
+    // range check below catches the i48-overflow case.
+    const sum = a + b;
+    return value_mod.fromFixnum(sum) orelse VmError.IntegerOverflow;
+}
 
 // =============================================================================
 // Convenience helpers for hand-assembling bytecode in tests.
@@ -500,6 +623,19 @@ pub const asm_ = struct {
             Operand.none,
             Operand.none,
             Operand.none,
+        );
+    }
+
+    /// math:add a b c   ;  slot[a] = resolve(b) + resolve(c)
+    /// `b` and `c` may be any kind that `resolve` accepts (slot
+    /// or constant in this commit).
+    pub fn mathAdd(slot_dst: u12, lhs: Operand, rhs: Operand) Inst {
+        return Inst.primary(
+            .math,
+            Math.add,
+            Operand.slot(slot_dst),
+            lhs,
+            rhs,
         );
     }
 };
@@ -645,16 +781,17 @@ test "VM: exhausting bytecode without return surfaces BytecodeExhausted" {
 }
 
 test "VM: known-but-not-implemented group returns UnimplementedOpcode" {
-    // math group (2) with variant 0 — known group, not wired yet.
-    const math_add = Inst.primary(
-        .math,
+    // jump group (0) with variant 0 — known group, not wired yet.
+    // (math was the placeholder before; math:add landed in step #2.)
+    const jump_jmp = Inst.primary(
+        .jump,
         @as(Mov, @enumFromInt(0)), // reusing Mov tag for a placeholder; we only care about group
         Operand.slot(0),
         Operand.slot(0),
         Operand.slot(0),
     );
     var code = [_]Inst{
-        math_add,
+        jump_jmp,
         asm_.returnNil(),
     };
     const routine = makeRoutine(&code, &.{}, 1, "unimpl");
@@ -706,6 +843,235 @@ test "VM: resolve on .unused operand returns InvalidOperandKind" {
     defer vm.deinit();
     const res = vm.run();
     try testing.expectError(VmError.InvalidOperandKind, res);
+}
+
+test "VM math:add: constant + constant = fixnum sum" {
+    // The exact bytecode the tiny step-#2 compiler emits for `(+ 1 2)`:
+    //   math:add  s0, c0, c1     ; s0 = 1 + 2
+    //   call:return s0
+    const consts = [_]Value{
+        value_mod.fromFixnum(1).?,
+        value_mod.fromFixnum(2).?,
+    };
+    var code = [_]Inst{
+        asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "(+ 1 2)");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.kind() == .fixnum);
+    try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+test "VM math:add: slot + slot through prelude staging" {
+    // Demonstrates the path the eventual real compiler takes
+    // when args have non-trivial sub-expressions: load each into
+    // a slot first, then add.
+    const consts = [_]Value{
+        value_mod.fromFixnum(10).?,
+        value_mod.fromFixnum(32).?,
+    };
+    var code = [_]Inst{
+        asm_.loadConst(0, 0),
+        asm_.loadConst(1, 1),
+        asm_.mathAdd(2, Operand.slot(0), Operand.slot(1)),
+        asm_.returnSlot(2),
+    };
+    const routine = makeRoutine(&code, &consts, 3, "(+ 10 32)");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "VM math:add: negative + negative" {
+    const consts = [_]Value{
+        value_mod.fromFixnum(-7).?,
+        value_mod.fromFixnum(-5).?,
+    };
+    var code = [_]Inst{
+        asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "(+ -7 -5)");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, -12), result.asFixnum());
+}
+
+test "VM math:add: i48-range sum wraps to IntegerOverflow" {
+    // fixnum_max + 1 overflows i48 and (until bignum Scope B
+    // lands) traps as IntegerOverflow rather than silently
+    // wrapping or losing precision.
+    const consts = [_]Value{
+        value_mod.fromFixnum(value_mod.fixnum_max).?,
+        value_mod.fromFixnum(1).?,
+    };
+    var code = [_]Inst{
+        asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "(+ fixnum_max 1)");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.IntegerOverflow, res);
+}
+
+test "VM math:add: non-fixnum operand surfaces KindMismatch" {
+    // float + fixnum is supported eventually (cross-type
+    // promotion); for step #2 we surface VM.md §13's existing
+    // `:kind-mismatch` rather than introducing a parallel
+    // taxonomy (peer-AI turn 33).
+    const consts = [_]Value{
+        value_mod.fromFloat(1.5),
+        value_mod.fromFixnum(2).?,
+    };
+    var code = [_]Inst{
+        asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "(+ 1.5 2)");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.KindMismatch, res);
+}
+
+test "VM math:add: i48-range underflow traps as IntegerOverflow" {
+    // The negative-side mirror of the positive overflow test
+    // above (peer-AI turn 33: positive-only coverage missed
+    // half the implementation).
+    const consts = [_]Value{
+        value_mod.fromFixnum(value_mod.fixnum_min).?,
+        value_mod.fromFixnum(-1).?,
+    };
+    var code = [_]Inst{
+        asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "(+ fixnum_min -1)");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.IntegerOverflow, res);
+}
+
+test "VM math:add: dst/src aliasing is well-defined (math:add s0, s0, c0)" {
+    // The handler must resolve BOTH source operands BEFORE
+    // writing the destination. Otherwise an aliased dst+lhs
+    // (or dst+rhs) would silently produce wrong results once
+    // future codegen reuses slots (peer-AI turn 33).
+    const consts = [_]Value{
+        value_mod.fromFixnum(1).?,
+        value_mod.fromFixnum(40).?,
+    };
+    var code = [_]Inst{
+        asm_.loadConst(0, 0), //                      s0 = 1
+        asm_.mathAdd(0, Operand.slot(0), Operand.constant(1)), // s0 = s0 + 40
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "alias-lhs");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 41), result.asFixnum());
+}
+
+test "VM math:add: dst/rhs aliasing (math:add s0, c0, s0)" {
+    const consts = [_]Value{
+        value_mod.fromFixnum(40).?,
+        value_mod.fromFixnum(1).?,
+    };
+    var code = [_]Inst{
+        asm_.loadConst(0, 1), //                      s0 = 1
+        asm_.mathAdd(0, Operand.constant(0), Operand.slot(0)), // s0 = 40 + s0
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "alias-rhs");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 41), result.asFixnum());
+}
+
+test "VM math:add: mixed slot+constant operand kinds" {
+    // Pins resolve() behavior across kind combinations the
+    // codegen will actually emit (peer-AI turn 33).
+    const consts = [_]Value{value_mod.fromFixnum(100).?};
+    var code = [_]Inst{
+        asm_.loadConst(0, 0), //                       s0 = 100
+        asm_.mathAdd(1, Operand.slot(0), Operand.constant(0)), // slot+const
+        asm_.mathAdd(2, Operand.constant(0), Operand.slot(1)), // const+slot
+        asm_.returnSlot(2),
+    };
+    const routine = makeRoutine(&code, &consts, 3, "mixed");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 300), result.asFixnum());
+}
+
+test "VM math:add: writing to a constant operand surfaces InvalidOperandKind" {
+    // Hand-build an instruction with destination kind = constant.
+    // Sources are valid (resolve to fixnums from the pool), so
+    // the addition succeeds and the failure surfaces at the
+    // destination store. Per VM.md §13's `:invalid-operand-kind`
+    // row, write-to-constant is an invalid operand kind in the
+    // store context, NOT "known but not yet wired" — peer-AI
+    // turn 35 holistic-review correction.
+    const consts = [_]Value{
+        value_mod.fromFixnum(1).?,
+        value_mod.fromFixnum(2).?,
+    };
+    const bad: Inst = .{
+        .kind = .primary,
+        .group = @intFromEnum(Group.math),
+        .variant = @intFromEnum(Math.add),
+        .a = Operand.constant(0), // illegal destination kind
+        .b = Operand.constant(0),
+        .c = Operand.constant(1),
+    };
+    var code = [_]Inst{ bad, asm_.returnNil() };
+    const routine = makeRoutine(&code, &consts, 1, "bad-dst");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.InvalidOperandKind, res);
+}
+
+test "VM math:add: unimplemented variant (sub) returns UnimplementedOpcode" {
+    // math:sub (variant 1) is reserved per PLAN §12.3 but not
+    // wired in this commit. Dispatch must surface
+    // UnimplementedOpcode, not BytecodeCorruption.
+    const math_sub: Inst = .{
+        .kind = .primary,
+        .group = @intFromEnum(Group.math),
+        .variant = 1,
+        .a = Operand.slot(0),
+        .b = Operand.slot(0),
+        .c = Operand.slot(0),
+    };
+    var code = [_]Inst{ math_sub, asm_.returnNil() };
+    const routine = makeRoutine(&code, &.{}, 1, "math-sub-unimpl");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.UnimplementedOpcode, res);
 }
 
 test "VM: a multi-step routine round-trips values through slots" {
