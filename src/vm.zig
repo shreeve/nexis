@@ -165,6 +165,18 @@ pub const Call = enum(u6) {
     _,
 };
 
+/// Variants for the `closure` group. Per VM.md §10.4. Step 5a1
+/// wires `make` only (with empty descriptors); 5b adds the cell
+/// access ops, 5c adds the placeholder-cell ops.
+pub const Closure_ = enum(u6) {
+    make = 0,
+    box_local = 1,
+    new_cell = 2,
+    init_cell = 3,
+    get_cell = 4,
+    _,
+};
+
 /// Variants for the `jump` group. Per PLAN §12.3 / VM.md §10.5.
 /// Step #3 (COMPILER.md §10 #3) wires all three v1 variants —
 /// they're tiny and `if-true` pairs naturally with `if-false`
@@ -246,16 +258,33 @@ comptime {
 /// The typed pool enforces: `mov:load-const` requires
 /// `Const.value`; `closure:make A=constant` requires
 /// `Const.routine`. Mismatch raises `:invalid-operand-kind`.
-///
-/// Step 5a0.5 introduces the type but only populates `.value`
-/// entries. Step 5a1 starts populating `.routine` entries when
-/// `closure:make` lowering lands.
 pub const Const = union(enum) {
     value: Value,
-    /// Step 5a1 placeholder — not yet populated by the compiler
-    /// or tested. Spec lives in VM.md §5 (typed constant pool
-    /// per turn 40 amendment).
     routine: *const Routine,
+};
+
+/// Source of one upvalue cell when constructing a closure.
+/// (Per VM.md §6 capture descriptor sources, peer-AI turn 34.)
+/// Step 5a1 introduces the type; only zero-source descriptors
+/// are populated. Step 5b populates `local_cell_slot` /
+/// `inherited_upvalue` entries during lazy-boxing capture.
+pub const CaptureSource = union(enum) {
+    /// Read raw `*UpvalCell` pointer from `caller.slot[index]`.
+    /// The slot must hold a cell pointer (a previous
+    /// `closure:box-local` or `closure:new-cell` populated it).
+    local_cell_slot: u12,
+    /// Copy raw cell pointer from `caller.upvalues[index]`. Used
+    /// when an inner closure transitively captures something its
+    /// enclosing closure already captured.
+    inherited_upvalue: u12,
+};
+
+/// One descriptor used by a `closure:make` instruction. Each
+/// `CaptureSource` corresponds to one upvalue slot in the
+/// constructed closure. v1 step 5a1 only ever uses zero-source
+/// descriptors (no captures).
+pub const CaptureDescriptor = struct {
+    sources: []const CaptureSource,
 };
 
 pub const Routine = struct {
@@ -265,11 +294,62 @@ pub const Routine = struct {
     /// index into this array; the operand-using opcode determines
     /// which `Const` variant is required.
     consts: []const Const,
+    /// Capture-descriptor table. Indexed by `closure:make`'s
+    /// operand B per VM.md §5 amendment. v1 step 5a1: only the
+    /// empty descriptor (zero sources) populated.
+    capture_descs: []const CaptureDescriptor = &.{},
     /// Slot count. The frame reserves this many `Value` slots on
     /// invocation.
     slot_count: u16,
+    /// Number of arguments this routine accepts (fixed-arity in
+    /// v1; variadic deferred per COMPILER.md §5.5). Matched
+    /// against `call:call`'s argc; mismatch raises
+    /// `:arity-mismatch` (peer-AI turn 40).
+    arity: u16 = 0,
+    /// Number of upvalue cells the routine's body expects in
+    /// its callee frame. Validated against the constructed
+    /// closure's upvalue array length at `call:call` time and
+    /// against `closure:make`'s descriptor source count at
+    /// closure-construction time.
+    upvalue_count: u16 = 0,
     /// Human-readable name for diagnostics. Non-owning.
     name: []const u8 = "<anonymous>",
+};
+
+/// Captured-binding cell. Heap object that holds one Value plus
+/// an `initialized` flag (per VM.md §6 amendment, peer-AI
+/// turn 34). v1 step 5a1: type defined but zero closures
+/// actually capture anything; `closure:box-local` /
+/// `closure:new-cell` / `closure:init-cell` lower in step 5b/5c.
+pub const UpvalCell = struct {
+    value: Value,
+    initialized: bool,
+};
+
+/// Runtime closure object: a routine + its upvalue cells.
+/// Per VALUE.md kind 22 = `function`.
+///
+/// **STAGED REPRESENTATION — TODO before GC integration**
+/// (peer-AI turns 40 / 42 / 43): v1 step 5a1 allocates Closure
+/// from VM-owned `runtime_arena` and stores a raw `*Closure`
+/// pointer in `Value.payload`. **This is a deliberate temporary
+/// violation** of the VALUE.md §4 heap-value contract, which
+/// requires `Value.payload` for heap kinds to point at a
+/// `HeapHeader`-prefixed object. The migration when real GC
+/// integration lands (post-5c) requires:
+///   1. Add a `header: HeapHeader` prefix field here.
+///   2. Switch allocation to `heap.alloc(.function, ...)` so
+///      the GC sees the object.
+///   3. Wire `gc.zig`'s `.function` arm from panic-reserved to
+///      a real trace function that walks `closure.upvalues`.
+///   4. Update `allocClosure` and `asClosure` accordingly.
+/// Field order (routine, upvalues) is migration-compatible
+/// when the header prefix lands.
+pub const Closure = struct {
+    routine: *const Routine,
+    /// Empty in 5a1 (zero captures); populated by `closure:make`
+    /// in step 5b once capture descriptors carry sources.
+    upvalues: []const *UpvalCell,
 };
 
 // =============================================================================
@@ -305,7 +385,20 @@ pub const Frame = struct {
     slot_count: u16,
     /// Bytecode offset of the next instruction to execute.
     pc: u32 = 0,
-    // For 5a1: return_dst, return_pc, upvalues lands here.
+    /// Where to write this frame's return value into the CALLER's
+    /// slot space when `call:return` runs. Top-level frame ignores
+    /// this; non-top-level frames receive it from `call:call`.
+    return_dst: u12 = 0,
+    /// PC to resume the caller at after `call:return`. Set by
+    /// `call:call` to the caller's already-incremented PC (i.e.,
+    /// the instruction following the call). Top-level frame
+    /// ignores this. Per VM.md §6.
+    return_pc: u32 = 0,
+    /// Upvalue array sourced from the executing closure. Empty
+    /// for the top-level frame and for empty-capture closures
+    /// (5a1 only allocates these); populated by `closure:make` +
+    /// `call:call` chain in step 5b.
+    upvalues: []const *UpvalCell = &.{},
 };
 
 // =============================================================================
@@ -358,6 +451,32 @@ pub const VmError = error{
     /// arithmetic Scope B lands, this surfaces as a hard error
     /// so we don't silently lose precision.
     IntegerOverflow,
+    /// `call:call` / `call:tailcall` invocation passed a different
+    /// number of arguments than the callee closure's routine
+    /// declares. Per VM.md §13 `:arity-mismatch` row (peer-AI
+    /// turn 40 clarification): runtime arity check fired at
+    /// frame transfer, distinct from compile-time arity errors
+    /// in COMPILER.md §4.3.
+    ArityMismatch,
+    /// `call:call` target slot did not contain a closure value.
+    /// Per VM.md §13 `:not-callable` row.
+    NotCallable,
+    /// `call:call` references a `call_base` slot such that
+    /// `slot[A + argc]` exceeds the frame's slot count. Per
+    /// VM.md §13 `:call-block-out-of-range`. Indicates a
+    /// compiler bug — call block was not allocated within the
+    /// routine's `slot_count`.
+    CallBlockOutOfRange,
+    /// `closure:make` capture descriptor's source count does not
+    /// match the child routine's `upvalue_count`. Indicates a
+    /// compiler bug.
+    CaptureCountMismatch,
+    /// Allocator failure during runtime allocation (Closure,
+    /// UpvalCell, stack growth, frame push). v1 surfaces this as
+    /// a generic OutOfMemory; a future commit may grow the
+    /// VM.md §13 taxonomy with a richer `:out-of-memory`
+    /// runtime error category that carries context.
+    OutOfMemory,
 };
 
 // =============================================================================
@@ -373,6 +492,13 @@ pub const VM = struct {
     /// top-level routine). Step 5a1: `call:call` appends; `call:return`
     /// pops.
     frames: std.ArrayList(Frame) = .empty,
+    /// Runtime allocation arena for `Closure` and `UpvalCell`
+    /// objects (peer-AI turn 40 + 42: VM-owned allocation, defer
+    /// real GC). Lifetime = VM lifetime; freed wholesale in
+    /// `deinit`. When real GC integration lands (post-5c),
+    /// allocations migrate to gc-managed `heap.alloc` calls; the
+    /// Closure/UpvalCell layouts stay trace-compatible.
+    runtime_arena: std.heap.ArenaAllocator,
     /// Where the top-level `call:return` stores the returned Value on
     /// halt.
     result: Value = value_mod.nilValue(),
@@ -380,8 +506,8 @@ pub const VM = struct {
 
     /// Build a VM around `routine`, allocating a single top-level
     /// frame with `routine.slot_count` slots zero-initialized to nil.
-    /// Caller owns the lifetime of `routine`; VM owns the stack and
-    /// frames storage and frees them in `deinit`.
+    /// Caller owns the lifetime of `routine`; VM owns the stack,
+    /// frames, and runtime arena and frees them in `deinit`.
     pub fn init(allocator: std.mem.Allocator, routine: *const Routine) !VM {
         var stack: std.ArrayList(Value) = .empty;
         errdefer stack.deinit(allocator);
@@ -400,13 +526,47 @@ pub const VM = struct {
             .allocator = allocator,
             .stack = stack,
             .frames = frames,
+            .runtime_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
     pub fn deinit(self: *VM) void {
+        self.runtime_arena.deinit();
         self.stack.deinit(self.allocator);
         self.frames.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Allocate a `Closure` from the runtime arena and return a
+    /// `Value` of kind `.function` pointing at it. The Value
+    /// payload encoding (raw `*Closure` pointer in payload) is
+    /// 5a1's staged-realization shape per peer-AI turn 42 — when
+    /// real GC integration lands, the closure migrates to a
+    /// `heap.alloc(.function, ...)` call with HeapHeader prefix
+    /// and the Value encoding becomes `*HeapHeader` per VALUE.md
+    /// §4. `asClosure()` is the matched accessor; both must
+    /// migrate together at that future cutover.
+    pub fn allocClosure(
+        self: *VM,
+        routine: *const Routine,
+        upvalues: []const *UpvalCell,
+    ) !Value {
+        const arena = self.runtime_arena.allocator();
+        const c = try arena.create(Closure);
+        c.* = .{ .routine = routine, .upvalues = upvalues };
+        return Value{
+            .tag = @as(u64, @intFromEnum(value_mod.Kind.function)),
+            .payload = @intFromPtr(c),
+        };
+    }
+
+    /// Inverse of `allocClosure`. Asserts `v.kind() == .function`
+    /// in safety builds; in release the cast is direct. Migration
+    /// note: when closures move to heap.alloc, this will need to
+    /// translate the `*HeapHeader` payload to `*Closure` body.
+    pub fn asClosure(v: Value) *const Closure {
+        std.debug.assert(v.kind() == .function);
+        return @ptrFromInt(v.payload);
     }
 
     /// Pointer to the currently-executing frame. **Single-shot use
@@ -577,8 +737,9 @@ pub const VM = struct {
             .call => try self.execCall(inst),
             .math => try self.execMath(inst),
             .jump => try self.execJump(inst),
+            .closure => try self.execClosure(inst),
             // Known but not yet implemented in this commit.
-            .cmp, .closure, .var_, .coll, .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
+            .cmp, .var_, .coll, .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
             // Unrecognized group byte — bytecode corruption.
             _ => return VmError.BytecodeCorruption,
         }
@@ -621,20 +782,266 @@ pub const VM = struct {
     fn execCall(self: *VM, inst: Inst) VmError!void {
         const variant: Call = @enumFromInt(inst.variant);
         switch (variant) {
-            .@"return" => {
-                // call:return a _ _   ;  result = slot[a]; halt
-                self.result = try self.resolve(inst.a);
-                self.halted = true;
-            },
-            .return_nil => {
-                self.result = value_mod.nilValue();
-                self.halted = true;
-            },
-            // call / tailcall land with a proper frame stack.
-            .call, .tailcall => return VmError.UnimplementedOpcode,
+            .call => try self.execCallCall(inst),
+            .@"return" => try self.execCallReturn(inst),
+            .return_nil => try self.execCallReturnNil(),
+            // tailcall lands in step #6 (recur + loop*).
+            .tailcall => return VmError.UnimplementedOpcode,
             _ => return VmError.UnimplementedOpcode,
         }
     }
+
+    /// `call:call A=call_base B=argc C=result_slot` — range-call
+    /// ABI per VM.md §6 (peer-AI turn 32). Caller has staged
+    /// `slot[A] = closure` and `slot[A+1 .. A+1+argc] = args`.
+    /// On return, the call's result lands in `slot[C]` and the
+    /// caller resumes at the instruction following this one.
+    fn execCallCall(self: *VM, inst: Inst) VmError!void {
+        // Operand kind validation per VM.md §13. A and C are
+        // slot operands; B is a raw-index immediate (kind ignored
+        // per §4.5 raw-index convention).
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
+
+        const call_base: u32 = inst.a.index;
+        const argc: u32 = inst.b.index;
+        const result_dst: u12 = inst.c.index;
+
+        // Validate the call block fits within the caller's frame
+        // (peer-AI turn 42: avoid u12 overflow with u32 math).
+        // The closure occupies slot[A], args are at A+1..A+argc.
+        // Compiler invariant: caller's slot_count >= A + 1 + argc.
+        const caller_idx = self.currentFrameIdx();
+        {
+            const caller_frame = self.currentFrame();
+            const required: u32 = call_base + 1 + argc;
+            if (required > caller_frame.slot_count) {
+                return VmError.CallBlockOutOfRange;
+            }
+        }
+
+        // Read closure value from slot[call_base]. Copy the Value
+        // by value (16 bytes) so we don't hold a *Value across
+        // stack growth (peer-AI turn 41 + 42).
+        const closure_v = (try self.slotPtr(@intCast(call_base))).*;
+        if (closure_v.kind() != value_mod.Kind.function) {
+            return VmError.NotCallable;
+        }
+        const closure = asClosure(closure_v);
+        const callee_routine = closure.routine;
+
+        // Arity check (peer-AI turn 42).
+        if (callee_routine.arity != argc) {
+            return VmError.ArityMismatch;
+        }
+        // Upvalue count consistency check: the closure's upvalue
+        // array length must match what the routine expects.
+        // Indicates `closure:make` was emitted with a wrong-size
+        // descriptor, OR the closure was constructed by a
+        // different routine. Trap as CaptureCountMismatch
+        // (peer-AI turn 42).
+        if (closure.upvalues.len != callee_routine.upvalue_count) {
+            return VmError.CaptureCountMismatch;
+        }
+        // Validate result slot fits within caller's frame
+        // (peer-AI turn 43): rejecting at call time is cheaper
+        // than running the callee and failing on return.
+        {
+            const caller_frame = self.currentFrame();
+            if (result_dst >= caller_frame.slot_count) {
+                return VmError.OperandOutOfRange;
+            }
+        }
+        // Validate the routine's metadata is internally
+        // consistent (peer-AI turn 43): a routine with
+        // `slot_count < arity` would underrun on param storage.
+        // This indicates a compiler bug or corrupt routine, not
+        // user error.
+        if (callee_routine.slot_count < callee_routine.arity) {
+            return VmError.BytecodeCorruption;
+        }
+
+        // Compute callee window per range-call ABI:
+        //   callee.base_slot = caller.base_slot + call_base + 1
+        // Read caller's base_slot before any stack/frames mutation.
+        const caller_base: u32 = self.frames.items[caller_idx].base_slot;
+        const callee_base: u32 = caller_base + call_base + 1;
+        const callee_end: u32 = callee_base + callee_routine.slot_count;
+
+        // Grow stack to fit the callee's full slot range. Args
+        // are already at callee_base..callee_base+argc (windowed
+        // from the caller). Locals/temps beyond args MUST be
+        // initialized to nil even though that memory may already
+        // exist as caller's high slots (peer-AI turn 42 catch:
+        // GC roots / next-iteration reads need a valid Value
+        // there, not stale caller data).
+        if (callee_end > self.stack.items.len) {
+            const grow_by: usize = callee_end - self.stack.items.len;
+            try self.stack.appendNTimes(self.allocator, value_mod.nilValue(), grow_by);
+        }
+        // Reset locals after args to nil.
+        const locals_start: usize = @as(usize, callee_base) + argc;
+        const locals_end: usize = callee_end;
+        var i: usize = locals_start;
+        while (i < locals_end) : (i += 1) {
+            self.stack.items[i] = value_mod.nilValue();
+        }
+
+        // Snapshot the caller's already-incremented PC for the
+        // callee's return_pc. The dispatch loop pre-increments
+        // PC before invoking handlers, so caller_frame.pc here
+        // points to the instruction following call:call.
+        const caller_pc_after_call: u32 = self.frames.items[caller_idx].pc;
+
+        // Append callee frame. After this point, `caller_frame`
+        // pointers are invalidated.
+        try self.frames.append(self.allocator, .{
+            .routine = callee_routine,
+            .base_slot = callee_base,
+            .slot_count = callee_routine.slot_count,
+            .pc = 0,
+            .return_dst = result_dst,
+            .return_pc = caller_pc_after_call,
+            .upvalues = closure.upvalues,
+        });
+    }
+
+    /// `call:return A=slot _ _` — read return value from
+    /// `slot[A]`, then either halt (if top-level) or pop the
+    /// callee frame and write the return value into the
+    /// caller's `return_dst` slot.
+    fn execCallReturn(self: *VM, inst: Inst) VmError!void {
+        // Read the return value FIRST while the callee frame is
+        // still active (peer-AI turn 42 ordering: shrinking the
+        // stack or popping the frame before this read would
+        // invalidate the slot pointer).
+        const return_value = try self.resolve(inst.a);
+
+        // Top-level return halts the VM and stores result.
+        if (self.frames.items.len == 1) {
+            self.result = return_value;
+            self.halted = true;
+            return;
+        }
+
+        // Non-top-level return.
+        // Validate frame metadata BEFORE any mutation (peer-AI
+        // turn 43): if `callee.return_dst` is invalid, popping
+        // and shrinking first would partially corrupt VM state
+        // before surfacing the error.
+        const callee_idx = self.frames.items.len - 1;
+        const caller_idx = callee_idx - 1;
+        const callee_meta = self.frames.items[callee_idx];
+        const caller_meta = self.frames.items[caller_idx];
+
+        if (callee_meta.return_dst >= caller_meta.slot_count) {
+            return VmError.OperandOutOfRange;
+        }
+        const caller_end: usize = @as(usize, caller_meta.base_slot) + caller_meta.slot_count;
+        const absolute: usize = @as(usize, caller_meta.base_slot) + callee_meta.return_dst;
+        if (absolute >= caller_end) return VmError.BytecodeCorruption;
+
+        // Mutations from here on out are post-validation.
+        _ = self.frames.pop().?;
+        self.stack.shrinkRetainingCapacity(caller_end);
+        self.stack.items[absolute] = return_value;
+        self.frames.items[caller_idx].pc = callee_meta.return_pc;
+    }
+
+    /// `call:return-nil` — same as `call:return` with a nil
+    /// return value, no operand resolution. Same validate-before-
+    /// mutate discipline as `execCallReturn` (peer-AI turn 43).
+    fn execCallReturnNil(self: *VM) VmError!void {
+        if (self.frames.items.len == 1) {
+            self.result = value_mod.nilValue();
+            self.halted = true;
+            return;
+        }
+        const callee_idx = self.frames.items.len - 1;
+        const caller_idx = callee_idx - 1;
+        const callee_meta = self.frames.items[callee_idx];
+        const caller_meta = self.frames.items[caller_idx];
+
+        if (callee_meta.return_dst >= caller_meta.slot_count) {
+            return VmError.OperandOutOfRange;
+        }
+        const caller_end: usize = @as(usize, caller_meta.base_slot) + caller_meta.slot_count;
+        const absolute: usize = @as(usize, caller_meta.base_slot) + callee_meta.return_dst;
+        if (absolute >= caller_end) return VmError.BytecodeCorruption;
+
+        _ = self.frames.pop().?;
+        self.stack.shrinkRetainingCapacity(caller_end);
+        self.stack.items[absolute] = value_mod.nilValue();
+        self.frames.items[caller_idx].pc = callee_meta.return_pc;
+    }
+
+    // -------------------------------------------------------------------------
+    // Group `closure` (VM.md §10.4)
+    //
+    // Step 5a1: only `make` is wired, and only with empty capture
+    // descriptors (zero sources). 5b populates real descriptors;
+    // 5c adds the placeholder-cell ops.
+    // -------------------------------------------------------------------------
+
+    fn execClosure(self: *VM, inst: Inst) VmError!void {
+        const variant: Closure_ = @enumFromInt(inst.variant);
+        switch (variant) {
+            .make => try self.execClosureMake(inst),
+            // box_local / new_cell / init_cell / get_cell wire in 5b/5c.
+            .box_local, .new_cell, .init_cell, .get_cell => return VmError.UnimplementedOpcode,
+            _ => return VmError.BytecodeCorruption,
+        }
+    }
+
+    /// `closure:make A=prototype_const B=cap_desc_imm C=result_slot`
+    /// per VM.md §6 (peer-AI turn 34, descriptor-based encoding).
+    fn execClosureMake(self: *VM, inst: Inst) VmError!void {
+        // Operand kind validation: A must be a constant (typed
+        // pool requires .routine variant; resolve below catches
+        // a .value mismatch). C must be a slot. B is raw-index
+        // (kind ignored per §4.5).
+        if (inst.a.kind != .constant) return VmError.InvalidOperandKind;
+        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
+
+        const frame = self.currentFrame();
+        const consts = frame.routine.consts;
+        if (inst.a.index >= consts.len) return VmError.OperandOutOfRange;
+
+        const child_routine = switch (consts[inst.a.index]) {
+            .routine => |r| r,
+            // mov:load-const with .routine raises InvalidOperandKind;
+            // closure:make with .value is the symmetric error.
+            .value => return VmError.InvalidOperandKind,
+        };
+
+        // Capture descriptor lookup (B operand, raw index).
+        const cap_idx: u32 = inst.b.index;
+        if (cap_idx >= frame.routine.capture_descs.len) {
+            return VmError.OperandOutOfRange;
+        }
+        const desc = frame.routine.capture_descs[cap_idx];
+
+        // Source count must match child routine's expectation.
+        if (desc.sources.len != child_routine.upvalue_count) {
+            return VmError.CaptureCountMismatch;
+        }
+
+        // 5a1: only empty-capture descriptors are populated, so
+        // upvalues is always an empty slice in this commit.
+        // 5b will allocate a `[]const *UpvalCell` array sized
+        // to `desc.sources.len` and populate from the descriptor
+        // sources reading `frame.slots[s.local_cell_slot]` or
+        // `frame.upvalues[s.inherited_upvalue]` respectively.
+        if (desc.sources.len != 0) return VmError.UnimplementedOpcode;
+
+        // Allocate the closure with an empty upvalue array.
+        // (Allocator failure surfaces as VmError.OutOfMemory.)
+        const closure_v = self.allocClosure(child_routine, &.{}) catch
+            return VmError.OutOfMemory;
+
+        try self.store(inst.c, closure_v);
+    }
+
 
     // -------------------------------------------------------------------------
     // Group `math` (VM.md §10 #3 — PLAN §12.3 group 2)
@@ -772,10 +1179,15 @@ pub fn makeRoutine(
 /// Test-ergonomics helper: wrap a `Value` in `Const.value`.
 /// Lets test fixtures write `cval(value_mod.fromFixnum(7).?)`
 /// instead of `.{ .value = value_mod.fromFixnum(7).? }` for
-/// each constant-pool entry. Step 5a1 will add a paired
-/// `croutine(*const Routine)` helper for routine constants.
+/// each constant-pool entry.
 pub fn cval(v: Value) Const {
     return .{ .value = v };
+}
+
+/// Test-ergonomics helper: wrap a `*const Routine` in
+/// `Const.routine`. Symmetric with `cval`.
+pub fn croutine(r: *const Routine) Const {
+    return .{ .routine = r };
 }
 
 /// Encoding helpers. Every opcode used in this commit has a
@@ -904,6 +1316,34 @@ pub const asm_ = struct {
     /// (peer-AI turn 36 simple-backpatch pattern).
     pub fn patchJumpTarget(inst: *Inst, target_pc: u12) void {
         inst.a = Operand.jump(target_pc);
+    }
+
+    /// `closure:make A=prototype_const B=cap_desc_imm C=result_slot`
+    /// per VM.md §6 (peer-AI turn 34 descriptor-based shape).
+    /// `cap_desc_index` is encoded as a raw-index immediate per
+    /// §4.5; the asm helper hides the encoding by using a slot
+    /// kind for the operand bits (handler ignores the kind).
+    pub fn closureMake(proto_const: u12, cap_desc_index: u12, dst: u12) Inst {
+        return Inst.primary(
+            .closure,
+            Closure_.make,
+            Operand.constant(proto_const),
+            Operand.slot(cap_desc_index), // raw-index immediate per §4.5
+            Operand.slot(dst),
+        );
+    }
+
+    /// `call:call A=call_base B=argc C=result_slot` per VM.md §6
+    /// range-call ABI (peer-AI turn 32). Caller has already
+    /// staged closure + args at `slot[A..A+1+argc]`.
+    pub fn callCall(call_base: u12, argc: u12, result_slot: u12) Inst {
+        return Inst.primary(
+            .call,
+            Call.call,
+            Operand.slot(call_base),
+            Operand.slot(argc), // raw-index immediate per §4.5
+            Operand.slot(result_slot),
+        );
     }
 };
 
@@ -1103,25 +1543,24 @@ test "VM: exhausting bytecode without return surfaces BytecodeExhausted" {
 }
 
 test "VM: known-but-not-implemented group returns UnimplementedOpcode" {
-    // closure group (5) with variant 0 — known group, not wired yet.
+    // var_ group (6) with variant 0 — known group, not wired yet.
     //
     // **Placeholder rotation discipline** (peer-AI turn 37): when a
     // new group lands, this placeholder must rotate to the NEXT
-    // still-unwired group. The history so far: math → jump → closure.
-    // Next likely rotations: closure → var (step #7) → coll → etc.
-    // Use `runWithFuel` (not `run`) so that an accidental rotation
-    // bug (e.g., the new wiring decodes the slot(0) operands as a
-    // self-jump) trips fuel exhaustion instead of hanging the suite
-    // for 22 minutes. This bit me once in step #3 — don't repeat.
-    const closure_make = Inst.primary(
-        .closure,
+    // still-unwired group. History: math → jump → closure → var_.
+    // Next likely: var_ → coll → cmp → etc.
+    // Use `runWithFuel` (not `run`) so an accidental rotation bug
+    // trips fuel exhaustion instead of hanging the suite (22-min
+    // hang in step #3 — don't repeat).
+    const var_op = Inst.primary(
+        .var_,
         @as(Mov, @enumFromInt(0)), // variant 0 — placeholder; only the group matters
         Operand.slot(0),
         Operand.slot(0),
         Operand.slot(0),
     );
     var code = [_]Inst{
-        closure_make,
+        var_op,
         asm_.returnNil(),
     };
     const routine = makeRoutine(&code, &.{}, 1, "unimpl");
@@ -1606,6 +2045,484 @@ test "VM math:add: writing to a constant operand surfaces InvalidOperandKind" {
     defer vm.deinit();
     const res = vm.run();
     try testing.expectError(VmError.InvalidOperandKind, res);
+}
+
+// ---- step 5a1: closure + call tests (peer-AI turn 42 checklist) ----
+
+test "VM 5a1: closure:make produces a function-kind Value" {
+    // Hand-assemble: child routine returns nil. Parent routine
+    // makes a closure for it, returns the closure.
+    var child_code = [_]Inst{asm_.returnNil()};
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &.{},
+        .capture_descs = &.{},
+        .slot_count = 1,
+        .arity = 0,
+        .upvalue_count = 0,
+        .name = "child",
+    };
+    const parent_consts = [_]Const{croutine(&child_routine)};
+    const parent_caps = [_]CaptureDescriptor{.{ .sources = &.{} }};
+    var parent_code = [_]Inst{
+        asm_.closureMake(0, 0, 0), // closure:make c0(routine), cap_desc 0 (empty), s0
+        asm_.returnSlot(0),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts,
+        .capture_descs = &parent_caps,
+        .slot_count = 1,
+        .arity = 0,
+        .upvalue_count = 0,
+        .name = "parent",
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.kind() == .function);
+    const c = VM.asClosure(result);
+    try testing.expectEqual(&child_routine, c.routine);
+    try testing.expectEqual(@as(usize, 0), c.upvalues.len);
+}
+
+test "VM 5a1: ((fn* [] 42)) — no-arg closure call returns its body value" {
+    // Child: load 42 into s0, return.
+    const child_consts = [_]Const{cval(value_mod.fromFixnum(42).?)};
+    var child_code = [_]Inst{
+        asm_.loadConst(0, 0),
+        asm_.returnSlot(0),
+    };
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &child_consts,
+        .slot_count = 1,
+    };
+    // Parent: closure:make → s0; call:call s0,0,s0; call:return s0.
+    // call_base = 0 (the closure slot); argc = 0; result_slot = 0.
+    // Note dst slot reuses s0 — the closure value is consumed by
+    // the call, then overwritten by the result. Legal per VM.md §6.
+    const parent_consts = [_]Const{croutine(&child_routine)};
+    const parent_caps = [_]CaptureDescriptor{.{ .sources = &.{} }};
+    var parent_code = [_]Inst{
+        asm_.closureMake(0, 0, 0),
+        asm_.callCall(0, 0, 0),
+        asm_.returnSlot(0),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts,
+        .capture_descs = &parent_caps,
+        .slot_count = 1,
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "VM 5a1: ((fn* [x] (+ x 1)) 5) = 6 — single arg" {
+    // Child: math:add s1, s0, c0 (s0 = param x); return s1.
+    const child_consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
+    var child_code = [_]Inst{
+        asm_.mathAdd(1, Operand.slot(0), Operand.constant(0)),
+        asm_.returnSlot(1),
+    };
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &child_consts,
+        .slot_count = 2,
+        .arity = 1,
+    };
+    // Parent: load fn into s0, load 5 into s1, call_base=s0 argc=1
+    // result=s2; return s2. slot_count = 3.
+    const parent_consts = [_]Const{
+        croutine(&child_routine),
+        cval(value_mod.fromFixnum(5).?),
+    };
+    const parent_caps = [_]CaptureDescriptor{.{ .sources = &.{} }};
+    var parent_code = [_]Inst{
+        asm_.closureMake(0, 0, 0), // s0 = closure
+        asm_.loadConst(1, 1), //         s1 = 5 (the arg)
+        asm_.callCall(0, 1, 2), //       s2 = (closure 5)
+        asm_.returnSlot(2),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts,
+        .capture_descs = &parent_caps,
+        .slot_count = 3,
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 6), result.asFixnum());
+}
+
+test "VM 5a1: ((fn* [x y] (+ x y)) 3 4) = 7 — two-arg call" {
+    // Child: math:add s2, s0, s1; return s2. slot_count=3, arity=2.
+    var child_code = [_]Inst{
+        asm_.mathAdd(2, Operand.slot(0), Operand.slot(1)),
+        asm_.returnSlot(2),
+    };
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &.{},
+        .slot_count = 3,
+        .arity = 2,
+    };
+    const parent_consts = [_]Const{
+        croutine(&child_routine),
+        cval(value_mod.fromFixnum(3).?),
+        cval(value_mod.fromFixnum(4).?),
+    };
+    const parent_caps = [_]CaptureDescriptor{.{ .sources = &.{} }};
+    var parent_code = [_]Inst{
+        asm_.closureMake(0, 0, 0), // s0 = closure
+        asm_.loadConst(1, 1), //         s1 = 3
+        asm_.loadConst(2, 2), //         s2 = 4
+        asm_.callCall(0, 2, 3), //       s3 = (closure 3 4)
+        asm_.returnSlot(3),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts,
+        .capture_descs = &parent_caps,
+        .slot_count = 4,
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 7), result.asFixnum());
+}
+
+test "VM 5a1: arity mismatch — too few args traps :arity-mismatch" {
+    // Child expects 2 args; we pass 1.
+    var child_code = [_]Inst{asm_.returnNil()};
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &.{},
+        .slot_count = 2,
+        .arity = 2,
+    };
+    const parent_consts = [_]Const{
+        croutine(&child_routine),
+        cval(value_mod.fromFixnum(1).?),
+    };
+    const parent_caps = [_]CaptureDescriptor{.{ .sources = &.{} }};
+    var parent_code = [_]Inst{
+        asm_.closureMake(0, 0, 0),
+        asm_.loadConst(1, 1),
+        asm_.callCall(0, 1, 2), // argc=1 but child expects 2
+        asm_.returnSlot(2),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts,
+        .capture_descs = &parent_caps,
+        .slot_count = 3,
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.ArityMismatch, res);
+}
+
+test "VM 5a1: arity mismatch — too many args traps :arity-mismatch" {
+    var child_code = [_]Inst{asm_.returnNil()};
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &.{},
+        .slot_count = 1,
+        .arity = 1,
+    };
+    const parent_consts = [_]Const{
+        croutine(&child_routine),
+        cval(value_mod.fromFixnum(1).?),
+        cval(value_mod.fromFixnum(2).?),
+    };
+    const parent_caps = [_]CaptureDescriptor{.{ .sources = &.{} }};
+    var parent_code = [_]Inst{
+        asm_.closureMake(0, 0, 0),
+        asm_.loadConst(1, 1),
+        asm_.loadConst(2, 2),
+        asm_.callCall(0, 2, 3), // argc=2 but child expects 1
+        asm_.returnSlot(3),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts,
+        .capture_descs = &parent_caps,
+        .slot_count = 4,
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.ArityMismatch, res);
+}
+
+test "VM 5a1: not-callable — call:call on a fixnum traps :not-callable" {
+    const consts = [_]Const{cval(value_mod.fromFixnum(42).?)};
+    var code = [_]Inst{
+        asm_.loadConst(0, 0), // s0 = 42 (not a closure)
+        asm_.callCall(0, 0, 1),
+        asm_.returnSlot(1),
+    };
+    const routine = Routine{
+        .code = &code,
+        .consts = &consts,
+        .slot_count = 2,
+    };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.NotCallable, res);
+}
+
+test "VM 5a1: mov:load-const with routine-typed Const traps :invalid-operand-kind" {
+    // Pins the typed-Const-pool enforcement: mov:load-const cannot
+    // load a Const.routine into a slot.
+    var dummy_code = [_]Inst{asm_.returnNil()};
+    const dummy_routine = Routine{ .code = &dummy_code, .consts = &.{}, .slot_count = 1 };
+    const consts = [_]Const{croutine(&dummy_routine)};
+    var code = [_]Inst{
+        asm_.loadConst(0, 0), // tries to load a routine into a slot
+        asm_.returnSlot(0),
+    };
+    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.InvalidOperandKind, res);
+}
+
+test "VM 5a1: closure:make with value-typed Const traps :invalid-operand-kind" {
+    // Symmetric: closure:make cannot use a Const.value as its
+    // prototype operand.
+    const consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
+    const caps = [_]CaptureDescriptor{.{ .sources = &.{} }};
+    var code = [_]Inst{
+        asm_.closureMake(0, 0, 0), // c0 is a value, not a routine
+        asm_.returnSlot(0),
+    };
+    const routine = Routine{
+        .code = &code,
+        .consts = &consts,
+        .capture_descs = &caps,
+        .slot_count = 1,
+    };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.InvalidOperandKind, res);
+}
+
+test "VM 5a1: closure:make capture descriptor source-count mismatch traps" {
+    // Child expects 1 upvalue; descriptor has 0 sources.
+    var child_code = [_]Inst{asm_.returnNil()};
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &.{},
+        .slot_count = 1,
+        .arity = 0,
+        .upvalue_count = 1, // mismatch with descriptor below
+    };
+    const parent_consts = [_]Const{croutine(&child_routine)};
+    const parent_caps = [_]CaptureDescriptor{.{ .sources = &.{} }}; // 0 sources
+    var parent_code = [_]Inst{
+        asm_.closureMake(0, 0, 0),
+        asm_.returnSlot(0),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts,
+        .capture_descs = &parent_caps,
+        .slot_count = 1,
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.CaptureCountMismatch, res);
+}
+
+test "VM 5a1: callee local slots are nil-initialized even when stack overlaps caller high slots" {
+    // Child has slot_count=3 (slot 0 = arg, slots 1-2 are locals).
+    // Body returns slot 2 without writing it — should be nil.
+    var child_code = [_]Inst{asm_.returnSlot(2)};
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &.{},
+        .slot_count = 3,
+        .arity = 1,
+    };
+    // Parent: stuff non-nil into all of its high slots first to
+    // create the "overlap with caller's stale data" scenario.
+    const parent_consts = [_]Const{
+        croutine(&child_routine),
+        cval(value_mod.fromFixnum(7).?),
+        cval(value_mod.fromFixnum(99).?), // poison value to detect leak
+    };
+    const parent_caps = [_]CaptureDescriptor{.{ .sources = &.{} }};
+    var parent_code = [_]Inst{
+        // Pre-poison high slots that will OVERLAP with callee locals.
+        asm_.loadConst(2, 2), // s2 = 99
+        asm_.loadConst(3, 2), // s3 = 99
+        asm_.closureMake(0, 0, 0), // s0 = closure
+        asm_.loadConst(1, 1), //         s1 = 7 (the arg)
+        asm_.callCall(0, 1, 4), //       call_base=0, argc=1, result→s4
+        asm_.returnSlot(4),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts,
+        .capture_descs = &parent_caps,
+        .slot_count = 5,
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    // If the callee's slot 2 had leaked the parent's poisoned 99,
+    // we'd get a fixnum back. Nil-init means we get nil.
+    try testing.expect(result.kind() == .nil);
+}
+
+test "VM 5a1: call:call with constant operand as A traps :invalid-operand-kind" {
+    // call:call requires A=slot (the call_base). A=constant is
+    // invalid (peer-AI turn 43 catch).
+    var dummy_code = [_]Inst{asm_.returnNil()};
+    const dummy_routine = Routine{ .code = &dummy_code, .consts = &.{}, .slot_count = 1 };
+    const consts = [_]Const{croutine(&dummy_routine)};
+    const bad_call: Inst = .{
+        .kind = .primary,
+        .group = @intFromEnum(Group.call),
+        .variant = @intFromEnum(Call.call),
+        .a = Operand.constant(0), // illegal: must be slot
+        .b = Operand.slot(0),
+        .c = Operand.slot(0),
+    };
+    var code = [_]Inst{ bad_call, asm_.returnNil() };
+    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.InvalidOperandKind, res);
+}
+
+test "VM 5a1: call:call with constant operand as C traps :invalid-operand-kind" {
+    // call:call requires C=slot (the result). C=constant is invalid.
+    var child_code = [_]Inst{asm_.returnNil()};
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &.{},
+        .slot_count = 1,
+        .arity = 0,
+    };
+    const consts = [_]Const{croutine(&child_routine)};
+    const caps = [_]CaptureDescriptor{.{ .sources = &.{} }};
+    const bad_call: Inst = .{
+        .kind = .primary,
+        .group = @intFromEnum(Group.call),
+        .variant = @intFromEnum(Call.call),
+        .a = Operand.slot(0),
+        .b = Operand.slot(0),
+        .c = Operand.constant(0), // illegal: must be slot
+    };
+    var code = [_]Inst{
+        asm_.closureMake(0, 0, 0),
+        bad_call,
+        asm_.returnNil(),
+    };
+    const routine = Routine{
+        .code = &code,
+        .consts = &consts,
+        .capture_descs = &caps,
+        .slot_count = 1,
+    };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.InvalidOperandKind, res);
+}
+
+test "VM 5a1: closure:make with capture descriptor index out of range traps OperandOutOfRange" {
+    var child_code = [_]Inst{asm_.returnNil()};
+    const child_routine = Routine{ .code = &child_code, .consts = &.{}, .slot_count = 1 };
+    const consts = [_]Const{croutine(&child_routine)};
+    // No capture descriptors at all — index 0 is OOR.
+    var code = [_]Inst{
+        asm_.closureMake(0, 0, 0),
+        asm_.returnSlot(0),
+    };
+    const routine = Routine{
+        .code = &code,
+        .consts = &consts,
+        .capture_descs = &.{}, // empty
+        .slot_count = 1,
+    };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.OperandOutOfRange, res);
+}
+
+test "VM 5a1: same closure called twice — both invocations succeed" {
+    // Child returns its single arg incremented by 1.
+    const child_consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
+    var child_code = [_]Inst{
+        asm_.mathAdd(1, Operand.slot(0), Operand.constant(0)),
+        asm_.returnSlot(1),
+    };
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &child_consts,
+        .slot_count = 2,
+        .arity = 1,
+    };
+    // Parent: make closure, call with 5 → s4. Reuse closure, call
+    // with 10 → s5. Add s4 + s5 → result.
+    const parent_consts = [_]Const{
+        croutine(&child_routine),
+        cval(value_mod.fromFixnum(5).?),
+        cval(value_mod.fromFixnum(10).?),
+    };
+    const parent_caps = [_]CaptureDescriptor{.{ .sources = &.{} }};
+    var parent_code = [_]Inst{
+        asm_.closureMake(0, 0, 0), // s0 = closure
+        asm_.loadConst(1, 1), //         s1 = 5
+        asm_.callCall(0, 1, 4), //       s4 = closure(5) = 6
+
+        // Reuse closure (s0 still holds it). Stage second call.
+        asm_.loadConst(1, 2), //         s1 = 10
+        asm_.callCall(0, 1, 5), //       s5 = closure(10) = 11
+
+        asm_.mathAdd(6, Operand.slot(4), Operand.slot(5)), // s6 = 6 + 11 = 17
+        asm_.returnSlot(6),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts,
+        .capture_descs = &parent_caps,
+        .slot_count = 7,
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 17), result.asFixnum());
 }
 
 test "VM math:add: unimplemented variant (sub) returns UnimplementedOpcode" {

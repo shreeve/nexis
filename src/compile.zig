@@ -117,6 +117,25 @@ pub const Tiny = union(enum) {
     /// `(do)` yields nil. Each let_star / fn_star / loop_star
     /// body that needs multiple expressions wraps them in `do_`.
     do_: []const *const Tiny,
+    /// `(fn* [params...] body)` per PLAN §6.1.
+    /// Step 5a1: empty-capture closures only. Bodies must NOT
+    /// reference free variables (anything not in `params`);
+    /// such references raise `UnresolvedSymbol` at compile time
+    /// (per peer-AI turn 42 — capture/parent-scope walk lands
+    /// in 5b). Named `fn*` deferred to 5c per turn 42 — for
+    /// now, no self-name is allowed.
+    fn_star: struct {
+        params: []const []const u8,
+        body: *const Tiny,
+    },
+    /// `(callee args...)` — function invocation. Lowers to the
+    /// range-call ABI per VM.md §6: stage callee + args in a
+    /// contiguous call block, emit `call:call`. Step 5a1 calls
+    /// any closure value (no captures yet).
+    call: struct {
+        callee: *const Tiny,
+        args: []const *const Tiny,
+    },
 };
 
 /// One binding in a `let*` form.
@@ -173,6 +192,12 @@ pub const CompileError = error{
     /// — per COMPILER.md §4.3 rule #8.
     UnresolvedSymbol,
 
+    /// Two parameter slots in the same `fn*` carry the same
+    /// name. Per peer-AI turn 40 / Clojure semantics: not
+    /// allowed (unlike `let*` where sequential bindings can
+    /// shadow within the same form per COMPILER.md §4.3).
+    DuplicateParam,
+
     OutOfMemory,
 };
 
@@ -181,7 +206,9 @@ pub const CompileError = error{
 // =============================================================================
 
 /// The compiler's product. Wrap with `toRoutine(name)` to get a
-/// `vm.Routine` ready for `vm.VM.init`.
+/// `vm.Routine` ready for `vm.VM.init`. Step 5a1 added
+/// `capture_descs` to support `closure:make` lowering and
+/// `arity` for call-site validation.
 ///
 /// **Ownership**: `code` and `consts` are slices allocated through
 /// the allocator passed to `compileTiny()` and remain valid until
@@ -195,10 +222,22 @@ pub const CompileError = error{
 pub const Compiled = struct {
     code: []const Inst,
     consts: []const vm.Const,
+    capture_descs: []const vm.CaptureDescriptor = &.{},
     slot_count: u16,
+    /// Top-level Compiled has arity 0; child routines built by
+    /// `compileFn` set this to their parameter count.
+    arity: u16 = 0,
 
     pub fn toRoutine(self: Compiled, name: []const u8) Routine {
-        return vm.makeRoutine(self.code, self.consts, self.slot_count, name);
+        return .{
+            .code = self.code,
+            .consts = self.consts,
+            .capture_descs = self.capture_descs,
+            .slot_count = self.slot_count,
+            .arity = self.arity,
+            .upvalue_count = 0, // 5a1: no captures
+            .name = name,
+        };
     }
 };
 
@@ -240,6 +279,7 @@ const Emitter = struct {
     allocator: std.mem.Allocator,
     code: std.ArrayList(Inst) = .empty,
     consts: std.ArrayList(vm.Const) = .empty,
+    capture_descs: std.ArrayList(vm.CaptureDescriptor) = .empty,
     scope: std.ArrayList(LocalBinding) = .empty,
     slot_count: u16 = 0,
 
@@ -250,6 +290,7 @@ const Emitter = struct {
     fn deinit(self: *Emitter) void {
         self.code.deinit(self.allocator);
         self.consts.deinit(self.allocator);
+        self.capture_descs.deinit(self.allocator);
         self.scope.deinit(self.allocator);
     }
 
@@ -292,6 +333,21 @@ const Emitter = struct {
         return @intCast(s);
     }
 
+    /// Allocate a contiguous run of `count` fresh slots, return the
+    /// base index. Required by `compileCall` to reserve the call
+    /// block BEFORE compiling sub-expressions (peer-AI turn 43
+    /// catch: per-arg `allocSlot` interleaved with sub-expression
+    /// compilation is incorrect — sub-expressions allocate their
+    /// own temps and the next "arg slot" is no longer adjacent
+    /// to the previous, breaking the range-call ABI invariant).
+    fn allocSlotBlock(self: *Emitter, count: u32) CompileError!u12 {
+        const base: u32 = self.slot_count;
+        const end: u32 = base + count;
+        if (end > 4096) return CompileError.SlotOverflow;
+        self.slot_count = @intCast(end);
+        return @intCast(base);
+    }
+
     /// Add a constant to the pool, return its index. Constants are
     /// not deduplicated in step #3 (correctness over polish).
     /// Step 5a0.5 widens to typed `Const` per peer-AI turn 40
@@ -308,6 +364,24 @@ const Emitter = struct {
     /// Convenience: add a `Value` constant (the common case).
     fn addValueConst(self: *Emitter, v: Value) CompileError!u12 {
         return self.addConst(.{ .value = v });
+    }
+
+    /// Convenience: add a `*const Routine` constant. Used by
+    /// `compileFn` when registering a child routine in the
+    /// parent's pool for later `closure:make` (peer-AI turn 42).
+    fn addRoutineConst(self: *Emitter, r: *const vm.Routine) CompileError!u12 {
+        return self.addConst(.{ .routine = r });
+    }
+
+    /// Add a capture descriptor to the emitter's table; return
+    /// the descriptor's index for use as `closure:make`'s B
+    /// operand. Step 5a1: only empty descriptors. 5b populates
+    /// `local_cell_slot` / `inherited_upvalue` sources.
+    fn addCaptureDescriptor(self: *Emitter, desc: vm.CaptureDescriptor) CompileError!u12 {
+        const idx = self.capture_descs.items.len;
+        if (idx >= 4096) return CompileError.ConstantPoolOverflow;
+        try self.capture_descs.append(self.allocator, desc);
+        return @intCast(idx);
     }
 
     /// Append an instruction to the code stream.
@@ -356,18 +430,22 @@ const Emitter = struct {
     /// Convert the accumulated state into an owned `Compiled`.
     ///
     /// Ownership transfer is errdefer-safe (peer-AI turn 37): if
-    /// `consts.toOwnedSlice` fails after `code.toOwnedSlice`
-    /// succeeded, `code` would leak under a non-arena allocator.
-    /// The errdefer guards against that.
+    /// any `toOwnedSlice` fails after a previous one succeeded,
+    /// the earlier slice would leak under a non-arena allocator.
+    /// The chained errdefers guard against that.
     fn finish(self: *Emitter) CompileError!Compiled {
         const code = try self.code.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(code);
         const consts = try self.consts.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(consts);
+        const caps = try self.capture_descs.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(caps);
         return .{
             .code = code,
             .consts = consts,
+            .capture_descs = caps,
             .slot_count = if (self.slot_count == 0) 1 else self.slot_count,
+            .arity = 0, // top-level only; compileFn sets this for child routines via Routine struct
         };
     }
 };
@@ -412,6 +490,8 @@ fn compileExpr(e: *Emitter, form: *const Tiny, dst: u12) CompileError!void {
         .if_ => |i| try compileIf(e, i.test_, i.then, i.else_, dst),
         .let_star => |l| try compileLetStar(e, l.bindings, l.body, dst),
         .do_ => |exprs| try compileDo(e, exprs, dst),
+        .fn_star => |f| try compileFn(e, f.params, f.body, dst),
+        .call => |c| try compileCall(e, c.callee, c.args, dst),
     }
 }
 
@@ -515,6 +595,141 @@ fn compileDo(e: *Emitter, exprs: []const *const Tiny, dst: u12) CompileError!voi
         try compileExpr(e, expr, discard);
     }
     try compileExpr(e, exprs[exprs.len - 1], dst);
+}
+
+/// Lower a `fn*` literal: spawn a child Emitter, compile body
+/// in it, register the resulting Routine in the parent's const
+/// pool, register an empty capture descriptor in the parent's
+/// capture table, emit `closure:make` in the parent.
+///
+/// **Step 5a1 restriction** (peer-AI turn 42): only empty-capture
+/// closures. The child Emitter has NO parent pointer; any free
+/// variable reference in the body raises `UnresolvedSymbol`.
+/// Capture support lands in 5b.
+///
+/// Named `fn*` (self-name) is deferred to 5c per turn 42 — for
+/// step 5a1, `Tiny.fn_star` carries no name field. When 5c lands,
+/// the name extends `Tiny.fn_star` and a placeholder-cell
+/// pattern handles self-reference.
+fn compileFn(
+    parent: *Emitter,
+    params: []const []const u8,
+    body: *const Tiny,
+    dst: u12,
+) CompileError!void {
+    // Reject duplicate parameter names (peer-AI turn 40).
+    // O(N²) is fine for v1; nexis fns are rarely high-arity.
+    for (params, 0..) |p, i| {
+        for (params[0..i]) |q| {
+            if (std.mem.eql(u8, p, q)) return CompileError.DuplicateParam;
+        }
+    }
+    // Per peer-AI turn 43: argc encodes in a 12-bit operand
+    // (max 4095), AND a fresh result slot must fit above the
+    // params (so max practical arity is 4095). Reject > 4095.
+    if (params.len > 4095) return CompileError.SlotOverflow;
+
+    // Spawn child Emitter. Parameters bind to slots 0..N-1
+    // by calling convention (VM.md §6).
+    //
+    // Use `defer` (not `errdefer`) per peer-AI turn 43: after a
+    // successful `child.finish()`, the transferred ArrayLists
+    // (code/consts/capture_descs) are emptied via `toOwnedSlice`,
+    // but `child.scope` retains its capacity. `errdefer` would
+    // skip cleanup on the success path and leak `scope`.
+    // `defer` always fires; `Emitter.deinit` on emptied
+    // ArrayLists is a no-op so the transfer remains correct.
+    var child = Emitter.init(parent.allocator);
+    defer child.deinit();
+
+    for (params, 0..) |p, i| {
+        const slot = try child.allocSlot();
+        std.debug.assert(slot == @as(u12, @intCast(i))); // monotonic invariant
+        try child.pushBinding(p, slot);
+    }
+
+    // Allocate a fresh result slot for the body so a self-move
+    // pattern (compiling a symbol whose binding lives in the
+    // result slot) is naturally a no-op (compileSymbol guard).
+    const result_slot = try child.allocSlot();
+    try compileExpr(&child, body, result_slot);
+    try child.emit(vm.asm_.returnSlot(result_slot));
+
+    // Finalize child. The Emitter's slot_count is the routine's
+    // slot_count; arity is params.len; upvalue_count is 0 in 5a1.
+    const child_compiled = try child.finish();
+
+    // Allocate the Routine on the parent's compile arena so its
+    // pointer outlives both Compiled artifacts (peer-AI turn 42:
+    // compile-arena-owned routine tree).
+    const child_routine = try parent.allocator.create(vm.Routine);
+    child_routine.* = .{
+        .code = child_compiled.code,
+        .consts = child_compiled.consts,
+        .capture_descs = child_compiled.capture_descs,
+        .slot_count = child_compiled.slot_count,
+        .arity = @intCast(params.len),
+        .upvalue_count = 0, // 5a1: empty capture only
+        .name = "<anon-fn>",
+    };
+
+    // Register the routine + an empty capture descriptor in the
+    // PARENT's pools.
+    const proto_idx = try parent.addRoutineConst(child_routine);
+    const cap_desc_idx = try parent.addCaptureDescriptor(.{ .sources = &.{} });
+
+    // Emit closure:make in parent.
+    try parent.emit(vm.asm_.closureMake(proto_idx, cap_desc_idx, dst));
+}
+
+/// Lower a function-call form: stage callee + args in a
+/// contiguous call block per VM.md §6 range-call ABI, emit
+/// `call:call`. The result lands in `dst`.
+///
+/// **Critical** (peer-AI turn 43): the entire `1 + args.len`
+/// contiguous call block MUST be reserved BEFORE compiling
+/// any sub-expression. An earlier per-arg allocSlot pattern
+/// silently broke when the callee or any arg's compilation
+/// allocated its own temp slots — the next arg's allocated
+/// slot would no longer be adjacent to the previous one,
+/// violating the range-call ABI invariant. Reserve up front;
+/// each sub-expression then targets its predetermined slot.
+///
+/// Slot-allocation correctness for "live across the call":
+/// `dst` was allocated by the caller before we entered, and
+/// the call block is allocated after `dst` (so `dst < call_base`).
+/// Per VM.md §6 the call-clobbered region is `[call_base ..
+/// call_base + slot_count)` — `dst` sits below this region
+/// and survives the call.
+fn compileCall(
+    e: *Emitter,
+    callee: *const Tiny,
+    args: []const *const Tiny,
+    dst: u12,
+) CompileError!void {
+    // 12-bit operand encoding: argc + 1 (closure slot) + 1 (room
+    // for the result slot peeking at most one beyond) must fit;
+    // 4095 max args is more than nexis will ever exercise.
+    if (args.len > 4095) return CompileError.SlotOverflow;
+
+    // Reserve the entire contiguous call block up front:
+    //   slot[call_base]                = closure
+    //   slot[call_base + 1 + i]        = arg i
+    const block_count: u32 = 1 + @as(u32, @intCast(args.len));
+    const call_base = try e.allocSlotBlock(block_count);
+
+    // Compile callee into call_base. Sub-expression may itself
+    // allocate temps; those land above the reserved block, which
+    // is correct (they're free-to-use by the time the call fires).
+    try compileExpr(e, callee, call_base);
+    // Compile each arg into its predetermined slot in the block.
+    for (args, 0..) |arg, i| {
+        const arg_slot: u12 = @intCast(@as(u32, call_base) + 1 + @as(u32, @intCast(i)));
+        try compileExpr(e, arg, arg_slot);
+    }
+
+    // Emit the call.
+    try e.emit(vm.asm_.callCall(call_base, @intCast(args.len), dst));
 }
 
 fn compileIf(
@@ -999,6 +1214,187 @@ test "compile: scope restored after compile error" {
     // referencing `x` should still fail.
     const res2 = compileTiny(arena.allocator(), &.{ .symbol = "x" });
     try testing.expectError(CompileError.UnresolvedSymbol, res2);
+}
+
+// ---- step 5a1: fn* + call tests (peer-AI turn 42 checklist) ----
+
+test "compile 5a1: ((fn* [] 42)) = 42" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .int = 42 } } };
+    const result = try runTiny(&arena, &.{ .call = .{ .callee = &fn_form, .args = &.{} } });
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "compile 5a1: ((fn* [x] (+ x 1)) 5) = 6" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .int = 1 } } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{"x"}, .body = &body } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 5 }} } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 6), result.asFixnum());
+}
+
+test "compile 5a1: ((fn* [x y] (+ x y)) 3 4) = 7" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .symbol = "y" } } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{ "x", "y" }, .body = &body } };
+    const call_form: Tiny = .{ .call = .{
+        .callee = &fn_form,
+        .args = &.{ &.{ .int = 3 }, &.{ .int = 4 } },
+    } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 7), result.asFixnum());
+}
+
+test "compile 5a1: (let* [f (fn* [x] (+ x 1))] (f 5)) = 6 — fn bound in let" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .int = 1 } } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{"x"}, .body = &body } };
+    const call_form: Tiny = .{ .call = .{
+        .callee = &.{ .symbol = "f" },
+        .args = &.{&.{ .int = 5 }},
+    } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "f", .value = &fn_form }},
+        .body = &call_form,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 6), result.asFixnum());
+}
+
+test "compile 5a1: (let* [x 5] ((fn* [y] x) 3)) → UnresolvedSymbol (free var; no capture in 5a1)" {
+    // Capture support lands in 5b. In 5a1, the inner fn body
+    // referencing `x` (a parent-frame binding) raises
+    // UnresolvedSymbol — the child Emitter has no parent
+    // pointer, so the lookup has no fall-through.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inner_body: Tiny = .{ .symbol = "x" };
+    const inner_fn: Tiny = .{ .fn_star = .{ .params = &.{"y"}, .body = &inner_body } };
+    const call_form: Tiny = .{ .call = .{ .callee = &inner_fn, .args = &.{&.{ .int = 3 }} } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &call_form,
+    } };
+    const res = compileTiny(arena.allocator(), &let_form);
+    try testing.expectError(CompileError.UnresolvedSymbol, res);
+}
+
+test "compile 5a1: nested call ((fn* [x] x) ((fn* [y] (+ y 1)) 4)) = 5" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inner_body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "y" }, .rhs = &.{ .int = 1 } } };
+    const inner_fn: Tiny = .{ .fn_star = .{ .params = &.{"y"}, .body = &inner_body } };
+    const inner_call: Tiny = .{ .call = .{ .callee = &inner_fn, .args = &.{&.{ .int = 4 }} } };
+    const outer_fn: Tiny = .{ .fn_star = .{ .params = &.{"x"}, .body = &.{ .symbol = "x" } } };
+    const outer_call: Tiny = .{ .call = .{ .callee = &outer_fn, .args = &.{&inner_call} } };
+    const result = try runTiny(&arena, &outer_call);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5a1: duplicate param (fn* [x x] x) → DuplicateParam" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{
+        .params = &.{ "x", "x" },
+        .body = &.{ .symbol = "x" },
+    } };
+    const res = compileTiny(arena.allocator(), &fn_form);
+    try testing.expectError(CompileError.DuplicateParam, res);
+}
+
+test "compile 5a1: arity mismatch — call with too few args traps :arity-mismatch at runtime" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{
+        .params = &.{ "x", "y" },
+        .body = &.{ .symbol = "x" },
+    } };
+    const call_form: Tiny = .{ .call = .{
+        .callee = &fn_form,
+        .args = &.{&.{ .int = 1 }}, // only 1 arg, fn expects 2
+    } };
+    const compiled = try compileTiny(arena.allocator(), &call_form);
+    const routine = compiled.toRoutine("arity-test");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const res = v.run();
+    try testing.expectError(vm.VmError.ArityMismatch, res);
+}
+
+test "compile 5a1: same closure called twice — both invocations succeed" {
+    // (let* [f (fn* [x] (+ x 1))] (+ (f 5) (f 10))) = 6 + 11 = 17
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .int = 1 } } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{"x"}, .body = &body } };
+    const call1: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{&.{ .int = 5 }} } };
+    const call2: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{&.{ .int = 10 }} } };
+    const sum: Tiny = .{ .add = .{ .lhs = &call1, .rhs = &call2 } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "f", .value = &fn_form }},
+        .body = &sum,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 17), result.asFixnum());
+}
+
+test "compile 5a1: fn body uses if + symbol — no captures needed" {
+    // ((fn* [x] (if true x 0)) 7) = 7
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &.{ .bool = true },
+        .then = &.{ .symbol = "x" },
+        .else_ = &.{ .int = 0 },
+    } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{"x"}, .body = &body } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 7 }} } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 7), result.asFixnum());
+}
+
+test "compile 5a1: ((fn* [x y] (+ x y)) ((fn* [a] a) 1) 2) = 3 — call-block contiguity regression" {
+    // Peer-AI turn 43 catch: prior compileCall allocated arg slots
+    // one-at-a-time, so a non-trivial first arg (which itself
+    // allocates temps for its own call block) would push the
+    // second arg's slot past the predetermined position, breaking
+    // the range-call ABI. Fixed by reserving the entire
+    // contiguous block via allocSlotBlock BEFORE compiling
+    // sub-expressions. This test pins the fix.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Inner: (fn* [a] a) called with 1 → 1
+    const inner_fn: Tiny = .{ .fn_star = .{ .params = &.{"a"}, .body = &.{ .symbol = "a" } } };
+    const inner_call: Tiny = .{ .call = .{ .callee = &inner_fn, .args = &.{&.{ .int = 1 }} } };
+    // Outer: (fn* [x y] (+ x y))
+    const outer_body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .symbol = "y" } } };
+    const outer_fn: Tiny = .{ .fn_star = .{ .params = &.{ "x", "y" }, .body = &outer_body } };
+    // Outer call: outer_fn(inner_call, 2)
+    const outer_call: Tiny = .{ .call = .{
+        .callee = &outer_fn,
+        .args = &.{ &inner_call, &.{ .int = 2 } },
+    } };
+    const result = try runTiny(&arena, &outer_call);
+    try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+test "compile 5a1: fn body uses inner let* — no captures of outer needed" {
+    // ((fn* [x] (let* [y x] y)) 5) = 5
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inner_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "y", .value = &.{ .symbol = "x" } }},
+        .body = &.{ .symbol = "y" },
+    } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{"x"}, .body = &inner_let } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 5 }} } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
 test "compile: arena cleanup releases code+consts atomically" {

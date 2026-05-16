@@ -276,6 +276,23 @@ is empty).
 - Routine reference.
 - Upvalue cell array `[*]UpvalCell`.
 
+**Closure value representation — staged (peer-AI turn 43)**:
+v1 step 5a1 implements `Closure` as a struct allocated from a
+VM-owned `runtime_arena`, with `Value.payload` carrying a raw
+`*Closure` pointer. **This is a deliberate temporary violation
+of the VALUE.md §4 heap-value contract**, which requires heap
+kinds to carry `*HeapHeader` payloads. The contract violation
+is acceptable in 5a1 because: (a) no code path calls
+`Heap.asHeapHeader` on closure values, (b) the closure isn't
+yet GC-traced (the function-kind trace function in `src/gc.zig`
+remains the reserved panic from Phase 1), and (c) closures
+have VM-lifetime ownership. The migration to a HeapHeader-
+prefixed Closure (allocated via `heap.alloc(.function, ...)`,
+GC-traceable) lands when real GC integration follows step #5c.
+The Closure field layout (`routine`, `upvalues`) is migration-
+compatible: the header prefix can be added without disturbing
+the existing fields.
+
 **UpvalCell**:
 - Heap object (counted toward GC).
 - Carries exactly one `Value` slot, plus an `initialized: bool`
