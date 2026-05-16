@@ -66,6 +66,18 @@ pub const Kind = enum(u8) {
     // ---- Runtime-private sentinels (never escape public API) ----
     unbound = 64,
     undef = 65,
+    /// Step 5b (peer-AI turn 40 lazy-boxing): a slot's stored
+    /// Value is a pointer to a runtime-arena `UpvalCell` rather
+    /// than an ordinary user value. Set by `closure:box-local`,
+    /// consumed by `closure:get-cell` and `closure:make`'s
+    /// `local_cell_slot` source. Never observable by user code;
+    /// the binding's `BindingRef` in the compiler's scope is
+    /// what records "this slot is now a cell" so subsequent
+    /// reads dispatch to `closure:get-cell` instead of plain
+    /// `mov:move`. GC integration (post-5c) walks these slots
+    /// via the closure trace path; until then, the VM-owned
+    /// runtime arena holds the cell.
+    cell_internal = 66,
     _,
 
     /// Does this kind store its entire value inside the tag+payload

@@ -144,13 +144,45 @@ pub const Binding = struct {
     value: *const Tiny,
 };
 
-/// One entry in the Emitter's lexical scope stack. `slot` is the
-/// frame slot the binding's value lives in. (Step #5 will widen
-/// this to a `BindingRef` union once captured upvalues exist; for
-/// step #4, all bindings are direct value slots.)
+/// How a lexical binding is realized in the current routine's
+/// frame (peer-AI turn 40 / 42 lazy-boxing). Step 5b widens
+/// `LocalBinding.ref` from a bare `u12` slot to this union so
+/// that captured bindings can mutate from `.direct_slot` to
+/// `.cell_slot` mid-compilation when an inner closure first
+/// captures them.
+///
+/// Same-frame read dispatch (in `compileSymbol`):
+///   .direct_slot(s)  → emit `mov:move dst, slot(s)`
+///   .cell_slot(s)    → emit `closure:get-cell dst, slot(s)`
+///   .upvalue(u)      → emit `mov:move dst, u:u` (resolve(u)
+///                      deref's the cell at runtime)
+pub const BindingRef = union(enum) {
+    /// Ordinary slot; binding's value lives directly in
+    /// `slot[s]`. Most bindings stay here.
+    direct_slot: u12,
+    /// Slot holds a `*UpvalCell` (boxed); binding's value lives
+    /// inside the cell. Transitions from `direct_slot` happen
+    /// lazily on first capture per COMPILER.md §6.1.
+    cell_slot: u12,
+    /// Binding is an inherited upvalue of the current routine,
+    /// at the given index in `frame.upvalues`. Reads via U
+    /// operand kind.
+    upvalue: u12,
+};
+
+/// One entry in the Emitter's lexical scope stack.
 pub const LocalBinding = struct {
     name: []const u8,
-    slot: u12,
+    ref: BindingRef,
+};
+
+/// Routine-level capture cache entry (peer-AI turn 45). Maps
+/// a captured name to its upvalue index, so repeat references
+/// to the same outer name from different lexical scopes share
+/// a single upvalue/descriptor entry.
+pub const CapturedName = struct {
+    name: []const u8,
+    upvalue: u12,
 };
 
 // =============================================================================
@@ -197,6 +229,15 @@ pub const CompileError = error{
     /// allowed (unlike `let*` where sequential bindings can
     /// shadow within the same form per COMPILER.md §4.3).
     DuplicateParam,
+
+    /// A compiler invariant was violated. Distinct from a
+    /// user-error like `UnresolvedSymbol`: this indicates the
+    /// compiler reached a state it believes impossible (e.g.,
+    /// `resolveOrCapture` got back `.direct_slot` for a name
+    /// that pre-analysis should have boxed). Surfaces in
+    /// release builds as a clean error rather than panicking;
+    /// debug builds also assert (peer-AI turn 45).
+    InternalCompilerBug,
 
     OutOfMemory,
 };
@@ -282,6 +323,35 @@ const Emitter = struct {
     capture_descs: std.ArrayList(vm.CaptureDescriptor) = .empty,
     scope: std.ArrayList(LocalBinding) = .empty,
     slot_count: u16 = 0,
+    /// Step 5b (peer-AI turn 42 linked-Emitter design): pointer
+    /// to the enclosing routine's Emitter, or null for the
+    /// top-level routine. Capture discovery walks the parent
+    /// chain in `resolveOrCapture`. Synchronous compilation
+    /// guarantees the parent pointer remains valid throughout
+    /// child compilation (parent is blocked in its
+    /// `compileFn` call).
+    parent: ?*Emitter = null,
+    /// Step 5b: captures THIS routine has registered (in
+    /// upvalue-index order). Each entry is a `CaptureSource`
+    /// describing how to source the cell from the PARENT
+    /// frame when the parent's `closure:make` runs. The
+    /// list grows in `resolveOrCapture` as inner functions
+    /// discover free-variable references. At `compileFn`
+    /// finalization, the parent builds a `CaptureDescriptor`
+    /// from `child.captures` and registers it in its own
+    /// `capture_descs` table.
+    captures: std.ArrayList(vm.CaptureSource) = .empty,
+    /// Step 5b (peer-AI turn 45): routine-level cache of
+    /// captured names → upvalue-index. Separate from
+    /// `scope` so inner `let_star` scope restoration cannot
+    /// pop a captured-binding entry. Without this, the same
+    /// outer name referenced in two unrelated inner scopes
+    /// would be captured twice (two upvalue indices, two
+    /// descriptor sources, double-allocated cell pointer in
+    /// the closure). Lexical locals still take precedence
+    /// (resolved via `scope` first), so shadowing is
+    /// preserved.
+    captured_names: std.ArrayList(CapturedName) = .empty,
 
     fn init(allocator: std.mem.Allocator) Emitter {
         return .{ .allocator = allocator };
@@ -292,36 +362,119 @@ const Emitter = struct {
         self.consts.deinit(self.allocator);
         self.capture_descs.deinit(self.allocator);
         self.scope.deinit(self.allocator);
+        self.captures.deinit(self.allocator);
+        self.captured_names.deinit(self.allocator);
     }
 
-    /// Push a binding onto the lexical scope. Does NOT allocate
-    /// a slot — the caller already has one (typically the slot
-    /// the binding's RHS was just compiled into).
+    /// Look up a name in the routine-level capture cache.
+    /// Returns the existing upvalue index if previously
+    /// captured (peer-AI turn 45 dedup); null otherwise.
+    fn lookupCapturedName(self: *const Emitter, name: []const u8) ?u12 {
+        for (self.captured_names.items) |c| {
+            if (std.mem.eql(u8, c.name, name)) return c.upvalue;
+        }
+        return null;
+    }
+
+    /// Push a direct-slot binding onto the lexical scope. Does
+    /// NOT allocate a slot — the caller already has one
+    /// (typically the slot the binding's RHS was just compiled
+    /// into). Subsequent capture by an inner closure may
+    /// mutate the binding to `.cell_slot` via `ensureBoxed`.
     fn pushBinding(self: *Emitter, name: []const u8, slot: u12) CompileError!void {
-        try self.scope.append(self.allocator, .{ .name = name, .slot = slot });
+        try self.scope.append(self.allocator, .{ .name = name, .ref = .{ .direct_slot = slot } });
     }
 
-    /// Resolve `name` to its slot via innermost-shadow lookup.
-    /// Returns null if no binding matches; callers turn that into
-    /// `CompileError.UnresolvedSymbol` (the resolution-priority
-    /// fall-through to vars / core happens in later steps).
+    /// Resolve `name` to a `BindingRef` via innermost-shadow
+    /// lookup of ONLY the current Emitter's scope. Returns null
+    /// if no binding matches; callers walk the parent chain via
+    /// `resolveOrCapture` if appropriate.
     ///
-    /// **Step #4 local-only resolver.** Nested function bodies
-    /// (step #5) MUST NOT use this flat lookup across routine
-    /// boundaries — outer-routine locals must become captured
-    /// upvalues, not direct slot references. Step #5 replaces or
-    /// extends this with capture-aware resolution; the most likely
-    /// shape is a `LexicalEnv { locals, parent: ?*LexicalEnv,
-    /// captures }` chain plus per-binding `BindingRef` records
-    /// (peer-AI turn 39).
-    fn resolveLocal(self: *const Emitter, name: []const u8) ?u12 {
+    /// Step 5b: returns the full BindingRef so callers can
+    /// dispatch on direct/cell/upvalue at emit time.
+    fn resolveLocalRef(self: *const Emitter, name: []const u8) ?BindingRef {
         var i = self.scope.items.len;
         while (i > 0) {
             i -= 1;
             const b = self.scope.items[i];
-            if (std.mem.eql(u8, b.name, name)) return b.slot;
+            if (std.mem.eql(u8, b.name, name)) return b.ref;
         }
         return null;
+    }
+
+    /// Walk self, then parents, to resolve `name` into a
+    /// `BindingRef` suitable for emit-time dispatch in
+    /// `compileSymbol`. If found in self.scope, returns the
+    /// ref directly. If found in a parent, performs the capture
+    /// dance per COMPILER.md §6.1: registers `self.captures`
+    /// (recording how to source the cell from parent), pushes
+    /// the binding into self.scope as `.upvalue(u)` so
+    /// subsequent references in the same routine resolve
+    /// directly, returns `.upvalue(u)`. Recurses transitively
+    /// for grandparent-and-beyond captures (each level
+    /// captures from its own parent so the chain delivers a
+    /// cell pointer to the innermost level).
+    ///
+    /// **Pre-analysis invariant** (peer-AI turn 44): captured
+    /// bindings are guaranteed `.cell_slot` (or `.upvalue`,
+    /// transitively) by the time `resolveOrCapture` walks the
+    /// parent chain. A parent returning `.direct_slot` for a
+    /// captured name indicates pre-analysis missed the capture
+    /// — that's a compiler bug, caught by the assertion below.
+    /// `ensureBoxed` (the lazy-boxing mid-codegen mutation
+    /// helper) was removed in the turn-44 rewrite.
+    ///
+    /// Returns `UnresolvedSymbol` if no enclosing scope (up
+    /// the entire parent chain) has the name.
+    fn resolveOrCapture(self: *Emitter, name: []const u8) CompileError!BindingRef {
+        // Step 1: lexical scope, innermost-first. Lexical
+        // locals (params, let_star bindings) shadow any
+        // captures with the same name, preserving lexical
+        // scope semantics.
+        if (self.resolveLocalRef(name)) |ref| return ref;
+        // Step 2: routine-level capture cache (peer-AI turn 45).
+        // If THIS routine previously captured `name` (from a
+        // sibling scope, or earlier in the body), reuse the
+        // existing upvalue index instead of registering a new
+        // one. This avoids the "synthetic upvalue popped by
+        // inner let_star scope restoration" hazard.
+        if (self.lookupCapturedName(name)) |u| return .{ .upvalue = u };
+        // Step 3: walk parent chain.
+        const parent = self.parent orelse return CompileError.UnresolvedSymbol;
+        const parent_ref = try parent.resolveOrCapture(name);
+        // Step 3: convert parent's ref into a CaptureSource for
+        // self.captures. Pre-analysis guarantees a captured
+        // name's parent binding is .cell_slot (or .upvalue);
+        // a .direct_slot return here means pre-analysis missed
+        // a capture — compiler bug.
+        const source: vm.CaptureSource = switch (parent_ref) {
+            .cell_slot => |s| .{ .local_cell_slot = s },
+            .upvalue => |u| .{ .inherited_upvalue = u },
+            .direct_slot => {
+                // Pre-analysis should have boxed this binding
+                // at let_star binding time or fn_star param
+                // entry. Reaching here is a compiler bug
+                // (peer-AI turn 45 — was UnresolvedSymbol
+                // pre-revision; that error was misleading
+                // because the symbol DID resolve, the box just
+                // wasn't emitted).
+                std.debug.assert(false);
+                return CompileError.InternalCompilerBug;
+            },
+        };
+        // Step 4: register the capture. Append the source to
+        // self.captures (in upvalue-index order) AND record
+        // the name → upvalue mapping in captured_names so
+        // future lookups dedupe (peer-AI turn 45). NOT pushed
+        // into self.scope because scope is for lexical
+        // bindings only — putting captures there meant
+        // inner let_star scope restoration could pop them.
+        const u_idx_usize = self.captures.items.len;
+        if (u_idx_usize >= 4096) return CompileError.SlotOverflow;
+        const u_idx: u12 = @intCast(u_idx_usize);
+        try self.captures.append(self.allocator, source);
+        try self.captured_names.append(self.allocator, .{ .name = name, .upvalue = u_idx });
+        return .{ .upvalue = u_idx };
     }
 
     /// Allocate a fresh result slot. Slots are monotonic; no
@@ -478,6 +631,212 @@ pub fn compileTiny(allocator: std.mem.Allocator, form: *const Tiny) CompileError
 // Internal lowering — destination-driven (peer-AI turn 36)
 // =============================================================================
 
+// =============================================================================
+// Capture pre-analysis (peer-AI turn 44 — supersedes lazy boxing)
+//
+// The analyzer answers: "given a `Tiny` subtree, which names are
+// referenced by some `fn*` body inside the subtree?" The compiler
+// uses this at `let*` binding time and `fn*` parameter time to
+// decide whether to emit `closure:box-local` UNCONDITIONALLY in
+// straight-line prelude code (so the boxing dominates every
+// reachable use, including reads inside or after branches).
+//
+// **Why not lazy-box** (peer-AI turn 44 catch): lazy boxing
+// emitted `closure:box-local` at the moment capture was discovered
+// during inner-fn compilation. If the inner fn was inside a
+// branch (e.g., `(if false (fn* [] x) 0)`), the box-local lived
+// in the unreachable branch while the compiler's BindingRef
+// scope-state thought x was boxed. Subsequent same-frame reads
+// emitted `closure:get-cell` against an unboxed slot at runtime
+// → `:expected-cell` trap on a perfectly valid program.
+//
+// Pre-analysis fixes this by computing the capture set BEFORE
+// codegen and emitting box-local in straight-line prelude code
+// that every reachable path traverses.
+//
+// **Soundness**: a binding is `.cell_slot` iff its
+// `closure:box-local` is in straight-line let-binding prelude
+// (or fn-entry prelude) that dominates every reachable use. The
+// analyzer over-reports captures in the presence of shadowing
+// (e.g., `(let [x 1] (let [x 2] (fn [] x)))` boxes both x's even
+// though only the inner is captured by the inner fn) — this is
+// a small wasted instruction, never a correctness issue.
+// =============================================================================
+
+/// Linear-lookup string set. Sufficient at v1's small Tiny
+/// surface; HashMap is overkill until measured otherwise.
+const NameSet = struct {
+    items: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(self: *NameSet, allocator: std.mem.Allocator) void {
+        self.items.deinit(allocator);
+    }
+
+    fn contains(self: *const NameSet, name: []const u8) bool {
+        for (self.items.items) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
+    }
+
+    fn put(self: *NameSet, allocator: std.mem.Allocator, name: []const u8) CompileError!void {
+        if (self.contains(name)) return;
+        try self.items.append(allocator, name);
+    }
+
+    /// Append every name from `other` not already in self.
+    fn unionWith(self: *NameSet, allocator: std.mem.Allocator, other: *const NameSet) CompileError!void {
+        for (other.items.items) |n| try self.put(allocator, n);
+    }
+};
+
+/// Standard free-variable analysis. Returns names referenced in
+/// `form` that are not bound by `env` (or by any binding inside
+/// `form` as we descend). Used internally by
+/// `capturedByDescendantFns` for `fn_star` boundaries.
+fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet, out: *NameSet) CompileError!void {
+    switch (form.*) {
+        .nil, .bool, .int => {},
+        .symbol => |name| if (!env.contains(name)) try out.put(allocator, name),
+        .add => |a| {
+            try freeVars(allocator, a.lhs, env, out);
+            try freeVars(allocator, a.rhs, env, out);
+        },
+        .if_ => |i| {
+            try freeVars(allocator, i.test_, env, out);
+            try freeVars(allocator, i.then, env, out);
+            if (i.else_) |e| try freeVars(allocator, e, env, out);
+        },
+        .let_star => |l| {
+            // Build incrementally-extended env to honor sequential
+            // bindings (binding-i's RHS sees bindings 1..i-1).
+            var local_env: NameSet = .{};
+            defer local_env.deinit(allocator);
+            try local_env.unionWith(allocator, env);
+            for (l.bindings) |b| {
+                try freeVars(allocator, b.value, &local_env, out);
+                try local_env.put(allocator, b.name);
+            }
+            try freeVars(allocator, l.body, &local_env, out);
+        },
+        .do_ => |exprs| {
+            for (exprs) |expr| try freeVars(allocator, expr, env, out);
+        },
+        .fn_star => |f| {
+            // fn body's env = outer env + params. Names referenced
+            // in fn body not bound by either are "free" — they
+            // escape ALL bound scopes (including outer's), so
+            // they bubble up here too.
+            var fn_env: NameSet = .{};
+            defer fn_env.deinit(allocator);
+            try fn_env.unionWith(allocator, env);
+            for (f.params) |p| try fn_env.put(allocator, p);
+            try freeVars(allocator, f.body, &fn_env, out);
+        },
+        .call => |c| {
+            try freeVars(allocator, c.callee, env, out);
+            for (c.args) |a| try freeVars(allocator, a, env, out);
+        },
+    }
+}
+
+/// Returns the set of names from `env` (names visible at
+/// "this" outer level) that are captured by SOME `fn_star`
+/// within `form`. A name is "captured" if it's referenced
+/// inside a fn body and not bound by that fn's params, any
+/// inner binding, OR any binding between us and the fn that
+/// shadows the name.
+///
+/// **Shadowing-aware** (peer-AI turn 45 fix): the `env`
+/// parameter tracks names visible at our level. As the walk
+/// descends into binding-forms (`let_star`, `fn_star` params),
+/// shadowed names are removed from the live env so they don't
+/// pollute the captured set. This avoids the false positive
+/// from turn 44 where an inner shadow caused the outer binding
+/// to be unnecessarily boxed.
+///
+/// `freeVars` against the descendant fn's own env (params +
+/// inner bindings) gives the names the fn captures. We
+/// intersect with `env` to keep only those bound at our level
+/// (or higher, but for our boxing decision we care about
+/// matches with our specific bindings).
+fn capturedByDescendantFns(
+    allocator: std.mem.Allocator,
+    form: *const Tiny,
+    env: *const NameSet,
+    out: *NameSet,
+) CompileError!void {
+    switch (form.*) {
+        .nil, .bool, .int, .symbol => {},
+        .add => |a| {
+            try capturedByDescendantFns(allocator, a.lhs, env, out);
+            try capturedByDescendantFns(allocator, a.rhs, env, out);
+        },
+        .if_ => |i| {
+            try capturedByDescendantFns(allocator, i.test_, env, out);
+            try capturedByDescendantFns(allocator, i.then, env, out);
+            if (i.else_) |e| try capturedByDescendantFns(allocator, e, env, out);
+        },
+        .let_star => |l| {
+            // As bindings shadow, names with the same name as
+            // a binding fall out of `env`. Build an env-without-
+            // shadowed-names for each phase.
+            // RHS-i sees env shadowed by bindings 1..i-1; body
+            // sees env shadowed by all bindings.
+            var local_env: NameSet = .{};
+            defer local_env.deinit(allocator);
+            try local_env.unionWith(allocator, env);
+            for (l.bindings) |b| {
+                try capturedByDescendantFns(allocator, b.value, &local_env, out);
+                // Remove shadowed name from local_env so subsequent
+                // RHSs / body don't see captures matching it.
+                removeFromSet(&local_env, b.name);
+            }
+            try capturedByDescendantFns(allocator, l.body, &local_env, out);
+        },
+        .do_ => |exprs| {
+            for (exprs) |expr| try capturedByDescendantFns(allocator, expr, env, out);
+        },
+        .fn_star => |f| {
+            // This fn body has its own params as initial env.
+            // The fn's free vars (against params + inner
+            // bindings) are the names it actually captures from
+            // OUR scope. We want only those that match `env`.
+            //
+            // freeVars already recurses through nested fn_stars
+            // (with appropriate inner envs), so descendant fns'
+            // captures bubble up here correctly. No additional
+            // capturedByDescendantFns recursion needed (peer-AI
+            // turn 45 simplification — was redundant).
+            var params_env: NameSet = .{};
+            defer params_env.deinit(allocator);
+            for (f.params) |p| try params_env.put(allocator, p);
+            var fn_free: NameSet = .{};
+            defer fn_free.deinit(allocator);
+            try freeVars(allocator, f.body, &params_env, &fn_free);
+            // Filter: only names visible at our level matter
+            // for our boxing decision.
+            for (fn_free.items.items) |name| {
+                if (env.contains(name)) try out.put(allocator, name);
+            }
+        },
+        .call => |c| {
+            try capturedByDescendantFns(allocator, c.callee, env, out);
+            for (c.args) |a| try capturedByDescendantFns(allocator, a, env, out);
+        },
+    }
+}
+
+/// Remove a name from a NameSet (mutates in place). Used by
+/// `capturedByDescendantFns` to model shadowing during the
+/// env-aware walk.
+fn removeFromSet(set: *NameSet, name: []const u8) void {
+    for (set.items.items, 0..) |n, i| {
+        if (std.mem.eql(u8, n, name)) {
+            _ = set.items.orderedRemove(i);
+            return;
+        }
+    }
+}
+
 /// Lower `form` into bytecode that, when executed, leaves the
 /// form's result in `slot[dst]`.
 fn compileExpr(e: *Emitter, form: *const Tiny, dst: u12) CompileError!void {
@@ -528,21 +887,34 @@ fn compileAdd(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) Compile
 }
 
 fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
-    // Step #4: lexical locals are the only resolution category.
-    // When step #7 (vars) lands, this fall-through becomes:
-    //   1. local → mov:move dst, slot
-    //   2. captured upvalue → resolve(u:N) read (step #5)
-    //   3. namespace var → var:load-var dst, var (step #7)
+    // Step 5b (peer-AI turn 40 lazy-boxing): resolution walks
+    // self first, then parents. A parent-scope hit triggers
+    // capture (lazy box-local in parent, push as upvalue in
+    // self). Step #7 (vars) extends this fall-through:
+    //   1. local (this routine) → dispatch on BindingRef
+    //   2. captured upvalue (parent chain) → resolve.upvalue + capture
+    //   3. namespace var → var:load-var
     //   4. error → :unresolved-symbol
-    const source_slot = e.resolveLocal(name) orelse
-        return CompileError.UnresolvedSymbol;
-    // Skip the no-op self-move (peer-AI turn 38). For step #4
-    // this case can't actually arise because dst is always
-    // caller-allocated and binding slots are Emitter-owned
-    // distinct ranges, but the guard preempts a future bug if
-    // those allocators ever overlap.
-    if (source_slot == dst) return;
-    try e.emit(vm.asm_.move(dst, source_slot));
+    const ref = try e.resolveOrCapture(name);
+    switch (ref) {
+        .direct_slot => |s| {
+            // Skip the no-op self-move (peer-AI turn 38).
+            if (s == dst) return;
+            try e.emit(vm.asm_.move(dst, s));
+        },
+        .cell_slot => |s| {
+            // Same-frame read of a boxed local: closure:get-cell
+            // dereferences slot[s]'s cell pointer and writes
+            // contents to dst.
+            try e.emit(vm.asm_.closureGetCell(dst, s));
+        },
+        .upvalue => |u| {
+            // Captured upvalue: U-operand source via mov:move.
+            // resolve(u:N) deref's the cell at runtime per
+            // VM.md §6 amendment (peer-AI turn 34).
+            try e.emit(vm.asm_.moveFrom(dst, vm.Operand.upvalue(u)));
+        },
+    }
 }
 
 fn compileLetStar(
@@ -552,22 +924,57 @@ fn compileLetStar(
     dst: u12,
 ) CompileError!void {
     // Strict left-of-self visibility per COMPILER.md §4.3
-    // (peer-AI turn 35 + 38): the loop body pushes each
-    // binding to scope AFTER its RHS has been compiled. The
-    // RHS therefore sees bindings 1..i-1 only, not its own
-    // LHS. `(let* [n n] body)` reads outer n for the RHS;
-    // `(let* [x 1 y x] body)` binds y to 1.
+    // (peer-AI turn 35 + 38): each binding's RHS sees bindings
+    // 1..i-1 only, not its own LHS. The loop pushes each
+    // binding to scope AFTER its RHS has been compiled.
     //
-    // Scope is restored via `defer` (peer-AI turn 38) so an
-    // error mid-body doesn't leave scope state polluted for a
-    // recovering caller.
+    // Pre-analysis capture (peer-AI turn 44, supersedes lazy
+    // boxing): for each binding, walk the rest of the let
+    // (subsequent binding RHSs + body) to determine if any
+    // descendant `fn_star` body captures this binding's name.
+    // If yes, emit `closure:box-local` UNCONDITIONALLY in the
+    // let_star prelude (straight-line code that every
+    // reachable path traverses), and push the binding as
+    // `.cell_slot`. Otherwise push as `.direct_slot`. This
+    // makes the runtime cell-vs-direct status of each slot
+    // provably stable across all control-flow paths.
+    //
+    // Scope is restored via `defer` so an error mid-body
+    // doesn't leave scope state polluted for a recovering
+    // caller (peer-AI turn 38).
     const mark = e.scope.items.len;
     defer e.scope.shrinkRetainingCapacity(mark);
 
-    for (bindings) |b| {
+    for (bindings, 0..) |b, i| {
         const slot = try e.allocSlot();
         try compileExpr(e, b.value, slot);
-        try e.pushBinding(b.name, slot);
+
+        // Pre-analyze (peer-AI turn 45 env-aware variant): is
+        // this binding captured by any inner fn_star in the
+        // REMAINING bindings or the body? `env` is just this
+        // single name — the analyzer's shadowing handling
+        // ensures we don't spuriously match a same-named
+        // shadow further inside.
+        var env: NameSet = .{};
+        defer env.deinit(e.allocator);
+        try env.put(e.allocator, b.name);
+        var captured: NameSet = .{};
+        defer captured.deinit(e.allocator);
+        for (bindings[i + 1 ..]) |later| {
+            try capturedByDescendantFns(e.allocator, later.value, &env, &captured);
+        }
+        try capturedByDescendantFns(e.allocator, body, &env, &captured);
+
+        if (captured.contains(b.name)) {
+            // Emit box-local in straight-line prelude code.
+            try e.emit(vm.asm_.closureBoxLocal(slot));
+            try e.scope.append(e.allocator, .{
+                .name = b.name,
+                .ref = .{ .cell_slot = slot },
+            });
+        } else {
+            try e.pushBinding(b.name, slot);
+        }
     }
 
     try compileExpr(e, body, dst);
@@ -629,23 +1036,49 @@ fn compileFn(
     // params (so max practical arity is 4095). Reject > 4095.
     if (params.len > 4095) return CompileError.SlotOverflow;
 
-    // Spawn child Emitter. Parameters bind to slots 0..N-1
-    // by calling convention (VM.md §6).
+    // Spawn child Emitter linked to parent (step 5b: parent
+    // pointer enables capture discovery; was null in 5a1).
     //
     // Use `defer` (not `errdefer`) per peer-AI turn 43: after a
     // successful `child.finish()`, the transferred ArrayLists
     // (code/consts/capture_descs) are emptied via `toOwnedSlice`,
-    // but `child.scope` retains its capacity. `errdefer` would
-    // skip cleanup on the success path and leak `scope`.
-    // `defer` always fires; `Emitter.deinit` on emptied
-    // ArrayLists is a no-op so the transfer remains correct.
+    // but `child.scope` and `child.captures` retain their
+    // capacity. `errdefer` would skip cleanup on the success
+    // path and leak. `defer` always fires; `Emitter.deinit` on
+    // emptied ArrayLists is a no-op so the transfer remains
+    // correct.
     var child = Emitter.init(parent.allocator);
+    child.parent = parent;
     defer child.deinit();
+
+    // Pre-analyze body to find captured params (peer-AI turn 44,
+    // env-aware per turn 45): pass the param set as `env` so
+    // the analyzer only reports captures matching one of OUR
+    // params (and not, e.g., a same-named binding shadowed
+    // inside an inner let_star).
+    var params_env: NameSet = .{};
+    defer params_env.deinit(parent.allocator);
+    for (params) |p| try params_env.put(parent.allocator, p);
+    var captured_in_body: NameSet = .{};
+    defer captured_in_body.deinit(parent.allocator);
+    try capturedByDescendantFns(parent.allocator, body, &params_env, &captured_in_body);
 
     for (params, 0..) |p, i| {
         const slot = try child.allocSlot();
         std.debug.assert(slot == @as(u12, @intCast(i))); // monotonic invariant
-        try child.pushBinding(p, slot);
+        if (captured_in_body.contains(p)) {
+            // Captured param: box at function entry. The
+            // box-local sits in straight-line prelude code so
+            // it always executes before any inner closure could
+            // possibly construct against this slot.
+            try child.emit(vm.asm_.closureBoxLocal(slot));
+            try child.scope.append(child.allocator, .{
+                .name = p,
+                .ref = .{ .cell_slot = slot },
+            });
+        } else {
+            try child.pushBinding(p, slot);
+        }
     }
 
     // Allocate a fresh result slot for the body so a self-move
@@ -655,8 +1088,19 @@ fn compileFn(
     try compileExpr(&child, body, result_slot);
     try child.emit(vm.asm_.returnSlot(result_slot));
 
-    // Finalize child. The Emitter's slot_count is the routine's
-    // slot_count; arity is params.len; upvalue_count is 0 in 5a1.
+    // Step 5b: capture descriptor sources come from
+    // `child.captures` (accumulated by `resolveOrCapture`
+    // during child body compilation). Snapshot them before
+    // `child.finish()` clears them, then register the
+    // descriptor in the PARENT's table.
+    const sources = if (child.captures.items.len == 0)
+        &[_]vm.CaptureSource{}
+    else
+        try parent.allocator.dupe(vm.CaptureSource, child.captures.items);
+    const upvalue_count: u16 = @intCast(child.captures.items.len);
+
+    // Finalize child Compiled (transfers ownership of code,
+    // consts, capture_descs slices to the result).
     const child_compiled = try child.finish();
 
     // Allocate the Routine on the parent's compile arena so its
@@ -669,14 +1113,14 @@ fn compileFn(
         .capture_descs = child_compiled.capture_descs,
         .slot_count = child_compiled.slot_count,
         .arity = @intCast(params.len),
-        .upvalue_count = 0, // 5a1: empty capture only
+        .upvalue_count = upvalue_count,
         .name = "<anon-fn>",
     };
 
-    // Register the routine + an empty capture descriptor in the
-    // PARENT's pools.
+    // Register the routine + the (possibly non-empty) capture
+    // descriptor in the PARENT's pools.
     const proto_idx = try parent.addRoutineConst(child_routine);
-    const cap_desc_idx = try parent.addCaptureDescriptor(.{ .sources = &.{} });
+    const cap_desc_idx = try parent.addCaptureDescriptor(.{ .sources = sources });
 
     // Emit closure:make in parent.
     try parent.emit(vm.asm_.closureMake(proto_idx, cap_desc_idx, dst));
@@ -1266,11 +1710,18 @@ test "compile 5a1: (let* [f (fn* [x] (+ x 1))] (f 5)) = 6 — fn bound in let" {
     try testing.expectEqual(@as(i64, 6), result.asFixnum());
 }
 
-test "compile 5a1: (let* [x 5] ((fn* [y] x) 3)) → UnresolvedSymbol (free var; no capture in 5a1)" {
-    // Capture support lands in 5b. In 5a1, the inner fn body
-    // referencing `x` (a parent-frame binding) raises
-    // UnresolvedSymbol — the child Emitter has no parent
-    // pointer, so the lookup has no fall-through.
+test "compile 5b: (let* [x 5] ((fn* [y] x) 3)) = 5 — single capture" {
+    // Step 5b: this is the canonical hand-trace example
+    // (lazy-boxing capture). Outer x = 5 is captured by inner
+    // fn body. compileSymbol for `x` inside the fn body walks
+    // to parent, triggers lazy box-local on outer's x, registers
+    // the capture source, returns BindingRef.upvalue(0).
+    // The fn body emits `mov:move dst, u:0` which deref's the
+    // cell at runtime.
+    //
+    // (In 5a1 this raised UnresolvedSymbol because child
+    // Emitter had no parent pointer. 5b's resolveOrCapture
+    // resolves it correctly.)
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const inner_body: Tiny = .{ .symbol = "x" };
@@ -1280,8 +1731,8 @@ test "compile 5a1: (let* [x 5] ((fn* [y] x) 3)) → UnresolvedSymbol (free var; 
         .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
         .body = &call_form,
     } };
-    const res = compileTiny(arena.allocator(), &let_form);
-    try testing.expectError(CompileError.UnresolvedSymbol, res);
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
 test "compile 5a1: nested call ((fn* [x] x) ((fn* [y] (+ y 1)) 4)) = 5" {
@@ -1357,6 +1808,402 @@ test "compile 5a1: fn body uses if + symbol — no captures needed" {
     const result = try runTiny(&arena, &call_form);
     try testing.expectEqual(@as(i64, 7), result.asFixnum());
 }
+
+// ---- step 5b: capture machinery tests ----
+
+test "compile 5b: (let* [x 5] ((fn* [y] (+ x y)) 3)) = 8 — capture + use" {
+    // The canonical hand-trace from before 5b implementation.
+    // x is captured, y is a param, body adds them.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .symbol = "y" } } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{"y"}, .body = &body } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 3 }} } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &call_form,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 8), result.asFixnum());
+}
+
+test "compile 5b: (let* [x 5 y 10] ((fn* [] (+ x y)))) = 15 — multi-capture" {
+    // Two bindings, both captured by the inner fn body.
+    // Each goes through ensureBoxed independently; child's
+    // capture descriptor gets two local_cell_slot sources.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .symbol = "y" } } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &body } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{} } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{
+            .{ .name = "x", .value = &.{ .int = 5 } },
+            .{ .name = "y", .value = &.{ .int = 10 } },
+        },
+        .body = &call_form,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 15), result.asFixnum());
+}
+
+test "compile 5b: (let* [x 5] (let* [f (fn* [] x)] (f))) = 5 — let-bound captured fn" {
+    // Captured fn stored in a let binding, then called by name.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const inner_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } };
+    const inner_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "f", .value = &fn_form }},
+        .body = &inner_call,
+    } };
+    const outer_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &inner_let,
+    } };
+    const result = try runTiny(&arena, &outer_let);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5b: (let* [x 5] ((fn* [] ((fn* [] x))))) = 5 — transitive capture" {
+    // Inner-inner fn captures x. Middle fn doesn't reference
+    // x directly but MUST capture it so that the closure:make
+    // for the inner-inner fn (which runs inside middle fn's
+    // frame) has a cell for x.
+    //
+    // Resolution chain:
+    //   inner-inner-fn sees x → walk to middle
+    //   middle has no x in local scope → walk to outer
+    //   outer has x as direct_slot → ensureBoxed on outer, mutate
+    //                                 to cell_slot
+    //   middle registers a capture (source = local_cell_slot in
+    //                                outer's frame)
+    //   middle pushes x as upvalue(0) into its own scope
+    //   inner-inner registers a capture (source =
+    //                                inherited_upvalue(0))
+    //   inner-inner pushes x as upvalue(0) into its own scope
+    //   inner-inner body emits mov:move dst, u:0
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const innermost_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const innermost_call: Tiny = .{ .call = .{ .callee = &innermost_fn, .args = &.{} } };
+    const middle_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &innermost_call } };
+    const middle_call: Tiny = .{ .call = .{ .callee = &middle_fn, .args = &.{} } };
+    const outer_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &middle_call,
+    } };
+    const result = try runTiny(&arena, &outer_let);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5b: same binding captured twice — second capture re-uses existing cell" {
+    // (let* [x 5] ((fn* [] x)) ((fn* [] x))) — both fns
+    // capture x. After the first fn's compileFn finishes, x
+    // is .cell_slot in outer scope. The second fn's compileFn
+    // sees x as .cell_slot already, doesn't re-emit
+    // closure:box-local, and just references local_cell_slot
+    // for the same slot.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn1: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const fn2: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const call1: Tiny = .{ .call = .{ .callee = &fn1, .args = &.{} } };
+    const call2: Tiny = .{ .call = .{ .callee = &fn2, .args = &.{} } };
+    // Use the second call as the result so we exercise both.
+    const body: Tiny = .{ .do_ = &.{ &call1, &call2 } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5b: captured + non-captured params mix" {
+    // (let* [x 10] ((fn* [y] (+ x y)) 7)) = 17
+    // x is captured (becomes upvalue), y is a normal param
+    // (direct_slot). The fn body's `+` reads both via the
+    // appropriate BindingRef dispatch.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .symbol = "y" } } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{"y"}, .body = &body } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 7 }} } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 10 } }},
+        .body = &call_form,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 17), result.asFixnum());
+}
+
+test "compile 5b: still-unresolved symbol traps UnresolvedSymbol" {
+    // (let* [x 5] ((fn* [] z))) — z is not in any enclosing
+    // scope. With 5b's parent-chain walk, the chain still
+    // bottoms out at top-level Emitter with no parent →
+    // UnresolvedSymbol.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "z" } } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{} } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &call_form,
+    } };
+    const res = compileTiny(arena.allocator(), &let_form);
+    try testing.expectError(CompileError.UnresolvedSymbol, res);
+}
+
+test "compile 5b: captured fn used after let binding scope (closure outlives binding)" {
+    // Demonstrates the central reason for boxing-via-cell:
+    // when the closure is returned out of the let* and called
+    // from elsewhere, the captured x must still work even
+    // though the outer let* frame has long since exited.
+    //
+    // (let* [add5 (let* [x 5] (fn* [y] (+ x y)))] (add5 3)) = 8
+    //
+    // The inner let* exits before add5 is called; if x weren't
+    // boxed into a heap cell, the captured slot would be
+    // stale memory.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .symbol = "y" } } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{"y"}, .body = &fn_body } };
+    const inner_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &fn_form,
+    } };
+    const outer_call: Tiny = .{ .call = .{
+        .callee = &.{ .symbol = "add5" },
+        .args = &.{&.{ .int = 3 }},
+    } };
+    const outer_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "add5", .value = &inner_let }},
+        .body = &outer_call,
+    } };
+    const result = try runTiny(&arena, &outer_let);
+    try testing.expectEqual(@as(i64, 8), result.asFixnum());
+}
+
+test "compile 5b: same-frame read of a captured binding after capture" {
+    // (let* [x 5] (do ((fn* [] x)) x)) — outer let body's
+    // second expression reads `x` AFTER the inner fn captured
+    // it. By 5b lazy-boxing, x is now .cell_slot in outer
+    // scope; the second read emits closure:get-cell instead of
+    // mov:move.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inner_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const inner_call: Tiny = .{ .call = .{ .callee = &inner_fn, .args = &.{} } };
+    const body: Tiny = .{ .do_ = &.{ &inner_call, &.{ .symbol = "x" } } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+// ---- step 5b control-flow safety tests (peer-AI turn 44) ----
+
+test "compile 5b: capture in unreachable branch — same-frame read works" {
+    // (let* [x 5] (do (if false (fn* [] x) 0) x)) = 5
+    //
+    // The hazard the lazy-boxing model failed: if the closure
+    // creation is skipped at runtime, but the compiler still
+    // thinks x is boxed, same-frame reads emit closure:get-cell
+    // against an unboxed slot → ExpectedCell trap.
+    //
+    // Pre-analysis fixes this: x is captured by the inner fn,
+    // so closure:box-local s_x is emitted in the let* prelude
+    // (always executed), regardless of whether the if-branch
+    // actually constructs the closure.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const if_form: Tiny = .{ .if_ = .{
+        .test_ = &.{ .bool = false },
+        .then = &fn_form,
+        .else_ = &.{ .int = 0 },
+    } };
+    const body: Tiny = .{ .do_ = &.{ &if_form, &.{ .symbol = "x" } } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5b: capture in unreachable branch — second closure construction works" {
+    // (let* [x 5] (do (if false (fn* [] x) 0) ((fn* [] x)))) = 5
+    //
+    // Variant of the above: the second occurrence is itself a
+    // closure construction. Under lazy boxing the second fn*
+    // may compile assuming x is already boxed (skip box-local),
+    // but at runtime the first branch was skipped and slot[s_x]
+    // is a direct fixnum, so closure:make's local_cell_slot
+    // source traps :expected-cell.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn1: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const fn2: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const if_form: Tiny = .{ .if_ = .{
+        .test_ = &.{ .bool = false },
+        .then = &fn1,
+        .else_ = &.{ .int = 0 },
+    } };
+    const second_call: Tiny = .{ .call = .{ .callee = &fn2, .args = &.{} } };
+    const body: Tiny = .{ .do_ = &.{ &if_form, &second_call } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5b: capture in taken branch still works" {
+    // (let* [x 5] (do (if true (fn* [] x) 0) x)) = 5
+    //
+    // Sanity: the case the lazy-boxing model did handle
+    // correctly should still work after the pre-analysis fix.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const if_form: Tiny = .{ .if_ = .{
+        .test_ = &.{ .bool = true },
+        .then = &fn_form,
+        .else_ = &.{ .int = 0 },
+    } };
+    const body: Tiny = .{ .do_ = &.{ &if_form, &.{ .symbol = "x" } } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5b: three-level transitive capture (let [x] ((fn () ((fn () ((fn () x))))))) = 5" {
+    // Pin the recursive resolveOrCapture invariant at deeper
+    // nesting (peer-AI turn 44 sanity check).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const innermost_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const innermost_call: Tiny = .{ .call = .{ .callee = &innermost_fn, .args = &.{} } };
+    const middle_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &innermost_call } };
+    const middle_call: Tiny = .{ .call = .{ .callee = &middle_fn, .args = &.{} } };
+    const outer_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &middle_call } };
+    const outer_call: Tiny = .{ .call = .{ .callee = &outer_fn, .args = &.{} } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &outer_call,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5b: shadowing capture — inner let-bound x shadows outer for inner fn" {
+    // (let* [x 1] (let* [f (let* [x 2] (fn* [] x))] (f))) = 2
+    //
+    // Inner let binds x to 2, then creates fn capturing x = 2.
+    // Outer fn binding f captures the closure. Calling f
+    // returns 2 (NOT 1 from the outermost x).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const inner_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 2 } }},
+        .body = &fn_form,
+    } };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } };
+    const middle_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "f", .value = &inner_let }},
+        .body = &f_call,
+    } };
+    const outer_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 1 } }},
+        .body = &middle_let,
+    } };
+    const result = try runTiny(&arena, &outer_let);
+    try testing.expectEqual(@as(i64, 2), result.asFixnum());
+}
+
+test "compile 5b: outer x captured by f, inner x shadows for body but not f's captured value" {
+    // (let* [x 1, f (fn* [] x)] (let* [x 2] (f))) = 1
+    //
+    // f captures the OUTER x = 1 at construction time.
+    // Inner let* shadows x with 2 for its body, but f's captured
+    // cell still references the outer x = 1.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } };
+    const inner_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 2 } }},
+        .body = &f_call,
+    } };
+    const outer_let: Tiny = .{ .let_star = .{
+        .bindings = &.{
+            .{ .name = "x", .value = &.{ .int = 1 } },
+            .{ .name = "f", .value = &fn_form },
+        },
+        .body = &inner_let,
+    } };
+    const result = try runTiny(&arena, &outer_let);
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "compile 5b: param shadowed by inner let — only inner is captured (peer-AI turn 45)" {
+    // (((fn* [x] (let* [x 2] (fn* [] x))) 1)) = 2
+    //
+    // Outer fn's param x is shadowed by inner let's x = 2.
+    // The innermost fn captures the SHADOWED inner x. Outer
+    // param x should NOT be boxed (the env-aware analyzer
+    // should detect the shadow and skip).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const innermost_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const inner_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 2 } }},
+        .body = &innermost_fn,
+    } };
+    const outer_fn: Tiny = .{ .fn_star = .{ .params = &.{"x"}, .body = &inner_let } };
+    const outer_call: Tiny = .{ .call = .{
+        .callee = &outer_fn,
+        .args = &.{&.{ .int = 1 }},
+    } };
+    // outer_call returns the closure; we then call it with no args.
+    const final_call: Tiny = .{ .call = .{ .callee = &outer_call, .args = &.{} } };
+    const result = try runTiny(&arena, &final_call);
+    try testing.expectEqual(@as(i64, 2), result.asFixnum());
+}
+
+test "compile 5b: captured param + branch — param boxed at fn entry (peer-AI turn 45)" {
+    // ((fn* [x] (do (if false (fn* [] x) 0) x)) 5) = 5
+    //
+    // Param x is captured by the inner fn (in unreachable
+    // branch). Pre-analysis must box x at function entry, so
+    // the same-frame read of x at the end of the do works
+    // regardless of whether the branch executes.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inner_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
+    const if_form: Tiny = .{ .if_ = .{
+        .test_ = &.{ .bool = false },
+        .then = &inner_fn,
+        .else_ = &.{ .int = 0 },
+    } };
+    const body: Tiny = .{ .do_ = &.{ &if_form, &.{ .symbol = "x" } } };
+    const outer_fn: Tiny = .{ .fn_star = .{ .params = &.{"x"}, .body = &body } };
+    const call: Tiny = .{ .call = .{ .callee = &outer_fn, .args = &.{&.{ .int = 5 }} } };
+    const result = try runTiny(&arena, &call);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+// ---- regression: 5a1 tests continue to work in 5b ----
 
 test "compile 5a1: ((fn* [x y] (+ x y)) ((fn* [a] a) 1) 2) = 3 — call-block contiguity regression" {
     // Peer-AI turn 43 catch: prior compileCall allocated arg slots

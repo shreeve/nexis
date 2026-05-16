@@ -384,20 +384,32 @@ subsequent `closure:make` can capture it.
   `initialized = true`. Replace `slot[A]` contents with the
   cell pointer.
 
-**Compiler emission timing** (peer-AI turn 40): a
-**one-pass compiler** (the v1 implementation in
-`src/compile.zig`) emits this **lazily, just before the
-enclosing `closure:make`**, NOT at the original binding
-point. See `COMPILER.md §6.1` for the full lazy-boxing
-discipline. A **two-pass compiler** (a future analyzer-
-backed lowering) may emit it at binding time after capture
-analysis has run. Both timings produce observably-equivalent
-behavior for v1 ordinary lexical locals because v1 lexical
-bindings are immutable. The opcode itself is timing-agnostic.
+**Compiler emission timing** (peer-AI turn 44, superseding
+turn 40 lazy-boxing): the v1 implementation in
+`src/compile.zig` does **capture pre-analysis per `let*` /
+`fn*`** and emits `closure:box-local` at **binding time**
+(let-binding prelude) or **function entry** (for captured
+params). The emission sits in straight-line code that every
+reachable runtime path traverses, guaranteeing the slot
+holds an `UpvalCell*` before any inner closure could
+possibly construct against it. This makes `closure:get-cell`
+and `closure:make`'s `local_cell_slot` source safely strict
+(no runtime "ensure cell" dynamic check needed).
 
-After emission (whichever timing), future reads of the local
-in the defining frame must use `closure:get-cell` (or any
-opcode through which a U-operand resolves to cell contents).
+The earlier turn-40 design ("lazy boxing": emit just before
+the enclosing `closure:make`) was retracted because it was
+not control-flow safe — closures created in unreachable
+branches would leave the binding unboxed at runtime while
+the compiler's scope thought it was boxed. See `COMPILER.md
+§6.1` for the full pre-analysis discipline.
+
+The opcode itself is timing-agnostic; either emission
+strategy produces the same instruction. The pre-analysis
+emission point is what makes the VM-level invariants hold.
+
+After emission, future reads of the local in the defining
+frame must use `closure:get-cell` (or any opcode through
+which a U-operand resolves to cell contents).
 
 **Errors**:
 - `:invalid-cell-state` if `slot[A]` already holds an
@@ -1153,6 +1165,16 @@ Per peer-AI turn 28:
 - **2026-04-19** (spec commit): Initial draft. All contracts
   `proposed`. No implementation yet. Peer-AI turn 28 decisions
   embedded.
+- **2026-05-16** (§6 — `closure:box-local` emission timing
+  reverted to pre-analysis, peer-AI turn 44): the turn-40
+  lazy-boxing emission timing was retracted as
+  control-flow-unsafe (closures in unreachable branches
+  would skip the box-local at runtime while the compiler's
+  scope thought the binding was boxed). v1 emission timing
+  is now binding-time / function-entry per pre-analysis
+  (COMPILER.md §6.1). The opcode semantics did not change;
+  only the emission discipline did.
+
 - **2026-05-15** (§5 / §6 / §13 — pre-step-#5 amendments,
   peer-AI turn 40): three changes prompted by the strategy
   turn before step #5 (functions + closures) implementation.

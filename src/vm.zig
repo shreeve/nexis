@@ -111,6 +111,10 @@ pub const Operand = packed struct(u16) {
     pub fn jump(i: u12) Operand {
         return .{ .kind = .jump, .index = i };
     }
+
+    pub fn upvalue(i: u12) Operand {
+        return .{ .kind = .upvalue, .index = i };
+    }
 };
 
 /// Instruction kind discriminator — primary vs extension (per PLAN
@@ -477,6 +481,29 @@ pub const VmError = error{
     /// VM.md §13 taxonomy with a richer `:out-of-memory`
     /// runtime error category that carries context.
     OutOfMemory,
+    /// `U` operand index exceeds the current frame's
+    /// `upvalues.len`, OR a `closure:make` `inherited_upvalue`
+    /// descriptor source exceeds it. Per VM.md §13
+    /// `:upvalue-out-of-range` (peer-AI turn 34).
+    UpvalueOutOfRange,
+    /// An opcode that requires an `UpvalCell*` in a slot (e.g.,
+    /// `closure:get-cell`, `closure:make` `local_cell_slot`
+    /// source) found a different Value kind in the slot. Per
+    /// VM.md §13 `:expected-cell` (peer-AI turn 34).
+    ExpectedCell,
+    /// `closure:box-local` invoked on a slot that already holds
+    /// an `UpvalCell*` (double-box), OR `closure:init-cell` on
+    /// an already-initialized cell. Per VM.md §13
+    /// `:invalid-cell-state` (peer-AI turn 34). Indicates a
+    /// compiler bug — should never reach the runtime.
+    InvalidCellState,
+    /// `closure:get-cell` (or U-operand resolve) read a cell
+    /// whose `initialized = false` — a placeholder cell that
+    /// has not yet been filled in. Per VM.md §13
+    /// `:uninitialized-cell` (peer-AI turn 34). Indicates a
+    /// `closure:init-cell` was emitted out of order or skipped
+    /// entirely.
+    UninitializedCell,
 };
 
 // =============================================================================
@@ -569,6 +596,43 @@ pub const VM = struct {
         return @ptrFromInt(v.payload);
     }
 
+    /// Allocate an UpvalCell from the runtime arena, return a
+    /// VM-private `Value` of kind `.cell_internal` whose payload
+    /// points at the cell. Step 5b box-local emission: when the
+    /// compiler discovers a binding is captured, it emits
+    /// `closure:box-local s` which calls `boxCell(slot[s].value)`
+    /// and replaces slot[s] with the returned cell-value. Same
+    /// staged-allocation discipline as `allocClosure` — VM-owned
+    /// arena lifetime, migration-compatible with future GC heap.
+    pub fn allocCell(self: *VM, initial: Value, initialized: bool) !Value {
+        const arena = self.runtime_arena.allocator();
+        const cell = try arena.create(UpvalCell);
+        cell.* = .{ .value = initial, .initialized = initialized };
+        return Value{
+            .tag = @as(u64, @intFromEnum(value_mod.Kind.cell_internal)),
+            .payload = @intFromPtr(cell),
+        };
+    }
+
+    /// Decode a `.cell_internal` Value to its underlying
+    /// `*UpvalCell`. Returns `ExpectedCell` if the Value's kind
+    /// is anything else (peer-AI turn 34: `:expected-cell` runtime
+    /// trap). Callers that already validated the kind (e.g., via
+    /// a `BindingRef.cell_slot` lookup) can use
+    /// `asCellUnchecked`; user-facing handlers should use this
+    /// validating variant.
+    pub fn asCell(v: Value) VmError!*UpvalCell {
+        if (v.kind() != value_mod.Kind.cell_internal) return VmError.ExpectedCell;
+        return @ptrFromInt(v.payload);
+    }
+
+    /// Unchecked variant of `asCell` for paths that have already
+    /// validated the Value's kind. Safety builds still assert.
+    pub fn asCellUnchecked(v: Value) *UpvalCell {
+        std.debug.assert(v.kind() == value_mod.Kind.cell_internal);
+        return @ptrFromInt(v.payload);
+    }
+
     /// Pointer to the currently-executing frame. **Single-shot use
     /// only**: a `frames.append()` in any code path between fetch
     /// and use will invalidate this pointer. For multi-step access,
@@ -619,6 +683,15 @@ pub const VM = struct {
     /// enforcement) — `closure:make` is the only opcode that
     /// reads routine constants, and it does so via a dedicated
     /// path, not through generic `resolve()`.
+    ///
+    /// For `.upvalue` operands (step 5b, peer-AI turns 34/40):
+    /// `U` is the **cell-contents** operand kind. `resolve(u:N)`
+    /// reads the current frame's `upvalues[N]` (a `*UpvalCell`),
+    /// validates it's `initialized = true`, and returns the
+    /// cell's value. Closure construction needs RAW cell pointers
+    /// (not contents) and does NOT go through `resolve()` — it
+    /// reads `frame.upvalues[u]` directly via a dedicated path
+    /// in `execClosureMake`. Do not conflate the two.
     fn resolve(self: *VM, op: Operand) VmError!Value {
         return switch (op.kind) {
             .slot => (try self.slotPtr(op.index)).*,
@@ -630,8 +703,15 @@ pub const VM = struct {
                     .routine => return VmError.InvalidOperandKind,
                 };
             },
+            .upvalue => blk: {
+                const frame = self.currentFrame();
+                if (op.index >= frame.upvalues.len) return VmError.UpvalueOutOfRange;
+                const cell = frame.upvalues[op.index];
+                if (!cell.initialized) return VmError.UninitializedCell;
+                break :blk cell.value;
+            },
             // Remaining kinds land with their respective opcode groups.
-            .var_, .upvalue, .intern, .jump, .durable => VmError.UnimplementedOpcode,
+            .var_, .intern, .jump, .durable => VmError.UnimplementedOpcode,
             // `unused` is a sentinel emitted by the assembler for
             // operand slots the opcode doesn't consume; calling
             // `resolve` on one is an opcode-handler bug.
@@ -987,10 +1067,52 @@ pub const VM = struct {
         const variant: Closure_ = @enumFromInt(inst.variant);
         switch (variant) {
             .make => try self.execClosureMake(inst),
-            // box_local / new_cell / init_cell / get_cell wire in 5b/5c.
-            .box_local, .new_cell, .init_cell, .get_cell => return VmError.UnimplementedOpcode,
+            .box_local => try self.execClosureBoxLocal(inst),
+            .get_cell => try self.execClosureGetCell(inst),
+            // new_cell / init_cell wire in 5c (letfn* + named fn*).
+            .new_cell, .init_cell => return VmError.UnimplementedOpcode,
             _ => return VmError.BytecodeCorruption,
         }
+    }
+
+    /// `closure:box-local A=slot _ _` — wrap slot[A]'s current
+    /// value into a fresh, initialized UpvalCell. Replaces
+    /// slot[A] with the cell-internal Value pointing at the cell.
+    /// Per VM.md §6 (peer-AI turn 34, emission timing peer
+    /// turn 40 lazy-boxing).
+    ///
+    /// Errors:
+    ///   - InvalidCellState if slot[A] already holds a cell
+    ///     pointer (double-box). Indicates compiler bug.
+    fn execClosureBoxLocal(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        const ptr = try self.slotPtr(inst.a.index);
+        const current = ptr.*;
+        if (current.kind() == value_mod.Kind.cell_internal) {
+            return VmError.InvalidCellState;
+        }
+        const cell_value = self.allocCell(current, true) catch return VmError.OutOfMemory;
+        // ptr may have been invalidated by stack growth inside
+        // allocCell? No — allocCell only touches runtime_arena,
+        // not vm.stack. Safe to reuse ptr.
+        ptr.* = cell_value;
+    }
+
+    /// `closure:get-cell A=dst_slot B=cell_slot _` — read the
+    /// contents of an UpvalCell whose pointer lives in slot[B];
+    /// write to slot[A]. Used by same-frame reads of a boxed
+    /// local (peer-AI turn 34).
+    ///
+    /// Errors:
+    ///   - ExpectedCell if slot[B] doesn't hold a cell pointer.
+    ///   - UninitializedCell if cell.initialized = false.
+    fn execClosureGetCell(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        if (inst.b.kind != .slot) return VmError.InvalidOperandKind;
+        const cell_v = (try self.slotPtr(inst.b.index)).*;
+        const cell = try VM.asCell(cell_v);
+        if (!cell.initialized) return VmError.UninitializedCell;
+        try self.store(inst.a, cell.value);
     }
 
     /// `closure:make A=prototype_const B=cap_desc_imm C=result_slot`
@@ -1026,17 +1148,48 @@ pub const VM = struct {
             return VmError.CaptureCountMismatch;
         }
 
-        // 5a1: only empty-capture descriptors are populated, so
-        // upvalues is always an empty slice in this commit.
-        // 5b will allocate a `[]const *UpvalCell` array sized
-        // to `desc.sources.len` and populate from the descriptor
-        // sources reading `frame.slots[s.local_cell_slot]` or
-        // `frame.upvalues[s.inherited_upvalue]` respectively.
-        if (desc.sources.len != 0) return VmError.UnimplementedOpcode;
+        // Step 5b (peer-AI turn 34 descriptor encoding): for
+        // each capture source, read the raw *UpvalCell pointer.
+        //   .local_cell_slot(s): slot[s] must hold a cell-
+        //     internal Value (boxed by prior closure:box-local).
+        //   .inherited_upvalue(u): caller's frame.upvalues[u]
+        //     is already a *UpvalCell pointer — copy directly.
+        // Construct the closure's upvalues[] by appending each
+        // resolved cell pointer in descriptor order.
+        const arena = self.runtime_arena.allocator();
+        var upvalues: []*UpvalCell = undefined;
+        if (desc.sources.len == 0) {
+            upvalues = &.{};
+        } else {
+            upvalues = arena.alloc(*UpvalCell, desc.sources.len) catch
+                return VmError.OutOfMemory;
+            for (desc.sources, 0..) |source, i| {
+                upvalues[i] = switch (source) {
+                    .local_cell_slot => |s| blk: {
+                        const cell_v = (try self.slotPtr(s)).*;
+                        // Must be a cell pointer (peer-AI turn 34:
+                        // `:expected-cell` trap). The compiler's
+                        // lazy-boxing path guarantees this in
+                        // well-formed bytecode; malformed bytecode
+                        // (e.g., descriptor source referencing an
+                        // un-boxed slot) traps here.
+                        break :blk try VM.asCell(cell_v);
+                    },
+                    .inherited_upvalue => |u| blk: {
+                        if (u >= frame.upvalues.len) return VmError.UpvalueOutOfRange;
+                        // Direct raw-cell access — NOT via
+                        // resolve(u), which would deref to
+                        // cell-contents (peer-AI turn 34 raw-vs-
+                        // contents distinction).
+                        break :blk frame.upvalues[u];
+                    },
+                };
+            }
+        }
 
-        // Allocate the closure with an empty upvalue array.
+        // Allocate the closure with the populated upvalue array.
         // (Allocator failure surfaces as VmError.OutOfMemory.)
-        const closure_v = self.allocClosure(child_routine, &.{}) catch
+        const closure_v = self.allocClosure(child_routine, upvalues) catch
             return VmError.OutOfMemory;
 
         try self.store(inst.c, closure_v);
@@ -1343,6 +1496,49 @@ pub const asm_ = struct {
             Operand.slot(call_base),
             Operand.slot(argc), // raw-index immediate per §4.5
             Operand.slot(result_slot),
+        );
+    }
+
+    /// General `mov:move dst, src` where `src` may be any operand
+    /// kind that `resolve` accepts (slot / constant / upvalue).
+    /// Used by `compileSymbol` for upvalue reads (step 5b):
+    /// `moveFrom(dst, Operand.upvalue(u))` lowers a captured-
+    /// binding read. The pre-existing `move(dst, slot_src)`
+    /// helper remains for the slot-to-slot common case.
+    pub fn moveFrom(slot_dst: u12, src: Operand) Inst {
+        return Inst.primary(
+            .mov,
+            Mov.move,
+            Operand.slot(slot_dst),
+            src,
+            Operand.none,
+        );
+    }
+
+    /// `closure:box-local A=slot` — wrap slot[A]'s current value
+    /// into a fresh `UpvalCell`, replacing slot[A] with the cell
+    /// pointer. Lazy-boxing emission timing per COMPILER.md §6.1
+    /// (peer-AI turn 40).
+    pub fn closureBoxLocal(slot_idx: u12) Inst {
+        return Inst.primary(
+            .closure,
+            Closure_.box_local,
+            Operand.slot(slot_idx),
+            Operand.none,
+            Operand.none,
+        );
+    }
+
+    /// `closure:get-cell A=dst_slot B=cell_slot` — read the
+    /// contents of an `UpvalCell` whose pointer lives in slot[B];
+    /// write to slot[A]. Same-frame read of a boxed local.
+    pub fn closureGetCell(dst: u12, cell_slot: u12) Inst {
+        return Inst.primary(
+            .closure,
+            Closure_.get_cell,
+            Operand.slot(dst),
+            Operand.slot(cell_slot),
+            Operand.none,
         );
     }
 };
@@ -2477,6 +2673,200 @@ test "VM 5a1: closure:make with capture descriptor index out of range traps Oper
     defer vm.deinit();
     const res = vm.run();
     try testing.expectError(VmError.OperandOutOfRange, res);
+}
+
+// ---- step 5b: cell operations + U-operand tests ----
+
+test "VM 5b: closure:box-local wraps slot value into an UpvalCell" {
+    // Load 42 into s0, box it, then verify s0 holds a cell and
+    // the cell's value is 42.
+    const consts = [_]Const{cval(value_mod.fromFixnum(42).?)};
+    var code = [_]Inst{
+        asm_.loadConst(0, 0),
+        asm_.closureBoxLocal(0),
+        asm_.returnSlot(0), // return the cell value (we'll inspect via VM state, not result)
+    };
+    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    // After box-local, the slot (now returned as result) is a cell-internal Value.
+    try testing.expect(result.kind() == value_mod.Kind.cell_internal);
+    const cell = try VM.asCell(result);
+    try testing.expect(cell.initialized);
+    try testing.expectEqual(@as(i64, 42), cell.value.asFixnum());
+}
+
+test "VM 5b: closure:box-local on already-boxed slot traps :invalid-cell-state" {
+    const consts = [_]Const{cval(value_mod.fromFixnum(7).?)};
+    var code = [_]Inst{
+        asm_.loadConst(0, 0),
+        asm_.closureBoxLocal(0), // first box
+        asm_.closureBoxLocal(0), // second box — must trap
+        asm_.returnSlot(0),
+    };
+    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.InvalidCellState, res);
+}
+
+test "VM 5b: closure:get-cell reads cell contents back" {
+    const consts = [_]Const{cval(value_mod.fromFixnum(99).?)};
+    var code = [_]Inst{
+        asm_.loadConst(0, 0),
+        asm_.closureBoxLocal(0),
+        asm_.closureGetCell(1, 0), // s1 = *cell at s0
+        asm_.returnSlot(1),
+    };
+    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 2 };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 99), result.asFixnum());
+}
+
+test "VM 5b: closure:get-cell on non-cell traps :expected-cell" {
+    const consts = [_]Const{cval(value_mod.fromFixnum(5).?)};
+    var code = [_]Inst{
+        asm_.loadConst(0, 0), // s0 = fixnum 5 (NOT a cell)
+        asm_.closureGetCell(1, 0),
+        asm_.returnSlot(1),
+    };
+    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 2 };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.ExpectedCell, res);
+}
+
+test "VM 5b: mov:move with U-operand source resolves cell contents (no opcode needed)" {
+    // Per peer-AI turn 34: no dedicated closure:read-upval —
+    // resolve(u:N) deref's the cell. Test it via a hand-assembled
+    // single-frame routine where we manually populate frame.upvalues.
+    var child_code = [_]Inst{
+        asm_.moveFrom(0, Operand.upvalue(0)), // s0 = u:0 (deref)
+        asm_.returnSlot(0),
+    };
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &.{},
+        .slot_count = 1,
+        .arity = 0,
+        .upvalue_count = 1,
+    };
+
+    // Set up VM with a top-level routine that calls the child.
+    // We need closure:make to provide an upvalue, which means
+    // we need to first box a local. Use box + make + call.
+    var parent_consts_storage = [_]Const{
+        cval(value_mod.fromFixnum(123).?),
+        croutine(&child_routine),
+    };
+    const parent_caps = [_]CaptureDescriptor{
+        .{ .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} },
+    };
+    var parent_code = [_]Inst{
+        asm_.loadConst(0, 0), //                 s0 = 123
+        asm_.closureBoxLocal(0), //              s0 = *cell{123}
+        asm_.closureMake(1, 0, 1), //            s1 = closure capturing cell at s0
+        asm_.callCall(1, 0, 2), //               s2 = (child) — child returns 123 via U deref
+        asm_.returnSlot(2),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts_storage,
+        .capture_descs = &parent_caps,
+        .slot_count = 3,
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 123), result.asFixnum());
+}
+
+test "VM 5b: U-operand out of range traps :upvalue-out-of-range" {
+    // Child routine has upvalue_count=0 but tries to read u:0.
+    var child_code = [_]Inst{
+        asm_.moveFrom(0, Operand.upvalue(0)),
+        asm_.returnSlot(0),
+    };
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &.{},
+        .slot_count = 1,
+        .arity = 0,
+        .upvalue_count = 0,
+    };
+
+    var parent_consts = [_]Const{croutine(&child_routine)};
+    const parent_caps = [_]CaptureDescriptor{.{ .sources = &.{} }};
+    var parent_code = [_]Inst{
+        asm_.closureMake(0, 0, 0),
+        asm_.callCall(0, 0, 1),
+        asm_.returnSlot(1),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts,
+        .capture_descs = &parent_caps,
+        .slot_count = 2,
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.UpvalueOutOfRange, res);
+}
+
+test "VM 5b: closure:make with local_cell_slot source populates closure.upvalues" {
+    // Standalone test of closure:make's descriptor execution
+    // (the existing 5a1 closure:make tests all used empty
+    // descriptors). Box a slot, then closure:make with one
+    // local_cell_slot source. Verify closure.upvalues has the
+    // right cell.
+    var child_code = [_]Inst{asm_.returnNil()};
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &.{},
+        .slot_count = 1,
+        .arity = 0,
+        .upvalue_count = 1,
+    };
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(42).?),
+        croutine(&child_routine),
+    };
+    const caps = [_]CaptureDescriptor{
+        .{ .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} },
+    };
+    var code = [_]Inst{
+        asm_.loadConst(0, 0), //         s0 = 42
+        asm_.closureBoxLocal(0), //      s0 = *cell{42}
+        asm_.closureMake(1, 0, 1), //    s1 = closure with upvalue[0] = cell
+        asm_.returnSlot(1),
+    };
+    const routine = Routine{
+        .code = &code,
+        .consts = &consts,
+        .capture_descs = &caps,
+        .slot_count = 2,
+    };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.kind() == .function);
+    const closure = VM.asClosure(result);
+    try testing.expectEqual(@as(usize, 1), closure.upvalues.len);
+    try testing.expectEqual(@as(i64, 42), closure.upvalues[0].value.asFixnum());
+    try testing.expect(closure.upvalues[0].initialized);
 }
 
 test "VM 5a1: same closure called twice — both invocations succeed" {

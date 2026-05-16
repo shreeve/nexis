@@ -667,42 +667,52 @@ discipline that supersedes earlier "at binding time" wording).
   an upvalue pointer array copied from the closure; U#
   operands resolve via the callee frame's upvalue array.
 
-#### 6.1 Lazy boxing — one-pass compiler implementation (peer-AI turn 40)
+#### 6.1 Pre-analysis capture, binding-time boxing (peer-AI turn 44)
 
-The earlier sections describe captured-binding semantics in a
-"compute capture, then box at binding time" two-pass framing.
-**A one-pass compiler cannot honestly do this** — when compiling
-`(let* [x 5] (fn* [] x))`, the compiler does not know `x` is
-captured at the point it compiles the binding RHS. It discovers
-it later, when compiling the inner `fn*` body.
+The v1 implementation in `src/compile.zig` does
+**capture pre-analysis per `let*` and per `fn*`**, then emits
+`closure:box-local` at **binding time** (or function entry for
+captured params), making the runtime cell-vs-direct status of
+each slot **provably stable across all control-flow paths**.
 
-The v1 implementation in `src/compile.zig` adopts **lazy boxing**:
+**History**: an earlier amendment (peer-AI turn 40) proposed
+"lazy boxing" — emit `closure:box-local` at the moment an inner
+closure first captures a binding, mutating the binding's
+`BindingRef` from `.direct_slot` to `.cell_slot` mid-codegen.
+That design was elegant for straight-line code but **fundamentally
+broken under control flow**: if the inner closure is created in a
+branch (e.g., `(if false (fn* [] x) 0)`), the `box-local` lives
+in the unreachable branch, while subsequent same-frame reads
+emit `closure:get-cell` against an unboxed slot — `:expected-cell`
+trap on a perfectly valid program. Peer-AI turn 44 caught this
+before the implementation was committed; this section was
+rewritten to the pre-analysis model below.
 
-1. **Bindings start as direct slots.** A fresh `let*` binding
-   pushes a `LocalBinding{ name, ref: .direct_slot(s) }` onto
-   the scope. No `closure:box-local` is emitted at binding time.
-   Same-frame reads of a `direct_slot` binding emit `mov:move
-   dst, slot(s)`.
+**The pre-analysis algorithm** (per `let*` / `fn*`):
 
-2. **Capture is discovered during inner-fn compilation.** When
-   compiling a child function's body, a symbol that resolves to
-   a parent-scope binding triggers capture. If the parent
-   binding is `.direct_slot(s)`:
+1. **Capture-set computation** — `freeVarsAcrossFn(body, locally_bound)`
+   walks the Tiny tree under `body`, accumulating the set of
+   names that are referenced by ANY enclosed `fn*` body and
+   that are NOT bound locally to that `fn*`. The walk recurses
+   into `fn*` bodies with that fn's params as the inner-bound
+   set; the result percolates up to the enclosing scope. This
+   is "free vars across function boundaries" — exactly the set
+   of names the enclosing scope's bindings might have to box.
 
-   a. The parent emits `closure:box-local s` **just before** its
-      `closure:make` instruction (i.e., just-in-time, at the
-      point the closure is constructed — NOT at the original
-      binding point).
+2. **`let*` binding-time decision**: when binding `name` at
+   slot `s`, check whether `name ∈ freeVarsAcrossFn(remaining
+   bindings + body)`. If yes, immediately emit
+   `closure:box-local s` and push the binding as `.cell_slot(s)`.
+   If no, push as `.direct_slot(s)`. The `closure:box-local`
+   instruction sits in the routine's straight-line prelude, so
+   it executes on every code path that reaches the let body.
 
-   b. The parent **mutates** the binding to
-      `.cell_slot(s)` so that subsequent same-frame reads (and
-      subsequent closures capturing the same binding) use the
-      now-boxed cell.
+3. **`fn*` param decision**: when entering a `fn*` body, check
+   each param against `freeVarsAcrossFn(body)`. Box captured
+   params at function entry (immediately after argument
+   reception); push as `.cell_slot`.
 
-   c. The child's capture descriptor records
-      `local_cell_slot(s)` for this upvalue.
-
-3. **Same-frame reads dispatch on `BindingRef`**:
+4. **Same-frame read dispatch** (in `compileSymbol`):
 
    ```
    .direct_slot(s) → mov:move dst, slot(s)
@@ -710,31 +720,49 @@ The v1 implementation in `src/compile.zig` adopts **lazy boxing**:
    .upvalue(u)     → mov:move dst, u:u   (resolve(u) deref's the cell)
    ```
 
-4. **Soundness for v1**: lazy boxing is observably equivalent
-   to binding-time boxing because v1 ordinary lexical locals are
-   **immutable**. Reading the binding before vs after the cell
-   transition yields the same value either way (the cell holds
-   a copy of the value at the moment of `closure:box-local`).
-   This identity breaks for mutable cells (`volatile!`,
-   post-v1); when those land, the timing-vs-mutability
-   interaction must be explicitly redesigned.
+5. **Capture from parent scope** (in `resolveOrCapture`): when
+   a child Emitter resolves a name to a parent-scope binding,
+   the parent's binding is **already** `.cell_slot` if the name
+   appears in any `fn*` body within the parent's scope (which
+   includes the child being compiled). If the resolution
+   returns `.direct_slot` instead, that's a compiler bug
+   (pre-analysis missed a capture). Implementation asserts
+   this via a debug-only check.
 
-5. **Implementation invariant**: by the time a `closure:make`
-   instruction is emitted, every captured parent binding it
-   references has been transitioned to `.cell_slot` (or was
-   already `.cell_slot` from a prior capture). The
-   `local_cell_slot(s)` source in the capture descriptor is
-   therefore always reading from a slot that holds an
-   `UpvalCell*`, never a direct value. `closure:make`'s
-   handler validates this with `:expected-cell` (VM.md §6 + §13).
+6. **`BindingRef`** is **immutable from binding time onward** in
+   the pre-analysis model. There is no `ensureBoxed` mid-
+   codegen mutation. The data structure is the same union as
+   before:
 
-**Alternative considered and rejected**: a pre-analysis pass
-that walks the Tiny tree to compute capture sets before codegen.
-Cleanly matches the original "at binding time" wording but
-doubles the compile-time machinery for v1's small Tiny surface.
-Real reader-form integration (step #8+) may revisit this when
-the macroexpander already walks the form tree once for fixed-
-point expansion.
+   ```zig
+   pub const BindingRef = union(enum) {
+       direct_slot: u12,
+       cell_slot: u12,
+       upvalue: u12,
+   };
+   ```
+
+**Implementation cost**: the `freeVarsAcrossFn` walker is ~80
+LOC of pure Tiny-tree traversal; runs once per `let*` and once
+per `fn*`. For the small Tiny surface this is trivially fast.
+When real reader-form integration lands (step #8+), the
+macroexpander/analyzer already walks the form tree, so the
+analysis can be folded into existing passes.
+
+**Soundness invariant** (peer-AI turn 44):
+> A binding is `.cell_slot` iff `closure:box-local` was emitted
+> for its slot in the routine's prelude (or function entry for
+> params), which guarantees the slot holds an `UpvalCell*` on
+> every reachable runtime path. `closure:get-cell` and
+> `closure:make`'s `local_cell_slot` source can therefore use
+> strict cell-only semantics with no runtime "ensure cell"
+> dynamic check.
+
+This invariant holds because the `closure:box-local` for a
+captured binding sits in straight-line code (let-binding
+prelude or fn-entry prelude) that EVERY reachable code path
+traverses before any inner `fn*` could possibly construct a
+closure that references the binding.
 
 **Invariants** (continuation):
 - `UpvalCell` is a **heap object**, traced by the GC like any
@@ -963,29 +991,39 @@ from code contact:
   no-implementation-cost; they pin behavior the implementation
   was going to need anyway.
 - **2026-05-15** (§6.1 added — lazy-boxing model): Pre-step-#5
-  strategy turn (peer-AI turn 40) caught that the pre-existing
-  §6 wording ("at the binding point, the compiler emits
-  `closure:box-local`") is **wrong for a one-pass compiler**.
-  When compiling `(let* [x 5] (fn* [] x))`, the compiler does
-  not know `x` is captured at the point it compiles the
-  binding RHS — it discovers it later, while compiling the
-  inner `fn*` body. The §6 wording assumed an analyzer pass
-  had already classified bindings before codegen. v1's
-  one-pass codegen needs a different discipline.
-  New §6.1 pins **lazy boxing**: bindings start as
-  `.direct_slot`, mutate to `.cell_slot` when capture is
-  first discovered, with `closure:box-local` emitted just
-  before the parent's `closure:make` (NOT at the original
-  binding point). Soundness rests on v1 lexical locals
-  being immutable; the timing distinction is observably
-  invisible because no read of the binding can witness the
-  pre-vs-post-boxing transition. The two-pass alternative
-  (pre-analysis pass over the Tiny tree) is documented as
-  considered-and-rejected. When real reader-form
-  integration lands and the macroexpander already walks the
-  form tree, the two-pass path may become preferable —
-  amend then.
-  Same-frame binding reads dispatch on `BindingRef`:
-  `.direct_slot` → `mov:move`; `.cell_slot` →
-  `closure:get-cell`; `.upvalue` → U operand. This
-  formalizes what was previously implicit in §6.
+  strategy turn (peer-AI turn 40) introduced lazy boxing as a
+  one-pass alternative to binding-time boxing. The §6.1 text
+  described the lazy-boxing discipline. **SUPERSEDED on
+  2026-05-16 by peer-AI turn 44** — see entry below.
+
+- **2026-05-16** (§6.1 rewritten — pre-analysis): peer-AI
+  turn 44 caught that the lazy-boxing model is **fundamentally
+  not control-flow safe**. When an inner closure is created in
+  a branch (e.g., `(if false (fn* [] x) 0)`), lazy boxing
+  emits `closure:box-local` inside the branch's code, while
+  mutating the binding's `BindingRef` to `.cell_slot` in
+  compile-time scope. At runtime, the branch may not execute,
+  so the box-local is skipped. Subsequent same-frame reads
+  emit `closure:get-cell` against an unboxed slot — traps
+  `:expected-cell` on a perfectly valid program. The bug was
+  caught BEFORE any commit landed it (the implementation was
+  in-progress with 575/575 tests passing because no test
+  exercised control-flow + capture together).
+  §6.1 rewritten to describe **pre-analysis**: walk the Tiny
+  tree per `let*` and per `fn*` to compute the captured-name
+  set BEFORE codegen, emit `closure:box-local` at binding
+  time (or function entry for captured params) so the
+  emission sits in straight-line code that every reachable
+  path traverses. `BindingRef` becomes immutable from binding
+  time onward; no `ensureBoxed` mid-codegen mutation.
+  Soundness invariant: a binding is `.cell_slot` iff its
+  `closure:box-local` is in straight-line prelude code that
+  dominates every reachable use. Same-frame reads
+  (`closure:get-cell`) and capture descriptor sources
+  (`local_cell_slot`) can use strict cell-only semantics with
+  no runtime "ensure cell" dynamic check.
+  The implementation cost is ~80 LOC of pure Tiny-tree walking
+  for the analyzer (`freeVarsAcrossFn`); trivially fast at
+  v1's small Tiny surface. Future reader-form integration can
+  fold the analysis into existing macroexpander/analyzer
+  passes.
