@@ -204,6 +204,22 @@ pub const Tiny = union(enum) {
     var_ref: struct {
         name: []const u8,
     },
+    /// `(defn name [params...] body)` per PLAN §6.1. Step #6c.
+    /// Sugar for `(def name (fn* name [params...] body))` —
+    /// the function carries its own name as the self-name (so
+    /// the body can recurse via the lexical name without going
+    /// through the Var, just like step 5c's named-fn*). The
+    /// Var binding makes the function reachable from outside
+    /// the form. Together: forward references between defns
+    /// work because each `defn` interns its Var (possibly
+    /// unbound at compile time), and call-time resolution via
+    /// the Var-table picks up whatever's bound by then.
+    defn: struct {
+        name: []const u8,
+        params: []const []const u8,
+        rest_param: ?[]const u8 = null,
+        body: *const Tiny,
+    },
     /// `(letfn* [(name1 params1 body1) (name2 params2 body2) ...] body)`
     /// per PLAN §6.1 + COMPILER.md §5.6b. Step 5c.
     /// Mutually-recursive function bindings: each fn body can
@@ -1014,6 +1030,19 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
             if (d.value) |val| try freeVars(allocator, val, env, out);
         },
         .var_ref => {}, // leaf: no sub-expressions, no free vars
+        .defn => |d| {
+            // Step #6c: defn lowers to (def name (fn* name ...)).
+            // For free-var analysis, treat the body's env as
+            // outer env + params + rest_param + name (the
+            // self-name is bound inside the fn body).
+            var fn_env: NameSet = .{};
+            defer fn_env.deinit(allocator);
+            try fn_env.unionWith(allocator, env);
+            for (d.params) |p| try fn_env.put(allocator, p);
+            if (d.rest_param) |rp| try fn_env.put(allocator, rp);
+            try fn_env.put(allocator, d.name);
+            try freeVars(allocator, d.body, &fn_env, out);
+        },
     }
 }
 
@@ -1158,6 +1187,22 @@ fn capturedByDescendantFns(
             if (d.value) |val| try capturedByDescendantFns(allocator, val, env, out);
         },
         .var_ref => {}, // leaf
+        .defn => |d| {
+            // Mirror the fn_star arm: body env = params +
+            // rest_param + self-name; report names in `env`
+            // that the body actually references.
+            var params_env: NameSet = .{};
+            defer params_env.deinit(allocator);
+            for (d.params) |p| try params_env.put(allocator, p);
+            if (d.rest_param) |rp| try params_env.put(allocator, rp);
+            try params_env.put(allocator, d.name);
+            var fn_free: NameSet = .{};
+            defer fn_free.deinit(allocator);
+            try freeVars(allocator, d.body, &params_env, &fn_free);
+            for (fn_free.items.items) |fname| {
+                if (env.contains(fname)) try out.put(allocator, fname);
+            }
+        },
     }
 }
 
@@ -1202,6 +1247,7 @@ fn compileExpr(
         .recur => |r| try compileRecur(e, r.args, recur_target),
         .def => |d| try compileDef(e, d.name, d.value, dst),
         .var_ref => |v| try compileVarRef(e, v.name, dst),
+        .defn => |d| try compileDefn(e, d.name, d.params, d.rest_param, d.body, dst),
     }
 }
 
@@ -1351,6 +1397,40 @@ fn compileVarRef(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
     if (e.namespace == null) return CompileError.UnresolvedSymbol;
     const idx = try e.addVarRef(name);
     try e.emit(vm.asm_.varVarObject(dst, idx));
+}
+
+/// Step #6c: lower `(defn name [params...] body)` as sugar for
+/// `(def name (fn* name [params...] body))`. The fn* carries
+/// `name` as its self-name so the body can self-recurse via
+/// the lexical name (handled by step 5c's named-fn placeholder
+/// pattern, no Var indirection). The outer `def` binds the
+/// Var so the function is callable from outside.
+///
+/// Forward references work because compileDef interns the Var
+/// possibly unbound; a sibling `defn` referencing this name
+/// emits `var:load-var` against the same Var. The trap fires
+/// only if the function is INVOKED before the Var is bound.
+///
+/// Requires a Namespace (inherits the constraint from compileDef).
+fn compileDefn(
+    e: *Emitter,
+    name: []const u8,
+    params: []const []const u8,
+    rest_param: ?[]const u8,
+    body: *const Tiny,
+    dst: u12,
+) CompileError!void {
+    // Build the equivalent `(fn* name [params...] body)` and
+    // dispatch through compileDef. The fn_star value lives on
+    // the Zig stack frame; compileDef and compileFn complete
+    // synchronously, so the pointer remains valid.
+    const fn_form: Tiny = .{ .fn_star = .{
+        .name = name,
+        .params = params,
+        .rest_param = rest_param,
+        .body = body,
+    } };
+    try compileDef(e, name, &fn_form, dst);
 }
 
 fn compileLetStar(
@@ -3027,6 +3107,152 @@ test "compile #6b: same Var referenced multiple times shares one var_table index
     const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
     // x appears in def + 2 symbol refs = same Var, 1 var_table entry.
     try testing.expectEqual(@as(usize, 1), compiled.var_table.len);
+}
+
+// ---- step #6c: defn + forward references tests ----
+
+test "compile #6c: (do (defn add1 [n] (+ n 1)) (add1 5)) = 6" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 1 } } };
+    const defn_form: Tiny = .{ .defn = .{
+        .name = "add1",
+        .params = &.{"n"},
+        .body = &body,
+    } };
+    const call_form: Tiny = .{ .call = .{
+        .callee = &.{ .symbol = "add1" },
+        .args = &.{&.{ .int = 5 }},
+    } };
+    const form: Tiny = .{ .do_ = &.{ &defn_form, &call_form } };
+    const result = try runTinyWithNs(&arena, &form);
+    try testing.expectEqual(@as(i64, 6), result.asFixnum());
+}
+
+test "compile #6c: (do (defn zero [] 0) (zero)) = 0 — nullary defn" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const defn_form: Tiny = .{ .defn = .{
+        .name = "zero",
+        .params = &.{},
+        .body = &.{ .int = 0 },
+    } };
+    const call_form: Tiny = .{ .call = .{ .callee = &.{ .symbol = "zero" }, .args = &.{} } };
+    const form: Tiny = .{ .do_ = &.{ &defn_form, &call_form } };
+    const result = try runTinyWithNs(&arena, &form);
+    try testing.expectEqual(@as(i64, 0), result.asFixnum());
+}
+
+test "compile #6c: defn supports recur for self-call (named fn* under the hood)" {
+    // (do (defn loop-down [n]
+    //       (if (< n 1) n (recur (+ n -1))))
+    //     (loop-down 5)) = 0
+    // Verifies that defn's lowering correctly threads the named-
+    // fn* path so recur in the body targets the function.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const neg1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = -1 } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&neg1} } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 1 } } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &.{ .symbol = "n" },
+        .else_ = &recur_form,
+    } };
+    const defn_form: Tiny = .{ .defn = .{
+        .name = "loop-down",
+        .params = &.{"n"},
+        .body = &body,
+    } };
+    const call_form: Tiny = .{ .call = .{
+        .callee = &.{ .symbol = "loop-down" },
+        .args = &.{&.{ .int = 5 }},
+    } };
+    const form: Tiny = .{ .do_ = &.{ &defn_form, &call_form } };
+    const result = try runTinyWithNs(&arena, &form);
+    try testing.expectEqual(@as(i64, 0), result.asFixnum());
+}
+
+test "compile #6c: forward reference — defn f calls g defined later" {
+    // (do (defn f [] (g))
+    //     (defn g [] 42)
+    //     (f)) = 42
+    // f compiles when g is still unbound (Var interned by
+    // symbol fall-through). At call time g is bound; load-var
+    // returns the closure; call succeeds.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f_body: Tiny = .{ .call = .{ .callee = &.{ .symbol = "g" }, .args = &.{} } };
+    const f_defn: Tiny = .{ .defn = .{ .name = "f", .params = &.{}, .body = &f_body } };
+    const g_defn: Tiny = .{ .defn = .{ .name = "g", .params = &.{}, .body = &.{ .int = 42 } } };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } };
+    const form: Tiny = .{ .do_ = &.{ &f_defn, &g_defn, &f_call } };
+    const result = try runTinyWithNs(&arena, &form);
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "compile #6c: forward reference + call before bind → UnboundVar trap" {
+    // (do (defn f [] (g))
+    //     (f))                ;; g never defined
+    // f compiles (g's Var interned unbound), but invoking f
+    // tries to load g's root → :unbound-var.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f_body: Tiny = .{ .call = .{ .callee = &.{ .symbol = "g" }, .args = &.{} } };
+    const f_defn: Tiny = .{ .defn = .{ .name = "f", .params = &.{}, .body = &f_body } };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } };
+    const form: Tiny = .{ .do_ = &.{ &f_defn, &f_call } };
+
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
+    const routine = compiled.toRoutine("unbound-fwd");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    try testing.expectError(vm.VmError.UnboundVar, v.run());
+}
+
+test "compile #6c: defn rebinding preserves Var identity" {
+    // (do (defn f [] 1)
+    //     (defn f [] 2)
+    //     (f)) = 2
+    // Like (def x 5) (def x 10) but via defn — same Var
+    // rebound, callers see the new value.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f1: Tiny = .{ .defn = .{ .name = "f", .params = &.{}, .body = &.{ .int = 1 } } };
+    const f2: Tiny = .{ .defn = .{ .name = "f", .params = &.{}, .body = &.{ .int = 2 } } };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } };
+    const form: Tiny = .{ .do_ = &.{ &f1, &f2, &f_call } };
+    const result = try runTinyWithNs(&arena, &form);
+    try testing.expectEqual(@as(i64, 2), result.asFixnum());
+}
+
+test "compile #6c: defn with rest param works end-to-end" {
+    // (do (defn first-of [a & r] a)
+    //     (first-of 7 99 100)) = 7
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const defn_form: Tiny = .{ .defn = .{
+        .name = "first-of",
+        .params = &.{"a"},
+        .rest_param = "r",
+        .body = &.{ .symbol = "a" },
+    } };
+    const call_form: Tiny = .{ .call = .{
+        .callee = &.{ .symbol = "first-of" },
+        .args = &.{ &.{ .int = 7 }, &.{ .int = 99 }, &.{ .int = 100 } },
+    } };
+    const form: Tiny = .{ .do_ = &.{ &defn_form, &call_form } };
+    const result = try runTinyWithNs(&arena, &form);
+    try testing.expectEqual(@as(i64, 7), result.asFixnum());
 }
 
 // ---- if-form tests (peer-AI turn 36 checklist) ----
