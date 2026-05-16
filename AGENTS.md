@@ -56,7 +56,13 @@ value kinds. Each of these is a frozen commitment. Amend `PLAN.md` first.
 
 - `zig build parser`  — regenerates `src/parser.zig` from `nexis.grammar`
   by invoking `../nexus/bin/nexus` (the nexus binary must exist).
-- `zig build test`    — runs reader unit tests + golden-file verification.
+- `zig build test`    — runs the full Phase 0/1/2 suite (unit + property +
+  golden). ~3 minutes due to Phase 1's randomized HAMT correctness gate.
+  Run before commits, NOT in the inner edit/test loop.
+- `zig build phase2-test` — runs ONLY the `vm` + `compile` module tests
+  (~3 seconds). Use this for Phase 2 compiler/VM iteration. When a new
+  Phase 2 module lands (e.g. `macroexpand`, `resolve`), add it to the
+  step in `build.zig`.
 - `zig build golden`  — golden diff alone.
 - `zig build golden -Dupdate=true` — rewrite expected files in place
   (use only when intentionally changing schema; commit diffs together).

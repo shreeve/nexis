@@ -2,7 +2,8 @@
 //!
 //! Usage:
 //!   zig build parser                    regenerate src/parser.zig from nexis.grammar
-//!   zig build test                      run Zig-native unit + property tests
+//!   zig build test                      run Zig-native unit + property tests (full suite, ~3min)
+//!   zig build phase2-test               run only vm + compile tests (~3s, for Phase 2 iteration)
 //!   zig build golden                    verify golden reader outputs (byte-exact)
 //!   zig build golden -Dupdate=true      regenerate golden expected files
 //!
@@ -640,6 +641,32 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all Phase 0/1 tests (unit + property + golden)");
     for (runtime_test_runs) |r| test_step.dependOn(&r.step);
+
+    // -------------------------------------------------------------------------
+    // `zig build phase2-test` — fast iteration target for Phase 2 work
+    //
+    // Runs ONLY the vm + compile module tests (currently ~187 tests in ~3s).
+    // The full `zig build test` re-runs Phase 1's randomized HAMT correctness
+    // gate, 10k+ collection ops, etc. — ~3min and unrelated to Phase 2
+    // compiler/VM iteration. Use this step during the Phase 2 edit/test loop;
+    // run the full suite before committing significant changes.
+    //
+    // When a new Phase 2 module lands (e.g., macroexpand.zig, resolve.zig),
+    // add its entry to `runtime_test_files` AND append the corresponding
+    // `runtime_test_runs[N]` to this step.
+    // -------------------------------------------------------------------------
+
+    const phase2_test_step = b.step("phase2-test", "Run only vm + compile tests (fast Phase 2 iteration)");
+    // Indices into runtime_test_files: vm = 16, compile = 17. Asserted at
+    // build time so a re-ordering of runtime_test_files trips this loudly
+    // instead of silently running the wrong tests.
+    comptime {
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[16].name, "vm"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[17].name, "compile"));
+    }
+    phase2_test_step.dependOn(&runtime_test_runs[16].step);
+    phase2_test_step.dependOn(&runtime_test_runs[17].step);
+
     test_step.dependOn(&run_prop_primitive_tests.step);
     test_step.dependOn(&run_prop_intern_tests.step);
     test_step.dependOn(&run_prop_heap_tests.step);
