@@ -1,16 +1,16 @@
-# nexis Phase 1 — Handoff Prompt (write this to the next AI as your first message)
+# nexis Phase 2 — Handoff Prompt (write this to the next AI as your first message)
 
 ```
 You are taking over work on the nexis project — a modern, Zig-native Lisp
 inspired by Clojure, built for persistent data, durable identity, and
 world-class performance. Multi-phase implementation driven by PLAN.md at
-the repository root. Phase 1 is roughly 55% risk-weighted complete; you
-are continuing mid-phase from a clean, all-green tree.
+the repository root.
 
-The previous AI's final act was to land persistent-vector + retire the
-architectural composition risk that peer-AI review had flagged as the
-project's primary hidden fault line. Your job is to continue from there
-with the same discipline.
+Phase 1 is COMPLETE — all 8 gates closed (PLAN.md §20.2). Phase 2 is in
+progress: VM kernel and the tiny compiler for `(+ 1 2)` have shipped
+(steps #1 and #2 of COMPILER.md §10's 11-step sequence). Step #3
+(conditionals: `jump:*` opcodes + `if` lowering) is next, against a
+spec that is fully converged from three peer-AI strategy/review turns.
 
 Read this entire prompt before touching anything.
 
@@ -19,100 +19,72 @@ Read this entire prompt before touching anything.
 
 - Location: /Users/shreeve/Data/Code/nexis/
 - Remote:   git@github.com:shreeve/nexis.git
-- Branch:   main, tracking origin/main, pushed
-- Last commit: 1be3317 Phase 1: persistent vector + cross-kind sequential
-               architecture retirement
+- Branch:   main
+- HEAD:     check `git log -1 --oneline`. Three new commits this session:
+              <c3>  docs: refresh HANDOFF.md for Phase 2 step #3
+              2a0831d phase 2 step #2: math:add opcode + tiny compiler for (+ 1 2)
+              ac75f69 docs: VM.md + COMPILER.md spec amendments (peer-AI turns 32, 34, 35)
+              (and the earlier session work above those — `git log --oneline -30`)
 - Working tree clean. Verify with `git status`.
 
-Phase 1 commit history (most recent first):
-  1be3317 Phase 1: persistent vector + cross-kind sequential architecture retirement
-  7da0ee0 Phase 1: bignum heap kind (Scope A: construction + canonical form + eq + hash)
-  2ec4e7b Phase 1: pin benchmark methodology (docs/BENCH.md + PLAN §19.8)
-  9c33cbd Phase 1: narrow eq.equal → eq.equalImmediate (abstraction-debt retire)
-  accbb83 Phase 1: cons list + equality-category hash domains
-  992f697 Phase 1: string heap kind + central dispatch
-  64728ee Phase 1: heap GC-stress property tests
-  e857c2d Phase 1 cleanup: split forEachLive, harden asHeapHeader, sync intern doc
-  823b394 Phase 1: heap allocator + HeapHeader storage
-  195a6ae Phase 1: keyword + symbol intern tables
-  99f9ab0 Start Phase 1: hash, Value immediates, and eq — with property tests
-
 ═══════════════════════════════════════════════════════════════════════
-## 2. REQUIRED READING (strict order — budget ~2.5 hours, do NOT skip)
+## 2. REQUIRED READING (strict order — budget ~3 hours, do NOT skip)
 
 ### 2.1 Authoritative design docs
 
-1. PLAN.md (2,489 lines, ~75 minutes). Especially:
+1. PLAN.md (2,531 lines, ~75 minutes). Especially:
    - §5   Three-representations boundary (non-negotiable)
-   - §6   Language semantics (truthiness, equality, nil propagation)
+   - §6   Language semantics (truthiness, equality, nil propagation,
+            primitive core list including `letfn*`)
    - §8   Value model (16-byte tagged Value, kind table, metadata matrix)
    - §9   Persistent collections (CHAMP map, 32-way vector, list, transients)
-   - §10  Memory management (precise mark-sweep tracing GC)
+   - §10  Memory management (precise mark-sweep tracing GC — SHIPPED)
+   - §11  Compiler pipeline (defines stage boundaries)
+   - §12  Bytecode & ISA (companion to docs/VM.md)
+   - §14  Macros & namespaces (Clojure-style; not yet implemented)
    - §19  SIMD & performance — especially §19.6 Tier 1/2 projections
-             and §19.8 performance gates methodology reference
-   - §20.2 Phase 1 gate — THE single most important milestone
-   - §21  Roadmap (which Phase 1 modules are shipped / pending)
+            and §19.8 performance gates methodology reference
+   - §20.2 Phase 1 gate (CLOSED) and Phase 2 gate spec
+   - §21  Roadmap (Phase 1 complete; Phase 2 in progress at step #2)
    - §23  Hard decisions (frozen — each requires an amendment to change)
    - §24  Open questions (deliberately undecided)
 
 2. CLOJURE-REVIEW.md — what we take, adapt, reject from Clojure.
-   §4 maps Clojure reader constructs to nexis Forms.
 
-3. docs/FORMS.md — Phase 0 canonical Form schema.
+3. **docs/COMPILER.md** (~700 lines) — Phase 2 compiler pipeline +
+   per-special-form lowering. Three amendment-log entries this session:
+   - §4.3: let*/loop* binding-i RHS visibility; fn* self-name binding.
+   - §5.5 / §5.6 / §5.6b / §6: closure / recur / letfn* lowering.
+   - §10 #2: tiny-compiler bootstrap exception note.
 
-4. docs/SEMANTICS.md — equality, hash, numeric corner cases.
-   Frozen. Re-amended in accbb83: §3.2 now specifies
-   EQUALITY-CATEGORY domain mixing (not per-kind). Sequential kinds
-   share domain byte 0xF0; associative 0xF1; set 0xF2. §2.2 amended
-   to fix the asymmetric i48 boundary (fixnum range is
-   [-2⁴⁷, 2⁴⁷-1], not ±(2⁴⁷-1)).
+4. **docs/VM.md** (~1100 lines) — Phase 2 runtime: bytecode + execution
+   contracts. Two amendment-log entries this session:
+   - §6 / §7 / §13: range-call ABI for `call:call` / `call:tailcall` /
+     `call:apply` (peer-AI turn 32).
+   - §6 / §10 / §13: closure-group opcode set; raw-index operand
+     convention; routine layout split; variant tables; recur on
+     captured loop bindings (peer-AI turn 34, holistic review turn 35).
 
-5. docs/VALUE.md — 16-byte Value layout, Kind discriminator,
-   HeapHeader spec, signed-zero/NaN matrix. Frozen.
+5. docs/SEMANTICS.md — equality, hash, numeric corner cases. Frozen.
 
-6. docs/HEAP.md — allocator contract, prefix-block storage strategy,
-   minimal sweep scaffold, 16-byte alignment, poisoned-kind double-
-   free detection. Frozen. Note: `sweepUnmarked` is a scaffold, not
-   a real collector — root enumeration + tracing live in the future
-   `src/gc.zig`.
+6. docs/VALUE.md — 16-byte Value layout, Kind discriminator, HeapHeader
+   spec, signed-zero/NaN matrix. Frozen.
 
-7. docs/INTERN.md — keyword + symbol intern tables. `split` helper
-   with the bare-`/` carve-out (it's the division symbol).
+7. docs/HEAP.md, INTERN.md, STRING.md, LIST.md, BIGNUM.md, VECTOR.md,
+   CHAMP.md, TRANSIENT.md, GC.md, CODEC.md, DB.md, BENCH.md, PERF.md,
+   POOL.md — per-kind specs (Phase 1 deliverables; all SHIPPED).
 
-8. docs/STRING.md — UTF-8 string heap kind, subkind 1 only. No
-   SSO, no UTF-8 validation at the storage boundary.
+8. docs/NEXTOMIC.md — post-v1 Datomic-class architecture on nexis +
+   emdb. Read only when Nextomic is being scoped or when a v1 decision
+   might preclude it.
 
-9. docs/LIST.md — immutable cons list + Cursor. First collection
-   kind; fn-pointer plumbing for element-recursive dispatch.
-
-10. docs/BIGNUM.md — arbitrary-precision integer. Scope A shipped:
-    construction + canonical form + equality + hash. **Arithmetic
-    deferred** (Scope B, next commit). The canonicalization
-    invariant is central: a bignum whose magnitude fits in i48
-    cannot exist; all constructors funnel through
-    `canonicalizeToValue`.
-
-11. docs/VECTOR.md — plain 32-way persistent vector + tail buffer,
-    per PLAN §23 #30. File is named `src/coll/rrb.zig` for
-    historical consistency; the v1 impl is NOT RRB-relaxed.
-    Four-subkind scheme (root/interior/leaf/tail), streaming Cursor
-    pattern, cross-kind list↔vector equality proven.
-
-12. docs/CODEC.md — serialization scope stub. Bytes TBD Phase 4.
-
-13. **docs/BENCH.md** (new in 2ec4e7b) — benchmarking methodology
-    pre-commitment. Pins the fairness, accuracy, and honesty
-    standards for every performance claim nexis will publish,
-    especially against Clojure. Landed before any benchmark code
-    deliberately — read it before even thinking about performance
-    work.
+9. docs/FORMS.md — Phase 0 canonical Form schema.
 
 ### 2.2 Contributor + Zig references
 
-14. AGENTS.md — contributor routing guide. Authority order, session
-    workflow, Phase 0 exit criteria, common traps.
+10. AGENTS.md — contributor routing guide.
 
-15. **ZIG-0.16.0-REFERENCE.md + ZIG-0.16.0-QUICKSTART.md — MANDATORY
+11. **ZIG-0.16.0-REFERENCE.md + ZIG-0.16.0-QUICKSTART.md — MANDATORY
     before writing any Zig.** 30+ stdlib APIs changed between 0.15
     and 0.16 in ways that silently break training-data code. See
     §6 below for the gotchas that have actually bitten us.
@@ -125,31 +97,21 @@ cd /Users/shreeve/Data/Code/nexis
 zig build test --summary all
 ```
 
-Expected: **247 tests pass / 40 build steps succeed** (257 total gates
-including 10 golden reader tests). If the tree isn't green, STOP and
-diagnose before editing.
+Expected: **487 tests pass / 68 build steps succeed**. If the tree
+isn't green, STOP and diagnose before editing.
 
 Test breakdown at handoff time:
-  Inline runtime tests:
-   10  hash.zig
-   12  value.zig
-    9  eq.zig
-   12  intern.zig
-   26  heap.zig
-   14  string.zig
-   19  coll/list.zig (incl. Cursor)
-   24  bignum.zig
-   21  coll/rrb.zig (vector)
-   25  dispatch.zig (incl. cross-kind retirement receipts)
-   11  reader.zig
-  Property tests (test/prop/):
-    7  primitive.zig
-   10  intern.zig
-    8  heap.zig
-    6  string.zig
-    8  list.zig
-   10  bignum.zig
-    9  vector.zig
+  Inline runtime tests (32 binaries):
+   10  hash, 12  value, 9  eq, 12  intern, 26  heap,
+   14  string, 19  list, 19  vector, 24  bignum, 42  hamt,
+   20  transient, 30  dispatch, 16  gc, 47  codec, 15  db,
+   9  pool, 21  vm (← +6 from step #2: math:add + holistic review),
+   8  reader (Phase 0)
+  Property tests (test/prop/, 11 files):
+   7  primitive, 10  intern, 8  heap, 6  string, 8  list,
+   10  bignum, 9  vector, 13  hamt, 8  transient, 3  gc, 11  codec
+  Compile tests (NEW this session):
+   7  compile (← step #2 tiny compiler)
   Golden reader tests:
    10  test/golden/
 
@@ -160,104 +122,127 @@ normally needed unless you're touching nexis.grammar.
 ═══════════════════════════════════════════════════════════════════════
 ## 4. ARCHITECTURAL NARRATIVE (things docs won't teach you)
 
-The hard-won insights from 11 sessions of implementation. Read this
-carefully — understanding WHY things are the way they are will save
-you days of rework.
+The hard-won insights from 14+ sessions of implementation. Phase 2 has
+its own wrinkles on top of the Phase 1 narrative below.
 
-### 4.1 The dispatch module is a one-way terminal
+### 4.1 The dispatch module is a one-way terminal (Phase 1, still true)
 
-`src/dispatch.zig` is the central composition point for every heap-
-kind operation. It imports value, eq, heap, hash, string, list,
-vector, bignum. **Nothing imports dispatch.** This asymmetry isn't
-aesthetic — it's forced by a concrete Zig test-runner constraint.
+`src/dispatch.zig` is the central composition point for every heap-kind
+operation. It imports value, eq, heap, hash, string, list, vector,
+bignum, hamt, transient, db. **Nothing imports dispatch.** This
+asymmetry is forced by a Zig test-runner constraint (cyclic imports
+across "self" appearance violate "file in only one module" rule).
 
-Early in Phase 1 we tried `value.hashValue` directly dispatching to
-heap kinds via `@import("dispatch")`. Every test binary for a cycle
-member (value.zig, eq.zig, string.zig) failed with:
+Pattern: kind modules provide per-kind operations with callback
+signatures (e.g., `hashSeq(h, elementHash)`); dispatch composes them.
+`value.hashImmediate` (not `hashValue`) panics on heap kinds pointing
+to `dispatch.hashValue`. Same for `eq.equalImmediate` →
+`dispatch.equal`. Documented in every panic message.
 
-    src/dispatch.zig:1:1: error: file exists in modules 'root' and 'X'
+### 4.2 Equality-category hash domains (Phase 1, still true)
 
-Zig's test runner makes each source file both the root of its own
-test binary AND available as a named module in its own graph. A
-cyclic import + "self" appearance violates the "file in only one
-module" rule.
-
-**The pattern:** kind modules provide per-kind operations with
-callback signatures (e.g., `hashSeq(h, elementHash)`); dispatch
-composes them. `value.hashImmediate` (not `hashValue`) panics on
-heap kinds pointing users to `dispatch.hashValue`. Same for
-`eq.equalImmediate` → `dispatch.equal`. This is a partial-API scar
-but it's documented in every panic message and the naming makes
-the partialness explicit.
-
-### 4.2 Equality-category hash domains (corrected from the original spec)
-
-SEMANTICS.md §3.2 originally said "every Value.hashValue output has
-the per-kind offset folded in." That directly contradicted the
-cross-type sequential equality rule `(= (list 1 2 3) [1 2 3]) →
-true`. If that must be true, and their hashes must be equal (the
-bedrock `= ⇒ hash-eq` law), then they CAN'T have different
-per-kind domain bytes folded in.
-
-Amendment landed in accbb83: equality-category domain mixing. The
-domain byte is:
+SEMANTICS.md §3.2 says cross-type sequential equality requires
+`(= (list 1 2 3) [1 2 3]) → true`, which means they MUST hash the
+same. Domain byte:
   - kind_local → @intFromEnum(Kind)
   - sequential (list, persistent_vector) → 0xF0 (shared)
   - associative (persistent_map) → 0xF1 (shared)
   - set (persistent_set) → 0xF2 (shared)
 
-Chosen outside the 0..29 valid-kind range. The `dispatch.eqCategory`
+Chosen outside the 0..29 valid-kind range. `dispatch.eqCategory`
 exhaustive test pins this for every Kind in v1.
 
-### 4.3 The Cursor pattern for cross-kind sequential walks
+### 4.3 The Cursor pattern for cross-kind sequential walks (Phase 1)
 
 When vector landed (second sequential kind), `dispatch.sequentialEqual`
-needed to walk list-vs-vector pairs. Peer AI pushed back on my initial
-`count + nth` proposal because list's `nth` is O(n), making naive
-cross-kind equality O(n²), AND because random-access is the wrong
-pattern for future sequentials (lazy-seq, cons).
+needed to walk list-vs-vector pairs without O(n²). Each sequential
+kind exposes `Cursor { init, next }`. dispatch.zig composes them in a
+`SeqCursor = union(enum) { list, vector }` and walks pairwise.
+Same-kind pairs use the O(n) `equalSeq` fast paths; cross-kind uses
+cursors.
 
-**The pattern:** each sequential kind exposes `Cursor { init, next }`.
-dispatch.zig composes them in a `SeqCursor = union(enum) { list, vector }`
-and walks pairwise. Same-kind pairs still use the O(n) `equalSeq` fast
-paths; cross-kind uses cursors. When lazy-seq and cons arrive, they
-add Cursor implementations — no change to dispatch's walk logic.
-
-### 4.4 The bignum canonicalization invariant
+### 4.4 The bignum canonicalization invariant (Phase 1)
 
 A bignum whose magnitude fits in i48 cannot exist. Every constructor
 routes through `canonicalizeToValue(heap, negative, limbs)` which
-trims trailing zeros, folds zero magnitude to `fixnum(0)` (regardless
-of sign — "no signed zero in the integer tower"), folds fixnum-range
-magnitudes to fixnum, and only allocates a bignum for genuinely-out-
-of-range values. This is what makes `(= fixnum(n) bignum(n)) → true`
-hold WITHOUT a cross-kind equality rule: the two forms can't both
-exist for the same mathematical value.
+trims trailing zeros, folds zero magnitude to `fixnum(0)`, folds
+fixnum-range magnitudes to fixnum, and only allocates a bignum for
+genuinely-out-of-range values.
 
-Scope B (arithmetic) is the next bignum commit. Every arithmetic
-result must re-canonicalize. See docs/BIGNUM.md §9.
+### 4.5 GC lives now (Phase 1, post-handoff change)
 
-### 4.5 The heap is provisional until real GC lands
+`src/gc.zig` is the precise mark-sweep collector. Per-kind tracing
+walks heap, intern tables, transient wrappers, db. Phase 2 VM frames
+will participate as additional roots; current single-frame VM's
+`Frame.slots` is owned by the VM but not yet enumerated by GC because
+the tests don't allocate heap objects in slots. When step #5 lands
+closures (heap objects), the VM's GC integration becomes load-bearing.
 
-`Heap.sweepUnmarked` is a scaffold — it walks the live list, frees
-unmarked-unpinned blocks, clears marks on survivors. It does NOT
-enumerate roots or trace reachability. The collector that will do
-that (`src/gc.zig`) doesn't exist yet. Heap kinds must assume GC
-may eventually force minor API changes: `HeapHeader.meta`, per-kind
-`trace` functions, possibly a tri-color marking scheme, possibly a
-temporary-root stack for in-flight allocations during construction.
+### 4.6 Pool allocator (Phase 1 perf lift)
 
-The `Interner.trace(visitor)` no-op seam is the placeholder for when
-GC starts scanning intern tables as roots. Heap objects don't yet
-have per-kind trace functions; when gc.zig lands, every heap kind's
-module grows one.
+`src/pool.zig` is a 16-class size-class pool over page allocator. Default
+backing for Heap. Measured 1.8–3.94× lift on collection construction
+benchmarks (PERF.md §3, POOL.md). Don't bypass it without a measured
+reason.
 
-### 4.6 Three representations stay distinct (PLAN §5, risk register #1)
+### 4.7 Phase 2: range-call ABI (peer-AI turn 32)
+
+`call:call A=call_base B=argc C=result_slot`. Caller stages
+`slot[A]=closure` and `slot[A+1..A+argc]=args` BEFORE the call.
+Callee's slot 0 sources from caller's slot[A+1] (window or copy).
+**Caller values live across the call MUST reside in slots strictly
+below A** — the call-clobbered region. `call:tailcall` slides args
+down to keep backing-stack bounded across mutual tail-recursion.
+
+Not yet implemented (step #5). Spec is frozen in VM.md §6.
+
+### 4.8 Phase 2: descriptor-based closure construction (peer-AI turn 34)
+
+`closure:make A=prototype_const B=capture_descriptor C=result_slot`.
+The capture set is statically known; capture sources are
+compile-time metadata (a side-table per routine), NOT runtime
+slot-staging. Each descriptor entry is `local_cell_slot(s)` (raw
+cell pointer in caller's slot s) or `inherited_upvalue(u)` (raw
+cell pointer from current closure's upvalues[u]).
+
+The U operand kind on existing opcodes (mov, math, etc.) reads
+**cell contents** via `resolve(u:N)`. NO dedicated `closure:read-upval`
+opcode. Writes (`store(u:N, ...)`) are reserved (`:unsupported-write`)
+until Phase 3+ dynamic-binding rebinding.
+
+`letfn*` (PLAN §6.1 primitive core) requires `closure:new-cell` +
+`closure:init-cell` placeholder cells so closures can be constructed
+referring to each other before either has its final value.
+
+**recur on captured loop bindings allocates a FRESH cell per
+iteration** (NOT mutates the shared cell). Otherwise closures
+created in earlier iterations would observe later iterations'
+values, breaking Clojure-equivalent immutable lexical binding
+semantics. The canonical hazard:
+
+```clojure
+(loop [i 0 acc []]
+  (if (< i 3) (recur (+ i 1) (conj acc (fn [] i))) acc))
+;; Closures must capture 0, 1, 2 — NOT 3, 3, 3.
+```
+
+Not yet implemented (step #5). Spec is frozen in VM.md §6 +
+COMPILER.md §5.6 / §6 / §5.6b.
+
+### 4.9 Three representations stay distinct (PLAN §5)
 
 Form (parsed source, in `src/reader.zig`), Value (runtime 16-byte
-tagged cells), Durable-Encoded (codec wire format, Phase 4). They
-only fuse through explicit codec ops. If you find yourself wanting
-to reach across the boundary because it's convenient, stop.
+tagged cells), Durable-Encoded (codec wire format, SHIPPED in
+src/codec.zig). They only fuse through explicit codec ops.
+
+### 4.10 Tiny vs reader.Form in compile.zig (step #2 ↔ step #3 boundary)
+
+`src/compile.zig` step #2 takes a local `Tiny` representation, NOT
+`reader.Form`. The public entry point is `compileTiny()` (loud
+naming). When step #3 adds conditionals, the natural shape extends
+to a recursive `Tiny` (with `if: struct { test: *Tiny, then: *Tiny,
+else_: ?*Tiny }`), at which point real `reader.Form` integration
+becomes worthwhile. Step #3 is where compile.zig grows up.
 
 ═══════════════════════════════════════════════════════════════════════
 ## 5. SESSION DISCIPLINE (non-negotiable — this is what makes the work good)
@@ -267,29 +252,28 @@ has caused real bugs in earlier sessions.
 
 ### 5.1 Before writing code
 
-1. Read the relevant frozen docs (SEMANTICS, VALUE, and the per-
-   kind doc if it exists).
+1. Read the relevant frozen docs (PLAN.md §6/§11/§12, VM.md, COMPILER.md,
+   plus per-kind doc if it exists).
 2. Draft a strategy message to peer AI via `user-ai` MCP with
    `conversation_id: "nexis-phase-1"`. Lay out scope, representation
-   options, specific questions. Don't rubber-stamp — peer AI has
-   caught real bugs every single turn. Strategy examples:
-   - Turn 1: sequential hash domain contradiction (led to amendment)
-   - Turn 3: architectural composition hidden fault line (led to V3
-             retirement receipt)
-   - Turn 6: bignum canonicalization boundary asymmetry
-             (led to SEMANTICS §2.2 amendment)
-   - Turn 7: `count+nth` cross-kind wrong pattern (led to Cursor)
+   options, specific questions. Don't rubber-stamp — peer AI has caught
+   real bugs every single turn. Examples:
+   - Turn 32: range-call ABI strategy → exposed wrong assumption about
+              tailcall slide-vs-base-shift
+   - Turn 34: closure-group encoding → caught 3 critical bugs (missing
+              prototype operand, missing letfn* placeholders, recur
+              semantic violation)
+   - Turn 35: holistic review → caught 15 spec drifts across COMPILER.md
+              ↔ VM.md ↔ src/vm.zig that per-turn reviews missed
 
 ### 5.2 Spec first
 
-If the module is substantive (a new heap kind, a new dispatch
-pattern, a new category), draft `docs/XXX.md` BEFORE the code.
-Pin the frozen invariants there. Examples:
-  - HEAP.md, INTERN.md, STRING.md, LIST.md, BIGNUM.md, VECTOR.md
-    all predate their src/*.zig files.
-  - BENCH.md predates any benchmark code deliberately — commitments
-    are strongest when they can't be retrofitted against favorable
-    measurements.
+If the module is substantive (a new opcode group, a new dispatch
+pattern, a new feature), draft the relevant doc section BEFORE the
+code. Pin the frozen invariants there. Examples from this session:
+  - VM.md §6 amendments landed BEFORE step #5 closure code
+  - COMPILER.md §10 #2 exception note landed AFTER tiny compiler
+    revealed the bootstrap-vs-folding tension
 
 ### 5.3 While writing code
 
@@ -297,9 +281,11 @@ Pin the frozen invariants there. Examples:
   DURING implementation, not after.
 - Property tests land ALONGSIDE the module, not at the end. Every
   module has a test/prop/*.zig file that exercises its invariants
-  under randomized workloads.
-- Inline unit tests (test "..." blocks) cover structural
-  invariants; property tests cover statistical laws.
+  under randomized workloads. (Phase 2 is opcode-by-opcode small
+  enough that property tests may not always make sense — strategy
+  turn should ask peer AI.)
+- Inline unit tests (test "..." blocks) cover structural invariants;
+  property tests cover statistical laws.
 - Use deterministic PRNG seeds: failures must reproduce.
 - `std.testing.allocator` catches leaks at teardown — if your
   `deinit` path forgets something, the test trips.
@@ -311,19 +297,21 @@ Pin the frozen invariants there. Examples:
    conversation_id, OR use the `review` tool for a structured pass).
 3. Apply peer's review items. Do NOT rubber-stamp. Previous turns
    have caught:
-   - Unchecked multiplication in body-size calc (bignum turn-7)
-   - Padding bytes leaking into semantic hash (bignum turn-6)
-   - Const-lie in forEachLive (heap)
-   - Missing read-side invariant asserts
+   - TypeError vs KindMismatch taxonomy drift (turn 33)
+   - Missing test cases (negative underflow, dst aliasing) (turn 33)
+   - Missing closure prototype operand in `closure:make` (turn 34)
+   - recur captured-binding semantic violation (turn 34)
+   - 15 doc-vs-code drifts including the recur contradiction across
+     three sections (turn 35)
 4. Run tests again; green.
-5. `git add -A && git commit -m "$(cat <<'EOF'\n...body...\nEOF\n)"`
-6. `git push origin main`
+5. `git add <files> && git commit -m "$(cat <<'EOF'\n...body...\nEOF\n)"`
+6. Do NOT push to origin unless the user explicitly asks.
 
 ### 5.5 Git discipline
 
-- Short imperative subject. Body when substantive (and substantive
-  means cite the SEMANTICS.md / PLAN.md sections that govern, cite
-  the peer-AI turn that caught each fix, call out explicit
+- Short imperative subject. Body when substantive (cite the
+  SEMANTICS.md / PLAN.md / COMPILER.md / VM.md sections that govern,
+  cite the peer-AI turn that caught each fix, call out explicit
   deferrals).
 - Split commits along logical lines.
 - NEVER --amend a commit that's been pushed.
@@ -339,41 +327,41 @@ The `user-ai` MCP server provides `chat`, `discuss`, `review`,
 `status` tools. Use `discuss` with `conversation_id: "nexis-phase-1"`
 to maintain continuity across turns.
 
-As of this handoff, the conversation has 8+ turns covering:
-  - T1: Strategy for first collection (list); caught spec contradiction
-  - T2-3: Step-back survey on project health (honest assessment)
-  - T4: Benchmarking methodology discussion
-  - T5: Final-review pattern settled
-  - T6: Bignum strategy + asymmetric i48 boundary catch
-  - T7: Vector strategy + Cursor pattern + 4-subkind scheme
-  - T8: Vector code review
+As of this handoff, the conversation is **~35 turns deep** spanning
+~14 substantive sessions. Peer AI has read every spec doc multiple
+times, has seen the VM kernel implementation, has read em's RUNTIME.md
++ ISA.md for the calling-convention discussion, and has caught one or
+more real bugs in nearly every turn it's been engaged.
 
-**Continue this thread.** Peer AI has earned trust over ~40 substantive
-interactions; each session has caught 1-5 real bugs pre-commit. Do
-not skip peer engagement even when the task seems simple. The times
-it catches nothing are a minority; the times it catches something
-load-bearing are frequent.
+**Continue this thread.** A new conversation_id throws away ~15 hours
+of accumulated context. Peer AI's strongest contributions come from
+catching drift between turns — that's only possible if it remembers
+the prior commitments.
 
 Invocation example:
 
   CallMcpTool server="user-ai" toolName="discuss" arguments={
     "conversation_id": "nexis-phase-1",
     "message": "...your substantive question + full context...",
-    "model": "gpt-5.4"
+    "model": "gpt-5.5",
+    "attachments": [
+      {"type": "file", "path": "/Users/shreeve/Data/Code/nexis/docs/VM.md"}
+    ]
   }
 
-Peer AI is GPT-5.4 by default; Claude Opus 4.6 is also available via
-model override.
+Peer AI is GPT-5.5 by default. Attachments support file/url/blob;
+attach the actual current state of files for holistic-review turns
+(it'll catch drift between sessions you didn't notice).
 
-**Pattern:** provide peer with everything they need (relevant spec
+**Pattern**: provide peer with everything they need (relevant spec
 text quoted; current design proposals; specific questions; explicit
-"don't rubber-stamp" instruction). A one-line question gets a one-
-line answer. A substantive briefing gets a substantive critique.
+"don't rubber-stamp" instruction). A one-line question gets a
+one-line answer. A substantive briefing gets a substantive critique.
 
 ═══════════════════════════════════════════════════════════════════════
 ## 7. CURRENT STATE — what's shipped, what's pending
 
-### 7.1 Shipped Phase 1 modules
+### 7.1 Phase 1 (COMPLETE — all 8 gates closed per PLAN §20.2)
 
 ```
 Runtime core:
@@ -383,12 +371,22 @@ Runtime core:
   src/intern.zig      keyword + symbol intern tables
   src/heap.zig        allocator + HeapHeader + minimal sweep scaffold
   src/dispatch.zig    one-way-terminal cross-kind composition
+  src/pool.zig        size-class pool allocator (1.8–3.94× lift)
 
-Heap kinds (three shipped):
+Heap kinds (all shipped):
   src/string.zig      UTF-8 strings (subkind 1: heap)
-  src/bignum.zig      arbitrary-precision integers (Scope A: eq/hash only)
+  src/bignum.zig      arbitrary-precision integers (Scope A only:
+                      construction + canonical form + eq + hash;
+                      arithmetic Scope B deferred to mid-Phase 2)
   src/coll/list.zig   immutable cons list + Cursor
   src/coll/rrb.zig    persistent vector (plain 32-way + tail) + Cursor
+  src/coll/hamt.zig   CHAMP persistent_map + persistent_set
+  src/coll/transient.zig  transient wrappers for vector/map/set
+
+Systems (all shipped):
+  src/gc.zig          precise mark-sweep with per-kind tracing
+  src/codec.zig       Value ↔ bytes (LEB128/ZigZag wire format)
+  src/db.zig          emdb bridge + durable-ref
 
 Phase 0 (still in place):
   src/nexis.zig       @lang module: Tag enum + Lexer wrapper
@@ -397,46 +395,104 @@ Phase 0 (still in place):
   src/parser.zig      GENERATED (do not edit; regenerate via `zig build parser`)
 ```
 
-### 7.2 Pending Phase 1 modules
+### 7.2 Phase 2 progress (in progress)
 
 ```
-[ ] src/coll/hamt.zig          CHAMP persistent map + set (§9.1, §23 #37)
-[ ] src/coll/transient.zig     owner-token discipline
-[ ] src/gc.zig                 real mark-sweep with root enum + tracing
-[ ] src/codec.zig              self-describing wire format
-[ ] src/db.zig                 emdb integration + durable-ref
-[ ] src/bignum.zig Scope B     add/sub/mul with canonicalization
-[ ] src/coll/rrb.zig Scope B   assoc / pop / subvec / concat
-[ ] src/string.zig subkind 0   inline-short-string optimization
+SHIPPED:
+  [x] src/vm.zig           VM kernel (mov, call:return, math:add) per
+                           VM.md §3-§4 + step #2
+  [x] src/compile.zig      Tiny compiler for `(+ 1 2)` per step #2
+                           (compileTiny() entry; Tiny union(enum) input;
+                           arena-owned Compiled output)
+
+PENDING per COMPILER.md §10:
+  [ ] step #3   Conditionals: jump:* opcodes + `if` lowering
+                NEXT — see §10 below for the immediate scope.
+  [ ] step #4   Locals + let* — slot allocation, sequential bindings
+  [ ] step #5   Functions + closures — range-call ABI (VM.md §6),
+                closure-group opcodes (VM.md §6), backing-stack
+                evolution of Frame, GC root enumeration from frames
+  [ ] step #6   recur + loop* — including fresh-cell-per-iteration for
+                captured bindings (VM.md §6 + COMPILER.md §5.6)
+  [ ] step #7   Vars + def — namespace integration (PLAN §14.3 sketch
+                exists but no docs/NAMESPACE.md or src/ns.zig yet)
+  [ ] step #8   Macroexpand + syntax-quote + #%anon-fn — including
+                auto-gensym hygiene (PLAN §14.2)
+  [ ] step #9   try/catch/throw (VM.md §12 minimal v1 spec)
+  [ ] step #10  Error-reporting hardening — SrcSpan threading
+                end-to-end, structured error Value layer
+  [ ] step #11  Golden + eval pipeline tests
+
+REFACTORS LIKELY DURING THE ABOVE:
+  [ ] src/numeric.zig      extract addNumbers + future math sub/mul/etc.
+                           when 2nd or 3rd math op lands (peer-AI turn 33)
+  [ ] src/vm/<group>.zig   split per-group handler files when vm.zig
+                           crosses ~1500 LOC (it's at ~1100 now)
+  [ ] backing value-stack  current Frame.slots is per-frame owned;
+                           must evolve to backing-stack-with-frame-base
+                           when call:call lands (VM.md §7)
+  [ ] src/gc.zig hookup    VM frames as roots when closures land
 ```
 
-### 7.3 Phase 1 gate tracking (PLAN §20.2)
+### 7.3 Spec status
 
 ```
-1. 100k+ randomized equality/hash tests    PARTIAL (~3k iter across
-                                             7 prop files; scaling is a
-                                             matter of bumping constants
-                                             once all kinds land)
-2. Persistent immutability                   PARTIAL (list + vector both
-                                             immutable by construction;
-                                             CHAMP pending)
-3. Transient equivalence                    PENDING (no transients)
-4. Transient ownership                      PENDING (no transients)
-5. Codec round-trip                         PENDING (no codec)
-6. emdb round-trip                          PENDING (no db integration)
-7. GC stress                                SHIPPED (test/prop/heap.zig)
-8. Interning invariants                     SHIPPED (test/prop/intern.zig)
+Frozen and authoritative:
+  [x] All Phase 1 specs (HEAP, INTERN, STRING, LIST, BIGNUM, VECTOR,
+      CHAMP, TRANSIENT, GC, CODEC, DB, BENCH, PERF, POOL).
+  [x] FORMS.md (Phase 0 reader).
+  [x] SEMANTICS.md, VALUE.md.
+  [x] COMPILER.md — §1-§13 all populated; amendment log up to date
+      with this session's three rounds.
+  [x] VM.md — §1-§18 all populated; per-group variant tables for mov,
+      call, math, closure, jump as authoritative variant numbering;
+      amendment log up to date.
+
+Spec gaps to address before their step lands:
+  [ ] docs/NAMESPACE.md — Var lookup hot path, refer/alias tables.
+      PLAN §14.3 has a 5-line struct sketch; needs full spec before
+      step #7. ~200-300 LOC commit.
+  [ ] docs/MACROS.md — macroexpander invariants; syntax-quote /
+      auto-gensym contracts. PLAN §14.1-§14.2 has the contracts;
+      a standalone doc would crystallize them before step #8.
+
+Spec amendments tracked in amendment logs:
+  - COMPILER.md §13: 2 entries (initial draft + 2026-05-15 §4.3
+    amendments + 2026-05-15 §5/§6 closure amendments).
+  - VM.md §18: 3 entries (initial + 2026-05-15 range-call ABI +
+    2026-05-15 closure-group).
 ```
 
-### 7.4 Risk-weighted progress
+### 7.4 Phase 1 gate retirement (PLAN §20.2)
 
-Peer AI's turn-3 assessment put us at ~35% risk-weighted. After
-bignum + vector + BENCH methodology + eq refactor, we're at ~55%.
-The biggest hidden fault line — "architecture under cross-kind
-composition" — has been RETIRED with the V3 property test in
-test/prop/vector.zig (500 random list↔vector sequences `=` and
-hash-equal). What remains is mostly (a) apply the proven pattern
-to more kinds (CHAMP), (b) systems-heavy work (GC, codec, db).
+```
+1. 100k+ randomized equality/hash tests        SHIPPED
+2. Persistent immutability                      SHIPPED
+3. Transient equivalence                        SHIPPED
+4. Transient ownership                          SHIPPED
+5. Codec round-trip                             SHIPPED
+6. emdb round-trip                              SHIPPED
+7. GC stress                                    SHIPPED
+8. Interning invariants                         SHIPPED
+```
+
+### 7.5 Phase 2 gate (per COMPILER.md §9.4)
+
+```
+1. Every primitive-core form compiles + executes correctly      PENDING
+   (currently only int literal + (+ int int) work via Tiny;
+    real form support starts at step #3)
+2. recur in 10k-iter loop runs in constant stack space          PENDING
+3. Closure capture works across deeply-nested fns               PENDING
+4. syntax-quote / unquote / unquote-splicing produce equivalent PENDING
+   structurally-equal Forms to hand-coded equivalents
+5. Compiler errors report stable error-kind keyword + primary   PENDING
+   SrcSpan + macro origin when applicable
+6. All golden tests pass; full test suite remains 487/487+      ON TRACK
+   (487/487 currently; +14 expected from compile-golden tests)
+7. bench/compiler.zig measures compilation throughput, eval     PENDING
+   throughput, closure-creation cost, recur per-iter cost
+```
 
 ═══════════════════════════════════════════════════════════════════════
 ## 8. NON-NEGOTIABLE DISCIPLINE
@@ -450,37 +506,38 @@ From PLAN.md §"Start here" and accumulated hard lessons:
 
 2. **Respect PLAN §23 frozen decisions.** 38 decisions committed
    before code was written. Each requires a PLAN amendment with
-   stated rationale to change. SEMANTICS.md §2.2 and §3.2 have
-   already been amended during Phase 1 to fix real contradictions
-   — that's the channel. Do not silently deviate.
+   stated rationale to change. SEMANTICS.md §2.2 / §3.2,
+   COMPILER.md §4.3 / §5/§6, VM.md §6 / §10 / §11 / §13 have all
+   been amended during Phase 1-2 to fix real contradictions —
+   that's the channel. Do not silently deviate.
 
 3. **Read actual source, don't trust intuition.**
    - For Clojure behavior: grep `misc/clojure/src/jvm/clojure/lang/`.
-     The Java core is checked in. Earlier AIs twice confidently
-     wrote wrong claims about Clojure and only caught them by
-     opening LispReader.java / PersistentVector.java and reading
-     the bytes.
-   - For Zig 0.16 APIs: read from
-     /opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/. Training-data
-     code for Zig 0.15 silently breaks in 0.16.
+     The Java core is checked in. AIs have twice confidently written
+     wrong claims about Clojure and only caught them by opening
+     LispReader.java / PersistentVector.java and reading the bytes.
+   - For Zig 0.16 APIs: read from /opt/homebrew/Cellar/zig/0.16.0/lib/
+     zig/std/. Training-data code for Zig 0.15 silently breaks.
+   - For em's bytecode/runtime patterns: ../em/docs/architecture/
+     ISA.md and RUNTIME.md are the references; the nexis VM is
+     em-template-shaped per PLAN §12.
 
 4. **Do NOT widen the v1 non-goals list** (§4) without an amendment.
 
 5. **Do NOT expose benchmarks publicly** until Phase 6 has real
    numbers (§19.7). The plan intentionally under-promises and
-   over-delivers. BENCH.md pins the methodology — every
-   performance claim must satisfy numerical + accurate + fair +
-   relevant (peer AI added "relevant" as the fourth standard).
+   over-delivers. BENCH.md pins the methodology — every performance
+   claim must satisfy numerical + accurate + fair + relevant.
 
 6. **Honesty clause** (from BENCH.md §8): when benchmarks eventually
    ship, publish scenarios where Clojure wins. Manufactured
    symmetry is worse than admitted losses. External Clojure-
    practitioner review required before any comparative report.
 
-7. **No claim of "reliable" until Phase 1 gate passes.** The
-   previous AI's handoff note was blunt about this:
-   "foundation yes, product no; credible path, but not yet near a
-   reliability claim for the full planned product."
+7. **Hand-trace before code** for substantial design questions.
+   Two hand-traces this session ((defn fact ...) and
+   (defn make-adder ...)) surfaced spec holes that step #5 would
+   have hit; they cost ~1 hour each and saved days of rework.
 
 ═══════════════════════════════════════════════════════════════════════
 ## 9. ZIG 0.16 GOTCHAS (things that have actually bitten us)
@@ -503,92 +560,104 @@ From PLAN.md §"Start here" and accumulated hard lessons:
 - **`@intCast(T, v)` is now `@as(T, @intCast(v))`**. `@intCast` is
   a builtin that infers target type from context; old two-arg
   form is gone.
-- Unused locals must be `const`, not `var`. (This has tripped
-  exactly one test file per session.)
+- Unused locals must be `const`, not `var`.
 - Multi-char literals in grammar rules: `nexus` generator's token
   name "integer" is hardcoded in the number scanner; `hasIdent`
   dispatch only fires when token name is literally "ident".
+- **Packed structs have field-order layout**. `vm.Inst` and
+  `vm.Operand` rely on this; if you add fields, mind the bit order.
 
 ═══════════════════════════════════════════════════════════════════════
-## 10. IMMEDIATE NEXT TASK — options with peer-AI's thinking
+## 10. IMMEDIATE NEXT TASK — Phase 2 step #3 (conditionals)
 
-After 1be3317, the architectural composition risk is retired. Peer
-AI's turn-6 original sequence was "A→B→C/D with C or D depending
-on appetite for semantic vs systems risk." A (eq refactor + BENCH),
-B (bignum), and C (vector) are done. The next candidates:
+Per COMPILER.md §10 #3: add `jump:*` opcodes + `if` lowering.
 
-### Option 1: CHAMP (src/coll/hamt.zig) — persistent map + set
+### Scope
 
-The last frozen major collection (PLAN §23 #37). 32-way branching,
-separate data/node bitmaps, canonical layout. Listed as the biggest
-remaining implementation risk in PLAN's risk register. Ships two
-kinds at once (map and set share code). Unblocks
-`{:a 1 :b 2}` literals for Phase 2 reader→Value lifting.
+**VM-side (`src/vm.zig`)**:
+- `Jump` enum with variants per VM.md §10.5: `jmp`, `if_true`,
+  `if_false`. (J operand kind already exists in OpKind.)
+- `execJump` handler dispatching on variant.
+- `jump:if-true` / `jump:if-false` need a "is this value falsy?"
+  predicate. Per PLAN §6.2: only nil and false are falsy. Per
+  peer-AI turn 35, this predicate should live in `value.zig` or a
+  shared helper (the macroexpander/analyzer constant-folding will
+  want the same semantics) — likely `value_mod.isFalsy(v)` returning
+  `v.kind() == .nil or v.kind() == .false_`.
+- `asm_.jumpJmp` / `asm_.jumpIfTrue` / `asm_.jumpIfFalse` helpers.
+- New tests for each variant + branch-not-taken, branch-taken,
+  out-of-range jump target, the truthy/falsy edge cases (0, "",
+  empty collections — all truthy per §6.2).
 
-Estimated 1000-1500 LOC across 2-3 sessions. Spec first
-(docs/CHAMP.md before code). Reuses the Cursor pattern from
-vector. The third and final equality category (associative, set)
-becomes observable.
+**Compiler-side (`src/compile.zig`)**:
+- Extend `Tiny` with an `if` variant: `if: struct { test: *Tiny,
+  then: *Tiny, else_: ?*Tiny }`. Test/then/else_ are heap-allocated
+  Tiny pointers — Tiny becomes recursive. The `compileTiny()` arena
+  owns them.
+- Implement `compileIf` per COMPILER.md §5.2:
+  - Lower test into a slot.
+  - Emit `jump:if-false` to else-label.
+  - Emit then code, leaving result in dst.
+  - Emit `jump:jmp` to end-label.
+  - Emit else-label, else code (or `mov:load-nil` if absent).
+  - End-label.
+- `compileTiny` may want to evolve into a "compile-to-destination"
+  API per peer-AI turn 35 recommendation:
+    `fn compileExpr(form: *const Tiny, dst: u12, emitter: *Emitter) !void`
+  This sets the pattern that step #4 (let*) will need for slot
+  allocation. Worth proposing in the strategy turn.
+- New compile tests: `(if true 1 2)` = 1, `(if false 1 2)` = 2,
+  `(if nil 1 2)` = 2, `(if 0 1 2)` = 1 (truthy), `(if "" 1 2)` = 1
+  (truthy), `(if true 1)` = 1 (no else), `(if false 1)` = nil.
 
-### Option 2: Real GC (src/gc.zig)
+### Strategy turn (DO THIS FIRST)
 
-Biggest remaining systems risk. Heap scaffolding is provisional.
-Will likely force API changes to per-kind modules (trace functions,
-root registration). Phase 1 gate test #7 becomes fully meaningful
-(currently uses hand-marking instead of root-walk).
+Before writing code, draft a peer-AI strategy message on
+`conversation_id: "nexis-phase-1"` covering:
 
-Estimated 400-700 LOC. Draft docs/GC.md first; pin the root
-enumeration strategy and the trace dispatch pattern. Each existing
-heap kind grows a `trace(h, visitor)` method.
+1. **Compile-to-destination vs return-from-compile pattern**: peer AI
+   suggested `compileExpr(form, dst, emitter)` over the current
+   `compile(form) -> Compiled` shape. The current shape works for
+   step #2 because there's only one form per Compiled; step #3's `if`
+   needs to compile two arms targeting the same dst. Should the API
+   shift now (small refactor, sets the pattern early) or in step #4?
 
-### Option 3: Bignum Scope B — arithmetic
+2. **Tiny representation**: recursive Tiny needs an arena. Currently
+   compileTiny accepts a pass-by-value `Tiny`. Should the test
+   fixtures construct trees through a small builder, or hand-build
+   them with `&Tiny{...}`?
 
-Completes the integer tower functionally. No architectural risk;
-all patterns already proven. Not on the Phase 1 gate critical path
-because no code path calls arithmetic yet (VM is Phase 2).
+3. **isFalsy predicate location**: value.zig vs vm.zig vs new
+   value-helpers module. Worth ~1 turn of peer review because every
+   subsequent opcode that branches on truthiness will reference it.
 
-Estimated 500-800 LOC. Reader extension for bignum literals is
-also part of this commit (so reader can produce out-of-range
-integer Values directly).
+4. **Emitter abstraction**: as Tiny grows, the current "alloc one
+   array up front" pattern stops scaling. Should an Emitter struct
+   land now (build code into an ArrayList, then ToOwnedSlice at
+   end) or stay with current shape?
 
-### Option 4: Transients (src/coll/transient.zig)
+These are the four design choices step #3 actually requires. Most
+of the rest is mechanical.
 
-Cross-cuts collections. The owner-token discipline is well-specified
-in PLAN §9.4. Requires map/set to be shipped first before it's
-meaningfully useful (list doesn't need transients; vector could
-use them but it's one kind). So probably after Option 1.
+### Estimated scope
 
-### My lean, and why I'd check with peer AI before starting
+- ~150 LOC in src/vm.zig (Jump enum, execJump, helpers, tests)
+- ~100 LOC in src/compile.zig (Tiny.if, compileIf, tests)
+- ~10-15 new tests across both
+- ~30 minutes of strategy + review
+- Likely 1-2 sessions if done with peer AI engagement and code review
 
-**CHAMP (Option 1) is the most-valuable next unit.** Reasons:
-  - The associative and set categories are the only hash-domain
-    categories still hypothetical. Shipping CHAMP makes
-    `(= {:a 1} {:a 1}) → true` and the associative-domain
-    0xF1 byte observable for the first time. That's the last
-    piece of the equality-category design to validate.
-  - It's the biggest remaining implementation risk per PLAN's
-    risk register.
-  - It unblocks map literals for Phase 2 (same reason vector
-    unblocked vector literals).
-  - It's a natural sequel to the vector session — the trie
-    structure is similar shape (branching factor, path-copy,
-    immutable updates).
+### After step #3 ships
 
-But: GC (Option 2) is the biggest systems risk. If you want to
-retire systems risk before more semantic risk piles up on top,
-start there. Check with peer AI via `discuss` before committing.
-
-### Other smaller items deferred from prior sessions (would add at
-### the end of whichever big commit you pick)
-
-- FailingAllocator tests for errdefer chains (peer-AI-agreed
-  follow-up; 30 minutes of work)
-- Lightweight microbench of Heap.free's O(n) scan (peer-AI turn-3
-  "measure something soon"; informational)
+Step #4 (locals + let*) becomes the obvious next item per
+COMPILER.md §10. let* is where slot allocation gets non-trivial
+(scoped lifetimes; sequential bindings per the §4.3 amendment).
+The Tiny representation likely grows a `let_star` variant; compile.zig
+gains a slot allocator (probably starting with bump-allocate per
+binding, no liveness reuse — that's Phase 6 polish).
 
 ═══════════════════════════════════════════════════════════════════════
-## 11. THE QUALITY BAR — what makes this project world-class vs just
-## competent
+## 11. THE QUALITY BAR — what makes this project world-class vs just competent
 
 This is the cultural context the code-level details won't transmit.
 
@@ -618,14 +687,16 @@ non-goals: no protocols, no STM, no agents, no core.async, no
 reader conditionals, no multimethods, no tagged literals).
 
 "World-class" means:
-  - **Internally consistent** — the SEMANTICS.md →
-    dispatch.zig → per-kind-module chain has no silent
-    contradictions. When we find one (bignum canonicalization
-    bounds; sequential hash domain), we amend the spec, not paper
-    over the code.
-  - **Tested at the right level** — 257 gates today, growing to
-    100k+ randomized iterations by Phase 1 exit (§20.2 test #1).
-    Every invariant has a property-test retirement receipt.
+  - **Internally consistent** — the SEMANTICS.md / VM.md / COMPILER.md
+    chain has no silent contradictions. When we find one (the
+    recur-on-captured-loop-binding contradiction across three
+    sections caught by the holistic-review turn), we amend the spec,
+    not paper over the code.
+  - **Tested at the right level** — 487 gates today, scaling to
+    100k+ randomized iterations across all property test files.
+    Every invariant has a property-test retirement receipt or an
+    explicit "tested by example only because it's a unique case"
+    annotation.
   - **Benchmarked honestly** — BENCH.md §11's summary sentence:
     "We measured several clearly defined performance regimes,
     with published source and methodology, and here is where
@@ -634,16 +705,20 @@ reader conditionals, no multimethods, no tagged literals).
   - **Spec-first, not code-first** — every frozen invariant
     lands in a doc BEFORE code can violate it. Amendments happen
     through PR-style doc edits, not commit messages.
-  - **Honest about progress** — the previous AI's handoff was blunt
-    about the ~35% → ~55% risk-weighted progress vs ~60% →
+  - **Honest about progress** — Phase 1's previous-AI handoff was
+    blunt about the ~35% → ~55% risk-weighted progress vs ~60% →
     ~70% LOC-weighted. Don't conflate "shipped foundation" with
-    "retired project risk."
+    "retired project risk." Phase 2 is at step #2 of 11; we are
+    early.
 
 ### 11.3 What breaks the quality bar
 
 - Writing code before drafting the spec for a substantive module.
-- Skipping peer AI review ("this is obviously right" is usually
-  when it isn't).
+- Skipping peer AI strategy turn ("this is obviously right" is
+  usually when it isn't — see turn 34 catching three load-bearing
+  bugs in what felt like a "consistency" proposal).
+- Skipping peer AI code review ("I'll just commit and let CI catch
+  it" — there is no CI; you ARE the CI).
 - Publishing performance claims that haven't been through BENCH.md
   discipline.
 - Manufactured test coverage (tests that only exercise the happy
@@ -654,54 +729,63 @@ reader conditionals, no multimethods, no tagged literals).
 - Letting the test count drift down for any reason. Every commit
   lands with at least the same number of tests that were passing
   at its parent. Prefer more.
+- Skipping the holistic-review pass when several pieces have
+  landed. Per-turn reviews catch local bugs; holistic reviews
+  catch drift between pieces. The session that ended at this
+  handoff caught 15 such drifts in a single holistic turn.
 
-### 11.4 Final word from the outgoing AI
+### 11.4 Final word
 
-What made Phase 1 work across 11 commits:
-  - Spec-first pinning of every invariant in docs/ before writing
-    code. The existence of SEMANTICS.md §3.2's equality-category
-    amendment commit is proof the discipline works: we found a
-    real internal contradiction and fixed it at the spec level
-    before the code diverged.
-  - Every substantive commit engaged peer AI at strategy AND at
-    review, with `conversation_id: "nexis-phase-1"`. Peer AI has
-    caught about one real bug per session before commit. That
-    number compounds over phases.
-  - Freeze-before-implement. BENCH.md was landed before any
-    benchmark code. docs/HEAP.md was drafted before src/heap.zig.
-    Deferring specification invites hand-waving.
-  - Honest reporting. The step-back survey (turn-3) that put
-    risk-weighted progress at ~35% when LOC-weighted was ~57%
-    was harder to write than a cheerleading update but made every
-    subsequent decision better.
+What made this session work across 3 commits + 4 peer-AI turns:
+  - **Hand-trace before code** for substantial design questions.
+    The (defn fact ...) trace caught the let*/loop* binding-i
+    visibility ambiguity before any line of resolver code was
+    written. The (defn make-adder ...) trace caught the closure-
+    descriptor encoding question before any line of closure code
+    was written. Both took ~30 minutes; both saved weeks of
+    rework downstream.
+  - **Peer AI as a peer, not a rubber stamp.** Turn 34 caught three
+    critical bugs in my own proposal — the missing routine operand,
+    the missing letfn* placeholders, the recur semantic violation.
+    Turn 35 caught 15 spec drifts across the integrated result.
+    Each per-turn review caught specific items; only the holistic
+    turn caught drift between turns.
+  - **Spec-first, with frozen invariants.** Every COMPILER.md /
+    VM.md amendment landed before any code that depended on it.
+    The amendment log entries cite the peer-AI turn that drove
+    them; the commit message cites both. This makes future
+    debugging tractable.
+  - **Honest reporting.** When peer AI catches a bug, name it as
+    a bug. When a spec contradiction exists, amend the spec rather
+    than paper over with a code workaround. When work is complete,
+    say so; when it's deferred, say so explicitly.
 
-Phase 1 gate (PLAN §20.2) is the single most important milestone
-in the whole project. Don't rush it. Plan for slack.
+Phase 2 gate (COMPILER.md §9.4) is the next major milestone.
+Don't rush it. Plan for slack.
 
 The force remains with you.
 
 ═══════════════════════════════════════════════════════════════════════
 ## 12. WHAT TO DO IN YOUR FIRST MESSAGE
 
-1. Read PLAN.md (75 min). Do not skim §20.2, §23, §21.
-2. Read at minimum: AGENTS.md, ZIG-0.16.0-REFERENCE.md,
-   docs/SEMANTICS.md, docs/VALUE.md, docs/HEAP.md, docs/BENCH.md,
-   plus the doc for the kind you'll touch next (VECTOR.md if
-   extending vector; BIGNUM.md if Scope B; none specific if
-   starting CHAMP or GC from scratch).
-3. Run `zig build test --summary all`. Confirm 247 tests, 40
-   build steps, all green.
-4. Run `git log --oneline -15` and `git status`. Confirm you're
-   at 1be3317 on a clean main tracking origin/main.
+1. Run `git log --oneline -10` and `git status`. Confirm you're at
+   the most recent commit on a clean main.
+2. Run `zig build test --summary all`. Confirm 487 tests, 68 build
+   steps, all green.
+3. Read PLAN.md (75 min). Do not skim §6, §11, §12, §14, §20.2,
+   §21, §23.
+4. Read at minimum: AGENTS.md, ZIG-0.16.0-REFERENCE.md, docs/VM.md,
+   docs/COMPILER.md, docs/SEMANTICS.md, docs/VALUE.md.
 5. Post a short status summary:
    - What you read.
    - Build status with exact test count.
-   - Proposed next module (default: CHAMP per §10 Option 1,
-     but argue for whichever you prefer with reasons).
+   - Proposed next module (default: step #3 conditionals per §10
+     above; argue for whichever you prefer with reasons).
    - Any clarifying questions.
 6. After user confirms, engage peer AI via `user-ai` MCP with
    `conversation_id: "nexis-phase-1"` for a strategy check on
-   your chosen module BEFORE writing code.
+   step #3 (the four design questions in §10 above) BEFORE writing
+   code.
 
 Good luck. Every commit you ship is already being reviewed by
 peer AI, by the user, and by the quality bar in §11. Hold the
@@ -712,7 +796,8 @@ line.
 
 A few notes about the handoff mechanics:
 
-- **Conversation thread**: The `conversation_id: "nexis-phase-1"` is ~40 substantive turns deep. The new AI inherits that context just by using the same ID — peer AI will remember everything we've discussed. Worth flagging in case they wonder why peer AI seems to know so much.
-- **Commit SHA**: `1be3317` is the reference point. They should verify they're at that commit before anything else.
-- **Test count**: `247 inline + 10 goldens = 257 total gates, 40 build steps`. That number is their ground truth for "clean starting state."
-- **The handoff is intentionally long** (~4,000 words). The original prompt you gave me was similarly long and it worked because it didn't skip anything the incoming AI needed. This one follows the same pattern — better to include too much than to send an AI into the project blind.
+- **Conversation thread**: `conversation_id: "nexis-phase-1"` is now ~35 turns and ~14 sessions deep. Peer AI will remember everything we've discussed, including specific corrections it has made (turn 33's KindMismatch alignment, turn 34's three closure bugs, turn 35's 15 drifts). This is enormous accumulated context — preserving it is high-leverage.
+- **Test count**: `487/487 tests, 68 build steps` is the ground truth for "clean starting state."
+- **Phase 2 step #2 boundary**: the tiny `compile.zig` exists but is intentionally limited. Step #3 is where it grows up to handle real Form-tree shapes (or extends `Tiny` recursively, depending on what the strategy turn decides).
+- **Spec convergence**: COMPILER.md and VM.md are now the load-bearing contracts for steps #3-#11. The amendment logs in each cite the peer-AI turn that drove each change.
+- **Hand-trace discipline**: two hand-traces this session caught spec holes that would have manifested as bugs in step #5. Recommend the next AI do at least one before any non-trivial step (probably step #5 itself, since closures are the most novel design surface).
