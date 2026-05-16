@@ -620,16 +620,19 @@ this out for ordinary `letfn*` use.
 
 Captured-only boxing (peer-AI turn 28 Q2; descriptor-based
 construction + cell access opcodes per turn 34; reads/writes
-wording corrected per turn 35).
+wording corrected per turn 35; **lazy boxing model** per
+turn 40 — see §6.1 for the one-pass-compiler implementation
+discipline that supersedes earlier "at binding time" wording).
 
 - A local is **captured** iff any nested `fn*` body references
-  it. Captured classification is computed by the analyzer.
+  it. Captured classification is computed by the analyzer for
+  a real two-pass compiler, OR discovered lazily by a one-pass
+  compiler — see §6.1.
 - **Non-captured locals**: plain frame slots. Read / write via
   SCVU slot operands. Zero per-op overhead.
-- **Captured locals**: at the binding point, the compiler emits
-  `closure:box-local` to wrap the bound value in a fresh
-  `UpvalCell` (VM.md §6). The local's slot thereafter holds
-  the **cell pointer**, not the direct value.
+- **Captured locals**: the bound value is wrapped in an
+  `UpvalCell` (VM.md §6). The local's slot holds the **cell
+  pointer**, not the direct value.
   - **Reads in the defining frame** use `closure:get-cell
     A=dst_slot B=cell_slot` to dereference and copy the
     cell's contents into a value slot. Plain slot operands
@@ -664,7 +667,76 @@ wording corrected per turn 35).
   an upvalue pointer array copied from the closure; U#
   operands resolve via the callee frame's upvalue array.
 
-**Invariants**:
+#### 6.1 Lazy boxing — one-pass compiler implementation (peer-AI turn 40)
+
+The earlier sections describe captured-binding semantics in a
+"compute capture, then box at binding time" two-pass framing.
+**A one-pass compiler cannot honestly do this** — when compiling
+`(let* [x 5] (fn* [] x))`, the compiler does not know `x` is
+captured at the point it compiles the binding RHS. It discovers
+it later, when compiling the inner `fn*` body.
+
+The v1 implementation in `src/compile.zig` adopts **lazy boxing**:
+
+1. **Bindings start as direct slots.** A fresh `let*` binding
+   pushes a `LocalBinding{ name, ref: .direct_slot(s) }` onto
+   the scope. No `closure:box-local` is emitted at binding time.
+   Same-frame reads of a `direct_slot` binding emit `mov:move
+   dst, slot(s)`.
+
+2. **Capture is discovered during inner-fn compilation.** When
+   compiling a child function's body, a symbol that resolves to
+   a parent-scope binding triggers capture. If the parent
+   binding is `.direct_slot(s)`:
+
+   a. The parent emits `closure:box-local s` **just before** its
+      `closure:make` instruction (i.e., just-in-time, at the
+      point the closure is constructed — NOT at the original
+      binding point).
+
+   b. The parent **mutates** the binding to
+      `.cell_slot(s)` so that subsequent same-frame reads (and
+      subsequent closures capturing the same binding) use the
+      now-boxed cell.
+
+   c. The child's capture descriptor records
+      `local_cell_slot(s)` for this upvalue.
+
+3. **Same-frame reads dispatch on `BindingRef`**:
+
+   ```
+   .direct_slot(s) → mov:move dst, slot(s)
+   .cell_slot(s)   → closure:get-cell dst, slot(s)
+   .upvalue(u)     → mov:move dst, u:u   (resolve(u) deref's the cell)
+   ```
+
+4. **Soundness for v1**: lazy boxing is observably equivalent
+   to binding-time boxing because v1 ordinary lexical locals are
+   **immutable**. Reading the binding before vs after the cell
+   transition yields the same value either way (the cell holds
+   a copy of the value at the moment of `closure:box-local`).
+   This identity breaks for mutable cells (`volatile!`,
+   post-v1); when those land, the timing-vs-mutability
+   interaction must be explicitly redesigned.
+
+5. **Implementation invariant**: by the time a `closure:make`
+   instruction is emitted, every captured parent binding it
+   references has been transitioned to `.cell_slot` (or was
+   already `.cell_slot` from a prior capture). The
+   `local_cell_slot(s)` source in the capture descriptor is
+   therefore always reading from a slot that holds an
+   `UpvalCell*`, never a direct value. `closure:make`'s
+   handler validates this with `:expected-cell` (VM.md §6 + §13).
+
+**Alternative considered and rejected**: a pre-analysis pass
+that walks the Tiny tree to compute capture sets before codegen.
+Cleanly matches the original "at binding time" wording but
+doubles the compile-time machinery for v1's small Tiny surface.
+Real reader-form integration (step #8+) may revisit this when
+the macroexpander already walks the form tree once for fixed-
+point expansion.
+
+**Invariants** (continuation):
 - `UpvalCell` is a **heap object**, traced by the GC like any
   other heap value.
 - Closures carry references to cells, NOT copies of cell
@@ -890,3 +962,30 @@ from code contact:
   `def` to have completed first. Both amendments are
   no-implementation-cost; they pin behavior the implementation
   was going to need anyway.
+- **2026-05-15** (§6.1 added — lazy-boxing model): Pre-step-#5
+  strategy turn (peer-AI turn 40) caught that the pre-existing
+  §6 wording ("at the binding point, the compiler emits
+  `closure:box-local`") is **wrong for a one-pass compiler**.
+  When compiling `(let* [x 5] (fn* [] x))`, the compiler does
+  not know `x` is captured at the point it compiles the
+  binding RHS — it discovers it later, while compiling the
+  inner `fn*` body. The §6 wording assumed an analyzer pass
+  had already classified bindings before codegen. v1's
+  one-pass codegen needs a different discipline.
+  New §6.1 pins **lazy boxing**: bindings start as
+  `.direct_slot`, mutate to `.cell_slot` when capture is
+  first discovered, with `closure:box-local` emitted just
+  before the parent's `closure:make` (NOT at the original
+  binding point). Soundness rests on v1 lexical locals
+  being immutable; the timing distinction is observably
+  invisible because no read of the binding can witness the
+  pre-vs-post-boxing transition. The two-pass alternative
+  (pre-analysis pass over the Tiny tree) is documented as
+  considered-and-rejected. When real reader-form
+  integration lands and the macroexpander already walks the
+  form tree, the two-pass path may become preferable —
+  amend then.
+  Same-frame binding reads dispatch on `BindingRef`:
+  `.direct_slot` → `mov:move`; `.cell_slot` →
+  `closure:get-cell`; `.upvalue` → U operand. This
+  formalizes what was previously implicit in §6.

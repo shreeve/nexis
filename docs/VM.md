@@ -216,10 +216,22 @@ in turn 35 to split the previously-conflated "upvalue
 descriptors" into two distinct concepts:
 
 - **Code**: array of 64-bit instructions.
-- **Constant pool** (`consts`): array of runtime `Value`s.
-  May include `function-proto` entries — references to
-  child routines that this routine's `closure:make`
-  instructions construct closures for.
+- **Constant pool** (`consts`): array of **typed constants**.
+  Each entry is one of (peer-AI turn 40):
+  ```
+  Const = union(enum) {
+      value: Value,                  // ordinary runtime value
+      routine: *const Routine,       // child routine prototype
+  }
+  ```
+  Operands that reference the constant pool must match the
+  expected variant: `mov:load-const A=slot B=constant`
+  requires `Const.value`; `closure:make A=constant` requires
+  `Const.routine`. Mismatched variant raises
+  `:invalid-operand-kind`. The typed pool prevents prototype
+  constants from being loaded into ordinary value slots
+  (which would let `math:add c:proto, c:1` be malformed in
+  ways harder to detect than a clean operand-kind error).
 - **Var table** (`vars`): array of pointers to namespace Vars
   the code references.
 - **Upvalue layout** (peer-AI turn 35): the count and order
@@ -346,20 +358,29 @@ recursive bindings see each other after init.
 
 #### `closure:box-local A=slot _ _`
 
-(Peer-AI turn 34.) Wraps a non-captured local's value into a
-fresh `UpvalCell` so that subsequent `closure:make` operations
-can capture it.
+(Peer-AI turn 34; emission timing clarified in turn 40.)
+Wraps a local's value into a fresh `UpvalCell` so that a
+subsequent `closure:make` can capture it.
 
 - `A` (slot) currently holds a plain `Value v`.
 - Effect: allocate a fresh `UpvalCell` with `value = v` and
   `initialized = true`. Replace `slot[A]` contents with the
   cell pointer.
 
-The compiler emits this at binding time for every local that
-capture analysis identified as captured by an enclosing
-closure. After emission, future reads of the local in the
-defining frame must use `closure:get-cell` (or any opcode
-through which a U-operand resolves to cell contents).
+**Compiler emission timing** (peer-AI turn 40): a
+**one-pass compiler** (the v1 implementation in
+`src/compile.zig`) emits this **lazily, just before the
+enclosing `closure:make`**, NOT at the original binding
+point. See `COMPILER.md §6.1` for the full lazy-boxing
+discipline. A **two-pass compiler** (a future analyzer-
+backed lowering) may emit it at binding time after capture
+analysis has run. Both timings produce observably-equivalent
+behavior for v1 ordinary lexical locals because v1 lexical
+bindings are immutable. The opcode itself is timing-agnostic.
+
+After emission (whichever timing), future reads of the local
+in the defining frame must use `closure:get-cell` (or any
+opcode through which a U-operand resolves to cell contents).
 
 **Errors**:
 - `:invalid-cell-state` if `slot[A]` already holds an
@@ -943,7 +964,7 @@ keyword; renames are breaking changes.
 | Error kind | When | Notes |
 |---|---|---|
 | `:stack-overflow` | Frame depth exceeds configured limit | Recoverable |
-| `:arity-mismatch` | Var-dispatched call has wrong arg count | Runtime-only; compile-time is `COMPILER.md` §4.3 |
+| `:arity-mismatch` | `call:call` / `call:tailcall` invocation passes a different number of arguments than the callee closure's routine declares (peer-AI turn 40 clarification: this is the runtime trap; the compile-time variant for direct same-routine calls is COMPILER.md §4.3) | Recoverable |
 | `:unresolved-var` | `var:load-var` resolves to an undefined Var | Linker should catch most cases; runtime catch is safety net |
 | `:divide-by-zero` | Fixnum or float `div` / `quot` / `rem` with zero divisor | Deterministic trap |
 | `:kind-mismatch` | `coll:*` opcode on a value of wrong kind (e.g., `map-get` on a vector) | Recoverable via try/catch |
@@ -1107,6 +1128,31 @@ Per peer-AI turn 28:
 - **2026-04-19** (spec commit): Initial draft. All contracts
   `proposed`. No implementation yet. Peer-AI turn 28 decisions
   embedded.
+- **2026-05-15** (§5 / §6 / §13 — pre-step-#5 amendments,
+  peer-AI turn 40): three changes prompted by the strategy
+  turn before step #5 (functions + closures) implementation.
+  (1) §5 routine constant pool typed as
+  `Const = union(enum) { value: Value, routine: *const Routine }`.
+  Routine prototypes are NOT user values; mixing them with
+  ordinary `Value` constants would let
+  `mov:load-const` load a prototype into a slot and downstream
+  ops produce malformed bytecode that's harder to detect than
+  the operand-kind error the typed pool gives.
+  `closure:make A=constant` requires `Const.routine`;
+  `mov:load-const A=slot B=constant` requires `Const.value`.
+  Mismatch raises `:invalid-operand-kind`.
+  (2) §6 `closure:box-local` emission timing clarified for
+  one-pass compilers: the v1 `src/compile.zig` uses **lazy
+  boxing** (per `COMPILER.md §6.1`), emitting box-local
+  just before the enclosing `closure:make`, NOT at the
+  original binding point. A two-pass analyzer-backed
+  compiler may emit at binding time. Both timings are
+  observably equivalent for v1 immutable lexical locals.
+  (3) §13 `:arity-mismatch` row clarified to be
+  `call:call`/`call:tailcall`-specific (the runtime
+  arity check before frame transfer); compile-time
+  same-routine arity errors live in `COMPILER.md §4.3`.
+
 - **2026-05-15** (§6 / §10 / §13 amendment): **Closure group
   opcode set pinned** (peer-AI turn 34). The previous
   one-line `closure:make-closure A=result B=routine_const
