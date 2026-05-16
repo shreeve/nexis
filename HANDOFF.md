@@ -6,11 +6,21 @@ inspired by Clojure, built for persistent data, durable identity, and
 world-class performance. Multi-phase implementation driven by PLAN.md at
 the repository root.
 
-Phase 1 is COMPLETE — all 8 gates closed (PLAN.md §20.2). Phase 2 is in
-progress: VM kernel and the tiny compiler for `(+ 1 2)` have shipped
-(steps #1 and #2 of COMPILER.md §10's 11-step sequence). Step #3
-(conditionals: `jump:*` opcodes + `if` lowering) is next, against a
-spec that is fully converged from three peer-AI strategy/review turns.
+Phase 1 is COMPLETE — all 8 gates closed (PLAN.md §20.2). Phase 2 has
+been heavily advanced: the VM kernel + tiny compiler now handle
+literals, arithmetic, comparisons (cmp:lt), conditionals, locals
+(let*), do, recursive named fn* with closures (5b/5c full capture
+pre-analysis with control-flow safety), letfn* with placeholder
+cells, tail-position recur + loop* (constant-stack 10k-iter
+verified), variadic params with VM-side rest construction, Vars
++ Namespace, def/defn with forward references, and the
+compileSymbol fall-through to namespace Vars. Steps #1 through #6
+of COMPILER.md §10 are done.
+
+Step #7 (replace the bootstrap `Tiny` AST with real `reader.Form`
+input — unlocks compiling any `.nx` source file) is next, against
+a spec that needs a fresh peer-AI strategy turn (turn 51) before
+coding begins.
 
 Read this entire prompt before touching anything.
 
@@ -20,11 +30,21 @@ Read this entire prompt before touching anything.
 - Location: /Users/shreeve/Data/Code/nexis/
 - Remote:   git@github.com:shreeve/nexis.git
 - Branch:   main
-- HEAD:     check `git log -1 --oneline`. Three new commits this session:
-              <c3>  docs: refresh HANDOFF.md for Phase 2 step #3
-              2a0831d phase 2 step #2: math:add opcode + tiny compiler for (+ 1 2)
-              ac75f69 docs: VM.md + COMPILER.md spec amendments (peer-AI turns 32, 34, 35)
-              (and the earlier session work above those — `git log --oneline -30`)
+- HEAD:     check `git log -1 --oneline`. The Phase 2 commit chain is:
+              4373b6e phase 2 step #6c: defn + forward references
+              ade5e7b phase 2 step #6b: def + var:store-var + Var-object + symbol fall-through
+              32b5436 phase 2 step #6a: Var + Namespace + var:load-var + UnboundVar trap
+              090c469 phase 2 step #5e: variadic params (& rest) + VM-side rest construction
+              cd5c47f build: add `zig build phase2-test` fast iteration target
+              0eff28d phase 2 step #5d: loop* + recur + tail-position machinery + cmp:lt
+              2a44bb1 phase 2 step #5c: placeholder cells + letfn* + named fn* self-reference
+              36962fe phase 2 step #5b: capture machinery — pre-analysis + cell ops + U-operand
+              3926fed phase 2 step #5a1: empty-capture closures + call:call/return
+              8b06c3c phase 2 step #5a0.5: typed Const pool
+              0330b6a phase 2 step #5a0: backing-stack frame refactor
+              1e53c33 docs: pre-step-#5 spec amendments (peer-AI turn 40)
+              ...
+              (full Phase 2 history: `git log --oneline | head -30`)
 - Working tree clean. Verify with `git status`.
 
 ═══════════════════════════════════════════════════════════════════════
@@ -92,28 +112,46 @@ Read this entire prompt before touching anything.
 ═══════════════════════════════════════════════════════════════════════
 ## 3. BUILD VERIFICATION (run on arrival)
 
+**Two build steps; use the right one for the right loop.**
+
+For **inner-loop Phase 2 iteration** (~3 seconds):
+```
+cd /Users/shreeve/Data/Code/nexis
+zig build phase2-test
+```
+Runs ONLY vm + compile tests. Expected: **221 tests pass**
+(86 vm + 135 compile as of HEAD).
+
+For **pre-commit validation** (~3 minutes):
 ```
 cd /Users/shreeve/Data/Code/nexis
 zig build test --summary all
 ```
+Runs the full Phase 0/1/2 suite. Expected: ~670 tests across all
+modules. The ~3 min runtime is dominated by Phase 1's randomized
+HAMT correctness gate (one test alone runs ~100k randomized ops in
+~3 minutes); Phase 2 work doesn't touch any of that. Run before
+substantive commits, NOT in the edit/test loop.
 
-Expected: **487 tests pass / 68 build steps succeed**. If the tree
-isn't green, STOP and diagnose before editing.
+If either is red, STOP and diagnose before editing.
 
-Test breakdown at handoff time:
-  Inline runtime tests (32 binaries):
-   10  hash, 12  value, 9  eq, 12  intern, 26  heap,
-   14  string, 19  list, 19  vector, 24  bignum, 42  hamt,
-   20  transient, 30  dispatch, 16  gc, 47  codec, 15  db,
-   9  pool, 21  vm (← +6 from step #2: math:add + holistic review),
-   8  reader (Phase 0)
-  Property tests (test/prop/, 11 files):
-   7  primitive, 10  intern, 8  heap, 6  string, 8  list,
-   10  bignum, 9  vector, 13  hamt, 8  transient, 3  gc, 11  codec
-  Compile tests (NEW this session):
-   7  compile (← step #2 tiny compiler)
-  Golden reader tests:
-   10  test/golden/
+Test breakdown at HEAD (4373b6e):
+  Phase 2 modules (run via `zig build phase2-test`):
+    86 vm        (Var/Namespace + var:load-var + var:store-var +
+                  var:var-object + cmp:lt + recur + variadic rest
+                  + capture machinery + ...)
+   135 compile   (Tiny: nil/bool/int/symbol/add/lt/if/let_star/
+                  do/fn_star/call/letfn_star/loop_star/recur/
+                  def/var_ref/defn)
+  Phase 0/1 modules (run via `zig build test`):
+    Inline runtime tests (32 binaries, mostly unchanged since
+    Phase 1 close): hash, value, eq, intern, heap, string, list,
+    vector, bignum, hamt, transient, dispatch, gc, codec, db,
+    pool, reader.
+    Property tests (test/prop/, 12 files): primitive, intern,
+    heap, string, list, bignum, vector, hamt, gc, transient,
+    codec, db.
+    Golden reader tests: 10  test/golden/
 
 If you run `zig build parser` for any reason, note it requires
 ../nexus/bin/nexus to exist. Regenerating src/parser.zig isn't
@@ -235,14 +273,79 @@ Form (parsed source, in `src/reader.zig`), Value (runtime 16-byte
 tagged cells), Durable-Encoded (codec wire format, SHIPPED in
 src/codec.zig). They only fuse through explicit codec ops.
 
-### 4.10 Tiny vs reader.Form in compile.zig (step #2 ↔ step #3 boundary)
+### 4.10 Tiny is a bootstrap AST that lives alongside reader.Form
 
-`src/compile.zig` step #2 takes a local `Tiny` representation, NOT
-`reader.Form`. The public entry point is `compileTiny()` (loud
-naming). When step #3 adds conditionals, the natural shape extends
-to a recursive `Tiny` (with `if: struct { test: *Tiny, then: *Tiny,
-else_: ?*Tiny }`), at which point real `reader.Form` integration
-becomes worthwhile. Step #3 is where compile.zig grows up.
+`src/compile.zig` consumes a local `Tiny` union(enum), NOT
+`reader.Form`. The public entry points are `compileTiny()` and
+`compileTinyWithNamespace()`. Tiny variants cover everything
+needed to bring the language up: literals (nil/bool/int/symbol),
+operators (add/lt), control flow (if_/let_star/do/loop_star/
+letfn_star/recur), functions (fn_star with name + rest_param),
+calls, vars (def/var_ref), defn sugar.
+
+Step #7 introduces `compileForm()` which consumes `reader.Form`
+directly. Tiny stays for now as a regression bed (135 tests as
+of HEAD) and a faster bring-up path. Eventually retired in
+Phase 2 polish.
+
+### 4.11 Capture analysis is pre-analysis, NOT lazy boxing
+(peer-AI turn 44 caught the lazy-boxing control-flow bug)
+
+The compiler's capture model is **pre-analysis with binding-time
+boxing**, NOT lazy boxing. For each let* binding and each fn*
+param, the analyzer walks the rest of the form looking for
+descendant `fn_star` bodies that reference the binding's name.
+If any do, the compiler emits `closure:box-local` UNCONDITIONALLY
+in straight-line prelude code (before any branching), and the
+binding is registered as `.cell_slot`.
+
+The lazy-boxing approach (emit box-local at the moment of
+capture discovery) was tried during 5b development. It is NOT
+control-flow safe: if a closure capturing the binding lives in
+an unreachable branch (e.g., `(if false (fn* [] x) 0)`), the
+box-local instruction lives in dead code and never executes at
+runtime, but the compiler's scope thinks the binding is boxed.
+Subsequent same-frame reads would emit `closure:get-cell`
+against an unboxed slot → runtime `:expected-cell` trap on
+perfectly valid programs.
+
+The pre-analysis pivot in 5b made the binding representation
+(`.direct_slot` vs `.cell_slot`) provably stable across ALL
+control-flow paths. `BindingRef` is immutable from binding-time
+onward; no mid-codegen mutation. The captured-loop-binding
+fresh-cell semantics (5d) and captured-fn-param semantics (5e)
+both rely on this invariant.
+
+### 4.12 Vars are heap-allocated identity-stable cells
+(peer-AI turn 49 design; #6a/#6b/#6c shipped)
+
+A `Var` is `{ name, root, bound, meta }`. Owned by a `Namespace`
+which maps `name → *Var`. The VM owns one global `Namespace`
+lazily via `ensureNamespace()`; multi-namespace machinery is a
+later commit.
+
+`Var` is a value-kind (`.var_ = 25` per VALUE.md) but encoded
+in the staged raw-pointer-in-payload style (same as Closure
+and UpvalCell) — when GC migration lands, all three migrate
+together to `heap.alloc(.kind, ...)` with `*HeapHeader` payloads.
+
+**Identity-stable rebind**: `(def x 5)` then `(def x 10)` updates
+the SAME Var in place. Existing closures that captured `x` via
+the namespace fall-through (`var:load-var`) see the new value
+on next read. Tests verify this directly.
+
+**Forward references** work because Vars can be interned unbound
+(`bound = false`). The compiler creates the Var at compile time
+(symbol fall-through OR explicit def), but reading the Var's
+root traps `:unbound-var` until a `def` sets it. The trap fires
+only on actual invocation, not on compilation.
+
+**Per-routine `var_table`** holds `*Var` pointers; the V operand
+index resolves through this table at runtime. Dedup via linear
+scan in `addVarRef` (var_tables are small in practice).
+`Routine.var_table` propagates through `Compiled.toRoutine` and
+`compileFn`'s child routine construction.
+
 
 ═══════════════════════════════════════════════════════════════════════
 ## 5. SESSION DISCIPLINE (non-negotiable — this is what makes the work good)
@@ -398,40 +501,87 @@ Phase 0 (still in place):
 ### 7.2 Phase 2 progress (in progress)
 
 ```
-SHIPPED:
-  [x] src/vm.zig           VM kernel (mov, call:return, math:add) per
-                           VM.md §3-§4 + step #2
-  [x] src/compile.zig      Tiny compiler for `(+ 1 2)` per step #2
-                           (compileTiny() entry; Tiny union(enum) input;
-                           arena-owned Compiled output)
+SHIPPED (steps #1-#6 of COMPILER.md §10's 11-step plan):
+  [x] step #1  VM kernel (mov:move, load-const, load-nil/true/false,
+               call:return, return-nil) — 6 core opcodes.
+  [x] step #2  math:add opcode + Tiny.add + literal-pair peephole.
+  [x] step #3  Conditionals: jump:* (jmp/if-true/if-false) +
+               Tiny.if_ + compileIf with back-patching.
+  [x] step #4  Locals + let* — Tiny.let_star + compileLetStar with
+               sequential RHS visibility, shadowing, do form.
+  [x] step #5  Functions + closures (decomposed for safety):
+       [x] 5a0   Backing-stack Frame refactor (base_slot + slot_count
+                 windowing into VM.stack; needed for call:call).
+       [x] 5a0.5 Typed Const pool (vm.Const = union { value, routine }).
+       [x] 5a1   Empty-capture closures + call:call/return:
+                 range-call ABI per VM.md §6 (closure + args staged
+                 contiguously; argc-imm + result-slot encoding).
+       [x] 5b    Capture machinery — pre-analysis + cell ops +
+                 U-operand. CONTROL-FLOW SAFE (peer-AI turn 44
+                 caught the lazy-boxing bug; pivoted to pre-
+                 analysis with binding-time closure:box-local).
+       [x] 5c    Placeholder cells (closure:new-cell, init-cell) +
+                 letfn* mutual recursion + named fn* self-reference.
+       [x] 5d    Tail-position machinery: loop* + recur with
+                 captured-fresh-cell semantics + cmp:lt + VM high-
+                 water instrumentation. 10k-iter constant-stack
+                 verified. call:tailcall DEFERRED per peer-AI turn 47
+                 (separate context model).
+       [x] 5e    Variadic params (& rest) via VM-side rest
+                 construction (Option D per peer-AI turn 49). Heap
+                 lazy-initialized on first variadic call.
+                 Variadic-recur rejected as UnsupportedFeature.
+  [x] step #6  Vars / def / namespaces (decomposed for safety):
+       [x] 6a    Var struct + Namespace + var:load-var opcode +
+                 UnboundVar trap. Tests pre-seed via VM API.
+       [x] 6b    def + var:store-var + var:var-object +
+                 compileSymbol fall-through to namespace Vars.
+                 compileTinyWithNamespace public entry. Lexical
+                 locals still take precedence over Vars.
+       [x] 6c    defn sugar (lowers to (def name (fn* name ...)))
+                 + forward references (compile then bind, runtime
+                 traps :unbound-var only on actual invocation).
 
 PENDING per COMPILER.md §10:
-  [ ] step #3   Conditionals: jump:* opcodes + `if` lowering
-                NEXT — see §10 below for the immediate scope.
-  [ ] step #4   Locals + let* — slot allocation, sequential bindings
-  [ ] step #5   Functions + closures — range-call ABI (VM.md §6),
-                closure-group opcodes (VM.md §6), backing-stack
-                evolution of Frame, GC root enumeration from frames
-  [ ] step #6   recur + loop* — including fresh-cell-per-iteration for
-                captured bindings (VM.md §6 + COMPILER.md §5.6)
-  [ ] step #7   Vars + def — namespace integration (PLAN §14.3 sketch
-                exists but no docs/NAMESPACE.md or src/ns.zig yet)
+  [ ] step #7   Replace Tiny AST with real reader.Form input.
+                NEXT — see §10 below. The big leap that unlocks
+                compiling any .nx source file. Needs a peer-AI
+                strategy turn (turn 51) before coding.
   [ ] step #8   Macroexpand + syntax-quote + #%anon-fn — including
-                auto-gensym hygiene (PLAN §14.2)
-  [ ] step #9   try/catch/throw (VM.md §12 minimal v1 spec)
+                auto-gensym hygiene (PLAN §14.2).
+  [ ] step #9   try/catch/throw (VM.md §12 minimal v1 spec).
   [ ] step #10  Error-reporting hardening — SrcSpan threading
-                end-to-end, structured error Value layer
-  [ ] step #11  Golden + eval pipeline tests
+                end-to-end, structured error Value layer.
+  [ ] step #11  Golden + eval pipeline tests.
 
-REFACTORS LIKELY DURING THE ABOVE:
-  [ ] src/numeric.zig      extract addNumbers + future math sub/mul/etc.
-                           when 2nd or 3rd math op lands (peer-AI turn 33)
-  [ ] src/vm/<group>.zig   split per-group handler files when vm.zig
-                           crosses ~1500 LOC (it's at ~1100 now)
-  [ ] backing value-stack  current Frame.slots is per-frame owned;
-                           must evolve to backing-stack-with-frame-base
-                           when call:call lands (VM.md §7)
-  [ ] src/gc.zig hookup    VM frames as roots when closures land
+OPTIONAL / DEFERRED (decided explicitly, not blockers):
+  [ ] call:tailcall opcode — context propagation differs from
+      recur's; deferred per peer-AI turn 47. When it lands, must
+      also perform variadic-rest construction after sliding args
+      (noted in VM.md §6 amendment log for 5e).
+  [ ] Variadic recur — rejected as UnsupportedFeature by
+      compileRecur for variadic fn targets. Proper lowering
+      rebuilds the rest list per iteration; deferred per peer-AI
+      turn 49.
+
+REFACTORS LIKELY DURING #7+:
+  [ ] src/macroexpand.zig  new module; recursive-to-fixed-point
+                           macro expander. Will sit between
+                           src/reader.zig and src/compile.zig.
+  [ ] src/resolve.zig      new module; symbol classification
+                           (local / upvalue / Var / special-form).
+                           May absorb Emitter's resolveOrCapture.
+  [ ] src/analyze.zig      new module; tail-position marking,
+                           captured-binding analysis, constant
+                           folding. May absorb pre-analysis from
+                           compile.zig.
+  [ ] src/vm/<group>.zig   split per-group handler files when
+                           vm.zig crosses ~5000 LOC (it's at
+                           ~4000 now).
+  [ ] src/gc.zig hookup    VM frames + namespace + heap as roots
+                           when GC migration lands. Closure/cell/
+                           Var raw-pointer-in-payload encoding
+                           migrates to *HeapHeader at that time.
 ```
 
 ### 7.3 Spec status
@@ -443,24 +593,32 @@ Frozen and authoritative:
   [x] FORMS.md (Phase 0 reader).
   [x] SEMANTICS.md, VALUE.md.
   [x] COMPILER.md — §1-§13 all populated; amendment log up to date
-      with this session's three rounds.
-  [x] VM.md — §1-§18 all populated; per-group variant tables for mov,
-      call, math, closure, jump as authoritative variant numbering;
-      amendment log up to date.
+      through step #6c (peer-AI turns 28, 32, 34, 35, 40, 44, 45,
+      46, 47, 48, 49, 50).
+  [x] VM.md — §1-§18 all populated; per-group variant tables for
+      mov, cmp, math, call, closure, jump, var as authoritative
+      variant numbering; amendment log up to date through step 5e
+      (peer-AI turns 28, 32, 34, 40, 44, 47, 48, 49, 50).
 
 Spec gaps to address before their step lands:
-  [ ] docs/NAMESPACE.md — Var lookup hot path, refer/alias tables.
-      PLAN §14.3 has a 5-line struct sketch; needs full spec before
-      step #7. ~200-300 LOC commit.
+  [ ] docs/NAMESPACE.md — full Namespace spec: refer/alias tables,
+      Var-table dedup discipline, multi-ns design. PLAN §14.3 has
+      a 5-line sketch; #6a/#6b/#6c shipped a working single-ns
+      implementation but the spec hasn't been formalized. Worth a
+      doc before multi-ns work begins.
   [ ] docs/MACROS.md — macroexpander invariants; syntax-quote /
       auto-gensym contracts. PLAN §14.1-§14.2 has the contracts;
       a standalone doc would crystallize them before step #8.
+  [ ] Spec text for cmp group (currently only amendment-log mention).
+      Worth a §10.X subsection in VM.md when more cmp variants land.
 
 Spec amendments tracked in amendment logs:
-  - COMPILER.md §13: 2 entries (initial draft + 2026-05-15 §4.3
-    amendments + 2026-05-15 §5/§6 closure amendments).
-  - VM.md §18: 3 entries (initial + 2026-05-15 range-call ABI +
-    2026-05-15 closure-group).
+  - COMPILER.md §13: 9 entries (initial + §4.3 + §5.5/§5.6/§6 +
+    §6.1 pre-analysis pivot + §5.5/§5.6b 5c + §5.6/§5.7 5d +
+    §5.5/§6 5e).
+  - VM.md §18: 8 entries (initial + range-call ABI + closure-group
+    + lazy→pre-analysis revert + new-cell/init-cell wiring + cmp
+    + recur runtime + variadic rest construction).
 ```
 
 ### 7.4 Phase 1 gate retirement (PLAN §20.2)
@@ -479,19 +637,34 @@ Spec amendments tracked in amendment logs:
 ### 7.5 Phase 2 gate (per COMPILER.md §9.4)
 
 ```
-1. Every primitive-core form compiles + executes correctly      PENDING
-   (currently only int literal + (+ int int) work via Tiny;
-    real form support starts at step #3)
-2. recur in 10k-iter loop runs in constant stack space          PENDING
-3. Closure capture works across deeply-nested fns               PENDING
+1. Every primitive-core form compiles + executes correctly      PARTIAL
+   Via Tiny: nil, bool, int, symbol, add, lt, if_, let_star,
+   do, fn_star (with name + rest_param), call, letfn_star,
+   loop_star, recur, def, var_ref, defn — ALL WORKING.
+   Pending: macros (step #8) + try/catch/throw (step #9). Real
+   primitive-core completion arrives with step #7 (reader.Form
+   integration) when these Tiny forms map back to PLAN §6.1 source
+   syntax.
+2. recur in 10k-iter loop runs in constant stack space          SHIPPED
+   (5d test verifies both stack_high_water and frame_high_water
+   are unchanged across 10k iterations)
+3. Closure capture works across deeply-nested fns               SHIPPED
+   (5b: 3-level transitive captures; 5c: letfn* mutual recursion
+   via placeholder cells; 5e: captured rest params)
 4. syntax-quote / unquote / unquote-splicing produce equivalent PENDING
    structurally-equal Forms to hand-coded equivalents
-5. Compiler errors report stable error-kind keyword + primary   PENDING
+   (step #8: macroexpander)
+5. Compiler errors report stable error-kind keyword + primary   PARTIAL
    SrcSpan + macro origin when applicable
-6. All golden tests pass; full test suite remains 487/487+      ON TRACK
-   (487/487 currently; +14 expected from compile-golden tests)
+   (CompileError variants exist; SrcSpan threading lands with
+   step #10 when reader.Form integration brings spans into
+   compile-time errors)
+6. All golden tests pass; full test suite remains green         ON TRACK
+   (670 tests total: 86 vm + 135 compile + ~454 Phase 1 + 10
+    golden, all green at HEAD 4373b6e)
 7. bench/compiler.zig measures compilation throughput, eval     PENDING
    throughput, closure-creation cost, recur per-iter cost
+   (Phase 6 polish; not a blocker for Phase 2 gate close)
 ```
 
 ═══════════════════════════════════════════════════════════════════════
@@ -568,93 +741,141 @@ From PLAN.md §"Start here" and accumulated hard lessons:
   `vm.Operand` rely on this; if you add fields, mind the bit order.
 
 ═══════════════════════════════════════════════════════════════════════
-## 10. IMMEDIATE NEXT TASK — Phase 2 step #3 (conditionals)
+## 10. IMMEDIATE NEXT TASK — Phase 2 step #7 (replace Tiny AST with reader.Form)
 
-Per COMPILER.md §10 #3: add `jump:*` opcodes + `if` lowering.
+Per COMPILER.md §10 #7: the biggest leap of Phase 2. Today the
+compiler consumes a hand-built `Tiny` union(enum); after #7 it
+consumes the `reader.Form` tree produced by `src/reader.zig` from
+actual `.nx` source bytes. **This unlocks compiling any source
+file end-to-end.**
 
-### Scope
+### Scope (high level — needs a strategy turn for concrete shape)
 
-**VM-side (`src/vm.zig`)**:
-- `Jump` enum with variants per VM.md §10.5: `jmp`, `if_true`,
-  `if_false`. (J operand kind already exists in OpKind.)
-- `execJump` handler dispatching on variant.
-- `jump:if-true` / `jump:if-false` need a "is this value falsy?"
-  predicate. Per PLAN §6.2: only nil and false are falsy. Per
-  peer-AI turn 35, this predicate should live in `value.zig` or a
-  shared helper (the macroexpander/analyzer constant-folding will
-  want the same semantics) — likely `value_mod.isFalsy(v)` returning
-  `v.kind() == .nil or v.kind() == .false_`.
-- `asm_.jumpJmp` / `asm_.jumpIfTrue` / `asm_.jumpIfFalse` helpers.
-- New tests for each variant + branch-not-taken, branch-taken,
-  out-of-range jump target, the truthy/falsy edge cases (0, "",
-  empty collections — all truthy per §6.2).
+**Input side**:
+- `src/reader.zig` already produces canonical `Form` trees per
+  `docs/FORMS.md` from Phase 0. Forms include literals, lists,
+  vectors, maps, sets, symbols, keywords, quote markers,
+  metadata, anonymous fn shorthand, syntax-quote.
+- The compiler currently takes `*const Tiny` and walks it
+  directly. After #7 it takes `*const Form` and walks THAT.
 
-**Compiler-side (`src/compile.zig`)**:
-- Extend `Tiny` with an `if` variant: `if: struct { test: *Tiny,
-  then: *Tiny, else_: ?*Tiny }`. Test/then/else_ are heap-allocated
-  Tiny pointers — Tiny becomes recursive. The `compileTiny()` arena
-  owns them.
-- Implement `compileIf` per COMPILER.md §5.2:
-  - Lower test into a slot.
-  - Emit `jump:if-false` to else-label.
-  - Emit then code, leaving result in dst.
-  - Emit `jump:jmp` to end-label.
-  - Emit else-label, else code (or `mov:load-nil` if absent).
-  - End-label.
-- `compileTiny` may want to evolve into a "compile-to-destination"
-  API per peer-AI turn 35 recommendation:
-    `fn compileExpr(form: *const Tiny, dst: u12, emitter: *Emitter) !void`
-  This sets the pattern that step #4 (let*) will need for slot
-  allocation. Worth proposing in the strategy turn.
-- New compile tests: `(if true 1 2)` = 1, `(if false 1 2)` = 2,
-  `(if nil 1 2)` = 2, `(if 0 1 2)` = 1 (truthy), `(if "" 1 2)` = 1
-  (truthy), `(if true 1)` = 1 (no else), `(if false 1)` = nil.
+**Translation layer (the actual work)**:
+- A function (let's call it `compileForm(allocator, form, ns?)`)
+  that recognizes special forms by their head symbol:
+    (def name value?)        → analogous to current compileDef
+    (defn name [params] body) → analogous to current compileDefn
+    (fn* [params] body)      → compileFn (existing)
+    (let* [bindings] body)   → compileLetStar (existing)
+    (letfn* [bindings] body) → compileLetFnStar (existing)
+    (loop* [bindings] body)  → compileLoopStar (existing)
+    (recur args...)          → compileRecur (existing)
+    (if test then else?)     → compileIf (existing)
+    (do exprs...)            → compileDo (existing)
+    (quote form)             → emit form as a literal constant
+    (var name)               → compileVarRef (existing)
+    (+ a b), (< a b)         → compileAdd / compileLt — but
+                               wait, these are calls to functions,
+                               NOT special forms in Clojure. See
+                               §7 strategy notes below.
+  Non-special-form lists: ordinary function calls (compileCall).
+  Symbols: compileSymbol fall-through (existing).
+  Literals: dispatch on Form kind → existing lowerings.
 
-### Strategy turn (DO THIS FIRST)
+**Discipline**: the Tiny module STAYS for now as a faster bring-up
+path for tests and a known-good baseline. New tests use Form
+trees end-to-end via the reader; existing Tiny tests stay green
+as a regression bed. Eventually (post-Phase 2 polish) the Tiny
+path can be retired.
 
-Before writing code, draft a peer-AI strategy message on
-`conversation_id: "nexis-phase-1"` covering:
+### Strategy turn (DO THIS FIRST — peer-AI turn 51)
 
-1. **Compile-to-destination vs return-from-compile pattern**: peer AI
-   suggested `compileExpr(form, dst, emitter)` over the current
-   `compile(form) -> Compiled` shape. The current shape works for
-   step #2 because there's only one form per Compiled; step #3's `if`
-   needs to compile two arms targeting the same dst. Should the API
-   shift now (small refactor, sets the pattern early) or in step #4?
+Before writing any code, draft a peer-AI strategy message on
+`conversation_id: "nexis-phase-1"` covering these design choices:
 
-2. **Tiny representation**: recursive Tiny needs an arena. Currently
-   compileTiny accepts a pass-by-value `Tiny`. Should the test
-   fixtures construct trees through a small builder, or hand-build
-   them with `&Tiny{...}`?
+1. **Tiny coexistence vs replacement**: keep Tiny as a parallel
+   path (recommended — preserves the 135 existing compile tests
+   as a regression bed) or rip it out and migrate all tests to
+   Form fixtures? Most projects pick the parallel-path approach
+   for stability.
 
-3. **isFalsy predicate location**: value.zig vs vm.zig vs new
-   value-helpers module. Worth ~1 turn of peer review because every
-   subsequent opcode that branches on truthiness will reference it.
+2. **`+`, `<`, etc.: special forms vs function calls?** Today
+   they're Tiny variants with their own compile functions. In
+   real Clojure, `+` is a function bound to a Var (clojure.core/+).
+   For step #7 do we:
+   (a) Keep them as compiler-recognized special forms (treat
+       `(+ a b)` head-symbol `+` as a magic name lowering to
+       math:add). Simple but limits user redefinition.
+   (b) Treat them as ordinary calls; bind core fns as Vars in
+       a `core` namespace at VM init time. Requires the namespace
+       machinery to seed Vars with native function values, which
+       we don't have yet.
+   (c) Hybrid: compile-time recognize `+`/`-`/`<`/etc. as inlined
+       opcodes ONLY when the head symbol is unshadowed and
+       resolves to the core Var; fall back to ordinary call
+       otherwise. This is what production-quality Clojure
+       implementations (Clojure-on-JVM, ClojureScript, Babashka)
+       all do.
+   Peer recommends (c) for v1; but (a) is shippable as a stepping
+   stone if scope blows up.
 
-4. **Emitter abstraction**: as Tiny grows, the current "alloc one
-   array up front" pattern stops scaling. Should an Emitter struct
-   land now (build code into an ArrayList, then ToOwnedSlice at
-   end) or stay with current shape?
+3. **Quoting**: `(quote form)` returns the form unevaluated. For
+   the compiler, this means emit Form-as-Value into the constant
+   pool. Today the const pool holds `Value` and `Routine`; we'd
+   need it to hold quoted Form trees as well, OR convert quoted
+   Forms to runtime Values at compile time (most common path:
+   build the Value tree at compile time and emit `mov:load-const`).
 
-These are the four design choices step #3 actually requires. Most
-of the rest is mechanical.
+4. **Anonymous fn shorthand `#(...)`**: reader produces something
+   like `(fn* [%1 %2] (...))` — does the compiler need to
+   recognize this or does the reader pre-lower it? FORMS.md
+   should answer this; check first.
+
+5. **Syntax-quote `\`form` + `~expr` + `~@expr`**: per PLAN
+   §14.2 this is macroexpander territory (step #8), not #7.
+   For #7, raise `:syntax-quote-outside-macro` (a CompileError
+   variant) if encountered. The reader emits these as canonical
+   Forms; the compiler refuses them outside macro context.
+
+6. **Error reporting + SrcSpan**: Forms carry source spans;
+   compile errors should propagate them. Today CompileError is
+   bare error{...}; #10 (error reporting hardening) introduces
+   structured errors with spans. For #7 it's acceptable to leave
+   span threading "TODO step #10" but the integration points
+   should be marked.
+
+7. **Test fixtures**: parse real `.nx` source strings via the
+   reader, then compile + run. End-to-end tests look like:
+   ```
+   const src = "(do (def x 5) x)";
+   const form = try reader.parse(arena.allocator(), src);
+   const compiled = try compileFormWithNamespace(...);
+   ```
+   This is the smell test that step #7 actually delivers value.
+
+8. **What ABSOLUTELY must NOT regress**: every existing Tiny
+   test stays green. Every existing CompileError variant keeps
+   its meaning. The phase2-test build step still runs in <5s.
 
 ### Estimated scope
 
-- ~150 LOC in src/vm.zig (Jump enum, execJump, helpers, tests)
-- ~100 LOC in src/compile.zig (Tiny.if, compileIf, tests)
-- ~10-15 new tests across both
-- ~30 minutes of strategy + review
-- Likely 1-2 sessions if done with peer AI engagement and code review
+- ~400-600 LOC in src/compile.zig (compileForm + special-form
+  recognition + literal handling)
+- ~5-10 new CompileError variants for Form-specific errors
+- ~20-30 new tests using real source strings + reader
+- Possible new src/compile_form.zig module if compile.zig
+  crosses ~5000 LOC (currently ~4600 after #6c)
+- Strategy turn + 1-2 code-review turns with peer AI
+- Likely 2-3 sessions
 
-### After step #3 ships
+### After step #7 ships
 
-Step #4 (locals + let*) becomes the obvious next item per
-COMPILER.md §10. let* is where slot allocation gets non-trivial
-(scoped lifetimes; sequential bindings per the §4.3 amendment).
-The Tiny representation likely grows a `let_star` variant; compile.zig
-gains a slot allocator (probably starting with bump-allocate per
-binding, no liveness reuse — that's Phase 6 polish).
+Steps #8-#11 in order:
+  - #8 macroexpander: recursive-to-fixed-point expansion; syntax-
+    quote/unquote; auto-gensym. PLAN §14.2 spec. ~500 LOC plus
+    a new src/macroexpand.zig.
+  - #9 try/catch/throw per VM.md §12 minimal spec.
+  - #10 error reporting hardening: SrcSpan threaded end-to-end.
+  - #11 golden + eval pipeline tests; Phase 2 gate close.
 
 ═══════════════════════════════════════════════════════════════════════
 ## 11. THE QUALITY BAR — what makes this project world-class vs just competent
