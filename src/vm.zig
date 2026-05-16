@@ -208,10 +208,16 @@ pub const Jump = enum(u6) {
 };
 
 /// Variants for the `var` group. Per VM.md §10 group #6.
-/// Step #6a wires `load_var` only; `store_var` lands in #6b.
+/// #6a wires `load_var`; #6b adds `store_var` and `var_object`.
 pub const VarOp = enum(u6) {
+    /// Load the Var's root value into a slot. Traps :unbound-var.
     load_var = 0,
+    /// Set the Var's root, mark bound, return the Var object.
     store_var = 1,
+    /// Load the Var object itself (not its value) into a slot.
+    /// Does NOT trap on unbound — taking a reference to an
+    /// unbound Var is legal.
+    var_object = 2,
     _,
 };
 
@@ -807,6 +813,24 @@ pub const VM = struct {
     /// translate the `*HeapHeader` payload to `*Closure` body.
     pub fn asClosure(v: Value) *const Closure {
         std.debug.assert(v.kind() == .function);
+        return @ptrFromInt(v.payload);
+    }
+
+    /// Step #6b: pack a `*Var` into a `Value` of kind `.var_`.
+    /// Used by `var:store-var` (returns the Var object so
+    /// `(def x 5)` evaluates to the Var, not the value 5) and
+    /// by `var:var-object` (Clojure's `(var x)` reader form).
+    /// Staged encoding (raw *Var in payload, NOT *HeapHeader)
+    /// matches Closure/UpvalCell; migrates with the GC cutover.
+    pub fn varToValue(v: *Var) Value {
+        return Value{
+            .tag = @as(u64, @intFromEnum(value_mod.Kind.var_)),
+            .payload = @intFromPtr(v),
+        };
+    }
+
+    pub fn asVar(v: Value) *Var {
+        std.debug.assert(v.kind() == .var_);
         return @ptrFromInt(v.payload);
     }
 
@@ -1660,8 +1684,8 @@ pub const VM = struct {
         const variant: VarOp = @enumFromInt(inst.variant);
         switch (variant) {
             .load_var => try self.execVarLoadVar(inst),
-            // Reserved; lands in #6b.
-            .store_var => return VmError.UnimplementedOpcode,
+            .store_var => try self.execVarStoreVar(inst),
+            .var_object => try self.execVarVarObject(inst),
             _ => return VmError.BytecodeCorruption,
         }
     }
@@ -1681,6 +1705,42 @@ pub const VM = struct {
         if (inst.b.kind != .var_) return VmError.InvalidOperandKind;
         const v = try self.resolve(inst.b);
         try self.store(inst.a, v);
+    }
+
+    /// `var:store-var A=dst_slot B=var(index) C=value_op` —
+    /// set `routine.var_table[B.index].root = resolve(C)`,
+    /// mark `bound = true`, and write the Var object (a Value
+    /// of kind `.var_`) into `slot[A]`. Step #6b.
+    ///
+    /// Returning the Var (not the value) matches Clojure's
+    /// `def` semantics: `(def x 5)` evaluates to the Var
+    /// `#'x`. Rebinding the same name updates the SAME Var in
+    /// place (identity-stable), so existing closures that
+    /// captured `x`'s Var continue to see the new value.
+    fn execVarStoreVar(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        if (inst.b.kind != .var_) return VmError.InvalidOperandKind;
+        const var_table = self.currentFrame().routine.var_table;
+        if (inst.b.index >= var_table.len) return VmError.OperandOutOfRange;
+        const target = var_table[inst.b.index];
+        const new_value = try self.resolve(inst.c);
+        target.root = new_value;
+        target.bound = true;
+        try self.store(inst.a, VM.varToValue(target));
+    }
+
+    /// `var:var-object A=dst_slot B=var(index) _` — write the
+    /// Var object itself (Value of kind `.var_`) into
+    /// `slot[A]`. Does NOT trap on unbound; taking a reference
+    /// to an unbound Var is legal (Clojure's `(var x)` /
+    /// `#'x`). Step #6b.
+    fn execVarVarObject(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        if (inst.b.kind != .var_) return VmError.InvalidOperandKind;
+        const var_table = self.currentFrame().routine.var_table;
+        if (inst.b.index >= var_table.len) return VmError.OperandOutOfRange;
+        const target = var_table[inst.b.index];
+        try self.store(inst.a, VM.varToValue(target));
     }
 };
 
@@ -1863,6 +1923,32 @@ pub const asm_ = struct {
         return Inst.primary(
             .var_,
             VarOp.load_var,
+            Operand.slot(slot_dst),
+            Operand.varRef(var_idx),
+            Operand.none,
+        );
+    }
+
+    /// var:store-var dst var_idx value_op
+    ///   set var.root := resolve(value_op); var.bound := true;
+    ///   slot[dst] := Var-object. Step #6b.
+    pub fn varStoreVar(slot_dst: u12, var_idx: u12, value: Operand) Inst {
+        return Inst.primary(
+            .var_,
+            VarOp.store_var,
+            Operand.slot(slot_dst),
+            Operand.varRef(var_idx),
+            value,
+        );
+    }
+
+    /// var:var-object dst var_idx  ; slot[dst] := Var-object
+    /// (does NOT trap on unbound). Step #6b — Clojure's
+    /// `(var x)` / `#'x` reader form lowers to this.
+    pub fn varVarObject(slot_dst: u12, var_idx: u12) Inst {
+        return Inst.primary(
+            .var_,
+            VarOp.var_object,
             Operand.slot(slot_dst),
             Operand.varRef(var_idx),
             Operand.none,
@@ -2707,16 +2793,112 @@ test "VM #6a: var:load-var with non-V B operand traps :invalid-operand-kind" {
     try testing.expectError(VmError.InvalidOperandKind, res);
 }
 
-test "VM #6a: var:store-var unimplemented (#6b)" {
-    var code = [_]Inst{
-        Inst.primary(.var_, VarOp.store_var, Operand.varRef(0), Operand.slot(0), Operand.none),
-        asm_.returnNil(),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "store-var-stub");
-    var vm = try VM.init(testing.allocator, &routine);
+// ---- step #6b: var:store-var + var:var-object tests ----
+
+test "VM #6b: var:store-var sets root, marks bound, returns Var object" {
+    var vm = try VM.init(
+        testing.allocator,
+        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
+    );
     defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.UnimplementedOpcode, res);
+
+    const ns = vm.ensureNamespace();
+    const x = try ns.intern("x");
+    try testing.expect(!x.bound);
+
+    const var_table = [_]*Var{x};
+    const consts = [_]Const{cval(value_mod.fromFixnum(42).?)};
+    var code = [_]Inst{
+        asm_.varStoreVar(0, 0, Operand.constant(0)), // x = 42; slot[0] = #'x
+        asm_.returnSlot(0),
+    };
+    const routine = Routine{
+        .code = &code,
+        .consts = &consts,
+        .slot_count = 1,
+        .var_table = &var_table,
+    };
+    vm.frames.items[0].routine = &routine;
+    vm.frames.items[0].pc = 0;
+    vm.frames.items[0].slot_count = routine.slot_count;
+
+    const result = try vm.run();
+    // store-var returns the Var object, not the value.
+    try testing.expect(result.kind() == .var_);
+    try testing.expectEqual(x, VM.asVar(result));
+    // Var state is now bound to 42.
+    try testing.expect(x.bound);
+    try testing.expectEqual(@as(i64, 42), x.root.asFixnum());
+}
+
+test "VM #6b: var:store-var twice preserves Var identity (rebind in place)" {
+    var vm = try VM.init(
+        testing.allocator,
+        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
+    );
+    defer vm.deinit();
+
+    const ns = vm.ensureNamespace();
+    const x = try ns.intern("x");
+
+    const var_table = [_]*Var{x};
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(5).?),
+        cval(value_mod.fromFixnum(10).?),
+    };
+    // Bind x=5, then x=10, then return the result of the second
+    // store-var. Same Var; root updated.
+    var code = [_]Inst{
+        asm_.varStoreVar(0, 0, Operand.constant(0)), // x = 5
+        asm_.varStoreVar(0, 0, Operand.constant(1)), // x = 10
+        asm_.returnSlot(0),
+    };
+    const routine = Routine{
+        .code = &code,
+        .consts = &consts,
+        .slot_count = 1,
+        .var_table = &var_table,
+    };
+    vm.frames.items[0].routine = &routine;
+    vm.frames.items[0].pc = 0;
+    vm.frames.items[0].slot_count = routine.slot_count;
+
+    const result = try vm.run();
+    try testing.expect(result.kind() == .var_);
+    try testing.expectEqual(x, VM.asVar(result));
+    try testing.expectEqual(@as(i64, 10), x.root.asFixnum());
+}
+
+test "VM #6b: var:var-object returns the Var WITHOUT trapping on unbound" {
+    var vm = try VM.init(
+        testing.allocator,
+        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
+    );
+    defer vm.deinit();
+
+    const ns = vm.ensureNamespace();
+    const x = try ns.intern("never-bound");
+    try testing.expect(!x.bound);
+
+    const var_table = [_]*Var{x};
+    var code = [_]Inst{
+        asm_.varVarObject(0, 0),
+        asm_.returnSlot(0),
+    };
+    const routine = Routine{
+        .code = &code,
+        .consts = &.{},
+        .slot_count = 1,
+        .var_table = &var_table,
+    };
+    vm.frames.items[0].routine = &routine;
+    vm.frames.items[0].pc = 0;
+    vm.frames.items[0].slot_count = routine.slot_count;
+
+    const result = try vm.run();
+    try testing.expect(result.kind() == .var_);
+    try testing.expectEqual(x, VM.asVar(result));
+    try testing.expect(!x.bound); // var-object did NOT bind it
 }
 
 test "VM jump:jmp skips past an instruction" {

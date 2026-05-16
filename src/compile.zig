@@ -180,6 +180,30 @@ pub const Tiny = union(enum) {
     recur: struct {
         args: []const *const Tiny,
     },
+    /// `(def name value?)` per PLAN §6.1. Step #6b.
+    /// Interns a Var in the namespace (or finds the existing
+    /// one), sets its root + bound, returns the Var object
+    /// (Clojure semantics: `(def x 5)` evaluates to `#'x`, not
+    /// to 5). If `value` is null, the Var is "declared" — root
+    /// unchanged; only the intern happens (matches Clojure's
+    /// arity-1 `def`, used for forward declarations).
+    ///
+    /// Compile-time requirement: a Namespace must be passed to
+    /// `compileTiny` for `def` to compile. Without one, this
+    /// raises `UnresolvedSymbol` (no namespace to put the Var
+    /// in). Tests that exercise `def` build a Namespace and
+    /// pass it explicitly.
+    def: struct {
+        name: []const u8,
+        value: ?*const Tiny = null,
+    },
+    /// `(var name)` per PLAN §6.1. Step #6b. Loads the Var
+    /// object itself (not its value) — Clojure's `#'name`
+    /// reader form. Does NOT trap on unbound; taking a
+    /// reference to a declared-but-unbound Var is legal.
+    var_ref: struct {
+        name: []const u8,
+    },
     /// `(letfn* [(name1 params1 body1) (name2 params2 body2) ...] body)`
     /// per PLAN §6.1 + COMPILER.md §5.6b. Step 5c.
     /// Mutually-recursive function bindings: each fn body can
@@ -396,6 +420,10 @@ pub const Compiled = struct {
     code: []const Inst,
     consts: []const vm.Const,
     capture_descs: []const vm.CaptureDescriptor = &.{},
+    /// Step #6b: per-routine Var table. The V operand index
+    /// resolves through this table at runtime. Lifetime: same
+    /// as the rest of the Compiled (compile-arena-owned).
+    var_table: []const *vm.Var = &.{},
     slot_count: u16,
     /// Top-level Compiled has fixed_arity 0; child routines built
     /// by `compileFn` set this to their fixed parameter count.
@@ -410,6 +438,7 @@ pub const Compiled = struct {
             .code = self.code,
             .consts = self.consts,
             .capture_descs = self.capture_descs,
+            .var_table = self.var_table,
             .slot_count = self.slot_count,
             .fixed_arity = self.fixed_arity,
             .variadic = self.variadic,
@@ -489,6 +518,22 @@ const Emitter = struct {
     /// (resolved via `scope` first), so shadowing is
     /// preserved.
     captured_names: std.ArrayList(CapturedName) = .empty,
+    /// Step #6b: per-routine Var table. The compiler appends
+    /// to this when it sees a `def`, a `(var x)`, or a
+    /// symbol-fall-through-to-Var resolution. Index in this
+    /// list becomes the V operand index in emitted bytecode.
+    /// Routines built from a child Emitter (compileFn) carry
+    /// their own table independent of the parent's; Vars are
+    /// global per-namespace and only the index encoding is
+    /// per-routine.
+    var_table: std.ArrayList(*vm.Var) = .empty,
+    /// Step #6b: Namespace used for `def` / `var` / symbol
+    /// fall-through. `null` means no namespace was passed to
+    /// `compileTiny`; in that case `def`/`var_ref` raise
+    /// `UnresolvedSymbol` and unresolved symbols stay
+    /// unresolved (existing behavior). Child Emitters inherit
+    /// the parent's namespace pointer.
+    namespace: ?*vm.Namespace = null,
 
     fn init(allocator: std.mem.Allocator) Emitter {
         return .{ .allocator = allocator };
@@ -501,6 +546,7 @@ const Emitter = struct {
         self.scope.deinit(self.allocator);
         self.captures.deinit(self.allocator);
         self.captured_names.deinit(self.allocator);
+        self.var_table.deinit(self.allocator);
     }
 
     /// Look up a name in the routine-level capture cache.
@@ -674,6 +720,30 @@ const Emitter = struct {
         return @intCast(idx);
     }
 
+    /// Step #6b: get-or-create a V operand index for `name` in
+    /// the current routine's var_table. Interns the Var in the
+    /// namespace (creating an unbound Var if absent), then
+    /// dedup-appends to var_table. Returns the V operand index.
+    /// Requires `self.namespace != null`; callers should check
+    /// first and surface `UnresolvedSymbol` otherwise.
+    ///
+    /// Dedup: a routine that references `x` twice gets ONE
+    /// var_table entry (same V index). Matches the const-pool
+    /// dedup pattern.
+    fn addVarRef(self: *Emitter, name: []const u8) CompileError!u12 {
+        const ns = self.namespace orelse return CompileError.InternalCompilerBug;
+        const v = ns.intern(name) catch return CompileError.OutOfMemory;
+        // Dedup: linear scan is fine for v1 routines (var_table
+        // length expected to stay small; rarely > a few dozen).
+        for (self.var_table.items, 0..) |existing, i| {
+            if (existing == v) return @intCast(i);
+        }
+        const idx = self.var_table.items.len;
+        if (idx >= 4096) return CompileError.SlotOverflow;
+        try self.var_table.append(self.allocator, v);
+        return @intCast(idx);
+    }
+
     /// Append an instruction to the code stream.
     fn emit(self: *Emitter, inst: Inst) CompileError!void {
         try self.code.append(self.allocator, inst);
@@ -730,10 +800,13 @@ const Emitter = struct {
         errdefer self.allocator.free(consts);
         const caps = try self.capture_descs.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(caps);
+        const vt = try self.var_table.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(vt);
         return .{
             .code = code,
             .consts = consts,
             .capture_descs = caps,
+            .var_table = vt,
             .slot_count = if (self.slot_count == 0) 1 else self.slot_count,
             .fixed_arity = 0, // top-level only; compileFn sets this for child routines via Routine struct
             .variadic = false, // top-level routine never variadic
@@ -754,7 +827,23 @@ const Emitter = struct {
 /// surface evolves; tooling/tests that built against `compileTiny`
 /// get a clean rename signal.
 pub fn compileTiny(allocator: std.mem.Allocator, form: *const Tiny) CompileError!Compiled {
+    return compileTinyWithNamespace(allocator, form, null);
+}
+
+/// Step #6b: compile with a Namespace for `def` / `(var x)` /
+/// symbol-fall-through-to-Var resolution. Existing call sites
+/// that don't use vars can keep calling `compileTiny`
+/// (namespace=null), and unresolved symbols continue to raise
+/// `UnresolvedSymbol`. Tests that exercise `def` build a
+/// Namespace (typically `VM.ensureNamespace()`'s) and pass it
+/// here.
+pub fn compileTinyWithNamespace(
+    allocator: std.mem.Allocator,
+    form: *const Tiny,
+    namespace: ?*vm.Namespace,
+) CompileError!Compiled {
     var emitter = Emitter.init(allocator);
+    emitter.namespace = namespace;
     errdefer emitter.deinit();
 
     // Top-level form compiles into slot 0; routine returns slot 0.
@@ -917,6 +1006,14 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
             // into each arg with the current env.
             for (r.args) |a| try freeVars(allocator, a, env, out);
         },
+        .def => |d| {
+            // def's RHS is the only sub-expression that can carry
+            // free vars; the name itself is a NAMESPACE-LEVEL
+            // binding, not a local, so it doesn't affect this
+            // routine's lexical env. Step #6b.
+            if (d.value) |val| try freeVars(allocator, val, env, out);
+        },
+        .var_ref => {}, // leaf: no sub-expressions, no free vars
     }
 }
 
@@ -1056,6 +1153,11 @@ fn capturedByDescendantFns(
             // turn 47 §7 catch). Recurse into each.
             for (r.args) |a| try capturedByDescendantFns(allocator, a, env, out);
         },
+        .def => |d| {
+            // RHS may contain inner fns; analyze.
+            if (d.value) |val| try capturedByDescendantFns(allocator, val, env, out);
+        },
+        .var_ref => {}, // leaf
     }
 }
 
@@ -1098,6 +1200,8 @@ fn compileExpr(
         .letfn_star => |l| try compileLetFnStar(e, l.bindings, l.body, dst, recur_target),
         .loop_star => |l| try compileLoopStar(e, l.bindings, l.body, dst),
         .recur => |r| try compileRecur(e, r.args, recur_target),
+        .def => |d| try compileDef(e, d.name, d.value, dst),
+        .var_ref => |v| try compileVarRef(e, v.name, dst),
     }
 }
 
@@ -1161,13 +1265,31 @@ fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
     // resolution walks self first, then parent emitters. Captured
     // locals are pre-boxed at binding time (let*/loop*) or
     // function entry (fn* params) so their BindingRef is stable
-    // across all control-flow paths. Step #7 (vars) will extend
-    // this fall-through:
+    // across all control-flow paths. Step #6b (peer-AI turn 49)
+    // adds Var fall-through:
     //   1. local (this routine) → dispatch on BindingRef
     //   2. captured upvalue (parent chain) → resolve.upvalue + capture
-    //   3. namespace var → var:load-var
+    //   3. namespace var (if namespace exists) → var:load-var
     //   4. error → :unresolved-symbol
-    const ref = try e.resolveOrCapture(name);
+    const ref = e.resolveOrCapture(name) catch |err| switch (err) {
+        // Step #6b: lexical resolution failed; try the
+        // namespace before giving up. Critical that this is
+        // ONLY done for UnresolvedSymbol — other errors
+        // (SlotOverflow, OutOfMemory, InternalCompilerBug)
+        // are real bugs and must propagate untouched.
+        CompileError.UnresolvedSymbol => {
+            if (e.namespace) |_| {
+                // Intern (or get existing) Var, add to var_table,
+                // emit var:load-var. The Var may be unbound at
+                // compile time; runtime traps :unbound-var if so.
+                const idx = try e.addVarRef(name);
+                try e.emit(vm.asm_.varLoadVar(dst, idx));
+                return;
+            }
+            return err; // no namespace; propagate UnresolvedSymbol
+        },
+        else => return err,
+    };
     switch (ref) {
         .direct_slot => |s| {
             // Skip the no-op self-move (peer-AI turn 38).
@@ -1187,6 +1309,48 @@ fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
             try e.emit(vm.asm_.moveFrom(dst, vm.Operand.upvalue(u)));
         },
     }
+}
+
+/// Step #6b: lower `(def name value?)`. Interns the Var in the
+/// namespace (creating an unbound Var if absent), compiles
+/// `value` into a temp slot, emits `var:store-var` to update
+/// the Var's root and write the Var object into `dst`.
+///
+/// Without a Namespace (`e.namespace == null`), `def` raises
+/// `UnresolvedSymbol`. Tests that exercise `def` must pass
+/// a Namespace to `compileTinyWithNamespace`.
+///
+/// `(def x)` (no value) is a forward-declaration: intern the
+/// Var, but don't emit any store-var. `dst` gets the Var
+/// object (load via `var:var-object`).
+fn compileDef(
+    e: *Emitter,
+    name: []const u8,
+    value: ?*const Tiny,
+    dst: u12,
+) CompileError!void {
+    if (e.namespace == null) return CompileError.UnresolvedSymbol;
+    const idx = try e.addVarRef(name);
+    if (value) |val| {
+        const t = try e.allocSlot();
+        try compileExpr(e, val, t, null); // RHS is non-tail
+        try e.emit(vm.asm_.varStoreVar(dst, idx, vm.Operand.slot(t)));
+    } else {
+        // Declare-only: emit var:var-object so dst gets the
+        // Var object. Bound state unchanged (still unbound on
+        // first declare).
+        try e.emit(vm.asm_.varVarObject(dst, idx));
+    }
+}
+
+/// Step #6b: lower `(var name)`. Interns the Var if absent,
+/// emits `var:var-object` to load the Var object itself (NOT
+/// its value). Does not trap on unbound; users can take a
+/// reference to a forward-declared Var.
+fn compileVarRef(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
+    if (e.namespace == null) return CompileError.UnresolvedSymbol;
+    const idx = try e.addVarRef(name);
+    try e.emit(vm.asm_.varVarObject(dst, idx));
 }
 
 fn compileLetStar(
@@ -1517,6 +1681,7 @@ fn compileFn(
     // correct.
     var child = Emitter.init(parent.allocator);
     child.parent = parent;
+    child.namespace = parent.namespace; // step #6b: inherit ns for def/var resolution
     defer child.deinit();
 
     // Step 5c: inject self-name as a pre-existing capture so
@@ -1641,6 +1806,7 @@ fn compileFn(
         .code = child_compiled.code,
         .consts = child_compiled.consts,
         .capture_descs = child_compiled.capture_descs,
+        .var_table = child_compiled.var_table,
         .slot_count = child_compiled.slot_count,
         .fixed_arity = @intCast(params.len),
         .variadic = rest_param != null,
@@ -2681,6 +2847,186 @@ test "compile 5e: recur in NON-variadic fn body still works (regression check fo
     const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 0 }} } };
     const result = try runTiny(&arena, &call_form);
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+// ---- step #6b: def + var + symbol fall-through tests ----
+
+/// Helper: compile + run with a namespace owned by a VM.
+/// Builds a stub VM (just to own the namespace), gets the
+/// namespace, compiles with it, then patches the VM's top
+/// frame to the real routine. Same pattern as the #6a tests.
+fn runTinyWithNs(
+    arena: *std.heap.ArenaAllocator,
+    form: *const Tiny,
+) !value_mod.Value {
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const compiled = try compileTinyWithNamespace(arena.allocator(), form, ns);
+    const routine = compiled.toRoutine("test-with-ns");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    // Make sure stack is large enough for the new routine.
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(
+            v.allocator,
+            value_mod.nilValue(),
+            routine.slot_count - v.stack.items.len,
+        );
+    }
+    return try v.run();
+}
+
+test "compile #6b: (def x 5) returns the Var object" {
+    // Manage VM lifetime explicitly — the returned Var pointer
+    // lives in vm.runtime_arena, so the VM must outlive the
+    // Var-kind result inspection. (The runTinyWithNs helper
+    // returns scalars after VM teardown, so it can't be used
+    // for Var-kind results.)
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form: Tiny = .{ .def = .{ .name = "x", .value = &.{ .int = 5 } } };
+
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
+    const routine = compiled.toRoutine("def-test");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+
+    try testing.expect(result.kind() == .var_);
+    const var_obj = vm.VM.asVar(result);
+    try testing.expect(var_obj.bound);
+    try testing.expectEqual(@as(i64, 5), var_obj.root.asFixnum());
+    try testing.expectEqualStrings("x", var_obj.name);
+}
+
+test "compile #6b: (do (def x 5) x) reads root via symbol fall-through" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const def_form: Tiny = .{ .def = .{ .name = "x", .value = &.{ .int = 5 } } };
+    const form: Tiny = .{ .do_ = &.{ &def_form, &.{ .symbol = "x" } } };
+    const result = try runTinyWithNs(&arena, &form);
+    try testing.expect(result.isFixnum());
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile #6b: (do (def x 5) (def x 10) x) — rebind preserves identity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const def1: Tiny = .{ .def = .{ .name = "x", .value = &.{ .int = 5 } } };
+    const def2: Tiny = .{ .def = .{ .name = "x", .value = &.{ .int = 10 } } };
+    const form: Tiny = .{ .do_ = &.{ &def1, &def2, &.{ .symbol = "x" } } };
+    const result = try runTinyWithNs(&arena, &form);
+    try testing.expectEqual(@as(i64, 10), result.asFixnum());
+}
+
+test "compile #6b: (var x) returns the Var object (unbound OK)" {
+    // Same lifetime pattern as the def test above.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form: Tiny = .{ .var_ref = .{ .name = "unbound-yet" } };
+
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
+    const routine = compiled.toRoutine("var-ref-test");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+
+    try testing.expect(result.kind() == .var_);
+    const var_obj = vm.VM.asVar(result);
+    try testing.expect(!var_obj.bound);
+    try testing.expectEqualStrings("unbound-yet", var_obj.name);
+}
+
+test "compile #6b: reading an unbound Var traps :unbound-var at runtime" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // No def; just reference unresolved symbol — compileSymbol
+    // creates an unbound Var, var:load-var traps at runtime.
+    const form: Tiny = .{ .symbol = "never-bound" };
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
+    const routine = compiled.toRoutine("unbound");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    try testing.expectError(vm.VmError.UnboundVar, v.run());
+}
+
+test "compile #6b: without a namespace, unresolved symbol still raises UnresolvedSymbol" {
+    // Regression: compileTiny (no namespace) must keep the
+    // pre-#6b error semantics.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form: Tiny = .{ .symbol = "x" };
+    try testing.expectError(CompileError.UnresolvedSymbol, compileTiny(arena.allocator(), &form));
+}
+
+test "compile #6b: without a namespace, def raises UnresolvedSymbol" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form: Tiny = .{ .def = .{ .name = "x", .value = &.{ .int = 5 } } };
+    try testing.expectError(CompileError.UnresolvedSymbol, compileTiny(arena.allocator(), &form));
+}
+
+test "compile #6b: lexical local shadows namespace Var" {
+    // (def x 100)
+    // (let* [x 5] x) = 5 — not 100
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const def_form: Tiny = .{ .def = .{ .name = "x", .value = &.{ .int = 100 } } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 5 } }},
+        .body = &.{ .symbol = "x" },
+    } };
+    const form: Tiny = .{ .do_ = &.{ &def_form, &let_form } };
+    const result = try runTinyWithNs(&arena, &form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile #6b: same Var referenced multiple times shares one var_table index (dedup)" {
+    // (do (def x 5) (+ x x)) should produce only ONE
+    // var_table entry. Hard to assert directly without
+    // inspecting Compiled.var_table.len, but easy via the
+    // helper compileTinyWithNamespace.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const def_form: Tiny = .{ .def = .{ .name = "x", .value = &.{ .int = 5 } } };
+    const add_form: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .symbol = "x" } } };
+    const form: Tiny = .{ .do_ = &.{ &def_form, &add_form } };
+    const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
+    // x appears in def + 2 symbol refs = same Var, 1 var_table entry.
+    try testing.expectEqual(@as(usize, 1), compiled.var_table.len);
 }
 
 // ---- if-form tests (peer-AI turn 36 checklist) ----
