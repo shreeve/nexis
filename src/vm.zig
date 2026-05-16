@@ -9,9 +9,13 @@
 //!   - `Routine` (compiled code + constants; plain Zig struct,
 //!     not a heap Value yet — heap-kind promotion lands with
 //!     closures per VM.md §5 staged-realization note).
-//!   - `Frame` (slots + pc + routine pointer); single-frame runtime.
-//!     Multi-frame comes with `call:call` / `call:tailcall` per
-//!     the range-call ABI in VM.md §6.
+//!   - `Frame` (base_slot + slot_count + pc + routine pointer)
+//!     windowing into a VM-shared backing `stack: ArrayList(Value)`
+//!     per VM.md §7 (peer-AI turn 40 backing-stack model). Frames
+//!     live in `frames: ArrayList(Frame)`; step 5a0 still has
+//!     exactly one frame at runtime, but the storage model is
+//!     ready for `call:call` / `call:tailcall` (step 5a1) without
+//!     a second restructuring.
 //!   - `VM` with two-level-switch dispatch. Tail-call-threaded
 //!     upgrade is deferred per VM.md §8 staged-realization note.
 //!   - 6 opcodes wired across 3 groups:
@@ -248,16 +252,37 @@ pub const Routine = struct {
 // =============================================================================
 // Frame (VM.md §7)
 //
-// Single-frame runtime in this commit. A call stack + caller/return
-// machinery lands with the `call:call` opcode in a later commit.
+// Step 5a0: backing-stack model (peer-AI turn 40). Each frame is a
+// window into the VM's shared `stack` ArrayList, denoted by
+// `base_slot..base_slot + slot_count`. This refactor preserves the
+// single-frame runtime semantics — call:call / multi-frame dispatch
+// land in step 5a1 — but evolves the storage so the range-call ABI
+// (VM.md §6) can window the callee's slots over the caller's
+// `[call_base + 1 .. call_base + 1 + argc]` region with zero copy.
+//
+// **Critical discipline** (peer-AI turn 40):
+//   - Never store a `[]Value` slice into `vm.stack.items` and hold
+//     it across any operation that might grow `stack` — ArrayList
+//     can reallocate and invalidate the slice. Use the slotPtr()
+//     helper for one-shot access; if you need stable references
+//     mid-handler, snapshot the frame's `base_slot` into a local.
+//   - Never hold a `*Frame` across `vm.frames.append()` for the
+//     same reason. Step 5a1 will do `frames.append`, so all helpers
+//     that take a frame pointer must be one-shot.
 // =============================================================================
 
 pub const Frame = struct {
     routine: *const Routine,
-    /// Owned slot storage. Allocated at frame construction.
-    slots: []Value,
+    /// Index into `vm.stack.items` where this frame's slot 0 lives.
+    /// Frame's slot[i] is `vm.stack.items[base_slot + i]`.
+    base_slot: u32,
+    /// Logical slot count for bounds checks + (future) GC root walk.
+    /// Always equals `routine.slot_count` at frame construction;
+    /// kept on the frame for direct access in hot dispatch paths.
+    slot_count: u16,
     /// Bytecode offset of the next instruction to execute.
     pc: u32 = 0,
+    // For 5a1: return_dst, return_pc, upvalues lands here.
 };
 
 // =============================================================================
@@ -318,42 +343,97 @@ pub const VmError = error{
 
 pub const VM = struct {
     allocator: std.mem.Allocator,
-    frame: Frame,
-    /// Where `call:return` stores the returned Value on halt.
+    /// Backing slot storage shared across all frames. Per-frame
+    /// access uses `frame.base_slot + slot_index` indirection.
+    stack: std.ArrayList(Value) = .empty,
+    /// Frame chain. Step 5a0: always exactly one frame (the
+    /// top-level routine). Step 5a1: `call:call` appends; `call:return`
+    /// pops.
+    frames: std.ArrayList(Frame) = .empty,
+    /// Where the top-level `call:return` stores the returned Value on
+    /// halt.
     result: Value = value_mod.nilValue(),
     halted: bool = false,
 
-    /// Build a VM around `routine`, allocating a single frame with
-    /// `routine.slot_count` slots. Caller owns the lifetime of
-    /// `routine`; VM owns the frame's slot storage and frees it in
-    /// `deinit`.
+    /// Build a VM around `routine`, allocating a single top-level
+    /// frame with `routine.slot_count` slots zero-initialized to nil.
+    /// Caller owns the lifetime of `routine`; VM owns the stack and
+    /// frames storage and frees them in `deinit`.
     pub fn init(allocator: std.mem.Allocator, routine: *const Routine) !VM {
-        const slots = try allocator.alloc(Value, routine.slot_count);
-        for (slots) |*s| s.* = value_mod.nilValue();
+        var stack: std.ArrayList(Value) = .empty;
+        errdefer stack.deinit(allocator);
+        try stack.appendNTimes(allocator, value_mod.nilValue(), routine.slot_count);
+
+        var frames: std.ArrayList(Frame) = .empty;
+        errdefer frames.deinit(allocator);
+        try frames.append(allocator, .{
+            .routine = routine,
+            .base_slot = 0,
+            .slot_count = routine.slot_count,
+            .pc = 0,
+        });
+
         return .{
             .allocator = allocator,
-            .frame = .{
-                .routine = routine,
-                .slots = slots,
-                .pc = 0,
-            },
+            .stack = stack,
+            .frames = frames,
         };
     }
 
     pub fn deinit(self: *VM) void {
-        self.allocator.free(self.frame.slots);
+        self.stack.deinit(self.allocator);
+        self.frames.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Pointer to the currently-executing frame. **Single-shot use
+    /// only**: a `frames.append()` in any code path between fetch
+    /// and use will invalidate this pointer. For multi-step access,
+    /// read the relevant fields into locals or use `currentFrameIdx`.
+    inline fn currentFrame(self: *VM) *Frame {
+        // Empty frame stack is a VM invariant violation, not a
+        // recoverable runtime condition (peer-AI turn 41).
+        std.debug.assert(self.frames.items.len > 0);
+        return &self.frames.items[self.frames.items.len - 1];
+    }
+
+    /// Index of the currently-executing frame. Stable across
+    /// `frames.append()` for the existing frames (a new frame
+    /// pushes at len; the prior current frame keeps its index).
+    inline fn currentFrameIdx(self: *const VM) usize {
+        return self.frames.items.len - 1;
+    }
+
+    /// Resolve a slot operand to a pointer into the backing stack.
+    /// Returns `OperandOutOfRange` if the slot index exceeds the
+    /// current frame's `slot_count`. **Single-shot use only**: the
+    /// returned pointer is invalidated by any `stack.append` /
+    /// `stack.appendNTimes`.
+    ///
+    /// Peer-AI turn 41: two bounds checks, not one.
+    /// - Logical (`slot_count`): catches bad bytecode. Step 5a1's
+    ///   call:call will produce overlapping frame windows where
+    ///   `stack.items.len > base_slot + slot_count` for the caller
+    ///   even after the callee has been popped, so the logical
+    ///   check is what defines a frame's visible slot range.
+    /// - Physical (`stack.items.len`): catches corrupt VM/frame
+    ///   state. In 5a0 this is always satisfied if the logical
+    ///   check passes, but in 5a1 a stale `slot_count` paired
+    ///   with a shrunken stack could underrun otherwise.
+    fn slotPtr(self: *VM, slot_index: u12) VmError!*Value {
+        const frame = self.currentFrame();
+        if (slot_index >= frame.slot_count) return VmError.OperandOutOfRange;
+        const absolute: usize = @as(usize, frame.base_slot) + slot_index;
+        if (absolute >= self.stack.items.len) return VmError.BytecodeCorruption;
+        return &self.stack.items[absolute];
     }
 
     /// Resolve an operand to a `Value` (read side).
     fn resolve(self: *VM, op: Operand) VmError!Value {
         return switch (op.kind) {
-            .slot => blk: {
-                if (op.index >= self.frame.slots.len) return VmError.OperandOutOfRange;
-                break :blk self.frame.slots[op.index];
-            },
+            .slot => (try self.slotPtr(op.index)).*,
             .constant => blk: {
-                const consts = self.frame.routine.consts;
+                const consts = self.currentFrame().routine.consts;
                 if (op.index >= consts.len) return VmError.OperandOutOfRange;
                 break :blk consts[op.index];
             },
@@ -390,10 +470,7 @@ pub const VM = struct {
     ///     operand.
     fn store(self: *VM, op: Operand, v: Value) VmError!void {
         switch (op.kind) {
-            .slot => {
-                if (op.index >= self.frame.slots.len) return VmError.OperandOutOfRange;
-                self.frame.slots[op.index] = v;
-            },
+            .slot => (try self.slotPtr(op.index)).* = v,
             .upvalue => return VmError.UnimplementedOpcode,
             .constant, .var_, .intern, .jump, .durable, .unused => return VmError.InvalidOperandKind,
             _ => return VmError.BytecodeCorruption,
@@ -403,16 +480,26 @@ pub const VM = struct {
     /// Run bytecode to completion (halt). Returns the VM's `result`
     /// slot. If bytecode exhausts without a `return`, returns
     /// `BytecodeExhausted`.
+    ///
+    /// Peer-AI turn 41: the `frame` pointer is scoped inside a
+    /// nested block so it cannot accidentally be reused after
+    /// `dispatch()` — `dispatch` may grow `frames` in step 5a1
+    /// (call:call) and invalidate the pointer. The block-scoping
+    /// makes the lifetime structurally obvious rather than just
+    /// conventionally true.
     pub fn run(self: *VM) VmError!Value {
         while (!self.halted) {
-            if (self.frame.pc >= self.frame.routine.code.len) {
-                return VmError.BytecodeExhausted;
-            }
-            const inst = self.frame.routine.code[self.frame.pc];
-            self.frame.pc += 1;
-
-            // Extension instructions are reserved; skip for now.
-            if (inst.kind == .extension) return VmError.UnimplementedOpcode;
+            const inst = blk: {
+                const frame = self.currentFrame();
+                if (frame.pc >= frame.routine.code.len) {
+                    return VmError.BytecodeExhausted;
+                }
+                const i = frame.routine.code[frame.pc];
+                frame.pc += 1;
+                // Extension instructions are reserved; skip for now.
+                if (i.kind == .extension) return VmError.UnimplementedOpcode;
+                break :blk i;
+            };
 
             try self.dispatch(inst);
         }
@@ -425,17 +512,22 @@ pub const VM = struct {
     /// that exercise potentially-pathological bytecode (peer-AI
     /// turn 37) — using `run()` for malformed/unimplemented opcode
     /// tests risks 22-minute hangs when the bytecode happens to
-    /// decode as a self-targeting jump.
+    /// decode as a self-targeting jump. Same frame-pointer scoping
+    /// discipline as `run()` (peer-AI turn 41).
     pub fn runWithFuel(self: *VM, max_steps: usize) VmError!Value {
         var steps: usize = 0;
         while (!self.halted) : (steps += 1) {
             if (steps >= max_steps) return VmError.BytecodeExhausted;
-            if (self.frame.pc >= self.frame.routine.code.len) {
-                return VmError.BytecodeExhausted;
-            }
-            const inst = self.frame.routine.code[self.frame.pc];
-            self.frame.pc += 1;
-            if (inst.kind == .extension) return VmError.UnimplementedOpcode;
+            const inst = blk: {
+                const frame = self.currentFrame();
+                if (frame.pc >= frame.routine.code.len) {
+                    return VmError.BytecodeExhausted;
+                }
+                const i = frame.routine.code[frame.pc];
+                frame.pc += 1;
+                if (i.kind == .extension) return VmError.UnimplementedOpcode;
+                break :blk i;
+            };
             try self.dispatch(inst);
         }
         return self.result;
@@ -570,8 +662,9 @@ pub const VM = struct {
     fn applyJump(self: *VM, target: Operand) VmError!void {
         if (target.kind != .jump) return VmError.InvalidOperandKind;
         const pc: u32 = @intCast(target.index);
-        if (pc >= self.frame.routine.code.len) return VmError.OperandOutOfRange;
-        self.frame.pc = pc;
+        const frame = self.currentFrame();
+        if (pc >= frame.routine.code.len) return VmError.OperandOutOfRange;
+        frame.pc = pc;
     }
 
     fn execMath(self: *VM, inst: Inst) VmError!void {
@@ -791,6 +884,61 @@ test "Operand helpers build the right bits" {
     const c = Operand.constant(42);
     try testing.expectEqual(OpKind.constant, c.kind);
     try testing.expectEqual(@as(u12, 42), c.index);
+}
+
+test "VM 5a0: stack and frames structures initialized correctly" {
+    // Pins the backing-stack model invariants: after VM.init,
+    // `stack.items.len == routine.slot_count`, `frames.items.len == 1`,
+    // and frame[0].base_slot == 0.
+    const routine = makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 5, "init-shape");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+
+    try testing.expectEqual(@as(usize, 5), vm.stack.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.frames.items.len);
+    try testing.expectEqual(@as(u32, 0), vm.frames.items[0].base_slot);
+    try testing.expectEqual(@as(u16, 5), vm.frames.items[0].slot_count);
+    try testing.expectEqual(@as(u32, 0), vm.frames.items[0].pc);
+    // All slots default-initialized to nil.
+    for (vm.stack.items) |s| {
+        try testing.expect(s.kind() == .nil);
+    }
+}
+
+test "VM 5a0: slotPtr through backing stack with base_slot indirection" {
+    // Verify that slot access goes through base_slot, not a
+    // per-frame slice. With base_slot = 0 (the only case in
+    // 5a0), this is functionally equivalent to direct slice
+    // access; the test exists to pin the indirection so a
+    // future "optimization" that stores a slice can't bypass
+    // it silently.
+    const consts = [_]Value{value_mod.fromFixnum(42).?};
+    var code = [_]Inst{
+        asm_.loadConst(0, 0), // s0 = 42
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "slotptr");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+
+    // Manually verify slotPtr returns a pointer into vm.stack.items.
+    const ptr = try vm.slotPtr(0);
+    try testing.expectEqual(&vm.stack.items[0], ptr);
+
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+    // After run, the slot still holds the value (via the same indirection).
+    try testing.expectEqual(@as(i64, 42), vm.stack.items[0].asFixnum());
+}
+
+test "VM 5a0: slotPtr out-of-range surfaces OperandOutOfRange" {
+    const routine = makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 3, "slotptr-oob");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    try testing.expectError(VmError.OperandOutOfRange, vm.slotPtr(3));
+    try testing.expectError(VmError.OperandOutOfRange, vm.slotPtr(4095));
 }
 
 test "VM: load-nil into slot 0, return slot 0 -> nil" {

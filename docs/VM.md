@@ -662,14 +662,22 @@ A **frame** represents one invocation of a routine.
     the copy on non-tail calls. v1 may ship either; the
     semantic contract is identical.
 
-**Implementation note for the current skeleton** (peer-AI
-turn 32): the existing `src/vm.zig` `Frame` carries `slots:
-[]Value` owned per-frame. This is fine for the single-frame
-runtime and for step #2 (math:add for `(+ 1 2)` with no
-calls). When step #5 (functions + closures) lands, the
-frame model evolves to a backing value-stack + frame-base
-pointers so that `call:call` can window without copying.
-The visible interface in this spec is unchanged either way.
+**Implementation note** (peer-AI turn 32 + turn 40): the
+`src/vm.zig` Frame model evolved as follows:
+- Steps #1-#4 (initial kernel through `let*`): single-frame
+  runtime with per-frame owned `slots: []Value`. Sufficient
+  while no opcode allocates new frames.
+- Step #5a0 (peer-AI turn 40): refactored to backing-stack
+  model — `vm.stack: ArrayList(Value)` is the shared slot
+  storage; each Frame is a window into it via `base_slot +
+  slot_count`. Frame chain lives in `vm.frames:
+  ArrayList(Frame)`. Discipline: never store
+  `[]Value` slices into `vm.stack.items` across operations
+  that may grow it; never hold `*Frame` across
+  `vm.frames.append()`. Helpers (`slotPtr`, `currentFrame`)
+  are one-shot. Step 5a0 still has exactly one frame at
+  runtime; multi-frame dispatch lands with `call:call` in
+  step 5a1.
 
 ---
 
