@@ -189,6 +189,17 @@ pub const Value = extern struct {
         return k != 0 and k != 1;
     }
 
+    /// Inverse of `isTruthy`. Provided as a named predicate for
+    /// jump-handler / cmp-handler / analyzer code paths that read
+    /// more naturally as `if (v.isFalsy())` than as
+    /// `if (!v.isTruthy())`. Same single-comparison hot path
+    /// (peer-AI turn 36 confirmation that this belongs in
+    /// value.zig as the language-level truthiness predicate).
+    pub inline fn isFalsy(self: Value) bool {
+        const k = @intFromEnum(self.kind());
+        return k == 0 or k == 1;
+    }
+
     // ---- Decoders (panic-free on well-constructed values) ----
 
     pub inline fn asBool(self: Value) bool {
@@ -370,6 +381,22 @@ test "truthiness: only nil and false are falsy" {
     try std.testing.expect((fromFixnum(0).?).isTruthy()); // zero is truthy
     try std.testing.expect((fromFloat(0.0)).isTruthy());
     try std.testing.expect((fromChar('a').?).isTruthy());
+}
+
+test "isFalsy: matches !isTruthy across every immediate kind" {
+    // Direct positive checks for the falsy kinds.
+    try std.testing.expect(nilValue().isFalsy());
+    try std.testing.expect(fromBool(false).isFalsy());
+    // Direct negative checks for representative truthy kinds (the
+    // PLAN §6.2 surprise list — values users might assume are
+    // falsy because they're zero/empty in other languages).
+    try std.testing.expect(!fromBool(true).isFalsy());
+    try std.testing.expect(!(fromFixnum(0).?).isFalsy());
+    try std.testing.expect(!fromFloat(0.0).isFalsy());
+    try std.testing.expect(!fromFloat(-0.0).isFalsy());
+    try std.testing.expect(!(fromChar('\x00').?).isFalsy());
+    try std.testing.expect(!(fromFixnum(-1).?).isFalsy());
+    try std.testing.expect(!(fromFixnum(fixnum_max).?).isFalsy());
 }
 
 test "fromChar: Unicode range and surrogate rejection" {

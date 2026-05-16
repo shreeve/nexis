@@ -796,9 +796,34 @@ Phase 2.
 
 | Var | Name | Status | Operands | Semantics |
 |---|---|---|---|---|
-| 0 | `jump:jmp` | reserved (step #3) | A=jump-target, _, _ | `pc := A.index` |
-| 1 | `jump:if-true` | reserved (step #3) | A=jump-target, B=any, _ | `if truthy(resolve(B)) then pc := A.index` |
-| 2 | `jump:if-false` | reserved (step #3) | A=jump-target, B=any, _ | `if falsy(resolve(B)) then pc := A.index` (per PLAN §6.2: only nil and false are falsy) |
+| 0 | `jump:jmp` | step #3 | A=jump-target, _, _ | `pc := A.index` |
+| 1 | `jump:if-true` | step #3 | A=jump-target, B=any, _ | `if truthy(resolve(B)) then pc := A.index` |
+| 2 | `jump:if-false` | step #3 | A=jump-target, B=any, _ | `if falsy(resolve(B)) then pc := A.index` (per PLAN §6.2: only nil and false are falsy) |
+
+**Target operand kind requirement** (peer-AI turn 37): the
+jump-target operand `A` MUST have `kind = .jump`. Other kinds
+(e.g., `.slot`, `.constant`) are rejected as
+`:invalid-operand-kind`. This is stricter than the §4.5
+raw-index convention because jump targets are control-flow
+critical: accepting a `.slot` target permissively turns a
+stale placeholder instruction into a self-jump that loops
+forever. The `.jump` requirement turns that class of
+corruption into a clean error.
+
+**Target validation timing**: for conditional jumps
+(`jump:if-true`, `jump:if-false`), the target operand is
+validated only when the branch is **taken** in the v1
+implementation. Eager validation (on every dispatch, even
+non-taken branches) is a defensible alternative that v1 does
+not pay for. Tools may emit additional verifier passes that
+check all jump operands statically.
+
+**Pre-increment dispatch invariant**: the VM's `run()` loop
+increments `frame.pc` BEFORE invoking the handler. Non-taken
+conditional jumps therefore "fall through" by simply not
+calling `applyJump`. If this invariant ever needs to change
+(e.g., for an optimized dispatch loop), the conditional jump
+handlers must be revisited.
 
 (Variant tables for `cmp`, `var`, `coll`, `transient`, `hash`,
 `ctrl`, `io` populate when their respective steps land. The

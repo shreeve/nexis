@@ -161,6 +161,18 @@ pub const Call = enum(u6) {
     _,
 };
 
+/// Variants for the `jump` group. Per PLAN §12.3 / VM.md §10.5.
+/// Step #3 (COMPILER.md §10 #3) wires all three v1 variants —
+/// they're tiny and `if-true` pairs naturally with `if-false`
+/// (the analyzer chooses whichever produces shorter code per
+/// branch direction).
+pub const Jump = enum(u6) {
+    jmp = 0,
+    if_true = 1,
+    if_false = 2,
+    _,
+};
+
 /// Variants for the `math` group. Per PLAN §12.3 / VM.md §10.
 /// Step #2 (COMPILER.md §10 #2) wires `add` only — the absolute
 /// minimum needed to lower `(+ 1 2)` end-to-end. The remaining
@@ -407,6 +419,28 @@ pub const VM = struct {
         return self.result;
     }
 
+    /// Run bytecode with a step budget. Returns `BytecodeExhausted`
+    /// if the routine completes within the budget without halting;
+    /// returns the result Value on normal halt. Intended for tests
+    /// that exercise potentially-pathological bytecode (peer-AI
+    /// turn 37) — using `run()` for malformed/unimplemented opcode
+    /// tests risks 22-minute hangs when the bytecode happens to
+    /// decode as a self-targeting jump.
+    pub fn runWithFuel(self: *VM, max_steps: usize) VmError!Value {
+        var steps: usize = 0;
+        while (!self.halted) : (steps += 1) {
+            if (steps >= max_steps) return VmError.BytecodeExhausted;
+            if (self.frame.pc >= self.frame.routine.code.len) {
+                return VmError.BytecodeExhausted;
+            }
+            const inst = self.frame.routine.code[self.frame.pc];
+            self.frame.pc += 1;
+            if (inst.kind == .extension) return VmError.UnimplementedOpcode;
+            try self.dispatch(inst);
+        }
+        return self.result;
+    }
+
     /// Two-level switch dispatcher. Tail-call-threaded upgrade is
     /// deferred (VM.md §8 contract is "tail-call-threaded"; this
     /// implementation is semantically equivalent via the simpler
@@ -417,8 +451,9 @@ pub const VM = struct {
             .mov => try self.execMov(inst),
             .call => try self.execCall(inst),
             .math => try self.execMath(inst),
+            .jump => try self.execJump(inst),
             // Known but not yet implemented in this commit.
-            .jump, .cmp, .closure, .var_, .coll, .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
+            .cmp, .closure, .var_, .coll, .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
             // Unrecognized group byte — bytecode corruption.
             _ => return VmError.BytecodeCorruption,
         }
@@ -483,6 +518,61 @@ pub const VM = struct {
     // only. Floats, bignums, and cross-type promotion are deferred to
     // subsequent commits.
     // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // Group `jump` (VM.md §10.5 — PLAN §12.3 group 0)
+    //
+    // Step #3 (COMPILER.md §10 #3): all three v1 variants wired.
+    // Jump targets are absolute instruction indices within the
+    // current routine's `code` array. Per VM.md §4.5, the jump
+    // target operand is a "raw index" (kind ignored, index is
+    // the data); the encoding convention is `Operand.jump(N)`
+    // where N is the destination PC.
+    // -------------------------------------------------------------------------
+
+    fn execJump(self: *VM, inst: Inst) VmError!void {
+        const variant: Jump = @enumFromInt(inst.variant);
+        switch (variant) {
+            .jmp => {
+                // jump:jmp A=target _ _   ; pc := A.index
+                try self.applyJump(inst.a);
+            },
+            .if_true => {
+                // jump:if-true A=target B=test _   ; if truthy(B) pc := A.index
+                const test_v = try self.resolve(inst.b);
+                if (test_v.isTruthy()) {
+                    try self.applyJump(inst.a);
+                }
+            },
+            .if_false => {
+                // jump:if-false A=target B=test _  ; if falsy(B) pc := A.index
+                const test_v = try self.resolve(inst.b);
+                if (test_v.isFalsy()) {
+                    try self.applyJump(inst.a);
+                }
+            },
+            _ => return VmError.BytecodeCorruption,
+        }
+    }
+
+    /// Apply a jump-target operand to the current frame's PC.
+    ///
+    /// Validates two things (peer-AI turn 37 hardening):
+    ///   1. `target.kind` is `.jump`. Permissively accepting other
+    ///      kinds (e.g., `.slot`) here turns "stale placeholder
+    ///      bytecode" into "infinite loop reading slot 0" — exactly
+    ///      the bug that almost shipped in step #3. Requiring the
+    ///      `.jump` kind turns that class of corruption into a
+    ///      clean `InvalidOperandKind` at the type level.
+    ///   2. The target PC is strictly within the routine's code
+    ///      range. A target equal to `code.len` is illegal because
+    ///      the next dispatch would surface BytecodeExhausted.
+    fn applyJump(self: *VM, target: Operand) VmError!void {
+        if (target.kind != .jump) return VmError.InvalidOperandKind;
+        const pc: u32 = @intCast(target.index);
+        if (pc >= self.frame.routine.code.len) return VmError.OperandOutOfRange;
+        self.frame.pc = pc;
+    }
 
     fn execMath(self: *VM, inst: Inst) VmError!void {
         const variant: Math = @enumFromInt(inst.variant);
@@ -638,6 +728,48 @@ pub const asm_ = struct {
             rhs,
         );
     }
+
+    /// jump:jmp target _ _   ; pc := target
+    /// `target` is an absolute PC within the current routine.
+    pub fn jumpJmp(target_pc: u12) Inst {
+        return Inst.primary(
+            .jump,
+            Jump.jmp,
+            Operand.jump(target_pc),
+            Operand.none,
+            Operand.none,
+        );
+    }
+
+    /// jump:if-true target test _   ; if truthy(resolve(test)) pc := target
+    pub fn jumpIfTrue(target_pc: u12, test_op: Operand) Inst {
+        return Inst.primary(
+            .jump,
+            Jump.if_true,
+            Operand.jump(target_pc),
+            test_op,
+            Operand.none,
+        );
+    }
+
+    /// jump:if-false target test _  ; if falsy(resolve(test)) pc := target
+    pub fn jumpIfFalse(target_pc: u12, test_op: Operand) Inst {
+        return Inst.primary(
+            .jump,
+            Jump.if_false,
+            Operand.jump(target_pc),
+            test_op,
+            Operand.none,
+        );
+    }
+
+    /// Patch the jump target of an already-emitted jump
+    /// instruction. Used by the compiler's back-patching loop
+    /// for forward jumps whose target wasn't known at emit time
+    /// (peer-AI turn 36 simple-backpatch pattern).
+    pub fn patchJumpTarget(inst: *Inst, target_pc: u12) void {
+        inst.a = Operand.jump(target_pc);
+    }
 };
 
 // =============================================================================
@@ -781,24 +913,32 @@ test "VM: exhausting bytecode without return surfaces BytecodeExhausted" {
 }
 
 test "VM: known-but-not-implemented group returns UnimplementedOpcode" {
-    // jump group (0) with variant 0 — known group, not wired yet.
-    // (math was the placeholder before; math:add landed in step #2.)
-    const jump_jmp = Inst.primary(
-        .jump,
-        @as(Mov, @enumFromInt(0)), // reusing Mov tag for a placeholder; we only care about group
+    // closure group (5) with variant 0 — known group, not wired yet.
+    //
+    // **Placeholder rotation discipline** (peer-AI turn 37): when a
+    // new group lands, this placeholder must rotate to the NEXT
+    // still-unwired group. The history so far: math → jump → closure.
+    // Next likely rotations: closure → var (step #7) → coll → etc.
+    // Use `runWithFuel` (not `run`) so that an accidental rotation
+    // bug (e.g., the new wiring decodes the slot(0) operands as a
+    // self-jump) trips fuel exhaustion instead of hanging the suite
+    // for 22 minutes. This bit me once in step #3 — don't repeat.
+    const closure_make = Inst.primary(
+        .closure,
+        @as(Mov, @enumFromInt(0)), // variant 0 — placeholder; only the group matters
         Operand.slot(0),
         Operand.slot(0),
         Operand.slot(0),
     );
     var code = [_]Inst{
-        jump_jmp,
+        closure_make,
         asm_.returnNil(),
     };
     const routine = makeRoutine(&code, &.{}, 1, "unimpl");
 
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
-    const res = vm.run();
+    const res = vm.runWithFuel(100);
     try testing.expectError(VmError.UnimplementedOpcode, res);
 }
 
@@ -1022,6 +1162,231 @@ test "VM math:add: mixed slot+constant operand kinds" {
     defer vm.deinit();
     const result = try vm.run();
     try testing.expectEqual(@as(i64, 300), result.asFixnum());
+}
+
+test "VM jump:jmp skips past an instruction" {
+    // mov:load-const s0, c0          ; s0 = 1
+    // jump:jmp 3                     ; skip past the next instruction
+    // mov:load-const s0, c1          ; (skipped) would set s0 = 99
+    // call:return s0                 ; return s0 = 1
+    const consts = [_]Value{
+        value_mod.fromFixnum(1).?,
+        value_mod.fromFixnum(99).?,
+    };
+    var code = [_]Inst{
+        asm_.loadConst(0, 0),
+        asm_.jumpJmp(3),
+        asm_.loadConst(0, 1),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "jmp");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "VM jump:if-false branches when test is nil" {
+    // s0 = 99
+    // jump:if-false 3, s0   ; s0 is fixnum (truthy) → don't branch (FAILS the test)
+    // ... this isn't right. Need to load nil into s0 first.
+    var code = [_]Inst{
+        asm_.loadNil(0),
+        asm_.jumpIfFalse(3, Operand.slot(0)), // s0 is nil (falsy) → branch to pc=3
+        asm_.returnNil(), //                    (skipped)
+        asm_.loadTrue(0), //                    (jumped here)
+        asm_.returnSlot(0), //                  return true
+    };
+    const routine = makeRoutine(&code, &.{}, 1, "if-false-nil");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.kind() == .true_);
+}
+
+test "VM jump:if-false branches when test is false" {
+    var code = [_]Inst{
+        asm_.loadFalse(0),
+        asm_.jumpIfFalse(3, Operand.slot(0)),
+        asm_.returnNil(),
+        asm_.loadTrue(0),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &.{}, 1, "if-false-bool");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.kind() == .true_);
+}
+
+test "VM jump:if-false does NOT branch when test is true" {
+    var code = [_]Inst{
+        asm_.loadTrue(0),
+        asm_.jumpIfFalse(3, Operand.slot(0)),
+        asm_.returnSlot(0), //                  fall through; return true
+        asm_.loadNil(0), //                     (not reached)
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &.{}, 1, "if-false-truthy");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.kind() == .true_);
+}
+
+test "VM jump:if-false does NOT branch when test is fixnum 0 (truthy)" {
+    // PLAN §6.2 surprise: 0 is TRUTHY in nexis.
+    const consts = [_]Value{value_mod.fromFixnum(0).?};
+    var code = [_]Inst{
+        asm_.loadConst(0, 0), //                s0 = 0
+        asm_.jumpIfFalse(3, Operand.slot(0)), // 0 is truthy → don't branch
+        asm_.returnSlot(0), //                  fall through; return 0
+        asm_.loadNil(0),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "if-false-zero");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 0), result.asFixnum());
+}
+
+test "VM jump:if-true branches when test is true" {
+    var code = [_]Inst{
+        asm_.loadTrue(0),
+        asm_.jumpIfTrue(3, Operand.slot(0)),
+        asm_.returnNil(), //                    (skipped)
+        asm_.loadFalse(0), //                   (jumped here)
+        asm_.returnSlot(0), //                  return false
+    };
+    const routine = makeRoutine(&code, &.{}, 1, "if-true-true");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.kind() == .false_);
+}
+
+test "VM jump:if-true does NOT branch when test is nil" {
+    var code = [_]Inst{
+        asm_.loadNil(0),
+        asm_.jumpIfTrue(3, Operand.slot(0)),
+        asm_.returnSlot(0), //                  fall through; return nil
+        asm_.loadTrue(0),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &.{}, 1, "if-true-nil");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.kind() == .nil);
+}
+
+test "VM jump: target out of routine code range surfaces OperandOutOfRange" {
+    // Routine has 2 instructions (indices 0-1); jumping to 5 is invalid.
+    var code = [_]Inst{
+        asm_.jumpJmp(5),
+        asm_.returnNil(),
+    };
+    const routine = makeRoutine(&code, &.{}, 1, "bad-jump");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.OperandOutOfRange, res);
+}
+
+test "VM jump: patchJumpTarget rewrites operand A in place" {
+    // Verify the asm_ helper used by the compiler back-patches
+    // correctly: emit a placeholder jump, then patch it.
+    var inst = asm_.jumpJmp(0); // placeholder target
+    asm_.patchJumpTarget(&inst, 7);
+    try testing.expectEqual(OpKind.jump, inst.a.kind);
+    try testing.expectEqual(@as(u12, 7), inst.a.index);
+}
+
+test "VM jump: target with wrong operand kind surfaces InvalidOperandKind" {
+    // Hand-build jump:jmp with target encoded as slot(0) instead
+    // of jump(0). Without the kind check this would loop forever
+    // (peer-AI turn 37: this is the bug that almost shipped in
+    // step #3). With the kind check it surfaces a clean error.
+    const bad_jump: Inst = .{
+        .kind = .primary,
+        .group = @intFromEnum(Group.jump),
+        .variant = @intFromEnum(Jump.jmp),
+        .a = Operand.slot(0), // wrong kind for jump target
+        .b = Operand.none,
+        .c = Operand.none,
+    };
+    var code = [_]Inst{ bad_jump, asm_.returnNil() };
+    const routine = makeRoutine(&code, &.{}, 1, "bad-jump-kind");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    // Bounded execution as a defense-in-depth measure: even if the
+    // kind check were removed, this can't hang the suite.
+    const res = vm.runWithFuel(100);
+    try testing.expectError(VmError.InvalidOperandKind, res);
+}
+
+test "VM jump: target == code.len traps OperandOutOfRange" {
+    // Code has 2 instructions (indices 0-1); jumping to index 2
+    // would surface BytecodeExhausted on the next dispatch.
+    // applyJump catches this eagerly as OperandOutOfRange so
+    // the error kind matches the cause.
+    var code = [_]Inst{
+        asm_.jumpJmp(2), // target == code.len → invalid
+        asm_.returnNil(),
+    };
+    const routine = makeRoutine(&code, &.{}, 1, "jump-at-end");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.runWithFuel(100);
+    try testing.expectError(VmError.OperandOutOfRange, res);
+}
+
+test "VM jump:if-false: constant operand as test resolves correctly" {
+    // Conditional test operand can be any kind resolve() handles.
+    // Constant pool entry → branch / fall through per its truthiness.
+    const consts = [_]Value{value_mod.fromBool(false)};
+    var code = [_]Inst{
+        asm_.jumpIfFalse(3, Operand.constant(0)), // c0=false → branch
+        asm_.returnNil(), // (skipped)
+        asm_.returnNil(), // (skipped)
+        asm_.loadTrue(0),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "if-false-const");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.kind() == .true_);
+}
+
+test "VM jump:if-true: non-taken branch falls through with pc pre-increment" {
+    // Pins the dispatch invariant: pc is incremented BEFORE
+    // handler execution, so non-taken conditionals "fall through"
+    // by leaving frame.pc alone. If pc were post-incremented,
+    // this test would loop on the jump instruction.
+    var code = [_]Inst{
+        asm_.loadFalse(0),
+        asm_.jumpIfTrue(0, Operand.slot(0)), // false → don't branch; pc=2 next
+        asm_.returnSlot(0), // halt with false
+    };
+    const routine = makeRoutine(&code, &.{}, 1, "fallthrough");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.kind() == .false_);
 }
 
 test "VM math:add: writing to a constant operand surfaces InvalidOperandKind" {
