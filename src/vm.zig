@@ -193,6 +193,22 @@ pub const Jump = enum(u6) {
     _,
 };
 
+/// Variants for the `cmp` group. Per VM.md §10 group #1 (peer-AI
+/// turn 47 — comparisons live in their own group, NOT in `math`,
+/// to keep arithmetic ISA clean). Step 5d0 wires `lt` only —
+/// the minimum needed to write a terminating loop test for
+/// `recur` / `loop*`. The remaining variants are listed here so
+/// dispatch can distinguish "known but not wired" from
+/// "unrecognized bit pattern" per the turn-31 split.
+pub const Cmp = enum(u6) {
+    lt = 0,
+    lte = 1,
+    gt = 2,
+    gte = 3,
+    eq_num = 4,
+    _,
+};
+
 /// Variants for the `math` group. Per PLAN §12.3 / VM.md §10.
 /// Step #2 (COMPILER.md §10 #2) wires `add` only — the absolute
 /// minimum needed to lower `(+ 1 2)` end-to-end. The remaining
@@ -530,6 +546,16 @@ pub const VM = struct {
     /// halt.
     result: Value = value_mod.nilValue(),
     halted: bool = false,
+    /// High-water marks for the backing stack and frame stack
+    /// (peer-AI turn 47). Used by `recur`/`loop*` tests to assert
+    /// that long-running iteration runs in bounded stack space
+    /// (PLAN §11.3 constant-stack guarantee). Updated on grow
+    /// operations only — comparing pre/post run-loop values gives
+    /// a true maximum, not just the final size (a buggy
+    /// implementation could grow and shrink, leaving final size
+    /// equal but high-water inflated).
+    stack_high_water: usize = 0,
+    frame_high_water: usize = 0,
 
     /// Build a VM around `routine`, allocating a single top-level
     /// frame with `routine.slot_count` slots zero-initialized to nil.
@@ -554,6 +580,8 @@ pub const VM = struct {
             .stack = stack,
             .frames = frames,
             .runtime_arena = std.heap.ArenaAllocator.init(allocator),
+            .stack_high_water = stack.items.len,
+            .frame_high_water = frames.items.len,
         };
     }
 
@@ -816,10 +844,11 @@ pub const VM = struct {
             .mov => try self.execMov(inst),
             .call => try self.execCall(inst),
             .math => try self.execMath(inst),
+            .cmp => try self.execCmp(inst),
             .jump => try self.execJump(inst),
             .closure => try self.execClosure(inst),
             // Known but not yet implemented in this commit.
-            .cmp, .var_, .coll, .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
+            .var_, .coll, .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
             // Unrecognized group byte — bytecode corruption.
             _ => return VmError.BytecodeCorruption,
         }
@@ -958,6 +987,9 @@ pub const VM = struct {
         if (callee_end > self.stack.items.len) {
             const grow_by: usize = callee_end - self.stack.items.len;
             try self.stack.appendNTimes(self.allocator, value_mod.nilValue(), grow_by);
+            if (self.stack.items.len > self.stack_high_water) {
+                self.stack_high_water = self.stack.items.len;
+            }
         }
         // Reset locals after args to nil.
         const locals_start: usize = @as(usize, callee_base) + argc;
@@ -984,6 +1016,9 @@ pub const VM = struct {
             .return_pc = caller_pc_after_call,
             .upvalues = closure.upvalues,
         });
+        if (self.frames.items.len > self.frame_high_water) {
+            self.frame_high_water = self.frames.items.len;
+        }
     }
 
     /// `call:return A=slot _ _` — read return value from
@@ -1330,6 +1365,29 @@ pub const VM = struct {
             _ => return VmError.BytecodeCorruption,
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Group `cmp` (VM.md §10 #1)
+    // -------------------------------------------------------------------------
+
+    fn execCmp(self: *VM, inst: Inst) VmError!void {
+        const variant: Cmp = @enumFromInt(inst.variant);
+        switch (variant) {
+            .lt => {
+                // cmp:lt a b c   ;  slot[a] = (resolve(b) < resolve(c)) as bool
+                // Step 5d0: fixnum-only. Non-fixnum operands trap
+                // :kind-mismatch (matches math:add discipline).
+                // Result is a `Value` of kind `.bool_`.
+                const lhs = try self.resolve(inst.b);
+                const rhs = try self.resolve(inst.c);
+                const result = try ltFixnums(lhs, rhs);
+                try self.store(inst.a, value_mod.fromBool(result));
+            },
+            // Known but not yet implemented in this commit.
+            .lte, .gt, .gte, .eq_num => return VmError.UnimplementedOpcode,
+            _ => return VmError.BytecodeCorruption,
+        }
+    }
 };
 
 /// Numeric addition for the math:add opcode. Step #2 supports
@@ -1361,6 +1419,16 @@ fn addNumbers(lhs: value_mod.Value, rhs: value_mod.Value) VmError!value_mod.Valu
     // range check below catches the i48-overflow case.
     const sum = a + b;
     return value_mod.fromFixnum(sum) orelse VmError.IntegerOverflow;
+}
+
+/// Fixnum-only less-than comparison for the cmp:lt opcode.
+/// Step 5d0: only fixnum<fixnum is supported; mixed-numeric
+/// (fixnum vs float) and bignum comparisons land later with
+/// the wider numeric tower. Non-fixnum operands raise
+/// `KindMismatch` — same discipline as `addNumbers`.
+fn ltFixnums(lhs: value_mod.Value, rhs: value_mod.Value) VmError!bool {
+    if (!lhs.isFixnum() or !rhs.isFixnum()) return VmError.KindMismatch;
+    return lhs.asFixnum() < rhs.asFixnum();
 }
 
 // =============================================================================
@@ -1475,6 +1543,19 @@ pub const asm_ = struct {
         return Inst.primary(
             .math,
             Math.add,
+            Operand.slot(slot_dst),
+            lhs,
+            rhs,
+        );
+    }
+
+    /// cmp:lt dst lhs rhs   ; slot[dst] := bool(resolve(lhs) < resolve(rhs))
+    /// Fixnum-only in step 5d0; non-fixnum operands trap
+    /// :kind-mismatch.
+    pub fn cmpLt(slot_dst: u12, lhs: Operand, rhs: Operand) Inst {
+        return Inst.primary(
+            .cmp,
+            Cmp.lt,
             Operand.slot(slot_dst),
             lhs,
             rhs,
@@ -2065,6 +2146,118 @@ test "VM math:add: mixed slot+constant operand kinds" {
     defer vm.deinit();
     const result = try vm.run();
     try testing.expectEqual(@as(i64, 300), result.asFixnum());
+}
+
+// ---- step 5d0: cmp:lt tests ----
+
+test "VM cmp:lt: true case (1 < 2)" {
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(1).?),
+        cval(value_mod.fromFixnum(2).?),
+    };
+    var code = [_]Inst{
+        asm_.cmpLt(0, Operand.constant(0), Operand.constant(1)),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "lt-true");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.isBool());
+    try testing.expectEqual(true, result.asBool());
+}
+
+test "VM cmp:lt: false case (2 < 1)" {
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(2).?),
+        cval(value_mod.fromFixnum(1).?),
+    };
+    var code = [_]Inst{
+        asm_.cmpLt(0, Operand.constant(0), Operand.constant(1)),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "lt-false");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.isBool());
+    try testing.expectEqual(false, result.asBool());
+}
+
+test "VM cmp:lt: equal case (2 < 2) — strict less-than yields false" {
+    const consts = [_]Const{cval(value_mod.fromFixnum(2).?)};
+    var code = [_]Inst{
+        asm_.cmpLt(0, Operand.constant(0), Operand.constant(0)),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "lt-eq");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(false, result.asBool());
+}
+
+test "VM cmp:lt: negative + positive (-5 < 3)" {
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(-5).?),
+        cval(value_mod.fromFixnum(3).?),
+    };
+    var code = [_]Inst{
+        asm_.cmpLt(0, Operand.constant(0), Operand.constant(1)),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "lt-neg");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(true, result.asBool());
+}
+
+test "VM cmp:lt: non-fixnum operand traps :kind-mismatch" {
+    // True (bool, kind=.bool_) is not a fixnum.
+    var code = [_]Inst{
+        asm_.loadTrue(0),
+        asm_.loadConst(1, 0),
+        asm_.cmpLt(2, Operand.slot(0), Operand.slot(1)),
+        asm_.returnSlot(2),
+    };
+    const consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
+    const routine = makeRoutine(&code, &consts, 3, "lt-kind");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.KindMismatch, res);
+}
+
+test "VM cmp:lt: writing to a constant operand surfaces InvalidOperandKind" {
+    const consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
+    var code = [_]Inst{
+        Inst.primary(
+            .cmp,
+            Cmp.lt,
+            Operand.constant(0), // dst can't be a constant
+            Operand.constant(0),
+            Operand.constant(0),
+        ),
+        asm_.returnNil(),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "lt-bad-dst");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.InvalidOperandKind, res);
+}
+
+test "VM cmp:lt: unimplemented variant (lte) returns UnimplementedOpcode" {
+    var code = [_]Inst{
+        Inst.primary(.cmp, Cmp.lte, Operand.slot(0), Operand.slot(0), Operand.slot(0)),
+        asm_.returnNil(),
+    };
+    const routine = makeRoutine(&code, &.{}, 1, "lt-lte");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.UnimplementedOpcode, res);
 }
 
 test "VM jump:jmp skips past an instruction" {

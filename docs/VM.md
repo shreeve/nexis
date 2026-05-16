@@ -1165,6 +1165,33 @@ Per peer-AI turn 28:
 - **2026-04-19** (spec commit): Initial draft. All contracts
   `proposed`. No implementation yet. Peer-AI turn 28 decisions
   embedded.
+- **2026-05-16** (§10 + §11 implementation, peer-AI turns
+  47 + 48): Step 5d lands the runtime-side tail-position
+  machinery and the first `cmp` opcode.
+  - `cmp` group wired in dispatch. `cmp:lt A=dst B=lhs
+    C=rhs` handler implemented (fixnum-only; `lte/gt/gte/
+    eq_num` reserved as `UnimplementedOpcode`). Result is
+    a `Value` of kind `.true_`/`.false_`. Non-fixnum
+    operands trap `:kind-mismatch` (matches `math:add`
+    discipline). Comparisons live in their own group per
+    spec §10 — NOT in `math` (peer-AI turn 47).
+  - `recur` lowering verified end-to-end: the compiler
+    emits `mov:move` + (optional) `closure:box-local` +
+    `jump:jmp` only; no call opcode, no new frame, no
+    backing-stack growth. VM does no special work for
+    `recur`. The constant-stack guarantee is now
+    instrumented and tested: 10k-iteration loop with
+    `stack_high_water` and `frame_high_water` unchanged.
+  - `VM.stack_high_water` and `VM.frame_high_water` fields
+    added; updated only on grow operations (peer-AI turn 47
+    §Q5 — comparing pre/post values gives a TRUE maximum,
+    not just final size; a buggy impl that grew and shrank
+    would still trip the assertion).
+  - `call:tailcall` opcode still traps `UnimplementedOpcode`
+    — deferred per turn 47 (its tail-call context model is
+    separate from recur's recur-target threading and would
+    risk wrong-code if conflated).
+
 - **2026-05-16** (§6 implementation): Step 5c lands
   `closure:new-cell` and `closure:init-cell` opcode handlers
   + asm helpers. `closure:new-cell A=slot` allocates an

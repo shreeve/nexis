@@ -94,6 +94,13 @@ pub const Tiny = union(enum) {
         lhs: *const Tiny,
         rhs: *const Tiny,
     },
+    /// `(< lhs rhs)` — fixnum less-than. Step 5d0: needed to write
+    /// terminating loop tests for `recur` / `loop*`. Lowers to
+    /// `cmp:lt` per VM.md §10 group #1.
+    lt: struct {
+        lhs: *const Tiny,
+        rhs: *const Tiny,
+    },
     /// `(if test then else?)`. else_ is optional; absent else
     /// synthesizes nil per PLAN §6.1.
     /// Field name `test_` (with trailing underscore) avoids
@@ -137,6 +144,27 @@ pub const Tiny = union(enum) {
     /// any closure value (no captures yet).
     call: struct {
         callee: *const Tiny,
+        args: []const *const Tiny,
+    },
+    /// `(loop* [name1 v1 name2 v2 ...] body)` per PLAN §6.1 +
+    /// COMPILER.md §5.7. Step 5d1.
+    /// Same as `let*` for binding setup (sequential RHS
+    /// visibility, captured-binding cells); the loop body
+    /// installs a `RecurTarget` so `(recur args...)` inside the
+    /// body rebinds and jumps to the entry label.
+    loop_star: struct {
+        bindings: []const Binding,
+        body: *const Tiny,
+    },
+    /// `(recur arg1 arg2 ...)` per PLAN §6.1 + COMPILER.md §5.6.
+    /// Step 5d1. Re-enters the nearest enclosing `loop*` or
+    /// `fn*` (5d2) with the given arguments. Must be in tail
+    /// position; arity must match the target's binding count.
+    /// Lowers to a parallel-assignment move (via temp slots)
+    /// into the target's binding slots + `jump:jmp` to the
+    /// target's entry label. NO call opcode is emitted (per
+    /// VM.md §11 — recur is not a call).
+    recur: struct {
         args: []const *const Tiny,
     },
     /// `(letfn* [(name1 params1 body1) (name2 params2 body2) ...] body)`
@@ -208,6 +236,38 @@ pub const CapturedName = struct {
     upvalue: u12,
 };
 
+/// Where `(recur args...)` should jump and which slots it
+/// rebinds. Threaded through `compileExpr` in tail position
+/// (peer-AI turn 47).
+///
+/// Lifetime: the struct (and the slices it points to) is owned
+/// by whichever compile* function established the target —
+/// `compileLoopStar` or `compileFn`. Body compilation must
+/// complete before the owning function returns.
+///
+/// Tail-position propagation rules (per COMPILER.md §4.4):
+///   - `if` then/else: propagate the outer target
+///   - `do` last expr, `let*` body, `letfn*` body: propagate
+///   - `fn*` body: RESET to a new fn target (NEVER propagate
+///     across function boundaries — `recur` inside a nested fn
+///     must NOT escape to the outer loop/fn)
+///   - `loop*` body: REPLACE with new loop target
+///   - all other positions: pass `null` (recur invalid here)
+pub const RecurTarget = struct {
+    entry_pc: u12,
+    binding_slots: []const u12,
+    /// Per-binding flag: true iff binding's slot holds a
+    /// `*UpvalCell` (was pre-analyzed as captured by a
+    /// descendant fn). `compileRecur` reads this to decide
+    /// between fresh-cell-install (captured) and plain
+    /// `mov:move` (direct) for each binding (per VM.md §11
+    /// + COMPILER.md §5.6 captured-recur semantics).
+    captured_mask: []const bool,
+    kind: RecurTargetKind,
+};
+
+pub const RecurTargetKind = enum { loop_star, fn_star };
+
 // =============================================================================
 // Errors
 // =============================================================================
@@ -259,6 +319,19 @@ pub const CompileError = error{
     /// create resolution ambiguity. Matches Clojure
     /// (`letfn` rejects duplicate names).
     DuplicateBinding,
+
+    /// `(recur ...)` appears in a position that is not a tail
+    /// position of an enclosing `loop*` or `fn*` body. Per
+    /// PLAN §11.3 + VM.md §11 + COMPILER.md §5.6: `recur` MUST
+    /// be in tail position to preserve the constant-stack
+    /// guarantee. Step 5d1.
+    RecurOutsideTail,
+
+    /// `(recur ...)` has a different argument count than the
+    /// target's binding count. Per VM.md §11 + COMPILER.md
+    /// §5.6. Caught at compile time (no runtime arity
+    /// revalidation — recur is not a call opcode). Step 5d1.
+    RecurArityMismatch,
 
     /// A compiler invariant was violated. Distinct from a
     /// user-error like `UnresolvedSymbol`: this indicates the
@@ -650,8 +723,10 @@ pub fn compileTiny(allocator: std.mem.Allocator, form: *const Tiny) CompileError
     errdefer emitter.deinit();
 
     // Top-level form compiles into slot 0; routine returns slot 0.
+    // Top-level position has NO enclosing loop/fn → recur_target is null.
+    // A top-level `(recur)` correctly raises RecurOutsideTail.
     const dst = try emitter.allocSlot();
-    try compileExpr(&emitter, form, dst);
+    try compileExpr(&emitter, form, dst, null);
     try emitter.emit(vm.asm_.returnSlot(dst));
 
     return try emitter.finish();
@@ -730,6 +805,10 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
             try freeVars(allocator, a.lhs, env, out);
             try freeVars(allocator, a.rhs, env, out);
         },
+        .lt => |a| {
+            try freeVars(allocator, a.lhs, env, out);
+            try freeVars(allocator, a.rhs, env, out);
+        },
         .if_ => |i| {
             try freeVars(allocator, i.test_, env, out);
             try freeVars(allocator, i.then, env, out);
@@ -784,6 +863,24 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
             }
             try freeVars(allocator, l.body, &local_env, out);
         },
+        .loop_star => |l| {
+            // Same as let*: sequential binding visibility (RHS
+            // i sees bindings 1..i-1; body sees all).
+            var local_env: NameSet = .{};
+            defer local_env.deinit(allocator);
+            try local_env.unionWith(allocator, env);
+            for (l.bindings) |b| {
+                try freeVars(allocator, b.value, &local_env, out);
+                try local_env.put(allocator, b.name);
+            }
+            try freeVars(allocator, l.body, &local_env, out);
+        },
+        .recur => |r| {
+            // Recur args may contain nested fn_stars referencing
+            // outer bindings (peer-AI turn 47 §7 catch). Recurse
+            // into each arg with the current env.
+            for (r.args) |a| try freeVars(allocator, a, env, out);
+        },
     }
 }
 
@@ -816,6 +913,10 @@ fn capturedByDescendantFns(
     switch (form.*) {
         .nil, .bool, .int, .symbol => {},
         .add => |a| {
+            try capturedByDescendantFns(allocator, a.lhs, env, out);
+            try capturedByDescendantFns(allocator, a.rhs, env, out);
+        },
+        .lt => |a| {
             try capturedByDescendantFns(allocator, a.lhs, env, out);
             try capturedByDescendantFns(allocator, a.rhs, env, out);
         },
@@ -898,6 +999,26 @@ fn capturedByDescendantFns(
             }
             try capturedByDescendantFns(allocator, l.body, &local_env, out);
         },
+        .loop_star => |l| {
+            // Same as let*: sequential RHS visibility. Each
+            // binding shadows `env` for subsequent positions.
+            // Recurse with progressively shadowed env.
+            var local_env: NameSet = .{};
+            defer local_env.deinit(allocator);
+            try local_env.unionWith(allocator, env);
+            for (l.bindings) |b| {
+                try capturedByDescendantFns(allocator, b.value, &local_env, out);
+                // Shadow: remove from env so later positions
+                // don't see the outer same-named binding.
+                removeFromSet(&local_env, b.name);
+            }
+            try capturedByDescendantFns(allocator, l.body, &local_env, out);
+        },
+        .recur => |r| {
+            // Recur args may contain nested fn_stars (peer-AI
+            // turn 47 §7 catch). Recurse into each.
+            for (r.args) |a| try capturedByDescendantFns(allocator, a, env, out);
+        },
     }
 }
 
@@ -914,20 +1035,32 @@ fn removeFromSet(set: *NameSet, name: []const u8) void {
 }
 
 /// Lower `form` into bytecode that, when executed, leaves the
-/// form's result in `slot[dst]`.
-fn compileExpr(e: *Emitter, form: *const Tiny, dst: u12) CompileError!void {
+/// form's result in `slot[dst]`. `recur_target` carries the
+/// nearest enclosing `loop*` / `fn*` body target, or `null` if
+/// `form` is in a non-tail position relative to any such target
+/// (peer-AI turn 47). Propagation is form-specific; see the
+/// per-arm handlers.
+fn compileExpr(
+    e: *Emitter,
+    form: *const Tiny,
+    dst: u12,
+    recur_target: ?*const RecurTarget,
+) CompileError!void {
     switch (form.*) {
         .nil => try e.emit(vm.asm_.loadNil(dst)),
         .bool => |b| try e.emit(if (b) vm.asm_.loadTrue(dst) else vm.asm_.loadFalse(dst)),
         .int => |n| try compileIntLiteral(e, n, dst),
         .symbol => |name| try compileSymbol(e, name, dst),
         .add => |a| try compileAdd(e, a.lhs, a.rhs, dst),
-        .if_ => |i| try compileIf(e, i.test_, i.then, i.else_, dst),
-        .let_star => |l| try compileLetStar(e, l.bindings, l.body, dst),
-        .do_ => |exprs| try compileDo(e, exprs, dst),
+        .lt => |a| try compileLt(e, a.lhs, a.rhs, dst),
+        .if_ => |i| try compileIf(e, i.test_, i.then, i.else_, dst, recur_target),
+        .let_star => |l| try compileLetStar(e, l.bindings, l.body, dst, recur_target),
+        .do_ => |exprs| try compileDo(e, exprs, dst, recur_target),
         .fn_star => |f| try compileFn(e, f.name, f.params, f.body, dst),
         .call => |c| try compileCall(e, c.callee, c.args, dst),
-        .letfn_star => |l| try compileLetFnStar(e, l.bindings, l.body, dst),
+        .letfn_star => |l| try compileLetFnStar(e, l.bindings, l.body, dst, recur_target),
+        .loop_star => |l| try compileLoopStar(e, l.bindings, l.body, dst),
+        .recur => |r| try compileRecur(e, r.args, recur_target),
     }
 }
 
@@ -955,19 +1088,44 @@ fn compileAdd(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) Compile
         try e.emit(vm.asm_.mathAdd(dst, Operand.constant(c_lhs), Operand.constant(c_rhs)));
         return;
     }
-    // Non-literal operands: stage into temp slots first.
+    // Non-literal operands: stage into temp slots first. Operands
+    // are non-tail (recur invalid inside arithmetic args).
     const t_lhs = try e.allocSlot();
-    try compileExpr(e, lhs, t_lhs);
+    try compileExpr(e, lhs, t_lhs, null);
     const t_rhs = try e.allocSlot();
-    try compileExpr(e, rhs, t_rhs);
+    try compileExpr(e, rhs, t_rhs, null);
     try e.emit(vm.asm_.mathAdd(dst, Operand.slot(t_lhs), Operand.slot(t_rhs)));
 }
 
+/// Lower `(< lhs rhs)` to `cmp:lt`. Same literal-pair peephole
+/// shape as `compileAdd`. Step 5d0 (peer-AI turn 47).
+fn compileLt(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) CompileError!void {
+    if (lhs.* == .int and rhs.* == .int) {
+        const v_lhs = value_mod.fromFixnum(lhs.int) orelse
+            return CompileError.IntegerOutOfFixnumRange;
+        const v_rhs = value_mod.fromFixnum(rhs.int) orelse
+            return CompileError.IntegerOutOfFixnumRange;
+        const c_lhs = try e.addValueConst(v_lhs);
+        const c_rhs = try e.addValueConst(v_rhs);
+        try e.emit(vm.asm_.cmpLt(dst, Operand.constant(c_lhs), Operand.constant(c_rhs)));
+        return;
+    }
+    // Operands are non-tail (recur invalid inside comparison args).
+    const t_lhs = try e.allocSlot();
+    try compileExpr(e, lhs, t_lhs, null);
+    const t_rhs = try e.allocSlot();
+    try compileExpr(e, rhs, t_rhs, null);
+    try e.emit(vm.asm_.cmpLt(dst, Operand.slot(t_lhs), Operand.slot(t_rhs)));
+}
+
 fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
-    // Step 5b (peer-AI turn 40 lazy-boxing): resolution walks
-    // self first, then parents. A parent-scope hit triggers
-    // capture (lazy box-local in parent, push as upvalue in
-    // self). Step #7 (vars) extends this fall-through:
+    // Step 5b/5c (peer-AI turns 44/45 pre-analysis model,
+    // SUPERSEDES the turn-40 lazy-boxing approach): capture-aware
+    // resolution walks self first, then parent emitters. Captured
+    // locals are pre-boxed at binding time (let*/loop*) or
+    // function entry (fn* params) so their BindingRef is stable
+    // across all control-flow paths. Step #7 (vars) will extend
+    // this fall-through:
     //   1. local (this routine) → dispatch on BindingRef
     //   2. captured upvalue (parent chain) → resolve.upvalue + capture
     //   3. namespace var → var:load-var
@@ -999,6 +1157,7 @@ fn compileLetStar(
     bindings: []const Binding,
     body: *const Tiny,
     dst: u12,
+    recur_target: ?*const RecurTarget,
 ) CompileError!void {
     // Strict left-of-self visibility per COMPILER.md §4.3
     // (peer-AI turn 35 + 38): each binding's RHS sees bindings
@@ -1024,7 +1183,8 @@ fn compileLetStar(
 
     for (bindings, 0..) |b, i| {
         const slot = try e.allocSlot();
-        try compileExpr(e, b.value, slot);
+        // RHS is non-tail (recur invalid in let-binding RHS).
+        try compileExpr(e, b.value, slot, null);
 
         // Pre-analyze (peer-AI turn 45 env-aware variant): is
         // this binding captured by any inner fn_star in the
@@ -1054,18 +1214,167 @@ fn compileLetStar(
         }
     }
 
-    try compileExpr(e, body, dst);
+    // Body inherits recur target (let* body is tail position
+    // relative to the enclosing form).
+    try compileExpr(e, body, dst, recur_target);
 }
 
-fn compileDo(e: *Emitter, exprs: []const *const Tiny, dst: u12) CompileError!void {
+/// Lower `(loop* [b1 v1 b2 v2 ...] body)` per COMPILER.md §5.7
+/// + VM.md §11 (peer-AI turn 47).
+///
+/// Same as `let*` for binding setup (sequential RHS visibility +
+/// captured-binding cells via pre-analysis). After the bindings
+/// are set up, mark the entry PC and compile the body with a
+/// loop `RecurTarget` so any `(recur ...)` in tail position
+/// rebinds the loop slots and jumps back to entry.
+///
+/// Entry-PC placement (peer-AI turn 47 §7 catch): AFTER the
+/// binding setup + captured-binding boxing prelude. Jumping
+/// back must NOT re-evaluate initial RHSs and must NOT re-box
+/// the binding slots — the recur path handles cell installation
+/// directly.
+fn compileLoopStar(
+    e: *Emitter,
+    bindings: []const Binding,
+    body: *const Tiny,
+    dst: u12,
+) CompileError!void {
+    const mark = e.scope.items.len;
+    defer e.scope.shrinkRetainingCapacity(mark);
+
+    // Step 1-3: bind values, box captured bindings, push scope
+    // entries (mirrors compileLetStar logic exactly).
+    const binding_slots = try e.allocator.alloc(u12, bindings.len);
+    defer e.allocator.free(binding_slots);
+    const captured_mask = try e.allocator.alloc(bool, bindings.len);
+    defer e.allocator.free(captured_mask);
+
+    for (bindings, 0..) |b, i| {
+        const slot = try e.allocSlot();
+        binding_slots[i] = slot;
+        try compileExpr(e, b.value, slot, null);
+
+        // Pre-analyze (same as let*): is this binding captured
+        // by any descendant fn in later bindings or body? `env`
+        // is the single binding name; analyzer's shadowing
+        // handling avoids spurious matches on inner same-named
+        // shadows.
+        var env: NameSet = .{};
+        defer env.deinit(e.allocator);
+        try env.put(e.allocator, b.name);
+        var captured: NameSet = .{};
+        defer captured.deinit(e.allocator);
+        for (bindings[i + 1 ..]) |later| {
+            try capturedByDescendantFns(e.allocator, later.value, &env, &captured);
+        }
+        try capturedByDescendantFns(e.allocator, body, &env, &captured);
+
+        const is_captured = captured.contains(b.name);
+        captured_mask[i] = is_captured;
+
+        if (is_captured) {
+            try e.emit(vm.asm_.closureBoxLocal(slot));
+            try e.scope.append(e.allocator, .{
+                .name = b.name,
+                .ref = .{ .cell_slot = slot },
+            });
+        } else {
+            try e.pushBinding(b.name, slot);
+        }
+    }
+
+    // Step 4: mark entry PC (AFTER box-local prelude).
+    const entry_pc = try e.checkJumpTarget(e.currentPc());
+    const loop_target = RecurTarget{
+        .entry_pc = entry_pc,
+        .binding_slots = binding_slots,
+        .captured_mask = captured_mask,
+        .kind = .loop_star,
+    };
+
+    // Step 5: compile body with the loop target installed. The
+    // body REPLACES (not propagates) any outer recur target —
+    // a recur inside the body always targets THIS loop, not an
+    // enclosing one (peer-AI turn 47 §Q1 / nested-loop rule).
+    try compileExpr(e, body, dst, &loop_target);
+}
+
+/// Lower `(recur args...)` per COMPILER.md §5.6 + VM.md §11
+/// (peer-AI turn 47).
+///
+/// `recur_target` is the nearest enclosing `loop*` or `fn*`'s
+/// target, threaded from compileExpr. If `null`, the `recur`
+/// is in non-tail position and we raise `RecurOutsideTail`.
+/// Arity is checked against `target.binding_slots.len` before
+/// any code is emitted.
+///
+/// Lowering (parallel-assignment via fresh temps, then move +
+/// optional fresh-cell install per captured_mask):
+///   compile each arg into a fresh temp slot (non-tail)
+///   for each binding i in order:
+///     if captured_mask[i]:
+///       closure:box-local temp[i]              ; temp[i] := fresh cell
+///       mov:move binding_slot[i], temp[i]       ; install fresh cell
+///     else:
+///       mov:move binding_slot[i], temp[i]
+///   jump:jmp entry_pc
+///
+/// `dst` is never written: `recur` jumps unconditionally before
+/// reaching any code that would consume dst. Surrounding control
+/// flow (e.g., `if`'s end-jmp) may emit unreachable code after
+/// the recur — harmless, per peer-AI turn 47 §7 dead-code note.
+fn compileRecur(
+    e: *Emitter,
+    args: []const *const Tiny,
+    recur_target: ?*const RecurTarget,
+) CompileError!void {
+    const target = recur_target orelse return CompileError.RecurOutsideTail;
+    if (args.len != target.binding_slots.len) return CompileError.RecurArityMismatch;
+
+    // Evaluate each arg into a fresh temp slot. Using temps
+    // (not the target slots directly) makes parallel-assignment
+    // correct for aliasing cases like `(loop* [a 1 b 2] (recur b a))`.
+    const temps = try e.allocator.alloc(u12, args.len);
+    defer e.allocator.free(temps);
+    for (args, 0..) |arg, i| {
+        temps[i] = try e.allocSlot();
+        // Recur args are non-tail (any nested recur would target
+        // the wrong scope; PLAN §11.3).
+        try compileExpr(e, arg, temps[i], null);
+    }
+
+    // Install into target slots. For captured bindings, allocate
+    // a fresh cell per iteration (per VM.md §11 — mutating the
+    // shared cell would break immutable lexical binding
+    // semantics; canonical hazard documented in COMPILER.md
+    // §5.6 captured-recur).
+    for (target.binding_slots, 0..) |target_slot, i| {
+        if (target.captured_mask[i]) {
+            try e.emit(vm.asm_.closureBoxLocal(temps[i]));
+            try e.emit(vm.asm_.move(target_slot, temps[i]));
+        } else {
+            try e.emit(vm.asm_.move(target_slot, temps[i]));
+        }
+    }
+
+    try e.emit(vm.asm_.jumpJmp(target.entry_pc));
+}
+
+fn compileDo(
+    e: *Emitter,
+    exprs: []const *const Tiny,
+    dst: u12,
+    recur_target: ?*const RecurTarget,
+) CompileError!void {
     // Empty do is nil.
     if (exprs.len == 0) {
         try e.emit(vm.asm_.loadNil(dst));
         return;
     }
-    // Single-expression do compiles directly into dst.
+    // Single-expression do compiles directly into dst, inheriting
+    // tail position from the enclosing form.
     if (exprs.len == 1) {
-        try compileExpr(e, exprs[0], dst);
+        try compileExpr(e, exprs[0], dst, recur_target);
         return;
     }
     // Multi-expression: ALL non-last go to a SHARED discard
@@ -1074,11 +1383,13 @@ fn compileDo(e: *Emitter, exprs: []const *const Tiny, dst: u12) CompileError!voi
     // allocation). Reusing one discard slot for all ignored
     // results is the natural meaning of "compile this for its
     // effect only" — not asymmetric liveness analysis.
+    // Non-last expressions are NOT in tail position.
     const discard = try e.allocSlot();
     for (exprs[0 .. exprs.len - 1]) |expr| {
-        try compileExpr(e, expr, discard);
+        try compileExpr(e, expr, discard, null);
     }
-    try compileExpr(e, exprs[exprs.len - 1], dst);
+    // Last expression IS tail position; inherit recur target.
+    try compileExpr(e, exprs[exprs.len - 1], dst, recur_target);
 }
 
 /// Lower a `fn*` literal: spawn a child Emitter, compile body
@@ -1199,11 +1510,37 @@ fn compileFn(
         }
     }
 
+    // Step 5d2: set up fn RecurTarget so `(recur ...)` inside
+    // the body (with no enclosing `loop*`) rebinds the params
+    // and jumps back to the entry point. Captured params get
+    // fresh cells per iteration (per VM.md §11 + COMPILER.md
+    // §5.6); non-captured get plain mov:move.
+    //
+    // entry_pc placement: AFTER the box-local prelude. Jumping
+    // back must NOT re-box params (would lose the previous
+    // iteration's mutated cell pointer); it must land where the
+    // body begins reading.
+    const param_slots = try parent.allocator.alloc(u12, params.len);
+    defer parent.allocator.free(param_slots);
+    const captured_mask = try parent.allocator.alloc(bool, params.len);
+    defer parent.allocator.free(captured_mask);
+    for (params, 0..) |p, i| {
+        param_slots[i] = @intCast(i); // params live at slots 0..arity-1
+        captured_mask[i] = captured_in_body.contains(p);
+    }
+    const fn_entry_pc = try child.checkJumpTarget(child.currentPc());
+    const fn_target = RecurTarget{
+        .entry_pc = fn_entry_pc,
+        .binding_slots = param_slots,
+        .captured_mask = captured_mask,
+        .kind = .fn_star,
+    };
+
     // Allocate a fresh result slot for the body so a self-move
     // pattern (compiling a symbol whose binding lives in the
     // result slot) is naturally a no-op (compileSymbol guard).
     const result_slot = try child.allocSlot();
-    try compileExpr(&child, body, result_slot);
+    try compileExpr(&child, body, result_slot, &fn_target);
     try child.emit(vm.asm_.returnSlot(result_slot));
 
     // Step 5b: capture descriptor sources come from
@@ -1276,6 +1613,7 @@ fn compileLetFnStar(
     bindings: []const FnBinding,
     body: *const Tiny,
     dst: u12,
+    recur_target: ?*const RecurTarget,
 ) CompileError!void {
     // Reject duplicate binding names. Unlike let* (sequential
     // shadowing OK), letfn* names are mutually visible — two
@@ -1329,8 +1667,10 @@ fn compileLetFnStar(
         try e.emit(vm.asm_.closureInitCell(cell_slots[i], vm.Operand.slot(closure_slots[i])));
     }
 
-    // Step 4: compile body in the now-fully-bound scope.
-    try compileExpr(e, body, dst);
+    // Step 4: compile body in the now-fully-bound scope. Body
+    // is in tail position relative to the enclosing form; inherit
+    // recur target.
+    try compileExpr(e, body, dst, recur_target);
 }
 
 /// Lower a function-call form: stage callee + args in a
@@ -1372,11 +1712,12 @@ fn compileCall(
     // Compile callee into call_base. Sub-expression may itself
     // allocate temps; those land above the reserved block, which
     // is correct (they're free-to-use by the time the call fires).
-    try compileExpr(e, callee, call_base);
+    // Callee + args are non-tail (recur invalid inside call sites).
+    try compileExpr(e, callee, call_base, null);
     // Compile each arg into its predetermined slot in the block.
     for (args, 0..) |arg, i| {
         const arg_slot: u12 = @intCast(@as(u32, call_base) + 1 + @as(u32, @intCast(i)));
-        try compileExpr(e, arg, arg_slot);
+        try compileExpr(e, arg, arg_slot, null);
     }
 
     // Emit the call.
@@ -1389,21 +1730,25 @@ fn compileIf(
     then_form: *const Tiny,
     else_form: ?*const Tiny,
     dst: u12,
+    recur_target: ?*const RecurTarget,
 ) CompileError!void {
     // Lower the test into a fresh temp slot; we can't reuse `dst`
     // because the test value would be overwritten by either arm.
+    // Test is NON-tail (peer-AI turn 47).
     const t_test = try e.allocSlot();
-    try compileExpr(e, test_form, t_test);
+    try compileExpr(e, test_form, t_test, null);
 
     // Emit `jump:if-false PLACEHOLDER, t_test`. Remember its PC
     // for back-patching once the else-label is known.
     const if_false_pc = try e.emitJumpIfFalsePlaceholder(Operand.slot(t_test));
 
-    // Then-arm: compile into dst.
-    try compileExpr(e, then_form, dst);
+    // Then-arm: compile into dst. Tail position INHERITED.
+    try compileExpr(e, then_form, dst, recur_target);
 
     // Emit `jump:jmp PLACEHOLDER` to skip past the else-arm.
     // Remember its PC for back-patching to end-label.
+    // (If then_form was a recur, this jump is unreachable but
+    // harmless — see peer-AI turn 47 §7 dead-code note.)
     const end_jmp_pc = try e.emitJumpPlaceholder();
 
     // Else-label is at the current PC.
@@ -1411,8 +1756,9 @@ fn compileIf(
     e.patchJumpAt(if_false_pc, else_label);
 
     // Else-arm: compile into dst (or synthesize nil if absent).
+    // Tail position INHERITED.
     if (else_form) |ef| {
-        try compileExpr(e, ef, dst);
+        try compileExpr(e, ef, dst, recur_target);
     } else {
         try e.emit(vm.asm_.loadNil(dst));
     }
@@ -1511,6 +1857,565 @@ test "compile + run: (+ fixnum_max 1) compiles but VM traps overflow" {
     defer v.deinit();
     const res = v.run();
     try testing.expectError(vm.VmError.IntegerOverflow, res);
+}
+
+// ---- step 5d0: cmp:lt tests ----
+
+test "compile 5d0: (< 1 2) = true" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try runTiny(&arena, &.{ .lt = .{ .lhs = &.{ .int = 1 }, .rhs = &.{ .int = 2 } } });
+    try testing.expect(result.isBool());
+    try testing.expectEqual(true, result.asBool());
+}
+
+test "compile 5d0: (< 2 1) = false" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try runTiny(&arena, &.{ .lt = .{ .lhs = &.{ .int = 2 }, .rhs = &.{ .int = 1 } } });
+    try testing.expectEqual(false, result.asBool());
+}
+
+test "compile 5d0: (< 3 3) = false — strict less-than" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try runTiny(&arena, &.{ .lt = .{ .lhs = &.{ .int = 3 }, .rhs = &.{ .int = 3 } } });
+    try testing.expectEqual(false, result.asBool());
+}
+
+test "compile 5d0: (if (< x 5) 'lt' 'ge') threads through if" {
+    // (let* [x 3] (if (< x 5) 1 0)) = 1
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .int = 5 } } };
+    const if_form: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &.{ .int = 1 },
+        .else_ = &.{ .int = 0 },
+    } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 3 } }},
+        .body = &if_form,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "compile 5d0: nested (< (+ a b) c) — operands are sub-expressions" {
+    // (let* [a 1 b 2 c 4] (< (+ a b) c)) = true (3 < 4)
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const add_form: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "a" }, .rhs = &.{ .symbol = "b" } } };
+    const lt_form: Tiny = .{ .lt = .{ .lhs = &add_form, .rhs = &.{ .symbol = "c" } } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{
+            .{ .name = "a", .value = &.{ .int = 1 } },
+            .{ .name = "b", .value = &.{ .int = 2 } },
+            .{ .name = "c", .value = &.{ .int = 4 } },
+        },
+        .body = &lt_form,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(true, result.asBool());
+}
+
+// ---- step 5d1 / 5d2: loop* + recur tests ----
+
+test "compile 5d1: (loop* [i 0] i) — degenerate loop, body returns binding" {
+    // No recur — just a single-iteration "loop".
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 7 } }},
+        .body = &.{ .symbol = "i" },
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 7), result.asFixnum());
+}
+
+test "compile 5d1: (loop* [i 0] (if (< i 1) (recur (+ i 1)) i)) = 1 — one iteration" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const recur_arg: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&recur_arg} } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &.{ .symbol = "i" },
+    } };
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 0 } }},
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "compile 5d1: (loop* [i 0 acc 0] (if (< i 10) (recur (+ i 1) (+ acc i)) acc)) = 45" {
+    // Sum 0..9 via two-binding loop.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const i_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const acc_plus_i: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "acc" }, .rhs = &.{ .symbol = "i" } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{ &i_plus_1, &acc_plus_i } } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 10 } } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &.{ .symbol = "acc" },
+    } };
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{
+            .{ .name = "i", .value = &.{ .int = 0 } },
+            .{ .name = "acc", .value = &.{ .int = 0 } },
+        },
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 45), result.asFixnum());
+}
+
+test "compile 5d1: 10k iteration loop runs in CONSTANT stack space" {
+    // Per peer-AI turn 47 §Q5: assert stack_high_water doesn't
+    // grow with iteration count. Final-length check is
+    // insufficient (buggy impl could grow + shrink to land at
+    // the same final value); we check the high-water mark
+    // explicitly.
+    //
+    // (loop* [i 0] (if (< i 10000) (recur (+ i 1)) i)) = 10000
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const recur_arg: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&recur_arg} } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 10000 } } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &.{ .symbol = "i" },
+    } };
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 0 } }},
+        .body = &body,
+    } };
+    const compiled = try compileTiny(arena.allocator(), &form);
+    const routine = compiled.toRoutine("10k-loop");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const stack_before = v.stack_high_water;
+    const frames_before = v.frame_high_water;
+    const result = try v.run();
+    try testing.expectEqual(@as(i64, 10000), result.asFixnum());
+    // 10k iterations must not have grown either high-water.
+    try testing.expectEqual(stack_before, v.stack_high_water);
+    try testing.expectEqual(frames_before, v.frame_high_water);
+}
+
+test "compile 5d1: (loop* [a 1 b 2] (if false (recur b a) (+ a b))) = 3 — aliasing recur (untaken)" {
+    // Aliasing pattern `(recur b a)` would corrupt without
+    // parallel-assignment temps. Branch untaken, but compiles +
+    // verifies no analyzer/codegen error.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{
+        &.{ .symbol = "b" },
+        &.{ .symbol = "a" },
+    } } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &.{ .bool = false },
+        .then = &recur_form,
+        .else_ = &.{ .add = .{ .lhs = &.{ .symbol = "a" }, .rhs = &.{ .symbol = "b" } } },
+    } };
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{
+            .{ .name = "a", .value = &.{ .int = 1 } },
+            .{ .name = "b", .value = &.{ .int = 2 } },
+        },
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+test "compile 5d1: (loop* [a 1 b 2] (if true (recur b a) (+ a b))) — recur b a swaps then if continued" {
+    // Same as above but recur IS taken once. Use a counter to
+    // limit. Verify parallel-assignment actually swapped:
+    //   (loop* [a 1 b 2 c 0]
+    //     (if (< c 1) (recur b a (+ c 1)) (+ a b)))
+    //  iteration 0: a=1 b=2 c=0 → recur(b=2, a=1, 1) → a=2 b=1 c=1
+    //  iteration 1: a=2 b=1 c=1 → else: a+b = 3
+    // (Verifies the swap actually happens — without temps,
+    // the second assignment would see the just-written a=2.)
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const c_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "c" }, .rhs = &.{ .int = 1 } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{
+        &.{ .symbol = "b" },
+        &.{ .symbol = "a" },
+        &c_plus_1,
+    } } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "c" }, .rhs = &.{ .int = 1 } } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &.{ .add = .{ .lhs = &.{ .symbol = "a" }, .rhs = &.{ .symbol = "b" } } },
+    } };
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{
+            .{ .name = "a", .value = &.{ .int = 1 } },
+            .{ .name = "b", .value = &.{ .int = 2 } },
+            .{ .name = "c", .value = &.{ .int = 0 } },
+        },
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+test "compile 5d1: captured loop binding gets fresh cell per iteration (peer-AI turn 47 canonical test)" {
+    // (loop* [i 0 f (fn* [] 999)]
+    //   (if (< i 1)
+    //     (recur (+ i 1) (fn* [] i))
+    //     (f))) = 0
+    //
+    // Iteration 0: i=0, f=999-fn. Branch taken: build new fn
+    //   capturing i=0, recur with i=1 and new fn.
+    // Iteration 1: i=1, f=(fn [] i_from_iter0). Branch NOT
+    //   taken: return (f).
+    //
+    // If recur mutated a single shared cell for i, (f) would
+    // return 1. With fresh cells per iteration, (f) returns
+    // the value of i AT CAPTURE TIME (= 0).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const i_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const capture_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "i" } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{ &i_plus_1, &capture_fn } } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &f_call,
+    } };
+    const initial_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .int = 999 } } };
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{
+            .{ .name = "i", .value = &.{ .int = 0 } },
+            .{ .name = "f", .value = &initial_fn },
+        },
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 0), result.asFixnum());
+}
+
+test "compile 5d2: fn* recur self-call — (fn* [n] (if (< n 5) (recur (+ n 1)) n)) called with 0 = 5" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const n_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 1 } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&n_plus_1} } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 5 } } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &.{ .symbol = "n" },
+    } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{"n"}, .body = &body } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 0 }} } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5d2: nested fn* RESETS recur target (recur in inner fn targets inner, not outer loop)" {
+    // (loop* [i 0]
+    //   ((fn* [j] (if (< j 1) (recur (+ j 1)) (+ i j)))
+    //    0))
+    //  Inner fn: j=0 → recur(1) → j=1 → else → i+j = 0+1 = 1
+    //  Outer loop never recurs (the inner recur targets the
+    //  fn, not the loop). Result: 1.
+    //
+    // Critical correctness: if recur leaked outward to the
+    // outer loop, this would loop forever (recur'ing i with
+    // (+ j 1), then loop again).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const j_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "j" }, .rhs = &.{ .int = 1 } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&j_plus_1} } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "j" }, .rhs = &.{ .int = 1 } } };
+    const i_plus_j: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .symbol = "j" } } };
+    const inner_body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &i_plus_j,
+    } };
+    const inner_fn: Tiny = .{ .fn_star = .{ .params = &.{"j"}, .body = &inner_body } };
+    const inner_call: Tiny = .{ .call = .{ .callee = &inner_fn, .args = &.{&.{ .int = 0 }} } };
+    const outer: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 0 } }},
+        .body = &inner_call,
+    } };
+    const result = try runTiny(&arena, &outer);
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "compile 5d1: recur outside tail (in let RHS) → RecurOutsideTail" {
+    // (loop* [i 0] (let* [x (recur 1)] x))
+    // recur is in let-binding RHS, which is NON-tail.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&.{ .int = 1 }} } };
+    const inner_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &recur_form }},
+        .body = &.{ .symbol = "x" },
+    } };
+    const loop_form: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 0 } }},
+        .body = &inner_let,
+    } };
+    try testing.expectError(CompileError.RecurOutsideTail, compileTiny(arena.allocator(), &loop_form));
+}
+
+test "compile 5d1: recur outside any loop/fn → RecurOutsideTail" {
+    // Top-level recur with no enclosing target.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form: Tiny = .{ .recur = .{ .args = &.{} } };
+    try testing.expectError(CompileError.RecurOutsideTail, compileTiny(arena.allocator(), &form));
+}
+
+test "compile 5d1: recur arity mismatch → RecurArityMismatch" {
+    // (loop* [i 0] (recur 1 2)) — loop has 1 binding, recur gives 2 args.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{ &.{ .int = 1 }, &.{ .int = 2 } } } };
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 0 } }},
+        .body = &recur_form,
+    } };
+    try testing.expectError(CompileError.RecurArityMismatch, compileTiny(arena.allocator(), &form));
+}
+
+test "compile 5d2: fn* recur arity mismatch → RecurArityMismatch" {
+    // (fn* [a b] (recur 1)) — fn has 2 params, recur gives 1 arg.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&.{ .int = 1 }} } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{ "a", "b" }, .body = &recur_form } };
+    try testing.expectError(CompileError.RecurArityMismatch, compileTiny(arena.allocator(), &fn_form));
+}
+
+test "compile 5d1: recur in (do non-last) is non-tail → RecurOutsideTail" {
+    // (loop* [i 0] (do (recur 1) i))
+    // recur is non-last in do → non-tail.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&.{ .int = 1 }} } };
+    const do_form: Tiny = .{ .do_ = &.{ &recur_form, &.{ .symbol = "i" } } };
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 0 } }},
+        .body = &do_form,
+    } };
+    try testing.expectError(CompileError.RecurOutsideTail, compileTiny(arena.allocator(), &form));
+}
+
+test "compile 5d1: recur in (do last) IS tail position" {
+    // (loop* [i 0] (do (if (< i 1) (recur (+ i 1)) i))) = 1
+    // recur is inside (do (if ...)) — last of do, then-arm of
+    // if, tail of loop body. All tail-inheriting → works.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const i_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&i_plus_1} } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const if_form: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &.{ .symbol = "i" },
+    } };
+    const do_form: Tiny = .{ .do_ = &.{&if_form} };
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 0 } }},
+        .body = &do_form,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "compile 5d1: loop* body can read outer let binding (lexical reference, not a closure capture)" {
+    // (let* [x 100] (loop* [i 0] (if (< i 1) (recur (+ i x)) i))) = 100
+    // Renamed per peer-AI turn 48: no closure involved; just a
+    // same-routine lexical reference to outer x from inside the
+    // loop body. (Actual cross-routine capture goes through fn*.)
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const i_plus_x: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .symbol = "x" } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&i_plus_x} } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &.{ .symbol = "i" },
+    } };
+    const loop_form: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 0 } }},
+        .body = &body,
+    } };
+    const outer: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 100 } }},
+        .body = &loop_form,
+    } };
+    const result = try runTiny(&arena, &outer);
+    try testing.expectEqual(@as(i64, 100), result.asFixnum());
+}
+
+test "compile 5d2: captured fn* param gets fresh cell across recur (peer-AI turn 48 analog)" {
+    // ((fn* [i f]
+    //    (if (< i 1)
+    //      (recur (+ i 1) (fn* [] i))
+    //      (f)))
+    //  0
+    //  (fn* [] 999)) = 0
+    //
+    // Symmetric to the loop* canonical fresh-cell test but for
+    // fn* params. Validates compileFn's
+    //   captured_mask[i] = captured_in_body.contains(p)
+    // and that recur's fresh-cell pattern works against fn-target
+    // bindings as well as loop-target bindings.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const i_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const capture_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "i" } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{ &i_plus_1, &capture_fn } } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &f_call,
+    } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{ "i", "f" }, .body = &body } };
+    const initial_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .int = 999 } } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{ &.{ .int = 0 }, &initial_fn } } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 0), result.asFixnum());
+}
+
+test "compile 5d1: letfn* body inherits enclosing loop's recur target" {
+    // (loop* [i 0]
+    //   (letfn* [(f [] 1)]
+    //     (if (< i 1)
+    //       (recur (+ i 1))
+    //       i))) = 1
+    // The recur sits inside letfn* body's if-then. letfn body
+    // must propagate the outer loop's recur target so recur
+    // can find it (peer-AI turn 47: letfn body inherits target).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const i_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&i_plus_1} } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
+    const inner_if: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &.{ .symbol = "i" },
+    } };
+    const letfn: Tiny = .{ .letfn_star = .{
+        .bindings = &.{.{ .name = "f", .params = &.{}, .body = &.{ .int = 1 } }},
+        .body = &inner_if,
+    } };
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 0 } }},
+        .body = &letfn,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "compile 5d2: recur inside letfn* fn body targets that fn (RESET at fn boundary)" {
+    // (letfn* [(f [n] (if (< n 3) (recur (+ n 1)) n))] (f 0)) = 3
+    // The recur inside f targets f's params (fresh fn RecurTarget
+    // set up by compileFn called from compileLetFnStar), NOT any
+    // outer target. f recurs 3 times then returns n=3.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const n_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 1 } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&n_plus_1} } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 3 } } };
+    const f_body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &.{ .symbol = "n" },
+    } };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{&.{ .int = 0 }} } };
+    const form: Tiny = .{ .letfn_star = .{
+        .bindings = &.{.{ .name = "f", .params = &.{"n"}, .body = &f_body }},
+        .body = &f_call,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+test "compile 5d1: recur in if-test position → RecurOutsideTail" {
+    // (loop* [i 0] (if (recur 1) i i))
+    // recur is in if's TEST, which is non-tail (peer-AI turn 48).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&.{ .int = 1 }} } };
+    const if_form: Tiny = .{ .if_ = .{
+        .test_ = &recur_form,
+        .then = &.{ .symbol = "i" },
+        .else_ = &.{ .symbol = "i" },
+    } };
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 0 } }},
+        .body = &if_form,
+    } };
+    try testing.expectError(CompileError.RecurOutsideTail, compileTiny(arena.allocator(), &form));
+}
+
+test "compile 5d1: recur in call-arg position → RecurOutsideTail" {
+    // (loop* [i 0] ((fn* [x] x) (recur 1)))
+    // recur is a call argument, which is non-tail.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&.{ .int = 1 }} } };
+    const id_fn: Tiny = .{ .fn_star = .{ .params = &.{"x"}, .body = &.{ .symbol = "x" } } };
+    const call_form: Tiny = .{ .call = .{ .callee = &id_fn, .args = &.{&recur_form} } };
+    const form: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 0 } }},
+        .body = &call_form,
+    } };
+    try testing.expectError(CompileError.RecurOutsideTail, compileTiny(arena.allocator(), &form));
+}
+
+test "compile 5d1: nested loop* — inner recur targets inner loop only" {
+    // (loop* [i 0]
+    //   (loop* [j 0]
+    //     (if (< j 1) (recur (+ j 1)) (+ i j))))
+    // Inner recur rebinds j only. Inner loop iterates once,
+    // exits with (+ i j) = 0+1 = 1. Outer loop never recurs.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const j_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "j" }, .rhs = &.{ .int = 1 } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&j_plus_1} } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "j" }, .rhs = &.{ .int = 1 } } };
+    const i_plus_j: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .symbol = "j" } } };
+    const inner_body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &i_plus_j,
+    } };
+    const inner: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "j", .value = &.{ .int = 0 } }},
+        .body = &inner_body,
+    } };
+    const outer: Tiny = .{ .loop_star = .{
+        .bindings = &.{.{ .name = "i", .value = &.{ .int = 0 } }},
+        .body = &inner,
+    } };
+    const result = try runTiny(&arena, &outer);
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
 // ---- if-form tests (peer-AI turn 36 checklist) ----

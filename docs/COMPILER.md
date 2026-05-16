@@ -1064,3 +1064,65 @@ from code contact:
   uninitialized state structurally invisible to user code.
   Malformed hand-written bytecode that violates this still
   surfaces cleanly via `:uninitialized-cell`.
+
+- **2026-05-16** (§5.6 + §5.7 implementation, peer-AI turns
+  47 + 48): Step 5d lands tail-position machinery for `recur`
+  and `loop*`, plus the `cmp:lt` opcode + `Tiny.lt`.
+  Implementation pieces:
+  - `Tiny.loop_star`, `Tiny.recur` variants.
+  - `RecurTarget { entry_pc, binding_slots, captured_mask,
+    kind }` threaded through `compileExpr` (added 4th
+    parameter). Propagation rules (peer-AI turn 47): if
+    then/else inherit, do-last inherit, let* body inherit,
+    letfn* body inherit; loop* body REPLACES (new loop
+    target); fn* body REPLACES (new fn target, never
+    propagates outer); all other positions (if test, do
+    non-last, let* RHS, callee, call args, recur args, lt
+    operands, add operands) pass null.
+  - `compileLoopStar` mirrors `compileLetStar` for binding
+    setup + captured-binding pre-analysis, then marks
+    `entry_pc = currentPc()` AFTER the box-local prelude.
+  - `compileRecur` validates target presence (else
+    `RecurOutsideTail`) and arity match (else
+    `RecurArityMismatch`), evaluates args into fresh temp
+    slots (parallel-assignment safety for aliasing patterns
+    like `(recur b a)`), then installs into target slots:
+    for captured bindings emits
+    `closure:box-local temp` + `mov:move target, temp`
+    (fresh cell per iteration, per VM.md §11 + §5.6
+    captured-recur invariant); for non-captured emits
+    plain `mov:move`. Final `jump:jmp entry_pc`. No call
+    opcode emitted.
+  - `compileFn` sets up a fn `RecurTarget` after the
+    captured-param boxing prelude so `(recur ...)` inside
+    a fn body without an enclosing `loop*` rebinds the
+    params + jumps back to the function entry (constant-
+    stack self-recursion). `param_slots[i] = i`,
+    `captured_mask[i] = captured_in_body.contains(p)`.
+  - Analyzer arms added for `loop_star` (let*-style
+    sequential visibility) and `recur` (recurse into args
+    so nested fn captures are detected).
+  - VM `stack_high_water` + `frame_high_water` counters
+    instrumented on grow ops only (peer-AI turn 47 §Q5 —
+    final-length check is insufficient).
+  - `cmp:lt` opcode + `Tiny.lt` (5d0): comparisons live in
+    their own group, NOT in `math` (peer-AI turn 47:
+    keeping arithmetic ISA clean). Needed to write any
+    terminating loop test.
+  Tests: 607 → 636 (+29). Coverage includes 10k-iteration
+  constant-stack assertion (high-water unchanged), aliasing
+  recur swap, **canonical captured-loop-binding fresh-cell
+  test** (`(loop* [i 0 f (fn* [] 999)] (if (< i 1) (recur
+  (+ i 1) (fn* [] i)) (f))) => 0` proves fresh cells per
+  iteration), captured fn-param fresh-cell test, `letfn*`
+  body inheriting loop target, recur inside letfn fn body
+  targeting that fn, nested-fn-RESETS-target, nested-loop-
+  only-targets-inner-loop, dead-branch recur, and all the
+  non-tail error cases (top-level, let RHS, do non-last,
+  if test, call arg, arity mismatches).
+
+  **`call:tailcall` deliberately deferred** (peer-AI turn 47):
+  its context propagation differs from recur's — emitting
+  `call:tailcall` in a position that is loop-body-tail but
+  not function-tail would generate wrong code. Will land
+  with its own context infrastructure in a later step.
