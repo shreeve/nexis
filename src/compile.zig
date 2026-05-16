@@ -1,6 +1,6 @@
-//! compile.zig — Phase 2 tiny compiler (steps #2 + #3).
+//! compile.zig — Phase 2 tiny compiler (steps #2 + #3 + #4).
 //!
-//! Authoritative spec: `docs/COMPILER.md` §10 #2-#3.
+//! Authoritative spec: `docs/COMPILER.md` §10 #2-#4.
 //!
 //! **Currently implemented**:
 //!
@@ -15,6 +15,21 @@
 //!                                  with simple PC back-patching per
 //!                                  peer-AI turn 36; absent else branch
 //!                                  synthesizes nil
+//!   - **`<symbol>`**             →  resolves to a lexical local in the
+//!                                  Emitter's scope stack; emits
+//!                                  `mov:move dst, slot[N]` (no-op when
+//!                                  source slot already equals dst)
+//!   - **`(let* [n1 v1, ...] body)`** → strict left-of-self-visibility
+//!                                  per COMPILER.md §4.3 (binding-i's
+//!                                  RHS sees bindings 1..i-1 only);
+//!                                  `defer scope.shrinkRetainingCapacity(mark)`
+//!                                  pops bindings on let-body exit
+//!   - **`(do e1 e2 ... eN)`**    →  empty → nil; one-expr → compile
+//!                                  to dst; multi-expr → all non-last
+//!                                  to a SHARED discard slot (peer-AI
+//!                                  turn 38: avoids 999-slot blowup
+//!                                  for `(do e1 ... e1000)`), last
+//!                                  to dst
 //!
 //! **Architecture**: destination-driven internal lowering per peer-AI
 //! turn 36. The public entry point `compileTiny()` returns a
@@ -66,6 +81,14 @@ pub const Tiny = union(enum) {
     /// `IntegerOutOfFixnumRange` (bignum literal lifting lands
     /// with bignum Scope B).
     int: i64,
+    /// Reference to a lexically-bound local (step #4). Resolution
+    /// walks the Emitter's scope stack innermost-first; unresolved
+    /// names raise `CompileError.UnresolvedSymbol`. When step #5
+    /// adds closures + step #7 adds vars, this lookup falls
+    /// through to capture analysis / Var resolution per
+    /// COMPILER.md §4.3 priority list. For step #4, locals are
+    /// the only resolution category that exists.
+    symbol: []const u8,
     /// `(+ lhs rhs)`. Sub-expressions are recursive.
     add: struct {
         lhs: *const Tiny,
@@ -80,6 +103,35 @@ pub const Tiny = union(enum) {
         then: *const Tiny,
         else_: ?*const Tiny,
     },
+    /// `(let* [n1 v1, n2 v2, ...] body)` per PLAN §6.1.
+    /// Strict left-of-self visibility per COMPILER.md §4.3:
+    /// each binding's RHS sees previous bindings only, NOT
+    /// itself. Body sees all bindings. Bindings exit scope at
+    /// the end of `body`.
+    let_star: struct {
+        bindings: []const Binding,
+        body: *const Tiny,
+    },
+    /// `(do e1 e2 ... eN)` per PLAN §6.1.
+    /// Sequential evaluation; yields the value of `eN`. Empty
+    /// `(do)` yields nil. Each let_star / fn_star / loop_star
+    /// body that needs multiple expressions wraps them in `do_`.
+    do_: []const *const Tiny,
+};
+
+/// One binding in a `let*` form.
+pub const Binding = struct {
+    name: []const u8,
+    value: *const Tiny,
+};
+
+/// One entry in the Emitter's lexical scope stack. `slot` is the
+/// frame slot the binding's value lives in. (Step #5 will widen
+/// this to a `BindingRef` union once captured upvalues exist; for
+/// step #4, all bindings are direct value slots.)
+pub const LocalBinding = struct {
+    name: []const u8,
+    slot: u12,
 };
 
 // =============================================================================
@@ -112,6 +164,14 @@ pub const CompileError = error{
     /// Routine has more slots than the 12-bit slot operand can
     /// address (4096).
     SlotOverflow,
+
+    /// Symbol reference doesn't resolve to a lexical local in
+    /// the current scope. Step #4: the only resolution category
+    /// is locals; once vars (step #7) and captured upvalues
+    /// (step #5) land, this error indicates the symbol resolves
+    /// to NONE of (local, upvalue, var, special-form, core-mapping)
+    /// — per COMPILER.md §4.3 rule #8.
+    UnresolvedSymbol,
 
     OutOfMemory,
 };
@@ -146,9 +206,10 @@ pub const Compiled = struct {
 // Emitter — internal mutable accumulator (peer-AI turn 36)
 // =============================================================================
 
-/// `Emitter` accumulates a routine's bytecode, constants, and slot
-/// count as a tree of `compileExpr` calls runs. It's allocator-
-/// owned and turned into a `Compiled` at the end via `finish()`.
+/// `Emitter` accumulates a routine's bytecode, constants, slot
+/// count, and active lexical scope as a tree of `compileExpr`
+/// calls runs. It's allocator-owned and turned into a `Compiled`
+/// at the end via `finish()`.
 ///
 /// **Slot allocation**: monotonic — each `allocSlot()` call returns
 /// `slot_count` and bumps it. No reuse across branches (step #6
@@ -158,10 +219,28 @@ pub const Compiled = struct {
 /// **Constant pool**: simple append. Future dedup is an obvious
 /// optimization but doesn't affect correctness; deferred per
 /// COMPILER.md §4.5 deduplication note.
+///
+/// **Lexical scope** (step #4, per peer-AI turn 38): a stack of
+/// `LocalBinding{name, slot}` pairs. Resolution walks innermost-
+/// first (newest entries shadow older). Bindings push at let*
+/// binding-time (after the RHS is compiled, per COMPILER.md §4.3's
+/// strict left-of-self rule) and pop at let-body exit via
+/// `defer scope.shrinkRetainingCapacity(mark)` — `defer` rather
+/// than success-path restore so an error mid-body doesn't leak
+/// scope into a recovering caller.
+///
+/// **Future evolution** (peer-AI turn 38 caveat): `LocalBinding`
+/// is going to grow into a `BindingRef` union once step #5
+/// closures and step #7 vars land — `local_value_slot |
+/// local_cell_slot | upvalue | var_ref`. The flat name→slot
+/// resolution we use today is correct only across the single
+/// current routine; nested function compilation (step #5) needs
+/// capture analysis at function boundaries.
 const Emitter = struct {
     allocator: std.mem.Allocator,
     code: std.ArrayList(Inst) = .empty,
     consts: std.ArrayList(Value) = .empty,
+    scope: std.ArrayList(LocalBinding) = .empty,
     slot_count: u16 = 0,
 
     fn init(allocator: std.mem.Allocator) Emitter {
@@ -171,6 +250,37 @@ const Emitter = struct {
     fn deinit(self: *Emitter) void {
         self.code.deinit(self.allocator);
         self.consts.deinit(self.allocator);
+        self.scope.deinit(self.allocator);
+    }
+
+    /// Push a binding onto the lexical scope. Does NOT allocate
+    /// a slot — the caller already has one (typically the slot
+    /// the binding's RHS was just compiled into).
+    fn pushBinding(self: *Emitter, name: []const u8, slot: u12) CompileError!void {
+        try self.scope.append(self.allocator, .{ .name = name, .slot = slot });
+    }
+
+    /// Resolve `name` to its slot via innermost-shadow lookup.
+    /// Returns null if no binding matches; callers turn that into
+    /// `CompileError.UnresolvedSymbol` (the resolution-priority
+    /// fall-through to vars / core happens in later steps).
+    ///
+    /// **Step #4 local-only resolver.** Nested function bodies
+    /// (step #5) MUST NOT use this flat lookup across routine
+    /// boundaries — outer-routine locals must become captured
+    /// upvalues, not direct slot references. Step #5 replaces or
+    /// extends this with capture-aware resolution; the most likely
+    /// shape is a `LexicalEnv { locals, parent: ?*LexicalEnv,
+    /// captures }` chain plus per-binding `BindingRef` records
+    /// (peer-AI turn 39).
+    fn resolveLocal(self: *const Emitter, name: []const u8) ?u12 {
+        var i = self.scope.items.len;
+        while (i > 0) {
+            i -= 1;
+            const b = self.scope.items[i];
+            if (std.mem.eql(u8, b.name, name)) return b.slot;
+        }
+        return null;
     }
 
     /// Allocate a fresh result slot. Slots are monotonic; no
@@ -288,8 +398,11 @@ fn compileExpr(e: *Emitter, form: *const Tiny, dst: u12) CompileError!void {
         .nil => try e.emit(vm.asm_.loadNil(dst)),
         .bool => |b| try e.emit(if (b) vm.asm_.loadTrue(dst) else vm.asm_.loadFalse(dst)),
         .int => |n| try compileIntLiteral(e, n, dst),
+        .symbol => |name| try compileSymbol(e, name, dst),
         .add => |a| try compileAdd(e, a.lhs, a.rhs, dst),
         .if_ => |i| try compileIf(e, i.test_, i.then, i.else_, dst),
+        .let_star => |l| try compileLetStar(e, l.bindings, l.body, dst),
+        .do_ => |exprs| try compileDo(e, exprs, dst),
     }
 }
 
@@ -323,6 +436,76 @@ fn compileAdd(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) Compile
     const t_rhs = try e.allocSlot();
     try compileExpr(e, rhs, t_rhs);
     try e.emit(vm.asm_.mathAdd(dst, Operand.slot(t_lhs), Operand.slot(t_rhs)));
+}
+
+fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
+    // Step #4: lexical locals are the only resolution category.
+    // When step #7 (vars) lands, this fall-through becomes:
+    //   1. local → mov:move dst, slot
+    //   2. captured upvalue → resolve(u:N) read (step #5)
+    //   3. namespace var → var:load-var dst, var (step #7)
+    //   4. error → :unresolved-symbol
+    const source_slot = e.resolveLocal(name) orelse
+        return CompileError.UnresolvedSymbol;
+    // Skip the no-op self-move (peer-AI turn 38). For step #4
+    // this case can't actually arise because dst is always
+    // caller-allocated and binding slots are Emitter-owned
+    // distinct ranges, but the guard preempts a future bug if
+    // those allocators ever overlap.
+    if (source_slot == dst) return;
+    try e.emit(vm.asm_.move(dst, source_slot));
+}
+
+fn compileLetStar(
+    e: *Emitter,
+    bindings: []const Binding,
+    body: *const Tiny,
+    dst: u12,
+) CompileError!void {
+    // Strict left-of-self visibility per COMPILER.md §4.3
+    // (peer-AI turn 35 + 38): the loop body pushes each
+    // binding to scope AFTER its RHS has been compiled. The
+    // RHS therefore sees bindings 1..i-1 only, not its own
+    // LHS. `(let* [n n] body)` reads outer n for the RHS;
+    // `(let* [x 1 y x] body)` binds y to 1.
+    //
+    // Scope is restored via `defer` (peer-AI turn 38) so an
+    // error mid-body doesn't leave scope state polluted for a
+    // recovering caller.
+    const mark = e.scope.items.len;
+    defer e.scope.shrinkRetainingCapacity(mark);
+
+    for (bindings) |b| {
+        const slot = try e.allocSlot();
+        try compileExpr(e, b.value, slot);
+        try e.pushBinding(b.name, slot);
+    }
+
+    try compileExpr(e, body, dst);
+}
+
+fn compileDo(e: *Emitter, exprs: []const *const Tiny, dst: u12) CompileError!void {
+    // Empty do is nil.
+    if (exprs.len == 0) {
+        try e.emit(vm.asm_.loadNil(dst));
+        return;
+    }
+    // Single-expression do compiles directly into dst.
+    if (exprs.len == 1) {
+        try compileExpr(e, exprs[0], dst);
+        return;
+    }
+    // Multi-expression: ALL non-last go to a SHARED discard
+    // slot (peer-AI turn 38: avoids the 999-slot blowup that
+    // `(do e1 e2 ... e1000)` would cause with fresh-per-expr
+    // allocation). Reusing one discard slot for all ignored
+    // results is the natural meaning of "compile this for its
+    // effect only" — not asymmetric liveness analysis.
+    const discard = try e.allocSlot();
+    for (exprs[0 .. exprs.len - 1]) |expr| {
+        try compileExpr(e, expr, discard);
+    }
+    try compileExpr(e, exprs[exprs.len - 1], dst);
 }
 
 fn compileIf(
@@ -573,6 +756,240 @@ test "compile: (if (+ 1 2) 'truthy 'falsy) — test is a non-trivial expression"
         .else_ = &.{ .int = -1 },
     } });
     try testing.expectEqual(@as(i64, 99), result.asFixnum());
+}
+
+// ---- step #4: symbol / let* / do tests (peer-AI turn 38 checklist) ----
+
+test "compile: bare unresolved symbol surfaces UnresolvedSymbol" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const res = compileTiny(arena.allocator(), &.{ .symbol = "x" });
+    try testing.expectError(CompileError.UnresolvedSymbol, res);
+}
+
+test "compile: (let* [x 1] x) = 1" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try runTiny(&arena, &.{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 1 } }},
+        .body = &.{ .symbol = "x" },
+    } });
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "compile: (let* [x 1 y 2] (+ x y)) = 3" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try runTiny(&arena, &.{ .let_star = .{
+        .bindings = &.{
+            .{ .name = "x", .value = &.{ .int = 1 } },
+            .{ .name = "y", .value = &.{ .int = 2 } },
+        },
+        .body = &.{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .symbol = "y" } } },
+    } });
+    try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+test "compile: (let* [x 1 y x] y) = 1 — sequential RHS sees prior binding" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try runTiny(&arena, &.{ .let_star = .{
+        .bindings = &.{
+            .{ .name = "x", .value = &.{ .int = 1 } },
+            .{ .name = "y", .value = &.{ .symbol = "x" } },
+        },
+        .body = &.{ .symbol = "y" },
+    } });
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "compile: (let* [x x] x) — RHS does NOT see own LHS, no outer x → UnresolvedSymbol" {
+    // Per COMPILER.md §4.3 amendment: binding-i's RHS sees
+    // bindings 1..i-1 only, not its own LHS. Without an outer
+    // x in scope, the RHS reference is unresolved.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const res = compileTiny(arena.allocator(), &.{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .symbol = "x" } }},
+        .body = &.{ .symbol = "x" },
+    } });
+    try testing.expectError(CompileError.UnresolvedSymbol, res);
+}
+
+test "compile: (let* [x 7] (let* [x x] x)) = 7 — self-shadow sees outer" {
+    // The inner [x x] reads outer-x for its RHS, then shadows.
+    // The body x reads the inner binding.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inner: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .symbol = "x" } }},
+        .body = &.{ .symbol = "x" },
+    } };
+    const outer: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 7 } }},
+        .body = &inner,
+    } };
+    const result = try runTiny(&arena, &outer);
+    try testing.expectEqual(@as(i64, 7), result.asFixnum());
+}
+
+test "compile: (let* [x 1 x 2] x) = 2 — duplicate name shadows in same let*" {
+    // Per COMPILER.md §4.3: NOT a :duplicate-binding (that's
+    // for parameter lists only). The second binding shadows
+    // the first from binding-2 onward + body.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try runTiny(&arena, &.{ .let_star = .{
+        .bindings = &.{
+            .{ .name = "x", .value = &.{ .int = 1 } },
+            .{ .name = "x", .value = &.{ .int = 2 } },
+        },
+        .body = &.{ .symbol = "x" },
+    } });
+    try testing.expectEqual(@as(i64, 2), result.asFixnum());
+}
+
+test "compile: nested let — inner shadow doesn't pollute outer scope after exit" {
+    // (let* [x 1] (do (let* [x 2] x) x)) → outer let-body's
+    // last form `x` resolves to outer x = 1, NOT inner-x = 2.
+    // Tests that the `defer scope.shrinkRetainingCapacity` pop
+    // correctly restores scope after the inner let exits.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inner_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 2 } }},
+        .body = &.{ .symbol = "x" },
+    } };
+    const body: Tiny = .{ .do_ = &.{ &inner_let, &.{ .symbol = "x" } } };
+    const outer: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 1 } }},
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &outer);
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "compile: empty (do) = nil" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try runTiny(&arena, &.{ .do_ = &.{} });
+    try testing.expect(result.kind() == .nil);
+}
+
+test "compile: single-expression (do x) = x" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try runTiny(&arena, &.{ .do_ = &.{&.{ .int = 42 }} });
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "compile: (do 1 2 3) = 3 — yields last expression" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const result = try runTiny(&arena, &.{ .do_ = &.{
+        &.{ .int = 1 },
+        &.{ .int = 2 },
+        &.{ .int = 3 },
+    } });
+    try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+test "compile: do sees enclosing let bindings" {
+    // (let* [x 4] (do 1 x)) → 4
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body: Tiny = .{ .do_ = &.{ &.{ .int = 1 }, &.{ .symbol = "x" } } };
+    const form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 4 } }},
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 4), result.asFixnum());
+}
+
+test "compile: let inside if-arm: (if true (let* [x 1] x) 2) = 1" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const then_arm: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 1 } }},
+        .body = &.{ .symbol = "x" },
+    } };
+    const result = try runTiny(&arena, &.{ .if_ = .{
+        .test_ = &.{ .bool = true },
+        .then = &then_arm,
+        .else_ = &.{ .int = 2 },
+    } });
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "compile: if inside let RHS: (let* [x (if false 1 2)] x) = 2" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rhs: Tiny = .{ .if_ = .{
+        .test_ = &.{ .bool = false },
+        .then = &.{ .int = 1 },
+        .else_ = &.{ .int = 2 },
+    } };
+    const result = try runTiny(&arena, &.{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &rhs }},
+        .body = &.{ .symbol = "x" },
+    } });
+    try testing.expectEqual(@as(i64, 2), result.asFixnum());
+}
+
+test "compile: (do unresolved 1) — non-last expressions still compile" {
+    // Pre-empts a future optimization that might skip non-last
+    // do expressions because their values are discarded
+    // (peer-AI turn 39). Discarded value ≠ discarded compilation:
+    // the side effects of compiling/executing must still occur.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const res = compileTiny(arena.allocator(), &.{ .do_ = &.{
+        &.{ .symbol = "missing" },
+        &.{ .int = 1 },
+    } });
+    try testing.expectError(CompileError.UnresolvedSymbol, res);
+}
+
+test "compile: nested let with sequential RHS sees inner shadow, not outer" {
+    // (let* [x 1] (let* [x 2, y x] y)) → 2
+    // Composition of: outer x = 1, inner-let shadows with x = 2,
+    // inner-let-binding y's RHS sees the SHADOWED x = 2 (not
+    // the outer x = 1). Test pins the interaction of nested
+    // scope + sequential RHS visibility (peer-AI turn 39).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inner: Tiny = .{ .let_star = .{
+        .bindings = &.{
+            .{ .name = "x", .value = &.{ .int = 2 } },
+            .{ .name = "y", .value = &.{ .symbol = "x" } },
+        },
+        .body = &.{ .symbol = "y" },
+    } };
+    const outer: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 1 } }},
+        .body = &inner,
+    } };
+    const result = try runTiny(&arena, &outer);
+    try testing.expectEqual(@as(i64, 2), result.asFixnum());
+}
+
+test "compile: scope restored after compile error" {
+    // Compile a let* whose body is unresolvable. Then compile
+    // another (different) form that should NOT see leaked
+    // scope from the failed compile.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const failing: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 1 } }},
+        .body = &.{ .symbol = "y" }, // y is unbound → error
+    } };
+    const res1 = compileTiny(arena.allocator(), &failing);
+    try testing.expectError(CompileError.UnresolvedSymbol, res1);
+    // The scope should not have leaked `x`. A fresh compile
+    // referencing `x` should still fail.
+    const res2 = compileTiny(arena.allocator(), &.{ .symbol = "x" });
+    try testing.expectError(CompileError.UnresolvedSymbol, res2);
 }
 
 test "compile: arena cleanup releases code+consts atomically" {
