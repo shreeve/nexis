@@ -181,6 +181,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     vm_mod.addImport("value", value_mod);
+    // Step 5e: VM owns a `Heap` (backed by its runtime_arena) for
+    // variadic rest-list construction. heap+list are tiny pure-
+    // allocator wrappers; pulling them in does NOT pull GC.
+    vm_mod.addImport("heap", heap_mod);
+    vm_mod.addImport("list", list_mod);
 
     const compile_mod = b.createModule(.{
         .root_source_file = b.path("src/compile.zig"),
@@ -189,6 +194,10 @@ pub fn build(b: *std.Build) void {
     });
     compile_mod.addImport("vm", vm_mod);
     compile_mod.addImport("value", value_mod);
+    // Step 5e: tests inspect rest-list results from variadic
+    // fn calls. compile.zig core doesn't depend on list — the
+    // VM constructs rest lists at call/prologue time.
+    compile_mod.addImport("list", list_mod);
 
     const db_mod = b.createModule(.{
         .root_source_file = b.path("src/db.zig"),
@@ -316,8 +325,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "hamt", "transient", "db" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "hamt", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
-        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{"value"} },
-        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value" } },
+        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list" } },
+        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;

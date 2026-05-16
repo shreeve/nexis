@@ -59,6 +59,14 @@
 
 const std = @import("std");
 const value_mod = @import("value");
+/// Step 5e (peer-AI turn 49 Option D): the VM owns a `Heap`
+/// backed by `runtime_arena` for constructing rest-arg lists
+/// at variadic call sites. heap + list are pure-allocator
+/// modules; pulling them in does NOT pull GC. The Heap shares
+/// the closure/cell allocator so all VM-side runtime values
+/// are freed together at `VM.deinit`.
+const heap_mod = @import("heap");
+const list_mod = @import("list");
 const Value = value_mod.Value;
 
 // =============================================================================
@@ -321,11 +329,22 @@ pub const Routine = struct {
     /// Slot count. The frame reserves this many `Value` slots on
     /// invocation.
     slot_count: u16,
-    /// Number of arguments this routine accepts (fixed-arity in
-    /// v1; variadic deferred per COMPILER.md §5.5). Matched
-    /// against `call:call`'s argc; mismatch raises
-    /// `:arity-mismatch` (peer-AI turn 40).
-    arity: u16 = 0,
+    /// Number of FIXED arguments this routine accepts. For a
+    /// non-variadic routine, `call:call` must pass exactly
+    /// `fixed_arity` args; mismatch raises `:arity-mismatch`
+    /// (peer-AI turn 40). For a variadic routine
+    /// (`variadic = true`), `call:call` must pass at least
+    /// `fixed_arity` args and the rest are packed into a list
+    /// installed at `slot[fixed_arity]` by the VM at call
+    /// time (per VM.md §6 + peer-AI turn 49 Option D).
+    /// (Renamed from `arity` in step 5e0.)
+    fixed_arity: u16 = 0,
+    /// If true, this routine takes a rest parameter at slot
+    /// `fixed_arity`. The VM packs any excess args into a list
+    /// at call time. `(fn* [a b & r] body)` lowers to
+    /// `fixed_arity = 2, variadic = true`. Step 5e (peer-AI
+    /// turn 49).
+    variadic: bool = false,
     /// Number of upvalue cells the routine's body expects in
     /// its callee frame. Validated against the constructed
     /// closure's upvalue array length at `call:call` time and
@@ -542,6 +561,13 @@ pub const VM = struct {
     /// allocations migrate to gc-managed `heap.alloc` calls; the
     /// Closure/UpvalCell layouts stay trace-compatible.
     runtime_arena: std.heap.ArenaAllocator,
+    /// Step 5e: heap for runtime list construction (variadic
+    /// rest args). Backed by `runtime_arena.allocator()` so list
+    /// nodes share the closure/cell lifetime — all freed at
+    /// `VM.deinit`. Initialized lazily on first variadic call
+    /// to avoid the cost on programs that never use variadic
+    /// fns.
+    heap: ?heap_mod.Heap = null,
     /// Where the top-level `call:return` stores the returned Value on
     /// halt.
     result: Value = value_mod.nilValue(),
@@ -586,10 +612,32 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *VM) void {
+        // Heap (if initialized) is arena-backed in this staged
+        // VM path. Its live-list is only bookkeeping; all
+        // memory is reclaimed by `runtime_arena.deinit()`
+        // below. We deliberately skip `heap.deinit()` because
+        // (1) the Heap holds no non-memory resources, (2)
+        // every allocation it owns came from runtime_arena,
+        // and (3) the surrounding `self.* = undefined` makes
+        // the field unreachable after this returns.
+        // Migration warning: if a future change backs `VM.heap`
+        // by `self.allocator` (instead of runtime_arena), this
+        // skip becomes a leak — call `heap.deinit()` then.
         self.runtime_arena.deinit();
         self.stack.deinit(self.allocator);
         self.frames.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Step 5e: lazy-initialize the rest-list heap on first use
+    /// (peer-AI turn 49). The Heap is just an allocator wrapper
+    /// with a live-list; init is O(1) and there's no cost
+    /// before the first variadic call.
+    fn ensureHeap(self: *VM) *heap_mod.Heap {
+        if (self.heap == null) {
+            self.heap = heap_mod.Heap.init(self.runtime_arena.allocator());
+        }
+        return &self.heap.?;
     }
 
     /// Allocate a `Closure` from the runtime arena and return a
@@ -939,9 +987,19 @@ pub const VM = struct {
         const closure = asClosure(closure_v);
         const callee_routine = closure.routine;
 
-        // Arity check (peer-AI turn 42).
-        if (callee_routine.arity != argc) {
-            return VmError.ArityMismatch;
+        // Arity check (peer-AI turn 42 + step 5e0):
+        //   non-variadic: argc must equal fixed_arity
+        //   variadic:     argc must be >= fixed_arity (excess
+        //                 args get packed into a rest list by
+        //                 the VM at call/prologue time below)
+        if (callee_routine.variadic) {
+            if (argc < callee_routine.fixed_arity) {
+                return VmError.ArityMismatch;
+            }
+        } else {
+            if (callee_routine.fixed_arity != argc) {
+                return VmError.ArityMismatch;
+            }
         }
         // Upvalue count consistency check: the closure's upvalue
         // array length must match what the routine expects.
@@ -962,11 +1020,19 @@ pub const VM = struct {
             }
         }
         // Validate the routine's metadata is internally
-        // consistent (peer-AI turn 43): a routine with
-        // `slot_count < arity` would underrun on param storage.
-        // This indicates a compiler bug or corrupt routine, not
-        // user error.
-        if (callee_routine.slot_count < callee_routine.arity) {
+        // consistent (peer-AI turn 43, extended in 5e0): a
+        // routine with `slot_count < fixed_arity` would underrun
+        // on fixed param storage; a variadic routine additionally
+        // needs `slot_count > fixed_arity` (room for the rest
+        // slot). Indicates compiler bug or corrupt routine.
+        // Use u32 for the addition to avoid overflow on
+        // malformed routines with fixed_arity == maxInt(u16) and
+        // variadic = true (peer-AI turn 50). Such routines are
+        // bytecode corruption regardless; we want to surface
+        // BytecodeCorruption, not an integer-overflow panic.
+        const min_slots: u32 = @as(u32, callee_routine.fixed_arity) +
+            @as(u32, if (callee_routine.variadic) 1 else 0);
+        if (@as(u32, callee_routine.slot_count) < min_slots) {
             return VmError.BytecodeCorruption;
         }
 
@@ -991,11 +1057,55 @@ pub const VM = struct {
                 self.stack_high_water = self.stack.items.len;
             }
         }
-        // Reset locals after args to nil.
-        const locals_start: usize = @as(usize, callee_base) + argc;
-        const locals_end: usize = callee_end;
-        var i: usize = locals_start;
-        while (i < locals_end) : (i += 1) {
+
+        // Step 5e: variadic-rest materialization. After this
+        // block, slot[callee_base + fixed_arity] holds an
+        // empty list (if argc == fixed_arity) or a cons list
+        // of the excess args in their original order.
+        //
+        // CRITICAL ORDERING (peer-AI turn 49):
+        //   (1) build the rest list FIRST, while excess-arg
+        //       slots still hold the live values;
+        //   (2) install at slot[fixed];
+        //   (3) ONLY THEN reset the local slots to nil.
+        // The earlier draft reset first, which clobbered the
+        // excess-arg slots before construction read them and
+        // produced rest lists of nils. The reset loop below
+        // is now careful to start AT THE EARLIEST after the
+        // rest slot (variadic: fixed+1) or after the args
+        // (non-variadic: argc).
+        if (callee_routine.variadic) {
+            const heap = self.ensureHeap();
+            var rest = list_mod.empty(heap) catch return VmError.OutOfMemory;
+            const fixed: usize = callee_routine.fixed_arity;
+            var j: usize = argc;
+            while (j > fixed) {
+                j -= 1;
+                const arg = self.stack.items[@as(usize, callee_base) + j];
+                rest = list_mod.cons(heap, arg, rest) catch return VmError.OutOfMemory;
+            }
+            self.stack.items[@as(usize, callee_base) + fixed] = rest;
+        }
+
+        // Reset dead slots to nil. Coverage (peer-AI turn 50):
+        //   - Variadic: start at fixed_arity+1 (skip the rest
+        //     slot, which was just written); end at
+        //     max(callee_base + argc, callee_end). When
+        //     argc > slot_count (common for variadic), excess-
+        //     arg slots sit ABOVE the callee's logical frame
+        //     but still inside the caller's backing stack —
+        //     they hold dead post-cons values and must be
+        //     nil'd for GC-root hygiene (once roots scan).
+        //   - Non-variadic: start at argc (skip the live args).
+        //     end at callee_end (slot_count).
+        const reset_start: usize = if (callee_routine.variadic)
+            @as(usize, callee_base) + callee_routine.fixed_arity + 1
+        else
+            @as(usize, callee_base) + argc;
+        const args_end: usize = @as(usize, callee_base) + argc;
+        const reset_end: usize = @max(args_end, callee_end);
+        var i: usize = reset_start;
+        while (i < reset_end) : (i += 1) {
             self.stack.items[i] = value_mod.nilValue();
         }
 
@@ -2525,7 +2635,7 @@ test "VM 5a1: closure:make produces a function-kind Value" {
         .consts = &.{},
         .capture_descs = &.{},
         .slot_count = 1,
-        .arity = 0,
+        .fixed_arity = 0,
         .upvalue_count = 0,
         .name = "child",
     };
@@ -2540,7 +2650,7 @@ test "VM 5a1: closure:make produces a function-kind Value" {
         .consts = &parent_consts,
         .capture_descs = &parent_caps,
         .slot_count = 1,
-        .arity = 0,
+        .fixed_arity = 0,
         .upvalue_count = 0,
         .name = "parent",
     };
@@ -2601,7 +2711,7 @@ test "VM 5a1: ((fn* [x] (+ x 1)) 5) = 6 — single arg" {
         .code = &child_code,
         .consts = &child_consts,
         .slot_count = 2,
-        .arity = 1,
+        .fixed_arity = 1,
     };
     // Parent: load fn into s0, load 5 into s1, call_base=s0 argc=1
     // result=s2; return s2. slot_count = 3.
@@ -2639,7 +2749,7 @@ test "VM 5a1: ((fn* [x y] (+ x y)) 3 4) = 7 — two-arg call" {
         .code = &child_code,
         .consts = &.{},
         .slot_count = 3,
-        .arity = 2,
+        .fixed_arity = 2,
     };
     const parent_consts = [_]Const{
         croutine(&child_routine),
@@ -2674,7 +2784,7 @@ test "VM 5a1: arity mismatch — too few args traps :arity-mismatch" {
         .code = &child_code,
         .consts = &.{},
         .slot_count = 2,
-        .arity = 2,
+        .fixed_arity = 2,
     };
     const parent_consts = [_]Const{
         croutine(&child_routine),
@@ -2706,7 +2816,7 @@ test "VM 5a1: arity mismatch — too many args traps :arity-mismatch" {
         .code = &child_code,
         .consts = &.{},
         .slot_count = 1,
-        .arity = 1,
+        .fixed_arity = 1,
     };
     const parent_consts = [_]Const{
         croutine(&child_routine),
@@ -2800,7 +2910,7 @@ test "VM 5a1: closure:make capture descriptor source-count mismatch traps" {
         .code = &child_code,
         .consts = &.{},
         .slot_count = 1,
-        .arity = 0,
+        .fixed_arity = 0,
         .upvalue_count = 1, // mismatch with descriptor below
     };
     const parent_consts = [_]Const{croutine(&child_routine)};
@@ -2830,7 +2940,7 @@ test "VM 5a1: callee local slots are nil-initialized even when stack overlaps ca
         .code = &child_code,
         .consts = &.{},
         .slot_count = 3,
-        .arity = 1,
+        .fixed_arity = 1,
     };
     // Parent: stuff non-nil into all of its high slots first to
     // create the "overlap with caller's stale data" scenario.
@@ -2894,7 +3004,7 @@ test "VM 5a1: call:call with constant operand as C traps :invalid-operand-kind" 
         .code = &child_code,
         .consts = &.{},
         .slot_count = 1,
-        .arity = 0,
+        .fixed_arity = 0,
     };
     const consts = [_]Const{croutine(&child_routine)};
     const caps = [_]CaptureDescriptor{.{ .sources = &.{} }};
@@ -3028,7 +3138,7 @@ test "VM 5b: mov:move with U-operand source resolves cell contents (no opcode ne
         .code = &child_code,
         .consts = &.{},
         .slot_count = 1,
-        .arity = 0,
+        .fixed_arity = 0,
         .upvalue_count = 1,
     };
 
@@ -3072,7 +3182,7 @@ test "VM 5b: U-operand out of range traps :upvalue-out-of-range" {
         .code = &child_code,
         .consts = &.{},
         .slot_count = 1,
-        .arity = 0,
+        .fixed_arity = 0,
         .upvalue_count = 0,
     };
 
@@ -3107,7 +3217,7 @@ test "VM 5b: closure:make with local_cell_slot source populates closure.upvalues
         .code = &child_code,
         .consts = &.{},
         .slot_count = 1,
-        .arity = 0,
+        .fixed_arity = 0,
         .upvalue_count = 1,
     };
     const consts = [_]Const{
@@ -3169,7 +3279,7 @@ test "VM 5c: U-operand resolve on uninitialized cell traps :uninitialized-cell" 
         .code = &child_code,
         .consts = &.{},
         .slot_count = 1,
-        .arity = 0,
+        .fixed_arity = 0,
         .upvalue_count = 1,
     };
     var parent_consts = [_]Const{croutine(&child_routine)};
@@ -3278,7 +3388,7 @@ test "VM 5c: placeholder pattern — new-cell + make + init enables self-recursi
         .code = &child_code,
         .consts = &.{},
         .slot_count = 1,
-        .arity = 0,
+        .fixed_arity = 0,
         .upvalue_count = 1,
     };
     var parent_consts = [_]Const{croutine(&child_routine)};
@@ -3321,7 +3431,7 @@ test "VM 5a1: same closure called twice — both invocations succeed" {
         .code = &child_code,
         .consts = &child_consts,
         .slot_count = 2,
-        .arity = 1,
+        .fixed_arity = 1,
     };
     // Parent: make closure, call with 5 → s4. Reuse closure, call
     // with 10 → s5. Add s4 + s5 → result.

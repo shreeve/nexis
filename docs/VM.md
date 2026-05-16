@@ -1165,6 +1165,41 @@ Per peer-AI turn 28:
 - **2026-04-19** (spec commit): Initial draft. All contracts
   `proposed`. No implementation yet. Peer-AI turn 28 decisions
   embedded.
+- **2026-05-16** (§5 + §6 + §13 implementation, peer-AI
+  turns 49 + 50): Step 5e wires variadic-call rest-arg
+  construction at the VM call/prologue level per Option D.
+  - `Routine.arity: u16` renamed to `Routine.fixed_arity:
+    u16 + variadic: bool`. `call:call` checks: non-variadic
+    requires `argc == fixed_arity`; variadic requires
+    `argc >= fixed_arity`. Mismatch → `:arity-mismatch`.
+  - `execCallCall` materializes the rest list inline for
+    variadic callees: build right-to-left from live
+    excess-arg slots BEFORE writing the rest slot (to
+    avoid clobbering source data — caught in first draft
+    review, see peer-AI turn 50 §A); install at
+    slot[fixed_arity]; reset dead slots
+    [fixed_arity+1 .. max(callee_base+argc, callee_end))
+    to nil for GC-root hygiene.
+  - VM gains an optional `heap: ?heap_mod.Heap` field,
+    lazy-initialized on first variadic call (no cost for
+    fixed-only programs). Backed by `runtime_arena.allocator()`
+    so list nodes share closure/cell lifetime; freed
+    wholesale at `VM.deinit`.
+  - Bytecode-corruption check for variadic routines
+    extended to require `slot_count >= fixed_arity + 1`
+    (room for the rest slot). Math uses u32 to avoid
+    overflow on malformed `fixed_arity == maxInt(u16)`
+    routines (peer-AI turn 50 §G1 — surface
+    `:bytecode-corruption`, never integer-overflow panic).
+  - Variadic `recur` rejected at compile time
+    (`UnsupportedFeature`) per peer-AI turn 49. The
+    runtime path for proper variadic recur (rebuild rest
+    list per iteration) is left for a later sub-step.
+  - `call:tailcall` also remains unimplemented; its
+    eventual implementation must perform the SAME
+    variadic-rest construction after sliding args (noted
+    here for the future implementer).
+
 - **2026-05-16** (§10 + §11 implementation, peer-AI turns
   47 + 48): Step 5d lands the runtime-side tail-position
   machinery and the first `cmp` opcode.

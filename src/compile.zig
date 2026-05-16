@@ -57,6 +57,10 @@
 const std = @import("std");
 const vm = @import("vm");
 const value_mod = @import("value");
+/// Step 5e (tests only): inspect rest-list results in variadic
+/// fn tests. The compiler itself doesn't depend on list — the
+/// VM constructs rest lists at call time per VM.md §6.
+const list_mod = @import("list");
 
 pub const Inst = vm.Inst;
 pub const Routine = vm.Routine;
@@ -136,6 +140,15 @@ pub const Tiny = union(enum) {
     fn_star: struct {
         name: ?[]const u8 = null,
         params: []const []const u8,
+        /// Step 5e (peer-AI turn 49): `(fn* [a b & r] body)`
+        /// has `params = ["a","b"]` and `rest_param = "r"`.
+        /// `rest_param` is bound at slot `params.len`. At call
+        /// time, the VM packs excess args into a list and
+        /// installs it in that slot. `null` means fixed-arity.
+        /// Tiny avoids encoding `&` as a fake symbol; reader-
+        /// form integration (step #7) parses `[a b & r]` into
+        /// this explicit shape.
+        rest_param: ?[]const u8 = null,
         body: *const Tiny,
     },
     /// `(callee args...)` — function invocation. Lowers to the
@@ -264,6 +277,14 @@ pub const RecurTarget = struct {
     /// + COMPILER.md §5.6 captured-recur semantics).
     captured_mask: []const bool,
     kind: RecurTargetKind,
+    /// Step 5e: true iff this fn target belongs to a variadic
+    /// fn. `compileRecur` rejects any recur targeting a
+    /// variadic fn with `UnsupportedFeature` for v1 — proper
+    /// variadic recur (rebuild rest list per iteration) is a
+    /// separate sub-step (peer-AI turn 49: "decide before
+    /// coding; implement explicitly or reject explicitly").
+    /// Always false for loop targets (loops never variadic).
+    variadic: bool = false,
 };
 
 pub const RecurTargetKind = enum { loop_star, fn_star };
@@ -333,6 +354,14 @@ pub const CompileError = error{
     /// revalidation — recur is not a call opcode). Step 5d1.
     RecurArityMismatch,
 
+    /// A feature is recognized but intentionally not wired in
+    /// the current step. Step 5e: emitted for `(recur ...)`
+    /// targeting a variadic fn (per peer-AI turn 49 — proper
+    /// variadic recur requires rebuilding the rest list per
+    /// iteration; deferred to a separate sub-step). Trapping
+    /// loudly is better than emitting subtly-wrong code.
+    UnsupportedFeature,
+
     /// A compiler invariant was violated. Distinct from a
     /// user-error like `UnresolvedSymbol`: this indicates the
     /// compiler reached a state it believes impossible (e.g.,
@@ -368,9 +397,13 @@ pub const Compiled = struct {
     consts: []const vm.Const,
     capture_descs: []const vm.CaptureDescriptor = &.{},
     slot_count: u16,
-    /// Top-level Compiled has arity 0; child routines built by
-    /// `compileFn` set this to their parameter count.
-    arity: u16 = 0,
+    /// Top-level Compiled has fixed_arity 0; child routines built
+    /// by `compileFn` set this to their fixed parameter count.
+    /// (Renamed from `arity` in step 5e0.)
+    fixed_arity: u16 = 0,
+    /// Step 5e: true for `(fn* [a b & r] ...)`. The VM packs
+    /// excess args into a list at call time.
+    variadic: bool = false,
 
     pub fn toRoutine(self: Compiled, name: []const u8) Routine {
         return .{
@@ -378,8 +411,9 @@ pub const Compiled = struct {
             .consts = self.consts,
             .capture_descs = self.capture_descs,
             .slot_count = self.slot_count,
-            .arity = self.arity,
-            .upvalue_count = 0, // 5a1: no captures
+            .fixed_arity = self.fixed_arity,
+            .variadic = self.variadic,
+            .upvalue_count = 0, // top-level routines have no upvalues
             .name = name,
         };
     }
@@ -701,7 +735,8 @@ const Emitter = struct {
             .consts = consts,
             .capture_descs = caps,
             .slot_count = if (self.slot_count == 0) 1 else self.slot_count,
-            .arity = 0, // top-level only; compileFn sets this for child routines via Routine struct
+            .fixed_arity = 0, // top-level only; compileFn sets this for child routines via Routine struct
+            .variadic = false, // top-level routine never variadic
         };
     }
 };
@@ -830,14 +865,15 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
             for (exprs) |expr| try freeVars(allocator, expr, env, out);
         },
         .fn_star => |f| {
-            // fn body's env = outer env + params + self-name (if any).
-            // Names referenced in fn body not bound by either
-            // are "free" — they escape ALL bound scopes
-            // (including outer's), so they bubble up here too.
+            // fn body's env = outer env + params + rest_param +
+            // self-name (if any). Names referenced in fn body
+            // not bound by any of those are "free" and bubble
+            // up here.
             var fn_env: NameSet = .{};
             defer fn_env.deinit(allocator);
             try fn_env.unionWith(allocator, env);
             for (f.params) |p| try fn_env.put(allocator, p);
+            if (f.rest_param) |rp| try fn_env.put(allocator, rp);
             if (f.name) |n| try fn_env.put(allocator, n);
             try freeVars(allocator, f.body, &fn_env, out);
         },
@@ -946,10 +982,10 @@ fn capturedByDescendantFns(
             for (exprs) |expr| try capturedByDescendantFns(allocator, expr, env, out);
         },
         .fn_star => |f| {
-            // This fn body has its own params + optional self-
-            // name as initial env. The fn's free vars are the
-            // names it actually captures from OUR scope. We
-            // want only those that match `env`.
+            // This fn body has its own params + rest_param +
+            // optional self-name as initial env. The fn's free
+            // vars are the names it actually captures from OUR
+            // scope. We want only those that match `env`.
             //
             // freeVars already recurses through nested fn_stars
             // (with appropriate inner envs), so descendant fns'
@@ -959,6 +995,7 @@ fn capturedByDescendantFns(
             var params_env: NameSet = .{};
             defer params_env.deinit(allocator);
             for (f.params) |p| try params_env.put(allocator, p);
+            if (f.rest_param) |rp| try params_env.put(allocator, rp);
             if (f.name) |n| try params_env.put(allocator, n);
             var fn_free: NameSet = .{};
             defer fn_free.deinit(allocator);
@@ -1056,7 +1093,7 @@ fn compileExpr(
         .if_ => |i| try compileIf(e, i.test_, i.then, i.else_, dst, recur_target),
         .let_star => |l| try compileLetStar(e, l.bindings, l.body, dst, recur_target),
         .do_ => |exprs| try compileDo(e, exprs, dst, recur_target),
-        .fn_star => |f| try compileFn(e, f.name, f.params, f.body, dst),
+        .fn_star => |f| try compileFn(e, f.name, f.params, f.rest_param, f.body, dst),
         .call => |c| try compileCall(e, c.callee, c.args, dst),
         .letfn_star => |l| try compileLetFnStar(e, l.bindings, l.body, dst, recur_target),
         .loop_star => |l| try compileLoopStar(e, l.bindings, l.body, dst),
@@ -1329,6 +1366,11 @@ fn compileRecur(
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
     const target = recur_target orelse return CompileError.RecurOutsideTail;
+    // Step 5e: variadic-fn-target recur is deliberately
+    // rejected for v1 (peer-AI turn 49). Proper lowering
+    // requires rebuilding the rest list per iteration; lands
+    // in a separate sub-step.
+    if (target.variadic) return CompileError.UnsupportedFeature;
     if (args.len != target.binding_slots.len) return CompileError.RecurArityMismatch;
 
     // Evaluate each arg into a fresh temp slot. Using temps
@@ -1410,6 +1452,7 @@ fn compileFn(
     parent: *Emitter,
     name: ?[]const u8,
     params: []const []const u8,
+    rest_param: ?[]const u8,
     body: *const Tiny,
     dst: u12,
 ) CompileError!void {
@@ -1418,6 +1461,12 @@ fn compileFn(
     for (params, 0..) |p, i| {
         for (params[0..i]) |q| {
             if (std.mem.eql(u8, p, q)) return CompileError.DuplicateParam;
+        }
+    }
+    // Step 5e: rest param can't shadow any fixed param.
+    if (rest_param) |rp| {
+        for (params) |p| {
+            if (std.mem.eql(u8, rp, p)) return CompileError.DuplicateParam;
         }
     }
     // Per peer-AI turn 43: argc encodes in a 12-bit operand
@@ -1488,6 +1537,7 @@ fn compileFn(
     var params_env: NameSet = .{};
     defer params_env.deinit(parent.allocator);
     for (params) |p| try params_env.put(parent.allocator, p);
+    if (rest_param) |rp| try params_env.put(parent.allocator, rp);
     var captured_in_body: NameSet = .{};
     defer captured_in_body.deinit(parent.allocator);
     try capturedByDescendantFns(parent.allocator, body, &params_env, &captured_in_body);
@@ -1510,6 +1560,24 @@ fn compileFn(
         }
     }
 
+    // Step 5e: rest parameter lives at slot `params.len`. The VM
+    // packs excess args into a list and installs it there at
+    // call time (before any of the fn body runs). Treat the
+    // rest binding like any other param for capture/scope.
+    if (rest_param) |rp| {
+        const slot = try child.allocSlot();
+        std.debug.assert(slot == @as(u12, @intCast(params.len)));
+        if (captured_in_body.contains(rp)) {
+            try child.emit(vm.asm_.closureBoxLocal(slot));
+            try child.scope.append(child.allocator, .{
+                .name = rp,
+                .ref = .{ .cell_slot = slot },
+            });
+        } else {
+            try child.pushBinding(rp, slot);
+        }
+    }
+
     // Step 5d2: set up fn RecurTarget so `(recur ...)` inside
     // the body (with no enclosing `loop*`) rebinds the params
     // and jumps back to the entry point. Captured params get
@@ -1520,12 +1588,18 @@ fn compileFn(
     // back must NOT re-box params (would lose the previous
     // iteration's mutated cell pointer); it must land where the
     // body begins reading.
+    // RecurTarget covers only FIXED params (step 5e). For
+    // variadic fns the `variadic` flag is true; compileRecur
+    // traps `UnsupportedFeature` rather than emit subtly-wrong
+    // code that rebinds fixed params but leaves the rest list
+    // stale (peer-AI turn 49 — proper variadic recur lands
+    // later).
     const param_slots = try parent.allocator.alloc(u12, params.len);
     defer parent.allocator.free(param_slots);
     const captured_mask = try parent.allocator.alloc(bool, params.len);
     defer parent.allocator.free(captured_mask);
     for (params, 0..) |p, i| {
-        param_slots[i] = @intCast(i); // params live at slots 0..arity-1
+        param_slots[i] = @intCast(i); // fixed params live at slots 0..fixed_arity-1
         captured_mask[i] = captured_in_body.contains(p);
     }
     const fn_entry_pc = try child.checkJumpTarget(child.currentPc());
@@ -1534,6 +1608,7 @@ fn compileFn(
         .binding_slots = param_slots,
         .captured_mask = captured_mask,
         .kind = .fn_star,
+        .variadic = rest_param != null,
     };
 
     // Allocate a fresh result slot for the body so a self-move
@@ -1567,7 +1642,8 @@ fn compileFn(
         .consts = child_compiled.consts,
         .capture_descs = child_compiled.capture_descs,
         .slot_count = child_compiled.slot_count,
-        .arity = @intCast(params.len),
+        .fixed_arity = @intCast(params.len),
+        .variadic = rest_param != null,
         .upvalue_count = upvalue_count,
         .name = "<anon-fn>",
     };
@@ -1659,7 +1735,9 @@ fn compileLetFnStar(
         // is already in scope (so the fn body's references
         // resolve via parent-chain capture); using the
         // self-name machinery here would double-allocate.
-        try compileFn(e, null, b.params, b.body, cs);
+        // letfn* bindings are always fixed-arity (no rest param
+        // syntax in (letfn* [(name [params] body) ...]) form).
+        try compileFn(e, null, b.params, null, b.body, cs);
     }
 
     // Step 3: init each cell with its closure.
@@ -2416,6 +2494,193 @@ test "compile 5d1: nested loop* — inner recur targets inner loop only" {
     } };
     const result = try runTiny(&arena, &outer);
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+// ---- step 5e: variadic params (& rest) tests ----
+
+test "compile 5e: ((fn* [a & r] a) 1 2 3) = 1 — rest collected but unused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{
+        .params = &.{"a"},
+        .rest_param = "r",
+        .body = &.{ .symbol = "a" },
+    } };
+    const call_form: Tiny = .{ .call = .{
+        .callee = &fn_form,
+        .args = &.{ &.{ .int = 1 }, &.{ .int = 2 }, &.{ .int = 3 } },
+    } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "compile 5e: ((fn* [a & r] r) 1 2 3) returns list (2 3)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{
+        .params = &.{"a"},
+        .rest_param = "r",
+        .body = &.{ .symbol = "r" },
+    } };
+    const call_form: Tiny = .{ .call = .{
+        .callee = &fn_form,
+        .args = &.{ &.{ .int = 1 }, &.{ .int = 2 }, &.{ .int = 3 } },
+    } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expect(result.kind() == .list);
+    try testing.expect(!list_mod.isEmpty(result));
+    try testing.expectEqual(@as(usize, 2), list_mod.count(result));
+    try testing.expectEqual(@as(i64, 2), list_mod.head(result).asFixnum());
+    const tail = list_mod.tail(result);
+    try testing.expectEqual(@as(i64, 3), list_mod.head(tail).asFixnum());
+}
+
+test "compile 5e: ((fn* [a & r] r) 1) returns empty list — argc == fixed_arity" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{
+        .params = &.{"a"},
+        .rest_param = "r",
+        .body = &.{ .symbol = "r" },
+    } };
+    const call_form: Tiny = .{ .call = .{
+        .callee = &fn_form,
+        .args = &.{&.{ .int = 1 }},
+    } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expect(result.kind() == .list);
+    try testing.expect(list_mod.isEmpty(result));
+    try testing.expectEqual(@as(usize, 0), list_mod.count(result));
+}
+
+test "compile 5e: ((fn* [& r] r) 1 2 3 4) — fixed_arity 0 variadic, all args to rest" {
+    // Verifies element ORDER and contents, not just count
+    // (peer-AI turn 50): list should be (1 2 3 4), not e.g.
+    // reversed or with stale values.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{
+        .params = &.{},
+        .rest_param = "r",
+        .body = &.{ .symbol = "r" },
+    } };
+    const call_form: Tiny = .{ .call = .{
+        .callee = &fn_form,
+        .args = &.{ &.{ .int = 1 }, &.{ .int = 2 }, &.{ .int = 3 }, &.{ .int = 4 } },
+    } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(usize, 4), list_mod.count(result));
+    var cur = result;
+    var expected: i64 = 1;
+    while (!list_mod.isEmpty(cur)) : (expected += 1) {
+        try testing.expectEqual(expected, list_mod.head(cur).asFixnum());
+        cur = list_mod.tail(cur);
+    }
+}
+
+test "compile 5e: ((fn* [& r] r)) — fixed_arity 0 variadic, no args" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{
+        .params = &.{},
+        .rest_param = "r",
+        .body = &.{ .symbol = "r" },
+    } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{} } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expect(list_mod.isEmpty(result));
+}
+
+test "compile 5e: variadic with too few args traps :arity-mismatch at runtime" {
+    // (fn* [a b & r] ...) requires >= 2 args; calling with 1
+    // must trap.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{
+        .params = &.{ "a", "b" },
+        .rest_param = "r",
+        .body = &.{ .symbol = "a" },
+    } };
+    const call_form: Tiny = .{ .call = .{
+        .callee = &fn_form,
+        .args = &.{&.{ .int = 1 }},
+    } };
+    const compiled = try compileTiny(arena.allocator(), &call_form);
+    const routine = compiled.toRoutine("variadic-too-few");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    try testing.expectError(vm.VmError.ArityMismatch, v.run());
+}
+
+test "compile 5e: variadic captured rest param survives across fn returns" {
+    // (((fn* [a & r] (fn* [] r)) 1 2 3))
+    // Outer fn captures r as upvalue of inner fn; inner returns
+    // r. Result should be list (2 3) — verify CONTENTS, not
+    // just count (peer-AI turn 50: count check wouldn't catch
+    // the "list of nils" hazard if it regressed).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inner_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "r" } } };
+    const outer_fn: Tiny = .{ .fn_star = .{
+        .params = &.{"a"},
+        .rest_param = "r",
+        .body = &inner_fn,
+    } };
+    const outer_call: Tiny = .{ .call = .{
+        .callee = &outer_fn,
+        .args = &.{ &.{ .int = 1 }, &.{ .int = 2 }, &.{ .int = 3 } },
+    } };
+    const inner_call: Tiny = .{ .call = .{ .callee = &outer_call, .args = &.{} } };
+    const result = try runTiny(&arena, &inner_call);
+    try testing.expect(result.kind() == .list);
+    try testing.expectEqual(@as(usize, 2), list_mod.count(result));
+    try testing.expectEqual(@as(i64, 2), list_mod.head(result).asFixnum());
+    try testing.expectEqual(@as(i64, 3), list_mod.head(list_mod.tail(result)).asFixnum());
+}
+
+test "compile 5e: duplicate rest+fixed name → DuplicateParam" {
+    // (fn* [a & a] a) — rest name shadows fixed param.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{
+        .params = &.{"a"},
+        .rest_param = "a",
+        .body = &.{ .symbol = "a" },
+    } };
+    try testing.expectError(CompileError.DuplicateParam, compileTiny(arena.allocator(), &fn_form));
+}
+
+test "compile 5e: recur in variadic fn body → UnsupportedFeature" {
+    // (fn* [a & r] (recur 1)) — variadic recur deferred per
+    // peer-AI turn 49.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&.{ .int = 1 }} } };
+    const fn_form: Tiny = .{ .fn_star = .{
+        .params = &.{"a"},
+        .rest_param = "r",
+        .body = &recur_form,
+    } };
+    try testing.expectError(CompileError.UnsupportedFeature, compileTiny(arena.allocator(), &fn_form));
+}
+
+test "compile 5e: recur in NON-variadic fn body still works (regression check for 5d2)" {
+    // Make sure my variadic-recur rejection didn't break
+    // ordinary fn-recur from 5d2.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const n_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 1 } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{&n_plus_1} } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 3 } } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &.{ .symbol = "n" },
+    } };
+    const fn_form: Tiny = .{ .fn_star = .{ .params = &.{"n"}, .body = &body } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 0 }} } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 3), result.asFixnum());
 }
 
 // ---- if-form tests (peer-AI turn 36 checklist) ----

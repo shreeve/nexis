@@ -1126,3 +1126,37 @@ from code contact:
   `call:tailcall` in a position that is loop-body-tail but
   not function-tail would generate wrong code. Will land
   with its own context infrastructure in a later step.
+
+- **2026-05-16** (§5.5 + §6 implementation, peer-AI turns
+  49 + 50): Step 5e lands variadic params via the explicit
+  `rest_param` shape — `(fn* [a b & r] body)` lowers with
+  `Tiny.fn_star.rest_param = "r"`, NOT by encoding `&` as a
+  fake symbol in `params`. The reader-form integration in
+  step #7 will parse `[a b & r]` source syntax into the
+  same Tiny shape.
+  - `compileFn` validates rest doesn't shadow any fixed
+    param, includes rest in the captured-binding pre-
+    analysis env, binds rest at slot `params.len`, and emits
+    `closure:box-local` on the rest slot in the prelude if
+    captured (same machinery as ordinary params).
+  - `Compiled` and `vm.Routine` carry `fixed_arity: u16 +
+    variadic: bool` (renamed from `arity: u16` — minimal
+    churn, clearer than a union for v1).
+  - Variadic `recur` is deliberately **REJECTED** with new
+    `CompileError.UnsupportedFeature` (peer-AI turn 49 §G7
+    "decide explicitly, implement explicitly or reject
+    explicitly"). `RecurTarget.variadic` propagates the
+    flag; `compileRecur` checks it before arity. Proper
+    variadic recur (rebuild rest list per iteration) lands
+    in a later sub-step.
+  - 10 compile tests: rest unused/used/empty/zero-fixed/
+    no-args/duplicate-name-error/captured-rest-with-content-
+    verification/variadic-too-few-args-runtime-trap/
+    variadic-recur-rejected/non-variadic-recur-still-works.
+
+  **Captured rest param** works identically to captured
+  ordinary params via the existing pre-analysis machinery:
+  the inner closure captures the rest slot's `*UpvalCell`,
+  and dereferences yield the rest list value. Verified by
+  `(((fn* [a & r] (fn* [] r)) 1 2 3))` returning the list
+  `(2 3)` with full content verification.
