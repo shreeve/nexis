@@ -117,14 +117,17 @@ pub const Tiny = union(enum) {
     /// `(do)` yields nil. Each let_star / fn_star / loop_star
     /// body that needs multiple expressions wraps them in `do_`.
     do_: []const *const Tiny,
-    /// `(fn* [params...] body)` per PLAN §6.1.
-    /// Step 5a1: empty-capture closures only. Bodies must NOT
-    /// reference free variables (anything not in `params`);
-    /// such references raise `UnresolvedSymbol` at compile time
-    /// (per peer-AI turn 42 — capture/parent-scope walk lands
-    /// in 5b). Named `fn*` deferred to 5c per turn 42 — for
-    /// now, no self-name is allowed.
+    /// `(fn* name? [params...] body)` per PLAN §6.1.
+    /// `name` is the optional self-name (step 5c); when present,
+    /// the body can reference itself recursively (e.g.,
+    /// `(fn* fact [n] ... (fact ...))`). Implementation uses
+    /// the placeholder-cell pattern: parent emits
+    /// `closure:new-cell` + `closure:make` (capturing the
+    /// placeholder) + `closure:init-cell` (filling the cell
+    /// with the constructed closure). The body's references
+    /// to `name` resolve to the captured upvalue.
     fn_star: struct {
+        name: ?[]const u8 = null,
         params: []const []const u8,
         body: *const Tiny,
     },
@@ -136,6 +139,26 @@ pub const Tiny = union(enum) {
         callee: *const Tiny,
         args: []const *const Tiny,
     },
+    /// `(letfn* [(name1 params1 body1) (name2 params2 body2) ...] body)`
+    /// per PLAN §6.1 + COMPILER.md §5.6b. Step 5c.
+    /// Mutually-recursive function bindings: each fn body can
+    /// reference any other letfn* binding, including itself.
+    /// Implementation uses placeholder cells (one per binding),
+    /// constructed BEFORE any closure is built so each closure
+    /// can capture the others' cells; the cells are then
+    /// initialized with the constructed closure values.
+    letfn_star: struct {
+        bindings: []const FnBinding,
+        body: *const Tiny,
+    },
+};
+
+/// One binding in a `letfn*` form. Each is a function
+/// definition (mutually visible across the binding group).
+pub const FnBinding = struct {
+    name: []const u8,
+    params: []const []const u8,
+    body: *const Tiny,
 };
 
 /// One binding in a `let*` form.
@@ -229,6 +252,13 @@ pub const CompileError = error{
     /// allowed (unlike `let*` where sequential bindings can
     /// shadow within the same form per COMPILER.md §4.3).
     DuplicateParam,
+
+    /// Two bindings in the same `letfn*` group carry the same
+    /// name. Step 5c: unlike `let*` (sequential shadowing
+    /// allowed), `letfn*` names are mutually visible — duplicates
+    /// create resolution ambiguity. Matches Clojure
+    /// (`letfn` rejects duplicate names).
+    DuplicateBinding,
 
     /// A compiler invariant was violated. Distinct from a
     /// user-error like `UnresolvedSymbol`: this indicates the
@@ -721,19 +751,38 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
             for (exprs) |expr| try freeVars(allocator, expr, env, out);
         },
         .fn_star => |f| {
-            // fn body's env = outer env + params. Names referenced
-            // in fn body not bound by either are "free" — they
-            // escape ALL bound scopes (including outer's), so
-            // they bubble up here too.
+            // fn body's env = outer env + params + self-name (if any).
+            // Names referenced in fn body not bound by either
+            // are "free" — they escape ALL bound scopes
+            // (including outer's), so they bubble up here too.
             var fn_env: NameSet = .{};
             defer fn_env.deinit(allocator);
             try fn_env.unionWith(allocator, env);
             for (f.params) |p| try fn_env.put(allocator, p);
+            if (f.name) |n| try fn_env.put(allocator, n);
             try freeVars(allocator, f.body, &fn_env, out);
         },
         .call => |c| {
             try freeVars(allocator, c.callee, env, out);
             for (c.args) |a| try freeVars(allocator, a, env, out);
+        },
+        .letfn_star => |l| {
+            // All letfn binding names are mutually visible
+            // (each fn body sees all letfn names as bindings).
+            // Body sees the same bindings.
+            var local_env: NameSet = .{};
+            defer local_env.deinit(allocator);
+            try local_env.unionWith(allocator, env);
+            for (l.bindings) |b| try local_env.put(allocator, b.name);
+            for (l.bindings) |b| {
+                // Each fn's body env = local_env + params.
+                var fn_env: NameSet = .{};
+                defer fn_env.deinit(allocator);
+                try fn_env.unionWith(allocator, &local_env);
+                for (b.params) |p| try fn_env.put(allocator, p);
+                try freeVars(allocator, b.body, &fn_env, out);
+            }
+            try freeVars(allocator, l.body, &local_env, out);
         },
     }
 }
@@ -796,10 +845,10 @@ fn capturedByDescendantFns(
             for (exprs) |expr| try capturedByDescendantFns(allocator, expr, env, out);
         },
         .fn_star => |f| {
-            // This fn body has its own params as initial env.
-            // The fn's free vars (against params + inner
-            // bindings) are the names it actually captures from
-            // OUR scope. We want only those that match `env`.
+            // This fn body has its own params + optional self-
+            // name as initial env. The fn's free vars are the
+            // names it actually captures from OUR scope. We
+            // want only those that match `env`.
             //
             // freeVars already recurses through nested fn_stars
             // (with appropriate inner envs), so descendant fns'
@@ -809,6 +858,7 @@ fn capturedByDescendantFns(
             var params_env: NameSet = .{};
             defer params_env.deinit(allocator);
             for (f.params) |p| try params_env.put(allocator, p);
+            if (f.name) |n| try params_env.put(allocator, n);
             var fn_free: NameSet = .{};
             defer fn_free.deinit(allocator);
             try freeVars(allocator, f.body, &params_env, &fn_free);
@@ -821,6 +871,32 @@ fn capturedByDescendantFns(
         .call => |c| {
             try capturedByDescendantFns(allocator, c.callee, env, out);
             for (c.args) |a| try capturedByDescendantFns(allocator, a, env, out);
+        },
+        .letfn_star => |l| {
+            // letfn* bindings shadow `env` for all fn bodies and
+            // for the let body. Build a local_env with bindings
+            // removed from `env`, then walk each fn body and
+            // the body.
+            var local_env: NameSet = .{};
+            defer local_env.deinit(allocator);
+            try local_env.unionWith(allocator, env);
+            for (l.bindings) |b| removeFromSet(&local_env, b.name);
+            for (l.bindings) |b| {
+                // Each fn's body's free vars (against
+                // params + letfn binding names + self-name)
+                // captured at our level = (free vars) ∩ env.
+                var fn_env: NameSet = .{};
+                defer fn_env.deinit(allocator);
+                for (b.params) |p| try fn_env.put(allocator, p);
+                for (l.bindings) |b2| try fn_env.put(allocator, b2.name);
+                var fn_free: NameSet = .{};
+                defer fn_free.deinit(allocator);
+                try freeVars(allocator, b.body, &fn_env, &fn_free);
+                for (fn_free.items.items) |name| {
+                    if (env.contains(name)) try out.put(allocator, name);
+                }
+            }
+            try capturedByDescendantFns(allocator, l.body, &local_env, out);
         },
     }
 }
@@ -849,8 +925,9 @@ fn compileExpr(e: *Emitter, form: *const Tiny, dst: u12) CompileError!void {
         .if_ => |i| try compileIf(e, i.test_, i.then, i.else_, dst),
         .let_star => |l| try compileLetStar(e, l.bindings, l.body, dst),
         .do_ => |exprs| try compileDo(e, exprs, dst),
-        .fn_star => |f| try compileFn(e, f.params, f.body, dst),
+        .fn_star => |f| try compileFn(e, f.name, f.params, f.body, dst),
         .call => |c| try compileCall(e, c.callee, c.args, dst),
+        .letfn_star => |l| try compileLetFnStar(e, l.bindings, l.body, dst),
     }
 }
 
@@ -1020,6 +1097,7 @@ fn compileDo(e: *Emitter, exprs: []const *const Tiny, dst: u12) CompileError!voi
 /// pattern handles self-reference.
 fn compileFn(
     parent: *Emitter,
+    name: ?[]const u8,
     params: []const []const u8,
     body: *const Tiny,
     dst: u12,
@@ -1036,6 +1114,36 @@ fn compileFn(
     // params (so max practical arity is 4095). Reject > 4095.
     if (params.len > 4095) return CompileError.SlotOverflow;
 
+    // Step 5c (named fn* self-reference): if the fn has a
+    // self-name AND the body references it, use the placeholder-
+    // cell pattern (per COMPILER.md §5.5 + §6 + §6.1). Allocate
+    // a cell in PARENT's frame BEFORE compiling the child body
+    // so the child can capture it; emit `closure:init-cell`
+    // AFTER `closure:make` so the cell's contents become the
+    // just-constructed closure value.
+    //
+    // If the body doesn't reference the self-name, skip the
+    // placeholder entirely (one freeVars walk decides).
+    var self_referenced = false;
+    if (name) |n| {
+        var params_env: NameSet = .{};
+        defer params_env.deinit(parent.allocator);
+        for (params) |p| try params_env.put(parent.allocator, p);
+        var body_free: NameSet = .{};
+        defer body_free.deinit(parent.allocator);
+        try freeVars(parent.allocator, body, &params_env, &body_free);
+        self_referenced = body_free.contains(n);
+    }
+
+    // If self-referenced, allocate the placeholder cell in
+    // PARENT's frame and emit closure:new-cell (in straight-
+    // line code, before the child's closure:make).
+    var self_cell_slot: u12 = 0; // unused if !self_referenced
+    if (self_referenced) {
+        self_cell_slot = try parent.allocSlot();
+        try parent.emit(vm.asm_.closureNewCell(self_cell_slot));
+    }
+
     // Spawn child Emitter linked to parent (step 5b: parent
     // pointer enables capture discovery; was null in 5a1).
     //
@@ -1050,6 +1158,16 @@ fn compileFn(
     var child = Emitter.init(parent.allocator);
     child.parent = parent;
     defer child.deinit();
+
+    // Step 5c: inject self-name as a pre-existing capture so
+    // the body's references resolve to upvalue 0 (sourced from
+    // the placeholder cell allocated above). The capture
+    // descriptor's local_cell_slot source for upvalue 0 will
+    // be set up below.
+    if (self_referenced) {
+        try child.captures.append(child.allocator, .{ .local_cell_slot = self_cell_slot });
+        try child.captured_names.append(child.allocator, .{ .name = name.?, .upvalue = 0 });
+    }
 
     // Pre-analyze body to find captured params (peer-AI turn 44,
     // env-aware per turn 45): pass the param set as `env` so
@@ -1124,6 +1242,95 @@ fn compileFn(
 
     // Emit closure:make in parent.
     try parent.emit(vm.asm_.closureMake(proto_idx, cap_desc_idx, dst));
+
+    // Step 5c: if self-referenced, finalize the placeholder
+    // cell with the just-constructed closure. The cell now
+    // holds the closure; subsequent invocations of the
+    // closure deref upvalue 0 to find itself.
+    if (self_referenced) {
+        try parent.emit(vm.asm_.closureInitCell(self_cell_slot, vm.Operand.slot(dst)));
+    }
+}
+
+/// Lower `letfn*` per COMPILER.md §5.6b: mutually-recursive
+/// function bindings via the placeholder-cell pattern.
+///
+/// Sequence (peer-AI turn 34 + COMPILER.md §5.6b):
+///   1. Allocate placeholder cells: `closure:new-cell` for
+///      each binding's name. Push each into scope as
+///      `.cell_slot`.
+///   2. For each binding, compile its fn body (constructing
+///      a closure via `closure:make`). Each fn body is
+///      compiled in a child Emitter, so references to letfn*
+///      names are captured from the parent's `.cell_slot`s
+///      and read at runtime as upvalues (cell deref via the
+///      U-operand). The letfn* body itself sees the
+///      bindings as same-frame `.cell_slot` reads
+///      (`closure:get-cell`).
+///   3. For each binding, init the cell with the
+///      constructed closure: `closure:init-cell s_cell, s_closure`.
+///   4. Compile body (with all letfn* bindings still in
+///      scope).
+fn compileLetFnStar(
+    e: *Emitter,
+    bindings: []const FnBinding,
+    body: *const Tiny,
+    dst: u12,
+) CompileError!void {
+    // Reject duplicate binding names. Unlike let* (sequential
+    // shadowing OK), letfn* names are mutually visible — two
+    // with the same name create resolution ambiguity.
+    for (bindings, 0..) |b, i| {
+        for (bindings[0..i]) |b2| {
+            if (std.mem.eql(u8, b.name, b2.name)) return CompileError.DuplicateBinding;
+        }
+    }
+
+    const scope_mark = e.scope.items.len;
+    defer e.scope.shrinkRetainingCapacity(scope_mark);
+
+    // Step 1: allocate placeholder cells for each binding;
+    // push each into scope as .cell_slot. Cells must exist
+    // BEFORE any closure:make so the cap_desc local_cell_slot
+    // sources can reference them.
+    const cell_slots = try e.allocator.alloc(u12, bindings.len);
+    defer e.allocator.free(cell_slots);
+    for (bindings, 0..) |b, i| {
+        const s = try e.allocSlot();
+        cell_slots[i] = s;
+        try e.emit(vm.asm_.closureNewCell(s));
+        try e.scope.append(e.allocator, .{
+            .name = b.name,
+            .ref = .{ .cell_slot = s },
+        });
+    }
+
+    // Step 2: compile each fn (constructing closures). We
+    // allocate a fresh result slot for each closure value.
+    // The fn bodies see all letfn* names in scope (as
+    // .cell_slot via the entries we just pushed).
+    const closure_slots = try e.allocator.alloc(u12, bindings.len);
+    defer e.allocator.free(closure_slots);
+    for (bindings, 0..) |b, i| {
+        const cs = try e.allocSlot();
+        closure_slots[i] = cs;
+        // compileFn handles the named case via the
+        // placeholder pattern when the body references its
+        // own name. For letfn*, we don't pass `b.name` as
+        // the fn's self-name because the binding-name's cell
+        // is already in scope (so the fn body's references
+        // resolve via parent-chain capture); using the
+        // self-name machinery here would double-allocate.
+        try compileFn(e, null, b.params, b.body, cs);
+    }
+
+    // Step 3: init each cell with its closure.
+    for (bindings, 0..) |_, i| {
+        try e.emit(vm.asm_.closureInitCell(cell_slots[i], vm.Operand.slot(closure_slots[i])));
+    }
+
+    // Step 4: compile body in the now-fully-bound scope.
+    try compileExpr(e, body, dst);
 }
 
 /// Lower a function-call form: stage callee + args in a
@@ -2242,6 +2449,370 @@ test "compile 5a1: fn body uses inner let* — no captures of outer needed" {
     const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 5 }} } };
     const result = try runTiny(&arena, &call_form);
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+// ---- step 5c: named fn* + letfn* tests ----
+
+test "compile 5c: named fn* without self-reference compiles as anonymous" {
+    // ((fn* foo [x] x) 5) = 5 — body doesn't reference `foo`,
+    // so no placeholder cell allocated, no init-cell emitted.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{
+        .name = "foo",
+        .params = &.{"x"},
+        .body = &.{ .symbol = "x" },
+    } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 5 }} } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5c: named fn* with self-ref in dead branch — placeholder allocated, no infinite recursion" {
+    // ((fn* foo [x] (if true x (foo (+ x 1)))) 7) = 7
+    // Body references `foo` but only under the (always-false)
+    // else branch. Compiler must STILL emit the placeholder
+    // cell (pre-analysis is control-flow agnostic), but at
+    // runtime the recursive call never happens.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inc_x: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .int = 1 } } };
+    const recursive_call: Tiny = .{ .call = .{
+        .callee = &.{ .symbol = "foo" },
+        .args = &.{&inc_x},
+    } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &.{ .bool = true },
+        .then = &.{ .symbol = "x" },
+        .else_ = &recursive_call,
+    } };
+    const fn_form: Tiny = .{ .fn_star = .{
+        .name = "foo",
+        .params = &.{"x"},
+        .body = &body,
+    } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 7 }} } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 7), result.asFixnum());
+}
+
+test "compile 5c: named fn* with recursive ref in untaken branch — placeholder allocated, base branch executes" {
+    // ((fn* foo [x] (if true (+ x 1) (foo x))) 7) = 8
+    // The recursive call exists in code (forces placeholder
+    // allocation per pre-analysis) but lives in the untaken
+    // branch, so runtime executes only the base case.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inc_x: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .int = 1 } } };
+    const rec_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "foo" }, .args = &.{&.{ .symbol = "x" }} } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &.{ .bool = true },
+        .then = &inc_x,
+        .else_ = &rec_call,
+    } };
+    const fn_form: Tiny = .{ .fn_star = .{ .name = "foo", .params = &.{"x"}, .body = &body } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 7 }} } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 8), result.asFixnum());
+}
+
+test "compile 5c: named fn* in let — recursive reference works after let-binding scope" {
+    // (let* [f (fn* fact [n] (if true n (fact (+ n 1))))] (f 5)) = 5
+    // The named self-ref creates a cell that's INSIDE the
+    // fn-creating expression (not in let-binding's slot), so
+    // the closure remains callable after the let binding's
+    // value is consumed.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inc_n: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 1 } } };
+    const rec_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "fact" }, .args = &.{&inc_n} } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &.{ .bool = true },
+        .then = &.{ .symbol = "n" },
+        .else_ = &rec_call,
+    } };
+    const fn_form: Tiny = .{ .fn_star = .{ .name = "fact", .params = &.{"n"}, .body = &body } };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{&.{ .int = 5 }} } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "f", .value = &fn_form }},
+        .body = &f_call,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5c: (letfn* [(f [x] (+ x 1))] (f 10)) = 11 — single binding" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f_body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .int = 1 } } };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{&.{ .int = 10 }} } };
+    const form: Tiny = .{ .letfn_star = .{
+        .bindings = &.{.{ .name = "f", .params = &.{"x"}, .body = &f_body }},
+        .body = &f_call,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 11), result.asFixnum());
+}
+
+test "compile 5c: (letfn* [(f [] (g)) (g [] 42)] (f)) = 42 — f calls g (forward ref)" {
+    // Demonstrates true forward reference: f's body references
+    // g, which is defined later in the binding group. The
+    // placeholder-cell pattern makes this work — g's cell
+    // exists before f's closure is constructed, so f can
+    // capture it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f_body: Tiny = .{ .call = .{ .callee = &.{ .symbol = "g" }, .args = &.{} } };
+    const g_body: Tiny = .{ .int = 42 };
+    const body: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } };
+    const form: Tiny = .{ .letfn_star = .{
+        .bindings = &.{
+            .{ .name = "f", .params = &.{}, .body = &f_body },
+            .{ .name = "g", .params = &.{}, .body = &g_body },
+        },
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "compile 5c: letfn* mutual recursion (dead branches only)" {
+    // (letfn* [(f [n] (if true n (g n)))
+    //          (g [n] (if true (+ n 10) (f n)))]
+    //   (g 5)) = 15
+    // Both bindings reference each other; both refs are in
+    // dead branches. Compiler must allocate cells for both,
+    // capture appropriately.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f_call_n: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{&.{ .symbol = "n" }} } };
+    const g_call_n: Tiny = .{ .call = .{ .callee = &.{ .symbol = "g" }, .args = &.{&.{ .symbol = "n" }} } };
+    const f_body: Tiny = .{ .if_ = .{
+        .test_ = &.{ .bool = true },
+        .then = &.{ .symbol = "n" },
+        .else_ = &g_call_n,
+    } };
+    const g_body_then: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 10 } } };
+    const g_body: Tiny = .{ .if_ = .{
+        .test_ = &.{ .bool = true },
+        .then = &g_body_then,
+        .else_ = &f_call_n,
+    } };
+    const body: Tiny = .{ .call = .{ .callee = &.{ .symbol = "g" }, .args = &.{&.{ .int = 5 }} } };
+    const form: Tiny = .{ .letfn_star = .{
+        .bindings = &.{
+            .{ .name = "f", .params = &.{"n"}, .body = &f_body },
+            .{ .name = "g", .params = &.{"n"}, .body = &g_body },
+        },
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 15), result.asFixnum());
+}
+
+test "compile 5c: named self shadowed by inner let — no placeholder, returns let value" {
+    // ((fn* foo [x] (let* [foo 5] foo)) 0) = 5
+    // The body's only reference to `foo` is inside a `let*`
+    // that rebinds it. Pre-analysis sees `foo` is NOT a free
+    // var of the body (because the inner let* binds it), so
+    // no placeholder cell is allocated, and `foo` inside the
+    // body resolves to the inner let* binding (= 5).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const inner_let: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "foo", .value = &.{ .int = 5 } }},
+        .body = &.{ .symbol = "foo" },
+    } };
+    const fn_form: Tiny = .{ .fn_star = .{ .name = "foo", .params = &.{"x"}, .body = &inner_let } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 0 }} } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5c: named self shadows outer binding — body sees the closure, not outer foo" {
+    // (let* [foo 123] ((fn* foo [] foo)))
+    // Inside the fn body, `foo` resolves to the self-name
+    // (= the closure itself), NOT the outer let-bound 123.
+    // Calling the fn returns the closure value (kind .function).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{ .name = "foo", .params = &.{}, .body = &.{ .symbol = "foo" } } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{} } };
+    const outer: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "foo", .value = &.{ .int = 123 } }},
+        .body = &call_form,
+    } };
+    const result = try runTiny(&arena, &outer);
+    try testing.expect(result.kind() == .function);
+}
+
+test "compile 5c: named fn* param shadows self-name (intentional Tiny semantics)" {
+    // ((fn* foo [foo] foo) 7) = 7
+    // The param `foo` shadows the self-name. Pre-analysis
+    // sees `foo` is NOT a free var of the body (because the
+    // param binds it), so no placeholder is allocated, and
+    // the body's `foo` resolves to the param (= 7).
+    // (Peer-AI turn 46: pin behavior with explicit test.)
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_form: Tiny = .{ .fn_star = .{ .name = "foo", .params = &.{"foo"}, .body = &.{ .symbol = "foo" } } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{&.{ .int = 7 }} } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 7), result.asFixnum());
+}
+
+test "compile 5c: letfn binding captures both another letfn binding and outer let binding" {
+    // (let* [x 10]
+    //   (letfn* [(f [] (+ x (g)))
+    //            (g [] 5)]
+    //     (f))) = 15
+    // f's closure capture descriptor has two sources: one for
+    // the outer let's x (cell_slot in outer frame) and one
+    // for g (cell_slot in letfn frame). Validates mixed-source
+    // capture descriptors compose correctly (peer-AI turn 46).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const g_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "g" }, .args = &.{} } };
+    const f_body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &g_call } };
+    const g_body: Tiny = .{ .int = 5 };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } };
+    const letfn: Tiny = .{ .letfn_star = .{
+        .bindings = &.{
+            .{ .name = "f", .params = &.{}, .body = &f_body },
+            .{ .name = "g", .params = &.{}, .body = &g_body },
+        },
+        .body = &f_call,
+    } };
+    const outer: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 10 } }},
+        .body = &letfn,
+    } };
+    const result = try runTiny(&arena, &outer);
+    try testing.expectEqual(@as(i64, 15), result.asFixnum());
+}
+
+test "compile 5c: letfn* with three bindings, chained calls" {
+    // (letfn* [(a [] (b))
+    //          (b [] (c))
+    //          (c [] 7)]
+    //   (a)) = 7
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a_body: Tiny = .{ .call = .{ .callee = &.{ .symbol = "b" }, .args = &.{} } };
+    const b_body: Tiny = .{ .call = .{ .callee = &.{ .symbol = "c" }, .args = &.{} } };
+    const c_body: Tiny = .{ .int = 7 };
+    const body: Tiny = .{ .call = .{ .callee = &.{ .symbol = "a" }, .args = &.{} } };
+    const form: Tiny = .{ .letfn_star = .{
+        .bindings = &.{
+            .{ .name = "a", .params = &.{}, .body = &a_body },
+            .{ .name = "b", .params = &.{}, .body = &b_body },
+            .{ .name = "c", .params = &.{}, .body = &c_body },
+        },
+        .body = &body,
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 7), result.asFixnum());
+}
+
+test "compile 5c: letfn* shadows outer let binding" {
+    // (let* [f 10] (letfn* [(f [] 5)] (f))) = 5
+    // Inner letfn* `f` shadows outer let* `f`.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f_body: Tiny = .{ .int = 5 };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } };
+    const inner: Tiny = .{ .letfn_star = .{
+        .bindings = &.{.{ .name = "f", .params = &.{}, .body = &f_body }},
+        .body = &f_call,
+    } };
+    const outer: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "f", .value = &.{ .int = 10 } }},
+        .body = &inner,
+    } };
+    const result = try runTiny(&arena, &outer);
+    try testing.expectEqual(@as(i64, 5), result.asFixnum());
+}
+
+test "compile 5c: letfn* binding captures outer let binding" {
+    // (let* [x 100]
+    //   (letfn* [(f [] x)]
+    //     (f))) = 100
+    // letfn binding f captures outer x.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f_body: Tiny = .{ .symbol = "x" };
+    const f_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } };
+    const inner: Tiny = .{ .letfn_star = .{
+        .bindings = &.{.{ .name = "f", .params = &.{}, .body = &f_body }},
+        .body = &f_call,
+    } };
+    const outer: Tiny = .{ .let_star = .{
+        .bindings = &.{.{ .name = "x", .value = &.{ .int = 100 } }},
+        .body = &inner,
+    } };
+    const result = try runTiny(&arena, &outer);
+    try testing.expectEqual(@as(i64, 100), result.asFixnum());
+}
+
+test "compile 5c: letfn* — body sees bindings (calls one of them)" {
+    // (letfn* [(f [] 99) (g [] 0)] (f)) = 99
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form: Tiny = .{ .letfn_star = .{
+        .bindings = &.{
+            .{ .name = "f", .params = &.{}, .body = &.{ .int = 99 } },
+            .{ .name = "g", .params = &.{}, .body = &.{ .int = 0 } },
+        },
+        .body = &.{ .call = .{ .callee = &.{ .symbol = "f" }, .args = &.{} } },
+    } };
+    const result = try runTiny(&arena, &form);
+    try testing.expectEqual(@as(i64, 99), result.asFixnum());
+}
+
+test "compile 5c: letfn* duplicate name → DuplicateBinding" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form: Tiny = .{ .letfn_star = .{
+        .bindings = &.{
+            .{ .name = "f", .params = &.{}, .body = &.{ .int = 1 } },
+            .{ .name = "f", .params = &.{}, .body = &.{ .int = 2 } },
+        },
+        .body = &.{ .symbol = "f" },
+    } };
+    try testing.expectError(CompileError.DuplicateBinding, compileTiny(arena.allocator(), &form));
+}
+
+test "compile 5c: letfn* body scope properly restored after letfn*" {
+    // (let* [x 1]
+    //   (letfn* [(x [] 99)]  ; shadow x as a fn
+    //     (x))
+    //   ;; outer x scope must still see x as 1 (but we test
+    //   ;; via a do form to chain two reads)
+    //   ) — Since we don't have do here at the top level
+    //   yet, use:
+    // (let* [x 1
+    //        a (letfn* [(x [] 99)] (x))
+    //        b x]
+    //   (+ a b)) = 99 + 1 = 100
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fn_body: Tiny = .{ .int = 99 };
+    const fn_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "x" }, .args = &.{} } };
+    const letfn: Tiny = .{ .letfn_star = .{
+        .bindings = &.{.{ .name = "x", .params = &.{}, .body = &fn_body }},
+        .body = &fn_call,
+    } };
+    const add_form: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "a" }, .rhs = &.{ .symbol = "b" } } };
+    const let_form: Tiny = .{ .let_star = .{
+        .bindings = &.{
+            .{ .name = "x", .value = &.{ .int = 1 } },
+            .{ .name = "a", .value = &letfn },
+            .{ .name = "b", .value = &.{ .symbol = "x" } },
+        },
+        .body = &add_form,
+    } };
+    const result = try runTiny(&arena, &let_form);
+    try testing.expectEqual(@as(i64, 100), result.asFixnum());
 }
 
 test "compile: arena cleanup releases code+consts atomically" {

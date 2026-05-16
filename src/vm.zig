@@ -1069,8 +1069,8 @@ pub const VM = struct {
             .make => try self.execClosureMake(inst),
             .box_local => try self.execClosureBoxLocal(inst),
             .get_cell => try self.execClosureGetCell(inst),
-            // new_cell / init_cell wire in 5c (letfn* + named fn*).
-            .new_cell, .init_cell => return VmError.UnimplementedOpcode,
+            .new_cell => try self.execClosureNewCell(inst),
+            .init_cell => try self.execClosureInitCell(inst),
             _ => return VmError.BytecodeCorruption,
         }
     }
@@ -1113,6 +1113,58 @@ pub const VM = struct {
         const cell = try VM.asCell(cell_v);
         if (!cell.initialized) return VmError.UninitializedCell;
         try self.store(inst.a, cell.value);
+    }
+
+    /// `closure:new-cell A=slot _ _` — allocate an
+    /// uninitialized UpvalCell, store its cell-internal Value
+    /// at slot[A]. Step 5c: used by `letfn*` lowering and
+    /// named `fn*` self-reference to allocate placeholder
+    /// cells that subsequent `closure:make` instructions
+    /// capture (raw cell pointer copied), and that
+    /// `closure:init-cell` later fills in with the constructed
+    /// closure value.
+    ///
+    /// Per VM.md §6 (peer-AI turn 34). The cell starts with
+    /// `initialized = false`; reading it via U-operand or
+    /// `closure:get-cell` before init traps `:uninitialized-cell`.
+    fn execClosureNewCell(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        // Initial value doesn't matter (it'll be overwritten by
+        // init-cell before any read). Use nil as a sentinel
+        // recognizable in dumps.
+        const cell_v = self.allocCell(value_mod.nilValue(), false) catch return VmError.OutOfMemory;
+        try self.store(inst.a, cell_v);
+    }
+
+    /// `closure:init-cell A=cell_slot B=value_op _` — fill an
+    /// uninitialized cell with a value, flip `initialized = true`.
+    /// Step 5c: used by `letfn*` and named `fn*` lowerings to
+    /// finalize placeholder cells with the constructed closure
+    /// value, after `closure:make` has constructed the closure
+    /// (which captured the still-uninitialized cell).
+    ///
+    /// Per VM.md §6 (peer-AI turn 34).
+    ///
+    /// Errors:
+    ///   - ExpectedCell if slot[A] doesn't hold a cell pointer.
+    ///   - InvalidCellState if the cell is already initialized
+    ///     (double-init). Indicates compiler bug.
+    fn execClosureInitCell(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        // Validate destination cell state BEFORE resolving B
+        // (peer-AI turn 46): the destination contract is the
+        // primary contract of init-cell. Reading a malformed
+        // source operand before checking the cell would surface
+        // the wrong error (e.g., UninitializedCell on the
+        // source upvalue instead of InvalidCellState on the
+        // already-initialized destination).
+        const cell_v = (try self.slotPtr(inst.a.index)).*;
+        const cell = try VM.asCell(cell_v);
+        if (cell.initialized) return VmError.InvalidCellState;
+        // B may be any operand kind that resolve() accepts.
+        const value = try self.resolve(inst.b);
+        cell.value = value;
+        cell.initialized = true;
     }
 
     /// `closure:make A=prototype_const B=cap_desc_imm C=result_slot`
@@ -1538,6 +1590,32 @@ pub const asm_ = struct {
             Closure_.get_cell,
             Operand.slot(dst),
             Operand.slot(cell_slot),
+            Operand.none,
+        );
+    }
+
+    /// `closure:new-cell A=slot` — allocate an uninitialized
+    /// UpvalCell, store cell pointer at slot[A]. Step 5c
+    /// placeholder cell for letfn* / named fn*.
+    pub fn closureNewCell(slot_idx: u12) Inst {
+        return Inst.primary(
+            .closure,
+            Closure_.new_cell,
+            Operand.slot(slot_idx),
+            Operand.none,
+            Operand.none,
+        );
+    }
+
+    /// `closure:init-cell A=cell_slot B=value_op` — fill
+    /// uninitialized cell at slot[A] with resolve(B); set
+    /// initialized=true. Step 5c letfn* / named fn* finalize.
+    pub fn closureInitCell(cell_slot: u12, value: Operand) Inst {
+        return Inst.primary(
+            .closure,
+            Closure_.init_cell,
+            Operand.slot(cell_slot),
+            value,
             Operand.none,
         );
     }
@@ -2867,6 +2945,176 @@ test "VM 5b: closure:make with local_cell_slot source populates closure.upvalues
     try testing.expectEqual(@as(usize, 1), closure.upvalues.len);
     try testing.expectEqual(@as(i64, 42), closure.upvalues[0].value.asFixnum());
     try testing.expect(closure.upvalues[0].initialized);
+}
+
+// ---- step 5c: placeholder cell tests ----
+
+test "VM 5c: closure:new-cell creates uninitialized cell" {
+    var code = [_]Inst{
+        asm_.closureNewCell(0),
+        asm_.returnSlot(0),
+    };
+    const routine = Routine{ .code = &code, .consts = &.{}, .slot_count = 1 };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.kind() == value_mod.Kind.cell_internal);
+    const cell = try VM.asCell(result);
+    try testing.expect(!cell.initialized);
+}
+
+test "VM 5c: U-operand resolve on uninitialized cell traps :uninitialized-cell" {
+    // Construct a closure with a single upvalue pointing to an
+    // uninitialized cell. Inner fn body tries to read it via
+    // u:0, which deref's the cell — should trap.
+    var child_code = [_]Inst{
+        asm_.moveFrom(0, Operand.upvalue(0)),
+        asm_.returnSlot(0),
+    };
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &.{},
+        .slot_count = 1,
+        .arity = 0,
+        .upvalue_count = 1,
+    };
+    var parent_consts = [_]Const{croutine(&child_routine)};
+    const parent_caps = [_]CaptureDescriptor{
+        .{ .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} },
+    };
+    var parent_code = [_]Inst{
+        asm_.closureNewCell(0), //         s0 = uninit cell
+        asm_.closureMake(0, 0, 1), //      s1 = closure capturing s0
+        asm_.callCall(1, 0, 2), //         call closure → child traps
+        asm_.returnSlot(2),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts,
+        .capture_descs = &parent_caps,
+        .slot_count = 3,
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.UninitializedCell, res);
+}
+
+test "VM 5c: closure:init-cell flips initialized=true and stores value" {
+    const consts = [_]Const{cval(value_mod.fromFixnum(42).?)};
+    var code = [_]Inst{
+        asm_.closureNewCell(0), //                     s0 = uninit cell
+        asm_.closureInitCell(0, Operand.constant(0)), // init s0 with 42
+        asm_.closureGetCell(1, 0), //                  s1 = *s0 = 42
+        asm_.returnSlot(1),
+    };
+    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 2 };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "VM 5c: closure:init-cell on already-initialized cell traps :invalid-cell-state" {
+    const consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
+    var code = [_]Inst{
+        asm_.closureNewCell(0),
+        asm_.closureInitCell(0, Operand.constant(0)), // first init OK
+        asm_.closureInitCell(0, Operand.constant(0)), // second init traps
+        asm_.returnNil(),
+    };
+    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.InvalidCellState, res);
+}
+
+test "VM 5c: closure:init-cell with non-slot A traps :invalid-operand-kind" {
+    // Per peer-AI turn 46: validate destination operand kind
+    // before any reads or writes.
+    const consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
+    var code = [_]Inst{
+        Inst.primary(
+            .closure,
+            Closure_.init_cell,
+            Operand.constant(0), // A=constant — invalid for init-cell dst
+            Operand.constant(0),
+            Operand.none,
+        ),
+        asm_.returnNil(),
+    };
+    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.InvalidOperandKind, res);
+}
+
+test "VM 5c: closure:init-cell on non-cell traps :expected-cell" {
+    const consts = [_]Const{cval(value_mod.fromFixnum(7).?)};
+    var code = [_]Inst{
+        asm_.loadConst(0, 0), //                       s0 = 7 (fixnum, not a cell)
+        asm_.closureInitCell(0, Operand.constant(0)),
+        asm_.returnNil(),
+    };
+    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.ExpectedCell, res);
+}
+
+test "VM 5c: placeholder pattern — new-cell + make + init enables self-recursion" {
+    // End-to-end: build a closure that captures itself via the
+    // placeholder pattern. Closure body just returns its
+    // upvalue (the closure itself). Calling the closure
+    // returns ... the closure itself.
+    //
+    // (fn* foo [] foo) — when called, returns foo.
+    var child_code = [_]Inst{
+        asm_.moveFrom(0, Operand.upvalue(0)), // s0 = u:0 = closure
+        asm_.returnSlot(0),
+    };
+    const child_routine = Routine{
+        .code = &child_code,
+        .consts = &.{},
+        .slot_count = 1,
+        .arity = 0,
+        .upvalue_count = 1,
+    };
+    var parent_consts = [_]Const{croutine(&child_routine)};
+    const parent_caps = [_]CaptureDescriptor{
+        .{ .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} },
+    };
+    var parent_code = [_]Inst{
+        asm_.closureNewCell(0), //                       s0 = uninit cell
+        asm_.closureMake(0, 0, 1), //                    s1 = closure capturing s0
+        asm_.closureInitCell(0, Operand.slot(1)), //     s0's cell = s1 (the closure)
+        asm_.callCall(1, 0, 2), //                       s2 = (closure) → returns closure
+        asm_.returnSlot(2),
+    };
+    const parent_routine = Routine{
+        .code = &parent_code,
+        .consts = &parent_consts,
+        .capture_descs = &parent_caps,
+        .slot_count = 3,
+    };
+
+    var vm = try VM.init(testing.allocator, &parent_routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    // Result should be a closure (kind .function).
+    try testing.expect(result.kind() == .function);
+    // Specifically, it should be the SAME closure we constructed
+    // (same routine pointer).
+    const c = VM.asClosure(result);
+    try testing.expectEqual(&child_routine, c.routine);
 }
 
 test "VM 5a1: same closure called twice — both invocations succeed" {

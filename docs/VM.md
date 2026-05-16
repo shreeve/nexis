@@ -1165,6 +1165,25 @@ Per peer-AI turn 28:
 - **2026-04-19** (spec commit): Initial draft. All contracts
   `proposed`. No implementation yet. Peer-AI turn 28 decisions
   embedded.
+- **2026-05-16** (§6 implementation): Step 5c lands
+  `closure:new-cell` and `closure:init-cell` opcode handlers
+  + asm helpers. `closure:new-cell A=slot` allocates an
+  uninitialized `UpvalCell` and stores its raw pointer at
+  slot[A] (kind `cell_internal`). `closure:init-cell
+  A=cell_slot B=value` flips a previously-allocated cell
+  from uninitialized to initialized, filling it with
+  `resolve(B)`. Errors: `:expected-cell` if slot[A] doesn't
+  hold a cell; `:invalid-cell-state` if cell is already
+  initialized (double-init indicates compiler bug);
+  `:invalid-operand-kind` if A isn't a slot. The placeholder-
+  cell pattern this enables (alloc cell → make closure
+  capturing cell → init cell with closure) is the
+  foundation for both `letfn*` and named `fn*` self-
+  reference (see COMPILER.md §5.6b + §5.5 implementation
+  amendment). No spec text changed — opcode contracts were
+  already pinned by turn 34; this is the implementation
+  landing.
+
 - **2026-05-16** (§6 — `closure:box-local` emission timing
   reverted to pre-analysis, peer-AI turn 44): the turn-40
   lazy-boxing emission timing was retracted as
