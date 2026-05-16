@@ -236,12 +236,35 @@ comptime {
 // Value of kind 22 (VALUE.md §2.2 `function`).
 // =============================================================================
 
+/// Typed entry in a routine's constant pool (peer-AI turn 40).
+///
+/// Routine prototypes are NOT user `Value`s; mixing them with
+/// ordinary values would let `mov:load-const` load a prototype
+/// into a slot and downstream ops produce malformed bytecode
+/// that's harder to detect than a clean operand-kind error.
+///
+/// The typed pool enforces: `mov:load-const` requires
+/// `Const.value`; `closure:make A=constant` requires
+/// `Const.routine`. Mismatch raises `:invalid-operand-kind`.
+///
+/// Step 5a0.5 introduces the type but only populates `.value`
+/// entries. Step 5a1 starts populating `.routine` entries when
+/// `closure:make` lowering lands.
+pub const Const = union(enum) {
+    value: Value,
+    /// Step 5a1 placeholder — not yet populated by the compiler
+    /// or tested. Spec lives in VM.md §5 (typed constant pool
+    /// per turn 40 amendment).
+    routine: *const Routine,
+};
+
 pub const Routine = struct {
     /// Bytecode instructions.
     code: []const Inst,
-    /// Per-routine constant pool. Constant operands (`C#`) index into
-    /// this array.
-    consts: []const Value,
+    /// Per-routine typed constant pool. Constant operands (`C#`)
+    /// index into this array; the operand-using opcode determines
+    /// which `Const` variant is required.
+    consts: []const Const,
     /// Slot count. The frame reserves this many `Value` slots on
     /// invocation.
     slot_count: u16,
@@ -429,13 +452,23 @@ pub const VM = struct {
     }
 
     /// Resolve an operand to a `Value` (read side).
+    ///
+    /// For `.constant` operands the typed `Const` pool requires
+    /// the entry to be `Const.value`. A `Const.routine` entry
+    /// raises `InvalidOperandKind` (peer-AI turn 40 typed-pool
+    /// enforcement) — `closure:make` is the only opcode that
+    /// reads routine constants, and it does so via a dedicated
+    /// path, not through generic `resolve()`.
     fn resolve(self: *VM, op: Operand) VmError!Value {
         return switch (op.kind) {
             .slot => (try self.slotPtr(op.index)).*,
             .constant => blk: {
                 const consts = self.currentFrame().routine.consts;
                 if (op.index >= consts.len) return VmError.OperandOutOfRange;
-                break :blk consts[op.index];
+                break :blk switch (consts[op.index]) {
+                    .value => |v| v,
+                    .routine => return VmError.InvalidOperandKind,
+                };
             },
             // Remaining kinds land with their respective opcode groups.
             .var_, .upvalue, .intern, .jump, .durable => VmError.UnimplementedOpcode,
@@ -724,7 +757,7 @@ fn addNumbers(lhs: value_mod.Value, rhs: value_mod.Value) VmError!value_mod.Valu
 
 pub fn makeRoutine(
     code: []const Inst,
-    consts: []const Value,
+    consts: []const Const,
     slot_count: u16,
     name: []const u8,
 ) Routine {
@@ -734,6 +767,15 @@ pub fn makeRoutine(
         .slot_count = slot_count,
         .name = name,
     };
+}
+
+/// Test-ergonomics helper: wrap a `Value` in `Const.value`.
+/// Lets test fixtures write `cval(value_mod.fromFixnum(7).?)`
+/// instead of `.{ .value = value_mod.fromFixnum(7).? }` for
+/// each constant-pool entry. Step 5a1 will add a paired
+/// `croutine(*const Routine)` helper for routine constants.
+pub fn cval(v: Value) Const {
+    return .{ .value = v };
 }
 
 /// Encoding helpers. Every opcode used in this commit has a
@@ -913,7 +955,7 @@ test "VM 5a0: slotPtr through backing stack with base_slot indirection" {
     // access; the test exists to pin the indirection so a
     // future "optimization" that stores a slice can't bypass
     // it silently.
-    const consts = [_]Value{value_mod.fromFixnum(42).?};
+    const consts = [_]Const{cval(value_mod.fromFixnum(42).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0), // s0 = 42
         asm_.returnSlot(0),
@@ -981,7 +1023,7 @@ test "VM: load-false into slot 0, return -> false" {
 }
 
 test "VM: load-const pulls a fixnum from the pool" {
-    const consts = [_]Value{value_mod.fromFixnum(12345).?};
+    const consts = [_]Const{cval(value_mod.fromFixnum(12345).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0),
         asm_.returnSlot(0),
@@ -996,7 +1038,7 @@ test "VM: load-const pulls a fixnum from the pool" {
 }
 
 test "VM: move copies one slot into another" {
-    const consts = [_]Value{value_mod.fromFixnum(77).?};
+    const consts = [_]Const{cval(value_mod.fromFixnum(77).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0), // slot[0] = 77
         asm_.move(1, 0), //      slot[1] = slot[0]
@@ -1137,9 +1179,9 @@ test "VM math:add: constant + constant = fixnum sum" {
     // The exact bytecode the tiny step-#2 compiler emits for `(+ 1 2)`:
     //   math:add  s0, c0, c1     ; s0 = 1 + 2
     //   call:return s0
-    const consts = [_]Value{
-        value_mod.fromFixnum(1).?,
-        value_mod.fromFixnum(2).?,
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(1).?),
+        cval(value_mod.fromFixnum(2).?),
     };
     var code = [_]Inst{
         asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
@@ -1158,9 +1200,9 @@ test "VM math:add: slot + slot through prelude staging" {
     // Demonstrates the path the eventual real compiler takes
     // when args have non-trivial sub-expressions: load each into
     // a slot first, then add.
-    const consts = [_]Value{
-        value_mod.fromFixnum(10).?,
-        value_mod.fromFixnum(32).?,
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(10).?),
+        cval(value_mod.fromFixnum(32).?),
     };
     var code = [_]Inst{
         asm_.loadConst(0, 0),
@@ -1177,9 +1219,9 @@ test "VM math:add: slot + slot through prelude staging" {
 }
 
 test "VM math:add: negative + negative" {
-    const consts = [_]Value{
-        value_mod.fromFixnum(-7).?,
-        value_mod.fromFixnum(-5).?,
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(-7).?),
+        cval(value_mod.fromFixnum(-5).?),
     };
     var code = [_]Inst{
         asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
@@ -1197,9 +1239,9 @@ test "VM math:add: i48-range sum wraps to IntegerOverflow" {
     // fixnum_max + 1 overflows i48 and (until bignum Scope B
     // lands) traps as IntegerOverflow rather than silently
     // wrapping or losing precision.
-    const consts = [_]Value{
-        value_mod.fromFixnum(value_mod.fixnum_max).?,
-        value_mod.fromFixnum(1).?,
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(value_mod.fixnum_max).?),
+        cval(value_mod.fromFixnum(1).?),
     };
     var code = [_]Inst{
         asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
@@ -1218,9 +1260,9 @@ test "VM math:add: non-fixnum operand surfaces KindMismatch" {
     // promotion); for step #2 we surface VM.md §13's existing
     // `:kind-mismatch` rather than introducing a parallel
     // taxonomy (peer-AI turn 33).
-    const consts = [_]Value{
-        value_mod.fromFloat(1.5),
-        value_mod.fromFixnum(2).?,
+    const consts = [_]Const{
+        cval(value_mod.fromFloat(1.5)),
+        cval(value_mod.fromFixnum(2).?),
     };
     var code = [_]Inst{
         asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
@@ -1238,9 +1280,9 @@ test "VM math:add: i48-range underflow traps as IntegerOverflow" {
     // The negative-side mirror of the positive overflow test
     // above (peer-AI turn 33: positive-only coverage missed
     // half the implementation).
-    const consts = [_]Value{
-        value_mod.fromFixnum(value_mod.fixnum_min).?,
-        value_mod.fromFixnum(-1).?,
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(value_mod.fixnum_min).?),
+        cval(value_mod.fromFixnum(-1).?),
     };
     var code = [_]Inst{
         asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
@@ -1259,9 +1301,9 @@ test "VM math:add: dst/src aliasing is well-defined (math:add s0, s0, c0)" {
     // writing the destination. Otherwise an aliased dst+lhs
     // (or dst+rhs) would silently produce wrong results once
     // future codegen reuses slots (peer-AI turn 33).
-    const consts = [_]Value{
-        value_mod.fromFixnum(1).?,
-        value_mod.fromFixnum(40).?,
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(1).?),
+        cval(value_mod.fromFixnum(40).?),
     };
     var code = [_]Inst{
         asm_.loadConst(0, 0), //                      s0 = 1
@@ -1277,9 +1319,9 @@ test "VM math:add: dst/src aliasing is well-defined (math:add s0, s0, c0)" {
 }
 
 test "VM math:add: dst/rhs aliasing (math:add s0, c0, s0)" {
-    const consts = [_]Value{
-        value_mod.fromFixnum(40).?,
-        value_mod.fromFixnum(1).?,
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(40).?),
+        cval(value_mod.fromFixnum(1).?),
     };
     var code = [_]Inst{
         asm_.loadConst(0, 1), //                      s0 = 1
@@ -1297,7 +1339,7 @@ test "VM math:add: dst/rhs aliasing (math:add s0, c0, s0)" {
 test "VM math:add: mixed slot+constant operand kinds" {
     // Pins resolve() behavior across kind combinations the
     // codegen will actually emit (peer-AI turn 33).
-    const consts = [_]Value{value_mod.fromFixnum(100).?};
+    const consts = [_]Const{cval(value_mod.fromFixnum(100).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0), //                       s0 = 100
         asm_.mathAdd(1, Operand.slot(0), Operand.constant(0)), // slot+const
@@ -1317,9 +1359,9 @@ test "VM jump:jmp skips past an instruction" {
     // jump:jmp 3                     ; skip past the next instruction
     // mov:load-const s0, c1          ; (skipped) would set s0 = 99
     // call:return s0                 ; return s0 = 1
-    const consts = [_]Value{
-        value_mod.fromFixnum(1).?,
-        value_mod.fromFixnum(99).?,
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(1).?),
+        cval(value_mod.fromFixnum(99).?),
     };
     var code = [_]Inst{
         asm_.loadConst(0, 0),
@@ -1388,7 +1430,7 @@ test "VM jump:if-false does NOT branch when test is true" {
 
 test "VM jump:if-false does NOT branch when test is fixnum 0 (truthy)" {
     // PLAN §6.2 surprise: 0 is TRUTHY in nexis.
-    const consts = [_]Value{value_mod.fromFixnum(0).?};
+    const consts = [_]Const{cval(value_mod.fromFixnum(0).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0), //                s0 = 0
         asm_.jumpIfFalse(3, Operand.slot(0)), // 0 is truthy → don't branch
@@ -1503,7 +1545,7 @@ test "VM jump: target == code.len traps OperandOutOfRange" {
 test "VM jump:if-false: constant operand as test resolves correctly" {
     // Conditional test operand can be any kind resolve() handles.
     // Constant pool entry → branch / fall through per its truthiness.
-    const consts = [_]Value{value_mod.fromBool(false)};
+    const consts = [_]Const{cval(value_mod.fromBool(false))};
     var code = [_]Inst{
         asm_.jumpIfFalse(3, Operand.constant(0)), // c0=false → branch
         asm_.returnNil(), // (skipped)
@@ -1545,9 +1587,9 @@ test "VM math:add: writing to a constant operand surfaces InvalidOperandKind" {
     // row, write-to-constant is an invalid operand kind in the
     // store context, NOT "known but not yet wired" — peer-AI
     // turn 35 holistic-review correction.
-    const consts = [_]Value{
-        value_mod.fromFixnum(1).?,
-        value_mod.fromFixnum(2).?,
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(1).?),
+        cval(value_mod.fromFixnum(2).?),
     };
     const bad: Inst = .{
         .kind = .primary,
@@ -1591,10 +1633,10 @@ test "VM: a multi-step routine round-trips values through slots" {
     // Load three fixnum constants into three slots, then pick the
     // middle one as the return value. Exercises the instruction loop
     // across multiple dispatches.
-    const consts = [_]Value{
-        value_mod.fromFixnum(10).?,
-        value_mod.fromFixnum(20).?,
-        value_mod.fromFixnum(30).?,
+    const consts = [_]Const{
+        cval(value_mod.fromFixnum(10).?),
+        cval(value_mod.fromFixnum(20).?),
+        cval(value_mod.fromFixnum(30).?),
     };
     var code = [_]Inst{
         asm_.loadConst(0, 0),

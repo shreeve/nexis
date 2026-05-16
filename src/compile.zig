@@ -194,7 +194,7 @@ pub const CompileError = error{
 /// deferred until the heap fn-kind is real.)
 pub const Compiled = struct {
     code: []const Inst,
-    consts: []const Value,
+    consts: []const vm.Const,
     slot_count: u16,
 
     pub fn toRoutine(self: Compiled, name: []const u8) Routine {
@@ -239,7 +239,7 @@ pub const Compiled = struct {
 const Emitter = struct {
     allocator: std.mem.Allocator,
     code: std.ArrayList(Inst) = .empty,
-    consts: std.ArrayList(Value) = .empty,
+    consts: std.ArrayList(vm.Const) = .empty,
     scope: std.ArrayList(LocalBinding) = .empty,
     slot_count: u16 = 0,
 
@@ -294,11 +294,20 @@ const Emitter = struct {
 
     /// Add a constant to the pool, return its index. Constants are
     /// not deduplicated in step #3 (correctness over polish).
-    fn addConst(self: *Emitter, v: Value) CompileError!u12 {
+    /// Step 5a0.5 widens to typed `Const` per peer-AI turn 40
+    /// — most callers want `addValueConst(v)` for an ordinary
+    /// `Value`; step 5a1 will add `addRoutineConst(*const Routine)`
+    /// for `closure:make` lowering.
+    fn addConst(self: *Emitter, c: vm.Const) CompileError!u12 {
         const idx = self.consts.items.len;
         if (idx >= 4096) return CompileError.ConstantPoolOverflow;
-        try self.consts.append(self.allocator, v);
+        try self.consts.append(self.allocator, c);
         return @intCast(idx);
+    }
+
+    /// Convenience: add a `Value` constant (the common case).
+    fn addValueConst(self: *Emitter, v: Value) CompileError!u12 {
+        return self.addConst(.{ .value = v });
     }
 
     /// Append an instruction to the code stream.
@@ -409,7 +418,7 @@ fn compileExpr(e: *Emitter, form: *const Tiny, dst: u12) CompileError!void {
 fn compileIntLiteral(e: *Emitter, n: i64, dst: u12) CompileError!void {
     const v = value_mod.fromFixnum(n) orelse
         return CompileError.IntegerOutOfFixnumRange;
-    const c = try e.addConst(v);
+    const c = try e.addValueConst(v);
     try e.emit(vm.asm_.loadConst(dst, c));
 }
 
@@ -425,8 +434,8 @@ fn compileAdd(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) Compile
             return CompileError.IntegerOutOfFixnumRange;
         const v_rhs = value_mod.fromFixnum(rhs.int) orelse
             return CompileError.IntegerOutOfFixnumRange;
-        const c_lhs = try e.addConst(v_lhs);
-        const c_rhs = try e.addConst(v_rhs);
+        const c_lhs = try e.addValueConst(v_lhs);
+        const c_rhs = try e.addValueConst(v_rhs);
         try e.emit(vm.asm_.mathAdd(dst, Operand.constant(c_lhs), Operand.constant(c_rhs)));
         return;
     }
