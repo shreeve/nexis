@@ -123,6 +123,12 @@ pub const Operand = packed struct(u16) {
     pub fn upvalue(i: u12) Operand {
         return .{ .kind = .upvalue, .index = i };
     }
+
+    /// Step #6a: V-kind operand referencing
+    /// `routine.var_table[i]`.
+    pub fn varRef(i: u12) Operand {
+        return .{ .kind = .var_, .index = i };
+    }
 };
 
 /// Instruction kind discriminator — primary vs extension (per PLAN
@@ -198,6 +204,14 @@ pub const Jump = enum(u6) {
     jmp = 0,
     if_true = 1,
     if_false = 2,
+    _,
+};
+
+/// Variants for the `var` group. Per VM.md §10 group #6.
+/// Step #6a wires `load_var` only; `store_var` lands in #6b.
+pub const VarOp = enum(u6) {
+    load_var = 0,
+    store_var = 1,
     _,
 };
 
@@ -351,8 +365,103 @@ pub const Routine = struct {
     /// against `closure:make`'s descriptor source count at
     /// closure-construction time.
     upvalue_count: u16 = 0,
+    /// Step #6a: per-routine Var table. The V operand index
+    /// resolves through this table (analogous to const_pool
+    /// for Values, capture_descs for closure construction).
+    /// Caller (compileSymbol fall-through, step #6c) interns
+    /// each referenced Var in the VM's Namespace and records
+    /// the *Var here. Resolution is O(1) at runtime.
+    var_table: []const *Var = &.{},
     /// Human-readable name for diagnostics. Non-owning.
     name: []const u8 = "<anonymous>",
+};
+
+/// A Var holds a mutable cell of a Value with stable identity
+/// across rebinds (matches Clojure's `def` semantics: `(def x 5)`
+/// then `(def x 10)` does NOT create a new Var; the same Var
+/// object's root is updated). Per PLAN §6.1 + VM.md §6, step #6a.
+///
+/// Staged allocation (peer-AI turn 49): same pattern as
+/// Closure/UpvalCell. Var lives in VM.runtime_arena; Value
+/// payload is the raw `*Var`. When real GC integration lands,
+/// this migrates to `heap.alloc(.var_, ...)` with a HeapHeader
+/// prefix and the Value encoding becomes `*HeapHeader`.
+///
+/// `bound`: false until the first `(def name val)` runs. Loads
+/// via `var:load-var` trap `:unbound-var` in that case. This
+/// is what makes forward references work — `(defn f [] (g))`
+/// compiles when g doesn't exist yet (g's Var is interned
+/// unbound), and only traps if f is called before g is bound.
+pub const Var = struct {
+    /// Symbol name (the Var's identity). The Namespace that
+    /// owns this Var owns the name's backing storage.
+    name: []const u8,
+    /// Current root value. Read by `var:load-var` / V-operand
+    /// resolve. Written by `var:store-var` (step #6b).
+    root: Value = value_mod.nilValue(),
+    /// True once `def` has set the root. Distinguishes
+    /// "intentionally nil" from "never bound".
+    bound: bool = false,
+    /// Reserved for metadata maps (doc, source location, etc.).
+    /// Wired in Phase 3+.
+    meta: Value = value_mod.nilValue(),
+};
+
+/// A namespace mapping symbol names to `*Var`. v1 has a single
+/// global namespace per VM; multi-namespace machinery lands
+/// later (peer-AI turn 49). Step #6a.
+///
+/// Lifetime: Var structs themselves live in VM.runtime_arena
+/// and are freed wholesale at `VM.deinit`. The HashMap's
+/// internal storage uses the same allocator the VM uses for
+/// its other ArrayLists (VM.allocator); freed in
+/// `Namespace.deinit`.
+pub const Namespace = struct {
+    /// Backs the HashMap's internal storage.
+    map_allocator: std.mem.Allocator,
+    /// Backs the Var struct allocations. Lifetime = VM lifetime.
+    var_allocator: std.mem.Allocator,
+    vars: std.StringHashMapUnmanaged(*Var) = .{},
+
+    pub fn init(
+        map_allocator: std.mem.Allocator,
+        var_allocator: std.mem.Allocator,
+    ) Namespace {
+        return .{
+            .map_allocator = map_allocator,
+            .var_allocator = var_allocator,
+        };
+    }
+
+    pub fn deinit(self: *Namespace) void {
+        // Var structs are arena-owned; freed wholesale at
+        // VM.deinit. Only the hash map's internal storage
+        // belongs to us here.
+        self.vars.deinit(self.map_allocator);
+        self.* = undefined;
+    }
+
+    /// Look up an existing Var. Returns null if no Var was
+    /// ever interned under `name`.
+    pub fn lookup(self: *const Namespace, name: []const u8) ?*Var {
+        return self.vars.get(name);
+    }
+
+    /// Get or create a Var for `name`. Newly-created Vars are
+    /// unbound (root = nil, bound = false). The compiler uses
+    /// this for forward references (step #6c).
+    ///
+    /// `name` lifetime: the caller must guarantee `name` outlives
+    /// the Namespace, OR pass a stable copy. v1 tests pass
+    /// string literals (program lifetime). Step #6c will dupe
+    /// from Tiny.symbol via the compile arena.
+    pub fn intern(self: *Namespace, name: []const u8) !*Var {
+        if (self.vars.get(name)) |v| return v;
+        const new_var = try self.var_allocator.create(Var);
+        new_var.* = .{ .name = name };
+        try self.vars.put(self.map_allocator, name, new_var);
+        return new_var;
+    }
 };
 
 /// Captured-binding cell. Heap object that holds one Value plus
@@ -539,6 +648,14 @@ pub const VmError = error{
     /// `closure:init-cell` was emitted out of order or skipped
     /// entirely.
     UninitializedCell,
+
+    /// V-operand resolve (or `var:load-var`) read a Var whose
+    /// `bound = false` — the Var was interned (e.g., by a
+    /// forward reference in another `defn`) but no `def` has
+    /// set its root yet. Per VM.md §13 `:unbound-var`
+    /// (peer-AI turn 49). Recoverable error (user can `def`
+    /// the var and retry).
+    UnboundVar,
 };
 
 // =============================================================================
@@ -568,6 +685,13 @@ pub const VM = struct {
     /// to avoid the cost on programs that never use variadic
     /// fns.
     heap: ?heap_mod.Heap = null,
+    /// Step #6a: global namespace for Vars. Lazy-initialized
+    /// on first access (no cost for programs that don't use
+    /// Vars). Var structs allocate from `runtime_arena`; the
+    /// HashMap's internal storage uses `allocator`.
+    /// v1 has a single global namespace; multi-namespace
+    /// machinery lands later.
+    namespace: ?Namespace = null,
     /// Where the top-level `call:return` stores the returned Value on
     /// halt.
     result: Value = value_mod.nilValue(),
@@ -612,6 +736,10 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *VM) void {
+        // Namespace's HashMap storage belongs to us (allocated
+        // via self.allocator). Free it explicitly. Var struct
+        // memory itself is arena-backed and gets freed below.
+        if (self.namespace) |*ns| ns.deinit();
         // Heap (if initialized) is arena-backed in this staged
         // VM path. Its live-list is only bookkeeping; all
         // memory is reclaimed by `runtime_arena.deinit()`
@@ -627,6 +755,16 @@ pub const VM = struct {
         self.stack.deinit(self.allocator);
         self.frames.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Step #6a: lazy-initialize the global Namespace on first
+    /// use. HashMap storage uses `self.allocator` (heap-grown);
+    /// Var structs use `runtime_arena` (lifetime = VM lifetime).
+    pub fn ensureNamespace(self: *VM) *Namespace {
+        if (self.namespace == null) {
+            self.namespace = Namespace.init(self.allocator, self.runtime_arena.allocator());
+        }
+        return &self.namespace.?;
     }
 
     /// Step 5e: lazy-initialize the rest-list heap on first use
@@ -786,8 +924,22 @@ pub const VM = struct {
                 if (!cell.initialized) return VmError.UninitializedCell;
                 break :blk cell.value;
             },
+            // Step #6a: V operand kind resolves through the
+            // current routine's var_table to the Var's root
+            // value. Unbound Vars (`!bound`) trap
+            // `:unbound-var` — this is what makes forward
+            // references work: compile time creates the Var,
+            // runtime traps only if the Var is read before
+            // any `def` has bound it.
+            .var_ => blk: {
+                const var_table = self.currentFrame().routine.var_table;
+                if (op.index >= var_table.len) return VmError.OperandOutOfRange;
+                const v = var_table[op.index];
+                if (!v.bound) return VmError.UnboundVar;
+                break :blk v.root;
+            },
             // Remaining kinds land with their respective opcode groups.
-            .var_, .intern, .jump, .durable => VmError.UnimplementedOpcode,
+            .intern, .jump, .durable => VmError.UnimplementedOpcode,
             // `unused` is a sentinel emitted by the assembler for
             // operand slots the opcode doesn't consume; calling
             // `resolve` on one is an opcode-handler bug.
@@ -895,8 +1047,9 @@ pub const VM = struct {
             .cmp => try self.execCmp(inst),
             .jump => try self.execJump(inst),
             .closure => try self.execClosure(inst),
+            .var_ => try self.execVar(inst),
             // Known but not yet implemented in this commit.
-            .var_, .coll, .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
+            .coll, .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
             // Unrecognized group byte — bytecode corruption.
             _ => return VmError.BytecodeCorruption,
         }
@@ -1498,6 +1651,37 @@ pub const VM = struct {
             _ => return VmError.BytecodeCorruption,
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Group `var` (VM.md §10 #6) — step #6a wires `load_var` only
+    // -------------------------------------------------------------------------
+
+    fn execVar(self: *VM, inst: Inst) VmError!void {
+        const variant: VarOp = @enumFromInt(inst.variant);
+        switch (variant) {
+            .load_var => try self.execVarLoadVar(inst),
+            // Reserved; lands in #6b.
+            .store_var => return VmError.UnimplementedOpcode,
+            _ => return VmError.BytecodeCorruption,
+        }
+    }
+
+    /// `var:load-var A=dst_slot B=var(index) _` — read the Var
+    /// at `routine.var_table[B.index]` and store its root value
+    /// into `slot[A]`. Step #6a. Traps `:unbound-var` if the
+    /// Var has never been bound by `def`.
+    ///
+    /// Semantically equivalent to `mov:move A=slot, B=var(idx)`
+    /// (the V operand kind goes through the same resolve()
+    /// path). The dedicated opcode exists for symmetry with
+    /// `var:store-var` (#6b) and for diagnostic clarity in
+    /// disassembly.
+    fn execVarLoadVar(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        if (inst.b.kind != .var_) return VmError.InvalidOperandKind;
+        const v = try self.resolve(inst.b);
+        try self.store(inst.a, v);
+    }
 };
 
 /// Numeric addition for the math:add opcode. Step #2 supports
@@ -1669,6 +1853,19 @@ pub const asm_ = struct {
             Operand.slot(slot_dst),
             lhs,
             rhs,
+        );
+    }
+
+    /// var:load-var dst var_idx  ; slot[dst] := routine.var_table[var_idx].root
+    /// Step #6a. Traps :unbound-var if the Var has never been
+    /// bound by `def`.
+    pub fn varLoadVar(slot_dst: u12, var_idx: u12) Inst {
+        return Inst.primary(
+            .var_,
+            VarOp.load_var,
+            Operand.slot(slot_dst),
+            Operand.varRef(var_idx),
+            Operand.none,
         );
     }
 
@@ -2008,17 +2205,17 @@ test "VM: exhausting bytecode without return surfaces BytecodeExhausted" {
 }
 
 test "VM: known-but-not-implemented group returns UnimplementedOpcode" {
-    // var_ group (6) with variant 0 — known group, not wired yet.
+    // coll group (7) with variant 0 — known group, not wired yet.
     //
     // **Placeholder rotation discipline** (peer-AI turn 37): when a
     // new group lands, this placeholder must rotate to the NEXT
-    // still-unwired group. History: math → jump → closure → var_.
-    // Next likely: var_ → coll → cmp → etc.
+    // still-unwired group. History: math → jump → closure → var_
+    // → coll. Next likely: coll → transient → hash → etc.
     // Use `runWithFuel` (not `run`) so an accidental rotation bug
     // trips fuel exhaustion instead of hanging the suite (22-min
     // hang in step #3 — don't repeat).
     const var_op = Inst.primary(
-        .var_,
+        .coll,
         @as(Mov, @enumFromInt(0)), // variant 0 — placeholder; only the group matters
         Operand.slot(0),
         Operand.slot(0),
@@ -2364,6 +2561,158 @@ test "VM cmp:lt: unimplemented variant (lte) returns UnimplementedOpcode" {
         asm_.returnNil(),
     };
     const routine = makeRoutine(&code, &.{}, 1, "lt-lte");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const res = vm.run();
+    try testing.expectError(VmError.UnimplementedOpcode, res);
+}
+
+// ---- step #6a: Var + Namespace + var:load-var tests ----
+
+test "VM #6a: Namespace.intern creates an unbound Var, lookup returns it" {
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "init"));
+    defer vm.deinit();
+    const ns = vm.ensureNamespace();
+    const v1 = try ns.intern("x");
+    try testing.expect(!v1.bound);
+    try testing.expect(v1.root.isNil());
+    // Re-intern returns the SAME Var (identity stable).
+    const v2 = try ns.intern("x");
+    try testing.expectEqual(v1, v2);
+    // Lookup of unknown returns null.
+    try testing.expect(ns.lookup("y") == null);
+}
+
+test "VM #6a: var:load-var returns var.root for bound var" {
+    var vm = try VM.init(
+        testing.allocator,
+        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
+    );
+    defer vm.deinit();
+
+    // Intern + bind x = 42 in the VM's namespace.
+    const ns = vm.ensureNamespace();
+    const x = try ns.intern("x");
+    x.root = value_mod.fromFixnum(42).?;
+    x.bound = true;
+
+    // Build a routine that references x via var_table[0] and
+    // patch the VM's top frame to use it. Direct manipulation —
+    // tests-only API; the compiler will set this up properly
+    // in step #6c.
+    const var_table = [_]*Var{x};
+    var code = [_]Inst{
+        asm_.varLoadVar(0, 0),
+        asm_.returnSlot(0),
+    };
+    const routine = Routine{
+        .code = &code,
+        .consts = &.{},
+        .slot_count = 1,
+        .var_table = &var_table,
+    };
+    // Reset the VM's frame to the new routine. (Hacky but
+    // matches what we did before compileTiny existed for the
+    // earlier VM tests.)
+    vm.frames.items[0].routine = &routine;
+    vm.frames.items[0].pc = 0;
+    vm.frames.items[0].slot_count = routine.slot_count;
+    // Stack already has 1 slot from the stub routine.
+    const result = try vm.run();
+    try testing.expect(result.isFixnum());
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "VM #6a: var:load-var on unbound Var traps :unbound-var" {
+    var vm = try VM.init(
+        testing.allocator,
+        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
+    );
+    defer vm.deinit();
+
+    const ns = vm.ensureNamespace();
+    const x = try ns.intern("undefined-yet"); // never bound
+
+    const var_table = [_]*Var{x};
+    var code = [_]Inst{
+        asm_.varLoadVar(0, 0),
+        asm_.returnSlot(0),
+    };
+    const routine = Routine{
+        .code = &code,
+        .consts = &.{},
+        .slot_count = 1,
+        .var_table = &var_table,
+    };
+    vm.frames.items[0].routine = &routine;
+    vm.frames.items[0].pc = 0;
+    vm.frames.items[0].slot_count = routine.slot_count;
+    const res = vm.run();
+    try testing.expectError(VmError.UnboundVar, res);
+}
+
+test "VM #6a: var:load-var operand index out of range traps :operand-out-of-range" {
+    var vm = try VM.init(
+        testing.allocator,
+        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
+    );
+    defer vm.deinit();
+
+    // Empty var_table, but instruction references index 5.
+    var code = [_]Inst{
+        asm_.varLoadVar(0, 5),
+        asm_.returnSlot(0),
+    };
+    const routine = Routine{
+        .code = &code,
+        .consts = &.{},
+        .slot_count = 1,
+        // var_table = default empty
+    };
+    vm.frames.items[0].routine = &routine;
+    vm.frames.items[0].pc = 0;
+    vm.frames.items[0].slot_count = routine.slot_count;
+    const res = vm.run();
+    try testing.expectError(VmError.OperandOutOfRange, res);
+}
+
+test "VM #6a: var:load-var with non-V B operand traps :invalid-operand-kind" {
+    var vm = try VM.init(
+        testing.allocator,
+        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
+    );
+    defer vm.deinit();
+
+    // Hand-build a malformed var:load-var with B as a slot
+    // operand instead of a var operand.
+    var code = [_]Inst{
+        Inst.primary(
+            .var_,
+            VarOp.load_var,
+            Operand.slot(0),
+            Operand.slot(0), // B should be var(idx); slot is invalid
+            Operand.none,
+        ),
+        asm_.returnNil(),
+    };
+    const routine = Routine{
+        .code = &code,
+        .consts = &.{},
+        .slot_count = 1,
+    };
+    vm.frames.items[0].routine = &routine;
+    vm.frames.items[0].pc = 0;
+    vm.frames.items[0].slot_count = routine.slot_count;
+    const res = vm.run();
+    try testing.expectError(VmError.InvalidOperandKind, res);
+}
+
+test "VM #6a: var:store-var unimplemented (#6b)" {
+    var code = [_]Inst{
+        Inst.primary(.var_, VarOp.store_var, Operand.varRef(0), Operand.slot(0), Operand.none),
+        asm_.returnNil(),
+    };
+    const routine = makeRoutine(&code, &.{}, 1, "store-var-stub");
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
     const res = vm.run();
