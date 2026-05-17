@@ -7,8 +7,9 @@ world-class performance. Multi-phase implementation driven by PLAN.md at
 the repository root.
 
 Phase 1 is COMPLETE — all 8 gates closed (PLAN.md §20.2). Phase 2
-is ~80% done: steps #1 through #7 of COMPILER.md §10 are shipped.
-That means:
+is ~85% done: steps #1 through #7 of COMPILER.md §10 are shipped,
+plus E1 (Tiny.literal + Interner), H1 (CLI runner), and #8a
+(macroexpand scaffold).
 
 - The VM has 7 wired opcode groups: mov, cmp, math, call,
   closure, jump, var.
@@ -22,13 +23,26 @@ That means:
   with forward references.
 - **Real `.nx` source compiles end-to-end** via `compileSource()`
   (step #7). The reader produces Forms, `lowerForm` translates
-  Form → Tiny IR, and the proven backend takes over. ~85
-  source-string tests exercise the full pipeline.
+  Form → Tiny IR, and the proven backend takes over.
+- **`bin/nexis` exists** (step H1). `nexis run FILE.nx` reads a
+  file, compiles + runs each top-level form, prints the final
+  result. Three working examples ship: `examples/hello.nx`,
+  `sum10.nx`, `forward-ref.nx`.
+- **Macroexpander scaffold landed** (step #8a). `MacroexpandContext`
+  + `HostMacroTable` + per-special-form traversal walker + depth
+  limit + lexical-shadowing-aware macro dispatch. With an empty
+  table (current default), the expander is a pure pass-through.
+  Spec pinned in `docs/MACROEXPAND.md` (peer-AI turn 56 review).
 
-Steps #8 through #11 remain:
-- **#8 next**: macroexpander (recursive-to-fixed-point expansion,
-  syntax-quote, auto-gensym, `#(...)` anon-fn lowering). Closes
-  the deferred-quote / collection-literal items pinned by #7.
+Steps #8b through #11 remain:
+- **#8b next**: host core macros (when/cond/and/or/->/->>/let/fn/loop)
+  using direct FormBuilder. NO runtime list/concat needed — these
+  macros construct output Forms directly. Peer-AI turn 56 ordering.
+- #8c: syntax-quote + unquote + auto-gensym + native `#%list` /
+  `#%concat` special forms. Closes the quoted-compound-collection
+  items deferred by #7.
+- #8d (defer to Phase 3): user-defined `defmacro` (requires
+  compile-time VM eval).
 - #9: try/catch/throw.
 - #10: error reporting hardening (SrcSpan threading end-to-end,
   structured CompileError).
@@ -44,6 +58,11 @@ Read this entire prompt before touching anything.
 - Branch:   main
 - HEAD:     check `git log -1 --oneline`. Recent commit chain
             (newest first):
+              8ca21a3 phase 2 step #8a: macroexpand scaffold + no-op traversal
+              0e50c77 phase 2 step #8 preflight: MACROEXPAND.md pinned
+              98a7d33 phase 2 step H1: minimal CLI runner — first .nx programs execute
+              97aa9dd phase 2 step E1: Tiny.literal + Interner integration
+              a85b281 docs: HANDOFF.md — full refresh after step #7 + POLS cleanup
               3dbfad6 docs: README — showcase real .nx source examples
               6f1123b phase 2 step #7: peer-AI turn 54 review fixes + docs
               c5d3f52 phase 2 step #7d: vars (def/defn/var) via Form
@@ -888,158 +907,107 @@ From PLAN.md §"Start here" and accumulated hard lessons:
   `vm.Operand` rely on this; if you add fields, mind the bit order.
 
 ═══════════════════════════════════════════════════════════════════════
-## 10. IMMEDIATE NEXT TASK — Phase 2 step #8 (macroexpander)
+## 10. IMMEDIATE NEXT TASK — Phase 2 step #8b (host core macros)
 
-Per COMPILER.md §10 #8: recursive-to-fixed-point macroexpander
-sitting between `src/reader.zig` and `src/compile.zig`'s
-`lowerForm`. Closes the items deferred during step #7:
-quoted symbols / keywords / collections, anonymous fn shorthand
-(`#(...)`), syntax-quote / unquote / unquote-splicing with
-auto-gensym hygiene. Per CLOJURE-REVIEW.md §1.1 the bootstrap
-sequence uses TWO stages: trivial renaming macros land first
-(e.g. `(defmacro let [& decl] (cons 'let* decl))`); later, after
-destructuring helpers exist, the user-facing `let` is redefined
-with full destructuring.
+**The macroexpander spec is pinned and the scaffold is shipped.**
 
-### Scope (high level — needs a fresh strategy turn before coding)
+Read `docs/MACROEXPAND.md` end-to-end (~25 min — 580 lines).
+It's the contract for steps #8b and #8c. Peer-AI turn 56
+applied 11 edits to the draft before any code landed; the
+amendment log at §12 lists each.
 
-**New module**: `src/macroexpand.zig`. Sits between
-`src/reader.zig` and `src/compile.zig`'s `lowerForm` in the
-pipeline:
+**Step #8a (DONE)**: `src/macroexpand.zig` ships with the
+scaffold:
+- `MacroexpandContext` + `MacroFn` + `HostMacroTable` +
+  `ExpandEnv` + `MAX_EXPANSION_DEPTH = 256`.
+- Per-special-form traversal (every Phase 2 special form has
+  its own walker per MACROEXPAND.md §2b table).
+- `quote` and `syntax_quote` both OPAQUE in #8a.
+- Lexical shadowing of macros works (tested with a custom
+  macro inside `(let* [my-macro 0] (my-macro))`).
+- Wired into `compile.compileFormFullWithMacros` /
+  `compileSourceFullWithMacros`. The CLI uses an empty
+  table by default — every `nexis run` invocation exercises
+  the scaffold even before #8b adds real macros.
+- 6 macroexpand tests + 2 compile-side integration tests.
+- New CompileError variants: `MacroDepthExceeded` (distinct,
+  per peer-AI turn 56 §1.7) and `MacroExpansionFailure`.
 
+**Step #8b (NEXT — start here)**: host core macros using
+direct FormBuilder. NO runtime list/concat required.
+
+Per MACROEXPAND.md §10 (#8b sub-step):
+
+```zig
+pub fn defaultMacros(allocator) !HostMacroTable {
+    var table: HostMacroTable = .empty;
+    try table.put(allocator, "when", expandWhen);
+    try table.put(allocator, "when-not", expandWhenNot);
+    try table.put(allocator, "and", expandAnd);
+    try table.put(allocator, "or", expandOr);    // uses gensym
+    try table.put(allocator, "cond", expandCond);
+    try table.put(allocator, "->", expandThreadFirst);
+    try table.put(allocator, "->>", expandThreadLast);
+    try table.put(allocator, "let", expandLetRename);   // → let*
+    try table.put(allocator, "fn", expandFnRename);     // → fn*
+    try table.put(allocator, "loop", expandLoopRename); // → loop*
+    return table;
+}
 ```
-source bytes → reader → Form tree → macroexpand → Form tree
-                                                        ↓
-                                                   lowerForm
-                                                        ↓
-                                                      Tiny
-                                                        ↓
-                                                  compileTinyWithNamespace
-                                                        ↓
-                                                     bytecode
+
+Each expander is 20-50 LOC. The critical one is `or` — it
+MUST use gensym to avoid double evaluation (MACROEXPAND.md
+§10.10):
+
+```clojure
+(or a b)   => (let* [g a] (if g g b))   ; g = gensym
 ```
 
-The macroexpander walks a Form tree, looking for compound lists
-whose head is a symbol bound to a macro Var; when found, it
-calls the macro fn at COMPILE TIME, passing the unevaluated
-form, and replaces the call site with the macro's result Form.
-Process repeats recursively to a fixed point.
+Decision matrix for `gensym` shape:
+- v1 format: `<base>__<counter>__auto__` (Clojure convention).
+- Counter on `MacroexpandContext.gensym_next` (already in
+  scaffold).
+- Allocate from `ctx.allocator` (the compile-time arena).
+- For #8b's `or`, only need one gensym per `or` expansion;
+  full syntax-quote `name#` machinery lands in #8c.
 
-**Closes deferred items from step #7**:
-- Quoted symbols / keywords / strings / compound collections
-  (the macroexpander emits quoted-Form output that must compile
-  to runtime Values — forces Tiny.literal: Value variant per
-  peer-AI turn 51 §Q3).
-- Anonymous fn shorthand `#(...)` — the reader's `anon_fn`
-  Datum lowers to `(fn* [%1 %2 ...] body)` per FORMS.md +
-  PLAN §14.2.
-- Syntax-quote ` ` ` + unquote `~` + splice `~@` with
-  auto-gensym hygiene for ` `# ` ` ` suffixed symbols (PLAN
-  §14.2).
-- Reader metadata `^{...}` propagation (if not deferred to
-  Phase 3+).
+After #8b:
+- Update CLI to populate the default macro table (no flag
+  needed — macros are always-on; that's the point).
+- Add `examples/cond.nx`, `examples/threading.nx` etc.
+- Tests: ~30-40 covering each macro + gensym hygiene + the
+  alias macros.
 
-**Bootstrap sequence** per CLOJURE-REVIEW.md §1.1:
-1. Stage 1 — trivial renaming macros in the host:
-   `(defmacro let [& decl] (cons 'let* decl))`. Just rename
-   user `let` to compiler `let*`; no destructuring; lets us
-   reach the next stage without needing full macro power.
-2. Stage 2 — once destructuring helpers exist (built in
-   stage 1 + plain Tiny), redefine user-facing `let` with the
-   full destructuring-aware version via `core.nx` (the stdlib
-   bootstrap that populates `stdlib/` per Phase 3).
+Estimated 1-2 sessions for #8b. Then #8c (syntax-quote +
+auto-gensym + native list/concat) is the subtle 2-3 session
+arc; that one needs another peer-AI strategy turn for the
+native-fn-vs-precompiled-routine decision.
 
-For step #8 itself, only stage-1-style trivial macros are
-required. Stage 2 is part of `core.nx` (Phase 3 work).
+### Scope already pinned
 
-**Discipline**: the Form trees produced by macroexpansion still
-go through the EXISTING `lowerForm` → `compileTiny` pipeline
-(steps #7a-#7d). The macroexpander is purely a Form→Form
-rewriter; it does NOT touch the Tiny IR or the backend. New
-Form datums (the macroexpansion result) must be valid Form
-shapes per `docs/FORMS.md`.
+The execution model, traversal rules, sub-step plan, error
+model, and macro semantics are spec'd. Do NOT re-derive
+them — read MACROEXPAND.md and code against it.
 
-### Strategy turn (DO THIS FIRST — peer-AI turn 55)
+Key reference points for #8b coding:
+- §1 MacroFn API + MacroexpandContext.
+- §2b per-special-form traversal table (already implemented
+  in #8a; #8b only ADDS macro fns to the table).
+- §4 + §4b auto-gensym lifecycle + SrcSpan provenance.
+- §10 sub-step #8b details.
+- §10.G `or` MUST use gensym (avoid double-eval). §10.H/I/J
+  spell out `and`/`cond`/threading exact shapes.
+- §10b FormBuilder helper sketch (add as needed).
 
-Before writing any code, draft a peer-AI strategy message on
-`conversation_id: "nexis-phase-1"` covering at minimum:
+### After step #8b ships
 
-1. **Calling macros at compile time** — the macroexpander
-   needs to *invoke* user-defined macro fns. That means
-   compile + run a macro fn against an unevaluated Form
-   argument. How does the macroexpander get a Compiled +
-   VM for the macro fn? Options:
-   (a) Use the same VM the runtime will use, but mark macro
-       Vars specially so eval can find them.
-   (b) Spin up a sub-VM for compile-time evaluation.
-   (c) Restrict v1 macros to interpreted Form-rewriters
-       written in Zig (no user-defined macros until Phase 3).
-   Per CLOJURE-REVIEW.md §1.1, the trivial-renaming
-   bootstrap macros are simple enough to interpret directly
-   without a VM round-trip. But user-defined macros require
-   real eval.
+- **#8c**: syntax-quote / unquote / unquote-splicing /
+  auto-gensym + native `#%list` / `#%concat` special forms.
+  Requires another peer-AI strategy turn for the native-fn-
+  Value-vs-precompiled-routine decision. ~2-3 sessions.
 
-2. **Quoted-symbol Value representation** — peer-AI turn 51
-   §Q2 noted that quoted symbols force adding `Tiny.literal:
-   Value` + Interner integration. Where does the VM's
-   Interner come from? VM.ensureInterner() analogous to
-   ensureNamespace? Lazy-init from runtime_arena?
-
-3. **Syntax-quote expansion algorithm** — recursive walk
-   producing `(list 'sym ...)` Form trees. Auto-gensym
-   environment (`GENSYM_ENV` in LispReader.java) maps
-   `foo#` to a fresh `foo__123__auto__` per expansion. v1
-   simplification: gensym at expansion time, not read time
-   (Clojure does the latter for historical reasons; the
-   peer-AI turn-7 review recommended the simpler model).
-
-4. **Anon-fn `#(...)` desugaring** — happens in the reader or
-   the macroexpander? FORMS.md may already specify. If reader,
-   the macroexpander just sees `(fn* [%1 ...] ...)` Forms with
-   the param vector synthesized. If macroexpander, the reader's
-   `anon_fn` Datum bubbles up to step #8.
-
-5. **Compile error vs macroexpand error** — should the
-   expander have its own error type (`MacroexpandError`) or
-   reuse `CompileError`? They're naturally distinct: expander
-   errors are about macro contract violations (`recur outside
-   tail`, `splicing outside syntax-quote already caught by
-   reader`, `macro returned non-Form`). Bucket into
-   `MacroExpansionFailure` initially; refine later.
-
-6. **Fixed-point loop termination** — recursive expansion can
-   diverge for misbehaved macros. Add a depth/iteration limit
-   (Clojure uses ~256; PLAN §14.2 should pin a number).
-
-7. **Quoting + macroexpansion ordering** — `(quote (defmacro
-   x))` should NOT expand the inner defmacro. Quote forms are
-   opaque to the expander.
-
-8. **What ABSOLUTELY must NOT regress** — every existing
-   phase2-test passes (308 tests at HEAD `3dbfad6`). Every
-   existing CompileError variant keeps its meaning. The
-   phase2-test build step still runs in <5s.
-
-### Estimated scope
-
-- New `src/macroexpand.zig`: ~500-700 LOC. Recursive walker,
-  fixed-point loop, GENSYM_ENV machinery, anon-fn desugaring
-  (if not in reader), syntax-quote expansion.
-- `Tiny.literal: Value` variant added in compile.zig + corresponding
-  compileLiteral arm + analyzer arms (trivial: literals are leaves).
-- `vm.zig` may need a public Interner field analogous to namespace
-  (lazy-init from runtime_arena) — see strategy Q2.
-- New CompileError variants OR a separate MacroExpansionFailure
-  error set.
-- ~30-40 new tests covering: trivial renaming macros, syntax-
-  quote on simple Forms, syntax-quote with unquote, auto-gensym
-  hygiene, anon-fn desugaring, depth-limit trap, malformed-macro
-  errors.
-- 1-2 strategy turns + 1-2 code review turns with peer AI.
-- Likely 3-5 sessions (this is the most semantically subtle
-  step in Phase 2).
-
-### After step #8 ships
+- **#8d (defer to Phase 3)**: user-defined `defmacro` — needs
+  compile-time VM eval. Significant scope.
 
 Steps #9-#11 in order:
   - #9 try/catch/throw per VM.md §12 minimal spec. Adds the
@@ -1048,6 +1016,8 @@ Steps #9-#11 in order:
   - #10 error reporting hardening: SrcSpan threaded end-to-end
     (Form.origin already preserved by reader; needs to flow
     into CompileError + macroexpand errors + runtime traces).
+    MACROEXPAND.md §4b already pins the synthetic-form-
+    provenance rule that #10 needs.
   - #11 golden + eval pipeline tests; close the Phase 2 gate
     per COMPILER.md §9.4. Add `bench/compiler.zig` per gate
     item 7 if not done in Phase 6 polish.
