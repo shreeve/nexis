@@ -101,7 +101,7 @@ pub fn build(b: *std.Build) void {
     list_mod.addImport("hash", hash_mod);
 
     const vector_mod = b.createModule(.{
-        .root_source_file = b.path("src/coll/rrb.zig"),
+        .root_source_file = b.path("src/coll/vector.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -118,14 +118,14 @@ pub fn build(b: *std.Build) void {
     bignum_mod.addImport("heap", heap_mod);
     bignum_mod.addImport("hash", hash_mod);
 
-    const hamt_mod = b.createModule(.{
-        .root_source_file = b.path("src/coll/hamt.zig"),
+    const champ_mod = b.createModule(.{
+        .root_source_file = b.path("src/coll/champ.zig"),
         .target = target,
         .optimize = optimize,
     });
-    hamt_mod.addImport("value", value_mod);
-    hamt_mod.addImport("heap", heap_mod);
-    hamt_mod.addImport("hash", hash_mod);
+    champ_mod.addImport("value", value_mod);
+    champ_mod.addImport("heap", heap_mod);
+    champ_mod.addImport("hash", hash_mod);
 
     const transient_mod = b.createModule(.{
         .root_source_file = b.path("src/coll/transient.zig"),
@@ -134,7 +134,7 @@ pub fn build(b: *std.Build) void {
     });
     transient_mod.addImport("value", value_mod);
     transient_mod.addImport("heap", heap_mod);
-    transient_mod.addImport("hamt", hamt_mod);
+    transient_mod.addImport("champ", champ_mod);
     transient_mod.addImport("vector", vector_mod);
 
     const codec_mod = b.createModule(.{
@@ -150,7 +150,7 @@ pub fn build(b: *std.Build) void {
     codec_mod.addImport("bignum", bignum_mod);
     codec_mod.addImport("list", list_mod);
     codec_mod.addImport("vector", vector_mod);
-    codec_mod.addImport("hamt", hamt_mod);
+    codec_mod.addImport("champ", champ_mod);
     // codec's inline tests import transient to exercise the
     // UnserializableKind error path for transient Values.
     codec_mod.addImport("transient", transient_mod);
@@ -166,7 +166,7 @@ pub fn build(b: *std.Build) void {
     gc_mod.addImport("bignum", bignum_mod);
     gc_mod.addImport("list", list_mod);
     gc_mod.addImport("vector", vector_mod);
-    gc_mod.addImport("hamt", hamt_mod);
+    gc_mod.addImport("champ", champ_mod);
     gc_mod.addImport("transient", transient_mod);
 
     const pool_mod = b.createModule(.{
@@ -210,7 +210,7 @@ pub fn build(b: *std.Build) void {
     db_mod.addImport("hash", hash_mod);
     db_mod.addImport("codec", codec_mod);
     db_mod.addImport("list", list_mod);
-    db_mod.addImport("hamt", hamt_mod);
+    db_mod.addImport("champ", champ_mod);
     db_mod.addImport("emdb", emdb_mod);
 
     gc_mod.addImport("db", db_mod);
@@ -228,7 +228,7 @@ pub fn build(b: *std.Build) void {
     dispatch_mod.addImport("list", list_mod);
     dispatch_mod.addImport("vector", vector_mod);
     dispatch_mod.addImport("bignum", bignum_mod);
-    dispatch_mod.addImport("hamt", hamt_mod);
+    dispatch_mod.addImport("champ", champ_mod);
     dispatch_mod.addImport("transient", transient_mod);
     dispatch_mod.addImport("db", db_mod);
     // dispatch is a one-way terminal: nothing depends on it. value
@@ -272,7 +272,7 @@ pub fn build(b: *std.Build) void {
         list: *std.Build.Module,
         vector: *std.Build.Module,
         bignum: *std.Build.Module,
-        hamt: *std.Build.Module,
+        champ: *std.Build.Module,
         transient: *std.Build.Module,
         gc: *std.Build.Module,
         codec: *std.Build.Module,
@@ -292,7 +292,7 @@ pub fn build(b: *std.Build) void {
         .list = list_mod,
         .vector = vector_mod,
         .bignum = bignum_mod,
-        .hamt = hamt_mod,
+        .champ = champ_mod,
         .transient = transient_mod,
         .gc = gc_mod,
         .codec = codec_mod,
@@ -316,14 +316,14 @@ pub fn build(b: *std.Build) void {
         .{ .name = "heap", .path = "src/heap.zig", .imports = &.{"value"} },
         .{ .name = "string", .path = "src/string.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "list", .path = "src/coll/list.zig", .imports = &.{ "value", "heap", "hash" } },
-        .{ .name = "vector", .path = "src/coll/rrb.zig", .imports = &.{ "value", "heap", "hash" } },
+        .{ .name = "vector", .path = "src/coll/vector.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "bignum", .path = "src/bignum.zig", .imports = &.{ "value", "heap", "hash" } },
-        .{ .name = "hamt", .path = "src/coll/hamt.zig", .imports = &.{ "value", "heap", "hash" } },
-        .{ .name = "transient", .path = "src/coll/transient.zig", .imports = &.{ "value", "heap", "hamt", "vector" } },
-        .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "hamt", "transient" } },
-        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "hamt", "transient", "db" } },
-        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "hamt", "transient", "db" } },
-        .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "hamt", "emdb" } },
+        .{ .name = "champ", .path = "src/coll/champ.zig", .imports = &.{ "value", "heap", "hash" } },
+        .{ .name = "transient", .path = "src/coll/transient.zig", .imports = &.{ "value", "heap", "champ", "vector" } },
+        .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "champ", "transient" } },
+        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "champ", "transient", "db" } },
+        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db" } },
+        .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list" } },
@@ -347,7 +347,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "vector")) siblings.vector
                 else if (std.mem.eql(u8, imp_name, "bignum")) siblings.bignum
                 else if (std.mem.eql(u8, imp_name, "intern")) siblings.intern
-                else if (std.mem.eql(u8, imp_name, "hamt")) siblings.hamt
+                else if (std.mem.eql(u8, imp_name, "champ")) siblings.champ
                 else if (std.mem.eql(u8, imp_name, "transient")) siblings.transient
                 else if (std.mem.eql(u8, imp_name, "gc")) siblings.gc
                 else if (std.mem.eql(u8, imp_name, "codec")) siblings.codec
@@ -460,21 +460,21 @@ pub fn build(b: *std.Build) void {
     const prop_vector_tests = b.addTest(.{ .root_module = prop_vector_mod });
     const run_prop_vector_tests = b.addRunArtifact(prop_vector_tests);
 
-    const prop_hamt_mod = b.createModule(.{
-        .root_source_file = b.path("test/prop/hamt.zig"),
+    const prop_champ_mod = b.createModule(.{
+        .root_source_file = b.path("test/prop/champ.zig"),
         .target = target,
         .optimize = optimize,
     });
-    prop_hamt_mod.addImport("value", value_mod);
-    prop_hamt_mod.addImport("heap", heap_mod);
-    prop_hamt_mod.addImport("hash", hash_mod);
-    prop_hamt_mod.addImport("hamt", hamt_mod);
-    prop_hamt_mod.addImport("list", list_mod);
-    prop_hamt_mod.addImport("vector", vector_mod);
-    prop_hamt_mod.addImport("dispatch", dispatch_mod);
+    prop_champ_mod.addImport("value", value_mod);
+    prop_champ_mod.addImport("heap", heap_mod);
+    prop_champ_mod.addImport("hash", hash_mod);
+    prop_champ_mod.addImport("champ", champ_mod);
+    prop_champ_mod.addImport("list", list_mod);
+    prop_champ_mod.addImport("vector", vector_mod);
+    prop_champ_mod.addImport("dispatch", dispatch_mod);
 
-    const prop_hamt_tests = b.addTest(.{ .root_module = prop_hamt_mod });
-    const run_prop_hamt_tests = b.addRunArtifact(prop_hamt_tests);
+    const prop_champ_tests = b.addTest(.{ .root_module = prop_champ_mod });
+    const run_prop_champ_tests = b.addRunArtifact(prop_champ_tests);
 
     const prop_gc_mod = b.createModule(.{
         .root_source_file = b.path("test/prop/gc.zig"),
@@ -487,7 +487,7 @@ pub fn build(b: *std.Build) void {
     prop_gc_mod.addImport("string", string_mod);
     prop_gc_mod.addImport("list", list_mod);
     prop_gc_mod.addImport("vector", vector_mod);
-    prop_gc_mod.addImport("hamt", hamt_mod);
+    prop_gc_mod.addImport("champ", champ_mod);
     prop_gc_mod.addImport("dispatch", dispatch_mod);
     prop_gc_mod.addImport("gc", gc_mod);
 
@@ -502,7 +502,7 @@ pub fn build(b: *std.Build) void {
     prop_transient_mod.addImport("value", value_mod);
     prop_transient_mod.addImport("heap", heap_mod);
     prop_transient_mod.addImport("hash", hash_mod);
-    prop_transient_mod.addImport("hamt", hamt_mod);
+    prop_transient_mod.addImport("champ", champ_mod);
     prop_transient_mod.addImport("vector", vector_mod);
     prop_transient_mod.addImport("transient", transient_mod);
     prop_transient_mod.addImport("dispatch", dispatch_mod);
@@ -524,7 +524,7 @@ pub fn build(b: *std.Build) void {
     prop_codec_mod.addImport("bignum", bignum_mod);
     prop_codec_mod.addImport("list", list_mod);
     prop_codec_mod.addImport("vector", vector_mod);
-    prop_codec_mod.addImport("hamt", hamt_mod);
+    prop_codec_mod.addImport("champ", champ_mod);
     prop_codec_mod.addImport("transient", transient_mod);
     prop_codec_mod.addImport("codec", codec_mod);
     prop_codec_mod.addImport("dispatch", dispatch_mod);
@@ -545,7 +545,7 @@ pub fn build(b: *std.Build) void {
     prop_db_mod.addImport("bignum", bignum_mod);
     prop_db_mod.addImport("list", list_mod);
     prop_db_mod.addImport("vector", vector_mod);
-    prop_db_mod.addImport("hamt", hamt_mod);
+    prop_db_mod.addImport("champ", champ_mod);
     prop_db_mod.addImport("codec", codec_mod);
     prop_db_mod.addImport("db", db_mod);
     prop_db_mod.addImport("dispatch", dispatch_mod);
@@ -585,7 +585,7 @@ pub fn build(b: *std.Build) void {
     bench_runner_mod.addImport("string", string_mod);
     bench_runner_mod.addImport("list", list_mod);
     bench_runner_mod.addImport("vector", vector_mod);
-    bench_runner_mod.addImport("hamt", hamt_mod);
+    bench_runner_mod.addImport("champ", champ_mod);
     bench_runner_mod.addImport("transient", transient_mod);
     bench_runner_mod.addImport("codec", codec_mod);
     bench_runner_mod.addImport("dispatch", dispatch_mod);
@@ -683,7 +683,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_list_tests.step);
     test_step.dependOn(&run_prop_bignum_tests.step);
     test_step.dependOn(&run_prop_vector_tests.step);
-    test_step.dependOn(&run_prop_hamt_tests.step);
+    test_step.dependOn(&run_prop_champ_tests.step);
     test_step.dependOn(&run_prop_gc_tests.step);
     test_step.dependOn(&run_prop_transient_tests.step);
     test_step.dependOn(&run_prop_codec_tests.step);

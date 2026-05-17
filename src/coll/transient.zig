@@ -8,8 +8,8 @@
 //! (owner-token epoch vs. Clojure's thread identity).
 //!
 //! v1 delivers "shallow" transients (TRANSIENT.md §1 Option B):
-//! mutation ops call the persistent backing operations (`hamt.mapAssoc`,
-//! `hamt.setConj`, `vector.conj`) underneath, updating the wrapper's
+//! mutation ops call the persistent backing operations (`champ.mapAssoc`,
+//! `champ.setConj`, `vector.conj`) underneath, updating the wrapper's
 //! `inner_header` field in place. Real in-place node editing
 //! (Option A, Clojure's performance advantage) is deferred to a
 //! Phase 6 commit.
@@ -25,7 +25,7 @@
 //!     src/coll/transient.zig
 //!     ├─ @import("value")
 //!     ├─ @import("heap")
-//!     ├─ @import("hamt")    — mapAssoc/Dissoc/Get/Count, setConj/Disj/Contains/Count, valueFromMapHeader, valueFromSetHeader
+//!     ├─ @import("champ")    — mapAssoc/Dissoc/Get/Count, setConj/Disj/Contains/Count, valueFromMapHeader, valueFromSetHeader
 //!     └─ @import("vector")  — conj/nth/count, valueFromVectorHeader
 //!
 //! Nothing imports `transient.zig`. `src/dispatch.zig` and
@@ -35,7 +35,7 @@
 const std = @import("std");
 const value = @import("value");
 const heap_mod = @import("heap");
-const hamt = @import("hamt");
+const champ = @import("champ");
 const vector = @import("vector");
 
 const Value = value.Value;
@@ -160,8 +160,8 @@ fn assertActiveSubkind(t: Value, expected_subkind: u16) TransientError!void {
 
 fn innerValueForSubkind(subkind: u16, h: *HeapHeader) Value {
     return switch (subkind) {
-        subkind_transient_map => hamt.valueFromMapHeader(h),
-        subkind_transient_set => hamt.valueFromSetHeader(h),
+        subkind_transient_map => champ.valueFromMapHeader(h),
+        subkind_transient_set => champ.valueFromSetHeader(h),
         subkind_transient_vector => vector.valueFromVectorHeader(h),
         else => unreachable,
     };
@@ -218,8 +218,8 @@ pub fn mapAssocBang(
     try assertActiveSubkind(t, subkind_transient_map);
     const h = Heap.asHeapHeader(t);
     const body = transientBody(h);
-    const old_v = hamt.valueFromMapHeader(body.inner_header);
-    const new_v = try hamt.mapAssoc(heap, old_v, key, val, elementHash, elementEq);
+    const old_v = champ.valueFromMapHeader(body.inner_header);
+    const new_v = try champ.mapAssoc(heap, old_v, key, val, elementHash, elementEq);
     body.inner_header = Heap.asHeapHeader(new_v);
     return t;
 }
@@ -234,8 +234,8 @@ pub fn mapDissocBang(
     try assertActiveSubkind(t, subkind_transient_map);
     const h = Heap.asHeapHeader(t);
     const body = transientBody(h);
-    const old_v = hamt.valueFromMapHeader(body.inner_header);
-    const new_v = try hamt.mapDissoc(heap, old_v, key, elementHash, elementEq);
+    const old_v = champ.valueFromMapHeader(body.inner_header);
+    const new_v = try champ.mapDissoc(heap, old_v, key, elementHash, elementEq);
     body.inner_header = Heap.asHeapHeader(new_v);
     return t;
 }
@@ -245,18 +245,18 @@ pub fn mapGetBang(
     key: Value,
     elementHash: *const fn (Value) u64,
     elementEq: *const fn (Value, Value) bool,
-) TransientError!hamt.MapLookup {
+) TransientError!champ.MapLookup {
     try assertActiveSubkind(t, subkind_transient_map);
     const body = transientBodyConst(Heap.asHeapHeader(t));
-    const v = hamt.valueFromMapHeader(body.inner_header);
-    return hamt.mapGet(v, key, elementHash, elementEq);
+    const v = champ.valueFromMapHeader(body.inner_header);
+    return champ.mapGet(v, key, elementHash, elementEq);
 }
 
 pub fn mapCountBang(t: Value) TransientError!usize {
     try assertActiveSubkind(t, subkind_transient_map);
     const body = transientBodyConst(Heap.asHeapHeader(t));
-    const v = hamt.valueFromMapHeader(body.inner_header);
-    return hamt.mapCount(v);
+    const v = champ.valueFromMapHeader(body.inner_header);
+    return champ.mapCount(v);
 }
 
 // =============================================================================
@@ -273,8 +273,8 @@ pub fn setConjBang(
     try assertActiveSubkind(t, subkind_transient_set);
     const h = Heap.asHeapHeader(t);
     const body = transientBody(h);
-    const old_v = hamt.valueFromSetHeader(body.inner_header);
-    const new_v = try hamt.setConj(heap, old_v, elem, elementHash, elementEq);
+    const old_v = champ.valueFromSetHeader(body.inner_header);
+    const new_v = try champ.setConj(heap, old_v, elem, elementHash, elementEq);
     body.inner_header = Heap.asHeapHeader(new_v);
     return t;
 }
@@ -289,8 +289,8 @@ pub fn setDisjBang(
     try assertActiveSubkind(t, subkind_transient_set);
     const h = Heap.asHeapHeader(t);
     const body = transientBody(h);
-    const old_v = hamt.valueFromSetHeader(body.inner_header);
-    const new_v = try hamt.setDisj(heap, old_v, elem, elementHash, elementEq);
+    const old_v = champ.valueFromSetHeader(body.inner_header);
+    const new_v = try champ.setDisj(heap, old_v, elem, elementHash, elementEq);
     body.inner_header = Heap.asHeapHeader(new_v);
     return t;
 }
@@ -303,15 +303,15 @@ pub fn setContainsBang(
 ) TransientError!bool {
     try assertActiveSubkind(t, subkind_transient_set);
     const body = transientBodyConst(Heap.asHeapHeader(t));
-    const v = hamt.valueFromSetHeader(body.inner_header);
-    return hamt.setContains(v, elem, elementHash, elementEq);
+    const v = champ.valueFromSetHeader(body.inner_header);
+    return champ.setContains(v, elem, elementHash, elementEq);
 }
 
 pub fn setCountBang(t: Value) TransientError!usize {
     try assertActiveSubkind(t, subkind_transient_set);
     const body = transientBodyConst(Heap.asHeapHeader(t));
-    const v = hamt.valueFromSetHeader(body.inner_header);
-    return hamt.setCount(v);
+    const v = champ.valueFromSetHeader(body.inner_header);
+    return champ.setCount(v);
 }
 
 // =============================================================================
@@ -393,7 +393,7 @@ test "TransientBody layout: 16 bytes, owner_token at 0, inner_header at 8" {
 test "transientFrom: wraps persistent map; subkind 0; owner_token nonzero" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const m = try hamt.mapEmpty(&heap);
+    const m = try champ.mapEmpty(&heap);
     const t = try transientFrom(&heap, m);
     try testing.expectEqual(Kind.transient, t.kind());
     try testing.expectEqual(subkind_transient_map, t.subkind());
@@ -405,7 +405,7 @@ test "transientFrom: wraps persistent map; subkind 0; owner_token nonzero" {
 test "transientFrom: wraps persistent set; subkind 1" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const s = try hamt.setEmpty(&heap);
+    const s = try champ.setEmpty(&heap);
     const t = try transientFrom(&heap, s);
     try testing.expectEqual(subkind_transient_set, t.subkind());
 }
@@ -436,7 +436,7 @@ test "transientFrom: rejects non-collection kinds with InvalidTransientInner" {
 test "transientFrom: two calls yield distinct owner tokens" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const m = try hamt.mapEmpty(&heap);
+    const m = try champ.mapEmpty(&heap);
     const t1 = try transientFrom(&heap, m);
     const t2 = try transientFrom(&heap, m);
     const b1 = transientBodyConst(Heap.asHeapHeader(t1));
@@ -449,7 +449,7 @@ test "transientFrom: two calls yield distinct owner tokens" {
 test "mapAssocBang + mapGetBang: round-trip on transient map" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const m = try hamt.mapEmpty(&heap);
+    const m = try champ.mapEmpty(&heap);
     const t = try transientFrom(&heap, m);
     const t2 = try mapAssocBang(&heap, t, value.fromKeywordId(1), value.fromFixnum(100).?, &synthHash, &synthEq);
     // Pointer stability: t and t2 are the same wrapper Value.
@@ -464,7 +464,7 @@ test "mapAssocBang + mapGetBang: round-trip on transient map" {
 test "mapAssocBang: multiple assoc operations" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const m = try hamt.mapEmpty(&heap);
+    const m = try champ.mapEmpty(&heap);
     var t = try transientFrom(&heap, m);
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
@@ -484,7 +484,7 @@ test "mapAssocBang: multiple assoc operations" {
 test "mapDissocBang: removes entry, updates count" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const m = try hamt.mapEmpty(&heap);
+    const m = try champ.mapEmpty(&heap);
     var t = try transientFrom(&heap, m);
     t = try mapAssocBang(&heap, t, value.fromKeywordId(1), value.fromFixnum(1).?, &synthHash, &synthEq);
     t = try mapAssocBang(&heap, t, value.fromKeywordId(2), value.fromFixnum(2).?, &synthHash, &synthEq);
@@ -499,7 +499,7 @@ test "mapDissocBang: removes entry, updates count" {
 test "setConjBang + setContainsBang: round-trip" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const s = try hamt.setEmpty(&heap);
+    const s = try champ.setEmpty(&heap);
     var t = try transientFrom(&heap, s);
     t = try setConjBang(&heap, t, value.fromKeywordId(1), &synthHash, &synthEq);
     t = try setConjBang(&heap, t, value.fromKeywordId(2), &synthHash, &synthEq);
@@ -512,7 +512,7 @@ test "setConjBang + setContainsBang: round-trip" {
 test "setDisjBang: removes element" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const s = try hamt.setEmpty(&heap);
+    const s = try champ.setEmpty(&heap);
     var t = try transientFrom(&heap, s);
     t = try setConjBang(&heap, t, value.fromKeywordId(1), &synthHash, &synthEq);
     t = try setDisjBang(&heap, t, value.fromKeywordId(1), &synthHash, &synthEq);
@@ -544,12 +544,12 @@ test "vectorConjBang + vectorNthBang: round-trip" {
 test "persistentBang: freezes wrapper and returns inner persistent Value" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const m = try hamt.mapEmpty(&heap);
+    const m = try champ.mapEmpty(&heap);
     var t = try transientFrom(&heap, m);
     t = try mapAssocBang(&heap, t, value.fromKeywordId(1), value.fromFixnum(99).?, &synthHash, &synthEq);
     const frozen = try persistentBang(t);
     try testing.expectEqual(Kind.persistent_map, frozen.kind());
-    try testing.expectEqual(@as(usize, 1), hamt.mapCount(frozen));
+    try testing.expectEqual(@as(usize, 1), champ.mapCount(frozen));
     // Wrapper's owner_token is now zero.
     const body = transientBodyConst(Heap.asHeapHeader(t));
     try testing.expectEqual(@as(u64, 0), body.owner_token);
@@ -558,7 +558,7 @@ test "persistentBang: freezes wrapper and returns inner persistent Value" {
 test "persistentBang: post-freeze ops return TransientFrozen" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const m = try hamt.mapEmpty(&heap);
+    const m = try champ.mapEmpty(&heap);
     const t = try transientFrom(&heap, m);
     _ = try persistentBang(t);
     // Every op now errors.
@@ -585,7 +585,7 @@ test "persistentBang: post-freeze ops return TransientFrozen" {
 test "persistentBang: inner_header survives post-freeze (for GC reachability)" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const m = try hamt.mapEmpty(&heap);
+    const m = try champ.mapEmpty(&heap);
     const t = try transientFrom(&heap, m);
     const inner_before = transientBodyConst(Heap.asHeapHeader(t)).inner_header;
     _ = try persistentBang(t);
@@ -598,7 +598,7 @@ test "persistentBang: inner_header survives post-freeze (for GC reachability)" {
 test "mapAssocBang on a set transient returns TransientKindMismatch" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const s = try hamt.setEmpty(&heap);
+    const s = try champ.setEmpty(&heap);
     const t_set = try transientFrom(&heap, s);
     try testing.expectError(
         TransientError.TransientKindMismatch,
@@ -609,7 +609,7 @@ test "mapAssocBang on a set transient returns TransientKindMismatch" {
 test "setConjBang on a map transient returns TransientKindMismatch" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const m = try hamt.mapEmpty(&heap);
+    const m = try champ.mapEmpty(&heap);
     const t_map = try transientFrom(&heap, m);
     try testing.expectError(
         TransientError.TransientKindMismatch,
@@ -620,7 +620,7 @@ test "setConjBang on a map transient returns TransientKindMismatch" {
 test "vectorConjBang on a map transient returns TransientKindMismatch" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const m = try hamt.mapEmpty(&heap);
+    const m = try champ.mapEmpty(&heap);
     const t_map = try transientFrom(&heap, m);
     try testing.expectError(
         TransientError.TransientKindMismatch,
@@ -631,7 +631,7 @@ test "vectorConjBang on a map transient returns TransientKindMismatch" {
 test "transient ops on a non-transient Value return TransientKindMismatch" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const m = try hamt.mapEmpty(&heap);
+    const m = try champ.mapEmpty(&heap);
     // Pass a persistent map Value (NOT a transient) to a transient op.
     try testing.expectError(
         TransientError.TransientKindMismatch,
@@ -644,8 +644,8 @@ test "transient ops on a non-transient Value return TransientKindMismatch" {
 test "transient session does not mutate source persistent" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const m0 = try hamt.mapEmpty(&heap);
-    const m1 = try hamt.mapAssoc(&heap, m0, value.fromKeywordId(1), value.fromFixnum(1).?, &synthHash, &synthEq);
+    const m0 = try champ.mapEmpty(&heap);
+    const m1 = try champ.mapAssoc(&heap, m0, value.fromKeywordId(1), value.fromFixnum(1).?, &synthHash, &synthEq);
     // Wrap m1 in a transient, do a bunch of mutations.
     var t = try transientFrom(&heap, m1);
     var i: u32 = 0;
@@ -654,11 +654,11 @@ test "transient session does not mutate source persistent" {
     }
     _ = try persistentBang(t);
     // m1 MUST still have exactly 1 entry.
-    try testing.expectEqual(@as(usize, 1), hamt.mapCount(m1));
-    const lookup = hamt.mapGet(m1, value.fromKeywordId(1), &synthHash, &synthEq);
+    try testing.expectEqual(@as(usize, 1), champ.mapCount(m1));
+    const lookup = champ.mapGet(m1, value.fromKeywordId(1), &synthHash, &synthEq);
     switch (lookup) {
         .present => |v| try testing.expectEqual(@as(i64, 1), v.asFixnum()),
         .absent => try testing.expect(false),
     }
-    try testing.expect(hamt.mapGet(m1, value.fromKeywordId(100), &synthHash, &synthEq) == .absent);
+    try testing.expect(champ.mapGet(m1, value.fromKeywordId(100), &synthHash, &synthEq) == .absent);
 }

@@ -1,4 +1,4 @@
-//! coll/hamt.zig — persistent map heap kind (Phase 1, commit 1).
+//! coll/champ.zig — persistent map + set heap kind (Phase 1).
 //!
 //! Authoritative spec: `docs/CHAMP.md`. Semantic framing:
 //! `docs/SEMANTICS.md` §2.6 (associative equality category) and §3.2
@@ -1768,7 +1768,7 @@ fn traceMapNode(node: *HeapHeader, shift: u8, visitor: anytype) void {
 // meaning is regular across both kinds.
 //
 // Commits where set shipped: this file's commit 2. Retirement
-// receipt: test/prop/hamt.zig S1..S9 (the set-category parallel of
+// receipt: test/prop/champ.zig S1..S9 (the set-category parallel of
 // the map category's M1..M11). After this commit, the three
 // equality categories (.sequential / .associative / .set) all have
 // concrete runtime members and property-test receipts.
@@ -2995,7 +2995,7 @@ fn traceSetNode(node: *HeapHeader, shift: u8, visitor: anytype) void {
 // Inline tests
 //
 // Unit-level invariants + trap coverage. Property tests live in
-// test/prop/hamt.zig.
+// test/prop/champ.zig.
 // =============================================================================
 
 // ---- Synthetic element callbacks for inline tests ----
@@ -3547,7 +3547,7 @@ test "single-entry-subtree promotion: dissoc inside a deep subtree pulls entry u
 // Unit-level invariants for the set kind. Mirrors the map test layout
 // but exercises set-specific shapes (no value column, no replace-
 // value case, contains bool instead of get union). Property tests
-// live in test/prop/hamt.zig (S1..S6).
+// live in test/prop/champ.zig (S1..S6).
 // =============================================================================
 
 test "setEmpty: subkind 0, count 0, isEmpty true" {

@@ -203,7 +203,8 @@ work.
 
 ### 5. Public API
 
-Lives in `src/coll/rrb.zig` (named for historical reasons; the v1
+Lives in `src/coll/vector.zig` (renamed from `rrb.zig` on 2026-05-16,
+peer-AI turn 52, to match the user-facing concept; the v1
 impl is plain trie, not RRB, per PLAN §23 #30).
 
 ```zig
@@ -300,7 +301,7 @@ above. The existing list-list fast-path stays (O(n) via
 `list.equalSeq`); the new vector-vector fast-path uses
 `vector.equalSeq`. Cross-kind pairs fall through to cursor-walk.
 
-`dispatch.zig` now imports `vector` (`@import("coll/rrb")` via the
+`dispatch.zig` now imports `vector` (`@import("vector")` via the
 `vector_mod` build wiring). Since dispatch is already a one-way
 terminal depending on every heap kind, this is additive.
 

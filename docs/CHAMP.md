@@ -7,14 +7,13 @@ Derivative from `PLAN.md` §9.1 + §23 #37, `docs/VALUE.md` §2.2,
 set by `docs/LIST.md` and `docs/VECTOR.md`. Those documents win on
 conflict. Reviewed against `CLOJURE-REVIEW.md` §2.2 and peer-AI turn 8.
 
-**Filename note.** The module ships as `src/coll/hamt.zig` for
-historical consistency with `PLAN.md` §22's pre-decision repository
-layout. The **algorithm is CHAMP** (Steindorfer & Vinju, OOPSLA 2015
-— separate data and node bitmaps, canonical layout), not classic
-Bagwell HAMT. Same pattern as `src/coll/rrb.zig` housing a plain
-32-way persistent vector (NOT RRB-relaxed) per PLAN §23 #30 / VECTOR.md.
-Classic HAMT is documented as a fallback (§1 "Out") only if CHAMP
-implementation hits an unforeseen blocker — it did not.
+**Filename note.** The module ships as `src/coll/champ.zig` (renamed
+from `hamt.zig` on 2026-05-16, peer-AI turn 52, to remove the
+doc/source name mismatch). The **algorithm is CHAMP** (Steindorfer &
+Vinju, OOPSLA 2015 — separate data and node bitmaps, canonical layout),
+not classic Bagwell HAMT. Classic HAMT was documented as a fallback
+(§1 "Out") only if CHAMP implementation hit an unforeseen blocker —
+it did not.
 
 This module ships the **associative** and **set** equality categories
 (hash-domain bytes `0xF1` and `0xF2`). These are the only two equality
@@ -320,7 +319,7 @@ formula authority lives in the code):
   selects entry width by kind; bitmap semantics are identical.
 
 The exact popcount expressions used at call sites live in
-`src/coll/hamt.zig` and are covered by inline unit tests.
+`src/coll/champ.zig` and are covered by inline unit tests.
 
 #### 4.4 Collision node (subkind 3)
 
@@ -665,7 +664,7 @@ the root body caches via the standard `HeapHeader.hash` slot.
 
 ### 8. Public API
 
-Lives in `src/coll/hamt.zig`. Map and set operations are prefixed for
+Lives in `src/coll/champ.zig`. Map and set operations are prefixed for
 clarity because both live in the same module.
 
 ```zig
@@ -848,13 +847,13 @@ Per peer-AI turn 8 and user confirmation:
 **Commit 1 — map core + associative infrastructure.** [LANDED at `b20c306`]
 
 - `docs/CHAMP.md` (this file).
-- `src/coll/hamt.zig` with:
+- `src/coll/champ.zig` with:
   - `.persistent_map` subkinds 0–3 fully implemented.
   - Map public API (`mapEmpty`, `mapFromEntries`, `mapAssoc`,
     `mapDissoc`, `mapGet`, `mapCount`, `mapIsEmpty`).
   - `hashMap`, `equalMap`, `MapIter`, dispatch integration.
-- `test/prop/hamt.zig` with map property tests M1–M11.
-- Inline map tests in `hamt.zig` (29 tests).
+- `test/prop/champ.zig` with map property tests M1–M11.
+- Inline map tests in `champ.zig` (29 tests).
 - `dispatch.zig` updates:
   - `heapHashBase` map arm.
   - `associativeEqual` helper.
@@ -863,7 +862,7 @@ Per peer-AI turn 8 and user confirmation:
 
 **Commit 2 — set parallel implementation.** [LANDED this commit]
 
-- `src/coll/hamt.zig` extended with the full set kind (parallel
+- `src/coll/champ.zig` extended with the full set kind (parallel
   PART 2 section):
   - `.persistent_set` subkinds 0–3. Bodies share header layout
     structs with the map side (`ChampSetRootBody`, `SetInteriorHeader`,
@@ -881,7 +880,7 @@ Per peer-AI turn 8 and user confirmation:
   - Parallel recursive ops: `champSetConjInNode`,
     `champSetDisjFromNode`, `champSetContains`, collision node
     versions of each.
-- `test/prop/hamt.zig` extended with set properties S1–S9
+- `test/prop/champ.zig` extended with set properties S1–S9
   (retirement receipt is S5 — cross-subkind array-set vs. CHAMP).
 - Inline set tests (13 tests parallel to the map ones).
 - `dispatch.zig` updates:
@@ -941,7 +940,7 @@ At structural cliff edges:
   value (use a custom hash-colliding test fixture) forcing collision
   nodes.
 
-#### 12.4 Property tests (`test/prop/hamt.zig`)
+#### 12.4 Property tests (`test/prop/champ.zig`)
 
 Commit 1 (map):
 
@@ -989,7 +988,7 @@ Listed so nothing silently slips the scope boundary.
 
 ### 14. What CHAMP.md does not cover
 
-- **`hamt.zig` implementation details** — lookup table for popcount,
+- **`champ.zig` implementation details** — lookup table for popcount,
   recursive node construction helpers, layout access functions. Those
   are module-internal and will be documented via inline comments, not
   here.

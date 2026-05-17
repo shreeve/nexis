@@ -216,8 +216,8 @@ Nothing in nexis is conceptually new. Every major design choice has a clear ance
 | **LMDB** (Howard Chu, 2011) | Memory-mapped B+ tree, copy-on-write pages, MVCC via dual meta-page commit, no-WAL crash safety, single-writer multi-reader concurrency | `emdb` — our storage engine is LMDB-class, pure-Zig, with added SIMD and prefix compression |
 | **Datomic** (Rich Hickey, 2012) | Database-as-value semantics, identity-as-stable-handle, time as first-class, snapshots as cheap values | `nexis.db` — durable refs, `with-tx` / `with-read-tx`, snapshot handles, future `as-of` reads |
 | **Clojure** (Rich Hickey, 2007) | Persistent immutable collections, keywords, `[]`/`{}`/`#{}` literals, macros + syntax-quote + auto-gensym, namespaces + vars, REPL redefinition, threading macros | Essentially the surface language |
-| **CHAMP** (Steindorfer & Vinju, OOPSLA 2015) | Bitmap-indexed trie with separate data/node bitmaps, canonicalization for equality speed | `src/coll/hamt.zig` — persistent map and set |
-| **RRB Trees** (Bagwell & Rompf, 2011) | Relaxed radix balanced tree for vectors with fast `concat` and `subvec` | `src/coll/rrb.zig` — persistent vector |
+| **CHAMP** (Steindorfer & Vinju, OOPSLA 2015) | Bitmap-indexed trie with separate data/node bitmaps, canonicalization for equality speed | `src/coll/champ.zig` — persistent map and set |
+| **RRB Trees** (Bagwell & Rompf, 2011) | Relaxed radix balanced tree for vectors with fast `concat` and `subvec` | `src/coll/vector.zig` — persistent vector |
 | **LuaJIT** (Mike Pall) | Register/slot VM, tail-call dispatch, operand-specialized opcodes (`ADDVV`/`ADDVN`), fixnum fast paths | The em-inherited ISA + our planned Phase 6 specialization |
 | **Lua 5.0** (Ierusalimschy et al., 2005) | Upvalue closure representation, register-based VM simplicity | Closure and upvalue model |
 | **Copy-and-Patch JIT** (Xu et al., PLDI 2021) | Template-based near-native code generation with ~500 LOC of glue | Future v2 JIT path (§19.5) |
@@ -1905,8 +1905,8 @@ Each phase has a crisp entry criterion (previous gate passed) and exit criterion
 - [ ] `src/intern.zig`: symbol and keyword intern tables.
 - [ ] `src/string.zig`: string heap kind.
 - [ ] `src/bignum.zig`: minimum viable arbitrary-precision integer (could wrap a library; prefer pure Zig).
-- [ ] `src/coll/hamt.zig`: persistent map and set.
-- [ ] `src/coll/rrb.zig`: persistent vector.
+- [ ] `src/coll/champ.zig`: persistent map and set.
+- [ ] `src/coll/vector.zig`: persistent vector.
 - [ ] `src/coll/list.zig`: immutable cons list.
 - [ ] `src/coll/transient.zig`: transient wrappers with owner token.
 - [ ] `src/hash.zig`: xxHash3-based hashing with structural combine for collections.
@@ -2020,8 +2020,8 @@ nexis/
 │   ├── string.zig
 │   ├── bignum.zig
 │   ├── coll/
-│   │   ├── hamt.zig                  persistent map + set
-│   │   ├── rrb.zig                   persistent vector
+│   │   ├── champ.zig                 persistent map + set
+│   │   ├── vector.zig                persistent vector
 │   │   ├── list.zig
 │   │   ├── transient.zig
 │   │   └── typed_vector.zig

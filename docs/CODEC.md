@@ -321,7 +321,7 @@ src/codec.zig
 ├── @import("bignum")
 ├── @import("list")
 ├── @import("vector")
-└── @import("hamt")
+└── @import("champ")
 ```
 
 This matches the `src/dispatch.zig` / `src/gc.zig` / `src/coll/transient.zig`

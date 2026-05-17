@@ -1,4 +1,4 @@
-//! test/prop/hamt.zig — randomized properties for the persistent map
+//! test/prop/champ.zig — randomized properties for the persistent map
 //! heap kind (CHAMP). Ships alongside commit 1; commit 2 extends this
 //! file with parallel set properties (S1–S9) when `persistent_set`
 //! lands.
@@ -39,7 +39,7 @@ const std = @import("std");
 const value = @import("value");
 const heap_mod = @import("heap");
 const hash_mod = @import("hash");
-const hamt = @import("hamt");
+const champ = @import("champ");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
 const dispatch = @import("dispatch");
@@ -89,7 +89,7 @@ test "M1: mapFromEntries + mapGet round-trip over 200 random maps" {
         // Generate DISTINCT keys by using a deterministic counter so
         // lookups have a predictable ground-truth. Interleave with
         // random values.
-        const entries = try gpa.alloc(hamt.Entry, n);
+        const entries = try gpa.alloc(champ.Entry, n);
         defer gpa.free(entries);
         for (entries, 0..) |*e, i| {
             e.* = .{
@@ -97,17 +97,17 @@ test "M1: mapFromEntries + mapGet round-trip over 200 random maps" {
                 .value = randValue(r),
             };
         }
-        const m = try hamt.mapFromEntries(&heap, entries, &dispatch.hashValue, &dispatch.equal);
-        try std.testing.expectEqual(n, hamt.mapCount(m));
+        const m = try champ.mapFromEntries(&heap, entries, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expectEqual(n, champ.mapCount(m));
         for (entries) |e| {
-            switch (hamt.mapGet(m, e.key, &dispatch.hashValue, &dispatch.equal)) {
+            switch (champ.mapGet(m, e.key, &dispatch.hashValue, &dispatch.equal)) {
                 .absent => try std.testing.expect(false),
                 .present => |v| try std.testing.expect(dispatch.equal(v, e.value)),
             }
         }
         // Absent key.
         const miss_key = value.fromFixnum(999_999_999).?;
-        try std.testing.expect(hamt.mapGet(m, miss_key, &dispatch.hashValue, &dispatch.equal) == .absent);
+        try std.testing.expect(champ.mapGet(m, miss_key, &dispatch.hashValue, &dispatch.equal) == .absent);
     }
 }
 
@@ -129,10 +129,10 @@ test "M2: random assoc/dissoc sequences preserve the entry set" {
         // Model map: a plain ArrayList of (key, value) pairs we maintain
         // in lockstep with the runtime map. At each step we compare
         // ground-truth to runtime lookup.
-        var model: std.ArrayList(hamt.Entry) = .empty;
+        var model: std.ArrayList(champ.Entry) = .empty;
         defer model.deinit(gpa);
 
-        var m = try hamt.mapEmpty(&heap);
+        var m = try champ.mapEmpty(&heap);
         const ops: usize = 30;
         var op: usize = 0;
         while (op < ops) : (op += 1) {
@@ -140,7 +140,7 @@ test "M2: random assoc/dissoc sequences preserve the entry set" {
             if (is_assoc) {
                 const k = value.fromFixnum(r.intRangeAtMost(i64, 0, 19)).?;
                 const v = randValue(r);
-                m = try hamt.mapAssoc(&heap, m, k, v, &dispatch.hashValue, &dispatch.equal);
+                m = try champ.mapAssoc(&heap, m, k, v, &dispatch.hashValue, &dispatch.equal);
                 // Update model: if key present, replace value; else append.
                 var found = false;
                 for (model.items) |*me| {
@@ -154,13 +154,13 @@ test "M2: random assoc/dissoc sequences preserve the entry set" {
             } else {
                 const idx = r.uintLessThan(usize, model.items.len);
                 const k = model.items[idx].key;
-                m = try hamt.mapDissoc(&heap, m, k, &dispatch.hashValue, &dispatch.equal);
+                m = try champ.mapDissoc(&heap, m, k, &dispatch.hashValue, &dispatch.equal);
                 _ = model.swapRemove(idx);
             }
             // After each op: count + all keys must match.
-            try std.testing.expectEqual(model.items.len, hamt.mapCount(m));
+            try std.testing.expectEqual(model.items.len, champ.mapCount(m));
             for (model.items) |me| {
-                switch (hamt.mapGet(m, me.key, &dispatch.hashValue, &dispatch.equal)) {
+                switch (champ.mapGet(m, me.key, &dispatch.hashValue, &dispatch.equal)) {
                     .absent => try std.testing.expect(false),
                     .present => |v| try std.testing.expect(dispatch.equal(v, me.value)),
                 }
@@ -186,19 +186,19 @@ test "M3: assoc replace-value updates value, count unchanged" {
         // Build a map of arbitrary size, then replace one random key's
         // value and verify.
         const n = r.intRangeAtMost(usize, 1, 25);
-        var m = try hamt.mapEmpty(&heap);
+        var m = try champ.mapEmpty(&heap);
         var idx: usize = 0;
         while (idx < n) : (idx += 1) {
             const k = value.fromFixnum(@intCast(idx)).?;
             const v = value.fromFixnum(@intCast(idx)).?;
-            m = try hamt.mapAssoc(&heap, m, k, v, &dispatch.hashValue, &dispatch.equal);
+            m = try champ.mapAssoc(&heap, m, k, v, &dispatch.hashValue, &dispatch.equal);
         }
         const pick = r.uintLessThan(usize, n);
         const k_pick = value.fromFixnum(@intCast(pick)).?;
         const v_new = value.fromFixnum(-42).?;
-        const m2 = try hamt.mapAssoc(&heap, m, k_pick, v_new, &dispatch.hashValue, &dispatch.equal);
-        try std.testing.expectEqual(hamt.mapCount(m), hamt.mapCount(m2));
-        switch (hamt.mapGet(m2, k_pick, &dispatch.hashValue, &dispatch.equal)) {
+        const m2 = try champ.mapAssoc(&heap, m, k_pick, v_new, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expectEqual(champ.mapCount(m), champ.mapCount(m2));
+        switch (champ.mapGet(m2, k_pick, &dispatch.hashValue, &dispatch.equal)) {
             .absent => try std.testing.expect(false),
             .present => |v| try std.testing.expect(dispatch.equal(v, v_new)),
         }
@@ -216,16 +216,16 @@ test "M4: assoc same-value returns same map pointer" {
     // existing value; result must be the same pointer.
     const sizes = [_]u32{ 0, 1, 5, 8, 9, 15, 40 };
     for (sizes) |size| {
-        var m = try hamt.mapEmpty(&heap);
+        var m = try champ.mapEmpty(&heap);
         var i: u32 = 0;
         while (i < size) : (i += 1) {
-            m = try hamt.mapAssoc(&heap, m, value.fromFixnum(@intCast(i)).?, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
+            m = try champ.mapAssoc(&heap, m, value.fromFixnum(@intCast(i)).?, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
         }
         if (size == 0) continue;
         // Assoc existing key with existing value.
         const k_pick = value.fromFixnum(@intCast(size / 2)).?;
         const v_existing = value.fromFixnum(@intCast(size / 2)).?;
-        const m2 = try hamt.mapAssoc(&heap, m, k_pick, v_existing, &dispatch.hashValue, &dispatch.equal);
+        const m2 = try champ.mapAssoc(&heap, m, k_pick, v_existing, &dispatch.hashValue, &dispatch.equal);
         try std.testing.expect(Heap.asHeapHeader(m) == Heap.asHeapHeader(m2));
     }
 }
@@ -248,12 +248,12 @@ test "M5: equality laws (reflexive, symmetric, pairwise transitive)" {
     var pool: [pool_size]Value = undefined;
     for (0..pool_size) |i| {
         const n = r.uintLessThan(usize, 15);
-        var m = try hamt.mapEmpty(&heap);
+        var m = try champ.mapEmpty(&heap);
         var j: usize = 0;
         while (j < n) : (j += 1) {
             const k = value.fromFixnum(r.intRangeAtMost(i64, 0, 20)).?;
             const v = value.fromFixnum(r.intRangeAtMost(i64, -100, 100)).?;
-            m = try hamt.mapAssoc(&heap, m, k, v, &dispatch.hashValue, &dispatch.equal);
+            m = try champ.mapAssoc(&heap, m, k, v, &dispatch.hashValue, &dispatch.equal);
         }
         pool[i] = m;
     }
@@ -310,7 +310,7 @@ test "M6: cross-subkind (array-map vs CHAMP) same entries hash AND equal (2000 t
     while (trial < trials) : (trial += 1) {
         // 1..8 distinct keys for array-map path.
         const n = r.intRangeAtMost(u32, 1, 8);
-        const entries = try gpa.alloc(hamt.Entry, n);
+        const entries = try gpa.alloc(champ.Entry, n);
         defer gpa.free(entries);
         for (entries, 0..) |*e, idx| {
             e.* = .{
@@ -319,20 +319,20 @@ test "M6: cross-subkind (array-map vs CHAMP) same entries hash AND equal (2000 t
             };
         }
         // Path A: pure array-map (stays subkind 0).
-        var am = try hamt.mapEmpty(&heap);
+        var am = try champ.mapEmpty(&heap);
         for (entries) |e| {
-            am = try hamt.mapAssoc(&heap, am, e.key, e.value, &dispatch.hashValue, &dispatch.equal);
+            am = try champ.mapAssoc(&heap, am, e.key, e.value, &dispatch.hashValue, &dispatch.equal);
         }
         try std.testing.expect(am.subkind() == 0);
 
         // Path B: grow to n+1 then dissoc the extra key → CHAMP.
         var ch = am;
         const extra_key = value.fromFixnum(@intCast(1_000_000 + trial)).?;
-        ch = try hamt.mapAssoc(&heap, ch, extra_key, value.fromFixnum(99).?, &dispatch.hashValue, &dispatch.equal);
+        ch = try champ.mapAssoc(&heap, ch, extra_key, value.fromFixnum(99).?, &dispatch.hashValue, &dispatch.equal);
         if (n >= 8) {
             try std.testing.expect(ch.subkind() == 1);
         }
-        ch = try hamt.mapDissoc(&heap, ch, extra_key, &dispatch.hashValue, &dispatch.equal);
+        ch = try champ.mapDissoc(&heap, ch, extra_key, &dispatch.hashValue, &dispatch.equal);
 
         // Equality and hash must agree regardless of whether ch is
         // actually CHAMP (it is, when n == 8) or stayed array-map.
@@ -349,9 +349,9 @@ test "M6: cross-subkind (array-map vs CHAMP) same entries hash AND equal (2000 t
 test "M7: map never equal to non-associative Values" {
     var heap = Heap.init(std.testing.allocator);
     defer heap.deinit();
-    const m = try hamt.mapAssoc(
+    const m = try champ.mapAssoc(
         &heap,
-        try hamt.mapEmpty(&heap),
+        try champ.mapEmpty(&heap),
         value.fromKeywordId(1),
         value.fromFixnum(1).?,
         &dispatch.hashValue,
@@ -374,7 +374,7 @@ test "M7: map never equal to non-associative Values" {
         try std.testing.expect(!dispatch.equal(other, m));
     }
     // Empty-map vs all of the above: never equal.
-    const em = try hamt.mapEmpty(&heap);
+    const em = try champ.mapEmpty(&heap);
     for (non_assoc) |other| {
         try std.testing.expect(!dispatch.equal(em, other));
     }
@@ -392,18 +392,18 @@ test "M8: assoc and dissoc never mutate source map" {
     const r = prng.random();
 
     // Build a random source map m_src of size 0..30.
-    var m_src = try hamt.mapEmpty(&heap);
-    var model: std.ArrayList(hamt.Entry) = .empty;
+    var m_src = try champ.mapEmpty(&heap);
+    var model: std.ArrayList(champ.Entry) = .empty;
     defer model.deinit(gpa);
     const n = r.uintLessThan(usize, 30);
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const k = value.fromFixnum(@intCast(i)).?;
         const v = randValue(r);
-        m_src = try hamt.mapAssoc(&heap, m_src, k, v, &dispatch.hashValue, &dispatch.equal);
+        m_src = try champ.mapAssoc(&heap, m_src, k, v, &dispatch.hashValue, &dispatch.equal);
         try model.append(gpa, .{ .key = k, .value = v });
     }
-    const src_count = hamt.mapCount(m_src);
+    const src_count = champ.mapCount(m_src);
     // Perform 40 random assoc/dissoc operations AGAINST m_src (not
     // updating m_src between). After each, m_src must still reflect
     // its original state exactly.
@@ -411,13 +411,13 @@ test "M8: assoc and dissoc never mutate source map" {
     while (ops < 40) : (ops += 1) {
         const is_assoc = r.boolean();
         if (is_assoc) {
-            _ = try hamt.mapAssoc(&heap, m_src, value.fromFixnum(9999).?, value.fromFixnum(0).?, &dispatch.hashValue, &dispatch.equal);
+            _ = try champ.mapAssoc(&heap, m_src, value.fromFixnum(9999).?, value.fromFixnum(0).?, &dispatch.hashValue, &dispatch.equal);
         } else if (n > 0) {
-            _ = try hamt.mapDissoc(&heap, m_src, value.fromFixnum(@intCast(r.uintLessThan(usize, n))).?, &dispatch.hashValue, &dispatch.equal);
+            _ = try champ.mapDissoc(&heap, m_src, value.fromFixnum(@intCast(r.uintLessThan(usize, n))).?, &dispatch.hashValue, &dispatch.equal);
         }
-        try std.testing.expectEqual(src_count, hamt.mapCount(m_src));
+        try std.testing.expectEqual(src_count, champ.mapCount(m_src));
         for (model.items) |me| {
-            switch (hamt.mapGet(m_src, me.key, &dispatch.hashValue, &dispatch.equal)) {
+            switch (champ.mapGet(m_src, me.key, &dispatch.hashValue, &dispatch.equal)) {
                 .absent => try std.testing.expect(false),
                 .present => |v| try std.testing.expect(dispatch.equal(v, me.value)),
             }
@@ -443,20 +443,20 @@ test "M9: keyword-keyed maps give identical results to fixnum-keyed maps" {
         // keys (fast path) and the other uses fixnum keys (general
         // path). After identical operations, equality over "keys I've
         // inserted" must report the same hit/miss results.
-        var m_kw = try hamt.mapEmpty(&heap);
-        var m_fx = try hamt.mapEmpty(&heap);
+        var m_kw = try champ.mapEmpty(&heap);
+        var m_fx = try champ.mapEmpty(&heap);
         var i: u32 = 0;
         while (i < n) : (i += 1) {
             const v = randValue(r);
-            m_kw = try hamt.mapAssoc(&heap, m_kw, value.fromKeywordId(i), v, &dispatch.hashValue, &dispatch.equal);
-            m_fx = try hamt.mapAssoc(&heap, m_fx, value.fromFixnum(@intCast(i)).?, v, &dispatch.hashValue, &dispatch.equal);
+            m_kw = try champ.mapAssoc(&heap, m_kw, value.fromKeywordId(i), v, &dispatch.hashValue, &dispatch.equal);
+            m_fx = try champ.mapAssoc(&heap, m_fx, value.fromFixnum(@intCast(i)).?, v, &dispatch.hashValue, &dispatch.equal);
         }
-        try std.testing.expectEqual(hamt.mapCount(m_kw), hamt.mapCount(m_fx));
+        try std.testing.expectEqual(champ.mapCount(m_kw), champ.mapCount(m_fx));
         // Every key lookup must match presence and value between them.
         i = 0;
         while (i < n) : (i += 1) {
-            const kw = hamt.mapGet(m_kw, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal);
-            const fx = hamt.mapGet(m_fx, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
+            const kw = champ.mapGet(m_kw, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal);
+            const fx = champ.mapGet(m_fx, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
             switch (kw) {
                 .absent => try std.testing.expect(fx == .absent),
                 .present => |v_kw| switch (fx) {
@@ -485,7 +485,7 @@ test "M9: keyword-keyed maps give identical results to fixnum-keyed maps" {
 ///
 /// Do not "optimize" to a constant u64 — that would cause spurious
 /// collisions in other test paths that re-use this fixture. See the
-/// equivalent `collidingHash` comment in `src/coll/hamt.zig`'s inline
+/// equivalent `collidingHash` comment in `src/coll/champ.zig`'s inline
 /// tests for the same discipline.
 fn collidingHash(v: Value) u64 {
     return (@as(u64, v.hashImmediate() >> 32) << 32) | 0xDEAD_BEEF;
@@ -497,38 +497,38 @@ test "M10: collision node stress — ≥5 distinct keys sharing an indexing hash
 
     // Insert 10 distinct keys. With `collidingHash`, all land in a
     // single collision node at the deepest trie level.
-    var m = try hamt.mapEmpty(&heap);
+    var m = try champ.mapEmpty(&heap);
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
-        m = try hamt.mapAssoc(&heap, m, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &collidingHash, &dispatch.equal);
+        m = try champ.mapAssoc(&heap, m, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &collidingHash, &dispatch.equal);
     }
-    try std.testing.expectEqual(@as(usize, 10), hamt.mapCount(m));
+    try std.testing.expectEqual(@as(usize, 10), champ.mapCount(m));
     // Every key must be retrievable.
     i = 0;
     while (i < 10) : (i += 1) {
-        switch (hamt.mapGet(m, value.fromKeywordId(i), &collidingHash, &dispatch.equal)) {
+        switch (champ.mapGet(m, value.fromKeywordId(i), &collidingHash, &dispatch.equal)) {
             .absent => try std.testing.expect(false),
             .present => |v| try std.testing.expectEqual(@as(i64, @intCast(i)), v.asFixnum()),
         }
     }
     // Dissoc alternating keys; remaining keys must still look up.
-    m = try hamt.mapDissoc(&heap, m, value.fromKeywordId(0), &collidingHash, &dispatch.equal);
-    m = try hamt.mapDissoc(&heap, m, value.fromKeywordId(3), &collidingHash, &dispatch.equal);
-    m = try hamt.mapDissoc(&heap, m, value.fromKeywordId(7), &collidingHash, &dispatch.equal);
-    try std.testing.expectEqual(@as(usize, 7), hamt.mapCount(m));
-    try std.testing.expect(hamt.mapGet(m, value.fromKeywordId(0), &collidingHash, &dispatch.equal) == .absent);
-    try std.testing.expect(hamt.mapGet(m, value.fromKeywordId(3), &collidingHash, &dispatch.equal) == .absent);
-    try std.testing.expect(hamt.mapGet(m, value.fromKeywordId(7), &collidingHash, &dispatch.equal) == .absent);
-    switch (hamt.mapGet(m, value.fromKeywordId(5), &collidingHash, &dispatch.equal)) {
+    m = try champ.mapDissoc(&heap, m, value.fromKeywordId(0), &collidingHash, &dispatch.equal);
+    m = try champ.mapDissoc(&heap, m, value.fromKeywordId(3), &collidingHash, &dispatch.equal);
+    m = try champ.mapDissoc(&heap, m, value.fromKeywordId(7), &collidingHash, &dispatch.equal);
+    try std.testing.expectEqual(@as(usize, 7), champ.mapCount(m));
+    try std.testing.expect(champ.mapGet(m, value.fromKeywordId(0), &collidingHash, &dispatch.equal) == .absent);
+    try std.testing.expect(champ.mapGet(m, value.fromKeywordId(3), &collidingHash, &dispatch.equal) == .absent);
+    try std.testing.expect(champ.mapGet(m, value.fromKeywordId(7), &collidingHash, &dispatch.equal) == .absent);
+    switch (champ.mapGet(m, value.fromKeywordId(5), &collidingHash, &dispatch.equal)) {
         .absent => try std.testing.expect(false),
         .present => |v| try std.testing.expectEqual(@as(i64, 5), v.asFixnum()),
     }
     // Dissoc all remaining → empty.
     const remaining = [_]u32{ 1, 2, 4, 5, 6, 8, 9 };
     for (remaining) |r| {
-        m = try hamt.mapDissoc(&heap, m, value.fromKeywordId(r), &collidingHash, &dispatch.equal);
+        m = try champ.mapDissoc(&heap, m, value.fromKeywordId(r), &collidingHash, &dispatch.equal);
     }
-    try std.testing.expect(hamt.mapIsEmpty(m));
+    try std.testing.expect(champ.mapIsEmpty(m));
 }
 
 // -----------------------------------------------------------------------------
@@ -546,7 +546,7 @@ test "M11: equal ⇒ hashValue equal over 2000 random map pairs (gate #1 scaled)
     while (trial < 2000) : (trial += 1) {
         // Build identical maps in two different insertion orders.
         const n = r.intRangeAtMost(usize, 0, 30);
-        const entries = try gpa.alloc(hamt.Entry, n);
+        const entries = try gpa.alloc(champ.Entry, n);
         defer gpa.free(entries);
         for (entries, 0..) |*e, idx| {
             e.* = .{
@@ -554,17 +554,17 @@ test "M11: equal ⇒ hashValue equal over 2000 random map pairs (gate #1 scaled)
                 .value = randValue(r),
             };
         }
-        var a = try hamt.mapEmpty(&heap);
+        var a = try champ.mapEmpty(&heap);
         for (entries) |e| {
-            a = try hamt.mapAssoc(&heap, a, e.key, e.value, &dispatch.hashValue, &dispatch.equal);
+            a = try champ.mapAssoc(&heap, a, e.key, e.value, &dispatch.hashValue, &dispatch.equal);
         }
         // Reverse-order build.
-        var b = try hamt.mapEmpty(&heap);
+        var b = try champ.mapEmpty(&heap);
         var idx_r: usize = entries.len;
         while (idx_r > 0) {
             idx_r -= 1;
             const e = entries[idx_r];
-            b = try hamt.mapAssoc(&heap, b, e.key, e.value, &dispatch.hashValue, &dispatch.equal);
+            b = try champ.mapAssoc(&heap, b, e.key, e.value, &dispatch.hashValue, &dispatch.equal);
         }
         try std.testing.expect(dispatch.equal(a, b));
         try std.testing.expectEqual(dispatch.hashValue(a), dispatch.hashValue(b));
@@ -609,12 +609,12 @@ test "S1: setFromElements + setContains round-trip over 200 random sets" {
         for (elems, 0..) |*slot, i| {
             slot.* = value.fromFixnum(@intCast(i + trial * 100)).?;
         }
-        const s = try hamt.setFromElements(&heap, elems, &dispatch.hashValue, &dispatch.equal);
-        try std.testing.expectEqual(n, hamt.setCount(s));
+        const s = try champ.setFromElements(&heap, elems, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expectEqual(n, champ.setCount(s));
         for (elems) |e| {
-            try std.testing.expect(hamt.setContains(s, e, &dispatch.hashValue, &dispatch.equal));
+            try std.testing.expect(champ.setContains(s, e, &dispatch.hashValue, &dispatch.equal));
         }
-        try std.testing.expect(!hamt.setContains(s, value.fromFixnum(999_999_999).?, &dispatch.hashValue, &dispatch.equal));
+        try std.testing.expect(!champ.setContains(s, value.fromFixnum(999_999_999).?, &dispatch.hashValue, &dispatch.equal));
     }
 }
 
@@ -632,14 +632,14 @@ test "S2: random conj/disj sequences preserve the element set" {
         var model: std.ArrayList(Value) = .empty;
         defer model.deinit(gpa);
 
-        var s = try hamt.setEmpty(&heap);
+        var s = try champ.setEmpty(&heap);
         const ops: usize = 30;
         var op: usize = 0;
         while (op < ops) : (op += 1) {
             const is_conj = r.boolean() or model.items.len == 0;
             if (is_conj) {
                 const e = value.fromFixnum(r.intRangeAtMost(i64, 0, 19)).?;
-                s = try hamt.setConj(&heap, s, e, &dispatch.hashValue, &dispatch.equal);
+                s = try champ.setConj(&heap, s, e, &dispatch.hashValue, &dispatch.equal);
                 var found = false;
                 for (model.items) |me| {
                     if (dispatch.equal(me, e)) {
@@ -651,12 +651,12 @@ test "S2: random conj/disj sequences preserve the element set" {
             } else {
                 const idx = r.uintLessThan(usize, model.items.len);
                 const e = model.items[idx];
-                s = try hamt.setDisj(&heap, s, e, &dispatch.hashValue, &dispatch.equal);
+                s = try champ.setDisj(&heap, s, e, &dispatch.hashValue, &dispatch.equal);
                 _ = model.swapRemove(idx);
             }
-            try std.testing.expectEqual(model.items.len, hamt.setCount(s));
+            try std.testing.expectEqual(model.items.len, champ.setCount(s));
             for (model.items) |me| {
-                try std.testing.expect(hamt.setContains(s, me, &dispatch.hashValue, &dispatch.equal));
+                try std.testing.expect(champ.setContains(s, me, &dispatch.hashValue, &dispatch.equal));
             }
         }
     }
@@ -667,13 +667,13 @@ test "S3: setConj of existing element returns same pointer" {
     defer heap.deinit();
     const sizes = [_]u32{ 1, 5, 8, 9, 15, 40 };
     for (sizes) |size| {
-        var s = try hamt.setEmpty(&heap);
+        var s = try champ.setEmpty(&heap);
         var i: u32 = 0;
         while (i < size) : (i += 1) {
-            s = try hamt.setConj(&heap, s, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
+            s = try champ.setConj(&heap, s, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
         }
         const pick = value.fromFixnum(@intCast(size / 2)).?;
-        const s2 = try hamt.setConj(&heap, s, pick, &dispatch.hashValue, &dispatch.equal);
+        const s2 = try champ.setConj(&heap, s, pick, &dispatch.hashValue, &dispatch.equal);
         try std.testing.expect(Heap.asHeapHeader(s) == Heap.asHeapHeader(s2));
     }
 }
@@ -689,11 +689,11 @@ test "S4: set equality laws (reflexive, symmetric, pairwise transitive)" {
     var pool: [pool_size]Value = undefined;
     for (0..pool_size) |i| {
         const n = r.uintLessThan(usize, 15);
-        var s = try hamt.setEmpty(&heap);
+        var s = try champ.setEmpty(&heap);
         var j: usize = 0;
         while (j < n) : (j += 1) {
             const e = value.fromFixnum(r.intRangeAtMost(i64, 0, 20)).?;
-            s = try hamt.setConj(&heap, s, e, &dispatch.hashValue, &dispatch.equal);
+            s = try champ.setConj(&heap, s, e, &dispatch.hashValue, &dispatch.equal);
         }
         pool[i] = s;
     }
@@ -736,15 +736,15 @@ test "S5: cross-subkind (array-set vs CHAMP) retirement receipt (2000 trials, ga
             slot.* = value.fromFixnum(@intCast(idx + trial * 100)).?;
         }
         // Path A: pure array-set.
-        var as = try hamt.setEmpty(&heap);
-        for (elems) |e| as = try hamt.setConj(&heap, as, e, &dispatch.hashValue, &dispatch.equal);
+        var as = try champ.setEmpty(&heap);
+        for (elems) |e| as = try champ.setConj(&heap, as, e, &dispatch.hashValue, &dispatch.equal);
         try std.testing.expect(as.subkind() == 0);
         // Path B: grow to n+1 then disj the extra → CHAMP.
         var ch = as;
         const extra = value.fromFixnum(@intCast(1_000_000 + trial)).?;
-        ch = try hamt.setConj(&heap, ch, extra, &dispatch.hashValue, &dispatch.equal);
+        ch = try champ.setConj(&heap, ch, extra, &dispatch.hashValue, &dispatch.equal);
         if (n >= 8) try std.testing.expect(ch.subkind() == 1);
-        ch = try hamt.setDisj(&heap, ch, extra, &dispatch.hashValue, &dispatch.equal);
+        ch = try champ.setDisj(&heap, ch, extra, &dispatch.hashValue, &dispatch.equal);
         try std.testing.expect(dispatch.equal(as, ch));
         try std.testing.expect(dispatch.equal(ch, as));
         try std.testing.expectEqual(dispatch.hashValue(as), dispatch.hashValue(ch));
@@ -754,9 +754,9 @@ test "S5: cross-subkind (array-set vs CHAMP) retirement receipt (2000 trials, ga
 test "S6: set never equal to non-set Values" {
     var heap = Heap.init(std.testing.allocator);
     defer heap.deinit();
-    const s = try hamt.setConj(
+    const s = try champ.setConj(
         &heap,
-        try hamt.setEmpty(&heap),
+        try champ.setEmpty(&heap),
         value.fromKeywordId(1),
         &dispatch.hashValue,
         &dispatch.equal,
@@ -769,13 +769,13 @@ test "S6: set never equal to non-set Values" {
         value.fromChar('a').?,
         try list_mod.empty(&heap),
         try vector_mod.empty(&heap),
-        try hamt.mapEmpty(&heap),
+        try champ.mapEmpty(&heap),
     };
     for (non_set) |other| {
         try std.testing.expect(!dispatch.equal(s, other));
         try std.testing.expect(!dispatch.equal(other, s));
     }
-    const es = try hamt.setEmpty(&heap);
+    const es = try champ.setEmpty(&heap);
     for (non_set) |other| {
         try std.testing.expect(!dispatch.equal(es, other));
     }
@@ -788,28 +788,28 @@ test "S7: set persistent immutability" {
     var prng = std.Random.DefaultPrng.init(prng_seed +% 0x57);
     const r = prng.random();
 
-    var s_src = try hamt.setEmpty(&heap);
+    var s_src = try champ.setEmpty(&heap);
     var model: std.ArrayList(Value) = .empty;
     defer model.deinit(gpa);
     const n = r.uintLessThan(usize, 30);
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const e = value.fromFixnum(@intCast(i)).?;
-        s_src = try hamt.setConj(&heap, s_src, e, &dispatch.hashValue, &dispatch.equal);
+        s_src = try champ.setConj(&heap, s_src, e, &dispatch.hashValue, &dispatch.equal);
         try model.append(gpa, e);
     }
-    const src_count = hamt.setCount(s_src);
+    const src_count = champ.setCount(s_src);
     var ops: usize = 0;
     while (ops < 40) : (ops += 1) {
         const is_conj = r.boolean();
         if (is_conj) {
-            _ = try hamt.setConj(&heap, s_src, value.fromFixnum(9999).?, &dispatch.hashValue, &dispatch.equal);
+            _ = try champ.setConj(&heap, s_src, value.fromFixnum(9999).?, &dispatch.hashValue, &dispatch.equal);
         } else if (n > 0) {
-            _ = try hamt.setDisj(&heap, s_src, value.fromFixnum(@intCast(r.uintLessThan(usize, n))).?, &dispatch.hashValue, &dispatch.equal);
+            _ = try champ.setDisj(&heap, s_src, value.fromFixnum(@intCast(r.uintLessThan(usize, n))).?, &dispatch.hashValue, &dispatch.equal);
         }
-        try std.testing.expectEqual(src_count, hamt.setCount(s_src));
+        try std.testing.expectEqual(src_count, champ.setCount(s_src));
         for (model.items) |me| {
-            try std.testing.expect(hamt.setContains(s_src, me, &dispatch.hashValue, &dispatch.equal));
+            try std.testing.expect(champ.setContains(s_src, me, &dispatch.hashValue, &dispatch.equal));
         }
     }
 }
@@ -824,18 +824,18 @@ test "S8: keyword-element sets give identical results to fixnum-element sets" {
     var trial: usize = 0;
     while (trial < 100) : (trial += 1) {
         const n = r.intRangeAtMost(u32, 0, 30);
-        var s_kw = try hamt.setEmpty(&heap);
-        var s_fx = try hamt.setEmpty(&heap);
+        var s_kw = try champ.setEmpty(&heap);
+        var s_fx = try champ.setEmpty(&heap);
         var i: u32 = 0;
         while (i < n) : (i += 1) {
-            s_kw = try hamt.setConj(&heap, s_kw, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal);
-            s_fx = try hamt.setConj(&heap, s_fx, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
+            s_kw = try champ.setConj(&heap, s_kw, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal);
+            s_fx = try champ.setConj(&heap, s_fx, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
         }
-        try std.testing.expectEqual(hamt.setCount(s_kw), hamt.setCount(s_fx));
+        try std.testing.expectEqual(champ.setCount(s_kw), champ.setCount(s_fx));
         i = 0;
         while (i < n) : (i += 1) {
-            const in_kw = hamt.setContains(s_kw, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal);
-            const in_fx = hamt.setContains(s_fx, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
+            const in_kw = champ.setContains(s_kw, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal);
+            const in_fx = champ.setContains(s_fx, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
             try std.testing.expectEqual(in_kw, in_fx);
         }
     }
@@ -844,25 +844,25 @@ test "S8: keyword-element sets give identical results to fixnum-element sets" {
 test "S9: collision-node stress for set (≥5 elements sharing indexing hash)" {
     var heap = Heap.init(std.testing.allocator);
     defer heap.deinit();
-    var s = try hamt.setEmpty(&heap);
+    var s = try champ.setEmpty(&heap);
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
-        s = try hamt.setConj(&heap, s, value.fromKeywordId(i), &collidingHash, &dispatch.equal);
+        s = try champ.setConj(&heap, s, value.fromKeywordId(i), &collidingHash, &dispatch.equal);
     }
-    try std.testing.expectEqual(@as(usize, 10), hamt.setCount(s));
+    try std.testing.expectEqual(@as(usize, 10), champ.setCount(s));
     i = 0;
     while (i < 10) : (i += 1) {
-        try std.testing.expect(hamt.setContains(s, value.fromKeywordId(i), &collidingHash, &dispatch.equal));
+        try std.testing.expect(champ.setContains(s, value.fromKeywordId(i), &collidingHash, &dispatch.equal));
     }
-    s = try hamt.setDisj(&heap, s, value.fromKeywordId(0), &collidingHash, &dispatch.equal);
-    s = try hamt.setDisj(&heap, s, value.fromKeywordId(5), &collidingHash, &dispatch.equal);
-    try std.testing.expectEqual(@as(usize, 8), hamt.setCount(s));
-    try std.testing.expect(!hamt.setContains(s, value.fromKeywordId(0), &collidingHash, &dispatch.equal));
-    try std.testing.expect(!hamt.setContains(s, value.fromKeywordId(5), &collidingHash, &dispatch.equal));
-    try std.testing.expect(hamt.setContains(s, value.fromKeywordId(3), &collidingHash, &dispatch.equal));
+    s = try champ.setDisj(&heap, s, value.fromKeywordId(0), &collidingHash, &dispatch.equal);
+    s = try champ.setDisj(&heap, s, value.fromKeywordId(5), &collidingHash, &dispatch.equal);
+    try std.testing.expectEqual(@as(usize, 8), champ.setCount(s));
+    try std.testing.expect(!champ.setContains(s, value.fromKeywordId(0), &collidingHash, &dispatch.equal));
+    try std.testing.expect(!champ.setContains(s, value.fromKeywordId(5), &collidingHash, &dispatch.equal));
+    try std.testing.expect(champ.setContains(s, value.fromKeywordId(3), &collidingHash, &dispatch.equal));
     const remaining = [_]u32{ 1, 2, 3, 4, 6, 7, 8, 9 };
     for (remaining) |x| {
-        s = try hamt.setDisj(&heap, s, value.fromKeywordId(x), &collidingHash, &dispatch.equal);
+        s = try champ.setDisj(&heap, s, value.fromKeywordId(x), &collidingHash, &dispatch.equal);
     }
-    try std.testing.expect(hamt.setIsEmpty(s));
+    try std.testing.expect(champ.setIsEmpty(s));
 }

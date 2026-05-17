@@ -644,7 +644,7 @@ test "del: removes the key, subsequent get returns null" {
 
 test "put / get: container values (list, map, set) codec round-trip" {
     const list_mod = @import("list");
-    const hamt = @import("hamt");
+    const champ = @import("champ");
 
     const path = try tmpDbPath(testing.allocator, "containers");
     defer testing.allocator.free(path);
@@ -666,13 +666,13 @@ test "put / get: container values (list, map, set) codec round-trip" {
     });
     // Map (use interned keywords so codec can emit textual form).
     const kw = try interner.internKeywordValue("alpha");
-    var m = try hamt.mapEmpty(&heap);
-    m = try hamt.mapAssoc(&heap, m, kw, value.fromFixnum(100).?, &synthHash, &synthEq);
+    var m = try champ.mapEmpty(&heap);
+    m = try champ.mapAssoc(&heap, m, kw, value.fromFixnum(100).?, &synthHash, &synthEq);
 
     // Set
-    var s = try hamt.setEmpty(&heap);
-    s = try hamt.setConj(&heap, s, value.fromFixnum(10).?, &synthHash, &synthEq);
-    s = try hamt.setConj(&heap, s, value.fromFixnum(20).?, &synthHash, &synthEq);
+    var s = try champ.setEmpty(&heap);
+    s = try champ.setConj(&heap, s, value.fromFixnum(10).?, &synthHash, &synthEq);
+    s = try champ.setConj(&heap, s, value.fromFixnum(20).?, &synthHash, &synthEq);
 
     var wtxn = try beginWrite(&conn);
     try put(&wtxn, "objects", "list", lst);
@@ -689,11 +689,11 @@ test "put / get: container values (list, map, set) codec round-trip" {
 
     const got_m = try get(&rtxn, "objects", "map", &synthHash, &synthEq);
     try testing.expect(got_m != null and got_m.?.kind() == .persistent_map);
-    try testing.expectEqual(@as(usize, 1), hamt.mapCount(got_m.?));
+    try testing.expectEqual(@as(usize, 1), champ.mapCount(got_m.?));
 
     const got_s = try get(&rtxn, "objects", "set", &synthHash, &synthEq);
     try testing.expect(got_s != null and got_s.?.kind() == .persistent_set);
-    try testing.expectEqual(@as(usize, 2), hamt.setCount(got_s.?));
+    try testing.expectEqual(@as(usize, 2), champ.setCount(got_s.?));
 }
 
 test "reopen-connection readback: values survive conn close/reopen" {

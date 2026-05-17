@@ -30,7 +30,7 @@ const string = @import("string");
 const bignum = @import("bignum");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
-const hamt = @import("hamt");
+const champ = @import("champ");
 const transient = @import("transient");
 const codec = @import("codec");
 const dispatch = @import("dispatch");
@@ -141,26 +141,26 @@ const Gen = struct {
 
     fn makeMap(self: *Gen, depth: u8) !Value {
         const n = self.r.uintLessThan(usize, 8);
-        var m = try hamt.mapEmpty(&self.ctx.heap);
+        var m = try champ.mapEmpty(&self.ctx.heap);
         var i: usize = 0;
         while (i < n) : (i += 1) {
             // Keys must be hashable, so we prefer scalar keys (no
             // transients etc., which we never generate anyway).
             const key = try self.scalar();
             const val = try self.container(depth);
-            m = try hamt.mapAssoc(&self.ctx.heap, m, key, val, &dispatch.hashValue, &dispatch.equal);
+            m = try champ.mapAssoc(&self.ctx.heap, m, key, val, &dispatch.hashValue, &dispatch.equal);
         }
         return m;
     }
 
     fn makeSet(self: *Gen, depth: u8) !Value {
         const n = self.r.uintLessThan(usize, 8);
-        var s = try hamt.setEmpty(&self.ctx.heap);
+        var s = try champ.setEmpty(&self.ctx.heap);
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const e = try self.scalar();
             _ = depth; // set elements: scalars only to keep hashing deterministic
-            s = try hamt.setConj(&self.ctx.heap, s, e, &dispatch.hashValue, &dispatch.equal);
+            s = try champ.setConj(&self.ctx.heap, s, e, &dispatch.hashValue, &dispatch.equal);
         }
         return s;
     }
@@ -367,8 +367,8 @@ test "C3: encoding a transient returns UnserializableKind" {
     defer ctx.deinit();
 
     const kinds = [_]Value{
-        try transient.transientFrom(&ctx.heap, try hamt.mapEmpty(&ctx.heap)),
-        try transient.transientFrom(&ctx.heap, try hamt.setEmpty(&ctx.heap)),
+        try transient.transientFrom(&ctx.heap, try champ.mapEmpty(&ctx.heap)),
+        try transient.transientFrom(&ctx.heap, try champ.setEmpty(&ctx.heap)),
         try transient.transientFrom(&ctx.heap, try vector_mod.empty(&ctx.heap)),
     };
     for (kinds) |v| {

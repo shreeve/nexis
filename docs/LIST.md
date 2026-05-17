@@ -195,7 +195,7 @@ fallback if real workloads hit the limit.
 
 ### 7. What LIST.md does not cover
 
-- **Persistent-vector** (`src/coll/rrb.zig`, kind 20). The second
+- **Persistent-vector** (`src/coll/vector.zig`, kind 20). The second
   member of the sequential equality category. When it lands, the
   `equalSeq` callback pattern generalizes to a cross-kind sequential
   comparator — list-vs-vector equality reuses the same element

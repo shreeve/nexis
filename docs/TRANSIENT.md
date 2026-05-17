@@ -344,7 +344,7 @@ public API with. Users who want the check call
 **Vector `assocBang` is deferred.** PLAN §9.2's vector supports
 `assoc n v` in the persistent path (random index update via
 path-copy), and a transient `assocBang` would parallel it. But
-`assocBang` isn't landed in `src/coll/rrb.zig`'s Scope A commit
+`assocBang` isn't landed in `src/coll/vector.zig`'s Scope A commit
 yet, so its transient counterpart can't exist either. When the
 persistent `assoc n v` ships (Phase 6 or a scheduled vector Scope
 B commit), `vectorAssocBang` joins the transient API.
@@ -370,11 +370,11 @@ inspection; vector root is always subkind 1) and shouldn't live in
 transient code. Each collection module exports a small helper:
 
 ```zig
-// src/coll/hamt.zig
+// src/coll/champ.zig
 pub fn valueFromMapHeader(h: *HeapHeader) Value;
 pub fn valueFromSetHeader(h: *HeapHeader) Value;
 
-// src/coll/rrb.zig
+// src/coll/vector.zig
 pub fn valueFromVectorHeader(h: *HeapHeader) Value;
 ```
 

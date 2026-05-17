@@ -482,8 +482,8 @@ Heap kinds (all shipped):
                       construction + canonical form + eq + hash;
                       arithmetic Scope B deferred to mid-Phase 2)
   src/coll/list.zig   immutable cons list + Cursor
-  src/coll/rrb.zig    persistent vector (plain 32-way + tail) + Cursor
-  src/coll/hamt.zig   CHAMP persistent_map + persistent_set
+  src/coll/vector.zig persistent vector (plain 32-way + tail) + Cursor
+  src/coll/champ.zig  CHAMP persistent_map + persistent_set
   src/coll/transient.zig  transient wrappers for vector/map/set
 
 Systems (all shipped):

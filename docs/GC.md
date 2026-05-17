@@ -418,7 +418,7 @@ gc.zig
 ├─ @import("bignum")        — bignum.trace
 ├─ @import("list")          — list.trace
 ├─ @import("vector")        — vector.trace
-└─ @import("hamt")          — hamt.traceMap + hamt.traceSet
+└─ @import("champ")         — champ.traceMap + champ.traceSet
 ```
 
 One-way terminal, same discipline as `dispatch.zig`. No heap-kind

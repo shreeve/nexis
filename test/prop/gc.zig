@@ -25,7 +25,7 @@ const hash_mod = @import("hash");
 const string = @import("string");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
-const hamt = @import("hamt");
+const champ = @import("champ");
 const dispatch = @import("dispatch");
 const gc = @import("gc");
 
@@ -148,22 +148,22 @@ test "G2: nested graph — reachable closure exactly matches liveCount" {
         } else if (choice == 3) {
             // Map: keys are fixnums (immediate), values are earlier
             // pool members (heap references).
-            pool[i] = try hamt.mapEmpty(&heap);
+            pool[i] = try champ.mapEmpty(&heap);
             const k = r.intRangeAtMost(usize, 1, @min(i, 3));
             for (0..k) |j| {
                 const idx = r.uintLessThan(usize, i);
-                pool[i] = try hamt.mapAssoc(&heap, pool[i], value.fromFixnum(@intCast(j)).?, pool[idx], &dispatch.hashValue, &dispatch.equal);
+                pool[i] = try champ.mapAssoc(&heap, pool[i], value.fromFixnum(@intCast(j)).?, pool[idx], &dispatch.hashValue, &dispatch.equal);
                 var it = reach[idx].iterator();
                 while (it.next()) |entry| try reach[i].put(entry.key_ptr.*, {});
             }
         } else {
             // Set of earlier pool members (where the element is a
             // heap-kind Value — so references are through elements).
-            pool[i] = try hamt.setEmpty(&heap);
+            pool[i] = try champ.setEmpty(&heap);
             const k = r.intRangeAtMost(usize, 1, @min(i, 3));
             for (0..k) |_| {
                 const idx = r.uintLessThan(usize, i);
-                pool[i] = try hamt.setConj(&heap, pool[i], pool[idx], &dispatch.hashValue, &dispatch.equal);
+                pool[i] = try champ.setConj(&heap, pool[i], pool[idx], &dispatch.hashValue, &dispatch.equal);
                 var it = reach[idx].iterator();
                 while (it.next()) |entry| try reach[i].put(entry.key_ptr.*, {});
             }
@@ -219,10 +219,10 @@ test "G2: nested graph — reachable closure exactly matches liveCount" {
                 _ = vector_mod.count(v);
             },
             .persistent_map => {
-                _ = hamt.mapCount(v);
+                _ = champ.mapCount(v);
             },
             .persistent_set => {
-                _ = hamt.setCount(v);
+                _ = champ.setCount(v);
             },
             else => {},
         }

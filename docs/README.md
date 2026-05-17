@@ -15,8 +15,8 @@ wins and the code is wrong.
 | `src/string.zig` | [`STRING.md`](STRING.md) | String heap kind |
 | `src/bignum.zig` | [`BIGNUM.md`](BIGNUM.md) | Bignum semantics + canonicalization |
 | `src/coll/list.zig` | [`LIST.md`](LIST.md) | Immutable cons list |
-| **`src/coll/hamt.zig`** | **[`CHAMP.md`](CHAMP.md)** | **Name mismatch by design** — file is `hamt` (the algorithm family); spec is `CHAMP` (the specific variant — Compressed Hash-Array Mapped Prefix-tree). Both names are correct in their own register. |
-| **`src/coll/rrb.zig`** | **[`VECTOR.md`](VECTOR.md)** | **Name mismatch by design** — file is `rrb` (the algorithm); spec is `VECTOR` (the user-facing concept — Clojure's persistent vector). |
+| `src/coll/champ.zig` | [`CHAMP.md`](CHAMP.md) | Persistent map + set via CHAMP (Compressed Hash-Array Mapped Prefix-tree) |
+| `src/coll/vector.zig` | [`VECTOR.md`](VECTOR.md) | Persistent vector via RRB tree |
 | `src/coll/transient.zig` | [`TRANSIENT.md`](TRANSIENT.md) | Transient lifecycle + ownership |
 | `src/eq.zig` | (in [`SEMANTICS.md`](SEMANTICS.md) §2) | Equality predicates; no dedicated spec doc |
 | `src/hash.zig` | (in [`SEMANTICS.md`](SEMANTICS.md) §3) | Hash primitives; no dedicated spec doc |

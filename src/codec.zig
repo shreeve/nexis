@@ -37,7 +37,7 @@
 //!     ├── @import("bignum")
 //!     ├── @import("list")
 //!     ├── @import("vector")
-//!     └── @import("hamt")
+//!     └── @import("champ")
 //!
 //! Nothing imports `codec.zig`.
 
@@ -50,7 +50,7 @@ const string = @import("string");
 const bignum = @import("bignum");
 const list = @import("list");
 const vector = @import("vector");
-const hamt = @import("hamt");
+const champ = @import("champ");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -368,9 +368,9 @@ fn encodeValue(
         },
         .persistent_map => {
             try writeByte(buf, allocator, @intFromEnum(Kind.persistent_map));
-            const n = hamt.mapCount(v);
+            const n = champ.mapCount(v);
             try writeUleb128(buf, allocator, @as(u64, n));
-            var iter = hamt.mapIter(v);
+            var iter = champ.mapIter(v);
             while (iter.next()) |entry| {
                 try encodeValue(buf, allocator, interner, entry.key);
                 try encodeValue(buf, allocator, interner, entry.value);
@@ -378,9 +378,9 @@ fn encodeValue(
         },
         .persistent_set => {
             try writeByte(buf, allocator, @intFromEnum(Kind.persistent_set));
-            const n = hamt.setCount(v);
+            const n = champ.setCount(v);
             try writeUleb128(buf, allocator, @as(u64, n));
-            var iter = hamt.setIter(v);
+            var iter = champ.setIter(v);
             while (iter.next()) |elem| {
                 try encodeValue(buf, allocator, interner, elem);
             }
@@ -503,23 +503,23 @@ fn decodeValue(
         @intFromEnum(Kind.persistent_map) => blk: {
             const count_u64 = try readUleb128(bytes, cursor);
             const n: usize = std.math.cast(usize, count_u64) orelse return CodecError.InvalidLeb128;
-            var m = try hamt.mapEmpty(heap);
+            var m = try champ.mapEmpty(heap);
             var i: usize = 0;
             while (i < n) : (i += 1) {
                 const key = try decodeValue(heap, interner, bytes, cursor, elementHash, elementEq);
                 const val = try decodeValue(heap, interner, bytes, cursor, elementHash, elementEq);
-                m = try hamt.mapAssoc(heap, m, key, val, elementHash, elementEq);
+                m = try champ.mapAssoc(heap, m, key, val, elementHash, elementEq);
             }
             break :blk m;
         },
         @intFromEnum(Kind.persistent_set) => blk: {
             const count_u64 = try readUleb128(bytes, cursor);
             const n: usize = std.math.cast(usize, count_u64) orelse return CodecError.InvalidLeb128;
-            var s = try hamt.setEmpty(heap);
+            var s = try champ.setEmpty(heap);
             var i: usize = 0;
             while (i < n) : (i += 1) {
                 const elem = try decodeValue(heap, interner, bytes, cursor, elementHash, elementEq);
-                s = try hamt.setConj(heap, s, elem, elementHash, elementEq);
+                s = try champ.setConj(heap, s, elem, elementHash, elementEq);
             }
             break :blk s;
         },
@@ -803,13 +803,13 @@ test "roundtrip: empty collections" {
 
     const el = try list.empty(&ctx.heap);
     const ev = try vector.empty(&ctx.heap);
-    const em = try hamt.mapEmpty(&ctx.heap);
-    const es = try hamt.setEmpty(&ctx.heap);
+    const em = try champ.mapEmpty(&ctx.heap);
+    const es = try champ.setEmpty(&ctx.heap);
 
     try testing.expect(list.isEmpty(try ctx.roundtrip(el)));
     try testing.expectEqual(@as(usize, 0), vector.count(try ctx.roundtrip(ev)));
-    try testing.expectEqual(@as(usize, 0), hamt.mapCount(try ctx.roundtrip(em)));
-    try testing.expectEqual(@as(usize, 0), hamt.setCount(try ctx.roundtrip(es)));
+    try testing.expectEqual(@as(usize, 0), champ.mapCount(try ctx.roundtrip(em)));
+    try testing.expectEqual(@as(usize, 0), champ.setCount(try ctx.roundtrip(es)));
 }
 
 test "roundtrip: list of fixnums" {
@@ -854,14 +854,14 @@ test "roundtrip: map (forces CHAMP) then element-wise check" {
         slot.* = try ctx.interner.internKeywordValue(name);
     }
 
-    var src = try hamt.mapEmpty(&ctx.heap);
+    var src = try champ.mapEmpty(&ctx.heap);
     for (kws, 0..) |k, i| {
-        src = try hamt.mapAssoc(&ctx.heap, src, k, value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
+        src = try champ.mapAssoc(&ctx.heap, src, k, value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
     }
     const got = try ctx.roundtrip(src);
-    try testing.expectEqual(@as(usize, 20), hamt.mapCount(got));
+    try testing.expectEqual(@as(usize, 20), champ.mapCount(got));
     for (kws, 0..) |k, i| {
-        switch (hamt.mapGet(got, k, &synthHash, &synthEq)) {
+        switch (champ.mapGet(got, k, &synthHash, &synthEq)) {
             .present => |v| try testing.expectEqual(@as(i64, @intCast(i)), v.asFixnum()),
             .absent => try testing.expect(false),
         }
@@ -879,14 +879,14 @@ test "roundtrip: set of 15 keywords" {
         slot.* = try ctx.interner.internKeywordValue(name);
     }
 
-    var src = try hamt.setEmpty(&ctx.heap);
+    var src = try champ.setEmpty(&ctx.heap);
     for (kws) |k| {
-        src = try hamt.setConj(&ctx.heap, src, k, &synthHash, &synthEq);
+        src = try champ.setConj(&ctx.heap, src, k, &synthHash, &synthEq);
     }
     const got = try ctx.roundtrip(src);
-    try testing.expectEqual(@as(usize, 15), hamt.setCount(got));
+    try testing.expectEqual(@as(usize, 15), champ.setCount(got));
     for (kws) |k| {
-        try testing.expect(hamt.setContains(got, k, &synthHash, &synthEq));
+        try testing.expect(champ.setContains(got, k, &synthHash, &synthEq));
     }
 }
 
@@ -898,12 +898,12 @@ test "roundtrip: nested structure (map whose values are lists of strings)" {
     const s1 = try string.fromBytes(&ctx.heap, "alpha");
     const s2 = try string.fromBytes(&ctx.heap, "beta");
     const lst = try list.fromSlice(&ctx.heap, &.{ s1, s2 });
-    var m = try hamt.mapEmpty(&ctx.heap);
-    m = try hamt.mapAssoc(&ctx.heap, m, kw, lst, &synthHash, &synthEq);
+    var m = try champ.mapEmpty(&ctx.heap);
+    m = try champ.mapAssoc(&ctx.heap, m, kw, lst, &synthHash, &synthEq);
 
     const got = try ctx.roundtrip(m);
-    try testing.expectEqual(@as(usize, 1), hamt.mapCount(got));
-    switch (hamt.mapGet(got, kw, &synthHash, &synthEq)) {
+    try testing.expectEqual(@as(usize, 1), champ.mapCount(got));
+    switch (champ.mapGet(got, kw, &synthHash, &synthEq)) {
         .absent => try testing.expect(false),
         .present => |v| {
             try testing.expect(v.kind() == .list);
@@ -919,7 +919,7 @@ test "encode: transient is unserializable" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    const m = try hamt.mapEmpty(&ctx.heap);
+    const m = try champ.mapEmpty(&ctx.heap);
     const t = try transient.transientFrom(&ctx.heap, m);
     try testing.expectError(
         CodecError.UnserializableKind,

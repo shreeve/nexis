@@ -30,7 +30,7 @@
 //!     ├─ @import("bignum")  — bignum.trace
 //!     ├─ @import("list")    — list.trace
 //!     ├─ @import("vector")  — vector.trace
-//!     └─ @import("hamt")    — hamt.traceMap + hamt.traceSet
+//!     └─ @import("champ")    — champ.traceMap + champ.traceSet
 //!
 //! Nothing imports gc.zig. Per-kind modules take the visitor as
 //! `anytype`; `gc.Collector` satisfies the duck-typed visitor ABI
@@ -43,7 +43,7 @@ const string = @import("string");
 const bignum = @import("bignum");
 const list = @import("list");
 const vector = @import("vector");
-const hamt = @import("hamt");
+const champ = @import("champ");
 const transient_mod = @import("transient");
 const db_mod = @import("db");
 
@@ -99,8 +99,8 @@ pub const Collector = struct {
             .bignum => bignum.trace(h, self),
             .list => list.trace(h, self),
             .persistent_vector => vector.trace(h, self),
-            .persistent_map => hamt.traceMap(h, self),
-            .persistent_set => hamt.traceSet(h, self),
+            .persistent_map => champ.traceMap(h, self),
+            .persistent_set => champ.traceSet(h, self),
             .transient => transient_mod.trace(h, self),
             // Durable refs have no heap children — store_id,
             // tree_name, key_bytes are all inline body bytes; the
@@ -273,9 +273,9 @@ test "collect: cross-kind graph — map whose values are lists" {
 
     const l1 = try list.fromSlice(&heap, &.{ value.fromFixnum(10).?, value.fromFixnum(20).? });
     const l2 = try list.fromSlice(&heap, &.{value.fromFixnum(30).?});
-    var m = try hamt.mapEmpty(&heap);
-    m = try hamt.mapAssoc(&heap, m, value.fromKeywordId(1), l1, &synthHash, &synthEq);
-    m = try hamt.mapAssoc(&heap, m, value.fromKeywordId(2), l2, &synthHash, &synthEq);
+    var m = try champ.mapEmpty(&heap);
+    m = try champ.mapAssoc(&heap, m, value.fromKeywordId(1), l1, &synthHash, &synthEq);
+    m = try champ.mapAssoc(&heap, m, value.fromKeywordId(2), l2, &synthHash, &synthEq);
 
     // Allocate an unrelated orphan.
     _ = try string.fromBytes(&heap, "orphan");
@@ -312,10 +312,10 @@ test "collect: CHAMP-backed map survives (>8 entries exercises internal nodes)" 
     // orphan strings below are additional orphans layered on top.
     // GC correctness here means: the FINAL map `m` + its reachable
     // subtree survive intact, and every other block is freed.
-    var m = try hamt.mapEmpty(&heap);
+    var m = try champ.mapEmpty(&heap);
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        m = try hamt.mapAssoc(&heap, m, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
+        m = try champ.mapAssoc(&heap, m, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
     }
     try testing.expect(m.subkind() == 1); // CHAMP root, not array-map
 
@@ -327,11 +327,11 @@ test "collect: CHAMP-backed map survives (>8 entries exercises internal nodes)" 
     _ = gc.collect(&.{Heap.asHeapHeader(m)});
     const live_after = heap.liveCount();
     try testing.expect(live_after < live_before); // orphans freed
-    try testing.expectEqual(@as(usize, 20), hamt.mapCount(m)); // map intact
+    try testing.expectEqual(@as(usize, 20), champ.mapCount(m)); // map intact
     // Every key still looks up to the correct value post-GC.
     i = 0;
     while (i < 20) : (i += 1) {
-        switch (hamt.mapGet(m, value.fromKeywordId(i), &synthHash, &synthEq)) {
+        switch (champ.mapGet(m, value.fromKeywordId(i), &synthHash, &synthEq)) {
             .absent => try testing.expect(false),
             .present => |v| try testing.expectEqual(@as(i64, @intCast(i)), v.asFixnum()),
         }
@@ -384,10 +384,10 @@ test "collect: persistent set survives (>8 elements exercises CHAMP internals)" 
         }
     }.f;
 
-    var s = try hamt.setEmpty(&heap);
+    var s = try champ.setEmpty(&heap);
     var i: u32 = 0;
     while (i < 15) : (i += 1) {
-        s = try hamt.setConj(&heap, s, value.fromKeywordId(i), &synthHash, &synthEq);
+        s = try champ.setConj(&heap, s, value.fromKeywordId(i), &synthHash, &synthEq);
     }
     try testing.expect(s.subkind() == 1);
 
@@ -398,10 +398,10 @@ test "collect: persistent set survives (>8 elements exercises CHAMP internals)" 
     _ = gc.collect(&.{Heap.asHeapHeader(s)});
     const live_after = heap.liveCount();
     try testing.expect(live_after < live_before);
-    try testing.expectEqual(@as(usize, 15), hamt.setCount(s));
+    try testing.expectEqual(@as(usize, 15), champ.setCount(s));
     i = 0;
     while (i < 15) : (i += 1) {
-        try testing.expect(hamt.setContains(s, value.fromKeywordId(i), &synthHash, &synthEq));
+        try testing.expect(champ.setContains(s, value.fromKeywordId(i), &synthHash, &synthEq));
     }
 }
 

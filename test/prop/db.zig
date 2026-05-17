@@ -40,7 +40,7 @@ const string = @import("string");
 const bignum = @import("bignum");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
-const hamt = @import("hamt");
+const champ = @import("champ");
 const codec_mod = @import("codec");
 const db = @import("db");
 const dispatch = @import("dispatch");
@@ -180,23 +180,23 @@ const Gen = struct {
 
     fn makeMap(self: *Gen, depth: u8) !Value {
         const n = self.r.uintLessThan(usize, 6);
-        var m = try hamt.mapEmpty(&self.ctx.heap);
+        var m = try champ.mapEmpty(&self.ctx.heap);
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const key = try self.scalar();
             const val = try self.container(depth);
-            m = try hamt.mapAssoc(&self.ctx.heap, m, key, val, &dispatch.hashValue, &dispatch.equal);
+            m = try champ.mapAssoc(&self.ctx.heap, m, key, val, &dispatch.hashValue, &dispatch.equal);
         }
         return m;
     }
 
     fn makeSet(self: *Gen, depth: u8) !Value {
         const n = self.r.uintLessThan(usize, 6);
-        var s = try hamt.setEmpty(&self.ctx.heap);
+        var s = try champ.setEmpty(&self.ctx.heap);
         var i: usize = 0;
         while (i < n) : (i += 1) {
             _ = depth;
-            s = try hamt.setConj(&self.ctx.heap, s, try self.scalar(), &dispatch.hashValue, &dispatch.equal);
+            s = try champ.setConj(&self.ctx.heap, s, try self.scalar(), &dispatch.hashValue, &dispatch.equal);
         }
         return s;
     }

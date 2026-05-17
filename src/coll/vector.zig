@@ -1,10 +1,11 @@
-//! coll/rrb.zig — persistent vector heap kind (Phase 1, Scope A).
+//! coll/vector.zig — persistent vector heap kind (Phase 1, Scope A).
 //!
 //! **This is plain 32-way radix trie + tail buffer, NOT RRB-relaxed.**
-//! The file is named `rrb.zig` for historical consistency with PLAN.md
-//! §22's repository layout; the v1 implementation is the same shape
-//! Clojure has shipped for 17+ years (PLAN §9.2 + §23 #30, frozen).
-//! RRB relaxation lands in v2+.
+//! Despite the canonical academic name "RRB tree," the v1 implementation
+//! is the same shape Clojure has shipped for 17+ years (PLAN §9.2 +
+//! §23 #30, frozen). RRB relaxation lands in v2+. The module is named
+//! `vector` for user-facing clarity; older docs may refer to it as
+//! `rrb.zig` (renamed 2026-05-16, peer-AI turn 52).
 //!
 //! Authoritative spec: `docs/VECTOR.md`. Semantic framing:
 //! `docs/SEMANTICS.md` §2.6 (sequential equality category) and §3.2

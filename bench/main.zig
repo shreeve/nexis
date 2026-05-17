@@ -42,7 +42,7 @@ const hash_mod = @import("hash");
 const string_mod = @import("string");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
-const hamt = @import("hamt");
+const champ = @import("champ");
 const transient_mod = @import("transient");
 const codec_mod = @import("codec");
 const dispatch = @import("dispatch");
@@ -182,10 +182,10 @@ fn benchVectorConj(ctx: *BuildCtx) anyerror!void {
 fn benchMapAssoc(ctx: *BuildCtx) anyerror!void {
     var heap = Heap.init(ctx.alloc);
     defer heap.deinit();
-    var m = try hamt.mapEmpty(&heap);
+    var m = try champ.mapEmpty(&heap);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
-        m = try hamt.mapAssoc(&heap, m, ctx.keys[i], ctx.vals[i], &dispatch.hashValue, &dispatch.equal);
+        m = try champ.mapAssoc(&heap, m, ctx.keys[i], ctx.vals[i], &dispatch.hashValue, &dispatch.equal);
     }
     std.mem.doNotOptimizeAway(m);
 }
@@ -193,10 +193,10 @@ fn benchMapAssoc(ctx: *BuildCtx) anyerror!void {
 fn benchSetConj(ctx: *BuildCtx) anyerror!void {
     var heap = Heap.init(ctx.alloc);
     defer heap.deinit();
-    var s = try hamt.setEmpty(&heap);
+    var s = try champ.setEmpty(&heap);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
-        s = try hamt.setConj(&heap, s, ctx.keys[i], &dispatch.hashValue, &dispatch.equal);
+        s = try champ.setConj(&heap, s, ctx.keys[i], &dispatch.hashValue, &dispatch.equal);
     }
     std.mem.doNotOptimizeAway(s);
 }
@@ -221,7 +221,7 @@ fn benchTransientVectorConj(ctx: *BuildCtx) anyerror!void {
 fn benchTransientMapAssoc(ctx: *BuildCtx) anyerror!void {
     var heap = Heap.init(ctx.alloc);
     defer heap.deinit();
-    const base = try hamt.mapEmpty(&heap);
+    const base = try champ.mapEmpty(&heap);
     var t = try transient_mod.transientFrom(&heap, base);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
@@ -234,7 +234,7 @@ fn benchTransientMapAssoc(ctx: *BuildCtx) anyerror!void {
 fn benchTransientSetConj(ctx: *BuildCtx) anyerror!void {
     var heap = Heap.init(ctx.alloc);
     defer heap.deinit();
-    const base = try hamt.setEmpty(&heap);
+    const base = try champ.setEmpty(&heap);
     var t = try transient_mod.transientFrom(&heap, base);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
@@ -271,7 +271,7 @@ fn benchMapGet(ctx: *LookupCtx) anyerror!void {
     var i: usize = 0;
     const n = ctx.keys.len;
     while (i < n) : (i += 1) {
-        const lookup = hamt.mapGet(ctx.map, ctx.keys[i], &dispatch.hashValue, &dispatch.equal);
+        const lookup = champ.mapGet(ctx.map, ctx.keys[i], &dispatch.hashValue, &dispatch.equal);
         switch (lookup) {
             .present => |pv| ctx.sink +%= @as(u64, @bitCast(pv.asFixnum())),
             .absent => {},
@@ -283,7 +283,7 @@ fn benchSetContains(ctx: *LookupCtx) anyerror!void {
     var i: usize = 0;
     const n = ctx.keys.len;
     while (i < n) : (i += 1) {
-        const present = hamt.setContains(ctx.set, ctx.keys[i], &dispatch.hashValue, &dispatch.equal);
+        const present = champ.setContains(ctx.set, ctx.keys[i], &dispatch.hashValue, &dispatch.equal);
         ctx.sink +%= if (present) 1 else 0;
     }
 }
@@ -505,13 +505,13 @@ pub fn main(init: std.process.Init) !u8 {
 
             // Pre-build the collections.
             var v = try vector_mod.empty(&heap);
-            var m = try hamt.mapEmpty(&heap);
-            var s2 = try hamt.setEmpty(&heap);
+            var m = try champ.mapEmpty(&heap);
+            var s2 = try champ.setEmpty(&heap);
             var i: usize = 0;
             while (i < n) : (i += 1) {
                 v = try vector_mod.conj(&heap, v, kv.vals[i]);
-                m = try hamt.mapAssoc(&heap, m, kv.keys[i], kv.vals[i], &dispatch.hashValue, &dispatch.equal);
-                s2 = try hamt.setConj(&heap, s2, kv.keys[i], &dispatch.hashValue, &dispatch.equal);
+                m = try champ.mapAssoc(&heap, m, kv.keys[i], kv.vals[i], &dispatch.hashValue, &dispatch.equal);
+                s2 = try champ.setConj(&heap, s2, kv.keys[i], &dispatch.hashValue, &dispatch.equal);
             }
 
             var lctx = LookupCtx{ .vec = v, .map = m, .set = s2, .keys = kv.keys };
@@ -539,10 +539,10 @@ pub fn main(init: std.process.Init) !u8 {
             const kv = try populateKeysAndVals(alloc, &interner, n);
             defer alloc.free(kv.keys);
             defer alloc.free(kv.vals);
-            var m = try hamt.mapEmpty(&heap);
+            var m = try champ.mapEmpty(&heap);
             var i: usize = 0;
             while (i < n) : (i += 1) {
-                m = try hamt.mapAssoc(&heap, m, kv.keys[i], kv.vals[i], &dispatch.hashValue, &dispatch.equal);
+                m = try champ.mapAssoc(&heap, m, kv.keys[i], kv.vals[i], &dispatch.hashValue, &dispatch.equal);
             }
             const bytes = try codec_mod.encode(alloc, &interner, m);
             defer alloc.free(bytes);
