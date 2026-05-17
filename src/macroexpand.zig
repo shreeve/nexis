@@ -273,7 +273,10 @@ fn expandList(
     // looked up in the macro table. Args ARE recursively
     // macroexpanded (per peer-AI turn 58 §D1 + §"Missing trap
     // #6"): a `(#%list (when x y))` should expand `(when x y)`.
-    if (std.mem.eql(u8, name, "#%list") or std.mem.eql(u8, name, "#%concat")) {
+    if (std.mem.eql(u8, name, "#%list") or
+        std.mem.eql(u8, name, "#%concat") or
+        std.mem.eql(u8, name, "#%vector"))
+    {
         return try expandOrdinaryCall(ctx, env, list_form, items, depth);
     }
 
@@ -1163,12 +1166,47 @@ fn expandSyntaxQuotePayload(
         .unquote_splicing => return MacroexpandError.MalformedMacroCall,
         // List: build the segment-and-concat structure.
         .list => |items| try expandSyntaxQuoteList(ctx, scope, call_form, items, payload.origin),
-        // Deferred: vector/map/set/nested-syntax-quote and other
+        // Step #8c.3: Vector — same pattern as list. The
+        // result wraps in `(#%vector ...)` instead of
+        // `(#%list ...)`. Splices inside a vector are also
+        // supported via concat + apply, but for v1 simplicity
+        // we delegate vector-with-splice via concat of vectors
+        // and a final apply: but easier path — we just don't
+        // support splice inside vector for v1, since vector-
+        // valued macros rarely splice (binding vectors are
+        // built positionally). UnsupportedFeature if splice
+        // appears inside a syntax-quoted vector.
+        .vector => |items| try expandSyntaxQuoteVector(ctx, scope, call_form, items, payload.origin),
+        // Deferred: map/set/nested-syntax-quote and other
         // reader macros need explicit support (peer-AI turn 58
         // §D7/D10). v1 raises MalformedMacroCall via the
         // MacroExpansionFailure bucket.
         else => return MacroexpandError.MalformedMacroCall,
     };
+}
+
+/// Step #8c.3: walk a syntax-quoted vector. Simpler than the
+/// list walker — no splice support in v1 (binding vectors are
+/// built positionally; splicing into vectors is rare and
+/// requires concat-of-vectors machinery that's not worth the
+/// extra surface).
+fn expandSyntaxQuoteVector(
+    ctx: *MacroexpandContext,
+    scope: *GensymScope,
+    call_form: *const Form,
+    items: []const *Form,
+    origin: reader_mod.SrcSpan,
+) MacroexpandError!*Form {
+    // Reject splices inside vectors for v1.
+    for (items) |it| {
+        if (it.datum == .unquote_splicing) return MacroexpandError.MalformedMacroCall;
+    }
+    const seg_items = try ctx.allocator.alloc(*Form, items.len + 1);
+    seg_items[0] = try makeSymbol(ctx, "#%vector", origin);
+    for (items, 0..) |item, i| {
+        seg_items[1 + i] = try expandSyntaxQuotePayload(ctx, scope, call_form, item);
+    }
+    return try makeList(ctx, seg_items, origin);
 }
 
 /// Walk the items of a syntax-quoted list. Groups runs of

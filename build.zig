@@ -186,6 +186,8 @@ pub fn build(b: *std.Build) void {
     // allocator wrappers; pulling them in does NOT pull GC.
     vm_mod.addImport("heap", heap_mod);
     vm_mod.addImport("list", list_mod);
+    // Step #8c.3: VM owns `coll:vector` runtime construction.
+    vm_mod.addImport("vector", vector_mod);
     // Step E1 (pre-#8): VM owns an `Interner` for quoted-symbol /
     // quoted-keyword Value construction. Per peer-AI turn 55 §K
     // (macro execution model preflight), the compile-side
@@ -366,8 +368,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
-        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern" } },
-        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "macroexpand" } },
+        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector" } },
+        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "macroexpand", "vector" } },
         .{ .name = "macroexpand", .path = "src/macroexpand.zig", .imports = &.{ "reader", "intern" } },
     };
 
@@ -684,6 +686,7 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("intern", intern_mod);
     cli_mod.addImport("macroexpand", macroexpand_mod);
     cli_mod.addImport("list", list_mod);
+    cli_mod.addImport("vector", vector_mod);
 
     const nexis_exe = b.addExecutable(.{
         .name = "nexis",

@@ -137,6 +137,12 @@ pub const Tiny = union(enum) {
     /// to a list at runtime (KindMismatch trap otherwise);
     /// result is the left-to-right concatenation.
     concat: []const *const Tiny,
+    /// Step #8c.3: runtime vector construction. IR for the
+    /// `#%vector` special form emitted by syntax-quote and by
+    /// `lowerQuotePayload` for vector payloads. Same block-
+    /// allocation pattern as `list_construct`; backend emits
+    /// `coll:vector`.
+    vector_construct: []const *const Tiny,
     /// `(+ lhs rhs)`. Sub-expressions are recursive.
     add: struct {
         lhs: *const Tiny,
@@ -1181,6 +1187,7 @@ fn lowerList(
         // quote will emit in step #8c.2.
         if (std.mem.eql(u8, name, "#%list")) return try lowerInternalList(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "#%concat")) return try lowerInternalConcat(allocator, items[1..], ctx);
+        if (std.mem.eql(u8, name, "#%vector")) return try lowerInternalVector(allocator, items[1..], ctx);
         // Binding forms (step #7c).
         if (std.mem.eql(u8, name, "let*")) return try lowerLetStar(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "loop*")) return try lowerLoopStar(allocator, items[1..], ctx);
@@ -1286,6 +1293,18 @@ fn lowerInternalConcat(
     return try allocTiny(allocator, .{ .concat = tiny_items });
 }
 
+/// Step #8c.3: lower `(#%vector a b c)` — same pattern as
+/// `#%list` but emits Tiny.vector_construct (backend: coll:vector).
+fn lowerInternalVector(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    ctx: LowerCtx,
+) CompileError!*Tiny {
+    const tiny_items = try allocator.alloc(*const Tiny, args.len);
+    for (args, 0..) |a, i| tiny_items[i] = try lowerFormEnv(allocator, a, ctx);
+    return try allocTiny(allocator, .{ .vector_construct = tiny_items });
+}
+
 /// Shared implementation for `(quote x)` and the reader-macro
 /// `'x` (which the reader emits as `Datum.quote`).
 ///
@@ -1339,9 +1358,18 @@ fn lowerQuotePayload(
             }
             break :blk try allocTiny(allocator, .{ .list_construct = tiny_items });
         },
-        // Quoted strings, chars, reals, vector/map/set: defer.
-        // Per peer-AI turn 58 §D10: collection literals beyond
-        // list await stdlib-aware lowering in Phase 3.
+        // Step #8c.3: quoted compound vector. Same pattern as
+        // quoted list — elements are recursively quote-lowered.
+        .vector => |items| blk: {
+            const tiny_items = try allocator.alloc(*const Tiny, items.len);
+            for (items, 0..) |item, i| {
+                tiny_items[i] = try lowerQuotePayload(allocator, item, ctx);
+            }
+            break :blk try allocTiny(allocator, .{ .vector_construct = tiny_items });
+        },
+        // Quoted strings, chars, reals, map/set: defer.
+        // Per peer-AI turn 58 §D10: map/set literals need
+        // stdlib-aware lowering in Phase 3.
         else => return CompileError.UnsupportedFeature,
     };
 }
@@ -2026,6 +2054,7 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
         .literal => {}, // leaf — Value constants have no free vars
         .list_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
         .concat => |items| for (items) |it| try freeVars(allocator, it, env, out),
+        .vector_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
         .def => |d| {
             // def's RHS is the only sub-expression that can carry
             // free vars; the name itself is a NAMESPACE-LEVEL
@@ -2189,6 +2218,7 @@ fn capturedByDescendantFns(
         .literal => {}, // leaf — Value constants have no descendant fns
         .list_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
         .concat => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
+        .vector_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
         .def => |d| {
             // RHS may contain inner fns; analyze.
             if (d.value) |val| try capturedByDescendantFns(allocator, val, env, out);
@@ -2245,6 +2275,7 @@ fn compileExpr(
         .symbol => |name| try compileSymbol(e, name, dst),
         .list_construct => |items| try compileListConstruct(e, items, dst),
         .concat => |items| try compileConcat(e, items, dst),
+        .vector_construct => |items| try compileVectorConstruct(e, items, dst),
         .add => |a| try compileAdd(e, a.lhs, a.rhs, dst),
         .lt => |a| try compileLt(e, a.lhs, a.rhs, dst),
         .if_ => |i| try compileIf(e, i.test_, i.then, i.else_, dst, recur_target),
@@ -2325,6 +2356,26 @@ fn compileConcat(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError
         try compileExpr(e, item, slot, null);
     }
     try e.emit(vm.asm_.collConcat(arg_base, argc, dst));
+}
+
+/// Step #8c.3: compile `#%vector`. Same pattern as `#%list`;
+/// backend emits `coll:vector` which routes through
+/// `vector_mod.fromSlice` (RRB persistent vector).
+fn compileVectorConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
+    if (items.len == 0) {
+        try e.emit(vm.asm_.collVector(dst, 0, dst));
+        return;
+    }
+    const argc: u12 = if (items.len <= std.math.maxInt(u12))
+        @intCast(items.len)
+    else
+        return CompileError.SlotOverflow;
+    const arg_base = try e.allocSlotBlock(argc);
+    for (items, 0..) |item, i| {
+        const slot: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
+        try compileExpr(e, item, slot, null);
+    }
+    try e.emit(vm.asm_.collVector(arg_base, argc, dst));
 }
 
 fn compileAdd(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) CompileError!void {
@@ -7064,9 +7115,42 @@ test "compile #8c.2: unquote outside syntax-quote → MacroExpansionFailure" {
     );
 }
 
-test "compile #8c.2: syntax-quote of vector still UnsupportedFeature (deferred)" {
-    // Per peer-AI turn 58 §D10 — vector/map/set syntax-quote
-    // requires runtime vector construction which is #8c.3.
+// ---- step #8c.3: vector support (coll:vector + #%vector) ----
+
+test "compile #8c.3: (quote [1 2 3]) builds a persistent vector" {
+    var r = try runSourceFull("(quote [1 2 3])");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .persistent_vector);
+    const vec_mod = @import("vector");
+    try testing.expectEqual(@as(usize, 3), vec_mod.count(r.result));
+    try testing.expectEqual(@as(i64, 1), vec_mod.nth(r.result, 0).asFixnum());
+    try testing.expectEqual(@as(i64, 2), vec_mod.nth(r.result, 1).asFixnum());
+    try testing.expectEqual(@as(i64, 3), vec_mod.nth(r.result, 2).asFixnum());
+}
+
+test "compile #8c.3: (quote []) builds empty vector" {
+    var r = try runSourceFull("(quote [])");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .persistent_vector);
+    const vec_mod = @import("vector");
+    try testing.expectEqual(@as(usize, 0), vec_mod.count(r.result));
+}
+
+test "compile #8c.3: `[~x ~y] syntax-quote with unquote" {
+    var r = try runSourceFull(
+        \\(let* [x 10 y 20] `[~x ~y])
+    );
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .persistent_vector);
+    const vec_mod = @import("vector");
+    try testing.expectEqual(@as(usize, 2), vec_mod.count(r.result));
+    try testing.expectEqual(@as(i64, 10), vec_mod.nth(r.result, 0).asFixnum());
+    try testing.expectEqual(@as(i64, 20), vec_mod.nth(r.result, 1).asFixnum());
+}
+
+test "compile #8c.3: syntax-quoted vector + splice → MacroExpansionFailure" {
+    // Vectors don't support splice in v1 (peer-AI turn 58 §D10
+    // simplification — binding vectors are built positionally).
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -7078,11 +7162,25 @@ test "compile #8c.2: syntax-quote of vector still UnsupportedFeature (deferred)"
     defer host_macros.deinit(testing.allocator);
     try testing.expectError(
         CompileError.MacroExpansionFailure,
-        compileSourceFullWithMacros(arena.allocator(), "`[1 2 3]", null, interner, &host_macros),
+        compileSourceFullWithMacros(arena.allocator(), "(let [xs '(1 2)] `[~@xs])", null, interner, &host_macros),
     );
 }
 
-test "compile #8c.1: quoted vector still UnsupportedFeature (deferred)" {
+test "compile #8c.3: nested vector in quoted list" {
+    var r = try runSourceFull("(quote (a [1 2] b))");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    // First element: symbol a
+    try testing.expect(list_mod.head(r.result).kind() == .symbol);
+    // Second element: vector [1 2]
+    const second = list_mod.head(list_mod.tail(r.result));
+    try testing.expect(second.kind() == .persistent_vector);
+    const vec_mod = @import("vector");
+    try testing.expectEqual(@as(usize, 2), vec_mod.count(second));
+}
+
+test "compile #8c.3: (quote (m {})) — quoted map still UnsupportedFeature" {
+    // Map/set runtime construction is Phase 3+ stdlib work.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -7092,10 +7190,9 @@ test "compile #8c.1: quoted vector still UnsupportedFeature (deferred)" {
     const interner = v.ensureInterner();
     try testing.expectError(
         CompileError.UnsupportedFeature,
-        compileSourceFull(arena.allocator(), "(quote [1 2 3])", null, interner),
+        compileSourceFull(arena.allocator(), "(quote {})", null, interner),
     );
 }
-
 test "compile E1: qualified symbol in quote still UnsupportedFeature" {
     // Even with an Interner, qualified symbols are post-v1.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

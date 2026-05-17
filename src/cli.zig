@@ -33,6 +33,7 @@ const reader_mod = @import("reader");
 const intern_mod = @import("intern");
 const macroexpand_mod = @import("macroexpand");
 const list_mod = @import("list");
+const vector_mod = @import("vector");
 
 const Value = value_mod.Value;
 
@@ -76,6 +77,17 @@ fn formatValue(v: Value, interner: *const intern_mod.Interner, writer: anytype) 
                 node = list_mod.tail(node);
             }
             try writer.writeAll(")");
+        },
+        .persistent_vector => {
+            // Step #8c.3: print as [a b c]. Empty as [].
+            try writer.writeAll("[");
+            const n = vector_mod.count(v);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                if (i > 0) try writer.writeAll(" ");
+                try formatValue(vector_mod.nth(v, i), interner, writer);
+            }
+            try writer.writeAll("]");
         },
         else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),
     }

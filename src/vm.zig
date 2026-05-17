@@ -67,6 +67,11 @@ const value_mod = @import("value");
 /// are freed together at `VM.deinit`.
 const heap_mod = @import("heap");
 const list_mod = @import("list");
+/// Step #8c.3: persistent vector for `coll:vector` opcode +
+/// runtime vector construction (the `(#%vector ...)` IR).
+/// Like list_mod, vector_mod is a pure-allocator wrapper —
+/// no GC dependency.
+const vector_mod = @import("vector");
 /// Step E1 (pre-#8 macroexpander prereq, peer-AI turn 55):
 /// the VM owns an `Interner` used by the Form-lowering layer
 /// to convert quoted symbols/keywords into stable `Value`s. The
@@ -234,6 +239,11 @@ pub const CollOp = enum(u6) {
     /// concatenation. Empty concat (argc=0) returns the empty
     /// list. Non-list arg traps `KindMismatch`.
     concat = 1,
+    /// Step #8c.3: `coll:vector A=arg_base B=argc C=dst` —
+    /// build a persistent vector from argc consecutive slots.
+    /// Empty vector (argc=0) via `vector_mod.empty(heap)`.
+    /// Allocates via `vector_mod.fromSlice` for argc>0.
+    vector = 2,
     _,
 };
 
@@ -1818,6 +1828,7 @@ pub const VM = struct {
         switch (variant) {
             .list => try self.execCollList(inst),
             .concat => try self.execCollConcat(inst),
+            .vector => try self.execCollVector(inst),
             _ => return VmError.BytecodeCorruption,
         }
     }
@@ -1909,6 +1920,45 @@ pub const VM = struct {
             k -= 1;
             result = list_mod.cons(heap, elements.items[k], result) catch return VmError.OutOfMemory;
         }
+        try self.store(.{ .kind = .slot, .index = dst }, result);
+    }
+
+    /// `coll:vector A=arg_base B=argc C=dst` — build a
+    /// persistent vector from argc slot values via
+    /// `vector_mod.fromSlice`. Step #8c.3.
+    fn execCollVector(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
+        const arg_base: u12 = inst.a.index;
+        const argc: u12 = inst.b.index;
+        const dst: u12 = inst.c.index;
+
+        const frame = self.currentFrame();
+        const last_arg_slot: u32 = @as(u32, arg_base) + @as(u32, argc);
+        if (last_arg_slot > frame.slot_count) return VmError.OperandOutOfRange;
+
+        const heap = self.ensureHeap();
+        if (argc == 0) {
+            const result = vector_mod.empty(heap) catch return VmError.OutOfMemory;
+            try self.store(.{ .kind = .slot, .index = dst }, result);
+            return;
+        }
+        // Collect elements into a temp slice then hand to
+        // fromSlice. The slice escapes the loop, so we allocate
+        // from runtime_arena.
+        var elems = std.ArrayList(Value).empty;
+        defer elems.deinit(self.runtime_arena.allocator());
+        try elems.ensureTotalCapacity(self.runtime_arena.allocator(), argc);
+        var i: usize = 0;
+        while (i < argc) : (i += 1) {
+            const arg_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
+            const arg_val = (try self.slotPtr(arg_idx)).*;
+            try elems.append(self.runtime_arena.allocator(), arg_val);
+        }
+        // GC TODO (peer-AI turn 58 §D3): vector node allocation
+        // can collect once GC integrates; the temp elems slice
+        // must be rooted during the build.
+        const result = vector_mod.fromSlice(heap, elems.items) catch return VmError.OutOfMemory;
         try self.store(.{ .kind = .slot, .index = dst }, result);
     }
 };
@@ -2142,6 +2192,18 @@ pub const asm_ = struct {
         return Inst.primary(
             .coll,
             CollOp.concat,
+            Operand.slot(arg_base),
+            .{ .kind = .unused, .index = argc },
+            Operand.slot(dst),
+        );
+    }
+
+    /// coll:vector arg_base argc dst  ; slot[dst] := vector
+    /// built from argc consecutive slot values. Step #8c.3.
+    pub fn collVector(arg_base: u12, argc: u12, dst: u12) Inst {
+        return Inst.primary(
+            .coll,
+            CollOp.vector,
             Operand.slot(arg_base),
             .{ .kind = .unused, .index = argc },
             Operand.slot(dst),
