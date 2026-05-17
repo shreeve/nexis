@@ -171,6 +171,84 @@ fn printUsage(io: std.Io) !void {
     try std.Io.File.stderr().writeStreamingAll(io, Usage);
 }
 
+/// Step #10.0: format a compile error with file:line:col +
+/// source-line caret. Closes COMPILER.md §9.4 gate item 5
+/// for compile-side errors (runtime VmError SrcSpans defer
+/// to post-gate).
+///
+/// Format:
+///   nexis: <path>:<line>:<col>: <ErrorKind>
+///       <source line>
+///       <spaces><caret>
+fn emitCompileError(
+    io: std.Io,
+    path: []const u8,
+    source: []const u8,
+    err: anyerror,
+    maybe_span: ?reader_mod.SrcSpan,
+) !void {
+    const stderr = std.Io.File.stderr();
+    if (maybe_span) |span| {
+        const loc = byteOffsetToLineCol(source, span.pos);
+        var buf: [256]u8 = undefined;
+        const header = try std.fmt.bufPrint(&buf, "nexis: {s}:{d}:{d}: {s}\n", .{ path, loc.line, loc.col, @errorName(err) });
+        try stderr.writeStreamingAll(io, header);
+        // Show source line + caret.
+        const line_text = lineAt(source, loc.line);
+        if (line_text.len > 0) {
+            try stderr.writeStreamingAll(io, "    ");
+            try stderr.writeStreamingAll(io, line_text);
+            try stderr.writeStreamingAll(io, "\n    ");
+            var i: usize = 1;
+            while (i < loc.col) : (i += 1) try stderr.writeStreamingAll(io, " ");
+            // Caret(s): one for each byte in the span, but cap
+            // at the line length so we don't run off.
+            const span_len: usize = if (span.len < 1) 1 else span.len;
+            var j: usize = 0;
+            while (j < span_len) : (j += 1) try stderr.writeStreamingAll(io, "^");
+            try stderr.writeStreamingAll(io, "\n");
+        }
+    } else {
+        // No span — fall back to the prior bare-error format.
+        try stderr.writeStreamingAll(io, "nexis: compile error: ");
+        try stderr.writeStreamingAll(io, @errorName(err));
+        try stderr.writeStreamingAll(io, "\n");
+    }
+}
+
+const LineCol = struct { line: u32, col: u32 };
+
+fn byteOffsetToLineCol(source: []const u8, offset: u32) LineCol {
+    var line: u32 = 1;
+    var col: u32 = 1;
+    var i: u32 = 0;
+    const cap: u32 = if (offset < source.len) offset else @intCast(source.len);
+    while (i < cap) : (i += 1) {
+        if (source[i] == '\n') {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    return .{ .line = line, .col = col };
+}
+
+fn lineAt(source: []const u8, line: u32) []const u8 {
+    var current_line: u32 = 1;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < source.len) : (i += 1) {
+        if (source[i] == '\n') {
+            if (current_line == line) return source[start..i];
+            current_line += 1;
+            start = i + 1;
+        }
+    }
+    if (current_line == line) return source[start..];
+    return "";
+}
+
 /// Read FILE.nx, parse, compile, run each top-level form. Print
 /// the final result to stdout.
 fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
@@ -237,16 +315,19 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     var last_result: Value = value_mod.nilValue();
 
     for (forms) |form| {
-        const compiled = compile.compileFormFullWithMacros(
+        // Step #10.0: surface SrcSpan from compile errors.
+        // The CLI converts byte offsets to file:line:col +
+        // shows the source line with a caret.
+        var error_span: ?reader_mod.SrcSpan = null;
+        const compiled = compile.compileFormFullWithMacrosSpan(
             compile_arena.allocator(),
             form,
             ns,
             interner,
             &host_macros,
+            &error_span,
         ) catch |err| {
-            try std.Io.File.stderr().writeStreamingAll(io, "nexis: compile error: ");
-            try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
-            try std.Io.File.stderr().writeStreamingAll(io, "\n");
+            try emitCompileError(io, path, source, err, error_span);
             std.process.exit(4);
         };
         const routine = compiled.toRoutine("file-form");

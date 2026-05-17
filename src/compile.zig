@@ -1929,14 +1929,25 @@ pub fn compileFormFullWithMacros(
     interner: ?*intern_mod.Interner,
     host_macros: ?*const macroexpand_mod.HostMacroTable,
 ) CompileError!Compiled {
+    return compileFormFullWithMacrosSpan(allocator, form, namespace, interner, host_macros, null);
+}
+
+/// Step #10.0: variant of `compileFormFullWithMacros` that
+/// surfaces the source span associated with any error raised.
+/// `out_span`, when non-null, is written with the span of the
+/// most recently-walked Form before the error (best-effort
+/// pointer; precise span tracking per error variant is a
+/// post-gate refinement). Callers ignoring spans pass null
+/// (matches the prior signature).
+pub fn compileFormFullWithMacrosSpan(
+    allocator: std.mem.Allocator,
+    form: *const reader_mod.Form,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+    host_macros: ?*const macroexpand_mod.HostMacroTable,
+    out_span: ?*?reader_mod.SrcSpan,
+) CompileError!Compiled {
     var working_form: *const reader_mod.Form = form;
-    // Step #8c.2: run the macroexpander whenever an interner
-    // is available, even if the host_macros table is null or
-    // empty. Syntax-quote handling is built into the expander
-    // (not a macro-table entry), so a form like `` `(1 2 3) ``
-    // requires the expander to fire regardless of registered
-    // macros. An empty table = "no user macros to fire," not
-    // "skip expansion entirely."
     if (interner != null) {
         const empty_table: macroexpand_mod.HostMacroTable = .{};
         const table_to_use: *const macroexpand_mod.HostMacroTable =
@@ -1947,15 +1958,35 @@ pub fn compileFormFullWithMacros(
             .host_macros = table_to_use,
         };
         working_form = macroexpand_mod.expandForm(&mctx, null, form) catch |err| switch (err) {
-            error.ExpansionDepthExceeded => return CompileError.MacroDepthExceeded,
-            error.MalformedMacroCall => return CompileError.MacroExpansionFailure,
-            error.MacroReturnedNull => return CompileError.MacroExpansionFailure,
+            error.ExpansionDepthExceeded => {
+                if (out_span) |s| s.* = form.origin;
+                return CompileError.MacroDepthExceeded;
+            },
+            error.MalformedMacroCall => {
+                if (out_span) |s| s.* = form.origin;
+                return CompileError.MacroExpansionFailure;
+            },
+            error.MacroReturnedNull => {
+                if (out_span) |s| s.* = form.origin;
+                return CompileError.MacroExpansionFailure;
+            },
             error.OutOfMemory => return CompileError.OutOfMemory,
         };
     }
     const ctx = LowerCtx{ .env = null, .interner = interner };
-    const tiny = try lowerFormEnv(allocator, working_form, ctx);
-    return compileTinyWithNamespace(allocator, tiny, namespace);
+    const tiny = lowerFormEnv(allocator, working_form, ctx) catch |err| {
+        // Backend errors carry the macroexpanded form's span
+        // — closer to the source than nothing. Per peer-AI
+        // turn 60: precise per-error span tracking is a
+        // post-gate refinement; this is the minimum gate-
+        // blocking surface.
+        if (out_span) |s| s.* = working_form.origin;
+        return err;
+    };
+    return compileTinyWithNamespace(allocator, tiny, namespace) catch |err| {
+        if (out_span) |s| s.* = working_form.origin;
+        return err;
+    };
 }
 
 /// End-to-end: parse + read + lower + compile a source string.
@@ -2011,14 +2042,47 @@ pub fn compileSourceFullWithMacros(
     interner: ?*intern_mod.Interner,
     host_macros: ?*const macroexpand_mod.HostMacroTable,
 ) CompileError!Compiled {
-    var p = reader_mod.parser.parseForm(allocator, source) catch
+    return compileSourceFullWithMacrosSpan(
+        allocator,
+        source,
+        namespace,
+        interner,
+        host_macros,
+        null,
+    );
+}
+
+/// Step #10.0: end-to-end source compile with span surfacing.
+/// Mirrors `compileFormFullWithMacrosSpan`. Reader errors set
+/// span to `null` (the reader's own error machinery owns that
+/// surface — see `reader.readOneForm`'s ErrorKind for spans
+/// from the reader layer).
+pub fn compileSourceFullWithMacrosSpan(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+    host_macros: ?*const macroexpand_mod.HostMacroTable,
+    out_span: ?*?reader_mod.SrcSpan,
+) CompileError!Compiled {
+    var p = reader_mod.parser.parseForm(allocator, source) catch {
+        // Reader errors don't have a clean SrcSpan to surface
+        // through this API in #10.0; leave out_span null.
         return CompileError.ReaderFailure;
+    };
     defer p.parser.deinit();
     var reader = reader_mod.Reader.init(allocator, source);
     defer reader.deinit();
     const form = reader.readOneForm(p.sexp) catch
         return CompileError.ReaderFailure;
-    return compileFormFullWithMacros(allocator, form, namespace, interner, host_macros);
+    return compileFormFullWithMacrosSpan(
+        allocator,
+        form,
+        namespace,
+        interner,
+        host_macros,
+        out_span,
+    );
 }
 
 // =============================================================================
@@ -7635,6 +7699,81 @@ test "compile #9.1: handler stack doesn't leak across normal exits" {
         try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
     }
     try testing.expectError(vm.VmError.UncaughtThrow, v.run());
+}
+
+// ---- step #10.0: SrcSpan in compile error reports ----------
+
+test "compile #10.0: out_span set on macro expansion failure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+
+    var span: ?reader_mod.SrcSpan = null;
+    const result = compileSourceFullWithMacrosSpan(
+        arena.allocator(),
+        "(when)", // malformed: when needs a test
+        null,
+        interner,
+        &host_macros,
+        &span,
+    );
+    try testing.expectError(CompileError.MacroExpansionFailure, result);
+    // Span surfaced — pointing at or near the offending form.
+    // Exact pos byte depends on reader's origin convention; we
+    // just confirm it's set and within source bounds.
+    try testing.expect(span != null);
+    try testing.expect(span.?.pos < 10);
+}
+
+test "compile #10.0: out_span on malformed if" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    var span: ?reader_mod.SrcSpan = null;
+    const result = compileSourceFullWithMacrosSpan(
+        arena.allocator(),
+        "(if)",
+        null,
+        interner,
+        &host_macros,
+        &span,
+    );
+    try testing.expectError(CompileError.MacroExpansionFailure, result);
+    try testing.expect(span != null);
+}
+
+test "compile #10.0: legacy compileSourceFullWithMacros API still works (backwards-compat)" {
+    // The pre-#10.0 entry point (no out_span) remains valid;
+    // it delegates to the Span variant with null out_span.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    const result = compileSourceFullWithMacros(
+        arena.allocator(),
+        "(when)",
+        null,
+        interner,
+        &host_macros,
+    );
+    try testing.expectError(CompileError.MacroExpansionFailure, result);
 }
 
 test "compile E1: qualified symbol in quote still UnsupportedFeature" {
