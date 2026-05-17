@@ -30,7 +30,7 @@ runtime, no compiler, no collections — those are Phase 1+ (`PLAN.md` §21).
 6. **`docs/NEXTOMIC.md`** — post-v1 Datomic-class database architecture on
    nexis + emdb. Not a v1 deliverable; read only when Nextomic is being
    scoped or when a v1 decision might preclude it.
-7. **`ZIG-0.16.0-REFERENCE.md`** + **`ZIG-0.16.0-QUICKSTART.md`** — mandatory
+7. **`ZIG-0.16.0.md`** — mandatory
    before writing any Zig. 30+ stdlib APIs changed between 0.15 and 0.16 in
    ways that silently break training-data code.
 
@@ -135,7 +135,7 @@ because it's convenient, stop.
 
 - `std.heap.GeneralPurposeAllocator` is **gone** in 0.16.0. Use
   `std.heap.DebugAllocator(.{})` or the `init.gpa` from `pub fn main(init:
-  std.process.Init)`. See `ZIG-0.16.0-QUICKSTART.md`.
+  std.process.Init)`. See `ZIG-0.16.0.md`.
 - `std.fs.cwd()` → `std.Io.Dir.cwd()`; most FS ops now take `io: std.Io`.
 - `std.io.Writer.fixed` → `std.Io.Writer.fixed`. `std.io.fixedBufferStream`
   is gone.

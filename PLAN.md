@@ -16,7 +16,7 @@
 
 1. **This document** (`PLAN.md`) — end to end. It's long (~2400 lines) but every section exists for a reason. Budget 60–90 minutes.
 2. **`CLOJURE-REVIEW.md`** (at repo root) — documents what we take / adapt / reject from Clojure's actual source code, and why. Explains the rationale behind many decisions in this PLAN.
-3. **`ZIG-0.16.0-REFERENCE.md`** and **`ZIG-0.16.0-QUICKSTART.md`** (at repo root) — **mandatory** before writing any Zig. 30+ stdlib APIs changed between 0.15 and 0.16 in ways that will silently break code from training data.
+3. **`ZIG-0.16.0.md`** (at repo root) — **mandatory** before writing any Zig. 30+ stdlib APIs changed between 0.15 and 0.16 in ways that will silently break code from training data.
 
 ### Local resources available to you (absolute paths)
 
@@ -35,7 +35,7 @@
 | `docs/SEMANTICS.md` | **to produce in Phase 0** | Numeric corner cases (NaN, -0.0, ±Inf, overflow), print/read contract, cross-type equality examples, nil/empty semantics, metadata matrix (§8.5) |
 | `docs/FORMS.md` | **to produce in Phase 0** | Canonical Form schema (lift from Appendix C §28 for easy reference), reader-to-Form normalization rules, reader/normalizer/macroexpander responsibility boundaries |
 | `docs/CODEC.md` (stub) | **to produce in Phase 0** | Serializability matrix (from §15.10), wire format, round-trip invariants |
-| `AGENTS.md` | **to produce in Phase 0** | Short routing guide: "read PLAN.md end-to-end, then CLOJURE-REVIEW.md, then ZIG-0.16.0-REFERENCE.md; follow §23 frozen decisions; see §24 for open questions." |
+| `AGENTS.md` | **to produce in Phase 0** | Short routing guide: "read PLAN.md end-to-end, then CLOJURE-REVIEW.md, then ZIG-0.16.0.md; follow §23 frozen decisions; see §24 for open questions." |
 
 ### Your Phase 0 deliverables
 
@@ -1887,7 +1887,7 @@ Each phase has a crisp entry criterion (previous gate passed) and exit criterion
   - nested `#(...)` (must reject)
   - `~@` outside a syntax-quote context
 - [ ] `README.md` updated with mission statement, status, and pointers to PLAN.md / CLOJURE-REVIEW.md.
-- [ ] `AGENTS.md` — AI/contributor routing guide: "read PLAN.md, FORMS.md, SEMANTICS.md; ZIG-0.16.0-REFERENCE.md is mandatory before writing Zig."
+- [ ] `AGENTS.md` — AI/contributor routing guide: "read PLAN.md, FORMS.md, SEMANTICS.md; ZIG-0.16.0.md is mandatory before writing Zig."
 - [ ] Directory layout established (§22).
 
 **Exit**:
@@ -2058,7 +2058,7 @@ nexis/
 │   ├── REPL.md
 │   ├── DB.md                         durable-ref + transaction spec
 │   ├── MACROS.md
-│   └── ZIG-0.16.0-REFERENCE.md       (already present)
+│   └── ZIG-0.16.0.md                 (already present)
 ├── test/
 │   ├── unit/                         Zig-level tests
 │   ├── prop/                         property-based tests
@@ -2153,7 +2153,7 @@ The things most likely to go wrong, with mitigations.
 | 5 | Macro expansion non-termination or stack overflow | Medium | Moderate | Expansion depth limit + clear error. |
 | 6 | Tail-call elision breaking debuggability | Low | Moderate | `--emit-tailcall-report` flag; only emit tailcall where safe. |
 | 7 | emdb API changes underneath us | Low | Moderate | Pinned version in `build.zig.zon`; our own tests catch regressions. |
-| 8 | Zig 0.16 stdlib churn | Medium | Moderate | Pinned Zig version; `ZIG-0.16.0-REFERENCE.md` as authoritative. |
+| 8 | Zig 0.16 stdlib churn | Medium | Moderate | Pinned Zig version; `ZIG-0.16.0.md` as authoritative. |
 | 9 | Over-ambition in stdlib leading to shallow v1 | High | Moderate | §17 is the shipping list; things not on it don't ship. |
 | 10 | Scope creep toward "Clojure compatibility" | Medium | Severe | §4 non-goals are doctrine, not wishes. |
 | 11 | ~~RRB implementation complexity stalls Phase 1~~ **Mitigated**: v1 now ships plain 32-way persistent vector (matching Clojure); RRB is v2+. | — | — | Resolved by Clojure source review (§9.2). |

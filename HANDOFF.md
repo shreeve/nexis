@@ -104,7 +104,7 @@ Read this entire prompt before touching anything.
 
 10. AGENTS.md — contributor routing guide.
 
-11. **ZIG-0.16.0-REFERENCE.md + ZIG-0.16.0-QUICKSTART.md — MANDATORY
+11. **ZIG-0.16.0.md — MANDATORY
     before writing any Zig.** 30+ stdlib APIs changed between 0.15
     and 0.16 in ways that silently break training-data code. See
     §6 below for the gotchas that have actually bitten us.
@@ -995,7 +995,7 @@ The force remains with you.
    steps, all green.
 3. Read PLAN.md (75 min). Do not skim §6, §11, §12, §14, §20.2,
    §21, §23.
-4. Read at minimum: AGENTS.md, ZIG-0.16.0-REFERENCE.md, docs/VM.md,
+4. Read at minimum: AGENTS.md, ZIG-0.16.0.md, docs/VM.md,
    docs/COMPILER.md, docs/SEMANTICS.md, docs/VALUE.md.
 5. Post a short status summary:
    - What you read.
