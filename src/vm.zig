@@ -67,6 +67,14 @@ const value_mod = @import("value");
 /// are freed together at `VM.deinit`.
 const heap_mod = @import("heap");
 const list_mod = @import("list");
+/// Step E1 (pre-#8 macroexpander prereq, peer-AI turn 55):
+/// the VM owns an `Interner` used by the Form-lowering layer
+/// to convert quoted symbols/keywords into stable `Value`s. The
+/// macroexpander (step #8) will use the same Interner for
+/// auto-gensym + syntax-quote output. Single shared Interner
+/// means symbol/keyword Value identity is consistent across the
+/// whole VM lifetime.
+const intern_mod = @import("intern");
 const Value = value_mod.Value;
 
 // =============================================================================
@@ -698,6 +706,15 @@ pub const VM = struct {
     /// v1 has a single global namespace; multi-namespace
     /// machinery lands later.
     namespace: ?Namespace = null,
+    /// Step E1 (pre-#8): shared Interner for symbol/keyword
+    /// Value construction. Lazy-initialized on first access.
+    /// Used by the compiler's `lowerQuotePayload` for quoted
+    /// symbols/keywords and (post-#8) by the macroexpander for
+    /// auto-gensym and syntax-quote output. Backed by
+    /// `self.allocator` (NOT runtime_arena) because the
+    /// Interner's internal hash maps need a real allocator
+    /// that supports realloc/free, which arena doesn't.
+    interner: ?intern_mod.Interner = null,
     /// Where the top-level `call:return` stores the returned Value on
     /// halt.
     result: Value = value_mod.nilValue(),
@@ -742,6 +759,9 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *VM) void {
+        // Interner owns hash maps allocated via self.allocator;
+        // free explicitly (step E1).
+        if (self.interner) |*it| it.deinit();
         // Namespace's HashMap storage belongs to us (allocated
         // via self.allocator). Free it explicitly. Var struct
         // memory itself is arena-backed and gets freed below.
@@ -771,6 +791,19 @@ pub const VM = struct {
             self.namespace = Namespace.init(self.allocator, self.runtime_arena.allocator());
         }
         return &self.namespace.?;
+    }
+
+    /// Step E1: lazy-initialize the shared Interner on first
+    /// use. The Interner owns hash maps that need realloc/free,
+    /// so it's backed by `self.allocator`, NOT runtime_arena.
+    /// Symbol/keyword names are owned by the Interner (it
+    /// dupes on intern). Interner.deinit in `VM.deinit` frees
+    /// every interned name.
+    pub fn ensureInterner(self: *VM) *intern_mod.Interner {
+        if (self.interner == null) {
+            self.interner = intern_mod.Interner.init(self.allocator);
+        }
+        return &self.interner.?;
     }
 
     /// Step 5e: lazy-initialize the rest-list heap on first use

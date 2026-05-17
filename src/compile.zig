@@ -66,6 +66,11 @@ const list_mod = @import("list");
 /// the backend stays unchanged (peer-AI turn 51 — Tiny is the IR,
 /// not a parallel codegen path).
 const reader_mod = @import("reader");
+/// Step E1: Interner for quoted symbols/keywords during Form
+/// lowering. The compile-side `lowerQuotePayload` interns
+/// symbols/keywords through the VM's shared Interner so identity
+/// is stable across compile + runtime + (post-#8) macroexpand.
+const intern_mod = @import("intern");
 
 pub const Inst = vm.Inst;
 pub const Routine = vm.Routine;
@@ -98,6 +103,22 @@ pub const Tiny = union(enum) {
     /// COMPILER.md §4.3 priority list. For step #4, locals are
     /// the only resolution category that exists.
     symbol: []const u8,
+    /// Step E1 (pre-#8 macroexpander prereq, peer-AI turn 55):
+    /// generic literal Value constant. Used by `lowerQuotePayload`
+    /// for quoted symbols/keywords (which become symbol/keyword
+    /// Values via the VM's Interner). Eventually (step #8 macro-
+    /// expander output) for quoted compound collections too.
+    ///
+    /// Quoted nil/bool/int still go through the existing Tiny
+    /// variants (peer-AI turn 53 §Q1) — they're cheaper than
+    /// const-pool entries.
+    ///
+    /// **Lifetime constraint**: the Value must be stable for the
+    /// lifetime of the Compiled artifact. Interned symbols/
+    /// keywords satisfy this (the Interner outlives compile +
+    /// VM run). Heap-backed Values from arbitrary sources do NOT
+    /// — only use `Tiny.literal` for Values with stable identity.
+    literal: value_mod.Value,
     /// `(+ lhs rhs)`. Sub-expressions are recursive.
     add: struct {
         lhs: *const Tiny,
@@ -947,6 +968,28 @@ fn allocTiny(allocator: std.mem.Allocator, value: Tiny) CompileError!*Tiny {
     return t;
 }
 
+/// Form-lowering context bundle (step E1, peer-AI turn 55).
+/// Passes both the lexical environment (for intrinsic shadowing)
+/// and the Interner (for quoted-symbol/quoted-keyword Value
+/// construction) through every `lower*` helper. Small (2
+/// pointers); copied by value at each level — child contexts
+/// override `env` while inheriting `interner`.
+///
+/// Why a bundle: every helper that recurses into `lowerFormEnv`
+/// needs to pass BOTH. Threading two parallel parameters through
+/// ~15 helpers is mechanical churn that this struct collapses to
+/// one parameter.
+pub const LowerCtx = struct {
+    env: ?*const LowerEnv = null,
+    interner: ?*intern_mod.Interner = null,
+
+    /// Create a child context with a new env, inheriting the
+    /// Interner unchanged.
+    pub fn withEnv(self: LowerCtx, env: ?*const LowerEnv) LowerCtx {
+        return .{ .env = env, .interner = self.interner };
+    }
+};
+
 /// Form-lowering lexical environment (step #7b, peer-AI turn 53).
 /// Tracks lexical names that are visible in operator position so
 /// the dispatcher can decide whether to inline intrinsics like
@@ -1013,7 +1056,7 @@ pub fn lowerForm(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
 ) CompileError!*Tiny {
-    return lowerFormEnv(allocator, form, null);
+    return lowerFormEnv(allocator, form, .{});
 }
 
 /// Internal `lowerForm` with LowerEnv threading (step #7b). The
@@ -1024,7 +1067,7 @@ pub fn lowerForm(
 fn lowerFormEnv(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     return switch (form.datum) {
         .nil => try allocTiny(allocator, .nil),
@@ -1037,7 +1080,7 @@ fn lowerFormEnv(
             if (name.ns != null) return CompileError.UnsupportedFeature;
             break :blk try allocTiny(allocator, .{ .symbol = name.name });
         },
-        .list => |items| try lowerList(allocator, items, env),
+        .list => |items| try lowerList(allocator, items, ctx),
         // -- Compound datums: land in later #7 sub-steps. --
         // Phase 1 numeric literals beyond fixnum.
         .real, .char, .string, .keyword => return CompileError.UnsupportedFeature,
@@ -1046,7 +1089,7 @@ fn lowerFormEnv(
         // is wired (compile-time call into coll/{champ,vector}).
         .vector, .map, .set => return CompileError.UnsupportedFeature,
         // Reader macros / meta.
-        .quote => |inner| try lowerQuotePayload(allocator, inner),
+        .quote => |inner| try lowerQuotePayload(allocator, inner, ctx),
         .syntax_quote, .unquote, .unquote_splicing => return CompileError.UnsupportedFeature,
         // Atoms aren't a Phase 2 feature.
         .deref => return CompileError.UnsupportedFeature,
@@ -1079,7 +1122,7 @@ fn lowerFormEnv(
 fn lowerList(
     allocator: std.mem.Allocator,
     items: []const *reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (items.len == 0) return CompileError.MalformedForm;
     // Head-symbol dispatch only fires when head is an unqualified
@@ -1088,29 +1131,29 @@ fn lowerList(
     if (items[0].datum == .symbol and items[0].datum.symbol.ns == null) {
         const name = items[0].datum.symbol.name;
         // -- Special forms (NOT shadowable) --
-        if (std.mem.eql(u8, name, "do")) return try lowerDo(allocator, items[1..], env);
-        if (std.mem.eql(u8, name, "if")) return try lowerIf(allocator, items[1..], env);
-        if (std.mem.eql(u8, name, "quote")) return try lowerQuote(allocator, items[1..]);
+        if (std.mem.eql(u8, name, "do")) return try lowerDo(allocator, items[1..], ctx);
+        if (std.mem.eql(u8, name, "if")) return try lowerIf(allocator, items[1..], ctx);
+        if (std.mem.eql(u8, name, "quote")) return try lowerQuote(allocator, items[1..], ctx);
         // Binding forms (step #7c).
-        if (std.mem.eql(u8, name, "let*")) return try lowerLetStar(allocator, items[1..], env);
-        if (std.mem.eql(u8, name, "loop*")) return try lowerLoopStar(allocator, items[1..], env);
-        if (std.mem.eql(u8, name, "recur")) return try lowerRecur(allocator, items[1..], env);
-        if (std.mem.eql(u8, name, "fn*")) return try lowerFnStar(allocator, items[1..], env);
-        if (std.mem.eql(u8, name, "letfn*")) return try lowerLetFnStar(allocator, items[1..], env);
+        if (std.mem.eql(u8, name, "let*")) return try lowerLetStar(allocator, items[1..], ctx);
+        if (std.mem.eql(u8, name, "loop*")) return try lowerLoopStar(allocator, items[1..], ctx);
+        if (std.mem.eql(u8, name, "recur")) return try lowerRecur(allocator, items[1..], ctx);
+        if (std.mem.eql(u8, name, "fn*")) return try lowerFnStar(allocator, items[1..], ctx);
+        if (std.mem.eql(u8, name, "letfn*")) return try lowerLetFnStar(allocator, items[1..], ctx);
         // Var forms (step #7d).
-        if (std.mem.eql(u8, name, "def")) return try lowerDef(allocator, items[1..], env);
-        if (std.mem.eql(u8, name, "defn")) return try lowerDefn(allocator, items[1..], env);
+        if (std.mem.eql(u8, name, "def")) return try lowerDef(allocator, items[1..], ctx);
+        if (std.mem.eql(u8, name, "defn")) return try lowerDefn(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "var")) return try lowerVarRef(allocator, items[1..]);
         // -- Inlineable intrinsics (shadowable) --
-        if (std.mem.eql(u8, name, "+") and items.len == 3 and !isIntrinsicShadowed(env, name)) {
-            return try lowerAdd(allocator, items[1], items[2], env);
+        if (std.mem.eql(u8, name, "+") and items.len == 3 and !isIntrinsicShadowed(ctx.env, name)) {
+            return try lowerAdd(allocator, items[1], items[2], ctx);
         }
-        if (std.mem.eql(u8, name, "<") and items.len == 3 and !isIntrinsicShadowed(env, name)) {
-            return try lowerLt(allocator, items[1], items[2], env);
+        if (std.mem.eql(u8, name, "<") and items.len == 3 and !isIntrinsicShadowed(ctx.env, name)) {
+            return try lowerLt(allocator, items[1], items[2], ctx);
         }
     }
     // Ordinary call: lower head as callee, rest as args.
-    return try lowerCall(allocator, items, env);
+    return try lowerCall(allocator, items, ctx);
 }
 
 /// `(do exprs...)`. Empty `(do)` lowers to `Tiny.do_` with an
@@ -1120,11 +1163,11 @@ fn lowerList(
 fn lowerDo(
     allocator: std.mem.Allocator,
     body_items: []const *reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     const exprs = try allocator.alloc(*const Tiny, body_items.len);
     for (body_items, 0..) |item, i| {
-        exprs[i] = try lowerFormEnv(allocator, item, env);
+        exprs[i] = try lowerFormEnv(allocator, item, ctx);
     }
     return try allocTiny(allocator, .{ .do_ = exprs });
 }
@@ -1134,13 +1177,13 @@ fn lowerDo(
 fn lowerIf(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len != 2 and args.len != 3) return CompileError.MalformedForm;
-    const test_ = try lowerFormEnv(allocator, args[0], env);
-    const then = try lowerFormEnv(allocator, args[1], env);
+    const test_ = try lowerFormEnv(allocator, args[0], ctx);
+    const then = try lowerFormEnv(allocator, args[1], ctx);
     const else_: ?*const Tiny = if (args.len == 3)
-        try lowerFormEnv(allocator, args[2], env)
+        try lowerFormEnv(allocator, args[2], ctx)
     else
         null;
     return try allocTiny(allocator, .{ .if_ = .{
@@ -1160,22 +1203,53 @@ fn lowerIf(
 fn lowerQuote(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len != 1) return CompileError.MalformedForm;
-    return lowerQuotePayload(allocator, args[0]);
+    return lowerQuotePayload(allocator, args[0], ctx);
 }
 
 /// Shared implementation for `(quote x)` and the reader-macro
 /// `'x` (which the reader emits as `Datum.quote`).
+///
+/// Step E1: quoted symbols/keywords use the Interner from
+/// `ctx.interner` to produce stable symbol/keyword Values
+/// emitted via `Tiny.literal`. Without an Interner
+/// (`ctx.interner == null`), quoted symbols/keywords still
+/// raise `UnsupportedFeature` — the caller is expected to use
+/// `compileSourceFull` / `compileFormFull` to pass an Interner.
+/// Quoted nil/bool/int never need the Interner.
+///
+/// Quoted compound collections (lists/vectors/maps/sets) still
+/// raise `UnsupportedFeature`; they require collection-value
+/// construction at compile time which is step #8 macroexpander
+/// work.
 fn lowerQuotePayload(
     allocator: std.mem.Allocator,
     payload: *const reader_mod.Form,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     return switch (payload.datum) {
         .nil => try allocTiny(allocator, .nil),
         .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
         .int => |n| try allocTiny(allocator, .{ .int = n }),
-        // Quoted symbol/keyword/string/etc.: defer (#8).
+        .symbol => |name| blk: {
+            // Qualified symbols not supported yet (multi-ns is
+            // post-v1).
+            if (name.ns != null) return CompileError.UnsupportedFeature;
+            const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
+            const v = interner.internSymbolValue(name.name) catch return CompileError.OutOfMemory;
+            break :blk try allocTiny(allocator, .{ .literal = v });
+        },
+        .keyword => |name| blk: {
+            if (name.ns != null) return CompileError.UnsupportedFeature;
+            const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
+            const v = interner.internKeywordValue(name.name) catch return CompileError.OutOfMemory;
+            break :blk try allocTiny(allocator, .{ .literal = v });
+        },
+        // Quoted strings, chars, reals, compound collections:
+        // defer to a later commit (step #8 macroexpander forces
+        // most of these).
         else => return CompileError.UnsupportedFeature,
     };
 }
@@ -1186,10 +1260,10 @@ fn lowerAdd(
     allocator: std.mem.Allocator,
     lhs: *const reader_mod.Form,
     rhs: *const reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
-    const t_lhs = try lowerFormEnv(allocator, lhs, env);
-    const t_rhs = try lowerFormEnv(allocator, rhs, env);
+    const t_lhs = try lowerFormEnv(allocator, lhs, ctx);
+    const t_rhs = try lowerFormEnv(allocator, rhs, ctx);
     return try allocTiny(allocator, .{ .add = .{ .lhs = t_lhs, .rhs = t_rhs } });
 }
 
@@ -1198,10 +1272,10 @@ fn lowerLt(
     allocator: std.mem.Allocator,
     lhs: *const reader_mod.Form,
     rhs: *const reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
-    const t_lhs = try lowerFormEnv(allocator, lhs, env);
-    const t_rhs = try lowerFormEnv(allocator, rhs, env);
+    const t_lhs = try lowerFormEnv(allocator, lhs, ctx);
+    const t_rhs = try lowerFormEnv(allocator, rhs, ctx);
     return try allocTiny(allocator, .{ .lt = .{ .lhs = t_lhs, .rhs = t_rhs } });
 }
 
@@ -1210,13 +1284,13 @@ fn lowerLt(
 fn lowerCall(
     allocator: std.mem.Allocator,
     items: []const *reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     std.debug.assert(items.len >= 1);
-    const callee = try lowerFormEnv(allocator, items[0], env);
+    const callee = try lowerFormEnv(allocator, items[0], ctx);
     const args = try allocator.alloc(*const Tiny, items.len - 1);
     for (items[1..], 0..) |item, i| {
-        args[i] = try lowerFormEnv(allocator, item, env);
+        args[i] = try lowerFormEnv(allocator, item, ctx);
     }
     return try allocTiny(allocator, .{ .call = .{ .callee = callee, .args = args } });
 }
@@ -1243,13 +1317,13 @@ fn lowerCall(
 fn lowerBody(
     allocator: std.mem.Allocator,
     body_items: []const *reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (body_items.len == 0) return CompileError.MalformedForm;
-    if (body_items.len == 1) return try lowerFormEnv(allocator, body_items[0], env);
+    if (body_items.len == 1) return try lowerFormEnv(allocator, body_items[0], ctx);
     const exprs = try allocator.alloc(*const Tiny, body_items.len);
     for (body_items, 0..) |item, i| {
-        exprs[i] = try lowerFormEnv(allocator, item, env);
+        exprs[i] = try lowerFormEnv(allocator, item, ctx);
     }
     return try allocTiny(allocator, .{ .do_ = exprs });
 }
@@ -1324,7 +1398,7 @@ fn parseParams(
 fn lowerLetStar(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len < 2) return CompileError.MalformedForm;
     const binding_vec = try expectVector(args[0]);
@@ -1335,18 +1409,18 @@ fn lowerLetStar(
     // Sequential env extension (peer-AI turn 53): each RHS sees
     // prior bindings only. We allocate one child env and grow its
     // name set as we go.
-    var local = LowerEnv{ .parent = env };
+    var local = LowerEnv{ .parent = ctx.env };
     defer local.deinit(allocator);
 
     var i: usize = 0;
     while (i < n_bindings) : (i += 1) {
         const name = try expectUnqualifiedSymbol(binding_vec[i * 2]);
-        const value = try lowerFormEnv(allocator, binding_vec[i * 2 + 1], &local);
+        const value = try lowerFormEnv(allocator, binding_vec[i * 2 + 1], ctx.withEnv(&local));
         bindings[i] = .{ .name = name, .value = value };
         try local.lexical_names.put(allocator, name);
     }
 
-    const body = try lowerBody(allocator, args[1..], &local);
+    const body = try lowerBody(allocator, args[1..], ctx.withEnv(&local));
     return try allocTiny(allocator, .{ .let_star = .{ .bindings = bindings, .body = body } });
 }
 
@@ -1354,7 +1428,7 @@ fn lowerLetStar(
 fn lowerLoopStar(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len < 2) return CompileError.MalformedForm;
     const binding_vec = try expectVector(args[0]);
@@ -1362,18 +1436,18 @@ fn lowerLoopStar(
     const n_bindings = binding_vec.len / 2;
     const bindings = try allocator.alloc(Binding, n_bindings);
 
-    var local = LowerEnv{ .parent = env };
+    var local = LowerEnv{ .parent = ctx.env };
     defer local.deinit(allocator);
 
     var i: usize = 0;
     while (i < n_bindings) : (i += 1) {
         const name = try expectUnqualifiedSymbol(binding_vec[i * 2]);
-        const value = try lowerFormEnv(allocator, binding_vec[i * 2 + 1], &local);
+        const value = try lowerFormEnv(allocator, binding_vec[i * 2 + 1], ctx.withEnv(&local));
         bindings[i] = .{ .name = name, .value = value };
         try local.lexical_names.put(allocator, name);
     }
 
-    const body = try lowerBody(allocator, args[1..], &local);
+    const body = try lowerBody(allocator, args[1..], ctx.withEnv(&local));
     return try allocTiny(allocator, .{ .loop_star = .{ .bindings = bindings, .body = body } });
 }
 
@@ -1383,11 +1457,11 @@ fn lowerLoopStar(
 fn lowerRecur(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     const recur_args = try allocator.alloc(*const Tiny, args.len);
     for (args, 0..) |item, i| {
-        recur_args[i] = try lowerFormEnv(allocator, item, env);
+        recur_args[i] = try lowerFormEnv(allocator, item, ctx);
     }
     return try allocTiny(allocator, .{ .recur = .{ .args = recur_args } });
 }
@@ -1398,7 +1472,7 @@ fn lowerRecur(
 fn lowerFnStar(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len < 2) return CompileError.MalformedForm;
     // Optional self-name: first arg is a symbol (and we have
@@ -1415,13 +1489,13 @@ fn lowerFnStar(
     // Body env: outer env + params + rest + self-name (per
     // peer-AI turn 53 §"fn*"). Each name is added so an inner
     // intrinsic-name reference is correctly shadowed.
-    var body_env = LowerEnv{ .parent = env };
+    var body_env = LowerEnv{ .parent = ctx.env };
     defer body_env.deinit(allocator);
     for (parsed.params) |p| try body_env.lexical_names.put(allocator, p);
     if (parsed.rest_param) |rp| try body_env.lexical_names.put(allocator, rp);
     if (self_name) |n| try body_env.lexical_names.put(allocator, n);
 
-    const body = try lowerBody(allocator, args[pos + 1 ..], &body_env);
+    const body = try lowerBody(allocator, args[pos + 1 ..], ctx.withEnv(&body_env));
     return try allocTiny(allocator, .{ .fn_star = .{
         .name = self_name,
         .params = parsed.params,
@@ -1437,7 +1511,7 @@ fn lowerFnStar(
 fn lowerLetFnStar(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len < 2) return CompileError.MalformedForm;
     const binding_vec = try expectVector(args[0]);
@@ -1445,7 +1519,7 @@ fn lowerLetFnStar(
 
     // Step 1: extract all binding names into a shared env BEFORE
     // lowering any fn body (mutual visibility per Tiny semantics).
-    var local = LowerEnv{ .parent = env };
+    var local = LowerEnv{ .parent = ctx.env };
     defer local.deinit(allocator);
     for (binding_vec, 0..) |entry, i| {
         const entry_items = switch (entry.datum) {
@@ -1475,11 +1549,11 @@ fn lowerLetFnStar(
         var body_env = LowerEnv{ .parent = &local };
         defer body_env.deinit(allocator);
         for (bindings[i].params) |p| try body_env.lexical_names.put(allocator, p);
-        bindings[i].body = try lowerBody(allocator, entry_items[2..], &body_env);
+        bindings[i].body = try lowerBody(allocator, entry_items[2..], ctx.withEnv(&body_env));
     }
 
     // Step 3: lower letfn body with local env.
-    const body = try lowerBody(allocator, args[1..], &local);
+    const body = try lowerBody(allocator, args[1..], ctx.withEnv(&local));
     return try allocTiny(allocator, .{ .letfn_star = .{ .bindings = bindings, .body = body } });
 }
 
@@ -1502,12 +1576,12 @@ fn lowerLetFnStar(
 fn lowerDef(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len != 1 and args.len != 2) return CompileError.MalformedForm;
     const name = try expectUnqualifiedSymbol(args[0]);
     const value: ?*const Tiny = if (args.len == 2)
-        try lowerFormEnv(allocator, args[1], env)
+        try lowerFormEnv(allocator, args[1], ctx)
     else
         null;
     return try allocTiny(allocator, .{ .def = .{ .name = name, .value = value } });
@@ -1519,7 +1593,7 @@ fn lowerDef(
 fn lowerDefn(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
-    env: ?*const LowerEnv,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len < 3) return CompileError.MalformedForm;
     const name = try expectUnqualifiedSymbol(args[0]);
@@ -1528,13 +1602,13 @@ fn lowerDefn(
 
     // Body env: outer env + params + rest + self-name (defn's
     // name IS its self-name per Tiny.defn lowering).
-    var body_env = LowerEnv{ .parent = env };
+    var body_env = LowerEnv{ .parent = ctx.env };
     defer body_env.deinit(allocator);
     for (parsed.params) |p| try body_env.lexical_names.put(allocator, p);
     if (parsed.rest_param) |rp| try body_env.lexical_names.put(allocator, rp);
     try body_env.lexical_names.put(allocator, name);
 
-    const body = try lowerBody(allocator, args[2..], &body_env);
+    const body = try lowerBody(allocator, args[2..], ctx.withEnv(&body_env));
     return try allocTiny(allocator, .{ .defn = .{
         .name = name,
         .params = parsed.params,
@@ -1573,7 +1647,27 @@ pub fn compileFormWithNamespace(
     form: *const reader_mod.Form,
     namespace: ?*vm.Namespace,
 ) CompileError!Compiled {
-    const tiny = try lowerForm(allocator, form);
+    return compileFormFull(allocator, form, namespace, null);
+}
+
+/// Step E1: full form-compile with both namespace AND interner.
+/// Without an Interner, quoted symbols/keywords raise
+/// `UnsupportedFeature`. With one (typically `VM.ensureInterner()`),
+/// `(quote foo)` / `'foo` / `(quote :bar)` / `':bar` all work
+/// end-to-end and produce stable interned symbol/keyword Values.
+///
+/// Lifetime: the returned Compiled holds Values that reference
+/// the Interner's name storage. The Interner must outlive the
+/// Compiled + any VM that runs it (typically by living on the
+/// VM itself).
+pub fn compileFormFull(
+    allocator: std.mem.Allocator,
+    form: *const reader_mod.Form,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+) CompileError!Compiled {
+    const ctx = LowerCtx{ .env = null, .interner = interner };
+    const tiny = try lowerFormEnv(allocator, form, ctx);
     return compileTinyWithNamespace(allocator, tiny, namespace);
 }
 
@@ -1606,6 +1700,18 @@ pub fn compileSourceWithNamespace(
     source: []const u8,
     namespace: ?*vm.Namespace,
 ) CompileError!Compiled {
+    return compileSourceFull(allocator, source, namespace, null);
+}
+
+/// Step E1: end-to-end source compile with namespace AND interner.
+/// Pass `VM.ensureInterner()` to enable quoted-symbol / quoted-
+/// keyword support via real source syntax.
+pub fn compileSourceFull(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+) CompileError!Compiled {
     var p = reader_mod.parser.parseForm(allocator, source) catch
         return CompileError.ReaderFailure;
     defer p.parser.deinit();
@@ -1613,7 +1719,7 @@ pub fn compileSourceWithNamespace(
     defer reader.deinit();
     const form = reader.readOneForm(p.sexp) catch
         return CompileError.ReaderFailure;
-    return compileFormWithNamespace(allocator, form, namespace);
+    return compileFormFull(allocator, form, namespace, interner);
 }
 
 // =============================================================================
@@ -1766,6 +1872,7 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
             // into each arg with the current env.
             for (r.args) |a| try freeVars(allocator, a, env, out);
         },
+        .literal => {}, // leaf — Value constants have no free vars
         .def => |d| {
             // def's RHS is the only sub-expression that can carry
             // free vars; the name itself is a NAMESPACE-LEVEL
@@ -1926,6 +2033,7 @@ fn capturedByDescendantFns(
             // turn 47 §7 catch). Recurse into each.
             for (r.args) |a| try capturedByDescendantFns(allocator, a, env, out);
         },
+        .literal => {}, // leaf — Value constants have no descendant fns
         .def => |d| {
             // RHS may contain inner fns; analyze.
             if (d.value) |val| try capturedByDescendantFns(allocator, val, env, out);
@@ -1978,6 +2086,7 @@ fn compileExpr(
         .nil => try e.emit(vm.asm_.loadNil(dst)),
         .bool => |b| try e.emit(if (b) vm.asm_.loadTrue(dst) else vm.asm_.loadFalse(dst)),
         .int => |n| try compileIntLiteral(e, n, dst),
+        .literal => |v| try compileLiteral(e, v, dst),
         .symbol => |name| try compileSymbol(e, name, dst),
         .add => |a| try compileAdd(e, a.lhs, a.rhs, dst),
         .lt => |a| try compileLt(e, a.lhs, a.rhs, dst),
@@ -1998,6 +2107,15 @@ fn compileExpr(
 fn compileIntLiteral(e: *Emitter, n: i64, dst: u12) CompileError!void {
     const v = value_mod.fromFixnum(n) orelse
         return CompileError.IntegerOutOfFixnumRange;
+    const c = try e.addValueConst(v);
+    try e.emit(vm.asm_.loadConst(dst, c));
+}
+
+/// Step E1: emit a generic Value constant. The Value must have
+/// stable identity (interned symbols/keywords, immediates,
+/// strings owned by the Interner). See `Tiny.literal` doc for
+/// the lifetime contract.
+fn compileLiteral(e: *Emitter, v: value_mod.Value, dst: u12) CompileError!void {
     const c = try e.addValueConst(v);
     try e.emit(vm.asm_.loadConst(dst, c));
 }
@@ -5623,7 +5741,10 @@ test "compile #7b: (quote a b) too many args → MalformedForm" {
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(quote 1 2)"));
 }
 
-test "compile #7b: (quote foo) symbol — defer → UnsupportedFeature" {
+test "compile #7b: (quote foo) symbol via compileSource (no interner) → UnsupportedFeature" {
+    // Without an Interner, quoted symbols still raise
+    // UnsupportedFeature. Use `compileSourceFull` to enable
+    // quoted-symbol support; see the E1 tests below.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.UnsupportedFeature, compileSource(arena.allocator(), "(quote foo)"));
@@ -5993,15 +6114,147 @@ test "compile #7: letfn* with rest param → UnsupportedFeature (Tiny FnBinding 
     );
 }
 
-test "compile #7: 'foo (reader-macro quote of symbol) → UnsupportedFeature" {
-    // Reader emits `'foo` as Datum.quote; quoted symbols
-    // require Tiny.literal + Interner (step #8). Both `'foo`
-    // and `(quote foo)` raise the same error symmetrically.
+test "compile #7: 'foo via compileSource (no interner) → UnsupportedFeature" {
+    // Without an Interner, both `'foo` and `(quote foo)` raise
+    // UnsupportedFeature symmetrically. compileSourceFull
+    // (step E1) closes this — see the E1 tests below.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(
         CompileError.UnsupportedFeature,
         compileSource(arena.allocator(), "'foo"),
+    );
+}
+
+// ---- step E1: Tiny.literal + Interner via compileSourceFull ----
+
+/// Helper: run a source string with both namespace AND interner
+/// from a freshly-built VM, return the result. Caller inspects
+/// the result; the helper does NOT defer-deinit the VM so the
+/// caller controls lifetime (Var-kind / symbol-kind results
+/// reference VM-owned storage).
+fn runSourceFull(src: []const u8) !struct { result: value_mod.Value, vm_owned: vm.VM } {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    errdefer v.deinit();
+    const ns = v.ensureNamespace();
+    const interner = v.ensureInterner();
+    const compiled = try compileSourceFull(arena.allocator(), src, ns, interner);
+    const routine = compiled.toRoutine("src-full");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    return .{ .result = result, .vm_owned = v };
+}
+
+test "compile E1: (quote foo) with interner returns interned symbol Value" {
+    var r = try runSourceFull("(quote foo)");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .symbol);
+}
+
+test "compile E1: 'foo (reader-macro) with interner returns interned symbol Value" {
+    var r = try runSourceFull("'foo");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .symbol);
+}
+
+test "compile E1: (quote :bar) with interner returns interned keyword Value" {
+    var r = try runSourceFull("(quote :bar)");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .keyword);
+}
+
+test "compile E1: ':bar (reader-macro) with interner returns interned keyword Value" {
+    var r = try runSourceFull("':bar");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .keyword);
+}
+
+test "compile E1: 'foo and 'foo intern to the SAME symbol Value (identity stable)" {
+    // Compile two separate programs in the same VM; both intern
+    // `foo` through the same Interner; the resulting Values
+    // must be identical.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const interner = v.ensureInterner();
+
+    // First program.
+    const c1 = try compileSourceFull(arena.allocator(), "'foo", ns, interner);
+    const r1 = c1.toRoutine("p1");
+    v.frames.items[0].routine = &r1;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = r1.slot_count;
+    if (v.stack.items.len < r1.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), r1.slot_count - v.stack.items.len);
+    }
+    const v1 = try v.run();
+
+    // Second program — fresh frame, same VM/interner.
+    const c2 = try compileSourceFull(arena.allocator(), "'foo", ns, interner);
+    const r2 = c2.toRoutine("p2");
+    v.frames.items[0].routine = &r2;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = r2.slot_count;
+    v.halted = false;
+    const v2 = try v.run();
+
+    try testing.expect(v1.kind() == .symbol);
+    try testing.expect(v2.kind() == .symbol);
+    // Interned identity: same tag, same payload.
+    try testing.expectEqual(v1.tag, v2.tag);
+    try testing.expectEqual(v1.payload, v2.payload);
+}
+
+test "compile E1: (quote 42) still uses Tiny.int (no const-pool waste)" {
+    // Quoted scalars (nil/bool/int) lower to existing Tiny
+    // variants directly, per peer-AI turn 53 §Q1. Tiny.literal
+    // only fires for quoted symbols/keywords. We verify behavior
+    // here by checking that compileSourceFull succeeds and
+    // returns the integer.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    const compiled = try compileSourceFull(arena.allocator(), "(quote 42)", null, interner);
+    const routine = compiled.toRoutine("scalar-quote");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "compile E1: qualified symbol in quote still UnsupportedFeature" {
+    // Even with an Interner, qualified symbols are post-v1.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    try testing.expectError(
+        CompileError.UnsupportedFeature,
+        compileSourceFull(arena.allocator(), "'foo/bar", null, interner),
     );
 }
 

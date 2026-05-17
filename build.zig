@@ -186,6 +186,12 @@ pub fn build(b: *std.Build) void {
     // allocator wrappers; pulling them in does NOT pull GC.
     vm_mod.addImport("heap", heap_mod);
     vm_mod.addImport("list", list_mod);
+    // Step E1 (pre-#8): VM owns an `Interner` for quoted-symbol /
+    // quoted-keyword Value construction. Per peer-AI turn 55 §K
+    // (macro execution model preflight), the compile-side
+    // `lowerQuotePayload` interns symbols/keywords through this
+    // shared Interner so identity is stable across compile + run.
+    vm_mod.addImport("intern", intern_mod);
 
     // Step #7a: reader exposed as a proper module so compile.zig
     // can consume `reader.Form` trees. reader.zig uses sibling-
@@ -211,6 +217,11 @@ pub fn build(b: *std.Build) void {
     compile_mod.addImport("list", list_mod);
     // Step #7a: Form-tree input from the reader.
     compile_mod.addImport("reader", reader_mod);
+    // Step E1 (pre-#8): Interner threaded through Form lowering
+    // for quoted-symbol/quoted-keyword Value construction.
+    // The Interner instance comes from the VM at runtime; the
+    // compile-side just imports the type.
+    compile_mod.addImport("intern", intern_mod);
 
     const db_mod = b.createModule(.{
         .root_source_file = b.path("src/db.zig"),
@@ -340,8 +351,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
-        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list" } },
-        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader" } },
+        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern" } },
+        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
