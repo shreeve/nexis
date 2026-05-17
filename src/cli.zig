@@ -32,6 +32,7 @@ const compile = @import("compile");
 const reader_mod = @import("reader");
 const intern_mod = @import("intern");
 const macroexpand_mod = @import("macroexpand");
+const list_mod = @import("list");
 
 const Value = value_mod.Value;
 
@@ -63,10 +64,17 @@ fn formatValue(v: Value, interner: *const intern_mod.Interner, writer: anytype) 
             try writer.print("#'{s}", .{var_obj.name});
         },
         .list => {
+            // Step #8c.1: walk the list and recursively format
+            // each element. Empty list prints as `()`.
             try writer.writeAll("(");
-            // TODO: walk the list once Phase 1's list iterator is
-            // exposed to cli; for now, mark as opaque.
-            try writer.writeAll("...");
+            var node = v;
+            var first = true;
+            while (node.kind() == .list and !list_mod.isEmpty(node)) {
+                if (!first) try writer.writeAll(" ");
+                first = false;
+                try formatValue(list_mod.head(node), interner, writer);
+                node = list_mod.tail(node);
+            }
             try writer.writeAll(")");
         },
         else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),

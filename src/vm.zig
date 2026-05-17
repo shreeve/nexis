@@ -215,6 +215,28 @@ pub const Jump = enum(u6) {
     _,
 };
 
+/// Variants for the `coll` group. Per VM.md §10 group #7
+/// (reserved for collection construction/access ops).
+///
+/// Step #8c.1: `list` and `concat` land as the runtime
+/// substrate for syntax-quote's `(#%list ...)` / `(#%concat ...)`
+/// output. Both take a slot-block (A=base, B=argc, C=dst) and
+/// build an immutable List Value via `VM.heap` (arena-backed
+/// for Phase 2; GC-traced in Phase 4 — peer-AI turn 58 §D3
+/// flagged the rooting TODO for the eventual GC integration).
+pub const CollOp = enum(u6) {
+    /// `coll:list A=arg_base B=argc C=dst` — build a list from
+    /// argc consecutive slots starting at A. Empty list (argc=0)
+    /// is the canonical empty value per `list_mod.empty(heap)`.
+    list = 0,
+    /// `coll:concat A=arg_base B=argc C=dst` — each arg slot
+    /// must hold a list Value; result is the left-to-right
+    /// concatenation. Empty concat (argc=0) returns the empty
+    /// list. Non-list arg traps `KindMismatch`.
+    concat = 1,
+    _,
+};
+
 /// Variants for the `var` group. Per VM.md §10 group #6.
 /// #6a wires `load_var`; #6b adds `store_var` and `var_object`.
 pub const VarOp = enum(u6) {
@@ -1105,8 +1127,9 @@ pub const VM = struct {
             .jump => try self.execJump(inst),
             .closure => try self.execClosure(inst),
             .var_ => try self.execVar(inst),
+            .coll => try self.execColl(inst),
             // Known but not yet implemented in this commit.
-            .coll, .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
+            .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
             // Unrecognized group byte — bytecode corruption.
             _ => return VmError.BytecodeCorruption,
         }
@@ -1775,6 +1798,119 @@ pub const VM = struct {
         const target = var_table[inst.b.index];
         try self.store(inst.a, VM.varToValue(target));
     }
+
+    // -------------------------------------------------------------
+    // Group #7: `coll` — collection construction (step #8c.1)
+    // -------------------------------------------------------------
+    //
+    // Operand convention (range ABI, mirrors call:call):
+    //   A = slot   — first arg slot (must be `.slot` kind)
+    //   B = raw    — argc (raw u12 immediate, kind ignored per §4.5)
+    //   C = slot   — destination slot
+    //
+    // Both opcodes allocate via `self.ensureHeap()` (arena-backed
+    // through Phase 2; GC integration in Phase 4 will require
+    // rooting partial results during construction — see GC TODO
+    // comments below).
+
+    fn execColl(self: *VM, inst: Inst) VmError!void {
+        const variant: CollOp = @enumFromInt(inst.variant);
+        switch (variant) {
+            .list => try self.execCollList(inst),
+            .concat => try self.execCollConcat(inst),
+            _ => return VmError.BytecodeCorruption,
+        }
+    }
+
+    /// `coll:list A=arg_base B=argc C=dst` — read argc values
+    /// from `stack[arg_base .. arg_base+argc]` and build a list
+    /// right-to-left via `list_mod.cons`. Step #8c.1.
+    fn execCollList(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
+        const arg_base: u12 = inst.a.index;
+        const argc: u12 = inst.b.index; // raw immediate (operand kind ignored)
+        const dst: u12 = inst.c.index;
+
+        // Validate the arg block is within the current frame's
+        // logical slot range. Catch malformed bytecode early.
+        const frame = self.currentFrame();
+        const last_arg_slot: u32 = @as(u32, arg_base) + @as(u32, argc);
+        if (last_arg_slot > frame.slot_count) return VmError.OperandOutOfRange;
+
+        const heap = self.ensureHeap();
+        // GC TODO (peer-AI turn 58 §D3): once `list_mod.cons`
+        // can collect, the partial `result` list must be a GC
+        // root for the duration of this loop. For arena-backed
+        // allocation (Phase 2), no rooting needed.
+        var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
+        var i: usize = argc;
+        while (i > 0) {
+            i -= 1;
+            // slotPtr is read-only here; arg slots are within
+            // the same frame, so the pointer is valid for one
+            // step. We deref into a Value (16 bytes) immediately
+            // to avoid holding *Value across the cons call.
+            const arg_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
+            const arg_val = (try self.slotPtr(arg_idx)).*;
+            result = list_mod.cons(heap, arg_val, result) catch return VmError.OutOfMemory;
+        }
+        try self.store(.{ .kind = .slot, .index = dst }, result);
+    }
+
+    /// `coll:concat A=arg_base B=argc C=dst` — each arg must
+    /// be a list Value; result is the left-to-right concat.
+    /// Strategy (peer-AI turn 58 §"Missing trap #4"): traverse
+    /// each input list, collect elements into a temp slice,
+    /// then build the result right-to-left via cons. Avoids
+    /// recursive append on singly-linked lists. Step #8c.1.
+    fn execCollConcat(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
+        const arg_base: u12 = inst.a.index;
+        const argc: u12 = inst.b.index;
+        const dst: u12 = inst.c.index;
+
+        const frame = self.currentFrame();
+        const last_arg_slot: u32 = @as(u32, arg_base) + @as(u32, argc);
+        if (last_arg_slot > frame.slot_count) return VmError.OperandOutOfRange;
+
+        const heap = self.ensureHeap();
+
+        // First pass: collect every element from every list
+        // into a temp ArrayList. We need this because we
+        // don't know the total length upfront, and singly-
+        // linked lists can only be built efficiently right-
+        // to-left. Empty concat → empty list.
+        var elements = std.ArrayList(Value).empty;
+        defer elements.deinit(self.runtime_arena.allocator());
+
+        var i: usize = 0;
+        while (i < argc) : (i += 1) {
+            const arg_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
+            const arg_val = (try self.slotPtr(arg_idx)).*;
+            // Validate: each arg must be a list.
+            if (arg_val.kind() != .list) return VmError.KindMismatch;
+            // Walk the list, collecting elements.
+            var node = arg_val;
+            while (node.kind() == .list and !list_mod.isEmpty(node)) {
+                const head = list_mod.head(node);
+                try elements.append(self.runtime_arena.allocator(), head);
+                node = list_mod.tail(node);
+            }
+        }
+
+        // Second pass: build result right-to-left.
+        // GC TODO (peer-AI turn 58 §D3): partial result needs
+        // rooting once cons can collect.
+        var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
+        var k: usize = elements.items.len;
+        while (k > 0) {
+            k -= 1;
+            result = list_mod.cons(heap, elements.items[k], result) catch return VmError.OutOfMemory;
+        }
+        try self.store(.{ .kind = .slot, .index = dst }, result);
+    }
 };
 
 /// Numeric addition for the math:add opcode. Step #2 supports
@@ -1985,6 +2121,30 @@ pub const asm_ = struct {
             Operand.slot(slot_dst),
             Operand.varRef(var_idx),
             Operand.none,
+        );
+    }
+
+    /// coll:list arg_base argc dst  ; slot[dst] := list from
+    /// argc consecutive slots starting at arg_base. Step #8c.1.
+    pub fn collList(arg_base: u12, argc: u12, dst: u12) Inst {
+        return Inst.primary(
+            .coll,
+            CollOp.list,
+            Operand.slot(arg_base),
+            .{ .kind = .unused, .index = argc }, // B = raw argc immediate
+            Operand.slot(dst),
+        );
+    }
+
+    /// coll:concat arg_base argc dst  ; slot[dst] := concat of
+    /// argc list values starting at arg_base. Step #8c.1.
+    pub fn collConcat(arg_base: u12, argc: u12, dst: u12) Inst {
+        return Inst.primary(
+            .coll,
+            CollOp.concat,
+            Operand.slot(arg_base),
+            .{ .kind = .unused, .index = argc },
+            Operand.slot(dst),
         );
     }
 
@@ -2310,6 +2470,101 @@ test "VM: reading a constant out of range returns OperandOutOfRange" {
     try testing.expectError(VmError.OperandOutOfRange, res);
 }
 
+// ---- Step #8c.1: coll group tests ---------------------------
+
+test "VM #8c.1: coll:list with argc=0 builds the empty list" {
+    var code = [_]Inst{
+        asm_.collList(0, 0, 0), // slot[0] := empty list
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &.{}, 1, "coll-list-empty");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const r = try vm.run();
+    try testing.expect(r.kind() == .list);
+    try testing.expect(list_mod.isEmpty(r));
+}
+
+test "VM #8c.1: coll:list with 3 fixnums builds [1 2 3]" {
+    // slot[0] := 1, slot[1] := 2, slot[2] := 3
+    // slot[3] := list from slots 0..2
+    // return slot[3]
+    const c1 = Const{ .value = value_mod.fromFixnum(1).? };
+    const c2 = Const{ .value = value_mod.fromFixnum(2).? };
+    const c3 = Const{ .value = value_mod.fromFixnum(3).? };
+    var code = [_]Inst{
+        asm_.loadConst(0, 0),
+        asm_.loadConst(1, 1),
+        asm_.loadConst(2, 2),
+        asm_.collList(0, 3, 3),
+        asm_.returnSlot(3),
+    };
+    const routine = makeRoutine(&code, &.{ c1, c2, c3 }, 4, "coll-list-3");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const r = try vm.run();
+    try testing.expect(r.kind() == .list);
+    try testing.expectEqual(@as(i64, 1), list_mod.head(r).asFixnum());
+    try testing.expectEqual(@as(i64, 2), list_mod.head(list_mod.tail(r)).asFixnum());
+    try testing.expectEqual(@as(i64, 3), list_mod.head(list_mod.tail(list_mod.tail(r))).asFixnum());
+    try testing.expect(list_mod.isEmpty(list_mod.tail(list_mod.tail(list_mod.tail(r)))));
+}
+
+test "VM #8c.1: coll:concat with argc=0 builds the empty list" {
+    var code = [_]Inst{
+        asm_.collConcat(0, 0, 0),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &.{}, 1, "coll-concat-empty");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const r = try vm.run();
+    try testing.expect(r.kind() == .list);
+    try testing.expect(list_mod.isEmpty(r));
+}
+
+test "VM #8c.1: coll:concat ([1 2] [3]) → [1 2 3]" {
+    // slot[0] := 1, slot[1] := 2, slot[2] := 3
+    // slot[3] := list from slots 0..1   ; [1 2]
+    // slot[4] := list from slots 2..2   ; [3]
+    // slot[5] := concat from slots 3..4
+    // return slot[5]
+    const c1 = Const{ .value = value_mod.fromFixnum(1).? };
+    const c2 = Const{ .value = value_mod.fromFixnum(2).? };
+    const c3 = Const{ .value = value_mod.fromFixnum(3).? };
+    var code = [_]Inst{
+        asm_.loadConst(0, 0),
+        asm_.loadConst(1, 1),
+        asm_.loadConst(2, 2),
+        asm_.collList(0, 2, 3), // [1 2]
+        asm_.collList(2, 1, 4), // [3]
+        asm_.collConcat(3, 2, 5),
+        asm_.returnSlot(5),
+    };
+    const routine = makeRoutine(&code, &.{ c1, c2, c3 }, 6, "coll-concat");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const r = try vm.run();
+    try testing.expect(r.kind() == .list);
+    try testing.expectEqual(@as(i64, 1), list_mod.head(r).asFixnum());
+    try testing.expectEqual(@as(i64, 2), list_mod.head(list_mod.tail(r)).asFixnum());
+    try testing.expectEqual(@as(i64, 3), list_mod.head(list_mod.tail(list_mod.tail(r))).asFixnum());
+    try testing.expect(list_mod.isEmpty(list_mod.tail(list_mod.tail(list_mod.tail(r)))));
+}
+
+test "VM #8c.1: coll:concat on non-list arg traps KindMismatch" {
+    const c1 = Const{ .value = value_mod.fromFixnum(99).? };
+    var code = [_]Inst{
+        asm_.loadConst(0, 0), // slot[0] := 99 (fixnum, NOT list)
+        asm_.collConcat(0, 1, 1),
+        asm_.returnSlot(1),
+    };
+    const routine = makeRoutine(&code, &.{c1}, 2, "coll-concat-kind");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    try testing.expectError(VmError.KindMismatch, vm.run());
+}
+
 test "VM: exhausting bytecode without return surfaces BytecodeExhausted" {
     var code = [_]Inst{
         asm_.loadNil(0),
@@ -2324,17 +2579,17 @@ test "VM: exhausting bytecode without return surfaces BytecodeExhausted" {
 }
 
 test "VM: known-but-not-implemented group returns UnimplementedOpcode" {
-    // coll group (7) with variant 0 — known group, not wired yet.
+    // transient group (8) with variant 0 — known group, not wired yet.
     //
     // **Placeholder rotation discipline** (peer-AI turn 37): when a
-    // new group lands, this placeholder must rotate to the NEXT
+    // new group lands, this placeholder rotates to the NEXT
     // still-unwired group. History: math → jump → closure → var_
-    // → coll. Next likely: coll → transient → hash → etc.
+    // → coll → transient. Next likely: transient → hash → etc.
     // Use `runWithFuel` (not `run`) so an accidental rotation bug
     // trips fuel exhaustion instead of hanging the suite (22-min
     // hang in step #3 — don't repeat).
     const var_op = Inst.primary(
-        .coll,
+        .transient,
         @as(Mov, @enumFromInt(0)), // variant 0 — placeholder; only the group matters
         Operand.slot(0),
         Operand.slot(0),

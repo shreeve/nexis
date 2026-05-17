@@ -683,6 +683,7 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("reader", reader_mod);
     cli_mod.addImport("intern", intern_mod);
     cli_mod.addImport("macroexpand", macroexpand_mod);
+    cli_mod.addImport("list", list_mod);
 
     const nexis_exe = b.addExecutable(.{
         .name = "nexis",

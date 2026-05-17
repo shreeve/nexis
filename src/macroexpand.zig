@@ -254,6 +254,14 @@ fn expandList(
     if (std.mem.eql(u8, name, "def")) return try expandDef(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "defn")) return try expandDefn(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "var")) return mutCast(list_form); // (var X) — X is just a name, don't expand
+    // Step #8c.1: internal compiler primitives (#%list / #%concat).
+    // Recognized as special forms — NOT user-shadowable, NOT
+    // looked up in the macro table. Args ARE recursively
+    // macroexpanded (per peer-AI turn 58 §D1 + §"Missing trap
+    // #6"): a `(#%list (when x y))` should expand `(when x y)`.
+    if (std.mem.eql(u8, name, "#%list") or std.mem.eql(u8, name, "#%concat")) {
+        return try expandOrdinaryCall(ctx, env, list_form, items, depth);
+    }
 
     // ---- Macro dispatch (shadowable by lexical bindings). -----
     if (env == null or !env.?.contains(name)) {

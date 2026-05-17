@@ -124,6 +124,19 @@ pub const Tiny = union(enum) {
     /// VM run). Heap-backed Values from arbitrary sources do NOT
     /// — only use `Tiny.literal` for Values with stable identity.
     literal: value_mod.Value,
+    /// Step #8c.1 (peer-AI turn 58): runtime list construction
+    /// from N evaluated subexpressions. The IR representation
+    /// of the internal `#%list` special form emitted by the
+    /// syntax-quote walker (#8c.2) AND by `lowerQuotePayload`
+    /// when the quoted payload is a compound list. Each item
+    /// is recursively compiled into a contiguous slot block;
+    /// the backend emits a single `coll:list` opcode.
+    list_construct: []const *const Tiny,
+    /// Step #8c.1: runtime list concatenation. The IR
+    /// representation of `#%concat`. Each arg must evaluate
+    /// to a list at runtime (KindMismatch trap otherwise);
+    /// result is the left-to-right concatenation.
+    concat: []const *const Tiny,
     /// `(+ lhs rhs)`. Sub-expressions are recursive.
     add: struct {
         lhs: *const Tiny,
@@ -1160,6 +1173,14 @@ fn lowerList(
         if (std.mem.eql(u8, name, "do")) return try lowerDo(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "if")) return try lowerIf(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "quote")) return try lowerQuote(allocator, items[1..], ctx);
+        // Step #8c.1: internal compiler primitives for list/concat.
+        // NOT user-shadowable (recognized as special forms in the
+        // dispatcher, never checked against the macro table or
+        // lexical env). Per MACROEXPAND.md §5 + peer-AI turn 56 §5
+        // Trap-4: this is the unshadowable substrate that syntax-
+        // quote will emit in step #8c.2.
+        if (std.mem.eql(u8, name, "#%list")) return try lowerInternalList(allocator, items[1..], ctx);
+        if (std.mem.eql(u8, name, "#%concat")) return try lowerInternalConcat(allocator, items[1..], ctx);
         // Binding forms (step #7c).
         if (std.mem.eql(u8, name, "let*")) return try lowerLetStar(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "loop*")) return try lowerLoopStar(allocator, items[1..], ctx);
@@ -1235,6 +1256,36 @@ fn lowerQuote(
     return lowerQuotePayload(allocator, args[0], ctx);
 }
 
+/// Step #8c.1: lower `(#%list a b c)` — recursively lower each
+/// arg as a normal evaluable expression, then build a
+/// Tiny.list_construct with those subtrees. The args ARE
+/// evaluated (this is NOT quote-like opacity); macros nested
+/// in args do expand. Per peer-AI turn 58 §D1.
+fn lowerInternalList(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    ctx: LowerCtx,
+) CompileError!*Tiny {
+    const tiny_items = try allocator.alloc(*const Tiny, args.len);
+    for (args, 0..) |a, i| tiny_items[i] = try lowerFormEnv(allocator, a, ctx);
+    return try allocTiny(allocator, .{ .list_construct = tiny_items });
+}
+
+/// Step #8c.1: lower `(#%concat a b c)` — same shape as
+/// `#%list`. Each arg must evaluate to a list value at runtime
+/// (KindMismatch trap otherwise — enforced by the VM, not the
+/// compiler, since we can't statically know an expression's
+/// kind in general).
+fn lowerInternalConcat(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    ctx: LowerCtx,
+) CompileError!*Tiny {
+    const tiny_items = try allocator.alloc(*const Tiny, args.len);
+    for (args, 0..) |a, i| tiny_items[i] = try lowerFormEnv(allocator, a, ctx);
+    return try allocTiny(allocator, .{ .concat = tiny_items });
+}
+
 /// Shared implementation for `(quote x)` and the reader-macro
 /// `'x` (which the reader emits as `Datum.quote`).
 ///
@@ -1273,9 +1324,24 @@ fn lowerQuotePayload(
             const v = interner.internKeywordValue(name.name) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
-        // Quoted strings, chars, reals, compound collections:
-        // defer to a later commit (step #8 macroexpander forces
-        // most of these).
+        // Step #8c.1 (peer-AI turn 58 §D6): quoted compound list.
+        // Closes the deferral from #7 — `(quote (1 2 3))` now
+        // works. Each element is recursively quote-lowered (so a
+        // nested `(quote (foo (bar baz)))` builds nested lists
+        // of interned symbols). Lowers to `Tiny.list_construct`
+        // with each element being a literal/recursive quote
+        // payload — NOT a normal evaluation (per the quote
+        // contract: elements are data, not source forms).
+        .list => |items| blk: {
+            const tiny_items = try allocator.alloc(*const Tiny, items.len);
+            for (items, 0..) |item, i| {
+                tiny_items[i] = try lowerQuotePayload(allocator, item, ctx);
+            }
+            break :blk try allocTiny(allocator, .{ .list_construct = tiny_items });
+        },
+        // Quoted strings, chars, reals, vector/map/set: defer.
+        // Per peer-AI turn 58 §D10: collection literals beyond
+        // list await stdlib-aware lowering in Phase 3.
         else => return CompileError.UnsupportedFeature,
     };
 }
@@ -1948,6 +2014,8 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
             for (r.args) |a| try freeVars(allocator, a, env, out);
         },
         .literal => {}, // leaf — Value constants have no free vars
+        .list_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
+        .concat => |items| for (items) |it| try freeVars(allocator, it, env, out),
         .def => |d| {
             // def's RHS is the only sub-expression that can carry
             // free vars; the name itself is a NAMESPACE-LEVEL
@@ -2109,6 +2177,8 @@ fn capturedByDescendantFns(
             for (r.args) |a| try capturedByDescendantFns(allocator, a, env, out);
         },
         .literal => {}, // leaf — Value constants have no descendant fns
+        .list_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
+        .concat => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
         .def => |d| {
             // RHS may contain inner fns; analyze.
             if (d.value) |val| try capturedByDescendantFns(allocator, val, env, out);
@@ -2163,6 +2233,8 @@ fn compileExpr(
         .int => |n| try compileIntLiteral(e, n, dst),
         .literal => |v| try compileLiteral(e, v, dst),
         .symbol => |name| try compileSymbol(e, name, dst),
+        .list_construct => |items| try compileListConstruct(e, items, dst),
+        .concat => |items| try compileConcat(e, items, dst),
         .add => |a| try compileAdd(e, a.lhs, a.rhs, dst),
         .lt => |a| try compileLt(e, a.lhs, a.rhs, dst),
         .if_ => |i| try compileIf(e, i.test_, i.then, i.else_, dst, recur_target),
@@ -2193,6 +2265,56 @@ fn compileIntLiteral(e: *Emitter, n: i64, dst: u12) CompileError!void {
 fn compileLiteral(e: *Emitter, v: value_mod.Value, dst: u12) CompileError!void {
     const c = try e.addValueConst(v);
     try e.emit(vm.asm_.loadConst(dst, c));
+}
+
+/// Step #8c.1: compile `#%list` — allocate a contiguous slot
+/// block for argc items, compile each arg into its slot, then
+/// emit `coll:list arg_base argc dst`. Empty list is a degenerate
+/// case: emit with argc=0 (the VM handles it specially via
+/// `list_mod.empty`).
+///
+/// Block-allocation strategy mirrors `compileCall` (peer-AI
+/// turn 36): reserve the entire block upfront so internal
+/// temporaries from sub-expression compilation don't fragment
+/// the arg slots.
+fn compileListConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
+    if (items.len == 0) {
+        try e.emit(vm.asm_.collList(dst, 0, dst));
+        return;
+    }
+    const argc: u12 = if (items.len <= std.math.maxInt(u12))
+        @intCast(items.len)
+    else
+        return CompileError.SlotOverflow;
+    const arg_base = try e.allocSlotBlock(argc);
+    for (items, 0..) |item, i| {
+        const slot: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
+        // Non-tail position: top-level expressions in a list
+        // construction never tail-call.
+        try compileExpr(e, item, slot, null);
+    }
+    try e.emit(vm.asm_.collList(arg_base, argc, dst));
+}
+
+/// Step #8c.1: compile `#%concat`. Same block-allocation
+/// strategy as `compileListConstruct`; backend emits a
+/// single `coll:concat` opcode that does the runtime
+/// traverse-collect-rebuild.
+fn compileConcat(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
+    if (items.len == 0) {
+        try e.emit(vm.asm_.collConcat(dst, 0, dst));
+        return;
+    }
+    const argc: u12 = if (items.len <= std.math.maxInt(u12))
+        @intCast(items.len)
+    else
+        return CompileError.SlotOverflow;
+    const arg_base = try e.allocSlotBlock(argc);
+    for (items, 0..) |item, i| {
+        const slot: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
+        try compileExpr(e, item, slot, null);
+    }
+    try e.emit(vm.asm_.collConcat(arg_base, argc, dst));
 }
 
 fn compileAdd(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) CompileError!void {
@@ -6756,6 +6878,81 @@ test "compile #8b: nested macros expand correctly" {
     try expectKeywordDefaultMacros(
         "(when (and 1 2) (or false :yes))",
         "yes",
+    );
+}
+
+// ---- step #8c.1: quoted compound + #%list / #%concat ----
+
+test "compile #8c.1: (quote (1 2 3)) returns list [1 2 3]" {
+    var r = try runSourceFull("(quote (1 2 3))");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    try testing.expect(!list_mod.isEmpty(r.result));
+    try testing.expectEqual(@as(i64, 1), list_mod.head(r.result).asFixnum());
+    const t1 = list_mod.tail(r.result);
+    try testing.expectEqual(@as(i64, 2), list_mod.head(t1).asFixnum());
+    const t2 = list_mod.tail(t1);
+    try testing.expectEqual(@as(i64, 3), list_mod.head(t2).asFixnum());
+    try testing.expect(list_mod.isEmpty(list_mod.tail(t2)));
+}
+
+test "compile #8c.1: (quote ()) returns the empty list" {
+    var r = try runSourceFull("(quote ())");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    try testing.expect(list_mod.isEmpty(r.result));
+}
+
+test "compile #8c.1: '(1 2 3) reader-macro form works same as (quote (1 2 3))" {
+    var r = try runSourceFull("'(1 2 3)");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    try testing.expectEqual(@as(i64, 1), list_mod.head(r.result).asFixnum());
+}
+
+test "compile #8c.1: (quote (foo)) — interned symbol inside list" {
+    var r = try runSourceFull("(quote (foo))");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    const h = list_mod.head(r.result);
+    try testing.expect(h.kind() == .symbol);
+}
+
+test "compile #8c.1: (quote (:a :b)) — keywords inside list" {
+    var r = try runSourceFull("(quote (:a :b))");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    const h = list_mod.head(r.result);
+    try testing.expect(h.kind() == .keyword);
+}
+
+test "compile #8c.1: (quote (1 (2 3) 4)) — nested lists" {
+    var r = try runSourceFull("(quote (1 (2 3) 4))");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    // First element is 1.
+    try testing.expectEqual(@as(i64, 1), list_mod.head(r.result).asFixnum());
+    // Second element is the nested list (2 3).
+    const inner = list_mod.head(list_mod.tail(r.result));
+    try testing.expect(inner.kind() == .list);
+    try testing.expectEqual(@as(i64, 2), list_mod.head(inner).asFixnum());
+    try testing.expectEqual(@as(i64, 3), list_mod.head(list_mod.tail(inner)).asFixnum());
+    // Third element is 4.
+    const fourth = list_mod.head(list_mod.tail(list_mod.tail(r.result)));
+    try testing.expectEqual(@as(i64, 4), fourth.asFixnum());
+}
+
+test "compile #8c.1: quoted vector still UnsupportedFeature (deferred)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    try testing.expectError(
+        CompileError.UnsupportedFeature,
+        compileSourceFull(arena.allocator(), "(quote [1 2 3])", null, interner),
     );
 }
 
