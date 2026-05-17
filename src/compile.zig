@@ -1097,7 +1097,10 @@ fn lowerList(
         if (std.mem.eql(u8, name, "recur")) return try lowerRecur(allocator, items[1..], env);
         if (std.mem.eql(u8, name, "fn*")) return try lowerFnStar(allocator, items[1..], env);
         if (std.mem.eql(u8, name, "letfn*")) return try lowerLetFnStar(allocator, items[1..], env);
-        // def, defn, var land in #7d.
+        // Var forms (step #7d).
+        if (std.mem.eql(u8, name, "def")) return try lowerDef(allocator, items[1..], env);
+        if (std.mem.eql(u8, name, "defn")) return try lowerDefn(allocator, items[1..], env);
+        if (std.mem.eql(u8, name, "var")) return try lowerVarRef(allocator, items[1..]);
         // -- Inlineable intrinsics (shadowable) --
         if (std.mem.eql(u8, name, "+") and items.len == 3 and !isIntrinsicShadowed(env, name)) {
             return try lowerAdd(allocator, items[1], items[2], env);
@@ -1478,6 +1481,77 @@ fn lowerLetFnStar(
     // Step 3: lower letfn body with local env.
     const body = try lowerBody(allocator, args[1..], &local);
     return try allocTiny(allocator, .{ .letfn_star = .{ .bindings = bindings, .body = body } });
+}
+
+// =============================================================================
+// Form var-form lowering (step #7d)
+// =============================================================================
+//
+// `def`, `defn`, `(var x)`. The backend (Tiny.def, Tiny.defn,
+// Tiny.var_ref) already handles forward references, identity-
+// stable rebind, and the named-fn placeholder pattern. #7d is
+// purely Form-side dispatch + structural validation.
+//
+// Per peer-AI turn 53 §"defn": LowerEnv does NOT add def/defn
+// names — Vars don't shadow intrinsic inlining under the
+// current rule. `(do (def + f) (+ 1 2))` still inlines to 3.
+// Documented as a staged limitation in the LowerEnv doc comment.
+
+/// `(def name)` or `(def name value)`. Per Tiny.def shape, the
+/// value is optional (declare-only).
+fn lowerDef(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    if (args.len != 1 and args.len != 2) return CompileError.MalformedForm;
+    const name = try expectUnqualifiedSymbol(args[0]);
+    const value: ?*const Tiny = if (args.len == 2)
+        try lowerFormEnv(allocator, args[1], env)
+    else
+        null;
+    return try allocTiny(allocator, .{ .def = .{ .name = name, .value = value } });
+}
+
+/// `(defn name [params... & rest?] body...)`. Sugar for
+/// `(def name (fn* name [params...] body))`, but we lower
+/// directly to `Tiny.defn` which has the same compileDefn path.
+fn lowerDefn(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    if (args.len < 3) return CompileError.MalformedForm;
+    const name = try expectUnqualifiedSymbol(args[0]);
+    const param_vec = try expectVector(args[1]);
+    const parsed = try parseParams(allocator, param_vec);
+
+    // Body env: outer env + params + rest + self-name (defn's
+    // name IS its self-name per Tiny.defn lowering).
+    var body_env = LowerEnv{ .parent = env };
+    defer body_env.deinit(allocator);
+    for (parsed.params) |p| try body_env.lexical_names.put(allocator, p);
+    if (parsed.rest_param) |rp| try body_env.lexical_names.put(allocator, rp);
+    try body_env.lexical_names.put(allocator, name);
+
+    const body = try lowerBody(allocator, args[2..], &body_env);
+    return try allocTiny(allocator, .{ .defn = .{
+        .name = name,
+        .params = parsed.params,
+        .rest_param = parsed.rest_param,
+        .body = body,
+    } });
+}
+
+/// `(var name)` → returns the Var object (NOT its value). Does
+/// not trap on unbound. Maps to Tiny.var_ref.
+fn lowerVarRef(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+) CompileError!*Tiny {
+    if (args.len != 1) return CompileError.MalformedForm;
+    const name = try expectUnqualifiedSymbol(args[0]);
+    return try allocTiny(allocator, .{ .var_ref = .{ .name = name } });
 }
 
 /// Compile a `reader.Form` tree into a `Compiled` artifact, no
@@ -5728,6 +5802,152 @@ test "compile #7c: (fn* (x) body) param spec is list not vector → ExpectedVect
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.ExpectedVector, compileSource(arena.allocator(), "(fn* (x) x)"));
+}
+
+// ---- step #7d: var forms via Form (def/defn/var) ----
+
+/// Helper: run a source string against a fresh VM with its own
+/// namespace, assert the result is a fixnum equal to `expected`.
+fn expectSourceFixnumWithNs(src: []const u8, expected: i64) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const compiled = try compileSourceWithNamespace(arena.allocator(), src, ns);
+    const routine = compiled.toRoutine("src-ns");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    try testing.expectEqual(expected, result.asFixnum());
+}
+
+test "compile #7d: (do (def x 5) x) → 5" {
+    try expectSourceFixnumWithNs("(do (def x 5) x)", 5);
+}
+
+test "compile #7d: (do (def x 5) (def x 10) x) → 10 — rebind preserves identity" {
+    try expectSourceFixnumWithNs("(do (def x 5) (def x 10) x)", 10);
+}
+
+test "compile #7d: (do (defn add1 [n] (+ n 1)) (add1 5)) → 6" {
+    try expectSourceFixnumWithNs("(do (defn add1 [n] (+ n 1)) (add1 5))", 6);
+}
+
+test "compile #7d: (do (defn id [x] x) (id 42)) → 42" {
+    try expectSourceFixnumWithNs("(do (defn id [x] x) (id 42))", 42);
+}
+
+test "compile #7d: defn with recur — (do (defn loop-down [n] (if (< n 1) n (recur (+ n -1)))) (loop-down 5)) → 0" {
+    try expectSourceFixnumWithNs(
+        "(do (defn loop-down [n] (if (< n 1) n (recur (+ n -1)))) (loop-down 5))",
+        0,
+    );
+}
+
+test "compile #7d: defn with rest param — (do (defn first-of [a & r] a) (first-of 7 99 100)) → 7" {
+    try expectSourceFixnumWithNs("(do (defn first-of [a & r] a) (first-of 7 99 100))", 7);
+}
+
+test "compile #7d: canonical forward reference — (do (defn f [] (g)) (defn g [] 42) (f)) → 42" {
+    // The big payoff: real source syntax for the forward-reference
+    // pattern. f compiles when g is unbound (Var interned lazily
+    // via compileSymbol's fall-through); after g is bound, f's
+    // call resolves to g's closure.
+    try expectSourceFixnumWithNs("(do (defn f [] (g)) (defn g [] 42) (f))", 42);
+}
+
+test "compile #7d: (do (def x 5) (let* [x 99] x)) → 99 — lexical local shadows Var" {
+    try expectSourceFixnumWithNs("(do (def x 5) (let* [x 99] x))", 99);
+}
+
+test "compile #7d: forward reference + call before bind → UnboundVar at runtime" {
+    // (do (defn f [] (g)) (f)) — g never defined; f's call to
+    // g traps :unbound-var when invoked.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const compiled = try compileSourceWithNamespace(
+        arena.allocator(),
+        "(do (defn f [] (g)) (f))",
+        ns,
+    );
+    const routine = compiled.toRoutine("fwd-unbound");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    try testing.expectError(vm.VmError.UnboundVar, v.run());
+}
+
+test "compile #7d: (var x) returns the Var object" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const compiled = try compileSourceWithNamespace(arena.allocator(), "(var some-name)", ns);
+    const routine = compiled.toRoutine("var-ref");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    try testing.expect(result.kind() == .var_);
+    const var_obj = vm.VM.asVar(result);
+    try testing.expectEqualStrings("some-name", var_obj.name);
+    try testing.expect(!var_obj.bound);
+}
+
+test "compile #7d: (def) → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(def)"));
+}
+
+test "compile #7d: (def 42 5) → ExpectedSymbol" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.ExpectedSymbol, compileSource(arena.allocator(), "(def 42 5)"));
+}
+
+test "compile #7d: (defn name) without body → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(defn f [x])"));
+}
+
+test "compile #7d: (var) → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(var)"));
+}
+
+test "compile #7d: without namespace, def → UnresolvedSymbol (regression)" {
+    // Preserves the no-namespace semantics from #6b: def needs
+    // a namespace to live in.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(
+        CompileError.UnresolvedSymbol,
+        compileSource(arena.allocator(), "(def x 5)"),
+    );
 }
 
 test "compile: arena cleanup releases code+consts atomically" {
