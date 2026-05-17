@@ -648,6 +648,44 @@ pub fn build(b: *std.Build) void {
     // Golden test runner (src/golden.zig)
     // -------------------------------------------------------------------------
 
+    // -------------------------------------------------------------------------
+    // Step H1 (peer-AI turn 55): minimal CLI runner
+    //
+    // `zig build nexis` produces bin/nexis. `zig build run -- run foo.nx`
+    // builds + runs (forwards args after `--`).
+    // -------------------------------------------------------------------------
+
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_mod.addImport("value", value_mod);
+    cli_mod.addImport("vm", vm_mod);
+    cli_mod.addImport("compile", compile_mod);
+    cli_mod.addImport("reader", reader_mod);
+    cli_mod.addImport("intern", intern_mod);
+
+    const nexis_exe = b.addExecutable(.{
+        .name = "nexis",
+        .root_module = cli_mod,
+    });
+
+    const install_nexis = b.addInstallArtifact(nexis_exe, .{
+        .dest_dir = .{ .override = .{ .custom = ".." } },
+        .dest_sub_path = "bin/nexis",
+    });
+
+    const run_nexis = b.addRunArtifact(nexis_exe);
+    if (b.args) |args| run_nexis.addArgs(args);
+    run_nexis.step.dependOn(&install_nexis.step);
+
+    const nexis_step = b.step("nexis", "Build bin/nexis (the CLI runner)");
+    nexis_step.dependOn(&install_nexis.step);
+
+    const run_step = b.step("run", "Build and run nexis (forwards args after `--`)");
+    run_step.dependOn(&run_nexis.step);
+
     const golden_mod = b.createModule(.{
         .root_source_file = b.path("src/golden.zig"),
         .target = target,
@@ -720,4 +758,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_golden.step);
 
     b.getInstallStep().dependOn(&install_golden.step);
+    b.getInstallStep().dependOn(&install_nexis.step);
 }

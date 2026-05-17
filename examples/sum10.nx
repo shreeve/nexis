@@ -1,0 +1,7 @@
+; examples/sum10.nx — sum 0..9 using loop*/recur in constant
+; stack space. The same shape works for any N.
+
+(loop* [i 0 acc 0]
+  (if (< i 10)
+    (recur (+ i 1) (+ acc i))
+    acc))

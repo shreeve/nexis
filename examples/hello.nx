@@ -1,0 +1,7 @@
+; examples/hello.nx — the first nexis program to compile from
+; actual source through bin/nexis. Step H1 (peer-AI turn 55).
+
+(defn greet [name]
+  name)
+
+(greet 'world)

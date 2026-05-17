@@ -1,0 +1,6 @@
+; examples/forward-ref.nx — defn forward reference. f calls g
+; before g is defined; the var-fall-through resolves at runtime.
+
+(defn f [] (g))
+(defn g [] 42)
+(f)

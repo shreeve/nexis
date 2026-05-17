@@ -1081,9 +1081,18 @@ fn lowerFormEnv(
             break :blk try allocTiny(allocator, .{ .symbol = name.name });
         },
         .list => |items| try lowerList(allocator, items, ctx),
+        // Step E1: bare keywords are self-evaluating per Clojure
+        // semantics. Lowers to Tiny.literal via the Interner.
+        // Without an Interner, falls back to UnsupportedFeature.
+        .keyword => |name| blk: {
+            if (name.ns != null) return CompileError.UnsupportedFeature;
+            const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
+            const v = interner.internKeywordValue(name.name) catch return CompileError.OutOfMemory;
+            break :blk try allocTiny(allocator, .{ .literal = v });
+        },
         // -- Compound datums: land in later #7 sub-steps. --
         // Phase 1 numeric literals beyond fixnum.
-        .real, .char, .string, .keyword => return CompileError.UnsupportedFeature,
+        .real, .char, .string => return CompileError.UnsupportedFeature,
         // Vectors/maps/sets as expressions: collection literals.
         // Land in a later step when collection-value construction
         // is wired (compile-time call into coll/{champ,vector}).
@@ -6241,6 +6250,30 @@ test "compile E1: (quote 42) still uses Tiny.int (no const-pool waste)" {
     }
     const result = try v.run();
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "compile E1: bare :keyword self-evaluates with interner" {
+    var r = try runSourceFull(":hello");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .keyword);
+}
+
+test "compile E1: (if true :yes :no) — bare keywords in if arms" {
+    var r = try runSourceFull("(if true :yes :no)");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .keyword);
+    const id: u32 = @intCast(r.result.payload);
+    try testing.expectEqualStrings("yes", r.vm_owned.ensureInterner().keywordName(id));
+}
+
+test "compile E1: bare keyword without interner → UnsupportedFeature" {
+    // compileSource (no interner) preserves the prior behavior.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(
+        CompileError.UnsupportedFeature,
+        compileSource(arena.allocator(), ":hello"),
+    );
 }
 
 test "compile E1: qualified symbol in quote still UnsupportedFeature" {

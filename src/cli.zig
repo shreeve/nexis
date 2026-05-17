@@ -1,0 +1,256 @@
+//! nexis CLI — minimal source runner.
+//!
+//! Step H1 (peer-AI turn 55). Tiny integration-shell that lets
+//! users execute `.nx` source files without going through Zig
+//! tests. Deliberately small: no REPL, no module loading, no
+//! pretty diagnostics, no watch mode. Future scope (Phase 3):
+//! REPL via `nexis repl`, module loading via `:require`,
+//! structured error rendering with SrcSpans (step #10).
+//!
+//! Usage:
+//!   nexis run FILE.nx     read FILE, parse all top-level forms,
+//!                         compile + run each in order, print
+//!                         the final result.
+//!
+//! Pipeline:
+//!   source bytes
+//!   → parser.parseProgram → Sexp
+//!   → Reader.readProgram  → []const *Form
+//!   → for each form:
+//!       → compileFormFull (VM's ns + interner)
+//!       → VM.run
+//!   → print last result via formatValue
+//!
+//! Multi-form files work because the VM (and its namespace +
+//! interner) persists across iterations; each form re-uses the
+//! same frame, recycled by replacing routine + pc + slot_count.
+
+const std = @import("std");
+const value_mod = @import("value");
+const vm = @import("vm");
+const compile = @import("compile");
+const reader_mod = @import("reader");
+const intern_mod = @import("intern");
+
+const Value = value_mod.Value;
+
+/// Pretty-print a Value to the given writer. Step H1 covers the
+/// kinds the current language produces:
+///   nil / true / false / fixnum / symbol / keyword
+///   function (closure — printed as #<fn>)
+///   var_ (printed as #'name)
+///   list (recursive)
+/// Everything else falls back to a kind-tag placeholder. Phase 3
+/// will replace this with a proper formatValue per VALUE.md.
+fn formatValue(v: Value, interner: *const intern_mod.Interner, writer: anytype) !void {
+    switch (v.kind()) {
+        .nil => try writer.writeAll("nil"),
+        .true_ => try writer.writeAll("true"),
+        .false_ => try writer.writeAll("false"),
+        .fixnum => try writer.print("{d}", .{v.asFixnum()}),
+        .symbol => {
+            const id: u32 = @intCast(v.payload);
+            try writer.print("{s}", .{interner.symbolName(id)});
+        },
+        .keyword => {
+            const id: u32 = @intCast(v.payload);
+            try writer.print(":{s}", .{interner.keywordName(id)});
+        },
+        .function => try writer.writeAll("#<fn>"),
+        .var_ => {
+            const var_obj = vm.VM.asVar(v);
+            try writer.print("#'{s}", .{var_obj.name});
+        },
+        .list => {
+            try writer.writeAll("(");
+            // TODO: walk the list once Phase 1's list iterator is
+            // exposed to cli; for now, mark as opaque.
+            try writer.writeAll("...");
+            try writer.writeAll(")");
+        },
+        else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),
+    }
+}
+
+const Usage =
+    \\nexis — A Lisp where immutable values, transactional durable
+    \\        identity, and historical snapshots are one coherent
+    \\        programming model.
+    \\
+    \\usage: nexis run FILE.nx
+    \\
+    \\Reads FILE.nx, parses all top-level forms, compiles and runs
+    \\each in order, prints the final result. The namespace (Vars
+    \\from `def`/`defn`) and interner persist across forms.
+    \\
+    \\Phase 2 source surface (what compiles today):
+    \\  literals: nil, true, false, integers
+    \\  arithmetic: (+ a b), (< a b)
+    \\  conditionals: (if test then else?), (do ...)
+    \\  bindings: (let* [name1 v1 name2 v2 ...] body...)
+    \\  functions: (fn* name? [params & rest?] body...)
+    \\  recursion: (loop* [...] body...), (recur args...)
+    \\  vars: (def name value?), (defn name [params] body...), (var name)
+    \\  quoting: (quote x), 'x (scalars + interned symbols/keywords)
+    \\  mutual: (letfn* [(name [params] body...) ...] body...)
+    \\
+    \\Limitations (closes as Phase 2 progresses):
+    \\  - macros / syntax-quote: step #8
+    \\  - try/catch/throw: step #9
+    \\  - error spans / structured diagnostics: step #10
+    \\  - REPL / module loading: Phase 3+
+    \\
+;
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+
+    // Iterate the argv stream into a small owned slice. Zig 0.16
+    // moved argv from `process.argsAlloc` to `init.minimal.args`
+    // (an iterator). We collect to a slice for simple indexing.
+    var arg_iter = std.process.Args.Iterator.init(init.minimal.args);
+    defer arg_iter.deinit();
+    var arg_list: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (arg_list.items) |a| allocator.free(a);
+        arg_list.deinit(allocator);
+    }
+    while (arg_iter.next()) |a| {
+        try arg_list.append(allocator, try allocator.dupe(u8, a));
+    }
+    const args = arg_list.items;
+
+    if (args.len < 2) {
+        try printUsage(io);
+        std.process.exit(1);
+    }
+
+    const cmd = args[1];
+    if (std.mem.eql(u8, cmd, "run")) {
+        if (args.len < 3) {
+            try printUsage(io);
+            std.process.exit(1);
+        }
+        try runFile(io, allocator, args[2]);
+    } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
+        try printUsage(io);
+    } else {
+        try std.Io.File.stderr().writeStreamingAll(io, "nexis: unknown command '");
+        try std.Io.File.stderr().writeStreamingAll(io, cmd);
+        try std.Io.File.stderr().writeStreamingAll(io, "' (try `nexis --help`)\n");
+        std.process.exit(1);
+    }
+}
+
+fn printUsage(io: std.Io) !void {
+    try std.Io.File.stderr().writeStreamingAll(io, Usage);
+}
+
+/// Read FILE.nx, parse, compile, run each top-level form. Print
+/// the final result to stdout.
+fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
+    // Read entire file. 16 MB cap is plenty for v1; Phase 3 may
+    // grow when stdlib bootstrap files arrive.
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| {
+        try std.Io.File.stderr().writeStreamingAll(io, "nexis: failed to read '");
+        try std.Io.File.stderr().writeStreamingAll(io, path);
+        try std.Io.File.stderr().writeStreamingAll(io, "': ");
+        try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
+        try std.Io.File.stderr().writeStreamingAll(io, "\n");
+        std.process.exit(2);
+    };
+    defer allocator.free(source);
+
+    // Parser owns its own arena for the Sexp tree.
+    var parse_result = reader_mod.parser.parseProgram(allocator, source) catch |err| {
+        try std.Io.File.stderr().writeStreamingAll(io, "nexis: parse error: ");
+        try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
+        try std.Io.File.stderr().writeStreamingAll(io, "\n");
+        std.process.exit(3);
+    };
+    defer parse_result.parser.deinit();
+
+    // Reader owns its own arena for the Form tree.
+    var reader = reader_mod.Reader.init(allocator, source);
+    defer reader.deinit();
+
+    const forms = reader.readProgram(parse_result.sexp) catch |err| {
+        try std.Io.File.stderr().writeStreamingAll(io, "nexis: reader error: ");
+        try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
+        try std.Io.File.stderr().writeStreamingAll(io, "\n");
+        std.process.exit(3);
+    };
+
+    if (forms.len == 0) {
+        // Empty file → nothing to print. Exit cleanly.
+        return;
+    }
+
+    // Initialize VM with a stub routine; we'll rebind it per
+    // form. The VM owns the namespace + interner that persist
+    // across forms.
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const interner = v.ensureInterner();
+
+    // Compile arena: shared across all top-level forms in this
+    // file. Form trees + Tiny IR + Compiled routines all live
+    // here. Released wholesale at the end.
+    var compile_arena = std.heap.ArenaAllocator.init(allocator);
+    defer compile_arena.deinit();
+
+    var last_result: Value = value_mod.nilValue();
+
+    for (forms) |form| {
+        const compiled = compile.compileFormFull(
+            compile_arena.allocator(),
+            form,
+            ns,
+            interner,
+        ) catch |err| {
+            try std.Io.File.stderr().writeStreamingAll(io, "nexis: compile error: ");
+            try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
+            try std.Io.File.stderr().writeStreamingAll(io, "\n");
+            std.process.exit(4);
+        };
+        const routine = compiled.toRoutine("file-form");
+        v.frames.items[0].routine = &routine;
+        v.frames.items[0].pc = 0;
+        v.frames.items[0].slot_count = routine.slot_count;
+        v.halted = false;
+        // Grow stack if needed.
+        if (v.stack.items.len < routine.slot_count) {
+            try v.stack.appendNTimes(
+                v.allocator,
+                value_mod.nilValue(),
+                routine.slot_count - v.stack.items.len,
+            );
+        }
+        last_result = v.run() catch |err| {
+            try std.Io.File.stderr().writeStreamingAll(io, "nexis: runtime error: ");
+            try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
+            try std.Io.File.stderr().writeStreamingAll(io, "\n");
+            std.process.exit(5);
+        };
+    }
+
+    // Print the final result via a small stack buffer + write to
+    // stdout. Avoids needing a writer adapter; Phase 3+ refactor
+    // can introduce a proper Value formatter.
+    var buf: [4096]u8 = undefined;
+    var stream = std.Io.Writer.fixed(&buf);
+    formatValue(last_result, interner, &stream) catch {
+        // Buffer overflow on a deep/large value — fall back to a
+        // kind tag. Phase 3 replaces this with a streaming
+        // formatter.
+        try std.Io.File.stdout().writeStreamingAll(io, "#<value too large to print>\n");
+        return;
+    };
+    const written = stream.buffered();
+    try std.Io.File.stdout().writeStreamingAll(io, written);
+    try std.Io.File.stdout().writeStreamingAll(io, "\n");
+}

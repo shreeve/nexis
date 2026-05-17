@@ -1,14 +1,29 @@
 # examples
 
-Reserved for end-user-facing `.nx` example programs. Empty for now.
+Tiny `.nx` programs that run via the `nexis` CLI (step H1).
 
-This directory will populate once step #7 (reader.Form integration)
-lands and `.nx` source files compile end-to-end. Initial targets:
+```bash
+# Build the CLI (produces bin/nexis):
+zig build nexis
 
-- `hello.nx` — `(println "hello, world")`
-- `fact.nx` — recursive factorial via `defn` + `recur`
-- `closures.nx` — `(let [counter (let [c 0] (fn [] ...))] ...)` style
-- `defn.nx` — multi-fn programs showing forward references via Vars
+# Run an example:
+./bin/nexis run examples/hello.nx
+```
 
-See `PLAN.md` §21 Phase 3 for the larger roadmap that includes example
-programs and the standard library bootstrap.
+| File | What it shows |
+|---|---|
+| `hello.nx` | Symbol literal via `defn` + call |
+| `sum10.nx` | `loop*`/`recur` constant-stack iteration |
+| `forward-ref.nx` | `defn` forward references work via the namespace Var fall-through (f calls g before g is defined) |
+
+These are the FIRST `.nx` programs to compile + run via the
+CLI. More land as Phase 2/3 progress closes deferred items:
+
+- Phase 2 step #8 (macroexpander): unlocks `when`, `cond`,
+  `and`, `or`, `->`, `->>`, multi-arity `defn`, `#(...)` anon
+  fn shorthand, syntax-quote, quoted compound collections.
+- Phase 2 step #10 (error reporting): structured error
+  messages with source spans.
+- Phase 3 (stdlib): `map`, `reduce`, `filter`, `conj`,
+  `assoc`, threading macros, protocols, multimethods, REPL,
+  multi-namespace support.
