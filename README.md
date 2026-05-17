@@ -17,33 +17,36 @@ identities are first-class values, not a library bolted on top.
 
 ## Status
 
-**Phase 2 in progress** — language core nearly complete; ready for
-reader-form integration. See [`PLAN.md`](PLAN.md) §21 for the phase map
-and [`HANDOFF.md`](HANDOFF.md) for the current state + next task.
+**Phase 2 in progress** — language core + source frontend
+complete; macros / try-catch / error-reporting / Phase 2 gate
+remain. See [`PLAN.md`](PLAN.md) §21 for the phase map and
+[`HANDOFF.md`](HANDOFF.md) for current state + next task.
 
 | Phase | Status | What |
 |---|---|---|
 | Phase 0 | ✓ shipped | Reader: grammar, `@lang` module, Form normalizer, pretty-printer, golden tests |
 | Phase 1 | ✓ shipped | Runtime core: Value model, persistent collections (CHAMP HAMT, RRB vector, list), heap + GC, codec, emdb integration |
-| Phase 2 | ~70% done | Compiler + VM. Steps #1-#6 of [`docs/COMPILER.md`](docs/COMPILER.md) §10 complete. Step #7 (reader-form integration → real `.nx` source files) is next. |
-| Phase 3+ | pending | Macros, standard library, error reporting, golden eval pipeline, performance polish |
+| Phase 2 | ~80% done | Compiler + VM. Steps #1-#7 of [`docs/COMPILER.md`](docs/COMPILER.md) §10 complete: `.nx` source compiles end-to-end through reader → Form → Tiny IR → bytecode → VM. Steps #8-#11 (macros, try/catch, error reporting, golden gate) remain. |
+| Phase 3+ | pending | Standard library (`core.nx` bootstrap), CLI runner / REPL, performance polish |
 
-Working today (via the bootstrap `Tiny` AST in `src/compile.zig`):
+**Working today** — real `.nx` source compiles end-to-end through
+the reader, compiler, and VM. Every snippet below is exercised by
+a passing test against `compileSource()` (`src/compile.zig`):
 
 ```clojure
-;; literals and arithmetic
+;; literals, arithmetic, comparison
 (+ 1 2)                             ;; => 3
 (< 1 2)                             ;; => true
-(if (< 0 5) :yes :no)               ;; => :yes (eventually; keywords land soon)
+(if (< 0 5) 1 2)                    ;; => 1
 
-;; let, fn, closures, captures (with control-flow-safe pre-analysis)
+;; let*, fn*, closures, captures (control-flow-safe pre-analysis)
 (let* [x 5]
   ((fn* [y] (+ x y)) 3))            ;; => 8
 
 ;; named fn* self-reference (Clojure semantics)
 ((fn* fact [n]
    (if (< n 2) n (recur (+ n -1))))
- 5)                                 ;; => 0 (counts down; via recur, constant stack)
+ 5)                                 ;; => 0 (counts down via recur, constant stack)
 
 ;; loop* + recur — constant stack, verified 10k iterations
 (loop* [i 0 acc 0]
@@ -51,22 +54,38 @@ Working today (via the bootstrap `Tiny` AST in `src/compile.zig`):
     (recur (+ i 1) (+ acc i))
     acc))                           ;; => 45
 
-;; mutual recursion via letfn* placeholder cells
-(letfn* [(f [n] (g n))
-         (g [n] (+ n 100))]
-  (f 5))                            ;; => 105
-
-;; vars, def, defn with forward references
-(do (defn f [] (g))
-    (defn g [] 42)
-    (f))                            ;; => 42
+;; letfn* — mutually-recursive bindings via placeholder cells
+(letfn* [(f [] (g))
+         (g [] 99)]
+  (f))                              ;; => 99
 
 ;; variadic & rest
-((fn* [a & r] r) 1 2 3 4)           ;; => (2 3 4)
+((fn* [a & r] a) 1 2 3 4)           ;; => 1
+
+;; vars, def, defn — with forward references
+(do (defn f [] (g))                 ;; g doesn't exist yet
+    (defn g [] 42)                  ;; now it does
+    (f))                            ;; => 42
+
+;; intrinsic shadowing follows lexical scope
+(let* [+ (fn* [a b] 42)]
+  (+ 1 2))                          ;; => 42 (NOT 3 — `+` is shadowed)
+
+(let* [if 1]
+  (if true 2 3))                    ;; => 2 (special forms NOT shadowable)
 ```
 
-Step #7 (next) closes the loop: actual `.nx` source files compile
-end-to-end via the reader.
+There's no CLI runner yet (Phase 3 ships `nexis` as a binary).
+For now, programs run via `compileSource()` from Zig tests; see
+`test "compile #7d: ..."` blocks in `src/compile.zig` for the
+end-to-end pattern.
+
+**Not yet supported in source** (step #8 macroexpander closes
+most of these): quoted symbols / collections (`'foo`, `'(1 2)`),
+anonymous fn shorthand (`#(...)`), syntax-quote (`` ` `` / `~` /
+`~@`), reader metadata (`^{...}`), keywords as values, strings.
+Collection literals (`[1 2]`, `{:a 1}`, `#{1 2}`) as expressions
+require step #8's collection-construction wiring.
 
 ## Build
 
