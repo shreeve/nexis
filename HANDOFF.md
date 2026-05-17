@@ -7,9 +7,12 @@ world-class performance. Multi-phase implementation driven by PLAN.md at
 the repository root.
 
 Phase 1 is COMPLETE — all 8 gates closed (PLAN.md §20.2). Phase 2
-is ~85% done: steps #1 through #7 of COMPILER.md §10 are shipped,
-plus E1 (Tiny.literal + Interner), H1 (CLI runner), and #8a
-(macroexpand scaffold).
+is **~95% done**: every primitive-core form compiles + executes,
+macros + syntax-quote + collections shipped, try/catch/throw
+shipped, source-span-in-errors shipped (Phase 2 gate item 5
+satisfied). Remaining: `finally` clauses (#9.2), property tests
+for syntax-quote/closure-depth (gate items 3,4), bench harness
+(gate item 7), golden eval-pipeline tests (#11).
 
 - The VM has 7 wired opcode groups: mov, cmp, math, call,
   closure, jump, var.
@@ -34,19 +37,43 @@ plus E1 (Tiny.literal + Interner), H1 (CLI runner), and #8a
   table (current default), the expander is a pure pass-through.
   Spec pinned in `docs/MACROEXPAND.md` (peer-AI turn 56 review).
 
-Steps #8b through #11 remain:
-- **#8b next**: host core macros (when/cond/and/or/->/->>/let/fn/loop)
-  using direct FormBuilder. NO runtime list/concat needed — these
-  macros construct output Forms directly. Peer-AI turn 56 ordering.
-- #8c: syntax-quote + unquote + auto-gensym + native `#%list` /
-  `#%concat` special forms. Closes the quoted-compound-collection
-  items deferred by #7.
-- #8d (defer to Phase 3): user-defined `defmacro` (requires
-  compile-time VM eval).
-- #9: try/catch/throw.
-- #10: error reporting hardening (SrcSpan threading end-to-end,
-  structured CompileError).
-- #11: Phase 2 gate golden + eval pipeline tests.
+SHIPPED since last HANDOFF:
+- **#8b** (4af8c22, 5270739): 10 host core macros — let/fn/loop
+  renames + when/when-not/and/or (both gensym-hygienic) + cond +
+  ->/->>. Default macro table wired through the CLI; all `.nx`
+  programs auto-expand. +38 tests.
+- **#8c.1** (4ad8dd3): `coll:list`/`coll:concat` opcodes +
+  `Tiny.list_construct`/`concat` IR + `#%list`/`#%concat`
+  internal special forms + quoted compound lists via
+  `lowerQuotePayload`. +12 tests.
+- **#8c.2** (32a8d34): syntax-quote walker + unquote + splicing
+  + auto-gensym. Also caught + fixed a gating bug — expander now
+  runs whenever interner is present, not just when macros are. +10 tests.
+- **#8c.3** (de3c775): `coll:vector` + `Tiny.vector_construct` +
+  `#%vector` + vector quote/syntax-quote. Unlocks the user-
+  defmacro pattern (synthesizing `(let* [name val] body)`). +4 tests.
+- **#9.1** (2527944): try/catch/throw + cross-frame unwind. VM
+  ctrl group + global Handler stack + cleanup-handler trick.
+  `(try body (catch any e handler))` with `(throw value)`. +16 tests.
+- **#10.0** (1e5b575): SrcSpans in compile errors. CLI prints
+  `path:line:col: ErrorKind` + source line + caret. Phase 2
+  gate item 5 satisfied for compile errors. +3 tests.
+
+Remaining:
+- **#9.2 (NOT gate-blocking)**: finally clauses + recur-inside-try.
+  Subtle continuation model spec'd in MACROEXPAND.md / peer-AI
+  turn 59. Defer until user picks it.
+- **#11 (gate-blocking)**: golden + eval pipeline tests (Phase 2
+  gate item 6).
+- **bench/compiler.zig** (gate item 7): forms/sec + ops/sec +
+  closure creation cost + recur per-iter cost.
+- **Property tests** (gate items 3, 4): closure depth-10 capture +
+  syntax-quote structural equality.
+- **Runtime VmError SrcSpans** (post-gate refinement): currently
+  runtime errors lack source spans; requires PC→source map per
+  Routine. Defer.
+- **#8d Phase 3**: user-defined `defmacro` — requires compile-time
+  VM eval. Not in v1.
 
 Read this entire prompt before touching anything.
 
@@ -58,6 +85,14 @@ Read this entire prompt before touching anything.
 - Branch:   main
 - HEAD:     check `git log -1 --oneline`. Recent commit chain
             (newest first):
+              1e5b575 phase 2 step #10.0: SrcSpan in compile errors — gate item 5 satisfied
+              2527944 phase 2 step #9.1: try / catch / throw + cross-frame unwind
+              de3c775 phase 2 step #8c.3: vector support — completes the macro author's toolkit
+              32a8d34 phase 2 step #8c.2: syntax-quote / unquote / splicing / auto-gensym
+              4ad8dd3 phase 2 step #8c.1: coll:list/concat opcodes + #%list/#%concat IR + quoted compound lists
+              5270739 phase 2 step #8b: peer-AI turn 57 review fixes
+              4af8c22 phase 2 step #8b: host core macros — 10 macros, all green
+              71bc308 docs: HANDOFF.md refresh — E1/H1/#8a shipped, #8b is next
               8ca21a3 phase 2 step #8a: macroexpand scaffold + no-op traversal
               0e50c77 phase 2 step #8 preflight: MACROEXPAND.md pinned
               98a7d33 phase 2 step H1: minimal CLI runner — first .nx programs execute
@@ -907,125 +942,69 @@ From PLAN.md §"Start here" and accumulated hard lessons:
   `vm.Operand` rely on this; if you add fields, mind the bit order.
 
 ═══════════════════════════════════════════════════════════════════════
-## 10. IMMEDIATE NEXT TASK — Phase 2 step #8b (host core macros)
+## 10. IMMEDIATE NEXT TASK — Phase 2 gate close-out
 
-**The macroexpander spec is pinned and the scaffold is shipped.**
+**Phase 2 is ~95% done.** Every primitive-core form compiles +
+runs. Macros + syntax-quote + collections + try/catch/throw all
+work. Source-span errors satisfy gate item 5. What remains is
+gate-finishing work — pick the order with the user.
 
-Read `docs/MACROEXPAND.md` end-to-end (~25 min — 580 lines).
-It's the contract for steps #8b and #8c. Peer-AI turn 56
-applied 11 edits to the draft before any code landed; the
-amendment log at §12 lists each.
+### Status of COMPILER.md §9.4 gate items
 
-**Step #8a (DONE)**: `src/macroexpand.zig` ships with the
-scaffold:
-- `MacroexpandContext` + `MacroFn` + `HostMacroTable` +
-  `ExpandEnv` + `MAX_EXPANSION_DEPTH = 256`.
-- Per-special-form traversal (every Phase 2 special form has
-  its own walker per MACROEXPAND.md §2b table).
-- `quote` and `syntax_quote` both OPAQUE in #8a.
-- Lexical shadowing of macros works (tested with a custom
-  macro inside `(let* [my-macro 0] (my-macro))`).
-- Wired into `compile.compileFormFullWithMacros` /
-  `compileSourceFullWithMacros`. The CLI uses an empty
-  table by default — every `nexis run` invocation exercises
-  the scaffold even before #8b adds real macros.
-- 6 macroexpand tests + 2 compile-side integration tests.
-- New CompileError variants: `MacroDepthExceeded` (distinct,
-  per peer-AI turn 56 §1.7) and `MacroExpansionFailure`.
+| # | Item | Status |
+|---|---|---|
+| 1 | Every primitive-core form compiles + executes | ✅ Done |
+| 2 | 10k-iter `recur` constant-stack | ✅ Done (earlier commits + watermark test) |
+| 3 | Closure capture depth-10 (property test) | ⏸️ Need property test |
+| 4 | syntax-quote/unquote/splice structural-equal (property test) | ⏸️ Need property test |
+| 5 | Compile errors → kind + SrcSpan + macro origin | ✅ Done (#10.0, 1e5b575) |
+| 6 | Full suite 441/441+ | ✅ Done (495 total now) |
+| 7 | `bench/compiler.zig` (compile + eval throughput) | ⏸️ Need bench harness |
 
-**Step #8b (NEXT — start here)**: host core macros using
-direct FormBuilder. NO runtime list/concat required.
+### Recommended next-step priority (user picks order)
 
-Per MACROEXPAND.md §10 (#8b sub-step):
+**Option A: ship the gate.** Do items 3, 4, 7 in roughly that
+order. Each is ~1 session; total 2-3 sessions.
 
-```zig
-pub fn defaultMacros(allocator) !HostMacroTable {
-    var table: HostMacroTable = .empty;
-    try table.put(allocator, "when", expandWhen);
-    try table.put(allocator, "when-not", expandWhenNot);
-    try table.put(allocator, "and", expandAnd);
-    try table.put(allocator, "or", expandOr);    // uses gensym
-    try table.put(allocator, "cond", expandCond);
-    try table.put(allocator, "->", expandThreadFirst);
-    try table.put(allocator, "->>", expandThreadLast);
-    try table.put(allocator, "let", expandLetRename);   // → let*
-    try table.put(allocator, "fn", expandFnRename);     // → fn*
-    try table.put(allocator, "loop", expandLoopRename); // → loop*
-    return table;
-}
-```
+**Option B: ship finally first.** #9.2 (finally clauses +
+recur-in-try) is the only major language feature left, but
+peer-AI turn 59 flagged it as the subtle one — coroutine-style
+continuation model spec'd but needs careful implementation.
+~2 sessions. NOT gate-blocking.
 
-Each expander is 20-50 LOC. The critical one is `or` — it
-MUST use gensym to avoid double evaluation (MACROEXPAND.md
-§10.10):
+**Option C: golden / eval pipeline tests (step #11).** Build
+out test/integration/ with `.nx` files + expected outputs.
+~1-2 sessions. Loose dependency on items 3+4 being green
+since some golden tests overlap.
 
-```clojure
-(or a b)   => (let* [g a] (if g g b))   ; g = gensym
-```
+My read: **A → B → C** is the order that closes Phase 2 fastest.
+B is feature-completion (nice for v1 polish but not gate-blocking
+per §9.4). Suggest user picks between "ship-the-gate" (A) and
+"finish-finally" (B) when they return.
 
-Decision matrix for `gensym` shape:
-- v1 format: `<base>__<counter>__auto__` (Clojure convention).
-- Counter on `MacroexpandContext.gensym_next` (already in
-  scaffold).
-- Allocate from `ctx.allocator` (the compile-time arena).
-- For #8b's `or`, only need one gensym per `or` expansion;
-  full syntax-quote `name#` machinery lands in #8c.
+### What's pinned + ready to code
 
-After #8b:
-- Update CLI to populate the default macro table (no flag
-  needed — macros are always-on; that's the point).
-- Add `examples/cond.nx`, `examples/threading.nx` etc.
-- Tests: ~30-40 covering each macro + gensym hygiene + the
-  alias macros.
+- **#9.2 finally**: full spec in MACROEXPAND.md amendment +
+  peer-AI turn 59 §D5 hand-trace. Coroutine-style continuation
+  model. Reserved opcodes already in vm.zig (`CtrlOp.finally_exit`).
+- **Property tests**: `test/prop/` directory standard exists.
+  Pattern: `std.testing.fuzz` or hand-rolled iteration over
+  randomly-generated forms.
+- **bench/compiler.zig**: shape per PERF.md §3 — measures
+  compile throughput + eval throughput + closure-creation
+  cost + recur per-iteration cost. Reuse the bench/ pattern
+  from existing `nexis-bench` binary.
 
-Estimated 1-2 sessions for #8b. Then #8c (syntax-quote +
-auto-gensym + native list/concat) is the subtle 2-3 session
-arc; that one needs another peer-AI strategy turn for the
-native-fn-vs-precompiled-routine decision.
+### What's NOT in v1 (Phase 3+)
 
-### Scope already pinned
-
-The execution model, traversal rules, sub-step plan, error
-model, and macro semantics are spec'd. Do NOT re-derive
-them — read MACROEXPAND.md and code against it.
-
-Key reference points for #8b coding:
-- §1 MacroFn API + MacroexpandContext.
-- §2b per-special-form traversal table (already implemented
-  in #8a; #8b only ADDS macro fns to the table).
-- §4 + §4b auto-gensym lifecycle + SrcSpan provenance.
-- §10 sub-step #8b details.
-- §10.G `or` MUST use gensym (avoid double-eval). §10.H/I/J
-  spell out `and`/`cond`/threading exact shapes.
-- §10b FormBuilder helper sketch (add as needed).
-
-### After step #8b ships
-
-- **#8c**: syntax-quote / unquote / unquote-splicing /
-  auto-gensym + native `#%list` / `#%concat` special forms.
-  Requires another peer-AI strategy turn for the native-fn-
-  Value-vs-precompiled-routine decision. ~2-3 sessions.
-
-- **#8d (defer to Phase 3)**: user-defined `defmacro` — needs
-  compile-time VM eval. Significant scope.
-
-Steps #9-#11 in order:
-  - #9 try/catch/throw per VM.md §12 minimal spec. Adds the
-    `ctrl` opcode group + `try-enter` / `try-exit` /
-    `finally-enter` / `finally-exit` / `throw` opcodes.
-  - #10 error reporting hardening: SrcSpan threaded end-to-end
-    (Form.origin already preserved by reader; needs to flow
-    into CompileError + macroexpand errors + runtime traces).
-    MACROEXPAND.md §4b already pins the synthetic-form-
-    provenance rule that #10 needs.
-  - #11 golden + eval pipeline tests; close the Phase 2 gate
-    per COMPILER.md §9.4. Add `bench/compiler.zig` per gate
-    item 7 if not done in Phase 6 polish.
-
-After #11, **Phase 2 ships**. Phase 3 starts: standard library
-(`stdlib/core.nx` per CLOJURE-REVIEW.md §1.1 two-stage
-bootstrap), CLI runner / REPL, refer/alias/require for
-multi-namespace usage.
+- User-defined `defmacro` (#8d) — needs compile-time VM eval.
+- Maps/sets as runtime values (`(quote {})` etc.) — Phase 3
+  stdlib bootstrap.
+- Reader macros `#(...)` — pinned in MACROEXPAND.md as Phase 3.
+- Runtime VmError SrcSpans — requires PC→source maps per
+  Routine; nice-to-have, NOT gate-blocking.
+- Persistent map/set literals — Phase 3.
+- REPL — Phase 3.
 
 ═══════════════════════════════════════════════════════════════════════
 ## 11. THE QUALITY BAR — what makes this project world-class vs just competent
