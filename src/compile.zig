@@ -2050,17 +2050,26 @@ fn compileLt(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) CompileE
 }
 
 fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
-    // Step 5b/5c (peer-AI turns 44/45 pre-analysis model,
-    // SUPERSEDES the turn-40 lazy-boxing approach): capture-aware
-    // resolution walks self first, then parent emitters. Captured
-    // locals are pre-boxed at binding time (let*/loop*) or
-    // function entry (fn* params) so their BindingRef is stable
-    // across all control-flow paths. Step #6b (peer-AI turn 49)
-    // adds Var fall-through:
+    // Symbol resolution order for the Tiny backend (peer-AI
+    // turn 54: this is the final fall-through; step #7 added
+    // a Form-frontend ABOVE the Tiny backend, but symbol
+    // resolution itself stayed here unchanged):
     //   1. local (this routine) → dispatch on BindingRef
-    //   2. captured upvalue (parent chain) → resolve.upvalue + capture
-    //   3. namespace var (if namespace exists) → var:load-var
+    //      (.direct_slot / .cell_slot / .upvalue per the
+    //       capture pre-analysis model from 5b/5c, peer-AI
+    //       turns 44/45)
+    //   2. captured upvalue (parent chain) → resolve.upvalue
+    //      + capture (also pre-analyzed; bindings are pre-
+    //      boxed at binding time so BindingRef is stable
+    //      across all control-flow paths)
+    //   3. namespace Var (if namespace exists) → var:load-var
+    //      (#6b fall-through; lazy-interns unbound Vars so
+    //      forward references work)
     //   4. error → :unresolved-symbol
+    //
+    // Form lowering (step #7) does NOT resolve symbols to slots
+    // — it preserves names and dispatches operator-position
+    // special forms / intrinsics. Slot resolution happens here.
     const ref = e.resolveOrCapture(name) catch |err| switch (err) {
         // Step #6b: lexical resolution failed; try the
         // namespace before giving up. Critical that this is
@@ -5633,20 +5642,12 @@ test "compile #7b: () empty list → MalformedForm" {
 // namespace lookup (already shipped via #6b). A simple smoke test
 // of that path:
 
-test "compile #7b: ordinary call ((symbol-bound-as-fn 5)) via namespace" {
-    // Pre-bind `inc` in the namespace to a closure that adds 1.
-    // Then compile + run `(inc 5)` via source → 6.
-    // Requires hand-building the closure since we don't yet have
-    // fn* lowering from Form. Skip the closure construction here
-    // and instead just test that the lowerCall path produces a
-    // valid call instruction shape. The full end-to-end happens
-    // in #7c.
-    //
-    // For #7b: confirm ordinary-call dispatch by compiling the
-    // CALL even without resolving the symbol — we get an
-    // UnresolvedSymbol error (correct: `inc` isn't bound and no
-    // ns was passed), proving the dispatcher routed through
-    // lowerCall rather than treating `inc` as a special form.
+test "compile #7b: non-special-form head falls through to ordinary-call dispatch" {
+    // Confirms the dispatcher routes `(inc 5)` through lowerCall
+    // (treating `inc` as a symbol to resolve), NOT a special form.
+    // Without a namespace, the symbol can't resolve → UnresolvedSymbol.
+    // (End-to-end calls with fn* callees / namespace-bound fns are
+    // tested in #7c and #7d.)
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(
@@ -5947,6 +5948,60 @@ test "compile #7d: without namespace, def → UnresolvedSymbol (regression)" {
     try testing.expectError(
         CompileError.UnresolvedSymbol,
         compileSource(arena.allocator(), "(def x 5)"),
+    );
+}
+
+// ---- step #7 peer-AI turn 54 nice-to-fix items ----
+
+test "compile #7: (let* [+ (+ 1 2)] +) → 3 — let* RHS does NOT see own binding" {
+    // Sequential RHS visibility: binding-i's RHS sees only
+    // 1..i-1. So `(+ 1 2)` inside the RHS of the `+` binding
+    // inlines to Tiny.add → 3. Body's `+` returns the function
+    // value (the integer 3 itself, since the binding's value
+    // IS 3).
+    try expectSourceFixnum("(let* [+ (+ 1 2)] +)", 3);
+}
+
+test "compile #7: ((fn* [+] (+ 1 2)) (fn* [a b] 42)) → 42 — fn param shadows intrinsic" {
+    try expectSourceFixnum("((fn* [+] (+ 1 2)) (fn* [a b] 42))", 42);
+}
+
+test "compile #7: (letfn* [(+ [a b] 42)] (+ 1 2)) → 42 — letfn name shadows intrinsic" {
+    try expectSourceFixnum("(letfn* [(+ [a b] 42)] (+ 1 2))", 42);
+}
+
+test "compile #7: (do (def + (fn* [a b] 42)) (+ 1 2)) → 3 — STAGED LIMITATION" {
+    // Pins the documented limitation from #7b: Var-level shadowing
+    // does NOT defeat intrinsic inlining (LowerEnv only tracks
+    // lexical names, not namespace Vars). Per peer-AI turn 54
+    // §"Nice-to-fix #1", this test makes the staged behavior
+    // explicit and provable. Var-aware inlining is Phase 3+.
+    try expectSourceFixnumWithNs("(do (def + (fn* [a b] 42)) (+ 1 2))", 3);
+}
+
+test "compile #7: letfn* with rest param → UnsupportedFeature (Tiny FnBinding has no rest yet)" {
+    // The Tiny.letfn_star.FnBinding shape predates 5e's
+    // variadic support and has no rest_param field. Per
+    // peer-AI turn 54 §D, this is documented + tested as a
+    // staged limitation. Resolving requires extending
+    // FnBinding (later commit).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(
+        CompileError.UnsupportedFeature,
+        compileSource(arena.allocator(), "(letfn* [(f [a & r] a)] (f 1 2))"),
+    );
+}
+
+test "compile #7: 'foo (reader-macro quote of symbol) → UnsupportedFeature" {
+    // Reader emits `'foo` as Datum.quote; quoted symbols
+    // require Tiny.literal + Interner (step #8). Both `'foo`
+    // and `(quote foo)` raise the same error symmetrically.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(
+        CompileError.UnsupportedFeature,
+        compileSource(arena.allocator(), "'foo"),
     );
 }
 

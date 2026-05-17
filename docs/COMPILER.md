@@ -1160,3 +1160,84 @@ from code contact:
   and dereferences yield the rest list value. Verified by
   `(((fn* [a & r] (fn* [] r)) 1 2 3))` returning the list
   `(2 3)` with full content verification.
+
+- **2026-05-17** (§4.1 + §5 — step #7 frontend, peer-AI
+  turns 51 + 53 + 54): Step #7 adds the Form→Tiny lowering
+  frontend. The compiler's input surface is now BOTH
+  `*const Tiny` (existing backend tests, 135+ regression
+  cases) AND `*const reader.Form` / source bytes. Per
+  peer-AI turn 51's architecture, Tiny remains the IR;
+  there is NO parallel Form→bytecode codegen path —
+  `lowerForm` translates Form to Tiny, then the proven
+  backend (capture pre-analysis, RecurTarget threading,
+  variadic rest, Var fall-through, defn placeholder cells,
+  etc.) takes over unchanged.
+
+  Public entries:
+  - `lowerForm(allocator, form)` → `*Tiny`
+  - `compileForm(allocator, form)` / `compileFormWithNamespace(...)`
+  - `compileSource(allocator, source)` / `compileSourceWithNamespace(...)`
+    — end-to-end: parser.parseForm + Reader.readOneForm +
+    lowerForm + compileTinyWithNamespace.
+
+  Sub-decomposition (4 commits):
+  - **#7a** (4df693d): scaffolding + literals (nil/bool/int)
+    + symbols. First time real `.nx` source compiles
+    end-to-end.
+  - **#7b** (3b4d467): list dispatch + special forms
+    (do/if/quote-of-scalar) + intrinsics (+/<) with the
+    LowerEnv lexical-shadowing guard. New error variants:
+    MalformedForm, ExpectedSymbol, ExpectedVector,
+    ReaderFailure.
+  - **#7c** (2c24a69): binding/fn forms (let*/fn*/letfn*/
+    loop*/recur) via Form. Implicit-do for multi-form
+    bodies. `&` rest detection in parseParams. Optional
+    self-name detection in lowerFnStar.
+  - **#7d** (c5d3f52): vars (def/defn/var) via Form.
+    Canonical defn forward-reference end-to-end via
+    source: `(do (defn f [] (g)) (defn g [] 42) (f))` → 42.
+
+  **LowerEnv** (compile.zig): linked-list of name sets,
+  parent-walked on lookup. Tracks lexical names ONLY for
+  intrinsic shadowing — NOT slot resolution (that's the
+  backend's resolveOrCapture). Special forms are RESERVED
+  (recognized regardless of lexical bindings); inlineable
+  intrinsics (+/<) check `env.contains(name)` and fall
+  through to ordinary call if shadowed. Documented
+  staged limitations:
+  - **Namespace-level Var shadowing NOT handled**:
+    `(do (def + f) (+ 1 2))` still inlines `+` to
+    `Tiny.add` (test pins this as explicit staged behavior
+    per peer-AI turn 54 §"Nice-to-fix #1"). Lexical-only
+    is the must-have; Var-aware inlining is Phase 3+.
+  - **Qualified symbols** (`foo/x`) NOT supported anywhere
+    (multi-ns is post-v1 surface).
+
+  **Unsupported Form datums** (raise `UnsupportedFeature`):
+  - real, char, string, keyword (deferred to a later
+    commit when Phase 1 numerics/strings integrate with
+    the const pool)
+  - vector, map, set as expressions (collection literals
+    require compile-time call into coll/{champ,vector},
+    deferred)
+  - quoted symbol/keyword/string/compound-collection
+    (requires Tiny.literal + Interner integration; step
+    #8 macroexpander will force this)
+  - syntax_quote, unquote, unquote_splicing (step #8
+    macroexpander territory)
+  - deref (atoms aren't a Phase 2 feature)
+  - anon_fn (`#(...)` shorthand; step #8 macroexpander)
+  - with_meta (`^{...}` metadata; Phase 3+)
+  - letfn* with rest param (Tiny.FnBinding has no
+    rest_param field yet; staged per peer-AI turn 54 §D)
+
+  Tests: 686 → 757 (+71 across #7a/b/c/d + the turn-54
+  nice-to-fix tests). All shadowing scenarios from peer-AI
+  turn 53 §"Critical trap" covered end-to-end via source
+  syntax. `zig build phase2-test` runs all phase2 tests
+  in ~2s. The bootstrap Tiny tests (135) remain as a
+  regression bed; eventual retirement is Phase 6 polish.
+
+  Next: step #8 (macroexpander). Requires Tiny.literal +
+  symbol/keyword Value support; the deferral list above
+  will start closing as #8 lands.
