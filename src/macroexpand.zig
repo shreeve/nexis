@@ -268,6 +268,8 @@ fn expandList(
     if (std.mem.eql(u8, name, "def")) return try expandDef(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "defn")) return try expandDefn(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "var")) return mutCast(list_form); // (var X) — X is just a name, don't expand
+    if (std.mem.eql(u8, name, "try")) return try expandTry(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "throw")) return try expandOrdinaryCall(ctx, env, list_form, items, depth);
     // Step #8c.1: internal compiler primitives (#%list / #%concat).
     // Recognized as special forms — NOT user-shadowable, NOT
     // looked up in the macro table. Args ARE recursively
@@ -649,6 +651,131 @@ fn expandDefn(
     out_items[2] = mutCast(params_form);
     for (new_body, 0..) |b, k| out_items[3 + k] = b;
     return try makeList(ctx, out_items, list_form.origin);
+}
+
+/// Step #9.1 (peer-AI turn 59 §D4): expand `(try body+
+/// (catch MATCHER BINDING handler+) (finally body+)?)`.
+///
+/// Traversal rule (per MACROEXPAND.md §2b — each special form
+/// has its own walker):
+///   - body forms expanded with outer env
+///   - catch's MATCHER + BINDING NOT expanded (literal symbols)
+///   - catch's handler body expanded with outer env + BINDING
+///   - finally body expanded with outer env (no new bindings)
+fn expandTry(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    if (items.len < 2) return MacroexpandError.MalformedMacroCall;
+    const head = items[0];
+
+    // Partition the args into body + clauses. Walk from the end
+    // detecting `(catch ...)` and `(finally ...)` lists.
+    var end = items.len;
+    var finally_form: ?*Form = null;
+    var catch_form: ?*Form = null;
+
+    // Detect optional finally as last clause.
+    if (end > 1) {
+        const last = items[end - 1];
+        if (isClauseHead(last, "finally")) {
+            finally_form = mutCast(last);
+            end -= 1;
+        }
+    }
+    // Detect catch as next-to-last (or last if no finally).
+    if (end > 1) {
+        const cl = items[end - 1];
+        if (isClauseHead(cl, "catch")) {
+            catch_form = mutCast(cl);
+            end -= 1;
+        }
+    }
+    // At least one of catch / finally must be present.
+    if (catch_form == null and finally_form == null) {
+        return MacroexpandError.MalformedMacroCall;
+    }
+
+    // Body (items[1..end]) expanded with outer env.
+    const body_count = end - 1;
+    var out_items: std.ArrayList(*Form) = .empty;
+    defer out_items.deinit(ctx.allocator);
+    try out_items.append(ctx.allocator, mutCast(head));
+
+    var i: usize = 1;
+    while (i < end) : (i += 1) {
+        const expanded = try expandFormDepth(ctx, env, items[i], depth);
+        try out_items.append(ctx.allocator, expanded);
+    }
+    _ = body_count; // (unused; structural reference)
+
+    // Expand catch clause. catch_items = [catch MATCHER BINDING handler...]
+    // MATCHER and BINDING are literal symbols — pass through.
+    if (catch_form) |cf| {
+        if (cf.datum.list.len < 4) return MacroexpandError.MalformedMacroCall;
+        const ci = cf.datum.list;
+        const cf_head = ci[0];
+        const matcher = ci[1];
+        const binding = ci[2];
+        if (binding.datum != .symbol or binding.datum.symbol.ns != null) {
+            return MacroexpandError.MalformedMacroCall;
+        }
+        // Build env for handler body.
+        var handler_env: ExpandEnv = .{ .parent = env };
+        defer handler_env.deinit(ctx.allocator);
+        _ = try handler_env.lexical_names.getOrPut(ctx.allocator, binding.datum.symbol.name);
+        // Expand handler body.
+        var new_catch_items: std.ArrayList(*Form) = .empty;
+        defer new_catch_items.deinit(ctx.allocator);
+        try new_catch_items.append(ctx.allocator, mutCast(cf_head));
+        try new_catch_items.append(ctx.allocator, mutCast(matcher));
+        try new_catch_items.append(ctx.allocator, mutCast(binding));
+        for (ci[3..]) |h| {
+            const ex = try expandFormDepth(ctx, &handler_env, h, depth);
+            try new_catch_items.append(ctx.allocator, ex);
+        }
+        const new_catch_slice = try ctx.allocator.alloc(*Form, new_catch_items.items.len);
+        for (new_catch_items.items, 0..) |item, j| new_catch_slice[j] = item;
+        const new_catch = try makeList(ctx, new_catch_slice, cf.origin);
+        try out_items.append(ctx.allocator, new_catch);
+    }
+
+    // Expand finally clause if present.
+    if (finally_form) |ff| {
+        if (ff.datum.list.len < 1) return MacroexpandError.MalformedMacroCall;
+        const fi = ff.datum.list;
+        var new_finally_items: std.ArrayList(*Form) = .empty;
+        defer new_finally_items.deinit(ctx.allocator);
+        try new_finally_items.append(ctx.allocator, mutCast(fi[0]));
+        for (fi[1..]) |f| {
+            const ex = try expandFormDepth(ctx, env, f, depth);
+            try new_finally_items.append(ctx.allocator, ex);
+        }
+        const new_finally_slice = try ctx.allocator.alloc(*Form, new_finally_items.items.len);
+        for (new_finally_items.items, 0..) |item, j| new_finally_slice[j] = item;
+        const new_finally = try makeList(ctx, new_finally_slice, ff.origin);
+        try out_items.append(ctx.allocator, new_finally);
+    }
+
+    const out_slice = try ctx.allocator.alloc(*Form, out_items.items.len);
+    for (out_items.items, 0..) |item, j| out_slice[j] = item;
+    return try makeList(ctx, out_slice, list_form.origin);
+}
+
+/// Helper: is `form` a list whose head is the unqualified
+/// symbol `name`? Used by `expandTry` to detect catch/finally
+/// clauses.
+fn isClauseHead(form: *const Form, name: []const u8) bool {
+    if (form.datum != .list) return false;
+    const items = form.datum.list;
+    if (items.len == 0) return false;
+    const head = items[0];
+    if (head.datum != .symbol) return false;
+    if (head.datum.symbol.ns != null) return false;
+    return std.mem.eql(u8, head.datum.symbol.name, name);
 }
 
 // =============================================================================

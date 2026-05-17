@@ -143,6 +143,25 @@ pub const Tiny = union(enum) {
     /// allocation pattern as `list_construct`; backend emits
     /// `coll:vector`.
     vector_construct: []const *const Tiny,
+    /// Step #9.1 (peer-AI turn 59): try / catch. v1 = catch-any
+    /// only; finally and other type matchers deferred to #9.2/
+    /// later. body and handler are each implicit-do; binding is
+    /// the catch's name (always present in v1 since catch-any
+    /// is the only matcher).
+    try_: struct {
+        body: *const Tiny,
+        /// catch binding name. Must be present for v1 since
+        /// catch is mandatory (finally-only forms land in #9.2).
+        binding: []const u8,
+        handler: *const Tiny,
+        /// Reserved for #9.2.
+        finally_: ?*const Tiny = null,
+    },
+    /// Step #9.1: `(throw value)`. Compiles the value to a
+    /// slot then emits `ctrl:throw <slot>`. Backend never
+    /// returns from this opcode (it either jumps to a catch
+    /// PC or raises VmError.UncaughtThrow).
+    throw_: *const Tiny,
     /// `(+ lhs rhs)`. Sub-expressions are recursive.
     add: struct {
         lhs: *const Tiny,
@@ -1198,6 +1217,8 @@ fn lowerList(
         if (std.mem.eql(u8, name, "def")) return try lowerDef(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "defn")) return try lowerDefn(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "var")) return try lowerVarRef(allocator, items[1..]);
+        if (std.mem.eql(u8, name, "try")) return try lowerTry(allocator, items[1..], ctx);
+        if (std.mem.eql(u8, name, "throw")) return try lowerThrow(allocator, items[1..], ctx);
         // -- Inlineable intrinsics (shadowable) --
         if (std.mem.eql(u8, name, "+") and items.len == 3 and !isIntrinsicShadowed(ctx.env, name)) {
             return try lowerAdd(allocator, items[1], items[2], ctx);
@@ -1748,6 +1769,105 @@ fn lowerVarRef(
     return try allocTiny(allocator, .{ .var_ref = .{ .name = name } });
 }
 
+/// Step #9.1 (peer-AI turn 59): lower `(try body+ (catch any
+/// binding handler+))`. v1 = catch-any only; finally and other
+/// type matchers deferred.
+///
+/// Form syntax:
+///   (try body... (catch any binding handler...))
+///   (try body... (catch any binding handler...) (finally ...))   ; #9.2
+///
+/// v1 enforcement:
+///   - Exactly one body+catch+optional-finally shape.
+///   - finally raises UnsupportedFeature (deferred to #9.2).
+///   - catch matcher MUST be the unqualified symbol `any`;
+///     anything else is UnsupportedFeature.
+///   - catch binding MUST be an unqualified symbol.
+fn lowerTry(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    ctx: LowerCtx,
+) CompileError!*Tiny {
+    if (args.len < 2) return CompileError.MalformedForm;
+
+    // Last arg should be the catch (or finally for #9.2).
+    // For v1, partition by walking from the end: optional
+    // finally (last), then required catch, then body.
+    var end = args.len;
+    var finally_form: ?*reader_mod.Form = null;
+
+    // Check for finally as last clause.
+    {
+        const last = args[end - 1];
+        if (last.datum == .list and last.datum.list.len >= 1) {
+            const head = last.datum.list[0];
+            if (head.datum == .symbol and
+                head.datum.symbol.ns == null and
+                std.mem.eql(u8, head.datum.symbol.name, "finally"))
+            {
+                finally_form = last;
+                end -= 1;
+            }
+        }
+    }
+    if (finally_form != null) return CompileError.UnsupportedFeature;
+
+    if (end < 2) return CompileError.MalformedForm;
+    const catch_form = args[end - 1];
+    if (catch_form.datum != .list or catch_form.datum.list.len < 4) {
+        return CompileError.MalformedForm;
+    }
+    const catch_items = catch_form.datum.list;
+    const catch_head = catch_items[0];
+    if (catch_head.datum != .symbol or
+        catch_head.datum.symbol.ns != null or
+        !std.mem.eql(u8, catch_head.datum.symbol.name, "catch"))
+    {
+        return CompileError.MalformedForm;
+    }
+    // (catch MATCHER BINDING handler+) — matcher must be `any`.
+    const matcher_form = catch_items[1];
+    if (matcher_form.datum != .symbol or
+        matcher_form.datum.symbol.ns != null or
+        !std.mem.eql(u8, matcher_form.datum.symbol.name, "any"))
+    {
+        return CompileError.UnsupportedFeature;
+    }
+    const binding = try expectUnqualifiedSymbol(catch_items[2]);
+    const handler_items = catch_items[3..];
+
+    // Body = args[0..end-1] (implicit do over multiple forms).
+    const body_items = args[0 .. end - 1];
+    const body = try lowerBody(allocator, body_items, ctx);
+
+    // Handler env: outer env + binding name. The binding is
+    // visible in operator position for intrinsic-shadowing
+    // (matches the LowerEnv discipline elsewhere).
+    var handler_env: LowerEnv = .{ .parent = ctx.env };
+    defer handler_env.deinit(allocator);
+    try handler_env.lexical_names.put(allocator, binding);
+    const handler_body = try lowerBody(allocator, handler_items, ctx.withEnv(&handler_env));
+
+    return try allocTiny(allocator, .{
+        .try_ = .{
+            .body = body,
+            .binding = binding,
+            .handler = handler_body,
+        },
+    });
+}
+
+/// Step #9.1: lower `(throw value)` — single arg.
+fn lowerThrow(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    ctx: LowerCtx,
+) CompileError!*Tiny {
+    if (args.len != 1) return CompileError.MalformedForm;
+    const value = try lowerFormEnv(allocator, args[0], ctx);
+    return try allocTiny(allocator, .{ .throw_ = value });
+}
+
 /// Compile a `reader.Form` tree into a `Compiled` artifact, no
 /// namespace. Equivalent to `compileTiny(allocator, lowerForm(form))`.
 /// Symbols that don't resolve lexically raise `UnresolvedSymbol`
@@ -2055,6 +2175,15 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
         .list_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
         .concat => |items| for (items) |it| try freeVars(allocator, it, env, out),
         .vector_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
+        .try_ => |t| {
+            try freeVars(allocator, t.body, env, out);
+            var handler_env: NameSet = .{};
+            defer handler_env.deinit(allocator);
+            try handler_env.unionWith(allocator, env);
+            try handler_env.put(allocator, t.binding);
+            try freeVars(allocator, t.handler, &handler_env, out);
+        },
+        .throw_ => |value| try freeVars(allocator, value, env, out),
         .def => |d| {
             // def's RHS is the only sub-expression that can carry
             // free vars; the name itself is a NAMESPACE-LEVEL
@@ -2219,6 +2348,15 @@ fn capturedByDescendantFns(
         .list_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
         .concat => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
         .vector_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
+        .try_ => |t| {
+            try capturedByDescendantFns(allocator, t.body, env, out);
+            var handler_env: NameSet = .{};
+            defer handler_env.deinit(allocator);
+            try handler_env.unionWith(allocator, env);
+            try handler_env.put(allocator, t.binding);
+            try capturedByDescendantFns(allocator, t.handler, &handler_env, out);
+        },
+        .throw_ => |value| try capturedByDescendantFns(allocator, value, env, out),
         .def => |d| {
             // RHS may contain inner fns; analyze.
             if (d.value) |val| try capturedByDescendantFns(allocator, val, env, out);
@@ -2276,6 +2414,8 @@ fn compileExpr(
         .list_construct => |items| try compileListConstruct(e, items, dst),
         .concat => |items| try compileConcat(e, items, dst),
         .vector_construct => |items| try compileVectorConstruct(e, items, dst),
+        .try_ => |t| try compileTry(e, t.body, t.binding, t.handler, dst),
+        .throw_ => |value| try compileThrow(e, value, dst),
         .add => |a| try compileAdd(e, a.lhs, a.rhs, dst),
         .lt => |a| try compileLt(e, a.lhs, a.rhs, dst),
         .if_ => |i| try compileIf(e, i.test_, i.then, i.else_, dst, recur_target),
@@ -2627,6 +2767,115 @@ fn compileLetStar(
     // Body inherits recur target (let* body is tail position
     // relative to the enclosing form).
     try compileExpr(e, body, dst, recur_target);
+}
+
+/// Step #9.1 (peer-AI turn 59): lower `(try body (catch any
+/// binding handler))`. v1 = catch-any only; finally deferred
+/// to #9.2.
+///
+/// Layout (per peer-AI turn 59 §D5 + hand-trace):
+///
+///   try-enter catch_pc binding_slot _
+///   <body → dst>
+///   try-exit post_pc
+///   <pad>            ; never reached (try-exit jumps to post)
+/// catch_pc:
+///   <handler → dst, binding in scope>
+///   try-exit post_pc ; pops the cleanup handler installed by throw
+/// post_pc:
+///   ...
+///
+/// VM mechanics: try-enter pushes a `.try_` handler. Throw
+/// finds it, REPLACES with `.cleanup` (so the catch body's own
+/// throw isn't re-caught), stores the thrown value into
+/// binding_slot, jumps to catch_pc. Catch body's try-exit pops
+/// the cleanup. Body-normal-exit's try-exit pops the try.
+///
+/// Captured-binding pre-analysis: the catch binding is treated
+/// the same as a `let*` binding — if descendant `fn*` bodies
+/// capture it, emit `closure:box-local` after the throw stores
+/// into the slot. But this introduces an ordering problem:
+/// throw stores BEFORE catch entry, then catch entry would need
+/// to box. For v1 simplicity, the catch binding is always
+/// `.direct_slot` (uncaptured). If user code captures it, raise
+/// `UnsupportedFeature` — easy to detect via the analyzer.
+fn compileTry(
+    e: *Emitter,
+    body: *const Tiny,
+    binding: []const u8,
+    handler: *const Tiny,
+    dst: u12,
+) CompileError!void {
+    // Detect whether the catch binding is captured by any
+    // descendant fn in the handler body. v1 doesn't support
+    // captured catch bindings (would require boxing on the
+    // throw path, not in straight-line code).
+    {
+        var env: NameSet = .{};
+        defer env.deinit(e.allocator);
+        try env.put(e.allocator, binding);
+        var captured: NameSet = .{};
+        defer captured.deinit(e.allocator);
+        try capturedByDescendantFns(e.allocator, handler, &env, &captured);
+        if (captured.contains(binding)) return CompileError.UnsupportedFeature;
+    }
+
+    // Allocate the binding slot up front so try-enter's operand
+    // is stable. Slot lifetime: from try-enter through the
+    // handler body (catch). Body doesn't need this slot.
+    const binding_slot = try e.allocSlot();
+
+    // Emit try-enter with a placeholder catch_pc. We patch it
+    // after we know the catch entry's PC.
+    const try_enter_pc: u32 = @intCast(e.code.items.len);
+    try e.emit(vm.asm_.tryEnter(0, binding_slot));
+
+    // Compile body → dst. Body is non-tail (recur is rejected
+    // inside try per peer-AI turn 59 §D6).
+    try compileExpr(e, body, dst, null);
+
+    // try-exit with placeholder post_pc.
+    const body_exit_pc: u32 = @intCast(e.code.items.len);
+    try e.emit(vm.asm_.tryExit(0));
+
+    // Mark catch entry; patch try-enter.
+    const catch_pc: u32 = @intCast(e.code.items.len);
+    {
+        const enter_inst = &e.code.items[try_enter_pc];
+        enter_inst.a = vm.Operand.jump(@intCast(catch_pc));
+    }
+
+    // Push the binding into scope for the handler body.
+    const scope_mark = e.scope.items.len;
+    defer e.scope.shrinkRetainingCapacity(scope_mark);
+    try e.pushBinding(binding, binding_slot);
+
+    // Compile handler → dst (also non-tail; recur invalid in
+    // catch body in v1).
+    try compileExpr(e, handler, dst, null);
+
+    // Catch's try-exit pops the cleanup handler that throw
+    // installed. Placeholder post_pc, patched below.
+    const catch_exit_pc: u32 = @intCast(e.code.items.len);
+    try e.emit(vm.asm_.tryExit(0));
+
+    // post_pc = current end of code. Patch both try-exits.
+    const post_pc: u32 = @intCast(e.code.items.len);
+    {
+        const body_exit = &e.code.items[body_exit_pc];
+        body_exit.a = vm.Operand.jump(@intCast(post_pc));
+        const catch_exit = &e.code.items[catch_exit_pc];
+        catch_exit.a = vm.Operand.jump(@intCast(post_pc));
+    }
+}
+
+/// Step #9.1: compile `(throw value)`. Compile value into a
+/// fresh slot (we use `dst` since the throw never returns
+/// normally — the dst slot's prior contents don't matter),
+/// then emit `ctrl:throw <dst>`.
+fn compileThrow(e: *Emitter, value: *const Tiny, dst: u12) CompileError!void {
+    try compileExpr(e, value, dst, null);
+    try e.emit(vm.asm_.throwOp(vm.Operand.slot(dst)));
 }
 
 /// Lower `(loop* [b1 v1 b2 v2 ...] body)` per COMPILER.md §5.7
@@ -7193,6 +7442,201 @@ test "compile #8c.3: (quote (m {})) — quoted map still UnsupportedFeature" {
         compileSourceFull(arena.allocator(), "(quote {})", null, interner),
     );
 }
+// ---- step #9.1: try / catch / throw end-to-end ----------
+
+test "compile #9.1: (try 42 (catch any e e)) → 42" {
+    try expectFixnumDefaultMacros("(try 42 (catch any e e))", 42);
+}
+
+test "compile #9.1: (try (throw 7) (catch any e e)) → 7" {
+    try expectFixnumDefaultMacros("(try (throw 7) (catch any e e))", 7);
+}
+
+test "compile #9.1: throw propagates a keyword value" {
+    try expectKeywordDefaultMacros("(try (throw :boom) (catch any e e))", "boom");
+}
+
+test "compile #9.1: cross-frame throw (callee throws, caller catches)" {
+    try expectFixnumDefaultMacros(
+        \\(do
+        \\  (defn f [] (throw 99))
+        \\  (try (f) (catch any e e)))
+    ,
+        99,
+    );
+}
+
+test "compile #9.1: catch body's own throw NOT re-caught by same handler" {
+    // The classic trap. Peer-AI turn 59 §"Missing trap 1" /
+    // §D5. (try (throw :a) (catch any e (throw :b))) must
+    // propagate :b as uncaught — the inner throw cannot loop
+    // back to the same catch handler.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    const compiled = try compileSourceFullWithMacros(
+        arena.allocator(),
+        "(try (throw :a) (catch any e (throw :b)))",
+        ns,
+        interner,
+        &host_macros,
+    );
+    const routine = compiled.toRoutine("p");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    try testing.expectError(vm.VmError.UncaughtThrow, v.run());
+    // The unhandled value is :b, not :a.
+    try testing.expect(v.unhandled_throw != null);
+    try testing.expect(v.unhandled_throw.?.kind() == .keyword);
+}
+
+test "compile #9.1: unhandled top-level throw → UncaughtThrow" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    const compiled = try compileSourceFullWithMacros(
+        arena.allocator(),
+        "(throw 13)",
+        null,
+        interner,
+        &host_macros,
+    );
+    const routine = compiled.toRoutine("p");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    try testing.expectError(vm.VmError.UncaughtThrow, v.run());
+    try testing.expectEqual(@as(i64, 13), v.unhandled_throw.?.asFixnum());
+}
+
+test "compile #9.1: handler binding visible in handler body" {
+    // The catch body adds 1 to the thrown value.
+    try expectFixnumDefaultMacros(
+        \\(try (throw 41) (catch any e (+ e 1)))
+    ,
+        42,
+    );
+}
+
+test "compile #9.1: try without catch or finally → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    try testing.expectError(
+        CompileError.MacroExpansionFailure,
+        compileSourceFullWithMacros(arena.allocator(), "(try 1)", null, interner, &host_macros),
+    );
+}
+
+test "compile #9.1: try with finally clause → UnsupportedFeature (deferred to #9.2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    try testing.expectError(
+        CompileError.UnsupportedFeature,
+        compileSourceFullWithMacros(
+            arena.allocator(),
+            "(try 1 (catch any e e) (finally 2))",
+            null,
+            interner,
+            &host_macros,
+        ),
+    );
+}
+
+test "compile #9.1: non-any matcher → UnsupportedFeature" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    try testing.expectError(
+        CompileError.UnsupportedFeature,
+        compileSourceFullWithMacros(
+            arena.allocator(),
+            "(try 1 (catch :my-error e e))",
+            null,
+            interner,
+            &host_macros,
+        ),
+    );
+}
+
+test "compile #9.1: nested try — outer catches what inner doesn't" {
+    try expectFixnumDefaultMacros(
+        \\(try
+        \\  (try (throw 100) (catch any e (throw e)))
+        \\  (catch any e e))
+    ,
+        100,
+    );
+}
+
+test "compile #9.1: handler stack doesn't leak across normal exits" {
+    // (do (try 1 (catch any e 2)) (throw :x)) — the second
+    // throw must NOT be caught by the popped try handler.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    const compiled = try compileSourceFullWithMacros(
+        arena.allocator(),
+        "(do (try 1 (catch any e 2)) (throw :x))",
+        null,
+        interner,
+        &host_macros,
+    );
+    const routine = compiled.toRoutine("p");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    try testing.expectError(vm.VmError.UncaughtThrow, v.run());
+}
+
 test "compile E1: qualified symbol in quote still UnsupportedFeature" {
     // Even with an Interner, qualified symbols are post-v1.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

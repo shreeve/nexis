@@ -229,6 +229,47 @@ pub const Jump = enum(u6) {
 /// build an immutable List Value via `VM.heap` (arena-backed
 /// for Phase 2; GC-traced in Phase 4 — peer-AI turn 58 §D3
 /// flagged the rooting TODO for the eventual GC integration).
+/// Variants for the `ctrl` group. Per VM.md §10 group #11 +
+/// §12 try/catch/throw spec.
+///
+/// Step #9.1 (peer-AI turn 59): try-enter / try-exit / throw
+/// land. `finally-exit` reserved (variant 2) — used by #9.2
+/// once finally support comes in.
+///
+/// `halt` variant (5) explicitly unused — the existing
+/// top-level `call:return` path already halts the VM (per
+/// peer-AI turn 59 §D10). Uncaught throw halts via
+/// `VmError.UncaughtThrow`.
+pub const CtrlOp = enum(u6) {
+    /// `ctrl:try-enter A=catch_pc B=binding_slot C=unused` —
+    /// push a try handler. catch_pc is absolute. binding_slot
+    /// is where the thrown value will be stored when the catch
+    /// fires. C is reserved for the finally_pc operand in #9.2;
+    /// MUST be `.unused` kind in #9.1.
+    try_enter = 0,
+    /// `ctrl:try-exit A=post_pc B=unused C=unused` — pop the
+    /// current handler/cleanup (must belong to this frame) and
+    /// jump to post_pc. In #9.2, if the popped handler has a
+    /// finally_pc, the VM redirects through the finally body
+    /// with a saved post_pc continuation.
+    try_exit = 1,
+    /// `ctrl:finally-exit` — reserved for #9.2.
+    finally_exit = 2,
+    /// `ctrl:throw A=value_operand B=unused C=unused` — throw
+    /// the resolved value. A may be any operand kind (slot,
+    /// constant, var). Walks the handler stack; if a try
+    /// handler matches, replaces it with a cleanup handler
+    /// (peer-AI turn 59 §D5 "classic trap": prevents the
+    /// catch body from being re-caught by its own handler),
+    /// binds the thrown value, and jumps to catch_pc. If no
+    /// handler matches in any frame, halts with
+    /// `VmError.UncaughtThrow`.
+    throw_ = 3,
+    /// Reserved.
+    halt_ = 5,
+    _,
+};
+
 pub const CollOp = enum(u6) {
     /// `coll:list A=arg_base B=argc C=dst` — build a list from
     /// argc consecutive slots starting at A. Empty list (argc=0)
@@ -695,6 +736,17 @@ pub const VmError = error{
     /// entirely.
     UninitializedCell,
 
+    /// Step #9.1 (peer-AI turn 59): a `ctrl:throw` walked the
+    /// entire frame chain without finding a matching handler.
+    /// Halts the VM; the thrown value is preserved in
+    /// `VM.unhandled_throw` for diagnostics (#10 will surface
+    /// this with source span context).
+    UncaughtThrow,
+    /// Step #9.1: handler stack is in an invalid state —
+    /// `ctrl:try-exit` referenced a handler that doesn't
+    /// belong to the current frame, or popping found nothing.
+    /// Indicates compiler bug, not user error.
+    InvalidHandlerState,
     /// V-operand resolve (or `var:load-var`) read a Var whose
     /// `bound = false` — the Var was interned (e.g., by a
     /// forward reference in another `defn`) but no `def` has
@@ -702,6 +754,53 @@ pub const VmError = error{
     /// (peer-AI turn 49). Recoverable error (user can `def`
     /// the var and retry).
     UnboundVar,
+};
+
+// =============================================================================
+// Try / catch / throw machinery (step #9.1, peer-AI turn 59)
+// =============================================================================
+
+/// What kind of frame-bound exception handler this is.
+pub const HandlerKind = enum {
+    /// A `(try body (catch any x handler))` is active —
+    /// catch_pc + binding_slot are valid; throw routes here.
+    try_,
+    /// The catch body of a fired try is running — preserves
+    /// per-handler bookkeeping (e.g., per-#9.2 finally_pc)
+    /// for the catch body's `try-exit`. Prevents the catch
+    /// body's own throw from being re-caught by the same
+    /// handler (peer-AI turn 59 §"Missing trap 1" — the
+    /// classic catch-body-rethrow trap).
+    cleanup,
+};
+
+/// Per-handler state stored on `VM.handlers`. Per peer-AI
+/// turn 59 §D2: a VM-global stack keyed by `frame_index`
+/// (instead of per-frame ArrayLists). Cheaper to manage, no
+/// per-frame init/deinit, frame indices stable under
+/// `frames.append` reallocations because frames only pop
+/// from the top.
+pub const Handler = struct {
+    kind: HandlerKind,
+    /// Index into `VM.frames`. Identifies which frame this
+    /// handler belongs to; on `ctrl:try-exit` the popped
+    /// handler's frame_index MUST match the current frame.
+    frame_index: usize,
+    /// PC of the catch entry (valid only when kind == .try_).
+    /// Throw routes control here, after binding the thrown
+    /// value into `binding_slot`.
+    catch_pc: u32,
+    /// Slot into which the thrown value is stored when the
+    /// catch fires. Valid only when kind == .try_.
+    binding_slot: u12,
+    /// Reserved for step #9.2. `null` in #9.1.
+    finally_pc: ?u32 = null,
+    /// Stack depth (logical, NOT physical) when the handler
+    /// was registered. On throw-unwind, shrink stack back to
+    /// this. v1: equal to frame.slot_count for the registering
+    /// frame (we don't yet have dynamic stack growth within a
+    /// frame), but reserved for future call-window cleanup.
+    saved_stack_len: usize,
 };
 
 // =============================================================================
@@ -738,6 +837,18 @@ pub const VM = struct {
     /// v1 has a single global namespace; multi-namespace
     /// machinery lands later.
     namespace: ?Namespace = null,
+    /// Step #9.1: global try-handler stack (peer-AI turn 59
+    /// §D2). Push on `ctrl:try-enter`, pop on `ctrl:try-exit`,
+    /// walk on `ctrl:throw`. Each Handler is keyed by
+    /// `frame_index` so throw-unwind can identify which frame
+    /// it belongs to.
+    handlers: std.ArrayList(Handler) = .empty,
+    /// Step #9.1: if a `ctrl:throw` walks the entire frame
+    /// chain without finding a matching handler, the VM halts
+    /// with `VmError.UncaughtThrow` AND stores the thrown
+    /// payload here. Step #10 will surface this with source
+    /// span context.
+    unhandled_throw: ?Value = null,
     /// Step E1 (pre-#8): shared Interner for symbol/keyword
     /// Value construction. Lazy-initialized on first access.
     /// Used by the compiler's `lowerQuotePayload` for quoted
@@ -791,6 +902,9 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *VM) void {
+        // Step #9.1: free the handler stack backing storage.
+        // Handlers themselves are POD (no nested allocations).
+        self.handlers.deinit(self.allocator);
         // Interner owns hash maps allocated via self.allocator;
         // free explicitly (step E1).
         if (self.interner) |*it| it.deinit();
@@ -1138,8 +1252,9 @@ pub const VM = struct {
             .closure => try self.execClosure(inst),
             .var_ => try self.execVar(inst),
             .coll => try self.execColl(inst),
+            .ctrl => try self.execCtrl(inst),
             // Known but not yet implemented in this commit.
-            .transient, .hash, .tx, .ctrl, .io, .simd => return VmError.UnimplementedOpcode,
+            .transient, .hash, .tx, .io, .simd => return VmError.UnimplementedOpcode,
             // Unrecognized group byte — bytecode corruption.
             _ => return VmError.BytecodeCorruption,
         }
@@ -1961,6 +2076,160 @@ pub const VM = struct {
         const result = vector_mod.fromSlice(heap, elems.items) catch return VmError.OutOfMemory;
         try self.store(.{ .kind = .slot, .index = dst }, result);
     }
+
+    // -------------------------------------------------------------
+    // Group #11: `ctrl` — try / catch / throw (step #9.1)
+    // -------------------------------------------------------------
+    //
+    // Per VM.md §12 + peer-AI turn 59. v1 covers user-thrown
+    // values; VM-detected errors (KindMismatch, etc.) are NOT
+    // catchable in this commit (deferred to post-#10 once the
+    // error reporting layer can convert them to user Values).
+    // finally is reserved for #9.2.
+
+    fn execCtrl(self: *VM, inst: Inst) VmError!void {
+        const variant: CtrlOp = @enumFromInt(inst.variant);
+        switch (variant) {
+            .try_enter => try self.execCtrlTryEnter(inst),
+            .try_exit => try self.execCtrlTryExit(inst),
+            .throw_ => try self.execCtrlThrow(inst),
+            // finally_exit and halt_ reserved for later commits.
+            .finally_exit, .halt_ => return VmError.UnimplementedOpcode,
+            _ => return VmError.BytecodeCorruption,
+        }
+    }
+
+    /// `ctrl:try-enter A=catch_pc B=binding_slot C=unused` —
+    /// push a try handler onto the global handler stack.
+    /// catch_pc is absolute within the current routine.
+    /// binding_slot is where the thrown value will be stored.
+    /// C MUST be `.unused` in #9.1 (reserved for finally_pc
+    /// in #9.2).
+    fn execCtrlTryEnter(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .jump) return VmError.InvalidOperandKind;
+        if (inst.b.kind != .slot) return VmError.InvalidOperandKind;
+        // C reserved for finally_pc (#9.2). Must be unused now.
+        if (inst.c.kind != .unused) return VmError.InvalidOperandKind;
+
+        const frame_index = self.frames.items.len - 1;
+        const frame = self.currentFrame();
+        try self.handlers.append(self.allocator, .{
+            .kind = .try_,
+            .frame_index = frame_index,
+            .catch_pc = inst.a.index,
+            .binding_slot = inst.b.index,
+            .finally_pc = null,
+            .saved_stack_len = @as(usize, frame.base_slot) + @as(usize, frame.slot_count),
+        });
+    }
+
+    /// `ctrl:try-exit A=post_pc B=unused C=unused` — pop the
+    /// current handler (must belong to this frame) and jump to
+    /// post_pc. Used on BOTH normal try-body exit AND catch-
+    /// body exit (the catch's handler is a `.cleanup` kind).
+    fn execCtrlTryExit(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .jump) return VmError.InvalidOperandKind;
+        const post_pc: u32 = inst.a.index;
+
+        if (self.handlers.items.len == 0) return VmError.InvalidHandlerState;
+        const top = self.handlers.items[self.handlers.items.len - 1];
+        const frame_index = self.frames.items.len - 1;
+        if (top.frame_index != frame_index) return VmError.InvalidHandlerState;
+
+        _ = self.handlers.pop();
+        const frame = self.currentFrame();
+        frame.pc = post_pc;
+    }
+
+    /// `ctrl:throw A=value_operand B=unused C=unused` — throw
+    /// the resolved value. Walks the handler stack top-to-bottom
+    /// looking for a `.try_` handler. If found:
+    ///   1. Replace the handler with a `.cleanup` (so the catch
+    ///      body's own throw isn't re-caught by the same
+    ///      handler — peer-AI turn 59 §"Missing trap 1").
+    ///   2. Unwind frames above the handler's frame_index.
+    ///   3. Shrink stack to saved_stack_len.
+    ///   4. Store the thrown value into binding_slot.
+    ///   5. Jump to catch_pc.
+    ///
+    /// If no `.try_` handler exists anywhere, stores the thrown
+    /// value into `VM.unhandled_throw` and returns
+    /// `VmError.UncaughtThrow`.
+    fn execCtrlThrow(self: *VM, inst: Inst) VmError!void {
+        const value = try self.resolve(inst.a);
+        try self.unwindThrow(value);
+    }
+
+    /// Walk the handler stack looking for the topmost `.try_`
+    /// handler. Cleanup records above it (from catch bodies
+    /// in inner scopes) are discarded along the way. Returns
+    /// the index of the matching handler in `self.handlers`,
+    /// or null if nothing matches.
+    fn findTryHandler(self: *VM) ?usize {
+        var i: usize = self.handlers.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.handlers.items[i].kind == .try_) return i;
+        }
+        return null;
+    }
+
+    /// Common throw-unwind logic. Used by `execCtrlThrow` and
+    /// (eventually #9.2) by finally-exit's throwing continuation.
+    fn unwindThrow(self: *VM, value: Value) VmError!void {
+        const handler_idx = self.findTryHandler() orelse {
+            // No matching handler anywhere — uncaught.
+            self.unhandled_throw = value;
+            return VmError.UncaughtThrow;
+        };
+        const matched = self.handlers.items[handler_idx];
+
+        // Discard any handlers above the matched one (cleanup
+        // records from inner scopes that didn't match — they
+        // can't fire again).
+        self.handlers.shrinkRetainingCapacity(handler_idx);
+
+        // Unwind frames above the matched handler's frame.
+        // Per peer-AI turn 59 §D8: do NOT write to caller
+        // return slots, just pop. (Normal `call:return` writes
+        // to caller's return_dst; throw bypasses that.)
+        while (self.frames.items.len - 1 > matched.frame_index) {
+            _ = self.frames.pop();
+        }
+
+        // Shrink stack back to the matched frame's logical end.
+        // saved_stack_len was set at try-enter time to
+        // (base_slot + slot_count); throw unwind shrinks back to
+        // there, discarding any callee slots.
+        if (self.stack.items.len > matched.saved_stack_len) {
+            self.stack.shrinkRetainingCapacity(matched.saved_stack_len);
+        }
+
+        // Push a cleanup handler in place of the original try
+        // (peer-AI turn 59 §D5 "classic trap" fix). This protects
+        // the catch body from being re-caught by its own handler
+        // and gives the catch body's `try-exit` something to pop.
+        try self.handlers.append(self.allocator, .{
+            .kind = .cleanup,
+            .frame_index = matched.frame_index,
+            .catch_pc = 0,
+            .binding_slot = 0,
+            .finally_pc = matched.finally_pc, // null in #9.1
+            .saved_stack_len = matched.saved_stack_len,
+        });
+
+        // Store thrown value into the handler's binding_slot.
+        // The slot is in the matched frame's logical slot space.
+        const frame = self.currentFrame();
+        if (matched.binding_slot >= frame.slot_count) {
+            return VmError.InvalidHandlerState;
+        }
+        const ptr = try self.slotPtr(matched.binding_slot);
+        ptr.* = value;
+
+        // Jump to catch entry.
+        frame.pc = matched.catch_pc;
+    }
 };
 
 /// Numeric addition for the math:add opcode. Step #2 supports
@@ -2195,6 +2464,42 @@ pub const asm_ = struct {
             Operand.slot(arg_base),
             .{ .kind = .unused, .index = argc },
             Operand.slot(dst),
+        );
+    }
+
+    /// ctrl:try-enter catch_pc binding_slot _   ; push handler.
+    /// Step #9.1.
+    pub fn tryEnter(catch_pc: u12, binding_slot: u12) Inst {
+        return Inst.primary(
+            .ctrl,
+            CtrlOp.try_enter,
+            Operand.jump(catch_pc),
+            Operand.slot(binding_slot),
+            Operand.none,
+        );
+    }
+
+    /// ctrl:try-exit post_pc _ _   ; pop handler, jump to post_pc.
+    /// Step #9.1.
+    pub fn tryExit(post_pc: u12) Inst {
+        return Inst.primary(
+            .ctrl,
+            CtrlOp.try_exit,
+            Operand.jump(post_pc),
+            Operand.none,
+            Operand.none,
+        );
+    }
+
+    /// ctrl:throw value_operand _ _   ; throw the resolved value.
+    /// Operand kind may be slot, constant, or var. Step #9.1.
+    pub fn throwOp(value: Operand) Inst {
+        return Inst.primary(
+            .ctrl,
+            CtrlOp.throw_,
+            value,
+            Operand.none,
+            Operand.none,
         );
     }
 
@@ -2625,6 +2930,119 @@ test "VM #8c.1: coll:concat on non-list arg traps KindMismatch" {
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
     try testing.expectError(VmError.KindMismatch, vm.run());
+}
+
+// ---- Step #9.1: ctrl group tests ---------------------------
+
+test "VM #9.1: try-enter pushes handler, try-exit pops it" {
+    // (try 42 (catch any _ 99)) — body returns 42, catch unused.
+    // Layout: slot 0 = result; slot 1 = catch binding (unused).
+    // Body returns 42 via mov; try-exit jumps past catch; catch
+    // would set 99 if reached.
+    var code = [_]Inst{
+        // PC 0: try-enter catch=4, binding=1, _
+        asm_.tryEnter(4, 1),
+        // PC 1: body: load 42 into slot 0
+        // (We can't loadConst w/o consts; use loadNil and then
+        // a constant via consts pool.)
+        asm_.loadConst(0, 0),
+        // PC 2: try-exit -> jump to post at PC 6
+        asm_.tryExit(6),
+        // PC 3: jump (just padding; never reached)
+        asm_.jumpJmp(6),
+        // PC 4: catch entry — set slot 0 to constant index 1 (99)
+        asm_.loadConst(0, 1),
+        // PC 5: try-exit -> post at PC 6
+        asm_.tryExit(6),
+        // PC 6: return slot 0
+        asm_.returnSlot(0),
+    };
+    const consts = [_]Const{
+        .{ .value = value_mod.fromFixnum(42).? },
+        .{ .value = value_mod.fromFixnum(99).? },
+    };
+    const routine = makeRoutine(&code, &consts, 2, "try-normal");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const r = try vm.run();
+    try testing.expectEqual(@as(i64, 42), r.asFixnum());
+    // Handler stack empty after normal exit.
+    try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
+}
+
+test "VM #9.1: throw caught by current frame's try handler" {
+    // (try (throw 7) (catch any e e)) — should return 7.
+    var code = [_]Inst{
+        // PC 0: try-enter catch=2, binding=1, _
+        asm_.tryEnter(2, 1),
+        // PC 1: throw constant 0 (= 7)
+        asm_.throwOp(Operand{ .kind = .constant, .index = 0 }),
+        // PC 2: catch entry — slot 1 was filled by throw with 7;
+        // move it to slot 0 (result), then try-exit to PC 4.
+        asm_.move(0, 1),
+        // PC 3: try-exit -> post at PC 4
+        asm_.tryExit(4),
+        // PC 4: return slot 0
+        asm_.returnSlot(0),
+    };
+    const consts = [_]Const{
+        .{ .value = value_mod.fromFixnum(7).? },
+    };
+    const routine = makeRoutine(&code, &consts, 2, "try-catch");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const r = try vm.run();
+    try testing.expectEqual(@as(i64, 7), r.asFixnum());
+    try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
+}
+
+test "VM #9.1: throw with no handler raises UncaughtThrow" {
+    // (throw 13) at top level — uncaught.
+    var code = [_]Inst{
+        asm_.throwOp(Operand{ .kind = .constant, .index = 0 }),
+        asm_.returnSlot(0), // unreached
+    };
+    const consts = [_]Const{
+        .{ .value = value_mod.fromFixnum(13).? },
+    };
+    const routine = makeRoutine(&code, &consts, 1, "uncaught");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    try testing.expectError(VmError.UncaughtThrow, vm.run());
+    // Payload stored for diagnostics (step #10 will use this).
+    try testing.expect(vm.unhandled_throw != null);
+    try testing.expectEqual(@as(i64, 13), vm.unhandled_throw.?.asFixnum());
+}
+
+test "VM #9.1: throw inside catch body NOT re-caught by same handler" {
+    // (try (throw :a) (catch any e (throw :b)))
+    // The inner throw must NOT be caught by the same handler;
+    // it should propagate as UncaughtThrow (no outer try here).
+    // This is the "classic trap" from peer-AI turn 59 §"Missing
+    // trap 1": the throw-handler replaces the try with cleanup
+    // so the catch body's own throw bypasses the same handler.
+    var code = [_]Inst{
+        // PC 0: try-enter catch=2, binding=1, _
+        asm_.tryEnter(2, 1),
+        // PC 1: throw const 0 = :a (fixnum 1 for simplicity)
+        asm_.throwOp(Operand{ .kind = .constant, .index = 0 }),
+        // PC 2: catch entry — throw const 1 = :b
+        asm_.throwOp(Operand{ .kind = .constant, .index = 1 }),
+        // PC 3: try-exit (unreached if inner throw escapes)
+        asm_.tryExit(4),
+        // PC 4: return
+        asm_.returnSlot(0),
+    };
+    const consts = [_]Const{
+        .{ .value = value_mod.fromFixnum(1).? }, // "a"
+        .{ .value = value_mod.fromFixnum(2).? }, // "b"
+    };
+    const routine = makeRoutine(&code, &consts, 2, "catch-rethrow");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    try testing.expectError(VmError.UncaughtThrow, vm.run());
+    // Should be the SECOND throw (value 2), not the first.
+    try testing.expectEqual(@as(i64, 2), vm.unhandled_throw.?.asFixnum());
 }
 
 test "VM: exhausting bytecode without return surfaces BytecodeExhausted" {

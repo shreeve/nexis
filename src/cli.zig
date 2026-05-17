@@ -115,11 +115,13 @@ const Usage =
     \\  quoting: (quote x), 'x (scalars + interned symbols/keywords)
     \\  mutual: (letfn* [(name [params] body...) ...] body...)
     \\  macros: when, when-not, and, or, cond, ->, ->>
+    \\  exceptions: (try body (catch any e handler) [(finally ...)])
+    \\              (throw value)
     \\
     \\Limitations (closes as Phase 2 progresses):
-    \\  - syntax-quote / unquote / #(...): step #8c
-    \\  - try/catch/throw: step #9
+    \\  - try/finally + recur-in-try: step #9.2
     \\  - error spans / structured diagnostics: step #10
+    \\  - #(...) anon-fn shorthand: post-#10
     \\  - REPL / module loading / user defmacro: Phase 3+
     \\
 ;
