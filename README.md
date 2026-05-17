@@ -1,14 +1,16 @@
 # nexis
 
-> **Clojure semantics on a Zig-native runtime** — same language to write,
-> completely different runtime story. Single binary, no JVM warmup,
-> integrated durable storage, post-v1 path to Datomic-class temporal
-> queries as a library (not an external service).
+> **Clojure language design on a Zig-native runtime.** Same surface
+> syntax, same persistent collections, same macros, same lexical
+> scoping. Single binary, no JVM warmup, integrated durable storage,
+> post-v1 path to Datomic-class temporal queries. **Not a Clojure
+> port** — no Java interop, no STM; what you trade the JVM ecosystem
+> for is described below.
 
 **nexis** takes Clojure's best ideas — persistent immutable collections,
 macros, keywords, data-first APIs, identity/value separation, lexical
 closures with proper capture semantics, `let`/`fn`/`defn`/`loop`/`recur` —
-and replants them on a vertically integrated Zig-native substrate:
+and reimplements them on a vertically integrated Zig-native substrate:
 a grammar-driven parser (`nexus`), an mmap'd MVCC B+ tree storage
 engine (`emdb`), and a production 64-bit bytecode VM. Durable
 identities are first-class values, not a library bolted on top.
@@ -90,12 +92,48 @@ See [`AGENTS.md`](AGENTS.md) for when to use which.
 | Durable storage | External (Datomic, JDBC, etc.) | First-class: emdb integrated; `durable_ref` is a Value kind |
 | Deployment | JVM uberjar / native-image | Static binary, end-state ~5 MB |
 
-**The syntax is intentionally Clojure's syntax.** Same `let`/`fn`/`defn`/
-`loop`/`recur`, same `#(...)` anon-fn shorthand, same `#'x` var ref,
-same `^{...}` metadata, same persistent-collection literals
-(`[]` / `{}` / `#{}`), same lisp-1 namespace with Vars, same
-Clojure-style truthiness (only `nil` / `false` are falsy). A Clojure
-programmer should read nexis source with zero learning curve.
+### What this means for a Clojure programmer
+
+**The language design is intentionally Clojure's** — same surface
+syntax, same macros, same persistent collections, same scoping rules.
+A Clojure programmer **reading** nexis source recognizes the language
+immediately: `let`/`fn`/`defn`/`loop`/`recur`, `#(...)` anon-fn
+shorthand, `#'x` var ref, `^{...}` metadata, `[]`/`{}`/`#{}` collection
+literals, Lisp-1 namespace with Vars, Clojure-style truthiness (only
+`nil`/`false` are falsy), proper lexical closures with fresh-cell-per-
+iteration capture for loop bindings.
+
+**Writing productive nexis is a different story.** Two categories of
+gap:
+
+**Permanent, by design** (these never close — they're not bugs, they're
+the deal):
+- **No Java interop.** No `(Math/sqrt x)`, no `(.method obj)`, no
+  `(import …)`. Roughly 30-40% of real-world Clojure code touches
+  Java; that code does not port.
+- **No STM (Refs, `dosync`, `commute`).** Channels + immutable
+  values + (post-v1) durable transactions are the concurrency story.
+- **No JVM ecosystem.** No Maven Central. The library story rebuilds
+  on top of nexis.
+
+**Closing as phases land:**
+- Phase 2 (now): single-arity functions only, single global namespace,
+  no destructuring, no stdlib, no REPL, no protocols/multimethods.
+  Step #7 (next) closes the loop on compiling `.nx` source files.
+- Phase 3: standard library (`map`, `reduce`, `filter`, `conj`,
+  `assoc`, threading macros, etc.), multi-arity functions,
+  destructuring, multiple namespaces, protocols, multimethods,
+  dynamic Var binding. After Phase 3, idiomatic non-interop Clojure
+  mostly ports.
+- Phase 4-5: codec + emdb integration finalized.
+- Phase 6: performance polish + benchmarks.
+- Post-v1: Nextomic — Datomic-class temporal queries embedded as a
+  library, something Clojure-on-JVM never had natively.
+
+So: **the semantics port; the platform and the libraries don't.** A
+Clojure programmer trades the JVM ecosystem for a single binary, no
+JVM warmup, integrated durable storage, and a path to Datomic-class
+identity. That's a real trade, not a free lunch.
 
 See [`CLOJURE-REVIEW.md`](CLOJURE-REVIEW.md) for the line-by-line
 catalogue of what we take, adapt, and reject from Clojure's source.
