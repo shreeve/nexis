@@ -1241,3 +1241,69 @@ from code contact:
   Next: step #8 (macroexpander). Requires Tiny.literal +
   symbol/keyword Value support; the deferral list above
   will start closing as #8 lands.
+
+- **2026-05-17** (step E1 prereq + step H1 CLI runner +
+  step #8 spec pinned):
+
+  **E1** (97aa9dd, peer-AI turn 55 §K): `Tiny.literal: Value`
+  added as a generic Value constant variant. Used by quoted
+  unqualified symbols/keywords, which lower via a shared
+  Interner threaded into the compile path. New entries:
+  - `compileFormFull(allocator, form, ns?, interner?)`
+  - `compileSourceFull(allocator, source, ns?, interner?)`
+  Existing entries (`compileSource`, `compileSourceWithNamespace`,
+  `compileForm`, `compileFormWithNamespace`) preserved as
+  null-interner wrappers — every prior test runs unchanged.
+
+  **LowerCtx** struct (NEW) bundles `{env, interner}` and is
+  threaded through every lower\* helper as one parameter.
+  Replaces the prior env-only parameter. `withEnv(child)`
+  creates a child context inheriting the interner. 15 function
+  signatures rotated via mechanical bulk-rename; semantics
+  unchanged.
+
+  Bare `:keyword` now self-evaluates via `Tiny.literal` (per
+  Clojure semantics; keywords are always self-evaluating).
+  Without an interner, falls back to `UnsupportedFeature`.
+
+  Quoted nil/bool/int still use existing Tiny variants
+  (peer-AI turn 53 §Q1 — saves const-pool entries).
+  Quoted compound collections still `UnsupportedFeature`;
+  step #8c will close that via `(#%list ...)` / `(#%concat
+  ...)` emission.
+
+  **H1** (98a7d33, peer-AI turn 55 §H): `bin/nexis` CLI
+  runner. `src/cli.zig` (~200 LOC) reads file, parses ALL
+  top-level forms via `parser.parseProgram` +
+  `Reader.readProgram`, compiles each via `compileFormFull`
+  (sharing VM's ns + interner), runs each, prints final
+  result via a tiny inline formatValue. First user-visible
+  `.nx` programs run end-to-end: `examples/hello.nx`,
+  `sum10.nx`, `forward-ref.nx`. New `zig build nexis` step.
+
+  **MACROEXPAND.md** spec pinned per peer-AI turn 56 (11
+  edits to draft applied BEFORE coding):
+  - MacroFn takes `*MacroexpandContext` (carries gensym
+    counter, interner, host_macros table).
+  - Gensym counter lives on context, NOT VM.
+  - Reordered #8b ↔ #8c: host macros first (FormBuilder
+    only, no runtime list/concat). Syntax-quote +
+    list/concat separate.
+  - Per-form traversal rules table (each special form has
+    its own walking rule).
+  - `quote` AND `syntax_quote` both opaque in #8a.
+  - SrcSpan rule pinned: synthetic forms get the macro
+    call's origin.
+  - Error model split: `MacroDepthExceeded` distinct from
+    `MacroExpansionFailure`.
+  - Removed multi-arity `defn` from step-#8 macro table
+    (defer to Phase 3 with `defmacro`).
+  - Added `let`/`fn`/`loop` rename macros per
+    CLOJURE-REVIEW.md §1.1.
+  - `or` MUST use gensym (avoid double-evaluation); exact
+    expansion shape spec'd.
+  - Syntax-quote-emitted `list`/`concat` use internal
+    `#%list` / `#%concat` special forms — unshadowable.
+
+  Tests: 757 → 767 (+10 across E1 + H1 keyword tests).
+  `zig build phase2-test` stays ~2s.

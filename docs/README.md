@@ -29,6 +29,8 @@ wins and the code is wrong.
 | `src/reader.zig` | [`FORMS.md`](FORMS.md) | Sexp → Form normalizer + pretty-printer + canonical Form schema |
 | `src/vm.zig` | [`VM.md`](VM.md) | Phase 2 bytecode VM: ISA + execution contracts |
 | `src/compile.zig` | [`COMPILER.md`](COMPILER.md) | Phase 2 compiler: pipeline + per-special-form lowering |
+| `src/cli.zig` | (no dedicated spec) | Step H1 CLI runner — wires the pipeline into `bin/nexis` |
+| `src/macroexpand.zig` (Phase 2 step #8) | [`MACROEXPAND.md`](MACROEXPAND.md) | Form → Form rewriter; host-Zig macros for v1 (`defmacro` defers to Phase 3) |
 | `src/parser.zig` | (no dedicated spec) | **Generated** from `nexis.grammar` by the external `nexus` tool. Do not edit by hand. |
 | `src/nexis.zig` | (no dedicated spec) | `@lang` module — Tag enum + Lexer wrapper |
 | `src/golden.zig` | (no dedicated spec) | Build tooling — golden-test runner CLI |
