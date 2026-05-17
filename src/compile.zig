@@ -420,6 +420,26 @@ pub const CompileError = error{
     /// ErrorKind.
     ReaderFailure,
 
+    /// A list form (call or special form) has the wrong shape.
+    /// Step #7b: emitted for malformed `(if)`, `(quote)`,
+    /// `(let* ...)` without a binding vector, etc. Covers
+    /// arity and structural errors that the reader accepted
+    /// as syntactically valid lists but the compiler rejects
+    /// as semantically malformed.
+    MalformedForm,
+
+    /// A position required a symbol but got something else
+    /// (e.g., `(let* [1 2] body)` — binding name `1` is not
+    /// a symbol; `(def 42 ...)` — def name `42` is not a
+    /// symbol). Step #7b/#7c.
+    ExpectedSymbol,
+
+    /// A position required a vector but got something else
+    /// (e.g., `(let* (x 1) body)` — binding spec is a list,
+    /// not a vector; `(fn* (x) body)` — param spec is a
+    /// list, not a vector). Step #7c.
+    ExpectedVector,
+
     /// A compiler invariant was violated. Distinct from a
     /// user-error like `UnresolvedSymbol`: this indicates the
     /// compiler reached a state it believes impossible (e.g.,
@@ -927,11 +947,64 @@ fn allocTiny(allocator: std.mem.Allocator, value: Tiny) CompileError!*Tiny {
     return t;
 }
 
+/// Form-lowering lexical environment (step #7b, peer-AI turn 53).
+/// Tracks lexical names that are visible in operator position so
+/// the dispatcher can decide whether to inline intrinsics like
+/// `+` and `<` or fall through to ordinary call lowering.
+///
+/// This is NOT slot resolution — that happens later in the backend
+/// via `resolveOrCapture`. LowerEnv ONLY exists to make the
+/// shadowing rule for inlineable core fns work correctly:
+///
+///   (let* [+ (fn* [a b] 42)] (+ 1 2))   ;; ordinary call, not Tiny.add
+///   (let* [if 1] (if true 2 3))          ;; STILL special form `if`
+///
+/// Special forms (`if`, `do`, `let*`, `fn*`, `letfn*`, `loop*`,
+/// `recur`, `quote`, `def`, `defn`, `var`) are RESERVED in operator
+/// position — they're recognized regardless of lexical bindings.
+/// Only inlineable core fns (`+`, `<` in #7b) check the env.
+///
+/// Known limitation (peer-AI turn 53 §"Additional traps"): the
+/// shadowing check is lexical-only. Namespace-level Var
+/// shadowing — `(do (def + f) (+ 1 2))` — still inlines `+` to
+/// `Tiny.add` because the lowerer doesn't track Vars. Fixing this
+/// would require LowerEnv to consult the namespace at lowering
+/// time, which is a Phase 3+ refinement (see CLOJURE-REVIEW.md
+/// §1.7's "core inlining" discussion).
+pub const LowerEnv = struct {
+    /// Names bound at THIS scope level. The full visibility set
+    /// is the union of this set with the parent's set,
+    /// transitively. Linear-lookup string set (matches the
+    /// backend's NameSet pattern — capture analysis already pays
+    /// this cost and proves it's fine at v1 scale).
+    lexical_names: NameSet = .{},
+    parent: ?*const LowerEnv = null,
+
+    /// Innermost-first lookup walks the parent chain.
+    fn contains(self: *const LowerEnv, name: []const u8) bool {
+        if (self.lexical_names.contains(name)) return true;
+        if (self.parent) |p| return p.contains(name);
+        return false;
+    }
+
+    fn deinit(self: *LowerEnv, allocator: std.mem.Allocator) void {
+        self.lexical_names.deinit(allocator);
+    }
+};
+
+/// Helper used by `lowerList` to test whether a head symbol is a
+/// shadowable intrinsic. Special forms are NOT shadowable; they
+/// have their own switch arm.
+fn isIntrinsicShadowed(env: ?*const LowerEnv, name: []const u8) bool {
+    const e = env orelse return false;
+    return e.contains(name);
+}
+
 /// Translate a `reader.Form` tree into a `Tiny` IR tree on the
-/// passed allocator. Step #7a supports literals (`nil`, `bool_`,
-/// `int`) and unqualified symbols only; all other Form datums
-/// raise `CompileError.UnsupportedFeature` (compound forms land
-/// in #7b through #7d).
+/// passed allocator. Public entry; passes a null `LowerEnv` so
+/// top-level forms see no lexical bindings (correct — the
+/// top-level operator-position is the outermost scope). Internal
+/// recursion goes through `lowerFormEnv` which threads the env.
 ///
 /// Symbol names are NOT duped — they're borrowed from the
 /// reader's source string. The caller must keep that source
@@ -939,6 +1012,19 @@ fn allocTiny(allocator: std.mem.Allocator, value: Tiny) CompileError!*Tiny {
 pub fn lowerForm(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
+) CompileError!*Tiny {
+    return lowerFormEnv(allocator, form, null);
+}
+
+/// Internal `lowerForm` with LowerEnv threading (step #7b). The
+/// env is consulted ONLY when classifying list-head symbols as
+/// intrinsics vs ordinary calls. Recursion into sub-expressions
+/// passes the env through unchanged; binding forms (let*, fn*,
+/// loop*, letfn*) construct a child env that adds their bindings.
+fn lowerFormEnv(
+    allocator: std.mem.Allocator,
+    form: *const reader_mod.Form,
+    env: ?*const LowerEnv,
 ) CompileError!*Tiny {
     return switch (form.datum) {
         .nil => try allocTiny(allocator, .nil),
@@ -951,14 +1037,17 @@ pub fn lowerForm(
             if (name.ns != null) return CompileError.UnsupportedFeature;
             break :blk try allocTiny(allocator, .{ .symbol = name.name });
         },
+        .list => |items| try lowerList(allocator, items, env),
         // -- Compound datums: land in later #7 sub-steps. --
         // Phase 1 numeric literals beyond fixnum.
         .real, .char, .string, .keyword => return CompileError.UnsupportedFeature,
-        // Sequential collections + special-form dispatch (#7b/#7c).
-        .list, .vector, .map, .set => return CompileError.UnsupportedFeature,
-        // Reader macros / meta (#7b for quote-of-scalar, deferred
-        // to step #8 macroexpander for the rest).
-        .quote, .syntax_quote, .unquote, .unquote_splicing => return CompileError.UnsupportedFeature,
+        // Vectors/maps/sets as expressions: collection literals.
+        // Land in a later step when collection-value construction
+        // is wired (compile-time call into coll/{champ,vector}).
+        .vector, .map, .set => return CompileError.UnsupportedFeature,
+        // Reader macros / meta.
+        .quote => |inner| try lowerQuotePayload(allocator, inner),
+        .syntax_quote, .unquote, .unquote_splicing => return CompileError.UnsupportedFeature,
         // Atoms aren't a Phase 2 feature.
         .deref => return CompileError.UnsupportedFeature,
         // #(...) anon-fn shorthand — deferred (likely to step #8
@@ -967,6 +1056,161 @@ pub fn lowerForm(
         // ^{...} metadata — deferred (Phase 3+).
         .with_meta => return CompileError.UnsupportedFeature,
     };
+}
+
+// =============================================================================
+// Form list dispatch (step #7b): special forms + intrinsics + calls
+// =============================================================================
+//
+// Operator-position head-symbol dispatch. Special forms are
+// RESERVED (recognized regardless of lexical bindings). Inlineable
+// core fns are checked against the LowerEnv — if the name is
+// lexically shadowed, fall through to ordinary call lowering.
+// Everything else lowers to `Tiny.call`.
+
+/// Lower a list form. The list represents either a call (head is
+/// any expression evaluating to a closure) or a special form
+/// (head is a reserved symbol like `if`, `do`, `let*`, etc.).
+///
+/// Empty `()` is rejected (`MalformedForm`) for #7b. Per peer-AI
+/// turn 53: source `()` is invalid as an expression; the empty
+/// list value `'()` requires quoted-compound-collection support
+/// which is deferred.
+fn lowerList(
+    allocator: std.mem.Allocator,
+    items: []const *reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    if (items.len == 0) return CompileError.MalformedForm;
+    // Head-symbol dispatch only fires when head is an unqualified
+    // symbol. Qualified symbols (`foo/x`) and non-symbol heads
+    // (calls of computed values) fall through to ordinary call.
+    if (items[0].datum == .symbol and items[0].datum.symbol.ns == null) {
+        const name = items[0].datum.symbol.name;
+        // -- Special forms (NOT shadowable) --
+        if (std.mem.eql(u8, name, "do")) return try lowerDo(allocator, items[1..], env);
+        if (std.mem.eql(u8, name, "if")) return try lowerIf(allocator, items[1..], env);
+        if (std.mem.eql(u8, name, "quote")) return try lowerQuote(allocator, items[1..]);
+        // let*, fn*, letfn*, loop*, recur land in #7c.
+        // def, defn, var land in #7d.
+        // -- Inlineable intrinsics (shadowable) --
+        if (std.mem.eql(u8, name, "+") and items.len == 3 and !isIntrinsicShadowed(env, name)) {
+            return try lowerAdd(allocator, items[1], items[2], env);
+        }
+        if (std.mem.eql(u8, name, "<") and items.len == 3 and !isIntrinsicShadowed(env, name)) {
+            return try lowerLt(allocator, items[1], items[2], env);
+        }
+    }
+    // Ordinary call: lower head as callee, rest as args.
+    return try lowerCall(allocator, items, env);
+}
+
+/// `(do exprs...)`. Empty `(do)` lowers to `Tiny.do_` with an
+/// empty slice (backend synthesizes nil). Multi-expression do
+/// passes through as `Tiny.do_` (backend evaluates non-last for
+/// effect, returns last).
+fn lowerDo(
+    allocator: std.mem.Allocator,
+    body_items: []const *reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    const exprs = try allocator.alloc(*const Tiny, body_items.len);
+    for (body_items, 0..) |item, i| {
+        exprs[i] = try lowerFormEnv(allocator, item, env);
+    }
+    return try allocTiny(allocator, .{ .do_ = exprs });
+}
+
+/// `(if test then)` or `(if test then else)`. Missing else
+/// synthesizes nil (matches Tiny semantics).
+fn lowerIf(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    if (args.len != 2 and args.len != 3) return CompileError.MalformedForm;
+    const test_ = try lowerFormEnv(allocator, args[0], env);
+    const then = try lowerFormEnv(allocator, args[1], env);
+    const else_: ?*const Tiny = if (args.len == 3)
+        try lowerFormEnv(allocator, args[2], env)
+    else
+        null;
+    return try allocTiny(allocator, .{ .if_ = .{
+        .test_ = test_,
+        .then = then,
+        .else_ = else_,
+    } });
+}
+
+/// `(quote x)`. Per peer-AI turn 53: scalars that already map to
+/// Tiny variants are lowered to those variants directly (saves
+/// const-pool entries for fixnums/bools/nil). Quoted symbols,
+/// keywords, strings, and compound collections raise
+/// `UnsupportedFeature` for #7b — they'd require a `Tiny.literal`
+/// variant + Interner integration. The macroexpander (step #8)
+/// will need quoted-symbol support before that point.
+fn lowerQuote(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+) CompileError!*Tiny {
+    if (args.len != 1) return CompileError.MalformedForm;
+    return lowerQuotePayload(allocator, args[0]);
+}
+
+/// Shared implementation for `(quote x)` and the reader-macro
+/// `'x` (which the reader emits as `Datum.quote`).
+fn lowerQuotePayload(
+    allocator: std.mem.Allocator,
+    payload: *const reader_mod.Form,
+) CompileError!*Tiny {
+    return switch (payload.datum) {
+        .nil => try allocTiny(allocator, .nil),
+        .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
+        .int => |n| try allocTiny(allocator, .{ .int = n }),
+        // Quoted symbol/keyword/string/etc.: defer (#8).
+        else => return CompileError.UnsupportedFeature,
+    };
+}
+
+/// `(+ a b)`. Caller has already verified arity (3 list items)
+/// and unshadowed status.
+fn lowerAdd(
+    allocator: std.mem.Allocator,
+    lhs: *const reader_mod.Form,
+    rhs: *const reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    const t_lhs = try lowerFormEnv(allocator, lhs, env);
+    const t_rhs = try lowerFormEnv(allocator, rhs, env);
+    return try allocTiny(allocator, .{ .add = .{ .lhs = t_lhs, .rhs = t_rhs } });
+}
+
+/// `(< a b)`. Caller has already verified arity and unshadowed.
+fn lowerLt(
+    allocator: std.mem.Allocator,
+    lhs: *const reader_mod.Form,
+    rhs: *const reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    const t_lhs = try lowerFormEnv(allocator, lhs, env);
+    const t_rhs = try lowerFormEnv(allocator, rhs, env);
+    return try allocTiny(allocator, .{ .lt = .{ .lhs = t_lhs, .rhs = t_rhs } });
+}
+
+/// Ordinary function call `(callee args...)`. Lowers head as
+/// callee (any expression), rest as args.
+fn lowerCall(
+    allocator: std.mem.Allocator,
+    items: []const *reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    std.debug.assert(items.len >= 1);
+    const callee = try lowerFormEnv(allocator, items[0], env);
+    const args = try allocator.alloc(*const Tiny, items.len - 1);
+    for (items[1..], 0..) |item, i| {
+        args[i] = try lowerFormEnv(allocator, item, env);
+    }
+    return try allocTiny(allocator, .{ .call = .{ .callee = callee, .args = args } });
 }
 
 /// Compile a `reader.Form` tree into a `Compiled` artifact, no
@@ -4862,21 +5106,17 @@ test "compile #7a: lowerForm of keyword → UnsupportedFeature (deferred)" {
     try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
 }
 
-test "compile #7a: lowerForm of list → UnsupportedFeature (lands in #7b)" {
+test "compile #7a: lowerForm of empty list → MalformedForm (per peer-AI turn 53)" {
+    // Empty `()` as an expression is rejected; quoted empty list
+    // requires quoted-compound-collection support (deferred).
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const empty: []const *reader_mod.Form = &.{};
     const form = reader_mod.Form{ .datum = .{ .list = empty }, .origin = .{ .pos = 0, .len = 0 } };
-    try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
+    try testing.expectError(CompileError.MalformedForm, lowerForm(arena.allocator(), &form));
 }
 
-test "compile #7a: lowerForm of quote → UnsupportedFeature (lands in #7b)" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var inner = reader_mod.Form{ .datum = .{ .int = 42 }, .origin = .{ .pos = 0, .len = 0 } };
-    const form = reader_mod.Form{ .datum = .{ .quote = &inner }, .origin = .{ .pos = 0, .len = 0 } };
-    try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
-}
+// (Quote-of-int now succeeds in #7b; covered by the #7b quote tests below.)
 
 test "compile #7a: lowerForm of qualified symbol → UnsupportedFeature (post-v1 multi-ns)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -4895,6 +5135,182 @@ test "compile #7a: compileSource of malformed input → ReaderFailure" {
     try testing.expectError(
         CompileError.ReaderFailure,
         compileSource(arena.allocator(), "(foo"),
+    );
+}
+
+// ---- step #7b: list dispatch — calls + special forms + intrinsics ----
+
+/// Helper: run a source string and assert the result is a fixnum
+/// equal to `expected`. Builds a fresh VM, manages lifetime
+/// explicitly so the result outlives the arena teardown is
+/// not an issue (the asserted value is read before defers fire).
+fn expectSourceFixnum(src: []const u8, expected: i64) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const compiled = try compileSource(arena.allocator(), src);
+    const routine = compiled.toRoutine("src");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const result = try v.run();
+    try testing.expectEqual(expected, result.asFixnum());
+}
+
+fn expectSourceBool(src: []const u8, expected: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const compiled = try compileSource(arena.allocator(), src);
+    const routine = compiled.toRoutine("src");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const result = try v.run();
+    try testing.expectEqual(expected, result.asBool());
+}
+
+fn expectSourceNil(src: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const compiled = try compileSource(arena.allocator(), src);
+    const routine = compiled.toRoutine("src");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const result = try v.run();
+    try testing.expect(result.isNil());
+}
+
+test "compile #7b: (+ 1 2) = 3" {
+    try expectSourceFixnum("(+ 1 2)", 3);
+}
+
+test "compile #7b: (+ -7 -5) = -12" {
+    try expectSourceFixnum("(+ -7 -5)", -12);
+}
+
+test "compile #7b: (< 1 2) = true" {
+    try expectSourceBool("(< 1 2)", true);
+}
+
+test "compile #7b: (< 2 1) = false" {
+    try expectSourceBool("(< 2 1)", false);
+}
+
+test "compile #7b: (if true 1 2) = 1" {
+    try expectSourceFixnum("(if true 1 2)", 1);
+}
+
+test "compile #7b: (if false 1 2) = 2" {
+    try expectSourceFixnum("(if false 1 2)", 2);
+}
+
+test "compile #7b: (if true 7) = 7 — no else arm" {
+    try expectSourceFixnum("(if true 7)", 7);
+}
+
+test "compile #7b: (if false 7) — no else, falsy test → nil" {
+    try expectSourceNil("(if false 7)");
+}
+
+test "compile #7b: (do) → nil" {
+    try expectSourceNil("(do)");
+}
+
+test "compile #7b: (do 1) → 1" {
+    try expectSourceFixnum("(do 1)", 1);
+}
+
+test "compile #7b: (do 1 2 3) → 3" {
+    try expectSourceFixnum("(do 1 2 3)", 3);
+}
+
+test "compile #7b: (quote 42) → 42" {
+    try expectSourceFixnum("(quote 42)", 42);
+}
+
+test "compile #7b: (quote nil) → nil" {
+    try expectSourceNil("(quote nil)");
+}
+
+test "compile #7b: (quote true) → true" {
+    try expectSourceBool("(quote true)", true);
+}
+
+test "compile #7b: 'true (reader-macro form) → true" {
+    // `'x` lowers to Datum.quote(x); lowerFormEnv handles it
+    // via the .quote arm.
+    try expectSourceBool("'true", true);
+}
+
+test "compile #7b: nested (if (< 1 2) (+ 10 20) (+ 100 200)) = 30" {
+    try expectSourceFixnum("(if (< 1 2) (+ 10 20) (+ 100 200))", 30);
+}
+
+test "compile #7b: (if) malformed → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(if)"));
+}
+
+test "compile #7b: (if 1) malformed → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(if 1)"));
+}
+
+test "compile #7b: (if a b c d) too many args → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(if true 1 2 3)"));
+}
+
+test "compile #7b: (quote) malformed → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(quote)"));
+}
+
+test "compile #7b: (quote a b) too many args → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(quote 1 2)"));
+}
+
+test "compile #7b: (quote foo) symbol — defer → UnsupportedFeature" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.UnsupportedFeature, compileSource(arena.allocator(), "(quote foo)"));
+}
+
+test "compile #7b: () empty list → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "()"));
+}
+
+// Ordinary-call tests with fn* callees land in #7c (which adds
+// fn* lowering). For #7b, ordinary calls work but the only
+// non-special-form callees are symbol references — and resolving
+// a top-level symbol requires either lexical binding (#7c) or
+// namespace lookup (already shipped via #6b). A simple smoke test
+// of that path:
+
+test "compile #7b: ordinary call ((symbol-bound-as-fn 5)) via namespace" {
+    // Pre-bind `inc` in the namespace to a closure that adds 1.
+    // Then compile + run `(inc 5)` via source → 6.
+    // Requires hand-building the closure since we don't yet have
+    // fn* lowering from Form. Skip the closure construction here
+    // and instead just test that the lowerCall path produces a
+    // valid call instruction shape. The full end-to-end happens
+    // in #7c.
+    //
+    // For #7b: confirm ordinary-call dispatch by compiling the
+    // CALL even without resolving the symbol — we get an
+    // UnresolvedSymbol error (correct: `inc` isn't bound and no
+    // ns was passed), proving the dispatcher routed through
+    // lowerCall rather than treating `inc` as a special form.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(
+        CompileError.UnresolvedSymbol,
+        compileSource(arena.allocator(), "(inc 5)"),
     );
 }
 
