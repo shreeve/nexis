@@ -71,6 +71,11 @@ const reader_mod = @import("reader");
 /// symbols/keywords through the VM's shared Interner so identity
 /// is stable across compile + runtime + (post-#8) macroexpand.
 const intern_mod = @import("intern");
+/// Step #8a: Form → Form macroexpander. Optional — if a
+/// `*HostMacroTable` is passed to `compileFormFull` /
+/// `compileSourceFull`, the form is expanded BEFORE lowering.
+/// With null, no expansion fires (existing behavior preserved).
+const macroexpand_mod = @import("macroexpand");
 
 pub const Inst = vm.Inst;
 pub const Routine = vm.Routine;
@@ -448,6 +453,18 @@ pub const CompileError = error{
     /// as syntactically valid lists but the compiler rejects
     /// as semantically malformed.
     MalformedForm,
+
+    /// Step #8a: macroexpansion exceeded the depth limit (256
+    /// per MACROEXPAND.md §6). Almost always an infinite macro
+    /// loop. Distinct from `MacroExpansionFailure` because
+    /// users debugging macros want this signaled clearly.
+    MacroDepthExceeded,
+
+    /// Step #8a: bucket for all other macroexpand errors —
+    /// malformed macro call, macro returned a non-Form, etc.
+    /// Step #10 splits these out with original variant +
+    /// SrcSpan preservation.
+    MacroExpansionFailure,
 
     /// A position required a symbol but got something else
     /// (e.g., `(let* [1 2] body)` — binding name `1` is not
@@ -1675,8 +1692,45 @@ pub fn compileFormFull(
     namespace: ?*vm.Namespace,
     interner: ?*intern_mod.Interner,
 ) CompileError!Compiled {
+    return compileFormFullWithMacros(allocator, form, namespace, interner, null);
+}
+
+/// Step #8a: full form-compile with optional macroexpansion.
+///
+/// If `host_macros` is non-null AND `interner` is non-null,
+/// the form is run through the macroexpander BEFORE lowering.
+/// Macro errors are bucketed per `MacroexpandError`:
+///   ExpansionDepthExceeded → CompileError.MacroDepthExceeded
+///   everything else        → CompileError.MacroExpansionFailure
+///
+/// Without either, behavior is identical to `compileFormFull`
+/// (no expansion). The `host_macros` table can be empty, in
+/// which case the expander walks the tree but never fires a
+/// macro — still slightly more expensive than null, but
+/// useful for testing the scaffold.
+pub fn compileFormFullWithMacros(
+    allocator: std.mem.Allocator,
+    form: *const reader_mod.Form,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+    host_macros: ?*const macroexpand_mod.HostMacroTable,
+) CompileError!Compiled {
+    var working_form: *const reader_mod.Form = form;
+    if (host_macros != null and interner != null) {
+        var mctx = macroexpand_mod.MacroexpandContext{
+            .allocator = allocator,
+            .interner = interner.?,
+            .host_macros = host_macros.?,
+        };
+        working_form = macroexpand_mod.expandForm(&mctx, null, form) catch |err| switch (err) {
+            error.ExpansionDepthExceeded => return CompileError.MacroDepthExceeded,
+            error.MalformedMacroCall => return CompileError.MacroExpansionFailure,
+            error.MacroReturnedNull => return CompileError.MacroExpansionFailure,
+            error.OutOfMemory => return CompileError.OutOfMemory,
+        };
+    }
     const ctx = LowerCtx{ .env = null, .interner = interner };
-    const tiny = try lowerFormEnv(allocator, form, ctx);
+    const tiny = try lowerFormEnv(allocator, working_form, ctx);
     return compileTinyWithNamespace(allocator, tiny, namespace);
 }
 
@@ -1721,6 +1775,18 @@ pub fn compileSourceFull(
     namespace: ?*vm.Namespace,
     interner: ?*intern_mod.Interner,
 ) CompileError!Compiled {
+    return compileSourceFullWithMacros(allocator, source, namespace, interner, null);
+}
+
+/// Step #8a: end-to-end source compile with optional macroexpansion.
+/// See `compileFormFullWithMacros` for macro semantics.
+pub fn compileSourceFullWithMacros(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+    host_macros: ?*const macroexpand_mod.HostMacroTable,
+) CompileError!Compiled {
     var p = reader_mod.parser.parseForm(allocator, source) catch
         return CompileError.ReaderFailure;
     defer p.parser.deinit();
@@ -1728,7 +1794,7 @@ pub fn compileSourceFull(
     defer reader.deinit();
     const form = reader.readOneForm(p.sexp) catch
         return CompileError.ReaderFailure;
-    return compileFormFull(allocator, form, namespace, interner);
+    return compileFormFullWithMacros(allocator, form, namespace, interner, host_macros);
 }
 
 // =============================================================================
@@ -6273,6 +6339,72 @@ test "compile E1: bare keyword without interner → UnsupportedFeature" {
     try testing.expectError(
         CompileError.UnsupportedFeature,
         compileSource(arena.allocator(), ":hello"),
+    );
+}
+
+// ---- step #8a: macroexpand integration ---------------------
+
+test "compile #8a: empty macro table passes through (sanity)" {
+    // compileSourceFullWithMacros with an empty macro table
+    // should produce the same result as compileSourceFull.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    var host_macros: macroexpand_mod.HostMacroTable = .{};
+    defer host_macros.deinit(arena.allocator());
+    const compiled = try compileSourceFullWithMacros(
+        arena.allocator(),
+        "(+ 1 2)",
+        null,
+        interner,
+        &host_macros,
+    );
+    const routine = compiled.toRoutine("p");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+test "compile #8a: infinite macro loop → MacroDepthExceeded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+
+    const Wrap = struct {
+        fn loopForever(
+            _: *macroexpand_mod.MacroexpandContext,
+            call_form: *const reader_mod.Form,
+            _: []const *reader_mod.Form,
+        ) macroexpand_mod.MacroexpandError!*reader_mod.Form {
+            return @constCast(call_form);
+        }
+    };
+    var host_macros: macroexpand_mod.HostMacroTable = .{};
+    defer host_macros.deinit(arena.allocator());
+    try host_macros.put(arena.allocator(), "boom", Wrap.loopForever);
+
+    try testing.expectError(
+        CompileError.MacroDepthExceeded,
+        compileSourceFullWithMacros(
+            arena.allocator(),
+            "(boom)",
+            null,
+            interner,
+            &host_macros,
+        ),
     );
 }
 

@@ -1,0 +1,886 @@
+//! Phase 2 step #8a — macroexpander scaffold.
+//!
+//! See `docs/MACROEXPAND.md` for the full design contract;
+//! this file implements §1 (execution model) + §2b (per-form
+//! traversal rules) + §6 (depth limit) + §8 (error model) for
+//! the no-op-traversal initial commit. Steps #8b (host core
+//! macros) and #8c (syntax-quote + auto-gensym + native list/
+//! concat) build on this scaffold.
+//!
+//! What this file DOES (#8a):
+//!   - Defines `MacroexpandContext`, `MacroFn`, `HostMacroTable`,
+//!     `ExpandEnv`, `MacroexpandError`.
+//!   - Implements `expandForm`: per-form-rule walker that
+//!     recognizes every Phase-2 special form, threads ExpandEnv
+//!     correctly through binding forms, and dispatches macro
+//!     calls through the host table. With an empty table, the
+//!     output is structurally identical to the input.
+//!   - Treats `quote` and `syntax_quote` as OPAQUE (does not
+//!     recurse into them). syntax_quote will become a transform
+//!     rule in step #8c.
+//!   - Enforces a depth limit (256) and reports
+//!     `MacroDepthExceeded` distinctly from
+//!     `MacroExpansionFailure`.
+//!
+//! What this file does NOT do yet:
+//!   - Provide any host macros (`#8b`).
+//!   - Handle syntax_quote / unquote / unquote_splicing
+//!     transformation (`#8c`).
+//!   - User `defmacro` (deferred to Phase 3 with compile-time
+//!     VM eval).
+
+const std = @import("std");
+const reader_mod = @import("reader");
+const intern_mod = @import("intern");
+
+const Form = reader_mod.Form;
+const Datum = reader_mod.Datum;
+const SrcSpan = reader_mod.SrcSpan;
+const Allocator = std.mem.Allocator;
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/// Errors specific to macroexpansion. Mapped to CompileError
+/// variants by the caller (compile.zig):
+///   ExpansionDepthExceeded → CompileError.MacroDepthExceeded
+///   everything else        → CompileError.MacroExpansionFailure
+///   OutOfMemory            → CompileError.OutOfMemory
+pub const MacroexpandError = error{
+    ExpansionDepthExceeded,
+    MalformedMacroCall,
+    MacroReturnedNull,
+    OutOfMemory,
+};
+
+/// Per-spec MACROEXPAND.md §1: bundles every cross-cutting
+/// resource a host MacroFn might need. Lives FOR THE LIFETIME
+/// of a single compilation unit (typically one CLI invocation
+/// or one test). Reusing across forms is how auto-gensym stays
+/// monotonic within a unit.
+pub const MacroexpandContext = struct {
+    allocator: Allocator,
+    interner: *intern_mod.Interner,
+    /// Monotonic auto-gensym counter (#8b will read+increment).
+    gensym_next: u64 = 0,
+    /// Macro registry. May be empty (#8a default → no expansion
+    /// fires).
+    host_macros: *const HostMacroTable,
+};
+
+/// Host-Zig macro callback. Takes the call form (head + args)
+/// and produces a rewritten form. The result is then re-fed to
+/// `expandForm` (so macro-of-macros works automatically).
+pub const MacroFn = *const fn (
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) MacroexpandError!*Form;
+
+/// Maps unqualified symbol name → MacroFn. v1 uses an empty
+/// table by default; #8b populates with when/cond/and/or/etc.
+pub const HostMacroTable = std.StringHashMapUnmanaged(MacroFn);
+
+/// Lexical-name set for macro-shadowing tracking. Mirrors
+/// `compile.LowerEnv` exactly so the two stay aligned.
+/// Innermost-first lookup via parent walk.
+pub const ExpandEnv = struct {
+    lexical_names: NameSet = .{},
+    parent: ?*const ExpandEnv = null,
+
+    const NameSet = std.StringHashMapUnmanaged(void);
+
+    pub fn contains(self: *const ExpandEnv, name: []const u8) bool {
+        if (self.lexical_names.contains(name)) return true;
+        if (self.parent) |p| return p.contains(name);
+        return false;
+    }
+
+    pub fn deinit(self: *ExpandEnv, allocator: Allocator) void {
+        self.lexical_names.deinit(allocator);
+    }
+};
+
+/// MACROEXPAND.md §6 — matches Clojure's default. The expander
+/// increments depth on EACH macro expansion (not on tree-walk
+/// recursion). Catches infinite macro loops without limiting
+/// legitimate deep source.
+pub const MAX_EXPANSION_DEPTH: u32 = 256;
+
+// =============================================================================
+// Public entry
+// =============================================================================
+
+/// Walk a single Form, expanding any macro calls found in
+/// operator position. Returns the transformed Form (which may
+/// share subtrees with the input — Form trees are immutable
+/// from this layer's POV). The output is suitable for direct
+/// consumption by `compile.lowerForm`.
+///
+/// Empty `ctx.host_macros` table → output structurally identical
+/// to input.
+pub fn expandForm(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    form: *const Form,
+) MacroexpandError!*Form {
+    return expandFormDepth(ctx, env, form, 0);
+}
+
+/// Walk an array of top-level forms (e.g. file contents).
+/// Output is a fresh slice in `ctx.allocator`. The same
+/// gensym counter is reused across all forms so gensyms stay
+/// unique within the unit.
+pub fn expandProgram(
+    ctx: *MacroexpandContext,
+    forms: []const *Form,
+) MacroexpandError![]const *Form {
+    const out = try ctx.allocator.alloc(*Form, forms.len);
+    for (forms, 0..) |form, i| {
+        out[i] = try expandForm(ctx, null, form);
+    }
+    return out;
+}
+
+// =============================================================================
+// Internal walker
+// =============================================================================
+
+fn expandFormDepth(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    form: *const Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    if (depth > MAX_EXPANSION_DEPTH) return MacroexpandError.ExpansionDepthExceeded;
+
+    return switch (form.datum) {
+        // ---- Leaves — pass through unchanged. -----------------
+        .nil, .bool_, .int, .real, .char, .string, .keyword, .symbol => mutCast(form),
+        // ---- Lists — special-form recognition + macro dispatch. --
+        .list => |items| try expandList(ctx, env, form, items, depth),
+        // ---- Compound non-list collections (#8a: pass-through). --
+        // Phase-2 source doesn't allow vector/map/set as code
+        // (only in `let*` binding vectors, which are handled by
+        // the let* arm via direct items access). For top-level
+        // vector/map/set expressions, lowerForm will raise
+        // UnsupportedFeature; we don't pre-traverse them here.
+        .vector, .map, .set => mutCast(form),
+        // ---- Quote — OPAQUE per MACROEXPAND.md §2b. ----------
+        // The expander does NOT recurse into the payload of a
+        // quote form. `(quote (when x y))` MUST NOT expand
+        // `when` — it's a literal symbol/list value.
+        .quote => mutCast(form),
+        // ---- Syntax-quote — opaque in #8a (transform in #8c). --
+        .syntax_quote, .unquote, .unquote_splicing => mutCast(form),
+        // ---- Reader macros / metadata. -----------------------
+        // anon_fn `#(...)` will land as a macro expansion in
+        // step #8b (or, more conservatively, as a dedicated
+        // lower-form transform). #8a leaves it opaque so
+        // lowerForm raises UnsupportedFeature consistently.
+        .anon_fn => mutCast(form),
+        // with_meta is metadata attached to a target form;
+        // #8a passes through. Step #10+ may want to expand
+        // through the target.
+        .with_meta => mutCast(form),
+        // deref `@x`: Phase-2 doesn't support atoms, so this
+        // is opaque at expansion time. lowerForm raises
+        // UnsupportedFeature.
+        .deref => mutCast(form),
+    };
+}
+
+/// Cast a `*const Form` to `*Form`. The Form tree is arena-
+/// owned and immutable from the expander's POV — when we
+/// "pass through" a form we return the same pointer. The Tiny
+/// lowerer also expects `*Form`. Cast safety: the lowerer
+/// reads the form; nothing in the pipeline writes back to it.
+inline fn mutCast(form: *const Form) *Form {
+    return @constCast(form);
+}
+
+/// Dispatch a list form: check for special form / macro / call.
+fn expandList(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    // Empty list `()` — pass through (lowerForm catches this
+    // and raises MalformedForm).
+    if (items.len == 0) return mutCast(list_form);
+
+    // Non-symbol head → ordinary call; expand head + all args.
+    const head_form = items[0];
+    if (head_form.datum != .symbol) {
+        return try expandOrdinaryCall(ctx, env, list_form, items, depth);
+    }
+    const head_sym = head_form.datum.symbol;
+
+    // Qualified symbols (foo/bar): not Phase-2 surface. Pass
+    // through; lowerForm catches and raises UnsupportedFeature.
+    if (head_sym.ns != null) {
+        return try expandOrdinaryCall(ctx, env, list_form, items, depth);
+    }
+    const name = head_sym.name;
+
+    // ---- Special forms (NOT shadowable, NOT macro-replaceable). --
+    if (std.mem.eql(u8, name, "quote")) return mutCast(list_form);
+    if (std.mem.eql(u8, name, "if")) return try expandIf(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "do")) return try expandDo(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "let*")) return try expandLetStar(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "loop*")) return try expandLetStar(ctx, env, list_form, items, depth); // same shape as let*
+    if (std.mem.eql(u8, name, "recur")) return try expandRecur(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "fn*")) return try expandFnStar(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "letfn*")) return try expandLetFnStar(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "def")) return try expandDef(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "defn")) return try expandDefn(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "var")) return mutCast(list_form); // (var X) — X is just a name, don't expand
+
+    // ---- Macro dispatch (shadowable by lexical bindings). -----
+    if (env == null or !env.?.contains(name)) {
+        if (ctx.host_macros.get(name)) |macro_fn| {
+            return try invokeMacro(ctx, env, macro_fn, list_form, items, depth);
+        }
+    }
+
+    // ---- Ordinary call. ---------------------------------------
+    return try expandOrdinaryCall(ctx, env, list_form, items, depth);
+}
+
+/// Macro fires: call the host fn, then recursively expand the
+/// result (macro-of-macros termination per MACROEXPAND.md §6).
+fn invokeMacro(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    macro_fn: MacroFn,
+    call_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    const args = items[1..];
+    const result = try macro_fn(ctx, call_form, args);
+    // Re-feed the macro output through the expander. Depth
+    // increments here (per MACROEXPAND.md §6 — depth gates
+    // macro applications, not tree-walk recursion).
+    return try expandFormDepth(ctx, env, result, depth + 1);
+}
+
+// =============================================================================
+// Per-special-form walkers (per MACROEXPAND.md §2b table)
+// =============================================================================
+
+fn expandIf(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    // (if test then) | (if test then else)
+    if (items.len < 3 or items.len > 4) return MacroexpandError.MalformedMacroCall;
+    return try rebuildListIfChanged(ctx, list_form, items, env, depth);
+}
+
+fn expandDo(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    return try rebuildListIfChanged(ctx, list_form, items, env, depth);
+}
+
+fn expandRecur(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    return try rebuildListIfChanged(ctx, list_form, items, env, depth);
+}
+
+fn expandOrdinaryCall(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    return try rebuildListIfChanged(ctx, list_form, items, env, depth);
+}
+
+/// Common pattern: expand every list item with the same env,
+/// rebuild the list ONLY if at least one item changed. Avoids
+/// unnecessary allocation when no expansion fires.
+fn rebuildListIfChanged(
+    ctx: *MacroexpandContext,
+    list_form: *const Form,
+    items: []const *Form,
+    env: ?*const ExpandEnv,
+    depth: u32,
+) MacroexpandError!*Form {
+    var new_items: ?[]*Form = null;
+    for (items, 0..) |item, i| {
+        const expanded = try expandFormDepth(ctx, env, item, depth);
+        if (expanded == item) continue;
+        // First divergence: clone the slice up to here.
+        if (new_items == null) {
+            new_items = try ctx.allocator.alloc(*Form, items.len);
+            for (items[0..i], 0..) |earlier, j| new_items.?[j] = mutCast(earlier);
+        }
+        new_items.?[i] = expanded;
+    }
+    if (new_items == null) return mutCast(list_form);
+    // Items past the divergence haven't been visited yet — wait,
+    // YES they have (the loop continues), but we only assigned
+    // into new_items on divergence. Need to copy/track post-
+    // divergence items too.
+    //
+    // Simpler model: if ANY item changed, do a second pass
+    // copying every expansion. Cheap because at #8a the macro
+    // table is empty and we never reach this branch.
+    const final = try ctx.allocator.alloc(*Form, items.len);
+    for (items, 0..) |item, i| {
+        final[i] = try expandFormDepth(ctx, env, item, depth);
+    }
+    return try makeList(ctx, final, list_form.origin);
+}
+
+// ---- let* / loop* — sequential binding scope ------------------------------
+
+fn expandLetStar(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    // (let* [n1 v1 n2 v2 ...] body...)
+    if (items.len < 2) return MacroexpandError.MalformedMacroCall;
+    const head = items[0]; // the `let*` symbol form
+    const binding_form = items[1];
+    if (binding_form.datum != .vector) return MacroexpandError.MalformedMacroCall;
+    const bindings = binding_form.datum.vector;
+    if (bindings.len % 2 != 0) return MacroexpandError.MalformedMacroCall;
+
+    // Walk bindings with a sequential env. Each binding's RHS
+    // sees prior names (and ONLY prior, per COMPILER.md §4.3
+    // amendment). Names themselves are NOT expanded.
+    var local: ExpandEnv = .{ .parent = env };
+    defer local.deinit(ctx.allocator);
+
+    // Output binding vector.
+    const new_bindings = try ctx.allocator.alloc(*Form, bindings.len);
+    var i: usize = 0;
+    while (i < bindings.len) : (i += 2) {
+        const name_form = bindings[i];
+        if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) {
+            return MacroexpandError.MalformedMacroCall;
+        }
+        // RHS expanded under env-so-far (BEFORE name added).
+        new_bindings[i] = mutCast(name_form);
+        new_bindings[i + 1] = try expandFormDepth(ctx, &local, bindings[i + 1], depth);
+        // NOW add the binding name to the local env (sequential).
+        _ = try local.lexical_names.getOrPut(ctx.allocator, name_form.datum.symbol.name);
+    }
+    const new_binding_vec = try makeVector(ctx, new_bindings, binding_form.origin);
+
+    // Body: every form expanded under the FULL local env.
+    const body = items[2..];
+    const new_body = try ctx.allocator.alloc(*Form, body.len);
+    for (body, 0..) |b, j| {
+        new_body[j] = try expandFormDepth(ctx, &local, b, depth);
+    }
+
+    // Reassemble: [let*/loop*, bindings, body...]
+    const total = 2 + body.len;
+    const out_items = try ctx.allocator.alloc(*Form, total);
+    out_items[0] = mutCast(head);
+    out_items[1] = new_binding_vec;
+    for (new_body, 0..) |b, k| out_items[2 + k] = b;
+    return try makeList(ctx, out_items, list_form.origin);
+}
+
+// ---- fn* — optional self-name + param vector + body -----------------------
+
+fn expandFnStar(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    // (fn* [params] body...) | (fn* name [params] body...)
+    if (items.len < 2) return MacroexpandError.MalformedMacroCall;
+    const head = items[0];
+
+    // Detect optional self-name. If items[1] is a symbol, it's
+    // the name; items[2] is the param vector. Otherwise items[1]
+    // is the param vector.
+    var has_name: bool = false;
+    var name_form: ?*const Form = null;
+    var params_idx: usize = 1;
+    if (items[1].datum == .symbol) {
+        has_name = true;
+        name_form = items[1];
+        params_idx = 2;
+    }
+    if (params_idx >= items.len) return MacroexpandError.MalformedMacroCall;
+    const params_form = items[params_idx];
+    if (params_form.datum != .vector) return MacroexpandError.MalformedMacroCall;
+    const body = items[params_idx + 1 ..];
+
+    // Build a child env with the self-name (if any) + param
+    // names. Per MACROEXPAND.md §2b: param vector is NOT
+    // expanded; only the body is.
+    var local: ExpandEnv = .{ .parent = env };
+    defer local.deinit(ctx.allocator);
+    if (has_name) {
+        _ = try local.lexical_names.getOrPut(ctx.allocator, name_form.?.datum.symbol.name);
+    }
+    for (params_form.datum.vector) |p| {
+        if (p.datum != .symbol or p.datum.symbol.ns != null) {
+            // Skip `&` rest marker and any non-symbol param
+            // shapes. Don't add `&` to env (it's not a binding).
+            // For non-symbol params (destructuring), v1 simply
+            // doesn't add anything to env (destructuring is
+            // post-v1).
+            continue;
+        }
+        if (std.mem.eql(u8, p.datum.symbol.name, "&")) continue;
+        _ = try local.lexical_names.getOrPut(ctx.allocator, p.datum.symbol.name);
+    }
+
+    // Expand body.
+    const new_body = try ctx.allocator.alloc(*Form, body.len);
+    for (body, 0..) |b, j| {
+        new_body[j] = try expandFormDepth(ctx, &local, b, depth);
+    }
+
+    // Reassemble.
+    const total = params_idx + 1 + body.len;
+    const out_items = try ctx.allocator.alloc(*Form, total);
+    out_items[0] = mutCast(head);
+    if (has_name) out_items[1] = mutCast(name_form.?);
+    out_items[params_idx] = mutCast(params_form);
+    for (new_body, 0..) |b, k| out_items[params_idx + 1 + k] = b;
+    return try makeList(ctx, out_items, list_form.origin);
+}
+
+// ---- letfn* — mutually recursive named fns --------------------------------
+
+fn expandLetFnStar(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    // (letfn* [(name [params] body...) ...] body...)
+    if (items.len < 2) return MacroexpandError.MalformedMacroCall;
+    const head = items[0];
+    const binding_form = items[1];
+    if (binding_form.datum != .vector) return MacroexpandError.MalformedMacroCall;
+    const fn_entries = binding_form.datum.vector;
+
+    // First pass: collect every fn name into the local env, so
+    // each fn body sees ALL fn names (mutual recursion).
+    var local: ExpandEnv = .{ .parent = env };
+    defer local.deinit(ctx.allocator);
+    for (fn_entries) |entry| {
+        if (entry.datum != .list or entry.datum.list.len < 2) {
+            return MacroexpandError.MalformedMacroCall;
+        }
+        const entry_items = entry.datum.list;
+        const fn_name_form = entry_items[0];
+        if (fn_name_form.datum != .symbol or fn_name_form.datum.symbol.ns != null) {
+            return MacroexpandError.MalformedMacroCall;
+        }
+        _ = try local.lexical_names.getOrPut(ctx.allocator, fn_name_form.datum.symbol.name);
+    }
+
+    // Second pass: expand each fn body under (local + that fn's
+    // params).
+    const new_entries = try ctx.allocator.alloc(*Form, fn_entries.len);
+    for (fn_entries, 0..) |entry, idx| {
+        const entry_items = entry.datum.list;
+        const fn_params = entry_items[1];
+        if (fn_params.datum != .vector) return MacroexpandError.MalformedMacroCall;
+        const fn_body = entry_items[2..];
+
+        var fn_env: ExpandEnv = .{ .parent = &local };
+        defer fn_env.deinit(ctx.allocator);
+        for (fn_params.datum.vector) |p| {
+            if (p.datum != .symbol or p.datum.symbol.ns != null) continue;
+            if (std.mem.eql(u8, p.datum.symbol.name, "&")) continue;
+            _ = try fn_env.lexical_names.getOrPut(ctx.allocator, p.datum.symbol.name);
+        }
+        const new_fn_body = try ctx.allocator.alloc(*Form, fn_body.len);
+        for (fn_body, 0..) |b, j| {
+            new_fn_body[j] = try expandFormDepth(ctx, &fn_env, b, depth);
+        }
+        const new_entry_items = try ctx.allocator.alloc(*Form, 2 + fn_body.len);
+        new_entry_items[0] = mutCast(entry_items[0]);
+        new_entry_items[1] = mutCast(fn_params);
+        for (new_fn_body, 0..) |b, k| new_entry_items[2 + k] = b;
+        new_entries[idx] = try makeList(ctx, new_entry_items, entry.origin);
+    }
+    const new_binding_vec = try makeVector(ctx, new_entries, binding_form.origin);
+
+    // letfn body expanded under local env.
+    const body = items[2..];
+    const new_body = try ctx.allocator.alloc(*Form, body.len);
+    for (body, 0..) |b, j| {
+        new_body[j] = try expandFormDepth(ctx, &local, b, depth);
+    }
+
+    const total = 2 + body.len;
+    const out_items = try ctx.allocator.alloc(*Form, total);
+    out_items[0] = mutCast(head);
+    out_items[1] = new_binding_vec;
+    for (new_body, 0..) |b, k| out_items[2 + k] = b;
+    return try makeList(ctx, out_items, list_form.origin);
+}
+
+// ---- def / defn -----------------------------------------------------------
+
+fn expandDef(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    // (def name) | (def name value)
+    if (items.len < 2 or items.len > 3) return MacroexpandError.MalformedMacroCall;
+    const head = items[0];
+    const name_form = items[1];
+    if (name_form.datum != .symbol) return MacroexpandError.MalformedMacroCall;
+    if (items.len == 2) return mutCast(list_form);
+    // Expand value only.
+    const new_value = try expandFormDepth(ctx, env, items[2], depth);
+    if (new_value == items[2]) return mutCast(list_form);
+    const out_items = try ctx.allocator.alloc(*Form, 3);
+    out_items[0] = mutCast(head);
+    out_items[1] = mutCast(name_form);
+    out_items[2] = new_value;
+    return try makeList(ctx, out_items, list_form.origin);
+}
+
+fn expandDefn(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    // (defn name [params] body...)
+    if (items.len < 3) return MacroexpandError.MalformedMacroCall;
+    const head = items[0];
+    const name_form = items[1];
+    if (name_form.datum != .symbol) return MacroexpandError.MalformedMacroCall;
+    const params_form = items[2];
+    if (params_form.datum != .vector) return MacroexpandError.MalformedMacroCall;
+    const body = items[3..];
+
+    // Body env = self-name + params.
+    var local: ExpandEnv = .{ .parent = env };
+    defer local.deinit(ctx.allocator);
+    _ = try local.lexical_names.getOrPut(ctx.allocator, name_form.datum.symbol.name);
+    for (params_form.datum.vector) |p| {
+        if (p.datum != .symbol or p.datum.symbol.ns != null) continue;
+        if (std.mem.eql(u8, p.datum.symbol.name, "&")) continue;
+        _ = try local.lexical_names.getOrPut(ctx.allocator, p.datum.symbol.name);
+    }
+    const new_body = try ctx.allocator.alloc(*Form, body.len);
+    for (body, 0..) |b, j| {
+        new_body[j] = try expandFormDepth(ctx, &local, b, depth);
+    }
+    const total = 3 + body.len;
+    const out_items = try ctx.allocator.alloc(*Form, total);
+    out_items[0] = mutCast(head);
+    out_items[1] = mutCast(name_form);
+    out_items[2] = mutCast(params_form);
+    for (new_body, 0..) |b, k| out_items[3 + k] = b;
+    return try makeList(ctx, out_items, list_form.origin);
+}
+
+// =============================================================================
+// Form construction helpers (precursor to #8b FormBuilder)
+// =============================================================================
+
+fn makeList(ctx: *MacroexpandContext, items: []*Form, origin: SrcSpan) MacroexpandError!*Form {
+    const form = try ctx.allocator.create(Form);
+    form.* = .{
+        .datum = .{ .list = @as([]const *Form, items) },
+        .origin = origin,
+    };
+    return form;
+}
+
+fn makeVector(ctx: *MacroexpandContext, items: []*Form, origin: SrcSpan) MacroexpandError!*Form {
+    const form = try ctx.allocator.create(Form);
+    form.* = .{
+        .datum = .{ .vector = @as([]const *Form, items) },
+        .origin = origin,
+    };
+    return form;
+}
+
+// =============================================================================
+// Inline tests
+// =============================================================================
+
+const testing = std.testing;
+
+/// Build a tiny test harness: parse `src`, run through the
+/// expander with the given macro table, return the resulting
+/// Form for caller inspection. Allocator is the arena owning
+/// the parsed form (caller must keep it alive).
+fn expandSourceForTest(
+    arena: Allocator,
+    src: []const u8,
+    host_macros: *const HostMacroTable,
+) !*Form {
+    var p = try reader_mod.parser.parseForm(arena, src);
+    defer p.parser.deinit();
+    var rdr = reader_mod.Reader.init(arena, src);
+    defer rdr.deinit();
+    const form = try rdr.readOneForm(p.sexp);
+
+    var interner = intern_mod.Interner.init(arena);
+    // NOTE: interner is in the arena, so deinit not strictly
+    // necessary, but explicit cleanup is good hygiene.
+    defer interner.deinit();
+    var ctx = MacroexpandContext{
+        .allocator = arena,
+        .interner = &interner,
+        .host_macros = host_macros,
+    };
+    return try expandForm(&ctx, null, form);
+}
+
+test "macroexpand #8a: no-op walks return input unchanged (empty table)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty: HostMacroTable = .{};
+    // A variety of forms — all should pass through with no
+    // macro fires. We compare pretty-printed output against
+    // round-trip via the reader for stability.
+    const fixtures = [_][]const u8{
+        "42",
+        "true",
+        "nil",
+        ":kw",
+        "x",
+        "(+ 1 2)",
+        "(if (< x 10) :small :big)",
+        "(do (def y 1) y)",
+        "(let* [a 1 b 2] (+ a b))",
+        "(loop* [i 0] (if (< i 10) (recur (+ i 1)) i))",
+        "(fn* [x y] (+ x y))",
+        "(fn* fact [n] (if (< n 2) n (recur (+ n -1))))",
+        "(letfn* [(f [x] (g x)) (g [x] x)] (f 7))",
+        "(defn add [x y] (+ x y))",
+        "(quote foo)",
+        "'foo",
+        "(quote (when x y))", // critical: quote opaque, when NOT expanded
+    };
+    for (fixtures) |src| {
+        // With an empty macro table, the expander never fires
+        // a macro. Top-level Datum tag must be preserved (the
+        // expander never mutates a form's tag, only rebuilds
+        // list/vector subtrees when binding-form helpers run).
+        const original_tag: std.meta.Tag(Datum) = blk: {
+            var p = try reader_mod.parser.parseForm(arena, src);
+            defer p.parser.deinit();
+            var rdr = reader_mod.Reader.init(arena, src);
+            defer rdr.deinit();
+            const f = try rdr.readOneForm(p.sexp);
+            break :blk std.meta.activeTag(f.datum);
+        };
+        const expanded = try expandSourceForTest(arena, src, &empty);
+        try testing.expectEqual(original_tag, std.meta.activeTag(expanded.datum));
+    }
+}
+
+test "macroexpand #8a: empty list passes through" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty: HostMacroTable = .{};
+    // `()` — expander returns the empty list; lowerForm will
+    // catch the empty-call malformation.
+    const result = try expandSourceForTest(arena, "()", &empty);
+    try testing.expect(result.datum == .list);
+    try testing.expectEqual(@as(usize, 0), result.datum.list.len);
+}
+
+test "macroexpand #8a: depth limit caught for infinite macro loop" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A pathological macro that returns the same call form
+    // it received — infinite loop.
+    const Wrap = struct {
+        fn loopForever(
+            _: *MacroexpandContext,
+            call_form: *const Form,
+            _: []const *Form,
+        ) MacroexpandError!*Form {
+            return mutCast(call_form);
+        }
+    };
+    var table: HostMacroTable = .{};
+    defer table.deinit(arena);
+    try table.put(arena, "boom", Wrap.loopForever);
+
+    var p = try reader_mod.parser.parseForm(arena, "(boom)");
+    defer p.parser.deinit();
+    var rdr = reader_mod.Reader.init(arena, "(boom)");
+    defer rdr.deinit();
+    const form = try rdr.readOneForm(p.sexp);
+
+    var interner = intern_mod.Interner.init(arena);
+    defer interner.deinit();
+    var ctx = MacroexpandContext{
+        .allocator = arena,
+        .interner = &interner,
+        .host_macros = &table,
+    };
+    try testing.expectError(MacroexpandError.ExpansionDepthExceeded, expandForm(&ctx, null, form));
+}
+
+test "macroexpand #8a: lexical shadowing blocks macro expansion" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A macro that, if fired, would replace `(my-macro)` with
+    // `:fired`. Inside a let* binding `my-macro` to anything,
+    // the macro MUST NOT fire.
+    const Wrap = struct {
+        fn fireIt(
+            ctx: *MacroexpandContext,
+            call_form: *const Form,
+            _: []const *Form,
+        ) MacroexpandError!*Form {
+            const kw_id = ctx.interner.internKeyword("fired") catch return MacroexpandError.OutOfMemory;
+            const form = try ctx.allocator.create(Form);
+            form.* = .{
+                .datum = .{ .keyword = .{ .ns = null, .name = ctx.interner.keywordName(kw_id) } },
+                .origin = call_form.origin,
+            };
+            return form;
+        }
+    };
+    var table: HostMacroTable = .{};
+    defer table.deinit(arena);
+    try table.put(arena, "my-macro", Wrap.fireIt);
+
+    // (let* [my-macro 0] (my-macro)) — macro is shadowed.
+    var p = try reader_mod.parser.parseForm(arena, "(let* [my-macro 0] (my-macro))");
+    defer p.parser.deinit();
+    var rdr = reader_mod.Reader.init(arena, "(let* [my-macro 0] (my-macro))");
+    defer rdr.deinit();
+    const form = try rdr.readOneForm(p.sexp);
+
+    var interner = intern_mod.Interner.init(arena);
+    defer interner.deinit();
+    var ctx = MacroexpandContext{
+        .allocator = arena,
+        .interner = &interner,
+        .host_macros = &table,
+    };
+    const expanded = try expandForm(&ctx, null, form);
+    // The expanded form should still be a let* with an inner
+    // (my-macro) call — NOT a :fired keyword.
+    try testing.expect(expanded.datum == .list);
+    const outer = expanded.datum.list;
+    try testing.expect(outer.len == 3);
+    // outer[2] is the body — should be a list (my-macro), NOT
+    // a keyword :fired.
+    try testing.expect(outer[2].datum == .list);
+}
+
+test "macroexpand #8a: macro fires at top level when not shadowed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Wrap = struct {
+        fn fireIt(
+            ctx: *MacroexpandContext,
+            call_form: *const Form,
+            _: []const *Form,
+        ) MacroexpandError!*Form {
+            const kw_id = ctx.interner.internKeyword("fired") catch return MacroexpandError.OutOfMemory;
+            const form = try ctx.allocator.create(Form);
+            form.* = .{
+                .datum = .{ .keyword = .{ .ns = null, .name = ctx.interner.keywordName(kw_id) } },
+                .origin = call_form.origin,
+            };
+            return form;
+        }
+    };
+    var table: HostMacroTable = .{};
+    defer table.deinit(arena);
+    try table.put(arena, "my-macro", Wrap.fireIt);
+
+    var p = try reader_mod.parser.parseForm(arena, "(my-macro)");
+    defer p.parser.deinit();
+    var rdr = reader_mod.Reader.init(arena, "(my-macro)");
+    defer rdr.deinit();
+    const form = try rdr.readOneForm(p.sexp);
+
+    var interner = intern_mod.Interner.init(arena);
+    defer interner.deinit();
+    var ctx = MacroexpandContext{
+        .allocator = arena,
+        .interner = &interner,
+        .host_macros = &table,
+    };
+    const expanded = try expandForm(&ctx, null, form);
+    try testing.expect(expanded.datum == .keyword);
+    try testing.expectEqualStrings("fired", expanded.datum.keyword.name);
+}
+
+test "macroexpand #8a: quote is opaque — macro inside quote does NOT fire" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Wrap = struct {
+        fn fireIt(_: *MacroexpandContext, call_form: *const Form, _: []const *Form) MacroexpandError!*Form {
+            // If ever called, return nil so the failure is obvious.
+            const form = std.heap.page_allocator.create(Form) catch unreachable;
+            form.* = .{ .datum = .nil, .origin = call_form.origin };
+            return form;
+        }
+    };
+    var table: HostMacroTable = .{};
+    defer table.deinit(arena);
+    try table.put(arena, "my-macro", Wrap.fireIt);
+
+    var p = try reader_mod.parser.parseForm(arena, "(quote (my-macro))");
+    defer p.parser.deinit();
+    var rdr = reader_mod.Reader.init(arena, "(quote (my-macro))");
+    defer rdr.deinit();
+    const form = try rdr.readOneForm(p.sexp);
+
+    var interner = intern_mod.Interner.init(arena);
+    defer interner.deinit();
+    var ctx = MacroexpandContext{
+        .allocator = arena,
+        .interner = &interner,
+        .host_macros = &table,
+    };
+    const expanded = try expandForm(&ctx, null, form);
+    // Should still be (quote (my-macro)), NOT nil.
+    try testing.expect(expanded.datum == .list);
+}

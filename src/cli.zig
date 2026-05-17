@@ -31,6 +31,7 @@ const vm = @import("vm");
 const compile = @import("compile");
 const reader_mod = @import("reader");
 const intern_mod = @import("intern");
+const macroexpand_mod = @import("macroexpand");
 
 const Value = value_mod.Value;
 
@@ -203,14 +204,24 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     var compile_arena = std.heap.ArenaAllocator.init(allocator);
     defer compile_arena.deinit();
 
+    // Step #8a: empty host-macro table. Steps #8b/#8c will
+    // populate this with the default macros (when, cond, and,
+    // or, ->, ->>, let, fn, loop). Even with an empty table,
+    // running through the expander exercises the scaffold —
+    // which is the entire point of #8a (catch traversal bugs
+    // before macros are added).
+    var host_macros: macroexpand_mod.HostMacroTable = .{};
+    defer host_macros.deinit(allocator);
+
     var last_result: Value = value_mod.nilValue();
 
     for (forms) |form| {
-        const compiled = compile.compileFormFull(
+        const compiled = compile.compileFormFullWithMacros(
             compile_arena.allocator(),
             form,
             ns,
             interner,
+            &host_macros,
         ) catch |err| {
             try std.Io.File.stderr().writeStreamingAll(io, "nexis: compile error: ");
             try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
