@@ -6544,9 +6544,14 @@ test "compile #8b: (and nil 99) → nil (returns falsy value, not literal false)
     try expectNilDefaultMacros("(and nil 99)");
 }
 
-test "compile #8b: (and expr ...) uses gensym (no double-eval)" {
-    // Same shape as the or-gensym test. step is invoked once
-    // for the and; if double-eval'd, step-count would be 2.
+test "compile #8b: (and falsy ...) uses gensym (no double-eval on falsy)" {
+    // Per peer-AI turn 57: the classic bad `and` expansion is
+    // `(if x y x)`. That double-evals x ONLY when x is falsy
+    // (test branch + else branch both evaluate x). So the
+    // single-eval test for `and` MUST use a FALSY-returning
+    // side effect to catch the bug. (The earlier truthy
+    // version of this test was sound for `or` but didn't
+    // exercise the right branch for `and`.)
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -6561,12 +6566,12 @@ test "compile #8b: (and expr ...) uses gensym (no double-eval)" {
     const src =
         \\(do
         \\  (def step-count 0)
-        \\  (defn step [] (do (def step-count (+ step-count 1)) step-count))
-        \\  (and (step) true)
+        \\  (defn step [] (do (def step-count (+ step-count 1)) nil))
+        \\  (and (step) 99)
         \\  step-count)
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
-    const routine = compiled.toRoutine("and-gensym");
+    const routine = compiled.toRoutine("and-gensym-falsy");
     v.frames.items[0].routine = &routine;
     v.frames.items[0].pc = 0;
     v.frames.items[0].slot_count = routine.slot_count;
@@ -6574,7 +6579,32 @@ test "compile #8b: (and expr ...) uses gensym (no double-eval)" {
         try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
     }
     const result = try v.run();
+    // step was invoked exactly once even though `and` short-
+    // circuited on falsy. The bad `(if x y x)` expansion would
+    // produce step-count = 2.
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+// ---- Value-semantics pins (peer-AI turn 57 §2): catch the
+// `and`/`or` bug variants more directly than gensym tests
+// alone.
+
+test "compile #8b: (and false 99) → false (returns the FALSE value, not nil)" {
+    try expectBoolDefaultMacros("(and false 99)", false);
+}
+
+test "compile #8b: (or 0 7) → 0 (zero is truthy in Lisp)" {
+    // Only nil and false are falsy in nexis (matches Clojure).
+    // A regression that treated 0 as falsy would return 7.
+    try expectFixnumDefaultMacros("(or 0 7)", 0);
+}
+
+test "compile #8b: (and 0 1) → 1 (zero is truthy → continues)" {
+    try expectFixnumDefaultMacros("(and 0 1)", 1);
+}
+
+test "compile #8b: (or false nil) → nil (returns LAST falsy when all falsy)" {
+    try expectNilDefaultMacros("(or false nil)");
 }
 
 // ---- or ----
