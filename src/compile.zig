@@ -61,6 +61,11 @@ const value_mod = @import("value");
 /// fn tests. The compiler itself doesn't depend on list — the
 /// VM constructs rest lists at call time per VM.md §6.
 const list_mod = @import("list");
+/// Step #7a: consume reader.Form trees as compiler input. The
+/// `lowerForm` function translates Form → Tiny (the existing IR);
+/// the backend stays unchanged (peer-AI turn 51 — Tiny is the IR,
+/// not a parallel codegen path).
+const reader_mod = @import("reader");
 
 pub const Inst = vm.Inst;
 pub const Routine = vm.Routine;
@@ -398,9 +403,22 @@ pub const CompileError = error{
     /// the current step. Step 5e: emitted for `(recur ...)`
     /// targeting a variadic fn (per peer-AI turn 49 — proper
     /// variadic recur requires rebuilding the rest list per
-    /// iteration; deferred to a separate sub-step). Trapping
-    /// loudly is better than emitting subtly-wrong code.
+    /// iteration; deferred to a separate sub-step). Step #7a:
+    /// also used for `reader.Form` datums that lower in later
+    /// step-#7 sub-steps (lists, vectors, maps, sets, quote,
+    /// syntax-quote, `#(...)`, `^{...}` metadata, qualified
+    /// symbols). Trapping loudly is better than emitting
+    /// subtly-wrong code.
     UnsupportedFeature,
+
+    /// The parser or reader rejected the source string while
+    /// compiling via `compileSource` / `compileSourceWithNamespace`.
+    /// Step #7a: bucketed error wrapping any inferred error from
+    /// `parser.parseForm` / `reader.readOneForm`. Step #10
+    /// (error reporting hardening) will replace this with
+    /// structured errors carrying SrcSpan + the original reader
+    /// ErrorKind.
+    ReaderFailure,
 
     /// A compiler invariant was violated. Distinct from a
     /// user-error like `UnresolvedSymbol`: this indicates the
@@ -870,6 +888,147 @@ pub fn compileTinyWithNamespace(
     try emitter.emit(vm.asm_.returnSlot(dst));
 
     return try emitter.finish();
+}
+
+// =============================================================================
+// Form → Tiny lowering (step #7a, peer-AI turn 51 architecture)
+// =============================================================================
+//
+// `lowerForm` converts a `reader.Form` tree into a `Tiny` IR tree on the
+// passed allocator. The Tiny tree is then compiled via the existing
+// backend (`compileTinyWithNamespace`), so the entire Phase 2 codegen
+// pipeline (capture pre-analysis, RecurTarget threading, variadic rest,
+// Var fall-through, etc.) reuses the proven Tiny path. There is no
+// parallel "compile Form directly to bytecode" path; that would
+// duplicate ~5000 LOC of backend logic and lose 135 regression tests.
+//
+// Step #7a scope (deliberately narrow): literals + symbols only.
+// All compound Form datums (lists, vectors, maps, sets, quote,
+// syntax-quote, etc.) raise `UnsupportedFeature`. The expansion plan:
+//
+//   #7b: list dispatch — ordinary calls + special forms (do, if,
+//        quote-of-scalar) + arithmetic intrinsics (+, < when not
+//        lexically shadowed)
+//   #7c: binding/fn forms (let*, fn*, letfn*, loop*, recur)
+//   #7d: vars/def/defn via Form
+//   #7e: full source-string end-to-end tests
+//
+// The lowering env (`LowerEnv`, peer-AI turn 51 §"load-bearing
+// issue") that tracks lexical-name shadowing for intrinsic
+// dispatch lands in #7b — #7a has no intrinsics and no special
+// forms, so no env is needed yet.
+
+/// Allocate and initialize a Tiny node on the given allocator.
+/// Used by `lowerForm` to build the IR tree. The arena passed to
+/// `compileForm`/`compileSource` owns these allocations.
+fn allocTiny(allocator: std.mem.Allocator, value: Tiny) CompileError!*Tiny {
+    const t = try allocator.create(Tiny);
+    t.* = value;
+    return t;
+}
+
+/// Translate a `reader.Form` tree into a `Tiny` IR tree on the
+/// passed allocator. Step #7a supports literals (`nil`, `bool_`,
+/// `int`) and unqualified symbols only; all other Form datums
+/// raise `CompileError.UnsupportedFeature` (compound forms land
+/// in #7b through #7d).
+///
+/// Symbol names are NOT duped — they're borrowed from the
+/// reader's source string. The caller must keep that source
+/// alive for the lifetime of the Compiled artifact.
+pub fn lowerForm(
+    allocator: std.mem.Allocator,
+    form: *const reader_mod.Form,
+) CompileError!*Tiny {
+    return switch (form.datum) {
+        .nil => try allocTiny(allocator, .nil),
+        .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
+        .int => |n| try allocTiny(allocator, .{ .int = n }),
+        .symbol => |name| blk: {
+            // Step #7a: only unqualified symbols. Qualified
+            // (namespace/name) symbols require multi-ns
+            // machinery (post-v1).
+            if (name.ns != null) return CompileError.UnsupportedFeature;
+            break :blk try allocTiny(allocator, .{ .symbol = name.name });
+        },
+        // -- Compound datums: land in later #7 sub-steps. --
+        // Phase 1 numeric literals beyond fixnum.
+        .real, .char, .string, .keyword => return CompileError.UnsupportedFeature,
+        // Sequential collections + special-form dispatch (#7b/#7c).
+        .list, .vector, .map, .set => return CompileError.UnsupportedFeature,
+        // Reader macros / meta (#7b for quote-of-scalar, deferred
+        // to step #8 macroexpander for the rest).
+        .quote, .syntax_quote, .unquote, .unquote_splicing => return CompileError.UnsupportedFeature,
+        // Atoms aren't a Phase 2 feature.
+        .deref => return CompileError.UnsupportedFeature,
+        // #(...) anon-fn shorthand — deferred (likely to step #8
+        // macroexpander; see strategy turn 51 §Q4).
+        .anon_fn => return CompileError.UnsupportedFeature,
+        // ^{...} metadata — deferred (Phase 3+).
+        .with_meta => return CompileError.UnsupportedFeature,
+    };
+}
+
+/// Compile a `reader.Form` tree into a `Compiled` artifact, no
+/// namespace. Equivalent to `compileTiny(allocator, lowerForm(form))`.
+/// Symbols that don't resolve lexically raise `UnresolvedSymbol`
+/// (no Var fall-through without a namespace).
+pub fn compileForm(
+    allocator: std.mem.Allocator,
+    form: *const reader_mod.Form,
+) CompileError!Compiled {
+    return compileFormWithNamespace(allocator, form, null);
+}
+
+/// Compile a `reader.Form` tree into a `Compiled` artifact, with
+/// namespace access for `def` / `(var x)` / symbol fall-through.
+/// Equivalent to `compileTinyWithNamespace(allocator, lowerForm(form), ns)`.
+pub fn compileFormWithNamespace(
+    allocator: std.mem.Allocator,
+    form: *const reader_mod.Form,
+    namespace: ?*vm.Namespace,
+) CompileError!Compiled {
+    const tiny = try lowerForm(allocator, form);
+    return compileTinyWithNamespace(allocator, tiny, namespace);
+}
+
+/// End-to-end: parse + read + lower + compile a source string.
+/// Convenience wrapper around `parser.parseForm` + `Reader.readOneForm`
+/// + `compileFormWithNamespace`. Step #7a. No namespace; symbols
+/// must resolve lexically.
+pub fn compileSource(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) CompileError!Compiled {
+    return compileSourceWithNamespace(allocator, source, null);
+}
+
+/// End-to-end with namespace access for `def` / `(var x)` /
+/// symbol fall-through. Step #7a.
+///
+/// Lifetime: the returned `Compiled` references strings borrowed
+/// from `source` (via Tiny.symbol → routine.var_table[*].name).
+/// The caller MUST keep `source` alive for the lifetime of the
+/// `Compiled` artifact and any VM that runs it. Tests typically
+/// achieve this by storing source as a string literal (program
+/// lifetime) or by holding it in the same arena as the
+/// `Compiled`.
+///
+/// Reader/parser errors are bucketed as `CompileError.ReaderFailure`
+/// for step #7a; structured errors with SrcSpans land in step #10.
+pub fn compileSourceWithNamespace(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    namespace: ?*vm.Namespace,
+) CompileError!Compiled {
+    var p = reader_mod.parser.parseForm(allocator, source) catch
+        return CompileError.ReaderFailure;
+    defer p.parser.deinit();
+    var reader = reader_mod.Reader.init(allocator, source);
+    defer reader.deinit();
+    const form = reader.readOneForm(p.sexp) catch
+        return CompileError.ReaderFailure;
+    return compileFormWithNamespace(allocator, form, namespace);
 }
 
 // =============================================================================
@@ -4555,6 +4714,188 @@ test "compile 5c: letfn* body scope properly restored after letfn*" {
     } };
     const result = try runTiny(&arena, &let_form);
     try testing.expectEqual(@as(i64, 100), result.asFixnum());
+}
+
+// ---- step #7a: Form → Tiny lowering + compileSource tests ----
+
+test "compile #7a: lowerForm of nil → run → nil" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form = reader_mod.Form{ .datum = .nil, .origin = .{ .pos = 0, .len = 0 } };
+    const compiled = try compileForm(arena.allocator(), &form);
+    const routine = compiled.toRoutine("nil-form");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const result = try v.run();
+    try testing.expect(result.isNil());
+}
+
+test "compile #7a: lowerForm of bool true → run → true" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form = reader_mod.Form{ .datum = .{ .bool_ = true }, .origin = .{ .pos = 0, .len = 0 } };
+    const compiled = try compileForm(arena.allocator(), &form);
+    const routine = compiled.toRoutine("true-form");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const result = try v.run();
+    try testing.expectEqual(true, result.asBool());
+}
+
+test "compile #7a: lowerForm of int 42 → run → 42" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form = reader_mod.Form{ .datum = .{ .int = 42 }, .origin = .{ .pos = 0, .len = 0 } };
+    const compiled = try compileForm(arena.allocator(), &form);
+    const routine = compiled.toRoutine("int-form");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const result = try v.run();
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "compile #7a: compileSource \"nil\" → nil" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const compiled = try compileSource(arena.allocator(), "nil");
+    const routine = compiled.toRoutine("src-nil");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const result = try v.run();
+    try testing.expect(result.isNil());
+}
+
+test "compile #7a: compileSource \"true\" → true" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const compiled = try compileSource(arena.allocator(), "true");
+    const routine = compiled.toRoutine("src-true");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const result = try v.run();
+    try testing.expectEqual(true, result.asBool());
+}
+
+test "compile #7a: compileSource \"false\" → false" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const compiled = try compileSource(arena.allocator(), "false");
+    const routine = compiled.toRoutine("src-false");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const result = try v.run();
+    try testing.expectEqual(false, result.asBool());
+}
+
+test "compile #7a: compileSource \"42\" → 42" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const compiled = try compileSource(arena.allocator(), "42");
+    const routine = compiled.toRoutine("src-42");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const result = try v.run();
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "compile #7a: compileSource \"-7\" → -7" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const compiled = try compileSource(arena.allocator(), "-7");
+    const routine = compiled.toRoutine("src-neg7");
+    var v = try vm.VM.init(testing.allocator, &routine);
+    defer v.deinit();
+    const result = try v.run();
+    try testing.expectEqual(@as(i64, -7), result.asFixnum());
+}
+
+test "compile #7a: compileSource of unqualified symbol with no namespace → UnresolvedSymbol" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(
+        CompileError.UnresolvedSymbol,
+        compileSource(arena.allocator(), "x"),
+    );
+}
+
+test "compile #7a: compileSource of symbol resolves via namespace fall-through" {
+    // Prove the symbol fall-through path works end-to-end via
+    // real source syntax: source "x" with x pre-bound in the
+    // namespace returns the bound value.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const x = try ns.intern("x");
+    x.root = value_mod.fromFixnum(99).?;
+    x.bound = true;
+
+    const compiled = try compileSourceWithNamespace(arena.allocator(), "x", ns);
+    const routine = compiled.toRoutine("src-symbol");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    try testing.expectEqual(@as(i64, 99), result.asFixnum());
+}
+
+test "compile #7a: lowerForm of string literal → UnsupportedFeature (deferred)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form = reader_mod.Form{ .datum = .{ .string = "hello" }, .origin = .{ .pos = 0, .len = 0 } };
+    try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
+}
+
+test "compile #7a: lowerForm of keyword → UnsupportedFeature (deferred)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form = reader_mod.Form{
+        .datum = .{ .keyword = .{ .ns = null, .name = "foo" } },
+        .origin = .{ .pos = 0, .len = 0 },
+    };
+    try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
+}
+
+test "compile #7a: lowerForm of list → UnsupportedFeature (lands in #7b)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const empty: []const *reader_mod.Form = &.{};
+    const form = reader_mod.Form{ .datum = .{ .list = empty }, .origin = .{ .pos = 0, .len = 0 } };
+    try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
+}
+
+test "compile #7a: lowerForm of quote → UnsupportedFeature (lands in #7b)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var inner = reader_mod.Form{ .datum = .{ .int = 42 }, .origin = .{ .pos = 0, .len = 0 } };
+    const form = reader_mod.Form{ .datum = .{ .quote = &inner }, .origin = .{ .pos = 0, .len = 0 } };
+    try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
+}
+
+test "compile #7a: lowerForm of qualified symbol → UnsupportedFeature (post-v1 multi-ns)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const form = reader_mod.Form{
+        .datum = .{ .symbol = .{ .ns = "foo", .name = "x" } },
+        .origin = .{ .pos = 0, .len = 0 },
+    };
+    try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
+}
+
+test "compile #7a: compileSource of malformed input → ReaderFailure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Unmatched paren — reader rejects.
+    try testing.expectError(
+        CompileError.ReaderFailure,
+        compileSource(arena.allocator(), "(foo"),
+    );
 }
 
 test "compile: arena cleanup releases code+consts atomically" {

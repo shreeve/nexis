@@ -32,7 +32,14 @@
 //! alongside the runtime Value layer (PLAN §21, Phase 1 gate test #1).
 
 const std = @import("std");
-const parser = @import("parser.zig");
+/// Step #7a: re-exported as `pub` so downstream modules
+/// (specifically `src/compile.zig` for the `compileSource`
+/// end-to-end entry point) can access `parser.parseForm`
+/// without needing their own `@import("parser.zig")` (which
+/// would require another build.zig module wiring). The actual
+/// parser is generated from `nexis.grammar` by the nexus tool;
+/// see `src/parser.zig`.
+pub const parser = @import("parser.zig");
 const nexis = @import("nexis.zig");
 
 pub const Tag = nexis.Tag;

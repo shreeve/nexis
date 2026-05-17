@@ -187,6 +187,17 @@ pub fn build(b: *std.Build) void {
     vm_mod.addImport("heap", heap_mod);
     vm_mod.addImport("list", list_mod);
 
+    // Step #7a: reader exposed as a proper module so compile.zig
+    // can consume `reader.Form` trees. reader.zig uses sibling-
+    // file imports (`@import("parser.zig")`, `@import("nexis.zig")`)
+    // which Zig resolves automatically from the file's directory,
+    // so no addImport calls are needed on this module.
+    const reader_mod = b.createModule(.{
+        .root_source_file = b.path("src/reader.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const compile_mod = b.createModule(.{
         .root_source_file = b.path("src/compile.zig"),
         .target = target,
@@ -198,6 +209,8 @@ pub fn build(b: *std.Build) void {
     // fn calls. compile.zig core doesn't depend on list — the
     // VM constructs rest lists at call/prologue time.
     compile_mod.addImport("list", list_mod);
+    // Step #7a: Form-tree input from the reader.
+    compile_mod.addImport("reader", reader_mod);
 
     const db_mod = b.createModule(.{
         .root_source_file = b.path("src/db.zig"),
@@ -281,6 +294,7 @@ pub fn build(b: *std.Build) void {
         pool: *std.Build.Module,
         vm: *std.Build.Module,
         compile: *std.Build.Module,
+        reader: *std.Build.Module,
     };
     const siblings: AllSiblings = .{
         .hash = hash_mod,
@@ -301,6 +315,7 @@ pub fn build(b: *std.Build) void {
         .pool = pool_mod,
         .vm = vm_mod,
         .compile = compile_mod,
+        .reader = reader_mod,
     };
 
     const RuntimeTest = struct {
@@ -326,7 +341,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list" } },
-        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list" } },
+        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
@@ -356,6 +371,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "pool")) siblings.pool
                 else if (std.mem.eql(u8, imp_name, "vm")) siblings.vm
                 else if (std.mem.eql(u8, imp_name, "compile")) siblings.compile
+                else if (std.mem.eql(u8, imp_name, "reader")) siblings.reader
                 else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
         }
