@@ -1782,11 +1782,21 @@ pub fn compileFormFullWithMacros(
     host_macros: ?*const macroexpand_mod.HostMacroTable,
 ) CompileError!Compiled {
     var working_form: *const reader_mod.Form = form;
-    if (host_macros != null and interner != null) {
+    // Step #8c.2: run the macroexpander whenever an interner
+    // is available, even if the host_macros table is null or
+    // empty. Syntax-quote handling is built into the expander
+    // (not a macro-table entry), so a form like `` `(1 2 3) ``
+    // requires the expander to fire regardless of registered
+    // macros. An empty table = "no user macros to fire," not
+    // "skip expansion entirely."
+    if (interner != null) {
+        const empty_table: macroexpand_mod.HostMacroTable = .{};
+        const table_to_use: *const macroexpand_mod.HostMacroTable =
+            host_macros orelse &empty_table;
         var mctx = macroexpand_mod.MacroexpandContext{
             .allocator = allocator,
             .interner = interner.?,
-            .host_macros = host_macros.?,
+            .host_macros = table_to_use,
         };
         working_form = macroexpand_mod.expandForm(&mctx, null, form) catch |err| switch (err) {
             error.ExpansionDepthExceeded => return CompileError.MacroDepthExceeded,
@@ -6940,6 +6950,136 @@ test "compile #8c.1: (quote (1 (2 3) 4)) — nested lists" {
     // Third element is 4.
     const fourth = list_mod.head(list_mod.tail(list_mod.tail(r.result)));
     try testing.expectEqual(@as(i64, 4), fourth.asFixnum());
+}
+
+// ---- step #8c.2: syntax-quote / unquote / splice / gensym ----
+
+test "compile #8c.2: `(1 2 3) builds (1 2 3)" {
+    var r = try runSourceFull("`(1 2 3)");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    try testing.expectEqual(@as(i64, 1), list_mod.head(r.result).asFixnum());
+    try testing.expectEqual(@as(i64, 2), list_mod.head(list_mod.tail(r.result)).asFixnum());
+    try testing.expectEqual(@as(i64, 3), list_mod.head(list_mod.tail(list_mod.tail(r.result))).asFixnum());
+}
+
+test "compile #8c.2: `() builds empty list" {
+    var r = try runSourceFull("`()");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    try testing.expect(list_mod.isEmpty(r.result));
+}
+
+test "compile #8c.2: `foo → interned symbol via (quote foo)" {
+    var r = try runSourceFull("`foo");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .symbol);
+}
+
+test "compile #8c.2: `:bar self-evaluates" {
+    var r = try runSourceFull("`:bar");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .keyword);
+}
+
+test "compile #8c.2: `(value ~x) — simple unquote" {
+    // Walk the resulting list directly (no stdlib head/tail yet).
+    // Source: (let [x 42] `(value ~x)) → (value 42)
+    var r = try runSourceFull(
+        \\(let* [x 42] `(value ~x))
+    );
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    const sym = list_mod.head(r.result);
+    try testing.expect(sym.kind() == .symbol);
+    const tail = list_mod.tail(r.result);
+    try testing.expectEqual(@as(i64, 42), list_mod.head(tail).asFixnum());
+    try testing.expect(list_mod.isEmpty(list_mod.tail(tail)));
+}
+
+test "compile #8c.2: ~@xs splices a list" {
+    // `(a ~@xs b) → list with xs's elements between a and b.
+    var r = try runSourceFull(
+        \\(let* [xs (quote (1 2 3))]
+        \\  `(start ~@xs end))
+    );
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    // Result: (start 1 2 3 end) — 5 elements.
+    const h = list_mod.head(r.result);
+    try testing.expect(h.kind() == .symbol);
+    var node = list_mod.tail(r.result);
+    try testing.expectEqual(@as(i64, 1), list_mod.head(node).asFixnum());
+    node = list_mod.tail(node);
+    try testing.expectEqual(@as(i64, 2), list_mod.head(node).asFixnum());
+    node = list_mod.tail(node);
+    try testing.expectEqual(@as(i64, 3), list_mod.head(node).asFixnum());
+    node = list_mod.tail(node);
+    try testing.expect(list_mod.head(node).kind() == .symbol);
+    try testing.expect(list_mod.isEmpty(list_mod.tail(node)));
+}
+
+test "compile #8c.2: auto-gensym — `(g# g#) — both refs share same gensym" {
+    // Output list should be (g__N__auto__ g__N__auto__) for the
+    // same N. We assert the two symbols are IDENTITY-EQUAL.
+    var r = try runSourceFull("`(g# g#)");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    const s1 = list_mod.head(r.result);
+    const s2 = list_mod.head(list_mod.tail(r.result));
+    try testing.expect(s1.kind() == .symbol);
+    try testing.expect(s2.kind() == .symbol);
+    // Interned symbols have identical (tag, payload) for equal names.
+    try testing.expectEqual(s1.tag, s2.tag);
+    try testing.expectEqual(s1.payload, s2.payload);
+}
+
+test "compile #8c.2: two separate syntax-quotes get DIFFERENT gensyms" {
+    // Two adjacent `g# in DIFFERENT syntax-quote scopes must
+    // produce different gensyms. Walk both via #%list to compare.
+    var r = try runSourceFull("`(~`g# ~`g#)");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    const s1 = list_mod.head(r.result);
+    const s2 = list_mod.head(list_mod.tail(r.result));
+    // Different gensym → different payload (different InternId).
+    try testing.expect(s1.payload != s2.payload);
+}
+
+test "compile #8c.2: unquote outside syntax-quote → MacroExpansionFailure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    // Reader actually catches this at parse time; we get
+    // ReaderFailure not MacroExpansionFailure. Document that
+    // the macroexpand-time defense is a belt-and-suspenders
+    // check for macro-host fns that might synthesize forms.
+    try testing.expectError(
+        CompileError.ReaderFailure,
+        compileSourceFull(arena.allocator(), "~x", null, interner),
+    );
+}
+
+test "compile #8c.2: syntax-quote of vector still UnsupportedFeature (deferred)" {
+    // Per peer-AI turn 58 §D10 — vector/map/set syntax-quote
+    // requires runtime vector construction which is #8c.3.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    try testing.expectError(
+        CompileError.MacroExpansionFailure,
+        compileSourceFullWithMacros(arena.allocator(), "`[1 2 3]", null, interner, &host_macros),
+    );
 }
 
 test "compile #8c.1: quoted vector still UnsupportedFeature (deferred)" {

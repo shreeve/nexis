@@ -188,8 +188,22 @@ fn expandFormDepth(
         // quote form. `(quote (when x y))` MUST NOT expand
         // `when` — it's a literal symbol/list value.
         .quote => mutCast(form),
-        // ---- Syntax-quote — opaque in #8a (transform in #8c). --
-        .syntax_quote, .unquote, .unquote_splicing => mutCast(form),
+        // ---- Syntax-quote — transform per #8c.2. ----------
+        // Open a fresh GensymScope, walk the payload, return
+        // the (#%list ...) / (#%concat ...) structure.
+        .syntax_quote => |payload| blk: {
+            var scope = GensymScope{};
+            defer scope.deinit(ctx.allocator);
+            const expanded = try expandSyntaxQuotePayload(ctx, &scope, form, payload);
+            // Recursively expand the result so that any macros
+            // present in unquote payloads expand normally.
+            break :blk try expandFormDepth(ctx, env, expanded, depth);
+        },
+        // ---- Unquote / unquote-splicing OUTSIDE syntax-quote. --
+        // Per peer-AI turn 58 §D9 + §"Missing trap 1": defensive
+        // error. The reader catches the source-syntax case, but a
+        // macro host fn could synthesize one.
+        .unquote, .unquote_splicing => return MacroexpandError.MalformedMacroCall,
         // ---- Reader macros / metadata. -----------------------
         // anon_fn `#(...)` will land as a macro expansion in
         // step #8b (or, more conservatively, as a dedicated
@@ -1042,6 +1056,181 @@ fn threadStep(
         return try makeList(ctx, new_items, call_form.origin);
     }
     return MacroexpandError.MalformedMacroCall;
+}
+
+// =============================================================================
+// Syntax-quote / unquote / unquote-splicing (step #8c.2)
+// =============================================================================
+//
+// Per MACROEXPAND.md §5 + peer-AI turn 58 §D4/D7/D10.
+//
+// `` `payload `` walks the payload, producing a Form that
+// CONSTRUCTS the quoted shape at runtime via #%list / #%concat
+// (the substrate landed in #8c.1).
+//
+// Element rules:
+//   nil / bool / int / real / char / string / keyword
+//     → return as-is (self-evaluating in nexis, no quote wrap
+//       needed). Equivalent to `(quote X)` but cheaper.
+//   symbol
+//     ends with `#` → gensym-lookup in current scope; emit
+//                     `(quote <name__N__auto__>)`
+//     else          → emit `(quote sym)`
+//   unquote        → return payload as-is (caller will re-walk
+//                    via normal expansion path; macros in
+//                    the unquote payload expand normally; the
+//                    payload is evaluated at runtime).
+//   unquote-splice → ILLEGAL outside list-element position.
+//                    The list walker handles splice; reaching
+//                    one here raises MalformedMacroCall.
+//   list           → expandSyntaxQuoteList (segment-and-concat)
+//   vector/map/set → UnsupportedFeature (deferred per §D10)
+//   quote / syntax-quote / anon_fn / with_meta / deref / nested
+//   syntax_quote   → UnsupportedFeature (deferred per §D7;
+//                    nested syntax-quote needs scope stacking)
+//
+// Auto-gensym scope lifecycle:
+//   - Fresh GensymScope opened at every `Datum.syntax_quote`
+//     entry. Per peer-AI turn 56 §1.4: ONE scope per syntax-
+//     quote form. Nested syntax-quote opens another scope but
+//     v1 raises UnsupportedFeature first, so this never fires.
+//   - Counter is on MacroexpandContext.gensym_next (monotonic
+//     across the entire compilation unit), so two separate
+//     syntax-quotes never collide even though their scopes
+//     are independent.
+
+/// Per-syntax-quote auto-gensym scope. Maps source name (with
+/// the `#` suffix) to the generated `name__N__auto__` string.
+/// Multiple references to the same `x#` within ONE syntax-
+/// quote scope return the same gensym; another syntax-quote
+/// at the same source position with the same `x#` returns a
+/// DIFFERENT gensym (the per-syntax-quote scope is fresh).
+pub const GensymScope = struct {
+    mappings: std.StringHashMapUnmanaged([]const u8) = .{},
+
+    pub fn deinit(self: *GensymScope, allocator: Allocator) void {
+        self.mappings.deinit(allocator);
+    }
+
+    /// Look up `name#` in the scope; allocate a fresh gensym
+    /// (via ctx.gensym(base)) if absent. `name` MUST end in
+    /// `#` (caller checks).
+    fn lookupOrAllocate(
+        self: *GensymScope,
+        ctx: *MacroexpandContext,
+        name: []const u8,
+    ) MacroexpandError![]const u8 {
+        if (self.mappings.get(name)) |existing| return existing;
+        // Strip the trailing `#` for the gensym base.
+        const base = name[0 .. name.len - 1];
+        const generated = try ctx.gensym(base);
+        try self.mappings.put(ctx.allocator, name, generated);
+        return generated;
+    }
+};
+
+/// Walk a syntax-quoted form. Returns a Form that, when
+/// compiled and run, produces the quoted shape.
+fn expandSyntaxQuotePayload(
+    ctx: *MacroexpandContext,
+    scope: *GensymScope,
+    call_form: *const Form,
+    payload: *const Form,
+) MacroexpandError!*Form {
+    return switch (payload.datum) {
+        // Self-evaluating leaves: pass through. Lowered as
+        // existing Tiny variants — no quote wrap needed.
+        .nil, .bool_, .int, .real, .char, .string, .keyword => mutCast(payload),
+        // Symbol → (quote sym) — unless ends with `#`, then
+        // gensym lookup.
+        .symbol => |name| blk: {
+            if (name.ns != null) return MacroexpandError.MalformedMacroCall;
+            const sym_name: []const u8 = if (name.name.len > 1 and name.name[name.name.len - 1] == '#')
+                try scope.lookupOrAllocate(ctx, name.name)
+            else
+                name.name;
+            const sym_form = try makeSymbol(ctx, sym_name, payload.origin);
+            // Emit (quote <sym>).
+            const items = try ctx.allocator.alloc(*Form, 2);
+            items[0] = try makeSymbol(ctx, "quote", call_form.origin);
+            items[1] = sym_form;
+            break :blk try makeList(ctx, items, call_form.origin);
+        },
+        // Unquote: return the payload directly; it goes through
+        // normal expansion + evaluation on the outer walk.
+        .unquote => |inner| mutCast(inner),
+        // Splice in non-list context is illegal.
+        .unquote_splicing => return MacroexpandError.MalformedMacroCall,
+        // List: build the segment-and-concat structure.
+        .list => |items| try expandSyntaxQuoteList(ctx, scope, call_form, items, payload.origin),
+        // Deferred: vector/map/set/nested-syntax-quote and other
+        // reader macros need explicit support (peer-AI turn 58
+        // §D7/D10). v1 raises MalformedMacroCall via the
+        // MacroExpansionFailure bucket.
+        else => return MacroexpandError.MalformedMacroCall,
+    };
+}
+
+/// Walk the items of a syntax-quoted list. Groups runs of
+/// non-splice elements into `(#%list ...)` segments; splices
+/// interleave as separate concat arguments. Returns either
+/// a bare `(#%list ...)` (no splices found) or a
+/// `(#%concat ...)` wrapping multiple segments.
+fn expandSyntaxQuoteList(
+    ctx: *MacroexpandContext,
+    scope: *GensymScope,
+    call_form: *const Form,
+    items: []const *Form,
+    list_origin: reader_mod.SrcSpan,
+) MacroexpandError!*Form {
+    var segments: std.ArrayList(*Form) = .empty;
+    defer segments.deinit(ctx.allocator);
+    var current: std.ArrayList(*Form) = .empty;
+    defer current.deinit(ctx.allocator);
+
+    const flushCurrent = struct {
+        fn call(c: *std.ArrayList(*Form), cx: *MacroexpandContext, segs: *std.ArrayList(*Form), origin: reader_mod.SrcSpan) MacroexpandError!void {
+            if (c.items.len == 0) return;
+            // Build (#%list ...) from the current segment.
+            const seg_items = try cx.allocator.alloc(*Form, c.items.len + 1);
+            seg_items[0] = try makeSymbol(cx, "#%list", origin);
+            for (c.items, 0..) |it, i| seg_items[1 + i] = it;
+            const seg_form = try makeList(cx, seg_items, origin);
+            try segs.append(cx.allocator, seg_form);
+            c.clearRetainingCapacity();
+        }
+    }.call;
+
+    for (items) |item| {
+        if (item.datum == .unquote_splicing) {
+            // Flush the current segment, then add the spliced
+            // payload as its own concat segment.
+            try flushCurrent(&current, ctx, &segments, list_origin);
+            try segments.append(ctx.allocator, mutCast(item.datum.unquote_splicing));
+        } else {
+            try current.append(ctx.allocator, try expandSyntaxQuotePayload(ctx, scope, call_form, item));
+        }
+    }
+    try flushCurrent(&current, ctx, &segments, list_origin);
+
+    // 0 segments → empty list: `(#%list)`.
+    if (segments.items.len == 0) {
+        const empty_items = try ctx.allocator.alloc(*Form, 1);
+        empty_items[0] = try makeSymbol(ctx, "#%list", list_origin);
+        return try makeList(ctx, empty_items, list_origin);
+    }
+    // 1 segment → return it directly. If it's a single
+    // segment, no concat needed. The segment is already
+    // either a `(#%list ...)` (if it came from a flush)
+    // or a spliced expression (which evaluates to a list
+    // at runtime — return it as-is and trust the caller).
+    if (segments.items.len == 1) return segments.items[0];
+
+    // 2+ segments → wrap in (#%concat seg1 seg2 ...).
+    const concat_items = try ctx.allocator.alloc(*Form, segments.items.len + 1);
+    concat_items[0] = try makeSymbol(ctx, "#%concat", list_origin);
+    for (segments.items, 0..) |seg, i| concat_items[1 + i] = seg;
+    return try makeList(ctx, concat_items, list_origin);
 }
 
 // ---- Default macro table -------------------------------------

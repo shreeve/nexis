@@ -19,6 +19,7 @@ zig build nexis
 | `threading.nx` | `->` thread-first chained through `+` |
 | `macros.nx` | `when-not` / `loop` / `or` end-to-end (step #8b host macros) |
 | `quoted-list.nx` | `(quote (...))` builds a runtime list value via `#%list` (step #8c.1) |
+| `syntax-quote.nx` | `` ` `` / `~` / `~@` with splicing (step #8c.2) |
 
 The macro-heavy examples (`cond.nx`, `threading.nx`,
 `macros.nx`) all rely on step #8b host macros. Step #8c
