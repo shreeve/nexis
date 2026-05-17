@@ -584,12 +584,14 @@ Macro semantics (peer-AI turn 56 §2.G-J):
 
 - `when`: `(when test body...)` → `(if test (do body...) nil)`
 - `when-not`: `(when-not test body...)` → `(if test nil (do body...))`
-- `and`:
+- `and` — **MUST USE GENSYM** to return the first falsy value
+  (Clojure semantics: returns the actual falsy value, NOT
+  literal `false`):
   ```clojure
   (and)       => true
   (and x)     => x
-  (and x y)   => (if x y false)
-  (and x y z) => (if x (and y z) false)   ; rebuild and recurse
+  (and x y)   => (let* [g x] (if g y g))
+  (and x y z) => (let* [g x] (if g (and y z) g))
   ```
 - `or` — **MUST USE GENSYM** to avoid double evaluation:
   ```clojure

@@ -62,11 +62,27 @@ pub const MacroexpandError = error{
 pub const MacroexpandContext = struct {
     allocator: Allocator,
     interner: *intern_mod.Interner,
-    /// Monotonic auto-gensym counter (#8b will read+increment).
+    /// Monotonic auto-gensym counter (peer-AI turn 56 §1.4 +
+    /// §5: lives on the context, NOT the VM). Used by host
+    /// macros that need to avoid double-evaluation (e.g. `or`).
     gensym_next: u64 = 0,
     /// Macro registry. May be empty (#8a default → no expansion
     /// fires).
     host_macros: *const HostMacroTable,
+
+    /// Allocate a fresh gensym name in the context's arena.
+    /// Format: `<base>__<counter>__auto__` per MACROEXPAND.md §4.
+    /// The `__auto__` suffix marks auto-gensym (vs future
+    /// user-controlled `(gensym base)`).
+    ///
+    /// Lifetime: the returned slice lives in `ctx.allocator`,
+    /// which is the macroexpand arena (typically the same as
+    /// the compile arena). The caller does NOT free.
+    pub fn gensym(self: *MacroexpandContext, base: []const u8) MacroexpandError![]const u8 {
+        const counter = self.gensym_next;
+        self.gensym_next += 1;
+        return std.fmt.allocPrint(self.allocator, "{s}__{d}__auto__", .{ base, counter });
+    }
 };
 
 /// Host-Zig macro callback. Takes the call form (head + args)
@@ -611,10 +627,21 @@ fn expandDefn(
 }
 
 // =============================================================================
-// Form construction helpers (precursor to #8b FormBuilder)
+// Form construction helpers (MACROEXPAND.md §10b — the
+// FormBuilder pattern, with origin carried through per §4b)
 // =============================================================================
+//
+// Every helper takes an `origin: SrcSpan` parameter. Per §4b
+// (peer-AI turn 56), synthetic forms get the macro CALL site's
+// origin so that future error messages can say "in macro
+// expansion of WHEN at line 5". Macros typically pass
+// `call_form.origin` to every helper.
+//
+// Lifetime: every constructed Form lives in `ctx.allocator`
+// (the macroexpand arena, same as the compile arena). The
+// caller does NOT free.
 
-fn makeList(ctx: *MacroexpandContext, items: []*Form, origin: SrcSpan) MacroexpandError!*Form {
+pub fn makeList(ctx: *MacroexpandContext, items: []*Form, origin: SrcSpan) MacroexpandError!*Form {
     const form = try ctx.allocator.create(Form);
     form.* = .{
         .datum = .{ .list = @as([]const *Form, items) },
@@ -623,13 +650,412 @@ fn makeList(ctx: *MacroexpandContext, items: []*Form, origin: SrcSpan) Macroexpa
     return form;
 }
 
-fn makeVector(ctx: *MacroexpandContext, items: []*Form, origin: SrcSpan) MacroexpandError!*Form {
+pub fn makeVector(ctx: *MacroexpandContext, items: []*Form, origin: SrcSpan) MacroexpandError!*Form {
     const form = try ctx.allocator.create(Form);
     form.* = .{
         .datum = .{ .vector = @as([]const *Form, items) },
         .origin = origin,
     };
     return form;
+}
+
+/// Construct a symbol form. `name` is borrowed (typically a
+/// string literal from the macro fn or a gensym output —
+/// either way the lifetime is at least as long as the
+/// resulting Form's). Always unqualified for host macros;
+/// qualified-symbol construction lands in #8c.
+pub fn makeSymbol(ctx: *MacroexpandContext, name: []const u8, origin: SrcSpan) MacroexpandError!*Form {
+    const form = try ctx.allocator.create(Form);
+    form.* = .{
+        .datum = .{ .symbol = .{ .ns = null, .name = name } },
+        .origin = origin,
+    };
+    return form;
+}
+
+pub fn makeNil(ctx: *MacroexpandContext, origin: SrcSpan) MacroexpandError!*Form {
+    const form = try ctx.allocator.create(Form);
+    form.* = .{ .datum = .nil, .origin = origin };
+    return form;
+}
+
+pub fn makeBool(ctx: *MacroexpandContext, value: bool, origin: SrcSpan) MacroexpandError!*Form {
+    const form = try ctx.allocator.create(Form);
+    form.* = .{ .datum = .{ .bool_ = value }, .origin = origin };
+    return form;
+}
+
+// =============================================================================
+// Host core macros (MACROEXPAND.md §10 — step #8b)
+// =============================================================================
+//
+// Each macro fn matches `MacroFn`:
+//   fn(ctx, call_form, args) MacroexpandError!*Form
+//
+// Conventions:
+//   - The macro's NAME is registered in `defaultMacros()` and
+//     resolved by the expander; the fn itself never sees the
+//     head symbol — only the args.
+//   - All synthetic Forms use `call_form.origin` per
+//     MACROEXPAND.md §4b.
+//   - Malformed shapes raise `MalformedMacroCall` which the
+//     compile layer buckets as `MacroExpansionFailure`.
+//   - Output forms are re-fed to the expander (see
+//     `invokeMacro`), so macro-of-macros termination is
+//     automatic.
+
+// ---- Rename macros (CLOJURE-REVIEW.md §1.1 primitive `*`) ----
+//
+// These exist because user-facing `let`/`fn`/`loop` are
+// macros that just rename to the compiler primitives
+// `let*`/`fn*`/`loop*`. Phase 3 will redefine `let` to add
+// destructuring; for v1 step #8b, the trivial rename is
+// the entire job.
+
+fn expandLetRename(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) MacroexpandError!*Form {
+    return renameHead(ctx, call_form, args, "let*");
+}
+
+fn expandFnRename(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) MacroexpandError!*Form {
+    return renameHead(ctx, call_form, args, "fn*");
+}
+
+fn expandLoopRename(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) MacroexpandError!*Form {
+    return renameHead(ctx, call_form, args, "loop*");
+}
+
+/// Generic rename helper: emit (NEW_HEAD args...). Args are
+/// passed through unchanged — the expander will descend into
+/// them on the next walk via the special-form traversal for
+/// the new head.
+fn renameHead(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+    new_head: []const u8,
+) MacroexpandError!*Form {
+    const items = try ctx.allocator.alloc(*Form, args.len + 1);
+    items[0] = try makeSymbol(ctx, new_head, call_form.origin);
+    for (args, 0..) |a, i| items[1 + i] = @constCast(a);
+    return try makeList(ctx, items, call_form.origin);
+}
+
+// ---- when / when-not -----------------------------------------
+//
+//   (when test body...)     => (if test (do body...) nil)
+//   (when-not test body...) => (if test nil (do body...))
+
+fn expandWhen(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) MacroexpandError!*Form {
+    if (args.len < 1) return MacroexpandError.MalformedMacroCall;
+    return try buildWhen(ctx, call_form, args, .when_true);
+}
+
+fn expandWhenNot(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) MacroexpandError!*Form {
+    if (args.len < 1) return MacroexpandError.MalformedMacroCall;
+    return try buildWhen(ctx, call_form, args, .when_false);
+}
+
+const WhenArm = enum { when_true, when_false };
+
+fn buildWhen(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+    arm: WhenArm,
+) MacroexpandError!*Form {
+    const test_form = args[0];
+    const body = args[1..];
+    // Build (do body...) — empty body yields just (do).
+    const do_items = try ctx.allocator.alloc(*Form, 1 + body.len);
+    do_items[0] = try makeSymbol(ctx, "do", call_form.origin);
+    for (body, 0..) |b, i| do_items[1 + i] = @constCast(b);
+    const do_form = try makeList(ctx, do_items, call_form.origin);
+
+    const nil_form = try makeNil(ctx, call_form.origin);
+    const if_items = try ctx.allocator.alloc(*Form, 4);
+    if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
+    if_items[1] = @constCast(test_form);
+    switch (arm) {
+        .when_true => {
+            if_items[2] = do_form;
+            if_items[3] = nil_form;
+        },
+        .when_false => {
+            if_items[2] = nil_form;
+            if_items[3] = do_form;
+        },
+    }
+    return try makeList(ctx, if_items, call_form.origin);
+}
+
+// ---- and / or ------------------------------------------------
+//
+// Clojure semantics: `and` returns the FIRST FALSY value or
+// the last value if all truthy; `or` returns the FIRST TRUTHY
+// value or the last value if all falsy. Crucially, both
+// return the actual value (not literal true/false).
+//
+//   (and)        => true
+//   (and x)      => x
+//   (and x y)    => (let* [g x] (if g y g))
+//   (and x y z)  => (let* [g x] (if g (and y z) g))
+//
+//   (or)         => nil
+//   (or x)       => x
+//   (or x y)     => (let* [g x] (if g g y))
+//   (or x y z)   => (let* [g x] (if g g (or y z)))
+//
+// BOTH `and` and `or` MUST gensym to avoid double-evaluating
+// the first operand (per MACROEXPAND.md §10.G/H — peer-AI
+// turn 56 §2.G).
+
+fn expandAnd(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) MacroexpandError!*Form {
+    if (args.len == 0) return try makeBool(ctx, true, call_form.origin);
+    if (args.len == 1) return @constCast(args[0]);
+
+    // Build the "rest" — either args[1] alone (2-arg case)
+    // or a recursive (and ...) call.
+    const rest_form: *Form = if (args.len == 2)
+        @constCast(args[1])
+    else blk: {
+        const rest_items = try ctx.allocator.alloc(*Form, args.len);
+        rest_items[0] = try makeSymbol(ctx, "and", call_form.origin);
+        for (args[1..], 0..) |a, i| rest_items[1 + i] = @constCast(a);
+        break :blk try makeList(ctx, rest_items, call_form.origin);
+    };
+
+    // (let* [g args[0]] (if g rest g))
+    const g_name = try ctx.gensym("and");
+    const g_sym1 = try makeSymbol(ctx, g_name, call_form.origin);
+    const g_sym2 = try makeSymbol(ctx, g_name, call_form.origin);
+    const g_sym3 = try makeSymbol(ctx, g_name, call_form.origin);
+
+    const binding_items = try ctx.allocator.alloc(*Form, 2);
+    binding_items[0] = g_sym1;
+    binding_items[1] = @constCast(args[0]);
+    const binding_vec = try makeVector(ctx, binding_items, call_form.origin);
+
+    const if_items = try ctx.allocator.alloc(*Form, 4);
+    if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
+    if_items[1] = g_sym2;
+    if_items[2] = rest_form;
+    if_items[3] = g_sym3;
+    const if_form = try makeList(ctx, if_items, call_form.origin);
+
+    const let_items = try ctx.allocator.alloc(*Form, 3);
+    let_items[0] = try makeSymbol(ctx, "let*", call_form.origin);
+    let_items[1] = binding_vec;
+    let_items[2] = if_form;
+    return try makeList(ctx, let_items, call_form.origin);
+}
+
+fn expandOr(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) MacroexpandError!*Form {
+    if (args.len == 0) return try makeNil(ctx, call_form.origin);
+    if (args.len == 1) return @constCast(args[0]);
+
+    // Build the "rest" — either the single second arg or
+    // a recursive (or ...) call.
+    const rest_form: *Form = if (args.len == 2)
+        @constCast(args[1])
+    else blk: {
+        const rest_items = try ctx.allocator.alloc(*Form, args.len);
+        rest_items[0] = try makeSymbol(ctx, "or", call_form.origin);
+        for (args[1..], 0..) |a, i| rest_items[1 + i] = @constCast(a);
+        break :blk try makeList(ctx, rest_items, call_form.origin);
+    };
+
+    // (let* [g args[0]] (if g g rest_form))
+    const g_name = try ctx.gensym("or");
+    const g_sym1 = try makeSymbol(ctx, g_name, call_form.origin);
+    const g_sym2 = try makeSymbol(ctx, g_name, call_form.origin);
+    const g_sym3 = try makeSymbol(ctx, g_name, call_form.origin);
+
+    const binding_items = try ctx.allocator.alloc(*Form, 2);
+    binding_items[0] = g_sym1;
+    binding_items[1] = @constCast(args[0]);
+    const binding_vec = try makeVector(ctx, binding_items, call_form.origin);
+
+    const if_items = try ctx.allocator.alloc(*Form, 4);
+    if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
+    if_items[1] = g_sym2;
+    if_items[2] = g_sym3;
+    if_items[3] = rest_form;
+    const if_form = try makeList(ctx, if_items, call_form.origin);
+
+    const let_items = try ctx.allocator.alloc(*Form, 3);
+    let_items[0] = try makeSymbol(ctx, "let*", call_form.origin);
+    let_items[1] = binding_vec;
+    let_items[2] = if_form;
+    return try makeList(ctx, let_items, call_form.origin);
+}
+
+// ---- cond ----------------------------------------------------
+//
+//   (cond)              => nil
+//   (cond t1 e1)        => (if t1 e1 nil)
+//   (cond t1 e1 t2 e2)  => (if t1 e1 (if t2 e2 nil))
+//
+// Odd-count args raise MalformedMacroCall. No special-case for
+// `:else` in v1 — any truthy test works as a default; users can
+// write `(cond ... :else default)` and the keyword's truthiness
+// makes it pass.
+
+fn expandCond(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) MacroexpandError!*Form {
+    if (args.len == 0) return try makeNil(ctx, call_form.origin);
+    if (args.len % 2 != 0) return MacroexpandError.MalformedMacroCall;
+
+    // Build right-to-left: start from nil, wrap each pair.
+    var current: *Form = try makeNil(ctx, call_form.origin);
+    var i: usize = args.len;
+    while (i >= 2) : (i -= 2) {
+        const test_form = args[i - 2];
+        const expr_form = args[i - 1];
+        const if_items = try ctx.allocator.alloc(*Form, 4);
+        if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
+        if_items[1] = @constCast(test_form);
+        if_items[2] = @constCast(expr_form);
+        if_items[3] = current;
+        current = try makeList(ctx, if_items, call_form.origin);
+    }
+    return current;
+}
+
+// ---- ->  /  ->>  (threading macros) --------------------------
+//
+//   (-> x)             => x
+//   (-> x f)           => (f x)
+//   (-> x (f a b))     => (f x a b)            ; thread-first
+//   (-> x f (g a))     => (g (f x) a)          ; chained
+//
+//   (->> x f)          => (f x)
+//   (->> x (f a b))    => (f a b x)            ; thread-last
+//
+// Symbol step `f` is treated as `(f)` — equivalent to inserting
+// the threaded value as the sole arg. Non-symbol non-list steps
+// raise MalformedMacroCall.
+
+const ThreadPosition = enum { first, last };
+
+fn expandThreadFirst(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) MacroexpandError!*Form {
+    return try expandThread(ctx, call_form, args, .first);
+}
+
+fn expandThreadLast(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) MacroexpandError!*Form {
+    return try expandThread(ctx, call_form, args, .last);
+}
+
+fn expandThread(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+    pos: ThreadPosition,
+) MacroexpandError!*Form {
+    if (args.len == 0) return MacroexpandError.MalformedMacroCall;
+    var acc: *Form = @constCast(args[0]);
+    for (args[1..]) |step| {
+        acc = try threadStep(ctx, call_form, acc, step, pos);
+    }
+    return acc;
+}
+
+fn threadStep(
+    ctx: *MacroexpandContext,
+    call_form: *const Form,
+    acc: *Form,
+    step: *const Form,
+    pos: ThreadPosition,
+) MacroexpandError!*Form {
+    // Symbol step `f` → (f acc).
+    if (step.datum == .symbol) {
+        const items = try ctx.allocator.alloc(*Form, 2);
+        items[0] = @constCast(step);
+        items[1] = acc;
+        return try makeList(ctx, items, call_form.origin);
+    }
+    // List step (f a b) → thread-first: (f acc a b)
+    //                      thread-last:  (f a b acc)
+    if (step.datum == .list) {
+        const step_items = step.datum.list;
+        if (step_items.len == 0) return MacroexpandError.MalformedMacroCall;
+        const new_items = try ctx.allocator.alloc(*Form, step_items.len + 1);
+        switch (pos) {
+            .first => {
+                // (head acc rest...)
+                new_items[0] = @constCast(step_items[0]);
+                new_items[1] = acc;
+                for (step_items[1..], 0..) |it, i| new_items[2 + i] = @constCast(it);
+            },
+            .last => {
+                // (head rest... acc)
+                for (step_items, 0..) |it, i| new_items[i] = @constCast(it);
+                new_items[step_items.len] = acc;
+            },
+        }
+        return try makeList(ctx, new_items, call_form.origin);
+    }
+    return MacroexpandError.MalformedMacroCall;
+}
+
+// ---- Default macro table -------------------------------------
+
+/// Build the standard host-macro table for `nexis run`. Pass
+/// the result via `compileSourceFullWithMacros` (the CLI does
+/// this automatically). Caller owns the returned table and is
+/// responsible for `table.deinit(allocator)`.
+pub fn defaultMacros(allocator: Allocator) MacroexpandError!HostMacroTable {
+    var table: HostMacroTable = .{};
+    errdefer table.deinit(allocator);
+    try table.put(allocator, "let", expandLetRename);
+    try table.put(allocator, "fn", expandFnRename);
+    try table.put(allocator, "loop", expandLoopRename);
+    try table.put(allocator, "when", expandWhen);
+    try table.put(allocator, "when-not", expandWhenNot);
+    try table.put(allocator, "and", expandAnd);
+    try table.put(allocator, "or", expandOr);
+    try table.put(allocator, "cond", expandCond);
+    try table.put(allocator, "->", expandThreadFirst);
+    try table.put(allocator, "->>", expandThreadLast);
+    return table;
 }
 
 // =============================================================================

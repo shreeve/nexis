@@ -1,0 +1,12 @@
+; examples/cond.nx — classification via cond + when.
+; Showcases the host macros landed in step #8b: cond, when,
+; and, or, ->, plus the user-facing `let`/`fn`/`loop` renames.
+
+(defn classify [n]
+  (cond
+    (and (< 0 n) (< n 10))  :small
+    (and (< 9 n) (< n 100)) :medium
+    (< 99 n)                :large
+    :else                   :non-positive))
+
+(classify 42)

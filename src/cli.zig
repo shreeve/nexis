@@ -85,21 +85,22 @@ const Usage =
     \\from `def`/`defn`) and interner persist across forms.
     \\
     \\Phase 2 source surface (what compiles today):
-    \\  literals: nil, true, false, integers
+    \\  literals: nil, true, false, integers, :keywords
     \\  arithmetic: (+ a b), (< a b)
     \\  conditionals: (if test then else?), (do ...)
-    \\  bindings: (let* [name1 v1 name2 v2 ...] body...)
-    \\  functions: (fn* name? [params & rest?] body...)
-    \\  recursion: (loop* [...] body...), (recur args...)
+    \\  bindings: (let [name1 v1 ...] body...)  -- or let*
+    \\  functions: (fn name? [params & rest?] body...)  -- or fn*
+    \\  recursion: (loop [...] body...) (recur args...)  -- or loop*
     \\  vars: (def name value?), (defn name [params] body...), (var name)
     \\  quoting: (quote x), 'x (scalars + interned symbols/keywords)
     \\  mutual: (letfn* [(name [params] body...) ...] body...)
+    \\  macros: when, when-not, and, or, cond, ->, ->>
     \\
     \\Limitations (closes as Phase 2 progresses):
-    \\  - macros / syntax-quote: step #8
+    \\  - syntax-quote / unquote / #(...): step #8c
     \\  - try/catch/throw: step #9
     \\  - error spans / structured diagnostics: step #10
-    \\  - REPL / module loading: Phase 3+
+    \\  - REPL / module loading / user defmacro: Phase 3+
     \\
 ;
 
@@ -204,13 +205,11 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     var compile_arena = std.heap.ArenaAllocator.init(allocator);
     defer compile_arena.deinit();
 
-    // Step #8a: empty host-macro table. Steps #8b/#8c will
-    // populate this with the default macros (when, cond, and,
-    // or, ->, ->>, let, fn, loop). Even with an empty table,
-    // running through the expander exercises the scaffold —
-    // which is the entire point of #8a (catch traversal bugs
-    // before macros are added).
-    var host_macros: macroexpand_mod.HostMacroTable = .{};
+    // Step #8b: default host macro table — let/fn/loop
+    // renames + when/when-not/and/or/cond + ->/->>. Phase 3
+    // will add user-defined `defmacro` and let users extend
+    // this table.
+    var host_macros = try macroexpand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);
 
     var last_result: Value = value_mod.nilValue();

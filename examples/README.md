@@ -15,15 +15,19 @@ zig build nexis
 | `hello.nx` | Symbol literal via `defn` + call |
 | `sum10.nx` | `loop*`/`recur` constant-stack iteration |
 | `forward-ref.nx` | `defn` forward references work via the namespace Var fall-through (f calls g before g is defined) |
+| `cond.nx` | `cond` + `and` + `:else`-as-truthy-keyword convention |
+| `threading.nx` | `->` thread-first chained through `+` |
+| `macros.nx` | `when-not` / `loop` / `or` end-to-end (step #8b host macros) |
 
-These are the FIRST `.nx` programs to compile + run via the
-CLI. More land as Phase 2/3 progress closes deferred items:
+The macro-heavy examples (`cond.nx`, `threading.nx`,
+`macros.nx`) all rely on step #8b host macros. Step #8c
+will unlock `syntax-quote`, quoted compound collections,
+and `#(...)` anonymous-fn shorthand.
 
-- Phase 2 step #8 (macroexpander): unlocks `when`, `cond`,
-  `and`, `or`, `->`, `->>`, multi-arity `defn`, `#(...)` anon
-  fn shorthand, syntax-quote, quoted compound collections.
+Future:
+- Phase 2 step #8c: syntax-quote, `~` / `~@`, `#(...)` anon fn.
 - Phase 2 step #10 (error reporting): structured error
   messages with source spans.
 - Phase 3 (stdlib): `map`, `reduce`, `filter`, `conj`,
-  `assoc`, threading macros, protocols, multimethods, REPL,
-  multi-namespace support.
+  `assoc`, protocols, multimethods, REPL, multi-namespace
+  support.

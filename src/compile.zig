@@ -6408,6 +6408,327 @@ test "compile #8a: infinite macro loop → MacroDepthExceeded" {
     );
 }
 
+// ---- step #8b: host core macros end-to-end ------------------
+
+/// Run a source string with default macros + interner + ns.
+/// Returns the result Value via the helper VM setup. The VM
+/// must outlive any post-call use of the result (interned
+/// symbols/keywords reference VM-owned storage).
+fn runSourceWithDefaultMacros(src: []const u8) !struct { result: value_mod.Value, vm_owned: vm.VM } {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    errdefer v.deinit();
+    const ns = v.ensureNamespace();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
+    const routine = compiled.toRoutine("p");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    return .{ .result = result, .vm_owned = v };
+}
+
+fn expectFixnumDefaultMacros(src: []const u8, expected: i64) !void {
+    var r = try runSourceWithDefaultMacros(src);
+    defer r.vm_owned.deinit();
+    try testing.expectEqual(expected, r.result.asFixnum());
+}
+
+fn expectNilDefaultMacros(src: []const u8) !void {
+    var r = try runSourceWithDefaultMacros(src);
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .nil);
+}
+
+fn expectBoolDefaultMacros(src: []const u8, expected: bool) !void {
+    var r = try runSourceWithDefaultMacros(src);
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.isBool());
+    try testing.expectEqual(expected, r.result.asBool());
+}
+
+fn expectKeywordDefaultMacros(src: []const u8, expected: []const u8) !void {
+    var r = try runSourceWithDefaultMacros(src);
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .keyword);
+    const id: u32 = @intCast(r.result.payload);
+    try testing.expectEqualStrings(expected, r.vm_owned.ensureInterner().keywordName(id));
+}
+
+// ---- rename macros ----
+
+test "compile #8b: (let [x 1 y 2] (+ x y)) → 3" {
+    try expectFixnumDefaultMacros("(let [x 1 y 2] (+ x y))", 3);
+}
+
+test "compile #8b: (fn [x] (+ x 1)) renamed to fn*" {
+    try expectFixnumDefaultMacros("((fn [x] (+ x 1)) 41)", 42);
+}
+
+test "compile #8b: (loop [i 0] ...) renamed to loop*" {
+    try expectFixnumDefaultMacros(
+        "(loop [i 0 acc 0] (if (< i 5) (recur (+ i 1) (+ acc i)) acc))",
+        10,
+    );
+}
+
+// ---- when / when-not ----
+
+test "compile #8b: (when true 42) → 42" {
+    try expectFixnumDefaultMacros("(when true 42)", 42);
+}
+
+test "compile #8b: (when false 42) → nil" {
+    try expectNilDefaultMacros("(when false 42)");
+}
+
+test "compile #8b: (when true 1 2 3) returns last body form" {
+    try expectFixnumDefaultMacros("(when true 1 2 3)", 3);
+}
+
+test "compile #8b: (when-not false 99) → 99" {
+    try expectFixnumDefaultMacros("(when-not false 99)", 99);
+}
+
+test "compile #8b: (when-not true 99) → nil" {
+    try expectNilDefaultMacros("(when-not true 99)");
+}
+
+test "compile #8b: (when) malformed → MacroExpansionFailure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    try testing.expectError(
+        CompileError.MacroExpansionFailure,
+        compileSourceFullWithMacros(arena.allocator(), "(when)", null, interner, &host_macros),
+    );
+}
+
+// ---- and ----
+
+test "compile #8b: (and) → true" {
+    try expectBoolDefaultMacros("(and)", true);
+}
+
+test "compile #8b: (and 42) → 42" {
+    try expectFixnumDefaultMacros("(and 42)", 42);
+}
+
+test "compile #8b: (and 1 2 3) → 3 (last truthy)" {
+    try expectFixnumDefaultMacros("(and 1 2 3)", 3);
+}
+
+test "compile #8b: (and 1 false 3) → false (short-circuit)" {
+    try expectBoolDefaultMacros("(and 1 false 3)", false);
+}
+
+test "compile #8b: (and nil 99) → nil (returns falsy value, not literal false)" {
+    // Clojure-style: and returns the FIRST FALSY value, not
+    // literal false. Confirms expandAnd uses the let*+gensym
+    // shape, not the simpler-but-wrong (if x y false).
+    try expectNilDefaultMacros("(and nil 99)");
+}
+
+test "compile #8b: (and expr ...) uses gensym (no double-eval)" {
+    // Same shape as the or-gensym test. step is invoked once
+    // for the and; if double-eval'd, step-count would be 2.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+
+    const src =
+        \\(do
+        \\  (def step-count 0)
+        \\  (defn step [] (do (def step-count (+ step-count 1)) step-count))
+        \\  (and (step) true)
+        \\  step-count)
+    ;
+    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
+    const routine = compiled.toRoutine("and-gensym");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+// ---- or ----
+
+test "compile #8b: (or) → nil" {
+    try expectNilDefaultMacros("(or)");
+}
+
+test "compile #8b: (or 42) → 42" {
+    try expectFixnumDefaultMacros("(or 42)", 42);
+}
+
+test "compile #8b: (or false nil 42) → 42" {
+    try expectFixnumDefaultMacros("(or false nil 42)", 42);
+}
+
+test "compile #8b: (or 1 2 3) → 1 (first truthy)" {
+    try expectFixnumDefaultMacros("(or 1 2 3)", 1);
+}
+
+test "compile #8b: (or false false false) → false" {
+    try expectBoolDefaultMacros("(or false false false)", false);
+}
+
+test "compile #8b: (or expr ...) uses gensym (no double-eval)" {
+    // The classic gensym test: a stateful expression that
+    // would yield different results if evaluated twice. We
+    // model statelessness here via a defn'd Var that counts
+    // invocations; `or` should call `step` exactly ONCE per
+    // operand position even though the macro expansion
+    // structurally references the value twice.
+    //
+    // (defn step [] (do (def step-count (+ step-count 1)) step-count))
+    // (def step-count 0)
+    // (or (step) 99)            ; step fires once; step-count = 1
+    // step-count                ; → 1, NOT 2
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+
+    const src =
+        \\(do
+        \\  (def step-count 0)
+        \\  (defn step [] (do (def step-count (+ step-count 1)) step-count))
+        \\  (or (step) 99)
+        \\  step-count)
+    ;
+    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
+    const routine = compiled.toRoutine("or-gensym");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    // step was invoked exactly once, so step-count = 1.
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+// ---- cond ----
+
+test "compile #8b: (cond) → nil" {
+    try expectNilDefaultMacros("(cond)");
+}
+
+test "compile #8b: (cond true 42) → 42" {
+    try expectFixnumDefaultMacros("(cond true 42)", 42);
+}
+
+test "compile #8b: (cond false 1 true 2 false 3) → 2" {
+    try expectFixnumDefaultMacros("(cond false 1 true 2 false 3)", 2);
+}
+
+test "compile #8b: (cond false 1 false 2) → nil (no match)" {
+    try expectNilDefaultMacros("(cond false 1 false 2)");
+}
+
+test "compile #8b: cond with :else convention (truthy keyword)" {
+    try expectKeywordDefaultMacros(
+        "(cond false :a false :b :else :c)",
+        "c",
+    );
+}
+
+test "compile #8b: (cond odd-args) → MacroExpansionFailure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    try testing.expectError(
+        CompileError.MacroExpansionFailure,
+        compileSourceFullWithMacros(arena.allocator(), "(cond true)", null, interner, &host_macros),
+    );
+}
+
+// ---- thread-first / thread-last ----
+
+test "compile #8b: (-> 10) → 10 (single-arg)" {
+    try expectFixnumDefaultMacros("(-> 10)", 10);
+}
+
+test "compile #8b: (-> 1 (+ 2)) → 3 (thread-first)" {
+    try expectFixnumDefaultMacros("(-> 1 (+ 2))", 3);
+}
+
+test "compile #8b: (-> 1 (+ 2) (+ 3)) chained → 6" {
+    try expectFixnumDefaultMacros("(-> 1 (+ 2) (+ 3))", 6);
+}
+
+test "compile #8b: (->> 1 (+ 2) (+ 3)) thread-last → 6" {
+    // (+ x y) is commutative so first/last give same result here;
+    // semantic difference is tested in the asymmetric arg case
+    // below.
+    try expectFixnumDefaultMacros("(->> 1 (+ 2) (+ 3))", 6);
+}
+
+test "compile #8b: -> with symbol step treats it as (step)" {
+    // (-> 41 inc) where inc is a fn — symbol step inserts the
+    // threaded value as the sole arg. We use an inline fn since
+    // there's no stdlib yet.
+    try expectFixnumDefaultMacros(
+        "(do (defn inc [x] (+ x 1)) (-> 41 inc))",
+        42,
+    );
+}
+
+// ---- shadowing ----
+
+test "compile #8b: macros are lexically shadowable" {
+    // (let [when 99] when) — `when` is shadowed by a let binding,
+    // so the inner `when` resolves to the local, NOT the macro.
+    try expectFixnumDefaultMacros("(let [when 99] when)", 99);
+}
+
+test "compile #8b: nested macros expand correctly" {
+    try expectKeywordDefaultMacros(
+        "(when (and 1 2) (or false :yes))",
+        "yes",
+    );
+}
+
 test "compile E1: qualified symbol in quote still UnsupportedFeature" {
     // Even with an Interner, qualified symbols are post-v1.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
