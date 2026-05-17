@@ -1091,7 +1091,12 @@ fn lowerList(
         if (std.mem.eql(u8, name, "do")) return try lowerDo(allocator, items[1..], env);
         if (std.mem.eql(u8, name, "if")) return try lowerIf(allocator, items[1..], env);
         if (std.mem.eql(u8, name, "quote")) return try lowerQuote(allocator, items[1..]);
-        // let*, fn*, letfn*, loop*, recur land in #7c.
+        // Binding forms (step #7c).
+        if (std.mem.eql(u8, name, "let*")) return try lowerLetStar(allocator, items[1..], env);
+        if (std.mem.eql(u8, name, "loop*")) return try lowerLoopStar(allocator, items[1..], env);
+        if (std.mem.eql(u8, name, "recur")) return try lowerRecur(allocator, items[1..], env);
+        if (std.mem.eql(u8, name, "fn*")) return try lowerFnStar(allocator, items[1..], env);
+        if (std.mem.eql(u8, name, "letfn*")) return try lowerLetFnStar(allocator, items[1..], env);
         // def, defn, var land in #7d.
         // -- Inlineable intrinsics (shadowable) --
         if (std.mem.eql(u8, name, "+") and items.len == 3 and !isIntrinsicShadowed(env, name)) {
@@ -1211,6 +1216,268 @@ fn lowerCall(
         args[i] = try lowerFormEnv(allocator, item, env);
     }
     return try allocTiny(allocator, .{ .call = .{ .callee = callee, .args = args } });
+}
+
+// =============================================================================
+// Form binding-form lowering (step #7c)
+// =============================================================================
+//
+// `let*`, `fn*`, `letfn*`, `loop*`, `recur`. All share the same
+// structural-validation primitives + the implicit-do helper
+// (per peer-AI turn 53 §Q4 — multi-form bodies synthesize
+// Tiny.do_).
+//
+// LowerEnv must mirror lexical visibility for intrinsic
+// shadowing (peer-AI turn 53 §"Critical trap"). Each binding
+// form constructs a child env that adds its bound names, then
+// passes it through body lowering.
+
+/// Lower a sequence of body forms into a single Tiny expression.
+/// Multi-form bodies wrap in `Tiny.do_`; single-form bodies pass
+/// through; empty body forms raise `MalformedForm` (caller's
+/// responsibility — `(do)` is fine because it goes through
+/// lowerDo directly, not this helper).
+fn lowerBody(
+    allocator: std.mem.Allocator,
+    body_items: []const *reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    if (body_items.len == 0) return CompileError.MalformedForm;
+    if (body_items.len == 1) return try lowerFormEnv(allocator, body_items[0], env);
+    const exprs = try allocator.alloc(*const Tiny, body_items.len);
+    for (body_items, 0..) |item, i| {
+        exprs[i] = try lowerFormEnv(allocator, item, env);
+    }
+    return try allocTiny(allocator, .{ .do_ = exprs });
+}
+
+/// Helper: assert a Form is an unqualified symbol and return its
+/// name. Used for binding names, param names, def names.
+fn expectUnqualifiedSymbol(form: *const reader_mod.Form) CompileError![]const u8 {
+    return switch (form.datum) {
+        .symbol => |name| blk: {
+            if (name.ns != null) return CompileError.ExpectedSymbol;
+            break :blk name.name;
+        },
+        else => CompileError.ExpectedSymbol,
+    };
+}
+
+/// Helper: assert a Form is a vector and return its items.
+fn expectVector(form: *const reader_mod.Form) CompileError![]const *reader_mod.Form {
+    return switch (form.datum) {
+        .vector => |items| items,
+        else => CompileError.ExpectedVector,
+    };
+}
+
+/// Parsed param vector for `fn*`/`defn`: split fixed params from
+/// optional `& rest` per peer-AI turn 53 §Q3.
+const ParsedParams = struct {
+    params: []const []const u8,
+    rest_param: ?[]const u8,
+};
+
+fn parseParams(
+    allocator: std.mem.Allocator,
+    param_vector_items: []const *reader_mod.Form,
+) CompileError!ParsedParams {
+    // Scan for the `&` separator. Validation:
+    //   - at most one `&`
+    //   - `&` followed by exactly one symbol
+    //   - no symbols after the rest param
+    var amp_pos: ?usize = null;
+    for (param_vector_items, 0..) |item, i| {
+        if (item.datum == .symbol and
+            item.datum.symbol.ns == null and
+            std.mem.eql(u8, item.datum.symbol.name, "&"))
+        {
+            if (amp_pos != null) return CompileError.MalformedForm;
+            amp_pos = i;
+        }
+    }
+    if (amp_pos) |pos| {
+        // `& rest` form. Expect exactly `pos + 2` items
+        // (the `&` itself + one rest symbol).
+        if (pos + 2 != param_vector_items.len) return CompileError.MalformedForm;
+        const rest_name = try expectUnqualifiedSymbol(param_vector_items[pos + 1]);
+        const params = try allocator.alloc([]const u8, pos);
+        for (param_vector_items[0..pos], 0..) |item, i| {
+            params[i] = try expectUnqualifiedSymbol(item);
+        }
+        return .{ .params = params, .rest_param = rest_name };
+    }
+    // No rest. Each item is a fixed param symbol.
+    const params = try allocator.alloc([]const u8, param_vector_items.len);
+    for (param_vector_items, 0..) |item, i| {
+        params[i] = try expectUnqualifiedSymbol(item);
+    }
+    return .{ .params = params, .rest_param = null };
+}
+
+/// `(let* [name1 expr1 name2 expr2 ...] body...)`. Sequential
+/// binding semantics per Tiny.let_star: binding-i's RHS sees
+/// bindings 1..i-1 in scope (LowerEnv); body sees all bindings.
+fn lowerLetStar(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    if (args.len < 2) return CompileError.MalformedForm;
+    const binding_vec = try expectVector(args[0]);
+    if (binding_vec.len % 2 != 0) return CompileError.MalformedForm;
+    const n_bindings = binding_vec.len / 2;
+    const bindings = try allocator.alloc(Binding, n_bindings);
+
+    // Sequential env extension (peer-AI turn 53): each RHS sees
+    // prior bindings only. We allocate one child env and grow its
+    // name set as we go.
+    var local = LowerEnv{ .parent = env };
+    defer local.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < n_bindings) : (i += 1) {
+        const name = try expectUnqualifiedSymbol(binding_vec[i * 2]);
+        const value = try lowerFormEnv(allocator, binding_vec[i * 2 + 1], &local);
+        bindings[i] = .{ .name = name, .value = value };
+        try local.lexical_names.put(allocator, name);
+    }
+
+    const body = try lowerBody(allocator, args[1..], &local);
+    return try allocTiny(allocator, .{ .let_star = .{ .bindings = bindings, .body = body } });
+}
+
+/// `(loop* [name1 expr1 ...] body...)`. Same shape as let*.
+fn lowerLoopStar(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    if (args.len < 2) return CompileError.MalformedForm;
+    const binding_vec = try expectVector(args[0]);
+    if (binding_vec.len % 2 != 0) return CompileError.MalformedForm;
+    const n_bindings = binding_vec.len / 2;
+    const bindings = try allocator.alloc(Binding, n_bindings);
+
+    var local = LowerEnv{ .parent = env };
+    defer local.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < n_bindings) : (i += 1) {
+        const name = try expectUnqualifiedSymbol(binding_vec[i * 2]);
+        const value = try lowerFormEnv(allocator, binding_vec[i * 2 + 1], &local);
+        bindings[i] = .{ .name = name, .value = value };
+        try local.lexical_names.put(allocator, name);
+    }
+
+    const body = try lowerBody(allocator, args[1..], &local);
+    return try allocTiny(allocator, .{ .loop_star = .{ .bindings = bindings, .body = body } });
+}
+
+/// `(recur args...)`. No binding form; just lowers args and
+/// wraps in `Tiny.recur`. Backend handles tail-position
+/// validation + arity match against the active RecurTarget.
+fn lowerRecur(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    const recur_args = try allocator.alloc(*const Tiny, args.len);
+    for (args, 0..) |item, i| {
+        recur_args[i] = try lowerFormEnv(allocator, item, env);
+    }
+    return try allocTiny(allocator, .{ .recur = .{ .args = recur_args } });
+}
+
+/// `(fn* name? [params... & rest?] body...)`. Optional self-name
+/// detected by checking whether the FIRST arg after `fn*` is a
+/// symbol (vs the param vector).
+fn lowerFnStar(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    if (args.len < 2) return CompileError.MalformedForm;
+    // Optional self-name: first arg is a symbol (and we have
+    // at least 3 args total: name, params, body...).
+    var pos: usize = 0;
+    var self_name: ?[]const u8 = null;
+    if (args[0].datum == .symbol and args.len >= 3) {
+        self_name = try expectUnqualifiedSymbol(args[0]);
+        pos = 1;
+    }
+    const param_vec = try expectVector(args[pos]);
+    const parsed = try parseParams(allocator, param_vec);
+
+    // Body env: outer env + params + rest + self-name (per
+    // peer-AI turn 53 §"fn*"). Each name is added so an inner
+    // intrinsic-name reference is correctly shadowed.
+    var body_env = LowerEnv{ .parent = env };
+    defer body_env.deinit(allocator);
+    for (parsed.params) |p| try body_env.lexical_names.put(allocator, p);
+    if (parsed.rest_param) |rp| try body_env.lexical_names.put(allocator, rp);
+    if (self_name) |n| try body_env.lexical_names.put(allocator, n);
+
+    const body = try lowerBody(allocator, args[pos + 1 ..], &body_env);
+    return try allocTiny(allocator, .{ .fn_star = .{
+        .name = self_name,
+        .params = parsed.params,
+        .rest_param = parsed.rest_param,
+        .body = body,
+    } });
+}
+
+/// `(letfn* [(name [params] body...) ...] body...)`. Each
+/// binding entry is itself a list of (name param-vector body...).
+/// All binding names are mutually visible across all fn bodies
+/// AND across the letfn body.
+fn lowerLetFnStar(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    env: ?*const LowerEnv,
+) CompileError!*Tiny {
+    if (args.len < 2) return CompileError.MalformedForm;
+    const binding_vec = try expectVector(args[0]);
+    const bindings = try allocator.alloc(FnBinding, binding_vec.len);
+
+    // Step 1: extract all binding names into a shared env BEFORE
+    // lowering any fn body (mutual visibility per Tiny semantics).
+    var local = LowerEnv{ .parent = env };
+    defer local.deinit(allocator);
+    for (binding_vec, 0..) |entry, i| {
+        const entry_items = switch (entry.datum) {
+            .list => |items| items,
+            else => return CompileError.MalformedForm,
+        };
+        if (entry_items.len < 3) return CompileError.MalformedForm;
+        const name = try expectUnqualifiedSymbol(entry_items[0]);
+        const param_vec = try expectVector(entry_items[1]);
+        const parsed = try parseParams(allocator, param_vec);
+        // letfn* per FnBinding shape doesn't support rest_param
+        // (the existing Tiny.letfn_star.FnBinding has no
+        // rest_param field). Reject for now.
+        if (parsed.rest_param != null) return CompileError.UnsupportedFeature;
+        bindings[i] = .{
+            .name = name,
+            .params = parsed.params,
+            .body = undefined, // patched in step 2 below
+        };
+        try local.lexical_names.put(allocator, name);
+    }
+
+    // Step 2: lower each fn body with local env (includes all
+    // letfn names) + that fn's params.
+    for (binding_vec, 0..) |entry, i| {
+        const entry_items = entry.datum.list;
+        var body_env = LowerEnv{ .parent = &local };
+        defer body_env.deinit(allocator);
+        for (bindings[i].params) |p| try body_env.lexical_names.put(allocator, p);
+        bindings[i].body = try lowerBody(allocator, entry_items[2..], &body_env);
+    }
+
+    // Step 3: lower letfn body with local env.
+    const body = try lowerBody(allocator, args[1..], &local);
+    return try allocTiny(allocator, .{ .letfn_star = .{ .bindings = bindings, .body = body } });
 }
 
 /// Compile a `reader.Form` tree into a `Compiled` artifact, no
@@ -5312,6 +5579,155 @@ test "compile #7b: ordinary call ((symbol-bound-as-fn 5)) via namespace" {
         CompileError.UnresolvedSymbol,
         compileSource(arena.allocator(), "(inc 5)"),
     );
+}
+
+// ---- step #7c: binding forms via Form (let*/fn*/letfn*/loop*/recur) ----
+
+test "compile #7c: (let* [x 5] x) → 5" {
+    try expectSourceFixnum("(let* [x 5] x)", 5);
+}
+
+test "compile #7c: (let* [x 1 y 2] (+ x y)) → 3" {
+    try expectSourceFixnum("(let* [x 1 y 2] (+ x y))", 3);
+}
+
+test "compile #7c: (let* [x 5 y x] y) → 5 — sequential RHS sees prior" {
+    try expectSourceFixnum("(let* [x 5 y x] y)", 5);
+}
+
+test "compile #7c: nested let — inner shadows outer" {
+    try expectSourceFixnum("(let* [x 1] (let* [x 99] x))", 99);
+}
+
+test "compile #7c: (let* [] 42) → 42 — empty binding vector" {
+    try expectSourceFixnum("(let* [] 42)", 42);
+}
+
+test "compile #7c: let* multi-form body (implicit do) — (let* [x 1] x x x) → 1" {
+    // Body is treated as (do x x x); last form is the result.
+    try expectSourceFixnum("(let* [x 1] 99 88 x)", 1);
+}
+
+test "compile #7c: ((fn* [x] (+ x 1)) 5) → 6" {
+    try expectSourceFixnum("((fn* [x] (+ x 1)) 5)", 6);
+}
+
+test "compile #7c: ((fn* [] 42)) → 42 — nullary fn" {
+    try expectSourceFixnum("((fn* [] 42))", 42);
+}
+
+test "compile #7c: ((fn* [x y] (+ x y)) 3 4) → 7" {
+    try expectSourceFixnum("((fn* [x y] (+ x y)) 3 4)", 7);
+}
+
+test "compile #7c: closure captures outer let binding" {
+    try expectSourceFixnum("(let* [x 10] ((fn* [y] (+ x y)) 5))", 15);
+}
+
+test "compile #7c: named fn* — ((fn* foo [n] (if (< n 3) (recur (+ n 1)) n)) 0) → 3" {
+    try expectSourceFixnum("((fn* foo [n] (if (< n 3) (recur (+ n 1)) n)) 0)", 3);
+}
+
+test "compile #7c: (loop* [i 0] (if (< i 5) (recur (+ i 1)) i)) → 5" {
+    try expectSourceFixnum("(loop* [i 0] (if (< i 5) (recur (+ i 1)) i))", 5);
+}
+
+test "compile #7c: (loop* [i 0 acc 0] (if (< i 10) (recur (+ i 1) (+ acc i)) acc)) → 45" {
+    try expectSourceFixnum("(loop* [i 0 acc 0] (if (< i 10) (recur (+ i 1) (+ acc i)) acc))", 45);
+}
+
+test "compile #7c: (letfn* [(f [] 42)] (f)) → 42" {
+    try expectSourceFixnum("(letfn* [(f [] 42)] (f))", 42);
+}
+
+test "compile #7c: (letfn* [(f [] (g)) (g [] 99)] (f)) → 99 — forward ref via letfn*" {
+    try expectSourceFixnum("(letfn* [(f [] (g)) (g [] 99)] (f))", 99);
+}
+
+// -- INTRINSIC SHADOWING (the big peer-AI turn 53 trap) --
+
+test "compile #7c: (let* [+ (fn* [a b] 42)] (+ 1 2)) → 42 — lexical shadow defeats inline" {
+    // The LowerEnv must mark `+` as bound inside the let* body
+    // so the dispatcher falls through to ordinary call rather
+    // than emitting Tiny.add. Result: 42 (the fn returns 42),
+    // not 3 (Tiny.add of 1 and 2).
+    try expectSourceFixnum("(let* [+ (fn* [a b] 42)] (+ 1 2))", 42);
+}
+
+test "compile #7c: (let* [< (fn* [a b] 999)] (if (< 1 2) 1 0)) → 0 — < shadowed" {
+    // Same idea for <. The fn always returns 999 (truthy), so
+    // `if` takes the then-branch... wait, no — the shadowed `<`
+    // returns 999, which IS truthy. Hmm let me reconsider.
+    // 999 is truthy → if takes then-branch → returns 1.
+    // Without shadowing, `(< 1 2)` would be true → also 1.
+    // So this test doesn't distinguish.
+    //
+    // Better: shadow `<` with a fn that returns FALSE; then
+    // the if takes else-branch (0). With Tiny.lt unshadowed,
+    // (< 1 2) = true → then-branch (1). So distinct results.
+    try expectSourceFixnum("(let* [< (fn* [a b] false)] (if (< 1 2) 1 0))", 0);
+}
+
+test "compile #7c: special form `if` is NOT shadowable" {
+    // (let* [if 1] (if true 2 3)) — `if` in operator position
+    // remains the special form. Result: 2 (then-branch of true).
+    // (If `if` were shadowable, the inner `if` would try to call
+    // the integer 1, which would fail with NotCallable.)
+    try expectSourceFixnum("(let* [if 1] (if true 2 3))", 2);
+}
+
+// -- Variadic params via Form --
+
+test "compile #7c: ((fn* [a & r] a) 1 2 3) → 1 — rest collected but unused" {
+    try expectSourceFixnum("((fn* [a & r] a) 1 2 3)", 1);
+}
+
+test "compile #7c: ((fn* [& r] 42)) → 42 — variadic with no args" {
+    try expectSourceFixnum("((fn* [& r] 42))", 42);
+}
+
+// -- Malformed forms --
+
+test "compile #7c: (let*) → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(let*)"));
+}
+
+test "compile #7c: (let* [x] x) odd binding count → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(let* [x] x)"));
+}
+
+test "compile #7c: (let* (x 1) x) binding spec is list not vector → ExpectedVector" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.ExpectedVector, compileSource(arena.allocator(), "(let* (x 1) x)"));
+}
+
+test "compile #7c: (let* [1 2] body) binding name is int → ExpectedSymbol" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.ExpectedSymbol, compileSource(arena.allocator(), "(let* [1 2] 3)"));
+}
+
+test "compile #7c: (fn* [x &]) trailing & → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(fn* [x &] x)"));
+}
+
+test "compile #7c: (fn* [x & r y] body) extra after rest → MalformedForm" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(fn* [x & r y] x)"));
+}
+
+test "compile #7c: (fn* (x) body) param spec is list not vector → ExpectedVector" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.ExpectedVector, compileSource(arena.allocator(), "(fn* (x) x)"));
 }
 
 test "compile: arena cleanup releases code+consts atomically" {
