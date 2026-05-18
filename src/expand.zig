@@ -1398,7 +1398,17 @@ fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
         .bool_ => |b| value_mod.fromBool(b),
         .int => |n| value_mod.fromFixnum(n) orelse return ExpandError.MalformedMacroCall,
         .symbol => |name| blk: {
-            if (name.ns != null) return ExpandError.MalformedMacroCall;
+            // Phase 4.0b: qualified symbols intern the full
+            // `ns/name` string; valueToForm splits it back into
+            // ns + name on the way out. Required for macros that
+            // receive a body containing qualified calls (e.g.,
+            // `(with-tx [tx conn] (db/put! tx ref v))`).
+            if (name.ns) |ns_prefix| {
+                const full = std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ns_prefix, name.name }) catch return ExpandError.OutOfMemory;
+                defer ctx.allocator.free(full);
+                const id = ctx.interner.internSymbol(full) catch return ExpandError.OutOfMemory;
+                break :blk value_mod.fromSymbolId(id);
+            }
             const id = ctx.interner.internSymbol(name.name) catch return ExpandError.OutOfMemory;
             break :blk value_mod.fromSymbolId(id);
         },
@@ -1489,10 +1499,26 @@ fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSp
         },
         .symbol => blk: {
             const id: u32 = @intCast(v.payload);
-            const name = ctx.interner.symbolName(id);
-            // Owned-by-interner name is stable for the
-            // compilation unit; safe to borrow into the Form.
-            break :blk try makeSymbol(ctx, name, origin);
+            const full_name = ctx.interner.symbolName(id);
+            // Phase 4.0b: split on first `/` to recover ns/name
+            // for qualified symbols round-tripped through the
+            // interner (the interner stores the full string).
+            const form = try ctx.allocator.create(Form);
+            if (std.mem.indexOfScalar(u8, full_name, '/')) |slash_idx| {
+                form.* = .{
+                    .datum = .{ .symbol = .{
+                        .ns = full_name[0..slash_idx],
+                        .name = full_name[slash_idx + 1 ..],
+                    } },
+                    .origin = origin,
+                };
+            } else {
+                form.* = .{
+                    .datum = .{ .symbol = .{ .ns = null, .name = full_name } },
+                    .origin = origin,
+                };
+            }
+            break :blk form;
         },
         .keyword => blk: {
             const id: u32 = @intCast(v.payload);
@@ -2670,14 +2696,23 @@ fn expandSyntaxQuotePayload(
         // existing Tiny variants — no quote wrap needed.
         .nil, .bool_, .int, .real, .char, .string, .keyword => mutCast(payload),
         // Symbol → (quote sym) — unless ends with `#`, then
-        // gensym lookup.
+        // gensym lookup. Qualified symbols (`ns/name`) preserve
+        // their prefix; auto-gensym applies only to unqualified
+        // symbols (Phase 4.0b: required so `\`(db/begin-write ...)`
+        // works in macros emitted by user code).
         .symbol => |name| blk: {
-            if (name.ns != null) return ExpandError.MalformedMacroCall;
-            const sym_name: []const u8 = if (name.name.len > 1 and name.name[name.name.len - 1] == '#')
-                try scope.lookupOrAllocate(ctx, name.name)
-            else
-                name.name;
-            const sym_form = try makeSymbol(ctx, sym_name, payload.origin);
+            // Build the synthesized symbol form. Qualified
+            // symbols pass through unchanged. Unqualified
+            // symbols ending in `#` are gensym'd.
+            const sym_form = if (name.ns != null)
+                mutCast(payload)
+            else lbl: {
+                const sym_name: []const u8 = if (name.name.len > 1 and name.name[name.name.len - 1] == '#')
+                    try scope.lookupOrAllocate(ctx, name.name)
+                else
+                    name.name;
+                break :lbl try makeSymbol(ctx, sym_name, payload.origin);
+            };
             // Emit (quote <sym>).
             const items = try ctx.allocator.alloc(*Form, 2);
             items[0] = try makeSymbol(ctx, "quote", call_form.origin);

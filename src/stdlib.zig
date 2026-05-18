@@ -85,6 +85,7 @@ pub fn installDb(db_ns: *Namespace) !void {
 }
 
 const db_fns = [_]CoreEntry{
+    // 4.0a connection + ref + auto-ephemeral primitives.
     .{ .name = "open", .descriptor = &native_db_open },
     .{ .name = "close", .descriptor = &native_db_close },
     .{ .name = "ref", .descriptor = &native_db_ref },
@@ -93,6 +94,15 @@ const db_fns = [_]CoreEntry{
     .{ .name = "get-key", .descriptor = &native_db_get_key },
     .{ .name = "delete-key!", .descriptor = &native_db_delete_key },
     .{ .name = "present?", .descriptor = &native_db_present_q },
+    // 4.0b explicit-tx primitives.
+    .{ .name = "begin-write", .descriptor = &native_db_begin_write },
+    .{ .name = "begin-read", .descriptor = &native_db_begin_read },
+    .{ .name = "commit!", .descriptor = &native_db_commit },
+    .{ .name = "abort-write!", .descriptor = &native_db_abort_write },
+    .{ .name = "abort-read!", .descriptor = &native_db_abort_read },
+    .{ .name = "put!", .descriptor = &native_db_put },
+    .{ .name = "get", .descriptor = &native_db_get },
+    .{ .name = "delete!", .descriptor = &native_db_delete },
 };
 
 /// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
@@ -280,6 +290,15 @@ const native_db_put_key = NativeFn{ .name = "db/put-key!", .min_arity = 2, .max_
 const native_db_get_key = NativeFn{ .name = "db/get-key", .min_arity = 1, .max_arity = 2, .call = &fnDbGetKey };
 const native_db_delete_key = NativeFn{ .name = "db/delete-key!", .min_arity = 1, .max_arity = 1, .call = &fnDbDeleteKey };
 const native_db_present_q = NativeFn{ .name = "db/present?", .min_arity = 1, .max_arity = 1, .call = &fnDbPresentQ };
+// Phase 4.0b explicit tx primitives.
+const native_db_begin_write = NativeFn{ .name = "db/begin-write", .min_arity = 1, .max_arity = 1, .call = &fnDbBeginWrite };
+const native_db_begin_read = NativeFn{ .name = "db/begin-read", .min_arity = 1, .max_arity = 1, .call = &fnDbBeginRead };
+const native_db_commit = NativeFn{ .name = "db/commit!", .min_arity = 1, .max_arity = 1, .call = &fnDbCommit };
+const native_db_abort_write = NativeFn{ .name = "db/abort-write!", .min_arity = 1, .max_arity = 1, .call = &fnDbAbortWrite };
+const native_db_abort_read = NativeFn{ .name = "db/abort-read!", .min_arity = 1, .max_arity = 1, .call = &fnDbAbortRead };
+const native_db_put = NativeFn{ .name = "db/put!", .min_arity = 3, .max_arity = 3, .call = &fnDbPut };
+const native_db_get = NativeFn{ .name = "db/get", .min_arity = 2, .max_arity = 3, .call = &fnDbGet };
+const native_db_delete = NativeFn{ .name = "db/delete!", .min_arity = 2, .max_arity = 2, .call = &fnDbDelete };
 
 // =============================================================================
 // Implementations
@@ -1136,6 +1155,151 @@ fn fnDbPresentQ(_: *VM, args: []const Value) VmError!Value {
     const key = db_mod.refKeyBytes(r);
     const result = db_mod.get(&txn, tree, key, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.DbError;
     return value_mod.fromBool(result != null);
+}
+
+// =============================================================================
+// db explicit-tx primitives (Phase 4.0b)
+// =============================================================================
+//
+// Per peer-AI turn 72: PATH B (explicit tx threading). The
+// `with-tx` / `with-read-tx` macros (in core.nx) generate
+// `(let [tx (db/begin-write conn)] (try ...body... (catch any e (db/abort-write! tx) (throw e))))`
+// with commit at the end of the body.
+//
+// Single-owner enforcement: each TxnHandle struct carries an
+// `active` flag. commit/abort sets it to false; subsequent ops
+// detect this and raise `:tx-closed`. Prevents double-commit and
+// use-after-finalize.
+//
+// Lifetime: TxnHandle structs live on `vm.runtime_arena` (small
+// allocations, short-lived; arena reclaims at VM teardown). The
+// underlying emdb txn handle is freed by commit/abort.
+//
+// Connection mismatch: `db/put!` etc. validate that the supplied
+// ref belongs to the same connection the tx is open against.
+// db.zig's putRef/getRef/delRef do this via `assertRefMatchesConn`.
+
+pub const WriteTxnHandle = struct {
+    txn: db_mod.WriteTxn,
+    active: bool,
+};
+
+pub const ReadTxnHandle = struct {
+    txn: db_mod.ReadTxn,
+    active: bool,
+};
+
+fn writeTxnHandle(v: Value) ?*WriteTxnHandle {
+    if (v.kind() != .db_write_txn) return null;
+    return @ptrFromInt(v.payload);
+}
+
+fn readTxnHandle(v: Value) ?*ReadTxnHandle {
+    if (v.kind() != .db_read_txn) return null;
+    return @ptrFromInt(v.payload);
+}
+
+fn fnDbBeginWrite(vm: *VM, args: []const Value) VmError!Value {
+    const conn_v = args[0];
+    if (conn_v.kind() != .db_connection) return VmError.KindMismatch;
+    const conn: *db_mod.Connection = @ptrFromInt(conn_v.payload);
+    if (!conn.open_flag) return VmError.DbClosed;
+    const handle = vm.runtime_arena.allocator().create(WriteTxnHandle) catch return VmError.OutOfMemory;
+    handle.* = .{
+        .txn = db_mod.beginWrite(conn) catch return VmError.DbError,
+        .active = true,
+    };
+    return value_mod.Value{
+        .tag = @intFromEnum(value_mod.Kind.db_write_txn),
+        .payload = @intFromPtr(handle),
+    };
+}
+
+fn fnDbBeginRead(vm: *VM, args: []const Value) VmError!Value {
+    const conn_v = args[0];
+    if (conn_v.kind() != .db_connection) return VmError.KindMismatch;
+    const conn: *db_mod.Connection = @ptrFromInt(conn_v.payload);
+    if (!conn.open_flag) return VmError.DbClosed;
+    const handle = vm.runtime_arena.allocator().create(ReadTxnHandle) catch return VmError.OutOfMemory;
+    handle.* = .{
+        .txn = db_mod.beginRead(conn) catch return VmError.DbError,
+        .active = true,
+    };
+    return value_mod.Value{
+        .tag = @intFromEnum(value_mod.Kind.db_read_txn),
+        .payload = @intFromPtr(handle),
+    };
+}
+
+fn fnDbCommit(_: *VM, args: []const Value) VmError!Value {
+    const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
+    if (!h.active) return VmError.TxClosed;
+    db_mod.commit(&h.txn) catch {
+        h.active = false;
+        return VmError.DbError;
+    };
+    h.active = false;
+    return value_mod.nilValue();
+}
+
+fn fnDbAbortWrite(_: *VM, args: []const Value) VmError!Value {
+    const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
+    if (!h.active) return value_mod.nilValue(); // idempotent abort
+    db_mod.abortWrite(&h.txn);
+    h.active = false;
+    return value_mod.nilValue();
+}
+
+fn fnDbAbortRead(_: *VM, args: []const Value) VmError!Value {
+    const h = readTxnHandle(args[0]) orelse return VmError.KindMismatch;
+    if (!h.active) return value_mod.nilValue();
+    db_mod.abortRead(&h.txn);
+    h.active = false;
+    return value_mod.nilValue();
+}
+
+/// `(db/put! tx ref value)` — write through an active tx.
+fn fnDbPut(_: *VM, args: []const Value) VmError!Value {
+    const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
+    if (!h.active) return VmError.TxClosed;
+    const r = args[1];
+    const v = args[2];
+    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
+    db_mod.putRef(&h.txn, r, v) catch return VmError.CodecFailed;
+    return value_mod.nilValue();
+}
+
+/// `(db/get tx ref)` or `(db/get tx ref default)` — read through
+/// either a write or read tx. Returns `default` (nil if omitted)
+/// for missing keys.
+fn fnDbGet(_: *VM, args: []const Value) VmError!Value {
+    const tx_v = args[0];
+    const r = args[1];
+    const default = if (args.len > 2) args[2] else value_mod.nilValue();
+    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
+    const result: ?Value = switch (tx_v.kind()) {
+        .db_write_txn => blk: {
+            const h = writeTxnHandle(tx_v).?;
+            if (!h.active) return VmError.TxClosed;
+            break :blk db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.CodecFailed;
+        },
+        .db_read_txn => blk: {
+            const h = readTxnHandle(tx_v).?;
+            if (!h.active) return VmError.TxClosed;
+            break :blk db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.CodecFailed;
+        },
+        else => return VmError.KindMismatch,
+    };
+    return result orelse default;
+}
+
+fn fnDbDelete(_: *VM, args: []const Value) VmError!Value {
+    const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
+    if (!h.active) return VmError.TxClosed;
+    const r = args[1];
+    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
+    const existed = db_mod.delRef(&h.txn, r) catch return VmError.DbError;
+    return value_mod.fromBool(existed);
 }
 
 // =============================================================================

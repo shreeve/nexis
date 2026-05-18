@@ -1080,6 +1080,9 @@ pub const VmError = error{
     /// value, corrupt bytes, version mismatch). Mapped to
     /// `:codec-failed`.
     CodecFailed,
+    /// Phase 4.0b: tx op attempted on a transaction that was
+    /// already committed or aborted. Mapped to `:tx-closed`.
+    TxClosed,
     /// Phase 3.3b (peer-AI turn 68): INTERNAL control-flow
     /// signal. NOT user-visible, NOT catchable. Raised when a
     /// throw propagated past a `VM.callValue` synthetic frame
@@ -3118,6 +3121,7 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.DbClosed => "db-closed",
         VmError.InvalidDurableRef => "invalid-durable-ref",
         VmError.CodecFailed => "codec-failed",
+        VmError.TxClosed => "tx-closed",
         // Unrecoverable: bytecode corruption / VM-internal /
         // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,

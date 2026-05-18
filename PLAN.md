@@ -2020,10 +2020,15 @@ transaction threading). No ambient tx via dynamic Var in v1.
       / `db/present?` / `db/ref?` as native fns installed in a
       `db` namespace. VM safety-net tracks open connections.
       Cross-process persistence verified.
-- [ ] **Phase 4.0b** Explicit `with-tx` / `with-read-tx` macros
-      + WriteTxn / ReadTxn Value kinds + `db/put!`/`db/get`/
-      `db/delete!` (tx-threaded). Try/finally-safe commit/abort.
-      Tx single-owner enforcement.
+- [x] **Phase 4.0b** Explicit `(with-tx ...)` / `(with-read-tx ...)`
+      macros (in `stdlib/core.nx`) + `Kind.db_write_txn` /
+      `Kind.db_read_txn` + `db/begin-write` / `db/begin-read` /
+      `db/commit!` / `db/abort-write!` / `db/abort-read!` /
+      `db/put!` / `db/get` / `db/delete!` native fns.
+      Single-owner enforcement via `active: bool` flag on the
+      handle. Try/catch-safe rollback verified end-to-end:
+      exceptions inside `with-tx` abort and rethrow.
+      Per peer-AI turn 72 §Q1 PATH B (explicit threading).
 - [ ] **Phase 4.0c** `@deref` operator dispatch on `.durable_ref`
       (ephemeral read) + `db/alter!` (read-modify-write inside tx).
 - [ ] **Phase 4.0d** Cursors + `db/scan` (eager v1) + `db/reduce-tree`.

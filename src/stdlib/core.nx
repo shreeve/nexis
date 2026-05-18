@@ -96,3 +96,35 @@
          (do ~@body
              (recur (inc ~(first binding))))
          nil))))
+
+; ============================================================
+; Phase 4.0b — durable transaction macros
+; ============================================================
+;
+; `(with-tx [tx conn] body...)` opens a write transaction,
+; runs body, commits on normal exit, aborts on exception
+; (rethrows the exception). Returns body's result.
+;
+; `(with-read-tx [tx conn] body...)` opens a read snapshot,
+; runs body, aborts on exit (reads never commit). Returns
+; body's result.
+
+(defmacro with-tx [binding & body]
+  `(let* [~(first binding) (db/begin-write ~(first (rest binding)))]
+     (try
+       (let* [r# (do ~@body)]
+         (db/commit! ~(first binding))
+         r#)
+       (catch any e#
+         (db/abort-write! ~(first binding))
+         (throw e#)))))
+
+(defmacro with-read-tx [binding & body]
+  `(let* [~(first binding) (db/begin-read ~(first (rest binding)))]
+     (try
+       (let* [r# (do ~@body)]
+         (db/abort-read! ~(first binding))
+         r#)
+       (catch any e#
+         (db/abort-read! ~(first binding))
+         (throw e#)))))

@@ -4,9 +4,9 @@
 ; values, not a library bolted on top. Backed by emdb (LMDB-class
 ; B+ tree, MVCC, zero-copy reads).
 ;
-; This example uses v1.alpha auto-ephemeral transaction APIs.
-; Real `(with-tx ...)` + `db/put!`/`db/alter!` with explicit tx
-; threading lands in Phase 4.0b.
+; This example uses both APIs:
+;   - v1.alpha auto-ephemeral: db/put-key! / db/get-key
+;   - Phase 4.0b explicit-tx: with-tx + db/put! / db/get
 
 ; Open (or create) a connection to a database file.
 ; v1.alpha accepts the path as a keyword (its interned name = path).
@@ -38,8 +38,33 @@
 
 (db/get-key history-key)
 
+; Phase 4.0b: explicit transactions via `with-tx` / `with-read-tx`.
+; Multi-write atomicity: the body either fully commits OR fully
+; aborts. An exception inside the body aborts; the read after
+; sees the pre-tx state.
+(def bob (db/ref conn :users :bob))
+(with-tx [tx conn]
+  (db/put! tx alice {:age 31 :note :updated-via-with-tx})
+  (db/put! tx bob {:age 25}))
+
+(with-read-tx [t conn]
+  [:alice (db/get t alice)
+   :bob (db/get t bob)])
+
+; Throwing inside `with-tx` rolls back.
+(def rolled-back
+  (try
+    (with-tx [tx conn]
+      (db/put! tx alice {:age 999 :note :should-not-persist})
+      (throw :oops))
+    (catch any e [:caught e])))
+
+; alice still has the {:age 31 ...} from the successful tx.
+(def after-rollback (db/get-key alice))
+
 ; Delete + close.
 (db/delete-key! alice)
+(db/delete-key! bob)
 (db/close conn)
 
-:done
+[:rolled-back rolled-back :after-rollback after-rollback]

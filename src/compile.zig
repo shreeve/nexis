@@ -1441,10 +1441,17 @@ fn lowerQuotePayload(
         .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
         .int => |n| try allocTiny(allocator, .{ .int = n }),
         .symbol => |name| blk: {
-            // Qualified symbols not supported yet (multi-ns is
-            // post-v1).
-            if (name.ns != null) return CompileError.UnsupportedFeature;
+            // Phase 4.0b: qualified symbols intern the full
+            // `ns/name` string; valueToForm splits it back into
+            // ns + name on the way out. This lets macros emit
+            // qualified-symbol literals like `(quote db/begin-write)`.
             const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
+            if (name.ns) |ns_prefix| {
+                const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ns_prefix, name.name });
+                defer allocator.free(full);
+                const v = interner.internSymbolValue(full) catch return CompileError.OutOfMemory;
+                break :blk try allocTiny(allocator, .{ .literal = v });
+            }
             const v = interner.internSymbolValue(name.name) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
@@ -8544,8 +8551,10 @@ test "compile #10.0: legacy compileSourceFullWithMacros API still works (backwar
     try testing.expectError(CompileError.MacroExpansionFailure, result);
 }
 
-test "compile E1: qualified symbol in quote still UnsupportedFeature" {
-    // Even with an Interner, qualified symbols are post-v1.
+test "compile 4.0b: qualified symbol in quote interns full ns/name" {
+    // Phase 4.0b: qualified symbols round-trip through the
+    // interner as the full `ns/name` string. valueToForm splits
+    // them back into ns + name on the way out.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8553,10 +8562,18 @@ test "compile E1: qualified symbol in quote still UnsupportedFeature" {
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
     const interner = v.ensureInterner();
-    try testing.expectError(
-        CompileError.UnsupportedFeature,
-        compileSourceFull(arena.allocator(), "'foo/bar", null, interner),
-    );
+    const compiled = try compileSourceFull(arena.allocator(), "'foo/bar", null, interner);
+    const routine = compiled.toRoutine("test");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    try testing.expectEqual(value_mod.Kind.symbol, result.kind());
+    const id: u32 = @intCast(result.payload);
+    try testing.expectEqualStrings("foo/bar", interner.symbolName(id));
 }
 
 test "compile: arena cleanup releases code+consts atomically" {
