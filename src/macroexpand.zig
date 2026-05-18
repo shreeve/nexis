@@ -205,11 +205,14 @@ fn expandFormDepth(
         // macro host fn could synthesize one.
         .unquote, .unquote_splicing => return MacroexpandError.MalformedMacroCall,
         // ---- Reader macros / metadata. -----------------------
-        // anon_fn `#(...)` will land as a macro expansion in
-        // step #8b (or, more conservatively, as a dedicated
-        // lower-form transform). #8a leaves it opaque so
-        // lowerForm raises UnsupportedFeature consistently.
-        .anon_fn => mutCast(form),
+        // Phase 3.0b (peer-AI turn 62): `#(...)` shorthand
+        // expands here. Reader emits Datum.anon_fn carrying
+        // the body forms; macroexpand scans for `%`, `%N`,
+        // `%&` references, computes arity, and generates the
+        // equivalent `(fn* [params] body...)` form. The
+        // result is recursively re-expanded so macros nested
+        // in the body still fire.
+        .anon_fn => |items| try expandAnonFn(ctx, env, form, items, depth),
         // with_meta is metadata attached to a target form;
         // #8a passes through. Step #10+ may want to expand
         // through the target.
@@ -763,6 +766,178 @@ fn expandTry(
     const out_slice = try ctx.allocator.alloc(*Form, out_items.items.len);
     for (out_items.items, 0..) |item, j| out_slice[j] = item;
     return try makeList(ctx, out_slice, list_form.origin);
+}
+
+/// Phase 3.0b (peer-AI turn 62): expand `#(body...)` shorthand.
+///
+/// Examples:
+///   #(+ % %2)   → (fn* [%1 %2] (+ %1 %2))
+///   #(+ %1 %2)  → same
+///   #(inc %)    → (fn* [%1] (inc %1))
+///   #(apply f %&) → (fn* [& %&] (apply f %&))
+///
+/// Algorithm:
+///   1. Scan body recursively for placeholder symbols:
+///        `%`  → records positional 1
+///        `%N` → records positional N (N >= 1)
+///        `%&` → marks rest used
+///   2. Param count = max positional N found (0 if none).
+///   3. Generate params `[%1 %2 ... %N]` plus `[& %&]` if rest.
+///   4. Rewrite `%` occurrences in body to `%1`.
+///   5. Build `(fn* params body...)`.
+///   6. Reject nested `#()` (Clojure compatibility).
+fn expandAnonFn(
+    ctx: *MacroexpandContext,
+    env: ?*const ExpandEnv,
+    call_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) MacroexpandError!*Form {
+    // First pass: scan to determine arity. Also rejects nested
+    // #() during the walk.
+    var max_positional: u32 = 0;
+    var uses_rest: bool = false;
+    for (items) |it| {
+        try anonScanForm(it, &max_positional, &uses_rest);
+    }
+
+    // Second pass: rewrite `%` → `%1`. The other patterns
+    // (`%1`, `%2`, ..., `%&`) are already valid symbols and
+    // need no rewriting.
+    var rewritten_body: std.ArrayList(*Form) = .empty;
+    defer rewritten_body.deinit(ctx.allocator);
+    try rewritten_body.ensureTotalCapacity(ctx.allocator, items.len);
+    for (items) |it| {
+        try rewritten_body.append(ctx.allocator, try anonRewriteForm(ctx, it));
+    }
+
+    // Build param vector.
+    // Layout: [%1 %2 ... %N] OR [%1 ... %N & %&] when rest.
+    const param_count: usize = max_positional + (if (uses_rest) @as(usize, 2) else 0);
+    var param_items: std.ArrayList(*Form) = .empty;
+    defer param_items.deinit(ctx.allocator);
+    try param_items.ensureTotalCapacity(ctx.allocator, param_count);
+    var i: u32 = 1;
+    while (i <= max_positional) : (i += 1) {
+        // Allocate the name string in the arena so it lives
+        // alongside the synthesized Form.
+        const name = try std.fmt.allocPrint(ctx.allocator, "%{d}", .{i});
+        try param_items.append(ctx.allocator, try makeSymbol(ctx, name, call_form.origin));
+    }
+    if (uses_rest) {
+        try param_items.append(ctx.allocator, try makeSymbol(ctx, "&", call_form.origin));
+        try param_items.append(ctx.allocator, try makeSymbol(ctx, "%&", call_form.origin));
+    }
+    const params_slice = try ctx.allocator.alloc(*Form, param_items.items.len);
+    for (param_items.items, 0..) |p, j| params_slice[j] = p;
+    const params_vec = try makeVector(ctx, params_slice, call_form.origin);
+
+    // Build the body call: `#(+ 1 2)` means the body IS the
+    // single call `(+ 1 2)`. The reader emits the body items
+    // ([+, 1, 2]) as the items of that synthetic call form,
+    // so we wrap them in a list here.
+    const body_call_items = try ctx.allocator.alloc(*Form, rewritten_body.items.len);
+    for (rewritten_body.items, 0..) |b, j| body_call_items[j] = b;
+    const body_call = try makeList(ctx, body_call_items, call_form.origin);
+
+    // Build (fn* params body_call).
+    const out_items = try ctx.allocator.alloc(*Form, 3);
+    out_items[0] = try makeSymbol(ctx, "fn*", call_form.origin);
+    out_items[1] = params_vec;
+    out_items[2] = body_call;
+    const fn_form = try makeList(ctx, out_items, call_form.origin);
+
+    // Recursively re-expand so any macros nested in body fire.
+    return try expandFormDepth(ctx, env, fn_form, depth);
+}
+
+/// Recursively walk a Form looking for anon-fn placeholders.
+/// Errors:
+///   - nested #(...) is rejected (MalformedMacroCall)
+///   - `%N` where N parses as 0 is rejected
+fn anonScanForm(form: *const Form, max_pos: *u32, uses_rest: *bool) MacroexpandError!void {
+    switch (form.datum) {
+        .symbol => |name| {
+            if (name.ns != null) return;
+            try anonClassifySymbol(name.name, max_pos, uses_rest);
+        },
+        .list => |items| for (items) |it| try anonScanForm(it, max_pos, uses_rest),
+        .vector => |items| for (items) |it| try anonScanForm(it, max_pos, uses_rest),
+        // Nested #() rejection.
+        .anon_fn => return MacroexpandError.MalformedMacroCall,
+        // Quote payload is OPAQUE — placeholders inside (quote ...)
+        // are literal data, not body references.
+        .quote, .syntax_quote, .unquote, .unquote_splicing => {},
+        else => {},
+    }
+}
+
+/// Inspect a symbol name for `%`, `%N`, or `%&` patterns and
+/// update the scan state. Anything else (including `%foo`)
+/// is left as an ordinary symbol — Clojure semantics.
+fn anonClassifySymbol(name: []const u8, max_pos: *u32, uses_rest: *bool) MacroexpandError!void {
+    if (name.len == 0 or name[0] != '%') return;
+    if (name.len == 1) {
+        // bare `%` → positional 1
+        if (max_pos.* < 1) max_pos.* = 1;
+        return;
+    }
+    if (name.len == 2 and name[1] == '&') {
+        uses_rest.* = true;
+        return;
+    }
+    // %N where N is a positive integer.
+    var n: u32 = 0;
+    for (name[1..]) |c| {
+        if (c < '0' or c > '9') return; // ordinary symbol like %foo
+        const d: u32 = c - '0';
+        n = n * 10 + d;
+        if (n > 1000) return MacroexpandError.MalformedMacroCall; // sanity bound
+    }
+    if (n == 0) return MacroexpandError.MalformedMacroCall;
+    if (max_pos.* < n) max_pos.* = n;
+}
+
+/// Recursively rewrite `%` symbols to `%1`. Other forms pass
+/// through unchanged. For lists/vectors, we only allocate a
+/// new node when at least one element changed (best-effort
+/// pointer-equality fast path).
+fn anonRewriteForm(ctx: *MacroexpandContext, form: *const Form) MacroexpandError!*Form {
+    return switch (form.datum) {
+        .symbol => |name| blk: {
+            if (name.ns == null and name.name.len == 1 and name.name[0] == '%') {
+                break :blk try makeSymbol(ctx, "%1", form.origin);
+            }
+            break :blk mutCast(form);
+        },
+        .list => |items| try anonRewriteList(ctx, form, items, false),
+        .vector => |items| try anonRewriteList(ctx, form, items, true),
+        // Quote payload preserved literally.
+        .quote, .syntax_quote, .unquote, .unquote_splicing => mutCast(form),
+        else => mutCast(form),
+    };
+}
+
+fn anonRewriteList(
+    ctx: *MacroexpandContext,
+    list_form: *const Form,
+    items: []const *Form,
+    is_vector: bool,
+) MacroexpandError!*Form {
+    var changed = false;
+    var rewritten: std.ArrayList(*Form) = .empty;
+    defer rewritten.deinit(ctx.allocator);
+    try rewritten.ensureTotalCapacity(ctx.allocator, items.len);
+    for (items) |it| {
+        const new_it = try anonRewriteForm(ctx, it);
+        if (new_it != it) changed = true;
+        try rewritten.append(ctx.allocator, new_it);
+    }
+    if (!changed) return mutCast(list_form);
+    const slice = try ctx.allocator.alloc(*Form, rewritten.items.len);
+    for (rewritten.items, 0..) |it, i| slice[i] = it;
+    if (is_vector) return try makeVector(ctx, slice, list_form.origin);
+    return try makeList(ctx, slice, list_form.origin);
 }
 
 /// Helper: is `form` a list whose head is the unqualified

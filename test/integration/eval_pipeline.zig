@@ -430,6 +430,30 @@ test "integration: composite — try with macros" {
     , "42");
 }
 
+// =============================================================================
+// Phase 3.0b — anon-fn #(...) shorthand
+// =============================================================================
+
+test "integration: anon-fn — bare #(+ 1 2)" {
+    try expectOutput("(#(+ 1 2))", "3");
+}
+
+test "integration: anon-fn — % positional 1" {
+    try expectOutput("(#(+ % 1) 41)", "42");
+}
+
+test "integration: anon-fn — %1 %2 explicit" {
+    try expectOutput("(#(+ %1 %2) 10 20)", "30");
+}
+
+test "integration: anon-fn — closure captures outer binding" {
+    try expectOutput("((fn* [x] (#(+ % x) 3)) 10)", "13");
+}
+
+test "integration: anon-fn — macro inside body re-expands" {
+    try expectOutput("(#(when % :yes) :anything)", ":yes");
+}
+
 test "integration: composite — syntax-quote inside defn" {
     try expectOutput(
         \\(do
