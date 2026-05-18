@@ -123,11 +123,16 @@ const Usage =
     \\  exceptions: (try body (catch any e handler) [(finally ...)])
     \\              (throw value)
     \\
+    \\Phase 3.0 surface (also shipped):
+    \\  - `nexis repl` interactive eval
+    \\  - `#(...)` anon-fn shorthand with %, %1..%N, %&
+    \\  - try/catch can now catch recoverable VM errors as
+    \\    keywords: :kind-mismatch, :unbound-var, :arity-mismatch,
+    \\    :not-callable, :integer-overflow
+    \\
     \\Limitations (post-v1):
     \\  - recur-in-try: not supported (wrap try around loop)
-    \\  - runtime VM errors not catchable: KindMismatch etc. halt
-    \\  - #(...) anon-fn shorthand: Phase 3
-    \\  - REPL / module loading / user defmacro: Phase 3+
+    \\  - user defmacro / multi-namespace / stdlib: Phase 3+
     \\
 ;
 

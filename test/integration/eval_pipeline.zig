@@ -431,6 +431,53 @@ test "integration: composite — try with macros" {
 }
 
 // =============================================================================
+// Phase 3.0c — catchable VmErrors
+// =============================================================================
+//
+// Per peer-AI turn 62: recoverable VmError variants are
+// translated into keyword Values when an active handler can
+// catch them. Without a handler, the raw VmError propagates
+// unchanged (backward compat).
+
+test "integration: catchable — KindMismatch caught as :kind-mismatch" {
+    try expectOutput("(try (+ 1 :hello) (catch any e e))", ":kind-mismatch");
+}
+
+test "integration: catchable — UnboundVar caught as :unbound-var" {
+    try expectOutput("(try (+ 1 nope) (catch any e e))", ":unbound-var");
+}
+
+test "integration: catchable — KindMismatch BYPASSES translation when no handler" {
+    // No try wraps this; runtime should raise the raw
+    // VmError so the existing error taxonomy is preserved.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    const compiled = try compile.compileSourceFullWithMacros(
+        arena.allocator(),
+        "(+ 1 :hello)",
+        ns,
+        interner,
+        &host_macros,
+    );
+    const routine = compiled.toRoutine("catchable-no-handler");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    try testing.expectError(vm.VmError.KindMismatch, v.run());
+}
+
+// =============================================================================
 // Phase 3.0b — anon-fn #(...) shorthand
 // =============================================================================
 

@@ -1236,7 +1236,16 @@ pub const VM = struct {
                 break :blk i;
             };
 
-            try self.dispatch(inst);
+            self.dispatch(inst) catch |err| {
+                // Phase 3.0c (peer-AI turn 62 §"Implementation
+                // model"): recoverable VM errors get translated
+                // into user Values and routed through the same
+                // unwind machinery as `ctrl:throw`. If no handler
+                // catches, the throw bubbles back out as
+                // UncaughtThrow (with the keyword payload in
+                // `unhandled_throw`).
+                try self.handleRuntimeError(err);
+            };
         }
         return self.result;
     }
@@ -1263,9 +1272,41 @@ pub const VM = struct {
                 if (i.kind == .extension) return VmError.UnimplementedOpcode;
                 break :blk i;
             };
-            try self.dispatch(inst);
+            self.dispatch(inst) catch |err| try self.handleRuntimeError(err);
         }
         return self.result;
+    }
+
+    /// Phase 3.0c (peer-AI turn 62): runtime error translation
+    /// to a user-throwable Value. Recoverable errors (per VM.md
+    /// §13 "Recoverable via try/catch" column) become keyword
+    /// payloads routed through `unwindThrow`; non-recoverable
+    /// errors (bytecode corruption, OOM, etc.) bubble back out
+    /// unchanged.
+    ///
+    /// Translation: each recoverable VmError maps to a keyword
+    /// like `:kind-mismatch`. Per turn 62: keyword for v1
+    /// (simpler than maps; we don't have rich map literals at
+    /// the throw site yet).
+    ///
+    /// Note: throw machinery via unwindThrow may itself raise
+    /// UncaughtThrow (if no handler catches the translated
+    /// payload). That propagates back to the dispatch caller
+    /// just like a user-level `(throw)`.
+    fn handleRuntimeError(self: *VM, err: VmError) VmError!void {
+        const kw_name = vmErrorToKeywordName(err) orelse return err;
+        // Only translate to a throwable Value if there's an
+        // active handler that could catch it. Otherwise let
+        // the raw VmError propagate — preserves backward
+        // compat with existing tests that assert specific
+        // VmError variants AND matches the principle of
+        // least surprise: programs that don't opt into
+        // try/catch see the original error taxonomy.
+        if (self.findThrowTarget() == null) return err;
+        const interner = self.ensureInterner();
+        const id = interner.internKeyword(kw_name) catch return err;
+        const payload = value_mod.fromKeywordId(id);
+        try self.unwindThrow(payload);
     }
 
     /// Two-level switch dispatcher. Tail-call-threaded upgrade is
@@ -2322,6 +2363,43 @@ pub const VM = struct {
         }
     }
 };
+
+/// Phase 3.0c: stable taxonomy mapping recoverable VmError
+/// variants to user-visible keyword names. Per VM.md §13
+/// "Recoverable via try/catch" column + peer-AI turn 62
+/// recoverable-list.
+///
+/// Returns null for unrecoverable errors — bytecode
+/// corruption, OOM, handler-state malformation, etc. Those
+/// propagate to the caller unchanged.
+fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
+    return switch (err) {
+        // Recoverable per VM.md §13.
+        VmError.KindMismatch => "kind-mismatch",
+        VmError.ArityMismatch => "arity-mismatch",
+        VmError.NotCallable => "not-callable",
+        VmError.UnboundVar => "unbound-var",
+        VmError.IntegerOverflow => "integer-overflow",
+        // Unrecoverable: bytecode corruption / VM-internal /
+        // OOM / already-a-user-throw / unimplemented.
+        VmError.UncaughtThrow,
+        VmError.BytecodeCorruption,
+        VmError.BytecodeExhausted,
+        VmError.UnimplementedOpcode,
+        VmError.OperandOutOfRange,
+        VmError.InvalidOperandKind,
+        VmError.OutOfMemory,
+        VmError.CaptureCountMismatch,
+        VmError.UpvalueOutOfRange,
+        VmError.ExpectedCell,
+        VmError.InvalidCellState,
+        VmError.UninitializedCell,
+        VmError.CallBlockOutOfRange,
+        VmError.InvalidHandlerState,
+        VmError.Halt,
+        => null,
+    };
+}
 
 /// Numeric addition for the math:add opcode. Step #2 supports
 /// only fixnum+fixnum; widening lands in subsequent commits.
