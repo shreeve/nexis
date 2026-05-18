@@ -1,0 +1,98 @@
+; src/stdlib/core.nx
+;
+; Phase 3.3d composite stdlib written in nexis itself,
+; embedded via @embedFile and bootstrapped at VM startup
+; AFTER native fns are installed.
+;
+; This is the "stage 2" layer per CLOJURE-REVIEW.md §1.1 —
+; user-facing macros + fns built atop the primitive substrate.
+; Each def/defn/defmacro here lands in the user's namespace and
+; is callable from REPL + source files.
+;
+; Constraints:
+;   - Only uses primitives installed by stdlib.installCore
+;     (sequence/HOF/arithmetic/collection groups from 3.3a/b/c).
+;   - No multi-arity defn yet (Phase 3.5).
+;   - No destructuring yet (Phase 3.5).
+;   - Single-argument macros only for v1 simplicity.
+
+; ============================================================
+; Simple predicates + accessors
+; ============================================================
+
+(defn true?  [x] (= x true))
+(defn false? [x] (= x false))
+
+; second / nthrest / last — basic seq access.
+(defn second [s] (first (rest s)))
+(defn third  [s] (first (rest (rest s))))
+
+(defn last [s]
+  ; Walk by reducing; the reduce fn keeps only the latest x.
+  (reduce (fn* [_ x] x) nil s))
+
+; ============================================================
+; Sequence transforms
+; ============================================================
+
+(defn reverse [s]
+  ; reduce + cons builds the list in reverse order naturally.
+  (reduce (fn* [acc x] (cons x acc)) (list) s))
+
+(defn range [n]
+  ; (range 5) => (0 1 2 3 4). Builds a cons list back-to-front.
+  (loop* [i n acc (list)]
+    (if (< 0 i)
+      (recur (dec i) (cons (dec i) acc))
+      acc)))
+
+(defn take [n s]
+  ; Return up to n elements of s as a list.
+  (loop* [i 0 rem s acc (list)]
+    (if (< i n)
+      (if (empty? rem)
+        (reverse acc)
+        (recur (inc i) (rest rem) (cons (first rem) acc)))
+      (reverse acc))))
+
+(defn drop [n s]
+  ; Return s after dropping up to n elements.
+  (loop* [i 0 rem s]
+    (if (< i n)
+      (if (empty? rem)
+        rem
+        (recur (inc i) (rest rem)))
+      rem)))
+
+; ============================================================
+; Conditional macros
+; ============================================================
+
+; (when-let [name val-expr] body...)
+;   evaluates val-expr; if truthy, binds it to name and runs
+;   body, returning its last value. Else nil.
+(defmacro when-let [binding & body]
+  `(let* [bound# ~(first (rest binding))]
+     (if bound#
+       (let* [~(first binding) bound#]
+         (do ~@body))
+       nil)))
+
+; (if-let [name val-expr] then else)
+;   like when-let but with explicit else branch.
+(defmacro if-let [binding then else]
+  `(let* [bound# ~(first (rest binding))]
+     (if bound#
+       (let* [~(first binding) bound#] ~then)
+       ~else)))
+
+; (dotimes [name n-expr] body...)
+;   runs body n times with name bound to 0..n-1.
+;   Returns nil.
+(defmacro dotimes [binding & body]
+  `(let* [limit# ~(first (rest binding))]
+     (loop* [~(first binding) 0]
+       (if (< ~(first binding) limit#)
+         (do ~@body
+             (recur (inc ~(first binding))))
+         nil))))

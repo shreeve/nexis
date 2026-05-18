@@ -68,6 +68,17 @@ pub fn installCore(ns: *Namespace) !void {
     }
 }
 
+/// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
+/// layer written in nexis itself, embedded at compile time.
+/// CLI / test harnesses compile + evaluate this AFTER calling
+/// `installCore` so the composite definitions can use the
+/// native primitives.
+///
+/// Lives in `src/stdlib/core.nx`. Add new macros/fns there,
+/// not here — keeping the composite layer in nexis source
+/// matches CLOJURE-REVIEW.md §1.1 two-stage bootstrap.
+pub const CORE_NX_SOURCE: []const u8 = @embedFile("stdlib/core.nx");
+
 const CoreEntry = struct {
     name: []const u8,
     descriptor: *const NativeFn,

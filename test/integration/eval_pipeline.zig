@@ -118,6 +118,45 @@ fn formatValue(buf: *std.array_list.Managed(u8), v: value_mod.Value, interner: *
     }
 }
 
+/// Phase 3.3d: compile + run the embedded core.nx layer
+/// against `v` so test programs can use composite definitions
+/// (second, last, reverse, range, take, drop, when-let,
+/// if-let, dotimes). Uses the VM's runtime arena as the
+/// compile arena so closures + routines outlive bootstrap.
+fn bootstrapCoreForTest(
+    v: *vm.VM,
+    ns: *vm.Namespace,
+    interner: *intern_mod.Interner,
+    host_macros: *const expand_mod.HostMacroTable,
+) !void {
+    var parse_result = try reader_mod.parser.parseProgram(testing.allocator, stdlib.CORE_NX_SOURCE);
+    defer parse_result.parser.deinit();
+    var rdr = reader_mod.Reader.init(testing.allocator, stdlib.CORE_NX_SOURCE);
+    defer rdr.deinit();
+    const forms = try rdr.readProgram(parse_result.sexp);
+    const ra = v.runtime_arena.allocator();
+    for (forms) |form| {
+        const compiled = try compile.compileFormFullWithMacrosSpanPersistent(
+            ra,
+            form,
+            ns,
+            interner,
+            host_macros,
+            null,
+            ra,
+        );
+        const routine = compiled.toRoutine("core-nx-test");
+        v.frames.items[0].routine = &routine;
+        v.frames.items[0].pc = 0;
+        v.frames.items[0].slot_count = routine.slot_count;
+        v.halted = false;
+        if (v.stack.items.len < routine.slot_count) {
+            try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+        }
+        _ = try v.run();
+    }
+}
+
 /// Run `src` end-to-end and assert the printed output equals
 /// `expected`. Wraps multiple top-level forms in an implicit do
 /// so callers can write multi-form programs naturally.
@@ -135,6 +174,10 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     try stdlib.installCore(ns);
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
+    // Phase 3.3d: bootstrap composite core.nx layer so tests
+    // can exercise when-let/if-let/dotimes/second/last/reverse/
+    // range/take/drop.
+    try bootstrapCoreForTest(&v, ns, interner, &host_macros);
 
     const compiled = try compile.compileSourceFullWithMacros(
         arena.allocator(),
@@ -147,6 +190,9 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     v.frames.items[0].routine = &routine;
     v.frames.items[0].pc = 0;
     v.frames.items[0].slot_count = routine.slot_count;
+    // Reset halted because bootstrap left the VM in the halted
+    // state after running the last core.nx form.
+    v.halted = false;
     if (v.stack.items.len < routine.slot_count) {
         try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
     }
@@ -553,6 +599,66 @@ test "integration: my-cond — user procedural macro using native fns" {
 test "integration: native fn — arity mismatch is catchable" {
     try expectOutput("(try (first) (catch any e e))", ":arity-mismatch");
     try expectOutput("(try (cons 1) (catch any e e))", ":arity-mismatch");
+}
+
+// =============================================================================
+// Phase 3.3d — embedded core.nx composite layer
+// =============================================================================
+
+test "integration: 3.3d — second / third / last" {
+    try expectOutput("(second [10 20 30])", "20");
+    try expectOutput("(third [10 20 30])", "30");
+    try expectOutput("(last [10 20 30])", "30");
+    try expectOutput("(last (list :a :b :c))", ":c");
+    try expectOutput("(last (list))", "nil");
+}
+
+test "integration: 3.3d — reverse" {
+    try expectOutput("(reverse [1 2 3 4 5])", "(5 4 3 2 1)");
+    try expectOutput("(reverse (list))", "()");
+    try expectOutput("(reverse nil)", "()");
+}
+
+test "integration: 3.3d — range" {
+    try expectOutput("(range 0)", "()");
+    try expectOutput("(range 1)", "(0)");
+    try expectOutput("(range 5)", "(0 1 2 3 4)");
+}
+
+test "integration: 3.3d — take / drop" {
+    try expectOutput("(take 3 [1 2 3 4 5])", "(1 2 3)");
+    try expectOutput("(take 0 [1 2 3])", "()");
+    try expectOutput("(take 10 [1 2 3])", "(1 2 3)");
+    try expectOutput("(drop 2 [1 2 3 4 5])", "(3 4 5)");
+    try expectOutput("(drop 10 [1 2 3])", "()");
+    try expectOutput("(drop 0 (list :a :b))", "(:a :b)");
+}
+
+test "integration: 3.3d — true? / false?" {
+    try expectOutput("(true? true)", "true");
+    try expectOutput("(true? 1)", "false");
+    try expectOutput("(true? :a)", "false");
+    try expectOutput("(false? false)", "true");
+    try expectOutput("(false? nil)", "false");
+}
+
+test "integration: 3.3d — when-let" {
+    try expectOutput("(when-let [x 42] (+ x 1))", "43");
+    try expectOutput("(when-let [x nil] :unreached)", "nil");
+    try expectOutput("(when-let [x false] :unreached)", "nil");
+    try expectOutput("(when-let [x (list 1 2)] (first x))", "1");
+}
+
+test "integration: 3.3d — if-let" {
+    try expectOutput("(if-let [x 7] (* x x) :nope)", "49");
+    try expectOutput("(if-let [x nil] :nope :else-branch)", ":else-branch");
+    try expectOutput("(if-let [x (get {:a 1} :missing)] x :default)", ":default");
+}
+
+test "integration: 3.3d — composite + HOFs" {
+    try expectOutput("(reduce + 0 (range 10))", "45");
+    try expectOutput("(count (filter odd? (range 10)))", "5");
+    try expectOutput("(reverse (map inc [1 2 3]))", "(4 3 2)");
 }
 
 // =============================================================================

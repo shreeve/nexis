@@ -305,6 +305,74 @@ fn lineAt(source: []const u8, line: u32) []const u8 {
 ///   - default macro table active
 ///   - `:quit` / `:q` / EOF exits
 ///   - errors caught + printed without exiting the loop
+/// Phase 3.3d (peer-AI turn 67 §3.3d): compile + evaluate the
+/// embedded `core.nx` source against the supplied VM. Each
+/// top-level form runs sequentially in a fresh stub frame, so
+/// `def`/`defn`/`defmacro` mutations land in `ns` and become
+/// visible to subsequent forms (and to user code that runs
+/// after bootstrap).
+///
+/// Errors here are FATAL — they indicate a bug in `core.nx`
+/// itself, not user code. We print and exit so the CLI doesn't
+/// silently come up with a half-loaded stdlib.
+fn bootstrapCoreNx(
+    v: *vm.VM,
+    ns: *vm.Namespace,
+    interner: *intern_mod.Interner,
+    allocator: std.mem.Allocator,
+) !void {
+    var parse_result = reader_mod.parser.parseProgram(allocator, stdlib.CORE_NX_SOURCE) catch |err| {
+        std.debug.panic("nexis: core.nx parse error: {s}\n", .{@errorName(err)});
+    };
+    defer parse_result.parser.deinit();
+
+    var rdr = reader_mod.Reader.init(allocator, stdlib.CORE_NX_SOURCE);
+    defer rdr.deinit();
+    const forms = rdr.readProgram(parse_result.sexp) catch |err| {
+        std.debug.panic("nexis: core.nx reader error: {s}\n", .{@errorName(err)});
+    };
+
+    var host_macros = try expand_mod.defaultMacros(allocator);
+    defer host_macros.deinit(allocator);
+
+    // CRITICAL: use the VM's runtime arena as the compile arena
+    // for bootstrap. ORDINARY `defn` compiled Routines live in
+    // the compile arena and are referenced by Closures stored in
+    // Var.roots. Those Vars must outlive bootstrap, so the
+    // routines must too. A separate temp compile_arena would
+    // dangle on bootstrap exit and crash on first user call to
+    // any core.nx fn. (Macros already use the persistent
+    // allocator via `compileFormFullWithMacrosSpanPersistent`,
+    // but ordinary fns need it too.)
+    const ra = v.runtime_arena.allocator();
+
+    for (forms) |form| {
+        var error_span: ?reader_mod.SrcSpan = null;
+        const compiled = compile.compileFormFullWithMacrosSpanPersistent(
+            ra,
+            form,
+            ns,
+            interner,
+            &host_macros,
+            &error_span,
+            ra,
+        ) catch |err| {
+            std.debug.panic("nexis: core.nx compile error: {s} (form span: {?})\n", .{ @errorName(err), error_span });
+        };
+        const routine = compiled.toRoutine("core-nx");
+        v.frames.items[0].routine = &routine;
+        v.frames.items[0].pc = 0;
+        v.frames.items[0].slot_count = routine.slot_count;
+        v.halted = false;
+        if (v.stack.items.len < routine.slot_count) {
+            try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+        }
+        _ = v.run() catch |err| {
+            std.debug.panic("nexis: core.nx runtime error: {s}\n", .{@errorName(err)});
+        };
+    }
+}
+
 fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
@@ -324,6 +392,9 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     // macro bodies. Names are string literals; no allocator
     // needed for storage.
     try stdlib.installCore(ns);
+    // Phase 3.3d: bootstrap the embedded core.nx composite
+    // layer.
+    try bootstrapCoreNx(&v, ns, interner, allocator);
     var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);
 
@@ -492,6 +563,10 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     const interner = v.ensureInterner();
     // Phase 3.3a: install core native fns.
     try stdlib.installCore(ns);
+    // Phase 3.3d: bootstrap the embedded core.nx composite
+    // layer (second, last, reverse, range, take, drop,
+    // when-let, if-let, dotimes, true?/false?).
+    try bootstrapCoreNx(&v, ns, interner, allocator);
 
     // Compile arena: shared across all top-level forms in this
     // file. Form trees + Tiny IR + Compiled routines all live
