@@ -556,6 +556,72 @@ test "integration: native fn — arity mismatch is catchable" {
 }
 
 // =============================================================================
+// Phase 3.3c — collection utilities
+// =============================================================================
+
+test "integration: 3.3c — vector / vec" {
+    try expectOutput("(vector 1 2 3)", "[1 2 3]");
+    try expectOutput("(vector)", "[]");
+    try expectOutput("(vec (list :a :b :c))", "[:a :b :c]");
+    try expectOutput("(vec nil)", "[]");
+}
+
+test "integration: 3.3c — hash-map / hash-set" {
+    try expectOutput("(hash-set 1 2 3 1 2)", "#{1 2 3}");
+    // hash-map iteration order is unspecified (HAMT); test via count + get
+    try expectOutput("(count (hash-map :a 1 :b 2 :c 3))", "3");
+    try expectOutput("(get (hash-map :a 1 :b 2) :a)", "1");
+}
+
+test "integration: 3.3c — assoc / dissoc" {
+    try expectOutput("(get (assoc {:a 1} :b 2) :b)", "2");
+    try expectOutput("(get (assoc nil :x 99) :x)", "99");
+    try expectOutput("(contains? (dissoc {:a 1 :b 2} :a) :a)", "false");
+    try expectOutput("(contains? (dissoc {:a 1 :b 2} :a) :b)", "true");
+}
+
+test "integration: 3.3c — get (2-arg + 3-arg default)" {
+    try expectOutput("(get {:a 1} :a)", "1");
+    try expectOutput("(get {:a 1} :missing)", "nil");
+    try expectOutput("(get {:a 1} :missing :default)", ":default");
+    try expectOutput("(get [10 20 30] 1)", "20");
+    try expectOutput("(get [10 20 30] 99 :oob)", ":oob");
+    try expectOutput("(get #{1 2 3} 2)", "2");
+    try expectOutput("(get nil :anything :fallback)", ":fallback");
+}
+
+test "integration: 3.3c — contains?" {
+    try expectOutput("(contains? {:a 1} :a)", "true");
+    try expectOutput("(contains? {:a 1} :b)", "false");
+    try expectOutput("(contains? #{1 2 3} 2)", "true");
+    try expectOutput("(contains? [10 20 30] 1)", "true");
+    try expectOutput("(contains? [10 20 30] 99)", "false");
+    try expectOutput("(contains? nil :anything)", "false");
+}
+
+test "integration: 3.3c — keys / vals" {
+    try expectOutput("(count (keys {:a 1 :b 2 :c 3}))", "3");
+    try expectOutput("(count (vals {:a 1 :b 2 :c 3}))", "3");
+    try expectOutput("(keys nil)", "()");
+    try expectOutput("(vals nil)", "()");
+}
+
+test "integration: 3.3c — conj (kind-specific)" {
+    try expectOutput("(conj nil 1 2 3)", "(3 2 1)"); // Clojure reverses for nil/list
+    try expectOutput("(conj (list 1 2 3) 0)", "(0 1 2 3)");
+    try expectOutput("(conj [10 20] 30 40)", "[10 20 30 40]");
+    try expectOutput("(get (conj {:a 1} [:b 2]) :b)", "2");
+    try expectOutput("(contains? (conj #{1 2} 3 4) 4)", "true");
+}
+
+test "integration: 3.3c — collection ops compose with HOFs" {
+    try expectOutput(
+        \\(reduce (fn* [m k] (assoc m k true)) {} [:a :b :c])
+    , "{:a true, :b true, :c true}");
+    try expectOutput("(count (filter (fn* [x] (contains? #{1 3 5} x)) [1 2 3 4 5]))", "3");
+}
+
+// =============================================================================
 // Phase 3.3b — VM.callValue + apply + HOFs + first-class arithmetic
 // =============================================================================
 

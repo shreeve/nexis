@@ -108,6 +108,18 @@ const core_fns = [_]CoreEntry{
     .{ .name = "map", .descriptor = &native_map },
     .{ .name = "reduce", .descriptor = &native_reduce },
     .{ .name = "filter", .descriptor = &native_filter },
+    // 3.3c collection construction + access.
+    .{ .name = "vector", .descriptor = &native_vector },
+    .{ .name = "vec", .descriptor = &native_vec },
+    .{ .name = "hash-map", .descriptor = &native_hash_map },
+    .{ .name = "hash-set", .descriptor = &native_hash_set },
+    .{ .name = "assoc", .descriptor = &native_assoc },
+    .{ .name = "dissoc", .descriptor = &native_dissoc },
+    .{ .name = "get", .descriptor = &native_get },
+    .{ .name = "contains?", .descriptor = &native_contains_q },
+    .{ .name = "keys", .descriptor = &native_keys },
+    .{ .name = "vals", .descriptor = &native_vals },
+    .{ .name = "conj", .descriptor = &native_conj },
 };
 
 // =============================================================================
@@ -204,6 +216,19 @@ const native_apply = NativeFn{ .name = "apply", .min_arity = 2, .max_arity = nul
 const native_map = NativeFn{ .name = "map", .min_arity = 2, .max_arity = 2, .call = &fnMap };
 const native_reduce = NativeFn{ .name = "reduce", .min_arity = 3, .max_arity = 3, .call = &fnReduce };
 const native_filter = NativeFn{ .name = "filter", .min_arity = 2, .max_arity = 2, .call = &fnFilter };
+
+// 3.3c collection utilities.
+const native_vector = NativeFn{ .name = "vector", .min_arity = 0, .max_arity = null, .call = &fnVector };
+const native_vec = NativeFn{ .name = "vec", .min_arity = 1, .max_arity = 1, .call = &fnVec };
+const native_hash_map = NativeFn{ .name = "hash-map", .min_arity = 0, .max_arity = null, .call = &fnHashMap };
+const native_hash_set = NativeFn{ .name = "hash-set", .min_arity = 0, .max_arity = null, .call = &fnHashSet };
+const native_assoc = NativeFn{ .name = "assoc", .min_arity = 3, .max_arity = 3, .call = &fnAssoc };
+const native_dissoc = NativeFn{ .name = "dissoc", .min_arity = 2, .max_arity = 2, .call = &fnDissoc };
+const native_get = NativeFn{ .name = "get", .min_arity = 2, .max_arity = 3, .call = &fnGet };
+const native_contains_q = NativeFn{ .name = "contains?", .min_arity = 2, .max_arity = 2, .call = &fnContainsQ };
+const native_keys = NativeFn{ .name = "keys", .min_arity = 1, .max_arity = 1, .call = &fnKeys };
+const native_vals = NativeFn{ .name = "vals", .min_arity = 1, .max_arity = 1, .call = &fnVals };
+const native_conj = NativeFn{ .name = "conj", .min_arity = 1, .max_arity = null, .call = &fnConj };
 
 // =============================================================================
 // Implementations
@@ -557,6 +582,327 @@ fn fnFilter(vm: *VM, args: []const Value) VmError!Value {
         }
     }
     return try buildListFromSlice(vm, results.items);
+}
+
+// =============================================================================
+// Collection utilities (3.3c)
+// =============================================================================
+//
+// Persistent collection construction + access. Per peer-AI
+// turn 67 §D8 Group B:
+//
+//   vector       (& xs)     persistent vector from args
+//   vec          (s)        persistent vector from seq
+//   hash-map     (& kvs)    persistent map from k/v pairs
+//   hash-set     (& xs)     persistent set from args
+//   assoc        (m k v)    persistent put (map or vector)
+//   dissoc       (m k)      persistent remove (map only)
+//   get          (m k)      lookup (map/set/vector); nil if missing
+//   get          (m k def)  lookup with default
+//   contains?    (m k)      key/element presence check
+//   keys         (m)        seq of map keys
+//   vals         (m)        seq of map values
+//   conj         (coll & xs) persistent add (list: cons; vector: push;
+//                            map: assoc with [k v] pair; set: include)
+//
+// HAMT iteration order is unspecified (peer-AI turn 67 §Sharp
+// warning §7). Tests using `keys`/`vals` should compare as
+// sets, not by exact order.
+
+fn fnVector(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    return vector_mod.fromSlice(heap, args) catch VmError.OutOfMemory;
+}
+
+fn fnVec(vm: *VM, args: []const Value) VmError!Value {
+    const s = args[0];
+    return switch (s.kind()) {
+        .nil => {
+            const heap = vm.ensureHeap();
+            return vector_mod.empty(heap) catch VmError.OutOfMemory;
+        },
+        .persistent_vector => s,
+        .list => blk: {
+            const heap = vm.ensureHeap();
+            // Materialize the list into a slice then fromSlice.
+            var items: std.ArrayList(Value) = .empty;
+            defer items.deinit(vm.allocator);
+            var node = s;
+            while (!list_mod.isEmpty(node)) {
+                items.append(vm.allocator, list_mod.head(node)) catch return VmError.OutOfMemory;
+                node = list_mod.tail(node);
+            }
+            break :blk vector_mod.fromSlice(heap, items.items) catch VmError.OutOfMemory;
+        },
+        else => VmError.KindMismatch,
+    };
+}
+
+fn fnHashMap(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len % 2 != 0) return VmError.ArityMismatch;
+    const heap = vm.ensureHeap();
+    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    var i: usize = 0;
+    while (i < args.len) : (i += 2) {
+        m = champ_mod.mapAssoc(
+            heap,
+            m,
+            args[i],
+            args[i + 1],
+            &dispatch_mod.hashValue,
+            &dispatch_mod.equal,
+        ) catch return VmError.OutOfMemory;
+    }
+    return m;
+}
+
+fn fnHashSet(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    var s = champ_mod.setEmpty(heap) catch return VmError.OutOfMemory;
+    for (args) |x| {
+        s = champ_mod.setConj(
+            heap,
+            s,
+            x,
+            &dispatch_mod.hashValue,
+            &dispatch_mod.equal,
+        ) catch return VmError.OutOfMemory;
+    }
+    return s;
+}
+
+fn fnAssoc(vm: *VM, args: []const Value) VmError!Value {
+    const coll = args[0];
+    const k = args[1];
+    const v = args[2];
+    const heap = vm.ensureHeap();
+    return switch (coll.kind()) {
+        .persistent_map => champ_mod.mapAssoc(
+            heap,
+            coll,
+            k,
+            v,
+            &dispatch_mod.hashValue,
+            &dispatch_mod.equal,
+        ) catch VmError.OutOfMemory,
+        .nil => blk: {
+            // Per Clojure, (assoc nil k v) => {k v}.
+            var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+            m = champ_mod.mapAssoc(
+                heap,
+                m,
+                k,
+                v,
+                &dispatch_mod.hashValue,
+                &dispatch_mod.equal,
+            ) catch return VmError.OutOfMemory;
+            break :blk m;
+        },
+        // Vector assoc-by-index is a Clojure feature; defer to
+        // a follow-up commit. v1: maps only.
+        else => VmError.KindMismatch,
+    };
+}
+
+fn fnDissoc(vm: *VM, args: []const Value) VmError!Value {
+    const coll = args[0];
+    const k = args[1];
+    return switch (coll.kind()) {
+        .persistent_map => champ_mod.mapDissoc(
+            vm.ensureHeap(),
+            coll,
+            k,
+            &dispatch_mod.hashValue,
+            &dispatch_mod.equal,
+        ) catch VmError.OutOfMemory,
+        .nil => coll,
+        else => VmError.KindMismatch,
+    };
+}
+
+fn fnGet(vm: *VM, args: []const Value) VmError!Value {
+    _ = vm;
+    const coll = args[0];
+    const k = args[1];
+    const default = if (args.len > 2) args[2] else value_mod.nilValue();
+    return switch (coll.kind()) {
+        .nil => default,
+        .persistent_map => switch (champ_mod.mapGet(
+            coll,
+            k,
+            &dispatch_mod.hashValue,
+            &dispatch_mod.equal,
+        )) {
+            .present => |v| v,
+            .absent => default,
+        },
+        .persistent_set => blk: {
+            // `(get s elem)` returns elem if present, default
+            // (or nil) otherwise.
+            const present = champ_mod.setContains(
+                coll,
+                k,
+                &dispatch_mod.hashValue,
+                &dispatch_mod.equal,
+            );
+            break :blk if (present) k else default;
+        },
+        .persistent_vector => blk: {
+            if (k.kind() != .fixnum) break :blk default;
+            const idx = k.asFixnum();
+            if (idx < 0) break :blk default;
+            const u_idx: usize = @intCast(idx);
+            if (u_idx >= vector_mod.count(coll)) break :blk default;
+            break :blk vector_mod.nth(coll, u_idx);
+        },
+        else => return VmError.KindMismatch,
+    };
+}
+
+fn fnContainsQ(_: *VM, args: []const Value) VmError!Value {
+    const coll = args[0];
+    const k = args[1];
+    return switch (coll.kind()) {
+        .nil => value_mod.fromBool(false),
+        .persistent_map => value_mod.fromBool(switch (champ_mod.mapGet(
+            coll,
+            k,
+            &dispatch_mod.hashValue,
+            &dispatch_mod.equal,
+        )) {
+            .present => true,
+            .absent => false,
+        }),
+        .persistent_set => value_mod.fromBool(champ_mod.setContains(
+            coll,
+            k,
+            &dispatch_mod.hashValue,
+            &dispatch_mod.equal,
+        )),
+        .persistent_vector => blk: {
+            if (k.kind() != .fixnum) break :blk value_mod.fromBool(false);
+            const idx = k.asFixnum();
+            if (idx < 0) break :blk value_mod.fromBool(false);
+            const u_idx: usize = @intCast(idx);
+            break :blk value_mod.fromBool(u_idx < vector_mod.count(coll));
+        },
+        else => return VmError.KindMismatch,
+    };
+}
+
+fn fnKeys(vm: *VM, args: []const Value) VmError!Value {
+    const m = args[0];
+    return switch (m.kind()) {
+        .nil => list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory,
+        .persistent_map => blk: {
+            var collected: std.ArrayList(Value) = .empty;
+            defer collected.deinit(vm.allocator);
+            var it = champ_mod.mapIter(m);
+            while (it.next()) |e| {
+                collected.append(vm.allocator, e.key) catch return VmError.OutOfMemory;
+            }
+            break :blk try buildListFromSlice(vm, collected.items);
+        },
+        else => return VmError.KindMismatch,
+    };
+}
+
+fn fnVals(vm: *VM, args: []const Value) VmError!Value {
+    const m = args[0];
+    return switch (m.kind()) {
+        .nil => list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory,
+        .persistent_map => blk: {
+            var collected: std.ArrayList(Value) = .empty;
+            defer collected.deinit(vm.allocator);
+            var it = champ_mod.mapIter(m);
+            while (it.next()) |e| {
+                collected.append(vm.allocator, e.value) catch return VmError.OutOfMemory;
+            }
+            break :blk try buildListFromSlice(vm, collected.items);
+        },
+        else => return VmError.KindMismatch,
+    };
+}
+
+/// `(conj coll & xs)` — persistent add. Kind-specific:
+///   list   → cons each x onto front (so order reverses for
+///            multi-arg conj; matches Clojure)
+///   vector → push each x to the end (left-to-right)
+///   map    → each x must be a 2-element vector [k v]; assoc
+///   set    → include each x
+///   nil    → builds a list (Clojure makes (conj nil 1 2) => (2 1))
+fn fnConj(vm: *VM, args: []const Value) VmError!Value {
+    const coll = args[0];
+    const xs = args[1..];
+    const heap = vm.ensureHeap();
+    return switch (coll.kind()) {
+        .nil => blk: {
+            // Build a cons list in reverse order to match
+            // Clojure's `(conj nil 1 2) => (2 1)` semantics.
+            var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
+            for (xs) |x| {
+                result = list_mod.cons(heap, x, result) catch return VmError.OutOfMemory;
+            }
+            break :blk result;
+        },
+        .list => blk: {
+            var result = coll;
+            for (xs) |x| {
+                result = list_mod.cons(heap, x, result) catch return VmError.OutOfMemory;
+            }
+            break :blk result;
+        },
+        .persistent_vector => blk: {
+            // Materialize, append, rebuild. Vector push API
+            // exists but our limited public surface only has
+            // fromSlice; round-tripping is fine for v1.
+            const n = vector_mod.count(coll);
+            var items: std.ArrayList(Value) = .empty;
+            defer items.deinit(vm.allocator);
+            items.ensureTotalCapacity(vm.allocator, n + xs.len) catch return VmError.OutOfMemory;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                items.append(vm.allocator, vector_mod.nth(coll, i)) catch return VmError.OutOfMemory;
+            }
+            for (xs) |x| {
+                items.append(vm.allocator, x) catch return VmError.OutOfMemory;
+            }
+            break :blk vector_mod.fromSlice(heap, items.items) catch VmError.OutOfMemory;
+        },
+        .persistent_map => blk: {
+            var result = coll;
+            for (xs) |x| {
+                // Each x must be a 2-element vector or list.
+                if (x.kind() != .persistent_vector) return VmError.KindMismatch;
+                if (vector_mod.count(x) != 2) return VmError.ArityMismatch;
+                const k = vector_mod.nth(x, 0);
+                const v = vector_mod.nth(x, 1);
+                result = champ_mod.mapAssoc(
+                    heap,
+                    result,
+                    k,
+                    v,
+                    &dispatch_mod.hashValue,
+                    &dispatch_mod.equal,
+                ) catch return VmError.OutOfMemory;
+            }
+            break :blk result;
+        },
+        .persistent_set => blk: {
+            var result = coll;
+            for (xs) |x| {
+                result = champ_mod.setConj(
+                    heap,
+                    result,
+                    x,
+                    &dispatch_mod.hashValue,
+                    &dispatch_mod.equal,
+                ) catch return VmError.OutOfMemory;
+            }
+            break :blk result;
+        },
+        else => return VmError.KindMismatch,
+    };
 }
 
 // =============================================================================
