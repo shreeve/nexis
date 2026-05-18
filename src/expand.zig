@@ -344,7 +344,10 @@ fn expandList(
     if (std.mem.eql(u8, name, "fn*")) return try expandFnStar(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "letfn*")) return try expandLetFnStar(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "def")) return try expandDef(ctx, env, list_form, items, depth);
-    if (std.mem.eql(u8, name, "defn")) return try expandDefn(ctx, env, list_form, items, depth);
+    // Phase 3.5a: `defn` is now a HOST MACRO (expandDefnMacro)
+    // that rewrites to `(def name (fn name ...))`. The host
+    // macro lives in the macros table; dispatching here would
+    // bypass the macro path.
     if (std.mem.eql(u8, name, "var")) return mutCast(list_form); // (var X) — X is just a name, don't expand
     if (std.mem.eql(u8, name, "try")) return try expandTry(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "throw")) return try expandOrdinaryCall(ctx, env, list_form, items, depth);
@@ -1560,20 +1563,387 @@ pub fn makeBool(ctx: *ExpandContext, value: bool, origin: SrcSpan) ExpandError!*
 // destructuring; for v1 step #8b, the trivial rename is
 // the entire job.
 
+/// Phase 3.5a (peer-AI turn 70): expand `(let bindings body...)`
+/// with destructuring support. The bindings vector may contain
+/// non-symbol PATTERNS (sequential `[a b c]`, associative
+/// `{:keys [...] :or {...} :as name}`); these expand to extra
+/// `(let* ...)` bindings that destructure via `nth`/`get`/`rest`.
+///
+/// Plain symbol bindings pass through unchanged. Non-symbol
+/// patterns are recognized via `destructurePair` and recursively
+/// destructure any nested patterns.
 fn expandLetRename(
     ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
 ) ExpandError!*Form {
-    return renameHead(ctx, call_form, args, "let*");
+    if (args.len < 1) return ExpandError.MalformedMacroCall;
+    const bindings_form = args[0];
+    if (bindings_form.datum != .vector) return ExpandError.MalformedMacroCall;
+    const src_pairs = bindings_form.datum.vector;
+    if (src_pairs.len % 2 != 0) return ExpandError.MalformedMacroCall;
+
+    // Expand into a flat list of [pattern expr] pairs.
+    var expanded: std.ArrayList(*Form) = .empty;
+    defer expanded.deinit(ctx.allocator);
+    var i: usize = 0;
+    while (i < src_pairs.len) : (i += 2) {
+        try destructurePair(ctx, src_pairs[i], src_pairs[i + 1], &expanded, call_form.origin);
+    }
+
+    const new_bindings_items = try ctx.allocator.alloc(*Form, expanded.items.len);
+    for (expanded.items, 0..) |it, j| new_bindings_items[j] = it;
+    const new_bindings = try makeVector(ctx, new_bindings_items, bindings_form.origin);
+
+    const new_args = try ctx.allocator.alloc(*Form, args.len);
+    new_args[0] = new_bindings;
+    for (args[1..], 1..) |a, j| new_args[j] = @constCast(a);
+    return renameHead(ctx, call_form, new_args, "let*");
 }
 
+/// Phase 3.5a: expand `(fn ...)` with destructuring in params.
+/// Supports `(fn [params] body)`, `(fn name [params] body)`.
+/// Destructured params are replaced with gensyms; the body is
+/// wrapped in a `(let [pattern gensym ...] body)` that itself
+/// expands via destructuring.
+///
+/// Multi-arity `(fn ([p1] b1) ([p1 p2] b2))` ships with `defn`
+/// in 3.5b.
 fn expandFnRename(
     ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
 ) ExpandError!*Form {
-    return renameHead(ctx, call_form, args, "fn*");
+    if (args.len < 1) return ExpandError.MalformedMacroCall;
+    // Detect (fn name [params] body) vs (fn [params] body).
+    var name_form: ?*Form = null;
+    var params_idx: usize = 0;
+    if (args[0].datum == .symbol) {
+        name_form = @constCast(args[0]);
+        params_idx = 1;
+    }
+    if (params_idx >= args.len) return ExpandError.MalformedMacroCall;
+    const params_form = args[params_idx];
+    if (params_form.datum != .vector) {
+        // Multi-arity form: (fn ([p1] b1) ([p1 p2] b2)). Defer
+        // to 3.5b — for now, pass through unchanged (will likely
+        // raise MalformedForm at lowering).
+        return renameHead(ctx, call_form, args, "fn*");
+    }
+    const params = params_form.datum.vector;
+    const body = args[params_idx + 1 ..];
+
+    // Walk params; for each non-symbol or non-& destructure, gen
+    // a fresh param symbol + collect a destructure binding.
+    var new_params: std.ArrayList(*Form) = .empty;
+    defer new_params.deinit(ctx.allocator);
+    var destruct_bindings: std.ArrayList(*Form) = .empty;
+    defer destruct_bindings.deinit(ctx.allocator);
+    var saw_rest = false;
+    for (params) |p| {
+        if (saw_rest) {
+            // After `&` — the rest param. If pattern, destructure.
+            if (p.datum == .symbol) {
+                try new_params.append(ctx.allocator, @constCast(p));
+            } else {
+                const tmp = try genTempSym(ctx, call_form.origin);
+                try new_params.append(ctx.allocator, tmp);
+                try destruct_bindings.append(ctx.allocator, @constCast(p));
+                try destruct_bindings.append(ctx.allocator, tmp);
+            }
+            continue;
+        }
+        if (p.datum == .symbol and std.mem.eql(u8, p.datum.symbol.name, "&")) {
+            try new_params.append(ctx.allocator, @constCast(p));
+            saw_rest = true;
+            continue;
+        }
+        if (p.datum == .symbol) {
+            try new_params.append(ctx.allocator, @constCast(p));
+        } else {
+            // Vector/map pattern → gensym param + destructure binding.
+            const tmp = try genTempSym(ctx, call_form.origin);
+            try new_params.append(ctx.allocator, tmp);
+            try destruct_bindings.append(ctx.allocator, @constCast(p));
+            try destruct_bindings.append(ctx.allocator, tmp);
+        }
+    }
+
+    const new_params_slice = try ctx.allocator.alloc(*Form, new_params.items.len);
+    for (new_params.items, 0..) |p, j| new_params_slice[j] = p;
+    const new_params_vec = try makeVector(ctx, new_params_slice, params_form.origin);
+
+    // Build the body. If we have destructure bindings, wrap in a
+    // (let [bindings...] body...). Else pass body through.
+    var final_body: std.ArrayList(*Form) = .empty;
+    defer final_body.deinit(ctx.allocator);
+    if (destruct_bindings.items.len > 0) {
+        const dbinds_slice = try ctx.allocator.alloc(*Form, destruct_bindings.items.len);
+        for (destruct_bindings.items, 0..) |b, j| dbinds_slice[j] = b;
+        const dbinds_vec = try makeVector(ctx, dbinds_slice, params_form.origin);
+        const let_items = try ctx.allocator.alloc(*Form, 2 + body.len);
+        let_items[0] = try makeSymbol(ctx, "let", call_form.origin);
+        let_items[1] = dbinds_vec;
+        for (body, 0..) |b, j| let_items[2 + j] = @constCast(b);
+        const let_form = try makeList(ctx, let_items, call_form.origin);
+        try final_body.append(ctx.allocator, let_form);
+    } else {
+        for (body) |b| try final_body.append(ctx.allocator, @constCast(b));
+    }
+
+    // Reconstruct: [name?] new_params_vec body...
+    const fn_args_len: usize = (if (name_form != null) @as(usize, 1) else 0) + 1 + final_body.items.len;
+    const fn_args = try ctx.allocator.alloc(*Form, fn_args_len);
+    var idx: usize = 0;
+    if (name_form) |n| {
+        fn_args[idx] = n;
+        idx += 1;
+    }
+    fn_args[idx] = new_params_vec;
+    idx += 1;
+    for (final_body.items) |b| {
+        fn_args[idx] = b;
+        idx += 1;
+    }
+    return renameHead(ctx, call_form, fn_args, "fn*");
+}
+
+/// Phase 3.5a: `(defn name [params] body...)` → `(def name
+/// (fn name [params] body...))`. Routing defn through `fn`
+/// gives us destructured params for free. Multi-arity defn
+/// ships in 3.5b.
+fn expandDefnMacro(
+    ctx: *ExpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) ExpandError!*Form {
+    if (args.len < 2) return ExpandError.MalformedMacroCall;
+    const name_form = args[0];
+    if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) {
+        return ExpandError.MalformedMacroCall;
+    }
+    // Build (fn name args[1..]).
+    const fn_items = try ctx.allocator.alloc(*Form, 1 + args.len);
+    fn_items[0] = try makeSymbol(ctx, "fn", call_form.origin);
+    fn_items[1] = @constCast(name_form);
+    for (args[1..], 0..) |a, i| fn_items[2 + i] = @constCast(a);
+    const fn_form = try makeList(ctx, fn_items, call_form.origin);
+
+    // Build (def name fn_form).
+    const def_items = try ctx.allocator.alloc(*Form, 3);
+    def_items[0] = try makeSymbol(ctx, "def", call_form.origin);
+    def_items[1] = @constCast(name_form);
+    def_items[2] = fn_form;
+    return try makeList(ctx, def_items, call_form.origin);
+}
+
+/// Phase 3.5a: destructure a single binding pair `pattern = expr`.
+/// Appends one or more `[name expr]` pairs to `out`.
+fn destructurePair(
+    ctx: *ExpandContext,
+    pattern: *const Form,
+    expr: *const Form,
+    out: *std.ArrayList(*Form),
+    origin: reader_mod.SrcSpan,
+) ExpandError!void {
+    switch (pattern.datum) {
+        .symbol => |sym| {
+            if (sym.ns != null) return ExpandError.MalformedMacroCall;
+            try out.append(ctx.allocator, @constCast(pattern));
+            try out.append(ctx.allocator, @constCast(expr));
+        },
+        .vector => |items| {
+            // [a b & rest :as v] pattern over expr.
+            // Bind a fresh tmp to expr, then walk elements.
+            const tmp = try genTempSym(ctx, origin);
+            try out.append(ctx.allocator, tmp);
+            try out.append(ctx.allocator, @constCast(expr));
+            try destructureVector(ctx, items, tmp, out, origin);
+        },
+        .map => |items| {
+            const tmp = try genTempSym(ctx, origin);
+            try out.append(ctx.allocator, tmp);
+            try out.append(ctx.allocator, @constCast(expr));
+            try destructureMap(ctx, items, tmp, out, origin);
+        },
+        else => return ExpandError.MalformedMacroCall,
+    }
+}
+
+/// Destructure a vector pattern over a source expression that's
+/// already bound to `src` (a symbol form).
+///
+/// Pattern elements: symbols bind to (nth src i nil); `&` rest
+/// binds to repeated rest; `:as name` binds name to src.
+fn destructureVector(
+    ctx: *ExpandContext,
+    elems: []const *Form,
+    src: *Form,
+    out: *std.ArrayList(*Form),
+    origin: reader_mod.SrcSpan,
+) ExpandError!void {
+    var i: usize = 0;
+    while (i < elems.len) : (i += 1) {
+        const e = elems[i];
+        // :as name
+        if (e.datum == .keyword and e.datum.keyword.ns == null and std.mem.eql(u8, e.datum.keyword.name, "as")) {
+            if (i + 1 >= elems.len) return ExpandError.MalformedMacroCall;
+            const as_name = elems[i + 1];
+            if (as_name.datum != .symbol) return ExpandError.MalformedMacroCall;
+            try out.append(ctx.allocator, @constCast(as_name));
+            try out.append(ctx.allocator, src);
+            i += 1;
+            continue;
+        }
+        // & rest
+        if (e.datum == .symbol and e.datum.symbol.ns == null and std.mem.eql(u8, e.datum.symbol.name, "&")) {
+            if (i + 1 >= elems.len) return ExpandError.MalformedMacroCall;
+            const rest_pat = elems[i + 1];
+            // Build expression: (rest (rest ... (rest src) ...))
+            // applied `i` times to skip the first `i` elements.
+            const rest_expr = try buildNestedRest(ctx, src, i, origin);
+            try destructurePair(ctx, rest_pat, rest_expr, out, origin);
+            i += 1;
+            continue;
+        }
+        // Normal element: (nth src i nil)
+        const nth_expr = try buildNthCall(ctx, src, i, origin);
+        try destructurePair(ctx, e, nth_expr, out, origin);
+    }
+}
+
+/// Destructure a map pattern.
+///
+/// Recognizes:
+///   {:keys [a b]}      → a (get src :a nil)  b (get src :b nil)
+///   {a :a-key}         → a (get src :a-key nil)
+///   {... :or {a 10}}   → a (get src :a 10) (overrides default)
+///   {... :as name}     → name src
+fn destructureMap(
+    ctx: *ExpandContext,
+    entries: []const *Form,
+    src: *Form,
+    out: *std.ArrayList(*Form),
+    origin: reader_mod.SrcSpan,
+) ExpandError!void {
+    if (entries.len % 2 != 0) return ExpandError.MalformedMacroCall;
+    // First pass: find :or defaults + :as name.
+    var defaults: ?[]const *Form = null;
+    var as_name: ?*Form = null;
+    var i: usize = 0;
+    while (i < entries.len) : (i += 2) {
+        const k = entries[i];
+        const v = entries[i + 1];
+        if (k.datum == .keyword and k.datum.keyword.ns == null) {
+            if (std.mem.eql(u8, k.datum.keyword.name, "or")) {
+                if (v.datum != .map) return ExpandError.MalformedMacroCall;
+                defaults = v.datum.map;
+            } else if (std.mem.eql(u8, k.datum.keyword.name, "as")) {
+                if (v.datum != .symbol) return ExpandError.MalformedMacroCall;
+                as_name = @constCast(v);
+            }
+        }
+    }
+    // Second pass: emit bindings.
+    i = 0;
+    while (i < entries.len) : (i += 2) {
+        const k = entries[i];
+        const v = entries[i + 1];
+        // Skip :or / :as (handled above).
+        if (k.datum == .keyword and k.datum.keyword.ns == null) {
+            if (std.mem.eql(u8, k.datum.keyword.name, "or") or
+                std.mem.eql(u8, k.datum.keyword.name, "as"))
+            {
+                continue;
+            }
+            if (std.mem.eql(u8, k.datum.keyword.name, "keys")) {
+                if (v.datum != .vector) return ExpandError.MalformedMacroCall;
+                for (v.datum.vector) |name_sym| {
+                    if (name_sym.datum != .symbol) return ExpandError.MalformedMacroCall;
+                    const sym_name = name_sym.datum.symbol.name;
+                    const key_form = try makeKeyword(ctx, sym_name, origin);
+                    const default_expr = lookupDefault(defaults, sym_name);
+                    const get_expr = try buildGetCall(ctx, src, key_form, default_expr, origin);
+                    try destructurePair(ctx, name_sym, get_expr, out, origin);
+                }
+                continue;
+            }
+        }
+        // Explicit binding: pattern -> key-expr.
+        const default_expr = if (k.datum == .symbol)
+            lookupDefault(defaults, k.datum.symbol.name)
+        else
+            null;
+        const get_expr = try buildGetCall(ctx, src, @constCast(v), default_expr, origin);
+        try destructurePair(ctx, k, get_expr, out, origin);
+    }
+    if (as_name) |n| {
+        try out.append(ctx.allocator, n);
+        try out.append(ctx.allocator, src);
+    }
+}
+
+fn lookupDefault(defaults: ?[]const *Form, name: []const u8) ?*Form {
+    if (defaults) |d| {
+        var i: usize = 0;
+        while (i < d.len) : (i += 2) {
+            const k = d[i];
+            if (k.datum == .symbol and std.mem.eql(u8, k.datum.symbol.name, name)) {
+                return @constCast(d[i + 1]);
+            }
+        }
+    }
+    return null;
+}
+
+/// Generate a fresh auto-gensym symbol like `nx__N__auto__`.
+fn genTempSym(ctx: *ExpandContext, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    ctx.gensym_next += 1;
+    const name = try std.fmt.allocPrint(ctx.allocator, "nx__{d}__auto__", .{ctx.gensym_next});
+    return try makeSymbol(ctx, name, origin);
+}
+
+/// Build `(nth src idx nil)` as a Form.
+fn buildNthCall(ctx: *ExpandContext, src: *Form, idx: usize, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    const items = try ctx.allocator.alloc(*Form, 4);
+    items[0] = try makeSymbol(ctx, "nth", origin);
+    items[1] = src;
+    const idx_form = try ctx.allocator.create(Form);
+    idx_form.* = .{ .datum = .{ .int = @intCast(idx) }, .origin = origin };
+    items[2] = idx_form;
+    items[3] = try makeNil(ctx, origin);
+    return try makeList(ctx, items, origin);
+}
+
+/// Build `(rest (rest ... (rest src) ...))` applied `n` times.
+fn buildNestedRest(ctx: *ExpandContext, src: *Form, n: usize, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    var expr: *Form = src;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const items = try ctx.allocator.alloc(*Form, 2);
+        items[0] = try makeSymbol(ctx, "rest", origin);
+        items[1] = expr;
+        expr = try makeList(ctx, items, origin);
+    }
+    return expr;
+}
+
+/// Build `(get src key default?)` as a Form. If default is null,
+/// emits the 2-arg form.
+fn buildGetCall(ctx: *ExpandContext, src: *Form, key: *Form, default: ?*Form, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    const argc: usize = if (default != null) 4 else 3;
+    const items = try ctx.allocator.alloc(*Form, argc);
+    items[0] = try makeSymbol(ctx, "get", origin);
+    items[1] = src;
+    items[2] = key;
+    if (default) |d| items[3] = d;
+    return try makeList(ctx, items, origin);
+}
+
+fn makeKeyword(ctx: *ExpandContext, name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    const form = try ctx.allocator.create(Form);
+    form.* = .{ .datum = .{ .keyword = .{ .ns = null, .name = name } }, .origin = origin };
+    return form;
 }
 
 fn expandLoopRename(
@@ -2105,6 +2475,7 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     errdefer table.deinit(allocator);
     try table.put(allocator, "let", expandLetRename);
     try table.put(allocator, "fn", expandFnRename);
+    try table.put(allocator, "defn", expandDefnMacro);
     try table.put(allocator, "loop", expandLoopRename);
     try table.put(allocator, "when", expandWhen);
     try table.put(allocator, "when-not", expandWhenNot);

@@ -175,7 +175,7 @@ const native_count = NativeFn{
 const native_nth = NativeFn{
     .name = "nth",
     .min_arity = 2,
-    .max_arity = 2,
+    .max_arity = 3,
     .call = &fnNth,
 };
 
@@ -326,27 +326,42 @@ fn fnCount(_: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(nth coll n)` → element at index `n`. Throws on out-of-
-/// bounds (per peer-AI turn 67 §D9; 3-arg default variant
-/// deferred to 3.3b). Negative indices rejected as
-/// `IndexOutOfBounds`.
+/// bounds. Negative indices rejected as `IndexOutOfBounds`.
+///
+/// `(nth coll n default)` → element at index `n`, or `default`
+/// if out-of-bounds. nil coll always returns default. Required
+/// by Phase 3.5 destructuring (peer-AI turn 70 §missing-trap
+/// §9: `[a b c]` against a 2-element source should bind c to
+/// nil, not throw).
 fn fnNth(_: *VM, args: []const Value) VmError!Value {
     const coll = args[0];
     const idx_v = args[1];
+    const has_default = args.len > 2;
+    const default = if (has_default) args[2] else value_mod.nilValue();
     if (idx_v.kind() != .fixnum) return VmError.KindMismatch;
     const idx = idx_v.asFixnum();
-    if (idx < 0) return VmError.IndexOutOfBounds;
+    if (idx < 0) {
+        if (has_default) return default;
+        return VmError.IndexOutOfBounds;
+    }
     const u_idx: usize = @intCast(idx);
     return switch (coll.kind()) {
+        .nil => if (has_default) default else VmError.IndexOutOfBounds,
         .list => blk: {
-            // Walk the list; lists are O(n) indexed.
-            if (u_idx >= list_mod.count(coll)) return VmError.IndexOutOfBounds;
+            if (u_idx >= list_mod.count(coll)) {
+                if (has_default) break :blk default;
+                return VmError.IndexOutOfBounds;
+            }
             var node = coll;
             var i: usize = 0;
             while (i < u_idx) : (i += 1) node = list_mod.tail(node);
             break :blk list_mod.head(node);
         },
         .persistent_vector => blk: {
-            if (u_idx >= vector_mod.count(coll)) return VmError.IndexOutOfBounds;
+            if (u_idx >= vector_mod.count(coll)) {
+                if (has_default) break :blk default;
+                return VmError.IndexOutOfBounds;
+            }
             break :blk vector_mod.nth(coll, u_idx);
         },
         else => return VmError.KindMismatch,

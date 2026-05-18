@@ -680,6 +680,77 @@ test "integration: native fn — arity mismatch is catchable" {
 }
 
 // =============================================================================
+// Phase 3.5a — destructuring (let / fn / defn params)
+// =============================================================================
+
+test "integration: 3.5a — sequential destructuring (let)" {
+    try expectOutput("(let [[a b c] [10 20 30]] (+ a b c))", "60");
+    try expectOutput("(let [[a b] [1 2 3]] (+ a b))", "3");
+    try expectOutput("(let [[a b c] [1 2]] (nil? c))", "true");
+}
+
+test "integration: 3.5a — sequential with rest" {
+    try expectOutput("(let [[a & rest] [1 2 3 4]] rest)", "(2 3 4)");
+    try expectOutput("(let [[a b & rest] [1 2 3 4 5]] rest)", "(3 4 5)");
+    try expectOutput("(let [[a & rest] [1]] rest)", "()");
+}
+
+test "integration: 3.5a — sequential with :as" {
+    try expectOutput("(let [[a b :as v] [10 20]] (+ a b (count v)))", "32");
+}
+
+test "integration: 3.5a — nested sequential destructuring" {
+    try expectOutput("(let [[a [b c] d] [1 [2 3] 4]] (+ a b c d))", "10");
+}
+
+test "integration: 3.5a — associative destructuring (:keys)" {
+    try expectOutput("(let [{:keys [x y]} {:x 1 :y 2}] (+ x y))", "3");
+}
+
+test "integration: 3.5a — associative with explicit keys" {
+    try expectOutput("(let [{a :alpha b :beta} {:alpha 10 :beta 20}] (+ a b))", "30");
+}
+
+test "integration: 3.5a — associative with :or defaults" {
+    try expectOutput("(let [{:keys [x y] :or {y 99}} {:x 5}] (+ x y))", "104");
+    // :or default applies only when key is missing.
+    try expectOutput("(let [{:keys [y] :or {y 99}} {:y 7}] y)", "7");
+}
+
+test "integration: 3.5a — associative with :as" {
+    try expectOutput("(let [{:keys [a] :as m} {:a 1 :b 2}] (count m))", "2");
+}
+
+test "integration: 3.5a — fn with destructured params" {
+    try expectOutput(
+        \\(do (defn point-sum [[x y]] (+ x y))
+        \\    (point-sum [3 4]))
+    , "7");
+    try expectOutput(
+        \\(do (defn sum-keys [{:keys [a b]}] (+ a b))
+        \\    (sum-keys {:a 10 :b 20}))
+    , "30");
+}
+
+test "integration: 3.5a — defn with destructured params + rest" {
+    try expectOutput(
+        \\(do (defn first-of [[a & _]] a)
+        \\    (first-of [99 1 2 3]))
+    , "99");
+}
+
+test "integration: 3.5a — let preserves single-evaluation of source" {
+    // The source expression should be evaluated once and bound to
+    // a gensym; destructuring reads from that gensym. Side-effect
+    // semantics matter for `(let [[a b] (some-effecting-call) ...])`.
+    // Easiest proof: a fn that counts invocations isn't possible
+    // without atoms, but we can verify structural correctness:
+    // a complex expression's value matches what plain (let [tmp e] e)
+    // would yield.
+    try expectOutput("(let [[a b] [(+ 1 2) (* 3 4)]] (+ a b))", "15");
+}
+
+// =============================================================================
 // Phase 3.4 — multi-namespace (auto-refer core + qualified symbols + (ns NAME))
 // =============================================================================
 
