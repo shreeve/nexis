@@ -98,11 +98,16 @@ const Usage =
     \\        identity, and historical snapshots are one coherent
     \\        programming model.
     \\
-    \\usage: nexis run FILE.nx
+    \\usage:
+    \\  nexis run FILE.nx    Reads FILE.nx, parses all top-level
+    \\                       forms, compiles and runs each in
+    \\                       order, prints the final result.
+    \\  nexis repl           Interactive read-eval-print loop.
+    \\                       :quit or EOF to exit.
     \\
-    \\Reads FILE.nx, parses all top-level forms, compiles and runs
-    \\each in order, prints the final result. The namespace (Vars
-    \\from `def`/`defn`) and interner persist across forms.
+    \\For `run`, the namespace (Vars from `def`/`defn`) and
+    \\interner persist across forms within the file. For `repl`,
+    \\they persist across the entire session.
     \\
     \\Phase 2 source surface (what compiles today):
     \\  literals: nil, true, false, integers, :keywords
@@ -157,6 +162,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
         try runFile(io, allocator, args[2]);
+    } else if (std.mem.eql(u8, cmd, "repl")) {
+        try runRepl(io, allocator);
     } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         try printUsage(io);
     } else {
@@ -247,6 +254,143 @@ fn lineAt(source: []const u8, line: u32) []const u8 {
     }
     if (current_line == line) return source[start..];
     return "";
+}
+
+/// Step Phase-3.0a (peer-AI turn 62): interactive read-eval-
+/// print loop. One form per input line; persistent namespace +
+/// interner across iterations; errors print + continue (REPL
+/// never crashes on user code).
+///
+/// MVP scope (peer recommendation):
+///   - single-form-per-line (no multiline continuation in v1)
+///   - persistent ns/interner across the session
+///   - default macro table active
+///   - `:quit` / `:q` / EOF exits
+///   - errors caught + printed without exiting the loop
+fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
+    const stdin = std.Io.File.stdin();
+    const stdout = std.Io.File.stdout();
+    const stderr = std.Io.File.stderr();
+
+    // Initialize the persistent VM + namespace + interner +
+    // macro table. These outlive every REPL evaluation.
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(allocator);
+    defer host_macros.deinit(allocator);
+
+    // Each evaluation gets its own arena so we can release
+    // form/Tiny/Compiled memory between iterations. The VM's
+    // runtime_arena holds the long-lived values (closures,
+    // cells, list nodes).
+    try stdout.writeStreamingAll(io,
+        \\nexis repl — Phase 3.0a
+        \\Type `:quit` or hit Ctrl-D to exit.
+        \\
+        \\
+    );
+
+    var stdin_buf: [4096]u8 = undefined;
+    var reader = stdin.readerStreaming(io, &stdin_buf);
+
+    while (true) {
+        try stdout.writeStreamingAll(io, "user=> ");
+        // takeDelimiter returns ?[]u8 — null at EOF.
+        // The returned slice excludes the delimiter, but the
+        // reader's seek position advances past it (unlike
+        // takeDelimiterExclusive which leaves the delimiter
+        // in the buffer — that variant infinite-loops on
+        // empty lines).
+        const maybe_line = (reader.interface.takeDelimiter('\n')) catch |err| {
+            try stderr.writeStreamingAll(io, "nexis: stdin read error: ");
+            try stderr.writeStreamingAll(io, @errorName(err));
+            try stderr.writeStreamingAll(io, "\n");
+            return;
+        };
+        const line = maybe_line orelse {
+            try stdout.writeStreamingAll(io, "\n");
+            return;
+        };
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (std.mem.eql(u8, trimmed, ":quit") or std.mem.eql(u8, trimmed, ":q")) return;
+
+        // Per-evaluation arena.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        // Source bytes need to live AT LEAST through the
+        // compile call (Tiny.symbol slices borrow from
+        // source). dupe into the arena.
+        const src = try arena.allocator().dupe(u8, trimmed);
+
+        var error_span: ?reader_mod.SrcSpan = null;
+        const compiled = compile.compileSourceFullWithMacrosSpan(
+            arena.allocator(),
+            src,
+            ns,
+            interner,
+            &host_macros,
+            &error_span,
+        ) catch |err| {
+            try emitCompileError(io, "<repl>", src, err, error_span);
+            continue;
+        };
+
+        // Bind the new routine onto frame 0 + reset the VM
+        // state for a fresh run.
+        const routine = compiled.toRoutine("repl");
+        v.frames.items[0].routine = &routine;
+        v.frames.items[0].pc = 0;
+        v.frames.items[0].slot_count = routine.slot_count;
+        v.halted = false;
+        if (v.stack.items.len < routine.slot_count) {
+            try v.stack.appendNTimes(
+                v.allocator,
+                value_mod.nilValue(),
+                routine.slot_count - v.stack.items.len,
+            );
+        }
+
+        const result = v.run() catch |err| {
+            try stderr.writeStreamingAll(io, "nexis: runtime error: ");
+            try stderr.writeStreamingAll(io, @errorName(err));
+            try stderr.writeStreamingAll(io, "\n");
+            // Print throw payload if available.
+            if (err == vm.VmError.UncaughtThrow and v.unhandled_throw != null) {
+                var buf: [4096]u8 = undefined;
+                var stream = std.Io.Writer.fixed(&buf);
+                formatValue(v.unhandled_throw.?, interner, &stream) catch {
+                    try stderr.writeStreamingAll(io, "  (payload too large to print)\n");
+                    continue;
+                };
+                try stderr.writeStreamingAll(io, "  payload: ");
+                try stderr.writeStreamingAll(io, stream.buffered());
+                try stderr.writeStreamingAll(io, "\n");
+            }
+            // Clear handler/finally state so next iteration
+            // starts clean. Otherwise an aborted try leaks
+            // handlers across REPL inputs.
+            v.handlers.shrinkRetainingCapacity(0);
+            v.finally_stack.shrinkRetainingCapacity(0);
+            v.unhandled_throw = null;
+            continue;
+        };
+
+        // Print the result.
+        var out_buf: [4096]u8 = undefined;
+        var out_stream = std.Io.Writer.fixed(&out_buf);
+        formatValue(result, interner, &out_stream) catch {
+            try stdout.writeStreamingAll(io, "#<value too large to print>\n");
+            continue;
+        };
+        try stdout.writeStreamingAll(io, out_stream.buffered());
+        try stdout.writeStreamingAll(io, "\n");
+    }
 }
 
 /// Read FILE.nx, parse, compile, run each top-level form. Print
