@@ -1996,11 +1996,16 @@ stdlib, multi-namespace, dynamic binding.
       `fn`/`defn` params + multi-arity `defn` (dispatch on
       argc via expansion to variadic + `let` + nested `if`).
       Peer-AI turn 70 architectural pin.
-- [ ] **Phase 3.6** (NEW) `require` + aliases + file loading
-      (`my.ns/foo` from disk-loaded namespace; load path; cycle
-      detection; idempotent loaded set). Strategy turn pending.
-- [ ] **Phase 3.7** (NEW) `src/dynamic.zig`: dynamic-binding
-      stack (`^:dynamic` Vars + `binding`).
+- [x] **Phase 3.6** `require` + aliases + file loading: `(require
+      'my.ns)` and `(require '[my.ns :as a])`. Ns-to-file mapping
+      (`my.app.foo` → `my/app/foo.nx`), load path, cycle
+      detection, idempotent loaded set, namespace-mismatch
+      validation. Per peer-AI turn 71 v1 scope; `:refer`/
+      `:rename`/`:exclude`/relative requires/reload deferred.
+- [ ] **Phase 3.7** `src/dynamic.zig`: dynamic-binding
+      stack (`^:dynamic` Vars + `binding`). Deferred until
+      Phase 4 clarifies whether transactions want dynamic-Var
+      or explicit-handle shape (peer-AI turn 71 §1).
 
 **Exit**: Phase 3 gate; REPL usable for real programs; core stdlib loaded.
 

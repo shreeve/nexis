@@ -36,6 +36,7 @@ const list_mod = @import("list");
 const vector_mod = @import("vector");
 const champ_mod = @import("champ");
 const stdlib = @import("stdlib");
+const loader_mod = @import("loader");
 
 const Value = value_mod.Value;
 
@@ -402,6 +403,8 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     // lookup (`nexis.core/map`). User code that defs the same
     // names creates a local shadow.
     try stdlib.installCore(registry.core);
+    var host_macros = try expand_mod.defaultMacros(allocator);
+    defer host_macros.deinit(allocator);
     // Phase 3.3d: bootstrap the embedded core.nx composite
     // layer INTO nexis.core (so user code inherits via auto-
     // refer). Temporarily switch current → core for bootstrap;
@@ -410,8 +413,21 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     registry.current = registry.core;
     try bootstrapCoreNx(&v, registry.core, interner, allocator);
     registry.current = saved_current;
-    var host_macros = try expand_mod.defaultMacros(allocator);
-    defer host_macros.deinit(allocator);
+    // Phase 3.6: namespace loader. Searches CWD for .nx files
+    // when `(require 'my.ns)` fires. Load path is just CWD for
+    // v1; a `--load-path DIR` CLI flag is post-v1 polish.
+    var load_paths = [_][]const u8{"."};
+    var loader = loader_mod.Loader.init(
+        allocator,
+        v.runtime_arena.allocator(),
+        io,
+        load_paths[0..],
+        &v,
+        interner,
+        registry,
+        &host_macros,
+    );
+    defer loader.deinit();
 
     // Each evaluation gets its own arena so we can release
     // form/Tiny/Compiled memory between iterations. The VM's
@@ -475,7 +491,7 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         // Phase 3.4: re-read registry.current each iteration so
         // `(ns NAME)` switches affect subsequent forms.
         const current_ns = registry.current;
-        const compiled = compile.compileSourceFullWithMacrosSpanPersistentRegistry(
+        const compiled = compile.compileSourceFullWithMacrosSpanPersistentRegistryLoader(
             arena_alloc,
             src,
             current_ns,
@@ -484,6 +500,7 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
             &error_span,
             v.runtime_arena.allocator(),
             registry,
+            .{ .user_data = @ptrCast(&loader), .load = &loader_mod.Loader.loadCallback },
         ) catch |err| {
             try emitCompileError(io, "<repl>", src, err, error_span);
             continue;
@@ -593,25 +610,37 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     const registry = try v.ensureRegistry();
     // Phase 3.3a: install core native fns into nexis.core.
     try stdlib.installCore(registry.core);
+    // Step #8b: default host macro table.
+    var host_macros = try expand_mod.defaultMacros(allocator);
+    defer host_macros.deinit(allocator);
     // Phase 3.3d: bootstrap core.nx INTO nexis.core (so user
     // code inherits via auto-refer).
     const saved_current = registry.current;
     registry.current = registry.core;
     try bootstrapCoreNx(&v, registry.core, interner, allocator);
     registry.current = saved_current;
+    // Phase 3.6: namespace loader. Searches CWD + the directory
+    // of the source file being run for `.nx` files when
+    // `(require ...)` fires.
+    const file_dir = std.fs.path.dirname(path) orelse ".";
+    var file_load_paths = [_][]const u8{ ".", file_dir };
+    var loader = loader_mod.Loader.init(
+        allocator,
+        v.runtime_arena.allocator(),
+        io,
+        file_load_paths[0..],
+        &v,
+        interner,
+        registry,
+        &host_macros,
+    );
+    defer loader.deinit();
 
     // Compile arena: shared across all top-level forms in this
     // file. Form trees + Tiny IR + Compiled routines all live
     // here. Released wholesale at the end.
     var compile_arena = std.heap.ArenaAllocator.init(allocator);
     defer compile_arena.deinit();
-
-    // Step #8b: default host macro table — let/fn/loop
-    // renames + when/when-not/and/or/cond + ->/->>. Phase 3
-    // will add user-defined `defmacro` and let users extend
-    // this table.
-    var host_macros = try expand_mod.defaultMacros(allocator);
-    defer host_macros.deinit(allocator);
 
     var last_result: Value = value_mod.nilValue();
 
@@ -623,7 +652,7 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
         // Phase 3.4: re-read registry.current per-form so
         // `(ns NAME)` switches mid-file affect subsequent forms.
         const current_ns = registry.current;
-        const compiled = compile.compileFormFullWithMacrosSpanPersistentRegistry(
+        const compiled = compile.compileFormFullWithMacrosSpanPersistentRegistryLoader(
             compile_arena.allocator(),
             form,
             current_ns,
@@ -632,6 +661,7 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
             &error_span,
             v.runtime_arena.allocator(),
             registry,
+            .{ .user_data = @ptrCast(&loader), .load = &loader_mod.Loader.loadCallback },
         ) catch |err| {
             try emitCompileError(io, path, source, err, error_span);
             std.process.exit(4);

@@ -1,0 +1,19 @@
+; examples/require-demo.nx — Phase 3.6 require + aliases demo
+;
+; Run with: ./bin/nexis run examples/require-demo.nx
+;
+; The loader searches the CWD and the directory of the source
+; file for `.nx` files. `lib.geom` resolves to `lib/geom.nx`.
+; (Dots in namespace names become slashes in the file path.)
+;
+; Supported require shapes (v1 scope, peer-AI turn 71):
+;   (require 'my.ns)              — load my.ns; no alias
+;   (require '[my.ns :as alias])  — load + alias `alias → my.ns`
+;
+; Deferred to post-v1: :refer, :rename, :exclude, relative
+; requires, reload.
+
+(require '[lib.geom :as g])
+
+; Qualified call via alias.
+(g/area-of-square 5)

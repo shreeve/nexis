@@ -48,7 +48,8 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Phase 3.3d | ✅ shipped | Embedded `core.nx` composite layer (`when-let`/`if-let`/`dotimes`/`range`/`take`/`drop`/etc.) |
 | Phase 3.4 | ✅ shipped | Multi-namespace: `nexis.core` + `user`, `(ns NAME)`, qualified symbols, auto-refer |
 | Phase 3.5 | ✅ shipped | Destructuring (sequential/associative/nested/`& rest`/`:as`/`:keys`/`:or`) + multi-arity `defn` |
-| Phase 3.6+ | pending | `require` + file loading + aliases (separate strategy turn); `^:dynamic` Vars + `binding` |
+| Phase 3.6 | ✅ shipped | `require` + file loading + `:as` aliases; ns-to-file mapping; cycle detection; idempotent load |
+| Phase 3.7 | pending (deferred) | `^:dynamic` Vars + `binding` — deferred until Phase 4 clarifies transaction-context shape |
 
 **558 tests** green: 95 VM + 313 compile + 6 macroexpand + 4
 property + 54 integration in `phase2-test` (~3s), plus 86 reader
@@ -194,6 +195,11 @@ Every snippet runs via `bin/nexis`. Run the file or paste into the REPL:
   ([x & r] :many))
 (arity-dispatch :a :b :c :d)        ;; => :many
 
+;; multi-file projects via require (Phase 3.6)
+;; — see examples/require-demo.nx + examples/lib/geom.nx
+(require '[lib.geom :as g])
+(g/area-of-square 5)                ;; => 25
+
 ;; anonymous-fn shorthand
 (#(+ % 1) 41)                       ;; => 42
 (#(+ %1 %2) 10 20)                  ;; => 30
@@ -221,16 +227,18 @@ nexis: bad.nx:1:1: MacroExpansionFailure
     ^^^^^^
 ```
 
-## Still missing (closes in Phase 3.6+ / Phase 4+)
+## Still missing (closes in Phase 3.7 / Phase 4+)
 
 These are temporary gaps, not strategic non-goals — each unlocks
 when its phase ships:
 
-- **`require` + file loading**: `(require '[my.lib :as l])` from
-  disk-loaded namespace files. Load path, cycle detection,
-  idempotent loaded set. Strategy turn pending for Phase 3.6.
 - **Dynamic binding** (`^:dynamic` Vars + `(binding ...)`): for
-  the small set of thread-local-style Vars (`*out*`, etc.). Phase 3.7.
+  the small set of thread-local-style Vars (`*out*`, etc.). Phase
+  3.7 — deferred per peer-AI turn 71 until Phase 4 clarifies
+  whether transaction context wants dynamic-Var or explicit-
+  handle shape.
+- **`require` enhancements**: `:refer`, `:rename`, `:exclude`,
+  relative requires, `:reload`. v1 ships `:as` only.
 - **Protocols / multimethods**: post-stdlib.
 - **Durable identity** (`durable_ref` Values + transactional
   `swap!`/`alter`/`commute` + snapshots backed by emdb): the OTHER

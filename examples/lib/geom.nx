@@ -1,0 +1,25 @@
+; examples/lib/geom.nx — Phase 3.6 require example library
+;
+; This file is loaded by examples/require-demo.nx via
+; `(require '[lib.geom :as g])`. The required file's first
+; form MUST be `(ns NAME)` matching the requested namespace.
+
+(ns lib.geom)
+
+(defn pi []
+  ; Approximation; nexis has no floats-with-precision yet
+  ; — fixnums only in the math primitives. So we use a
+  ; rationals-as-pairs style.
+  3)
+
+(defn area-of-square [side]
+  (* side side))
+
+(defn area-of-rectangle [w h]
+  (* w h))
+
+(defn perimeter-of-square [side]
+  (* 4 side))
+
+(defn point [x y]
+  [:point x y])

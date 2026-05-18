@@ -551,6 +551,15 @@ pub const Namespace = struct {
     /// `registry.lookupNs(name)`. Null for ad-hoc namespaces
     /// constructed without going through `NamespaceRegistry`.
     registry: ?*NamespaceRegistry = null,
+    /// Phase 3.6: per-namespace alias table. Maps alias name
+    /// (e.g., "m") to the canonical namespace name (e.g.,
+    /// "my.app"). Populated by `(require '[my.app :as m])` in
+    /// the CURRENT namespace. Qualified symbol resolution
+    /// (`compileQualifiedSymbol`) checks aliases BEFORE
+    /// treating the prefix as a literal namespace name. Aliases
+    /// are namespace-local (not inherited via auto-refer).
+    aliases: std.StringHashMap([]const u8) = undefined,
+    aliases_initialized: bool = false,
     /// Backs the HashMap's internal storage.
     map_allocator: std.mem.Allocator,
     /// Backs the Var struct allocations. Lifetime = VM lifetime.
@@ -564,6 +573,8 @@ pub const Namespace = struct {
         return .{
             .map_allocator = map_allocator,
             .var_allocator = var_allocator,
+            .aliases = std.StringHashMap([]const u8).init(map_allocator),
+            .aliases_initialized = true,
         };
     }
 
@@ -572,7 +583,28 @@ pub const Namespace = struct {
         // VM.deinit. Only the hash map's internal storage
         // belongs to us here.
         self.vars.deinit(self.map_allocator);
+        if (self.aliases_initialized) self.aliases.deinit();
         self.* = undefined;
+    }
+
+    /// Phase 3.6: register an alias `alias_name → target_ns_name`
+    /// in this namespace's alias table. Used by
+    /// `(require '[my.ns :as alias])`. Replaces any existing
+    /// binding for `alias_name`. Both strings are duped into
+    /// var_allocator (stable for the namespace's lifetime)
+    /// since the caller's slices may live in a per-form arena
+    /// that dies before the next lookup.
+    pub fn putAlias(self: *Namespace, alias_name: []const u8, target_ns_name: []const u8) !void {
+        const owned_alias = try self.var_allocator.dupe(u8, alias_name);
+        const owned_target = try self.var_allocator.dupe(u8, target_ns_name);
+        try self.aliases.put(owned_alias, owned_target);
+    }
+
+    /// Phase 3.6: resolve an alias name. Returns the target
+    /// namespace name if `name` is registered as an alias in
+    /// this namespace, else null.
+    pub fn lookupAlias(self: *const Namespace, name: []const u8) ?[]const u8 {
+        return self.aliases.get(name);
     }
 
     /// Look up an existing Var. Returns null if no Var was
@@ -596,15 +628,19 @@ pub const Namespace = struct {
     /// unbound (root = nil, bound = false). The compiler uses
     /// this for forward references (step #6c).
     ///
-    /// `name` lifetime: the caller must guarantee `name` outlives
-    /// the Namespace, OR pass a stable copy. v1 tests pass
-    /// string literals (program lifetime). Step #6c will dupe
-    /// from Tiny.symbol via the compile arena.
+    /// Phase 3.6: the name is duped into `var_allocator` so
+    /// callers can pass slices from transient arenas (e.g., a
+    /// per-form reader arena that dies after `(require ...)`
+    /// loads a file). Pre-3.6 callers passed string literals,
+    /// so this dupe was a (small) leak nobody noticed; with
+    /// loader-driven interning, dupe is required for
+    /// correctness.
     pub fn intern(self: *Namespace, name: []const u8) !*Var {
         if (self.vars.get(name)) |v| return v;
+        const owned_name = try self.var_allocator.dupe(u8, name);
         const new_var = try self.var_allocator.create(Var);
-        new_var.* = .{ .name = name };
-        try self.vars.put(self.map_allocator, name, new_var);
+        new_var.* = .{ .name = owned_name };
+        try self.vars.put(self.map_allocator, owned_name, new_var);
         return new_var;
     }
 };
@@ -706,12 +742,18 @@ pub const NamespaceRegistry = struct {
         name: []const u8,
         parent: ?*Namespace,
     ) !*Namespace {
+        // Phase 3.6 fix: dupe the name into stable storage
+        // (var_allocator, typically vm.runtime_arena). The caller's
+        // `name` slice may be in a per-form reader arena that
+        // dies after the load completes; the registry map key
+        // + Namespace.name field must outlive that.
+        const owned_name = try self.var_allocator.dupe(u8, name);
         const ns = try self.var_allocator.create(Namespace);
         ns.* = Namespace.init(self.map_allocator, self.var_allocator);
-        ns.name = name;
+        ns.name = owned_name;
         ns.parent = parent;
         ns.registry = self;
-        try self.map.put(name, ns);
+        try self.map.put(owned_name, ns);
         return ns;
     }
 };

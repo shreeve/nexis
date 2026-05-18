@@ -2183,6 +2183,33 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistry(
     persistent_allocator: ?std.mem.Allocator,
     registry: ?*vm.NamespaceRegistry,
 ) CompileError!Compiled {
+    return compileFormFullWithMacrosSpanPersistentRegistryLoader(
+        allocator,
+        form,
+        namespace,
+        interner,
+        host_macros,
+        out_span,
+        persistent_allocator,
+        registry,
+        null,
+    );
+}
+
+/// Phase 3.6: full-featured form-compile entry. Accepts a
+/// `*NamespaceRegistry` for `(ns NAME)` AND a `LoadCallback`
+/// for `(require ...)`.
+pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
+    allocator: std.mem.Allocator,
+    form: *const reader_mod.Form,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+    host_macros: ?*const expand_mod.HostMacroTable,
+    out_span: ?*?reader_mod.SrcSpan,
+    persistent_allocator: ?std.mem.Allocator,
+    registry: ?*vm.NamespaceRegistry,
+    load_callback: ?expand_mod.LoadCallback,
+) CompileError!Compiled {
     var working_form: *const reader_mod.Form = form;
     if (interner != null) {
         const empty_table: expand_mod.HostMacroTable = .{};
@@ -2212,6 +2239,8 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistry(
             // sets it; ad-hoc tests pass null). Enables
             // `(ns NAME)` to switch the current namespace.
             .registry = registry,
+            // Phase 3.6: load callback for `(require ...)`.
+            .load_callback = load_callback,
         };
         working_form = expand_mod.expandForm(&mctx, null, form) catch |err| switch (err) {
             error.ExpansionDepthExceeded => {
@@ -2353,6 +2382,40 @@ pub fn compileSourceFullWithMacrosSpanPersistent(
         out_span,
         persistent_allocator,
         null,
+    );
+}
+
+/// Phase 3.6: variant with both registry AND load callback.
+/// CLI's REPL + runFile pass this so `(require ...)` works.
+pub fn compileSourceFullWithMacrosSpanPersistentRegistryLoader(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+    host_macros: ?*const expand_mod.HostMacroTable,
+    out_span: ?*?reader_mod.SrcSpan,
+    persistent_allocator: ?std.mem.Allocator,
+    registry: ?*vm.NamespaceRegistry,
+    load_callback: ?expand_mod.LoadCallback,
+) CompileError!Compiled {
+    var p = reader_mod.parser.parseForm(allocator, source) catch {
+        return CompileError.ReaderFailure;
+    };
+    defer p.parser.deinit();
+    var reader = reader_mod.Reader.init(allocator, source);
+    defer reader.deinit();
+    const form = reader.readOneForm(p.sexp) catch
+        return CompileError.ReaderFailure;
+    return compileFormFullWithMacrosSpanPersistentRegistryLoader(
+        allocator,
+        form,
+        namespace,
+        interner,
+        host_macros,
+        out_span,
+        persistent_allocator,
+        registry,
+        load_callback,
     );
 }
 
@@ -3007,8 +3070,16 @@ fn compileQualifiedSymbol(
 ) CompileError!void {
     const current_ns = e.namespace orelse return CompileError.UnresolvedSymbol;
     const registry = current_ns.registry orelse return CompileError.UnresolvedSymbol;
-    const target_ns = registry.lookupNs(ns_prefix) orelse return CompileError.UnresolvedSymbol;
-    // Qualified lookup is EXACT — no auto-refer parent walk.
+    // Phase 3.6: alias resolution. If the current namespace
+    // has registered `ns_prefix` as an alias (via
+    // `(require '[real.name :as ns_prefix])`), swap it for the
+    // canonical name before the registry lookup. Otherwise the
+    // prefix is treated as a literal namespace name.
+    const effective_prefix = if (current_ns.aliases_initialized)
+        (current_ns.lookupAlias(ns_prefix) orelse ns_prefix)
+    else
+        ns_prefix;
+    const target_ns = registry.lookupNs(effective_prefix) orelse return CompileError.UnresolvedSymbol;
     const v = target_ns.lookupLocal(name) orelse return CompileError.UnresolvedSymbol;
     // Reuse the var_table machinery (dedup + table append). We
     // bypass `addVarRef`'s lookup-then-intern path because we

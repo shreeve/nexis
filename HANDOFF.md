@@ -7,7 +7,7 @@ world-class performance. Multi-phase implementation driven by PLAN.md at
 the repository root.
 
 Phase 1 is COMPLETE (PLAN.md §20.2). **Phase 2 COMPLETE**.
-**Phase 3 COMPLETE through 3.5**:
+**Phase 3 COMPLETE through 3.6** (3.7 deferred per peer turn 71):
 every primitive-core form compiles + executes, host macros +
 user `defmacro` (compile-time VM eval) + procedural macros via
 native primitives + syntax-quote + collections + try/catch/
@@ -19,14 +19,22 @@ auto-refer + full destructuring (sequential / associative /
 nested / `& rest` / `:as` / `:keys` / `:or`) + multi-arity
 `defn`. The LANGUAGE is feature-complete for v1.
 
-562 phase2 tests + 86 reader/golden = 648 tests in the fast
+563 phase2 tests + 86 reader/golden = 649 tests in the fast
 inner-loop suite (~3s). Full suite (`zig build test`) green
 including Phase 1 randomized property tests.
 
-Phase 3 remaining (post-language-complete polish):
-  - Phase 3.6: `require` + file loading + aliases (strategy
-    turn pending).
-  - Phase 3.7: `^:dynamic` Vars + `binding`.
+Phase 3.6 adds: `(require 'my.lib)` + `(require '[my.lib :as l])`,
+ns-to-file mapping (`my.app.foo` → `my/app/foo.nx`), load
+path (CWD + source-file dir for `run`), cycle detection,
+idempotent loaded set, namespace-mismatch validation
+(required file's `(ns NAME)` MUST match requested name).
+Deferred (v1.x): `:refer`/`:rename`/`:exclude`/relative
+requires/`:reload`.
+
+Phase 3 remaining:
+  - Phase 3.7: `^:dynamic` Vars + `binding`. DEFERRED per
+    peer turn 71 §1: Phase 4 may reveal whether transaction
+    context wants dynamic-Var or explicit-handle shape.
 
 Phase 4 (the OTHER big arc): durable identity as a first-class
 language concept — `durable_ref` Values, transactional
@@ -120,7 +128,8 @@ Read this entire prompt before touching anything.
 - Branch:   main
 - HEAD:     check `git log -1 --oneline`. Recent commit chain
             (newest first):
-              (pending) phase 3.5b: multi-arity defn
+              (pending) phase 3.6: require + file loading + :as aliases
+              e5639d8 phase 3.5b: multi-arity defn — Phase 3 SEALED
               0fe09fa phase 3.5a: destructuring in let / fn / defn params
               83f8e85 phase 3.4: multi-namespace (registry + qualified symbols + ns)
               d36b745 phase 3.3d: embedded core.nx composite stdlib layer

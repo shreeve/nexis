@@ -90,6 +90,17 @@ pub const CompileEvalContext = struct {
     ) anyerror!value_mod.Value,
 };
 
+/// Phase 3.6 (peer-AI turn 71): callback used by `(require ...)`
+/// to load a namespace from disk. Set by the CLI / test harness.
+/// The callback is responsible for ALL file-loading concerns
+/// (path resolution, parsing, compilation, evaluation, registry
+/// updates, cycle detection). The expander just decodes the
+/// `(require ...)` arg and dispatches.
+pub const LoadCallback = struct {
+    user_data: *anyopaque,
+    load: *const fn (user_data: *anyopaque, ns_name: []const u8) anyerror!void,
+};
+
 /// Per-spec MACROEXPAND.md §1: bundles every cross-cutting
 /// resource a host MacroFn might need. Lives FOR THE LIFETIME
 /// of a single compilation unit (typically one CLI invocation
@@ -123,6 +134,11 @@ pub const ExpandContext = struct {
     /// CLI sets this; ad-hoc tests can leave it null (in which
     /// case `(ns NAME)` raises MalformedMacroCall).
     registry: ?*vm_mod.NamespaceRegistry = null,
+    /// Phase 3.6: when set, `(require ...)` special form calls
+    /// through this callback to load a namespace from disk.
+    /// Null = `(require ...)` raises MalformedMacroCall (useful
+    /// for tests that compile in-memory only).
+    load_callback: ?LoadCallback = null,
     /// Phase 3.2: lazy-init heap for arg Value construction.
     /// Macro args that are vectors/maps/sets need a heap for
     /// their backing nodes. We use ExpandContext.allocator
@@ -353,6 +369,7 @@ fn expandList(
     if (std.mem.eql(u8, name, "throw")) return try expandOrdinaryCall(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "defmacro")) return try expandDefmacro(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "ns")) return try expandNs(ctx, list_form, items);
+    if (std.mem.eql(u8, name, "require")) return try expandRequire(ctx, list_form, items);
     // Step #8c.1: internal compiler primitives (#%list / #%concat).
     // Recognized as special forms — NOT user-shadowable, NOT
     // looked up in the macro table. Args ARE recursively
@@ -1135,6 +1152,85 @@ fn expandNs(
     // side effect already happened; nothing else to do at
     // runtime.
     return try makeNil(ctx, list_form.origin);
+}
+
+/// Phase 3.6 (peer-AI turn 71): expand `(require ...)`. Supported
+/// forms:
+///
+///   (require 'my.ns)              ; load my.ns; no alias
+///   (require '[my.ns :as alias])  ; load my.ns + alias `alias` → my.ns
+///
+/// The side effect (file load + registry update + alias entry)
+/// happens at EXPANSION TIME via `ctx.load_callback`. The
+/// replacement form is `nil` (the runtime no longer has work to
+/// do). Both forms accept `:as` only — `:refer` / `:rename` /
+/// `:exclude` are deferred.
+///
+/// Multiple specs in one require call (Clojure-style
+/// `(require '[a] '[b])`) supported.
+fn expandRequire(
+    ctx: *ExpandContext,
+    list_form: *const Form,
+    items: []const *Form,
+) ExpandError!*Form {
+    if (items.len < 2) return ExpandError.MalformedMacroCall;
+    const cb = ctx.load_callback orelse return ExpandError.MalformedMacroCall;
+    const reg = ctx.registry orelse return ExpandError.MalformedMacroCall;
+
+    // Each item after the head is a require spec. The reader
+    // sees `'X` as a `Datum.quote{X}` form; we unwrap one level.
+    for (items[1..]) |spec_form| {
+        const spec = unwrapQuote(spec_form);
+        switch (spec.datum) {
+            .symbol => |sym| {
+                if (sym.ns != null) return ExpandError.MalformedMacroCall;
+                cb.load(cb.user_data, sym.name) catch return ExpandError.MalformedMacroCall;
+            },
+            .vector => |elems| {
+                if (elems.len < 1) return ExpandError.MalformedMacroCall;
+                const ns_form = elems[0];
+                if (ns_form.datum != .symbol or ns_form.datum.symbol.ns != null) {
+                    return ExpandError.MalformedMacroCall;
+                }
+                const ns_name = ns_form.datum.symbol.name;
+                // Optional `:as alias` clause.
+                var alias_name: ?[]const u8 = null;
+                var i: usize = 1;
+                while (i < elems.len) : (i += 2) {
+                    const k = elems[i];
+                    if (k.datum != .keyword or k.datum.keyword.ns != null) {
+                        return ExpandError.MalformedMacroCall;
+                    }
+                    if (std.mem.eql(u8, k.datum.keyword.name, "as")) {
+                        if (i + 1 >= elems.len) return ExpandError.MalformedMacroCall;
+                        const alias_form = elems[i + 1];
+                        if (alias_form.datum != .symbol or alias_form.datum.symbol.ns != null) {
+                            return ExpandError.MalformedMacroCall;
+                        }
+                        alias_name = alias_form.datum.symbol.name;
+                    } else {
+                        // :refer / :rename / :exclude deferred.
+                        return ExpandError.MalformedMacroCall;
+                    }
+                }
+                cb.load(cb.user_data, ns_name) catch return ExpandError.MalformedMacroCall;
+                if (alias_name) |an| {
+                    reg.current.putAlias(an, ns_name) catch return ExpandError.OutOfMemory;
+                }
+            },
+            else => return ExpandError.MalformedMacroCall,
+        }
+    }
+    return try makeNil(ctx, list_form.origin);
+}
+
+/// Unwrap one level of `(quote X)` from a Form. Returns X if
+/// the form is a quote; else returns the form unchanged.
+fn unwrapQuote(form: *const Form) *const Form {
+    return switch (form.datum) {
+        .quote => |inner| inner,
+        else => form,
+    };
 }
 
 /// Phase 3.2: expand `(defmacro name [params] body)`.
