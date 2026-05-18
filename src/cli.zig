@@ -118,10 +118,10 @@ const Usage =
     \\  exceptions: (try body (catch any e handler) [(finally ...)])
     \\              (throw value)
     \\
-    \\Limitations (closes as Phase 2 progresses):
-    \\  - try/finally + recur-in-try: step #9.2
-    \\  - error spans / structured diagnostics: step #10
-    \\  - #(...) anon-fn shorthand: post-#10
+    \\Limitations (post-v1):
+    \\  - recur-in-try: not supported (wrap try around loop)
+    \\  - runtime VM errors not catchable: KindMismatch etc. halt
+    \\  - #(...) anon-fn shorthand: Phase 3
     \\  - REPL / module loading / user defmacro: Phase 3+
     \\
 ;

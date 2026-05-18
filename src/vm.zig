@@ -793,7 +793,10 @@ pub const Handler = struct {
     /// Slot into which the thrown value is stored when the
     /// catch fires. Valid only when kind == .try_.
     binding_slot: u12,
-    /// Reserved for step #9.2. `null` in #9.1.
+    /// Step #9.2: PC of the finally entry. null when the try
+    /// has no finally clause. Both .try_ and .cleanup handlers
+    /// carry this so unwind through either kind runs the
+    /// finally.
     finally_pc: ?u32 = null,
     /// Stack depth (logical, NOT physical) when the handler
     /// was registered. On throw-unwind, shrink stack back to
@@ -801,6 +804,28 @@ pub const Handler = struct {
     /// frame (we don't yet have dynamic stack growth within a
     /// frame), but reserved for future call-window cleanup.
     saved_stack_len: usize,
+};
+
+/// Step #9.2 (peer-AI turn 59 §D5): tagged continuation for
+/// finally bodies. When a try-exit / catch-exit / throw-unwind
+/// path needs to run a finally, it pushes a continuation onto
+/// `VM.finally_stack` describing what to do AFTER the finally
+/// finishes.
+pub const FinallyReason = union(enum) {
+    /// Finally was reached via normal/caught exit. Resume at
+    /// `post_pc` after the finally body completes.
+    normal: u32,
+    /// Finally was reached during throw-unwind. The thrown
+    /// value must continue propagating after the finally
+    /// completes.
+    throwing: Value,
+};
+
+pub const FinallyContinuation = struct {
+    /// Frame the originating handler belonged to. Used as a
+    /// sanity check at finally-exit time.
+    frame_index: usize,
+    reason: FinallyReason,
 };
 
 // =============================================================================
@@ -843,6 +868,11 @@ pub const VM = struct {
     /// `frame_index` so throw-unwind can identify which frame
     /// it belongs to.
     handlers: std.ArrayList(Handler) = .empty,
+    /// Step #9.2: finally continuation stack. Pushed by
+    /// try-exit (when the popped handler has a finally) and by
+    /// throw-unwind (when a finally must run before the throw
+    /// continues). Popped by finally-exit.
+    finally_stack: std.ArrayList(FinallyContinuation) = .empty,
     /// Step #9.1: if a `ctrl:throw` walks the entire frame
     /// chain without finding a matching handler, the VM halts
     /// with `VmError.UncaughtThrow` AND stores the thrown
@@ -902,9 +932,10 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *VM) void {
-        // Step #9.1: free the handler stack backing storage.
-        // Handlers themselves are POD (no nested allocations).
+        // Step #9.1/#9.2: free handler + finally stack backing
+        // storage. Both contain POD entries.
         self.handlers.deinit(self.allocator);
+        self.finally_stack.deinit(self.allocator);
         // Interner owns hash maps allocated via self.allocator;
         // free explicitly (step E1).
         if (self.interner) |*it| it.deinit();
@@ -2093,23 +2124,28 @@ pub const VM = struct {
             .try_enter => try self.execCtrlTryEnter(inst),
             .try_exit => try self.execCtrlTryExit(inst),
             .throw_ => try self.execCtrlThrow(inst),
-            // finally_exit and halt_ reserved for later commits.
-            .finally_exit, .halt_ => return VmError.UnimplementedOpcode,
+            .finally_exit => try self.execCtrlFinallyExit(inst),
+            .halt_ => return VmError.UnimplementedOpcode,
             _ => return VmError.BytecodeCorruption,
         }
     }
 
-    /// `ctrl:try-enter A=catch_pc B=binding_slot C=unused` —
+    /// `ctrl:try-enter A=catch_pc B=binding_slot C=finally_pc?` —
     /// push a try handler onto the global handler stack.
     /// catch_pc is absolute within the current routine.
     /// binding_slot is where the thrown value will be stored.
-    /// C MUST be `.unused` in #9.1 (reserved for finally_pc
-    /// in #9.2).
+    ///
+    /// Step #9.2: C may now carry an absolute finally_pc as a
+    /// `.jump` operand, OR remain `.unused` for try forms
+    /// without a finally clause.
     fn execCtrlTryEnter(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .jump) return VmError.InvalidOperandKind;
         if (inst.b.kind != .slot) return VmError.InvalidOperandKind;
-        // C reserved for finally_pc (#9.2). Must be unused now.
-        if (inst.c.kind != .unused) return VmError.InvalidOperandKind;
+        const finally_pc: ?u32 = switch (inst.c.kind) {
+            .unused => null,
+            .jump => inst.c.index,
+            else => return VmError.InvalidOperandKind,
+        };
 
         const frame_index = self.frames.items.len - 1;
         const frame = self.currentFrame();
@@ -2118,15 +2154,19 @@ pub const VM = struct {
             .frame_index = frame_index,
             .catch_pc = inst.a.index,
             .binding_slot = inst.b.index,
-            .finally_pc = null,
+            .finally_pc = finally_pc,
             .saved_stack_len = @as(usize, frame.base_slot) + @as(usize, frame.slot_count),
         });
     }
 
     /// `ctrl:try-exit A=post_pc B=unused C=unused` — pop the
-    /// current handler (must belong to this frame) and jump to
-    /// post_pc. Used on BOTH normal try-body exit AND catch-
-    /// body exit (the catch's handler is a `.cleanup` kind).
+    /// current handler (must belong to this frame).
+    ///
+    /// Step #9.1: jumps directly to post_pc.
+    /// Step #9.2: if the popped handler had a finally, push a
+    /// `.normal(post_pc)` FinallyContinuation and jump to
+    /// finally_pc instead. The finally-exit opcode pops the
+    /// continuation and jumps to post_pc.
     fn execCtrlTryExit(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .jump) return VmError.InvalidOperandKind;
         const post_pc: u32 = inst.a.index;
@@ -2138,7 +2178,33 @@ pub const VM = struct {
 
         _ = self.handlers.pop();
         const frame = self.currentFrame();
-        frame.pc = post_pc;
+        if (top.finally_pc) |fpc| {
+            try self.finally_stack.append(self.allocator, .{
+                .frame_index = frame_index,
+                .reason = .{ .normal = post_pc },
+            });
+            frame.pc = fpc;
+        } else {
+            frame.pc = post_pc;
+        }
+    }
+
+    /// `ctrl:finally-exit` (step #9.2) — pop the topmost
+    /// FinallyContinuation and dispatch on its reason.
+    fn execCtrlFinallyExit(self: *VM, _: Inst) VmError!void {
+        if (self.finally_stack.items.len == 0) return VmError.InvalidHandlerState;
+        const cont = self.finally_stack.pop().?;
+        const frame_index = self.frames.items.len - 1;
+        if (cont.frame_index != frame_index) return VmError.InvalidHandlerState;
+        switch (cont.reason) {
+            .normal => |post_pc| {
+                const frame = self.currentFrame();
+                frame.pc = post_pc;
+            },
+            .throwing => |value| {
+                try self.unwindThrow(value);
+            },
+        }
     }
 
     /// `ctrl:throw A=value_operand B=unused C=unused` — throw
@@ -2160,24 +2226,33 @@ pub const VM = struct {
         try self.unwindThrow(value);
     }
 
-    /// Walk the handler stack looking for the topmost `.try_`
-    /// handler. Cleanup records above it (from catch bodies
-    /// in inner scopes) are discarded along the way. Returns
-    /// the index of the matching handler in `self.handlers`,
-    /// or null if nothing matches.
-    fn findTryHandler(self: *VM) ?usize {
+    /// Walk the handler stack top-down looking for the topmost
+    /// handler that catches a throw. Per step #9.2:
+    ///   - `.try_` handlers catch (jump to catch_pc).
+    ///   - `.cleanup` handlers do NOT catch but DO run their
+    ///     finally (jump to finally_pc with .throwing
+    ///     continuation).
+    ///   - `.cleanup` with no finally is just bookkeeping —
+    ///     skip it.
+    /// Returns the index of the matching handler in
+    /// `self.handlers`, or null if nothing matches.
+    fn findThrowTarget(self: *VM) ?usize {
         var i: usize = self.handlers.items.len;
         while (i > 0) {
             i -= 1;
-            if (self.handlers.items[i].kind == .try_) return i;
+            const h = self.handlers.items[i];
+            switch (h.kind) {
+                .try_ => return i,
+                .cleanup => if (h.finally_pc != null) return i,
+            }
         }
         return null;
     }
 
     /// Common throw-unwind logic. Used by `execCtrlThrow` and
-    /// (eventually #9.2) by finally-exit's throwing continuation.
+    /// by `finally-exit`'s `.throwing` continuation.
     fn unwindThrow(self: *VM, value: Value) VmError!void {
-        const handler_idx = self.findTryHandler() orelse {
+        const handler_idx = self.findThrowTarget() orelse {
             // No matching handler anywhere — uncaught.
             self.unhandled_throw = value;
             return VmError.UncaughtThrow;
@@ -2185,8 +2260,9 @@ pub const VM = struct {
         const matched = self.handlers.items[handler_idx];
 
         // Discard any handlers above the matched one (cleanup
-        // records from inner scopes that didn't match — they
-        // can't fire again).
+        // records from inner scopes that we passed over —
+        // they're no longer reachable since their try is
+        // unwinding through us).
         self.handlers.shrinkRetainingCapacity(handler_idx);
 
         // Unwind frames above the matched handler's frame.
@@ -2198,37 +2274,52 @@ pub const VM = struct {
         }
 
         // Shrink stack back to the matched frame's logical end.
-        // saved_stack_len was set at try-enter time to
-        // (base_slot + slot_count); throw unwind shrinks back to
-        // there, discarding any callee slots.
         if (self.stack.items.len > matched.saved_stack_len) {
             self.stack.shrinkRetainingCapacity(matched.saved_stack_len);
         }
 
-        // Push a cleanup handler in place of the original try
-        // (peer-AI turn 59 §D5 "classic trap" fix). This protects
-        // the catch body from being re-caught by its own handler
-        // and gives the catch body's `try-exit` something to pop.
-        try self.handlers.append(self.allocator, .{
-            .kind = .cleanup,
-            .frame_index = matched.frame_index,
-            .catch_pc = 0,
-            .binding_slot = 0,
-            .finally_pc = matched.finally_pc, // null in #9.1
-            .saved_stack_len = matched.saved_stack_len,
-        });
-
-        // Store thrown value into the handler's binding_slot.
-        // The slot is in the matched frame's logical slot space.
         const frame = self.currentFrame();
-        if (matched.binding_slot >= frame.slot_count) {
-            return VmError.InvalidHandlerState;
-        }
-        const ptr = try self.slotPtr(matched.binding_slot);
-        ptr.* = value;
 
-        // Jump to catch entry.
-        frame.pc = matched.catch_pc;
+        switch (matched.kind) {
+            .try_ => {
+                // Push a cleanup handler in place of the original
+                // try (peer-AI turn 59 §D5 "classic trap" fix).
+                // This protects the catch body from being re-caught
+                // by its own handler and gives the catch body's
+                // `try-exit` something to pop. The cleanup INHERITS
+                // the try's finally_pc so a throw inside the catch
+                // body still runs the finally.
+                try self.handlers.append(self.allocator, .{
+                    .kind = .cleanup,
+                    .frame_index = matched.frame_index,
+                    .catch_pc = 0,
+                    .binding_slot = 0,
+                    .finally_pc = matched.finally_pc,
+                    .saved_stack_len = matched.saved_stack_len,
+                });
+
+                // Store thrown value into the handler's binding_slot.
+                if (matched.binding_slot >= frame.slot_count) {
+                    return VmError.InvalidHandlerState;
+                }
+                const ptr = try self.slotPtr(matched.binding_slot);
+                ptr.* = value;
+
+                // Jump to catch entry.
+                frame.pc = matched.catch_pc;
+            },
+            .cleanup => {
+                // The popped record was a cleanup with finally.
+                // Push a .throwing continuation so the finally
+                // resumes the throw after completion.
+                const fpc = matched.finally_pc orelse return VmError.InvalidHandlerState;
+                try self.finally_stack.append(self.allocator, .{
+                    .frame_index = matched.frame_index,
+                    .reason = .{ .throwing = value },
+                });
+                frame.pc = fpc;
+            },
+        }
     }
 };
 
@@ -2479,13 +2570,40 @@ pub const asm_ = struct {
         );
     }
 
-    /// ctrl:try-exit post_pc _ _   ; pop handler, jump to post_pc.
-    /// Step #9.1.
+    /// ctrl:try-enter catch_pc binding_slot finally_pc  ; push
+    /// handler with finally. Step #9.2.
+    pub fn tryEnterFinally(catch_pc: u12, binding_slot: u12, finally_pc: u12) Inst {
+        return Inst.primary(
+            .ctrl,
+            CtrlOp.try_enter,
+            Operand.jump(catch_pc),
+            Operand.slot(binding_slot),
+            Operand.jump(finally_pc),
+        );
+    }
+
+    /// ctrl:try-exit post_pc _ _   ; pop handler.
+    /// Step #9.1: jump to post_pc.
+    /// Step #9.2: if popped handler has finally, push
+    /// `.normal(post_pc)` continuation + jump to finally.
     pub fn tryExit(post_pc: u12) Inst {
         return Inst.primary(
             .ctrl,
             CtrlOp.try_exit,
             Operand.jump(post_pc),
+            Operand.none,
+            Operand.none,
+        );
+    }
+
+    /// ctrl:finally-exit _ _ _   ; pop FinallyContinuation +
+    /// dispatch (.normal jumps post_pc, .throwing continues
+    /// unwind). Step #9.2.
+    pub fn finallyExit() Inst {
+        return Inst.primary(
+            .ctrl,
+            CtrlOp.finally_exit,
+            Operand.none,
             Operand.none,
             Operand.none,
         );

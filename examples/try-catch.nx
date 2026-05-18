@@ -1,24 +1,27 @@
-; examples/try-catch.nx — try / catch / throw, step #9.1.
+; examples/try-catch.nx — try / catch / throw / finally
+; (steps #9.1 + #9.2).
 ;
-; v1 supports: throw any value, catch-any binding, cross-frame
-; propagation. The throw walks up the frame chain until it
-; finds a try handler.
+; v1 supports:
+;   - throw any value (slot/constant/var operand)
+;   - catch-any binding
+;   - cross-frame propagation (callee throws, caller catches)
+;   - finally clauses (runs on normal exit, caught throw,
+;     uncaught throw); throw inside finally overrides
 ;
-; Deferred to #9.2: finally clauses, recur inside try.
-; Deferred to post-#10: catching VM-detected errors
-; (KindMismatch / DivideByZero / etc. still halt the VM
-; rather than being caught).
+; Limitations:
+;   - recur inside try not supported (wrap try around loop)
+;   - runtime VM errors (KindMismatch etc.) not catchable
+;   - only `(catch any binding handler)` matcher in v1
 
 (defn safe-divide [a b]
   (try
     (do
       ; A user-thrown :div-by-zero signals invalid input.
-      ; In v1 the throw payload is just a value; richer
-      ; structured-error conventions land later.
       (when (< b 1)
         (throw :div-by-zero))
-      a)                ; placeholder for actual division
-    (catch any e e)))
+      a)
+    (catch any e e)
+    (finally :always-runs)))   ; finally body runs but value discarded
 
-; Returns 42 — no throw, normal exit.
+; Result: 42. Finally body always runs; its value is ignored.
 (safe-divide 42 1)

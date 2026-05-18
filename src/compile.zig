@@ -1790,9 +1790,9 @@ fn lowerTry(
 ) CompileError!*Tiny {
     if (args.len < 2) return CompileError.MalformedForm;
 
-    // Last arg should be the catch (or finally for #9.2).
-    // For v1, partition by walking from the end: optional
-    // finally (last), then required catch, then body.
+    // Last arg should be the catch (or finally).
+    // Partition by walking from the end: optional finally
+    // (last), then required catch, then body.
     var end = args.len;
     var finally_form: ?*reader_mod.Form = null;
 
@@ -1810,7 +1810,7 @@ fn lowerTry(
             }
         }
     }
-    if (finally_form != null) return CompileError.UnsupportedFeature;
+    // Step #9.2: finally is now SUPPORTED.
 
     if (end < 2) return CompileError.MalformedForm;
     const catch_form = args[end - 1];
@@ -1848,11 +1848,22 @@ fn lowerTry(
     try handler_env.lexical_names.put(allocator, binding);
     const handler_body = try lowerBody(allocator, handler_items, ctx.withEnv(&handler_env));
 
+    // Step #9.2: lower the finally body if present. It sees
+    // the OUTER lexical env (NOT the catch binding).
+    var finally_tiny: ?*const Tiny = null;
+    if (finally_form) |ff| {
+        if (ff.datum != .list or ff.datum.list.len < 1) return CompileError.MalformedForm;
+        const fitems = ff.datum.list;
+        // (finally body...) — body forms.
+        finally_tiny = try lowerBody(allocator, fitems[1..], ctx);
+    }
+
     return try allocTiny(allocator, .{
         .try_ = .{
             .body = body,
             .binding = binding,
             .handler = handler_body,
+            .finally_ = finally_tiny,
         },
     });
 }
@@ -2246,6 +2257,7 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
             try handler_env.unionWith(allocator, env);
             try handler_env.put(allocator, t.binding);
             try freeVars(allocator, t.handler, &handler_env, out);
+            if (t.finally_) |fin| try freeVars(allocator, fin, env, out);
         },
         .throw_ => |value| try freeVars(allocator, value, env, out),
         .def => |d| {
@@ -2419,6 +2431,7 @@ fn capturedByDescendantFns(
             try handler_env.unionWith(allocator, env);
             try handler_env.put(allocator, t.binding);
             try capturedByDescendantFns(allocator, t.handler, &handler_env, out);
+            if (t.finally_) |fin| try capturedByDescendantFns(allocator, fin, env, out);
         },
         .throw_ => |value| try capturedByDescendantFns(allocator, value, env, out),
         .def => |d| {
@@ -2478,7 +2491,7 @@ fn compileExpr(
         .list_construct => |items| try compileListConstruct(e, items, dst),
         .concat => |items| try compileConcat(e, items, dst),
         .vector_construct => |items| try compileVectorConstruct(e, items, dst),
-        .try_ => |t| try compileTry(e, t.body, t.binding, t.handler, dst),
+        .try_ => |t| try compileTry(e, t.body, t.binding, t.handler, t.finally_, dst),
         .throw_ => |value| try compileThrow(e, value, dst),
         .add => |a| try compileAdd(e, a.lhs, a.rhs, dst),
         .lt => |a| try compileLt(e, a.lhs, a.rhs, dst),
@@ -2833,47 +2846,45 @@ fn compileLetStar(
     try compileExpr(e, body, dst, recur_target);
 }
 
-/// Step #9.1 (peer-AI turn 59): lower `(try body (catch any
-/// binding handler))`. v1 = catch-any only; finally deferred
-/// to #9.2.
+/// Step #9.1/#9.2 (peer-AI turns 59/61): lower `(try body
+/// (catch any binding handler) (finally body))`.
 ///
-/// Layout (per peer-AI turn 59 §D5 + hand-trace):
-///
+/// Layout WITHOUT finally:
 ///   try-enter catch_pc binding_slot _
 ///   <body → dst>
 ///   try-exit post_pc
-///   <pad>            ; never reached (try-exit jumps to post)
 /// catch_pc:
 ///   <handler → dst, binding in scope>
-///   try-exit post_pc ; pops the cleanup handler installed by throw
+///   try-exit post_pc
 /// post_pc:
-///   ...
 ///
-/// VM mechanics: try-enter pushes a `.try_` handler. Throw
-/// finds it, REPLACES with `.cleanup` (so the catch body's own
-/// throw isn't re-caught), stores the thrown value into
-/// binding_slot, jumps to catch_pc. Catch body's try-exit pops
-/// the cleanup. Body-normal-exit's try-exit pops the try.
+/// Layout WITH finally (step #9.2):
+///   try-enter catch_pc binding_slot finally_pc
+///   <body → dst>
+///   try-exit post_pc          ; VM pushes .normal(post_pc),
+///                              ; jumps to finally_pc
+/// catch_pc:
+///   <handler → dst, binding in scope>
+///   try-exit post_pc          ; same: VM pushes .normal,
+///                              ; runs finally, resumes post_pc
+/// finally_pc:
+///   <finally body → scratch_slot>  ; result discarded
+///   finally-exit               ; VM pops continuation,
+///                              ; dispatches (.normal → post,
+///                              ;             .throwing → unwind)
+/// post_pc:
 ///
-/// Captured-binding pre-analysis: the catch binding is treated
-/// the same as a `let*` binding — if descendant `fn*` bodies
-/// capture it, emit `closure:box-local` after the throw stores
-/// into the slot. But this introduces an ordering problem:
-/// throw stores BEFORE catch entry, then catch entry would need
-/// to box. For v1 simplicity, the catch binding is always
-/// `.direct_slot` (uncaptured). If user code captures it, raise
-/// `UnsupportedFeature` — easy to detect via the analyzer.
+/// The finally body sees the OUTER lexical scope, NOT the
+/// catch binding (which is only in scope inside the handler).
 fn compileTry(
     e: *Emitter,
     body: *const Tiny,
     binding: []const u8,
     handler: *const Tiny,
+    finally_: ?*const Tiny,
     dst: u12,
 ) CompileError!void {
-    // Detect whether the catch binding is captured by any
-    // descendant fn in the handler body. v1 doesn't support
-    // captured catch bindings (would require boxing on the
-    // throw path, not in straight-line code).
+    // Reject captured catch binding per #9.1 staging.
     {
         var env: NameSet = .{};
         defer env.deinit(e.allocator);
@@ -2884,46 +2895,60 @@ fn compileTry(
         if (captured.contains(binding)) return CompileError.UnsupportedFeature;
     }
 
-    // Allocate the binding slot up front so try-enter's operand
-    // is stable. Slot lifetime: from try-enter through the
-    // handler body (catch). Body doesn't need this slot.
     const binding_slot = try e.allocSlot();
+    // Scratch slot for finally body's result (discarded). Even
+    // when finally is absent we allocate to keep dst-slot
+    // ownership clean.
+    const finally_scratch: u12 = if (finally_ != null) try e.allocSlot() else 0;
 
-    // Emit try-enter with a placeholder catch_pc. We patch it
-    // after we know the catch entry's PC.
+    // Emit try-enter with placeholder catch_pc (and
+    // finally_pc when present). Patch after we know both PCs.
     const try_enter_pc: u32 = @intCast(e.code.items.len);
-    try e.emit(vm.asm_.tryEnter(0, binding_slot));
+    if (finally_ != null) {
+        try e.emit(vm.asm_.tryEnterFinally(0, binding_slot, 0));
+    } else {
+        try e.emit(vm.asm_.tryEnter(0, binding_slot));
+    }
 
-    // Compile body → dst. Body is non-tail (recur is rejected
-    // inside try per peer-AI turn 59 §D6).
+    // Body → dst.
     try compileExpr(e, body, dst, null);
 
-    // try-exit with placeholder post_pc.
+    // Body-exit try-exit (post_pc placeholder).
     const body_exit_pc: u32 = @intCast(e.code.items.len);
     try e.emit(vm.asm_.tryExit(0));
 
-    // Mark catch entry; patch try-enter.
+    // Catch entry.
     const catch_pc: u32 = @intCast(e.code.items.len);
     {
         const enter_inst = &e.code.items[try_enter_pc];
         enter_inst.a = vm.Operand.jump(@intCast(catch_pc));
     }
 
-    // Push the binding into scope for the handler body.
     const scope_mark = e.scope.items.len;
     defer e.scope.shrinkRetainingCapacity(scope_mark);
     try e.pushBinding(binding, binding_slot);
-
-    // Compile handler → dst (also non-tail; recur invalid in
-    // catch body in v1).
     try compileExpr(e, handler, dst, null);
+    e.scope.shrinkRetainingCapacity(scope_mark);
 
-    // Catch's try-exit pops the cleanup handler that throw
-    // installed. Placeholder post_pc, patched below.
+    // Catch-exit try-exit (post_pc placeholder).
     const catch_exit_pc: u32 = @intCast(e.code.items.len);
     try e.emit(vm.asm_.tryExit(0));
 
-    // post_pc = current end of code. Patch both try-exits.
+    // Optional finally block + finally-exit.
+    var finally_pc: u32 = 0;
+    if (finally_) |fin_body| {
+        finally_pc = @intCast(e.code.items.len);
+        // Finally body sees OUTER scope (binding is out of
+        // scope here — we already popped it). Result discarded
+        // into finally_scratch slot.
+        try compileExpr(e, fin_body, finally_scratch, null);
+        try e.emit(vm.asm_.finallyExit());
+        // Patch try-enter's finally_pc operand.
+        const enter_inst = &e.code.items[try_enter_pc];
+        enter_inst.c = vm.Operand.jump(@intCast(finally_pc));
+    }
+
+    // post_pc = end of code. Patch both try-exits.
     const post_pc: u32 = @intCast(e.code.items.len);
     {
         const body_exit = &e.code.items[body_exit_pc];
@@ -7618,26 +7643,173 @@ test "compile #9.1: try without catch or finally → MalformedForm" {
     );
 }
 
-test "compile #9.1: try with finally clause → UnsupportedFeature (deferred to #9.2)" {
+// ---- step #9.2: finally clauses end-to-end ----------
+
+test "compile #9.2: try/catch/finally — normal exit runs finally" {
+    // Body returns 1; catch unused; finally runs but result is
+    // discarded — the try expression's value is 1.
+    try expectFixnumDefaultMacros(
+        "(try 1 (catch any e 99) (finally 42))",
+        1,
+    );
+}
+
+test "compile #9.2: try/catch/finally — caught throw + finally" {
+    // Body throws :a; catch binds e and returns 7; finally runs
+    // but result discarded — try expression's value is 7.
+    try expectFixnumDefaultMacros(
+        "(try (throw 13) (catch any e 7) (finally 99))",
+        7,
+    );
+}
+
+test "compile #9.2: try/catch/finally — finally side effect via def" {
+    // The finally body sets a Var; after the try expression
+    // returns, the Var holds the new value. Proves finally
+    // actually ran.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
     const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
+    const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
     var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
-    try testing.expectError(
-        CompileError.UnsupportedFeature,
-        compileSourceFullWithMacros(
-            arena.allocator(),
-            "(try 1 (catch any e e) (finally 2))",
-            null,
-            interner,
-            &host_macros,
-        ),
-    );
+    const src =
+        \\(do
+        \\  (def fired 0)
+        \\  (try
+        \\    1
+        \\    (catch any e e)
+        \\    (finally (def fired 1)))
+        \\  fired)
+    ;
+    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
+    const routine = compiled.toRoutine("p");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
+test "compile #9.2: uncaught throw — finally runs then throw propagates" {
+    // Outer try catches; inner try has only finally. Body
+    // throws; inner finally runs (side effect via def); outer
+    // catch receives the original thrown value.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    // Note: a try with finally but no catch isn't supported by
+    // the v1 grammar (we require catch). So we use catch that
+    // rethrows + outer try to test the throw-through-finally
+    // path.
+    const src =
+        \\(do
+        \\  (def fired 0)
+        \\  (try
+        \\    (try
+        \\      (throw 42)
+        \\      (catch any e (throw e))
+        \\      (finally (def fired 1)))
+        \\    (catch any e e)))
+    ;
+    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
+    const routine = compiled.toRoutine("p");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    // The outer try received 42 from the inner rethrow.
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+    // The inner finally ran (fired = 1).
+    const fired_var = v.namespace.?.lookup("fired").?;
+    try testing.expectEqual(@as(i64, 1), fired_var.root.asFixnum());
+}
+
+test "compile #9.2: throw inside finally replaces pending value" {
+    // Body returns 1; finally throws :replaced. Per peer-AI
+    // turn 61 + Clojure semantics: the new throw replaces
+    // whatever was happening; outer catch receives :replaced
+    // (not 1).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    const src =
+        \\(try
+        \\  (try
+        \\    1
+        \\    (catch any e e)
+        \\    (finally (throw 99)))
+        \\  (catch any e e))
+    ;
+    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
+    const routine = compiled.toRoutine("p");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    // The outer catch sees 99 (the finally's throw), not the
+    // body's value 1.
+    try testing.expectEqual(@as(i64, 99), result.asFixnum());
+}
+
+test "compile #9.2: finally body runs on caught-throw exit" {
+    // Body throws → catch caught it → finally runs after.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const ns = v.ensureNamespace();
+    const interner = v.ensureInterner();
+    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    const src =
+        \\(do
+        \\  (def fired 0)
+        \\  (try
+        \\    (throw 7)
+        \\    (catch any e e)
+        \\    (finally (def fired 1)))
+        \\  fired)
+    ;
+    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
+    const routine = compiled.toRoutine("p");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
 test "compile #9.1: non-any matcher → UnsupportedFeature" {
