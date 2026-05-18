@@ -6,28 +6,33 @@ inspired by Clojure, built for persistent data, durable identity, and
 world-class performance. Multi-phase implementation driven by PLAN.md at
 the repository root.
 
-Phase 1 is COMPLETE (PLAN.md §20.2). **Phase 2 is COMPLETE**.
-**Phase 3.0/3.1/3.2/3.3a are COMPLETE**:
+Phase 1 is COMPLETE (PLAN.md §20.2). **Phase 2 COMPLETE**.
+**Phase 3 COMPLETE through 3.5**:
 every primitive-core form compiles + executes, host macros +
-user `defmacro` (compile-time VM eval) + syntax-quote +
-collections (lists/vectors/maps/sets), try/catch/throw/finally
-with catchable VmErrors, source-span errors, anon-fn shorthand
-`#(...)`, REPL + file runner, property tests, bench harness,
-golden eval-pipeline tests, AND 10 native fns for macro
-authoring (`list`/`cons`/`first`/`rest`/`count`/`nth`/`empty?`/
-`identity`/`nil?`/`some?`). Procedural user-defined macros
-that walk arg lists at compile time now work.
+user `defmacro` (compile-time VM eval) + procedural macros via
+native primitives + syntax-quote + collections + try/catch/
+finally + catchable VmErrors + source-span errors + anon-fn
+shorthand + REPL + file runner + ~30 native fns (sequence/HOF/
+arithmetic/collection) + embedded `core.nx` composite layer +
+multi-namespace with `(ns NAME)` + qualified symbols +
+auto-refer + full destructuring (sequential / associative /
+nested / `& rest` / `:as` / `:keys` / `:or`) + multi-arity
+`defn`. The LANGUAGE is feature-complete for v1.
 
-508 phase2 tests + 86 reader/golden = 594 tests in the fast
+562 phase2 tests + 86 reader/golden = 648 tests in the fast
 inner-loop suite (~3s). Full suite (`zig build test`) green
 including Phase 1 randomized property tests.
 
-Phase 3 remaining: `VM.callValue` reentrancy + `apply` +
-higher-order fns (`map`/`reduce`/`filter`) + first-class
-arithmetic Vars — Phase 3.3b. Collection ops (`assoc`/`get`/
-`conj`/etc.) — Phase 3.3c. Embedded `core.nx` composite layer
-— Phase 3.3d. Multi-namespace — Phase 3.4. Destructuring +
-multi-arity defn — Phase 3.5.
+Phase 3 remaining (post-language-complete polish):
+  - Phase 3.6: `require` + file loading + aliases (strategy
+    turn pending).
+  - Phase 3.7: `^:dynamic` Vars + `binding`.
+
+Phase 4 (the OTHER big arc): durable identity as a first-class
+language concept — `durable_ref` Values, transactional
+`swap!`/`alter`/`commute`, snapshots backed by emdb. This is
+what makes nexis differentiated from "Clojure-on-Zig" — it's
+Clojure + Datomic fused into a single binary.
 
 - The VM has 7 wired opcode groups: mov, cmp, math, call,
   closure, jump, var.
@@ -115,7 +120,13 @@ Read this entire prompt before touching anything.
 - Branch:   main
 - HEAD:     check `git log -1 --oneline`. Recent commit chain
             (newest first):
-              (pending) phase 3.3a: native_fn infra + 10 macro-authoring primitives
+              (pending) phase 3.5b: multi-arity defn
+              0fe09fa phase 3.5a: destructuring in let / fn / defn params
+              83f8e85 phase 3.4: multi-namespace (registry + qualified symbols + ns)
+              d36b745 phase 3.3d: embedded core.nx composite stdlib layer
+              d596f57 phase 3.3c: collection utilities
+              60af4d8 phase 3.3b: VM.callValue + apply + HOFs + first-class arithmetic
+              e003aad phase 3.3a: native_fn infra + 10 macro-authoring primitives
               ce534d1 phase 3.2: user-defined defmacro with compile-time VM eval
               8461ae9 phase 3.1: maps + sets as runtime values
               9364615 phase 3.0c: catchable VmErrors

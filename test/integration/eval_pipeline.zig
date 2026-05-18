@@ -680,6 +680,54 @@ test "integration: native fn — arity mismatch is catchable" {
 }
 
 // =============================================================================
+// Phase 3.5b — multi-arity defn
+// =============================================================================
+
+test "integration: 3.5b — multi-arity dispatch by argc" {
+    try expectOutput(
+        \\(do (defn f ([x] :one) ([x y] :two) ([x y z] :three))
+        \\    (f :a))
+    , ":one");
+    try expectOutput(
+        \\(do (defn f ([x] :one) ([x y] :two) ([x y z] :three))
+        \\    (f :a :b))
+    , ":two");
+    try expectOutput(
+        \\(do (defn f ([x] :one) ([x y] :two) ([x y z] :three))
+        \\    (f :a :b :c))
+    , ":three");
+}
+
+test "integration: 3.5b — multi-arity arity-mismatch is catchable" {
+    try expectOutput(
+        \\(do (defn f ([x] :one) ([x y] :two))
+        \\    (try (f 1 2 3) (catch any e e)))
+    , ":arity-mismatch");
+}
+
+test "integration: 3.5b — multi-arity with variadic overload" {
+    try expectOutput(
+        \\(do (defn f ([x] x) ([x & rest] (+ x (reduce + 0 rest))))
+        \\    (f 100))
+    , "100");
+    try expectOutput(
+        \\(do (defn f ([x] x) ([x & rest] (+ x (reduce + 0 rest))))
+        \\    (f 1 2 3 4 5))
+    , "15");
+}
+
+test "integration: 3.5b — multi-arity with destructured params" {
+    try expectOutput(
+        \\(do (defn f ([[a b]] (+ a b)) ([x y] (* x y)))
+        \\    (f [10 20]))
+    , "30");
+    try expectOutput(
+        \\(do (defn f ([[a b]] (+ a b)) ([x y] (* x y)))
+        \\    (f 3 4))
+    , "12");
+}
+
+// =============================================================================
 // Phase 3.5a — destructuring (let / fn / defn params)
 // =============================================================================
 

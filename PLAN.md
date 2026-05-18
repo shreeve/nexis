@@ -1974,20 +1974,33 @@ stdlib, multi-namespace, dynamic binding.
       `identity`, `nil?`, `some?`). Procedural macros now
       possible via `first`/`rest`/`empty?` at compile time.
       Peer-AI turn 67 architectural pin.
-- [ ] **Phase 3.3b** `VM.callValue` (reentrant VM execution) +
+- [x] **Phase 3.3b** `VM.callValue` (reentrant VM execution) +
       `apply` + higher-order fns (`map`/`reduce`/`filter`) +
       first-class arithmetic/comparison Vars (`+`/`<`/`=`/`inc`/
-      `dec`/predicates).
-- [ ] **Phase 3.3c** Collection utilities (`vector`/`vec`/
+      `dec`/predicates). Peer-AI turn 68 architectural pin.
+- [x] **Phase 3.3c** Collection utilities (`vector`/`vec`/
       `hash-map`/`hash-set`/`assoc`/`dissoc`/`get`/`contains?`/
       `keys`/`vals`/`conj`).
-- [ ] **Phase 3.3d** Embedded `src/stdlib/core.nx`: composite
+- [x] **Phase 3.3d** Embedded `src/stdlib/core.nx`: composite
       macros + fns in nexis (`when-let`, `if-let`, `dotimes`,
-      ...) per CLOJURE-REVIEW.md §1.1 two-stage bootstrap.
-- [ ] **Phase 3.4** `src/namespace.zig` enhancements + `(require ...)`
-      / `(use ...)` / qualified-symbol resolution.
-- [ ] **Phase 3.5** `src/dynamic.zig`: dynamic-binding stack
-      (`^:dynamic` Vars + `binding`).
+      `second`/`last`/`reverse`/`range`/`take`/`drop`,
+      `true?`/`false?`) per CLOJURE-REVIEW.md §1.1 two-stage
+      bootstrap.
+- [x] **Phase 3.4** Multi-namespace: `NamespaceRegistry` +
+      `nexis.core` / `user` + auto-refer + qualified symbols
+      + `(ns NAME)` special form. Peer-AI turn 69 architectural
+      pin. (Deferred: `require` + aliases + file loading —
+      separate strategy turn.)
+- [x] **Phase 3.5** Destructuring (sequential / associative /
+      nested / `& rest` / `:as` / `:keys` / `:or`) in `let`/
+      `fn`/`defn` params + multi-arity `defn` (dispatch on
+      argc via expansion to variadic + `let` + nested `if`).
+      Peer-AI turn 70 architectural pin.
+- [ ] **Phase 3.6** (NEW) `require` + aliases + file loading
+      (`my.ns/foo` from disk-loaded namespace; load path; cycle
+      detection; idempotent loaded set). Strategy turn pending.
+- [ ] **Phase 3.7** (NEW) `src/dynamic.zig`: dynamic-binding
+      stack (`^:dynamic` Vars + `binding`).
 
 **Exit**: Phase 3 gate; REPL usable for real programs; core stdlib loaded.
 

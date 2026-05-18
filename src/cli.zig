@@ -449,14 +449,24 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         if (trimmed.len == 0) continue;
         if (std.mem.eql(u8, trimmed, ":quit") or std.mem.eql(u8, trimmed, ":q")) return;
 
-        // Per-evaluation arena.
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
+        // Phase 3.5b fix: use the VM's runtime_arena as the
+        // compile arena. Closures + their Routines reference
+        // sub-routine pointers that live in the compile arena;
+        // freeing the arena at end of REPL line would dangle
+        // those pointers for next line's calls (manifested as
+        // segfaults on multi-arity defn, but the bug was
+        // pre-existing — small defns just happened to land in
+        // chunks that weren't immediately reused).
+        //
+        // Cost: per-line compile allocations accumulate for the
+        // session lifetime. Acceptable for v1; a per-session
+        // session-arena policy is post-v1 polish.
+        const arena_alloc = v.runtime_arena.allocator();
 
         // Source bytes need to live AT LEAST through the
         // compile call (Tiny.symbol slices borrow from
         // source). dupe into the arena.
-        const src = try arena.allocator().dupe(u8, trimmed);
+        const src = try arena_alloc.dupe(u8, trimmed);
 
         var error_span: ?reader_mod.SrcSpan = null;
         // Phase 3.2: pass v.runtime_arena.allocator() as the
@@ -466,7 +476,7 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         // `(ns NAME)` switches affect subsequent forms.
         const current_ns = registry.current;
         const compiled = compile.compileSourceFullWithMacrosSpanPersistentRegistry(
-            arena.allocator(),
+            arena_alloc,
             src,
             current_ns,
             interner,

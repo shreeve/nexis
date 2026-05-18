@@ -17,16 +17,19 @@ identities are first-class values, not a library bolted on top.
 
 ## Status
 
-**Phase 2 COMPLETE**, **Phase 3.0 COMPLETE**, **Phase 3.1 COMPLETE**,
-**Phase 3.2 COMPLETE**, **Phase 3.3a COMPLETE**. Real `.nx` source
-runs end-to-end through `bin/nexis run FILE.nx` AND an interactive
-`bin/nexis repl`. The reader, macroexpander, compiler, and bytecode
-VM all ship; host macros (`when`/`cond`/`and`/`or`/`->`/`->>`/etc.)
-AND user-defined macros via `defmacro` work; syntax-quote
-(`` ` ``/`~`/`~@`/auto-gensym), try/catch/finally, recoverable
-error catchability, persistent maps/sets, AND the first 10
-macro-authoring native fns (`list`/`cons`/`first`/`rest`/`count`/
-`nth`/`empty?`/`identity`/`nil?`/`some?`) are all in.
+**Phase 2 COMPLETE**. **Phase 3 COMPLETE** through 3.5 (3.0/3.1/3.2/3.3/3.4/3.5
+all shipped). Real `.nx` source runs end-to-end through
+`bin/nexis run FILE.nx` AND an interactive `bin/nexis repl`. The
+reader, macroexpander, compiler, and bytecode VM all ship; host
+macros + user `defmacro` + procedural macros via native primitives
+all work; syntax-quote (`` ` ``/`~`/`~@`/auto-gensym),
+try/catch/finally with catchable VM errors, persistent
+maps/sets/vectors/lists, ~30 native fns (sequence/HOF/arithmetic/
+collection), composite `core.nx` stdlib layer (`when-let`/`if-let`/
+`dotimes`/`range`/`take`/`drop`/etc.), multi-namespace with
+qualified symbols + `(ns NAME)`, full destructuring (sequential
++ associative + nested + `& rest` + `:as` + `:keys` + `:or`) in
+let/fn/defn, AND multi-arity `defn` — all in.
 
 See [`PLAN.md`](PLAN.md) §21 for the phase map and
 [`HANDOFF.md`](HANDOFF.md) for current state + next task.
@@ -39,8 +42,13 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Phase 3.0 | ✅ shipped | CLI runner + REPL, anonymous-fn shorthand `#(...)`, catchable VM errors |
 | Phase 3.1 | ✅ shipped | Persistent maps `{:k 1}` and sets `#{1 2}` as runtime literals |
 | Phase 3.2 | ✅ shipped | User-defined `defmacro` with compile-time evaluation (fresh sub-VM per invocation) |
-| Phase 3.3a | ✅ shipped | 10 native fns for macro authoring (`list`/`cons`/`first`/`rest`/`count`/`nth`/`empty?`/`identity`/`nil?`/`some?`); `Kind.native_fn` infrastructure |
-| Phase 3.3b+ | pending | `VM.callValue` + `apply` + higher-order fns (`map`/`reduce`/`filter`) + first-class arithmetic Vars + collection utilities (`assoc`/`get`/`conj`) + `core.nx` embed + multi-namespace |
+| Phase 3.3a | ✅ shipped | 10 native fns for macro authoring; `Kind.native_fn` infrastructure |
+| Phase 3.3b | ✅ shipped | `VM.callValue` reentrancy + `apply` + HOFs (`map`/`reduce`/`filter`) + first-class arithmetic Vars |
+| Phase 3.3c | ✅ shipped | Collection utilities (`vector`/`vec`/`hash-map`/`assoc`/`get`/`conj`/`keys`/`vals`/etc.) |
+| Phase 3.3d | ✅ shipped | Embedded `core.nx` composite layer (`when-let`/`if-let`/`dotimes`/`range`/`take`/`drop`/etc.) |
+| Phase 3.4 | ✅ shipped | Multi-namespace: `nexis.core` + `user`, `(ns NAME)`, qualified symbols, auto-refer |
+| Phase 3.5 | ✅ shipped | Destructuring (sequential/associative/nested/`& rest`/`:as`/`:keys`/`:or`) + multi-arity `defn` |
+| Phase 3.6+ | pending | `require` + file loading + aliases (separate strategy turn); `^:dynamic` Vars + `binding` |
 
 **558 tests** green: 95 VM + 313 compile + 6 macroexpand + 4
 property + 54 integration in `phase2-test` (~3s), plus 86 reader
@@ -167,6 +175,25 @@ Every snippet runs via `bin/nexis`. Run the file or paste into the REPL:
        (my-cond ~@(rest (rest clauses))))))
 (my-cond false :a true :b false :c) ;; => :b
 
+;; multi-namespace (Phase 3.4)
+(ns my.app)
+(defn double [x] (* x 2))
+(ns user)
+(my.app/double 21)                  ;; => 42
+(nexis.core/+ 1 2 3)                ;; => 6
+
+;; destructuring + multi-arity defn (Phase 3.5)
+(let [[a b & rest] [1 2 3 4 5]] rest) ;; => (2 3 4 5)
+(let [{:keys [x y] :or {y 10}} {:x 5}] (+ x y)) ;; => 15
+(defn point-sum [[x y]] (+ x y))
+(point-sum [3 4])                   ;; => 7
+
+(defn arity-dispatch
+  ([x]     :one)
+  ([x y]   :two)
+  ([x & r] :many))
+(arity-dispatch :a :b :c :d)        ;; => :many
+
 ;; anonymous-fn shorthand
 (#(+ % 1) 41)                       ;; => 42
 (#(+ %1 %2) 10 20)                  ;; => 30
@@ -194,25 +221,22 @@ nexis: bad.nx:1:1: MacroExpansionFailure
     ^^^^^^
 ```
 
-## Still missing (closes in Phase 3.3b+)
+## Still missing (closes in Phase 3.6+ / Phase 4+)
 
 These are temporary gaps, not strategic non-goals — each unlocks
 when its phase ships:
 
-- **Higher-order fns**: `map`/`reduce`/`filter`/`apply` need
-  `VM.callValue` (reentrant VM execution) — Phase 3.3b.
-- **First-class arithmetic Vars**: `(reduce + 0 xs)` needs `+`
-  to resolve to a Var, not just inline at the call head —
-  Phase 3.3b.
-- **Collection ops**: `assoc`/`dissoc`/`get`/`conj`/`keys`/`vals`
-  — Phase 3.3c.
-- **`core.nx` embedded stdlib**: composite macros + fns written
-  in nexis (`when-let`/`if-let`/`dotimes`/...) — Phase 3.3d.
-- **Multi-namespace**: single global namespace today.
-  `(require ...)`/`(use ...)`/qualified symbols are Phase 3.4.
-- **Multi-arity `defn`**: `(defn f ([x] …) ([x y] …))` not supported.
-- **Destructuring**: `(let [{:keys [a b]} m] …)` etc. — Phase 3.5.
+- **`require` + file loading**: `(require '[my.lib :as l])` from
+  disk-loaded namespace files. Load path, cycle detection,
+  idempotent loaded set. Strategy turn pending for Phase 3.6.
+- **Dynamic binding** (`^:dynamic` Vars + `(binding ...)`): for
+  the small set of thread-local-style Vars (`*out*`, etc.). Phase 3.7.
 - **Protocols / multimethods**: post-stdlib.
+- **Durable identity** (`durable_ref` Values + transactional
+  `swap!`/`alter`/`commute` + snapshots backed by emdb): the OTHER
+  big arc. Phase 4.
+- **SIMD / perf pass**: collection bulk ops vectorized.
+  Phase 5.
 - **Runtime SrcSpans**: runtime errors (UncaughtThrow etc.)
   don't carry source spans yet — bounded post-gate work.
 
