@@ -17,44 +17,73 @@ identities are first-class values, not a library bolted on top.
 
 ## Status
 
-**Phase 2 in progress** — language core + source frontend
-complete; macros / try-catch / error-reporting / Phase 2 gate
-remain. See [`PLAN.md`](PLAN.md) §21 for the phase map and
+**Phase 2 COMPLETE**, **Phase 3.0 COMPLETE**. Real `.nx` source
+runs end-to-end through `bin/nexis run FILE.nx` AND an interactive
+`bin/nexis repl`. The reader, macroexpander, compiler, and bytecode
+VM all ship; macros (`when`/`cond`/`and`/`or`/`->`/`->>`/etc.) +
+syntax-quote (`` ` ``/`~`/`~@`/auto-gensym) + try/catch/finally +
+recoverable error catchability all work.
+
+See [`PLAN.md`](PLAN.md) §21 for the phase map and
 [`HANDOFF.md`](HANDOFF.md) for current state + next task.
 
 | Phase | Status | What |
 |---|---|---|
-| Phase 0 | ✓ shipped | Reader: grammar, `@lang` module, Form normalizer, pretty-printer, golden tests |
-| Phase 1 | ✓ shipped | Runtime core: Value model, persistent collections (CHAMP HAMT, RRB vector, list), heap + GC, codec, emdb integration |
-| Phase 2 | ~80% done | Compiler + VM. Steps #1-#7 of [`docs/COMPILER.md`](docs/COMPILER.md) §10 complete: `.nx` source compiles end-to-end through reader → Form → Tiny IR → bytecode → VM. Steps #8-#11 (macros, try/catch, error reporting, golden gate) remain. |
-| Phase 3+ | pending | Standard library (`core.nx` bootstrap), CLI runner / REPL, performance polish |
+| Phase 0 | ✅ shipped | Reader: grammar, `@lang` module, Form normalizer, pretty-printer, golden tests |
+| Phase 1 | ✅ shipped | Runtime core: Value model, persistent collections (CHAMP HAMT, RRB vector, list), heap + GC, codec, emdb integration |
+| Phase 2 | ✅ shipped | Compiler + bytecode VM. 11/11 steps of [`docs/COMPILER.md`](docs/COMPILER.md) §10 complete. All 7 gate items from §9.4 satisfied. |
+| Phase 3.0 | ✅ shipped | CLI runner + REPL, anonymous-fn shorthand `#(...)`, catchable VM errors |
+| Phase 3.1+ | pending | Maps/sets as runtime values, user-defined `defmacro`, standard library (`core.nx` bootstrap), multi-namespace via `require`/`use` |
 
-**Working today** — real `.nx` source compiles end-to-end through
-the reader, compiler, and VM. Every snippet below is exercised by
-a passing test against `compileSource()` (`src/compile.zig`):
+**558 tests** green: 95 VM + 313 compile + 6 macroexpand + 4
+property + 54 integration in `phase2-test` (~3s), plus 86 reader
++ golden tests, plus the Phase 1 randomized property tests.
+
+## Build & run
+
+```bash
+zig build install                  # produces bin/nexis, bin/nexis-bench, bin/nexis-golden
+
+./bin/nexis run examples/hello.nx          # run a file
+./bin/nexis repl                            # interactive REPL
+./bin/nexis --help                          # usage
+```
+
+For developers:
+
+```bash
+zig build phase2-test              # ~3s — fast inner-loop test suite
+zig build test                     # ~3min — full Phase 0/1/2 suite + property tests
+zig build parser                   # regenerate src/parser.zig from nexis.grammar
+zig build bench                    # ReleaseFast benchmark suite
+zig build golden                   # reader golden tests alone
+```
+
+See [`AGENTS.md`](AGENTS.md) for when to use which.
+
+## Working today
+
+Every snippet runs via `bin/nexis`. Run the file or paste into the REPL:
 
 ```clojure
-;; literals, arithmetic, comparison
+;; arithmetic + comparison + conditionals
 (+ 1 2)                             ;; => 3
-(< 1 2)                             ;; => true
-(if (< 0 5) 1 2)                    ;; => 1
+(if (< 0 5) :small :big)            ;; => :small
 
-;; let*, fn*, closures, captures (control-flow-safe pre-analysis)
-(let* [x 5]
-  ((fn* [y] (+ x y)) 3))            ;; => 8
+;; bindings — user-facing `let` (rename macro to let*)
+(let [x 1 y 2] (+ x y))             ;; => 3
 
-;; named fn* self-reference (Clojure semantics)
-((fn* fact [n]
-   (if (< n 2) n (recur (+ n -1))))
- 5)                                 ;; => 0 (counts down via recur, constant stack)
+;; functions + closures with proper capture
+(let [x 5]
+  ((fn [y] (+ x y)) 3))             ;; => 8
 
-;; loop* + recur — constant stack, verified 10k iterations
-(loop* [i 0 acc 0]
+;; constant-stack recursion via recur (verified 10k iterations)
+(loop [i 0 acc 0]
   (if (< i 10)
     (recur (+ i 1) (+ acc i))
     acc))                           ;; => 45
 
-;; letfn* — mutually-recursive bindings via placeholder cells
+;; mutual recursion via letfn*
 (letfn* [(f [] (g))
          (g [] 99)]
   (f))                              ;; => 99
@@ -62,41 +91,110 @@ a passing test against `compileSource()` (`src/compile.zig`):
 ;; variadic & rest
 ((fn* [a & r] a) 1 2 3 4)           ;; => 1
 
-;; vars, def, defn — with forward references
-(do (defn f [] (g))                 ;; g doesn't exist yet
-    (defn g [] 42)                  ;; now it does
+;; vars + forward references
+(do (defn f [] (g))
+    (defn g [] 42)
     (f))                            ;; => 42
 
-;; intrinsic shadowing follows lexical scope
-(let* [+ (fn* [a b] 42)]
-  (+ 1 2))                          ;; => 42 (NOT 3 — `+` is shadowed)
+;; lexical shadowing follows scope
+(let [+ (fn [a b] 99)]
+  (+ 1 2))                          ;; => 99 (+ shadowed)
 
-(let* [if 1]
-  (if true 2 3))                    ;; => 2 (special forms NOT shadowable)
+;; macros (when/when-not/and/or/cond/->/->>/let/fn/loop)
+(when (and 1 :truthy)
+  (or false :got-it))               ;; => :got-it
+
+(-> 1 (+ 2) (+ 3))                  ;; => 6
+
+(cond
+  (< 1 0) :impossible
+  :else   :reachable)               ;; => :reachable
+
+;; or/and use gensym so side-effects evaluate once
+(or false nil :found)               ;; => :found
+
+;; quote scalar + quote compound
+(quote 42)                          ;; => 42
+(quote (1 2 3))                     ;; => (1 2 3)
+(quote [a b c])                     ;; => [a b c]
+
+;; syntax-quote with unquote + splicing
+(let [xs (quote (b c d))]
+  `(start ~@xs end))                ;; => (start b c d end)
+
+;; auto-gensym (each `g#` in one syntax-quote scope gets the same name)
+`(let* [g# 1] g#)                   ;; => (let* [g__N__auto__ 1] g__N__auto__)
+
+;; macro author pattern (this is what user `defmacro` will do in Phase 3.2)
+(let [name (quote x) value 99]
+  `(let* [~name ~value] ~name))     ;; => (let* [x 99] x)
+
+;; anonymous-fn shorthand
+(#(+ % 1) 41)                       ;; => 42
+(#(+ %1 %2) 10 20)                  ;; => 30
+
+;; try/catch/finally with cross-frame unwinding
+(try
+  (throw :bang)
+  (catch any e e)
+  (finally :always-runs))           ;; => :bang
+
+;; VM-detected errors are catchable (Phase 3.0c)
+(try (+ 1 :not-a-number)
+  (catch any e e))                  ;; => :kind-mismatch
+
+(try (+ 1 undefined-var)
+  (catch any e e))                  ;; => :unbound-var
 ```
 
-There's no CLI runner yet (Phase 3 ships `nexis` as a binary).
-For now, programs run via `compileSource()` from Zig tests; see
-`test "compile #7d: ..."` blocks in `src/compile.zig` for the
-end-to-end pattern.
+Compile errors carry file:line:col + a source caret:
 
-**Not yet supported in source** (step #8 macroexpander closes
-most of these): quoted symbols / collections (`'foo`, `'(1 2)`),
-anonymous fn shorthand (`#(...)`), syntax-quote (`` ` `` / `~` /
-`~@`), reader metadata (`^{...}`), keywords as values, strings.
-Collection literals (`[1 2]`, `{:a 1}`, `#{1 2}`) as expressions
-require step #8's collection-construction wiring.
-
-## Build
-
-```bash
-zig build phase2-test              # ~3s — vm + compile tests (inner loop)
-zig build test                     # ~3min — full Phase 0/1/2 suite + golden (pre-commit gate)
-zig build parser                   # regenerate src/parser.zig from nexis.grammar
-zig build golden                   # reader golden tests alone
+```text
+$ echo '(when)' > bad.nx && bin/nexis run bad.nx
+nexis: bad.nx:1:1: MacroExpansionFailure
+    (when)
+    ^^^^^^
 ```
 
-See [`AGENTS.md`](AGENTS.md) for when to use which.
+## Still missing (closes in Phase 3.1+)
+
+These are temporary gaps, not strategic non-goals — each unlocks
+when its phase ships:
+
+- **Maps/sets as runtime values**: `(quote {:a 1})` and `(quote #{1 2})`
+  still raise `UnsupportedFeature`. Lists and vectors work.
+- **User-defined `defmacro`**: macros today are host-Zig functions
+  registered in a default table. User `defmacro` needs compile-time
+  VM eval (Phase 3.2).
+- **Standard library**: no `map`/`reduce`/`filter`/`first`/`rest`/
+  `count`/`assoc`/`get` yet. Phase 3.3 (`core.nx` bootstrap).
+- **Multi-namespace**: single global namespace today.
+  `(require ...)`/`(use ...)`/qualified symbols are Phase 3.4.
+- **Multi-arity `defn`**: `(defn f ([x] …) ([x y] …))` not supported.
+- **Destructuring**: `(let [{:keys [a b]} m] …)` etc. — Phase 3.3.
+- **Protocols / multimethods**: Phase 3+ once stdlib exists.
+- **Runtime SrcSpans**: runtime errors (UncaughtThrow etc.)
+  don't carry source spans yet — bounded post-gate work.
+
+## Permanent differences from Clojure/JVM
+
+These never close — they're trade-offs, not bugs:
+
+- **No Java interop.** No `(Math/sqrt x)`, no `(.method obj)`, no
+  `(import …)`. Roughly 30-40% of real-world Clojure code touches
+  Java; that code does not port.
+- **No STM** (`ref`, `dosync`, `commute`). Channels + immutable
+  values + (post-v1) durable transactions are the concurrency story.
+- **No JVM ecosystem.** No Maven Central, no Leiningen. The library
+  story rebuilds on top of nexis.
+
+**The semantics port; the platform and the libraries don't.** A
+Clojure programmer trades the JVM ecosystem for a single binary, no
+JVM warmup, integrated durable storage, and a path to Datomic-class
+identity. That's a real trade, not a free lunch.
+
+See [`CLOJURE-REVIEW.md`](CLOJURE-REVIEW.md) for the line-by-line
+catalogue of what we take, adapt, and reject from Clojure's source.
 
 ## What makes this different
 
@@ -111,52 +209,6 @@ See [`AGENTS.md`](AGENTS.md) for when to use which.
 | Durable storage | External (Datomic, JDBC, etc.) | First-class: emdb integrated; `durable_ref` is a Value kind |
 | Deployment | JVM uberjar / native-image | Static binary, end-state ~5 MB |
 
-### What this means for a Clojure programmer
-
-**The language design is intentionally Clojure's** — same surface
-syntax, same macros, same persistent collections, same scoping rules.
-A Clojure programmer **reading** nexis source recognizes the language
-immediately: `let`/`fn`/`defn`/`loop`/`recur`, `#(...)` anon-fn
-shorthand, `#'x` var ref, `^{...}` metadata, `[]`/`{}`/`#{}` collection
-literals, Lisp-1 namespace with Vars, Clojure-style truthiness (only
-`nil`/`false` are falsy), proper lexical closures with fresh-cell-per-
-iteration capture for loop bindings.
-
-**Writing productive nexis is a different story.** Two categories of
-gap:
-
-**Permanent, by design** (these never close — they're not bugs, they're
-the deal):
-- **No Java interop.** No `(Math/sqrt x)`, no `(.method obj)`, no
-  `(import …)`. Roughly 30-40% of real-world Clojure code touches
-  Java; that code does not port.
-- **No STM (Refs, `dosync`, `commute`).** Channels + immutable
-  values + (post-v1) durable transactions are the concurrency story.
-- **No JVM ecosystem.** No Maven Central. The library story rebuilds
-  on top of nexis.
-
-**Closing as phases land:**
-- Phase 2 (now): single-arity functions only, single global namespace,
-  no destructuring, no stdlib, no REPL, no protocols/multimethods.
-  Step #7 (next) closes the loop on compiling `.nx` source files.
-- Phase 3: standard library (`map`, `reduce`, `filter`, `conj`,
-  `assoc`, threading macros, etc.), multi-arity functions,
-  destructuring, multiple namespaces, protocols, multimethods,
-  dynamic Var binding. After Phase 3, idiomatic non-interop Clojure
-  mostly ports.
-- Phase 4-5: codec + emdb integration finalized.
-- Phase 6: performance polish + benchmarks.
-- Post-v1: Nextomic — Datomic-class temporal queries embedded as a
-  library, something Clojure-on-JVM never had natively.
-
-So: **the semantics port; the platform and the libraries don't.** A
-Clojure programmer trades the JVM ecosystem for a single binary, no
-JVM warmup, integrated durable storage, and a path to Datomic-class
-identity. That's a real trade, not a free lunch.
-
-See [`CLOJURE-REVIEW.md`](CLOJURE-REVIEW.md) for the line-by-line
-catalogue of what we take, adapt, and reject from Clojure's source.
-
 ## What's here
 
 | Path | Purpose |
@@ -166,8 +218,9 @@ catalogue of what we take, adapt, and reject from Clojure's source.
 | [`AGENTS.md`](AGENTS.md) | Routing guide for contributors / AI sessions |
 | [`CLOJURE-REVIEW.md`](CLOJURE-REVIEW.md) | What we take, adapt, reject from Clojure's source |
 | [`docs/`](docs/) | 20 design specs — see [`docs/README.md`](docs/README.md) for the module ↔ spec map |
-| [`src/`](src/) | 24 Zig modules — runtime + compiler. `vm.zig` (VM kernel) and `compile.zig` (Phase 2 compiler) are the largest. |
-| [`test/`](test/) | Property tests + golden tests; most unit tests are inline in `src/*.zig`. See [`test/README.md`](test/README.md). |
+| [`src/`](src/) | Zig modules — runtime + compiler. `vm.zig` (VM kernel), `compile.zig` (compiler), and `expand.zig` (macroexpander) are the largest. |
+| [`test/`](test/) | Property tests, integration tests, golden tests; most unit tests are inline in `src/*.zig`. See [`test/README.md`](test/README.md). |
+| [`examples/`](examples/) | Working `.nx` programs — `hello.nx`, `cond.nx`, `threading.nx`, `macro-author.nx`, `try-catch.nx`, `syntax-quote.nx`, `sum10.nx`, `forward-ref.nx`, `macros.nx`, `quoted-list.nx`. |
 | [`nexis.grammar`](nexis.grammar) | Reader grammar — source of truth for `src/parser.zig` |
 | [`ZIG-0.16.0.md`](ZIG-0.16.0.md) | Project-specific Zig 0.16 stdlib reference + gotchas (MANDATORY before writing Zig) |
 

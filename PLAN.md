@@ -1860,7 +1860,7 @@ Before any compiler work proceeds, the following must pass:
 
 Each phase has a crisp entry criterion (previous gate passed) and exit criterion (next gate).
 
-### Phase 0 — Foundations (weeks 1–2)
+### Phase 0 — Foundations (weeks 1–2) — **✅ SHIPPED**
 
 **Goal**: commit to semantics before code. Land the minimum artifacts a fresh implementation session needs to begin Phase 1 without ambiguity.
 
@@ -1896,7 +1896,7 @@ Each phase has a crisp entry criterion (previous gate passed) and exit criterion
 - `docs/SEMANTICS.md` is reviewed and signed off — every semantic corner case has an explicit decision.
 - All golden tests pass byte-for-byte.
 
-### Phase 1 — Runtime core, no compiler (weeks 3–8) — **critical**
+### Phase 1 — Runtime core, no compiler (weeks 3–8) — **✅ SHIPPED**
 
 **Goal**: have the entire data universe working before a single bytecode instruction executes.
 
@@ -1918,27 +1918,60 @@ Each phase has a crisp entry criterion (previous gate passed) and exit criterion
 
 **Exit**: all Phase 1 gate tests pass.
 
-### Phase 2 — Compiler and VM (weeks 9–14)
+### Phase 2 — Compiler and VM (weeks 9–14) — **✅ SHIPPED**
 
-- [ ] `src/reader.zig`: Sexp → Form.
-- [ ] `src/resolve.zig`: Form → Resolved (symbols → slot/upvalue/var/special).
-- [ ] `src/analyze.zig`: closure analysis, tail-position detection, literal lifting.
-- [ ] `src/bytecode.zig`: 64-bit instruction encoding (adapted from em).
-- [ ] `src/compile.zig`: IR → bytecode.
-- [ ] `src/vm.zig`: frame/slot machine, tail-call dispatcher, handlers for groups 0–7.
-- [ ] `src/loader.zig`: bytecode module loading and linking.
-- [ ] `src/fn.zig`: function/closure runtime representation.
+All 11 sub-steps of COMPILER.md §10 complete + all 7 gate items
+from §9.4 satisfied. The original deliverable list below merged
+slightly with reality: `resolve.zig`/`analyze.zig`/`bytecode.zig`/
+`loader.zig`/`fn.zig` are folded into `compile.zig` + `vm.zig` for
+v1 simplicity. `expand.zig` (macroexpander) lives where peer-AI
+turn 28 originally placed it in Phase 3 but landed early because
+the Phase 2 gate required it.
 
-**Exit**: Phase 2 gate; can run `let`, `if`, `fn`, `loop`/`recur`, `do`, `quote`, exception handling.
+- [x] `src/reader.zig`: Sexp → Form.
+- [x] `src/compile.zig`: Form → Tiny IR → bytecode (`resolve` +
+      `analyze` + `bytecode` + `loader` + `fn` consolidated here).
+- [x] `src/vm.zig`: frame/slot machine + dispatch + 9 wired opcode
+      groups (mov/call/math/cmp/jump/closure/var/coll/ctrl).
+- [x] `src/expand.zig`: macroexpander (was planned for Phase 3;
+      shipped in Phase 2 #8 because gate item 5 — error SrcSpans —
+      required macro origin tracking).
+- [x] `src/cli.zig`: `bin/nexis run FILE.nx` + `bin/nexis repl`.
 
-### Phase 3 — Macros, namespaces, REPL (weeks 15–18)
+**Exit (achieved)**: every primitive-core form compiles + executes
+end-to-end; try/catch/throw/finally working with cross-frame
+unwind; quoted compound lists/vectors; syntax-quote with splicing
++ auto-gensym; SrcSpans in compile errors. 472 phase2 tests
+green in ~3s.
 
-- [ ] `src/namespace.zig`: Namespace, Var cell, unbound marker, revision counter.
-- [ ] `src/expand.zig`: fixpoint expander.
-- [ ] `src/syntax_quote.zig`: syntax-quote, auto-gensym.
-- [ ] `src/repl.zig`: interactive shell (adapted from em).
-- [ ] `src/dynamic.zig`: dynamic binding stack.
-- [ ] `src/stdlib/core.nx`: core macros (`when`, `->`, `->>`, `cond`, `let`, `if-let`, `defn`, etc.) written in nexis itself.
+### Phase 3 — Macros, namespaces, REPL (weeks 15–18) — **in progress**
+
+Phase 3 reshuffled: `expand.zig` + `syntax_quote.zig` + most
+macro work landed early in Phase 2 because the Phase 2 gate
+needed them. Phase 3.0 closed REPL + anon-fn + catchable VM
+errors. Remaining: maps/sets as runtime values, user defmacro,
+stdlib, multi-namespace, dynamic binding.
+
+- [x] `src/expand.zig`: fixpoint expander (shipped in Phase 2 #8).
+- [x] Syntax-quote, auto-gensym (folded into `expand.zig`, shipped
+      in Phase 2 #8c.2).
+- [x] **Phase 3.0a** `src/cli.zig` REPL (commit 1c4d7df).
+- [x] **Phase 3.0b** `#(...)` anon-fn shorthand (commit 64c2c15).
+- [x] **Phase 3.0c** Catchable VmError → keyword payload (commit
+      4122532).
+- [ ] **Phase 3.1** Maps/sets as runtime values (`coll:map` /
+      `coll:set` opcodes + `Tiny.map_construct` / `Tiny.set_construct`).
+- [ ] **Phase 3.2** User-defined `defmacro` — needs compile-time
+      VM eval (the macro-Var marker + same-VM compile-time eval
+      path or a sub-VM).
+- [ ] **Phase 3.3** `src/stdlib/core.nx`: core macros + functions
+      (`map`, `reduce`, `filter`, `conj`, `assoc`, threading-arrow
+      variants, destructuring `let`/`fn`, multi-arity `defn`) per
+      CLOJURE-REVIEW.md §1.1 two-stage bootstrap.
+- [ ] **Phase 3.4** `src/namespace.zig` enhancements + `(require ...)`
+      / `(use ...)` / qualified-symbol resolution.
+- [ ] **Phase 3.5** `src/dynamic.zig`: dynamic-binding stack
+      (`^:dynamic` Vars + `binding`).
 
 **Exit**: Phase 3 gate; REPL usable for real programs; core stdlib loaded.
 

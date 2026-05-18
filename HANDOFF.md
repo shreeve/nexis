@@ -146,7 +146,7 @@ Read this entire prompt before touching anything.
    - §19  SIMD & performance — especially §19.6 Tier 1/2 projections
             and §19.8 performance gates methodology reference
    - §20.2 Phase 1 gate (CLOSED) and Phase 2 gate spec
-   - §21  Roadmap (Phase 1 complete; Phase 2 in progress at step #2)
+   - §21  Roadmap (Phases 1-2 complete; Phase 3.0 complete; Phase 3.1+ pending)
    - §23  Hard decisions (frozen — each requires an amendment to change)
    - §24  Open questions (deliberately undecided)
 
@@ -648,7 +648,7 @@ Phase 0 (still in place):
   src/parser.zig      GENERATED (do not edit; regenerate via `zig build parser`)
 ```
 
-### 7.2 Phase 2 progress (in progress, ~80% complete)
+### 7.2 Phase 2 progress (COMPLETE)
 
 ```
 SHIPPED (steps #1-#7 of COMPILER.md §10's 11-step plan):

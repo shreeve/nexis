@@ -1307,3 +1307,88 @@ from code contact:
 
   Tests: 757 → 767 (+10 across E1 + H1 keyword tests).
   `zig build phase2-test` stays ~2s.
+
+- **2026-05-17** (Phase 2 close-out — steps #8b through #11
+  shipped in a single session arc; commits 4af8c22 through
+  8def91d):
+
+  **#8b** (4af8c22, peer-AI turn 57 fix in 5270739): host
+  core macros — when, when-not, and, or, cond, ->, ->>,
+  let, fn, loop. Default macro table wired into CLI. `or`
+  AND `and` both use gensym to avoid double-evaluation
+  (peer-AI turn 57 caught a missing falsy-counter test for
+  `and` + the `(if x y false)` spec error). +38 tests.
+
+  **#8c.1** (4ad8dd3): `coll:list` / `coll:concat` opcodes
+  + `Tiny.list_construct` / `Tiny.concat` IR + `#%list` /
+  `#%concat` internal special forms. Quoted compound lists
+  via `lowerQuotePayload` close the #7 deferral. +12 tests.
+
+  **#8c.2** (32a8d34): syntax-quote walker + unquote +
+  unquote-splicing + auto-gensym (`x#` → `x__N__auto__`).
+  Caught + fixed a gating bug — the expander now runs
+  whenever an interner is present (syntax-quote is built
+  into the expander, NOT a macro-table entry). +10 tests.
+
+  **#8c.3** (de3c775): `coll:vector` + `Tiny.vector_construct`
+  + `#%vector` + vector quote/syntax-quote. Unlocks the
+  user-defmacro pattern (synthesizing `(let* [name val]
+  body)`). +4 tests net.
+
+  **#9.1** (2527944, peer-AI turn 59 strategy): try/catch/
+  throw + cross-frame unwind. VM `ctrl` opcode group +
+  global Handler stack + cleanup-handler trick (catch
+  body's own throw cannot be re-caught by the same
+  handler). +16 tests.
+
+  **#9.2** (a610cb4, peer-AI turn 61): finally clauses +
+  throw-through-finally via FinallyContinuation coroutine
+  model. All 4 exit paths tested (normal exit, caught
+  throw, uncaught throw, throw-inside-finally overrides).
+
+  **#10.0** (1e5b575): SrcSpans in compile errors via
+  out-param + CLI's file:line:col + source-line + caret.
+  Phase 2 gate item 5 satisfied.
+
+  **Gate items 3/4/7** (b948ab0): closure capture
+  depth-10 property test + syntax-quote structural-
+  equality property test + bench/main.zig compiler
+  category (compile_simple 487ns, eval_loop ~49ns/iter,
+  closure_create 895ns, eval_arith 1.26µs).
+
+  **#11** (8def91d): test/integration/eval_pipeline.zig
+  with 46 end-to-end test cases covering every primitive-
+  core form, every macro, every try/catch/finally path.
+
+  Tests: 767 → 472 phase2 (full suite 558 with
+  reader/golden + Phase 1 property tests). All 7 gate
+  items from §9.4 satisfied. PHASE 2 COMPLETE.
+
+  Now-stale deferral list from the #7d entry above
+  (anon_fn, syntax_quote/unquote/unquote_splicing,
+  quoted compound, vector/map/set syntax-quote, etc.):
+  every item is now SHIPPED except map/set runtime
+  values which await Phase 3.1.
+
+- **2026-05-18** (Phase 3.0 shipped):
+
+  **3.0a REPL** (1c4d7df): `nexis repl` interactive eval
+  loop with persistent ns/interner/macro-table; errors
+  print and the loop continues.
+
+  **3.0b anon-fn** (64c2c15): `#(...)` reader-macro
+  expansion. `%`/`%1..%N`/`%&` placeholders. Closes the
+  last #7 deferral except map/set.
+
+  **3.0c catchable VmErrors** (4122532, peer-AI turn 62):
+  recoverable VmError variants (KindMismatch, ArityMismatch,
+  NotCallable, UnboundVar, IntegerOverflow) translate to
+  keyword payloads when a handler exists. Without a
+  handler, the raw VmError still propagates (backward
+  compat).
+
+  **Rename** (2d45546, peer-AI turn 63):
+  src/macroexpand.zig → src/expand.zig +
+  MacroexpandContext/Error → ExpandContext/Error. MacroFn
+  and HostMacroTable kept (specifically about macros).
+  docs/MACROEXPAND.md kept (about the phase, not the file).
