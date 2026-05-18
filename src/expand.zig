@@ -118,6 +118,11 @@ pub const ExpandContext = struct {
     /// macro fn's body via a fresh sub-VM. Null = `defmacro`
     /// raises MacroExpansionFailure.
     compile_eval: ?CompileEvalContext = null,
+    /// Phase 3.4: when set, `(ns NAME)` special form switches
+    /// the current namespace via `registry.switchTo(NAME)`. The
+    /// CLI sets this; ad-hoc tests can leave it null (in which
+    /// case `(ns NAME)` raises MalformedMacroCall).
+    registry: ?*vm_mod.NamespaceRegistry = null,
     /// Phase 3.2: lazy-init heap for arg Value construction.
     /// Macro args that are vectors/maps/sets need a heap for
     /// their backing nodes. We use ExpandContext.allocator
@@ -344,6 +349,7 @@ fn expandList(
     if (std.mem.eql(u8, name, "try")) return try expandTry(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "throw")) return try expandOrdinaryCall(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "defmacro")) return try expandDefmacro(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "ns")) return try expandNs(ctx, list_form, items);
     // Step #8c.1: internal compiler primitives (#%list / #%concat).
     // Recognized as special forms — NOT user-shadowable, NOT
     // looked up in the macro table. Args ARE recursively
@@ -1104,6 +1110,30 @@ fn expandCollKind(
 // `cons`/`first`/`rest`/etc. native fns are a future commit
 // (peer-AI turn 66 §D4).
 
+/// Phase 3.4 (peer-AI turn 69): expand `(ns NAME)`. Switches
+/// `ctx.registry.current` to the named namespace, creating it
+/// (with `nexis.core` as auto-referred parent) if not already
+/// registered. Returns nil; the runtime effect already happened
+/// at expansion time, so subsequent forms see the new current
+/// namespace.
+fn expandNs(
+    ctx: *ExpandContext,
+    list_form: *const Form,
+    items: []const *Form,
+) ExpandError!*Form {
+    if (items.len != 2) return ExpandError.MalformedMacroCall;
+    const name_form = items[1];
+    if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) {
+        return ExpandError.MalformedMacroCall;
+    }
+    const reg = ctx.registry orelse return ExpandError.MalformedMacroCall;
+    reg.switchTo(name_form.datum.symbol.name) catch return ExpandError.OutOfMemory;
+    // Replace `(ns NAME)` with `nil` in the form tree — the
+    // side effect already happened; nothing else to do at
+    // runtime.
+    return try makeNil(ctx, list_form.origin);
+}
+
 /// Phase 3.2: expand `(defmacro name [params] body)`.
 fn expandDefmacro(
     ctx: *ExpandContext,
@@ -1158,13 +1188,24 @@ fn expandDefmacro(
     const def_form = try makeList(ctx, def_items, list_form.origin);
 
     // Compile-time-eval the def form. Returns the Var Value.
+    //
+    // CRITICAL (Phase 3.4 bugfix): we INTENTIONALLY LEAK the
+    // sub-VM here. The macro fn's Closure is allocated in the
+    // sub-VM's `runtime_arena`, which is backed by the
+    // caller's persistent allocator. `ArenaAllocator.free`
+    // RECLAIMS the most-recent allocation (peer-AI turn 69
+    // discovery during 3.4 integration), so `sub_vm.deinit()`
+    // would invalidate the Closure pointer stored in `Var.root`
+    // \u2014 and the next defmacro's allocations would land on the
+    // exact bytes. Leaking the sub-VM here is safe: every
+    // allocation it made was from the persistent allocator
+    // (typically `vm.runtime_arena`), which is freed wholesale
+    // at VM teardown. The sub-VM struct itself is on the Zig
+    // stack and dies normally.
     var sub_vm: vm_mod.VM = undefined;
-    var sub_vm_ready = false;
-    defer if (sub_vm_ready) sub_vm.deinit();
     const result_value = ceval.eval(ceval.user_data, def_form, &sub_vm) catch {
         return ExpandError.MalformedMacroCall;
     };
-    sub_vm_ready = true;
 
     // Sanity: result should be a Var value. Mark it as macro.
     if (result_value.kind() != .var_) return ExpandError.MalformedMacroCall;

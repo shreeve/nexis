@@ -111,6 +111,15 @@ pub const Tiny = union(enum) {
     /// COMPILER.md §4.3 priority list. For step #4, locals are
     /// the only resolution category that exists.
     symbol: []const u8,
+    /// Phase 3.4 (peer-AI turn 69): namespace-qualified symbol
+    /// `prefix/name`. Resolves DIRECTLY through the namespace
+    /// registry — lexical scope is NOT consulted. The compiler
+    /// looks up `prefix` as a registered namespace name, then
+    /// fetches `name` from that namespace's local vars (NOT
+    /// walking the parent chain — qualified lookup is exact).
+    /// Missing ns / missing var both surface as UnresolvedSymbol
+    /// at compile time.
+    qualified_symbol: struct { ns: []const u8, name: []const u8 },
     /// Step E1 (pre-#8 macroexpander prereq, peer-AI turn 55):
     /// generic literal Value constant. Used by `lowerQuotePayload`
     /// for quoted symbols/keywords (which become symbol/keyword
@@ -876,7 +885,15 @@ const Emitter = struct {
     /// dedup pattern.
     fn addVarRef(self: *Emitter, name: []const u8) CompileError!u12 {
         const ns = self.namespace orelse return CompileError.InternalCompilerBug;
-        const v = ns.intern(name) catch return CompileError.OutOfMemory;
+        // Phase 3.4: lookup walks the parent chain (auto-refer
+        // fallback to `nexis.core` etc.). If found there, use
+        // that Var directly. Only fall through to `intern` (which
+        // creates a NEW unbound Var in `ns` itself, supporting
+        // forward references) when no existing Var resolves.
+        const v = if (ns.lookup(name)) |existing_v|
+            existing_v
+        else
+            ns.intern(name) catch return CompileError.OutOfMemory;
         // Dedup: linear scan is fine for v1 routines (var_table
         // length expected to stay small; rarely > a few dozen).
         for (self.var_table.items, 0..) |existing, i| {
@@ -1143,10 +1160,12 @@ fn lowerFormEnv(
         .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
         .int => |n| try allocTiny(allocator, .{ .int = n }),
         .symbol => |name| blk: {
-            // Step #7a: only unqualified symbols. Qualified
-            // (namespace/name) symbols require multi-ns
-            // machinery (post-v1).
-            if (name.ns != null) return CompileError.UnsupportedFeature;
+            // Phase 3.4: qualified symbols `ns/name` lower to
+            // `Tiny.qualified_symbol`; compileSymbol handles
+            // dispatch through the namespace registry.
+            if (name.ns) |ns_prefix| {
+                break :blk try allocTiny(allocator, .{ .qualified_symbol = .{ .ns = ns_prefix, .name = name.name } });
+            }
             break :blk try allocTiny(allocator, .{ .symbol = name.name });
         },
         .list => |items| try lowerList(allocator, items, ctx),
@@ -2126,6 +2145,10 @@ pub fn compileFormFullWithMacrosSpan(
 /// (the per-form arena). That's fine when ALL macro uses
 /// fall within the same arena lifetime (e.g., one-shot
 /// source compilation).
+///
+/// Phase 3.4: `registry` (optional) enables `(ns NAME)`
+/// expansion to switch the current namespace. If null, `(ns
+/// ...)` is a hard error.
 pub fn compileFormFullWithMacrosSpanPersistent(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
@@ -2134,6 +2157,31 @@ pub fn compileFormFullWithMacrosSpanPersistent(
     host_macros: ?*const expand_mod.HostMacroTable,
     out_span: ?*?reader_mod.SrcSpan,
     persistent_allocator: ?std.mem.Allocator,
+) CompileError!Compiled {
+    return compileFormFullWithMacrosSpanPersistentRegistry(
+        allocator,
+        form,
+        namespace,
+        interner,
+        host_macros,
+        out_span,
+        persistent_allocator,
+        null,
+    );
+}
+
+/// Phase 3.4: same as `compileFormFullWithMacrosSpanPersistent`
+/// but also accepts a `*NamespaceRegistry` for `(ns NAME)`
+/// expansion support.
+pub fn compileFormFullWithMacrosSpanPersistentRegistry(
+    allocator: std.mem.Allocator,
+    form: *const reader_mod.Form,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+    host_macros: ?*const expand_mod.HostMacroTable,
+    out_span: ?*?reader_mod.SrcSpan,
+    persistent_allocator: ?std.mem.Allocator,
+    registry: ?*vm.NamespaceRegistry,
 ) CompileError!Compiled {
     var working_form: *const reader_mod.Form = form;
     if (interner != null) {
@@ -2160,6 +2208,10 @@ pub fn compileFormFullWithMacrosSpanPersistent(
                 .user_data = @ptrCast(&ceval_data),
                 .eval = compileEvalCallback,
             },
+            // Phase 3.4: registry threaded by the caller (CLI
+            // sets it; ad-hoc tests pass null). Enables
+            // `(ns NAME)` to switch the current namespace.
+            .registry = registry,
         };
         working_form = expand_mod.expandForm(&mctx, null, form) catch |err| switch (err) {
             error.ExpansionDepthExceeded => {
@@ -2292,6 +2344,32 @@ pub fn compileSourceFullWithMacrosSpanPersistent(
     out_span: ?*?reader_mod.SrcSpan,
     persistent_allocator: ?std.mem.Allocator,
 ) CompileError!Compiled {
+    return compileSourceFullWithMacrosSpanPersistentRegistry(
+        allocator,
+        source,
+        namespace,
+        interner,
+        host_macros,
+        out_span,
+        persistent_allocator,
+        null,
+    );
+}
+
+/// Phase 3.4: source-string entry with both persistent
+/// allocator AND namespace registry. CLI's REPL + runFile call
+/// this so `(ns NAME)` switches affect subsequent forms in the
+/// session/file.
+pub fn compileSourceFullWithMacrosSpanPersistentRegistry(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+    host_macros: ?*const expand_mod.HostMacroTable,
+    out_span: ?*?reader_mod.SrcSpan,
+    persistent_allocator: ?std.mem.Allocator,
+    registry: ?*vm.NamespaceRegistry,
+) CompileError!Compiled {
     var p = reader_mod.parser.parseForm(allocator, source) catch {
         return CompileError.ReaderFailure;
     };
@@ -2300,7 +2378,7 @@ pub fn compileSourceFullWithMacrosSpanPersistent(
     defer reader.deinit();
     const form = reader.readOneForm(p.sexp) catch
         return CompileError.ReaderFailure;
-    return compileFormFullWithMacrosSpanPersistent(
+    return compileFormFullWithMacrosSpanPersistentRegistry(
         allocator,
         form,
         namespace,
@@ -2308,6 +2386,7 @@ pub fn compileSourceFullWithMacrosSpanPersistent(
         host_macros,
         out_span,
         persistent_allocator,
+        registry,
     );
 }
 
@@ -2380,6 +2459,9 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
     switch (form.*) {
         .nil, .bool, .int => {},
         .symbol => |name| if (!env.contains(name)) try out.put(allocator, name),
+        // Phase 3.4: qualified symbols resolve through the
+        // namespace registry — never lexically captured.
+        .qualified_symbol => {},
         .add => |a| {
             try freeVars(allocator, a.lhs, env, out);
             try freeVars(allocator, a.rhs, env, out);
@@ -2528,7 +2610,7 @@ fn capturedByDescendantFns(
     out: *NameSet,
 ) CompileError!void {
     switch (form.*) {
-        .nil, .bool, .int, .symbol => {},
+        .nil, .bool, .int, .symbol, .qualified_symbol => {},
         .add => |a| {
             try capturedByDescendantFns(allocator, a.lhs, env, out);
             try capturedByDescendantFns(allocator, a.rhs, env, out);
@@ -2707,6 +2789,7 @@ fn compileExpr(
         .int => |n| try compileIntLiteral(e, n, dst),
         .literal => |v| try compileLiteral(e, v, dst),
         .symbol => |name| try compileSymbol(e, name, dst),
+        .qualified_symbol => |qs| try compileQualifiedSymbol(e, qs.ns, qs.name, dst),
         .list_construct => |items| try compileListConstruct(e, items, dst),
         .concat => |items| try compileConcat(e, items, dst),
         .vector_construct => |items| try compileVectorConstruct(e, items, dst),
@@ -2902,6 +2985,44 @@ fn compileLt(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) CompileE
     const t_rhs = try e.allocSlot();
     try compileExpr(e, rhs, t_rhs, null);
     try e.emit(vm.asm_.cmpLt(dst, Operand.slot(t_lhs), Operand.slot(t_rhs)));
+}
+
+/// Phase 3.4: resolve `prefix/name` through the namespace
+/// registry attached to the current namespace's parent chain.
+/// Lexical bindings are NOT consulted (qualified symbols
+/// always go through namespaces, peer-AI turn 69 §D3).
+///
+/// Resolution shape:
+///   1. Locate the prefix namespace via the registry.
+///   2. Look up `name` in that namespace's LOCAL vars only
+///      (no auto-refer fallback — qualified means exact).
+///   3. Emit `var:load-var`.
+///
+/// Missing ns or missing var surface as UnresolvedSymbol.
+fn compileQualifiedSymbol(
+    e: *Emitter,
+    ns_prefix: []const u8,
+    name: []const u8,
+    dst: u12,
+) CompileError!void {
+    const current_ns = e.namespace orelse return CompileError.UnresolvedSymbol;
+    const registry = current_ns.registry orelse return CompileError.UnresolvedSymbol;
+    const target_ns = registry.lookupNs(ns_prefix) orelse return CompileError.UnresolvedSymbol;
+    // Qualified lookup is EXACT — no auto-refer parent walk.
+    const v = target_ns.lookupLocal(name) orelse return CompileError.UnresolvedSymbol;
+    // Reuse the var_table machinery (dedup + table append). We
+    // bypass `addVarRef`'s lookup-then-intern path because we
+    // already have the Var pointer.
+    for (e.var_table.items, 0..) |existing, i| {
+        if (existing == v) {
+            try e.emit(vm.asm_.varLoadVar(dst, @intCast(i)));
+            return;
+        }
+    }
+    const idx = e.var_table.items.len;
+    if (idx >= 4096) return CompileError.SlotOverflow;
+    try e.var_table.append(e.allocator, v);
+    try e.emit(vm.asm_.varLoadVar(dst, @intCast(idx)));
 }
 
 fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
@@ -6444,14 +6565,17 @@ test "compile #7a: lowerForm of empty list → MalformedForm (per peer-AI turn 5
 
 // (Quote-of-int now succeeds in #7b; covered by the #7b quote tests below.)
 
-test "compile #7a: lowerForm of qualified symbol → UnsupportedFeature (post-v1 multi-ns)" {
+test "compile #3.4: lowerForm of qualified symbol → Tiny.qualified_symbol" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const form = reader_mod.Form{
         .datum = .{ .symbol = .{ .ns = "foo", .name = "x" } },
         .origin = .{ .pos = 0, .len = 0 },
     };
-    try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
+    const tiny = try lowerForm(arena.allocator(), &form);
+    try testing.expect(tiny.* == .qualified_symbol);
+    try testing.expectEqualStrings("foo", tiny.qualified_symbol.ns);
+    try testing.expectEqualStrings("x", tiny.qualified_symbol.name);
 }
 
 test "compile #7a: compileSource of malformed input → ReaderFailure" {

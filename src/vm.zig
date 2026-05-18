@@ -530,6 +530,27 @@ pub const Var = struct {
 /// its other ArrayLists (VM.allocator); freed in
 /// `Namespace.deinit`.
 pub const Namespace = struct {
+    /// Phase 3.4 (peer-AI turn 69): namespace name. Empty for
+    /// ad-hoc single-ns usage (backward compat with tests that
+    /// construct a Namespace directly without going through
+    /// `NamespaceRegistry`). When non-empty, this is the
+    /// canonical name (e.g., "nexis.core", "user", "my.app").
+    name: []const u8 = "",
+    /// Phase 3.4: auto-refer fallback. When `lookup` doesn't
+    /// find a Var by name in this namespace, it walks the
+    /// parent chain. Used to thread `nexis.core` into every
+    /// user-defined namespace (peer-AI turn 69 §D6: "auto-refer
+    /// `nexis.core` from every new namespace by default").
+    /// `intern` does NOT walk parent — forward references
+    /// always land in the current namespace, never silently
+    /// shadowing parent Vars.
+    parent: ?*Namespace = null,
+    /// Phase 3.4: back-link to the owning registry. Lets
+    /// arbitrary cross-namespace qualified lookups (`other/x`
+    /// where `other` is not an ancestor) resolve directly via
+    /// `registry.lookupNs(name)`. Null for ad-hoc namespaces
+    /// constructed without going through `NamespaceRegistry`.
+    registry: ?*NamespaceRegistry = null,
     /// Backs the HashMap's internal storage.
     map_allocator: std.mem.Allocator,
     /// Backs the Var struct allocations. Lifetime = VM lifetime.
@@ -555,8 +576,19 @@ pub const Namespace = struct {
     }
 
     /// Look up an existing Var. Returns null if no Var was
-    /// ever interned under `name`.
+    /// ever interned under `name` in this namespace OR in any
+    /// auto-referred parent (Phase 3.4 peer-AI turn 69).
     pub fn lookup(self: *const Namespace, name: []const u8) ?*Var {
+        if (self.vars.get(name)) |v| return v;
+        if (self.parent) |p| return p.lookup(name);
+        return null;
+    }
+
+    /// Phase 3.4: local-only lookup. Does NOT walk parent.
+    /// Used by interner-style fall-through where a forward-
+    /// reference Var should ONLY land in the current
+    /// namespace, never in a referred-in parent.
+    pub fn lookupLocal(self: *const Namespace, name: []const u8) ?*Var {
         return self.vars.get(name);
     }
 
@@ -574,6 +606,113 @@ pub const Namespace = struct {
         new_var.* = .{ .name = name };
         try self.vars.put(self.map_allocator, name, new_var);
         return new_var;
+    }
+};
+
+/// Phase 3.4 (peer-AI turn 69): multi-namespace registry. Owns
+/// a map from canonical namespace name to `*Namespace`, plus
+/// pointers to the conventional `nexis.core` (auto-referred by
+/// every new namespace) and the `current` namespace (where
+/// `def`/`defn`/`defmacro` install).
+///
+/// Lifetime: Namespaces are arena-allocated (typically into
+/// `VM.runtime_arena`); the registry's HashMap uses
+/// `map_allocator` for its own internal storage and is
+/// `deinit`-ed by the registry's owner.
+pub const NamespaceRegistry = struct {
+    map_allocator: std.mem.Allocator,
+    /// Allocator for Namespace structs + their Var children.
+    /// Typically `VM.runtime_arena.allocator()`.
+    var_allocator: std.mem.Allocator,
+    /// Map of canonical ns name → namespace pointer.
+    map: std.StringHashMap(*Namespace) = undefined,
+    /// Auto-referred fallback for every new namespace.
+    core: *Namespace = undefined,
+    /// Where `def`/`defn`/`defmacro` install.
+    current: *Namespace = undefined,
+
+    /// Two-phase init: caller stores the empty registry FIRST,
+    /// then calls `setupDefaults` on the stable pointer.
+    /// Single-phase init was unsafe because `ns.registry = self`
+    /// captured the local `self` pointer, which dangled once
+    /// the registry was copied into its final home (peer-AI
+    /// turn 69 fix during 3.4 integration).
+    pub fn initEmpty(
+        map_allocator: std.mem.Allocator,
+        var_allocator: std.mem.Allocator,
+    ) NamespaceRegistry {
+        return .{
+            .map_allocator = map_allocator,
+            .var_allocator = var_allocator,
+            .map = std.StringHashMap(*Namespace).init(map_allocator),
+            .core = undefined,
+            .current = undefined,
+        };
+    }
+
+    /// Populate the conventional `nexis.core` (auto-referred)
+    /// and `user` (default current) namespaces. Must be called
+    /// on a STABLE pointer (i.e., after the registry has been
+    /// stored in its final location) because each namespace
+    /// captures `self` as its back-pointer.
+    pub fn setupDefaults(self: *NamespaceRegistry) !void {
+        self.core = try self.makeNamespace("nexis.core", null);
+        self.current = try self.makeNamespace("user", self.core);
+    }
+
+    pub fn deinit(self: *NamespaceRegistry) void {
+        // Namespace structs + their Vars live in `var_allocator`
+        // (typically an arena); freed wholesale by the arena's
+        // owner. We only own the outer HashMap + the per-
+        // namespace `vars` HashMap storage (which uses
+        // `map_allocator`).
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+        }
+        self.map.deinit();
+        self.* = undefined;
+    }
+
+    /// Get an existing namespace by name, or create + register
+    /// a new one (with `parent` as its auto-referred fallback).
+    /// `name` must be a stable slice (typically a string literal
+    /// or arena-owned; the registry holds the slice by reference).
+    pub fn getOrCreate(
+        self: *NamespaceRegistry,
+        name: []const u8,
+        parent: ?*Namespace,
+    ) !*Namespace {
+        if (self.map.get(name)) |existing| return existing;
+        return try self.makeNamespace(name, parent);
+    }
+
+    /// Look up a namespace by name. Returns null if missing.
+    pub fn lookupNs(self: *const NamespaceRegistry, name: []const u8) ?*Namespace {
+        return self.map.get(name);
+    }
+
+    /// Switch the current namespace pointer. If the named ns
+    /// doesn't exist yet, create it with `core` as its parent
+    /// (matches Clojure's `(ns NAME)` semantics for first-time
+    /// declarations).
+    pub fn switchTo(self: *NamespaceRegistry, name: []const u8) !void {
+        const ns = try self.getOrCreate(name, self.core);
+        self.current = ns;
+    }
+
+    fn makeNamespace(
+        self: *NamespaceRegistry,
+        name: []const u8,
+        parent: ?*Namespace,
+    ) !*Namespace {
+        const ns = try self.var_allocator.create(Namespace);
+        ns.* = Namespace.init(self.map_allocator, self.var_allocator);
+        ns.name = name;
+        ns.parent = parent;
+        ns.registry = self;
+        try self.map.put(name, ns);
+        return ns;
     }
 };
 
@@ -1010,6 +1149,13 @@ pub const VM = struct {
     /// v1 has a single global namespace; multi-namespace
     /// machinery lands later.
     namespace: ?Namespace = null,
+    /// Phase 3.4: multi-namespace registry. When non-null, the
+    /// CURRENT namespace is `registry.current` (which may differ
+    /// across REPL evaluations or file forms via `(ns NAME)`).
+    /// `ensureNamespace()` returns `registry.current` when the
+    /// registry exists; otherwise it falls back to the legacy
+    /// single `namespace` field (test/ad-hoc compat).
+    registry: ?NamespaceRegistry = null,
     /// Step #9.1: global try-handler stack (peer-AI turn 59
     /// §D2). Push on `ctrl:try-enter`, pop on `ctrl:try-exit`,
     /// walk on `ctrl:throw`. Each Handler is keyed by
@@ -1091,6 +1237,10 @@ pub const VM = struct {
         // via self.allocator). Free it explicitly. Var struct
         // memory itself is arena-backed and gets freed below.
         if (self.namespace) |*ns| ns.deinit();
+        // Phase 3.4: registry owns its outer HashMap + per-ns
+        // HashMaps (both via self.allocator). Free explicitly;
+        // Namespace structs themselves are arena-backed.
+        if (self.registry) |*reg| reg.deinit();
         // Heap (if initialized) is arena-backed in this staged
         // VM path. Its live-list is only bookkeeping; all
         // memory is reclaimed by `runtime_arena.deinit()`
@@ -1109,13 +1259,35 @@ pub const VM = struct {
     }
 
     /// Step #6a: lazy-initialize the global Namespace on first
-    /// use. HashMap storage uses `self.allocator` (heap-grown);
-    /// Var structs use `runtime_arena` (lifetime = VM lifetime).
+    /// use. After Phase 3.4: if a NamespaceRegistry was created
+    /// (via `ensureRegistry`), this returns `registry.current`
+    /// (the namespace where `def`/`defn`/`defmacro` install).
+    /// Otherwise falls back to the legacy single-ns slot for
+    /// ad-hoc test/test-only callers.
     pub fn ensureNamespace(self: *VM) *Namespace {
+        if (self.registry) |*reg| return reg.current;
         if (self.namespace == null) {
             self.namespace = Namespace.init(self.allocator, self.runtime_arena.allocator());
         }
         return &self.namespace.?;
+    }
+
+    /// Phase 3.4: lazy-initialize a NamespaceRegistry with the
+    /// conventional `nexis.core` (auto-referred) and `user`
+    /// (default current) namespaces. Callers that want
+    /// multi-namespace semantics use this instead of
+    /// `ensureNamespace`. After init, `ensureNamespace()`
+    /// returns `registry.current` automatically.
+    pub fn ensureRegistry(self: *VM) !*NamespaceRegistry {
+        if (self.registry == null) {
+            self.registry = NamespaceRegistry.initEmpty(
+                self.allocator,
+                self.runtime_arena.allocator(),
+            );
+            // Populate AFTER storage so back-pointers are stable.
+            try self.registry.?.setupDefaults();
+        }
+        return &self.registry.?;
     }
 
     /// Step E1: lazy-initialize the shared Interner on first

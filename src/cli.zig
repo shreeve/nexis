@@ -120,6 +120,13 @@ fn formatValue(v: Value, interner: *const intern_mod.Interner, writer: anytype) 
             }
             try writer.writeAll("}");
         },
+        .native_fn => {
+            // Phase 3.3a / 3.4: print native fns as
+            // `#<native-fn NAME>` (matching Clojure's
+            // `#<core$+ ...>` flavor but slimmer).
+            const nf = vm.asNativeFn(v);
+            try writer.print("#<native-fn {s}>", .{nf.name});
+        },
         else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),
     }
 }
@@ -384,17 +391,25 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
     var v = try vm.VM.init(allocator, &stub);
     defer v.deinit();
-    const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    // Phase 3.3a: install core native fns (list/cons/first/rest/
-    // count/nth/empty?/identity/nil?/some?) into the namespace
-    // so they're callable from user code AND from compile-time
-    // macro bodies. Names are string literals; no allocator
-    // needed for storage.
-    try stdlib.installCore(ns);
+    // Phase 3.4: set up the namespace registry (creates
+    // `nexis.core` + `user`, with user.parent = core for
+    // auto-refer). After this, `v.ensureNamespace()` returns
+    // `registry.current` (initially `user`).
+    const registry = try v.ensureRegistry();
+    // Phase 3.3a: install core native fns into nexis.core (NOT
+    // user) so they're visible via auto-refer + qualified
+    // lookup (`nexis.core/map`). User code that defs the same
+    // names creates a local shadow.
+    try stdlib.installCore(registry.core);
     // Phase 3.3d: bootstrap the embedded core.nx composite
-    // layer.
-    try bootstrapCoreNx(&v, ns, interner, allocator);
+    // layer INTO nexis.core (so user code inherits via auto-
+    // refer). Temporarily switch current → core for bootstrap;
+    // switch back to user after.
+    const saved_current = registry.current;
+    registry.current = registry.core;
+    try bootstrapCoreNx(&v, registry.core, interner, allocator);
+    registry.current = saved_current;
     var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);
 
@@ -447,14 +462,18 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         // Phase 3.2: pass v.runtime_arena.allocator() as the
         // persistent allocator so defmacro Closures defined
         // on one REPL line survive into subsequent lines.
-        const compiled = compile.compileSourceFullWithMacrosSpanPersistent(
+        // Phase 3.4: re-read registry.current each iteration so
+        // `(ns NAME)` switches affect subsequent forms.
+        const current_ns = registry.current;
+        const compiled = compile.compileSourceFullWithMacrosSpanPersistentRegistry(
             arena.allocator(),
             src,
-            ns,
+            current_ns,
             interner,
             &host_macros,
             &error_span,
             v.runtime_arena.allocator(),
+            registry,
         ) catch |err| {
             try emitCompileError(io, "<repl>", src, err, error_span);
             continue;
@@ -559,14 +578,17 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
     var v = try vm.VM.init(allocator, &stub);
     defer v.deinit();
-    const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    // Phase 3.3a: install core native fns.
-    try stdlib.installCore(ns);
-    // Phase 3.3d: bootstrap the embedded core.nx composite
-    // layer (second, last, reverse, range, take, drop,
-    // when-let, if-let, dotimes, true?/false?).
-    try bootstrapCoreNx(&v, ns, interner, allocator);
+    // Phase 3.4: namespace registry (nexis.core + user).
+    const registry = try v.ensureRegistry();
+    // Phase 3.3a: install core native fns into nexis.core.
+    try stdlib.installCore(registry.core);
+    // Phase 3.3d: bootstrap core.nx INTO nexis.core (so user
+    // code inherits via auto-refer).
+    const saved_current = registry.current;
+    registry.current = registry.core;
+    try bootstrapCoreNx(&v, registry.core, interner, allocator);
+    registry.current = saved_current;
 
     // Compile arena: shared across all top-level forms in this
     // file. Form trees + Tiny IR + Compiled routines all live
@@ -588,13 +610,18 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
         // The CLI converts byte offsets to file:line:col +
         // shows the source line with a caret.
         var error_span: ?reader_mod.SrcSpan = null;
-        const compiled = compile.compileFormFullWithMacrosSpan(
+        // Phase 3.4: re-read registry.current per-form so
+        // `(ns NAME)` switches mid-file affect subsequent forms.
+        const current_ns = registry.current;
+        const compiled = compile.compileFormFullWithMacrosSpanPersistentRegistry(
             compile_arena.allocator(),
             form,
-            ns,
+            current_ns,
             interner,
             &host_macros,
             &error_span,
+            v.runtime_arena.allocator(),
+            registry,
         ) catch |err| {
             try emitCompileError(io, path, source, err, error_span);
             std.process.exit(4);

@@ -110,6 +110,12 @@ fn formatValue(buf: *std.array_list.Managed(u8), v: value_mod.Value, interner: *
             try buf.appendSlice(var_obj.name);
         },
         .function => try buf.appendSlice("#<fn>"),
+        .native_fn => {
+            const nf = vm.asNativeFn(v);
+            try buf.appendSlice("#<native-fn ");
+            try buf.appendSlice(nf.name);
+            try buf.append('>');
+        },
         else => {
             const s = try std.fmt.allocPrint(testing.allocator, "#<value kind={d}>", .{@intFromEnum(v.kind())});
             defer testing.allocator.free(s);
@@ -157,6 +163,69 @@ fn bootstrapCoreForTest(
     }
 }
 
+/// Phase 3.4: multi-form test helper that processes top-level
+/// forms sequentially (matching runFile semantics). Use this
+/// when `(ns NAME)` switching needs to affect subsequent
+/// forms within the same test. The final form's value is the
+/// "result".
+fn expectOutputProgram(src: []const u8, expected: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    const registry = try v.ensureRegistry();
+    try stdlib.installCore(registry.core);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    const saved_current = registry.current;
+    registry.current = registry.core;
+    try bootstrapCoreForTest(&v, registry.core, interner, &host_macros);
+    registry.current = saved_current;
+
+    // Parse + read program (multiple top-level forms).
+    var parse_result = try reader_mod.parser.parseProgram(testing.allocator, src);
+    defer parse_result.parser.deinit();
+    var rdr = reader_mod.Reader.init(testing.allocator, src);
+    defer rdr.deinit();
+    const forms = try rdr.readProgram(parse_result.sexp);
+
+    var last_result: value_mod.Value = value_mod.nilValue();
+    for (forms) |form| {
+        // Re-read current per form so (ns NAME) takes effect.
+        const current_ns = registry.current;
+        const compiled = try compile.compileFormFullWithMacrosSpanPersistentRegistry(
+            arena.allocator(),
+            form,
+            current_ns,
+            interner,
+            &host_macros,
+            null,
+            v.runtime_arena.allocator(),
+            registry,
+        );
+        const routine = compiled.toRoutine("test-form");
+        v.frames.items[0].routine = &routine;
+        v.frames.items[0].pc = 0;
+        v.frames.items[0].slot_count = routine.slot_count;
+        v.halted = false;
+        if (v.stack.items.len < routine.slot_count) {
+            try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+        }
+        last_result = try v.run();
+    }
+
+    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
+    defer buf.deinit();
+    try formatValue(&buf, last_result, interner);
+    testing.expectEqualStrings(expected, buf.items) catch |err| {
+        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
+        return err;
+    };
+}
+
 /// Run `src` end-to-end and assert the printed output equals
 /// `expected`. Wraps multiple top-level forms in an implicit do
 /// so callers can write multi-form programs naturally.
@@ -167,24 +236,33 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
-    const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    // Phase 3.3a: install core native fns so integration tests
-    // can exercise list/cons/first/rest/etc.
-    try stdlib.installCore(ns);
+    // Phase 3.4: set up the namespace registry so tests can
+    // exercise `(ns NAME)` + qualified symbol resolution.
+    const registry = try v.ensureRegistry();
+    // Phase 3.3a: install core native fns into nexis.core (auto-
+    // referred by user via parent).
+    try stdlib.installCore(registry.core);
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
-    // Phase 3.3d: bootstrap composite core.nx layer so tests
-    // can exercise when-let/if-let/dotimes/second/last/reverse/
-    // range/take/drop.
-    try bootstrapCoreForTest(&v, ns, interner, &host_macros);
+    // Phase 3.3d: bootstrap composite core.nx layer into core.
+    const saved_current = registry.current;
+    registry.current = registry.core;
+    try bootstrapCoreForTest(&v, registry.core, interner, &host_macros);
+    registry.current = saved_current;
 
-    const compiled = try compile.compileSourceFullWithMacros(
+    // Phase 3.4: each test compiles in the CURRENT namespace
+    // (initially user). `(ns NAME)` in src can switch mid-test.
+    const current_ns = registry.current;
+    const compiled = try compile.compileSourceFullWithMacrosSpanPersistentRegistry(
         arena.allocator(),
         src,
-        ns,
+        current_ns,
         interner,
         &host_macros,
+        null,
+        v.runtime_arena.allocator(),
+        registry,
     );
     const routine = compiled.toRoutine("integration");
     v.frames.items[0].routine = &routine;
@@ -599,6 +677,98 @@ test "integration: my-cond — user procedural macro using native fns" {
 test "integration: native fn — arity mismatch is catchable" {
     try expectOutput("(try (first) (catch any e e))", ":arity-mismatch");
     try expectOutput("(try (cons 1) (catch any e e))", ":arity-mismatch");
+}
+
+// =============================================================================
+// Phase 3.4 — multi-namespace (auto-refer core + qualified symbols + (ns NAME))
+// =============================================================================
+
+test "integration: 3.4 — auto-refer nexis.core from user" {
+    try expectOutput("(map inc [1 2 3])", "(2 3 4)");
+    try expectOutput("(reduce + 0 (range 5))", "10");
+}
+
+test "integration: 3.4 — qualified core symbol" {
+    try expectOutput("(nexis.core/+ 1 2 3)", "6");
+    try expectOutput("(nexis.core/* 2 3 4)", "24");
+    try expectOutput("(nexis.core/inc 41)", "42");
+}
+
+test "integration: 3.4 — (ns NAME) switches current namespace" {
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(def x 100)
+        \\(ns user)
+        \\my.app/x
+    , "100");
+}
+
+test "integration: 3.4 — defn in a namespace + qualified call" {
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(defn double [n] (* n 2))
+        \\(ns user)
+        \\(my.app/double 21)
+    , "42");
+}
+
+test "integration: 3.4 — qualified symbol resolves via registry not lexical" {
+    // Qualified `my.app/x` is parsed as a single symbol with
+    // `ns="my.app"`. Lexical `let` binding form `[my.app/x 99]`
+    // is rejected at expand-time (let* binding names must be
+    // unqualified). This test just verifies a let with an
+    // UNQUALIFIED name doesn't shadow a same-name qualified
+    // symbol elsewhere.
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(def x 100)
+        \\(ns user)
+        \\(let [x 99] my.app/x)
+    , "100");
+}
+
+test "integration: 3.4 — defs in different namespaces don't collide" {
+    try expectOutputProgram(
+        \\(ns a) (def x 1)
+        \\(ns b) (def x 2)
+        \\(ns user)
+        \\(+ a/x b/x)
+    , "3");
+}
+
+test "integration: 3.4 — unqualified def shadows core in current ns" {
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(def map :i-am-not-a-function)
+        \\map
+    , ":i-am-not-a-function");
+}
+
+test "integration: 3.4 — missing qualified ns is UnresolvedSymbol" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    const registry = try v.ensureRegistry();
+    try stdlib.installCore(registry.core);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    try testing.expectError(
+        compile.CompileError.UnresolvedSymbol,
+        compile.compileSourceFullWithMacrosSpanPersistentRegistry(
+            arena.allocator(),
+            "missing.ns/foo",
+            registry.current,
+            interner,
+            &host_macros,
+            null,
+            v.runtime_arena.allocator(),
+            registry,
+        ),
+    );
 }
 
 // =============================================================================
