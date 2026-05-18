@@ -247,6 +247,8 @@ pub fn build(b: *std.Build) void {
     stdlib_mod.addImport("vector", vector_mod);
     stdlib_mod.addImport("champ", champ_mod);
     stdlib_mod.addImport("intern", intern_mod);
+    // dispatch_mod is declared later (after db); the addImport
+    // for it is attached at the bottom of the dispatch block.
 
     const compile_mod = b.createModule(.{
         .root_source_file = b.path("src/compile.zig"),
@@ -321,6 +323,9 @@ pub fn build(b: *std.Build) void {
     // Phase 3.2: expand needs dispatch for Form→Value
     // construction of maps/sets (hash + equality).
     expand_mod.addImport("dispatch", dispatch_mod);
+    // Phase 3.3b: stdlib needs dispatch for `=` (value
+    // equality) implementation.
+    stdlib_mod.addImport("dispatch", dispatch_mod);
 
     // -------------------------------------------------------------------------
     // Phase 0: reader unit tests (src/reader.zig has its own test { ... }
@@ -422,7 +427,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch" } },
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch" } },
-        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern" } },
+        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;

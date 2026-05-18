@@ -556,6 +556,127 @@ test "integration: native fn — arity mismatch is catchable" {
 }
 
 // =============================================================================
+// Phase 3.3b — VM.callValue + apply + HOFs + first-class arithmetic
+// =============================================================================
+
+test "integration: 3.3b — variadic native + / * / - / <" {
+    try expectOutput("(+)", "0");
+    try expectOutput("(+ 1 2 3 4 5)", "15");
+    try expectOutput("(*)", "1");
+    try expectOutput("(* 2 3 4)", "24");
+    try expectOutput("(- 10 3)", "7");
+    try expectOutput("(- 7)", "-7");
+    try expectOutput("(<)", "true");
+    try expectOutput("(< 1 2 3)", "true");
+    try expectOutput("(< 1 3 2)", "false");
+}
+
+test "integration: 3.3b — value equality `=` (variadic, structural)" {
+    try expectOutput("(=)", "true");
+    try expectOutput("(= 1)", "true");
+    try expectOutput("(= 1 1 1)", "true");
+    try expectOutput("(= 1 1 2)", "false");
+    try expectOutput("(= :a :a)", "true");
+    try expectOutput("(= [1 2 3] [1 2 3])", "true");
+    try expectOutput("(= {:a 1} {:a 1})", "true");
+}
+
+test "integration: 3.3b — inc / dec / not / predicates" {
+    try expectOutput("(inc 41)", "42");
+    try expectOutput("(dec 1)", "0");
+    try expectOutput("(not nil)", "true");
+    try expectOutput("(not false)", "true");
+    try expectOutput("(not 0)", "false");
+    try expectOutput("(zero? 0)", "true");
+    try expectOutput("(pos? 5)", "true");
+    try expectOutput("(neg? -3)", "true");
+    try expectOutput("(odd? 7)", "true");
+    try expectOutput("(even? 4)", "true");
+}
+
+test "integration: 3.3b — apply (no leading args)" {
+    try expectOutput("(apply + (list 1 2 3 4 5))", "15");
+    try expectOutput("(apply * [2 3 4])", "24");
+}
+
+test "integration: 3.3b — apply with leading args" {
+    try expectOutput("(apply + 10 (list 1 2 3))", "16");
+    try expectOutput("(apply + 1 2 3 (list 4 5))", "15");
+}
+
+test "integration: 3.3b — apply with user fn" {
+    try expectOutput(
+        \\(do (defn square [x] (* x x))
+        \\    (apply square (list 7)))
+    , "49");
+}
+
+test "integration: 3.3b — map (eager) on list + vector" {
+    try expectOutput("(map inc (list 1 2 3 4))", "(2 3 4 5)");
+    try expectOutput("(map inc [10 20 30])", "(11 21 31)");
+    try expectOutput("(map inc nil)", "()");
+}
+
+test "integration: 3.3b — reduce" {
+    try expectOutput("(reduce + 0 [1 2 3 4 5])", "15");
+    try expectOutput("(reduce + 0 (list))", "0");
+    try expectOutput("(reduce * 1 [1 2 3 4])", "24");
+    try expectOutput("(reduce + 100 nil)", "100");
+}
+
+test "integration: 3.3b — filter" {
+    try expectOutput("(filter odd? [1 2 3 4 5 6 7])", "(1 3 5 7)");
+    try expectOutput("(filter pos? [-2 -1 0 1 2])", "(1 2)");
+    try expectOutput("(filter some? (list 1 nil 2 nil 3))", "(1 2 3)");
+}
+
+test "integration: 3.3b — map with user lambda" {
+    try expectOutput(
+        \\(map (fn* [x] (* x x)) [1 2 3 4])
+    , "(1 4 9 16)");
+}
+
+test "integration: 3.3b — reduce with user lambda" {
+    try expectOutput(
+        \\(reduce (fn* [acc x] (+ acc (* x x))) 0 [1 2 3])
+    , "14");
+}
+
+test "integration: 3.3b — throw inside map propagates to outer catch" {
+    try expectOutput(
+        \\(try (map (fn* [x] (throw :boom)) [1 2 3])
+        \\     (catch any e e))
+    , ":boom");
+}
+
+test "integration: 3.3b — throw inside reduce propagates" {
+    try expectOutput(
+        \\(try (reduce (fn* [acc x]
+        \\               (if (< 10 acc)
+        \\                 (throw :too-big)
+        \\                 (+ acc x)))
+        \\             0 [1 5 8 2])
+        \\     (catch any e e))
+    , ":too-big");
+}
+
+test "integration: 3.3b — throw through apply" {
+    try expectOutput(
+        \\(try (apply (fn* [x] (throw :inside-apply)) (list 99))
+        \\     (catch any e e))
+    , ":inside-apply");
+}
+
+test "integration: 3.3b — HOFs composed" {
+    try expectOutput(
+        \\(reduce + 0 (filter odd? (map inc [0 1 2 3 4 5])))
+    , "9");
+    // (map inc xs) => (1 2 3 4 5 6)
+    // (filter odd? ...) => (1 3 5)
+    // (reduce + 0 ...) => 9
+}
+
+// =============================================================================
 // Phase 3.2 — user-defined defmacro
 // =============================================================================
 

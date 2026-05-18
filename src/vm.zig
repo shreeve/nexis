@@ -751,6 +751,22 @@ pub const Frame = struct {
     /// (5a1 only allocates these); populated by `closure:make` +
     /// `call:call` chain in step 5b.
     upvalues: []const *UpvalCell = &.{},
+    /// Phase 3.3b (peer-AI turn 68): when non-null, this frame
+    /// was pushed by `VM.callValue` (a host-Zig fn re-entering
+    /// the VM). When `call:return` fires for this frame, it
+    /// writes the return value into `host_result.value`, sets
+    /// `host_result.done = true`, pops the frame, and returns
+    /// WITHOUT writing into a caller slot (callValue's caller
+    /// isn't a regular routine — it's host code).
+    host_result: ?*HostCallResult = null,
+};
+
+/// Phase 3.3b (peer-AI turn 68): result cell for `VM.callValue`.
+/// The synthetic frame's `call:return` handler writes into this
+/// instead of into a caller's slot.
+pub const HostCallResult = struct {
+    done: bool = false,
+    value: Value = value_mod.nilValue(),
 };
 
 // =============================================================================
@@ -869,6 +885,16 @@ pub const VmError = error{
     /// `:index-out-of-bounds` by the catchable-error
     /// translation table.
     IndexOutOfBounds,
+    /// Phase 3.3b (peer-AI turn 68): INTERNAL control-flow
+    /// signal. NOT user-visible, NOT catchable. Raised when a
+    /// throw propagated past a `VM.callValue` synthetic frame
+    /// (i.e., control transferred to a handler installed BELOW
+    /// the callValue entry point). Native fns + HOFs that
+    /// invoke `callValue` must propagate this unchanged so the
+    /// outer handler's frame-rewind happens correctly. The run
+    /// loop catches it and continues dispatch (PC + frame state
+    /// have already been adjusted by unwindThrow).
+    ControlTransferred,
     /// V-operand resolve (or `var:load-var`) read a Var whose
     /// `bound = false` — the Var was interned (e.g., by a
     /// forward reference in another `defn`) but no `def` has
@@ -1216,6 +1242,155 @@ pub const VM = struct {
         return try out_vm.run();
     }
 
+    /// Phase 3.3b (peer-AI turn 68): invoke `callee` (Closure
+    /// or native_fn) from inside an already-running VM. Used by
+    /// native HOFs (`map`/`reduce`/`filter`/`apply`) to call
+    /// user-supplied fns at runtime without the per-call
+    /// fresh-VM overhead of `evalClosure`.
+    ///
+    /// **Args lifetime**: `args` is borrowed for the duration
+    /// of the call. Callees (native fns + closures) must not
+    /// retain the slice past their own return.
+    ///
+    /// **Throw propagation**: if the callee throws and no
+    /// handler INSIDE the callee catches it, control transfers
+    /// to a handler installed BELOW the `callValue` entry
+    /// point. In that case `callValue` returns
+    /// `VmError.ControlTransferred` — an INTERNAL signal that
+    /// callers (native fns + HOFs) must propagate unchanged.
+    /// The main run loop catches `ControlTransferred` and
+    /// continues dispatch (frame + PC already adjusted by
+    /// `unwindThrow`).
+    pub fn callValue(self: *VM, callee: Value, args: []const Value) VmError!Value {
+        switch (callee.kind()) {
+            value_mod.Kind.native_fn => {
+                const native = asNativeFn(callee);
+                if (args.len < native.min_arity) return VmError.ArityMismatch;
+                if (native.max_arity) |max| {
+                    if (args.len > max) return VmError.ArityMismatch;
+                }
+                return native.call(self, args);
+            },
+            value_mod.Kind.function => {
+                const closure = asClosure(callee);
+                const routine = closure.routine;
+                // Arity check (same shape as execCallCall).
+                if (routine.variadic) {
+                    if (args.len < routine.fixed_arity) return VmError.ArityMismatch;
+                } else {
+                    if (routine.fixed_arity != args.len) return VmError.ArityMismatch;
+                }
+                if (closure.upvalues.len != routine.upvalue_count) {
+                    return VmError.CaptureCountMismatch;
+                }
+                // Allocate stack space. Peer-AI turn 68 variadic
+                // gotcha: must accommodate args.len even when
+                // > routine.slot_count, otherwise the arg-copy
+                // loop below writes out of bounds. After rest
+                // construction we shrink back to slot_count.
+                const required_slots = @max(@as(usize, routine.slot_count), args.len);
+                const base_slot: usize = self.stack.items.len;
+                self.stack.appendNTimes(self.allocator, value_mod.nilValue(), required_slots) catch return VmError.OutOfMemory;
+                // Copy fixed args.
+                const fixed: usize = routine.fixed_arity;
+                var i: usize = 0;
+                while (i < fixed) : (i += 1) {
+                    self.stack.items[base_slot + i] = args[i];
+                }
+                // Variadic rest construction.
+                if (routine.variadic) {
+                    // Build the rest list from excess args in
+                    // reverse so cons threads correctly.
+                    const heap = self.ensureHeap();
+                    var rest = list_mod.empty(heap) catch return VmError.OutOfMemory;
+                    var j: usize = args.len;
+                    while (j > fixed) {
+                        j -= 1;
+                        rest = list_mod.cons(heap, args[j], rest) catch return VmError.OutOfMemory;
+                    }
+                    self.stack.items[base_slot + fixed] = rest;
+                    // Nil any slots between fixed+1 .. required_slots
+                    // (these are the dead args we no longer need).
+                    var k: usize = fixed + 1;
+                    while (k < required_slots) : (k += 1) {
+                        self.stack.items[base_slot + k] = value_mod.nilValue();
+                    }
+                }
+                // Now shrink to the routine's logical slot_count.
+                // (Variadic routines' slot_count already accounts
+                // for the rest slot.)
+                if (required_slots > routine.slot_count) {
+                    self.stack.shrinkRetainingCapacity(base_slot + routine.slot_count);
+                }
+
+                // Set up result cell and push the synthetic frame.
+                var result_cell = HostCallResult{};
+                const initial_depth = self.frames.items.len;
+                self.frames.append(self.allocator, .{
+                    .routine = routine,
+                    .base_slot = @intCast(base_slot),
+                    .slot_count = routine.slot_count,
+                    .pc = 0,
+                    .upvalues = closure.upvalues,
+                    .host_result = &result_cell,
+                }) catch return VmError.OutOfMemory;
+                if (self.frames.items.len > self.frame_high_water) {
+                    self.frame_high_water = self.frames.items.len;
+                }
+                if (self.stack.items.len > self.stack_high_water) {
+                    self.stack_high_water = self.stack.items.len;
+                }
+
+                // Run until our frame returns (depth back to initial).
+                try self.runUntilDepth(initial_depth);
+
+                // If the depth dropped without `done = true`, a
+                // throw propagated past us → ControlTransferred.
+                if (!result_cell.done) return VmError.ControlTransferred;
+                return result_cell.value;
+            },
+            else => return VmError.NotCallable,
+        }
+    }
+
+    /// Phase 3.3b helper: dispatch instructions until
+    /// `frames.items.len == target_depth`. Unlike `run()`, does
+    /// NOT toggle global `halted` — termination is purely
+    /// depth-based (peer-AI turn 68 Sharp warning §1). Throws
+    /// propagate identically to `run()` (translated to user
+    /// keyword Values when a handler exists; otherwise raw
+    /// VmError bubbles back to the caller).
+    fn runUntilDepth(self: *VM, target_depth: usize) VmError!void {
+        while (self.frames.items.len > target_depth) {
+            // Fetch.
+            const frame = self.currentFrame();
+            if (frame.pc >= frame.routine.code.len) {
+                return VmError.BytecodeExhausted;
+            }
+            const inst = frame.routine.code[frame.pc];
+            frame.pc += 1;
+            if (inst.kind == .extension) return VmError.UnimplementedOpcode;
+
+            // Dispatch with the same error-handling shape as
+            // run(): ControlTransferred continues; other errors
+            // route through handleRuntimeError.
+            self.dispatch(inst) catch |err| switch (err) {
+                VmError.ControlTransferred => continue,
+                else => self.handleRuntimeError(err) catch |err2| switch (err2) {
+                    // If unwindThrow popped us past our target
+                    // depth, the throw escaped — let caller
+                    // (callValue) detect via result_cell.done.
+                    VmError.UncaughtThrow => return err2,
+                    else => return err2,
+                },
+            };
+            // If unwindThrow inside dispatch popped frames past
+            // target_depth without our frame's call:return
+            // firing, our caller will detect this via result_cell.
+            if (self.frames.items.len <= target_depth) return;
+        }
+    }
+
     /// Step #6b: pack a `*Var` into a `Value` of kind `.var_`.
     /// Used by `var:store-var` (returns the Var object so
     /// `(def x 5)` evaluates to the Var, not the value 5) and
@@ -1426,15 +1601,18 @@ pub const VM = struct {
                 break :blk i;
             };
 
-            self.dispatch(inst) catch |err| {
-                // Phase 3.0c (peer-AI turn 62 §"Implementation
-                // model"): recoverable VM errors get translated
-                // into user Values and routed through the same
-                // unwind machinery as `ctrl:throw`. If no handler
-                // catches, the throw bubbles back out as
-                // UncaughtThrow (with the keyword payload in
-                // `unhandled_throw`).
-                try self.handleRuntimeError(err);
+            self.dispatch(inst) catch |err| switch (err) {
+                // Phase 3.3b (peer-AI turn 68): internal control-
+                // transfer signal from a callValue/native re-
+                // entry path. Frame + PC already adjusted by
+                // unwindThrow; just continue dispatch.
+                VmError.ControlTransferred => continue,
+                else => {
+                    // Phase 3.0c (peer-AI turn 62): recoverable
+                    // VM errors get translated into user Values
+                    // and routed through unwindThrow.
+                    try self.handleRuntimeError(err);
+                },
             };
         }
         return self.result;
@@ -1462,7 +1640,10 @@ pub const VM = struct {
                 if (i.kind == .extension) return VmError.UnimplementedOpcode;
                 break :blk i;
             };
-            self.dispatch(inst) catch |err| try self.handleRuntimeError(err);
+            self.dispatch(inst) catch |err| switch (err) {
+                VmError.ControlTransferred => continue,
+                else => try self.handleRuntimeError(err),
+            };
         }
         return self.result;
     }
@@ -1773,6 +1954,24 @@ pub const VM = struct {
         // invalidate the slot pointer).
         const return_value = try self.resolve(inst.a);
 
+        // Phase 3.3b (peer-AI turn 68): callValue's synthetic
+        // frame path. If this frame's host_result is set, the
+        // caller is HOST CODE (not a regular routine), so the
+        // result must go into the result cell, not into a
+        // caller's slot. Pop the frame, shrink the stack to the
+        // frame's base, and signal completion. `runUntilDepth`
+        // detects the depth decrease + result_cell.done and
+        // returns.
+        const callee_idx_check = self.frames.items.len - 1;
+        if (self.frames.items[callee_idx_check].host_result) |hr| {
+            const callee = self.frames.items[callee_idx_check];
+            hr.value = return_value;
+            hr.done = true;
+            _ = self.frames.pop().?;
+            self.stack.shrinkRetainingCapacity(callee.base_slot);
+            return;
+        }
+
         // Top-level return halts the VM and stores result.
         if (self.frames.items.len == 1) {
             self.result = return_value;
@@ -1808,6 +2007,17 @@ pub const VM = struct {
     /// return value, no operand resolution. Same validate-before-
     /// mutate discipline as `execCallReturn` (peer-AI turn 43).
     fn execCallReturnNil(self: *VM) VmError!void {
+        // Phase 3.3b (peer-AI turn 68): host_result path.
+        const callee_idx_check = self.frames.items.len - 1;
+        if (self.frames.items[callee_idx_check].host_result) |hr| {
+            const callee = self.frames.items[callee_idx_check];
+            hr.value = value_mod.nilValue();
+            hr.done = true;
+            _ = self.frames.pop().?;
+            self.stack.shrinkRetainingCapacity(callee.base_slot);
+            return;
+        }
+
         if (self.frames.items.len == 1) {
             self.result = value_mod.nilValue();
             self.halted = true;
@@ -2673,6 +2883,7 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.CallBlockOutOfRange,
         VmError.InvalidHandlerState,
         VmError.Halt,
+        VmError.ControlTransferred,
         => null,
     };
 }

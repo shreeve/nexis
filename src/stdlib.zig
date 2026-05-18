@@ -74,6 +74,7 @@ const CoreEntry = struct {
 };
 
 const core_fns = [_]CoreEntry{
+    // 3.3a sequence primitives.
     .{ .name = "list", .descriptor = &native_list },
     .{ .name = "cons", .descriptor = &native_cons },
     .{ .name = "first", .descriptor = &native_first },
@@ -84,6 +85,29 @@ const core_fns = [_]CoreEntry{
     .{ .name = "identity", .descriptor = &native_identity },
     .{ .name = "nil?", .descriptor = &native_nil_q },
     .{ .name = "some?", .descriptor = &native_some_q },
+    // 3.3b first-class arithmetic + comparison Vars.
+    // Required so `(reduce + 0 xs)` resolves `+` as a Var
+    // (the inlining of `(+ x y)` at the call head continues
+    // to work — known limitation per peer-AI turn 67 §Sharp
+    // warning §2).
+    .{ .name = "+", .descriptor = &native_add },
+    .{ .name = "-", .descriptor = &native_sub },
+    .{ .name = "*", .descriptor = &native_mul },
+    .{ .name = "<", .descriptor = &native_lt },
+    .{ .name = "=", .descriptor = &native_eq },
+    .{ .name = "inc", .descriptor = &native_inc },
+    .{ .name = "dec", .descriptor = &native_dec },
+    .{ .name = "not", .descriptor = &native_not },
+    .{ .name = "zero?", .descriptor = &native_zero_q },
+    .{ .name = "pos?", .descriptor = &native_pos_q },
+    .{ .name = "neg?", .descriptor = &native_neg_q },
+    .{ .name = "odd?", .descriptor = &native_odd_q },
+    .{ .name = "even?", .descriptor = &native_even_q },
+    // 3.3b apply + HOFs.
+    .{ .name = "apply", .descriptor = &native_apply },
+    .{ .name = "map", .descriptor = &native_map },
+    .{ .name = "reduce", .descriptor = &native_reduce },
+    .{ .name = "filter", .descriptor = &native_filter },
 };
 
 // =============================================================================
@@ -159,6 +183,27 @@ const native_some_q = NativeFn{
     .max_arity = 1,
     .call = &fnSomeQ,
 };
+
+// 3.3b arithmetic + comparison.
+const native_add = NativeFn{ .name = "+", .min_arity = 0, .max_arity = null, .call = &fnAdd };
+const native_sub = NativeFn{ .name = "-", .min_arity = 1, .max_arity = null, .call = &fnSub };
+const native_mul = NativeFn{ .name = "*", .min_arity = 0, .max_arity = null, .call = &fnMul };
+const native_lt = NativeFn{ .name = "<", .min_arity = 0, .max_arity = null, .call = &fnLt };
+const native_eq = NativeFn{ .name = "=", .min_arity = 0, .max_arity = null, .call = &fnEq };
+const native_inc = NativeFn{ .name = "inc", .min_arity = 1, .max_arity = 1, .call = &fnInc };
+const native_dec = NativeFn{ .name = "dec", .min_arity = 1, .max_arity = 1, .call = &fnDec };
+const native_not = NativeFn{ .name = "not", .min_arity = 1, .max_arity = 1, .call = &fnNot };
+const native_zero_q = NativeFn{ .name = "zero?", .min_arity = 1, .max_arity = 1, .call = &fnZeroQ };
+const native_pos_q = NativeFn{ .name = "pos?", .min_arity = 1, .max_arity = 1, .call = &fnPosQ };
+const native_neg_q = NativeFn{ .name = "neg?", .min_arity = 1, .max_arity = 1, .call = &fnNegQ };
+const native_odd_q = NativeFn{ .name = "odd?", .min_arity = 1, .max_arity = 1, .call = &fnOddQ };
+const native_even_q = NativeFn{ .name = "even?", .min_arity = 1, .max_arity = 1, .call = &fnEvenQ };
+
+// 3.3b apply + HOFs.
+const native_apply = NativeFn{ .name = "apply", .min_arity = 2, .max_arity = null, .call = &fnApply };
+const native_map = NativeFn{ .name = "map", .min_arity = 2, .max_arity = 2, .call = &fnMap };
+const native_reduce = NativeFn{ .name = "reduce", .min_arity = 3, .max_arity = 3, .call = &fnReduce };
+const native_filter = NativeFn{ .name = "filter", .min_arity = 2, .max_arity = 2, .call = &fnFilter };
 
 // =============================================================================
 // Implementations
@@ -303,8 +348,286 @@ fn fnSomeQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
+// Arithmetic + comparison (3.3b)
+// =============================================================================
+//
+// Fixnum-only for v1, matching the inlined `math:add` /
+// `cmp:lt` opcode paths. Float / bignum support is a Phase 4+
+// numeric-tower expansion. Variadic semantics match Clojure:
+//
+//   (+)        => 0
+//   (+ x)      => x  (must be numeric)
+//   (+ x y...) => left-to-right sum
+//   (<)        => true
+//   (< x)      => true
+//   (< x y z)  => chained
+//
+// Equality `(=)`:
+//   (=)        => true
+//   (= x)      => true
+//   (= x y z)  => chained value-equality via dispatch.equal
+
+const dispatch_mod = @import("dispatch");
+
+fn requireFixnum(v: Value) VmError!i64 {
+    if (v.kind() != .fixnum) return VmError.KindMismatch;
+    return v.asFixnum();
+}
+
+fn fnAdd(_: *VM, args: []const Value) VmError!Value {
+    if (args.len == 0) return value_mod.fromFixnum(0).?;
+    var acc = try requireFixnum(args[0]);
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const x = try requireFixnum(args[i]);
+        const sum = std.math.add(i64, acc, x) catch return VmError.IntegerOverflow;
+        acc = sum;
+    }
+    return value_mod.fromFixnum(acc) orelse VmError.IntegerOverflow;
+}
+
+fn fnSub(_: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) {
+        // Unary negation.
+        const x = try requireFixnum(args[0]);
+        const neg = std.math.negate(x) catch return VmError.IntegerOverflow;
+        return value_mod.fromFixnum(neg) orelse VmError.IntegerOverflow;
+    }
+    var acc = try requireFixnum(args[0]);
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const x = try requireFixnum(args[i]);
+        const diff = std.math.sub(i64, acc, x) catch return VmError.IntegerOverflow;
+        acc = diff;
+    }
+    return value_mod.fromFixnum(acc) orelse VmError.IntegerOverflow;
+}
+
+fn fnMul(_: *VM, args: []const Value) VmError!Value {
+    if (args.len == 0) return value_mod.fromFixnum(1).?;
+    var acc = try requireFixnum(args[0]);
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const x = try requireFixnum(args[i]);
+        const prod = std.math.mul(i64, acc, x) catch return VmError.IntegerOverflow;
+        acc = prod;
+    }
+    return value_mod.fromFixnum(acc) orelse VmError.IntegerOverflow;
+}
+
+fn fnLt(_: *VM, args: []const Value) VmError!Value {
+    if (args.len < 2) return value_mod.fromBool(true);
+    var i: usize = 0;
+    while (i + 1 < args.len) : (i += 1) {
+        const a = try requireFixnum(args[i]);
+        const b = try requireFixnum(args[i + 1]);
+        if (!(a < b)) return value_mod.fromBool(false);
+    }
+    return value_mod.fromBool(true);
+}
+
+fn fnEq(_: *VM, args: []const Value) VmError!Value {
+    if (args.len < 2) return value_mod.fromBool(true);
+    var i: usize = 0;
+    while (i + 1 < args.len) : (i += 1) {
+        if (!dispatch_mod.equal(args[i], args[i + 1])) return value_mod.fromBool(false);
+    }
+    return value_mod.fromBool(true);
+}
+
+fn fnInc(_: *VM, args: []const Value) VmError!Value {
+    const x = try requireFixnum(args[0]);
+    const r = std.math.add(i64, x, 1) catch return VmError.IntegerOverflow;
+    return value_mod.fromFixnum(r) orelse VmError.IntegerOverflow;
+}
+
+fn fnDec(_: *VM, args: []const Value) VmError!Value {
+    const x = try requireFixnum(args[0]);
+    const r = std.math.sub(i64, x, 1) catch return VmError.IntegerOverflow;
+    return value_mod.fromFixnum(r) orelse VmError.IntegerOverflow;
+}
+
+fn fnNot(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(!args[0].isTruthy());
+}
+
+fn fnZeroQ(_: *VM, args: []const Value) VmError!Value {
+    const x = try requireFixnum(args[0]);
+    return value_mod.fromBool(x == 0);
+}
+
+fn fnPosQ(_: *VM, args: []const Value) VmError!Value {
+    const x = try requireFixnum(args[0]);
+    return value_mod.fromBool(x > 0);
+}
+
+fn fnNegQ(_: *VM, args: []const Value) VmError!Value {
+    const x = try requireFixnum(args[0]);
+    return value_mod.fromBool(x < 0);
+}
+
+fn fnOddQ(_: *VM, args: []const Value) VmError!Value {
+    const x = try requireFixnum(args[0]);
+    return value_mod.fromBool(@mod(x, 2) != 0);
+}
+
+fn fnEvenQ(_: *VM, args: []const Value) VmError!Value {
+    const x = try requireFixnum(args[0]);
+    return value_mod.fromBool(@mod(x, 2) == 0);
+}
+
+// =============================================================================
+// apply + HOFs (3.3b)
+// =============================================================================
+//
+// `apply` + `map` / `reduce` / `filter` are the FIRST users of
+// `VM.callValue` (peer-AI turn 68). They MUST propagate
+// `VmError.ControlTransferred` unchanged so throws from inside
+// user fns escape to the outer handler correctly.
+
+/// `(apply f x1 x2 ... xs)` calls `f` with the elements of
+/// the last arg seq spliced in after the leading args.
+fn fnApply(vm: *VM, args: []const Value) VmError!Value {
+    const f = args[0];
+    const last = args[args.len - 1];
+
+    // Materialize the final arg list.
+    var combined: std.ArrayList(Value) = .empty;
+    defer combined.deinit(vm.allocator);
+    // Leading args (between f and the seq).
+    var i: usize = 1;
+    while (i < args.len - 1) : (i += 1) {
+        combined.append(vm.allocator, args[i]) catch return VmError.OutOfMemory;
+    }
+    // Walk `last` as a seq.
+    try appendSeqValues(vm, last, &combined);
+
+    return try vm.callValue(f, combined.items);
+}
+
+/// `(map f coll)` → eager cons list of `(f x)` for each x in
+/// coll. Order-preserving. Throws inside `f` propagate via
+/// `ControlTransferred`.
+fn fnMap(vm: *VM, args: []const Value) VmError!Value {
+    const f = args[0];
+    const coll = args[1];
+
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+
+    var it = try makeSeqIter(coll);
+    while (it.next()) |x| {
+        const one = [_]Value{x};
+        const mapped = try vm.callValue(f, &one);
+        results.append(vm.allocator, mapped) catch return VmError.OutOfMemory;
+    }
+
+    return try buildListFromSlice(vm, results.items);
+}
+
+/// `(reduce f init coll)` → left fold.
+fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
+    const f = args[0];
+    var acc = args[1];
+    const coll = args[2];
+
+    var it = try makeSeqIter(coll);
+    while (it.next()) |x| {
+        const pair = [_]Value{ acc, x };
+        acc = try vm.callValue(f, &pair);
+    }
+    return acc;
+}
+
+/// `(filter pred coll)` → eager cons list of x where `(pred x)`
+/// is truthy.
+fn fnFilter(vm: *VM, args: []const Value) VmError!Value {
+    const pred = args[0];
+    const coll = args[1];
+
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+
+    var it = try makeSeqIter(coll);
+    while (it.next()) |x| {
+        const one = [_]Value{x};
+        const keep = try vm.callValue(pred, &one);
+        if (keep.isTruthy()) {
+            results.append(vm.allocator, x) catch return VmError.OutOfMemory;
+        }
+    }
+    return try buildListFromSlice(vm, results.items);
+}
+
+// =============================================================================
 // Helpers
 // =============================================================================
+
+/// Phase 3.3b seq iterator: walks a Value as a sequence.
+/// Supports nil (empty), list, vector. Map/set seq semantics
+/// deferred (Clojure returns entry-pairs/elements but our 3.3
+/// scope doesn't pin that yet).
+const SeqIter = struct {
+    kind: enum { empty, list, vector },
+    node: Value = value_mod.nilValue(),
+    vec: Value = value_mod.nilValue(),
+    vec_idx: usize = 0,
+    vec_count: usize = 0,
+
+    fn next(self: *SeqIter) ?Value {
+        switch (self.kind) {
+            .empty => return null,
+            .list => {
+                if (list_mod.isEmpty(self.node)) return null;
+                const h = list_mod.head(self.node);
+                self.node = list_mod.tail(self.node);
+                return h;
+            },
+            .vector => {
+                if (self.vec_idx >= self.vec_count) return null;
+                const e = vector_mod.nth(self.vec, self.vec_idx);
+                self.vec_idx += 1;
+                return e;
+            },
+        }
+    }
+};
+
+fn makeSeqIter(coll: Value) VmError!SeqIter {
+    return switch (coll.kind()) {
+        .nil => SeqIter{ .kind = .empty },
+        .list => SeqIter{ .kind = .list, .node = coll },
+        .persistent_vector => SeqIter{
+            .kind = .vector,
+            .vec = coll,
+            .vec_count = vector_mod.count(coll),
+        },
+        else => VmError.KindMismatch,
+    };
+}
+
+/// Append every element of `seq` to `out`. Used by `apply` to
+/// splice the trailing seq into the args list.
+fn appendSeqValues(vm: *VM, seq: Value, out: *std.ArrayList(Value)) VmError!void {
+    var it = try makeSeqIter(seq);
+    while (it.next()) |e| {
+        out.append(vm.allocator, e) catch return VmError.OutOfMemory;
+    }
+}
+
+/// Build a fresh cons list from a slice of Values (left-to-
+/// right). Uses `vm.ensureHeap()`. GC TODO: results aren't
+/// rooted between cons calls.
+fn buildListFromSlice(vm: *VM, items: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
+    var i: usize = items.len;
+    while (i > 0) {
+        i -= 1;
+        result = list_mod.cons(heap, items[i], result) catch return VmError.OutOfMemory;
+    }
+    return result;
+}
 
 /// Convert a Value into a list for cons. nil → empty list;
 /// list passes through unchanged; vector becomes a fresh list
