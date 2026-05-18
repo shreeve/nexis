@@ -617,6 +617,27 @@ pub fn build(b: *std.Build) void {
     const prop_compile_tests = b.addTest(.{ .root_module = prop_compile_mod });
     const run_prop_compile_tests = b.addRunArtifact(prop_compile_tests);
 
+    // Phase 2 step #11 (COMPILER.md §9.4 + §10): golden + eval
+    // pipeline tests. End-to-end source→VM coverage for every
+    // primitive-core form, macro, and exception-handling
+    // path. Lives in test/integration/.
+    const integration_eval_mod = b.createModule(.{
+        .root_source_file = b.path("test/integration/eval_pipeline.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_eval_mod.addImport("value", value_mod);
+    integration_eval_mod.addImport("vm", vm_mod);
+    integration_eval_mod.addImport("compile", compile_mod);
+    integration_eval_mod.addImport("intern", intern_mod);
+    integration_eval_mod.addImport("reader", reader_mod);
+    integration_eval_mod.addImport("macroexpand", macroexpand_mod);
+    integration_eval_mod.addImport("list", list_mod);
+    integration_eval_mod.addImport("vector", vector_mod);
+
+    const integration_eval_tests = b.addTest(.{ .root_module = integration_eval_mod });
+    const run_integration_eval_tests = b.addRunArtifact(integration_eval_tests);
+
     // -------------------------------------------------------------------------
     // Benchmark harness (src/bench.zig) + benchmark runner (bench/main.zig).
     //
@@ -791,6 +812,8 @@ pub fn build(b: *std.Build) void {
     phase2_test_step.dependOn(&runtime_test_runs[18].step);
     // Phase 2 gate items 3 + 4.
     phase2_test_step.dependOn(&run_prop_compile_tests.step);
+    // Phase 2 step #11 — eval-pipeline integration tests.
+    phase2_test_step.dependOn(&run_integration_eval_tests.step);
 
     test_step.dependOn(&run_prop_primitive_tests.step);
     test_step.dependOn(&run_prop_intern_tests.step);
@@ -805,6 +828,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_codec_tests.step);
     test_step.dependOn(&run_prop_db_tests.step);
     test_step.dependOn(&run_prop_compile_tests.step);
+    test_step.dependOn(&run_integration_eval_tests.step);
     test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);
