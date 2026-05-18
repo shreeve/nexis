@@ -1,0 +1,31 @@
+; examples/defmacro.nx — user-defined macros via defmacro
+; (Phase 3.2).
+;
+; A user macro is a fn that runs at COMPILE TIME, takes
+; unevaluated arg Forms as data, and returns a Form that
+; replaces the call site. v1 macros use syntax-quote to
+; build their output (`/`~`/`~@`); collection-manipulation
+; fns like cons/first/rest land later as host builtins
+; alongside the stdlib (Phase 3.3).
+;
+; defmacro mechanics:
+;   - The macro fn body is evaluated at expansion time in a
+;     fresh sub-VM that shares the user's namespace and
+;     interner (so macros can def Vars, intern symbols, etc.).
+;   - Macros defined earlier in the same compilation unit
+;     are visible to subsequent forms.
+;   - Lexical bindings shadow macros (let-bound `when` is a
+;     local, not a macro invocation).
+
+(defmacro unless [test body]
+  `(if ~test nil ~body))
+
+(defmacro my-when [test & body]
+  `(if ~test (do ~@body) nil))
+
+(defmacro safe-div [a b]
+  `(if (< 0 ~b) (let [x ~a] x) :div-by-zero))
+
+(my-when (unless false true)
+  :all-the-macros-work
+  :and-the-do-block-returns-this-last-one)

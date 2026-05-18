@@ -366,13 +366,17 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         const src = try arena.allocator().dupe(u8, trimmed);
 
         var error_span: ?reader_mod.SrcSpan = null;
-        const compiled = compile.compileSourceFullWithMacrosSpan(
+        // Phase 3.2: pass v.runtime_arena.allocator() as the
+        // persistent allocator so defmacro Closures defined
+        // on one REPL line survive into subsequent lines.
+        const compiled = compile.compileSourceFullWithMacrosSpanPersistent(
             arena.allocator(),
             src,
             ns,
             interner,
             &host_macros,
             &error_span,
+            v.runtime_arena.allocator(),
         ) catch |err| {
             try emitCompileError(io, "<repl>", src, err, error_span);
             continue;

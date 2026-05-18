@@ -1959,14 +1959,19 @@ stdlib, multi-namespace, dynamic binding.
 - [x] **Phase 3.0b** `#(...)` anon-fn shorthand (commit 64c2c15).
 - [x] **Phase 3.0c** Catchable VmError → keyword payload (commit
       4122532).
-- [ ] **Phase 3.1** Maps/sets as runtime values (`coll:map` /
-      `coll:set` opcodes + `Tiny.map_construct` / `Tiny.set_construct`).
-- [ ] **Phase 3.2** User-defined `defmacro` — needs compile-time
-      VM eval (the macro-Var marker + same-VM compile-time eval
-      path or a sub-VM).
-- [ ] **Phase 3.3** `src/stdlib/core.nx`: core macros + functions
-      (`map`, `reduce`, `filter`, `conj`, `assoc`, threading-arrow
-      variants, destructuring `let`/`fn`, multi-arity `defn`) per
+- [x] **Phase 3.1** Maps/sets as runtime values (`coll:map` /
+      `coll:set` opcodes + `Tiny.map_construct` / `Tiny.set_construct`,
+      commit 8461ae9).
+- [x] **Phase 3.2** User-defined `defmacro` — compile-time VM
+      eval via a fresh sub-VM per invocation. Macros defined
+      earlier in a do-block are visible to later forms. Lexical
+      bindings shadow macros; user macros shadow host macros.
+      Peer-AI turn 66 architectural pin.
+- [ ] **Phase 3.3** Host fns for macro authoring + `src/stdlib/core.nx`:
+      `cons`/`first`/`rest`/`list`/`count`/`nth`/`apply`/`seq` as
+      native fns (unlock procedural macros); then `map`/`reduce`/
+      `filter`/`conj`/`assoc` + threading-arrow variants +
+      destructuring `let`/`fn` + multi-arity `defn` per
       CLOJURE-REVIEW.md §1.1 two-stage bootstrap.
 - [ ] **Phase 3.4** `src/namespace.zig` enhancements + `(require ...)`
       / `(use ...)` / qualified-symbol resolution.

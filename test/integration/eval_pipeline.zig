@@ -456,6 +456,56 @@ test "integration: composite — try with macros" {
 }
 
 // =============================================================================
+// Phase 3.2 — user-defined defmacro
+// =============================================================================
+
+test "integration: defmacro — define then use in same do-block" {
+    try expectOutput(
+        \\(do (defmacro my-unless [test body] `(if ~test nil ~body))
+        \\    (my-unless false :got-it))
+    , ":got-it");
+}
+
+test "integration: defmacro — true branch returns nil for unless" {
+    try expectOutput(
+        \\(do (defmacro my-unless [test body] `(if ~test nil ~body))
+        \\    (my-unless true :nope))
+    , "nil");
+}
+
+test "integration: defmacro — variadic body with splicing" {
+    try expectOutput(
+        \\(do (defmacro my-when [test & body] `(if ~test (do ~@body) nil))
+        \\    (my-when true :a :b :c))
+    , ":c");
+}
+
+test "integration: defmacro — lexical shadowing suppresses macro" {
+    try expectOutput(
+        \\(do (defmacro foo [x] `(+ ~x 100))
+        \\    (let [foo 7] foo))
+    , "7");
+}
+
+test "integration: defmacro — user macro shadows host macro" {
+    try expectOutput(
+        \\(do (defmacro when [test] `(if ~test :user-when :nope))
+        \\    (when true))
+    , ":user-when");
+}
+
+test "integration: defmacro — macro can use already-defined macros in body" {
+    // outer's body uses unless (a previously-defined macro);
+    // when outer is invoked, the macro fn body is already
+    // expanded so the unless call is already turned into (if).
+    try expectOutput(
+        \\(do (defmacro unless [test body] `(if ~test nil ~body))
+        \\    (defmacro twice [x] `(unless false ~x))
+        \\    (twice :twice-got-it))
+    , ":twice-got-it");
+}
+
+// =============================================================================
 // Phase 3.1 — maps/sets as runtime values
 // =============================================================================
 

@@ -6,21 +6,24 @@ inspired by Clojure, built for persistent data, durable identity, and
 world-class performance. Multi-phase implementation driven by PLAN.md at
 the repository root.
 
-Phase 1 is COMPLETE (PLAN.md §20.2). **Phase 2 is COMPLETE**:
-every primitive-core form compiles + executes, macros +
-syntax-quote + collections, try/catch/throw/finally, source-
-span errors, property tests, bench harness, golden eval-pipeline
-tests. All 7 gate items from COMPILER.md §9.4 satisfied + step
-#11 integration coverage added as belt-and-suspenders.
+Phase 1 is COMPLETE (PLAN.md §20.2). **Phase 2 is COMPLETE**.
+**Phase 3.0/3.1/3.2 are COMPLETE**:
+every primitive-core form compiles + executes, host macros +
+user `defmacro` (compile-time VM eval) + syntax-quote +
+collections (lists/vectors/maps/sets), try/catch/throw/finally
+with catchable VmErrors, source-span errors, anon-fn shorthand
+`#(...)`, REPL + file runner, property tests, bench harness,
+golden eval-pipeline tests.
 
-464 phase2 tests + 86 reader/golden = 550 tests in the fast
+495 phase2 tests + 86 reader/golden = 581 tests in the fast
 inner-loop suite (~3s). Full suite (`zig build test`) green
 including Phase 1 randomized property tests.
 
-Phase 3 starts when the user decides: standard library bootstrap
-(`stdlib/core.nx` per CLOJURE-REVIEW.md §1.1), user-defined
-`defmacro` (#8d, needs compile-time VM eval), REPL, multi-
-namespace via refer/alias/require, runtime VM-error catchability.
+Phase 3 remaining: standard library bootstrap (`stdlib/core.nx`
+per CLOJURE-REVIEW.md §1.1) + host fns for macro authoring
+(cons/first/rest/etc.) — Phase 3.3. Multi-namespace via
+require/refer — Phase 3.4. Destructuring + multi-arity defn —
+Phase 3.5.
 
 - The VM has 7 wired opcode groups: mov, cmp, math, call,
   closure, jump, var.
@@ -66,17 +69,37 @@ SHIPPED to close Phase 2:
   end-to-end test cases covering every primitive-core form,
   every macro, every try/catch/finally path.
 
-Remaining (Phase 3+):
-- **#8d**: user-defined `defmacro` — requires compile-time VM
-  eval. Significant scope.
-- **recur inside try**: explicitly rejected in v1 (wrap try
-  around loop). Tractable but not v1 priority.
-- **Runtime VmError SrcSpans**: PC→source map per Routine.
-  Nice-to-have UX improvement, NOT gate-blocking.
-- **Maps/sets as runtime values**: requires stdlib bootstrap.
-- **#(...) anon-fn reader macro**: Phase 3.
-- **REPL + module loading**: Phase 3.
-- **Type matchers beyond `catch any`**: post-Phase-3 type system.
+SHIPPED in Phase 3.0/3.1/3.2:
+- **Phase 3.0a** (REPL): `bin/nexis repl` interactive read-eval-
+  print loop with persistent VM/namespace/interner across lines.
+- **Phase 3.0b** (anon-fn): `#(...)` reader-macro expansion to
+  `(fn* [%1 %2 ...] body)` with `%`/`%N`/`%&` placeholders.
+- **Phase 3.0c** (catchable VmErrors): recoverable runtime
+  errors (kind-mismatch, arity-mismatch, etc.) translate to
+  keyword Values when a try-handler is active.
+- **Phase 3.1** (maps/sets): persistent maps `{:a 1}` and sets
+  `#{1 2}` as runtime literals, backed by CHAMP HAMT.
+- **Phase 3.2** (defmacro): user-defined macros with compile-
+  time VM evaluation. Fresh sub-VM per invocation; namespace
+  + interner shared via routine.var_table + const pool. Macros
+  defined earlier in a do-block are visible to later forms.
+  Lexical bindings shadow macros; user macros shadow host macros.
+
+Remaining (Phase 3.3+):
+- **stdlib bootstrap** (`stdlib/core.nx`): cons/first/rest/seq/
+  count/nth/apply + map/reduce/filter + assoc/dissoc/get + ...
+  Many ship as host fns (called from defmacro bodies + user
+  code); the rest in core.nx using existing primitives.
+- **multi-namespace** (`require`/`use`/`alias`/`refer`):
+  qualified symbol resolution + per-namespace var tables.
+- **multi-arity defn**: `(defn f ([x] …) ([x y] …))`.
+- **destructuring**: `(let [{:keys [a b]} m] …)`,
+  `(let [[x y] v] …)`.
+- **recur inside try**: rejected in v1; tractable for Phase 4.
+- **Runtime VmError SrcSpans**: PC→source map for runtime
+  error reporting parity with compile errors.
+- **Type matchers beyond `catch any`**: post-Phase-3 type
+  system.
 
 Read this entire prompt before touching anything.
 
@@ -88,6 +111,12 @@ Read this entire prompt before touching anything.
 - Branch:   main
 - HEAD:     check `git log -1 --oneline`. Recent commit chain
             (newest first):
+              (pending) phase 3.2: user-defined defmacro with compile-time VM eval
+              8461ae9 phase 3.1: maps + sets as runtime values
+              9364615 phase 3.0c: catchable VmErrors
+              7d8a16e phase 3.0b: anon-fn `#(...)` reader-macro expansion
+              4ccd281 phase 3.0a: REPL (bin/nexis repl)
+              [...] expand.zig rename + POLS arc
               8def91d phase 2 step #11: golden + eval pipeline integration tests
               a610cb4 phase 2 step #9.2: finally clauses + throw-through-finally
               b948ab0 phase 2 gate item A (3, 4, 7): property tests + bench
@@ -946,68 +975,58 @@ From PLAN.md §"Start here" and accumulated hard lessons:
   `vm.Operand` rely on this; if you add fields, mind the bit order.
 
 ═══════════════════════════════════════════════════════════════════════
-## 10. IMMEDIATE NEXT TASK — Phase 3 onboarding
+## 10. IMMEDIATE NEXT TASK — Phase 3.3 (stdlib bootstrap)
 
-**Phase 2 is COMPLETE.** Every COMPILER.md §9.4 gate item is
-satisfied + step #11 integration coverage added. The next
-substantive work is Phase 3.
+**Phase 2 + Phase 3.0/3.1/3.2 are COMPLETE.** The language now
+has every primitive core form, host macros, user-defined
+`defmacro` with compile-time VM eval, persistent maps/sets,
+catchable VmErrors, anon-fn shorthand, REPL, and file runner.
+The next substantive work is Phase 3.3.
 
-### Status of COMPILER.md §9.4 gate items
-
+### Phase 2 gate (COMPILER.md §9.4) — all green
 | # | Item | Status |
 |---|---|---|
-| 1 | Every primitive-core form compiles + executes | ✅ Done |
-| 2 | 10k-iter `recur` constant-stack | ✅ Done |
-| 3 | Closure capture depth-10 (property test) | ✅ Done (b948ab0) |
-| 4 | syntax-quote/unquote/splice structural-equal (property test) | ✅ Done (b948ab0) |
-| 5 | Compile errors → kind + SrcSpan + macro origin | ✅ Done (1e5b575) |
-| 6 | Full suite passes (≥441 tests) | ✅ Done (550+ tests) |
-| 7 | `bench/compiler.zig` (compile + eval throughput) | ✅ Done (b948ab0) |
+| 1 | Every primitive-core form compiles + executes | ✅ |
+| 2 | 10k-iter `recur` constant-stack | ✅ |
+| 3 | Closure capture depth-10 (property test) | ✅ b948ab0 |
+| 4 | syntax-quote/unquote/splice structural-equal | ✅ b948ab0 |
+| 5 | Compile errors → kind + SrcSpan + macro origin | ✅ 1e5b575 |
+| 6 | Full suite passes (≥441 tests) | ✅ 581 tests |
+| 7 | `bench/compiler.zig` (throughput) | ✅ b948ab0 |
 
-Phase 2 step list (COMPILER.md §10) — all green:
-  ✅ #1-#7: primitive core (literals → vars)
-  ✅ #8a: macroexpand scaffold
-  ✅ #8b: host core macros
-  ✅ #8c.1/.2/.3: syntax-quote + collections
-  ✅ #9.1: try/catch/throw + cross-frame unwind
-  ✅ #9.2: finally + throw-through-finally
-  ✅ #10.0: SrcSpan in compile errors
-  ✅ #11: golden + eval-pipeline integration tests
+### Phase 3.0/3.1/3.2 ship list
+  ✅ 3.0a REPL (`bin/nexis repl`)
+  ✅ 3.0b anon-fn `#(...)` → `(fn* [%1 %2 ...] body)`
+  ✅ 3.0c catchable VmErrors → keyword Values via try/catch
+  ✅ 3.1  persistent maps `{:k v}` + sets `#{e}` as literals
+  ✅ 3.2  user-defined `defmacro` with compile-time VM eval
 
-Phase 2 PRODUCT bar:
-  ✅ `bin/nexis run file.nx` — every example in examples/ runs
-  ✅ ~2-3M compiles/sec, ~49 ns/recur-iteration
-  ✅ Friendly error messages with file:line:col + caret
-  ✅ Full Lisp macro author's toolkit (syntax-quote with
-     splicing + auto-gensym + vector synthesis)
+### What Phase 3.3+ looks like
 
-### What Phase 3 looks like
+Per PLAN.md §21 and peer-AI turn 66 §D4 (defmacro arc):
+  1. **Host fns for macro authoring** — `cons`/`first`/`rest`/
+     `list`/`count`/`nth`/`apply`/`seq`/`empty?`. Native-fn
+     Value kind + dispatch. Unlocks procedural macros that
+     destructure args (today's macros are syntax-quote-only).
+  2. **Standard library bootstrap** (`stdlib/core.nx`,
+     CLOJURE-REVIEW.md §1.1): map/reduce/filter/assoc/
+     dissoc/get/...
+  3. **Multi-namespace**: `(require ...)`/`(use ...)`/qualified
+     symbols (`my-ns/foo`) + per-namespace Var tables.
+  4. **Multi-arity defn**: `(defn f ([x] …) ([x y] …))`.
+  5. **Destructuring**: `(let [{:keys [a b]} m] …)`.
+  6. **Runtime VmError SrcSpans**: PC→source map parity with
+     compile errors.
 
-Per PLAN.md §21:
-  1. **Standard library bootstrap** (`stdlib/core.nx`,
-     CLOJURE-REVIEW.md §1.1 two-stage process):
-     - Stage 1: trivial host-defined `defmacro` enabling
-       user-written macros
-     - Stage 2: redefine user-facing forms with
-       destructuring, multi-arity defn, etc., from
-       `core.nx`
-  2. **REPL** — interactive eval loop
-  3. **Module loading**: `(require ...)` / `(use ...)` /
-     namespace support
-  4. **Runtime VmError catchability**: convert recoverable
-     VM errors to user-throwable Values
-  5. **Reader macros `#(...)`**
-  6. **Maps/sets as runtime values + literals**
+### Recommended Phase 3.3 onboarding
 
-Each of those is bounded; user picks priority.
-
-### Recommended Phase 3 onboarding sequence
-
-1. Read PLAN.md §21 (Phase 3 roadmap).
-2. Read CLOJURE-REVIEW.md §1.1 (two-stage stdlib bootstrap).
-3. Pick: `defmacro` first (the biggest leverage —
-   immediately unblocks stage-1 macros), or REPL first
-   (immediate UX win for any user).
+1. Read PLAN.md §21 (Phase 3 roadmap) and CLOJURE-REVIEW.md §1.1.
+2. Strategy turn with peer-AI on host-fn dispatch shape (new
+   `Value.kind = .native_fn` vs reusing Closure with a
+   "host-callable" Routine variant).
+3. Pick low-leverage items first: `list`/`count`/`first`/`rest`
+   are useful for tests and macro bodies; map/reduce/filter
+   come second.
 
 ### Active design surface for next-AI
 

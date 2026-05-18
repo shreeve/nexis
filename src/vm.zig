@@ -508,6 +508,13 @@ pub const Var = struct {
     /// True once `def` has set the root. Distinguishes
     /// "intentionally nil" from "never bound".
     bound: bool = false,
+    /// Phase 3.2 (peer-AI turn 66): true when this Var was
+    /// created by `(defmacro ...)`. The expander dispatches
+    /// macro Vars (compile-time evaluation of the macro fn)
+    /// instead of compiling `(my-macro ...)` as an ordinary
+    /// call. Set ONLY by the expander's defmacro handler;
+    /// regular `def` never sets it.
+    macro: bool = false,
     /// Reserved for metadata maps (doc, source location, etc.).
     /// Wired in Phase 3+.
     meta: Value = value_mod.nilValue(),
@@ -1043,6 +1050,74 @@ pub const VM = struct {
     pub fn asClosure(v: Value) *const Closure {
         std.debug.assert(v.kind() == .function);
         return @ptrFromInt(v.payload);
+    }
+
+    /// Phase 3.2 (peer-AI turn 66): invoke `closure` with `args`
+    /// in a FRESH sub-VM, returning the result Value. Used by
+    /// the expander for compile-time macro evaluation.
+    ///
+    /// **Why fresh-VM-per-call**: avoids save/restore of the
+    /// caller's VM state (handlers, finally stack, halted flag,
+    /// frame stack). Each invocation gets isolated heap +
+    /// frame state. The closure's routine carries its `var_table`
+    /// (pointers into the caller's namespace) and constant pool
+    /// (literals interned by the caller's interner) directly,
+    /// so the sub-VM doesn't need a namespace/interner of its
+    /// own for the macro body to read or mutate the caller's
+    /// Vars. Symbols/keywords emitted by the macro come from
+    /// the caller's interner via the routine's literal pool.
+    ///
+    /// **Lifetime**: the returned Value may reference the
+    /// sub-VM's `runtime_arena` (list nodes, closures, maps,
+    /// vectors). The caller MUST convert the result to a
+    /// caller-arena-owned form (typically by walking it into a
+    /// Form tree on the compile arena) BEFORE calling `deinit`
+    /// on the sub-VM. `out_vm` is written so the caller controls
+    /// the deinit timing.
+    pub fn evalClosure(
+        allocator: std.mem.Allocator,
+        closure_v: Value,
+        args: []const Value,
+        out_vm: *VM,
+    ) !Value {
+        if (closure_v.kind() != .function) return error.NotCallable;
+        const closure = VM.asClosure(closure_v);
+        const routine = closure.routine;
+
+        // Arity check.
+        if (routine.variadic) {
+            if (args.len < routine.fixed_arity) return error.ArityMismatch;
+        } else {
+            if (args.len != routine.fixed_arity) return error.ArityMismatch;
+        }
+
+        out_vm.* = try VM.init(allocator, routine);
+
+        // Wire the frame's upvalues to the closure's captures.
+        out_vm.frames.items[0].upvalues = closure.upvalues;
+
+        // Populate the fixed-arity args into slots.
+        const fixed: usize = routine.fixed_arity;
+        var i: usize = 0;
+        while (i < fixed) : (i += 1) {
+            out_vm.stack.items[i] = args[i];
+        }
+
+        // For variadic, build the rest list from the excess args.
+        if (routine.variadic) {
+            const heap = out_vm.ensureHeap();
+            var rest = list_mod.empty(heap) catch return error.OutOfMemory;
+            var j: usize = args.len;
+            while (j > fixed) {
+                j -= 1;
+                rest = list_mod.cons(heap, args[j], rest) catch return error.OutOfMemory;
+            }
+            if (fixed < out_vm.stack.items.len) {
+                out_vm.stack.items[fixed] = rest;
+            }
+        }
+
+        return try out_vm.run();
     }
 
     /// Step #6b: pack a `*Var` into a `Value` of kind `.var_`.

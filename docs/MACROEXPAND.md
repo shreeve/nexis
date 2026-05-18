@@ -136,26 +136,55 @@ explicit arity check. **For step #8 we punt multi-arity to
 Phase 3.** Single-arity `defn` already works via the existing
 `Tiny.defn` lowering.
 
-### Future graduation to user-defined `defmacro`
+### User-defined `defmacro` — SHIPPED (Phase 3.2)
 
-When stage 2 is needed (Phase 3, post-stdlib bootstrap):
+Per peer-AI turn 66 architectural pin, user `defmacro` works
+via these mechanics:
 
-1. Add `Var.macro: bool` field (matches Clojure's `:macro`
-   metadata).
-2. `defmacro` becomes a special form: `(defmacro name [params]
-   body)` lowers to `(def name (fn* name [params] body))` with
-   the Var's `.macro = true`.
-3. The macroexpander, when seeing `(head ...)`, looks up `head`
-   in the namespace; if the resolved Var has `.macro = true`,
-   compile + run the fn at compile time against the unevaluated
-   args, replace the call site with the result.
-4. Compile-time execution uses the SAME VM as runtime (PLAN
-   §14.1 — "macros are functions that happen to run at
-   compile time"). The Interner and Namespace are shared.
-
-Step #8 leaves these hooks in place but does NOT wire them
-(`Var.macro` field could be added in #8 for forward compat;
-the lookup path is just unimplemented).
+1. **`Var.macro: bool`** field on every Var (`src/vm.zig`).
+2. **`defmacro` is an expander-time special form**, not a Tiny
+   IR node. The expander recognizes `(defmacro name [params] body)`,
+   pre-expands the body in an env that includes the self-name +
+   params, builds the synthetic form
+   `(def name (fn* name [params] body))`, and calls the
+   `CompileEvalContext.eval` callback to compile + run it in a
+   fresh sub-VM. The resulting Var pointer is mutated to set
+   `macro = true`. The defmacro expansion result is `(var name)`
+   so the REPL prints `#'name`.
+3. **User-macro invocation** (`expandList`): on a list whose
+   head is a symbol, after lexical-shadowing check, look up in
+   `ctx.namespace`. If the Var has `.macro = true`, convert
+   each arg Form → Value (`formToValue`), call
+   `vm_mod.VM.evalClosure(var.root, args, &sub_vm)`, convert
+   the result back to Form (`valueToForm` in `ctx.allocator`),
+   recursively re-expand.
+4. **Fresh sub-VM per call** (not persistent), per peer-AI turn
+   66 §D1 — avoids handler/finally/halted state save/restore.
+   The macro routine's `var_table` already holds pointers into
+   the caller's namespace (resolved at compile time), and the
+   constant pool already holds caller-interned literals, so the
+   sub-VM doesn't need its own namespace/interner.
+5. **Persistent allocator threading**: the compile-eval callback
+   uses a separate `persistent_allocator` (typically
+   `vm.runtime_arena.allocator()`) for the macro fn's storage so
+   the Closure outlives the per-form compile arena. REPL passes
+   this; without it, defmacros only work inside a single arena
+   lifetime (e.g., one `nexis run FILE.nx` invocation).
+6. **Lookup order** (`expandList`): lexical env → user macros
+   (`Var.macro`) → host macros → ordinary call. User macros
+   shadow host macros (override allowed).
+7. **Form↔Value conversion supports**: nil, bool, int, symbol,
+   keyword, list, vector, map, set, quote (normalized to a
+   2-list). `MalformedMacroCall` for syntax-quote/unquote/
+   splicing/anon-fn/with-meta/deref/real/char/string as macro
+   args (deferred to a later commit).
+8. **Variadic macros** (`& body`) work end-to-end. Variadic
+   recur in macros: same restriction as runtime (rejected for
+   v1).
+9. **Host fns for macro authoring** (`cons`/`first`/`rest`/
+   etc.) are deferred to Phase 3.3 — v1 macros are syntax-quote-
+   only, which covers `unless`/`when-not`/`cond`-likes/
+   threading variants.
 
 ---
 

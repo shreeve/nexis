@@ -20,19 +20,20 @@ zig build nexis
 | `macros.nx` | `when-not` / `loop` / `or` end-to-end (step #8b host macros) |
 | `quoted-list.nx` | `(quote (...))` builds a runtime list value via `#%list` (step #8c.1) |
 | `syntax-quote.nx` | `` ` `` / `~` / `~@` with splicing (step #8c.2) |
-| `macro-author.nx` | Synthesize a `(let* [x 99] x)` form via vector syntax-quote (step #8c.3) — the pattern user `defmacro` will use in Phase 3 |
+| `macro-author.nx` | Synthesize a `(let* [x 99] x)` form via vector syntax-quote (step #8c.3) |
 | `try-catch.nx` | `try` / `catch` / `throw` with cross-frame propagation (step #9.1) |
 | `maps-sets.nx` | Collection literals `{...}` and `#{...}` (Phase 3.1) |
+| `defmacro.nx` | User-defined macros via `defmacro` (Phase 3.2) — fresh sub-VM per compile-time invocation |
 
-The macro-heavy examples (`cond.nx`, `threading.nx`,
-`macros.nx`) all rely on step #8b host macros. Step #8c
-will unlock `syntax-quote`, quoted compound collections,
-and `#(...)` anonymous-fn shorthand.
+The macro-heavy examples cover both styles: host macros (Zig-
+implemented, registered in the default table) and user macros
+(`defmacro` — compile-time VM eval). Lexical bindings shadow
+both; user macros shadow host macros.
 
-Future:
-- Phase 2 step #8c: syntax-quote, `~` / `~@`, `#(...)` anon fn.
-- Phase 2 step #10 (error reporting): structured error
-  messages with source spans.
-- Phase 3 (stdlib): `map`, `reduce`, `filter`, `conj`,
-  `assoc`, protocols, multimethods, REPL, multi-namespace
-  support.
+Future (Phase 3.3+):
+- Host fns for macro authoring (`cons`/`first`/`rest`/`list`/
+  `count`/`nth`/`apply`/`seq`) — unlock procedural macros.
+- `stdlib/core.nx`: `map`/`reduce`/`filter`/`conj`/`assoc` +
+  destructuring `let`/`fn` + multi-arity `defn`.
+- Multi-namespace: `(require ...)`/`(use ...)`/qualified
+  symbols.

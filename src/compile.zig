@@ -1991,6 +1991,57 @@ pub fn compileFormWithNamespace(
     return compileFormFull(allocator, form, namespace, null);
 }
 
+/// Phase 3.2 (peer-AI turn 66): user_data for the
+/// CompileEvalContext callback. The `persistent_allocator` is
+/// CRITICAL — defmacro Closures must outlive the per-form
+/// compile arena (REPL uses a fresh arena per input line; the
+/// macro Closure has to survive into the next form's
+/// invocation). Typically wired to `vm.runtime_arena.allocator()`.
+const CompileEvalData = struct {
+    /// Used by the callback for synthetic Routine + Compiled
+    /// artifact storage. Must outlive ALL subsequent forms
+    /// that might invoke the macro.
+    persistent_allocator: std.mem.Allocator,
+    namespace: ?*vm.Namespace,
+    interner: *intern_mod.Interner,
+};
+
+/// Phase 3.2: compile-time eval callback. Compiles `form`
+/// WITHOUT a macro table (the body has already been expanded by
+/// the expander before this is called) and runs it via a fresh
+/// sub-VM written through `out_vm`.
+///
+/// **Lifetime contract** (per expand.CompileEvalContext): the
+/// returned Value may reference `out_vm.runtime_arena`. The
+/// caller MUST extract whatever it needs from the result + call
+/// `out_vm.deinit()` to release the arena. The synthetic
+/// Routine itself lives in `data.allocator` (the compile
+/// arena), so it outlives the sub-VM.
+fn compileEvalCallback(
+    user_data: *anyopaque,
+    form: *const reader_mod.Form,
+    out_vm: *vm.VM,
+) anyerror!value_mod.Value {
+    const data: *CompileEvalData = @ptrCast(@alignCast(user_data));
+    var dummy_span: ?reader_mod.SrcSpan = null;
+    // Compile into the PERSISTENT allocator (typically the
+    // user VM's runtime_arena). The macro fn's Closure +
+    // Routine + capture_descs all live there and outlive
+    // any per-form compile arena.
+    const compiled = try compileFormFullWithMacrosSpan(
+        data.persistent_allocator,
+        form,
+        data.namespace,
+        data.interner,
+        null,
+        &dummy_span,
+    );
+    const routine_storage = try data.persistent_allocator.create(vm.Routine);
+    routine_storage.* = compiled.toRoutine("defmacro-eval");
+    out_vm.* = try vm.VM.init(data.persistent_allocator, routine_storage);
+    return try out_vm.run();
+}
+
 /// Step E1: full form-compile with both namespace AND interner.
 /// Without an Interner, quoted symbols/keywords raise
 /// `UnsupportedFeature`. With one (typically `VM.ensureInterner()`),
@@ -2048,15 +2099,67 @@ pub fn compileFormFullWithMacrosSpan(
     host_macros: ?*const expand_mod.HostMacroTable,
     out_span: ?*?reader_mod.SrcSpan,
 ) CompileError!Compiled {
+    return compileFormFullWithMacrosSpanPersistent(
+        allocator,
+        form,
+        namespace,
+        interner,
+        host_macros,
+        out_span,
+        null,
+    );
+}
+
+/// Phase 3.2: variant that accepts a `persistent_allocator`
+/// for defmacro Closure storage. When non-null, the synthetic
+/// `(def name (fn* ...))` form produced by `defmacro` is
+/// compiled into this allocator, so the resulting macro fn
+/// Closure outlives the per-form compile arena.
+///
+/// CLI's REPL passes `vm.runtime_arena.allocator()` so
+/// defmacros defined in one REPL line are usable in
+/// subsequent lines. File runner ALSO passes a persistent
+/// arena (already does, since runFile shares one arena
+/// across the file).
+///
+/// If null, defmacro Closures use the regular `allocator`
+/// (the per-form arena). That's fine when ALL macro uses
+/// fall within the same arena lifetime (e.g., one-shot
+/// source compilation).
+pub fn compileFormFullWithMacrosSpanPersistent(
+    allocator: std.mem.Allocator,
+    form: *const reader_mod.Form,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+    host_macros: ?*const expand_mod.HostMacroTable,
+    out_span: ?*?reader_mod.SrcSpan,
+    persistent_allocator: ?std.mem.Allocator,
+) CompileError!Compiled {
     var working_form: *const reader_mod.Form = form;
     if (interner != null) {
         const empty_table: expand_mod.HostMacroTable = .{};
         const table_to_use: *const expand_mod.HostMacroTable =
             host_macros orelse &empty_table;
+        // Phase 3.2: build a compile-eval callback so the
+        // defmacro handler in expand.zig can compile + run
+        // the synthetic `(def name (fn* ...))` form via a
+        // fresh sub-VM. Persistent allocator (when supplied
+        // by caller) is used for the macro fn's storage so
+        // it outlives the per-form arena.
+        var ceval_data = CompileEvalData{
+            .persistent_allocator = persistent_allocator orelse allocator,
+            .namespace = namespace,
+            .interner = interner.?,
+        };
         var mctx = expand_mod.ExpandContext{
             .allocator = allocator,
             .interner = interner.?,
             .host_macros = table_to_use,
+            .namespace = namespace,
+            .compile_eval = .{
+                .user_data = @ptrCast(&ceval_data),
+                .eval = compileEvalCallback,
+            },
         };
         working_form = expand_mod.expandForm(&mctx, null, form) catch |err| switch (err) {
             error.ExpansionDepthExceeded => {
@@ -2166,9 +2269,30 @@ pub fn compileSourceFullWithMacrosSpan(
     host_macros: ?*const expand_mod.HostMacroTable,
     out_span: ?*?reader_mod.SrcSpan,
 ) CompileError!Compiled {
+    return compileSourceFullWithMacrosSpanPersistent(
+        allocator,
+        source,
+        namespace,
+        interner,
+        host_macros,
+        out_span,
+        null,
+    );
+}
+
+/// Phase 3.2: source-string entry with `persistent_allocator`.
+/// Callers that want defmacros to survive beyond the per-form
+/// arena (REPL, file runner) pass `vm.runtime_arena.allocator()`.
+pub fn compileSourceFullWithMacrosSpanPersistent(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+    host_macros: ?*const expand_mod.HostMacroTable,
+    out_span: ?*?reader_mod.SrcSpan,
+    persistent_allocator: ?std.mem.Allocator,
+) CompileError!Compiled {
     var p = reader_mod.parser.parseForm(allocator, source) catch {
-        // Reader errors don't have a clean SrcSpan to surface
-        // through this API in #10.0; leave out_span null.
         return CompileError.ReaderFailure;
     };
     defer p.parser.deinit();
@@ -2176,13 +2300,14 @@ pub fn compileSourceFullWithMacrosSpan(
     defer reader.deinit();
     const form = reader.readOneForm(p.sexp) catch
         return CompileError.ReaderFailure;
-    return compileFormFullWithMacrosSpan(
+    return compileFormFullWithMacrosSpanPersistent(
         allocator,
         form,
         namespace,
         interner,
         host_macros,
         out_span,
+        persistent_allocator,
     );
 }
 

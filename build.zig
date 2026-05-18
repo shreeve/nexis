@@ -222,6 +222,17 @@ pub fn build(b: *std.Build) void {
     });
     expand_mod.addImport("reader", reader_mod);
     expand_mod.addImport("intern", intern_mod);
+    // Phase 3.2: defmacro + user-macro invocation need vm
+    // (Namespace, Var, evalClosure) + value + collection
+    // modules for Form↔Value conversion.
+    expand_mod.addImport("vm", vm_mod);
+    expand_mod.addImport("value", value_mod);
+    expand_mod.addImport("list", list_mod);
+    expand_mod.addImport("vector", vector_mod);
+    expand_mod.addImport("champ", champ_mod);
+    expand_mod.addImport("heap", heap_mod);
+    // dispatch_mod is declared LATER (it depends on db); the
+    // addImport for it is attached after that block. See below.
 
     const compile_mod = b.createModule(.{
         .root_source_file = b.path("src/compile.zig"),
@@ -293,6 +304,9 @@ pub fn build(b: *std.Build) void {
     // dispatch_mod's creation.
     vm_mod.addImport("dispatch", dispatch_mod);
     compile_mod.addImport("dispatch", dispatch_mod);
+    // Phase 3.2: expand needs dispatch for Form→Value
+    // construction of maps/sets (hash + equality).
+    expand_mod.addImport("dispatch", dispatch_mod);
 
     // -------------------------------------------------------------------------
     // Phase 0: reader unit tests (src/reader.zig has its own test { ... }
@@ -391,7 +405,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch" } },
-        .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern" } },
+        .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;

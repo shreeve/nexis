@@ -17,12 +17,14 @@ identities are first-class values, not a library bolted on top.
 
 ## Status
 
-**Phase 2 COMPLETE**, **Phase 3.0 COMPLETE**. Real `.nx` source
-runs end-to-end through `bin/nexis run FILE.nx` AND an interactive
-`bin/nexis repl`. The reader, macroexpander, compiler, and bytecode
-VM all ship; macros (`when`/`cond`/`and`/`or`/`->`/`->>`/etc.) +
-syntax-quote (`` ` ``/`~`/`~@`/auto-gensym) + try/catch/finally +
-recoverable error catchability all work.
+**Phase 2 COMPLETE**, **Phase 3.0 COMPLETE**, **Phase 3.1 COMPLETE**,
+**Phase 3.2 COMPLETE**. Real `.nx` source runs end-to-end through
+`bin/nexis run FILE.nx` AND an interactive `bin/nexis repl`. The
+reader, macroexpander, compiler, and bytecode VM all ship; host
+macros (`when`/`cond`/`and`/`or`/`->`/`->>`/etc.) AND
+user-defined macros via `defmacro` work; syntax-quote
+(`` ` ``/`~`/`~@`/auto-gensym), try/catch/finally, recoverable
+error catchability, and persistent maps/sets are all in.
 
 See [`PLAN.md`](PLAN.md) §21 for the phase map and
 [`HANDOFF.md`](HANDOFF.md) for current state + next task.
@@ -33,7 +35,9 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Phase 1 | ✅ shipped | Runtime core: Value model, persistent collections (CHAMP HAMT, RRB vector, list), heap + GC, codec, emdb integration |
 | Phase 2 | ✅ shipped | Compiler + bytecode VM. 11/11 steps of [`docs/COMPILER.md`](docs/COMPILER.md) §10 complete. All 7 gate items from §9.4 satisfied. |
 | Phase 3.0 | ✅ shipped | CLI runner + REPL, anonymous-fn shorthand `#(...)`, catchable VM errors |
-| Phase 3.1+ | pending | Maps/sets as runtime values, user-defined `defmacro`, standard library (`core.nx` bootstrap), multi-namespace via `require`/`use` |
+| Phase 3.1 | ✅ shipped | Persistent maps `{:k 1}` and sets `#{1 2}` as runtime literals |
+| Phase 3.2 | ✅ shipped | User-defined `defmacro` with compile-time evaluation (fresh sub-VM per invocation) |
+| Phase 3.3+ | pending | Standard library (`core.nx` bootstrap), multi-namespace via `require`/`use`, host fns for macro authoring (`cons`/`first`/`rest`/...) |
 
 **558 tests** green: 95 VM + 313 compile + 6 macroexpand + 4
 property + 54 integration in `phase2-test` (~3s), plus 86 reader
@@ -125,9 +129,23 @@ Every snippet runs via `bin/nexis`. Run the file or paste into the REPL:
 ;; auto-gensym (each `g#` in one syntax-quote scope gets the same name)
 `(let* [g# 1] g#)                   ;; => (let* [g__N__auto__ 1] g__N__auto__)
 
-;; macro author pattern (this is what user `defmacro` will do in Phase 3.2)
-(let [name (quote x) value 99]
-  `(let* [~name ~value] ~name))     ;; => (let* [x 99] x)
+;; user-defined macros via defmacro (Phase 3.2)
+(defmacro unless [test body]
+  `(if ~test nil ~body))
+(unless false :got-it)              ;; => :got-it
+
+;; variadic defmacro with splicing
+(defmacro my-when [test & body]
+  `(if ~test (do ~@body) nil))
+(my-when true :a :b :c)             ;; => :c
+
+;; defmacro is visible to subsequent forms in same do-block
+(do (defmacro twice [x] `(+ ~x ~x))
+    (twice 21))                     ;; => 42
+
+;; persistent maps + sets as first-class values (Phase 3.1)
+{:a 1 :b 2}                         ;; persistent map
+#{1 2 3}                            ;; persistent set
 
 ;; anonymous-fn shorthand
 (#(+ % 1) 41)                       ;; => 42
@@ -156,23 +174,25 @@ nexis: bad.nx:1:1: MacroExpansionFailure
     ^^^^^^
 ```
 
-## Still missing (closes in Phase 3.1+)
+## Still missing (closes in Phase 3.3+)
 
 These are temporary gaps, not strategic non-goals — each unlocks
 when its phase ships:
 
-- **Maps/sets as runtime values**: `(quote {:a 1})` and `(quote #{1 2})`
-  still raise `UnsupportedFeature`. Lists and vectors work.
-- **User-defined `defmacro`**: macros today are host-Zig functions
-  registered in a default table. User `defmacro` needs compile-time
-  VM eval (Phase 3.2).
 - **Standard library**: no `map`/`reduce`/`filter`/`first`/`rest`/
-  `count`/`assoc`/`get` yet. Phase 3.3 (`core.nx` bootstrap).
+  `count`/`assoc`/`get` yet. Phase 3.3 (`core.nx` bootstrap + host
+  fns for macro authoring).
 - **Multi-namespace**: single global namespace today.
   `(require ...)`/`(use ...)`/qualified symbols are Phase 3.4.
 - **Multi-arity `defn`**: `(defn f ([x] …) ([x y] …))` not supported.
 - **Destructuring**: `(let [{:keys [a b]} m] …)` etc. — Phase 3.3.
 - **Protocols / multimethods**: Phase 3+ once stdlib exists.
+
+User macros today rely entirely on syntax-quote (`` ` ``/`~`/`~@`/
+auto-gensym) to build their output — that covers most common
+macro patterns (`unless`, `when-not`, `cond`-likes, threading
+variants). Macros that need to procedurally manipulate args
+(`first`/`rest`/`cons`) wait on Phase 3.3 host fns.
 - **Runtime SrcSpans**: runtime errors (UncaughtThrow etc.)
   don't carry source spans yet — bounded post-gate work.
 
@@ -220,7 +240,7 @@ catalogue of what we take, adapt, and reject from Clojure's source.
 | [`docs/`](docs/) | 20 design specs — see [`docs/README.md`](docs/README.md) for the module ↔ spec map |
 | [`src/`](src/) | Zig modules — runtime + compiler. `vm.zig` (VM kernel), `compile.zig` (compiler), and `expand.zig` (macroexpander) are the largest. |
 | [`test/`](test/) | Property tests, integration tests, golden tests; most unit tests are inline in `src/*.zig`. See [`test/README.md`](test/README.md). |
-| [`examples/`](examples/) | Working `.nx` programs — `hello.nx`, `cond.nx`, `threading.nx`, `macro-author.nx`, `try-catch.nx`, `syntax-quote.nx`, `sum10.nx`, `forward-ref.nx`, `macros.nx`, `quoted-list.nx`. |
+| [`examples/`](examples/) | Working `.nx` programs — `hello.nx`, `cond.nx`, `threading.nx`, `macro-author.nx`, `defmacro.nx`, `try-catch.nx`, `syntax-quote.nx`, `sum10.nx`, `forward-ref.nx`, `macros.nx`, `quoted-list.nx`, `maps-sets.nx`. |
 | [`nexis.grammar`](nexis.grammar) | Reader grammar — source of truth for `src/parser.zig` |
 | [`ZIG-0.16.0.md`](ZIG-0.16.0.md) | Project-specific Zig 0.16 stdlib reference + gotchas (MANDATORY before writing Zig) |
 

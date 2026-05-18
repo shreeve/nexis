@@ -32,6 +32,19 @@
 const std = @import("std");
 const reader_mod = @import("reader");
 const intern_mod = @import("intern");
+/// Phase 3.2: needed for Namespace + Var lookup (user-defmacro
+/// dispatch), Value construction (Form→Value conversion for
+/// macro args), and the VM type referenced by the compile-eval
+/// callback type signature. expand.zig was reader+intern only
+/// before this; adding vm here pulls in champ + dispatch +
+/// vector + heap + list transitively. No cycle: compile.zig
+/// imports expand AND vm; vm doesn't import expand.
+const vm_mod = @import("vm");
+const value_mod = @import("value");
+const list_mod = @import("list");
+const vector_mod = @import("vector");
+const champ_mod = @import("champ");
+const heap_mod = @import("heap");
 
 const Form = reader_mod.Form;
 const Datum = reader_mod.Datum;
@@ -54,6 +67,29 @@ pub const ExpandError = error{
     OutOfMemory,
 };
 
+/// Phase 3.2 (peer-AI turn 66): callback for compile-time
+/// evaluation of arbitrary Form trees. Used by `defmacro` to
+/// compile the equivalent `(def name (fn* name [params] body))`
+/// form and evaluate it via a fresh sub-VM. The callback lives
+/// outside expand.zig (in compile.zig) so the expander doesn't
+/// need to depend on the compile backend — passing this through
+/// as a context-pointer + fn-pointer pair avoids the cycle.
+///
+/// Implementation contract:
+///   - `eval(user_data, form, out_vm)` returns the runtime Value
+///     produced by compiling + running `form`.
+///   - The returned Value may reference `out_vm.runtime_arena`.
+///   - The caller MUST keep `out_vm` alive until done reading
+///     the result; the helper does NOT call `out_vm.deinit`.
+pub const CompileEvalContext = struct {
+    user_data: *anyopaque,
+    eval: *const fn (
+        user_data: *anyopaque,
+        form: *const Form,
+        out_vm: *vm_mod.VM,
+    ) anyerror!value_mod.Value,
+};
+
 /// Per-spec MACROEXPAND.md §1: bundles every cross-cutting
 /// resource a host MacroFn might need. Lives FOR THE LIFETIME
 /// of a single compilation unit (typically one CLI invocation
@@ -69,6 +105,36 @@ pub const ExpandContext = struct {
     /// Macro registry. May be empty (#8a default → no expansion
     /// fires).
     host_macros: *const HostMacroTable,
+    /// Phase 3.2: namespace for user-defmacro lookup. When
+    /// expanding `(my-fn ...)`, if `my-fn` resolves to a Var
+    /// whose `.macro = true`, dispatch as a user macro instead
+    /// of an ordinary call. Null = no namespace = no user
+    /// macros (useful for tests that exercise host-macro-only
+    /// expansion).
+    namespace: ?*vm_mod.Namespace = null,
+    /// Phase 3.2: compile-time eval callback. Set by
+    /// `compile.zig` when building the ExpandContext. The
+    /// `defmacro` handler uses this to compile + evaluate the
+    /// macro fn's body via a fresh sub-VM. Null = `defmacro`
+    /// raises MacroExpansionFailure.
+    compile_eval: ?CompileEvalContext = null,
+    /// Phase 3.2: lazy-init heap for arg Value construction.
+    /// Macro args that are vectors/maps/sets need a heap for
+    /// their backing nodes. We use ExpandContext.allocator
+    /// (the compile arena) so the nodes outlive the fresh
+    /// sub-VM (which has its OWN heap for the macro fn's
+    /// runtime allocations). Reuse across macro invocations
+    /// — cheap because allocator is an arena.
+    _arg_heap: ?heap_mod.Heap = null,
+
+    /// Lazy-init the arg-construction heap. Returns a pointer
+    /// good for the lifetime of the ExpandContext.
+    pub fn heapForArgs(self: *ExpandContext) ExpandError!*heap_mod.Heap {
+        if (self._arg_heap == null) {
+            self._arg_heap = heap_mod.Heap.init(self.allocator);
+        }
+        return &self._arg_heap.?;
+    }
 
     /// Allocate a fresh gensym name in the context's arena.
     /// Format: `<base>__<counter>__auto__` per MACROEXPAND.md §4.
@@ -277,6 +343,7 @@ fn expandList(
     if (std.mem.eql(u8, name, "var")) return mutCast(list_form); // (var X) — X is just a name, don't expand
     if (std.mem.eql(u8, name, "try")) return try expandTry(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "throw")) return try expandOrdinaryCall(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "defmacro")) return try expandDefmacro(ctx, env, list_form, items, depth);
     // Step #8c.1: internal compiler primitives (#%list / #%concat).
     // Recognized as special forms — NOT user-shadowable, NOT
     // looked up in the macro table. Args ARE recursively
@@ -292,7 +359,21 @@ fn expandList(
     }
 
     // ---- Macro dispatch (shadowable by lexical bindings). -----
+    // Lookup order (peer-AI turn 66):
+    //   1. lexical env (shadowing) — bail to ordinary call.
+    //   2. user macros in the namespace (Var.macro = true).
+    //   3. host macros table.
+    //   4. ordinary call.
     if (env == null or !env.?.contains(name)) {
+        // (2) User macro: namespace Var with .macro = true.
+        if (ctx.namespace) |ns| {
+            if (ns.lookup(name)) |user_var| {
+                if (user_var.macro and user_var.bound) {
+                    return try invokeUserMacro(ctx, env, user_var, list_form, items, depth);
+                }
+            }
+        }
+        // (3) Host macro.
         if (ctx.host_macros.get(name)) |macro_fn| {
             return try invokeMacro(ctx, env, macro_fn, list_form, items, depth);
         }
@@ -983,6 +1064,360 @@ fn expandCollKind(
         .origin = coll_form.origin,
     };
     return new_form;
+}
+
+// =============================================================================
+// Phase 3.2 — user-defined defmacro
+// =============================================================================
+//
+// Per peer-AI turn 66:
+//
+//   1. `(defmacro name [params] body)` is recognized by the
+//      EXPANDER (not Tiny/backend). Must execute at expansion
+//      time so subsequent forms in the SAME compile unit see
+//      the macro.
+//   2. Defmacro lowers internally to:
+//        (def name (fn* name [params] body))
+//      compile-time-evaluated via `ctx.compile_eval`. The
+//      callback compiles + runs the form in a fresh sub-VM
+//      and returns the resulting Var Value.
+//   3. The expander sets `Var.macro = true` on the returned
+//      Var pointer (the namespace owns the Var; mutating the
+//      flag here is correct).
+//   4. The defmacro form's REPLACEMENT (what the rest of the
+//      pipeline sees) is `(var name)` — that lowers to a
+//      Var-object load, so REPL/eval print the Var like
+//      `#'name`.
+//
+// User-macro INVOCATION (peer-AI turn 66 §D9):
+//   1. Convert each arg Form → Value via `formToValue`.
+//   2. Call `VM.evalClosure(var.root, arg_values, &sub_vm)`.
+//   3. Convert returned Value → Form via `valueToForm` in
+//      `ctx.allocator` (the compile arena).
+//   4. Deinit the sub-VM.
+//   5. Recursively re-expand the resulting Form (so macros
+//      in the macro output expand).
+//
+// Macro args are UNEVALUATED Forms-as-Values; the macro body
+// inspects them as data (lists, symbols, etc.) and builds
+// output via syntax-quote. v1 ships syntax-quote-only macros;
+// `cons`/`first`/`rest`/etc. native fns are a future commit
+// (peer-AI turn 66 §D4).
+
+/// Phase 3.2: expand `(defmacro name [params] body)`.
+fn expandDefmacro(
+    ctx: *ExpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) ExpandError!*Form {
+    // (defmacro NAME [PARAMS] BODY...)
+    if (items.len < 4) return ExpandError.MalformedMacroCall;
+    const name_form = items[1];
+    const params_form = items[2];
+    if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) {
+        return ExpandError.MalformedMacroCall;
+    }
+    if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
+    const body_forms = items[3..];
+
+    // Need both a namespace (to mark the Var) and a compile-
+    // eval callback (to compile+run the synthetic def form).
+    const ns = ctx.namespace orelse return ExpandError.MalformedMacroCall;
+    const ceval = ctx.compile_eval orelse return ExpandError.MalformedMacroCall;
+
+    // First: macroexpand the body BEFORE compiling it. Body
+    // env includes the self-name + params (matches expandDefn
+    // semantics).
+    var local: ExpandEnv = .{ .parent = env };
+    defer local.deinit(ctx.allocator);
+    _ = try local.lexical_names.getOrPut(ctx.allocator, name_form.datum.symbol.name);
+    for (params_form.datum.vector) |p| {
+        if (p.datum != .symbol or p.datum.symbol.ns != null) continue;
+        if (std.mem.eql(u8, p.datum.symbol.name, "&")) continue;
+        _ = try local.lexical_names.getOrPut(ctx.allocator, p.datum.symbol.name);
+    }
+    const expanded_body = try ctx.allocator.alloc(*Form, body_forms.len);
+    for (body_forms, 0..) |b, i| {
+        expanded_body[i] = try expandFormDepth(ctx, &local, b, depth);
+    }
+
+    // Build the synthetic form: (def NAME (fn* NAME [PARAMS] body...))
+    const fn_items = try ctx.allocator.alloc(*Form, 3 + expanded_body.len);
+    fn_items[0] = try makeSymbol(ctx, "fn*", list_form.origin);
+    fn_items[1] = mutCast(name_form);
+    fn_items[2] = mutCast(params_form);
+    for (expanded_body, 0..) |b, i| fn_items[3 + i] = b;
+    const fn_form = try makeList(ctx, fn_items, list_form.origin);
+
+    const def_items = try ctx.allocator.alloc(*Form, 3);
+    def_items[0] = try makeSymbol(ctx, "def", list_form.origin);
+    def_items[1] = mutCast(name_form);
+    def_items[2] = fn_form;
+    const def_form = try makeList(ctx, def_items, list_form.origin);
+
+    // Compile-time-eval the def form. Returns the Var Value.
+    var sub_vm: vm_mod.VM = undefined;
+    var sub_vm_ready = false;
+    defer if (sub_vm_ready) sub_vm.deinit();
+    const result_value = ceval.eval(ceval.user_data, def_form, &sub_vm) catch {
+        return ExpandError.MalformedMacroCall;
+    };
+    sub_vm_ready = true;
+
+    // Sanity: result should be a Var value. Mark it as macro.
+    if (result_value.kind() != .var_) return ExpandError.MalformedMacroCall;
+    const target_var = vm_mod.VM.asVar(result_value);
+    target_var.macro = true;
+
+    // Replacement form: (var name) — evaluates to the same Var
+    // at runtime so the REPL prints `#'name`.
+    const var_items = try ctx.allocator.alloc(*Form, 2);
+    var_items[0] = try makeSymbol(ctx, "var", list_form.origin);
+    var_items[1] = mutCast(name_form);
+
+    // Also intern the Var in the caller's namespace explicitly,
+    // to be safe (the compile-eval should have done this, but
+    // the macro flag is on a pointer — make sure the namespace
+    // sees the SAME pointer). The compile-eval already created
+    // the Var via def; our `lookup` and `intern` ought to return
+    // it. Double-check:
+    if (ns.lookup(name_form.datum.symbol.name)) |looked| {
+        if (looked != target_var) {
+            // Should not happen — compile-eval used the same
+            // namespace. If pointer identity mismatches, the
+            // macro flag is on the wrong Var.
+            return ExpandError.MalformedMacroCall;
+        }
+    }
+
+    return try makeList(ctx, var_items, list_form.origin);
+}
+
+/// Phase 3.2: invoke a user-defined macro.
+fn invokeUserMacro(
+    ctx: *ExpandContext,
+    env: ?*const ExpandEnv,
+    macro_var: *vm_mod.Var,
+    call_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) ExpandError!*Form {
+    const args = items[1..];
+
+    // Convert each arg Form → Value (unevaluated, as data).
+    const arg_values = ctx.allocator.alloc(value_mod.Value, args.len) catch return ExpandError.OutOfMemory;
+    defer ctx.allocator.free(arg_values);
+    for (args, 0..) |a, i| {
+        arg_values[i] = formToValue(ctx, a) catch return ExpandError.MalformedMacroCall;
+    }
+
+    // Invoke in a fresh sub-VM. The sub-VM's heap holds the
+    // macro fn's runtime state; we must convert the result back
+    // to a Form (in ctx.allocator) BEFORE deinit.
+    var sub_vm: vm_mod.VM = undefined;
+    var sub_vm_ready = false;
+    defer if (sub_vm_ready) sub_vm.deinit();
+    const result_value = vm_mod.VM.evalClosure(
+        ctx.allocator,
+        macro_var.root,
+        arg_values,
+        &sub_vm,
+    ) catch {
+        return ExpandError.MalformedMacroCall;
+    };
+    sub_vm_ready = true;
+
+    // Convert result Value → Form.
+    const result_form = valueToForm(ctx, result_value, call_form.origin) catch return ExpandError.MalformedMacroCall;
+
+    // Recursively re-expand the result (macros in the macro
+    // output get expanded).
+    return try expandFormDepth(ctx, env, result_form, depth + 1);
+}
+
+/// Convert a `Form` to its runtime Value representation. Used
+/// to pass macro args as unevaluated data. Supports the data
+/// shapes a macro typically inspects.
+///
+/// Mapping (peer-AI turn 66 §D3):
+///   nil/bool/int   → corresponding immediate
+///   keyword/symbol → interned Value
+///   list           → cons list of recursively-converted items
+///   vector         → persistent vector
+///   map            → persistent map (flat k,v,k,v items)
+///   set            → persistent set
+///   quote          → `(quote payload-value)` as a 2-element list
+/// Other Form datums (real, char, string, syntax_quote, unquote,
+/// unquote_splicing, anon_fn, with_meta, deref) are deferred for
+/// v1 — `MalformedMacroCall` if encountered.
+fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
+    return switch (form.datum) {
+        .nil => value_mod.nilValue(),
+        .bool_ => |b| value_mod.fromBool(b),
+        .int => |n| value_mod.fromFixnum(n) orelse return ExpandError.MalformedMacroCall,
+        .symbol => |name| blk: {
+            if (name.ns != null) return ExpandError.MalformedMacroCall;
+            const id = ctx.interner.internSymbol(name.name) catch return ExpandError.OutOfMemory;
+            break :blk value_mod.fromSymbolId(id);
+        },
+        .keyword => |name| blk: {
+            if (name.ns != null) return ExpandError.MalformedMacroCall;
+            const id = ctx.interner.internKeyword(name.name) catch return ExpandError.OutOfMemory;
+            break :blk value_mod.fromKeywordId(id);
+        },
+        .list => |items| try formItemsToList(ctx, items),
+        .vector => |items| blk: {
+            // Construct vector via fromSlice. We need a heap; the
+            // ctx doesn't own one, so we make a tiny temporary
+            // heap backed by ctx.allocator (arena). The vector's
+            // backing storage lives in ctx.allocator, so the
+            // resulting Value is valid for the macro call duration.
+            const elems = try ctx.allocator.alloc(value_mod.Value, items.len);
+            for (items, 0..) |it, i| elems[i] = try formToValue(ctx, it);
+            const heap = try ctx.heapForArgs();
+            break :blk vector_mod.fromSlice(heap, elems) catch return ExpandError.OutOfMemory;
+        },
+        .map => |items| blk: {
+            if (items.len % 2 != 0) return ExpandError.MalformedMacroCall;
+            const heap = try ctx.heapForArgs();
+            var m = champ_mod.mapEmpty(heap) catch return ExpandError.OutOfMemory;
+            const dispatch = @import("dispatch");
+            var i: usize = 0;
+            while (i < items.len) : (i += 2) {
+                const k = try formToValue(ctx, items[i]);
+                const v = try formToValue(ctx, items[i + 1]);
+                m = champ_mod.mapAssoc(heap, m, k, v, &dispatch.hashValue, &dispatch.equal) catch return ExpandError.OutOfMemory;
+            }
+            break :blk m;
+        },
+        .set => |items| blk: {
+            const heap = try ctx.heapForArgs();
+            var s = champ_mod.setEmpty(heap) catch return ExpandError.OutOfMemory;
+            const dispatch = @import("dispatch");
+            for (items) |it| {
+                const v = try formToValue(ctx, it);
+                s = champ_mod.setConj(heap, s, v, &dispatch.hashValue, &dispatch.equal) catch return ExpandError.OutOfMemory;
+            }
+            break :blk s;
+        },
+        .quote => |payload| blk: {
+            // Normalize `'x` → (quote <payload-value>) as a 2-list.
+            const quote_id = ctx.interner.internSymbol("quote") catch return ExpandError.OutOfMemory;
+            const quote_sym = value_mod.fromSymbolId(quote_id);
+            const payload_val = try formToValue(ctx, payload);
+            const heap = try ctx.heapForArgs();
+            var lst = list_mod.empty(heap) catch return ExpandError.OutOfMemory;
+            lst = list_mod.cons(heap, payload_val, lst) catch return ExpandError.OutOfMemory;
+            lst = list_mod.cons(heap, quote_sym, lst) catch return ExpandError.OutOfMemory;
+            break :blk lst;
+        },
+        // syntax_quote, unquote, unquote_splicing, anon_fn,
+        // with_meta, deref, real, char, string → defer.
+        else => return ExpandError.MalformedMacroCall,
+    };
+}
+
+fn formItemsToList(ctx: *ExpandContext, items: []const *Form) ExpandError!value_mod.Value {
+    const heap = try ctx.heapForArgs();
+    var lst = list_mod.empty(heap) catch return ExpandError.OutOfMemory;
+    var i: usize = items.len;
+    while (i > 0) {
+        i -= 1;
+        const item_v = try formToValue(ctx, items[i]);
+        lst = list_mod.cons(heap, item_v, lst) catch return ExpandError.OutOfMemory;
+    }
+    return lst;
+}
+
+/// Convert a runtime Value back into a Form (for the macro
+/// return path). Lifetime: Forms allocated in `ctx.allocator`
+/// (the compile arena), so the result outlives the macro
+/// sub-VM. Each constructed Form gets `origin` as its source
+/// span — typically the macro call site (peer-AI turn 66 §D3
+/// "Span/origin": generated forms use the macro call origin).
+fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSpan) !*Form {
+    return switch (v.kind()) {
+        .nil => try makeNil(ctx, origin),
+        .true_ => try makeBool(ctx, true, origin),
+        .false_ => try makeBool(ctx, false, origin),
+        .fixnum => blk: {
+            const form = try ctx.allocator.create(Form);
+            form.* = .{ .datum = .{ .int = v.asFixnum() }, .origin = origin };
+            break :blk form;
+        },
+        .symbol => blk: {
+            const id: u32 = @intCast(v.payload);
+            const name = ctx.interner.symbolName(id);
+            // Owned-by-interner name is stable for the
+            // compilation unit; safe to borrow into the Form.
+            break :blk try makeSymbol(ctx, name, origin);
+        },
+        .keyword => blk: {
+            const id: u32 = @intCast(v.payload);
+            const name = ctx.interner.keywordName(id);
+            const form = try ctx.allocator.create(Form);
+            form.* = .{
+                .datum = .{ .keyword = .{ .ns = null, .name = name } },
+                .origin = origin,
+            };
+            break :blk form;
+        },
+        .list => blk: {
+            var items: std.ArrayList(*Form) = .empty;
+            defer items.deinit(ctx.allocator);
+            var node = v;
+            while (node.kind() == .list and !list_mod.isEmpty(node)) {
+                const head_f = try valueToForm(ctx, list_mod.head(node), origin);
+                try items.append(ctx.allocator, head_f);
+                node = list_mod.tail(node);
+            }
+            const slice = try ctx.allocator.alloc(*Form, items.items.len);
+            for (items.items, 0..) |it, i| slice[i] = it;
+            break :blk try makeList(ctx, slice, origin);
+        },
+        .persistent_vector => blk: {
+            const n = vector_mod.count(v);
+            const slice = try ctx.allocator.alloc(*Form, n);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                slice[i] = try valueToForm(ctx, vector_mod.nth(v, i), origin);
+            }
+            break :blk try makeVector(ctx, slice, origin);
+        },
+        .persistent_map => blk: {
+            var entries: std.ArrayList(*Form) = .empty;
+            defer entries.deinit(ctx.allocator);
+            var it = champ_mod.mapIter(v);
+            while (it.next()) |e| {
+                try entries.append(ctx.allocator, try valueToForm(ctx, e.key, origin));
+                try entries.append(ctx.allocator, try valueToForm(ctx, e.value, origin));
+            }
+            const slice = try ctx.allocator.alloc(*Form, entries.items.len);
+            for (entries.items, 0..) |item, i| slice[i] = item;
+            const form = try ctx.allocator.create(Form);
+            form.* = .{ .datum = .{ .map = @as([]const *Form, slice) }, .origin = origin };
+            break :blk form;
+        },
+        .persistent_set => blk: {
+            var elems: std.ArrayList(*Form) = .empty;
+            defer elems.deinit(ctx.allocator);
+            var it = champ_mod.setIter(v);
+            while (it.next()) |e| {
+                try elems.append(ctx.allocator, try valueToForm(ctx, e, origin));
+            }
+            const slice = try ctx.allocator.alloc(*Form, elems.items.len);
+            for (elems.items, 0..) |item, i| slice[i] = item;
+            const form = try ctx.allocator.create(Form);
+            form.* = .{ .datum = .{ .set = @as([]const *Form, slice) }, .origin = origin };
+            break :blk form;
+        },
+        // Macro returned a kind we don't know how to surface
+        // as a Form (function, var, etc.). Most macros return
+        // shapes built via syntax-quote, so this is rare.
+        else => return ExpandError.MalformedMacroCall,
+    };
 }
 
 /// Helper: is `form` a list whose head is the unqualified
