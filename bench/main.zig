@@ -49,6 +49,9 @@ const dispatch = @import("dispatch");
 const db = @import("db");
 const emdb = @import("emdb");
 const pool_mod = @import("pool");
+const vm_mod = @import("vm");
+const compile_mod = @import("compile");
+const macroexpand_mod = @import("macroexpand");
 
 const Value = value_mod.Value;
 const Heap = heap_mod.Heap;
@@ -370,6 +373,116 @@ fn populateKeysAndVals(
     return .{ .keys = keys, .vals = vals };
 }
 
+// =============================================================================
+// Compiler benchmarks (COMPILER.md §9.4 gate item 7)
+// =============================================================================
+
+const CompileBenchCtx = struct {
+    alloc: std.mem.Allocator,
+};
+
+/// Measure compile throughput: parser + reader + macroexpand +
+/// lowerForm + compileTiny for `(+ 1 2)`. Allocates a fresh
+/// arena per iteration so the measured cost is steady-state
+/// compile, not amortized scope reuse.
+fn benchCompileSimple(ctx: *CompileBenchCtx) !void {
+    var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena.deinit();
+    var interner = intern_mod.Interner.init(arena.allocator());
+    defer interner.deinit();
+    const compiled = try compile_mod.compileSourceFull(
+        arena.allocator(),
+        "(+ 1 2)",
+        null,
+        &interner,
+    );
+    std.mem.doNotOptimizeAway(compiled);
+}
+
+/// Measure eval throughput on a 100-iteration recur loop.
+/// per-iteration cost = total / 100. The bench harness
+/// reports ops/sec at the OUTER iteration; divide by the
+/// loop-iter count to get recur per-iter.
+fn benchEvalSimpleLoop(ctx: *CompileBenchCtx) !void {
+    var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena.deinit();
+    var stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
+    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm_mod.VM.init(ctx.alloc, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    const compiled = try compile_mod.compileSourceFull(
+        arena.allocator(),
+        "(loop* [i 0] (if (< i 100) (recur (+ i 1)) i))",
+        null,
+        interner,
+    );
+    const routine = compiled.toRoutine("bench");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    std.mem.doNotOptimizeAway(result);
+}
+
+/// Closure creation cost: `((fn* [] 42))`. Each iteration
+/// constructs a fresh closure and immediately calls it.
+fn benchClosureCreate(ctx: *CompileBenchCtx) !void {
+    var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena.deinit();
+    var stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
+    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm_mod.VM.init(ctx.alloc, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    const compiled = try compile_mod.compileSourceFull(
+        arena.allocator(),
+        "((fn* [] 42))",
+        null,
+        interner,
+    );
+    const routine = compiled.toRoutine("bench");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    std.mem.doNotOptimizeAway(result);
+}
+
+/// Eval throughput on a 4-arg arithmetic chain `(+ (+ 1 2) (+ 3 4))`.
+/// Tests cost of nested calls + arithmetic without the loop
+/// overhead. Closer to "raw eval" speed.
+fn benchEvalArith(ctx: *CompileBenchCtx) !void {
+    var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena.deinit();
+    var stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
+    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm_mod.VM.init(ctx.alloc, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    const compiled = try compile_mod.compileSourceFull(
+        arena.allocator(),
+        "(+ (+ 1 2) (+ 3 4))",
+        null,
+        interner,
+    );
+    const routine = compiled.toRoutine("bench");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    std.mem.doNotOptimizeAway(result);
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const alloc = init.gpa;
     const io = init.io;
@@ -520,6 +633,28 @@ pub fn main(init: std.process.Init) !u8 {
             try runner.bench("map_get_n_hit", "collection-lookup-update", np, &lctx, benchMapGet);
             try runner.bench("set_contains_n_hit", "collection-lookup-update", np, &lctx, benchSetContains);
         }
+    }
+
+    // ---- Compiler (COMPILER.md §9.4 gate item 7) ----
+    //
+    // 4 measurements per gate spec:
+    //   compile_simple — forms/sec for `(+ 1 2)`
+    //   eval_simple_loop — ops/sec for a tight recur loop
+    //                      (= recur-per-iteration cost)
+    //   closure_create — per-construction cost for `((fn* [] 42))`
+    //   eval_arith — ops/sec for a 4-arg arithmetic chain
+    //
+    // These exercise the full reader→Form→lowerForm→Tiny→VM
+    // pipeline. The bench runner amortizes pilot+warmup+30
+    // measurements with criterion-style sampling; the per-bench
+    // setup (allocator + VM init) is amortized across the inner
+    // reps for stability.
+    if (include(filter, "compiler")) {
+        var cctx = CompileBenchCtx{ .alloc = alloc };
+        try runner.bench("compile_simple", "compiler", null, &cctx, benchCompileSimple);
+        try runner.bench("eval_simple_loop", "compiler", 100, &cctx, benchEvalSimpleLoop);
+        try runner.bench("closure_create", "compiler", null, &cctx, benchClosureCreate);
+        try runner.bench("eval_arith", "compiler", null, &cctx, benchEvalArith);
     }
 
     // ---- Codec ----

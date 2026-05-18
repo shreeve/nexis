@@ -599,6 +599,24 @@ pub fn build(b: *std.Build) void {
     const prop_db_tests = b.addTest(.{ .root_module = prop_db_mod });
     const run_prop_db_tests = b.addRunArtifact(prop_db_tests);
 
+    // Phase 2 gate items 3 + 4 (COMPILER.md §9.4): closure
+    // capture depth-10 + syntax-quote structural equality.
+    const prop_compile_mod = b.createModule(.{
+        .root_source_file = b.path("test/prop/compile.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prop_compile_mod.addImport("value", value_mod);
+    prop_compile_mod.addImport("vm", vm_mod);
+    prop_compile_mod.addImport("compile", compile_mod);
+    prop_compile_mod.addImport("intern", intern_mod);
+    prop_compile_mod.addImport("reader", reader_mod);
+    prop_compile_mod.addImport("macroexpand", macroexpand_mod);
+    prop_compile_mod.addImport("list", list_mod);
+
+    const prop_compile_tests = b.addTest(.{ .root_module = prop_compile_mod });
+    const run_prop_compile_tests = b.addRunArtifact(prop_compile_tests);
+
     // -------------------------------------------------------------------------
     // Benchmark harness (src/bench.zig) + benchmark runner (bench/main.zig).
     //
@@ -638,6 +656,12 @@ pub fn build(b: *std.Build) void {
     bench_runner_mod.addImport("db", db_mod);
     bench_runner_mod.addImport("emdb", emdb_mod);
     bench_runner_mod.addImport("pool", pool_mod);
+    // Phase 2 gate item 7 (COMPILER.md §9.4): bench/main.zig
+    // measures compile + eval throughput + closure-creation
+    // cost + recur per-iter cost.
+    bench_runner_mod.addImport("vm", vm_mod);
+    bench_runner_mod.addImport("compile", compile_mod);
+    bench_runner_mod.addImport("macroexpand", macroexpand_mod);
 
     const bench_exe = b.addExecutable(.{
         .name = "nexis-bench",
@@ -765,6 +789,8 @@ pub fn build(b: *std.Build) void {
     phase2_test_step.dependOn(&runtime_test_runs[16].step);
     phase2_test_step.dependOn(&runtime_test_runs[17].step);
     phase2_test_step.dependOn(&runtime_test_runs[18].step);
+    // Phase 2 gate items 3 + 4.
+    phase2_test_step.dependOn(&run_prop_compile_tests.step);
 
     test_step.dependOn(&run_prop_primitive_tests.step);
     test_step.dependOn(&run_prop_intern_tests.step);
@@ -778,6 +804,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_transient_tests.step);
     test_step.dependOn(&run_prop_codec_tests.step);
     test_step.dependOn(&run_prop_db_tests.step);
+    test_step.dependOn(&run_prop_compile_tests.step);
     test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);
