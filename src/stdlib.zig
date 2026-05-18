@@ -37,6 +37,10 @@ const list_mod = @import("list");
 const vector_mod = @import("vector");
 const champ_mod = @import("champ");
 const intern_mod = @import("intern");
+const db_mod = @import("db");
+const codec_mod = @import("codec");
+const heap_mod = @import("heap");
+const dispatch_mod_alias = @import("dispatch");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -67,6 +71,29 @@ pub fn installCore(ns: *Namespace) !void {
         // Native fns are NOT macros (Var.macro stays false).
     }
 }
+
+/// Phase 4.0a: install db primitives into the `db` namespace
+/// so `(db/open path)` resolves through the registry's
+/// qualified-symbol path. CLI calls this AFTER `installCore`
+/// + after the registry has a "db" namespace registered.
+pub fn installDb(db_ns: *Namespace) !void {
+    for (db_fns) |entry| {
+        const v = try db_ns.intern(entry.name);
+        v.root = vm_mod.nativeFnValue(entry.descriptor);
+        v.bound = true;
+    }
+}
+
+const db_fns = [_]CoreEntry{
+    .{ .name = "open", .descriptor = &native_db_open },
+    .{ .name = "close", .descriptor = &native_db_close },
+    .{ .name = "ref", .descriptor = &native_db_ref },
+    .{ .name = "ref?", .descriptor = &native_db_ref_q },
+    .{ .name = "put-key!", .descriptor = &native_db_put_key },
+    .{ .name = "get-key", .descriptor = &native_db_get_key },
+    .{ .name = "delete-key!", .descriptor = &native_db_delete_key },
+    .{ .name = "present?", .descriptor = &native_db_present_q },
+};
 
 /// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
 /// layer written in nexis itself, embedded at compile time.
@@ -131,6 +158,9 @@ const core_fns = [_]CoreEntry{
     .{ .name = "keys", .descriptor = &native_keys },
     .{ .name = "vals", .descriptor = &native_vals },
     .{ .name = "conj", .descriptor = &native_conj },
+    // Phase 4.0a: db primitives live in the `db` namespace
+    // (installed separately via `installDb`) so they appear as
+    // qualified `(db/open ...)` calls.
 };
 
 // =============================================================================
@@ -240,6 +270,16 @@ const native_contains_q = NativeFn{ .name = "contains?", .min_arity = 2, .max_ar
 const native_keys = NativeFn{ .name = "keys", .min_arity = 1, .max_arity = 1, .call = &fnKeys };
 const native_vals = NativeFn{ .name = "vals", .min_arity = 1, .max_arity = 1, .call = &fnVals };
 const native_conj = NativeFn{ .name = "conj", .min_arity = 1, .max_arity = null, .call = &fnConj };
+
+// Phase 4.0a db primitives.
+const native_db_open = NativeFn{ .name = "db/open", .min_arity = 1, .max_arity = 1, .call = &fnDbOpen };
+const native_db_close = NativeFn{ .name = "db/close", .min_arity = 1, .max_arity = 1, .call = &fnDbClose };
+const native_db_ref = NativeFn{ .name = "db/ref", .min_arity = 3, .max_arity = 3, .call = &fnDbRef };
+const native_db_ref_q = NativeFn{ .name = "db/ref?", .min_arity = 1, .max_arity = 1, .call = &fnDbRefQ };
+const native_db_put_key = NativeFn{ .name = "db/put-key!", .min_arity = 2, .max_arity = 2, .call = &fnDbPutKey };
+const native_db_get_key = NativeFn{ .name = "db/get-key", .min_arity = 1, .max_arity = 2, .call = &fnDbGetKey };
+const native_db_delete_key = NativeFn{ .name = "db/delete-key!", .min_arity = 1, .max_arity = 1, .call = &fnDbDeleteKey };
+const native_db_present_q = NativeFn{ .name = "db/present?", .min_arity = 1, .max_arity = 1, .call = &fnDbPresentQ };
 
 // =============================================================================
 // Implementations
@@ -929,6 +969,173 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
         },
         else => return VmError.KindMismatch,
     };
+}
+
+// =============================================================================
+// db primitives (Phase 4.0a)
+// =============================================================================
+//
+// Per peer-AI turn 72: Path B (explicit transaction threading).
+// `(db/open path)` opens a connection; `db/close` closes it.
+// `(db/ref conn tree-keyword key-string)` constructs a durable
+// ref Value. `db/put-key!` / `db/get-key` / `db/delete-key!` /
+// `db/present?` operate via AUTO-EPHEMERAL transactions for
+// v1.alpha (4.0a). Explicit `with-tx` + tx-threaded ops land in
+// 4.0b.
+//
+// Errors land as catchable keyword payloads:
+//   :db-error            general open/io failure
+//   :db-closed           op on already-closed connection
+//   :invalid-durable-ref arg was not a durable_ref Value
+//   :codec-failed        encode/decode error
+//
+// Connection lifetime: each `db/open` allocates a Connection
+// on the VM's main allocator (NOT the runtime arena) + appends
+// it to vm.db_connections. `db/close` removes from the list +
+// frees. VM.deinit closes any remaining as a safety net.
+
+fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
+    // v1.alpha: accept the path as a keyword OR symbol (their
+    // interned name is the path string). First-class strings
+    // arrive in Phase 4 polish.
+    const path_v = args[0];
+    const path_slice: []const u8 = blk: {
+        if (path_v.kind() == .keyword) {
+            const id: u32 = @intCast(path_v.payload);
+            break :blk vm.ensureInterner().keywordName(id);
+        }
+        if (path_v.kind() == .symbol) {
+            const id: u32 = @intCast(path_v.payload);
+            break :blk vm.ensureInterner().symbolName(id);
+        }
+        return VmError.KindMismatch;
+    };
+    // Heap-alloc the Connection on VM.allocator (NOT the arena).
+    const conn = vm.allocator.create(db_mod.Connection) catch return VmError.OutOfMemory;
+    errdefer vm.allocator.destroy(conn);
+    const path_z = vm.allocator.dupeZ(u8, path_slice) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(path_z);
+    const heap = vm.ensureHeap();
+    const interner = vm.ensureInterner();
+    conn.* = db_mod.open(vm.allocator, heap, interner, path_z.ptr, .{}) catch return VmError.DbError;
+    // Register on VM safety-net list.
+    vm.db_close_callback = &dbCloseCallback;
+    vm.db_connections.append(vm.allocator, @ptrCast(conn)) catch return VmError.OutOfMemory;
+    return value_mod.Value{
+        .tag = @intFromEnum(value_mod.Kind.db_connection),
+        .payload = @intFromPtr(conn),
+    };
+}
+
+/// Phase 4.0a: stand-alone closer used by VM.deinit safety net.
+/// Closes the emdb env AND destroys the Connection struct. The
+/// struct's own `allocator` field tells us how it was allocated.
+fn dbCloseCallback(opaque_ptr: *anyopaque) void {
+    const conn: *db_mod.Connection = @ptrCast(@alignCast(opaque_ptr));
+    if (conn.open_flag) db_mod.close(conn);
+    const allocator = conn.allocator;
+    allocator.destroy(conn);
+}
+
+fn fnDbClose(vm: *VM, args: []const Value) VmError!Value {
+    const v = args[0];
+    if (v.kind() != .db_connection) return VmError.KindMismatch;
+    const conn: *db_mod.Connection = @ptrFromInt(v.payload);
+    // Remove from VM safety-net list.
+    var i: usize = 0;
+    while (i < vm.db_connections.items.len) : (i += 1) {
+        if (vm.db_connections.items[i] == @as(*anyopaque, @ptrCast(conn))) {
+            _ = vm.db_connections.swapRemove(i);
+            break;
+        }
+    }
+    db_mod.close(conn);
+    vm.allocator.destroy(conn);
+    return value_mod.nilValue();
+}
+
+fn fnDbRef(vm: *VM, args: []const Value) VmError!Value {
+    const conn_v = args[0];
+    const tree_v = args[1];
+    const key_v = args[2];
+    if (conn_v.kind() != .db_connection) return VmError.KindMismatch;
+    // Tree name must be a keyword (its interned name = tree id).
+    if (tree_v.kind() != .keyword) return VmError.KindMismatch;
+    // Key can be keyword / symbol (interned-name as key bytes).
+    // First-class string keys arrive in Phase 4 polish.
+    if (key_v.kind() != .keyword and key_v.kind() != .symbol) return VmError.KindMismatch;
+    const conn: *db_mod.Connection = @ptrFromInt(conn_v.payload);
+    if (!conn.open_flag) return VmError.DbClosed;
+    const interner = vm.ensureInterner();
+    const tree_id: u32 = @intCast(tree_v.payload);
+    const tree_name = interner.keywordName(tree_id);
+    const key_id: u32 = @intCast(key_v.payload);
+    const key_bytes: []const u8 = switch (key_v.kind()) {
+        .keyword => interner.keywordName(key_id),
+        .symbol => interner.symbolName(key_id),
+        else => unreachable,
+    };
+    return db_mod.ref(vm.ensureHeap(), conn, tree_name, key_bytes) catch return VmError.DbError;
+}
+
+fn fnDbRefQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(args[0].kind() == .durable_ref);
+}
+
+/// `(db/put-key! ref value)` — auto-ephemeral write tx for v1.alpha.
+fn fnDbPutKey(_: *VM, args: []const Value) VmError!Value {
+    const r = args[0];
+    const v = args[1];
+    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
+    const conn = db_mod.refConn(r) orelse return VmError.DbError;
+    if (!conn.open_flag) return VmError.DbClosed;
+    var txn = db_mod.beginWrite(conn) catch return VmError.DbError;
+    db_mod.putRef(&txn, r, v) catch {
+        db_mod.abortWrite(&txn);
+        return VmError.CodecFailed;
+    };
+    db_mod.commit(&txn) catch return VmError.DbError;
+    return value_mod.nilValue();
+}
+
+/// `(db/get-key ref)` or `(db/get-key ref default)` — auto-ephemeral read tx.
+fn fnDbGetKey(_: *VM, args: []const Value) VmError!Value {
+    const r = args[0];
+    const default = if (args.len > 1) args[1] else value_mod.nilValue();
+    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
+    const conn = db_mod.refConn(r) orelse return VmError.DbError;
+    if (!conn.open_flag) return VmError.DbClosed;
+    var txn = db_mod.beginRead(conn) catch return VmError.DbError;
+    defer db_mod.abortRead(&txn);
+    const result = db_mod.getRef(&txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.CodecFailed;
+    return result orelse default;
+}
+
+fn fnDbDeleteKey(_: *VM, args: []const Value) VmError!Value {
+    const r = args[0];
+    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
+    const conn = db_mod.refConn(r) orelse return VmError.DbError;
+    if (!conn.open_flag) return VmError.DbClosed;
+    var txn = db_mod.beginWrite(conn) catch return VmError.DbError;
+    const existed = db_mod.delRef(&txn, r) catch {
+        db_mod.abortWrite(&txn);
+        return VmError.DbError;
+    };
+    db_mod.commit(&txn) catch return VmError.DbError;
+    return value_mod.fromBool(existed);
+}
+
+fn fnDbPresentQ(_: *VM, args: []const Value) VmError!Value {
+    const r = args[0];
+    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
+    const conn = db_mod.refConn(r) orelse return VmError.DbError;
+    if (!conn.open_flag) return VmError.DbClosed;
+    var txn = db_mod.beginRead(conn) catch return VmError.DbError;
+    defer db_mod.abortRead(&txn);
+    const tree = db_mod.refTreeName(r);
+    const key = db_mod.refKeyBytes(r);
+    const result = db_mod.get(&txn, tree, key, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.DbError;
+    return value_mod.fromBool(result != null);
 }
 
 // =============================================================================

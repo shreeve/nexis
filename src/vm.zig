@@ -1066,6 +1066,20 @@ pub const VmError = error{
     /// `:index-out-of-bounds` by the catchable-error
     /// translation table.
     IndexOutOfBounds,
+    /// Phase 4.0a: db engine error (file open failure, missing
+    /// tree, MVCC conflict, etc.). Mapped to `:db-error`.
+    DbError,
+    /// Phase 4.0a: operation attempted on a Connection that
+    /// was already closed (via `db/close` or VM teardown).
+    /// Mapped to `:db-closed`.
+    DbClosed,
+    /// Phase 4.0a: arg expected to be a `durable_ref` Value
+    /// was not. Mapped to `:invalid-durable-ref`.
+    InvalidDurableRef,
+    /// Phase 4.0a: codec encode/decode failed (unserializable
+    /// value, corrupt bytes, version mismatch). Mapped to
+    /// `:codec-failed`.
+    CodecFailed,
     /// Phase 3.3b (peer-AI turn 68): INTERNAL control-flow
     /// signal. NOT user-visible, NOT catchable. Raised when a
     /// throw propagated past a `VM.callValue` synthetic frame
@@ -1198,6 +1212,18 @@ pub const VM = struct {
     /// registry exists; otherwise it falls back to the legacy
     /// single `namespace` field (test/ad-hoc compat).
     registry: ?NamespaceRegistry = null,
+    /// Phase 4.0a (peer-AI turn 72): list of OPEN db Connections.
+    /// `db/open` appends; `db/close` removes; `VM.deinit` closes
+    /// any still-open as a safety net. Connections own OS
+    /// resources (mmap, file handle); they CANNOT live in
+    /// runtime_arena (which is freed wholesale).
+    /// Stored as `*anyopaque` to avoid a vm.zig → db.zig
+    /// dependency. db.zig owns the cast back to `*db.Connection`.
+    db_connections: std.ArrayList(*anyopaque) = .empty,
+    /// Phase 4.0a: closer callback. Set by db.zig the first
+    /// time a connection is registered, so VM.deinit can close
+    /// connections without importing db.
+    db_close_callback: ?*const fn (*anyopaque) void = null,
     /// Step #9.1: global try-handler stack (peer-AI turn 59
     /// §D2). Push on `ctrl:try-enter`, pop on `ctrl:try-exit`,
     /// walk on `ctrl:throw`. Each Handler is keyed by
@@ -1283,6 +1309,14 @@ pub const VM = struct {
         // HashMaps (both via self.allocator). Free explicitly;
         // Namespace structs themselves are arena-backed.
         if (self.registry) |*reg| reg.deinit();
+        // Phase 4.0a: close any still-open db Connections as a
+        // safety net (callers should explicitly `db/close`).
+        // Callback closes the emdb env AND destroys the
+        // Connection struct allocated via self.allocator.
+        if (self.db_close_callback) |close_fn| {
+            for (self.db_connections.items) |conn_ptr| close_fn(conn_ptr);
+        }
+        self.db_connections.deinit(self.allocator);
         // Heap (if initialized) is arena-backed in this staged
         // VM path. Its live-list is only bookkeeping; all
         // memory is reclaimed by `runtime_arena.deinit()`
@@ -3080,6 +3114,10 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.UnboundVar => "unbound-var",
         VmError.IntegerOverflow => "integer-overflow",
         VmError.IndexOutOfBounds => "index-out-of-bounds",
+        VmError.DbError => "db-error",
+        VmError.DbClosed => "db-closed",
+        VmError.InvalidDurableRef => "invalid-durable-ref",
+        VmError.CodecFailed => "codec-failed",
         // Unrecoverable: bytecode corruption / VM-internal /
         // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,

@@ -247,8 +247,9 @@ pub fn build(b: *std.Build) void {
     stdlib_mod.addImport("vector", vector_mod);
     stdlib_mod.addImport("champ", champ_mod);
     stdlib_mod.addImport("intern", intern_mod);
-    // dispatch_mod is declared later (after db); the addImport
-    // for it is attached at the bottom of the dispatch block.
+    stdlib_mod.addImport("heap", heap_mod);
+    // dispatch_mod, db_mod, codec_mod are declared later;
+    // imports attached at the bottom of the dispatch block.
 
     // loader_mod declared AFTER compile_mod (below).
 
@@ -341,6 +342,9 @@ pub fn build(b: *std.Build) void {
     // Phase 3.3b: stdlib needs dispatch for `=` (value
     // equality) implementation.
     stdlib_mod.addImport("dispatch", dispatch_mod);
+    // Phase 4.0a: stdlib's db primitives need db + codec.
+    stdlib_mod.addImport("db", db_mod);
+    stdlib_mod.addImport("codec", codec_mod);
 
     // -------------------------------------------------------------------------
     // Phase 0: reader unit tests (src/reader.zig has its own test { ... }
@@ -444,7 +448,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch" } },
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch" } },
-        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch" } },
+        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
     };
 

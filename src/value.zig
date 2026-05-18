@@ -67,7 +67,20 @@ pub const Kind = enum(u8) {
     /// Distinguished from `.function` (user closure) at
     /// `call:call` dispatch.
     native_fn = 30,
-    // 31..63 reserved for future heap kinds.
+    /// Phase 4.0a (peer-AI turn 72): emdb connection handle.
+    /// Payload is a pointer to a `db.Connection` struct owned
+    /// by the VM (NOT the runtime arena — Connections hold OS
+    /// resources and must be closed explicitly or by VM.deinit
+    /// safety-net).
+    db_connection = 31,
+    /// Phase 4.0b: write transaction handle. Payload is a
+    /// pointer to a heap-allocated `db.WriteTxn`. Single-owner,
+    /// invalidated on commit/abort.
+    db_write_txn = 32,
+    /// Phase 4.0b: read transaction handle. Payload is a
+    /// pointer to a heap-allocated `db.ReadTxn`.
+    db_read_txn = 33,
+    // 34..63 reserved for future heap kinds.
 
     // ---- Runtime-private sentinels (never escape public API) ----
     unbound = 64,

@@ -50,6 +50,8 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Phase 3.5 | ✅ shipped | Destructuring (sequential/associative/nested/`& rest`/`:as`/`:keys`/`:or`) + multi-arity `defn` |
 | Phase 3.6 | ✅ shipped | `require` + file loading + `:as` aliases; ns-to-file mapping; cycle detection; idempotent load |
 | Phase 3.7 | pending (deferred) | `^:dynamic` Vars + `binding` — deferred until Phase 4 clarifies transaction-context shape |
+| Phase 4.0a | ✅ shipped | Durable refs as first-class Values backed by emdb. `db/open`/`db/close`/`db/ref`/`db/put-key!`/`db/get-key`/`db/delete-key!`/`db/present?`. Auto-ephemeral tx. Cross-process persistence verified. |
+| Phase 4.0b+ | pending | Explicit `with-tx`/`with-read-tx`, `@deref`, `db/alter!`, cursors, scan, todo-tracker demo |
 
 **558 tests** green: 95 VM + 313 compile + 6 macroexpand + 4
 property + 54 integration in `phase2-test` (~3s), plus 86 reader
@@ -199,6 +201,16 @@ Every snippet runs via `bin/nexis`. Run the file or paste into the REPL:
 ;; — see examples/require-demo.nx + examples/lib/geom.nx
 (require '[lib.geom :as g])
 (g/area-of-square 5)                ;; => 25
+
+;; durable refs backed by emdb (Phase 4.0a — the OTHER big arc)
+;; — see examples/durable-refs.nx
+(def conn (db/open :app.edb))
+(def alice (db/ref conn :users :alice))
+(db/put-key! alice {:name :alice :age 30})
+(db/get-key alice)                  ;; => {:name :alice, :age 30}
+(db/close conn)
+;; Values PERSIST across processes. Re-open the file in a new
+;; `nexis` invocation and you read the same data.
 
 ;; anonymous-fn shorthand
 (#(+ % 1) 41)                       ;; => 42

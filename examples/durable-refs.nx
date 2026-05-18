@@ -1,0 +1,45 @@
+; examples/durable-refs.nx — Phase 4.0a durable identity demo
+;
+; The OTHER big arc: durable identities are first-class language
+; values, not a library bolted on top. Backed by emdb (LMDB-class
+; B+ tree, MVCC, zero-copy reads).
+;
+; This example uses v1.alpha auto-ephemeral transaction APIs.
+; Real `(with-tx ...)` + `db/put!`/`db/alter!` with explicit tx
+; threading lands in Phase 4.0b.
+
+; Open (or create) a connection to a database file.
+; v1.alpha accepts the path as a keyword (its interned name = path).
+(def conn (db/open :app.edb))
+
+; Construct a durable ref. Its identity is the triple
+; {store-id, tree-name, key-bytes}. Two refs with the same
+; triple compare equal, regardless of stored content.
+(def alice (db/ref conn :users :alice))
+
+; Write + read via auto-ephemeral transactions.
+(db/put-key! alice {:name :alice :age 30 :tags #{:admin :early-user}})
+(db/get-key alice)               ; => {:name :alice, :age 30, ...}
+
+; Presence check (no decode cost).
+(db/present? alice)              ; => true
+
+; Default value for missing keys.
+(db/get-key (db/ref conn :users :nobody) :not-found)   ; => :not-found
+
+; Persistent values round-trip through the codec — maps, sets,
+; vectors, nested structures all work.
+(def history-key (db/ref conn :events :session-1))
+(db/put-key! history-key
+  [:event-log
+   {:t 0 :kind :login}
+   {:t 1 :kind :click :target :button}
+   {:t 2 :kind :logout}])
+
+(db/get-key history-key)
+
+; Delete + close.
+(db/delete-key! alice)
+(db/close conn)
+
+:done

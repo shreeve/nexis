@@ -2011,11 +2011,26 @@ stdlib, multi-namespace, dynamic binding.
 
 ### Phase 4 — emdb integration as a first-class concept (weeks 19–22)
 
-- [ ] `src/tx.zig`: `with-tx` / `with-read-tx` compile and runtime contract.
-- [ ] Durable-ref special handling in `coll` + new `tx` opcodes.
-- [ ] `src/stdlib/db.nx`: library wrapper for user-facing API.
-- [ ] Codec v1 frozen; version-tagged for forward compatibility.
-- [ ] Cursor and scan exposed.
+Per peer-AI turn 72 strategic pin: **Path B** (explicit
+transaction threading). No ambient tx via dynamic Var in v1.
+
+- [x] **Phase 4.0a** Connection + durable-ref + auto-ephemeral
+      tx primitives. `Kind.db_connection`. `db/open` / `db/close`
+      / `db/ref` / `db/put-key!` / `db/get-key` / `db/delete-key!`
+      / `db/present?` / `db/ref?` as native fns installed in a
+      `db` namespace. VM safety-net tracks open connections.
+      Cross-process persistence verified.
+- [ ] **Phase 4.0b** Explicit `with-tx` / `with-read-tx` macros
+      + WriteTxn / ReadTxn Value kinds + `db/put!`/`db/get`/
+      `db/delete!` (tx-threaded). Try/finally-safe commit/abort.
+      Tx single-owner enforcement.
+- [ ] **Phase 4.0c** `@deref` operator dispatch on `.durable_ref`
+      (ephemeral read) + `db/alter!` (read-modify-write inside tx).
+- [ ] **Phase 4.0d** Cursors + `db/scan` (eager v1) + `db/reduce-tree`.
+- [ ] **Phase 4.0e** Small example app (to-do tracker) per
+      Phase 4 EXIT CRITERION.
+- [ ] **Phase 4.0f** (stretch) Snapshots + `db/as-of` per
+      PLAN.md §15.7.
 
 **Exit**: Phase 4 gate; a small application (e.g. a to-do tracker with persistent state) works end-to-end.
 

@@ -403,6 +403,12 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     // lookup (`nexis.core/map`). User code that defs the same
     // names creates a local shadow.
     try stdlib.installCore(registry.core);
+    // Phase 4.0a: install db primitives into a `db` namespace
+    // so qualified-form `(db/open ...)` resolves through the
+    // registry. The `db` ns is registered with `nexis.core` as
+    // its auto-refer parent (matches user/core relationship).
+    const db_ns = try registry.getOrCreate("db", registry.core);
+    try stdlib.installDb(db_ns);
     var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);
     // Phase 3.3d: bootstrap the embedded core.nx composite
@@ -610,6 +616,9 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     const registry = try v.ensureRegistry();
     // Phase 3.3a: install core native fns into nexis.core.
     try stdlib.installCore(registry.core);
+    // Phase 4.0a: install db primitives into the `db` ns.
+    const db_ns = try registry.getOrCreate("db", registry.core);
+    try stdlib.installDb(db_ns);
     // Step #8b: default host macro table.
     var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);

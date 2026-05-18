@@ -26,6 +26,7 @@ zig build nexis
 | `defmacro.nx` | User-defined macros via `defmacro` (Phase 3.2) — fresh sub-VM per compile-time invocation |
 | `stdlib-primitives.nx` | Native fns (`list`/`cons`/`first`/`rest`/`empty?`/...) + a user-written recursive procedural `my-cond` macro (Phase 3.3a) |
 | `require-demo.nx` + `lib/geom.nx` | `(require '[lib.geom :as g])` loads a library from disk; Phase 3.6 |
+| `durable-refs.nx` | First-class durable identity backed by emdb. `db/open`/`db/ref`/`db/put-key!`/`db/get-key`/`db/delete-key!`. Phase 4.0a — values PERSIST across processes. |
 
 The macro-heavy examples cover both styles: host macros (Zig-
 implemented, registered in the default table) and user macros

@@ -11,3 +11,7 @@ notes.txt
 # record live inline in docs/PERF.md; regenerate locally with
 # `zig build bench -- --out bench/baseline.json`.
 bench/*.json
+
+# Phase 4: emdb data files (created during testing)
+*.edb
+*.edb-lock
