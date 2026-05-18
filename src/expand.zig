@@ -176,13 +176,17 @@ fn expandFormDepth(
         .nil, .bool_, .int, .real, .char, .string, .keyword, .symbol => mutCast(form),
         // ---- Lists — special-form recognition + macro dispatch. --
         .list => |items| try expandList(ctx, env, form, items, depth),
-        // ---- Compound non-list collections (#8a: pass-through). --
-        // Phase-2 source doesn't allow vector/map/set as code
-        // (only in `let*` binding vectors, which are handled by
-        // the let* arm via direct items access). For top-level
-        // vector/map/set expressions, lowerForm will raise
-        // UnsupportedFeature; we don't pre-traverse them here.
-        .vector, .map, .set => mutCast(form),
+        // Phase 3.1: vector/map/set are now real expressions
+        // (lowerForm builds runtime values via coll:vector /
+        // coll:map / coll:set). Walk into each item so macros
+        // inside collection literals expand.
+        // NB: let*/loop*/fn*/letfn* binding vectors are still
+        // handled by their dedicated walkers (which do their
+        // own per-form traversal); this arm catches top-level
+        // collection-literal expressions.
+        .vector => |items| try expandCollKind(ctx, env, form, items, depth, .vector_),
+        .map => |items| try expandCollKind(ctx, env, form, items, depth, .map_),
+        .set => |items| try expandCollKind(ctx, env, form, items, depth, .set_),
         // ---- Quote — OPAQUE per MACROEXPAND.md §2b. ----------
         // The expander does NOT recurse into the payload of a
         // quote form. `(quote (when x y))` MUST NOT expand
@@ -280,7 +284,9 @@ fn expandList(
     // #6"): a `(#%list (when x y))` should expand `(when x y)`.
     if (std.mem.eql(u8, name, "#%list") or
         std.mem.eql(u8, name, "#%concat") or
-        std.mem.eql(u8, name, "#%vector"))
+        std.mem.eql(u8, name, "#%vector") or
+        std.mem.eql(u8, name, "#%map") or
+        std.mem.eql(u8, name, "#%set"))
     {
         return try expandOrdinaryCall(ctx, env, list_form, items, depth);
     }
@@ -938,6 +944,45 @@ fn anonRewriteList(
     for (rewritten.items, 0..) |it, i| slice[i] = it;
     if (is_vector) return try makeVector(ctx, slice, list_form.origin);
     return try makeList(ctx, slice, list_form.origin);
+}
+
+/// Phase 3.1: discriminator for `expandCollKind`.
+const CollKind = enum { vector_, map_, set_ };
+
+/// Phase 3.1: walk a vector/map/set literal's items + rebuild
+/// the collection Form. Each item is expanded with the current
+/// env (collection literals don't introduce bindings). Re-uses
+/// the input form if no item changed (cheap fast path).
+fn expandCollKind(
+    ctx: *ExpandContext,
+    env: ?*const ExpandEnv,
+    coll_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+    kind: CollKind,
+) ExpandError!*Form {
+    var changed = false;
+    var rewritten: std.ArrayList(*Form) = .empty;
+    defer rewritten.deinit(ctx.allocator);
+    try rewritten.ensureTotalCapacity(ctx.allocator, items.len);
+    for (items) |it| {
+        const new_it = try expandFormDepth(ctx, env, it, depth);
+        if (new_it != it) changed = true;
+        try rewritten.append(ctx.allocator, new_it);
+    }
+    if (!changed) return mutCast(coll_form);
+    const slice = try ctx.allocator.alloc(*Form, rewritten.items.len);
+    for (rewritten.items, 0..) |it, i| slice[i] = it;
+    const new_form = try ctx.allocator.create(Form);
+    new_form.* = .{
+        .datum = switch (kind) {
+            .vector_ => .{ .vector = @as([]const *Form, slice) },
+            .map_ => .{ .map = @as([]const *Form, slice) },
+            .set_ => .{ .set = @as([]const *Form, slice) },
+        },
+        .origin = coll_form.origin,
+    };
+    return new_form;
 }
 
 /// Helper: is `form` a list whose head is the unqualified

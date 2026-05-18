@@ -22,6 +22,7 @@ zig build nexis
 | `syntax-quote.nx` | `` ` `` / `~` / `~@` with splicing (step #8c.2) |
 | `macro-author.nx` | Synthesize a `(let* [x 99] x)` form via vector syntax-quote (step #8c.3) — the pattern user `defmacro` will use in Phase 3 |
 | `try-catch.nx` | `try` / `catch` / `throw` with cross-frame propagation (step #9.1) |
+| `maps-sets.nx` | Collection literals `{...}` and `#{...}` (Phase 3.1) |
 
 The macro-heavy examples (`cond.nx`, `threading.nx`,
 `macros.nx`) all rely on step #8b host macros. Step #8c

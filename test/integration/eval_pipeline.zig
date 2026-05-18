@@ -31,6 +31,7 @@ const reader_mod = @import("reader");
 const expand_mod = @import("expand");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
+const champ_mod = @import("champ");
 
 const testing = std.testing;
 
@@ -77,6 +78,30 @@ fn formatValue(buf: *std.array_list.Managed(u8), v: value_mod.Value, interner: *
                 try formatValue(buf, vector_mod.nth(v, i), interner);
             }
             try buf.append(']');
+        },
+        .persistent_map => {
+            try buf.append('{');
+            var it = champ_mod.mapIter(v);
+            var first = true;
+            while (it.next()) |entry| {
+                if (!first) try buf.appendSlice(", ");
+                first = false;
+                try formatValue(buf, entry.key, interner);
+                try buf.append(' ');
+                try formatValue(buf, entry.value, interner);
+            }
+            try buf.append('}');
+        },
+        .persistent_set => {
+            try buf.appendSlice("#{");
+            var it = champ_mod.setIter(v);
+            var first = true;
+            while (it.next()) |elem| {
+                if (!first) try buf.append(' ');
+                first = false;
+                try formatValue(buf, elem, interner);
+            }
+            try buf.append('}');
         },
         .var_ => {
             const var_obj = vm.VM.asVar(v);
@@ -428,6 +453,42 @@ test "integration: composite — try with macros" {
         \\    n)
         \\  (try (check 42) (catch any e e)))
     , "42");
+}
+
+// =============================================================================
+// Phase 3.1 — maps/sets as runtime values
+// =============================================================================
+
+test "integration: quoted empty map" {
+    try expectOutput("(quote {})", "{}");
+}
+
+test "integration: quoted map with keyword keys" {
+    try expectOutput("(quote {:a 1})", "{:a 1}");
+}
+
+test "integration: runtime map literal — computed value" {
+    try expectOutput("(let* [n 42] {:answer n})", "{:answer 42}");
+}
+
+test "integration: nested quoted maps" {
+    try expectOutput("(quote {:outer {:inner 1}})", "{:outer {:inner 1}}");
+}
+
+test "integration: quoted empty set" {
+    try expectOutput("(quote #{})", "#{}");
+}
+
+test "integration: quoted set" {
+    try expectOutput("(quote #{:a})", "#{:a}");
+}
+
+test "integration: runtime set literal" {
+    try expectOutput("#{:x}", "#{:x}");
+}
+
+test "integration: bare vector literal as expression" {
+    try expectOutput("[1 2 3]", "[1 2 3]");
 }
 
 // =============================================================================

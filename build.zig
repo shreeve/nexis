@@ -188,6 +188,12 @@ pub fn build(b: *std.Build) void {
     vm_mod.addImport("list", list_mod);
     // Step #8c.3: VM owns `coll:vector` runtime construction.
     vm_mod.addImport("vector", vector_mod);
+    // Phase 3.1: VM also owns `coll:map` / `coll:set`. The
+    // `champ` and `dispatch` addImports happen LATER in the
+    // file (after dispatch_mod is declared) — they're attached
+    // to the same vm_mod via a deferred addImport call (see
+    // the "VM Phase-3.1 deps" block below dispatch_mod).
+    vm_mod.addImport("champ", champ_mod);
     // Step E1 (pre-#8): VM owns an `Interner` for quoted-symbol /
     // quoted-keyword Value construction. Per peer-AI turn 55 §K
     // (macro execution model preflight), the compile-side
@@ -237,6 +243,11 @@ pub fn build(b: *std.Build) void {
     compile_mod.addImport("intern", intern_mod);
     // Step #8a: expander is consumed by compileFormFullWithMacros.
     compile_mod.addImport("expand", expand_mod);
+    // Phase 3.1: champ used by compile.zig tests to assert
+    // mapCount / setCount / mapGet on result Values; the
+    // compile-side core itself doesn't need champ (the VM
+    // executes coll:map / coll:set).
+    compile_mod.addImport("champ", champ_mod);
 
     const db_mod = b.createModule(.{
         .root_source_file = b.path("src/db.zig"),
@@ -274,6 +285,14 @@ pub fn build(b: *std.Build) void {
     // and eq deliberately stay low-level (panicking on heap kinds)
     // so the module graph remains acyclic and every test-binary
     // root resolves cleanly.
+    //
+    // Phase 3.1 exception: vm_mod + compile_mod need dispatch
+    // for `coll:map` / `coll:set` hash + equality (compile_mod's
+    // tests use it for assertions; vm_mod for the runtime build).
+    // Attaching here so they're not forward-declared above
+    // dispatch_mod's creation.
+    vm_mod.addImport("dispatch", dispatch_mod);
+    compile_mod.addImport("dispatch", dispatch_mod);
 
     // -------------------------------------------------------------------------
     // Phase 0: reader unit tests (src/reader.zig has its own test { ... }
@@ -322,6 +341,7 @@ pub fn build(b: *std.Build) void {
         compile: *std.Build.Module,
         reader: *std.Build.Module,
         expand: *std.Build.Module,
+        dispatch: *std.Build.Module,
     };
     const siblings: AllSiblings = .{
         .hash = hash_mod,
@@ -344,6 +364,7 @@ pub fn build(b: *std.Build) void {
         .compile = compile_mod,
         .reader = reader_mod,
         .expand = expand_mod,
+        .dispatch = dispatch_mod,
     };
 
     const RuntimeTest = struct {
@@ -368,8 +389,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
-        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector" } },
-        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector" } },
+        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch" } },
+        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch" } },
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern" } },
     };
 
@@ -402,6 +423,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "compile")) siblings.compile
                 else if (std.mem.eql(u8, imp_name, "reader")) siblings.reader
                 else if (std.mem.eql(u8, imp_name, "expand")) siblings.expand
+                else if (std.mem.eql(u8, imp_name, "dispatch")) siblings.dispatch
                 else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
         }
@@ -634,6 +656,7 @@ pub fn build(b: *std.Build) void {
     integration_eval_mod.addImport("expand", expand_mod);
     integration_eval_mod.addImport("list", list_mod);
     integration_eval_mod.addImport("vector", vector_mod);
+    integration_eval_mod.addImport("champ", champ_mod);
 
     const integration_eval_tests = b.addTest(.{ .root_module = integration_eval_mod });
     const run_integration_eval_tests = b.addRunArtifact(integration_eval_tests);
@@ -732,6 +755,7 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("expand", expand_mod);
     cli_mod.addImport("list", list_mod);
     cli_mod.addImport("vector", vector_mod);
+    cli_mod.addImport("champ", champ_mod);
 
     const nexis_exe = b.addExecutable(.{
         .name = "nexis",

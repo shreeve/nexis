@@ -34,6 +34,7 @@ const intern_mod = @import("intern");
 const expand_mod = @import("expand");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
+const champ_mod = @import("champ");
 
 const Value = value_mod.Value;
 
@@ -89,6 +90,35 @@ fn formatValue(v: Value, interner: *const intern_mod.Interner, writer: anytype) 
             }
             try writer.writeAll("]");
         },
+        .persistent_map => {
+            // Phase 3.1: print as {k1 v1, k2 v2}. Empty as {}.
+            // Iteration order is implementation-defined for
+            // CHAMP; for deterministic test output, a stable
+            // key-sorted printer can come later.
+            try writer.writeAll("{");
+            var it = champ_mod.mapIter(v);
+            var first = true;
+            while (it.next()) |entry| {
+                if (!first) try writer.writeAll(", ");
+                first = false;
+                try formatValue(entry.key, interner, writer);
+                try writer.writeAll(" ");
+                try formatValue(entry.value, interner, writer);
+            }
+            try writer.writeAll("}");
+        },
+        .persistent_set => {
+            // Phase 3.1: print as #{a b c}. Empty as #{}.
+            try writer.writeAll("#{");
+            var it = champ_mod.setIter(v);
+            var first = true;
+            while (it.next()) |elem| {
+                if (!first) try writer.writeAll(" ");
+                first = false;
+                try formatValue(elem, interner, writer);
+            }
+            try writer.writeAll("}");
+        },
         else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),
     }
 }
@@ -123,12 +153,14 @@ const Usage =
     \\  exceptions: (try body (catch any e handler) [(finally ...)])
     \\              (throw value)
     \\
-    \\Phase 3.0 surface (also shipped):
+    \\Phase 3.0 + 3.1 surface (also shipped):
     \\  - `nexis repl` interactive eval
     \\  - `#(...)` anon-fn shorthand with %, %1..%N, %&
     \\  - try/catch can now catch recoverable VM errors as
     \\    keywords: :kind-mismatch, :unbound-var, :arity-mismatch,
     \\    :not-callable, :integer-overflow
+    \\  - collection literals: [vectors], {maps}, #{sets}
+    \\    + quoted forms of all three
     \\
     \\Limitations (post-v1):
     \\  - recur-in-try: not supported (wrap try around loop)

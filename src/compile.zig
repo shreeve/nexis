@@ -146,6 +146,17 @@ pub const Tiny = union(enum) {
     /// allocation pattern as `list_construct`; backend emits
     /// `coll:vector`.
     vector_construct: []const *const Tiny,
+    /// Phase 3.1: runtime map construction. IR for the
+    /// `#%map` special form + bare `{...}` literals. Items
+    /// are flat k,v,k,v,... pairs (length MUST be even at
+    /// build time — compiler guarantees this). Backend emits
+    /// `coll:map`; duplicate keys overwrite earlier (Clojure
+    /// semantics).
+    map_construct: []const *const Tiny,
+    /// Phase 3.1: runtime set construction. IR for `#%set`
+    /// + bare `#{...}` literals. Duplicates collapse at
+    /// runtime via `champ.setConj`.
+    set_construct: []const *const Tiny,
     /// Step #9.1 (peer-AI turn 59): try / catch. v1 = catch-any
     /// only; finally and other type matchers deferred to #9.2/
     /// later. body and handler are each implicit-do; binding is
@@ -1148,13 +1159,42 @@ fn lowerFormEnv(
             const v = interner.internKeywordValue(name.name) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
-        // -- Compound datums: land in later #7 sub-steps. --
-        // Phase 1 numeric literals beyond fixnum.
+        // -- Phase 1 numeric literals beyond fixnum: defer. --
         .real, .char, .string => return CompileError.UnsupportedFeature,
-        // Vectors/maps/sets as expressions: collection literals.
-        // Land in a later step when collection-value construction
-        // is wired (compile-time call into coll/{champ,vector}).
-        .vector, .map, .set => return CompileError.UnsupportedFeature,
+        // Phase 3.1: `{k1 v1 k2 v2 ...}` as an expression →
+        // each key + value is a normal expression, evaluated
+        // left-to-right (peer-AI turn 65 §4). The runtime
+        // map-builder fires after all are evaluated; duplicate
+        // keys keep the LATER value.
+        .map => |items| blk: {
+            if (items.len % 2 != 0) return CompileError.MalformedForm;
+            const tiny_items = try allocator.alloc(*const Tiny, items.len);
+            for (items, 0..) |item, i| {
+                tiny_items[i] = try lowerFormEnv(allocator, item, ctx);
+            }
+            break :blk try allocTiny(allocator, .{ .map_construct = tiny_items });
+        },
+        // Phase 3.1: `#{a b c}` as an expression. Each element
+        // is a normal expression; duplicates collapse at
+        // runtime via `champ.setConj`.
+        .set => |items| blk: {
+            const tiny_items = try allocator.alloc(*const Tiny, items.len);
+            for (items, 0..) |item, i| {
+                tiny_items[i] = try lowerFormEnv(allocator, item, ctx);
+            }
+            break :blk try allocTiny(allocator, .{ .set_construct = tiny_items });
+        },
+        // Vectors as expressions: was deferred pre-3.1 but
+        // collections of homogeneous semantics with maps/sets
+        // — implement here for completeness (peer-AI turn 65
+        // §1: scope to runtime literals, not stdlib helpers).
+        .vector => |items| blk: {
+            const tiny_items = try allocator.alloc(*const Tiny, items.len);
+            for (items, 0..) |item, i| {
+                tiny_items[i] = try lowerFormEnv(allocator, item, ctx);
+            }
+            break :blk try allocTiny(allocator, .{ .vector_construct = tiny_items });
+        },
         // Reader macros / meta.
         .quote => |inner| try lowerQuotePayload(allocator, inner, ctx),
         .syntax_quote, .unquote, .unquote_splicing => return CompileError.UnsupportedFeature,
@@ -1210,6 +1250,8 @@ fn lowerList(
         if (std.mem.eql(u8, name, "#%list")) return try lowerInternalList(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "#%concat")) return try lowerInternalConcat(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "#%vector")) return try lowerInternalVector(allocator, items[1..], ctx);
+        if (std.mem.eql(u8, name, "#%map")) return try lowerInternalMap(allocator, items[1..], ctx);
+        if (std.mem.eql(u8, name, "#%set")) return try lowerInternalSet(allocator, items[1..], ctx);
         // Binding forms (step #7c).
         if (std.mem.eql(u8, name, "let*")) return try lowerLetStar(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "loop*")) return try lowerLoopStar(allocator, items[1..], ctx);
@@ -1329,6 +1371,32 @@ fn lowerInternalVector(
     return try allocTiny(allocator, .{ .vector_construct = tiny_items });
 }
 
+/// Phase 3.1: lower `(#%map k1 v1 k2 v2 ...)`. Args MUST be
+/// even (compiler raises MalformedForm otherwise; the runtime
+/// also enforces). Backend: coll:map → champ.mapAssoc per pair.
+fn lowerInternalMap(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    ctx: LowerCtx,
+) CompileError!*Tiny {
+    if (args.len % 2 != 0) return CompileError.MalformedForm;
+    const tiny_items = try allocator.alloc(*const Tiny, args.len);
+    for (args, 0..) |a, i| tiny_items[i] = try lowerFormEnv(allocator, a, ctx);
+    return try allocTiny(allocator, .{ .map_construct = tiny_items });
+}
+
+/// Phase 3.1: lower `(#%set a b c)`. Duplicates collapse at
+/// runtime via `champ.setConj`. Backend: coll:set.
+fn lowerInternalSet(
+    allocator: std.mem.Allocator,
+    args: []const *reader_mod.Form,
+    ctx: LowerCtx,
+) CompileError!*Tiny {
+    const tiny_items = try allocator.alloc(*const Tiny, args.len);
+    for (args, 0..) |a, i| tiny_items[i] = try lowerFormEnv(allocator, a, ctx);
+    return try allocTiny(allocator, .{ .set_construct = tiny_items });
+}
+
 /// Shared implementation for `(quote x)` and the reader-macro
 /// `'x` (which the reader emits as `Datum.quote`).
 ///
@@ -1391,9 +1459,28 @@ fn lowerQuotePayload(
             }
             break :blk try allocTiny(allocator, .{ .vector_construct = tiny_items });
         },
-        // Quoted strings, chars, reals, map/set: defer.
-        // Per peer-AI turn 58 §D10: map/set literals need
-        // stdlib-aware lowering in Phase 3.
+        // Phase 3.1: quoted compound map. Items are k,v,k,v...
+        // recursively quote-lowered. The reader ensures even
+        // arity for `{...}` source syntax; defensive check
+        // here in case a synthesized map form sneaks in.
+        .map => |items| blk: {
+            if (items.len % 2 != 0) return CompileError.MalformedForm;
+            const tiny_items = try allocator.alloc(*const Tiny, items.len);
+            for (items, 0..) |item, i| {
+                tiny_items[i] = try lowerQuotePayload(allocator, item, ctx);
+            }
+            break :blk try allocTiny(allocator, .{ .map_construct = tiny_items });
+        },
+        // Phase 3.1: quoted compound set. Duplicate elements
+        // collapse via runtime `champ.setConj`.
+        .set => |items| blk: {
+            const tiny_items = try allocator.alloc(*const Tiny, items.len);
+            for (items, 0..) |item, i| {
+                tiny_items[i] = try lowerQuotePayload(allocator, item, ctx);
+            }
+            break :blk try allocTiny(allocator, .{ .set_construct = tiny_items });
+        },
+        // Quoted strings, chars, reals: defer.
         else => return CompileError.UnsupportedFeature,
     };
 }
@@ -2253,6 +2340,8 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
         .list_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
         .concat => |items| for (items) |it| try freeVars(allocator, it, env, out),
         .vector_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
+        .map_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
+        .set_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
         .try_ => |t| {
             try freeVars(allocator, t.body, env, out);
             var handler_env: NameSet = .{};
@@ -2427,6 +2516,8 @@ fn capturedByDescendantFns(
         .list_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
         .concat => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
         .vector_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
+        .map_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
+        .set_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
         .try_ => |t| {
             try capturedByDescendantFns(allocator, t.body, env, out);
             var handler_env: NameSet = .{};
@@ -2494,6 +2585,8 @@ fn compileExpr(
         .list_construct => |items| try compileListConstruct(e, items, dst),
         .concat => |items| try compileConcat(e, items, dst),
         .vector_construct => |items| try compileVectorConstruct(e, items, dst),
+        .map_construct => |items| try compileMapConstruct(e, items, dst),
+        .set_construct => |items| try compileSetConstruct(e, items, dst),
         .try_ => |t| try compileTry(e, t.body, t.binding, t.handler, t.finally_, dst),
         .throw_ => |value| try compileThrow(e, value, dst),
         .add => |a| try compileAdd(e, a.lhs, a.rhs, dst),
@@ -2596,6 +2689,47 @@ fn compileVectorConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) Com
         try compileExpr(e, item, slot, null);
     }
     try e.emit(vm.asm_.collVector(arg_base, argc, dst));
+}
+
+/// Phase 3.1: compile `#%map`. Items are flat k,v,k,v,... so
+/// length MUST be even (compiler enforces; runtime would
+/// reject as BytecodeCorruption otherwise). Backend emits
+/// `coll:map` which iterates pairs through `champ.mapAssoc`.
+fn compileMapConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
+    if (items.len % 2 != 0) return CompileError.MalformedForm;
+    if (items.len == 0) {
+        try e.emit(vm.asm_.collMap(dst, 0, dst));
+        return;
+    }
+    const argc: u12 = if (items.len <= std.math.maxInt(u12))
+        @intCast(items.len)
+    else
+        return CompileError.SlotOverflow;
+    const arg_base = try e.allocSlotBlock(argc);
+    for (items, 0..) |item, i| {
+        const slot: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
+        try compileExpr(e, item, slot, null);
+    }
+    try e.emit(vm.asm_.collMap(arg_base, argc, dst));
+}
+
+/// Phase 3.1: compile `#%set`. Same shape as `#%list`; backend
+/// emits `coll:set` which de-duplicates via `champ.setConj`.
+fn compileSetConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
+    if (items.len == 0) {
+        try e.emit(vm.asm_.collSet(dst, 0, dst));
+        return;
+    }
+    const argc: u12 = if (items.len <= std.math.maxInt(u12))
+        @intCast(items.len)
+    else
+        return CompileError.SlotOverflow;
+    const arg_base = try e.allocSlotBlock(argc);
+    for (items, 0..) |item, i| {
+        const slot: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
+        try compileExpr(e, item, slot, null);
+    }
+    try e.emit(vm.asm_.collSet(arg_base, argc, dst));
 }
 
 fn compileAdd(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) CompileError!void {
@@ -7520,8 +7654,62 @@ test "compile #8c.3: nested vector in quoted list" {
     try testing.expectEqual(@as(usize, 2), vec_mod.count(second));
 }
 
-test "compile #8c.3: (quote (m {})) — quoted map still UnsupportedFeature" {
-    // Map/set runtime construction is Phase 3+ stdlib work.
+// ---- Phase 3.1: maps/sets as runtime values ----------------
+
+test "compile #3.1: (quote {}) builds the empty persistent map" {
+    var r = try runSourceFull("(quote {})");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .persistent_map);
+    const cm = @import("champ");
+    try testing.expectEqual(@as(usize, 0), cm.mapCount(r.result));
+}
+
+test "compile #3.1: (quote {:a 1 :b 2}) builds 2-entry map" {
+    var r = try runSourceFull("(quote {:a 1 :b 2})");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .persistent_map);
+    const cm = @import("champ");
+    try testing.expectEqual(@as(usize, 2), cm.mapCount(r.result));
+}
+
+test "compile #3.1: runtime-computed duplicate key — later wins (Clojure semantics)" {
+    // Two map keys both evaluate to :a at runtime; the second
+    // value (2) wins. The reader catches STATIC duplicates
+    // (`{:a 1 :a 2}` → ReaderFailure) but lets computed
+    // duplicates through to runtime.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    const src = "(let* [k :a k2 :a] {k 1 k2 2})";
+    const compiled = try compileSourceFull(arena.allocator(), src, null, interner);
+    const routine = compiled.toRoutine("dup-key-runtime");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    try testing.expect(result.kind() == .persistent_map);
+    const cm = @import("champ");
+    try testing.expectEqual(@as(usize, 1), cm.mapCount(result));
+    const dispatch = @import("dispatch");
+    const kw_id = try interner.internKeyword("a");
+    const kw_val = value_mod.fromKeywordId(kw_id);
+    const looked_up = cm.mapGet(result, kw_val, &dispatch.hashValue, &dispatch.equal);
+    try testing.expect(looked_up == .present);
+    try testing.expectEqual(@as(i64, 2), looked_up.present.asFixnum());
+}
+
+test "compile #3.1: static duplicate key {:a 1 :a 2} → ReaderFailure" {
+    // The READER catches static duplicate keys with
+    // `duplicate_literal_key`. Runtime never sees this case
+    // via source literals; the "later wins" semantics applies
+    // only to runtime-computed keys.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -7530,9 +7718,94 @@ test "compile #8c.3: (quote (m {})) — quoted map still UnsupportedFeature" {
     defer v.deinit();
     const interner = v.ensureInterner();
     try testing.expectError(
-        CompileError.UnsupportedFeature,
-        compileSourceFull(arena.allocator(), "(quote {})", null, interner),
+        CompileError.ReaderFailure,
+        compileSourceFull(arena.allocator(), "{:a 1 :a 2}", null, interner),
     );
+}
+
+test "compile #3.1: (quote #{}) builds the empty persistent set" {
+    var r = try runSourceFull("(quote #{})");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .persistent_set);
+    const cm = @import("champ");
+    try testing.expectEqual(@as(usize, 0), cm.setCount(r.result));
+}
+
+test "compile #3.1: (quote #{1 2 3}) builds 3-element set" {
+    var r = try runSourceFull("(quote #{1 2 3})");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .persistent_set);
+    const cm = @import("champ");
+    try testing.expectEqual(@as(usize, 3), cm.setCount(r.result));
+}
+
+test "compile #3.1: runtime-computed duplicate elem — set collapses" {
+    // The reader catches static `#{1 1 2}` as
+    // duplicate_literal_element. Runtime sees this only via
+    // computed elements; here both elements evaluate to 1.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    const src = "(let* [a 1 b 1] #{a b 2})";
+    const compiled = try compileSourceFull(arena.allocator(), src, null, interner);
+    const routine = compiled.toRoutine("dup-elem-runtime");
+    v.frames.items[0].routine = &routine;
+    v.frames.items[0].pc = 0;
+    v.frames.items[0].slot_count = routine.slot_count;
+    if (v.stack.items.len < routine.slot_count) {
+        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
+    }
+    const result = try v.run();
+    try testing.expect(result.kind() == .persistent_set);
+    const cm = @import("champ");
+    try testing.expectEqual(@as(usize, 2), cm.setCount(result));
+}
+
+test "compile #3.1: static duplicate set elem #{1 1 2} → ReaderFailure" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    try testing.expectError(
+        CompileError.ReaderFailure,
+        compileSourceFull(arena.allocator(), "#{1 1 2}", null, interner),
+    );
+}
+
+test "compile #3.1: runtime map literal {k1 v1} — value expressions evaluated" {
+    // Demonstrate that map values can be arbitrary expressions
+    // (here: (+ 1 2)), not just literals.
+    var r = try runSourceFull("(let* [n 42] {:answer n})");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .persistent_map);
+    const cm = @import("champ");
+    try testing.expectEqual(@as(usize, 1), cm.mapCount(r.result));
+    const dispatch = @import("dispatch");
+    const kw_id = try r.vm_owned.ensureInterner().internKeyword("answer");
+    const kw_val = value_mod.fromKeywordId(kw_id);
+    const got = cm.mapGet(r.result, kw_val, &dispatch.hashValue, &dispatch.equal);
+    try testing.expect(got == .present);
+    try testing.expectEqual(@as(i64, 42), got.present.asFixnum());
+}
+
+test "compile #3.1: (quote {k {:nested :map}}) — nested quoted maps" {
+    var r = try runSourceFull("(quote {:outer {:inner 1}})");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .persistent_map);
+    const cm = @import("champ");
+    const dispatch = @import("dispatch");
+    const interner = r.vm_owned.ensureInterner();
+    const outer_id = try interner.internKeyword("outer");
+    const inner_map = cm.mapGet(r.result, value_mod.fromKeywordId(outer_id), &dispatch.hashValue, &dispatch.equal);
+    try testing.expect(inner_map == .present);
+    try testing.expect(inner_map.present.kind() == .persistent_map);
 }
 // ---- step #9.1: try / catch / throw end-to-end ----------
 

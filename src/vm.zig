@@ -72,6 +72,12 @@ const list_mod = @import("list");
 /// Like list_mod, vector_mod is a pure-allocator wrapper —
 /// no GC dependency.
 const vector_mod = @import("vector");
+/// Phase 3.1: persistent map/set (CHAMP) for `coll:map` /
+/// `coll:set` opcodes. Map/set construction requires hash +
+/// equality, so we also pull in dispatch_mod (the canonical
+/// hashValue + equal entry points per dispatch.zig docs).
+const champ_mod = @import("champ");
+const dispatch_mod = @import("dispatch");
 /// Step E1 (pre-#8 macroexpander prereq, peer-AI turn 55):
 /// the VM owns an `Interner` used by the Form-lowering layer
 /// to convert quoted symbols/keywords into stable `Value`s. The
@@ -285,6 +291,19 @@ pub const CollOp = enum(u6) {
     /// Empty vector (argc=0) via `vector_mod.empty(heap)`.
     /// Allocates via `vector_mod.fromSlice` for argc>0.
     vector = 2,
+    /// Phase 3.1: `coll:map A=arg_base B=argc C=dst` — build
+    /// a persistent map from argc slots interpreted as flat
+    /// k,v,k,v,... pairs. argc MUST be even
+    /// (BytecodeCorruption otherwise — compiler guarantees
+    /// this). Duplicate keys: later wins (Clojure semantics).
+    /// Hash + equality come from dispatch.hashValue +
+    /// dispatch.equal.
+    map = 3,
+    /// Phase 3.1: `coll:set A=arg_base B=argc C=dst` — build
+    /// a persistent set from argc slot values. Duplicates
+    /// collapse (set semantics). Same hash/eq machinery as
+    /// `coll:map`.
+    set = 4,
     _,
 };
 
@@ -2016,6 +2035,8 @@ pub const VM = struct {
             .list => try self.execCollList(inst),
             .concat => try self.execCollConcat(inst),
             .vector => try self.execCollVector(inst),
+            .map => try self.execCollMap(inst),
+            .set => try self.execCollSet(inst),
             _ => return VmError.BytecodeCorruption,
         }
     }
@@ -2146,6 +2167,78 @@ pub const VM = struct {
         // can collect once GC integrates; the temp elems slice
         // must be rooted during the build.
         const result = vector_mod.fromSlice(heap, elems.items) catch return VmError.OutOfMemory;
+        try self.store(.{ .kind = .slot, .index = dst }, result);
+    }
+
+    /// `coll:map A=arg_base B=argc C=dst` — build a persistent
+    /// map from argc slot values interpreted as flat k,v,k,v,...
+    /// pairs. argc MUST be even. Iterates left-to-right calling
+    /// `champ.mapAssoc`; later duplicate keys overwrite earlier
+    /// (Clojure semantics, peer-AI turn 65 §2). Phase 3.1.
+    fn execCollMap(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
+        const arg_base: u12 = inst.a.index;
+        const argc: u12 = inst.b.index;
+        const dst: u12 = inst.c.index;
+
+        if (argc % 2 != 0) return VmError.BytecodeCorruption;
+
+        const frame = self.currentFrame();
+        const last_arg_slot: u32 = @as(u32, arg_base) + @as(u32, argc);
+        if (last_arg_slot > frame.slot_count) return VmError.OperandOutOfRange;
+
+        const heap = self.ensureHeap();
+        var result = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+        // GC TODO (peer-AI turn 58 §D3): each mapAssoc may
+        // collect; partial result must be a root once GC
+        // integrates. Arena-backed for Phase 2/3.
+        var i: usize = 0;
+        while (i < argc) : (i += 2) {
+            const k_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
+            const v_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i + 1)));
+            const k = (try self.slotPtr(k_idx)).*;
+            const v = (try self.slotPtr(v_idx)).*;
+            result = champ_mod.mapAssoc(
+                heap,
+                result,
+                k,
+                v,
+                &dispatch_mod.hashValue,
+                &dispatch_mod.equal,
+            ) catch return VmError.OutOfMemory;
+        }
+        try self.store(.{ .kind = .slot, .index = dst }, result);
+    }
+
+    /// `coll:set A=arg_base B=argc C=dst` — build a persistent
+    /// set from argc slot values. Duplicates collapse (set
+    /// semantics, peer-AI turn 65 §3). Phase 3.1.
+    fn execCollSet(self: *VM, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
+        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
+        const arg_base: u12 = inst.a.index;
+        const argc: u12 = inst.b.index;
+        const dst: u12 = inst.c.index;
+
+        const frame = self.currentFrame();
+        const last_arg_slot: u32 = @as(u32, arg_base) + @as(u32, argc);
+        if (last_arg_slot > frame.slot_count) return VmError.OperandOutOfRange;
+
+        const heap = self.ensureHeap();
+        var result = champ_mod.setEmpty(heap) catch return VmError.OutOfMemory;
+        var i: usize = 0;
+        while (i < argc) : (i += 1) {
+            const arg_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
+            const v = (try self.slotPtr(arg_idx)).*;
+            result = champ_mod.setConj(
+                heap,
+                result,
+                v,
+                &dispatch_mod.hashValue,
+                &dispatch_mod.equal,
+            ) catch return VmError.OutOfMemory;
+        }
         try self.store(.{ .kind = .slot, .index = dst }, result);
     }
 
@@ -2705,6 +2798,30 @@ pub const asm_ = struct {
         return Inst.primary(
             .coll,
             CollOp.vector,
+            Operand.slot(arg_base),
+            .{ .kind = .unused, .index = argc },
+            Operand.slot(dst),
+        );
+    }
+
+    /// coll:map arg_base argc dst  ; slot[dst] := persistent map
+    /// from argc/2 k,v pairs (argc MUST be even). Phase 3.1.
+    pub fn collMap(arg_base: u12, argc: u12, dst: u12) Inst {
+        return Inst.primary(
+            .coll,
+            CollOp.map,
+            Operand.slot(arg_base),
+            .{ .kind = .unused, .index = argc },
+            Operand.slot(dst),
+        );
+    }
+
+    /// coll:set arg_base argc dst  ; slot[dst] := persistent set
+    /// from argc slot values (duplicates collapse). Phase 3.1.
+    pub fn collSet(arg_base: u12, argc: u12, dst: u12) Inst {
+        return Inst.primary(
+            .coll,
+            CollOp.set,
             Operand.slot(arg_base),
             .{ .kind = .unused, .index = argc },
             Operand.slot(dst),
