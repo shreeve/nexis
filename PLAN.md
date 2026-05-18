@@ -811,7 +811,7 @@ Stage boundaries are **strict**. A fresh implementation session must not let wor
 
 1. **Parser** (generated from `nexis.grammar`): source → raw `Sexp` tree with `.src` spans. Pure lexer + LALR(1). No semantic logic.
 2. **Reader / normalizer** (`src/reader.zig`): raw `Sexp` → canonical `Form` tree (Appendix C §28.2). Attaches origin + user metadata. Normalizes metadata sugar (`^:kw` → `{:kw true}`, merges multiple metas). Lowers `#(...)` to `(#%anon-fn body)`. Emits `(syntax-quote f)` markers *without* expansion. Discards `#_` forms. Rejects duplicate statically-detectable literal map/set keys, odd map arity, nested anon-fn, bare unquote outside syntax-quote.
-3. **Macroexpander** (`src/macroexpand.zig`): canonical `Form` → expanded `Form`. Looks up macros in the current namespace's Var table. **Expands `syntax-quote` forms** (auto-qualification, auto-gensym, unquote/splice handling) as an early sub-pass. **Resolves `(#%anon-fn body)`** to `(fn* [%1 %2 ...] body)` by scanning for positional-arg symbols. Expands user macros outermost-first, to fixpoint, with `&form` and `&env` injected. Recursion limit enforced.
+3. **Macroexpander** (`src/expand.zig`): canonical `Form` → expanded `Form`. Looks up macros in the current namespace's Var table. **Expands `syntax-quote` forms** (auto-qualification, auto-gensym, unquote/splice handling) as an early sub-pass. **Resolves `(#%anon-fn body)`** to `(fn* [%1 %2 ...] body)` by scanning for positional-arg symbols. Expands user macros outermost-first, to fixpoint, with `&form` and `&env` injected. Recursion limit enforced.
 4. **Resolver** (`src/resolve.zig`): expanded `Form` → `Resolved` AST. Binds each symbol reference to one of: local slot, upvalue, Var handle, special form, or error (unbound). Detects shadowing. Resolution order: **special form → lexical local (let/fn/loop binding) → namespace-qualified → alias-qualified → current-namespace mapping**.
 5. **Analyzer** (`src/analyze.zig`): `Resolved` → `IR`. Assigns slots, identifies closures/upvalues, marks tail positions, folds constants, lifts literals to the pool.
 6. **Codegen** (`src/compile.zig`): `IR` → bytecode. Emits 64-bit instructions, per-function literal/var tables, source maps.
@@ -1934,7 +1934,7 @@ Each phase has a crisp entry criterion (previous gate passed) and exit criterion
 ### Phase 3 — Macros, namespaces, REPL (weeks 15–18)
 
 - [ ] `src/namespace.zig`: Namespace, Var cell, unbound marker, revision counter.
-- [ ] `src/macroexpand.zig`: fixpoint expander.
+- [ ] `src/expand.zig`: fixpoint expander.
 - [ ] `src/syntax_quote.zig`: syntax-quote, auto-gensym.
 - [ ] `src/repl.zig`: interactive shell (adapted from em).
 - [ ] `src/dynamic.zig`: dynamic binding stack.
@@ -2399,7 +2399,7 @@ A fresh implementation session **must** respect these stage boundaries:
 |---|---|---|---|
 | **Parser** (nexus-generated, `src/parser.zig`) | source text | raw `Sexp` tree with `.src` spans | Tokenization + LALR(1) parse. No semantic validation beyond grammar. No normalization. |
 | **Reader / normalizer** (`src/reader.zig`) | raw `Sexp` | canonical `Form` tree | Wraps each Sexp into a Form. Attaches source spans. Normalizes metadata sugar → map form. Lowers `#(...)` → `(#%anon-fn ...)`. Emits `(syntax-quote f)` markers. Discards `#_` forms. Rejects duplicate literal keys / odd map arity / nested anon-fn / bare unquote. |
-| **Macroexpander** (`src/macroexpand.zig`) | canonical `Form` | expanded `Form` | Expands macros to fixpoint. Expands `syntax-quote` forms (auto-qualifies symbols, auto-gensym `x#`, handles unquote/splice). Resolves `#%anon-fn` to `(fn* [%1 %2 ...] body)`. Passes `&form` and `&env` to user macros. |
+| **Macroexpander** (`src/expand.zig`) | canonical `Form` | expanded `Form` | Expands macros to fixpoint. Expands `syntax-quote` forms (auto-qualifies symbols, auto-gensym `x#`, handles unquote/splice). Resolves `#%anon-fn` to `(fn* [%1 %2 ...] body)`. Passes `&form` and `&env` to user macros. |
 | **Resolver** (`src/resolve.zig`) | expanded `Form` | `Resolved` AST | Symbols → slot / upvalue / var handle / special form. Errors on unbound. |
 
 **Important**: `syntax-quote` expansion happens in the **macroexpander**, not the reader. The reader only marks syntax-quoted forms with the `(syntax-quote f)` tag. This lets tooling inspect raw reader output without losing the backtick-form structure.

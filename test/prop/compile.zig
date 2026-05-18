@@ -24,7 +24,7 @@ const vm = @import("vm");
 const compile = @import("compile");
 const intern_mod = @import("intern");
 const reader_mod = @import("reader");
-const macroexpand_mod = @import("macroexpand");
+const expand_mod = @import("expand");
 const list_mod = @import("list");
 
 const testing = std.testing;
@@ -48,7 +48,7 @@ fn runSource(src: []const u8) !struct { result: Value, vm_owned: vm.VM } {
     errdefer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const compiled = try compile.compileSourceFullWithMacros(
         arena.allocator(),
@@ -237,7 +237,7 @@ test "prop #4: syntax-quote ≡ quote for splice-free shapes" {
         defer v.deinit();
         const ns = v.ensureNamespace();
         const interner = v.ensureInterner();
-        var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+        var host_macros = try expand_mod.defaultMacros(testing.allocator);
         defer host_macros.deinit(testing.allocator);
 
         const q_compiled = try compile.compileSourceFullWithMacros(

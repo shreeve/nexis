@@ -4,7 +4,7 @@
 //! produces the canonical `Form` tree documented in `docs/FORMS.md`. All
 //! normalization rules from PLAN §28.3 / FORMS.md §3 are enforced here;
 //! anything that requires namespace resolution or macro context is left for
-//! later stages (`src/macroexpand.zig`, `src/resolve.zig`).
+//! later stages (`src/expand.zig`, `src/resolve.zig`).
 //!
 //! Phase 0 scope:
 //!   - Parse atom text into typed datums (int, real, char, string, kw, sym).

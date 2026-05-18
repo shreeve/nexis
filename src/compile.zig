@@ -71,11 +71,14 @@ const reader_mod = @import("reader");
 /// symbols/keywords through the VM's shared Interner so identity
 /// is stable across compile + runtime + (post-#8) macroexpand.
 const intern_mod = @import("intern");
-/// Step #8a: Form → Form macroexpander. Optional — if a
-/// `*HostMacroTable` is passed to `compileFormFull` /
-/// `compileSourceFull`, the form is expanded BEFORE lowering.
-/// With null, no expansion fires (existing behavior preserved).
-const macroexpand_mod = @import("macroexpand");
+/// Step #8a: Form → Form expander (was expand_mod;
+/// renamed in turn 63 since the module does more than
+/// macros — syntax-quote, anon-fn, #%list/#%concat/#%vector
+/// dispatch all live here). Optional — if a `*HostMacroTable`
+/// is passed to `compileFormFull` / `compileSourceFull`, the
+/// form is expanded BEFORE lowering. With null, no expansion
+/// fires (existing behavior preserved).
+const expand_mod = @import("expand");
 
 pub const Inst = vm.Inst;
 pub const Routine = vm.Routine;
@@ -1924,7 +1927,7 @@ pub fn compileFormFull(
 ///
 /// If `host_macros` is non-null AND `interner` is non-null,
 /// the form is run through the macroexpander BEFORE lowering.
-/// Macro errors are bucketed per `MacroexpandError`:
+/// Macro errors are bucketed per `ExpandError`:
 ///   ExpansionDepthExceeded → CompileError.MacroDepthExceeded
 ///   everything else        → CompileError.MacroExpansionFailure
 ///
@@ -1938,7 +1941,7 @@ pub fn compileFormFullWithMacros(
     form: *const reader_mod.Form,
     namespace: ?*vm.Namespace,
     interner: ?*intern_mod.Interner,
-    host_macros: ?*const macroexpand_mod.HostMacroTable,
+    host_macros: ?*const expand_mod.HostMacroTable,
 ) CompileError!Compiled {
     return compileFormFullWithMacrosSpan(allocator, form, namespace, interner, host_macros, null);
 }
@@ -1955,20 +1958,20 @@ pub fn compileFormFullWithMacrosSpan(
     form: *const reader_mod.Form,
     namespace: ?*vm.Namespace,
     interner: ?*intern_mod.Interner,
-    host_macros: ?*const macroexpand_mod.HostMacroTable,
+    host_macros: ?*const expand_mod.HostMacroTable,
     out_span: ?*?reader_mod.SrcSpan,
 ) CompileError!Compiled {
     var working_form: *const reader_mod.Form = form;
     if (interner != null) {
-        const empty_table: macroexpand_mod.HostMacroTable = .{};
-        const table_to_use: *const macroexpand_mod.HostMacroTable =
+        const empty_table: expand_mod.HostMacroTable = .{};
+        const table_to_use: *const expand_mod.HostMacroTable =
             host_macros orelse &empty_table;
-        var mctx = macroexpand_mod.MacroexpandContext{
+        var mctx = expand_mod.ExpandContext{
             .allocator = allocator,
             .interner = interner.?,
             .host_macros = table_to_use,
         };
-        working_form = macroexpand_mod.expandForm(&mctx, null, form) catch |err| switch (err) {
+        working_form = expand_mod.expandForm(&mctx, null, form) catch |err| switch (err) {
             error.ExpansionDepthExceeded => {
                 if (out_span) |s| s.* = form.origin;
                 return CompileError.MacroDepthExceeded;
@@ -2051,7 +2054,7 @@ pub fn compileSourceFullWithMacros(
     source: []const u8,
     namespace: ?*vm.Namespace,
     interner: ?*intern_mod.Interner,
-    host_macros: ?*const macroexpand_mod.HostMacroTable,
+    host_macros: ?*const expand_mod.HostMacroTable,
 ) CompileError!Compiled {
     return compileSourceFullWithMacrosSpan(
         allocator,
@@ -2073,7 +2076,7 @@ pub fn compileSourceFullWithMacrosSpan(
     source: []const u8,
     namespace: ?*vm.Namespace,
     interner: ?*intern_mod.Interner,
-    host_macros: ?*const macroexpand_mod.HostMacroTable,
+    host_macros: ?*const expand_mod.HostMacroTable,
     out_span: ?*?reader_mod.SrcSpan,
 ) CompileError!Compiled {
     var p = reader_mod.parser.parseForm(allocator, source) catch {
@@ -6875,7 +6878,7 @@ test "compile #8a: empty macro table passes through (sanity)" {
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
     const interner = v.ensureInterner();
-    var host_macros: macroexpand_mod.HostMacroTable = .{};
+    var host_macros: expand_mod.HostMacroTable = .{};
     defer host_macros.deinit(arena.allocator());
     const compiled = try compileSourceFullWithMacros(
         arena.allocator(),
@@ -6906,14 +6909,14 @@ test "compile #8a: infinite macro loop → MacroDepthExceeded" {
 
     const Wrap = struct {
         fn loopForever(
-            _: *macroexpand_mod.MacroexpandContext,
+            _: *expand_mod.ExpandContext,
             call_form: *const reader_mod.Form,
             _: []const *reader_mod.Form,
-        ) macroexpand_mod.MacroexpandError!*reader_mod.Form {
+        ) expand_mod.ExpandError!*reader_mod.Form {
             return @constCast(call_form);
         }
     };
-    var host_macros: macroexpand_mod.HostMacroTable = .{};
+    var host_macros: expand_mod.HostMacroTable = .{};
     defer host_macros.deinit(arena.allocator());
     try host_macros.put(arena.allocator(), "boom", Wrap.loopForever);
 
@@ -6944,7 +6947,7 @@ fn runSourceWithDefaultMacros(src: []const u8) !struct { result: value_mod.Value
     errdefer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("p");
@@ -7032,7 +7035,7 @@ test "compile #8b: (when) malformed → MacroExpansionFailure" {
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     try testing.expectError(
         CompileError.MacroExpansionFailure,
@@ -7081,7 +7084,7 @@ test "compile #8b: (and falsy ...) uses gensym (no double-eval on falsy)" {
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
 
     const src =
@@ -7170,7 +7173,7 @@ test "compile #8b: (or expr ...) uses gensym (no double-eval)" {
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
 
     const src =
@@ -7226,7 +7229,7 @@ test "compile #8b: (cond odd-args) → MacroExpansionFailure" {
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     try testing.expectError(
         CompileError.MacroExpansionFailure,
@@ -7496,7 +7499,7 @@ test "compile #8c.3: syntax-quoted vector + splice → MacroExpansionFailure" {
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     try testing.expectError(
         CompileError.MacroExpansionFailure,
@@ -7568,7 +7571,7 @@ test "compile #9.1: catch body's own throw NOT re-caught by same handler" {
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const compiled = try compileSourceFullWithMacros(
         arena.allocator(),
@@ -7598,7 +7601,7 @@ test "compile #9.1: unhandled top-level throw → UncaughtThrow" {
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const compiled = try compileSourceFullWithMacros(
         arena.allocator(),
@@ -7635,7 +7638,7 @@ test "compile #9.1: try without catch or finally → MalformedForm" {
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     try testing.expectError(
         CompileError.MacroExpansionFailure,
@@ -7675,7 +7678,7 @@ test "compile #9.2: try/catch/finally — finally side effect via def" {
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const src =
         \\(do
@@ -7710,7 +7713,7 @@ test "compile #9.2: uncaught throw — finally runs then throw propagates" {
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     // Note: a try with finally but no catch isn't supported by
     // the v1 grammar (we require catch). So we use catch that
@@ -7755,7 +7758,7 @@ test "compile #9.2: throw inside finally replaces pending value" {
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const src =
         \\(try
@@ -7789,7 +7792,7 @@ test "compile #9.2: finally body runs on caught-throw exit" {
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const src =
         \\(do
@@ -7820,7 +7823,7 @@ test "compile #9.1: non-any matcher → UnsupportedFeature" {
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     try testing.expectError(
         CompileError.UnsupportedFeature,
@@ -7854,7 +7857,7 @@ test "compile #9.1: handler stack doesn't leak across normal exits" {
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const compiled = try compileSourceFullWithMacros(
         arena.allocator(),
@@ -7883,7 +7886,7 @@ test "compile #10.0: out_span set on macro expansion failure" {
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
 
     var span: ?reader_mod.SrcSpan = null;
@@ -7911,7 +7914,7 @@ test "compile #10.0: out_span on malformed if" {
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     var span: ?reader_mod.SrcSpan = null;
     const result = compileSourceFullWithMacrosSpan(
@@ -7936,7 +7939,7 @@ test "compile #10.0: legacy compileSourceFullWithMacros API still works (backwar
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const result = compileSourceFullWithMacros(
         arena.allocator(),

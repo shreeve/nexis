@@ -39,7 +39,7 @@ namespace via refer/alias/require, runtime VM-error catchability.
   file, compiles + runs each top-level form, prints the final
   result. Three working examples ship: `examples/hello.nx`,
   `sum10.nx`, `forward-ref.nx`.
-- **Macroexpander scaffold landed** (step #8a). `MacroexpandContext`
+- **Macroexpander scaffold landed** (step #8a). `ExpandContext`
   + `HostMacroTable` + per-special-form traversal walker + depth
   limit + lexical-shadowing-aware macro dispatch. With an empty
   table (current default), the expander is a pure pass-through.
@@ -763,7 +763,7 @@ REPO CLEANUP DONE THIS PHASE (peer-AI turn 52 POLS audit):
       consolidated to ZIG-0.16.0.md.
 
 REFACTORS LIKELY DURING #8+:
-  [ ] src/macroexpand.zig  new module; recursive-to-fixed-point
+  [ ] src/expand.zig  new module; recursive-to-fixed-point
                            macro expander. Will sit between
                            src/reader.zig and src/compile.zig.
                            Per CLOJURE-REVIEW.md §1.1 two-stage
@@ -1012,7 +1012,7 @@ Each of those is bounded; user picks priority.
 ### Active design surface for next-AI
 
 The Phase 2 architecture is settled. Tiny IR + LowerCtx +
-MacroexpandContext + VM's group-based opcode dispatch are
+ExpandContext + VM's group-based opcode dispatch are
 all stable interfaces. Phase 3 work BUILDS on this without
 reshaping.
 

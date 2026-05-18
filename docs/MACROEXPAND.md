@@ -48,7 +48,7 @@ are **host-Zig callback functions**. There is no user-defined
 `defmacro` in step #8.
 
 ```zig
-pub const MacroexpandContext = struct {
+pub const ExpandContext = struct {
     allocator: std.mem.Allocator,
     interner: *intern_mod.Interner,
     /// Monotonic counter for auto-gensym. Per peer-AI turn 56:
@@ -60,10 +60,10 @@ pub const MacroexpandContext = struct {
 };
 
 pub const MacroFn = *const fn (
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const reader.Form,    // the (when x y) form being expanded
     args: []const *reader.Form,        // the args after the head: [x, y]
-) MacroexpandError!*reader.Form;       // returns the rewritten form
+) ExpandError!*reader.Form;       // returns the rewritten form
 ```
 
 The context bundle (peer-AI turn 56 §1.2) is mandatory — `or`
@@ -338,7 +338,7 @@ referenced within the scope reuses the mapped value; first
 reference allocates a new entry.
 
 Gensym name format: `<base>__<counter>__auto__`. Counter lives
-on `MacroexpandContext.gensym_next` (peer-AI turn 56 §1.4 +
+on `ExpandContext.gensym_next` (peer-AI turn 56 §1.4 +
 §5: NOT the VM — macroexpand runs before VM execution and may
 run without a VM at all). The context is reused across all
 top-level forms in one compilation unit so gensyms remain
@@ -420,7 +420,7 @@ const MAX_EXPANSION_DEPTH: u32 = 256; // matches Clojure
 ```
 
 Each recursive expansion of a form increments a depth counter.
-If depth exceeds the limit, raise `MacroexpandError.ExpansionDepthExceeded`.
+If depth exceeds the limit, raise `ExpandError.ExpansionDepthExceeded`.
 This catches infinite macro loops:
 
 ```clojure
@@ -454,14 +454,14 @@ path is wired alongside macros).
 
 ---
 
-## 8. CompileError vs MacroexpandError
+## 8. CompileError vs ExpandError
 (peer-AI turn 56 §1.7 chose Option B — distinct depth error)
 
-The `MacroexpandError` internal error type is rich; for v1 it
+The `ExpandError` internal error type is rich; for v1 it
 maps to TWO CompileError variants:
 
 ```zig
-pub const MacroexpandError = error{
+pub const ExpandError = error{
     ExpansionDepthExceeded,     // → CompileError.MacroDepthExceeded
     MacroReturnedNonForm,       // → CompileError.MacroExpansionFailure
     MalformedMacroCall,         // → CompileError.MacroExpansionFailure
@@ -496,7 +496,7 @@ For step #8a (scaffold):
 
 | Variant | When |
 |---|---|
-| `MacroExpansionFailure` | Bucketed wrapper for any MacroexpandError |
+| `MacroExpansionFailure` | Bucketed wrapper for any ExpandError |
 | `MacroDepthExceeded` | Specific case (worth distinct so users can recognize infinite loops) |
 
 The existing `MalformedForm` / `ExpectedSymbol` / `ExpectedVector`
@@ -524,7 +524,7 @@ pub const FormBuilder = struct {
     pub fn vector(self: *FormBuilder, items: []const *Form, origin: SrcSpan) !*Form;
     pub fn quote(self: *FormBuilder, payload: *Form, origin: SrcSpan) !*Form;
     /// Step #8c: gensym-mapped symbol for auto-gensym output.
-    pub fn gensym(self: *FormBuilder, base: []const u8, ctx: *MacroexpandContext, origin: SrcSpan) ![]const u8;
+    pub fn gensym(self: *FormBuilder, base: []const u8, ctx: *ExpandContext, origin: SrcSpan) ![]const u8;
 };
 ```
 
@@ -538,9 +538,9 @@ needs runtime construction support so it lands separately.)
 
 ### #8a: Macroexpand scaffold + no-op traversal + special-form boundaries
 
-- New `src/macroexpand.zig` module.
-- `MacroexpandContext`, `HostMacroTable`, `MacroFn`,
-  `MacroexpandError` types per §1.
+- New `src/expand.zig` module.
+- `ExpandContext`, `HostMacroTable`, `MacroFn`,
+  `ExpandError` types per §1.
 - `pub fn expandForm(ctx, env, depth, form) → *Form`.
 - Recursive walk per §2b's per-form rules. `quote` and
   `syntax_quote` BOTH opaque in #8a (syntax_quote lands at
@@ -674,8 +674,8 @@ write their own. Phase 3 deliverable, after stdlib bootstrap.
   pattern for macro shadowing; #8a-c sub-step plan.
 - **2026-05-17** (peer-AI turn 56 review pass — 11 spec edits
   applied BEFORE coding):
-  1. MacroFn takes `*MacroexpandContext`, not flat params.
-  2. Gensym counter lives on MacroexpandContext, not VM.
+  1. MacroFn takes `*ExpandContext`, not flat params.
+  2. Gensym counter lives on ExpandContext, not VM.
   3. Reordered #8b ↔ #8c: host macros first (direct
      FormBuilder, no runtime collection ops needed),
      syntax-quote + list/concat second.

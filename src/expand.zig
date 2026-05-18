@@ -8,8 +8,8 @@
 //! concat) build on this scaffold.
 //!
 //! What this file DOES (#8a):
-//!   - Defines `MacroexpandContext`, `MacroFn`, `HostMacroTable`,
-//!     `ExpandEnv`, `MacroexpandError`.
+//!   - Defines `ExpandContext`, `MacroFn`, `HostMacroTable`,
+//!     `ExpandEnv`, `ExpandError`.
 //!   - Implements `expandForm`: per-form-rule walker that
 //!     recognizes every Phase-2 special form, threads ExpandEnv
 //!     correctly through binding forms, and dispatches macro
@@ -47,7 +47,7 @@ const Allocator = std.mem.Allocator;
 ///   ExpansionDepthExceeded → CompileError.MacroDepthExceeded
 ///   everything else        → CompileError.MacroExpansionFailure
 ///   OutOfMemory            → CompileError.OutOfMemory
-pub const MacroexpandError = error{
+pub const ExpandError = error{
     ExpansionDepthExceeded,
     MalformedMacroCall,
     MacroReturnedNull,
@@ -59,7 +59,7 @@ pub const MacroexpandError = error{
 /// of a single compilation unit (typically one CLI invocation
 /// or one test). Reusing across forms is how auto-gensym stays
 /// monotonic within a unit.
-pub const MacroexpandContext = struct {
+pub const ExpandContext = struct {
     allocator: Allocator,
     interner: *intern_mod.Interner,
     /// Monotonic auto-gensym counter (peer-AI turn 56 §1.4 +
@@ -78,7 +78,7 @@ pub const MacroexpandContext = struct {
     /// Lifetime: the returned slice lives in `ctx.allocator`,
     /// which is the macroexpand arena (typically the same as
     /// the compile arena). The caller does NOT free.
-    pub fn gensym(self: *MacroexpandContext, base: []const u8) MacroexpandError![]const u8 {
+    pub fn gensym(self: *ExpandContext, base: []const u8) ExpandError![]const u8 {
         const counter = self.gensym_next;
         self.gensym_next += 1;
         return std.fmt.allocPrint(self.allocator, "{s}__{d}__auto__", .{ base, counter });
@@ -89,10 +89,10 @@ pub const MacroexpandContext = struct {
 /// and produces a rewritten form. The result is then re-fed to
 /// `expandForm` (so macro-of-macros works automatically).
 pub const MacroFn = *const fn (
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
-) MacroexpandError!*Form;
+) ExpandError!*Form;
 
 /// Maps unqualified symbol name → MacroFn. v1 uses an empty
 /// table by default; #8b populates with when/cond/and/or/etc.
@@ -137,10 +137,10 @@ pub const MAX_EXPANSION_DEPTH: u32 = 256;
 /// Empty `ctx.host_macros` table → output structurally identical
 /// to input.
 pub fn expandForm(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     form: *const Form,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     return expandFormDepth(ctx, env, form, 0);
 }
 
@@ -149,9 +149,9 @@ pub fn expandForm(
 /// gensym counter is reused across all forms so gensyms stay
 /// unique within the unit.
 pub fn expandProgram(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     forms: []const *Form,
-) MacroexpandError![]const *Form {
+) ExpandError![]const *Form {
     const out = try ctx.allocator.alloc(*Form, forms.len);
     for (forms, 0..) |form, i| {
         out[i] = try expandForm(ctx, null, form);
@@ -164,12 +164,12 @@ pub fn expandProgram(
 // =============================================================================
 
 fn expandFormDepth(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     form: *const Form,
     depth: u32,
-) MacroexpandError!*Form {
-    if (depth > MAX_EXPANSION_DEPTH) return MacroexpandError.ExpansionDepthExceeded;
+) ExpandError!*Form {
+    if (depth > MAX_EXPANSION_DEPTH) return ExpandError.ExpansionDepthExceeded;
 
     return switch (form.datum) {
         // ---- Leaves — pass through unchanged. -----------------
@@ -203,7 +203,7 @@ fn expandFormDepth(
         // Per peer-AI turn 58 §D9 + §"Missing trap 1": defensive
         // error. The reader catches the source-syntax case, but a
         // macro host fn could synthesize one.
-        .unquote, .unquote_splicing => return MacroexpandError.MalformedMacroCall,
+        .unquote, .unquote_splicing => return ExpandError.MalformedMacroCall,
         // ---- Reader macros / metadata. -----------------------
         // Phase 3.0b (peer-AI turn 62): `#(...)` shorthand
         // expands here. Reader emits Datum.anon_fn carrying
@@ -235,12 +235,12 @@ inline fn mutCast(form: *const Form) *Form {
 
 /// Dispatch a list form: check for special form / macro / call.
 fn expandList(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     // Empty list `()` — pass through (lowerForm catches this
     // and raises MalformedForm).
     if (items.len == 0) return mutCast(list_form);
@@ -299,13 +299,13 @@ fn expandList(
 /// Macro fires: call the host fn, then recursively expand the
 /// result (macro-of-macros termination per MACROEXPAND.md §6).
 fn invokeMacro(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     macro_fn: MacroFn,
     call_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     const args = items[1..];
     const result = try macro_fn(ctx, call_form, args);
     // Re-feed the macro output through the expander. Depth
@@ -319,44 +319,44 @@ fn invokeMacro(
 // =============================================================================
 
 fn expandIf(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     // (if test then) | (if test then else)
-    if (items.len < 3 or items.len > 4) return MacroexpandError.MalformedMacroCall;
+    if (items.len < 3 or items.len > 4) return ExpandError.MalformedMacroCall;
     return try rebuildListIfChanged(ctx, list_form, items, env, depth);
 }
 
 fn expandDo(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     return try rebuildListIfChanged(ctx, list_form, items, env, depth);
 }
 
 fn expandRecur(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     return try rebuildListIfChanged(ctx, list_form, items, env, depth);
 }
 
 fn expandOrdinaryCall(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     return try rebuildListIfChanged(ctx, list_form, items, env, depth);
 }
 
@@ -364,12 +364,12 @@ fn expandOrdinaryCall(
 /// rebuild the list ONLY if at least one item changed. Avoids
 /// unnecessary allocation when no expansion fires.
 fn rebuildListIfChanged(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     list_form: *const Form,
     items: []const *Form,
     env: ?*const ExpandEnv,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     var new_items: ?[]*Form = null;
     for (items, 0..) |item, i| {
         const expanded = try expandFormDepth(ctx, env, item, depth);
@@ -400,19 +400,19 @@ fn rebuildListIfChanged(
 // ---- let* / loop* — sequential binding scope ------------------------------
 
 fn expandLetStar(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     // (let* [n1 v1 n2 v2 ...] body...)
-    if (items.len < 2) return MacroexpandError.MalformedMacroCall;
+    if (items.len < 2) return ExpandError.MalformedMacroCall;
     const head = items[0]; // the `let*` symbol form
     const binding_form = items[1];
-    if (binding_form.datum != .vector) return MacroexpandError.MalformedMacroCall;
+    if (binding_form.datum != .vector) return ExpandError.MalformedMacroCall;
     const bindings = binding_form.datum.vector;
-    if (bindings.len % 2 != 0) return MacroexpandError.MalformedMacroCall;
+    if (bindings.len % 2 != 0) return ExpandError.MalformedMacroCall;
 
     // Walk bindings with a sequential env. Each binding's RHS
     // sees prior names (and ONLY prior, per COMPILER.md §4.3
@@ -426,7 +426,7 @@ fn expandLetStar(
     while (i < bindings.len) : (i += 2) {
         const name_form = bindings[i];
         if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) {
-            return MacroexpandError.MalformedMacroCall;
+            return ExpandError.MalformedMacroCall;
         }
         // RHS expanded under env-so-far (BEFORE name added).
         new_bindings[i] = mutCast(name_form);
@@ -455,14 +455,14 @@ fn expandLetStar(
 // ---- fn* — optional self-name + param vector + body -----------------------
 
 fn expandFnStar(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     // (fn* [params] body...) | (fn* name [params] body...)
-    if (items.len < 2) return MacroexpandError.MalformedMacroCall;
+    if (items.len < 2) return ExpandError.MalformedMacroCall;
     const head = items[0];
 
     // Detect optional self-name. If items[1] is a symbol, it's
@@ -476,9 +476,9 @@ fn expandFnStar(
         name_form = items[1];
         params_idx = 2;
     }
-    if (params_idx >= items.len) return MacroexpandError.MalformedMacroCall;
+    if (params_idx >= items.len) return ExpandError.MalformedMacroCall;
     const params_form = items[params_idx];
-    if (params_form.datum != .vector) return MacroexpandError.MalformedMacroCall;
+    if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
     const body = items[params_idx + 1 ..];
 
     // Build a child env with the self-name (if any) + param
@@ -521,17 +521,17 @@ fn expandFnStar(
 // ---- letfn* — mutually recursive named fns --------------------------------
 
 fn expandLetFnStar(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     // (letfn* [(name [params] body...) ...] body...)
-    if (items.len < 2) return MacroexpandError.MalformedMacroCall;
+    if (items.len < 2) return ExpandError.MalformedMacroCall;
     const head = items[0];
     const binding_form = items[1];
-    if (binding_form.datum != .vector) return MacroexpandError.MalformedMacroCall;
+    if (binding_form.datum != .vector) return ExpandError.MalformedMacroCall;
     const fn_entries = binding_form.datum.vector;
 
     // First pass: collect every fn name into the local env, so
@@ -540,12 +540,12 @@ fn expandLetFnStar(
     defer local.deinit(ctx.allocator);
     for (fn_entries) |entry| {
         if (entry.datum != .list or entry.datum.list.len < 2) {
-            return MacroexpandError.MalformedMacroCall;
+            return ExpandError.MalformedMacroCall;
         }
         const entry_items = entry.datum.list;
         const fn_name_form = entry_items[0];
         if (fn_name_form.datum != .symbol or fn_name_form.datum.symbol.ns != null) {
-            return MacroexpandError.MalformedMacroCall;
+            return ExpandError.MalformedMacroCall;
         }
         _ = try local.lexical_names.getOrPut(ctx.allocator, fn_name_form.datum.symbol.name);
     }
@@ -556,7 +556,7 @@ fn expandLetFnStar(
     for (fn_entries, 0..) |entry, idx| {
         const entry_items = entry.datum.list;
         const fn_params = entry_items[1];
-        if (fn_params.datum != .vector) return MacroexpandError.MalformedMacroCall;
+        if (fn_params.datum != .vector) return ExpandError.MalformedMacroCall;
         const fn_body = entry_items[2..];
 
         var fn_env: ExpandEnv = .{ .parent = &local };
@@ -596,17 +596,17 @@ fn expandLetFnStar(
 // ---- def / defn -----------------------------------------------------------
 
 fn expandDef(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     // (def name) | (def name value)
-    if (items.len < 2 or items.len > 3) return MacroexpandError.MalformedMacroCall;
+    if (items.len < 2 or items.len > 3) return ExpandError.MalformedMacroCall;
     const head = items[0];
     const name_form = items[1];
-    if (name_form.datum != .symbol) return MacroexpandError.MalformedMacroCall;
+    if (name_form.datum != .symbol) return ExpandError.MalformedMacroCall;
     if (items.len == 2) return mutCast(list_form);
     // Expand value only.
     const new_value = try expandFormDepth(ctx, env, items[2], depth);
@@ -619,19 +619,19 @@ fn expandDef(
 }
 
 fn expandDefn(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     // (defn name [params] body...)
-    if (items.len < 3) return MacroexpandError.MalformedMacroCall;
+    if (items.len < 3) return ExpandError.MalformedMacroCall;
     const head = items[0];
     const name_form = items[1];
-    if (name_form.datum != .symbol) return MacroexpandError.MalformedMacroCall;
+    if (name_form.datum != .symbol) return ExpandError.MalformedMacroCall;
     const params_form = items[2];
-    if (params_form.datum != .vector) return MacroexpandError.MalformedMacroCall;
+    if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
     const body = items[3..];
 
     // Body env = self-name + params.
@@ -666,13 +666,13 @@ fn expandDefn(
 ///   - catch's handler body expanded with outer env + BINDING
 ///   - finally body expanded with outer env (no new bindings)
 fn expandTry(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
-    if (items.len < 2) return MacroexpandError.MalformedMacroCall;
+) ExpandError!*Form {
+    if (items.len < 2) return ExpandError.MalformedMacroCall;
     const head = items[0];
 
     // Partition the args into body + clauses. Walk from the end
@@ -699,7 +699,7 @@ fn expandTry(
     }
     // At least one of catch / finally must be present.
     if (catch_form == null and finally_form == null) {
-        return MacroexpandError.MalformedMacroCall;
+        return ExpandError.MalformedMacroCall;
     }
 
     // Body (items[1..end]) expanded with outer env.
@@ -718,13 +718,13 @@ fn expandTry(
     // Expand catch clause. catch_items = [catch MATCHER BINDING handler...]
     // MATCHER and BINDING are literal symbols — pass through.
     if (catch_form) |cf| {
-        if (cf.datum.list.len < 4) return MacroexpandError.MalformedMacroCall;
+        if (cf.datum.list.len < 4) return ExpandError.MalformedMacroCall;
         const ci = cf.datum.list;
         const cf_head = ci[0];
         const matcher = ci[1];
         const binding = ci[2];
         if (binding.datum != .symbol or binding.datum.symbol.ns != null) {
-            return MacroexpandError.MalformedMacroCall;
+            return ExpandError.MalformedMacroCall;
         }
         // Build env for handler body.
         var handler_env: ExpandEnv = .{ .parent = env };
@@ -748,7 +748,7 @@ fn expandTry(
 
     // Expand finally clause if present.
     if (finally_form) |ff| {
-        if (ff.datum.list.len < 1) return MacroexpandError.MalformedMacroCall;
+        if (ff.datum.list.len < 1) return ExpandError.MalformedMacroCall;
         const fi = ff.datum.list;
         var new_finally_items: std.ArrayList(*Form) = .empty;
         defer new_finally_items.deinit(ctx.allocator);
@@ -787,12 +787,12 @@ fn expandTry(
 ///   5. Build `(fn* params body...)`.
 ///   6. Reject nested `#()` (Clojure compatibility).
 fn expandAnonFn(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     call_form: *const Form,
     items: []const *Form,
     depth: u32,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     // First pass: scan to determine arity. Also rejects nested
     // #() during the walk.
     var max_positional: u32 = 0;
@@ -855,7 +855,7 @@ fn expandAnonFn(
 /// Errors:
 ///   - nested #(...) is rejected (MalformedMacroCall)
 ///   - `%N` where N parses as 0 is rejected
-fn anonScanForm(form: *const Form, max_pos: *u32, uses_rest: *bool) MacroexpandError!void {
+fn anonScanForm(form: *const Form, max_pos: *u32, uses_rest: *bool) ExpandError!void {
     switch (form.datum) {
         .symbol => |name| {
             if (name.ns != null) return;
@@ -864,7 +864,7 @@ fn anonScanForm(form: *const Form, max_pos: *u32, uses_rest: *bool) MacroexpandE
         .list => |items| for (items) |it| try anonScanForm(it, max_pos, uses_rest),
         .vector => |items| for (items) |it| try anonScanForm(it, max_pos, uses_rest),
         // Nested #() rejection.
-        .anon_fn => return MacroexpandError.MalformedMacroCall,
+        .anon_fn => return ExpandError.MalformedMacroCall,
         // Quote payload is OPAQUE — placeholders inside (quote ...)
         // are literal data, not body references.
         .quote, .syntax_quote, .unquote, .unquote_splicing => {},
@@ -875,7 +875,7 @@ fn anonScanForm(form: *const Form, max_pos: *u32, uses_rest: *bool) MacroexpandE
 /// Inspect a symbol name for `%`, `%N`, or `%&` patterns and
 /// update the scan state. Anything else (including `%foo`)
 /// is left as an ordinary symbol — Clojure semantics.
-fn anonClassifySymbol(name: []const u8, max_pos: *u32, uses_rest: *bool) MacroexpandError!void {
+fn anonClassifySymbol(name: []const u8, max_pos: *u32, uses_rest: *bool) ExpandError!void {
     if (name.len == 0 or name[0] != '%') return;
     if (name.len == 1) {
         // bare `%` → positional 1
@@ -892,9 +892,9 @@ fn anonClassifySymbol(name: []const u8, max_pos: *u32, uses_rest: *bool) Macroex
         if (c < '0' or c > '9') return; // ordinary symbol like %foo
         const d: u32 = c - '0';
         n = n * 10 + d;
-        if (n > 1000) return MacroexpandError.MalformedMacroCall; // sanity bound
+        if (n > 1000) return ExpandError.MalformedMacroCall; // sanity bound
     }
-    if (n == 0) return MacroexpandError.MalformedMacroCall;
+    if (n == 0) return ExpandError.MalformedMacroCall;
     if (max_pos.* < n) max_pos.* = n;
 }
 
@@ -902,7 +902,7 @@ fn anonClassifySymbol(name: []const u8, max_pos: *u32, uses_rest: *bool) Macroex
 /// through unchanged. For lists/vectors, we only allocate a
 /// new node when at least one element changed (best-effort
 /// pointer-equality fast path).
-fn anonRewriteForm(ctx: *MacroexpandContext, form: *const Form) MacroexpandError!*Form {
+fn anonRewriteForm(ctx: *ExpandContext, form: *const Form) ExpandError!*Form {
     return switch (form.datum) {
         .symbol => |name| blk: {
             if (name.ns == null and name.name.len == 1 and name.name[0] == '%') {
@@ -919,11 +919,11 @@ fn anonRewriteForm(ctx: *MacroexpandContext, form: *const Form) MacroexpandError
 }
 
 fn anonRewriteList(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     list_form: *const Form,
     items: []const *Form,
     is_vector: bool,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     var changed = false;
     var rewritten: std.ArrayList(*Form) = .empty;
     defer rewritten.deinit(ctx.allocator);
@@ -968,7 +968,7 @@ fn isClauseHead(form: *const Form, name: []const u8) bool {
 // (the macroexpand arena, same as the compile arena). The
 // caller does NOT free.
 
-pub fn makeList(ctx: *MacroexpandContext, items: []*Form, origin: SrcSpan) MacroexpandError!*Form {
+pub fn makeList(ctx: *ExpandContext, items: []*Form, origin: SrcSpan) ExpandError!*Form {
     const form = try ctx.allocator.create(Form);
     form.* = .{
         .datum = .{ .list = @as([]const *Form, items) },
@@ -977,7 +977,7 @@ pub fn makeList(ctx: *MacroexpandContext, items: []*Form, origin: SrcSpan) Macro
     return form;
 }
 
-pub fn makeVector(ctx: *MacroexpandContext, items: []*Form, origin: SrcSpan) MacroexpandError!*Form {
+pub fn makeVector(ctx: *ExpandContext, items: []*Form, origin: SrcSpan) ExpandError!*Form {
     const form = try ctx.allocator.create(Form);
     form.* = .{
         .datum = .{ .vector = @as([]const *Form, items) },
@@ -991,7 +991,7 @@ pub fn makeVector(ctx: *MacroexpandContext, items: []*Form, origin: SrcSpan) Mac
 /// either way the lifetime is at least as long as the
 /// resulting Form's). Always unqualified for host macros;
 /// qualified-symbol construction lands in #8c.
-pub fn makeSymbol(ctx: *MacroexpandContext, name: []const u8, origin: SrcSpan) MacroexpandError!*Form {
+pub fn makeSymbol(ctx: *ExpandContext, name: []const u8, origin: SrcSpan) ExpandError!*Form {
     const form = try ctx.allocator.create(Form);
     form.* = .{
         .datum = .{ .symbol = .{ .ns = null, .name = name } },
@@ -1000,13 +1000,13 @@ pub fn makeSymbol(ctx: *MacroexpandContext, name: []const u8, origin: SrcSpan) M
     return form;
 }
 
-pub fn makeNil(ctx: *MacroexpandContext, origin: SrcSpan) MacroexpandError!*Form {
+pub fn makeNil(ctx: *ExpandContext, origin: SrcSpan) ExpandError!*Form {
     const form = try ctx.allocator.create(Form);
     form.* = .{ .datum = .nil, .origin = origin };
     return form;
 }
 
-pub fn makeBool(ctx: *MacroexpandContext, value: bool, origin: SrcSpan) MacroexpandError!*Form {
+pub fn makeBool(ctx: *ExpandContext, value: bool, origin: SrcSpan) ExpandError!*Form {
     const form = try ctx.allocator.create(Form);
     form.* = .{ .datum = .{ .bool_ = value }, .origin = origin };
     return form;
@@ -1017,7 +1017,7 @@ pub fn makeBool(ctx: *MacroexpandContext, value: bool, origin: SrcSpan) Macroexp
 // =============================================================================
 //
 // Each macro fn matches `MacroFn`:
-//   fn(ctx, call_form, args) MacroexpandError!*Form
+//   fn(ctx, call_form, args) ExpandError!*Form
 //
 // Conventions:
 //   - The macro's NAME is registered in `defaultMacros()` and
@@ -1040,26 +1040,26 @@ pub fn makeBool(ctx: *MacroexpandContext, value: bool, origin: SrcSpan) Macroexp
 // the entire job.
 
 fn expandLetRename(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     return renameHead(ctx, call_form, args, "let*");
 }
 
 fn expandFnRename(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     return renameHead(ctx, call_form, args, "fn*");
 }
 
 fn expandLoopRename(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     return renameHead(ctx, call_form, args, "loop*");
 }
 
@@ -1068,11 +1068,11 @@ fn expandLoopRename(
 /// them on the next walk via the special-form traversal for
 /// the new head.
 fn renameHead(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
     new_head: []const u8,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     const items = try ctx.allocator.alloc(*Form, args.len + 1);
     items[0] = try makeSymbol(ctx, new_head, call_form.origin);
     for (args, 0..) |a, i| items[1 + i] = @constCast(a);
@@ -1085,31 +1085,31 @@ fn renameHead(
 //   (when-not test body...) => (if test nil (do body...))
 
 fn expandWhen(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
-) MacroexpandError!*Form {
-    if (args.len < 1) return MacroexpandError.MalformedMacroCall;
+) ExpandError!*Form {
+    if (args.len < 1) return ExpandError.MalformedMacroCall;
     return try buildWhen(ctx, call_form, args, .when_true);
 }
 
 fn expandWhenNot(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
-) MacroexpandError!*Form {
-    if (args.len < 1) return MacroexpandError.MalformedMacroCall;
+) ExpandError!*Form {
+    if (args.len < 1) return ExpandError.MalformedMacroCall;
     return try buildWhen(ctx, call_form, args, .when_false);
 }
 
 const WhenArm = enum { when_true, when_false };
 
 fn buildWhen(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
     arm: WhenArm,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     const test_form = args[0];
     const body = args[1..];
     // Build (do body...) — empty body yields just (do).
@@ -1157,10 +1157,10 @@ fn buildWhen(
 // turn 56 §2.G).
 
 fn expandAnd(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     if (args.len == 0) return try makeBool(ctx, true, call_form.origin);
     if (args.len == 1) return @constCast(args[0]);
 
@@ -1201,10 +1201,10 @@ fn expandAnd(
 }
 
 fn expandOr(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     if (args.len == 0) return try makeNil(ctx, call_form.origin);
     if (args.len == 1) return @constCast(args[0]);
 
@@ -1256,12 +1256,12 @@ fn expandOr(
 // makes it pass.
 
 fn expandCond(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     if (args.len == 0) return try makeNil(ctx, call_form.origin);
-    if (args.len % 2 != 0) return MacroexpandError.MalformedMacroCall;
+    if (args.len % 2 != 0) return ExpandError.MalformedMacroCall;
 
     // Build right-to-left: start from nil, wrap each pair.
     var current: *Form = try makeNil(ctx, call_form.origin);
@@ -1296,28 +1296,28 @@ fn expandCond(
 const ThreadPosition = enum { first, last };
 
 fn expandThreadFirst(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     return try expandThread(ctx, call_form, args, .first);
 }
 
 fn expandThreadLast(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     return try expandThread(ctx, call_form, args, .last);
 }
 
 fn expandThread(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
     pos: ThreadPosition,
-) MacroexpandError!*Form {
-    if (args.len == 0) return MacroexpandError.MalformedMacroCall;
+) ExpandError!*Form {
+    if (args.len == 0) return ExpandError.MalformedMacroCall;
     var acc: *Form = @constCast(args[0]);
     for (args[1..]) |step| {
         acc = try threadStep(ctx, call_form, acc, step, pos);
@@ -1326,12 +1326,12 @@ fn expandThread(
 }
 
 fn threadStep(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     call_form: *const Form,
     acc: *Form,
     step: *const Form,
     pos: ThreadPosition,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     // Symbol step `f` → (f acc).
     if (step.datum == .symbol) {
         const items = try ctx.allocator.alloc(*Form, 2);
@@ -1343,7 +1343,7 @@ fn threadStep(
     //                      thread-last:  (f a b acc)
     if (step.datum == .list) {
         const step_items = step.datum.list;
-        if (step_items.len == 0) return MacroexpandError.MalformedMacroCall;
+        if (step_items.len == 0) return ExpandError.MalformedMacroCall;
         const new_items = try ctx.allocator.alloc(*Form, step_items.len + 1);
         switch (pos) {
             .first => {
@@ -1360,7 +1360,7 @@ fn threadStep(
         }
         return try makeList(ctx, new_items, call_form.origin);
     }
-    return MacroexpandError.MalformedMacroCall;
+    return ExpandError.MalformedMacroCall;
 }
 
 // =============================================================================
@@ -1399,7 +1399,7 @@ fn threadStep(
 //     entry. Per peer-AI turn 56 §1.4: ONE scope per syntax-
 //     quote form. Nested syntax-quote opens another scope but
 //     v1 raises UnsupportedFeature first, so this never fires.
-//   - Counter is on MacroexpandContext.gensym_next (monotonic
+//   - Counter is on ExpandContext.gensym_next (monotonic
 //     across the entire compilation unit), so two separate
 //     syntax-quotes never collide even though their scopes
 //     are independent.
@@ -1422,9 +1422,9 @@ pub const GensymScope = struct {
     /// `#` (caller checks).
     fn lookupOrAllocate(
         self: *GensymScope,
-        ctx: *MacroexpandContext,
+        ctx: *ExpandContext,
         name: []const u8,
-    ) MacroexpandError![]const u8 {
+    ) ExpandError![]const u8 {
         if (self.mappings.get(name)) |existing| return existing;
         // Strip the trailing `#` for the gensym base.
         const base = name[0 .. name.len - 1];
@@ -1437,11 +1437,11 @@ pub const GensymScope = struct {
 /// Walk a syntax-quoted form. Returns a Form that, when
 /// compiled and run, produces the quoted shape.
 fn expandSyntaxQuotePayload(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     scope: *GensymScope,
     call_form: *const Form,
     payload: *const Form,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     return switch (payload.datum) {
         // Self-evaluating leaves: pass through. Lowered as
         // existing Tiny variants — no quote wrap needed.
@@ -1449,7 +1449,7 @@ fn expandSyntaxQuotePayload(
         // Symbol → (quote sym) — unless ends with `#`, then
         // gensym lookup.
         .symbol => |name| blk: {
-            if (name.ns != null) return MacroexpandError.MalformedMacroCall;
+            if (name.ns != null) return ExpandError.MalformedMacroCall;
             const sym_name: []const u8 = if (name.name.len > 1 and name.name[name.name.len - 1] == '#')
                 try scope.lookupOrAllocate(ctx, name.name)
             else
@@ -1465,7 +1465,7 @@ fn expandSyntaxQuotePayload(
         // normal expansion + evaluation on the outer walk.
         .unquote => |inner| mutCast(inner),
         // Splice in non-list context is illegal.
-        .unquote_splicing => return MacroexpandError.MalformedMacroCall,
+        .unquote_splicing => return ExpandError.MalformedMacroCall,
         // List: build the segment-and-concat structure.
         .list => |items| try expandSyntaxQuoteList(ctx, scope, call_form, items, payload.origin),
         // Step #8c.3: Vector — same pattern as list. The
@@ -1483,7 +1483,7 @@ fn expandSyntaxQuotePayload(
         // reader macros need explicit support (peer-AI turn 58
         // §D7/D10). v1 raises MalformedMacroCall via the
         // MacroExpansionFailure bucket.
-        else => return MacroexpandError.MalformedMacroCall,
+        else => return ExpandError.MalformedMacroCall,
     };
 }
 
@@ -1493,15 +1493,15 @@ fn expandSyntaxQuotePayload(
 /// requires concat-of-vectors machinery that's not worth the
 /// extra surface).
 fn expandSyntaxQuoteVector(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     scope: *GensymScope,
     call_form: *const Form,
     items: []const *Form,
     origin: reader_mod.SrcSpan,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     // Reject splices inside vectors for v1.
     for (items) |it| {
-        if (it.datum == .unquote_splicing) return MacroexpandError.MalformedMacroCall;
+        if (it.datum == .unquote_splicing) return ExpandError.MalformedMacroCall;
     }
     const seg_items = try ctx.allocator.alloc(*Form, items.len + 1);
     seg_items[0] = try makeSymbol(ctx, "#%vector", origin);
@@ -1517,19 +1517,19 @@ fn expandSyntaxQuoteVector(
 /// a bare `(#%list ...)` (no splices found) or a
 /// `(#%concat ...)` wrapping multiple segments.
 fn expandSyntaxQuoteList(
-    ctx: *MacroexpandContext,
+    ctx: *ExpandContext,
     scope: *GensymScope,
     call_form: *const Form,
     items: []const *Form,
     list_origin: reader_mod.SrcSpan,
-) MacroexpandError!*Form {
+) ExpandError!*Form {
     var segments: std.ArrayList(*Form) = .empty;
     defer segments.deinit(ctx.allocator);
     var current: std.ArrayList(*Form) = .empty;
     defer current.deinit(ctx.allocator);
 
     const flushCurrent = struct {
-        fn call(c: *std.ArrayList(*Form), cx: *MacroexpandContext, segs: *std.ArrayList(*Form), origin: reader_mod.SrcSpan) MacroexpandError!void {
+        fn call(c: *std.ArrayList(*Form), cx: *ExpandContext, segs: *std.ArrayList(*Form), origin: reader_mod.SrcSpan) ExpandError!void {
             if (c.items.len == 0) return;
             // Build (#%list ...) from the current segment.
             const seg_items = try cx.allocator.alloc(*Form, c.items.len + 1);
@@ -1579,7 +1579,7 @@ fn expandSyntaxQuoteList(
 /// the result via `compileSourceFullWithMacros` (the CLI does
 /// this automatically). Caller owns the returned table and is
 /// responsible for `table.deinit(allocator)`.
-pub fn defaultMacros(allocator: Allocator) MacroexpandError!HostMacroTable {
+pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     var table: HostMacroTable = .{};
     errdefer table.deinit(allocator);
     try table.put(allocator, "let", expandLetRename);
@@ -1620,7 +1620,7 @@ fn expandSourceForTest(
     // NOTE: interner is in the arena, so deinit not strictly
     // necessary, but explicit cleanup is good hygiene.
     defer interner.deinit();
-    var ctx = MacroexpandContext{
+    var ctx = ExpandContext{
         .allocator = arena,
         .interner = &interner,
         .host_macros = host_macros,
@@ -1693,10 +1693,10 @@ test "macroexpand #8a: depth limit caught for infinite macro loop" {
     // it received — infinite loop.
     const Wrap = struct {
         fn loopForever(
-            _: *MacroexpandContext,
+            _: *ExpandContext,
             call_form: *const Form,
             _: []const *Form,
-        ) MacroexpandError!*Form {
+        ) ExpandError!*Form {
             return mutCast(call_form);
         }
     };
@@ -1712,12 +1712,12 @@ test "macroexpand #8a: depth limit caught for infinite macro loop" {
 
     var interner = intern_mod.Interner.init(arena);
     defer interner.deinit();
-    var ctx = MacroexpandContext{
+    var ctx = ExpandContext{
         .allocator = arena,
         .interner = &interner,
         .host_macros = &table,
     };
-    try testing.expectError(MacroexpandError.ExpansionDepthExceeded, expandForm(&ctx, null, form));
+    try testing.expectError(ExpandError.ExpansionDepthExceeded, expandForm(&ctx, null, form));
 }
 
 test "macroexpand #8a: lexical shadowing blocks macro expansion" {
@@ -1730,11 +1730,11 @@ test "macroexpand #8a: lexical shadowing blocks macro expansion" {
     // the macro MUST NOT fire.
     const Wrap = struct {
         fn fireIt(
-            ctx: *MacroexpandContext,
+            ctx: *ExpandContext,
             call_form: *const Form,
             _: []const *Form,
-        ) MacroexpandError!*Form {
-            const kw_id = ctx.interner.internKeyword("fired") catch return MacroexpandError.OutOfMemory;
+        ) ExpandError!*Form {
+            const kw_id = ctx.interner.internKeyword("fired") catch return ExpandError.OutOfMemory;
             const form = try ctx.allocator.create(Form);
             form.* = .{
                 .datum = .{ .keyword = .{ .ns = null, .name = ctx.interner.keywordName(kw_id) } },
@@ -1756,7 +1756,7 @@ test "macroexpand #8a: lexical shadowing blocks macro expansion" {
 
     var interner = intern_mod.Interner.init(arena);
     defer interner.deinit();
-    var ctx = MacroexpandContext{
+    var ctx = ExpandContext{
         .allocator = arena,
         .interner = &interner,
         .host_macros = &table,
@@ -1779,11 +1779,11 @@ test "macroexpand #8a: macro fires at top level when not shadowed" {
 
     const Wrap = struct {
         fn fireIt(
-            ctx: *MacroexpandContext,
+            ctx: *ExpandContext,
             call_form: *const Form,
             _: []const *Form,
-        ) MacroexpandError!*Form {
-            const kw_id = ctx.interner.internKeyword("fired") catch return MacroexpandError.OutOfMemory;
+        ) ExpandError!*Form {
+            const kw_id = ctx.interner.internKeyword("fired") catch return ExpandError.OutOfMemory;
             const form = try ctx.allocator.create(Form);
             form.* = .{
                 .datum = .{ .keyword = .{ .ns = null, .name = ctx.interner.keywordName(kw_id) } },
@@ -1804,7 +1804,7 @@ test "macroexpand #8a: macro fires at top level when not shadowed" {
 
     var interner = intern_mod.Interner.init(arena);
     defer interner.deinit();
-    var ctx = MacroexpandContext{
+    var ctx = ExpandContext{
         .allocator = arena,
         .interner = &interner,
         .host_macros = &table,
@@ -1819,7 +1819,7 @@ test "macroexpand #8a: quote is opaque — macro inside quote does NOT fire" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const Wrap = struct {
-        fn fireIt(_: *MacroexpandContext, call_form: *const Form, _: []const *Form) MacroexpandError!*Form {
+        fn fireIt(_: *ExpandContext, call_form: *const Form, _: []const *Form) ExpandError!*Form {
             // If ever called, return nil so the failure is obvious.
             const form = std.heap.page_allocator.create(Form) catch unreachable;
             form.* = .{ .datum = .nil, .origin = call_form.origin };
@@ -1838,7 +1838,7 @@ test "macroexpand #8a: quote is opaque — macro inside quote does NOT fire" {
 
     var interner = intern_mod.Interner.init(arena);
     defer interner.deinit();
-    var ctx = MacroexpandContext{
+    var ctx = ExpandContext{
         .allocator = arena,
         .interner = &interner,
         .host_macros = &table,

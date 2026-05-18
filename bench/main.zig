@@ -51,7 +51,7 @@ const emdb = @import("emdb");
 const pool_mod = @import("pool");
 const vm_mod = @import("vm");
 const compile_mod = @import("compile");
-const macroexpand_mod = @import("macroexpand");
+const expand_mod = @import("expand");
 
 const Value = value_mod.Value;
 const Heap = heap_mod.Heap;

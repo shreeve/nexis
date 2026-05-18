@@ -31,7 +31,7 @@ const vm = @import("vm");
 const compile = @import("compile");
 const reader_mod = @import("reader");
 const intern_mod = @import("intern");
-const macroexpand_mod = @import("macroexpand");
+const expand_mod = @import("expand");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
 
@@ -285,7 +285,7 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(allocator);
+    var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);
 
     // Each evaluation gets its own arena so we can release
@@ -458,7 +458,7 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     // renames + when/when-not/and/or/cond + ->/->>. Phase 3
     // will add user-defined `defmacro` and let users extend
     // this table.
-    var host_macros = try macroexpand_mod.defaultMacros(allocator);
+    var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);
 
     var last_result: Value = value_mod.nilValue();

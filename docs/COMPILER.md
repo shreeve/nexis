@@ -72,7 +72,7 @@ Sexp tree
    ▼  reader (src/reader.zig, Phase 0)
 Form tree
    │
-   ▼  macroexpand (src/macroexpand.zig) — recursive to fixed point
+   ▼  macroexpand (src/expand.zig) — recursive to fixed point
 Expanded Form tree
    │
    ▼  resolve (src/resolve.zig)
@@ -819,7 +819,7 @@ Phase 2 has three test layers:
 
 #### 9.1 Unit tests per stage
 
-- `src/macroexpand.zig`: inline tests for recursive expansion,
+- `src/expand.zig`: inline tests for recursive expansion,
   fixed-point termination, syntax-quote handling, #%anon-fn
   lowering, error cases.
 - `src/resolve.zig`: inline tests for every classification
@@ -1283,7 +1283,7 @@ from code contact:
 
   **MACROEXPAND.md** spec pinned per peer-AI turn 56 (11
   edits to draft applied BEFORE coding):
-  - MacroFn takes `*MacroexpandContext` (carries gensym
+  - MacroFn takes `*ExpandContext` (carries gensym
     counter, interner, host_macros table).
   - Gensym counter lives on context, NOT VM.
   - Reordered #8b ↔ #8c: host macros first (FormBuilder

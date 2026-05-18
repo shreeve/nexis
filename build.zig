@@ -209,13 +209,13 @@ pub fn build(b: *std.Build) void {
     // Step #8a: Form → Form macro expansion (see
     // docs/MACROEXPAND.md). Lives between Reader.readOneForm
     // and lowerForm in the pipeline.
-    const macroexpand_mod = b.createModule(.{
-        .root_source_file = b.path("src/macroexpand.zig"),
+    const expand_mod = b.createModule(.{
+        .root_source_file = b.path("src/expand.zig"),
         .target = target,
         .optimize = optimize,
     });
-    macroexpand_mod.addImport("reader", reader_mod);
-    macroexpand_mod.addImport("intern", intern_mod);
+    expand_mod.addImport("reader", reader_mod);
+    expand_mod.addImport("intern", intern_mod);
 
     const compile_mod = b.createModule(.{
         .root_source_file = b.path("src/compile.zig"),
@@ -235,8 +235,8 @@ pub fn build(b: *std.Build) void {
     // The Interner instance comes from the VM at runtime; the
     // compile-side just imports the type.
     compile_mod.addImport("intern", intern_mod);
-    // Step #8a: macroexpander is consumed by compileFormFullWithMacros.
-    compile_mod.addImport("macroexpand", macroexpand_mod);
+    // Step #8a: expander is consumed by compileFormFullWithMacros.
+    compile_mod.addImport("expand", expand_mod);
 
     const db_mod = b.createModule(.{
         .root_source_file = b.path("src/db.zig"),
@@ -321,7 +321,7 @@ pub fn build(b: *std.Build) void {
         vm: *std.Build.Module,
         compile: *std.Build.Module,
         reader: *std.Build.Module,
-        macroexpand: *std.Build.Module,
+        expand: *std.Build.Module,
     };
     const siblings: AllSiblings = .{
         .hash = hash_mod,
@@ -343,7 +343,7 @@ pub fn build(b: *std.Build) void {
         .vm = vm_mod,
         .compile = compile_mod,
         .reader = reader_mod,
-        .macroexpand = macroexpand_mod,
+        .expand = expand_mod,
     };
 
     const RuntimeTest = struct {
@@ -369,8 +369,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector" } },
-        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "macroexpand", "vector" } },
-        .{ .name = "macroexpand", .path = "src/macroexpand.zig", .imports = &.{ "reader", "intern" } },
+        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector" } },
+        .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
@@ -401,7 +401,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "vm")) siblings.vm
                 else if (std.mem.eql(u8, imp_name, "compile")) siblings.compile
                 else if (std.mem.eql(u8, imp_name, "reader")) siblings.reader
-                else if (std.mem.eql(u8, imp_name, "macroexpand")) siblings.macroexpand
+                else if (std.mem.eql(u8, imp_name, "expand")) siblings.expand
                 else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
         }
@@ -611,7 +611,7 @@ pub fn build(b: *std.Build) void {
     prop_compile_mod.addImport("compile", compile_mod);
     prop_compile_mod.addImport("intern", intern_mod);
     prop_compile_mod.addImport("reader", reader_mod);
-    prop_compile_mod.addImport("macroexpand", macroexpand_mod);
+    prop_compile_mod.addImport("expand", expand_mod);
     prop_compile_mod.addImport("list", list_mod);
 
     const prop_compile_tests = b.addTest(.{ .root_module = prop_compile_mod });
@@ -631,7 +631,7 @@ pub fn build(b: *std.Build) void {
     integration_eval_mod.addImport("compile", compile_mod);
     integration_eval_mod.addImport("intern", intern_mod);
     integration_eval_mod.addImport("reader", reader_mod);
-    integration_eval_mod.addImport("macroexpand", macroexpand_mod);
+    integration_eval_mod.addImport("expand", expand_mod);
     integration_eval_mod.addImport("list", list_mod);
     integration_eval_mod.addImport("vector", vector_mod);
 
@@ -682,7 +682,7 @@ pub fn build(b: *std.Build) void {
     // cost + recur per-iter cost.
     bench_runner_mod.addImport("vm", vm_mod);
     bench_runner_mod.addImport("compile", compile_mod);
-    bench_runner_mod.addImport("macroexpand", macroexpand_mod);
+    bench_runner_mod.addImport("expand", expand_mod);
 
     const bench_exe = b.addExecutable(.{
         .name = "nexis-bench",
@@ -729,7 +729,7 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("compile", compile_mod);
     cli_mod.addImport("reader", reader_mod);
     cli_mod.addImport("intern", intern_mod);
-    cli_mod.addImport("macroexpand", macroexpand_mod);
+    cli_mod.addImport("expand", expand_mod);
     cli_mod.addImport("list", list_mod);
     cli_mod.addImport("vector", vector_mod);
 
@@ -792,20 +792,20 @@ pub fn build(b: *std.Build) void {
     // compiler/VM iteration. Use this step during the Phase 2 edit/test loop;
     // run the full suite before committing significant changes.
     //
-    // When a new Phase 2 module lands (e.g., macroexpand.zig, resolve.zig),
+    // When a new Phase 2 module lands (e.g., expand.zig, resolve.zig),
     // add its entry to `runtime_test_files` AND append the corresponding
     // `runtime_test_runs[N]` to this step.
     // -------------------------------------------------------------------------
 
     const phase2_test_step = b.step("phase2-test", "Run only vm + compile tests (fast Phase 2 iteration)");
     // Indices into runtime_test_files: vm = 16, compile = 17,
-    // macroexpand = 18. Asserted at build time so re-ordering
+    // expand = 18. Asserted at build time so re-ordering
     // trips this loudly instead of silently running the wrong
     // tests.
     comptime {
         std.debug.assert(std.mem.eql(u8, runtime_test_files[16].name, "vm"));
         std.debug.assert(std.mem.eql(u8, runtime_test_files[17].name, "compile"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[18].name, "macroexpand"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[18].name, "expand"));
     }
     phase2_test_step.dependOn(&runtime_test_runs[16].step);
     phase2_test_step.dependOn(&runtime_test_runs[17].step);

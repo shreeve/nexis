@@ -28,7 +28,7 @@ const vm = @import("vm");
 const compile = @import("compile");
 const intern_mod = @import("intern");
 const reader_mod = @import("reader");
-const macroexpand_mod = @import("macroexpand");
+const expand_mod = @import("expand");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
 
@@ -104,7 +104,7 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
 
     const compiled = try compile.compileSourceFullWithMacros(
@@ -458,7 +458,7 @@ test "integration: catchable — KindMismatch BYPASSES translation when no handl
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
-    var host_macros = try macroexpand_mod.defaultMacros(testing.allocator);
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const compiled = try compile.compileSourceFullWithMacros(
         arena.allocator(),

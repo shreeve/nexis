@@ -115,7 +115,7 @@ raw Sexp tree
    ▼   src/reader.zig     (normalize, merge meta, lower #(), drop #_)
 canonical Form tree
    │
-   ▼   src/macroexpand.zig   (future — expand syntax-quote, user macros)
+   ▼   src/expand.zig   (future — expand syntax-quote, user macros)
 expanded Form
    │
    ▼   src/resolve.zig       (future — bind symbols)

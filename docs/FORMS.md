@@ -137,7 +137,7 @@ boundaries.
 |---|---|---|---|
 | **Parser** (`src/parser.zig`, generated) | source text | raw `Sexp` tree with `.src` spans | Tokenization + LALR(1) parse. No semantic validation beyond grammar. No normalization. |
 | **Reader / normalizer** (`src/reader.zig`) | raw `Sexp` | canonical `Form` tree | §3 rules. Attaches spans. Normalizes metadata. Lowers `#(...)`. Emits `(syntax-quote f)` marker. Discards `#_`. Rejects duplicate literal keys / odd map / nested anon-fn / bare unquote. |
-| **Macroexpander** (`src/macroexpand.zig`) | canonical `Form` | expanded `Form` | Macros to fixpoint. **Expands `syntax-quote` forms.** Resolves `#%anon-fn` to `(fn* ...)`. Passes `&form` and `&env`. |
+| **Macroexpander** (`src/expand.zig`) | canonical `Form` | expanded `Form` | Macros to fixpoint. **Expands `syntax-quote` forms.** Resolves `#%anon-fn` to `(fn* ...)`. Passes `&form` and `&env`. |
 | **Resolver** (`src/resolve.zig`) | expanded `Form` | `Resolved` AST | Symbols → slot / upvalue / var / special form. Errors on unbound. |
 
 **Important**: `syntax-quote` expansion happens in the macroexpander, not the
