@@ -6,13 +6,21 @@ inspired by Clojure, built for persistent data, durable identity, and
 world-class performance. Multi-phase implementation driven by PLAN.md at
 the repository root.
 
-Phase 1 is COMPLETE — all 8 gates closed (PLAN.md §20.2). Phase 2
-is **~95% done**: every primitive-core form compiles + executes,
-macros + syntax-quote + collections shipped, try/catch/throw
-shipped, source-span-in-errors shipped (Phase 2 gate item 5
-satisfied). Remaining: `finally` clauses (#9.2), property tests
-for syntax-quote/closure-depth (gate items 3,4), bench harness
-(gate item 7), golden eval-pipeline tests (#11).
+Phase 1 is COMPLETE (PLAN.md §20.2). **Phase 2 is COMPLETE**:
+every primitive-core form compiles + executes, macros +
+syntax-quote + collections, try/catch/throw/finally, source-
+span errors, property tests, bench harness, golden eval-pipeline
+tests. All 7 gate items from COMPILER.md §9.4 satisfied + step
+#11 integration coverage added as belt-and-suspenders.
+
+464 phase2 tests + 86 reader/golden = 550 tests in the fast
+inner-loop suite (~3s). Full suite (`zig build test`) green
+including Phase 1 randomized property tests.
+
+Phase 3 starts when the user decides: standard library bootstrap
+(`stdlib/core.nx` per CLOJURE-REVIEW.md §1.1), user-defined
+`defmacro` (#8d, needs compile-time VM eval), REPL, multi-
+namespace via refer/alias/require, runtime VM-error catchability.
 
 - The VM has 7 wired opcode groups: mov, cmp, math, call,
   closure, jump, var.
@@ -37,43 +45,38 @@ for syntax-quote/closure-depth (gate items 3,4), bench harness
   table (current default), the expander is a pure pass-through.
   Spec pinned in `docs/MACROEXPAND.md` (peer-AI turn 56 review).
 
-SHIPPED since last HANDOFF:
-- **#8b** (4af8c22, 5270739): 10 host core macros — let/fn/loop
-  renames + when/when-not/and/or (both gensym-hygienic) + cond +
-  ->/->>. Default macro table wired through the CLI; all `.nx`
-  programs auto-expand. +38 tests.
-- **#8c.1** (4ad8dd3): `coll:list`/`coll:concat` opcodes +
-  `Tiny.list_construct`/`concat` IR + `#%list`/`#%concat`
-  internal special forms + quoted compound lists via
-  `lowerQuotePayload`. +12 tests.
-- **#8c.2** (32a8d34): syntax-quote walker + unquote + splicing
-  + auto-gensym. Also caught + fixed a gating bug — expander now
-  runs whenever interner is present, not just when macros are. +10 tests.
-- **#8c.3** (de3c775): `coll:vector` + `Tiny.vector_construct` +
-  `#%vector` + vector quote/syntax-quote. Unlocks the user-
-  defmacro pattern (synthesizing `(let* [name val] body)`). +4 tests.
-- **#9.1** (2527944): try/catch/throw + cross-frame unwind. VM
-  ctrl group + global Handler stack + cleanup-handler trick.
-  `(try body (catch any e handler))` with `(throw value)`. +16 tests.
-- **#10.0** (1e5b575): SrcSpans in compile errors. CLI prints
-  `path:line:col: ErrorKind` + source line + caret. Phase 2
-  gate item 5 satisfied for compile errors. +3 tests.
+SHIPPED to close Phase 2:
+- **#8b** (4af8c22, 5270739): 10 host core macros (when/cond/and/or/->/->>
+  + let/fn/loop renames). Default macro table wired into CLI.
+- **#8c.1** (4ad8dd3): coll:list/concat opcodes + Tiny IR +
+  #%list/#%concat + quoted compound lists.
+- **#8c.2** (32a8d34): syntax-quote / unquote / splicing /
+  auto-gensym. Caught + fixed a gating bug.
+- **#8c.3** (de3c775): coll:vector + #%vector + vector quote/
+  syntax-quote — unlocks the user-defmacro pattern.
+- **#9.1** (2527944): try/catch/throw + cross-frame unwind.
+- **#10.0** (1e5b575): SrcSpans in compile errors (gate item 5).
+- **A** (b948ab0): gate items 3+4+7 — closure depth-10 property
+  test + syntax-quote structural-equality property test +
+  bench/main.zig compiler category (compile_simple, eval_loop,
+  closure_create, eval_arith).
+- **#9.2** (a610cb4): finally clauses + throw-through-finally.
+  Coroutine continuation model. All 4 exit paths tested.
+- **#11** (8def91d): test/integration/eval_pipeline.zig — 46
+  end-to-end test cases covering every primitive-core form,
+  every macro, every try/catch/finally path.
 
-Remaining:
-- **#9.2 (NOT gate-blocking)**: finally clauses + recur-inside-try.
-  Subtle continuation model spec'd in MACROEXPAND.md / peer-AI
-  turn 59. Defer until user picks it.
-- **#11 (gate-blocking)**: golden + eval pipeline tests (Phase 2
-  gate item 6).
-- **bench/compiler.zig** (gate item 7): forms/sec + ops/sec +
-  closure creation cost + recur per-iter cost.
-- **Property tests** (gate items 3, 4): closure depth-10 capture +
-  syntax-quote structural equality.
-- **Runtime VmError SrcSpans** (post-gate refinement): currently
-  runtime errors lack source spans; requires PC→source map per
-  Routine. Defer.
-- **#8d Phase 3**: user-defined `defmacro` — requires compile-time
-  VM eval. Not in v1.
+Remaining (Phase 3+):
+- **#8d**: user-defined `defmacro` — requires compile-time VM
+  eval. Significant scope.
+- **recur inside try**: explicitly rejected in v1 (wrap try
+  around loop). Tractable but not v1 priority.
+- **Runtime VmError SrcSpans**: PC→source map per Routine.
+  Nice-to-have UX improvement, NOT gate-blocking.
+- **Maps/sets as runtime values**: requires stdlib bootstrap.
+- **#(...) anon-fn reader macro**: Phase 3.
+- **REPL + module loading**: Phase 3.
+- **Type matchers beyond `catch any`**: post-Phase-3 type system.
 
 Read this entire prompt before touching anything.
 
@@ -85,6 +88,9 @@ Read this entire prompt before touching anything.
 - Branch:   main
 - HEAD:     check `git log -1 --oneline`. Recent commit chain
             (newest first):
+              8def91d phase 2 step #11: golden + eval pipeline integration tests
+              a610cb4 phase 2 step #9.2: finally clauses + throw-through-finally
+              b948ab0 phase 2 gate item A (3, 4, 7): property tests + bench
               1e5b575 phase 2 step #10.0: SrcSpan in compile errors — gate item 5 satisfied
               2527944 phase 2 step #9.1: try / catch / throw + cross-frame unwind
               de3c775 phase 2 step #8c.3: vector support — completes the macro author's toolkit
@@ -92,8 +98,6 @@ Read this entire prompt before touching anything.
               4ad8dd3 phase 2 step #8c.1: coll:list/concat opcodes + #%list/#%concat IR + quoted compound lists
               5270739 phase 2 step #8b: peer-AI turn 57 review fixes
               4af8c22 phase 2 step #8b: host core macros — 10 macros, all green
-              71bc308 docs: HANDOFF.md refresh — E1/H1/#8a shipped, #8b is next
-              8ca21a3 phase 2 step #8a: macroexpand scaffold + no-op traversal
               0e50c77 phase 2 step #8 preflight: MACROEXPAND.md pinned
               98a7d33 phase 2 step H1: minimal CLI runner — first .nx programs execute
               97aa9dd phase 2 step E1: Tiny.literal + Interner integration
@@ -942,69 +946,82 @@ From PLAN.md §"Start here" and accumulated hard lessons:
   `vm.Operand` rely on this; if you add fields, mind the bit order.
 
 ═══════════════════════════════════════════════════════════════════════
-## 10. IMMEDIATE NEXT TASK — Phase 2 gate close-out
+## 10. IMMEDIATE NEXT TASK — Phase 3 onboarding
 
-**Phase 2 is ~95% done.** Every primitive-core form compiles +
-runs. Macros + syntax-quote + collections + try/catch/throw all
-work. Source-span errors satisfy gate item 5. What remains is
-gate-finishing work — pick the order with the user.
+**Phase 2 is COMPLETE.** Every COMPILER.md §9.4 gate item is
+satisfied + step #11 integration coverage added. The next
+substantive work is Phase 3.
 
 ### Status of COMPILER.md §9.4 gate items
 
 | # | Item | Status |
 |---|---|---|
 | 1 | Every primitive-core form compiles + executes | ✅ Done |
-| 2 | 10k-iter `recur` constant-stack | ✅ Done (earlier commits + watermark test) |
-| 3 | Closure capture depth-10 (property test) | ⏸️ Need property test |
-| 4 | syntax-quote/unquote/splice structural-equal (property test) | ⏸️ Need property test |
-| 5 | Compile errors → kind + SrcSpan + macro origin | ✅ Done (#10.0, 1e5b575) |
-| 6 | Full suite 441/441+ | ✅ Done (495 total now) |
-| 7 | `bench/compiler.zig` (compile + eval throughput) | ⏸️ Need bench harness |
+| 2 | 10k-iter `recur` constant-stack | ✅ Done |
+| 3 | Closure capture depth-10 (property test) | ✅ Done (b948ab0) |
+| 4 | syntax-quote/unquote/splice structural-equal (property test) | ✅ Done (b948ab0) |
+| 5 | Compile errors → kind + SrcSpan + macro origin | ✅ Done (1e5b575) |
+| 6 | Full suite passes (≥441 tests) | ✅ Done (550+ tests) |
+| 7 | `bench/compiler.zig` (compile + eval throughput) | ✅ Done (b948ab0) |
 
-### Recommended next-step priority (user picks order)
+Phase 2 step list (COMPILER.md §10) — all green:
+  ✅ #1-#7: primitive core (literals → vars)
+  ✅ #8a: macroexpand scaffold
+  ✅ #8b: host core macros
+  ✅ #8c.1/.2/.3: syntax-quote + collections
+  ✅ #9.1: try/catch/throw + cross-frame unwind
+  ✅ #9.2: finally + throw-through-finally
+  ✅ #10.0: SrcSpan in compile errors
+  ✅ #11: golden + eval-pipeline integration tests
 
-**Option A: ship the gate.** Do items 3, 4, 7 in roughly that
-order. Each is ~1 session; total 2-3 sessions.
+Phase 2 PRODUCT bar:
+  ✅ `bin/nexis run file.nx` — every example in examples/ runs
+  ✅ ~2-3M compiles/sec, ~49 ns/recur-iteration
+  ✅ Friendly error messages with file:line:col + caret
+  ✅ Full Lisp macro author's toolkit (syntax-quote with
+     splicing + auto-gensym + vector synthesis)
 
-**Option B: ship finally first.** #9.2 (finally clauses +
-recur-in-try) is the only major language feature left, but
-peer-AI turn 59 flagged it as the subtle one — coroutine-style
-continuation model spec'd but needs careful implementation.
-~2 sessions. NOT gate-blocking.
+### What Phase 3 looks like
 
-**Option C: golden / eval pipeline tests (step #11).** Build
-out test/integration/ with `.nx` files + expected outputs.
-~1-2 sessions. Loose dependency on items 3+4 being green
-since some golden tests overlap.
+Per PLAN.md §21:
+  1. **Standard library bootstrap** (`stdlib/core.nx`,
+     CLOJURE-REVIEW.md §1.1 two-stage process):
+     - Stage 1: trivial host-defined `defmacro` enabling
+       user-written macros
+     - Stage 2: redefine user-facing forms with
+       destructuring, multi-arity defn, etc., from
+       `core.nx`
+  2. **REPL** — interactive eval loop
+  3. **Module loading**: `(require ...)` / `(use ...)` /
+     namespace support
+  4. **Runtime VmError catchability**: convert recoverable
+     VM errors to user-throwable Values
+  5. **Reader macros `#(...)`**
+  6. **Maps/sets as runtime values + literals**
 
-My read: **A → B → C** is the order that closes Phase 2 fastest.
-B is feature-completion (nice for v1 polish but not gate-blocking
-per §9.4). Suggest user picks between "ship-the-gate" (A) and
-"finish-finally" (B) when they return.
+Each of those is bounded; user picks priority.
 
-### What's pinned + ready to code
+### Recommended Phase 3 onboarding sequence
 
-- **#9.2 finally**: full spec in MACROEXPAND.md amendment +
-  peer-AI turn 59 §D5 hand-trace. Coroutine-style continuation
-  model. Reserved opcodes already in vm.zig (`CtrlOp.finally_exit`).
-- **Property tests**: `test/prop/` directory standard exists.
-  Pattern: `std.testing.fuzz` or hand-rolled iteration over
-  randomly-generated forms.
-- **bench/compiler.zig**: shape per PERF.md §3 — measures
-  compile throughput + eval throughput + closure-creation
-  cost + recur per-iteration cost. Reuse the bench/ pattern
-  from existing `nexis-bench` binary.
+1. Read PLAN.md §21 (Phase 3 roadmap).
+2. Read CLOJURE-REVIEW.md §1.1 (two-stage stdlib bootstrap).
+3. Pick: `defmacro` first (the biggest leverage —
+   immediately unblocks stage-1 macros), or REPL first
+   (immediate UX win for any user).
 
-### What's NOT in v1 (Phase 3+)
+### Active design surface for next-AI
 
-- User-defined `defmacro` (#8d) — needs compile-time VM eval.
-- Maps/sets as runtime values (`(quote {})` etc.) — Phase 3
-  stdlib bootstrap.
-- Reader macros `#(...)` — pinned in MACROEXPAND.md as Phase 3.
-- Runtime VmError SrcSpans — requires PC→source maps per
-  Routine; nice-to-have, NOT gate-blocking.
-- Persistent map/set literals — Phase 3.
-- REPL — Phase 3.
+The Phase 2 architecture is settled. Tiny IR + LowerCtx +
+MacroexpandContext + VM's group-based opcode dispatch are
+all stable interfaces. Phase 3 work BUILDS on this without
+reshaping.
+
+The one Phase-2 residual to flag: **runtime VmError
+SrcSpans**. Currently runtime errors (UncaughtThrow / etc.)
+lack source spans. Adding them requires a PC→source map per
+Routine. Bounded work (~1 session) but pulls in a compiler-
+side instruction-to-source mapping table that doesn't exist
+yet. Nice-to-have for UX but post-gate.
 
 ═══════════════════════════════════════════════════════════════════════
 ## 11. THE QUALITY BAR — what makes this project world-class vs just competent
