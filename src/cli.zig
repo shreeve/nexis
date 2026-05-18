@@ -35,6 +35,7 @@ const expand_mod = @import("expand");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
 const champ_mod = @import("champ");
+const stdlib = @import("stdlib");
 
 const Value = value_mod.Value;
 
@@ -317,6 +318,12 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
+    // Phase 3.3a: install core native fns (list/cons/first/rest/
+    // count/nth/empty?/identity/nil?/some?) into the namespace
+    // so they're callable from user code AND from compile-time
+    // macro bodies. Names are string literals; no allocator
+    // needed for storage.
+    try stdlib.installCore(ns);
     var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);
 
@@ -483,6 +490,8 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
+    // Phase 3.3a: install core native fns.
+    try stdlib.installCore(ns);
 
     // Compile arena: shared across all top-level forms in this
     // file. Form trees + Tiny IR + Compiled routines all live

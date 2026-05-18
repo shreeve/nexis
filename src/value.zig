@@ -61,7 +61,13 @@ pub const Kind = enum(u8) {
     transient = 27,
     error_ = 28,
     meta_symbol = 29,
-    // 30..63 reserved for future heap kinds.
+    /// Phase 3.3a (peer-AI turn 67): host-Zig function exposed
+    /// as a first-class Value. Payload is a pointer to a STATIC
+    /// `NativeFn` descriptor (no heap allocation per fn).
+    /// Distinguished from `.function` (user closure) at
+    /// `call:call` dispatch.
+    native_fn = 30,
+    // 31..63 reserved for future heap kinds.
 
     // ---- Runtime-private sentinels (never escape public API) ----
     unbound = 64,
@@ -362,6 +368,19 @@ pub fn fromSymbolId(intern_id: u32) Value {
     return Value{
         .tag = @intFromEnum(Kind.symbol),
         .payload = @as(u64, intern_id),
+    };
+}
+
+/// Phase 3.3a (peer-AI turn 67): pack a STATIC `NativeFn`
+/// descriptor pointer into a Value of kind `.native_fn`. The
+/// descriptor lives in static storage (no heap, no GC, no
+/// lifetime concern). The runtime treats the Value as
+/// equivalent to a Closure for call dispatch purposes (see
+/// `vm.execCallCall`).
+pub fn fromNativeFnPtr(descriptor_ptr: *const anyopaque) Value {
+    return Value{
+        .tag = @intFromEnum(Kind.native_fn),
+        .payload = @intFromPtr(descriptor_ptr),
     };
 }
 

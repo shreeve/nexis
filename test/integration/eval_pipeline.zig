@@ -32,6 +32,7 @@ const expand_mod = @import("expand");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
 const champ_mod = @import("champ");
+const stdlib = @import("stdlib");
 
 const testing = std.testing;
 
@@ -129,6 +130,9 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     defer v.deinit();
     const ns = v.ensureNamespace();
     const interner = v.ensureInterner();
+    // Phase 3.3a: install core native fns so integration tests
+    // can exercise list/cons/first/rest/etc.
+    try stdlib.installCore(ns);
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
 
@@ -453,6 +457,102 @@ test "integration: composite — try with macros" {
         \\    n)
         \\  (try (check 42) (catch any e e)))
     , "42");
+}
+
+// =============================================================================
+// Phase 3.3a — native fns (macro-authoring primitives)
+// =============================================================================
+
+test "integration: native list — empty + variadic" {
+    try expectOutput("(list)", "()");
+    try expectOutput("(list 1 2 3)", "(1 2 3)");
+}
+
+test "integration: native cons" {
+    try expectOutput("(cons 0 (list 1 2 3))", "(0 1 2 3)");
+    try expectOutput("(cons :x nil)", "(:x)");
+}
+
+test "integration: native first — nil/list/vector" {
+    try expectOutput("(first nil)", "nil");
+    try expectOutput("(first (list))", "nil");
+    try expectOutput("(first (list :a :b))", ":a");
+    try expectOutput("(first [10 20 30])", "10");
+}
+
+test "integration: native rest — nil/list/vector" {
+    try expectOutput("(rest nil)", "()");
+    try expectOutput("(rest (list))", "()");
+    try expectOutput("(rest (list :a :b :c))", "(:b :c)");
+    try expectOutput("(rest [10 20 30])", "(20 30)");
+}
+
+test "integration: native count — nil/list/vector/map/set" {
+    try expectOutput("(count nil)", "0");
+    try expectOutput("(count (list))", "0");
+    try expectOutput("(count (list 1 2 3))", "3");
+    try expectOutput("(count [10 20 30])", "3");
+    try expectOutput("(count {:a 1 :b 2})", "2");
+    try expectOutput("(count #{1 2 3 4})", "4");
+}
+
+test "integration: native nth — list + vector" {
+    try expectOutput("(nth (list :a :b :c) 0)", ":a");
+    try expectOutput("(nth (list :a :b :c) 2)", ":c");
+    try expectOutput("(nth [10 20 30] 1)", "20");
+}
+
+test "integration: native nth — out of bounds catchable" {
+    try expectOutput("(try (nth [1 2] 5) (catch any e e))", ":index-out-of-bounds");
+}
+
+test "integration: native empty?" {
+    try expectOutput("(empty? nil)", "true");
+    try expectOutput("(empty? (list))", "true");
+    try expectOutput("(empty? (list 1))", "false");
+    try expectOutput("(empty? [])", "true");
+    try expectOutput("(empty? [1])", "false");
+    try expectOutput("(empty? {})", "true");
+    try expectOutput("(empty? #{})", "true");
+}
+
+test "integration: native identity / nil? / some?" {
+    try expectOutput("(identity :hello)", ":hello");
+    try expectOutput("(nil? nil)", "true");
+    try expectOutput("(nil? 0)", "false");
+    try expectOutput("(some? nil)", "false");
+    try expectOutput("(some? 0)", "true");
+}
+
+test "integration: my-cond — user procedural macro using native fns" {
+    // The canonical 3.3a payoff: a user-written recursive
+    // procedural macro that uses first/rest/empty? at COMPILE
+    // TIME. Native fns work in defmacro bodies because the
+    // persistent-namespace design from 3.2 makes them visible
+    // to the compile-time sub-VM.
+    try expectOutput(
+        \\(do (defmacro my-cond [& clauses]
+        \\      (if (empty? clauses)
+        \\        nil
+        \\        `(if ~(first clauses)
+        \\           ~(first (rest clauses))
+        \\           (my-cond ~@(rest (rest clauses))))))
+        \\    (my-cond))
+    , "nil");
+    try expectOutput(
+        \\(do (defmacro my-cond [& clauses]
+        \\      (if (empty? clauses)
+        \\        nil
+        \\        `(if ~(first clauses)
+        \\           ~(first (rest clauses))
+        \\           (my-cond ~@(rest (rest clauses))))))
+        \\    (my-cond false :no true :yes false :nope))
+    , ":yes");
+}
+
+test "integration: native fn — arity mismatch is catchable" {
+    try expectOutput("(try (first) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(try (cons 1) (catch any e e))", ":arity-mismatch");
 }
 
 // =============================================================================

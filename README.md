@@ -18,13 +18,15 @@ identities are first-class values, not a library bolted on top.
 ## Status
 
 **Phase 2 COMPLETE**, **Phase 3.0 COMPLETE**, **Phase 3.1 COMPLETE**,
-**Phase 3.2 COMPLETE**. Real `.nx` source runs end-to-end through
-`bin/nexis run FILE.nx` AND an interactive `bin/nexis repl`. The
-reader, macroexpander, compiler, and bytecode VM all ship; host
-macros (`when`/`cond`/`and`/`or`/`->`/`->>`/etc.) AND
-user-defined macros via `defmacro` work; syntax-quote
+**Phase 3.2 COMPLETE**, **Phase 3.3a COMPLETE**. Real `.nx` source
+runs end-to-end through `bin/nexis run FILE.nx` AND an interactive
+`bin/nexis repl`. The reader, macroexpander, compiler, and bytecode
+VM all ship; host macros (`when`/`cond`/`and`/`or`/`->`/`->>`/etc.)
+AND user-defined macros via `defmacro` work; syntax-quote
 (`` ` ``/`~`/`~@`/auto-gensym), try/catch/finally, recoverable
-error catchability, and persistent maps/sets are all in.
+error catchability, persistent maps/sets, AND the first 10
+macro-authoring native fns (`list`/`cons`/`first`/`rest`/`count`/
+`nth`/`empty?`/`identity`/`nil?`/`some?`) are all in.
 
 See [`PLAN.md`](PLAN.md) §21 for the phase map and
 [`HANDOFF.md`](HANDOFF.md) for current state + next task.
@@ -37,7 +39,8 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Phase 3.0 | ✅ shipped | CLI runner + REPL, anonymous-fn shorthand `#(...)`, catchable VM errors |
 | Phase 3.1 | ✅ shipped | Persistent maps `{:k 1}` and sets `#{1 2}` as runtime literals |
 | Phase 3.2 | ✅ shipped | User-defined `defmacro` with compile-time evaluation (fresh sub-VM per invocation) |
-| Phase 3.3+ | pending | Standard library (`core.nx` bootstrap), multi-namespace via `require`/`use`, host fns for macro authoring (`cons`/`first`/`rest`/...) |
+| Phase 3.3a | ✅ shipped | 10 native fns for macro authoring (`list`/`cons`/`first`/`rest`/`count`/`nth`/`empty?`/`identity`/`nil?`/`some?`); `Kind.native_fn` infrastructure |
+| Phase 3.3b+ | pending | `VM.callValue` + `apply` + higher-order fns (`map`/`reduce`/`filter`) + first-class arithmetic Vars + collection utilities (`assoc`/`get`/`conj`) + `core.nx` embed + multi-namespace |
 
 **558 tests** green: 95 VM + 313 compile + 6 macroexpand + 4
 property + 54 integration in `phase2-test` (~3s), plus 86 reader
@@ -147,6 +150,23 @@ Every snippet runs via `bin/nexis`. Run the file or paste into the REPL:
 {:a 1 :b 2}                         ;; persistent map
 #{1 2 3}                            ;; persistent set
 
+;; native fns for macro authoring (Phase 3.3a)
+(list 1 2 3)                        ;; => (1 2 3)
+(cons 0 (list 1 2 3))               ;; => (0 1 2 3)
+(first [10 20 30])                  ;; => 10
+(rest (list :a :b :c))              ;; => (:b :c)
+(count {:a 1 :b 2})                 ;; => 2
+(empty? nil)                        ;; => true (nil-as-empty-seq)
+
+;; user-written PROCEDURAL macro using native fns at compile time
+(defmacro my-cond [& clauses]
+  (if (empty? clauses)
+    nil
+    `(if ~(first clauses)
+       ~(first (rest clauses))
+       (my-cond ~@(rest (rest clauses))))))
+(my-cond false :a true :b false :c) ;; => :b
+
 ;; anonymous-fn shorthand
 (#(+ % 1) 41)                       ;; => 42
 (#(+ %1 %2) 10 20)                  ;; => 30
@@ -174,25 +194,25 @@ nexis: bad.nx:1:1: MacroExpansionFailure
     ^^^^^^
 ```
 
-## Still missing (closes in Phase 3.3+)
+## Still missing (closes in Phase 3.3b+)
 
 These are temporary gaps, not strategic non-goals — each unlocks
 when its phase ships:
 
-- **Standard library**: no `map`/`reduce`/`filter`/`first`/`rest`/
-  `count`/`assoc`/`get` yet. Phase 3.3 (`core.nx` bootstrap + host
-  fns for macro authoring).
+- **Higher-order fns**: `map`/`reduce`/`filter`/`apply` need
+  `VM.callValue` (reentrant VM execution) — Phase 3.3b.
+- **First-class arithmetic Vars**: `(reduce + 0 xs)` needs `+`
+  to resolve to a Var, not just inline at the call head —
+  Phase 3.3b.
+- **Collection ops**: `assoc`/`dissoc`/`get`/`conj`/`keys`/`vals`
+  — Phase 3.3c.
+- **`core.nx` embedded stdlib**: composite macros + fns written
+  in nexis (`when-let`/`if-let`/`dotimes`/...) — Phase 3.3d.
 - **Multi-namespace**: single global namespace today.
   `(require ...)`/`(use ...)`/qualified symbols are Phase 3.4.
 - **Multi-arity `defn`**: `(defn f ([x] …) ([x y] …))` not supported.
-- **Destructuring**: `(let [{:keys [a b]} m] …)` etc. — Phase 3.3.
-- **Protocols / multimethods**: Phase 3+ once stdlib exists.
-
-User macros today rely entirely on syntax-quote (`` ` ``/`~`/`~@`/
-auto-gensym) to build their output — that covers most common
-macro patterns (`unless`, `when-not`, `cond`-likes, threading
-variants). Macros that need to procedurally manipulate args
-(`first`/`rest`/`cons`) wait on Phase 3.3 host fns.
+- **Destructuring**: `(let [{:keys [a b]} m] …)` etc. — Phase 3.5.
+- **Protocols / multimethods**: post-stdlib.
 - **Runtime SrcSpans**: runtime errors (UncaughtThrow etc.)
   don't carry source spans yet — bounded post-gate work.
 

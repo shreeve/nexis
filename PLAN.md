@@ -1967,12 +1967,23 @@ stdlib, multi-namespace, dynamic binding.
       earlier in a do-block are visible to later forms. Lexical
       bindings shadow macros; user macros shadow host macros.
       Peer-AI turn 66 architectural pin.
-- [ ] **Phase 3.3** Host fns for macro authoring + `src/stdlib/core.nx`:
-      `cons`/`first`/`rest`/`list`/`count`/`nth`/`apply`/`seq` as
-      native fns (unlock procedural macros); then `map`/`reduce`/
-      `filter`/`conj`/`assoc` + threading-arrow variants +
-      destructuring `let`/`fn` + multi-arity `defn` per
-      CLOJURE-REVIEW.md §1.1 two-stage bootstrap.
+- [x] **Phase 3.3a** Native-fn infrastructure (`Kind.native_fn` +
+      static `NativeFn` descriptors + `call:call` dispatch +
+      `stdlib.installCore`) + 10 macro-authoring primitives
+      (`list`, `cons`, `first`, `rest`, `count`, `nth`, `empty?`,
+      `identity`, `nil?`, `some?`). Procedural macros now
+      possible via `first`/`rest`/`empty?` at compile time.
+      Peer-AI turn 67 architectural pin.
+- [ ] **Phase 3.3b** `VM.callValue` (reentrant VM execution) +
+      `apply` + higher-order fns (`map`/`reduce`/`filter`) +
+      first-class arithmetic/comparison Vars (`+`/`<`/`=`/`inc`/
+      `dec`/predicates).
+- [ ] **Phase 3.3c** Collection utilities (`vector`/`vec`/
+      `hash-map`/`hash-set`/`assoc`/`dissoc`/`get`/`contains?`/
+      `keys`/`vals`/`conj`).
+- [ ] **Phase 3.3d** Embedded `src/stdlib/core.nx`: composite
+      macros + fns in nexis (`when-let`, `if-let`, `dotimes`,
+      ...) per CLOJURE-REVIEW.md §1.1 two-stage bootstrap.
 - [ ] **Phase 3.4** `src/namespace.zig` enhancements + `(require ...)`
       / `(use ...)` / qualified-symbol resolution.
 - [ ] **Phase 3.5** `src/dynamic.zig`: dynamic-binding stack

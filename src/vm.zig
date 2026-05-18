@@ -613,6 +613,97 @@ pub const Closure = struct {
     upvalues: []const *UpvalCell,
 };
 
+/// Phase 3.3a (peer-AI turn 67): static descriptor for a
+/// host-Zig function exposed as a first-class Value.
+/// Descriptors live in STATIC storage (one `const NativeFn`
+/// per fn); the Value just packs a pointer to the descriptor.
+/// No heap allocation, no GC concern, immortal lifetime.
+///
+/// Arity semantics:
+///   - `min_arity`: minimum acceptable argc.
+///   - `max_arity`: null = unbounded (variadic); else max argc.
+pub const NativeFn = struct {
+    name: []const u8,
+    min_arity: u16,
+    max_arity: ?u16,
+    call: *const fn (vm: *VM, args: []const Value) VmError!Value,
+};
+
+/// Unpack the descriptor pointer from a `.native_fn` Value.
+pub fn asNativeFn(v: Value) *const NativeFn {
+    std.debug.assert(v.kind() == .native_fn);
+    return @ptrFromInt(v.payload);
+}
+
+/// Build a `.native_fn` Value from a static `NativeFn`
+/// descriptor. Typical use: `vm_mod.nativeFnValue(&native_first)`.
+pub fn nativeFnValue(descriptor: *const NativeFn) Value {
+    return value_mod.fromNativeFnPtr(@ptrCast(descriptor));
+}
+
+/// Phase 3.3a: dispatch a `call:call` whose callee resolves to
+/// a `.native_fn` Value. Copies args off the stack (peer-AI
+/// turn 67 §3 — args slice lifetime), validates arity,
+/// invokes the host fn, stores the result.
+fn execCallNative(
+    self: *VM,
+    callee_v: Value,
+    call_base: u32,
+    argc: u32,
+    result_dst: u12,
+) VmError!void {
+    const native = asNativeFn(callee_v);
+
+    // Arity check.
+    if (argc < native.min_arity) return VmError.ArityMismatch;
+    if (native.max_arity) |max| {
+        if (argc > max) return VmError.ArityMismatch;
+    }
+
+    // Validate caller's frame can fit the result_dst (mirrors
+    // the closure-call validation path; both must trap symmetric
+    // bytecode corruption).
+    {
+        const caller_frame = self.currentFrame();
+        if (result_dst >= caller_frame.slot_count) {
+            return VmError.OperandOutOfRange;
+        }
+    }
+
+    // Copy args off the stack into a heap-allocated slice so
+    // the native fn can re-enter the VM, grow the stack, or
+    // allocate freely without aliasing dead slots. We use a
+    // small bounded stack buffer for the common case (argc <= 8)
+    // to avoid the allocator round-trip; longer arg lists fall
+    // back to allocator.alloc.
+    var stack_buf: [8]Value = undefined;
+    var args_slice: []Value = undefined;
+    var heap_args: ?[]Value = null;
+    defer if (heap_args) |h| self.allocator.free(h);
+    if (argc <= stack_buf.len) {
+        args_slice = stack_buf[0..argc];
+    } else {
+        const h = self.allocator.alloc(Value, argc) catch return VmError.OutOfMemory;
+        heap_args = h;
+        args_slice = h;
+    }
+    var i: u32 = 0;
+    while (i < argc) : (i += 1) {
+        const src = try self.slotPtr(@intCast(call_base + 1 + i));
+        args_slice[i] = src.*;
+    }
+
+    // Invoke. Native fns return a Value or propagate VmError;
+    // throws are propagated upward via the standard handler
+    // mechanism (3.3a non-reentrant scope: native fns don't
+    // re-enter the VM yet, so no nested throw handling here).
+    const result = try native.call(self, args_slice);
+
+    // Store result at the caller's result_dst slot.
+    const dst_ptr = try self.slotPtr(result_dst);
+    dst_ptr.* = result;
+}
+
 // =============================================================================
 // Frame (VM.md §7)
 //
@@ -773,6 +864,11 @@ pub const VmError = error{
     /// belong to the current frame, or popping found nothing.
     /// Indicates compiler bug, not user error.
     InvalidHandlerState,
+    /// Phase 3.3a: indexed access on a collection (e.g.,
+    /// `(nth coll n)`) used an out-of-bounds index. Mapped to
+    /// `:index-out-of-bounds` by the catchable-error
+    /// translation table.
+    IndexOutOfBounds,
     /// V-operand resolve (or `var:load-var`) read a Var whose
     /// `bound = false` — the Var was interned (e.g., by a
     /// forward reference in another `defn`) but no `def` has
@@ -1013,7 +1109,7 @@ pub const VM = struct {
     /// (peer-AI turn 49). The Heap is just an allocator wrapper
     /// with a live-list; init is O(1) and there's no cost
     /// before the first variadic call.
-    fn ensureHeap(self: *VM) *heap_mod.Heap {
+    pub fn ensureHeap(self: *VM) *heap_mod.Heap {
         if (self.heap == null) {
             self.heap = heap_mod.Heap.init(self.runtime_arena.allocator());
         }
@@ -1501,10 +1597,21 @@ pub const VM = struct {
             }
         }
 
-        // Read closure value from slot[call_base]. Copy the Value
+        // Read callee value from slot[call_base]. Copy the Value
         // by value (16 bytes) so we don't hold a *Value across
         // stack growth (peer-AI turn 41 + 42).
         const closure_v = (try self.slotPtr(@intCast(call_base))).*;
+
+        // Phase 3.3a (peer-AI turn 67): native-fn dispatch
+        // branch. Native fns don't push a new frame — they run
+        // host-Zig code directly with the arg slice and write
+        // their result back to the caller's result_dst. Args are
+        // COPIED off the stack first (peer-AI turn 67 §3) so
+        // native fns can safely allocate / re-enter / grow the
+        // stack without aliasing dead slots.
+        if (closure_v.kind() == value_mod.Kind.native_fn) {
+            return try execCallNative(self, closure_v, call_base, argc, result_dst);
+        }
         if (closure_v.kind() != value_mod.Kind.function) {
             return VmError.NotCallable;
         }
@@ -2548,6 +2655,7 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.NotCallable => "not-callable",
         VmError.UnboundVar => "unbound-var",
         VmError.IntegerOverflow => "integer-overflow",
+        VmError.IndexOutOfBounds => "index-out-of-bounds",
         // Unrecoverable: bytecode corruption / VM-internal /
         // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,

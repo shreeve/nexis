@@ -24,6 +24,7 @@ zig build nexis
 | `try-catch.nx` | `try` / `catch` / `throw` with cross-frame propagation (step #9.1) |
 | `maps-sets.nx` | Collection literals `{...}` and `#{...}` (Phase 3.1) |
 | `defmacro.nx` | User-defined macros via `defmacro` (Phase 3.2) — fresh sub-VM per compile-time invocation |
+| `stdlib-primitives.nx` | Native fns (`list`/`cons`/`first`/`rest`/`empty?`/...) + a user-written recursive procedural `my-cond` macro (Phase 3.3a) |
 
 The macro-heavy examples cover both styles: host macros (Zig-
 implemented, registered in the default table) and user macros

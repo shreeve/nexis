@@ -7,23 +7,27 @@ world-class performance. Multi-phase implementation driven by PLAN.md at
 the repository root.
 
 Phase 1 is COMPLETE (PLAN.md §20.2). **Phase 2 is COMPLETE**.
-**Phase 3.0/3.1/3.2 are COMPLETE**:
+**Phase 3.0/3.1/3.2/3.3a are COMPLETE**:
 every primitive-core form compiles + executes, host macros +
 user `defmacro` (compile-time VM eval) + syntax-quote +
 collections (lists/vectors/maps/sets), try/catch/throw/finally
 with catchable VmErrors, source-span errors, anon-fn shorthand
 `#(...)`, REPL + file runner, property tests, bench harness,
-golden eval-pipeline tests.
+golden eval-pipeline tests, AND 10 native fns for macro
+authoring (`list`/`cons`/`first`/`rest`/`count`/`nth`/`empty?`/
+`identity`/`nil?`/`some?`). Procedural user-defined macros
+that walk arg lists at compile time now work.
 
-495 phase2 tests + 86 reader/golden = 581 tests in the fast
+508 phase2 tests + 86 reader/golden = 594 tests in the fast
 inner-loop suite (~3s). Full suite (`zig build test`) green
 including Phase 1 randomized property tests.
 
-Phase 3 remaining: standard library bootstrap (`stdlib/core.nx`
-per CLOJURE-REVIEW.md §1.1) + host fns for macro authoring
-(cons/first/rest/etc.) — Phase 3.3. Multi-namespace via
-require/refer — Phase 3.4. Destructuring + multi-arity defn —
-Phase 3.5.
+Phase 3 remaining: `VM.callValue` reentrancy + `apply` +
+higher-order fns (`map`/`reduce`/`filter`) + first-class
+arithmetic Vars — Phase 3.3b. Collection ops (`assoc`/`get`/
+`conj`/etc.) — Phase 3.3c. Embedded `core.nx` composite layer
+— Phase 3.3d. Multi-namespace — Phase 3.4. Destructuring +
+multi-arity defn — Phase 3.5.
 
 - The VM has 7 wired opcode groups: mov, cmp, math, call,
   closure, jump, var.
@@ -111,7 +115,8 @@ Read this entire prompt before touching anything.
 - Branch:   main
 - HEAD:     check `git log -1 --oneline`. Recent commit chain
             (newest first):
-              (pending) phase 3.2: user-defined defmacro with compile-time VM eval
+              (pending) phase 3.3a: native_fn infra + 10 macro-authoring primitives
+              ce534d1 phase 3.2: user-defined defmacro with compile-time VM eval
               8461ae9 phase 3.1: maps + sets as runtime values
               9364615 phase 3.0c: catchable VmErrors
               7d8a16e phase 3.0b: anon-fn `#(...)` reader-macro expansion
@@ -994,39 +999,45 @@ The next substantive work is Phase 3.3.
 | 6 | Full suite passes (≥441 tests) | ✅ 581 tests |
 | 7 | `bench/compiler.zig` (throughput) | ✅ b948ab0 |
 
-### Phase 3.0/3.1/3.2 ship list
+### Phase 3.0/3.1/3.2/3.3a ship list
   ✅ 3.0a REPL (`bin/nexis repl`)
   ✅ 3.0b anon-fn `#(...)` → `(fn* [%1 %2 ...] body)`
   ✅ 3.0c catchable VmErrors → keyword Values via try/catch
   ✅ 3.1  persistent maps `{:k v}` + sets `#{e}` as literals
   ✅ 3.2  user-defined `defmacro` with compile-time VM eval
+  ✅ 3.3a native_fn infra + 10 macro-authoring primitives
+        (`list`/`cons`/`first`/`rest`/`count`/`nth`/`empty?`/
+        `identity`/`nil?`/`some?`)
 
-### What Phase 3.3+ looks like
+### What Phase 3.3b+ looks like
 
-Per PLAN.md §21 and peer-AI turn 66 §D4 (defmacro arc):
-  1. **Host fns for macro authoring** — `cons`/`first`/`rest`/
-     `list`/`count`/`nth`/`apply`/`seq`/`empty?`. Native-fn
-     Value kind + dispatch. Unlocks procedural macros that
-     destructure args (today's macros are syntax-quote-only).
-  2. **Standard library bootstrap** (`stdlib/core.nx`,
-     CLOJURE-REVIEW.md §1.1): map/reduce/filter/assoc/
-     dissoc/get/...
-  3. **Multi-namespace**: `(require ...)`/`(use ...)`/qualified
-     symbols (`my-ns/foo`) + per-namespace Var tables.
-  4. **Multi-arity defn**: `(defn f ([x] …) ([x y] …))`.
-  5. **Destructuring**: `(let [{:keys [a b]} m] …)`.
-  6. **Runtime VmError SrcSpans**: PC→source map parity with
-     compile errors.
+Per peer-AI turn 67 §D9 refined split:
+  - **3.3b** `VM.callValue` (REENTRANT VM execution) + `apply` +
+    HOFs (`map`/`reduce`/`filter`) + first-class arithmetic /
+    comparison Vars (`+`/`<`/`=`/`inc`/`dec`/`zero?`/`pos?`/
+    `neg?`/`odd?`/`even?`/`not`). The `VM.callValue` design is
+    the subtle one — must track frame depth, propagate
+    throws/finally through native calls, NOT corrupt the
+    current frame.
+  - **3.3c** Collection utilities (`vector`/`vec`/`hash-map`/
+    `hash-set`/`assoc`/`dissoc`/`get`/`contains?`/`keys`/
+    `vals`/`conj`).
+  - **3.3d** Embedded `core.nx` for composite macros + fns
+    (`when-let`/`if-let`/`dotimes`/...).
+  - **3.4** Multi-namespace (`require`/`use`/qualified symbols).
+  - **3.5** Multi-arity `defn` + destructuring.
+  - **post-3.5**: Runtime VmError SrcSpans (PC→source map).
 
-### Recommended Phase 3.3 onboarding
+### Recommended Phase 3.3b onboarding
 
-1. Read PLAN.md §21 (Phase 3 roadmap) and CLOJURE-REVIEW.md §1.1.
-2. Strategy turn with peer-AI on host-fn dispatch shape (new
-   `Value.kind = .native_fn` vs reusing Closure with a
-   "host-callable" Routine variant).
-3. Pick low-leverage items first: `list`/`count`/`first`/`rest`
-   are useful for tests and macro bodies; map/reduce/filter
-   come second.
+1. Read peer-AI turn 67 (this conversation) — D7 + Sharp
+   warning §4 cover `VM.callValue` design pitfalls.
+2. Strategy turn with peer-AI on `VM.callValue` signature +
+   frame-depth tracking + throw/finally propagation.
+3. Hand-trace `(reduce + 0 [1 2 3 4 5])` end-to-end BEFORE
+   coding: native `reduce` invokes native `+` via `callValue`
+   in a loop; `+` returns to `reduce`; `reduce` returns final
+   value to caller.
 
 ### Active design surface for next-AI
 

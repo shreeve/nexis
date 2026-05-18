@@ -234,6 +234,20 @@ pub fn build(b: *std.Build) void {
     // dispatch_mod is declared LATER (it depends on db); the
     // addImport for it is attached after that block. See below.
 
+    // Phase 3.3a: standard library — host-Zig native fns
+    // installed into the user's namespace at VM startup.
+    const stdlib_mod = b.createModule(.{
+        .root_source_file = b.path("src/stdlib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    stdlib_mod.addImport("value", value_mod);
+    stdlib_mod.addImport("vm", vm_mod);
+    stdlib_mod.addImport("list", list_mod);
+    stdlib_mod.addImport("vector", vector_mod);
+    stdlib_mod.addImport("champ", champ_mod);
+    stdlib_mod.addImport("intern", intern_mod);
+
     const compile_mod = b.createModule(.{
         .root_source_file = b.path("src/compile.zig"),
         .target = target,
@@ -356,6 +370,7 @@ pub fn build(b: *std.Build) void {
         reader: *std.Build.Module,
         expand: *std.Build.Module,
         dispatch: *std.Build.Module,
+        stdlib: *std.Build.Module,
     };
     const siblings: AllSiblings = .{
         .hash = hash_mod,
@@ -379,6 +394,7 @@ pub fn build(b: *std.Build) void {
         .reader = reader_mod,
         .expand = expand_mod,
         .dispatch = dispatch_mod,
+        .stdlib = stdlib_mod,
     };
 
     const RuntimeTest = struct {
@@ -406,6 +422,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch" } },
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch" } },
+        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
@@ -438,6 +455,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "reader")) siblings.reader
                 else if (std.mem.eql(u8, imp_name, "expand")) siblings.expand
                 else if (std.mem.eql(u8, imp_name, "dispatch")) siblings.dispatch
+                else if (std.mem.eql(u8, imp_name, "stdlib")) siblings.stdlib
                 else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
         }
@@ -671,6 +689,7 @@ pub fn build(b: *std.Build) void {
     integration_eval_mod.addImport("list", list_mod);
     integration_eval_mod.addImport("vector", vector_mod);
     integration_eval_mod.addImport("champ", champ_mod);
+    integration_eval_mod.addImport("stdlib", stdlib_mod);
 
     const integration_eval_tests = b.addTest(.{ .root_module = integration_eval_mod });
     const run_integration_eval_tests = b.addRunArtifact(integration_eval_tests);
@@ -770,6 +789,7 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("list", list_mod);
     cli_mod.addImport("vector", vector_mod);
     cli_mod.addImport("champ", champ_mod);
+    cli_mod.addImport("stdlib", stdlib_mod);
 
     const nexis_exe = b.addExecutable(.{
         .name = "nexis",
@@ -837,17 +857,19 @@ pub fn build(b: *std.Build) void {
 
     const phase2_test_step = b.step("phase2-test", "Run only vm + compile tests (fast Phase 2 iteration)");
     // Indices into runtime_test_files: vm = 16, compile = 17,
-    // expand = 18. Asserted at build time so re-ordering
-    // trips this loudly instead of silently running the wrong
-    // tests.
+    // expand = 18, stdlib = 19. Asserted at build time so re-
+    // ordering trips this loudly instead of silently running
+    // the wrong tests.
     comptime {
         std.debug.assert(std.mem.eql(u8, runtime_test_files[16].name, "vm"));
         std.debug.assert(std.mem.eql(u8, runtime_test_files[17].name, "compile"));
         std.debug.assert(std.mem.eql(u8, runtime_test_files[18].name, "expand"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[19].name, "stdlib"));
     }
     phase2_test_step.dependOn(&runtime_test_runs[16].step);
     phase2_test_step.dependOn(&runtime_test_runs[17].step);
     phase2_test_step.dependOn(&runtime_test_runs[18].step);
+    phase2_test_step.dependOn(&runtime_test_runs[19].step);
     // Phase 2 gate items 3 + 4.
     phase2_test_step.dependOn(&run_prop_compile_tests.step);
     // Phase 2 step #11 — eval-pipeline integration tests.

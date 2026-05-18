@@ -1,0 +1,48 @@
+; examples/stdlib-primitives.nx — Phase 3.3a stdlib primitives
+;
+; Phase 3.3a ships 10 native fns for macro authoring + basic
+; collection inspection: list, cons, first, rest, count, nth,
+; empty?, identity, nil?, some?
+;
+; These are pure host-Zig fns installed into the user's
+; namespace at VM startup. They're callable from both runtime
+; code AND inside `defmacro` bodies at compile time.
+;
+; Higher-order fns (map/reduce/filter/apply) + first-class
+; arithmetic (+, <, =, inc, ...) + map/set utilities (assoc,
+; get, conj, ...) ship in Phase 3.3b/c.
+
+; ---- Sequence inspection on nil/list/vector ---------------
+;
+; Clojure semantics:
+;   (first nil)  => nil
+;   (rest nil)   => ()       ; always returns a seq
+;   (count nil)  => 0
+;   (empty? nil) => true
+
+(defn classify [x]
+  (if (empty? x)
+    :empty
+    (if (nil? (rest x))
+      :singleton
+      :many)))
+
+; ---- A user-written recursive procedural macro ------------
+;
+; my-cond walks a flat (pred result pred result ...) sequence
+; at COMPILE TIME using first/rest/empty? — the same
+; primitives that work at runtime. The macro body executes in
+; a fresh sub-VM that sees the same Vars as the user code, so
+; `first`/`rest`/`empty?` resolve to the same native fns.
+
+(defmacro my-cond [& clauses]
+  (if (empty? clauses)
+    nil
+    `(if ~(first clauses)
+       ~(first (rest clauses))
+       (my-cond ~@(rest (rest clauses))))))
+
+(my-cond
+  (empty? (list))          :got-empty
+  (empty? (list :anything)) :unreached
+  true                      :default)
