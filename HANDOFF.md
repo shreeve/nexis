@@ -1,4 +1,4 @@
-# nexis Phase 2 — Handoff Prompt (write this to the next AI as your first message)
+# nexis Phase 5 — Handoff Prompt (write this to the next AI as your first message)
 
 ```
 You are taking over work on the nexis project — a modern, Zig-native Lisp
@@ -6,117 +6,48 @@ inspired by Clojure, built for persistent data, durable identity, and
 world-class performance. Multi-phase implementation driven by PLAN.md at
 the repository root.
 
-Phase 1 is COMPLETE (PLAN.md §20.2). **Phase 2 COMPLETE**.
-**Phase 3 COMPLETE through 3.6** (3.7 deferred per peer turn 71):
-every primitive-core form compiles + executes, host macros +
-user `defmacro` (compile-time VM eval) + procedural macros via
-native primitives + syntax-quote + collections + try/catch/
-finally + catchable VmErrors + source-span errors + anon-fn
-shorthand + REPL + file runner + ~30 native fns (sequence/HOF/
-arithmetic/collection) + embedded `core.nx` composite layer +
-multi-namespace with `(ns NAME)` + qualified symbols +
-auto-refer + full destructuring (sequential / associative /
-nested / `& rest` / `:as` / `:keys` / `:or`) + multi-arity
-`defn`. The LANGUAGE is feature-complete for v1.
+============================================================
+PHASES 0–4 ALL COMPLETE. Currently in Phase 5 (Clojure
+compatibility breadth: atoms, strings/IO, protocols, more
+stdlib). Pre-Phase-5 work is ALREADY DONE — see below for
+state + roadmap.
+============================================================
 
-563 phase2 tests + 86 reader/golden = 649 tests in the fast
-inner-loop suite (~3s). Full suite (`zig build test`) green
-including Phase 1 randomized property tests.
+Phase 0  — reader + Form normalization                  ✅ SHIPPED
+Phase 1  — runtime: Value model, CHAMP/RRB/list, GC,
+           codec, emdb integration                       ✅ SHIPPED
+Phase 2  — compiler + bytecode VM                        ✅ SHIPPED
+Phase 3  — macros, namespaces, REPL, stdlib infra,
+           multi-namespace, destructuring, multi-arity
+           defn, require                                 ✅ SHIPPED (3.6 done; 3.7 deferred)
+Phase 4  — DURABLE IDENTITY as first-class language
+           concept (durable_ref + with-tx + db/alter! +
+           db/scan + db/reduce-tree + snapshots)         ✅ SHIPPED — Phase 4 EXIT MET
+Phase 5  — Clojure compatibility breadth                 ← IN PROGRESS
 
-Phase 3.6 adds: `(require 'my.lib)` + `(require '[my.lib :as l])`,
-ns-to-file mapping (`my.app.foo` → `my/app/foo.nx`), load
-path (CWD + source-file dir for `run`), cycle detection,
-idempotent loaded set, namespace-mismatch validation
-(required file's `(ns NAME)` MUST match requested name).
-Deferred (v1.x): `:refer`/`:rename`/`:exclude`/relative
-requires/`:reload`.
+The LANGUAGE is feature-complete for v1's promised core: every
+primitive form, host macros, user defmacro, syntax-quote with
+auto-gensym, try/catch/finally with catchable VmErrors, ~30
+native fns (sequence/HOF/arithmetic/collection), multi-namespace
+with require + qualified symbols, full destructuring +
+multi-arity defn + composite core.nx layer.
 
-Phase 3 remaining:
-  - Phase 3.7: `^:dynamic` Vars + `binding`. DEFERRED per
-    peer turn 71 §1: Phase 4 may reveal whether transaction
-    context wants dynamic-Var or explicit-handle shape.
+THE OTHER BIG ARC IS ALSO DONE: durable refs backed by emdb
+(LMDB-class B+ tree, MVCC). `(db/open "app.edb")` → refs that
+PERSIST across processes, with `(with-tx [tx conn] ...)` atomic
+multi-write transactions, exception-rollback verified,
+time-travel via MVCC snapshots. Single binary. No JVM.
+The pitch ("Clojure + Datomic, fused") is no longer
+aspirational — it's runnable in examples/todo-app.nx.
 
-Phase 4 (the OTHER big arc): durable identity as a first-class
-language concept — `durable_ref` Values, transactional
-`swap!`/`alter`/`commute`, snapshots backed by emdb. This is
-what makes nexis differentiated from "Clojure-on-Zig" — it's
-Clojure + Datomic fused into a single binary.
+THIS HANDOFF prepares you for Phase 5: closing the "yes you
+can run real Clojure-style code" gap. The architectural
+hard work is DONE; what's left is breadth + a few specific
+new abstractions (protocols + records is the biggest).
 
-- The VM has 7 wired opcode groups: mov, cmp, math, call,
-  closure, jump, var.
-- The compiler handles every primitive-core form: literals,
-  arithmetic (`+`), comparison (`<`), conditionals (`if`), locals
-  (`let*`), do, fn* with named self-reference and `& rest`
-  variadic, recursive closures with full control-flow-safe
-  capture pre-analysis (5b/5c), `letfn*` with placeholder cells,
-  tail-position `recur` + `loop*` (constant-stack verified to
-  10k iterations), Vars + Namespace, `def` / `defn` / `(var x)`
-  with forward references.
-- **Real `.nx` source compiles end-to-end** via `compileSource()`
-  (step #7). The reader produces Forms, `lowerForm` translates
-  Form → Tiny IR, and the proven backend takes over.
-- **`bin/nexis` exists** (step H1). `nexis run FILE.nx` reads a
-  file, compiles + runs each top-level form, prints the final
-  result. Three working examples ship: `examples/hello.nx`,
-  `sum10.nx`, `forward-ref.nx`.
-- **Macroexpander scaffold landed** (step #8a). `ExpandContext`
-  + `HostMacroTable` + per-special-form traversal walker + depth
-  limit + lexical-shadowing-aware macro dispatch. With an empty
-  table (current default), the expander is a pure pass-through.
-  Spec pinned in `docs/MACROEXPAND.md` (peer-AI turn 56 review).
-
-SHIPPED to close Phase 2:
-- **#8b** (4af8c22, 5270739): 10 host core macros (when/cond/and/or/->/->>
-  + let/fn/loop renames). Default macro table wired into CLI.
-- **#8c.1** (4ad8dd3): coll:list/concat opcodes + Tiny IR +
-  #%list/#%concat + quoted compound lists.
-- **#8c.2** (32a8d34): syntax-quote / unquote / splicing /
-  auto-gensym. Caught + fixed a gating bug.
-- **#8c.3** (de3c775): coll:vector + #%vector + vector quote/
-  syntax-quote — unlocks the user-defmacro pattern.
-- **#9.1** (2527944): try/catch/throw + cross-frame unwind.
-- **#10.0** (1e5b575): SrcSpans in compile errors (gate item 5).
-- **A** (b948ab0): gate items 3+4+7 — closure depth-10 property
-  test + syntax-quote structural-equality property test +
-  bench/main.zig compiler category (compile_simple, eval_loop,
-  closure_create, eval_arith).
-- **#9.2** (a610cb4): finally clauses + throw-through-finally.
-  Coroutine continuation model. All 4 exit paths tested.
-- **#11** (8def91d): test/integration/eval_pipeline.zig — 46
-  end-to-end test cases covering every primitive-core form,
-  every macro, every try/catch/finally path.
-
-SHIPPED in Phase 3.0/3.1/3.2:
-- **Phase 3.0a** (REPL): `bin/nexis repl` interactive read-eval-
-  print loop with persistent VM/namespace/interner across lines.
-- **Phase 3.0b** (anon-fn): `#(...)` reader-macro expansion to
-  `(fn* [%1 %2 ...] body)` with `%`/`%N`/`%&` placeholders.
-- **Phase 3.0c** (catchable VmErrors): recoverable runtime
-  errors (kind-mismatch, arity-mismatch, etc.) translate to
-  keyword Values when a try-handler is active.
-- **Phase 3.1** (maps/sets): persistent maps `{:a 1}` and sets
-  `#{1 2}` as runtime literals, backed by CHAMP HAMT.
-- **Phase 3.2** (defmacro): user-defined macros with compile-
-  time VM evaluation. Fresh sub-VM per invocation; namespace
-  + interner shared via routine.var_table + const pool. Macros
-  defined earlier in a do-block are visible to later forms.
-  Lexical bindings shadow macros; user macros shadow host macros.
-
-Remaining (Phase 3.3+):
-- **stdlib bootstrap** (`stdlib/core.nx`): cons/first/rest/seq/
-  count/nth/apply + map/reduce/filter + assoc/dissoc/get + ...
-  Many ship as host fns (called from defmacro bodies + user
-  code); the rest in core.nx using existing primitives.
-- **multi-namespace** (`require`/`use`/`alias`/`refer`):
-  qualified symbol resolution + per-namespace var tables.
-- **multi-arity defn**: `(defn f ([x] …) ([x y] …))`.
-- **destructuring**: `(let [{:keys [a b]} m] …)`,
-  `(let [[x y] v] …)`.
-- **recur inside try**: rejected in v1; tractable for Phase 4.
-- **Runtime VmError SrcSpans**: PC→source map for runtime
-  error reporting parity with compile errors.
-- **Type matchers beyond `catch any`**: post-Phase-3 type
-  system.
+563 phase2 + 86 reader/golden = 649 tests in the fast inner-
+loop suite (~3s). Full suite (`zig build test`) green including
+Phase 1 randomized property tests.
 
 Read this entire prompt before touching anything.
 
@@ -127,9 +58,19 @@ Read this entire prompt before touching anything.
 - Remote:   git@github.com:shreeve/nexis.git
 - Branch:   main
 - HEAD:     check `git log -1 --oneline`. Recent commit chain
-            (newest first):
-              (pending) phase 3.6: require + file loading + :as aliases
-              e5639d8 phase 3.5b: multi-arity defn — Phase 3 SEALED
+            (newest first; ~3 dozen Phase-3+ commits):
+
+              == Phase 4 (durable identity) ==
+              8189bf8 phase 4.0f: snapshot vocabulary — TIME TRAVEL
+              d3b2412 phase 4.0e: persistent to-do tracker — Phase 4 EXIT MET
+              0c3c959 phase 4.0d: db/scan + db/reduce-tree
+              0807b5d phase 4.0c: @deref + db/alter!
+              bc21a0a phase 4.0b: with-tx / with-read-tx + tx-threaded ops
+              e64c091 phase 4.0a: durable refs backed by emdb
+
+              == Phase 3 (language core) ==
+              a1e23c4 phase 3.6: require + file loading + :as aliases
+              e5639d8 phase 3.5b: multi-arity defn
               0fe09fa phase 3.5a: destructuring in let / fn / defn params
               83f8e85 phase 3.4: multi-namespace (registry + qualified symbols + ns)
               d36b745 phase 3.3d: embedded core.nx composite stdlib layer
@@ -141,45 +82,9 @@ Read this entire prompt before touching anything.
               9364615 phase 3.0c: catchable VmErrors
               7d8a16e phase 3.0b: anon-fn `#(...)` reader-macro expansion
               4ccd281 phase 3.0a: REPL (bin/nexis repl)
-              [...] expand.zig rename + POLS arc
-              8def91d phase 2 step #11: golden + eval pipeline integration tests
-              a610cb4 phase 2 step #9.2: finally clauses + throw-through-finally
-              b948ab0 phase 2 gate item A (3, 4, 7): property tests + bench
-              1e5b575 phase 2 step #10.0: SrcSpan in compile errors — gate item 5 satisfied
-              2527944 phase 2 step #9.1: try / catch / throw + cross-frame unwind
-              de3c775 phase 2 step #8c.3: vector support — completes the macro author's toolkit
-              32a8d34 phase 2 step #8c.2: syntax-quote / unquote / splicing / auto-gensym
-              4ad8dd3 phase 2 step #8c.1: coll:list/concat opcodes + #%list/#%concat IR + quoted compound lists
-              5270739 phase 2 step #8b: peer-AI turn 57 review fixes
-              4af8c22 phase 2 step #8b: host core macros — 10 macros, all green
-              0e50c77 phase 2 step #8 preflight: MACROEXPAND.md pinned
-              98a7d33 phase 2 step H1: minimal CLI runner — first .nx programs execute
-              97aa9dd phase 2 step E1: Tiny.literal + Interner integration
-              a85b281 docs: HANDOFF.md — full refresh after step #7 + POLS cleanup
-              3dbfad6 docs: README — showcase real .nx source examples
-              6f1123b phase 2 step #7: peer-AI turn 54 review fixes + docs
-              c5d3f52 phase 2 step #7d: vars (def/defn/var) via Form
-              2c24a69 phase 2 step #7c: binding/fn forms via Form
-              3b4d467 phase 2 step #7b: list dispatch + special forms + intrinsics
-              4df693d phase 2 step #7a: Form→Tiny scaffolding + literals + symbols
-              52eb8de docs: README — soften "zero learning curve" claim
-              9e4ca42 refactor: rename hamt.zig→champ.zig + rrb.zig→vector.zig
-              7387c0c docs: README.md overhaul — Phase 2 status + Clojure-on-Zig pitch
-              cfcf353 docs: add docs/README.md module ↔ spec map
-              58382cb chore: repo POLS cleanup (peer-AI turn 52)
-              4373b6e phase 2 step #6c: defn + forward references
-              ade5e7b phase 2 step #6b: def + var:store-var + symbol fall-through
-              32b5436 phase 2 step #6a: Var + Namespace + var:load-var
-              090c469 phase 2 step #5e: variadic params (& rest)
-              cd5c47f build: add `zig build phase2-test` fast iteration target
-              0eff28d phase 2 step #5d: loop* + recur + tail-position + cmp:lt
-              2a44bb1 phase 2 step #5c: placeholder cells + letfn* + named fn*
-              36962fe phase 2 step #5b: capture machinery (pre-analysis)
-              3926fed phase 2 step #5a1: empty-capture closures + call:call/return
-              8b06c3c phase 2 step #5a0.5: typed Const pool
-              0330b6a phase 2 step #5a0: backing-stack frame refactor
-              ...
-              (full Phase 2 history: `git log --oneline | head -40`)
+
+              == Phase 2 (compiler + VM) — see `git log --oneline` ==
+
 - Working tree clean. Verify with `git status`.
 
 ═══════════════════════════════════════════════════════════════════════
@@ -249,51 +154,35 @@ Read this entire prompt before touching anything.
 
 **Two build steps; use the right one for the right loop.**
 
-For **inner-loop Phase 2 iteration** (~3 seconds):
+For **inner-loop iteration** (~3 seconds):
 ```
 cd /Users/shreeve/Data/Code/nexis
 zig build phase2-test
 ```
-Runs ONLY vm + compile tests. Expected: **308 tests pass**
-(86 vm + 222 compile as of HEAD `3dbfad6`).
+Runs vm + compile + expand + stdlib + loader + integration +
+property tests. Expected at HEAD `8189bf8`:
+  95 vm + 322 compile + 6 macro-prop + 2 stdlib + 1 loader +
+  4 closure-prop + 133 integration = **563 tests pass**.
 
-For **pre-commit validation** (~3 minutes):
+For **pre-commit validation** (~3 minutes, ~1 GB peak):
 ```
 cd /Users/shreeve/Data/Code/nexis
 zig build test --summary all
 ```
-Runs the full Phase 0/1/2 suite. Expected: ~770 tests across all
-modules. The ~3 min runtime is dominated by Phase 1's randomized
-HAMT correctness gate (one test alone runs ~100k randomized ops in
-~3 minutes, ~1 GB peak — has been OOM-killed on memory-constrained
-systems; in that case rely on phase2-test for inner-loop and run
-the full suite when system memory is freer). Phase 2 work doesn't
-touch any of that.
+Runs the full Phase 0/1/2 suite + randomized property tests.
+The ~3 min runtime is dominated by Phase 1's randomized HAMT
+gate (~100k ops, can OOM-kill on memory-constrained systems
+— use `phase2-test` for inner-loop if that bites).
 
-If either is red, STOP and diagnose before editing.
+For **end-to-end smoke** (verify Phase 4 actually persists):
+```
+cd /tmp && rm -f todos.edb
+/path/to/bin/nexis run /path/to/examples/todo-app.nx
+/path/to/bin/nexis run /path/to/examples/todo-app.nx
+```
+Second run should show `:completed 1` — state PERSISTS.
 
-Test breakdown at HEAD `3dbfad6`:
-  Phase 2 modules (run via `zig build phase2-test`):
-    86 vm        (Var/Namespace + var:* opcodes + cmp:lt + recur
-                  + variadic rest + capture machinery + closures
-                  + tail-position machinery + ...)
-   222 compile   ((1) Tiny IR — nil/bool/int/symbol/add/lt/if/
-                  let_star/do/fn_star/call/letfn_star/loop_star/
-                  recur/def/var_ref/defn — 135 tests; (2) Form→
-                  Tiny lowering frontend — literals, symbols,
-                  list dispatch, special forms, intrinsics with
-                  LowerEnv shadowing, binding/fn forms,
-                  vars — 87 tests via compileSource() against
-                  real source strings)
-  Phase 0/1 modules (run via `zig build test`):
-    Inline runtime tests (32 binaries, mostly unchanged since
-    Phase 1 close): hash, value, eq, intern, heap, string, list,
-    vector, bignum, champ (was hamt), transient, dispatch, gc,
-    codec, db, pool, reader.
-    Property tests (test/prop/, 12 files): primitive, intern,
-    heap, string, list, bignum, vector, champ, gc, transient,
-    codec, db.
-    Golden reader tests: 10  test/golden/
+If anything is red, STOP and diagnose before editing.
 
 If you run `zig build parser` for any reason, note it requires
 ../nexus/bin/nexus to exist. Regenerating src/parser.zig isn't
@@ -702,10 +591,14 @@ Phase 0 (still in place):
   src/parser.zig      GENERATED (do not edit; regenerate via `zig build parser`)
 ```
 
-### 7.2 Phase 2 progress (COMPLETE)
+### 7.2 Phase 2 progress (COMPLETE — historical detail)
+
+**Status: all 7 gate items + 11 sub-steps SHIPPED.** Brief
+history below for context only; new work doesn't need to
+re-litigate any of this.
 
 ```
-SHIPPED (steps #1-#7 of COMPILER.md §10's 11-step plan):
+ALL STEPS SHIPPED (COMPILER.md §10's 11-step plan):
   [x] step #1  VM kernel (mov:move, load-const, load-nil/true/false,
                call:return, return-nil) — 6 core opcodes.
   [x] step #2  math:add opcode + Tiny.add + literal-pair peephole.
@@ -761,26 +654,16 @@ SHIPPED (steps #1-#7 of COMPILER.md §10's 11-step plan):
                  forward-reference end-to-end via source:
                  (do (defn f [] (g)) (defn g [] 42) (f)) => 42.
 
-PENDING per COMPILER.md §10:
-  [ ] step #8   NEXT — Macroexpand + syntax-quote + #%anon-fn +
-                quoted-symbol/collection support + auto-gensym
-                hygiene (PLAN §14.2). Closes the deferred items
-                pinned at step #7:
-                  - quoted symbols/keywords/strings/collections
-                  - anon_fn `#(...)` shorthand
-                  - syntax_quote / unquote / unquote_splicing
-                  - Tiny.literal: Value variant (peer-AI turn 51
-                    §Q3, deferred to #8)
-                Requires symbol/keyword Value support via the
-                existing Interner (src/intern.zig).
-  [ ] step #9   try/catch/throw (VM.md §12 minimal v1 spec).
-  [ ] step #10  Error-reporting hardening — SrcSpan threading
-                end-to-end (Form.origin is already preserved by
-                the reader; compile errors currently drop it).
-                Bucketed CompileError.ReaderFailure expands into
-                structured errors carrying the original reader
-                ErrorKind + span.
-  [ ] step #11  Golden + eval pipeline tests; Phase 2 gate close.
+  [x] step #8a-c  Macroexpand + syntax-quote + collection
+                  literals + auto-gensym hygiene.
+  [x] step #9.1/.2  try/catch/throw + finally.
+  [x] step #10.0  SrcSpan threading in compile errors.
+  [x] step #11   Golden + eval pipeline integration tests
+                 (46 cases).
+  [x] gate A   Property tests (3, 4, 7) + bench/main.zig.
+
+All Phase 2 work merged. Phase 3 + 4 built on top WITHOUT
+reshaping the Phase 2 architecture.
 
 OPTIONAL / DEFERRED (decided explicitly, not blockers):
   [ ] call:tailcall opcode — context propagation differs from
@@ -891,39 +774,48 @@ Spec amendments tracked in amendment logs:
 8. Interning invariants                         SHIPPED
 ```
 
-### 7.5 Phase 2 gate (per COMPILER.md §9.4)
+### 7.5 Phase 2 gate (per COMPILER.md §9.4) — ALL CLOSED
 
 ```
-1. Every primitive-core form compiles + executes correctly      MOSTLY
-   Via REAL .nx source through compileSource():
-     nil, bool, int, symbol, +, <, if, do, quote-of-scalar,
-     let*, fn* (with self-name + & rest), call, letfn*,
-     loop*, recur, def, defn, (var x) — ALL WORKING.
-   Pending for full gate: macros (step #8 — closes quoted
-   symbols / collection literals / #(...) / syntax-quote) +
-   try/catch/throw (step #9).
-2. recur in 10k-iter loop runs in constant stack space          SHIPPED
-   (5d test verifies both stack_high_water and frame_high_water
-   are unchanged across 10k iterations)
-3. Closure capture works across deeply-nested fns               SHIPPED
-   (5b: 3-level transitive captures; 5c: letfn* mutual recursion
-   via placeholder cells; 5e: captured rest params)
-4. syntax-quote / unquote / unquote-splicing produce equivalent PENDING
-   structurally-equal Forms to hand-coded equivalents
-   (step #8: macroexpander)
-5. Compiler errors report stable error-kind keyword + primary   PARTIAL
-   SrcSpan + macro origin when applicable
-   (CompileError variants exist + cover Form-side malformed
-   shapes via MalformedForm/ExpectedSymbol/ExpectedVector;
-   SrcSpan threading lands with step #10 — the reader already
-   produces Form.origin, the compiler just doesn't propagate
-   it into errors yet)
-6. All golden tests pass; full test suite remains green         ON TRACK
-   (~770 tests total at HEAD 3dbfad6: 86 vm + 222 compile +
-    ~454 Phase 1 + 10 golden, all green)
-7. bench/compiler.zig measures compilation throughput, eval     PENDING
-   throughput, closure-creation cost, recur per-iter cost
-   (Phase 6 polish; not a blocker for Phase 2 gate close)
+1. Every primitive-core form compiles + executes correctly      ✅ SHIPPED
+2. recur in 10k-iter loop runs in constant stack space          ✅ SHIPPED
+3. Closure capture works across deeply-nested fns               ✅ SHIPPED
+4. syntax-quote / unquote / splicing                            ✅ SHIPPED
+5. Compiler errors report kind + SrcSpan + macro origin         ✅ SHIPPED (#10.0)
+6. All golden tests pass; full test suite remains green         ✅ 649 tests
+7. bench/compiler.zig measures throughput                       ✅ SHIPPED (b948ab0)
+```
+
+### 7.6 Phase 3 + 4 status — all shipped except 3.7 (deferred)
+
+```
+PHASE 3 — language breadth                  ✅ COMPLETE (3.7 deferred)
+  3.0a REPL + 3.0b anon-fn + 3.0c catchable VmErrors
+  3.1 maps/sets as literals
+  3.2 user defmacro with compile-time VM eval
+  3.3a/b/c/d native_fn + HOFs + collections + core.nx layer
+  3.4 multi-namespace + (ns NAME) + qualified symbols
+  3.5a/b destructuring + multi-arity defn
+  3.6 require + :as aliases + file loading
+
+  Deferred (Phase 5+):
+    3.7 ^:dynamic Vars + (binding ...) — peer-AI turn 71:
+        defer until concrete need surfaces.
+
+PHASE 4 — durable identity                  ✅ COMPLETE
+  4.0a Connection + durable_ref + auto-ephemeral primitives
+  4.0b with-tx / with-read-tx + WriteTxn/ReadTxn + tx-threaded ops
+  4.0c @deref operator + db/alter! read-modify-write
+  4.0d db/scan + db/reduce-tree
+  4.0e examples/todo-app.nx — Phase 4 EXIT CRITERION MET
+  4.0f snapshot vocabulary (db/snapshot + with-snapshot) —
+       time travel verified
+
+  Phase 4 substantive deferral:
+    db/as-of "database as a value" abstraction (PLAN.md §15.7
+    Datomic-style ambient snapshot context). Would need new
+    Kind.db_value + ambient-context dispatch in all deref/get
+    ops. Substrate is sufficient for explicit-snapshot use.
 ```
 
 ═══════════════════════════════════════════════════════════════════════
@@ -1000,78 +892,427 @@ From PLAN.md §"Start here" and accumulated hard lessons:
   `vm.Operand` rely on this; if you add fields, mind the bit order.
 
 ═══════════════════════════════════════════════════════════════════════
-## 10. IMMEDIATE NEXT TASK — Phase 3.3 (stdlib bootstrap)
+## 10. IMMEDIATE NEXT TASK — Phase 5: close the "runs Clojure code" gap
 
-**Phase 2 + Phase 3.0/3.1/3.2 are COMPLETE.** The language now
-has every primitive core form, host macros, user-defined
-`defmacro` with compile-time VM eval, persistent maps/sets,
-catchable VmErrors, anon-fn shorthand, REPL, and file runner.
-The next substantive work is Phase 3.3.
+Per the architectural assessment at end of Phase 4, the
+remaining work to make a typical Clojure-style program
+(modulo Java interop) runnable on nexis is **bounded and
+well-understood**. Six items, with peer-AI design pins
+locked in turn 74:
 
-### Phase 2 gate (COMPILER.md §9.4) — all green
-| # | Item | Status |
-|---|---|---|
-| 1 | Every primitive-core form compiles + executes | ✅ |
-| 2 | 10k-iter `recur` constant-stack | ✅ |
-| 3 | Closure capture depth-10 (property test) | ✅ b948ab0 |
-| 4 | syntax-quote/unquote/splice structural-equal | ✅ b948ab0 |
-| 5 | Compile errors → kind + SrcSpan + macro origin | ✅ 1e5b575 |
-| 6 | Full suite passes (≥441 tests) | ✅ 581 tests |
-| 7 | `bench/compiler.zig` (throughput) | ✅ b948ab0 |
+| # | Item | Effort | New ground? |
+|---|---|---|---|
+| 1 | Atoms (`atom`/`swap!`/`reset!`/`@a`) | ~1 session | NO — small native fn arc |
+| 2 | Strings as first-class + basic I/O | ~2 sessions | NO — string Kind exists |
+| 3 | **Protocols + records** | ~3-5 sessions | **YES** — new Value kind + dispatch tables |
+| 4 | `case` / `condp` / `for` macros | ~1 session | NO — pure expansion |
+| 5 | Broader `core.nx` stdlib breadth | ongoing | NO — user-land |
+| 6 | Regex | ~1 session import / more if scratch | NO if importing |
 
-### Phase 3.0/3.1/3.2/3.3a ship list
-  ✅ 3.0a REPL (`bin/nexis repl`)
-  ✅ 3.0b anon-fn `#(...)` → `(fn* [%1 %2 ...] body)`
-  ✅ 3.0c catchable VmErrors → keyword Values via try/catch
-  ✅ 3.1  persistent maps `{:k v}` + sets `#{e}` as literals
-  ✅ 3.2  user-defined `defmacro` with compile-time VM eval
-  ✅ 3.3a native_fn infra + 10 macro-authoring primitives
-        (`list`/`cons`/`first`/`rest`/`count`/`nth`/`empty?`/
-        `identity`/`nil?`/`some?`)
+Items 1, 4, 5, 6 are well-understood "do the obvious work."
+Items 2, 3 have design surface — peer-AI turn 74 pins below.
 
-### What Phase 3.3b+ looks like
+---
 
-Per peer-AI turn 67 §D9 refined split:
-  - **3.3b** `VM.callValue` (REENTRANT VM execution) + `apply` +
-    HOFs (`map`/`reduce`/`filter`) + first-class arithmetic /
-    comparison Vars (`+`/`<`/`=`/`inc`/`dec`/`zero?`/`pos?`/
-    `neg?`/`odd?`/`even?`/`not`). The `VM.callValue` design is
-    the subtle one — must track frame depth, propagate
-    throws/finally through native calls, NOT corrupt the
-    current frame.
-  - **3.3c** Collection utilities (`vector`/`vec`/`hash-map`/
-    `hash-set`/`assoc`/`dissoc`/`get`/`contains?`/`keys`/
-    `vals`/`conj`).
-  - **3.3d** Embedded `core.nx` for composite macros + fns
-    (`when-let`/`if-let`/`dotimes`/...).
-  - **3.4** Multi-namespace (`require`/`use`/qualified symbols).
-  - **3.5** Multi-arity `defn` + destructuring.
-  - **post-3.5**: Runtime VmError SrcSpans (PC→source map).
+### 10.1 Item 1 — Atoms (peer-AI turn 74 §A)
 
-### Recommended Phase 3.3b onboarding
+In-memory mutable cell. The simplest Clojure concurrency primitive.
 
-1. Read peer-AI turn 67 (this conversation) — D7 + Sharp
-   warning §4 cover `VM.callValue` design pitfalls.
-2. Strategy turn with peer-AI on `VM.callValue` signature +
-   frame-depth tracking + throw/finally propagation.
-3. Hand-trace `(reduce + 0 [1 2 3 4 5])` end-to-end BEFORE
-   coding: native `reduce` invokes native `+` via `callValue`
-   in a loop; `+` returns to `reduce`; `reduce` returns final
-   value to caller.
+**Design pins:**
+  - New `Kind.atom = 34`. Heap-allocated `AtomBox { value: Value }`.
+    Stored in `vm.runtime_arena`.
+  - **Equality**: atoms compare by IDENTITY, NOT contained value.
+    `(= (atom 1) (atom 1))` → false. Critical.
+  - Native fns to install in `nexis.core`:
+    - `(atom init)` → atom
+    - `(atom? x)` → bool
+    - `(reset! a v)` → v (unconditional set)
+    - `(swap! a f & args)` → new value (read → apply f → write)
+    - `(swap-vals! a f & args)` → `[old new]` 2-vector
+    - `(compare-and-set! a old new)` → bool
+  - `swap!` uses `VM.callValue` (same pattern as `db/alter!`).
+    If `f` throws, atom is NOT mutated.
+  - `@a` works via the UNIVERSAL `deref` (extend dispatch in
+    `db/deref` to add the atom arm; or — better — RENAME
+    `db/deref` to `deref` in `nexis.core` and keep `db/deref`
+    as an alias).
+  - Single-threaded VM in v1 — no actual CAS retry semantics;
+    `compare-and-set!` is just an atomic check-and-set under
+    the single-threaded execution model. Document.
+  - Validators / watches / metadata DEFERRED.
 
-### Active design surface for next-AI
+**Sub-step:** one session, one commit. Add Kind, native fns,
+universal-deref extension, integration tests, commit.
 
-The Phase 2 architecture is settled. Tiny IR + LowerCtx +
-ExpandContext + VM's group-based opcode dispatch are
-all stable interfaces. Phase 3 work BUILDS on this without
-reshaping.
+---
 
-The one Phase-2 residual to flag: **runtime VmError
-SrcSpans**. Currently runtime errors (UncaughtThrow / etc.)
-lack source spans. Adding them requires a PC→source map per
-Routine. Bounded work (~1 session) but pulls in a compiler-
-side instruction-to-source mapping table that doesn't exist
-yet. Nice-to-have for UX but post-gate.
+### 10.2 Item 2 — Strings as first-class + basic I/O (peer-AI turn 74 §B)
+
+`Kind.string = 16` already exists in value.zig with heap
+representation. The stdlib just doesn't expose much yet.
+
+**Design pins:**
+
+Core string API (install in `nexis.core`):
+```clojure
+(str & xs)         ; concat any-to-string; nil→""; matches Clojure
+(string? x)        ; predicate
+(subs s start)
+(subs s start end)
+(count s)          ; EXTEND existing count to strings
+(nth s i)          ; EXTEND existing nth to strings
+```
+
+`str` semantics (Clojure-canonical):
+```clojure
+(str)             => ""
+(str nil)         => ""
+(str :x)          => ":x"
+(str "a" 1 :b)    => "a1:b"
+```
+
+`nexis.string` namespace (separate, not auto-referred — like Clojure's
+`clojure.string`):
+```clojure
+nexis.string/lower-case
+nexis.string/upper-case
+nexis.string/trim
+nexis.string/split
+nexis.string/join
+nexis.string/replace
+```
+
+I/O fns (install in `nexis.core` — synchronous, UTF-8 only):
+```clojure
+(slurp path)        ; read file → string
+(spit path content) ; write string → file
+(print & xs)        ; stdout, no newline
+(println & xs)      ; stdout + newline
+(prn & xs)          ; reader-readable form
+```
+
+**Print distinction** (matches Clojure):
+  - `str` / `print` / `println` → human-ish, strings unquoted
+  - `prn` → reader-readable, strings quoted + escaped
+  - v1.alpha can ship with ONE formatter shared by all four;
+    document that `prn` will diverge once a separate
+    pr-str-style formatter lands.
+
+**Catchable error keywords:**
+  - `:io-error`
+  - `:file-not-found`
+  - `:invalid-path`
+  - `:utf8-error`
+
+**File ops**: use Zig 0.16 `std.Io.Dir` (same pattern as
+src/loader.zig). Loader is the working reference for the
+I/O pattern; copy from there.
+
+**Deferred**: readers/writers, `with-open`, binary I/O,
+encodings beyond UTF-8, append-mode option maps.
+
+**Sub-steps:**
+  - **5.2a** — `str` + `string?` + extend `count`/`nth` + core
+    string ops in `nexis.core`. One commit.
+  - **5.2b** — `nexis.string` namespace with case/trim/split/
+    join/replace. One commit.
+  - **5.2c** — I/O fns (`slurp`/`spit`/`print`/`println`/`prn`).
+    One commit. NOTE: extracting `formatValue` from cli.zig into
+    a public stdlib fn is part of this; print/println share it.
+
+---
+
+### 10.3 Item 3 — Protocols + Records (peer-AI turn 74 §C)
+
+**The BIG one.** Real new design ground. The Clojure pattern:
+
+```clojure
+(defprotocol IFoo
+  (bar [this x])
+  (baz [this x y]))
+
+(defrecord Counter [n]
+  IFoo
+  (bar [this x] (assoc this :n (+ x (:n this))))
+  (baz [this x y] [:counter (+ x y)]))
+
+(extend-protocol IFoo
+  Map
+  (bar [m x] (assoc m :extended x))
+  (baz [m x y] [:map x y]))
+
+(satisfies? IFoo (Counter. 0))   ; => true
+(bar (Counter. 5) 3)              ; => #Counter{:n 8}
+(bar {} 99)                        ; => {:extended 99}
+```
+
+**Architectural pin: ONE `Kind.record = 35`, NOT tagged maps,
+NOT one kind per record type.**
+
+Tagged maps tempting but create semantic problems: record
+identity blurs, equality with plain maps accidental, dispatch
+inspects map contents, fields/extras get messy.
+
+Per-record-type new kinds is IMPOSSIBLE: our 6-bit kind tag
+can't support dynamic per-record kinds.
+
+Middle ground: one `Kind.record` with a `RecordTypeId` in the
+heap body.
+
+**Storage shape:**
+```zig
+Kind.record = 35
+RecordValue {
+    type_id: RecordTypeId,         // points at RecordType metadata
+    fields: Value (persistent_map), // keyword → value
+}
+```
+
+**Protocol dispatch key (unified):**
+```zig
+DispatchType = union(enum) {
+    kind: Value.Kind,         // built-ins (.string, .persistent_map, ...)
+    record_type: RecordTypeId,
+    default,                  // Object/Any fallback
+};
+```
+
+For a receiver:
+```text
+if kind == .record:
+    key = .record_type(record.type_id)
+else:
+    key = .kind(value.kind())
+```
+
+**Protocol object shape:**
+```zig
+Protocol {
+    name: QualifiedSymbol,
+    methods: HashMap(method_name → MethodSpec),
+}
+
+MethodSpec {
+    name: []const u8,
+    arities: []u16,
+    impls: HashMap(DispatchType → *Closure),
+    default_impl: ?*Closure,
+}
+```
+
+**`defprotocol`** (host macro / special form):
+  1. Create a Protocol object stored as a Var in the current ns.
+  2. For each method, generate a DISPATCHER fn (or native fn)
+     that looks up the impl via the protocol's dispatch table:
+     ```text
+     (defn bar [this x]
+       (let [impl (lookup-protocol-impl IFoo :bar this)]
+         (if impl
+           (impl this x)
+           (throw :no-protocol-impl))))
+     ```
+  - Native fn is easier for v1 (needs to walk internal tables).
+
+**`defrecord`** (host macro / special form):
+  1. Create RecordType metadata (name, fields list, ns) and
+     register in the current namespace.
+  2. Generate `(->Counter n)` positional constructor + `Counter?`
+     predicate.
+  3. Register provided protocol impls in the protocol tables.
+  4. (Optional) `map->Counter` constructor.
+
+**`extend-protocol` / `extend-type`** — mutate protocol method
+tables. Dispatch targets:
+  - Built-in type names: `String`, `Map`, `Vector`, `List`,
+    `Nil`, `Atom`, `Set`, `Keyword`, `Symbol`, `Number`, ...
+    Resolve via name → `Value.Kind` lookup table.
+  - Record names → `RecordTypeId`.
+  - `Object` or `Any` → `DispatchType.default`.
+
+**`satisfies?`** — check that ALL of the protocol's methods
+have an impl/default for the receiver's dispatch key.
+
+**Field access** (minimum):
+  - `(get rec :n)` — works like map get
+  - `(assoc rec :n v)` — returns a record of the same type with
+    updated field map
+  - Extra keys: allow (record carries extmap) OR reject. Lean:
+    allow, store in extmap; matches Clojure's semantics.
+
+**Sub-steps (3-5 sessions):**
+  - **5.3a** — `Kind.record` + `RecordType` + `RecordTypeId`
+    registry on VM + basic constructor/predicate/get/assoc.
+    NO protocols yet. One commit.
+  - **5.3b** — `defprotocol` + dispatcher fns + protocol Var
+    storage. One commit.
+  - **5.3c** — `defrecord` with inline impls, registers in
+    protocol tables. One commit.
+  - **5.3d** — `extend-protocol` / `extend-type` / `satisfies?`
+    + `Object`/`Any` default fallback. One commit.
+
+**Hand-trace before code**: walk through `(defprotocol IFoo
+(bar [this]))` + `(defrecord Counter [n] IFoo (bar [this] n))`
++ `(bar (Counter. 5))` end-to-end through:
+  - defprotocol expansion → Var registration + dispatcher fn
+  - defrecord expansion → RecordType + ->Counter ctor + impl
+    registered in Protocol's method table
+  - (Counter. 5) → record Value construction
+  - (bar (Counter. 5)) → dispatcher native fn → lookup
+    DispatchType.record_type(Counter.type_id) → invoke impl
+
+---
+
+### 10.4 Item 4 — `case` / `condp` / `for` macros
+
+Pure expansion. All three are user-defmacros in `core.nx` or
+host macros in expand.zig.
+
+**`case`** (peer-AI turn 74 §4 trap): expand to chained `if`
+with a gensym for single-eval of the test expression:
+```clojure
+(case e k1 v1 k2 v2 default)
+→
+(let [g# e]
+  (if (= g# k1) v1
+    (if (= g# k2) v2
+      default)))
+```
+Clojure's `case` uses hash dispatch + compile-time constants;
+the chained-if expansion is v1-acceptable performance.
+
+**`condp`** — like `cond` but tests `(pred test-expr clause)`
+for each clause.
+
+**`for`** (peer-AI turn 74 §4 warning): full Clojure `for`
+supports `:let` / `:when` / `:while` + lazy seq + multi-binding.
+**v1 scope: subset only.** Document clearly. Lean:
+  - Multi-binding cartesian product: yes
+  - `:when` (filter): yes
+  - `:let`: yes
+  - `:while`: no
+  - Lazy seq: no — EAGER list/vector return
+  - Call it "nexis `for`, a subset of Clojure `for`" in docs.
+
+**Effort**: ~1 session, one commit. Maybe split into 5.4a
+(case+condp, trivial) and 5.4b (for, subset).
+
+---
+
+### 10.5 Item 5 — Broader `core.nx` stdlib
+
+Pure user-land. Add to `src/stdlib/core.nx`:
+```
+partition / partition-by
+interleave / interpose
+frequencies / group-by
+distinct / dedupe
+zipmap / merge / merge-with
+update / update-in / assoc-in / get-in
+some / every? / not-any? / not-every?
+comp / juxt / partial / complement
+constantly / fnil
+min / max / min-key / max-key
+sort / sort-by (uses < — easy)
+range with optional start/step (currently only single-arg)
+```
+
+ALL written in nexis. Test against expected eager-seq results.
+
+**Effort**: ongoing, low-risk per addition. One commit per
+batch of ~5-10 fns.
+
+---
+
+### 10.6 Item 6 — Regex (peer-AI turn 74 §6 warning)
+
+NOT purely mechanical. Decisions:
+  - Pick regex backend: import a Zig regex library (PCRE-style),
+    OR write a small one (defer).
+  - New `Kind.regex` opaque-Value (compiled regex object).
+  - Match result shape: Clojure returns matched-substring or
+    `[whole, group1, group2, ...]` vector for capture groups.
+  - Native fns: `re-find`, `re-matches`, `re-seq`, `re-pattern`,
+    `re-quote-replacement`, optional `re-groups`.
+
+Keep regex SEPARATE from string basics (5.2). Don't conflate.
+
+**Effort**: ~1 session if importing a Zig regex lib; multiple
+sessions if writing from scratch.
+
+---
+
+### 10.7 Suggested ordering
+
+Per leverage + risk:
+
+1. **Atoms (Item 1)** — small, gives users in-memory mutable
+   state. Most-asked-for after persistent state.
+2. **Strings + I/O (Item 2)** — unlocks `(slurp ...)` /
+   `(println ...)` — every real program needs these.
+3. **case / condp / for subset (Item 4)** — easy macro wins.
+4. **Broader core.nx (Item 5, ongoing)** — start in parallel
+   with Items 1-4; each addition is low-risk.
+5. **Protocols + records (Item 3)** — biggest, most architectural.
+   Save for when 1+2+4 are stable so you're working against a
+   solid foundation.
+6. **Regex (Item 6)** — depends on library decision; do
+   separately.
+
+After Items 1+2+4: you can write a non-trivial nexis program
+that LOOKS like Clojure and uses the same idioms (immutable
+data + atoms + I/O + macros).
+
+After Item 3: you can port a typical Clojure library that
+uses protocols + records (which is most of them).
+
+After Items 5+6: typical Clojure libraries that don't touch
+Java interop are within porting reach.
+
+---
+
+### 10.8 Phase 5 EXIT criterion
+
+Per PLAN.md §21 Phase 5 (reframed by us in this handoff):
+
+**A non-trivial Clojure-style application — not just a script,
+but a multi-file project using atoms + protocols + records +
+require + multiple stdlib utilities — runs end-to-end on
+nexis with no source modifications beyond namespace renames
+(`clojure.string` → `nexis.string`, etc.).**
+
+Candidate demos:
+  - Port a small Datascript-style in-memory entity store.
+  - Port a small JSON parser written in pure Clojure.
+  - Port a stripped-down `clj-time`-style date library.
+  - Write a multi-file todo CLI with protocols for storage backends
+    (in-memory vs. durable via Phase 4).
+
+---
+
+### 10.9 Architectural surface that's settled
+
+The hard stuff is DONE. These interfaces are stable; new work
+builds on them WITHOUT reshaping:
+
+- **Value model** (16-byte tagged Value, Kind enum). New kinds
+  add to the enum (currently 30 used). Heap-kind bodies are
+  free-form per-kind.
+- **VM** (group-based opcode dispatch, frame management,
+  callValue reentrancy, handler/finally stacks).
+- **Compiler** (lowerForm → Tiny → bytecode; emitter; var_table).
+- **Expander** (per-form-rule walker, syntax-quote, host +
+  user macros, compile-eval callback, namespace + load
+  callbacks).
+- **Namespaces** (registry + auto-refer + qualified resolution
+  + alias tables + loader).
+- **Codec** (round-trip for all v1 kinds).
+- **emdb integration** (Connection, txn handles, codec-wired
+  read/write/scan).
+
+The single Phase-2 residual still on the wish-list:
+  - **Runtime VmError SrcSpans** (PC→source map per Routine).
+    Currently runtime errors lack source spans. ~1 session,
+    bounded. Nice UX win; not blocking anything.
 
 ═══════════════════════════════════════════════════════════════════════
 ## 11. THE QUALITY BAR — what makes this project world-class vs just competent
@@ -1185,28 +1426,54 @@ The force remains with you.
 ═══════════════════════════════════════════════════════════════════════
 ## 12. WHAT TO DO IN YOUR FIRST MESSAGE
 
-1. Run `git log --oneline -10` and `git status`. Confirm you're at
-   the most recent commit on a clean main.
-2. Run `zig build test --summary all`. Confirm 487 tests, 68 build
-   steps, all green.
-3. Read PLAN.md (75 min). Do not skim §6, §11, §12, §14, §20.2,
-   §21, §23.
-4. Read at minimum: AGENTS.md, ZIG-0.16.0.md, docs/VM.md,
-   docs/COMPILER.md, docs/SEMANTICS.md, docs/VALUE.md.
-5. Post a short status summary:
-   - What you read.
-   - Build status with exact test count.
-   - Proposed next module (default: step #3 conditionals per §10
-     above; argue for whichever you prefer with reasons).
+1. Run `git log --oneline -15` and `git status`. Confirm you're
+   at the most recent commit on a clean main. HEAD should be
+   `8189bf8` (phase 4.0f) or later.
+2. Run `zig build phase2-test --summary all`. Confirm 563
+   phase2 tests + supporting categories, all green. Full
+   `zig build test` includes Phase 1 randomized property
+   tests (peaks ~1 GB RAM; can OOM-kill on smaller boxes —
+   use `phase2-test` for inner-loop.)
+3. Run the Phase 4 EXIT demo to confirm durable identity
+   actually works:
+   ```
+   $ rm -f /tmp/todos.edb
+   $ cd /tmp && /path/to/bin/nexis run /path/to/examples/todo-app.nx
+   $ /path/to/bin/nexis run /path/to/examples/todo-app.nx
+   ```
+   Second run should show `:completed 1` (state PERSISTED).
+4. Read PLAN.md §0-§3 (positioning + non-goals) and §21
+   (roadmap with current ship status). Skim §15 (durable
+   identity model) since Phase 4 is done. Read §23 (frozen
+   decisions) before any architectural proposal.
+5. Read this HANDOFF.md §10 (Phase 5 plan with peer-AI turn
+   74 design pins for atoms, strings/IO, protocols).
+6. Read AGENTS.md, ZIG-0.16.0-{REFERENCE,QUICKSTART}.md,
+   docs/MACROEXPAND.md (for understanding how user macros
+   work — protocols will be macros too).
+7. Post a short status summary:
+   - HEAD commit, test count, Phase 4 demo passed/failed.
+   - Which Item from §10 you propose starting (default per
+     §10.7 ordering: Item 1 atoms first).
    - Any clarifying questions.
-6. After user confirms, engage peer AI via `user-ai` MCP with
+8. After user confirms, engage peer AI via `user-ai` MCP with
    `conversation_id: "nexis-phase-1"` for a strategy check on
-   step #3 (the four design questions in §10 above) BEFORE writing
-   code.
+   your chosen item BEFORE writing code. (Turn count is ~74
+   as of this handoff; the conversation has FULL context on
+   architectural decisions from Phases 0-4.)
+9. Hand-trace before code for protocols (Item 3). It's the
+   only Item where doing this matters; the others are obvious
+   once the design pin is locked.
 
 Good luck. Every commit you ship is already being reviewed by
 peer AI, by the user, and by the quality bar in §11. Hold the
 line.
+
+Phase 4 sealed the differentiated pitch ("Clojure + Datomic,
+single binary"). Phase 5 closes the "yes you can run real
+Clojure-style code" gap. The hard architectural work is DONE;
+what's left is breadth and a few specific new abstractions —
+all designed in §10.
 ```
 
 ---
@@ -1214,7 +1481,7 @@ line.
 A few notes about the handoff mechanics:
 
 - **Conversation thread**: `conversation_id: "nexis-phase-1"` is now ~35 turns and ~14 sessions deep. Peer AI will remember everything we've discussed, including specific corrections it has made (turn 33's KindMismatch alignment, turn 34's three closure bugs, turn 35's 15 drifts). This is enormous accumulated context — preserving it is high-leverage.
-- **Test count**: `487/487 tests, 68 build steps` is the ground truth for "clean starting state."
-- **Phase 2 step #2 boundary**: the tiny `compile.zig` exists but is intentionally limited. Step #3 is where it grows up to handle real Form-tree shapes (or extends `Tiny` recursively, depending on what the strategy turn decides).
+- **Test count**: `563 phase2 + 86 reader/golden = 649 fast suite` is the ground truth for "clean starting state" at HEAD `8189bf8`.
+- **Conversation thread**: `conversation_id: "nexis-phase-1"` is now ~74 turns deep. Peer AI has full context on every architectural decision from Phases 0-4, including the Phase 5 design pins for atoms/strings/protocols (turn 74). Don't make peer re-derive what it already pinned.
 - **Spec convergence**: COMPILER.md and VM.md are now the load-bearing contracts for steps #3-#11. The amendment logs in each cite the peer-AI turn that drove each change.
 - **Hand-trace discipline**: two hand-traces this session caught spec holes that would have manifested as bugs in step #5. Recommend the next AI do at least one before any non-trivial step (probably step #5 itself, since closures are the most novel design surface).
