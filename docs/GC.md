@@ -428,6 +428,70 @@ module imports `gc.zig`. Per-kind modules receive the visitor as
 
 ---
 
+### 11.5 Future-migration audit checklist (carry-over for post-v1)
+
+The v1 collector is explicit-only (§9); `heap.alloc` never triggers a
+collection. When the collector eventually migrates to allocation-
+triggered (Phase 6 perf pass, or post-v1 generational nursery — both
+deferred), every native fn that allocates **after** holding Values only
+in Zig locals becomes a rooting hazard. The pattern looks like:
+
+```zig
+old = read_some_value();
+new = try vm.callValue(f, args);
+mutate_some_state(new);              // may drop last edge to `old`
+return try build_vector(old, new);   // alloc may trigger GC; `old`
+                                     // only in Zig local — at risk
+```
+
+**General rule** (peer-AI turn 76): any native fn that calls
+`heap.alloc` (or any allocating helper that may transitively call it)
+while holding non-rooted `Value`s in Zig locals must either root those
+Values (via the post-v1 root-stack API) or prove they are still
+reachable from VM slots / Vars / heap collections that are themselves
+rooted.
+
+Confirmed sites in current code (Phase 5):
+
+- `src/stdlib.zig fnAtom` — single `atom_mod.make` call; the init
+  arg lives in the args slice, which `vm.invokeNative` already keeps
+  reachable through the caller's slot window for the duration of the
+  call. Safe today; audit on migration anyway.
+- `src/stdlib.zig fnSwapValsBang` — builds `[old new]` vector AFTER
+  writing `body.value = new`. (`docs/ATOM.md` §4.5)
+- `src/stdlib.zig buildListFromSlice` — cons calls between iterations
+  hold the intermediate `result` in a Zig local. (Pre-existing GC TODO
+  comment at the function definition; predates atoms.)
+- `src/stdlib.zig fnApply` / HOF callbacks generally — any
+  `vm.callValue` invocation called between allocations.
+- `src/stdlib.zig fnDbAlter` — write happens AFTER `callValue`, so
+  `old`/`new` are not at risk in this fn specifically, but the
+  reentrancy of `vm.callValue` itself is what triggered turn 49's
+  variadic-rest construction discussion.
+- **Catch-all**: every entry in `core_fns` / `db_fns` that calls
+  `heap.alloc` directly or indirectly is in-scope for the migration
+  audit; the list above is the known-non-trivial subset. Future
+  Phase 5 items adding native fns (strings, I/O, records) MUST
+  document their rooting story when they land, OR explicitly extend
+  this checklist.
+
+Migration plan when triggered-GC lands:
+
+1. Grep `vm.callValue` call sites in `src/stdlib.zig` (and
+   `src/db.zig` if it grows similar patterns).
+2. For each: classify whether any local Value could become unrooted
+   between `callValue` and the next use of that local.
+3. Add a root-stack push/pop API (PLAN §10 future-work) and wrap
+   exposed sites.
+4. Verify with a randomized property test that forces GC at every
+   allocation boundary during a `swap!` / `apply` / `reduce` cascade.
+
+Listed here so the Phase 6 audit catches all sites at once rather than
+discovering them ad-hoc. peer-AI turn 75 §Q9 raised this for atoms
+specifically; the checklist is the broader carry-over.
+
+---
+
 ### 12. What GC.md does not cover
 
 - **Per-kind trace implementations.** Each kind's own doc is amended

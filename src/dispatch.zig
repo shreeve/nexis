@@ -65,6 +65,7 @@ const bignum = @import("bignum");
 const champ = @import("champ");
 const transient = @import("transient");
 const db = @import("db");
+const atom = @import("atom");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -161,6 +162,12 @@ pub fn heapHashBase(v: Value) u64 {
         // SEMANTICS.md §3.2. The advisory `conn` pointer is NOT
         // part of the hash (DB.md §7.2).
         .durable_ref => @as(u64, db.hashHeader(h)),
+        // Phase 5 Item 1 (peer-AI turn 75): atoms hash on their
+        // *HeapHeader pointer identity only; the contained value
+        // is NEVER consulted (mutation must not change an atom's
+        // hash, or atom-as-map-key would break across mutations).
+        // ATOM.md §3, SEMANTICS.md §2.6 amendment.
+        .atom => @as(u64, atom.hashHeader(h)),
         // Transients are not hashable per SEMANTICS §3.2 / PLAN §9.4:
         // "transient — throws `:no-hash-on-transient`". Using a
         // transient as a map key or set element is a programming error.
@@ -336,6 +343,11 @@ pub fn heapEqual(a: Value, b: Value) bool {
         // (store, tree, key) from different Connection objects
         // compare equal.
         .durable_ref => db.refsEqual(ah, bh),
+        // Phase 5 Item 1 (peer-AI turn 75): atom equality is
+        // pointer identity. Two atoms holding `(= a b)` values are
+        // NOT equal — mutable identity values must not participate
+        // in structural equality. ATOM.md §3.
+        .atom => atom.atomsEqual(ah, bh),
         // Transient equality is bit-identity on the wrapper header
         // (TRANSIENT.md §9, SEMANTICS §2.6). Two transient wrappers
         // are equal iff they are the same allocation. The top-level
@@ -653,6 +665,9 @@ test "eqCategory + domainByteForKind: exhaustive table matches SEMANTICS §2.6/�
         .{ .kind = .transient, .cat = .kind_local, .domain = 27 },
         .{ .kind = .error_, .cat = .kind_local, .domain = 28 },
         .{ .kind = .meta_symbol, .cat = .kind_local, .domain = 29 },
+        // Phase 5 Item 1 (peer-AI turn 75): atoms are kind-local
+        // identity-valued; domain byte 34 == @intFromEnum(.atom).
+        .{ .kind = .atom, .cat = .kind_local, .domain = 34 },
     };
     for (cases) |c| {
         try testing.expectEqual(c.cat, eqCategory(c.kind));

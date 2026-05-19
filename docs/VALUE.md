@@ -123,9 +123,14 @@ Payload = `u64` pointer to a heap object with a standard `HeapHeader`
 | 27 | `transient` | mutable wrapper | 0 = transient map, 1 = transient set, 2 = transient vector (local enum, pinned in `docs/TRANSIENT.md` §2; peer-AI turn 17 flagged the original "mirrors inner collection kind" phrasing as pulling external kind numbering into the transient namespace) |
 | 28 | `error_` | exception value | |
 | 29 | `meta_symbol` | metadata-bearing symbol wrapper | wraps base-symbol id + meta map (PLAN §8.4) |
+| 30 | `native_fn` | host-Zig function exposed as a first-class Value | Payload is `*const NativeFn` (static descriptor). Phase 3.3a, peer-AI turn 67. |
+| 31 | `db_connection` | emdb connection handle | Payload is `*db.Connection` owned by the VM. Phase 4.0a, peer-AI turn 72. |
+| 32 | `db_write_txn` | write transaction handle | Single-owner; invalidated on commit/abort. Phase 4.0b. |
+| 33 | `db_read_txn` | read transaction handle | Phase 4.0b. |
+| 34 | `atom` | in-memory mutable cell | Payload is `*HeapHeader → AtomBox { value, in_flight, _pad }`. Identity equality + identity hash; GC traces contained value; codec rejects as `:unserializable`. Phase 5 Item 1, peer-AI turn 75. See `docs/ATOM.md`. |
 
 Values 8–15 are **reserved** for future immediate kinds (e.g. a second
-fixnum flavor, or a tagged inline byte burst). Values 30–63 are
+fixnum flavor, or a tagged inline byte burst). Values 35–63 are
 **reserved** for future heap kinds. Values 64+ are **reserved** for
 runtime-private use (internal sentinels that must never escape a public
 API).

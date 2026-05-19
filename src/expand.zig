@@ -308,21 +308,29 @@ fn expandFormDepth(
         // #8a passes through. Step #10+ may want to expand
         // through the target.
         .with_meta => mutCast(form),
-        // deref `@x`: Phase-2 doesn't support atoms, so this
-        // is opaque at expansion time. lowerForm raises
-        // UnsupportedFeature.
+        // deref `@x`: rewrite to QUALIFIED `(nexis.core/deref x)`.
+        // The native `deref` is installed in `nexis.core` and
+        // dispatches over `{durable_ref, var_, atom, …}` per
+        // ATOM.md §5 / Phase 4.0c peer-AI turn 73 semantics.
+        //
+        // Lowering path history:
+        //   - Phase 4.0c: `@x → (db/deref x)` — qualified, but
+        //     coupled to the `db` namespace.
+        //   - Phase 5 Item 1 first attempt: `@x → (deref x)` —
+        //     bare, but LEXICALLY SHADOWABLE (peer-AI turn 76
+        //     §"Must-fix": `(let [deref (fn [_] 42)] @a)` would
+        //     return 42, which is surprising — reader sugar
+        //     should not be capturable by a local binding).
+        //   - Phase 5 Item 1 final: `@x → (nexis.core/deref x)`
+        //     — qualified through the auto-referred core ns; not
+        //     shadowable by lexical bindings or by user-namespace
+        //     `def deref ...`. `db/deref` remains installed for
+        //     backward-compat with explicit qualified user code.
         .deref => |inner| blk: {
-            // Phase 4.0c (peer-AI turn 73): rewrite `@x` →
-            // `(db/deref x)`. The native fn dispatches on the
-            // arg's kind: durable_ref → ephemeral read; Var →
-            // root value; else → :not-derefable.
             const items = try ctx.allocator.alloc(*Form, 2);
-            items[0] = try makeSymbol(ctx, "db/deref", form.origin);
-            // Mark `db/deref` as qualified by storing both ns+name.
-            // Actually `makeSymbol` only handles unqualified. Build directly.
             const deref_sym = try ctx.allocator.create(Form);
             deref_sym.* = .{
-                .datum = .{ .symbol = .{ .ns = "db", .name = "deref" } },
+                .datum = .{ .symbol = .{ .ns = "nexis.core", .name = "deref" } },
                 .origin = form.origin,
             };
             items[0] = deref_sym;

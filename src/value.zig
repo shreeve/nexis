@@ -80,7 +80,13 @@ pub const Kind = enum(u8) {
     /// Phase 4.0b: read transaction handle. Payload is a
     /// pointer to a heap-allocated `db.ReadTxn`.
     db_read_txn = 33,
-    // 34..63 reserved for future heap kinds.
+    /// Phase 5 Item 1 (peer-AI turn 75): in-memory mutable cell.
+    /// Payload is `*HeapHeader` → `AtomBox { value, in_flight,
+    /// _pad }` in heap body. Identity equality + identity hash;
+    /// GC traces the contained value; codec rejects as
+    /// `:unserializable`. See `docs/ATOM.md`.
+    atom = 34,
+    // 35..63 reserved for future heap kinds.
 
     // ---- Runtime-private sentinels (never escape public API) ----
     unbound = 64,

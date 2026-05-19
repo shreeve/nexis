@@ -1104,6 +1104,14 @@ pub const VmError = error{
     /// (peer-AI turn 49). Recoverable error (user can `def`
     /// the var and retry).
     UnboundVar,
+    /// Phase 5 Item 1 (peer-AI turn 75): a mutating op on an
+    /// atom (`swap!`/`reset!`/`compare-and-set!`/`swap-vals!`)
+    /// was attempted while ANOTHER mutating op on the same
+    /// atom is still in flight. The single-threaded VM cannot
+    /// retry a `swap!`-style CAS loop, so this is reported as a
+    /// catchable error instead of being silently allowed.
+    /// Mapped to `:atom-re-entry`. See ATOM.md §4.4.
+    AtomReEntry,
 };
 
 // =============================================================================
@@ -3127,6 +3135,7 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.CodecFailed => "codec-failed",
         VmError.TxClosed => "tx-closed",
         VmError.NotDerefable => "not-derefable",
+        VmError.AtomReEntry => "atom-re-entry",
         // Unrecoverable: bytecode corruption / VM-internal /
         // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,

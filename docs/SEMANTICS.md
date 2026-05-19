@@ -167,6 +167,13 @@ Vars compare by identity (PLAN §13.3).
 Functions, closures, transients: equality is identity-based; serialization
 is disallowed (PLAN §15.10).
 
+Atoms (`atom`, Phase 5 Item 1) compare by identity (pointer-to-AtomBox);
+the contained value is NEVER consulted during equality or hash. Two
+atoms holding `(= a b)` values are still `(not (= atom-a atom-b))`. This
+matches Clojure and is load-bearing: mutable identity values participating
+in structural equality would let a map key become unequal to itself on
+mutation. Serialization is disallowed; see `docs/ATOM.md` §3 + §6.
+
 ---
 
 ### 3. Hashing — invariants

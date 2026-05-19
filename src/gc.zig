@@ -46,6 +46,7 @@ const vector = @import("vector");
 const champ = @import("champ");
 const transient_mod = @import("transient");
 const db_mod = @import("db");
+const atom_mod = @import("atom");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -107,6 +108,11 @@ pub const Collector = struct {
             // advisory `conn` pointer is NOT heap-managed (per
             // DB.md §7.3 / peer-AI turn 23).
             .durable_ref => db_mod.trace(h, self),
+            // Phase 5 Item 1 (peer-AI turn 75): atom trace walks
+            // the contained value. `in_flight` is a u8, not a
+            // Value. Self-references work via mark-bit short-
+            // circuit in `mark`. ATOM.md §7.
+            .atom => atom_mod.trace(h, self),
             // Reserved heap kinds without implementations in v1.
             // PANIC, not silent no-op, per GC.md §5 / peer-AI turn 14:
             // a silent no-op on a kind that SHOULD trace would create
@@ -403,6 +409,59 @@ test "collect: persistent set survives (>8 elements exercises CHAMP internals)" 
     while (i < 15) : (i += 1) {
         try testing.expect(champ.setContains(s, value.fromKeywordId(i), &synthHash, &synthEq));
     }
+}
+
+test "collect: atom contained value survives via trace" {
+    // Phase 5 Item 1 (peer-AI turn 76 §"Strongly recommended"):
+    // confirms `atom_mod.trace` walks `body.value` so the
+    // contained heap value is reachable purely through the atom
+    // (no other root). If trace returned a no-op, the contained
+    // string would be swept and the post-collect read would
+    // surface garbage.
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    const contained = try string.fromBytes(&heap, "atom-contained-string");
+    const a = try atom_mod.make(&heap, contained);
+
+    var gc = Collector.init(&heap);
+    // Only `a` is rooted. `contained` is reachable ONLY through
+    // the atom's body. If `atom_mod.trace` is wrong, the string
+    // is freed.
+    const live_before = heap.liveCount();
+    _ = gc.collect(&.{Heap.asHeapHeader(a)});
+    const live_after = heap.liveCount();
+    // Both atom + string must survive.
+    try testing.expectEqual(live_before, live_after);
+    // And the contained string is the same Value we put in (the
+    // collector is non-moving in v1, so pointer identity is
+    // preserved).
+    const fetched = atom_mod.getValue(a);
+    try testing.expectEqual(contained.payload, fetched.payload);
+}
+
+test "collect: atom whose contained value is unreferenced gets that value swept" {
+    // Inverse of the previous test: after `reset!`'ing the atom
+    // to a different value, the original contained value loses
+    // its only edge and must be reclaimed on the next collect.
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    const initial = try string.fromBytes(&heap, "initial-string");
+    const replacement = try string.fromBytes(&heap, "replacement-string");
+    const a = try atom_mod.make(&heap, initial);
+
+    // Replace contained value — `initial` is now an orphan.
+    atom_mod.setValue(a, replacement);
+
+    var gc = Collector.init(&heap);
+    const live_before = heap.liveCount();
+    const freed = gc.collect(&.{Heap.asHeapHeader(a)});
+    const live_after = heap.liveCount();
+    // The orphan `initial` string must be freed; atom + `replacement` survive.
+    try testing.expect(freed >= 1);
+    try testing.expect(live_after < live_before);
+    try testing.expectEqual(replacement.payload, atom_mod.getValue(a).payload);
 }
 
 test "collect: pinned block survives without being in roots" {

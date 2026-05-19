@@ -394,6 +394,11 @@ fn encodeValue(
         .transient,
         .error_,
         .meta_symbol,
+        // Phase 5 Item 1 (peer-AI turn 75): atoms are process-local
+        // mutable identity values; encoding them would be misleading.
+        // PLAN §23 #25 v1-serializable set explicitly excludes them.
+        // ATOM.md §6.
+        .atom,
         => return CodecError.UnserializableKind,
         // Sentinels (unbound, undef) and any other non-heap,
         // non-immediate kind reaching here is a runtime bug. Treat

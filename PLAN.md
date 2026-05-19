@@ -2278,7 +2278,7 @@ The things most likely to go wrong, with mitigations.
 | `(= 1 1.0)` | true | **false** (use `==` for cross-type) |
 | Laziness | Pervasive `seq` | Eager, explicit streams later |
 | STM | `ref`, `dosync`, `alter` | **Removed.** emdb transactions only |
-| Atoms | In-memory CAS | **Removed.** Durable refs are different |
+| Atoms | In-memory CAS | **Kept** (Phase 5 Item 1, peer-AI turn 75). In-memory mutable cell; single-threaded v1 makes `compare-and-set!` a deterministic check-and-set, not a lock-free retry loop. Durable refs cover durable mutation; atoms cover ephemeral mutation. See `docs/ATOM.md`. |
 | Agents | `send`, `send-off` | **Removed.** |
 | `core.async` | Channels, go blocks | **Removed.** |
 | Multimethods | `defmulti`, `defmethod` | **Removed.** |
@@ -2629,3 +2629,27 @@ It fails if it feels like:
 *Companion documents: `CLOJURE-REVIEW.md` (source review findings), `docs/SEMANTICS.md` (Phase 0 deliverable — numeric corner cases, nil/empty semantics, print contract), `docs/FORMS.md` (Phase 0 deliverable — canonical Form schema).*
 
 *Last updated: 2026-04-19*
+
+---
+
+## Amendment Log
+
+PLAN.md is the highest-authority document in the project (AGENTS.md
+authority order). Substantive changes since v1.1 are logged here with
+their rationale and peer-AI turn citation. Per-doc amendment logs
+(COMPILER.md §13, VM.md §18, ATOM.md §11, etc.) record finer-grained
+spec changes downstream of each PLAN entry.
+
+- **2026-05-18 — Atoms (Phase 5 Item 1) added.** Appendix A's
+  "Atoms — Removed" row was a v1 scoping decision predating the Phase
+  5 framing in HANDOFF.md §10. Atoms re-enter v1 as in-memory mutable
+  cells consistent with §23 #5 (single-isolate, single-threaded): the
+  Clojure-canonical API (`atom`/`reset!`/`swap!`/`swap-vals!`/
+  `compare-and-set!`/`atom?` + `@a` via universal `deref`) is provided
+  for source-portability, but `compare-and-set!` is a deterministic
+  check-and-set under the single-threaded execution model — not a
+  lock-free retry primitive. Validators / watches / metadata on atoms
+  remain deferred (post-v1 only on concrete user demand). Authority:
+  peer-AI turn 75. Full spec: `docs/ATOM.md`. No frozen-decision in
+  §23 needed amending (the prior "Removed" line lived in Appendix A
+  comparison only); this log entry IS the authority record.

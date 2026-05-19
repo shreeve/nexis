@@ -91,6 +91,19 @@ pub fn build(b: *std.Build) void {
     string_mod.addImport("heap", heap_mod);
     string_mod.addImport("hash", hash_mod);
 
+    // Phase 5 Item 1 (peer-AI turn 75): in-memory mutable cell.
+    // Identical module-graph shape to string_mod (value+heap+hash).
+    // No back-edges; consumed only by dispatch / gc / stdlib /
+    // codec / cli at their `.atom` arms.
+    const atom_mod = b.createModule(.{
+        .root_source_file = b.path("src/atom.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    atom_mod.addImport("value", value_mod);
+    atom_mod.addImport("heap", heap_mod);
+    atom_mod.addImport("hash", hash_mod);
+
     const list_mod = b.createModule(.{
         .root_source_file = b.path("src/coll/list.zig"),
         .target = target,
@@ -154,6 +167,8 @@ pub fn build(b: *std.Build) void {
     // codec's inline tests import transient to exercise the
     // UnserializableKind error path for transient Values.
     codec_mod.addImport("transient", transient_mod);
+    // Phase 5 Item 1: codec rejects atoms as :unserializable.
+    codec_mod.addImport("atom", atom_mod);
 
     const gc_mod = b.createModule(.{
         .root_source_file = b.path("src/gc.zig"),
@@ -168,6 +183,7 @@ pub fn build(b: *std.Build) void {
     gc_mod.addImport("vector", vector_mod);
     gc_mod.addImport("champ", champ_mod);
     gc_mod.addImport("transient", transient_mod);
+    gc_mod.addImport("atom", atom_mod);
 
     const pool_mod = b.createModule(.{
         .root_source_file = b.path("src/pool.zig"),
@@ -248,6 +264,8 @@ pub fn build(b: *std.Build) void {
     stdlib_mod.addImport("champ", champ_mod);
     stdlib_mod.addImport("intern", intern_mod);
     stdlib_mod.addImport("heap", heap_mod);
+    // Phase 5 Item 1: atom native fns.
+    stdlib_mod.addImport("atom", atom_mod);
     // dispatch_mod, db_mod, codec_mod are declared later;
     // imports attached at the bottom of the dispatch block.
 
@@ -324,6 +342,7 @@ pub fn build(b: *std.Build) void {
     dispatch_mod.addImport("champ", champ_mod);
     dispatch_mod.addImport("transient", transient_mod);
     dispatch_mod.addImport("db", db_mod);
+    dispatch_mod.addImport("atom", atom_mod);
     // dispatch is a one-way terminal: nothing depends on it. value
     // and eq deliberately stay low-level (panicking on heap kinds)
     // so the module graph remains acyclic and every test-binary
@@ -386,6 +405,7 @@ pub fn build(b: *std.Build) void {
         bignum: *std.Build.Module,
         champ: *std.Build.Module,
         transient: *std.Build.Module,
+        atom: *std.Build.Module,
         gc: *std.Build.Module,
         codec: *std.Build.Module,
         db: *std.Build.Module,
@@ -411,6 +431,7 @@ pub fn build(b: *std.Build) void {
         .bignum = bignum_mod,
         .champ = champ_mod,
         .transient = transient_mod,
+        .atom = atom_mod,
         .gc = gc_mod,
         .codec = codec_mod,
         .db = db_mod,
@@ -442,15 +463,17 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bignum", .path = "src/bignum.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "champ", .path = "src/coll/champ.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "transient", .path = "src/coll/transient.zig", .imports = &.{ "value", "heap", "champ", "vector" } },
-        .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "champ", "transient" } },
-        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "champ", "transient", "db" } },
-        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db" } },
+        // Phase 5 Item 1: atom test binary. Same import shape as string.
+        .{ .name = "atom", .path = "src/atom.zig", .imports = &.{ "value", "heap", "hash" } },
+        .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "champ", "transient", "atom" } },
+        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "champ", "transient", "db", "atom" } },
+        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db", "atom" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch" } },
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch" } },
-        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb" } },
+        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
     };
 
@@ -474,6 +497,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "intern")) siblings.intern
                 else if (std.mem.eql(u8, imp_name, "champ")) siblings.champ
                 else if (std.mem.eql(u8, imp_name, "transient")) siblings.transient
+                else if (std.mem.eql(u8, imp_name, "atom")) siblings.atom
                 else if (std.mem.eql(u8, imp_name, "gc")) siblings.gc
                 else if (std.mem.eql(u8, imp_name, "codec")) siblings.codec
                 else if (std.mem.eql(u8, imp_name, "db")) siblings.db
@@ -822,6 +846,9 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("champ", champ_mod);
     cli_mod.addImport("stdlib", stdlib_mod);
     cli_mod.addImport("loader", loader_mod);
+    // Phase 5 Item 1: cli.formatValue prints `#<atom 0x...>`
+    // by pointer identity (no atom_mod import needed; payload
+    // is the pointer).
 
     const nexis_exe = b.addExecutable(.{
         .name = "nexis",
@@ -888,22 +915,29 @@ pub fn build(b: *std.Build) void {
     // -------------------------------------------------------------------------
 
     const phase2_test_step = b.step("phase2-test", "Run only vm + compile tests (fast Phase 2 iteration)");
-    // Indices into runtime_test_files: vm = 16, compile = 17,
-    // expand = 18, stdlib = 19, loader = 20. Asserted at build
-    // time so re-ordering trips this loudly instead of silently
-    // running the wrong tests.
+    // Indices into runtime_test_files: atom = 11, vm = 17,
+    // compile = 18, expand = 19, stdlib = 20, loader = 21.
+    // (Phase 5 Item 1 shifted everything past `transient` by +1
+    // by inserting `atom` after the per-kind block.) Asserted at
+    // build time so re-ordering trips this loudly instead of
+    // silently running the wrong tests.
     comptime {
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[16].name, "vm"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[17].name, "compile"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[18].name, "expand"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[19].name, "stdlib"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[20].name, "loader"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[11].name, "atom"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[17].name, "vm"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[18].name, "compile"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[19].name, "expand"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[20].name, "stdlib"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[21].name, "loader"));
     }
-    phase2_test_step.dependOn(&runtime_test_runs[16].step);
+    // Phase 5 Item 1: include the atom test binary in phase2-test
+    // so the inner loop covers the new kind without waiting for
+    // the full `zig build test` Phase 1 randomized property suite.
+    phase2_test_step.dependOn(&runtime_test_runs[11].step);
     phase2_test_step.dependOn(&runtime_test_runs[17].step);
     phase2_test_step.dependOn(&runtime_test_runs[18].step);
     phase2_test_step.dependOn(&runtime_test_runs[19].step);
     phase2_test_step.dependOn(&runtime_test_runs[20].step);
+    phase2_test_step.dependOn(&runtime_test_runs[21].step);
     // Phase 2 gate items 3 + 4.
     phase2_test_step.dependOn(&run_prop_compile_tests.step);
     // Phase 2 step #11 — eval-pipeline integration tests.

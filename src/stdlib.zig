@@ -42,6 +42,7 @@ const codec_mod = @import("codec");
 const heap_mod = @import("heap");
 const dispatch_mod_alias = @import("dispatch");
 const emdb_mod = @import("emdb");
+const atom_mod = @import("atom");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -179,6 +180,19 @@ const core_fns = [_]CoreEntry{
     .{ .name = "keys", .descriptor = &native_keys },
     .{ .name = "vals", .descriptor = &native_vals },
     .{ .name = "conj", .descriptor = &native_conj },
+    // Phase 5 Item 1 (peer-AI turn 75): atom primitives.
+    // Identity-valued in-memory mutable cells. `deref` was
+    // already installed (above is `&native_db_deref` aliased in
+    // db_fns; we also expose it as bare `deref` here so
+    // `(deref atom-or-var-or-durable-ref)` resolves without the
+    // `db/` prefix). See `docs/ATOM.md`.
+    .{ .name = "deref", .descriptor = &native_db_deref },
+    .{ .name = "atom", .descriptor = &native_atom },
+    .{ .name = "atom?", .descriptor = &native_atom_q },
+    .{ .name = "reset!", .descriptor = &native_reset_bang },
+    .{ .name = "swap!", .descriptor = &native_swap_bang },
+    .{ .name = "swap-vals!", .descriptor = &native_swap_vals_bang },
+    .{ .name = "compare-and-set!", .descriptor = &native_compare_and_set_bang },
     // Phase 4.0a: db primitives live in the `db` namespace
     // (installed separately via `installDb`) so they appear as
     // qualified `(db/open ...)` calls.
@@ -311,7 +325,15 @@ const native_db_put = NativeFn{ .name = "db/put!", .min_arity = 3, .max_arity = 
 const native_db_get = NativeFn{ .name = "db/get", .min_arity = 2, .max_arity = 3, .call = &fnDbGet };
 const native_db_delete = NativeFn{ .name = "db/delete!", .min_arity = 2, .max_arity = 2, .call = &fnDbDelete };
 // Phase 4.0c — deref + alter.
-const native_db_deref = NativeFn{ .name = "db/deref", .min_arity = 1, .max_arity = 1, .call = &fnDbDeref };
+const native_db_deref = NativeFn{ .name = "deref", .min_arity = 1, .max_arity = 1, .call = &fnDbDeref };
+
+// Phase 5 Item 1 (peer-AI turn 75) — atoms.
+const native_atom = NativeFn{ .name = "atom", .min_arity = 1, .max_arity = 1, .call = &fnAtom };
+const native_atom_q = NativeFn{ .name = "atom?", .min_arity = 1, .max_arity = 1, .call = &fnAtomQ };
+const native_reset_bang = NativeFn{ .name = "reset!", .min_arity = 2, .max_arity = 2, .call = &fnResetBang };
+const native_swap_bang = NativeFn{ .name = "swap!", .min_arity = 2, .max_arity = null, .call = &fnSwapBang };
+const native_swap_vals_bang = NativeFn{ .name = "swap-vals!", .min_arity = 2, .max_arity = null, .call = &fnSwapValsBang };
+const native_compare_and_set_bang = NativeFn{ .name = "compare-and-set!", .min_arity = 3, .max_arity = 3, .call = &fnCompareAndSetBang };
 const native_db_alter = NativeFn{ .name = "db/alter!", .min_arity = 3, .max_arity = null, .call = &fnDbAlter };
 // Phase 4.0d — scan + reduce-tree.
 const native_db_scan = NativeFn{ .name = "db/scan", .min_arity = 2, .max_arity = 4, .call = &fnDbScan };
@@ -1326,11 +1348,15 @@ fn fnDbDelete(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(existed);
 }
 
-/// `(db/deref x)` — universal deref:
+/// `(deref x)` (also installed as `db/deref` for Phase 4 backward
+/// compatibility) — universal deref:
 ///   durable_ref → ephemeral read tx, return decoded value (nil
 ///                 if absent)
 ///   var         → Var.root (raises :unbound-var if unbound, per
 ///                 peer-AI turn 73 §Q1)
+///   atom        → current contained value (Phase 5 Item 1, peer-
+///                 AI turn 75; deref does NOT touch in_flight and
+///                 is allowed inside a swap! critical section)
 ///   other       → :not-derefable (catchable)
 fn fnDbDeref(_: *VM, args: []const Value) VmError!Value {
     const x = args[0];
@@ -1348,6 +1374,7 @@ fn fnDbDeref(_: *VM, args: []const Value) VmError!Value {
             if (!var_obj.bound) return VmError.UnboundVar;
             break :blk var_obj.root;
         },
+        .atom => atom_mod.getValue(x),
         else => VmError.NotDerefable,
     };
 }
@@ -1553,6 +1580,117 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     // 4. Write.
     db_mod.putRef(&h.txn, r, new_value) catch return VmError.CodecFailed;
     return new_value;
+}
+
+// =============================================================================
+// Phase 5 Item 1 — atoms (peer-AI turn 75; see docs/ATOM.md)
+// =============================================================================
+//
+// All six fns enforce identity-equality / identity-hash invariants
+// by going through `atom_mod`'s typed accessors. Re-entrancy is
+// detected via `atom_mod.tryEnterCritical` + a `defer` pairing on
+// `exitCritical` so the flag clears on every exit path — normal
+// return, recoverable VmError, OutOfMemory, ControlTransferred.
+//
+// `vm.callValue` is the reentrant call point (same shape as
+// `fnDbAlter`, `fnApply`, `fnMap`). Rollback-on-throw is ensured
+// by ordering: the atom is written ONLY after `callValue` returns
+// normally (steps 3 → 4 in each function). If `callValue` throws
+// or control-transfers, the write never executes.
+
+fn fnAtom(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    return atom_mod.make(heap, args[0]) catch return VmError.OutOfMemory;
+}
+
+fn fnAtomQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(args[0].kind() == .atom);
+}
+
+fn fnResetBang(_: *VM, args: []const Value) VmError!Value {
+    const a = args[0];
+    const new_val = args[1];
+    if (a.kind() != .atom) return VmError.KindMismatch;
+    if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
+    defer atom_mod.exitCritical(a);
+    atom_mod.setValue(a, new_val);
+    return new_val;
+}
+
+fn fnSwapBang(vm: *VM, args: []const Value) VmError!Value {
+    const a = args[0];
+    const f = args[1];
+    const extra = args[2..];
+
+    if (a.kind() != .atom) return VmError.KindMismatch;
+    if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
+    defer atom_mod.exitCritical(a);
+
+    // 1. Read current.
+    const old = atom_mod.getValue(a);
+
+    // 2. Build call_args = [old, ...extra].
+    const call_args = vm.allocator.alloc(Value, 1 + extra.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(call_args);
+    call_args[0] = old;
+    for (extra, 0..) |x, i| call_args[1 + i] = x;
+
+    // 3. Invoke. NO write on throw / control transfer.
+    const new_val = try vm.callValue(f, call_args);
+
+    // 4. Write.
+    atom_mod.setValue(a, new_val);
+    return new_val;
+}
+
+fn fnSwapValsBang(vm: *VM, args: []const Value) VmError!Value {
+    const a = args[0];
+    const f = args[1];
+    const extra = args[2..];
+
+    if (a.kind() != .atom) return VmError.KindMismatch;
+    if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
+    defer atom_mod.exitCritical(a);
+
+    const old = atom_mod.getValue(a);
+
+    const call_args = vm.allocator.alloc(Value, 1 + extra.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(call_args);
+    call_args[0] = old;
+    for (extra, 0..) |x, i| call_args[1 + i] = x;
+
+    const new_val = try vm.callValue(f, call_args);
+
+    // GC rooting note (peer-AI turn 75 Q9): the [old new] vector
+    // is built AFTER `setValue`. Under v1's explicit-only GC
+    // (docs/GC.md §9), `vector_mod.fromTwo`'s alloc cannot trigger
+    // collection, so `old` (a Zig local) stays alive trivially.
+    // When GC migrates to alloc-triggered (post-v1), this site is
+    // listed in docs/GC.md §11.5 audit checklist.
+    atom_mod.setValue(a, new_val);
+    const pair_elems = [_]Value{ old, new_val };
+    return vector_mod.fromSlice(vm.ensureHeap(), &pair_elems) catch return VmError.OutOfMemory;
+}
+
+fn fnCompareAndSetBang(_: *VM, args: []const Value) VmError!Value {
+    const a = args[0];
+    const old = args[1];
+    const new_val = args[2];
+
+    if (a.kind() != .atom) return VmError.KindMismatch;
+    if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
+    defer atom_mod.exitCritical(a);
+
+    // identical? semantics, not structural `=`. Matches Clojure's
+    // documented "identical to oldval" CAS contract. For
+    // immediates, bit-identity. For heap kinds, pointer-identity
+    // (HeapHeader). See ATOM.md §4.6.
+    const current = atom_mod.getValue(a);
+    if (current.tag == old.tag and current.payload == old.payload) {
+        atom_mod.setValue(a, new_val);
+        return value_mod.fromBool(true);
+    }
+    return value_mod.fromBool(false);
 }
 
 // =============================================================================

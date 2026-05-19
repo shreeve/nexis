@@ -128,6 +128,16 @@ fn formatValue(v: Value, interner: *const intern_mod.Interner, writer: anytype) 
             const nf = vm.asNativeFn(v);
             try writer.print("#<native-fn {s}>", .{nf.name});
         },
+        .atom => {
+            // Phase 5 Item 1 (peer-AI turn 75): print atoms
+            // OPAQUELY by pointer identity to avoid recursing
+            // through self-referential contained values. The
+            // contained value is observable via `@a` /
+            // `(deref a)` which evaluates first, then is
+            // printed via the normal recursive printer.
+            // ATOM.md §8.
+            try writer.print("#<atom 0x{x}>", .{v.payload});
+        },
         else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),
     }
 }

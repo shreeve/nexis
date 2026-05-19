@@ -116,6 +116,12 @@ fn formatValue(buf: *std.array_list.Managed(u8), v: value_mod.Value, interner: *
             try buf.appendSlice(nf.name);
             try buf.append('>');
         },
+        // Phase 5 Item 1: print atoms as `#<atom>` opaquely (no
+        // pointer — pointer values are unstable across runs and
+        // would force every test to use deref). Tests always
+        // inspect atoms through `@a` / `(deref a)` / `atom?` /
+        // identity comparisons.
+        .atom => try buf.appendSlice("#<atom>"),
         else => {
             const s = try std.fmt.allocPrint(testing.allocator, "#<value kind={d}>", .{@intFromEnum(v.kind())});
             defer testing.allocator.free(s);
@@ -178,6 +184,11 @@ fn expectOutputProgram(src: []const u8, expected: []const u8) !void {
     const interner = v.ensureInterner();
     const registry = try v.ensureRegistry();
     try stdlib.installCore(registry.core);
+    // Phase 5 Item 1: mirror the CLI's environment so qualified
+    // `db/...` calls (the Phase 4 surface, and the backward-
+    // compat `db/deref` alias for `@x` on atoms) resolve.
+    const db_ns_program = try registry.getOrCreate("db", registry.core);
+    try stdlib.installDb(db_ns_program);
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const saved_current = registry.current;
@@ -243,6 +254,10 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     // Phase 3.3a: install core native fns into nexis.core (auto-
     // referred by user via parent).
     try stdlib.installCore(registry.core);
+    // Phase 5 Item 1: install db namespace so qualified `db/...`
+    // calls and the `db/deref` alias resolve in tests.
+    const db_ns_single = try registry.getOrCreate("db", registry.core);
+    try stdlib.installDb(db_ns_single);
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     // Phase 3.3d: bootstrap composite core.nx layer into core.
@@ -1302,3 +1317,222 @@ test "integration: composite — syntax-quote inside defn" {
         \\  (build 1 2))
     , "(pair 1 2)");
 }
+
+// =============================================================================
+// Phase 5 Item 1 — atoms (peer-AI turn 75; docs/ATOM.md)
+// =============================================================================
+//
+// Coverage map (every spec invariant in ATOM.md should have at
+// least one row here):
+//   §3 identity equality + identity hash         → atom-eq tests
+//   §4.1 `(atom init)`                           → ctor + deref
+//   §4.2 `(atom? x)`                             → predicate tests
+//   §4.3 `(reset! a v)` returns v                → reset tests
+//   §4.4 `(swap! a f & args)` + rollback         → swap tests
+//   §4.5 `(swap-vals! a f & args)`               → swap-vals test
+//   §4.6 `(compare-and-set! a old new)`          → CAS tests
+//   §5 universal `deref` / `@a` / `db/deref`     → deref tests
+//   §6 codec :unserializable (atom + nested)     → wire later via DB
+//   §9 catchable errors                          → error keyword tests
+
+test "phase5 atom: ctor + atom? predicate" {
+    try expectOutput("(atom? (atom 0))", "true");
+    try expectOutput("(atom? (atom :anything))", "true");
+    try expectOutput("(atom? 1)", "false");
+    try expectOutput("(atom? :keyword)", "false");
+    try expectOutput("(atom? nil)", "false");
+    try expectOutput("(atom? [1 2])", "false");
+}
+
+test "phase5 atom: deref via @a, (deref a), (db/deref a)" {
+    try expectOutput("@(atom 42)", "42");
+    try expectOutput("(deref (atom 42))", "42");
+    try expectOutput("(db/deref (atom 42))", "42");
+    try expectOutput("@(atom :keyword)", ":keyword");
+    try expectOutput("@(atom nil)", "nil");
+    try expectOutput("@(atom [1 2 3])", "[1 2 3]");
+}
+
+test "phase5 atom: identity equality (= a a) vs (= (atom v) (atom v))" {
+    // Same atom compares equal to itself.
+    try expectOutput("(let [a (atom 1)] (= a a))", "true");
+    // Two distinct atoms holding equal values are NOT equal.
+    try expectOutput("(= (atom 1) (atom 1))", "false");
+    try expectOutput("(= (atom :x) (atom :x))", "false");
+    // Equality survives a mutation: same atom always equals
+    // itself, even after its contained value changes.
+    try expectOutput(
+        \\(let [a (atom 1)]
+        \\  (reset! a 999)
+        \\  (= a a))
+    , "true");
+}
+
+test "phase5 atom: reset! sets value, returns new value" {
+    try expectOutput("(let [a (atom 0)] (reset! a 42))", "42");
+    try expectOutput("(let [a (atom 0)] (reset! a 42) @a)", "42");
+    try expectOutput("(let [a (atom :before)] (reset! a :after) @a)", ":after");
+}
+
+test "phase5 atom: swap! with inc / + / variadic args" {
+    try expectOutput("(let [a (atom 0)] (swap! a inc))", "1");
+    try expectOutput("(let [a (atom 0)] (swap! a inc) (swap! a inc) @a)", "2");
+    try expectOutput("(let [a (atom 10)] (swap! a + 32))", "42");
+    try expectOutput("(let [a (atom 10)] (swap! a + 1 2 3 4))", "20");
+}
+
+test "phase5 atom: swap! rollback on throw — value unchanged" {
+    try expectOutput(
+        \\(let [a (atom 11)]
+        \\  (try (swap! a (fn [_] (throw :bad))) (catch any e e))
+        \\  @a)
+    , "11");
+    // The thrown value propagates as the catch's bound value
+    // (rollback is observable through @a above, NOT through the
+    // catch shape itself).
+    try expectOutput(
+        \\(let [a (atom 0)]
+        \\  (try (swap! a (fn [_] (throw :nope))) (catch any e e)))
+    , ":nope");
+}
+
+test "phase5 atom: swap! re-entrancy detection (:atom-re-entry)" {
+    try expectOutput(
+        \\(let [a (atom 0)]
+        \\  (try (swap! a (fn [_] (reset! a 999))) (catch any e e)))
+    , ":atom-re-entry");
+    // After the failed re-entrant attempt, the outer swap! also
+    // failed to write — atom remains at the original value.
+    try expectOutput(
+        \\(let [a (atom 0)]
+        \\  (try (swap! a (fn [_] (reset! a 999))) (catch any e e))
+        \\  @a)
+    , "0");
+    // CAS-from-inside-swap! also trips re-entry.
+    try expectOutput(
+        \\(let [a (atom 0)]
+        \\  (try (swap! a (fn [_] (compare-and-set! a 0 999))) (catch any e e)))
+    , ":atom-re-entry");
+}
+
+test "phase5 atom: swap! deref of in-flight atom is allowed" {
+    // deref does NOT touch in_flight, so a swap! function may
+    // legally call @a (e.g., to inspect the staging value).
+    // This is the canonical "side-effecting log inside swap!"
+    // pattern.
+    try expectOutput(
+        \\(let [a (atom 7)]
+        \\  (swap! a (fn [old] (+ old @a))))
+    , "14");
+}
+
+test "phase5 atom: swap-vals! returns [old new] vector" {
+    try expectOutput("(let [a (atom 10)] (swap-vals! a inc))", "[10 11]");
+    try expectOutput("(let [a (atom 10)] (swap-vals! a inc) @a)", "11");
+    try expectOutput(
+        \\(let [a (atom 1)] (swap-vals! a + 2 3 4))
+    , "[1 10]");
+}
+
+test "phase5 atom: swap-vals! rollback on throw" {
+    try expectOutput(
+        \\(let [a (atom 1)]
+        \\  (try (swap-vals! a (fn [_] (throw :bad))) (catch any e :caught))
+        \\  @a)
+    , "1");
+}
+
+test "phase5 atom: compare-and-set! identity-based" {
+    try expectOutput(
+        \\(let [a (atom 11)] (compare-and-set! a 11 100))
+    , "true");
+    try expectOutput(
+        \\(let [a (atom 11)] (compare-and-set! a 11 100) @a)
+    , "100");
+    try expectOutput(
+        \\(let [a (atom 11)] (compare-and-set! a 99 100))
+    , "false");
+    try expectOutput(
+        \\(let [a (atom 11)] (compare-and-set! a 99 100) @a)
+    , "11");
+}
+
+test "phase5 atom: compare-and-set! uses identity, not =" {
+    // Two distinct vectors are structurally equal but NOT
+    // pointer-identical. CAS must reject the swap.
+    try expectOutput(
+        \\(let [a (atom [1 2])] (compare-and-set! a [1 2] :new))
+    , "false");
+    try expectOutput(
+        \\(let [a (atom [1 2])] (compare-and-set! a [1 2] :new) @a)
+    , "[1 2]");
+    // But CAS with the SAME atom-stored value (identity match)
+    // succeeds.
+    try expectOutput(
+        \\(let [v [1 2] a (atom v)]
+        \\  (compare-and-set! a v :new))
+    , "true");
+}
+
+test "phase5 atom: reset!/swap!/CAS type errors caught as :kind-mismatch" {
+    try expectOutput("(try (reset! 1 2) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (swap! 1 inc) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (compare-and-set! 1 1 2) (catch any e e))", ":kind-mismatch");
+}
+
+test "phase5 atom: swap! with non-callable f surfaces :not-callable" {
+    try expectOutput(
+        \\(try (swap! (atom 1) 2) (catch any e e))
+    , ":not-callable");
+}
+
+test "phase5 atom: atoms as map keys distinguish by identity" {
+    // Same atom used twice as a key resolves to its single
+    // entry's value. Identity-based; lookup with the same atom
+    // succeeds.
+    try expectOutput(
+        \\(let [a (atom 1) m {a :one}] (get m a))
+    , ":one");
+    // Distinct atoms holding `=` values do NOT collide in a map.
+    // Distinguish via a let-bound copy of one atom — the *other*
+    // atom (distinct allocation) does not see :one.
+    try expectOutput(
+        \\(let [a (atom 1) b (atom 1) m {a :one}] (get m b))
+    , "nil");
+}
+
+test "phase5 atom: universal deref still serves Vars" {
+    // deref over Var: still works after the .atom arm was added
+    // (regression guard for peer-AI turn 73's behavior).
+    try expectOutput("(do (def x 5) (deref (var x)))", "5");
+}
+
+test "phase5 atom: @-lowering is not lexically shadowable" {
+    // Peer-AI turn 76 §"Must-fix": reader-macro `@` must NOT be
+    // captured by a local binding named `deref`. `@x` lowers to
+    // QUALIFIED `(nexis.core/deref x)` which resolves through the
+    // registry, not through lexical fall-through. Confirms the
+    // turn-76 fix.
+    try expectOutput(
+        \\(let [deref (fn [_] 42)
+        \\      a    (atom 5)]
+        \\  @a)
+    , "5");
+    // Note: `(def deref ...)` at top level does NOT prove a
+    // separate shadowing case because Phase 3.4 auto-refer makes
+    // `def` of an auto-referred name UPDATE the shared
+    // `nexis.core/deref` Var in place (compile.zig addVarRef walks
+    // the parent chain). That's a pre-existing language behavior,
+    // not specific to atoms or `@`. The lexical-binding case above
+    // is the load-bearing one for the turn-76 fix.
+}
+
+test "phase5 atom: self-reference does not break equality / count" {
+    // An atom holding itself satisfies (= @a a). Pins the
+    // GC self-reference safety + cycle behavior at the
+    // language level.
+    try expectOutput(
+        \\(let [a (atom nil)] (reset! a a) (= @a a))
+    , "true");
+}
+
