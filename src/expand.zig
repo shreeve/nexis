@@ -2724,6 +2724,214 @@ fn expandCondp(
     return try makeList(ctx, let_items, call_form.origin);
 }
 
+// ---- for ----------------------------------------------------
+//
+// Eager subset of Clojure's `for`. v1 supports:
+//   - multi-binding cartesian:
+//       (for [x [1 2] y [10 20]] (+ x y)) => [11 21 12 22]
+//   - `:let` (uses `let` so destructuring works):
+//       (for [x [1 2 3] :let [y (* x 10)]] y) => [10 20 30]
+//   - `:when` (filter):
+//       (for [x [1 2 3] :when (odd? x)] x)   => [1 3]
+//   - empty source → []
+//
+// Out of scope (turn 74 §4 + turn 83 §D3):
+//   - `:while`
+//   - lazy seqs (we eager-return a vector)
+//   - `:reduce` / `:initial` clauses
+//
+// Expansion: nested `reduce` calls, one per binding pair. Each
+// `reduce` introduces its own accumulator gensym. The body
+// invokes `(conj acc-innermost <body>)` to grow the result.
+// `:let` wraps the inner expression with `(let bindings ...)`
+// (NOT `let*` — peer-AI turn 83 §"`:let` destructuring") so
+// users can destructure inside `:let`. `:when` wraps with
+// `(if pred ...inner... <current-acc>)` — pred false → acc
+// unchanged.
+//
+// Frozen invariants (turn 83):
+//   §F1. First segment in the binding vector MUST be a `sym src`
+//        pair. Modifiers before any binding are rejected as
+//        MalformedMacroCall (turn 83 §"modifier before first").
+//   §F2. `conj` on `[]` initial accumulator preserves vector
+//        kind (verified via CLI smoke + (conj [] x) → vector).
+//   §F3. Return type is ALWAYS vector. Empty source / all
+//        filtered → `[]`.
+//   §F4. Multiple `:when` / `:let` clauses between bindings are
+//        supported (turn 83 §D3 d). Order matters: a `:let`
+//        before a `:when` makes the let-bound name visible to
+//        the when's predicate.
+
+const ForSegment = union(enum) {
+    sym_src: struct { sym: *Form, src: *Form },
+    when_pred: *Form,
+    let_bindings: *Form,
+};
+
+fn expandFor(
+    ctx: *ExpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) ExpandError!*Form {
+    if (args.len != 2) return ExpandError.MalformedMacroCall;
+    const bindings_form = args[0];
+    if (bindings_form.datum != .vector) return ExpandError.MalformedMacroCall;
+    const bindings = bindings_form.datum.vector;
+    const body = args[1];
+
+    if (bindings.len == 0) return ExpandError.MalformedMacroCall;
+
+    // Parse the binding vector into segments.
+    var segments: std.ArrayList(ForSegment) = .empty;
+    defer segments.deinit(ctx.allocator);
+
+    var i: usize = 0;
+    while (i < bindings.len) {
+        const item = bindings[i];
+        switch (item.datum) {
+            .keyword => |kw| {
+                if (kw.ns != null) return ExpandError.MalformedMacroCall;
+                // `:when` consumes a predicate Form.
+                if (std.mem.eql(u8, kw.name, "when")) {
+                    if (i + 1 >= bindings.len) return ExpandError.MalformedMacroCall;
+                    segments.append(ctx.allocator, .{ .when_pred = @constCast(bindings[i + 1]) }) catch return ExpandError.OutOfMemory;
+                    i += 2;
+                } else if (std.mem.eql(u8, kw.name, "let")) {
+                    // `:let` consumes a vector of bindings (which
+                    // `let` will then handle, including any
+                    // destructuring patterns).
+                    if (i + 1 >= bindings.len) return ExpandError.MalformedMacroCall;
+                    const lb = bindings[i + 1];
+                    if (lb.datum != .vector) return ExpandError.MalformedMacroCall;
+                    segments.append(ctx.allocator, .{ .let_bindings = @constCast(lb) }) catch return ExpandError.OutOfMemory;
+                    i += 2;
+                } else {
+                    // Unknown modifier keyword (e.g. `:while`,
+                    // `:reduce`) → reject explicitly so users
+                    // don't get silent wrong behavior.
+                    return ExpandError.MalformedMacroCall;
+                }
+            },
+            .symbol => {
+                if (i + 1 >= bindings.len) return ExpandError.MalformedMacroCall;
+                segments.append(ctx.allocator, .{ .sym_src = .{
+                    .sym = @constCast(bindings[i]),
+                    .src = @constCast(bindings[i + 1]),
+                } }) catch return ExpandError.OutOfMemory;
+                i += 2;
+            },
+            // Destructuring patterns (vector / map literals as
+            // the binding sym) are NOT supported in `for`'s
+            // direct sym-position for v1. Users can use `:let`
+            // for destructuring (which goes through `let`).
+            else => return ExpandError.MalformedMacroCall,
+        }
+    }
+
+    if (segments.items.len == 0) return ExpandError.MalformedMacroCall;
+    // §F1: first segment must be a sym_src pair.
+    if (segments.items[0] != .sym_src) return ExpandError.MalformedMacroCall;
+
+    // Count sym segments + gensym one accumulator name per.
+    var n_sym: usize = 0;
+    for (segments.items) |seg| {
+        if (seg == .sym_src) n_sym += 1;
+    }
+    const acc_names = ctx.allocator.alloc([]const u8, n_sym) catch return ExpandError.OutOfMemory;
+    for (acc_names) |*name_slot| {
+        name_slot.* = try ctx.gensym("for-acc");
+    }
+
+    // Build innermost: (conj acc[n_sym - 1] body).
+    var inner: *Form = blk: {
+        const items = try ctx.allocator.alloc(*Form, 3);
+        items[0] = try makeSymbol(ctx, "conj", call_form.origin);
+        items[1] = try makeSymbol(ctx, acc_names[n_sym - 1], call_form.origin);
+        items[2] = @constCast(body);
+        break :blk try makeList(ctx, items, call_form.origin);
+    };
+
+    // Walk segments right-to-left. `k` tracks the current
+    // sym-acc index (the acc-name in scope at the current
+    // expansion level). Starts at n_sym - 1 (deepest sym's
+    // acc) and decrements as we walk OUT through sym segments.
+    var k: usize = n_sym - 1;
+    // We need to enter the loop with k pointing at the
+    // innermost-sym's acc index. After the first sym we
+    // encounter (the rightmost sym), we'll decrement k.
+    // But `k` is unsigned, so we sentinel via `done_with_syms`.
+    var done_with_syms = false;
+
+    var r_idx: usize = segments.items.len;
+    while (r_idx > 0) {
+        r_idx -= 1;
+        const seg = segments.items[r_idx];
+        switch (seg) {
+            .let_bindings => |lb| {
+                const items = try ctx.allocator.alloc(*Form, 3);
+                items[0] = try makeSymbol(ctx, "let", call_form.origin);
+                items[1] = lb;
+                items[2] = inner;
+                inner = try makeList(ctx, items, call_form.origin);
+            },
+            .when_pred => |pred| {
+                // §F1 guarantees we've already processed at
+                // least one sym to the RIGHT of any modifier
+                // (modifiers come AFTER the first sym in
+                // source order; in reverse walk, that means
+                // we hit them only after we've processed at
+                // least the rightmost sym). So `k` is the
+                // valid current-level acc-name index.
+                std.debug.assert(!done_with_syms);
+                const items = try ctx.allocator.alloc(*Form, 4);
+                items[0] = try makeSymbol(ctx, "if", call_form.origin);
+                items[1] = pred;
+                items[2] = inner;
+                items[3] = try makeSymbol(ctx, acc_names[k], call_form.origin);
+                inner = try makeList(ctx, items, call_form.origin);
+            },
+            .sym_src => |ss| {
+                // Build the outer-acc form: acc[k-1] if k > 0,
+                // else the literal `[]` (outermost seed).
+                const outer_acc: *Form = if (k > 0) blk2: {
+                    break :blk2 try makeSymbol(ctx, acc_names[k - 1], call_form.origin);
+                } else blk2: {
+                    // (vector) — empty literal initial accumulator.
+                    const empty_items = try ctx.allocator.alloc(*Form, 0);
+                    break :blk2 try makeVector(ctx, empty_items, call_form.origin);
+                };
+
+                // (fn [acc[k] sym] inner)
+                const fn_params = try ctx.allocator.alloc(*Form, 2);
+                fn_params[0] = try makeSymbol(ctx, acc_names[k], call_form.origin);
+                fn_params[1] = ss.sym;
+                const fn_param_vec = try makeVector(ctx, fn_params, call_form.origin);
+                const fn_items = try ctx.allocator.alloc(*Form, 3);
+                fn_items[0] = try makeSymbol(ctx, "fn", call_form.origin);
+                fn_items[1] = fn_param_vec;
+                fn_items[2] = inner;
+                const fn_form = try makeList(ctx, fn_items, call_form.origin);
+
+                // (reduce <fn> <outer-acc> <src>)
+                const reduce_items = try ctx.allocator.alloc(*Form, 4);
+                reduce_items[0] = try makeSymbol(ctx, "reduce", call_form.origin);
+                reduce_items[1] = fn_form;
+                reduce_items[2] = outer_acc;
+                reduce_items[3] = ss.src;
+                inner = try makeList(ctx, reduce_items, call_form.origin);
+
+                if (k == 0) {
+                    done_with_syms = true;
+                } else {
+                    k -= 1;
+                }
+            },
+        }
+    }
+
+    return inner;
+}
+
 /// Helper: build `(throw :KEYWORD)` for the no-matching-clause
 /// fallthrough used by `case` and `condp`.
 fn makeThrow(ctx: *ExpandContext, kw_name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
@@ -3061,9 +3269,10 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     try table.put(allocator, "cond", expandCond);
     try table.put(allocator, "->", expandThreadFirst);
     try table.put(allocator, "->>", expandThreadLast);
-    // Phase 5 Item 4 (peer-AI turn 83): case + condp.
+    // Phase 5 Item 4 (peer-AI turn 83): case + condp + for.
     try table.put(allocator, "case", expandCase);
     try table.put(allocator, "condp", expandCondp);
+    try table.put(allocator, "for", expandFor);
     return table;
 }
 

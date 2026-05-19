@@ -1961,6 +1961,54 @@ test "phase5.4 condp: pred + expr each evaluated EXACTLY ONCE" {
     , "[2 1]");
 }
 
+// ---- for -----------------------------------------------------
+
+test "phase5.4 for: single binding maps over the source" {
+    try expectOutput("(for [x [1 2 3]] (* x x))", "[1 4 9]");
+    try expectOutput("(for [x []] (* x x))", "[]");
+    try expectOutput("(for [x [42]] x)", "[42]");
+}
+
+test "phase5.4 for: multi-binding cartesian product" {
+    // Cartesian order: outermost iterates first, innermost
+    // varies fastest. (Peer-AI turn 83 §D3 verified output
+    // expectation.)
+    try expectOutput("(for [x [1 2] y [10 20]] (+ x y))", "[11 21 12 22]");
+    try expectOutput(
+        \\(for [x [:a :b] y [1 2 3]] [x y])
+    , "[[:a 1] [:a 2] [:a 3] [:b 1] [:b 2] [:b 3]]");
+}
+
+test "phase5.4 for: :when filter" {
+    // `<` is in core (not `>`); use `<` consistently in tests.
+    try expectOutput("(for [x [1 2 3 4 5] :when (< 0 x)] x)", "[1 2 3 4 5]");
+    try expectOutput("(for [x [1 2 3 4 5] :when (< 2 x)] x)", "[3 4 5]");
+    try expectOutput("(for [x [1 2 3] :when (< 99 x)] x)", "[]");
+}
+
+test "phase5.4 for: :let modifier with destructuring-capable bindings" {
+    // `:let` uses `let` (NOT `let*`) so destructuring works —
+    // peer-AI turn 83 §\"`:let` destructuring\".
+    try expectOutput("(for [x [1 2 3] :let [y (* x 10)]] y)", "[10 20 30]");
+    // Compose :let + :when (order matters; let-bound name
+    // visible to the when's predicate).
+    try expectOutput(
+        \\(for [x [1 2 3 4] :let [y (* x 10)] :when (< 15 y)] y)
+    , "[20 30 40]");
+    // Destructuring: bind a vector to [a b].
+    try expectOutput(
+        \\(for [pair [[1 :a] [2 :b]] :let [[n k] pair]] [k n])
+    , "[[:a 1] [:b 2]]");
+}
+
+// Note: malformed `for` shapes (empty bindings, unknown modifier
+// keyword, dangling symbol) raise MalformedMacroCall at EXPAND
+// time, which surfaces as CompileError.MacroExpansionFailure —
+// not catchable via runtime try/catch. The rejection is verified
+// by the impl (expand.zig:expandFor); we don't add an integration
+// test because the test harness panics on compile errors rather
+// than surfacing them as catchable values.
+
 test "phase5.2b end-to-end: case + trim + split + join chain" {
     // Composite test pinning that the six fns interop cleanly.
     try expectOutput(
