@@ -2029,11 +2029,18 @@ transaction threading). No ambient tx via dynamic Var in v1.
       handle. Try/catch-safe rollback verified end-to-end:
       exceptions inside `with-tx` abort and rethrow.
       Per peer-AI turn 72 §Q1 PATH B (explicit threading).
-- [ ] **Phase 4.0c** `@deref` operator dispatch on `.durable_ref`
-      (ephemeral read) + `db/alter!` (read-modify-write inside tx).
-- [ ] **Phase 4.0d** Cursors + `db/scan` (eager v1) + `db/reduce-tree`.
-- [ ] **Phase 4.0e** Small example app (to-do tracker) per
-      Phase 4 EXIT CRITERION.
+- [x] **Phase 4.0c** `@deref` operator (reader macro → `db/deref`)
+      + `db/alter!` (read-modify-write inside tx). Universal
+      deref dispatches durable_ref → ephemeral read; Var →
+      root; else → `:not-derefable`.
+- [x] **Phase 4.0d** `db/scan` (eager `[[k v]...]`, start-
+      inclusive, end-exclusive) + `db/reduce-tree`
+      (server-side reduce). Cursors not exposed as raw Value
+      (peer-AI turn 73 §Q3 deferred — stateful + lifetime-
+      sensitive).
+- [x] **Phase 4.0e** `examples/todo-app.nx` — Phase 4 EXIT
+      DEMO. Persistent to-do tracker exercising the entire
+      Phase 4 surface. Verified: state persists across runs.
 - [ ] **Phase 4.0f** (stretch) Snapshots + `db/as-of` per
       PLAN.md §15.7.
 

@@ -27,6 +27,7 @@ zig build nexis
 | `stdlib-primitives.nx` | Native fns (`list`/`cons`/`first`/`rest`/`empty?`/...) + a user-written recursive procedural `my-cond` macro (Phase 3.3a) |
 | `require-demo.nx` + `lib/geom.nx` | `(require '[lib.geom :as g])` loads a library from disk; Phase 3.6 |
 | `durable-refs.nx` | First-class durable identity backed by emdb. `db/open`/`db/ref`/`db/put-key!`/`db/get-key`/`db/delete-key!`. Phase 4.0a — values PERSIST across processes. |
+| `todo-app.nx` | **Phase 4 EXIT DEMO** — persistent to-do tracker exercising the entire Phase 4 surface (`with-tx`, `db/alter!`, `db/scan`, `db/reduce-tree`, `@deref`, rollback on exception). Run twice to verify state persists. |
 
 The macro-heavy examples cover both styles: host macros (Zig-
 implemented, registered in the default table) and user macros

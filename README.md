@@ -52,7 +52,10 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Phase 3.7 | pending (deferred) | `^:dynamic` Vars + `binding` — deferred until Phase 4 clarifies transaction-context shape |
 | Phase 4.0a | ✅ shipped | Durable refs as first-class Values backed by emdb. `db/open`/`db/close`/`db/ref`/`db/put-key!`/`db/get-key`/`db/delete-key!`/`db/present?`. Auto-ephemeral tx. Cross-process persistence verified. |
 | Phase 4.0b | ✅ shipped | Explicit `(with-tx ...)` + `(with-read-tx ...)` + WriteTxn/ReadTxn Value kinds + `db/begin-write`/`db/commit!`/`db/abort-write!`/`db/put!`/`db/get`/`db/delete!`. Try/catch-safe rollback. Multi-write atomicity. |
-| Phase 4.0c+ | pending | `@deref` operator + `db/alter!` + cursors + scan + todo-tracker demo |
+| Phase 4.0c | ✅ shipped | `@deref` operator + `db/deref` (universal: ref/var/else) + `db/alter!` read-modify-write |
+| Phase 4.0d | ✅ shipped | `db/scan` (eager, ordered, range-bounded) + `db/reduce-tree` (server-side reduce) |
+| **Phase 4.0e** | ✅ **shipped** | **EXIT DEMO** — `examples/todo-app.nx`. Persistent to-do tracker. State PERSISTS across `nexis run` invocations. |
+| Phase 4.0f | pending (stretch) | Snapshots + `db/as-of` for historical reads |
 
 **558 tests** green: 95 VM + 313 compile + 6 macroexpand + 4
 property + 54 integration in `phase2-test` (~3s), plus 86 reader
@@ -230,7 +233,24 @@ Every snippet runs via `bin/nexis`. Run the file or paste into the REPL:
   (catch any e e))                  ;; => :nope
 (db/get-key alice)                  ;; => {:age 31} — unchanged
 
+;; @-deref + db/alter! read-modify-write (Phase 4.0c)
+@alice                              ;; => {:age 31} (ephemeral read)
+(with-tx [tx conn]
+  (db/alter! tx alice (fn* [m] (assoc m :tag :super))))
+@alice                              ;; => {:age 31 :tag :super}
+
+;; ordered scan + server-side reduce (Phase 4.0d)
+(with-read-tx [t conn]
+  (db/scan t :users))               ;; => [[:alice {...}] [:bob {...}]]
+(with-read-tx [t conn]
+  (db/reduce-tree t :users
+    (fn* [acc k v] (+ acc (get v :age)))
+    0))                              ;; => sum of all :age fields
+
 (db/close conn)
+
+;; Phase 4 EXIT DEMO: examples/todo-app.nx — persistent
+;; to-do tracker. Run twice to verify state persists.
 
 ;; anonymous-fn shorthand
 (#(+ % 1) 41)                       ;; => 42
