@@ -1083,6 +1083,10 @@ pub const VmError = error{
     /// Phase 4.0b: tx op attempted on a transaction that was
     /// already committed or aborted. Mapped to `:tx-closed`.
     TxClosed,
+    /// Phase 4.0c: `(db/deref x)` / `@x` invoked on a Value
+    /// whose kind isn't a durable_ref or Var. Mapped to
+    /// `:not-derefable`.
+    NotDerefable,
     /// Phase 3.3b (peer-AI turn 68): INTERNAL control-flow
     /// signal. NOT user-visible, NOT catchable. Raised when a
     /// throw propagated past a `VM.callValue` synthetic frame
@@ -3122,6 +3126,7 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.InvalidDurableRef => "invalid-durable-ref",
         VmError.CodecFailed => "codec-failed",
         VmError.TxClosed => "tx-closed",
+        VmError.NotDerefable => "not-derefable",
         // Unrecoverable: bytecode corruption / VM-internal /
         // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,

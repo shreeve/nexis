@@ -103,6 +103,9 @@ const db_fns = [_]CoreEntry{
     .{ .name = "put!", .descriptor = &native_db_put },
     .{ .name = "get", .descriptor = &native_db_get },
     .{ .name = "delete!", .descriptor = &native_db_delete },
+    // 4.0c
+    .{ .name = "deref", .descriptor = &native_db_deref },
+    .{ .name = "alter!", .descriptor = &native_db_alter },
 };
 
 /// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
@@ -299,6 +302,9 @@ const native_db_abort_read = NativeFn{ .name = "db/abort-read!", .min_arity = 1,
 const native_db_put = NativeFn{ .name = "db/put!", .min_arity = 3, .max_arity = 3, .call = &fnDbPut };
 const native_db_get = NativeFn{ .name = "db/get", .min_arity = 2, .max_arity = 3, .call = &fnDbGet };
 const native_db_delete = NativeFn{ .name = "db/delete!", .min_arity = 2, .max_arity = 2, .call = &fnDbDelete };
+// Phase 4.0c — deref + alter.
+const native_db_deref = NativeFn{ .name = "db/deref", .min_arity = 1, .max_arity = 1, .call = &fnDbDeref };
+const native_db_alter = NativeFn{ .name = "db/alter!", .min_arity = 3, .max_arity = null, .call = &fnDbAlter };
 
 // =============================================================================
 // Implementations
@@ -1300,6 +1306,70 @@ fn fnDbDelete(_: *VM, args: []const Value) VmError!Value {
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
     const existed = db_mod.delRef(&h.txn, r) catch return VmError.DbError;
     return value_mod.fromBool(existed);
+}
+
+/// `(db/deref x)` — universal deref:
+///   durable_ref → ephemeral read tx, return decoded value (nil
+///                 if absent)
+///   var         → Var.root (raises :unbound-var if unbound, per
+///                 peer-AI turn 73 §Q1)
+///   other       → :not-derefable (catchable)
+fn fnDbDeref(_: *VM, args: []const Value) VmError!Value {
+    const x = args[0];
+    return switch (x.kind()) {
+        .durable_ref => blk: {
+            const conn = db_mod.refConn(x) orelse return VmError.DbError;
+            if (!conn.open_flag) return VmError.DbClosed;
+            var txn = db_mod.beginRead(conn) catch return VmError.DbError;
+            defer db_mod.abortRead(&txn);
+            const result = db_mod.getRef(&txn, x, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.CodecFailed;
+            break :blk result orelse value_mod.nilValue();
+        },
+        .var_ => blk: {
+            const var_obj = vm_mod.VM.asVar(x);
+            if (!var_obj.bound) return VmError.UnboundVar;
+            break :blk var_obj.root;
+        },
+        else => VmError.NotDerefable,
+    };
+}
+
+/// `(db/alter! tx ref f & args)` — read-modify-write inside an
+/// active write tx. Reads current via getRef, computes
+/// `(apply f current args)` via vm.callValue, writes via putRef.
+/// Returns the new value.
+///
+/// Per peer-AI turn 73 §Q2: if `f` throws or control transfers,
+/// do NOT write. Connection mismatch on `ref` surfaces as
+/// :db-error via db.zig's assertRefMatchesConn.
+fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
+    const tx_v = args[0];
+    const r = args[1];
+    const f = args[2];
+    const extra = args[3..];
+
+    const h = writeTxnHandle(tx_v) orelse return VmError.KindMismatch;
+    if (!h.active) return VmError.TxClosed;
+    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
+
+    // 1. Read current.
+    const current_opt = db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.CodecFailed;
+    const current = current_opt orelse value_mod.nilValue();
+
+    // 2. Build (f current extra...) arg list. f is the FIRST
+    //    arg to callValue; current + extra follow.
+    const call_args = vm.allocator.alloc(Value, 1 + extra.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(call_args);
+    call_args[0] = current;
+    for (extra, 0..) |a, i| call_args[1 + i] = a;
+
+    // 3. Invoke. Throws / control transfers propagate UNCHANGED
+    //    so the with-tx's catch can abort. NO write on error.
+    const new_value = try vm.callValue(f, call_args);
+
+    // 4. Write.
+    db_mod.putRef(&h.txn, r, new_value) catch return VmError.CodecFailed;
+    return new_value;
 }
 
 // =============================================================================

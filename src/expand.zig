@@ -311,7 +311,25 @@ fn expandFormDepth(
         // deref `@x`: Phase-2 doesn't support atoms, so this
         // is opaque at expansion time. lowerForm raises
         // UnsupportedFeature.
-        .deref => mutCast(form),
+        .deref => |inner| blk: {
+            // Phase 4.0c (peer-AI turn 73): rewrite `@x` →
+            // `(db/deref x)`. The native fn dispatches on the
+            // arg's kind: durable_ref → ephemeral read; Var →
+            // root value; else → :not-derefable.
+            const items = try ctx.allocator.alloc(*Form, 2);
+            items[0] = try makeSymbol(ctx, "db/deref", form.origin);
+            // Mark `db/deref` as qualified by storing both ns+name.
+            // Actually `makeSymbol` only handles unqualified. Build directly.
+            const deref_sym = try ctx.allocator.create(Form);
+            deref_sym.* = .{
+                .datum = .{ .symbol = .{ .ns = "db", .name = "deref" } },
+                .origin = form.origin,
+            };
+            items[0] = deref_sym;
+            items[1] = try expandFormDepth(ctx, env, inner, depth);
+            const call = try makeList(ctx, items, form.origin);
+            break :blk call;
+        },
     };
 }
 
