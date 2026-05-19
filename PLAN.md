@@ -2282,7 +2282,7 @@ The things most likely to go wrong, with mitigations.
 | Agents | `send`, `send-off` | **Removed.** |
 | `core.async` | Channels, go blocks | **Removed.** |
 | Multimethods | `defmulti`, `defmethod` | **Removed.** |
-| Protocols | `defprotocol`, `extend-type` | **Removed in v1.** |
+| Protocols | `defprotocol`, `extend-type` | **Kept** (Phase 5 Item 3, peer-AI turn 84). Per-VM registries for records + protocols; `Kind.record = 35` (structural equality + hash), `Kind.protocol = 36`, `Kind.protocol_fn = 37`. `defprotocol` / `defrecord` / `extend-protocol` / `extend-type` / `satisfies?` host macros. Built-in dispatch types + `Any` / `Object` default. NOT serializable. Static dispatch in v1; inline caches deferred to Phase 6. Full spec in `docs/PROTOCOLS.md`. |
 | Reader conditionals | `#?(...)` | **Removed.** |
 | Tagged literals | `#inst`, `#uuid`, user-extensible | **Removed.** |
 | Namespaces | `ns`, `require`, `refer`, `alias` | **Kept.** Simplified. |
@@ -2653,3 +2653,21 @@ spec changes downstream of each PLAN entry.
   peer-AI turn 75. Full spec: `docs/ATOM.md`. No frozen-decision in
   §23 needed amending (the prior "Removed" line lived in Appendix A
   comparison only); this log entry IS the authority record.
+
+- **2026-05-19 — Protocols + records (Phase 5 Item 3) added.**
+  §23 #8 ("No user protocols in v1") and Appendix A
+  ("Protocols — Removed in v1") were v1-scoping decisions
+  pre-Phase-5. The HANDOFF.md §10.3 Phase 5 framing (peer-AI
+  turn 74) and the design freeze in `docs/PROTOCOLS.md` (peer-AI
+  turn 84) reframe these as Phase 5 scope additions, not changes
+  to architecturally load-bearing decisions. v1 keeps its other
+  §23 #5 constraint (single-isolate, single-threaded), so
+  protocols here are static-dispatch + per-VM registries;
+  no STM, no agents, no concurrency. Per-VM `RecordType` and
+  `Protocol` registries; new heap kinds 35–37 (`record` /
+  `protocol` / `protocol_fn`); structural equality + hash for
+  records; opaque identity for protocols / protocol_fns. Records
+  + protocols are NOT in the §23 #25 serializable set
+  (`:unserializable`). 4-sub-commit implementation split (5.3a–d).
+  See `docs/PROTOCOLS.md` for the full spec, hand-trace, and
+  amendment-log entry. Authority: peer-AI turn 84.
