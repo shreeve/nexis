@@ -1,4 +1,4 @@
-# nexis Phase 5 — Handoff Prompt (write this to the next AI as your first message)
+# nexis Phase 6 — Handoff Prompt (write this to the next AI as your first message)
 
 > **How to use this file**: copy everything between the opening
 > and closing ``` fences below and paste it as the FIRST message
@@ -57,10 +57,9 @@ If all four are present: proceed.
 ============================================================
 
 ============================================================
-PHASES 0–4 ALL COMPLETE. Currently in Phase 5 (Clojure
-compatibility breadth: atoms, strings/IO, protocols, more
-stdlib). Pre-Phase-5 work is ALREADY DONE — see below for
-state + roadmap.
+PHASES 0–5 ALL COMPLETE. Phase 5 EXIT criterion MET (see
+examples/shapes.nx). Currently positioned for Phase 6
+(performance + benchmarks per PLAN.md §21 weeks 27–30).
 ============================================================
 
 Phase 0  — reader + Form normalization                  ✅ SHIPPED
@@ -73,14 +72,22 @@ Phase 3  — macros, namespaces, REPL, stdlib infra,
 Phase 4  — DURABLE IDENTITY as first-class language
            concept (durable_ref + with-tx + db/alter! +
            db/scan + db/reduce-tree + snapshots)         ✅ SHIPPED — Phase 4 EXIT MET
-Phase 5  — Clojure compatibility breadth                 ← IN PROGRESS
+Phase 5  — Clojure compatibility breadth                 ✅ SHIPPED — Phase 5 EXIT MET
+           5.1 atoms (atom/swap!/reset!/@a/CAS)
+           5.2a/b/c strings + nexis.string + print/I/O
+           5.3a/b/c/d records + protocols + extend +
+                      satisfies? + :any fallback
+           5.4a/b case/condp/for macros
+Phase 6  — Performance pass (Tier 2 wins §19.6)          ← NEXT MILESTONE
 
-The LANGUAGE is feature-complete for v1's promised core: every
+The LANGUAGE is feature-complete for v1's promised core (every
 primitive form, host macros, user defmacro, syntax-quote with
-auto-gensym, try/catch/finally with catchable VmErrors, ~30
-native fns (sequence/HOF/arithmetic/collection), multi-namespace
-with require + qualified symbols, full destructuring +
-multi-arity defn + composite core.nx layer.
+auto-gensym, try/catch/finally with catchable VmErrors, ~60
+native fns, multi-namespace with require + qualified symbols,
+full destructuring + multi-arity defn + composite core.nx layer)
+PLUS the full Clojure compatibility surface Phase 5 promised:
+atoms, strings, I/O, records, protocols, extend-protocol /
+extend-type / satisfies? / :any, case/condp/for.
 
 THE OTHER BIG ARC IS ALSO DONE: durable refs backed by emdb
 (LMDB-class B+ tree, MVCC). `(db/open "app.edb")` → refs that
@@ -88,16 +95,18 @@ PERSIST across processes, with `(with-tx [tx conn] ...)` atomic
 multi-write transactions, exception-rollback verified,
 time-travel via MVCC snapshots. Single binary. No JVM.
 The pitch ("Clojure + Datomic, fused") is no longer
-aspirational — it's runnable in examples/todo-app.nx.
+aspirational — it's runnable in examples/todo-app.nx +
+examples/shapes.nx.
 
-THIS HANDOFF prepares you for Phase 5: closing the "yes you
-can run real Clojure-style code" gap. The architectural
-hard work is DONE; what's left is breadth + a few specific
-new abstractions (protocols + records is the biggest).
+THIS HANDOFF prepares you for Phase 6: performance + benchmarks.
+The architectural + breadth work is DONE; what's left is
+measuring real-world performance, retiring §19.6's Tier 2
+projections one by one, and shipping a credible vs-Clojure
+comparison report under BENCH.md §11's honesty discipline.
 
-563 phase2 + 86 reader/golden = 649 tests in the fast inner-
-loop suite (~3s). Full suite (`zig build test`) green including
-Phase 1 randomized property tests.
+1136 tests passing (`zig build test`), including ~100k
+randomized property iterations in Phase 1's HAMT gate. Inner
+loop (`zig build phase2-test`) runs in ~3s.
 
 Read this entire prompt before touching anything.
 
@@ -108,7 +117,33 @@ Read this entire prompt before touching anything.
 - Remote:   git@github.com:shreeve/nexis.git
 - Branch:   main
 - HEAD:     check `git log -1 --oneline`. Recent commit chain
-            (newest first; ~3 dozen Phase-3+ commits):
+            (newest first; Phase 5 lands the last ~20 commits):
+
+              == Phase 5 (Clojure compatibility breadth) — COMPLETE ==
+              b03e9b2 phase 5.3d: extend-protocol/extend-type +
+                                  satisfies? + :any default
+              3e1b9cc phase 5.3c: defrecord inline protocol impls —
+                                  canonical (bar (->Counter 5) 7) → 12
+              da6ec22 phase 5.3b: protocols substrate (Kind.protocol +
+                                  Kind.protocol_fn + defprotocol +
+                                  dispatchProtocolMethod)
+              3eb5dc0 phase 5.3a: records substrate (Kind.record +
+                                  defrecord + map-like ops)
+              a4b2202 phase 5.3 design freeze (docs/PROTOCOLS.md +
+                                  PLAN.md amendment)
+              <hash>  phase 5.4: case/condp/for macros (5.4a + 5.4b)
+              <hash>  phase 5.2c: print/println/prn/pr-str/slurp/spit +
+                                  src/format.zig + Writer.Allocating
+                                  + :io-error / :file-not-found
+              <hash>  phase 5.2b: nexis.string namespace (lower-case /
+                                  upper-case / trim / split / join /
+                                  replace)
+              <hash>  phase 5.2a: str + string? + subs + codepoint
+                                  helpers + count/nth/empty? over
+                                  strings + db/open + db/ref accept
+                                  string args
+              <hash>  phase 5.1:  atoms (atom/swap!/reset!/@a/CAS +
+                                  Kind.atom + in_flight re-entry guard)
 
               == Phase 4 (durable identity) ==
               8189bf8 phase 4.0f: snapshot vocabulary — TIME TRAVEL
@@ -118,22 +153,8 @@ Read this entire prompt before touching anything.
               bc21a0a phase 4.0b: with-tx / with-read-tx + tx-threaded ops
               e64c091 phase 4.0a: durable refs backed by emdb
 
-              == Phase 3 (language core) ==
-              a1e23c4 phase 3.6: require + file loading + :as aliases
-              e5639d8 phase 3.5b: multi-arity defn
-              0fe09fa phase 3.5a: destructuring in let / fn / defn params
-              83f8e85 phase 3.4: multi-namespace (registry + qualified symbols + ns)
-              d36b745 phase 3.3d: embedded core.nx composite stdlib layer
-              d596f57 phase 3.3c: collection utilities
-              60af4d8 phase 3.3b: VM.callValue + apply + HOFs + first-class arithmetic
-              e003aad phase 3.3a: native_fn infra + 10 macro-authoring primitives
-              ce534d1 phase 3.2: user-defined defmacro with compile-time VM eval
-              8461ae9 phase 3.1: maps + sets as runtime values
-              9364615 phase 3.0c: catchable VmErrors
-              7d8a16e phase 3.0b: anon-fn `#(...)` reader-macro expansion
-              4ccd281 phase 3.0a: REPL (bin/nexis repl)
-
-              == Phase 2 (compiler + VM) — see `git log --oneline` ==
+              == Phase 3 (language core) — see `git log --oneline` ==
+              == Phase 2 (compiler + VM)  — see `git log --oneline` ==
 
 - Working tree clean. Verify with `git status`.
 
@@ -212,10 +233,10 @@ For **inner-loop iteration** (~3 seconds):
 cd /path/to/nexis
 zig build phase2-test
 ```
-Runs vm + compile + expand + stdlib + loader + integration +
-property tests. Expected at HEAD `f5bc4f8`:
-  95 vm + 322 compile + 6 macro-prop + 2 stdlib + 1 loader +
-  4 closure-prop + 133 integration = **563 tests pass**.
+Runs atom + record + protocol + vm + format + compile + expand
++ stdlib + loader + integration + property tests. At Phase 5
+EXIT (HEAD `b03e9b2` or later) the count is **675 tests** in
+this fast suite. Counts grow with every Phase 6 perf addition.
 
 For **pre-commit validation** (~3 minutes, ~1 GB peak):
 ```
@@ -227,16 +248,22 @@ The ~3 min runtime is dominated by Phase 1's randomized HAMT
 gate (~100k ops, can OOM-kill on memory-constrained systems
 — use `phase2-test` for inner-loop if that bites).
 
-For **end-to-end smoke** (verify Phase 4 actually persists):
+For **end-to-end smoke** (verify Phase 4 + Phase 5 EXIT both
+remain working before touching anything):
 ```
-cd /tmp && rm -f todos.edb
+# Phase 4 EXIT — durable persistence across processes
+rm -rf tmp
 /path/to/nexis/bin/nexis run /path/to/nexis/examples/todo-app.nx
 /path/to/nexis/bin/nexis run /path/to/nexis/examples/todo-app.nx
+# Second run shows `:completed 1` — state PERSISTS
+
+# Phase 5 EXIT — protocols + records demo (no persistence)
+/path/to/nexis/bin/nexis run /path/to/nexis/examples/shapes.nx
+# Expect the protocol-dispatch table to print correctly with
+# all 6 shape kinds (Circle/Rectangle/Triangle/fixnum/string/:any).
 ```
-Second run should show `:completed 1` — state PERSISTS across
-processes. If you don't see persisted state, the Phase 4
-durable substrate is broken; do not proceed with Phase 5 until
-that's resolved.
+If either smoke is red, the substrate has regressed; do not
+proceed with Phase 6 until that's resolved.
 
 If anything is red, STOP and diagnose before editing.
 
@@ -948,29 +975,253 @@ From PLAN.md §"Start here" and accumulated hard lessons:
   `vm.Operand` rely on this; if you add fields, mind the bit order.
 
 ═══════════════════════════════════════════════════════════════════════
-## 10. IMMEDIATE NEXT TASK — Phase 5: close the "runs Clojure code" gap
+## 10. IMMEDIATE NEXT TASK — Phase 6: performance pass
 
-Per the architectural assessment at end of Phase 4, the
-remaining work to make a typical Clojure-style program
-(modulo Java interop) runnable on nexis is **bounded and
-well-understood**. Six items, with peer-AI design pins
-locked in turn 74:
+Phase 5 closed the "runs Clojure code" gap. The substrate is
+broad enough to port typical Clojure-style applications; the
+end-to-end demo at `examples/shapes.nx` exercises records,
+protocols, extend-protocol over built-ins + records, :any
+fallback, satisfies?, atoms, str, and case/for in one file.
 
-| # | Item | Effort | New ground? |
+What remains is PERFORMANCE — making the interpreter actually
+fast. Per PLAN.md §19.6 + §21 Phase 6 (weeks 27–30) the work
+is enumerated as Tier 2 wins. Discipline is in BENCH.md (the
+honesty gate is severe — see §10.6 below).
+
+| # | Item | Target speedup | Notes |
 |---|---|---|---|
-| 1 | Atoms (`atom`/`swap!`/`reset!`/`@a`) | ~1 session | NO — small native fn arc |
-| 2 | Strings as first-class + basic I/O | ~2 sessions | NO — string Kind exists |
-| 3 | **Protocols + records** | ~3-5 sessions | **YES** — new Value kind + dispatch tables |
-| 4 | `case` / `condp` / `for` macros | ~1 session | NO — pure expansion |
-| 5 | Broader `core.nx` stdlib breadth | ongoing | NO — user-land |
-| 6 | Regex | ~1 session import / more if scratch | NO if importing |
+| T2.1 | SIMD-packed CHAMP nodes (NEON `CNT`, parallel key-compare) | 2-3× map lookup | per-node hot path |
+| T2.2 | Zero-copy strings/bytes from emdb mmap pages | 10-50× DB-read of large blobs | string Kind already supports `subkind` |
+| T2.3 | Inline caches on Var loads (per-Var revision counter) | 2-5× call-heavy code | leverages existing Var struct |
+| T2.4 | Perfect-hash keyword tables (compile-time generated) | smaller, faster intern lookup | post-hoc compaction step |
+| T2.5 | LuaJIT-style operand-specialized opcodes (`math:add-ss`/`math:add-sc`) | varies | requires inst-shape expansion |
+| T2.6 | Generational GC nursery | only if mark-sweep pauses become visible | gated by real benchmarks |
+| T2.7 | `nexis.simd` kernels on typed vectors (`vdot`/`vsum`/`vmap`/`vfilter`) | new user-facing feature | publishes the SIMD lift to user code |
+| T2.8 | Branchless CHAMP lookup for small bitmaps | micro | bench-driven |
+| T2.9 | Precomputed compact source maps (lazy stack-trace) | LOC savings + GC bench fairness | also fixes Phase 2 residual |
 
-Items 1, 4, 5, 6 are well-understood "do the obvious work."
-Items 2, 3 have design surface — peer-AI turn 74 pins below.
+There are also TWO leftover items from Phase 5 that were
+explicitly deferred and may land in parallel with Phase 6 if
+they help:
+
+- **Phase 5 Item 5 (broader core.nx)** — ongoing. Add
+  partition/frequencies/group-by/comp/juxt/partial/etc. as
+  user-land defns in `src/stdlib/core.nx`. Low-risk per
+  addition; great parallel work while Phase 6 perf turns
+  are queued.
+
+- **Phase 5 Item 6 (regex)** — deferred pending a Zig regex
+  library decision. Don't start unless an actual blocker
+  surfaces in a real workload.
 
 ---
 
-### 10.1 Item 1 — Atoms (peer-AI turn 74 §A)
+### 10.1 Phase 6 must-read first
+
+Before touching any perf work, internalize:
+
+1. **PLAN.md §19** in full — especially §19.6 Tier-1/Tier-2
+   projections (what's promised), §19.7 the honesty clause
+   (no public claims until BENCH.md gates pass), §19.8 the
+   methodology reference.
+
+2. **docs/BENCH.md** in full — the gates a perf claim has to
+   satisfy: numerical + accurate + fair + relevant. §8's
+   honesty clause + §11's summary sentence are the publication
+   bar. Read both BEFORE writing any benchmark code.
+
+3. **docs/PERF.md** — the per-kind perf invariants from
+   Phase 1 (CHAMP allocator, vector tail buffer, etc.). When
+   you touch any of these for perf, the invariant doesn't move.
+
+4. **bench/main.zig** — the existing micro-bench harness.
+   The Phase 6 work expands this; don't fork it.
+
+The honesty clause is severe: "When benchmarks eventually
+ship, publish scenarios where Clojure wins. Manufactured
+symmetry is worse than admitted losses." Every comparison
+report needs to survive that sentence + external Clojure-
+practitioner review per BENCH.md §9.
+
+---
+
+### 10.2 Sub-step structure (suggested)
+
+Phase 6 is a sequence of independently-shippable wins. Each
+sub-commit does ONE of:
+
+- Lands a benchmark suite (no code change to nexis itself).
+- Lands an optimization (perf code change) + the bench that
+  proves it (+ a regression test pinning the wire-format /
+  semantic invariants the optimization preserves).
+- Lands a publication report (numbers + methodology + honest
+  scenarios where we don't win).
+
+The right ordering depends on what the benchmarks show.
+Don't optimize before measuring. Per BENCH.md §3, never
+publish a Tier-2 speedup claim without:
+- A scenario specification (what was measured + on what
+  data + on what hardware).
+- A baseline (typically Clojure or the un-optimized nexis
+  build).
+- A confidence interval (multiple runs, not a single number).
+- A test that survives `--release-fast` AND `--debug`.
+
+---
+
+### 10.3 First concrete action — establish the baseline
+
+The very first Phase 6 commit should NOT be an optimization.
+It should be:
+
+- A `bench/` infrastructure pass: ensure `bench/main.zig`
+  covers the kernel set we care about (Var loads, map
+  lookups, string concat, fn call overhead, GC pause
+  distributions).
+- A FAIR Clojure-side equivalent for each benchmark
+  (matching workload, matching warmup discipline, separate
+  source files in `bench/clojure-baseline/`).
+- A baseline numbers file (committed) so future perf commits
+  show delta vs this baseline, not vs nothing.
+
+This commit ships zero speedup. It enables every subsequent
+speedup commit to be honest. Without it the perf phase
+slides into manufactured optimism.
+
+---
+
+### 10.4 Likely high-leverage early wins
+
+Once the baseline is in place, the likely highest-leverage
+optimizations are:
+
+1. **T2.3 inline caches on Var loads.** Var lookup is the
+   dominant cost in call-heavy code; the per-Var revision
+   counter is already in the Var struct. ~1 session for
+   the basic IC; multi-session for adaptive specialization.
+
+2. **T2.4 perfect-hash keyword tables.** Keyword intern is
+   currently a HashMap lookup. A perfect-hash compiled at
+   stdlib-bootstrap time would make `(:k m)` and `(get m :k)`
+   meaningfully faster. ~1 session.
+
+3. **T2.1 SIMD CHAMP nodes.** Bigger swing but bigger lift —
+   the inner loop of every map operation. Multi-session;
+   requires careful per-platform validation. NEON first
+   (we're on macOS Apple Silicon).
+
+4. **T2.7 nexis.simd kernels** — publishes the SIMD lift to
+   user-facing code. ~1-2 sessions; mostly additive (new
+   namespace, no existing-code changes).
+
+Hold T2.2 (zero-copy strings from emdb) for last in this
+batch; it touches the DB substrate and wants a stable post-
+optimization baseline to measure against.
+
+---
+
+### 10.5 The Phase 2 residual still on the wish-list
+
+(Carry-over from the Phase 5 handoff; still applicable.)
+
+**Runtime VmError SrcSpans** (PC→source map per Routine).
+Currently runtime errors lack source spans. Bounded
+~1-2 sessions. T2.9 in §10 above subsumes this — the
+"precomputed compact source maps" item gives us source
+spans for free AND a lazy stack-trace materialization win.
+Lean into doing them together.
+
+---
+
+### 10.6 Phase 6 EXIT criterion
+
+Per PLAN.md §21:
+
+**"Performance numbers published; clear comparison table vs
+Clojure and vs bare emdb."**
+
+To meet this:
+- BENCH.md §11's summary sentence works end-to-end:
+  "We measured several clearly defined performance regimes,
+  with published source and methodology, and here is where
+  nexis is faster, where it is comparable, and where
+  Clojure wins."
+- The report names BOTH win scenarios AND loss scenarios.
+- External Clojure-practitioner review per BENCH.md §9
+  has been performed; the reviewer's concerns are either
+  addressed or noted in the report.
+- All Tier 2 items in §10 above are either shipped, or
+  explicitly deferred to a future phase with a stated
+  rationale.
+
+Phase 6 is the phase that retires "nexis is fast" from
+aspiration to demonstrable.
+
+---
+
+### 10.7 Architectural surface that's settled
+
+The hard work is DONE. These interfaces are stable; new work
+builds on them WITHOUT reshaping:
+
+- **Value model** (16-byte tagged Value, Kind enum). 37 kinds
+  used as of Phase 5.3d (atoms = 34, records = 35, protocol =
+  36, protocol_fn = 37). New kinds add to the enum + dispatch.
+- **VM** (group-based opcode dispatch, frame management,
+  callValue reentrancy, handler/finally stacks, the new
+  Phase 5.3b protocol-fn dispatch arm in execCallCall).
+- **Compiler** (lowerForm → Tiny → bytecode; emitter; var_table;
+  heap-allocated string literals via LowerCtx.heap).
+- **Expander** (host macros for atoms / case / condp / for /
+  defrecord / defprotocol / extend-protocol / extend-type;
+  user defmacro; syntax-quote; compile-eval callback).
+- **Namespaces** (registry + auto-refer + qualified resolution
+  + alias tables + loader + nexis.internal qualified-only
+  namespace pattern).
+- **Codec** (round-trip for all v1 kinds; atoms / records /
+  protocol* explicitly excluded as identity-valued or
+  per-VM).
+- **Per-VM registries** (record_registry + protocol_registry,
+  with name dedup + entry teardown wired into VM.deinit).
+- **emdb integration** (Connection, txn handles, codec-wired
+  read/write/scan, parent-directory auto-create in db/open).
+- **format.zig** (centralized Value → text formatter with
+  display/readable modes; CLI + tests + str all delegate
+  to it).
+
+If you find yourself wanting to reshape any of these for a
+perf win: STOP. The right move is almost always an additive
+layer (new opcodes, new caches, new kernel) on top of the
+stable surface, not a reshape of the surface itself.
+
+---
+
+### 10.LEGACY Phase 5 design pins (archived; useful reference only)
+
+The original Phase 5 takeover laid out detailed design pins
+for atoms, strings, protocols, case/condp/for, etc. All six
+items shipped per the design freeze, with peer-AI turn 84's
+PROTOCOLS.md adding the Item 3 architecture freeze. The
+pins themselves are now historical — refer to:
+
+- docs/ATOM.md      (Item 1 frozen spec)
+- docs/STRING.md §7-§9  (Item 2 a/b/c)
+- docs/PROTOCOLS.md (Item 3 a/b/c/d — frozen via amendment)
+- expand.zig host macros for case/condp/for (Item 4 a/b)
+
+The Phase 5 EXIT demo (examples/shapes.nx) exercises every
+Item 3 surface plus Item 1 atoms + Item 2 str + Item 4 for
+in one file.
+
+═══════════════════════════════════════════════════════════════════════
+
+[The original Phase 5 §10.1-§10.9 design pin material below
+this point is retained verbatim from the Phase 5 handoff for
+archival reference. Skip unless researching Phase 5 history.]
+
+═══════════════════════════════════════════════════════════════════════
+
+### 10.LEGACY.1 Item 1 — Atoms (peer-AI turn 74 §A)
 
 In-memory mutable cell. The simplest Clojure concurrency primitive.
 
@@ -1474,8 +1725,10 @@ What made this session work across 3 commits + 4 peer-AI turns:
     than paper over with a code workaround. When work is complete,
     say so; when it's deferred, say so explicitly.
 
-Phase 2 gate (COMPILER.md §9.4) is the next major milestone.
-Don't rush it. Plan for slack.
+Phase 6 EXIT (PLAN §21: "performance numbers published; clear
+comparison table vs Clojure and vs bare emdb") is the next
+major milestone. Don't rush it. Plan for slack. Measure
+before optimizing. Honesty over manufactured wins.
 
 The force remains with you.
 
@@ -1484,52 +1737,72 @@ The force remains with you.
 
 1. Run `git log --oneline -15` and `git status`. Confirm you're
    at the most recent commit on a clean main. HEAD should be
-   `8189bf8` (phase 4.0f) or later.
-2. Run `zig build phase2-test --summary all`. Confirm 563
-   phase2 tests + supporting categories, all green. Full
-   `zig build test` includes Phase 1 randomized property
-   tests (peaks ~1 GB RAM; can OOM-kill on smaller boxes —
-   use `phase2-test` for inner-loop.)
-3. Run the Phase 4 EXIT demo to confirm durable identity
-   actually works:
+   `b03e9b2` (phase 5.3d) or later — Phase 5 EXIT MET.
+2. Run `zig build phase2-test --summary all`. Confirm 675
+   tests pass in the inner-loop suite. Then run
+   `zig build test --summary all` — full suite is 1136 tests
+   (~3 minutes; includes Phase 1 randomized property tests
+   that peak ~1 GB RAM; can OOM-kill on smaller boxes —
+   use `phase2-test` for inner-loop iteration).
+3. Run the Phase 4 + Phase 5 EXIT demos to confirm both
+   substrates actually work:
    ```
-   $ rm -f /tmp/todos.edb
-   $ cd /tmp && /path/to/bin/nexis run /path/to/examples/todo-app.nx
+   $ rm -rf tmp
    $ /path/to/bin/nexis run /path/to/examples/todo-app.nx
+   $ /path/to/bin/nexis run /path/to/examples/todo-app.nx
+   $ /path/to/bin/nexis run /path/to/examples/shapes.nx
    ```
-   Second run should show `:completed 1` (state PERSISTED).
-4. Read PLAN.md §0-§3 (positioning + non-goals) and §21
-   (roadmap with current ship status). Skim §15 (durable
-   identity model) since Phase 4 is done. Read §23 (frozen
-   decisions) before any architectural proposal.
-5. Read this HANDOFF.md §10 (Phase 5 plan with peer-AI turn
-   74 design pins for atoms, strings/IO, protocols).
-6. Read AGENTS.md, ZIG-0.16.0-{REFERENCE,QUICKSTART}.md,
-   docs/MACROEXPAND.md (for understanding how user macros
+   Second todo-app run should show `:completed 1` (state
+   PERSISTED across processes). The shapes demo should print
+   the full protocol-dispatch table with all 6 receiver kinds.
+4. Read PLAN.md §0-§3 (positioning + non-goals) and §19 (perf
+   projections — the source of truth for Phase 6 targets) and
+   §21 (roadmap with current ship status). Read §23 (frozen
+   decisions) + the Amendment Log section before any
+   architectural proposal.
+5. Read this HANDOFF.md §10 (Phase 6 plan + benchmark
+   discipline). The §10.LEGACY material is archival reference
+   from the Phase 5 takeover — skip unless researching
+   history.
+6. Read docs/BENCH.md + docs/PERF.md in full BEFORE any perf
+   work. The honesty gate is severe.
+7. Read AGENTS.md, ZIG-0.16.0.md, docs/MACROEXPAND.md
+   (for understanding how user macros
    work — protocols will be macros too).
-7. Post a short status summary:
-   - HEAD commit, test count, Phase 4 demo passed/failed.
-   - Which Item from §10 you propose starting (default per
-     §10.7 ordering: Item 1 atoms first).
+8. Post a short status summary:
+   - HEAD commit + test count + Phase 4 demo PASS + Phase 5
+     demo PASS confirmation.
+   - Which §10 item you propose starting. The default is the
+     baseline-benchmark infrastructure pass (§10.3) — that
+     pre-condition has to land before any perf optimization
+     can ship honestly.
    - Any clarifying questions.
-8. After user confirms, engage peer AI via `user-ai` MCP with
-   `conversation_id: "nexis-phase-1"` for a strategy check on
-   your chosen item BEFORE writing code. (Turn count is ~74
-   as of this handoff; the conversation has FULL context on
-   architectural decisions from Phases 0-4.)
-9. Hand-trace before code for protocols (Item 3). It's the
-   only Item where doing this matters; the others are obvious
-   once the design pin is locked.
+9. After user confirms, engage peer AI via `user-ai` MCP with
+   `conversation_id: "nexis-phase-1"` for a strategy check
+   on your chosen item BEFORE writing code. (Turn count is
+   ~84 as of this handoff; the conversation has FULL context
+   on every architectural decision from Phases 0-5 including
+   the protocols/records design freeze in turn 84.)
+10. Measure BEFORE optimizing. The benchmark suite is the
+    contract; every optimization commit must reference the
+    specific scenario in `bench/` it's tuning, and must show
+    the measured delta vs the committed baseline.
+11. Hand-trace before code for any optimization that touches
+    the Value model, the call:call dispatch, or the GC
+    integration. These three have settled-load-bearing
+    interactions; a "small" perf change can ripple in
+    surprising ways.
 
 Good luck. Every commit you ship is already being reviewed by
 peer AI, by the user, and by the quality bar in §11. Hold the
-line.
+line. And on Phase 6: HONESTY OVER MANUFACTURED WINS.
 
 Phase 4 sealed the differentiated pitch ("Clojure + Datomic,
-single binary"). Phase 5 closes the "yes you can run real
-Clojure-style code" gap. The hard architectural work is DONE;
-what's left is breadth and a few specific new abstractions —
-all designed in §10.
+single binary"). Phase 5 closed the "yes you can run real
+Clojure-style code" gap (atoms, strings, I/O, protocols +
+records + extend-protocol / extend-type / satisfies? + :any,
+case/condp/for). Phase 6 retires "nexis is fast" from
+aspiration to demonstrable.
 ```
 
 ---
@@ -1539,18 +1812,19 @@ handing off, NOT for the incoming AI — these aren't part of
 the prompt above):
 
 - **Conversation thread**: `conversation_id: "nexis-phase-1"`
-  on the `user-ai` MCP is now ~74 turns deep. Peer AI has
+  on the `user-ai` MCP is now ~84 turns deep. Peer AI has
   full context on every architectural decision from Phases
-  0-4, including the Phase 5 design pins for atoms / strings
-  / protocols (turn 74). When the new AI resumes this
-  conversation, it inherits all of that history. Don't make
-  peer re-derive what it already pinned.
+  0-5, including the atom design pins (turn 75), strings/IO
+  pins (turns 77-81), case/condp/for pins (turn 83), and
+  the protocols+records design freeze (turn 84). When the
+  new AI resumes this conversation, it inherits all of that
+  history. Don't make peer re-derive what it already pinned.
 
-- **Test count baseline**: `563 phase2 + 86 reader/golden =
-  649 fast suite` is the ground truth for "clean starting
-  state" at HEAD `f5bc4f8`. If the new AI reports a
-  different count, something is off — investigate before
-  proceeding.
+- **Test count baseline**: `675 phase2 + 461 reader/golden/
+  property = 1136 full suite` is the ground truth for
+  "clean starting state" at HEAD `b03e9b2` (Phase 5.3d EXIT).
+  If the new AI reports a different count, something is off —
+  investigate before proceeding.
 
 - **Spec convergence**: COMPILER.md, VM.md, MACROEXPAND.md,
   DB.md are the load-bearing contracts. Each has an
