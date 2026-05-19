@@ -173,6 +173,8 @@ const internal_fns = [_]CoreEntry{
     // 5.3b — protocols.
     .{ .name = "#%register-protocol", .descriptor = &native_register_protocol },
     .{ .name = "#%protocol-fn", .descriptor = &native_protocol_fn },
+    // 5.3c — defrecord inline protocol impls.
+    .{ .name = "#%extend-record-impl", .descriptor = &native_extend_record_impl },
 };
 
 /// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
@@ -429,6 +431,8 @@ const native_record_type_id = NativeFn{ .name = "#%record-type-id", .min_arity =
 // Phase 5.3b (peer-AI turn 84) — protocol internals.
 const native_register_protocol = NativeFn{ .name = "#%register-protocol", .min_arity = 2, .max_arity = 2, .call = &fnRegisterProtocol };
 const native_protocol_fn = NativeFn{ .name = "#%protocol-fn", .min_arity = 2, .max_arity = 2, .call = &fnProtocolFn };
+// Phase 5.3c (peer-AI turn 84) — defrecord inline protocol impls.
+const native_extend_record_impl = NativeFn{ .name = "#%extend-record-impl", .min_arity = 4, .max_arity = 4, .call = &fnExtendRecordImpl };
 
 // Phase 5 Item 2 sub-step 5.2b (peer-AI turn 79) — nexis.string namespace.
 const native_string_lower_case = NativeFn{ .name = "nexis.string/lower-case", .min_arity = 1, .max_arity = 1, .call = &fnStringLowerCase };
@@ -2497,6 +2501,35 @@ fn fnProtocolFn(vm: *VM, args: []const Value) VmError!Value {
     if (!found) return VmError.NoProtocolMethod;
 
     return protocol_mod.makeProtocolFn(vm.ensureHeap(), protocol_id, method_name_id) catch return VmError.OutOfMemory;
+}
+
+/// `(#%extend-record-impl protocol method-kw record-type-id impl-fn)`
+///   → nil
+///
+/// Phase 5.3c (peer-AI turn 84): wire an impl for a specific
+/// record type into the protocol registry. Used by `defrecord`'s
+/// inline protocol clauses + by `extend-protocol`/`extend-type`
+/// (5.3d) over record receivers.
+fn fnExtendRecordImpl(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .protocol) return VmError.KindMismatch;
+    if (args[1].kind() != .keyword) return VmError.KindMismatch;
+    if (args[2].kind() != .fixnum) return VmError.KindMismatch;
+    // args[3] is the impl callable: closure / native_fn / etc.
+    // We don't validate its kind here — dispatchProtocolMethod
+    // calls `callValue` which surfaces NotCallable if it's not
+    // invocable. Errors point at the user's impl form rather
+    // than this scaffolding.
+    const protocol_id = protocol_mod.protocolId(args[0]);
+    const method_name_id: u32 = @intCast(args[1].payload);
+    const type_id_signed = args[2].asFixnum();
+    if (type_id_signed < 0) return VmError.KindMismatch;
+    const type_id: u32 = @intCast(type_id_signed);
+    const key = vm_mod.DispatchKey{ .tag = .record, .id = type_id };
+    vm.extendProtocol(protocol_id, method_name_id, key, args[3]) catch |err| switch (err) {
+        error.NoProtocolMethod => return VmError.NoProtocolMethod,
+        error.OutOfMemory => return VmError.OutOfMemory,
+    };
+    return value_mod.nilValue();
 }
 
 // =============================================================================

@@ -2173,6 +2173,78 @@ test "phase5.3b protocol dispatch with zero args raises :arity-mismatch" {
     , ":arity-mismatch");
 }
 
+// =============================================================================
+// Phase 5 Item 3 sub-step 5.3c — defrecord with inline protocol impls
+// (peer-AI turn 84). The canonical hand-trace from PROTOCOLS.md §5.
+// =============================================================================
+
+test "phase5.3c hand-trace: (bar (->Counter 5) 7) -> 12" {
+    // The canonical hand-trace from PROTOCOLS.md §5 — verifies
+    // end-to-end that defprotocol + defrecord-with-impl wire up
+    // protocol dispatch correctly.
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo
+        \\    (bar [this y]))
+        \\  (defrecord Counter [n]
+        \\    IFoo
+        \\    (bar [this y] (+ (get this :n) y)))
+        \\  (bar (->Counter 5) 7))
+    , "12");
+}
+
+test "phase5.3c defrecord impls: receiver-typed dispatch" {
+    // Two distinct records each with their own impl. Each
+    // dispatches to its own body.
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this]))
+        \\  (defrecord A [n] IFoo (bar [this] (+ (get this :n) 100)))
+        \\  (defrecord B [n] IFoo (bar [this] (* (get this :n) 10)))
+        \\  [(bar (->A 5)) (bar (->B 5))])
+    , "[105 50]");
+}
+
+test "phase5.3c defrecord impls: multiple methods" {
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo
+        \\    (bar [this])
+        \\    (baz [this y]))
+        \\  (defrecord Counter [n]
+        \\    IFoo
+        \\    (bar [this] (get this :n))
+        \\    (baz [this y] (+ (get this :n) y)))
+        \\  [(bar (->Counter 5)) (baz (->Counter 5) 7)])
+    , "[5 12]");
+}
+
+test "phase5.3c defrecord impls: multiple protocols on one record" {
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this]))
+        \\  (defprotocol IBaz (baz [this]))
+        \\  (defrecord Counter [n]
+        \\    IFoo (bar [this] :i-am-bar)
+        \\    IBaz (baz [this] :i-am-baz))
+        \\  [(bar (->Counter 5)) (baz (->Counter 5))])
+    , "[:i-am-bar :i-am-baz]");
+}
+
+test "phase5.3c defrecord impls: this is the literal record value" {
+    // The first arg to a protocol method is the receiver itself
+    // (NOT a magic this-pointer). It's just the value that gets
+    // passed in — peer-AI turn 84 §D2.
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this]))
+        \\  (defrecord Counter [n]
+        \\    IFoo
+        \\    (bar [this] (Counter? this)))
+        \\  (bar (->Counter 5)))
+    , "true");
+}
+
 test "phase5.3b defprotocol: protocol-fn passes through map-as-key" {
     // protocol_fn values are identity-valued; storing two distinct
     // calls to defprotocol-emitted protocol_fn under the same key

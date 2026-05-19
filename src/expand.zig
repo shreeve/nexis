@@ -2932,31 +2932,35 @@ fn expandFor(
     return inner;
 }
 
-// ---- defrecord (5.3a — records only; no protocol clauses) ----
+// ---- defrecord (5.3c — records + inline protocol impls) ----
 //
 // Spec: PROTOCOLS.md §4.2.
 //
-//   (defrecord Counter [n])
+//   (defrecord Counter [n]
+//     IFoo
+//     (bar [this y] (+ (:n this) y))
+//     IBar
+//     (baz [this] (:n this)))
 //   →
 //   (do
 //     (def Counter-type-id (nexis.internal/#%register-record-type
 //                            "<ns>/Counter" [:n]))
-//     (defn ->Counter [n]
-//       (nexis.internal/#%make-record Counter-type-id
-//                                     (assoc {} :n n)))
-//     (defn map->Counter [m]
-//       (nexis.internal/#%make-record Counter-type-id m))
-//     (defn Counter? [x]
-//       (and (nexis.internal/#%record? x)
-//            (= Counter-type-id (nexis.internal/#%record-type-id x)))))
+//     (defn ->Counter [n] ...)
+//     (defn map->Counter [m] ...)
+//     (defn Counter? [x] ...)
+//     ;; 5.3c additions — one extend call per method impl:
+//     (nexis.internal/#%extend-record-impl
+//       IFoo :bar Counter-type-id
+//       (fn [this y] (+ (:n this) y)))
+//     (nexis.internal/#%extend-record-impl
+//       IBar :baz Counter-type-id
+//       (fn [this] (:n this))))
 //
-// In 5.3a, ANY protocol clause AFTER the field-vector raises
-// MalformedMacroCall. 5.3c relaxes this and parses protocol
-// bodies. The PROTOCOLS.md §0 boundary lists 5.3a as
-// "no protocols yet" — explicit deferral.
-//
-// Records' `Counter?` uses `and` + `=` which expand later;
-// `defrecord` itself just emits the surface forms.
+// Clauses after the field-vector are parsed in order:
+//   - A bare symbol → switch "current protocol" to that symbol.
+//   - A list `(method-name [params] body...)` → emit one
+//     extend-record-impl call against the current protocol.
+// Same shape Clojure uses.
 
 fn expandDefrecord(
     ctx: *ExpandContext,
@@ -2970,10 +2974,6 @@ fn expandDefrecord(
     if (name_form.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
     const fields_form = args[1];
     if (fields_form.datum != .vector) return ExpandError.MalformedMacroCall;
-
-    // 5.3a: reject any extra args (protocol clauses) — those land
-    // in 5.3c.
-    if (args.len > 2) return ExpandError.MalformedMacroCall;
 
     const rec_name = name_form.datum.symbol.name;
     const origin = call_form.origin;
@@ -3119,14 +3119,72 @@ fn expandDefrecord(
         pred_body,
     });
 
-    // ---- Wrap all four in (do ...).
-    return try makeListInline(ctx, origin, &.{
-        try makeSymbol(ctx, "do", origin),
-        def_type_id,
-        defn_ctor,
-        defn_map_ctor,
-        defn_pred,
-    });
+    // ---- 5.3c: parse inline protocol clauses (args[2..]).
+    // Walk clauses tracking a "current protocol symbol". Bare
+    // symbol → switch; list → emit one #%extend-record-impl call.
+    const extend_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%extend-record-impl", origin);
+    var extend_calls: std.ArrayList(*Form) = .empty;
+    defer extend_calls.deinit(ctx.allocator);
+
+    if (args.len > 2) {
+        var current_protocol: ?*const Form = null;
+        for (args[2..]) |clause| {
+            if (clause.datum == .symbol) {
+                // Protocol-name switch.
+                current_protocol = clause;
+                continue;
+            }
+            if (clause.datum != .list) return ExpandError.MalformedMacroCall;
+            if (clause.datum.list.len < 2) return ExpandError.MalformedMacroCall;
+            const proto = current_protocol orelse return ExpandError.MalformedMacroCall;
+            const method_head = clause.datum.list[0];
+            if (method_head.datum != .symbol) return ExpandError.MalformedMacroCall;
+            if (method_head.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
+            const method_name = method_head.datum.symbol.name;
+            const params_form = clause.datum.list[1];
+            if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
+            const body_slice = clause.datum.list[2..];
+
+            // Build `(fn params body...)`.
+            var fn_items = try ctx.allocator.alloc(*Form, 2 + body_slice.len);
+            fn_items[0] = try makeSymbol(ctx, "fn", origin);
+            fn_items[1] = params_form;
+            for (body_slice, 0..) |b, i| fn_items[2 + i] = b;
+            const fn_form = try makeList(ctx, fn_items, origin);
+
+            // Method-name keyword.
+            const method_kw = try ctx.allocator.create(Form);
+            method_kw.* = .{
+                .datum = .{ .keyword = .{ .ns = null, .name = method_name } },
+                .origin = origin,
+            };
+
+            // Build the qualified protocol symbol reference (just
+            // pass the user-typed symbol verbatim — runtime resolves
+            // it via the namespace binding from defprotocol).
+            const proto_ref = try ctx.allocator.create(Form);
+            proto_ref.* = proto.*;
+
+            const call_form_x = try makeListInline(ctx, origin, &.{
+                extend_sym,
+                proto_ref,
+                method_kw,
+                try makeSymbol(ctx, type_id_name, origin),
+                fn_form,
+            });
+            try extend_calls.append(ctx.allocator, call_form_x);
+        }
+    }
+
+    // ---- Wrap everything in (do ...).
+    var top_items = try ctx.allocator.alloc(*Form, 5 + extend_calls.items.len);
+    top_items[0] = try makeSymbol(ctx, "do", origin);
+    top_items[1] = def_type_id;
+    top_items[2] = defn_ctor;
+    top_items[3] = defn_map_ctor;
+    top_items[4] = defn_pred;
+    for (extend_calls.items, 0..) |c, i| top_items[5 + i] = c;
+    return try makeList(ctx, top_items, origin);
 }
 
 // ---- defprotocol (5.3b — protocols substrate) ----
