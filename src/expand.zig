@@ -3290,6 +3290,191 @@ fn expandDefprotocol(
     return try makeList(ctx, top_items, origin);
 }
 
+// ---- extend-type / extend-protocol (5.3d) ----
+//
+// Spec: PROTOCOLS.md §4.3.
+//
+// `extend-type` shape:
+//   (extend-type Type
+//     Protocol1
+//     (method1 [params] body)
+//     (method2 [params] body)
+//     Protocol2
+//     (method3 [params] body))
+//
+// `extend-protocol` shape:
+//   (extend-protocol Protocol
+//     Type1
+//     (method1 [params] body)
+//     Type2
+//     (method2 [params] body))
+//
+// Type forms:
+//   - Keyword `:string` / `:vector` / `:map` / `:nil` / etc. →
+//     dispatches via the built-in Kind enum.
+//   - Keyword `:any` → installs as the default-impl fallback.
+//   - Symbol `Counter` → dispatches via the record's type_id
+//     (must be a defrecord-defined name; the macro emits a
+//     reference to `Counter-type-id`).
+
+fn emitExtendCall(
+    ctx: *ExpandContext,
+    type_form: *const Form,
+    protocol_form: *const Form,
+    method_name: []const u8,
+    params: *Form,
+    body_slice: []const *Form,
+    origin: reader_mod.SrcSpan,
+) ExpandError!*Form {
+    // Build (fn params body...).
+    var fn_items = try ctx.allocator.alloc(*Form, 2 + body_slice.len);
+    fn_items[0] = try makeSymbol(ctx, "fn", origin);
+    fn_items[1] = params;
+    for (body_slice, 0..) |b, i| fn_items[2 + i] = b;
+    const fn_form = try makeList(ctx, fn_items, origin);
+
+    // Method-name keyword.
+    const method_kw = try ctx.allocator.create(Form);
+    method_kw.* = .{
+        .datum = .{ .keyword = .{ .ns = null, .name = method_name } },
+        .origin = origin,
+    };
+
+    // Pass the protocol form verbatim (resolved at runtime).
+    const proto_ref = try ctx.allocator.create(Form);
+    proto_ref.* = protocol_form.*;
+
+    if (type_form.datum == .keyword) {
+        const tag = type_form.datum.keyword.name;
+        if (std.mem.eql(u8, tag, "any")) {
+            // #%extend-default-impl
+            const ext_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%extend-default-impl", origin);
+            return try makeListInline(ctx, origin, &.{
+                ext_sym,
+                proto_ref,
+                method_kw,
+                fn_form,
+            });
+        }
+        // #%extend-builtin-impl
+        const ext_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%extend-builtin-impl", origin);
+        const type_kw = try ctx.allocator.create(Form);
+        type_kw.* = .{
+            .datum = .{ .keyword = .{ .ns = null, .name = tag } },
+            .origin = origin,
+        };
+        return try makeListInline(ctx, origin, &.{
+            ext_sym,
+            proto_ref,
+            method_kw,
+            type_kw,
+            fn_form,
+        });
+    }
+    if (type_form.datum == .symbol) {
+        // Record type: refer to `<RecName>-type-id`. The macro
+        // emits the symbol; the user is responsible for
+        // ensuring it's defined (defrecord generates it).
+        const rec_name = type_form.datum.symbol.name;
+        const type_id_name = try std.fmt.allocPrint(ctx.allocator, "{s}-type-id", .{rec_name});
+        const ext_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%extend-record-impl", origin);
+        return try makeListInline(ctx, origin, &.{
+            ext_sym,
+            proto_ref,
+            method_kw,
+            try makeSymbol(ctx, type_id_name, origin),
+            fn_form,
+        });
+    }
+    return ExpandError.MalformedMacroCall;
+}
+
+/// Walk `clauses` looking for protocol-name / type / method-list
+/// sequences and emit one extend call per method. The walk
+/// alternates between "expect protocol or type" and "expect
+/// method impls until next protocol/type", letting it support
+/// both `extend-type` (one type, many (protocol-symbol, methods)
+/// groups) and `extend-protocol` (one protocol, many (type,
+/// methods) groups) with the same parser by swapping which
+/// position is iterated.
+fn walkExtendClauses(
+    ctx: *ExpandContext,
+    fixed_anchor_is_protocol: bool,
+    anchor_form: *const Form,
+    clauses: []const *Form,
+    origin: reader_mod.SrcSpan,
+    out_calls: *std.ArrayList(*Form),
+) ExpandError!void {
+    var current_other: ?*const Form = null;
+    for (clauses) |clause| {
+        if (clause.datum == .symbol or clause.datum == .keyword) {
+            current_other = clause;
+            continue;
+        }
+        if (clause.datum != .list) return ExpandError.MalformedMacroCall;
+        if (clause.datum.list.len < 2) return ExpandError.MalformedMacroCall;
+        const other = current_other orelse return ExpandError.MalformedMacroCall;
+        const method_head = clause.datum.list[0];
+        if (method_head.datum != .symbol) return ExpandError.MalformedMacroCall;
+        if (method_head.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
+        const method_name = method_head.datum.symbol.name;
+        const params = clause.datum.list[1];
+        if (params.datum != .vector) return ExpandError.MalformedMacroCall;
+        const body_slice = clause.datum.list[2..];
+
+        const protocol_form: *const Form = if (fixed_anchor_is_protocol) anchor_form else other;
+        const type_form: *const Form = if (fixed_anchor_is_protocol) other else anchor_form;
+        const call_form = try emitExtendCall(
+            ctx,
+            type_form,
+            protocol_form,
+            method_name,
+            params,
+            body_slice,
+            origin,
+        );
+        try out_calls.append(ctx.allocator, call_form);
+    }
+}
+
+fn expandExtendType(
+    ctx: *ExpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) ExpandError!*Form {
+    if (args.len < 1) return ExpandError.MalformedMacroCall;
+    const type_form = args[0];
+    if (type_form.datum != .symbol and type_form.datum != .keyword) {
+        return ExpandError.MalformedMacroCall;
+    }
+    const origin = call_form.origin;
+    var calls: std.ArrayList(*Form) = .empty;
+    defer calls.deinit(ctx.allocator);
+    try walkExtendClauses(ctx, false, type_form, args[1..], origin, &calls);
+    var top_items = try ctx.allocator.alloc(*Form, 1 + calls.items.len);
+    top_items[0] = try makeSymbol(ctx, "do", origin);
+    for (calls.items, 0..) |c, i| top_items[1 + i] = c;
+    return try makeList(ctx, top_items, origin);
+}
+
+fn expandExtendProtocol(
+    ctx: *ExpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) ExpandError!*Form {
+    if (args.len < 1) return ExpandError.MalformedMacroCall;
+    const proto_form = args[0];
+    if (proto_form.datum != .symbol) return ExpandError.MalformedMacroCall;
+    const origin = call_form.origin;
+    var calls: std.ArrayList(*Form) = .empty;
+    defer calls.deinit(ctx.allocator);
+    try walkExtendClauses(ctx, true, proto_form, args[1..], origin, &calls);
+    var top_items = try ctx.allocator.alloc(*Form, 1 + calls.items.len);
+    top_items[0] = try makeSymbol(ctx, "do", origin);
+    for (calls.items, 0..) |c, i| top_items[1 + i] = c;
+    return try makeList(ctx, top_items, origin);
+}
+
 /// Helper: make a qualified symbol form (`ns/name`).
 fn makeQualifiedSymbol(ctx: *ExpandContext, ns_name: []const u8, sym_name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
     const f = try ctx.allocator.create(Form);
@@ -3667,6 +3852,10 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     try table.put(allocator, "defrecord", expandDefrecord);
     // Phase 5 Item 3 sub-step 5.3b (peer-AI turn 84): defprotocol.
     try table.put(allocator, "defprotocol", expandDefprotocol);
+    // Phase 5 Item 3 sub-step 5.3d (peer-AI turn 84): extend-type +
+    // extend-protocol.
+    try table.put(allocator, "extend-type", expandExtendType);
+    try table.put(allocator, "extend-protocol", expandExtendProtocol);
     return table;
 }
 

@@ -2245,6 +2245,92 @@ test "phase5.3c defrecord impls: this is the literal record value" {
     , "true");
 }
 
+// =============================================================================
+// Phase 5 Item 3 sub-step 5.3d — extend-protocol/extend-type + satisfies? +
+// :any default (peer-AI turn 84).
+// =============================================================================
+
+test "phase5.3d extend-protocol: built-in kinds" {
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this y]))
+        \\  (extend-protocol IFoo
+        \\    :string (bar [s y] (str s "-" y))
+        \\    :fixnum (bar [n y] (* n y)))
+        \\  [(bar "hi" 7) (bar 5 7)])
+    , "[hi-7 35]");
+}
+
+test "phase5.3d extend-type: record and built-in mixed" {
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this y]))
+        \\  (defrecord Counter [n])
+        \\  (extend-type Counter IFoo (bar [c y] (+ (get c :n) y)))
+        \\  (extend-type :string IFoo (bar [s y] (str s "-" y)))
+        \\  [(bar (->Counter 5) 7) (bar "hi" 7)])
+    , "[12 hi-7]");
+}
+
+test "phase5.3d :any default fallback" {
+    // :any catches receivers with no specific impl.
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this y]))
+        \\  (extend-protocol IFoo
+        \\    :fixnum (bar [n y] :got-fixnum)
+        \\    :any (bar [x y] :got-any))
+        \\  [(bar 1 2) (bar "hi" 2) (bar [] 2)])
+    , "[:got-fixnum :got-any :got-any]");
+}
+
+test "phase5.3d satisfies?: identifies impl presence" {
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this]))
+        \\  (defrecord Counter [n])
+        \\  (extend-protocol IFoo
+        \\    :string (bar [s] :s)
+        \\    Counter (bar [c] :c))
+        \\  [(satisfies? IFoo "hi")
+        \\   (satisfies? IFoo (->Counter 5))
+        \\   (satisfies? IFoo 5)])
+    , "[true true false]");
+}
+
+test "phase5.3d satisfies? with :any default: always true" {
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this]))
+        \\  (extend-protocol IFoo :any (bar [x] :default))
+        \\  [(satisfies? IFoo "hi")
+        \\   (satisfies? IFoo 5)
+        \\   (satisfies? IFoo [])])
+    , "[true true true]");
+}
+
+test "phase5.3d extend with :vector / :map friendly aliases" {
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this]))
+        \\  (extend-protocol IFoo
+        \\    :vector (bar [v] :v)
+        \\    :map (bar [m] :m))
+        \\  [(bar []) (bar {})])
+    , "[:v :m]");
+}
+
+test "phase5.3d extend-protocol with bogus type-kw: :invalid-argument" {
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this]))
+        \\  (try
+        \\    (extend-protocol IFoo
+        \\      :no-such-kind (bar [x] :nope))
+        \\    (catch any e e)))
+    , ":invalid-argument");
+}
+
 test "phase5.3b defprotocol: protocol-fn passes through map-as-key" {
     // protocol_fn values are identity-valued; storing two distinct
     // calls to defprotocol-emitted protocol_fn under the same key

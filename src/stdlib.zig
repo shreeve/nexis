@@ -175,6 +175,9 @@ const internal_fns = [_]CoreEntry{
     .{ .name = "#%protocol-fn", .descriptor = &native_protocol_fn },
     // 5.3c — defrecord inline protocol impls.
     .{ .name = "#%extend-record-impl", .descriptor = &native_extend_record_impl },
+    // 5.3d — extend-protocol / extend-type / satisfies?.
+    .{ .name = "#%extend-builtin-impl", .descriptor = &native_extend_builtin_impl },
+    .{ .name = "#%extend-default-impl", .descriptor = &native_extend_default_impl },
 };
 
 /// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
@@ -253,6 +256,8 @@ const core_fns = [_]CoreEntry{
     .{ .name = "swap!", .descriptor = &native_swap_bang },
     .{ .name = "swap-vals!", .descriptor = &native_swap_vals_bang },
     .{ .name = "compare-and-set!", .descriptor = &native_compare_and_set_bang },
+    // Phase 5.3d (peer-AI turn 84): satisfies? predicate.
+    .{ .name = "satisfies?", .descriptor = &native_satisfies_q },
     // Phase 5 Item 2 sub-step 5.2a (peer-AI turn 77): core
     // string ops. Indexing semantics are by Unicode scalar
     // (codepoint), NOT byte; see `docs/STRING.md` §7.
@@ -433,6 +438,10 @@ const native_register_protocol = NativeFn{ .name = "#%register-protocol", .min_a
 const native_protocol_fn = NativeFn{ .name = "#%protocol-fn", .min_arity = 2, .max_arity = 2, .call = &fnProtocolFn };
 // Phase 5.3c (peer-AI turn 84) — defrecord inline protocol impls.
 const native_extend_record_impl = NativeFn{ .name = "#%extend-record-impl", .min_arity = 4, .max_arity = 4, .call = &fnExtendRecordImpl };
+// Phase 5.3d (peer-AI turn 84) — extend-protocol over built-in kinds + Any default + satisfies?.
+const native_extend_builtin_impl = NativeFn{ .name = "#%extend-builtin-impl", .min_arity = 4, .max_arity = 4, .call = &fnExtendBuiltinImpl };
+const native_extend_default_impl = NativeFn{ .name = "#%extend-default-impl", .min_arity = 3, .max_arity = 3, .call = &fnExtendDefaultImpl };
+const native_satisfies_q = NativeFn{ .name = "satisfies?", .min_arity = 2, .max_arity = 2, .call = &fnSatisfiesQ };
 
 // Phase 5 Item 2 sub-step 5.2b (peer-AI turn 79) — nexis.string namespace.
 const native_string_lower_case = NativeFn{ .name = "nexis.string/lower-case", .min_arity = 1, .max_arity = 1, .call = &fnStringLowerCase };
@@ -2530,6 +2539,96 @@ fn fnExtendRecordImpl(vm: *VM, args: []const Value) VmError!Value {
         error.OutOfMemory => return VmError.OutOfMemory,
     };
     return value_mod.nilValue();
+}
+
+// =============================================================================
+// Phase 5.3d — extend-protocol over built-in kinds + Any default + satisfies?
+// =============================================================================
+//
+// `extend-type` / `extend-protocol` macros (in expand.zig) emit
+// qualified calls to these helpers. v1 type-tag keywords match
+// the `Kind` enum's tag names:
+//
+//   :nil :bool :char :fixnum :bignum :rational :keyword :symbol
+//   :string :list :persistent_vector :persistent_map :persistent_set
+//   :transient_vector :transient_map :transient_set :function
+//   :native_fn :db_connection :db_write_txn :db_read_txn :atom
+//   :record :protocol :protocol_fn :var :durable_ref :error_object
+//
+// Plus the v1 friendly aliases:
+//   :vector → :persistent_vector
+//   :map    → :persistent_map
+//   :set    → :persistent_set
+//
+// `:any` triggers the default-fallback path (default_impl on the
+// method) and lives in #%extend-default-impl, not the builtin one.
+
+fn fnExtendBuiltinImpl(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .protocol) return VmError.KindMismatch;
+    if (args[1].kind() != .keyword) return VmError.KindMismatch;
+    if (args[2].kind() != .keyword) return VmError.KindMismatch;
+
+    const protocol_id = protocol_mod.protocolId(args[0]);
+    const method_name_id: u32 = @intCast(args[1].payload);
+
+    const interner = vm.ensureInterner();
+    const type_id_kw: u32 = @intCast(args[2].payload);
+    const type_name = interner.keywordName(type_id_kw);
+    const kind = typeNameToKind(type_name) orelse return VmError.InvalidArgument;
+    const key = vm_mod.DispatchKey{ .tag = .builtin, .id = @intFromEnum(kind) };
+
+    vm.extendProtocol(protocol_id, method_name_id, key, args[3]) catch |err| switch (err) {
+        error.NoProtocolMethod => return VmError.NoProtocolMethod,
+        error.OutOfMemory => return VmError.OutOfMemory,
+    };
+    return value_mod.nilValue();
+}
+
+fn fnExtendDefaultImpl(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .protocol) return VmError.KindMismatch;
+    if (args[1].kind() != .keyword) return VmError.KindMismatch;
+
+    const protocol_id = protocol_mod.protocolId(args[0]);
+    const method_name_id: u32 = @intCast(args[1].payload);
+    const proto = vm.protocolById(protocol_id) orelse return VmError.NoProtocolMethod;
+    for (proto.methods.items) |*m| {
+        if (m.name_id == method_name_id) {
+            m.default_impl = args[2];
+            return value_mod.nilValue();
+        }
+    }
+    return VmError.NoProtocolMethod;
+}
+
+fn fnSatisfiesQ(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .protocol) return VmError.KindMismatch;
+    const proto = vm.protocolById(protocol_mod.protocolId(args[0])) orelse
+        return value_mod.fromBool(false);
+    const key = vm_mod.DispatchKey.ofValue(args[1]);
+    for (proto.methods.items) |m| {
+        if (m.impls.contains(key) or m.default_impl != null) {
+            return value_mod.fromBool(true);
+        }
+    }
+    return value_mod.fromBool(false);
+}
+
+/// Phase 5.3d: map a friendly type-tag keyword name to a Kind
+/// enum value. Friendly aliases (vector/map/set) are accepted
+/// alongside the canonical Kind enum names. Returns null for
+/// unknown names; the caller raises `:invalid-argument`.
+fn typeNameToKind(name: []const u8) ?value_mod.Kind {
+    if (std.mem.eql(u8, name, "vector")) return .persistent_vector;
+    if (std.mem.eql(u8, name, "map")) return .persistent_map;
+    if (std.mem.eql(u8, name, "set")) return .persistent_set;
+    // Iterate over Kind tags at comptime so this stays in sync
+    // with the enum without a hand-maintained table.
+    inline for (std.meta.fields(value_mod.Kind)) |field| {
+        if (std.mem.eql(u8, name, field.name)) {
+            return @field(value_mod.Kind, field.name);
+        }
+    }
+    return null;
 }
 
 // =============================================================================
