@@ -1140,6 +1140,19 @@ pub const VmError = error{
     /// match for replace. Distinct from KindMismatch (which is
     /// for wrong-kind args). Mapped to `:invalid-argument`.
     InvalidArgument,
+    /// Phase 5.2c (peer-AI turn 81): generic I/O failure for
+    /// `slurp`/`spit`/`print`/`println`/`prn` — permissions,
+    /// disk full, write failure, vm.io == null, etc. Mapped to
+    /// `:io-error`.
+    IoError,
+    /// Phase 5.2c: target path does not exist (slurp on a
+    /// missing file). Mapped to `:file-not-found`.
+    FileNotFound,
+    /// Phase 5.2c: path argument is structurally invalid (empty
+    /// string, contains a NUL byte, etc.). Distinct from
+    /// `:io-error` because the issue is at the language boundary,
+    /// not in the filesystem. Mapped to `:invalid-path`.
+    InvalidPath,
 };
 
 // =============================================================================
@@ -3180,6 +3193,9 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.AtomReEntry => "atom-re-entry",
         VmError.Utf8Error => "utf8-error",
         VmError.InvalidArgument => "invalid-argument",
+        VmError.IoError => "io-error",
+        VmError.FileNotFound => "file-not-found",
+        VmError.InvalidPath => "invalid-path",
         // Unrecoverable: bytecode corruption / VM-internal /
         // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,

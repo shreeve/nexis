@@ -104,6 +104,10 @@ pub fn build(b: *std.Build) void {
     atom_mod.addImport("heap", heap_mod);
     atom_mod.addImport("hash", hash_mod);
 
+    // format_mod is declared further down (after db_mod) so its
+    // addImport calls see every dependency already-created.
+    // Phase 5.2c (peer-AI turn 81).
+
     const list_mod = b.createModule(.{
         .root_source_file = b.path("src/coll/list.zig"),
         .target = target,
@@ -272,6 +276,8 @@ pub fn build(b: *std.Build) void {
     stdlib_mod.addImport("atom", atom_mod);
     // Phase 5 Item 2 (5.2a): core string ops + codepoint helpers.
     stdlib_mod.addImport("string", string_mod);
+    // stdlib_mod's "format" import is wired AFTER format_mod is
+    // declared (which is after db_mod). See further down.
     // dispatch_mod, db_mod, codec_mod are declared later;
     // imports attached at the bottom of the dispatch block.
 
@@ -336,6 +342,30 @@ pub fn build(b: *std.Build) void {
     db_mod.addImport("emdb", emdb_mod);
 
     gc_mod.addImport("db", db_mod);
+
+    // Phase 5.2c (peer-AI turn 81): central Value → text formatter
+    // with `.display` and `.readable` modes. Imports the menagerie
+    // of consumer kinds (one-way; nothing depends on format_mod).
+    // Replaces the three formatValue duplicates from before 5.2c.
+    // Declared here AFTER all leaf-kind modules + db + vm exist.
+    const format_mod = b.createModule(.{
+        .root_source_file = b.path("src/format.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    format_mod.addImport("value", value_mod);
+    format_mod.addImport("intern", intern_mod);
+    format_mod.addImport("list", list_mod);
+    format_mod.addImport("vector", vector_mod);
+    format_mod.addImport("champ", champ_mod);
+    format_mod.addImport("string", string_mod);
+    format_mod.addImport("heap", heap_mod);
+    format_mod.addImport("atom", atom_mod);
+    format_mod.addImport("db", db_mod);
+    format_mod.addImport("vm", vm_mod);
+
+    // Late-binding addImport for stdlib_mod (declared earlier).
+    stdlib_mod.addImport("format", format_mod);
 
     const dispatch_mod = b.createModule(.{
         .root_source_file = b.path("src/dispatch.zig"),
@@ -417,6 +447,7 @@ pub fn build(b: *std.Build) void {
         champ: *std.Build.Module,
         transient: *std.Build.Module,
         atom: *std.Build.Module,
+        format: *std.Build.Module,
         gc: *std.Build.Module,
         codec: *std.Build.Module,
         db: *std.Build.Module,
@@ -443,6 +474,7 @@ pub fn build(b: *std.Build) void {
         .champ = champ_mod,
         .transient = transient_mod,
         .atom = atom_mod,
+        .format = format_mod,
         .gc = gc_mod,
         .codec = codec_mod,
         .db = db_mod,
@@ -482,9 +514,12 @@ pub fn build(b: *std.Build) void {
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch" } },
+        // Phase 5.2c: format test binary. Imports the menagerie of
+        // consumer kinds; nothing depends on format itself.
+        .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch", "heap", "string" } },
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string" } },
-        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string" } },
+        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
     };
 
@@ -509,6 +544,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "champ")) siblings.champ
                 else if (std.mem.eql(u8, imp_name, "transient")) siblings.transient
                 else if (std.mem.eql(u8, imp_name, "atom")) siblings.atom
+                else if (std.mem.eql(u8, imp_name, "format")) siblings.format
                 else if (std.mem.eql(u8, imp_name, "gc")) siblings.gc
                 else if (std.mem.eql(u8, imp_name, "codec")) siblings.codec
                 else if (std.mem.eql(u8, imp_name, "db")) siblings.db
@@ -759,6 +795,10 @@ pub fn build(b: *std.Build) void {
     // Phase 5 Item 2 (5.2a): formatValue prints strings via
     // string.asBytes.
     integration_eval_mod.addImport("string", string_mod);
+    // Phase 5.2c (peer-AI turn 81): integration tests delegate
+    // value-printing to the central format.zig too, so test
+    // expectations match REPL output exactly.
+    integration_eval_mod.addImport("format", format_mod);
 
     const integration_eval_tests = b.addTest(.{ .root_module = integration_eval_mod });
     const run_integration_eval_tests = b.addRunArtifact(integration_eval_tests);
@@ -863,6 +903,9 @@ pub fn build(b: *std.Build) void {
     // Phase 5 Item 2 (5.2a, peer-AI turn 77): cli.formatValue
     // prints strings via string.asBytes (display mode, unquoted).
     cli_mod.addImport("string", string_mod);
+    // Phase 5.2c (peer-AI turn 81): cli delegates value-printing
+    // to the central format.zig (display mode).
+    cli_mod.addImport("format", format_mod);
 
     const nexis_exe = b.addExecutable(.{
         .name = "nexis",
@@ -930,28 +973,31 @@ pub fn build(b: *std.Build) void {
 
     const phase2_test_step = b.step("phase2-test", "Run only vm + compile tests (fast Phase 2 iteration)");
     // Indices into runtime_test_files: atom = 11, vm = 17,
-    // compile = 18, expand = 19, stdlib = 20, loader = 21.
-    // (Phase 5 Item 1 shifted everything past `transient` by +1
-    // by inserting `atom` after the per-kind block.) Asserted at
-    // build time so re-ordering trips this loudly instead of
-    // silently running the wrong tests.
+    // format = 18, compile = 19, expand = 20, stdlib = 21,
+    // loader = 22. (Phase 5.2c shifted everything past `vm` by
+    // +1 by inserting `format` between vm and compile.)
+    // Asserted at build time so re-ordering trips this loudly
+    // instead of silently running the wrong tests.
     comptime {
         std.debug.assert(std.mem.eql(u8, runtime_test_files[11].name, "atom"));
         std.debug.assert(std.mem.eql(u8, runtime_test_files[17].name, "vm"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[18].name, "compile"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[19].name, "expand"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[20].name, "stdlib"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[21].name, "loader"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[18].name, "format"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[19].name, "compile"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[20].name, "expand"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[21].name, "stdlib"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[22].name, "loader"));
     }
     // Phase 5 Item 1: include the atom test binary in phase2-test
     // so the inner loop covers the new kind without waiting for
     // the full `zig build test` Phase 1 randomized property suite.
+    // Phase 5.2c: format binary lands in the same inner-loop set.
     phase2_test_step.dependOn(&runtime_test_runs[11].step);
     phase2_test_step.dependOn(&runtime_test_runs[17].step);
     phase2_test_step.dependOn(&runtime_test_runs[18].step);
     phase2_test_step.dependOn(&runtime_test_runs[19].step);
     phase2_test_step.dependOn(&runtime_test_runs[20].step);
     phase2_test_step.dependOn(&runtime_test_runs[21].step);
+    phase2_test_step.dependOn(&runtime_test_runs[22].step);
     // Phase 2 gate items 3 + 4.
     phase2_test_step.dependOn(&run_prop_compile_tests.step);
     // Phase 2 step #11 — eval-pipeline integration tests.

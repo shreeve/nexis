@@ -381,6 +381,109 @@ so today.
 | `:utf8-error`        | malformed UTF-8 in any input to `split` / `replace` (turn 80 §"Must-fix" #1) |
 | `:arity-mismatch`    | wrong argc on any fn                         |
 
+---
+
+### 9. Printing + I/O (Phase 5.2c — peer-AI turn 81)
+
+**Module split.** Value→text formatting lives in `src/format.zig`,
+not in `src/stdlib.zig` or `src/cli.zig`. format.zig is the single
+source of truth for both display + readable modes; cli.zig and
+the integration-test harness delegate to it. The 5.2a / 5.2b /
+5.2c arc removed two prior duplicate `formatValue` helpers and one
+mini `appendStringified` in stdlib.zig.
+
+**`src/format.zig` API:**
+
+```zig
+pub const FormatMode = enum { display, readable };
+pub const Error = std.Io.Writer.Error || error{Utf8Error};
+
+pub fn format(
+    v: Value,
+    mode: FormatMode,
+    writer: *std.Io.Writer,
+    interner: ?*const intern_mod.Interner,
+) Error!void;
+
+pub fn formatToString(
+    allocator: std.mem.Allocator,
+    heap: *heap_mod.Heap,
+    v: Value,
+    mode: FormatMode,
+    interner: ?*const intern_mod.Interner,
+) !Value;
+```
+
+**Two modes (frozen):**
+
+| Aspect | `.display` | `.readable` |
+|---|---|---|
+| `nil` | `"nil"` (turn 81 §F1) | `"nil"` |
+| string | unquoted raw bytes | `"…"` with `\ " \n \t \r` + `\u{HEX}` for other 0x00..0x1F + DEL |
+| char | UTF-8 encoded scalar | named tokens (`\space`, `\newline`, `\tab`, `\return`, `\formfeed`, `\backspace`, `\\`), printable ASCII as `\x`, NUL + non-printable as `\u{HEX}` |
+| atom / function / native-fn / var / durable-ref / transient / connection / tx | OPAQUE (`#<atom>`, `#<fn>`, `#<native-fn NAME>`, `#'name`, `#<durable-ref :tree/key>`, ...) | OPAQUE (same; intentionally NOT reader-round-trippable — these are identity-valued/process-local kinds) |
+| collections | recursive in same mode | recursive in same mode |
+| malformed UTF-8 in string | passes through bytes unchanged | `:utf8-error` (turn 81 §F2 — readable mode must not emit invalid source) |
+
+**`format` is purely presentation, not serialization.** The codec
+(`src/codec.zig`) owns wire-format bytes; `format` owns text-out.
+They don't share an encoding. `#<atom>` / `#<fn>` / durable-ref
+text are NOT reader-round-trippable.
+
+**Nil semantics split** (turn 81 §F1 — load-bearing):
+
+| Call | Result |
+|---|---|
+| `format(.display, nil)` / `(print nil)` / `(println nil)` / `(prn nil)` / `(pr-str nil)` | `"nil"` |
+| `(str nil)` / `(spit path nil)` / `(nexis.string/join [1 nil 2])` | `""` (nil → empty) |
+
+`str` / `join` / `spit` each layer a thin wrapper
+(`stdlib.appendStrValue`) that special-cases nil → empty BEFORE
+delegating to `format.format(.display, ...)`. The formatter
+itself never special-cases nil.
+
+**Native fns in `nexis.core`:**
+
+```
+(print & xs)     ; stdout, no newline, display mode, args joined by " "
+(println & xs)   ; stdout + "\n", display mode, args joined by " "
+(prn & xs)       ; stdout + "\n", readable mode, args joined by " "
+(pr-str & xs)    ; returns a String, readable mode, args joined by " "
+(slurp path)     ; read UTF-8 file → String. 16 MiB cap.
+(spit path content) ; write (str content) to file; NO parent-dir auto-create.
+```
+
+**Errors:**
+
+| Keyword              | Source                                                       |
+|----------------------|--------------------------------------------------------------|
+| `:io-error`          | `vm.io == null` (test harnesses); writeFailed; non-FileNotFound emdb errors |
+| `:file-not-found`    | slurp on missing path                                        |
+| `:invalid-path`      | empty path string; path containing NUL byte                  |
+| `:kind-mismatch`     | non-string path arg                                          |
+| `:utf8-error`        | slurp file content not valid UTF-8                           |
+
+**Frozen invariants (turn 81):**
+
+§9.1. `vm.io` is the authority for filesystem + stdout. Null
+`vm.io` → `:io-error` on print/println/prn/slurp/spit. Tests run
+with null io and exercise the error path; the CLI sets
+`vm.io = init.io` on bootstrap so real programs work.
+
+§9.2. `spit` does NOT auto-create parent directories (turn 81
+§D5). Missing parents → `:file-not-found` / `:io-error`. The
+`db/open` parent-dir auto-create (Phase 5.2a polish) is a DB-
+specific convenience; file I/O is not auto-creating.
+
+§9.3. `slurp` size cap is **16 MiB** in v1 (turn 81 §D7). Larger
+files surface `:io-error`. No size-limit-arg overload in v1.
+
+§9.4. `pr-str` does NOT print a trailing newline; `println` and
+`prn` DO. `print` does not.
+
+§9.5. Print args separate with a single space (Clojure parity).
+Empty argc is legal: `(println) → "\n"`, returns `nil`.
+
 **GC-rooting checklist additions (peer-AI turn 79 §D9):** all six
 fns allocate output strings/vectors via `string.fromBytes` /
 `vector.fromSlice` AFTER holding their argument Values in Zig

@@ -473,6 +473,24 @@ Confirmed sites in current code (Phase 5):
   are reachable through the args slice; the intermediate byte
   buffers are owned by the function's local `std.ArrayList(u8)`
   freed on return. Safe today.
+- **Phase 5.2c (peer-AI turn 81)** — printing + I/O fns all
+  build into a `std.Io.Writer.Allocating` buffer before either
+  writing to stdout or producing a heap-string Value:
+  `fnPrint`/`fnPrintln`/`fnPrn` (display/readable into buffer,
+  then `writeStreamingAll` to stdout); `fnPrStr` (readable into
+  buffer, then `string.fromBytes`); `fnSlurp` (read file into
+  caller-allocator byte slice, validate UTF-8, then
+  `string.fromBytes`); `fnSpit` (str-stringify into buffer, then
+  `writeFile`). Input args stay reachable through the args
+  slice; intermediate buffers are freed on return; output
+  string Values are allocated AFTER all input use is complete.
+  Plus the central `src/format.zig` formatter itself: walks any
+  Value tree into a writer, no inputs held in Zig locals across
+  allocations (it's pure-write, not allocate-then-mutate). Safe
+  today; the audit point is the post-migration root-stack
+  policy for the `Allocating` buffer's intermediate bytes if a
+  triggered GC fires between the buffer's first write and the
+  final `fromBytes`.
 - `src/stdlib.zig buildListFromSlice` — cons calls between iterations
   hold the intermediate `result` in a Zig local. (Pre-existing GC TODO
   comment at the function definition; predates atoms.)

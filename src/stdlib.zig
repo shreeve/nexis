@@ -44,6 +44,7 @@ const dispatch_mod_alias = @import("dispatch");
 const emdb_mod = @import("emdb");
 const atom_mod = @import("atom");
 const string_mod = @import("string");
+const format_mod = @import("format");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -227,6 +228,13 @@ const core_fns = [_]CoreEntry{
     .{ .name = "str", .descriptor = &native_str },
     .{ .name = "string?", .descriptor = &native_string_q },
     .{ .name = "subs", .descriptor = &native_subs },
+    // Phase 5 Item 2 sub-step 5.2c (peer-AI turn 81) — printing + I/O.
+    .{ .name = "print", .descriptor = &native_print },
+    .{ .name = "println", .descriptor = &native_println },
+    .{ .name = "prn", .descriptor = &native_prn },
+    .{ .name = "pr-str", .descriptor = &native_pr_str },
+    .{ .name = "slurp", .descriptor = &native_slurp },
+    .{ .name = "spit", .descriptor = &native_spit },
     // Phase 4.0a: db primitives live in the `db` namespace
     // (installed separately via `installDb`) so they appear as
     // qualified `(db/open ...)` calls.
@@ -373,6 +381,14 @@ const native_compare_and_set_bang = NativeFn{ .name = "compare-and-set!", .min_a
 const native_str = NativeFn{ .name = "str", .min_arity = 0, .max_arity = null, .call = &fnStr };
 const native_string_q = NativeFn{ .name = "string?", .min_arity = 1, .max_arity = 1, .call = &fnStringQ };
 const native_subs = NativeFn{ .name = "subs", .min_arity = 2, .max_arity = 3, .call = &fnSubs };
+
+// Phase 5.2c (peer-AI turn 81) — printing + I/O.
+const native_print = NativeFn{ .name = "print", .min_arity = 0, .max_arity = null, .call = &fnPrint };
+const native_println = NativeFn{ .name = "println", .min_arity = 0, .max_arity = null, .call = &fnPrintln };
+const native_prn = NativeFn{ .name = "prn", .min_arity = 0, .max_arity = null, .call = &fnPrn };
+const native_pr_str = NativeFn{ .name = "pr-str", .min_arity = 0, .max_arity = null, .call = &fnPrStr };
+const native_slurp = NativeFn{ .name = "slurp", .min_arity = 1, .max_arity = 1, .call = &fnSlurp };
+const native_spit = NativeFn{ .name = "spit", .min_arity = 2, .max_arity = 2, .call = &fnSpit };
 
 // Phase 5 Item 2 sub-step 5.2b (peer-AI turn 79) — nexis.string namespace.
 const native_string_lower_case = NativeFn{ .name = "nexis.string/lower-case", .min_arity = 1, .max_arity = 1, .call = &fnStringLowerCase };
@@ -1803,81 +1819,47 @@ fn fnCompareAndSetBang(_: *VM, args: []const Value) VmError!Value {
 // Phase 5 Item 2 sub-step 5.2a — core string ops (peer-AI turn 77)
 // =============================================================================
 //
-// `(str & xs)` is display-mode stringify+concat. v1.alpha ships a
-// minimal local stringifier that handles the scalar value kinds plus
-// strings and chars; collection kinds fall back to an opaque
-// `#<value kind=N>` marker. Sub-step 5.2c lifts the full recursive
-// formatter into `src/format.zig` and replaces this minimal helper.
-// Note (peer-AI turn 77 §D10): str / subs allocate after holding
-// argument values in Zig locals — listed in `docs/GC.md` §11.5 audit
-// checklist for the future triggered-GC migration.
+// `(str & xs)` is display-mode stringify+concat. Phase 5.2c
+// (peer-AI turn 81 §F1) split nil semantics: `format(.display, nil)`
+// writes "nil", so `str` / `join` / `spit` each wrap their element
+// path to convert nil → empty BEFORE delegating to the formatter.
+//
+// GC rooting note (peer-AI turn 81 §D9 #4): str / pr-str allocate
+// the final heap string AFTER walking the args slice. The args
+// slice is held by `vm.invokeNative` for the duration of the call,
+// so input values stay reachable. Listed in `docs/GC.md` §11.5
+// audit checklist for the future triggered-GC migration.
 
-/// Append a single Value to `out` in display-mode formatting.
-/// Strings are unquoted; chars are emitted as their UTF-8 bytes;
-/// nil → empty. Collections are NOT recursed in 5.2a (they fall
-/// into an opaque marker; the recursive formatter ships in 5.2c).
-fn appendStringified(
+/// Append a single Value to `out` in `str`-semantics (display mode
+/// with `nil → empty` override). Used by `str`, `join`, and `spit`.
+/// `print`/`println`/`prn` do NOT go through this — they print
+/// `nil` as the literal `"nil"` per turn 81 §F1.
+fn appendStrValue(
     allocator: std.mem.Allocator,
-    out: *std.ArrayList(u8),
+    w: *std.Io.Writer.Allocating,
     v: Value,
     interner: ?*const intern_mod.Interner,
 ) VmError!void {
-    switch (v.kind()) {
-        .nil => {}, // (str nil) appends "" — Clojure-canonical.
-        .true_ => out.appendSlice(allocator, "true") catch return VmError.OutOfMemory,
-        .false_ => out.appendSlice(allocator, "false") catch return VmError.OutOfMemory,
-        .fixnum => {
-            var buf: [24]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "{d}", .{v.asFixnum()}) catch return VmError.OutOfMemory;
-            out.appendSlice(allocator, s) catch return VmError.OutOfMemory;
-        },
-        .char => {
-            // TODO(5.2c): hoist this 4-byte UTF-8 encode dance
-            // into `src/format.zig` alongside the same pattern
-            // in cli.zig + eval_pipeline.zig's local helper.
-            var utf8_buf: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(v.asChar(), &utf8_buf) catch return VmError.Utf8Error;
-            out.appendSlice(allocator, utf8_buf[0..n]) catch return VmError.OutOfMemory;
-        },
-        .string => out.appendSlice(allocator, string_mod.asBytes(v)) catch return VmError.OutOfMemory,
-        .keyword => {
-            const id: u32 = @intCast(v.payload);
-            const it = interner orelse return VmError.KindMismatch;
-            out.append(allocator, ':') catch return VmError.OutOfMemory;
-            out.appendSlice(allocator, it.keywordName(id)) catch return VmError.OutOfMemory;
-        },
-        .symbol => {
-            const id: u32 = @intCast(v.payload);
-            const it = interner orelse return VmError.KindMismatch;
-            out.appendSlice(allocator, it.symbolName(id)) catch return VmError.OutOfMemory;
-        },
-        // Phase 5 Item 1 (turn 75) + turn 77 §D4: opaque `#<atom>`
-        // shape; the contained value is reachable via `@a` /
-        // `(deref a)` and stringifies through the normal path.
-        // Matches the deterministic CLI formatter.
-        .atom => out.appendSlice(allocator, "#<atom>") catch return VmError.OutOfMemory,
-        // Collections + complex kinds: opaque placeholder until 5.2c
-        // lands the full recursive formatter in `src/format.zig`.
-        // Tests that need recursive output use `(println …)` /
-        // `(prn …)` which go through the full formatter (5.2c). For
-        // 5.2a callers that actually need recursive `str` output,
-        // 5.2c will replace this branch with a recursive call.
-        else => {
-            var buf: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "#<value kind={d}>", .{@intFromEnum(v.kind())}) catch return VmError.OutOfMemory;
-            out.appendSlice(allocator, s) catch return VmError.OutOfMemory;
-        },
-    }
+    _ = allocator;
+    if (v.kind() == .nil) return; // str/join/spit: nil → "" per turn 81.
+    // `format_mod.Error = std.Io.Writer.Error || error{Utf8Error}` —
+    // WriteFailed bubbles up from the Allocating writer's drain
+    // when the backing allocator fails, so map it to OutOfMemory
+    // (the closest catchable taxonomy entry the VM has).
+    format_mod.format(v, .display, &w.writer, interner) catch |err| switch (err) {
+        error.Utf8Error => return VmError.Utf8Error,
+        error.WriteFailed => return VmError.OutOfMemory,
+    };
 }
 
 fn fnStr(vm: *VM, args: []const Value) VmError!Value {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(vm.allocator);
+    var w = std.Io.Writer.Allocating.init(vm.allocator);
+    defer w.deinit();
     const interner = vm.ensureInterner();
     for (args) |x| {
-        try appendStringified(vm.allocator, &buf, x, interner);
+        try appendStrValue(vm.allocator, &w, x, interner);
     }
-    return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch return VmError.OutOfMemory;
+    return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch return VmError.OutOfMemory;
 }
 
 fn fnStringQ(_: *VM, args: []const Value) VmError!Value {
@@ -2029,11 +2011,11 @@ fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(nexis.string/join coll)` / `(nexis.string/join sep coll)` —
-/// concatenate stringified elements, optionally separated. Element
-/// stringification uses the same `appendStringified` helper as
-/// `str` (5.2c lifts both into `format.zig`). Map rejection per
-/// turn 79 §D4: CHAMP iteration order isn't pinned, so excluding
-/// maps until that's settled.
+/// concatenate stringified elements, optionally separated.
+/// Elements stringify via `appendStrValue` (str-semantics: nil → "",
+/// per peer-AI turn 81 §F1) so `(join [1 nil 2]) → "12"` and
+/// `(join "," [1 nil 2]) → "1,,2"`. Map rejection per turn 79 §D4:
+/// CHAMP iteration order isn't pinned.
 fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
     const sep_bytes: []const u8 = if (args.len == 2) blk: {
         if (args[0].kind() != .string) return VmError.KindMismatch;
@@ -2048,25 +2030,18 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
         else => return VmError.KindMismatch,
     }
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(vm.allocator);
+    var w = std.Io.Writer.Allocating.init(vm.allocator);
+    defer w.deinit();
     const interner = vm.ensureInterner();
     var first = true;
 
-    const appendOne = struct {
-        fn go(
-            vmm: *VM,
-            buff: *std.ArrayList(u8),
-            sep: []const u8,
-            firstp: *bool,
-            it: *const intern_mod.Interner,
-            elem: Value,
-        ) VmError!void {
+    const appendSep = struct {
+        fn go(ww: *std.Io.Writer.Allocating, sep: []const u8, firstp: *bool) VmError!void {
             if (!firstp.*) {
-                buff.appendSlice(vmm.allocator, sep) catch return VmError.OutOfMemory;
+                // Allocating writer; WriteFailed = allocator-fail.
+                ww.writer.writeAll(sep) catch return VmError.OutOfMemory;
             }
             firstp.* = false;
-            try appendStringified(vmm.allocator, buff, elem, it);
         }
     }.go;
 
@@ -2075,7 +2050,8 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
         .list => {
             var node = coll;
             while (node.kind() == .list and !list_mod.isEmpty(node)) {
-                try appendOne(vm, &buf, sep_bytes, &first, interner, list_mod.head(node));
+                try appendSep(&w, sep_bytes, &first);
+                try appendStrValue(vm.allocator, &w, list_mod.head(node), interner);
                 node = list_mod.tail(node);
             }
         },
@@ -2083,19 +2059,21 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
             const n = vector_mod.count(coll);
             var i: usize = 0;
             while (i < n) : (i += 1) {
-                try appendOne(vm, &buf, sep_bytes, &first, interner, vector_mod.nth(coll, i));
+                try appendSep(&w, sep_bytes, &first);
+                try appendStrValue(vm.allocator, &w, vector_mod.nth(coll, i), interner);
             }
         },
         .persistent_set => {
             var it = champ_mod.setIter(coll);
             while (it.next()) |elem| {
-                try appendOne(vm, &buf, sep_bytes, &first, interner, elem);
+                try appendSep(&w, sep_bytes, &first);
+                try appendStrValue(vm.allocator, &w, elem, interner);
             }
         },
         else => unreachable,
     }
 
-    return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch return VmError.OutOfMemory;
+    return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch return VmError.OutOfMemory;
 }
 
 /// `(nexis.string/replace s match replacement)` — literal,
@@ -2140,6 +2118,152 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
         }
     }
     return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch return VmError.OutOfMemory;
+}
+
+// =============================================================================
+// Phase 5 Item 2 sub-step 5.2c — printing + I/O (peer-AI turn 81)
+// =============================================================================
+//
+// `print` / `println` / `prn` write to the VM's stdout (via
+// `vm.io`); `pr-str` returns a String; `slurp` / `spit` read or
+// write UTF-8 files via `vm.io`. All six fns require `vm.io != null`;
+// ad-hoc test harnesses (which don't run user-source I/O paths)
+// leave `vm.io` null and these fns surface `:io-error` cleanly.
+// CLI bootstrap (`runFile` / `runRepl`) sets `vm.io = init.io`.
+//
+// Nil semantics (turn 81 §F1):
+//   - `print` / `println` / `prn`  treat `nil` arg as the literal
+//     `"nil"` because they use `format(.display, ...)` directly.
+//   - `pr-str` similarly. (Readable mode also writes `"nil"`.)
+//   - `spit` uses str-semantics so `(spit path nil) → ""`.
+//
+// Each fn writes through format_mod, which lives in `src/format.zig`.
+// Print fns separate args with a single space (Clojure parity);
+// `println` and `prn` append a trailing newline.
+
+/// Append a single Value to an Allocating buffer with optional
+/// leading separator. Peer-AI turn 82 §R2: the writer is an
+/// Allocating buffer; WriteFailed from it means the backing
+/// allocator failed → OutOfMemory (not IoError). Print fns that
+/// drain to stdout later map THAT failure to IoError separately.
+fn writeOneAndSep(
+    w: *std.Io.Writer.Allocating,
+    v: Value,
+    mode: format_mod.FormatMode,
+    first: *bool,
+    interner: *const intern_mod.Interner,
+) VmError!void {
+    if (!first.*) {
+        w.writer.writeAll(" ") catch return VmError.OutOfMemory;
+    }
+    first.* = false;
+    format_mod.format(v, mode, &w.writer, interner) catch |err| switch (err) {
+        error.Utf8Error => return VmError.Utf8Error,
+        // Allocating-writer drain → allocator failure.
+        error.WriteFailed => return VmError.OutOfMemory,
+    };
+}
+
+fn writeBufferedToStdout(vm: *VM, bytes: []const u8) VmError!void {
+    const io_handle = vm.io orelse return VmError.IoError;
+    std.Io.File.stdout().writeStreamingAll(io_handle, bytes) catch return VmError.IoError;
+}
+
+fn fnPrint(vm: *VM, args: []const Value) VmError!Value {
+    var w = std.Io.Writer.Allocating.init(vm.allocator);
+    defer w.deinit();
+    const interner = vm.ensureInterner();
+    var first = true;
+    for (args) |x| try writeOneAndSep(&w, x, .display, &first, interner);
+    try writeBufferedToStdout(vm, w.written());
+    return value_mod.nilValue();
+}
+
+fn fnPrintln(vm: *VM, args: []const Value) VmError!Value {
+    var w = std.Io.Writer.Allocating.init(vm.allocator);
+    defer w.deinit();
+    const interner = vm.ensureInterner();
+    var first = true;
+    for (args) |x| try writeOneAndSep(&w, x, .display, &first, interner);
+    // The trailing newline goes into the SAME Allocating buffer,
+    // so a WriteFailed here is allocator-fail, not I/O. Map to
+    // OOM. Real stdout-write failure surfaces from
+    // writeBufferedToStdout below as :io-error.
+    w.writer.writeAll("\n") catch return VmError.OutOfMemory;
+    try writeBufferedToStdout(vm, w.written());
+    return value_mod.nilValue();
+}
+
+fn fnPrn(vm: *VM, args: []const Value) VmError!Value {
+    var w = std.Io.Writer.Allocating.init(vm.allocator);
+    defer w.deinit();
+    const interner = vm.ensureInterner();
+    var first = true;
+    for (args) |x| try writeOneAndSep(&w, x, .readable, &first, interner);
+    w.writer.writeAll("\n") catch return VmError.OutOfMemory;
+    try writeBufferedToStdout(vm, w.written());
+    return value_mod.nilValue();
+}
+
+fn fnPrStr(vm: *VM, args: []const Value) VmError!Value {
+    var w = std.Io.Writer.Allocating.init(vm.allocator);
+    defer w.deinit();
+    const interner = vm.ensureInterner();
+    var first = true;
+    for (args) |x| try writeOneAndSep(&w, x, .readable, &first, interner);
+    return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch return VmError.OutOfMemory;
+}
+
+/// `(slurp path)` — read a UTF-8 text file into a String.
+/// 16 MiB cap (matches `cli.zig`'s file-source reader).
+/// Errors: `:invalid-path` for non-string path or empty path;
+/// `:file-not-found` for a missing target; `:utf8-error` for
+/// malformed file content (validation happens after read);
+/// `:io-error` for anything else (permissions, too-large, etc.).
+fn fnSlurp(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const path = string_mod.asBytes(args[0]);
+    if (path.len == 0) return VmError.InvalidPath;
+    for (path) |b| if (b == 0) return VmError.InvalidPath;
+    const io_handle = vm.io orelse return VmError.IoError;
+    const slice = std.Io.Dir.cwd().readFileAlloc(
+        io_handle,
+        path,
+        vm.allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return VmError.FileNotFound,
+        else => return VmError.IoError,
+    };
+    defer vm.allocator.free(slice);
+    if (!std.unicode.utf8ValidateSlice(slice)) return VmError.Utf8Error;
+    return string_mod.fromBytes(vm.ensureHeap(), slice) catch return VmError.OutOfMemory;
+}
+
+/// `(spit path content)` — write `(str content)` to a file.
+/// Per peer-AI turn 81 §D5: `spit` does NOT auto-create parent
+/// directories (unlike `db/open`); missing parents surface as
+/// `:file-not-found` / `:io-error`. Content stringifies via the
+/// str-semantics wrapper (nil → empty).
+fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const path = string_mod.asBytes(args[0]);
+    if (path.len == 0) return VmError.InvalidPath;
+    for (path) |b| if (b == 0) return VmError.InvalidPath;
+    const io_handle = vm.io orelse return VmError.IoError;
+
+    var w = std.Io.Writer.Allocating.init(vm.allocator);
+    defer w.deinit();
+    try appendStrValue(vm.allocator, &w, args[1], vm.ensureInterner());
+
+    std.Io.Dir.cwd().writeFile(io_handle, .{
+        .sub_path = path,
+        .data = w.written(),
+    }) catch |err| switch (err) {
+        error.FileNotFound => return VmError.FileNotFound,
+        else => return VmError.IoError,
+    };
+    return value_mod.nilValue();
 }
 
 // =============================================================================

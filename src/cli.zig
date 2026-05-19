@@ -38,121 +38,17 @@ const champ_mod = @import("champ");
 const stdlib = @import("stdlib");
 const loader_mod = @import("loader");
 const string_mod = @import("string");
+const format_mod = @import("format");
 
 const Value = value_mod.Value;
 
-/// Pretty-print a Value to the given writer. Step H1 covers the
-/// kinds the current language produces:
-///   nil / true / false / fixnum / symbol / keyword
-///   function (closure — printed as #<fn>)
-///   var_ (printed as #'name)
-///   list (recursive)
-/// Everything else falls back to a kind-tag placeholder. Phase 3
-/// will replace this with a proper formatValue per VALUE.md.
-fn formatValue(v: Value, interner: *const intern_mod.Interner, writer: anytype) !void {
-    switch (v.kind()) {
-        .nil => try writer.writeAll("nil"),
-        .true_ => try writer.writeAll("true"),
-        .false_ => try writer.writeAll("false"),
-        .fixnum => try writer.print("{d}", .{v.asFixnum()}),
-        .symbol => {
-            const id: u32 = @intCast(v.payload);
-            try writer.print("{s}", .{interner.symbolName(id)});
-        },
-        .keyword => {
-            const id: u32 = @intCast(v.payload);
-            try writer.print(":{s}", .{interner.keywordName(id)});
-        },
-        // Phase 5.2a: display-mode formatter prints strings
-        // UNQUOTED and chars as their UTF-8 bytes. Readable mode
-        // (quoted strings, `\char` syntax) lands in 5.2c with
-        // `format.zig` + `prn` / `pr-str`.
-        .string => try writer.writeAll(string_mod.asBytes(v)),
-        .char => {
-            const scalar = v.asChar();
-            var utf8_buf: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(scalar, &utf8_buf) catch 0;
-            if (n > 0) try writer.writeAll(utf8_buf[0..n]);
-        },
-        .function => try writer.writeAll("#<fn>"),
-        .var_ => {
-            const var_obj = vm.VM.asVar(v);
-            try writer.print("#'{s}", .{var_obj.name});
-        },
-        .list => {
-            // Step #8c.1: walk the list and recursively format
-            // each element. Empty list prints as `()`.
-            try writer.writeAll("(");
-            var node = v;
-            var first = true;
-            while (node.kind() == .list and !list_mod.isEmpty(node)) {
-                if (!first) try writer.writeAll(" ");
-                first = false;
-                try formatValue(list_mod.head(node), interner, writer);
-                node = list_mod.tail(node);
-            }
-            try writer.writeAll(")");
-        },
-        .persistent_vector => {
-            // Step #8c.3: print as [a b c]. Empty as [].
-            try writer.writeAll("[");
-            const n = vector_mod.count(v);
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                if (i > 0) try writer.writeAll(" ");
-                try formatValue(vector_mod.nth(v, i), interner, writer);
-            }
-            try writer.writeAll("]");
-        },
-        .persistent_map => {
-            // Phase 3.1: print as {k1 v1, k2 v2}. Empty as {}.
-            // Iteration order is implementation-defined for
-            // CHAMP; for deterministic test output, a stable
-            // key-sorted printer can come later.
-            try writer.writeAll("{");
-            var it = champ_mod.mapIter(v);
-            var first = true;
-            while (it.next()) |entry| {
-                if (!first) try writer.writeAll(", ");
-                first = false;
-                try formatValue(entry.key, interner, writer);
-                try writer.writeAll(" ");
-                try formatValue(entry.value, interner, writer);
-            }
-            try writer.writeAll("}");
-        },
-        .persistent_set => {
-            // Phase 3.1: print as #{a b c}. Empty as #{}.
-            try writer.writeAll("#{");
-            var it = champ_mod.setIter(v);
-            var first = true;
-            while (it.next()) |elem| {
-                if (!first) try writer.writeAll(" ");
-                first = false;
-                try formatValue(elem, interner, writer);
-            }
-            try writer.writeAll("}");
-        },
-        .native_fn => {
-            // Phase 3.3a / 3.4: print native fns as
-            // `#<native-fn NAME>` (matching Clojure's
-            // `#<core$+ ...>` flavor but slimmer).
-            const nf = vm.asNativeFn(v);
-            try writer.print("#<native-fn {s}>", .{nf.name});
-        },
-        .atom => {
-            // Phase 5 Item 1 (peer-AI turn 75): print atoms
-            // OPAQUELY to avoid recursing through self-
-            // referential contained values. Peer-AI turn 77 §D4
-            // dropped the pointer so user-facing output is
-            // deterministic (pointer values are unstable across
-            // runs and force every golden test to deref first).
-            // The contained value is still observable via `@a` /
-            // `(deref a)`.
-            try writer.writeAll("#<atom>");
-        },
-        else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),
-    }
+/// Pretty-print a Value via the canonical `src/format.zig`
+/// formatter in display mode. Phase 5.2c extracted the per-kind
+/// switch into format.zig so cli.zig, the integration test
+/// harness, and `(str ...)` / `(print ...)` all share one
+/// source of truth.
+fn formatValue(v: Value, interner: *const intern_mod.Interner, writer: *std.Io.Writer) !void {
+    try format_mod.format(v, .display, writer, interner);
 }
 
 const Usage =
