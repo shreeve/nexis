@@ -415,6 +415,12 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
     var v = try vm.VM.init(allocator, &stub);
     defer v.deinit();
+    // Phase 5.2a polish: hand the VM the CLI's std.Io so
+    // `(db/open path)` can create the path's parent directories
+    // before emdb opens the file. emdb itself does not create
+    // parents; without this, `(db/open "data/x.edb")` fails
+    // unless the user pre-creates `data/`.
+    v.io = io;
     const interner = v.ensureInterner();
     // Phase 3.4: set up the namespace registry (creates
     // `nexis.core` + `user`, with user.parent = core for
@@ -642,6 +648,9 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
     var v = try vm.VM.init(allocator, &stub);
     defer v.deinit();
+    // Phase 5.2a polish: see `runFile` — hand the VM the CLI's
+    // std.Io so `(db/open path)` can auto-create parent dirs.
+    v.io = io;
     const interner = v.ensureInterner();
     // Phase 3.4: namespace registry (nexis.core + user).
     const registry = try v.ensureRegistry();

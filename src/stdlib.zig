@@ -1162,6 +1162,27 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     errdefer vm.allocator.destroy(conn);
     const path_z = vm.allocator.dupeZ(u8, path_slice) catch return VmError.OutOfMemory;
     defer vm.allocator.free(path_z);
+
+    // Phase 5.2a polish (chore): auto-create the path's parent
+    // directories so `(db/open "tmp/x.edb")` / `(db/open
+    // "data/v1/state.edb")` Just Work. emdb does NOT create
+    // parents; without this, the open fails with `:db-error`
+    // unless the user pre-created the directory.
+    //
+    // The auto-create branch only fires when the VM was given
+    // a `std.Io` handle (the CLI sets one; ad-hoc test harnesses
+    // don't, and tests use absolute `/tmp/...` paths or
+    // pre-create their dirs explicitly). Best-effort: any error
+    // here is swallowed — emdb's open will surface a precise
+    // `:db-error` if the directory still isn't usable.
+    if (vm.io) |io_handle| {
+        if (std.fs.path.dirname(path_slice)) |dir| {
+            if (dir.len > 0) {
+                std.Io.Dir.cwd().createDirPath(io_handle, dir) catch {};
+            }
+        }
+    }
+
     const heap = vm.ensureHeap();
     const interner = vm.ensureInterner();
     conn.* = db_mod.open(vm.allocator, heap, interner, path_z.ptr, .{}) catch return VmError.DbError;

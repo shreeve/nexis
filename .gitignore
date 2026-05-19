@@ -13,13 +13,12 @@ notes.txt
 bench/*.json
 
 # Phase 4: emdb data files (created during testing).
-# Examples that use relative paths now write to `tmp/`
-# (see `examples/todo-app.nx`, `examples/durable-refs.nx`); the
-# bare patterns below catch any stragglers from REPL sessions or
-# ad-hoc commands run from the repo root. `tmp/.gitkeep` keeps
-# the directory present at clone time (emdb doesn't auto-create
-# parent dirs); everything else inside `tmp/` is local-only.
+# Examples that use relative paths now write to `tmp/` (see
+# `examples/todo-app.nx`, `examples/durable-refs.nx`). `db/open`
+# auto-creates the path's parent directories (Phase 5.2a polish),
+# so `tmp/` doesn't need to exist at clone time — the CLI creates
+# it on first run. The bare patterns below catch stragglers from
+# REPL sessions or ad-hoc commands run from the repo root.
 *.edb
 *.edb-lock
-tmp/*
-!tmp/.gitkeep
+tmp/

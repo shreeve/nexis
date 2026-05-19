@@ -88,6 +88,21 @@ page on `Connection.open`. `Connection` exposes `storeId() u128`
 as a read-only accessor so downstream code doesn't hardwire the
 derivation.
 
+**Parent-directory auto-creation (Phase 5.2a polish).** emdb's
+`open()` requires the path's parent directory to already exist;
+it does NOT create parents. The language-surface `(db/open path)`
+in `src/stdlib.zig fnDbOpen` calls
+`std.Io.Dir.cwd().createDirPath(io, dirname(path))` before
+invoking emdb, so `(db/open "tmp/x.edb")` and
+`(db/open "data/v1/state.edb")` Just Work from a fresh cwd. The
+auto-create branch fires only when the VM was given a `std.Io`
+handle (the CLI sets `v.io = init.io` after `VM.init`; ad-hoc
+test harnesses use absolute `/tmp/...` paths or pre-create their
+dirs, so the branch is a structural no-op there). Errors from
+`createDirPath` are intentionally swallowed — best-effort; emdb's
+own open surfaces a precise `:db-error` if the directory still
+isn't usable after the attempt.
+
 ---
 
 ### 3. `Connection` shape

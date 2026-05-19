@@ -1267,6 +1267,15 @@ pub const VM = struct {
     /// time a connection is registered, so VM.deinit can close
     /// connections without importing db.
     db_close_callback: ?*const fn (*anyopaque) void = null,
+    /// Phase 5.2a polish (chore): Zig 0.16 `std.Io` handle for
+    /// filesystem ops that live below the language surface —
+    /// today only `(db/open path)` uses it to auto-create the
+    /// path's parent directories (emdb does NOT create parents).
+    /// Set by the CLI (`runFile`/`runRepl`) right after
+    /// `VM.init`; left null in ad-hoc test harnesses (which use
+    /// absolute `/tmp` paths or pre-create dirs explicitly, so
+    /// the auto-create branch is a no-op there).
+    io: ?std.Io = null,
     /// Step #9.1: global try-handler stack (peer-AI turn 59
     /// §D2). Push on `ctrl:try-enter`, pop on `ctrl:try-exit`,
     /// walk on `ctrl:throw`. Each Handler is keyed by
