@@ -404,6 +404,10 @@ fn encodeValue(
         // u32 with no stable cross-process meaning; encoding
         // it would mislead. PROTOCOLS.md §0 boundary.
         .record,
+        // Phase 5.3b: protocols + protocol_fn are likewise per-VM
+        // identity-valued. NOT in §23 #25.
+        .protocol,
+        .protocol_fn,
         => return CodecError.UnserializableKind,
         // Sentinels (unbound, undef) and any other non-heap,
         // non-immediate kind reaching here is a runtime bug. Treat

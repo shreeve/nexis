@@ -169,6 +169,18 @@ pub fn build(b: *std.Build) void {
     record_mod.addImport("hash", hash_mod);
     record_mod.addImport("champ", champ_mod);
 
+    // Phase 5.3b (peer-AI turn 84): Kind.protocol = 36 +
+    // Kind.protocol_fn = 37. Identity-valued. Same module-graph
+    // shape as atom (value + heap + hash only).
+    const protocol_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    protocol_mod.addImport("value", value_mod);
+    protocol_mod.addImport("heap", heap_mod);
+    protocol_mod.addImport("hash", hash_mod);
+
     const codec_mod = b.createModule(.{
         .root_source_file = b.path("src/codec.zig"),
         .target = target,
@@ -189,6 +201,7 @@ pub fn build(b: *std.Build) void {
     // Phase 5 Item 1: codec rejects atoms as :unserializable.
     codec_mod.addImport("atom", atom_mod);
     codec_mod.addImport("record", record_mod);
+    codec_mod.addImport("protocol", protocol_mod);
 
     const gc_mod = b.createModule(.{
         .root_source_file = b.path("src/gc.zig"),
@@ -205,6 +218,7 @@ pub fn build(b: *std.Build) void {
     gc_mod.addImport("transient", transient_mod);
     gc_mod.addImport("atom", atom_mod);
     gc_mod.addImport("record", record_mod);
+    gc_mod.addImport("protocol", protocol_mod);
 
     const pool_mod = b.createModule(.{
         .root_source_file = b.path("src/pool.zig"),
@@ -237,6 +251,11 @@ pub fn build(b: *std.Build) void {
     // `lowerQuotePayload` interns symbols/keywords through this
     // shared Interner so identity is stable across compile + run.
     vm_mod.addImport("intern", intern_mod);
+    // Phase 5.3a: DispatchKey.ofValue inspects record type_id.
+    vm_mod.addImport("record", record_mod);
+    // Phase 5.3b: VM owns the protocol registry + the
+    // dispatchProtocolMethod path used by `call:call`.
+    vm_mod.addImport("protocol", protocol_mod);
 
     // Step #7a: reader exposed as a proper module so compile.zig
     // can consume `reader.Form` trees. reader.zig uses sibling-
@@ -296,6 +315,8 @@ pub fn build(b: *std.Build) void {
     // Phase 5.3a: records substrate (Kind.record + registry +
     // native helpers + map-like ops over records).
     stdlib_mod.addImport("record", record_mod);
+    // Phase 5.3b: protocols substrate.
+    stdlib_mod.addImport("protocol", protocol_mod);
     // stdlib_mod's "format" import is wired AFTER format_mod is
     // declared (which is after db_mod). See further down.
     // dispatch_mod, db_mod, codec_mod are declared later;
@@ -384,6 +405,7 @@ pub fn build(b: *std.Build) void {
     format_mod.addImport("db", db_mod);
     format_mod.addImport("vm", vm_mod);
     format_mod.addImport("record", record_mod);
+    format_mod.addImport("protocol", protocol_mod);
 
     // Late-binding addImport for stdlib_mod (declared earlier).
     stdlib_mod.addImport("format", format_mod);
@@ -406,6 +428,7 @@ pub fn build(b: *std.Build) void {
     dispatch_mod.addImport("db", db_mod);
     dispatch_mod.addImport("atom", atom_mod);
     dispatch_mod.addImport("record", record_mod);
+    dispatch_mod.addImport("protocol", protocol_mod);
     // dispatch is a one-way terminal: nothing depends on it. value
     // and eq deliberately stay low-level (panicking on heap kinds)
     // so the module graph remains acyclic and every test-binary
@@ -470,6 +493,7 @@ pub fn build(b: *std.Build) void {
         transient: *std.Build.Module,
         atom: *std.Build.Module,
         record: *std.Build.Module,
+        protocol: *std.Build.Module,
         format: *std.Build.Module,
         gc: *std.Build.Module,
         codec: *std.Build.Module,
@@ -498,6 +522,7 @@ pub fn build(b: *std.Build) void {
         .transient = transient_mod,
         .atom = atom_mod,
         .record = record_mod,
+        .protocol = protocol_mod,
         .format = format_mod,
         .gc = gc_mod,
         .codec = codec_mod,
@@ -534,18 +559,20 @@ pub fn build(b: *std.Build) void {
         .{ .name = "atom", .path = "src/atom.zig", .imports = &.{ "value", "heap", "hash" } },
         // Phase 5.3a: record test binary (Kind.record = 35).
         .{ .name = "record", .path = "src/record.zig", .imports = &.{ "value", "heap", "hash", "champ" } },
-        .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "champ", "transient", "atom", "record" } },
-        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "champ", "transient", "db", "atom", "record" } },
-        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db", "atom", "record" } },
+        // Phase 5.3b: protocol test binary (Kind.protocol = 36 + Kind.protocol_fn = 37).
+        .{ .name = "protocol", .path = "src/protocol.zig", .imports = &.{ "value", "heap", "hash" } },
+        .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "champ", "transient", "atom", "record", "protocol" } },
+        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "champ", "transient", "db", "atom", "record", "protocol" } },
+        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db", "atom", "record", "protocol" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
-        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch" } },
+        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch", "record", "protocol" } },
         // Phase 5.2c: format test binary. Imports the menagerie of
         // consumer kinds; nothing depends on format itself.
-        .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record" } },
+        .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch", "heap", "string" } },
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string" } },
-        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record" } },
+        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
     };
 
@@ -571,6 +598,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "transient")) siblings.transient
                 else if (std.mem.eql(u8, imp_name, "atom")) siblings.atom
                 else if (std.mem.eql(u8, imp_name, "record")) siblings.record
+                else if (std.mem.eql(u8, imp_name, "protocol")) siblings.protocol
                 else if (std.mem.eql(u8, imp_name, "format")) siblings.format
                 else if (std.mem.eql(u8, imp_name, "gc")) siblings.gc
                 else if (std.mem.eql(u8, imp_name, "codec")) siblings.codec
@@ -1000,34 +1028,33 @@ pub fn build(b: *std.Build) void {
 
     const phase2_test_step = b.step("phase2-test", "Run only vm + compile tests (fast Phase 2 iteration)");
     // Indices into runtime_test_files: atom = 11, record = 12,
-    // vm = 18, format = 19, compile = 20, expand = 21,
-    // stdlib = 22, loader = 23. (Phase 5.3a shifted everything
-    // past `atom` by +1 by inserting `record` between atom
-    // and codec.) Asserted at build time so re-ordering trips
+    // protocol = 13, vm = 19, format = 20, compile = 21,
+    // expand = 22, stdlib = 23, loader = 24. (Phase 5.3b
+    // shifted everything past `record` by +1 by inserting
+    // `protocol`.) Asserted at build time so re-ordering trips
     // this loudly instead of silently running the wrong tests.
     comptime {
         std.debug.assert(std.mem.eql(u8, runtime_test_files[11].name, "atom"));
         std.debug.assert(std.mem.eql(u8, runtime_test_files[12].name, "record"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[18].name, "vm"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[19].name, "format"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[20].name, "compile"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[21].name, "expand"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[22].name, "stdlib"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[23].name, "loader"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[13].name, "protocol"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[19].name, "vm"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[20].name, "format"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[21].name, "compile"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[22].name, "expand"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[23].name, "stdlib"));
+        std.debug.assert(std.mem.eql(u8, runtime_test_files[24].name, "loader"));
     }
-    // Phase 5 Item 1: include the atom test binary in phase2-test
-    // so the inner loop covers the new kind without waiting for
-    // the full `zig build test` Phase 1 randomized property suite.
-    // Phase 5.2c: format binary lands in the same inner-loop set.
-    // Phase 5.3a: record binary also.
+    // Inner-loop binaries: atom + record + protocol +
+    // vm + format + compile + expand + stdlib + loader.
     phase2_test_step.dependOn(&runtime_test_runs[11].step);
     phase2_test_step.dependOn(&runtime_test_runs[12].step);
-    phase2_test_step.dependOn(&runtime_test_runs[18].step);
+    phase2_test_step.dependOn(&runtime_test_runs[13].step);
     phase2_test_step.dependOn(&runtime_test_runs[19].step);
     phase2_test_step.dependOn(&runtime_test_runs[20].step);
     phase2_test_step.dependOn(&runtime_test_runs[21].step);
     phase2_test_step.dependOn(&runtime_test_runs[22].step);
     phase2_test_step.dependOn(&runtime_test_runs[23].step);
+    phase2_test_step.dependOn(&runtime_test_runs[24].step);
     // Phase 2 gate items 3 + 4.
     phase2_test_step.dependOn(&run_prop_compile_tests.step);
     // Phase 2 step #11 — eval-pipeline integration tests.

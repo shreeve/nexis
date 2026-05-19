@@ -92,8 +92,21 @@ pub const Kind = enum(u8) {
     /// (same type_id + equal field maps). NOT serializable.
     /// See `docs/PROTOCOLS.md` §2.1.
     record = 35,
-    // 36..63 reserved for future heap kinds (Phase 5.3b
-    // reserves 36 = protocol + 37 = protocol_fn).
+    /// Phase 5.3b (peer-AI turn 84): protocol handle.
+    /// Opaque, identity-valued. Payload `*HeapHeader` →
+    /// `ProtocolBody { id }`. Per-VM dense `id` indexes into
+    /// `VM.protocol_registry`. See `docs/PROTOCOLS.md` §2.2.
+    protocol = 36,
+    /// Phase 5.3b: protocol-method dispatcher. Opaque,
+    /// identity-valued. Payload `*HeapHeader` →
+    /// `ProtocolFnBody { protocol_id, method_name_id }`. The
+    /// `call:call` dispatch arm routes invocations to
+    /// `vm.dispatchProtocolMethod`. Solves the "NativeFn is a
+    /// static descriptor with no per-instance state" hazard
+    /// (peer-AI turn 84 §"Big missing implementation concern").
+    /// See `docs/PROTOCOLS.md` §2.3.
+    protocol_fn = 37,
+    // 38..63 reserved for future heap kinds.
 
 
     // ---- Runtime-private sentinels (never escape public API) ----

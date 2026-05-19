@@ -48,6 +48,7 @@ const transient_mod = @import("transient");
 const db_mod = @import("db");
 const atom_mod = @import("atom");
 const record_mod = @import("record");
+const protocol_mod = @import("protocol");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -118,6 +119,9 @@ pub const Collector = struct {
             // the contained field map (type_id is a plain u32,
             // not a heap value). PROTOCOLS.md §2.1.
             .record => record_mod.trace(h, self),
+            // Phase 5.3b: protocol + protocol_fn are LEAFS
+            // (no inner heap values).
+            .protocol, .protocol_fn => protocol_mod.trace(h, self),
             // Reserved heap kinds without implementations in v1.
             // PANIC, not silent no-op, per GC.md §5 / peer-AI turn 14:
             // a silent no-op on a kind that SHOULD trace would create

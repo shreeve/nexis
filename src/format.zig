@@ -52,6 +52,7 @@ const vm_mod = @import("vm");
 const atom_mod = @import("atom");
 const db_mod = @import("db");
 const record_mod = @import("record");
+const protocol_mod = @import("protocol");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -132,6 +133,20 @@ pub fn format(
         // until tagged-literal reader support exists). The full
         // `#my.ns/Counter{:n 1}` shape is deferred.
         .record => try writer.print("#<record type-id={d}>", .{record_mod.typeId(v)}),
+        // Phase 5.3b: protocols + protocol_fn are opaque
+        // identity-valued. Format prints `#<protocol id=N>` and
+        // `#<protocol-fn proto=P method=M>` (interned-name
+        // resolution lives in the VM and is intentionally not
+        // wired into format.zig to keep this module dependency-
+        // free of the VM internals).
+        .protocol => try writer.print("#<protocol id={d}>", .{protocol_mod.protocolId(v)}),
+        .protocol_fn => try writer.print(
+            "#<protocol-fn proto={d} method={d}>",
+            .{
+                protocol_mod.protocolFnProtocolId(v),
+                protocol_mod.protocolFnMethodNameId(v),
+            },
+        ),
         .durable_ref => try formatDurableRef(v, writer, interner),
         .db_connection => try writer.writeAll("#<db-connection>"),
         .db_write_txn => try writer.writeAll("#<db-write-txn>"),

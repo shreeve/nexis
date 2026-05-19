@@ -2126,6 +2126,65 @@ test "phase5.3a defrecord: keys + vals walk the field map" {
     , "1");
 }
 
+// =============================================================================
+// Phase 5 Item 3 sub-step 5.3b — protocols substrate (peer-AI turn 84)
+// =============================================================================
+
+test "phase5.3b defprotocol: registers protocol + method dispatchers" {
+    // Smoke: both IFoo and bar end up bound to the right kinds.
+    // (Use `str` rather than `println` because the test harness
+    // has no `vm.io` and println→:io-error there.)
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this y]))
+        \\  (str IFoo " " bar))
+    , "#<protocol id=0> #<protocol-fn proto=0 method=0>");
+}
+
+test "phase5.3b protocol dispatch with NO impl raises :no-protocol-impl" {
+    // Hand-trace from PROTOCOLS.md §5: registering IFoo then
+    // calling `(bar receiver y)` with no impl for receiver's
+    // dispatch key must raise a catchable :no-protocol-impl
+    // (NOT panic, NOT silently return nil). turn 84 §D6.
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this y]))
+        \\  (try (bar 1 2) (catch any e e)))
+    , ":no-protocol-impl");
+    // Even when the receiver is a record, no impl means
+    // :no-protocol-impl (different dispatch key but same
+    // outcome).
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this y]))
+        \\  (defrecord Counter [n])
+        \\  (try (bar (->Counter 5) 7) (catch any e e)))
+    , ":no-protocol-impl");
+}
+
+test "phase5.3b protocol dispatch with zero args raises :arity-mismatch" {
+    // `(bar)` has no receiver to dispatch on; dispatchProtocolMethod
+    // raises ArityMismatch which surfaces as the catchable
+    // keyword `:arity-mismatch`.
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this y]))
+        \\  (try (bar) (catch any e e)))
+    , ":arity-mismatch");
+}
+
+test "phase5.3b defprotocol: protocol-fn passes through map-as-key" {
+    // protocol_fn values are identity-valued; storing two distinct
+    // calls to defprotocol-emitted protocol_fn under the same key
+    // verifies hash + equality agree.
+    try expectOutputProgram(
+        \\(do
+        \\  (defprotocol IFoo (bar [this]))
+        \\  (let [m {bar :hi}]
+        \\    (get m bar)))
+    , ":hi");
+}
+
 test "phase5.3a defrecord: records-as-map-keys use structural identity" {
     // Two structurally-equal records hash + compare equal so
     // they're the SAME key in a map. (Verified by storing under

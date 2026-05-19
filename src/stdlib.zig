@@ -46,6 +46,7 @@ const atom_mod = @import("atom");
 const string_mod = @import("string");
 const format_mod = @import("format");
 const record_mod = @import("record");
+const protocol_mod = @import("protocol");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -169,6 +170,9 @@ const internal_fns = [_]CoreEntry{
     .{ .name = "#%make-record", .descriptor = &native_make_record },
     .{ .name = "#%record?", .descriptor = &native_record_q },
     .{ .name = "#%record-type-id", .descriptor = &native_record_type_id },
+    // 5.3b — protocols.
+    .{ .name = "#%register-protocol", .descriptor = &native_register_protocol },
+    .{ .name = "#%protocol-fn", .descriptor = &native_protocol_fn },
 };
 
 /// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
@@ -421,6 +425,10 @@ const native_register_record_type = NativeFn{ .name = "#%register-record-type", 
 const native_make_record = NativeFn{ .name = "#%make-record", .min_arity = 2, .max_arity = 2, .call = &fnMakeRecord };
 const native_record_q = NativeFn{ .name = "#%record?", .min_arity = 1, .max_arity = 1, .call = &fnRecordQ };
 const native_record_type_id = NativeFn{ .name = "#%record-type-id", .min_arity = 1, .max_arity = 1, .call = &fnRecordTypeId };
+
+// Phase 5.3b (peer-AI turn 84) — protocol internals.
+const native_register_protocol = NativeFn{ .name = "#%register-protocol", .min_arity = 2, .max_arity = 2, .call = &fnRegisterProtocol };
+const native_protocol_fn = NativeFn{ .name = "#%protocol-fn", .min_arity = 2, .max_arity = 2, .call = &fnProtocolFn };
 
 // Phase 5 Item 2 sub-step 5.2b (peer-AI turn 79) — nexis.string namespace.
 const native_string_lower_case = NativeFn{ .name = "nexis.string/lower-case", .min_arity = 1, .max_arity = 1, .call = &fnStringLowerCase };
@@ -2418,6 +2426,77 @@ fn fnRecordQ(_: *VM, args: []const Value) VmError!Value {
 fn fnRecordTypeId(_: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .record) return VmError.NotARecord;
     return value_mod.fromFixnum(@intCast(record_mod.typeId(args[0]))) orelse VmError.IntegerOverflow;
+}
+
+// =============================================================================
+// Phase 5.3b — protocol internals (peer-AI turn 84; PROTOCOLS.md §4.1)
+// =============================================================================
+//
+// Two helpers installed in `nexis.internal` (alongside the
+// record helpers). `defprotocol` macro emits qualified calls.
+//
+//   (#%register-protocol "ns/IFoo" [:bar :baz])  → protocol Value
+//   (#%protocol-fn IFoo :bar)                    → protocol_fn Value
+//
+// Method-name IDs are KEYWORD-pool ids — the macro converts each
+// method symbol to a keyword in the emitted expansion so the
+// natives see homogeneous values + use a single interning pool.
+
+fn fnRegisterProtocol(vm: *VM, args: []const Value) VmError!Value {
+    const full_name_v = args[0];
+    const methods_vec = args[1];
+    if (full_name_v.kind() != .string) return VmError.KindMismatch;
+    if (methods_vec.kind() != .persistent_vector) return VmError.KindMismatch;
+
+    const full_name = string_mod.asBytes(full_name_v);
+    var ns_name: []const u8 = "";
+    var proto_name: []const u8 = full_name;
+    if (std.mem.lastIndexOfScalar(u8, full_name, '/')) |slash_idx| {
+        ns_name = full_name[0..slash_idx];
+        proto_name = full_name[slash_idx + 1 ..];
+    }
+
+    const interner = vm.ensureInterner();
+    const n = vector_mod.count(methods_vec);
+    const specs = vm.allocator.alloc(vm_mod.ProtocolMethodSpec, n) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(specs);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const m = vector_mod.nth(methods_vec, i);
+        if (m.kind() != .keyword) return VmError.KindMismatch;
+        const id: u32 = @intCast(m.payload);
+        specs[i] = .{ .name_id = id, .name = interner.keywordName(id) };
+    }
+
+    const new_id = vm.registerProtocol(ns_name, proto_name, specs) catch |err| switch (err) {
+        error.ProtocolRedefinition => return VmError.ProtocolRedefinition,
+        error.OutOfMemory => return VmError.OutOfMemory,
+    };
+    return protocol_mod.makeProtocol(vm.ensureHeap(), new_id) catch return VmError.OutOfMemory;
+}
+
+fn fnProtocolFn(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .protocol) return VmError.KindMismatch;
+    if (args[1].kind() != .keyword) return VmError.KindMismatch;
+    const protocol_id = protocol_mod.protocolId(args[0]);
+    const method_name_id: u32 = @intCast(args[1].payload);
+
+    // Verify the method exists on the protocol — otherwise the
+    // protocol_fn would be dispatching into the void at every
+    // call site. Raise NoProtocolMethod at construction time
+    // (earliest possible) so the error points at defprotocol /
+    // a corrupted macro.
+    const proto = vm.protocolById(protocol_id) orelse return VmError.NoProtocolMethod;
+    var found = false;
+    for (proto.methods.items) |m| {
+        if (m.name_id == method_name_id) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return VmError.NoProtocolMethod;
+
+    return protocol_mod.makeProtocolFn(vm.ensureHeap(), protocol_id, method_name_id) catch return VmError.OutOfMemory;
 }
 
 // =============================================================================

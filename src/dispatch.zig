@@ -67,6 +67,7 @@ const transient = @import("transient");
 const db = @import("db");
 const atom = @import("atom");
 const record = @import("record");
+const protocol = @import("protocol");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -174,6 +175,9 @@ pub fn heapHashBase(v: Value) u64 {
         // dispatch.hashValue recursively (one-way through this
         // function pointer). PROTOCOLS.md §2.1.
         .record => @as(u64, record.hashHeader(h, &hashValue)),
+        // Phase 5.3b: protocol + protocol_fn are identity-valued.
+        // Pointer hash, domain-mixed by their own kind byte.
+        .protocol, .protocol_fn => @as(u64, protocol.hashHeader(h)),
         // Transients are not hashable per SEMANTICS §3.2 / PLAN §9.4:
         // "transient — throws `:no-hash-on-transient`". Using a
         // transient as a map key or set element is a programming error.
@@ -358,6 +362,9 @@ pub fn heapEqual(a: Value, b: Value) bool {
         // equality: same type_id + equal field maps. Field-map
         // equality delegates to dispatch.equal recursively.
         .record => record.recordsEqual(ah, bh, &equal),
+        // Phase 5.3b: protocols + protocol_fn use POINTER
+        // identity (opaque, identity-valued).
+        .protocol, .protocol_fn => protocol.pointerEqual(ah, bh),
         // Transient equality is bit-identity on the wrapper header
         // (TRANSIENT.md §9, SEMANTICS §2.6). Two transient wrappers
         // are equal iff they are the same allocation. The top-level
@@ -682,6 +689,10 @@ test "eqCategory + domainByteForKind: exhaustive table matches SEMANTICS §2.6/�
         // (structural over field map but NOT cross-kind equal to
         // plain maps). Domain byte 35.
         .{ .kind = .record, .cat = .kind_local, .domain = 35 },
+        // Phase 5.3b: protocol + protocol_fn are kind-local
+        // identity-valued. Domain bytes 36 / 37.
+        .{ .kind = .protocol, .cat = .kind_local, .domain = 36 },
+        .{ .kind = .protocol_fn, .cat = .kind_local, .domain = 37 },
     };
     for (cases) |c| {
         try testing.expectEqual(c.cat, eqCategory(c.kind));

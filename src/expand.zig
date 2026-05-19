@@ -3129,6 +3129,109 @@ fn expandDefrecord(
     });
 }
 
+// ---- defprotocol (5.3b — protocols substrate) ----
+//
+// Spec: PROTOCOLS.md §4.1.
+//
+//   (defprotocol IFoo
+//     (bar [this y])
+//     (baz [this]))
+//   →
+//   (do
+//     (def IFoo (nexis.internal/#%register-protocol
+//                  "<ns>/IFoo" [:bar :baz]))
+//     (def bar (nexis.internal/#%protocol-fn IFoo :bar))
+//     (def baz (nexis.internal/#%protocol-fn IFoo :baz)))
+//
+// 5.3b ignores method signatures (arity verification, doc
+// strings) — those land if/when needed. The dispatch path
+// raises `:no-protocol-impl` at call time when no impl matches
+// the receiver.
+
+fn expandDefprotocol(
+    ctx: *ExpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) ExpandError!*Form {
+    // Minimum: (defprotocol Name <method-spec>+)
+    if (args.len < 1) return ExpandError.MalformedMacroCall;
+    const name_form = args[0];
+    if (name_form.datum != .symbol) return ExpandError.MalformedMacroCall;
+    if (name_form.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
+    const proto_name = name_form.datum.symbol.name;
+    const origin = call_form.origin;
+
+    // Parse method specs: each must be a list whose head is a
+    // symbol (the method name). The arg-vector after the name
+    // is currently ignored (5.3b).
+    var method_kw_items = try ctx.allocator.alloc(*Form, args.len - 1);
+    var method_names = try ctx.allocator.alloc([]const u8, args.len - 1);
+    for (args[1..], 0..) |spec, i| {
+        if (spec.datum != .list) return ExpandError.MalformedMacroCall;
+        if (spec.datum.list.len == 0) return ExpandError.MalformedMacroCall;
+        const head = spec.datum.list[0];
+        if (head.datum != .symbol) return ExpandError.MalformedMacroCall;
+        if (head.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
+        method_names[i] = head.datum.symbol.name;
+        const kw = try ctx.allocator.create(Form);
+        kw.* = .{
+            .datum = .{ .keyword = .{ .ns = null, .name = head.datum.symbol.name } },
+            .origin = origin,
+        };
+        method_kw_items[i] = kw;
+    }
+    const methods_kw_vec = try makeVector(ctx, method_kw_items, origin);
+
+    // Build the protocol full-name string.
+    const ns_name: []const u8 = if (ctx.namespace) |ns| ns.name else "";
+    const full_name = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ns_name, proto_name });
+    const full_name_str = try ctx.allocator.create(Form);
+    full_name_str.* = .{
+        .datum = .{ .string = full_name },
+        .origin = origin,
+    };
+
+    // Qualified helpers.
+    const register_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%register-protocol", origin);
+    const protocol_fn_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%protocol-fn", origin);
+
+    // (def IFoo (#%register-protocol "ns/IFoo" [:bar :baz]))
+    const reg_call = try makeListInline(ctx, origin, &.{
+        register_sym,
+        full_name_str,
+        methods_kw_vec,
+    });
+    const def_proto = try makeListInline(ctx, origin, &.{
+        try makeSymbol(ctx, "def", origin),
+        try makeSymbol(ctx, proto_name, origin),
+        reg_call,
+    });
+
+    // Build the (def method-name (#%protocol-fn IFoo :method-name))
+    // for every method.
+    var top_items = try ctx.allocator.alloc(*Form, args.len + 1);
+    top_items[0] = try makeSymbol(ctx, "do", origin);
+    top_items[1] = def_proto;
+    for (method_names, 0..) |mname, i| {
+        const kw = try ctx.allocator.create(Form);
+        kw.* = .{
+            .datum = .{ .keyword = .{ .ns = null, .name = mname } },
+            .origin = origin,
+        };
+        const pf_call = try makeListInline(ctx, origin, &.{
+            protocol_fn_sym,
+            try makeSymbol(ctx, proto_name, origin),
+            kw,
+        });
+        top_items[2 + i] = try makeListInline(ctx, origin, &.{
+            try makeSymbol(ctx, "def", origin),
+            try makeSymbol(ctx, mname, origin),
+            pf_call,
+        });
+    }
+    return try makeList(ctx, top_items, origin);
+}
+
 /// Helper: make a qualified symbol form (`ns/name`).
 fn makeQualifiedSymbol(ctx: *ExpandContext, ns_name: []const u8, sym_name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
     const f = try ctx.allocator.create(Form);
@@ -3504,6 +3607,8 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     // Phase 5 Item 3 sub-step 5.3a (peer-AI turn 84): defrecord
     // (records only; protocol-clause support lands in 5.3c).
     try table.put(allocator, "defrecord", expandDefrecord);
+    // Phase 5 Item 3 sub-step 5.3b (peer-AI turn 84): defprotocol.
+    try table.put(allocator, "defprotocol", expandDefprotocol);
     return table;
 }
 

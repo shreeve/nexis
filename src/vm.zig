@@ -86,6 +86,7 @@ const dispatch_mod = @import("dispatch");
 /// means symbol/keyword Value identity is consistent across the
 /// whole VM lifetime.
 const intern_mod = @import("intern");
+const protocol_mod = @import("protocol");
 const Value = value_mod.Value;
 
 // =============================================================================
@@ -980,6 +981,65 @@ pub const RecordTypeEntry = struct {
     field_names: []const []const u8,
 };
 
+/// Phase 5.3b (peer-AI turn 84): one entry per `defprotocol`.
+/// Methods table is indexed by method-name-id (interned symbol
+/// id). Each method's impls map keys on DispatchKey (record
+/// type_id for records, kind tag for built-in kinds — see
+/// dispatchKeyOf in this module).
+pub const ProtocolEntry = struct {
+    id: u32,
+    ns_name: []const u8,
+    name: []const u8,
+    methods: std.ArrayList(ProtocolMethod) = .empty,
+};
+
+pub const ProtocolMethod = struct {
+    /// Interned symbol id (matches ProtocolFnBody.method_name_id).
+    name_id: u32,
+    /// Short copy of the method name string (owned by VM allocator)
+    /// so error messages can reach the user without a re-intern.
+    name: []const u8,
+    /// Method impls keyed by DispatchKey. The Value is callable
+    /// (closure / native_fn / etc.) and receives the protocol
+    /// receiver as its first arg.
+    impls: std.AutoHashMapUnmanaged(DispatchKey, Value) = .empty,
+    /// 5.3d adds Any/Object-fallback. Stub field for now.
+    default_impl: ?Value = null,
+};
+
+/// Inline-method spec passed to `registerProtocol`. Owned by the
+/// caller (slices duped on registration).
+pub const ProtocolMethodSpec = struct {
+    name_id: u32,
+    name: []const u8,
+};
+
+/// DispatchKey: how protocol-fn dispatch finds an impl. For
+/// records, we key on `(:record, type_id)`. For built-in kinds
+/// we key on `(:builtin, kind_byte)`. PROTOCOLS.md §3.2.
+pub const DispatchKey = struct {
+    tag: Tag,
+    id: u32,
+
+    pub const Tag = enum(u8) {
+        builtin = 0,
+        record = 1,
+    };
+
+    pub fn ofValue(v: value_mod.Value) DispatchKey {
+        if (v.kind() == .record) {
+            return .{
+                .tag = .record,
+                .id = @import("record").typeId(v),
+            };
+        }
+        return .{
+            .tag = .builtin,
+            .id = @intFromEnum(v.kind()),
+        };
+    }
+};
+
 pub const VmError = error{
     /// Known opcode / group / variant / operand kind that this VM
     /// commit hasn't wired yet (e.g., upvalue operand before
@@ -1172,6 +1232,19 @@ pub const VmError = error{
     /// Phase 5.3a: record-introspection ops expected a record
     /// receiver but got something else. Mapped to `:not-a-record`.
     NotARecord,
+    /// Phase 5.3b (peer-AI turn 84): protocol-fn dispatch could
+    /// not find an impl for the receiver's dispatch key (no
+    /// matching record / built-in kind impl, no Any default).
+    /// Mapped to `:no-protocol-impl`.
+    NoProtocolImpl,
+    /// Phase 5.3b: tried to extend a protocol that does not
+    /// have a method with the given name. Mapped to
+    /// `:no-protocol-method`.
+    NoProtocolMethod,
+    /// Phase 5.3b: `defprotocol` with a name that already
+    /// exists (same `(ns, name)`). Mapped to
+    /// `:protocol-redefinition`.
+    ProtocolRedefinition,
 };
 
 // =============================================================================
@@ -1315,6 +1388,12 @@ pub const VM = struct {
     /// returned dense u32 id is used as `RecordBody.type_id`.
     /// PROTOCOLS.md §3.
     record_registry: std.ArrayList(RecordTypeEntry) = .empty,
+
+    /// Phase 5.3b (peer-AI turn 84): per-VM protocol registry.
+    /// Each `defprotocol` adds an entry; `extend-protocol` /
+    /// inline `defrecord` impls mutate `methods[*].impls`. See
+    /// PROTOCOLS.md §3.2.
+    protocol_registry: std.ArrayList(ProtocolEntry) = .empty,
     /// Step #9.1: global try-handler stack (peer-AI turn 59
     /// §D2). Push on `ctrl:try-enter`, pop on `ctrl:try-exit`,
     /// walk on `ctrl:throw`. Each Handler is keyed by
@@ -1418,6 +1497,17 @@ pub const VM = struct {
             self.allocator.free(entry.field_names);
         }
         self.record_registry.deinit(self.allocator);
+        // Phase 5.3b: free protocol-registry storage.
+        for (self.protocol_registry.items) |*proto| {
+            self.allocator.free(proto.ns_name);
+            self.allocator.free(proto.name);
+            for (proto.methods.items) |*method| {
+                self.allocator.free(method.name);
+                method.impls.deinit(self.allocator);
+            }
+            proto.methods.deinit(self.allocator);
+        }
+        self.protocol_registry.deinit(self.allocator);
         // Heap (if initialized) is arena-backed in this staged
         // VM path. Its live-list is only bookkeeping; all
         // memory is reclaimed by `runtime_arena.deinit()`
@@ -1543,6 +1633,114 @@ pub const VM = struct {
     pub fn recordTypeById(self: *const VM, id: u32) ?*const RecordTypeEntry {
         if (id >= self.record_registry.items.len) return null;
         return &self.record_registry.items[id];
+    }
+
+    /// Phase 5.3b (peer-AI turn 84): register a new protocol in
+    /// the per-VM protocol registry. Method-spec is a slice of
+    /// (interned-method-name-id, method-name-string) pairs;
+    /// extend-protocol fills `impls` later. Returns the dense
+    /// `u32` protocol id. Re-defining with the same `(ns, name)`
+    /// raises `ProtocolRedefinition`.
+    pub fn registerProtocol(
+        self: *VM,
+        ns_name: []const u8,
+        protocol_name: []const u8,
+        method_specs: []const ProtocolMethodSpec,
+    ) !u32 {
+        for (self.protocol_registry.items) |existing| {
+            if (std.mem.eql(u8, existing.ns_name, ns_name) and
+                std.mem.eql(u8, existing.name, protocol_name))
+            {
+                return error.ProtocolRedefinition;
+            }
+        }
+        const new_id: u32 = @intCast(self.protocol_registry.items.len);
+        const ns_dup = try self.allocator.dupe(u8, ns_name);
+        errdefer self.allocator.free(ns_dup);
+        const name_dup = try self.allocator.dupe(u8, protocol_name);
+        errdefer self.allocator.free(name_dup);
+
+        var methods: std.ArrayList(ProtocolMethod) = .empty;
+        errdefer methods.deinit(self.allocator);
+        for (method_specs) |spec| {
+            const m_name = try self.allocator.dupe(u8, spec.name);
+            errdefer self.allocator.free(m_name);
+            try methods.append(self.allocator, .{
+                .name_id = spec.name_id,
+                .name = m_name,
+            });
+        }
+        try self.protocol_registry.append(self.allocator, .{
+            .id = new_id,
+            .ns_name = ns_dup,
+            .name = name_dup,
+            .methods = methods,
+        });
+        return new_id;
+    }
+
+    pub fn protocolById(self: *VM, id: u32) ?*ProtocolEntry {
+        if (id >= self.protocol_registry.items.len) return null;
+        return &self.protocol_registry.items[id];
+    }
+
+    /// Phase 5.3b: register an impl `(protocol_id, method_name_id,
+    /// dispatch_key) → impl`. Used by `extend-protocol` and by
+    /// inline `defrecord` impls in 5.3c.
+    pub fn extendProtocol(
+        self: *VM,
+        protocol_id: u32,
+        method_name_id: u32,
+        key: DispatchKey,
+        impl: Value,
+    ) !void {
+        const proto = self.protocolById(protocol_id) orelse return error.NoProtocolMethod;
+        for (proto.methods.items) |*method| {
+            if (method.name_id == method_name_id) {
+                try method.impls.put(self.allocator, key, impl);
+                return;
+            }
+        }
+        return error.NoProtocolMethod;
+    }
+
+    /// Phase 5.3b (peer-AI turn 84): dispatch a protocol-method
+    /// invocation. Called from `execCallCall` when the callee
+    /// has `Kind.protocol_fn`. Walks the protocol registry to
+    /// find an impl for the receiver's dispatch key, returns
+    /// `NoProtocolImpl` if none and no default exists.
+    pub fn dispatchProtocolMethod(
+        self: *VM,
+        callee: Value,
+        args: []const Value,
+    ) VmError!Value {
+        std.debug.assert(callee.kind() == .protocol_fn);
+        if (args.len == 0) return VmError.ArityMismatch;
+
+        const protocol_id = protocol_mod.protocolFnProtocolId(callee);
+        const method_name_id = protocol_mod.protocolFnMethodNameId(callee);
+        const proto = self.protocolById(protocol_id) orelse return VmError.NoProtocolImpl;
+
+        // Find the method by name_id.
+        var method_ptr: ?*ProtocolMethod = null;
+        for (proto.methods.items) |*m| {
+            if (m.name_id == method_name_id) {
+                method_ptr = m;
+                break;
+            }
+        }
+        const method = method_ptr orelse return VmError.NoProtocolMethod;
+
+        // Look up impl by dispatch key (receiver is args[0]).
+        const key = DispatchKey.ofValue(args[0]);
+        const impl_v: Value = blk: {
+            if (method.impls.get(key)) |impl| break :blk impl;
+            if (method.default_impl) |dflt| break :blk dflt;
+            return VmError.NoProtocolImpl;
+        };
+
+        // Invoke. callValue handles closures, native_fns, etc.
+        return try self.callValue(impl_v, args);
     }
 
     /// Allocate a `Closure` from the runtime arena and return a
@@ -2195,6 +2393,33 @@ pub const VM = struct {
         // stack without aliasing dead slots.
         if (closure_v.kind() == value_mod.Kind.native_fn) {
             return try execCallNative(self, closure_v, call_base, argc, result_dst);
+        }
+        // Phase 5.3b (peer-AI turn 84): protocol-fn dispatch.
+        // Same shape as native — args COPIED off the stack (so
+        // the dispatcher's invoked impl can safely grow the
+        // stack), result written to result_dst. The receiver
+        // (args[0]) determines which impl wins. PROTOCOLS.md
+        // §3.2 + §5 hand-trace.
+        if (closure_v.kind() == value_mod.Kind.protocol_fn) {
+            // Copy args.
+            const args_buf = try self.allocator.alloc(value_mod.Value, argc);
+            defer self.allocator.free(args_buf);
+            var i: u32 = 0;
+            while (i < argc) : (i += 1) {
+                const arg_ptr = try self.slotPtr(@intCast(call_base + 1 + i));
+                args_buf[i] = arg_ptr.*;
+            }
+            const result = try self.dispatchProtocolMethod(closure_v, args_buf);
+            // Write result back. Caller frame's result_dst slot
+            // is valid (validated below for closures; here we
+            // re-check the same window).
+            const caller_frame = self.currentFrame();
+            if (result_dst >= caller_frame.slot_count) {
+                return VmError.OperandOutOfRange;
+            }
+            const dst_ptr = try self.slotPtr(result_dst);
+            dst_ptr.* = result;
+            return;
         }
         if (closure_v.kind() != value_mod.Kind.function) {
             return VmError.NotCallable;
@@ -3283,6 +3508,9 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.InvalidPath => "invalid-path",
         VmError.RecordRedefinition => "record-redefinition",
         VmError.NotARecord => "not-a-record",
+        VmError.NoProtocolImpl => "no-protocol-impl",
+        VmError.NoProtocolMethod => "no-protocol-method",
+        VmError.ProtocolRedefinition => "protocol-redefinition",
         // Unrecoverable: bytecode corruption / VM-internal /
         // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,
