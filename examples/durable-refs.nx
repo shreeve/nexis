@@ -8,9 +8,12 @@
 ;   - v1.alpha auto-ephemeral: db/put-key! / db/get-key
 ;   - Phase 4.0b explicit-tx: with-tx + db/put! / db/get
 
-; Open (or create) a connection to a database file.
-; v1.alpha accepts the path as a keyword (its interned name = path).
-(def conn (db/open :app.edb))
+; Open (or create) a connection to a database file. Phase 5.2a
+; first-class strings (and the prior keyword/symbol path overloads)
+; both work; we pick the string form here since it's the canonical
+; Phase 5+ shape. `tmp/` is gitignored, so running this from the
+; repo root keeps data files out of the way.
+(def conn (db/open "tmp/app.edb"))
 
 ; Construct a durable ref. Its identity is the triple
 ; {store-id, tree-name, key-bytes}. Two refs with the same

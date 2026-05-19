@@ -26,10 +26,13 @@
 ; v1 NOTE on keys: db/ref accepts keyword/symbol keys.
 ; Runtime keyword construction isn't in v1 yet, so this demo
 ; uses a fixed set of pre-defined keyword keys for clarity.
-; Real apps with dynamic ids will use the first-class string
-; key support that arrives with broader string Value plumbing.
+; Real apps with dynamic ids can use the first-class string
+; keys that landed in Phase 5.2a (db/ref + db/open both accept
+; string paths/keys now).
 
-(def conn (db/open :todos.edb))
+; tmp/ is gitignored; running this demo from the repo root
+; lands data files out of the way.
+(def conn (db/open "tmp/todos.edb"))
 
 (defn todo-ref [k]
   (db/ref conn :todos k))

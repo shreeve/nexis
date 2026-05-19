@@ -12,6 +12,14 @@ notes.txt
 # `zig build bench -- --out bench/baseline.json`.
 bench/*.json
 
-# Phase 4: emdb data files (created during testing)
+# Phase 4: emdb data files (created during testing).
+# Examples that use relative paths now write to `tmp/`
+# (see `examples/todo-app.nx`, `examples/durable-refs.nx`); the
+# bare patterns below catch any stragglers from REPL sessions or
+# ad-hoc commands run from the repo root. `tmp/.gitkeep` keeps
+# the directory present at clone time (emdb doesn't auto-create
+# parent dirs); everything else inside `tmp/` is local-only.
 *.edb
 *.edb-lock
+tmp/*
+!tmp/.gitkeep
