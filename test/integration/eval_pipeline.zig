@@ -1871,6 +1871,96 @@ test "phase5.2c slurp / spit: empty path is :invalid-path" {
     try expectOutput("(try (spit \"\" \"x\") (catch any e e))", ":invalid-path");
 }
 
+// =============================================================================
+// Phase 5 Item 4 — case / condp macros (peer-AI turn 83)
+// =============================================================================
+//
+// `for` ships in a follow-up commit per turn 83's split rec.
+// `case` + `condp` are pure expansion + single-eval gensym
+// patterns; both throw `:no-matching-clause` when no clause
+// matches and no default is supplied (peer-AI turn 83 §D1/§D2
+// OVERRIDE — returning nil silently masks bugs).
+
+test "phase5.4 case: basic match + default" {
+    try expectOutput("(case 1 1 :one 2 :two :default)", ":one");
+    try expectOutput("(case 2 1 :one 2 :two :default)", ":two");
+    try expectOutput("(case 99 1 :one 2 :two :default)", ":default");
+    try expectOutput("(case 1 1 :one)", ":one");
+    // Odd terminal arg = default; no clauses → default.
+    try expectOutput("(case :anything :default)", ":default");
+}
+
+test "phase5.4 case: no match without default throws :no-matching-clause" {
+    try expectOutput(
+        \\(try (case 99 1 :one 2 :two) (catch any e e))
+    , ":no-matching-clause");
+    // Even count = no default; still throws.
+    try expectOutput(
+        \\(try (case 5 1 :one) (catch any e e))
+    , ":no-matching-clause");
+}
+
+test "phase5.4 case: heterogeneous keys + nested expressions" {
+    // Keywords, integers, strings all compare via `=`.
+    try expectOutput(
+        \\(case :hi 1 :one :hi :greet :default)
+    , ":greet");
+    try expectOutput(
+        \\(case "x" 1 :one "x" :str-match :default)
+    , ":str-match");
+    // The result expr is fully evaluated (not just a literal).
+    try expectOutput(
+        \\(let [base 100]
+        \\  (case 2 1 (+ base 1) 2 (+ base 2) :nope))
+    , "102");
+}
+
+test "phase5.4 case: expression evaluated EXACTLY ONCE" {
+    // Use an atom-mutating step fn to count evaluations.
+    try expectOutput(
+        \\(let [counter (atom 0)
+        \\      step    (fn [] (swap! counter inc) @counter)]
+        \\  (case (step) 1 :one :other)
+        \\  @counter)
+    , "1");
+}
+
+test "phase5.4 condp: predicate + default" {
+    try expectOutput("(condp = 1 1 :one 2 :two :default)", ":one");
+    try expectOutput("(condp = 2 1 :one 2 :two :default)", ":two");
+    try expectOutput("(condp = 99 1 :one 2 :two :default)", ":default");
+    // Single trailing default with no clauses.
+    try expectOutput("(condp = 99 :default)", ":default");
+}
+
+test "phase5.4 condp: no match without default throws :no-matching-clause" {
+    try expectOutput(
+        \\(try (condp = 99 1 :one 2 :two) (catch any e e))
+    , ":no-matching-clause");
+}
+
+test "phase5.4 condp: predicate is called as (pred clause expr)" {
+    // `(condp < 5 ...)` invokes `(< clause 5)` per clause.
+    // `(< 3 5)` is true → `:gt3`. `(< 10 5)` is false.
+    try expectOutput(
+        \\(condp < 5 3 :gt3 10 :gt10 :default)
+    , ":gt3");
+    try expectOutput(
+        \\(condp < 5 10 :gt10 3 :gt3 :default)
+    , ":gt3");
+}
+
+test "phase5.4 condp: pred + expr each evaluated EXACTLY ONCE" {
+    try expectOutput(
+        \\(let [p-count (atom 0)
+        \\      e-count (atom 0)
+        \\      p (fn [a b] (swap! p-count inc) (= a b))
+        \\      e (fn []   (swap! e-count inc) 42)]
+        \\  (condp p (e) 1 :one 42 :match :default)
+        \\  [@p-count @e-count])
+    , "[2 1]");
+}
+
 test "phase5.2b end-to-end: case + trim + split + join chain" {
     // Composite test pinning that the six fns interop cleanly.
     try expectOutput(

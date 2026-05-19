@@ -2580,6 +2580,164 @@ fn expandCond(
     return current;
 }
 
+// ---- case ----------------------------------------------------
+//
+//   (case expr)                  => (throw :no-matching-clause)
+//   (case expr default)          => (let* [g# expr] default)
+//   (case expr k1 v1 k2 v2 ...)  => chained `(if (= g# k_i) v_i ...)`
+//                                   with a `(throw :no-matching-clause)`
+//                                   default if the clause count is even
+//                                   (i.e., no trailing default supplied).
+//   (case expr k1 v1 ... default) => same, with `default` as the
+//                                    terminal else branch when the
+//                                    clause count is odd.
+//
+// Peer-AI turn 83 §D1 OVERRIDE: no-match with no default THROWS
+// `:no-matching-clause`, not returns nil. Forces users to be
+// explicit about exhaustion. Mirrors Clojure semantics modulo
+// the perf shape (Clojure uses hash dispatch; we chain `if` until
+// Phase 6).
+//
+// `expr` is evaluated EXACTLY ONCE via gensym (turn 74 §4 trap).
+
+fn expandCase(
+    ctx: *ExpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) ExpandError!*Form {
+    if (args.len == 0) return ExpandError.MalformedMacroCall;
+    const expr_form = args[0];
+    const clauses = args[1..];
+
+    // Terminal default branch: `:no-matching-clause` throw OR the
+    // odd-arity terminal form.
+    const has_default = (clauses.len % 2 == 1);
+    var terminal: *Form = if (has_default)
+        @constCast(clauses[clauses.len - 1])
+    else
+        try makeThrow(ctx, "no-matching-clause", call_form.origin);
+
+    // gensym the test expression so it's evaluated exactly once.
+    const g_name = try ctx.gensym("case");
+
+    // Walk pairs right-to-left, wrapping in `(if (= g k) v rest)`.
+    const pair_count = clauses.len / 2;
+    var i: usize = pair_count;
+    while (i > 0) {
+        i -= 1;
+        const key = clauses[i * 2];
+        const value = clauses[i * 2 + 1];
+
+        const eq_items = try ctx.allocator.alloc(*Form, 3);
+        eq_items[0] = try makeSymbol(ctx, "=", call_form.origin);
+        eq_items[1] = try makeSymbol(ctx, g_name, call_form.origin);
+        eq_items[2] = @constCast(key);
+        const eq_form = try makeList(ctx, eq_items, call_form.origin);
+
+        const if_items = try ctx.allocator.alloc(*Form, 4);
+        if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
+        if_items[1] = eq_form;
+        if_items[2] = @constCast(value);
+        if_items[3] = terminal;
+        terminal = try makeList(ctx, if_items, call_form.origin);
+    }
+
+    // Wrap in (let* [g# expr] <chained-if>).
+    const binding_items = try ctx.allocator.alloc(*Form, 2);
+    binding_items[0] = try makeSymbol(ctx, g_name, call_form.origin);
+    binding_items[1] = @constCast(expr_form);
+    const binding_vec = try makeVector(ctx, binding_items, call_form.origin);
+
+    const let_items = try ctx.allocator.alloc(*Form, 3);
+    let_items[0] = try makeSymbol(ctx, "let*", call_form.origin);
+    let_items[1] = binding_vec;
+    let_items[2] = terminal;
+    return try makeList(ctx, let_items, call_form.origin);
+}
+
+// ---- condp ---------------------------------------------------
+//
+//   (condp pred expr)                       => (throw :no-matching-clause)
+//   (condp pred expr default)               => default
+//   (condp pred expr c1 v1 c2 v2 ...)       => chained `(if (p# c_i e#) v_i ...)`
+//                                              with `:no-matching-clause` throw
+//                                              when the clause count is even.
+//   (condp pred expr c1 v1 ... default)     => terminal default.
+//
+// Peer-AI turn 83 §D2 OVERRIDE: same throw-on-no-match policy as
+// case. `pred` and `expr` each evaluated exactly ONCE via gensyms.
+// Predicate call order: `(p# clause expr)` (matches Clojure).
+// No `:>>` thread-result-through-fn syntax in v1.
+
+fn expandCondp(
+    ctx: *ExpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) ExpandError!*Form {
+    if (args.len < 2) return ExpandError.MalformedMacroCall;
+    const pred_form = args[0];
+    const expr_form = args[1];
+    const clauses = args[2..];
+
+    const has_default = (clauses.len % 2 == 1);
+    var terminal: *Form = if (has_default)
+        @constCast(clauses[clauses.len - 1])
+    else
+        try makeThrow(ctx, "no-matching-clause", call_form.origin);
+
+    const p_name = try ctx.gensym("condp-pred");
+    const e_name = try ctx.gensym("condp-expr");
+
+    const pair_count = clauses.len / 2;
+    var i: usize = pair_count;
+    while (i > 0) {
+        i -= 1;
+        const clause = clauses[i * 2];
+        const value = clauses[i * 2 + 1];
+
+        const call_items = try ctx.allocator.alloc(*Form, 3);
+        call_items[0] = try makeSymbol(ctx, p_name, call_form.origin);
+        call_items[1] = @constCast(clause);
+        call_items[2] = try makeSymbol(ctx, e_name, call_form.origin);
+        const call = try makeList(ctx, call_items, call_form.origin);
+
+        const if_items = try ctx.allocator.alloc(*Form, 4);
+        if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
+        if_items[1] = call;
+        if_items[2] = @constCast(value);
+        if_items[3] = terminal;
+        terminal = try makeList(ctx, if_items, call_form.origin);
+    }
+
+    // Wrap in (let* [p# pred e# expr] <chained-if>).
+    const binding_items = try ctx.allocator.alloc(*Form, 4);
+    binding_items[0] = try makeSymbol(ctx, p_name, call_form.origin);
+    binding_items[1] = @constCast(pred_form);
+    binding_items[2] = try makeSymbol(ctx, e_name, call_form.origin);
+    binding_items[3] = @constCast(expr_form);
+    const binding_vec = try makeVector(ctx, binding_items, call_form.origin);
+
+    const let_items = try ctx.allocator.alloc(*Form, 3);
+    let_items[0] = try makeSymbol(ctx, "let*", call_form.origin);
+    let_items[1] = binding_vec;
+    let_items[2] = terminal;
+    return try makeList(ctx, let_items, call_form.origin);
+}
+
+/// Helper: build `(throw :KEYWORD)` for the no-matching-clause
+/// fallthrough used by `case` and `condp`.
+fn makeThrow(ctx: *ExpandContext, kw_name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    const items = try ctx.allocator.alloc(*Form, 2);
+    items[0] = try makeSymbol(ctx, "throw", origin);
+    const kw_form = try ctx.allocator.create(Form);
+    kw_form.* = .{
+        .datum = .{ .keyword = .{ .ns = null, .name = kw_name } },
+        .origin = origin,
+    };
+    items[1] = kw_form;
+    return try makeList(ctx, items, origin);
+}
+
 // ---- ->  /  ->>  (threading macros) --------------------------
 //
 //   (-> x)             => x
@@ -2903,6 +3061,9 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     try table.put(allocator, "cond", expandCond);
     try table.put(allocator, "->", expandThreadFirst);
     try table.put(allocator, "->>", expandThreadLast);
+    // Phase 5 Item 4 (peer-AI turn 83): case + condp.
+    try table.put(allocator, "case", expandCase);
+    try table.put(allocator, "condp", expandCondp);
     return table;
 }
 
