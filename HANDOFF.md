@@ -1,10 +1,60 @@
 # nexis Phase 5 — Handoff Prompt (write this to the next AI as your first message)
 
+> **How to use this file**: copy everything between the opening
+> and closing ``` fences below and paste it as the FIRST message
+> to a new AI session. The post-fence "handoff mechanics" notes
+> at the bottom are for the HUMAN handing off, not for the
+> incoming AI.
+
 ```
 You are taking over work on the nexis project — a modern, Zig-native Lisp
 inspired by Clojure, built for persistent data, durable identity, and
 world-class performance. Multi-phase implementation driven by PLAN.md at
 the repository root.
+
+============================================================
+ENVIRONMENT PREREQUISITES — verify before doing anything
+============================================================
+
+This handoff assumes you have FOUR environmental capabilities.
+If ANY is missing, surface that to the human IMMEDIATELY
+before attempting work — you'll fail in confusing ways
+otherwise.
+
+1. **Agentic file + shell tools.** You can read files
+   (Read/Glob/Grep), run shell commands (Shell), edit files
+   (StrReplace/Write), and check lint diagnostics. You're in
+   Cursor or an equivalent environment. If you only have
+   chat-text capabilities, this handoff is unusable as-is —
+   tell the human you can't proceed.
+
+2. **The nexis repo cloned and accessible.** The HANDOFF
+   references paths like `/Users/shreeve/Data/Code/nexis/` and
+   `/Users/shreeve/Data/Code/emdb/` (sibling dependency). On
+   YOUR machine these paths will almost certainly differ.
+   Substitute the actual paths from `git rev-parse --show-toplevel`
+   on the nexis repo. Treat every absolute path in this
+   document as illustrative; the relative layout (src/,
+   docs/, examples/, test/, build.zig, PLAN.md at root) is
+   what's stable.
+
+3. **`user-ai` MCP server configured** for peer-AI access.
+   Strategy turns are routed through this. The conversation
+   id `nexis-phase-1` carries ~74 turns of architectural
+   context across Phases 0-4 — every design decision, every
+   bug peer-AI caught, every spec amendment. Resuming that
+   conversation INHERITS all of it. If the MCP isn't
+   configured, you can still work but you'll lose enormous
+   accumulated context; flag this to the human first.
+
+4. **The sibling emdb repo** at `../emdb/` (sibling to nexis)
+   — the storage engine nexis links against. Build will fail
+   without it. Check `git status` in `../emdb/` to confirm
+   it's present. Path is hardcoded in `build.zig`.
+
+If all four are present: proceed.
+
+============================================================
 
 ============================================================
 PHASES 0–4 ALL COMPLETE. Currently in Phase 5 (Clojure
@@ -154,19 +204,22 @@ Read this entire prompt before touching anything.
 
 **Two build steps; use the right one for the right loop.**
 
+**All paths below assume `cd` to the nexis repo root first.
+Substitute YOUR actual path for `/path/to/nexis/`.**
+
 For **inner-loop iteration** (~3 seconds):
 ```
-cd /Users/shreeve/Data/Code/nexis
+cd /path/to/nexis
 zig build phase2-test
 ```
 Runs vm + compile + expand + stdlib + loader + integration +
-property tests. Expected at HEAD `8189bf8`:
+property tests. Expected at HEAD `f5bc4f8`:
   95 vm + 322 compile + 6 macro-prop + 2 stdlib + 1 loader +
   4 closure-prop + 133 integration = **563 tests pass**.
 
 For **pre-commit validation** (~3 minutes, ~1 GB peak):
 ```
-cd /Users/shreeve/Data/Code/nexis
+cd /path/to/nexis
 zig build test --summary all
 ```
 Runs the full Phase 0/1/2 suite + randomized property tests.
@@ -177,10 +230,13 @@ gate (~100k ops, can OOM-kill on memory-constrained systems
 For **end-to-end smoke** (verify Phase 4 actually persists):
 ```
 cd /tmp && rm -f todos.edb
-/path/to/bin/nexis run /path/to/examples/todo-app.nx
-/path/to/bin/nexis run /path/to/examples/todo-app.nx
+/path/to/nexis/bin/nexis run /path/to/nexis/examples/todo-app.nx
+/path/to/nexis/bin/nexis run /path/to/nexis/examples/todo-app.nx
 ```
-Second run should show `:completed 1` — state PERSISTS.
+Second run should show `:completed 1` — state PERSISTS across
+processes. If you don't see persisted state, the Phase 4
+durable substrate is broken; do not proceed with Phase 5 until
+that's resolved.
 
 If anything is red, STOP and diagnose before editing.
 
@@ -1478,10 +1534,35 @@ all designed in §10.
 
 ---
 
-A few notes about the handoff mechanics:
+A few notes about the handoff mechanics (FOR THE HUMAN
+handing off, NOT for the incoming AI — these aren't part of
+the prompt above):
 
-- **Conversation thread**: `conversation_id: "nexis-phase-1"` is now ~35 turns and ~14 sessions deep. Peer AI will remember everything we've discussed, including specific corrections it has made (turn 33's KindMismatch alignment, turn 34's three closure bugs, turn 35's 15 drifts). This is enormous accumulated context — preserving it is high-leverage.
-- **Test count**: `563 phase2 + 86 reader/golden = 649 fast suite` is the ground truth for "clean starting state" at HEAD `8189bf8`.
-- **Conversation thread**: `conversation_id: "nexis-phase-1"` is now ~74 turns deep. Peer AI has full context on every architectural decision from Phases 0-4, including the Phase 5 design pins for atoms/strings/protocols (turn 74). Don't make peer re-derive what it already pinned.
-- **Spec convergence**: COMPILER.md and VM.md are now the load-bearing contracts for steps #3-#11. The amendment logs in each cite the peer-AI turn that drove each change.
-- **Hand-trace discipline**: two hand-traces this session caught spec holes that would have manifested as bugs in step #5. Recommend the next AI do at least one before any non-trivial step (probably step #5 itself, since closures are the most novel design surface).
+- **Conversation thread**: `conversation_id: "nexis-phase-1"`
+  on the `user-ai` MCP is now ~74 turns deep. Peer AI has
+  full context on every architectural decision from Phases
+  0-4, including the Phase 5 design pins for atoms / strings
+  / protocols (turn 74). When the new AI resumes this
+  conversation, it inherits all of that history. Don't make
+  peer re-derive what it already pinned.
+
+- **Test count baseline**: `563 phase2 + 86 reader/golden =
+  649 fast suite` is the ground truth for "clean starting
+  state" at HEAD `f5bc4f8`. If the new AI reports a
+  different count, something is off — investigate before
+  proceeding.
+
+- **Spec convergence**: COMPILER.md, VM.md, MACROEXPAND.md,
+  DB.md are the load-bearing contracts. Each has an
+  amendment log citing the peer-AI turn that drove every
+  change since Phase 1. New work follows the same
+  spec-amendment-then-code discipline.
+
+- **Hand-trace discipline**: substantial design choices land
+  via hand-trace before code. Examples that worked: Phase 2
+  closure design (turn 34 caught three bugs), Phase 3.2
+  defmacro arena reclamation bug (turn 66 design + caught at
+  integration), Phase 4.0b tx-handle single-owner enforcement.
+  The new AI should hand-trace Item 3 (protocols + records)
+  before writing any code — it's the most architecturally
+  novel of the Phase 5 items.
