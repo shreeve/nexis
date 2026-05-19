@@ -2331,6 +2331,104 @@ test "phase5.3d extend-protocol with bogus type-kw: :invalid-argument" {
     , ":invalid-argument");
 }
 
+// =============================================================================
+// Phase 5 Item 5 — broader core.nx stdlib (peer-AI turn 74 §10.5)
+// =============================================================================
+
+test "phase5.5 core.nx: constantly / complement / partial / comp" {
+    try expectOutputProgram(
+        \\((constantly 42))
+    , "42");
+    try expectOutputProgram(
+        \\((complement even?) 3)
+    , "true");
+    try expectOutputProgram(
+        \\((partial + 10) 5)
+    , "15");
+    try expectOutputProgram(
+        \\((comp inc inc) 1)
+    , "3");
+    // (comp) → identity; identity itself is a native fn.
+    try expectOutputProgram(
+        \\((comp identity inc) 5)
+    , "6");
+}
+
+test "phase5.5 core.nx: every? truthy + falsy cases" {
+    try expectOutputProgram(
+        \\(every? pos? [1 2 3])
+    , "true");
+    try expectOutputProgram(
+        \\(every? pos? [1 -2 3])
+    , "false");
+}
+
+test "phase5.5 core.nx: every? empty seq is vacuously true" {
+    try expectOutputProgram(
+        \\(every? pos? [])
+    , "true");
+}
+
+test "phase5.5 core.nx: not-every?" {
+    try expectOutputProgram(
+        \\(not-every? pos? [1 -2 3])
+    , "true");
+    try expectOutputProgram(
+        \\(not-every? pos? [1 2 3])
+    , "false");
+}
+
+test "phase5.5 core.nx: some + not-any?" {
+    try expectOutputProgram(
+        \\(some even? [1 3 5])
+    , "nil");
+    try expectOutputProgram(
+        \\(some even? [1 4 5])
+    , "true");
+    try expectOutputProgram(
+        \\(not-any? neg? [1 2 3])
+    , "true");
+    try expectOutputProgram(
+        \\(not-any? neg? [1 -2 3])
+    , "false");
+}
+
+test "phase5.5 core.nx: merge / update / get-in / assoc-in / update-in" {
+    try expectOutputProgram(
+        \\(merge {:a 1} {:b 2} {:a 99})
+    , "{:a 99, :b 2}");
+    try expectOutputProgram(
+        \\(update {:x 5} :x inc)
+    , "{:x 6}");
+    try expectOutputProgram(
+        \\(get-in {:a {:b {:c 42}}} [:a :b :c])
+    , "42");
+    try expectOutputProgram(
+        \\(get-in {:a {:b 1}} [:a :missing])
+    , "nil");
+    try expectOutputProgram(
+        \\(assoc-in {:a {:b 1}} [:a :b] 99)
+    , "{:a {:b 99}}");
+    try expectOutputProgram(
+        \\(update-in {:a {:b 1}} [:a :b] inc)
+    , "{:a {:b 2}}");
+}
+
+test "phase5.5 core.nx: frequencies / group-by / interpose" {
+    try expectOutputProgram(
+        \\(get (frequencies [:a :b :a :c :a :b]) :a)
+    , "3");
+    try expectOutputProgram(
+        \\(get (group-by even? [1 2 3 4 5 6]) true)
+    , "[2 4 6]");
+    try expectOutputProgram(
+        \\(interpose :- [1 2 3])
+    , "(1 :- 2 :- 3)");
+    try expectOutputProgram(
+        \\(interpose :- [])
+    , "()");
+}
+
 test "phase5.3b defprotocol: protocol-fn passes through map-as-key" {
     // protocol_fn values are identity-valued; storing two distinct
     // calls to defprotocol-emitted protocol_fn under the same key

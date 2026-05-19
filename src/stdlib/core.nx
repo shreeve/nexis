@@ -159,3 +159,148 @@
        (catch any e#
          (db/release-snapshot! ~(first binding))
          (throw e#)))))
+
+; ============================================================
+; Phase 5 Item 5 — stdlib breadth (peer-AI turn 74 §10.5)
+; ============================================================
+;
+; All user-land. Each defn builds on existing primitives —
+; reduce + loop* + cons + assoc + apply. No new runtime
+; surface. These are the Clojure-canonical helpers that
+; real programs reach for first.
+;
+; Where Clojure ships short-circuiting via `reduced`, we use
+; `loop*` instead — nexis v1 doesn't have `reduced` yet, so
+; `every?` / `some` / etc. iterate with explicit termination.
+
+; ---- function composition helpers ----
+
+; (constantly x) → fn taking any args, always returns x.
+(defn constantly [x]
+  (fn* [& _] x))
+
+; (complement f) → fn returning the logical-not of f.
+(defn complement [f]
+  (fn* [& args] (not (apply f args))))
+
+; (partial f & args) → fn taking more args, prepending the
+; closed-over `args`. Single-arity captures matching Clojure
+; behavior; for multi-arity callees the caller supplies the
+; rest.
+(defn partial [f & bound]
+  (fn* [& more] (apply f (apply list (concat-lists bound more)))))
+
+; tiny helper for partial (private; not exported by intent).
+(defn concat-lists [a b]
+  ; (a) is a list; (b) is a list. Walk a back-to-front via
+  ; reverse so we can cons each item onto b.
+  (reduce (fn* [acc x] (cons x acc)) b (reverse a)))
+
+; (comp & fns) → fn that applies the rightmost fn to args,
+; then walks left passing single results. (comp) → identity.
+; (comp f) → f. Matches Clojure's right-to-left composition.
+(defn comp [& fns]
+  (if (empty? fns)
+    identity
+    (let* [reversed (reverse fns)
+           first-fn (first reversed)
+           rest-fns (rest reversed)]
+      (fn* [& args]
+        (reduce (fn* [acc f] (f acc))
+                (apply first-fn args)
+                rest-fns)))))
+
+; ---- short-circuiting predicates over sequences ----
+
+; (every? pred coll) → true iff pred is truthy for every elt.
+; Empty coll → true (vacuous). Stops on first falsy result.
+(defn every? [pred coll]
+  (loop* [s coll]
+    (if (empty? s)
+      true
+      (if (pred (first s))
+        (recur (rest s))
+        false))))
+
+; (not-every? pred coll) → true iff pred is falsy for at
+; least one elt. (Inverse of every?.)
+(defn not-every? [pred coll]
+  (not (every? pred coll)))
+
+; (some pred coll) → first truthy (pred x) result, or nil.
+(defn some [pred coll]
+  (loop* [s coll]
+    (if (empty? s)
+      nil
+      (let* [r (pred (first s))]
+        (if r r (recur (rest s)))))))
+
+; (not-any? pred coll) → true iff pred is falsy for all elts.
+(defn not-any? [pred coll]
+  (if (some pred coll) false true))
+
+; ---- collection extras ----
+
+; (merge & maps) → left-to-right map merge. Later keys win.
+; (merge) → nil. (merge m) → m. Nil maps treated as empty.
+(defn merge [& maps]
+  (reduce (fn* [acc m]
+            (if (nil? m)
+              acc
+              (reduce (fn* [a k] (assoc a k (get m k)))
+                      acc
+                      (keys m))))
+          nil
+          maps))
+
+; (update m k f & args) → assoc m with k → (apply f (get m k) args).
+(defn update [m k f & args]
+  (assoc m k (apply f (cons (get m k) args))))
+
+; (get-in m [k1 k2 ...]) → nested lookup. nil if any step
+; misses. (get-in m ks default) → default on miss.
+(defn get-in [m ks]
+  (reduce (fn* [acc k] (if (nil? acc) nil (get acc k)))
+          m
+          ks))
+
+; (assoc-in m [k1 k2 ...] v) → m with the nested path set to v.
+(defn assoc-in [m ks v]
+  (if (empty? (rest ks))
+    (assoc m (first ks) v)
+    (assoc m
+           (first ks)
+           (assoc-in (get m (first ks)) (rest ks) v))))
+
+; (update-in m [k1 k2 ...] f & args) → assoc-in over the
+; result of applying f to the current value.
+(defn update-in [m ks f & args]
+  (assoc-in m ks (apply f (cons (get-in m ks) args))))
+
+; ---- sequence breakdown helpers ----
+
+; (frequencies coll) → map counting occurrences of each elt.
+(defn frequencies [coll]
+  (reduce (fn* [acc x] (assoc acc x (inc (get acc x 0))))
+          {}
+          coll))
+
+; (group-by f coll) → map from (f x) to vector of matching xs.
+; Order within each bucket is left-to-right.
+(defn group-by [f coll]
+  (reduce (fn* [acc x]
+            (let* [k (f x)
+                   bucket (get acc k [])]
+              (assoc acc k (conj bucket x))))
+          {}
+          coll))
+
+; (interpose sep coll) → coll with sep between each pair of
+; adjacent elements. Returns a list.
+(defn interpose [sep coll]
+  (if (empty? coll)
+    (list)
+    (loop* [s (rest coll) acc (list (first coll))]
+      (if (empty? s)
+        (reverse acc)
+        (recur (rest s) (cons (first s) (cons sep acc)))))))
