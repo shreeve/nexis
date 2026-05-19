@@ -2041,8 +2041,15 @@ transaction threading). No ambient tx via dynamic Var in v1.
 - [x] **Phase 4.0e** `examples/todo-app.nx` — Phase 4 EXIT
       DEMO. Persistent to-do tracker exercising the entire
       Phase 4 surface. Verified: state persists across runs.
-- [ ] **Phase 4.0f** (stretch) Snapshots + `db/as-of` per
-      PLAN.md §15.7.
+- [x] **Phase 4.0f** Snapshot vocabulary (PLAN.md §15.7 aliases):
+      `db/snapshot` + `db/release-snapshot!` + `db/snapshot?` +
+      `(with-snapshot [snap conn] ...)` macro. emdb's MVCC read
+      transactions already ARE pinned snapshots; this commit
+      ships the user-facing naming. Verified: snap-N captured
+      before subsequent writes still reads the historical state
+      after those writes commit. The `db/as-of` ambient-db-value
+      abstraction (Datomic-style) is deferred until concrete
+      need — substrate is sufficient for explicit-snapshot use.
 
 **Exit**: Phase 4 gate; a small application (e.g. a to-do tracker with persistent state) works end-to-end.
 

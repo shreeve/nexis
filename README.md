@@ -55,7 +55,7 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Phase 4.0c | ✅ shipped | `@deref` operator + `db/deref` (universal: ref/var/else) + `db/alter!` read-modify-write |
 | Phase 4.0d | ✅ shipped | `db/scan` (eager, ordered, range-bounded) + `db/reduce-tree` (server-side reduce) |
 | **Phase 4.0e** | ✅ **shipped** | **EXIT DEMO** — `examples/todo-app.nx`. Persistent to-do tracker. State PERSISTS across `nexis run` invocations. |
-| Phase 4.0f | pending (stretch) | Snapshots + `db/as-of` for historical reads |
+| Phase 4.0f | ✅ shipped | Snapshot vocabulary (`db/snapshot` / `db/release-snapshot!` / `db/snapshot?` / `(with-snapshot ...)`). Time-travel reads through pinned MVCC snapshots. |
 
 **558 tests** green: 95 VM + 313 compile + 6 macroexpand + 4
 property + 54 integration in `phase2-test` (~3s), plus 86 reader
@@ -248,6 +248,13 @@ Every snippet runs via `bin/nexis`. Run the file or paste into the REPL:
     0))                              ;; => sum of all :age fields
 
 (db/close conn)
+
+;; snapshots — time-travel reads (Phase 4.0f)
+(def snap-0 (db/snapshot conn))
+(with-tx [tx conn] (db/put! tx alice {:age 999}))
+(db/get snap-0 alice)               ;; => {:age 31} — historical state!
+@alice                              ;; => {:age 999} — current
+(db/release-snapshot! snap-0)
 
 ;; Phase 4 EXIT DEMO: examples/todo-app.nx — persistent
 ;; to-do tracker. Run twice to verify state persists.

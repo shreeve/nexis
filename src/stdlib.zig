@@ -110,6 +110,10 @@ const db_fns = [_]CoreEntry{
     // 4.0d
     .{ .name = "scan", .descriptor = &native_db_scan },
     .{ .name = "reduce-tree", .descriptor = &native_db_reduce_tree },
+    // 4.0f snapshot aliases (PLAN.md §15.7 vocabulary).
+    .{ .name = "snapshot", .descriptor = &native_db_snapshot },
+    .{ .name = "release-snapshot!", .descriptor = &native_db_release_snapshot },
+    .{ .name = "snapshot?", .descriptor = &native_db_snapshot_q },
 };
 
 /// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
@@ -312,6 +316,13 @@ const native_db_alter = NativeFn{ .name = "db/alter!", .min_arity = 3, .max_arit
 // Phase 4.0d — scan + reduce-tree.
 const native_db_scan = NativeFn{ .name = "db/scan", .min_arity = 2, .max_arity = 4, .call = &fnDbScan };
 const native_db_reduce_tree = NativeFn{ .name = "db/reduce-tree", .min_arity = 4, .max_arity = 4, .call = &fnDbReduceTree };
+// Phase 4.0f — snapshot aliases. emdb read transactions ARE
+// snapshots (pinned to the commit generation at begin time).
+// These names give users PLAN.md §15.7 vocabulary without
+// duplicating the underlying mechanism.
+const native_db_snapshot = NativeFn{ .name = "db/snapshot", .min_arity = 1, .max_arity = 1, .call = &fnDbBeginRead };
+const native_db_release_snapshot = NativeFn{ .name = "db/release-snapshot!", .min_arity = 1, .max_arity = 1, .call = &fnDbAbortRead };
+const native_db_snapshot_q = NativeFn{ .name = "db/snapshot?", .min_arity = 1, .max_arity = 1, .call = &fnDbSnapshotQ };
 
 // =============================================================================
 // Implementations
@@ -1468,6 +1479,16 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     }
 
     return vector_mod.fromSlice(vm.ensureHeap(), entries.items) catch VmError.OutOfMemory;
+}
+
+/// Phase 4.0f: predicate for snapshot Values. True if `x` is a
+/// read-tx handle that hasn't yet been released. Released
+/// snapshots return false (mirrors Var.bound semantics).
+fn fnDbSnapshotQ(_: *VM, args: []const Value) VmError!Value {
+    const v = args[0];
+    if (v.kind() != .db_read_txn) return value_mod.fromBool(false);
+    const h = readTxnHandle(v).?;
+    return value_mod.fromBool(h.active);
 }
 
 fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {

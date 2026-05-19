@@ -128,3 +128,34 @@
        (catch any e#
          (db/abort-read! ~(first binding))
          (throw e#)))))
+
+; Phase 4.0f — snapshot vocabulary (PLAN.md §15.7).
+;
+; A snapshot is an emdb read transaction pinned to the commit
+; generation that was current when it began. As long as the
+; snapshot is alive, all reads through it see EXACTLY that
+; state regardless of subsequent writes.
+;
+; `(with-snapshot [snap conn] body...)` opens a snapshot,
+; runs body, releases on exit. Identical semantics to
+; `with-read-tx`; different name matches the user-facing
+; "I'm pinning to a point in time" mental model.
+;
+; To pin a snapshot past block scope: call `(db/snapshot conn)`
+; directly and `(db/release-snapshot! snap)` when done. The
+; snapshot is an ordinary Value — pass it to functions, store
+; it, compare it for identity.
+;
+; Caveat (per PLAN.md §15.7): long-held snapshots prevent emdb
+; from reclaiming pages they reference. Don't pin snapshots
+; you don't intend to release.
+
+(defmacro with-snapshot [binding & body]
+  `(let* [~(first binding) (db/snapshot ~(first (rest binding)))]
+     (try
+       (let* [r# (do ~@body)]
+         (db/release-snapshot! ~(first binding))
+         r#)
+       (catch any e#
+         (db/release-snapshot! ~(first binding))
+         (throw e#)))))
