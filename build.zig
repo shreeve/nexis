@@ -345,6 +345,8 @@ pub fn build(b: *std.Build) void {
     // Phase 4.0a: stdlib's db primitives need db + codec.
     stdlib_mod.addImport("db", db_mod);
     stdlib_mod.addImport("codec", codec_mod);
+    // Phase 4.0d: db/scan + db/reduce-tree need emdb cursors.
+    stdlib_mod.addImport("emdb", emdb_mod);
 
     // -------------------------------------------------------------------------
     // Phase 0: reader unit tests (src/reader.zig has its own test { ... }
@@ -448,7 +450,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch" } },
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch" } },
-        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap" } },
+        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
     };
 
@@ -484,6 +486,7 @@ pub fn build(b: *std.Build) void {
                 else if (std.mem.eql(u8, imp_name, "dispatch")) siblings.dispatch
                 else if (std.mem.eql(u8, imp_name, "stdlib")) siblings.stdlib
                 else if (std.mem.eql(u8, imp_name, "loader")) siblings.loader
+                else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb
                 else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
         }

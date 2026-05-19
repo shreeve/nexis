@@ -41,6 +41,7 @@ const db_mod = @import("db");
 const codec_mod = @import("codec");
 const heap_mod = @import("heap");
 const dispatch_mod_alias = @import("dispatch");
+const emdb_mod = @import("emdb");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -106,6 +107,9 @@ const db_fns = [_]CoreEntry{
     // 4.0c
     .{ .name = "deref", .descriptor = &native_db_deref },
     .{ .name = "alter!", .descriptor = &native_db_alter },
+    // 4.0d
+    .{ .name = "scan", .descriptor = &native_db_scan },
+    .{ .name = "reduce-tree", .descriptor = &native_db_reduce_tree },
 };
 
 /// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
@@ -305,6 +309,9 @@ const native_db_delete = NativeFn{ .name = "db/delete!", .min_arity = 2, .max_ar
 // Phase 4.0c — deref + alter.
 const native_db_deref = NativeFn{ .name = "db/deref", .min_arity = 1, .max_arity = 1, .call = &fnDbDeref };
 const native_db_alter = NativeFn{ .name = "db/alter!", .min_arity = 3, .max_arity = null, .call = &fnDbAlter };
+// Phase 4.0d — scan + reduce-tree.
+const native_db_scan = NativeFn{ .name = "db/scan", .min_arity = 2, .max_arity = 4, .call = &fnDbScan };
+const native_db_reduce_tree = NativeFn{ .name = "db/reduce-tree", .min_arity = 4, .max_arity = 4, .call = &fnDbReduceTree };
 
 // =============================================================================
 // Implementations
@@ -1342,6 +1349,161 @@ fn fnDbDeref(_: *VM, args: []const Value) VmError!Value {
 /// Per peer-AI turn 73 §Q2: if `f` throws or control transfers,
 /// do NOT write. Connection mismatch on `ref` surfaces as
 /// :db-error via db.zig's assertRefMatchesConn.
+// =============================================================================
+// scan + reduce-tree (Phase 4.0d)
+// =============================================================================
+//
+// `(db/scan tx tree-keyword)` returns a vector of `[key value]`
+// 2-vectors in key-ordered iteration order.
+//
+// `(db/scan tx tree-keyword start-key)` — start-inclusive scan.
+// `(db/scan tx tree-keyword start-key end-key)` — start-inclusive,
+// end-exclusive (peer-AI turn 73 §Q5).
+//
+// `(db/reduce-tree tx tree-keyword f init)` — server-side-ish
+// reduction. Walks the whole tree applying `(f acc key value)`
+// to each entry. Returns final accumulator.
+//
+// v1 LIMITATIONS (peer-AI turn 73 §Q8 traps):
+//   - Keys are returned as keyword Values (interned from key
+//     bytes). Matches the v1.alpha key model where db/ref's key
+//     arg is a keyword/symbol. Arbitrary byte keys await
+//     first-class string support.
+//   - Values are FULLY DECODED + Heap-allocated per entry. The
+//     cursor advances safely because we decode BEFORE moving.
+//   - Eager vector (peer §Q4). Lazy seqs are a future polish.
+
+fn getTxnCursor(tx_v: Value, tree_name: []const u8) VmError!emdb_mod.Cursor {
+    const txn_inner: *emdb_mod.Txn = switch (tx_v.kind()) {
+        .db_write_txn => blk: {
+            const h = writeTxnHandle(tx_v).?;
+            if (!h.active) return VmError.TxClosed;
+            break :blk h.txn.inner;
+        },
+        .db_read_txn => blk: {
+            const h = readTxnHandle(tx_v).?;
+            if (!h.active) return VmError.TxClosed;
+            break :blk h.txn.inner;
+        },
+        else => return VmError.KindMismatch,
+    };
+    const tree_id = txn_inner.openTree(tree_name, false) catch return VmError.DbError;
+    return txn_inner.openCursorForTree(tree_id) catch VmError.DbError;
+}
+
+fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
+    const tx_v = args[0];
+    const tree_v = args[1];
+    if (tree_v.kind() != .keyword) return VmError.KindMismatch;
+    const interner = vm.ensureInterner();
+    const tree_id: u32 = @intCast(tree_v.payload);
+    const tree_name = interner.keywordName(tree_id);
+
+    // Optional range bounds. Keys are keyword Values; extract
+    // their interned names as byte slices.
+    const start_bytes: ?[]const u8 = if (args.len >= 3) blk: {
+        const sv = args[2];
+        if (sv.kind() != .keyword and sv.kind() != .symbol) return VmError.KindMismatch;
+        const id: u32 = @intCast(sv.payload);
+        break :blk if (sv.kind() == .keyword) interner.keywordName(id) else interner.symbolName(id);
+    } else null;
+    const end_bytes: ?[]const u8 = if (args.len >= 4) blk: {
+        const ev = args[3];
+        if (ev.kind() != .keyword and ev.kind() != .symbol) return VmError.KindMismatch;
+        const id: u32 = @intCast(ev.payload);
+        break :blk if (ev.kind() == .keyword) interner.keywordName(id) else interner.symbolName(id);
+    } else null;
+
+    var cursor = getTxnCursor(tx_v, tree_name) catch |err| switch (err) {
+        // Tree-not-found via openTree → empty scan.
+        VmError.DbError => {
+            const heap = vm.ensureHeap();
+            return vector_mod.fromSlice(heap, &.{}) catch VmError.OutOfMemory;
+        },
+        else => return err,
+    };
+
+    var entries: std.ArrayList(Value) = .empty;
+    defer entries.deinit(vm.allocator);
+
+    // Position. If start_bytes given, advance to first key >= start.
+    var maybe_kv: ?@TypeOf(cursor).KeyValue = blk: {
+        if (start_bytes) |sb| {
+            // emdb's Cursor doesn't have a public `seek` exposed
+            // in our wrapper; we walk from `first` and skip
+            // entries < start. Fine for v1 (small datasets).
+            // O(n) worst case; replace with proper seek when
+            // emdb's seek API is exposed at this level.
+            var kv_opt = cursor.first();
+            while (kv_opt) |kv| {
+                if (std.mem.order(u8, kv.key, sb) != .lt) break;
+                kv_opt = cursor.next();
+            }
+            break :blk kv_opt;
+        }
+        break :blk cursor.first();
+    };
+
+    while (maybe_kv) |kv| {
+        // End-exclusive check.
+        if (end_bytes) |eb| {
+            if (std.mem.order(u8, kv.key, eb) != .lt) break;
+        }
+        // Decode value (Heap-owned) and intern key (interner-owned).
+        // Both are stable past the next cursor advance.
+        const decoded_v = codec_mod.decode(
+            vm.ensureHeap(),
+            interner,
+            kv.value,
+            &dispatch_mod_alias.hashValue,
+            &dispatch_mod_alias.equal,
+        ) catch return VmError.CodecFailed;
+        const key_id = interner.internKeyword(kv.key) catch return VmError.OutOfMemory;
+        const key_v = value_mod.fromKeywordId(key_id);
+        // Build [key value] 2-vector.
+        const pair = [_]Value{ key_v, decoded_v };
+        const pair_vec = vector_mod.fromSlice(vm.ensureHeap(), &pair) catch return VmError.OutOfMemory;
+        entries.append(vm.allocator, pair_vec) catch return VmError.OutOfMemory;
+        maybe_kv = cursor.next();
+    }
+
+    return vector_mod.fromSlice(vm.ensureHeap(), entries.items) catch VmError.OutOfMemory;
+}
+
+fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
+    const tx_v = args[0];
+    const tree_v = args[1];
+    const f = args[2];
+    var acc = args[3];
+    if (tree_v.kind() != .keyword) return VmError.KindMismatch;
+    const interner = vm.ensureInterner();
+    const tree_id: u32 = @intCast(tree_v.payload);
+    const tree_name = interner.keywordName(tree_id);
+
+    var cursor = getTxnCursor(tx_v, tree_name) catch |err| switch (err) {
+        VmError.DbError => return acc, // empty tree → init unchanged
+        else => return err,
+    };
+
+    var maybe_kv: ?@TypeOf(cursor).KeyValue = cursor.first();
+    while (maybe_kv) |kv| {
+        const decoded_v = codec_mod.decode(
+            vm.ensureHeap(),
+            interner,
+            kv.value,
+            &dispatch_mod_alias.hashValue,
+            &dispatch_mod_alias.equal,
+        ) catch return VmError.CodecFailed;
+        const key_id = interner.internKeyword(kv.key) catch return VmError.OutOfMemory;
+        const key_v = value_mod.fromKeywordId(key_id);
+        // (f acc key value) — peer-AI turn 73 §Q6 shape.
+        const call_args = [_]Value{ acc, key_v, decoded_v };
+        acc = try vm.callValue(f, &call_args);
+        maybe_kv = cursor.next();
+    }
+    return acc;
+}
+
 fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     const tx_v = args[0];
     const r = args[1];
