@@ -666,6 +666,21 @@ pub const NamespaceRegistry = struct {
     core: *Namespace = undefined,
     /// Where `def`/`defn`/`defmacro` install.
     current: *Namespace = undefined,
+    /// Phase 5.2a (peer-AI turns 77/78): heap reachable from
+    /// the compile.zig Form-lowering path via
+    /// `namespace.registry.heap`. Used by `LowerCtx.heap` to
+    /// allocate string-literal Values (Tiny.literal carriers).
+    /// `VM.ensureRegistry` populates this from `VM.ensureHeap()`.
+    /// Ad-hoc test harnesses that init a registry without a VM
+    /// can leave it null; `.string` Forms then defer as before.
+    ///
+    /// TODO(post-5.2): replace with an explicit `CompileContext`
+    /// (peer-AI turn 78 §R1) that bundles allocator + registry +
+    /// current namespace + interner + heap + loader + macros into
+    /// one struct, so compile entry points stop accreting
+    /// optional parameters. Today's registry-as-backchannel is a
+    /// staged shape, not the final architecture.
+    heap: ?*heap_mod.Heap = null,
 
     /// Two-phase init: caller stores the empty registry FIRST,
     /// then calls `setupDefaults` on the stable pointer.
@@ -683,6 +698,7 @@ pub const NamespaceRegistry = struct {
             .map = std.StringHashMap(*Namespace).init(map_allocator),
             .core = undefined,
             .current = undefined,
+            .heap = null,
         };
     }
 
@@ -1112,6 +1128,12 @@ pub const VmError = error{
     /// catchable error instead of being silently allowed.
     /// Mapped to `:atom-re-entry`. See ATOM.md §4.4.
     AtomReEntry,
+    /// Phase 5 Item 2 (peer-AI turn 77 §D9): malformed UTF-8
+    /// byte sequence encountered during codepoint iteration of
+    /// a `.string` Value. Storage is byte-blob; the reader and
+    /// codec validate on construction, but a corrupt-codec or
+    /// fuzz path could produce one. Mapped to `:utf8-error`.
+    Utf8Error,
 };
 
 // =============================================================================
@@ -1377,6 +1399,11 @@ pub const VM = struct {
             );
             // Populate AFTER storage so back-pointers are stable.
             try self.registry.?.setupDefaults();
+            // Phase 5.2a (peer-AI turn 77): make the VM heap
+            // reachable from the registry so compile.zig's Form
+            // lowering can allocate string-literal Values into
+            // it via `namespace.registry.heap`.
+            self.registry.?.heap = self.ensureHeap();
         }
         return &self.registry.?;
     }
@@ -3136,6 +3163,7 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.TxClosed => "tx-closed",
         VmError.NotDerefable => "not-derefable",
         VmError.AtomReEntry => "atom-re-entry",
+        VmError.Utf8Error => "utf8-error",
         // Unrecoverable: bytecode corruption / VM-internal /
         // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,

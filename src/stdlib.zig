@@ -43,6 +43,7 @@ const heap_mod = @import("heap");
 const dispatch_mod_alias = @import("dispatch");
 const emdb_mod = @import("emdb");
 const atom_mod = @import("atom");
+const string_mod = @import("string");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -193,6 +194,12 @@ const core_fns = [_]CoreEntry{
     .{ .name = "swap!", .descriptor = &native_swap_bang },
     .{ .name = "swap-vals!", .descriptor = &native_swap_vals_bang },
     .{ .name = "compare-and-set!", .descriptor = &native_compare_and_set_bang },
+    // Phase 5 Item 2 sub-step 5.2a (peer-AI turn 77): core
+    // string ops. Indexing semantics are by Unicode scalar
+    // (codepoint), NOT byte; see `docs/STRING.md` §7.
+    .{ .name = "str", .descriptor = &native_str },
+    .{ .name = "string?", .descriptor = &native_string_q },
+    .{ .name = "subs", .descriptor = &native_subs },
     // Phase 4.0a: db primitives live in the `db` namespace
     // (installed separately via `installDb`) so they appear as
     // qualified `(db/open ...)` calls.
@@ -334,6 +341,11 @@ const native_reset_bang = NativeFn{ .name = "reset!", .min_arity = 2, .max_arity
 const native_swap_bang = NativeFn{ .name = "swap!", .min_arity = 2, .max_arity = null, .call = &fnSwapBang };
 const native_swap_vals_bang = NativeFn{ .name = "swap-vals!", .min_arity = 2, .max_arity = null, .call = &fnSwapValsBang };
 const native_compare_and_set_bang = NativeFn{ .name = "compare-and-set!", .min_arity = 3, .max_arity = 3, .call = &fnCompareAndSetBang };
+
+// Phase 5 Item 2 sub-step 5.2a (peer-AI turn 77) — core string ops.
+const native_str = NativeFn{ .name = "str", .min_arity = 0, .max_arity = null, .call = &fnStr };
+const native_string_q = NativeFn{ .name = "string?", .min_arity = 1, .max_arity = 1, .call = &fnStringQ };
+const native_subs = NativeFn{ .name = "subs", .min_arity = 2, .max_arity = 3, .call = &fnSubs };
 const native_db_alter = NativeFn{ .name = "db/alter!", .min_arity = 3, .max_arity = null, .call = &fnDbAlter };
 // Phase 4.0d — scan + reduce-tree.
 const native_db_scan = NativeFn{ .name = "db/scan", .min_arity = 2, .max_arity = 4, .call = &fnDbScan };
@@ -416,7 +428,10 @@ fn fnRest(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(count coll)` → element count. nil → 0. Lists, vectors,
-/// maps, sets, strings supported.
+/// maps, sets, strings supported. For strings: codepoint count
+/// (Phase 5.2a, peer-AI turn 77 §D1 — user-facing count is by
+/// Unicode scalar, not byte; O(n) walk via
+/// `string_mod.codepointCount`).
 fn fnCount(_: *VM, args: []const Value) VmError!Value {
     const c = args[0];
     const n: i64 = switch (c.kind()) {
@@ -425,6 +440,7 @@ fn fnCount(_: *VM, args: []const Value) VmError!Value {
         .persistent_vector => @intCast(vector_mod.count(c)),
         .persistent_map => @intCast(champ_mod.mapCount(c)),
         .persistent_set => @intCast(champ_mod.setCount(c)),
+        .string => @intCast(string_mod.codepointCount(c) catch return VmError.Utf8Error),
         else => return VmError.KindMismatch,
     };
     return value_mod.fromFixnum(n) orelse VmError.IntegerOverflow;
@@ -444,6 +460,17 @@ fn fnNth(_: *VM, args: []const Value) VmError!Value {
     const has_default = args.len > 2;
     const default = if (has_default) args[2] else value_mod.nilValue();
     if (idx_v.kind() != .fixnum) return VmError.KindMismatch;
+    // Phase 5.2a (peer-AI turn 78): kind-check the receiver
+    // BEFORE consulting `idx < 0` / `has_default`. Pre-5.2a the
+    // negative-index path returned `default` even when `coll`
+    // was non-indexable (e.g. `(nth 123 -1 :d) → :d`). That's a
+    // type-soundness violation — `:kind-mismatch` must fire on
+    // non-indexable receivers regardless of index sign or
+    // default arity.
+    switch (coll.kind()) {
+        .nil, .list, .persistent_vector, .string => {},
+        else => return VmError.KindMismatch,
+    }
     const idx = idx_v.asFixnum();
     if (idx < 0) {
         if (has_default) return default;
@@ -469,12 +496,28 @@ fn fnNth(_: *VM, args: []const Value) VmError!Value {
             }
             break :blk vector_mod.nth(coll, u_idx);
         },
+        // Phase 5.2a (peer-AI turn 77 §D2): `(nth s i)` returns a
+        // Kind.char at codepoint index `i`. Indexing is by
+        // Unicode scalar to match `(count s)`. Out-of-bounds
+        // surfaces `:index-out-of-bounds`; malformed UTF-8
+        // surfaces `:utf8-error`.
+        .string => blk: {
+            const scalar = string_mod.codepointAt(coll, u_idx) catch |err| switch (err) {
+                error.OutOfBounds => {
+                    if (has_default) break :blk default;
+                    return VmError.IndexOutOfBounds;
+                },
+                error.InvalidUtf8 => return VmError.Utf8Error,
+            };
+            break :blk value_mod.fromChar(scalar) orelse return VmError.Utf8Error;
+        },
         else => return VmError.KindMismatch,
     };
 }
 
 /// `(empty? coll)` → true if coll has zero elements. nil →
-/// true (matches Clojure).
+/// true (matches Clojure). Strings: byte-length test (O(1)) —
+/// empty UTF-8 ↔ zero codepoints, so no codepoint walk needed.
 fn fnEmptyQ(_: *VM, args: []const Value) VmError!Value {
     const c = args[0];
     const is_empty = switch (c.kind()) {
@@ -483,6 +526,7 @@ fn fnEmptyQ(_: *VM, args: []const Value) VmError!Value {
         .persistent_vector => vector_mod.isEmpty(c),
         .persistent_map => champ_mod.mapCount(c) == 0,
         .persistent_set => champ_mod.setCount(c) == 0,
+        .string => string_mod.byteLen(c) == 0,
         else => return VmError.KindMismatch,
     };
     return value_mod.fromBool(is_empty);
@@ -1060,11 +1104,14 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
 // frees. VM.deinit closes any remaining as a safety net.
 
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
-    // v1.alpha: accept the path as a keyword OR symbol (their
-    // interned name is the path string). First-class strings
-    // arrive in Phase 4 polish.
+    // Phase 4.0a accepted keyword OR symbol (interned-name-as-
+    // path). Phase 5.2a (peer-AI turn 78) adds first-class
+    // strings: `(db/open "/tmp/x.edb")` is now the canonical
+    // form; the keyword/symbol overloads remain for backward
+    // compat with the Phase 4 examples.
     const path_v = args[0];
     const path_slice: []const u8 = blk: {
+        if (path_v.kind() == .string) break :blk string_mod.asBytes(path_v);
         if (path_v.kind() == .keyword) {
             const id: u32 = @intCast(path_v.payload);
             break :blk vm.ensureInterner().keywordName(id);
@@ -1126,18 +1173,21 @@ fn fnDbRef(vm: *VM, args: []const Value) VmError!Value {
     if (conn_v.kind() != .db_connection) return VmError.KindMismatch;
     // Tree name must be a keyword (its interned name = tree id).
     if (tree_v.kind() != .keyword) return VmError.KindMismatch;
-    // Key can be keyword / symbol (interned-name as key bytes).
-    // First-class string keys arrive in Phase 4 polish.
-    if (key_v.kind() != .keyword and key_v.kind() != .symbol) return VmError.KindMismatch;
+    // Key can be keyword / symbol (interned-name as key bytes)
+    // or string. Phase 5.2a (peer-AI turn 78): first-class
+    // string keys arrived with first-class string literals.
+    if (key_v.kind() != .keyword and key_v.kind() != .symbol and key_v.kind() != .string) {
+        return VmError.KindMismatch;
+    }
     const conn: *db_mod.Connection = @ptrFromInt(conn_v.payload);
     if (!conn.open_flag) return VmError.DbClosed;
     const interner = vm.ensureInterner();
     const tree_id: u32 = @intCast(tree_v.payload);
     const tree_name = interner.keywordName(tree_id);
-    const key_id: u32 = @intCast(key_v.payload);
     const key_bytes: []const u8 = switch (key_v.kind()) {
-        .keyword => interner.keywordName(key_id),
-        .symbol => interner.symbolName(key_id),
+        .keyword => interner.keywordName(@intCast(key_v.payload)),
+        .symbol => interner.symbolName(@intCast(key_v.payload)),
+        .string => string_mod.asBytes(key_v),
         else => unreachable,
     };
     return db_mod.ref(vm.ensureHeap(), conn, tree_name, key_bytes) catch return VmError.DbError;
@@ -1691,6 +1741,125 @@ fn fnCompareAndSetBang(_: *VM, args: []const Value) VmError!Value {
         return value_mod.fromBool(true);
     }
     return value_mod.fromBool(false);
+}
+
+// =============================================================================
+// Phase 5 Item 2 sub-step 5.2a — core string ops (peer-AI turn 77)
+// =============================================================================
+//
+// `(str & xs)` is display-mode stringify+concat. v1.alpha ships a
+// minimal local stringifier that handles the scalar value kinds plus
+// strings and chars; collection kinds fall back to an opaque
+// `#<value kind=N>` marker. Sub-step 5.2c lifts the full recursive
+// formatter into `src/format.zig` and replaces this minimal helper.
+// Note (peer-AI turn 77 §D10): str / subs allocate after holding
+// argument values in Zig locals — listed in `docs/GC.md` §11.5 audit
+// checklist for the future triggered-GC migration.
+
+/// Append a single Value to `out` in display-mode formatting.
+/// Strings are unquoted; chars are emitted as their UTF-8 bytes;
+/// nil → empty. Collections are NOT recursed in 5.2a (they fall
+/// into an opaque marker; the recursive formatter ships in 5.2c).
+fn appendStringified(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    v: Value,
+    interner: ?*const intern_mod.Interner,
+) VmError!void {
+    switch (v.kind()) {
+        .nil => {}, // (str nil) appends "" — Clojure-canonical.
+        .true_ => out.appendSlice(allocator, "true") catch return VmError.OutOfMemory,
+        .false_ => out.appendSlice(allocator, "false") catch return VmError.OutOfMemory,
+        .fixnum => {
+            var buf: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d}", .{v.asFixnum()}) catch return VmError.OutOfMemory;
+            out.appendSlice(allocator, s) catch return VmError.OutOfMemory;
+        },
+        .char => {
+            // TODO(5.2c): hoist this 4-byte UTF-8 encode dance
+            // into `src/format.zig` alongside the same pattern
+            // in cli.zig + eval_pipeline.zig's local helper.
+            var utf8_buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(v.asChar(), &utf8_buf) catch return VmError.Utf8Error;
+            out.appendSlice(allocator, utf8_buf[0..n]) catch return VmError.OutOfMemory;
+        },
+        .string => out.appendSlice(allocator, string_mod.asBytes(v)) catch return VmError.OutOfMemory,
+        .keyword => {
+            const id: u32 = @intCast(v.payload);
+            const it = interner orelse return VmError.KindMismatch;
+            out.append(allocator, ':') catch return VmError.OutOfMemory;
+            out.appendSlice(allocator, it.keywordName(id)) catch return VmError.OutOfMemory;
+        },
+        .symbol => {
+            const id: u32 = @intCast(v.payload);
+            const it = interner orelse return VmError.KindMismatch;
+            out.appendSlice(allocator, it.symbolName(id)) catch return VmError.OutOfMemory;
+        },
+        // Phase 5 Item 1 (turn 75) + turn 77 §D4: opaque `#<atom>`
+        // shape; the contained value is reachable via `@a` /
+        // `(deref a)` and stringifies through the normal path.
+        // Matches the deterministic CLI formatter.
+        .atom => out.appendSlice(allocator, "#<atom>") catch return VmError.OutOfMemory,
+        // Collections + complex kinds: opaque placeholder until 5.2c
+        // lands the full recursive formatter in `src/format.zig`.
+        // Tests that need recursive output use `(println …)` /
+        // `(prn …)` which go through the full formatter (5.2c). For
+        // 5.2a callers that actually need recursive `str` output,
+        // 5.2c will replace this branch with a recursive call.
+        else => {
+            var buf: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "#<value kind={d}>", .{@intFromEnum(v.kind())}) catch return VmError.OutOfMemory;
+            out.appendSlice(allocator, s) catch return VmError.OutOfMemory;
+        },
+    }
+}
+
+fn fnStr(vm: *VM, args: []const Value) VmError!Value {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(vm.allocator);
+    const interner = vm.ensureInterner();
+    for (args) |x| {
+        try appendStringified(vm.allocator, &buf, x, interner);
+    }
+    return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch return VmError.OutOfMemory;
+}
+
+fn fnStringQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(args[0].kind() == .string);
+}
+
+/// `(subs s start)` / `(subs s start end)` — substring by CODEPOINT
+/// indices (turn 77 §D3). Allocates a fresh heap string; future
+/// zero-copy subkind (subkind 2 reserved for emdb-mmap, NOT for
+/// in-heap slicing) is explicitly out of scope.
+fn fnSubs(vm: *VM, args: []const Value) VmError!Value {
+    const s = args[0];
+    if (s.kind() != .string) return VmError.KindMismatch;
+    if (args[1].kind() != .fixnum) return VmError.KindMismatch;
+    const start = args[1].asFixnum();
+    if (start < 0) return VmError.IndexOutOfBounds;
+
+    const cp_count = string_mod.codepointCount(s) catch return VmError.Utf8Error;
+    const start_u: usize = @intCast(start);
+    const end_u: usize = if (args.len > 2) blk: {
+        if (args[2].kind() != .fixnum) return VmError.KindMismatch;
+        const end_i = args[2].asFixnum();
+        if (end_i < 0) return VmError.IndexOutOfBounds;
+        break :blk @intCast(end_i);
+    } else cp_count;
+
+    if (start_u > cp_count or end_u > cp_count or start_u > end_u) {
+        return VmError.IndexOutOfBounds;
+    }
+    const byte_range = string_mod.byteRangeForCodepoints(s, start_u, end_u) catch |err| switch (err) {
+        error.InvalidUtf8 => return VmError.Utf8Error,
+        // `byteRangeForCodepoints` returns OutOfBounds for
+        // start/end/cp_count consistency; we already validated
+        // above so this branch is defensive.
+        error.OutOfBounds => return VmError.IndexOutOfBounds,
+    };
+    const src_bytes = string_mod.asBytes(s);
+    return string_mod.fromBytes(vm.ensureHeap(), src_bytes[byte_range.start..byte_range.end]) catch return VmError.OutOfMemory;
 }
 
 // =============================================================================

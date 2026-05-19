@@ -33,6 +33,7 @@ const list_mod = @import("list");
 const vector_mod = @import("vector");
 const champ_mod = @import("champ");
 const stdlib = @import("stdlib");
+const string_mod = @import("string");
 
 const testing = std.testing;
 
@@ -115,6 +116,16 @@ fn formatValue(buf: *std.array_list.Managed(u8), v: value_mod.Value, interner: *
             try buf.appendSlice("#<native-fn ");
             try buf.appendSlice(nf.name);
             try buf.append('>');
+        },
+        // Phase 5.2a: display-mode printing. Strings unquoted,
+        // chars as their UTF-8 bytes. Readable mode lands in
+        // 5.2c with `format.zig`.
+        .string => try buf.appendSlice(string_mod.asBytes(v)),
+        .char => {
+            const scalar = v.asChar();
+            var utf8_buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(scalar, &utf8_buf) catch 0;
+            if (n > 0) try buf.appendSlice(utf8_buf[0..n]);
         },
         // Phase 5 Item 1: print atoms as `#<atom>` opaquely (no
         // pointer — pointer values are unstable across runs and
@@ -1534,5 +1545,165 @@ test "phase5 atom: self-reference does not break equality / count" {
     try expectOutput(
         \\(let [a (atom nil)] (reset! a a) (= @a a))
     , "true");
+}
+
+// =============================================================================
+// Phase 5 Item 2 sub-step 5.2a — core string ops (peer-AI turn 77)
+// =============================================================================
+//
+// User-facing string ops index by Unicode SCALAR (codepoint), not
+// byte. Test coverage hits the four corners turn 77 §Tests:
+//   - ASCII baseline                  → count/nth/subs on ASCII
+//   - Multi-byte codepoint sanity     → count of "é", "🦀", mixed
+//   - Bounds                          → :index-out-of-bounds keyword
+//   - str shape                       → Clojure-canonical for nil/kw/sym/atom
+
+test "phase5.2a string?: kind predicate" {
+    try expectOutput("(string? \"hi\")", "true");
+    try expectOutput("(string? \"\")", "true");
+    try expectOutput("(string? :hello)", "false");
+    try expectOutput("(string? 1)", "false");
+    try expectOutput("(string? nil)", "false");
+    try expectOutput("(string? [\"a\"])", "false");
+}
+
+test "phase5.2a count: ASCII + multibyte codepoints" {
+    try expectOutput("(count \"\")", "0");
+    try expectOutput("(count \"a\")", "1");
+    try expectOutput("(count \"hello\")", "5");
+    // U+00E9 é is 2 bytes UTF-8 → 1 codepoint.
+    try expectOutput("(count \"é\")", "1");
+    // U+1F980 🦀 is 4 bytes → 1 codepoint.
+    try expectOutput("(count \"🦀\")", "1");
+    // Mixed: a(1) + é(2) + b(1) + 🦀(4) bytes = 4 codepoints.
+    try expectOutput("(count \"aéb🦀\")", "4");
+}
+
+test "phase5.2a empty?: byteLen == 0 fast path" {
+    try expectOutput("(empty? \"\")", "true");
+    try expectOutput("(empty? \"x\")", "false");
+    try expectOutput("(empty? \"🦀\")", "false");
+}
+
+test "phase5.2a nth on string: returns Kind.char at codepoint index" {
+    try expectOutput("(nth \"abc\" 0)", "a");
+    try expectOutput("(nth \"abc\" 1)", "b");
+    try expectOutput("(nth \"abc\" 2)", "c");
+    // Multibyte: index 1 in "aéb" is é (U+00E9).
+    try expectOutput("(nth \"aéb\" 0)", "a");
+    try expectOutput("(nth \"aéb\" 1)", "é");
+    try expectOutput("(nth \"aéb\" 2)", "b");
+    // 4-byte codepoint at index 1.
+    try expectOutput("(nth \"a🦀b\" 1)", "🦀");
+}
+
+test "phase5.2a nth on string: out-of-bounds + default" {
+    try expectOutput("(try (nth \"ab\" 2) (catch any e e))", ":index-out-of-bounds");
+    try expectOutput("(try (nth \"\" 0) (catch any e e))", ":index-out-of-bounds");
+    // Negative index: same keyword (peer-AI turn 77 §D2).
+    try expectOutput("(try (nth \"ab\" -1) (catch any e e))", ":index-out-of-bounds");
+    // Default branch: out-of-bounds returns default instead of throwing.
+    try expectOutput("(nth \"ab\" 5 :missing)", ":missing");
+    try expectOutput("(nth \"ab\" -1 :neg)", ":neg");
+}
+
+test "phase5.2a subs: codepoint indices, two- and three-arity" {
+    try expectOutput("(subs \"hello\" 1)", "ello");
+    try expectOutput("(subs \"hello\" 0)", "hello");
+    try expectOutput("(subs \"hello\" 1 4)", "ell");
+    try expectOutput("(subs \"hello\" 0 0)", "");
+    try expectOutput("(subs \"hello\" 5)", "");
+    try expectOutput("(subs \"hello\" 5 5)", "");
+    // Multibyte: code-points 1..3 of "aéb🦀" = "éb".
+    try expectOutput("(subs \"aéb🦀\" 1 3)", "éb");
+    // Trailing 4-byte codepoint preserved.
+    try expectOutput("(subs \"aéb🦀\" 3)", "🦀");
+}
+
+test "phase5.2a subs: bounds errors as :index-out-of-bounds" {
+    try expectOutput("(try (subs \"ab\" -1) (catch any e e))", ":index-out-of-bounds");
+    try expectOutput("(try (subs \"ab\" 0 -1) (catch any e e))", ":index-out-of-bounds");
+    try expectOutput("(try (subs \"ab\" 3) (catch any e e))", ":index-out-of-bounds");
+    try expectOutput("(try (subs \"ab\" 0 3) (catch any e e))", ":index-out-of-bounds");
+    // start > end.
+    try expectOutput("(try (subs \"abc\" 2 1) (catch any e e))", ":index-out-of-bounds");
+}
+
+test "phase5.2a subs: kind-mismatch on non-string / non-fixnum index" {
+    try expectOutput("(try (subs 42 0) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (subs \"ab\" :nope) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (subs \"ab\" 0 :nope) (catch any e e))", ":kind-mismatch");
+}
+
+test "phase5.2a str: Clojure-canonical concat shape" {
+    try expectOutput("(str)", "");
+    try expectOutput("(str nil)", "");
+    try expectOutput("(str \"a\" \"b\" \"c\")", "abc");
+    try expectOutput("(str \"a\" 1 :b)", "a1:b");
+    try expectOutput("(str :hello)", ":hello");
+    try expectOutput("(str true)", "true");
+    try expectOutput("(str false)", "false");
+    try expectOutput("(str -7)", "-7");
+    // Char concatenates as its UTF-8 bytes (matches display mode).
+    try expectOutput("(str (nth \"é\" 0))", "é");
+    // Atom prints opaquely as `#<atom>` (turn 77 §D4 deterministic).
+    try expectOutput("(str (atom 1))", "#<atom>");
+}
+
+test "phase5.2a str: result is itself a string" {
+    try expectOutput("(string? (str \"a\" 1 :b))", "true");
+    try expectOutput("(count (str \"héllo\"))", "5");
+}
+
+test "phase5.2a string? after subs returns true" {
+    try expectOutput("(string? (subs \"hello\" 1 4))", "true");
+}
+
+test "phase5.2a nth: kind-mismatch fires on non-indexable receiver (peer-AI turn 78)" {
+    // Pre-5.2a bug: the negative-index + default path returned
+    // the default even when the receiver was non-indexable. The
+    // turn-78 fix moves the kind check ABOVE the index-sign
+    // branch. `(nth 123 -1 :d)` must be `:kind-mismatch`, NOT
+    // `:d`.
+    try expectOutput("(try (nth 123 -1 :d) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nth :keyword 0 :d) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nth {:a 1} 0 :d) (catch any e e))", ":kind-mismatch");
+    // Strings + vectors + lists + nil still honor the default-
+    // on-OOB contract from Phase 3.5.
+    try expectOutput("(nth \"ab\" -1 :d)", ":d");
+    try expectOutput("(nth nil 0 :d)", ":d");
+    try expectOutput("(nth [1 2] 5 :d)", ":d");
+}
+
+test "phase5.2a subs: boundary case (start == end at count)" {
+    // Peer-AI turn 78 §R4: `(subs s n n)` for any `n` in
+    // `[0, count]` returns `""`. The end-at-end boundary should
+    // succeed, not throw.
+    try expectOutput("(subs \"abc\" 3 3)", "");
+    try expectOutput("(count (subs \"abc\" 3 3))", "0");
+}
+
+test "phase5.2a nth: char-at-default on out-of-bounds + multibyte" {
+    // Peer-AI turn 78 §R5: `(nth s i :default)` returns default
+    // when `i >= codepointCount`. Multi-byte boundary.
+    try expectOutput("(nth \"é\" 0 :default)", "é");
+    try expectOutput("(nth \"é\" 1 :default)", ":default");
+}
+
+test "phase5.2a end-to-end DB persistence of a string value (peer-AI turn 78 §R9)" {
+    // Direct test that string literals survive the entire
+    // compile → durable codec → emdb → decode → user path. The
+    // todo-app demo uses keyword values; this test pins the
+    // string Value codec round-trip explicitly. The /tmp file
+    // is overwritten by the with-tx put on every run, so no
+    // explicit cleanup is needed (and Zig 0.16's std.Io.Dir
+    // file ops would add unnecessary boilerplate here).
+    try expectOutputProgram(
+        \\(do
+        \\  (def conn (db/open "/tmp/nexis-phase5-2a-strings.edb"))
+        \\  (def r   (db/ref conn :strings "k"))
+        \\  (with-tx [tx conn] (db/put! tx r "hello-utf8-é-🦀"))
+        \\  (with-read-tx [tx conn] (db/get tx r)))
+    , "hello-utf8-é-🦀");
 }
 

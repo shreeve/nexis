@@ -1489,8 +1489,20 @@ fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
             lst = list_mod.cons(heap, quote_sym, lst) catch return ExpandError.OutOfMemory;
             break :blk lst;
         },
+        // Phase 5.2a (peer-AI turn 78): string literals reach
+        // the macro layer via syntax-quote payloads and direct
+        // arguments to host macros (e.g. `with-tx`'s body forms
+        // can be arbitrary Forms containing `(db/put! tx r "x")`).
+        // Allocate the heap string in the same arena
+        // (`ctx.heapForArgs()`) the rest of formToValue uses for
+        // collections.
+        .string => |bytes| blk: {
+            const string_mod_local = @import("string");
+            const heap = try ctx.heapForArgs();
+            break :blk string_mod_local.fromBytes(heap, bytes) catch return ExpandError.OutOfMemory;
+        },
         // syntax_quote, unquote, unquote_splicing, anon_fn,
-        // with_meta, deref, real, char, string → defer.
+        // with_meta, deref, real, char → defer.
         else => return ExpandError.MalformedMacroCall,
     };
 }
@@ -1603,6 +1615,20 @@ fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSp
             for (elems.items, 0..) |item, i| slice[i] = item;
             const form = try ctx.allocator.create(Form);
             form.* = .{ .datum = .{ .set = @as([]const *Form, slice) }, .origin = origin };
+            break :blk form;
+        },
+        // Phase 5.2a (peer-AI turn 78): macro-returned string
+        // Values surface as `Form.datum.string` byte slices. The
+        // reader produces string Forms with already-decoded bytes
+        // (escapes resolved); macro round-trip mirrors that
+        // shape. The byte slice is copied into the macro arena
+        // (`ctx.allocator`) so it outlives the source Value.
+        .string => blk: {
+            const string_mod_local = @import("string");
+            const src_bytes = string_mod_local.asBytes(v);
+            const owned = try ctx.allocator.dupe(u8, src_bytes);
+            const form = try ctx.allocator.create(Form);
+            form.* = .{ .datum = .{ .string = owned }, .origin = origin };
             break :blk form;
         },
         // Macro returned a kind we don't know how to surface

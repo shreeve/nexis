@@ -176,8 +176,10 @@ depends on `dispatch.zig`. When a new kind lands, exactly one
 - **Zero-copy subkind 2.** Needs mmap / emdb-page plumbing from
   Phase 6. Same transparency contract as SSO.
 - **Unicode operations** (grapheme iteration, case folding, normalization,
-  collation). These are stdlib-level operations that will live in a
-  future `nexis.string` namespace, not in the runtime module.
+  collation). Phase 5.2b will ship case conversion + trim as
+  **ASCII-only** in `nexis.string`. Full Unicode case folding,
+  grapheme clustering, normalization, and collation are post-v1 and
+  will require a dedicated Unicode tables module.
 - **String interning** (explicit `(intern s)`). PLAN §8.4 defers this
   to v2+ or an opt-in string module; not v1 runtime.
 - **Print-time escape encoding** (`\n`, `\t`, `\u{HEX}`). That's
@@ -187,3 +189,66 @@ depends on `dispatch.zig`. When a new kind lands, exactly one
 - **Mutability / transient strings.** Strings are persistent (immutable)
   at the Value layer. Mutable string builders will be a separate
   transient-kind facility if/when needed (not committed for v1).
+
+---
+
+### 7. Language-level operations (Phase 5.2a — peer-AI turn 77)
+
+The storage module ships codepoint-iteration helpers that the
+language-surface stdlib (`src/stdlib.zig`) calls. Frozen invariants
+for the user-facing API:
+
+**Indexing is by Unicode scalar (codepoint), not grapheme cluster
+and not byte.** Picked over byte indexing in turn 77 §D1 because
+`count` / `nth` / `subs` must agree, and surfacing UTF-8 byte
+positions through a user-facing `(count s)` would surprise users
+porting Clojure code where `(.length s)` is character-flavored. v1
+makes no claim about graphemes (`🇺🇸` is multiple codepoints; that's
+out of scope and documented).
+
+**Native fns in `nexis.core`:**
+
+```
+(str & xs)        ; variadic, concat-stringify per Clojure; nil → "".
+                  ; Display-mode formatting: strings unquoted.
+(string? x)       ; true iff x.kind() == .string
+(subs s start)        ; [start, codepoint-count) byte-slice → fresh string
+(subs s start end)    ; [start, end)
+
+(count s)         ; extends to strings: number of codepoints (O(n) walk).
+(nth s i)         ; codepoint at index → Kind.char
+(nth s i default) ; default on out-of-bounds (matches existing nth)
+(empty? s)        ; (= 0 (count s))
+```
+
+**Errors** (catchable keywords):
+- `:kind-mismatch` — non-string passed to `string?`/`subs` etc.;
+  non-fixnum index to `subs`/`nth`.
+- `:index-out-of-bounds` — negative start, end > count, start > end,
+  index outside `[0, count)`.
+
+**Algorithm**: `string.codepointCount(v)` walks the byte body once
+using `std.unicode.utf8ByteSequenceLength`-style decoding;
+`string.byteRangeForCodepoints(v, start, end)` converts a
+codepoint range to a byte range in a second walk;
+`string.codepointAt(v, i)` returns a `Kind.char` Value via a
+front-to-position walk. None of these store side-cache state on
+the HeapHeader — codepoint count IS NOT cached today (v1; if
+profiling shows hot use, a Phase 6 cache slot or full
+codepoint-counted subkind could land).
+
+**Storage shape unchanged.** Byte layout (§2) is invariant: the body
+is still raw UTF-8 bytes; codepoint indexing is purely a presentation
+view. `subs` allocates a fresh heap string via `fromBytes` — no
+zero-copy slicing in v1 (subkind 2 is reserved for emdb-page
+mmap, not for slicing our own heap; turn 77 §D3 confirmed).
+
+**v1 invalid-UTF-8 policy.** If a corrupted byte sequence makes
+codepoint iteration fail mid-string, `string.codepointAt` /
+`codepointCount` / `byteRangeForCodepoints` SHOULD return
+`error.InvalidUtf8` (or equivalent). The caller (stdlib) maps that
+to `:utf8-error` (catchable). Construction-time validation of
+strings happens at the reader and the codec; runtime corruption
+that reaches the storage layer is treated as a recoverable
+language error rather than a panic, matching the Phase 1
+"caller's responsibility" stance.

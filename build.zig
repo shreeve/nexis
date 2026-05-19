@@ -247,6 +247,10 @@ pub fn build(b: *std.Build) void {
     expand_mod.addImport("vector", vector_mod);
     expand_mod.addImport("champ", champ_mod);
     expand_mod.addImport("heap", heap_mod);
+    // Phase 5.2a (peer-AI turn 78): formToValue handles `.string`
+    // Form datums by allocating via `string.fromBytes` against
+    // the macro-arg heap.
+    expand_mod.addImport("string", string_mod);
     // dispatch_mod is declared LATER (it depends on db); the
     // addImport for it is attached after that block. See below.
 
@@ -266,6 +270,8 @@ pub fn build(b: *std.Build) void {
     stdlib_mod.addImport("heap", heap_mod);
     // Phase 5 Item 1: atom native fns.
     stdlib_mod.addImport("atom", atom_mod);
+    // Phase 5 Item 2 (5.2a): core string ops + codepoint helpers.
+    stdlib_mod.addImport("string", string_mod);
     // dispatch_mod, db_mod, codec_mod are declared later;
     // imports attached at the bottom of the dispatch block.
 
@@ -296,6 +302,11 @@ pub fn build(b: *std.Build) void {
     // compile-side core itself doesn't need champ (the VM
     // executes coll:map / coll:set).
     compile_mod.addImport("champ", champ_mod);
+    // Phase 5.2a (peer-AI turn 77): string literals lower to
+    // Tiny.literal via `string.fromBytes` against a heap reached
+    // through `namespace.registry.heap`.
+    compile_mod.addImport("heap", heap_mod);
+    compile_mod.addImport("string", string_mod);
 
     // Phase 3.6: namespace loader (require + file loading).
     const loader_mod = b.createModule(.{
@@ -471,9 +482,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch" } },
-        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch" } },
-        .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch" } },
-        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom" } },
+        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch", "heap", "string" } },
+        .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string" } },
+        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
     };
 
@@ -745,6 +756,9 @@ pub fn build(b: *std.Build) void {
     integration_eval_mod.addImport("vector", vector_mod);
     integration_eval_mod.addImport("champ", champ_mod);
     integration_eval_mod.addImport("stdlib", stdlib_mod);
+    // Phase 5 Item 2 (5.2a): formatValue prints strings via
+    // string.asBytes.
+    integration_eval_mod.addImport("string", string_mod);
 
     const integration_eval_tests = b.addTest(.{ .root_module = integration_eval_mod });
     const run_integration_eval_tests = b.addRunArtifact(integration_eval_tests);
@@ -846,9 +860,9 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("champ", champ_mod);
     cli_mod.addImport("stdlib", stdlib_mod);
     cli_mod.addImport("loader", loader_mod);
-    // Phase 5 Item 1: cli.formatValue prints `#<atom 0x...>`
-    // by pointer identity (no atom_mod import needed; payload
-    // is the pointer).
+    // Phase 5 Item 2 (5.2a, peer-AI turn 77): cli.formatValue
+    // prints strings via string.asBytes (display mode, unquoted).
+    cli_mod.addImport("string", string_mod);
 
     const nexis_exe = b.addExecutable(.{
         .name = "nexis",

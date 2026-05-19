@@ -119,6 +119,104 @@ pub fn bytesEqual(a: *HeapHeader, b: *HeapHeader) bool {
 }
 
 // =============================================================================
+// Codepoint helpers (Phase 5.2a — peer-AI turn 77)
+// =============================================================================
+//
+// The language-level surface (`(count s)`, `(nth s i)`, `(subs s
+// start end)`) indexes by Unicode SCALAR / codepoint, NOT by byte
+// and NOT by grapheme cluster. The storage body remains raw UTF-8
+// bytes; these helpers walk it once per call to convert codepoint
+// indices into byte offsets.
+//
+// Frozen contract (STRING.md §7):
+//   - All four ops return `error.InvalidUtf8` on a malformed body
+//     mid-walk. The runtime caller (`stdlib.zig`) maps that to
+//     `:utf8-error` (catchable). v1's storage layer does not
+//     pre-validate bytes; the user's source had to be well-formed
+//     to reach a string Value, but a fuzzer / corrupt-codec path
+//     could produce one.
+//   - Codepoint count is NOT cached on the HeapHeader. Phase 6 may
+//     add a cache slot if profiling shows hot use.
+
+/// Total number of Unicode codepoints in `v`. O(byteLen). Returns
+/// `error.InvalidUtf8` if the body contains an invalid byte
+/// sequence.
+pub fn codepointCount(v: Value) error{InvalidUtf8}!usize {
+    const bytes = asBytes(v);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch return error.InvalidUtf8;
+        if (i + seq_len > bytes.len) return error.InvalidUtf8;
+        // Validate the sequence (catches lone continuation bytes
+        // and over-long encodings).
+        _ = std.unicode.utf8Decode(bytes[i..][0..seq_len]) catch return error.InvalidUtf8;
+        i += seq_len;
+        count += 1;
+    }
+    return count;
+}
+
+/// Unicode scalar at codepoint index `i`. Returns `error.OutOfBounds`
+/// if `i >= codepointCount(v)`, `error.InvalidUtf8` on a malformed
+/// byte sequence anywhere up to position `i`.
+pub fn codepointAt(v: Value, i: usize) error{ OutOfBounds, InvalidUtf8 }!u21 {
+    const bytes = asBytes(v);
+    var byte_pos: usize = 0;
+    var cp_pos: usize = 0;
+    while (byte_pos < bytes.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(bytes[byte_pos]) catch return error.InvalidUtf8;
+        if (byte_pos + seq_len > bytes.len) return error.InvalidUtf8;
+        const scalar = std.unicode.utf8Decode(bytes[byte_pos..][0..seq_len]) catch return error.InvalidUtf8;
+        if (cp_pos == i) return scalar;
+        byte_pos += seq_len;
+        cp_pos += 1;
+    }
+    return error.OutOfBounds;
+}
+
+/// Convert a codepoint range `[start, end)` to a byte range. Both
+/// endpoints are codepoint-indexed. Returns `error.OutOfBounds` if
+/// `start > end`, `start > codepointCount(v)`, or `end >
+/// codepointCount(v)`; `error.InvalidUtf8` on malformed bytes.
+///
+/// Caller responsibility: `start` and `end` must already be
+/// non-negative — the public API rejects negatives as
+/// `:index-out-of-bounds` BEFORE calling this helper, so the helper
+/// itself only sees `usize` indices.
+pub fn byteRangeForCodepoints(
+    v: Value,
+    start: usize,
+    end: usize,
+) error{ OutOfBounds, InvalidUtf8 }!struct { start: usize, end: usize } {
+    if (start > end) return error.OutOfBounds;
+    const bytes = asBytes(v);
+    var byte_pos: usize = 0;
+    var cp_pos: usize = 0;
+    var byte_start: ?usize = if (start == 0) 0 else null;
+    while (byte_pos < bytes.len) {
+        if (cp_pos == start) byte_start = byte_pos;
+        if (cp_pos == end) {
+            return .{ .start = byte_start.?, .end = byte_pos };
+        }
+        const seq_len = std.unicode.utf8ByteSequenceLength(bytes[byte_pos]) catch return error.InvalidUtf8;
+        if (byte_pos + seq_len > bytes.len) return error.InvalidUtf8;
+        _ = std.unicode.utf8Decode(bytes[byte_pos..][0..seq_len]) catch return error.InvalidUtf8;
+        byte_pos += seq_len;
+        cp_pos += 1;
+    }
+    // Reached end of bytes. Final positions land iff cp_pos
+    // matches the requested boundary.
+    if (cp_pos == end) {
+        if (byte_start == null) {
+            if (cp_pos == start) byte_start = byte_pos else return error.OutOfBounds;
+        }
+        return .{ .start = byte_start.?, .end = byte_pos };
+    }
+    return error.OutOfBounds;
+}
+
+// =============================================================================
 // Private helpers
 // =============================================================================
 
@@ -344,6 +442,89 @@ test "malformed UTF-8 bytes round-trip byte-exact (byte-blob semantics)" {
         const v2 = try fromBytes(&heap, m);
         try testing.expect(bytesEqual(Heap.asHeapHeader(v), Heap.asHeapHeader(v2)));
     }
+}
+
+// =============================================================================
+// Codepoint helper tests (Phase 5.2a — peer-AI turn 77)
+// =============================================================================
+
+test "codepointCount: ASCII + multi-byte sequences" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    const cases = [_]struct { s: []const u8, count: usize }{
+        .{ .s = "", .count = 0 },
+        .{ .s = "a", .count = 1 },
+        .{ .s = "hello", .count = 5 },
+        .{ .s = "é", .count = 1 }, // U+00E9, 2 bytes
+        .{ .s = "aéb", .count = 3 }, // 1 + 2 + 1 bytes
+        .{ .s = "你好", .count = 2 }, // 3 + 3 bytes
+        .{ .s = "🦀", .count = 1 }, // 4 bytes
+        .{ .s = "A🦀é€", .count = 4 }, // 1 + 4 + 2 + 3 bytes = 10
+    };
+    for (cases) |c| {
+        const v = try fromBytes(&heap, c.s);
+        try testing.expectEqual(c.count, try codepointCount(v));
+    }
+}
+
+test "codepointCount: invalid UTF-8 returns error" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const v = try fromBytes(&heap, "\xC0\x80"); // overlong NUL
+    try testing.expectError(error.InvalidUtf8, codepointCount(v));
+}
+
+test "codepointAt: returns Unicode scalar at codepoint index" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    const v = try fromBytes(&heap, "aéb🦀");
+    try testing.expectEqual(@as(u21, 'a'), try codepointAt(v, 0));
+    try testing.expectEqual(@as(u21, 0x00E9), try codepointAt(v, 1));
+    try testing.expectEqual(@as(u21, 'b'), try codepointAt(v, 2));
+    try testing.expectEqual(@as(u21, 0x1F980), try codepointAt(v, 3));
+    try testing.expectError(error.OutOfBounds, codepointAt(v, 4));
+}
+
+test "byteRangeForCodepoints: empty range, full range, mid-range" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    const v = try fromBytes(&heap, "aéb🦀"); // bytes: 1 + 2 + 1 + 4 = 8
+    // [0, 4) = full = byte [0, 8)
+    {
+        const r = try byteRangeForCodepoints(v, 0, 4);
+        try testing.expectEqual(@as(usize, 0), r.start);
+        try testing.expectEqual(@as(usize, 8), r.end);
+    }
+    // [1, 3) = "éb" = byte [1, 4)
+    {
+        const r = try byteRangeForCodepoints(v, 1, 3);
+        try testing.expectEqual(@as(usize, 1), r.start);
+        try testing.expectEqual(@as(usize, 4), r.end);
+    }
+    // [0, 0) = empty at start = byte [0, 0)
+    {
+        const r = try byteRangeForCodepoints(v, 0, 0);
+        try testing.expectEqual(@as(usize, 0), r.start);
+        try testing.expectEqual(@as(usize, 0), r.end);
+    }
+    // [4, 4) = empty at end = byte [8, 8)
+    {
+        const r = try byteRangeForCodepoints(v, 4, 4);
+        try testing.expectEqual(@as(usize, 8), r.start);
+        try testing.expectEqual(@as(usize, 8), r.end);
+    }
+}
+
+test "byteRangeForCodepoints: out-of-bounds returns error" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const v = try fromBytes(&heap, "aéb"); // 3 codepoints
+    try testing.expectError(error.OutOfBounds, byteRangeForCodepoints(v, 0, 4));
+    try testing.expectError(error.OutOfBounds, byteRangeForCodepoints(v, 4, 5));
+    try testing.expectError(error.OutOfBounds, byteRangeForCodepoints(v, 2, 1));
 }
 
 test "bytesEqual and hashHeader don't accidentally tamper with each other" {

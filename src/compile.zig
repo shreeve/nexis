@@ -79,6 +79,12 @@ const intern_mod = @import("intern");
 /// form is expanded BEFORE lowering. With null, no expansion
 /// fires (existing behavior preserved).
 const expand_mod = @import("expand");
+/// Phase 5.2a (peer-AI turn 77): Form-lowering allocates string-
+/// literal Values into a stable Heap so `Tiny.literal` can carry
+/// them across compile → run. `LowerCtx.heap` is the optional
+/// heap; when null, `.string` Forms still defer as before.
+const heap_mod = @import("heap");
+const string_mod = @import("string");
 
 pub const Inst = vm.Inst;
 pub const Routine = vm.Routine;
@@ -1068,11 +1074,19 @@ fn allocTiny(allocator: std.mem.Allocator, value: Tiny) CompileError!*Tiny {
 pub const LowerCtx = struct {
     env: ?*const LowerEnv = null,
     interner: ?*intern_mod.Interner = null,
+    /// Phase 5.2a (peer-AI turn 77): heap for allocating string-
+    /// literal Values during Form → Tiny lowering. Strings reach
+    /// the lowerer as `Datum.string` ([]const u8 in the reader's
+    /// arena) and need a stable Heap so the resulting Value can
+    /// live in `Tiny.literal` for the artifact's lifetime. When
+    /// null, `.string` Forms lower to `UnsupportedFeature` (same
+    /// as pre-5.2a behavior).
+    heap: ?*heap_mod.Heap = null,
 
     /// Create a child context with a new env, inheriting the
-    /// Interner unchanged.
+    /// Interner + heap unchanged.
     pub fn withEnv(self: LowerCtx, env: ?*const LowerEnv) LowerCtx {
-        return .{ .env = env, .interner = self.interner };
+        return .{ .env = env, .interner = self.interner, .heap = self.heap };
     }
 };
 
@@ -1179,7 +1193,21 @@ fn lowerFormEnv(
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
         // -- Phase 1 numeric literals beyond fixnum: defer. --
-        .real, .char, .string => return CompileError.UnsupportedFeature,
+        // `.real` (f64) + `.char` (Unicode scalar) still defer
+        // until a `Tiny.literal` path is wired for them.
+        .real, .char => return CompileError.UnsupportedFeature,
+        // Phase 5.2a (peer-AI turn 77): string literals lower
+        // through the heap plumbed into LowerCtx. The Value goes
+        // into `Tiny.literal`; the heap is the same one routines
+        // and closures use, so the string lifetime tracks the
+        // artifact. When no heap is available (older compile
+        // entry points), the form still defers — string literals
+        // in those code paths weren't supported before either.
+        .string => |bytes| blk: {
+            const h = ctx.heap orelse return CompileError.UnsupportedFeature;
+            const v = string_mod.fromBytes(h, bytes) catch return CompileError.OutOfMemory;
+            break :blk try allocTiny(allocator, .{ .literal = v });
+        },
         // Phase 3.1: `{k1 v1 k2 v2 ...}` as an expression →
         // each key + value is a normal expression, evaluated
         // left-to-right (peer-AI turn 65 §4). The runtime
@@ -2265,7 +2293,17 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
             error.OutOfMemory => return CompileError.OutOfMemory,
         };
     }
-    const ctx = LowerCtx{ .env = null, .interner = interner };
+    // Phase 5.2a (peer-AI turn 77): plumb the heap through
+    // `namespace.registry.heap` so `.string` Form datums lower
+    // to `Tiny.literal` with a stable allocation. Ad-hoc test
+    // entry points that pass a null namespace (or one without a
+    // registry) keep the prior `.string → UnsupportedFeature`
+    // behavior because LowerCtx.heap stays null.
+    const lower_heap: ?*heap_mod.Heap = if (namespace) |n|
+        (if (n.registry) |r| r.heap else null)
+    else
+        null;
+    const ctx = LowerCtx{ .env = null, .interner = interner, .heap = lower_heap };
     const tiny = lowerFormEnv(allocator, working_form, ctx) catch |err| {
         // Backend errors carry the macroexpanded form's span
         // — closer to the source than nothing. Per peer-AI

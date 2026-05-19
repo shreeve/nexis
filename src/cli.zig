@@ -37,6 +37,7 @@ const vector_mod = @import("vector");
 const champ_mod = @import("champ");
 const stdlib = @import("stdlib");
 const loader_mod = @import("loader");
+const string_mod = @import("string");
 
 const Value = value_mod.Value;
 
@@ -61,6 +62,17 @@ fn formatValue(v: Value, interner: *const intern_mod.Interner, writer: anytype) 
         .keyword => {
             const id: u32 = @intCast(v.payload);
             try writer.print(":{s}", .{interner.keywordName(id)});
+        },
+        // Phase 5.2a: display-mode formatter prints strings
+        // UNQUOTED and chars as their UTF-8 bytes. Readable mode
+        // (quoted strings, `\char` syntax) lands in 5.2c with
+        // `format.zig` + `prn` / `pr-str`.
+        .string => try writer.writeAll(string_mod.asBytes(v)),
+        .char => {
+            const scalar = v.asChar();
+            var utf8_buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(scalar, &utf8_buf) catch 0;
+            if (n > 0) try writer.writeAll(utf8_buf[0..n]);
         },
         .function => try writer.writeAll("#<fn>"),
         .var_ => {
@@ -130,13 +142,14 @@ fn formatValue(v: Value, interner: *const intern_mod.Interner, writer: anytype) 
         },
         .atom => {
             // Phase 5 Item 1 (peer-AI turn 75): print atoms
-            // OPAQUELY by pointer identity to avoid recursing
-            // through self-referential contained values. The
-            // contained value is observable via `@a` /
-            // `(deref a)` which evaluates first, then is
-            // printed via the normal recursive printer.
-            // ATOM.md §8.
-            try writer.print("#<atom 0x{x}>", .{v.payload});
+            // OPAQUELY to avoid recursing through self-
+            // referential contained values. Peer-AI turn 77 §D4
+            // dropped the pointer so user-facing output is
+            // deterministic (pointer values are unstable across
+            // runs and force every golden test to deref first).
+            // The contained value is still observable via `@a` /
+            // `(deref a)`.
+            try writer.writeAll("#<atom>");
         },
         else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),
     }

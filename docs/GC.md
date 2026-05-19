@@ -475,6 +475,41 @@ Confirmed sites in current code (Phase 5):
   document their rooting story when they land, OR explicitly extend
   this checklist.
 
+**Routine const pools — Phase 5.2a addition (peer-AI turn 78).**
+Compile-time-allocated heap Values can now appear in
+`Routine.consts[i].value`. As of Phase 5.2a this happens for
+**source string literals** (e.g. `"hello"` lowering via
+`string.fromBytes` against the heap reachable through
+`namespace.registry.heap`). Future widenings (real-literal `1.5`,
+char-literal `\é`, fixed-form byte-vector literals, etc.) will
+extend the set. When the GC migrates to triggered (alloc-driven or
+nursery-cycle) mode, the VM root walk MUST enumerate the const
+pool of every reachable `Routine`:
+
+```text
+for each frame F on VM.frames:
+    for each entry e in F.routine.consts:
+        if e == .value and e.value.isHeap():
+            mark(e.value's *HeapHeader)
+        if e == .routine:
+            recurse into e.routine.consts (no allocation, just walk)
+```
+
+Plus any `Routine` reachable via closure `prototype` pointers or
+the `var_table` `Var.root` chain — those must also have their
+const pools walked. None of this is wired today because the
+collector is explicit-only (§9), but the migration audit must
+catch every site where a routine-owned heap Value's only edge is
+through `consts[i].value`. v1 manual collect tests build Values
+directly from the test harness and never go through routine
+consts, so the hazard is structurally absent today and the test
+suite cannot catch it. The bytecode-load-const + load-var paths
+DO copy `consts[i].value` into a slot before any user code can
+allocate, so a slot-only-tracing collector that runs strictly
+between bytecode instructions is still safe; the hazard window
+opens with any pre-emption point inside a sequence of instructions
+that may allocate (e.g., concurrent / write-barrier designs).
+
 Migration plan when triggered-GC lands:
 
 1. Grep `vm.callValue` call sites in `src/stdlib.zig` (and
