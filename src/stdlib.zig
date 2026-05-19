@@ -87,6 +87,21 @@ pub fn installDb(db_ns: *Namespace) !void {
     }
 }
 
+/// Phase 5.2b (peer-AI turn 79): install `nexis.string/*` ops
+/// into the `nexis.string` namespace. NOT auto-referred (matches
+/// Clojure's `clojure.string`); users call qualified
+/// `(nexis.string/lower-case ...)`. CLI ordering must be
+/// installCore → installDb → installString → bootstrap core.nx
+/// (turn 79 §D7) so future composite definitions in core.nx
+/// can reference `nexis.string/*` without a load-order trap.
+pub fn installString(string_ns: *Namespace) !void {
+    for (string_fns) |entry| {
+        const v = try string_ns.intern(entry.name);
+        v.root = vm_mod.nativeFnValue(entry.descriptor);
+        v.bound = true;
+    }
+}
+
 const db_fns = [_]CoreEntry{
     // 4.0a connection + ref + auto-ephemeral primitives.
     .{ .name = "open", .descriptor = &native_db_open },
@@ -116,6 +131,18 @@ const db_fns = [_]CoreEntry{
     .{ .name = "snapshot", .descriptor = &native_db_snapshot },
     .{ .name = "release-snapshot!", .descriptor = &native_db_release_snapshot },
     .{ .name = "snapshot?", .descriptor = &native_db_snapshot_q },
+};
+
+/// Phase 5.2b (peer-AI turn 79): `nexis.string` namespace entries.
+/// Installed into `registry.string` via `installString`. NOT
+/// auto-referred — users call qualified `nexis.string/lower-case`.
+const string_fns = [_]CoreEntry{
+    .{ .name = "lower-case", .descriptor = &native_string_lower_case },
+    .{ .name = "upper-case", .descriptor = &native_string_upper_case },
+    .{ .name = "trim", .descriptor = &native_string_trim },
+    .{ .name = "split", .descriptor = &native_string_split },
+    .{ .name = "join", .descriptor = &native_string_join },
+    .{ .name = "replace", .descriptor = &native_string_replace },
 };
 
 /// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
@@ -346,6 +373,14 @@ const native_compare_and_set_bang = NativeFn{ .name = "compare-and-set!", .min_a
 const native_str = NativeFn{ .name = "str", .min_arity = 0, .max_arity = null, .call = &fnStr };
 const native_string_q = NativeFn{ .name = "string?", .min_arity = 1, .max_arity = 1, .call = &fnStringQ };
 const native_subs = NativeFn{ .name = "subs", .min_arity = 2, .max_arity = 3, .call = &fnSubs };
+
+// Phase 5 Item 2 sub-step 5.2b (peer-AI turn 79) — nexis.string namespace.
+const native_string_lower_case = NativeFn{ .name = "nexis.string/lower-case", .min_arity = 1, .max_arity = 1, .call = &fnStringLowerCase };
+const native_string_upper_case = NativeFn{ .name = "nexis.string/upper-case", .min_arity = 1, .max_arity = 1, .call = &fnStringUpperCase };
+const native_string_trim = NativeFn{ .name = "nexis.string/trim", .min_arity = 1, .max_arity = 1, .call = &fnStringTrim };
+const native_string_split = NativeFn{ .name = "nexis.string/split", .min_arity = 2, .max_arity = 2, .call = &fnStringSplit };
+const native_string_join = NativeFn{ .name = "nexis.string/join", .min_arity = 1, .max_arity = 2, .call = &fnStringJoin };
+const native_string_replace = NativeFn{ .name = "nexis.string/replace", .min_arity = 3, .max_arity = 3, .call = &fnStringReplace };
 const native_db_alter = NativeFn{ .name = "db/alter!", .min_arity = 3, .max_arity = null, .call = &fnDbAlter };
 // Phase 4.0d — scan + reduce-tree.
 const native_db_scan = NativeFn{ .name = "db/scan", .min_arity = 2, .max_arity = 4, .call = &fnDbScan };
@@ -1860,6 +1895,230 @@ fn fnSubs(vm: *VM, args: []const Value) VmError!Value {
     };
     const src_bytes = string_mod.asBytes(s);
     return string_mod.fromBytes(vm.ensureHeap(), src_bytes[byte_range.start..byte_range.end]) catch return VmError.OutOfMemory;
+}
+
+// =============================================================================
+// Phase 5 Item 2 sub-step 5.2b — nexis.string namespace (peer-AI turn 79)
+// =============================================================================
+//
+// ASCII-only case conversion + trim; literal-string split / replace;
+// join over nil/list/vector/set. All six fns are byte-preserving for
+// non-ASCII content (case conversion bypasses bytes ≥ 0x80; trim
+// recognizes only six ASCII whitespace chars; split/replace search
+// via `std.mem.indexOf` which is byte-exact, safe for valid UTF-8
+// because continuation bytes can never equal ASCII delimiter bytes
+// and multi-byte delimiters align only at codepoint boundaries).
+//
+// Errors are catchable keywords:
+//   :kind-mismatch          non-string s/sep/match, empty delim/match,
+//                           non-collection arg to join, etc.
+//   :arity-mismatch         enforced by NativeFn descriptor
+//
+// GC rooting: each fn allocates output via string.fromBytes /
+// vector.fromSlice AFTER holding inputs in Zig locals. Under v1's
+// explicit-only GC this is structurally safe; documented in
+// docs/GC.md §11.5.
+
+fn fnStringLowerCase(vm: *VM, args: []const Value) VmError!Value {
+    const s = args[0];
+    if (s.kind() != .string) return VmError.KindMismatch;
+    const src = string_mod.asBytes(s);
+    const buf = vm.allocator.alloc(u8, src.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(buf);
+    for (src, 0..) |b, i| {
+        buf[i] = if (b >= 'A' and b <= 'Z') b + ('a' - 'A') else b;
+    }
+    return string_mod.fromBytes(vm.ensureHeap(), buf) catch return VmError.OutOfMemory;
+}
+
+fn fnStringUpperCase(vm: *VM, args: []const Value) VmError!Value {
+    const s = args[0];
+    if (s.kind() != .string) return VmError.KindMismatch;
+    const src = string_mod.asBytes(s);
+    const buf = vm.allocator.alloc(u8, src.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(buf);
+    for (src, 0..) |b, i| {
+        buf[i] = if (b >= 'a' and b <= 'z') b - ('a' - 'A') else b;
+    }
+    return string_mod.fromBytes(vm.ensureHeap(), buf) catch return VmError.OutOfMemory;
+}
+
+/// `std.ascii.isWhitespace` recognizes the six ASCII whitespace
+/// characters: space, tab, LF, VT, FF, CR (turn 79 §D2). Inlined
+/// rather than calling so the fn is testable without Zig stdlib
+/// internals.
+inline fn isAsciiSpace(b: u8) bool {
+    return b == ' ' or b == '\t' or b == '\n' or b == 0x0B or b == 0x0C or b == '\r';
+}
+
+fn fnStringTrim(vm: *VM, args: []const Value) VmError!Value {
+    const s = args[0];
+    if (s.kind() != .string) return VmError.KindMismatch;
+    const src = string_mod.asBytes(s);
+    var lo: usize = 0;
+    var hi: usize = src.len;
+    while (lo < hi and isAsciiSpace(src[lo])) lo += 1;
+    while (hi > lo and isAsciiSpace(src[hi - 1])) hi -= 1;
+    return string_mod.fromBytes(vm.ensureHeap(), src[lo..hi]) catch return VmError.OutOfMemory;
+}
+
+/// `(nexis.string/split s delim)` — literal split, preserves
+/// trailing empties (turn 79 §D3 override of Clojure's regex
+/// trimming). Returns a vector.
+///   - Empty delimiter → :invalid-argument
+///   - Invalid UTF-8 in either arg → :utf8-error  (turn 80 §"Must-fix" #1)
+fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
+    const s = args[0];
+    const delim = args[1];
+    if (s.kind() != .string or delim.kind() != .string) return VmError.KindMismatch;
+    const src = string_mod.asBytes(s);
+    const sep = string_mod.asBytes(delim);
+    if (sep.len == 0) return VmError.InvalidArgument;
+    // Phase 5.2b (peer-AI turn 80 §"Must-fix" #1): validate both
+    // arguments as UTF-8 before scanning. Storage is byte-blob
+    // (STRING.md §2 invariant 4); without validation a delimiter
+    // like a lone 0xC3 byte could match the first byte of a
+    // multibyte codepoint and split mid-character, producing
+    // invalid UTF-8 output from valid-looking inputs. Validation
+    // is O(n) and the input is already byte-walked anyway.
+    if (!std.unicode.utf8ValidateSlice(src)) return VmError.Utf8Error;
+    if (!std.unicode.utf8ValidateSlice(sep)) return VmError.Utf8Error;
+
+    var fragments: std.ArrayList(Value) = .empty;
+    defer fragments.deinit(vm.allocator);
+    const heap = vm.ensureHeap();
+
+    var cursor: usize = 0;
+    while (cursor <= src.len) {
+        // `std.mem.indexOf(u8, haystack[cursor..], sep)` returns an
+        // offset relative to the suffix; remap to an absolute index.
+        const rel = std.mem.indexOf(u8, src[cursor..], sep);
+        if (rel) |r| {
+            const abs = cursor + r;
+            const frag = string_mod.fromBytes(heap, src[cursor..abs]) catch return VmError.OutOfMemory;
+            fragments.append(vm.allocator, frag) catch return VmError.OutOfMemory;
+            cursor = abs + sep.len;
+        } else {
+            const frag = string_mod.fromBytes(heap, src[cursor..]) catch return VmError.OutOfMemory;
+            fragments.append(vm.allocator, frag) catch return VmError.OutOfMemory;
+            break;
+        }
+    }
+    return vector_mod.fromSlice(heap, fragments.items) catch return VmError.OutOfMemory;
+}
+
+/// `(nexis.string/join coll)` / `(nexis.string/join sep coll)` —
+/// concatenate stringified elements, optionally separated. Element
+/// stringification uses the same `appendStringified` helper as
+/// `str` (5.2c lifts both into `format.zig`). Map rejection per
+/// turn 79 §D4: CHAMP iteration order isn't pinned, so excluding
+/// maps until that's settled.
+fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
+    const sep_bytes: []const u8 = if (args.len == 2) blk: {
+        if (args[0].kind() != .string) return VmError.KindMismatch;
+        break :blk string_mod.asBytes(args[0]);
+    } else &.{};
+    const coll = if (args.len == 2) args[1] else args[0];
+
+    // Validate the collection kind up front (peer-AI turn 78 §"Must-fix":
+    // kind check fires before any other branch).
+    switch (coll.kind()) {
+        .nil, .list, .persistent_vector, .persistent_set => {},
+        else => return VmError.KindMismatch,
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(vm.allocator);
+    const interner = vm.ensureInterner();
+    var first = true;
+
+    const appendOne = struct {
+        fn go(
+            vmm: *VM,
+            buff: *std.ArrayList(u8),
+            sep: []const u8,
+            firstp: *bool,
+            it: *const intern_mod.Interner,
+            elem: Value,
+        ) VmError!void {
+            if (!firstp.*) {
+                buff.appendSlice(vmm.allocator, sep) catch return VmError.OutOfMemory;
+            }
+            firstp.* = false;
+            try appendStringified(vmm.allocator, buff, elem, it);
+        }
+    }.go;
+
+    switch (coll.kind()) {
+        .nil => {},
+        .list => {
+            var node = coll;
+            while (node.kind() == .list and !list_mod.isEmpty(node)) {
+                try appendOne(vm, &buf, sep_bytes, &first, interner, list_mod.head(node));
+                node = list_mod.tail(node);
+            }
+        },
+        .persistent_vector => {
+            const n = vector_mod.count(coll);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                try appendOne(vm, &buf, sep_bytes, &first, interner, vector_mod.nth(coll, i));
+            }
+        },
+        .persistent_set => {
+            var it = champ_mod.setIter(coll);
+            while (it.next()) |elem| {
+                try appendOne(vm, &buf, sep_bytes, &first, interner, elem);
+            }
+        },
+        else => unreachable,
+    }
+
+    return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch return VmError.OutOfMemory;
+}
+
+/// `(nexis.string/replace s match replacement)` — literal,
+/// all-non-overlapping, left-to-right (turn 79 §D5).
+///   - Empty `match` → :invalid-argument
+///   - Invalid UTF-8 in any arg → :utf8-error  (turn 80 §"Must-fix" #1)
+/// After each match, cursor advances by `match.len` so
+/// `(replace "aaa" "aa" "x") → "xa"`.
+fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
+    const s = args[0];
+    const match = args[1];
+    const replacement = args[2];
+    if (s.kind() != .string or match.kind() != .string or replacement.kind() != .string) {
+        return VmError.KindMismatch;
+    }
+    const src = string_mod.asBytes(s);
+    const m = string_mod.asBytes(match);
+    const r = string_mod.asBytes(replacement);
+    if (m.len == 0) return VmError.InvalidArgument;
+    // Phase 5.2b (peer-AI turn 80 §"Must-fix" #1): validate all
+    // three byte slices as UTF-8 before scanning. Same rationale
+    // as fnStringSplit — keep `nexis.string/*` semantically a
+    // Unicode-string operation rather than a raw-byte one.
+    if (!std.unicode.utf8ValidateSlice(src)) return VmError.Utf8Error;
+    if (!std.unicode.utf8ValidateSlice(m)) return VmError.Utf8Error;
+    if (!std.unicode.utf8ValidateSlice(r)) return VmError.Utf8Error;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(vm.allocator);
+
+    var cursor: usize = 0;
+    while (cursor < src.len) {
+        const rel = std.mem.indexOf(u8, src[cursor..], m);
+        if (rel) |off| {
+            const abs = cursor + off;
+            buf.appendSlice(vm.allocator, src[cursor..abs]) catch return VmError.OutOfMemory;
+            buf.appendSlice(vm.allocator, r) catch return VmError.OutOfMemory;
+            cursor = abs + m.len;
+        } else {
+            buf.appendSlice(vm.allocator, src[cursor..]) catch return VmError.OutOfMemory;
+            cursor = src.len;
+        }
+    }
+    return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch return VmError.OutOfMemory;
 }
 
 // =============================================================================

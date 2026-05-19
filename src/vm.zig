@@ -1134,6 +1134,12 @@ pub const VmError = error{
     /// codec validate on construction, but a corrupt-codec or
     /// fuzz path could produce one. Mapped to `:utf8-error`.
     Utf8Error,
+    /// Phase 5 Item 2 sub-step 5.2b (peer-AI turn 80 §"Must-fix"
+    /// #2): argument is the right kind but an invalid value for
+    /// the operation — e.g., empty delimiter for split, empty
+    /// match for replace. Distinct from KindMismatch (which is
+    /// for wrong-kind args). Mapped to `:invalid-argument`.
+    InvalidArgument,
 };
 
 // =============================================================================
@@ -3164,6 +3170,7 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.NotDerefable => "not-derefable",
         VmError.AtomReEntry => "atom-re-entry",
         VmError.Utf8Error => "utf8-error",
+        VmError.InvalidArgument => "invalid-argument",
         // Unrecoverable: bytecode corruption / VM-internal /
         // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,

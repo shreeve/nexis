@@ -459,6 +459,20 @@ Confirmed sites in current code (Phase 5):
   call. Safe today; audit on migration anyway.
 - `src/stdlib.zig fnSwapValsBang` — builds `[old new]` vector AFTER
   writing `body.value = new`. (`docs/ATOM.md` §4.5)
+- **Phase 5.2a (peer-AI turn 78)** — `fnStr`, `fnSubs` build output
+  strings via `string.fromBytes` after the input args have been
+  copied off the stack into the args slice (which is reachable from
+  the calling frame). Safe today.
+- **Phase 5.2b (peer-AI turn 79)** — `nexis.string/*` fns all
+  allocate output strings/vectors after holding inputs in Zig
+  locals: `fnLowerCase`, `fnUpperCase`, `fnTrim` (`string.fromBytes`
+  output); `fnSplit` (each fragment is `fromBytes` then collected
+  into a `vector.fromSlice`); `fnJoin` (intermediate byte buffer
+  + final `string.fromBytes`); `fnReplace` (left-to-right rebuild
+  via byte buffer + `string.fromBytes`). Each call's input args
+  are reachable through the args slice; the intermediate byte
+  buffers are owned by the function's local `std.ArrayList(u8)`
+  freed on return. Safe today.
 - `src/stdlib.zig buildListFromSlice` — cons calls between iterations
   hold the intermediate `result` in a Zig local. (Pre-existing GC TODO
   comment at the function definition; predates atoms.)

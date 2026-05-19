@@ -252,3 +252,138 @@ strings happens at the reader and the codec; runtime corruption
 that reaches the storage layer is treated as a recoverable
 language error rather than a panic, matching the Phase 1
 "caller's responsibility" stance.
+
+---
+
+### 8. `nexis.string` namespace (Phase 5.2b — peer-AI turn 79)
+
+Separate from `nexis.core`, NOT auto-referred (matches Clojure's
+`clojure.string`). Users call qualified: `(nexis.string/lower-case
+"HI") → "hi"`. The `nexis.string` namespace is registered with
+`nexis.core` as parent so its own definitions can use core fns,
+but bare `(lower-case ...)` from user code resolves to
+`:unresolved-symbol` unless the user explicitly requires/aliases
+the namespace.
+
+**Installation order (frozen).** CLI + test harnesses install in
+this exact sequence so namespace + Var visibility is consistent
+at every load:
+
+```
+1. installCore(registry.core)        ; sequence/HOF/arithmetic/atoms/strings
+2. installDb(registry.db)            ; emdb primitives
+3. installString(registry.string)    ; nexis.string ops below
+4. bootstrap embedded core.nx        ; composite definitions
+```
+
+`installString` is called BEFORE `core.nx` so future composite
+definitions in `stdlib/core.nx` can refer to `nexis.string/*`
+without a load-order trap, even if no current core.nx form does
+so today.
+
+**Native fns:**
+
+```
+(nexis.string/lower-case s)        ; ASCII-only; non-ASCII bytes preserved
+(nexis.string/upper-case s)        ; ASCII-only; non-ASCII bytes preserved
+(nexis.string/trim s)              ; six ASCII whitespace chars
+(nexis.string/split s delim)       ; literal delimiter, preserves trailing empties
+(nexis.string/join coll)           ; concatenate, no separator
+(nexis.string/join sep coll)       ; concatenate with separator
+(nexis.string/replace s match new) ; literal match, all non-overlapping
+```
+
+**Frozen invariants:**
+
+1. **Case conversion is ASCII-only** (turn 77 §D10 + turn 79 §D1).
+   `lower-case` maps bytes `A-Z (0x41..0x5A)` → `a-z (0x61..0x7A)`;
+   `upper-case` does the inverse. Bytes ≥ 0x80 (every multi-byte
+   UTF-8 continuation or leading byte) are preserved
+   verbatim. UTF-8 validity preservation is by construction:
+   no codepoint boundary crosses an ASCII byte we modify.
+   Future Unicode case folding requires per-codepoint tables;
+   tracked in §6's "Unicode operations" deferral.
+
+2. **`trim` whitespace set** (turn 79 §D2): the six ASCII chars
+   space (0x20), tab (0x09), LF (0x0A), VT (0x0B), FF (0x0C),
+   CR (0x0D). Matches `std.ascii.isWhitespace`. Unicode
+   whitespace (e.g., U+00A0, U+2028, U+2029) is NOT recognized.
+   `trim` strips from both sides simultaneously (left + right);
+   no separate `triml`/`trimr` shipped in 5.2b.
+
+3. **`split` is a literal-string splitter** that preserves
+   trailing empties (turn 79 §D3 override). Examples:
+   ```
+   (nexis.string/split "a,b,c" ",") → ["a" "b" "c"]
+   (nexis.string/split "a,b,"  ",") → ["a" "b" ""]
+   (nexis.string/split ",,"    ",") → ["" "" ""]
+   (nexis.string/split ""      ",") → [""]
+   (nexis.string/split "a"     "foo") → ["a"]
+   ```
+   `delim` must be a non-empty string. Empty delimiter
+   surfaces `:invalid-argument` (peer-AI turn 80 §"Must-fix"
+   #2: empty delim is the right KIND but an invalid VALUE for
+   the operation, distinct from `:kind-mismatch` which is for
+   wrong-kind args). Result is a vector, not a list.
+   The "regex split" variant (Clojure's
+   `clojure.string/split` 2-arg form trims trailing empties)
+   is deferred to Item 6 alongside regex; our literal split
+   is honest fields. Search is byte-wise (`std.mem.indexOf`).
+
+   **UTF-8 validation**: `nexis.string/*` is a Unicode-string
+   API, not a byte-blob API (peer-AI turn 80 §"Must-fix" #1).
+   `split` validates both `s` and `delim` as UTF-8 before
+   scanning; malformed input → `:utf8-error`. This guarantees
+   that valid output strings would not be sliced
+   mid-codepoint by a byte-only delimiter like a lone 0xC3
+   (which is a valid UTF-8 leading byte but invalid as a
+   complete string). Storage (STRING.md §2) remains byte-blob
+   for codec compatibility; user-surface validation lives in
+   `nexis.string/*`.
+
+4. **`join` accepts nil + sequential + set** (turn 79 §D4):
+   - `nil` → `""`
+   - `list` / `vector` → walk in declaration order
+   - `set` → walk in iteration order (implementation-defined
+     for CHAMP; users requiring deterministic order should
+     sort beforehand)
+   - `map` → `:kind-mismatch` until map seq shape is pinned
+   Each element stringifies via the same display formatter
+   used by `(str ...)` (5.2a's `appendStringified`; 5.2c
+   replaces with `src/format.zig`). The separator must be a
+   `Kind.string`; non-string separator → `:kind-mismatch`.
+   `join` does NOT auto-stringify the separator.
+
+5. **`replace` is literal, all-non-overlapping, left-to-right**
+   (turn 79 §D5). `match` must be a non-empty string; empty
+   `match` → `:invalid-argument` (turn 80 §"Must-fix" #2:
+   distinct from `:kind-mismatch`). `replacement` must be a
+   `Kind.string`; non-string → `:kind-mismatch`. No special
+   replacement syntax (`$1`, `\1`, etc.) in literal mode.
+   After each match, scanning continues at
+   `match_pos + match.len` (NOT at `match_pos + 1`), so
+   `(replace "aaa" "aa" "x") → "xa"`, not `"xx"`. Consecutive
+   non-overlapping matches both fire:
+   `(replace "aaaa" "aa" "x") → "xx"`.
+
+   **UTF-8 validation** (turn 80 §"Must-fix" #1): all three
+   args (`s`, `match`, `replacement`) are validated as UTF-8
+   before scanning; malformed input → `:utf8-error`. Same
+   rationale as `split` — the user-surface API is a Unicode
+   string operation, not a raw-byte one.
+
+**v1 errors (catchable keywords):**
+
+| Keyword              | Source                                       |
+|----------------------|----------------------------------------------|
+| `:kind-mismatch`     | non-string `s` / non-string sep / non-collection `coll` for join (wrong KIND of arg) |
+| `:invalid-argument`  | empty delim for split, empty match for replace (right kind, wrong value; turn 80 §"Must-fix" #2) |
+| `:utf8-error`        | malformed UTF-8 in any input to `split` / `replace` (turn 80 §"Must-fix" #1) |
+| `:arity-mismatch`    | wrong argc on any fn                         |
+
+**GC-rooting checklist additions (peer-AI turn 79 §D9):** all six
+fns allocate output strings/vectors via `string.fromBytes` /
+`vector.fromSlice` AFTER holding their argument Values in Zig
+locals. Under v1's explicit-only GC this is structurally safe;
+the future-migration audit must walk each one. Tracked in
+`docs/GC.md` §11.5.

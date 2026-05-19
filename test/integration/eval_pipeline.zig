@@ -200,6 +200,9 @@ fn expectOutputProgram(src: []const u8, expected: []const u8) !void {
     // compat `db/deref` alias for `@x` on atoms) resolve.
     const db_ns_program = try registry.getOrCreate("db", registry.core);
     try stdlib.installDb(db_ns_program);
+    // Phase 5.2b: nexis.string namespace (qualified-only).
+    const string_ns_program = try registry.getOrCreate("nexis.string", registry.core);
+    try stdlib.installString(string_ns_program);
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const saved_current = registry.current;
@@ -269,6 +272,9 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     // calls and the `db/deref` alias resolve in tests.
     const db_ns_single = try registry.getOrCreate("db", registry.core);
     try stdlib.installDb(db_ns_single);
+    // Phase 5.2b: nexis.string namespace (qualified-only).
+    const string_ns_single = try registry.getOrCreate("nexis.string", registry.core);
+    try stdlib.installString(string_ns_single);
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     // Phase 3.3d: bootstrap composite core.nx layer into core.
@@ -1705,5 +1711,175 @@ test "phase5.2a end-to-end DB persistence of a string value (peer-AI turn 78 §R
         \\  (with-tx [tx conn] (db/put! tx r "hello-utf8-é-🦀"))
         \\  (with-read-tx [tx conn] (db/get tx r)))
     , "hello-utf8-é-🦀");
+}
+
+// =============================================================================
+// Phase 5 Item 2 sub-step 5.2b — nexis.string namespace (peer-AI turn 79)
+// =============================================================================
+//
+// Coverage map (every STRING.md §8 invariant gets at least one row):
+//   §8.1 ASCII case conversion preserves non-ASCII bytes
+//   §8.2 trim = six ASCII whitespace chars; both sides
+//   §8.3 literal split preserves trailing empties; vector return
+//   §8.4 join over nil/list/vector/set; map rejected; sep is string
+//   §8.5 replace literal, all-non-overlapping, left-to-right
+//
+// Also pins: qualified-only (NOT auto-referred into user).
+
+test "phase5.2b nexis.string is qualified-only (not auto-referred)" {
+    // Bare `(lower-case ...)` from user namespace must NOT
+    // resolve to nexis.string/lower-case. The user-friendly
+    // surface for short names will be require/alias (Phase 3.6
+    // already supports this) or `:refer`. Until then, qualified
+    // calls are the only path.
+    try expectOutput("(try (lower-case \"HI\") (catch any e e))", ":unbound-var");
+    try expectOutput("(nexis.string/lower-case \"HI\")", "hi");
+}
+
+test "phase5.2b lower-case + upper-case: ASCII baseline" {
+    try expectOutput("(nexis.string/lower-case \"HELLO\")", "hello");
+    try expectOutput("(nexis.string/lower-case \"Hello, World!\")", "hello, world!");
+    try expectOutput("(nexis.string/upper-case \"hello\")", "HELLO");
+    try expectOutput("(nexis.string/upper-case \"MixedCASE\")", "MIXEDCASE");
+    try expectOutput("(nexis.string/lower-case \"\")", "");
+    try expectOutput("(nexis.string/upper-case \"\")", "");
+}
+
+test "phase5.2b lower-case + upper-case: non-ASCII passes through unchanged" {
+    // ASCII letters map; non-ASCII bytes are preserved verbatim
+    // (peer-AI turn 79 §D1). UTF-8 validity is preserved by
+    // construction because bytes ≥ 0x80 are never modified.
+    try expectOutput("(nexis.string/lower-case \"HéLLO\")", "héllo");
+    try expectOutput("(nexis.string/upper-case \"abç\")", "ABç");
+    try expectOutput("(nexis.string/lower-case \"🦀A\")", "🦀a");
+    // Round-trip identity: codepoint count survives transform.
+    try expectOutput("(count (nexis.string/lower-case \"HéLLO\"))", "5");
+}
+
+test "phase5.2b trim: six ASCII whitespace chars; both sides" {
+    try expectOutput("(nexis.string/trim \"   hello   \")", "hello");
+    try expectOutput("(nexis.string/trim \"hello\")", "hello");
+    try expectOutput("(nexis.string/trim \"\")", "");
+    // nexis source uses `\t` `\n` `\r` escapes inside string
+    // literals (the reader decodes them per nexis.grammar §28.3).
+    // The Zig source-level "\\t" produces the two bytes `\` `t`,
+    // which the nexis reader then decodes into the tab byte.
+    try expectOutput("(nexis.string/trim \"\\t\\nhi\\r\\n\")", "hi");
+    // All-whitespace input → empty.
+    try expectOutput("(nexis.string/trim \"   \\t\\n\")", "");
+    // Unicode whitespace (U+00A0 NBSP) is NOT recognized in v1
+    // (turn 79 §D2). Bytes 0xC2 0xA0 pass through.
+    try expectOutput("(nexis.string/trim \"\u{00A0}x\u{00A0}\")", "\u{00A0}x\u{00A0}");
+}
+
+test "phase5.2b split: literal delimiter, preserves trailing empties" {
+    // Turn 79 §D3 override of Clojure's regex-trim behavior.
+    try expectOutput("(nexis.string/split \"a,b,c\" \",\")", "[a b c]");
+    try expectOutput("(nexis.string/split \"a,b,\" \",\")", "[a b ]");
+    try expectOutput("(nexis.string/split \",,\" \",\")", "[  ]");
+    try expectOutput("(nexis.string/split \"\" \",\")", "[]");
+    try expectOutput("(nexis.string/split \"a\" \"foo\")", "[a]");
+    // Multi-char delim.
+    try expectOutput("(nexis.string/split \"a::b::c\" \"::\")", "[a b c]");
+    // Multi-byte content split on ASCII delim (UTF-8 safety:
+    // continuation bytes never match ASCII delimiter).
+    try expectOutput("(nexis.string/split \"é,🦀,b\" \",\")", "[é 🦀 b]");
+}
+
+test "phase5.2b split: empty delim and non-string args (peer-AI turn 80 §#2)" {
+    // Empty delimiter is a string of the wrong VALUE (not the
+    // wrong KIND), so it surfaces `:invalid-argument` per turn
+    // 80's taxonomy improvement; non-string args remain
+    // `:kind-mismatch`.
+    try expectOutput("(try (nexis.string/split \"abc\" \"\") (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (nexis.string/split \"abc\" 42) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.string/split 1 \",\") (catch any e e))", ":kind-mismatch");
+}
+
+test "phase5.2b split: returns a vector" {
+    try expectOutput("(let [parts (nexis.string/split \"a,b,c\" \",\")] (count parts))", "3");
+    try expectOutput("(nth (nexis.string/split \"a,b,c\" \",\") 1)", "b");
+}
+
+test "phase5.2b join: 1-arity concatenates without separator" {
+    try expectOutput("(nexis.string/join [])", "");
+    try expectOutput("(nexis.string/join nil)", "");
+    try expectOutput("(nexis.string/join [\"a\" \"b\" \"c\"])", "abc");
+    try expectOutput("(nexis.string/join [1 2 :a])", "12:a");
+    try expectOutput("(nexis.string/join (list :x :y :z))", ":x:y:z");
+}
+
+test "phase5.2b join: 2-arity inserts separator between elements" {
+    try expectOutput("(nexis.string/join \",\" [])", "");
+    try expectOutput("(nexis.string/join \",\" [\"a\"])", "a");
+    try expectOutput("(nexis.string/join \",\" [\"a\" \"b\" \"c\"])", "a,b,c");
+    try expectOutput("(nexis.string/join \" \" [1 2 3])", "1 2 3");
+    try expectOutput("(nexis.string/join \"::\" [\"x\" \"y\" \"z\"])", "x::y::z");
+}
+
+test "phase5.2b join: rejects map; rejects non-string sep" {
+    // Turn 79 §D4: maps excluded until CHAMP iteration order is
+    // pinned; non-string sep surfaces :kind-mismatch.
+    try expectOutput("(try (nexis.string/join {:a 1 :b 2}) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.string/join :sep [1 2]) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.string/join 42 [1 2]) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.string/join \",\" 42) (catch any e e))", ":kind-mismatch");
+}
+
+test "phase5.2b join: round-trips with split" {
+    // Useful pin: (join sep (split s sep)) == s when sep is in s
+    // and trailing empties are preserved (turn 79 §D3).
+    try expectOutput(
+        \\(let [s "x,y,z" sep ","]
+        \\  (nexis.string/join sep (nexis.string/split s sep)))
+    , "x,y,z");
+    try expectOutput(
+        \\(let [s "a,b,," sep ","]
+        \\  (nexis.string/join sep (nexis.string/split s sep)))
+    , "a,b,,");
+}
+
+test "phase5.2b replace: literal, all-non-overlapping" {
+    try expectOutput("(nexis.string/replace \"abc\" \"b\" \"X\")", "aXc");
+    try expectOutput("(nexis.string/replace \"abababab\" \"ab\" \"X\")", "XXXX");
+    // Turn 79 §D5: after match, cursor jumps by match.len, so
+    // `(replace "aaa" "aa" "x") → "xa"`, not `"xx"`.
+    try expectOutput("(nexis.string/replace \"aaa\" \"aa\" \"x\")", "xa");
+    // Turn 80 §"Additional tests" pin: consecutive non-overlapping
+    // matches both fire.
+    try expectOutput("(nexis.string/replace \"aaaa\" \"aa\" \"x\")", "xx");
+    try expectOutput("(nexis.string/replace \"abc\" \"z\" \"x\")", "abc");
+    try expectOutput("(nexis.string/replace \"\" \"x\" \"y\")", "");
+    // Replacement can be longer/shorter than match.
+    try expectOutput("(nexis.string/replace \"a\" \"a\" \"foo\")", "foo");
+    try expectOutput("(nexis.string/replace \"foobar\" \"foo\" \"\")", "bar");
+}
+
+test "phase5.2b replace: empty match / non-string args (peer-AI turn 80 §#2)" {
+    // Empty match → :invalid-argument (right kind, wrong value);
+    // non-string args → :kind-mismatch.
+    try expectOutput("(try (nexis.string/replace \"abc\" \"\" \"x\") (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (nexis.string/replace \"abc\" :nope \"x\") (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.string/replace \"abc\" \"b\" 42) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.string/replace 42 \"b\" \"x\") (catch any e e))", ":kind-mismatch");
+}
+
+test "phase5.2b replace: UTF-8 boundary safety" {
+    // Valid UTF-8 in, valid UTF-8 out. `é` (0xC3 0xA9) won't be
+    // matched by ASCII `c` (UTF-8 continuation bytes never equal
+    // ASCII delimiter targets).
+    try expectOutput("(nexis.string/replace \"aécé\" \"c\" \"X\")", "aéXé");
+}
+
+test "phase5.2b end-to-end: case + trim + split + join chain" {
+    // Composite test pinning that the six fns interop cleanly.
+    try expectOutput(
+        \\(let [raw     "  HELLO,WORLD,FROM,NEXIS  "
+        \\      cleaned (nexis.string/trim raw)
+        \\      lower   (nexis.string/lower-case cleaned)
+        \\      parts   (nexis.string/split lower ",")
+        \\      joined  (nexis.string/join "/" parts)]
+        \\  joined)
+    , "hello/world/from/nexis");
 }
 

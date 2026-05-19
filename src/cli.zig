@@ -432,6 +432,14 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     // its auto-refer parent (matches user/core relationship).
     const db_ns = try registry.getOrCreate("db", registry.core);
     try stdlib.installDb(db_ns);
+    // Phase 5.2b (peer-AI turn 79): install `nexis.string` ops
+    // into the `nexis.string` namespace, with `nexis.core` as
+    // parent. NOT auto-referred into `user` — qualified calls
+    // only. Order is fixed: installCore → installDb → installString
+    // → bootstrapCoreNx, so any future core.nx form can refer to
+    // `nexis.string/*` without a load-order trap.
+    const string_ns = try registry.getOrCreate("nexis.string", registry.core);
+    try stdlib.installString(string_ns);
     var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);
     // Phase 3.3d: bootstrap the embedded core.nx composite
@@ -642,6 +650,11 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     // Phase 4.0a: install db primitives into the `db` ns.
     const db_ns = try registry.getOrCreate("db", registry.core);
     try stdlib.installDb(db_ns);
+    // Phase 5.2b (peer-AI turn 79): install `nexis.string` ops
+    // (qualified-only; not auto-referred). Install order is
+    // installCore → installDb → installString → bootstrapCoreNx.
+    const string_ns = try registry.getOrCreate("nexis.string", registry.core);
+    try stdlib.installString(string_ns);
     // Step #8b: default host macro table.
     var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);
