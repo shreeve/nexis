@@ -399,6 +399,11 @@ fn encodeValue(
         // PLAN §23 #25 v1-serializable set explicitly excludes them.
         // ATOM.md §6.
         .atom,
+        // Phase 5.3a (peer-AI turn 84): records are NOT in the
+        // §23 #25 serializable set. RecordTypeId is a per-VM
+        // u32 with no stable cross-process meaning; encoding
+        // it would mislead. PROTOCOLS.md §0 boundary.
+        .record,
         => return CodecError.UnserializableKind,
         // Sentinels (unbound, undef) and any other non-heap,
         // non-immediate kind reaching here is a runtime bug. Treat

@@ -342,6 +342,11 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     // `nexis.string/*` without a load-order trap.
     const string_ns = try registry.getOrCreate("nexis.string", registry.core);
     try stdlib.installString(string_ns);
+    // Phase 5.3a (peer-AI turn 84): install `nexis.internal`
+    // helpers (#%register-record-type / #%make-record / etc.).
+    // Macros emit qualified calls; users don't touch these.
+    const internal_ns = try registry.getOrCreate("nexis.internal", registry.core);
+    try stdlib.installInternal(internal_ns);
     var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);
     // Phase 3.3d: bootstrap the embedded core.nx composite
@@ -560,6 +565,9 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     // installCore → installDb → installString → bootstrapCoreNx.
     const string_ns = try registry.getOrCreate("nexis.string", registry.core);
     try stdlib.installString(string_ns);
+    // Phase 5.3a (peer-AI turn 84): nexis.internal (qualified-only).
+    const internal_ns = try registry.getOrCreate("nexis.internal", registry.core);
+    try stdlib.installInternal(internal_ns);
     // Step #8b: default host macro table.
     var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);

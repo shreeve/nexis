@@ -970,6 +970,16 @@ pub const HostCallResult = struct {
 // Errors
 // =============================================================================
 
+/// Phase 5.3a (peer-AI turn 84): one entry per `defrecord`.
+/// Names are owned by the registry (duped on registration).
+pub const RecordTypeEntry = struct {
+    id: u32,
+    ns_name: []const u8,
+    type_name: []const u8,
+    /// Declared field keyword names (interned strings).
+    field_names: []const []const u8,
+};
+
 pub const VmError = error{
     /// Known opcode / group / variant / operand kind that this VM
     /// commit hasn't wired yet (e.g., upvalue operand before
@@ -1153,6 +1163,15 @@ pub const VmError = error{
     /// `:io-error` because the issue is at the language boundary,
     /// not in the filesystem. Mapped to `:invalid-path`.
     InvalidPath,
+    /// Phase 5.3a (peer-AI turn 84): `defrecord` with a record
+    /// type name that already exists in the per-VM registry.
+    /// Rejected to avoid the confusing-state hazard where
+    /// existing instances reference a stale type_id.
+    /// Mapped to `:record-redefinition`.
+    RecordRedefinition,
+    /// Phase 5.3a: record-introspection ops expected a record
+    /// receiver but got something else. Mapped to `:not-a-record`.
+    NotARecord,
 };
 
 // =============================================================================
@@ -1289,6 +1308,13 @@ pub const VM = struct {
     /// absolute `/tmp` paths or pre-create dirs explicitly, so
     /// the auto-create branch is a no-op there).
     io: ?std.Io = null,
+
+    /// Phase 5.3a (peer-AI turn 84): per-VM record-type
+    /// registry. Lazy-init via `ensureRecordRegistry`. Each
+    /// `defrecord` allocates a new RecordTypeEntry; the
+    /// returned dense u32 id is used as `RecordBody.type_id`.
+    /// PROTOCOLS.md §3.
+    record_registry: std.ArrayList(RecordTypeEntry) = .empty,
     /// Step #9.1: global try-handler stack (peer-AI turn 59
     /// §D2). Push on `ctrl:try-enter`, pop on `ctrl:try-exit`,
     /// walk on `ctrl:throw`. Each Handler is keyed by
@@ -1382,6 +1408,16 @@ pub const VM = struct {
             for (self.db_connections.items) |conn_ptr| close_fn(conn_ptr);
         }
         self.db_connections.deinit(self.allocator);
+        // Phase 5.3a: free record-registry storage (the entry
+        // structs + their interned-name slices live in
+        // self.allocator).
+        for (self.record_registry.items) |entry| {
+            self.allocator.free(entry.ns_name);
+            self.allocator.free(entry.type_name);
+            for (entry.field_names) |fname| self.allocator.free(fname);
+            self.allocator.free(entry.field_names);
+        }
+        self.record_registry.deinit(self.allocator);
         // Heap (if initialized) is arena-backed in this staged
         // VM path. Its live-list is only bookkeeping; all
         // memory is reclaimed by `runtime_arena.deinit()`
@@ -1458,6 +1494,55 @@ pub const VM = struct {
             self.heap = heap_mod.Heap.init(self.runtime_arena.allocator());
         }
         return &self.heap.?;
+    }
+
+    /// Phase 5.3a (peer-AI turn 84): register a new record type
+    /// in the per-VM record registry. Returns the dense `u32`
+    /// type_id, or `RecordRedefinition` if a record type with
+    /// the same `(ns, name)` already exists. Names are duped
+    /// into `self.allocator` for stable ownership across the VM
+    /// lifetime. PROTOCOLS.md §3.1.
+    pub fn registerRecordType(
+        self: *VM,
+        ns_name: []const u8,
+        type_name: []const u8,
+        field_names: []const []const u8,
+    ) !u32 {
+        for (self.record_registry.items) |existing| {
+            if (std.mem.eql(u8, existing.ns_name, ns_name) and
+                std.mem.eql(u8, existing.type_name, type_name))
+            {
+                return error.RecordRedefinition;
+            }
+        }
+        const new_id: u32 = @intCast(self.record_registry.items.len);
+        const ns_dup = try self.allocator.dupe(u8, ns_name);
+        errdefer self.allocator.free(ns_dup);
+        const name_dup = try self.allocator.dupe(u8, type_name);
+        errdefer self.allocator.free(name_dup);
+        const fields_dup = try self.allocator.alloc([]const u8, field_names.len);
+        errdefer self.allocator.free(fields_dup);
+        var initialized: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < initialized) : (i += 1) self.allocator.free(fields_dup[i]);
+        }
+        for (field_names, 0..) |fname, i| {
+            fields_dup[i] = try self.allocator.dupe(u8, fname);
+            initialized = i + 1;
+        }
+        try self.record_registry.append(self.allocator, .{
+            .id = new_id,
+            .ns_name = ns_dup,
+            .type_name = name_dup,
+            .field_names = fields_dup,
+        });
+        return new_id;
+    }
+
+    pub fn recordTypeById(self: *const VM, id: u32) ?*const RecordTypeEntry {
+        if (id >= self.record_registry.items.len) return null;
+        return &self.record_registry.items[id];
     }
 
     /// Allocate a `Closure` from the runtime arena and return a
@@ -3196,6 +3281,8 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.IoError => "io-error",
         VmError.FileNotFound => "file-not-found",
         VmError.InvalidPath => "invalid-path",
+        VmError.RecordRedefinition => "record-redefinition",
+        VmError.NotARecord => "not-a-record",
         // Unrecoverable: bytecode corruption / VM-internal /
         // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,

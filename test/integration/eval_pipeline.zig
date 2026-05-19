@@ -120,6 +120,9 @@ fn expectOutputProgram(src: []const u8, expected: []const u8) !void {
     // Phase 5.2b: nexis.string namespace (qualified-only).
     const string_ns_program = try registry.getOrCreate("nexis.string", registry.core);
     try stdlib.installString(string_ns_program);
+    // Phase 5.3a: nexis.internal (qualified-only macro scaffolding).
+    const internal_ns_program = try registry.getOrCreate("nexis.internal", registry.core);
+    try stdlib.installInternal(internal_ns_program);
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const saved_current = registry.current;
@@ -194,6 +197,9 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     // Phase 5.2b: nexis.string namespace (qualified-only).
     const string_ns_single = try registry.getOrCreate("nexis.string", registry.core);
     try stdlib.installString(string_ns_single);
+    // Phase 5.3a: nexis.internal (qualified-only macro scaffolding).
+    const internal_ns_single = try registry.getOrCreate("nexis.internal", registry.core);
+    try stdlib.installInternal(internal_ns_single);
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     // Phase 3.3d: bootstrap composite core.nx layer into core.
@@ -2008,6 +2014,131 @@ test "phase5.4 for: :let modifier with destructuring-capable bindings" {
 // by the impl (expand.zig:expandFor); we don't add an integration
 // test because the test harness panics on compile errors rather
 // than surfacing them as catchable values.
+
+// =============================================================================
+// Phase 5 Item 3 sub-step 5.3a — records substrate (peer-AI turn 84)
+// =============================================================================
+
+test "phase5.3a defrecord: constructor + predicate + Counter-type-id" {
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (Counter? (->Counter 5)))
+    , "true");
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (Counter? 42))
+    , "false");
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (Counter? {:n 5}))
+    , "false");
+}
+
+test "phase5.3a defrecord: structural equality (turn 84 §D1)" {
+    // Two distinct constructor calls with the same field map
+    // are STRUCTURALLY equal.
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (= (->Counter 5) (->Counter 5)))
+    , "true");
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (= (->Counter 5) (->Counter 7)))
+    , "false");
+    // Records of DIFFERENT types with the same field map are NOT
+    // equal (type_id participates in equality).
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord A [n])
+        \\  (defrecord B [n])
+        \\  (= (->A 5) (->B 5)))
+    , "false");
+}
+
+test "phase5.3a defrecord: map-like get / assoc / dissoc / contains?" {
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (get (->Counter 5) :n))
+    , "5");
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (get (->Counter 5) :nope :missing))
+    , ":missing");
+    // `assoc` returns a record of the SAME type with updated fields.
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (let [c (->Counter 5)
+        \\        c2 (assoc c :n 99)]
+        \\    [(Counter? c2) (get c2 :n)]))
+    , "[true 99]");
+    // `dissoc` likewise preserves record type.
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (let [c (->Counter 5)
+        \\        c2 (dissoc c :n)]
+        \\    [(Counter? c2) (get c2 :n)]))
+    , "[true nil]");
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (contains? (->Counter 5) :n))
+    , "true");
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (contains? (->Counter 5) :nope))
+    , "false");
+}
+
+test "phase5.3a defrecord: extra keys allowed via map->Counter" {
+    // Declared fields are constructor metadata, NOT a storage
+    // restriction (turn 84 §D4). map->Counter passes its arg
+    // verbatim as the field map.
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (let [c (map->Counter {:n 5 :extra :hi})]
+        \\    [(Counter? c) (get c :extra)]))
+    , "[true :hi]");
+}
+
+test "phase5.3a defrecord: keys + vals walk the field map" {
+    // Single-key map → deterministic key/value output via
+    // `count` to avoid CHAMP iteration-order brittleness.
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (count (keys (->Counter 5))))
+    , "1");
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (count (vals (->Counter 5))))
+    , "1");
+}
+
+test "phase5.3a defrecord: records-as-map-keys use structural identity" {
+    // Two structurally-equal records hash + compare equal so
+    // they're the SAME key in a map. (Verified by storing under
+    // the first record and looking up with the second.)
+    try expectOutputProgram(
+        \\(do
+        \\  (defrecord Counter [n])
+        \\  (let [c1 (->Counter 5)
+        \\        c2 (->Counter 5)
+        \\        m  {c1 :found}]
+        \\    (get m c2)))
+    , ":found");
+}
 
 test "phase5.2b end-to-end: case + trim + split + join chain" {
     // Composite test pinning that the six fns interop cleanly.

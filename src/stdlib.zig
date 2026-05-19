@@ -45,6 +45,7 @@ const emdb_mod = @import("emdb");
 const atom_mod = @import("atom");
 const string_mod = @import("string");
 const format_mod = @import("format");
+const record_mod = @import("record");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -103,6 +104,19 @@ pub fn installString(string_ns: *Namespace) !void {
     }
 }
 
+/// Phase 5.3a (peer-AI turn 84): install `#%`-prefixed internal
+/// helpers into the `nexis.internal` namespace. NOT auto-
+/// referred; the `defrecord`/`defprotocol` macros emit qualified
+/// calls (`nexis.internal/#%register-record-type` etc.). User
+/// code does not call these directly.
+pub fn installInternal(internal_ns: *Namespace) !void {
+    for (internal_fns) |entry| {
+        const v = try internal_ns.intern(entry.name);
+        v.root = vm_mod.nativeFnValue(entry.descriptor);
+        v.bound = true;
+    }
+}
+
 const db_fns = [_]CoreEntry{
     // 4.0a connection + ref + auto-ephemeral primitives.
     .{ .name = "open", .descriptor = &native_db_open },
@@ -144,6 +158,17 @@ const string_fns = [_]CoreEntry{
     .{ .name = "split", .descriptor = &native_string_split },
     .{ .name = "join", .descriptor = &native_string_join },
     .{ .name = "replace", .descriptor = &native_string_replace },
+};
+
+/// Phase 5.3a (peer-AI turn 84): `nexis.internal` namespace
+/// entries. Installed via `installInternal`. NOT auto-referred;
+/// macros emit qualified calls.
+const internal_fns = [_]CoreEntry{
+    // 5.3a — records.
+    .{ .name = "#%register-record-type", .descriptor = &native_register_record_type },
+    .{ .name = "#%make-record", .descriptor = &native_make_record },
+    .{ .name = "#%record?", .descriptor = &native_record_q },
+    .{ .name = "#%record-type-id", .descriptor = &native_record_type_id },
 };
 
 /// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
@@ -389,6 +414,13 @@ const native_prn = NativeFn{ .name = "prn", .min_arity = 0, .max_arity = null, .
 const native_pr_str = NativeFn{ .name = "pr-str", .min_arity = 0, .max_arity = null, .call = &fnPrStr };
 const native_slurp = NativeFn{ .name = "slurp", .min_arity = 1, .max_arity = 1, .call = &fnSlurp };
 const native_spit = NativeFn{ .name = "spit", .min_arity = 2, .max_arity = 2, .call = &fnSpit };
+
+// Phase 5.3a (peer-AI turn 84) — record internals. All four
+// install into `nexis.internal`; macros emit qualified calls.
+const native_register_record_type = NativeFn{ .name = "#%register-record-type", .min_arity = 2, .max_arity = 2, .call = &fnRegisterRecordType };
+const native_make_record = NativeFn{ .name = "#%make-record", .min_arity = 2, .max_arity = 2, .call = &fnMakeRecord };
+const native_record_q = NativeFn{ .name = "#%record?", .min_arity = 1, .max_arity = 1, .call = &fnRecordQ };
+const native_record_type_id = NativeFn{ .name = "#%record-type-id", .min_arity = 1, .max_arity = 1, .call = &fnRecordTypeId };
 
 // Phase 5 Item 2 sub-step 5.2b (peer-AI turn 79) — nexis.string namespace.
 const native_string_lower_case = NativeFn{ .name = "nexis.string/lower-case", .min_arity = 1, .max_arity = 1, .call = &fnStringLowerCase };
@@ -924,6 +956,21 @@ fn fnAssoc(vm: *VM, args: []const Value) VmError!Value {
             ) catch return VmError.OutOfMemory;
             break :blk m;
         },
+        // Phase 5.3a (peer-AI turn 84): record `assoc` returns a
+        // NEW record of the SAME type with an updated field map.
+        // PROTOCOLS.md §2.1 + §4.2.
+        .record => blk: {
+            const cur_fields = record_mod.fieldsOf(coll);
+            const new_fields = champ_mod.mapAssoc(
+                heap,
+                cur_fields,
+                k,
+                v,
+                &dispatch_mod.hashValue,
+                &dispatch_mod.equal,
+            ) catch return VmError.OutOfMemory;
+            break :blk record_mod.withFields(heap, coll, new_fields) catch return VmError.OutOfMemory;
+        },
         // Vector assoc-by-index is a Clojure feature; defer to
         // a follow-up commit. v1: maps only.
         else => VmError.KindMismatch,
@@ -933,15 +980,29 @@ fn fnAssoc(vm: *VM, args: []const Value) VmError!Value {
 fn fnDissoc(vm: *VM, args: []const Value) VmError!Value {
     const coll = args[0];
     const k = args[1];
+    const heap = vm.ensureHeap();
     return switch (coll.kind()) {
         .persistent_map => champ_mod.mapDissoc(
-            vm.ensureHeap(),
+            heap,
             coll,
             k,
             &dispatch_mod.hashValue,
             &dispatch_mod.equal,
         ) catch VmError.OutOfMemory,
         .nil => coll,
+        // Phase 5.3a: record `dissoc` returns a NEW record of the
+        // SAME type with the key removed from the field map.
+        .record => blk: {
+            const cur_fields = record_mod.fieldsOf(coll);
+            const new_fields = champ_mod.mapDissoc(
+                heap,
+                cur_fields,
+                k,
+                &dispatch_mod.hashValue,
+                &dispatch_mod.equal,
+            ) catch return VmError.OutOfMemory;
+            break :blk record_mod.withFields(heap, coll, new_fields) catch return VmError.OutOfMemory;
+        },
         else => VmError.KindMismatch,
     };
 }
@@ -981,6 +1042,16 @@ fn fnGet(vm: *VM, args: []const Value) VmError!Value {
             if (u_idx >= vector_mod.count(coll)) break :blk default;
             break :blk vector_mod.nth(coll, u_idx);
         },
+        // Phase 5.3a: records are map-like for `get`.
+        .record => switch (champ_mod.mapGet(
+            record_mod.fieldsOf(coll),
+            k,
+            &dispatch_mod.hashValue,
+            &dispatch_mod.equal,
+        )) {
+            .present => |v| v,
+            .absent => default,
+        },
         else => return VmError.KindMismatch,
     };
 }
@@ -1012,42 +1083,54 @@ fn fnContainsQ(_: *VM, args: []const Value) VmError!Value {
             const u_idx: usize = @intCast(idx);
             break :blk value_mod.fromBool(u_idx < vector_mod.count(coll));
         },
+        // Phase 5.3a: records are map-like for `contains?`.
+        .record => value_mod.fromBool(switch (champ_mod.mapGet(
+            record_mod.fieldsOf(coll),
+            k,
+            &dispatch_mod.hashValue,
+            &dispatch_mod.equal,
+        )) {
+            .present => true,
+            .absent => false,
+        }),
         else => return VmError.KindMismatch,
     };
 }
 
 fn fnKeys(vm: *VM, args: []const Value) VmError!Value {
     const m = args[0];
-    return switch (m.kind()) {
-        .nil => list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory,
-        .persistent_map => blk: {
-            var collected: std.ArrayList(Value) = .empty;
-            defer collected.deinit(vm.allocator);
-            var it = champ_mod.mapIter(m);
-            while (it.next()) |e| {
-                collected.append(vm.allocator, e.key) catch return VmError.OutOfMemory;
-            }
-            break :blk try buildListFromSlice(vm, collected.items);
-        },
+    const map_v: Value = switch (m.kind()) {
+        .nil => return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory,
+        .persistent_map => m,
+        // Phase 5.3a: records expose their field-map keys.
+        .record => record_mod.fieldsOf(m),
         else => return VmError.KindMismatch,
     };
+    var collected: std.ArrayList(Value) = .empty;
+    defer collected.deinit(vm.allocator);
+    var it = champ_mod.mapIter(map_v);
+    while (it.next()) |e| {
+        collected.append(vm.allocator, e.key) catch return VmError.OutOfMemory;
+    }
+    return try buildListFromSlice(vm, collected.items);
 }
 
 fn fnVals(vm: *VM, args: []const Value) VmError!Value {
     const m = args[0];
-    return switch (m.kind()) {
-        .nil => list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory,
-        .persistent_map => blk: {
-            var collected: std.ArrayList(Value) = .empty;
-            defer collected.deinit(vm.allocator);
-            var it = champ_mod.mapIter(m);
-            while (it.next()) |e| {
-                collected.append(vm.allocator, e.value) catch return VmError.OutOfMemory;
-            }
-            break :blk try buildListFromSlice(vm, collected.items);
-        },
+    const map_v: Value = switch (m.kind()) {
+        .nil => return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory,
+        .persistent_map => m,
+        // Phase 5.3a: records expose their field-map values.
+        .record => record_mod.fieldsOf(m),
         else => return VmError.KindMismatch,
     };
+    var collected: std.ArrayList(Value) = .empty;
+    defer collected.deinit(vm.allocator);
+    var it = champ_mod.mapIter(map_v);
+    while (it.next()) |e| {
+        collected.append(vm.allocator, e.value) catch return VmError.OutOfMemory;
+    }
+    return try buildListFromSlice(vm, collected.items);
 }
 
 /// `(conj coll & xs)` — persistent add. Kind-specific:
@@ -2264,6 +2347,77 @@ fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
         else => return VmError.IoError,
     };
     return value_mod.nilValue();
+}
+
+// =============================================================================
+// Phase 5.3a — record internals (peer-AI turn 84; PROTOCOLS.md §4)
+// =============================================================================
+//
+// Four internal helpers installed in `nexis.internal` (NOT auto-
+// referred). `defrecord` expansion emits qualified calls. v1
+// users don't touch these directly; they're macro-emit-only
+// scaffolding.
+
+/// `(#%register-record-type "ns/name" [:field1 :field2 ...])`
+///   → fixnum type_id
+///
+/// Looks up the receiver VM's namespace registry to derive the
+/// effective ns prefix (the current namespace), then calls
+/// `vm.registerRecordType`. Re-defining a record type with the
+/// same (ns, name) raises `:record-redefinition` (peer-AI turn 84
+/// §3.1 — avoids stale type_id hazard).
+fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
+    const full_name_v = args[0];
+    const fields_vec = args[1];
+    if (full_name_v.kind() != .string) return VmError.KindMismatch;
+    if (fields_vec.kind() != .persistent_vector) return VmError.KindMismatch;
+
+    const full_name = string_mod.asBytes(full_name_v);
+    // Split on the LAST `/` for `ns/name`.
+    var ns_name: []const u8 = "";
+    var type_name: []const u8 = full_name;
+    if (std.mem.lastIndexOfScalar(u8, full_name, '/')) |slash_idx| {
+        ns_name = full_name[0..slash_idx];
+        type_name = full_name[slash_idx + 1 ..];
+    }
+
+    const interner = vm.ensureInterner();
+    const n = vector_mod.count(fields_vec);
+    const field_names = vm.allocator.alloc([]const u8, n) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(field_names);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const f = vector_mod.nth(fields_vec, i);
+        if (f.kind() != .keyword) return VmError.KindMismatch;
+        const id: u32 = @intCast(f.payload);
+        field_names[i] = interner.keywordName(id);
+    }
+
+    const new_id = vm.registerRecordType(ns_name, type_name, field_names) catch |err| switch (err) {
+        error.RecordRedefinition => return VmError.RecordRedefinition,
+        error.OutOfMemory => return VmError.OutOfMemory,
+    };
+    return value_mod.fromFixnum(@intCast(new_id)) orelse VmError.IntegerOverflow;
+}
+
+/// `(#%make-record type-id field-map)` → record Value.
+fn fnMakeRecord(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .fixnum) return VmError.KindMismatch;
+    const id = args[0].asFixnum();
+    if (id < 0) return VmError.KindMismatch;
+    if (args[1].kind() != .persistent_map) return VmError.KindMismatch;
+    return record_mod.make(vm.ensureHeap(), @intCast(id), args[1]) catch return VmError.OutOfMemory;
+}
+
+/// `(#%record? x)` → bool.
+fn fnRecordQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(args[0].kind() == .record);
+}
+
+/// `(#%record-type-id record)` → fixnum.
+fn fnRecordTypeId(_: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .record) return VmError.NotARecord;
+    return value_mod.fromFixnum(@intCast(record_mod.typeId(args[0]))) orelse VmError.IntegerOverflow;
 }
 
 // =============================================================================

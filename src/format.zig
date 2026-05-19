@@ -51,6 +51,7 @@ const heap_mod = @import("heap");
 const vm_mod = @import("vm");
 const atom_mod = @import("atom");
 const db_mod = @import("db");
+const record_mod = @import("record");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -125,6 +126,12 @@ pub fn format(
         // round-trippable. The codec is the serialization layer;
         // these kinds throw `:unserializable` there.
         .atom => try writer.writeAll("#<atom>"),
+        // Phase 5.3a (peer-AI turn 84): records render as
+        // `#<record type-id={id}>` opaque in both modes (turn 84
+        // §"Format" — intentionally NOT reader-roundtrippable
+        // until tagged-literal reader support exists). The full
+        // `#my.ns/Counter{:n 1}` shape is deferred.
+        .record => try writer.print("#<record type-id={d}>", .{record_mod.typeId(v)}),
         .durable_ref => try formatDurableRef(v, writer, interner),
         .db_connection => try writer.writeAll("#<db-connection>"),
         .db_write_txn => try writer.writeAll("#<db-write-txn>"),

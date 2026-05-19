@@ -47,6 +47,7 @@ const champ = @import("champ");
 const transient_mod = @import("transient");
 const db_mod = @import("db");
 const atom_mod = @import("atom");
+const record_mod = @import("record");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -113,6 +114,10 @@ pub const Collector = struct {
             // Value. Self-references work via mark-bit short-
             // circuit in `mark`. ATOM.md §7.
             .atom => atom_mod.trace(h, self),
+            // Phase 5.3a (peer-AI turn 84): record trace walks
+            // the contained field map (type_id is a plain u32,
+            // not a heap value). PROTOCOLS.md §2.1.
+            .record => record_mod.trace(h, self),
             // Reserved heap kinds without implementations in v1.
             // PANIC, not silent no-op, per GC.md §5 / peer-AI turn 14:
             // a silent no-op on a kind that SHOULD trace would create

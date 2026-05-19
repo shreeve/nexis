@@ -2932,6 +2932,234 @@ fn expandFor(
     return inner;
 }
 
+// ---- defrecord (5.3a — records only; no protocol clauses) ----
+//
+// Spec: PROTOCOLS.md §4.2.
+//
+//   (defrecord Counter [n])
+//   →
+//   (do
+//     (def Counter-type-id (nexis.internal/#%register-record-type
+//                            "<ns>/Counter" [:n]))
+//     (defn ->Counter [n]
+//       (nexis.internal/#%make-record Counter-type-id
+//                                     (assoc {} :n n)))
+//     (defn map->Counter [m]
+//       (nexis.internal/#%make-record Counter-type-id m))
+//     (defn Counter? [x]
+//       (and (nexis.internal/#%record? x)
+//            (= Counter-type-id (nexis.internal/#%record-type-id x)))))
+//
+// In 5.3a, ANY protocol clause AFTER the field-vector raises
+// MalformedMacroCall. 5.3c relaxes this and parses protocol
+// bodies. The PROTOCOLS.md §0 boundary lists 5.3a as
+// "no protocols yet" — explicit deferral.
+//
+// Records' `Counter?` uses `and` + `=` which expand later;
+// `defrecord` itself just emits the surface forms.
+
+fn expandDefrecord(
+    ctx: *ExpandContext,
+    call_form: *const Form,
+    args: []const *Form,
+) ExpandError!*Form {
+    // Minimum: (defrecord Name [fields])
+    if (args.len < 2) return ExpandError.MalformedMacroCall;
+    const name_form = args[0];
+    if (name_form.datum != .symbol) return ExpandError.MalformedMacroCall;
+    if (name_form.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
+    const fields_form = args[1];
+    if (fields_form.datum != .vector) return ExpandError.MalformedMacroCall;
+
+    // 5.3a: reject any extra args (protocol clauses) — those land
+    // in 5.3c.
+    if (args.len > 2) return ExpandError.MalformedMacroCall;
+
+    const rec_name = name_form.datum.symbol.name;
+    const origin = call_form.origin;
+
+    // Build the fully-qualified record-type name string. Use
+    // the macroexpand context's current namespace if available;
+    // otherwise emit just the bare name (the registry treats
+    // empty ns as "no qualifier", and re-registration safety
+    // is per-name).
+    const ns_name: []const u8 = if (ctx.namespace) |ns| ns.name else "";
+    const full_name = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ns_name, rec_name });
+
+    // Helper: build the keyword-vector of field names (verifies
+    // each field is an unqualified symbol; emits `:fieldname`
+    // keywords).
+    const field_count = fields_form.datum.vector.len;
+    var keyword_items = try ctx.allocator.alloc(*Form, field_count);
+    for (fields_form.datum.vector, 0..) |fld, i| {
+        if (fld.datum != .symbol) return ExpandError.MalformedMacroCall;
+        if (fld.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
+        const kw = try ctx.allocator.create(Form);
+        kw.* = .{
+            .datum = .{ .keyword = .{ .ns = null, .name = fld.datum.symbol.name } },
+            .origin = origin,
+        };
+        keyword_items[i] = kw;
+    }
+    const fields_kw_vec = try makeVector(ctx, keyword_items, origin);
+
+    // Names we synthesize.
+    const type_id_name = try std.fmt.allocPrint(ctx.allocator, "{s}-type-id", .{rec_name});
+    const ctor_name = try std.fmt.allocPrint(ctx.allocator, "->{s}", .{rec_name});
+    const map_ctor_name = try std.fmt.allocPrint(ctx.allocator, "map->{s}", .{rec_name});
+    const pred_name = try std.fmt.allocPrint(ctx.allocator, "{s}?", .{rec_name});
+
+    // Qualified internal-helper Forms.
+    const register_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%register-record-type", origin);
+    const make_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%make-record", origin);
+    const record_q_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%record?", origin);
+    const record_type_id_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%record-type-id", origin);
+
+    // String literal for the full record-type name.
+    const full_name_str = try ctx.allocator.create(Form);
+    full_name_str.* = .{
+        .datum = .{ .string = full_name },
+        .origin = origin,
+    };
+
+    // ---- Form 1: (def Counter-type-id
+    //                 (nexis.internal/#%register-record-type
+    //                   "ns/Counter" [:n]))
+    const reg_call = try makeListInline(ctx, origin, &.{
+        register_sym,
+        full_name_str,
+        fields_kw_vec,
+    });
+    const def_type_id = try makeListInline(ctx, origin, &.{
+        try makeSymbol(ctx, "def", origin),
+        try makeSymbol(ctx, type_id_name, origin),
+        reg_call,
+    });
+
+    // ---- Form 2: (defn ->Counter [n] (#%make-record id (assoc {} :n n)))
+    // Build the field-map construction: (assoc (assoc ... {} :f0 f0) :f1 f1 ...)
+    // Easier: start from `{}` literal map, then `assoc` each field.
+    const ctor_body_inner: *Form = blk: {
+        const empty_map = try makeEmptyMap(ctx, origin);
+        var acc = empty_map;
+        for (fields_form.datum.vector) |fld| {
+            const sym_name = fld.datum.symbol.name;
+            const kw = try ctx.allocator.create(Form);
+            kw.* = .{
+                .datum = .{ .keyword = .{ .ns = null, .name = sym_name } },
+                .origin = origin,
+            };
+            const sym_form = try makeSymbol(ctx, sym_name, origin);
+            acc = try makeListInline(ctx, origin, &.{
+                try makeSymbol(ctx, "assoc", origin),
+                acc,
+                kw,
+                sym_form,
+            });
+        }
+        break :blk acc;
+    };
+    const ctor_make_call = try makeListInline(ctx, origin, &.{
+        make_sym,
+        try makeSymbol(ctx, type_id_name, origin),
+        ctor_body_inner,
+    });
+    // Build parameter vector [n m ...] for the constructor.
+    const ctor_params = try ctx.allocator.alloc(*Form, field_count);
+    for (fields_form.datum.vector, 0..) |fld, i| {
+        ctor_params[i] = try makeSymbol(ctx, fld.datum.symbol.name, origin);
+    }
+    const ctor_param_vec = try makeVector(ctx, ctor_params, origin);
+    const defn_ctor = try makeListInline(ctx, origin, &.{
+        try makeSymbol(ctx, "defn", origin),
+        try makeSymbol(ctx, ctor_name, origin),
+        ctor_param_vec,
+        ctor_make_call,
+    });
+
+    // ---- Form 3: (defn map->Counter [m] (#%make-record id m))
+    const map_ctor_call = try makeListInline(ctx, origin, &.{
+        make_sym,
+        try makeSymbol(ctx, type_id_name, origin),
+        try makeSymbol(ctx, "m", origin),
+    });
+    const map_ctor_params = try ctx.allocator.alloc(*Form, 1);
+    map_ctor_params[0] = try makeSymbol(ctx, "m", origin);
+    const defn_map_ctor = try makeListInline(ctx, origin, &.{
+        try makeSymbol(ctx, "defn", origin),
+        try makeSymbol(ctx, map_ctor_name, origin),
+        try makeVector(ctx, map_ctor_params, origin),
+        map_ctor_call,
+    });
+
+    // ---- Form 4: (defn Counter? [x]
+    //                (and (#%record? x)
+    //                     (= Counter-type-id (#%record-type-id x))))
+    const pred_body = try makeListInline(ctx, origin, &.{
+        try makeSymbol(ctx, "and", origin),
+        try makeListInline(ctx, origin, &.{
+            record_q_sym,
+            try makeSymbol(ctx, "x", origin),
+        }),
+        try makeListInline(ctx, origin, &.{
+            try makeSymbol(ctx, "=", origin),
+            try makeSymbol(ctx, type_id_name, origin),
+            try makeListInline(ctx, origin, &.{
+                record_type_id_sym,
+                try makeSymbol(ctx, "x", origin),
+            }),
+        }),
+    });
+    const pred_params = try ctx.allocator.alloc(*Form, 1);
+    pred_params[0] = try makeSymbol(ctx, "x", origin);
+    const defn_pred = try makeListInline(ctx, origin, &.{
+        try makeSymbol(ctx, "defn", origin),
+        try makeSymbol(ctx, pred_name, origin),
+        try makeVector(ctx, pred_params, origin),
+        pred_body,
+    });
+
+    // ---- Wrap all four in (do ...).
+    return try makeListInline(ctx, origin, &.{
+        try makeSymbol(ctx, "do", origin),
+        def_type_id,
+        defn_ctor,
+        defn_map_ctor,
+        defn_pred,
+    });
+}
+
+/// Helper: make a qualified symbol form (`ns/name`).
+fn makeQualifiedSymbol(ctx: *ExpandContext, ns_name: []const u8, sym_name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    const f = try ctx.allocator.create(Form);
+    f.* = .{
+        .datum = .{ .symbol = .{ .ns = ns_name, .name = sym_name } },
+        .origin = origin,
+    };
+    return f;
+}
+
+/// Helper: make an empty map literal `{}` Form.
+fn makeEmptyMap(ctx: *ExpandContext, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    const f = try ctx.allocator.create(Form);
+    const items = try ctx.allocator.alloc(*Form, 0);
+    f.* = .{
+        .datum = .{ .map = items },
+        .origin = origin,
+    };
+    return f;
+}
+
+/// Helper: make a list from inline slice (allocates the items
+/// array, copies the inputs, returns the list Form). Convenience
+/// for the long sequence of `try ctx.allocator.alloc(*Form, N); items[0] = ...`
+/// patterns this file would otherwise need.
+fn makeListInline(ctx: *ExpandContext, origin: reader_mod.SrcSpan, items: []const *Form) ExpandError!*Form {
+    const buf = try ctx.allocator.alloc(*Form, items.len);
+    for (items, 0..) |it, i| buf[i] = it;
+    return try makeList(ctx, buf, origin);
+}
+
 /// Helper: build `(throw :KEYWORD)` for the no-matching-clause
 /// fallthrough used by `case` and `condp`.
 fn makeThrow(ctx: *ExpandContext, kw_name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
@@ -3273,6 +3501,9 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     try table.put(allocator, "case", expandCase);
     try table.put(allocator, "condp", expandCondp);
     try table.put(allocator, "for", expandFor);
+    // Phase 5 Item 3 sub-step 5.3a (peer-AI turn 84): defrecord
+    // (records only; protocol-clause support lands in 5.3c).
+    try table.put(allocator, "defrecord", expandDefrecord);
     return table;
 }
 

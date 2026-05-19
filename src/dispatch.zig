@@ -66,6 +66,7 @@ const champ = @import("champ");
 const transient = @import("transient");
 const db = @import("db");
 const atom = @import("atom");
+const record = @import("record");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -168,6 +169,11 @@ pub fn heapHashBase(v: Value) u64 {
         // hash, or atom-as-map-key would break across mutations).
         // ATOM.md §3, SEMANTICS.md §2.6 amendment.
         .atom => @as(u64, atom.hashHeader(h)),
+        // Phase 5.3a (peer-AI turn 84): records hash STRUCTURALLY
+        // over (type_id, field_map). Field-map hash uses
+        // dispatch.hashValue recursively (one-way through this
+        // function pointer). PROTOCOLS.md §2.1.
+        .record => @as(u64, record.hashHeader(h, &hashValue)),
         // Transients are not hashable per SEMANTICS §3.2 / PLAN §9.4:
         // "transient — throws `:no-hash-on-transient`". Using a
         // transient as a map key or set element is a programming error.
@@ -348,6 +354,10 @@ pub fn heapEqual(a: Value, b: Value) bool {
         // NOT equal — mutable identity values must not participate
         // in structural equality. ATOM.md §3.
         .atom => atom.atomsEqual(ah, bh),
+        // Phase 5.3a (peer-AI turn 84): records use STRUCTURAL
+        // equality: same type_id + equal field maps. Field-map
+        // equality delegates to dispatch.equal recursively.
+        .record => record.recordsEqual(ah, bh, &equal),
         // Transient equality is bit-identity on the wrapper header
         // (TRANSIENT.md §9, SEMANTICS §2.6). Two transient wrappers
         // are equal iff they are the same allocation. The top-level
@@ -668,6 +678,10 @@ test "eqCategory + domainByteForKind: exhaustive table matches SEMANTICS §2.6/�
         // Phase 5 Item 1 (peer-AI turn 75): atoms are kind-local
         // identity-valued; domain byte 34 == @intFromEnum(.atom).
         .{ .kind = .atom, .cat = .kind_local, .domain = 34 },
+        // Phase 5.3a (peer-AI turn 84): records are kind-local
+        // (structural over field map but NOT cross-kind equal to
+        // plain maps). Domain byte 35.
+        .{ .kind = .record, .cat = .kind_local, .domain = 35 },
     };
     for (cases) |c| {
         try testing.expectEqual(c.cat, eqCategory(c.kind));

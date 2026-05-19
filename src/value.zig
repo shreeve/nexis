@@ -86,7 +86,15 @@ pub const Kind = enum(u8) {
     /// GC traces the contained value; codec rejects as
     /// `:unserializable`. See `docs/ATOM.md`.
     atom = 34,
-    // 35..63 reserved for future heap kinds.
+    /// Phase 5 Item 3 / 5.3a (peer-AI turn 84): user-defined
+    /// record value. Payload is `*HeapHeader` → `RecordBody
+    /// { type_id, _pad, fields }`. STRUCTURAL equality + hash
+    /// (same type_id + equal field maps). NOT serializable.
+    /// See `docs/PROTOCOLS.md` §2.1.
+    record = 35,
+    // 36..63 reserved for future heap kinds (Phase 5.3b
+    // reserves 36 = protocol + 37 = protocol_fn).
+
 
     // ---- Runtime-private sentinels (never escape public API) ----
     unbound = 64,
