@@ -1,0 +1,13 @@
+; examples/lib/shapes/protocol.nx
+;
+; The Shape protocol. Loaded into namespace `lib.shapes.protocol`;
+; consumed by `lib.shapes.records`, `lib.shapes.builtins`, and the
+; top-level driver `examples/shapes-app.nx` via `require`.
+;
+; Phase 5 EXIT demo: §1 of 4 — defprotocol in its own module.
+
+(ns lib.shapes.protocol)
+
+(defprotocol Shape
+  (area [s])
+  (describe [s]))

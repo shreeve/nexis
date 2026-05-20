@@ -1,0 +1,46 @@
+; examples/lib/shapes/records.nx
+;
+; Concrete record types implementing `lib.shapes.protocol/Shape`.
+;
+; Phase 5 EXIT demo: §2 of 4 — records with inline protocol impls
+; (5.3c surface) + `extend-type` over a record defined elsewhere
+; (5.3d surface). Cross-namespace protocol reference via the `p`
+; alias.
+
+(ns lib.shapes.records)
+
+(require '[lib.shapes.protocol :as p])
+
+; ---- inline impls (5.3c) ----
+
+(defrecord Circle [radius]
+  p/Shape
+  (area [c]
+    ; nexis v1 has no fractional arithmetic — areas are in
+    ; centi-pi units (radius² × 314). Output is illustrative;
+    ; what we're demonstrating is protocol dispatch.
+    (let* [r (get c :radius)]
+      (* 314 r r)))
+  (describe [c]
+    (str "Circle r=" (get c :radius))))
+
+(defrecord Rectangle [width height]
+  p/Shape
+  (area [r] (* (get r :width) (get r :height)))
+  (describe [r]
+    (str "Rectangle " (get r :width) "x" (get r :height))))
+
+; ---- separate extend-type over a record (5.3d) ----
+;
+; Triangle is declared without an inline impl, then extended
+; via `extend-type` — same target (`p/Shape`), different
+; mechanism. Verifies both shapes converge in the protocol
+; registry.
+
+(defrecord Triangle [base height])
+
+(extend-type Triangle
+  p/Shape
+  (area [t] (* (get t :base) (get t :height)))
+  (describe [t]
+    (str "Triangle b=" (get t :base) " h=" (get t :height))))

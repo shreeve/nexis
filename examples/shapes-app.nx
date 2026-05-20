@@ -1,0 +1,110 @@
+; examples/shapes-app.nx
+;
+; ============================================================
+; Phase 5 EXIT DEMO — multi-file Clojure-style application.
+; ============================================================
+;
+; Per PLAN.md §21 Phase 5 EXIT CRITERION + HANDOFF.md §10.8:
+;
+;     "A non-trivial Clojure-style application — not just a
+;      script, but a MULTI-FILE PROJECT USING atoms +
+;      protocols + records + REQUIRE + multiple stdlib
+;      utilities — runs end-to-end on nexis with no source
+;      modifications beyond namespace renames."
+;
+; Run:
+;     $ ./bin/nexis run examples/shapes-app.nx
+;
+; This driver requires three modules:
+;
+;     lib.shapes.protocol  — defprotocol Shape (area, describe)
+;     lib.shapes.records   — Circle / Rectangle / Triangle records
+;                            with inline + extend-type impls
+;     lib.shapes.builtins  — extend-protocol over :fixnum /
+;                            :string / :any
+;
+; Then exercises the full Phase 5 surface end-to-end:
+;
+;     Phase 5.1  — atoms       (total-area atom + swap!)
+;     Phase 5.2  — strings + I/O (str + println)
+;     Phase 5.3a — records      (Circle/Rectangle/Triangle)
+;     Phase 5.3b — protocols    (Shape dispatch)
+;     Phase 5.3c — inline impls (Circle/Rectangle have inline
+;                                Shape clauses)
+;     Phase 5.3d — extend-type  (Triangle), extend-protocol
+;                  over built-ins, :any default, satisfies?
+;     Phase 5.4  — for loop     (iterate shapes vector)
+;     Phase 5.5  — core.nx      (every?, frequencies)
+
+(require '[lib.shapes.protocol :as p])
+(require '[lib.shapes.records :as r])
+(require '[lib.shapes.builtins])  ; side-effect: register impls
+
+; -------------------------------------------------------------
+; Stateful aggregate (Phase 5.1 atom)
+; -------------------------------------------------------------
+
+(def total-area (atom 0))
+
+(defn report [shape]
+  (swap! total-area + (p/area shape))
+  (str (p/describe shape)
+       " => area=" (p/area shape)
+       " satisfies?=" (satisfies? p/Shape shape)))
+
+; -------------------------------------------------------------
+; The fleet of shapes — records from `lib.shapes.records` plus
+; built-in receivers covered by `lib.shapes.builtins`.
+; -------------------------------------------------------------
+
+(def shapes
+  [(r/->Circle 5)
+   (r/->Rectangle 3 4)
+   (r/->Triangle 6 4)
+   42                   ; treated as square (5.3d :fixnum impl)
+   "hello"              ; treated as label (5.3d :string impl)
+   :unknown-shape])     ; caught by :any default
+
+(println "=== Phase 5 EXIT demo: multi-file shapes ===")
+(println "")
+
+(println "Per-shape reports (cross-namespace dispatch):")
+(for [s shapes]
+  (println "  " (report s)))
+
+(println "")
+(println "Aggregate state:")
+(println "  total-area atom =" (deref total-area))
+
+(println "")
+(println "satisfies? probes (cross-namespace protocol ref):")
+(println "  p/Shape ⊇ Circle   ?" (satisfies? p/Shape (r/->Circle 5)))
+(println "  p/Shape ⊇ Triangle ?" (satisfies? p/Shape (r/->Triangle 6 4)))
+(println "  p/Shape ⊇ :fixnum  ?" (satisfies? p/Shape 42))
+(println "  p/Shape ⊇ :string  ?" (satisfies? p/Shape "hi"))
+(println "  p/Shape ⊇ :keyword ? (caught by :any) =>"
+         (satisfies? p/Shape :anything))
+
+; -------------------------------------------------------------
+; Phase 5.5 stdlib cross-check: every? + frequencies
+; -------------------------------------------------------------
+
+(println "")
+(println "Phase 5.5 stdlib over the protocol dispatch:")
+(println "  every? satisfies? p/Shape: "
+         (every? (fn* [s] (satisfies? p/Shape s)) shapes))
+(println "  frequencies of describe-prefixes:")
+(let* [first-words (for [s shapes]
+                     (let* [d (p/describe s)]
+                       ; isolate the first space-delimited word
+                       (let* [i (loop* [k 0]
+                                  (if (< k (count d))
+                                    (if (= " " (subs d k (inc k)))
+                                      k
+                                      (recur (inc k)))
+                                    (count d)))]
+                         (subs d 0 i))))]
+  (println "   " (frequencies first-words)))
+
+(println "")
+(println "=== demo complete ===")

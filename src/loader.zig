@@ -184,7 +184,14 @@ pub const Loader = struct {
 
         for (forms) |form| {
             const current_ns = self.registry.current;
-            const compiled = compile_mod.compileFormFullWithMacrosSpanPersistentRegistry(
+            // Phase 5 EXIT polish: pass `self` as the load_callback
+            // so that `(require ...)` forms INSIDE the file we're
+            // loading work transitively. Without this, a required
+            // file's nested require would expand into UnboundVar /
+            // MacroExpansionFailure because the inner expander has
+            // no loader to dispatch to. Caught by the multi-file
+            // shapes demo (shapes-app.nx → records.nx → protocol.nx).
+            const compiled = compile_mod.compileFormFullWithMacrosSpanPersistentRegistryLoader(
                 ra,
                 form,
                 current_ns,
@@ -193,6 +200,7 @@ pub const Loader = struct {
                 null,
                 ra,
                 self.registry,
+                .{ .user_data = @ptrCast(self), .load = &Loader.loadCallback },
             ) catch return LoadError.LoadCompileFailed;
             const routine = compiled.toRoutine("loader");
             self.vm.frames.items[0].routine = &routine;

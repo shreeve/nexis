@@ -1,0 +1,33 @@
+; examples/lib/shapes/builtins.nx
+;
+; Extends `lib.shapes.protocol/Shape` to built-in kinds + the
+; `:any` default fallback. Loaded purely for side effects —
+; the top-level driver requires this so that dispatch over
+; fixnums / strings / unknown receivers has impls registered.
+;
+; Phase 5 EXIT demo: §3 of 4 — `extend-protocol` over built-in
+; kinds (5.3d) + `:any` default (5.3d).
+
+(ns lib.shapes.builtins)
+
+(require '[lib.shapes.protocol :as p])
+
+; Treat bare fixnums as squares (side-length); strings as
+; labels with area zero.
+
+(extend-protocol p/Shape
+  :fixnum
+  (area [n] (* n n))
+  (describe [n] (str "Square of side " n))
+
+  :string
+  (area [_] 0)
+  (describe [s] (str "Label: " s)))
+
+; Default fallback catches any other receiver kind without
+; an explicit impl (keywords, nil, vectors, maps, etc.).
+
+(extend-protocol p/Shape
+  :any
+  (area [_] 0)
+  (describe [x] (str "Unknown: " x)))

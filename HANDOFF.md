@@ -57,8 +57,12 @@ If all four are present: proceed.
 ============================================================
 
 ============================================================
-PHASES 0–5 ALL COMPLETE. Phase 5 EXIT criterion MET (see
-examples/shapes.nx). Currently positioned for Phase 6
+PHASES 0–5 ALL COMPLETE. Phase 5 EXIT criterion strictly
+MET — examples/shapes-app.nx is a multi-file Clojure-style
+application (driver + 3 required modules) using atoms +
+protocols + records + cross-namespace `(require ...)` + multiple
+stdlib utilities, runs end-to-end with no source modifications
+beyond namespace renames. Currently positioned for Phase 6
 (performance + benchmarks per PLAN.md §21 weeks 27–30).
 ============================================================
 
@@ -257,10 +261,16 @@ rm -rf tmp
 /path/to/nexis/bin/nexis run /path/to/nexis/examples/todo-app.nx
 # Second run shows `:completed 1` — state PERSISTS
 
-# Phase 5 EXIT — protocols + records demo (no persistence)
+# Phase 5 EXIT — multi-file Clojure-style app (canonical demo
+# per HANDOFF §10.8: protocols + records + atoms + require
+# across 3 modules)
+/path/to/nexis/bin/nexis run /path/to/nexis/examples/shapes-app.nx
+# Expects the multi-file dispatch table to print across all
+# 6 receiver kinds; cross-namespace satisfies? probes return
+# true; aggregate atom accumulates total-area=9650.
+
+# Phase 5 quick reference — same demo in one file
 /path/to/nexis/bin/nexis run /path/to/nexis/examples/shapes.nx
-# Expect the protocol-dispatch table to print correctly with
-# all 6 shape kinds (Circle/Rectangle/Triangle/fixnum/string/:any).
 ```
 If either smoke is red, the substrate has regressed; do not
 proceed with Phase 6 until that's resolved.
@@ -1750,11 +1760,16 @@ The force remains with you.
    $ rm -rf tmp
    $ /path/to/bin/nexis run /path/to/examples/todo-app.nx
    $ /path/to/bin/nexis run /path/to/examples/todo-app.nx
-   $ /path/to/bin/nexis run /path/to/examples/shapes.nx
+   $ /path/to/bin/nexis run /path/to/examples/shapes-app.nx
    ```
-   Second todo-app run should show `:completed 1` (state
-   PERSISTED across processes). The shapes demo should print
-   the full protocol-dispatch table with all 6 receiver kinds.
+   Second todo-app run shows `:completed 1` (state PERSISTED
+   across processes). The shapes-app demo is the canonical
+   Phase 5 EXIT — a multi-file project (driver + 3 required
+   modules) using atoms + protocols + records + cross-
+   namespace dispatch + multiple stdlib utilities, all
+   running with no source modifications beyond namespace
+   names. Should print 6 per-shape reports + total-area=9650
+   + satisfies? probes all true.
 4. Read PLAN.md §0-§3 (positioning + non-goals) and §19 (perf
    projections — the source of truth for Phase 6 targets) and
    §21 (roadmap with current ship status). Read §23 (frozen
@@ -1820,10 +1835,10 @@ the prompt above):
   new AI resumes this conversation, it inherits all of that
   history. Don't make peer re-derive what it already pinned.
 
-- **Test count baseline**: `675 phase2 + 461 reader/golden/
-  property = 1136 full suite` is the ground truth for
-  "clean starting state" at HEAD `b03e9b2` (Phase 5.3d EXIT).
-  If the new AI reports a different count, something is off —
+- **Test count baseline**: 1143 tests in the full
+  `zig build test` suite is the ground truth for "clean
+  starting state" at the Phase 5 EXIT commit. If the new
+  AI reports a different count, something is off —
   investigate before proceeding.
 
 - **Spec convergence**: COMPILER.md, VM.md, MACROEXPAND.md,
