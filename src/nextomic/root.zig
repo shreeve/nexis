@@ -12,6 +12,7 @@ pub const schema = @import("schema.zig");
 pub const db = @import("db.zig");
 pub const transact = @import("transact.zig");
 pub const relation = @import("relation.zig");
+pub const query = @import("query.zig");
 
 pub const Val = key.Val;
 pub const ValueType = key.ValueType;
@@ -39,4 +40,5 @@ test {
     _ = db;
     _ = transact;
     _ = relation;
+    _ = query;
 }
