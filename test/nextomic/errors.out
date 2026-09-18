@@ -1,0 +1,25 @@
+:nextomic/unknown-attribute
+:nextomic/unknown-attribute
+:nextomic/value-type
+:nextomic/value-type
+:nextomic/unique
+:nextomic/conflict
+:nextomic/no-entity
+:nextomic/no-entity
+:nextomic/tx-data
+:nextomic/tx-data
+:nextomic/tx-data
+:nextomic/tx-data
+:db/open-failed
+ok a failed transaction leaves the basis alone
+ok the store still works after every failure
+:nextomic/closed
+:nextomic/closed
+:nextomic/closed
+:nextomic/closed
+:nextomic/closed
+:nextomic/closed
+:nextomic/closed
+ok release is idempotent
+ok reopened store is at the last committed basis
+:errors-done

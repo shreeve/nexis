@@ -1,0 +1,39 @@
+; test/nextomic/with-conn.nx — with-conn releases on normal exit and on
+; throw, returns the body's value, and passes connect options through.
+
+(require '[nextomic :as d])
+
+(defn check [label ok]
+  (println (if ok "ok" "FAIL") label)
+  (when-not ok (throw :check-failed)))
+
+(def escaped (atom nil))
+
+(def result
+  (d/with-conn [c "with-conn.edb"]
+    (reset! escaped c)
+    (d/transact! c [{:db/ident :note/text :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
+    (d/basis-t (d/db c))))
+(check "with-conn returns the body's value" (= 2 result))
+(check "the connection is released on normal exit"
+       (= :nextomic/closed (try (d/db @escaped) (catch any e e))))
+(println @escaped)
+
+(def thrown
+  (try
+    (d/with-conn [c "with-conn.edb"]
+      (reset! escaped c)
+      (d/transact! c [{:db/id "n" :note/text "kept"}])
+      (throw :boom))
+    (catch any e e)))
+(check "the throw propagates" (= :boom thrown))
+(check "the connection is released on throw"
+       (= :nextomic/closed (try (d/db @escaped) (catch any e e))))
+
+(d/with-conn [c "with-conn.edb" {:sync :none}]
+  (check "the transaction committed before the throw persisted"
+         (= 1 (count (d/datoms (d/db c) :aevt :note/text))))
+  (d/sync c)
+  (check "nested with-conn on another store"
+         (= 1 (d/with-conn [c2 "with-conn-2.edb"] (d/basis-t (d/db c2))))))
+:with-conn-done

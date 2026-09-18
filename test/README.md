@@ -12,6 +12,7 @@ present; see "removed directories" below).
 | `src/*.zig` (inline `test` blocks) | Per-module unit tests + integration smoke tests | `zig build test` |
 | `test/prop/` | Cross-module property tests (12 files: primitive, intern, heap, string, list, bignum, vector, hamt, transient, gc, codec, db) | `zig build test` |
 | `test/golden/` | Phase 0 reader golden tests (`.nx` source ↔ `.sexp` / `.err` expected) | `zig build golden` (or `zig build test`) |
+| `test/nextomic/` | Nextomic end-to-end scripts (`.nx` run through `bin/nexis` ↔ `.out` expected stdout), in a scratch directory, in order; `persist-1`/`persist-2` share one store across two processes | `zig build nextomic-nx` (or `zig build test`) |
 | `test/fuzz/` | Reserved for Phase 6+ fuzz testing. Empty for now. | — |
 | `test/integration/` | Reserved for Phase 6+ end-to-end source-to-execution tests. Empty for now. | — |
 

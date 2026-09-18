@@ -1075,6 +1075,52 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Build and run nexis (forwards args after `--`)");
     run_step.dependOn(&run_nexis.step);
 
+    // -------------------------------------------------------------------------
+    // test/nextomic/*.nx — end-to-end Nextomic scripts run through the
+    // nexis binary (NEXTOMIC.md §8). Every script and its expected
+    // stdout are copied into one generated directory that is also the
+    // scripts' working directory, so the store files they create are
+    // fresh whenever the binary or a script changes and the persistence
+    // pair shares one file. Scripts run in the listed order.
+    // -------------------------------------------------------------------------
+
+    const nextomic_nx_step = b.step("nextomic-nx", "Run the test/nextomic end-to-end scripts through bin/nexis");
+    {
+        const scripts = [_][]const u8{
+            "basics",
+            "indexes",
+            "time",
+            "errors",
+            "with-conn",
+            "persist-1",
+            "persist-2",
+        };
+        const scratch = b.addWriteFiles();
+        _ = scratch.addCopyFile(nexis_exe.getEmittedBin(), "nexis");
+        for (scripts) |name| {
+            _ = scratch.addCopyFile(b.path(b.fmt("test/nextomic/{s}.nx", .{name})), b.fmt("{s}.nx", .{name}));
+            _ = scratch.addCopyFile(b.path(b.fmt("test/nextomic/{s}.out", .{name})), b.fmt("{s}.out", .{name}));
+        }
+        var previous: ?*std.Build.Step = null;
+        for (scripts) |name| {
+            const expected = b.build_root.handle.readFileAlloc(
+                b.graph.io,
+                b.fmt("test/nextomic/{s}.out", .{name}),
+                b.allocator,
+                .limited(1 << 20),
+            ) catch @panic("test/nextomic: missing expected-output file");
+            const run = b.addRunArtifact(nexis_exe);
+            run.addArg("run");
+            run.addArg(b.fmt("{s}.nx", .{name}));
+            run.setCwd(scratch.getDirectory());
+            run.expectExitCode(0);
+            run.expectStdOutEqual(expected);
+            if (previous) |p| run.step.dependOn(p);
+            previous = &run.step;
+        }
+        nextomic_nx_step.dependOn(previous.?);
+    }
+
     const golden_mod = b.createModule(.{
         .root_source_file = b.path("src/golden.zig"),
         .target = target,
@@ -1172,6 +1218,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_db_tests.step);
     test_step.dependOn(&run_nextomic_handle_tests.step);
     test_step.dependOn(&run_nextomic_tests.step);
+    test_step.dependOn(nextomic_nx_step);
     test_step.dependOn(&run_prop_nextomic_key_tests.step);
     test_step.dependOn(&run_prop_nextomic_tx_tests.step);
     test_step.dependOn(&run_prop_compile_tests.step);

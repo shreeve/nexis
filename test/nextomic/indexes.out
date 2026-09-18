@@ -1,0 +1,25 @@
+[[4294967297 :item/sku B-1 3 true] [4294967297 :item/name Bolt 3 true] [4294967297 :item/qty 500 3 true] [4294967297 :item/color :steel 3 true] [4294967297 :item/part-of 4294967296 3 true]]
+[[4294967297 :item/qty 500 3 true]]
+[[4294967297 :item/qty 500 3 true]]
+ok exact datom with the wrong value is empty
+ok lookup ref as the entity component
+ok a gap filters: every :item/name datom holding Bolt
+[4294967296 4294967297 4294967298]
+[[4294967298 :item/name Nut 3 true]]
+ok aevt with a value after a gap
+[4294967297 4294967298]
+[[4294967297 :item/sku B-1 3 true]]
+ok avet with entity after a gap
+ok avet on an unindexed attribute reads nothing
+ok a value nobody holds matches nothing
+[4294967297 4294967298]
+[[4294967297 :item/part-of 4294967296 3 true]]
+ok vaet by lookup ref
+ok vaet of an entity nobody references is empty
+ok keyword value round trip
+ok keyword the store never saw matches nothing
+ok unknown ident as entity matches nothing
+[[1 :db/ident :db/ident 1 true] [1 :db/valueType :db.type/keyword 1 true] [1 :db/cardinality :db.cardinality/one 1 true] [1 :db/unique :db.unique/identity 1 true] [1 :db/index true 1 true]]
+ok datoms carry their transaction
+ok current datoms are assertions
+:indexes-done
