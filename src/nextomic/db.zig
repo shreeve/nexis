@@ -406,7 +406,12 @@ pub const DatomScan = struct {
         folded: Store.FoldScan,
     },
 
-    /// Components that came after a gap in the prefix.
+    /// Components the prefix does not pin exactly: those after a gap,
+    /// and always `v`. A value encoding that ends in the `0x00`
+    /// terminator is a byte prefix of every key whose value continues
+    /// with an escaped NUL (`"a"` is a prefix of `"a\x00b"`), so a
+    /// prefix scan covering `v` still admits longer values; comparing
+    /// the row's whole value section makes the match exact.
     pub const Filter = struct {
         e: ?u64 = null,
         a: ?u32 = null,
@@ -419,11 +424,11 @@ pub const DatomScan = struct {
                 .avet => .{ 'a', 'v', 'e' },
                 .vaet => .{ 'v', 'a', 'e' },
             };
-            var f: Filter = .{};
+            var f: Filter = .{ .v = comps.v };
             for (order[covered..]) |c| switch (c) {
                 'e' => f.e = comps.e,
                 'a' => f.a = comps.a,
-                'v' => f.v = comps.v,
+                'v' => {},
                 else => unreachable,
             };
             return f;

@@ -754,11 +754,17 @@ const Ctx = struct {
     }
 
     /// The entity holding `(a v)` in the committed AVET tree, or null.
+    /// The first key under the prefix may carry a longer value whose
+    /// encoding continues past the terminator of `vbytes` (an escaped
+    /// NUL), so the value section is compared exactly.
     fn probeAvet(self: *Ctx, a: u32, vbytes: []const u8) !?u64 {
         const prefix = try key.prefixBytes(self.arena, .avet, .{ .a = a, .v = vbytes });
         var s = try self.conn.store.scan(self.txn, self.conn.store.trees.cur(.avet), prefix);
-        const kv = s.next() orelse return null;
-        return (try key.unpackKey(.avet, false, kv.key)).e;
+        while (s.next()) |kv| {
+            const parts = try key.unpackKey(.avet, false, kv.key);
+            if (std.mem.eql(u8, parts.v, vbytes)) return parts.e;
+        }
+        return null;
     }
 
     /// The entity holding `(a v)` in the tree or the overlay, or null.
@@ -1759,4 +1765,52 @@ test "with: Lisp tx-data" {
     w.finish();
     try testing.expectError(error.TxData, with(tc.conn, arena, try string_mod.fromBytes(&heap, "nope"), .{}));
     try testing.expect(tc.conn.speculative == null);
+}
+
+test "a string with an escaped NUL never aliases its prefix under a prefix scan" {
+    const tc = try TestConn.init("tx_nul_alias");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const name = try attrId(tc, "user/name");
+
+    // x's identity is "a\x00b", whose encoding starts with the encoding of "a".
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "x" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a\x00b" } } } },
+    }, .{});
+    const x = r1.tempids[0].eid;
+    const db = try tc.conn.db();
+    const a_bytes = try key.valBytes(arena, .{ .string = "a" });
+
+    // Reads: no datom carries "a".
+    try testing.expect((try db.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a" } } })) == null);
+    try testing.expectEqual(@as(usize, 0), (try db.datoms(arena, .avet, .{ .a = email, .v = a_bytes })).len);
+    try testing.expectEqual(@as(usize, 0), (try db.datoms(arena, .eavt, .{ .e = x, .a = email, .v = a_bytes })).len);
+    try testing.expectEqual(@as(usize, 0), (try db.datoms(arena, .aevt, .{ .a = email, .e = x, .v = a_bytes })).len);
+    try testing.expectEqual(@as(?u64, x), try db.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a\x00b" } } }));
+
+    // Writes: "a" is free, so another entity may take it, and a tempid
+    // claiming it is a new entity rather than an upsert onto x.
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "z" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "z" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Zed" } } } },
+    }, .{});
+    const z = r2.tempids[0].eid;
+    try testing.expect(z != x);
+    const db2 = try tc.conn.db();
+    const xs = try db2.datoms(arena, .eavt, .{ .e = x, .a = email });
+    try testing.expectEqual(@as(usize, 1), xs.len);
+    try testing.expectEqualStrings("a\x00b", xs[0].v.string);
+    try testing.expectEqual(@as(?u64, z), try db2.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a" } } }));
+    // A lookup ref on "a" now names z, not x.
+    try testing.expectError(error.NoEntity, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .lookup = .{ .a = .{ .id = email }, .v = .{ .string = "a\x00" } } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "nobody" } } } },
+    }, .{}));
+    const r3 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .lookup = .{ .a = .{ .id = email }, .v = .{ .string = "a" } } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Zed2" } } } },
+    }, .{});
+    try testing.expectEqual(z, r3.tx_data[0].e);
 }
