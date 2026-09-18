@@ -369,9 +369,13 @@ fn expandList(
     }
     const head_sym = head_form.datum.symbol;
 
-    // Qualified symbols (foo/bar): not Phase-2 surface. Pass
-    // through; lowerForm catches and raises UnsupportedFeature.
-    if (head_sym.ns != null) {
+    // Qualified head (`alias/name` or `ns/name`): a macro Var in
+    // that namespace expands; anything else is an ordinary call
+    // resolved through the registry at compile time.
+    if (head_sym.ns) |ns_prefix| {
+        if (qualifiedMacro(ctx, ns_prefix, head_sym.name)) |user_var| {
+            return try invokeUserMacro(ctx, env, user_var, list_form, items, depth);
+        }
         return try expandOrdinaryCall(ctx, env, list_form, items, depth);
     }
     const name = head_sym.name;
@@ -433,6 +437,17 @@ fn expandList(
 
     // ---- Ordinary call. ---------------------------------------
     return try expandOrdinaryCall(ctx, env, list_form, items, depth);
+}
+
+/// The macro Var a qualified head `ns/name` names, with `ns` an
+/// alias of the current namespace or a namespace name; null when
+/// the namespace is unknown or the Var is not a macro.
+fn qualifiedMacro(ctx: *ExpandContext, ns_prefix: []const u8, name: []const u8) ?*vm_mod.Var {
+    const reg = ctx.registry orelse return null;
+    const target_name = if (ctx.namespace) |cur| (cur.lookupAlias(ns_prefix) orelse ns_prefix) else ns_prefix;
+    const target = reg.lookupNs(target_name) orelse return null;
+    const user_var = target.lookupLocal(name) orelse return null;
+    return if (user_var.macro and user_var.bound) user_var else null;
 }
 
 /// Macro fires: call the host fn, then recursively expand the
@@ -932,6 +947,20 @@ fn expandAnonFn(
     items: []const *Form,
     depth: u32,
 ) ExpandError!*Form {
+    const fn_form = try anonFnForm(ctx, call_form, items);
+    // Recursively re-expand so any macros nested in body fire.
+    return try expandFormDepth(ctx, env, fn_form, depth);
+}
+
+/// The `(fn* [%1 ...] (body...))` form a `#(body...)` literal
+/// stands for, built syntactically and not yet expanded. Shared by
+/// the expander and by macro-argument conversion, so a `#()` inside
+/// a user macro's body reaches the macro as an ordinary `fn*` form.
+fn anonFnForm(
+    ctx: *ExpandContext,
+    call_form: *const Form,
+    items: []const *Form,
+) ExpandError!*Form {
     // First pass: scan to determine arity. Also rejects nested
     // #() during the walk.
     var max_positional: u32 = 0;
@@ -984,10 +1013,7 @@ fn expandAnonFn(
     out_items[0] = try makeSymbol(ctx, "fn*", call_form.origin);
     out_items[1] = params_vec;
     out_items[2] = body_call;
-    const fn_form = try makeList(ctx, out_items, call_form.origin);
-
-    // Recursively re-expand so any macros nested in body fire.
-    return try expandFormDepth(ctx, env, fn_form, depth);
+    return try makeList(ctx, out_items, call_form.origin);
 }
 
 /// Recursively walk a Form looking for anon-fn placeholders.
@@ -1439,7 +1465,14 @@ fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
             break :blk value_mod.fromSymbolId(id);
         },
         .keyword => |name| blk: {
-            if (name.ns != null) return ExpandError.MalformedMacroCall;
+            // Qualified keywords intern their full `ns/name` text,
+            // like qualified symbols; valueToForm splits it back.
+            if (name.ns) |ns_prefix| {
+                const full = std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ns_prefix, name.name }) catch return ExpandError.OutOfMemory;
+                defer ctx.allocator.free(full);
+                const id = ctx.interner.internKeyword(full) catch return ExpandError.OutOfMemory;
+                break :blk value_mod.fromKeywordId(id);
+            }
             const id = ctx.interner.internKeyword(name.name) catch return ExpandError.OutOfMemory;
             break :blk value_mod.fromKeywordId(id);
         },
@@ -1513,8 +1546,9 @@ fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
             lst = list_mod.cons(heap, value_mod.fromSymbolId(deref_id), lst) catch return ExpandError.OutOfMemory;
             break :blk lst;
         },
-        // syntax_quote, unquote, unquote_splicing, anon_fn,
-        // with_meta → defer.
+        // `#(...)` reaches a macro as the `fn*` form it stands for.
+        .anon_fn => |items| try formToValue(ctx, try anonFnForm(ctx, form, items)),
+        // syntax_quote, unquote, unquote_splicing, with_meta → defer.
         else => return ExpandError.MalformedMacroCall,
     };
 }
@@ -1582,12 +1616,22 @@ fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSp
         },
         .keyword => blk: {
             const id: u32 = @intCast(v.payload);
-            const name = ctx.interner.keywordName(id);
+            const full_name = ctx.interner.keywordName(id);
             const form = try ctx.allocator.create(Form);
-            form.* = .{
-                .datum = .{ .keyword = .{ .ns = null, .name = name } },
-                .origin = origin,
-            };
+            if (std.mem.indexOfScalar(u8, full_name, '/')) |slash_idx| {
+                form.* = .{
+                    .datum = .{ .keyword = .{
+                        .ns = full_name[0..slash_idx],
+                        .name = full_name[slash_idx + 1 ..],
+                    } },
+                    .origin = origin,
+                };
+            } else {
+                form.* = .{
+                    .datum = .{ .keyword = .{ .ns = null, .name = full_name } },
+                    .origin = origin,
+                };
+            }
             break :blk form;
         },
         .list => blk: {

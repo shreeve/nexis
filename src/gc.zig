@@ -122,6 +122,10 @@ pub const Collector = struct {
             // Phase 5.3b: protocol + protocol_fn are LEAFS
             // (no inner heap values).
             .protocol, .protocol_fn => protocol_mod.trace(h, self),
+            // Nextomic handles are leaves: the connection box holds a
+            // pointer the VM owns plus inline path text, the db box
+            // that pointer and numbers (nextomic_handle).
+            .nextomic_conn, .nextomic_db => {},
             // Reserved heap kinds without implementations in v1.
             // PANIC, not silent no-op, per GC.md §5 / peer-AI turn 14:
             // a silent no-op on a kind that SHOULD trace would create

@@ -61,6 +61,7 @@ const hash_mod = @import("hash");
 const string = @import("string");
 const list = @import("list");
 const vector = @import("vector");
+const nextomic_handle = @import("nextomic_handle");
 const bignum = @import("bignum");
 const champ = @import("champ");
 const transient = @import("transient");
@@ -178,6 +179,10 @@ pub fn heapHashBase(v: Value) u64 {
         // Phase 5.3b: protocol + protocol_fn are identity-valued.
         // Pointer hash, domain-mixed by their own kind byte.
         .protocol, .protocol_fn => @as(u64, protocol.hashHeader(h)),
+        // A Nextomic connection is identity-valued; a db-value hashes
+        // over the fields its equality reads (connection, basis, mode).
+        .nextomic_conn => @as(u64, nextomic_handle.connHash(h)),
+        .nextomic_db => @as(u64, nextomic_handle.dbHash(h)),
         // Transients are not hashable per SEMANTICS §3.2 / PLAN §9.4:
         // "transient — throws `:no-hash-on-transient`". Using a
         // transient as a map key or set element is a programming error.
@@ -365,6 +370,10 @@ pub fn heapEqual(a: Value, b: Value) bool {
         // Phase 5.3b: protocols + protocol_fn use POINTER
         // identity (opaque, identity-valued).
         .protocol, .protocol_fn => protocol.pointerEqual(ah, bh),
+        // A Nextomic connection equals itself only; db-values are
+        // equal when they name the same connection, basis and mode.
+        .nextomic_conn => nextomic_handle.connEqual(ah, bh),
+        .nextomic_db => nextomic_handle.dbEqual(ah, bh),
         // Transient equality is bit-identity on the wrapper header
         // (TRANSIENT.md §9, SEMANTICS §2.6). Two transient wrappers
         // are equal iff they are the same allocation. The top-level
@@ -693,6 +702,8 @@ test "eqCategory + domainByteForKind: exhaustive table matches SEMANTICS §2.6/�
         // identity-valued. Domain bytes 36 / 37.
         .{ .kind = .protocol, .cat = .kind_local, .domain = 36 },
         .{ .kind = .protocol_fn, .cat = .kind_local, .domain = 37 },
+        .{ .kind = .nextomic_conn, .cat = .kind_local, .domain = 38 },
+        .{ .kind = .nextomic_db, .cat = .kind_local, .domain = 39 },
     };
     for (cases) |c| {
         try testing.expectEqual(c.cat, eqCategory(c.kind));

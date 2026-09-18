@@ -1,0 +1,116 @@
+; test/nextomic/basics.nx — connect, schema, transact!, entity, entid,
+; ident, schema. Runs from a scratch directory; the store is fresh.
+
+(require '[nextomic :as d])
+
+(defn check [label ok]
+  (println (if ok "ok" "FAIL") label)
+  (when-not ok (throw :check-failed)))
+
+; Drop the transaction's own :db/txInstant datom: its value is the clock.
+(defn facts [report]
+  (filterv (fn [[e a v t added]] (not= a :db/txInstant)) (:tx-data report)))
+
+(def c (d/connect "basics.edb"))
+(println c)
+(println (d/db c))
+(check "fresh store is at the bootstrap basis" (= 1 (d/basis-t (d/db c))))
+(check "db-values are values" (= (d/db c) (d/db c)))
+(check "a db-value is not its history view" (not= (d/db c) (d/history (d/db c))))
+
+; Schema install is an ordinary transaction of attribute entities.
+(def schema-report
+  (d/transact! c [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+                  {:db/ident :person/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+                   :db/unique :db.unique/identity}
+                  {:db/ident :person/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+                  {:db/ident :person/height :db/valueType :db.type/double :db/cardinality :db.cardinality/one}
+                  {:db/ident :person/active :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+                  {:db/ident :person/born :db/valueType :db.type/instant :db/cardinality :db.cardinality/one}
+                  {:db/ident :person/tags :db/valueType :db.type/keyword :db/cardinality :db.cardinality/many}
+                  {:db/ident :person/friends :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+                  {:db/ident :person/home :db/valueType :db.type/ref :db/cardinality :db.cardinality/one
+                   :db/isComponent true}
+                  {:db/ident :addr/city :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+                   :db/index true}
+                  {:db/ident :person/uuid :db/valueType :db.type/uuid :db/cardinality :db.cardinality/one}
+                  {:db/ident :person/photo :db/valueType :db.type/bytes :db/cardinality :db.cardinality/one}]))
+(check "schema transaction is t=2" (= 2 (:tx schema-report)))
+(check "attribute entities take ids in the attribute partition" (= 22 (d/entid (d/db c) :person/name)))
+(check "db-before and db-after bracket the transaction"
+       (and (= 1 (d/basis-t (:db-before schema-report))) (= 2 (d/basis-t (:db-after schema-report)))))
+(println (get (d/schema (d/db c)) :person/email))
+(println (get (d/schema (d/db c)) :person/home))
+(println (get (d/schema (d/db c)) :addr/city))
+(check "ident round trips" (= :person/tags (d/ident (d/db c) (d/entid (d/db c) :person/tags))))
+(check "ident of an unknown eid is nil" (nil? (d/ident (d/db c) 12345)))
+(check "entid of an unknown ident is nil" (nil? (d/entid (d/db c) :person/nope)))
+
+; Map forms with tempids, card-many vectors, nested component maps, and
+; vector forms that refer to the same tempids.
+(def r1 (d/transact! c [{:db/id "ann" :person/name "Ann" :person/email "ann@example.com" :person/age 41
+                         :person/height 1.7 :person/active true :person/born 1000000
+                         :person/tags [:staff :admin]
+                         :person/home {:addr/city "Rome"}
+                         :person/uuid "0123abcd-4567-89ef-0123-456789abcdef"
+                         :person/photo "raw bytes"}
+                        [:db/add "bob" :person/name "Bob"]
+                        [:db/add "bob" :person/email "bob@example.com"]
+                        [:db/add "bob" :person/friends "ann"]
+                        [:db/add "datomic.tx" :db/doc "first import"]]))
+(println (:tempids r1))
+(println (facts r1))
+(def ann (get (:tempids r1) "ann"))
+(def bob (get (:tempids r1) "bob"))
+(println (d/entity (d/db c) ann))
+(println (d/entity (d/db c) bob))
+(check "the transaction entity carries its doc"
+       (= "first import" (:db/doc (d/entity (d/db c) (+ 70368744177664 (:tx r1))))))
+(check "a component entity is reachable through its ref"
+       (= "Rome" (:addr/city (d/entity (d/db c) (:person/home (d/entity (d/db c) ann))))))
+(check "entity by lookup ref" (= ann (:db/id (d/entity (d/db c) [:person/email "ann@example.com"]))))
+(check "entity by unknown lookup ref is nil" (nil? (d/entity (d/db c) [:person/email "nobody@example.com"])))
+(check "entid by lookup ref" (= bob (d/entid (d/db c) [:person/email "bob@example.com"])))
+(check "an entity with no datoms is nil" (nil? (d/entity (d/db c) 4294967999)))
+
+; Card-one overwrite retracts the old value in the same transaction;
+; re-asserting a current value writes nothing.
+(def r2 (d/transact! c [[:db/add ann :person/age 42]]))
+(println (facts r2))
+(check "no-op re-assertion writes only :db/txInstant" (empty? (facts (d/transact! c [[:db/add ann :person/age 42]]))))
+
+; Card-many accumulates; explicit retract removes one value.
+(d/transact! c [[:db/add ann :person/tags :founder]])
+(println (:person/tags (d/entity (d/db c) ann)))
+(d/transact! c [[:db/retract ann :person/tags :admin]])
+(println (:person/tags (d/entity (d/db c) ann)))
+; Retracting the attribute drops every value.
+(d/transact! c [[:db/retract ann :person/tags]])
+(check "retract-attribute leaves no values" (nil? (:person/tags (d/entity (d/db c) ann))))
+
+; Unique identity upserts: a map keyed by the same email updates Ann.
+(def r3 (d/transact! c [{:db/id "who" :person/email "ann@example.com" :person/name "Ann Lee"}]))
+(check "upsert resolves the tempid to the existing entity" (= ann (get (:tempids r3) "who")))
+(println (:person/name (d/entity (d/db c) ann)))
+
+; Negative fixnum tempids, lookup refs in entity position, refs by
+; lookup ref.
+(def r4 (d/transact! c [[:db/add -1 :person/name "Cy"]
+                        [:db/add -1 :person/friends [:person/email "ann@example.com"]]
+                        [:db/add [:person/email "bob@example.com"] :person/age 30]]))
+(println (:tempids r4))
+(check "ref by lookup ref resolves" (= #{ann} (:person/friends (d/entity (d/db c) (get (:tempids r4) -1)))))
+(check "lookup ref in entity position" (= 30 (:person/age (d/entity (d/db c) bob))))
+
+; retractEntity removes the entity's datoms, the refs pointing at it and
+; its components.
+(def home (:person/home (d/entity (d/db c) ann)))
+(def r5 (d/transact! c [[:db/retractEntity ann]]))
+(println (count (facts r5)))
+(check "retracted entity is gone" (nil? (d/entity (d/db c) ann)))
+(check "its component is gone" (nil? (d/entity (d/db c) home)))
+(check "refs to it are gone" (nil? (:person/friends (d/entity (d/db c) bob))))
+(check "its email is free again" (nil? (d/entid (d/db c) [:person/email "ann@example.com"])))
+
+(d/release c)
+:basics-done

@@ -1,0 +1,21 @@
+; src/stdlib/nextomic.nx — sugar for the `nextomic` namespace
+; (docs/NEXTOMIC.md §6, §8), embedded via @embedFile and
+; bootstrapped at VM startup with `nextomic` as the current
+; namespace, after the natives are installed. Everything
+; substantive is a native in src/nextomic/natives.zig; this
+; file holds only forms that read better as macros.
+
+; `(with-conn [c "path"] body...)` and
+; `(with-conn [c "path" {:sync :none}] body...)` open a connection
+; for the extent of body and release it on every exit, including a
+; throw, which continues to propagate. Returns body's value.
+
+(defmacro with-conn [binding & body]
+  `(let* [~(first binding) (nextomic/connect ~@(rest binding))]
+     (try
+       (let* [r# (do ~@body)]
+         (nextomic/release ~(first binding))
+         r#)
+       (catch any e#
+         (nextomic/release ~(first binding))
+         (throw e#)))))

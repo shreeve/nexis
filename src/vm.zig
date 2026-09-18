@@ -1398,6 +1398,11 @@ pub const VM = struct {
     /// time a connection is registered, so VM.deinit can close
     /// connections without importing db.
     db_close_callback: ?*const fn (*anyopaque) void = null,
+    /// Open Nextomic connections (`nextomic/connect` appends; VM
+    /// teardown destroys each through `nextomic_close_callback`). The
+    /// nextomic natives own the cast, so vm.zig needs no import.
+    nextomic_connections: std.ArrayList(*anyopaque) = .empty,
+    nextomic_close_callback: ?*const fn (*anyopaque) void = null,
     /// Phase 5.2a polish (chore): Zig 0.16 `std.Io` handle for
     /// filesystem ops that live below the language surface —
     /// today only `(db/open path)` uses it to auto-create the
@@ -1514,6 +1519,10 @@ pub const VM = struct {
             for (self.db_connections.items) |conn_ptr| close_fn(conn_ptr);
         }
         self.db_connections.deinit(self.allocator);
+        if (self.nextomic_close_callback) |close_fn| {
+            for (self.nextomic_connections.items) |conn_ptr| close_fn(conn_ptr);
+        }
+        self.nextomic_connections.deinit(self.allocator);
         // Phase 5.3a: free record-registry storage (the entry
         // structs + their interned-name slices live in
         // self.allocator).
