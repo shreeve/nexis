@@ -378,6 +378,7 @@ pub fn build(b: *std.Build) void {
     db_mod.addImport("intern", intern_mod);
     db_mod.addImport("hash", hash_mod);
     db_mod.addImport("codec", codec_mod);
+    db_mod.addImport("string", string_mod);
     db_mod.addImport("list", list_mod);
     db_mod.addImport("champ", champ_mod);
     db_mod.addImport("emdb", emdb_mod);
@@ -564,7 +565,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "champ", "transient", "atom", "record", "protocol" } },
         .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "champ", "transient", "db", "atom", "record", "protocol" } },
         .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db", "atom", "record", "protocol" } },
-        .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "list", "champ", "emdb" } },
+        .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "string", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch", "record", "protocol" } },
         // Phase 5.2c: format test binary. Imports the menagerie of

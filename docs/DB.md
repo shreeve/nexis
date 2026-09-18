@@ -100,8 +100,8 @@ handle (the CLI sets `v.io = init.io` after `VM.init`; ad-hoc
 test harnesses use absolute `/tmp/...` paths or pre-create their
 dirs, so the branch is a structural no-op there). Errors from
 `createDirPath` are intentionally swallowed — best-effort; emdb's
-own open surfaces a precise `:db-error` if the directory still
-isn't usable after the attempt.
+own open surfaces `:db/open-failed` if the directory still isn't
+usable after the attempt.
 
 ---
 
@@ -121,8 +121,29 @@ pub const Connection = struct {
     store_id_hi: u64,
     // Canonicalized absolute path, owned. Freed in close().
     path_owned: [:0]u8,
+    // Named-tree handles resolved so far, keyed by owned copies
+    // of the tree names. Freed in close().
+    tree_ids: std.StringHashMapUnmanaged(emdb.TreeId),
 };
 ```
+
+**Tree handles are resolved once per connection.** `treeId(txn,
+name, create)` looks the name up in `tree_ids` before asking emdb;
+a `TreeId` is fixed for the life of the environment (emdb
+INV-SUB03), so the handle is remembered across transactions. emdb
+keeps per-transaction tree state, so each `WriteTxn` / `ReadTxn`
+carries an `opened` bit set and loads the tree behind a handle the
+first time it touches it; every later operation on that tree in the
+same transaction is a bit test. `put` / `get` / `del` and the
+stdlib cursor natives all go through `treeId`.
+
+**Cursor values may be one page short.** An emdb cursor exposes at
+most the first page of an overflow value. `cursorValue(txn, tree_id,
+kv, page_bytes)` returns the entry's complete value: when the
+visible slice fills a page (`cursorPageBytes(conn)`) it re-reads
+the key through the tree, which assembles every overflow page. The
+stdlib `db/scan` and `db/reduce-tree` natives decode through it;
+`db/scan` positions its cursor with `setRange` for the start bound.
 
 **`Connection` is NOT a runtime heap-managed Value.** It's a plain
 Zig struct allocated on the caller's allocator. Multiple
@@ -132,6 +153,15 @@ explicit `close()`.
 
 **Metadata attachability**: not applicable. Connections are not
 Values.
+
+**File geometry is pinned.** `open` overrides the caller's
+`pageSize` with `db.page_size` (16 KiB) and `maxNamedTrees` with
+`db.max_named_trees` (128) before handing the options to
+`emdb.Env.open`. emdb's own default page size is the OS page size,
+which differs between platforms, and the page size fixes the key
+bound and overflow threshold for the life of the file; pinning it
+here means a store carries the same geometry wherever it is
+created. An existing file keeps the page size it was created with.
 
 ---
 
@@ -410,6 +440,18 @@ Per peer-AI turn 23, pinned explicitly:
 **Equality and hash are unaffected** by any of the above — the
 identity triple is fully defined by the stored bytes, independent
 of operational state.
+
+**At the language level** every one of these reaches the program
+as a keyword payload (stdlib `dbFailure`). Distinct emdb error sets
+get distinct names — `:db/key-too-large`, `:db/value-too-large`,
+`:db/max-trees`, `:db/not-found`, `:db/corrupted`, `:db/map-full`,
+`:db/mmap-failed`, `:db/open-failed`, `:db/page-size-mismatch`,
+`:db/busy`, `:db/txn-aborted`, `:db/read-only`, `:db/sync-failed` —
+as do the db.zig errors `:db/store-mismatch`, `:db/no-connection`
+and `:db/invalid-key`; anything else is `:db-error`, and codec
+errors are `:codec-failed`. Outside any `try` the raw `VmError`
+(`DbError` / `CodecFailed`) propagates, the rule the VM applies to
+every recoverable error.
 
 **Re-hydrating a ref** (constructing from bytes without an
 available Connection): `refFromBytes(heap, store_id, tree_name,

@@ -90,85 +90,112 @@ fn bootstrapCoreForTest(
     }
 }
 
+/// A VM with core, `db`, `nexis.string` and `nexis.internal`
+/// installed and core.nx bootstrapped, ready to run one program of
+/// top-level forms. Integration tests leave `v.io` null (see
+/// `expectOutput`).
+const Program = struct {
+    arena: std.heap.ArenaAllocator,
+    v: vm.VM,
+    host_macros: expand_mod.HostMacroTable,
+    registry: *vm.NamespaceRegistry,
+    interner: *intern_mod.Interner,
+
+    const stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+
+    fn init(self: *Program) !void {
+        self.arena = std.heap.ArenaAllocator.init(testing.allocator);
+        errdefer self.arena.deinit();
+        self.v = try vm.VM.init(testing.allocator, &stub);
+        errdefer self.v.deinit();
+        self.interner = self.v.ensureInterner();
+        self.registry = try self.v.ensureRegistry();
+        try stdlib.installCore(self.registry.core);
+        const db_ns = try self.registry.getOrCreate("db", self.registry.core);
+        try stdlib.installDb(db_ns);
+        const string_ns = try self.registry.getOrCreate("nexis.string", self.registry.core);
+        try stdlib.installString(string_ns);
+        const internal_ns = try self.registry.getOrCreate("nexis.internal", self.registry.core);
+        try stdlib.installInternal(internal_ns);
+        self.host_macros = try expand_mod.defaultMacros(testing.allocator);
+        errdefer self.host_macros.deinit(testing.allocator);
+        const saved_current = self.registry.current;
+        self.registry.current = self.registry.core;
+        try bootstrapCoreForTest(&self.v, self.registry.core, self.interner, &self.host_macros);
+        self.registry.current = saved_current;
+    }
+
+    fn deinit(self: *Program) void {
+        self.host_macros.deinit(testing.allocator);
+        self.v.deinit();
+        self.arena.deinit();
+    }
+
+    /// Run every top-level form of `src` in order (matching
+    /// runFile semantics); the last form's value is the result.
+    fn run(self: *Program, src: []const u8) !value_mod.Value {
+        var parse_result = try reader_mod.parser.parseProgram(testing.allocator, src);
+        defer parse_result.parser.deinit();
+        var rdr = reader_mod.Reader.init(testing.allocator, src);
+        defer rdr.deinit();
+        const forms = try rdr.readProgram(parse_result.sexp);
+
+        var last_result: value_mod.Value = value_mod.nilValue();
+        for (forms) |form| {
+            // Re-read current per form so (ns NAME) takes effect.
+            const current_ns = self.registry.current;
+            const compiled = try compile.compileFormFullWithMacrosSpanPersistentRegistry(
+                self.arena.allocator(),
+                form,
+                current_ns,
+                self.interner,
+                &self.host_macros,
+                null,
+                self.v.runtime_arena.allocator(),
+                self.registry,
+            );
+            const routine = compiled.toRoutine("test-form");
+            self.v.frames.items[0].routine = &routine;
+            self.v.frames.items[0].pc = 0;
+            self.v.frames.items[0].slot_count = routine.slot_count;
+            self.v.halted = false;
+            if (self.v.stack.items.len < routine.slot_count) {
+                try self.v.stack.appendNTimes(self.v.allocator, value_mod.nilValue(), routine.slot_count - self.v.stack.items.len);
+            }
+            last_result = try self.v.run();
+        }
+        return last_result;
+    }
+};
+
 /// Phase 3.4: multi-form test helper that processes top-level
 /// forms sequentially (matching runFile semantics). Use this
 /// when `(ns NAME)` switching needs to affect subsequent
 /// forms within the same test. The final form's value is the
 /// "result".
 fn expectOutputProgram(src: []const u8, expected: []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    // Phase 5.2c (peer-AI turn 81 §D6): integration tests leave
-    // `v.io` null, so 5.2c I/O fns (`slurp`/`spit`/`print`/
-    // `println`/`prn`) surface `:io-error` cleanly. Their format
-    // output is fully covered by `src/format.zig`'s 8 inline
-    // tests; integration tests check only the error path + the
-    // language-level surface (return values, taxonomy). A
-    // future smoke test in `examples/` exercises real I/O.
-    const interner = v.ensureInterner();
-    const registry = try v.ensureRegistry();
-    try stdlib.installCore(registry.core);
-    // Phase 5 Item 1: mirror the CLI's environment so qualified
-    // `db/...` calls (the Phase 4 surface, and the backward-
-    // compat `db/deref` alias for `@x` on atoms) resolve.
-    const db_ns_program = try registry.getOrCreate("db", registry.core);
-    try stdlib.installDb(db_ns_program);
-    // Phase 5.2b: nexis.string namespace (qualified-only).
-    const string_ns_program = try registry.getOrCreate("nexis.string", registry.core);
-    try stdlib.installString(string_ns_program);
-    // Phase 5.3a: nexis.internal (qualified-only macro scaffolding).
-    const internal_ns_program = try registry.getOrCreate("nexis.internal", registry.core);
-    try stdlib.installInternal(internal_ns_program);
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    const saved_current = registry.current;
-    registry.current = registry.core;
-    try bootstrapCoreForTest(&v, registry.core, interner, &host_macros);
-    registry.current = saved_current;
-
-    // Parse + read program (multiple top-level forms).
-    var parse_result = try reader_mod.parser.parseProgram(testing.allocator, src);
-    defer parse_result.parser.deinit();
-    var rdr = reader_mod.Reader.init(testing.allocator, src);
-    defer rdr.deinit();
-    const forms = try rdr.readProgram(parse_result.sexp);
-
-    var last_result: value_mod.Value = value_mod.nilValue();
-    for (forms) |form| {
-        // Re-read current per form so (ns NAME) takes effect.
-        const current_ns = registry.current;
-        const compiled = try compile.compileFormFullWithMacrosSpanPersistentRegistry(
-            arena.allocator(),
-            form,
-            current_ns,
-            interner,
-            &host_macros,
-            null,
-            v.runtime_arena.allocator(),
-            registry,
-        );
-        const routine = compiled.toRoutine("test-form");
-        v.frames.items[0].routine = &routine;
-        v.frames.items[0].pc = 0;
-        v.frames.items[0].slot_count = routine.slot_count;
-        v.halted = false;
-        if (v.stack.items.len < routine.slot_count) {
-            try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-        }
-        last_result = try v.run();
-    }
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const last_result = try program.run(src);
 
     var buf: std.array_list.Managed(u8) = .init(testing.allocator);
     defer buf.deinit();
-    try formatValue(&buf, last_result, interner);
+    try formatValue(&buf, last_result, program.interner);
     testing.expectEqualStrings(expected, buf.items) catch |err| {
         std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
         return err;
     };
+}
+
+/// Run `src` as a program and assert it fails with `expected`
+/// instead of producing a value.
+fn expectProgramError(src: []const u8, expected: anyerror) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(expected, program.run(src));
 }
 
 /// Run `src` end-to-end and assert the printed output equals
@@ -1636,6 +1663,79 @@ test "phase5.2a end-to-end DB persistence of a string value (peer-AI turn 78 §R
         \\  (with-tx [tx conn] (db/put! tx r "hello-utf8-é-🦀"))
         \\  (with-read-tx [tx conn] (db/get tx r)))
     , "hello-utf8-é-🦀");
+}
+
+test "db/scan seeks to the start bound and stops before the end bound" {
+    try expectOutputProgram(
+        \\(do
+        \\  (def conn (db/open "/tmp/nexis-seam-scan-range.edb"))
+        \\  (with-tx [tx conn]
+        \\    (db/put! tx (db/ref conn :range :a) 1)
+        \\    (db/put! tx (db/ref conn :range :b) 2)
+        \\    (db/put! tx (db/ref conn :range :c) 3)
+        \\    (db/put! tx (db/ref conn :range :d) 4))
+        \\  (with-read-tx [t conn]
+        \\    [(db/scan t :range :b)
+        \\     (db/scan t :range :bb :d)
+        \\     (db/scan t :range :e)
+        \\     (db/scan t :range :a :a)
+        \\     (db/scan t :none)]))
+    , "[[[:b 2] [:c 3] [:d 4]] [[:c 3]] [] [] []]");
+}
+
+test "storage failures surface as :db/<reason> keywords inside try" {
+    // 8192-byte key: past the key bound of a 16 KiB page.
+    try expectOutputProgram(
+        \\(do
+        \\  (def conn (db/open "/tmp/nexis-seam-errors.edb"))
+        \\  (def long-key (loop [s "k" n 0] (if (< n 13) (recur (str s s) (inc n)) s)))
+        \\  [(try (with-tx [tx conn] (db/put! tx (db/ref conn :t long-key) 1))
+        \\        (catch any e e))
+        \\   (try (db/put-key! (db/ref conn :t long-key) 1)
+        \\        (catch any e e))
+        \\   (try (db/open "/nexis-no-such-directory/sub/store.edb")
+        \\        (catch any e e))])
+    , "[:db/key-too-large :db/key-too-large :db/open-failed]");
+}
+
+test "the VM keeps running after a caught storage failure" {
+    try expectOutputProgram(
+        \\(do
+        \\  (def conn (db/open "/tmp/nexis-seam-errors-resume.edb"))
+        \\  (def long-key (loop [s "k" n 0] (if (< n 13) (recur (str s s) (inc n)) s)))
+        \\  (with-tx [tx conn] (db/put! tx (db/ref conn :t :k) 41))
+        \\  (def caught (try (with-tx [tx conn] (db/put! tx (db/ref conn :t long-key) 1))
+        \\                   (catch any e e)))
+        \\  [caught (inc (with-read-tx [t conn] (db/get t (db/ref conn :t :k))))])
+    , "[:db/key-too-large 42]");
+}
+
+test "outside try a storage failure is the raw DbError" {
+    try expectProgramError(
+        \\(do
+        \\  (def conn (db/open "/tmp/nexis-seam-errors-raw.edb"))
+        \\  (def long-key (loop [s "k" n 0] (if (< n 13) (recur (str s s) (inc n)) s)))
+        \\  (db/put-key! (db/ref conn :t long-key) 1))
+    , vm.VmError.DbError);
+}
+
+test "db/scan and db/reduce-tree read a value that spans several overflow pages" {
+    // 5 * 2^13 = 40960 bytes: three 16 KiB pages once encoded. A
+    // cursor alone shows the first page; the natives must return
+    // the whole value.
+    try expectOutputProgram(
+        \\(do
+        \\  (def conn (db/open "/tmp/nexis-seam-overflow.edb"))
+        \\  (def big (loop [s "abcde" n 0] (if (< n 13) (recur (str s s) (inc n)) s)))
+        \\  (with-tx [tx conn]
+        \\    (db/put! tx (db/ref conn :blobs :big) big)
+        \\    (db/put! tx (db/ref conn :blobs :small) "x"))
+        \\  (with-read-tx [t conn]
+        \\    [(count big)
+        \\     (count (nth (first (db/scan t :blobs)) 1))
+        \\     (= big (nth (first (db/scan t :blobs)) 1))
+        \\     (db/reduce-tree t :blobs (fn* [acc k v] (+ acc (count v))) 0)]))
+    , "[40960 40960 true 40961]");
 }
 
 // =============================================================================

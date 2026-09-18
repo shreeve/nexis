@@ -104,15 +104,38 @@ pub const Connection = struct {
     /// `ConnectionUnavailable` for subsequent ops.
     open_flag: bool,
 
+    /// Named-tree handles this connection has resolved, keyed by
+    /// owned copies of the tree names. A `TreeId` is fixed for the
+    /// life of the environment (emdb INV-SUB03): the same name
+    /// yields the same handle in every transaction. Each
+    /// transaction still loads the tree behind a handle once
+    /// before using it; `WriteTxn.opened` / `ReadTxn.opened`
+    /// track that.
+    tree_ids: std.StringHashMapUnmanaged(emdb.TreeId),
+
     pub fn storeId(self: *const Connection) u128 {
         return (@as(u128, self.store_id_hi) << 64) | @as(u128, self.store_id_lo);
     }
 };
 
+/// Page size every nexis store is created with. emdb's default is
+/// the OS page size, which differs between platforms; the page
+/// size fixes the key bound (`Env.maxKeySize`) and the overflow
+/// threshold for the life of the file, so a store must carry the
+/// same geometry wherever it is created. An existing file keeps
+/// the page size it was created with (emdb reads it from the meta
+/// page).
+pub const page_size: u32 = 16384;
+
+/// Named-tree capacity every nexis store is opened with. Bounds
+/// the `TreeId` range, which sizes the per-transaction tree set.
+pub const max_named_trees: u32 = 128;
+
 /// Open (or create) a database file at `path`. `allocator` /
 /// `heap` / `interner` are non-owning references; caller
 /// guarantees their lifetimes. `options` is passed through to
-/// `emdb.Env.open`.
+/// `emdb.Env.open` with `pageSize` and `maxNamedTrees` pinned to
+/// `page_size` / `max_named_trees`.
 pub fn open(
     allocator: std.mem.Allocator,
     heap: *Heap,
@@ -120,6 +143,10 @@ pub fn open(
     path: [*:0]const u8,
     options: emdb.EnvOptions,
 ) !Connection {
+    var env_options = options;
+    env_options.pageSize = page_size;
+    env_options.maxNamedTrees = max_named_trees;
+
     // Canonicalize the path for store_id derivation. On failure
     // (file doesn't exist yet), fall back to the supplied path
     // bytes verbatim — `realpath` returns ENOENT for new files,
@@ -149,10 +176,7 @@ pub fn open(
     };
     const hash_hi = hash_mod.hashBytes(hi_input);
 
-    var env = emdb.Env.open(path, options) catch |err| {
-        allocator.free(path_owned);
-        return err;
-    };
+    var env = try emdb.Env.open(path, env_options);
     errdefer env.close();
 
     return Connection{
@@ -164,12 +188,16 @@ pub fn open(
         .store_id_hi = hash_hi,
         .path_owned = path_owned,
         .open_flag = true,
+        .tree_ids = .empty,
     };
 }
 
 pub fn close(self: *Connection) void {
     if (!self.open_flag) return;
     self.env.close();
+    var names = self.tree_ids.keyIterator();
+    while (names.next()) |name| self.allocator.free(name.*);
+    self.tree_ids.deinit(self.allocator);
     self.allocator.free(self.path_owned);
     self.open_flag = false;
 }
@@ -178,14 +206,22 @@ pub fn close(self: *Connection) void {
 // Transactions (DB.md §5)
 // =============================================================================
 
+/// One bit per `TreeId` slot: the two core trees plus every named
+/// tree the pinned capacity admits.
+pub const TreeSet = std.bit_set.StaticBitSet(emdb.txn.coreTreeCount + max_named_trees);
+
 pub const WriteTxn = struct {
     conn: *Connection,
     inner: *emdb.Txn,
+    /// Trees this transaction has loaded; see `treeId`.
+    opened: TreeSet = TreeSet.initEmpty(),
 };
 
 pub const ReadTxn = struct {
     conn: *Connection,
     inner: *emdb.Txn,
+    /// Trees this transaction has loaded; see `treeId`.
+    opened: TreeSet = TreeSet.initEmpty(),
 };
 
 pub fn beginWrite(conn: *Connection) !WriteTxn {
@@ -221,6 +257,44 @@ fn validateTreeNameAndKey(tree_name: []const u8, key_bytes: []const u8) DbError!
     if (key_bytes.len == 0) return DbError.InvalidKey;
 }
 
+/// Resolve `tree_name` to the handle this transaction can use.
+/// Accepts `*WriteTxn` or `*ReadTxn`.
+///
+/// The connection remembers every handle it has resolved, and a
+/// transaction loads the tree behind a handle the first time it
+/// touches it (emdb keeps per-transaction tree state, so a handle
+/// alone is not enough). Within one transaction every further
+/// operation on the tree is a bit test.
+///
+/// Returns null when the tree does not exist and `create` is
+/// false. A tree registered by an aborted transaction stays
+/// registered with the environment and reads as empty, which is
+/// emdb's own behavior for the name.
+pub fn treeId(txn: anytype, tree_name: []const u8, create: bool) !?emdb.TreeId {
+    const conn = txn.conn;
+    if (conn.tree_ids.get(tree_name)) |id| {
+        if (!txn.opened.isSet(id)) {
+            const loaded = txn.inner.openTree(tree_name, create) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            std.debug.assert(loaded == id);
+            txn.opened.set(id);
+        }
+        return id;
+    }
+    const id = txn.inner.openTree(tree_name, create) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    std.debug.assert(id < TreeSet.bit_length);
+    const owned_name = try conn.allocator.dupe(u8, tree_name);
+    errdefer conn.allocator.free(owned_name);
+    try conn.tree_ids.put(conn.allocator, owned_name, id);
+    txn.opened.set(id);
+    return id;
+}
+
 pub fn put(
     txn: *WriteTxn,
     tree_name: []const u8,
@@ -228,7 +302,7 @@ pub fn put(
     v: Value,
 ) !void {
     try validateTreeNameAndKey(tree_name, key_bytes);
-    const tree_id = try txn.inner.openTree(tree_name, true);
+    const tree_id = (try treeId(txn, tree_name, true)).?;
     // Encode the value via codec, pass the bytes to emdb, free the
     // codec buffer.
     const encoded = try codec_mod.encode(txn.conn.allocator, txn.conn.interner, v);
@@ -269,11 +343,8 @@ pub fn get(
     elementEq: *const fn (Value, Value) bool,
 ) !?Value {
     try validateTreeNameAndKey(tree_name, key_bytes);
-    const tree_id = txn.inner.openTree(tree_name, false) catch |err| switch (err) {
-        // Tree doesn't exist yet → key is absent.
-        error.NotFound => return null,
-        else => return err,
-    };
+    // No such tree → key is absent.
+    const tree_id = (try treeId(txn, tree_name, false)) orelse return null;
     const bytes_opt = try txn.inner.getFromTree(tree_id, key_bytes);
     if (bytes_opt) |bytes| {
         return try codec_mod.decode(
@@ -287,16 +358,36 @@ pub fn get(
     return null;
 }
 
+/// Bytes of value an emdb cursor shows from one page. A cursor
+/// entry whose value is at least this long may continue on further
+/// overflow pages; `cursorValue` fetches the rest.
+pub fn cursorPageBytes(conn: *Connection) u32 {
+    return emdb.page.PageHeader.usableSize(conn.env.info().pageSize);
+}
+
+/// The complete value of a cursor entry. A cursor exposes at most
+/// the first page of an overflow value, so when the visible slice
+/// fills a page (`page_bytes` from `cursorPageBytes`) the entry is
+/// re-read through the tree, which assembles every page. Accepts
+/// `*WriteTxn` or `*ReadTxn`. The result is valid until the next
+/// multi-page read on the same transaction.
+pub fn cursorValue(
+    txn: anytype,
+    tree_id: emdb.TreeId,
+    kv: emdb.Cursor.KeyValue,
+    page_bytes: u32,
+) ![]const u8 {
+    if (kv.value.len < page_bytes) return kv.value;
+    return (try txn.inner.getFromTree(tree_id, kv.key)) orelse kv.value;
+}
+
 pub fn del(
     txn: *WriteTxn,
     tree_name: []const u8,
     key_bytes: []const u8,
 ) !bool {
     try validateTreeNameAndKey(tree_name, key_bytes);
-    const tree_id = txn.inner.openTree(tree_name, false) catch |err| switch (err) {
-        error.NotFound => return false,
-        else => return err,
-    };
+    const tree_id = (try treeId(txn, tree_name, false)) orelse return false;
     return try txn.inner.delFromTree(tree_id, key_bytes);
 }
 
@@ -560,6 +651,72 @@ test "open / close: round-trip with a tiny file" {
     try testing.expect(sid != 0);
 }
 
+test "open: a new store has 16 KiB pages and the pinned tree capacity" {
+    const path = try tmpDbPath(testing.allocator, "pagesize");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    // Caller-supplied geometry does not leak through.
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{
+        .allocator = testing.allocator,
+        .pageSize = 4096,
+        .maxNamedTrees = 8,
+    });
+    defer close(&conn);
+
+    try testing.expectEqual(page_size, conn.env.info().pageSize);
+    try testing.expectEqual(page_size, conn.env.options.pageSize);
+    try testing.expectEqual(max_named_trees, conn.env.options.maxNamedTrees);
+    try testing.expectEqual(emdb.btree.maxKeySize(page_size), conn.env.maxKeySize());
+}
+
+test "open: failure in a missing directory releases everything it took" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    // `std.testing.allocator` reports the leak if `path_owned`
+    // survives the failed open, and the double free if it is
+    // released twice.
+    const path: [:0]const u8 = "test_nexis_db_no_such_dir/missing/store.emdb";
+    try testing.expectError(
+        error.OpenFailed,
+        open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }),
+    );
+}
+
+test "open: a file that is not an emdb store is refused without leaking" {
+    const path = try tmpDbPath(testing.allocator, "notastore");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    // Two pages of 0xFF: a non-zero size with no valid meta page.
+    {
+        const io = std.testing.io;
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        const junk = [_]u8{0xFF} ** (2 * page_size);
+        try file.writeStreamingAll(io, &junk);
+    }
+
+    if (open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator })) |conn| {
+        var opened = conn;
+        close(&opened);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
 test "put / get / del: single-tree round-trip of a scalar" {
     const path = try tmpDbPath(testing.allocator, "putget");
     defer testing.allocator.free(path);
@@ -640,6 +797,132 @@ test "del: removes the key, subsequent get returns null" {
     var rtxn = try beginRead(&conn);
     defer abortRead(&rtxn);
     try testing.expect((try get(&rtxn, "t", "k", &synthHash, &synthEq)) == null);
+}
+
+test "treeId: one handle per name, remembered across transactions, loaded once per transaction" {
+    const path = try tmpDbPath(testing.allocator, "treeids");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer close(&conn);
+
+    // Unknown tree, no create: nothing resolved, nothing cached.
+    {
+        var rtxn = try beginRead(&conn);
+        defer abortRead(&rtxn);
+        try testing.expect((try treeId(&rtxn, "users", false)) == null);
+        try testing.expectEqual(@as(usize, 0), conn.tree_ids.count());
+    }
+
+    var first_id: emdb.TreeId = undefined;
+    {
+        var wtxn = try beginWrite(&conn);
+        first_id = (try treeId(&wtxn, "users", true)).?;
+        try testing.expect(wtxn.opened.isSet(first_id));
+        try testing.expectEqual(first_id, (try treeId(&wtxn, "users", true)).?);
+        try put(&wtxn, "users", "alice", value.fromFixnum(1).?);
+        try commit(&wtxn);
+    }
+    try testing.expectEqual(@as(usize, 1), conn.tree_ids.count());
+    try testing.expectEqual(first_id, conn.tree_ids.get("users").?);
+
+    // A later transaction starts with nothing loaded and resolves
+    // the same handle.
+    {
+        var rtxn = try beginRead(&conn);
+        defer abortRead(&rtxn);
+        try testing.expect(!rtxn.opened.isSet(first_id));
+        try testing.expectEqual(first_id, (try treeId(&rtxn, "users", false)).?);
+        try testing.expect(rtxn.opened.isSet(first_id));
+        try testing.expectEqual(@as(i64, 1), (try get(&rtxn, "users", "alice", &synthHash, &synthEq)).?.asFixnum());
+    }
+    try testing.expectEqual(@as(usize, 1), conn.tree_ids.count());
+}
+
+test "treeId: a tree created by an aborted transaction reads as empty afterwards" {
+    const path = try tmpDbPath(testing.allocator, "treeabort");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer close(&conn);
+
+    {
+        var wtxn = try beginWrite(&conn);
+        try put(&wtxn, "scratch", "k", value.fromFixnum(7).?);
+        abortWrite(&wtxn);
+    }
+    {
+        var rtxn = try beginRead(&conn);
+        defer abortRead(&rtxn);
+        try testing.expect((try get(&rtxn, "scratch", "k", &synthHash, &synthEq)) == null);
+    }
+    {
+        var wtxn = try beginWrite(&conn);
+        defer abortWrite(&wtxn);
+        try testing.expect(!(try del(&wtxn, "scratch", "k")));
+    }
+}
+
+test "cursorValue: a value spanning several overflow pages comes back whole" {
+    const string_mod = @import("string");
+
+    const path = try tmpDbPath(testing.allocator, "cursorvalue");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer close(&conn);
+
+    // 40 KiB of text: three 16 KiB pages once encoded.
+    const big_len = 40 * 1024;
+    const text = try testing.allocator.alloc(u8, big_len);
+    defer testing.allocator.free(text);
+    for (text, 0..) |*c, i| c.* = 'a' + @as(u8, @intCast(i % 26));
+    const big = try string_mod.fromBytes(&heap, text);
+
+    var wtxn = try beginWrite(&conn);
+    try put(&wtxn, "blobs", "big", big);
+    try put(&wtxn, "blobs", "small", value.fromFixnum(1).?);
+    try commit(&wtxn);
+
+    var rtxn = try beginRead(&conn);
+    defer abortRead(&rtxn);
+    const tree_id = (try treeId(&rtxn, "blobs", false)).?;
+    var cursor = try rtxn.inner.openCursorForTree(tree_id);
+    const page_bytes = cursorPageBytes(&conn);
+
+    const first = cursor.first().?;
+    try testing.expectEqualStrings("big", first.key);
+    // The cursor alone shows exactly one page of the value.
+    try testing.expectEqual(@as(usize, page_bytes), first.value.len);
+    const whole = try cursorValue(&rtxn, tree_id, first, page_bytes);
+    try testing.expect(whole.len > page_bytes);
+    const decoded = try codec_mod.decode(&heap, &interner, whole, &synthHash, &synthEq);
+    try testing.expect(decoded.kind() == .string);
+    try testing.expectEqualStrings(text, string_mod.asBytes(decoded));
+
+    // An inline value is returned as the cursor shows it.
+    const second = cursor.next().?;
+    try testing.expectEqualStrings("small", second.key);
+    const small = try cursorValue(&rtxn, tree_id, second, page_bytes);
+    try testing.expectEqual(second.value.ptr, small.ptr);
 }
 
 test "put / get: container values (list, map, set) codec round-trip" {
