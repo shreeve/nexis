@@ -513,9 +513,10 @@ pub const Parts = struct {
     top: ?Top,
 };
 
-/// The VAET value section is the referenced entity id without a tag.
-fn vaetValue(vbytes: []const u8) []const u8 {
-    std.debug.assert(vbytes.len == 1 + id_len and vbytes[0] == @intFromEnum(Tag.ref));
+/// The VAET value section is the referenced entity id without a tag;
+/// any other value encoding has no place in VAET.
+fn vaetValue(vbytes: []const u8) error{ValueType}![]const u8 {
+    if (vbytes.len != 1 + id_len or vbytes[0] != @intFromEnum(Tag.ref)) return error.ValueType;
     return vbytes[1..];
 }
 
@@ -543,7 +544,7 @@ pub fn packKey(out: *std.ArrayList(u8), gpa: Allocator, index: Index, e: u64, a:
             try out.appendSlice(gpa, &ebuf);
         },
         .vaet => {
-            try out.appendSlice(gpa, vaetValue(vbytes));
+            try out.appendSlice(gpa, try vaetValue(vbytes));
             try out.appendSlice(gpa, &abuf);
             try out.appendSlice(gpa, &ebuf);
         },
@@ -645,7 +646,7 @@ pub fn packPrefix(out: *std.ArrayList(u8), gpa: Allocator, index: Index, comps: 
             },
             'v' => {
                 const v = comps.v orelse break;
-                try out.appendSlice(gpa, if (index == .vaet) vaetValue(v) else v);
+                try out.appendSlice(gpa, if (index == .vaet) try vaetValue(v) else v);
             },
             else => unreachable,
         }

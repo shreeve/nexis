@@ -728,6 +728,24 @@ test "basis in the future is refused" {
     try testing.expectError(error.BasisInFuture, db.datoms(arena, .eavt, .{ .e = 1 }));
 }
 
+test "a VAET component must be a ref value" {
+    const tc = try TestConn.init("db_vaet_value");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const db = try tc.conn.db();
+    const sb = try key.valBytes(arena, .{ .string = "x" });
+    try testing.expectError(error.ValueType, db.datoms(arena, .vaet, .{ .v = sb }));
+    try testing.expectError(error.ValueType, key.prefixBytes(arena, .vaet, .{ .v = sb }));
+    try testing.expectError(error.ValueType, key.keyBytes(arena, .vaet, 1, 2, sb, null));
+    try testing.expectError(error.ValueType, key.prefixBytes(arena, .vaet, .{ .v = "" }));
+    // A ref value scans; the other indexes take any value.
+    const rb = try key.valBytes(arena, .{ .ref = 1 });
+    _ = try db.datoms(arena, .vaet, .{ .v = rb });
+    _ = try db.datoms(arena, .avet, .{ .a = 1, .v = sb });
+}
+
 test "materialise every value kind into a heap" {
     const tc = try TestConn.init("db_mat");
     defer tc.deinit();
