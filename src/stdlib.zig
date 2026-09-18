@@ -1248,15 +1248,99 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
 // 4.0b.
 //
 // Errors land as catchable keyword payloads:
-//   :db-error            general open/io failure
+//   :db/<reason>         a named emdb / db-layer failure, see
+//                        `dbFailureName` (:db/key-too-large,
+//                        :db/max-trees, :db/corrupted, ...)
+//   :db-error            any other storage failure
 //   :db-closed           op on already-closed connection
 //   :invalid-durable-ref arg was not a durable_ref Value
 //   :codec-failed        encode/decode error
+//   :tx-closed           op on a finished transaction
+//
+// Outside any `try`, the raw VmError propagates instead (the same
+// rule the VM applies to every recoverable error).
 //
 // Connection lifetime: each `db/open` allocates a Connection
 // on the VM's main allocator (NOT the runtime arena) + appends
 // it to vm.db_connections. `db/close` removes from the list +
 // frees. VM.deinit closes any remaining as a safety net.
+
+/// A one-instruction routine that throws its argument. Calling it
+/// through `vm.callValue` is how a native raises a payload of its
+/// own choosing: the VM routes the throw to the innermost handler
+/// exactly as it does for `(throw x)`.
+const raise_code = [_]vm_mod.Inst{vm_mod.asm_.throwOp(vm_mod.Operand.slot(0))};
+const raise_routine = vm_mod.Routine{
+    .code = &raise_code,
+    .consts = &.{},
+    .slot_count = 1,
+    .fixed_arity = 1,
+    .name = "db/raise",
+};
+
+/// Throw the keyword `name`. When a handler catches it the result
+/// is `ControlTransferred`, which the run loop resumes from. With no
+/// handler anywhere, the raise frame is dropped again and `raw` is
+/// returned, so a program that does not opt into `try` sees the
+/// same VmError taxonomy as for every other recoverable error.
+fn throwKeyword(vm: *VM, name: []const u8, raw: VmError) VmError {
+    const id = vm.ensureInterner().internKeyword(name) catch return VmError.OutOfMemory;
+    const raise = vm.allocClosure(&raise_routine, &.{}) catch return VmError.OutOfMemory;
+    const frames_len = vm.frames.items.len;
+    const stack_len = vm.stack.items.len;
+    _ = vm.callValue(raise, &.{value_mod.fromKeywordId(id)}) catch |err| switch (err) {
+        VmError.UncaughtThrow => {
+            vm.frames.shrinkRetainingCapacity(frames_len);
+            vm.stack.shrinkRetainingCapacity(stack_len);
+            vm.unhandled_throw = null;
+            return raw;
+        },
+        else => return err,
+    };
+    return raw;
+}
+
+/// The keyword a storage-layer error surfaces as. Each emdb error
+/// set with a distinct cause gets its own name; the rest share
+/// `:db-error`. Codec errors keep `:codec-failed`.
+fn dbFailureName(err: anyerror) []const u8 {
+    return switch (err) {
+        error.KeyTooLarge => "db/key-too-large",
+        error.ValueTooLarge => "db/value-too-large",
+        error.MaxDbsReached => "db/max-trees",
+        error.NotFound => "db/not-found",
+        error.Corrupted, error.InvalidPage, error.FormatVersionMismatch => "db/corrupted",
+        error.DatabaseFull => "db/map-full",
+        error.MmapFailed => "db/mmap-failed",
+        error.OpenFailed => "db/open-failed",
+        error.PageSizeMismatch, error.InvalidPageSize => "db/page-size-mismatch",
+        error.WriterActive, error.EnvBusy => "db/busy",
+        error.TxnAborted => "db/txn-aborted",
+        error.TxnReadOnly => "db/read-only",
+        error.SyncFailed => "db/sync-failed",
+        error.StoreMismatch => "db/store-mismatch",
+        error.ConnectionUnavailable => "db/no-connection",
+        error.InvalidTreeName, error.InvalidKey => "db/invalid-key",
+        error.UnserializableKind,
+        error.TruncatedInput,
+        error.TrailingBytes,
+        error.InvalidVersion,
+        error.InvalidKindByte,
+        error.InvalidLeb128,
+        error.InvalidCharScalar,
+        error.MalformedPayload,
+        => "codec-failed",
+        else => "db-error",
+    };
+}
+
+/// Surface a db.zig / emdb / codec error to the program.
+fn dbFailure(vm: *VM, err: anyerror) VmError {
+    if (err == error.OutOfMemory) return VmError.OutOfMemory;
+    const name = dbFailureName(err);
+    const raw: VmError = if (std.mem.eql(u8, name, "codec-failed")) VmError.CodecFailed else VmError.DbError;
+    return throwKeyword(vm, name, raw);
+}
 
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     // Phase 4.0a accepted keyword OR symbol (interned-name-as-
@@ -1286,15 +1370,15 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     // Phase 5.2a polish (chore): auto-create the path's parent
     // directories so `(db/open "tmp/x.edb")` / `(db/open
     // "data/v1/state.edb")` Just Work. emdb does NOT create
-    // parents; without this, the open fails with `:db-error`
+    // parents; without this, the open fails with `:db/open-failed`
     // unless the user pre-created the directory.
     //
     // The auto-create branch only fires when the VM was given
     // a `std.Io` handle (the CLI sets one; ad-hoc test harnesses
     // don't, and tests use absolute `/tmp/...` paths or
     // pre-create their dirs explicitly). Best-effort: any error
-    // here is swallowed — emdb's open will surface a precise
-    // `:db-error` if the directory still isn't usable.
+    // here is swallowed — emdb's open will surface
+    // `:db/open-failed` if the directory still isn't usable.
     if (vm.io) |io_handle| {
         if (std.fs.path.dirname(path_slice)) |dir| {
             if (dir.len > 0) {
@@ -1305,7 +1389,7 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
 
     const heap = vm.ensureHeap();
     const interner = vm.ensureInterner();
-    conn.* = db_mod.open(vm.allocator, heap, interner, path_z.ptr, .{}) catch return VmError.DbError;
+    conn.* = db_mod.open(vm.allocator, heap, interner, path_z.ptr, .{}) catch |err| return dbFailure(vm, err);
     // Register on VM safety-net list.
     vm.db_close_callback = &dbCloseCallback;
     vm.db_connections.append(vm.allocator, @ptrCast(conn)) catch return VmError.OutOfMemory;
@@ -1366,7 +1450,7 @@ fn fnDbRef(vm: *VM, args: []const Value) VmError!Value {
         .string => string_mod.asBytes(key_v),
         else => unreachable,
     };
-    return db_mod.ref(vm.ensureHeap(), conn, tree_name, key_bytes) catch return VmError.DbError;
+    return db_mod.ref(vm.ensureHeap(), conn, tree_name, key_bytes) catch |err| return dbFailure(vm, err);
 }
 
 fn fnDbRefQ(_: *VM, args: []const Value) VmError!Value {
@@ -1374,58 +1458,58 @@ fn fnDbRefQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(db/put-key! ref value)` — auto-ephemeral write tx for v1.alpha.
-fn fnDbPutKey(_: *VM, args: []const Value) VmError!Value {
+fn fnDbPutKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const v = args[1];
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return VmError.DbError;
+    const conn = db_mod.refConn(r) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
     if (!conn.open_flag) return VmError.DbClosed;
-    var txn = db_mod.beginWrite(conn) catch return VmError.DbError;
-    db_mod.putRef(&txn, r, v) catch {
+    var txn = db_mod.beginWrite(conn) catch |err| return dbFailure(vm, err);
+    db_mod.putRef(&txn, r, v) catch |err| {
         db_mod.abortWrite(&txn);
-        return VmError.CodecFailed;
+        return dbFailure(vm, err);
     };
-    db_mod.commit(&txn) catch return VmError.DbError;
+    db_mod.commit(&txn) catch |err| return dbFailure(vm, err);
     return value_mod.nilValue();
 }
 
 /// `(db/get-key ref)` or `(db/get-key ref default)` — auto-ephemeral read tx.
-fn fnDbGetKey(_: *VM, args: []const Value) VmError!Value {
+fn fnDbGetKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const default = if (args.len > 1) args[1] else value_mod.nilValue();
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return VmError.DbError;
+    const conn = db_mod.refConn(r) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
     if (!conn.open_flag) return VmError.DbClosed;
-    var txn = db_mod.beginRead(conn) catch return VmError.DbError;
+    var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
     defer db_mod.abortRead(&txn);
-    const result = db_mod.getRef(&txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.CodecFailed;
+    const result = db_mod.getRef(&txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
     return result orelse default;
 }
 
-fn fnDbDeleteKey(_: *VM, args: []const Value) VmError!Value {
+fn fnDbDeleteKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return VmError.DbError;
+    const conn = db_mod.refConn(r) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
     if (!conn.open_flag) return VmError.DbClosed;
-    var txn = db_mod.beginWrite(conn) catch return VmError.DbError;
-    const existed = db_mod.delRef(&txn, r) catch {
+    var txn = db_mod.beginWrite(conn) catch |err| return dbFailure(vm, err);
+    const existed = db_mod.delRef(&txn, r) catch |err| {
         db_mod.abortWrite(&txn);
-        return VmError.DbError;
+        return dbFailure(vm, err);
     };
-    db_mod.commit(&txn) catch return VmError.DbError;
+    db_mod.commit(&txn) catch |err| return dbFailure(vm, err);
     return value_mod.fromBool(existed);
 }
 
-fn fnDbPresentQ(_: *VM, args: []const Value) VmError!Value {
+fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return VmError.DbError;
+    const conn = db_mod.refConn(r) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
     if (!conn.open_flag) return VmError.DbClosed;
-    var txn = db_mod.beginRead(conn) catch return VmError.DbError;
+    var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
     defer db_mod.abortRead(&txn);
     const tree = db_mod.refTreeName(r);
     const key = db_mod.refKeyBytes(r);
-    const result = db_mod.get(&txn, tree, key, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.DbError;
+    const result = db_mod.get(&txn, tree, key, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
     return value_mod.fromBool(result != null);
 }
 
@@ -1478,7 +1562,7 @@ fn fnDbBeginWrite(vm: *VM, args: []const Value) VmError!Value {
     if (!conn.open_flag) return VmError.DbClosed;
     const handle = vm.runtime_arena.allocator().create(WriteTxnHandle) catch return VmError.OutOfMemory;
     handle.* = .{
-        .txn = db_mod.beginWrite(conn) catch return VmError.DbError,
+        .txn = db_mod.beginWrite(conn) catch |err| return dbFailure(vm, err),
         .active = true,
     };
     return value_mod.Value{
@@ -1494,7 +1578,7 @@ fn fnDbBeginRead(vm: *VM, args: []const Value) VmError!Value {
     if (!conn.open_flag) return VmError.DbClosed;
     const handle = vm.runtime_arena.allocator().create(ReadTxnHandle) catch return VmError.OutOfMemory;
     handle.* = .{
-        .txn = db_mod.beginRead(conn) catch return VmError.DbError,
+        .txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err),
         .active = true,
     };
     return value_mod.Value{
@@ -1503,12 +1587,12 @@ fn fnDbBeginRead(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
-fn fnDbCommit(_: *VM, args: []const Value) VmError!Value {
+fn fnDbCommit(vm: *VM, args: []const Value) VmError!Value {
     const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
     if (!h.active) return VmError.TxClosed;
-    db_mod.commit(&h.txn) catch {
+    db_mod.commit(&h.txn) catch |err| {
         h.active = false;
-        return VmError.DbError;
+        return dbFailure(vm, err);
     };
     h.active = false;
     return value_mod.nilValue();
@@ -1531,20 +1615,20 @@ fn fnDbAbortRead(_: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(db/put! tx ref value)` — write through an active tx.
-fn fnDbPut(_: *VM, args: []const Value) VmError!Value {
+fn fnDbPut(vm: *VM, args: []const Value) VmError!Value {
     const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
     if (!h.active) return VmError.TxClosed;
     const r = args[1];
     const v = args[2];
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    db_mod.putRef(&h.txn, r, v) catch return VmError.CodecFailed;
+    db_mod.putRef(&h.txn, r, v) catch |err| return dbFailure(vm, err);
     return value_mod.nilValue();
 }
 
 /// `(db/get tx ref)` or `(db/get tx ref default)` — read through
 /// either a write or read tx. Returns `default` (nil if omitted)
 /// for missing keys.
-fn fnDbGet(_: *VM, args: []const Value) VmError!Value {
+fn fnDbGet(vm: *VM, args: []const Value) VmError!Value {
     const tx_v = args[0];
     const r = args[1];
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
@@ -1553,24 +1637,24 @@ fn fnDbGet(_: *VM, args: []const Value) VmError!Value {
         .db_write_txn => blk: {
             const h = writeTxnHandle(tx_v).?;
             if (!h.active) return VmError.TxClosed;
-            break :blk db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.CodecFailed;
+            break :blk db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
         },
         .db_read_txn => blk: {
             const h = readTxnHandle(tx_v).?;
             if (!h.active) return VmError.TxClosed;
-            break :blk db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.CodecFailed;
+            break :blk db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
         },
         else => return VmError.KindMismatch,
     };
     return result orelse default;
 }
 
-fn fnDbDelete(_: *VM, args: []const Value) VmError!Value {
+fn fnDbDelete(vm: *VM, args: []const Value) VmError!Value {
     const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
     if (!h.active) return VmError.TxClosed;
     const r = args[1];
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const existed = db_mod.delRef(&h.txn, r) catch return VmError.DbError;
+    const existed = db_mod.delRef(&h.txn, r) catch |err| return dbFailure(vm, err);
     return value_mod.fromBool(existed);
 }
 
@@ -1584,15 +1668,15 @@ fn fnDbDelete(_: *VM, args: []const Value) VmError!Value {
 ///                 AI turn 75; deref does NOT touch in_flight and
 ///                 is allowed inside a swap! critical section)
 ///   other       → :not-derefable (catchable)
-fn fnDbDeref(_: *VM, args: []const Value) VmError!Value {
+fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     return switch (x.kind()) {
         .durable_ref => blk: {
-            const conn = db_mod.refConn(x) orelse return VmError.DbError;
+            const conn = db_mod.refConn(x) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
             if (!conn.open_flag) return VmError.DbClosed;
-            var txn = db_mod.beginRead(conn) catch return VmError.DbError;
+            var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
             defer db_mod.abortRead(&txn);
-            const result = db_mod.getRef(&txn, x, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.CodecFailed;
+            const result = db_mod.getRef(&txn, x, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
             break :blk result orelse value_mod.nilValue();
         },
         .var_ => blk: {
@@ -1612,7 +1696,7 @@ fn fnDbDeref(_: *VM, args: []const Value) VmError!Value {
 ///
 /// Per peer-AI turn 73 §Q2: if `f` throws or control transfers,
 /// do NOT write. Connection mismatch on `ref` surfaces as
-/// :db-error via db.zig's assertRefMatchesConn.
+/// :db/store-mismatch via db.zig's assertRefMatchesConn.
 // =============================================================================
 // scan + reduce-tree (Phase 4.0d)
 // =============================================================================
@@ -1648,7 +1732,7 @@ const TreeCursor = struct {
 
     /// Open a cursor on `tree_name`. Null when the tree does not
     /// exist, which every caller treats as an empty tree.
-    fn open(tx_v: Value, tree_name: []const u8) VmError!?TreeCursor {
+    fn open(vm: *VM, tx_v: Value, tree_name: []const u8) VmError!?TreeCursor {
         const Resolved = struct { conn: *db_mod.Connection, inner: *emdb_mod.Txn, tree_id: ?emdb_mod.TreeId };
         const r: Resolved = switch (tx_v.kind()) {
             .db_write_txn => blk: {
@@ -1657,7 +1741,7 @@ const TreeCursor = struct {
                 break :blk .{
                     .conn = h.txn.conn,
                     .inner = h.txn.inner,
-                    .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch return VmError.DbError,
+                    .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err),
                 };
             },
             .db_read_txn => blk: {
@@ -1666,13 +1750,13 @@ const TreeCursor = struct {
                 break :blk .{
                     .conn = h.txn.conn,
                     .inner = h.txn.inner,
-                    .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch return VmError.DbError,
+                    .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err),
                 };
             },
             else => return VmError.KindMismatch,
         };
         const tree_id = r.tree_id orelse return null;
-        const cursor = r.inner.openCursorForTree(tree_id) catch return VmError.DbError;
+        const cursor = r.inner.openCursorForTree(tree_id) catch |err| return dbFailure(vm, err);
         return .{
             .conn = r.conn,
             .inner = r.inner,
@@ -1686,14 +1770,14 @@ const TreeCursor = struct {
     /// that continue past the cursor's first page are re-read
     /// through the tree (`db.cursorValue`).
     fn decode(self: *TreeCursor, vm: *VM, kv: emdb_mod.Cursor.KeyValue) VmError!Value {
-        const bytes = db_mod.cursorValue(self, self.tree_id, kv, self.page_bytes) catch return VmError.DbError;
+        const bytes = db_mod.cursorValue(self, self.tree_id, kv, self.page_bytes) catch |err| return dbFailure(vm, err);
         return codec_mod.decode(
             vm.ensureHeap(),
             vm.ensureInterner(),
             bytes,
             &dispatch_mod_alias.hashValue,
             &dispatch_mod_alias.equal,
-        ) catch return VmError.CodecFailed;
+        ) catch |err| return dbFailure(vm, err);
     }
 };
 
@@ -1720,7 +1804,7 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
         break :blk if (ev.kind() == .keyword) interner.keywordName(id) else interner.symbolName(id);
     } else null;
 
-    var tc = (try TreeCursor.open(tx_v, tree_name)) orelse {
+    var tc = (try TreeCursor.open(vm, tx_v, tree_name)) orelse {
         return vector_mod.fromSlice(vm.ensureHeap(), &.{}) catch VmError.OutOfMemory;
     };
 
@@ -1771,7 +1855,7 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     const tree_name = interner.keywordName(tree_id);
 
     // No such tree: the init value, unchanged.
-    var tc = (try TreeCursor.open(tx_v, tree_name)) orelse return acc;
+    var tc = (try TreeCursor.open(vm, tx_v, tree_name)) orelse return acc;
 
     var maybe_kv: ?emdb_mod.Cursor.KeyValue = tc.cursor.first();
     while (maybe_kv) |kv| {
@@ -1797,7 +1881,7 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
 
     // 1. Read current.
-    const current_opt = db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.CodecFailed;
+    const current_opt = db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
     const current = current_opt orelse value_mod.nilValue();
 
     // 2. Build (f current extra...) arg list. f is the FIRST
@@ -1812,7 +1896,7 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     const new_value = try vm.callValue(f, call_args);
 
     // 4. Write.
-    db_mod.putRef(&h.txn, r, new_value) catch return VmError.CodecFailed;
+    db_mod.putRef(&h.txn, r, new_value) catch |err| return dbFailure(vm, err);
     return new_value;
 }
 

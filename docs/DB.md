@@ -100,8 +100,8 @@ handle (the CLI sets `v.io = init.io` after `VM.init`; ad-hoc
 test harnesses use absolute `/tmp/...` paths or pre-create their
 dirs, so the branch is a structural no-op there). Errors from
 `createDirPath` are intentionally swallowed — best-effort; emdb's
-own open surfaces a precise `:db-error` if the directory still
-isn't usable after the attempt.
+own open surfaces `:db/open-failed` if the directory still isn't
+usable after the attempt.
 
 ---
 
@@ -440,6 +440,18 @@ Per peer-AI turn 23, pinned explicitly:
 **Equality and hash are unaffected** by any of the above — the
 identity triple is fully defined by the stored bytes, independent
 of operational state.
+
+**At the language level** every one of these reaches the program
+as a keyword payload (stdlib `dbFailure`). Distinct emdb error sets
+get distinct names — `:db/key-too-large`, `:db/value-too-large`,
+`:db/max-trees`, `:db/not-found`, `:db/corrupted`, `:db/map-full`,
+`:db/mmap-failed`, `:db/open-failed`, `:db/page-size-mismatch`,
+`:db/busy`, `:db/txn-aborted`, `:db/read-only`, `:db/sync-failed` —
+as do the db.zig errors `:db/store-mismatch`, `:db/no-connection`
+and `:db/invalid-key`; anything else is `:db-error`, and codec
+errors are `:codec-failed`. Outside any `try` the raw `VmError`
+(`DbError` / `CodecFailed`) propagates, the rule the VM applies to
+every recoverable error.
 
 **Re-hydrating a ref** (constructing from bytes without an
 available Connection): `refFromBytes(heap, store_id, tree_name,
