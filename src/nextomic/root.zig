@@ -11,6 +11,7 @@ pub const idents = @import("idents.zig");
 pub const schema = @import("schema.zig");
 pub const db = @import("db.zig");
 pub const transact = @import("transact.zig");
+pub const natives = @import("natives.zig");
 
 pub const Val = key.Val;
 pub const ValueType = key.ValueType;
@@ -35,4 +36,5 @@ test {
     _ = schema;
     _ = db;
     _ = transact;
+    _ = natives;
 }

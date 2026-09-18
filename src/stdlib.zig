@@ -191,6 +191,7 @@ const internal_fns = [_]CoreEntry{
 /// matches CLOJURE-REVIEW.md §1.1 two-stage bootstrap.
 pub const CORE_NX_SOURCE: []const u8 = @embedFile("stdlib/core.nx");
 
+
 const CoreEntry = struct {
     name: []const u8,
     descriptor: *const NativeFn,
@@ -2279,7 +2280,7 @@ fn isIfn(k: Kind) bool {
 //
 // Errors land as catchable keyword payloads:
 //   :db/<reason>         a named emdb / db-layer failure, see
-//                        `dbFailureName` (:db/key-too-large,
+//                        `db.failureName` (:db/key-too-large,
 //                        :db/max-trees, :db/corrupted, ...)
 //   :db-error            any other storage failure
 //   :db-closed           op on already-closed connection
@@ -2310,44 +2311,10 @@ fn throwKeyword(vm: *VM, name: []const u8, raw: VmError) VmError {
     return err;
 }
 
-/// The keyword a storage-layer error surfaces as. Each emdb error
-/// set with a distinct cause gets its own name; the rest share
-/// `:db-error`. Codec errors keep `:codec-failed`.
-fn dbFailureName(err: anyerror) []const u8 {
-    return switch (err) {
-        error.KeyTooLarge => "db/key-too-large",
-        error.ValueTooLarge => "db/value-too-large",
-        error.MaxDbsReached => "db/max-trees",
-        error.NotFound => "db/not-found",
-        error.Corrupted, error.InvalidPage, error.FormatVersionMismatch => "db/corrupted",
-        error.DatabaseFull => "db/map-full",
-        error.MmapFailed => "db/mmap-failed",
-        error.OpenFailed => "db/open-failed",
-        error.PageSizeMismatch, error.InvalidPageSize => "db/page-size-mismatch",
-        error.WriterActive, error.EnvBusy => "db/busy",
-        error.TxnAborted => "db/txn-aborted",
-        error.TxnReadOnly => "db/read-only",
-        error.SyncFailed => "db/sync-failed",
-        error.StoreMismatch => "db/store-mismatch",
-        error.ConnectionUnavailable => "db/no-connection",
-        error.InvalidTreeName, error.InvalidKey => "db/invalid-key",
-        error.UnserializableKind,
-        error.TruncatedInput,
-        error.TrailingBytes,
-        error.InvalidVersion,
-        error.InvalidKindByte,
-        error.InvalidLeb128,
-        error.InvalidCharScalar,
-        error.MalformedPayload,
-        => "codec-failed",
-        else => "db-error",
-    };
-}
-
 /// Surface a db.zig / emdb / codec error to the program.
 fn dbFailure(vm: *VM, err: anyerror) VmError {
     if (err == error.OutOfMemory) return VmError.OutOfMemory;
-    const name = dbFailureName(err);
+    const name = db_mod.failureName(err);
     const raw: VmError = if (std.mem.eql(u8, name, "codec-failed")) VmError.CodecFailed else VmError.DbError;
     return throwKeyword(vm, name, raw);
 }
