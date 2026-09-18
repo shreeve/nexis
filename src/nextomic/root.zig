@@ -10,6 +10,7 @@ pub const store = @import("store.zig");
 pub const idents = @import("idents.zig");
 pub const schema = @import("schema.zig");
 pub const db = @import("db.zig");
+pub const transact = @import("transact.zig");
 
 pub const Val = key.Val;
 pub const ValueType = key.ValueType;
@@ -23,6 +24,8 @@ pub const Attr = schema.Attr;
 pub const Conn = db.Conn;
 pub const DbValue = db.DbValue;
 pub const Error = db.Error;
+pub const Report = transact.Report;
+pub const Op = transact.Op;
 
 test {
     _ = key;
@@ -31,4 +34,5 @@ test {
     _ = idents;
     _ = schema;
     _ = db;
+    _ = transact;
 }

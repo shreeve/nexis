@@ -457,16 +457,19 @@ pub const DatomScan = struct {
     }
 
     /// The full out-of-line value from the EAVT payload of this exact
-    /// datom (current or history), read with `getFromTree`.
+    /// datom (current or history), read with `getFromTree` and copied
+    /// into the arena: a multi-page value is assembled in the
+    /// transaction's own buffer, which dies with the transaction.
     fn payload(self: *DatomScan, parts: key.Parts, t: u64, added: bool) ![]const u8 {
         const store = self.read.db.conn.store;
         const vbytes = if (self.index == .vaet) unreachable else parts.v;
         if (self.source == .current) {
             const raw = (try store.getCurrent(self.read.txn, .eavt, parts.e, parts.a, vbytes, self.arena)) orelse return error.Corrupted;
             if (raw.len < key.id_len) return error.Corrupted;
-            return raw[key.id_len..];
+            return self.arena.dupe(u8, raw[key.id_len..]);
         }
-        return (try store.getHistory(self.read.txn, .eavt, parts.e, parts.a, vbytes, .{ .t = t, .added = added }, self.arena)) orelse error.Corrupted;
+        const raw = (try store.getHistory(self.read.txn, .eavt, parts.e, parts.a, vbytes, .{ .t = t, .added = added }, self.arena)) orelse return error.Corrupted;
+        return self.arena.dupe(u8, raw);
     }
 };
 
