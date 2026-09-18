@@ -8,8 +8,9 @@
 //!      entities and card-many collections), resolving attributes through
 //!      the schema at `now` and converting values by the attribute's type;
 //!   3. bind tempids: `:db/ident` binds to the ident's id (minting it),
-//!      unique-identity assertions upsert through an AVET probe, two
-//!      tempids naming one identity unify, the rest take fresh eids;
+//!      unique-identity assertions upsert through an AVET probe (a
+//!      tempid- or lookup-ref-valued claim once its value is known),
+//!      two tempids naming one identity unify, the rest take fresh eids;
 //!   4. expand ops in order against the committed trees plus the
 //!      transaction's own overlay: card-one implicit retracts, no-op
 //!      re-assertions, conflicts, unique-value collisions, lookup refs,
@@ -768,21 +769,65 @@ const Ctx = struct {
             if (op.add.v != .val) return error.ValueType;
             try self.bind(op.add.e.tempid, op.add.v.val.keyword);
         }
-        // Unique-identity assertions upsert; equal identities unify.
+        // Unique-identity assertions upsert; equal identities unify. A
+        // claim whose value is a tempid or a lookup ref waits until the
+        // value is known: a tempid bound by its own identity, a lookup
+        // ref found in the tree or among the claims of this
+        // transaction. Each round settles what the last one bound.
         var claims: std.StringHashMapUnmanaged(u32) = .empty;
-        for (self.ops.items) |op| {
+        var deferred: std.ArrayList(struct { op: usize, e: u32, attr: Attr, v: PVal }) = .empty;
+        for (self.ops.items, 0..) |op, idx| {
             if (op != .add or op.add.e != .tempid) continue;
             const attr = op.add.attr;
-            if (attr.unique != .identity or attr.id == boot.ident or op.add.v != .val) continue;
-            const vb = try key.valBytes(self.arena, op.add.v.val);
-            const av = try self.avKey(attr.id, vb);
-            const g = try claims.getOrPut(self.arena, av);
-            if (g.found_existing) {
-                try self.unify(op.add.e.tempid, g.value_ptr.*);
-            } else {
-                g.value_ptr.* = op.add.e.tempid;
+            if (attr.unique != .identity or attr.id == boot.ident) continue;
+            switch (op.add.v) {
+                .val => |v| try self.claimIdentity(&claims, op.add.e.tempid, attr, v),
+                else => try deferred.append(self.arena, .{ .op = idx, .e = op.add.e.tempid, .attr = attr, .v = op.add.v }),
             }
-            if (try self.probeAvet(attr.id, vb)) |eid| try self.bind(op.add.e.tempid, eid);
+        }
+        var progress = true;
+        while (progress and deferred.items.len > 0) {
+            progress = false;
+            var i: usize = 0;
+            while (i < deferred.items.len) {
+                const d = deferred.items[i];
+                var eid: ?u64 = null;
+                var target: ?u32 = null;
+                switch (d.v) {
+                    .tempid => |t| target = t,
+                    .lookup => |l| {
+                        const vb = try key.valBytes(self.arena, l.v);
+                        eid = try self.probeAvet(l.attr.id, vb);
+                        if (eid == null) target = claims.get(try self.avKey(l.attr.id, vb));
+                        // A lookup ref naming a tempid's identity is that
+                        // tempid, wherever the identity is asserted.
+                        if (target) |t| self.ops.items[d.op].add.v = .{ .tempid = t };
+                    },
+                    .val => unreachable,
+                }
+                if (eid == null) if (target) |t| {
+                    eid = self.bindings.items[self.root(t)].eid;
+                };
+                if (eid) |id| {
+                    try self.claimIdentity(&claims, d.e, d.attr, .{ .ref = id });
+                } else if (target != null) {
+                    // Waits for its target's binding.
+                    i += 1;
+                    continue;
+                }
+                // Resolved, or naming nothing this transaction knows:
+                // expansion resolves or refuses such a lookup ref.
+                progress = true;
+                _ = deferred.swapRemove(i);
+            }
+        }
+        // Claims on entities this transaction creates: equal claims are
+        // one entity, and the tree cannot hold them yet.
+        var by_target: std.AutoHashMapUnmanaged(struct { a: u32, root: u32 }, u32) = .empty;
+        for (deferred.items) |d| {
+            const t: u32 = self.ops.items[d.op].add.v.tempid;
+            const g = try by_target.getOrPut(self.arena, .{ .a = d.attr.id, .root = self.root(t) });
+            if (g.found_existing) try self.unify(d.e, g.value_ptr.*) else g.value_ptr.* = d.e;
         }
         // Fresh eids for the rest.
         for (self.bindings.items, 0..) |*b, i| {
@@ -794,6 +839,20 @@ const Ctx = struct {
             self.next_eid += 1;
             self.eid_bumped = true;
         }
+    }
+
+    /// One identity claim `(e a v)` with `v` known: equal claims unify,
+    /// and the entity holding `(a v)` in the tree binds the tempid.
+    fn claimIdentity(self: *Ctx, claims: *std.StringHashMapUnmanaged(u32), e: u32, attr: Attr, v: Val) !void {
+        const vb = try key.valBytes(self.arena, v);
+        const av = try self.avKey(attr.id, vb);
+        const g = try claims.getOrPut(self.arena, av);
+        if (g.found_existing) {
+            try self.unify(e, g.value_ptr.*);
+        } else {
+            g.value_ptr.* = e;
+        }
+        if (try self.probeAvet(attr.id, vb)) |eid| try self.bind(e, eid);
     }
 
     fn avKey(self: *Ctx, a: u32, vbytes: []const u8) ![]u8 {
@@ -1079,7 +1138,7 @@ const Ctx = struct {
         for (self.overlay.items) |p| {
             if (p.attr.id != attr.id or !p.added) continue;
             if ((try seen.getOrPut(self.arena, p.vbytes)).found_existing) return error.Unique;
-            if (try self.probeAvet(attr.id, p.vbytes)) |other| if (other != p.e) return error.Unique;
+            if (try self.findByAv(attr.id, p.vbytes)) |other| if (other != p.e) return error.Unique;
         }
     }
 
@@ -2127,6 +2186,126 @@ test "a lookup ref under a card-many ref attribute is one ref; a vector of them 
     m3 = try champ.mapAssoc(&heap, m3, try K.k(tc, "user/tags"), try vector_mod.fromSlice(&heap, &.{ try K.k(tc, "user/email"), try K.k(tc, "tag/b") }), &dispatch.hashValue, &dispatch.equal);
     _ = try transact(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{m3}), .{});
     try testing.expectEqual(@as(usize, 2), (try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = ann, .a = tags })).len);
+}
+
+/// Install `:user/nick` (string, indexed) and `:user/spouse` (ref,
+/// unique identity) beside `installSchema`'s attributes.
+fn installIdentitySchema(tc: *TestConn, arena: Allocator) !void {
+    _ = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.ident }, .v = .{ .keyword = try kw(tc, "user/nick") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_string } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.index }, .v = .{ .val = .{ .boolean = true } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "spouse" } }, .a = .{ .id = boot.ident }, .v = .{ .keyword = try kw(tc, "user/spouse") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "spouse" } }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_ref } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "spouse" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "spouse" } }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_identity } } } },
+    }, .{});
+}
+
+test "an indexed attribute becomes unique while a value moves between entities" {
+    const tc = try TestConn.init("tx_unique_move");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    try installIdentitySchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const nick = try attrId(tc, "user/nick");
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = nick }, .v = .{ .val = .{ .string = "N" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "b@x" } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    const b = r1.tempids[1].eid;
+
+    // Without the retraction, two entities would hold "N": refused.
+    try testing.expectError(error.Unique, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = b }, .a = .{ .id = nick }, .v = .{ .val = .{ .string = "N" } } } },
+        .{ .add = .{ .e = .{ .eid = nick }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_identity } } } },
+    }, .{}));
+    // The value moves from a to b in the transaction that makes the
+    // attribute unique: after it, exactly one entity holds "N".
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .retract = .{ .e = .{ .eid = a }, .a = .{ .id = nick }, .v = .{ .val = .{ .string = "N" } } } },
+        .{ .add = .{ .e = .{ .eid = b }, .a = .{ .id = nick }, .v = .{ .val = .{ .string = "N" } } } },
+        .{ .add = .{ .e = .{ .eid = nick }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_identity } } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 4), r2.tx_data.len);
+    const db = try tc.conn.db();
+    try testing.expectEqual(schema_mod.Unique.identity, (try db.attr(arena, nick)).?.unique);
+    try testing.expectEqual(@as(?u64, b), try db.entid(arena, .{ .lookup = .{ .a = nick, .v = .{ .string = "N" } } }));
+    try testing.expectEqual(@as(usize, 1), (try db.datoms(arena, .aevt, .{ .a = nick })).len);
+}
+
+test "identity claims whose value is a lookup ref or a tempid upsert" {
+    const tc = try TestConn.init("tx_identity_ref");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    try installIdentitySchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const name = try attrId(tc, "user/name");
+    const age = try attrId(tc, "user/age");
+    const spouse = try attrId(tc, "user/spouse");
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "h" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "h@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = spouse }, .v = .{ .entity = .{ .tempid = .{ .string = "h" } } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    const h = r1.tempids[1].eid;
+
+    // The claim's value is a lookup ref: x is a.
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "x" } }, .a = .{ .id = spouse }, .v = .{ .entity = .{ .lookup = .{ .a = .{ .id = email }, .v = .{ .string = "h@x" } } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "x" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    try testing.expectEqual(a, r2.tempids[0].eid);
+    try testing.expectEqual(@as(usize, 2), r2.tx_data.len);
+    for (r2.tx_data) |d| try testing.expect(d.a != spouse);
+
+    // The claim's value is a tempid that itself upserts: x is a, hh is h.
+    const r3 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "x" } }, .a = .{ .id = spouse }, .v = .{ .entity = .{ .tempid = .{ .string = "hh" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "x" } }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 3 } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "hh" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "h@x" } } } },
+    }, .{});
+    try testing.expectEqual(a, r3.tempids[0].eid);
+    try testing.expectEqual(h, r3.tempids[1].eid);
+    try testing.expectEqual(@as(usize, 2), r3.tx_data.len);
+
+    // Two tempids claiming one new entity as spouse are one entity.
+    const r4 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "p" } }, .a = .{ .id = spouse }, .v = .{ .entity = .{ .tempid = .{ .string = "n" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "q" } }, .a = .{ .id = spouse }, .v = .{ .entity = .{ .tempid = .{ .string = "n" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "q" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Q" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "n@x" } } } },
+    }, .{});
+    // Tempids are listed in order of first mention: p, n, q.
+    try testing.expectEqual(r4.tempids[0].eid, r4.tempids[2].eid);
+    try testing.expect(r4.tempids[1].eid != r4.tempids[0].eid);
+    try testing.expect(r4.tempids[1].eid != a and r4.tempids[1].eid != h);
+    try testing.expectEqual(@as(usize, 4), r4.tx_data.len);
+
+    // A claim through a lookup ref on a new entity's identity, asserted
+    // later in the same transaction: y and m are fresh, y's spouse is m.
+    const r5 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "y" } }, .a = .{ .id = spouse }, .v = .{ .entity = .{ .lookup = .{ .a = .{ .id = email }, .v = .{ .string = "m@x" } } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "y" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Y" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "m" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "m@x" } } } },
+    }, .{});
+    const y = r5.tempids[0].eid;
+    const m = r5.tempids[1].eid;
+    try testing.expect(y != m and y > h and m > h);
+    try testing.expectEqual(@as(usize, 4), r5.tx_data.len);
+    try testing.expectEqual(@as(?u64, y), try (try tc.conn.db()).entid(arena, .{ .lookup = .{ .a = spouse, .v = .{ .ref = m } } }));
 }
 
 test "the view outlives the scratch arena until destroy" {

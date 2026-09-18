@@ -170,9 +170,13 @@ so there is no queue; emdb's write lock is the transactor.
    attribute's `:db/valueType`; mint ident ids for new keyword values
    inside `wtxn`. Resolve lookup refs and unique-identity tempids by an
    AVET probe **through `wtxn`** so datoms earlier in the same
-   transaction are visible. A unique-value collision with a different
-   entity is `:nextomic/unique`. Remaining tempids take eids from
-   `sys/"eid"`, read once and bumped once.
+   transaction are visible. A unique-identity claim whose value is a
+   tempid or a lookup ref upserts once the value is known: a tempid
+   bound by its own identity, a lookup ref found in the tree or naming
+   an identity asserted anywhere in the same transaction; claims on an
+   entity the transaction creates unify their tempids. A unique-value
+   collision with a different entity is `:nextomic/unique`. Remaining
+   tempids take eids from `sys/"eid"`, read once and bumped once.
 4. **Expand**: a card-one assertion whose current value differs writes
    the retraction of the old value and the assertion of the new one in
    this `t`; asserting an already-current datom writes nothing; two
