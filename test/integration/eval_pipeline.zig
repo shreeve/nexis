@@ -145,25 +145,42 @@ const Program = struct {
     /// Run every top-level form of `src` in order (matching
     /// runFile semantics); the last form's value is the result.
     fn run(self: *Program, src: []const u8) !value_mod.Value {
+        return self.runWith(src, false, null);
+    }
+
+    /// `run` the way the CLI runs a file: every name the program
+    /// defines is declared up front and any other unresolved
+    /// symbol is a compile error whose span lands in `out_span`.
+    fn runChecked(self: *Program, src: []const u8, out_span: ?*?reader_mod.SrcSpan) !value_mod.Value {
+        return self.runWith(src, true, out_span);
+    }
+
+    fn runWith(self: *Program, src: []const u8, checked: bool, out_span: ?*?reader_mod.SrcSpan) !value_mod.Value {
         var parse_result = try reader_mod.parser.parseProgram(testing.allocator, src);
         defer parse_result.parser.deinit();
         var rdr = reader_mod.Reader.init(testing.allocator, src);
         defer rdr.deinit();
         const forms = try rdr.readProgram(parse_result.sexp);
 
+        var declared = compile.DeclaredNames.init(testing.allocator);
+        defer declared.deinit();
+        if (checked) for (forms) |form| try declared.declareForm(form);
+
         var last_result: value_mod.Value = value_mod.nilValue();
         for (forms) |form| {
             // Re-read current per form so (ns NAME) takes effect.
             const current_ns = self.registry.current;
-            const compiled = try compile.compileFormFullWithMacrosSpanPersistentRegistry(
+            const compiled = try compile.compileFormFullWithMacrosSpanPersistentRegistryLoader(
                 self.arena.allocator(),
                 form,
                 current_ns,
                 self.interner,
                 &self.host_macros,
-                null,
+                out_span,
                 self.v.runtime_arena.allocator(),
                 self.registry,
+                null,
+                if (checked) &declared else null,
             );
             const routine = compiled.toRoutine("test-form");
             self.v.frames.items[0].routine = &routine;
@@ -3375,4 +3392,94 @@ test "native throw: uncaught surfaces as UncaughtThrow with the value recorded" 
     try testing.expectError(vm.VmError.UncaughtThrow, program.run("(boom-with :loose)"));
     const thrown = program.v.unhandled_throw orelse return error.TestFailed;
     try testing.expectEqualStrings("loose", program.interner.keywordName(thrown.asKeywordId()));
+}
+
+// =============================================================================
+// Unresolved symbols are compile errors located at the symbol
+// =============================================================================
+
+fn expectCheckedOutput(src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var span: ?reader_mod.SrcSpan = null;
+    const result = program.runChecked(src, &span) catch |err| {
+        std.debug.print("\n  source: {s}\n  error: {s} at {?}\n", .{ src, @errorName(err), span });
+        return err;
+    };
+    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
+    defer buf.deinit();
+    try formatValue(&buf, result, program.interner);
+    testing.expectEqualStrings(expected, buf.items) catch |err| {
+        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
+        return err;
+    };
+}
+
+/// The program must fail to compile with `UnresolvedSymbol`, and the
+/// reported span must cover exactly `symbol` in the source.
+fn expectUnresolved(src: []const u8, symbol: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var span: ?reader_mod.SrcSpan = null;
+    try testing.expectError(compile.CompileError.UnresolvedSymbol, program.runChecked(src, &span));
+    const sp = span orelse return error.TestFailed;
+    testing.expectEqualStrings(symbol, src[sp.pos .. sp.pos + sp.len]) catch |err| {
+        std.debug.print("\n  source: {s}\n  span: {?}\n", .{ src, span });
+        return err;
+    };
+}
+
+test "unresolved symbols: forward references across a file keep working" {
+    try expectCheckedOutput("(defn f [] (g)) (defn g [] 42) (f)", "42");
+    try expectCheckedOutput("(defn f [] (later 1)) (def later inc) (f)", "2");
+    try expectCheckedOutput("(declare later) (defn f [] (later 1)) (defn later [x] (* x 3)) (f)", "3");
+    try expectCheckedOutput("(do (defn h [] (i)) (defn i [] :i)) (h)", ":i");
+    try expectCheckedOutput("(defmacro m [] 1) (defn f [] (m)) (f)", "1");
+    try expectCheckedOutput("(defn uses [] (->P 1 2)) (defrecord P [x y]) (:y (uses))", "2");
+    try expectCheckedOutput("(defn a [s] (area s)) (defprotocol Shape (area [s])) (defrecord Sq [w]) (extend-type Sq Shape (area [s] (* (:w s) (:w s)))) (a (->Sq 3))", "9");
+    try expectCheckedOutput("(defn f [x] (-> x inc)) (f 1)", "2");
+    try expectCheckedOutput("(defn f [] (map inc [1 2])) (f)", "(2 3)");
+    try expectCheckedOutput("(defn f [] '(a b c)) (f)", "(a b c)");
+    try expectCheckedOutput("(let [{k :k} {:k 5} [p q] [1 2]] (+ k p q))", "8");
+    try expectCheckedOutput("(letfn [(ev? [n] (if (zero? n) true (od? (dec n)))) (od? [n] (if (zero? n) false (ev? (dec n))))] (ev? 4))", "true");
+    try expectCheckedOutput("(try (throw :x) (catch any e (str e)))", ":x");
+    try expectCheckedOutput("(for [x [1 2] y [10 20]] (+ x y))", "[11 21 12 22]");
+    try expectCheckedOutput("(def acc (atom [])) (doseq [x [1 2]] (swap! acc conj x)) @acc", "[1 2]");
+    try expectCheckedOutput("(ns other) (defn f [] (g)) (defn g [] :other) (f)", ":other");
+}
+
+test "unresolved symbols: a reference to nothing is a compile error at the symbol" {
+    try expectUnresolved("(defn f [x] (+ x y))", "y");
+    try expectUnresolved("(let [a 1]\n  (list a b))", "b");
+    try expectUnresolved("(defn f [x]\n  (-> x inc nope dec))", "nope");
+    try expectUnresolved("(fn [x] (missing-fn x))", "missing-fn");
+    try expectUnresolved("(defn f [] (g)) (defn g [] (h))", "h");
+    try expectUnresolved("(if true undefined-a undefined-b)", "undefined-a");
+    try expectUnresolved("(let [x 1] x) y", "y");
+    try expectUnresolved("(try 1 (catch any e (log e)))", "log");
+}
+
+test "unresolved symbols: a symbol a user macro produced is reported at the macro call" {
+    // Forms a core.nx (user) macro produces carry the call's span,
+    // so the report covers the call rather than the symbol.
+    const src = "(letfn [(a [n] (b n))] (a 1))";
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var span: ?reader_mod.SrcSpan = null;
+    try testing.expectError(compile.CompileError.UnresolvedSymbol, program.runChecked(src, &span));
+    const sp = span orelse return error.TestFailed;
+    try testing.expect(sp.pos + sp.len <= src.len);
+    try testing.expect(std.mem.indexOf(u8, src[sp.pos .. sp.pos + sp.len], "(b n)") != null);
+}
+
+test "unresolved symbols: nothing is interned for a rejected form" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var span: ?reader_mod.SrcSpan = null;
+    try testing.expectError(compile.CompileError.UnresolvedSymbol, program.runChecked("(defn f [] (ghost))", &span));
+    try testing.expect(program.registry.current.lookupLocal("ghost") == null);
 }

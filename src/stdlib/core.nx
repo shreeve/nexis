@@ -341,6 +341,12 @@
 ; Control-flow macros
 ; ============================================================
 
+; (declare a b ...) → interns each name as an unbound Var so a
+; later definition can be referred to before it appears, even
+; when a macro will produce that definition.
+(defmacro declare [& names]
+  `(do ~@(map (fn* [n] (list 'def n)) names) nil))
+
 ; (if-not test then else?) → (if test else then).
 (defmacro if-not [test then & else]
   `(if ~test ~(first else) ~then))

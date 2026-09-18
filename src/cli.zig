@@ -435,6 +435,11 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         // Phase 3.4: re-read registry.current each iteration so
         // `(ns NAME)` switches affect subsequent forms.
         const current_ns = registry.current;
+        // A REPL line may only refer to what exists or what the
+        // line itself defines; the compiler reports anything else
+        // at the symbol.
+        var declared = compile.DeclaredNames.init(allocator);
+        defer declared.deinit();
         const compiled = compile.compileSourceFullWithMacrosSpanPersistentRegistryLoader(
             arena_alloc,
             src,
@@ -445,6 +450,7 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
             v.runtime_arena.allocator(),
             registry,
             .{ .user_data = @ptrCast(&loader), .load = &loader_mod.Loader.loadCallback },
+            &declared,
         ) catch |err| {
             try emitCompileError(io, "<repl>", src, err, error_span);
             continue;
@@ -602,6 +608,13 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
 
     var last_result: Value = value_mod.nilValue();
 
+    // Every name the file defines at top level may be referred to
+    // from any form in it (forward references); a symbol that
+    // resolves to nothing else is a compile error at its span.
+    var declared = compile.DeclaredNames.init(allocator);
+    defer declared.deinit();
+    for (forms) |form| try declared.declareForm(form);
+
     for (forms) |form| {
         // Step #10.0: surface SrcSpan from compile errors.
         // The CLI converts byte offsets to file:line:col +
@@ -620,6 +633,7 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
             v.runtime_arena.allocator(),
             registry,
             .{ .user_data = @ptrCast(&loader), .load = &loader_mod.Loader.loadCallback },
+            &declared,
         ) catch |err| {
             try emitCompileError(io, path, source, err, error_span);
             std.process.exit(4);

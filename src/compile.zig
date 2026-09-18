@@ -1082,11 +1082,89 @@ pub const LowerCtx = struct {
     /// null, `.string` Forms lower to `UnsupportedFeature` (same
     /// as pre-5.2a behavior).
     heap: ?*heap_mod.Heap = null,
+    /// The namespace symbols resolve in. With `declared` set, a
+    /// symbol that is neither lexically bound, resolvable here
+    /// (including referred namespaces) nor declared is a compile
+    /// error instead of an unbound Var.
+    namespace: ?*vm.Namespace = null,
+    declared: ?*const DeclaredNames = null,
+    diag: ?*LowerDiag = null,
 
-    /// Create a child context with a new env, inheriting the
-    /// Interner + heap unchanged.
+    /// Create a child context with a new env; everything else
+    /// carries over.
     pub fn withEnv(self: LowerCtx, env: ?*const LowerEnv) LowerCtx {
-        return .{ .env = env, .interner = self.interner, .heap = self.heap };
+        var copy = self;
+        copy.env = env;
+        return copy;
+    }
+};
+
+/// Where lowering failed, when it can say more precisely than
+/// "somewhere in this top-level form".
+pub const LowerDiag = struct {
+    span: ?reader_mod.SrcSpan = null,
+};
+
+/// Names a file or REPL line defines at top level, collected before
+/// any of its forms compile, so a form may refer to a Var that a
+/// later form defines. Keys are owned copies.
+pub const DeclaredNames = struct {
+    allocator: std.mem.Allocator,
+    names: std.StringHashMapUnmanaged(void) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) DeclaredNames {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *DeclaredNames) void {
+        var it = self.names.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.names.deinit(self.allocator);
+    }
+
+    pub fn contains(self: *const DeclaredNames, name: []const u8) bool {
+        return self.names.contains(name);
+    }
+
+    pub fn declare(self: *DeclaredNames, name: []const u8) !void {
+        if (self.names.contains(name)) return;
+        const owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned);
+        try self.names.put(self.allocator, owned, {});
+    }
+
+    /// Record every name `form` defines at top level: `def`,
+    /// `defn`, `defmacro`, `defrecord` (the type id, `->T`,
+    /// `map->T`, `T?`), `defprotocol` (the protocol and each
+    /// method) and, recursively, the forms of a `do`.
+    pub fn declareForm(self: *DeclaredNames, form: *const reader_mod.Form) !void {
+        if (form.datum != .list) return;
+        const items = form.datum.list;
+        if (items.len < 2 or items[0].datum != .symbol or items[0].datum.symbol.ns != null) return;
+        const head = items[0].datum.symbol.name;
+        if (std.mem.eql(u8, head, "do")) {
+            for (items[1..]) |item| try self.declareForm(item);
+            return;
+        }
+        if (items[1].datum != .symbol or items[1].datum.symbol.ns != null) return;
+        const name = items[1].datum.symbol.name;
+        if (std.mem.eql(u8, head, "def") or std.mem.eql(u8, head, "defn") or std.mem.eql(u8, head, "defmacro")) {
+            try self.declare(name);
+        } else if (std.mem.eql(u8, head, "defrecord")) {
+            try self.declare(name);
+            inline for ([_][]const u8{ "{s}-type-id", "->{s}", "map->{s}", "{s}?" }) |pattern| {
+                const derived = try std.fmt.allocPrint(self.allocator, pattern, .{name});
+                defer self.allocator.free(derived);
+                try self.declare(derived);
+            }
+        } else if (std.mem.eql(u8, head, "defprotocol")) {
+            try self.declare(name);
+            for (items[2..]) |sig| {
+                if (sig.datum != .list or sig.datum.list.len == 0) continue;
+                const m = sig.datum.list[0];
+                if (m.datum == .symbol and m.datum.symbol.ns == null) try self.declare(m.datum.symbol.name);
+            }
+        }
     }
 };
 
@@ -1135,6 +1213,19 @@ pub const LowerEnv = struct {
     }
 };
 
+/// Whether an unqualified symbol names something: a lexical
+/// binding, a Var visible from the namespace (its own or a
+/// referred one), or a name the enclosing file declares.
+fn symbolResolves(ctx: LowerCtx, declared: *const DeclaredNames, name: []const u8) bool {
+    if (ctx.env) |env| {
+        if (env.contains(name)) return true;
+    }
+    if (ctx.namespace) |ns| {
+        if (ns.lookup(name) != null) return true;
+    }
+    return declared.contains(name);
+}
+
 /// Helper used by `lowerList` to test whether a head symbol is a
 /// shadowable intrinsic. Special forms are NOT shadowable; they
 /// have their own switch arm.
@@ -1179,6 +1270,12 @@ fn lowerFormEnv(
             // dispatch through the namespace registry.
             if (name.ns) |ns_prefix| {
                 break :blk try allocTiny(allocator, .{ .qualified_symbol = .{ .ns = ns_prefix, .name = name.name } });
+            }
+            if (ctx.declared) |declared| {
+                if (!symbolResolves(ctx, declared, name.name)) {
+                    if (ctx.diag) |d| d.span = form.origin;
+                    return CompileError.UnresolvedSymbol;
+                }
             }
             break :blk try allocTiny(allocator, .{ .symbol = name.name });
         },
@@ -2239,12 +2336,15 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistry(
         persistent_allocator,
         registry,
         null,
+        null,
     );
 }
 
 /// Phase 3.6: full-featured form-compile entry. Accepts a
 /// `*NamespaceRegistry` for `(ns NAME)` AND a `LoadCallback`
-/// for `(require ...)`.
+/// for `(require ...)`, and optionally the file's `DeclaredNames`,
+/// which turns a reference to nothing into `UnresolvedSymbol` at
+/// the symbol's span.
 pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
@@ -2255,6 +2355,7 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
     persistent_allocator: ?std.mem.Allocator,
     registry: ?*vm.NamespaceRegistry,
     load_callback: ?expand_mod.LoadCallback,
+    declared: ?*DeclaredNames,
 ) CompileError!Compiled {
     var working_form: *const reader_mod.Form = form;
     if (interner != null) {
@@ -2314,14 +2415,22 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
         (if (n.registry) |r| r.heap else null)
     else
         null;
-    const ctx = LowerCtx{ .env = null, .interner = interner, .heap = lower_heap };
+    // Whatever this form defines (including definitions a macro
+    // expanded into it) may be referred to anywhere inside it.
+    if (declared) |d| d.declareForm(working_form) catch return CompileError.OutOfMemory;
+    var diag = LowerDiag{};
+    const ctx = LowerCtx{
+        .env = null,
+        .interner = interner,
+        .heap = lower_heap,
+        .namespace = namespace,
+        .declared = declared,
+        .diag = &diag,
+    };
     const tiny = lowerFormEnv(allocator, working_form, ctx) catch |err| {
-        // Backend errors carry the macroexpanded form's span
-        // — closer to the source than nothing. Per peer-AI
-        // turn 60: precise per-error span tracking is a
-        // post-gate refinement; this is the minimum gate-
-        // blocking surface.
-        if (out_span) |s| s.* = working_form.origin;
+        // An error that located itself reports that span; the
+        // rest carry the macroexpanded form's span.
+        if (out_span) |s| s.* = diag.span orelse working_form.origin;
         return err;
     };
     return compileTinyWithNamespace(allocator, tiny, namespace) catch |err| {
@@ -2453,6 +2562,7 @@ pub fn compileSourceFullWithMacrosSpanPersistentRegistryLoader(
     persistent_allocator: ?std.mem.Allocator,
     registry: ?*vm.NamespaceRegistry,
     load_callback: ?expand_mod.LoadCallback,
+    declared: ?*DeclaredNames,
 ) CompileError!Compiled {
     var p = reader_mod.parser.parseForm(allocator, source) catch {
         return CompileError.ReaderFailure;
@@ -2472,6 +2582,7 @@ pub fn compileSourceFullWithMacrosSpanPersistentRegistryLoader(
         persistent_allocator,
         registry,
         load_callback,
+        declared,
     );
 }
 
@@ -8648,4 +8759,97 @@ test "compile: arena cleanup releases code+consts atomically" {
         const result = try v.run();
         try testing.expectEqual(tc.expected, result.asFixnum());
     }
+}
+
+// ---- declared-name checking ----
+
+/// Compile `src` with `declared` in force in the VM's bare namespace
+/// (no core installed), so a symbol resolves only lexically, by
+/// declaration, or by a `def` the program itself ran.
+fn compileChecked(arena: std.mem.Allocator, v: *vm.VM, src: []const u8, declared: *DeclaredNames, span: *?reader_mod.SrcSpan) anyerror!Compiled {
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    return compileSourceFullWithMacrosSpanPersistentRegistryLoader(
+        arena,
+        src,
+        v.ensureNamespace(),
+        v.ensureInterner(),
+        &host_macros,
+        span,
+        null,
+        null,
+        null,
+        declared,
+    );
+}
+
+test "declared names: an unresolved symbol is reported at its own span" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    var declared = DeclaredNames.init(testing.allocator);
+    defer declared.deinit();
+
+    const src = "(fn* [x] (let* [z 1] (+ x (< z y))))";
+    var span: ?reader_mod.SrcSpan = null;
+    try testing.expectError(CompileError.UnresolvedSymbol, compileChecked(arena.allocator(), &v, src, &declared, &span));
+    const sp = span orelse return error.TestFailed;
+    try testing.expectEqualStrings("y", src[sp.pos .. sp.pos + sp.len]);
+
+    // Declaring it makes the same source compile.
+    try declared.declare("y");
+    _ = try compileChecked(arena.allocator(), &v, src, &declared, &span);
+}
+
+test "declared names: lexical bindings, quoted data and same-form definitions resolve" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var v = try vm.VM.init(testing.allocator, &stub);
+    defer v.deinit();
+    var span: ?reader_mod.SrcSpan = null;
+
+    const ok_sources = [_][]const u8{
+        "(let* [g 1] g)",
+        "(fn* [a & more] more)",
+        "(loop* [i 0] (if i i (recur i)))",
+        "(letfn* [(a [n] (b n)) (b [n] n)] (a 1))",
+        "(try 1 (catch any e e))",
+        "(quote (a b c))",
+        "(do (def a (fn* [] (b))) (def b 1))",
+        "(do (defn c [] (d)) (defn d [] 1))",
+        "(fn* self [n] (self n))",
+    };
+    for (ok_sources) |src| {
+        var declared = DeclaredNames.init(testing.allocator);
+        defer declared.deinit();
+        _ = compileChecked(arena.allocator(), &v, src, &declared, &span) catch |err| {
+            std.debug.print("\n  source: {s}\n  error: {s}\n", .{ src, @errorName(err) });
+            return err;
+        };
+    }
+}
+
+test "declared names: declareForm collects def/defn/defmacro/defrecord/defprotocol through do" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "(do (def a 1) (defn b [] 2) (defmacro c [] 3) (defrecord R [x]) (defprotocol P (m [s]) (n [s])) (println z))";
+    var p = try reader_mod.parser.parseForm(arena.allocator(), src);
+    defer p.parser.deinit();
+    var reader = reader_mod.Reader.init(arena.allocator(), src);
+    defer reader.deinit();
+    const form = try reader.readOneForm(p.sexp);
+
+    var declared = DeclaredNames.init(testing.allocator);
+    defer declared.deinit();
+    try declared.declareForm(form);
+    for ([_][]const u8{ "a", "b", "c", "R", "R-type-id", "->R", "map->R", "R?", "P", "m", "n" }) |name| {
+        try testing.expect(declared.contains(name));
+    }
+    try testing.expect(!declared.contains("z"));
+    try testing.expect(!declared.contains("println"));
 }
