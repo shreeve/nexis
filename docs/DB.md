@@ -121,8 +121,21 @@ pub const Connection = struct {
     store_id_hi: u64,
     // Canonicalized absolute path, owned. Freed in close().
     path_owned: [:0]u8,
+    // Named-tree handles resolved so far, keyed by owned copies
+    // of the tree names. Freed in close().
+    tree_ids: std.StringHashMapUnmanaged(emdb.TreeId),
 };
 ```
+
+**Tree handles are resolved once per connection.** `treeId(txn,
+name, create)` looks the name up in `tree_ids` before asking emdb;
+a `TreeId` is fixed for the life of the environment (emdb
+INV-SUB03), so the handle is remembered across transactions. emdb
+keeps per-transaction tree state, so each `WriteTxn` / `ReadTxn`
+carries an `opened` bit set and loads the tree behind a handle the
+first time it touches it; every later operation on that tree in the
+same transaction is a bit test. `put` / `get` / `del` and the
+stdlib cursor natives all go through `treeId`.
 
 **`Connection` is NOT a runtime heap-managed Value.** It's a plain
 Zig struct allocated on the caller's allocator. Multiple
