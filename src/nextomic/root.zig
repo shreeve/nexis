@@ -9,6 +9,7 @@ pub const datom = @import("datom.zig");
 pub const store = @import("store.zig");
 pub const idents = @import("idents.zig");
 pub const schema = @import("schema.zig");
+pub const db = @import("db.zig");
 
 pub const Val = key.Val;
 pub const ValueType = key.ValueType;
@@ -19,6 +20,9 @@ pub const boot = store.boot;
 pub const Idents = idents.Idents;
 pub const Schema = schema.Schema;
 pub const Attr = schema.Attr;
+pub const Conn = db.Conn;
+pub const DbValue = db.DbValue;
+pub const Error = db.Error;
 
 test {
     _ = key;
@@ -26,4 +30,5 @@ test {
     _ = store;
     _ = idents;
     _ = schema;
+    _ = db;
 }
