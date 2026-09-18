@@ -561,15 +561,22 @@ and never goes through the codec or per-operation tree opens.
 
 ### 12. Deferred (explicitly)
 
-- Language-surface `(with-tx ...)` macro — PLAN §21 Phase 3.
-- `as-of` / snapshots / `db/snapshot-stats` — PLAN §15.7.
-- Cursors / `reduce-tree` / `scan` — PLAN §15.8.
-- `alter!` — derivable, Phase 3 stdlib macro.
+Shipped, and so not deferred: `(with-tx
+...)` / `(with-read-tx ...)` (PLAN §21 Phase 4.0b), `db/snapshot` /
+`with-snapshot` (4.0f), `db/scan` / `db/reduce-tree` (4.0d),
+`db/alter!` (4.0c), and the per-connection `TreeId` cache (4.0g).
+Datomic-style `as-of` db-values are Nextomic's (`docs/NEXTOMIC.md`
+§4). Open:
+
+- Cursors as raw Values — PLAN §15.8; `db/scan` and `db/reduce-tree`
+  are the eager surface.
+- `db/snapshot-stats` — PLAN §15.7 (pinned snapshots and their page
+  cost).
 - emdb file-UUID integration — coordinated emdb amendment.
 - Multi-process concurrent writes — emdb handles single-writer
   discipline; nexis surface stays single-isolate per PLAN §16.1.
-- `.durable_ref` codec encode/decode arms — §9 follow-up.
-- `Connection`-level `TreeId` cache — Phase 6 optimization.
+- `.durable_ref` codec encode/decode arms — §9 follow-up; the codec
+  raises `:unserializable` for the kind.
 
 ---
 
