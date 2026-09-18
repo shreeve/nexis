@@ -133,6 +133,15 @@ explicit `close()`.
 **Metadata attachability**: not applicable. Connections are not
 Values.
 
+**File geometry is pinned.** `open` overrides the caller's
+`pageSize` with `db.page_size` (16 KiB) and `maxNamedTrees` with
+`db.max_named_trees` (128) before handing the options to
+`emdb.Env.open`. emdb's own default page size is the OS page size,
+which differs between platforms, and the page size fixes the key
+bound and overflow threshold for the life of the file; pinning it
+here means a store carries the same geometry wherever it is
+created. An existing file keeps the page size it was created with.
+
 ---
 
 ### 4. `durable_ref` heap kind (VALUE.md §2.2 kind 26)

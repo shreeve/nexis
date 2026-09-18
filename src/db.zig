@@ -109,10 +109,24 @@ pub const Connection = struct {
     }
 };
 
+/// Page size every nexis store is created with. emdb's default is
+/// the OS page size, which differs between platforms; the page
+/// size fixes the key bound (`Env.maxKeySize`) and the overflow
+/// threshold for the life of the file, so a store must carry the
+/// same geometry wherever it is created. An existing file keeps
+/// the page size it was created with (emdb reads it from the meta
+/// page).
+pub const page_size: u32 = 16384;
+
+/// Named-tree capacity every nexis store is opened with. Bounds
+/// the `TreeId` range, which sizes the per-transaction tree set.
+pub const max_named_trees: u32 = 128;
+
 /// Open (or create) a database file at `path`. `allocator` /
 /// `heap` / `interner` are non-owning references; caller
 /// guarantees their lifetimes. `options` is passed through to
-/// `emdb.Env.open`.
+/// `emdb.Env.open` with `pageSize` and `maxNamedTrees` pinned to
+/// `page_size` / `max_named_trees`.
 pub fn open(
     allocator: std.mem.Allocator,
     heap: *Heap,
@@ -120,6 +134,10 @@ pub fn open(
     path: [*:0]const u8,
     options: emdb.EnvOptions,
 ) !Connection {
+    var env_options = options;
+    env_options.pageSize = page_size;
+    env_options.maxNamedTrees = max_named_trees;
+
     // Canonicalize the path for store_id derivation. On failure
     // (file doesn't exist yet), fall back to the supplied path
     // bytes verbatim — `realpath` returns ENOENT for new files,
@@ -149,7 +167,7 @@ pub fn open(
     };
     const hash_hi = hash_mod.hashBytes(hi_input);
 
-    var env = emdb.Env.open(path, options) catch |err| {
+    var env = emdb.Env.open(path, env_options) catch |err| {
         allocator.free(path_owned);
         return err;
     };
@@ -558,6 +576,30 @@ test "open / close: round-trip with a tiny file" {
     try testing.expect(conn.open_flag);
     const sid = conn.storeId();
     try testing.expect(sid != 0);
+}
+
+test "open: a new store has 16 KiB pages and the pinned tree capacity" {
+    const path = try tmpDbPath(testing.allocator, "pagesize");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    // Caller-supplied geometry does not leak through.
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{
+        .allocator = testing.allocator,
+        .pageSize = 4096,
+        .maxNamedTrees = 8,
+    });
+    defer close(&conn);
+
+    try testing.expectEqual(page_size, conn.env.info().pageSize);
+    try testing.expectEqual(page_size, conn.env.options.pageSize);
+    try testing.expectEqual(max_named_trees, conn.env.options.maxNamedTrees);
+    try testing.expectEqual(emdb.btree.maxKeySize(page_size), conn.env.maxKeySize());
 }
 
 test "put / get / del: single-tree round-trip of a scalar" {
