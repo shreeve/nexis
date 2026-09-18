@@ -104,6 +104,7 @@ projected nexis direction vs Clojure. "Measured" column cites the
 | 18 | Startup | 100–500 ms JVM warmup | Native binary | **10–500×** | — | implemented, not yet measured |
 | 19 | Compilation | HotSpot C1+C2 JIT | Tree-walking interpreter today | **worse** today, winning after Phase 2/6 | — | acknowledged; Phase 2/6 |
 | 20 | Comptime specialization | JIT inlining + escape analysis | Zig `comptime` monomorphization | **~2×** on specialized paths | — | planned (Phase 6) |
+| 21 | Datalog over datoms (Nextomic) | Datomic (peer + transactor, JVM) | in-process, emdb named trees, arena per operation | not head-to-head measured | 3-way join over 200k datoms 1.43 ms to rows; 20k `[*]` pulls 15.7 ms (§3.7) | measured (single sample, corpus benchmark) |
 
 **†** NaN-box pair inlines through arithmetic; measured median is
 at or below harness timer resolution. See §3.1 footnote.
@@ -342,6 +343,48 @@ random-access variant is a follow-up.
   100 μs–1 ms. nexis is clearly orders of magnitude faster for
   overlapping use cases — but this is not a same-machine
   head-to-head measurement.
+
+### 3.7 Nextomic — query and pull over 200k datoms
+
+The two integration corpora end with a benchmark test that prints
+`[bench]` lines to stderr (`test/integration/nextomic_q.zig`
+"benchmark: 200k datoms, three-way join";
+`test/integration/nextomic_pull.zig` "benchmark: pull-many [*] and a
+nested pattern over 20k entities"). Reproduce with
+`zig build nextomic-test -Doptimize=ReleaseFast --summary all`. The
+store is emdb with 16 KiB pages; the datom set is 40,000 employees
+in 20 departments, five attributes each (~200k datoms).
+
+| Op | ReleaseFast, Apple M5 | Notes |
+|---|---:|---|
+| 3-way join by department (`avet` seek → `vaet` → `eavt`), 2000 rows | 1.43 ms to rows | 38.3 ms including the persistent result set — see the allocator caveat |
+| 3-way join by age (`avet` range → `eavt` → `eavt`), 851 rows | 19.8 ms | includes the result set |
+| `(count ?e)` by department (`aevt` scan + hash join), 667 rows | 1.10 ms | |
+| `pull-many [*]` over 20,000 entities (5 datoms each) | 15.7 ms | one read transaction for the whole call |
+| `pull-many` nested ref + `:limit` over 20,000 entities | 23.8 ms | |
+| reverse-ref pull of the 2,000 employees of one department | 0.45 ms | |
+
+The landing reports for the query and pull work measured the same
+three headline rows at 1.2 ms (join to rows), 16.5 ms (`[*]` pulls)
+and 0.9 ms (count query); the spread against the table is single-
+sample run-to-run noise, not a regression.
+
+**Caveats:**
+
+- **The query corpus's VM heap is `std.testing.allocator`** even in
+  the benchmark (`Fx.init` in `nextomic_q.zig`), so the "with the
+  result set" column measures the testing allocator's per-allocation
+  bookkeeping while materializing 2000 persistent vectors into a
+  persistent set, not the engine. The "to rows" column is the engine
+  and planner alone. The pull corpus's benchmark uses `c_allocator`
+  (`Fx.initWith`) and pays no such tax.
+- Single sample per row, not the 30-sample median the §3.1–§3.6
+  harness reports; these rows do not enter the §2 scorecard as
+  `measured` until `src/bench.zig` carries them.
+- Under `zig build test` (Debug, testing allocator) the same rows
+  read 16.3 ms to rows, 1.33 s with the result set, and 203 ms for
+  the `[*]` pulls; those are the numbers a contributor sees in the
+  summary and they are not performance measurements.
 
 ---
 
@@ -943,3 +986,9 @@ iterations**.
   belong in version control. The curated numbers live inline in
   §3 and in this amendment log; regenerate JSON locally via
   `zig build bench -- --out bench/baseline.json`.
+- **2026-09-18**: **§3.7 Nextomic numbers** from the corpus
+  benchmarks in `test/integration/nextomic_{q,pull}.zig` under
+  `-Doptimize=ReleaseFast` on an Apple M5, single sample, with the
+  testing-allocator caveat on result materialization. Scorecard row
+  21 added. Not harness numbers; promoted to `measured` in the §2
+  sense only once `src/bench.zig` carries the scenarios.
