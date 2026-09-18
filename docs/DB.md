@@ -545,6 +545,20 @@ trace helpers.
 
 ---
 
+### 11.1 The datom API
+
+`db/*` is the key-value layer: named trees, codec-encoded values,
+explicit transactions and durable refs. The Datomic-class database
+built on the same engine — datoms, schema-as-data, `transact!` with
+tempids and upserts, `as-of`/`since`/`history` db-values and the
+query pipeline — is the `nextomic` namespace, specified end to end
+in `docs/NEXTOMIC.md` (§6 Lisp API, §7 errors, §8 module layout). The
+two layers share the engine and the `:db/*` engine-error keywords
+(`failureName` above) and nothing else: Nextomic holds raw byte keys
+and never goes through the codec or per-operation tree opens.
+
+---
+
 ### 12. Deferred (explicitly)
 
 - Language-surface `(with-tx ...)` macro — PLAN §21 Phase 3.

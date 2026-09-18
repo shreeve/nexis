@@ -56,6 +56,7 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Phase 4.0d | ✅ shipped | `db/scan` (eager, ordered, range-bounded) + `db/reduce-tree` (server-side reduce) |
 | **Phase 4.0e** | ✅ **shipped** | **EXIT DEMO** — `examples/todo-app.nx`. Persistent to-do tracker. State PERSISTS across `nexis run` invocations. |
 | Phase 4.0f | ✅ shipped | Snapshot vocabulary (`db/snapshot` / `db/release-snapshot!` / `db/snapshot?` / `(with-snapshot ...)`). Time-travel reads through pinned MVCC snapshots. |
+| Nextomic natives | ✅ shipped | The `nextomic` namespace over the datom storage layer ([`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) §6): `connect`/`release`/`db`/`basis-t`/`transact!`/`entity`/`entid`/`ident`/`datoms`/`as-of`/`since`/`history`/`tx-range`/`schema`/`sync`, `with-conn`, `nextomic_conn`/`nextomic_db` value kinds, every error a catchable `:nextomic/*` keyword. `test/nextomic/*.nx` run through `bin/nexis` under `zig build test`; `examples/nextomic-app.nx`. Query natives (`q`/`pull`/`with`) plug into `natives.zig`'s marked seam. |
 
 **558 tests** green: 95 VM + 313 compile + 6 macroexpand + 4
 property + 54 integration in `phase2-test` (~3s), plus 86 reader
