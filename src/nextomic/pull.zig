@@ -464,29 +464,30 @@ const Puller = struct {
             if (pat.wildcard and !s.reverse) try covered.put(self.arena, s.attr.id, {});
         }
 
-        var it = try self.read.scan(self.arena, .eavt, .{ .e = e });
         if (!pat.wildcard) {
+            if (any) return m;
             // Only whether the entity exists at all.
-            if (!any and (try it.next()) == null) return null;
-            return m;
+            var probe = try self.read.scan(self.arena, .eavt, .{ .e = e });
+            return if ((try probe.next()) == null) null else m;
         }
+        var it = try self.read.scan(self.arena, .eavt, .{ .e = e });
         var vals: std.ArrayList(Val) = .empty;
         var cur: ?u32 = null;
         while (try it.next()) |d| {
             any = true;
             if (cur != null and cur.? != d.a) {
-                m = try self.wildAttr(m, cur.?, vals.items, covered);
+                m = try self.wildAttr(m, cur.?, vals.items, &covered);
                 vals.clearRetainingCapacity();
             }
             cur = d.a;
             try vals.append(self.arena, d.v);
         }
-        if (cur) |a| m = try self.wildAttr(m, a, vals.items, covered);
+        if (cur) |a| m = try self.wildAttr(m, a, vals.items, &covered);
         return if (any) m else null;
     }
 
     /// One attribute of a `*` pull, as a bare spec.
-    fn wildAttr(self: *Puller, m: Value, a: u32, vals: []const Val, covered: std.AutoHashMapUnmanaged(u32, void)) anyerror!Value {
+    fn wildAttr(self: *Puller, m: Value, a: u32, vals: []const Val, covered: *const std.AutoHashMapUnmanaged(u32, void)) anyerror!Value {
         if (covered.contains(a)) return m;
         const attr = (try self.read.attr(a)) orelse return error.Corrupted;
         const k = (try self.read.db.conn.idents.internOf(self.read.txn, a)) orelse return error.Corrupted;
