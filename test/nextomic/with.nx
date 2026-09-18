@@ -1,0 +1,103 @@
+; test/nextomic/with.nx — speculative transactions: db-after sees the
+; speculative datoms through q, entity, pull and datoms, the report
+; matches transact!'s, nothing is committed, the scope cleans up after
+; a throw, and the errors. Runs from a scratch directory; the store is
+; fresh.
+
+(require '[nextomic :as d])
+
+(defn check [label ok]
+  (println (if ok "ok" "FAIL") label)
+  (when-not ok (throw :check-failed)))
+
+(defmacro caught [& body]
+  `(try (do ~@body :no-error) (catch any e# e#)))
+
+; Drop the transaction's own :db/txInstant datom: its value is the clock.
+(defn facts [report]
+  (mapv (fn [[e a v t added]] [a v added])
+        (filterv (fn [[e a v t added]] (not= a :db/txInstant)) (:tx-data report))))
+
+(def c (d/connect "with.edb"))
+(d/transact! c [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+                {:db/ident :person/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+                 :db/unique :db.unique/identity}
+                {:db/ident :person/tags :db/valueType :db.type/keyword :db/cardinality :db.cardinality/many}
+                {:db/ident :person/boss :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}])
+(def people (d/transact! c [{:db/id "ann" :person/name "Ann" :person/email "ann@x" :person/tags [:red]}
+                            {:db/id "bob" :person/name "Bob" :person/email "bob@x" :person/boss "ann"}]))
+(def ann (get (:tempids people) "ann"))
+(def before (d/db c))
+(defn names [db] (sort (d/q '[:find [?n ...] :where [?e :person/name ?n]] db)))
+
+(def escaped (atom nil))
+(def gus (atom nil))
+
+; A speculative transaction: f sees the result and the report; the
+; value of the scope is f's value.
+(def outcome
+  (d/with c [{:db/id "gus" :person/name "Gus" :person/email "gus@x" :person/boss [:person/email "ann@x"]}
+             [:db/add [:person/email "ann@x"] :person/tags :green]
+             [:db/retract [:person/email "ann@x"] :person/tags :red]]
+    (fn [db-after report]
+      (reset! escaped db-after)
+      (reset! gus (get (:tempids report) "gus"))
+      (println db-after)
+      (check "db-after is the report's db-after" (= db-after (:db-after report)))
+      (check "db-before is the committed view" (= before (:db-before report)))
+      (check "the speculative t follows the basis" (= (inc (d/basis-t before)) (:tx report) (d/basis-t db-after)))
+      (println (facts report))
+      (check "q sees the new person and the tag change"
+             (and (= ["Ann" "Bob" "Gus"] (names db-after))
+                  (= #{[:green]} (d/q '[:find ?t :where [?e :person/email "ann@x"] [?e :person/tags ?t]] db-after))))
+      (check "entity sees the new person" (= "Gus" (:person/name (d/entity db-after @gus))))
+      (check "pull follows a speculative ref"
+             (= {:db/id @gus :person/name "Gus" :person/boss {:db/id ann :person/name "Ann"}}
+                (d/pull db-after '[:person/name {:person/boss [:person/name]}] [:person/email "gus@x"])))
+      (check "datoms sees the speculative datom" (= 1 (count (d/datoms db-after :avet :person/email "gus@x"))))
+      (check "the tx position binds the speculative transaction"
+             (= (d/q '[:find ?tx . :where [?e :person/name "Gus" ?tx]] db-after)
+                (d/q '[:find ?tx . :where [?e :person/tags :green ?tx]] db-after)))
+      (check "as-of on db-after folds the speculative rows away"
+             (= ["Ann" "Bob"] (names (d/as-of db-after (d/basis-t before)))))
+      (check "the committed view is untouched inside the scope" (= ["Ann" "Bob"] (names (d/db c))))
+      (check "transact! inside the scope is nested"
+             (= :nextomic/nested (caught (d/transact! c [[:db/add ann :person/tags :blue]]))))
+      (check "with inside the scope is nested"
+             (= :nextomic/nested (caught (d/with c [] (fn [inner r] inner)))))
+      :speculated)))
+(check "with returns f's value" (= :speculated outcome))
+
+; After the scope: nothing was committed, the view is closed, and the
+; connection is free again.
+(check "the committed basis is unchanged" (= (d/basis-t before) (d/basis-t (d/db c))))
+(check "the speculative entity does not exist" (nil? (d/entity (d/db c) @gus)))
+(check "the speculative tag change did not happen" (= #{:red} (:person/tags (d/entity (d/db c) ann))))
+(println (caught (d/entity @escaped ann)))
+(println (caught (d/basis-t (d/as-of @escaped 1))))
+(println (caught (d/pull @escaped '[*] ann)))
+(def committed (d/transact! c [{:db/id "gus" :person/name "Gus" :person/email "gus@x"}]))
+(check "transact! afterwards takes the t the scope reported" (= (inc (d/basis-t before)) (:tx committed)))
+(check "and its tempid" (= @gus (get (:tempids committed) "gus")))
+
+; A throw inside f propagates after the scope is cleaned up.
+(println (caught (d/with c [{:db/id "x" :person/name "X" :person/email "x@x"}]
+                   (fn [db-after report] (throw :boom)))))
+(check "the basis is still the committed one" (= (:tx committed) (d/basis-t (d/db c))))
+(check "the connection writes again after the throw" (= (inc (:tx committed)) (:tx (d/transact! c [[:db/add ann :person/tags :blue]]))))
+
+; A speculative schema attribute exists in the view only.
+(d/with c [{:db/ident :person/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+  (fn [db-after report]
+    (check "the view has the new attribute" (= :db.type/string (:db/valueType (get (d/schema db-after) :person/nick))))
+    (check "and its ident" (= (get (:tempids report) "nick" (d/entid db-after :person/nick)) (d/entid db-after :person/nick)))
+    (check "the connection does not" (nil? (get (d/schema (d/db c)) :person/nick)))))
+(println (caught (d/transact! c [[:db/add ann :person/nick "Annie"]])))
+
+; Errors before f runs: bad tx-data, and a released connection.
+(println (caught (d/with c [[:db/add ann :person/nope 1]] (fn [db-after report] :unreached))))
+(println (caught (d/with c "not tx-data" (fn [db-after report] :unreached))))
+(check "a failed with leaves the connection writable" (= 6 (:tx (d/transact! c [[:db/add ann :person/tags :teal]]))))
+(d/release c)
+(println (caught (d/with c [] (fn [db-after report] :unreached))))
+:with-done

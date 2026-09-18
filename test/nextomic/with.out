@@ -1,0 +1,35 @@
+#nextomic/db {:basis-t 4 :mode :current}
+ok db-after is the report's db-after
+ok db-before is the committed view
+ok the speculative t follows the basis
+[[:person/name Gus true] [:person/email gus@x true] [:person/boss 4294967296 true] [:person/tags :green true] [:person/tags :red false]]
+ok q sees the new person and the tag change
+ok entity sees the new person
+ok pull follows a speculative ref
+ok datoms sees the speculative datom
+ok the tx position binds the speculative transaction
+ok as-of on db-after folds the speculative rows away
+ok the committed view is untouched inside the scope
+ok transact! inside the scope is nested
+ok with inside the scope is nested
+ok with returns f's value
+ok the committed basis is unchanged
+ok the speculative entity does not exist
+ok the speculative tag change did not happen
+:nextomic/closed
+:nextomic/closed
+:nextomic/closed
+ok transact! afterwards takes the t the scope reported
+ok and its tempid
+:boom
+ok the basis is still the committed one
+ok the connection writes again after the throw
+ok the view has the new attribute
+ok and its ident
+ok the connection does not
+:nextomic/unknown-attribute
+:nextomic/unknown-attribute
+:nextomic/tx-data
+ok a failed with leaves the connection writable
+:nextomic/closed
+:with-done

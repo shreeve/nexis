@@ -1,0 +1,52 @@
+ok [*] carries :db/id
+ok [*] lists card-many values in index order
+ok a ref to an ident renders with the ident
+ok a component is pulled in full under [*]
+ok a plain ref renders as {:db/id e}
+ok an entity with no datoms pulls as nil
+ok a lookup ref resolves the entity
+ok an ident resolves the entity
+{:db/id 4294967296, :person/name Ann, :person/age 30}
+ok a missing attribute is omitted
+{:db/id 4294967302, :person/name Di, :person/boss {:db/id 4294967301, :person/name Cy}}
+{:db/id 4294967302, :person/name Di, :person/boss {:db/id 4294967301, :person/name Cy, :person/boss {:db/id 4294967296, :person/name Ann}}}
+{:db/id 4294967301, :person/name Cy, :person/friend [{:db/id 4294967296, :person/name Ann} {:db/id 4294967300, :person/name Bob}]}
+ok a nested spec wins over *
+{:db/id 4294967296, :person/name Ann, :person/_boss [{:db/id 4294967300} {:db/id 4294967301}]}
+{:db/id 4294967296, :person/name Ann, :person/_boss [{:db/id 4294967300, :person/name Bob} {:db/id 4294967301, :person/name Cy}]}
+ok a reverse component attribute pulls its one owner in full
+ok a reverse attribute with no referrers is omitted
+{:db/id 4294967302, :person/name Di, :person/boss {:db/id 4294967301, :person/name Cy, :person/boss {:db/id 4294967296, :person/name Ann}}}
+{:db/id 4294967302, :person/name Di, :person/boss {:db/id 4294967301, :person/name Cy, :person/boss {:db/id 4294967296}}}
+{:db/id 4294967303, :person/name Ed, :person/friend [{:db/id 4294967303}]}
+{:db/id 4294967304, :node/label n1, :edge/to [{:db/id 4294967305, :node/label n2, :edge/to [{:db/id 4294967306, :node/label n3, :edge/to [{:db/id 4294967304}]}]}]}
+{:db/id 4294967304, :node/label n1, :edge/to [{:db/id 4294967305, :node/label n2, :edge/to [{:db/id 4294967306}]}]}
+ok depth 0 is the plain ref
+ok :limit cuts card-many values
+ok (limit attr n) is the same spec
+ok :limit nil lifts the cut
+ok :limit 0 omits the attribute
+ok :default fills a missing attribute
+ok :default does not replace a present one
+ok (default attr v) is the same spec
+ok :as renames the key
+{:db/id 4294967301, :pal [{:db/id 4294967296, :person/name Ann}]}
+ok the current view sees the update
+ok as-of before the update sees the old facts
+ok an older db-value is unchanged
+ok since shows only the new facts
+ok since has nothing for an untouched entity
+[{:db/id 4294967296, :person/name Ann} {:db/id 4294967300, :person/name Bob} nil {:db/id 36}]
+ok pull-many over a list
+ok pull-many over nothing
+:nextomic/history-view
+{:error :nextomic/pull-syntax, :message unknown element in pattern, :clause 1}
+{:error :nextomic/pull-syntax, :message :limit needs a non-negative integer or nil, :clause 0}
+{:error :nextomic/pull-syntax, :message entity must be an eid, a lookup ref or an ident}
+:nextomic/tx-data
+:nextomic/no-entity
+:nextomic/unknown-attribute
+:kind-mismatch
+ok a caught error leaves the db usable
+:nextomic/closed
+:pull-done
