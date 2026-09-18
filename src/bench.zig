@@ -414,12 +414,13 @@ test "Runner: runs a trivial benchmark and computes stats" {
 
     try runner.bench("sanity", "test", null, &ctx, struct {
         fn run(c: *Ctx) anyerror!void {
-            // Volatile pointer aliasing defeats DCE on `counter`
-            // reliably in Zig 0.16 without depending on the
-            // `std.mem.doNotOptimizeAway` API (which was reshuffled
-            // between 0.15 and 0.16).
+            // Volatile pointer aliasing defeats DCE on `counter`.
+            // A thousand increments keep one run above the timer's
+            // resolution, so the per-op median is never rounded to
+            // zero and the throughput assertion below is exact.
             const vp: *volatile u64 = &c.counter;
-            vp.* = vp.* +% 1;
+            var i: usize = 0;
+            while (i < 1000) : (i += 1) vp.* = vp.* +% 1;
         }
     }.run);
 
