@@ -152,7 +152,13 @@ so there is no queue; emdb's write lock is the transactor.
 1. `wtxn = env.beginWriteWith(.{ .sync = opt })`; `t = sys["t"] + 1`.
 2. **Normalise** tx-data to `[op e a v]`. Entities may be an eid, a
    tempid (string, or a negative fixnum), a lookup ref `[:unique/attr v]`,
-   a keyword ident, or `"datomic.tx"` for the transaction entity. Map
+   a keyword ident, or `"datomic.tx"` for the transaction entity. An
+   explicit eid, as an entity or as a ref value, must have been handed
+   out by its partition's allocator (a user id below `sys/"eid"`, an
+   ident id below `sys/"aid"`, a transaction entity no newer than this
+   transaction); any other id is `:nextomic/no-entity`, since it would
+   collide with an id minted later. An allocated entity whose datoms
+   were all retracted stays addressable. Map
    forms `{:db/id e :attr v ...}` expand; nested maps under component or
    ref attributes become entities with fresh tempids; vectors under
    card-many attributes expand to one datom each.

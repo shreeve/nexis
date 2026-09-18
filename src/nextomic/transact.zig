@@ -363,6 +363,20 @@ const Ctx = struct {
         };
     }
 
+    // ── entity ids ────────────────────────────────────────────────
+
+    /// An explicit entity id, as an entity or a ref value, must have been
+    /// handed out by its partition's allocator: a user id below the next
+    /// user id, an attribute or ident id below the next ident id, a
+    /// transaction entity no newer than this transaction. Anything else
+    /// would collide with an id minted later: `error.NoEntity`.
+    fn checkEid(self: *Ctx, id: u64) !u64 {
+        if (id == 0 or id > key.id_max) return error.NoEntity;
+        if (key.txOfEntity(id)) |t| return if (t <= self.t) id else error.NoEntity;
+        if (key.isAttrPartition(id)) return if (id < self.minter.next_aid) id else error.NoEntity;
+        return if (id < self.next_eid) id else error.NoEntity;
+    }
+
     // ── tempids ───────────────────────────────────────────────────
 
     fn tempid(self: *Ctx, k: TempidKey) !u32 {
@@ -426,7 +440,7 @@ const Ctx = struct {
 
     fn entityOf(self: *Ctx, e: Entity) !Ent {
         return switch (e) {
-            .eid => |id| .{ .eid = try checkEid(id) },
+            .eid => |id| .{ .eid = try self.checkEid(id) },
             .tempid => |k| .{ .tempid = try self.tempid(k) },
             .lookup => |l| .{ .lookup = .{ .attr = try self.lookupAttr(try self.attrOf(l.a), l.v), .v = l.v } },
             .ident => |k| .{ .eid = (try self.minter.lookup(k)) orelse return error.NoEntity },
@@ -446,7 +460,7 @@ const Ctx = struct {
             .val => |x| {
                 if (x.valueType() != attr.value_type) return error.ValueType;
                 if (x == .double and std.math.isNan(x.double)) return error.ValueType;
-                if (x == .ref) _ = try checkEid(x.ref);
+                if (x == .ref) _ = try self.checkEid(x.ref);
                 return .{ .val = try x.dupe(self.arena) };
             },
             .entity => |e| {
@@ -593,7 +607,7 @@ const Ctx = struct {
             .fixnum => {
                 const n = v.asFixnum();
                 if (n < 0) return .{ .tempid = try self.tempid(.{ .fixnum = n }) };
-                return .{ .eid = try checkEid(@intCast(n)) };
+                return .{ .eid = try self.checkEid(@intCast(n)) };
             },
             .string => {
                 const s = string_mod.asBytes(v);
@@ -1146,11 +1160,6 @@ const Ctx = struct {
         return out.toOwnedSlice(self.arena);
     }
 };
-
-fn checkEid(id: u64) !u64 {
-    if (id == 0 or id > key.id_max) return error.NoEntity;
-    return id;
-}
 
 fn isCollection(v: Value) bool {
     return switch (v.kind()) {
@@ -1813,4 +1822,65 @@ test "a string with an escaped NUL never aliases its prefix under a prefix scan"
         .{ .add = .{ .e = .{ .lookup = .{ .a = .{ .id = email }, .v = .{ .string = "a" } } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Zed2" } } } },
     }, .{});
     try testing.expectEqual(z, r3.tx_data[0].e);
+}
+
+test "explicit entity ids must have been allocated" {
+    const tc = try TestConn.init("tx_explicit_eid");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const friend = try attrId(tc, "user/friend");
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    const next_aid = blk: {
+        const txn = try tc.conn.store.beginRead();
+        defer txn.abort();
+        break :blk try tc.conn.store.readNextAid(txn);
+    };
+
+    // A user id the allocator has not handed out; an attribute-partition
+    // id no ident holds; a transaction entity that does not exist yet.
+    try testing.expectError(error.NoEntity, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a + 5 }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "ghost" } } } },
+    }, .{}));
+    try testing.expectError(error.NoEntity, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = next_aid + 100 }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "ghost" } } } },
+    }, .{}));
+    try testing.expectError(error.NoEntity, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = key.txEntity(r1.t + 5) }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "ghost" } } } },
+    }, .{}));
+    // The same ids as ref values.
+    try testing.expectError(error.NoEntity, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = friend }, .v = .{ .val = .{ .ref = a + 5 } } } },
+    }, .{}));
+    try testing.expectError(error.NoEntity, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = friend }, .v = .{ .entity = .{ .eid = key.txEntity(r1.t + 5) } } } },
+    }, .{}));
+    try testing.expectEqual(r1.t, (try tc.conn.db()).basis);
+
+    // Allocated ids are fine: an existing entity, an attribute entity, a
+    // past transaction entity and this transaction's own entity, as
+    // entities and as ref values.
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = friend }, .v = .{ .val = .{ .ref = a } } } },
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = friend }, .v = .{ .val = .{ .ref = key.txEntity(r1.t) } } } },
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = friend }, .v = .{ .val = .{ .ref = name } } } },
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "a name" } } } },
+        .{ .add = .{ .e = .{ .eid = key.txEntity(r1.t) }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "old tx" } } } },
+        .{ .add = .{ .e = .{ .eid = key.txEntity(r1.t + 1) }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "this tx" } } } },
+    }, .{});
+    try testing.expectEqual(r1.t + 1, r2.t);
+    try testing.expectEqual(@as(usize, 7), r2.tx_data.len);
+    // An allocated entity stays addressable after every datom is retracted.
+    _ = try transactOps(tc.conn, arena, &.{.{ .retract_entity = .{ .eid = a } }}, .{});
+    const r4 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Back" } } } },
+    }, .{});
+    try testing.expectEqual(a, r4.tx_data[0].e);
 }
