@@ -1,7 +1,8 @@
 //! test/prop/nextomic_key.zig — for every value type, the byte order of
 //! two encodings equals the order of the two values (NEXTOMIC.md §2.2);
-//! the string escape round-trips through embedded NUL; every AVET key of
-//! an inline value stays under emdb's 256-byte search-clue buffer.
+//! the string escape round-trips through embedded NUL; order holds across
+//! the inline threshold on the 64-byte prefix; every AVET key of an
+//! inline value stays under emdb's 256-byte search-clue buffer.
 
 const std = @import("std");
 const nextomic = @import("nextomic");
@@ -150,8 +151,8 @@ test "K3 out-of-line values: digest equality, prefix order, key bound" {
             c.* = 0;
         };
         const ea = try key.valBytes(gpa, .{ .string = sa });
-        try testing.expectEqual(@as(u8, @intFromEnum(key.Tag.string_long)), ea[0]);
-        try testing.expect(ea.len <= 1 + 2 * key.prefix_len + 1 + key.hash_len);
+        try testing.expectEqual(@as(u8, @intFromEnum(key.Tag.string)), ea[0]);
+        try testing.expect(ea.len <= 1 + 2 * key.prefix_len + 2 + key.hash_len);
 
         // Same bytes: same key. Different bytes with the same prefix: same
         // prefix section, different hash.
@@ -204,4 +205,52 @@ test "K4 every AVET key of an inline value is under 256 bytes" {
     const wb = try key.valBytes(gpa, .{ .string = &worst });
     const wk = try key.keyBytes(gpa, .avet, key.id_max, std.math.maxInt(u32), wb, .{ .t = 1, .added = true });
     try testing.expectEqual(@as(usize, 210), wk.len);
+}
+
+test "K5 strings across the inline threshold: one tag, order holds on the 64-byte prefix" {
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 5);
+    const rand = prng.random();
+    var arena = Arena.init();
+    defer arena.deinit();
+    var ba: [key.inline_max]u8 = undefined;
+    var bb: [1024]u8 = undefined;
+    var i: usize = 0;
+    while (i < pairs_per_type) : (i += 1) {
+        const gpa = arena.reset();
+        const sa = randBlob(rand, &ba, key.inline_max);
+        const sb = bb[0 .. key.inline_max + 1 + rand.uintAtMost(usize, bb.len - key.inline_max - 1)];
+        for (sb) |*c| c.* = switch (rand.uintLessThan(u8, 8)) {
+            0 => 0,
+            1 => 0xFF,
+            2 => rand.intRangeAtMost(u8, 'a', 'c'),
+            else => rand.int(u8),
+        };
+        // Share a prefix often, sometimes the whole inline value.
+        if (rand.boolean()) {
+            const n = rand.uintAtMost(usize, sa.len);
+            @memcpy(sb[0..n], sa[0..n]);
+        }
+        const pa = sa[0..@min(sa.len, key.prefix_len)];
+        const pb = sb[0..@min(sb.len, key.prefix_len)];
+        const want = std.mem.order(u8, pa, pb);
+        const as_string = rand.boolean();
+        const va: Val = if (as_string) .{ .string = sa } else .{ .bytes = sa };
+        const vb: Val = if (as_string) .{ .string = sb } else .{ .bytes = sb };
+        const ea = try key.valBytes(gpa, va);
+        const eb = try key.valBytes(gpa, vb);
+        try testing.expectEqual(ea[0], eb[0]);
+        if (want == .eq) continue;
+        try testing.expectEqual(want, std.mem.order(u8, ea, eb));
+        // The same holds for whole index keys, where fixed fields follow v.
+        const e = rand.uintAtMost(u64, key.id_max);
+        const ka = try key.keyBytes(gpa, .avet, e, 7, ea, .{ .t = 3, .added = true });
+        const kb = try key.keyBytes(gpa, .avet, e, 7, eb, .{ .t = 3, .added = true });
+        try testing.expectEqual(want, std.mem.order(u8, ka, kb));
+        // Both decode to what they are.
+        const da = try key.decodeVal(gpa, ea);
+        try testing.expect(da == .val);
+        const db = try key.decodeVal(gpa, eb);
+        try testing.expect(db != .val);
+        try testing.expectEqual(key.hash128(sb), if (as_string) db.string_long.hash else db.bytes_long.hash);
+    }
 }

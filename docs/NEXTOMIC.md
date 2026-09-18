@@ -95,19 +95,25 @@ One tag byte orders types; within a type, byte order equals value order.
 | `0x30` | keyword | `[ident-id:4]` |
 | `0x40` | ref | `[eid:6]` |
 | `0x50` | string ≤ 96 bytes | UTF-8 with `0x00 → 0x00 0xFF`, terminated by `0x00` |
-| `0x51` | string > 96 bytes | first 64 escaped bytes, `0x00`, then `xxh3-128` of the whole string |
+| `0x50` | string > 96 bytes | first 64 escaped bytes, `0x00`, `0x01`, then a 128-bit hash of the whole string |
 | `0x60` | uuid | 16 bytes |
-| `0x70` / `0x71` | bytes | as string / long string |
+| `0x70` | bytes | as string, both shapes |
 
 String order is UTF-8 byte order, which is code point order, not
 UTF-16 order; no Unicode normalization is applied. Type tags never
 compare equal across types, so `1` and `1.0` are different keys, in
 line with `(= 1 1.0)` being false.
 
-**Out-of-line values** (`0x51`, `0x71`): the index key is an equality
-key, not an order key. Range predicates over long strings are correct
-only on the 64-byte prefix and are refused by the planner
-(`:nextomic/unsupported-range`). The full value is stored in the
+**Out-of-line values** (strings and byte arrays over 96 bytes): the
+index key is an equality key, not an order key. A string or byte array
+has one tag whatever its length, so byte order equals value order
+across the threshold whenever two values differ within their first 64
+bytes; two values that agree on those 64 bytes order by hash when
+either is out of line. The decoder tells the shapes apart by the bare
+`0x00`: an inline value ends there, an out-of-line value continues with
+the `0x01` marker and the hash (the hash is two seeded xxh3-64 lanes).
+Range predicates over long strings are correct only on the 64-byte
+prefix and are refused by the planner (`:nextomic/unsupported-range`). The full value is stored in the
 `nx/eavt` value after the 6-byte `t` (and in `nx/eavt-h`); an AVET or
 AEVT hit on a long value is confirmed by an EAVT point read before it is
 returned. Two distinct values with the same 64-byte prefix and the same
