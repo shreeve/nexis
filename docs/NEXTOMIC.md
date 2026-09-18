@@ -74,8 +74,8 @@ that most "build a Datomic on X" projects lack from day one:
 | Snapshot isolation with lock-free readers | emdb `INV-T02`, `INV-T13` | A Datalog query opens a read tx at start and every clause sees the same basis — no phantom reads across joins |
 | Multiple independent B+ trees per file | emdb `INV-SUB01..06` | EAVT/AEVT/AVET/VAET/log/schema are separate named trees, atomically published by one meta-page flip |
 | Atomic multi-tree commit | emdb `INV-T07A`, `INV-M03` | Transact writes all index updates, the log append, and any schema change as a single atomic value |
-| Prefix-compressed branch pages | emdb `SPEC.md §5.0.2` | Composite EAVT keys share 8-16+ byte prefixes across adjacent keys; branch-page G=1/G>1/G<0 compression was tuned for exactly this shape |
-| Zero-copy mmap reads | emdb `INV-WM01` | String/bytes values can point into mmap pages for the read tx's duration — no deserialization cost |
+| Prefix-compressed branch pages | emdb `SPEC.md §5.0.2`, `INV-P03` | Composite EAVT keys share long prefixes across adjacent keys; a branch page stores one page-wide prefix, so fan-out rises and depth stays at three levels for millions of datoms. Leaf keys are stored whole: leaf compression was measured on datom keys and declined (`../emdb/PERFORMANCE.md` §6.27) |
+| Zero-copy mmap reads | emdb `API-KV01` | Inline and single-page overflow values point into mmap pages for the read tx's duration — no deserialization cost. A value spanning several overflow pages is assembled into a tx-owned buffer, so only txlog and schema values are ever affected |
 | Persistent collections with structural equality | nexis `PLAN.md §9`, §23 #36 | `(= (list 1 2 3) (vector 1 2 3))` — query result literals interoperate trivially |
 | Durable-ref as first-class value kind | nexis `PLAN.md §15.2`, §23 #7 | Identity bridge between runtime and storage already exists — reuse at the `(db/ref ...)` layer |
 | Explicit lexical transactions, no STM | nexis §15.3, §23 #6 | `(with-tx ...)` shape cleanly mirrors Datomic's transact boundary |
@@ -320,13 +320,17 @@ comparator is exactly the ordering Nextomic requires. The
 numerically and strings sort lexicographically within their type.
 
 **Index values are empty.** In EAVT/AEVT/AVET/VAET, the key *is* the
-datom — no separate value is needed. This maximizes B+ tree leaf
-density and leverages emdb's prefix compression fully.
+datom — no separate value is needed. Leaf density comes from that: a
+datom costs its key bytes plus a 10-byte node overhead and nothing else.
+Two encoding levers return more than any engine change would: a 6-byte
+entity, 2-byte attribute and 6-byte tx with `op` folded in (7 of the 33
+key bytes above), and sorting a transaction's AVET/VAET inserts before
+writing them (leaf fill 0.66-0.72 → 0.90).
 
 **Write path.** A single `transact!` opens one emdb write tx, updates
 all relevant indexes + the txlog + any schema changes, and commits
-once. emdb's `INV-T07A` (Phase 2 data sync before Phase 3 meta write)
-gives atomic cross-index publication for free.
+once. Named-tree roots commit together in one meta-page publish
+(`INV-SUB04`, `INV-M03`), so cross-index atomicity comes for free.
 
 ---
 
@@ -448,18 +452,35 @@ occurs on schema change.
 
 One affordance *already exists* and is all that Nextomic will ever ask:
 
-- Stamp a db-value's `basis-tx` from `Env.info().lastTxnId`
-  (`../emdb/src/emdb.zig`). Already exposed, no code change.
+- Stamp a db-value's `basis-tx` from the `txnId` of the read transaction
+  the db-value lives in (`Txn.txnId`, `../emdb/src/txn.zig`). It is the
+  snapshot the query actually reads. `Env.info().lastTxnId` reports the
+  same number outside any transaction but can lag a commit from another
+  process, so it must not be the source. A datom's `tx` is the
+  committing write transaction's `txnId`, so a basis compares directly
+  against every datom with no translation table.
 
-Four temptations to refuse if they arise during Nextomic
-implementation — each has a correct Nexis-side answer:
+Engine facts that bound the key design (details in
+`../emdb/NEXTOMIC.md` §5): index keys must stay under the 256-byte
+search-clue buffer (a string `v` is a capped prefix plus a hash, the
+full string lives in the txlog value) and under the 4078-byte hard bound
+at 16K pages; open the file with `pageSize = 16384` explicitly (the
+Linux default is 4K, and page size is fixed for the file's life); open
+all eight trees once at connect before any worker thread runs; state
+the sync mode, since a fully durable commit is two device flushes.
+
+Temptations to refuse if they arise during Nextomic implementation —
+each has a correct Nexis-side answer:
 
 | Temptation | Nexis-side answer |
 |---|---|
 | Add a typed key comparator to emdb | Encode types into key bytes so default lex-sort matches value-sort |
 | Add "read at arbitrary historical txn_id" to emdb | Route history through tx-in-key filtering (§3.4) |
 | Add record/tuple awareness to emdb | Encode datoms into byte keys; emdb sees only bytes |
-| Add Nextomic-specific APIs to emdb | Compose existing emdb primitives (named trees, cursors, range scans, read txns) on the Nexis side |
+| Add Nextomic-specific APIs to emdb | Compose existing emdb primitives (named trees, cursors, range scans, prefix deletes, read txns) on the Nexis side |
+| Turn `CommitObserver` into a change feed | The txlog is a named tree committed with the indexes; a change feed is a scan of it from `basis + 1` |
+| Ask for concurrent writers | Queue `transact!` calls on the Nexis side and batch them into one write tx |
+| Widen the clue buffer or key bound for long values | Long strings live in the txlog value; index keys carry a capped prefix plus a hash |
 
 The default answer to each is no — and the architectural discipline
 that produced this document is the reason why.
@@ -485,7 +506,7 @@ advantages that neither Datomic nor Datahike can replicate:
 |---|---|---|
 | Cold-start embedded query | mmap'd `.nx.o` + emdb open in <10ms vs JVM class-loading + Datahike init in hundreds of ms | 10–50× on end-to-end first-result latency |
 | Zero-copy large-string read | emdb overflow pages + Nexis `string` Value payload points into mmap | 10–50× on large-blob reads |
-| Historical range scan (tx-in-key) | SIMD-accelerated cursor + G>1/G<0 prefix compression on composite EAVT keys | 3–10× on history traversal |
+| Historical range scan (tx-in-key) | SIMD-accelerated cursor over composite EAVT keys with single-prefix branch pages | 3–10× on history traversal |
 | Numeric analytical aggregation over a Relation | `typed-vector` columns + `nexis.simd` kernels; approaches ~40 GFLOPS per core on f64 | Orders of magnitude over Datahike/Datascript. **No managed-runtime Datomic-successor can compete in this lane.** |
 | REPL-driven query development | Macroexpand the query and see exactly what IR it produces; sub-millisecond round-trip | Qualitative: interactive experience Clojure cannot match on JVM |
 
@@ -535,7 +556,7 @@ All of this is nexis-side code. Zero lines in `../emdb/` or `../em/`.
 | N1 | Generic execution representation (falling back to persistent-set-of-persistent-vector internally) | **High** | **Severe** — this is the difference between "great" and "works" | Commit to `Relation` type §3.2 before first planner code lands |
 | N2 | Schema machinery underdesigned | High | Severe | §6 of this doc; amend before first `transact!` lands |
 | N3 | Query planner stays "simple nested-loop forever" | Medium | Moderate | Ship a minimal planner first; invest in selectivity heuristics once real workloads exist |
-| N4 | Someone tries to extend emdb with Nextomic-specific APIs | Medium | Severe | `../emdb/NEXTOMIC.md` §4 names the four temptations to refuse |
+| N4 | Someone tries to extend emdb with Nextomic-specific APIs | Medium | Severe | `../emdb/NEXTOMIC.md` §6 names the temptations to refuse |
 | N5 | Someone tries to extend the §15.10 codec matrix to handle query plans | Low | Moderate | §5 three-representation discipline; codec amendment requires PLAN.md change |
 | N6 | `as-of` leaning on emdb snapshot pinning instead of tx-in-key | Medium | Moderate | §3.4 is explicit; pinning is operational only |
 | N7 | Write amplification under long-running append-only history in B+ tree pages | Low | Moderate | Honest documentation; history-compaction strategy is a v2 concern |
