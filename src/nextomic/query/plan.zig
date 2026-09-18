@@ -65,6 +65,9 @@ pub const Error = error{
 pub const Const = struct {
     cell: Cell,
     bytes: ?[]const u8 = null,
+    /// The VM keyword the constant was written as (an attribute or an
+    /// ident), for `explain`.
+    name: ?u32 = null,
 };
 
 /// A data-pattern position at plan time.
@@ -618,11 +621,11 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) anyerror!?Co
     switch (pos) {
         0 => {
             const eid = (try resolveEntity(ctx, c)) orelse return null;
-            return .{ .cell = .{ .int = @intCast(eid) } };
+            return .{ .cell = .{ .int = @intCast(eid) }, .name = if (c == .cell and c.cell == .keyword) c.cell.keyword else null };
         },
         1 => {
             const at = attr orelse return error.QuerySyntax;
-            return .{ .cell = .{ .int = at.id } };
+            return .{ .cell = .{ .int = at.id }, .name = if (c == .cell and c.cell == .keyword) c.cell.keyword else null };
         },
         2 => {
             if (attr) |at| {
@@ -667,7 +670,12 @@ pub fn resolveEntity(ctx: *Ctx, c: ir.Constant) anyerror!?u64 {
                 if (n < 0 or n > key.id_max) return null;
                 return @intCast(n);
             },
-            .keyword => |kw| return ctx.read.entid(ctx.arena, .{ .ident = kw }),
+            .keyword => |kw| {
+                // An ident names an entity whatever the view's window; the
+                // window filters the entity's datoms, not its name.
+                const id = (try ctx.read.db.conn.idents.idOf(ctx.read.txn, kw)) orelse return null;
+                return id;
+            },
             else => return error.QuerySyntax,
         },
         .lookup => |l| {
@@ -693,7 +701,7 @@ pub fn resolveTyped(ctx: *Ctx, c: ir.Constant, vt: key.ValueType) anyerror!?key.
         },
         .cell => |cell| {
             if (vt == .ref and cell == .keyword) {
-                const eid = (try ctx.read.entid(ctx.arena, .{ .ident = cell.keyword })) orelse return null;
+                const eid = (try ctx.read.db.conn.idents.idOf(ctx.read.txn, cell.keyword)) orelse return null;
                 return .{ .ref = eid };
             }
             return try encodeCell(ctx.read, cell, vt);
@@ -837,7 +845,10 @@ fn explainSlot(slot: Slot, ctx: *const Ctx, w: *std.Io.Writer) !void {
         .blank => try w.writeAll("_"),
         .bound => |v| try w.print("{s}!", .{ctx.varName(v)}),
         .fresh, .same => |v| try w.writeAll(ctx.varName(v)),
-        .constant => |c| try explainCell(c.cell, ctx, w),
+        .constant => |c| {
+            if (c.name) |k| return w.print(":{s}", .{ctx.interner.keywordName(k)});
+            try explainCell(c.cell, ctx, w);
+        },
     }
 }
 

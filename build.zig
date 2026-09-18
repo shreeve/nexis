@@ -511,10 +511,25 @@ pub fn build(b: *std.Build) void {
     const prop_nextomic_tx_tests = b.addTest(.{ .root_module = prop_nextomic_tx_mod });
     const run_prop_nextomic_tx_tests = b.addRunArtifact(prop_nextomic_tx_tests);
 
+    // The query corpus (test/integration/nextomic_q.zig) reads its
+    // queries with the language reader and checks every result against
+    // a naive evaluator.
+    const integration_nextomic_q_mod = b.createModule(.{
+        .root_source_file = b.path("test/integration/nextomic_q.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_nextomic_q_mod.addImport("nextomic", nextomic_mod);
+    integration_nextomic_q_mod.addImport("reader", reader_mod);
+    for (nextomic_imports) |imp| integration_nextomic_q_mod.addImport(imp.name, imp.mod);
+    const integration_nextomic_q_tests = b.addTest(.{ .root_module = integration_nextomic_q_mod });
+    const run_integration_nextomic_q_tests = b.addRunArtifact(integration_nextomic_q_tests);
+
     const nextomic_test_step = b.step("nextomic-test", "Run only the nextomic unit + property tests");
     nextomic_test_step.dependOn(&run_nextomic_tests.step);
     nextomic_test_step.dependOn(&run_prop_nextomic_key_tests.step);
     nextomic_test_step.dependOn(&run_prop_nextomic_tx_tests.step);
+    nextomic_test_step.dependOn(&run_integration_nextomic_q_tests.step);
 
     // -------------------------------------------------------------------------
     // Phase 0: reader unit tests (src/reader.zig has its own test { ... }
@@ -1142,6 +1157,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_nextomic_tests.step);
     test_step.dependOn(&run_prop_nextomic_key_tests.step);
     test_step.dependOn(&run_prop_nextomic_tx_tests.step);
+    test_step.dependOn(&run_integration_nextomic_q_tests.step);
     test_step.dependOn(&run_prop_compile_tests.step);
     test_step.dependOn(&run_integration_eval_tests.step);
     test_step.dependOn(&run_bench_tests.step);

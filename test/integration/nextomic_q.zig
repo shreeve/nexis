@@ -1,0 +1,1347 @@
+//! test/integration/nextomic_q.zig — the query corpus (NEXTOMIC.md §8).
+//!
+//! Every query here runs twice: through the pipeline (parse, plan,
+//! exec) and through `Naive`, a nested-loop evaluator over the view's
+//! datoms that knows nothing of relations, plans or indexes. The two
+//! row sets must agree after sorting. Queries are read from source
+//! text with the language reader so the corpus reads like Datalog.
+//! Rules in `Naive` are evaluated bottom-up to a naive fixpoint over
+//! the whole view, so the rule corpus uses a small graph; the 5k-edge
+//! chain is checked against its known closure instead.
+
+const std = @import("std");
+const nextomic = @import("nextomic");
+const value = @import("value");
+const heap_mod = @import("heap");
+const intern_mod = @import("intern");
+const string_mod = @import("string");
+const list_mod = @import("list");
+const vector_mod = @import("vector");
+const champ = @import("champ");
+const dispatch = @import("dispatch");
+const reader_mod = @import("reader");
+
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const Value = value.Value;
+const Heap = heap_mod.Heap;
+const Interner = intern_mod.Interner;
+const query = nextomic.query;
+const ir = query.ir;
+const Cell = nextomic.Cell;
+const Relation = nextomic.Relation;
+const Var = ir.Var;
+const DbValue = nextomic.DbValue;
+const TestConn = nextomic.db.TestConn;
+const key = nextomic.key;
+
+// =============================================================================
+// Fixture
+// =============================================================================
+
+const Fx = struct {
+    tc: *TestConn,
+    heap: Heap,
+    arena_state: std.heap.ArenaAllocator,
+
+    fn init(name: []const u8) !*Fx {
+        const self = try testing.allocator.create(Fx);
+        self.* = .{
+            .tc = try TestConn.init(name),
+            .heap = Heap.init(testing.allocator),
+            .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
+        };
+        return self;
+    }
+
+    fn deinit(self: *Fx) void {
+        self.arena_state.deinit();
+        self.heap.deinit();
+        self.tc.deinit();
+        testing.allocator.destroy(self);
+    }
+
+    fn arena(self: *Fx) Allocator {
+        return self.arena_state.allocator();
+    }
+
+    fn interner(self: *Fx) *Interner {
+        return &self.tc.interner;
+    }
+
+    fn conn(self: *Fx) *nextomic.Conn {
+        return self.tc.conn;
+    }
+
+    /// Read one form of source text into a VM value.
+    fn read(self: *Fx, src: []const u8) !Value {
+        var parsed = try reader_mod.parser.parseProgram(testing.allocator, src);
+        defer parsed.parser.deinit();
+        var rdr = reader_mod.Reader.init(testing.allocator, src);
+        defer rdr.deinit();
+        const forms = try rdr.readProgram(parsed.sexp);
+        try testing.expectEqual(@as(usize, 1), forms.len);
+        return self.formToValue(forms[0]);
+    }
+
+    fn formToValue(self: *Fx, form: *const reader_mod.Form) anyerror!Value {
+        const a = self.arena();
+        return switch (form.datum) {
+            .nil => value.nilValue(),
+            .bool_ => |b| value.fromBool(b),
+            .int => |n| value.fromFixnum(n).?,
+            .real => |d| value.fromFloat(d),
+            .string => |s| try string_mod.fromBytes(&self.heap, s),
+            .keyword => |name| try self.interner().internKeywordValue(try joinName(a, name)),
+            .symbol => |name| try self.interner().internSymbolValue(try joinName(a, name)),
+            .list => |items| blk: {
+                const vals = try a.alloc(Value, items.len);
+                for (items, vals) |it, *v| v.* = try self.formToValue(it);
+                break :blk try list_mod.fromSlice(&self.heap, vals);
+            },
+            .vector => |items| blk: {
+                const vals = try a.alloc(Value, items.len);
+                for (items, vals) |it, *v| v.* = try self.formToValue(it);
+                break :blk try vector_mod.fromSlice(&self.heap, vals);
+            },
+            .map => |items| blk: {
+                var m = try champ.mapEmpty(&self.heap);
+                var i: usize = 0;
+                while (i < items.len) : (i += 2) {
+                    m = try champ.mapAssoc(&self.heap, m, try self.formToValue(items[i]), try self.formToValue(items[i + 1]), &dispatch.hashValue, &dispatch.equal);
+                }
+                break :blk m;
+            },
+            .set => |items| blk: {
+                var s = try champ.setEmpty(&self.heap);
+                for (items) |it| s = try champ.setConj(&self.heap, s, try self.formToValue(it), &dispatch.hashValue, &dispatch.equal);
+                break :blk s;
+            },
+            else => error.UnsupportedForm,
+        };
+    }
+
+    fn joinName(a: Allocator, name: anytype) ![]const u8 {
+        if (name.ns) |ns| return std.fmt.allocPrint(a, "{s}/{s}", .{ ns, name.name });
+        return name.name;
+    }
+
+    fn transact(self: *Fx, src: []const u8) !nextomic.Report {
+        const tx = try self.read(src);
+        return nextomic.transact.transact(self.conn(), self.arena(), tx, .{});
+    }
+
+    fn db(self: *Fx) !DbValue {
+        return self.conn().db();
+    }
+
+    fn kw(self: *Fx, name: []const u8) !u32 {
+        return self.interner().internKeyword(name);
+    }
+
+    fn str(self: *Fx, s: []const u8) !Value {
+        return string_mod.fromBytes(&self.heap, s);
+    }
+
+    fn hook(self: *Fx) query.CallHook {
+        return .{ .ctx = @ptrCast(self), .call = &hookCall };
+    }
+
+    /// The test's user functions.
+    fn hookCall(ctx: *anyopaque, sym_id: u32, args: []const Value) anyerror!Value {
+        const self: *Fx = @ptrCast(@alignCast(ctx));
+        const name = self.interner().symbolName(sym_id);
+        const a = self.arena();
+        if (std.mem.eql(u8, name, "inc")) return value.fromFixnum(args[0].asFixnum() + 1).?;
+        if (std.mem.eql(u8, name, "add")) return value.fromFixnum(args[0].asFixnum() + args[1].asFixnum()).?;
+        if (std.mem.eql(u8, name, "even?")) return value.fromBool(@mod(args[0].asFixnum(), 2) == 0);
+        if (std.mem.eql(u8, name, "str")) {
+            var out: std.ArrayList(u8) = .empty;
+            for (args) |x| switch (x.kind()) {
+                .string => try out.appendSlice(a, string_mod.asBytes(x)),
+                .fixnum => try out.print(a, "{d}", .{x.asFixnum()}),
+                .keyword => try out.print(a, ":{s}", .{self.interner().keywordName(x.asKeywordId())}),
+                else => try out.appendSlice(a, "?"),
+            };
+            return string_mod.fromBytes(&self.heap, out.items);
+        }
+        if (std.mem.eql(u8, name, "upper")) {
+            const s = string_mod.asBytes(args[0]);
+            const out = try a.alloc(u8, s.len);
+            for (s, out) |c, *o| o.* = std.ascii.toUpper(c);
+            return string_mod.fromBytes(&self.heap, out);
+        }
+        if (std.mem.eql(u8, name, "range")) {
+            const n: usize = @intCast(args[0].asFixnum());
+            const vals = try a.alloc(Value, n);
+            for (vals, 0..) |*v, i| v.* = value.fromFixnum(@intCast(i)).?;
+            return vector_mod.fromSlice(&self.heap, vals);
+        }
+        if (std.mem.eql(u8, name, "pair")) return vector_mod.fromSlice(&self.heap, args[0..2]);
+        if (std.mem.eql(u8, name, "halves")) {
+            // [[n 0] [n 1]]
+            const rows = try a.alloc(Value, 2);
+            rows[0] = try vector_mod.fromSlice(&self.heap, &.{ args[0], value.fromFixnum(0).? });
+            rows[1] = try vector_mod.fromSlice(&self.heap, &.{ args[0], value.fromFixnum(1).? });
+            return vector_mod.fromSlice(&self.heap, rows);
+        }
+        if (std.mem.eql(u8, name, "maybe")) return if (args[0].asFixnum() > 30) args[0] else value.nilValue();
+        if (std.mem.eql(u8, name, "boom")) return error.ControlTransferred;
+        return error.UnknownFunction;
+    }
+};
+
+const long_bio_a = "Ann has a biography that runs well past the ninety-six byte inline limit of the sortable string encoding, so it lives out of line with a prefix and a hash.";
+const long_bio_d = "Di also has a long biography, long enough to be stored out of line; the first sixty-four bytes are shared with nothing else in this corpus at all.";
+const long_bio_x = "Ann has a biography that runs well past the ninety-six byte inline limit of the sortable string encoding, so it lives out of line -- but this one differs after the prefix.";
+
+/// Schema, people, orders, graph, then an update transaction.
+fn loadCorpus(fx: *Fx) !void {
+    _ = try fx.transact(
+        \\[{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/index true}
+        \\ {:db/ident :person/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+        \\ {:db/ident :person/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :person/height :db/valueType :db.type/double :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :person/active :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :person/tags :db/valueType :db.type/keyword :db/cardinality :db.cardinality/many}
+        \\ {:db/ident :person/friend :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+        \\ {:db/ident :person/boss :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :person/bio :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :person/role :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :order/number :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/unique :db.unique/value}
+        \\ {:db/ident :order/customer :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :order/total :db/valueType :db.type/double :db/cardinality :db.cardinality/one :db/index true}
+        \\ {:db/ident :order/status :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one :db/index true}
+        \\ {:db/ident :order/items :db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+        \\ {:db/ident :edge/to :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+        \\ {:db/ident :node/label :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :role/admin} {:db/ident :role/user}]
+    );
+    const people = try std.fmt.allocPrint(fx.arena(),
+        \\[{{:db/id "ann" :person/name "Ann" :person/email "ann@x" :person/age 30 :person/height 1.7 :person/active true :person/tags [:red :blue] :person/role :role/admin :person/bio "{s}"}}
+        \\ {{:db/id "bob" :person/name "Bob" :person/email "bob@x" :person/age 25 :person/height 1.8 :person/active false :person/tags [:blue] :person/friend ["ann"] :person/boss "ann" :person/role :role/user}}
+        \\ {{:db/id "cy" :person/name "Cy" :person/email "cy@x" :person/age 41 :person/height 1.65 :person/active true :person/tags [:red :green] :person/friend ["ann" "bob"] :person/boss "ann"}}
+        \\ {{:db/id "di" :person/name "Di" :person/email "di@x" :person/age 30 :person/active true :person/friend ["cy"] :person/boss "cy" :person/bio "{s}"}}
+        \\ {{:db/id "ed" :person/name "Ed" :person/email "ed@x" :person/age 55 :person/tags [:green] :person/role :role/admin}}]
+    , .{ long_bio_a, long_bio_d });
+    _ = try fx.transact(people);
+    _ = try fx.transact(
+        \\[{:order/number 1 :order/customer [:person/email "ann@x"] :order/total 10.5 :order/status :status/open :order/items ["apple" "pear"]}
+        \\ {:order/number 2 :order/customer [:person/email "bob@x"] :order/total 99.0 :order/status :status/shipped :order/items ["fig"]}
+        \\ {:order/number 3 :order/customer [:person/email "ann@x"] :order/total 5.25 :order/status :status/shipped}
+        \\ {:order/number 4 :order/customer [:person/email "cy@x"] :order/total 42.0 :order/status :status/open :order/items ["apple"]}]
+    );
+    _ = try fx.transact(
+        \\[{:db/id "n1" :node/label "n1" :edge/to ["n2"]} {:db/id "n2" :node/label "n2" :edge/to ["n3"]}
+        \\ {:db/id "n3" :node/label "n3" :edge/to ["n1" "n4"]} {:db/id "n4" :node/label "n4" :edge/to ["n5"]}
+        \\ {:db/id "n5" :node/label "n5"} {:db/id "n6" :node/label "n6"}]
+    );
+    _ = try fx.transact(
+        \\[[:db/add [:person/email "bob@x"] :person/age 26]
+        \\ [:db/retract [:person/email "ann@x"] :person/tags :red]
+        \\ {:db/id [:person/email "ed@x"] :person/name "Edward"}
+        \\ {:db/id "flo" :person/name "Flo" :person/email "flo@x" :person/age 33 :person/friend [[:person/email "bob@x"]]}
+        \\ [:db/retract [:person/email "cy@x"] :person/friend [:person/email "bob@x"]]]
+    );
+}
+
+// =============================================================================
+// Running both engines
+// =============================================================================
+
+const Row = []const Cell;
+
+/// Rows through the pipeline, in `arena`.
+fn runEngine(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args: []const Value) anyerror![]const Row {
+    const qv = try fx.read(src);
+    var diag: query.Diag = .{};
+    const parsed = try query.parse.parse(testing.allocator, fx.interner(), qv, &diag);
+    defer parsed.deinit();
+    if (args.len != parsed.in.len) return error.QuerySyntax;
+    var rules: *const ir.RuleSet = &ir.no_rules;
+    var owned_rules: ?*ir.RuleSet = null;
+    defer if (owned_rules) |r| r.deinit();
+    for (parsed.in, args) |b, a| {
+        if (b == .rules) {
+            owned_rules = try query.parse.parseRules(testing.allocator, fx.interner(), a, &diag);
+            rules = owned_rules.?;
+        }
+    }
+    var read = try dbv.beginRead();
+    defer read.close();
+    var ctx = try query.plan.Ctx.init(arena, &read, fx.interner(), parsed, rules);
+    const p = try query.plan.plan(&ctx, parsed);
+    var ex = query.Exec{ .arena = arena, .read = &read, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook() };
+    const input = try ex.inputRelation(parsed.in, args);
+    const rel = try ex.runPlan(p, input);
+    return ex.findRows(parsed, rel);
+}
+
+fn sortedRelation(arena: Allocator, rows: []const Row, width: usize) !Relation {
+    const vars = try arena.alloc(Var, width);
+    for (vars, 0..) |*v, i| v.* = @intCast(i);
+    var rel = try Relation.init(arena, vars);
+    for (rows) |r| try rel.append(r);
+    try rel.sort();
+    return rel;
+}
+
+fn printRows(fx: *Fx, label: []const u8, rel: *const Relation) void {
+    std.debug.print("{s} ({d} rows):\n", .{ label, rel.rows });
+    var i: usize = 0;
+    while (i < rel.rows and i < 40) : (i += 1) {
+        std.debug.print("  [", .{});
+        for (rel.cols) |*c| {
+            switch (c.get(i)) {
+                .nil => std.debug.print(" nil", .{}),
+                .int => |n| std.debug.print(" {d}", .{n}),
+                .double => |d| std.debug.print(" {d}", .{d}),
+                .boolean => |b| std.debug.print(" {}", .{b}),
+                .keyword => |k| std.debug.print(" :{s}", .{fx.interner().keywordName(k)}),
+                .str => |s| std.debug.print(" \"{s}\"", .{if (s.len > 20) s[0..20] else s}),
+                .vm => std.debug.print(" #vm", .{}),
+            }
+        }
+        std.debug.print(" ]\n", .{});
+    }
+}
+
+/// Run `src` through both engines and compare. Returns the engine's
+/// sorted rows for further checks.
+fn check(fx: *Fx, dbv: DbValue, src: []const u8, args: []const Value) !Relation {
+    const arena = fx.arena();
+    const got = try runEngine(fx, arena, dbv, src, args);
+    const want = try Naive.run(fx, arena, dbv, src, args);
+    const width = if (got.len > 0) got[0].len else if (want.len > 0) want[0].len else 0;
+    const got_rel = try sortedRelation(arena, got, width);
+    const want_rel = try sortedRelation(arena, want, width);
+    if (!got_rel.eqlRows(&want_rel)) {
+        std.debug.print("\nMISMATCH for {s}\n", .{src});
+        printRows(fx, "engine", &got_rel);
+        printRows(fx, "naive", &want_rel);
+        return error.QueryMismatch;
+    }
+    return got_rel;
+}
+
+fn checkCount(fx: *Fx, dbv: DbValue, src: []const u8, args: []const Value, n: usize) !void {
+    const rel = try check(fx, dbv, src, args);
+    if (rel.rows != n) {
+        std.debug.print("\nexpected {d} rows, got {d} for {s}\n", .{ n, rel.rows, src });
+        printRows(fx, "engine", &rel);
+        return error.RowCount;
+    }
+}
+
+// =============================================================================
+// Naive evaluator
+// =============================================================================
+
+const Env = []?Cell;
+
+const Naive = struct {
+    fx: *Fx,
+    arena: Allocator,
+    dbv: DbValue,
+    datoms: []const [5]Cell,
+    rules: *const ir.RuleSet,
+    read: *nextomic.db.Read,
+    facts: std.AutoHashMapUnmanaged(u32, std.ArrayList(Row)) = .empty,
+    attr_types: std.AutoHashMapUnmanaged(u32, key.ValueType) = .empty,
+
+    fn run(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args: []const Value) anyerror![]const Row {
+        const qv = try fx.read(src);
+        var diag: query.Diag = .{};
+        const parsed = try query.parse.parse(testing.allocator, fx.interner(), qv, &diag);
+        defer parsed.deinit();
+        if (args.len != parsed.in.len) return error.QuerySyntax;
+        var rules: *const ir.RuleSet = &ir.no_rules;
+        var owned_rules: ?*ir.RuleSet = null;
+        defer if (owned_rules) |r| r.deinit();
+        for (parsed.in, args) |b, a| {
+            if (b == .rules) {
+                owned_rules = try query.parse.parseRules(testing.allocator, fx.interner(), a, &diag);
+                rules = owned_rules.?;
+            }
+        }
+
+        var read = try dbv.beginRead();
+        defer read.close();
+        var self = Naive{ .fx = fx, .arena = arena, .dbv = dbv, .datoms = &.{}, .rules = rules, .read = &read };
+        try self.loadDatoms();
+        try self.computeFacts();
+
+        // Initial environments from :in.
+        var envs: std.ArrayList(Env) = .empty;
+        try envs.append(arena, try self.emptyEnv(parsed.vars.len));
+        for (parsed.in, args) |b, a| {
+            var next: std.ArrayList(Env) = .empty;
+            switch (b) {
+                .src, .rules => continue,
+                .scalar => |v| for (envs.items) |e| {
+                    const e2 = try self.copy(e);
+                    e2[v] = Cell.fromValue(a);
+                    try next.append(arena, e2);
+                },
+                .collection => |v| for (envs.items) |e| for (try seq(arena, a)) |x| {
+                    const e2 = try self.copy(e);
+                    e2[v] = Cell.fromValue(x);
+                    try next.append(arena, e2);
+                },
+                .tuple => |ts| for (envs.items) |e| {
+                    const e2 = try self.copy(e);
+                    for (ts, try seq(arena, a)) |t, x| if (t) |v| {
+                        e2[v] = Cell.fromValue(x);
+                    };
+                    try next.append(arena, e2);
+                },
+                .relation => |ts| for (envs.items) |e| for (try seq(arena, a)) |row| {
+                    const e2 = try self.copy(e);
+                    for (ts, try seq(arena, row)) |t, x| if (t) |v| {
+                        e2[v] = Cell.fromValue(x);
+                    };
+                    try next.append(arena, e2);
+                },
+            }
+            envs = next;
+        }
+
+        var solved: std.ArrayList(Env) = .empty;
+        for (envs.items) |e| try self.solve(parsed.where, e, &solved);
+
+        // Basis: distinct tuples over find ∪ with variables.
+        var basis_vars: std.ArrayList(Var) = .empty;
+        for (parsed.find) |f| try ir.addVar(arena, &basis_vars, f.variable_of());
+        for (parsed.with) |w| try ir.addVar(arena, &basis_vars, w);
+        var basis: std.ArrayList(Row) = .empty;
+        for (solved.items) |e| {
+            const row = try arena.alloc(Cell, basis_vars.items.len);
+            for (basis_vars.items, row) |v, *c| c.* = e[v] orelse return error.Unbound;
+            if (!containsRow(basis.items, row)) try basis.append(arena, row);
+        }
+
+        var out: std.ArrayList(Row) = .empty;
+        if (!parsed.hasAggregates()) {
+            for (basis.items) |b| {
+                const row = try arena.alloc(Cell, parsed.find.len);
+                for (parsed.find, row) |f, *c| c.* = b[indexOf(basis_vars.items, f.variable)];
+                if (parsed.with.len == 0 or !containsRow(out.items, row)) try out.append(arena, row);
+            }
+            return out.toOwnedSlice(arena);
+        }
+
+        // Group by the plain find variables.
+        var group_vars: std.ArrayList(Var) = .empty;
+        for (parsed.find) |f| if (f == .variable) try ir.addVar(arena, &group_vars, f.variable);
+        var keys: std.ArrayList(Row) = .empty;
+        var groups: std.ArrayList(std.ArrayList(Row)) = .empty;
+        for (basis.items) |b| {
+            const k = try arena.alloc(Cell, group_vars.items.len);
+            for (group_vars.items, k) |v, *c| c.* = b[indexOf(basis_vars.items, v)];
+            var g: ?usize = null;
+            for (keys.items, 0..) |kk, i| if (rowEql(kk, k)) {
+                g = i;
+            };
+            if (g == null) {
+                try keys.append(arena, k);
+                try groups.append(arena, .empty);
+                g = keys.items.len - 1;
+            }
+            try groups.items[g.?].append(arena, b);
+        }
+        for (groups.items) |members| {
+            const row = try arena.alloc(Cell, parsed.find.len);
+            for (parsed.find, row) |f, *c| {
+                c.* = switch (f) {
+                    .variable => |v| members.items[0][indexOf(basis_vars.items, v)],
+                    .agg => |ag| try self.aggregate(ag.op, members.items, indexOf(basis_vars.items, ag.arg)),
+                };
+            }
+            try out.append(arena, row);
+        }
+        return out.toOwnedSlice(arena);
+    }
+
+    fn aggregate(self: *Naive, op: ir.AggOp, members: []const Row, col: usize) !Cell {
+        switch (op) {
+            .count => return .{ .int = @intCast(members.len) },
+            .count_distinct, .distinct => {
+                var seen: std.ArrayList(Cell) = .empty;
+                for (members) |m| {
+                    var dup = false;
+                    for (seen.items) |s| if (s.eql(m[col])) {
+                        dup = true;
+                    };
+                    if (!dup) try seen.append(self.arena, m[col]);
+                }
+                if (op == .count_distinct) return .{ .int = @intCast(seen.items.len) };
+                var set = try champ.setEmpty(&self.fx.heap);
+                for (seen.items) |c| set = try champ.setConj(&self.fx.heap, set, try self.cellValue(c), &dispatch.hashValue, &dispatch.equal);
+                return .{ .vm = set };
+            },
+            .min, .max => {
+                var best = members[0][col];
+                for (members[1..]) |m| {
+                    const o = m[col].order(best);
+                    if ((op == .min and o == .lt) or (op == .max and o == .gt)) best = m[col];
+                }
+                return best;
+            },
+            .sum, .avg => {
+                var total: f64 = 0;
+                var all_int = true;
+                var itotal: i64 = 0;
+                for (members) |m| switch (m[col]) {
+                    .int => |n| {
+                        itotal += n;
+                        total += @floatFromInt(n);
+                    },
+                    .double => |d| {
+                        all_int = false;
+                        total += d;
+                    },
+                    else => return error.ValueType,
+                };
+                if (op == .sum) return if (all_int) .{ .int = itotal } else .{ .double = total };
+                return .{ .double = total / @as(f64, @floatFromInt(members.len)) };
+            },
+        }
+    }
+
+    fn cellValue(self: *Naive, c: Cell) !Value {
+        return switch (c) {
+            .nil => value.nilValue(),
+            .int => |n| value.fromFixnum(n).?,
+            .double => |d| value.fromFloat(d),
+            .boolean => |b| value.fromBool(b),
+            .keyword => |k| value.fromKeywordId(k),
+            .str => |s| try string_mod.fromBytes(&self.fx.heap, s),
+            .vm => |v| v,
+        };
+    }
+
+    fn emptyEnv(self: *Naive, n: usize) !Env {
+        const e = try self.arena.alloc(?Cell, n);
+        @memset(e, null);
+        return e;
+    }
+
+    fn copy(self: *Naive, e: Env) !Env {
+        return self.arena.dupe(?Cell, e);
+    }
+
+    /// Every datom of the view as cells, plus attribute types.
+    fn loadDatoms(self: *Naive) !void {
+        const read = self.read;
+        const ds = try self.dbv.datoms(self.arena, .eavt, .{});
+        const out = try self.arena.alloc([5]Cell, ds.len);
+        for (ds, out) |d, *o| {
+            const v: Cell = switch (d.v) {
+                .boolean => |b| .{ .boolean = b },
+                .long, .instant => |n| .{ .int = n },
+                .double => |x| .{ .double = x },
+                .keyword => |id| .{ .keyword = (try self.fx.conn().idents.internOf(read.txn, id)).? },
+                .ref => |r| .{ .int = @intCast(r) },
+                .string, .bytes => |s| .{ .str = s },
+                .uuid => |u| blk: {
+                    const text = try self.arena.alloc(u8, 36);
+                    nextomic.datom.uuidToText(text[0..36], u);
+                    break :blk .{ .str = text };
+                },
+            };
+            o.* = .{ .{ .int = @intCast(d.e) }, .{ .int = d.a }, v, .{ .int = @intCast(key.txEntity(d.t)) }, .{ .boolean = d.added } };
+            if (!self.attr_types.contains(d.a)) {
+                if (try read.attr(d.a)) |at| try self.attr_types.put(self.arena, d.a, at.value_type);
+            }
+        }
+        self.datoms = out;
+    }
+
+    /// Bottom-up naive fixpoint of every rule over the whole view.
+    fn computeFacts(self: *Naive) !void {
+        for (self.rules.rules) |r| {
+            if (!self.facts.contains(r.name)) try self.facts.put(self.arena, r.name, .empty);
+        }
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (self.rules.rules) |r| {
+                var solved: std.ArrayList(Env) = .empty;
+                try self.solve(r.body, try self.emptyEnv(self.rules.vars.len), &solved);
+                const list = self.facts.getPtr(r.name).?;
+                for (solved.items) |e| {
+                    const tuple = try self.arena.alloc(Cell, r.head.len);
+                    var complete = true;
+                    for (r.head, tuple) |h, *c| c.* = e[h] orelse {
+                        complete = false;
+                        break;
+                    };
+                    if (!complete) continue;
+                    if (!containsRow(list.items, tuple)) {
+                        try list.append(self.arena, tuple);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn solve(self: *Naive, clauses: []const ir.Clause, env: Env, out: *std.ArrayList(Env)) anyerror!void {
+        if (clauses.len == 0) return out.append(self.arena, env);
+        const rest = clauses[1..];
+        switch (clauses[0]) {
+            .pattern => |p| for (self.datoms) |d| {
+                const e2 = (try self.matchPattern(p, d, env)) orelse continue;
+                try self.solve(rest, e2, out);
+            },
+            .pred => |call| if (try self.evalPred(call, env)) try self.solve(rest, env, out),
+            .bind => |b| {
+                const results = try self.evalFn(b.call, env);
+                for (results) |r| {
+                    const bound = try self.bind(b.out, r, env);
+                    for (bound) |e2| try self.solve(rest, e2, out);
+                }
+            },
+            .not => |n| {
+                var sub: std.ArrayList(Env) = .empty;
+                try self.solve(n.body, env, &sub);
+                if (sub.items.len == 0) try self.solve(rest, env, out);
+            },
+            .@"or" => |o| {
+                var join: std.ArrayList(Var) = .empty;
+                if (o.join) |js| {
+                    try join.appendSlice(self.arena, js);
+                } else try ir.allVars(self.arena, o.branches[0], &join);
+                var seen: std.ArrayList(Env) = .empty;
+                for (o.branches) |br| {
+                    var sub: std.ArrayList(Env) = .empty;
+                    try self.solve(br, env, &sub);
+                    for (sub.items) |s| {
+                        const e2 = try self.copy(env);
+                        for (join.items) |v| e2[v] = s[v];
+                        var dup = false;
+                        for (seen.items) |x| if (envEql(x, e2)) {
+                            dup = true;
+                        };
+                        if (dup) continue;
+                        try seen.append(self.arena, e2);
+                        try self.solve(rest, e2, out);
+                    }
+                }
+            },
+            .rule => |r| {
+                const list = self.facts.get(r.name) orelse return error.UnknownRule;
+                for (list.items) |tuple| {
+                    const e2 = (try self.unifyArgs(r.args, tuple, env)) orelse continue;
+                    try self.solve(rest, e2, out);
+                }
+            },
+            .source => unreachable,
+        }
+    }
+
+    fn unifyArgs(self: *Naive, args: []const ir.Arg, tuple: Row, env: Env) !?Env {
+        const e2 = try self.copy(env);
+        for (args, tuple) |a, c| switch (a) {
+            .variable => |v| {
+                if (e2[v]) |have| {
+                    if (!have.eql(c)) return null;
+                } else e2[v] = c;
+            },
+            .constant => |k| if (!k.eql(c)) return null,
+            .src => return error.Unsupported,
+        };
+        return e2;
+    }
+
+    /// The cell a pattern constant compares as at position `pos`.
+    fn constCell(self: *Naive, c: ir.Constant, pos: usize, d: [5]Cell) !?Cell {
+        const a = self.arena;
+        switch (c) {
+            .lookup => |l| {
+                const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, l.attr)) orelse return null;
+                const vt = self.attr_types.get(attr_id) orelse return null;
+                const val = (try cellToVal(a, l.v, vt)) orelse return null;
+                const eid = (try self.dbv.entid(a, .{ .lookup = .{ .a = attr_id, .v = val } })) orelse return null;
+                return .{ .int = @intCast(eid) };
+            },
+            .cell => |cell| {
+                if (cell == .keyword) {
+                    const is_ref = switch (pos) {
+                        0, 1 => true,
+                        2 => blk: {
+                            const vt = self.attr_types.get(@intCast(d[1].int)) orelse break :blk false;
+                            break :blk vt == .ref;
+                        },
+                        else => false,
+                    };
+                    if (is_ref) {
+                        const eid = (try self.fx.conn().idents.idOf(self.read.txn, cell.keyword)) orelse return null;
+                        return .{ .int = @intCast(eid) };
+                    }
+                }
+                if (pos == 3 and cell == .int) {
+                    const n = cell.int;
+                    if (n < 0) return null;
+                    const t = key.txOfEntity(@intCast(n)) orelse @as(u64, @intCast(n));
+                    return .{ .int = @intCast(key.txEntity(t)) };
+                }
+                return cell;
+            },
+        }
+    }
+
+    fn matchPattern(self: *Naive, p: ir.Pattern, d: [5]Cell, env: Env) !?Env {
+        var e2: ?Env = null;
+        for (p.terms(), 0..) |t, pos| {
+            switch (t) {
+                .blank => {},
+                .variable => |v| {
+                    const cur = if (e2) |e| e[v] else env[v];
+                    if (cur) |have| {
+                        if (!have.eql(d[pos])) return null;
+                    } else {
+                        if (e2 == null) e2 = try self.copy(env);
+                        e2.?[v] = d[pos];
+                    }
+                },
+                .constant => |c| {
+                    const want = (try self.constCell(c, pos, d)) orelse return null;
+                    if (!want.eql(d[pos])) return null;
+                },
+            }
+        }
+        return e2 orelse try self.copy(env);
+    }
+
+    fn argCell(a: ir.Arg, env: Env) !Cell {
+        return switch (a) {
+            .variable => |v| env[v] orelse error.Unbound,
+            .constant => |c| c,
+            .src => .nil,
+        };
+    }
+
+    fn evalPred(self: *Naive, call: ir.Call, env: Env) !bool {
+        const cells = try self.arena.alloc(Cell, call.args.len);
+        for (call.args, cells) |a, *c| c.* = try argCell(a, env);
+        switch (call.f) {
+            .builtin => |b| switch (b) {
+                .lt, .le, .gt, .ge => {
+                    var i: usize = 0;
+                    while (i + 1 < cells.len) : (i += 1) {
+                        const o = cells[i].order(cells[i + 1]);
+                        const ok = switch (b) {
+                            .lt => o == .lt,
+                            .le => o != .gt,
+                            .gt => o == .gt,
+                            .ge => o != .lt,
+                            else => unreachable,
+                        };
+                        if (!ok) return false;
+                    }
+                    return true;
+                },
+                .eq => {
+                    for (cells[1..]) |c| if (!cells[0].eql(c)) return false;
+                    return true;
+                },
+                .ne => {
+                    for (cells[1..]) |c| if (!cells[0].eql(c)) return true;
+                    return false;
+                },
+                .missing => return (try self.lookup(cells[1], cells[2])) == null,
+                else => return error.Unsupported,
+            },
+            .user => |sym| {
+                const vals = try self.arena.alloc(Value, cells.len);
+                for (cells, vals) |c, *v| v.* = try self.cellValue(c);
+                return (try Fx.hookCall(@ptrCast(self.fx), sym, vals)).isTruthy();
+            },
+        }
+    }
+
+    /// First value of attribute `attr` (keyword cell) on `e` in the view.
+    fn lookup(self: *Naive, e: Cell, attr: Cell) !?Cell {
+        const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, attr.keyword)) orelse return null;
+        for (self.datoms) |d| {
+            if (d[0].eql(e) and d[1].int == attr_id) return d[2];
+        }
+        return null;
+    }
+
+    fn evalFn(self: *Naive, call: ir.Call, env: Env) ![]Value {
+        const cells = try self.arena.alloc(Cell, call.args.len);
+        for (call.args, cells) |a, *c| c.* = try argCell(a, env);
+        const vals = try self.arena.alloc(Value, cells.len);
+        for (cells, vals) |c, *v| v.* = try self.cellValue(c);
+        const result: Value = switch (call.f) {
+            .builtin => |b| switch (b) {
+                .ground, .untuple => vals[0],
+                .get_else => try self.cellValue((try self.lookup(cells[1], cells[2])) orelse cells[3]),
+                .tuple => try vector_mod.fromSlice(&self.fx.heap, vals),
+                else => return error.Unsupported,
+            },
+            .user => |sym| try Fx.hookCall(@ptrCast(self.fx), sym, vals),
+        };
+        return self.arena.dupe(Value, &.{result});
+    }
+
+    fn bind(self: *Naive, b: ir.Binding, v: Value, env: Env) ![]Env {
+        var out: std.ArrayList(Env) = .empty;
+        switch (b) {
+            .scalar => |x| if (!v.isNil()) {
+                const e2 = try self.copy(env);
+                e2[x] = Cell.fromValue(v);
+                try out.append(self.arena, e2);
+            },
+            .collection => |x| for (try seq(self.arena, v)) |item| {
+                const e2 = try self.copy(env);
+                e2[x] = Cell.fromValue(item);
+                try out.append(self.arena, e2);
+            },
+            .tuple => |ts| if (!v.isNil()) {
+                const e2 = try self.copy(env);
+                for (ts, (try seq(self.arena, v))[0..ts.len]) |t, item| if (t) |x| {
+                    e2[x] = Cell.fromValue(item);
+                };
+                try out.append(self.arena, e2);
+            },
+            .relation => |ts| for (try seq(self.arena, v)) |row| {
+                const e2 = try self.copy(env);
+                for (ts, (try seq(self.arena, row))[0..ts.len]) |t, item| if (t) |x| {
+                    e2[x] = Cell.fromValue(item);
+                };
+                try out.append(self.arena, e2);
+            },
+        }
+        return out.toOwnedSlice(self.arena);
+    }
+};
+
+fn cellToVal(arena: Allocator, c: Cell, vt: key.ValueType) !?key.Val {
+    _ = arena;
+    return switch (vt) {
+        .string => if (c == .str) .{ .string = c.str } else null,
+        .long => if (c == .int) .{ .long = c.int } else null,
+        .double => if (c == .double) .{ .double = c.double } else null,
+        .ref => if (c.asEid()) |e| .{ .ref = e } else null,
+        .boolean => if (c == .boolean) .{ .boolean = c.boolean } else null,
+        else => null,
+    };
+}
+
+fn seq(arena: Allocator, v: Value) ![]Value {
+    var out: std.ArrayList(Value) = .empty;
+    switch (v.kind()) {
+        .persistent_vector => {
+            var it = vector_mod.Cursor.init(v);
+            while (it.next()) |x| try out.append(arena, x);
+        },
+        .list => {
+            var it = list_mod.Cursor.init(v);
+            while (it.next()) |x| try out.append(arena, x);
+        },
+        .persistent_set => {
+            var it = champ.setIter(v);
+            while (it.next()) |x| try out.append(arena, x);
+        },
+        else => return error.NotASeq,
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn rowEql(a: Row, b: Row) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!x.eql(y)) return false;
+    return true;
+}
+
+fn containsRow(rows: []const Row, row: Row) bool {
+    for (rows) |r| if (rowEql(r, row)) return true;
+    return false;
+}
+
+fn envEql(a: Env, b: Env) bool {
+    for (a, b) |x, y| {
+        if (x == null and y == null) continue;
+        if (x == null or y == null) return false;
+        if (!x.?.eql(y.?)) return false;
+    }
+    return true;
+}
+
+fn indexOf(vars: []const Var, v: Var) usize {
+    return std.mem.indexOfScalar(Var, vars, v).?;
+}
+
+// =============================================================================
+// The corpus
+// =============================================================================
+
+const rules_src =
+    \\[[(friend ?a ?b) [?a :person/friend ?b]]
+    \\ [(friend ?a ?b) [?b :person/friend ?a]]
+    \\ [(admin ?p) [?p :person/role :role/admin]]
+    \\ [(reach ?a ?b) [?a :edge/to ?b]]
+    \\ [(reach ?a ?b) (reach ?a ?m) [?m :edge/to ?b]]
+    \\ [(reach-left ?a ?b) [?a :edge/to ?b]]
+    \\ [(reach-left ?a ?b) [?a :edge/to ?m] (reach-left ?m ?b)]
+    \\ [(even-hops ?a ?b) [?a :edge/to ?m] (odd-hops ?m ?b)]
+    \\ [(odd-hops ?a ?b) [?a :edge/to ?b]]
+    \\ [(odd-hops ?a ?b) [?a :edge/to ?m] (even-hops ?m ?b)]
+    \\ [(labeled ?n ?l) [?n :node/label ?l]]
+    \\ [(reach-label [?a] ?l) (reach ?a ?b) (labeled ?b ?l)]
+    \\ [(older ?p ?q) [?p :person/age ?x] [?q :person/age ?y] [(> ?x ?y)]]
+    \\ [(has-tag ?p ?t) [?p :person/tags ?t]]
+    \\ [(has-tag ?p ?t) (friend ?p ?f) [?f :person/tags ?t]]]
+;
+
+test "corpus: patterns, constants, joins, predicates, functions, aggregates, find specs" {
+    const fx = try Fx.init("q_corpus");
+    defer fx.deinit();
+    try loadCorpus(fx);
+    const dbv = try fx.db();
+    const none: []const Value = &.{value.nilValue()};
+
+    // Constants in every position, wildcards, single patterns.
+    try checkCount(fx, dbv, "[:find ?e ?n :where [?e :person/name ?n]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/name \"Ann\"]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/age 30]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/height 1.8]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/active true]]", none, 3);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/tags :blue]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/role :role/admin]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?a ?v :where [[:person/email \"bob@x\"] ?a ?v]]", none, 9);
+    try checkCount(fx, dbv, "[:find ?v :where [[:person/email \"ann@x\"] :person/tags ?v]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/friend [:person/email \"ann@x\"]]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/boss [:person/email \"ann@x\"]]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?e :where [?e _ [:person/email \"cy@x\"]]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?a :where [:person/name ?a _]]", none, 4);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/age _]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/name]]", none, 6);
+    try testing.expectError(error.UnknownAttribute, runEngine(fx, fx.arena(), dbv, "[:find ?e :where [?e :person/nope ?v]]", none));
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/name 42]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/tags :nowhere/kw]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/friend [:person/email \"nobody\"]]]", none, 0);
+
+    // Long strings (out of line) match by value.
+    const bio = try std.fmt.allocPrint(fx.arena(), "[:find ?e :where [?e :person/bio \"{s}\"]]", .{long_bio_a});
+    try checkCount(fx, dbv, bio, none, 1);
+    const bio_x = try std.fmt.allocPrint(fx.arena(), "[:find ?e :where [?e :person/bio \"{s}\"]]", .{long_bio_x});
+    try checkCount(fx, dbv, bio_x, none, 0);
+    try checkCount(fx, dbv, "[:find ?e ?b :where [?e :person/bio ?b]]", none, 2);
+
+    // Multi-way joins in both directions.
+    try checkCount(fx, dbv, "[:find ?n ?fn :where [?e :person/name ?n] [?e :person/friend ?f] [?f :person/name ?fn]]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n ?bn :where [?e :person/boss ?b] [?b :person/name ?bn] [?e :person/name ?n]]", none, 3);
+    try checkCount(fx, dbv, "[:find ?n ?num ?st :where [?o :order/customer ?c] [?c :person/name ?n] [?o :order/number ?num] [?o :order/status ?st]]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n :where [?o :order/status :status/shipped] [?o :order/customer ?c] [?c :person/name ?n]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?n :where [?c :person/name ?n] [?o :order/customer ?c] [?o :order/items \"apple\"]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?e ?f :where [?e :person/friend ?f] [?f :person/friend ?e]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/friend ?f] [?e :person/boss ?f]]", none, 3);
+    try checkCount(fx, dbv, "[:find ?a ?b :where [?a :person/age ?x] [?b :person/age ?x] [(not= ?a ?b)]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?e ?tx :where [?e :person/name \"Flo\" ?tx]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?e ?t :where [?e :person/name \"Flo\" ?tx] [?tx :db/txInstant ?t]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/name \"Flo\" 6]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/name \"Ann\" 6]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?e ?added :where [?e :person/name \"Ann\" _ ?added]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/name \"Ann\" _ true]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?e :where [?e :person/name \"Ann\" _ false]]", none, 0);
+
+    // Predicates.
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/age ?a] [(< ?a 30)] [?e :person/name ?n]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/age ?a] [(>= ?a 30)] [(<= ?a 41)] [?e :person/name ?n]]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(> ?n \"C\")]]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/height ?h] [(< 1.66 ?h)] [?e :person/name ?n]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(= ?n \"Cy\")]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(not= ?n \"Cy\")]]", none, 5);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(missing? $ ?e :person/bio)]]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(even? ?e)]]", none, 3);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/age ?a] [?e :person/name ?n] [(< 20 ?a 31)]]", none, 3);
+
+    // Function bindings, every binding form.
+    try checkCount(fx, dbv, "[:find ?n ?a1 :where [?e :person/age ?a] [(inc ?a) ?a1] [?e :person/name ?n]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?s :where [?e :person/name ?n] [?e :person/age ?a] [(str ?n \"-\" ?a) ?s]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?u :where [?e :person/name ?n] [(upper ?n) ?u]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?n ?i :where [?e :person/name ?n] [(range 3) [?i ...]]]", none, 18);
+    try checkCount(fx, dbv, "[:find ?n ?x ?y :where [?e :person/name ?n] [?e :person/age ?a] [(pair ?a ?n) [?x ?y]]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?n ?h :where [?e :person/name ?n] [?e :person/age ?a] [(halves ?a) [[_ ?h]]]]", none, 12);
+    try checkCount(fx, dbv, "[:find ?n ?m :where [?e :person/name ?n] [?e :person/age ?a] [(maybe ?a) ?m]]", none, 3);
+    try checkCount(fx, dbv, "[:find ?n ?b :where [?e :person/name ?n] [(get-else $ ?e :person/bio \"none\") ?b]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?x :where [(ground 7) ?x]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?x :where [(ground [1 2 3]) [?x ...]]]", none, 3);
+    try checkCount(fx, dbv, "[:find ?x ?y :where [(ground [[1 2] [3 4]]) [[?x ?y]]]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?t :where [?e :person/name \"Ann\"] [?e :person/age ?a] [(tuple ?a \"x\") ?t]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?a ?b :where [(ground [10 20]) ?t] [(untuple ?t) [?a ?b]]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?n ?a2 :where [?e :person/name ?n] [?e :person/age ?a] [(add ?a ?a) ?a2] [(> ?a2 60)]]", none, 3);
+
+    // Aggregates and :with.
+    try checkCount(fx, dbv, "[:find (count ?e) :where [?e :person/name _]]", none, 1);
+    try checkCount(fx, dbv, "[:find (count ?a) :where [_ :person/age ?a]]", none, 1);
+    try checkCount(fx, dbv, "[:find (count ?a) :with ?e :where [?e :person/age ?a]]", none, 1);
+    try checkCount(fx, dbv, "[:find (sum ?a) (min ?a) (max ?a) (avg ?a) (count-distinct ?a) :with ?e :where [?e :person/age ?a]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?st (sum ?t) :where [?o :order/status ?st] [?o :order/total ?t]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?n (count ?o) :where [?o :order/customer ?c] [?c :person/name ?n]]", none, 3);
+    try checkCount(fx, dbv, "[:find ?n (distinct ?i) :where [?o :order/customer ?c] [?c :person/name ?n] [?o :order/items ?i]]", none, 3);
+    try checkCount(fx, dbv, "[:find (max ?n) :where [_ :person/name ?n]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?t :with ?o :where [?o :order/status :status/open] [?o :order/total ?t]]", none, 2);
+
+    // Find specs (the row shape is the same; the value shape is checked below).
+    try checkCount(fx, dbv, "[:find ?n . :where [?e :person/name ?n] [?e :person/age 55]]", none, 1);
+    try checkCount(fx, dbv, "[:find [?n ...] :where [?e :person/name ?n]]", none, 6);
+    try checkCount(fx, dbv, "[:find [?n ?a] :where [?e :person/name ?n] [?e :person/age ?a] [?e :person/email \"cy@x\"]]", none, 1);
+    try checkCount(fx, dbv, "[:find (count ?e) . :where [?e :person/tags :green]]", none, 1);
+    try checkCount(fx, dbv, "[:find [(min ?a) (max ?a)] :where [_ :person/age ?a]]", none, 1);
+
+    // Map form.
+    try checkCount(fx, dbv, "{:find [?n] :where [[?e :person/name ?n] [?e :person/tags :green]]}", none, 2);
+}
+
+test "corpus: every :in form" {
+    const fx = try Fx.init("q_in");
+    defer fx.deinit();
+    try loadCorpus(fx);
+    const dbv = try fx.db();
+    const nil = value.nilValue();
+
+    try checkCount(fx, dbv, "[:find ?e :in $ ?n :where [?e :person/name ?n]]", &.{ nil, try fx.str("Cy") }, 1);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e :person/age ?a]]", &.{ nil, value.fromFixnum(30).? }, 2);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?t :where [?e :person/tags ?t]]", &.{ nil, value.fromKeywordId(try fx.kw("green")) }, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, value.fromFixnum(@intCast(key.user_partition_start)).? }, 1);
+    try checkCount(fx, dbv, "[:find ?e :in $ [?n ...] :where [?e :person/name ?n]]", &.{ nil, try fx.read("[\"Ann\" \"Bob\" \"Nobody\"]") }, 2);
+    try checkCount(fx, dbv, "[:find ?e :in $ [?n ?a] :where [?e :person/name ?n] [?e :person/age ?a]]", &.{ nil, try fx.read("[\"Ann\" 30]") }, 1);
+    try checkCount(fx, dbv, "[:find ?e :in $ [?n _] :where [?e :person/name ?n]]", &.{ nil, try fx.read("[\"Ann\" 99]") }, 1);
+    try checkCount(fx, dbv, "[:find ?e ?a :in $ [[?n ?a]] :where [?e :person/name ?n] [?e :person/age ?a]]", &.{ nil, try fx.read("[[\"Ann\" 30] [\"Bob\" 26] [\"Bob\" 1]]") }, 2);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?lo ?hi :where [?e :person/age ?a] [(< ?lo ?a ?hi)]]", &.{ nil, value.fromFixnum(29).?, value.fromFixnum(34).? }, 3);
+    try checkCount(fx, dbv, "[:find ?n ?x :in $ [?x ...] :where [?e :person/name ?n] [?e :person/age ?a] [(< ?a ?x)]]", &.{ nil, try fx.read("[27 31]") }, 4);
+    try checkCount(fx, dbv, "[:find ?p :in $ % :where (admin ?p)]", &.{ nil, try fx.read(rules_src) }, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ % ?t :where (has-tag ?p ?t) [?p :person/name ?n]]", &.{ nil, try fx.read(rules_src), value.fromKeywordId(try fx.kw("green")) }, 4);
+    try checkCount(fx, dbv, "[:find ?x :in $ ?x]", &.{ nil, value.fromFixnum(5).? }, 1);
+    try checkCount(fx, dbv, "[:find ?x ?y :in $ [?x ...] [?y ...]]", &.{ nil, try fx.read("[1 2]"), try fx.read("[3 4 3]") }, 4);
+    // Wrong input count and shape.
+    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?e :in $ ?n :where [?e :person/name ?n]]", &.{nil}));
+    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?e :in $ [?n ...] :where [?e :person/name ?n]]", &.{ nil, value.fromFixnum(1).? }));
+}
+
+test "corpus: not, not-join, or, or-join, and" {
+    const fx = try Fx.init("q_notor");
+    defer fx.deinit();
+    try loadCorpus(fx);
+    const dbv = try fx.db();
+    const none: []const Value = &.{value.nilValue()};
+
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (not [?e :person/tags _])]", none, 2);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (not [?e :person/tags :blue])]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (not [?e :person/friend ?f] [?f :person/age 30])]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (not-join [?e] [?e :person/friend ?f] [?f :person/age 30])]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] (not [?e :person/boss ?b] [?b :person/age ?a])]", none, 6);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (not [(missing? $ ?e :person/bio)])]", none, 2);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (not (not [?e :person/tags _]))]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (or [?e :person/tags :green] [?e :person/age 30])]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (or-join [?e] [?e :person/tags :green] (and [?e :person/age ?a] [(< ?a 30)]))]", none, 3);
+    try checkCount(fx, dbv, "[:find ?n :where (or [?e :person/tags :green] [?e :person/age 30]) [?e :person/name ?n]]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (or-join [?e] [?e :person/friend ?f] (and [?e :person/boss ?b] [?b :person/tags :red]))]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n ?w :where [?e :person/name ?n] (or-join [?e ?w] (and [?e :person/tags ?w]) (and [?e :person/role ?w]))]", none, 8);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (or (and [?e :person/age ?a] [(> ?a 40)]) (and [?e :person/age ?a] [(< ?a 27)]))]", none, 3);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (or [?e :person/tags :blue] (not [?e :person/friend _]))]", none, 3);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (not (or [?e :person/tags :blue] [?e :person/tags :green]))]", none, 2);
+    try checkCount(fx, dbv, "[:find ?n :where (and [?e :person/name ?n] [?e :person/active true])]", none, 3);
+    try checkCount(fx, dbv, "[:find ?o :where (or-join [?o] (and [?o :order/total ?t] [(> ?t 50.0)]) [?o :order/items \"pear\"])]", none, 2);
+    // Errors: not with nothing bound outside, or branches with different vars, unbound pattern.
+    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?n :where [?e :person/name ?n] (not [?x :person/tags :blue])]", none));
+    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?n :where [?e :person/name ?n] (or [?e :person/tags :blue] [?x :person/tags :green])]", none));
+    try testing.expectError(error.UnboundPattern, runEngine(fx, fx.arena(), dbv, "[:find ?e :where [?e ?a ?v]]", none));
+    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?e :where [?e :person/name ?n] [(< ?zz 3)]]", none));
+}
+
+test "corpus: rules" {
+    const fx = try Fx.init("q_rules");
+    defer fx.deinit();
+    try loadCorpus(fx);
+    const dbv = try fx.db();
+    const rules = try fx.read(rules_src);
+    const args: []const Value = &.{ value.nilValue(), rules };
+
+    // Non-recursive, both directions, constants and bound args.
+    try checkCount(fx, dbv, "[:find ?a ?b :in $ % :where (friend ?a ?b)]", args, 8);
+    try checkCount(fx, dbv, "[:find ?n :in $ % :where [?a :person/name \"Ann\"] (friend ?a ?b) [?b :person/name ?n]]", args, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ % :where [?b :person/email \"bob@x\"] (friend ?a ?b) [?a :person/name ?n]]", args, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ % :where (admin ?p) [?p :person/name ?n]]", args, 2);
+    try checkCount(fx, dbv, "[:find ?n ?t :in $ % :where (has-tag ?p ?t) [?p :person/name ?n]]", args, 11);
+    try checkCount(fx, dbv, "[:find ?n :in $ % :where [?f :person/email \"flo@x\"] (older ?p ?f) [?p :person/name ?n]]", args, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ % :where [?p :person/name ?n] (not (admin ?p))]", args, 4);
+    try checkCount(fx, dbv, "[:find ?n :in $ % :where [?p :person/name ?n] (or (admin ?p) (has-tag ?p :green))]", args, 4);
+    // Recursive: pass-through push-down, no push-down, cycles, mutual recursion, required args.
+    try checkCount(fx, dbv, "[:find ?a ?b :in $ % :where (reach ?a ?b)]", args, 16);
+    try checkCount(fx, dbv, "[:find ?l :in $ % :where [?a :node/label \"n4\"] (reach ?a ?b) [?b :node/label ?l]]", args, 1);
+    try checkCount(fx, dbv, "[:find ?l :in $ % :where [?a :node/label \"n1\"] (reach ?a ?b) [?b :node/label ?l]]", args, 5);
+    try checkCount(fx, dbv, "[:find ?l :in $ % :where [?a :node/label \"n1\"] (reach-left ?a ?b) [?b :node/label ?l]]", args, 5);
+    try checkCount(fx, dbv, "[:find ?l :in $ % :where [?b :node/label \"n5\"] (reach-left ?a ?b) [?a :node/label ?l]]", args, 4);
+    try checkCount(fx, dbv, "[:find ?l :in $ % :where [?b :node/label \"n5\"] (reach ?a ?b) [?a :node/label ?l]]", args, 4);
+    try checkCount(fx, dbv, "[:find ?a ?b :in $ % :where (even-hops ?a ?b)]", args, 15);
+    try checkCount(fx, dbv, "[:find ?a ?b :in $ % :where (odd-hops ?a ?b)]", args, 16);
+    try checkCount(fx, dbv, "[:find ?l :in $ % :where [?a :node/label \"n1\"] (even-hops ?a ?b) [?b :node/label ?l]]", args, 5);
+    try checkCount(fx, dbv, "[:find ?l :in $ % :where [?a :node/label \"n2\"] (reach-label ?a ?l)]", args, 5);
+    try checkCount(fx, dbv, "[:find ?l :in $ % :where [?a :node/label \"n4\"] (reach-label ?a ?l)]", args, 1);
+    try checkCount(fx, dbv, "[:find ?l :in $ % :where [?n :node/label ?l] (not (reach ?n ?n))]", args, 3);
+    try checkCount(fx, dbv, "[:find ?l :in $ % :where [?n :node/label ?l] (reach ?n ?n)]", args, 3);
+    try checkCount(fx, dbv, "[:find (count ?b) :in $ % :where [?a :node/label \"n3\"] (reach ?a ?b)]", args, 1);
+    // Errors: unknown rule, arity, required argument unbound.
+    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?a :in $ % :where (nope ?a)]", args));
+    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?a :in $ % :where (admin ?a ?b)]", args));
+    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?a ?l :in $ % :where (reach-label ?a ?l)]", args));
+}
+
+test "corpus: as-of, since, history views" {
+    const fx = try Fx.init("q_time");
+    defer fx.deinit();
+    try loadCorpus(fx);
+    const now = try fx.db();
+    const none: []const Value = &.{value.nilValue()};
+
+    const before = now.asOf(5);
+    try checkCount(fx, before, "[:find ?e ?n :where [?e :person/name ?n]]", none, 5);
+    try checkCount(fx, before, "[:find ?e :where [?e :person/name \"Ed\"]]", none, 1);
+    try checkCount(fx, before, "[:find ?e :where [?e :person/age 25]]", none, 1);
+    try checkCount(fx, before, "[:find ?t :where [[:person/email \"ann@x\"] :person/tags ?t]]", none, 2);
+    try checkCount(fx, before, "[:find ?n ?fn :where [?e :person/name ?n] [?e :person/friend ?f] [?f :person/name ?fn]]", none, 4);
+    try checkCount(fx, before, "[:find ?n :where [?e :person/name ?n] (not [?e :person/friend _])]", none, 2);
+    try checkCount(fx, now.asOf(3), "[:find ?o :where [?o :order/number _]]", none, 0);
+    try checkCount(fx, now.asOf(2), "[:find ?e :where [?e :person/name _]]", none, 0);
+
+    const since = now.sinceT(5);
+    try checkCount(fx, since, "[:find ?e ?n :where [?e :person/name ?n]]", none, 2);
+    try checkCount(fx, since, "[:find ?e ?a :where [?e :person/age ?a]]", none, 2);
+    try checkCount(fx, since, "[:find ?e :where [?e :person/tags _]]", none, 0);
+    try checkCount(fx, since, "[:find ?n ?fn :where [?e :person/name ?n] [?e :person/friend ?f] [?f :person/name ?fn]]", none, 0);
+    try checkCount(fx, now.sinceT(0), "[:find ?e ?n :where [?e :person/name ?n]]", none, 6);
+
+    const hist = now.withHistory();
+    try checkCount(fx, hist, "[:find ?v ?added :where [[:person/email \"bob@x\"] :person/age ?v _ ?added]]", none, 3);
+    try checkCount(fx, hist, "[:find ?v ?tx ?added :where [[:person/email \"ed@x\"] :person/name ?v ?tx ?added]]", none, 3);
+    try checkCount(fx, hist, "[:find ?e :where [?e :person/tags :red _ false]]", none, 1);
+    try checkCount(fx, hist, "[:find ?e ?f :where [?e :person/friend ?f _ false]]", none, 1);
+    try checkCount(fx, hist, "[:find ?e :where [?e :person/name \"Ed\"]]", none, 1);
+    try checkCount(fx, hist, "[:find (count ?tx) :where [_ :person/age _ ?tx]]", none, 1);
+    try checkCount(fx, hist, "[:find ?n :where [?e :person/name ?n _ true] [?e :person/age 25 _ ?added]]", none, 1);
+    try checkCount(fx, hist.asOf(5), "[:find ?v ?added :where [[:person/email \"bob@x\"] :person/age ?v _ ?added]]", none, 1);
+    try checkCount(fx, hist, "[:find ?n :where [?e :person/name ?n] (not [?e :person/name _ _ false])]", none, 5);
+}
+
+test "results materialise as set, scalar, collection, tuple; caches; explain" {
+    const fx = try Fx.init("q_values");
+    defer fx.deinit();
+    try loadCorpus(fx);
+    const dbv = try fx.db();
+    const none: []const Value = &.{value.nilValue()};
+    var diag: query.Diag = .{};
+    var cache = query.Cache.init(testing.allocator);
+    defer cache.deinit();
+    var rules_cache = query.RulesCache.init(testing.allocator);
+    defer rules_cache.deinit();
+    const opts: query.Options = .{ .hook = fx.hook(), .ir_cache = &cache, .rules_cache = &rules_cache };
+
+    const rel_q = try fx.read("[:find ?n ?a :where [?e :person/name ?n] [?e :person/age ?a] [(< ?a 31)]]");
+    const set = try query.q(testing.allocator, fx.interner(), &fx.heap, rel_q, dbv, none, &diag, opts);
+    try testing.expect(set.kind() == .persistent_set);
+    try testing.expectEqual(@as(usize, 3), champ.setCount(set));
+    const probe = try fx.read("[\"Bob\" 26]");
+    try testing.expect(champ.setContains(set, probe, &dispatch.hashValue, &dispatch.equal));
+
+    const scalar = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n . :where [?e :person/age 55] [?e :person/name ?n]]"), dbv, none, &diag, opts);
+    try testing.expectEqualStrings("Edward", string_mod.asBytes(scalar));
+    const nothing = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n . :where [?e :person/age 99] [?e :person/name ?n]]"), dbv, none, &diag, opts);
+    try testing.expect(nothing.isNil());
+
+    const coll = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [?t ...] :where [_ :person/tags ?t]]"), dbv, none, &diag, opts);
+    try testing.expect(coll.kind() == .persistent_vector);
+    try testing.expectEqual(@as(usize, 3), vector_mod.count(coll));
+
+    const tuple = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [?n ?a] :where [?e :person/email \"cy@x\"] [?e :person/name ?n] [?e :person/age ?a]]"), dbv, none, &diag, opts);
+    try testing.expect(tuple.kind() == .persistent_vector);
+    try testing.expectEqualStrings("Cy", string_mod.asBytes(vector_mod.nth(tuple, 0)));
+    try testing.expectEqual(@as(i64, 41), vector_mod.nth(tuple, 1).asFixnum());
+
+    const agg = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [(sum ?a) (count ?e) (avg ?a) (distinct ?a)] :where [?e :person/age ?a]]"), dbv, none, &diag, opts);
+    try testing.expectEqual(@as(i64, 30 + 26 + 41 + 30 + 55 + 33), vector_mod.nth(agg, 0).asFixnum());
+    try testing.expectEqual(@as(i64, 6), vector_mod.nth(agg, 1).asFixnum());
+    try testing.expectApproxEqAbs(@as(f64, 215.0 / 6.0), vector_mod.nth(agg, 2).asFloat(), 1e-9);
+    try testing.expectEqual(@as(usize, 5), champ.setCount(vector_mod.nth(agg, 3)));
+
+    // Keyword and string values come back as VM values; the cache serves repeats.
+    const kws = try query.q(testing.allocator, fx.interner(), &fx.heap, rel_q, dbv, none, &diag, opts);
+    try testing.expectEqual(@as(usize, 3), champ.setCount(kws));
+    try testing.expectEqual(@as(usize, 6), cache.count());
+    const rules_q = try fx.read("[:find [?n ...] :in $ % :where (admin ?p) [?p :person/name ?n]]");
+    const rules_v = try fx.read(rules_src);
+    const admins = try query.q(testing.allocator, fx.interner(), &fx.heap, rules_q, dbv, &.{ value.nilValue(), rules_v }, &diag, opts);
+    try testing.expectEqual(@as(usize, 2), vector_mod.count(admins));
+    _ = try query.q(testing.allocator, fx.interner(), &fx.heap, rules_q, dbv, &.{ value.nilValue(), rules_v }, &diag, opts);
+    try testing.expectEqual(@as(usize, 1), rules_cache.count());
+
+    // A syntax error reports its clause.
+    try testing.expectError(error.QuerySyntax, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?e :where [?e :person/name ?n] [?e bogus]]"), dbv, none, &diag, opts));
+    try testing.expectEqual(@as(?usize, 1), diag.clause);
+
+    // The hook's control transfer aborts the query and propagates.
+    try testing.expectError(error.ControlTransferred, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n :where [?e :person/name ?n] [(boom ?n)]]"), dbv, none, &diag, opts));
+    // The read transaction was closed: a transaction still commits.
+    _ = try fx.transact("[{:db/id [:person/email \"flo@x\"] :person/age 34}]");
+
+    // Explain.
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :in $ % :where [?e :person/age 30] [?e :person/name ?n] (not [?e :person/tags :red]) (admin ?e) [(< 1 2)]]"), dbv, &.{ value.nilValue(), rules_v }, &diag, opts, &out.writer);
+    const text = out.written();
+    try testing.expect(std.mem.indexOf(u8, text, "1. pred (< 1 2)") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "2. scan [?e :person/age 30 _ _] aevt") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "scan [?e! :person/name ?n _ _] eavt est=1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "not-join [?e]") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "or-join [?e] branches=1") != null);
+}
+
+test "transitive closure over a 5k-edge chain" {
+    const fx = try Fx.init("q_chain");
+    defer fx.deinit();
+    _ = try fx.transact(
+        \\[{:db/ident :node/id :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/index true}
+        \\ {:db/ident :node/next :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}]
+    );
+    const n: usize = 5001;
+    var ops: std.ArrayList(nextomic.Op) = .empty;
+    const id_attr = (try fx.conn().idents.idOfName(blk: {
+        const t = try fx.conn().store.beginRead();
+        defer t.abort();
+        break :blk t;
+    }, "node/id")).?;
+    const next_attr = (try fx.conn().idents.idOfName(blk: {
+        const t = try fx.conn().store.beginRead();
+        defer t.abort();
+        break :blk t;
+    }, "node/next")).?;
+    for (0..n) |i| {
+        const me: nextomic.transact.Entity = .{ .tempid = .{ .fixnum = -@as(i64, @intCast(i + 1)) } };
+        try ops.append(fx.arena(), .{ .add = .{ .e = me, .a = .{ .id = id_attr }, .v = .{ .val = .{ .long = @intCast(i) } } } });
+        if (i + 1 < n) try ops.append(fx.arena(), .{ .add = .{ .e = me, .a = .{ .id = next_attr }, .v = .{ .entity = .{ .tempid = .{ .fixnum = -@as(i64, @intCast(i + 2)) } } } } });
+    }
+    _ = try nextomic.transact.transactOps(fx.conn(), fx.arena(), ops.items, .{});
+    const dbv = try fx.db();
+    const rules = try fx.read(
+        \\[[(reach ?a ?b) [?a :node/next ?b]]
+        \\ [(reach ?a ?b) (reach ?a ?m) [?m :node/next ?b]]
+        \\ [(back ?a ?b) [?a :node/next ?b]]
+        \\ [(back ?a ?b) [?a :node/next ?m] (back ?m ?b)]]
+    );
+    const args: []const Value = &.{ value.nilValue(), rules };
+    const arena = fx.arena();
+
+    // Forward closure from the head, pushed down on the pass-through position.
+    const all = try runEngine(fx, arena, dbv, "[:find ?id :in $ % :where [?s :node/id 0] (reach ?s ?b) [?b :node/id ?id]]", args);
+    try testing.expectEqual(n - 1, all.len);
+    var sum: i64 = 0;
+    for (all) |row| sum += row[0].int;
+    try testing.expectEqual(@as(i64, @intCast((n - 1) * n / 2)), sum);
+    const tail = try runEngine(fx, arena, dbv, "[:find ?id :in $ % :where [?s :node/id 4990] (reach ?s ?b) [?b :node/id ?id]]", args);
+    try testing.expectEqual(@as(usize, 10), tail.len);
+    // Backward closure to a bound end through the right-recursive rule (position 1 passes through).
+    const head = try runEngine(fx, arena, dbv, "[:find ?id :in $ % :where [?e :node/id 10] (back ?a ?e) [?a :node/id ?id]]", args);
+    try testing.expectEqual(@as(usize, 10), head.len);
+    // Both ends bound.
+    const both = try runEngine(fx, arena, dbv, "[:find ?s ?e :in $ % :where [?s :node/id 100] [?e :node/id 4000] (reach ?s ?e)]", args);
+    try testing.expectEqual(@as(usize, 1), both.len);
+    const none_ = try runEngine(fx, arena, dbv, "[:find ?s ?e :in $ % :where [?s :node/id 4000] [?e :node/id 100] (reach ?s ?e)]", args);
+    try testing.expectEqual(@as(usize, 0), none_.len);
+}
+
+test "benchmark: 200k datoms, three-way join" {
+    const fx = try Fx.init("q_bench");
+    defer fx.deinit();
+    _ = try fx.transact(
+        \\[{:db/ident :emp/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :emp/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/index true}
+        \\ {:db/ident :emp/dept :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :emp/salary :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :emp/active :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :dept/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}]
+    );
+    const txn0 = try fx.conn().store.beginRead();
+    const a_name = (try fx.conn().idents.idOfName(txn0, "emp/name")).?;
+    const a_age = (try fx.conn().idents.idOfName(txn0, "emp/age")).?;
+    const a_dept = (try fx.conn().idents.idOfName(txn0, "emp/dept")).?;
+    const a_salary = (try fx.conn().idents.idOfName(txn0, "emp/salary")).?;
+    const a_active = (try fx.conn().idents.idOfName(txn0, "emp/active")).?;
+    const a_dname = (try fx.conn().idents.idOfName(txn0, "dept/name")).?;
+    txn0.abort();
+
+    const depts: usize = 20;
+    var dept_ops: std.ArrayList(nextomic.Op) = .empty;
+    for (0..depts) |i| {
+        const name = try std.fmt.allocPrint(fx.arena(), "d{d}", .{i});
+        try dept_ops.append(fx.arena(), .{ .add = .{ .e = .{ .tempid = .{ .fixnum = -@as(i64, @intCast(i + 1)) } }, .a = .{ .id = a_dname }, .v = .{ .val = .{ .string = name } } } });
+    }
+    const dept_report = try nextomic.transact.transactOps(fx.conn(), fx.arena(), dept_ops.items, .{});
+    const dept_eids = try fx.arena().alloc(u64, depts);
+    for (dept_report.tempids) |b| dept_eids[@intCast(-b.key.fixnum - 1)] = b.eid;
+
+    const emps: usize = 40_000;
+    const batch: usize = 5_000;
+    var start: usize = 0;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    while (start < emps) : (start += batch) {
+        var ops: std.ArrayList(nextomic.Op) = .empty;
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        for (start..start + batch) |i| {
+            const me: nextomic.transact.Entity = .{ .tempid = .{ .fixnum = -@as(i64, @intCast(i + 1)) } };
+            const name = try std.fmt.allocPrint(arena, "emp-{d}", .{i});
+            try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_name }, .v = .{ .val = .{ .string = name } } } });
+            try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_age }, .v = .{ .val = .{ .long = 20 + @as(i64, @intCast(rnd.uintLessThan(u32, 45))) } } } });
+            try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_dept }, .v = .{ .val = .{ .ref = dept_eids[i % depts] } } } });
+            try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_salary }, .v = .{ .val = .{ .long = 1000 + @as(i64, @intCast(rnd.uintLessThan(u32, 9000))) } } } });
+            try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_active }, .v = .{ .val = .{ .boolean = i % 3 == 0 } } } });
+        }
+        _ = try nextomic.transact.transactOps(fx.conn(), arena, ops.items, .{});
+    }
+    const dbv = try fx.db();
+    const none: []const Value = &.{value.nilValue()};
+    var diag: query.Diag = .{};
+    const opts: query.Options = .{};
+
+    const q3 = try fx.read("[:find ?n ?dn :where [?d :dept/name \"d7\"] [?e :emp/dept ?d] [?e :emp/name ?n] [?d :dept/name ?dn]]");
+    const q_age = try fx.read("[:find ?n ?dn :where [?e :emp/age 33] [?e :emp/dept ?d] [?d :dept/name ?dn] [?e :emp/name ?n]]");
+    const q_hash = try fx.read("[:find (count ?e) . :where [?e :emp/active true] [?e :emp/dept ?d] [?d :dept/name \"d3\"]]");
+
+    // Warm, then time; rows first (no heap copy), then the full call.
+    _ = try query.q(testing.allocator, fx.interner(), &fx.heap, q3, dbv, none, &diag, opts);
+    const r0 = nowNs();
+    const rows3 = try runEngine(fx, fx.arena(), dbv, "[:find ?n ?dn :where [?d :dept/name \"d7\"] [?e :emp/dept ?d] [?e :emp/name ?n] [?d :dept/name ?dn]]", none);
+    const r1 = nowNs();
+    try testing.expectEqual(emps / depts, rows3.len);
+    const t0 = nowNs();
+    const r3 = try query.q(testing.allocator, fx.interner(), &fx.heap, q3, dbv, none, &diag, opts);
+    const t1 = nowNs();
+    const r_age = try query.q(testing.allocator, fx.interner(), &fx.heap, q_age, dbv, none, &diag, opts);
+    const t2 = nowNs();
+    const r_hash = try query.q(testing.allocator, fx.interner(), &fx.heap, q_hash, dbv, none, &diag, opts);
+    const t3 = nowNs();
+    try testing.expectEqual(emps / depts, champ.setCount(r3));
+    try testing.expect(champ.setCount(r_age) > 0);
+    try testing.expect(r_hash.asFixnum() > 0);
+    std.debug.print("\n[bench] 200k datoms, {d} employees / {d} departments\n", .{ emps, depts });
+    std.debug.print("[bench] 3-way join by department (dept -> vaet -> eavt), {d} rows: {d} us to rows, {d} us with the result set\n", .{ champ.setCount(r3), (r1 - r0) / 1000, (t1 - t0) / 1000 });
+    std.debug.print("[bench] 3-way join by age (avet -> eavt -> eavt), {d} rows: {d} us\n", .{ champ.setCount(r_age), (t2 - t1) / 1000 });
+    std.debug.print("[bench] active count by department (aevt scan + hash join), {d} rows: {d} us\n", .{ r_hash.asFixnum(), (t3 - t2) / 1000 });
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try query.explain(testing.allocator, fx.interner(), q3, dbv, none, &diag, opts, &out.writer);
+    std.debug.print("[bench] plan:\n{s}", .{out.written()});
+}
+
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
