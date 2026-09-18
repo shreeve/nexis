@@ -18,12 +18,20 @@
 //! leaves the struct allocated so db-values still pointing at it raise
 //! `:nextomic/closed`; VM teardown destroys every connection through
 //! `closeCallback`.
+//!
+//! Per-VM state (`State`): the parsed-query caches and every finished
+//! `with` scope, created on first use and destroyed at VM teardown
+//! through `vm.nextomic_query_close`. A scope's arena holds the view
+//! `Conn` that its db-values name, so it outlives the scope the way a
+//! released connection's struct does: after `finish` the view answers
+//! `:nextomic/closed`.
 
 const std = @import("std");
 const value = @import("value");
 const vm_mod = @import("vm");
 const heap_mod = @import("heap");
 const string_mod = @import("string");
+const list_mod = @import("list");
 const vector_mod = @import("vector");
 const champ = @import("champ");
 const dispatch = @import("dispatch");
@@ -36,6 +44,8 @@ const store_mod = @import("store.zig");
 const schema_mod = @import("schema.zig");
 const db_mod = @import("db.zig");
 const transact_mod = @import("transact.zig");
+const pull_mod = @import("pull.zig");
+const query = @import("query.zig");
 const query_natives = @import("query/natives.zig");
 
 const Allocator = std.mem.Allocator;
@@ -55,6 +65,7 @@ const Datom = datom_mod.Datom;
 const Attr = schema_mod.Attr;
 const SyncMode = store_mod.SyncMode;
 const boot = store_mod.boot;
+const Diag = pull_mod.Diag;
 
 // =============================================================================
 // Installation
@@ -78,6 +89,9 @@ const natives = [_]Entry{
     .{ .name = "tx-range", .descriptor = &native_tx_range },
     .{ .name = "schema", .descriptor = &native_schema },
     .{ .name = "sync", .descriptor = &native_sync },
+    .{ .name = "pull", .descriptor = &native_pull },
+    .{ .name = "pull-many", .descriptor = &native_pull_many },
+    .{ .name = "with", .descriptor = &native_with },
 };
 
 /// Install the `nextomic/*` natives into `ns`, then the query natives
@@ -106,13 +120,56 @@ const native_history = NativeFn{ .name = "nextomic/history", .min_arity = 1, .ma
 const native_tx_range = NativeFn{ .name = "nextomic/tx-range", .min_arity = 1, .max_arity = 3, .call = &fnTxRange };
 const native_schema = NativeFn{ .name = "nextomic/schema", .min_arity = 1, .max_arity = 1, .call = &fnSchema };
 const native_sync = NativeFn{ .name = "nextomic/sync", .min_arity = 1, .max_arity = 1, .call = &fnSync };
+const native_pull = NativeFn{ .name = "nextomic/pull", .min_arity = 3, .max_arity = 3, .call = &fnPull };
+const native_pull_many = NativeFn{ .name = "nextomic/pull-many", .min_arity = 3, .max_arity = 3, .call = &fnPullMany };
+const native_with = NativeFn{ .name = "nextomic/with", .min_arity = 3, .max_arity = 3, .call = &fnWith };
+
+// =============================================================================
+// Per-VM state
+// =============================================================================
+
+pub const State = struct {
+    gpa: Allocator,
+    ir_cache: query.Cache,
+    rules_cache: query.RulesCache,
+    /// Finished `with` scopes. Each arena holds the view `Conn` that
+    /// the scope's db-values name, so it lives until VM teardown.
+    scopes: std.ArrayList(*std.heap.ArenaAllocator) = .empty,
+};
+
+/// The VM's state, created on first use.
+pub fn state(vm: *VM) !*State {
+    if (vm.nextomic_query_state) |p| return @ptrCast(@alignCast(p));
+    const s = try vm.allocator.create(State);
+    s.* = .{
+        .gpa = vm.allocator,
+        .ir_cache = query.Cache.init(vm.allocator),
+        .rules_cache = query.RulesCache.init(vm.allocator),
+    };
+    vm.nextomic_query_state = @ptrCast(s);
+    vm.nextomic_query_close = &closeState;
+    return s;
+}
+
+fn closeState(ptr: *anyopaque) void {
+    const s: *State = @ptrCast(@alignCast(ptr));
+    for (s.scopes.items) |scope| {
+        scope.deinit();
+        s.gpa.destroy(scope);
+    }
+    s.scopes.deinit(s.gpa);
+    s.ir_cache.deinit();
+    s.rules_cache.deinit();
+    s.gpa.destroy(s);
+}
 
 // =============================================================================
 // Errors (§7)
 // =============================================================================
 
 /// The keyword an error surfaces as: the `nextomic` set for the
-/// storage layer's own errors, the `db.zig` set for engine errors.
+/// storage, transaction and pull layers' own errors, the `db.zig` set
+/// for engine errors.
 pub fn errorKeyword(err: anyerror) []const u8 {
     return switch (err) {
         error.UnknownAttribute => "nextomic/unknown-attribute",
@@ -123,6 +180,9 @@ pub fn errorKeyword(err: anyerror) []const u8 {
         error.BasisInFuture => "nextomic/basis-in-future",
         error.Closed => "nextomic/closed",
         error.TxData => "nextomic/tx-data",
+        error.Nested => "nextomic/nested",
+        error.PullSyntax => "nextomic/pull-syntax",
+        error.HistoryView => "nextomic/history-view",
         error.Format, error.UnknownIdent => "db/corrupted",
         else => dblayer.failureName(err),
     };
@@ -130,16 +190,31 @@ pub fn errorKeyword(err: anyerror) []const u8 {
 
 /// Surface `err` to the program. VM errors pass through unchanged;
 /// everything else is thrown as its keyword.
-fn fail(vm: *VM, err: anyerror) VmError {
-    switch (err) {
-        error.OutOfMemory => return VmError.OutOfMemory,
-        error.KindMismatch => return VmError.KindMismatch,
-        error.InvalidArgument => return VmError.InvalidArgument,
-        error.ArithmeticOverflow => return VmError.ArithmeticOverflow,
-        error.ControlTransferred => return VmError.ControlTransferred,
-        error.UncaughtThrow => return VmError.UncaughtThrow,
-        else => return vm.throwKeyword(errorKeyword(err)),
+pub fn fail(vm: *VM, err: anyerror) VmError {
+    inline for (@typeInfo(VmError).error_set.?) |e| {
+        if (err == @field(anyerror, e.name)) return @field(VmError, e.name);
     }
+    return vm.throwKeyword(errorKeyword(err));
+}
+
+/// Throw the map a syntax error travels as (§7): `{:error name
+/// :message message :clause clause}`, `:clause` present when given.
+pub fn throwSyntax(vm: *VM, name: []const u8, message: []const u8, clause: ?usize) VmError {
+    const payload = syntaxPayload(vm, name, message, clause) catch return VmError.OutOfMemory;
+    return vm.throwValue(payload);
+}
+
+fn syntaxPayload(vm: *VM, name: []const u8, message: []const u8, clause: ?usize) !Value {
+    const heap = vm.ensureHeap();
+    const it = vm.ensureInterner();
+    var m = try champ.mapEmpty(heap);
+    m = try champ.mapAssoc(heap, m, try it.internKeywordValue("error"), try it.internKeywordValue(name), &dispatch.hashValue, &dispatch.equal);
+    m = try champ.mapAssoc(heap, m, try it.internKeywordValue("message"), try string_mod.fromBytes(heap, message), &dispatch.hashValue, &dispatch.equal);
+    if (clause) |c| {
+        const n = value.fromFixnum(@intCast(c)) orelse return error.ArithmeticOverflow;
+        m = try champ.mapAssoc(heap, m, try it.internKeywordValue("clause"), n, &dispatch.hashValue, &dispatch.equal);
+    }
+    return m;
 }
 
 // =============================================================================
@@ -413,10 +488,17 @@ fn transactNative(vm: *VM, args: []const Value) !Value {
     const arena = arena_state.allocator();
 
     const report = try transact_mod.transact(c, arena, args[1], options);
+    return reportMap(vm, c, arena, report);
+}
 
-    const txn = try c.store.beginRead();
+/// The report (§3): `{:db-before :db-after :tx :tempids :tx-data}`.
+/// `conn` resolves the report's idents and values: the connection
+/// after `transact!`, the view after `with`, whose minted idents live
+/// in the view's cache only.
+fn reportMap(vm: *VM, conn: *Conn, arena: Allocator, report: transact_mod.Report) !Value {
+    const txn = try conn.beginReadTxn();
     defer txn.abort();
-    var b = Builder.init(vm, c, txn);
+    var b = Builder.init(vm, conn, txn);
 
     var tempids = try champ.mapEmpty(b.heap);
     for (report.tempids) |t| {
@@ -434,6 +516,96 @@ fn transactNative(vm: *VM, args: []const Value) !Value {
     m = try b.putKw(m, "tempids", tempids);
     m = try b.putKw(m, "tx-data", try b.datoms(arena, report.tx_data));
     return m;
+}
+
+// =============================================================================
+// with
+// =============================================================================
+
+fn fnWith(vm: *VM, args: []const Value) VmError!Value {
+    return withNative(vm, args) catch |err| fail(vm, err);
+}
+
+/// `(with conn tx-data f)`: apply tx-data in a held write transaction,
+/// call `f` with a db-value over the uncommitted state and the report
+/// `transact!` would have returned, then abort. Whatever `f` raises
+/// propagates after the abort. The scope's arena goes on the VM state:
+/// it holds the view `Conn` that `db-after`, and every db-value
+/// derived from it, name.
+fn withNative(vm: *VM, args: []const Value) !Value {
+    const c = try openConn(args[0]);
+    const f = args[2];
+    const st = try state(vm);
+    try st.scopes.ensureUnusedCapacity(vm.allocator, 1);
+    const scope = try vm.allocator.create(std.heap.ArenaAllocator);
+    scope.* = .init(vm.allocator);
+    const w = transact_mod.with(c, scope.allocator(), args[1], .{}) catch |err| {
+        scope.deinit();
+        vm.allocator.destroy(scope);
+        return err;
+    };
+    st.scopes.appendAssumeCapacity(scope);
+    defer w.finish();
+
+    var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
+    defer arena_state.deinit();
+    const report = try reportMap(vm, &w.view, arena_state.allocator(), w.report);
+    const db_after = try boxDb(vm.ensureHeap(), w.db());
+    return vm.callValue(f, &.{ db_after, report });
+}
+
+// =============================================================================
+// pull, pull-many
+// =============================================================================
+
+fn fnPull(vm: *VM, args: []const Value) VmError!Value {
+    var diag: Diag = .{};
+    return pullNative(vm, args, &diag) catch |err| failPull(vm, err, &diag);
+}
+
+/// `(pull db pattern e)`: the pattern's map for `e`; nil when the
+/// entity has no datoms in this view.
+fn pullNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
+    const d = try dbOf(args[0]);
+    return pull_mod.pull(vm.allocator, vm.ensureInterner(), vm.ensureHeap(), d, args[1], args[2], diag);
+}
+
+fn fnPullMany(vm: *VM, args: []const Value) VmError!Value {
+    var diag: Diag = .{};
+    return pullManyNative(vm, args, &diag) catch |err| failPull(vm, err, &diag);
+}
+
+/// `(pull-many db pattern es)`: one result per entity of the vector
+/// or list `es`, in its order, all in one read.
+fn pullManyNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
+    const d = try dbOf(args[0]);
+    var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
+    defer arena_state.deinit();
+    const es = try entities(arena_state.allocator(), args[2]);
+    return pull_mod.pullMany(vm.allocator, vm.ensureInterner(), vm.ensureHeap(), d, args[1], es, diag);
+}
+
+/// A pattern or entity syntax error travels with its reason.
+fn failPull(vm: *VM, err: anyerror, diag: *const Diag) VmError {
+    if (err == error.PullSyntax) return throwSyntax(vm, "nextomic/pull-syntax", diag.message, diag.clause);
+    return fail(vm, err);
+}
+
+/// The elements of a vector or list.
+fn entities(arena: Allocator, v: Value) ![]Value {
+    var out: std.ArrayList(Value) = .empty;
+    switch (v.kind()) {
+        .persistent_vector => {
+            var it = vector_mod.Cursor.init(v);
+            while (it.next()) |x| try out.append(arena, x);
+        },
+        .list => {
+            var it = list_mod.Cursor.init(v);
+            while (it.next()) |x| try out.append(arena, x);
+        },
+        else => return error.KindMismatch,
+    }
+    return out.items;
 }
 
 // =============================================================================
@@ -708,6 +880,9 @@ test "every nextomic error maps to its §7 keyword; engine errors to the db set"
         .{ .err = error.BasisInFuture, .name = "nextomic/basis-in-future" },
         .{ .err = error.Closed, .name = "nextomic/closed" },
         .{ .err = error.TxData, .name = "nextomic/tx-data" },
+        .{ .err = error.Nested, .name = "nextomic/nested" },
+        .{ .err = error.PullSyntax, .name = "nextomic/pull-syntax" },
+        .{ .err = error.HistoryView, .name = "nextomic/history-view" },
         .{ .err = error.Format, .name = "db/corrupted" },
         .{ .err = error.Corrupted, .name = "db/corrupted" },
         .{ .err = error.KeyTooLarge, .name = "db/key-too-large" },
@@ -715,10 +890,12 @@ test "every nextomic error maps to its §7 keyword; engine errors to the db set"
         .{ .err = error.SomethingElse, .name = "db-error" },
     };
     for (cases) |c| try testing.expectEqualStrings(c.name, errorKeyword(c.err));
-    // The set is total over `nextomic.Error`.
-    inline for (@typeInfo(db_mod.Error).error_set.?) |e| {
-        const name = errorKeyword(@field(anyerror, e.name));
-        try testing.expect(std.mem.startsWith(u8, name, "nextomic/"));
+    // The set is total over the storage, transaction and pull errors.
+    inline for (.{ db_mod.Error, transact_mod.Error, pull_mod.Error }) |Set| {
+        inline for (@typeInfo(Set).error_set.?) |e| {
+            const name = errorKeyword(@field(anyerror, e.name));
+            try testing.expect(std.mem.startsWith(u8, name, "nextomic/"));
+        }
     }
 }
 

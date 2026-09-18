@@ -7,8 +7,8 @@
 //! `$` argument and the rest bind `?x`, `[?x ...]`, `[?a ?b]`,
 //! `[[?a ?b]]` and `%`.
 //!
-//! Caches: one IR cache and one rules cache per VM, created on first
-//! use and destroyed at VM teardown. A parsed query is pure syntax over
+//! Caches: one IR cache and one rules cache per VM, on the natives'
+//! per-VM state (`natives.state`). A parsed query is pure syntax over
 //! the VM's symbol table, so one cache serves every connection the VM
 //! opens. The caches hold the query values themselves (by heap identity
 //! first, then by structure); no collector frees or moves a heap value,
@@ -34,21 +34,16 @@
 const std = @import("std");
 const value = @import("value");
 const vm_mod = @import("vm");
-const heap_mod = @import("heap");
 const string_mod = @import("string");
-const champ = @import("champ");
-const dispatch = @import("dispatch");
 const natives = @import("../natives.zig");
 const query = @import("../query.zig");
 
-const Allocator = std.mem.Allocator;
 const Value = value.Value;
 const VM = vm_mod.VM;
 const VmError = vm_mod.VmError;
 const NativeFn = vm_mod.NativeFn;
 const Namespace = vm_mod.Namespace;
 const Var = vm_mod.Var;
-const Heap = heap_mod.Heap;
 const Diag = query.Diag;
 
 // =============================================================================
@@ -72,37 +67,6 @@ pub fn install(ns: *Namespace) !void {
 
 const native_q = NativeFn{ .name = "nextomic/q", .min_arity = 2, .max_arity = null, .call = &fnQ };
 const native_explain = NativeFn{ .name = "nextomic/explain", .min_arity = 2, .max_arity = null, .call = &fnExplain };
-
-// =============================================================================
-// Per-VM state
-// =============================================================================
-
-const State = struct {
-    gpa: Allocator,
-    ir_cache: query.Cache,
-    rules_cache: query.RulesCache,
-};
-
-/// The VM's caches, created on first use.
-fn state(vm: *VM) !*State {
-    if (vm.nextomic_query_state) |p| return @ptrCast(@alignCast(p));
-    const s = try vm.allocator.create(State);
-    s.* = .{
-        .gpa = vm.allocator,
-        .ir_cache = query.Cache.init(vm.allocator),
-        .rules_cache = query.RulesCache.init(vm.allocator),
-    };
-    vm.nextomic_query_state = @ptrCast(s);
-    vm.nextomic_query_close = &closeState;
-    return s;
-}
-
-fn closeState(ptr: *anyopaque) void {
-    const s: *State = @ptrCast(@alignCast(ptr));
-    s.ir_cache.deinit();
-    s.rules_cache.deinit();
-    s.gpa.destroy(s);
-}
 
 // =============================================================================
 // Errors
@@ -134,22 +98,7 @@ fn fail(vm: *VM, err: anyerror, diag: *const Diag) VmError {
 
 /// Throw the `:nextomic/query-syntax` map.
 fn throwSyntax(vm: *VM, message: []const u8, clause: ?usize) VmError {
-    const payload = syntaxPayload(vm, message, clause) catch return VmError.OutOfMemory;
-    return vm.throwValue(payload);
-}
-
-fn syntaxPayload(vm: *VM, message: []const u8, clause: ?usize) !Value {
-    const heap = vm.ensureHeap();
-    const it = vm.ensureInterner();
-    var m = try champ.mapEmpty(heap);
-    m = try put(heap, m, try it.internKeywordValue("error"), try it.internKeywordValue("nextomic/query-syntax"));
-    m = try put(heap, m, try it.internKeywordValue("message"), try string_mod.fromBytes(heap, message));
-    if (clause) |c| m = try put(heap, m, try it.internKeywordValue("clause"), value.fromFixnum(@intCast(c)) orelse return error.ArithmeticOverflow);
-    return m;
-}
-
-fn put(heap: *Heap, m: Value, k: Value, v: Value) !Value {
-    return champ.mapAssoc(heap, m, k, v, &dispatch.hashValue, &dispatch.equal);
+    return natives.throwSyntax(vm, "nextomic/query-syntax", message, clause);
 }
 
 // =============================================================================
@@ -218,7 +167,7 @@ fn fnQ(vm: *VM, args: []const Value) VmError!Value {
 
 fn qNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     const d = try natives.dbOf(args[1]);
-    const st = try state(vm);
+    const st = try natives.state(vm);
     var hook = Hook{ .vm = vm };
     const options: query.Options = .{ .hook = hook.callHook(), .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };
     return query.q(vm.allocator, vm.ensureInterner(), vm.ensureHeap(), args[0], d, args[1..], diag, options);
@@ -231,7 +180,7 @@ fn fnExplain(vm: *VM, args: []const Value) VmError!Value {
 
 fn explainNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     const d = try natives.dbOf(args[1]);
-    const st = try state(vm);
+    const st = try natives.state(vm);
     var hook = Hook{ .vm = vm };
     const options: query.Options = .{ .hook = hook.callHook(), .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };
     var out: std.Io.Writer.Allocating = .init(vm.allocator);
@@ -251,6 +200,9 @@ test "pipeline errors map to keywords; VM errors pass through" {
     try testing.expectEqualStrings("nextomic/unknown-attribute", keywordFor(error.UnknownAttribute).?);
     try testing.expectEqualStrings("nextomic/value-type", keywordFor(error.ValueType).?);
     try testing.expectEqualStrings("nextomic/closed", keywordFor(error.Closed).?);
+    try testing.expectEqualStrings("nextomic/nested", keywordFor(error.Nested).?);
+    try testing.expectEqualStrings("nextomic/pull-syntax", keywordFor(error.PullSyntax).?);
+    try testing.expectEqualStrings("nextomic/history-view", keywordFor(error.HistoryView).?);
     try testing.expectEqualStrings("db/corrupted", keywordFor(error.Corrupted).?);
     try testing.expect(keywordFor(error.ControlTransferred) == null);
     try testing.expect(keywordFor(error.UncaughtThrow) == null);

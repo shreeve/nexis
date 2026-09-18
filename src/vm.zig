@@ -1403,9 +1403,9 @@ pub const VM = struct {
     /// nextomic natives own the cast, so vm.zig needs no import.
     nextomic_connections: std.ArrayList(*anyopaque) = .empty,
     nextomic_close_callback: ?*const fn (*anyopaque) void = null,
-    /// The query natives' per-VM state (parsed-query caches), created
-    /// on the first `nextomic/q` and destroyed at teardown through
-    /// `nextomic_query_close`. The natives own the cast.
+    /// The nextomic natives' per-VM state (parsed-query caches and
+    /// finished `with` scopes), created on first use and destroyed at
+    /// teardown through `nextomic_query_close`. The natives own the cast.
     nextomic_query_state: ?*anyopaque = null,
     nextomic_query_close: ?*const fn (*anyopaque) void = null,
     /// Phase 5.2a polish (chore): Zig 0.16 `std.Io` handle for
