@@ -327,8 +327,9 @@ sub-plans with the same output variables.
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4) |
 | `(d/tx-range conn from to)` | vector of `{:t t :data [...]}` |
 | `(d/schema db)` | map ident → attribute map |
-| `(d/pull db pattern e)` / `(d/pull-many db pattern es)` | `*`, attribute lists, `{:ref [...]}`, reverse `:_attr`, `:limit`, component recursion |
-| `(d/with conn tx-data (fn [db-after report] ...))` | speculative transaction: applied in a write transaction, `db-after` reads through `beginReadChild`, aborted at scope exit; holds the write lock for the scope, so `transact!` and `with` inside are `:nextomic/nested` |
+| `(d/pull db pattern e)` | the pattern's map for an eid, lookup ref or ident; nil when the entity has no datoms in the view. A pattern is `[spec+]`: `*`, an attribute, `{attr sub-pattern}`, a reverse `:ns/_attr` (a vector of referrers; through a component, its one owner pulled with `[*]`), `{attr ...}` or `{attr depth}` recursion (a target already on the path, or past the depth, is a plain ref), `(attr :limit n)` / `(attr :limit nil)` / `(attr :default v)` / `(attr :as k)` and the `(limit attr n)` / `(default attr v)` spellings. `:db/id` is always present, a missing attribute omitted unless it has a default, card-many values are vectors in index order cut at 1000 unless `:limit` says otherwise, a ref is `{:db/id e}` plus `:db/ident` when it has one, and a component target is pulled with `[*]`. Defined on current, as-of and since views; one read per call |
+| `(d/pull-many db pattern es)` | one result per entity of the vector or list `es`, in its order, in the same read |
+| `(d/with conn tx-data f)` | speculative transaction: tx-data applied in a held write transaction, `f` called with `db-after` (a db-value over the uncommitted state: `q`, `entity`, `pull`, `datoms`, `schema` and the time views read it) and the report `transact!` would have returned, then aborted. Returns `f`'s value; a throw inside `f` propagates after the abort; the committed basis is unchanged and the next `transact!` takes the same `t`. `transact!` and `with` inside the scope are `:nextomic/nested`; `db-after` after the scope is `:nextomic/closed` |
 | `(d/sync conn)` | `Env.sync()` after `:none` loads |
 | `(d/with-conn [c path opts?] body...)` | connect for the extent of body; released on every exit, a throw keeps propagating |
 
@@ -354,13 +355,15 @@ All errors are keywords in the `nextomic` namespace and are catchable:
 `:nextomic/unbound-pattern`, `:nextomic/unsupported-range`,
 `:nextomic/basis-in-future`, `:nextomic/closed`, `:nextomic/tx-data`
 for malformed tx-data or a lookup ref on a non-unique attribute,
-`:nextomic/pull-syntax`, `:nextomic/history-view` (pull on a history
-db) and `:nextomic/nested` (`transact!` or `with` while a `with` holds
-the write transaction). The one
-exception carries its reason: a query syntax error throws the map
+`:nextomic/history-view` (pull on a history db) and `:nextomic/nested`
+(`transact!` or `with` while a `with` holds the write transaction). Two
+carry their reason as a map: a query syntax error throws
 `{:error :nextomic/query-syntax :message "..." :clause i}` (`:clause`
 present when the parser was inside a `:where` clause; an unknown
-function name is reported the same way at run time). Engine errors surface as the
+function name is reported the same way at run time), and a pull
+syntax error throws `{:error :nextomic/pull-syntax :message "..."
+:clause i}` (`:clause` is the index of the spec in the pattern, absent
+when the entity argument is malformed). Engine errors surface as the
 `db.zig` keyword set (`:db/key-too-large`, `:db/map-full`,
 `:db/corrupted`, ...). A released connection keeps its struct so a
 db-value taken from it raises `:nextomic/closed` rather than dangling.
