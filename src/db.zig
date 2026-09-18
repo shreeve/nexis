@@ -167,10 +167,7 @@ pub fn open(
     };
     const hash_hi = hash_mod.hashBytes(hi_input);
 
-    var env = emdb.Env.open(path, env_options) catch |err| {
-        allocator.free(path_owned);
-        return err;
-    };
+    var env = try emdb.Env.open(path, env_options);
     errdefer env.close();
 
     return Connection{
@@ -600,6 +597,48 @@ test "open: a new store has 16 KiB pages and the pinned tree capacity" {
     try testing.expectEqual(page_size, conn.env.options.pageSize);
     try testing.expectEqual(max_named_trees, conn.env.options.maxNamedTrees);
     try testing.expectEqual(emdb.btree.maxKeySize(page_size), conn.env.maxKeySize());
+}
+
+test "open: failure in a missing directory releases everything it took" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    // `std.testing.allocator` reports the leak if `path_owned`
+    // survives the failed open, and the double free if it is
+    // released twice.
+    const path: [:0]const u8 = "test_nexis_db_no_such_dir/missing/store.emdb";
+    try testing.expectError(
+        error.OpenFailed,
+        open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }),
+    );
+}
+
+test "open: a file that is not an emdb store is refused without leaking" {
+    const path = try tmpDbPath(testing.allocator, "notastore");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    // Two pages of 0xFF: a non-zero size with no valid meta page.
+    {
+        const io = std.testing.io;
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        const junk = [_]u8{0xFF} ** (2 * page_size);
+        try file.writeStreamingAll(io, &junk);
+    }
+
+    if (open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator })) |conn| {
+        var opened = conn;
+        close(&opened);
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }
 
 test "put / get / del: single-tree round-trip of a scalar" {
