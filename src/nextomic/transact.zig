@@ -15,7 +15,8 @@
 //!      transaction's own overlay: card-one implicit retracts, no-op
 //!      re-assertions, conflicts, unique-value collisions, lookup refs,
 //!      retract-attribute, retract-entity with VAET cleanup and component
-//!      cascade, then the `:db/txInstant` datom;
+//!      cascade, then the `:db/txInstant` datom unless the tx-data
+//!      asserted one on the transaction entity;
 //!   5. validate schema changes and backfill AVET for attributes that
 //!      become indexed or unique;
 //!   6. write the eight index trees, the txlog, the counts and `sys`;
@@ -318,8 +319,9 @@ const Ctx = struct {
     overlay: std.ArrayList(Pending) = .empty,
     /// EAVT key of a pending datom -> overlay index.
     facts: std.StringHashMapUnmanaged(u32) = .empty,
-    /// (e a) -> overlay index of the pending card-one assertion.
-    one_adds: std.AutoHashMapUnmanaged(EA, u32) = .empty,
+    /// (e a) -> value bytes of the card-one assertion seen so far,
+    /// pending or already current.
+    one_adds: std.AutoHashMapUnmanaged(EA, []const u8) = .empty,
     /// (e a) -> number of pending assertions.
     ea_adds: std.AutoHashMapUnmanaged(EA, u32) = .empty,
     /// `[a][v]` of a pending assertion -> e.
@@ -967,14 +969,16 @@ const Ctx = struct {
         }
         const already = (try self.txn.getFromTree(self.conn.store.trees.cur(.eavt), fk)) != null;
         if (!attr.many()) {
+            // One value per (e a) per transaction, whether it is
+            // pending or was current already.
             const ea: EA = .{ .e = e, .a = attr.id };
-            if (self.one_adds.get(ea)) |_| return error.Conflict;
+            if (self.one_adds.get(ea)) |seen| return if (std.mem.eql(u8, seen, vb)) {} else error.Conflict;
+            try self.one_adds.put(self.arena, ea, vb);
             if (already) return;
             if (try self.currentOne(e, attr.id)) |old| {
                 try self.pushRetract(e, attr, old.val, old.vbytes);
             }
             try self.push(e, attr, v, vb, true, fk);
-            try self.one_adds.put(self.arena, ea, @intCast(self.overlay.items.len - 1));
             return;
         }
         if (already) return;
@@ -1090,9 +1094,19 @@ const Ctx = struct {
         try self.push(e, attr, v, vbytes, false, null);
     }
 
+    /// The transaction's instant: one the tx-data asserted on its own
+    /// transaction entity stands, and is the txlog's instant too;
+    /// otherwise the clock's.
     fn txInstant(self: *Ctx) !void {
+        const tx = key.txEntity(self.t);
+        for (self.overlay.items) |p| {
+            if (p.e == tx and p.attr.id == boot.tx_instant and p.added) {
+                self.now_ms = p.v.instant;
+                return;
+            }
+        }
         const attr = try self.attrById(boot.tx_instant);
-        try self.expandAdd(key.txEntity(self.t), attr, .{ .instant = self.now_ms });
+        try self.expandAdd(tx, attr, .{ .instant = self.now_ms });
     }
 
     // ── step 5: schema ────────────────────────────────────────────
@@ -2366,6 +2380,96 @@ test "a large transaction's arena stays well under a kilobyte per datom" {
     const per_datom = bytes / r.tx_data.len;
     if (std.c.getenv("NEXTOMIC_BENCH") != null) std.debug.print("\ntransaction arena: {d} bytes for {d} datoms, {d} bytes/datom\n", .{ bytes, r.tx_data.len, per_datom });
     try testing.expect(per_datom < 1024);
+}
+
+test "history composed with since shows only the rows after since" {
+    const tc = try TestConn.init("tx_history_since");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Anne" } } } },
+    }, .{});
+    const db = try tc.conn.db();
+    // History alone: the assertion, its retraction and the new value.
+    try testing.expectEqual(@as(usize, 3), (try db.withHistory().datoms(arena, .eavt, .{ .e = a })).len);
+    // History since r1: the two rows of r2, whichever way it is composed.
+    for ([_]DbValue{ db.sinceT(r1.t).withHistory(), db.withHistory().sinceT(r1.t) }) |view| {
+        const rows = try view.datoms(arena, .eavt, .{ .e = a });
+        try testing.expectEqual(@as(usize, 2), rows.len);
+        for (rows) |d| try testing.expectEqual(r2.t, d.t);
+        try testing.expect(!rows[0].added and rows[1].added);
+    }
+    // Since r2 there is nothing; since 0 there is everything.
+    try testing.expectEqual(@as(usize, 0), (try db.sinceT(r2.t).withHistory().datoms(arena, .eavt, .{ .e = a })).len);
+    try testing.expectEqual(@as(usize, 3), (try db.sinceT(0).withHistory().datoms(arena, .eavt, .{ .e = a })).len);
+    // As-of composes on top: history since r1 as of r1 is empty.
+    try testing.expectEqual(@as(usize, 0), (try db.sinceT(r1.t).withHistory().asOf(r1.t).datoms(arena, .eavt, .{ .e = a })).len);
+}
+
+test "two card-one values in one transaction conflict even when the first is current" {
+    const tc = try TestConn.init("tx_card_one_current");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const age = try attrId(tc, "user/age");
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 30 } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 30 } } } },
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 31 } } } },
+    }, .{}));
+    // Re-asserting the current value twice writes nothing.
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 30 } } } },
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 30 } } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 1), r2.tx_data.len);
+    try testing.expectEqual(@as(i64, 30), (try (try tc.conn.db()).entity(arena, a))[0].vals[0].long);
+}
+
+test "an explicit :db/txInstant on the transaction entity stands" {
+    const tc = try TestConn.init("tx_explicit_instant");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+
+    const r = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .tx, .a = .{ .id = boot.tx_instant }, .v = .{ .val = .{ .instant = 12345 } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{ .now_ms = 777 });
+    try testing.expectEqual(@as(usize, 2), r.tx_data.len);
+    var instants: usize = 0;
+    for (r.tx_data) |d| if (d.a == boot.tx_instant) {
+        instants += 1;
+        try testing.expectEqual(@as(i64, 12345), d.v.instant);
+    };
+    try testing.expectEqual(@as(usize, 1), instants);
+    const db = try tc.conn.db();
+    try testing.expectEqual(@as(i64, 12345), (try db.entity(arena, key.txEntity(r.t)))[0].vals[0].instant);
+    const entries = try db_mod.txRange(tc.conn, arena, r.t, null);
+    try testing.expectEqual(@as(i64, 12345), entries[0].instant);
+    // Two different instants for one transaction conflict.
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .tx, .a = .{ .id = boot.tx_instant }, .v = .{ .val = .{ .instant = 1 } } } },
+        .{ .add = .{ .e = .tx, .a = .{ .id = boot.tx_instant }, .v = .{ .val = .{ .instant = 2 } } } },
+    }, .{}));
 }
 
 test "the view outlives the scratch arena until destroy" {

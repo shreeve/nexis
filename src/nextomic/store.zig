@@ -623,14 +623,14 @@ pub const Store = struct {
         as_of: u64,
         /// `after < t <= upto`: fold from an empty state.
         since: struct { after: u64, upto: u64 },
-        /// `t <= upto`: every row, no fold.
-        all: u64,
+        /// `after < t <= upto`: every row, no fold.
+        all: struct { after: u64, upto: u64 },
 
         pub fn contains(self: Window, t: u64) bool {
             return switch (self) {
                 .as_of => |upto| t <= upto,
                 .since => |w| t > w.after and t <= w.upto,
-                .all => |upto| t <= upto,
+                .all => |w| t > w.after and t <= w.upto,
             };
         }
     };
@@ -994,7 +994,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
         try testing.expectEqualSlices(u64, c.facts, got.items);
     }
     // History mode sees all five rows in t order with their flags.
-    var all = try store.foldScan(txn, tree, prefix, end, .{ .all = 5 });
+    var all = try store.foldScan(txn, tree, prefix, end, .{ .all = .{ .after = 0, .upto = 5 } });
     var n: usize = 0;
     var adds: usize = 0;
     while (all.next()) |r| {

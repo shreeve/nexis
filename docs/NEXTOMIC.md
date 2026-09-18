@@ -194,7 +194,9 @@ so there is no queue; emdb's write lock is the transactor.
    then AEVT, then AVET and VAET after sorting the batch (better leaf
    fill for random-order keys). Then `nx/txlog[t]`, then `sys` counters
    including `"t"`.
-6. Append `[tx-entity :db/txInstant now]` as a datom of this transaction.
+6. Append `[tx-entity :db/txInstant now]` as a datom of this transaction,
+   unless the tx-data asserted `:db/txInstant` on `"datomic.tx"` itself:
+   that instant stands, in the datom and in the txlog entry.
 7. `wtxn.commit()`. On any error `wtxn.abort()`: nothing partial can
    exist (emdb INV-SUB04).
 8. Return `{:db-before db :db-after db :tx t :tempids {..} :tx-data
@@ -239,7 +241,8 @@ Every operation on a db-value opens one read transaction, reads
   state: an entity asserted before T and untouched since is invisible;
   a fact retracted after T shows nothing.
 - **history**: history trees, every datom with `t ≤ basis`, no fold,
-  each with its `added` flag. `history ∘ as-of` composes.
+  each with its `added` flag. `history` composes with `as-of` and with
+  `since` (`history ∘ since T`: every datom with `T < t ≤ basis`).
 
 **The fold.** Walk from `setRange(prefix)` while the key carries the
 prefix; consecutive keys with equal `(e a v)` form a group in ascending

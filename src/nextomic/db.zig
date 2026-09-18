@@ -283,7 +283,7 @@ pub const DbValue = struct {
 
     fn window(self: DbValue) Store.Window {
         const up = self.upper();
-        if (self.history) return .{ .all = up };
+        if (self.history) return .{ .all = .{ .after = self.since orelse 0, .upto = up } };
         if (self.since) |after| return .{ .since = .{ .after = after, .upto = up } };
         return .{ .as_of = up };
     }
