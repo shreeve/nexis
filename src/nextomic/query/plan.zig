@@ -191,6 +191,8 @@ pub const Ctx = struct {
     ir_vars: usize,
     /// Run-time relation slots, by `Clause.source.id`.
     sources: std.ArrayList(*SourceSlot) = .empty,
+    /// Entries of the AEVT tree this view reads, once asked.
+    aevt_entries: ?u64 = null,
 
     pub fn init(arena: Allocator, read: *Read, interner: *Interner, query: *const Ir, rules: *const RuleSet) !Ctx {
         var vars: std.ArrayList(ir.VarInfo) = .empty;
@@ -215,6 +217,24 @@ pub const Ctx = struct {
         const attr: ?Attr = if (id) |a| try self.read.attr(a) else null;
         try self.attr_cache.put(self.arena, kw, attr);
         return attr;
+    }
+
+    /// Entries of the AEVT tree this view reads: the cost of a scan
+    /// over every datom.
+    pub fn aevtEntries(self: *Ctx) !u64 {
+        if (self.aevt_entries) |n| return n;
+        const store = self.read.db.conn.store;
+        const tree = if (self.read.fast()) store.trees.cur(.aevt) else store.trees.hist(.aevt);
+        const n = try store.treeEntries(self.read.txn, tree);
+        self.aevt_entries = n;
+        return n;
+    }
+
+    /// Datoms per attribute, the AEVT estimate for an attribute known
+    /// only at run time.
+    pub fn entriesPerAttr(self: *Ctx) !u64 {
+        const attrs = (try self.read.schema()).attrs.count();
+        return @max(1, (try self.aevtEntries()) / @max(1, attrs));
     }
 
     pub fn ruleInfo(self: *Ctx) !*rules_mod.Info {
@@ -533,6 +553,10 @@ fn choose(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !Choice {
         }
         return .{ .index = .eavt, .estimate = if (a_b) 1 else attrs_per_entity };
     }
+    if (a_b and attr == null) {
+        // The attribute arrives with the row: AEVT under it, `v` filtered.
+        return .{ .index = .aevt, .estimate = try ctx.entriesPerAttr() };
+    }
     if (attr) |at| {
         if (v_b) {
             if (at.unique != .none) return .{ .index = .avet, .estimate = 1 };
@@ -544,13 +568,17 @@ fn choose(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !Choice {
     }
     if (!a_b and v_b) {
         // `v` bound with no attribute: VAET answers for ref attributes,
-        // which is what a value that can be an entity id asks for.
+        // which is what a value that can be an entity id asks for; any
+        // other value is matched across every datom in AEVT. A variable
+        // is planned as a ref and falls back to the full scan at run
+        // time when its cell is not an entity id.
         const ref_like = switch (p.v) {
             .variable => true,
             .constant => |c| c == .lookup or c.cell == .int,
             .blank => unreachable,
         };
         if (ref_like) return .{ .index = .vaet, .estimate = refs_per_value };
+        return .{ .index = .aevt, .estimate = try ctx.aevtEntries() };
     }
     return error.UnboundPattern;
 }

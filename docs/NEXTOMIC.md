@@ -283,7 +283,16 @@ runs:
 | `a` + `v`, not indexed | AEVT `[a]` + filter | entries of `a` |
 | `v` ref, `a` optional | VAET `[v][a?]` | small |
 | `a` only | AEVT `[a]` | entries of `a` |
+| `a` a bound variable (id or ident) | AEVT `[a]` + filter | entries / attributes |
+| `v` only, not a ref | AEVT, every datom + filter | entries of AEVT |
 | nothing | refused (`:nextomic/unbound-pattern`) | |
+
+A value with no attribute is a ref when it can be an entity id (an
+integer, a lookup ref, or a variable at plan time); a variable whose cell
+turns out to be a string, keyword, double or boolean falls back at run
+time to the scan of every datom. That scan costs the whole database and
+is the price of `[?e _ ?v]` without an attribute; give the attribute
+when it is known.
 
 Clauses are ordered greedily by estimate given the variables bound so
 far; predicates run at the first point all their variables are bound.

@@ -143,7 +143,9 @@ pub const Exec = struct {
         if (s.unsatisfiable or rel.rows == 0) return out;
 
         const log_n: u64 = std.math.log2_int_ceil(u64, s.tree_entries + 2);
-        const nested = s.hash_index == null or (std.math.mulWide(u64, rel.rows, log_n) < s.hash_estimate);
+        // A bound attribute variable seeks per row: its cell may be an
+        // ident, which a hash join would not match against attribute ids.
+        const nested = s.hash_index == null or s.a == .bound or (std.math.mulWide(u64, rel.rows, log_n) < s.hash_estimate);
         const slots = s.slots();
 
         if (nested) {
@@ -190,23 +192,34 @@ pub const Exec = struct {
         };
     }
 
-    /// Scan `index` for the datoms of `s` given one input row (or none),
-    /// appending the passing rows to `out` through `srcs`.
-    fn scanInto(self: *Exec, s: *const Scan, index: key.Index, rel: ?*const Relation, row: []const Cell, srcs: []const Src, out: *Relation) anyerror!void {
+    /// Scan `planned` for the datoms of `s` given one input row (or
+    /// none), appending the passing rows to `out` through `srcs`. A
+    /// VAET scan whose value cell is not an entity id becomes a scan
+    /// of every datom in AEVT, filtered on the value.
+    fn scanInto(self: *Exec, s: *const Scan, planned: key.Index, rel: ?*const Relation, row: []const Cell, srcs: []const Src, out: *Relation) anyerror!void {
         const slots = s.slots();
         var comps: key.Components = .{};
+        var index = planned;
+        // The cells the bound positions compare against, with an ident
+        // in the attribute position turned into the attribute id.
+        var wants: [5]?Cell = undefined;
+        for (slots, 0..) |slot, pos| wants[pos] = slotCell(slot, rel, row);
 
-        if (slotCell(slots[0], rel, row)) |c| comps.e = c.asEid() orelse return;
+        if (wants[0]) |c| comps.e = c.asEid() orelse return;
 
         var attr = s.attr;
-        if (slotCell(slots[1], rel, row)) |c| {
-            const n = c.asInt() orelse return;
+        if (wants[1]) |c| {
+            const n: i64 = switch (c) {
+                .keyword => |kw| (try self.read.db.conn.idents.idOf(self.read.txn, kw)) orelse return,
+                else => c.asInt() orelse return,
+            };
             if (n <= 0 or n >= key.attr_partition_end) return;
             comps.a = @intCast(n);
+            wants[1] = .{ .int = n };
             if (attr == null) attr = (try self.read.attr(comps.a.?)) orelse return;
         }
 
-        if (slotCell(slots[2], rel, row)) |c| {
+        if (wants[2]) |c| {
             if (slots[2] == .constant and slots[2].constant.bytes != null) {
                 comps.v = slots[2].constant.bytes;
             } else if (attr) |at| {
@@ -216,8 +229,11 @@ pub const Exec = struct {
                     else => return err,
                 };
             } else if (index == .vaet) {
-                const eid = c.asEid() orelse return;
-                comps.v = try key.valBytes(self.arena, .{ .ref = eid });
+                if (c.asEid()) |eid| {
+                    comps.v = try key.valBytes(self.arena, .{ .ref = eid });
+                } else {
+                    index = .aevt;
+                }
             }
         }
 
@@ -228,7 +244,7 @@ pub const Exec = struct {
             for (slots, 0..) |slot, pos| {
                 switch (slot) {
                     .blank, .fresh => {},
-                    .constant, .bound => if (slotCell(slot, rel, row)) |want| {
+                    .constant, .bound => if (wants[pos]) |want| {
                         if (!dc[pos].eql(want)) continue :datoms;
                     },
                     .same => |v| if (!dc[pos].eql(dc[slotPos(slots, v)])) continue :datoms,
