@@ -87,6 +87,7 @@ const dispatch_mod = @import("dispatch");
 /// whole VM lifetime.
 const intern_mod = @import("intern");
 const protocol_mod = @import("protocol");
+const record_mod = @import("record");
 const Value = value_mod.Value;
 
 // =============================================================================
@@ -1977,7 +1978,10 @@ pub const VM = struct {
                 if (!result_cell.done) return VmError.ControlTransferred;
                 return result_cell.value;
             },
-            else => return VmError.NotCallable,
+            else => {
+                if (isLookupCallable(callee.kind())) return callLookup(callee, args);
+                return VmError.NotCallable;
+            },
         }
     }
 
@@ -2446,6 +2450,22 @@ pub const VM = struct {
             }
             const dst_ptr = try self.slotPtr(result_dst);
             dst_ptr.* = result;
+            return;
+        }
+        // Keywords and collections are invocable as lookups
+        // (PLAN §8.7): `(:k m)`, `(m :k)`, `(s x)`, `(v i)`.
+        if (isLookupCallable(closure_v.kind())) {
+            if (argc > 2) return VmError.ArityMismatch;
+            var args_buf: [2]Value = undefined;
+            var i: u32 = 0;
+            while (i < argc) : (i += 1) {
+                args_buf[i] = (try self.slotPtr(@intCast(call_base + 1 + i))).*;
+            }
+            const result = try callLookup(closure_v, args_buf[0..argc]);
+            if (result_dst >= self.currentFrame().slot_count) {
+                return VmError.OperandOutOfRange;
+            }
+            (try self.slotPtr(result_dst)).* = result;
             return;
         }
         if (closure_v.kind() != value_mod.Kind.function) {
@@ -3558,6 +3578,84 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.Halt,
         VmError.ControlTransferred,
         => null,
+    };
+}
+
+// =============================================================================
+// Lookup (PLAN §6.5, §8.7)
+//
+// `get` and the invocable-as-lookup kinds share one lookup so that
+// `(get m k)`, `(:k m)` and `(m :k)` cannot drift apart.
+// =============================================================================
+
+/// `(get coll key default)`. Maps and records look the key up,
+/// sets return the element itself when present, vectors index by
+/// fixnum, nil yields the default. Any other receiver is a
+/// `KindMismatch`.
+pub fn lookup(coll: Value, key: Value, default: Value) VmError!Value {
+    return switch (coll.kind()) {
+        .nil => default,
+        .persistent_map => mapLookup(coll, key, default),
+        .record => mapLookup(record_mod.fieldsOf(coll), key, default),
+        .persistent_set => if (champ_mod.setContains(
+            coll,
+            key,
+            &dispatch_mod.hashValue,
+            &dispatch_mod.equal,
+        )) key else default,
+        .persistent_vector => blk: {
+            if (key.kind() != .fixnum) break :blk default;
+            const idx = key.asFixnum();
+            if (idx < 0 or @as(usize, @intCast(idx)) >= vector_mod.count(coll)) break :blk default;
+            break :blk vector_mod.nth(coll, @intCast(idx));
+        },
+        else => VmError.KindMismatch,
+    };
+}
+
+fn mapLookup(m: Value, key: Value, default: Value) Value {
+    return switch (champ_mod.mapGet(m, key, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
+        .present => |v| v,
+        .absent => default,
+    };
+}
+
+/// Kinds a `call:call` treats as a lookup rather than a function.
+pub fn isLookupCallable(k: value_mod.Kind) bool {
+    return switch (k) {
+        .keyword, .persistent_map, .persistent_set, .persistent_vector => true,
+        else => false,
+    };
+}
+
+/// Invoke a keyword or collection as a function.
+///
+///   (:k x)      → (get x :k)       nil when `x` is not a lookup target
+///   (:k x d)    → (get x :k d)
+///   (m k), (m k d) → (get m k d)
+///   (s x)       → (get s x)       sets take exactly one argument
+///   (v i)       → (nth v i)       vectors take exactly one fixnum;
+///                                 out of range is an error
+///
+/// Any other arity is `ArityMismatch` (PLAN §8.7).
+pub fn callLookup(callee: Value, args: []const Value) VmError!Value {
+    if (args.len < 1 or args.len > 2) return VmError.ArityMismatch;
+    const default = if (args.len == 2) args[1] else value_mod.nilValue();
+    return switch (callee.kind()) {
+        .keyword => switch (args[0].kind()) {
+            .nil, .persistent_map, .record, .persistent_set, .persistent_vector => lookup(args[0], callee, default),
+            else => default,
+        },
+        .persistent_map => lookup(callee, args[0], default),
+        .persistent_set => if (args.len == 1) lookup(callee, args[0], default) else VmError.ArityMismatch,
+        .persistent_vector => blk: {
+            if (args.len != 1) return VmError.ArityMismatch;
+            if (args[0].kind() != .fixnum) return VmError.KindMismatch;
+            const idx = args[0].asFixnum();
+            if (idx < 0 or @as(usize, @intCast(idx)) >= vector_mod.count(callee)) return VmError.IndexOutOfBounds;
+            break :blk vector_mod.nth(callee, @intCast(idx));
+        },
+        else => VmError.NotCallable,
     };
 }
 
@@ -4854,6 +4952,41 @@ test "numeric tower: comparison across kinds and NaN" {
     try testing.expectEqual(@as(f64, 4.0), (try numExtremum(true, fx(3), fl(4.0))).asFloat());
     try testing.expectEqual(@as(f64, 3.0), (try numExtremum(false, fx(3), fl(4.0))).asFloat());
     try testing.expect(std.math.isNan((try numExtremum(true, nan, fx(4))).asFloat()));
+}
+
+test "callValue: keywords, maps, sets and vectors are invocable as lookups" {
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "lookup"));
+    defer vm.deinit();
+    const heap = vm.ensureHeap();
+    const k = vm.ensureInterner().internKeywordValue("k") catch unreachable;
+    const other = vm.ensureInterner().internKeywordValue("other") catch unreachable;
+    var m = try champ_mod.mapEmpty(heap);
+    m = try champ_mod.mapAssoc(heap, m, k, fx(1), &dispatch_mod.hashValue, &dispatch_mod.equal);
+    var set = try champ_mod.setEmpty(heap);
+    set = try champ_mod.setConj(heap, set, fx(5), &dispatch_mod.hashValue, &dispatch_mod.equal);
+    const vec = try vector_mod.fromSlice(heap, &.{ fx(10), fx(20) });
+
+    // (:k m) / (:k m default) / (:other m default) / (:k nil) / (:k 5)
+    try testing.expectEqual(@as(i64, 1), (try vm.callValue(k, &.{m})).asFixnum());
+    try testing.expectEqual(@as(i64, 1), (try vm.callValue(k, &.{ m, fx(9) })).asFixnum());
+    try testing.expectEqual(@as(i64, 9), (try vm.callValue(other, &.{ m, fx(9) })).asFixnum());
+    try testing.expect((try vm.callValue(k, &.{value_mod.nilValue()})).isNil());
+    try testing.expect((try vm.callValue(k, &.{fx(5)})).isNil());
+    try testing.expectError(VmError.ArityMismatch, vm.callValue(k, &.{}));
+    try testing.expectError(VmError.ArityMismatch, vm.callValue(k, &.{ m, m, m }));
+    // (m :k) / (m :other :d)
+    try testing.expectEqual(@as(i64, 1), (try vm.callValue(m, &.{k})).asFixnum());
+    try testing.expectEqual(@as(i64, 9), (try vm.callValue(m, &.{ other, fx(9) })).asFixnum());
+    // (s 5) / (s 6)
+    try testing.expectEqual(@as(i64, 5), (try vm.callValue(set, &.{fx(5)})).asFixnum());
+    try testing.expect((try vm.callValue(set, &.{fx(6)})).isNil());
+    try testing.expectError(VmError.ArityMismatch, vm.callValue(set, &.{ fx(5), fx(6) }));
+    // (v 1) / (v 2) / (v :k)
+    try testing.expectEqual(@as(i64, 20), (try vm.callValue(vec, &.{fx(1)})).asFixnum());
+    try testing.expectError(VmError.IndexOutOfBounds, vm.callValue(vec, &.{fx(2)}));
+    try testing.expectError(VmError.KindMismatch, vm.callValue(vec, &.{k}));
+    // Numbers stay uncallable.
+    try testing.expectError(VmError.NotCallable, vm.callValue(fx(1), &.{fx(2)}));
 }
 
 test "VM math/cmp opcodes cover every wired variant" {

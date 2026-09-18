@@ -2955,3 +2955,58 @@ test "numbers: macros can return float and char literals" {
     try expectOutput("(do (defmacro ch [] \\z) (pr-str (ch)))", "\\z");
     try expectOutput("(do (defmacro twice [x] `(* 2 ~x)) (twice 1.25))", "2.5");
 }
+
+// =============================================================================
+// Keyword-as-function and collection-as-function (PLAN §8.7)
+// =============================================================================
+
+test "keyword-as-function: direct calls" {
+    try expectOutput("(:a {:a 1 :b 2})", "1");
+    try expectOutput("(:c {:a 1 :b 2})", "nil");
+    try expectOutput("(:c {:a 1 :b 2} :none)", ":none");
+    try expectOutput("(:a {:a nil} :none)", "nil");
+    try expectOutput("(:a nil)", "nil");
+    try expectOutput("(:a nil :d)", ":d");
+    try expectOutput("(:a 5)", "nil");
+    try expectOutput("(:a \"s\" :d)", ":d");
+    try expectOutput("(:a #{:a :b})", ":a");
+    try expectOutput("(:z #{:a :b})", "nil");
+    try expectOutput("(try (:a) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(try (:a {} 1 2) (catch any e e))", ":arity-mismatch");
+    // Nested and in tail position.
+    try expectOutput("(:b (:a {:a {:b 2}}))", "2");
+    try expectOutput("(-> {:a {:b 3}} :a :b)", "3");
+    try expectOutput("(do (defn field [m] (:x m)) (field {:x 7}))", "7");
+    try expectOutput("(let [f :a] (f {:a 9}))", "9");
+    try expectOutput("(do (defrecord P [x y]) (:y (->P 1 2)))", "2");
+}
+
+test "keyword-as-function: keywords passed to higher-order functions" {
+    try expectOutput("(map :name [{:name :x} {:name :y}])", "(:x :y)");
+    try expectOutput("(filter :ok [{:ok true :n 1} {:ok false :n 2} {:n 3}])", "({:ok true, :n 1})");
+    try expectOutput("(apply :a [{:a 3}])", "3");
+    try expectOutput("(apply :a {:b 1} [:d])", ":d");
+    try expectOutput("(reduce (fn [acc m] (+ acc (:n m))) 0 [{:n 1} {:n 2} {:n 3}])", "6");
+    try expectOutput("(some :hit [{:hit nil} {:hit :yes} {:hit :later}])", ":yes");
+    try expectOutput("(every? :ok [{:ok 1} {:ok 2}])", "true");
+    try expectOutput("((comp :b :a) {:a {:b 4}})", "4");
+    try expectOutput("((partial :a) {:a 5})", "5");
+}
+
+test "collection-as-function: maps, sets and vectors" {
+    try expectOutput("({:a 1} :a)", "1");
+    try expectOutput("({:a 1} :b)", "nil");
+    try expectOutput("({:a 1} :b :d)", ":d");
+    try expectOutput("(#{1 2} 1)", "1");
+    try expectOutput("(#{1 2} 3)", "nil");
+    try expectOutput("(try (#{1 2} 3 :d) (catch any e e))", ":arity-mismatch");
+    try expectOutput("([10 20] 1)", "20");
+    try expectOutput("(try ([10 20] 2) (catch any e e))", ":index-out-of-bounds");
+    try expectOutput("(try ([10 20] :a) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try ([10 20] 0 :d) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(map {:a 1 :b 2} [:a :b :c])", "(1 2 nil)");
+    try expectOutput("(filter #{2 4} [1 2 3 4])", "(2 4)");
+    try expectOutput("(let [m {:x 1}] (m :x))", "1");
+    try expectOutput("(try (5 1) (catch any e e))", ":not-callable");
+    try expectOutput("(try (\"s\" 1) (catch any e e))", ":not-callable");
+}

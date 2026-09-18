@@ -3585,8 +3585,9 @@ fn threadStep(
     step: *const Form,
     pos: ThreadPosition,
 ) ExpandError!*Form {
-    // Symbol step `f` → (f acc).
-    if (step.datum == .symbol) {
+    // A non-list step `f` → (f acc): a symbol, or a keyword /
+    // other invocable value (`(-> m :a :b)`).
+    if (step.datum != .list) {
         const items = try ctx.allocator.alloc(*Form, 2);
         items[0] = @constCast(step);
         items[1] = acc;
@@ -3594,7 +3595,7 @@ fn threadStep(
     }
     // List step (f a b) → thread-first: (f acc a b)
     //                      thread-last:  (f a b acc)
-    if (step.datum == .list) {
+    {
         const step_items = step.datum.list;
         if (step_items.len == 0) return ExpandError.MalformedMacroCall;
         const new_items = try ctx.allocator.alloc(*Form, step_items.len + 1);
@@ -3613,7 +3614,6 @@ fn threadStep(
         }
         return try makeList(ctx, new_items, call_form.origin);
     }
-    return ExpandError.MalformedMacroCall;
 }
 
 // =============================================================================

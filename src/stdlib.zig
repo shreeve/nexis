@@ -1122,53 +1122,9 @@ fn fnDissoc(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
-fn fnGet(vm: *VM, args: []const Value) VmError!Value {
-    _ = vm;
-    const coll = args[0];
-    const k = args[1];
+fn fnGet(_: *VM, args: []const Value) VmError!Value {
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
-    return switch (coll.kind()) {
-        .nil => default,
-        .persistent_map => switch (champ_mod.mapGet(
-            coll,
-            k,
-            &dispatch_mod.hashValue,
-            &dispatch_mod.equal,
-        )) {
-            .present => |v| v,
-            .absent => default,
-        },
-        .persistent_set => blk: {
-            // `(get s elem)` returns elem if present, default
-            // (or nil) otherwise.
-            const present = champ_mod.setContains(
-                coll,
-                k,
-                &dispatch_mod.hashValue,
-                &dispatch_mod.equal,
-            );
-            break :blk if (present) k else default;
-        },
-        .persistent_vector => blk: {
-            if (k.kind() != .fixnum) break :blk default;
-            const idx = k.asFixnum();
-            if (idx < 0) break :blk default;
-            const u_idx: usize = @intCast(idx);
-            if (u_idx >= vector_mod.count(coll)) break :blk default;
-            break :blk vector_mod.nth(coll, u_idx);
-        },
-        // Phase 5.3a: records are map-like for `get`.
-        .record => switch (champ_mod.mapGet(
-            record_mod.fieldsOf(coll),
-            k,
-            &dispatch_mod.hashValue,
-            &dispatch_mod.equal,
-        )) {
-            .present => |v| v,
-            .absent => default,
-        },
-        else => return VmError.KindMismatch,
-    };
+    return vm_mod.lookup(args[0], args[1], default);
 }
 
 fn fnContainsQ(_: *VM, args: []const Value) VmError!Value {
