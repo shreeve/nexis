@@ -202,8 +202,8 @@ so there is no queue; emdb's write lock is the transactor.
 8. Return `{:db-before db :db-after db :tx t :tempids {..} :tx-data
    [[e a v t added] ...]}` with `db-after.basis = t`.
 
-Schema changes are ordinary transactions on attribute entities. In v1
-schema is additive: an attribute's value type and cardinality never
+Schema changes are ordinary transactions on attribute entities. Schema
+is additive: an attribute's value type and cardinality never
 change once written; `:db/index` and `:db/unique` may be added to an
 attribute (the transaction that adds them backfills AVET from AEVT).
 

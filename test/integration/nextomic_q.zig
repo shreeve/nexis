@@ -1351,14 +1351,21 @@ test "benchmark: 200k datoms, three-way join" {
     try testing.expectEqual(emps / depts, champ.setCount(r3));
     try testing.expect(champ.setCount(r_age) > 0);
     try testing.expect(r_hash.asFixnum() > 0);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try query.explain(testing.allocator, fx.interner(), q3, dbv, none, &diag, opts, &out.writer);
+    if (!benchOutput()) return;
     std.debug.print("\n[bench] 200k datoms, {d} employees / {d} departments\n", .{ emps, depts });
     std.debug.print("[bench] 3-way join by department (dept -> vaet -> eavt), {d} rows: {d} us to rows, {d} us with the result set\n", .{ champ.setCount(r3), (r1 - r0) / 1000, (t1 - t0) / 1000 });
     std.debug.print("[bench] 3-way join by age (avet -> eavt -> eavt), {d} rows: {d} us\n", .{ champ.setCount(r_age), (t2 - t1) / 1000 });
     std.debug.print("[bench] active count by department (aevt scan + hash join), {d} rows: {d} us\n", .{ r_hash.asFixnum(), (t3 - t2) / 1000 });
-    var out: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer out.deinit();
-    try query.explain(testing.allocator, fx.interner(), q3, dbv, none, &diag, opts, &out.writer);
     std.debug.print("[bench] plan:\n{s}", .{out.written()});
+}
+
+/// Timings print only when `NEXTOMIC_BENCH` is set; the checks run
+/// regardless.
+fn benchOutput() bool {
+    return std.c.getenv("NEXTOMIC_BENCH") != null;
 }
 
 fn nowNs() u64 {

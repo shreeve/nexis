@@ -785,8 +785,8 @@ test "long string becomes a digest key" {
 
 test "every fixed-width type round trips" {
     const vals = [_]Val{
-        .{ .boolean = false }, .{ .boolean = true }, .{ .long = -7 }, .{ .double = 2.5 }, .{ .instant = 1_700_000_000_000 },
-        .{ .keyword = 17 },    .{ .ref = 1 << 40 },   .{ .uuid = [_]u8{9} ** 16 },
+        .{ .boolean = false }, .{ .boolean = true }, .{ .long = -7 },             .{ .double = 2.5 }, .{ .instant = 1_700_000_000_000 },
+        .{ .keyword = 17 },    .{ .ref = 1 << 40 },  .{ .uuid = [_]u8{9} ** 16 },
     };
     for (vals) |v| {
         const x = try enc(v);

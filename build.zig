@@ -705,39 +705,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         for (f.imports) |imp_name| {
-            const mod: *std.Build.Module =
-                if (std.mem.eql(u8, imp_name, "hash")) siblings.hash
-                else if (std.mem.eql(u8, imp_name, "value")) siblings.value
-                else if (std.mem.eql(u8, imp_name, "eq")) siblings.eq
-                else if (std.mem.eql(u8, imp_name, "heap")) siblings.heap
-                else if (std.mem.eql(u8, imp_name, "string")) siblings.string
-                else if (std.mem.eql(u8, imp_name, "list")) siblings.list
-                else if (std.mem.eql(u8, imp_name, "vector")) siblings.vector
-                else if (std.mem.eql(u8, imp_name, "bignum")) siblings.bignum
-                else if (std.mem.eql(u8, imp_name, "intern")) siblings.intern
-                else if (std.mem.eql(u8, imp_name, "champ")) siblings.champ
-                else if (std.mem.eql(u8, imp_name, "transient")) siblings.transient
-                else if (std.mem.eql(u8, imp_name, "atom")) siblings.atom
-                else if (std.mem.eql(u8, imp_name, "record")) siblings.record
-                else if (std.mem.eql(u8, imp_name, "protocol")) siblings.protocol
-                else if (std.mem.eql(u8, imp_name, "format")) siblings.format
-                else if (std.mem.eql(u8, imp_name, "gc")) siblings.gc
-                else if (std.mem.eql(u8, imp_name, "codec")) siblings.codec
-                else if (std.mem.eql(u8, imp_name, "db")) siblings.db
-                else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb
-                else if (std.mem.eql(u8, imp_name, "pool")) siblings.pool
-                else if (std.mem.eql(u8, imp_name, "vm")) siblings.vm
-                else if (std.mem.eql(u8, imp_name, "compile")) siblings.compile
-                else if (std.mem.eql(u8, imp_name, "reader")) siblings.reader
-                else if (std.mem.eql(u8, imp_name, "expand")) siblings.expand
-                else if (std.mem.eql(u8, imp_name, "dispatch")) siblings.dispatch
-                else if (std.mem.eql(u8, imp_name, "stdlib")) siblings.stdlib
-                else if (std.mem.eql(u8, imp_name, "nextomic_handle")) siblings.nextomic_handle
-                else if (std.mem.eql(u8, imp_name, "nextomic")) siblings.nextomic
-                else if (std.mem.eql(u8, imp_name, "loader")) siblings.loader
-                else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb
-                else @panic("unknown sibling import");
-            m.addImport(imp_name, mod);
+            var mod: ?*std.Build.Module = null;
+            inline for (@typeInfo(AllSiblings).@"struct".fields) |field| {
+                if (std.mem.eql(u8, imp_name, field.name)) mod = @field(siblings, field.name);
+            }
+            m.addImport(imp_name, mod orelse @panic("unknown sibling import"));
         }
 
         const t = b.addTest(.{ .root_module = m });

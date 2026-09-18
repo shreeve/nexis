@@ -861,9 +861,16 @@ test "benchmark: pull-many [*] and a nested pattern over 20k entities" {
     try testing.expectEqual(emps, vector_mod.count(all));
     try testing.expectEqual(emps, vector_mod.count(some));
     try testing.expectEqual(emps / depts, vector_mod.count((try fx.getName(rev, "emp/_dept")).?));
+    if (!benchOutput()) return;
     std.debug.print("\n[bench] pull-many [*] over {d} entities ({d} datoms each): {d} us\n", .{ emps, 5, (t1 - t0) / 1000 });
     std.debug.print("[bench] pull-many nested ref + limit over {d} entities: {d} us\n", .{ emps, (t2 - t1) / 1000 });
     std.debug.print("[bench] reverse ref pull of {d} employees of one department: {d} us\n", .{ emps / depts, (t3 - t2) / 1000 });
+}
+
+/// Timings print only when `NEXTOMIC_BENCH` is set; the checks run
+/// regardless.
+fn benchOutput() bool {
+    return std.c.getenv("NEXTOMIC_BENCH") != null;
 }
 
 fn nowNs() u64 {
