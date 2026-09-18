@@ -210,7 +210,7 @@ pub const With = struct {
             .db_after = .{ .conn = &self.view, .basis = self.ctx.t },
             .t = self.ctx.t,
             .tempids = try self.ctx.userTempids(),
-            .tx_data = try self.ctx.txData(),
+            .tx_data = self.ctx.tx_data,
         };
         self.finished = false;
         conn.speculative = &self.view;
@@ -314,6 +314,8 @@ const Ctx = struct {
     schema_touched: bool = false,
     /// Per-attribute change in current-datom count.
     deltas: std.AutoHashMapUnmanaged(u32, i64) = .empty,
+    /// The transaction's datoms in write order, built once by `write`.
+    tx_data: []Datom = &.{},
 
     fn begin(conn: *Conn, arena: Allocator, options: Options) !Ctx {
         if (!conn.is_open) return error.Closed;
@@ -696,12 +698,17 @@ const Ctx = struct {
     }
 
     /// Step 7: commit, then publish the mints and update the schema
-    /// cache, and report.
+    /// cache, and report. Everything that can fail (the report's tempid
+    /// bindings, the tx-data, room in the ident cache) is prepared
+    /// before the commit; after it only infallible steps remain, so a
+    /// committed transaction is never reported as an error.
     fn commit(self: *Ctx) !Report {
         const db_before: DbValue = .{ .conn = self.conn, .basis = self.now };
+        const tempids = try self.userTempids();
+        try self.minter.reserveCache();
         try self.txn.commit();
         self.finished = true;
-        try self.minter.commitCache();
+        self.minter.commitCache();
         if (self.schema_touched) {
             self.conn.dropSchema();
         } else if (self.conn.schema_cache) |s| {
@@ -718,8 +725,8 @@ const Ctx = struct {
             .db_before = db_before,
             .db_after = .{ .conn = self.conn, .basis = self.t },
             .t = self.t,
-            .tempids = try self.userTempids(),
-            .tx_data = try self.txData(),
+            .tempids = tempids,
+            .tx_data = self.tx_data,
         };
     }
 
@@ -1128,9 +1135,9 @@ const Ctx = struct {
             try store.writeAttrCount(self.txn, e.key_ptr.*, @intCast(next));
         }
 
-        const datoms = try self.txData();
+        self.tx_data = try self.txData();
         const names: datom_mod.NameSource = .{ .ctx = @ptrCast(self), .identName = &identName };
-        const entry = try datom_mod.encodeTxlog(self.arena, self.now_ms, datoms, names);
+        const entry = try datom_mod.encodeTxlog(self.arena, self.now_ms, self.tx_data, names);
         try store.putTxlog(self.txn, self.t, entry);
 
         try store.writeT(self.txn, self.t);
@@ -1883,4 +1890,58 @@ test "explicit entity ids must have been allocated" {
         .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Back" } } } },
     }, .{});
     try testing.expectEqual(a, r4.tx_data[0].e);
+}
+
+/// Transact one new entity with a fresh keyword value while allocation
+/// `fail_index` of `where` fails; returns whether a failure was induced.
+fn transactWithFailure(tc: *TestConn, arena: Allocator, name: u32, tags: u32, where: enum { arena, cache }, fail_index: usize) !bool {
+    var tx_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer tx_arena.deinit();
+    var fa = std.testing.FailingAllocator.init(if (where == .arena) tx_arena.allocator() else testing.allocator, .{ .fail_index = fail_index });
+    const saved_gpa = tc.conn.idents.gpa;
+    if (where == .cache) {
+        // An empty cache has to grow for the mint, so the publication's
+        // own allocation is in the sweep.
+        tc.conn.idents.by_intern.clearAndFree(saved_gpa);
+        tc.conn.idents.by_ident.clearAndFree(saved_gpa);
+        tc.conn.idents.gpa = fa.allocator();
+    }
+    defer tc.conn.idents.gpa = saved_gpa;
+    const tag = try kw(tc, try std.fmt.allocPrint(arena, "tag/oom-{s}-{d}", .{ @tagName(where), fail_index }));
+    const before = (try tc.conn.db()).basis;
+    const result = transactOps(tc.conn, if (where == .arena) fa.allocator() else tx_arena.allocator(), &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "N" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = tags }, .v = .{ .keyword = tag } } },
+    }, .{});
+    const after = (try tc.conn.db()).basis;
+    if (result) |r| {
+        try testing.expectEqual(before + 1, r.t);
+        try testing.expectEqual(before + 1, after);
+        try testing.expectEqual(@as(usize, 1), r.tempids.len);
+        try testing.expectEqual(@as(usize, 3), r.tx_data.len);
+    } else |err| {
+        try testing.expectEqual(error.OutOfMemory, err);
+        try testing.expectEqual(before, after);
+    }
+    return fa.has_induced_failure;
+}
+
+test "an allocation failure never reports an error for a committed transaction" {
+    const tc = try TestConn.init("tx_oom");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const tags = try attrId(tc, "user/tags");
+
+    // Every allocation the transaction makes, first in its arena and
+    // then in the ident cache, fails once at index i. Either the
+    // transaction errors and t is untouched, or it commits and reports.
+    inline for (.{ .arena, .cache }) |where| {
+        var fail_index: usize = 0;
+        while (try transactWithFailure(tc, arena, name, tags, where, fail_index)) : (fail_index += 1) {}
+        try testing.expect(fail_index > @as(usize, if (where == .arena) 8 else 0));
+    }
 }
