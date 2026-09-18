@@ -161,7 +161,10 @@ so there is no queue; emdb's write lock is the transactor.
    were all retracted stays addressable. Map
    forms `{:db/id e :attr v ...}` expand; nested maps under component or
    ref attributes become entities with fresh tempids; vectors under
-   card-many attributes expand to one datom each.
+   card-many attributes expand to one datom each, except that under a
+   ref attribute a two-element vector whose first element names an
+   attribute is one lookup ref (`{:user/friends [:user/email "a@x"]}`
+   is one friend; `[[:user/email "a@x"] "tmp"]` is two).
 3. **Resolve** attributes through the ident cache (unknown →
    `:nextomic/unknown-attribute`); validate each `v` against the
    attribute's `:db/valueType`; mint ident ids for new keyword values

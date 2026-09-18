@@ -567,7 +567,7 @@ const Ctx = struct {
             if (self.kwIs(entry.key, "db/id")) continue;
             const attr = try self.attrFromVm(entry.key);
             const v = entry.value;
-            if (attr.many() and isCollection(v)) {
+            if (attr.many() and isCollection(v) and !(attr.value_type == .ref and try self.isLookupRef(v))) {
                 var elems = try collectionElements(self.arena, v);
                 for (elems[0..]) |el| try self.addFromVm(e, attr, el);
                 elems = &.{};
@@ -576,6 +576,17 @@ const Ctx = struct {
             }
         }
         return e;
+    }
+
+    /// Under a ref attribute a two-element vector whose first element is
+    /// a keyword naming an attribute is a lookup ref, one value; a
+    /// collection of lookup refs is a vector of such vectors.
+    fn isLookupRef(self: *Ctx, v: Value) !bool {
+        if (v.kind() != .persistent_vector or vector_mod.count(v) != 2) return false;
+        const head = vector_mod.nth(v, 0);
+        if (head.kind() != .keyword) return false;
+        const id = (try self.minter.lookup(head.asKeywordId())) orelse return false;
+        return self.schema.attr(id) != null;
     }
 
     fn addFromVm(self: *Ctx, e: Ent, attr: Attr, v: Value) anyerror!void {
@@ -2029,4 +2040,73 @@ test "retractEntity expands against the committed state; the transaction's own d
     const bn = try (try tc.conn.db()).entity(arena, b);
     try testing.expectEqual(@as(usize, 1), bn.len);
     try testing.expectEqual(age, bn[0].a);
+}
+
+test "a lookup ref under a card-many ref attribute is one ref; a vector of them is a collection" {
+    const tc = try TestConn.init("tx_lookup_many");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    const dispatch = @import("dispatch");
+    try installSchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const friend = try attrId(tc, "user/friend");
+    const tags = try attrId(tc, "user/tags");
+
+    const r0 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "bob" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "bob@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "cy" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "cy@x" } } } },
+    }, .{});
+    const bob = r0.tempids[0].eid;
+    const cy = r0.tempids[1].eid;
+
+    const K = struct {
+        fn k(t: *TestConn, n: []const u8) !Value {
+            return t.interner.internKeywordValue(n);
+        }
+    };
+    const lookup_bob = try vector_mod.fromSlice(&heap, &.{ try K.k(tc, "user/email"), try string_mod.fromBytes(&heap, "bob@x") });
+    const lookup_cy = try vector_mod.fromSlice(&heap, &.{ try K.k(tc, "user/email"), try string_mod.fromBytes(&heap, "cy@x") });
+
+    // One lookup ref: one friend.
+    var m = try champ.mapEmpty(&heap);
+    m = try champ.mapAssoc(&heap, m, try K.k(tc, "db/id"), try string_mod.fromBytes(&heap, "ann"), &dispatch.hashValue, &dispatch.equal);
+    m = try champ.mapAssoc(&heap, m, try K.k(tc, "user/email"), try string_mod.fromBytes(&heap, "ann@x"), &dispatch.hashValue, &dispatch.equal);
+    m = try champ.mapAssoc(&heap, m, try K.k(tc, "user/friend"), lookup_bob, &dispatch.hashValue, &dispatch.equal);
+    const r1 = try transact(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{m}), .{});
+    try testing.expectEqual(@as(usize, 1), r1.tempids.len);
+    const ann = r1.tempids[0].eid;
+    const friends1 = try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = ann, .a = friend });
+    try testing.expectEqual(@as(usize, 1), friends1.len);
+    try testing.expectEqual(bob, friends1[0].v.ref);
+
+    // A vector of lookup refs and tempids: one friend each.
+    const many = try vector_mod.fromSlice(&heap, &.{ lookup_cy, try string_mod.fromBytes(&heap, "dee") });
+    var m2 = try champ.mapEmpty(&heap);
+    m2 = try champ.mapAssoc(&heap, m2, try K.k(tc, "db/id"), try string_mod.fromBytes(&heap, "ann2"), &dispatch.hashValue, &dispatch.equal);
+    m2 = try champ.mapAssoc(&heap, m2, try K.k(tc, "user/email"), try string_mod.fromBytes(&heap, "ann@x"), &dispatch.hashValue, &dispatch.equal);
+    m2 = try champ.mapAssoc(&heap, m2, try K.k(tc, "user/friend"), many, &dispatch.hashValue, &dispatch.equal);
+    var dee = try champ.mapEmpty(&heap);
+    dee = try champ.mapAssoc(&heap, dee, try K.k(tc, "db/id"), try string_mod.fromBytes(&heap, "dee"), &dispatch.hashValue, &dispatch.equal);
+    dee = try champ.mapAssoc(&heap, dee, try K.k(tc, "user/email"), try string_mod.fromBytes(&heap, "dee@x"), &dispatch.hashValue, &dispatch.equal);
+    const r2 = try transact(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{ m2, dee }), .{});
+    try testing.expectEqual(ann, r2.tempids[0].eid);
+    const dee_e = r2.tempids[1].eid;
+    const friends2 = try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = ann, .a = friend });
+    try testing.expectEqual(@as(usize, 3), friends2.len);
+    try testing.expectEqual(bob, friends2[0].v.ref);
+    try testing.expectEqual(cy, friends2[1].v.ref);
+    try testing.expectEqual(dee_e, friends2[2].v.ref);
+
+    // A two-element keyword vector under a card-many keyword attribute is
+    // still a collection, whatever its first element names.
+    var m3 = try champ.mapEmpty(&heap);
+    m3 = try champ.mapAssoc(&heap, m3, try K.k(tc, "db/id"), try string_mod.fromBytes(&heap, "ann3"), &dispatch.hashValue, &dispatch.equal);
+    m3 = try champ.mapAssoc(&heap, m3, try K.k(tc, "user/email"), try string_mod.fromBytes(&heap, "ann@x"), &dispatch.hashValue, &dispatch.equal);
+    m3 = try champ.mapAssoc(&heap, m3, try K.k(tc, "user/tags"), try vector_mod.fromSlice(&heap, &.{ try K.k(tc, "user/email"), try K.k(tc, "tag/b") }), &dispatch.hashValue, &dispatch.equal);
+    _ = try transact(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{m3}), .{});
+    try testing.expectEqual(@as(usize, 2), (try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = ann, .a = tags })).len);
 }
