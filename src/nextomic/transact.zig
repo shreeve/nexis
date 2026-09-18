@@ -202,6 +202,7 @@ pub const With = struct {
             .idents = try conn.idents.clone(),
             .sync_mode = self.ctx.sync_mode,
             .is_open = true,
+            .owns_store = false,
             .overlay = self.ctx.txn,
         };
         errdefer self.view.idents.deinit();
@@ -321,8 +322,11 @@ const Ctx = struct {
         if (!conn.is_open) return error.Closed;
         if (conn.speculative != null or conn.overlay != null) return error.Nested;
         const sync_mode = options.sync orelse conn.sync_mode;
-        const txn = try conn.store.beginWrite(sync_mode);
-        errdefer txn.abort();
+        const txn = try conn.beginWriteTxn(sync_mode);
+        errdefer {
+            txn.abort();
+            conn.taskDone();
+        }
         const now = try conn.store.readT(txn);
         if (now + 1 >= key.tx_partition_bit) return error.DatabaseFull;
         const schema = try conn.schemaAt(txn, now, now);
@@ -344,6 +348,7 @@ const Ctx = struct {
         if (self.finished) return;
         self.finished = true;
         self.txn.abort();
+        self.conn.taskDone();
     }
 
     // ── attributes ────────────────────────────────────────────────
@@ -719,6 +724,7 @@ const Ctx = struct {
         try self.minter.reserveCache();
         try self.txn.commit();
         self.finished = true;
+        self.conn.taskDone();
         self.minter.commitCache();
         if (self.schema_touched) {
             self.conn.dropSchema();
@@ -1673,7 +1679,7 @@ test "with: the view sees the speculative state, the connection does not" {
     // The minted keyword resolves through the view's cache only.
     {
         const txn = try w.view.beginReadTxn();
-        defer txn.abort();
+        defer w.view.endReadTxn(txn);
         try testing.expect((try w.view.idents.idOf(txn, k_new)) != null);
     }
     try testing.expect(tc.conn.idents.by_intern.get(k_new) == null);
@@ -2109,4 +2115,30 @@ test "a lookup ref under a card-many ref attribute is one ref; a vector of them 
     m3 = try champ.mapAssoc(&heap, m3, try K.k(tc, "user/tags"), try vector_mod.fromSlice(&heap, &.{ try K.k(tc, "user/email"), try K.k(tc, "tag/b") }), &dispatch.hashValue, &dispatch.equal);
     _ = try transact(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{m3}), .{});
     try testing.expectEqual(@as(usize, 2), (try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = ann, .a = tags })).len);
+}
+
+test "a held with keeps the store open until finish; a closed connection refuses writes" {
+    const tc = try TestConn.init("tx_busy_with");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+
+    const w = try withOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    defer w.finish();
+    const a = w.report.tempids[0].eid;
+    try testing.expectError(error.Busy, tc.conn.release());
+    tc.conn.close();
+    try testing.expect(!tc.conn.is_open and tc.conn.close_pending and !tc.conn.store_closed);
+    // The view still reads the speculative state.
+    try testing.expectEqual(@as(usize, 1), (try w.db().entity(arena, a)).len);
+    w.finish();
+    try testing.expect(tc.conn.store_closed);
+    try testing.expectError(error.Closed, w.db().entity(arena, a));
+    try testing.expectError(error.Closed, transactOps(tc.conn, arena, &.{}, .{}));
+    try testing.expectError(error.Closed, withOps(tc.conn, arena, &.{}, .{}));
 }

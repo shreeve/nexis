@@ -212,6 +212,14 @@ batches the meta flush; `:none` is for bulk loads followed by
 `(d/db conn)` opens a pooled read transaction, reads `sys["t"]` as the
 basis, closes it, and returns `{store, basis, mode = current}`.
 
+A connection counts its operations in flight (reads, a `transact!`, a
+held `with`). `release` refuses while the count is nonzero
+(`:nextomic/busy`); closing a connection at teardown while it is busy
+marks it closed at once and frees the store when the last operation
+ends, so no cursor in flight dangles. A closed connection keeps its
+struct for as long as db-values can name it; every operation on them
+is `:nextomic/closed`.
+
 Every operation on a db-value opens one read transaction, reads
 `sys["t"]` as `now`, and:
 
@@ -315,7 +323,7 @@ sub-plans with the same output variables.
 | form | semantics |
 |---|---|
 | `(d/connect path)` / `(d/connect path {:sync ...})` | open or create, bootstrap on first open, cache idents and schema; returns a connection |
-| `(d/release conn)` | close, idempotent |
+| `(d/release conn)` | close, idempotent; `:nextomic/busy` while a query, pull, `transact!` or `with` on the connection is in flight (a released connection keeps its struct, so its db-values raise `:nextomic/closed`) |
 | `(d/db conn)` | db-value at the current basis |
 | `(d/basis-t db)` | the basis |
 | `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report |
@@ -353,8 +361,10 @@ All errors are keywords in the `nextomic` namespace and are catchable:
 `:nextomic/unknown-attribute`, `:nextomic/value-type`,
 `:nextomic/unique`, `:nextomic/conflict`, `:nextomic/no-entity`,
 `:nextomic/unbound-pattern`, `:nextomic/unsupported-range`,
-`:nextomic/basis-in-future`, `:nextomic/closed`, `:nextomic/tx-data`
-for malformed tx-data or a lookup ref on a non-unique attribute,
+`:nextomic/basis-in-future`, `:nextomic/closed`, `:nextomic/busy`
+(`release` while an operation on the connection is in flight),
+`:nextomic/tx-data` for malformed tx-data or a lookup ref on a
+non-unique attribute,
 `:nextomic/history-view` (pull on a history db) and `:nextomic/nested`
 (`transact!` or `with` while a `with` holds the write transaction). Two
 carry their reason as a map: a query syntax error throws

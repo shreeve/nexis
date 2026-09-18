@@ -14,8 +14,9 @@
 //! arguments are `KindMismatch`, as for every other native.
 //!
 //! Connection lifetime: `connect` registers the `Conn` on
-//! `vm.nextomic_connections`; `release` closes it (idempotent) and
-//! leaves the struct allocated so db-values still pointing at it raise
+//! `vm.nextomic_connections`; `release` closes it (idempotent, and
+//! `:nextomic/busy` while an operation on it is in flight) and leaves
+//! the struct allocated so db-values still pointing at it raise
 //! `:nextomic/closed`; VM teardown destroys every connection through
 //! `closeCallback`.
 //!
@@ -179,6 +180,7 @@ pub fn errorKeyword(err: anyerror) []const u8 {
         error.NoEntity => "nextomic/no-entity",
         error.BasisInFuture => "nextomic/basis-in-future",
         error.Closed => "nextomic/closed",
+        error.Busy => "nextomic/busy",
         error.TxData => "nextomic/tx-data",
         error.Nested => "nextomic/nested",
         error.PullSyntax => "nextomic/pull-syntax",
@@ -294,9 +296,12 @@ fn connect(vm: *VM, args: []const Value) !Value {
     return handle.makeConn(vm.ensureHeap(), @ptrCast(c), path);
 }
 
+/// `(release conn)`: idempotent; `:nextomic/busy` while a query, pull,
+/// transaction or `with` on the connection is in flight, so nothing
+/// running holds cursors into a freed store.
 fn fnRelease(vm: *VM, args: []const Value) VmError!Value {
     const c = connOf(args[0]) catch |err| return fail(vm, err);
-    c.close();
+    c.release() catch |err| return fail(vm, err);
     return value.nilValue();
 }
 
@@ -497,7 +502,7 @@ fn transactNative(vm: *VM, args: []const Value) !Value {
 /// in the view's cache only.
 fn reportMap(vm: *VM, conn: *Conn, arena: Allocator, report: transact_mod.Report) !Value {
     const txn = try conn.beginReadTxn();
-    defer txn.abort();
+    defer conn.endReadTxn(txn);
     var b = Builder.init(vm, conn, txn);
 
     var tempids = try champ.mapEmpty(b.heap);
@@ -879,6 +884,7 @@ test "every nextomic error maps to its §7 keyword; engine errors to the db set"
         .{ .err = error.NoEntity, .name = "nextomic/no-entity" },
         .{ .err = error.BasisInFuture, .name = "nextomic/basis-in-future" },
         .{ .err = error.Closed, .name = "nextomic/closed" },
+        .{ .err = error.Busy, .name = "nextomic/busy" },
         .{ .err = error.TxData, .name = "nextomic/tx-data" },
         .{ .err = error.Nested, .name = "nextomic/nested" },
         .{ .err = error.PullSyntax, .name = "nextomic/pull-syntax" },
