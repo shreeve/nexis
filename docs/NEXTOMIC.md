@@ -65,14 +65,14 @@ fields, so it is `key[prefix .. len - suffix]` with no length byte.
 
 ### 2.1 Identifiers
 
-All ids are unsigned 48-bit, stored big-endian in 6 bytes, and fit the
-VM's `fixnum` (i48).
+All ids are stored big-endian in 6 bytes and fit the VM's `fixnum`
+(i48), so the usable range is `0 .. 2^47-1`.
 
 | partition | range | source |
 |---|---|---|
 | attributes and idents | `1 .. 2^32-1` | `sys/"aid"`; an attribute entity's eid **is** its 4-byte `a` |
-| user entities | `2^32 .. 2^47-1` | `sys/"eid"` |
-| transaction entities | `2^47 \| t` | the logical `t` of the transaction |
+| user entities | `2^32 .. 2^46-1` | `sys/"eid"` |
+| transaction entities | `2^46 \| t` | the logical `t` of the transaction |
 
 `t` starts at 1 and increases by one per committed `transact!`. Because
 `t` lives in the same file as the datoms and commits with them, a crash

@@ -106,7 +106,15 @@ pub const Kind = enum(u8) {
     /// (peer-AI turn 84 §"Big missing implementation concern").
     /// See `docs/PROTOCOLS.md` §2.3.
     protocol_fn = 37,
-    // 38..63 reserved for future heap kinds.
+    /// Nextomic connection handle (docs/NEXTOMIC.md §8). Payload is
+    /// a pointer to a `nextomic.Conn` owned by the VM, closed
+    /// explicitly or by the VM's teardown; identity-valued.
+    nextomic_conn = 38,
+    /// Nextomic db-value (docs/NEXTOMIC.md §4). Payload is a pointer
+    /// to a heap-allocated `nextomic.DbValue` `{conn, basis, as-of,
+    /// since, history}`; a plain value with no open transaction.
+    nextomic_db = 39,
+    // 40..63 reserved for future heap kinds.
 
 
     // ---- Runtime-private sentinels (never escape public API) ----
