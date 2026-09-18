@@ -924,11 +924,37 @@ fn execCallNative(
 //     that take a frame pointer must be one-shot.
 // =============================================================================
 
+// Backing-stack extent invariant
+//
+// Frames window into one backing stack and a callee's window
+// (`base_slot .. base_slot + slot_count`) may end BELOW a wider
+// caller's or grandparent's window, so no single frame's extent
+// says how long the stack must be. The rule is per frame:
+//
+//   - On entry to a frame, `entry_stack_len` records
+//     `stack.items.len` as it was before the frame's window was
+//     grown into it: the extent every frame beneath it requires.
+//     `stack.items.len` is then `max(entry_stack_len,
+//     base_slot + slot_count)`.
+//   - On return, and on unwind, popping a frame restores
+//     `stack.items.len` to that frame's `entry_stack_len`. An
+//     unwind that pops several frames restores the lowest popped
+//     frame's value, which is the extent the handler's frame set
+//     requires.
+//
+// The top-level frame is never popped, so the harnesses that
+// retarget `frames.items[0]` in place only have to keep the stack
+// at least `slot_count` long.
+
 pub const Frame = struct {
     routine: *const Routine,
     /// Index into `vm.stack.items` where this frame's slot 0 lives.
     /// Frame's slot[i] is `vm.stack.items[base_slot + i]`.
     base_slot: u32,
+    /// `stack.items.len` at the moment this frame was pushed: the
+    /// extent the frames beneath it require. Popping this frame,
+    /// by return or by unwind, restores the stack to this length.
+    entry_stack_len: u32,
     /// Logical slot count for bounds checks + (future) GC root walk.
     /// Always equals `routine.slot_count` at frame construction;
     /// kept on the frame for direct access in hot dispatch paths.
@@ -1289,12 +1315,6 @@ pub const Handler = struct {
     /// carry this so unwind through either kind runs the
     /// finally.
     finally_pc: ?u32 = null,
-    /// Stack depth (logical, NOT physical) when the handler
-    /// was registered. On throw-unwind, shrink stack back to
-    /// this. v1: equal to frame.slot_count for the registering
-    /// frame (we don't yet have dynamic stack growth within a
-    /// frame), but reserved for future call-window cleanup.
-    saved_stack_len: usize,
 };
 
 /// Step #9.2 (peer-AI turn 59 §D5): tagged continuation for
@@ -1449,6 +1469,7 @@ pub const VM = struct {
         try frames.append(allocator, .{
             .routine = routine,
             .base_slot = 0,
+            .entry_stack_len = 0,
             .slot_count = routine.slot_count,
             .pc = 0,
         });
@@ -1930,6 +1951,7 @@ pub const VM = struct {
                 self.frames.append(self.allocator, .{
                     .routine = routine,
                     .base_slot = @intCast(base_slot),
+                    .entry_stack_len = @intCast(base_slot),
                     .slot_count = routine.slot_count,
                     .pc = 0,
                     .upvalues = closure.upvalues,
@@ -2483,6 +2505,10 @@ pub const VM = struct {
         const callee_base: u32 = caller_base + call_base + 1;
         const callee_end: u32 = callee_base + callee_routine.slot_count;
 
+        // The stack length before the callee's window is grown
+        // into it is what the callee's return must restore.
+        const entry_stack_len: u32 = @intCast(self.stack.items.len);
+
         // Grow stack to fit the callee's full slot range. Args
         // are already at callee_base..callee_base+argc (windowed
         // from the caller). Locals/temps beyond args MUST be
@@ -2560,6 +2586,7 @@ pub const VM = struct {
         try self.frames.append(self.allocator, .{
             .routine = callee_routine,
             .base_slot = callee_base,
+            .entry_stack_len = entry_stack_len,
             .slot_count = callee_routine.slot_count,
             .pc = 0,
             .return_dst = result_dst,
@@ -2586,8 +2613,8 @@ pub const VM = struct {
         // frame path. If this frame's host_result is set, the
         // caller is HOST CODE (not a regular routine), so the
         // result must go into the result cell, not into a
-        // caller's slot. Pop the frame, shrink the stack to the
-        // frame's base, and signal completion. `runUntilDepth`
+        // caller's slot. Pop the frame, restore the stack to the
+        // frame's entry length, and signal completion. `runUntilDepth`
         // detects the depth decrease + result_cell.done and
         // returns.
         const callee_idx_check = self.frames.items.len - 1;
@@ -2596,7 +2623,7 @@ pub const VM = struct {
             hr.value = return_value;
             hr.done = true;
             _ = self.frames.pop().?;
-            self.stack.shrinkRetainingCapacity(callee.base_slot);
+            self.stack.shrinkRetainingCapacity(callee.entry_stack_len);
             return;
         }
 
@@ -2626,7 +2653,7 @@ pub const VM = struct {
 
         // Mutations from here on out are post-validation.
         _ = self.frames.pop().?;
-        self.stack.shrinkRetainingCapacity(caller_end);
+        self.stack.shrinkRetainingCapacity(callee_meta.entry_stack_len);
         self.stack.items[absolute] = return_value;
         self.frames.items[caller_idx].pc = callee_meta.return_pc;
     }
@@ -2642,7 +2669,7 @@ pub const VM = struct {
             hr.value = value_mod.nilValue();
             hr.done = true;
             _ = self.frames.pop().?;
-            self.stack.shrinkRetainingCapacity(callee.base_slot);
+            self.stack.shrinkRetainingCapacity(callee.entry_stack_len);
             return;
         }
 
@@ -2664,7 +2691,7 @@ pub const VM = struct {
         if (absolute >= caller_end) return VmError.BytecodeCorruption;
 
         _ = self.frames.pop().?;
-        self.stack.shrinkRetainingCapacity(caller_end);
+        self.stack.shrinkRetainingCapacity(callee_meta.entry_stack_len);
         self.stack.items[absolute] = value_mod.nilValue();
         self.frames.items[caller_idx].pc = callee_meta.return_pc;
     }
@@ -3302,14 +3329,12 @@ pub const VM = struct {
         };
 
         const frame_index = self.frames.items.len - 1;
-        const frame = self.currentFrame();
         try self.handlers.append(self.allocator, .{
             .kind = .try_,
             .frame_index = frame_index,
             .catch_pc = inst.a.index,
             .binding_slot = inst.b.index,
             .finally_pc = finally_pc,
-            .saved_stack_len = @as(usize, frame.base_slot) + @as(usize, frame.slot_count),
         });
     }
 
@@ -3367,10 +3392,11 @@ pub const VM = struct {
     ///   1. Replace the handler with a `.cleanup` (so the catch
     ///      body's own throw isn't re-caught by the same
     ///      handler — peer-AI turn 59 §"Missing trap 1").
-    ///   2. Unwind frames above the handler's frame_index.
-    ///   3. Shrink stack to saved_stack_len.
-    ///   4. Store the thrown value into binding_slot.
-    ///   5. Jump to catch_pc.
+    ///   2. Unwind frames above the handler's frame_index,
+    ///      restoring the stack to the lowest popped frame's
+    ///      entry length.
+    ///   3. Store the thrown value into binding_slot.
+    ///   4. Jump to catch_pc.
     ///
     /// If no `.try_` handler exists anywhere, stores the thrown
     /// value into `VM.unhandled_throw` and returns
@@ -3422,14 +3448,13 @@ pub const VM = struct {
         // Unwind frames above the matched handler's frame.
         // Per peer-AI turn 59 §D8: do NOT write to caller
         // return slots, just pop. (Normal `call:return` writes
-        // to caller's return_dst; throw bypasses that.)
-        while (self.frames.items.len - 1 > matched.frame_index) {
-            _ = self.frames.pop();
-        }
-
-        // Shrink stack back to the matched frame's logical end.
-        if (self.stack.items.len > matched.saved_stack_len) {
-            self.stack.shrinkRetainingCapacity(matched.saved_stack_len);
+        // to caller's return_dst; throw bypasses that.) The
+        // lowest popped frame recorded the stack length its
+        // caller's frame set requires; restore that.
+        if (self.frames.items.len - 1 > matched.frame_index) {
+            const restore_len = self.frames.items[matched.frame_index + 1].entry_stack_len;
+            self.frames.shrinkRetainingCapacity(matched.frame_index + 1);
+            self.stack.shrinkRetainingCapacity(restore_len);
         }
 
         const frame = self.currentFrame();
@@ -3449,7 +3474,6 @@ pub const VM = struct {
                     .catch_pc = 0,
                     .binding_slot = 0,
                     .finally_pc = matched.finally_pc,
-                    .saved_stack_len = matched.saved_stack_len,
                 });
 
                 // Store thrown value into the handler's binding_slot.

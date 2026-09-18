@@ -90,6 +90,16 @@ fn bootstrapCoreForTest(
     }
 }
 
+/// Every frame the VM pushes during a run is popped by return or
+/// unwind before the top-level form halts, and each pop restores
+/// the backing stack to the length recorded at that frame's entry,
+/// so a completed run leaves both the stack length and the frame
+/// depth exactly where they started.
+fn expectStackRestored(v: *vm.VM, stack_len_before: usize, frame_depth_before: usize) !void {
+    try testing.expectEqual(stack_len_before, v.stack.items.len);
+    try testing.expectEqual(frame_depth_before, v.frames.items.len);
+}
+
 /// Phase 3.4: multi-form test helper that processes top-level
 /// forms sequentially (matching runFile semantics). Use this
 /// when `(ns NAME)` switching needs to affect subsequent
@@ -159,7 +169,10 @@ fn expectOutputProgram(src: []const u8, expected: []const u8) !void {
         if (v.stack.items.len < routine.slot_count) {
             try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
         }
+        const stack_len_before = v.stack.items.len;
+        const frame_depth_before = v.frames.items.len;
         last_result = try v.run();
+        try expectStackRestored(&v, stack_len_before, frame_depth_before);
     }
 
     var buf: std.array_list.Managed(u8) = .init(testing.allocator);
@@ -231,7 +244,10 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     if (v.stack.items.len < routine.slot_count) {
         try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
     }
+    const stack_len_before = v.stack.items.len;
+    const frame_depth_before = v.frames.items.len;
     const result = try v.run();
+    try expectStackRestored(&v, stack_len_before, frame_depth_before);
 
     var buf: std.array_list.Managed(u8) = .init(testing.allocator);
     defer buf.deinit();
@@ -2467,3 +2483,233 @@ test "phase5.2b end-to-end: case + trim + split + join chain" {
     , "hello/world/from/nexis");
 }
 
+
+// =============================================================================
+// Backing-stack extent across nested frames
+//
+// Frames window into one backing stack, and a callee's window can end
+// below a wider grandparent's extent. These tests pin the stack-length
+// rule: every frame pop restores the length recorded at that frame's
+// entry, so the frames beneath keep their full extent.
+// =============================================================================
+
+test "integration: stack extent — narrow middle callee under a wide caller" {
+    try expectOutput(
+        \\(do
+        \\  (defn c [] 1)
+        \\  (defn b [] (c))
+        \\  (defn a [] (do (b) (let [x1 1 x2 2 x3 3 x4 4 x5 5 x6 6 x7 7 x8 8 x9 9 x10 10] x10)))
+        \\  (a))
+    , "10");
+}
+
+test "integration: stack extent — narrow handler frame under a wide caller" {
+    // `b` registers the handler and its window ends below `a`'s
+    // extent when called from `a`'s low slot; the catch fires in
+    // `b`, `b` returns, and `a` still binds and reads its locals.
+    try expectOutput(
+        \\(do
+        \\  (defn c [] (throw :deep))
+        \\  (defn b [] (try (c) (catch any e 5)))
+        \\  (defn a [] (do (b) (let [x1 1 x2 2 x3 3 x4 4 x5 5 x6 6 x7 7 x8 8 x9 9 x10 10] (+ x10 (b) x1))))
+        \\  (a))
+    , "16");
+}
+
+test "integration: stack extent — throw from a deep callee caught by an outer try keeps locals" {
+    try expectOutput(
+        \\(do
+        \\  (defn d [] (throw :deep))
+        \\  (defn c [] (let [t1 1 t2 2] (+ t1 t2 (d))))
+        \\  (defn b [] (try (c) (catch any e 50)))
+        \\  (defn a []
+        \\    (do (b)
+        \\      (let [x1 1 x2 2 x3 3 x4 4 x5 5 x6 6 x7 7 x8 8 x9 9 x10 10]
+        \\        (+ (try (b) (catch any e 100)) (try (c) (catch any e 50)) x1 x2 x3 x4 x5 x6 x7 x8 x9 x10))))
+        \\  (a))
+    , "155");
+    // The throw crosses a host frame: `reduce` re-enters the VM
+    // through `callValue` and the handler sits below that entry.
+    try expectOutput(
+        \\(do
+        \\  (defn d [] (throw :deep))
+        \\  (defn c [] (reduce (fn [acc x] (+ acc (d))) 0 [1 2 3]))
+        \\  (defn b [] (try (c) (catch any e 50)))
+        \\  (defn a []
+        \\    (do (b)
+        \\      (let [x1 1 x2 2 x3 3 x4 4 x5 5 x6 6 x7 7 x8 8 x9 9 x10 10]
+        \\        (+ (try (b) (catch any e 100)) (try (c) (catch any e 50)) x1 x2 x3 x4 x5 x6 x7 x8 x9 x10))))
+        \\  (a))
+    , "155");
+}
+
+test "integration: stack extent — native/closure reentrancy 8 deep through callValue" {
+    // closure g → native reduce → closure fn → closure g → ... eight
+    // levels down. Each `g` first calls the narrow `leaf` from a low
+    // slot, so a narrow window ends below `g`'s extent at every
+    // level; the harness checks the stack length and frame depth
+    // are exactly restored after the run.
+    try expectOutput(
+        \\(do
+        \\  (defn id [x] x)
+        \\  (defn leaf [] (id 1))
+        \\  (defn g [n]
+        \\    (if (= n 0)
+        \\      (leaf)
+        \\      (do (leaf)
+        \\        (let [a 1 b 2 c 3 d 4 e 5 f 6 h 7 i 8]
+        \\          (+ (reduce (fn [acc x] (+ acc (g (- n 1)))) 0 [1 1]) a b c d e f h i -36)))))
+        \\  (g 8))
+    , "256");
+    try expectOutput(
+        \\(do
+        \\  (defn id [x] x)
+        \\  (defn leaf [] (id 1))
+        \\  (defn g [n]
+        \\    (if (= n 0)
+        \\      (leaf)
+        \\      (do (leaf)
+        \\        (let [a 1 b 2 c 3 d 4 e 5 f 6 h 7 i 8]
+        \\          (+ (apply g [(- n 1)]) (first (map (fn [x] (g (- n 1))) [1])) a b c d e f h i -36)))))
+        \\  (g 8))
+    , "256");
+}
+
+// Randomized call chains: `f0` calls `f1` calls ... `f{depth}`, each
+// level with a random number of `let` locals and a random call shape,
+// so narrow and wide windows interleave in every order. The expected
+// value is computed directly from the generated shapes.
+const ChainShape = enum {
+    /// `(do (f) (let [...] sum))` — the callee's result is dropped and
+    /// the caller's locals are bound after the call returns.
+    call_then_let,
+    /// `(let [...] (+ (f) locals...))` — locals live across the call.
+    let_then_call,
+    /// Half the locals bound before the call, half after it.
+    call_between_lets,
+    /// The call goes through `reduce`, so a host frame sits between
+    /// caller and callee.
+    call_via_reduce,
+    /// The call sits inside a `try` whose catch never fires.
+    call_in_try,
+    /// The callee returns, then the caller throws to its own catch.
+    call_then_throw,
+};
+
+fn appendLocals(out: *std.ArrayList(u8), values: []const u8, offset: usize) !void {
+    for (values, 0..) |v, j| {
+        try out.print(testing.allocator, " l{d} {d}", .{ offset + j, v });
+    }
+}
+
+fn appendLocalRefs(out: *std.ArrayList(u8), count: usize) !void {
+    var j: usize = 0;
+    while (j < count) : (j += 1) {
+        try out.print(testing.allocator, " l{d}", .{j});
+    }
+}
+
+test "integration: stack extent — randomized call chains match direct evaluation" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_5eed_0000_0001);
+    const random = prng.random();
+    const shapes = std.enums.values(ChainShape);
+
+    var trial: usize = 0;
+    while (trial < 48) : (trial += 1) {
+        const depth = random.intRangeAtMost(usize, 2, 7);
+        const leaf_value = random.intRangeAtMost(u8, 0, 50);
+
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(testing.allocator);
+        try src.appendSlice(testing.allocator, "(do");
+
+        // Widths, local values and shapes per level, kept so the
+        // expected value can be computed from the same data.
+        var widths: [8]usize = undefined;
+        var sums: [8]i64 = undefined;
+        var level_shapes: [8]ChainShape = undefined;
+        var values: [8][10]u8 = undefined;
+
+        var i: usize = 0;
+        while (i < depth) : (i += 1) {
+            widths[i] = random.intRangeAtMost(usize, 0, 10);
+            level_shapes[i] = shapes[random.intRangeAtMost(usize, 0, shapes.len - 1)];
+            sums[i] = 0;
+            var j: usize = 0;
+            while (j < widths[i]) : (j += 1) {
+                values[i][j] = random.intRangeAtMost(u8, 1, 9);
+                sums[i] += values[i][j];
+            }
+            const w = widths[i];
+            const vals = values[i][0..w];
+            try src.print(testing.allocator, " (defn f{d} []", .{i});
+            switch (level_shapes[i]) {
+                .call_then_let => {
+                    try src.print(testing.allocator, " (do (f{d}) (let [", .{i + 1});
+                    try appendLocals(&src, vals, 0);
+                    try src.appendSlice(testing.allocator, "] (+ 0");
+                    try appendLocalRefs(&src, w);
+                    try src.appendSlice(testing.allocator, ")))");
+                },
+                .let_then_call => {
+                    try src.appendSlice(testing.allocator, " (let [");
+                    try appendLocals(&src, vals, 0);
+                    try src.print(testing.allocator, "] (+ (f{d})", .{i + 1});
+                    try appendLocalRefs(&src, w);
+                    try src.appendSlice(testing.allocator, "))");
+                },
+                .call_between_lets => {
+                    const half = w / 2;
+                    try src.appendSlice(testing.allocator, " (let [");
+                    try appendLocals(&src, vals[0..half], 0);
+                    try src.print(testing.allocator, " r (f{d})", .{i + 1});
+                    try appendLocals(&src, vals[half..], half);
+                    try src.appendSlice(testing.allocator, "] (+ r");
+                    try appendLocalRefs(&src, w);
+                    try src.appendSlice(testing.allocator, "))");
+                },
+                .call_via_reduce => {
+                    try src.appendSlice(testing.allocator, " (let [");
+                    try appendLocals(&src, vals, 0);
+                    try src.print(testing.allocator, "] (+ (reduce (fn [acc x] (+ acc (f{d}))) 0 [1])", .{i + 1});
+                    try appendLocalRefs(&src, w);
+                    try src.appendSlice(testing.allocator, "))");
+                },
+                .call_in_try => {
+                    try src.appendSlice(testing.allocator, " (let [");
+                    try appendLocals(&src, vals, 0);
+                    try src.print(testing.allocator, "] (+ (try (f{d}) (catch any e -1))", .{i + 1});
+                    try appendLocalRefs(&src, w);
+                    try src.appendSlice(testing.allocator, "))");
+                },
+                .call_then_throw => {
+                    try src.appendSlice(testing.allocator, " (let [");
+                    try appendLocals(&src, vals, 0);
+                    try src.print(testing.allocator, "] (+ (try (do (f{d}) (throw 7)) (catch any e e))", .{i + 1});
+                    try appendLocalRefs(&src, w);
+                    try src.appendSlice(testing.allocator, "))");
+                },
+            }
+            try src.appendSlice(testing.allocator, ")");
+        }
+        try src.print(testing.allocator, " (defn f{d} [] {d}) (f0))", .{ depth, leaf_value });
+
+        // Direct evaluation of the same chain.
+        var expected: i64 = leaf_value;
+        i = depth;
+        while (i > 0) {
+            i -= 1;
+            expected = switch (level_shapes[i]) {
+                .call_then_let => sums[i],
+                .call_then_throw => 7 + sums[i],
+                else => expected + sums[i],
+            };
+        }
+        var expected_buf: [32]u8 = undefined;
+        const expected_str = try std.fmt.bufPrint(&expected_buf, "{d}", .{expected});
+        expectOutput(src.items, expected_str) catch |err| {
+            std.debug.print("\n  trial {d} source:\n  {s}\n", .{ trial, src.items });
+            return err;
+        };
+    }
+}
