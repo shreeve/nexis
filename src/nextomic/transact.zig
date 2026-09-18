@@ -1945,3 +1945,88 @@ test "an allocation failure never reports an error for a committed transaction" 
         try testing.expect(fail_index > @as(usize, if (where == .arena) 8 else 0));
     }
 }
+
+test "retractEntity expands against the committed state; the transaction's own datoms survive" {
+    const tc = try TestConn.init("tx_retract_pending");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const age = try attrId(tc, "user/age");
+    const friend = try attrId(tc, "user/friend");
+    const home = try attrId(tc, "user/home");
+    const city = try attrId(tc, "addr/city");
+
+    // A tempid asserted and retracted in one transaction: the retraction
+    // sees nothing committed, so the assertion stands.
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "x" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "X" } } } },
+        .{ .retract_entity = .{ .tempid = .{ .string = "x" } } },
+    }, .{});
+    const x = r1.tempids[0].eid;
+    try testing.expectEqual(@as(usize, 2), r1.tx_data.len);
+    try testing.expectEqual(@as(usize, 1), (try (try tc.conn.db()).entity(arena, x)).len);
+
+    // A pending inbound ref is not a current (e' a' e) datom: it stays.
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "A" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 3 } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .string = "h1" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "h1" } }, .a = .{ .id = city }, .v = .{ .val = .{ .string = "Oslo" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "B" } } } },
+    }, .{});
+    const a = r2.tempids[0].eid;
+    const h1 = r2.tempids[1].eid;
+    const b = r2.tempids[2].eid;
+    const r3 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = b }, .a = .{ .id = friend }, .v = .{ .val = .{ .ref = a } } } },
+        .{ .retract_entity = .{ .eid = a } },
+    }, .{});
+    var retracted: usize = 0;
+    for (r3.tx_data) |d| {
+        if (!d.added) retracted += 1;
+    }
+    // a: name, age, home; h1: city.
+    try testing.expectEqual(@as(usize, 4), retracted);
+    const db3 = try tc.conn.db();
+    try testing.expectEqual(@as(usize, 0), (try db3.entity(arena, a)).len);
+    try testing.expectEqual(@as(usize, 0), (try db3.entity(arena, h1)).len);
+    const ab = try key.valBytes(arena, .{ .ref = a });
+    try testing.expectEqual(@as(usize, 1), (try db3.datoms(arena, .vaet, .{ .v = ab })).len);
+
+    // A component replaced and its parent retracted in one transaction:
+    // the committed component goes with the parent, the new one stays.
+    const r4 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "p" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "P" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "p" } }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .string = "old" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "old" } }, .a = .{ .id = city }, .v = .{ .val = .{ .string = "Oslo" } } } },
+    }, .{});
+    const p = r4.tempids[0].eid;
+    const old = r4.tempids[1].eid;
+    const r5 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = p }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .string = "new" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "new" } }, .a = .{ .id = city }, .v = .{ .val = .{ .string = "Rome" } } } },
+        .{ .retract_entity = .{ .eid = p } },
+    }, .{});
+    const new = r5.tempids[0].eid;
+    const db5 = try tc.conn.db();
+    try testing.expectEqual(@as(usize, 0), (try db5.entity(arena, old)).len);
+    const p_now = try db5.entity(arena, p);
+    try testing.expectEqual(@as(usize, 1), p_now.len);
+    try testing.expectEqual(home, p_now[0].a);
+    try testing.expectEqual(new, p_now[0].vals[0].ref);
+    try testing.expectEqualStrings("Rome", (try db5.entity(arena, new))[0].vals[0].string);
+
+    // retractEntity followed by an assertion on the same entity in one
+    // transaction: the assertion is the entity's only datom afterwards.
+    const r6 = try transactOps(tc.conn, arena, &.{
+        .{ .retract_entity = .{ .eid = b } },
+        .{ .add = .{ .e = .{ .eid = b }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 5 } } } },
+    }, .{});
+    _ = r6;
+    const bn = try (try tc.conn.db()).entity(arena, b);
+    try testing.expectEqual(@as(usize, 1), bn.len);
+    try testing.expectEqual(age, bn[0].a);
+}
