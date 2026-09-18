@@ -525,11 +525,26 @@ pub fn build(b: *std.Build) void {
     const integration_nextomic_q_tests = b.addTest(.{ .root_module = integration_nextomic_q_mod });
     const run_integration_nextomic_q_tests = b.addRunArtifact(integration_nextomic_q_tests);
 
+    // The pull corpus (test/integration/nextomic_pull.zig) checks every
+    // pattern against a naive evaluator over entity() and datoms(), and
+    // covers speculative `with` through q, entity and pull.
+    const integration_nextomic_pull_mod = b.createModule(.{
+        .root_source_file = b.path("test/integration/nextomic_pull.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_nextomic_pull_mod.addImport("nextomic", nextomic_mod);
+    integration_nextomic_pull_mod.addImport("reader", reader_mod);
+    for (nextomic_imports) |imp| integration_nextomic_pull_mod.addImport(imp.name, imp.mod);
+    const integration_nextomic_pull_tests = b.addTest(.{ .root_module = integration_nextomic_pull_mod });
+    const run_integration_nextomic_pull_tests = b.addRunArtifact(integration_nextomic_pull_tests);
+
     const nextomic_test_step = b.step("nextomic-test", "Run only the nextomic unit + property tests");
     nextomic_test_step.dependOn(&run_nextomic_tests.step);
     nextomic_test_step.dependOn(&run_prop_nextomic_key_tests.step);
     nextomic_test_step.dependOn(&run_prop_nextomic_tx_tests.step);
     nextomic_test_step.dependOn(&run_integration_nextomic_q_tests.step);
+    nextomic_test_step.dependOn(&run_integration_nextomic_pull_tests.step);
 
     // -------------------------------------------------------------------------
     // Phase 0: reader unit tests (src/reader.zig has its own test { ... }
@@ -663,35 +678,7 @@ pub fn build(b: *std.Build) void {
         });
         for (f.imports) |imp_name| {
             const mod: *std.Build.Module =
-                if (std.mem.eql(u8, imp_name, "hash")) siblings.hash
-                else if (std.mem.eql(u8, imp_name, "value")) siblings.value
-                else if (std.mem.eql(u8, imp_name, "eq")) siblings.eq
-                else if (std.mem.eql(u8, imp_name, "heap")) siblings.heap
-                else if (std.mem.eql(u8, imp_name, "string")) siblings.string
-                else if (std.mem.eql(u8, imp_name, "list")) siblings.list
-                else if (std.mem.eql(u8, imp_name, "vector")) siblings.vector
-                else if (std.mem.eql(u8, imp_name, "bignum")) siblings.bignum
-                else if (std.mem.eql(u8, imp_name, "intern")) siblings.intern
-                else if (std.mem.eql(u8, imp_name, "champ")) siblings.champ
-                else if (std.mem.eql(u8, imp_name, "transient")) siblings.transient
-                else if (std.mem.eql(u8, imp_name, "atom")) siblings.atom
-                else if (std.mem.eql(u8, imp_name, "record")) siblings.record
-                else if (std.mem.eql(u8, imp_name, "protocol")) siblings.protocol
-                else if (std.mem.eql(u8, imp_name, "format")) siblings.format
-                else if (std.mem.eql(u8, imp_name, "gc")) siblings.gc
-                else if (std.mem.eql(u8, imp_name, "codec")) siblings.codec
-                else if (std.mem.eql(u8, imp_name, "db")) siblings.db
-                else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb
-                else if (std.mem.eql(u8, imp_name, "pool")) siblings.pool
-                else if (std.mem.eql(u8, imp_name, "vm")) siblings.vm
-                else if (std.mem.eql(u8, imp_name, "compile")) siblings.compile
-                else if (std.mem.eql(u8, imp_name, "reader")) siblings.reader
-                else if (std.mem.eql(u8, imp_name, "expand")) siblings.expand
-                else if (std.mem.eql(u8, imp_name, "dispatch")) siblings.dispatch
-                else if (std.mem.eql(u8, imp_name, "stdlib")) siblings.stdlib
-                else if (std.mem.eql(u8, imp_name, "loader")) siblings.loader
-                else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb
-                else @panic("unknown sibling import");
+                if (std.mem.eql(u8, imp_name, "hash")) siblings.hash else if (std.mem.eql(u8, imp_name, "value")) siblings.value else if (std.mem.eql(u8, imp_name, "eq")) siblings.eq else if (std.mem.eql(u8, imp_name, "heap")) siblings.heap else if (std.mem.eql(u8, imp_name, "string")) siblings.string else if (std.mem.eql(u8, imp_name, "list")) siblings.list else if (std.mem.eql(u8, imp_name, "vector")) siblings.vector else if (std.mem.eql(u8, imp_name, "bignum")) siblings.bignum else if (std.mem.eql(u8, imp_name, "intern")) siblings.intern else if (std.mem.eql(u8, imp_name, "champ")) siblings.champ else if (std.mem.eql(u8, imp_name, "transient")) siblings.transient else if (std.mem.eql(u8, imp_name, "atom")) siblings.atom else if (std.mem.eql(u8, imp_name, "record")) siblings.record else if (std.mem.eql(u8, imp_name, "protocol")) siblings.protocol else if (std.mem.eql(u8, imp_name, "format")) siblings.format else if (std.mem.eql(u8, imp_name, "gc")) siblings.gc else if (std.mem.eql(u8, imp_name, "codec")) siblings.codec else if (std.mem.eql(u8, imp_name, "db")) siblings.db else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb else if (std.mem.eql(u8, imp_name, "pool")) siblings.pool else if (std.mem.eql(u8, imp_name, "vm")) siblings.vm else if (std.mem.eql(u8, imp_name, "compile")) siblings.compile else if (std.mem.eql(u8, imp_name, "reader")) siblings.reader else if (std.mem.eql(u8, imp_name, "expand")) siblings.expand else if (std.mem.eql(u8, imp_name, "dispatch")) siblings.dispatch else if (std.mem.eql(u8, imp_name, "stdlib")) siblings.stdlib else if (std.mem.eql(u8, imp_name, "loader")) siblings.loader else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
         }
 
@@ -1158,6 +1145,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_nextomic_key_tests.step);
     test_step.dependOn(&run_prop_nextomic_tx_tests.step);
     test_step.dependOn(&run_integration_nextomic_q_tests.step);
+    test_step.dependOn(&run_integration_nextomic_pull_tests.step);
     test_step.dependOn(&run_prop_compile_tests.step);
     test_step.dependOn(&run_integration_eval_tests.step);
     test_step.dependOn(&run_bench_tests.step);
