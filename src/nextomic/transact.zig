@@ -149,6 +149,7 @@ pub fn transact(conn: *Conn, arena: Allocator, tx_data: Value, options: Options)
 pub fn transactOps(conn: *Conn, arena: Allocator, ops: []const Op, options: Options) !Report {
     var ctx = try Ctx.begin(conn, arena, options);
     errdefer ctx.abort();
+    try ctx.ops.ensureTotalCapacityPrecise(arena, ops.len);
     for (ops) |op| try ctx.normaliseOp(op);
     return ctx.run();
 }
@@ -246,6 +247,7 @@ pub fn withOps(conn: *Conn, arena: Allocator, ops: []const Op, options: Options)
     const self = try arena.create(With);
     self.ctx = try Ctx.begin(conn, arena, options);
     errdefer self.ctx.abort();
+    try self.ctx.ops.ensureTotalCapacityPrecise(arena, ops.len);
     for (ops) |op| try self.ctx.normaliseOp(op);
     try self.speculate();
     return self;
@@ -261,13 +263,14 @@ const Ent = union(enum) {
     eid: u64,
     /// Index into `Ctx.bindings`.
     tempid: u32,
-    lookup: Lookup,
+    /// In the arena: the rare case, kept off the common op's size.
+    lookup: *const Lookup,
 };
 
 const PVal = union(enum) {
     val: Val,
     tempid: u32,
-    lookup: Lookup,
+    lookup: *const Lookup,
 };
 
 const ROp = union(enum) {
@@ -462,10 +465,16 @@ const Ctx = struct {
         return switch (e) {
             .eid => |id| .{ .eid = try self.checkEid(id) },
             .tempid => |k| .{ .tempid = try self.tempid(k) },
-            .lookup => |l| .{ .lookup = .{ .attr = try self.lookupAttr(try self.attrOf(l.a), l.v), .v = l.v } },
+            .lookup => |l| .{ .lookup = try self.lookupRef(try self.lookupAttr(try self.attrOf(l.a), l.v), l.v) },
             .ident => |k| .{ .eid = (try self.minter.lookup(k)) orelse return error.NoEntity },
             .tx => .{ .eid = key.txEntity(self.t) },
         };
+    }
+
+    fn lookupRef(self: *Ctx, attr: Attr, v: Val) !*const Lookup {
+        const l = try self.arena.create(Lookup);
+        l.* = .{ .attr = attr, .v = v };
+        return l;
     }
 
     fn lookupAttr(self: *Ctx, attr: Attr, v: Val) !Attr {
@@ -525,10 +534,12 @@ const Ctx = struct {
     fn normaliseValue(self: *Ctx, tx_data: Value) !void {
         switch (tx_data.kind()) {
             .persistent_vector => {
+                try self.ops.ensureTotalCapacityPrecise(self.arena, vector_mod.count(tx_data));
                 var it = vector_mod.Cursor.init(tx_data);
                 while (it.next()) |form| try self.normaliseForm(form);
             },
             .list => {
+                try self.ops.ensureTotalCapacityPrecise(self.arena, list_mod.count(tx_data));
                 var it = list_mod.Cursor.init(tx_data);
                 while (it.next()) |form| try self.normaliseForm(form);
             },
@@ -652,7 +663,7 @@ const Ctx = struct {
                 if (attr.unique == .none) return error.TxData;
                 const lv = try self.valueFromVm(attr, vector_mod.nth(v, 1));
                 if (lv != .val) return error.TxData;
-                return .{ .lookup = .{ .attr = attr, .v = lv.val } };
+                return .{ .lookup = try self.lookupRef(attr, lv.val) };
             },
             else => return error.TxData,
         }
@@ -912,6 +923,12 @@ const Ctx = struct {
     // ── step 4: expand ────────────────────────────────────────────
 
     fn expandAll(self: *Ctx) !void {
+        // Room for one datom per op and the transaction's instant; a
+        // card-one overwrite or a cascade grows past it.
+        const n = self.ops.items.len + 1;
+        try self.overlay.ensureTotalCapacityPrecise(self.arena, n);
+        try self.facts.ensureTotalCapacity(self.arena, @intCast(n));
+        try self.ea_adds.ensureTotalCapacity(self.arena, @intCast(n));
         for (self.ops.items) |op| {
             switch (op) {
                 .add => |o| try self.expandAdd(try self.resolveEnt(o.e), o.attr, try self.resolveVal(o.v)),
@@ -956,12 +973,12 @@ const Ctx = struct {
             if (try self.currentOne(e, attr.id)) |old| {
                 try self.pushRetract(e, attr, old.val, old.vbytes);
             }
-            try self.push(e, attr, v, vb, true);
+            try self.push(e, attr, v, vb, true, fk);
             try self.one_adds.put(self.arena, ea, @intCast(self.overlay.items.len - 1));
             return;
         }
         if (already) return;
-        try self.push(e, attr, v, vb, true);
+        try self.push(e, attr, v, vb, true, fk);
     }
 
     const Current = struct { val: Val, vbytes: []const u8 };
@@ -1054,8 +1071,9 @@ const Ctx = struct {
         for (components.items) |c| try self.expandRetractEntity(c, seen);
     }
 
-    fn push(self: *Ctx, e: u64, attr: Attr, v: Val, vbytes: []const u8, added: bool) !void {
-        const fk = try key.keyBytes(self.arena, .eavt, e, attr.id, vbytes, null);
+    /// Queue a datom; `fact_key` is its EAVT key when the caller has it.
+    fn push(self: *Ctx, e: u64, attr: Attr, v: Val, vbytes: []const u8, added: bool, fact_key: ?[]const u8) !void {
+        const fk = fact_key orelse try key.keyBytes(self.arena, .eavt, e, attr.id, vbytes, null);
         const i: u32 = @intCast(self.overlay.items.len);
         try self.overlay.append(self.arena, .{ .e = e, .attr = attr, .v = v, .vbytes = vbytes, .added = added });
         try self.facts.put(self.arena, fk, i);
@@ -1069,7 +1087,7 @@ const Ctx = struct {
     }
 
     fn pushRetract(self: *Ctx, e: u64, attr: Attr, v: Val, vbytes: []const u8) !void {
-        try self.push(e, attr, v, vbytes, false);
+        try self.push(e, attr, v, vbytes, false, null);
     }
 
     fn txInstant(self: *Ctx) !void {
@@ -1224,8 +1242,12 @@ const Ctx = struct {
         }
 
         self.tx_data = try self.txData();
+        // The txlog entry is built through a VM heap of its own; the
+        // store copies the bytes, so that scratch is freed here.
+        var scratch = std.heap.ArenaAllocator.init(self.conn.gpa);
+        defer scratch.deinit();
         const names: datom_mod.NameSource = .{ .ctx = @ptrCast(self), .identName = &identName };
-        const entry = try datom_mod.encodeTxlog(self.arena, self.now_ms, self.tx_data, names);
+        const entry = try datom_mod.encodeTxlog(scratch.allocator(), self.now_ms, self.tx_data, names);
         try store.putTxlog(self.txn, self.t, entry);
 
         try store.writeT(self.txn, self.t);
@@ -2306,6 +2328,44 @@ test "identity claims whose value is a lookup ref or a tempid upsert" {
     try testing.expect(y != m and y > h and m > h);
     try testing.expectEqual(@as(usize, 4), r5.tx_data.len);
     try testing.expectEqual(@as(?u64, y), try (try tc.conn.db()).entid(arena, .{ .lookup = .{ .a = spouse, .v = .{ .ref = m } } }));
+}
+
+test "a large transaction's arena stays well under a kilobyte per datom" {
+    const tc = try TestConn.init("tx_arena_per_datom");
+    defer tc.deinit();
+    var setup = std.heap.ArenaAllocator.init(testing.allocator);
+    defer setup.deinit();
+    try installSchema(tc, setup.allocator());
+    const email = try attrId(tc, "user/email");
+    const name = try attrId(tc, "user/name");
+    const age = try attrId(tc, "user/age");
+    const bio = try attrId(tc, "user/bio");
+    const home = try attrId(tc, "user/home");
+
+    // The ops live in their own arena; the transaction's arena holds
+    // only what the transaction allocates.
+    const entities = 20_000;
+    const per_entity = 5;
+    const ops = try setup.allocator().alloc(Op, entities * per_entity);
+    for (0..entities) |i| {
+        const id: TempidKey = .{ .fixnum = -@as(i64, @intCast(i + 1)) };
+        const em = try std.fmt.allocPrint(setup.allocator(), "user{d}@example.com", .{i});
+        const nm = try std.fmt.allocPrint(setup.allocator(), "User Number {d}", .{i});
+        ops[i * per_entity + 0] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = email }, .v = .{ .val = .{ .string = em } } } };
+        ops[i * per_entity + 1] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = name }, .v = .{ .val = .{ .string = nm } } } };
+        ops[i * per_entity + 2] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = age }, .v = .{ .val = .{ .long = @intCast(i % 90) } } } };
+        ops[i * per_entity + 3] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = bio }, .v = .{ .val = .{ .string = "A short biography that fits inline in the key." } } } };
+        ops[i * per_entity + 4] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .fixnum = -@as(i64, @intCast((i % entities) + 1)) } } } } };
+    }
+
+    var tx_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer tx_arena.deinit();
+    const r = try transactOps(tc.conn, tx_arena.allocator(), ops, .{});
+    try testing.expectEqual(@as(usize, entities * per_entity + 1), r.tx_data.len);
+    const bytes = tx_arena.queryCapacity();
+    const per_datom = bytes / r.tx_data.len;
+    if (std.c.getenv("NEXTOMIC_BENCH") != null) std.debug.print("\ntransaction arena: {d} bytes for {d} datoms, {d} bytes/datom\n", .{ bytes, r.tx_data.len, per_datom });
+    try testing.expect(per_datom < 1024);
 }
 
 test "the view outlives the scratch arena until destroy" {

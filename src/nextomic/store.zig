@@ -481,32 +481,49 @@ pub const Store = struct {
     /// its own key order. Scratch lives in `arena`.
     pub fn writeBatch(self: *Store, txn: *Txn, t: u64, batch: []const Prepared, arena: Allocator) !void {
         if (batch.len == 0) return;
+        // The keys of one index, packed end to end and reused for the
+        // next; an index a datom is absent from gets an empty key.
+        var total: usize = 0;
+        for (batch) |p| total += key.id_len + key.attr_len + p.vbytes.len;
+        var keys: std.ArrayList(u8) = .empty;
+        try keys.ensureTotalCapacityPrecise(arena, total);
+        const offsets = try arena.alloc(u32, batch.len + 1);
         const order = try arena.alloc(usize, batch.len);
         for (order, 0..) |*o, i| o.* = i;
         inline for (.{ Index.eavt, Index.aevt, Index.avet, Index.vaet }) |index| {
-            const keys = try arena.alloc([]const u8, batch.len);
+            keys.clearRetainingCapacity();
             for (batch, 0..) |p, i| {
-                keys[i] = if (index == .avet and !p.avet or index == .vaet and !p.vaet)
-                    &.{}
-                else
-                    try key.keyBytes(arena, index, p.e, p.a, p.vbytes, null);
+                offsets[i] = @intCast(keys.items.len);
+                if (index == .avet and !p.avet or index == .vaet and !p.vaet) continue;
+                try key.packKey(&keys, arena, index, p.e, p.a, p.vbytes, null);
             }
-            std.mem.sort(usize, order, keys, lessByKey);
+            offsets[batch.len] = @intCast(keys.items.len);
+            const packed_keys: PackedKeys = .{ .bytes = keys.items, .offsets = offsets };
+            std.mem.sort(usize, order, packed_keys, PackedKeys.less);
             for (order) |i| {
-                const p = batch[i];
-                const k = keys[i];
+                const k = packed_keys.at(i);
                 if (k.len == 0) continue;
-                try self.writeOne(txn, index, t, p, k, arena);
+                try self.writeOne(txn, index, t, batch[i], k, arena);
             }
         }
     }
 
-    fn lessByKey(keys: []const []const u8, a: usize, b: usize) bool {
-        return std.mem.order(u8, keys[a], keys[b]) == .lt;
-    }
+    const PackedKeys = struct {
+        bytes: []const u8,
+        offsets: []const u32,
+
+        fn at(self: PackedKeys, i: usize) []const u8 {
+            return self.bytes[self.offsets[i]..self.offsets[i + 1]];
+        }
+
+        fn less(self: PackedKeys, a: usize, b: usize) bool {
+            return std.mem.order(u8, self.at(a), self.at(b)) == .lt;
+        }
+    };
 
     fn writeOne(self: *Store, txn: *Txn, index: Index, t: u64, p: Prepared, cur_key: []const u8, arena: Allocator) !void {
-        const hist_key = try arena.alloc(u8, cur_key.len + key.top_len);
+        var hist_buf: [key.max_key_len]u8 = undefined;
+        const hist_key = hist_buf[0 .. cur_key.len + key.top_len];
         @memcpy(hist_key[0..cur_key.len], cur_key);
         key.writeTop(hist_key[cur_key.len..][0..key.top_len], t, p.added);
         const payload: []const u8 = if (index == .eavt) (p.payload orelse &.{}) else &.{};
