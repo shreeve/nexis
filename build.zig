@@ -454,6 +454,68 @@ pub fn build(b: *std.Build) void {
     stdlib_mod.addImport("emdb", emdb_mod);
 
     // -------------------------------------------------------------------------
+    // nextomic — the Datomic-class database (docs/NEXTOMIC.md §8). One
+    // module above dispatch and vm, imported by stdlib and cli only. The
+    // storage half lives in src/nextomic/{key,datom,store,idents,schema,
+    // transact,db}.zig; the query pipeline, pull and natives are files in
+    // the same module. Its test binary is `nextomic` below.
+    // -------------------------------------------------------------------------
+
+    const nextomic_imports = [_]struct { name: []const u8, mod: *std.Build.Module }{
+        .{ .name = "value", .mod = value_mod },
+        .{ .name = "heap", .mod = heap_mod },
+        .{ .name = "intern", .mod = intern_mod },
+        .{ .name = "hash", .mod = hash_mod },
+        .{ .name = "string", .mod = string_mod },
+        .{ .name = "list", .mod = list_mod },
+        .{ .name = "vector", .mod = vector_mod },
+        .{ .name = "champ", .mod = champ_mod },
+        .{ .name = "codec", .mod = codec_mod },
+        .{ .name = "dispatch", .mod = dispatch_mod },
+        .{ .name = "emdb", .mod = emdb_mod },
+    };
+    const nextomic_mod = b.createModule(.{
+        .root_source_file = b.path("src/nextomic/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    for (nextomic_imports) |imp| nextomic_mod.addImport(imp.name, imp.mod);
+    stdlib_mod.addImport("nextomic", nextomic_mod);
+
+    const nextomic_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/nextomic/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    for (nextomic_imports) |imp| nextomic_tests_mod.addImport(imp.name, imp.mod);
+    const nextomic_tests = b.addTest(.{ .root_module = nextomic_tests_mod });
+    const run_nextomic_tests = b.addRunArtifact(nextomic_tests);
+
+    const prop_nextomic_key_mod = b.createModule(.{
+        .root_source_file = b.path("test/prop/nextomic_key.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prop_nextomic_key_mod.addImport("nextomic", nextomic_mod);
+    const prop_nextomic_key_tests = b.addTest(.{ .root_module = prop_nextomic_key_mod });
+    const run_prop_nextomic_key_tests = b.addRunArtifact(prop_nextomic_key_tests);
+
+    const prop_nextomic_tx_mod = b.createModule(.{
+        .root_source_file = b.path("test/prop/nextomic_tx.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prop_nextomic_tx_mod.addImport("nextomic", nextomic_mod);
+    for (nextomic_imports) |imp| prop_nextomic_tx_mod.addImport(imp.name, imp.mod);
+    const prop_nextomic_tx_tests = b.addTest(.{ .root_module = prop_nextomic_tx_mod });
+    const run_prop_nextomic_tx_tests = b.addRunArtifact(prop_nextomic_tx_tests);
+
+    const nextomic_test_step = b.step("nextomic-test", "Run only the nextomic unit + property tests");
+    nextomic_test_step.dependOn(&run_nextomic_tests.step);
+    nextomic_test_step.dependOn(&run_prop_nextomic_key_tests.step);
+    nextomic_test_step.dependOn(&run_prop_nextomic_tx_tests.step);
+
+    // -------------------------------------------------------------------------
     // Phase 0: reader unit tests (src/reader.zig has its own test { ... }
     // blocks; depends on src/parser.zig + src/nexis.zig which live in the
     // same directory and import each other via @import("parser.zig") etc.).
@@ -1059,6 +1121,10 @@ pub fn build(b: *std.Build) void {
     phase2_test_step.dependOn(&run_prop_compile_tests.step);
     // Phase 2 step #11 — eval-pipeline integration tests.
     phase2_test_step.dependOn(&run_integration_eval_tests.step);
+    // nextomic storage layer: unit + property binaries.
+    phase2_test_step.dependOn(&run_nextomic_tests.step);
+    phase2_test_step.dependOn(&run_prop_nextomic_key_tests.step);
+    phase2_test_step.dependOn(&run_prop_nextomic_tx_tests.step);
 
     test_step.dependOn(&run_prop_primitive_tests.step);
     test_step.dependOn(&run_prop_intern_tests.step);
@@ -1072,6 +1138,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_transient_tests.step);
     test_step.dependOn(&run_prop_codec_tests.step);
     test_step.dependOn(&run_prop_db_tests.step);
+    test_step.dependOn(&run_nextomic_tests.step);
+    test_step.dependOn(&run_prop_nextomic_key_tests.step);
+    test_step.dependOn(&run_prop_nextomic_tx_tests.step);
     test_step.dependOn(&run_prop_compile_tests.step);
     test_step.dependOn(&run_integration_eval_tests.step);
     test_step.dependOn(&run_bench_tests.step);
