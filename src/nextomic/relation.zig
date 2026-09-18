@@ -506,6 +506,34 @@ pub const Relation = struct {
     }
 };
 
+/// A growing set of rows: a relation plus a hash index over it, for
+/// accumulating a fixpoint total without rescanning it.
+pub const Accumulator = struct {
+    rel: Relation,
+    set: Relation.RowSet,
+
+    pub fn create(arena: Allocator, vars: []const Var) !*Accumulator {
+        const self = try arena.create(Accumulator);
+        self.* = .{ .rel = try Relation.init(arena, vars), .set = .{ .rel = &self.rel } };
+        return self;
+    }
+
+    /// Add row `row` of `src` (whose variables cover `rel.vars`);
+    /// false when an equal row was already present.
+    pub fn add(self: *Accumulator, src: *const Relation, row: usize, map: []const usize) !bool {
+        try self.rel.appendFrom(src, row, map);
+        if (try self.set.insert(self.rel.arena, self.rel.rows - 1)) return true;
+        try self.rel.dropLast();
+        return false;
+    }
+
+    /// Does the set hold an equal row to row `row` of `other` (over
+    /// the same variables in the same order)?
+    pub fn contains(self: *Accumulator, other: *const Relation, row: usize) bool {
+        return self.set.contains(other, row, other.rowHash(row));
+    }
+};
+
 const max_identity = 64;
 const identity_table = blk: {
     var t: [max_identity]usize = undefined;

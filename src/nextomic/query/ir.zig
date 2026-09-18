@@ -155,6 +155,10 @@ pub const Clause = union(enum) {
     @"or": struct { join: ?[]const Var, branches: []const Branch },
     /// `(rule-name arg ...)`.
     rule: struct { name: u32, args: []const Arg },
+    /// A join with a relation supplied at run time, by slot id in the
+    /// plan context; rule expansion replaces recursive calls with it.
+    /// `vars` bind the relation's columns positionally.
+    source: struct { id: usize, vars: []const Var },
 };
 
 pub const AggOp = enum {
@@ -311,6 +315,7 @@ pub fn boundVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(
         .rule => |r| for (r.args) |a| {
             if (a == .variable) try addVar(arena, out, a.variable);
         },
+        .source => |s| for (s.vars) |v| try addVar(arena, out, v),
     };
 }
 
@@ -337,6 +342,7 @@ pub fn allVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(Va
         .rule => |r| for (r.args) |a| {
             if (a == .variable) try addVar(arena, out, a.variable);
         },
+        .source => |s| for (s.vars) |v| try addVar(arena, out, v),
     };
 }
 
