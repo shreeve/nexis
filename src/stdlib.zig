@@ -216,10 +216,27 @@ const core_fns = [_]CoreEntry{
     .{ .name = "+", .descriptor = &native_add },
     .{ .name = "-", .descriptor = &native_sub },
     .{ .name = "*", .descriptor = &native_mul },
+    .{ .name = "/", .descriptor = &native_div },
+    .{ .name = "quot", .descriptor = &native_quot },
+    .{ .name = "rem", .descriptor = &native_rem },
+    .{ .name = "mod", .descriptor = &native_mod },
     .{ .name = "<", .descriptor = &native_lt },
+    .{ .name = "<=", .descriptor = &native_lte },
+    .{ .name = ">", .descriptor = &native_gt },
+    .{ .name = ">=", .descriptor = &native_gte },
+    .{ .name = "==", .descriptor = &native_num_eq },
     .{ .name = "=", .descriptor = &native_eq },
+    .{ .name = "not=", .descriptor = &native_not_eq },
     .{ .name = "inc", .descriptor = &native_inc },
     .{ .name = "dec", .descriptor = &native_dec },
+    .{ .name = "max", .descriptor = &native_max },
+    .{ .name = "min", .descriptor = &native_min },
+    .{ .name = "abs", .descriptor = &native_abs },
+    .{ .name = "number?", .descriptor = &native_number_q },
+    .{ .name = "integer?", .descriptor = &native_integer_q },
+    .{ .name = "float?", .descriptor = &native_float_q },
+    .{ .name = "NaN?", .descriptor = &native_nan_q },
+    .{ .name = "infinite?", .descriptor = &native_infinite_q },
     .{ .name = "not", .descriptor = &native_not },
     .{ .name = "zero?", .descriptor = &native_zero_q },
     .{ .name = "pos?", .descriptor = &native_pos_q },
@@ -354,10 +371,27 @@ const native_some_q = NativeFn{
 const native_add = NativeFn{ .name = "+", .min_arity = 0, .max_arity = null, .call = &fnAdd };
 const native_sub = NativeFn{ .name = "-", .min_arity = 1, .max_arity = null, .call = &fnSub };
 const native_mul = NativeFn{ .name = "*", .min_arity = 0, .max_arity = null, .call = &fnMul };
+const native_div = NativeFn{ .name = "/", .min_arity = 1, .max_arity = null, .call = &fnDiv };
+const native_quot = NativeFn{ .name = "quot", .min_arity = 2, .max_arity = 2, .call = &fnQuot };
+const native_rem = NativeFn{ .name = "rem", .min_arity = 2, .max_arity = 2, .call = &fnRem };
+const native_mod = NativeFn{ .name = "mod", .min_arity = 2, .max_arity = 2, .call = &fnMod };
 const native_lt = NativeFn{ .name = "<", .min_arity = 0, .max_arity = null, .call = &fnLt };
+const native_lte = NativeFn{ .name = "<=", .min_arity = 0, .max_arity = null, .call = &fnLte };
+const native_gt = NativeFn{ .name = ">", .min_arity = 0, .max_arity = null, .call = &fnGt };
+const native_gte = NativeFn{ .name = ">=", .min_arity = 0, .max_arity = null, .call = &fnGte };
+const native_num_eq = NativeFn{ .name = "==", .min_arity = 0, .max_arity = null, .call = &fnNumEq };
 const native_eq = NativeFn{ .name = "=", .min_arity = 0, .max_arity = null, .call = &fnEq };
+const native_not_eq = NativeFn{ .name = "not=", .min_arity = 1, .max_arity = null, .call = &fnNotEq };
 const native_inc = NativeFn{ .name = "inc", .min_arity = 1, .max_arity = 1, .call = &fnInc };
 const native_dec = NativeFn{ .name = "dec", .min_arity = 1, .max_arity = 1, .call = &fnDec };
+const native_max = NativeFn{ .name = "max", .min_arity = 1, .max_arity = null, .call = &fnMax };
+const native_min = NativeFn{ .name = "min", .min_arity = 1, .max_arity = null, .call = &fnMin };
+const native_abs = NativeFn{ .name = "abs", .min_arity = 1, .max_arity = 1, .call = &fnAbs };
+const native_number_q = NativeFn{ .name = "number?", .min_arity = 1, .max_arity = 1, .call = &fnNumberQ };
+const native_integer_q = NativeFn{ .name = "integer?", .min_arity = 1, .max_arity = 1, .call = &fnIntegerQ };
+const native_float_q = NativeFn{ .name = "float?", .min_arity = 1, .max_arity = 1, .call = &fnFloatQ };
+const native_nan_q = NativeFn{ .name = "NaN?", .min_arity = 1, .max_arity = 1, .call = &fnNanQ };
+const native_infinite_q = NativeFn{ .name = "infinite?", .min_arity = 1, .max_arity = 1, .call = &fnInfiniteQ };
 const native_not = NativeFn{ .name = "not", .min_arity = 1, .max_arity = 1, .call = &fnNot };
 const native_zero_q = NativeFn{ .name = "zero?", .min_arity = 1, .max_arity = 1, .call = &fnZeroQ };
 const native_pos_q = NativeFn{ .name = "pos?", .min_arity = 1, .max_arity = 1, .call = &fnPosQ };
@@ -547,7 +581,7 @@ fn fnCount(_: *VM, args: []const Value) VmError!Value {
         .string => @intCast(string_mod.codepointCount(c) catch return VmError.Utf8Error),
         else => return VmError.KindMismatch,
     };
-    return value_mod.fromFixnum(n) orelse VmError.IntegerOverflow;
+    return value_mod.fromFixnum(n) orelse VmError.ArithmeticOverflow;
 }
 
 /// `(nth coll n)` → element at index `n`. Throws on out-of-
@@ -652,82 +686,105 @@ fn fnSomeQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Arithmetic + comparison (3.3b)
+// Arithmetic + comparison
 // =============================================================================
 //
-// Fixnum-only for v1, matching the inlined `math:add` /
-// `cmp:lt` opcode paths. Float / bignum support is a Phase 4+
-// numeric-tower expansion. Variadic semantics match Clojure:
+// Every operator runs on the numeric tower in vm.zig (`numAdd`
+// and friends), the same code the `math:*` / `cmp:*` opcodes
+// use, so an inlined `(+ a b)` and a first-class `+` agree
+// exactly. Variadic semantics match Clojure:
 //
-//   (+)        => 0
-//   (+ x)      => x  (must be numeric)
-//   (+ x y...) => left-to-right sum
-//   (<)        => true
-//   (< x)      => true
-//   (< x y z)  => chained
+//   (+)        => 0            (*)        => 1
+//   (+ x)      => x            (- x)      => negation
+//   (+ x y...) => left fold    (/ x)      => reciprocal
+//   (<)        => true         (< x y z)  => chained
 //
-// Equality `(=)`:
-//   (=)        => true
-//   (= x)      => true
-//   (= x y z)  => chained value-equality via dispatch.equal
+// `=` is value equality (dispatch.equal, cross-type false);
+// `==` is numeric equality with contagion (`(== 1 1.0)` is true).
 
 const dispatch_mod = @import("dispatch");
+
+fn requireNumber(v: Value) VmError!Value {
+    if (!vm_mod.isNumber(v)) return VmError.KindMismatch;
+    return v;
+}
 
 fn requireFixnum(v: Value) VmError!i64 {
     if (v.kind() != .fixnum) return VmError.KindMismatch;
     return v.asFixnum();
 }
 
+const BinaryNum = *const fn (Value, Value) VmError!Value;
+
+/// Left fold of `op` over `args`, which must be non-empty.
+fn foldNumbers(op: BinaryNum, args: []const Value) VmError!Value {
+    var acc = try requireNumber(args[0]);
+    for (args[1..]) |x| acc = try op(acc, x);
+    return acc;
+}
+
 fn fnAdd(_: *VM, args: []const Value) VmError!Value {
     if (args.len == 0) return value_mod.fromFixnum(0).?;
-    var acc = try requireFixnum(args[0]);
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const x = try requireFixnum(args[i]);
-        const sum = std.math.add(i64, acc, x) catch return VmError.IntegerOverflow;
-        acc = sum;
-    }
-    return value_mod.fromFixnum(acc) orelse VmError.IntegerOverflow;
+    return foldNumbers(&vm_mod.numAdd, args);
 }
 
 fn fnSub(_: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) {
-        // Unary negation.
-        const x = try requireFixnum(args[0]);
-        const neg = std.math.negate(x) catch return VmError.IntegerOverflow;
-        return value_mod.fromFixnum(neg) orelse VmError.IntegerOverflow;
-    }
-    var acc = try requireFixnum(args[0]);
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const x = try requireFixnum(args[i]);
-        const diff = std.math.sub(i64, acc, x) catch return VmError.IntegerOverflow;
-        acc = diff;
-    }
-    return value_mod.fromFixnum(acc) orelse VmError.IntegerOverflow;
+    if (args.len == 1) return vm_mod.numNeg(args[0]);
+    return foldNumbers(&vm_mod.numSub, args);
 }
 
 fn fnMul(_: *VM, args: []const Value) VmError!Value {
     if (args.len == 0) return value_mod.fromFixnum(1).?;
-    var acc = try requireFixnum(args[0]);
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const x = try requireFixnum(args[i]);
-        const prod = std.math.mul(i64, acc, x) catch return VmError.IntegerOverflow;
-        acc = prod;
+    return foldNumbers(&vm_mod.numMul, args);
+}
+
+fn fnDiv(_: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return vm_mod.numDiv(value_mod.fromFixnum(1).?, args[0]);
+    return foldNumbers(&vm_mod.numDiv, args);
+}
+
+fn fnQuot(_: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numQuot(args[0], args[1]);
+}
+
+fn fnRem(_: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numRem(args[0], args[1]);
+}
+
+fn fnMod(_: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numMod(args[0], args[1]);
+}
+
+/// Chained comparison: true iff every adjacent pair satisfies
+/// `cmp`. Fewer than two arguments is vacuously true; a lone
+/// argument must still be a number.
+fn chainCompare(cmp: vm_mod.NumCmp, args: []const Value) VmError!Value {
+    if (args.len == 1) _ = try requireNumber(args[0]);
+    var i: usize = 0;
+    while (i + 1 < args.len) : (i += 1) {
+        if (!try vm_mod.numCompare(cmp, args[i], args[i + 1])) return value_mod.fromBool(false);
     }
-    return value_mod.fromFixnum(acc) orelse VmError.IntegerOverflow;
+    return value_mod.fromBool(true);
 }
 
 fn fnLt(_: *VM, args: []const Value) VmError!Value {
-    if (args.len < 2) return value_mod.fromBool(true);
-    var i: usize = 0;
-    while (i + 1 < args.len) : (i += 1) {
-        const a = try requireFixnum(args[i]);
-        const b = try requireFixnum(args[i + 1]);
-        if (!(a < b)) return value_mod.fromBool(false);
-    }
-    return value_mod.fromBool(true);
+    return chainCompare(.lt, args);
+}
+
+fn fnLte(_: *VM, args: []const Value) VmError!Value {
+    return chainCompare(.lte, args);
+}
+
+fn fnGt(_: *VM, args: []const Value) VmError!Value {
+    return chainCompare(.gt, args);
+}
+
+fn fnGte(_: *VM, args: []const Value) VmError!Value {
+    return chainCompare(.gte, args);
+}
+
+fn fnNumEq(_: *VM, args: []const Value) VmError!Value {
+    return chainCompare(.eq, args);
 }
 
 fn fnEq(_: *VM, args: []const Value) VmError!Value {
@@ -739,16 +796,33 @@ fn fnEq(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(true);
 }
 
+fn fnNotEq(vm: *VM, args: []const Value) VmError!Value {
+    const same = try fnEq(vm, args);
+    return value_mod.fromBool(!same.asBool());
+}
+
 fn fnInc(_: *VM, args: []const Value) VmError!Value {
-    const x = try requireFixnum(args[0]);
-    const r = std.math.add(i64, x, 1) catch return VmError.IntegerOverflow;
-    return value_mod.fromFixnum(r) orelse VmError.IntegerOverflow;
+    return vm_mod.numAdd(args[0], value_mod.fromFixnum(1).?);
 }
 
 fn fnDec(_: *VM, args: []const Value) VmError!Value {
-    const x = try requireFixnum(args[0]);
-    const r = std.math.sub(i64, x, 1) catch return VmError.IntegerOverflow;
-    return value_mod.fromFixnum(r) orelse VmError.IntegerOverflow;
+    return vm_mod.numSub(args[0], value_mod.fromFixnum(1).?);
+}
+
+fn fnMax(_: *VM, args: []const Value) VmError!Value {
+    var acc = try requireNumber(args[0]);
+    for (args[1..]) |x| acc = try vm_mod.numExtremum(true, acc, x);
+    return acc;
+}
+
+fn fnMin(_: *VM, args: []const Value) VmError!Value {
+    var acc = try requireNumber(args[0]);
+    for (args[1..]) |x| acc = try vm_mod.numExtremum(false, acc, x);
+    return acc;
+}
+
+fn fnAbs(_: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numAbs(args[0]);
 }
 
 fn fnNot(_: *VM, args: []const Value) VmError!Value {
@@ -756,20 +830,18 @@ fn fnNot(_: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnZeroQ(_: *VM, args: []const Value) VmError!Value {
-    const x = try requireFixnum(args[0]);
-    return value_mod.fromBool(x == 0);
+    return value_mod.fromBool(try vm_mod.numSign(args[0]) == .eq);
 }
 
 fn fnPosQ(_: *VM, args: []const Value) VmError!Value {
-    const x = try requireFixnum(args[0]);
-    return value_mod.fromBool(x > 0);
+    return value_mod.fromBool(try vm_mod.numSign(args[0]) == .gt);
 }
 
 fn fnNegQ(_: *VM, args: []const Value) VmError!Value {
-    const x = try requireFixnum(args[0]);
-    return value_mod.fromBool(x < 0);
+    return value_mod.fromBool(try vm_mod.numSign(args[0]) == .lt);
 }
 
+/// `even?` / `odd?` are integer-only, as in Clojure.
 fn fnOddQ(_: *VM, args: []const Value) VmError!Value {
     const x = try requireFixnum(args[0]);
     return value_mod.fromBool(@mod(x, 2) != 0);
@@ -778,6 +850,28 @@ fn fnOddQ(_: *VM, args: []const Value) VmError!Value {
 fn fnEvenQ(_: *VM, args: []const Value) VmError!Value {
     const x = try requireFixnum(args[0]);
     return value_mod.fromBool(@mod(x, 2) == 0);
+}
+
+fn fnNumberQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(vm_mod.isNumber(args[0]));
+}
+
+fn fnIntegerQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(args[0].kind() == .fixnum);
+}
+
+fn fnFloatQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(args[0].kind() == .float);
+}
+
+fn fnNanQ(_: *VM, args: []const Value) VmError!Value {
+    _ = try requireNumber(args[0]);
+    return value_mod.fromBool(args[0].isFloat() and std.math.isNan(args[0].asFloat()));
+}
+
+fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
+    _ = try requireNumber(args[0]);
+    return value_mod.fromBool(args[0].isFloat() and std.math.isInf(args[0].asFloat()));
 }
 
 // =============================================================================
@@ -2510,7 +2604,7 @@ fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
         error.RecordRedefinition => return VmError.RecordRedefinition,
         error.OutOfMemory => return VmError.OutOfMemory,
     };
-    return value_mod.fromFixnum(@intCast(new_id)) orelse VmError.IntegerOverflow;
+    return value_mod.fromFixnum(@intCast(new_id)) orelse VmError.ArithmeticOverflow;
 }
 
 /// `(#%make-record type-id field-map)` → record Value.
@@ -2530,7 +2624,7 @@ fn fnRecordQ(_: *VM, args: []const Value) VmError!Value {
 /// `(#%record-type-id record)` → fixnum.
 fn fnRecordTypeId(_: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .record) return VmError.NotARecord;
-    return value_mod.fromFixnum(@intCast(record_mod.typeId(args[0]))) orelse VmError.IntegerOverflow;
+    return value_mod.fromFixnum(@intCast(record_mod.typeId(args[0]))) orelse VmError.ArithmeticOverflow;
 }
 
 // =============================================================================

@@ -21,7 +21,7 @@
 //!   - 6 opcodes wired across 3 groups:
 //!       mov: load-const, move, load-nil, load-true, load-false
 //!       call: return, return-nil
-//!       math: add (fixnum+fixnum, traps overflow as IntegerOverflow,
+//!       math: add (fixnum/float tower, i48 overflow raises ArithmeticOverflow,
 //!             traps non-fixnum as KindMismatch)
 //!   - Hand-assembled bytecode tests. The `src/compile.zig` tiny
 //!     compiler lowers `(+ 1 2)`-style forms directly to math:add
@@ -1107,11 +1107,16 @@ pub const VmError = error{
     /// §6.3) is fixnum→bignum promotion on overflow and an
     /// arithmetic exception on non-numeric operands.
     KindMismatch,
-    /// fixnum + fixnum overflowed i48. The eventual behavior is
-    /// promotion to bignum (PLAN §6.3 + §8.3); until bignum
-    /// arithmetic Scope B lands, this surfaces as a hard error
-    /// so we don't silently lose precision.
-    IntegerOverflow,
+    /// An integer result left the i48 fixnum range. Bignum
+    /// promotion (PLAN §6.3 + §8.3) needs bignum arithmetic,
+    /// which the runtime does not have, so the error is raised
+    /// as the catchable `:arithmetic-overflow` rather than
+    /// silently losing precision.
+    ArithmeticOverflow,
+    /// Integer `/`, or `quot`/`rem`/`mod` of any kind, with a
+    /// zero divisor. Float `/` by zero is IEEE (infinity / NaN)
+    /// and never raises.
+    DivideByZero,
     /// `call:call` / `call:tailcall` invocation passed a different
     /// number of arguments than the callee closure's routine
     /// declares. Per VM.md §13 `:arity-mismatch` row (peer-AI
@@ -2955,21 +2960,22 @@ pub const VM = struct {
 
     fn execMath(self: *VM, inst: Inst) VmError!void {
         const variant: Math = @enumFromInt(inst.variant);
-        switch (variant) {
-            .add => {
-                // math:add a b c   ;  slot[a] = resolve(b) + resolve(c)
-                // Resolve BOTH source operands BEFORE storing so that
-                // dst/src aliasing (e.g., math:add s0, s0, c0) is
-                // correct (peer-AI turn 33).
-                const lhs = try self.resolve(inst.b);
-                const rhs = try self.resolve(inst.c);
-                const sum = try addNumbers(lhs, rhs);
-                try self.store(inst.a, sum);
-            },
-            // Known but not yet implemented in this commit.
-            .sub, .mul, .div, .idiv, .mod, .pow, .neg, .abs => return VmError.UnimplementedOpcode,
+        // Resolve every source operand BEFORE storing so that
+        // dst/src aliasing (e.g., math:add s0, s0, c0) is correct.
+        const lhs = try self.resolve(inst.b);
+        const result = switch (variant) {
+            .add => try numAdd(lhs, try self.resolve(inst.c)),
+            .sub => try numSub(lhs, try self.resolve(inst.c)),
+            .mul => try numMul(lhs, try self.resolve(inst.c)),
+            .div => try numDiv(lhs, try self.resolve(inst.c)),
+            .idiv => try numQuot(lhs, try self.resolve(inst.c)),
+            .mod => try numMod(lhs, try self.resolve(inst.c)),
+            .neg => try numNeg(lhs),
+            .abs => try numAbs(lhs),
+            .pow => return VmError.UnimplementedOpcode,
             _ => return VmError.BytecodeCorruption,
-        }
+        };
+        try self.store(inst.a, result);
     }
 
     // -------------------------------------------------------------------------
@@ -2978,21 +2984,18 @@ pub const VM = struct {
 
     fn execCmp(self: *VM, inst: Inst) VmError!void {
         const variant: Cmp = @enumFromInt(inst.variant);
-        switch (variant) {
-            .lt => {
-                // cmp:lt a b c   ;  slot[a] = (resolve(b) < resolve(c)) as bool
-                // Step 5d0: fixnum-only. Non-fixnum operands trap
-                // :kind-mismatch (matches math:add discipline).
-                // Result is a `Value` of kind `.bool_`.
-                const lhs = try self.resolve(inst.b);
-                const rhs = try self.resolve(inst.c);
-                const result = try ltFixnums(lhs, rhs);
-                try self.store(inst.a, value_mod.fromBool(result));
-            },
-            // Known but not yet implemented in this commit.
-            .lte, .gt, .gte, .eq_num => return VmError.UnimplementedOpcode,
+        // cmp:<op> a b c   ;  slot[a] = bool(resolve(b) <op> resolve(c))
+        const lhs = try self.resolve(inst.b);
+        const rhs = try self.resolve(inst.c);
+        const cmp: NumCmp = switch (variant) {
+            .lt => .lt,
+            .lte => .lte,
+            .gt => .gt,
+            .gte => .gte,
+            .eq_num => .eq,
             _ => return VmError.BytecodeCorruption,
-        }
+        };
+        try self.store(inst.a, value_mod.fromBool(try numCompare(cmp, lhs, rhs)));
     }
 
     // -------------------------------------------------------------------------
@@ -3516,7 +3519,8 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.ArityMismatch => "arity-mismatch",
         VmError.NotCallable => "not-callable",
         VmError.UnboundVar => "unbound-var",
-        VmError.IntegerOverflow => "integer-overflow",
+        VmError.ArithmeticOverflow => "arithmetic-overflow",
+        VmError.DivideByZero => "divide-by-zero",
         VmError.IndexOutOfBounds => "index-out-of-bounds",
         VmError.DbError => "db-error",
         VmError.DbClosed => "db-closed",
@@ -3557,45 +3561,190 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
     };
 }
 
-/// Numeric addition for the math:add opcode. Step #2 supports
-/// only fixnum+fixnum; widening lands in subsequent commits.
-///
-/// Future-target factoring (peer-AI turn 33): when math:sub and
-/// friends land, this and its siblings extract into a `src/numeric.zig`
-/// module that both vm.zig and dispatch.zig can call. Avoiding a
-/// vm→dispatch dependency now keeps the import graph clean and
-/// matches the "low-level semantics shared by VM + dispatch" target
-/// shape.
-///
-/// Returns:
-///   - `IntegerOverflow` if the i64-extended sum exceeds the i48
-///     fixnum range. Bignum promotion (PLAN §6.3) is the eventual
-///     behavior; until bignum arithmetic Scope B lands, the trap
-///     is preferable to silent precision loss.
-///   - `KindMismatch` if either operand is not a fixnum (in v1
-///     this includes float — float + fixnum support arrives with
-///     the float-arithmetic commit). Reuses VM.md §13's existing
-///     `:kind-mismatch` taxonomy rather than introducing a parallel
-///     `:type-error` category.
-fn addNumbers(lhs: value_mod.Value, rhs: value_mod.Value) VmError!value_mod.Value {
-    if (!lhs.isFixnum() or !rhs.isFixnum()) return VmError.KindMismatch;
-    const a = lhs.asFixnum();
-    const b = rhs.asFixnum();
-    // i64 add never overflows from i48-range operands (max sum is
-    // 2 * (2^47 - 1) which fits comfortably in i64). The fixnum
-    // range check below catches the i48-overflow case.
-    const sum = a + b;
-    return value_mod.fromFixnum(sum) orelse VmError.IntegerOverflow;
+// =============================================================================
+// Numeric tower (PLAN §8.3, SEMANTICS §2.2)
+//
+// Two runtime number kinds take part in arithmetic: `fixnum` (i48)
+// and `float` (f64). Contagion follows Clojure: an operation with
+// any float operand is carried out in f64 and yields a float; an
+// operation on two fixnums stays integral. A fixnum result that
+// leaves the i48 range raises `ArithmeticOverflow`. `/` on two
+// fixnums yields a fixnum when the division is exact and a float
+// otherwise (there are no rationals, PLAN §23 #10). Integer
+// division by zero and `quot`/`rem`/`mod` by zero raise
+// `DivideByZero`; float `/` by zero follows IEEE and yields an
+// infinity or NaN.
+//
+// These are the single implementation behind the `math:*` and
+// `cmp:*` opcodes and the arithmetic natives in stdlib.zig.
+// =============================================================================
+
+/// Any operand kind arithmetic accepts.
+pub fn isNumber(v: value_mod.Value) bool {
+    return v.isFixnum() or v.isFloat();
 }
 
-/// Fixnum-only less-than comparison for the cmp:lt opcode.
-/// Step 5d0: only fixnum<fixnum is supported; mixed-numeric
-/// (fixnum vs float) and bignum comparisons land later with
-/// the wider numeric tower. Non-fixnum operands raise
-/// `KindMismatch` — same discipline as `addNumbers`.
-fn ltFixnums(lhs: value_mod.Value, rhs: value_mod.Value) VmError!bool {
-    if (!lhs.isFixnum() or !rhs.isFixnum()) return VmError.KindMismatch;
-    return lhs.asFixnum() < rhs.asFixnum();
+/// Widen a number to f64 for a contagious operation.
+fn toFloat(v: value_mod.Value) VmError!f64 {
+    return switch (v.kind()) {
+        .fixnum => @floatFromInt(v.asFixnum()),
+        .float => v.asFloat(),
+        else => VmError.KindMismatch,
+    };
+}
+
+fn fixnumResult(n: i64) VmError!value_mod.Value {
+    return value_mod.fromFixnum(n) orelse VmError.ArithmeticOverflow;
+}
+
+pub fn numAdd(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
+    if (a.isFixnum() and b.isFixnum()) {
+        // Two i48 operands never overflow an i64 sum; only the
+        // fixnum range check can fail.
+        return fixnumResult(a.asFixnum() + b.asFixnum());
+    }
+    return value_mod.fromFloat(try toFloat(a) + try toFloat(b));
+}
+
+pub fn numSub(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
+    if (a.isFixnum() and b.isFixnum()) {
+        return fixnumResult(a.asFixnum() - b.asFixnum());
+    }
+    return value_mod.fromFloat(try toFloat(a) - try toFloat(b));
+}
+
+pub fn numMul(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
+    if (a.isFixnum() and b.isFixnum()) {
+        const p = std.math.mul(i64, a.asFixnum(), b.asFixnum()) catch return VmError.ArithmeticOverflow;
+        return fixnumResult(p);
+    }
+    return value_mod.fromFloat(try toFloat(a) * try toFloat(b));
+}
+
+/// `/`: exact fixnum quotient stays a fixnum, anything else is f64.
+pub fn numDiv(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
+    if (a.isFixnum() and b.isFixnum()) {
+        const x = a.asFixnum();
+        const y = b.asFixnum();
+        if (y == 0) return VmError.DivideByZero;
+        if (@rem(x, y) == 0) return fixnumResult(@divTrunc(x, y));
+        return value_mod.fromFloat(@as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(y)));
+    }
+    return value_mod.fromFloat(try toFloat(a) / try toFloat(b));
+}
+
+/// `quot`: truncated division. A zero divisor of either kind raises.
+pub fn numQuot(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
+    if (a.isFixnum() and b.isFixnum()) {
+        const y = b.asFixnum();
+        if (y == 0) return VmError.DivideByZero;
+        return fixnumResult(@divTrunc(a.asFixnum(), y));
+    }
+    const x = try toFloat(a);
+    const y = try toFloat(b);
+    if (y == 0) return VmError.DivideByZero;
+    return value_mod.fromFloat(@trunc(x / y));
+}
+
+/// `rem`: remainder of truncated division, sign of the dividend.
+pub fn numRem(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
+    if (a.isFixnum() and b.isFixnum()) {
+        const y = b.asFixnum();
+        if (y == 0) return VmError.DivideByZero;
+        return fixnumResult(@rem(a.asFixnum(), y));
+    }
+    const x = try toFloat(a);
+    const y = try toFloat(b);
+    if (y == 0) return VmError.DivideByZero;
+    return value_mod.fromFloat(@rem(x, y));
+}
+
+/// `mod`: remainder of floored division, sign of the divisor.
+pub fn numMod(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
+    if (a.isFixnum() and b.isFixnum()) {
+        const y = b.asFixnum();
+        if (y == 0) return VmError.DivideByZero;
+        return fixnumResult(@mod(a.asFixnum(), y));
+    }
+    const x = try toFloat(a);
+    const y = try toFloat(b);
+    if (y == 0) return VmError.DivideByZero;
+    return value_mod.fromFloat(@mod(x, y));
+}
+
+pub fn numNeg(a: value_mod.Value) VmError!value_mod.Value {
+    return switch (a.kind()) {
+        .fixnum => fixnumResult(-a.asFixnum()),
+        .float => value_mod.fromFloat(-a.asFloat()),
+        else => VmError.KindMismatch,
+    };
+}
+
+pub fn numAbs(a: value_mod.Value) VmError!value_mod.Value {
+    return switch (a.kind()) {
+        .fixnum => fixnumResult(@intCast(@abs(a.asFixnum()))),
+        .float => value_mod.fromFloat(@abs(a.asFloat())),
+        else => VmError.KindMismatch,
+    };
+}
+
+pub const NumCmp = enum { lt, lte, gt, gte, eq };
+
+/// Ordered comparison across the tower. Two fixnums compare as
+/// integers; any float operand widens both sides to f64, so
+/// `(< 1 1.5)` holds and `(== 1 1.0)` holds. NaN compares false
+/// under every predicate, as IEEE specifies.
+pub fn numCompare(cmp: NumCmp, a: value_mod.Value, b: value_mod.Value) VmError!bool {
+    if (a.isFixnum() and b.isFixnum()) {
+        const x = a.asFixnum();
+        const y = b.asFixnum();
+        return switch (cmp) {
+            .lt => x < y,
+            .lte => x <= y,
+            .gt => x > y,
+            .gte => x >= y,
+            .eq => x == y,
+        };
+    }
+    const x = try toFloat(a);
+    const y = try toFloat(b);
+    return switch (cmp) {
+        .lt => x < y,
+        .lte => x <= y,
+        .gt => x > y,
+        .gte => x >= y,
+        .eq => x == y,
+    };
+}
+
+/// Sign tests shared by `zero?`, `pos?` and `neg?`. NaN is
+/// neither positive, negative nor zero.
+pub fn numSign(a: value_mod.Value) VmError!std.math.Order {
+    return switch (a.kind()) {
+        .fixnum => std.math.order(a.asFixnum(), 0),
+        .float => blk: {
+            const f = a.asFloat();
+            if (f > 0) break :blk .gt;
+            if (f < 0) break :blk .lt;
+            break :blk .eq;
+        },
+        else => VmError.KindMismatch,
+    };
+}
+
+/// `max`/`min` over two operands. A float operand makes the
+/// result a float; NaN wins, as in Clojure.
+pub fn numExtremum(want_max: bool, a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
+    if (a.isFixnum() and b.isFixnum()) {
+        const x = a.asFixnum();
+        const y = b.asFixnum();
+        return if ((x > y) == want_max) a else b;
+    }
+    const x = try toFloat(a);
+    const y = try toFloat(b);
+    if (std.math.isNan(x)) return value_mod.fromFloat(x);
+    if (std.math.isNan(y)) return value_mod.fromFloat(y);
+    return value_mod.fromFloat(if ((x > y) == want_max) x else y);
 }
 
 // =============================================================================
@@ -4566,10 +4715,9 @@ test "VM math:add: negative + negative" {
     try testing.expectEqual(@as(i64, -12), result.asFixnum());
 }
 
-test "VM math:add: i48-range sum wraps to IntegerOverflow" {
-    // fixnum_max + 1 overflows i48 and (until bignum Scope B
-    // lands) traps as IntegerOverflow rather than silently
-    // wrapping or losing precision.
+test "VM math:add: i48-range sum raises ArithmeticOverflow" {
+    // fixnum_max + 1 overflows i48 and raises ArithmeticOverflow
+    // rather than silently wrapping or losing precision.
     const consts = [_]Const{
         cval(value_mod.fromFixnum(value_mod.fixnum_max).?),
         cval(value_mod.fromFixnum(1).?),
@@ -4583,14 +4731,10 @@ test "VM math:add: i48-range sum wraps to IntegerOverflow" {
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
     const res = vm.run();
-    try testing.expectError(VmError.IntegerOverflow, res);
+    try testing.expectError(VmError.ArithmeticOverflow, res);
 }
 
-test "VM math:add: non-fixnum operand surfaces KindMismatch" {
-    // float + fixnum is supported eventually (cross-type
-    // promotion); for step #2 we surface VM.md §13's existing
-    // `:kind-mismatch` rather than introducing a parallel
-    // taxonomy (peer-AI turn 33).
+test "VM math:add: a float operand makes the result a float" {
     const consts = [_]Const{
         cval(value_mod.fromFloat(1.5)),
         cval(value_mod.fromFixnum(2).?),
@@ -4603,11 +4747,153 @@ test "VM math:add: non-fixnum operand surfaces KindMismatch" {
 
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.isFloat());
+    try testing.expectEqual(@as(f64, 3.5), result.asFloat());
+}
+
+test "VM math:add: a non-numeric operand surfaces KindMismatch" {
+    const consts = [_]Const{
+        cval(value_mod.fromBool(true)),
+        cval(value_mod.fromFixnum(2).?),
+    };
+    var code = [_]Inst{
+        asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 1, "(+ true 2)");
+
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
     const res = vm.run();
     try testing.expectError(VmError.KindMismatch, res);
 }
 
-test "VM math:add: i48-range underflow traps as IntegerOverflow" {
+// ---- numeric tower ----
+
+fn fx(n: i64) value_mod.Value {
+    return value_mod.fromFixnum(n).?;
+}
+
+fn fl(f: f64) value_mod.Value {
+    return value_mod.fromFloat(f);
+}
+
+test "numeric tower: contagion, exact division and integer results" {
+    try testing.expectEqual(@as(i64, 7), (try numAdd(fx(3), fx(4))).asFixnum());
+    try testing.expectEqual(@as(f64, 7.5), (try numAdd(fx(3), fl(4.5))).asFloat());
+    try testing.expectEqual(@as(f64, 7.5), (try numAdd(fl(3.5), fx(4))).asFloat());
+    try testing.expectEqual(@as(f64, -1.0), (try numSub(fl(3.0), fx(4))).asFloat());
+    try testing.expectEqual(@as(i64, 12), (try numMul(fx(3), fx(4))).asFixnum());
+    try testing.expectEqual(@as(f64, 1.5), (try numMul(fl(0.5), fx(3))).asFloat());
+    // `/` of two fixnums: exact stays fixnum, inexact is f64.
+    try testing.expectEqual(@as(i64, 2), (try numDiv(fx(6), fx(3))).asFixnum());
+    try testing.expectEqual(@as(i64, -2), (try numDiv(fx(6), fx(-3))).asFixnum());
+    try testing.expectEqual(@as(f64, 2.5), (try numDiv(fx(5), fx(2))).asFloat());
+    try testing.expectEqual(@as(f64, 2.5), (try numDiv(fl(5.0), fx(2))).asFloat());
+    // quot / rem / mod: truncated vs floored.
+    try testing.expectEqual(@as(i64, -2), (try numQuot(fx(-7), fx(3))).asFixnum());
+    try testing.expectEqual(@as(i64, -1), (try numRem(fx(-7), fx(3))).asFixnum());
+    try testing.expectEqual(@as(i64, 2), (try numMod(fx(-7), fx(3))).asFixnum());
+    try testing.expectEqual(@as(i64, -2), (try numMod(fx(7), fx(-3))).asFixnum());
+    try testing.expectEqual(@as(f64, -2.0), (try numQuot(fl(-7.0), fx(3))).asFloat());
+    try testing.expectEqual(@as(f64, -1.0), (try numRem(fl(-7.0), fx(3))).asFloat());
+    try testing.expectEqual(@as(f64, 2.0), (try numMod(fl(-7.0), fx(3))).asFloat());
+    try testing.expectEqual(@as(i64, -3), (try numNeg(fx(3))).asFixnum());
+    try testing.expectEqual(@as(i64, 3), (try numAbs(fx(-3))).asFixnum());
+    try testing.expectEqual(@as(f64, 3.5), (try numAbs(fl(-3.5))).asFloat());
+}
+
+test "numeric tower: fixnum overflow raises, float overflow does not" {
+    try testing.expectError(VmError.ArithmeticOverflow, numAdd(fx(value_mod.fixnum_max), fx(1)));
+    try testing.expectError(VmError.ArithmeticOverflow, numSub(fx(value_mod.fixnum_min), fx(1)));
+    try testing.expectError(VmError.ArithmeticOverflow, numMul(fx(1 << 30), fx(1 << 30)));
+    try testing.expectError(VmError.ArithmeticOverflow, numMul(fx(value_mod.fixnum_max), fx(value_mod.fixnum_max)));
+    try testing.expectError(VmError.ArithmeticOverflow, numNeg(fx(value_mod.fixnum_min)));
+    try testing.expectError(VmError.ArithmeticOverflow, numAbs(fx(value_mod.fixnum_min)));
+    try testing.expectError(VmError.ArithmeticOverflow, numDiv(fx(value_mod.fixnum_min), fx(-1)));
+    try testing.expectError(VmError.ArithmeticOverflow, numQuot(fx(value_mod.fixnum_min), fx(-1)));
+    // The same magnitudes are fine as floats.
+    const big = try numMul(fl(@floatFromInt(value_mod.fixnum_max)), fx(value_mod.fixnum_max));
+    try testing.expect(big.isFloat());
+    try testing.expect(std.math.isInf((try numMul(fl(1e308), fx(10))).asFloat()));
+}
+
+test "numeric tower: division by zero" {
+    try testing.expectError(VmError.DivideByZero, numDiv(fx(1), fx(0)));
+    try testing.expectError(VmError.DivideByZero, numQuot(fx(1), fx(0)));
+    try testing.expectError(VmError.DivideByZero, numRem(fx(1), fx(0)));
+    try testing.expectError(VmError.DivideByZero, numMod(fx(1), fx(0)));
+    try testing.expectError(VmError.DivideByZero, numQuot(fl(1.0), fl(0.0)));
+    try testing.expectError(VmError.DivideByZero, numMod(fx(1), fl(0.0)));
+    // Float `/` is IEEE.
+    try testing.expect(std.math.isPositiveInf((try numDiv(fl(1.0), fx(0))).asFloat()));
+    try testing.expect(std.math.isNegativeInf((try numDiv(fx(-1), fl(0.0))).asFloat()));
+    try testing.expect(std.math.isNan((try numDiv(fl(0.0), fl(0.0))).asFloat()));
+}
+
+test "numeric tower: comparison across kinds and NaN" {
+    try testing.expect(try numCompare(.lt, fx(1), fl(1.5)));
+    try testing.expect(try numCompare(.gt, fl(1.5), fx(1)));
+    try testing.expect(try numCompare(.lte, fx(2), fl(2.0)));
+    try testing.expect(try numCompare(.gte, fl(2.0), fx(2)));
+    try testing.expect(try numCompare(.eq, fx(1), fl(1.0)));
+    try testing.expect(!try numCompare(.eq, fx(1), fl(1.5)));
+    try testing.expect(try numCompare(.lt, fx(value_mod.fixnum_min), fx(value_mod.fixnum_max)));
+    const nan = fl(std.math.nan(f64));
+    try testing.expect(!try numCompare(.lt, nan, fx(1)));
+    try testing.expect(!try numCompare(.gte, nan, fx(1)));
+    try testing.expect(!try numCompare(.eq, nan, nan));
+    try testing.expectError(VmError.KindMismatch, numCompare(.lt, fx(1), value_mod.nilValue()));
+    try testing.expectError(VmError.KindMismatch, numAdd(fx(1), value_mod.fromBool(true)));
+    // Sign and extremum.
+    try testing.expectEqual(std.math.Order.lt, try numSign(fl(-0.5)));
+    try testing.expectEqual(std.math.Order.eq, try numSign(fl(-0.0)));
+    try testing.expectEqual(std.math.Order.gt, try numSign(fx(3)));
+    try testing.expectEqual(@as(i64, 4), (try numExtremum(true, fx(3), fx(4))).asFixnum());
+    try testing.expectEqual(@as(f64, 4.0), (try numExtremum(true, fx(3), fl(4.0))).asFloat());
+    try testing.expectEqual(@as(f64, 3.0), (try numExtremum(false, fx(3), fl(4.0))).asFloat());
+    try testing.expect(std.math.isNan((try numExtremum(true, nan, fx(4))).asFloat()));
+}
+
+test "VM math/cmp opcodes cover every wired variant" {
+    const consts = [_]Const{
+        cval(fx(7)),
+        cval(fx(2)),
+        cval(fl(0.5)),
+    };
+    var code = [_]Inst{
+        Inst.primary(.math, Math.sub, Operand.slot(0), Operand.constant(0), Operand.constant(1)), // 5
+        Inst.primary(.math, Math.mul, Operand.slot(1), Operand.slot(0), Operand.constant(1)), // 10
+        Inst.primary(.math, Math.div, Operand.slot(2), Operand.slot(1), Operand.constant(1)), // 5
+        Inst.primary(.math, Math.idiv, Operand.slot(3), Operand.constant(0), Operand.constant(1)), // 3
+        Inst.primary(.math, Math.mod, Operand.slot(4), Operand.constant(0), Operand.constant(1)), // 1
+        Inst.primary(.math, Math.neg, Operand.slot(5), Operand.slot(4), Operand.none), // -1
+        Inst.primary(.math, Math.abs, Operand.slot(6), Operand.slot(5), Operand.none), // 1
+        Inst.primary(.cmp, Cmp.lte, Operand.slot(7), Operand.slot(6), Operand.constant(1)), // true
+        Inst.primary(.cmp, Cmp.gt, Operand.slot(8), Operand.slot(6), Operand.constant(2)), // true
+        Inst.primary(.cmp, Cmp.gte, Operand.slot(9), Operand.constant(2), Operand.slot(6)), // false
+        Inst.primary(.cmp, Cmp.eq_num, Operand.slot(10), Operand.slot(2), Operand.slot(0)), // true
+        asm_.returnSlot(10),
+    };
+    const routine = makeRoutine(&code, &consts, 11, "math-cmp");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expect(result.asBool());
+    try testing.expectEqual(@as(i64, 5), vm.stack.items[0].asFixnum());
+    try testing.expectEqual(@as(i64, 10), vm.stack.items[1].asFixnum());
+    try testing.expectEqual(@as(i64, 5), vm.stack.items[2].asFixnum());
+    try testing.expectEqual(@as(i64, 3), vm.stack.items[3].asFixnum());
+    try testing.expectEqual(@as(i64, 1), vm.stack.items[4].asFixnum());
+    try testing.expectEqual(@as(i64, -1), vm.stack.items[5].asFixnum());
+    try testing.expectEqual(@as(i64, 1), vm.stack.items[6].asFixnum());
+    try testing.expect(vm.stack.items[7].asBool());
+    try testing.expect(vm.stack.items[8].asBool());
+    try testing.expect(!vm.stack.items[9].asBool());
+}
+
+test "VM math:add: i48-range underflow raises ArithmeticOverflow" {
     // The negative-side mirror of the positive overflow test
     // above (peer-AI turn 33: positive-only coverage missed
     // half the implementation).
@@ -4624,7 +4910,7 @@ test "VM math:add: i48-range underflow traps as IntegerOverflow" {
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
     const res = vm.run();
-    try testing.expectError(VmError.IntegerOverflow, res);
+    try testing.expectError(VmError.ArithmeticOverflow, res);
 }
 
 test "VM math:add: dst/src aliasing is well-defined (math:add s0, s0, c0)" {
@@ -4785,16 +5071,16 @@ test "VM cmp:lt: writing to a constant operand surfaces InvalidOperandKind" {
     try testing.expectError(VmError.InvalidOperandKind, res);
 }
 
-test "VM cmp:lt: unimplemented variant (lte) returns UnimplementedOpcode" {
+test "VM cmp: unrecognized variant returns BytecodeCorruption" {
     var code = [_]Inst{
-        Inst.primary(.cmp, Cmp.lte, Operand.slot(0), Operand.slot(0), Operand.slot(0)),
+        Inst.primary(.cmp, @as(Cmp, @enumFromInt(9)), Operand.slot(0), Operand.slot(0), Operand.slot(0)),
         asm_.returnNil(),
     };
-    const routine = makeRoutine(&code, &.{}, 1, "lt-lte");
+    const routine = makeRoutine(&code, &.{}, 1, "cmp-bad-variant");
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
     const res = vm.run();
-    try testing.expectError(VmError.UnimplementedOpcode, res);
+    try testing.expectError(VmError.BytecodeCorruption, res);
 }
 
 // ---- step #6a: Var + Namespace + var:load-var tests ----
@@ -6141,20 +6427,19 @@ test "VM 5a1: same closure called twice — both invocations succeed" {
     try testing.expectEqual(@as(i64, 17), result.asFixnum());
 }
 
-test "VM math:add: unimplemented variant (sub) returns UnimplementedOpcode" {
-    // math:sub (variant 1) is reserved per PLAN §12.3 but not
-    // wired in this commit. Dispatch must surface
-    // UnimplementedOpcode, not BytecodeCorruption.
-    const math_sub: Inst = .{
+test "VM math: unimplemented variant (pow) returns UnimplementedOpcode" {
+    // math:pow is reserved per PLAN §12.3 but not wired. Dispatch
+    // must surface UnimplementedOpcode, not BytecodeCorruption.
+    const math_pow: Inst = .{
         .kind = .primary,
         .group = @intFromEnum(Group.math),
-        .variant = 1,
+        .variant = @intFromEnum(Math.pow),
         .a = Operand.slot(0),
         .b = Operand.slot(0),
         .c = Operand.slot(0),
     };
-    var code = [_]Inst{ math_sub, asm_.returnNil() };
-    const routine = makeRoutine(&code, &.{}, 1, "math-sub-unimpl");
+    var code = [_]Inst{ math_pow, asm_.returnNil() };
+    const routine = makeRoutine(&code, &.{}, 1, "math-pow-unimpl");
 
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();

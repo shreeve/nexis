@@ -1192,10 +1192,12 @@ fn lowerFormEnv(
             const v = interner.internKeywordValue(name.name) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
-        // -- Phase 1 numeric literals beyond fixnum: defer. --
-        // `.real` (f64) + `.char` (Unicode scalar) still defer
-        // until a `Tiny.literal` path is wired for them.
-        .real, .char => return CompileError.UnsupportedFeature,
+        // Floats and chars are immediates: they lower straight
+        // to `Tiny.literal` with no interner or heap involved.
+        .real => |f| try allocTiny(allocator, .{ .literal = value_mod.fromFloat(f) }),
+        .char => |c| try allocTiny(allocator, .{
+            .literal = value_mod.fromChar(c) orelse return CompileError.MalformedForm,
+        }),
         // Phase 5.2a (peer-AI turn 77): string literals lower
         // through the heap plumbed into LowerCtx. The Value goes
         // into `Tiny.literal`; the heap is the same one routines
@@ -1534,7 +1536,16 @@ fn lowerQuotePayload(
             }
             break :blk try allocTiny(allocator, .{ .set_construct = tiny_items });
         },
-        // Quoted strings, chars, reals: defer.
+        // Quoting a self-evaluating literal yields the literal.
+        .real => |f| try allocTiny(allocator, .{ .literal = value_mod.fromFloat(f) }),
+        .char => |c| try allocTiny(allocator, .{
+            .literal = value_mod.fromChar(c) orelse return CompileError.MalformedForm,
+        }),
+        .string => |bytes| blk: {
+            const h = ctx.heap orelse return CompileError.UnsupportedFeature;
+            const v = string_mod.fromBytes(h, bytes) catch return CompileError.OutOfMemory;
+            break :blk try allocTiny(allocator, .{ .literal = v });
+        },
         else => return CompileError.UnsupportedFeature,
     };
 }
@@ -4146,7 +4157,7 @@ test "compile + run: (+ fixnum_max 1) compiles but VM traps overflow" {
     var v = try vm.VM.init(testing.allocator, &routine);
     defer v.deinit();
     const res = v.run();
-    try testing.expectError(vm.VmError.IntegerOverflow, res);
+    try testing.expectError(vm.VmError.ArithmeticOverflow, res);
 }
 
 // ---- step 5d0: cmp:lt tests ----

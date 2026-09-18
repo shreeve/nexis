@@ -1382,7 +1382,7 @@ from code contact:
 
   **3.0c catchable VmErrors** (4122532, peer-AI turn 62):
   recoverable VmError variants (KindMismatch, ArityMismatch,
-  NotCallable, UnboundVar, IntegerOverflow) translate to
+  NotCallable, UnboundVar, ArithmeticOverflow) translate to
   keyword payloads when a handler exists. Without a
   handler, the raw VmError still propagates (backward
   compat).

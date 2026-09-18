@@ -2813,3 +2813,145 @@ test "integration: stack extent — randomized call chains match direct evaluati
         };
     }
 }
+
+// =============================================================================
+// Numeric tower: floats, contagion, division, comparison, overflow
+// =============================================================================
+
+test "numbers: float literals print like Clojure doubles" {
+    try expectOutput("1.0", "1.0");
+    try expectOutput("1.5", "1.5");
+    try expectOutput("-2.25", "-2.25");
+    try expectOutput("0.1", "0.1");
+    try expectOutput("100.0", "100.0");
+    try expectOutput("1e10", "1.0E10");
+    try expectOutput("12345678.5", "1.23456785E7");
+    try expectOutput("0.0001", "1.0E-4");
+    try expectOutput("0.001", "0.001");
+    try expectOutput("(- 0.0)", "-0.0");
+    try expectOutput("'1.5", "1.5");
+    try expectOutput("(pr-str [1 1.0 \"s\" \\a])", "[1 1.0 \"s\" \\a]");
+    try expectOutput("(str 1.5 \" \" 2.0)", "1.5 2.0");
+}
+
+test "numbers: special floats" {
+    try expectOutput("(/ 1.0 0)", "Infinity");
+    try expectOutput("(/ -1.0 0)", "-Infinity");
+    try expectOutput("(/ 0.0 0.0)", "NaN");
+    try expectOutput("(NaN? (/ 0.0 0.0))", "true");
+    try expectOutput("(NaN? 1.5)", "false");
+    try expectOutput("(infinite? (/ 1.0 0))", "true");
+    try expectOutput("(infinite? (/ 1 2))", "false");
+    try expectOutput("(let [n (/ 0.0 0.0)] [(= n n) (== n n) (< n 1) (> n 1)])", "[true false false false]");
+}
+
+test "numbers: arithmetic contagion" {
+    try expectOutput("(+ 1 2.5)", "3.5");
+    try expectOutput("(+ 1.5 2)", "3.5");
+    try expectOutput("(+ 1 2 3.0)", "6.0");
+    try expectOutput("(- 10 2.5)", "7.5");
+    try expectOutput("(- 1.5)", "-1.5");
+    try expectOutput("(* 2 2.5)", "5.0");
+    try expectOutput("(* 2 3)", "6");
+    try expectOutput("(inc 1.5)", "2.5");
+    try expectOutput("(dec 0.5)", "-0.5");
+    try expectOutput("(abs -3)", "3");
+    try expectOutput("(abs -3.5)", "3.5");
+    try expectOutput("(max 1 5 3)", "5");
+    try expectOutput("(min 1 5 3)", "1");
+    try expectOutput("(max 1 2.0)", "2.0");
+    try expectOutput("(max 3 2.0)", "3.0");
+    try expectOutput("(min 3 2.0)", "2.0");
+    // The inlined `(+ a b)` intrinsic uses the same tower.
+    try expectOutput("(let [a 1 b 2.5] (+ a b))", "3.5");
+    try expectOutput("(let [a 1.0] (< a 2))", "true");
+}
+
+test "numbers: division" {
+    try expectOutput("(/ 6 3)", "2");
+    try expectOutput("(/ 7 2)", "3.5");
+    try expectOutput("(/ -6 3)", "-2");
+    try expectOutput("(/ 1 3)", "0.3333333333333333");
+    try expectOutput("(/ 6.0 3)", "2.0");
+    try expectOutput("(/ 2)", "0.5");
+    try expectOutput("(/ 24 2 3)", "4");
+    try expectOutput("(quot 7 2)", "3");
+    try expectOutput("(quot -7 2)", "-3");
+    try expectOutput("(rem -7 2)", "-1");
+    try expectOutput("(mod -7 2)", "1");
+    try expectOutput("(mod 7 -2)", "-1");
+    try expectOutput("(mod 7.5 2)", "1.5");
+    try expectOutput("(quot 7.5 2)", "3.0");
+    try expectOutput("(rem 7.5 2)", "1.5");
+    try expectOutput("(try (/ 1 0) (catch any e e))", ":divide-by-zero");
+    try expectOutput("(try (quot 1 0) (catch any e e))", ":divide-by-zero");
+    try expectOutput("(try (rem 1.0 0) (catch any e e))", ":divide-by-zero");
+    try expectOutput("(try (mod 1 0.0) (catch any e e))", ":divide-by-zero");
+}
+
+test "numbers: comparison across kinds" {
+    try expectOutput("(< 1 1.5)", "true");
+    try expectOutput("(< 1.5 1)", "false");
+    try expectOutput("(<= 2 2.0)", "true");
+    try expectOutput("(<= 2 1.0)", "false");
+    try expectOutput("(> 2 1)", "true");
+    try expectOutput("(> 1 2)", "false");
+    try expectOutput("(>= 2 2)", "true");
+    try expectOutput("(>= 1 2)", "false");
+    try expectOutput("(> 3 2 1)", "true");
+    try expectOutput("(> 3 1 2)", "false");
+    try expectOutput("(<= 1 1 2)", "true");
+    try expectOutput("(>)", "true");
+    try expectOutput("(>= 5)", "true");
+    try expectOutput("(= 1 1.0)", "false");
+    try expectOutput("(== 1 1.0)", "true");
+    try expectOutput("(== 1 1 1.0)", "true");
+    try expectOutput("(== 1 2)", "false");
+    try expectOutput("(not= 1 2)", "true");
+    try expectOutput("(not= 1 1)", "false");
+    try expectOutput("(not= 1 1.0)", "true");
+    try expectOutput("(not= :a :a :a)", "false");
+    try expectOutput("(try (< 1 :a) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (> \"a\" 1) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (>= nil) (catch any e e))", ":kind-mismatch");
+}
+
+test "numbers: predicates over the tower" {
+    try expectOutput("[(number? 1) (number? 1.5) (number? :a) (number? nil)]", "[true true false false]");
+    try expectOutput("[(integer? 1) (integer? 1.0) (float? 1.0) (float? 1)]", "[true false true false]");
+    try expectOutput("[(zero? 0) (zero? 0.0) (zero? -0.0) (zero? 0.5)]", "[true true true false]");
+    try expectOutput("[(pos? 1) (pos? 0.5) (pos? -0.5) (neg? -1) (neg? -0.5) (neg? 0.0)]", "[true true false true true false]");
+    try expectOutput("[(even? 2) (odd? 3)]", "[true true]");
+    try expectOutput("(try (even? 2.0) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (zero? :a) (catch any e e))", ":kind-mismatch");
+}
+
+test "numbers: float equality and hashing agree with SEMANTICS" {
+    try expectOutput("(= 0.0 -0.0)", "true");
+    try expectOutput("(= 1.5 1.5)", "true");
+    try expectOutput("(= 1.5 1.25)", "false");
+    try expectOutput("(get {0.0 :zero} -0.0)", ":zero");
+    try expectOutput("(get {1 :int} 1.0)", "nil");
+    try expectOutput("(let [n (/ 0.0 0.0)] (get {n :nan} (/ 0.0 0.0)))", ":nan");
+    try expectOutput("(contains? #{1.5 2.5} 2.5)", "true");
+    try expectOutput("(= [1.0 2.0] [1.0 2.0])", "true");
+    try expectOutput("(= [1 2] [1.0 2.0])", "false");
+}
+
+test "numbers: fixnum overflow is a catchable :arithmetic-overflow" {
+    try expectOutput("(+ 140737488355326 1)", "140737488355327");
+    try expectOutput("(try (+ 140737488355327 1) (catch any e e))", ":arithmetic-overflow");
+    try expectOutput("(try (- -140737488355328 1) (catch any e e))", ":arithmetic-overflow");
+    try expectOutput("(try (* 100000000 100000000) (catch any e e))", ":arithmetic-overflow");
+    try expectOutput("(try (inc 140737488355327) (catch any e e))", ":arithmetic-overflow");
+    try expectOutput("(try (let [a 140737488355327] (+ a 1)) (catch any e e))", ":arithmetic-overflow");
+    // Floats never overflow into an error.
+    try expectOutput("(* 140737488355327.0 140737488355327)", "1.9807040628565803E28");
+    try expectProgramError("(+ 140737488355327 1)", vm.VmError.ArithmeticOverflow);
+}
+
+test "numbers: macros can return float and char literals" {
+    try expectOutput("(do (defmacro half [] 0.5) (half))", "0.5");
+    try expectOutput("(do (defmacro ch [] \\z) (pr-str (ch)))", "\\z");
+    try expectOutput("(do (defmacro twice [x] `(* 2 ~x)) (twice 1.25))", "2.5");
+}

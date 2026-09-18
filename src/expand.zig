@@ -1501,8 +1501,10 @@ fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
             const heap = try ctx.heapForArgs();
             break :blk string_mod_local.fromBytes(heap, bytes) catch return ExpandError.OutOfMemory;
         },
+        .real => |f| value_mod.fromFloat(f),
+        .char => |c| value_mod.fromChar(c) orelse return ExpandError.MalformedMacroCall,
         // syntax_quote, unquote, unquote_splicing, anon_fn,
-        // with_meta, deref, real, char → defer.
+        // with_meta, deref → defer.
         else => return ExpandError.MalformedMacroCall,
     };
 }
@@ -1533,6 +1535,16 @@ fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSp
         .fixnum => blk: {
             const form = try ctx.allocator.create(Form);
             form.* = .{ .datum = .{ .int = v.asFixnum() }, .origin = origin };
+            break :blk form;
+        },
+        .float => blk: {
+            const form = try ctx.allocator.create(Form);
+            form.* = .{ .datum = .{ .real = v.asFloat() }, .origin = origin };
+            break :blk form;
+        },
+        .char => blk: {
+            const form = try ctx.allocator.create(Form);
+            form.* = .{ .datum = .{ .char = v.asChar() }, .origin = origin };
             break :blk form;
         },
         .symbol => blk: {

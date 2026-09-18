@@ -86,7 +86,7 @@ const Usage =
     \\  - `#(...)` anon-fn shorthand with %, %1..%N, %&
     \\  - try/catch can now catch recoverable VM errors as
     \\    keywords: :kind-mismatch, :unbound-var, :arity-mismatch,
-    \\    :not-callable, :integer-overflow
+    \\    :not-callable, :arithmetic-overflow
     \\  - collection literals: [vectors], {maps}, #{sets}
     \\    + quoted forms of all three
     \\
