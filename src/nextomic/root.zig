@@ -11,6 +11,8 @@ pub const idents = @import("idents.zig");
 pub const schema = @import("schema.zig");
 pub const db = @import("db.zig");
 pub const transact = @import("transact.zig");
+pub const relation = @import("relation.zig");
+pub const query = @import("query.zig");
 
 pub const Val = key.Val;
 pub const ValueType = key.ValueType;
@@ -26,6 +28,8 @@ pub const DbValue = db.DbValue;
 pub const Error = db.Error;
 pub const Report = transact.Report;
 pub const Op = transact.Op;
+pub const Relation = relation.Relation;
+pub const Cell = relation.Cell;
 
 test {
     _ = key;
@@ -35,4 +39,6 @@ test {
     _ = schema;
     _ = db;
     _ = transact;
+    _ = relation;
+    _ = query;
 }
