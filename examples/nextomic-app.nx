@@ -2,8 +2,9 @@
 ; (docs/NEXTOMIC.md). Patients are upserted by medical record number,
 ; visits by their own id, so the script is safe to run again: the
 ; store under tmp/ keeps every fact it ever learned, the queries ask
-; the chart questions as Datalog, and the reads at the end show how it
-; looked at each transaction.
+; the chart questions as Datalog, pull shapes an answer, the time
+; views show how the chart looked at each transaction, and a
+; speculative transaction trials a change without filing it.
 ;
 ;   ./bin/nexis run examples/nextomic-app.nx
 
@@ -74,6 +75,16 @@
              (sort (d/q '[:find [?name ...] :where [?dr :clinician/name "Dr. Okafor"] [?p :patient/primary ?dr]
                           [?p :patient/name ?name]] db)))
 
+    ; Pull: a pattern is the shape of the answer. Nested patterns
+    ; follow refs, a reverse attribute walks a ref the other way, and
+    ; a component (the notes) comes along in full by default.
+    (println "Mara's chart:"
+             (d/pull db '[:patient/name :patient/allergies {:patient/primary [:clinician/name]}
+                          {:visit/_patient [:visit/reason :visit/weight-kg :visit/notes]}]
+                     [:patient/mrn "MRN-1001"]))
+    (println "both names:"
+             (mapv :patient/name (d/pull-many db '[:patient/name] [[:patient/mrn "MRN-1001"] [:patient/mrn "MRN-1002"]])))
+
     ; Time travel: the chart as it stood right after intake, and the
     ; full history of one attribute.
     (println "Mara at intake:" (:patient/allergies (patient (d/as-of db (:tx intake)) "MRN-1001")))
@@ -84,6 +95,17 @@
              (mapv (fn [[e a v t added]] [(d/ident db a) v added])
                    (filterv (fn [[e a v t added]] (not= a :db/txInstant))
                             (:data (first (d/tx-range c (:tx correction) (inc (:tx correction))))))))
+
+    ; Speculation: `with` applies tx-data in a transaction that is
+    ; never committed, so a follow-up visit can be trialled against the
+    ; chart, queried like any other db, and dropped. The basis is
+    ; unchanged afterwards.
+    (d/with c [{:visit/id "V-2" :visit/patient [:patient/mrn "MRN-1001"] :visit/reason "follow-up" :visit/weight-kg 61.0}]
+      (fn [db-after report]
+        (println "if V-2 were filed:"
+                 (sort (d/q '[:find ?name (count ?v) :where [?v :visit/patient ?p] [?p :patient/name ?name]] db-after))
+                 "at t =" (:tx report))))
+    (println "on file:" (count (d/datoms (d/db c) :aevt :visit/id)) "visit(s), basis" (d/basis-t (d/db c)))
 
     ; A unique identity is a promise: the same MRN with another name is
     ; an update of the same patient, and a second entity claiming a
