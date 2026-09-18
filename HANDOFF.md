@@ -145,7 +145,7 @@ inline tests, then `zig build test` green, then commit.
    logs). Refresh the `src/cli.zig` usage text in the same pass.
 4. **Datalog function-position variables.** Allow `[(?f ?x) ?y]` and
    `[(?pred ?x)]` where `?f` is bound to a function value by an `:in`
-   input or an earlier clause; `query/parse.zig` currently accepts a
+   input or an earlier clause; `query/parse.zig` accepts a
    symbol only, `query/exec.zig` calls through the CallHook. Add
    corpus cases in `test/integration/nextomic_q.zig` and a row in
    `docs/NEXTOMIC.md` §5.

@@ -561,7 +561,7 @@ and never goes through the codec or per-operation tree opens.
 
 ### 12. Deferred (explicitly)
 
-Shipped from the original list and no longer deferred: `(with-tx
+Shipped, and so not deferred: `(with-tx
 ...)` / `(with-read-tx ...)` (PLAN §21 Phase 4.0b), `db/snapshot` /
 `with-snapshot` (4.0f), `db/scan` / `db/reduce-tree` (4.0d),
 `db/alter!` (4.0c), and the per-connection `TreeId` cache (4.0g).
