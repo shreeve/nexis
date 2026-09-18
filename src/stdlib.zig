@@ -247,7 +247,70 @@ const core_fns = [_]CoreEntry{
     .{ .name = "apply", .descriptor = &native_apply },
     .{ .name = "map", .descriptor = &native_map },
     .{ .name = "reduce", .descriptor = &native_reduce },
+    .{ .name = "reduce-kv", .descriptor = &native_reduce_kv },
     .{ .name = "filter", .descriptor = &native_filter },
+    .{ .name = "remove", .descriptor = &native_remove },
+    .{ .name = "keep", .descriptor = &native_keep },
+    .{ .name = "seq", .descriptor = &native_seq },
+    .{ .name = "next", .descriptor = &native_next },
+    .{ .name = "range", .descriptor = &native_range },
+    .{ .name = "concat", .descriptor = &native_concat },
+    .{ .name = "mapcat", .descriptor = &native_mapcat },
+    .{ .name = "into", .descriptor = &native_into },
+    .{ .name = "mapv", .descriptor = &native_mapv },
+    .{ .name = "filterv", .descriptor = &native_filterv },
+    .{ .name = "map-indexed", .descriptor = &native_map_indexed },
+    .{ .name = "keep-indexed", .descriptor = &native_keep_indexed },
+    .{ .name = "distinct", .descriptor = &native_distinct },
+    .{ .name = "partition", .descriptor = &native_partition },
+    .{ .name = "partition-all", .descriptor = &native_partition_all },
+    .{ .name = "interleave", .descriptor = &native_interleave },
+    .{ .name = "zipmap", .descriptor = &native_zipmap },
+    .{ .name = "take-while", .descriptor = &native_take_while },
+    .{ .name = "drop-while", .descriptor = &native_drop_while },
+    .{ .name = "butlast", .descriptor = &native_butlast },
+    .{ .name = "nthrest", .descriptor = &native_nthrest },
+    .{ .name = "split-at", .descriptor = &native_split_at },
+    .{ .name = "take-last", .descriptor = &native_take_last },
+    .{ .name = "drop-last", .descriptor = &native_drop_last },
+    .{ .name = "flatten", .descriptor = &native_flatten },
+    .{ .name = "reductions", .descriptor = &native_reductions },
+    .{ .name = "repeat", .descriptor = &native_repeat },
+    .{ .name = "repeatedly", .descriptor = &native_repeatedly },
+    .{ .name = "iterate", .descriptor = &native_iterate },
+    .{ .name = "max-key", .descriptor = &native_max_key },
+    .{ .name = "min-key", .descriptor = &native_min_key },
+    .{ .name = "select-keys", .descriptor = &native_select_keys },
+    .{ .name = "find", .descriptor = &native_find },
+    .{ .name = "key", .descriptor = &native_key },
+    .{ .name = "val", .descriptor = &native_val },
+    .{ .name = "peek", .descriptor = &native_peek },
+    .{ .name = "pop", .descriptor = &native_pop },
+    .{ .name = "empty", .descriptor = &native_empty },
+    .{ .name = "not-empty", .descriptor = &native_not_empty },
+    .{ .name = "disj", .descriptor = &native_disj },
+    .{ .name = "compare", .descriptor = &native_compare },
+    .{ .name = "sort", .descriptor = &native_sort },
+    .{ .name = "sort-by", .descriptor = &native_sort_by },
+    .{ .name = "hash", .descriptor = &native_hash },
+    .{ .name = "name", .descriptor = &native_name },
+    .{ .name = "keyword", .descriptor = &native_keyword },
+    .{ .name = "symbol", .descriptor = &native_symbol },
+    .{ .name = "boolean", .descriptor = &native_boolean },
+    .{ .name = "list?", .descriptor = &native_list_q },
+    .{ .name = "seq?", .descriptor = &native_seq_q },
+    .{ .name = "vector?", .descriptor = &native_vector_q },
+    .{ .name = "map?", .descriptor = &native_map_q },
+    .{ .name = "set?", .descriptor = &native_set_q },
+    .{ .name = "keyword?", .descriptor = &native_keyword_q },
+    .{ .name = "symbol?", .descriptor = &native_symbol_q },
+    .{ .name = "char?", .descriptor = &native_char_q },
+    .{ .name = "boolean?", .descriptor = &native_boolean_q },
+    .{ .name = "coll?", .descriptor = &native_coll_q },
+    .{ .name = "sequential?", .descriptor = &native_sequential_q },
+    .{ .name = "associative?", .descriptor = &native_associative_q },
+    .{ .name = "fn?", .descriptor = &native_fn_q },
+    .{ .name = "ifn?", .descriptor = &native_ifn_q },
     // 3.3c collection construction + access.
     .{ .name = "vector", .descriptor = &native_vector },
     .{ .name = "vec", .descriptor = &native_vec },
@@ -401,17 +464,80 @@ const native_even_q = NativeFn{ .name = "even?", .min_arity = 1, .max_arity = 1,
 
 // 3.3b apply + HOFs.
 const native_apply = NativeFn{ .name = "apply", .min_arity = 2, .max_arity = null, .call = &fnApply };
-const native_map = NativeFn{ .name = "map", .min_arity = 2, .max_arity = 2, .call = &fnMap };
-const native_reduce = NativeFn{ .name = "reduce", .min_arity = 3, .max_arity = 3, .call = &fnReduce };
+const native_map = NativeFn{ .name = "map", .min_arity = 2, .max_arity = null, .call = &fnMap };
+const native_reduce = NativeFn{ .name = "reduce", .min_arity = 2, .max_arity = 3, .call = &fnReduce };
+const native_reduce_kv = NativeFn{ .name = "reduce-kv", .min_arity = 3, .max_arity = 3, .call = &fnReduceKv };
 const native_filter = NativeFn{ .name = "filter", .min_arity = 2, .max_arity = 2, .call = &fnFilter };
+const native_remove = NativeFn{ .name = "remove", .min_arity = 2, .max_arity = 2, .call = &fnRemove };
+const native_keep = NativeFn{ .name = "keep", .min_arity = 2, .max_arity = 2, .call = &fnKeep };
+const native_seq = NativeFn{ .name = "seq", .min_arity = 1, .max_arity = 1, .call = &fnSeq };
+const native_next = NativeFn{ .name = "next", .min_arity = 1, .max_arity = 1, .call = &fnNext };
+const native_range = NativeFn{ .name = "range", .min_arity = 1, .max_arity = 3, .call = &fnRange };
+const native_concat = NativeFn{ .name = "concat", .min_arity = 0, .max_arity = null, .call = &fnConcat };
+const native_mapcat = NativeFn{ .name = "mapcat", .min_arity = 2, .max_arity = null, .call = &fnMapcat };
+const native_into = NativeFn{ .name = "into", .min_arity = 2, .max_arity = 2, .call = &fnInto };
+const native_mapv = NativeFn{ .name = "mapv", .min_arity = 2, .max_arity = null, .call = &fnMapv };
+const native_filterv = NativeFn{ .name = "filterv", .min_arity = 2, .max_arity = 2, .call = &fnFilterv };
+const native_map_indexed = NativeFn{ .name = "map-indexed", .min_arity = 2, .max_arity = 2, .call = &fnMapIndexed };
+const native_keep_indexed = NativeFn{ .name = "keep-indexed", .min_arity = 2, .max_arity = 2, .call = &fnKeepIndexed };
+const native_distinct = NativeFn{ .name = "distinct", .min_arity = 1, .max_arity = 1, .call = &fnDistinct };
+const native_partition = NativeFn{ .name = "partition", .min_arity = 2, .max_arity = 4, .call = &fnPartition };
+const native_partition_all = NativeFn{ .name = "partition-all", .min_arity = 2, .max_arity = 3, .call = &fnPartitionAll };
+const native_interleave = NativeFn{ .name = "interleave", .min_arity = 0, .max_arity = null, .call = &fnInterleave };
+const native_zipmap = NativeFn{ .name = "zipmap", .min_arity = 2, .max_arity = 2, .call = &fnZipmap };
+const native_take_while = NativeFn{ .name = "take-while", .min_arity = 2, .max_arity = 2, .call = &fnTakeWhile };
+const native_drop_while = NativeFn{ .name = "drop-while", .min_arity = 2, .max_arity = 2, .call = &fnDropWhile };
+const native_butlast = NativeFn{ .name = "butlast", .min_arity = 1, .max_arity = 1, .call = &fnButlast };
+const native_nthrest = NativeFn{ .name = "nthrest", .min_arity = 2, .max_arity = 2, .call = &fnNthrest };
+const native_split_at = NativeFn{ .name = "split-at", .min_arity = 2, .max_arity = 2, .call = &fnSplitAt };
+const native_take_last = NativeFn{ .name = "take-last", .min_arity = 2, .max_arity = 2, .call = &fnTakeLast };
+const native_drop_last = NativeFn{ .name = "drop-last", .min_arity = 2, .max_arity = 2, .call = &fnDropLast };
+const native_flatten = NativeFn{ .name = "flatten", .min_arity = 1, .max_arity = 1, .call = &fnFlatten };
+const native_reductions = NativeFn{ .name = "reductions", .min_arity = 2, .max_arity = 3, .call = &fnReductions };
+const native_repeat = NativeFn{ .name = "repeat", .min_arity = 2, .max_arity = 2, .call = &fnRepeat };
+const native_repeatedly = NativeFn{ .name = "repeatedly", .min_arity = 2, .max_arity = 2, .call = &fnRepeatedly };
+const native_iterate = NativeFn{ .name = "iterate", .min_arity = 3, .max_arity = 3, .call = &fnIterate };
+const native_max_key = NativeFn{ .name = "max-key", .min_arity = 2, .max_arity = null, .call = &fnMaxKey };
+const native_min_key = NativeFn{ .name = "min-key", .min_arity = 2, .max_arity = null, .call = &fnMinKey };
+const native_select_keys = NativeFn{ .name = "select-keys", .min_arity = 2, .max_arity = 2, .call = &fnSelectKeys };
+const native_find = NativeFn{ .name = "find", .min_arity = 2, .max_arity = 2, .call = &fnFind };
+const native_key = NativeFn{ .name = "key", .min_arity = 1, .max_arity = 1, .call = &fnKey };
+const native_val = NativeFn{ .name = "val", .min_arity = 1, .max_arity = 1, .call = &fnVal };
+const native_peek = NativeFn{ .name = "peek", .min_arity = 1, .max_arity = 1, .call = &fnPeek };
+const native_pop = NativeFn{ .name = "pop", .min_arity = 1, .max_arity = 1, .call = &fnPop };
+const native_empty = NativeFn{ .name = "empty", .min_arity = 1, .max_arity = 1, .call = &fnEmpty };
+const native_not_empty = NativeFn{ .name = "not-empty", .min_arity = 1, .max_arity = 1, .call = &fnNotEmpty };
+const native_disj = NativeFn{ .name = "disj", .min_arity = 1, .max_arity = null, .call = &fnDisj };
+const native_compare = NativeFn{ .name = "compare", .min_arity = 2, .max_arity = 2, .call = &fnCompare };
+const native_sort = NativeFn{ .name = "sort", .min_arity = 1, .max_arity = 2, .call = &fnSort };
+const native_sort_by = NativeFn{ .name = "sort-by", .min_arity = 2, .max_arity = 3, .call = &fnSortBy };
+const native_hash = NativeFn{ .name = "hash", .min_arity = 1, .max_arity = 1, .call = &fnHash };
+const native_name = NativeFn{ .name = "name", .min_arity = 1, .max_arity = 1, .call = &fnName };
+const native_keyword = NativeFn{ .name = "keyword", .min_arity = 1, .max_arity = 1, .call = &fnKeyword };
+const native_symbol = NativeFn{ .name = "symbol", .min_arity = 1, .max_arity = 1, .call = &fnSymbol };
+const native_boolean = NativeFn{ .name = "boolean", .min_arity = 1, .max_arity = 1, .call = &fnBoolean };
+const native_list_q = NativeFn{ .name = "list?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
+const native_seq_q = NativeFn{ .name = "seq?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
+const native_vector_q = NativeFn{ .name = "vector?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isVector) };
+const native_map_q = NativeFn{ .name = "map?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isMap) };
+const native_set_q = NativeFn{ .name = "set?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isSet) };
+const native_keyword_q = NativeFn{ .name = "keyword?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isKeyword) };
+const native_symbol_q = NativeFn{ .name = "symbol?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isSymbol) };
+const native_char_q = NativeFn{ .name = "char?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isChar) };
+const native_boolean_q = NativeFn{ .name = "boolean?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isBoolean) };
+const native_coll_q = NativeFn{ .name = "coll?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isColl) };
+const native_sequential_q = NativeFn{ .name = "sequential?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isSequential) };
+const native_associative_q = NativeFn{ .name = "associative?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isAssociative) };
+const native_fn_q = NativeFn{ .name = "fn?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isFn) };
+const native_ifn_q = NativeFn{ .name = "ifn?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isIfn) };
 
 // 3.3c collection utilities.
 const native_vector = NativeFn{ .name = "vector", .min_arity = 0, .max_arity = null, .call = &fnVector };
 const native_vec = NativeFn{ .name = "vec", .min_arity = 1, .max_arity = 1, .call = &fnVec };
 const native_hash_map = NativeFn{ .name = "hash-map", .min_arity = 0, .max_arity = null, .call = &fnHashMap };
 const native_hash_set = NativeFn{ .name = "hash-set", .min_arity = 0, .max_arity = null, .call = &fnHashSet };
-const native_assoc = NativeFn{ .name = "assoc", .min_arity = 3, .max_arity = 3, .call = &fnAssoc };
-const native_dissoc = NativeFn{ .name = "dissoc", .min_arity = 2, .max_arity = 2, .call = &fnDissoc };
+const native_assoc = NativeFn{ .name = "assoc", .min_arity = 3, .max_arity = null, .call = &fnAssoc };
+const native_dissoc = NativeFn{ .name = "dissoc", .min_arity = 1, .max_arity = null, .call = &fnDissoc };
 const native_get = NativeFn{ .name = "get", .min_arity = 2, .max_arity = 3, .call = &fnGet };
 const native_contains_q = NativeFn{ .name = "contains?", .min_arity = 2, .max_arity = 2, .call = &fnContainsQ };
 const native_keys = NativeFn{ .name = "keys", .min_arity = 1, .max_arity = 1, .call = &fnKeys };
@@ -525,13 +651,16 @@ fn fnCons(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(first s)` → head of the seq, or nil if empty/nil.
-fn fnFirst(_: *VM, args: []const Value) VmError!Value {
+fn fnFirst(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
     return switch (s.kind()) {
         .nil => value_mod.nilValue(),
         .list => if (list_mod.isEmpty(s)) value_mod.nilValue() else list_mod.head(s),
         .persistent_vector => if (vector_mod.isEmpty(s)) value_mod.nilValue() else vector_mod.nth(s, 0),
-        else => VmError.KindMismatch,
+        else => blk: {
+            var it = try makeSeqIter(vm, s);
+            break :blk (try it.next()) orelse value_mod.nilValue();
+        },
     };
 }
 
@@ -561,8 +690,31 @@ fn fnRest(vm: *VM, args: []const Value) VmError!Value {
             }
             break :blk result;
         },
-        else => VmError.KindMismatch,
+        else => blk: {
+            var items = try collectSeq(vm, s);
+            defer items.deinit(vm.allocator);
+            if (items.items.len <= 1) break :blk list_mod.empty(heap) catch VmError.OutOfMemory;
+            break :blk try buildListFromSlice(vm, items.items[1..]);
+        },
     };
+}
+
+/// `(next s)` → `(seq (rest s))`: nil when nothing follows.
+fn fnNext(vm: *VM, args: []const Value) VmError!Value {
+    const r = try fnRest(vm, args);
+    return if (list_mod.isEmpty(r)) value_mod.nilValue() else r;
+}
+
+/// `(seq coll)` → nil for nil or an empty collection, otherwise a
+/// list of the collection's elements (a non-empty list is
+/// returned as is). Maps yield `[k v]` entries, strings chars.
+fn fnSeq(vm: *VM, args: []const Value) VmError!Value {
+    const c = args[0];
+    if (c.kind() == .list) return if (list_mod.isEmpty(c)) value_mod.nilValue() else c;
+    var items = try collectSeq(vm, c);
+    defer items.deinit(vm.allocator);
+    if (items.items.len == 0) return value_mod.nilValue();
+    return try buildListFromSlice(vm, items.items);
 }
 
 /// `(count coll)` → element count. nil → 0. Lists, vectors,
@@ -903,58 +1055,118 @@ fn fnApply(vm: *VM, args: []const Value) VmError!Value {
     return try vm.callValue(f, combined.items);
 }
 
-/// `(map f coll)` → eager cons list of `(f x)` for each x in
-/// coll. Order-preserving. Throws inside `f` propagate via
-/// `ControlTransferred`.
+/// `(map f coll & colls)` → eager list of `(f x1 x2 ...)`,
+/// stopping at the shortest collection. Throws inside `f`
+/// propagate via `ControlTransferred`.
 fn fnMap(vm: *VM, args: []const Value) VmError!Value {
     const f = args[0];
-    const coll = args[1];
+    const colls = args[1..];
 
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
 
-    var it = try makeSeqIter(coll);
-    while (it.next()) |x| {
-        const one = [_]Value{x};
-        const mapped = try vm.callValue(f, &one);
-        results.append(vm.allocator, mapped) catch return VmError.OutOfMemory;
+    if (colls.len == 1) {
+        var it = try makeSeqIter(vm, colls[0]);
+        while (try it.next()) |x| {
+            const one = [_]Value{x};
+            results.append(vm.allocator, try vm.callValue(f, &one)) catch return VmError.OutOfMemory;
+        }
+        return try buildListFromSlice(vm, results.items);
     }
 
+    const iters = vm.allocator.alloc(SeqIter, colls.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(iters);
+    for (colls, 0..) |c, i| iters[i] = try makeSeqIter(vm, c);
+    const call_args = vm.allocator.alloc(Value, colls.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(call_args);
+    outer: while (true) {
+        for (iters, 0..) |*it, i| {
+            call_args[i] = (try it.next()) orelse break :outer;
+        }
+        results.append(vm.allocator, try vm.callValue(f, call_args)) catch return VmError.OutOfMemory;
+    }
     return try buildListFromSlice(vm, results.items);
 }
 
-/// `(reduce f init coll)` → left fold.
+/// `(reduce f coll)` / `(reduce f init coll)` → left fold. With
+/// no init the first element seeds the fold and an empty
+/// collection yields `(f)`.
 fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     const f = args[0];
-    var acc = args[1];
-    const coll = args[2];
-
-    var it = try makeSeqIter(coll);
-    while (it.next()) |x| {
+    const coll = args[args.len - 1];
+    var it = try makeSeqIter(vm, coll);
+    var acc: Value = undefined;
+    if (args.len == 3) {
+        acc = args[1];
+    } else {
+        acc = (try it.next()) orelse return try vm.callValue(f, &.{});
+    }
+    while (try it.next()) |x| {
         const pair = [_]Value{ acc, x };
         acc = try vm.callValue(f, &pair);
     }
     return acc;
 }
 
-/// `(filter pred coll)` → eager cons list of x where `(pred x)`
-/// is truthy.
-fn fnFilter(vm: *VM, args: []const Value) VmError!Value {
-    const pred = args[0];
-    const coll = args[1];
+/// `(reduce-kv f init m)` → `(f acc k v)` over a map's entries or
+/// a vector's index/element pairs.
+fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
+    const f = args[0];
+    var acc = args[1];
+    const coll = args[2];
+    switch (coll.kind()) {
+        .nil => {},
+        .persistent_map, .record => {
+            var it = champ_mod.mapIter(if (coll.kind() == .record) record_mod.fieldsOf(coll) else coll);
+            while (it.next()) |e| {
+                acc = try vm.callValue(f, &.{ acc, e.key, e.value });
+            }
+        },
+        .persistent_vector => {
+            const n = vector_mod.count(coll);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                acc = try vm.callValue(f, &.{ acc, value_mod.fromFixnum(@intCast(i)).?, vector_mod.nth(coll, i) });
+            }
+        },
+        else => return VmError.KindMismatch,
+    }
+    return acc;
+}
 
+/// Shared body of `filter` / `remove` / `keep`.
+const Sieve = enum { keep_truthy, keep_falsy, keep_result };
+
+fn sieve(vm: *VM, mode: Sieve, pred: Value, coll: Value) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
-
-    var it = try makeSeqIter(coll);
-    while (it.next()) |x| {
+    var it = try makeSeqIter(vm, coll);
+    while (try it.next()) |x| {
         const one = [_]Value{x};
-        const keep = try vm.callValue(pred, &one);
-        if (keep.isTruthy()) {
-            results.append(vm.allocator, x) catch return VmError.OutOfMemory;
-        }
+        const r = try vm.callValue(pred, &one);
+        const out: ?Value = switch (mode) {
+            .keep_truthy => if (r.isTruthy()) x else null,
+            .keep_falsy => if (r.isTruthy()) null else x,
+            .keep_result => if (r.isNil()) null else r,
+        };
+        if (out) |v| results.append(vm.allocator, v) catch return VmError.OutOfMemory;
     }
     return try buildListFromSlice(vm, results.items);
+}
+
+/// `(filter pred coll)` → eager list of x where `(pred x)` is truthy.
+fn fnFilter(vm: *VM, args: []const Value) VmError!Value {
+    return sieve(vm, .keep_truthy, args[0], args[1]);
+}
+
+/// `(remove pred coll)` → eager list of x where `(pred x)` is falsy.
+fn fnRemove(vm: *VM, args: []const Value) VmError!Value {
+    return sieve(vm, .keep_falsy, args[0], args[1]);
+}
+
+/// `(keep f coll)` → eager list of the non-nil `(f x)` results.
+fn fnKeep(vm: *VM, args: []const Value) VmError!Value {
+    return sieve(vm, .keep_result, args[0], args[1]);
 }
 
 // =============================================================================
@@ -1044,10 +1256,21 @@ fn fnHashSet(vm: *VM, args: []const Value) VmError!Value {
     return s;
 }
 
+/// `(assoc coll k v & kvs)` → persistent put. Maps and records
+/// key by value; vectors index by fixnum where the index may be
+/// at most the count (one past the end appends); nil becomes a
+/// map.
 fn fnAssoc(vm: *VM, args: []const Value) VmError!Value {
-    const coll = args[0];
-    const k = args[1];
-    const v = args[2];
+    if (args.len % 2 != 1) return VmError.ArityMismatch;
+    var coll = args[0];
+    var i: usize = 1;
+    while (i < args.len) : (i += 2) {
+        coll = try assocOne(vm, coll, args[i], args[i + 1]);
+    }
+    return coll;
+}
+
+fn assocOne(vm: *VM, coll: Value, k: Value, v: Value) VmError!Value {
     const heap = vm.ensureHeap();
     return switch (coll.kind()) {
         .persistent_map => champ_mod.mapAssoc(
@@ -1059,7 +1282,6 @@ fn fnAssoc(vm: *VM, args: []const Value) VmError!Value {
             &dispatch_mod.equal,
         ) catch VmError.OutOfMemory,
         .nil => blk: {
-            // Per Clojure, (assoc nil k v) => {k v}.
             var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
             m = champ_mod.mapAssoc(
                 heap,
@@ -1071,9 +1293,6 @@ fn fnAssoc(vm: *VM, args: []const Value) VmError!Value {
             ) catch return VmError.OutOfMemory;
             break :blk m;
         },
-        // Phase 5.3a (peer-AI turn 84): record `assoc` returns a
-        // NEW record of the SAME type with an updated field map.
-        // PROTOCOLS.md §2.1 + §4.2.
         .record => blk: {
             const cur_fields = record_mod.fieldsOf(coll);
             const new_fields = champ_mod.mapAssoc(
@@ -1086,40 +1305,73 @@ fn fnAssoc(vm: *VM, args: []const Value) VmError!Value {
             ) catch return VmError.OutOfMemory;
             break :blk record_mod.withFields(heap, coll, new_fields) catch return VmError.OutOfMemory;
         },
-        // Vector assoc-by-index is a Clojure feature; defer to
-        // a follow-up commit. v1: maps only.
+        .persistent_vector => blk: {
+            if (k.kind() != .fixnum) return VmError.KindMismatch;
+            const idx = k.asFixnum();
+            const n = vector_mod.count(coll);
+            if (idx < 0 or @as(usize, @intCast(idx)) > n) return VmError.IndexOutOfBounds;
+            const u_idx: usize = @intCast(idx);
+            if (u_idx == n) break :blk vector_mod.conj(heap, coll, v) catch return VmError.OutOfMemory;
+            const items = vm.allocator.alloc(Value, n) catch return VmError.OutOfMemory;
+            defer vm.allocator.free(items);
+            var i: usize = 0;
+            while (i < n) : (i += 1) items[i] = vector_mod.nth(coll, i);
+            items[u_idx] = v;
+            break :blk vector_mod.fromSlice(heap, items) catch VmError.OutOfMemory;
+        },
         else => VmError.KindMismatch,
     };
 }
 
+/// `(dissoc m k & ks)` → persistent remove from a map or record.
 fn fnDissoc(vm: *VM, args: []const Value) VmError!Value {
-    const coll = args[0];
-    const k = args[1];
     const heap = vm.ensureHeap();
-    return switch (coll.kind()) {
-        .persistent_map => champ_mod.mapDissoc(
-            heap,
-            coll,
-            k,
-            &dispatch_mod.hashValue,
-            &dispatch_mod.equal,
-        ) catch VmError.OutOfMemory,
-        .nil => coll,
-        // Phase 5.3a: record `dissoc` returns a NEW record of the
-        // SAME type with the key removed from the field map.
-        .record => blk: {
-            const cur_fields = record_mod.fieldsOf(coll);
-            const new_fields = champ_mod.mapDissoc(
+    var coll = args[0];
+    for (args[1..]) |k| {
+        coll = switch (coll.kind()) {
+            .persistent_map => champ_mod.mapDissoc(
                 heap,
-                cur_fields,
+                coll,
                 k,
                 &dispatch_mod.hashValue,
                 &dispatch_mod.equal,
-            ) catch return VmError.OutOfMemory;
-            break :blk record_mod.withFields(heap, coll, new_fields) catch return VmError.OutOfMemory;
-        },
-        else => VmError.KindMismatch,
-    };
+            ) catch return VmError.OutOfMemory,
+            .nil => coll,
+            .record => blk: {
+                const cur_fields = record_mod.fieldsOf(coll);
+                const new_fields = champ_mod.mapDissoc(
+                    heap,
+                    cur_fields,
+                    k,
+                    &dispatch_mod.hashValue,
+                    &dispatch_mod.equal,
+                ) catch return VmError.OutOfMemory;
+                break :blk record_mod.withFields(heap, coll, new_fields) catch return VmError.OutOfMemory;
+            },
+            else => return VmError.KindMismatch,
+        };
+    }
+    return coll;
+}
+
+/// `(disj s x & xs)` → set without the elements.
+fn fnDisj(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    var coll = args[0];
+    for (args[1..]) |x| {
+        coll = switch (coll.kind()) {
+            .persistent_set => champ_mod.setDisj(
+                heap,
+                coll,
+                x,
+                &dispatch_mod.hashValue,
+                &dispatch_mod.equal,
+            ) catch return VmError.OutOfMemory,
+            .nil => coll,
+            else => return VmError.KindMismatch,
+        };
+    }
+    return coll;
 }
 
 fn fnGet(_: *VM, args: []const Value) VmError!Value {
@@ -1252,19 +1504,36 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
         .persistent_map => blk: {
             var result = coll;
             for (xs) |x| {
-                // Each x must be a 2-element vector or list.
-                if (x.kind() != .persistent_vector) return VmError.KindMismatch;
-                if (vector_mod.count(x) != 2) return VmError.ArityMismatch;
-                const k = vector_mod.nth(x, 0);
-                const v = vector_mod.nth(x, 1);
-                result = champ_mod.mapAssoc(
-                    heap,
-                    result,
-                    k,
-                    v,
-                    &dispatch_mod.hashValue,
-                    &dispatch_mod.equal,
-                ) catch return VmError.OutOfMemory;
+                // Each x is a `[k v]` entry, a map whose entries
+                // are all added, or nil (skipped).
+                switch (x.kind()) {
+                    .nil => {},
+                    .persistent_map, .record => {
+                        var it = champ_mod.mapIter(if (x.kind() == .record) record_mod.fieldsOf(x) else x);
+                        while (it.next()) |e| {
+                            result = champ_mod.mapAssoc(
+                                heap,
+                                result,
+                                e.key,
+                                e.value,
+                                &dispatch_mod.hashValue,
+                                &dispatch_mod.equal,
+                            ) catch return VmError.OutOfMemory;
+                        }
+                    },
+                    .persistent_vector => {
+                        if (vector_mod.count(x) != 2) return VmError.ArityMismatch;
+                        result = champ_mod.mapAssoc(
+                            heap,
+                            result,
+                            vector_mod.nth(x, 0),
+                            vector_mod.nth(x, 1),
+                            &dispatch_mod.hashValue,
+                            &dispatch_mod.equal,
+                        ) catch return VmError.OutOfMemory;
+                    },
+                    else => return VmError.KindMismatch,
+                }
             }
             break :blk result;
         },
@@ -1283,6 +1552,717 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
         },
         else => return VmError.KindMismatch,
     };
+}
+
+// =============================================================================
+// Sequence library
+// =============================================================================
+//
+// Eager, list-producing (PLAN §23 #14). Every function takes any
+// seqable receiver through `makeSeqIter` and builds its result
+// with `buildListFromSlice`; vector-producing variants (`mapv`,
+// `filterv`, `vec`) go through `vector_mod.fromSlice`.
+
+fn requireFixnumArg(v: Value) VmError!i64 {
+    if (v.kind() != .fixnum) return VmError.KindMismatch;
+    return v.asFixnum();
+}
+
+/// `(range end)` / `(range start end)` / `(range start end step)`
+/// → list of fixnums. A zero step is `:invalid-argument` (there
+/// is no infinite sequence to return).
+fn fnRange(vm: *VM, args: []const Value) VmError!Value {
+    var start: i64 = 0;
+    var end: i64 = undefined;
+    var step: i64 = 1;
+    switch (args.len) {
+        1 => end = try requireFixnumArg(args[0]),
+        2 => {
+            start = try requireFixnumArg(args[0]);
+            end = try requireFixnumArg(args[1]);
+        },
+        else => {
+            start = try requireFixnumArg(args[0]);
+            end = try requireFixnumArg(args[1]);
+            step = try requireFixnumArg(args[2]);
+            if (step == 0) return VmError.InvalidArgument;
+        },
+    }
+    var items: std.ArrayList(Value) = .empty;
+    defer items.deinit(vm.allocator);
+    var i = start;
+    while (if (step > 0) i < end else i > end) : (i += step) {
+        items.append(vm.allocator, value_mod.fromFixnum(i) orelse return VmError.ArithmeticOverflow) catch return VmError.OutOfMemory;
+    }
+    return try buildListFromSlice(vm, items.items);
+}
+
+/// `(concat & colls)` → one list of every element in order.
+fn fnConcat(vm: *VM, args: []const Value) VmError!Value {
+    var items: std.ArrayList(Value) = .empty;
+    defer items.deinit(vm.allocator);
+    for (args) |c| try appendSeqValues(vm, c, &items);
+    return try buildListFromSlice(vm, items.items);
+}
+
+/// `(mapcat f & colls)` → `(apply concat (map f & colls))`.
+fn fnMapcat(vm: *VM, args: []const Value) VmError!Value {
+    const mapped = try fnMap(vm, args);
+    var items: std.ArrayList(Value) = .empty;
+    defer items.deinit(vm.allocator);
+    var it = try makeSeqIter(vm, mapped);
+    while (try it.next()) |sub| try appendSeqValues(vm, sub, &items);
+    return try buildListFromSlice(vm, items.items);
+}
+
+/// `(into to from)` → `to` with every element of `from` conj'd.
+fn fnInto(vm: *VM, args: []const Value) VmError!Value {
+    var items = try collectSeq(vm, args[1]);
+    defer items.deinit(vm.allocator);
+    if (items.items.len == 0) return args[0];
+    const conj_args = vm.allocator.alloc(Value, items.items.len + 1) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(conj_args);
+    conj_args[0] = args[0];
+    @memcpy(conj_args[1..], items.items);
+    return fnConj(vm, conj_args);
+}
+
+/// `(mapv f & colls)` / `(filterv pred coll)` — vector results.
+fn fnMapv(vm: *VM, args: []const Value) VmError!Value {
+    return fnVec(vm, &.{try fnMap(vm, args)});
+}
+
+fn fnFilterv(vm: *VM, args: []const Value) VmError!Value {
+    return fnVec(vm, &.{try fnFilter(vm, args)});
+}
+
+/// `(map-indexed f coll)` → `(f i x)`; `(keep-indexed f coll)` →
+/// the non-nil `(f i x)`.
+fn indexedMap(vm: *VM, keep_nil: bool, f: Value, coll: Value) VmError!Value {
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    var it = try makeSeqIter(vm, coll);
+    var i: i64 = 0;
+    while (try it.next()) |x| : (i += 1) {
+        const r = try vm.callValue(f, &.{ value_mod.fromFixnum(i).?, x });
+        if (keep_nil or !r.isNil()) results.append(vm.allocator, r) catch return VmError.OutOfMemory;
+    }
+    return try buildListFromSlice(vm, results.items);
+}
+
+fn fnMapIndexed(vm: *VM, args: []const Value) VmError!Value {
+    return indexedMap(vm, true, args[0], args[1]);
+}
+
+fn fnKeepIndexed(vm: *VM, args: []const Value) VmError!Value {
+    return indexedMap(vm, false, args[0], args[1]);
+}
+
+/// `(distinct coll)` → first occurrences, in order.
+fn fnDistinct(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    var seen = champ_mod.setEmpty(heap) catch return VmError.OutOfMemory;
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    var it = try makeSeqIter(vm, args[0]);
+    while (try it.next()) |x| {
+        if (champ_mod.setContains(seen, x, &dispatch_mod.hashValue, &dispatch_mod.equal)) continue;
+        seen = champ_mod.setConj(heap, seen, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+        results.append(vm.allocator, x) catch return VmError.OutOfMemory;
+    }
+    return try buildListFromSlice(vm, results.items);
+}
+
+/// `(partition n coll)` / `(partition n step coll)` /
+/// `(partition n step pad coll)` → list of n-element lists; a
+/// short tail is dropped unless `pad` supplies its missing
+/// elements. `(partition-all n coll)` / `(partition-all n step
+/// coll)` keeps the short tail.
+fn partitionImpl(vm: *VM, all: bool, args: []const Value) VmError!Value {
+    const n = try requireFixnumArg(args[0]);
+    if (n <= 0) return VmError.InvalidArgument;
+    const step: i64 = if (args.len >= 3) try requireFixnumArg(args[1]) else n;
+    if (step <= 0) return VmError.InvalidArgument;
+    const pad: ?Value = if (args.len == 4) args[2] else null;
+    var items = try collectSeq(vm, args[args.len - 1]);
+    defer items.deinit(vm.allocator);
+    var pad_items: std.ArrayList(Value) = .empty;
+    defer pad_items.deinit(vm.allocator);
+    if (pad) |pv| try appendSeqValues(vm, pv, &pad_items);
+
+    var groups: std.ArrayList(Value) = .empty;
+    defer groups.deinit(vm.allocator);
+    var group: std.ArrayList(Value) = .empty;
+    defer group.deinit(vm.allocator);
+    const un: usize = @intCast(n);
+    const ustep: usize = @intCast(step);
+    var at: usize = 0;
+    while (at < items.items.len) : (at += ustep) {
+        const end = @min(at + un, items.items.len);
+        group.clearRetainingCapacity();
+        group.appendSlice(vm.allocator, items.items[at..end]) catch return VmError.OutOfMemory;
+        if (group.items.len < un) {
+            if (pad != null) {
+                var pi: usize = 0;
+                while (group.items.len < un and pi < pad_items.items.len) : (pi += 1) {
+                    group.append(vm.allocator, pad_items.items[pi]) catch return VmError.OutOfMemory;
+                }
+            } else if (!all) break;
+        }
+        groups.append(vm.allocator, try buildListFromSlice(vm, group.items)) catch return VmError.OutOfMemory;
+    }
+    return try buildListFromSlice(vm, groups.items);
+}
+
+fn fnPartition(vm: *VM, args: []const Value) VmError!Value {
+    return partitionImpl(vm, false, args);
+}
+
+fn fnPartitionAll(vm: *VM, args: []const Value) VmError!Value {
+    return partitionImpl(vm, true, args);
+}
+
+/// `(interleave & colls)` → round-robin elements until the
+/// shortest collection runs out.
+fn fnInterleave(vm: *VM, args: []const Value) VmError!Value {
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    if (args.len > 0) {
+        const iters = vm.allocator.alloc(SeqIter, args.len) catch return VmError.OutOfMemory;
+        defer vm.allocator.free(iters);
+        for (args, 0..) |c, i| iters[i] = try makeSeqIter(vm, c);
+        outer: while (true) {
+            const mark = results.items.len;
+            for (iters) |*it| {
+                const x = (try it.next()) orelse {
+                    results.shrinkRetainingCapacity(mark);
+                    break :outer;
+                };
+                results.append(vm.allocator, x) catch return VmError.OutOfMemory;
+            }
+        }
+    }
+    return try buildListFromSlice(vm, results.items);
+}
+
+/// `(zipmap keys vals)` → map pairing keys with vals positionally.
+fn fnZipmap(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    var ks = try makeSeqIter(vm, args[0]);
+    var vs = try makeSeqIter(vm, args[1]);
+    while (try ks.next()) |k| {
+        const v = (try vs.next()) orelse break;
+        m = champ_mod.mapAssoc(heap, m, k, v, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+    }
+    return m;
+}
+
+/// `(take-while pred coll)` / `(drop-while pred coll)`.
+fn whileSplit(vm: *VM, take: bool, pred: Value, coll: Value) VmError!Value {
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    var it = try makeSeqIter(vm, coll);
+    var dropping = true;
+    while (try it.next()) |x| {
+        if (dropping) {
+            const r = try vm.callValue(pred, &.{x});
+            if (r.isTruthy()) {
+                if (take) results.append(vm.allocator, x) catch return VmError.OutOfMemory;
+                continue;
+            }
+            dropping = false;
+            if (take) break;
+        }
+        results.append(vm.allocator, x) catch return VmError.OutOfMemory;
+    }
+    return try buildListFromSlice(vm, results.items);
+}
+
+fn fnTakeWhile(vm: *VM, args: []const Value) VmError!Value {
+    return whileSplit(vm, true, args[0], args[1]);
+}
+
+fn fnDropWhile(vm: *VM, args: []const Value) VmError!Value {
+    return whileSplit(vm, false, args[0], args[1]);
+}
+
+/// `(butlast coll)` → all but the last element, nil when fewer
+/// than two.
+fn fnButlast(vm: *VM, args: []const Value) VmError!Value {
+    var items = try collectSeq(vm, args[0]);
+    defer items.deinit(vm.allocator);
+    if (items.items.len < 2) return value_mod.nilValue();
+    return try buildListFromSlice(vm, items.items[0 .. items.items.len - 1]);
+}
+
+/// `(nthrest coll n)` → coll without its first n elements, as a list.
+fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
+    const n = try requireFixnumArg(args[1]);
+    if (n < 0) return VmError.IndexOutOfBounds;
+    var items = try collectSeq(vm, args[0]);
+    defer items.deinit(vm.allocator);
+    const skip = @min(@as(usize, @intCast(n)), items.items.len);
+    return try buildListFromSlice(vm, items.items[skip..]);
+}
+
+/// `(split-at n coll)` → `[(take n coll) (drop n coll)]`.
+fn fnSplitAt(vm: *VM, args: []const Value) VmError!Value {
+    const n = try requireFixnumArg(args[0]);
+    if (n < 0) return VmError.IndexOutOfBounds;
+    var items = try collectSeq(vm, args[1]);
+    defer items.deinit(vm.allocator);
+    const at = @min(@as(usize, @intCast(n)), items.items.len);
+    const head = try buildListFromSlice(vm, items.items[0..at]);
+    const tail = try buildListFromSlice(vm, items.items[at..]);
+    return vector_mod.fromSlice(vm.ensureHeap(), &.{ head, tail }) catch VmError.OutOfMemory;
+}
+
+/// `(take-last n coll)` / `(drop-last n coll)`.
+fn fnTakeLast(vm: *VM, args: []const Value) VmError!Value {
+    const n = try requireFixnumArg(args[0]);
+    var items = try collectSeq(vm, args[1]);
+    defer items.deinit(vm.allocator);
+    const keep = @min(@as(usize, @intCast(@max(n, 0))), items.items.len);
+    return try buildListFromSlice(vm, items.items[items.items.len - keep ..]);
+}
+
+fn fnDropLast(vm: *VM, args: []const Value) VmError!Value {
+    const n = try requireFixnumArg(args[0]);
+    var items = try collectSeq(vm, args[1]);
+    defer items.deinit(vm.allocator);
+    const drop = @min(@as(usize, @intCast(@max(n, 0))), items.items.len);
+    return try buildListFromSlice(vm, items.items[0 .. items.items.len - drop]);
+}
+
+/// `(flatten coll)` → every non-sequential leaf, depth first.
+fn fnFlatten(vm: *VM, args: []const Value) VmError!Value {
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    try flattenInto(vm, args[0], &results);
+    return try buildListFromSlice(vm, results.items);
+}
+
+fn flattenInto(vm: *VM, v: Value, out: *std.ArrayList(Value)) VmError!void {
+    switch (v.kind()) {
+        .list, .persistent_vector => {
+            var it = try makeSeqIter(vm, v);
+            while (try it.next()) |x| try flattenInto(vm, x, out);
+        },
+        .nil => {},
+        else => out.append(vm.allocator, v) catch return VmError.OutOfMemory,
+    }
+}
+
+/// `(reductions f coll)` / `(reductions f init coll)` → every
+/// intermediate accumulator of the fold.
+fn fnReductions(vm: *VM, args: []const Value) VmError!Value {
+    const f = args[0];
+    var it = try makeSeqIter(vm, args[args.len - 1]);
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    var acc: Value = undefined;
+    if (args.len == 3) {
+        acc = args[1];
+    } else {
+        acc = (try it.next()) orelse return try buildListFromSlice(vm, &.{try vm.callValue(f, &.{})});
+    }
+    results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
+    while (try it.next()) |x| {
+        acc = try vm.callValue(f, &.{ acc, x });
+        results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
+    }
+    return try buildListFromSlice(vm, results.items);
+}
+
+/// `(repeat n x)` → n copies of x. `(repeatedly n f)` → n results
+/// of `(f)`. `(iterate f x n)` → the first n of x, (f x), (f (f x))
+/// … — the count is explicit because sequences are eager.
+fn fnRepeat(vm: *VM, args: []const Value) VmError!Value {
+    const n = try requireFixnumArg(args[0]);
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    var i: i64 = 0;
+    while (i < n) : (i += 1) results.append(vm.allocator, args[1]) catch return VmError.OutOfMemory;
+    return try buildListFromSlice(vm, results.items);
+}
+
+fn fnRepeatedly(vm: *VM, args: []const Value) VmError!Value {
+    const n = try requireFixnumArg(args[0]);
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    var i: i64 = 0;
+    while (i < n) : (i += 1) results.append(vm.allocator, try vm.callValue(args[1], &.{})) catch return VmError.OutOfMemory;
+    return try buildListFromSlice(vm, results.items);
+}
+
+fn fnIterate(vm: *VM, args: []const Value) VmError!Value {
+    const n = try requireFixnumArg(args[2]);
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    var x = args[1];
+    var i: i64 = 0;
+    while (i < n) : (i += 1) {
+        results.append(vm.allocator, x) catch return VmError.OutOfMemory;
+        if (i + 1 < n) x = try vm.callValue(args[0], &.{x});
+    }
+    return try buildListFromSlice(vm, results.items);
+}
+
+/// `(max-key k x & xs)` / `(min-key k x & xs)` → the x with the
+/// greatest / least `(k x)`; ties go to the later argument.
+fn keyExtremum(vm: *VM, want_max: bool, args: []const Value) VmError!Value {
+    const k = args[0];
+    var best = args[1];
+    var best_key = try vm.callValue(k, &.{best});
+    for (args[2..]) |x| {
+        const key = try vm.callValue(k, &.{x});
+        const keep_best = try vm_mod.numCompare(if (want_max) .gt else .lt, best_key, key);
+        if (!keep_best) {
+            best = x;
+            best_key = key;
+        }
+    }
+    return best;
+}
+
+fn fnMaxKey(vm: *VM, args: []const Value) VmError!Value {
+    return keyExtremum(vm, true, args);
+}
+
+fn fnMinKey(vm: *VM, args: []const Value) VmError!Value {
+    return keyExtremum(vm, false, args);
+}
+
+/// `(select-keys m ks)` → map of the entries of m whose keys are in ks.
+fn fnSelectKeys(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    var out = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    const src = args[0];
+    if (!(src.kind() == .nil or src.kind() == .persistent_map or src.kind() == .record)) return VmError.KindMismatch;
+    var ks = try makeSeqIter(vm, args[1]);
+    while (try ks.next()) |k| {
+        const entry = try fnFind(vm, &.{ src, k });
+        if (entry.isNil()) continue;
+        out = champ_mod.mapAssoc(heap, out, k, vector_mod.nth(entry, 1), &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+    }
+    return out;
+}
+
+/// `(find m k)` → the `[k v]` entry or nil.
+fn fnFind(vm: *VM, args: []const Value) VmError!Value {
+    const m = args[0];
+    const map_v: Value = switch (m.kind()) {
+        .nil => return value_mod.nilValue(),
+        .persistent_map => m,
+        .record => record_mod.fieldsOf(m),
+        .persistent_vector => {
+            const k = args[1];
+            if (k.kind() != .fixnum) return value_mod.nilValue();
+            const idx = k.asFixnum();
+            if (idx < 0 or @as(usize, @intCast(idx)) >= vector_mod.count(m)) return value_mod.nilValue();
+            return vector_mod.fromSlice(vm.ensureHeap(), &.{ k, vector_mod.nth(m, @intCast(idx)) }) catch VmError.OutOfMemory;
+        },
+        else => return VmError.KindMismatch,
+    };
+    return switch (champ_mod.mapGet(map_v, args[1], &dispatch_mod.hashValue, &dispatch_mod.equal)) {
+        .present => |v| vector_mod.fromSlice(vm.ensureHeap(), &.{ args[1], v }) catch VmError.OutOfMemory,
+        .absent => value_mod.nilValue(),
+    };
+}
+
+/// `(key e)` / `(val e)` on a `[k v]` entry.
+fn entryPart(idx: usize, e: Value) VmError!Value {
+    if (e.kind() != .persistent_vector or vector_mod.count(e) != 2) return VmError.KindMismatch;
+    return vector_mod.nth(e, idx);
+}
+
+fn fnKey(_: *VM, args: []const Value) VmError!Value {
+    return entryPart(0, args[0]);
+}
+
+fn fnVal(_: *VM, args: []const Value) VmError!Value {
+    return entryPart(1, args[0]);
+}
+
+/// `(peek coll)` → last of a vector, first of a list.
+/// `(pop coll)` → vector without its last, list without its first.
+fn fnPeek(_: *VM, args: []const Value) VmError!Value {
+    const c = args[0];
+    return switch (c.kind()) {
+        .nil => value_mod.nilValue(),
+        .list => if (list_mod.isEmpty(c)) value_mod.nilValue() else list_mod.head(c),
+        .persistent_vector => if (vector_mod.isEmpty(c)) value_mod.nilValue() else vector_mod.nth(c, vector_mod.count(c) - 1),
+        else => VmError.KindMismatch,
+    };
+}
+
+fn fnPop(vm: *VM, args: []const Value) VmError!Value {
+    const c = args[0];
+    return switch (c.kind()) {
+        .nil => value_mod.nilValue(),
+        .list => if (list_mod.isEmpty(c)) VmError.IndexOutOfBounds else list_mod.tail(c),
+        .persistent_vector => blk: {
+            const n = vector_mod.count(c);
+            if (n == 0) return VmError.IndexOutOfBounds;
+            const items = vm.allocator.alloc(Value, n - 1) catch return VmError.OutOfMemory;
+            defer vm.allocator.free(items);
+            var i: usize = 0;
+            while (i < n - 1) : (i += 1) items[i] = vector_mod.nth(c, i);
+            break :blk vector_mod.fromSlice(vm.ensureHeap(), items) catch VmError.OutOfMemory;
+        },
+        else => VmError.KindMismatch,
+    };
+}
+
+/// `(empty coll)` → an empty collection of the same kind.
+fn fnEmpty(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    return switch (args[0].kind()) {
+        .nil => value_mod.nilValue(),
+        .list => list_mod.empty(heap) catch VmError.OutOfMemory,
+        .persistent_vector => vector_mod.empty(heap) catch VmError.OutOfMemory,
+        .persistent_map => champ_mod.mapEmpty(heap) catch VmError.OutOfMemory,
+        .persistent_set => champ_mod.setEmpty(heap) catch VmError.OutOfMemory,
+        .string => string_mod.fromBytes(heap, "") catch VmError.OutOfMemory,
+        else => VmError.KindMismatch,
+    };
+}
+
+/// `(not-empty coll)` → coll, or nil when it has no elements.
+fn fnNotEmpty(vm: *VM, args: []const Value) VmError!Value {
+    const e = try fnEmptyQ(vm, args);
+    return if (e.asBool()) value_mod.nilValue() else args[0];
+}
+
+// ---- ordering ----
+
+/// Total order used by `compare` and `sort`: nil sorts first;
+/// numbers order across the tower; strings, keywords and symbols
+/// by bytes; chars by scalar; false before true; vectors by count
+/// then elementwise. Comparing different kinds is a
+/// `KindMismatch`.
+pub fn compareValues(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
+    const ka = a.kind();
+    const kb = b.kind();
+    if (ka == .nil and kb == .nil) return .eq;
+    if (ka == .nil) return .lt;
+    if (kb == .nil) return .gt;
+    if (vm_mod.isNumber(a) and vm_mod.isNumber(b)) {
+        if (try vm_mod.numCompare(.lt, a, b)) return .lt;
+        if (try vm_mod.numCompare(.gt, a, b)) return .gt;
+        return .eq;
+    }
+    if (a.isBool() and b.isBool()) return std.math.order(@intFromBool(a.asBool()), @intFromBool(b.asBool()));
+    if (ka != kb) return VmError.KindMismatch;
+    return switch (ka) {
+        .string => std.mem.order(u8, string_mod.asBytes(a), string_mod.asBytes(b)),
+        .keyword => blk: {
+            const it = vm.ensureInterner();
+            break :blk std.mem.order(u8, it.keywordName(a.asKeywordId()), it.keywordName(b.asKeywordId()));
+        },
+        .symbol => blk: {
+            const it = vm.ensureInterner();
+            break :blk std.mem.order(u8, it.symbolName(a.asSymbolId()), it.symbolName(b.asSymbolId()));
+        },
+        .char => std.math.order(a.asChar(), b.asChar()),
+        .persistent_vector => blk: {
+            const na = vector_mod.count(a);
+            const nb = vector_mod.count(b);
+            if (na != nb) break :blk std.math.order(na, nb);
+            var i: usize = 0;
+            while (i < na) : (i += 1) {
+                const o = try compareValues(vm, vector_mod.nth(a, i), vector_mod.nth(b, i));
+                if (o != .eq) break :blk o;
+            }
+            break :blk .eq;
+        },
+        else => VmError.KindMismatch,
+    };
+}
+
+fn fnCompare(vm: *VM, args: []const Value) VmError!Value {
+    const o = try compareValues(vm, args[0], args[1]);
+    return value_mod.fromFixnum(switch (o) {
+        .lt => -1,
+        .eq => 0,
+        .gt => 1,
+    }).?;
+}
+
+/// Ordering used by `sort` / `sort-by`: the natural order, or a
+/// user comparator returning a number (negative = less) or a
+/// boolean (true = less).
+const SortOrder = struct {
+    vm: *VM,
+    comparator: ?Value,
+
+    fn less(self: SortOrder, a: Value, b: Value) VmError!bool {
+        const cmp = self.comparator orelse return (try compareValues(self.vm, a, b)) == .lt;
+        const r = try self.vm.callValue(cmp, &.{ a, b });
+        return switch (r.kind()) {
+            .true_ => true,
+            .false_, .nil => false,
+            else => (try vm_mod.numSign(r)) == .lt,
+        };
+    }
+};
+
+/// A sortable element: `key` is what the order looks at, `val`
+/// is what the result contains.
+const Keyed = struct { key: Value, val: Value };
+
+/// Stable merge sort whose comparator may fail (it re-enters the
+/// VM for user comparators).
+fn mergeSort(items: []Keyed, scratch: []Keyed, order: SortOrder) VmError!void {
+    if (items.len < 2) return;
+    const mid = items.len / 2;
+    try mergeSort(items[0..mid], scratch[0..mid], order);
+    try mergeSort(items[mid..], scratch[mid..], order);
+    @memcpy(scratch[0..items.len], items);
+    var i: usize = 0;
+    var j: usize = mid;
+    var k: usize = 0;
+    while (i < mid and j < items.len) : (k += 1) {
+        if (try order.less(scratch[j].key, scratch[i].key)) {
+            items[k] = scratch[j];
+            j += 1;
+        } else {
+            items[k] = scratch[i];
+            i += 1;
+        }
+    }
+    while (i < mid) : ({
+        i += 1;
+        k += 1;
+    }) items[k] = scratch[i];
+    while (j < items.len) : ({
+        j += 1;
+        k += 1;
+    }) items[k] = scratch[j];
+}
+
+fn sortImpl(vm: *VM, keyfn: ?Value, comparator: ?Value, coll: Value) VmError!Value {
+    var items = try collectSeq(vm, coll);
+    defer items.deinit(vm.allocator);
+    const keyed = vm.allocator.alloc(Keyed, items.items.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(keyed);
+    const scratch = vm.allocator.alloc(Keyed, items.items.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(scratch);
+    for (items.items, 0..) |v, i| {
+        keyed[i] = .{ .key = if (keyfn) |kf| try vm.callValue(kf, &.{v}) else v, .val = v };
+    }
+    try mergeSort(keyed, scratch, .{ .vm = vm, .comparator = comparator });
+    for (keyed, 0..) |e, i| items.items[i] = e.val;
+    return try buildListFromSlice(vm, items.items);
+}
+
+/// `(sort coll)` / `(sort cmp coll)`.
+fn fnSort(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return sortImpl(vm, null, null, args[0]);
+    return sortImpl(vm, null, args[0], args[1]);
+}
+
+/// `(sort-by keyfn coll)` / `(sort-by keyfn cmp coll)`.
+fn fnSortBy(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 2) return sortImpl(vm, args[0], null, args[1]);
+    return sortImpl(vm, args[0], args[1], args[2]);
+}
+
+// ---- names, hashes and kind predicates ----
+
+/// `(hash x)` → the runtime's semantic hash as a fixnum.
+fn fnHash(_: *VM, args: []const Value) VmError!Value {
+    const h = dispatch_mod.hashValue(args[0]);
+    return value_mod.fromFixnum(@intCast(h & @as(u64, @intCast(value_mod.fixnum_max)))).?;
+}
+
+fn interned_name(vm: *VM, v: Value) VmError![]const u8 {
+    return switch (v.kind()) {
+        .keyword => vm.ensureInterner().keywordName(v.asKeywordId()),
+        .symbol => vm.ensureInterner().symbolName(v.asSymbolId()),
+        .string => string_mod.asBytes(v),
+        else => VmError.KindMismatch,
+    };
+}
+
+/// `(name x)` → the name part of a keyword, symbol or string.
+fn fnName(vm: *VM, args: []const Value) VmError!Value {
+    const full = try interned_name(vm, args[0]);
+    const local = if (args[0].kind() == .string) full else if (std.mem.indexOfScalar(u8, full, '/')) |i| full[i + 1 ..] else full;
+    return string_mod.fromBytes(vm.ensureHeap(), local) catch VmError.OutOfMemory;
+}
+
+/// `(keyword x)` / `(symbol x)` → interned from a string, keyword
+/// or symbol.
+fn fnKeyword(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() == .keyword) return args[0];
+    const text = try interned_name(vm, args[0]);
+    return vm.ensureInterner().internKeywordValue(text) catch VmError.OutOfMemory;
+}
+
+fn fnSymbol(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() == .symbol) return args[0];
+    const text = try interned_name(vm, args[0]);
+    return vm.ensureInterner().internSymbolValue(text) catch VmError.OutOfMemory;
+}
+
+fn fnBoolean(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(args[0].isTruthy());
+}
+
+fn kindPredicate(comptime pred: fn (Kind) bool) *const fn (*VM, []const Value) VmError!Value {
+    return struct {
+        fn call(_: *VM, args: []const Value) VmError!Value {
+            return value_mod.fromBool(pred(args[0].kind()));
+        }
+    }.call;
+}
+
+fn isList(k: Kind) bool {
+    return k == .list;
+}
+fn isVector(k: Kind) bool {
+    return k == .persistent_vector;
+}
+fn isMap(k: Kind) bool {
+    return k == .persistent_map or k == .record;
+}
+fn isSet(k: Kind) bool {
+    return k == .persistent_set;
+}
+fn isKeyword(k: Kind) bool {
+    return k == .keyword;
+}
+fn isSymbol(k: Kind) bool {
+    return k == .symbol;
+}
+fn isChar(k: Kind) bool {
+    return k == .char;
+}
+fn isBoolean(k: Kind) bool {
+    return k == .true_ or k == .false_;
+}
+fn isColl(k: Kind) bool {
+    return switch (k) {
+        .list, .persistent_vector, .persistent_map, .persistent_set, .record => true,
+        else => false,
+    };
+}
+fn isSequential(k: Kind) bool {
+    return k == .list or k == .persistent_vector;
+}
+fn isAssociative(k: Kind) bool {
+    return k == .persistent_map or k == .persistent_vector or k == .record;
+}
+fn isFn(k: Kind) bool {
+    return switch (k) {
+        .function, .native_fn, .protocol_fn => true,
+        else => false,
+    };
+}
+fn isIfn(k: Kind) bool {
+    return isFn(k) or vm_mod.isLookupCallable(k);
 }
 
 // =============================================================================
@@ -2782,13 +3762,17 @@ fn typeNameToKind(name: []const u8) ?value_mod.Kind {
 /// deferred (Clojure returns entry-pairs/elements but our 3.3
 /// scope doesn't pin that yet).
 const SeqIter = struct {
-    kind: enum { empty, list, vector },
+    kind: enum { empty, list, vector, map, set, string },
     node: Value = value_mod.nilValue(),
     vec: Value = value_mod.nilValue(),
     vec_idx: usize = 0,
     vec_count: usize = 0,
+    map_it: champ_mod.MapIter = undefined,
+    set_it: champ_mod.SetIter = undefined,
+    utf8: std.unicode.Utf8Iterator = undefined,
+    heap: *heap_mod.Heap = undefined,
 
-    fn next(self: *SeqIter) ?Value {
+    fn next(self: *SeqIter) VmError!?Value {
         switch (self.kind) {
             .empty => return null,
             .list => {
@@ -2803,11 +3787,22 @@ const SeqIter = struct {
                 self.vec_idx += 1;
                 return e;
             },
+            .map => {
+                const e = self.map_it.next() orelse return null;
+                return vector_mod.fromSlice(self.heap, &.{ e.key, e.value }) catch VmError.OutOfMemory;
+            },
+            .set => return self.set_it.next(),
+            .string => {
+                const scalar = self.utf8.nextCodepoint() orelse return null;
+                return value_mod.fromChar(scalar) orelse VmError.Utf8Error;
+            },
         }
     }
 };
 
-fn makeSeqIter(coll: Value) VmError!SeqIter {
+/// Every seqable receiver: nil, list, vector, map (as `[k v]`
+/// entries), record (its field map), set and string (as chars).
+fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
     return switch (coll.kind()) {
         .nil => SeqIter{ .kind = .empty },
         .list => SeqIter{ .kind = .list, .node = coll },
@@ -2816,15 +3811,38 @@ fn makeSeqIter(coll: Value) VmError!SeqIter {
             .vec = coll,
             .vec_count = vector_mod.count(coll),
         },
+        .persistent_map => SeqIter{ .kind = .map, .map_it = champ_mod.mapIter(coll), .heap = vm.ensureHeap() },
+        .record => SeqIter{ .kind = .map, .map_it = champ_mod.mapIter(record_mod.fieldsOf(coll)), .heap = vm.ensureHeap() },
+        .persistent_set => SeqIter{ .kind = .set, .set_it = champ_mod.setIter(coll) },
+        .string => SeqIter{
+            .kind = .string,
+            .utf8 = std.unicode.Utf8View.initUnchecked(string_mod.asBytes(coll)).iterator(),
+        },
         else => VmError.KindMismatch,
     };
+}
+
+fn isSeqable(v: Value) bool {
+    return switch (v.kind()) {
+        .nil, .list, .persistent_vector, .persistent_map, .record, .persistent_set, .string => true,
+        else => false,
+    };
+}
+
+/// Materialize a seqable into an owned list of Values. The
+/// caller frees it with `vm.allocator`.
+fn collectSeq(vm: *VM, coll: Value) VmError!std.ArrayList(Value) {
+    var out: std.ArrayList(Value) = .empty;
+    errdefer out.deinit(vm.allocator);
+    try appendSeqValues(vm, coll, &out);
+    return out;
 }
 
 /// Append every element of `seq` to `out`. Used by `apply` to
 /// splice the trailing seq into the args list.
 fn appendSeqValues(vm: *VM, seq: Value, out: *std.ArrayList(Value)) VmError!void {
-    var it = try makeSeqIter(seq);
-    while (it.next()) |e| {
+    var it = try makeSeqIter(vm, seq);
+    while (try it.next()) |e| {
         out.append(vm.allocator, e) catch return VmError.OutOfMemory;
     }
 }

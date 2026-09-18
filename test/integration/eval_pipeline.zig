@@ -2253,8 +2253,8 @@ test "phase5.3b defprotocol: registers protocol + method dispatchers" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this y]))
-        \\  (str IFoo " " bar))
-    , "#<protocol id=0> #<protocol-fn proto=0 method=0>");
+        \\  (str IFoo " " (fn? bar)))
+    , "#<protocol id=0> true");
 }
 
 test "phase5.3b protocol dispatch with NO impl raises :no-protocol-impl" {
@@ -3009,4 +3009,299 @@ test "collection-as-function: maps, sets and vectors" {
     try expectOutput("(let [m {:x 1}] (m :x))", "1");
     try expectOutput("(try (5 1) (catch any e e))", ":not-callable");
     try expectOutput("(try (\"s\" 1) (catch any e e))", ":not-callable");
+}
+
+// =============================================================================
+// Core library completeness (table-driven)
+// =============================================================================
+
+const CoreCase = struct { src: []const u8, expected: []const u8 };
+
+fn runCoreCases(cases: []const CoreCase) !void {
+    for (cases) |c| try expectOutput(c.src, c.expected);
+}
+
+test "core: seq over every seqable kind" {
+    try runCoreCases(&.{
+        .{ .src = "(seq nil)", .expected = "nil" },
+        .{ .src = "(seq [])", .expected = "nil" },
+        .{ .src = "(seq (list))", .expected = "nil" },
+        .{ .src = "(seq {})", .expected = "nil" },
+        .{ .src = "(seq \"\")", .expected = "nil" },
+        .{ .src = "(seq [1 2])", .expected = "(1 2)" },
+        .{ .src = "(seq '(1 2))", .expected = "(1 2)" },
+        .{ .src = "(seq {:a 1})", .expected = "([:a 1])" },
+        .{ .src = "(seq #{7})", .expected = "(7)" },
+        .{ .src = "(pr-str (seq \"ab\"))", .expected = "(\\a \\b)" },
+        .{ .src = "(first {:a 1})", .expected = "[:a 1]" },
+        .{ .src = "(first #{3})", .expected = "3" },
+        .{ .src = "(pr-str (first \"xy\"))", .expected = "\\x" },
+        .{ .src = "(pr-str (rest \"xyz\"))", .expected = "(\\y \\z)" },
+        .{ .src = "(rest {:a 1})", .expected = "()" },
+        .{ .src = "(next [1])", .expected = "nil" },
+        .{ .src = "(next [1 2])", .expected = "(2)" },
+        .{ .src = "(next nil)", .expected = "nil" },
+        .{ .src = "(count (seq {:a 1 :b 2}))", .expected = "2" },
+        .{ .src = "(map (fn [[k v]] (str k v)) {:a 1})", .expected = "(:a1)" },
+        .{ .src = "(reduce + 0 #{1 2 3})", .expected = "6" },
+        .{ .src = "(map identity \"hi\")", .expected = "(h i)" },
+        .{ .src = "(apply str (reverse \"abc\"))", .expected = "cba" },
+        .{ .src = "(sort (keys {:b 1 :a 2}))", .expected = "(:a :b)" },
+        .{ .src = "(try (seq 5) (catch any e e))", .expected = ":kind-mismatch" },
+    });
+}
+
+test "core: reduce, range, assoc, dissoc, conj" {
+    try runCoreCases(&.{
+        .{ .src = "(reduce + [1 2 3])", .expected = "6" },
+        .{ .src = "(reduce + [])", .expected = "0" },
+        .{ .src = "(reduce + [7])", .expected = "7" },
+        .{ .src = "(reduce + 10 [1 2 3])", .expected = "16" },
+        .{ .src = "(reduce (fn [a x] (conj a x)) [] '(1 2))", .expected = "[1 2]" },
+        .{ .src = "(reduce-kv (fn [acc k v] (assoc acc v k)) {} {:a 1})", .expected = "{1 :a}" },
+        .{ .src = "(reduce-kv (fn [acc i x] (+ acc (* i x))) 0 [10 20 30])", .expected = "80" },
+        .{ .src = "(range 5)", .expected = "(0 1 2 3 4)" },
+        .{ .src = "(range 0)", .expected = "()" },
+        .{ .src = "(range 2 5)", .expected = "(2 3 4)" },
+        .{ .src = "(range 5 2)", .expected = "()" },
+        .{ .src = "(range 0 10 3)", .expected = "(0 3 6 9)" },
+        .{ .src = "(range 5 0 -2)", .expected = "(5 3 1)" },
+        .{ .src = "(try (range 0 1 0) (catch any e e))", .expected = ":invalid-argument" },
+        .{ .src = "(assoc [1 2 3] 1 :x)", .expected = "[1 :x 3]" },
+        .{ .src = "(assoc [1 2 3] 3 :end)", .expected = "[1 2 3 :end]" },
+        .{ .src = "(try (assoc [1 2 3] 4 :x) (catch any e e))", .expected = ":index-out-of-bounds" },
+        .{ .src = "(try (assoc [1] :k 1) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(assoc {} :a 1 :b 2)", .expected = "{:a 1, :b 2}" },
+        .{ .src = "(try (assoc {} :a 1 :b) (catch any e e))", .expected = ":arity-mismatch" },
+        .{ .src = "(assoc nil :a 1)", .expected = "{:a 1}" },
+        .{ .src = "(dissoc {:a 1 :b 2 :c 3} :a :c)", .expected = "{:b 2}" },
+        .{ .src = "(dissoc {:a 1})", .expected = "{:a 1}" },
+        .{ .src = "(disj #{1 2 3} 1 3)", .expected = "#{2}" },
+        .{ .src = "(conj {:a 1} {:b 2 :c 3})", .expected = "{:a 1, :b 2, :c 3}" },
+        .{ .src = "(conj {:a 1} [:b 2] nil)", .expected = "{:a 1, :b 2}" },
+        .{ .src = "(update [1 2 3] 0 inc)", .expected = "[2 2 3]" },
+        .{ .src = "(update {:a 1} :a + 10)", .expected = "{:a 11}" },
+        .{ .src = "(update-in {:a {:b 1}} [:a :b] inc)", .expected = "{:a {:b 2}}" },
+        .{ .src = "(assoc-in {} [:a :b] 1)", .expected = "{:a {:b 1}}" },
+        .{ .src = "(get-in {:a {:b 1}} [:a :b])", .expected = "1" },
+        .{ .src = "(get-in {:a {:b 1}} [:a :c])", .expected = "nil" },
+        .{ .src = "(get-in {:a {:b 1}} [:a :c] :d)", .expected = ":d" },
+        .{ .src = "(get-in {:a {:b nil}} [:a :b] :d)", .expected = "nil" },
+        .{ .src = "(get-in {:a [10 20]} [:a 1])", .expected = "20" },
+    });
+}
+
+test "core: maps" {
+    try runCoreCases(&.{
+        .{ .src = "(merge {:a 1} {:b 2} nil {:a 3})", .expected = "{:a 3, :b 2}" },
+        .{ .src = "(merge-with + {:a 1 :b 2} {:a 10} {:c 5})", .expected = "{:a 11, :b 2, :c 5}" },
+        .{ .src = "(merge-with +)", .expected = "nil" },
+        .{ .src = "(select-keys {:a 1 :b 2 :c 3} [:a :c :z])", .expected = "{:a 1, :c 3}" },
+        .{ .src = "(select-keys nil [:a])", .expected = "{}" },
+        .{ .src = "(zipmap [:a :b :c] [1 2])", .expected = "{:a 1, :b 2}" },
+        .{ .src = "(find {:a 1} :a)", .expected = "[:a 1]" },
+        .{ .src = "(find {:a 1} :b)", .expected = "nil" },
+        .{ .src = "(find [5 6] 1)", .expected = "[1 6]" },
+        .{ .src = "(key (find {:a 1} :a))", .expected = ":a" },
+        .{ .src = "(val (find {:a 1} :a))", .expected = "1" },
+        .{ .src = "(contains? {:a nil} :a)", .expected = "true" },
+        .{ .src = "(contains? [1 2] 1)", .expected = "true" },
+        .{ .src = "(contains? [1 2] 2)", .expected = "false" },
+        .{ .src = "(contains? #{:x} :x)", .expected = "true" },
+        .{ .src = "(frequencies [:a :b :a])", .expected = "{:a 2, :b 1}" },
+        .{ .src = "(group-by odd? [1 2 3])", .expected = "{true [1 3], false [2]}" },
+        .{ .src = "(group-by :k [{:k 1 :v :a} {:k 1 :v :b}])", .expected = "{1 [{:k 1, :v :a} {:k 1, :v :b}]}" },
+        .{ .src = "(into {} [[:a 1] [:b 2]])", .expected = "{:a 1, :b 2}" },
+        .{ .src = "(into {:a 1} {:b 2})", .expected = "{:a 1, :b 2}" },
+        .{ .src = "(empty {:a 1})", .expected = "{}" },
+        .{ .src = "(sort (map key {:b 1 :a 2}))", .expected = "(:a :b)" },
+        .{ .src = "(sort (vals {:b 1 :a 2}))", .expected = "(1 2)" },
+    });
+}
+
+test "core: sequence functions" {
+    try runCoreCases(&.{
+        .{ .src = "(concat [1 2] '(3) nil #{4})", .expected = "(1 2 3 4)" },
+        .{ .src = "(concat)", .expected = "()" },
+        .{ .src = "(mapcat (fn [x] [x x]) [1 2])", .expected = "(1 1 2 2)" },
+        .{ .src = "(map + [1 2 3] [10 20])", .expected = "(11 22)" },
+        .{ .src = "(map vector [:a :b] [1 2] [\"x\" \"y\"])", .expected = "([:a 1 x] [:b 2 y])" },
+        .{ .src = "(mapv inc [1 2])", .expected = "[2 3]" },
+        .{ .src = "(filterv even? [1 2 3 4])", .expected = "[2 4]" },
+        .{ .src = "(map-indexed vector [:a :b])", .expected = "([0 :a] [1 :b])" },
+        .{ .src = "(keep-indexed (fn [i x] (if (odd? i) x nil)) [:a :b :c :d])", .expected = "(:b :d)" },
+        .{ .src = "(keep (fn [x] (if (odd? x) (* x x) nil)) [1 2 3])", .expected = "(1 9)" },
+        .{ .src = "(keep identity [1 nil false 2])", .expected = "(1 false 2)" },
+        .{ .src = "(remove odd? [1 2 3 4])", .expected = "(2 4)" },
+        .{ .src = "(distinct [1 2 1 3 2 1.0])", .expected = "(1 2 3 1.0)" },
+        .{ .src = "(distinct \"aab\")", .expected = "(a b)" },
+        .{ .src = "(partition 2 [1 2 3 4 5])", .expected = "((1 2) (3 4))" },
+        .{ .src = "(partition 2 1 [1 2 3])", .expected = "((1 2) (2 3))" },
+        .{ .src = "(partition 3 3 [:pad] [1 2 3 4])", .expected = "((1 2 3) (4 :pad))" },
+        .{ .src = "(partition-all 2 [1 2 3 4 5])", .expected = "((1 2) (3 4) (5))" },
+        .{ .src = "(partition-all 2 3 [1 2 3 4 5])", .expected = "((1 2) (4 5))" },
+        .{ .src = "(try (partition 0 [1]) (catch any e e))", .expected = ":invalid-argument" },
+        .{ .src = "(interleave [1 2 3] [:a :b])", .expected = "(1 :a 2 :b)" },
+        .{ .src = "(interleave [1 2] [:a :b] [\"x\" \"y\"])", .expected = "(1 :a x 2 :b y)" },
+        .{ .src = "(interleave)", .expected = "()" },
+        .{ .src = "(interpose :s [1 2 3])", .expected = "(1 :s 2 :s 3)" },
+        .{ .src = "(into [] '(1 2))", .expected = "[1 2]" },
+        .{ .src = "(into '(0) [1 2])", .expected = "(2 1 0)" },
+        .{ .src = "(into #{} [1 1 2])", .expected = "#{1 2}" },
+        .{ .src = "(into nil [1 2])", .expected = "(2 1)" },
+        .{ .src = "(take-while odd? [1 3 4 5])", .expected = "(1 3)" },
+        .{ .src = "(drop-while odd? [1 3 4 5])", .expected = "(4 5)" },
+        .{ .src = "(take-while odd? [])", .expected = "()" },
+        .{ .src = "(take 2 [1 2 3])", .expected = "(1 2)" },
+        .{ .src = "(drop 2 [1 2 3])", .expected = "(3)" },
+        .{ .src = "(take-last 2 [1 2 3])", .expected = "(2 3)" },
+        .{ .src = "(drop-last 2 [1 2 3])", .expected = "(1)" },
+        .{ .src = "(split-at 1 [1 2 3])", .expected = "[(1) (2 3)]" },
+        .{ .src = "(last [1 2 3])", .expected = "3" },
+        .{ .src = "(last [])", .expected = "nil" },
+        .{ .src = "(butlast [1 2 3])", .expected = "(1 2)" },
+        .{ .src = "(butlast [1])", .expected = "nil" },
+        .{ .src = "(nth [1 2 3] 1)", .expected = "2" },
+        .{ .src = "(nth '(1 2 3) 2)", .expected = "3" },
+        .{ .src = "(nth [1] 5 :d)", .expected = ":d" },
+        .{ .src = "(nthrest [1 2 3] 2)", .expected = "(3)" },
+        .{ .src = "(nthrest [1 2 3] 0)", .expected = "(1 2 3)" },
+        .{ .src = "(reverse [1 2 3])", .expected = "(3 2 1)" },
+        .{ .src = "(flatten [1 [2 [3 nil]] '(4)])", .expected = "(1 2 3 4)" },
+        .{ .src = "(reductions + [1 2 3])", .expected = "(1 3 6)" },
+        .{ .src = "(reductions + 10 [1 2])", .expected = "(10 11 13)" },
+        .{ .src = "(repeat 3 :x)", .expected = "(:x :x :x)" },
+        .{ .src = "(repeat 0 :x)", .expected = "()" },
+        .{ .src = "(do (def n (atom 0)) (repeatedly 3 (fn [] (swap! n inc))))", .expected = "(1 2 3)" },
+        .{ .src = "(iterate inc 0 5)", .expected = "(0 1 2 3 4)" },
+        .{ .src = "(iterate (fn [x] (* 2 x)) 1 4)", .expected = "(1 2 4 8)" },
+        .{ .src = "(iterate inc 0 0)", .expected = "()" },
+        .{ .src = "(empty? [])", .expected = "true" },
+        .{ .src = "(empty? \"\")", .expected = "true" },
+        .{ .src = "(not-empty [1])", .expected = "[1]" },
+        .{ .src = "(not-empty [])", .expected = "nil" },
+        .{ .src = "(not-empty \"\")", .expected = "nil" },
+        .{ .src = "(empty [1 2])", .expected = "[]" },
+        .{ .src = "(empty '(1))", .expected = "()" },
+        .{ .src = "(peek [1 2 3])", .expected = "3" },
+        .{ .src = "(peek '(1 2 3))", .expected = "1" },
+        .{ .src = "(pop [1 2 3])", .expected = "[1 2]" },
+        .{ .src = "(pop '(1 2 3))", .expected = "(2 3)" },
+        .{ .src = "(count \"héllo\")", .expected = "5" },
+        .{ .src = "(count nil)", .expected = "0" },
+        .{ .src = "(subs \"hello\" 1 3)", .expected = "el" },
+        .{ .src = "(str)", .expected = "" },
+        .{ .src = "(str \"a\" 1 :k nil \\c)", .expected = "a1:kc" },
+    });
+}
+
+test "core: sorting and comparison" {
+    try runCoreCases(&.{
+        .{ .src = "(sort [3 1 2])", .expected = "(1 2 3)" },
+        .{ .src = "(sort [3 1.5 2])", .expected = "(1.5 2 3)" },
+        .{ .src = "(sort > [3 1 2])", .expected = "(3 2 1)" },
+        .{ .src = "(sort (fn [a b] (compare b a)) [1 3 2])", .expected = "(3 2 1)" },
+        .{ .src = "(sort [\"b\" \"a\" \"c\"])", .expected = "(a b c)" },
+        .{ .src = "(sort [:b :a])", .expected = "(:a :b)" },
+        .{ .src = "(sort [nil 2 1])", .expected = "(nil 1 2)" },
+        .{ .src = "(sort [[2 1] [1 9] [1 2 0]])", .expected = "([1 9] [2 1] [1 2 0])" },
+        .{ .src = "(sort [])", .expected = "()" },
+        .{ .src = "(sort #{3 1 2})", .expected = "(1 2 3)" },
+        .{ .src = "(try (sort [1 :a]) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(sort-by :age [{:age 30 :n :a} {:age 20 :n :b}])", .expected = "({:age 20, :n :b} {:age 30, :n :a})" },
+        .{ .src = "(sort-by count [[1 2] [1] []])", .expected = "([] [1] [1 2])" },
+        .{ .src = "(sort-by :k > [{:k 1} {:k 3} {:k 2}])", .expected = "({:k 3} {:k 2} {:k 1})" },
+        // Stable: equal keys keep their input order.
+        .{ .src = "(sort-by :k [{:k 1 :i 1} {:k 0 :i 2} {:k 1 :i 3} {:k 0 :i 4}])", .expected = "({:k 0, :i 2} {:k 0, :i 4} {:k 1, :i 1} {:k 1, :i 3})" },
+        .{ .src = "(sort (range 20 0 -1))", .expected = "(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20)" },
+        .{ .src = "(compare 1 2)", .expected = "-1" },
+        .{ .src = "(compare 2 2.0)", .expected = "0" },
+        .{ .src = "(compare \"b\" \"a\")", .expected = "1" },
+        .{ .src = "(compare nil 1)", .expected = "-1" },
+        .{ .src = "(compare false true)", .expected = "-1" },
+        .{ .src = "(compare [1 2] [1 3])", .expected = "-1" },
+        .{ .src = "(compare [1 2 3] [9])", .expected = "1" },
+        .{ .src = "(max-key count [1 2] [1] [1 2 3])", .expected = "[1 2 3]" },
+        .{ .src = "(min-key count [1 2] [1] [1 2 3])", .expected = "[1]" },
+        .{ .src = "(max-key :k {:k 1 :n :a} {:k 1 :n :b})", .expected = "{:k 1, :n :b}" },
+        .{ .src = "(= (hash [1 2]) (hash '(1 2)))", .expected = "true" },
+        .{ .src = "(= (hash 0.0) (hash -0.0))", .expected = "true" },
+        .{ .src = "(integer? (hash :a))", .expected = "true" },
+    });
+}
+
+test "core: predicates, names and conversions" {
+    try runCoreCases(&.{
+        .{ .src = "[(list? '(1)) (list? [1]) (seq? '(1)) (seq? nil)]", .expected = "[true false true false]" },
+        .{ .src = "[(vector? [1]) (vector? '(1)) (map? {}) (map? []) (set? #{}) (set? {})]", .expected = "[true false true false true false]" },
+        .{ .src = "[(keyword? :a) (keyword? 'a) (symbol? 'a) (symbol? :a) (string? \"s\")]", .expected = "[true false true false true]" },
+        .{ .src = "[(char? \\a) (char? \"a\") (boolean? true) (boolean? nil) (nil? nil) (some? false)]", .expected = "[true false true false true true]" },
+        .{ .src = "[(coll? []) (coll? {}) (coll? \"s\") (coll? nil)]", .expected = "[true true false false]" },
+        .{ .src = "[(sequential? []) (sequential? '()) (sequential? #{}) (associative? {}) (associative? []) (associative? #{})]", .expected = "[true true false true true false]" },
+        .{ .src = "[(fn? inc) (fn? (fn [] 1)) (fn? :a) (ifn? :a) (ifn? {}) (ifn? 1)]", .expected = "[true true false true true false]" },
+        .{ .src = "(do (defrecord R [a]) [(map? (->R 1)) (coll? (->R 1))])", .expected = "[true true]" },
+        .{ .src = "[(true? true) (true? 1) (false? false) (false? nil)]", .expected = "[true false true false]" },
+        .{ .src = "(name :abc)", .expected = "abc" },
+        .{ .src = "(name 'x/y)", .expected = "y" },
+        .{ .src = "(name \"s\")", .expected = "s" },
+        .{ .src = "(try (name 1) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(keyword \"k\")", .expected = ":k" },
+        .{ .src = "(keyword 'k)", .expected = ":k" },
+        .{ .src = "(= (keyword \"k\") :k)", .expected = "true" },
+        .{ .src = "(symbol \"s\")", .expected = "s" },
+        .{ .src = "(= (symbol :s) 's)", .expected = "true" },
+        .{ .src = "[(boolean nil) (boolean 0) (boolean false)]", .expected = "[false true false]" },
+        .{ .src = "(identity :x)", .expected = ":x" },
+        .{ .src = "((constantly 7) 1 2 3)", .expected = "7" },
+        .{ .src = "((comp inc inc) 1)", .expected = "3" },
+        .{ .src = "((comp) 4)", .expected = "4" },
+        .{ .src = "((partial + 1 2) 3 4)", .expected = "10" },
+        .{ .src = "((juxt inc dec) 5)", .expected = "[6 4]" },
+        .{ .src = "((juxt :a :b) {:a 1 :b 2})", .expected = "[1 2]" },
+        .{ .src = "((fnil inc 10) nil)", .expected = "11" },
+        .{ .src = "((fnil + 10) 1 2)", .expected = "3" },
+        .{ .src = "((complement odd?) 2)", .expected = "true" },
+        .{ .src = "(apply + 1 2 [3 4])", .expected = "10" },
+        .{ .src = "(apply max [1 5 2])", .expected = "5" },
+        .{ .src = "(apply str \"a\" [\"b\" \"c\"])", .expected = "abc" },
+        .{ .src = "(some even? [1 3 4])", .expected = "true" },
+        .{ .src = "(some even? [1 3])", .expected = "nil" },
+        .{ .src = "(every? odd? [1 3])", .expected = "true" },
+        .{ .src = "(every? odd? [])", .expected = "true" },
+        .{ .src = "(not-every? odd? [1 2])", .expected = "true" },
+        .{ .src = "(not-any? odd? [2 4])", .expected = "true" },
+        .{ .src = "(some #{3} [1 2 3])", .expected = "3" },
+    });
+}
+
+test "core: macros" {
+    try runCoreCases(&.{
+        .{ .src = "(if-not true :a :b)", .expected = ":b" },
+        .{ .src = "(if-not nil :a :b)", .expected = ":a" },
+        .{ .src = "(if-not true :a)", .expected = "nil" },
+        .{ .src = "(when-not false :a)", .expected = ":a" },
+        .{ .src = "(do (def a (atom 0)) (while (< @a 5) (swap! a inc)) @a)", .expected = "5" },
+        .{ .src = "(letfn [(ev? [n] (if (zero? n) true (od? (dec n)))) (od? [n] (if (zero? n) false (ev? (dec n))))] (ev? 10))", .expected = "true" },
+        .{ .src = "(do (def acc (atom [])) (doseq [x [1 2 3]] (swap! acc conj (* x x))) @acc)", .expected = "[1 4 9]" },
+        .{ .src = "(do (def acc (atom [])) (doseq [x [1 2] y [:a :b]] (swap! acc conj [x y])) @acc)", .expected = "[[1 :a] [1 :b] [2 :a] [2 :b]]" },
+        .{ .src = "(doseq [x []] :never)", .expected = "nil" },
+        .{ .src = "(do (def acc (atom 0)) (doseq [[k v] {:a 1 :b 2}] (swap! acc + v)) @acc)", .expected = "3" },
+        .{ .src = "(cond-> 1 true inc false (* 10) true (+ 100))", .expected = "102" },
+        .{ .src = "(cond-> {} true (assoc :a 1) nil (assoc :b 2))", .expected = "{:a 1}" },
+        .{ .src = "(cond-> 5)", .expected = "5" },
+        .{ .src = "(cond->> [1 2 3] true (map inc) false (filter odd?) true (reduce +))", .expected = "9" },
+        .{ .src = "(some-> {:a {:b 1}} :a :b inc)", .expected = "2" },
+        .{ .src = "(some-> {:a {:b 1}} :c :b inc)", .expected = "nil" },
+        .{ .src = "(some-> nil inc)", .expected = "nil" },
+        .{ .src = "(some-> 1 (+ 2) (* 3))", .expected = "9" },
+        .{ .src = "(some->> [1 2 3] (map inc) (reduce +))", .expected = "9" },
+        .{ .src = "(some->> nil (map inc))", .expected = "nil" },
+        .{ .src = "(as-> 1 x (+ x 1) (* x 10) [x x])", .expected = "[20 20]" },
+        .{ .src = "(as-> {:a 1} m (assoc m :b 2) (count m))", .expected = "2" },
+        .{ .src = "(-> 5 inc (* 2) (- 1))", .expected = "11" },
+        .{ .src = "(->> [1 2 3] (map inc) (filter odd?) (reduce +))", .expected = "3" },
+        .{ .src = "(dotimes [i 3] i)", .expected = "nil" },
+        .{ .src = "(when-let [x 1] (inc x))", .expected = "2" },
+        .{ .src = "(if-let [x nil] x :none)", .expected = ":none" },
+    });
 }

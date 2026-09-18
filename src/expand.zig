@@ -1503,8 +1503,18 @@ fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
         },
         .real => |f| value_mod.fromFloat(f),
         .char => |c| value_mod.fromChar(c) orelse return ExpandError.MalformedMacroCall,
+        // `@x` reaches a macro as the call `(deref x)`.
+        .deref => |inner| blk: {
+            const deref_id = ctx.interner.internSymbol("deref") catch return ExpandError.OutOfMemory;
+            const inner_v = try formToValue(ctx, inner);
+            const heap = try ctx.heapForArgs();
+            var lst = list_mod.empty(heap) catch return ExpandError.OutOfMemory;
+            lst = list_mod.cons(heap, inner_v, lst) catch return ExpandError.OutOfMemory;
+            lst = list_mod.cons(heap, value_mod.fromSymbolId(deref_id), lst) catch return ExpandError.OutOfMemory;
+            break :blk lst;
+        },
         // syntax_quote, unquote, unquote_splicing, anon_fn,
-        // with_meta, deref → defer.
+        // with_meta → defer.
         else => return ExpandError.MalformedMacroCall,
     };
 }

@@ -39,13 +39,6 @@
   ; reduce + cons builds the list in reverse order naturally.
   (reduce (fn* [acc x] (cons x acc)) (list) s))
 
-(defn range [n]
-  ; (range 5) => (0 1 2 3 4). Builds a cons list back-to-front.
-  (loop* [i n acc (list)]
-    (if (< 0 i)
-      (recur (dec i) (cons (dec i) acc))
-      acc)))
-
 (defn take [n s]
   ; Return up to n elements of s as a list.
   (loop* [i 0 rem s acc (list)]
@@ -258,11 +251,20 @@
   (assoc m k (apply f (cons (get m k) args))))
 
 ; (get-in m [k1 k2 ...]) → nested lookup. nil if any step
-; misses. (get-in m ks default) → default on miss.
-(defn get-in [m ks]
-  (reduce (fn* [acc k] (if (nil? acc) nil (get acc k)))
-          m
-          ks))
+; misses. (get-in m ks default) → default when any key along
+; the path is absent (a present nil value is still nil).
+(defn get-in
+  ([m ks]
+   (reduce (fn* [acc k] (if (nil? acc) nil (get acc k)))
+           m
+           ks))
+  ([m ks default]
+   (loop* [acc m s (seq ks)]
+     (if (nil? s)
+       acc
+       (if (and (some? acc) (contains? acc (first s)))
+         (recur (get acc (first s)) (next s))
+         default)))))
 
 ; (assoc-in m [k1 k2 ...] v) → m with the nested path set to v.
 (defn assoc-in [m ks v]
@@ -304,3 +306,112 @@
       (if (empty? s)
         (reverse acc)
         (recur (rest s) (cons (first s) (cons sep acc)))))))
+
+; ============================================================
+; Function combinators
+; ============================================================
+
+; (juxt f g ...) → fn returning [(f args) (g args) ...].
+(defn juxt [& fs]
+  (fn* [& args]
+    (vec (map (fn* [f] (apply f args)) fs))))
+
+; (fnil f default) → f, with a nil first argument replaced by
+; default.
+(defn fnil [f default]
+  (fn* [x & more]
+    (apply f (if (nil? x) default x) more)))
+
+; (merge-with f & maps) → merge where a key present on both
+; sides keeps (f left right).
+(defn merge-with [f & maps]
+  (reduce (fn* [acc m]
+            (if (nil? m)
+              acc
+              (reduce (fn* [a k]
+                        (if (contains? a k)
+                          (assoc a k (f (get a k) (get m k)))
+                          (assoc a k (get m k))))
+                      acc
+                      (keys m))))
+          (first maps)
+          (rest maps)))
+
+; ============================================================
+; Control-flow macros
+; ============================================================
+
+; (if-not test then else?) → (if test else then).
+(defmacro if-not [test then & else]
+  `(if ~test ~(first else) ~then))
+
+; (while test body...) → loops until test is falsy; nil.
+(defmacro while [test & body]
+  `(loop* []
+     (if ~test
+       (do ~@body (recur))
+       nil)))
+
+; (letfn [(f [x] ...) (g [y] ...)] body...) — mutually
+; recursive local functions; the primitive takes the same shape.
+(defmacro letfn [bindings & body]
+  `(letfn* ~bindings ~@body))
+
+; (doseq [x xs y ys ...] body...) → runs body for each x in xs
+; and, nested inside, each y in ys. The binding form may
+; destructure. Returns nil.
+(defmacro doseq [bindings & body]
+  (if (empty? bindings)
+    `(do ~@body nil)
+    `(loop* [s# (seq ~(second bindings))]
+       (if s#
+         (let [~(first bindings) (first s#)]
+           (doseq ~(vec (rest (rest bindings))) ~@body)
+           (recur (next s#)))
+         nil))))
+
+; ============================================================
+; Threading macros
+; ============================================================
+
+; (cond-> x test step ...) → threads x through each step whose
+; test is truthy; tests see the ORIGINAL x, not the threaded
+; value, exactly as in Clojure.
+(defmacro cond-> [expr & clauses]
+  (if (empty? clauses)
+    expr
+    `(let* [g# ~expr
+            next# (if ~(first clauses) (-> g# ~(second clauses)) g#)]
+       (cond-> next# ~@(rest (rest clauses))))))
+
+(defmacro cond->> [expr & clauses]
+  (if (empty? clauses)
+    expr
+    `(let* [g# ~expr
+            next# (if ~(first clauses) (->> g# ~(second clauses)) g#)]
+       (cond->> next# ~@(rest (rest clauses))))))
+
+; (some-> x f g ...) → threads while the value is non-nil.
+(defmacro some-> [expr & forms]
+  (if (empty? forms)
+    expr
+    `(let* [g# ~expr]
+       (if (nil? g#)
+         nil
+         (some-> (-> g# ~(first forms)) ~@(rest forms))))))
+
+(defmacro some->> [expr & forms]
+  (if (empty? forms)
+    expr
+    `(let* [g# ~expr]
+       (if (nil? g#)
+         nil
+         (some->> (->> g# ~(first forms)) ~@(rest forms))))))
+
+; (as-> x name form ...) → binds name to x, then to each form
+; in turn.
+(defmacro as-> [expr name & forms]
+  (if (empty? forms)
+    expr
+    `(let* [~name ~expr]
+       (as-> ~(first forms) ~name ~@(rest forms)))))
