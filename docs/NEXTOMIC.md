@@ -239,9 +239,9 @@ error throws `{:error :nextomic/query-syntax :message "..." :clause i}`
 with the clause index when the error is inside `:where`. The IR is pure
 syntax over the VM's symbol table, so it is cached per VM by query value
 (heap identity first, structural hash second) and reused across every
-db and basis; the rule set bound to `%` is cached the same way. Nothing
-frees or moves a heap value today, so a cache entry lives as long as the
-VM; a collector must clear both caches. Constants in data patterns are
+db and basis; the rule set bound to `%` is cached the same way. No
+collector frees or moves a heap value, so a cache entry lives as long as
+the VM; one that does must clear both caches. Constants in data patterns are
 encoded to their sortable bytes, and lookup refs and idents in constant
 positions resolve against the db, at plan time.
 

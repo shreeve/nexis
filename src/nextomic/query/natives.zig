@@ -11,9 +11,9 @@
 //! use and destroyed at VM teardown. A parsed query is pure syntax over
 //! the VM's symbol table, so one cache serves every connection the VM
 //! opens. The caches hold the query values themselves (by heap identity
-//! first, then by structure); nothing frees or moves a heap value
-//! today, so an entry stays valid for the VM's life. A collector that
-//! frees or moves values must `clear` both caches.
+//! first, then by structure); no collector frees or moves a heap value,
+//! so an entry stays valid for the VM's life. One that does must
+//! `clear` both caches.
 //!
 //! Functions: a predicate or function-binding symbol that is not a
 //! built-in resolves through the namespace registry the way the
