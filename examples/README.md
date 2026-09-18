@@ -1,44 +1,38 @@
 # examples
 
-Tiny `.nx` programs that run via the `nexis` CLI (step H1).
+`.nx` programs that run through the `nexis` CLI.
 
 ```bash
-# Build the CLI (produces bin/nexis):
-zig build nexis
-
-# Run an example:
+zig build install                       # bin/nexis
 ./bin/nexis run examples/hello.nx
 ```
 
 | File | What it shows |
 |---|---|
-| `hello.nx` | Symbol literal via `defn` + call |
-| `sum10.nx` | `loop*`/`recur` constant-stack iteration |
-| `forward-ref.nx` | `defn` forward references work via the namespace Var fall-through (f calls g before g is defined) |
-| `cond.nx` | `cond` + `and` + `:else`-as-truthy-keyword convention |
-| `threading.nx` | `->` thread-first chained through `+` |
-| `macros.nx` | `when-not` / `loop` / `or` end-to-end (step #8b host macros) |
-| `quoted-list.nx` | `(quote (...))` builds a runtime list value via `#%list` (step #8c.1) |
-| `syntax-quote.nx` | `` ` `` / `~` / `~@` with splicing (step #8c.2) |
-| `macro-author.nx` | Synthesize a `(let* [x 99] x)` form via vector syntax-quote (step #8c.3) |
-| `try-catch.nx` | `try` / `catch` / `throw` with cross-frame propagation (step #9.1) |
-| `maps-sets.nx` | Collection literals `{...}` and `#{...}` (Phase 3.1) |
-| `defmacro.nx` | User-defined macros via `defmacro` (Phase 3.2) — fresh sub-VM per compile-time invocation |
-| `stdlib-primitives.nx` | Native fns (`list`/`cons`/`first`/`rest`/`empty?`/...) + a user-written recursive procedural `my-cond` macro (Phase 3.3a) |
-| `require-demo.nx` + `lib/geom.nx` | `(require '[lib.geom :as g])` loads a library from disk; Phase 3.6 |
-| `durable-refs.nx` | First-class durable identity backed by emdb. `db/open`/`db/ref`/`db/put-key!`/`db/get-key`/`db/delete-key!`. Phase 4.0a — values PERSIST across processes. |
-| `todo-app.nx` | **Phase 4 EXIT DEMO** — persistent to-do tracker exercising the entire Phase 4 surface (`with-tx`, `db/alter!`, `db/scan`, `db/reduce-tree`, `@deref`, rollback on exception). Run twice to verify state persists. |
-| `nextomic-app.nx` | A clinic chart on Nextomic (`docs/NEXTOMIC.md`): schema as data, upserts by unique identity, component notes, Datalog queries with `d/q` (joins, `:in`, a predicate, an aggregate), `d/pull` patterns (nested, reverse, component), `as-of`/`history`/`tx-range` reads, a speculative `d/with`, a caught `:nextomic/unique`. Safe to run twice. |
+| `hello.nx` | `defn` + call |
+| `sum10.nx` | `loop`/`recur` constant-stack iteration |
+| `forward-ref.nx` | `defn` forward references through the namespace Var (f calls g before g is defined) |
+| `cond.nx` | `cond` + `and` + `:else` |
+| `threading.nx` | `->` thread-first through `+` |
+| `macros.nx` | `when-not` / `loop` / `or` host macros |
+| `quoted-list.nx` | `(quote (...))` builds a runtime list |
+| `syntax-quote.nx` | `` ` `` / `~` / `~@` with splicing |
+| `macro-author.nx` | Synthesizing a `(let* [x 99] x)` form with a vector syntax-quote |
+| `try-catch.nx` | `try` / `catch` / `throw` across frames |
+| `maps-sets.nx` | `{...}` and `#{...}` literals |
+| `defmacro.nx` | User macros: a fresh sub-VM per compile-time invocation |
+| `stdlib-primitives.nx` | Native fns (`list`/`cons`/`first`/`rest`/`empty?`/...) and a recursive procedural `my-cond` macro |
+| `require-demo.nx` + `lib/geom.nx` | `(require '[lib.geom :as g])` loads a library from disk |
+| `shapes.nx` | Protocols + records in one file: `defprotocol`, `defrecord`, `extend-protocol` over records and built-ins, `satisfies?`, atoms, `str`, `case`/`for` |
+| `shapes-app.nx` + `lib/shapes/{protocol,records,builtins}.nx` | The same program as a multi-file application: a driver and three required modules; prints one report per shape and `total-area atom = 9650` |
+| `durable-refs.nx` | Durable identity backed by emdb: `db/open`/`db/ref`/`db/put-key!`/`db/get-key`/`db/delete-key!`; values persist across processes |
+| `todo-app.nx` | Persistent to-do tracker over the whole `db/*` surface (`with-tx`, `db/alter!`, `db/scan`, `db/reduce-tree`, `@deref`, rollback on exception). Run twice: the second run shows `:completed 1` |
+| `nextomic-app.nx` | A clinic chart on Nextomic (`docs/NEXTOMIC.md`): schema as data, upserts by unique identity, component notes, Datalog queries with `d/q` (joins, `:in`, a predicate, an aggregate), `d/pull` patterns (nested, reverse, component), `as-of`/`history`/`tx-range` reads, a speculative `d/with`, a caught `:nextomic/unique`. Safe to run twice: the second run re-upserts the same patients and advances only the basis |
 
-The macro-heavy examples cover both styles: host macros (Zig-
-implemented, registered in the default table) and user macros
-(`defmacro` — compile-time VM eval). Lexical bindings shadow
-both; user macros shadow host macros.
+The store-backed examples write under `tmp/` relative to the working
+directory; delete it to start from an empty store.
 
-Future (Phase 3.3+):
-- Host fns for macro authoring (`cons`/`first`/`rest`/`list`/
-  `count`/`nth`/`apply`/`seq`) — unlock procedural macros.
-- `stdlib/core.nx`: `map`/`reduce`/`filter`/`conj`/`assoc` +
-  destructuring `let`/`fn` + multi-arity `defn`.
-- Multi-namespace: `(require ...)`/`(use ...)`/qualified
-  symbols.
+The macro examples cover both styles: host macros (Zig-implemented,
+registered in the default table) and user macros (`defmacro`,
+compile-time VM eval). Lexical bindings shadow both; user macros
+shadow host macros.

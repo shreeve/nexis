@@ -1944,13 +1944,11 @@ unwind; quoted compound lists/vectors; syntax-quote with splicing
 + auto-gensym; SrcSpans in compile errors. 472 phase2 tests
 green in ~3s.
 
-### Phase 3 — Macros, namespaces, REPL (weeks 15–18) — **in progress**
+### Phase 3 — Macros, namespaces, REPL (weeks 15–18) — **✅ SHIPPED** (3.7 open)
 
-Phase 3 reshuffled: `expand.zig` + `syntax_quote.zig` + most
-macro work landed early in Phase 2 because the Phase 2 gate
-needed them. Phase 3.0 closed REPL + anon-fn + catchable VM
-errors. Remaining: maps/sets as runtime values, user defmacro,
-stdlib, multi-namespace, dynamic binding.
+Phase 3 reshuffled: `expand.zig` and the syntax-quote work landed
+in Phase 2 because the Phase 2 gate needed them. Every row below
+ships except 3.7.
 
 - [x] `src/expand.zig`: fixpoint expander (shipped in Phase 2 #8).
 - [x] Syntax-quote, auto-gensym (folded into `expand.zig`, shipped
@@ -2003,13 +2001,13 @@ stdlib, multi-namespace, dynamic binding.
       validation. Per peer-AI turn 71 v1 scope; `:refer`/
       `:rename`/`:exclude`/relative requires/reload deferred.
 - [ ] **Phase 3.7** `src/dynamic.zig`: dynamic-binding
-      stack (`^:dynamic` Vars + `binding`). Deferred until
-      Phase 4 clarifies whether transactions want dynamic-Var
-      or explicit-handle shape (peer-AI turn 71 §1).
+      stack (`^:dynamic` Vars + `binding`). Open. Phase 4 settled
+      on explicit transaction handles (Path B), so nothing blocks
+      it; ranked in `HANDOFF.md` §4.
 
 **Exit**: Phase 3 gate; REPL usable for real programs; core stdlib loaded.
 
-### Phase 4 — emdb integration as a first-class concept (weeks 19–22)
+### Phase 4 — emdb integration as a first-class concept (weeks 19–22) — **✅ SHIPPED**
 
 Per peer-AI turn 72 strategic pin: **Path B** (explicit
 transaction threading). No ambient tx via dynamic Var in v1.
@@ -2048,20 +2046,85 @@ transaction threading). No ambient tx via dynamic Var in v1.
       ships the user-facing naming. Verified: snap-N captured
       before subsequent writes still reads the historical state
       after those writes commit. The `db/as-of` ambient-db-value
-      abstraction (Datomic-style) is deferred until concrete
-      need — substrate is sufficient for explicit-snapshot use.
+      abstraction (Datomic-style) is Nextomic's `as-of` (below).
+- [x] **Phase 4.0g** Engine seam: every store opens with
+      `pageSize = 16384` and 128 named trees (fixed for the file's
+      life; the Linux engine default is 4 KiB), the path is released
+      once when emdb refuses to open, tree ids are resolved once per
+      connection, cursor natives read whole values, and every engine
+      failure is a named `:db/*` keyword (`docs/DB.md`).
 
 **Exit**: Phase 4 gate; a small application (e.g. a to-do tracker with persistent state) works end-to-end.
 
-### Phase 5 — Standard library and tooling (weeks 23–26)
+### Phase 5 — Standard library and tooling (weeks 23–26) — **breadth shipped, tooling open**
 
-- [ ] Remainder of `nexis.core` written in nexis itself on top of primitives.
-- [ ] `nexis.test`, `nexis.pprint`, `nexis.string`, `nexis.math`, `nexis.repl`.
+Two definitions of Phase 5 exist. The Clojure-breadth definition
+(Amendment Log entries of 2026-05-18 and 2026-05-19) shipped in
+full; the tooling definition below is open and ranked in
+`HANDOFF.md` §4.
+
+As shipped (Clojure compatibility breadth):
+
+- [x] **5.1** Atoms: `atom`/`reset!`/`swap!`/`swap-vals!`/
+      `compare-and-set!`/`atom?`, `@a` (`docs/ATOM.md`).
+- [x] **5.2** Strings and I/O: `str`/`string?`/`subs`, `nexis.string`
+      (`lower-case`/`upper-case`/`trim`/`split`/`join`/`replace`),
+      `print`/`println`/`prn`/`pr-str`/`slurp`/`spit`.
+- [x] **5.3** Records and protocols: `defrecord`, `defprotocol`,
+      `extend-protocol`/`extend-type`, `satisfies?`, `:any` fallback
+      (`docs/PROTOCOLS.md`).
+- [x] **5.4** `case`/`condp`/`for` macros.
+- [x] **5.5** `nexis.core` breadth: `src/stdlib/core.nx` (`doseq`/
+      `while`/`letfn`/`if-not`, `cond->`/`some->`/`as->`, `merge`/
+      `update`/`get-in`/`assoc-in`/`update-in`/`merge-with`,
+      `frequencies`/`group-by`/`interpose`/`juxt`/`fnil`/`comp`/
+      `partial`/`constantly`/`complement`, `every?`/`some`/`not-any?`)
+      plus the native sequence library in `src/stdlib.zig`
+      (`partition`, `distinct`, `zipmap`, `sort-by`, `reductions`,
+      `iterate`, `select-keys`, ...).
+- [x] Exit as shipped: `examples/shapes-app.nx`, a multi-file
+      protocols + records + atoms application, runs unchanged.
+
+As defined (tooling), open:
+
+- [ ] `nexis.test`, `nexis.pprint`, `nexis.math`, `nexis.repl`.
 - [ ] `nexis --compile` / `--run` / `--disasm` subcommands.
 - [ ] Test runner.
 - [ ] Source-mapped stack traces end-to-end.
 
-**Exit**: Phase 5 gate; realistic user experience.
+**Exit as defined**: Phase 5 gate (§20.2); realistic user experience.
+
+### Nextomic — Datomic-class database — **✅ SHIPPED**
+
+Authoritative design: `docs/NEXTOMIC.md`. Built on the engine as it
+is — zero changes to emdb (§11 there).
+
+- [x] Store: eleven emdb named trees — four current indexes, four
+      history indexes with the logical `t` in the key, `nx/txlog`,
+      `nx/idents`, `nx/sys`; sortable value encodings;
+      `test/prop/nextomic_key.zig` (§2).
+- [x] Transactions: tempids, upserts by unique identity, cardinality,
+      components, retractions, `:db/txInstant`;
+      `test/prop/nextomic_tx.zig` against an in-memory model at every
+      basis (§3).
+- [x] Db-values and time: `db`, `basis-t`, `as-of`, `since`,
+      `history`, `tx-range`, `entity`, `entid`/`ident`, `datoms` (§4).
+- [x] Query: `q` as a native over a query value — patterns, every
+      `:in` form, predicates and function bindings through the
+      namespace registry, aggregates, every find spec, `not`/`or` and
+      their `-join` forms, rules; greedy planner over the §5 index
+      table; `explain`; `test/integration/nextomic_q.zig` against a
+      naive evaluator (§5).
+- [x] Pull: `pull`/`pull-many` with nested, reverse, recursive,
+      `:limit`/`:default`/`:as` specs;
+      `test/integration/nextomic_pull.zig`.
+- [x] Speculative `with` over a held write transaction.
+- [x] Natives, the `nextomic_conn`/`nextomic_db` value kinds,
+      `with-conn`, `:nextomic/*` errors (§6, §7); `test/nextomic/*.nx`
+      under `zig build test`; `examples/nextomic-app.nx`.
+- [ ] Listed as later in §6: transaction functions and `:db.fn/cas`,
+      excision, full-text, lazy entities, a datom heap kind; Datalog
+      function-position variables (§5).
 
 ### Phase 6 — Performance pass (weeks 27–30)
 
@@ -2092,7 +2155,6 @@ Phase 6 delivers the **Tier 2 performance wins** from §19.6. Each item maps to 
 
 - Multi-isolate runtime via Nexus orchestrator.
 - User-extensible protocols.
-- `as-of` historical reads.
 - Storage-native collection variants.
 - Zig-level FFI story.
 - Native compilation (AOT via LLVM or Zig's backend).
@@ -2680,3 +2742,49 @@ spec changes downstream of each PLAN entry.
   since §23 #10 has no rationals. Fixnum overflow raises the catchable
   `:arithmetic-overflow` until bignum arithmetic lands. SEMANTICS.md
   §2.2 and §6.3 track this entry.
+
+- **2026-09-18 — Doubles as landed; addendum to the number-tower
+  entry.** Integer division by zero (`/`, `quot`, `rem`, `mod`) raises
+  the catchable `:divide-by-zero`; float division by zero is IEEE
+  (`(/ 1.0 0)` is `Infinity`). The fixnum payload is 48
+  bits (`value.zig`: `fixnum_max = 2^47 - 1`); an integer literal
+  outside that range is the compile error `IntegerOutOfFixnumRange`.
+  §23 #10 ("fixnum + bignum") is realized as a `bignum` kind with
+  codec and hashing and no arithmetic or literal lifting; both are
+  ranked first in `HANDOFF.md` §4.
+
+- **2026-09-18 — Keyword-as-function shipped (§8.7, §23 #33).**
+  `(:k m)` and `(:k m default)` are handled by the VM's call path
+  for a keyword in function position; maps, sets and vectors are invocable
+  the same way (`(m :k)`, `(#{1 2} 2)`, `([10 20] 1)`). The §19 note
+  before §19.3 ("not a v1 language feature") and §24 #11 are
+  superseded by this entry; §8.7 and §23 #33 are the authority.
+
+- **2026-09-18 — `q` is a native, not a macro (§15.11 NX-3).** The
+  query is a value (vector or map form) parsed at run time into IR
+  and cached per VM by heap identity and structural hash, so the
+  parse cost NX-3 assigned to a macro is paid once per distinct query
+  and the query stays data: composable, storable, buildable at run
+  time. No bytecode-constant IR exists. `docs/NEXTOMIC.md` §1 #7 and
+  §5 are the authority; macros over `q` are sugar only.
+
+- **2026-09-18 — Nextomic index layout (§15.11 NX-4, NX-5, NX-6).**
+  History is tx-in-key as NX-4 says, but current and history are
+  separate trees: four current indexes (`nx/eavt`, `nx/aevt`,
+  `nx/avet`, `nx/vaet`) hold only asserted facts and answer ordinary
+  reads with no fold, their value being the logical `[t:6]`; four
+  history indexes (`nx/*-h`) carry `(t << 1) | added` in the key and
+  answer `as-of`/`since`/`history`; `nx/txlog`, `nx/idents` and
+  `nx/sys` complete the eleven. `t` is Nextomic's own monotonic
+  counter in `nx/sys`, never the engine's `txnId`. NX-6's
+  `:nextomic/schema` tree does not exist: schema is datoms on
+  attribute entities read as-of the basis. NX-5's `datom` heap kind
+  is not shipped; `datoms`, `tx-range` and `history` reads return
+  `[e a v t added]` vectors, and the kind is listed as later in
+  `docs/NEXTOMIC.md` §6. `docs/NEXTOMIC.md` §1–§2 are the authority.
+
+- **2026-09-18 — `as-of` removed from §21 "Beyond 1.0".** §23 #22
+  makes `as-of` reads v1, and they ship twice: `db/snapshot` /
+  `with-snapshot` over MVCC read transactions (Phase 4.0f) and
+  Nextomic's `as-of`/`since`/`history` db-values over tx-in-key
+  history.

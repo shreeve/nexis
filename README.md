@@ -1,285 +1,117 @@
 # nexis
 
-> **Clojure language design on a Zig-native runtime.** Same surface
-> syntax, same persistent collections, same macros, same lexical
-> scoping. Single binary, no JVM warmup, integrated durable storage,
-> post-v1 path to Datomic-class temporal queries. **Not a Clojure
-> port** — no Java interop, no STM; what you trade the JVM ecosystem
-> for is described below.
+> **Clojure language design on a Zig-native runtime, with a
+> Datomic-class database inside.** Same surface syntax, same
+> persistent collections, same macros, same lexical scoping. One
+> static binary, no JVM, durable identity as a value kind, and
+> Nextomic: immutable facts with time, Datalog, `as-of`/`since`/
+> `history`, in one file. **Not a Clojure port** — no Java interop,
+> no STM; the trade is spelled out below.
 
 **nexis** takes Clojure's best ideas — persistent immutable collections,
 macros, keywords, data-first APIs, identity/value separation, lexical
-closures with proper capture semantics, `let`/`fn`/`defn`/`loop`/`recur` —
-and reimplements them on a vertically integrated Zig-native substrate:
-a grammar-driven parser (`nexus`), an mmap'd MVCC B+ tree storage
-engine (`emdb`), and a production 64-bit bytecode VM. Durable
-identities are first-class values, not a library bolted on top.
+closures, `let`/`fn`/`defn`/`loop`/`recur` — and implements them on a
+vertically integrated Zig substrate: a grammar-driven parser (`nexus`),
+an mmap'd MVCC B+ tree storage engine (`emdb`), and a 64-bit bytecode
+VM. Durable identities and Nextomic connections are first-class values,
+not a library bolted on top.
 
 ## Status
 
-**Phase 2 COMPLETE**. **Phase 3 COMPLETE** through 3.5 (3.0/3.1/3.2/3.3/3.4/3.5
-all shipped). Real `.nx` source runs end-to-end through
-`bin/nexis run FILE.nx` AND an interactive `bin/nexis repl`. The
-reader, macroexpander, compiler, and bytecode VM all ship; host
-macros + user `defmacro` + procedural macros via native primitives
-all work; syntax-quote (`` ` ``/`~`/`~@`/auto-gensym),
-try/catch/finally with catchable VM errors, persistent
-maps/sets/vectors/lists, ~30 native fns (sequence/HOF/arithmetic/
-collection), composite `core.nx` stdlib layer (`when-let`/`if-let`/
-`dotimes`/`range`/`take`/`drop`/etc.), multi-namespace with
-qualified symbols + `(ns NAME)`, full destructuring (sequential
-+ associative + nested + `& rest` + `:as` + `:keys` + `:or`) in
-let/fn/defn, AND multi-arity `defn` — all in.
-
+Every row below is runnable through `bin/nexis`. `zig build test`
+runs **1265 tests** across 111 build steps (unit, property, golden,
+Nextomic corpora, and the `test/nextomic/*.nx` end-to-end scripts).
 See [`PLAN.md`](PLAN.md) §21 for the phase map and
-[`HANDOFF.md`](HANDOFF.md) for current state + next task.
+[`HANDOFF.md`](HANDOFF.md) for the ranked next-work list.
 
-| Phase | Status | What |
-|---|---|---|
-| Phase 0 | ✅ shipped | Reader: grammar, `@lang` module, Form normalizer, pretty-printer, golden tests |
-| Phase 1 | ✅ shipped | Runtime core: Value model, persistent collections (CHAMP HAMT, RRB vector, list), heap + GC, codec, emdb integration |
-| Phase 2 | ✅ shipped | Compiler + bytecode VM. 11/11 steps of [`docs/COMPILER.md`](docs/COMPILER.md) §10 complete. All 7 gate items from §9.4 satisfied. |
-| Phase 3.0 | ✅ shipped | CLI runner + REPL, anonymous-fn shorthand `#(...)`, catchable VM errors |
-| Phase 3.1 | ✅ shipped | Persistent maps `{:k 1}` and sets `#{1 2}` as runtime literals |
-| Phase 3.2 | ✅ shipped | User-defined `defmacro` with compile-time evaluation (fresh sub-VM per invocation) |
-| Phase 3.3a | ✅ shipped | 10 native fns for macro authoring; `Kind.native_fn` infrastructure |
-| Phase 3.3b | ✅ shipped | `VM.callValue` reentrancy + `apply` + HOFs (`map`/`reduce`/`filter`) + first-class arithmetic Vars |
-| Phase 3.3c | ✅ shipped | Collection utilities (`vector`/`vec`/`hash-map`/`assoc`/`get`/`conj`/`keys`/`vals`/etc.) |
-| Phase 3.3d | ✅ shipped | Embedded `core.nx` composite layer (`when-let`/`if-let`/`dotimes`/`range`/`take`/`drop`/etc.) |
-| Phase 3.4 | ✅ shipped | Multi-namespace: `nexis.core` + `user`, `(ns NAME)`, qualified symbols, auto-refer |
-| Phase 3.5 | ✅ shipped | Destructuring (sequential/associative/nested/`& rest`/`:as`/`:keys`/`:or`) + multi-arity `defn` |
-| Phase 3.6 | ✅ shipped | `require` + file loading + `:as` aliases; ns-to-file mapping; cycle detection; idempotent load |
-| Phase 3.7 | pending (deferred) | `^:dynamic` Vars + `binding` — deferred until Phase 4 clarifies transaction-context shape |
-| Phase 4.0a | ✅ shipped | Durable refs as first-class Values backed by emdb. `db/open`/`db/close`/`db/ref`/`db/put-key!`/`db/get-key`/`db/delete-key!`/`db/present?`. Auto-ephemeral tx. Cross-process persistence verified. |
-| Phase 4.0b | ✅ shipped | Explicit `(with-tx ...)` + `(with-read-tx ...)` + WriteTxn/ReadTxn Value kinds + `db/begin-write`/`db/commit!`/`db/abort-write!`/`db/put!`/`db/get`/`db/delete!`. Try/catch-safe rollback. Multi-write atomicity. |
-| Phase 4.0c | ✅ shipped | `@deref` operator + `db/deref` (universal: ref/var/else) + `db/alter!` read-modify-write |
-| Phase 4.0d | ✅ shipped | `db/scan` (eager, ordered, range-bounded) + `db/reduce-tree` (server-side reduce) |
-| **Phase 4.0e** | ✅ **shipped** | **EXIT DEMO** — `examples/todo-app.nx`. Persistent to-do tracker. State PERSISTS across `nexis run` invocations. |
-| Phase 4.0f | ✅ shipped | Snapshot vocabulary (`db/snapshot` / `db/release-snapshot!` / `db/snapshot?` / `(with-snapshot ...)`). Time-travel reads through pinned MVCC snapshots. |
-| Nextomic natives | ✅ shipped | The `nextomic` namespace over the datom storage layer ([`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) §6): `connect`/`release`/`db`/`basis-t`/`transact!`/`entity`/`entid`/`ident`/`datoms`/`as-of`/`since`/`history`/`tx-range`/`schema`/`sync`, `with-conn`, `nextomic_conn`/`nextomic_db` value kinds, every error a catchable `:nextomic/*` keyword. `test/nextomic/*.nx` run through `bin/nexis` under `zig build test`; `examples/nextomic-app.nx`. |
-| Nextomic query | ✅ shipped | `d/q` and `d/explain` over the Datalog pipeline (§5): patterns, every `:in` form, predicates and function bindings that call any Lisp function through the namespace registry, aggregates, every find spec, `not`/`or` and their `-join` forms, recursive rules, time views; parsed queries cached per VM; `test/nextomic/query.nx`. `d/pull`/`d/pull-many` patterns (nested, reverse, recursion, `:limit`/`:default`/`:as`) and speculative `d/with`; `test/nextomic/pull.nx`, `test/nextomic/with.nx`. |
-
-**558 tests** green: 95 VM + 313 compile + 6 macroexpand + 4
-property + 54 integration in `phase2-test` (~3s), plus 86 reader
-+ golden tests, plus the Phase 1 randomized property tests.
+| Area | What ships |
+|---|---|
+| Reader | Grammar-driven parser, canonical Form schema, pretty-printer, golden tests |
+| Runtime core | 16-byte tagged Value, CHAMP map/set, 32-way persistent vector, list, transients, bignum kind, codec, precise mark-sweep collector (`src/gc.zig`; see Known gaps) |
+| Compiler + VM | Form → Tiny IR → 64-bit bytecode; slot VM with closures, `recur`, `letfn*`, try/catch/finally, catchable VM errors as keywords; a frame restores its entry stack length on return and unwind |
+| Errors | Compile errors carry `file:line:col` and a source caret; a symbol that names nothing is `UnresolvedSymbol` at its own span |
+| Macros | Host macros, user `defmacro` (compile-time sub-VM), syntax-quote with `~`/`~@`/auto-gensym, procedural macros over native fns, qualified macro heads (`alias/name`) |
+| Namespaces | `(ns NAME)`, qualified symbols and keywords (`:person/name`), `require` with `:as`, ns-to-file loading, cycle detection |
+| Numbers | Fixnum (48-bit) and f64 with Clojure contagion; `(= 1 1.0)` is `false`, `(== 1 1.0)` is `true`; `/` on two integers yields a float when inexact; `:divide-by-zero` and `:arithmetic-overflow` are catchable |
+| Invocation | Keywords, maps, sets and vectors are callable: `(:a m)`, `(m :a)`, `(#{1 2} 2)`, `([10 20] 1)` |
+| Destructuring | Sequential, associative, nested, `& rest`, `:as`, `:keys`, `:or` in `let`/`fn`/`defn`; multi-arity `defn`; `#(...)` shorthand |
+| Core library | 162 native functions in `nexis.core` (`src/stdlib.zig`: sequences, HOFs, collections, arithmetic, predicates, strings, I/O) plus 44 macros and functions in `src/stdlib/core.nx` (`when-let`, `doseq`, `cond->`, `some->`, `as->`, `update-in`, `group-by`, `frequencies`, ...); `nexis.string` |
+| Clojure breadth | Atoms (`atom`/`swap!`/`reset!`/`compare-and-set!`), `str`/`subs`/`print`/`println`/`slurp`/`spit`, records, protocols, `extend-protocol`/`extend-type`/`satisfies?`, `case`/`condp`/`for` |
+| Durable refs (`db/*`) | Refs backed by emdb named trees: `db/open`/`db/ref`/`db/put-key!`/`db/get-key`, `with-tx`/`with-read-tx` with rollback on throw, `@deref`, `db/alter!`, `db/scan`, `db/reduce-tree`, MVCC snapshots via `with-snapshot`; page size pinned to 16 KiB, tree ids cached per connection, engine failures as named `:db/*` keywords |
+| Nextomic | The `nextomic` namespace: `connect`/`release`/`db`/`basis-t`/`transact!`/`entity`/`entid`/`ident`/`datoms`/`as-of`/`since`/`history`/`tx-range`/`schema`/`sync`/`q`/`explain`/`pull`/`pull-many`/`with`, `with-conn`; every error a catchable `:nextomic/*` keyword. Spec: [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) |
+| Tooling | `nexis run FILE.nx`, `nexis repl`, `zig build bench` (ReleaseFast harness, [`docs/BENCH.md`](docs/BENCH.md)), `zig build golden` |
 
 ## Build & run
 
 ```bash
-zig build install                  # produces bin/nexis, bin/nexis-bench, bin/nexis-golden
+zig build install                  # bin/nexis, bin/nexis-golden
 
-./bin/nexis run examples/hello.nx          # run a file
-./bin/nexis repl                            # interactive REPL
-./bin/nexis --help                          # usage
+./bin/nexis run examples/hello.nx  # run a file
+./bin/nexis repl                   # interactive REPL
+./bin/nexis --help                 # usage
 ```
 
 For developers:
 
 ```bash
-zig build phase2-test              # ~3s — fast inner-loop test suite
-zig build test                     # ~3min — full Phase 0/1/2 suite + property tests
+zig build phase2-test              # seconds — vm + compile + stdlib inner loop
+zig build nextomic-test            # Nextomic unit, property and corpus tests
+zig build nextomic-nx              # test/nextomic/*.nx through bin/nexis
+zig build test --summary all       # minutes — everything (1265 tests)
 zig build parser                   # regenerate src/parser.zig from nexis.grammar
 zig build bench                    # ReleaseFast benchmark suite
-zig build golden                   # reader golden tests alone
 ```
 
-See [`AGENTS.md`](AGENTS.md) for when to use which.
+See [`AGENTS.md`](AGENTS.md) for which step fits which loop.
 
-## Working today
+## The language
 
-Every snippet runs via `bin/nexis`. Run the file or paste into the REPL:
+Every snippet runs via `bin/nexis`:
 
 ```clojure
-;; arithmetic + comparison + conditionals
-(+ 1 2)                             ;; => 3
-(if (< 0 5) :small :big)            ;; => :small
-
-;; bindings — user-facing `let` (rename macro to let*)
-(let [x 1 y 2] (+ x y))             ;; => 3
-
-;; functions + closures with proper capture
-(let [x 5]
-  ((fn [y] (+ x y)) 3))             ;; => 8
-
-;; constant-stack recursion via recur (verified 10k iterations)
+(let [x 5] ((fn [y] (+ x y)) 3))            ;; => 8
 (loop [i 0 acc 0]
-  (if (< i 10)
-    (recur (+ i 1) (+ acc i))
-    acc))                           ;; => 45
+  (if (< i 10) (recur (+ i 1) (+ acc i)) acc)) ;; => 45  constant stack
 
-;; mutual recursion via letfn*
-(letfn* [(f [] (g))
-         (g [] 99)]
-  (f))                              ;; => 99
+(defmacro unless [test & body]
+  `(if ~test nil (do ~@body)))
+(unless false :got-it)                      ;; => :got-it
 
-;; variadic & rest
-((fn* [a & r] a) 1 2 3 4)           ;; => 1
+(let [{:keys [x y] :or {y 10}} {:x 5}] (+ x y)) ;; => 15
+(defn arity ([x] :one) ([x y] :two) ([x y & r] :many))
+(arity :a :b :c)                            ;; => :many
 
-;; vars + forward references
-(do (defn f [] (g))
-    (defn g [] 42)
-    (f))                            ;; => 42
+(:a {:a 1})                                 ;; => 1   keyword as function
+(#{1 2} 2)                                  ;; => 2   set as function
+(+ 1 2.5)                                   ;; => 3.5 contagion
+(= 1 1.0)                                   ;; => false
+(== 1 1.0)                                  ;; => true
+(try (/ 1 0) (catch any e e))               ;; => :divide-by-zero
 
-;; lexical shadowing follows scope
-(let [+ (fn [a b] 99)]
-  (+ 1 2))                          ;; => 99 (+ shadowed)
-
-;; macros (when/when-not/and/or/cond/->/->>/let/fn/loop)
-(when (and 1 :truthy)
-  (or false :got-it))               ;; => :got-it
-
-(-> 1 (+ 2) (+ 3))                  ;; => 6
-
-(cond
-  (< 1 0) :impossible
-  :else   :reachable)               ;; => :reachable
-
-;; or/and use gensym so side-effects evaluate once
-(or false nil :found)               ;; => :found
-
-;; quote scalar + quote compound
-(quote 42)                          ;; => 42
-(quote (1 2 3))                     ;; => (1 2 3)
-(quote [a b c])                     ;; => [a b c]
-
-;; syntax-quote with unquote + splicing
-(let [xs (quote (b c d))]
-  `(start ~@xs end))                ;; => (start b c d end)
-
-;; auto-gensym (each `g#` in one syntax-quote scope gets the same name)
-`(let* [g# 1] g#)                   ;; => (let* [g__N__auto__ 1] g__N__auto__)
-
-;; user-defined macros via defmacro (Phase 3.2)
-(defmacro unless [test body]
-  `(if ~test nil ~body))
-(unless false :got-it)              ;; => :got-it
-
-;; variadic defmacro with splicing
-(defmacro my-when [test & body]
-  `(if ~test (do ~@body) nil))
-(my-when true :a :b :c)             ;; => :c
-
-;; defmacro is visible to subsequent forms in same do-block
-(do (defmacro twice [x] `(+ ~x ~x))
-    (twice 21))                     ;; => 42
-
-;; persistent maps + sets as first-class values (Phase 3.1)
-{:a 1 :b 2}                         ;; persistent map
-#{1 2 3}                            ;; persistent set
-
-;; native fns for macro authoring (Phase 3.3a)
-(list 1 2 3)                        ;; => (1 2 3)
-(cons 0 (list 1 2 3))               ;; => (0 1 2 3)
-(first [10 20 30])                  ;; => 10
-(rest (list :a :b :c))              ;; => (:b :c)
-(count {:a 1 :b 2})                 ;; => 2
-(empty? nil)                        ;; => true (nil-as-empty-seq)
-
-;; user-written PROCEDURAL macro using native fns at compile time
-(defmacro my-cond [& clauses]
-  (if (empty? clauses)
-    nil
-    `(if ~(first clauses)
-       ~(first (rest clauses))
-       (my-cond ~@(rest (rest clauses))))))
-(my-cond false :a true :b false :c) ;; => :b
-
-;; multi-namespace (Phase 3.4)
 (ns my.app)
 (defn double [x] (* x 2))
 (ns user)
-(my.app/double 21)                  ;; => 42
-(nexis.core/+ 1 2 3)                ;; => 6
+(my.app/double 21)                          ;; => 42
+(require '[lib.geom :as g])                 ;; examples/lib/geom.nx
+(g/area-of-square 5)                        ;; => 25
 
-;; destructuring + multi-arity defn (Phase 3.5)
-(let [[a b & rest] [1 2 3 4 5]] rest) ;; => (2 3 4 5)
-(let [{:keys [x y] :or {y 10}} {:x 5}] (+ x y)) ;; => 15
-(defn point-sum [[x y]] (+ x y))
-(point-sum [3 4])                   ;; => 7
+(defprotocol Area (area [s]))
+(defrecord Square [side])
+(extend-protocol Area Square (area [s] (* (:side s) (:side s))))
+(area (->Square 3))                         ;; => 9
 
-(defn arity-dispatch
-  ([x]     :one)
-  ([x y]   :two)
-  ([x & r] :many))
-(arity-dispatch :a :b :c :d)        ;; => :many
+(def counter (atom 0))
+(swap! counter inc)                         ;; => 1
 
-;; multi-file projects via require (Phase 3.6)
-;; — see examples/require-demo.nx + examples/lib/geom.nx
-(require '[lib.geom :as g])
-(g/area-of-square 5)                ;; => 25
-
-;; durable refs backed by emdb (Phase 4.0a — the OTHER big arc)
-;; — see examples/durable-refs.nx
+;; durable refs — values persist across processes (examples/todo-app.nx)
 (def conn (db/open :app.edb))
 (def alice (db/ref conn :users :alice))
-(db/put-key! alice {:name :alice :age 30})
-(db/get-key alice)                  ;; => {:name :alice, :age 30}
-;; Values PERSIST across processes. Re-open the file in a new
-;; `nexis` invocation and you read the same data.
-
-;; explicit transactions (Phase 4.0b)
-(def bob (db/ref conn :users :bob))
-(with-tx [tx conn]
-  (db/put! tx alice {:age 31})
-  (db/put! tx bob   {:age 25}))    ;; both or neither — atomic
-
-(with-read-tx [t conn]
-  (db/get t alice))                 ;; => {:age 31}
-
-;; Throws inside `with-tx` ROLL BACK. The next read sees
-;; the pre-tx state.
-(try
-  (with-tx [tx conn]
-    (db/put! tx alice {:age 999})
-    (throw :nope))
-  (catch any e e))                  ;; => :nope
-(db/get-key alice)                  ;; => {:age 31} — unchanged
-
-;; @-deref + db/alter! read-modify-write (Phase 4.0c)
-@alice                              ;; => {:age 31} (ephemeral read)
-(with-tx [tx conn]
-  (db/alter! tx alice (fn* [m] (assoc m :tag :super))))
-@alice                              ;; => {:age 31 :tag :super}
-
-;; ordered scan + server-side reduce (Phase 4.0d)
-(with-read-tx [t conn]
-  (db/scan t :users))               ;; => [[:alice {...}] [:bob {...}]]
-(with-read-tx [t conn]
-  (db/reduce-tree t :users
-    (fn* [acc k v] (+ acc (get v :age)))
-    0))                              ;; => sum of all :age fields
-
+(with-tx [tx conn] (db/put! tx alice {:age 31}))
+@alice                                      ;; => {:age 31}
 (db/close conn)
-
-;; snapshots — time-travel reads (Phase 4.0f)
-(def snap-0 (db/snapshot conn))
-(with-tx [tx conn] (db/put! tx alice {:age 999}))
-(db/get snap-0 alice)               ;; => {:age 31} — historical state!
-@alice                              ;; => {:age 999} — current
-(db/release-snapshot! snap-0)
-
-;; Phase 4 EXIT DEMO: examples/todo-app.nx — persistent
-;; to-do tracker. Run twice to verify state persists.
-
-;; anonymous-fn shorthand
-(#(+ % 1) 41)                       ;; => 42
-(#(+ %1 %2) 10 20)                  ;; => 30
-
-;; try/catch/finally with cross-frame unwinding
-(try
-  (throw :bang)
-  (catch any e e)
-  (finally :always-runs))           ;; => :bang
-
-;; VM-detected errors are catchable (Phase 3.0c)
-(try (+ 1 :not-a-number)
-  (catch any e e))                  ;; => :kind-mismatch
-
-(try (+ 1 undefined-var)
-  (catch any e e))                  ;; => :unbound-var
 ```
 
-Compile errors carry file:line:col + a source caret:
+Compile errors carry `file:line:col` and a source caret:
 
 ```text
 $ echo '(when)' > bad.nx && bin/nexis run bad.nx
@@ -288,121 +120,157 @@ nexis: bad.nx:1:1: MacroExpansionFailure
     ^^^^^^
 ```
 
-## Still missing (closes in Phase 3.7 / Phase 4+)
+## Nextomic
 
-These are temporary gaps, not strategic non-goals — each unlocks
-when its phase ships:
+Nextomic is a Datomic-class database inside the binary. A fact is a
+datom `[e a v t added]`; the store keeps every fact it ever learned;
+a db-value is an immutable view at a basis `t`; `as-of`, `since` and
+`history` are views of the same trees; queries are Datalog data; a
+transaction is data too. One file on disk, no JVM, no server, and
+zero changes to emdb — every index is an ordinary named tree of
+byte keys whose lexicographic order is the index order. Current
+facts live in four current trees; history in four more with the
+transaction in the key; `nx/txlog`, `nx/idents` and `nx/sys` make
+eleven.
 
-- **Dynamic binding** (`^:dynamic` Vars + `(binding ...)`): for
-  the small set of thread-local-style Vars (`*out*`, etc.). Phase
-  3.7 — deferred per peer-AI turn 71 until Phase 4 clarifies
-  whether transaction context wants dynamic-Var or explicit-
-  handle shape.
-- **`require` enhancements**: `:refer`, `:rename`, `:exclude`,
-  relative requires, `:reload`. v1 ships `:as` only.
-- **Protocols / multimethods**: post-stdlib.
-- **Durable identity** (`durable_ref` Values + transactional
-  `swap!`/`alter`/`commute` + snapshots backed by emdb): the OTHER
-  big arc. Phase 4.
-- **SIMD / perf pass**: collection bulk ops vectorized.
-  Phase 5.
-- **Runtime SrcSpans**: runtime errors (UncaughtThrow etc.)
-  don't carry source spans yet — bounded post-gate work.
+From [`examples/nextomic-app.nx`](examples/nextomic-app.nx), a clinic
+chart:
+
+```clojure
+(require '[nextomic :as d])
+
+(def schema
+  [{:db/ident :patient/mrn :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity :db/doc "Medical record number"}
+   {:db/ident :patient/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :patient/allergies :db/valueType :db.type/keyword :db/cardinality :db.cardinality/many}])
+
+(d/with-conn [c "tmp/clinic.edb"]
+  (d/transact! c schema)
+  (let [intake (d/transact! c [{:patient/mrn "MRN-1001" :patient/name "Mara Quist"
+                                :patient/allergies [:penicillin]}])
+        db     (d/db c)]
+    (println "latex allergies:"
+             (d/q '[:find [?name ...] :where [?p :patient/allergies :latex] [?p :patient/name ?name]] db))
+    (println "Mara at intake:" (:patient/allergies (d/entity (d/as-of db (:tx intake)) [:patient/mrn "MRN-1001"])))))
+```
+
+The full example adds refs, component notes, a double-valued
+attribute, joins with `:in` inputs, a predicate, an aggregate,
+nested and reverse `pull` patterns, `history`/`tx-range`, a
+speculative `with`, and a caught `:nextomic/unique`. It is safe to
+run twice: upserts by unique identity make the second run a no-op.
+
+What the query layer accepts: patterns, every `:in` form (`$`, scalar,
+collection, tuple, relation, `%` rules), predicates and function
+bindings that call any Lisp function including one you `defn`'d,
+aggregates, every find spec (`.`, `[...]`, `[[...]]`, relation),
+`not`/`not-join`/`or`/`or-join`/`and`, recursive rules, and the time
+views. `(d/explain query db)` prints the plan. Parsed queries are
+cached per VM by value.
+
+`test/nextomic/{basics,indexes,time,errors,query,pull,with,with-conn,
+persist-1,persist-2}.nx` are the executable specification; each
+`.out` file is the expected stdout. [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md)
+is the authoritative design: §2 store layout, §3 transactions, §4
+db-values and time, §5 query pipeline, §6 Lisp API, §7 errors, §8
+module layout, §9 runtime prerequisites, §10 where Nextomic wins and
+where it does not.
+
+## Known gaps
+
+Stated so nobody rediscovers them:
+
+- **The collector is never invoked at runtime.** `src/gc.zig`
+  implements precise mark-sweep and passes its property tests, but
+  no allocation path calls `collect`; a long-running process grows
+  without bound. Nextomic allocates in per-operation arenas and
+  copies only results into the VM heap, so it does not make this
+  worse. Wiring it needs a rooting protocol for native functions
+  (see `HANDOFF.md`).
+- **No bignum arithmetic.** The `bignum` kind, codec and hashing
+  exist; arithmetic does not promote. Fixnum overflow raises
+  `:arithmetic-overflow`; an integer literal outside ±2^47 is a
+  compile error (`IntegerOutOfFixnumRange`).
+- **No `^:dynamic` Vars, no `binding`.** `(binding ...)` is an
+  unresolved symbol.
+- **Phase 5 as PLAN §21 defines it is open**: no test runner, no
+  `nexis.test`/`nexis.math`/`nexis.pprint`, no `--disasm`, and
+  runtime errors carry no source spans (stack traces are not
+  source-mapped). The Clojure-breadth work that shipped under the
+  Phase 5 name is listed in the status table.
+- **`(vec #{...})` and `(vec {...})` raise `:kind-mismatch`**; `vec`
+  accepts nil, vectors and lists. Use `(into [] s)`.
+- **Datalog function-position variables** are unsupported: the
+  function position of a predicate or function clause takes a
+  symbol naming a function, never a `?var` bound to one
+  (`docs/NEXTOMIC.md` §5).
+- **`typed_vector`** is a reserved Value kind with no
+  implementation; `nexis.simd` kernels do not exist.
+- **Not serializable**: functions, vars, transients, namespaces,
+  tx handles, records, protocols (`:unserializable`).
+- **Nextomic follow-ups** (listed in `docs/NEXTOMIC.md` §6):
+  transaction functions and `:db.fn/cas`, excision, full-text,
+  lazy entities, a datom heap kind.
 
 ## Permanent differences from Clojure/JVM
 
-These never close — they're trade-offs, not bugs:
+These never close — they are trade-offs, not bugs:
 
 - **No Java interop.** No `(Math/sqrt x)`, no `(.method obj)`, no
-  `(import …)`. Roughly 30-40% of real-world Clojure code touches
+  `(import …)`. Roughly 30–40% of real-world Clojure code touches
   Java; that code does not port.
-- **No STM** (`ref`, `dosync`, `commute`). Channels + immutable
-  values + (post-v1) durable transactions are the concurrency story.
+- **No STM** (`ref`, `dosync`, `commute`). Immutable values, atoms
+  and durable transactions are the concurrency story. Single
+  isolate, single thread.
 - **No JVM ecosystem.** No Maven Central, no Leiningen. The library
   story rebuilds on top of nexis.
 
 **The semantics port; the platform and the libraries don't.** A
 Clojure programmer trades the JVM ecosystem for a single binary, no
-JVM warmup, integrated durable storage, and a path to Datomic-class
-identity. That's a real trade, not a free lunch.
-
-See [`CLOJURE-REVIEW.md`](CLOJURE-REVIEW.md) for the line-by-line
-catalogue of what we take, adapt, and reject from Clojure's source.
+JVM warmup, integrated durable storage, and a Datomic-class database
+in the same process. That is a real trade, not a free lunch. See
+[`CLOJURE-REVIEW.md`](CLOJURE-REVIEW.md) for the line-by-line
+catalogue of what nexis takes, adapts, and rejects from Clojure's
+source.
 
 ## What makes this different
 
 | Dimension | Clojure-on-JVM | nexis |
 |---|---|---|
-| Host runtime | JVM (~150 MB resident, 1-3s startup) | Zig-native binary (~5 MB target, instant) |
+| Host runtime | JVM (~150 MB resident, 1–3 s startup) | Zig-native binary, instant start |
 | Compilation target | JVM bytecode | Custom 64-bit ISA ([`docs/VM.md`](docs/VM.md)) |
-| GC | JVM (G1 / ZGC / etc.) | Precise mark-sweep tracing (Phase 1, shipped) |
-| Persistent collections | Bagwell HAMT + plain 32-way vector | CHAMP HAMT + RRB vector (modern designs) |
-| Concurrency | JVM threads + STM (Refs) | Single-isolate v1; multi-isolate via channels later |
-| Java interop | Yes (huge) | None (intentional — keeps the runtime tight) |
-| Durable storage | External (Datomic, JDBC, etc.) | First-class: emdb integrated; `durable_ref` is a Value kind |
-| Deployment | JVM uberjar / native-image | Static binary, end-state ~5 MB |
+| GC | JVM (G1 / ZGC / etc.) | Precise mark-sweep, implemented but not wired (Known gaps) |
+| Persistent collections | Bagwell HAMT + 32-way vector | CHAMP HAMT + 32-way vector |
+| Concurrency | JVM threads + STM (Refs) | Single isolate; atoms; durable transactions |
+| Java interop | Yes (huge) | None (intentional) |
+| Durable storage | External (Datomic, JDBC, etc.) | In-process: emdb; `durable_ref`, `nextomic_conn`, `nextomic_db` are Value kinds |
+| Temporal database | Datomic (separate product, JVM, transactor + storage service) | Nextomic in the same binary, one file, no emdb changes |
+| Deployment | JVM uberjar / native-image | Static binary |
 
 ## What's here
 
 | Path | Purpose |
 |---|---|
-| [`PLAN.md`](PLAN.md) | Authoritative design — read this first (§23 frozen decisions, §28 canonical Form schema) |
-| [`HANDOFF.md`](HANDOFF.md) | Current state + immediate next task (for inter-session continuity) |
+| [`PLAN.md`](PLAN.md) | Authoritative design — read first (§21 roadmap, §23 frozen decisions + amendment log, §28 canonical Form schema) |
+| [`HANDOFF.md`](HANDOFF.md) | Self-contained handoff: what exists, how to verify it, ranked next work |
 | [`AGENTS.md`](AGENTS.md) | Routing guide for contributors / AI sessions |
-| [`CLOJURE-REVIEW.md`](CLOJURE-REVIEW.md) | What we take, adapt, reject from Clojure's source |
-| [`docs/`](docs/) | 20 design specs — see [`docs/README.md`](docs/README.md) for the module ↔ spec map |
-| [`src/`](src/) | Zig modules — runtime + compiler. `vm.zig` (VM kernel), `compile.zig` (compiler), and `expand.zig` (macroexpander) are the largest. |
-| [`test/`](test/) | Property tests, integration tests, golden tests; most unit tests are inline in `src/*.zig`. See [`test/README.md`](test/README.md). |
-| [`examples/`](examples/) | Working `.nx` programs — `hello.nx`, `cond.nx`, `threading.nx`, `macro-author.nx`, `defmacro.nx`, `try-catch.nx`, `syntax-quote.nx`, `sum10.nx`, `forward-ref.nx`, `macros.nx`, `quoted-list.nx`, `maps-sets.nx`. |
+| [`CLOJURE-REVIEW.md`](CLOJURE-REVIEW.md) | What nexis takes, adapts, rejects from Clojure's source |
+| [`docs/`](docs/) | Design specs — [`docs/README.md`](docs/README.md) maps module ↔ spec; [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) is the database |
+| [`src/`](src/) | Zig modules: `vm.zig`, `compile.zig`, `expand.zig`, `stdlib.zig`, `db.zig`, `coll/`, `nextomic/` (`key`, `datom`, `store`, `idents`, `schema`, `transact`, `db`, `relation`, `query/{ir,parse,plan,exec,rules}`, `pull`, `natives`, `handle`) |
+| [`stdlib/`](src/stdlib/) | `core.nx` and `nextomic.nx`, embedded at build time |
+| [`test/`](test/) | `prop/` property tests, `integration/` corpora (`nextomic_q.zig`, `nextomic_pull.zig`), `golden/` reader tests, `nextomic/` end-to-end scripts; most unit tests are inline in `src/*.zig` |
+| [`examples/`](examples/) | Working `.nx` programs — see [`examples/README.md`](examples/README.md) |
 | [`nexis.grammar`](nexis.grammar) | Reader grammar — source of truth for `src/parser.zig` |
-| [`ZIG-0.16.0.md`](ZIG-0.16.0.md) | Project-specific Zig 0.16 stdlib reference + gotchas (MANDATORY before writing Zig) |
+| [`ZIG-0.16.0.md`](ZIG-0.16.0.md) | Zig 0.16 stdlib reference + gotchas (mandatory before writing Zig) |
 
 ## Requirements
 
-- **Zig 0.16.0** (pinned; stdlib changed substantially between 0.15 and
-  0.16). See [`ZIG-0.16.0.md`](ZIG-0.16.0.md) for the gotchas that have
-  actually bitten us.
+- **Zig 0.16.0** (pinned). See [`ZIG-0.16.0.md`](ZIG-0.16.0.md).
 - **nexus** at `../nexus/bin/nexus` for `zig build parser`.
-- **emdb** as a path dependency (see `build.zig.zon`).
-
-## Post-v1 vision: Nextomic
-
-A Datomic-class embedded database, built as a nexis library on top of
-emdb. Not a v1 deliverable; the substrate is intentionally designed to
-support it without retrofitting. See [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md)
-for the architecture reference.
-
-## Querying
-
-Nextomic answers Datalog. A query is a quoted vector, the db is the
-`$` input and the rest follow `:in`; any Lisp function, including one
-you just `defn`'d, can serve as a predicate or produce a binding:
-
-```clojure
-(require '[nextomic :as d])
-
-(defn adult? [age] (>= age 30))
-
-(d/q '[:find ?name ?age
-       :in $ ?min
-       :where [?p :person/age ?age]
-              [(> ?age ?min)]
-              [(adult? ?age)]
-              [?p :person/name ?name]]
-     (d/db conn) 20)
-;; => #{["Ann" 30] ["Cy" 41]}
-```
-
-`(d/pull db '[:person/name {:person/boss [:person/name]}] e)` shapes
-an entity's facts by a pattern, following refs, reverse refs and
-components. `(d/with conn tx-data (fn [db-after report] ...))` runs
-tx-data speculatively: `db-after` answers every read as if it were
-committed, and nothing is written.
-
-`examples/nextomic-app.nx` walks a clinic chart through joins, `:in`,
-a predicate, an aggregate, a pull and a speculative `with`;
-`test/nextomic/{query,pull,with}.nx` cover the whole surface, and
-`(d/explain query db)` prints the plan.
+- **emdb** as a path dependency (see `build.zig.zon`). Nextomic
+  opens every store with `pageSize = 16384`; on Linux, where the
+  engine default is 4 KiB, the pin is what keeps files portable.
 
 ## License
 

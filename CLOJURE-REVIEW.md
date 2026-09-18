@@ -265,9 +265,9 @@ These are the semantic traps a Clojure programmer will hit.
 
 | Expression | Clojure | nexis | Pin |
 |---|---|---|---|
-| `(= 1 1.0)` | `true` | `false` | PLAN §23 #11 (cross-type `=` deferred to v2 `==`) |
+| `(= 1 1.0)` | `true` | `false`; `(== 1 1.0)` is `true` | PLAN §23 #11; `==` is the cross-type numeric equality (PLAN Amendment Log, number tower) |
 | `(= Double/NaN Double/NaN)` | `false` | `true` (canonical bit pattern) | SEMANTICS §2.2 |
-| Integer overflow | auto-promotes to `BigInteger` | Phase 0 rejects; Phase 1 auto-promotes | PLAN §21 Phase 1 gate |
+| Integer overflow | auto-promotes to `BigInteger` | raises the catchable `:arithmetic-overflow`; a literal outside ±2^47 is a compile error (no bignum arithmetic; `HANDOFF.md` §4 item 1) | PLAN §23 #10, Amendment Log (doubles as landed) |
 | Syntax-quote expansion | at read time, auto-qualifies + auto-gensyms | reader emits marker only; macroexpander qualifies | PLAN §14.2 (see §2.6 above) |
 
 ### 4.4 Explicit omissions (by PLAN §4 non-goals)
