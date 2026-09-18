@@ -234,12 +234,16 @@ The txlog is the change feed: `(d/tx-range conn from to)` scans
 `q` is a native. Input is a query value (vector or map form) plus the
 db and inputs.
 
-**Parse** → IR `{find, in, where, rules}` with a symbol table; clause
-errors carry the clause index and sub-form (`:nextomic/query-syntax`).
-Constants in data patterns are pre-encoded to their sortable bytes;
-lookup refs and idents in constant positions resolve against the db. The
-IR is cached per query value (pointer identity of literal-pool constants
-first, structural hash second) and per schema basis.
+**Parse** → IR `{find, in, where, rules}` with a symbol table; a syntax
+error throws `{:error :nextomic/query-syntax :message "..." :clause i}`
+with the clause index when the error is inside `:where`. The IR is pure
+syntax over the VM's symbol table, so it is cached per VM by query value
+(heap identity first, structural hash second) and reused across every
+db and basis; the rule set bound to `%` is cached the same way. No
+collector frees or moves a heap value, so a cache entry lives as long as
+the VM; one that does must clear both caches. Constants in data patterns are
+encoded to their sortable bytes, and lookup refs and idents in constant
+positions resolve against the db, at plan time.
 
 **Plan** → ordered steps. Index choice by what is bound when the clause
 runs:
@@ -267,8 +271,14 @@ for every cursor, emdb INV-T02). Scans drive `openCursorForTree` +
 seek, constants after an unbound position filter. Built-in predicates
 (`< <= > >= = not= missing?`, later `ground tuple untuple get-else`) are
 Zig over `Value`. Any other symbol resolves through the namespace
-registry and is called with `vm.callValue`; `ControlTransferred` aborts
-the query and propagates after the read transaction is closed.
+registry as the compiler resolves it (an alias-qualified `ns/name` to
+that namespace's own var, a bare name in the current namespace and then
+its auto-referred parents) and is called with `vm.callValue`; an
+unbound name throws `:nextomic/query-syntax` naming it. A throw inside
+the function aborts the query, the read transaction closes, and the
+thrown value reaches the caller's `try`; `ControlTransferred` propagates
+unchanged. Function position takes a symbol naming a function, not a
+`:in`-bound variable.
 
 **Relation** is a Zig-private columnar struct in the query arena
 (`vars`, typed columns for eids and longs, a `Value` column otherwise);
@@ -297,7 +307,8 @@ sub-plans with the same output variables.
 | `(d/entity db e)` | eager map `{:db/id e :attr v ...}`, card-many as sets, refs as eids; nil when the entity has no datoms in this view |
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
 | `(d/datoms db :eavt e a v)` (index and optional components in index order; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
-| `(d/q query db & inputs)` | §5; `:find`, `:in $ ?x [?x ...] [[?x ?y]] %`, `:where` |
+| `(d/q query db & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]` and aggregates, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] %` with inputs positional after the db, `:where` with patterns, predicates, function bindings, `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors |
+| `(d/explain query db & inputs)` | the plan `q` would run, as a string: one numbered line per step with index, estimate and bound variables |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4) |
 | `(d/tx-range conn from to)` | vector of `{:t t :data [...]}` |
 | `(d/schema db)` | map ident → attribute map |
@@ -325,10 +336,13 @@ full-text, a datom heap kind.
 All errors are keywords in the `nextomic` namespace and are catchable:
 `:nextomic/unknown-attribute`, `:nextomic/value-type`,
 `:nextomic/unique`, `:nextomic/conflict`, `:nextomic/no-entity`,
-`:nextomic/query-syntax`, `:nextomic/unbound-pattern`,
-`:nextomic/unsupported-range`, `:nextomic/basis-in-future`,
-`:nextomic/closed`, and `:nextomic/tx-data` for malformed tx-data or a
-lookup ref on a non-unique attribute. Engine errors surface as the
+`:nextomic/unbound-pattern`, `:nextomic/unsupported-range`,
+`:nextomic/basis-in-future`, `:nextomic/closed`, and `:nextomic/tx-data`
+for malformed tx-data or a lookup ref on a non-unique attribute. The one
+exception carries its reason: a query syntax error throws the map
+`{:error :nextomic/query-syntax :message "..." :clause i}` (`:clause`
+present when the parser was inside a `:where` clause; an unknown
+function name is reported the same way at run time). Engine errors surface as the
 `db.zig` keyword set (`:db/key-too-large`, `:db/map-full`,
 `:db/corrupted`, ...). A released connection keeps its struct so a
 db-value taken from it raises `:nextomic/closed` rather than dangling.

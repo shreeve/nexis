@@ -1106,6 +1106,7 @@ pub fn build(b: *std.Build) void {
             "indexes",
             "time",
             "errors",
+            "query",
             "with-conn",
             "persist-1",
             "persist-2",
