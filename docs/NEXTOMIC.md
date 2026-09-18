@@ -1,602 +1,399 @@
-# NEXTOMIC.md — Architecture for a Datomic-class database on nexis + emdb
+# NEXTOMIC.md — A Datomic-class database on nexis + emdb
 
-> **Status: post-v1 design reference. Authoritative for Nextomic architecture
-> decisions when the library is scoped, but does NOT modify any v1 PLAN.md §23
-> frozen decision. Nextomic is explicitly not a v1 deliverable (PLAN.md §15.11).**
+This is the authoritative design for Nextomic: the storage layout, the
+transaction protocol, the db-value semantics, the query pipeline and the
+Lisp API. Code follows this document; when they disagree, fix one in the
+same commit. The emdb-side view (what the engine already provides and
+what must not be asked of it) is `../emdb/NEXTOMIC.md`. The reader's
+introduction to Datomic and Nextomic is §1 of that file.
 
----
-
-## 0. What this document is
-
-This is the comprehensive architecture reference for **Nextomic** — the
-codename for a Datomic-class embedded database that will be built as a
-nexis library on top of `emdb`, after nexis v1 ships.
-
-`PLAN.md` §15.11 is the *opportunity statement*. This document is the
-*architecture* — deeper on all of:
-
-- Why emdb + nexis is the right substrate (not a rhetorical claim).
-- The specific frozen-once-scoped architectural decisions that separate
-  "credible 2026-class Datomic successor" from "beautiful
-  proof-of-concept."
-- Exact storage layout: named sub-databases, key encodings, value
-  encoding discipline.
-- The semantic model: datoms, entity ids, schema, tx-log.
-- The query compilation pipeline: macro → IR → plan → executor.
-- What `emdb` does NOT need (zero changes) and why that matters.
-- What wins this buys and what it doesn't.
-
-### Authority
-
-1. `PLAN.md` §23 frozen decisions — still highest authority for v1.
-2. `PLAN.md` §15 durable-identity contract — load-bearing for
-   Nextomic; must not regress.
-3. **This document** — authoritative for Nextomic library architecture.
-   When Nextomic is scoped, frozen decisions in §3 below become
-   binding in the same way §23 decisions are binding for v1.
-4. All other docs — derivative.
-
-### How this document was produced
-
-Through two rounds of adversarial architectural review with a peer AI
-(GPT-5.4 via `user-ai` MCP). Round one established that emdb alone is a
-good *index* substrate but not a semantic substrate without a canonical
-append-only datom log. Round two, after the peer was shown the nexis
-codebase in depth, established the eight-point architectural split
-captured in §3 of this document. The review flagged what could make
-Nextomic great versus merely functional. This doc captures that bar.
+Nextomic requires **zero changes to emdb**. Every engine capability used
+below is a public function or a committed invariant of emdb as it stands
+(§11 lists the two places a wish was noted and the workaround chosen).
 
 ---
 
-## 1. The core thesis
+## 1. Commitments
 
-> **emdb + nexis is the right foundation for Nextomic — genuinely, not
-> rhetorically — IF you commit to:**
->
-> 1. Integer entity ids, not durable-refs.
-> 2. A specialized internal Relation type (typed-vector columns),
->    separate from the API persistent-set-of-persistent-vectors.
-> 3. A macro → IR → runtime-plan split (not "everything is a macro"
->    and not "everything is a runtime plan").
-> 4. tx-in-key filtering for historical semantics, not emdb snapshot
->    pinning.
->
-> Do those four things and you have something neither Clojure nor
-> Datascript can match on embedded single-node workloads. Skip them
-> and you have a lovely Zig-native Datascript. That is the entire
-> delta between "serious contender" and "charming toy."
+1. **Datoms in emdb named trees, bytes only.** A datom is
+   `[e a v tx added]`. emdb sees byte keys whose unsigned lexicographic
+   order is the index order. No engine-side type awareness.
+2. **Current and history are separate trees.** Four current indexes hold
+   only asserted facts and answer ordinary reads with no per-fact fold.
+   Four history indexes hold every assertion and retraction with the
+   transaction in the key and answer `as-of`, `since` and `history`.
+3. **Logical transaction numbers.** Nextomic mints its own monotonic `t`
+   (stored in the `sys` tree, committed atomically with the datoms). The
+   engine's `txnId` never appears in a key or an entity id.
+4. **A db-value is a plain value** `{store, basis, mode}` with no open
+   read transaction. Each operation opens a pooled read transaction for
+   its own duration and closes it.
+5. **Integer entity ids in partitions**, never durable-refs.
+6. **Schema is datoms** on attribute entities, read as-of the basis.
+7. **`q` is a native function** taking a query value; queries are data,
+   composable and storable. Macros are sugar only.
+8. **All Nextomic memory is arena-scoped per operation**; only results
+   are copied into the VM heap.
 
-The substrate is unusually well-matched. Several structural alignments
-that most "build a Datomic on X" projects lack from day one:
+---
 
-| Alignment | Where | Why it matters |
+## 2. Store layout
+
+Open with `emdb.EnvOptions{ .pageSize = 16384, .maxNamedTrees = 128 }`.
+Page size is fixed for the file's life (emdb INV-M05) and sets the
+4078-byte hard key bound; the Linux default would be 4K. All eleven
+trees are opened in one bootstrap write transaction at connect and their
+`TreeId`s cached for the connection's life (`treeNames` registration is
+not thread-safe; nothing else is).
+
+| tree | key | value |
 |---|---|---|
-| Snapshot isolation with lock-free readers | emdb `INV-T02`, `INV-T13` | A Datalog query opens a read tx at start and every clause sees the same basis — no phantom reads across joins |
-| Multiple independent B+ trees per file | emdb `INV-SUB01..06` | EAVT/AEVT/AVET/VAET/log/schema are separate named trees, atomically published by one meta-page flip |
-| Atomic multi-tree commit | emdb `INV-T07A`, `INV-M03` | Transact writes all index updates, the log append, and any schema change as a single atomic value |
-| Prefix-compressed branch pages | emdb `SPEC.md §5.0.2`, `INV-P03` | Composite EAVT keys share long prefixes across adjacent keys; a branch page stores one page-wide prefix, so fan-out rises and depth stays at three levels for millions of datoms. Leaf keys are stored whole: leaf compression was measured on datom keys and declined (`../emdb/PERFORMANCE.md` §6.27) |
-| Zero-copy mmap reads | emdb `API-KV01` | Inline and single-page overflow values point into mmap pages for the read tx's duration — no deserialization cost. A value spanning several overflow pages is assembled into a tx-owned buffer, so only txlog and schema values are ever affected |
-| Persistent collections with structural equality | nexis `PLAN.md §9`, §23 #36 | `(= (list 1 2 3) (vector 1 2 3))` — query result literals interoperate trivially |
-| Durable-ref as first-class value kind | nexis `PLAN.md §15.2`, §23 #7 | Identity bridge between runtime and storage already exists — reuse at the `(db/ref ...)` layer |
-| Explicit lexical transactions, no STM | nexis §15.3, §23 #6 | `(with-tx ...)` shape cleanly mirrors Datomic's transact boundary |
-| `as-of` as first-class in v1 | nexis §15.7, §23 #22 | Snapshot-as-value infrastructure is already committed; Nextomic reuses it |
-| Three-representation discipline | nexis §5, §23 #17 | Form ≠ Value ≠ Encoded — exactly the separation Datalog needs between query syntax, query plan, and datom storage |
-| Arena allocators for compile intermediates | nexis §10 | Query compilation produces many transient Forms and IR nodes; arena-freed at end of expansion |
+| `nx/eavt` | `[e:6][a:4][v]` | `[t:6]` + full payload for out-of-line values |
+| `nx/aevt` | `[a:4][e:6][v]` | `[t:6]` |
+| `nx/avet` | `[a:4][v][e:6]` | `[t:6]` (indexed and unique attrs only) |
+| `nx/vaet` | `[v:6][a:4][e:6]` | `[t:6]` (ref attrs only) |
+| `nx/eavt-h` | `[e:6][a:4][v][top:6]` | empty, or the full payload |
+| `nx/aevt-h` | `[a:4][e:6][v][top:6]` | empty |
+| `nx/avet-h` | `[a:4][v][e:6][top:6]` | empty (indexed and unique attrs only) |
+| `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
+| `nx/txlog` | `[t:6]` | codec vector `[instant [e a v added] ...]` |
+| `nx/idents` | `[0x00][utf8 text]` → id, `[0x01][id:4]` → text | |
+| `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"` | see §2.3 |
 
-None of these is a Nextomic-specific concession. They all already exist
-(or are frozen commitments) for independent v1 reasons.
+`top` = `(t << 1) | added`. `v` is always followed only by fixed-width
+fields, so it is `key[prefix .. len - suffix]` with no length byte.
 
----
+### 2.1 Identifiers
 
-## 2. Prior art
+All ids are unsigned 48-bit, stored big-endian in 6 bytes, and fit the
+VM's `fixnum` (i48).
 
-| System | Language | What we take | What we reject |
-|---|---|---|---|
-| **Datomic** (Hickey, 2012) | Clojure/JVM | Datom model `[e a v tx op]`, four covering indexes, database-as-value, Datalog+pull syntax, time as first-class, schema-as-datoms | Cloud-storage abstraction over DynamoDB/Cassandra (wrong shape for embedded); peer/transactor separation (single-process simpler for local-first) |
-| **Datahike** (replikativ, 2018+) | Clojure/JVM | Proof that Datomic semantics work on LMDB-class engines in open-source; API shape for embedded use | JVM heap cost per datom; deserialization-heavy read path |
-| **Datascript** (tonsky, 2015+) | ClojureScript | Datalog compiler techniques; in-memory representation ideas for query engine | In-memory-only constraint; host-language representation costs |
-| **XTDB** (JUXT, 2019+) | Clojure/JVM | Bitemporal potential; document-style datoms as an alternative to flat datoms | Log-native segment architecture (wrong shape for local-first B+ tree substrate) |
-| **Datalevin** (juji-io, 2020+) | Clojure/JVM | Pattern of "embedded Datalog over LMDB" — closest spiritual cousin to Nextomic | JVM layer still sits between query engine and LMDB |
-
-Nextomic's unique position: **pure-Zig, vertically integrated, mmap-native,
-single-process embedded, with the host language and database co-designed
-from the start.** No JVM, no deserialization, no host/engine impedance
-mismatch. This is a lane no existing Datomic-successor occupies.
-
----
-
-## 3. Architecture — frozen once scoped
-
-When Nextomic is scoped as an active project, the following six
-decisions become binding. Changing one requires an amendment to this
-document with stated rationale, in the same discipline as PLAN.md §23.
-
-### 3.1 Integer entity ids (not durable-refs)
-
-**Decision.** Entity ids (`eid`) are plain fixnums (i48 fits 140
-trillion entities — more than any realistic database). Attribute ids
-(`aid`) are `u32` keyword intern ids. Durable-refs remain the low-level
-handle type for the `nexis.db` API, but are **not** the Nextomic entity
-identity.
-
-**Why.** `durable-ref` is `{store-id: u128, tree-id: Keyword,
-key-bytes: []u8}` — heavy (~40+ bytes), and it encodes storage topology
-into identity. Letting entity ids be durable-refs would:
-
-- Bloat every EAVT/AEVT/AVET/VAET index key.
-- Force 40-byte compares and hashes during joins instead of 8-byte
-  integer compares.
-- Tie semantic identity to storage location, forbidding re-homing data.
-- Complicate tempid resolution, import/export, and cross-store
-  references.
-
-Fixnum eids:
-
-- Fit the 16-byte `Value` payload word with no heap allocation.
-- Compare/hash in a single machine instruction.
-- Match Datomic's eid semantics directly.
-- Interoperate with Nexis's existing tagged-value fast paths.
-
-**Three-layer identity model.** Nextomic exposes three identity
-concepts, cleanly separated:
-
-| Identity | Representation | Purpose |
+| partition | range | source |
 |---|---|---|
-| Entity id (`eid`) | `fixnum` | Semantic database identity; appears in every datom and index key |
-| Attribute id (`aid`) | `u32` keyword intern id | Compact attr in hot paths; keyword is the user-facing surface |
-| Lookup ref | `[:user/email "alice@x"]` vector literal | User-facing identity via unique attr; resolved by AVET scan at query time |
-| Durable-ref (pre-existing) | PLAN.md §15.2 triple | Lower-level `nexis.db` API only; NOT Nextomic's entity model |
+| attributes and idents | `1 .. 2^32-1` | `sys/"aid"`; an attribute entity's eid **is** its 4-byte `a` |
+| user entities | `2^32 .. 2^47-1` | `sys/"eid"` |
+| transaction entities | `2^47 \| t` | the logical `t` of the transaction |
 
-### 3.2 Internal Relation type (not persistent-set-of-persistent-vectors)
+`t` starts at 1 and increases by one per committed `transact!`. Because
+`t` lives in the same file as the datoms and commits with them, a crash
+or an engine-level rollback can never leave `t` ahead of the data.
 
-**Decision.** Nextomic owns a runtime-private `Relation` struct — a
-column-oriented container backed by existing `typed_vector` Value
-kinds. This is the execution representation. Query results are
-materialized to `persistent-set` of `persistent-vector` (or
-`vector-of-map` via pull) **only at the API boundary**.
+Keyword *values* (enums) are interned in `nx/idents` exactly like
+attributes and stored as 4-byte ids, so `:db/ident` refs and enum values
+are the same mechanism. They sort by id, not by text.
 
-**Why.** PLAN.md §15.11 currently says "persistent-set of
-persistent-vector — no impedance mismatch." That is true at the API
-boundary and false at every internal pipeline stage. A
-persistent-set-of-persistent-vector is:
+### 2.2 Sortable value encoding
 
-- Great for a 10-row answer a human sees.
-- Barely acceptable for a 10k-row materialized result.
-- Cache-hostile and allocation-heavy for a 1M-row intermediate relation
-  during a multi-way join.
+One tag byte orders types; within a type, byte order equals value order.
 
-Datascript demonstrates that generic-persistent-collections-all-the-way
-is **correct** and **slow**. Datomic's internals do not look like
-Datascript's internals for exactly this reason.
-
-**Relation shape.**
-
-```
-Relation {
-  arity:          u16                    // number of columns
-  row_count:      u64
-  var_to_col:     [Symbol → u16]         // map logical variables to column indices
-  columns:        [Column × arity]
-  sorted_by:      ?u16                   // optional: column index this is sorted by
-  unique_col:     ?u16                   // optional: column with uniqueness property
-}
-
-Column = union {
-  EidCol:       typed_vector<u64>        // entity ids
-  AidCol:       typed_vector<u32>        // attribute ids
-  TxCol:        typed_vector<u64>        // transaction ids
-  FixnumCol:    typed_vector<i64>        // integer values
-  FloatCol:     typed_vector<f64>        // floating-point values
-  BoolMask:     bitmap                   // booleans / op column
-  TaggedCol:    [Value]                  // heterogeneous scalar values
-  StringRefCol: [Value]                  // strings (Value payload points into mmap or heap)
-}
-```
-
-The three-representation boundary (PLAN.md §5) is preserved: `Relation`
-lives in Layer 2 (Runtime Value), never hits the codec in Layer 3.
-It is a runtime-private container, structurally analogous to
-`DirtyPageMap` inside emdb — a performance tool, not a user value.
-
-**Why this lane is winnable.** Nexis already has typed-vector as a
-frozen value kind with SIMD kernels in `nexis.simd`. Using it for
-relation columns is the single highest-leverage design decision
-Nextomic will make. It is the difference between "~2× slower than
-Datascript's JS" and "~5× faster than Datahike's JVM."
-
-### 3.3 Macro → IR → runtime-plan split
-
-**Decision.** Query compilation is split across three stages:
-
-| Stage | Done by | Artifact |
+| tag | type | bytes |
 |---|---|---|
-| **Parse-time (macro)** | `nexis.nextomic/q` as a macro | Query IR (a small, canonical data structure) — embedded as a literal constant in the caller's bytecode |
-| **Plan-time (runtime)** | `nexis.nextomic.planner/plan` called by the expanded macro body | Executable plan specialized to current schema + input bindings |
-| **Execute-time (runtime)** | `nexis.nextomic.exec/run` | Relation → materialized API result |
+| `0x02` / `0x03` | boolean false / true | none |
+| `0x10` | long | `i64 ^ 0x8000_0000_0000_0000`, big-endian |
+| `0x18` | double | IEEE bits `b`: sign set → `~b`, else `b ^ 0x8000…`; `-0.0` stored as `+0.0`; NaN rejected (`:nextomic/value-type`) |
+| `0x20` | instant | i64 milliseconds, encoded like long |
+| `0x30` | keyword | `[ident-id:4]` |
+| `0x40` | ref | `[eid:6]` |
+| `0x50` | string ≤ 96 bytes | UTF-8 with `0x00 → 0x00 0xFF`, terminated by `0x00` |
+| `0x51` | string > 96 bytes | first 64 escaped bytes, `0x00`, then `xxh3-128` of the whole string |
+| `0x60` | uuid | 16 bytes |
+| `0x70` / `0x71` | bytes | as string / long string |
 
-**Why not entirely in macros.** Macros only see syntax at expansion
-time. Datalog planning is partly static, partly dynamic:
+String order is UTF-8 byte order, which is code point order, not
+UTF-16 order; no Unicode normalization is applied. Type tags never
+compare equal across types, so `1` and `1.0` are different keys, in
+line with `(= 1 1.0)` being false.
 
-- Schema (indexed / unique / ref / cardinality per attr) is a runtime
-  value.
-- Which `?vars` are bound at call time affects plan choice.
-- Selectivity hints evolve with the data.
-- Rules can be assembled dynamically; queries can be passed as values.
+**Out-of-line values** (`0x51`, `0x71`): the index key is an equality
+key, not an order key. Range predicates over long strings are correct
+only on the 64-byte prefix and are refused by the planner
+(`:nextomic/unsupported-range`). The full value is stored in the
+`nx/eavt` value after the 6-byte `t` (and in `nx/eavt-h`); an AVET or
+AEVT hit on a long value is confirmed by an EAVT point read before it is
+returned. Two distinct values with the same 64-byte prefix and the same
+128-bit hash under one `(e a)` are treated as one value; the probability
+is 2^-128 and the rule is documented rather than defended against.
 
-**Why not entirely at runtime.** Parse-time work lets Nextomic do
-things no existing Datalog implementation does cleanly:
+Worst-case key: AVET with a 96-byte string, `4 + 1 + 193 + 6 + 6 = 210`
+bytes, inside emdb's 256-byte search-clue buffer.
 
-- Clause-shape validation with source spans (`Form.origin`, PLAN.md §5).
-- Rewrite lookup refs into explicit AVET probes.
-- Detect constant-only clauses and lift them.
-- Emit IR as a literal constant — zero parsing cost per query
-  invocation, even on cold cache.
-- Compiler-visible variable slots for the execution engine.
+### 2.3 `sys` tree
 
-**Why macros are genuinely leverage.** `(d/q '[:find ?e ...] db)` IS a
-nexis Form. Nexis macros receive `&form` and `&env` (PLAN.md §23 #34).
-Clojure-on-JVM Datalog libraries cannot do this cleanly because their
-reader/compiler boundary is different. In nexis this is native.
-
-**Concrete macro sketch.**
-
-```clojure
-(defmacro q [query db & inputs]
-  (let [qir (nextomic.compile/compile-query &form query)]
-    ;; `qir` becomes a literal constant embedded in the caller's bytecode.
-    `(nextomic.run ~qir ~db ~@inputs)))
-```
-
-### 3.4 tx-in-key for history (not snapshot pinning)
-
-**Decision.** Historical query semantics (`as-of`, `since`, `history`)
-are answered by range filtering on the `tx` component of composite
-index keys. Datoms are stored append-only; retraction is a new datom
-with `op = false`. emdb's native snapshot pinning is operational — used
-only when the user explicitly asks for a long-lived reproducible
-reference (debug sessions, external consistency across many API calls).
-
-**Why.** Datomic semantics require history as data, not as page
-retention. A `as-of T` database value is defined by "the datoms
-asserted by transactions ≤ T." That is a pure range filter in tx-in-key
-indexes — no storage-layer snapshot needed.
-
-**Two consequences:**
-
-- **Consistency of one query** still requires a read tx held for the
-  query's duration (so cursors on different indexes see the same emdb
-  snapshot). This is the operational snapshot — short-lived, always
-  released.
-- **Historical correctness** comes from the datom history itself, which
-  never disappears. emdb's free-list reclamation continues to operate
-  on pages because the *current* indexes' pages that were superseded
-  can be freed — the datoms those pages held are still referenced by
-  the tx-in-key history rows in the current indexes.
-
-**Why this is a better answer than snapshot pinning.** Long-lived
-pinned snapshots in emdb prevent page reclamation and grow the file
-without bound. PLAN.md §15.7 flags this honestly. Routing history
-through tx-in-key eliminates the cost almost entirely — pinning is
-reserved for the narrow case where the user genuinely needs it.
-
-### 3.5 Datom as a heap kind (user-facing projection only)
-
-**Decision.** Add `datom` as a new heap `Kind` in `src/value.zig`.
-Reserves one slot in the 30..63 range Nexis already has open for heap
-kinds. A datom value has five accessors: `.e`, `.a`, `.v`, `.tx`, `.added?`.
-
-**Why a heap kind, not a vector of five Values.** For user-facing
-projection only — cheaper accessors, nicer print representation,
-identity equality semantics, avoidance of allocating a tiny
-persistent-vector per emitted datom. The execution engine does NOT use
-this type; it works on `Relation` columns (§3.2).
-
-**Serialization.** The datom heap kind serializes by projecting its
-five fields through the existing §15.10 codec matrix — all five of
-`eid: fixnum`, `aid: keyword`, `v: various`, `tx: fixnum`, `op: bool`
-are already serializable. **The §15.10 codec matrix does NOT need to
-be extended.** No PLAN.md amendment required.
-
-### 3.6 Storage layout — one named sub-DB per concern
-
-**Decision.** Nextomic uses emdb named sub-databases (`maxNamedTrees`)
-for all storage. Default `maxNamedTrees = 128` in emdb's `EnvOptions`
-is >10× what Nextomic needs.
-
-| Named tree | Key | Value | Purpose |
-|---|---|---|---|
-| `:nextomic/txlog` | `tx:be-u64` | encoded `[datom+]` | Canonical append-only source of truth |
-| `:nextomic/eavt` | `[e:be-u64][a:be-u32][v:sortable][tx:be-u64][op:u8]` | empty | Entity-centric scans |
-| `:nextomic/aevt` | `[a:be-u32][e:be-u64][v:sortable][tx:be-u64][op:u8]` | empty | Attribute-scan |
-| `:nextomic/avet` | `[a:be-u32][v:sortable][e:be-u64][tx:be-u64][op:u8]` | empty | Value lookup (indexed / unique attrs only) |
-| `:nextomic/vaet` | `[v-ref:be-u64][a:be-u32][e:be-u64][tx:be-u64][op:u8]` | empty | Reverse refs (ref-valued attrs only) |
-| `:nextomic/schema` | `a:be-u32` | encoded schema map | Per-attr `:db/valueType`, cardinality, uniqueness, ref? |
-| `:nextomic/idents` | `keyword-text` | `aid:be-u32` | Keyword → attr-id resolution |
-| `:nextomic/sys` | `"eid-seq"` | `last-eid:be-u64` | Monotonic entity id allocator |
-
-Keys are binary-sortable byte strings — emdb's default SIMD unsigned-lex
-comparator is exactly the ordering Nextomic requires. The
-`v:sortable` encoding includes a 1-byte type tag so numeric values sort
-numerically and strings sort lexicographically within their type.
-
-**Index values are empty.** In EAVT/AEVT/AVET/VAET, the key *is* the
-datom — no separate value is needed. Leaf density comes from that: a
-datom costs its key bytes plus a 10-byte node overhead and nothing else.
-Two encoding levers return more than any engine change would: a 6-byte
-entity, 2-byte attribute and 6-byte tx with `op` folded in (7 of the 33
-key bytes above), and sorting a transaction's AVET/VAET inserts before
-writing them (leaf fill 0.66-0.72 → 0.90).
-
-**Write path.** A single `transact!` opens one emdb write tx, updates
-all relevant indexes + the txlog + any schema changes, and commits
-once. Named-tree roots commit together in one meta-page publish
-(`INV-SUB04`, `INV-M03`), so cross-index atomicity comes for free.
-
----
-
-## 4. Three-representation boundary — what stays where
-
-PLAN.md §5 is unchanged and unchallenged. Nextomic fits cleanly:
-
-| Layer | Contains (Nextomic) |
+| key | value |
 |---|---|
-| **Form** (Layer 1) | Query literal `'[:find ?e :where ...]`, rule definitions, `transact!` data vectors, schema declarations. Macros see Forms. Source spans drive diagnostics. |
-| **Runtime Value** (Layer 2) | db-value (`{conn, basis-tx}`), snapshot (`{conn, tx-id}`), Query IR, runtime plan, `Relation`, variable bindings, result tuples, datom projections. Nothing here hits the codec. |
-| **Durable Encoded** (Layer 3) | Datom bytes in `eavt`/`aevt`/`avet`/`vaet`, tx-log entries in `txlog`, schema entries in `schema`. Only via the §15.10 codec. |
+| `"format"` | u16 Nextomic format number (1) |
+| `"uuid"` | 16 random bytes minted at bootstrap: the store id, stable across renames |
+| `"t"` | u48 last committed logical transaction number |
+| `"eid"` | u48 next user entity id |
+| `"aid"` | u32 next attribute / ident id |
 
-**Rules and queries as data** round-trip through the codec because
-they are just nested collections of keywords, symbols, numbers, strings,
-and vectors — every kind in the §15.10 serializable matrix. A user can
-persist a named query, load it later, and run it. **Compiled query
-plans do NOT round-trip and shouldn't.** That would fuse layers 2 and
-3, which §5 forbids.
+### 2.4 Bootstrap
 
----
-
-## 5. Query compilation pipeline
-
-End-to-end flow for `(d/q '[:find ?name :where [?e :user/name ?name]] db)`:
-
-```
-1. READ
-   nexis.grammar parses source → Sexp → Form
-   The quoted query literal is a Form datum — a vector containing
-   keywords, symbols, other vectors. Carries source spans.
-
-2. MACRO EXPANSION (parse-time, once per call site)
-   nexis.nextomic/q receives (&form, &env, query-form, db-expr, *inputs)
-   Calls nexis.nextomic.compile/compile-query on the query Form:
-   - Validates clause shape (errors with source span if malformed)
-   - Normalizes clauses (rewrites lookup refs, constants, predicates)
-   - Allocates variable slots
-   - Emits Query IR: a canonical small struct
-   Expands to:
-     (nexis.nextomic/run <IR-literal> db inputs...)
-   IR is embedded as a bytecode literal-pool entry — no re-parsing cost.
-
-3. PLAN (runtime, may be cached per (IR-hash, schema-basis, input-shape))
-   nexis.nextomic.planner/plan takes the IR + current db schema + bound
-   inputs:
-   - Orders clauses by estimated selectivity
-   - Chooses which index drives each clause (EAVT/AEVT/AVET/VAET)
-   - Plans join order and join types
-   - Emits executable plan
-
-4. EXECUTE (runtime)
-   nexis.nextomic.exec/run iterates the plan:
-   - Opens one emdb read tx for query duration
-   - Drives emdb cursors on chosen indexes
-   - Builds/merges Relations column-wise
-   - Evaluates predicates on typed columns where possible
-   - Final projection to the :find shape
-
-5. MATERIALIZE (runtime)
-   Convert execution Relation → API shape
-   (persistent-set of persistent-vector by default)
-
-6. RETURN to user
-```
-
-**Cold-query cost.** ~0 macro cost at call time (IR is a literal),
-planner runs once, executor traverses mmap'd pages. A query whose
-scan plan hits warm pages can complete in a few μs. This is the regime
-where Nextomic can outperform Datomic-on-JVM by orders of magnitude on
-cold startup specifically — no class loading, no JIT warmup, no JDBC
-round-trip.
+The first open writes, with fixed ids so files from different builds
+agree: the attributes `:db/ident`, `:db/valueType`, `:db/cardinality`,
+`:db/unique`, `:db/index`, `:db/isComponent`, `:db/doc`,
+`:db/txInstant`, and the idents `:db.type/{long double instant keyword
+ref string uuid bytes boolean}`, `:db.cardinality/{one many}`,
+`:db.unique/{identity value}`. Bootstrap is transaction `t = 1`.
 
 ---
 
-## 6. Schema
+## 3. Transactions
 
-Schema is the second-biggest Nextomic risk after query engine
-representation. PLAN.md §15.11 does not address schema; this section
-does.
+One `transact!` is one emdb write transaction. The VM is single-threaded,
+so there is no queue; emdb's write lock is the transactor.
 
-### 6.1 Schema as datoms
+1. `wtxn = env.beginWriteWith(.{ .sync = opt })`; `t = sys["t"] + 1`.
+2. **Normalise** tx-data to `[op e a v]`. Entities may be an eid, a
+   tempid (string, or a negative fixnum), a lookup ref `[:unique/attr v]`,
+   a keyword ident, or `"datomic.tx"` for the transaction entity. Map
+   forms `{:db/id e :attr v ...}` expand; nested maps under component or
+   ref attributes become entities with fresh tempids; vectors under
+   card-many attributes expand to one datom each.
+3. **Resolve** attributes through the ident cache (unknown →
+   `:nextomic/unknown-attribute`); validate each `v` against the
+   attribute's `:db/valueType`; mint ident ids for new keyword values
+   inside `wtxn`. Resolve lookup refs and unique-identity tempids by an
+   AVET probe **through `wtxn`** so datoms earlier in the same
+   transaction are visible. A unique-value collision with a different
+   entity is `:nextomic/unique`. Remaining tempids take eids from
+   `sys/"eid"`, read once and bumped once.
+4. **Expand**: a card-one assertion whose current value differs writes
+   the retraction of the old value and the assertion of the new one in
+   this `t`; asserting an already-current datom writes nothing; two
+   different card-one values for one `(e a)` in one transaction, or an
+   assertion and a retraction of the same datom in one transaction, are
+   `:nextomic/conflict`. `[:db/retract e a]` retracts every current value
+   of `a`. `[:db/retractEntity e]` retracts every current `(e a v)` from
+   an EAVT `[e]` scan plus every current `(e' a' e)` from a VAET `[e]`
+   scan, recursively through component attributes.
+5. **Write**: for each assertion, put into the current trees (value
+   `[t]`, plus the payload in `nx/eavt` for out-of-line values) and
+   append `[.. top]` with `added = 1` to the history trees; for each
+   retraction, delete from the current trees and append `added = 0` to
+   the history trees. EAVT first in key order (append-biased splits),
+   then AEVT, then AVET and VAET after sorting the batch (better leaf
+   fill for random-order keys). Then `nx/txlog[t]`, then `sys` counters
+   including `"t"`.
+6. Append `[tx-entity :db/txInstant now]` as a datom of this transaction.
+7. `wtxn.commit()`. On any error `wtxn.abort()`: nothing partial can
+   exist (emdb INV-SUB04).
+8. Return `{:db-before db :db-after db :tx t :tempids {..} :tx-data
+   [[e a v t added] ...]}` with `db-after.basis = t`.
 
-Following Datomic: the schema for attribute `:user/name` is itself a
-set of datoms on an entity representing that attribute, with
-meta-attributes like `:db/valueType`, `:db/cardinality`, `:db/unique`,
-`:db/index`, `:db/isComponent`.
+Schema changes are ordinary transactions on attribute entities. In v1
+schema is additive: an attribute's value type and cardinality never
+change once written; `:db/index` and `:db/unique` may be added to an
+attribute (the transaction that adds them backfills AVET from AEVT).
 
-### 6.2 Attributes the planner needs at runtime
+**Sync mode.** `:full` (default) syncs data and meta; `:no-meta`
+batches the meta flush; `:none` is for bulk loads followed by
+`(d/sync conn)`. A fully durable commit is two device flushes.
 
-| Attr meta | Values | Why the planner needs it |
+---
+
+## 4. Db-values and time
+
+`(d/db conn)` opens a pooled read transaction, reads `sys["t"]` as the
+basis, closes it, and returns `{store, basis, mode = current}`.
+
+Every operation on a db-value opens one read transaction, reads
+`sys["t"]` as `now`, and:
+
+- **current mode**, `now == basis`: current trees, no fold. The common
+  case: the program has not transacted since taking the db.
+- **current mode**, `now > basis`: history trees with the as-of fold at
+  `basis`. Correct, slower, and only reachable when the program itself
+  transacts between taking a db and using it.
+- `now < basis`: `:nextomic/basis-in-future`. Only possible after an
+  engine-level rollback of the file; the db-value is dead.
+- **as-of T**: history trees, fold over `top` with `t ≤ T`.
+- **since T**: history trees, fold over `T < t ≤ basis`, from an empty
+  state: an entity asserted before T and untouched since is invisible;
+  a fact retracted after T shows nothing.
+- **history**: history trees, every datom with `t ≤ basis`, no fold,
+  each with its `added` flag. `history ∘ as-of` composes.
+
+**The fold.** Walk from `setRange(prefix)` while the key carries the
+prefix; consecutive keys with equal `(e a v)` form a group in ascending
+`t`; keep the last `added` among datoms inside the window; on group end
+emit the group's newest kept datom iff its `added` is 1.
+
+**Schema as-of.** `Schema` is built from the attribute partition's
+datoms with `t ≤ basis`, cached per `(store, basis)`; since schema is
+additive, a cache built at a later basis is a superset and may serve an
+earlier one for attributes that existed then.
+
+The txlog is the change feed: `(d/tx-range conn from to)` scans
+`nx/txlog` by `t`.
+
+---
+
+## 5. Query pipeline
+
+`q` is a native. Input is a query value (vector or map form) plus the
+db and inputs.
+
+**Parse** → IR `{find, in, where, rules}` with a symbol table; clause
+errors carry the clause index and sub-form (`:nextomic/query-syntax`).
+Constants in data patterns are pre-encoded to their sortable bytes;
+lookup refs and idents in constant positions resolve against the db. The
+IR is cached per query value (pointer identity of literal-pool constants
+first, structural hash second) and per schema basis.
+
+**Plan** → ordered steps. Index choice by what is bound when the clause
+runs:
+
+| bound | index | cost estimate |
 |---|---|---|
-| `:db/valueType` | `:db.type/string`, `:db.type/long`, `:db.type/ref`, `:db.type/keyword`, `:db.type/boolean`, `:db.type/float`, `:db.type/instant`, `:db.type/uuid`, `:db.type/bytes` | Determines the binary-sortable encoding used for `v` in keys |
-| `:db/cardinality` | `:db.cardinality/one` or `:db.cardinality/many` | Retraction and uniqueness semantics |
-| `:db/unique` | `nil`, `:db.unique/identity`, `:db.unique/value` | Drives lookup-ref resolution; enforces uniqueness on assertion |
-| `:db/index` | `true` or `false` | Controls whether AVET is populated for this attr |
-| `:db/isComponent` | `true` or `false` | Influences retraction cascade and pull traversal |
-| `:db/doc` | string | Diagnostics; not performance-critical |
+| `e` | EAVT `[e][a?]` | attributes per entity |
+| `a` + `v`, unique | AVET `[a][v]` | 1 |
+| `a` + `v`, indexed | AVET `[a][v]` | entries / distinct values |
+| `a` + `v`, not indexed | AEVT `[a]` + filter | entries of `a` |
+| `v` ref, `a` optional | VAET `[v][a?]` | small |
+| `a` only | AEVT `[a]` | entries of `a` |
+| nothing | refused (`:nextomic/unbound-pattern`) | |
 
-### 6.3 Bootstrap
+Clauses are ordered greedily by estimate given the variables bound so
+far; predicates run at the first point all their variables are bound.
+Join per step: index nested loop (seek per row) when `rows × log n` is
+below the scan estimate, otherwise a hash join on the shared variables.
+Estimates come from `treeStat` and per-attribute counts kept in
+`Schema`.
 
-The schema-for-schema is bootstrapped on database creation — the small
-set of attributes describing attributes themselves is written as datoms
-in the first transaction. All subsequent schema modifications are just
-transactions that assert more schema datoms.
+**Execute** over one read transaction for the whole query (one snapshot
+for every cursor, emdb INV-T02). Scans drive `openCursorForTree` +
+`setRange` with the §4 fold inline; constants in the prefix narrow the
+seek, constants after an unbound position filter. Built-in predicates
+(`< <= > >= = not= missing?`, later `ground tuple untuple get-else`) are
+Zig over `Value`. Any other symbol resolves through the namespace
+registry and is called with `vm.callValue`; `ControlTransferred` aborts
+the query and propagates after the read transaction is closed.
 
-### 6.4 The planner reads schema at plan-time, not at every query
+**Relation** is a Zig-private columnar struct in the query arena
+(`vars`, typed columns for eids and longs, a `Value` column otherwise);
+never a VM value. Results are copied into the VM heap as a persistent
+set of vectors (or the `.`, `[...]`, `[[...]]` find specs).
 
-The `Schema` value is cached in the db-value at the time it is
-captured. A query planning against that db-value sees schema as of
-that basis-tx. Plan cache keys include a schema-hash so re-planning
-occurs on schema change.
+**Rules.** `:in $ %` binds a rule set. Non-recursive rules inline as
+sub-plans (cached per binding signature). Recursive rules run
+semi-naive: `total = base bodies; delta = total; repeat { new = ∪ bodies
+with one recursive call bound to delta, others to total, minus total;
+total ∪= new; delta = new } until delta is empty`. `not`/`not-join` are
+anti-joins on the shared variables; `or`/`or-join` are unions of
+sub-plans with the same output variables.
 
 ---
 
-## 7. What emdb does NOT need to change
+## 6. Lisp API (`nextomic` namespace, conventionally `d`)
 
-**Nothing. Zero changes.** The full rationale is in `../emdb/NEXTOMIC.md`.
-
-One affordance *already exists* and is all that Nextomic will ever ask:
-
-- Stamp a db-value's `basis-tx` from the `txnId` of the read transaction
-  the db-value lives in (`Txn.txnId`, `../emdb/src/txn.zig`). It is the
-  snapshot the query actually reads. `Env.info().lastTxnId` reports the
-  same number outside any transaction but can lag a commit from another
-  process, so it must not be the source. A datom's `tx` is the
-  committing write transaction's `txnId`, so a basis compares directly
-  against every datom with no translation table.
-
-Engine facts that bound the key design (details in
-`../emdb/NEXTOMIC.md` §5): index keys must stay under the 256-byte
-search-clue buffer (a string `v` is a capped prefix plus a hash, the
-full string lives in the txlog value) and under the 4078-byte hard bound
-at 16K pages; open the file with `pageSize = 16384` explicitly (the
-Linux default is 4K, and page size is fixed for the file's life); open
-all eight trees once at connect before any worker thread runs; state
-the sync mode, since a fully durable commit is two device flushes.
-
-Temptations to refuse if they arise during Nextomic implementation —
-each has a correct Nexis-side answer:
-
-| Temptation | Nexis-side answer |
+| form | semantics |
 |---|---|
-| Add a typed key comparator to emdb | Encode types into key bytes so default lex-sort matches value-sort |
-| Add "read at arbitrary historical txn_id" to emdb | Route history through tx-in-key filtering (§3.4) |
-| Add record/tuple awareness to emdb | Encode datoms into byte keys; emdb sees only bytes |
-| Add Nextomic-specific APIs to emdb | Compose existing emdb primitives (named trees, cursors, range scans, prefix deletes, read txns) on the Nexis side |
-| Turn `CommitObserver` into a change feed | The txlog is a named tree committed with the indexes; a change feed is a scan of it from `basis + 1` |
-| Ask for concurrent writers | Queue `transact!` calls on the Nexis side and batch them into one write tx |
-| Widen the clue buffer or key bound for long values | Long strings live in the txlog value; index keys carry a capped prefix plus a hash |
+| `(d/connect path)` / `(d/connect path {:sync ...})` | open or create, bootstrap on first open, cache idents and schema; returns a connection |
+| `(d/release conn)` | close, idempotent |
+| `(d/db conn)` | db-value at the current basis |
+| `(d/basis-t db)` | the basis |
+| `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report |
+| `(d/entity db e)` | eager map `{:db/id e :attr v ...}`, card-many as sets, refs as eids |
+| `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
+| `(d/datoms db :eavt e a v)` (index and optional prefix components) | vector of `[e a v t added]` after the fold |
+| `(d/q query db & inputs)` | §5; `:find`, `:in $ ?x [?x ...] [[?x ?y]] %`, `:where` |
+| `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4) |
+| `(d/tx-range conn from to)` | vector of `{:t t :data [...]}` |
+| `(d/schema db)` | map ident → attribute map |
+| `(d/pull db pattern e)` / `(d/pull-many db pattern es)` | `*`, attribute lists, `{:ref [...]}`, reverse `:_attr`, `:limit`, component recursion |
+| `(d/with conn tx-data (fn [db-after report] ...))` | speculative transaction: applied in a write transaction, `db-after` reads through `beginReadChild`, aborted at scope exit; holds the write lock for the scope |
+| `(d/sync conn)` | `Env.sync()` after `:none` loads |
 
-The default answer to each is no — and the architectural discipline
-that produced this document is the reason why.
+Schema install is `transact!` of attribute entities: `{:db/ident
+:user/email :db/valueType :db.type/string :db/cardinality
+:db.cardinality/one :db/unique :db.unique/identity :db/index true}`.
 
----
-
-## 8. What em does NOT need to change
-
-**Nothing. Zero changes.** em is prior art, not a runtime dependency.
-Nexis reuses em's ideas (64-bit bytecode ISA shape, tail-call
-dispatcher pattern, slot/register VM, routine cache format) by
-re-implementing them in its own codebase. em does not appear as a
-`build.zig.zon` dependency of nexis.
-
----
-
-## 9. Where Nextomic can actually win
-
-Not every workload. But in specific lanes, the stack has structural
-advantages that neither Datomic nor Datahike can replicate:
-
-| Workload | Why Nextomic wins | Expected advantage (aspirational) |
-|---|---|---|
-| Cold-start embedded query | mmap'd `.nx.o` + emdb open in <10ms vs JVM class-loading + Datahike init in hundreds of ms | 10–50× on end-to-end first-result latency |
-| Zero-copy large-string read | emdb overflow pages + Nexis `string` Value payload points into mmap | 10–50× on large-blob reads |
-| Historical range scan (tx-in-key) | SIMD-accelerated cursor over composite EAVT keys with single-prefix branch pages | 3–10× on history traversal |
-| Numeric analytical aggregation over a Relation | `typed-vector` columns + `nexis.simd` kernels; approaches ~40 GFLOPS per core on f64 | Orders of magnitude over Datahike/Datascript. **No managed-runtime Datomic-successor can compete in this lane.** |
-| REPL-driven query development | Macroexpand the query and see exactly what IR it produces; sub-millisecond round-trip | Qualitative: interactive experience Clojure cannot match on JVM |
-
-**Natural lane.** Embedded / single-node / local-first / read-mostly.
-Enormous 2026 demand (local-first apps, on-device AI agents with
-memory, developer tooling, CLI-embedded knowledge graphs) with no
-dominant player.
-
-Where Nextomic will NOT win v1, and should not try:
-
-- Distributed deployment. Datomic peer/transactor split exists for
-  reasons Nextomic does not yet address.
-- Advanced query optimization. Datomic's decade of planner work is
-  real. Nextomic ships a simple-but-correct planner first; any
-  competitive optimizer is v2+.
-- Write-heavy transactional OLTP. emdb is single-writer; that is a
-  feature for consistency, a limit for write-scale.
+Later: transaction functions, `:db.fn/cas`, excision, lazy entities,
+full-text, a datom heap kind.
 
 ---
 
-## 10. Implementation estimate
+## 7. Errors
 
-PLAN.md §15.11 estimates ~4–5k LOC. This document's finer-grained
-breakdown, reflecting the architecture above:
-
-| Module | LOC estimate | Notes |
-|---|---|---|
-| Datom encoding + five named trees + tx-log | 1,500 | Direct emdb usage; binary-sortable key encoders |
-| Schema + unique/indexed/ref attr handling | 800 | Revised up from PLAN.md's 500 — schema is underscoped there |
-| Internal `Relation` type + column kernels | 600 | New; builds on existing `typed_vector` |
-| Query compiler (macro → IR) | 500 | Parse-time validation, normalization, slot allocation |
-| Runtime planner (IR → plan) | 800 | Selectivity heuristics; index choice; join ordering |
-| Executor + cursor drivers | 900 | Opens read tx, drives emdb cursors, builds Relations |
-| Pull syntax | 500 | Entity graph expansion |
-| Temporal ops (`as-of`, `since`, `history`) | 300 | Mostly riding on §15.7; composition |
-| Datom heap kind + 5 accessors | 200 | `src/value.zig` addition, one new slot in Kind enum |
-| **Total** | **~6,100** | Up from 4–5k once schema and Relation costs are honest |
-
-All of this is nexis-side code. Zero lines in `../emdb/` or `../em/`.
+All errors are keywords in the `nextomic` namespace and are catchable:
+`:nextomic/unknown-attribute`, `:nextomic/value-type`,
+`:nextomic/unique`, `:nextomic/conflict`, `:nextomic/no-entity`,
+`:nextomic/query-syntax`, `:nextomic/unbound-pattern`,
+`:nextomic/unsupported-range`, `:nextomic/basis-in-future`,
+`:nextomic/closed`. Engine errors surface as the `db.zig` keyword set
+(`:db/key-too-large`, `:db/map-full`, `:db/corrupted`, ...).
 
 ---
 
-## 11. Risk register
+## 8. Module layout
 
-| # | Risk | Likelihood | Impact | Mitigation |
-|---|---|---|---|---|
-| N1 | Generic execution representation (falling back to persistent-set-of-persistent-vector internally) | **High** | **Severe** — this is the difference between "great" and "works" | Commit to `Relation` type §3.2 before first planner code lands |
-| N2 | Schema machinery underdesigned | High | Severe | §6 of this doc; amend before first `transact!` lands |
-| N3 | Query planner stays "simple nested-loop forever" | Medium | Moderate | Ship a minimal planner first; invest in selectivity heuristics once real workloads exist |
-| N4 | Someone tries to extend emdb with Nextomic-specific APIs | Medium | Severe | `../emdb/NEXTOMIC.md` §6 names the temptations to refuse |
-| N5 | Someone tries to extend the §15.10 codec matrix to handle query plans | Low | Moderate | §5 three-representation discipline; codec amendment requires PLAN.md change |
-| N6 | `as-of` leaning on emdb snapshot pinning instead of tx-in-key | Medium | Moderate | §3.4 is explicit; pinning is operational only |
-| N7 | Write amplification under long-running append-only history in B+ tree pages | Low | Moderate | Honest documentation; history-compaction strategy is a v2 concern |
-| N8 | "Nextomic" name survives to ship | Low | Low | PLAN.md §15.11 already notes the shipped library will have a cleaner name |
+```
+src/nextomic/
+  root.zig       module root; re-exports
+  key.zig        sortable encodings, index key pack/unpack, prefix successor
+  datom.zig      Datom, txlog entry codec
+  store.zig      Env ownership, 11 TreeIds, bootstrap, sys counters, raw put/del/scan
+  idents.zig     durable keyword <-> id, per-connection cache
+  schema.zig     Schema from attribute datoms as-of a basis, per-attribute counts
+  transact.zig   §3
+  db.zig         DbValue, fold, datoms, entity, entid/ident, tx-range
+  relation.zig   columnar Relation
+  query/ir.zig  query/parse.zig  query/plan.zig  query/exec.zig  query/rules.zig
+  pull.zig
+  natives.zig    nextomic/* NativeFn table, marshalling, error mapping, installNextomic
+stdlib/nextomic.nx   sugar only (with-conn)
+test/prop/nextomic_key.zig     order(enc a, enc b) == cmp(a, b) per type
+test/prop/nextomic_tx.zig      random transactions vs an in-memory model, every basis
+test/integration/nextomic_q.zig  query corpus vs a naive evaluator
+test/nextomic/*.nx             end-to-end scripts
+```
 
----
-
-## 12. Pre-scope checklist
-
-Before writing any Nextomic code, this needs to be in place:
-
-- [ ] `PLAN.md` §15.11 amended to reference this document and to
-      record the §3 frozen-once-scoped decisions inline.
-- [ ] `src/value.zig` `Kind` enum has a reserved slot and comment
-      for `datom` (does not require implementation at reservation
-      time).
-- [ ] `build.zig.zon` pins a specific `emdb` version (PLAN.md §25
-      risk #7 — Nextomic makes this risk real).
-- [ ] `docs/CODEC.md` audited: confirm no Nextomic-specific entries
-      are needed. Datoms serialize via projection to existing kinds.
-- [ ] Throwaway branch: 500 LOC nested-loop-join Nextomic prototype
-      to smoke-test the macro → emdb-cursor path end-to-end before
-      committing to the full architecture.
+`nextomic` is one build module above `dispatch` and `vm`, imported by
+`stdlib` and `cli` only. Value kinds: `nextomic_conn`, `nextomic_db`
+(pointer payloads like `db_connection`). Nextomic never uses the
+`db/*` layer's per-operation tree opens or codec-encoded keys; it holds
+raw `*emdb.Txn` handles and byte keys, and uses `db.Connection` only for
+the `Env`.
 
 ---
 
-## 13. Bottom line
+## 9. Runtime prerequisites
 
-> **Nexis + emdb is the right foundation for Nextomic — genuinely, not
-> rhetorically — and it can ship as a serious 2026+-class embedded
-> Datomic successor if and only if the four commitments in §1 are
-> followed without compromise.**
-
-The seven years of emdb-style B+ tree discipline and the em-shaped VM
-ISA are already load-bearing exactly where Nextomic needs them. The
-only risk is wasting that substrate by letting the query engine stay
-"Lisp-pure" instead of making it brutally specialized where it counts.
+- **Page size pinned** and the `db.zig` double free fixed (blocking; the
+  seam work).
+- **VM stack invariant on nested calls** (blocking for user-function
+  predicates and transaction functions; built-in predicates need
+  nothing).
+- **GC**: not blocking. Every Nextomic operation allocates in its own
+  arena and copies only results into the VM heap. Wiring the collector
+  bounds process lifetime, not correctness.
+- **Number tower**: blocking only for double predicates and aggregates.
+  Doubles are storable from the start.
 
 ---
 
-*Document version: 1.0 — Produced 2026-04-19 after two-round peer-AI
-architectural review. Companion to `PLAN.md` §15.11. For the
-corresponding emdb-side notes, see `../emdb/NEXTOMIC.md`.*
+## 10. Where Nextomic wins, and where it does not
+
+Wins, by construction: sub-10 ms open; reads straight off the mapping
+with no deserialization; empty-value index leaves; history as a range
+filter; one file, one process, backup by transaction number. Measured
+claims wait for the benchmark suite; nothing in this document asserts a
+multiplier.
+
+Not in scope: distribution (Datomic's peer/transactor split), a
+cost-based optimizer beyond greedy selectivity, write-heavy OLTP beyond
+one writer.
+
+---
+
+## 11. emdb: nothing required
+
+Two wishes noted and worked around, so that the engine stays untouched:
+
+1. A transaction id accessor: the public `Txn.txnId` field is not used;
+   Nextomic's own `t` is read from `sys` inside the same snapshot.
+2. Full multi-page overflow values off a cursor (cursors clamp to one
+   page): index trees carry only `[t]` in current trees and nothing in
+   history trees; out-of-line payloads and txlog entries are read with
+   `Txn.getFromTree` on the exact key, which assembles every page.
