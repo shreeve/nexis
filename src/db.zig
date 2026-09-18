@@ -358,6 +358,29 @@ pub fn get(
     return null;
 }
 
+/// Bytes of value an emdb cursor shows from one page. A cursor
+/// entry whose value is at least this long may continue on further
+/// overflow pages; `cursorValue` fetches the rest.
+pub fn cursorPageBytes(conn: *Connection) u32 {
+    return emdb.page.PageHeader.usableSize(conn.env.info().pageSize);
+}
+
+/// The complete value of a cursor entry. A cursor exposes at most
+/// the first page of an overflow value, so when the visible slice
+/// fills a page (`page_bytes` from `cursorPageBytes`) the entry is
+/// re-read through the tree, which assembles every page. Accepts
+/// `*WriteTxn` or `*ReadTxn`. The result is valid until the next
+/// multi-page read on the same transaction.
+pub fn cursorValue(
+    txn: anytype,
+    tree_id: emdb.TreeId,
+    kv: emdb.Cursor.KeyValue,
+    page_bytes: u32,
+) ![]const u8 {
+    if (kv.value.len < page_bytes) return kv.value;
+    return (try txn.inner.getFromTree(tree_id, kv.key)) orelse kv.value;
+}
+
 pub fn del(
     txn: *WriteTxn,
     tree_name: []const u8,
@@ -850,6 +873,56 @@ test "treeId: a tree created by an aborted transaction reads as empty afterwards
         defer abortWrite(&wtxn);
         try testing.expect(!(try del(&wtxn, "scratch", "k")));
     }
+}
+
+test "cursorValue: a value spanning several overflow pages comes back whole" {
+    const string_mod = @import("string");
+
+    const path = try tmpDbPath(testing.allocator, "cursorvalue");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer close(&conn);
+
+    // 40 KiB of text: three 16 KiB pages once encoded.
+    const big_len = 40 * 1024;
+    const text = try testing.allocator.alloc(u8, big_len);
+    defer testing.allocator.free(text);
+    for (text, 0..) |*c, i| c.* = 'a' + @as(u8, @intCast(i % 26));
+    const big = try string_mod.fromBytes(&heap, text);
+
+    var wtxn = try beginWrite(&conn);
+    try put(&wtxn, "blobs", "big", big);
+    try put(&wtxn, "blobs", "small", value.fromFixnum(1).?);
+    try commit(&wtxn);
+
+    var rtxn = try beginRead(&conn);
+    defer abortRead(&rtxn);
+    const tree_id = (try treeId(&rtxn, "blobs", false)).?;
+    var cursor = try rtxn.inner.openCursorForTree(tree_id);
+    const page_bytes = cursorPageBytes(&conn);
+
+    const first = cursor.first().?;
+    try testing.expectEqualStrings("big", first.key);
+    // The cursor alone shows exactly one page of the value.
+    try testing.expectEqual(@as(usize, page_bytes), first.value.len);
+    const whole = try cursorValue(&rtxn, tree_id, first, page_bytes);
+    try testing.expect(whole.len > page_bytes);
+    const decoded = try codec_mod.decode(&heap, &interner, whole, &synthHash, &synthEq);
+    try testing.expect(decoded.kind() == .string);
+    try testing.expectEqualStrings(text, string_mod.asBytes(decoded));
+
+    // An inline value is returned as the cursor shows it.
+    const second = cursor.next().?;
+    try testing.expectEqualStrings("small", second.key);
+    const small = try cursorValue(&rtxn, tree_id, second, page_bytes);
+    try testing.expectEqual(second.value.ptr, small.ptr);
 }
 
 test "put / get: container values (list, map, set) codec round-trip" {

@@ -137,6 +137,14 @@ first time it touches it; every later operation on that tree in the
 same transaction is a bit test. `put` / `get` / `del` and the
 stdlib cursor natives all go through `treeId`.
 
+**Cursor values may be one page short.** An emdb cursor exposes at
+most the first page of an overflow value. `cursorValue(txn, tree_id,
+kv, page_bytes)` returns the entry's complete value: when the
+visible slice fills a page (`cursorPageBytes(conn)`) it re-reads
+the key through the tree, which assembles every overflow page. The
+stdlib `db/scan` and `db/reduce-tree` natives decode through it;
+`db/scan` positions its cursor with `setRange` for the start bound.
+
 **`Connection` is NOT a runtime heap-managed Value.** It's a plain
 Zig struct allocated on the caller's allocator. Multiple
 durable-refs may point to the same Connection; the Connection

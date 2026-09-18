@@ -1638,6 +1638,43 @@ test "phase5.2a end-to-end DB persistence of a string value (peer-AI turn 78 §R
     , "hello-utf8-é-🦀");
 }
 
+test "db/scan seeks to the start bound and stops before the end bound" {
+    try expectOutputProgram(
+        \\(do
+        \\  (def conn (db/open "/tmp/nexis-seam-scan-range.edb"))
+        \\  (with-tx [tx conn]
+        \\    (db/put! tx (db/ref conn :range :a) 1)
+        \\    (db/put! tx (db/ref conn :range :b) 2)
+        \\    (db/put! tx (db/ref conn :range :c) 3)
+        \\    (db/put! tx (db/ref conn :range :d) 4))
+        \\  (with-read-tx [t conn]
+        \\    [(db/scan t :range :b)
+        \\     (db/scan t :range :bb :d)
+        \\     (db/scan t :range :e)
+        \\     (db/scan t :range :a :a)
+        \\     (db/scan t :none)]))
+    , "[[[:b 2] [:c 3] [:d 4]] [[:c 3]] [] [] []]");
+}
+
+test "db/scan and db/reduce-tree read a value that spans several overflow pages" {
+    // 5 * 2^13 = 40960 bytes: three 16 KiB pages once encoded. A
+    // cursor alone shows the first page; the natives must return
+    // the whole value.
+    try expectOutputProgram(
+        \\(do
+        \\  (def conn (db/open "/tmp/nexis-seam-overflow.edb"))
+        \\  (def big (loop [s "abcde" n 0] (if (< n 13) (recur (str s s) (inc n)) s)))
+        \\  (with-tx [tx conn]
+        \\    (db/put! tx (db/ref conn :blobs :big) big)
+        \\    (db/put! tx (db/ref conn :blobs :small) "x"))
+        \\  (with-read-tx [t conn]
+        \\    [(count big)
+        \\     (count (nth (first (db/scan t :blobs)) 1))
+        \\     (= big (nth (first (db/scan t :blobs)) 1))
+        \\     (db/reduce-tree t :blobs (fn* [acc k v] (+ acc (count v))) 0)]))
+    , "[40960 40960 true 40961]");
+}
+
 // =============================================================================
 // Phase 5 Item 2 sub-step 5.2b — nexis.string namespace (peer-AI turn 79)
 // =============================================================================

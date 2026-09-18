@@ -1637,23 +1637,65 @@ fn fnDbDeref(_: *VM, args: []const Value) VmError!Value {
 //     cursor advances safely because we decode BEFORE moving.
 //   - Eager vector (peer §Q4). Lazy seqs are a future polish.
 
-fn getTxnCursor(tx_v: Value, tree_name: []const u8) VmError!emdb_mod.Cursor {
-    const txn_inner: *emdb_mod.Txn = switch (tx_v.kind()) {
-        .db_write_txn => blk: {
-            const h = writeTxnHandle(tx_v).?;
-            if (!h.active) return VmError.TxClosed;
-            break :blk h.txn.inner;
-        },
-        .db_read_txn => blk: {
-            const h = readTxnHandle(tx_v).?;
-            if (!h.active) return VmError.TxClosed;
-            break :blk h.txn.inner;
-        },
-        else => return VmError.KindMismatch,
-    };
-    const tree_id = txn_inner.openTree(tree_name, false) catch return VmError.DbError;
-    return txn_inner.openCursorForTree(tree_id) catch VmError.DbError;
-}
+/// A cursor over one named tree inside an active transaction.
+const TreeCursor = struct {
+    conn: *db_mod.Connection,
+    inner: *emdb_mod.Txn,
+    tree_id: emdb_mod.TreeId,
+    cursor: emdb_mod.Cursor,
+    /// See `db.cursorPageBytes`.
+    page_bytes: u32,
+
+    /// Open a cursor on `tree_name`. Null when the tree does not
+    /// exist, which every caller treats as an empty tree.
+    fn open(tx_v: Value, tree_name: []const u8) VmError!?TreeCursor {
+        const Resolved = struct { conn: *db_mod.Connection, inner: *emdb_mod.Txn, tree_id: ?emdb_mod.TreeId };
+        const r: Resolved = switch (tx_v.kind()) {
+            .db_write_txn => blk: {
+                const h = writeTxnHandle(tx_v).?;
+                if (!h.active) return VmError.TxClosed;
+                break :blk .{
+                    .conn = h.txn.conn,
+                    .inner = h.txn.inner,
+                    .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch return VmError.DbError,
+                };
+            },
+            .db_read_txn => blk: {
+                const h = readTxnHandle(tx_v).?;
+                if (!h.active) return VmError.TxClosed;
+                break :blk .{
+                    .conn = h.txn.conn,
+                    .inner = h.txn.inner,
+                    .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch return VmError.DbError,
+                };
+            },
+            else => return VmError.KindMismatch,
+        };
+        const tree_id = r.tree_id orelse return null;
+        const cursor = r.inner.openCursorForTree(tree_id) catch return VmError.DbError;
+        return .{
+            .conn = r.conn,
+            .inner = r.inner,
+            .tree_id = tree_id,
+            .cursor = cursor,
+            .page_bytes = db_mod.cursorPageBytes(r.conn),
+        };
+    }
+
+    /// The complete value of `kv`, decoded onto the heap. Values
+    /// that continue past the cursor's first page are re-read
+    /// through the tree (`db.cursorValue`).
+    fn decode(self: *TreeCursor, vm: *VM, kv: emdb_mod.Cursor.KeyValue) VmError!Value {
+        const bytes = db_mod.cursorValue(self, self.tree_id, kv, self.page_bytes) catch return VmError.DbError;
+        return codec_mod.decode(
+            vm.ensureHeap(),
+            vm.ensureInterner(),
+            bytes,
+            &dispatch_mod_alias.hashValue,
+            &dispatch_mod_alias.equal,
+        ) catch return VmError.CodecFailed;
+    }
+};
 
 fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     const tx_v = args[0];
@@ -1678,35 +1720,15 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
         break :blk if (ev.kind() == .keyword) interner.keywordName(id) else interner.symbolName(id);
     } else null;
 
-    var cursor = getTxnCursor(tx_v, tree_name) catch |err| switch (err) {
-        // Tree-not-found via openTree → empty scan.
-        VmError.DbError => {
-            const heap = vm.ensureHeap();
-            return vector_mod.fromSlice(heap, &.{}) catch VmError.OutOfMemory;
-        },
-        else => return err,
+    var tc = (try TreeCursor.open(tx_v, tree_name)) orelse {
+        return vector_mod.fromSlice(vm.ensureHeap(), &.{}) catch VmError.OutOfMemory;
     };
 
     var entries: std.ArrayList(Value) = .empty;
     defer entries.deinit(vm.allocator);
 
-    // Position. If start_bytes given, advance to first key >= start.
-    var maybe_kv: ?@TypeOf(cursor).KeyValue = blk: {
-        if (start_bytes) |sb| {
-            // emdb's Cursor doesn't have a public `seek` exposed
-            // in our wrapper; we walk from `first` and skip
-            // entries < start. Fine for v1 (small datasets).
-            // O(n) worst case; replace with proper seek when
-            // emdb's seek API is exposed at this level.
-            var kv_opt = cursor.first();
-            while (kv_opt) |kv| {
-                if (std.mem.order(u8, kv.key, sb) != .lt) break;
-                kv_opt = cursor.next();
-            }
-            break :blk kv_opt;
-        }
-        break :blk cursor.first();
-    };
+    // Seek to the first key >= start (or the first key).
+    var maybe_kv: ?emdb_mod.Cursor.KeyValue = if (start_bytes) |sb| tc.cursor.setRange(sb) else tc.cursor.first();
 
     while (maybe_kv) |kv| {
         // End-exclusive check.
@@ -1715,20 +1737,14 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
         }
         // Decode value (Heap-owned) and intern key (interner-owned).
         // Both are stable past the next cursor advance.
-        const decoded_v = codec_mod.decode(
-            vm.ensureHeap(),
-            interner,
-            kv.value,
-            &dispatch_mod_alias.hashValue,
-            &dispatch_mod_alias.equal,
-        ) catch return VmError.CodecFailed;
+        const decoded_v = try tc.decode(vm, kv);
         const key_id = interner.internKeyword(kv.key) catch return VmError.OutOfMemory;
         const key_v = value_mod.fromKeywordId(key_id);
         // Build [key value] 2-vector.
         const pair = [_]Value{ key_v, decoded_v };
         const pair_vec = vector_mod.fromSlice(vm.ensureHeap(), &pair) catch return VmError.OutOfMemory;
         entries.append(vm.allocator, pair_vec) catch return VmError.OutOfMemory;
-        maybe_kv = cursor.next();
+        maybe_kv = tc.cursor.next();
     }
 
     return vector_mod.fromSlice(vm.ensureHeap(), entries.items) catch VmError.OutOfMemory;
@@ -1754,26 +1770,18 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     const tree_id: u32 = @intCast(tree_v.payload);
     const tree_name = interner.keywordName(tree_id);
 
-    var cursor = getTxnCursor(tx_v, tree_name) catch |err| switch (err) {
-        VmError.DbError => return acc, // empty tree → init unchanged
-        else => return err,
-    };
+    // No such tree: the init value, unchanged.
+    var tc = (try TreeCursor.open(tx_v, tree_name)) orelse return acc;
 
-    var maybe_kv: ?@TypeOf(cursor).KeyValue = cursor.first();
+    var maybe_kv: ?emdb_mod.Cursor.KeyValue = tc.cursor.first();
     while (maybe_kv) |kv| {
-        const decoded_v = codec_mod.decode(
-            vm.ensureHeap(),
-            interner,
-            kv.value,
-            &dispatch_mod_alias.hashValue,
-            &dispatch_mod_alias.equal,
-        ) catch return VmError.CodecFailed;
+        const decoded_v = try tc.decode(vm, kv);
         const key_id = interner.internKeyword(kv.key) catch return VmError.OutOfMemory;
         const key_v = value_mod.fromKeywordId(key_id);
         // (f acc key value) — peer-AI turn 73 §Q6 shape.
         const call_args = [_]Value{ acc, key_v, decoded_v };
         acc = try vm.callValue(f, &call_args);
-        maybe_kv = cursor.next();
+        maybe_kv = tc.cursor.next();
     }
     return acc;
 }
