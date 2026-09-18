@@ -36,6 +36,7 @@ const store_mod = @import("store.zig");
 const schema_mod = @import("schema.zig");
 const db_mod = @import("db.zig");
 const transact_mod = @import("transact.zig");
+const query_natives = @import("query/natives.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -79,18 +80,15 @@ const natives = [_]Entry{
     .{ .name = "sync", .descriptor = &native_sync },
 };
 
-/// Install the `nextomic/*` natives into `ns`. The query pipeline
-/// (`q`, `pull`, `pull-many`, `with`; NEXTOMIC.md §5) installs its own
-/// natives from `query/natives.zig` at the seam marked below.
+/// Install the `nextomic/*` natives into `ns`, then the query natives
+/// (`q`, `explain`; NEXTOMIC.md §5) from `query/natives.zig`.
 pub fn install(ns: *Namespace) !void {
     for (natives) |entry| {
         const v = try ns.intern(entry.name);
         v.root = vm_mod.nativeFnValue(entry.descriptor);
         v.bound = true;
     }
-    // SEAM: query natives. When src/nextomic/query lands, add
-    //   try @import("query/natives.zig").install(ns);
-    // here; nothing else in this file changes.
+    try query_natives.install(ns);
 }
 
 const native_connect = NativeFn{ .name = "nextomic/connect", .min_arity = 1, .max_arity = 2, .call = &fnConnect };
@@ -167,7 +165,7 @@ fn openConn(v: Value) !*Conn {
     return c;
 }
 
-fn dbOf(v: Value) !DbValue {
+pub fn dbOf(v: Value) !DbValue {
     if (v.kind() != .nextomic_db) return error.KindMismatch;
     const s = handle.dbShape(v);
     const c: *Conn = @ptrCast(@alignCast(s.conn));
@@ -695,6 +693,10 @@ fn schemaNative(vm: *VM, args: []const Value) !Value {
 const testing = std.testing;
 const TestConn = db_mod.TestConn;
 const intern_mod = @import("intern");
+
+test {
+    _ = query_natives;
+}
 
 test "every nextomic error maps to its §7 keyword; engine errors to the db set" {
     const cases = [_]struct { err: anyerror, name: []const u8 }{

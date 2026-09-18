@@ -1403,6 +1403,11 @@ pub const VM = struct {
     /// nextomic natives own the cast, so vm.zig needs no import.
     nextomic_connections: std.ArrayList(*anyopaque) = .empty,
     nextomic_close_callback: ?*const fn (*anyopaque) void = null,
+    /// The query natives' per-VM state (parsed-query caches), created
+    /// on the first `nextomic/q` and destroyed at teardown through
+    /// `nextomic_query_close`. The natives own the cast.
+    nextomic_query_state: ?*anyopaque = null,
+    nextomic_query_close: ?*const fn (*anyopaque) void = null,
     /// Phase 5.2a polish (chore): Zig 0.16 `std.Io` handle for
     /// filesystem ops that live below the language surface —
     /// today only `(db/open path)` uses it to auto-create the
@@ -1523,6 +1528,9 @@ pub const VM = struct {
             for (self.nextomic_connections.items) |conn_ptr| close_fn(conn_ptr);
         }
         self.nextomic_connections.deinit(self.allocator);
+        if (self.nextomic_query_state) |state| {
+            if (self.nextomic_query_close) |close_fn| close_fn(state);
+        }
         // Phase 5.3a: free record-registry storage (the entry
         // structs + their interned-name slices live in
         // self.allocator).
