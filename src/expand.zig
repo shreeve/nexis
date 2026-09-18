@@ -1501,8 +1501,20 @@ fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
             const heap = try ctx.heapForArgs();
             break :blk string_mod_local.fromBytes(heap, bytes) catch return ExpandError.OutOfMemory;
         },
+        .real => |f| value_mod.fromFloat(f),
+        .char => |c| value_mod.fromChar(c) orelse return ExpandError.MalformedMacroCall,
+        // `@x` reaches a macro as the call `(deref x)`.
+        .deref => |inner| blk: {
+            const deref_id = ctx.interner.internSymbol("deref") catch return ExpandError.OutOfMemory;
+            const inner_v = try formToValue(ctx, inner);
+            const heap = try ctx.heapForArgs();
+            var lst = list_mod.empty(heap) catch return ExpandError.OutOfMemory;
+            lst = list_mod.cons(heap, inner_v, lst) catch return ExpandError.OutOfMemory;
+            lst = list_mod.cons(heap, value_mod.fromSymbolId(deref_id), lst) catch return ExpandError.OutOfMemory;
+            break :blk lst;
+        },
         // syntax_quote, unquote, unquote_splicing, anon_fn,
-        // with_meta, deref, real, char → defer.
+        // with_meta → defer.
         else => return ExpandError.MalformedMacroCall,
     };
 }
@@ -1533,6 +1545,16 @@ fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSp
         .fixnum => blk: {
             const form = try ctx.allocator.create(Form);
             form.* = .{ .datum = .{ .int = v.asFixnum() }, .origin = origin };
+            break :blk form;
+        },
+        .float => blk: {
+            const form = try ctx.allocator.create(Form);
+            form.* = .{ .datum = .{ .real = v.asFloat() }, .origin = origin };
+            break :blk form;
+        },
+        .char => blk: {
+            const form = try ctx.allocator.create(Form);
+            form.* = .{ .datum = .{ .char = v.asChar() }, .origin = origin };
             break :blk form;
         },
         .symbol => blk: {
@@ -3573,8 +3595,9 @@ fn threadStep(
     step: *const Form,
     pos: ThreadPosition,
 ) ExpandError!*Form {
-    // Symbol step `f` → (f acc).
-    if (step.datum == .symbol) {
+    // A non-list step `f` → (f acc): a symbol, or a keyword /
+    // other invocable value (`(-> m :a :b)`).
+    if (step.datum != .list) {
         const items = try ctx.allocator.alloc(*Form, 2);
         items[0] = @constCast(step);
         items[1] = acc;
@@ -3582,7 +3605,7 @@ fn threadStep(
     }
     // List step (f a b) → thread-first: (f acc a b)
     //                      thread-last:  (f a b acc)
-    if (step.datum == .list) {
+    {
         const step_items = step.datum.list;
         if (step_items.len == 0) return ExpandError.MalformedMacroCall;
         const new_items = try ctx.allocator.alloc(*Form, step_items.len + 1);
@@ -3601,7 +3624,6 @@ fn threadStep(
         }
         return try makeList(ctx, new_items, call_form.origin);
     }
-    return ExpandError.MalformedMacroCall;
 }
 
 // =============================================================================

@@ -145,25 +145,42 @@ const Program = struct {
     /// Run every top-level form of `src` in order (matching
     /// runFile semantics); the last form's value is the result.
     fn run(self: *Program, src: []const u8) !value_mod.Value {
+        return self.runWith(src, false, null);
+    }
+
+    /// `run` the way the CLI runs a file: every name the program
+    /// defines is declared up front and any other unresolved
+    /// symbol is a compile error whose span lands in `out_span`.
+    fn runChecked(self: *Program, src: []const u8, out_span: ?*?reader_mod.SrcSpan) !value_mod.Value {
+        return self.runWith(src, true, out_span);
+    }
+
+    fn runWith(self: *Program, src: []const u8, checked: bool, out_span: ?*?reader_mod.SrcSpan) !value_mod.Value {
         var parse_result = try reader_mod.parser.parseProgram(testing.allocator, src);
         defer parse_result.parser.deinit();
         var rdr = reader_mod.Reader.init(testing.allocator, src);
         defer rdr.deinit();
         const forms = try rdr.readProgram(parse_result.sexp);
 
+        var declared = compile.DeclaredNames.init(testing.allocator);
+        defer declared.deinit();
+        if (checked) for (forms) |form| try declared.declareForm(form);
+
         var last_result: value_mod.Value = value_mod.nilValue();
         for (forms) |form| {
             // Re-read current per form so (ns NAME) takes effect.
             const current_ns = self.registry.current;
-            const compiled = try compile.compileFormFullWithMacrosSpanPersistentRegistry(
+            const compiled = try compile.compileFormFullWithMacrosSpanPersistentRegistryLoader(
                 self.arena.allocator(),
                 form,
                 current_ns,
                 self.interner,
                 &self.host_macros,
-                null,
+                out_span,
                 self.v.runtime_arena.allocator(),
                 self.registry,
+                null,
+                if (checked) &declared else null,
             );
             const routine = compiled.toRoutine("test-form");
             self.v.frames.items[0].routine = &routine;
@@ -2253,8 +2270,8 @@ test "phase5.3b defprotocol: registers protocol + method dispatchers" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this y]))
-        \\  (str IFoo " " bar))
-    , "#<protocol id=0> #<protocol-fn proto=0 method=0>");
+        \\  (str IFoo " " (fn? bar)))
+    , "#<protocol id=0> true");
 }
 
 test "phase5.3b protocol dispatch with NO impl raises :no-protocol-impl" {
@@ -2812,4 +2829,657 @@ test "integration: stack extent — randomized call chains match direct evaluati
             return err;
         };
     }
+}
+
+// =============================================================================
+// Numeric tower: floats, contagion, division, comparison, overflow
+// =============================================================================
+
+test "numbers: float literals print like Clojure doubles" {
+    try expectOutput("1.0", "1.0");
+    try expectOutput("1.5", "1.5");
+    try expectOutput("-2.25", "-2.25");
+    try expectOutput("0.1", "0.1");
+    try expectOutput("100.0", "100.0");
+    try expectOutput("1e10", "1.0E10");
+    try expectOutput("12345678.5", "1.23456785E7");
+    try expectOutput("0.0001", "1.0E-4");
+    try expectOutput("0.001", "0.001");
+    try expectOutput("(- 0.0)", "-0.0");
+    try expectOutput("'1.5", "1.5");
+    try expectOutput("(pr-str [1 1.0 \"s\" \\a])", "[1 1.0 \"s\" \\a]");
+    try expectOutput("(str 1.5 \" \" 2.0)", "1.5 2.0");
+}
+
+test "numbers: special floats" {
+    try expectOutput("(/ 1.0 0)", "Infinity");
+    try expectOutput("(/ -1.0 0)", "-Infinity");
+    try expectOutput("(/ 0.0 0.0)", "NaN");
+    try expectOutput("(NaN? (/ 0.0 0.0))", "true");
+    try expectOutput("(NaN? 1.5)", "false");
+    try expectOutput("(infinite? (/ 1.0 0))", "true");
+    try expectOutput("(infinite? (/ 1 2))", "false");
+    try expectOutput("(let [n (/ 0.0 0.0)] [(= n n) (== n n) (< n 1) (> n 1)])", "[true false false false]");
+}
+
+test "numbers: arithmetic contagion" {
+    try expectOutput("(+ 1 2.5)", "3.5");
+    try expectOutput("(+ 1.5 2)", "3.5");
+    try expectOutput("(+ 1 2 3.0)", "6.0");
+    try expectOutput("(- 10 2.5)", "7.5");
+    try expectOutput("(- 1.5)", "-1.5");
+    try expectOutput("(* 2 2.5)", "5.0");
+    try expectOutput("(* 2 3)", "6");
+    try expectOutput("(inc 1.5)", "2.5");
+    try expectOutput("(dec 0.5)", "-0.5");
+    try expectOutput("(abs -3)", "3");
+    try expectOutput("(abs -3.5)", "3.5");
+    try expectOutput("(max 1 5 3)", "5");
+    try expectOutput("(min 1 5 3)", "1");
+    try expectOutput("(max 1 2.0)", "2.0");
+    try expectOutput("(max 3 2.0)", "3.0");
+    try expectOutput("(min 3 2.0)", "2.0");
+    // The inlined `(+ a b)` intrinsic uses the same tower.
+    try expectOutput("(let [a 1 b 2.5] (+ a b))", "3.5");
+    try expectOutput("(let [a 1.0] (< a 2))", "true");
+}
+
+test "numbers: division" {
+    try expectOutput("(/ 6 3)", "2");
+    try expectOutput("(/ 7 2)", "3.5");
+    try expectOutput("(/ -6 3)", "-2");
+    try expectOutput("(/ 1 3)", "0.3333333333333333");
+    try expectOutput("(/ 6.0 3)", "2.0");
+    try expectOutput("(/ 2)", "0.5");
+    try expectOutput("(/ 24 2 3)", "4");
+    try expectOutput("(quot 7 2)", "3");
+    try expectOutput("(quot -7 2)", "-3");
+    try expectOutput("(rem -7 2)", "-1");
+    try expectOutput("(mod -7 2)", "1");
+    try expectOutput("(mod 7 -2)", "-1");
+    try expectOutput("(mod 7.5 2)", "1.5");
+    try expectOutput("(quot 7.5 2)", "3.0");
+    try expectOutput("(rem 7.5 2)", "1.5");
+    try expectOutput("(try (/ 1 0) (catch any e e))", ":divide-by-zero");
+    try expectOutput("(try (quot 1 0) (catch any e e))", ":divide-by-zero");
+    try expectOutput("(try (rem 1.0 0) (catch any e e))", ":divide-by-zero");
+    try expectOutput("(try (mod 1 0.0) (catch any e e))", ":divide-by-zero");
+}
+
+test "numbers: comparison across kinds" {
+    try expectOutput("(< 1 1.5)", "true");
+    try expectOutput("(< 1.5 1)", "false");
+    try expectOutput("(<= 2 2.0)", "true");
+    try expectOutput("(<= 2 1.0)", "false");
+    try expectOutput("(> 2 1)", "true");
+    try expectOutput("(> 1 2)", "false");
+    try expectOutput("(>= 2 2)", "true");
+    try expectOutput("(>= 1 2)", "false");
+    try expectOutput("(> 3 2 1)", "true");
+    try expectOutput("(> 3 1 2)", "false");
+    try expectOutput("(<= 1 1 2)", "true");
+    try expectOutput("(>)", "true");
+    try expectOutput("(>= 5)", "true");
+    try expectOutput("(= 1 1.0)", "false");
+    try expectOutput("(== 1 1.0)", "true");
+    try expectOutput("(== 1 1 1.0)", "true");
+    try expectOutput("(== 1 2)", "false");
+    try expectOutput("(not= 1 2)", "true");
+    try expectOutput("(not= 1 1)", "false");
+    try expectOutput("(not= 1 1.0)", "true");
+    try expectOutput("(not= :a :a :a)", "false");
+    try expectOutput("(try (< 1 :a) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (> \"a\" 1) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (>= nil) (catch any e e))", ":kind-mismatch");
+}
+
+test "numbers: predicates over the tower" {
+    try expectOutput("[(number? 1) (number? 1.5) (number? :a) (number? nil)]", "[true true false false]");
+    try expectOutput("[(integer? 1) (integer? 1.0) (float? 1.0) (float? 1)]", "[true false true false]");
+    try expectOutput("[(zero? 0) (zero? 0.0) (zero? -0.0) (zero? 0.5)]", "[true true true false]");
+    try expectOutput("[(pos? 1) (pos? 0.5) (pos? -0.5) (neg? -1) (neg? -0.5) (neg? 0.0)]", "[true true false true true false]");
+    try expectOutput("[(even? 2) (odd? 3)]", "[true true]");
+    try expectOutput("(try (even? 2.0) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (zero? :a) (catch any e e))", ":kind-mismatch");
+}
+
+test "numbers: float equality and hashing agree with SEMANTICS" {
+    try expectOutput("(= 0.0 -0.0)", "true");
+    try expectOutput("(= 1.5 1.5)", "true");
+    try expectOutput("(= 1.5 1.25)", "false");
+    try expectOutput("(get {0.0 :zero} -0.0)", ":zero");
+    try expectOutput("(get {1 :int} 1.0)", "nil");
+    try expectOutput("(let [n (/ 0.0 0.0)] (get {n :nan} (/ 0.0 0.0)))", ":nan");
+    try expectOutput("(contains? #{1.5 2.5} 2.5)", "true");
+    try expectOutput("(= [1.0 2.0] [1.0 2.0])", "true");
+    try expectOutput("(= [1 2] [1.0 2.0])", "false");
+}
+
+test "numbers: fixnum overflow is a catchable :arithmetic-overflow" {
+    try expectOutput("(+ 140737488355326 1)", "140737488355327");
+    try expectOutput("(try (+ 140737488355327 1) (catch any e e))", ":arithmetic-overflow");
+    try expectOutput("(try (- -140737488355328 1) (catch any e e))", ":arithmetic-overflow");
+    try expectOutput("(try (* 100000000 100000000) (catch any e e))", ":arithmetic-overflow");
+    try expectOutput("(try (inc 140737488355327) (catch any e e))", ":arithmetic-overflow");
+    try expectOutput("(try (let [a 140737488355327] (+ a 1)) (catch any e e))", ":arithmetic-overflow");
+    // Floats never overflow into an error.
+    try expectOutput("(* 140737488355327.0 140737488355327)", "1.9807040628565803E28");
+    try expectProgramError("(+ 140737488355327 1)", vm.VmError.ArithmeticOverflow);
+}
+
+test "numbers: macros can return float and char literals" {
+    try expectOutput("(do (defmacro half [] 0.5) (half))", "0.5");
+    try expectOutput("(do (defmacro ch [] \\z) (pr-str (ch)))", "\\z");
+    try expectOutput("(do (defmacro twice [x] `(* 2 ~x)) (twice 1.25))", "2.5");
+}
+
+// =============================================================================
+// Keyword-as-function and collection-as-function (PLAN §8.7)
+// =============================================================================
+
+test "keyword-as-function: direct calls" {
+    try expectOutput("(:a {:a 1 :b 2})", "1");
+    try expectOutput("(:c {:a 1 :b 2})", "nil");
+    try expectOutput("(:c {:a 1 :b 2} :none)", ":none");
+    try expectOutput("(:a {:a nil} :none)", "nil");
+    try expectOutput("(:a nil)", "nil");
+    try expectOutput("(:a nil :d)", ":d");
+    try expectOutput("(:a 5)", "nil");
+    try expectOutput("(:a \"s\" :d)", ":d");
+    try expectOutput("(:a #{:a :b})", ":a");
+    try expectOutput("(:z #{:a :b})", "nil");
+    try expectOutput("(try (:a) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(try (:a {} 1 2) (catch any e e))", ":arity-mismatch");
+    // Nested and in tail position.
+    try expectOutput("(:b (:a {:a {:b 2}}))", "2");
+    try expectOutput("(-> {:a {:b 3}} :a :b)", "3");
+    try expectOutput("(do (defn field [m] (:x m)) (field {:x 7}))", "7");
+    try expectOutput("(let [f :a] (f {:a 9}))", "9");
+    try expectOutput("(do (defrecord P [x y]) (:y (->P 1 2)))", "2");
+}
+
+test "keyword-as-function: keywords passed to higher-order functions" {
+    try expectOutput("(map :name [{:name :x} {:name :y}])", "(:x :y)");
+    try expectOutput("(filter :ok [{:ok true :n 1} {:ok false :n 2} {:n 3}])", "({:ok true, :n 1})");
+    try expectOutput("(apply :a [{:a 3}])", "3");
+    try expectOutput("(apply :a {:b 1} [:d])", ":d");
+    try expectOutput("(reduce (fn [acc m] (+ acc (:n m))) 0 [{:n 1} {:n 2} {:n 3}])", "6");
+    try expectOutput("(some :hit [{:hit nil} {:hit :yes} {:hit :later}])", ":yes");
+    try expectOutput("(every? :ok [{:ok 1} {:ok 2}])", "true");
+    try expectOutput("((comp :b :a) {:a {:b 4}})", "4");
+    try expectOutput("((partial :a) {:a 5})", "5");
+}
+
+test "collection-as-function: maps, sets and vectors" {
+    try expectOutput("({:a 1} :a)", "1");
+    try expectOutput("({:a 1} :b)", "nil");
+    try expectOutput("({:a 1} :b :d)", ":d");
+    try expectOutput("(#{1 2} 1)", "1");
+    try expectOutput("(#{1 2} 3)", "nil");
+    try expectOutput("(try (#{1 2} 3 :d) (catch any e e))", ":arity-mismatch");
+    try expectOutput("([10 20] 1)", "20");
+    try expectOutput("(try ([10 20] 2) (catch any e e))", ":index-out-of-bounds");
+    try expectOutput("(try ([10 20] :a) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try ([10 20] 0 :d) (catch any e e))", ":arity-mismatch");
+    try expectOutput("(map {:a 1 :b 2} [:a :b :c])", "(1 2 nil)");
+    try expectOutput("(filter #{2 4} [1 2 3 4])", "(2 4)");
+    try expectOutput("(let [m {:x 1}] (m :x))", "1");
+    try expectOutput("(try (5 1) (catch any e e))", ":not-callable");
+    try expectOutput("(try (\"s\" 1) (catch any e e))", ":not-callable");
+}
+
+// =============================================================================
+// Core library completeness (table-driven)
+// =============================================================================
+
+const CoreCase = struct { src: []const u8, expected: []const u8 };
+
+fn runCoreCases(cases: []const CoreCase) !void {
+    for (cases) |c| try expectOutput(c.src, c.expected);
+}
+
+test "core: seq over every seqable kind" {
+    try runCoreCases(&.{
+        .{ .src = "(seq nil)", .expected = "nil" },
+        .{ .src = "(seq [])", .expected = "nil" },
+        .{ .src = "(seq (list))", .expected = "nil" },
+        .{ .src = "(seq {})", .expected = "nil" },
+        .{ .src = "(seq \"\")", .expected = "nil" },
+        .{ .src = "(seq [1 2])", .expected = "(1 2)" },
+        .{ .src = "(seq '(1 2))", .expected = "(1 2)" },
+        .{ .src = "(seq {:a 1})", .expected = "([:a 1])" },
+        .{ .src = "(seq #{7})", .expected = "(7)" },
+        .{ .src = "(pr-str (seq \"ab\"))", .expected = "(\\a \\b)" },
+        .{ .src = "(first {:a 1})", .expected = "[:a 1]" },
+        .{ .src = "(first #{3})", .expected = "3" },
+        .{ .src = "(pr-str (first \"xy\"))", .expected = "\\x" },
+        .{ .src = "(pr-str (rest \"xyz\"))", .expected = "(\\y \\z)" },
+        .{ .src = "(rest {:a 1})", .expected = "()" },
+        .{ .src = "(next [1])", .expected = "nil" },
+        .{ .src = "(next [1 2])", .expected = "(2)" },
+        .{ .src = "(next nil)", .expected = "nil" },
+        .{ .src = "(count (seq {:a 1 :b 2}))", .expected = "2" },
+        .{ .src = "(map (fn [[k v]] (str k v)) {:a 1})", .expected = "(:a1)" },
+        .{ .src = "(reduce + 0 #{1 2 3})", .expected = "6" },
+        .{ .src = "(map identity \"hi\")", .expected = "(h i)" },
+        .{ .src = "(apply str (reverse \"abc\"))", .expected = "cba" },
+        .{ .src = "(sort (keys {:b 1 :a 2}))", .expected = "(:a :b)" },
+        .{ .src = "(try (seq 5) (catch any e e))", .expected = ":kind-mismatch" },
+    });
+}
+
+test "core: reduce, range, assoc, dissoc, conj" {
+    try runCoreCases(&.{
+        .{ .src = "(reduce + [1 2 3])", .expected = "6" },
+        .{ .src = "(reduce + [])", .expected = "0" },
+        .{ .src = "(reduce + [7])", .expected = "7" },
+        .{ .src = "(reduce + 10 [1 2 3])", .expected = "16" },
+        .{ .src = "(reduce (fn [a x] (conj a x)) [] '(1 2))", .expected = "[1 2]" },
+        .{ .src = "(reduce-kv (fn [acc k v] (assoc acc v k)) {} {:a 1})", .expected = "{1 :a}" },
+        .{ .src = "(reduce-kv (fn [acc i x] (+ acc (* i x))) 0 [10 20 30])", .expected = "80" },
+        .{ .src = "(range 5)", .expected = "(0 1 2 3 4)" },
+        .{ .src = "(range 0)", .expected = "()" },
+        .{ .src = "(range 2 5)", .expected = "(2 3 4)" },
+        .{ .src = "(range 5 2)", .expected = "()" },
+        .{ .src = "(range 0 10 3)", .expected = "(0 3 6 9)" },
+        .{ .src = "(range 5 0 -2)", .expected = "(5 3 1)" },
+        .{ .src = "(try (range 0 1 0) (catch any e e))", .expected = ":invalid-argument" },
+        .{ .src = "(assoc [1 2 3] 1 :x)", .expected = "[1 :x 3]" },
+        .{ .src = "(assoc [1 2 3] 3 :end)", .expected = "[1 2 3 :end]" },
+        .{ .src = "(try (assoc [1 2 3] 4 :x) (catch any e e))", .expected = ":index-out-of-bounds" },
+        .{ .src = "(try (assoc [1] :k 1) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(assoc {} :a 1 :b 2)", .expected = "{:a 1, :b 2}" },
+        .{ .src = "(try (assoc {} :a 1 :b) (catch any e e))", .expected = ":arity-mismatch" },
+        .{ .src = "(assoc nil :a 1)", .expected = "{:a 1}" },
+        .{ .src = "(dissoc {:a 1 :b 2 :c 3} :a :c)", .expected = "{:b 2}" },
+        .{ .src = "(dissoc {:a 1})", .expected = "{:a 1}" },
+        .{ .src = "(disj #{1 2 3} 1 3)", .expected = "#{2}" },
+        .{ .src = "(conj {:a 1} {:b 2 :c 3})", .expected = "{:a 1, :b 2, :c 3}" },
+        .{ .src = "(conj {:a 1} [:b 2] nil)", .expected = "{:a 1, :b 2}" },
+        .{ .src = "(update [1 2 3] 0 inc)", .expected = "[2 2 3]" },
+        .{ .src = "(update {:a 1} :a + 10)", .expected = "{:a 11}" },
+        .{ .src = "(update-in {:a {:b 1}} [:a :b] inc)", .expected = "{:a {:b 2}}" },
+        .{ .src = "(assoc-in {} [:a :b] 1)", .expected = "{:a {:b 1}}" },
+        .{ .src = "(get-in {:a {:b 1}} [:a :b])", .expected = "1" },
+        .{ .src = "(get-in {:a {:b 1}} [:a :c])", .expected = "nil" },
+        .{ .src = "(get-in {:a {:b 1}} [:a :c] :d)", .expected = ":d" },
+        .{ .src = "(get-in {:a {:b nil}} [:a :b] :d)", .expected = "nil" },
+        .{ .src = "(get-in {:a [10 20]} [:a 1])", .expected = "20" },
+    });
+}
+
+test "core: maps" {
+    try runCoreCases(&.{
+        .{ .src = "(merge {:a 1} {:b 2} nil {:a 3})", .expected = "{:a 3, :b 2}" },
+        .{ .src = "(merge-with + {:a 1 :b 2} {:a 10} {:c 5})", .expected = "{:a 11, :b 2, :c 5}" },
+        .{ .src = "(merge-with +)", .expected = "nil" },
+        .{ .src = "(select-keys {:a 1 :b 2 :c 3} [:a :c :z])", .expected = "{:a 1, :c 3}" },
+        .{ .src = "(select-keys nil [:a])", .expected = "{}" },
+        .{ .src = "(zipmap [:a :b :c] [1 2])", .expected = "{:a 1, :b 2}" },
+        .{ .src = "(find {:a 1} :a)", .expected = "[:a 1]" },
+        .{ .src = "(find {:a 1} :b)", .expected = "nil" },
+        .{ .src = "(find [5 6] 1)", .expected = "[1 6]" },
+        .{ .src = "(key (find {:a 1} :a))", .expected = ":a" },
+        .{ .src = "(val (find {:a 1} :a))", .expected = "1" },
+        .{ .src = "(contains? {:a nil} :a)", .expected = "true" },
+        .{ .src = "(contains? [1 2] 1)", .expected = "true" },
+        .{ .src = "(contains? [1 2] 2)", .expected = "false" },
+        .{ .src = "(contains? #{:x} :x)", .expected = "true" },
+        .{ .src = "(frequencies [:a :b :a])", .expected = "{:a 2, :b 1}" },
+        .{ .src = "(group-by odd? [1 2 3])", .expected = "{true [1 3], false [2]}" },
+        .{ .src = "(group-by :k [{:k 1 :v :a} {:k 1 :v :b}])", .expected = "{1 [{:k 1, :v :a} {:k 1, :v :b}]}" },
+        .{ .src = "(into {} [[:a 1] [:b 2]])", .expected = "{:a 1, :b 2}" },
+        .{ .src = "(into {:a 1} {:b 2})", .expected = "{:a 1, :b 2}" },
+        .{ .src = "(empty {:a 1})", .expected = "{}" },
+        .{ .src = "(sort (map key {:b 1 :a 2}))", .expected = "(:a :b)" },
+        .{ .src = "(sort (vals {:b 1 :a 2}))", .expected = "(1 2)" },
+    });
+}
+
+test "core: sequence functions" {
+    try runCoreCases(&.{
+        .{ .src = "(concat [1 2] '(3) nil #{4})", .expected = "(1 2 3 4)" },
+        .{ .src = "(concat)", .expected = "()" },
+        .{ .src = "(mapcat (fn [x] [x x]) [1 2])", .expected = "(1 1 2 2)" },
+        .{ .src = "(map + [1 2 3] [10 20])", .expected = "(11 22)" },
+        .{ .src = "(map vector [:a :b] [1 2] [\"x\" \"y\"])", .expected = "([:a 1 x] [:b 2 y])" },
+        .{ .src = "(mapv inc [1 2])", .expected = "[2 3]" },
+        .{ .src = "(filterv even? [1 2 3 4])", .expected = "[2 4]" },
+        .{ .src = "(map-indexed vector [:a :b])", .expected = "([0 :a] [1 :b])" },
+        .{ .src = "(keep-indexed (fn [i x] (if (odd? i) x nil)) [:a :b :c :d])", .expected = "(:b :d)" },
+        .{ .src = "(keep (fn [x] (if (odd? x) (* x x) nil)) [1 2 3])", .expected = "(1 9)" },
+        .{ .src = "(keep identity [1 nil false 2])", .expected = "(1 false 2)" },
+        .{ .src = "(remove odd? [1 2 3 4])", .expected = "(2 4)" },
+        .{ .src = "(distinct [1 2 1 3 2 1.0])", .expected = "(1 2 3 1.0)" },
+        .{ .src = "(distinct \"aab\")", .expected = "(a b)" },
+        .{ .src = "(partition 2 [1 2 3 4 5])", .expected = "((1 2) (3 4))" },
+        .{ .src = "(partition 2 1 [1 2 3])", .expected = "((1 2) (2 3))" },
+        .{ .src = "(partition 3 3 [:pad] [1 2 3 4])", .expected = "((1 2 3) (4 :pad))" },
+        .{ .src = "(partition-all 2 [1 2 3 4 5])", .expected = "((1 2) (3 4) (5))" },
+        .{ .src = "(partition-all 2 3 [1 2 3 4 5])", .expected = "((1 2) (4 5))" },
+        .{ .src = "(try (partition 0 [1]) (catch any e e))", .expected = ":invalid-argument" },
+        .{ .src = "(interleave [1 2 3] [:a :b])", .expected = "(1 :a 2 :b)" },
+        .{ .src = "(interleave [1 2] [:a :b] [\"x\" \"y\"])", .expected = "(1 :a x 2 :b y)" },
+        .{ .src = "(interleave)", .expected = "()" },
+        .{ .src = "(interpose :s [1 2 3])", .expected = "(1 :s 2 :s 3)" },
+        .{ .src = "(into [] '(1 2))", .expected = "[1 2]" },
+        .{ .src = "(into '(0) [1 2])", .expected = "(2 1 0)" },
+        .{ .src = "(into #{} [1 1 2])", .expected = "#{1 2}" },
+        .{ .src = "(into nil [1 2])", .expected = "(2 1)" },
+        .{ .src = "(take-while odd? [1 3 4 5])", .expected = "(1 3)" },
+        .{ .src = "(drop-while odd? [1 3 4 5])", .expected = "(4 5)" },
+        .{ .src = "(take-while odd? [])", .expected = "()" },
+        .{ .src = "(take 2 [1 2 3])", .expected = "(1 2)" },
+        .{ .src = "(drop 2 [1 2 3])", .expected = "(3)" },
+        .{ .src = "(take-last 2 [1 2 3])", .expected = "(2 3)" },
+        .{ .src = "(drop-last 2 [1 2 3])", .expected = "(1)" },
+        .{ .src = "(split-at 1 [1 2 3])", .expected = "[(1) (2 3)]" },
+        .{ .src = "(last [1 2 3])", .expected = "3" },
+        .{ .src = "(last [])", .expected = "nil" },
+        .{ .src = "(butlast [1 2 3])", .expected = "(1 2)" },
+        .{ .src = "(butlast [1])", .expected = "nil" },
+        .{ .src = "(nth [1 2 3] 1)", .expected = "2" },
+        .{ .src = "(nth '(1 2 3) 2)", .expected = "3" },
+        .{ .src = "(nth [1] 5 :d)", .expected = ":d" },
+        .{ .src = "(nthrest [1 2 3] 2)", .expected = "(3)" },
+        .{ .src = "(nthrest [1 2 3] 0)", .expected = "(1 2 3)" },
+        .{ .src = "(reverse [1 2 3])", .expected = "(3 2 1)" },
+        .{ .src = "(flatten [1 [2 [3 nil]] '(4)])", .expected = "(1 2 3 4)" },
+        .{ .src = "(reductions + [1 2 3])", .expected = "(1 3 6)" },
+        .{ .src = "(reductions + 10 [1 2])", .expected = "(10 11 13)" },
+        .{ .src = "(repeat 3 :x)", .expected = "(:x :x :x)" },
+        .{ .src = "(repeat 0 :x)", .expected = "()" },
+        .{ .src = "(do (def n (atom 0)) (repeatedly 3 (fn [] (swap! n inc))))", .expected = "(1 2 3)" },
+        .{ .src = "(iterate inc 0 5)", .expected = "(0 1 2 3 4)" },
+        .{ .src = "(iterate (fn [x] (* 2 x)) 1 4)", .expected = "(1 2 4 8)" },
+        .{ .src = "(iterate inc 0 0)", .expected = "()" },
+        .{ .src = "(empty? [])", .expected = "true" },
+        .{ .src = "(empty? \"\")", .expected = "true" },
+        .{ .src = "(not-empty [1])", .expected = "[1]" },
+        .{ .src = "(not-empty [])", .expected = "nil" },
+        .{ .src = "(not-empty \"\")", .expected = "nil" },
+        .{ .src = "(empty [1 2])", .expected = "[]" },
+        .{ .src = "(empty '(1))", .expected = "()" },
+        .{ .src = "(peek [1 2 3])", .expected = "3" },
+        .{ .src = "(peek '(1 2 3))", .expected = "1" },
+        .{ .src = "(pop [1 2 3])", .expected = "[1 2]" },
+        .{ .src = "(pop '(1 2 3))", .expected = "(2 3)" },
+        .{ .src = "(count \"héllo\")", .expected = "5" },
+        .{ .src = "(count nil)", .expected = "0" },
+        .{ .src = "(subs \"hello\" 1 3)", .expected = "el" },
+        .{ .src = "(str)", .expected = "" },
+        .{ .src = "(str \"a\" 1 :k nil \\c)", .expected = "a1:kc" },
+    });
+}
+
+test "core: sorting and comparison" {
+    try runCoreCases(&.{
+        .{ .src = "(sort [3 1 2])", .expected = "(1 2 3)" },
+        .{ .src = "(sort [3 1.5 2])", .expected = "(1.5 2 3)" },
+        .{ .src = "(sort > [3 1 2])", .expected = "(3 2 1)" },
+        .{ .src = "(sort (fn [a b] (compare b a)) [1 3 2])", .expected = "(3 2 1)" },
+        .{ .src = "(sort [\"b\" \"a\" \"c\"])", .expected = "(a b c)" },
+        .{ .src = "(sort [:b :a])", .expected = "(:a :b)" },
+        .{ .src = "(sort [nil 2 1])", .expected = "(nil 1 2)" },
+        .{ .src = "(sort [[2 1] [1 9] [1 2 0]])", .expected = "([1 9] [2 1] [1 2 0])" },
+        .{ .src = "(sort [])", .expected = "()" },
+        .{ .src = "(sort #{3 1 2})", .expected = "(1 2 3)" },
+        .{ .src = "(try (sort [1 :a]) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(sort-by :age [{:age 30 :n :a} {:age 20 :n :b}])", .expected = "({:age 20, :n :b} {:age 30, :n :a})" },
+        .{ .src = "(sort-by count [[1 2] [1] []])", .expected = "([] [1] [1 2])" },
+        .{ .src = "(sort-by :k > [{:k 1} {:k 3} {:k 2}])", .expected = "({:k 3} {:k 2} {:k 1})" },
+        // Stable: equal keys keep their input order.
+        .{ .src = "(sort-by :k [{:k 1 :i 1} {:k 0 :i 2} {:k 1 :i 3} {:k 0 :i 4}])", .expected = "({:k 0, :i 2} {:k 0, :i 4} {:k 1, :i 1} {:k 1, :i 3})" },
+        .{ .src = "(sort (range 20 0 -1))", .expected = "(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20)" },
+        .{ .src = "(compare 1 2)", .expected = "-1" },
+        .{ .src = "(compare 2 2.0)", .expected = "0" },
+        .{ .src = "(compare \"b\" \"a\")", .expected = "1" },
+        .{ .src = "(compare nil 1)", .expected = "-1" },
+        .{ .src = "(compare false true)", .expected = "-1" },
+        .{ .src = "(compare [1 2] [1 3])", .expected = "-1" },
+        .{ .src = "(compare [1 2 3] [9])", .expected = "1" },
+        .{ .src = "(max-key count [1 2] [1] [1 2 3])", .expected = "[1 2 3]" },
+        .{ .src = "(min-key count [1 2] [1] [1 2 3])", .expected = "[1]" },
+        .{ .src = "(max-key :k {:k 1 :n :a} {:k 1 :n :b})", .expected = "{:k 1, :n :b}" },
+        .{ .src = "(= (hash [1 2]) (hash '(1 2)))", .expected = "true" },
+        .{ .src = "(= (hash 0.0) (hash -0.0))", .expected = "true" },
+        .{ .src = "(integer? (hash :a))", .expected = "true" },
+    });
+}
+
+test "core: predicates, names and conversions" {
+    try runCoreCases(&.{
+        .{ .src = "[(list? '(1)) (list? [1]) (seq? '(1)) (seq? nil)]", .expected = "[true false true false]" },
+        .{ .src = "[(vector? [1]) (vector? '(1)) (map? {}) (map? []) (set? #{}) (set? {})]", .expected = "[true false true false true false]" },
+        .{ .src = "[(keyword? :a) (keyword? 'a) (symbol? 'a) (symbol? :a) (string? \"s\")]", .expected = "[true false true false true]" },
+        .{ .src = "[(char? \\a) (char? \"a\") (boolean? true) (boolean? nil) (nil? nil) (some? false)]", .expected = "[true false true false true true]" },
+        .{ .src = "[(coll? []) (coll? {}) (coll? \"s\") (coll? nil)]", .expected = "[true true false false]" },
+        .{ .src = "[(sequential? []) (sequential? '()) (sequential? #{}) (associative? {}) (associative? []) (associative? #{})]", .expected = "[true true false true true false]" },
+        .{ .src = "[(fn? inc) (fn? (fn [] 1)) (fn? :a) (ifn? :a) (ifn? {}) (ifn? 1)]", .expected = "[true true false true true false]" },
+        .{ .src = "(do (defrecord R [a]) [(map? (->R 1)) (coll? (->R 1))])", .expected = "[true true]" },
+        .{ .src = "[(true? true) (true? 1) (false? false) (false? nil)]", .expected = "[true false true false]" },
+        .{ .src = "(name :abc)", .expected = "abc" },
+        .{ .src = "(name 'x/y)", .expected = "y" },
+        .{ .src = "(name \"s\")", .expected = "s" },
+        .{ .src = "(try (name 1) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(keyword \"k\")", .expected = ":k" },
+        .{ .src = "(keyword 'k)", .expected = ":k" },
+        .{ .src = "(= (keyword \"k\") :k)", .expected = "true" },
+        .{ .src = "(symbol \"s\")", .expected = "s" },
+        .{ .src = "(= (symbol :s) 's)", .expected = "true" },
+        .{ .src = "[(boolean nil) (boolean 0) (boolean false)]", .expected = "[false true false]" },
+        .{ .src = "(identity :x)", .expected = ":x" },
+        .{ .src = "((constantly 7) 1 2 3)", .expected = "7" },
+        .{ .src = "((comp inc inc) 1)", .expected = "3" },
+        .{ .src = "((comp) 4)", .expected = "4" },
+        .{ .src = "((partial + 1 2) 3 4)", .expected = "10" },
+        .{ .src = "((juxt inc dec) 5)", .expected = "[6 4]" },
+        .{ .src = "((juxt :a :b) {:a 1 :b 2})", .expected = "[1 2]" },
+        .{ .src = "((fnil inc 10) nil)", .expected = "11" },
+        .{ .src = "((fnil + 10) 1 2)", .expected = "3" },
+        .{ .src = "((complement odd?) 2)", .expected = "true" },
+        .{ .src = "(apply + 1 2 [3 4])", .expected = "10" },
+        .{ .src = "(apply max [1 5 2])", .expected = "5" },
+        .{ .src = "(apply str \"a\" [\"b\" \"c\"])", .expected = "abc" },
+        .{ .src = "(some even? [1 3 4])", .expected = "true" },
+        .{ .src = "(some even? [1 3])", .expected = "nil" },
+        .{ .src = "(every? odd? [1 3])", .expected = "true" },
+        .{ .src = "(every? odd? [])", .expected = "true" },
+        .{ .src = "(not-every? odd? [1 2])", .expected = "true" },
+        .{ .src = "(not-any? odd? [2 4])", .expected = "true" },
+        .{ .src = "(some #{3} [1 2 3])", .expected = "3" },
+    });
+}
+
+test "core: macros" {
+    try runCoreCases(&.{
+        .{ .src = "(if-not true :a :b)", .expected = ":b" },
+        .{ .src = "(if-not nil :a :b)", .expected = ":a" },
+        .{ .src = "(if-not true :a)", .expected = "nil" },
+        .{ .src = "(when-not false :a)", .expected = ":a" },
+        .{ .src = "(do (def a (atom 0)) (while (< @a 5) (swap! a inc)) @a)", .expected = "5" },
+        .{ .src = "(letfn [(ev? [n] (if (zero? n) true (od? (dec n)))) (od? [n] (if (zero? n) false (ev? (dec n))))] (ev? 10))", .expected = "true" },
+        .{ .src = "(do (def acc (atom [])) (doseq [x [1 2 3]] (swap! acc conj (* x x))) @acc)", .expected = "[1 4 9]" },
+        .{ .src = "(do (def acc (atom [])) (doseq [x [1 2] y [:a :b]] (swap! acc conj [x y])) @acc)", .expected = "[[1 :a] [1 :b] [2 :a] [2 :b]]" },
+        .{ .src = "(doseq [x []] :never)", .expected = "nil" },
+        .{ .src = "(do (def acc (atom 0)) (doseq [[k v] {:a 1 :b 2}] (swap! acc + v)) @acc)", .expected = "3" },
+        .{ .src = "(cond-> 1 true inc false (* 10) true (+ 100))", .expected = "102" },
+        .{ .src = "(cond-> {} true (assoc :a 1) nil (assoc :b 2))", .expected = "{:a 1}" },
+        .{ .src = "(cond-> 5)", .expected = "5" },
+        .{ .src = "(cond->> [1 2 3] true (map inc) false (filter odd?) true (reduce +))", .expected = "9" },
+        .{ .src = "(some-> {:a {:b 1}} :a :b inc)", .expected = "2" },
+        .{ .src = "(some-> {:a {:b 1}} :c :b inc)", .expected = "nil" },
+        .{ .src = "(some-> nil inc)", .expected = "nil" },
+        .{ .src = "(some-> 1 (+ 2) (* 3))", .expected = "9" },
+        .{ .src = "(some->> [1 2 3] (map inc) (reduce +))", .expected = "9" },
+        .{ .src = "(some->> nil (map inc))", .expected = "nil" },
+        .{ .src = "(as-> 1 x (+ x 1) (* x 10) [x x])", .expected = "[20 20]" },
+        .{ .src = "(as-> {:a 1} m (assoc m :b 2) (count m))", .expected = "2" },
+        .{ .src = "(-> 5 inc (* 2) (- 1))", .expected = "11" },
+        .{ .src = "(->> [1 2 3] (map inc) (filter odd?) (reduce +))", .expected = "3" },
+        .{ .src = "(dotimes [i 3] i)", .expected = "nil" },
+        .{ .src = "(when-let [x 1] (inc x))", .expected = "2" },
+        .{ .src = "(if-let [x nil] x :none)", .expected = ":none" },
+    });
+}
+
+// =============================================================================
+// VM.throwValue / VM.throwKeyword from native code
+// =============================================================================
+
+fn nativeBoom(v: *vm.VM, _: []const value_mod.Value) vm.VmError!value_mod.Value {
+    return v.throwKeyword("boom");
+}
+
+fn nativeBoomWith(v: *vm.VM, args: []const value_mod.Value) vm.VmError!value_mod.Value {
+    return v.throwValue(args[0]);
+}
+
+const native_boom = vm.NativeFn{ .name = "boom", .min_arity = 0, .max_arity = 0, .call = &nativeBoom };
+const native_boom_with = vm.NativeFn{ .name = "boom-with", .min_arity = 1, .max_arity = 1, .call = &nativeBoomWith };
+
+/// A Program whose core namespace also binds `boom` (throws :boom)
+/// and `boom-with` (throws its argument), both from native code.
+fn throwingProgram(program: *Program) !void {
+    try program.init();
+    errdefer program.deinit();
+    const boom_var = try program.registry.core.intern("boom");
+    boom_var.root = vm.nativeFnValue(&native_boom);
+    boom_var.bound = true;
+    const with_var = try program.registry.core.intern("boom-with");
+    with_var.root = vm.nativeFnValue(&native_boom_with);
+    with_var.bound = true;
+}
+
+fn expectThrowingOutput(src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try throwingProgram(&program);
+    defer program.deinit();
+    const result = try program.run(src);
+    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
+    defer buf.deinit();
+    try formatValue(&buf, result, program.interner);
+    testing.expectEqualStrings(expected, buf.items) catch |err| {
+        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
+        return err;
+    };
+}
+
+test "native throw: caught by the innermost handler wherever the native runs" {
+    try expectThrowingOutput("(try (boom) (catch any e e))", ":boom");
+    try expectThrowingOutput("(try (boom-with {:kind :custom}) (catch any e (:kind e)))", ":custom");
+    try expectThrowingOutput("(try (boom-with 42) (catch any e (inc e)))", "43");
+    // Through a closure, a higher-order native, apply and nesting.
+    try expectThrowingOutput("(try ((fn [] (boom))) (catch any e e))", ":boom");
+    try expectThrowingOutput("(try (map (fn [x] (boom-with x)) [1 2]) (catch any e e))", "1");
+    try expectThrowingOutput("(try (reduce (fn [a x] (if (= x 3) (boom-with a) (+ a x))) 0 [1 2 3 4]) (catch any e e))", "3");
+    try expectThrowingOutput("(try (apply boom []) (catch any e e))", ":boom");
+    try expectThrowingOutput("(try (try (boom) (catch any e (boom-with [:again e]))) (catch any e e))", "[:again :boom]");
+    // finally runs on the way out, and the VM keeps working afterwards.
+    try expectThrowingOutput(
+        \\(do
+        \\  (def log (atom []))
+        \\  (def r (try (boom) (catch any e (swap! log conj :caught) e) (finally (swap! log conj :finally))))
+        \\  [r @log (+ 1 2)])
+    , "[:boom [:caught :finally] 3]");
+    try expectThrowingOutput("(do (defn safe [f] (try (f) (catch any e [:err e]))) [(safe boom) (safe (fn [] :ok))])", "[[:err :boom] :ok]");
+}
+
+test "native throw: uncaught surfaces as UncaughtThrow with the value recorded" {
+    var program: Program = undefined;
+    try throwingProgram(&program);
+    defer program.deinit();
+    try testing.expectError(vm.VmError.UncaughtThrow, program.run("(boom-with :loose)"));
+    const thrown = program.v.unhandled_throw orelse return error.TestFailed;
+    try testing.expectEqualStrings("loose", program.interner.keywordName(thrown.asKeywordId()));
+}
+
+// =============================================================================
+// Unresolved symbols are compile errors located at the symbol
+// =============================================================================
+
+fn expectCheckedOutput(src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var span: ?reader_mod.SrcSpan = null;
+    const result = program.runChecked(src, &span) catch |err| {
+        std.debug.print("\n  source: {s}\n  error: {s} at {?}\n", .{ src, @errorName(err), span });
+        return err;
+    };
+    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
+    defer buf.deinit();
+    try formatValue(&buf, result, program.interner);
+    testing.expectEqualStrings(expected, buf.items) catch |err| {
+        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
+        return err;
+    };
+}
+
+/// The program must fail to compile with `UnresolvedSymbol`, and the
+/// reported span must cover exactly `symbol` in the source.
+fn expectUnresolved(src: []const u8, symbol: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var span: ?reader_mod.SrcSpan = null;
+    try testing.expectError(compile.CompileError.UnresolvedSymbol, program.runChecked(src, &span));
+    const sp = span orelse return error.TestFailed;
+    testing.expectEqualStrings(symbol, src[sp.pos .. sp.pos + sp.len]) catch |err| {
+        std.debug.print("\n  source: {s}\n  span: {?}\n", .{ src, span });
+        return err;
+    };
+}
+
+test "unresolved symbols: forward references across a file keep working" {
+    try expectCheckedOutput("(defn f [] (g)) (defn g [] 42) (f)", "42");
+    try expectCheckedOutput("(defn f [] (later 1)) (def later inc) (f)", "2");
+    try expectCheckedOutput("(declare later) (defn f [] (later 1)) (defn later [x] (* x 3)) (f)", "3");
+    try expectCheckedOutput("(do (defn h [] (i)) (defn i [] :i)) (h)", ":i");
+    try expectCheckedOutput("(defmacro m [] 1) (defn f [] (m)) (f)", "1");
+    try expectCheckedOutput("(defn uses [] (->P 1 2)) (defrecord P [x y]) (:y (uses))", "2");
+    try expectCheckedOutput("(defn a [s] (area s)) (defprotocol Shape (area [s])) (defrecord Sq [w]) (extend-type Sq Shape (area [s] (* (:w s) (:w s)))) (a (->Sq 3))", "9");
+    try expectCheckedOutput("(defn f [x] (-> x inc)) (f 1)", "2");
+    try expectCheckedOutput("(defn f [] (map inc [1 2])) (f)", "(2 3)");
+    try expectCheckedOutput("(defn f [] '(a b c)) (f)", "(a b c)");
+    try expectCheckedOutput("(let [{k :k} {:k 5} [p q] [1 2]] (+ k p q))", "8");
+    try expectCheckedOutput("(letfn [(ev? [n] (if (zero? n) true (od? (dec n)))) (od? [n] (if (zero? n) false (ev? (dec n))))] (ev? 4))", "true");
+    try expectCheckedOutput("(try (throw :x) (catch any e (str e)))", ":x");
+    try expectCheckedOutput("(for [x [1 2] y [10 20]] (+ x y))", "[11 21 12 22]");
+    try expectCheckedOutput("(def acc (atom [])) (doseq [x [1 2]] (swap! acc conj x)) @acc", "[1 2]");
+    try expectCheckedOutput("(ns other) (defn f [] (g)) (defn g [] :other) (f)", ":other");
+}
+
+test "unresolved symbols: a reference to nothing is a compile error at the symbol" {
+    try expectUnresolved("(defn f [x] (+ x y))", "y");
+    try expectUnresolved("(let [a 1]\n  (list a b))", "b");
+    try expectUnresolved("(defn f [x]\n  (-> x inc nope dec))", "nope");
+    try expectUnresolved("(fn [x] (missing-fn x))", "missing-fn");
+    try expectUnresolved("(defn f [] (g)) (defn g [] (h))", "h");
+    try expectUnresolved("(if true undefined-a undefined-b)", "undefined-a");
+    try expectUnresolved("(let [x 1] x) y", "y");
+    try expectUnresolved("(try 1 (catch any e (log e)))", "log");
+}
+
+test "unresolved symbols: a symbol a user macro produced is reported at the macro call" {
+    // Forms a core.nx (user) macro produces carry the call's span,
+    // so the report covers the call rather than the symbol.
+    const src = "(letfn [(a [n] (b n))] (a 1))";
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var span: ?reader_mod.SrcSpan = null;
+    try testing.expectError(compile.CompileError.UnresolvedSymbol, program.runChecked(src, &span));
+    const sp = span orelse return error.TestFailed;
+    try testing.expect(sp.pos + sp.len <= src.len);
+    try testing.expect(std.mem.indexOf(u8, src[sp.pos .. sp.pos + sp.len], "(b n)") != null);
+}
+
+test "unresolved symbols: nothing is interned for a rejected form" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var span: ?reader_mod.SrcSpan = null;
+    try testing.expectError(compile.CompileError.UnresolvedSymbol, program.runChecked("(defn f [] (ghost))", &span));
+    try testing.expect(program.registry.current.lookupLocal("ghost") == null);
 }

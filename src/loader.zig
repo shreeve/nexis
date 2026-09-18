@@ -182,6 +182,12 @@ pub const Loader = struct {
         // every def'd Var + Closure + Routine outlives the load.
         const ra = self.persistent_allocator;
 
+        // Every name the file defines is visible to every form in
+        // it; anything else unresolved is a compile error.
+        var declared = compile_mod.DeclaredNames.init(self.allocator);
+        defer declared.deinit();
+        for (forms) |form| declared.declareForm(form) catch return LoadError.OutOfMemory;
+
         for (forms) |form| {
             const current_ns = self.registry.current;
             // Phase 5 EXIT polish: pass `self` as the load_callback
@@ -201,6 +207,7 @@ pub const Loader = struct {
                 ra,
                 self.registry,
                 .{ .user_data = @ptrCast(self), .load = &Loader.loadCallback },
+                &declared,
             ) catch return LoadError.LoadCompileFailed;
             const routine = compiled.toRoutine("loader");
             self.vm.frames.items[0].routine = &routine;

@@ -372,7 +372,7 @@ Two levels of equality, with frozen semantics:
   - **Vars and durable refs**: identity-based (see §13.3, §15.2).
   - **Metadata**: **never** participates.
 
-Clojure's `==` for cross-type numeric equality is deferred to v2; v1 users who want `(= 1 1.0)` → true must explicitly cast.
+Clojure's `==` gives cross-type numeric equality: `(== 1 1.0)` → true. Arithmetic and ordered comparison use float contagion (see §8.3 and SEMANTICS.md §2.2).
 
 Hashing:
 
@@ -584,7 +584,7 @@ Deliberately minimal:
 - `fixnum` (i48) and `bignum` form the integer tower; promotion on overflow.
 - `float` (f64) is a separate type. `(= 1 1.0)` is **false**; use `(== 1 1.0)` helper if cross-type numeric equality is desired.
 - No rationals. No decimals. No complex.
-- Division of two integers yielding a non-integer result raises `:type-error` unless one operand is explicitly floated (`(/ 1.0 3)`), matching integer arithmetic discipline.
+- Arithmetic and ordered comparison use Clojure contagion: any float operand makes the operation f64. `/` of two integers yields an integer when exact and a float otherwise (`(/ 6 3)` → `2`, `(/ 7 2)` → `3.5`). A fixnum result outside i48 raises the catchable `:arithmetic-overflow` until bignum arithmetic exists; integer division by zero raises `:divide-by-zero`.
 - *(Decimal support can be resurrected later by borrowing em's Math module wholesale — the infrastructure is proven.)*
 
 ### 8.4 Interning — keyword / symbol asymmetry
@@ -2671,3 +2671,12 @@ spec changes downstream of each PLAN entry.
   (`:unserializable`). 4-sub-commit implementation split (5.3a–d).
   See `docs/PROTOCOLS.md` for the full spec, hand-trace, and
   amendment-log entry. Authority: peer-AI turn 84.
+
+- **2026-09-18 — Number tower contagion (§8.3 / §6.3).** Arithmetic
+  and ordered comparison between fixnum and float now follow Clojure
+  contagion instead of raising `:type-error`, `==` ships in v1 as the
+  cross-type numeric equality (§23 #11 keeps `(= 1 1.0)` false), and
+  `/` on two integers yields a float when the quotient is inexact,
+  since §23 #10 has no rationals. Fixnum overflow raises the catchable
+  `:arithmetic-overflow` until bignum arithmetic lands. SEMANTICS.md
+  §2.2 and §6.3 track this entry.

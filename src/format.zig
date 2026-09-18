@@ -154,8 +154,8 @@ pub fn format(
         .transient => try writer.writeAll("#<transient>"),
         .error_ => try writer.writeAll("#<error>"),
         .meta_symbol => try writer.writeAll("#<meta-symbol>"),
-        // Phase 1 numerics beyond fixnum: defer until kinds ship.
-        .float, .bignum, .byte_vector, .typed_vector => {
+        .float => try formatFloat(v.asFloat(), writer),
+        .bignum, .byte_vector, .typed_vector => {
             try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())});
         },
         else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),
@@ -183,6 +183,33 @@ pub fn formatToString(
 // =============================================================================
 // Per-kind helpers
 // =============================================================================
+
+/// Floats print the way Clojure prints doubles (SEMANTICS §6.3):
+/// the shortest round-trip decimal with a mandatory fraction
+/// (`1.0`, `2.5`, `-0.0`), switching to `1.0E10` / `1.5E-7`
+/// exponent form at or above 1e7 and below 1e-3, plus the
+/// literal spellings `NaN`, `Infinity` and `-Infinity`.
+fn formatFloat(f: f64, writer: *std.Io.Writer) Error!void {
+    if (std.math.isNan(f)) return writer.writeAll("NaN");
+    if (std.math.isInf(f)) return writer.writeAll(if (f > 0) "Infinity" else "-Infinity");
+    // Both spellings of a finite f64 fit comfortably: the
+    // shortest round-trip mantissa is at most 17 digits.
+    var buf: [64]u8 = undefined;
+    const mag = @abs(f);
+    if (mag != 0 and (mag >= 1e7 or mag < 1e-3)) {
+        const text = std.fmt.bufPrint(&buf, "{e}", .{f}) catch unreachable;
+        const e_idx = std.mem.indexOfScalar(u8, text, 'e').?;
+        const mantissa = text[0..e_idx];
+        try writer.writeAll(mantissa);
+        if (std.mem.indexOfScalar(u8, mantissa, '.') == null) try writer.writeAll(".0");
+        try writer.writeByte('E');
+        try writer.writeAll(text[e_idx + 1 ..]);
+        return;
+    }
+    const text = std.fmt.bufPrint(&buf, "{d}", .{f}) catch unreachable;
+    try writer.writeAll(text);
+    if (std.mem.indexOfScalar(u8, text, '.') == null) try writer.writeAll(".0");
+}
 
 fn formatString(v: Value, mode: FormatMode, writer: *std.Io.Writer) Error!void {
     const bytes = string_mod.asBytes(v);

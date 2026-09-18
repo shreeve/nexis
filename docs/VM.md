@@ -830,15 +830,15 @@ Phase 2.
 
 | Var | Name | Status | Operands | Semantics |
 |---|---|---|---|---|
-| 0 | `math:add` | step #2 | A=slot, B=any, C=any | `slot[A] := resolve(B) + resolve(C)`. v1: fixnum+fixnum only. Errors: `:integer-overflow`, `:kind-mismatch` |
-| 1 | `math:sub` | reserved | A=slot, B=any, C=any | subtraction |
-| 2 | `math:mul` | reserved | A=slot, B=any, C=any | multiplication |
-| 3 | `math:div` | reserved | A=slot, B=any, C=any | division (true) |
-| 4 | `math:idiv` | reserved | A=slot, B=any, C=any | integer division |
-| 5 | `math:mod` | reserved | A=slot, B=any, C=any | modulo |
+| 0 | `math:add` | wired | A=slot, B=any, C=any | `slot[A] := resolve(B) + resolve(C)` over the fixnum/float tower (SEMANTICS.md §2.2 contagion). Errors: `:arithmetic-overflow`, `:kind-mismatch` |
+| 1 | `math:sub` | wired | A=slot, B=any, C=any | subtraction, same tower and errors |
+| 2 | `math:mul` | wired | A=slot, B=any, C=any | multiplication, same tower and errors |
+| 3 | `math:div` | wired | A=slot, B=any, C=any | `/`: exact fixnum quotient stays fixnum, otherwise float. Errors: `:divide-by-zero` (integer), `:arithmetic-overflow`, `:kind-mismatch` |
+| 4 | `math:idiv` | wired | A=slot, B=any, C=any | `quot`: truncated division. Errors: `:divide-by-zero`, `:arithmetic-overflow`, `:kind-mismatch` |
+| 5 | `math:mod` | wired | A=slot, B=any, C=any | `mod`: floored remainder, sign of the divisor. Same errors as `math:idiv` |
 | 6 | `math:pow` | reserved | A=slot, B=any, C=any | exponentiation |
-| 7 | `math:neg` | reserved | A=slot, B=any, _ | unary negation |
-| 8 | `math:abs` | reserved | A=slot, B=any, _ | absolute value |
+| 7 | `math:neg` | wired | A=slot, B=any, _ | unary negation. Errors: `:arithmetic-overflow`, `:kind-mismatch` |
+| 8 | `math:abs` | wired | A=slot, B=any, _ | absolute value. Same errors as `math:neg` |
 
 #### 10.4 `closure` group variants
 
@@ -1005,7 +1005,7 @@ keyword; renames are breaking changes.
 | `:unresolved-var` | `var:load-var` resolves to an undefined Var | Linker should catch most cases; runtime catch is safety net |
 | `:divide-by-zero` | Fixnum or float `div` / `quot` / `rem` with zero divisor | Deterministic trap |
 | `:kind-mismatch` | `coll:*` opcode on a value of wrong kind (e.g., `map-get` on a vector) | Recoverable via try/catch |
-| `:not-callable` | `call:call` on a non-callable value | Recoverable |
+| `:not-callable` | `call:call` on a value that is neither a function nor invocable as a lookup (keywords, maps, sets and vectors are; PLAN §8.7) | Recoverable |
 | `:uncaught-throw` | `ctrl:throw` with no handler up the frame chain | Halts VM with error report |
 | `:extension-decode-failure` | Primary instruction expects extension but extension bytes malformed | Programming error; halts VM |
 | `:transient-frozen` | `transient_mod.*Bang` op on a finalized transient | Recoverable |
@@ -1017,7 +1017,7 @@ keyword; renames are breaking changes.
 | `:invalid-cell-state` | `closure:box-local` on an already-boxed slot (double-box), or `closure:init-cell` on an already-initialized cell | Programming error; halts VM |
 | `:uninitialized-cell` | `closure:get-cell` (or U-operand resolve) on a cell with `initialized = false` — placeholder not yet filled | Recoverable in principle but typically a compiler-emitted-out-of-order bug |
 | `:unsupported-write` | `store(u:N, ...)` attempted in v1 (writes to captured upvalues are reserved for Phase 3+ dynamic-binding rebinding) | Recoverable; user code shouldn't see this in v1 unless attempting a future feature |
-| `:integer-overflow` | Fixnum arithmetic overflowed i48 range AND bignum promotion is not yet wired for the offending opcode. Temporary trap (peer-AI turn 35) until bignum-arithmetic Scope B lands; remains useful afterward for bounded-integer ops, byte conversions, FFI, and unchecked-math variants | Recoverable |
+| `:arithmetic-overflow` | An integer result of `math:*` (or an arithmetic native) left the i48 fixnum range. Bignum promotion needs bignum arithmetic, which the runtime does not have, so the error is raised instead of losing precision | Recoverable |
 
 All errors are structured `Value`s (map with `:kind`, `:msg`,
 `:span` keys minimally) so user code can pattern-match.

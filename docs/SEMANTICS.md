@@ -98,11 +98,25 @@ Float (`f64`):
   `false`.
 - Float subnormals compare numerically; no flush-to-zero.
 
-Cross-type operators:
+Cross-type operators (PLAN §8.3):
 
-- `<`, `<=`, `>`, `>=` between numbers of mixed integer/float kinds throw
-  `:type-error` in v1. The user must explicitly cast. Future `==` for
-  cross-type numeric equality is deferred to v2 (PLAN §6.3 / §23 decision 11).
+- Arithmetic and ordered comparison follow Clojure contagion: an
+  operation with any float operand is carried out in f64 and yields a
+  float; two fixnums stay integral. `(< 1 1.5)` → `true`, `(+ 1 0.5)` →
+  `1.5`, `(max 1 2.0)` → `2.0`.
+- `==` is numeric equality under contagion: `(== 1 1.0)` → `true` while
+  `(= 1 1.0)` stays `false` (PLAN §23 decision 11). `==` is IEEE on NaN:
+  `(== nan nan)` → `false` even though `(= nan nan)` → `true`.
+- `/` on two fixnums yields a fixnum when the division is exact and a
+  float otherwise: `(/ 6 3)` → `2`, `(/ 7 2)` → `3.5`. There are no
+  rationals (PLAN §23 decision 10).
+- A fixnum result outside the i48 range raises `:arithmetic-overflow`
+  (catchable). Bignum promotion needs bignum arithmetic the runtime does
+  not have; the error keeps precision loss from being silent.
+- Integer `/` by zero, and `quot` / `rem` / `mod` by zero of any kind,
+  raise `:divide-by-zero`. Float `/` by zero is IEEE: `Infinity`,
+  `-Infinity` or `NaN`.
+- `even?` / `odd?` accept integers only (`:kind-mismatch` on a float).
 
 #### 2.3 Characters
 
@@ -359,10 +373,13 @@ For every value kind, a **pr-style** textual representation exists such that:
 - Integers print in decimal, no leading zeros, with `-` for negatives.
   Hex/binary source literals do **not** round-trip: `(pr-str 0x2A)` is
   `"42"`, and reading `"42"` back yields the same integer value.
-- Floats print with Zig's default `{d}` unless special:
-  - `+inf` → `"Infinity"` reading back requires `##Inf` (reserved for Phase
-    3 reader extension). Phase 0 prints `+inf` but does not commit to a
-    reading syntax yet; `docs/CODEC.md` will pin this.
+- Floats print the way Clojure prints doubles: the shortest decimal that
+  reads back to the same f64, always with a fraction (`1.0`, `2.5`,
+  `100.0`), switching to exponent form with a one-digit integer part at
+  or above `1e7` and below `1e-3` (`1.0E10`, `1.23456785E7`, `1.0E-4`).
+  Specials:
+  - `+inf` → `"Infinity"`; reading it back requires `##Inf` (reserved for
+    a reader extension; `docs/CODEC.md` will pin this).
   - `-inf` → `"-Infinity"`; same caveat.
   - Canonical NaN → `"NaN"`; reading it back is planned as `##NaN`.
 - `0.0` prints as `"0.0"`, `-0.0` prints as `"-0.0"`. Both read back as
