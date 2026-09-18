@@ -38,6 +38,16 @@ pub const Idents = struct {
         self.* = undefined;
     }
 
+    /// A cache holding the same committed mappings, which then diverges
+    /// on its own.
+    pub fn clone(self: *const Idents) !Idents {
+        var out = Idents.init(self.gpa, self.store, self.interner);
+        errdefer out.deinit();
+        out.by_intern = try self.by_intern.clone(self.gpa);
+        out.by_ident = try self.by_ident.clone(self.gpa);
+        return out;
+    }
+
     /// Record a committed mapping.
     pub fn remember(self: *Idents, intern_id: u32, id: u32) !void {
         try self.by_intern.put(self.gpa, intern_id, id);

@@ -313,7 +313,7 @@ sub-plans with the same output variables.
 | `(d/tx-range conn from to)` | vector of `{:t t :data [...]}` |
 | `(d/schema db)` | map ident → attribute map |
 | `(d/pull db pattern e)` / `(d/pull-many db pattern es)` | `*`, attribute lists, `{:ref [...]}`, reverse `:_attr`, `:limit`, component recursion |
-| `(d/with conn tx-data (fn [db-after report] ...))` | speculative transaction: applied in a write transaction, `db-after` reads through `beginReadChild`, aborted at scope exit; holds the write lock for the scope |
+| `(d/with conn tx-data (fn [db-after report] ...))` | speculative transaction: applied in a write transaction, `db-after` reads through `beginReadChild`, aborted at scope exit; holds the write lock for the scope, so `transact!` and `with` inside are `:nextomic/nested` |
 | `(d/sync conn)` | `Env.sync()` after `:none` loads |
 | `(d/with-conn [c path opts?] body...)` | connect for the extent of body; released on every exit, a throw keeps propagating |
 
@@ -337,8 +337,11 @@ All errors are keywords in the `nextomic` namespace and are catchable:
 `:nextomic/unknown-attribute`, `:nextomic/value-type`,
 `:nextomic/unique`, `:nextomic/conflict`, `:nextomic/no-entity`,
 `:nextomic/unbound-pattern`, `:nextomic/unsupported-range`,
-`:nextomic/basis-in-future`, `:nextomic/closed`, and `:nextomic/tx-data`
-for malformed tx-data or a lookup ref on a non-unique attribute. The one
+`:nextomic/basis-in-future`, `:nextomic/closed`, `:nextomic/tx-data`
+for malformed tx-data or a lookup ref on a non-unique attribute,
+`:nextomic/pull-syntax`, `:nextomic/history-view` (pull on a history
+db) and `:nextomic/nested` (`transact!` or `with` while a `with` holds
+the write transaction). The one
 exception carries its reason: a query syntax error throws the map
 `{:error :nextomic/query-syntax :message "..." :clause i}` (`:clause`
 present when the parser was inside a `:where` clause; an unknown

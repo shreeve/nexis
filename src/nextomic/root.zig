@@ -13,6 +13,7 @@ pub const db = @import("db.zig");
 pub const transact = @import("transact.zig");
 pub const relation = @import("relation.zig");
 pub const query = @import("query.zig");
+pub const pull = @import("pull.zig");
 pub const natives = @import("natives.zig");
 
 pub const Val = key.Val;
@@ -28,6 +29,7 @@ pub const Conn = db.Conn;
 pub const DbValue = db.DbValue;
 pub const Error = db.Error;
 pub const Report = transact.Report;
+pub const With = transact.With;
 pub const Op = transact.Op;
 pub const Relation = relation.Relation;
 pub const Cell = relation.Cell;
@@ -42,5 +44,6 @@ test {
     _ = transact;
     _ = relation;
     _ = query;
+    _ = pull;
     _ = natives;
 }
