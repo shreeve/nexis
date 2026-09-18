@@ -2295,39 +2295,19 @@ fn isIfn(k: Kind) bool {
 // it to vm.db_connections. `db/close` removes from the list +
 // frees. VM.deinit closes any remaining as a safety net.
 
-/// A one-instruction routine that throws its argument. Calling it
-/// through `vm.callValue` is how a native raises a payload of its
-/// own choosing: the VM routes the throw to the innermost handler
-/// exactly as it does for `(throw x)`.
-const raise_code = [_]vm_mod.Inst{vm_mod.asm_.throwOp(vm_mod.Operand.slot(0))};
-const raise_routine = vm_mod.Routine{
-    .code = &raise_code,
-    .consts = &.{},
-    .slot_count = 1,
-    .fixed_arity = 1,
-    .name = "db/raise",
-};
-
-/// Throw the keyword `name`. When a handler catches it the result
-/// is `ControlTransferred`, which the run loop resumes from. With no
-/// handler anywhere, the raise frame is dropped again and `raw` is
-/// returned, so a program that does not opt into `try` sees the
-/// same VmError taxonomy as for every other recoverable error.
+/// Throw the keyword `name` through `VM.throwKeyword`. When a
+/// handler catches it the result is `ControlTransferred`, which the
+/// run loop resumes from. With no handler anywhere the throw is
+/// withdrawn and `raw` is returned instead, so a program that does
+/// not opt into `try` sees the same VmError taxonomy as for every
+/// other recoverable error.
 fn throwKeyword(vm: *VM, name: []const u8, raw: VmError) VmError {
-    const id = vm.ensureInterner().internKeyword(name) catch return VmError.OutOfMemory;
-    const raise = vm.allocClosure(&raise_routine, &.{}) catch return VmError.OutOfMemory;
-    const frames_len = vm.frames.items.len;
-    const stack_len = vm.stack.items.len;
-    _ = vm.callValue(raise, &.{value_mod.fromKeywordId(id)}) catch |err| switch (err) {
-        VmError.UncaughtThrow => {
-            vm.frames.shrinkRetainingCapacity(frames_len);
-            vm.stack.shrinkRetainingCapacity(stack_len);
-            vm.unhandled_throw = null;
-            return raw;
-        },
-        else => return err,
-    };
-    return raw;
+    const err = vm.throwKeyword(name);
+    if (err == VmError.UncaughtThrow) {
+        vm.unhandled_throw = null;
+        return raw;
+    }
+    return err;
 }
 
 /// The keyword a storage-layer error surfaces as. Each emdb error

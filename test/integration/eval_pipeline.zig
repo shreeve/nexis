@@ -3305,3 +3305,74 @@ test "core: macros" {
         .{ .src = "(if-let [x nil] x :none)", .expected = ":none" },
     });
 }
+
+// =============================================================================
+// VM.throwValue / VM.throwKeyword from native code
+// =============================================================================
+
+fn nativeBoom(v: *vm.VM, _: []const value_mod.Value) vm.VmError!value_mod.Value {
+    return v.throwKeyword("boom");
+}
+
+fn nativeBoomWith(v: *vm.VM, args: []const value_mod.Value) vm.VmError!value_mod.Value {
+    return v.throwValue(args[0]);
+}
+
+const native_boom = vm.NativeFn{ .name = "boom", .min_arity = 0, .max_arity = 0, .call = &nativeBoom };
+const native_boom_with = vm.NativeFn{ .name = "boom-with", .min_arity = 1, .max_arity = 1, .call = &nativeBoomWith };
+
+/// A Program whose core namespace also binds `boom` (throws :boom)
+/// and `boom-with` (throws its argument), both from native code.
+fn throwingProgram(program: *Program) !void {
+    try program.init();
+    errdefer program.deinit();
+    const boom_var = try program.registry.core.intern("boom");
+    boom_var.root = vm.nativeFnValue(&native_boom);
+    boom_var.bound = true;
+    const with_var = try program.registry.core.intern("boom-with");
+    with_var.root = vm.nativeFnValue(&native_boom_with);
+    with_var.bound = true;
+}
+
+fn expectThrowingOutput(src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try throwingProgram(&program);
+    defer program.deinit();
+    const result = try program.run(src);
+    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
+    defer buf.deinit();
+    try formatValue(&buf, result, program.interner);
+    testing.expectEqualStrings(expected, buf.items) catch |err| {
+        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
+        return err;
+    };
+}
+
+test "native throw: caught by the innermost handler wherever the native runs" {
+    try expectThrowingOutput("(try (boom) (catch any e e))", ":boom");
+    try expectThrowingOutput("(try (boom-with {:kind :custom}) (catch any e (:kind e)))", ":custom");
+    try expectThrowingOutput("(try (boom-with 42) (catch any e (inc e)))", "43");
+    // Through a closure, a higher-order native, apply and nesting.
+    try expectThrowingOutput("(try ((fn [] (boom))) (catch any e e))", ":boom");
+    try expectThrowingOutput("(try (map (fn [x] (boom-with x)) [1 2]) (catch any e e))", "1");
+    try expectThrowingOutput("(try (reduce (fn [a x] (if (= x 3) (boom-with a) (+ a x))) 0 [1 2 3 4]) (catch any e e))", "3");
+    try expectThrowingOutput("(try (apply boom []) (catch any e e))", ":boom");
+    try expectThrowingOutput("(try (try (boom) (catch any e (boom-with [:again e]))) (catch any e e))", "[:again :boom]");
+    // finally runs on the way out, and the VM keeps working afterwards.
+    try expectThrowingOutput(
+        \\(do
+        \\  (def log (atom []))
+        \\  (def r (try (boom) (catch any e (swap! log conj :caught) e) (finally (swap! log conj :finally))))
+        \\  [r @log (+ 1 2)])
+    , "[:boom [:caught :finally] 3]");
+    try expectThrowingOutput("(do (defn safe [f] (try (f) (catch any e [:err e]))) [(safe boom) (safe (fn [] :ok))])", "[[:err :boom] :ok]");
+}
+
+test "native throw: uncaught surfaces as UncaughtThrow with the value recorded" {
+    var program: Program = undefined;
+    try throwingProgram(&program);
+    defer program.deinit();
+    try testing.expectError(vm.VmError.UncaughtThrow, program.run("(boom-with :loose)"));
+    const thrown = program.v.unhandled_throw orelse return error.TestFailed;
+    try testing.expectEqualStrings("loose", program.interner.keywordName(thrown.asKeywordId()));
+}

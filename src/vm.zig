@@ -3452,8 +3452,27 @@ pub const VM = struct {
         return null;
     }
 
-    /// Common throw-unwind logic. Used by `execCtrlThrow` and
-    /// by `finally-exit`'s `.throwing` continuation.
+    /// Throw `value` from native code exactly as `(throw value)`
+    /// does from bytecode. When a handler catches it the frames
+    /// and pc are already positioned at the handler and the result
+    /// is `ControlTransferred`, which the caller returns unchanged
+    /// so the run loop resumes there. With no handler anywhere the
+    /// result is `UncaughtThrow` and `unhandled_throw` holds the
+    /// value.
+    pub fn throwValue(self: *VM, value: Value) VmError {
+        self.unwindThrow(value) catch |err| return err;
+        return VmError.ControlTransferred;
+    }
+
+    /// `throwValue` of the keyword named `name`.
+    pub fn throwKeyword(self: *VM, name: []const u8) VmError {
+        const id = self.ensureInterner().internKeyword(name) catch return VmError.OutOfMemory;
+        return self.throwValue(value_mod.fromKeywordId(id));
+    }
+
+    /// Common throw-unwind logic. Used by `execCtrlThrow`,
+    /// `throwValue` and by `finally-exit`'s `.throwing`
+    /// continuation.
     fn unwindThrow(self: *VM, value: Value) VmError!void {
         const handler_idx = self.findThrowTarget() orelse {
             // No matching handler anywhere — uncaught.
