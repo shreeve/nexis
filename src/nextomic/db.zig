@@ -61,9 +61,6 @@ pub const Error = error{
     Closed,
     /// Malformed tx-data: `:nextomic/tx-data`.
     TxData,
-    /// A speculative `with` holds the connection's write transaction, so
-    /// another `transact` or `with` cannot begin: `:nextomic/nested`.
-    Nested,
 };
 
 // =============================================================================

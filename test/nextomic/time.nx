@@ -1,0 +1,72 @@
+; test/nextomic/time.nx — as-of, since, history (with a retract-then-
+; reassert sequence), tx-range, and db-values as values across time.
+
+(require '[nextomic :as d])
+
+(defn check [label ok]
+  (println (if ok "ok" "FAIL") label)
+  (when-not ok (throw :check-failed)))
+
+(defn vals-of [db e a] (mapv #(nth % 2) (d/datoms db :eavt e a)))
+(defn rows-of [db e a] (mapv #(vector (nth % 2) (nth % 3) (nth % 4)) (d/datoms db :eavt e a)))
+
+(def c (d/connect "time.edb"))
+(d/transact! c [{:db/ident :doc/title :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+                {:db/ident :doc/tags :db/valueType :db.type/keyword :db/cardinality :db.cardinality/many}])
+; t=2 schema; t=3 create; t=4 retitle; t=5 retract tag; t=6 reassert tag; t=7 retract title.
+(def r (d/transact! c [{:db/id "d" :doc/title "Draft" :doc/tags [:red :blue]}]))
+(def doc (get (:tempids r) "d"))
+(def db3 (d/db c))
+(d/transact! c [[:db/add doc :doc/title "Final"]])
+(def db4 (d/db c))
+(d/transact! c [[:db/retract doc :doc/tags :red]])
+(d/transact! c [[:db/add doc :doc/tags :red]])
+(d/transact! c [[:db/retract doc :doc/title "Final"]])
+(def db7 (d/db c))
+
+(check "basis advances per transaction" (= [3 4 7] [(d/basis-t db3) (d/basis-t db4) (d/basis-t db7)]))
+(check "a db-value taken earlier still answers as of its basis" (= ["Draft"] (vals-of db3 doc :doc/title)))
+(check "the current view has no title" (empty? (vals-of db7 doc :doc/title)))
+(check "equal views are equal values" (= (d/as-of db7 3) (d/as-of db7 3)))
+(check "a plain db and an as-of view at the same t are different values" (not= db3 (d/as-of db7 3)))
+(check "as-of composes to the older bound" (= (d/as-of db7 3) (d/as-of (d/as-of db7 5) 3)))
+
+(println (d/as-of db7 3))
+(println (vals-of (d/as-of db7 3) doc :doc/title))
+(println (vals-of (d/as-of db7 4) doc :doc/title))
+(println (vals-of (d/as-of db7 5) doc :doc/tags))
+(println (vals-of (d/as-of db7 6) doc :doc/tags))
+(check "as-of 0 sees nothing" (nil? (d/entity (d/as-of db7 0) doc)))
+(check "as-of before the schema has no attribute" (nil? (get (d/schema (d/as-of db7 1)) :doc/title)))
+
+; since: only facts asserted after T, from an empty state.
+(println (d/since db7 3))
+(println (vals-of (d/since db7 3) doc :doc/title))
+(check "since shows the reasserted tag, not the untouched one" (= [:red] (vals-of (d/since db7 4) doc :doc/tags)))
+(check "since after the last change is empty" (nil? (d/entity (d/since db7 7) doc)))
+
+; history: every assertion and retraction with its t and added flag.
+(println (d/history db7))
+(println (rows-of (d/history db7) doc :doc/title))
+(println (rows-of (d/history db7) doc :doc/tags))
+(check "history composes with as-of" (= [["Draft" 3 true]] (rows-of (d/as-of (d/history db7) 3) doc :doc/title)))
+(check "the history view is not equal to the current one" (not= db7 (d/history db7)))
+
+; tx-range over the log.
+(println (mapv :t (d/tx-range c)))
+(println (mapv :t (d/tx-range c 4)))
+(println (mapv :t (d/tx-range c 4 6)))
+(println (mapv :t (d/tx-range c nil 3)))
+(check "tx-range entries carry an instant" (every? #(pos? (:instant %)) (d/tx-range c)))
+(println (mapv (fn [[e a v t added]] [a v added])
+               (filterv (fn [[e a v t added]] (not= a :db/txInstant)) (:data (first (d/tx-range c 5 6))))))
+(check "tx-range past the end is empty" (empty? (d/tx-range c 99)))
+
+; A db-value stays usable after later transactions on its connection.
+(d/transact! c [[:db/add doc :doc/title "Again"]])
+(check "older db-value unaffected by later writes" (empty? (vals-of db7 doc :doc/title)))
+(check "history taken earlier stops at its basis" (= 4 (count (rows-of (d/history db7) doc :doc/tags))))
+(check "the new db sees the write" (= ["Again"] (vals-of (d/db c) doc :doc/title)))
+
+(d/release c)
+:time-done

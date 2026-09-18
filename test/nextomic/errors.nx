@@ -1,0 +1,54 @@
+; test/nextomic/errors.nx — every error keyword is catchable by try.
+
+(require '[nextomic :as d])
+
+(defn check [label ok]
+  (println (if ok "ok" "FAIL") label)
+  (when-not ok (throw :check-failed)))
+
+(defmacro caught [& body]
+  `(try (do ~@body :no-error) (catch any e# e#)))
+
+(def c (d/connect "errors.edb"))
+(d/transact! c [{:db/ident :user/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+                 :db/unique :db.unique/identity}
+                {:db/ident :user/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+                {:db/ident :user/boss :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}])
+(def r (d/transact! c [{:db/id "a" :user/email "a@x" :user/age 1} {:db/id "b" :user/email "b@x"}]))
+(def a (get (:tempids r) "a"))
+(def b (get (:tempids r) "b"))
+(def db (d/db c))
+
+(println (caught (d/transact! c [[:db/add a :user/nope 1]])))
+(println (caught (d/datoms db :eavt a :user/nope)))
+(println (caught (d/transact! c [[:db/add a :user/age "old"]])))
+(println (caught (d/datoms db :eavt a :user/age "old")))
+(println (caught (d/transact! c [[:db/add a :user/email "b@x"]])))
+(println (caught (d/transact! c [[:db/add a :user/age 2] [:db/add a :user/age 3]])))
+(println (caught (d/transact! c [[:db/add a :user/boss [:user/email "nobody@x"]]])))
+(println (caught (d/transact! c [[:db/add 0 :user/age 2]])))
+(println (caught (d/transact! c [[:db/add a :user/age]])))
+(println (caught (d/transact! c [[:db/nope a :user/age 1]])))
+(println (caught (d/transact! c "not tx-data")))
+(println (caught (d/entid db [:user/age 1])))
+(println (caught (d/connect "/")))
+(check "a failed transaction leaves the basis alone" (= (d/basis-t db) (d/basis-t (d/db c))))
+(check "the store still works after every failure" (= 1 (:user/age (d/entity (d/db c) a))))
+
+; Releasing: idempotent; every later use of the connection or of a
+; db-value taken from it is :nextomic/closed.
+(d/release c)
+(d/release c)
+(println (caught (d/db c)))
+(println (caught (d/transact! c [[:db/add a :user/age 2]])))
+(println (caught (d/entity db a)))
+(println (caught (d/datoms db :eavt a)))
+(println (caught (d/basis-t (d/as-of db 1))))
+(println (caught (d/tx-range c)))
+(println (caught (d/sync c)))
+(check "release is idempotent" (nil? (d/release c)))
+
+; The store reopens cleanly after all of that.
+(d/with-conn [c2 "errors.edb"]
+  (check "reopened store is at the last committed basis" (= 3 (d/basis-t (d/db c2)))))
+:errors-done

@@ -462,6 +462,24 @@ pub fn build(b: *std.Build) void {
     // the same module. Its test binary is `nextomic` below.
     // -------------------------------------------------------------------------
 
+    // nextomic_handle — the heap bodies of the `nextomic_conn` and
+    // `nextomic_db` kinds. Below dispatch, format and gc so their kind
+    // arms can print, compare, hash and trace the handles without
+    // importing the module above them.
+    const nextomic_handle_mod = b.createModule(.{
+        .root_source_file = b.path("src/nextomic/handle.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    nextomic_handle_mod.addImport("value", value_mod);
+    nextomic_handle_mod.addImport("heap", heap_mod);
+    nextomic_handle_mod.addImport("hash", hash_mod);
+    dispatch_mod.addImport("nextomic_handle", nextomic_handle_mod);
+    format_mod.addImport("nextomic_handle", nextomic_handle_mod);
+    gc_mod.addImport("nextomic_handle", nextomic_handle_mod);
+    const nextomic_handle_tests = b.addTest(.{ .root_module = nextomic_handle_mod });
+    const run_nextomic_handle_tests = b.addRunArtifact(nextomic_handle_tests);
+
     const nextomic_imports = [_]struct { name: []const u8, mod: *std.Build.Module }{
         .{ .name = "value", .mod = value_mod },
         .{ .name = "heap", .mod = heap_mod },
@@ -474,6 +492,11 @@ pub fn build(b: *std.Build) void {
         .{ .name = "codec", .mod = codec_mod },
         .{ .name = "dispatch", .mod = dispatch_mod },
         .{ .name = "emdb", .mod = emdb_mod },
+        // natives.zig: the VM (NativeFn, throwKeyword), the db.zig
+        // failure-name table and the handle bodies.
+        .{ .name = "vm", .mod = vm_mod },
+        .{ .name = "db", .mod = db_mod },
+        .{ .name = "nextomic_handle", .mod = nextomic_handle_mod },
     };
     const nextomic_mod = b.createModule(.{
         .root_source_file = b.path("src/nextomic/root.zig"),
@@ -540,6 +563,7 @@ pub fn build(b: *std.Build) void {
     const run_integration_nextomic_pull_tests = b.addRunArtifact(integration_nextomic_pull_tests);
 
     const nextomic_test_step = b.step("nextomic-test", "Run only the nextomic unit + property tests");
+    nextomic_test_step.dependOn(&run_nextomic_handle_tests.step);
     nextomic_test_step.dependOn(&run_nextomic_tests.step);
     nextomic_test_step.dependOn(&run_prop_nextomic_key_tests.step);
     nextomic_test_step.dependOn(&run_prop_nextomic_tx_tests.step);
@@ -600,6 +624,8 @@ pub fn build(b: *std.Build) void {
         dispatch: *std.Build.Module,
         stdlib: *std.Build.Module,
         loader: *std.Build.Module,
+        nextomic_handle: *std.Build.Module,
+        nextomic: *std.Build.Module,
     };
     const siblings: AllSiblings = .{
         .hash = hash_mod,
@@ -629,6 +655,8 @@ pub fn build(b: *std.Build) void {
         .dispatch = dispatch_mod,
         .stdlib = stdlib_mod,
         .loader = loader_mod,
+        .nextomic_handle = nextomic_handle_mod,
+        .nextomic = nextomic_mod,
     };
 
     const RuntimeTest = struct {
@@ -655,17 +683,17 @@ pub fn build(b: *std.Build) void {
         // Phase 5.3b: protocol test binary (Kind.protocol = 36 + Kind.protocol_fn = 37).
         .{ .name = "protocol", .path = "src/protocol.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "champ", "transient", "atom", "record", "protocol" } },
-        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "champ", "transient", "db", "atom", "record", "protocol" } },
-        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db", "atom", "record", "protocol" } },
+        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "champ", "transient", "db", "atom", "record", "protocol", "nextomic_handle" } },
+        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db", "atom", "record", "protocol", "nextomic_handle" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "string", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch", "record", "protocol" } },
         // Phase 5.2c: format test binary. Imports the menagerie of
         // consumer kinds; nothing depends on format itself.
-        .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol" } },
+        .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch", "heap", "string" } },
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string" } },
-        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol" } },
+        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol", "nextomic" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
     };
 
@@ -678,7 +706,37 @@ pub fn build(b: *std.Build) void {
         });
         for (f.imports) |imp_name| {
             const mod: *std.Build.Module =
-                if (std.mem.eql(u8, imp_name, "hash")) siblings.hash else if (std.mem.eql(u8, imp_name, "value")) siblings.value else if (std.mem.eql(u8, imp_name, "eq")) siblings.eq else if (std.mem.eql(u8, imp_name, "heap")) siblings.heap else if (std.mem.eql(u8, imp_name, "string")) siblings.string else if (std.mem.eql(u8, imp_name, "list")) siblings.list else if (std.mem.eql(u8, imp_name, "vector")) siblings.vector else if (std.mem.eql(u8, imp_name, "bignum")) siblings.bignum else if (std.mem.eql(u8, imp_name, "intern")) siblings.intern else if (std.mem.eql(u8, imp_name, "champ")) siblings.champ else if (std.mem.eql(u8, imp_name, "transient")) siblings.transient else if (std.mem.eql(u8, imp_name, "atom")) siblings.atom else if (std.mem.eql(u8, imp_name, "record")) siblings.record else if (std.mem.eql(u8, imp_name, "protocol")) siblings.protocol else if (std.mem.eql(u8, imp_name, "format")) siblings.format else if (std.mem.eql(u8, imp_name, "gc")) siblings.gc else if (std.mem.eql(u8, imp_name, "codec")) siblings.codec else if (std.mem.eql(u8, imp_name, "db")) siblings.db else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb else if (std.mem.eql(u8, imp_name, "pool")) siblings.pool else if (std.mem.eql(u8, imp_name, "vm")) siblings.vm else if (std.mem.eql(u8, imp_name, "compile")) siblings.compile else if (std.mem.eql(u8, imp_name, "reader")) siblings.reader else if (std.mem.eql(u8, imp_name, "expand")) siblings.expand else if (std.mem.eql(u8, imp_name, "dispatch")) siblings.dispatch else if (std.mem.eql(u8, imp_name, "stdlib")) siblings.stdlib else if (std.mem.eql(u8, imp_name, "loader")) siblings.loader else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb else @panic("unknown sibling import");
+                if (std.mem.eql(u8, imp_name, "hash")) siblings.hash
+                else if (std.mem.eql(u8, imp_name, "value")) siblings.value
+                else if (std.mem.eql(u8, imp_name, "eq")) siblings.eq
+                else if (std.mem.eql(u8, imp_name, "heap")) siblings.heap
+                else if (std.mem.eql(u8, imp_name, "string")) siblings.string
+                else if (std.mem.eql(u8, imp_name, "list")) siblings.list
+                else if (std.mem.eql(u8, imp_name, "vector")) siblings.vector
+                else if (std.mem.eql(u8, imp_name, "bignum")) siblings.bignum
+                else if (std.mem.eql(u8, imp_name, "intern")) siblings.intern
+                else if (std.mem.eql(u8, imp_name, "champ")) siblings.champ
+                else if (std.mem.eql(u8, imp_name, "transient")) siblings.transient
+                else if (std.mem.eql(u8, imp_name, "atom")) siblings.atom
+                else if (std.mem.eql(u8, imp_name, "record")) siblings.record
+                else if (std.mem.eql(u8, imp_name, "protocol")) siblings.protocol
+                else if (std.mem.eql(u8, imp_name, "format")) siblings.format
+                else if (std.mem.eql(u8, imp_name, "gc")) siblings.gc
+                else if (std.mem.eql(u8, imp_name, "codec")) siblings.codec
+                else if (std.mem.eql(u8, imp_name, "db")) siblings.db
+                else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb
+                else if (std.mem.eql(u8, imp_name, "pool")) siblings.pool
+                else if (std.mem.eql(u8, imp_name, "vm")) siblings.vm
+                else if (std.mem.eql(u8, imp_name, "compile")) siblings.compile
+                else if (std.mem.eql(u8, imp_name, "reader")) siblings.reader
+                else if (std.mem.eql(u8, imp_name, "expand")) siblings.expand
+                else if (std.mem.eql(u8, imp_name, "dispatch")) siblings.dispatch
+                else if (std.mem.eql(u8, imp_name, "stdlib")) siblings.stdlib
+                else if (std.mem.eql(u8, imp_name, "nextomic_handle")) siblings.nextomic_handle
+                else if (std.mem.eql(u8, imp_name, "nextomic")) siblings.nextomic
+                else if (std.mem.eql(u8, imp_name, "loader")) siblings.loader
+                else if (std.mem.eql(u8, imp_name, "emdb")) siblings.emdb
+                else @panic("unknown sibling import");
             m.addImport(imp_name, mod);
         }
 
@@ -1047,6 +1105,53 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Build and run nexis (forwards args after `--`)");
     run_step.dependOn(&run_nexis.step);
 
+    // -------------------------------------------------------------------------
+    // test/nextomic/*.nx — end-to-end Nextomic scripts run through the
+    // nexis binary (NEXTOMIC.md §8). Every script and its expected
+    // stdout are copied into one generated directory that is also the
+    // scripts' working directory, so the store files they create are
+    // fresh whenever the binary or a script changes and the persistence
+    // pair shares one file. Scripts run in the listed order.
+    // -------------------------------------------------------------------------
+
+    const nextomic_nx_step = b.step("nextomic-nx", "Run the test/nextomic end-to-end scripts through bin/nexis");
+    {
+        const scripts = [_][]const u8{
+            "basics",
+            "indexes",
+            "time",
+            "errors",
+            "query",
+            "with-conn",
+            "persist-1",
+            "persist-2",
+        };
+        const scratch = b.addWriteFiles();
+        _ = scratch.addCopyFile(nexis_exe.getEmittedBin(), "nexis");
+        for (scripts) |name| {
+            _ = scratch.addCopyFile(b.path(b.fmt("test/nextomic/{s}.nx", .{name})), b.fmt("{s}.nx", .{name}));
+            _ = scratch.addCopyFile(b.path(b.fmt("test/nextomic/{s}.out", .{name})), b.fmt("{s}.out", .{name}));
+        }
+        var previous: ?*std.Build.Step = null;
+        for (scripts) |name| {
+            const expected = b.build_root.handle.readFileAlloc(
+                b.graph.io,
+                b.fmt("test/nextomic/{s}.out", .{name}),
+                b.allocator,
+                .limited(1 << 20),
+            ) catch @panic("test/nextomic: missing expected-output file");
+            const run = b.addRunArtifact(nexis_exe);
+            run.addArg("run");
+            run.addArg(b.fmt("{s}.nx", .{name}));
+            run.setCwd(scratch.getDirectory());
+            run.expectExitCode(0);
+            run.expectStdOutEqual(expected);
+            if (previous) |p| run.step.dependOn(p);
+            previous = &run.step;
+        }
+        nextomic_nx_step.dependOn(previous.?);
+    }
+
     const golden_mod = b.createModule(.{
         .root_source_file = b.path("src/golden.zig"),
         .target = target,
@@ -1125,6 +1230,7 @@ pub fn build(b: *std.Build) void {
     // Phase 2 step #11 — eval-pipeline integration tests.
     phase2_test_step.dependOn(&run_integration_eval_tests.step);
     // nextomic storage layer: unit + property binaries.
+    phase2_test_step.dependOn(&run_nextomic_handle_tests.step);
     phase2_test_step.dependOn(&run_nextomic_tests.step);
     phase2_test_step.dependOn(&run_prop_nextomic_key_tests.step);
     phase2_test_step.dependOn(&run_prop_nextomic_tx_tests.step);
@@ -1141,7 +1247,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_transient_tests.step);
     test_step.dependOn(&run_prop_codec_tests.step);
     test_step.dependOn(&run_prop_db_tests.step);
+    test_step.dependOn(&run_nextomic_handle_tests.step);
     test_step.dependOn(&run_nextomic_tests.step);
+    test_step.dependOn(nextomic_nx_step);
     test_step.dependOn(&run_prop_nextomic_key_tests.step);
     test_step.dependOn(&run_prop_nextomic_tx_tests.step);
     test_step.dependOn(&run_integration_nextomic_q_tests.step);

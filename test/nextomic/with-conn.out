@@ -1,0 +1,8 @@
+ok with-conn returns the body's value
+ok the connection is released on normal exit
+#nextomic/conn "with-conn.edb"
+ok the throw propagates
+ok the connection is released on throw
+ok the transaction committed before the throw persisted
+ok nested with-conn on another store
+:with-conn-done

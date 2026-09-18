@@ -1250,11 +1250,22 @@ pub fn lowerForm(
     return lowerFormEnv(allocator, form, .{});
 }
 
+/// Intern a keyword Form's full text: `ns/name` when qualified.
+fn internKeywordForm(allocator: std.mem.Allocator, interner: *intern_mod.Interner, name: anytype) !value_mod.Value {
+    if (name.ns) |ns_prefix| {
+        const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ns_prefix, name.name });
+        defer allocator.free(full);
+        return interner.internKeywordValue(full);
+    }
+    return interner.internKeywordValue(name.name);
+}
+
 /// Internal `lowerForm` with LowerEnv threading (step #7b). The
 /// env is consulted ONLY when classifying list-head symbols as
 /// intrinsics vs ordinary calls. Recursion into sub-expressions
 /// passes the env through unchanged; binding forms (let*, fn*,
 /// loop*, letfn*) construct a child env that adds their bindings.
+
 fn lowerFormEnv(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
@@ -1283,10 +1294,11 @@ fn lowerFormEnv(
         // Step E1: bare keywords are self-evaluating per Clojure
         // semantics. Lowers to Tiny.literal via the Interner.
         // Without an Interner, falls back to UnsupportedFeature.
+        // A qualified keyword interns its full `ns/name` text, the
+        // same way qualified symbols do.
         .keyword => |name| blk: {
-            if (name.ns != null) return CompileError.UnsupportedFeature;
             const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            const v = interner.internKeywordValue(name.name) catch return CompileError.OutOfMemory;
+            const v = internKeywordForm(allocator, interner, name) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
         // Floats and chars are immediates: they lower straight
@@ -1583,9 +1595,8 @@ fn lowerQuotePayload(
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
         .keyword => |name| blk: {
-            if (name.ns != null) return CompileError.UnsupportedFeature;
             const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            const v = interner.internKeywordValue(name.name) catch return CompileError.OutOfMemory;
+            const v = internKeywordForm(allocator, interner, name) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
         // Step #8c.1 (peer-AI turn 58 §D6): quoted compound list.

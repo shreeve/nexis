@@ -1,0 +1,10 @@
+ok basis persisted
+{:city/name Turin, :city/population 870000, :city/mood :calm}
+{:city/name Genoa, :city/population 560000}
+ok keyword values survive a reopen
+ok history survives a reopen
+ok the schema survives a reopen
+[1 2 3 4]
+ok writing continues from the persisted t
+3
+nil

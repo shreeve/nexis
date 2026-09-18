@@ -61,6 +61,12 @@ const SyncMode = store_mod.SyncMode;
 // Public types
 // =============================================================================
 
+pub const Error = error{
+    /// A speculative `with` holds the connection's write transaction, so
+    /// another `transact` or `with` cannot begin: `:nextomic/nested`.
+    Nested,
+};
+
 pub const Options = struct {
     /// Overrides the connection's sync mode for this commit.
     sync: ?SyncMode = null,

@@ -1,0 +1,99 @@
+; examples/nextomic-app.nx — a small clinic chart on Nextomic
+; (docs/NEXTOMIC.md). Patients are upserted by medical record number,
+; visits by their own id, so the script is safe to run again: the
+; store under tmp/ keeps every fact it ever learned, the queries ask
+; the chart questions as Datalog, and the reads at the end show how it
+; looked at each transaction.
+;
+;   ./bin/nexis run examples/nextomic-app.nx
+
+(require '[nextomic :as d])
+
+(def schema
+  [{:db/ident :patient/mrn :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity :db/doc "Medical record number"}
+   {:db/ident :patient/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :patient/born :db/valueType :db.type/instant :db/cardinality :db.cardinality/one}
+   {:db/ident :patient/allergies :db/valueType :db.type/keyword :db/cardinality :db.cardinality/many}
+   {:db/ident :patient/primary :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
+   {:db/ident :clinician/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :visit/id :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :visit/patient :db/valueType :db.type/ref :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :visit/reason :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :visit/weight-kg :db/valueType :db.type/double :db/cardinality :db.cardinality/one}
+   {:db/ident :visit/notes :db/valueType :db.type/ref :db/cardinality :db.cardinality/many
+    :db/isComponent true}
+   {:db/ident :note/text :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
+
+(defn patient [db mrn] (d/entity db [:patient/mrn mrn]))
+
+(defn visits-of [db mrn]
+  ; VAET answers "which entities point at this patient?"; the visit
+  ; attribute narrows it to visits.
+  (mapv (fn [[visit-eid a v t added]] (d/entity db visit-eid))
+        (d/datoms db :vaet (d/entid db [:patient/mrn mrn]) :visit/patient)))
+
+(d/with-conn [c "tmp/clinic.edb"]
+  (d/transact! c schema)
+  (let [; Intake: the clinician and two patients. Tempids are strings;
+        ; "datomic.tx" annotates the transaction itself.
+        intake (d/transact! c [{:db/id "dr" :clinician/name "Dr. Okafor"}
+                               {:patient/mrn "MRN-1001" :patient/name "Mara Quist" :patient/born 631152000000
+                                :patient/allergies [:penicillin] :patient/primary "dr"}
+                               {:patient/mrn "MRN-1002" :patient/name "Teo Lund" :patient/born 946684800000
+                                :patient/primary "dr"}
+                               [:db/add "datomic.tx" :db/doc "intake"]])
+        ; A visit with component notes; weight recorded as a double.
+        first-visit (d/transact! c [{:visit/id "V-1" :visit/patient [:patient/mrn "MRN-1001"]
+                                     :visit/reason "annual" :visit/weight-kg 62.5
+                                     :visit/notes [{:note/text "BP normal"} {:note/text "advised flu shot"}]}])
+        ; Corrections are ordinary assertions: card-one replaces,
+        ; card-many accumulates, a retraction removes exactly one fact.
+        correction (d/transact! c [[:db/add [:visit/id "V-1"] :visit/weight-kg 63.0]
+                                   [:db/add [:patient/mrn "MRN-1001"] :patient/allergies :latex]
+                                   [:db/retract [:patient/mrn "MRN-1001"] :patient/allergies :penicillin]])
+        db (d/db c)]
+    (println "intake at t =" (:tx intake) ", basis now" (d/basis-t db))
+    (println "Mara today:" (dissoc (patient db "MRN-1001") :db/id :patient/primary))
+    (println "Mara's visits:" (mapv :visit/reason (visits-of db "MRN-1001")))
+    (println "V-1 notes:" (mapv (fn [note] (:note/text (d/entity db note)))
+                                (:visit/notes (d/entity db [:visit/id "V-1"]))))
+
+    ; The same questions as Datalog. A query is data: patterns join on
+    ; shared variables, `:in` binds inputs after the db, predicates and
+    ; aggregates run inside the query, and the result is an ordinary set.
+    (println "latex allergies:"
+             (d/q '[:find [?name ...] :where [?p :patient/allergies :latex] [?p :patient/name ?name]] db))
+    (println "visits per patient:"
+             (sort (d/q '[:find ?name (count ?v) :where [?v :visit/patient ?p] [?p :patient/name ?name]] db)))
+    (println "visits over 60 kg:"
+             (d/q '[:find ?id ?kg :in $ ?min :where [?v :visit/weight-kg ?kg] [(> ?kg ?min)] [?v :visit/id ?id]] db 60.0))
+    (println "Dr. Okafor's patients:"
+             (sort (d/q '[:find [?name ...] :where [?dr :clinician/name "Dr. Okafor"] [?p :patient/primary ?dr]
+                          [?p :patient/name ?name]] db)))
+
+    ; Time travel: the chart as it stood right after intake, and the
+    ; full history of one attribute.
+    (println "Mara at intake:" (:patient/allergies (patient (d/as-of db (:tx intake)) "MRN-1001")))
+    (println "weight history:"
+             (mapv (fn [[e a v t added]] [v t added])
+                   (d/datoms (d/history db) :eavt [:visit/id "V-1"] :visit/weight-kg)))
+    (println "what changed in the correction:"
+             (mapv (fn [[e a v t added]] [(d/ident db a) v added])
+                   (filterv (fn [[e a v t added]] (not= a :db/txInstant))
+                            (:data (first (d/tx-range c (:tx correction) (inc (:tx correction))))))))
+
+    ; A unique identity is a promise: the same MRN with another name is
+    ; an update of the same patient, and a second entity claiming a
+    ; taken visit id is refused.
+    (d/transact! c [{:patient/mrn "MRN-1002" :patient/name "Teodor Lund"}])
+    (println "Teo renamed:" (:patient/name (patient (d/db c) "MRN-1002")))
+    (println "conflict:"
+             (try (d/transact! c [[:db/add [:patient/mrn "MRN-1002"] :visit/id "V-1"]])
+                  (catch any e e)))
+
+    (println "patients:" (count (d/datoms (d/db c) :aevt :patient/mrn))
+             "visits:" (count (d/datoms (d/db c) :aevt :visit/id))
+             "basis:" (d/basis-t (d/db c)))))

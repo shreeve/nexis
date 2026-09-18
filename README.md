@@ -56,6 +56,8 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Phase 4.0d | ✅ shipped | `db/scan` (eager, ordered, range-bounded) + `db/reduce-tree` (server-side reduce) |
 | **Phase 4.0e** | ✅ **shipped** | **EXIT DEMO** — `examples/todo-app.nx`. Persistent to-do tracker. State PERSISTS across `nexis run` invocations. |
 | Phase 4.0f | ✅ shipped | Snapshot vocabulary (`db/snapshot` / `db/release-snapshot!` / `db/snapshot?` / `(with-snapshot ...)`). Time-travel reads through pinned MVCC snapshots. |
+| Nextomic natives | ✅ shipped | The `nextomic` namespace over the datom storage layer ([`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) §6): `connect`/`release`/`db`/`basis-t`/`transact!`/`entity`/`entid`/`ident`/`datoms`/`as-of`/`since`/`history`/`tx-range`/`schema`/`sync`, `with-conn`, `nextomic_conn`/`nextomic_db` value kinds, every error a catchable `:nextomic/*` keyword. `test/nextomic/*.nx` run through `bin/nexis` under `zig build test`; `examples/nextomic-app.nx`. |
+| Nextomic query | ✅ shipped | `d/q` and `d/explain` over the Datalog pipeline (§5): patterns, every `:in` form, predicates and function bindings that call any Lisp function through the namespace registry, aggregates, every find spec, `not`/`or` and their `-join` forms, recursive rules, time views; parsed queries cached per VM; `test/nextomic/query.nx`. `pull` and `with` are separate natives, not yet installed. |
 
 **558 tests** green: 95 VM + 313 compile + 6 macroexpand + 4
 property + 54 integration in `phase2-test` (~3s), plus 86 reader
@@ -369,6 +371,31 @@ A Datomic-class embedded database, built as a nexis library on top of
 emdb. Not a v1 deliverable; the substrate is intentionally designed to
 support it without retrofitting. See [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md)
 for the architecture reference.
+
+## Querying
+
+Nextomic answers Datalog. A query is a quoted vector, the db is the
+`$` input and the rest follow `:in`; any Lisp function, including one
+you just `defn`'d, can serve as a predicate or produce a binding:
+
+```clojure
+(require '[nextomic :as d])
+
+(defn adult? [age] (>= age 30))
+
+(d/q '[:find ?name ?age
+       :in $ ?min
+       :where [?p :person/age ?age]
+              [(> ?age ?min)]
+              [(adult? ?age)]
+              [?p :person/name ?name]]
+     (d/db conn) 20)
+;; => #{["Ann" 30] ["Cy" 41]}
+```
+
+`examples/nextomic-app.nx` walks a clinic chart through joins, `:in`,
+a predicate and an aggregate; `test/nextomic/query.nx` covers the whole
+surface, and `(d/explain query db)` prints the plan.
 
 ## License
 

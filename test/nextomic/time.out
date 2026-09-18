@@ -1,0 +1,33 @@
+ok basis advances per transaction
+ok a db-value taken earlier still answers as of its basis
+ok the current view has no title
+ok equal views are equal values
+ok a plain db and an as-of view at the same t are different values
+ok as-of composes to the older bound
+#nextomic/db {:basis-t 7 :mode :as-of :as-of 3}
+[Draft]
+[Final]
+[:blue]
+[:red :blue]
+ok as-of 0 sees nothing
+ok as-of before the schema has no attribute
+#nextomic/db {:basis-t 7 :mode :since :since 3}
+[]
+ok since shows the reasserted tag, not the untouched one
+ok since after the last change is empty
+#nextomic/db {:basis-t 7 :mode :history}
+[[Draft 3 true] [Draft 4 false] [Final 4 true] [Final 7 false]]
+[[:red 3 true] [:red 5 false] [:red 6 true] [:blue 3 true]]
+ok history composes with as-of
+ok the history view is not equal to the current one
+[1 2 3 4 5 6 7]
+[4 5 6 7]
+[4 5]
+[1 2]
+ok tx-range entries carry an instant
+[[:doc/tags :red false]]
+ok tx-range past the end is empty
+ok older db-value unaffected by later writes
+ok history taken earlier stops at its basis
+ok the new db sees the write
+:time-done

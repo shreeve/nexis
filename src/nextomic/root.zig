@@ -14,6 +14,7 @@ pub const transact = @import("transact.zig");
 pub const relation = @import("relation.zig");
 pub const query = @import("query.zig");
 pub const pull = @import("pull.zig");
+pub const natives = @import("natives.zig");
 
 pub const Val = key.Val;
 pub const ValueType = key.ValueType;
@@ -44,4 +45,5 @@ test {
     _ = relation;
     _ = query;
     _ = pull;
+    _ = natives;
 }

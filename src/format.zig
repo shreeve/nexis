@@ -53,6 +53,7 @@ const atom_mod = @import("atom");
 const db_mod = @import("db");
 const record_mod = @import("record");
 const protocol_mod = @import("protocol");
+const nextomic_handle = @import("nextomic_handle");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -149,6 +150,8 @@ pub fn format(
         ),
         .durable_ref => try formatDurableRef(v, writer, interner),
         .db_connection => try writer.writeAll("#<db-connection>"),
+        .nextomic_conn => try nextomic_handle.formatConn(v, writer),
+        .nextomic_db => try nextomic_handle.formatDb(v, writer),
         .db_write_txn => try writer.writeAll("#<db-write-txn>"),
         .db_read_txn => try writer.writeAll("#<db-read-txn>"),
         .transient => try writer.writeAll("#<transient>"),

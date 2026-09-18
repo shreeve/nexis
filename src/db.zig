@@ -71,6 +71,41 @@ pub const DbError = error{
     NotADurableRef,
 };
 
+/// The keyword a storage-layer error surfaces as at the language
+/// level (DB.md §8). Each emdb error set with a distinct cause gets
+/// its own name; the rest share `:db-error`. Codec errors keep
+/// `:codec-failed`.
+pub fn failureName(err: anyerror) []const u8 {
+    return switch (err) {
+        error.KeyTooLarge => "db/key-too-large",
+        error.ValueTooLarge => "db/value-too-large",
+        error.MaxDbsReached => "db/max-trees",
+        error.NotFound => "db/not-found",
+        error.Corrupted, error.InvalidPage, error.FormatVersionMismatch => "db/corrupted",
+        error.DatabaseFull => "db/map-full",
+        error.MmapFailed => "db/mmap-failed",
+        error.OpenFailed => "db/open-failed",
+        error.PageSizeMismatch, error.InvalidPageSize => "db/page-size-mismatch",
+        error.WriterActive, error.EnvBusy => "db/busy",
+        error.TxnAborted => "db/txn-aborted",
+        error.TxnReadOnly => "db/read-only",
+        error.SyncFailed => "db/sync-failed",
+        error.StoreMismatch => "db/store-mismatch",
+        error.ConnectionUnavailable => "db/no-connection",
+        error.InvalidTreeName, error.InvalidKey => "db/invalid-key",
+        error.UnserializableKind,
+        error.TruncatedInput,
+        error.TrailingBytes,
+        error.InvalidVersion,
+        error.InvalidKindByte,
+        error.InvalidLeb128,
+        error.InvalidCharScalar,
+        error.MalformedPayload,
+        => "codec-failed",
+        else => "db-error",
+    };
+}
+
 // =============================================================================
 // Connection (DB.md §3)
 //
