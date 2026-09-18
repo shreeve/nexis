@@ -3,7 +3,10 @@
 //! A `Conn` owns the store, the ident cache and the schema cache. A
 //! `DbValue` is a plain value `{conn, basis, as_of, since, history}`
 //! with no open read transaction: every operation opens one, reads
-//! `sys["t"]` as `now`, and closes it. Invariants:
+//! `sys["t"]` as `now`, and closes it. A speculative `with`
+//! (transact.zig) makes a second `Conn` over the same store whose
+//! reads are read-only children of the held write transaction, with
+//! ident and schema caches of its own. Invariants:
 //!   - `now == basis` in current mode reads the current trees with no
 //!     fold; any other view folds the history trees (`Store.FoldScan`).
 //!   - `now < basis` is `error.BasisInFuture`; the db-value is dead.
@@ -58,6 +61,9 @@ pub const Error = error{
     Closed,
     /// Malformed tx-data: `:nextomic/tx-data`.
     TxData,
+    /// A speculative `with` holds the connection's write transaction, so
+    /// another `transact` or `with` cannot begin: `:nextomic/nested`.
+    Nested,
 };
 
 // =============================================================================
@@ -77,6 +83,12 @@ pub const Conn = struct {
     schema_cache: ?*Schema = null,
     sync_mode: SyncMode,
     is_open: bool,
+    /// The write transaction this connection reads through, as
+    /// read-only children: set on the view of a speculative `with`.
+    overlay: ?*Txn = null,
+    /// The view of the speculative `with` holding this connection's
+    /// write transaction, while it is open.
+    speculative: ?*Conn = null,
 
     /// Open or create the store at `path`; bootstrap on first open.
     /// `interner` is the VM's keyword table and outlives the connection.
@@ -113,10 +125,17 @@ pub const Conn = struct {
         self.gpa.destroy(self);
     }
 
+    /// A read transaction for one operation: a fresh reader, or a
+    /// read-only child of the held write transaction on a `with` view.
+    pub fn beginReadTxn(self: *Conn) !*Txn {
+        if (!self.is_open) return error.Closed;
+        if (self.overlay) |w| return self.store.beginReadChild(w);
+        return self.store.beginRead();
+    }
+
     /// A db-value at the current basis.
     pub fn db(self: *Conn) !DbValue {
-        if (!self.is_open) return error.Closed;
-        const txn = try self.store.beginRead();
+        const txn = try self.beginReadTxn();
         defer txn.abort();
         return .{ .conn = self, .basis = try self.store.readT(txn) };
     }
@@ -217,8 +236,7 @@ pub const DbValue = struct {
 
     /// Open a read transaction for one operation and check the basis.
     pub fn beginRead(self: DbValue) !Read {
-        if (!self.conn.is_open) return error.Closed;
-        const txn = try self.conn.store.beginRead();
+        const txn = try self.conn.beginReadTxn();
         errdefer txn.abort();
         const now = try self.conn.store.readT(txn);
         if (now < self.basis) return error.BasisInFuture;
@@ -485,8 +503,7 @@ pub const TxEntry = struct {
 
 /// Txlog entries with `from <= t < to` (an absent `to` runs to the newest).
 pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
-    if (!conn.is_open) return error.Closed;
-    const txn = try conn.store.beginRead();
+    const txn = try conn.beginReadTxn();
     defer txn.abort();
     const now = try conn.store.readT(txn);
     const schema = try conn.schemaAt(txn, now, now);

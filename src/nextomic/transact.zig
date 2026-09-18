@@ -22,6 +22,11 @@
 //!
 //! Any error aborts the write transaction; nothing partial can exist.
 //! Everything the transaction allocates lives in the caller's arena.
+//!
+//! A speculative `with` runs steps 1-6 and stops: the write transaction
+//! stays open, a view connection reads it through read-only children,
+//! and `finish` aborts it. Only one write transaction exists per store,
+//! so `transact` and `with` are `error.Nested` while one is held.
 
 const std = @import("std");
 const value = @import("value");
@@ -141,6 +146,91 @@ pub fn transactOps(conn: *Conn, arena: Allocator, ops: []const Op, options: Opti
     return ctx.run();
 }
 
+/// A speculative transaction (NEXTOMIC.md §6, row `with`): tx-data
+/// applied inside the write transaction, which is held open, never
+/// committed, and aborted by `finish`. `report.db_after` is a view of
+/// the uncommitted state: its reads are read-only children of the held
+/// transaction, so `q`, `entity`, `pull`, `datoms` and `txRange` see
+/// the speculative datoms, while the connection's committed state,
+/// ident cache and schema cache are untouched throughout. The write
+/// lock is held until `finish`; meanwhile `transact` and `with` on the
+/// connection, and any write through the view, are `error.Nested`.
+/// Allocated in the caller's arena, which must outlive every use of
+/// the view.
+pub const With = struct {
+    ctx: Ctx,
+    /// The view: the connection's store and interner, its own ident and
+    /// schema caches, reads through `ctx.txn`.
+    view: Conn,
+    report: Report,
+    finished: bool = false,
+
+    /// The uncommitted state at the speculative `t`.
+    pub fn db(self: *With) DbValue {
+        return self.report.db_after;
+    }
+
+    /// Close the view and abort the write transaction. Every `Read`
+    /// opened on the view must be closed first: they are children of
+    /// the transaction. Idempotent.
+    pub fn finish(self: *With) void {
+        if (self.finished) return;
+        self.finished = true;
+        self.view.dropSchema();
+        self.view.idents.deinit();
+        self.view.is_open = false;
+        self.view.overlay = null;
+        self.ctx.conn.speculative = null;
+        self.ctx.abort();
+    }
+
+    /// The protocol after normalisation: apply, then open the view over
+    /// the held transaction.
+    fn speculate(self: *With) !void {
+        const conn = self.ctx.conn;
+        try self.ctx.apply();
+        self.view = .{
+            .gpa = conn.gpa,
+            .store = conn.store,
+            .interner = conn.interner,
+            .idents = try conn.idents.clone(),
+            .sync_mode = self.ctx.sync_mode,
+            .is_open = true,
+            .overlay = self.ctx.txn,
+        };
+        errdefer self.view.idents.deinit();
+        self.report = .{
+            .db_before = .{ .conn = conn, .basis = self.ctx.now },
+            .db_after = .{ .conn = &self.view, .basis = self.ctx.t },
+            .t = self.ctx.t,
+            .tempids = try self.ctx.userTempids(),
+            .tx_data = try self.ctx.txData(),
+        };
+        self.finished = false;
+        conn.speculative = &self.view;
+    }
+};
+
+/// Apply Lisp tx-data speculatively.
+pub fn with(conn: *Conn, arena: Allocator, tx_data: Value, options: Options) !*With {
+    const self = try arena.create(With);
+    self.ctx = try Ctx.begin(conn, arena, options);
+    errdefer self.ctx.abort();
+    try self.ctx.normaliseValue(tx_data);
+    try self.speculate();
+    return self;
+}
+
+/// Apply Zig-level ops speculatively.
+pub fn withOps(conn: *Conn, arena: Allocator, ops: []const Op, options: Options) !*With {
+    const self = try arena.create(With);
+    self.ctx = try Ctx.begin(conn, arena, options);
+    errdefer self.ctx.abort();
+    for (ops) |op| try self.ctx.normaliseOp(op);
+    try self.speculate();
+    return self;
+}
+
 // =============================================================================
 // Internal representation
 // =============================================================================
@@ -221,6 +311,7 @@ const Ctx = struct {
 
     fn begin(conn: *Conn, arena: Allocator, options: Options) !Ctx {
         if (!conn.is_open) return error.Closed;
+        if (conn.speculative != null or conn.overlay != null) return error.Nested;
         const sync_mode = options.sync orelse conn.sync_mode;
         const txn = try conn.store.beginWrite(sync_mode);
         errdefer txn.abort();
@@ -570,12 +661,24 @@ const Ctx = struct {
     // ── the pipeline ──────────────────────────────────────────────
 
     fn run(self: *Ctx) !Report {
-        const db_before: DbValue = .{ .conn = self.conn, .basis = self.now };
+        try self.apply();
+        return self.commit();
+    }
+
+    /// Steps 3-6: everything up to the commit, leaving the write
+    /// transaction open with the datoms, txlog and counters written.
+    fn apply(self: *Ctx) !void {
         try self.bindTempids();
         try self.expandAll();
         try self.txInstant();
         try self.applySchema();
         try self.write();
+    }
+
+    /// Step 7: commit, then publish the mints and update the schema
+    /// cache, and report.
+    fn commit(self: *Ctx) !Report {
+        const db_before: DbValue = .{ .conn = self.conn, .basis = self.now };
         try self.txn.commit();
         self.finished = true;
         try self.minter.commitCache();
@@ -1477,4 +1580,177 @@ test "long strings round trip through the payload in every view" {
     try testing.expectEqualStrings(other, now[0].v.string);
     const txs = try db_mod.txRange(tc.conn, arena, r3.t, null);
     try testing.expectEqualStrings(other, txs[0].datoms[1].v.string);
+}
+
+test "with: the view sees the speculative state, the connection does not" {
+    const tc = try TestConn.init("tx_with");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const name = try attrId(tc, "user/name");
+    const tags = try attrId(tc, "user/tags");
+    const home = try attrId(tc, "user/home");
+    const city = try attrId(tc, "addr/city");
+    const k_new = try kw(tc, "tag/new");
+    const before = try tc.conn.db();
+
+    const w = try withOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = tags }, .v = .{ .keyword = k_new } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .string = "h" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "h" } }, .a = .{ .id = city }, .v = .{ .val = .{ .string = "Oslo" } } } },
+    }, .{});
+    defer w.finish();
+
+    // The report.
+    try testing.expectEqual(before.basis + 1, w.report.t);
+    try testing.expectEqual(before.basis, w.report.db_before.basis);
+    try testing.expectEqual(w.report.t, w.db().basis);
+    try testing.expectEqual(@as(usize, 2), w.report.tempids.len);
+    try testing.expectEqual(@as(usize, 6), w.report.tx_data.len);
+    const a = w.report.tempids[0].eid;
+    const h = w.report.tempids[1].eid;
+
+    // Every read of the view sees the speculative datoms.
+    const view = w.db();
+    try testing.expectEqual(@as(usize, 4), (try view.entity(arena, a)).len);
+    try testing.expectEqual(@as(usize, 1), (try view.datoms(arena, .aevt, .{ .a = email })).len);
+    const hb = try key.valBytes(arena, .{ .ref = h });
+    try testing.expectEqual(@as(usize, 1), (try view.datoms(arena, .vaet, .{ .v = hb })).len);
+    try testing.expectEqual(@as(?u64, a), try view.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a@x" } } }));
+    try testing.expectEqual(@as(u64, 1), (try view.attr(arena, email)).?.count);
+    const entries = try db_mod.txRange(&w.view, arena, w.report.t, null);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqual(@as(usize, 6), entries[0].datoms.len);
+    try testing.expectEqual(w.report.t, (try w.view.db()).basis);
+    // Time travel on the view folds the speculative rows like any other.
+    try testing.expectEqual(@as(usize, 0), (try view.asOf(before.basis).entity(arena, a)).len);
+    try testing.expectEqual(@as(usize, 4), (try view.withHistory().datoms(arena, .eavt, .{ .e = a })).len);
+    try testing.expectEqual(@as(usize, 4), (try view.sinceT(before.basis).datoms(arena, .eavt, .{ .e = a })).len);
+    // The minted keyword resolves through the view's cache only.
+    {
+        const txn = try w.view.beginReadTxn();
+        defer txn.abort();
+        try testing.expect((try w.view.idents.idOf(txn, k_new)) != null);
+    }
+    try testing.expect(tc.conn.idents.by_intern.get(k_new) == null);
+
+    // The committed state is untouched.
+    try testing.expectEqual(before.basis, (try tc.conn.db()).basis);
+    try testing.expectEqual(@as(usize, 0), (try before.entity(arena, a)).len);
+    try testing.expectEqual(@as(usize, 0), (try w.report.db_before.entity(arena, a)).len);
+    try testing.expectEqual(@as(u64, 0), (try before.attr(arena, email)).?.count);
+
+    // One write transaction per store: nothing else may begin one.
+    try testing.expectError(error.Nested, withOps(tc.conn, arena, &.{}, .{}));
+    try testing.expectError(error.Nested, transactOps(tc.conn, arena, &.{}, .{}));
+    try testing.expectError(error.Nested, transactOps(&w.view, arena, &.{}, .{}));
+    try testing.expectError(error.Nested, withOps(&w.view, arena, &.{}, .{}));
+
+    w.finish();
+    w.finish();
+    try testing.expectError(error.Closed, view.entity(arena, a));
+    try testing.expect(tc.conn.speculative == null);
+    try testing.expectEqual(before.basis, (try tc.conn.db()).basis);
+    {
+        const txn = try tc.conn.store.beginRead();
+        defer txn.abort();
+        try testing.expect((try tc.conn.idents.idOf(txn, k_new)) == null);
+    }
+
+    // A real transaction takes the same t, the same eid and the same ident id.
+    const r = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Bob" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = tags }, .v = .{ .keyword = k_new } } },
+    }, .{});
+    try testing.expectEqual(w.report.t, r.t);
+    try testing.expectEqual(a, r.tempids[0].eid);
+    try testing.expectEqual(w.report.tx_data[2].v.keyword, r.tx_data[1].v.keyword);
+    try testing.expectEqual(@as(usize, 2), (try (try tc.conn.db()).entity(arena, a)).len);
+}
+
+test "with: errors surface without holding the write transaction; schema changes stay in the view" {
+    const tc = try TestConn.init("tx_with_err");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const age = try attrId(tc, "user/age");
+    const r0 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "b@x" } } } },
+    }, .{});
+    const a = r0.tempids[0].eid;
+    const b = r0.tempids[1].eid;
+
+    try testing.expectError(error.Conflict, withOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 1 } } } },
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 2 } } } },
+    }, .{}));
+    try testing.expectError(error.Unique, withOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = b }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a@x" } } } },
+    }, .{}));
+    try testing.expectError(error.UnknownAttribute, withOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .ident = try kw(tc, "user/nope") }, .v = .{ .val = .{ .long = 1 } } } },
+    }, .{}));
+    try testing.expectError(error.ValueType, withOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .string = "x" } } } },
+    }, .{}));
+    try testing.expect(tc.conn.speculative == null);
+    try testing.expectEqual(r0.t, (try tc.conn.db()).basis);
+    try testing.expectEqual(@as(usize, 1), (try (try tc.conn.db()).entity(arena, a)).len);
+
+    // A speculative attribute exists in the view and nowhere else.
+    const w = try withOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.ident }, .v = .{ .keyword = try kw(tc, "user/nick") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_string } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+    }, .{});
+    defer w.finish();
+    const nick: u32 = @intCast(w.report.tempids[0].eid);
+    try testing.expectEqual(key.ValueType.string, (try w.db().attr(arena, nick)).?.value_type);
+    try testing.expectEqual(@as(?u64, nick), try w.db().entid(arena, .{ .ident = try kw(tc, "user/nick") }));
+    try testing.expect((try (try tc.conn.db()).attr(arena, nick)) == null);
+    w.finish();
+    try testing.expect((try (try tc.conn.db()).attr(arena, nick)) == null);
+    try testing.expectEqual(r0.t, (try tc.conn.db()).basis);
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 3 } } } },
+    }, .{});
+    try testing.expectEqual(r0.t + 1, r1.t);
+}
+
+test "with: Lisp tx-data" {
+    const tc = try TestConn.init("tx_with_lisp");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const add = try vector_mod.fromSlice(&heap, &.{
+        try tc.interner.internKeywordValue("db/add"),
+        try string_mod.fromBytes(&heap, "z"),
+        try tc.interner.internKeywordValue("user/name"),
+        try string_mod.fromBytes(&heap, "Zed"),
+    });
+    const w = try with(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{add}), .{ .now_ms = 7 });
+    defer w.finish();
+    const z = w.report.tempids[0].eid;
+    const ent = try w.db().entity(arena, z);
+    try testing.expectEqual(@as(usize, 1), ent.len);
+    try testing.expectEqual(name, ent[0].a);
+    try testing.expectEqualStrings("Zed", ent[0].vals[0].string);
+    try testing.expectEqual(@as(i64, 7), (try w.db().entity(arena, key.txEntity(w.report.t)))[0].vals[0].instant);
+    w.finish();
+    try testing.expectError(error.TxData, with(tc.conn, arena, try string_mod.fromBytes(&heap, "nope"), .{}));
+    try testing.expect(tc.conn.speculative == null);
 }

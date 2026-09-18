@@ -28,6 +28,7 @@ pub const Conn = db.Conn;
 pub const DbValue = db.DbValue;
 pub const Error = db.Error;
 pub const Report = transact.Report;
+pub const With = transact.With;
 pub const Op = transact.Op;
 pub const Relation = relation.Relation;
 pub const Cell = relation.Cell;

@@ -290,6 +290,17 @@ pub const Store = struct {
         return txn;
     }
 
+    /// Begin a read-only child of the open write transaction `parent`,
+    /// seeing its uncommitted state, with all eleven trees loaded. The
+    /// parent refuses mutations and commit until the child is finished.
+    pub fn beginReadChild(self: *Store, parent: *Txn) !*Txn {
+        if (!self.is_open) return error.Closed;
+        const txn = try parent.beginReadChild();
+        errdefer txn.abort();
+        try self.loadTrees(txn);
+        return txn;
+    }
+
     /// Begin the write transaction with all eleven trees loaded.
     pub fn beginWrite(self: *Store, sync_mode: SyncMode) !*Txn {
         if (!self.is_open) return error.Closed;
