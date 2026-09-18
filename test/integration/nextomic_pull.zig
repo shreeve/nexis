@@ -734,7 +734,7 @@ test "with: q, entity and pull see the speculative datoms; nothing is written" {
         \\ [:db/retract [:person/email "ann@x"] :person/tags :red]]
     );
     const w = try nextomic.transact.with(fx.conn(), fx.arena(), tx, .{});
-    defer w.finish();
+    defer w.destroy();
     const view = w.db();
     try testing.expectEqual(before.basis + 1, w.report.t);
     try testing.expectEqual(before.basis, w.report.db_before.basis);

@@ -161,13 +161,16 @@ pub fn transactOps(conn: *Conn, arena: Allocator, ops: []const Op, options: Opti
 /// ident cache and schema cache are untouched throughout. The write
 /// lock is held until `finish`; meanwhile `transact` and `with` on the
 /// connection, and any write through the view, are `error.Nested`.
-/// Allocated in the caller's arena, which must outlive every use of
-/// the view.
+/// The `With` and its scratch live in the caller's arena, which must
+/// outlive `finish`; the view is allocated on the connection's
+/// allocator so that db-values naming it may outlive the arena, and
+/// `destroy` frees it.
 pub const With = struct {
     ctx: Ctx,
     /// The view: the connection's store and interner, its own ident and
-    /// schema caches, reads through `ctx.txn`.
-    view: Conn,
+    /// schema caches, reads through `ctx.txn`. Allocated on the
+    /// connection's allocator; closed by `finish`, freed by `destroy`.
+    view: *Conn,
     report: Report,
     finished: bool = false,
 
@@ -182,12 +185,18 @@ pub const With = struct {
     pub fn finish(self: *With) void {
         if (self.finished) return;
         self.finished = true;
-        self.view.dropSchema();
-        self.view.idents.deinit();
-        self.view.is_open = false;
+        self.view.close();
         self.view.overlay = null;
         self.ctx.conn.speculative = null;
         self.ctx.abort();
+    }
+
+    /// `finish`, then free the view. Nothing may name the view
+    /// afterwards: a db-value that escaped the scope reads freed
+    /// memory. Once per `With`.
+    pub fn destroy(self: *With) void {
+        self.finish();
+        self.view.destroy();
     }
 
     /// The protocol after normalisation: apply, then open the view over
@@ -195,7 +204,9 @@ pub const With = struct {
     fn speculate(self: *With) !void {
         const conn = self.ctx.conn;
         try self.ctx.apply();
-        self.view = .{
+        const view = try conn.gpa.create(Conn);
+        errdefer conn.gpa.destroy(view);
+        view.* = .{
             .gpa = conn.gpa,
             .store = conn.store,
             .interner = conn.interner,
@@ -205,16 +216,17 @@ pub const With = struct {
             .owns_store = false,
             .overlay = self.ctx.txn,
         };
-        errdefer self.view.idents.deinit();
+        errdefer view.idents.deinit();
+        self.view = view;
         self.report = .{
             .db_before = .{ .conn = conn, .basis = self.ctx.now },
-            .db_after = .{ .conn = &self.view, .basis = self.ctx.t },
+            .db_after = .{ .conn = view, .basis = self.ctx.t },
             .t = self.ctx.t,
             .tempids = try self.ctx.userTempids(),
             .tx_data = self.ctx.tx_data,
         };
         self.finished = false;
-        conn.speculative = &self.view;
+        conn.speculative = view;
     }
 };
 
@@ -1649,7 +1661,7 @@ test "with: the view sees the speculative state, the connection does not" {
         .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .string = "h" } } } } },
         .{ .add = .{ .e = .{ .tempid = .{ .string = "h" } }, .a = .{ .id = city }, .v = .{ .val = .{ .string = "Oslo" } } } },
     }, .{});
-    defer w.finish();
+    defer w.destroy();
 
     // The report.
     try testing.expectEqual(before.basis + 1, w.report.t);
@@ -1668,7 +1680,7 @@ test "with: the view sees the speculative state, the connection does not" {
     try testing.expectEqual(@as(usize, 1), (try view.datoms(arena, .vaet, .{ .v = hb })).len);
     try testing.expectEqual(@as(?u64, a), try view.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a@x" } } }));
     try testing.expectEqual(@as(u64, 1), (try view.attr(arena, email)).?.count);
-    const entries = try db_mod.txRange(&w.view, arena, w.report.t, null);
+    const entries = try db_mod.txRange(w.view, arena, w.report.t, null);
     try testing.expectEqual(@as(usize, 1), entries.len);
     try testing.expectEqual(@as(usize, 6), entries[0].datoms.len);
     try testing.expectEqual(w.report.t, (try w.view.db()).basis);
@@ -1693,8 +1705,8 @@ test "with: the view sees the speculative state, the connection does not" {
     // One write transaction per store: nothing else may begin one.
     try testing.expectError(error.Nested, withOps(tc.conn, arena, &.{}, .{}));
     try testing.expectError(error.Nested, transactOps(tc.conn, arena, &.{}, .{}));
-    try testing.expectError(error.Nested, transactOps(&w.view, arena, &.{}, .{}));
-    try testing.expectError(error.Nested, withOps(&w.view, arena, &.{}, .{}));
+    try testing.expectError(error.Nested, transactOps(w.view, arena, &.{}, .{}));
+    try testing.expectError(error.Nested, withOps(w.view, arena, &.{}, .{}));
 
     w.finish();
     w.finish();
@@ -1757,7 +1769,7 @@ test "with: errors surface without holding the write transaction; schema changes
         .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_string } } } },
         .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
     }, .{});
-    defer w.finish();
+    defer w.destroy();
     const nick: u32 = @intCast(w.report.tempids[0].eid);
     try testing.expectEqual(key.ValueType.string, (try w.db().attr(arena, nick)).?.value_type);
     try testing.expectEqual(@as(?u64, nick), try w.db().entid(arena, .{ .ident = try kw(tc, "user/nick") }));
@@ -1788,7 +1800,7 @@ test "with: Lisp tx-data" {
         try string_mod.fromBytes(&heap, "Zed"),
     });
     const w = try with(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{add}), .{ .now_ms = 7 });
-    defer w.finish();
+    defer w.destroy();
     const z = w.report.tempids[0].eid;
     const ent = try w.db().entity(arena, z);
     try testing.expectEqual(@as(usize, 1), ent.len);
@@ -2117,6 +2129,33 @@ test "a lookup ref under a card-many ref attribute is one ref; a vector of them 
     try testing.expectEqual(@as(usize, 2), (try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = ann, .a = tags })).len);
 }
 
+test "the view outlives the scratch arena until destroy" {
+    const tc = try TestConn.init("tx_with_view_lifetime");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    const w = try withOps(tc.conn, scratch.allocator(), &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    const escaped = w.db();
+    const a = w.report.tempids[0].eid;
+    try testing.expectEqual(@as(usize, 1), (try escaped.entity(arena, a)).len);
+    w.finish();
+    // The scratch arena, and the `With` in it, are gone; the view is
+    // not: an escaped db-value answers Closed rather than reading freed
+    // memory, and the connection is free again.
+    scratch.deinit();
+    try testing.expectError(error.Closed, escaped.entity(arena, a));
+    try testing.expect(tc.conn.speculative == null);
+    try testing.expectEqual(@as(usize, 0), (try (try tc.conn.db()).entity(arena, a)).len);
+    escaped.conn.destroy();
+}
+
 test "a held with keeps the store open until finish; a closed connection refuses writes" {
     const tc = try TestConn.init("tx_busy_with");
     defer tc.deinit();
@@ -2129,7 +2168,7 @@ test "a held with keeps the store open until finish; a closed connection refuses
     const w = try withOps(tc.conn, arena, &.{
         .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
     }, .{});
-    defer w.finish();
+    defer w.destroy();
     const a = w.report.tempids[0].eid;
     try testing.expectError(error.Busy, tc.conn.release());
     tc.conn.close();
