@@ -589,6 +589,79 @@ pub const Store = struct {
         return .{ .cursor = try txn.openCursorForTree(tree), .start = start, .end = end };
     }
 
+    /// Which history rows a fold sees (NEXTOMIC.md §4).
+    pub const Window = union(enum) {
+        /// `t <= T`: fold, emit current facts as of `T`.
+        as_of: u64,
+        /// `after < t <= upto`: fold from an empty state.
+        since: struct { after: u64, upto: u64 },
+        /// `t <= upto`: every row, no fold.
+        all: u64,
+
+        pub fn contains(self: Window, t: u64) bool {
+            return switch (self) {
+                .as_of => |upto| t <= upto,
+                .since => |w| t > w.after and t <= w.upto,
+                .all => |upto| t <= upto,
+            };
+        }
+    };
+
+    /// A history row: the key without `top`, its clamped value, `t` and
+    /// `added`. Slices borrow the transaction's snapshot.
+    pub const HistoryRow = struct {
+        fact: []const u8,
+        value: []const u8,
+        t: u64,
+        added: bool,
+    };
+
+    /// The §4 fold over a history tree: rows in `[start, end)` grouped
+    /// by their fact bytes (everything before `top`); consecutive rows
+    /// of one fact ascend in `t`; the last row inside the window wins
+    /// and is emitted iff it is an assertion. `.all` emits every row in
+    /// the window unfolded.
+    pub const FoldScan = struct {
+        inner: RangeScan,
+        window: Window,
+        pending: ?HistoryRow = null,
+        exhausted: bool = false,
+
+        pub fn next(self: *FoldScan) ?HistoryRow {
+            while (!self.exhausted) {
+                const row = self.inner.next() orelse {
+                    self.exhausted = true;
+                    break;
+                };
+                if (row.key.len < key.top_len) continue;
+                const fact_len = row.key.len - key.top_len;
+                const top = key.readTop(row.key[fact_len..][0..key.top_len]);
+                if (!self.window.contains(top.t)) continue;
+                const r: HistoryRow = .{ .fact = row.key[0..fact_len], .value = row.value, .t = top.t, .added = top.added };
+                if (self.window == .all) return r;
+                if (self.pending) |p| {
+                    if (std.mem.eql(u8, p.fact, r.fact)) {
+                        self.pending = r;
+                        continue;
+                    }
+                    self.pending = r;
+                    if (p.added) return p;
+                    continue;
+                }
+                self.pending = r;
+            }
+            if (self.pending) |p| {
+                self.pending = null;
+                if (p.added) return p;
+            }
+            return null;
+        }
+    };
+
+    pub fn foldScan(self: *Store, txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8, window: Window) !FoldScan {
+        return .{ .inner = try self.scanRange(txn, tree, start, end), .window = window };
+    }
+
     /// Number of entries in `tree` at the transaction's snapshot.
     pub fn treeEntries(self: *Store, txn: *Txn, tree: TreeId) !u64 {
         _ = self;
@@ -836,6 +909,77 @@ test "abort leaves nothing behind" {
     defer txn.abort();
     try testing.expectEqual(@as(u64, 1), try store.readT(txn));
     try testing.expect((try store.identIdByName(txn, "gone")) == null);
+}
+
+test "fold keeps the newest in-window row per fact and drops retractions" {
+    var td = try TestDir.init("store_fold");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Entity 2^33, attribute 100: v=1 asserted at t=2, retracted at t=3,
+    // v=2 asserted at t=3, v=2 retracted at t=5; attribute 101: v=7 at t=4.
+    const e: u64 = 1 << 33;
+    const v1 = try key.valBytes(arena, .{ .long = 1 });
+    const v2 = try key.valBytes(arena, .{ .long = 2 });
+    const v7 = try key.valBytes(arena, .{ .long = 7 });
+    {
+        const txn = try store.beginWrite(.none);
+        try store.writeBatch(txn, 2, &.{.{ .e = e, .a = 100, .vbytes = v1, .added = true, .avet = false, .vaet = false }}, arena);
+        try store.writeBatch(txn, 3, &.{
+            .{ .e = e, .a = 100, .vbytes = v1, .added = false, .avet = false, .vaet = false },
+            .{ .e = e, .a = 100, .vbytes = v2, .added = true, .avet = false, .vaet = false },
+        }, arena);
+        try store.writeBatch(txn, 4, &.{.{ .e = e, .a = 101, .vbytes = v7, .added = true, .avet = false, .vaet = false }}, arena);
+        try store.writeBatch(txn, 5, &.{.{ .e = e, .a = 100, .vbytes = v2, .added = false, .avet = false, .vaet = false }}, arena);
+        try txn.commit();
+    }
+    const txn = try store.beginRead();
+    defer txn.abort();
+    const prefix = try key.prefixBytes(arena, .eavt, .{ .e = e });
+    const end = (try key.successor(arena, prefix)).?;
+    const tree = store.trees.hist(.eavt);
+
+    const Expect = struct { window: Store.Window, facts: []const u64 };
+    const cases = [_]Expect{
+        .{ .window = .{ .as_of = 1 }, .facts = &.{} },
+        .{ .window = .{ .as_of = 2 }, .facts = &.{1} },
+        .{ .window = .{ .as_of = 3 }, .facts = &.{2} },
+        .{ .window = .{ .as_of = 4 }, .facts = &.{ 2, 7 } },
+        .{ .window = .{ .as_of = 5 }, .facts = &.{7} },
+        .{ .window = .{ .since = .{ .after = 3, .upto = 5 } }, .facts = &.{7} },
+        .{ .window = .{ .since = .{ .after = 2, .upto = 4 } }, .facts = &.{ 2, 7 } },
+        .{ .window = .{ .since = .{ .after = 4, .upto = 5 } }, .facts = &.{} },
+    };
+    for (cases) |c| {
+        var fs = try store.foldScan(txn, tree, prefix, end, c.window);
+        var got: std.ArrayList(u64) = .empty;
+        while (fs.next()) |r| {
+            try testing.expect(r.added);
+            const parts = try key.unpackKey(.eavt, false, r.fact);
+            const kv = try key.decodeVal(arena, parts.v);
+            try got.append(arena, @intCast(kv.val.long));
+        }
+        try testing.expectEqualSlices(u64, c.facts, got.items);
+    }
+    // History mode sees all five rows in t order with their flags.
+    var all = try store.foldScan(txn, tree, prefix, end, .{ .all = 5 });
+    var n: usize = 0;
+    var adds: usize = 0;
+    while (all.next()) |r| {
+        n += 1;
+        if (r.added) adds += 1;
+    }
+    try testing.expectEqual(@as(usize, 5), n);
+    try testing.expectEqual(@as(usize, 3), adds);
+    // Current trees hold only attribute 101 now.
+    var cur = try store.scan(txn, store.trees.cur(.eavt), prefix);
+    const only = cur.next().?;
+    try testing.expectEqual(@as(u32, 101), (try key.unpackKey(.eavt, false, only.key)).a);
+    try testing.expect(cur.next() == null);
 }
 
 test "long ident names use the heap path" {
