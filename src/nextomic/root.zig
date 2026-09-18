@@ -6,13 +6,17 @@
 
 pub const key = @import("key.zig");
 pub const datom = @import("datom.zig");
+pub const store = @import("store.zig");
 
 pub const Val = key.Val;
 pub const ValueType = key.ValueType;
 pub const Index = key.Index;
 pub const Datom = datom.Datom;
+pub const Store = store.Store;
+pub const boot = store.boot;
 
 test {
     _ = key;
     _ = datom;
+    _ = store;
 }
