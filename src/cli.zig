@@ -248,15 +248,37 @@ fn bootstrapCoreNx(
     interner: *intern_mod.Interner,
     allocator: std.mem.Allocator,
 ) !void {
-    var parse_result = reader_mod.parser.parseProgram(allocator, stdlib.CORE_NX_SOURCE) catch |err| {
-        std.debug.panic("nexis: core.nx parse error: {s}\n", .{@errorName(err)});
+    try bootstrapEmbedded(v, ns, interner, allocator, stdlib.CORE_NX_SOURCE, "core.nx");
+}
+
+/// Bootstrap the embedded `nextomic.nx` sugar into the `nextomic`
+/// namespace, after its natives are installed.
+fn bootstrapNextomicNx(
+    v: *vm.VM,
+    ns: *vm.Namespace,
+    interner: *intern_mod.Interner,
+    allocator: std.mem.Allocator,
+) !void {
+    try bootstrapEmbedded(v, ns, interner, allocator, stdlib.NEXTOMIC_NX_SOURCE, "nextomic.nx");
+}
+
+fn bootstrapEmbedded(
+    v: *vm.VM,
+    ns: *vm.Namespace,
+    interner: *intern_mod.Interner,
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    label: []const u8,
+) !void {
+    var parse_result = reader_mod.parser.parseProgram(allocator, source) catch |err| {
+        std.debug.panic("nexis: {s} parse error: {s}\n", .{ label, @errorName(err) });
     };
     defer parse_result.parser.deinit();
 
-    var rdr = reader_mod.Reader.init(allocator, stdlib.CORE_NX_SOURCE);
+    var rdr = reader_mod.Reader.init(allocator, source);
     defer rdr.deinit();
     const forms = rdr.readProgram(parse_result.sexp) catch |err| {
-        std.debug.panic("nexis: core.nx reader error: {s}\n", .{@errorName(err)});
+        std.debug.panic("nexis: {s} reader error: {s}\n", .{ label, @errorName(err) });
     };
 
     var host_macros = try expand_mod.defaultMacros(allocator);
@@ -284,9 +306,9 @@ fn bootstrapCoreNx(
             &error_span,
             ra,
         ) catch |err| {
-            std.debug.panic("nexis: core.nx compile error: {s} (form span: {?})\n", .{ @errorName(err), error_span });
+            std.debug.panic("nexis: {s} compile error: {s} (form span: {?})\n", .{ label, @errorName(err), error_span });
         };
-        const routine = compiled.toRoutine("core-nx");
+        const routine = compiled.toRoutine(label);
         v.frames.items[0].routine = &routine;
         v.frames.items[0].pc = 0;
         v.frames.items[0].slot_count = routine.slot_count;
@@ -295,7 +317,7 @@ fn bootstrapCoreNx(
             try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
         }
         _ = v.run() catch |err| {
-            std.debug.panic("nexis: core.nx runtime error: {s}\n", .{@errorName(err)});
+            std.debug.panic("nexis: {s} runtime error: {s}\n", .{ label, @errorName(err) });
         };
     }
 }
@@ -347,6 +369,10 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     // Macros emit qualified calls; users don't touch these.
     const internal_ns = try registry.getOrCreate("nexis.internal", registry.core);
     try stdlib.installInternal(internal_ns);
+    // The `nextomic` namespace (docs/NEXTOMIC.md §6): natives now,
+    // its embedded sugar after core.nx.
+    const nextomic_ns = try registry.getOrCreate("nextomic", registry.core);
+    try stdlib.installNextomic(nextomic_ns);
     var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);
     // Phase 3.3d: bootstrap the embedded core.nx composite
@@ -356,6 +382,8 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     const saved_current = registry.current;
     registry.current = registry.core;
     try bootstrapCoreNx(&v, registry.core, interner, allocator);
+    registry.current = nextomic_ns;
+    try bootstrapNextomicNx(&v, nextomic_ns, interner, allocator);
     registry.current = saved_current;
     // Phase 3.6: namespace loader. Searches CWD for .nx files
     // when `(require 'my.ns)` fires. Load path is just CWD for
@@ -574,6 +602,10 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     // Phase 5.3a (peer-AI turn 84): nexis.internal (qualified-only).
     const internal_ns = try registry.getOrCreate("nexis.internal", registry.core);
     try stdlib.installInternal(internal_ns);
+    // The `nextomic` namespace (docs/NEXTOMIC.md §6): natives now,
+    // its embedded sugar after core.nx.
+    const nextomic_ns = try registry.getOrCreate("nextomic", registry.core);
+    try stdlib.installNextomic(nextomic_ns);
     // Step #8b: default host macro table.
     var host_macros = try expand_mod.defaultMacros(allocator);
     defer host_macros.deinit(allocator);
@@ -582,6 +614,8 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     const saved_current = registry.current;
     registry.current = registry.core;
     try bootstrapCoreNx(&v, registry.core, interner, allocator);
+    registry.current = nextomic_ns;
+    try bootstrapNextomicNx(&v, nextomic_ns, interner, allocator);
     registry.current = saved_current;
     // Phase 3.6: namespace loader. Searches CWD + the directory
     // of the source file being run for `.nx` files when
@@ -655,6 +689,15 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
             try std.Io.File.stderr().writeStreamingAll(io, "nexis: runtime error: ");
             try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
             try std.Io.File.stderr().writeStreamingAll(io, "\n");
+            if (err == vm.VmError.UncaughtThrow and v.unhandled_throw != null) {
+                var buf: [4096]u8 = undefined;
+                var stream = std.Io.Writer.fixed(&buf);
+                if (formatValue(v.unhandled_throw.?, interner, &stream)) |_| {
+                    try std.Io.File.stderr().writeStreamingAll(io, "  payload: ");
+                    try std.Io.File.stderr().writeStreamingAll(io, stream.buffered());
+                    try std.Io.File.stderr().writeStreamingAll(io, "\n");
+                } else |_| {}
+            }
             std.process.exit(5);
         };
     }

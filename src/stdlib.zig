@@ -47,6 +47,7 @@ const string_mod = @import("string");
 const format_mod = @import("format");
 const record_mod = @import("record");
 const protocol_mod = @import("protocol");
+const nextomic_mod = @import("nextomic");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -88,6 +89,12 @@ pub fn installDb(db_ns: *Namespace) !void {
         v.root = vm_mod.nativeFnValue(entry.descriptor);
         v.bound = true;
     }
+}
+
+/// Install the `nextomic/*` natives (docs/NEXTOMIC.md §6) into the
+/// `nextomic` namespace; `NEXTOMIC_NX_SOURCE` adds the sugar on top.
+pub fn installNextomic(nextomic_ns: *Namespace) !void {
+    try nextomic_mod.natives.install(nextomic_ns);
 }
 
 /// Phase 5.2b (peer-AI turn 79): install `nexis.string/*` ops
@@ -190,7 +197,9 @@ const internal_fns = [_]CoreEntry{
 /// not here — keeping the composite layer in nexis source
 /// matches CLOJURE-REVIEW.md §1.1 two-stage bootstrap.
 pub const CORE_NX_SOURCE: []const u8 = @embedFile("stdlib/core.nx");
-
+/// The `nextomic` namespace's sugar (`with-conn`), bootstrapped after
+/// `installNextomic` with that namespace current.
+pub const NEXTOMIC_NX_SOURCE: []const u8 = @embedFile("stdlib/nextomic.nx");
 
 const CoreEntry = struct {
     name: []const u8,

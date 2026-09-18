@@ -121,6 +121,9 @@ pub const Loader = struct {
     /// The caller's current namespace is preserved (saved before
     /// load, restored after).
     pub fn loadNamespace(self: *Loader, ns_name: []const u8) LoadError!void {
+        // Namespaces installed at VM startup have no file; a require
+        // of one only aliases it.
+        for (installed_namespaces) |name| if (std.mem.eql(u8, name, ns_name)) return;
         // Already loaded → no-op.
         if (self.loaded.contains(ns_name)) return;
         // Already loading → cycle.
@@ -229,6 +232,9 @@ pub const Loader = struct {
         try self.loadNamespace(ns_name);
     }
 };
+
+/// Namespaces the CLI populates before any file runs.
+const installed_namespaces = [_][]const u8{ "nexis.core", "db", "nexis.string", "nexis.internal", "nextomic" };
 
 /// Map `my.app.foo` → `my/app/foo.nx`. Caller owns returned slice.
 fn nsNameToRelPath(allocator: std.mem.Allocator, ns_name: []const u8) ![]u8 {
