@@ -57,42 +57,21 @@ const Usage =
     \\        programming model.
     \\
     \\usage:
-    \\  nexis run FILE.nx    Reads FILE.nx, parses all top-level
-    \\                       forms, compiles and runs each in
-    \\                       order, prints the final result.
+    \\  nexis run FILE.nx    Reads FILE.nx, compiles and runs each
+    \\                       top-level form in order, prints the
+    \\                       final result.
     \\  nexis repl           Interactive read-eval-print loop.
     \\                       :quit or EOF to exit.
     \\
-    \\For `run`, the namespace (Vars from `def`/`defn`) and
-    \\interner persist across forms within the file. For `repl`,
-    \\they persist across the entire session.
+    \\For `run`, Vars and the interner persist across forms within
+    \\the file; for `repl`, across the whole session.
     \\
-    \\Phase 2 source surface (what compiles today):
-    \\  literals: nil, true, false, integers, :keywords
-    \\  arithmetic: (+ a b), (< a b)
-    \\  conditionals: (if test then else?), (do ...)
-    \\  bindings: (let [name1 v1 ...] body...)  -- or let*
-    \\  functions: (fn name? [params & rest?] body...)  -- or fn*
-    \\  recursion: (loop [...] body...) (recur args...)  -- or loop*
-    \\  vars: (def name value?), (defn name [params] body...), (var name)
-    \\  quoting: (quote x), 'x (scalars + interned symbols/keywords)
-    \\  mutual: (letfn* [(name [params] body...) ...] body...)
-    \\  macros: when, when-not, and, or, cond, ->, ->>
-    \\  exceptions: (try body (catch any e handler) [(finally ...)])
-    \\              (throw value)
+    \\Namespaces available without a file: nexis.core (auto-referred),
+    \\db (key-value storage on emdb), nextomic (Datomic-class datoms:
+    \\transact!, q, pull, as-of/since/history, with), nexis.string,
+    \\nexis.internal. See README.md and docs/NEXTOMIC.md.
     \\
-    \\Phase 3.0 + 3.1 surface (also shipped):
-    \\  - `nexis repl` interactive eval
-    \\  - `#(...)` anon-fn shorthand with %, %1..%N, %&
-    \\  - try/catch can now catch recoverable VM errors as
-    \\    keywords: :kind-mismatch, :unbound-var, :arity-mismatch,
-    \\    :not-callable, :arithmetic-overflow
-    \\  - collection literals: [vectors], {maps}, #{sets}
-    \\    + quoted forms of all three
-    \\
-    \\Limitations (post-v1):
-    \\  - recur-in-try: not supported (wrap try around loop)
-    \\  - user defmacro / multi-namespace / stdlib: Phase 3+
+    \\Examples: examples/*.nx (examples/nextomic-app.nx for Nextomic).
     \\
 ;
 

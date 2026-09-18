@@ -1,21 +1,15 @@
 # stdlib
 
-Reserved for the nexis standard library (the `core` namespace bootstrap).
-Empty for now.
+The nexis standard library sources live in `src/stdlib/` and are
+embedded into the binary and bootstrapped at startup:
 
-Per `PLAN.md` §21 Phase 3 and CLOJURE-REVIEW.md §1.1, this directory
-will hold `core.nx` and friends — the Clojure-style two-stage bootstrap
-where:
+- `src/stdlib/core.nx`: the `nexis.core` composite layer (`let`, `fn`,
+  `defn`, `when`, `cond`, `doseq`, threading macros, `with-tx`,
+  `with-read-tx`, `with-snapshot`, and the collection helpers built on
+  the compiler primitives and the native functions in `src/stdlib.zig`).
+- `src/stdlib/nextomic.nx`: sugar for the Nextomic natives (`with-conn`).
 
-1. First, trivial renaming macros land: `(defmacro let [& decl] (cons 'let* decl))`.
-2. Later, after destructuring helpers exist, `let` is redefined with the
-   full destructuring-aware version.
-
-The compiler primitives (`let*`, `fn*`, `letfn*`, `loop*`, `recur`,
-`def`, `defn`, `if`, `do`, `quote`, `var`) are NOT in stdlib — they
-live in the compiler (`src/compile.zig`). The user-facing `let`, `fn`,
-`letfn`, `loop`, `defmacro`, `defn`'s docstring/destructuring shape,
-`when`, `cond`, `case`, etc. are stdlib macros built on top of the
-primitives.
-
-This directory populates after step #8 (macroexpander) lands.
+Compiler primitives (`let*`, `fn*`, `letfn*`, `loop*`, `recur`, `def`,
+`if`, `do`, `quote`, `var`, `set!`, `try`, `throw`) live in
+`src/compile.zig`. Native functions live in `src/stdlib.zig` and
+`src/nextomic/natives.zig`.

@@ -13,24 +13,21 @@ present; see "removed directories" below).
 | `test/prop/` | Cross-module property tests (12 files: primitive, intern, heap, string, list, bignum, vector, hamt, transient, gc, codec, db) | `zig build test` |
 | `test/golden/` | Phase 0 reader golden tests (`.nx` source ↔ `.sexp` / `.err` expected) | `zig build golden` (or `zig build test`) |
 | `test/nextomic/` | Nextomic end-to-end scripts (`.nx` run through `bin/nexis` ↔ `.out` expected stdout), in a scratch directory, in order; `persist-1`/`persist-2` share one store across two processes | `zig build nextomic-nx` (or `zig build test`) |
-| `test/fuzz/` | Reserved for Phase 6+ fuzz testing. Empty for now. | — |
-| `test/integration/` | Reserved for Phase 6+ end-to-end source-to-execution tests. Empty for now. | — |
+| `test/integration/` | End-to-end source-to-execution suites (`eval_pipeline.zig`), the Nextomic query corpus (`nextomic_q.zig`, checked against a naive evaluator) and pull corpus (`nextomic_pull.zig`) | `zig build test` (Nextomic ones also via `zig build nextomic-test`) |
+| `test/fuzz/` | Fuzz targets; populated as fuzzing lands | — |
 
 ## Two build steps for two loops
 
-- **`zig build phase2-test`** (~3 seconds) — runs ONLY the `vm` + `compile`
-  module tests. The inner edit/test loop for Phase 2 compiler/VM work.
-- **`zig build test`** (~3 minutes) — runs the full Phase 0/1/2 suite,
-  property tests, and golden verification. ~3 min runtime is dominated
-  by Phase 1's randomized HAMT correctness gate. Run before commits.
+- **`zig build phase2-test`** (~3 seconds) — runs the `vm`, `compile`, integration and
+  nextomic module tests. The inner edit/test loop for compiler/VM work.
+- **`zig build test`** (~3 minutes) — runs the full suite: every module's
+  inline tests, property tests, golden verification, the Nextomic
+  corpora and the `.nx` scripts. The runtime is dominated by the
+  randomized HAMT correctness gate. Run before commits.
 
-## Counts at last update (commit `4373b6e`)
+## Counts
 
-- `vm`: 86 inline tests
-- `compile`: 135 inline tests
-- Phase 0/1 modules + property tests: ~454 tests
-- Reader golden: 10
-- Total: ~685 tests
+`zig build test --summary all` prints the authoritative count (1265 tests across 111 steps at the docs reconciliation). Per-binary counts are in the same summary.
 
 ## Removed directories
 

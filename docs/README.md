@@ -44,7 +44,7 @@ modules and pin contracts that several modules must conform to.
 |---|---|
 | [`SEMANTICS.md`](SEMANTICS.md) | Equality, hash, numeric corner cases — pins the contract that `value.zig`, `eq.zig`, `hash.zig`, `dispatch.zig` collectively implement |
 | [`PERF.md`](PERF.md) | Performance methodology + gates — what the bench harness measures and what's a regression |
-| [`NEXTOMIC.md`](NEXTOMIC.md) | Post-v1 Datomic-class database architecture on nexis + emdb — NOT a v1 deliverable, but constrains v1 substrate decisions |
+| [`NEXTOMIC.md`](NEXTOMIC.md) | Nextomic: the Datomic-class database on nexis + emdb — storage layout, transactions, db-values and time, the query pipeline, the Lisp API (authoritative; the code follows it) |
 
 ## Top-level docs (not in `docs/`)
 
