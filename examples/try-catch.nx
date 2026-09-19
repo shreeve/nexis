@@ -1,6 +1,7 @@
 ; examples/try-catch.nx — try / catch / throw / finally
 ;
-;   - throw any value; a map {:error :tag ...} says more
+;   - throw any value; a map {:error :tag ...} says more, and
+;     (ex-info msg data) builds {:message msg :data data}
 ;   - (catch any e ...) takes every value, (catch :tag e ...) the
 ;     value :tag or a map whose :error is :tag; clauses in order
 ;   - cross-frame propagation (callee throws, caller catches)
@@ -33,3 +34,8 @@
               (catch :boom e (:detail e))))
 (println (try (try (throw :x) (finally (println :cleanup)))
               (catch any e [:outer e])))
+
+; ex-info: a map with :message and :data; a tag catches it through
+; the :error of its data, and ex-message / ex-data read it back.
+(println (try (throw (ex-info "missing" {:error :not-found :id 3}))
+              (catch :not-found e [(ex-message e) (:id (ex-data e))])))

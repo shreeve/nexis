@@ -902,6 +902,20 @@ pub const HostCallResult = struct {
 
 /// One entry per `defrecord`.
 /// Names are owned by the registry (duped on registration).
+/// What a native needs from the compiler at run time. `user_data`
+/// belongs to the installer (the CLI runtime, a test harness); the
+/// functions run on the calling VM and build their results on its
+/// heap.
+pub const CompilerHooks = struct {
+    user_data: *anyopaque,
+    /// One macro step on `form`: the expansion when `form` is a
+    /// macro call, null when it is not. Expansion failures throw.
+    expand_once: *const fn (*anyopaque, *VM, Value) VmError!?Value,
+    /// The first form of `source` as a value; a form that does not
+    /// read throws `:reader-error`.
+    read_string: *const fn (*anyopaque, *VM, []const u8) VmError!Value,
+};
+
 pub const RecordTypeEntry = struct {
     id: u32,
     ns_name: []const u8,
@@ -1338,6 +1352,14 @@ pub const VM = struct {
     /// and symbol ids in its arguments resolve. Not owned; never
     /// freed here.
     borrowed_interner: ?*intern_mod.Interner = null,
+    /// Compile-time services a native reaches at run time
+    /// (`macroexpand-1`, `read-string`). Installed by whoever boots
+    /// the runtime around this VM; a bare VM has none and those
+    /// natives throw `:no-compiler`.
+    compiler_hooks: ?CompilerHooks = null,
+    /// The record type `reduced` wraps a value in, registered on
+    /// first use (`ensureReducedType`).
+    reduced_type_id: ?u32 = null,
     /// Where the top-level `call:return` stores the returned Value on
     /// halt.
     result: Value = value_mod.nilValue(),
@@ -1552,6 +1574,15 @@ pub const VM = struct {
             .field_names = fields_dup,
         });
         return new_id;
+    }
+
+    /// The type id of `nexis.core/Reduced`, the one-field record
+    /// (`:val`) that `reduced` builds and `reduce` stops on.
+    pub fn ensureReducedType(self: *VM) !u32 {
+        if (self.reduced_type_id) |id| return id;
+        const id = try self.registerRecordType("nexis.core", "Reduced", &.{"val"});
+        self.reduced_type_id = id;
+        return id;
     }
 
     pub fn recordTypeById(self: *const VM, id: u32) ?*const RecordTypeEntry {

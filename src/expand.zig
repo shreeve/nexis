@@ -147,10 +147,17 @@ pub const ExpandContext = struct {
     /// runtime allocations). Reuse across macro invocations
     /// — cheap because allocator is an arena.
     _arg_heap: ?heap_mod.Heap = null,
+    /// A heap to build values on instead of `_arg_heap`: the
+    /// calling VM's heap when the expander runs on behalf of a
+    /// native (`macroexpand-1`, `read-string`), so the values it
+    /// returns outlive the context.
+    value_heap: ?*heap_mod.Heap = null,
 
-    /// Lazy-init the arg-construction heap. Returns a pointer
-    /// good for the lifetime of the ExpandContext.
+    /// The heap for arg Value construction: `value_heap` when set,
+    /// else the lazily created `_arg_heap`, good for the lifetime
+    /// of the ExpandContext.
     pub fn heapForArgs(self: *ExpandContext) ExpandError!*heap_mod.Heap {
+        if (self.value_heap) |h| return h;
         if (self._arg_heap == null) {
             self._arg_heap = heap_mod.Heap.init(self.allocator);
         }
@@ -229,6 +236,49 @@ pub fn expandForm(
     form: *const Form,
 ) ExpandError!*Form {
     return expandFormDepth(ctx, env, form, 0);
+}
+
+/// One macro step, the way `macroexpand-1` sees it: when `form` is
+/// a call whose head names a user or host macro (special forms and
+/// the `#%` primitives are not macros), the macro's raw output;
+/// otherwise null. Nothing inside the result is expanded and no
+/// lexical environment applies: the form is top-level data.
+pub fn expandOnce(ctx: *ExpandContext, form: *const Form) ExpandError!?*Form {
+    if (form.datum != .list) return null;
+    const items = form.datum.list;
+    if (items.len == 0 or items[0].datum != .symbol) return null;
+    const head = items[0].datum.symbol;
+    if (head.ns) |ns_prefix| {
+        if (qualifiedMacro(ctx, ns_prefix, head.name)) |user_var| {
+            return try callUserMacro(ctx, user_var, form, items);
+        }
+        if (qualifiedHostMacro(ctx, ns_prefix, head.name)) |macro_fn| {
+            return try macro_fn(ctx, form, items[1..]);
+        }
+        return null;
+    }
+    if (isSpecialFormName(head.name)) return null;
+    if (ctx.namespace) |ns| {
+        if (ns.lookup(head.name)) |user_var| {
+            if (user_var.macro and user_var.bound) {
+                return try callUserMacro(ctx, user_var, form, items);
+            }
+        }
+    }
+    if (ctx.host_macros.get(head.name)) |macro_fn| {
+        return try macro_fn(ctx, form, items[1..]);
+    }
+    return null;
+}
+
+/// The heads `expandList` treats as special forms or internal
+/// primitives: never macros, never shadowable.
+fn isSpecialFormName(name: []const u8) bool {
+    const names = [_][]const u8{
+        "quote", "if", "do", "let*", "loop*", "recur", "fn*", "letfn*", "def", "var", "try", "throw", "defmacro", "ns", "require",
+    };
+    for (names) |n| if (std.mem.eql(u8, name, n)) return true;
+    return std.mem.startsWith(u8, name, "#%");
 }
 
 /// Walk an array of top-level forms (e.g. file contents).
@@ -1497,6 +1547,20 @@ fn invokeUserMacro(
     items: []const *Form,
     depth: u32,
 ) ExpandError!*Form {
+    const result_form = try callUserMacro(ctx, macro_var, call_form, items);
+    // Recursively re-expand the result (macros in the macro
+    // output get expanded).
+    return try expandFormDepth(ctx, env, result_form, depth + 1);
+}
+
+/// Call the user macro `macro_var` on the unevaluated args of
+/// `call_form` and return its output as a Form, unexpanded.
+fn callUserMacro(
+    ctx: *ExpandContext,
+    macro_var: *vm_mod.Var,
+    call_form: *const Form,
+    items: []const *Form,
+) ExpandError!*Form {
     const args = items[1..];
 
     // Convert each arg Form → Value (unevaluated, as data).
@@ -1524,11 +1588,7 @@ fn invokeUserMacro(
     sub_vm_ready = true;
 
     // Convert result Value → Form.
-    const result_form = valueToForm(ctx, result_value, call_form.origin) catch return ExpandError.MalformedMacroCall;
-
-    // Recursively re-expand the result (macros in the macro
-    // output get expanded).
-    return try expandFormDepth(ctx, env, result_form, depth + 1);
+    return valueToForm(ctx, result_value, call_form.origin) catch return ExpandError.MalformedMacroCall;
 }
 
 /// Convert a `Form` to its runtime Value representation. Used
@@ -1548,7 +1608,7 @@ fn invokeUserMacro(
 ///   anon_fn        → the `fn*` form it stands for
 /// syntax_quote, unquote, unquote_splicing and with_meta raise
 /// `MalformedMacroCall`.
-fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
+pub fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
     return switch (form.datum) {
         .nil => value_mod.nilValue(),
         .bool_ => |b| value_mod.fromBool(b),
@@ -1665,7 +1725,7 @@ fn formItemsToList(ctx: *ExpandContext, items: []const *Form) ExpandError!value_
 /// sub-VM. Each constructed Form gets `origin` as its source
 /// span — typically the macro call site (generated forms use
 /// the macro call origin).
-fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSpan) !*Form {
+pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSpan) !*Form {
     return switch (v.kind()) {
         .nil => try makeNil(ctx, origin),
         .true_ => try makeBool(ctx, true, origin),

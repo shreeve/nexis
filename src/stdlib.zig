@@ -199,6 +199,7 @@ const CoreEntry = struct {
 const core_fns = [_]CoreEntry{
     // Sequence primitives.
     .{ .name = "list", .descriptor = &native_list },
+    .{ .name = "list*", .descriptor = &native_list_star },
     .{ .name = "cons", .descriptor = &native_cons },
     .{ .name = "first", .descriptor = &native_first },
     .{ .name = "rest", .descriptor = &native_rest },
@@ -297,6 +298,17 @@ const core_fns = [_]CoreEntry{
     .{ .name = "keyword", .descriptor = &native_keyword },
     .{ .name = "symbol", .descriptor = &native_symbol },
     .{ .name = "gensym", .descriptor = &native_gensym },
+    // Exceptions as maps (PLAN Amendment Log, exceptions are values).
+    .{ .name = "ex-info", .descriptor = &native_ex_info },
+    .{ .name = "ex-data", .descriptor = &native_ex_data },
+    .{ .name = "ex-message", .descriptor = &native_ex_message },
+    // Early exit from a fold.
+    .{ .name = "reduced", .descriptor = &native_reduced },
+    .{ .name = "reduced?", .descriptor = &native_reduced_q },
+    // The compiler at run time.
+    .{ .name = "macroexpand-1", .descriptor = &native_macroexpand_1 },
+    .{ .name = "macroexpand", .descriptor = &native_macroexpand },
+    .{ .name = "read-string", .descriptor = &native_read_string },
     // Metadata (PLAN §8.5).
     .{ .name = "meta", .descriptor = &native_meta },
     .{ .name = "with-meta", .descriptor = &native_with_meta },
@@ -525,6 +537,15 @@ const native_namespace = NativeFn{ .name = "namespace", .min_arity = 1, .max_ari
 const native_keyword = NativeFn{ .name = "keyword", .min_arity = 1, .max_arity = 2, .call = &fnKeyword };
 const native_symbol = NativeFn{ .name = "symbol", .min_arity = 1, .max_arity = 2, .call = &fnSymbol };
 const native_gensym = NativeFn{ .name = "gensym", .min_arity = 0, .max_arity = 1, .call = &fnGensym };
+const native_ex_info = NativeFn{ .name = "ex-info", .min_arity = 2, .max_arity = 3, .call = &fnExInfo };
+const native_ex_data = NativeFn{ .name = "ex-data", .min_arity = 1, .max_arity = 1, .call = &fnExData };
+const native_ex_message = NativeFn{ .name = "ex-message", .min_arity = 1, .max_arity = 1, .call = &fnExMessage };
+const native_reduced = NativeFn{ .name = "reduced", .min_arity = 1, .max_arity = 1, .call = &fnReduced };
+const native_reduced_q = NativeFn{ .name = "reduced?", .min_arity = 1, .max_arity = 1, .call = &fnReducedQ };
+const native_macroexpand_1 = NativeFn{ .name = "macroexpand-1", .min_arity = 1, .max_arity = 1, .call = &fnMacroexpand1 };
+const native_macroexpand = NativeFn{ .name = "macroexpand", .min_arity = 1, .max_arity = 1, .call = &fnMacroexpand };
+const native_read_string = NativeFn{ .name = "read-string", .min_arity = 1, .max_arity = 1, .call = &fnReadString };
+const native_list_star = NativeFn{ .name = "list*", .min_arity = 1, .max_arity = null, .call = &fnListStar };
 const native_meta = NativeFn{ .name = "meta", .min_arity = 1, .max_arity = 1, .call = &fnMeta };
 const native_with_meta = NativeFn{ .name = "with-meta", .min_arity = 2, .max_arity = 2, .call = &fnWithMeta };
 const native_reset_meta = NativeFn{ .name = "reset-meta!", .min_arity = 2, .max_arity = 2, .call = &fnResetMeta };
@@ -657,6 +678,18 @@ fn fnList(vm: *VM, args: []const Value) VmError!Value {
         result = list_mod.cons(heap, args[i], result) catch return VmError.OutOfMemory;
     }
     return result;
+}
+
+/// `(list* a b ... seq)` → list of the leading args followed by
+/// every element of `seq`; nil when there is nothing at all, the
+/// way Clojure's returns a nil seq.
+fn fnListStar(vm: *VM, args: []const Value) VmError!Value {
+    var items: std.ArrayList(Value) = .empty;
+    defer items.deinit(vm.allocator);
+    items.appendSlice(vm.allocator, args[0 .. args.len - 1]) catch return VmError.OutOfMemory;
+    try appendSeqValues(vm, args[args.len - 1], &items);
+    if (items.items.len == 0) return value_mod.nilValue();
+    return try buildListFromSlice(vm, items.items);
 }
 
 /// `(cons x s)` → new cons cell with `x` as head and `s` as
@@ -1123,8 +1156,37 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     while (try it.next()) |x| {
         const pair = [_]Value{ acc, x };
         acc = try vm.callValue(f, &pair);
+        if (isReduced(vm, acc)) return reducedValue(acc);
     }
     return acc;
+}
+
+/// `(reduced x)` → a value `reduce` returns at once, unwrapped;
+/// a one-field record of the type `nexis.core/Reduced`, so
+/// `reduced?` is a type test and `@` reads the value back.
+fn fnReduced(vm: *VM, args: []const Value) VmError!Value {
+    const type_id = vm.ensureReducedType() catch return VmError.OutOfMemory;
+    const heap = vm.ensureHeap();
+    const key = vm.ensureInterner().internKeywordValue("val") catch return VmError.OutOfMemory;
+    const empty = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    const fields = champ_mod.mapAssoc(heap, empty, key, args[0], &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+    return record_mod.make(heap, type_id, fields) catch VmError.OutOfMemory;
+}
+
+fn fnReducedQ(vm: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(isReduced(vm, args[0]));
+}
+
+fn isReduced(vm: *const VM, v: Value) bool {
+    const type_id = vm.reduced_type_id orelse return false;
+    return v.kind() == .record and record_mod.typeId(v) == type_id;
+}
+
+/// The value inside a `reduced` record.
+fn reducedValue(r: Value) Value {
+    var it = champ_mod.mapIter(record_mod.fieldsOf(r));
+    const entry = it.next() orelse return value_mod.nilValue();
+    return entry.value;
 }
 
 /// `(reduce-kv f init m)` → `(f acc k v)` over a map's entries or
@@ -1139,6 +1201,7 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
             var it = champ_mod.mapIter(if (coll.kind() == .record) record_mod.fieldsOf(coll) else coll);
             while (it.next()) |e| {
                 acc = try vm.callValue(f, &.{ acc, e.key, e.value });
+                if (isReduced(vm, acc)) return reducedValue(acc);
             }
         },
         .persistent_vector => {
@@ -1146,6 +1209,7 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
             var i: usize = 0;
             while (i < n) : (i += 1) {
                 acc = try vm.callValue(f, &.{ acc, value_mod.fromFixnum(@intCast(i)).?, vector_mod.nth(coll, i) });
+                if (isReduced(vm, acc)) return reducedValue(acc);
             }
         },
         else => return VmError.KindMismatch,
@@ -1880,7 +1944,10 @@ fn fnReductions(vm: *VM, args: []const Value) VmError!Value {
     results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
     while (try it.next()) |x| {
         acc = try vm.callValue(f, &.{ acc, x });
+        const stop = isReduced(vm, acc);
+        if (stop) acc = reducedValue(acc);
         results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
+        if (stop) break;
     }
     return try buildListFromSlice(vm, results.items);
 }
@@ -2259,6 +2326,70 @@ fn fnSymbol(vm: *VM, args: []const Value) VmError!Value {
     }
     if (args[0].kind() == .symbol) return args[0];
     return vm.ensureInterner().internSymbolValue(try internedName(vm, args[0])) catch |err| internFailure(err);
+}
+
+// =============================================================================
+// Exceptions as maps
+// =============================================================================
+
+/// `(ex-info msg data)` / `(ex-info msg data cause)` → the map
+/// `{:message msg :data data}` (+ `:cause`) for `throw`; `catch`
+/// takes it by `any` or by the `:error` of its data. Keys are
+/// interned at the call, not at boot.
+fn fnExInfo(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    const interner = vm.ensureInterner();
+    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    const names = [_][]const u8{ "message", "data", "cause" };
+    for (args, 0..) |v, i| {
+        const key = interner.internKeywordValue(names[i]) catch return VmError.OutOfMemory;
+        m = champ_mod.mapAssoc(heap, m, key, v, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+    }
+    return m;
+}
+
+/// `(ex-data e)` → the `:data` of a map, nil for anything else.
+fn fnExData(vm: *VM, args: []const Value) VmError!Value {
+    return exEntry(vm, args[0], "data");
+}
+
+/// `(ex-message e)` → the `:message` of a map, nil for anything else.
+fn fnExMessage(vm: *VM, args: []const Value) VmError!Value {
+    return exEntry(vm, args[0], "message");
+}
+
+fn exEntry(vm: *VM, e: Value, name: []const u8) VmError!Value {
+    if (e.kind() != .persistent_map) return value_mod.nilValue();
+    const key = vm.ensureInterner().internKeywordValue(name) catch return VmError.OutOfMemory;
+    return try vm_mod.lookup(e, key, value_mod.nilValue());
+}
+
+// =============================================================================
+// The compiler at run time (vm.CompilerHooks)
+// =============================================================================
+
+/// `(macroexpand-1 form)` → the form after one macro step; a form
+/// that is not a macro call comes back as it is.
+fn fnMacroexpand1(vm: *VM, args: []const Value) VmError!Value {
+    const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
+    return (try hooks.expand_once(hooks.user_data, vm, args[0])) orelse args[0];
+}
+
+/// `(macroexpand form)` → `macroexpand-1` repeated until the head
+/// is no longer a macro; subforms are left alone, as in Clojure.
+fn fnMacroexpand(vm: *VM, args: []const Value) VmError!Value {
+    const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
+    var form = args[0];
+    while (try hooks.expand_once(hooks.user_data, vm, form)) |next| form = next;
+    return form;
+}
+
+/// `(read-string s)` → the first form of `s` as data; a string
+/// that does not read throws `:reader-error`.
+fn fnReadString(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
+    return try hooks.read_string(hooks.user_data, vm, string_mod.asBytes(args[0]));
 }
 
 // =============================================================================
@@ -2784,6 +2915,7 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
             break :blk var_obj.root;
         },
         .atom => atom_mod.getValue(x),
+        .record => if (isReduced(vm, x)) reducedValue(x) else VmError.NotDerefable,
         else => VmError.NotDerefable,
     };
 }
@@ -3777,8 +3909,14 @@ fn fnCatchMatches(vm: *VM, args: []const Value) VmError!Value {
     const tag = args[1];
     if (dispatch_mod_alias.equal(v, tag)) return value_mod.fromBool(true);
     if (v.kind() != .persistent_map and v.kind() != .record) return value_mod.fromBool(false);
-    const error_key = vm.ensureInterner().internKeywordValue("error") catch return VmError.OutOfMemory;
-    return value_mod.fromBool(dispatch_mod_alias.equal(try vm_mod.lookup(v, error_key, value_mod.nilValue()), tag));
+    const interner = vm.ensureInterner();
+    const error_key = interner.internKeywordValue("error") catch return VmError.OutOfMemory;
+    if (dispatch_mod_alias.equal(try vm_mod.lookup(v, error_key, value_mod.nilValue()), tag)) return value_mod.fromBool(true);
+    // An `ex-info` map: its data's `:error`.
+    const data_key = interner.internKeywordValue("data") catch return VmError.OutOfMemory;
+    const data = try vm_mod.lookup(v, data_key, value_mod.nilValue());
+    if (data.kind() != .persistent_map) return value_mod.fromBool(false);
+    return value_mod.fromBool(dispatch_mod_alias.equal(try vm_mod.lookup(data, error_key, value_mod.nilValue()), tag));
 }
 
 fn fnExtendDefaultImpl(vm: *VM, args: []const Value) VmError!Value {

@@ -142,8 +142,17 @@
 ; ============================================================
 ;
 ; Each defn builds on the natives: reduce, loop*, cons, assoc,
-; apply. Where Clojure short-circuits through `reduced`, these
-; iterate with `loop*` and an explicit exit.
+; apply. A fold over `reduce` stops on a `reduced` value the way
+; Clojure's does; the others iterate with `loop*` and an explicit
+; exit.
+
+; (unreduced x) → the value inside a reduced, else x.
+(defn unreduced [x]
+  (if (reduced? x) @x x))
+
+; (ensure-reduced x) → x if already reduced, else (reduced x).
+(defn ensure-reduced [x]
+  (if (reduced? x) x (reduced x)))
 
 ; ---- function composition helpers ----
 

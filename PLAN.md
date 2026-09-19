@@ -2789,9 +2789,10 @@ spec changes downstream of each PLAN entry.
   `{:error :tag ...}` (the shape `docs/NEXTOMIC.md` §7 and
   `case`'s no-match map use), one that cannot is the bare keyword.
   `(catch any e ...)` takes every value; `(catch :tag e ...)` takes
-  the value `:tag` or a map whose `:error` entry is `:tag`; clauses
-  are tried in order and an untaken value is rethrown through
-  `finally`. `ex-info` builds `{:message m :data d}` and
+  the value `:tag`, a map whose `:error` entry is `:tag`, or an
+  `ex-info` map whose data's `:error` is `:tag`; clauses are tried
+  in order and an untaken value is rethrown through `finally`.
+  `ex-info` builds `{:message m :data d}` (`:cause` when given) and
   `ex-data`/`ex-message` read it back. §6.4's `:kind` and
   `:trace` fields and its destructuring catch pattern are not
   shipped; `docs/MACROEXPAND.md` §8b and `docs/COMPILER.md` §5.10

@@ -188,6 +188,8 @@ const Runtime = struct {
     v: vm.VM,
     host_macros: expand_mod.HostMacroTable,
     loader: loader_mod.Loader,
+    /// What `macroexpand-1` and `read-string` call into.
+    hooks: compile.RuntimeHooks,
     interner: *intern_mod.Interner,
     registry: *vm.NamespaceRegistry,
 
@@ -284,6 +286,13 @@ fn bootRuntime(rt: *Runtime, io: std.Io, allocator: std.mem.Allocator, load_path
         rt.registry,
         &rt.host_macros,
     );
+    rt.hooks = .{
+        .host_macros = &rt.host_macros,
+        .registry = rt.registry,
+        .interner = rt.interner,
+        .load_callback = .{ .user_data = @ptrCast(&rt.loader), .load = &loader_mod.Loader.loadCallback },
+    };
+    rt.hooks.install(&rt.v);
 }
 
 /// Compile and evaluate one embedded source into `ns`, one

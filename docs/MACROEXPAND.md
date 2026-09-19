@@ -173,11 +173,11 @@ via these mechanics:
 6. **Lookup order** (`expandList`): lexical env → user macros
    (`Var.macro`) → host macros → ordinary call. User macros
    shadow host macros (override allowed).
-7. **Form↔Value conversion supports**: nil, bool, int, symbol,
-   keyword, list, vector, map, set, quote (normalized to a
-   2-list). `MalformedMacroCall` for syntax-quote/unquote/
-   splicing/anon-fn/with-meta/deref/real/char/string as macro
-   args (deferred to a later commit).
+7. **Form↔Value conversion supports**: nil, bool, int, real,
+   char, string, symbol, keyword, list, vector, map, set, quote
+   (normalized to a 2-list), `@x` (as `(deref x)`) and `#(...)`
+   (as its `fn*`). Syntax-quote, unquote, splicing and `^meta`
+   as macro args are `MalformedMacroCall`.
 8. **Variadic macros** (`& body`) work end-to-end. Variadic
    recur in macros: same restriction as runtime (rejected for
    v1).
@@ -185,6 +185,18 @@ via these mechanics:
    etc.) are deferred to Phase 3.3 — v1 macros are syntax-quote-
    only, which covers `unless`/`when-not`/`cond`-likes/
    threading variants.
+10. **The expander at run time**: `(macroexpand-1 form)` takes a
+    form as data and returns one macro step (`expandOnce`: a
+    user or host macro at the head, special forms and the `#%`
+    primitives excluded; the raw output, nothing inside it
+    expanded, no lexical environment) or the form itself;
+    `macroexpand` repeats until the head is not a macro.
+    `(read-string s)` reads the first form of `s` as data.
+    Both reach the compiler through `vm.CompilerHooks`
+    (`compile.RuntimeHooks`, installed by the runtime that boots
+    the VM); their values are built on the VM heap. Failures
+    throw `:macro-expansion-failure` / `:reader-error`; a VM
+    without hooks throws `:no-compiler`.
 
 ---
 
@@ -694,9 +706,12 @@ Macro semantics (peer-AI turn 56 §2.G-J):
   `any` matcher needing no test, and ends in `(throw g)` so a
   value no clause takes unwinds through the `finally` to the
   enclosing `try`. A matcher is `any` or a keyword `:tag`, which
-  takes a thrown value equal to `:tag` or a map whose `:error`
+  takes a thrown value equal to `:tag`, a map whose `:error`
   entry is `:tag` (the shape of Nextomic's error maps and of the
-  `case` no-match map); anything else is `MacroExpansionFailure`.
+  `case` no-match map), or an `ex-info` map (`{:message m :data
+  d}`, `:cause` when given) whose data's `:error` is `:tag`;
+  anything else is `MacroExpansionFailure`. `ex-message` and
+  `ex-data` read a map's `:message` and `:data` (nil elsewhere).
   No clause at all is a finally-only `try`; neither catch nor
   finally makes the form `(do body*)`.
 - `->` (thread-first):

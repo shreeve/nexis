@@ -100,6 +100,7 @@ const Program = struct {
     arena: std.heap.ArenaAllocator,
     v: vm.VM,
     host_macros: expand_mod.HostMacroTable,
+    hooks: compile.RuntimeHooks,
     registry: *vm.NamespaceRegistry,
     interner: *intern_mod.Interner,
 
@@ -126,6 +127,8 @@ const Program = struct {
         self.registry.current = self.registry.core;
         try bootstrapCoreForTest(&self.v, self.registry.core, self.interner, &self.host_macros);
         self.registry.current = saved_current;
+        self.hooks = .{ .host_macros = &self.host_macros, .registry = self.registry, .interner = self.interner };
+        self.hooks.install(&self.v);
     }
 
     fn deinit(self: *Program) void {
@@ -295,6 +298,8 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     registry.current = registry.core;
     try bootstrapCoreForTest(&v, registry.core, interner, &host_macros);
     registry.current = saved_current;
+    var hooks = compile.RuntimeHooks{ .host_macros = &host_macros, .registry = registry, .interner = interner };
+    hooks.install(&v);
 
     // Each test compiles in the CURRENT namespace
     // (initially user). `(ns NAME)` in src can switch mid-test.
@@ -3732,4 +3737,62 @@ test "unresolved symbols: nothing is interned for a rejected form" {
     var span: ?reader_mod.SrcSpan = null;
     try testing.expectError(compile.CompileError.UnresolvedSymbol, program.runChecked("(defn f [] (ghost))", &span));
     try testing.expect(program.registry.current.lookupLocal("ghost") == null);
+}
+
+test "ex-info: a map thrown and caught, read back with ex-data and ex-message" {
+    try expectOutputProgram(
+        "(try (throw (ex-info \"boom\" {:code 7})) (catch any e [(ex-message e) (ex-data e)]))",
+        "[boom {:code 7}]",
+    );
+    try expectOutputProgram(
+        "(let [e (ex-info \"m\" {:a 1} :why)] [(:message e) (:data e) (:cause e) (map? e)])",
+        "[m {:a 1} :why true]",
+    );
+    try expectOutputProgram("[(ex-data 1) (ex-message :k) (ex-data {:x 1}) (:cause (ex-info \"m\" {}))]", "[nil nil nil nil]");
+    // A tag catches an ex-info map through the `:error` of its data.
+    try expectOutputProgram(
+        "(try (throw (ex-info \"nf\" {:error :not-found :id 3})) (catch :other e :no) (catch :not-found e [(ex-message e) (:id (ex-data e))]))",
+        "[nf 3]",
+    );
+}
+
+test "list*: leading elements before a seq" {
+    try expectOutput("(list* 1 2 [3 4])", "(1 2 3 4)");
+    try expectOutput("(list* [1 2])", "(1 2)");
+    try expectOutput("(list* 1 nil)", "(1)");
+    try expectOutput("(list* nil)", "nil");
+    try expectOutput("(apply + (list* 1 2 '(3)))", "6");
+}
+
+test "reduced: reduce, reductions and reduce-kv stop and unwrap" {
+    try expectOutput("(reduce (fn [acc x] (if (> acc 10) (reduced acc) (+ acc x))) 0 [1 2 3 4 5 6 7 8 9])", "15");
+    try expectOutput("(reduce (fn [acc x] (if (= x 3) (reduced :stop) (+ acc x))) [1 2 3 4])", ":stop");
+    try expectOutput("(reduce (fn [acc x] (reduced x)) 0 [])", "0");
+    try expectOutput("(reductions (fn [acc x] (if (= x 3) (reduced :stop) (+ acc x))) 0 [1 2 3 4])", "(0 1 3 :stop)");
+    try expectOutput("(reduce-kv (fn [acc i x] (if (= i 2) (reduced acc) (conj acc x))) [] [10 20 30 40])", "[10 20]");
+    try expectOutput("[(reduced? (reduced 1)) (reduced? 1) (reduced? {:val 1}) @(reduced 5)]", "[true false false 5]");
+    try expectOutput("[(unreduced (reduced 2)) (unreduced 2) (reduced? (ensure-reduced 3)) (reduced? (ensure-reduced (reduced 3)))]", "[2 2 true true]");
+}
+
+test "macroexpand: host and user macros, one step and to a fixed head" {
+    try expectOutput("(macroexpand-1 '(when a b))", "(if a (do b) nil)");
+    try expectOutput("(macroexpand-1 '(+ 1 2))", "(+ 1 2)");
+    try expectOutput("(macroexpand-1 'x)", "x");
+    try expectOutput("(macroexpand-1 '(if a b))", "(if a b)");
+    try expectOutput("(macroexpand '(-> x f g))", "(g (f x))");
+    try expectOutput("(macroexpand '(when-not a b))", "(if a nil (do b))");
+    try expectOutputProgram("(defmacro twice [x] `(do ~x ~x)) (macroexpand-1 '(twice 1))", "(do 1 1)");
+    try expectOutputProgram("(defmacro w [x] `(when ~x 1)) [(macroexpand-1 '(w a)) (macroexpand '(w a))]", "[(nexis.core/when a 1) (if a (do 1) nil)]");
+}
+
+test "read-string: forms as data, the first form only, errors thrown" {
+    try expectOutput("(read-string \"(+ 1 2)\")", "(+ 1 2)");
+    try expectOutput("(read-string \"[1 :a \\\"s\\\" nil true]\")", "[1 :a s nil true]");
+    try expectOutput("(first (read-string \"(a b)\"))", "a");
+    try expectOutput("(read-string \"{:a 1}\")", "{:a 1}");
+    try expectOutput("(read-string \"'x\")", "(quote x)");
+    try expectOutput("(read-string \" 42 ; comment\\n 43\")", "42");
+    try expectOutput("(try (read-string \"(\") (catch :reader-error e :bad))", ":bad");
+    try expectOutput("(try (read-string \"\") (catch :reader-error e :empty))", ":empty");
+    try expectOutput("(macroexpand-1 (read-string \"(when a b)\"))", "(if a (do b) nil)");
 }

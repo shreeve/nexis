@@ -2154,6 +2154,81 @@ fn compileEvalCallback(
     return try out_vm.run();
 }
 
+/// The compiler as `macroexpand-1` and `read-string` reach it at
+/// run time (`vm.CompilerHooks`). The runtime that boots a VM owns
+/// one of these for as long as the VM lives and calls `install`.
+pub const RuntimeHooks = struct {
+    host_macros: *const expand_mod.HostMacroTable,
+    registry: *vm.NamespaceRegistry,
+    interner: *intern_mod.Interner,
+    load_callback: ?expand_mod.LoadCallback = null,
+
+    pub fn install(self: *RuntimeHooks, v: *vm.VM) void {
+        v.compiler_hooks = .{
+            .user_data = @ptrCast(self),
+            .expand_once = &expandOnceHook,
+            .read_string = &readStringHook,
+        };
+    }
+
+    /// An expander over the current namespace that builds its
+    /// values on the VM's heap; Forms live in `arena`.
+    fn context(self: *RuntimeHooks, arena: std.mem.Allocator, v: *vm.VM) expand_mod.ExpandContext {
+        return .{
+            .allocator = arena,
+            .interner = self.interner,
+            .host_macros = self.host_macros,
+            .namespace = self.registry.current,
+            .registry = self.registry,
+            .load_callback = self.load_callback,
+            .value_heap = v.ensureHeap(),
+        };
+    }
+
+    fn expandOnceHook(user_data: *anyopaque, v: *vm.VM, form_value: value_mod.Value) vm.VmError!?value_mod.Value {
+        const self: *RuntimeHooks = @ptrCast(@alignCast(user_data));
+        var arena = std.heap.ArenaAllocator.init(v.allocator);
+        defer arena.deinit();
+        var ctx = self.context(arena.allocator(), v);
+        const origin = reader_mod.SrcSpan{ .pos = 0, .len = 0 };
+        const form = expand_mod.valueToForm(&ctx, form_value, origin) catch |err|
+            return failure(v, err, "macro-expansion-failure");
+        const expanded = expand_mod.expandOnce(&ctx, form) catch |err|
+            return failure(v, err, "macro-expansion-failure");
+        const out = expanded orelse return null;
+        return expand_mod.formToValue(&ctx, out) catch |err|
+            return failure(v, err, "macro-expansion-failure");
+    }
+
+    /// The first form of `source`; the rest is ignored, as in
+    /// Clojure. Syntax-quote, unquote and `^meta` do not read as
+    /// data and are reader errors here.
+    fn readStringHook(user_data: *anyopaque, v: *vm.VM, source: []const u8) vm.VmError!value_mod.Value {
+        const self: *RuntimeHooks = @ptrCast(@alignCast(user_data));
+        var arena = std.heap.ArenaAllocator.init(v.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var p = reader_mod.parser.parseProgram(a, source) catch |err|
+            return failure(v, err, "reader-error");
+        defer p.parser.deinit();
+        var reader = reader_mod.Reader.init(a, source);
+        defer reader.deinit();
+        const forms = reader.readProgram(p.sexp) catch |err|
+            return failure(v, err, "reader-error");
+        if (forms.len == 0) return v.throwKeyword("reader-error");
+        var ctx = self.context(a, v);
+        return expand_mod.formToValue(&ctx, forms[0]) catch |err|
+            return failure(v, err, "reader-error");
+    }
+
+    /// Out of memory stays an error; anything else the hook could
+    /// not do throws `tag`.
+    fn failure(v: *vm.VM, err: anyerror, tag: []const u8) vm.VmError {
+        if (err == error.OutOfMemory) return vm.VmError.OutOfMemory;
+        return v.throwKeyword(tag);
+    }
+};
+
 /// Full form-compile with both namespace AND interner.
 /// Without an Interner, quoted symbols/keywords raise
 /// `UnsupportedFeature`. With one (typically `VM.ensureInterner()`),
