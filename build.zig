@@ -584,6 +584,19 @@ pub fn build(b: *std.Build) void {
     const integration_nextomic_pull_tests = b.addTest(.{ .root_module = integration_nextomic_pull_mod });
     const run_integration_nextomic_pull_tests = b.addRunArtifact(integration_nextomic_pull_tests);
 
+    // The transaction-function corpus (test/integration/nextomic_fn.zig):
+    // :db.fn/call and :db.fn/cas through transact!.
+    const integration_nextomic_fn_mod = b.createModule(.{
+        .root_source_file = b.path("test/integration/nextomic_fn.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_nextomic_fn_mod.addImport("nextomic", nextomic_mod);
+    integration_nextomic_fn_mod.addImport("reader", reader_mod);
+    for (nextomic_imports) |imp| integration_nextomic_fn_mod.addImport(imp.name, imp.mod);
+    const integration_nextomic_fn_tests = b.addTest(.{ .root_module = integration_nextomic_fn_mod });
+    const run_integration_nextomic_fn_tests = b.addRunArtifact(integration_nextomic_fn_tests);
+
     const nextomic_test_step = b.step("nextomic-test", "Nextomic unit tests, key and transaction property tests, and the query and pull corpora");
     nextomic_test_step.dependOn(&run_nextomic_handle_tests.step);
     nextomic_test_step.dependOn(&run_nextomic_tests.step);
@@ -591,6 +604,7 @@ pub fn build(b: *std.Build) void {
     nextomic_test_step.dependOn(&run_prop_nextomic_tx_tests.step);
     nextomic_test_step.dependOn(&run_integration_nextomic_q_tests.step);
     nextomic_test_step.dependOn(&run_integration_nextomic_pull_tests.step);
+    nextomic_test_step.dependOn(&run_integration_nextomic_fn_tests.step);
 
     // -------------------------------------------------------------------------
     // Reader unit tests (src/reader.zig has its own test { ... }
@@ -1363,6 +1377,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_nextomic_tx_tests.step);
     test_step.dependOn(&run_integration_nextomic_q_tests.step);
     test_step.dependOn(&run_integration_nextomic_pull_tests.step);
+    test_step.dependOn(&run_integration_nextomic_fn_tests.step);
     test_step.dependOn(&run_prop_compile_tests.step);
     test_step.dependOn(&run_integration_eval_tests.step);
     test_step.dependOn(&run_runtime_polish_tests.step);
