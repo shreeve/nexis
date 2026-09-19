@@ -2479,21 +2479,8 @@ pub const VM = struct {
             dst_ptr.* = result;
             return;
         }
-        // Keywords and collections are invocable as lookups
-        // (PLAN §8.7): `(:k m)`, `(m :k)`, `(s x)`, `(v i)`.
         if (isLookupCallable(closure_v.kind())) {
-            if (argc > 2) return VmError.ArityMismatch;
-            var args_buf: [2]Value = undefined;
-            var i: u32 = 0;
-            while (i < argc) : (i += 1) {
-                args_buf[i] = (try self.slotPtr(@intCast(call_base + 1 + i))).*;
-            }
-            const result = try callLookup(closure_v, args_buf[0..argc]);
-            if (result_dst >= self.currentFrame().slot_count) {
-                return VmError.OperandOutOfRange;
-            }
-            (try self.slotPtr(result_dst)).* = result;
-            return;
+            return try self.execCallLookup(closure_v, call_base, argc, result_dst);
         }
         if (closure_v.kind() != value_mod.Kind.function) {
             return VmError.NotCallable;
@@ -2642,107 +2629,88 @@ pub const VM = struct {
             .return_pc = caller_pc_after_call,
             .upvalues = closure.upvalues,
         });
+    }
+
+    /// Push `frame`. The caller has already grown the stack into
+    /// the frame's window and recorded the length it found before
+    /// doing so in `frame.entry_stack_len`; `popFrame` restores
+    /// exactly that length.
+    fn pushFrame(self: *VM, frame: Frame) VmError!void {
+        self.frames.append(self.allocator, frame) catch return VmError.OutOfMemory;
         if (self.frames.items.len > self.frame_high_water) {
             self.frame_high_water = self.frames.items.len;
         }
+        if (self.stack.items.len > self.stack_high_water) {
+            self.stack_high_water = self.stack.items.len;
+        }
     }
 
-    /// `call:return A=slot _ _` — read return value from
-    /// `slot[A]`, then either halt (if top-level) or pop the
-    /// callee frame and write the return value into the
-    /// caller's `return_dst` slot.
-    fn execCallReturn(self: *VM, inst: Inst) VmError!void {
-        // Read the return value FIRST while the callee frame is
-        // still active (peer-AI turn 42 ordering: shrinking the
-        // stack or popping the frame before this read would
-        // invalidate the slot pointer).
-        const return_value = try self.resolve(inst.a);
+    /// Pop the top frame and restore the stack to the length it
+    /// recorded on entry. The top-level frame is never popped.
+    fn popFrame(self: *VM) Frame {
+        std.debug.assert(self.frames.items.len > 1);
+        const frame = self.frames.pop().?;
+        self.stack.shrinkRetainingCapacity(frame.entry_stack_len);
+        return frame;
+    }
 
-        // Phase 3.3b (peer-AI turn 68): callValue's synthetic
-        // frame path. If this frame's host_result is set, the
-        // caller is HOST CODE (not a regular routine), so the
-        // result must go into the result cell, not into a
-        // caller's slot. Pop the frame, restore the stack to the
-        // frame's entry length, and signal completion. `runUntilDepth`
-        // detects the depth decrease + result_cell.done and
-        // returns.
-        const callee_idx_check = self.frames.items.len - 1;
-        if (self.frames.items[callee_idx_check].host_result) |hr| {
-            const callee = self.frames.items[callee_idx_check];
+    /// `call:call` on a keyword or collection (PLAN §8.7): `(:k m)`,
+    /// `(m :k)`, `(s x)`, `(v i)` are lookups, which take at most a
+    /// receiver and a default and never push a frame.
+    fn execCallLookup(self: *VM, callee: Value, call_base: u32, argc: u32, result_dst: u12) VmError!void {
+        if (argc > 2) return VmError.ArityMismatch;
+        var args_buf: [2]Value = undefined;
+        var i: u32 = 0;
+        while (i < argc) : (i += 1) {
+            args_buf[i] = (try self.slotPtr(@intCast(call_base + 1 + i))).*;
+        }
+        const result = try callLookup(callee, args_buf[0..argc]);
+        if (result_dst >= self.currentFrame().slot_count) {
+            return VmError.OperandOutOfRange;
+        }
+        (try self.slotPtr(result_dst)).* = result;
+    }
+
+    /// `call:return A=slot _ _` — return `slot[A]` from the current
+    /// frame.
+    fn execCallReturn(self: *VM, inst: Inst) VmError!void {
+        // Read the return value while the callee frame is still
+        // active; popping first would invalidate the slot.
+        const return_value = try self.resolve(inst.a);
+        return self.returnValue(return_value);
+    }
+
+    /// `call:return-nil` — return nil from the current frame.
+    fn execCallReturnNil(self: *VM) VmError!void {
+        return self.returnValue(value_mod.nilValue());
+    }
+
+    /// Complete the current frame with `return_value`. A frame
+    /// pushed by `callValue` hands the value to its host result
+    /// cell; the top-level frame halts the VM with it; any other
+    /// frame is popped and the value lands in the caller's
+    /// `return_dst` slot, where the caller resumes at `return_pc`.
+    /// Frame metadata is validated before anything is mutated so
+    /// a corrupt frame surfaces an error, not a half-popped VM.
+    fn returnValue(self: *VM, return_value: Value) VmError!void {
+        const callee = self.frames.items[self.frames.items.len - 1];
+        if (callee.host_result) |hr| {
             hr.value = return_value;
             hr.done = true;
-            _ = self.frames.pop().?;
-            self.stack.shrinkRetainingCapacity(callee.entry_stack_len);
+            _ = self.popFrame();
             return;
         }
-
-        // Top-level return halts the VM and stores result.
         if (self.frames.items.len == 1) {
             self.result = return_value;
             self.halted = true;
             return;
         }
-
-        // Non-top-level return.
-        // Validate frame metadata BEFORE any mutation (peer-AI
-        // turn 43): if `callee.return_dst` is invalid, popping
-        // and shrinking first would partially corrupt VM state
-        // before surfacing the error.
-        const callee_idx = self.frames.items.len - 1;
-        const caller_idx = callee_idx - 1;
-        const callee_meta = self.frames.items[callee_idx];
-        const caller_meta = self.frames.items[caller_idx];
-
-        if (callee_meta.return_dst >= caller_meta.slot_count) {
-            return VmError.OperandOutOfRange;
-        }
-        const caller_end: usize = @as(usize, caller_meta.base_slot) + caller_meta.slot_count;
-        const absolute: usize = @as(usize, caller_meta.base_slot) + callee_meta.return_dst;
-        if (absolute >= caller_end) return VmError.BytecodeCorruption;
-
-        // Mutations from here on out are post-validation.
-        _ = self.frames.pop().?;
-        self.stack.shrinkRetainingCapacity(callee_meta.entry_stack_len);
+        const caller = self.frames.items[self.frames.items.len - 2];
+        if (callee.return_dst >= caller.slot_count) return VmError.OperandOutOfRange;
+        const absolute: usize = @as(usize, caller.base_slot) + callee.return_dst;
+        _ = self.popFrame();
         self.stack.items[absolute] = return_value;
-        self.frames.items[caller_idx].pc = callee_meta.return_pc;
-    }
-
-    /// `call:return-nil` — same as `call:return` with a nil
-    /// return value, no operand resolution. Same validate-before-
-    /// mutate discipline as `execCallReturn` (peer-AI turn 43).
-    fn execCallReturnNil(self: *VM) VmError!void {
-        // Phase 3.3b (peer-AI turn 68): host_result path.
-        const callee_idx_check = self.frames.items.len - 1;
-        if (self.frames.items[callee_idx_check].host_result) |hr| {
-            const callee = self.frames.items[callee_idx_check];
-            hr.value = value_mod.nilValue();
-            hr.done = true;
-            _ = self.frames.pop().?;
-            self.stack.shrinkRetainingCapacity(callee.entry_stack_len);
-            return;
-        }
-
-        if (self.frames.items.len == 1) {
-            self.result = value_mod.nilValue();
-            self.halted = true;
-            return;
-        }
-        const callee_idx = self.frames.items.len - 1;
-        const caller_idx = callee_idx - 1;
-        const callee_meta = self.frames.items[callee_idx];
-        const caller_meta = self.frames.items[caller_idx];
-
-        if (callee_meta.return_dst >= caller_meta.slot_count) {
-            return VmError.OperandOutOfRange;
-        }
-        const caller_end: usize = @as(usize, caller_meta.base_slot) + caller_meta.slot_count;
-        const absolute: usize = @as(usize, caller_meta.base_slot) + callee_meta.return_dst;
-        if (absolute >= caller_end) return VmError.BytecodeCorruption;
-
-        _ = self.frames.pop().?;
-        self.stack.shrinkRetainingCapacity(callee_meta.entry_stack_len);
-        self.stack.items[absolute] = value_mod.nilValue();
-        self.frames.items[caller_idx].pc = callee_meta.return_pc;
+        self.frames.items[self.frames.items.len - 1].pc = callee.return_pc;
     }
 
     // -------------------------------------------------------------------------
@@ -3026,18 +2994,10 @@ pub const VM = struct {
     // -------------------------------------------------------------------------
 
     fn execCmp(self: *VM, inst: Inst) VmError!void {
-        const variant: Cmp = @enumFromInt(inst.variant);
         // cmp:<op> a b c   ;  slot[a] = bool(resolve(b) <op> resolve(c))
+        const cmp = std.enums.fromInt(NumCmp, inst.variant) orelse return VmError.BytecodeCorruption;
         const lhs = try self.resolve(inst.b);
         const rhs = try self.resolve(inst.c);
-        const cmp: NumCmp = switch (variant) {
-            .lt => .lt,
-            .lte => .lte,
-            .gt => .gt,
-            .gte => .gte,
-            .eq_num => .eq,
-            _ => return VmError.BytecodeCorruption,
-        };
         try self.store(inst.a, value_mod.fromBool(try numCompare(cmp, lhs, rhs)));
     }
 
@@ -3732,28 +3692,85 @@ fn fixnumResult(n: i64) VmError!value_mod.Value {
     return value_mod.fromFixnum(n) orelse VmError.ArithmeticOverflow;
 }
 
-pub fn numAdd(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
-    if (a.isFixnum() and b.isFixnum()) {
-        // Two i48 operands never overflow an i64 sum; only the
-        // fixnum range check can fail.
-        return fixnumResult(a.asFixnum() + b.asFixnum());
+/// One contagious binary operation: two fixnums stay integral
+/// through `int_op` (whose result is range-checked into a fixnum),
+/// any float operand widens both sides through `float_op`.
+fn arith(
+    comptime int_op: fn (i64, i64) VmError!i64,
+    comptime float_op: fn (f64, f64) f64,
+    a: value_mod.Value,
+    b: value_mod.Value,
+) VmError!value_mod.Value {
+    if (a.isFixnum() and b.isFixnum()) return fixnumResult(try int_op(a.asFixnum(), b.asFixnum()));
+    return value_mod.fromFloat(float_op(try toFloat(a), try toFloat(b)));
+}
+
+/// `arith` for the division family: a zero divisor of either kind
+/// raises before the operation is chosen.
+fn divLike(
+    comptime int_op: fn (i64, i64) VmError!i64,
+    comptime float_op: fn (f64, f64) f64,
+    a: value_mod.Value,
+    b: value_mod.Value,
+) VmError!value_mod.Value {
+    if ((b.isFixnum() and b.asFixnum() == 0) or (b.isFloat() and b.asFloat() == 0)) return VmError.DivideByZero;
+    return arith(int_op, float_op, a, b);
+}
+
+const int_ops = struct {
+    // Two i48 operands never overflow an i64 sum or difference;
+    // only the fixnum range check on the result can fail.
+    fn add(x: i64, y: i64) VmError!i64 {
+        return x + y;
     }
-    return value_mod.fromFloat(try toFloat(a) + try toFloat(b));
+    fn sub(x: i64, y: i64) VmError!i64 {
+        return x - y;
+    }
+    fn mul(x: i64, y: i64) VmError!i64 {
+        return std.math.mul(i64, x, y) catch VmError.ArithmeticOverflow;
+    }
+    fn quot(x: i64, y: i64) VmError!i64 {
+        return @divTrunc(x, y);
+    }
+    fn rem(x: i64, y: i64) VmError!i64 {
+        return @rem(x, y);
+    }
+    fn mod(x: i64, y: i64) VmError!i64 {
+        return @mod(x, y);
+    }
+};
+
+const float_ops = struct {
+    fn add(x: f64, y: f64) f64 {
+        return x + y;
+    }
+    fn sub(x: f64, y: f64) f64 {
+        return x - y;
+    }
+    fn mul(x: f64, y: f64) f64 {
+        return x * y;
+    }
+    fn quot(x: f64, y: f64) f64 {
+        return @trunc(x / y);
+    }
+    fn rem(x: f64, y: f64) f64 {
+        return @rem(x, y);
+    }
+    fn mod(x: f64, y: f64) f64 {
+        return @mod(x, y);
+    }
+};
+
+pub fn numAdd(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
+    return arith(int_ops.add, float_ops.add, a, b);
 }
 
 pub fn numSub(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
-    if (a.isFixnum() and b.isFixnum()) {
-        return fixnumResult(a.asFixnum() - b.asFixnum());
-    }
-    return value_mod.fromFloat(try toFloat(a) - try toFloat(b));
+    return arith(int_ops.sub, float_ops.sub, a, b);
 }
 
 pub fn numMul(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
-    if (a.isFixnum() and b.isFixnum()) {
-        const p = std.math.mul(i64, a.asFixnum(), b.asFixnum()) catch return VmError.ArithmeticOverflow;
-        return fixnumResult(p);
-    }
-    return value_mod.fromFloat(try toFloat(a) * try toFloat(b));
+    return arith(int_ops.mul, float_ops.mul, a, b);
 }
 
 /// `/`: exact fixnum quotient stays a fixnum, anything else is f64.
@@ -3770,41 +3787,17 @@ pub fn numDiv(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
 
 /// `quot`: truncated division. A zero divisor of either kind raises.
 pub fn numQuot(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
-    if (a.isFixnum() and b.isFixnum()) {
-        const y = b.asFixnum();
-        if (y == 0) return VmError.DivideByZero;
-        return fixnumResult(@divTrunc(a.asFixnum(), y));
-    }
-    const x = try toFloat(a);
-    const y = try toFloat(b);
-    if (y == 0) return VmError.DivideByZero;
-    return value_mod.fromFloat(@trunc(x / y));
+    return divLike(int_ops.quot, float_ops.quot, a, b);
 }
 
 /// `rem`: remainder of truncated division, sign of the dividend.
 pub fn numRem(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
-    if (a.isFixnum() and b.isFixnum()) {
-        const y = b.asFixnum();
-        if (y == 0) return VmError.DivideByZero;
-        return fixnumResult(@rem(a.asFixnum(), y));
-    }
-    const x = try toFloat(a);
-    const y = try toFloat(b);
-    if (y == 0) return VmError.DivideByZero;
-    return value_mod.fromFloat(@rem(x, y));
+    return divLike(int_ops.rem, float_ops.rem, a, b);
 }
 
 /// `mod`: remainder of floored division, sign of the divisor.
 pub fn numMod(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
-    if (a.isFixnum() and b.isFixnum()) {
-        const y = b.asFixnum();
-        if (y == 0) return VmError.DivideByZero;
-        return fixnumResult(@mod(a.asFixnum(), y));
-    }
-    const x = try toFloat(a);
-    const y = try toFloat(b);
-    if (y == 0) return VmError.DivideByZero;
-    return value_mod.fromFloat(@mod(x, y));
+    return divLike(int_ops.mod, float_ops.mod, a, b);
 }
 
 pub fn numNeg(a: value_mod.Value) VmError!value_mod.Value {
@@ -3823,26 +3816,28 @@ pub fn numAbs(a: value_mod.Value) VmError!value_mod.Value {
     };
 }
 
-pub const NumCmp = enum { lt, lte, gt, gte, eq };
+/// The comparison predicates of the tower. The variants share
+/// their values with the `cmp` opcode group so `execCmp` needs no
+/// mapping.
+pub const NumCmp = enum(u6) { lt, lte, gt, gte, eq };
+
+comptime {
+    for (std.meta.tags(NumCmp)) |tag| {
+        const op: Cmp = @enumFromInt(@intFromEnum(tag));
+        std.debug.assert(std.mem.startsWith(u8, @tagName(op), @tagName(tag)));
+    }
+}
 
 /// Ordered comparison across the tower. Two fixnums compare as
 /// integers; any float operand widens both sides to f64, so
 /// `(< 1 1.5)` holds and `(== 1 1.0)` holds. NaN compares false
 /// under every predicate, as IEEE specifies.
 pub fn numCompare(cmp: NumCmp, a: value_mod.Value, b: value_mod.Value) VmError!bool {
-    if (a.isFixnum() and b.isFixnum()) {
-        const x = a.asFixnum();
-        const y = b.asFixnum();
-        return switch (cmp) {
-            .lt => x < y,
-            .lte => x <= y,
-            .gt => x > y,
-            .gte => x >= y,
-            .eq => x == y,
-        };
-    }
-    const x = try toFloat(a);
-    const y = try toFloat(b);
+    if (a.isFixnum() and b.isFixnum()) return ordered(i64, cmp, a.asFixnum(), b.asFixnum());
+    return ordered(f64, cmp, try toFloat(a), try toFloat(b));
+}
+
+fn ordered(comptime T: type, cmp: NumCmp, x: T, y: T) bool {
     return switch (cmp) {
         .lt => x < y,
         .lte => x <= y,
