@@ -1,29 +1,25 @@
-//! coll/vector.zig — persistent vector heap kind (Phase 1, Scope A).
+//! coll/vector.zig — persistent vector heap kind.
 //!
 //! **This is plain 32-way radix trie + tail buffer, NOT RRB-relaxed.**
-//! Despite the canonical academic name "RRB tree," the v1 implementation
-//! is the same shape Clojure has shipped for 17+ years (PLAN §9.2 +
-//! §23 #30, frozen). RRB relaxation lands in v2+. The module is named
-//! `vector` for user-facing clarity; older docs may refer to it as
-//! `rrb.zig` (renamed 2026-05-16, peer-AI turn 52).
+//! Despite the canonical academic name "RRB tree," the implementation
+//! is the same shape Clojure ships (PLAN §9.2 + §23 #30). There is no
+//! RRB relaxation. The module is named `vector` for user-facing
+//! clarity.
 //!
 //! Authoritative spec: `docs/VECTOR.md`. Semantic framing:
 //! `docs/SEMANTICS.md` §2.6 (sequential equality category) and §3.2
 //! (shared-sequential hash domain byte `0xF0`). Physical storage:
 //! `docs/HEAP.md`.
 //!
-//! This is the **second sequential collection kind**. Its landing is
-//! the first direct exercise of the cross-kind sequential equality
-//! story the architecture committed to in `accbb83`. The critical
-//! invariant exercised here: `(= (list 1 2 3) [1 2 3])` must be true
-//! and `(hash (list 1 2 3)) == (hash [1 2 3])` must hold by
+//! Cross-kind sequential equality invariant: `(= (list 1 2 3) [1 2 3])`
+//! is true and `(hash (list 1 2 3)) == (hash [1 2 3])` holds by
 //! construction. See `test "cross-kind: (list 1 2 3) and [1 2 3] are
 //! equal and share hashValue"` in `src/dispatch.zig`.
 //!
-//! Scope (Scope A): `empty` / `fromSlice` / `conj` / `count` / `nth`
-//! / `isEmpty` / `hashSeq` / `equalSeq` / `Cursor`. Deferred:
-//! `assoc`, `pop`, `subvec`, `concat`, transients, small-vector
-//! inline (subkind 0).
+//! Surface: `empty` / `fromSlice` / `conj` / `assoc` / `count` / `nth`
+//! / `isEmpty` / `hashSeq` / `equalSeq` / `Cursor` / `trace`. There is
+//! no `pop`, `subvec` or `concat`, and no small-vector inline subkind;
+//! transients wrap this module from `src/coll/transient.zig`.
 
 const std = @import("std");
 const value = @import("value");
@@ -51,11 +47,10 @@ pub const subkind_root: u16 = 1;
 // Body layouts
 //
 // Per VECTOR.md §3. Four conceptual subkinds (root / interior / leaf /
-// tail) are semantically distinct but NOT encoded in the HeapHeader in
-// v1 — every internal access derives the kind from structural context
-// (root.shift + descent level). GC will add explicit subkind encoding
-// when gc.zig lands; Scope A doesn't need it because only vector.zig
-// itself traverses these allocations today.
+// tail) are semantically distinct but NOT encoded in the HeapHeader —
+// every internal access, including `trace`, derives the kind from
+// structural context (root.shift + descent level). Only vector.zig
+// itself traverses these allocations.
 // =============================================================================
 
 /// Root vector body (subkind 1). Every vector — empty, small, or
@@ -180,8 +175,8 @@ fn valueFromRoot(h: *HeapHeader) Value {
 /// Public reconstruction helper for the transient module (TRANSIENT.md
 /// §8). Builds a persistent-vector user Value from a raw root
 /// `*HeapHeader`. The transient wrapper's `inner_header` is always a
-/// subkind-1 vector root in v1 (no other vector subkind is
-/// user-facing), so no subkind inference is needed.
+/// subkind-1 vector root (no other vector subkind is user-facing),
+/// so no subkind inference is needed.
 pub fn valueFromVectorHeader(h: *HeapHeader) Value {
     if (std.debug.runtime_safety) {
         std.debug.assert(h.kind == @intFromEnum(Kind.persistent_vector));
@@ -266,12 +261,12 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
     // `promoted_leaf_base` is the logical element index the promoted
     // leaf covers from: the leaf spans indices
     // `[promoted_leaf_base, promoted_leaf_base + 32)`. Derived from
-    // the OLD count, not the new one (peer-AI turn-7 naming review).
+    // the OLD count, not the new one.
     const promoted_leaf_base: u32 = src.count - @as(u32, branch_factor);
     // `elems_after_promotion` is how many elements the trie must
     // address once the promoted leaf is in place: old count (which
-    // already includes the 32 elements currently in the tail that
-    // are about to become the promoted leaf).
+    // already includes the 32 elements in the tail that are about to
+    // become the promoted leaf).
     const elems_after_promotion: u32 = src.count;
 
     var new_root_node: *HeapHeader = undefined;
@@ -306,10 +301,9 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
     // GC-interaction note: this function allocates 3–5 heap objects
     // (new_tail, promoted_leaf, possibly clones and new interiors,
     // new_root_h) before any of them is reachable from a user-held
-    // Value. v1's heap is arena-ish and does not trigger GC during
-    // `alloc`. When `gc.zig` lands, this function will need a
-    // temporary root-stack pattern (or a "no-GC during construction"
-    // discipline) to prevent partial-tree reclamation.
+    // Value. `Heap.alloc` never triggers a collection (GC.md §9:
+    // collection is explicit-only), so no temporary root-stack is
+    // needed to protect the partial tree.
     if (src.root_node == null or elems_after_promotion > capacityAtShift(src.shift)) {
         const old_shift = src.shift;
         new_shift = if (src.root_node == null) branch_bits else src.shift + branch_bits;
@@ -520,11 +514,10 @@ fn traceTrie(node: *HeapHeader, shift: u32, visitor: anytype) void {
 // =============================================================================
 // Cursor — streaming ordered iteration for cross-kind walking
 //
-// Peer-AI turn-7: cross-kind `sequentialEqual` uses cursor-based walks
-// rather than `count + nth` so the pattern generalizes to lazy-seq and
-// cons without random-access. Vector's v1 cursor uses `nth(i)` per
-// step — O(log₃₂ n) per element; a Phase 6 optimization can rewrite
-// to leaf-wise traversal without changing the public shape.
+// Cross-kind `sequentialEqual` uses cursor-based walks rather than
+// `count + nth` so the pattern generalizes to lazy-seq and cons
+// without random-access. Vector's cursor uses `nth(i)` per step —
+// O(log₃₂ n) per element; it does not cache the current leaf.
 // =============================================================================
 
 pub const Cursor = struct {
@@ -621,8 +614,8 @@ fn pushLeaf(
 
 /// Index-based trie lookup starting from a root header. Used by
 /// `hashSeq` and `equalSeq` to avoid re-deriving the whole root body
-/// per element. For bulk iteration a future optimization can cache
-/// the current leaf; for Scope A this is O(log₃₂ n) per call.
+/// per element. It does not cache the current leaf, so bulk
+/// iteration is O(log₃₂ n) per call.
 fn nthFromHeader(h: *HeapHeader, i: usize) Value {
     const body = rootBodyConst(h);
     const tail_offset: usize = body.count - body.tail_len;
@@ -944,7 +937,7 @@ test "conj at the actual shift-10 → shift-15 overflow (32800 + 1 = 32801)" {
     // capacityAtShift(10) = 32768 elements plus a 32-element tail =
     // 32800 total before forcing a new level. At count 32801 shift
     // grows to 15. This test validates the recursive newPath
-    // construction at the deepest depth v1 exercises.
+    // construction at the deepest depth the tests exercise.
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();

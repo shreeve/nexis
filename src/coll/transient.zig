@@ -1,4 +1,4 @@
-//! coll/transient.zig — transient wrapper kind (Phase 1).
+//! coll/transient.zig — transient wrapper kind.
 //!
 //! Authoritative spec: `docs/TRANSIENT.md`. Derivative semantics:
 //! `docs/SEMANTICS.md` §2.6 (identity-based equality; not hashable;
@@ -7,12 +7,11 @@
 //! (owner-token + frozen state machine), CLOJURE-REVIEW §1.2 + §2.7
 //! (owner-token epoch vs. Clojure's thread identity).
 //!
-//! v1 delivers "shallow" transients (TRANSIENT.md §1 Option B):
-//! mutation ops call the persistent backing operations (`champ.mapAssoc`,
+//! Transients are "shallow" (TRANSIENT.md §1 Option B): mutation ops
+//! call the persistent backing operations (`champ.mapAssoc`,
 //! `champ.setConj`, `vector.conj`) underneath, updating the wrapper's
-//! `inner_header` field in place. Real in-place node editing
-//! (Option A, Clojure's performance advantage) is deferred to a
-//! Phase 6 commit.
+//! `inner_header` field in place. There is no in-place node editing
+//! (TRANSIENT.md §1 Option A, Clojure's performance advantage).
 //!
 //! Token discipline enforced at every public entry point:
 //!   - `owner_token == 0` → frozen; all ops return `error.TransientFrozen`.
@@ -28,9 +27,8 @@
 //!     ├─ @import("champ")    — mapAssoc/Dissoc/Get/Count, setConj/Disj/Contains/Count, valueFromMapHeader, valueFromSetHeader
 //!     └─ @import("vector")  — conj/nth/count, valueFromVectorHeader
 //!
-//! Nothing imports `transient.zig`. `src/dispatch.zig` and
-//! `src/gc.zig` each gain a `.transient` arm that calls into this
-//! module (dispatch) or this module's `trace` (gc).
+//! Importers: the `.transient` arms of `src/dispatch.zig` (operations),
+//! `src/gc.zig` (this module's `trace`) and `src/codec.zig`.
 
 const std = @import("std");
 const value = @import("value");
@@ -46,7 +44,7 @@ const HeapHeader = heap_mod.HeapHeader;
 const testing = std.testing;
 
 // =============================================================================
-// Subkind taxonomy (TRANSIENT.md §2 local enum, VALUE.md §2.2 amended)
+// Subkind taxonomy (TRANSIENT.md §2 local enum, VALUE.md §2.2)
 // =============================================================================
 
 pub const subkind_transient_map: u16 = 0;
@@ -61,9 +59,8 @@ pub const TransientError = error{
     /// Op called on a frozen transient (owner_token == 0). After
     /// `persistentBang` OR on a wrapper whose token was never stamped.
     TransientFrozen,
-    /// Reserved for Phase 7+ multi-isolate owner mismatch. No v1
-    /// runtime code path produces this variant; it exists so
-    /// Phase 7+ can light it up without introducing a new error kind.
+    /// Reserved for multi-isolate owner mismatch. No runtime code
+    /// path produces this variant.
     TransientWrongOwner,
     /// `transientFrom` called on a Value whose kind is not a valid
     /// transient inner (must be .persistent_map / .persistent_set /
@@ -98,9 +95,8 @@ const TransientBody = extern struct {
 // Owner-token source (TRANSIENT.md §4)
 //
 // Private module-level counter. No public API for issuance. Tokens
-// are opaque to user code. Exhaustion not handled in v1 (u64 at
-// realistic issue rates is practically unreachable; wraparound
-// revisited with multi-isolate support per TRANSIENT.md §4).
+// are opaque to user code. Exhaustion is not handled: a u64 at
+// realistic issue rates is practically unreachable (TRANSIENT.md §4).
 // =============================================================================
 
 var next_token: u64 = 1;
@@ -153,9 +149,9 @@ fn assertActiveSubkind(t: Value, expected_subkind: u16) TransientError!void {
 //
 // The single place transient code crosses into kind-specific
 // reconstruction. Calls only the public per-kind `valueFromXxxHeader`
-// helpers — does NOT inspect body layouts directly. Per peer-AI
-// turn 18, this boundary keeps transient ignorant of CHAMP/array-map
-// subkind inference details.
+// helpers — does NOT inspect body layouts directly. This boundary
+// keeps transient ignorant of CHAMP/array-map subkind inference
+// details.
 // =============================================================================
 
 fn innerValueForSubkind(subkind: u16, h: *HeapHeader) Value {
