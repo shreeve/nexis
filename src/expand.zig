@@ -2319,7 +2319,7 @@ fn buildMultiArityFn(
 
     // (let* [n_sym (count args_sym)] current_else)
     const count_items = try ctx.allocator.alloc(*Form, 2);
-    count_items[0] = try makeSymbol(ctx, "count", call_form.origin);
+    count_items[0] = try coreSym(ctx, "count", call_form.origin);
     count_items[1] = args_sym;
     const let_bindings = try ctx.allocator.alloc(*Form, 2);
     let_bindings[0] = n_sym;
@@ -2383,7 +2383,7 @@ fn buildThrowArity(ctx: *ExpandContext, origin: reader_mod.SrcSpan) ExpandError!
 
 fn buildFixedCondition(ctx: *ExpandContext, origin: reader_mod.SrcSpan, n_sym: *Form, k: usize) ExpandError!*Form {
     const items = try ctx.allocator.alloc(*Form, 3);
-    items[0] = try makeSymbol(ctx, "=", origin);
+    items[0] = try coreSym(ctx, "=", origin);
     items[1] = n_sym;
     const k_form = try ctx.allocator.create(Form);
     k_form.* = .{ .datum = .{ .int = @intCast(k) }, .origin = origin };
@@ -2396,14 +2396,14 @@ fn buildFixedCondition(ctx: *ExpandContext, origin: reader_mod.SrcSpan, n_sym: *
 /// avoids needing `<=`.
 fn buildVariadicCondition(ctx: *ExpandContext, origin: reader_mod.SrcSpan, n_sym: *Form, fixed_count: usize) ExpandError!*Form {
     const lt_items = try ctx.allocator.alloc(*Form, 3);
-    lt_items[0] = try makeSymbol(ctx, "<", origin);
+    lt_items[0] = try coreSym(ctx, "<", origin);
     lt_items[1] = n_sym;
     const k_form = try ctx.allocator.create(Form);
     k_form.* = .{ .datum = .{ .int = @intCast(fixed_count) }, .origin = origin };
     lt_items[2] = k_form;
     const lt_call = try makeList(ctx, lt_items, origin);
     const not_items = try ctx.allocator.alloc(*Form, 2);
-    not_items[0] = try makeSymbol(ctx, "not", origin);
+    not_items[0] = try coreSym(ctx, "not", origin);
     not_items[1] = lt_call;
     return try makeList(ctx, not_items, origin);
 }
@@ -2672,7 +2672,7 @@ fn genTempSym(ctx: *ExpandContext, origin: reader_mod.SrcSpan) ExpandError!*Form
 /// Build `(nth src idx nil)` as a Form.
 fn buildNthCall(ctx: *ExpandContext, src: *Form, idx: usize, origin: reader_mod.SrcSpan) ExpandError!*Form {
     const items = try ctx.allocator.alloc(*Form, 4);
-    items[0] = try makeSymbol(ctx, "nth", origin);
+    items[0] = try coreSym(ctx, "nth", origin);
     items[1] = src;
     const idx_form = try ctx.allocator.create(Form);
     idx_form.* = .{ .datum = .{ .int = @intCast(idx) }, .origin = origin };
@@ -2687,7 +2687,7 @@ fn buildNestedRest(ctx: *ExpandContext, src: *Form, n: usize, origin: reader_mod
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const items = try ctx.allocator.alloc(*Form, 2);
-        items[0] = try makeSymbol(ctx, "rest", origin);
+        items[0] = try coreSym(ctx, "rest", origin);
         items[1] = expr;
         expr = try makeList(ctx, items, origin);
     }
@@ -2699,7 +2699,7 @@ fn buildNestedRest(ctx: *ExpandContext, src: *Form, n: usize, origin: reader_mod
 fn buildGetCall(ctx: *ExpandContext, src: *Form, key: *Form, default: ?*Form, origin: reader_mod.SrcSpan) ExpandError!*Form {
     const argc: usize = if (default != null) 4 else 3;
     const items = try ctx.allocator.alloc(*Form, argc);
-    items[0] = try makeSymbol(ctx, "get", origin);
+    items[0] = try coreSym(ctx, "get", origin);
     items[1] = src;
     items[2] = key;
     if (default) |d| items[3] = d;
@@ -3080,7 +3080,7 @@ fn buildCaseEq(ctx: *ExpandContext, g_name: []const u8, key: *const Form, origin
     quote_items[0] = try makeSymbol(ctx, "quote", origin);
     quote_items[1] = @constCast(key);
     const eq_items = try ctx.allocator.alloc(*Form, 3);
-    eq_items[0] = try makeSymbol(ctx, "=", origin);
+    eq_items[0] = try coreSym(ctx, "=", origin);
     eq_items[1] = try makeSymbol(ctx, g_name, origin);
     eq_items[2] = try makeList(ctx, quote_items, origin);
     return try makeList(ctx, eq_items, origin);
@@ -3248,13 +3248,13 @@ fn buildForLevel(
     const level = levels[idx];
     const s_sym = try genTempSym(ctx, origin);
     const acc_sym = try genTempSym(ctx, origin);
-    const next_s = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "next", origin), s_sym });
+    const next_s = try makeListInline(ctx, origin, &.{ try coreSym(ctx, "next", origin), s_sym });
 
     // What the element contributes: the nested loop or the body.
     const contribution: *Form = if (idx + 1 < levels.len)
         try buildForLevel(ctx, levels, idx + 1, acc_sym, body, origin)
     else
-        try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "conj", origin), acc_sym, @constCast(body) });
+        try makeListInline(ctx, origin, &.{ try coreSym(ctx, "conj", origin), acc_sym, @constCast(body) });
     var inner: *Form = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "recur", origin), next_s, contribution });
 
     var m: usize = level.modifiers.items.len;
@@ -3272,7 +3272,7 @@ fn buildForLevel(
         };
     }
 
-    const first_s = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "first", origin), s_sym });
+    const first_s = try makeListInline(ctx, origin, &.{ try coreSym(ctx, "first", origin), s_sym });
     const elem_bindings = try ctx.allocator.alloc(*Form, 2);
     elem_bindings[0] = level.pattern;
     elem_bindings[1] = first_s;
@@ -3280,7 +3280,7 @@ fn buildForLevel(
 
     const loop_bindings = try ctx.allocator.alloc(*Form, 4);
     loop_bindings[0] = s_sym;
-    loop_bindings[1] = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "seq", origin), level.src });
+    loop_bindings[1] = try makeListInline(ctx, origin, &.{ try coreSym(ctx, "seq", origin), level.src });
     loop_bindings[2] = acc_sym;
     loop_bindings[3] = outer_acc;
     return try makeListInline(ctx, origin, &.{
@@ -3443,7 +3443,7 @@ fn expandDefrecord(
             };
             const sym_form = try makeSymbol(ctx, sym_name, origin);
             acc = try makeListInline(ctx, origin, &.{
-                try makeSymbol(ctx, "assoc", origin),
+                try coreSym(ctx, "assoc", origin),
                 acc,
                 kw,
                 sym_form,
@@ -3494,7 +3494,7 @@ fn expandDefrecord(
             try makeSymbol(ctx, "x", origin),
         }),
         try makeListInline(ctx, origin, &.{
-            try makeSymbol(ctx, "=", origin),
+            try coreSym(ctx, "=", origin),
             try makeSymbol(ctx, type_id_name, origin),
             try makeListInline(ctx, origin, &.{
                 record_type_id_sym,
@@ -3864,6 +3864,15 @@ fn expandExtendProtocol(
     top_items[0] = try makeSymbol(ctx, "do", origin);
     for (calls.items, 0..) |c, i| top_items[1 + i] = c;
     return try makeList(ctx, top_items, origin);
+}
+
+/// The `nexis.core` function `name` as a qualified symbol: what a
+/// host macro emits wherever its output calls a core function, so a
+/// user local or Var of the same name cannot capture the call
+/// (MACROEXPAND.md §5). Heads that are themselves host macros or
+/// special forms stay bare.
+fn coreSym(ctx: *ExpandContext, name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    return try makeQualifiedSymbol(ctx, "nexis.core", name, origin);
 }
 
 /// Helper: make a qualified symbol form (`ns/name`).

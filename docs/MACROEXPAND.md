@@ -445,15 +445,37 @@ written bare inside syntax-quote, `` `(let [x ~a] x) ``, becomes
 `user/x`, which cannot be bound. Write `x#` (fresh per
 expansion) or `~'x` (deliberate capture), as in Clojure.
 
-**Shadowing safety**: syntax-quote output must not be capturable
-by user lexical or Var bindings. If a user writes
-`(let* [list 99] `(~x))`, the emitted list construction must not
-resolve to the user's `list`. Therefore syntax-quote emits the
-internal special forms `#%list` / `#%concat` / `#%vector` /
-`#%map` / `#%set`, which the compiler recognizes in its
-special-form dispatcher and which are never user-shadowable
+**Shadowing safety**: syntax-quote output and host-macro output
+must not be capturable by user lexical or Var bindings. If a user
+writes `(let* [list 99] `(~x))`, the emitted list construction
+must not resolve to the user's `list`. Therefore syntax-quote
+emits the internal special forms `#%list` / `#%concat` /
+`#%vector` / `#%map` / `#%set`, which the compiler recognizes in
+its special-form dispatcher and which are never user-shadowable
 (`COMPILER.md` §4.3); the rebuild calls are qualified
 `nexis.core/...` symbols for the same reason.
+
+A host macro follows the same rule: every core function its
+output calls is emitted as the qualified symbol `nexis.core/name`
+through `coreSym` (§10b), never bare. `let` destructures through
+`nexis.core/nth`, `nexis.core/next` and `nexis.core/get`; `fn`
+overload dispatch counts and tests through `nexis.core/count`,
+`nexis.core/=`, `nexis.core/<` and `nexis.core/not` and takes a
+clause's rest through `nexis.core/rest`; `case` compares with
+`nexis.core/=`; `for` walks with `nexis.core/seq`,
+`nexis.core/first`, `nexis.core/next` and `nexis.core/conj`;
+`defrecord` builds with `nexis.core/assoc` and tests with
+`nexis.core/=`; `case` and `condp` report through
+`nexis.core/str`; `@x` is `nexis.core/deref`. So
+`(let [nth (fn [& _] :captured)] (let [[a b] [1 2]] [a b]))` is
+`[1 2]` and `(defn nth ...)` in the user's namespace changes
+nothing about destructuring. A qualified `nexis.core/+` or
+`nexis.core/<` is still the inlined intrinsic (`COMPILER.md`
+§4.3), so the qualification costs overload dispatch nothing.
+Only heads that are special forms or host macros (`let`, `let*`,
+`fn`, `fn*`, `loop*`, `if`, `and`, `or`, `recur`, `throw`,
+`quote`, `var`, `defn`, `catch`) stay bare, because the compiler
+and the macro table recognize them regardless of bindings (§3).
 
 ---
 
@@ -597,7 +619,10 @@ pub fn makeBool(ctx, value: bool, origin: SrcSpan) ExpandError!*Form;
 ```
 
 Every helper takes `origin` per §4b. Host macros build all of
-their output through them.
+their output through them. `makeQualifiedSymbol(ctx, ns, name,
+origin)` builds `ns/name`, and `coreSym(ctx, name, origin)` is
+`nexis.core/name`: the form of every core function a host macro's
+output calls (§5).
 
 ---
 

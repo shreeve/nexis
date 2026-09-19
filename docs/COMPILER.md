@@ -176,7 +176,10 @@ compiler relies on:
      operands lower to `math:add` / `cmp:lt` directly, unless
      the name is lexically shadowed (`LowerEnv`). A Var named
      `+` does not disable the inlining: `(do (def + f) (+ 1 2))`
-     still inlines.
+     still inlines. The qualified `nexis.core/+` and
+     `nexis.core/<` with two operands inline unconditionally: a
+     qualified head is never a local, and host macros emit them
+     (`MACROEXPAND.md` §5).
   3. **Lexical local** — innermost binding from `let*`, `fn*`,
      `loop*`, `letfn*`, `catch`, or a `fn*` self-name.
   4. **Captured upvalue** — a lexical local of an enclosing

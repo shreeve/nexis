@@ -1035,6 +1035,19 @@ test "destructuring: loop bindings destructure and recur rebinds them" {
     try expectOutput("(loop [[a b] [1 2]] (+ a b))", "3");
 }
 
+test "hygiene: a local or Var named after a core function cannot capture host-macro output" {
+    // MACROEXPAND.md §5: host macros emit `nexis.core/name`.
+    try expectOutput("(let [nth (fn [& _] :captured)] (let [[a b] [1 2]] [a b]))", "[1 2]");
+    try expectOutput("(let [count (fn [& _] 99)] ((fn ([x] :one) ([x y] :two)) 1))", ":one");
+    try expectOutputProgram("(defn nth [& _] :user-nth) (let [[a b] [1 2]] [a b])", "[1 2]");
+    try expectOutput("(let [= (fn [& _] false)] (case 1 1 :one :none))", ":one");
+    try expectOutput("(let [seq (fn [& _] nil)] (for [x [1 2]] x))", "[1 2]");
+    try expectOutput("(let [get (fn [& _] :g)] (let [{a :a} {:a 1}] a))", "1");
+    try expectOutput("(let [< (fn [& _] false) not (fn [& _] false)] ((fn ([x] :one) ([x & r] :var)) 1 2))", ":var");
+    try expectOutput("(let [first (fn [& _] :f) next (fn [& _] nil) conj (fn [& _] :c)] (for [x [1 2]] x))", "[1 2]");
+    try expectOutput("(let [rest (fn [& _] :r)] (let [[a & r] [1 2 3]] r))", "(2 3)");
+}
+
 test "integration: fn with destructured params" {
     try expectOutput(
         \\(do (defn point-sum [[x y]] (+ x y))
