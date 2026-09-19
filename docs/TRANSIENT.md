@@ -1,28 +1,26 @@
-## TRANSIENT.md — Transient Wrappers (Phase 1)
+## TRANSIENT.md — Transient Wrappers
 
-**Status**: Phase 1 deliverable. Authoritative contract for the
-`.transient` heap kind and the `...Bang` mutation operations.
+Authoritative contract for the `.transient` heap kind and the
+`...Bang` mutation operations (`src/coll/transient.zig`).
 Derivative from `PLAN.md` §9.4, `docs/VALUE.md` §2.2,
 `docs/SEMANTICS.md` §2.6 (identity-based equality + serialization
 disallowed), `docs/GC.md` (trace integration), and
 `CLOJURE-REVIEW.md` §1.2 + §2.7 (owner-token epoch vs. thread
-identity). Those documents win on conflict. Reviewed peer-AI turn 17.
+identity). Those documents win on conflict.
 
-This module unblocks **Phase 1 gate tests #3 (transient
-equivalence) and #4 (transient ownership discipline)** per PLAN §20.2.
+This module satisfies the transient-equivalence and
+transient-ownership properties of PLAN §20.2.
 
-Scope-frozen commitment for this commit: **v1 transients are
-"shallow" wrappers** — they hold an owner-token and a mutable
+**v1 transients are "shallow" wrappers** — they hold an owner-token and a mutable
 pointer to a persistent inner root. Mutating ops call the
 persistent backing operations underneath, reassigning the wrapper's
 `inner_header` field in place. Token discipline enforced at every
 boundary. Node-level in-place mutation (Clojure's real perf
-advantage) is explicitly deferred to a Phase 6 performance commit
-(PLAN §19.6 Tier 2).
+advantage) does not exist (PLAN §19.6 Tier 2).
 
 ---
 
-### 1. The two-option fork, and why v1 picks "shallow" (peer-AI turn 17)
+### 1. The two-option fork, and why v1 picks "shallow"
 
 **Option A — full Clojure-style transients** with per-node owner
 tags: every CHAMP interior / collision / vector interior / leaf /
@@ -40,34 +38,27 @@ persistent root, atomically update the wrapper's `inner_header`
 field. No existing hamt/rrb code changes. Gate-test discipline
 (#3 equivalence, #4 ownership) satisfied by construction.
 
-**v1 picks B.** Reasons (peer-AI turn 17 concurring):
+**v1 picks B.** Reasons:
   - Gate tests measure semantics, not performance. B delivers
     semantics with ~800 LOC of new code + zero changes to stable
     persistent paths.
-  - Peer-AI turn 8 specifically rejected pre-reserving transient
-    fields in CHAMP nodes. Option B's landing is the payoff of
-    that earlier discipline.
-  - B → A is achievable later without changing the user-facing
+  - CHAMP nodes carry no reserved transient fields.
+  - B → A is achievable without changing the user-facing
     transient API: wrapper layout stays identical, owner-token
     discipline stays identical, only the internal mutation paths
     and node bodies change.
 
-Option B is documented as the v1 implementation; the user-facing
-wrapper API and ownership model are forward-compatible with a
-Phase 6 performance revision that replaces the underlying
-mutation paths with in-place editing.
+Option B is the implementation; the user-facing wrapper API and
+ownership model are forward-compatible with a revision that
+replaces the underlying mutation paths with in-place editing.
 
 ---
 
 ### 2. Subkind taxonomy (local enum)
 
-VALUE.md §2.2 is amended in this commit. Previously the row for
-kind 27 said "subkind mirrors the inner collection kind" — a
-reading that would reuse global kind bytes (18/19/20) as transient
-subkinds. Peer-AI turn 17 flagged this: subkinds should classify
-within a kind, not mirror external kind numbering.
-
-The amended taxonomy is a **local enum**:
+Subkinds classify within a kind; they do not mirror the global
+kind bytes (18/19/20) of the inner collection. The taxonomy is a
+**local enum** (VALUE.md §2.2 row 27):
 
 | Subkind | Meaning                          | Wraps       |
 |---------|----------------------------------|-------------|
@@ -151,7 +142,7 @@ fn issueOwnerToken() u64 {
     // Overflow-safe on u64 for every practical workload. Wraparound
     // after 2^64 - 1 tokens is theoretically reachable in a long-
     // running multi-isolate system; v1 single-isolate cannot.
-    // Phase 7+ multi-isolate should revisit.
+    // A multi-isolate runtime would have to revisit this.
     return t;
 }
 ```
@@ -166,28 +157,26 @@ inspects tokens directly.
     Any op on a wrapper whose `owner_token == 0` returns
     `error.TransientFrozen`.
   - Nonzero = active owner. In v1 single-threaded, the token is
-    effectively an aliveness signal. Phase 7+ multi-isolate will
+    effectively an aliveness signal. A multi-isolate runtime would
     additionally check that the **current isolate's epoch** matches
-    the token's issuing epoch; that check is absent here because
-    there is no second isolate to mismatch against.
+    the token's issuing epoch; that check is absent because there
+    is no second isolate to mismatch against.
 
 **Token exhaustion.** Owner tokens are issued from a monotonically
 increasing `u64` counter. Exhaustion is not handled in v1;
-wraparound is considered practically unreachable for Phase 1
-workloads and should be revisited when multi-isolate support
-lands. No saturation / error path is provided.
+wraparound is practically unreachable for single-isolate
+workloads. No saturation / error path is provided.
 
-**`TransientWrongOwner` in v1.** The error variant exists in the
-`TransientError` set for Phase 7+ forward compatibility, but no v1
-runtime code path produces it — single-isolate, single-threaded
-Phase 1 has no legitimate way for a transient to encounter a
-mismatched-but-nonzero owner. Gate test #4 is satisfied by the
+**`TransientWrongOwner`.** The error variant exists in the
+`TransientError` set, but no runtime code path produces it —
+single-isolate, single-threaded execution has no legitimate way
+for a transient to encounter a mismatched-but-nonzero owner. Gate test #4 is satisfied by the
 frozen-rejection path alone: "using a transient after
 `persistentBang`" IS the v1 operational manifestation of "using a
 transient from the wrong owner" (the owner has become the
 nobody-token `0`). The `TransientWrongOwner` code path is wired in
-`transient.zig` so Phase 7+ can light it up by adding an isolate-
-epoch comparison without introducing a new error kind.
+`transient.zig` so a multi-isolate runtime can light it up by adding
+an isolate-epoch comparison without introducing a new error kind.
 
 ---
 
@@ -223,7 +212,7 @@ Every `.transient` wrapper is in exactly one of three states:
 
 **All** transient ops — `...Bang` mutations AND queries (`mapGet`,
 `setContains`, `mapCount`, etc.) — reject frozen wrappers.
-Per peer-AI turn 17: keeping reads also rejecting frozen makes the
+Keeping reads also rejecting frozen makes the
 ownership discipline crisp. The user-visible rule is simple:
 "after `persistentBang`, the transient is dead; use the returned
 persistent value instead."
@@ -237,13 +226,12 @@ to trace through it without special-casing frozen wrappers.
 
 ### 6. Error surface
 
-Public transient ops return typed errors at the user boundary
-(peer-AI turn 17):
+Public transient ops return typed errors at the user boundary:
 
 ```zig
 pub const TransientError = error{
     TransientFrozen,            // owner_token == 0
-    TransientWrongOwner,        // owner mismatch (Phase 7+ primary; v1 test-only)
+    TransientWrongOwner,        // owner mismatch (never produced; single isolate)
     InvalidTransientInner,      // transientFrom on a non-wrappable kind
     TransientKindMismatch,      // e.g., mapAssocBang called with a set wrapper
 };
@@ -254,8 +242,8 @@ Each public entry point:
   - returns `error.TransientKindMismatch` if the Value's subkind
     doesn't match the op family (mapAssocBang on a set, etc.),
   - returns `error.TransientFrozen` if `owner_token == 0`,
-  - (Phase 7+) returns `error.TransientWrongOwner` on token
-    mismatch,
+  - would return `error.TransientWrongOwner` on token mismatch
+    (no path produces it),
   - proceeds to the underlying persistent op.
 
 Non-safe-build safety: in Release builds, kind/subkind
@@ -337,17 +325,12 @@ pub fn vectorCountBang(t: Value) !usize;
 
 **`isEmptyBang` is deliberately not exported.** `countBang == 0`
 suffices; a dedicated `isEmptyBang` per kind is trivial wrapper
-surface area that peer-AI turn 18 recommended against bloating the
-public API with. Users who want the check call
+surface area that would bloat the public API. Users who want the check call
 `(try mapCountBang(t)) == 0`.
 
-**Vector `assocBang` is deferred.** PLAN §9.2's vector supports
-`assoc n v` in the persistent path (random index update via
-path-copy), and a transient `assocBang` would parallel it. But
-`assocBang` isn't landed in `src/coll/vector.zig`'s Scope A commit
-yet, so its transient counterpart can't exist either. When the
-persistent `assoc n v` ships (Phase 6 or a scheduled vector Scope
-B commit), `vectorAssocBang` joins the transient API.
+**There is no vector `assocBang`.** The persistent path has
+`vector.assoc` (random index update via path-copy); the transient
+API has no counterpart.
 
 **`...Bang` ops return the same transient wrapper Value they were
 given.** The wrapper's `inner_header` field is mutated in place.
@@ -360,11 +343,11 @@ in the future; the user-facing contract is pointer-stable.)
 
 ### 8. Implementation sketch
 
-**Per-kind root reconstruction helpers (new).** The transient
+**Per-kind root reconstruction helpers.** The transient
 module needs to reconstruct a persistent Value from a raw
 `*HeapHeader` — e.g. to call `hamt.mapAssoc(heap, v, …)` where `v`
 is a persistent-map Value built from the transient's
-`inner_header`. Per peer-AI turn 18, this is kind-specific
+`inner_header`. This is kind-specific
 knowledge (CHAMP/array-map subkind discovery via body-size
 inspection; vector root is always subkind 1) and shouldn't live in
 transient code. Each collection module exports a small helper:
@@ -482,7 +465,7 @@ These are enforced in `dispatch.zig`:
 The `dispatch.equal` top-level bit-identity fast path (`a.tag ==
 b.tag and a.payload == b.payload`) already catches same-wrapper
 comparisons before reaching `heapEqual`. The explicit transient
-arm in `heapEqual` is defensive routing per peer-AI turn 17:
+arm in `heapEqual` is defensive routing:
 makes transient identity semantics visible in the dispatch table
 rather than an accidental fast-path consequence.
 
@@ -572,10 +555,9 @@ Property tests in `test/prop/transient.zig` (new):
   `dispatch.equal` and `dispatch.hashValue`-equal results. 300
   trials per kind.
 - **T2. Ownership (gate test #4)**: frozen transients reject
-  every subsequent op with `error.TransientFrozen`. v1 has no
+  every subsequent op with `error.TransientFrozen`. There is no
   operational `TransientWrongOwner` path (single-isolate); the
-  error kind is retained in the API for Phase 7+ forward
-  compatibility.
+  error kind is retained in the API.
 - **T3. No mutation escapes the wrapper**: after a session of
   `...Bang` ops on transient `t`, the original persistent value
   the transient was wrapped from is still structurally intact
@@ -584,18 +566,16 @@ Property tests in `test/prop/transient.zig` (new):
   persistent inner structures; collect with random root subsets;
   every reachable inner structure survives intact.
 
-Together T1 and T2 deliver the PLAN §20.2 gate test #3 and #4
-receipts. v1 has no test-only `_testReplaceOwnerToken` helper
-(peer-AI turn 18 recommendation against direct internal state
-surgery) — instead the ownership discipline is tested entirely
-through the frozen path, which is the operationally reachable
-ownership failure in single-isolate Phase 1.
+Together T1 and T2 pin the PLAN §20.2 transient properties. There
+is no test-only `_testReplaceOwnerToken` helper — the ownership
+discipline is tested entirely through the frozen path, which is the
+operationally reachable ownership failure in a single isolate.
 
 ---
 
-### 13. Scope frozen / deferred
+### 13. Scope
 
-**In (this commit):**
+**In:**
   - `.transient` kind, three subkinds (0/1/2).
   - `transientFrom` / `persistentBang`.
   - Map, set, vector mutation ops per §7.
@@ -603,41 +583,14 @@ ownership failure in single-isolate Phase 1.
   - GC trace integration.
   - Dispatch hash-panic + equality-identity arms.
   - Inline + property tests for T1–T4.
-  - VALUE.md §2.2 amendment: transient subkind is a local enum.
 
-**Deferred:**
+**Absent:**
   - **Node-level in-place mutation** (Option A, real Clojure-
-    style). Phase 6 Tier 2 performance commit.
-  - **Transient vector `assocBang`**. Depends on persistent
-    `vector.assoc` which is in vector Scope B (not yet shipped).
-  - **Transient byte-vector / typed-vector**. Depends on those
-    kinds existing.
-  - **Multi-isolate token mismatch path** (gate #4 cross-owner
-    case). Phase 7+ when isolates exist; v1 tests manufacture
-    via internal helper.
-  - **Auto-promotion** of array-map/set when growing beyond 8
-    entries while transient. Today the persistent `mapAssoc`
-    handles promotion internally; the transient inherits this
-    behavior automatically. A dedicated transient promotion
-    path would be Phase 6 optimization work.
-
----
-
-### 14. Amendment note for VALUE.md §2.2
-
-This commit updates VALUE.md §2.2's row 27:
-
-```
-| 27 | `transient` | mutable wrapper | subkind mirrors the inner collection kind |
-```
-
-to:
-
-```
-| 27 | `transient` | mutable wrapper | 0 = map, 1 = set, 2 = vector (local enum, peer-AI turn 17) |
-```
-
-Previous phrasing would have subkinds mirror kind bytes 18/19/20;
-amended phrasing uses a local enum so the subkind field classifies
-within `.transient` rather than pulling external kind numbering
-into the transient namespace.
+    style).
+  - **Transient vector `assocBang`** (§7).
+  - **Transient byte-vector / typed-vector**: those kinds have no
+    implementation.
+  - **Multi-isolate token mismatch path**: there is one isolate.
+  - **A dedicated transient promotion path** for array-map/set
+    growing beyond 8 entries: the persistent `mapAssoc` handles
+    promotion internally and the transient inherits it.
