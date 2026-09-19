@@ -1,6 +1,6 @@
-nexis: test/golden/cli/divide-by-zero.nx:5:4: runtime error: DivideByZero
+nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
       (/ total n))
-       ^^^^^^^^^
-  at average (test/golden/cli/divide-by-zero.nx:5:4)
-  at report (test/golden/cli/divide-by-zero.nx:8:4)
-  at <top> (test/golden/cli/divide-by-zero.nx:10:2)
+      ^^^^^^^^^^^
+  at average (test/golden/cli/divide-by-zero.nx:5:3)
+  at report (test/golden/cli/divide-by-zero.nx:8:3)
+  at <top> (test/golden/cli/divide-by-zero.nx:10:1)

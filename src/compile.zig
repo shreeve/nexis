@@ -8764,7 +8764,7 @@ test "span table: entries ascend from pc 0, cover the source and carry the form'
         try testing.expect(entry.span.pos + entry.span.len <= src.len);
     }
     const origin = compiled.origin orelse return error.TestFailed;
-    try testing.expectEqualStrings("if true (+ 1 2) 3", src[origin.pos .. origin.pos + origin.len]);
+    try testing.expectEqualStrings("(if true (+ 1 2) 3)", src[origin.pos .. origin.pos + origin.len]);
     try testing.expect(compiled.source == &info);
     // Every instruction resolves, and the inlined `math:add` carries
     // the span of `(+ 1 2)`.
@@ -8773,7 +8773,7 @@ test "span table: entries ascend from pc 0, cover the source and carry the form'
     for (routine.code, 0..) |inst, pc| {
         const span = routine.spanAt(@intCast(pc)) orelse return error.TestFailed;
         if (inst.groupOf() == .math) {
-            try testing.expectEqualStrings("+ 1 2", src[span.pos .. span.pos + span.len]);
+            try testing.expectEqualStrings("(+ 1 2)", src[span.pos .. span.pos + span.len]);
             saw_add = true;
         }
     }
@@ -8797,11 +8797,11 @@ test "span table: a nested routine carries its own table, origin and name" {
     try testing.expectEqualStrings("sq", r.name);
     try testing.expect(r.spans.len > 0);
     const origin = r.origin orelse return error.TestFailed;
-    try testing.expectEqualStrings("defn sq [x]\n  (* x x", src[origin.pos .. origin.pos + origin.len]);
+    try testing.expectEqualStrings("(defn sq [x]\n  (* x x))", src[origin.pos .. origin.pos + origin.len]);
     // The body's call carries the span of `(* x x)`; the return
     // after it carries the fn's.
     const last = r.spanAt(@intCast(r.code.len - 2)) orelse return error.TestFailed;
-    try testing.expectEqualStrings("* x x", src[last.pos .. last.pos + last.len]);
+    try testing.expectEqualStrings("(* x x)", src[last.pos .. last.pos + last.len]);
 }
 
 test "span table: a hand-built Tiny compiles with no table" {

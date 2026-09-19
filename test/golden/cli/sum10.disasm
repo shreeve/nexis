@@ -1,19 +1,19 @@
-routine <top> (examples/sum10.nx:4:2) slots=12 arity=0 upvalues=0
+routine <top> (examples/sum10.nx:4:1) slots=12 arity=0 upvalues=0
   0000  mov:load-const      s1  c0=0  -  ; 4:11
   0001  mov:load-const      s2  c1=0  -  ; 4:17
   0002  mov:move            s4  s1  -  ; 5:10
   0003  mov:load-const      s5  c2=10  -  ; 5:12
-  0004  cmp:lt              s3  s4  s5  ; 5:8
-  0005  jump:if-false       j0016  s3  -  ; 5:4
+  0004  cmp:lt              s3  s4  s5  ; 5:7
+  0005  jump:if-false       j0016  s3  -  ; 5:3
   0006  mov:move            s7  s1  -  ; 6:15
   0007  mov:load-const      s8  c3=1  -  ; 6:17
-  0008  math:add            s6  s7  s8  ; 6:13
+  0008  math:add            s6  s7  s8  ; 6:12
   0009  mov:move            s10  s2  -  ; 6:23
   0010  mov:move            s11  s1  -  ; 6:27
-  0011  math:add            s9  s10  s11  ; 6:21
-  0012  mov:move            s1  s6  -  ; 6:6
+  0011  math:add            s9  s10  s11  ; 6:20
+  0012  mov:move            s1  s6  -  ; 6:5
   0013  mov:move            s2  s9  -
   0014  jump:jmp            j0002  -  -
-  0015  jump:jmp            j0017  -  -  ; 5:4
+  0015  jump:jmp            j0017  -  -  ; 5:3
   0016  mov:move            s0  s2  -  ; 7:5
-  0017  call:return         s0  -  -  ; 4:2
+  0017  call:return         s0  -  -  ; 4:1

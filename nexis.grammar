@@ -175,21 +175,24 @@ atom     = INTEGER                               → (int 1)
          | KEYWORD                               → (keyword 1)
          | IDENT                                 → (symbol 1)
 
-list_form            = "(" forms ")"             → (list ...2)
-vector_form          = "[" forms "]"             → (vector ...2)
-map_form             = "{" forms "}"             → (map ...2)
-set_form             = "#{" forms "}"            → (set ...2)
+# Compound and prefix rules keep their delimiter tokens as children so
+# the compound's source span covers them; the reader drops the bare
+# token children (src/reader.zig `withoutDelimiters`).
+list_form            = "(" forms ")"             → (list 1 ...2 3)
+vector_form          = "[" forms "]"             → (vector 1 ...2 3)
+map_form             = "{" forms "}"             → (map 1 ...2 3)
+set_form             = "#{" forms "}"            → (set 1 ...2 3)
 
-quote_form           = "'"  form                 → (quote 2)
-syntax_quote_form    = "`"  form                 → (syntax-quote 2)
-unquote_form         = "~"  form                 → (unquote 2)
-unquote_splicing_form = "~@" form                → (unquote-splicing 2)
-deref_form           = "@"  form                 → (deref 2)
-anon_fn_form         = "#(" forms ")"            → (anon-fn ...2)
-discard_form         = "#_" form                 → (discard 2)
+quote_form           = "'"  form                 → (quote 1 2)
+syntax_quote_form    = "`"  form                 → (syntax-quote 1 2)
+unquote_form         = "~"  form                 → (unquote 1 2)
+unquote_splicing_form = "~@" form                → (unquote-splicing 1 2)
+deref_form           = "@"  form                 → (deref 1 2)
+anon_fn_form         = "#(" forms ")"            → (anon-fn 1 ...2 3)
+discard_form         = "#_" form                 → (discard 1 2)
 
 # Metadata sugar. `^M T` in source produces `(with-meta-raw T M)` in Sexp;
 # the reader normalizes stacked metadata (right-to-left) into a single
 # `(with-meta TARGET META-MAP)` Form and converts keyword/symbol shorthand
 # into a map (see FORMS.md §3).
-meta_form            = "^" form form             → (with-meta-raw 3 2)
+meta_form            = "^" form form             → (with-meta-raw 1 3 2)

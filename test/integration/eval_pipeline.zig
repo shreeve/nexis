@@ -4105,9 +4105,9 @@ test "runtime errors: a VmError is located at the form that raised it, with the 
     const info = vm.SourceInfo{ .path = "t.nx", .text = "(defn f [x]\n  (/ 10 x))\n\n(defn g [x] (f x))\n(g 0)" };
     try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
     try testing.expectEqual(@as(usize, 3), program.v.error_trace.items.len);
-    try expectFrame(&program, &info, 0, "f", 2, 4, "/ 10 x");
-    try expectFrame(&program, &info, 1, "g", 4, 14, "f x");
-    try expectFrame(&program, &info, 2, "<top>", 5, 2, "g 0");
+    try expectFrame(&program, &info, 0, "f", 2, 3, "(/ 10 x)");
+    try expectFrame(&program, &info, 1, "g", 4, 13, "(f x)");
+    try expectFrame(&program, &info, 2, "<top>", 5, 1, "(g 0)");
 }
 
 test "runtime errors: an uncaught throw records the value and a two-deep chain" {
@@ -4118,9 +4118,9 @@ test "runtime errors: an uncaught throw records the value and a two-deep chain" 
     try testing.expectError(vm.VmError.UncaughtThrow, runLocated(&program, &info));
     const thrown = program.v.unhandled_throw orelse return error.TestFailed;
     try testing.expectEqualStrings("boom", program.interner.keywordName(thrown.asKeywordId()));
-    try expectFrame(&program, &info, 0, "inner", 1, 17, "throw :boom");
-    try expectFrame(&program, &info, 1, "outer", 2, 17, "inner");
-    try expectFrame(&program, &info, 2, "<top>", 3, 2, "outer");
+    try expectFrame(&program, &info, 0, "inner", 1, 16, "(throw :boom)");
+    try expectFrame(&program, &info, 1, "outer", 2, 16, "(inner)");
+    try expectFrame(&program, &info, 2, "<top>", 3, 1, "(outer)");
 }
 
 test "runtime errors: a closure called back from a native is the frame named fn" {
@@ -4129,8 +4129,8 @@ test "runtime errors: a closure called back from a native is the frame named fn"
     defer program.deinit();
     const info = vm.SourceInfo{ .path = "t.nx", .text = "(map (fn [x] (/ 1 x)) [1 0])" };
     try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
-    try expectFrame(&program, &info, 0, "fn", 1, 15, "/ 1 x");
-    try expectFrame(&program, &info, 1, "<top>", 1, 2, "map (fn [x] (/ 1 x)) [1 0");
+    try expectFrame(&program, &info, 0, "fn", 1, 14, "(/ 1 x)");
+    try expectFrame(&program, &info, 1, "<top>", 1, 1, "(map (fn [x] (/ 1 x)) [1 0])");
 }
 
 /// Compile one form of `src` into a routine the caller owns, the

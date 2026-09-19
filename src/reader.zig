@@ -195,7 +195,13 @@ pub const Reader = struct {
             return self.fail(.unknown_reader_construct, srcSpan(s), null);
         }
         const tag: Tag = items[0].tag;
-        const args = items[1..];
+        // An atom's one child is its token; a compound's leading and
+        // trailing token children are its delimiters, kept by the
+        // grammar so the compound's span covers them (§ srcSpan).
+        const args = switch (tag) {
+            .int, .real, .string, .char, .keyword, .symbol => items[1..],
+            else => withoutDelimiters(items[1..]),
+        };
         return switch (tag) {
             .int => try self.readInt(args, srcSpan(s)),
             .real => try self.readReal(args, srcSpan(s)),
@@ -627,7 +633,7 @@ pub const Reader = struct {
         if (items.len == 0 or items[0] != .tag or items[0].tag != expected) {
             return self.fail(.unknown_reader_construct, srcSpan(s), null);
         }
-        return items[1..];
+        return withoutDelimiters(items[1..]);
     }
 
     fn isCompoundWithTag(_: *const Reader, s: Sexp, expected: Tag) bool {
@@ -658,19 +664,33 @@ fn discardChainDepth(s: Sexp) usize {
         if (cur != .list) break;
         const it = cur.list;
         if (it.len < 2 or it[0] != .tag or it[0].tag != .discard) break;
+        const payload = withoutDelimiters(it[1..]);
+        if (payload.len == 0) break;
         depth += 1;
-        cur = it[1];
+        cur = payload[0];
     }
     return depth;
+}
+
+/// A compound's children without the delimiter tokens the grammar
+/// keeps at either end (`(` `)`, `[` `]`, `'`, `^`, ...): every real
+/// child is itself a compound, so a bare token child is a delimiter.
+fn withoutDelimiters(items: []const Sexp) []const Sexp {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi and items[lo] == .src) lo += 1;
+    while (hi > lo and items[hi - 1] == .src) hi -= 1;
+    return items[lo..hi];
 }
 
 fn srcSpan(s: Sexp) SrcSpan {
     return switch (s) {
         .src => |r| .{ .pos = r.pos, .len = r.len },
         .list => |it| blk: {
-            // Actions like (with-meta-raw 3 2) reorder positional children
-            // relative to source order; the compound's logical span is the
-            // min/max envelope over all descendant source positions.
+            // Actions like (with-meta-raw 1 3 2) reorder positional
+            // children relative to source order; the compound's span is
+            // the min/max envelope over all descendant source positions,
+            // delimiter tokens included.
             var lo: u32 = std.math.maxInt(u32);
             var hi: u32 = 0;
             var any = false;

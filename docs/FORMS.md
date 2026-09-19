@@ -232,9 +232,10 @@ range that produced it. Policy:
 - `None` appears only for Forms synthesized by macros; the reader never
   produces `None`.
 
-Spans are **not** printed in golden outputs by default. Including them would
-churn goldens on unrelated edits. A future `nexis -s --with-spans` flag may
-add them explicitly for tooling.
+Spans are **not** printed in the `.sexp` goldens: including them would
+churn goldens on unrelated edits. The CLI goldens under `test/golden/cli`
+pin them where they are visible, in error carets and `nexis disasm`
+annotations.
 
 For reader **errors**, spans are formatted as `{:line L :col C :end-line L
 :end-col C}` in the error map, where `L`/`C` are 1-based and `end-col` is the
