@@ -46,7 +46,7 @@ const Program = struct {
         errdefer self.host_macros.deinit(testing.allocator);
         const saved_current = self.registry.current;
         self.registry.current = self.registry.core;
-        _ = try self.runForms(stdlib.CORE_NX_SOURCE, self.v.runtime_arena.allocator());
+        _ = try self.runForms(stdlib.CORE_NX_SOURCE, self.v.runtime_arena.allocator(), false);
         self.registry.current = saved_current;
     }
 
@@ -59,15 +59,26 @@ const Program = struct {
     /// Run every top-level form of `src` in order; the last form's
     /// value is the result.
     fn run(self: *Program, src: []const u8) !value_mod.Value {
-        return self.runForms(src, self.arena.allocator());
+        return self.runForms(src, self.arena.allocator(), false);
     }
 
-    fn runForms(self: *Program, src: []const u8, compile_allocator: std.mem.Allocator) !value_mod.Value {
+    /// `run` the way the CLI runs a file: every name the program
+    /// defines is declared up front and any other unresolved
+    /// symbol is a compile error.
+    fn runChecked(self: *Program, src: []const u8) !value_mod.Value {
+        return self.runForms(src, self.arena.allocator(), true);
+    }
+
+    fn runForms(self: *Program, src: []const u8, compile_allocator: std.mem.Allocator, checked: bool) !value_mod.Value {
         var parse_result = try reader_mod.parser.parseProgram(testing.allocator, src);
         defer parse_result.parser.deinit();
         var rdr = reader_mod.Reader.init(testing.allocator, src);
         defer rdr.deinit();
         const forms = try rdr.readProgram(parse_result.sexp);
+
+        var declared = compile.DeclaredNames.init(testing.allocator);
+        defer declared.deinit();
+        if (checked) for (forms) |form| try declared.declareForm(form);
 
         var last_result: value_mod.Value = value_mod.nilValue();
         for (forms) |form| {
@@ -77,6 +88,7 @@ const Program = struct {
                 .host_macros = &self.host_macros,
                 .persistent_allocator = self.v.runtime_arena.allocator(),
                 .registry = self.registry,
+                .declared = if (checked) &declared else null,
             });
             const routine = compiled.toRoutine("polish-form");
             try self.v.retargetTop(&routine);
@@ -102,6 +114,19 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     try program.init();
     defer program.deinit();
     const result = try program.run(src);
+    const actual = try program.format(result);
+    defer testing.allocator.free(actual);
+    testing.expectEqualStrings(expected, actual) catch |err| {
+        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, actual });
+        return err;
+    };
+}
+
+fn expectCheckedOutput(src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const result = try program.runChecked(src);
     const actual = try program.format(result);
     defer testing.allocator.free(actual);
     testing.expectEqualStrings(expected, actual) catch |err| {
@@ -219,4 +244,22 @@ test "/ resolves after passing through a user macro, and names as itself" {
         \\(defmacro sq [x] `(* ~x ~x))
         \\[(sq (/ 6 3)) (some-> 6 (/ 3)) (cond-> 6 true (/ 3)) (name '/) (name :/) (namespace '/)]
     , "[4 2 2 / / nil]");
+}
+
+// ---- def anywhere in a form declares its name ----
+
+test "a def nested in let, when or a call is declared before its use" {
+    try expectCheckedOutput(
+        \\[(let [] (def y 2) y)
+        \\ (when true (def z 3) z)
+        \\ (str (do (def x 1) x))
+        \\ (+ x y z)]
+    , "[2 3 1 6]");
+}
+
+test "a quoted def declares nothing" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(compile.CompileError.UnresolvedSymbol, program.runChecked("(do '(def hidden 1) hidden)"));
 }

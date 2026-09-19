@@ -1133,19 +1133,25 @@ pub const DeclaredNames = struct {
         try self.names.put(self.allocator, owned, {});
     }
 
-    /// Record every name `form` defines at top level: `def`,
+    /// Record every name `form` defines, at any depth: `def`,
     /// `defn`, `defmacro`, `defrecord` (the type id, `->T`,
-    /// `map->T`, `T?`), `defprotocol` (the protocol and each
-    /// method) and, recursively, the forms of a `do`.
+    /// `map->T`, `T?`) and `defprotocol` (the protocol and each
+    /// method). A definition inside a `let`, a `when` or a call
+    /// interns its Var when it runs, exactly like one at top level,
+    /// so it is declared wherever it appears; quoted data is not
+    /// walked.
     pub fn declareForm(self: *DeclaredNames, form: *const reader_mod.Form) !void {
-        if (form.datum != .list) return;
-        const items = form.datum.list;
+        const items: []const *reader_mod.Form = switch (form.datum) {
+            .list => |items| items,
+            .vector, .map, .set => |items| {
+                for (items) |item| try self.declareForm(item);
+                return;
+            },
+            else => return,
+        };
+        for (items) |item| try self.declareForm(item);
         if (items.len < 2 or items[0].datum != .symbol or items[0].datum.symbol.ns != null) return;
         const head = items[0].datum.symbol.name;
-        if (std.mem.eql(u8, head, "do")) {
-            for (items[1..]) |item| try self.declareForm(item);
-            return;
-        }
         if (items[1].datum != .symbol or items[1].datum.symbol.ns != null) return;
         const name = items[1].datum.symbol.name;
         if (std.mem.eql(u8, head, "def") or std.mem.eql(u8, head, "defn") or std.mem.eql(u8, head, "defmacro")) {
