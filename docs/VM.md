@@ -230,7 +230,8 @@ them (§6).
   slot) or the routine is `BytecodeCorruption`.
 - **Name**: for diagnostics (`<anonymous>` by default; the
   compiler names a `defn` routine after its Var, an anonymous
-  closure `fn`, and the CLI a top-level form `<top>`).
+  closure `fn`, the CLI a top-level form `<top>` and `eval` the
+  form it runs `<eval>`).
 - **Span table** (`spans`): `SpanEntry{pc, span}` runs ascending
   by pc, one per change of source span, so `spanAt(pc)` (a
   binary search) gives the `SourceSpan{pos, len}` of the form

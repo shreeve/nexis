@@ -19,7 +19,7 @@ not a library bolted on top.
 ## Status
 
 Every row below is runnable through `bin/nexis`. `zig build test`
-runs **1439 tests** across 154 build steps (unit, property, golden,
+runs **1451 tests** across 155 build steps (unit, property, golden,
 Nextomic corpora, and the `test/nextomic/*.nx` end-to-end scripts).
 See [`PLAN.md`](PLAN.md) §21 for the phase map and
 [`HANDOFF.md`](HANDOFF.md) for the ranked next-work list.
@@ -31,12 +31,12 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Typed vectors | `i64-vector` / `f64-vector`: unboxed contiguous numeric vectors, `#i64[1 2 3]`, serializable, seqable by every core function; `nexis.simd` kernels `sum`/`dot`/`scale`/`map` (`f64` in `@Vector` lanes). Spec: [`docs/TYPED_VECTOR.md`](docs/TYPED_VECTOR.md) |
 | Compiler + VM | Form → Tiny IR → 64-bit bytecode; slot VM with closures, `recur`, `letfn*`, try/catch/finally, catchable VM errors as keywords; a frame restores its entry stack length on return and unwind |
 | Errors | Compile errors carry `file:line:col` and a source caret; a symbol that names nothing is `UnresolvedSymbol` at its own span; a runtime error is reported at its instruction's `file:line:col` with the caret and a stack trace, one `at f (file:line:col)` line per frame ([`docs/TOOLING.md`](docs/TOOLING.md) §1) |
-| Macros | Host macros, user `defmacro` (compile-time sub-VM), syntax-quote with `~`/`~@`/auto-gensym, procedural macros over native fns, qualified macro heads (`alias/name`) |
+| Macros | Host macros, user `defmacro` (compile-time sub-VM), syntax-quote with `~`/`~@`/auto-gensym, procedural macros over native fns, qualified macro heads (`alias/name`); at run time `macroexpand-1`/`macroexpand`, `read-string` and `eval` (a form compiled in the current namespace and run on the calling VM; a compile error is the catchable `:compile-error` map) |
 | Namespaces | `(ns NAME)`, qualified symbols and keywords (`:person/name`), `require` with `:as`, ns-to-file loading, cycle detection |
 | Numbers | Integers of any size (48-bit fixnums promote to bignums and demote back) and f64 with Clojure contagion; `(= 1 1.0)` is `false`, `(== 1 1.0)` is `true`; `/` on two integers yields a float when inexact; `:divide-by-zero` is catchable |
 | Invocation | Keywords, maps, sets and vectors are callable: `(:a m)`, `(m :a)`, `(#{1 2} 2)`, `([10 20] 1)` |
 | Destructuring | Sequential, associative, nested, `& rest`, `:as`, `:keys`, `:or` in `let`/`fn`/`defn`; multi-arity `defn`; `#(...)` shorthand |
-| Core library | 159 native functions in `nexis.core` (`src/stdlib.zig`: sequences, HOFs, collections, arithmetic, predicates, strings, I/O) plus 44 macros and functions in `src/stdlib/core.nx` (`when-let`, `doseq`, `cond->`, `some->`, `as->`, `update-in`, `group-by`, `frequencies`, ...); `nexis.string` |
+| Core library | 164 native functions in `nexis.core` (`src/stdlib.zig`: sequences, HOFs, collections, arithmetic, predicates, strings, I/O) plus 48 macros and functions in `src/stdlib/core.nx` (`when-let`, `doseq`, `cond->`, `some->`, `as->`, `update-in`, `group-by`, `frequencies`, ...); `nexis.string` |
 | Clojure breadth | Atoms (`atom`/`swap!`/`reset!`/`compare-and-set!`), `str`/`subs`/`print`/`println`/`slurp`/`spit`, records, protocols, `extend-protocol`/`extend-type`/`satisfies?`, `case`/`condp`/`for` |
 | Durable refs (`db/*`) | Refs backed by emdb named trees: `db/open`/`db/ref`/`db/put-key!`/`db/get-key`, `with-tx`/`with-read-tx` with rollback on throw, `@deref`, `db/alter!`, `db/scan`, `db/reduce-tree`, MVCC snapshots via `with-snapshot`; page size pinned to 16 KiB, tree ids cached per connection, engine failures as named `:db/*` keywords |
 | Nextomic | The `nextomic` namespace: `connect`/`release`/`db`/`basis-t`/`transact!`/`entity`/`entid`/`ident`/`datoms`/`as-of`/`since`/`history`/`tx-range`/`schema`/`sync`/`q`/`explain`/`pull`/`pull-many`/`with`, `with-conn`; every error catchable by `try` (the taxonomy is under Nextomic below). Spec: [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) |
@@ -208,9 +208,6 @@ where it does not.
 
 Stated so nobody rediscovers them:
 
-- **`eval` is absent.** `macroexpand-1` and `read-string` reach the
-  compiler through hooks; a form compiled and run in the calling VM
-  is the one Clojure surface form still missing (`HANDOFF.md` §6.1).
 - **The tooling layer is the runtime error report, `nexis disasm`,
   `nexis.test`, `nexis.pprint` and `nexis.math`**
   ([`docs/TOOLING.md`](docs/TOOLING.md)); there is no `nexis.repl`

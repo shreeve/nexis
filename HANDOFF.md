@@ -63,11 +63,11 @@ git status                        # clean main
 zig build install                 # bin/nexis and bin/nexis-golden
 ./bin/nexis --help                # usage; lists the namespaces available without a file
 zig build quick                   # the inner loop, ~35-50 s warm
-zig build test --summary all      # the gate: 1439 tests, 154 steps, ~4 min wall
+zig build test --summary all      # the gate: 1451 tests, 155 steps, ~4 min wall
 ```
 
-The gate's last line reads `Build Summary: 154/154 steps succeeded;
-1439/1439 tests passed`, preceded by `golden: ok=10 updated=0
+The gate's last line reads `Build Summary: 155/155 steps succeeded;
+1451/1451 tests passed`, preceded by `golden: ok=10 updated=0
 failed=0 missing=0`. Two integration binaries end with a benchmark
 whose row-count checks always run; the build runner echoes their
 stderr as `failed command:` lines while both succeed, so read the
@@ -248,7 +248,7 @@ context, or the bare keyword when there is nothing more to say.
 
 | namespace | contents |
 |---|---|
-| `nexis.core` (auto-referred) | 163 natives in `src/stdlib.zig` `core_fns` (sequences, HOFs, collections, arithmetic, predicates, strings, I/O, dynamic bindings) plus 45 definitions in `src/stdlib/core.nx`: 18 macros (`when-let if-let dotimes with-tx with-read-tx with-snapshot binding set! declare if-not while letfn doseq cond-> cond->> some-> some->> as->`) and 27 functions (`true? false? second third last reverse take drop constantly complement partial comp every? not-every? some not-any? merge update get-in assoc-in update-in frequencies group-by interpose juxt fnil merge-with`) |
+| `nexis.core` (auto-referred) | 164 natives in `src/stdlib.zig` `core_fns` (sequences, HOFs, collections, arithmetic, predicates, strings, I/O, dynamic bindings, the compiler at run time: `macroexpand-1 macroexpand read-string eval`) plus 48 definitions in `src/stdlib/core.nx`: 18 macros (`when-let if-let dotimes with-tx with-read-tx with-snapshot binding doc declare if-not while letfn doseq cond-> cond->> some-> some->> as->`) and 30 functions (`true? false? second third last reverse take drop unreduced ensure-reduced constantly complement partial comp every? not-every? some not-any? merge update get-in assoc-in update-in frequencies group-by interpose juxt vary-meta fnil merge-with`) |
 | `db` | 23 natives: `open close ref ref? put-key! get-key delete-key! present? begin-write begin-read commit! abort-write! abort-read! put! get delete! deref alter! scan reduce-tree snapshot release-snapshot! snapshot?` |
 | `nexis.string` | `lower-case upper-case trim split join replace` |
 | `nexis.simd` | the typed-vector kernels `sum dot scale map` over `i64-vector` / `f64-vector` values (`docs/TYPED_VECTOR.md` §7.2); `(require '[nexis.simd :as tv])` aliases it |
@@ -423,7 +423,6 @@ through `bin/nexis`:
 
 | gap | observed | where |
 |---|---|---|
-| `eval` | `UnresolvedSymbol` | a form compiled and run in the calling VM; `macroexpand-1` and `read-string` reach the compiler through `vm.CompilerHooks` and are the pattern |
 | symbols not callable | `('a {'a 1})` → `:not-callable` | `vm.zig` lookup arm; PLAN §23 #33 promises keywords only, so state or extend |
 | macros receive only their arguments | no `&form`/`&env` (PLAN §23 #34) | `expand.zig` `callUserMacro` passes the arg forms as values; `macroexpand-1` at run time has no lexical environment to offer either |
 
@@ -565,13 +564,9 @@ regenerated file with the grammar).
 
 ## 8. Recommended order of work
 
-1. **`eval` (§6.1)**, the one Clojure surface form still absent; the
-   compiler hooks `macroexpand-1` and `read-string` use are the
-   pattern, and the missing piece is a routine compiled and run in
-   the calling VM rather than a sub-VM.
-2. **A lazy entity kind (§6.2)** when a program reads a few
+1. **A lazy entity kind (§6.2)** when a program reads a few
    attributes of many entities; the design is written out there.
-3. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
+2. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
    inline caches, SIMD CHAMP nodes, zero-copy strings from emdb
    pages, hash-join estimate quality. Measure first with `zig build
    bench`; `docs/BENCH.md` is the honesty gate.
