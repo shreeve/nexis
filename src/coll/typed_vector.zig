@@ -209,6 +209,34 @@ pub fn nth(heap: *Heap, v: Value, i: usize) NthError!Value {
 }
 
 // =============================================================================
+// Element coercion — the constructor rule (TYPED_VECTOR.md §7.1)
+// =============================================================================
+
+/// The `i64` an integer Value denotes: a fixnum, or a bignum within
+/// `i64`. Null for any other Value, including a float.
+pub fn i64FromValue(v: Value) ?i64 {
+    if (!bignum.isInteger(v)) return null;
+    return bignum.toI64(v);
+}
+
+/// The `f64` a number Value denotes: a float as is, a fixnum or
+/// bignum widened to its nearest `f64`. Null for a non-number.
+pub fn f64FromValue(v: Value) ?f64 {
+    return switch (v.kind()) {
+        .fixnum => @floatFromInt(v.asFixnum()),
+        .float => v.asFloat(),
+        .bignum => bignum.toF64(v),
+        else => null,
+    };
+}
+
+/// The integer Value for `n`: a fixnum, or a bignum beyond the
+/// fixnum range.
+pub fn i64Value(heap: *Heap, n: i64) error{OutOfMemory}!Value {
+    return bignum.fromI64(heap, n) catch error.OutOfMemory;
+}
+
+// =============================================================================
 // Per-kind hash + equality (called by dispatch)
 // =============================================================================
 
@@ -421,6 +449,24 @@ test "format: #i64[...] and #f64[...]" {
     w = std.Io.Writer.fixed(&buf);
     try format(ev, &w, testFloat);
     try testing.expectEqualStrings("#f64[]", w.buffered());
+}
+
+test "element coercion: integers only for i64, any number for f64" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const big = try bignum.fromI64(&heap, value.fixnum_max + 1);
+    const huge = try bignum.fromLimbs(&heap, false, &[_]u64{ 0, 1 });
+    try testing.expectEqual(@as(?i64, 5), i64FromValue(value.fromFixnum(5).?));
+    try testing.expectEqual(@as(?i64, value.fixnum_max + 1), i64FromValue(big));
+    try testing.expectEqual(@as(?i64, null), i64FromValue(huge));
+    try testing.expectEqual(@as(?i64, null), i64FromValue(value.fromFloat(1.0)));
+    try testing.expectEqual(@as(?i64, null), i64FromValue(value.nilValue()));
+    try testing.expectEqual(@as(?f64, 5.0), f64FromValue(value.fromFixnum(5).?));
+    try testing.expectEqual(@as(?f64, 2.5), f64FromValue(value.fromFloat(2.5)));
+    try testing.expectEqual(@as(?f64, 18446744073709551616.0), f64FromValue(huge));
+    try testing.expectEqual(@as(?f64, null), f64FromValue(value.fromBool(true)));
+    try testing.expect((try i64Value(&heap, 3)).kind() == .fixnum);
+    try testing.expect((try i64Value(&heap, value.fixnum_min - 1)).kind() == .bignum);
 }
 
 test "ElemType.fromTag accepts only the implemented tags" {

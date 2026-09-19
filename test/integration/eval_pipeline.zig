@@ -3786,3 +3786,106 @@ test "read-string: forms as data, the first form only, errors thrown" {
     try expectOutput("(try (read-string \"\") (catch :reader-error e :empty))", ":empty");
     try expectOutput("(macroexpand-1 (read-string \"(when a b)\"))", "(if a (do b) nil)");
 }
+
+// =============================================================================
+// Typed vectors (docs/TYPED_VECTOR.md §7)
+// =============================================================================
+
+test "typed vectors: constructors, type, printing and the generic natives" {
+    try runCoreCases(&.{
+        .{ .src = "(i64-vector [1 2 3])", .expected = "#i64[1 2 3]" },
+        .{ .src = "(f64-vector [1 2.5 3])", .expected = "#f64[1.0 2.5 3.0]" },
+        .{ .src = "(i64-vector nil)", .expected = "#i64[]" },
+        .{ .src = "(f64-vector '(1 2))", .expected = "#f64[1.0 2.0]" },
+        .{ .src = "(i64-vector (range 5))", .expected = "#i64[0 1 2 3 4]" },
+        .{ .src = "(f64-vector #{1})", .expected = "#f64[1.0]" },
+        .{ .src = "(f64-vector (i64-vector [1 2]))", .expected = "#f64[1.0 2.0]" },
+        .{ .src = "(pr-str (f64-vector [10000000000.0 (/ 1.0 0) (/ -1.0 0)]))", .expected = "#f64[1.0E10 Infinity -Infinity]" },
+        .{ .src = "(i64-vector [140737488355328 -140737488355329])", .expected = "#i64[140737488355328 -140737488355329]" },
+        .{ .src = "(nth (i64-vector [140737488355328]) 0)", .expected = "140737488355328" },
+        .{ .src = "(i64-vector [9223372036854775807])", .expected = "#i64[9223372036854775807]" },
+        .{ .src = "(typed-vector? (i64-vector [1]))", .expected = "true" },
+        .{ .src = "(typed-vector? (f64-vector []))", .expected = "true" },
+        .{ .src = "(typed-vector? [1])", .expected = "false" },
+        .{ .src = "(typed-vector-type (i64-vector [1]))", .expected = ":i64" },
+        .{ .src = "(typed-vector-type (f64-vector [1]))", .expected = ":f64" },
+        .{ .src = "(count (i64-vector [1 2 3]))", .expected = "3" },
+        .{ .src = "(count (f64-vector []))", .expected = "0" },
+        .{ .src = "(empty? (f64-vector []))", .expected = "true" },
+        .{ .src = "(empty? (i64-vector [1]))", .expected = "false" },
+        .{ .src = "(nth (i64-vector [10 20]) 1)", .expected = "20" },
+        .{ .src = "(nth (f64-vector [10 20]) 1)", .expected = "20.0" },
+        .{ .src = "(nth (i64-vector [10 20]) 5 :d)", .expected = ":d" },
+        .{ .src = "(get (i64-vector [10 20]) 0)", .expected = "10" },
+        .{ .src = "(get (f64-vector [10 20]) 1)", .expected = "20.0" },
+        .{ .src = "(get (i64-vector [10 20]) 2)", .expected = "nil" },
+        .{ .src = "(get (i64-vector [10 20]) -1 :d)", .expected = ":d" },
+        .{ .src = "(get (i64-vector [10 20]) :k :d)", .expected = ":d" },
+        .{ .src = "(seq (i64-vector [1 2]))", .expected = "(1 2)" },
+        .{ .src = "(seq (i64-vector []))", .expected = "nil" },
+        .{ .src = "(first (f64-vector [1.5 2]))", .expected = "1.5" },
+        .{ .src = "(rest (i64-vector [1 2 3]))", .expected = "(2 3)" },
+        .{ .src = "(next (i64-vector [1]))", .expected = "nil" },
+        .{ .src = "(vec (i64-vector [1 2 3]))", .expected = "[1 2 3]" },
+        .{ .src = "(vector? (vec (f64-vector [1])))", .expected = "true" },
+        .{ .src = "(reduce + (i64-vector [1 2 3]))", .expected = "6" },
+        .{ .src = "(reduce + 0.5 (f64-vector [1 2]))", .expected = "3.5" },
+        .{ .src = "(into [] (i64-vector [1 2]))", .expected = "[1 2]" },
+        .{ .src = "(into #{} (f64-vector [1 1]))", .expected = "#{1.0}" },
+        .{ .src = "(into '() (i64-vector [1 2]))", .expected = "(2 1)" },
+        .{ .src = "(map inc (i64-vector [1 2]))", .expected = "(2 3)" },
+        .{ .src = "(mapv (fn [x] (* x 2)) (f64-vector [1 2]))", .expected = "[2.0 4.0]" },
+        .{ .src = "(filter odd? (i64-vector [1 2 3]))", .expected = "(1 3)" },
+        .{ .src = "(apply + (i64-vector [1 2 3]))", .expected = "6" },
+        .{ .src = "(sort (i64-vector [3 1 2]))", .expected = "(1 2 3)" },
+        .{ .src = "(let [[a b] (i64-vector [7 8])] (+ a b))", .expected = "15" },
+        .{ .src = "(str (i64-vector [1 2]) \"!\")", .expected = "#i64[1 2]!" },
+        .{ .src = "(coll? (i64-vector [1]))", .expected = "false" },
+        .{ .src = "(sequential? (i64-vector [1]))", .expected = "false" },
+        .{ .src = "(vector? (i64-vector [1]))", .expected = "false" },
+    });
+}
+
+test "typed vectors: equality, hash and identity" {
+    try runCoreCases(&.{
+        .{ .src = "(= (i64-vector [1 2]) (i64-vector [1 2]))", .expected = "true" },
+        .{ .src = "(= (i64-vector [1 2]) (i64-vector [1 3]))", .expected = "false" },
+        .{ .src = "(= (i64-vector [1 2]) (i64-vector [1]))", .expected = "false" },
+        .{ .src = "(= (i64-vector [1 2]) (f64-vector [1 2]))", .expected = "false" },
+        .{ .src = "(= (i64-vector [1 2]) [1 2])", .expected = "false" },
+        .{ .src = "(= [1 2] (i64-vector [1 2]))", .expected = "false" },
+        .{ .src = "(= (i64-vector [1 2]) '(1 2))", .expected = "false" },
+        .{ .src = "(= (i64-vector []) [])", .expected = "false" },
+        .{ .src = "(= (f64-vector [0.0]) (f64-vector [-0.0]))", .expected = "true" },
+        .{ .src = "(= (f64-vector [(/ 0.0 0)]) (f64-vector [(/ 0.0 0)]))", .expected = "true" },
+        .{ .src = "(= (hash (i64-vector [1 2])) (hash (i64-vector [1 2])))", .expected = "true" },
+        .{ .src = "(= (hash (f64-vector [0.0])) (hash (f64-vector [-0.0])))", .expected = "true" },
+        .{ .src = "(= (hash (i64-vector [1 2])) (hash [1 2]))", .expected = "false" },
+        .{ .src = "(let [v (i64-vector [1])] (identical? v v))", .expected = "true" },
+        .{ .src = "(identical? (i64-vector [1]) (i64-vector [1]))", .expected = "false" },
+        .{ .src = "(get {(i64-vector [1 2]) :hit} (i64-vector [1 2]))", .expected = ":hit" },
+        .{ .src = "(contains? #{(f64-vector [1])} (f64-vector [1.0]))", .expected = "true" },
+    });
+}
+
+test "typed vectors: constructor errors and the absent update operations" {
+    try runCoreCases(&.{
+        .{ .src = "(try (i64-vector [1.5]) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (i64-vector [:a]) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (i64-vector [18446744073709551616]) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (f64-vector [\"1\"]) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (i64-vector 5) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (typed-vector-type [1]) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (nth (i64-vector [1]) 1) (catch any e e))", .expected = ":index-out-of-bounds" },
+        .{ .src = "(try (nth (i64-vector [1]) -1) (catch any e e))", .expected = ":index-out-of-bounds" },
+        .{ .src = "(try (nth (f64-vector []) 0) (catch any e e))", .expected = ":index-out-of-bounds" },
+        .{ .src = "(try (conj (i64-vector [1]) 2) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (assoc (i64-vector [1]) 0 2) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (pop (i64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (peek (i64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (subvec (i64-vector [1]) 0) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (empty (i64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try ((i64-vector [1]) 0) (catch any e e))", .expected = ":not-callable" },
+        .{ .src = "(try (with-meta (i64-vector [1]) {}) (catch any e e))", .expected = ":no-metadata-on-immediate" },
+    });
+}
