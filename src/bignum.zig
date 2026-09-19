@@ -846,36 +846,6 @@ test "cross-constructor canonical coherence: i64.min ≡ fromLimbs(true, &{1<<63
     try testing.expectEqual(hashHeader(ah), hashHeader(bh));
 }
 
-test "fromLimbs: pathological length rejected with error.Overflow" {
-    // Ensures the overflow-safe `std.math.mul` check in
-    // canonicalizeToValue rejects impossibly-large limb counts
-    // before the heap allocator sees them. We can't actually
-    // materialize a usize-scale slice, so we synthesize one by
-    // pointer-crafting a zero-length base + fake length. Zig's
-    // safety model allows this for a pointer we never dereference
-    // when len > 0 would trip the mul check immediately.
-    //
-    // NOTE: we only need the length; we pass a fake pointer that the
-    // canonicalizer never dereferences because the mul check fires
-    // before the copy loop. The `input_limbs[trimmed_len - 1] == 0`
-    // loop WILL read memory, though, which is unsafe. So instead we
-    // test the overflow directly by picking a size that fits the
-    // trim pass (all zeros, so trims to empty) but would still reveal
-    // overflow logic if it ran. The mul overflow is unreachable in
-    // practice; the test covers the contract rather than the
-    // physical impossibility.
-    //
-    // A stronger test would require fabricating a real slice of
-    // @as(usize, maxInt(usize) / 8 + 1) u64s, which isn't
-    // materializable. The overflow-safe mul is correctness-by-
-    // construction.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    // Degenerate: empty slice → fixnum(0), no allocation.
-    const v = try fromLimbs(&heap, false, &.{});
-    try testing.expectEqual(@as(i64, 0), v.asFixnum());
-}
-
 // =============================================================================
 // Inline tests — arithmetic, ordering and conversion
 // =============================================================================

@@ -413,9 +413,7 @@ the dispatch loop alone; each loops 10,000 times.
 | `set_contains_n_hit` N=4096 | 36.71 μs [36.7–37.2] | 28.17 μs [28.2–28.3] | same; 6.9 ns per contains |
 | `map_assoc_n` / `set_conj_n` at 16, 256, 4096 | 463 ns / 390 ns, 11.5 μs / 10.4 μs, 318 μs / 298 μs | within noise | construction is allocation-bound |
 
-The `vm` commit's message carries the pair measured when it landed
-(267.22, 483.06 and 534.74 μs); the table is a later five-run
-measurement of the same tree. Per instruction, the counting loop
+Per instruction, the counting loop
 costs 2.9 ns after the change (9 instructions per iteration; 3.8 ns
 before); a global fn call (`var:load-var`, `call:call`, the callee's
 four instructions, `call:return`) adds 20 ns per iteration. A Var load is one read of

@@ -59,9 +59,8 @@ collection↔string coercion, no keyword↔symbol coercion.
 - `min = -(2⁴⁷) = -140_737_488_355_328`
 - `max =  2⁴⁷ - 1 = 140_737_488_355_327`
 - Canonicalization must fold any integer in `[min, max]` to `fixnum`.
-  The asymmetric lower bound (one below the symmetric `±(2⁴⁷−1)`
-  statement previous versions of this document carried) is
-  deliberate: it matches the authoritative `src/value.zig` constants
+  The asymmetric lower bound is deliberate: it matches the
+  authoritative `src/value.zig` constants
   `fixnum_min` / `fixnum_max` and the standard signed-i48
   two's-complement range. Bignum construction that sees a magnitude
   equal to `2⁴⁷` with negative sign must canonicalize to
@@ -120,7 +119,14 @@ Cross-type operators (PLAN §8.3):
   and unary `-` promote the same way (`(- -140737488355328)` →
   `140737488355328`). Ordering, `compare`, `max`, `min`, `zero?`,
   `pos?`, `neg?`, `even?` and `odd?` are exact over bignums. No
-  arithmetic raises `:arithmetic-overflow`.
+  arithmetic raises `:arithmetic-overflow`, with one exception: the
+  element-typed kernel `tv/scale` over an `i64` typed vector, whose
+  result is an `i64` vector with no wider element to promote to
+  (TYPED_VECTOR.md §7.2). `tv/sum` and `tv/dot` are exact and
+  promote like `(reduce + xs)`.
+- `zero?`, `pos?` and `neg?` are all `false` on NaN, which is neither
+  zero, positive nor negative (Clojure's `isZero`, `isPos` and `isNeg`
+  agree); `-0.0` is zero. The infinities are positive and negative.
 - Integer `/` by zero, and `quot` / `rem` / `mod` by zero of any kind,
   raise `:divide-by-zero`. Float `/` by zero is IEEE: `Infinity`,
   `-Infinity` or `NaN`.

@@ -163,6 +163,10 @@ pub fn build(b: *std.Build) void {
     champ_mod.addImport("value", value_mod);
     champ_mod.addImport("heap", heap_mod);
     champ_mod.addImport("hash", hash_mod);
+    // string: the collision-node fixtures key by heap strings, the one
+    // key kind whose indexing hash reaches the `elementHash` callback
+    // (CHAMP.md §5.1).
+    champ_mod.addImport("string", string_mod);
 
     const transient_mod = b.createModule(.{
         .root_source_file = b.path("src/coll/transient.zig"),
@@ -327,6 +331,7 @@ pub fn build(b: *std.Build) void {
     stdlib_mod.addImport("list", list_mod);
     stdlib_mod.addImport("vector", vector_mod);
     stdlib_mod.addImport("typed_vector", typed_vector_mod);
+    stdlib_mod.addImport("bignum", bignum_mod);
     stdlib_mod.addImport("champ", champ_mod);
     stdlib_mod.addImport("intern", intern_mod);
     stdlib_mod.addImport("heap", heap_mod);
@@ -714,7 +719,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "list", .path = "src/coll/list.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "vector", .path = "src/coll/vector.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "bignum", .path = "src/bignum.zig", .imports = &.{ "value", "heap", "hash" } },
-        .{ .name = "champ", .path = "src/coll/champ.zig", .imports = &.{ "value", "heap", "hash" } },
+        .{ .name = "champ", .path = "src/coll/champ.zig", .imports = &.{ "value", "heap", "hash", "string" } },
         .{ .name = "transient", .path = "src/coll/transient.zig", .imports = &.{ "value", "heap", "champ", "vector" } },
         // atom test binary. Same import shape as string.
         .{ .name = "atom", .path = "src/atom.zig", .imports = &.{ "value", "heap", "hash" } },
@@ -733,7 +738,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle", "bignum", "typed_vector" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch", "heap", "string", "bignum" } },
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string", "bignum" } },
-        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "typed_vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol", "nextomic" } },
+        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "typed_vector", "bignum", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol", "nextomic" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
         .{ .name = "disasm", .path = "src/disasm.zig", .imports = &.{ "vm", "value", "format", "intern" } },
         .{ .name = "typed_vector", .path = "src/coll/typed_vector.zig", .imports = &.{ "value", "heap", "hash", "bignum" } },
@@ -863,6 +868,7 @@ pub fn build(b: *std.Build) void {
     prop_champ_mod.addImport("heap", heap_mod);
     prop_champ_mod.addImport("hash", hash_mod);
     prop_champ_mod.addImport("champ", champ_mod);
+    prop_champ_mod.addImport("string", string_mod);
     prop_champ_mod.addImport("list", list_mod);
     prop_champ_mod.addImport("vector", vector_mod);
     prop_champ_mod.addImport("dispatch", dispatch_mod);

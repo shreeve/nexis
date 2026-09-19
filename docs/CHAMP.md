@@ -356,7 +356,12 @@ module takes it as a parameter rather than importing `dispatch.zig`.
 An immediate key hashes through `Value.hashImmediate` directly: that
 is the value `dispatch.hashValue` computes for every non-heap kind,
 so the index is the same either way and a keyword or fixnum key
-skips the callback.)
+skips the callback. `elementHash` is consulted for heap keys only.
+A test fixture that shapes the indexing hash through the callback
+therefore keys by heap values, strings in every collision fixture,
+and asserts through `mapCollisionCount` / `setCollisionCount` that
+its keys reached the collision node; an immediate key would never
+see the fixture's hash and the trie would partition it cleanly.)
 
 Rationale for low-32 (vs. high-32 / XOR-fold): freeze one rule;
 pick the simpler. Truncation does not bias distribution because
@@ -714,6 +719,10 @@ pub fn setIter(s: value.Value) SetIter;
 // -- GC trace entry points (called by gc.zig) --
 pub fn traceMap(h: *HeapHeader, visitor: anytype) void;
 pub fn traceSet(h: *HeapHeader, visitor: anytype) void;
+
+// -- Trie introspection for tests (§12.3) --
+pub fn mapCollisionCount(m: value.Value, hash32: u32) ?u32;
+pub fn setCollisionCount(s: value.Value, hash32: u32) ?u32;
 ```
 
 #### 8.1 Error set and semantic details
@@ -899,9 +908,15 @@ tests target:
 - count 9 (first promotion; single interior node)
 - count 32, 33 (bitmap boundary within a node)
 - count 1024 (level-2 first promotion; trie depth 2)
-- Hash-collision stress: keys all hashing to the same 32-bit value
-  (a hash-colliding test fixture: low 32 bits pinned to
-  `0xDEAD_BEEF`) forcing collision nodes.
+- Hash-collision stress: string keys all hashing to the same 32-bit
+  value (a hash-colliding test fixture: low 32 bits pinned to
+  `0xDEAD_BEEF`; heap keys because the callback is consulted for
+  heap keys only, §5.1) forcing collision nodes. `mapCollisionCount`
+  / `setCollisionCount` descend the trie along a 32-bit hash and
+  report the entry count of the collision node at the bottom, or
+  `null` when the descent leaves the trie earlier; every collision
+  test asserts the count so the fixture cannot degrade into a
+  cleanly partitioned trie without failing.
 
 #### 12.4 Property tests (`test/prop/champ.zig`)
 

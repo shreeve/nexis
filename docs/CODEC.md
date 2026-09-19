@@ -110,7 +110,9 @@ VALUE.md §2 numeric values):
 - **Fixed little-endian for bignum limbs** — bignum magnitudes are
   large by definition (canonicalization guarantees magnitude >
   i48 range per BIGNUM.md §1). Varint overhead per limb would be
-  wasted.
+  wasted. Decode bounds the input it needs from the limb count
+  before allocating, so a count past the input is `TruncatedInput`,
+  never an allocation failure.
 - **Fixed little-endian for typed-vector elements** — the elements
   are unboxed `i64` / `f64` in memory; the wire form is the same
   eight bytes each, so decode can bound the input it needs from the

@@ -4342,9 +4342,11 @@ fn integerOrder(a: value_mod.Value, b: value_mod.Value) VmError!std.math.Order {
     return bignum_mod.compare(a, b);
 }
 
-/// Sign tests shared by `zero?`, `pos?` and `neg?`. NaN is
-/// neither positive, negative nor zero.
-pub fn numSign(a: value_mod.Value) VmError!std.math.Order {
+/// Sign tests shared by `zero?`, `pos?` and `neg?`: the order of
+/// the number against zero, or `null` for NaN, which is neither
+/// positive, negative nor zero (Clojure's `isZero`, `isPos` and
+/// `isNeg` are all false on it). Negative zero is zero.
+pub fn numSign(a: value_mod.Value) VmError!?std.math.Order {
     return switch (a.kind()) {
         .fixnum => std.math.order(a.asFixnum(), 0),
         .bignum => if (bignum_mod.isNegative(a)) .lt else .gt,
@@ -4352,7 +4354,8 @@ pub fn numSign(a: value_mod.Value) VmError!std.math.Order {
             const f = a.asFloat();
             if (f > 0) break :blk .gt;
             if (f < 0) break :blk .lt;
-            break :blk .eq;
+            if (f == 0) break :blk .eq;
+            break :blk null;
         },
         else => VmError.KindMismatch,
     };
@@ -5548,11 +5551,13 @@ test "numeric tower: comparison across kinds and NaN" {
     try testing.expect(!try numCompare(.lt, nan, over));
     try testing.expectError(VmError.KindMismatch, numCompare(.lt, over, value_mod.nilValue()));
     // Sign and extremum.
-    try testing.expectEqual(std.math.Order.lt, try numSign(fl(-0.5)));
-    try testing.expectEqual(std.math.Order.eq, try numSign(fl(-0.0)));
-    try testing.expectEqual(std.math.Order.gt, try numSign(fx(3)));
-    try testing.expectEqual(std.math.Order.gt, try numSign(over));
-    try testing.expectEqual(std.math.Order.lt, try numSign(under));
+    try testing.expectEqual(std.math.Order.lt, (try numSign(fl(-0.5))).?);
+    try testing.expectEqual(std.math.Order.eq, (try numSign(fl(-0.0))).?);
+    try testing.expectEqual(std.math.Order.gt, (try numSign(fx(3))).?);
+    try testing.expectEqual(std.math.Order.gt, (try numSign(over)).?);
+    try testing.expectEqual(std.math.Order.lt, (try numSign(under)).?);
+    try testing.expectEqual(@as(?std.math.Order, null), try numSign(nan));
+    try testing.expectError(VmError.KindMismatch, numSign(value_mod.nilValue()));
     try testing.expectEqual(@as(i64, 4), (try numExtremum(true, fx(3), fx(4))).asFixnum());
     try testing.expectEqual(@as(f64, 4.0), (try numExtremum(true, fx(3), fl(4.0))).asFloat());
     try testing.expectEqual(@as(i64, 3), (try numExtremum(false, fx(3), fl(4.0))).asFixnum());

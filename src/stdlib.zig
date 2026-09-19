@@ -30,6 +30,7 @@ const vm_mod = @import("vm");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
 const typed_vector_mod = @import("typed_vector");
+const bignum_mod = @import("bignum");
 const champ_mod = @import("champ");
 const intern_mod = @import("intern");
 const db_mod = @import("db");
@@ -1165,16 +1166,21 @@ fn fnNot(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(!args[0].isTruthy());
 }
 
+/// `zero?` / `pos?` / `neg?`: all three are false on NaN, which
+/// `numSign` reports as no order at all.
 fn fnZeroQ(_: *VM, args: []const Value) VmError!Value {
-    return value_mod.fromBool(try vm_mod.numSign(args[0]) == .eq);
+    const sign = (try vm_mod.numSign(args[0])) orelse return value_mod.fromBool(false);
+    return value_mod.fromBool(sign == .eq);
 }
 
 fn fnPosQ(_: *VM, args: []const Value) VmError!Value {
-    return value_mod.fromBool(try vm_mod.numSign(args[0]) == .gt);
+    const sign = (try vm_mod.numSign(args[0])) orelse return value_mod.fromBool(false);
+    return value_mod.fromBool(sign == .gt);
 }
 
 fn fnNegQ(_: *VM, args: []const Value) VmError!Value {
-    return value_mod.fromBool(try vm_mod.numSign(args[0]) == .lt);
+    const sign = (try vm_mod.numSign(args[0])) orelse return value_mod.fromBool(false);
+    return value_mod.fromBool(sign == .lt);
 }
 
 /// `even?` / `odd?` are integer-only, as in Clojure.
@@ -1685,6 +1691,13 @@ fn fnContainsQ(vm: *VM, args: []const Value) VmError!Value {
             break :blk value_mod.fromBool(u_idx < vector_mod.count(coll));
         },
         .string => value_mod.fromBool((try stringIndex(coll, k)) != null),
+        .typed_vector => blk: {
+            if (k.kind() != .fixnum) break :blk value_mod.fromBool(false);
+            const idx = k.asFixnum();
+            if (idx < 0) break :blk value_mod.fromBool(false);
+            const u_idx: usize = @intCast(idx);
+            break :blk value_mod.fromBool(u_idx < typed_vector_mod.count(coll));
+        },
         .record => value_mod.fromBool(switch (champ_mod.mapGet(
             record_mod.fieldsOf(coll),
             k,
@@ -2384,7 +2397,7 @@ const SortOrder = struct {
         return switch (r.kind()) {
             .true_ => true,
             .false_, .nil => false,
-            else => (try vm_mod.numSign(r)) == .lt,
+            else => ((try vm_mod.numSign(r)) orelse return false) == .lt,
         };
     }
 };
@@ -4441,24 +4454,37 @@ fn dotF64(xs: []const f64, ys: []const f64) f64 {
     return total;
 }
 
-/// `(tv/sum xs)`: an integer for `i64` (`:arithmetic-overflow` past
-/// `i64`), a float for `f64`.
+/// `(tv/sum xs)`: the exact integer sum for `i64`, a bignum when it
+/// is beyond the fixnum range, as `(reduce + xs)` yields; a float
+/// for `f64`. Fewer than 2^64 elements of `i64` sum to a magnitude
+/// under 2^127, so the `i128` accumulator never overflows.
 fn fnSimdSum(vm: *VM, args: []const Value) VmError!Value {
     try requireTypedVector(args[0]);
     switch (typed_vector_mod.elemType(args[0])) {
         .i64 => {
-            var total: i64 = 0;
-            for (typed_vector_mod.i64Elems(args[0])) |x| {
-                total = std.math.add(i64, total, x) catch return VmError.ArithmeticOverflow;
-            }
-            return typed_vector_mod.i64Value(vm.ensureHeap(), total) catch VmError.OutOfMemory;
+            var total: i128 = 0;
+            for (typed_vector_mod.i64Elems(args[0])) |x| total += x;
+            return bignum_mod.fromI128(vm.ensureHeap(), total) catch VmError.OutOfMemory;
         },
         .f64 => return value_mod.fromFloat(sumF64(typed_vector_mod.f64Elems(args[0]))),
     }
 }
 
+/// `acc + n` as an exact integer Value; a null `acc` is zero. Used
+/// by `tv/dot` to spill an `i128` partial total into a bignum.
+/// `Heap.alloc` never collects (GC.md §11.5), so the running bignum
+/// needs no root while the kernel holds it.
+fn spillI128(heap: *heap_mod.Heap, acc: ?Value, n: i128) VmError!Value {
+    const v = bignum_mod.fromI128(heap, n) catch return VmError.OutOfMemory;
+    const a = acc orelse return v;
+    return bignum_mod.add(heap, a, v) catch VmError.OutOfMemory;
+}
+
 /// `(tv/dot xs ys)`: same element type (`:kind-mismatch`) and length
-/// (`:invalid-argument`); result kind as `sum`.
+/// (`:invalid-argument`); result kind as `sum`, exact at any size. A
+/// product of two `i64` fits `i128`; when the running total of
+/// products leaves `i128` it spills into a bignum and the `i128`
+/// accumulation restarts from the product that overflowed it.
 fn fnSimdDot(vm: *VM, args: []const Value) VmError!Value {
     try requireTypedVector(args[0]);
     try requireTypedVector(args[1]);
@@ -4467,18 +4493,26 @@ fn fnSimdDot(vm: *VM, args: []const Value) VmError!Value {
     if (typed_vector_mod.count(args[0]) != typed_vector_mod.count(args[1])) return VmError.InvalidArgument;
     switch (elem) {
         .i64 => {
-            var total: i64 = 0;
+            const heap = vm.ensureHeap();
+            var total: i128 = 0;
+            var spilled: ?Value = null;
             for (typed_vector_mod.i64Elems(args[0]), typed_vector_mod.i64Elems(args[1])) |x, y| {
-                const p = std.math.mul(i64, x, y) catch return VmError.ArithmeticOverflow;
-                total = std.math.add(i64, total, p) catch return VmError.ArithmeticOverflow;
+                const p = @as(i128, x) * @as(i128, y);
+                total = std.math.add(i128, total, p) catch blk: {
+                    spilled = try spillI128(heap, spilled, total);
+                    break :blk p;
+                };
             }
-            return typed_vector_mod.i64Value(vm.ensureHeap(), total) catch VmError.OutOfMemory;
+            return spillI128(heap, spilled, total);
         },
         .f64 => return value_mod.fromFloat(dotF64(typed_vector_mod.f64Elems(args[0]), typed_vector_mod.f64Elems(args[1]))),
     }
 }
 
 /// `(tv/scale xs k)`: every element times `k`, same element type.
+/// The result is an element-typed vector, so an `i64` product
+/// outside `i64` has no representation and is `:arithmetic-overflow`
+/// (TYPED_VECTOR.md §7.2), the one arithmetic that raises it.
 fn fnSimdScale(vm: *VM, args: []const Value) VmError!Value {
     try requireTypedVector(args[0]);
     const heap = vm.ensureHeap();

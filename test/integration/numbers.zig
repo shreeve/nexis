@@ -223,6 +223,13 @@ test "predicates over bignums" {
     try expectOutput("(let [b (+ " ++ fm ++ " 1)] [(NaN? b) (infinite? b)])", "[false false]");
 }
 
+test "predicates: NaN is neither zero, positive nor negative; negative zero is zero" {
+    try expectOutput("(let [n (/ 0.0 0.0)] [(zero? n) (pos? n) (neg? n) (NaN? n)])", "[false false false true]");
+    try expectOutput("[(zero? -0.0) (pos? -0.0) (neg? -0.0) (zero? 0.0) (pos? 1e-300) (neg? -1e-300)]", "[true false false true true true]");
+    try expectOutput("(let [i (/ 1.0 0.0)] [(pos? i) (neg? (- i)) (zero? i)])", "[true true false]");
+    try expectOutput("(try (zero? nil) (catch any e e))", ":kind-mismatch");
+}
+
 test "conversions: long truncates a float toward zero at any size, double widens" {
     try expectOutput("[(long 5) (long 3.99) (long -3.99) (long 0.5) (long -0.5)]", "[5 3 -3 0 0]");
     try expectOutput("(long 18446744073709551616)", "18446744073709551616");

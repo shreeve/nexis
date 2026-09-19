@@ -40,6 +40,7 @@ const value = @import("value");
 const heap_mod = @import("heap");
 const hash_mod = @import("hash");
 const champ = @import("champ");
+const string_mod = @import("string");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
 const dispatch = @import("dispatch");
@@ -476,56 +477,72 @@ test "M9: keyword-keyed maps give identical results to fixnum-keyed maps" {
 /// key's real hash. CHAMP indexes on low 32 bits (CHAMP.md §5.1) so
 /// the collision path is exercised end-to-end.
 ///
+/// The keys are heap strings from `collidingKey`, never immediates:
+/// an immediate key hashes inline and never reaches `elementHash`
+/// (CHAMP.md §5.1), so a keyword or fixnum key would partition
+/// cleanly through the trie instead of colliding. Each test asserts
+/// through `champ.mapCollisionCount` / `champ.setCollisionCount` that
+/// its keys did reach the collision node.
+///
 /// Invariant: low 32 bits = `0xDEAD_BEEF` for every input. High 32
 /// bits vary by input so that any downstream hashing pipelines that
 /// DO consume the full u64 (e.g. when a colliding-keyed map's own
 /// entries are hashed into a parent collection) still produce
-/// distinct hashes across distinct entries.
-///
-/// Do not "optimize" to a constant u64 — that would cause spurious
-/// collisions in other test paths that re-use this fixture. See the
-/// equivalent `collidingHash` comment in `src/coll/champ.zig`'s inline
-/// tests for the same discipline.
+/// distinct hashes across distinct entries; a constant u64 would
+/// cause spurious collisions in other paths that reuse this fixture.
+/// See the equivalent `collidingHash` in `src/coll/champ.zig`'s
+/// inline tests for the same discipline.
 fn collidingHash(v: Value) u64 {
-    return (@as(u64, v.hashImmediate() >> 32) << 32) | 0xDEAD_BEEF;
+    return (@as(u64, dispatch.hashValue(v) >> 32) << 32) | 0xDEAD_BEEF;
+}
+
+/// The `i`-th key of a collision fixture: a fresh heap string, equal
+/// by content under `dispatch.equal`, so any call with the same `i`
+/// names the same key.
+fn collidingKey(heap: *Heap, i: u32) !Value {
+    var buf: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "collider-{d}", .{i}) catch unreachable;
+    return string_mod.fromBytes(heap, text);
 }
 
 test "M10: collision node stress — ≥5 distinct keys sharing an indexing hash" {
     var heap = Heap.init(std.testing.allocator);
     defer heap.deinit();
 
-    // Insert 10 distinct keys. With `collidingHash`, all land in a
-    // single collision node at the deepest trie level.
+    // Insert 10 distinct string keys. With `collidingHash`, all land
+    // in a single collision node at the deepest trie level.
     var m = try champ.mapEmpty(&heap);
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
-        m = try champ.mapAssoc(&heap, m, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &collidingHash, &dispatch.equal);
+        m = try champ.mapAssoc(&heap, m, try collidingKey(&heap, i), value.fromFixnum(@intCast(i)).?, &collidingHash, &dispatch.equal);
     }
     try std.testing.expectEqual(@as(usize, 10), champ.mapCount(m));
+    try std.testing.expectEqual(@as(?u32, 10), champ.mapCollisionCount(m, 0xDEAD_BEEF));
     // Every key must be retrievable.
     i = 0;
     while (i < 10) : (i += 1) {
-        switch (champ.mapGet(m, value.fromKeywordId(i), &collidingHash, &dispatch.equal)) {
+        switch (champ.mapGet(m, try collidingKey(&heap, i), &collidingHash, &dispatch.equal)) {
             .absent => try std.testing.expect(false),
             .present => |v| try std.testing.expectEqual(@as(i64, @intCast(i)), v.asFixnum()),
         }
     }
     // Dissoc alternating keys; remaining keys must still look up.
-    m = try champ.mapDissoc(&heap, m, value.fromKeywordId(0), &collidingHash, &dispatch.equal);
-    m = try champ.mapDissoc(&heap, m, value.fromKeywordId(3), &collidingHash, &dispatch.equal);
-    m = try champ.mapDissoc(&heap, m, value.fromKeywordId(7), &collidingHash, &dispatch.equal);
+    m = try champ.mapDissoc(&heap, m, try collidingKey(&heap, 0), &collidingHash, &dispatch.equal);
+    m = try champ.mapDissoc(&heap, m, try collidingKey(&heap, 3), &collidingHash, &dispatch.equal);
+    m = try champ.mapDissoc(&heap, m, try collidingKey(&heap, 7), &collidingHash, &dispatch.equal);
     try std.testing.expectEqual(@as(usize, 7), champ.mapCount(m));
-    try std.testing.expect(champ.mapGet(m, value.fromKeywordId(0), &collidingHash, &dispatch.equal) == .absent);
-    try std.testing.expect(champ.mapGet(m, value.fromKeywordId(3), &collidingHash, &dispatch.equal) == .absent);
-    try std.testing.expect(champ.mapGet(m, value.fromKeywordId(7), &collidingHash, &dispatch.equal) == .absent);
-    switch (champ.mapGet(m, value.fromKeywordId(5), &collidingHash, &dispatch.equal)) {
+    try std.testing.expectEqual(@as(?u32, 7), champ.mapCollisionCount(m, 0xDEAD_BEEF));
+    try std.testing.expect(champ.mapGet(m, try collidingKey(&heap, 0), &collidingHash, &dispatch.equal) == .absent);
+    try std.testing.expect(champ.mapGet(m, try collidingKey(&heap, 3), &collidingHash, &dispatch.equal) == .absent);
+    try std.testing.expect(champ.mapGet(m, try collidingKey(&heap, 7), &collidingHash, &dispatch.equal) == .absent);
+    switch (champ.mapGet(m, try collidingKey(&heap, 5), &collidingHash, &dispatch.equal)) {
         .absent => try std.testing.expect(false),
         .present => |v| try std.testing.expectEqual(@as(i64, 5), v.asFixnum()),
     }
     // Dissoc all remaining → empty.
     const remaining = [_]u32{ 1, 2, 4, 5, 6, 8, 9 };
     for (remaining) |r| {
-        m = try champ.mapDissoc(&heap, m, value.fromKeywordId(r), &collidingHash, &dispatch.equal);
+        m = try champ.mapDissoc(&heap, m, try collidingKey(&heap, r), &collidingHash, &dispatch.equal);
     }
     try std.testing.expect(champ.mapIsEmpty(m));
 }
@@ -846,22 +863,24 @@ test "S9: collision-node stress for set (≥5 elements sharing indexing hash)" {
     var s = try champ.setEmpty(&heap);
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
-        s = try champ.setConj(&heap, s, value.fromKeywordId(i), &collidingHash, &dispatch.equal);
+        s = try champ.setConj(&heap, s, try collidingKey(&heap, i), &collidingHash, &dispatch.equal);
     }
     try std.testing.expectEqual(@as(usize, 10), champ.setCount(s));
+    try std.testing.expectEqual(@as(?u32, 10), champ.setCollisionCount(s, 0xDEAD_BEEF));
     i = 0;
     while (i < 10) : (i += 1) {
-        try std.testing.expect(champ.setContains(s, value.fromKeywordId(i), &collidingHash, &dispatch.equal));
+        try std.testing.expect(champ.setContains(s, try collidingKey(&heap, i), &collidingHash, &dispatch.equal));
     }
-    s = try champ.setDisj(&heap, s, value.fromKeywordId(0), &collidingHash, &dispatch.equal);
-    s = try champ.setDisj(&heap, s, value.fromKeywordId(5), &collidingHash, &dispatch.equal);
+    s = try champ.setDisj(&heap, s, try collidingKey(&heap, 0), &collidingHash, &dispatch.equal);
+    s = try champ.setDisj(&heap, s, try collidingKey(&heap, 5), &collidingHash, &dispatch.equal);
     try std.testing.expectEqual(@as(usize, 8), champ.setCount(s));
-    try std.testing.expect(!champ.setContains(s, value.fromKeywordId(0), &collidingHash, &dispatch.equal));
-    try std.testing.expect(!champ.setContains(s, value.fromKeywordId(5), &collidingHash, &dispatch.equal));
-    try std.testing.expect(champ.setContains(s, value.fromKeywordId(3), &collidingHash, &dispatch.equal));
+    try std.testing.expectEqual(@as(?u32, 8), champ.setCollisionCount(s, 0xDEAD_BEEF));
+    try std.testing.expect(!champ.setContains(s, try collidingKey(&heap, 0), &collidingHash, &dispatch.equal));
+    try std.testing.expect(!champ.setContains(s, try collidingKey(&heap, 5), &collidingHash, &dispatch.equal));
+    try std.testing.expect(champ.setContains(s, try collidingKey(&heap, 3), &collidingHash, &dispatch.equal));
     const remaining = [_]u32{ 1, 2, 3, 4, 6, 7, 8, 9 };
     for (remaining) |x| {
-        s = try champ.setDisj(&heap, s, value.fromKeywordId(x), &collidingHash, &dispatch.equal);
+        s = try champ.setDisj(&heap, s, try collidingKey(&heap, x), &collidingHash, &dispatch.equal);
     }
     try std.testing.expect(champ.setIsEmpty(s));
 }
