@@ -83,6 +83,7 @@ pub const Builtin = enum {
     get_some,
     tuple,
     untuple,
+    fulltext,
 
     pub fn name(self: Builtin) []const u8 {
         return switch (self) {
@@ -98,6 +99,7 @@ pub const Builtin = enum {
             .get_some => "get-some",
             .tuple => "tuple",
             .untuple => "untuple",
+            .fulltext => "fulltext",
         };
     }
 

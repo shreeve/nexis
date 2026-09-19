@@ -33,7 +33,7 @@
                   {:db/ident :person/uuid :db/valueType :db.type/uuid :db/cardinality :db.cardinality/one}
                   {:db/ident :person/photo :db/valueType :db.type/bytes :db/cardinality :db.cardinality/one}]))
 (t/check "schema transaction is t=2" (= 2 (:tx schema-report)))
-(t/check "attribute entities take ids in the attribute partition" (= 22 (d/entid (d/db c) :person/name)))
+(t/check "attribute entities take ids in the attribute partition" (= 23 (d/entid (d/db c) :person/name)))
 (t/check "db-before and db-after bracket the transaction"
        (and (= 1 (d/basis-t (:db-before schema-report))) (= 2 (d/basis-t (:db-after schema-report)))))
 (println (get (d/schema (d/db c)) :person/email))
@@ -108,6 +108,53 @@
 (t/check "its component is gone" (nil? (d/entity (d/db c) home)))
 (t/check "refs to it are gone" (nil? (:person/friends (d/entity (d/db c) bob))))
 (t/check "its email is free again" (nil? (d/entid (d/db c) [:person/email "ann@example.com"])))
+
+; Transaction functions: [:db.fn/call f arg ...] calls f with db-before
+; and the args; its tx-data takes the form's place. A symbol names a
+; var; the function value itself is never stored.
+(defn older [db e years]
+  [[:db/add e :person/age (+ years (:person/age (d/entity db e)))]])
+(defn older-twice [db e] [[:db.fn/call older e 1] [:db.fn/call older e 1]])
+(println (facts (d/transact! c [[:db.fn/call older bob 5]])))
+(println (facts (d/transact! c '[[:db.fn/call older 4294967298 1]])))
+(t/check "nested calls see the same db-before, so equal claims are one datom"
+       (= 37 (:person/age (d/entity (:db-after (d/transact! c [[:db.fn/call older-twice bob]])) bob))))
+(t/check "a nil result is no tx-data" (empty? (facts (d/transact! c [[:db.fn/call (fn [db] nil)]]))))
+(t/check "a call inside with is speculative"
+       (= [38 37] [(d/with c [[:db.fn/call older bob 1]] (fn [db r] (:person/age (d/entity db bob))))
+                   (:person/age (d/entity (d/db c) bob))]))
+
+; :db.fn/cas asserts new when the current value is old; nil old means absent.
+(println (facts (d/transact! c [[:db.fn/cas bob :person/age 37 40]])))
+(println (t/caught (d/transact! c [[:db.fn/cas bob :person/age 37 41]])))
+(println (t/caught (d/transact! c [[:db.fn/cas bob :person/height nil 1.8] [:db.fn/cas bob :person/height nil 1.9]])))
+(t/check "cas against an absent attribute" (= 1.8 (:person/height (d/entity (:db-after (d/transact! c [[:db.fn/cas bob :person/height nil 1.8]])) bob))))
+(println (t/caught (d/transact! c [[:db.fn/cas bob :person/height nil 1.9]])))
+
+; Schema alteration: :db/ident on an attribute entity renames it (the
+; old name retires, for every view), :db/cardinality goes one -> many
+; freely and many -> one while no entity holds two values.
+(def db-named (d/db c))
+(println (facts (d/transact! c [[:db/add :person/name :db/ident :person/full-name]])))
+(println [(d/entid (d/db c) :person/name) (d/entid (d/db c) :person/full-name) (d/ident (d/db c) 23)])
+(println (:person/full-name (d/entity (d/db c) bob)))
+(t/check "the old name is gone from every view" (= (keys (d/entity db-named bob)) (keys (d/entity (d/db c) bob))))
+(t/check "tx-range decodes the entries written under the old name"
+       (= 1 (count (filterv (fn [[e a v]] (= [a v] [:db/ident :person/full-name])) (:data (first (d/tx-range c 2 3)))))))
+(println (t/caught (d/transact! c [[:db/add bob :person/name "Bob"]])))
+(println (t/caught (d/transact! c [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])))
+(println (t/caught (d/transact! c [[:db/add :person/full-name :db/ident :person/age]])))
+(d/transact! c [[:db/add :person/full-name :db/cardinality :db.cardinality/many]])
+(d/transact! c [[:db/add bob :person/full-name "Robert"]])
+(println (:person/full-name (d/entity (d/db c) bob)))
+(println (:person/full-name (d/entity db-named bob)))
+(println (t/caught (d/transact! c [[:db/add :person/full-name :db/cardinality :db.cardinality/one]])))
+(d/transact! c [[:db/retract bob :person/full-name "Bob"]])
+(d/transact! c [[:db/add :person/full-name :db/cardinality :db.cardinality/one]])
+(println (:db/cardinality (get (d/schema (d/db c)) :person/full-name)))
+(println (:person/full-name (d/entity (d/db c) bob)))
+(println (t/caught (d/transact! c [[:db/add :person/email :db/cardinality :db.cardinality/many]])))
+(println (t/caught (d/transact! c [[:db/add :person/age :db/valueType :db.type/string]])))
 
 (d/release c)
 :basics-done

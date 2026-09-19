@@ -106,5 +106,26 @@ ok explain returns the plan as text
 :boom
 ok the store still works after a predicate threw
 ok results are ordinary sets
+([Ann] [Bob])
+([Ann Ann runs the red team; loves Café Noir.])
+([Ann])
+([Cy])
+#{}
+#{}
+([1 apple] [4 apple])
+([Ann])
+([4])
+([Ann] [Bob])
+#{[Bob now bills in blue]}
+#{}
+{:error :nextomic/tx-data, :message attribute is not :db/fulltext, :attr :order/items}
+{:error :nextomic/tx-data, :message attribute is not :db/fulltext, :attr :person/name}
+{:error :nextomic/unknown-attribute, :attr :person/nope}
+:nextomic/value-type
+{:error :nextomic/query-syntax, :message fulltext is (fulltext $ :attr "needle"), :clause 0}
+{:error :nextomic/schema, :message :db/fulltext takes a string attribute, :attr :person/age}
+{:error :nextomic/schema, :message :db/fulltext takes a string attribute, :attr :person/nick}
+{:error :nextomic/conflict, :e 44, :a :db/fulltext}
+ok :db/fulltext is a bootstrap attribute
 :nextomic/closed
 :query-done

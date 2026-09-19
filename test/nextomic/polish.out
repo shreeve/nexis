@@ -42,6 +42,12 @@ ok failed transactions leave the basis alone
 Dee
 Eve
 Eve
+[Bob :none (:db/id :user/age :user/boss :user/email :user/friends :user/name :user/next :user/role) 4294967297 8]
+ok an entity is a map
+ok entity maps of one view are equal
+ok an entity map from a view that differs is not
+ok the map is read once; a later transaction leaves it alone
+ok assoc yields a new map, the entity map is unchanged
 :nextomic/history-view
 :nextomic/history-view
 ([30 true])

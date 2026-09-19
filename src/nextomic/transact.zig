@@ -45,6 +45,8 @@ const idents_mod = @import("idents.zig");
 const schema_mod = @import("schema.zig");
 const db_mod = @import("db.zig");
 const marshal = @import("marshal.zig");
+const excise_mod = @import("excise.zig");
+const fulltext = @import("fulltext.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -69,6 +71,27 @@ pub const Error = error{
     /// A speculative `with` holds the connection's write transaction, so
     /// another `transact` or `with` cannot begin: `:nextomic/nested`.
     Nested,
+    /// A transaction function could not run: no hook to call it through,
+    /// or calls nested past `max_call_depth`: `:nextomic/tx-fn`.
+    TxFn,
+    /// A `:db.fn/cas` found a value other than the one it expected:
+    /// `:nextomic/cas`.
+    Cas,
+    /// A schema change the attribute's data refuses: `:nextomic/schema`.
+    Schema,
+};
+
+/// How deep `:db.fn/call` results may nest further calls.
+pub const max_call_depth: u32 = 16;
+
+/// Calls a transaction function (NEXTOMIC.md §3 "Transaction
+/// functions"). `f` is the value in the `:db.fn/call` form: a function,
+/// or a symbol the hook resolves through the namespace registry. The
+/// hook boxes `db_before` for the VM, calls `f` with it ahead of
+/// `args`, and returns the tx-data the function produced.
+pub const CallHook = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, f: Value, db_before: DbValue, args: []const Value) anyerror!Value,
 };
 
 /// Everything a transaction can fail with: its own errors, the
@@ -82,6 +105,8 @@ pub const Options = struct {
     now_ms: ?i64 = null,
     /// Filled with what a failing step was looking at.
     fault: ?*Fault = null,
+    /// Runs `:db.fn/call` forms; without it they are `error.TxFn`.
+    hook: ?CallHook = null,
 };
 
 /// A tempid as the caller wrote it.
@@ -161,6 +186,31 @@ pub fn transactOps(conn: *Conn, arena: Allocator, ops: []const Op, options: Opti
     try ctx.ops.ensureTotalCapacityPrecise(arena, ops.len);
     for (ops) |op| try ctx.normaliseOp(op);
     return ctx.run();
+}
+
+pub const ExciseReport = struct {
+    report: Report,
+    /// The entity whose datoms went.
+    excised: u64,
+    /// History rows removed.
+    removed: u64,
+};
+
+/// Excise the datoms of entity `e` (a VM entity reference), under the
+/// attribute `a` when given (NEXTOMIC.md §4 "Excision"): one
+/// transaction whose only datom is its `:db/txInstant`, whose txlog
+/// entry carries the marker, and inside whose write transaction the
+/// datoms leave every tree and every txlog entry that held them.
+pub fn excise(conn: *Conn, arena: Allocator, e: Value, a: ?Value, options: Options) !ExciseReport {
+    var ctx = try Ctx.begin(conn, arena, options);
+    errdefer ctx.abort();
+    const ent = try ctx.entityFromVm(e);
+    if (ent == .tempid) return ctx.malformed("excision takes an existing entity");
+    const attr: ?Attr = if (a) |x| try ctx.attrFromVm(x) else null;
+    ctx.excision = .{ .e = ent, .a = attr };
+    try ctx.apply();
+    const report = try ctx.commit();
+    return .{ .report = report, .excised = ctx.excised[0], .removed = ctx.removed };
 }
 
 /// A speculative transaction (NEXTOMIC.md §6, row `with`): tx-data
@@ -280,13 +330,24 @@ const PVal = union(enum) {
     val: Val,
     tempid: u32,
     lookup: *const Lookup,
+    /// A `:db/ident` value by VM keyword id, settled by `bindIdents`:
+    /// the keyword may name the entity already, be fresh (minted for a
+    /// new entity, or renaming an attribute entity), or belong to
+    /// another entity (a conflict).
+    ident: u32,
 };
+
+/// `[:db.fn/cas e a old new]`: assert `new` when the current value of
+/// the card-one `(e a)` is `old` (absent when `old` is null). In the
+/// arena: the rare case, kept off the common op's size.
+const CasOp = struct { e: Ent, attr: Attr, old: ?PVal, new: PVal };
 
 const ROp = union(enum) {
     add: struct { e: Ent, attr: Attr, v: PVal },
     retract: struct { e: Ent, attr: Attr, v: PVal },
     retract_attr: struct { e: Ent, attr: Attr },
     retract_entity: Ent,
+    cas: *const CasOp,
 };
 
 const Binding = struct {
@@ -318,7 +379,10 @@ const Ctx = struct {
     schema: *Schema,
     minter: Minter,
     fault: ?*Fault,
+    hook: ?CallHook,
     finished: bool = false,
+    /// Nesting of the `:db.fn/call` whose result is being normalised.
+    call_depth: u32 = 0,
 
     bindings: std.ArrayList(Binding) = .empty,
     str_tempids: std.StringHashMapUnmanaged(u32) = .empty,
@@ -344,12 +408,24 @@ const Ctx = struct {
     deltas: std.AutoHashMapUnmanaged(u32, i64) = .empty,
     /// The transaction's datoms in write order, built once by `write`.
     tx_data: []Datom = &.{},
+    /// The excision this transaction records, if it is one.
+    excision: ?struct { e: Ent, a: ?Attr } = null,
+    /// The marker of this transaction's txlog entry: the excised entity.
+    excised: []const u64 = &.{},
+    /// History rows an excision removed.
+    removed: u64 = 0,
 
     fn begin(conn: *Conn, arena: Allocator, options: Options) !Ctx {
         if (!conn.is_open) return error.Closed;
         if (conn.speculative != null or conn.overlay != null) return error.Nested;
         const sync_mode = options.sync orelse conn.sync_mode;
-        const txn = try conn.beginWriteTxn(sync_mode);
+        // The engine has one writer: a transaction function that
+        // transacts on its own connection, or on another connection to
+        // the same file, meets the write transaction it runs inside.
+        const txn = conn.beginWriteTxn(sync_mode) catch |err| switch (err) {
+            error.WriterActive => return error.Nested,
+            else => return err,
+        };
         errdefer {
             txn.abort();
             conn.taskDone();
@@ -368,6 +444,7 @@ const Ctx = struct {
             .schema = schema,
             .minter = try Minter.init(&conn.idents, txn, arena),
             .fault = options.fault,
+            .hook = options.hook,
             .next_eid = try conn.store.readNextEid(txn),
         };
     }
@@ -396,6 +473,34 @@ const Ctx = struct {
     fn malformed(self: *Ctx, message: []const u8) error{TxData} {
         if (self.fault) |f| f.* = .{ .message = message };
         return error.TxData;
+    }
+
+    /// `TxFn` with the reason.
+    fn txFn(self: *Ctx, message: []const u8) error{TxFn} {
+        if (self.fault) |f| f.* = .{ .message = message };
+        return error.TxFn;
+    }
+
+    /// `Cas`: `attr` holds `actual` where the form expected `expected`.
+    fn cas(self: *Ctx, attr: Attr, expected: ?Val, actual: ?Val) error{Cas} {
+        if (self.fault) |f| f.* = .{ .attr = self.attrValue(attr.id), .cas = .{ .expected = expected, .actual = actual } };
+        return error.Cas;
+    }
+
+    /// `Schema`: the change to attribute `a` is refused for `message`,
+    /// by entity `e` when one is at fault.
+    fn schemaRefused(self: *Ctx, a: u32, e: ?u64, message: []const u8) error{Schema} {
+        if (self.fault) |f| f.* = .{ .attr = self.attrValue(a), .e = e, .message = message };
+        return error.Schema;
+    }
+
+    /// The ident id of keyword `k`, minted when new; a name retired by
+    /// a rename is malformed tx-data.
+    fn mintKeyword(self: *Ctx, k: u32) !u32 {
+        return self.minter.resolve(k) catch |err| switch (err) {
+            error.RetiredIdent => self.malformed("a retired ident name is never reused"),
+            else => err,
+        };
     }
 
     /// The attribute as a program names it: its ident, else its id.
@@ -546,7 +651,8 @@ const Ctx = struct {
             },
             .keyword => |k| {
                 if (attr.value_type != .keyword) return error.ValueType;
-                return .{ .val = .{ .keyword = try self.minter.resolve(k) } };
+                if (attr.id == boot.ident) return .{ .ident = k };
+                return .{ .val = .{ .keyword = try self.mintKeyword(k) } };
             },
             .vm => |x| return self.valueFromVm(attr, x),
         }
@@ -575,7 +681,7 @@ const Ctx = struct {
         return v.kind() == .keyword and std.mem.eql(u8, self.conn.interner.keywordName(v.asKeywordId()), name);
     }
 
-    fn normaliseValue(self: *Ctx, tx_data: Value) !void {
+    fn normaliseValue(self: *Ctx, tx_data: Value) anyerror!void {
         switch (tx_data.kind()) {
             .persistent_vector => {
                 try self.ops.ensureTotalCapacityPrecise(self.arena, vector_mod.count(tx_data));
@@ -591,13 +697,23 @@ const Ctx = struct {
         }
     }
 
-    fn normaliseForm(self: *Ctx, form: Value) !void {
+    fn normaliseForm(self: *Ctx, form: Value) anyerror!void {
         switch (form.kind()) {
             .persistent_vector => {
                 const n = vector_mod.count(form);
                 if (n < 2) return self.malformed("a vector form is [op e ...]");
                 const op = vector_mod.nth(form, 0);
-                if (self.kwIs(op, "db/add")) {
+                if (self.kwIs(op, "db.fn/call")) {
+                    try self.normaliseCall(form);
+                } else if (self.kwIs(op, "db.fn/cas")) {
+                    if (n != 5) return self.malformed(":db.fn/cas is [:db.fn/cas e a old new]");
+                    const attr = try self.attrFromVm(vector_mod.nth(form, 2));
+                    const e = try self.entityFromVm(vector_mod.nth(form, 1));
+                    const old_v = vector_mod.nth(form, 3);
+                    const op_cas = try self.arena.create(CasOp);
+                    op_cas.* = .{ .e = e, .attr = attr, .old = if (old_v.isNil()) null else try self.valueFromVm(attr, old_v), .new = try self.valueFromVm(attr, vector_mod.nth(form, 4)) };
+                    try self.ops.append(self.arena, .{ .cas = op_cas });
+                } else if (self.kwIs(op, "db/add")) {
                     if (n != 4) return self.malformed(":db/add is [:db/add e a v]");
                     const attr = try self.attrFromVm(vector_mod.nth(form, 2));
                     const e = try self.entityFromVm(vector_mod.nth(form, 1));
@@ -614,11 +730,36 @@ const Ctx = struct {
                 } else if (self.kwIs(op, "db/retractEntity")) {
                     if (n != 2) return self.malformed(":db/retractEntity is [:db/retractEntity e]");
                     try self.ops.append(self.arena, .{ .retract_entity = try self.entityFromVm(vector_mod.nth(form, 1)) });
-                } else return self.malformed("unknown op; one of :db/add, :db/retract, :db/retractEntity");
+                } else return self.malformed("unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas");
             },
             .persistent_map => _ = try self.normaliseMap(form),
             else => return self.malformed("a form is a vector or a map"),
         }
+    }
+
+    /// `[:db.fn/call f arg ...]`: call `f` with `db-before` and the
+    /// arguments, then normalise the tx-data it returns in place of the
+    /// form, where further calls may nest to `max_call_depth`. The
+    /// function value is called, never stored: only the datoms it
+    /// returns reach the trees and the txlog. A nil result is no
+    /// tx-data.
+    fn normaliseCall(self: *Ctx, form: Value) anyerror!void {
+        const hook = self.hook orelse return self.txFn("transaction functions run inside transact! and with only");
+        const f = vector_mod.nth(form, 1);
+        switch (f.kind()) {
+            .function, .native_fn, .symbol => {},
+            else => return self.malformed(":db.fn/call takes a function or a symbol naming one"),
+        }
+        if (self.call_depth >= max_call_depth) return self.txFn("transaction functions nest past the depth limit");
+        const n = vector_mod.count(form);
+        const args = try self.arena.alloc(Value, n - 2);
+        for (args, 2..) |*a, i| a.* = vector_mod.nth(form, i);
+        const db_before: DbValue = .{ .conn = self.conn, .basis = self.now };
+        const result = try hook.call(hook.ctx, f, db_before, args);
+        if (result.isNil()) return;
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+        try self.normaliseValue(result);
     }
 
     /// Expand a map form into adds; returns the entity. A key
@@ -783,7 +924,8 @@ const Ctx = struct {
             },
             .keyword => {
                 if (v.kind() != .keyword) return error.ValueType;
-                return .{ .val = .{ .keyword = try self.minter.resolve(v.asKeywordId()) } };
+                if (attr.id == boot.ident) return .{ .ident = v.asKeywordId() };
+                return .{ .val = .{ .keyword = try self.mintKeyword(v.asKeywordId()) } };
             },
             .ref => {
                 const e = self.entityFromVm(v) catch |err| switch (err) {
@@ -822,11 +964,51 @@ const Ctx = struct {
     /// the write transaction open with the datoms, txlog and counters
     /// written.
     fn apply(self: *Ctx) !void {
+        try self.bindIdents();
         try self.bindTempids();
         try self.expandAll();
         try self.txInstant();
         try self.applySchema();
+        if (self.excision) |x| {
+            // Resolved before the write, which marks the entry with it.
+            const e = try self.resolveEnt(x.e);
+            if (e < key.user_partition_start or e >= key.user_partition_end) return self.malformed("excision takes a user entity");
+            self.excised = try self.arena.dupe(u64, &.{e});
+        }
         try self.write();
+        if (self.excision) |x| try self.runExcision(self.excised[0], if (x.a) |attr| attr.id else null);
+    }
+
+    /// Remove the datoms of `e` (under `a`) from the trees and the
+    /// txlog entries that held them, and settle the attribute counts.
+    fn runExcision(self: *Ctx, e: u64, a: ?u32) !void {
+        const store = self.conn.store;
+        const out = try excise_mod.removeDatoms(store, self.txn, self.arena, self.schema, e, a);
+        self.removed = out.removed;
+        var it = out.counts.iterator();
+        while (it.next()) |entry| {
+            const cur = try store.attrCount(self.txn, entry.key_ptr.*);
+            if (cur < entry.value_ptr.*) return error.Corrupted;
+            try store.writeAttrCount(self.txn, entry.key_ptr.*, cur - entry.value_ptr.*);
+            const g = try self.deltas.getOrPut(self.arena, entry.key_ptr.*);
+            if (!g.found_existing) g.value_ptr.* = 0;
+            g.value_ptr.* -= @intCast(entry.value_ptr.*);
+        }
+        const ids: datom_mod.IdSource = .{ .ctx = @ptrCast(self), .identId = &identIdOf, .attrType = &attrTypeOf };
+        const names: datom_mod.NameSource = .{ .ctx = @ptrCast(self), .identName = &identName };
+        try excise_mod.rewriteTxlog(store, self.txn, self.arena, out.ts, e, a, ids, names);
+    }
+
+    fn identIdOf(ctx: *anyopaque, name: []const u8) anyerror!?u32 {
+        const self: *Ctx = @ptrCast(@alignCast(ctx));
+        if (try self.minter.lookupName(name)) |id| return id;
+        return self.conn.store.retiredIdentId(self.txn, name);
+    }
+
+    fn attrTypeOf(ctx: *anyopaque, a: u32) anyerror!?key.ValueType {
+        const self: *Ctx = @ptrCast(@alignCast(ctx));
+        const attr = self.schema.attr(a) orelse return null;
+        return attr.value_type;
     }
 
     /// Commit, then publish the mints and update the schema
@@ -861,6 +1043,61 @@ const Ctx = struct {
             .tempids = tempids,
             .tx_data = self.tx_data,
         };
+    }
+
+    // ── idents ────────────────────────────────────────────────────
+
+    /// Settle every `:db/ident` value (NEXTOMIC.md §3 step 5). An
+    /// assertion on a tempid mints the keyword when it is new, and the
+    /// tempid takes the ident's id. On an entity that exists: a keyword
+    /// naming it already is a no-op, one naming another entity a
+    /// conflict, and a fresh keyword on an attribute-partition entity
+    /// renames it, retiring the old name. A retraction resolves the
+    /// keyword as any value.
+    fn bindIdents(self: *Ctx) !void {
+        for (self.ops.items) |*op| {
+            const slot: *PVal = switch (op.*) {
+                .add => |*o| if (o.attr.id == boot.ident) &o.v else continue,
+                .retract => |*o| if (o.attr.id == boot.ident) &o.v else continue,
+                .cas => |c| blk: {
+                    const mutable: *CasOp = @constCast(c);
+                    if (mutable.old) |*old| if (old.* == .ident) {
+                        old.* = .{ .val = .{ .keyword = try self.mintKeyword(old.ident) } };
+                    };
+                    break :blk &mutable.new;
+                },
+                else => continue,
+            };
+            if (slot.* != .ident) continue;
+            const k = slot.ident;
+            if (op.* != .add) {
+                slot.* = .{ .val = .{ .keyword = try self.mintKeyword(k) } };
+                continue;
+            }
+            const existing = try self.minter.lookup(k);
+            const e: ?u64 = switch (op.add.e) {
+                .eid => |id| id,
+                .tempid => null,
+                .lookup => |l| blk: {
+                    const vb = try key.valBytes(self.arena, l.v);
+                    break :blk (try self.probeAvet(l.attr.id, vb)) orelse return error.NoEntity;
+                },
+            };
+            const id: u32 = blk: {
+                const eid = e orelse break :blk existing orelse try self.mintKeyword(k);
+                if (existing) |x| {
+                    if (x != eid) return self.conflict(eid, boot.ident);
+                    break :blk x;
+                }
+                if (!key.isAttrPartition(eid)) return self.conflict(eid, boot.ident);
+                self.minter.rename(@intCast(eid), k) catch |err| switch (err) {
+                    error.RetiredIdent => return self.malformed("a retired ident name is never reused"),
+                    else => return err,
+                };
+                break :blk @intCast(eid);
+            };
+            slot.* = .{ .val = .{ .keyword = id } };
+        }
     }
 
     // ── tempids ───────────────────────────────────────────────────
@@ -906,7 +1143,7 @@ const Ctx = struct {
                         // tempid, wherever the identity is asserted.
                         if (target) |t| self.ops.items[d.op].add.v = .{ .tempid = t };
                     },
-                    .val => unreachable,
+                    .val, .ident => unreachable,
                 }
                 if (eid == null) if (target) |t| {
                     eid = self.bindings.items[self.root(t)].eid;
@@ -1008,6 +1245,7 @@ const Ctx = struct {
                 const vb = try key.valBytes(self.arena, l.v);
                 break :blk .{ .ref = (try self.findByAv(l.attr.id, vb)) orelse return error.NoEntity };
             },
+            .ident => unreachable,
         };
     }
 
@@ -1029,8 +1267,24 @@ const Ctx = struct {
                     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
                     try self.expandRetractEntity(try self.resolveEnt(e), &seen);
                 },
+                .cas => |o| {
+                    const old: ?Val = if (o.old) |v| try self.resolveVal(v) else null;
+                    try self.expandCas(try self.resolveEnt(o.e), o.attr, old, try self.resolveVal(o.new));
+                },
             }
         }
+    }
+
+    /// `:db.fn/cas`: the committed value of the card-one `(e a)`, less
+    /// what this transaction retracted, must be `old` (absent when `old`
+    /// is null); then `new` is asserted as an ordinary add.
+    fn expandCas(self: *Ctx, e: u64, attr: Attr, old: ?Val, new: Val) !void {
+        if (attr.many()) return self.malformed(":db.fn/cas takes a cardinality-one attribute");
+        const current = try self.currentOne(e, attr.id);
+        const actual: ?Val = if (current) |c| c.val else null;
+        const matches = if (old) |o| (if (actual) |a| a.eql(o) else false) else actual == null;
+        if (!matches) return self.cas(attr, old, actual);
+        try self.expandAdd(e, attr, new);
     }
 
     fn checkAttrValue(self: *Ctx, e: u64, attr: Attr, v: Val) !void {
@@ -1219,26 +1473,65 @@ const Ctx = struct {
 
     // ── schema ────────────────────────────────────────────────────
 
-    /// Attribute entities: a new attribute needs `:db/valueType` and
-    /// `:db/cardinality`; an existing one keeps both; adding
-    /// `:db/index` or `:db/unique` backfills AVET from AEVT.
+    /// Attribute entities (NEXTOMIC.md §3 step 5): a new attribute needs
+    /// `:db/valueType` and `:db/cardinality`; `:db/valueType` never
+    /// changes; `:db/cardinality` may go one → many, and many → one
+    /// while no entity holds two values; adding `:db/index` or
+    /// `:db/unique` backfills AVET from AEVT; none of them is retracted.
     fn applySchema(self: *Ctx) !void {
         if (!self.schema_touched) return;
-        var new_attrs: std.AutoHashMapUnmanaged(u32, struct { has_type: bool = false, has_card: bool = false, many: bool = false }) = .empty;
+        var new_attrs: std.AutoHashMapUnmanaged(u32, struct { has_type: bool = false, has_card: bool = false, many: bool = false, string: bool = false }) = .empty;
         var backfill: std.AutoHashMapUnmanaged(u32, Attr) = .empty;
         var unique_added: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        // Attributes gaining `:db/fulltext true`: existing ones backfill
+        // the tokens tree, new ones must be strings.
+        var fulltext_backfill: std.AutoHashMapUnmanaged(u32, Attr) = .empty;
+        var fulltext_new: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        const fulltext_aid = self.conn.store.fulltext_aid;
+        // The card-one overwrite of `:db/cardinality` retracts the old
+        // value beside the new one; that retraction is the change, not
+        // a removal.
+        var card_changed: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        for (self.overlay.items) |p| {
+            if (key.isAttrPartition(p.e) and p.attr.id == boot.cardinality and p.added) try card_changed.put(self.arena, @intCast(p.e), {});
+        }
         for (self.overlay.items) |p| {
             if (!key.isAttrPartition(p.e)) continue;
             const a: u32 = @intCast(p.e);
             const existing = self.schema.attr(a);
+            if (p.attr.id == fulltext_aid) {
+                if (!p.added) return self.conflict(p.e, p.attr.id);
+                if (!p.v.boolean) continue;
+                if (existing) |ex| {
+                    if (ex.value_type != .string) return self.schemaRefused(a, null, ":db/fulltext takes a string attribute");
+                    if (!ex.fulltext) try fulltext_backfill.put(self.arena, a, ex.*);
+                } else try fulltext_new.put(self.arena, a, {});
+                continue;
+            }
             switch (p.attr.id) {
-                boot.value_type, boot.cardinality => {
-                    if (!p.added) return self.conflict(p.e, p.attr.id);
-                    if (existing != null) return self.conflict(p.e, p.attr.id);
+                boot.value_type => {
+                    if (!p.added or existing != null) return self.conflict(p.e, p.attr.id);
                     const g = try new_attrs.getOrPut(self.arena, a);
                     if (!g.found_existing) g.value_ptr.* = .{};
-                    if (p.attr.id == boot.value_type) g.value_ptr.has_type = true else g.value_ptr.has_card = true;
-                    if (p.attr.id == boot.cardinality and p.v.keyword == boot.card_many) g.value_ptr.many = true;
+                    g.value_ptr.has_type = true;
+                    g.value_ptr.string = p.v.keyword == boot.type_string;
+                },
+                boot.cardinality => {
+                    const many = p.v.keyword == boot.card_many;
+                    if (!p.added) {
+                        if (card_changed.get(a) == null) return self.conflict(p.e, p.attr.id);
+                        continue;
+                    }
+                    if (existing) |ex| {
+                        if (many == ex.many()) continue;
+                        if (many and ex.unique != .none) return self.schemaRefused(a, null, "a unique attribute is cardinality one");
+                        if (!many) try self.checkSingleValued(ex.*);
+                        continue;
+                    }
+                    const g = try new_attrs.getOrPut(self.arena, a);
+                    if (!g.found_existing) g.value_ptr.* = .{};
+                    g.value_ptr.has_card = true;
+                    if (many) g.value_ptr.many = true;
                 },
                 boot.unique, boot.index => {
                     if (!p.added) return self.conflict(p.e, p.attr.id);
@@ -1263,11 +1556,58 @@ const Ctx = struct {
         // is card-one.
         var uit = unique_added.keyIterator();
         while (uit.next()) |a| {
-            const many = if (self.schema.attr(a.*)) |ex| ex.many() else new_attrs.get(a.*).?.many;
+            const many = if (self.schema.attr(a.*)) |ex| (if (card_changed.get(a.*) != null) !ex.many() else ex.many()) else new_attrs.get(a.*).?.many;
             if (many) return self.malformed("a unique attribute is cardinality one");
+        }
+        var fit = fulltext_new.keyIterator();
+        while (fit.next()) |a| {
+            const n = new_attrs.get(a.*) orelse return self.schemaRefused(a.*, null, ":db/fulltext takes a string attribute");
+            if (!n.string) return self.schemaRefused(a.*, null, ":db/fulltext takes a string attribute");
         }
         var bit = backfill.iterator();
         while (bit.next()) |e| try self.backfillAvet(e.value_ptr.*);
+        var fbit = fulltext_backfill.iterator();
+        while (fbit.next()) |e| try self.backfillFulltext(e.value_ptr.*);
+        // Pending string datoms of an attribute that is full-text from
+        // this transaction on belong in the tokens tree too.
+        for (self.overlay.items) |*p| {
+            if (fulltext_backfill.contains(p.attr.id) or fulltext_new.contains(p.attr.id)) p.attr.fulltext = true;
+        }
+    }
+
+    /// Index every current string value of the attribute in the tokens
+    /// tree, less this transaction's retractions.
+    fn backfillFulltext(self: *Ctx, attr: Attr) !void {
+        const store = self.conn.store;
+        var live = try self.liveRows(.aevt, .{ .a = attr.id });
+        while (try live.next()) |r| {
+            if (r.pending) |p| if (!p.added) continue;
+            const v = try self.valFromParts(r.parts);
+            try fulltext.index(store, self.txn, self.arena, attr.id, r.parts.e, v.string, true);
+        }
+    }
+
+    /// An attribute becoming cardinality one: no entity may hold two
+    /// values, in the tree less this transaction's retractions, or
+    /// counting its assertions.
+    fn checkSingleValued(self: *Ctx, attr: Attr) !void {
+        var rows = try self.liveRows(.aevt, .{ .a = attr.id });
+        var prev: ?u64 = null;
+        while (try rows.next()) |r| {
+            if (r.pending) |p| if (!p.added) continue;
+            if (prev) |e| if (e == r.parts.e) return self.schemaRefused(attr.id, e, "an entity holds two values; cardinality stays many");
+            prev = r.parts.e;
+        }
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (self.overlay.items) |p| {
+            if (p.attr.id != attr.id or !p.added) continue;
+            if ((try seen.getOrPut(self.arena, p.e)).found_existing) return self.schemaRefused(attr.id, p.e, "an entity holds two values; cardinality stays many");
+            var live = try self.liveRows(.eavt, .{ .e = p.e, .a = attr.id });
+            while (try live.next()) |r| {
+                if (r.pending != null) continue;
+                return self.schemaRefused(attr.id, p.e, "an entity holds two values; cardinality stays many");
+            }
+        }
     }
 
     /// An indexed attribute becoming unique: no value may be held by two
@@ -1355,6 +1695,7 @@ const Ctx = struct {
             const g = try counts.getOrPut(self.arena, p.attr.id);
             if (!g.found_existing) g.value_ptr.* = 0;
             g.value_ptr.* += if (p.added) 1 else -1;
+            if (p.attr.fulltext and p.v == .string) try fulltext.index(store, self.txn, self.arena, p.attr.id, p.e, p.v.string, p.added);
         }
         try store.writeBatch(self.txn, self.t, batch, self.arena);
 
@@ -1372,7 +1713,7 @@ const Ctx = struct {
         var scratch = std.heap.ArenaAllocator.init(self.conn.gpa);
         defer scratch.deinit();
         const names: datom_mod.NameSource = .{ .ctx = @ptrCast(self), .identName = &identName };
-        const entry = try datom_mod.encodeTxlog(scratch.allocator(), self.now_ms, self.tx_data, names);
+        const entry = try datom_mod.encodeTxlog(scratch.allocator(), self.now_ms, self.tx_data, self.excised, names);
         try store.putTxlog(self.txn, self.t, entry);
 
         try store.writeT(self.txn, self.t);
@@ -1690,7 +2031,7 @@ test "schema changes: index backfill, unique backfill refusal, immutable type" {
     try testing.expectError(error.Unique, transactOps(tc.conn, arena, &.{
         .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_value } } } },
     }, .{}));
-    // Value type and cardinality never change.
+    // Value type never changes.
     try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{
         .{ .add = .{ .e = .{ .eid = age }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_string } } } },
     }, .{}));
@@ -2819,4 +3160,386 @@ test "a held with keeps the store open until finish; a closed connection refuses
     try testing.expectError(error.Closed, w.db().entity(arena, a));
     try testing.expectError(error.Closed, transactOps(tc.conn, arena, &.{}, .{}));
     try testing.expectError(error.Closed, withOps(tc.conn, arena, &.{}, .{}));
+}
+
+test "an ident rename retires the old name; cardinality changes under the data's rule" {
+    const tc = try TestConn.init("tx_alter");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const email = try attrId(tc, "user/email");
+    const tags = try attrId(tc, "user/tags");
+    var fault: Fault = .{};
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = tags }, .v = .{ .keyword = try kw(tc, "tag/x") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = tags }, .v = .{ .keyword = try kw(tc, "tag/y") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Bob" } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    const b = r1.tempids[1].eid;
+
+    // Rename: no datom, the new keyword resolves, the old is retired.
+    const k_full = try kw(tc, "user/full-name");
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.ident }, .v = .{ .keyword = k_full } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 1), r2.tx_data.len);
+    const db2 = try tc.conn.db();
+    try testing.expectEqual(@as(?u64, name), try db2.entid(arena, .{ .ident = k_full }));
+    try testing.expect((try db2.entid(arena, .{ .ident = try kw(tc, "user/name") })) == null);
+    try testing.expectEqual(@as(?u32, k_full), try db2.ident(arena, name));
+    try testing.expectEqual(@as(?u32, k_full), try db2.asOf(r1.t).ident(arena, name));
+    try testing.expectError(error.UnknownAttribute, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .ident = try kw(tc, "user/name") }, .v = .{ .val = .{ .string = "x" } } } },
+    }, .{}));
+    // The retired name is never minted again, as an attribute or a value.
+    try testing.expectError(error.TxData, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = boot.ident }, .v = .{ .keyword = try kw(tc, "user/name") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_string } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+    }, .{}));
+    try testing.expectError(error.TxData, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = tags }, .v = .{ .keyword = try kw(tc, "user/name") } } },
+    }, .{}));
+    // A keyword naming another entity conflicts; the entity's own ident is a no-op.
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.ident }, .v = .{ .keyword = try kw(tc, "user/email") } } },
+    }, .{}));
+    const r3 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.ident }, .v = .{ .keyword = k_full } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 1), r3.tx_data.len);
+    // The txlog still decodes the entry written under the old name.
+    const entries = try db_mod.txRange(tc.conn, arena, 2, 3);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    var saw_name = false;
+    for (entries[0].datoms) |d| {
+        if (d.a == boot.ident and d.v.keyword == name) saw_name = true;
+    }
+    try testing.expect(saw_name);
+    // A second connection sees the rename through the generation.
+    {
+        const other = try Conn.open(testing.allocator, &tc.interner, tc.td.path.ptr, .{ .sync = .none });
+        defer other.destroy();
+        const odb = try other.db();
+        try testing.expectEqual(@as(?u64, name), try odb.entid(arena, .{ .ident = k_full }));
+        try testing.expect((try odb.entid(arena, .{ .ident = try kw(tc, "user/name") })) == null);
+        try testing.expectEqual(@as(?u32, k_full), try odb.ident(arena, name));
+    }
+
+    // Cardinality one → many: the attribute takes a second value; an
+    // earlier basis still reads it as card-one.
+    const r4 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_many } } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 3), r4.tx_data.len);
+    const r5 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Annie" } } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 2), r5.tx_data.len);
+    const db5 = try tc.conn.db();
+    try testing.expect((try db5.attr(name)).?.many());
+    try testing.expect(!(try db5.asOf(r1.t).attr(name)).?.many());
+    try testing.expectEqual(@as(usize, 2), (try db5.entity(arena, a))[0].vals.len);
+    try testing.expectEqual(@as(usize, 1), (try db5.asOf(r1.t).entity(arena, a))[0].vals.len);
+
+    // Many → one is refused while `a` holds two values, naming it.
+    try testing.expectError(error.Schema, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+    }, .{ .fault = &fault }));
+    try testing.expectEqual(@as(?u64, a), fault.e);
+    try testing.expectEqual(k_full, fault.attr.?.asKeywordId());
+    // Retracting in the same transaction makes room; a second value asserted in it does not.
+    try testing.expectError(error.Schema, transactOps(tc.conn, arena, &.{
+        .{ .retract = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+        .{ .add = .{ .e = .{ .eid = b }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Bobby" } } } },
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+    }, .{ .fault = &fault }));
+    try testing.expectEqual(@as(?u64, b), fault.e);
+    const r6 = try transactOps(tc.conn, arena, &.{
+        .{ .retract = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+    }, .{});
+    const db6 = try tc.conn.db();
+    try testing.expect(!(try db6.attr(name)).?.many());
+    try testing.expect((try db6.asOf(r5.t).attr(name)).?.many());
+    try testing.expectEqual(@as(usize, 3), (try db6.attr(name)).?.card_changes.len);
+    // The card-one rule applies from the next transaction on.
+    const r7 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Anne" } } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 3), r7.tx_data.len);
+    _ = r6;
+    // A unique attribute stays card-one; a bare retraction of the cardinality is a conflict.
+    try testing.expectError(error.Schema, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = email }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_many } } } },
+    }, .{}));
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{
+        .{ .retract = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+    }, .{}));
+}
+
+test "excision removes an entity's datoms from every view and rewrites the txlog" {
+    const tc = try TestConn.init("tx_excise");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const name = try attrId(tc, "user/name");
+    const friend = try attrId(tc, "user/friend");
+    var fault: Fault = .{};
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Bob" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = friend }, .v = .{ .entity = .{ .tempid = .{ .string = "a" } } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    const b = r1.tempids[1].eid;
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Anne" } } } },
+    }, .{});
+    const before = try tc.conn.db();
+
+    // One attribute: its rows go from every view, the rest stay.
+    const x = try excise(tc.conn, arena, value.fromFixnum(@intCast(a)).?, value.fromFixnum(name).?, .{});
+    try testing.expectEqual(r2.t + 1, x.report.t);
+    try testing.expectEqual(a, x.excised);
+    try testing.expectEqual(@as(u64, 3), x.removed);
+    try testing.expectEqual(@as(usize, 1), x.report.tx_data.len);
+    const db3 = try tc.conn.db();
+    try testing.expectEqual(@as(usize, 1), (try db3.entity(arena, a)).len);
+    try testing.expectEqual(email, (try db3.entity(arena, a))[0].a);
+    try testing.expectEqual(@as(usize, 1), (try before.entity(arena, a)).len);
+    try testing.expectEqual(@as(usize, 0), (try db3.withHistory().datoms(arena, .eavt, .{ .e = a, .a = name })).len);
+    try testing.expectEqual(@as(usize, 0), (try db3.datoms(arena, .aevt, .{ .a = name, .e = a })).len);
+    try testing.expectEqual(@as(usize, 1), (try db3.datoms(arena, .aevt, .{ .a = name })).len);
+    try testing.expectEqual(@as(u64, 1), (try db3.attr(name)).?.count);
+    // The txlog: the entries that held the datoms lost them and carry
+    // the marker; the excising entry carries it too.
+    const log = try db_mod.txRange(tc.conn, arena, r1.t, null);
+    try testing.expectEqual(@as(usize, 3), log.len);
+    try testing.expectEqualSlices(u64, &.{a}, log[0].excised);
+    try testing.expectEqual(@as(usize, 4), log[0].datoms.len);
+    try testing.expectEqualSlices(u64, &.{a}, log[1].excised);
+    try testing.expectEqual(@as(usize, 1), log[1].datoms.len);
+    try testing.expectEqual(boot.tx_instant, log[1].datoms[0].a);
+    try testing.expectEqualSlices(u64, &.{a}, log[2].excised);
+    for (log) |entry| for (entry.datoms) |d| try testing.expect(!(d.e == a and d.a == name));
+
+    // The whole entity: gone everywhere; the ref to it from `b` stays.
+    const y = try excise(tc.conn, arena, value.fromFixnum(@intCast(a)).?, null, .{});
+    try testing.expectEqual(@as(u64, 1), y.removed);
+    const db4 = try tc.conn.db();
+    try testing.expectEqual(@as(usize, 0), (try db4.entity(arena, a)).len);
+    try testing.expectEqual(@as(usize, 0), (try before.entity(arena, a)).len);
+    try testing.expect((try db4.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a@x" } } })) == null);
+    try testing.expectEqual(@as(usize, 2), (try db4.entity(arena, b)).len);
+    try testing.expectEqual(a, (try db4.entity(arena, b))[1].vals[0].ref);
+    try testing.expectEqual(@as(usize, 1), (try db4.datoms(arena, .vaet, .{ .v = try key.valBytes(arena, .{ .ref = a }) })).len);
+    const log2 = try db_mod.txRange(tc.conn, arena, r1.t, r1.t + 1);
+    try testing.expectEqual(@as(usize, 3), log2[0].datoms.len);
+    for (log2[0].datoms) |d| try testing.expect(d.e == b or d.e == key.txEntity(r1.t));
+    // An excised entity is still addressable: excising it again removes nothing.
+    const z = try excise(tc.conn, arena, value.fromFixnum(@intCast(a)).?, null, .{});
+    try testing.expectEqual(@as(u64, 0), z.removed);
+
+    // Refusals: an attribute or transaction entity, a tempid, an
+    // unallocated id, an unknown attribute; nothing is recorded.
+    const basis = (try tc.conn.db()).basis;
+    try testing.expectError(error.TxData, excise(tc.conn, arena, value.fromFixnum(name).?, null, .{ .fault = &fault }));
+    try testing.expectError(error.TxData, excise(tc.conn, arena, value.fromFixnum(@intCast(key.txEntity(r1.t))).?, null, .{}));
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    try testing.expectError(error.TxData, excise(tc.conn, arena, try string_mod.fromBytes(&heap, "tmp"), null, .{}));
+    try testing.expectError(error.NoEntity, excise(tc.conn, arena, value.fromFixnum(@intCast(key.user_partition_start + 99)).?, null, .{}));
+    try testing.expectError(error.UnknownAttribute, excise(tc.conn, arena, value.fromFixnum(@intCast(b)).?, value.fromFixnum(9999).?, .{ .fault = &fault }));
+    try testing.expectEqual(basis, (try tc.conn.db()).basis);
+    // Inside a held `with`, excision is nested.
+    const w = try withOps(tc.conn, arena, &.{}, .{});
+    defer w.destroy();
+    try testing.expectError(error.Nested, excise(tc.conn, arena, value.fromFixnum(@intCast(b)).?, null, .{}));
+}
+
+/// `[:db.fn/cas e a old new]` as a VM value; `old` may be nil.
+fn casForm(heap: *@import("heap").Heap, tc: *TestConn, e: Value, attr: []const u8, old: Value, new: Value) !Value {
+    const it = &tc.interner;
+    const form = try vector_mod.fromSlice(heap, &.{ try it.internKeywordValue("db.fn/cas"), e, try it.internKeywordValue(attr), old, new });
+    return vector_mod.fromSlice(heap, &.{form});
+}
+
+test "cas asserts against the committed value and reports what it found" {
+    const tc = try TestConn.init("tx_cas");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    try installSchema(tc, arena);
+    const age = try attrId(tc, "user/age");
+    const name = try attrId(tc, "user/name");
+    const r0 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    const a = r0.tempids[0].eid;
+    const eid = value.fromFixnum(@intCast(a)).?;
+    const nil = value.nilValue();
+    const n = struct {
+        fn n(x: i64) Value {
+            return value.fromFixnum(x).?;
+        }
+    }.n;
+    var fault: Fault = .{};
+
+    // An absent attribute: nil expected succeeds, a value expected fails.
+    const r1 = try transact(tc.conn, arena, try casForm(&heap, tc, eid, "user/age", nil, n(1)), .{});
+    try testing.expectEqual(@as(usize, 2), r1.tx_data.len);
+    try testing.expectEqual(@as(i64, 1), r1.tx_data[0].v.long);
+    try testing.expectError(error.Cas, transact(tc.conn, arena, try casForm(&heap, tc, eid, "user/age", nil, n(2)), .{ .fault = &fault }));
+    try testing.expect(fault.cas.?.expected == null);
+    try testing.expectEqual(@as(i64, 1), fault.cas.?.actual.?.long);
+    try testing.expectEqual(try kw(tc, "user/age"), fault.attr.?.asKeywordId());
+
+    // The right expectation swaps; the wrong one names both values.
+    const r2 = try transact(tc.conn, arena, try casForm(&heap, tc, eid, "user/age", n(1), n(2)), .{});
+    try testing.expectEqual(@as(usize, 3), r2.tx_data.len);
+    try testing.expect(!r2.tx_data[0].added and r2.tx_data[1].added);
+    try testing.expectError(error.Cas, transact(tc.conn, arena, try casForm(&heap, tc, eid, "user/age", n(1), n(3)), .{ .fault = &fault }));
+    try testing.expectEqual(@as(i64, 1), fault.cas.?.expected.?.long);
+    try testing.expectEqual(@as(i64, 2), fault.cas.?.actual.?.long);
+
+    // A retraction earlier in the transaction counts; card-many is refused.
+    const retract = try vector_mod.fromSlice(&heap, &.{ try tc.interner.internKeywordValue("db/retract"), eid, try tc.interner.internKeywordValue("user/age"), n(2) });
+    const both = try vector_mod.fromSlice(&heap, &.{ retract, vector_mod.nth(try casForm(&heap, tc, eid, "user/age", nil, n(9)), 0) });
+    const r3 = try transact(tc.conn, arena, both, .{});
+    try testing.expectEqual(@as(usize, 3), r3.tx_data.len);
+    try testing.expectError(error.TxData, transact(tc.conn, arena, try casForm(&heap, tc, eid, "user/tags", nil, try tc.interner.internKeywordValue("tag/x")), .{}));
+    const ent = try (try tc.conn.db()).entity(arena, a);
+    try testing.expectEqual(age, ent[1].a);
+    try testing.expectEqual(@as(i64, 9), ent[1].vals[0].long);
+}
+
+/// A transaction-function hook for the tests: `f` is a symbol naming
+/// a behaviour, and the hook builds the tx-data the behaviour returns.
+const TestTxHook = struct {
+    tc: *TestConn,
+    heap: *@import("heap").Heap,
+    calls: usize = 0,
+    /// The basis the last call saw.
+    basis: u64 = 0,
+
+    fn hook(self: *TestTxHook) CallHook {
+        return .{ .ctx = @ptrCast(self), .call = &call };
+    }
+
+    fn call(ctx: *anyopaque, f: Value, db_before: DbValue, args: []const Value) anyerror!Value {
+        const self: *TestTxHook = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.basis = db_before.basis;
+        const heap = self.heap;
+        const it = &self.tc.interner;
+        const name = it.symbolName(f.asSymbolId());
+        // Age of `args[0]` becomes `args[1]`.
+        if (std.mem.eql(u8, name, "age!")) {
+            const form = try vector_mod.fromSlice(heap, &.{ try it.internKeywordValue("db/add"), args[0], try it.internKeywordValue("user/age"), args[1] });
+            return vector_mod.fromSlice(heap, &.{form});
+        }
+        // Calls `age!` through a nested call form.
+        if (std.mem.eql(u8, name, "via")) {
+            const form = try vector_mod.fromSlice(heap, &.{ try it.internKeywordValue("db.fn/call"), try it.internSymbolValue("age!"), args[0], args[1] });
+            return vector_mod.fromSlice(heap, &.{form});
+        }
+        // Calls itself forever.
+        if (std.mem.eql(u8, name, "forever")) {
+            const form = try vector_mod.fromSlice(heap, &.{ try it.internKeywordValue("db.fn/call"), f });
+            return vector_mod.fromSlice(heap, &.{form});
+        }
+        // Nothing.
+        if (std.mem.eql(u8, name, "nothing")) return value.nilValue();
+        // Not tx-data.
+        if (std.mem.eql(u8, name, "text")) return string_mod.fromBytes(heap, "nope");
+        return error.UnknownBehaviour;
+    }
+};
+
+test "transaction functions splice their tx-data in place, nest to a bound, and see db-before" {
+    const tc = try TestConn.init("tx_fn");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    try installSchema(tc, arena);
+    const age = try attrId(tc, "user/age");
+    const name = try attrId(tc, "user/name");
+    const r0 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    const a = r0.tempids[0].eid;
+    var th = TestTxHook{ .tc = tc, .heap = &heap };
+    const it = &tc.interner;
+    const call_kw = try it.internKeywordValue("db.fn/call");
+    const eid = value.fromFixnum(@intCast(a)).?;
+    var fault: Fault = .{};
+
+    // Without a hook the form cannot run; nothing is written.
+    const direct = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("age!"), eid, value.fromFixnum(30).? })});
+    try testing.expectError(error.TxFn, transact(tc.conn, arena, direct, .{ .fault = &fault }));
+    try testing.expect(fault.message != null);
+    try testing.expectEqual(r0.t, (try tc.conn.db()).basis);
+
+    // The call's datoms land in place, between the surrounding forms.
+    const add_kw = try it.internKeywordValue("db/add");
+    const name_kw = try it.internKeywordValue("user/name");
+    const before = try vector_mod.fromSlice(&heap, &.{ add_kw, eid, name_kw, try string_mod.fromBytes(&heap, "Anne") });
+    const tx = try vector_mod.fromSlice(&heap, &.{ before, try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("via"), eid, value.fromFixnum(30).? }) });
+    const r1 = try transact(tc.conn, arena, tx, .{ .hook = th.hook() });
+    try testing.expectEqual(@as(usize, 2), th.calls);
+    try testing.expectEqual(r0.t, th.basis);
+    // Anne retract+add, age add, txInstant.
+    try testing.expectEqual(@as(usize, 4), r1.tx_data.len);
+    try testing.expectEqual(name, r1.tx_data[0].a);
+    try testing.expectEqual(age, r1.tx_data[2].a);
+    try testing.expectEqual(@as(i64, 30), r1.tx_data[2].v.long);
+
+    // Unbounded nesting stops at the depth limit with nothing written.
+    const forever = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("forever") })});
+    try testing.expectError(error.TxFn, transact(tc.conn, arena, forever, .{ .hook = th.hook(), .fault = &fault }));
+    try testing.expectEqual(r1.t, (try tc.conn.db()).basis);
+
+    // A nil result is no tx-data; a non-tx-data result is malformed.
+    const nothing = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("nothing") })});
+    const r2 = try transact(tc.conn, arena, nothing, .{ .hook = th.hook() });
+    try testing.expectEqual(@as(usize, 1), r2.tx_data.len);
+    const bad = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("text") })});
+    try testing.expectError(error.TxData, transact(tc.conn, arena, bad, .{ .hook = th.hook() }));
+    // Only a function or a symbol may sit in function position.
+    const not_fn = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try string_mod.fromBytes(&heap, "f") })});
+    try testing.expectError(error.TxData, transact(tc.conn, arena, not_fn, .{ .hook = th.hook() }));
+
+    // A second write on the connection inside a call is nested.
+    const Inner = struct {
+        fn call(ctx: *anyopaque, _: Value, db_before: DbValue, _: []const Value) anyerror!Value {
+            const c: *TestConn = @ptrCast(@alignCast(ctx));
+            var inner_arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer inner_arena.deinit();
+            try testing.expectError(error.Nested, transactOps(c.conn, inner_arena.allocator(), &.{}, .{}));
+            try testing.expectError(error.Nested, withOps(c.conn, inner_arena.allocator(), &.{}, .{}));
+            // Reads of db-before work while the write is held.
+            try testing.expect((try db_before.datoms(inner_arena.allocator(), .eavt, .{ .e = boot.ident })).len > 0);
+            return value.nilValue();
+        }
+    };
+    const inner_hook: CallHook = .{ .ctx = @ptrCast(tc), .call = &Inner.call };
+    _ = try transact(tc.conn, arena, nothing, .{ .hook = inner_hook });
 }

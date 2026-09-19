@@ -67,6 +67,9 @@ pub const Fault = struct {
     e: ?u64 = null,
     value: ?Val = null,
     message: ?[]const u8 = null,
+    /// A failed `:db.fn/cas`: what it expected and what it found, either
+    /// absent when the attribute had no value.
+    cas: ?struct { expected: ?Val, actual: ?Val } = null,
 };
 
 pub const Error = error{
@@ -182,6 +185,8 @@ pub const Conn = struct {
     pub fn beginReadTxn(self: *Conn) !*Txn {
         if (!self.is_open) return error.Closed;
         const txn = if (self.overlay) |w| try self.store.beginReadChild(w) else try self.store.beginRead();
+        errdefer txn.abort();
+        try self.idents.refresh(txn);
         self.busy += 1;
         return txn;
     }
@@ -196,6 +201,8 @@ pub const Conn = struct {
     pub fn beginWriteTxn(self: *Conn, sync_mode: SyncMode) !*Txn {
         if (!self.is_open) return error.Closed;
         const txn = try self.store.beginWrite(sync_mode);
+        errdefer txn.abort();
+        try self.idents.refresh(txn);
         self.busy += 1;
         return txn;
     }
@@ -569,6 +576,8 @@ pub const TxEntry = struct {
     t: u64,
     instant: i64,
     datoms: []Datom,
+    /// The excision marker (§4); empty on an untouched entry.
+    excised: []u64,
 };
 
 /// Txlog entries with `from <= t < to` (an absent `to` runs to the newest).
@@ -596,7 +605,7 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
         const t = key.readId(kv.key[0..key.id_len]);
         const bytes = (try conn.store.getTxlog(txn, t)) orelse return error.Corrupted;
         const entry = try datom_mod.decodeTxlog(arena, bytes, t, ids);
-        try out.append(arena, .{ .t = t, .instant = entry.instant, .datoms = entry.datoms });
+        try out.append(arena, .{ .t = t, .instant = entry.instant, .datoms = entry.datoms, .excised = entry.excised });
     }
     return out.toOwnedSlice(arena);
 }
@@ -606,9 +615,12 @@ const TxCtx = struct {
     txn: *Txn,
     schema: *Schema,
 
+    /// An entry spells a keyword by the name it had when written; a
+    /// name retired by a rename still decodes to its id.
     fn identId(ctx: *anyopaque, name: []const u8) anyerror!?u32 {
         const self: *TxCtx = @ptrCast(@alignCast(ctx));
-        return self.conn.idents.idOfName(self.txn, name);
+        if (try self.conn.idents.idOfName(self.txn, name)) |id| return id;
+        return self.conn.store.retiredIdentId(self.txn, name);
     }
 
     fn attrType(ctx: *anyopaque, a: u32) anyerror!?key.ValueType {

@@ -119,7 +119,7 @@ fn throwSyntax(vm: *VM, message: []const u8, clause: ?usize) VmError {
 // The call hook
 // =============================================================================
 
-const Hook = struct {
+pub const Hook = struct {
     vm: *VM,
 
     fn callHook(self: *Hook) query.CallHook {
@@ -143,7 +143,15 @@ const Hook = struct {
 
     /// The bound value the symbol names, or a thrown
     /// `:nextomic/query-syntax` naming what is missing.
-    fn resolve(self: *Hook, sym: u32) anyerror!Value {
+    pub fn resolve(self: *Hook, sym: u32) anyerror!Value {
+        return (try self.lookup(sym)) orelse self.unknown("unknown function", self.vm.ensureInterner().symbolName(sym));
+    }
+
+    /// The bound value the symbol names as the compiler resolves it: an
+    /// alias-qualified `ns/name` to that namespace's own var, a bare
+    /// name in the current namespace and then its auto-referred
+    /// parents; null when nothing is bound.
+    pub fn lookup(self: *Hook, sym: u32) !?Value {
         const vm = self.vm;
         const name = vm.ensureInterner().symbolName(sym);
         const registry = try vm.ensureRegistry();
@@ -157,7 +165,7 @@ const Hook = struct {
             break :blk current.lookup(name);
         };
         if (found) |v| if (v.bound) return v.root;
-        return self.unknown("unknown function", name);
+        return null;
     }
 
     fn unknown(self: *Hook, reason: []const u8, name: []const u8) anyerror!Value {

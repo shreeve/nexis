@@ -48,6 +48,7 @@ const plan_mod = @import("plan.zig");
 const rules_mod = @import("rules.zig");
 const marshal = @import("../marshal.zig");
 const pull_mod = @import("../pull.zig");
+const fulltext = @import("../fulltext.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -344,8 +345,61 @@ pub const Exec = struct {
                 return false;
             },
             .missing => return (try self.firstValue(call_args[0].src, args[1], args[2])) == null,
-            .ground, .get_else, .get_some, .tuple, .untuple => unreachable,
+            .ground, .get_else, .get_some, .tuple, .untuple, .fulltext => unreachable,
         }
+    }
+
+    /// `[[e v] ...]`: the string values of `attr` (a keyword cell) in
+    /// source `src` that hold every token of `needle`, in entity order.
+    /// A view at the newest basis reads the tokens tree; any other
+    /// re-tokenises the attribute's values in that view. The attribute
+    /// must carry `:db/fulltext` at the view's basis.
+    fn fulltextHits(self: *Exec, src: ?ir.Src, attr: Cell, needle: Cell) anyerror!Value {
+        const read = self.readOf(src);
+        if (attr != .keyword or needle != .str) return error.ValueType;
+        const a = (try read.db.conn.idents.idOf(read.txn, attr.keyword)) orelse return self.unknownAttribute(attr.keyword);
+        const at = (try read.attr(a)) orelse return self.unknownAttribute(attr.keyword);
+        if (!at.fulltext) {
+            if (self.diag) |d| d.* = .{ .message = "attribute is not :db/fulltext", .attr = value.fromKeywordId(attr.keyword) };
+            return error.TxData;
+        }
+        const tokens = try fulltext.tokens(self.arena, needle.str);
+        var rows: std.ArrayList(Value) = .empty;
+        if (read.fast()) {
+            const hits = try fulltext.search(read.db.conn.store, read.txn, self.arena, a, tokens);
+            var i: usize = 0;
+            while (i < hits.len) {
+                const e = hits[i].e;
+                var j = i;
+                while (j < hits.len and hits[j].e == e) j += 1;
+                var it = try read.scan(self.arena, .eavt, .{ .e = e, .a = a });
+                while (try it.next()) |d| {
+                    if (d.v != .string) continue;
+                    const h = key.hash128(d.v.string);
+                    for (hits[i..j]) |hit| if (hit.hash == h) {
+                        try rows.append(self.arena, try self.pair(read, d));
+                        break;
+                    };
+                }
+                i = j;
+            }
+        } else if (tokens.len > 0) {
+            var it = try read.scan(self.arena, .aevt, .{ .a = a });
+            while (try it.next()) |d| {
+                if (d.v != .string or !try fulltext.matches(self.arena, d.v.string, tokens)) continue;
+                try rows.append(self.arena, try self.pair(read, d));
+            }
+        }
+        return vector_mod.fromSlice(self.heap, rows.items);
+    }
+
+    fn pair(self: *Exec, read: *Read, d: datom_mod.Datom) !Value {
+        return vector_mod.fromSlice(self.heap, &.{ try self.cellValue(.{ .int = @intCast(d.e) }), try self.cellValue(try self.valCell(read, d.v)) });
+    }
+
+    fn unknownAttribute(self: *Exec, kw: u32) anyerror {
+        if (self.diag) |d| d.* = .{ .message = "unknown attribute", .attr = value.fromKeywordId(kw) };
+        return error.UnknownAttribute;
     }
 
     /// The first value of attribute `attr` (a keyword cell) on entity
@@ -387,6 +441,7 @@ pub const Exec = struct {
                         for (cells, vals) |c, *v| v.* = try self.cellValue(c);
                         break :blk try vector_mod.fromSlice(self.heap, vals);
                     },
+                    .fulltext => try self.fulltextHits(b.call.args[0].src, cells[1], cells[2]),
                     .lt, .le, .gt, .ge, .eq, .ne, .missing => unreachable,
                 },
                 .user => |sym| try self.callUser(sym, cells),

@@ -82,6 +82,7 @@ const natives = [_]Entry{
     .{ .name = "db", .descriptor = &native_db },
     .{ .name = "basis-t", .descriptor = &native_basis_t },
     .{ .name = "transact!", .descriptor = &native_transact },
+    .{ .name = "excise!", .descriptor = &native_excise },
     .{ .name = "entity", .descriptor = &native_entity },
     .{ .name = "entid", .descriptor = &native_entid },
     .{ .name = "ident", .descriptor = &native_ident },
@@ -114,6 +115,7 @@ const native_release = NativeFn{ .name = "nextomic/release", .min_arity = 1, .ma
 const native_db = NativeFn{ .name = "nextomic/db", .min_arity = 1, .max_arity = 1, .call = &fnDb };
 const native_basis_t = NativeFn{ .name = "nextomic/basis-t", .min_arity = 1, .max_arity = 1, .call = &fnBasisT };
 const native_transact = NativeFn{ .name = "nextomic/transact!", .min_arity = 2, .max_arity = 3, .call = &fnTransact };
+const native_excise = NativeFn{ .name = "nextomic/excise!", .min_arity = 2, .max_arity = 3, .call = &fnExcise };
 const native_entity = NativeFn{ .name = "nextomic/entity", .min_arity = 2, .max_arity = 2, .call = &fnEntity };
 const native_entid = NativeFn{ .name = "nextomic/entid", .min_arity = 2, .max_arity = 2, .call = &fnEntid };
 const native_ident = NativeFn{ .name = "nextomic/ident", .min_arity = 2, .max_arity = 2, .call = &fnIdent };
@@ -184,6 +186,9 @@ pub fn errorKeyword(err: anyerror) []const u8 {
         error.Busy => "nextomic/busy",
         error.TxData => "nextomic/tx-data",
         error.Nested => "nextomic/nested",
+        error.TxFn => "nextomic/tx-fn",
+        error.Cas => "nextomic/cas",
+        error.Schema => "nextomic/schema",
         error.PullSyntax => "nextomic/pull-syntax",
         error.HistoryView => "nextomic/history-view",
         error.Format, error.UnknownIdent => "db/corrupted",
@@ -198,9 +203,12 @@ pub const Detail = struct {
     attr: ?Value = null,
     value: ?Value = null,
     e: ?u64 = null,
+    /// `:expected` and `:actual` of a failed `:db.fn/cas`; nil is a
+    /// value here, meaning the attribute has none.
+    cas: ?struct { expected: Value, actual: Value } = null,
 
     fn empty(self: Detail) bool {
-        return self.message == null and self.clause == null and self.attr == null and self.value == null and self.e == null;
+        return self.message == null and self.clause == null and self.attr == null and self.value == null and self.e == null and self.cas == null;
     }
 };
 
@@ -248,6 +256,10 @@ fn payloadMap(vm: *VM, name: []const u8, detail: Detail, attr_key: []const u8) !
     }
     if (detail.attr) |a| m = try champ.mapAssoc(heap, m, try it.internKeywordValue(attr_key), a, &dispatch.hashValue, &dispatch.equal);
     if (detail.value) |v| m = try champ.mapAssoc(heap, m, try it.internKeywordValue("value"), v, &dispatch.hashValue, &dispatch.equal);
+    if (detail.cas) |c| {
+        m = try champ.mapAssoc(heap, m, try it.internKeywordValue("expected"), c.expected, &dispatch.hashValue, &dispatch.equal);
+        m = try champ.mapAssoc(heap, m, try it.internKeywordValue("actual"), c.actual, &dispatch.hashValue, &dispatch.equal);
+    }
     return m;
 }
 
@@ -256,10 +268,15 @@ fn payloadMap(vm: *VM, name: []const u8, detail: Detail, attr_key: []const u8) !
 /// by the failed transaction) is left out.
 fn detailOf(vm: *VM, conn: *Conn, fault: *const Fault) Detail {
     var d: Detail = .{ .message = fault.message, .attr = fault.attr, .e = fault.e };
-    if (fault.value) |v| {
+    if (fault.value != null or fault.cas != null) {
         if (conn.store.beginRead()) |txn| {
             defer txn.abort();
-            d.value = conn.valToValue(txn, vm.ensureHeap(), v) catch null;
+            const heap = vm.ensureHeap();
+            if (fault.value) |v| d.value = conn.valToValue(txn, heap, v) catch null;
+            if (fault.cas) |c| d.cas = .{
+                .expected = if (c.expected) |v| conn.valToValue(txn, heap, v) catch value.nilValue() else value.nilValue(),
+                .actual = if (c.actual) |v| conn.valToValue(txn, heap, v) catch value.nilValue() else value.nilValue(),
+            };
         } else |_| {}
     }
     return d;
@@ -476,10 +493,41 @@ const Builder = struct {
 
 const fnTransact = wrap(transactNative);
 
+/// Runs `:db.fn/call` forms (NEXTOMIC.md §3 "Transaction functions"):
+/// a symbol resolves as a query function does (`query/natives.zig`
+/// `Hook.resolve`), and the function is called through `vm.callValue`
+/// with the boxed `db-before` ahead of the form's arguments. Whatever it
+/// throws propagates through the transaction, which aborts.
+const TxHook = struct {
+    vm: *VM,
+
+    fn hook(self: *TxHook) transact_mod.CallHook {
+        return .{ .ctx = @ptrCast(self), .call = &call };
+    }
+
+    fn call(ctx: *anyopaque, f: Value, db_before: DbValue, args: []const Value) anyerror!Value {
+        const self: *TxHook = @ptrCast(@alignCast(ctx));
+        const vm = self.vm;
+        var resolver = query_natives.Hook{ .vm = vm };
+        const callee = if (f.kind() == .symbol) (try resolver.lookup(f.asSymbolId())) orelse {
+            const name = vm.ensureInterner().symbolName(f.asSymbolId());
+            const message = try std.fmt.allocPrint(vm.allocator, "unknown function: {s}", .{name});
+            defer vm.allocator.free(message);
+            return throwSyntax(vm, "nextomic/tx-fn", message, null);
+        } else f;
+        const all = try vm.allocator.alloc(Value, args.len + 1);
+        defer vm.allocator.free(all);
+        all[0] = try boxDb(vm.ensureHeap(), db_before);
+        @memcpy(all[1..], args);
+        return vm.callValue(callee, all);
+    }
+};
+
 fn transactNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     const c = try openConn(args[0]);
     var fault: Fault = .{};
-    var options: transact_mod.Options = .{ .fault = &fault };
+    var tx_hook = TxHook{ .vm = vm };
+    var options: transact_mod.Options = .{ .fault = &fault, .hook = tx_hook.hook() };
     if (args.len == 3) options.sync = try syncOption(vm, args[2]);
     var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
     defer arena_state.deinit();
@@ -519,6 +567,32 @@ fn reportMap(vm: *VM, conn: *Conn, arena: Allocator, report: transact_mod.Report
 }
 
 // =============================================================================
+// excise!
+// =============================================================================
+
+const fnExcise = wrap(exciseNative);
+
+/// `(excise! conn e)` / `(excise! conn e attr)` (NEXTOMIC.md §4
+/// "Excision"): the report of the recording transaction plus
+/// `:excised [e]` and `:removed`, the history rows that went.
+fn exciseNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
+    const c = try openConn(args[0]);
+    var fault: Fault = .{};
+    var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
+    defer arena_state.deinit();
+    errdefer detail.* = detailOf(vm, c, &fault);
+    const arena = arena_state.allocator();
+    const attr: ?Value = if (args.len == 3 and !args[2].isNil()) args[2] else null;
+    const out = try transact_mod.excise(c, arena, args[1], attr, .{ .fault = &fault });
+    var m = try reportMap(vm, c, arena, out.report);
+    const heap = vm.ensureHeap();
+    const it = vm.ensureInterner();
+    m = try champ.mapAssoc(heap, m, try it.internKeywordValue("excised"), try vector_mod.fromSlice(heap, &.{try fixnum(out.excised)}), &dispatch.hashValue, &dispatch.equal);
+    m = try champ.mapAssoc(heap, m, try it.internKeywordValue("removed"), try fixnum(out.removed), &dispatch.hashValue, &dispatch.equal);
+    return m;
+}
+
+// =============================================================================
 // with
 // =============================================================================
 
@@ -541,7 +615,8 @@ fn withNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     // The fault's value lives in the arena: rendered before the arena goes.
     errdefer detail.* = detailOf(vm, c, &fault);
     const arena = arena_state.allocator();
-    const w = try transact_mod.with(c, arena, args[1], .{ .fault = &fault });
+    var tx_hook = TxHook{ .vm = vm };
+    const w = try transact_mod.with(c, arena, args[1], .{ .fault = &fault, .hook = tx_hook.hook() });
     st.views.appendAssumeCapacity(w.view);
     defer w.finish();
 
@@ -825,6 +900,11 @@ fn txRangeNative(vm: *VM, args: []const Value) !Value {
         m = try b.putKw(m, "t", try fixnum(entry.t));
         m = try b.putKw(m, "instant", value.fromFixnum(entry.instant) orelse return error.ArithmeticOverflow);
         m = try b.putKw(m, "data", try b.datoms(arena, entry.datoms));
+        if (entry.excised.len > 0) {
+            const ids = try arena.alloc(Value, entry.excised.len);
+            for (ids, entry.excised) |*out_id, e| out_id.* = try fixnum(e);
+            m = try b.putKw(m, "excised", try vector_mod.fromSlice(b.heap, ids));
+        }
         slot.* = m;
     }
     return vector_mod.fromSlice(b.heap, out);
@@ -891,6 +971,9 @@ test "every nextomic error maps to its §7 keyword; engine errors to the db set"
         .{ .err = error.Busy, .name = "nextomic/busy" },
         .{ .err = error.TxData, .name = "nextomic/tx-data" },
         .{ .err = error.Nested, .name = "nextomic/nested" },
+        .{ .err = error.TxFn, .name = "nextomic/tx-fn" },
+        .{ .err = error.Cas, .name = "nextomic/cas" },
+        .{ .err = error.Schema, .name = "nextomic/schema" },
         .{ .err = error.PullSyntax, .name = "nextomic/pull-syntax" },
         .{ .err = error.HistoryView, .name = "nextomic/history-view" },
         .{ .err = error.Format, .name = "db/corrupted" },

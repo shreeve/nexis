@@ -41,10 +41,11 @@ below is a public function or a committed invariant of emdb as it stands
 
 Open with `emdb.EnvOptions{ .pageSize = 16384, .maxNamedTrees = 128 }`.
 Page size is fixed for the file's life (emdb INV-M05) and sets the
-4078-byte hard key bound; the Linux default would be 4K. All eleven
+4078-byte hard key bound; the Linux default would be 4K. All twelve
 trees are opened in one bootstrap write transaction at connect and their
 `TreeId`s cached for the connection's life (`treeNames` registration is
-not thread-safe; nothing else is).
+not thread-safe; nothing else is); a tree the file lacks is created
+then, so a store written without one gains it at open.
 
 | tree | key | value |
 |---|---|---|
@@ -56,9 +57,10 @@ not thread-safe; nothing else is).
 | `nx/aevt-h` | `[a:4][e:6][v][top:6]` | empty |
 | `nx/avet-h` | `[a:4][v][e:6][top:6]` | empty (indexed and unique attrs only) |
 | `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
-| `nx/txlog` | `[t:6]` | codec vector `[instant [e a v added] ...]` |
-| `nx/idents` | `[0x00][utf8 text]` → id, `[0x01][id:4]` → text | |
-| `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"` | see §2.3 |
+| `nx/txlog` | `[t:6]` | codec vector `[instant [e a v added] ...]`, with a trailing map `{:excised [e ...]}` on an entry an excision touched |
+| `nx/idents` | `[0x00][utf8 text]` → id, `[0x01][id:4]` → text, `[0x02][utf8 text]` → id for a name a rename retired | |
+| `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"` | see §2.3 |
+| `nx/fulltext` | `[a:4][token][0x00][e:6][hash128(v):16]` | empty; one row per token of each current string value of a `:db/fulltext` attribute (§5 "fulltext") |
 
 `top` = `(t << 1) | added`. `v` is always followed only by fixed-width
 fields, so it is `key[prefix .. len - suffix]` with no length byte.
@@ -80,7 +82,12 @@ or an engine-level rollback can never leave `t` ahead of the data.
 
 Keyword *values* (enums) are interned in `nx/idents` exactly like
 attributes and stored as 4-byte ids, so `:db/ident` refs and enum values
-are the same mechanism. They sort by id, not by text.
+are the same mechanism. They sort by id, not by text. An ident's text
+is a property of its id, not a datom value: renaming an ident (§3 step
+5) changes what every view, past or present, prints for that id, and
+leaves no datom behind. The old text moves to the retired names, which
+only the txlog decoder reads (an entry spells keywords by the names
+they had when it was written) and which are never minted again.
 
 ### 2.2 Sortable value encoding
 
@@ -133,15 +140,20 @@ bytes, inside emdb's 256-byte search-clue buffer.
 | `"t"` | u48 last committed logical transaction number |
 | `"eid"` | u48 next user entity id |
 | `"aid"` | u32 next attribute / ident id |
+| `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once |
 
 ### 2.4 Bootstrap
 
 The first open writes, with fixed ids so files from different builds
 agree: the attributes `:db/ident`, `:db/valueType`, `:db/cardinality`,
 `:db/unique`, `:db/index`, `:db/isComponent`, `:db/doc`,
-`:db/txInstant`, and the idents `:db.type/{long double instant keyword
+`:db/txInstant`, the idents `:db.type/{long double instant keyword
 ref string uuid bytes boolean}`, `:db.cardinality/{one many}`,
-`:db.unique/{identity value}`. Bootstrap is transaction `t = 1`.
+`:db.unique/{identity value}`, and the attribute `:db/fulltext`
+(boolean, cardinality one) at id 22. Bootstrap is transaction `t = 1`.
+A store whose idents lack `:db/fulltext` receives it at open, in a
+transaction of its own at the store's next ident id, so its id is the
+one the store reports (`Store.fulltext_aid`), not 22.
 
 ---
 
@@ -203,14 +215,42 @@ so there is no queue; emdb's write lock is the transactor.
    `"datomic.tx"` itself: that instant stands, in the datom and in the
    txlog entry.
 5. **Schema**: schema changes are ordinary assertions on attribute
-   entities, checked here. A new attribute needs `:db/valueType` and
-   `:db/cardinality`, and neither changes once written
-   (`:nextomic/conflict`); `:db/index` and `:db/unique` may be added,
-   and the transaction that adds them backfills AVET from AEVT (an
-   attribute becoming unique while two entities hold one value is
-   `:nextomic/unique`). A unique attribute identifies one entity by one
-   value, so it is cardinality one: `:db/unique` on a card-many
-   attribute is `:nextomic/tx-data`.
+   entities, checked here, and take effect for the transactions after
+   the one that makes them (the data of the same transaction is
+   expanded under the schema it began with). A new attribute needs
+   `:db/valueType` and `:db/cardinality`. What may change afterwards:
+   - `:db/valueType` never (`:nextomic/conflict`).
+   - `:db/cardinality`: one → many always; many → one while no entity
+     holds two values, in the tree or in the transaction, otherwise
+     `:nextomic/schema` naming the attribute and an entity. The
+     cardinality in force at each basis is kept (§4), so an as-of view
+     reads sets or scalars as its time saw them.
+   - `:db/index` and `:db/unique` may be added, never retracted
+     (`:nextomic/conflict`), and the transaction that adds them
+     backfills AVET from AEVT (an attribute becoming unique while two
+     entities hold one value is `:nextomic/unique`). A unique attribute
+     identifies one entity by one value, so it is cardinality one:
+     `:db/unique` on a card-many attribute is `:nextomic/tx-data`, and
+     a unique attribute becoming card-many `:nextomic/schema`.
+   - `:db/fulltext true` may be added to a string attribute, never
+     retracted (`:nextomic/conflict`); on any other value type it is
+     `:nextomic/schema`. The transaction that adds it backfills
+     `nx/fulltext` from the attribute's current values, and from then
+     on every assertion and retraction of one of its string values
+     puts or deletes that value's token rows in the same write.
+   - `:db/ident` on an attribute or ident entity renames it, provided
+     the new keyword names nothing (`:nextomic/conflict` when it names
+     another entity; asserting the entity's own ident is a no-op). The
+     new ident wins everywhere and the old one is retired: the entity
+     resolves by the new keyword alone, `ident`, `schema`, `entity`,
+     `pull` and query results spell it the new way in every view, and
+     the old keyword is `:nextomic/unknown-attribute` as an attribute,
+     nil as an ident, and never minted again (`:nextomic/tx-data` when
+     tx-data tries). The ident's id, its datoms and its keyword values
+     are untouched, so the rename writes no datom; the transaction's
+     entry holds only its `:db/txInstant`. An ident on a user-partition
+     entity is `:nextomic/conflict`.
+   - `:db/doc` and `:db/isComponent` are ordinary card-one attributes.
 6. **Write**: for each assertion, put into the current trees (value
    `[t]`, plus the payload in `nx/eavt` for out-of-line values) and
    append `[.. top]` with `added = 1` to the history trees; for each
@@ -224,6 +264,30 @@ so there is no queue; emdb's write lock is the transactor.
    exist (emdb INV-SUB04).
 8. Return `{:db-before db :db-after db :tx t :tempids {..} :tx-data
    [[e a v t added] ...]}` with `db-after.basis = t`.
+
+**Transaction functions.** A form `[:db.fn/call f arg ...]` calls `f`
+during normalisation with `db-before` (a db-value at the connection's
+basis, the state every function in the transaction sees) followed by
+the args, and the tx-data it returns takes the form's place: it is
+normalised like any other tx-data, so it may hold map forms, tempids
+and further calls, to a depth of 16 (`:nextomic/tx-fn` past it). `f` is
+a function value, or a symbol naming a var resolved as a query
+function is (§5); anything else is `:nextomic/tx-data`, and an unbound
+symbol `:nextomic/tx-fn` naming it. A nil result is no tx-data. The
+function value is called and never stored: the trees and the txlog
+hold only the datoms it returned. Its reads of `db-before`, or of
+`(d/db conn)`, open ordinary read transactions beside the held write;
+a `transact!` or `with` inside it, on this connection or on another to
+the same file, is `:nextomic/nested`, since the engine has one writer.
+A throw inside it aborts the transaction and reaches the caller's
+`try`. The built-in `[:db.fn/cas e a old new]` asserts `new` on the
+cardinality-one attribute `a` when the value the transaction sees
+(the committed value, less what an earlier form of the same
+transaction retracted) is `old`, nil meaning absent; otherwise it is
+`:nextomic/cas` with `:attr`, `:expected` and `:actual`. A card-many
+attribute is `:nextomic/tx-data`. The assertion then follows the
+card-one rule of step 4, so two cas forms on one `(e a)` in one
+transaction conflict as two values would.
 
 **Sync mode.** `:full` (default) syncs data and meta; `:no-meta`
 batches the meta flush; `:none` is for bulk loads followed by
@@ -275,13 +339,42 @@ prefix; consecutive keys with equal `(e a v)` form a group in ascending
 emit the group's newest kept datom iff its `added` is 1.
 
 **Schema as-of.** `Schema` is built from the attribute partition's
-datoms with `t ≤ basis`, cached per `(store, basis)`; since schema is
-additive, a cache built at a later basis is a superset and may serve an
-earlier one for attributes that existed then.
+datoms with `t ≤ basis`, cached per `(store, basis)`; a cache built at
+a later basis serves an earlier one: attributes created after it are
+hidden, `:db/index`, `:db/unique` and `:db/fulltext` that arrived after
+it are masked, and an attribute whose cardinality has changed carries the timeline of
+its `:db/cardinality` assertions, read from the history tree, so the
+cardinality in force at the earlier basis is what `entity`, `pull` and
+the planner see.
 
 The txlog is the change feed: `(d/tx-range conn from to)` scans
 `nx/txlog` over `from ≤ t < to`; a bound that is `nil` or not given is
 open.
+
+**Excision.** `(d/excise! conn e)` removes every datom whose entity is
+`e`, current and history, from all eight index trees;
+`(d/excise! conn e attr)` those under one attribute. It is a
+transaction: it takes the next `t`, its only datom is its
+`:db/txInstant`, and everything happens in its one write transaction.
+Inside it, EAVT and EAVT-h lose the datoms by a prefix delete (and
+AEVT and AEVT-h when the attribute is given), the other trees one key
+at a time from a scan of the entity's history rows, which name every
+datom it ever had; the per-attribute counts drop by the current rows
+removed. Every txlog entry that held one of the datoms is rewritten
+without them and marked `{:excised [e ...]}`, the marker accumulating
+across excisions; an entry emptied this way keeps its place, its
+instant and its marker, and the excising transaction's own entry
+carries the marker too, so `tx-range` replays the same transactions
+with the datoms gone and shows `:excised` on the entries an excision
+touched. Every view is affected alike: a db-value taken before the
+excision no longer sees the datoms either, since the trees are the
+only record. Datoms that refer to `e` through a ref attribute are not
+its datoms and stay, as a ref to an entity with no datoms. `e` is a
+user entity given as an eid, ident or lookup ref; an attribute, ident
+or transaction entity, or a tempid, is `:nextomic/tx-data`, an
+unallocated id `:nextomic/no-entity`. An entity excised of everything
+stays addressable, and excising it again removes nothing. Inside a
+`with` or a transaction function, `excise!` is `:nextomic/nested`.
 
 ---
 
@@ -359,9 +452,9 @@ is `:kind-mismatch`.
 (one snapshot for every cursor, emdb INV-T02). Scans drive `openCursorForTree` +
 `setRange` with the §4 fold inline; constants in the prefix narrow the
 seek, constants after an unbound position filter. Built-in predicates and functions (`< <= > >= = not= missing?`, `!=` as
-`not=`; `ground`, `tuple`, `untuple`, `get-else`, and `get-some`, which
+`not=`; `ground`, `tuple`, `untuple`, `get-else`, `get-some`, which
 binds `[attr value]` for the first of its attributes the entity has and
-drops the row when it has none) are Zig over cells; an int and a double compare numerically, and a
+drops the row when it has none, and `fulltext`) are Zig over cells; an int and a double compare numerically, and a
 comparison across other types (a string against a number, a number
 against a keyword) is `:nextomic/value-type`, as is an input or a
 function result whose shape does not fit its binding form. Any other symbol resolves through the namespace
@@ -377,6 +470,21 @@ earlier clause (so a rule head may carry it), and the value it holds is
 applied when the clause runs: a function through `callValue`, a keyword
 or collection as the language applies them, anything else is the VM's
 `:not-callable`. A function is identity-valued in a relation.
+
+**fulltext.** `[(fulltext $ :attr "needle") [[?e ?v]]]` binds, for a
+string attribute carrying `:db/fulltext` at the view's basis, every
+`[e v]` whose value holds every token of the needle, in entity order;
+the attribute and the needle may be variables bound earlier or by
+`:in`. Tokens are the runs of ASCII letters, digits and non-ASCII
+bytes, ASCII letters lowercased, split on every other byte; a run
+longer than 255 bytes is not a token, and a needle without tokens
+matches nothing. The plain view at the newest basis intersects the
+`nx/fulltext` rows of the tokens, then reads the matching values from
+EAVT; an as-of, since or history view re-tokenises the attribute's
+values under that view, so it answers with the values its time held.
+An attribute without `:db/fulltext` at the basis is `:nextomic/tx-data`
+naming it; an unknown one `:nextomic/unknown-attribute`; a needle that
+is not a string `:nextomic/value-type`.
 
 **Aggregates** group the basis set (the distinct tuples over the `:find`
 and `:with` variables) by the plain find elements: `count`, `sum`,
@@ -425,15 +533,16 @@ sub-plans with the same output variables.
 | `(d/release conn)` | close, idempotent; `:nextomic/busy` while a query, pull, `transact!` or `with` on the connection is in flight (a released connection keeps its struct, so its db-values raise `:nextomic/closed`) |
 | `(d/db conn)` | db-value at the current basis |
 | `(d/basis-t db)` | the basis |
-| `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report |
-| `(d/entity db e)` | eager map `{:db/id e :attr v ...}`, card-many as sets, refs as eids; nil when the entity has no datoms in this view; `:nextomic/history-view` on a history db |
+| `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report. tx-data forms: `[:db/add e a v]`, `[:db/retract e a v?]`, `[:db/retractEntity e]`, `[:db.fn/call f arg ...]`, `[:db.fn/cas e a old new]` and map forms |
+| `(d/entity db e)` | the map `{:db/id e :attr v ...}`, card-many as sets, refs as eids; nil when the entity has no datoms in this view; `:nextomic/history-view` on a history db. Access is eager: the map is read from the view in one read when `entity` returns, so `(:attr ent)`, `(get ent :attr)`, `(keys ent)` and `(into {} ent)` are map operations that open nothing, and a later transaction never changes the map. It is a plain map, equal by content: two entity maps of one entity from views that agree are equal, and maps from views that differ are not; a ref is the eid, not a map, so the referred entity is read with another `entity` call |
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
 | `(d/datoms db :eavt e a v tx added)` (index, its components in index order, then `tx` as a t or a transaction entity id and `added` as a boolean; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
 | `(d/index-range db attr start end)` | the AVET datoms of an indexed or unique attribute with `start <= v < end` in value order; a nil bound is open; another attribute is `:nextomic/tx-data` naming it, a bound of the wrong type `:nextomic/value-type` |
 | `(d/q query db & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]`, aggregates (built-in and custom) and `(pull ?e pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] % $2` with inputs positional after the db (a `$name` source takes a db value; `[$2 ?e :a ?v]` and `($2 rule ?x)` read it), `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
 | `(d/explain query db & inputs)` | the plan `q` would run, as an aligned table: one numbered line per step with its description (index, estimate, tree size, source when not `$`, bound variables marked `!`), the join a scan will run (`nested`, one seek per input row; `hash`, one scan of the constant prefix hash-joined on the shared variables; `fixpoint` for a recursive rule) and the estimated rows after the step; sub-plans indent under their step and end with `rows~` |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4); `t` is a transaction number or a transaction's entity id |
-| `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}` for `from ≤ t < to`, oldest first; a bound that is `nil` or not given is open |
+| `(d/excise! conn e)` / `(d/excise! conn e attr)` | §4 "Excision"; returns the recording transaction's report plus `:excised [e]` and `:removed`, the history rows that went |
+| `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}` for `from ≤ t < to`, oldest first, with `:excised [e ...]` on an entry an excision touched; a bound that is `nil` or not given is open |
 | `(d/schema db)` | map ident → attribute map |
 | `(d/pull db pattern e)` | the pattern's map for an eid, lookup ref or ident; nil when the entity has no datoms in the view. `e` follows the entity contract every native shares: an eid below 1, or an ident or lookup ref that names nothing, is `:nextomic/no-entity`; a lookup ref on a non-unique attribute, or a vector that is not `[attr v]`, is `:nextomic/tx-data`; a lookup value of the wrong type is `:nextomic/value-type`; any other kind is the VM's `:kind-mismatch`. A pattern is `[spec+]`: `*`, an attribute, `{attr sub-pattern}`, a reverse `:ns/_attr` (a vector of referrers; through a component, its one owner pulled with `[*]`), `{attr ...}` or `{attr depth}` recursion (a target already on the path, or past the depth, is a plain ref), `(attr :limit n)` / `(attr :limit nil)` / `(attr :default v)` / `(attr :as k)` and the `(limit attr n)` / `(default attr v)` spellings. `:db/id` is always present, a missing attribute omitted unless it has a default, card-many values are vectors in index order cut at 1000 unless `:limit` says otherwise (`*` cuts at 1000 too), a ref is `{:db/id e}` plus `:db/ident` when it has one, and a component target is pulled with `[*]`. Defined on current, as-of and since views; one read per call |
 | `(d/pull-many db pattern es)` | one result per entity of the vector or list `es`, in its order, in the same read |
@@ -448,10 +557,10 @@ are values, equal when they name the same connection, basis and mode.
 
 Schema install is `transact!` of attribute entities: `{:db/ident
 :user/email :db/valueType :db.type/string :db/cardinality
-:db.cardinality/one :db/unique :db.unique/identity :db/index true}`.
+:db.cardinality/one :db/unique :db.unique/identity :db/index true}`;
+what a later transaction may change is §3 step 5.
 
-Later: transaction functions, `:db.fn/cas`, excision, lazy entities,
-full-text, a datom heap kind.
+Later: a lazy entity kind, a datom heap kind.
 
 ---
 
@@ -464,9 +573,14 @@ All errors are keywords in the `nextomic` namespace and are catchable:
 `:nextomic/closed`, `:nextomic/busy` (`release` while an operation on
 the connection is in flight), `:nextomic/tx-data` for malformed
 tx-data, a lookup ref on a non-unique attribute, a nested map nothing
-could reach, or a unique card-many attribute, `:nextomic/history-view`
-(`entity` or `pull` on a history db) and `:nextomic/nested`
-(`transact!` or `with` while a `with` holds the write transaction).
+could reach, a unique card-many attribute, or `fulltext` on an
+attribute without `:db/fulltext`, `:nextomic/history-view`
+(`entity` or `pull` on a history db), `:nextomic/schema` (a schema
+change the attribute's data or type refuses), `:nextomic/nested`
+(`transact!` or `with` while a `with` holds the write transaction, or
+inside a transaction function), `:nextomic/tx-fn` (a transaction
+function that cannot run) and `:nextomic/cas` (a `:db.fn/cas` whose
+expectation failed).
 
 An error that can say more travels as a map, `{:error keyword ...}`,
 whose other keys name what went wrong; one that cannot is the bare
@@ -480,6 +594,9 @@ keyword. The shapes:
 | `:nextomic/conflict` | `:e` and `:a`, the datom the two claims disagree on |
 | `:nextomic/no-entity` | bare |
 | `:nextomic/tx-data` | `:message`; `:attr` when an attribute is at fault |
+| `:nextomic/tx-fn` | `:message`: the unbound symbol, or the depth limit |
+| `:nextomic/schema` | `:message` and `:attr`; `:e`, the entity holding two values, when one refuses many → one; `:db/fulltext` on a non-string attribute names the attribute |
+| `:nextomic/cas` | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
 | `:nextomic/query-syntax` | `:message`; `:clause`, the index into `:where`, when the parser or planner was inside a clause (an unbound function name is reported the same way at run time). A scoping refusal names what is wrong: the variable an `or` branch mentions and another does not, the join variable an `or-join` branch leaves unbound, the variable a `not` body has that nothing outside binds, the argument or function-position variable no clause ever binds |
 | `:nextomic/pull-syntax` | `:message`; `:clause`, the index of the spec in the pattern (from `pull`, `pull-many` or a `(pull ?e pattern)` find element) |
 
@@ -498,10 +615,12 @@ src/nextomic/
   root.zig       module root; re-exports
   key.zig        sortable encodings, index key pack/unpack, prefix successor
   datom.zig      Datom, txlog entry codec
-  store.zig      Env ownership, 11 TreeIds, bootstrap, sys counters, raw put/del/scan
+  store.zig      Env ownership, 12 TreeIds, bootstrap, sys counters, raw put/del/scan
   idents.zig     durable keyword <-> id, per-connection cache
   schema.zig     Schema from attribute datoms as-of a basis, per-attribute counts
   transact.zig   §3
+  excise.zig     §4 "Excision": the tree deletes and the txlog rewrite
+  fulltext.zig   the tokenizer and the nx/fulltext rows: put, delete, search
   db.zig         DbValue, fold, datoms, entity, entid/ident, tx-range
   handle.zig     heap bodies of the two value kinds; its own module
                  `nextomic_handle` below dispatch/format/gc, so their
@@ -518,6 +637,7 @@ test/prop/nextomic_tx.zig      random transactions vs an in-memory model, every 
 test/integration/nextomic_fx.zig    the fixture the corpora share
 test/integration/nextomic_q.zig     query corpus vs a naive evaluator
 test/integration/nextomic_pull.zig  pull corpus vs a naive evaluator
+test/integration/nextomic_fn.zig    transaction functions, cas, schema alteration, excision, full-text
 test/nextomic/*.nx             end-to-end scripts
 ```
 
