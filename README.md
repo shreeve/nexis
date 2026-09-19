@@ -60,7 +60,7 @@ zig build quick                    # seconds — language, eval-pipeline and Nex
 zig build nextomic-test            # Nextomic unit, property and corpus tests
 zig build nextomic-nx              # test/nextomic/*.nx through bin/nexis
 zig build examples                 # every examples/*.nx through bin/nexis
-zig build test --summary all       # minutes — everything (1439 tests)
+zig build test --summary all       # minutes — everything (1451 tests)
 zig build parser                   # regenerate src/parser.zig from nexis.grammar
 zig build bench                    # ReleaseFast benchmark suite
 ```
