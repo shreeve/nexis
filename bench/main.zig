@@ -17,6 +17,8 @@
 //!   - codec: encode / decode for representative Values.
 //!   - db-integrated: emdb put / get round-trip cost (PLAN §19
 //!     "database-integrated" category).
+//!   - vm: the dispatch loop on a routine compiled once (a counting
+//!     loop, the same loop calling a global fn, a keyword lookup).
 //!
 //! Every benchmark function here is a tiny wrapper over a
 //! `Runner.bench` call; the heavy lifting lives in `src/bench.zig`.
@@ -483,6 +485,52 @@ fn benchEvalArith(ctx: *CompileBenchCtx) !void {
     std.mem.doNotOptimizeAway(result);
 }
 
+// -----------------------------------------------------------------------------
+// VM dispatch — a routine compiled once and run per invocation
+// -----------------------------------------------------------------------------
+
+/// A VM with one compiled routine. `run` retargets the top frame and
+/// runs it, so a sample is the dispatch loop alone: no reader, no
+/// compiler, no VM construction.
+const RunCtx = struct {
+    arena: std.heap.ArenaAllocator,
+    v: vm_mod.VM,
+    routine: vm_mod.Routine,
+    sink: u64 = 0,
+
+    fn init(alloc: std.mem.Allocator, setup: ?[]const u8, source: []const u8) !*RunCtx {
+        const ctx = try alloc.create(RunCtx);
+        ctx.arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer ctx.arena.deinit();
+        ctx.v = try vm_mod.VM.init(alloc, &vm_mod.VM.idle_routine);
+        errdefer ctx.v.deinit();
+        const interner = ctx.v.ensureInterner();
+        const ns = ctx.v.ensureNamespace();
+        if (setup) |s| {
+            const compiled = try compile_mod.compileSourceFull(ctx.arena.allocator(), s, ns, interner);
+            const routine = compiled.toRoutine("bench-setup");
+            try ctx.v.retargetTop(&routine);
+            _ = try ctx.v.run();
+        }
+        const compiled = try compile_mod.compileSourceFull(ctx.arena.allocator(), source, ns, interner);
+        ctx.routine = compiled.toRoutine("bench");
+        ctx.sink = 0;
+        return ctx;
+    }
+
+    fn deinit(self: *RunCtx, alloc: std.mem.Allocator) void {
+        self.v.deinit();
+        self.arena.deinit();
+        alloc.destroy(self);
+    }
+};
+
+fn benchRun(ctx: *RunCtx) anyerror!void {
+    try ctx.v.retargetTop(&ctx.routine);
+    const result = try ctx.v.run();
+    ctx.sink +%= @as(u64, @bitCast(result.payload));
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const alloc = init.gpa;
     const io = init.io;
@@ -655,6 +703,33 @@ pub fn main(init: std.process.Init) !u8 {
         try runner.bench("eval_simple_loop", "compiler", 100, &cctx, benchEvalSimpleLoop);
         try runner.bench("closure_create", "compiler", null, &cctx, benchClosureCreate);
         try runner.bench("eval_arith", "compiler", null, &cctx, benchEvalArith);
+    }
+
+    // ---- VM dispatch ----
+    //
+    // Each routine is compiled once; a sample runs it on the same
+    // VM. Every row loops 10,000 times, so per-iteration cost is
+    // the median divided by 10,000.
+    if (include(filter, "vm")) {
+        const loop_ctx = try RunCtx.init(alloc, null, "(loop* [i 0] (if (< i 10000) (recur (+ i 1)) i))");
+        defer loop_ctx.deinit(alloc);
+        try runner.bench("vm_loop_10k", "vm", 10_000, loop_ctx, benchRun);
+
+        const call_ctx = try RunCtx.init(
+            alloc,
+            "(def inc1 (fn* [x] (+ x 1)))",
+            "(loop* [i 0] (if (< i 10000) (recur (inc1 i)) i))",
+        );
+        defer call_ctx.deinit(alloc);
+        try runner.bench("vm_global_call_10k", "vm", 10_000, call_ctx, benchRun);
+
+        const kw_ctx = try RunCtx.init(
+            alloc,
+            "(def m {:a 1 :b 2 :c 3 :d 4 :e 5 :f 6 :g 7 :h 8 :i 9 :j 10 :k 11 :l 12})",
+            "(loop* [i 0 acc 0] (if (< i 10000) (recur (+ i 1) (+ acc (:k m))) acc))",
+        );
+        defer kw_ctx.deinit(alloc);
+        try runner.bench("vm_keyword_get_10k", "vm", 10_000, kw_ctx, benchRun);
     }
 
     // ---- Codec ----
