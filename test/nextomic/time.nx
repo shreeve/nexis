@@ -83,5 +83,23 @@
 (println (t/caught (d/excise! c :doc/title)))
 (println (t/caught (d/excise! c (+ t/user-partition 99))))
 
+; Each schema flag is masked by the transaction that asserted it: an
+; attribute indexed at one t and made unique at a later t is indexed
+; but not unique in a view between them, so a lookup ref on it is
+; refused there; :db/isComponent reads as false before its assertion.
+(def t-idx (:tx (d/transact! c [{:db/ident :doc/code :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/index true}
+                                {:db/ident :doc/part :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}])))
+(def coded (get (:tempids (d/transact! c [{:db/id "x" :doc/code "A1"}])) "x"))
+(def t-uniq (:tx (d/transact! c [[:db/add :doc/code :db/unique :db.unique/identity]])))
+(def t-comp (:tx (d/transact! c [[:db/add :doc/part :db/isComponent true]])))
+(def flagged (d/db c))
+(defn flags [db attr] (let [m (get (d/schema db) attr)] [(:db/index m) (:db/unique m) (:db/isComponent m)]))
+(println (flags (d/as-of flagged t-idx) :doc/code))
+(println (flags (d/as-of flagged t-uniq) :doc/code))
+(println (t/caught (d/entid (d/as-of flagged t-idx) [:doc/code "A1"])))
+(t/check "the lookup ref resolves from the transaction that made the attribute unique"
+       (= coded (d/entid (d/as-of flagged t-uniq) [:doc/code "A1"])))
+(println [(flags (d/as-of flagged t-uniq) :doc/part) (flags flagged :doc/part)])
+
 (d/release c)
 :time-done

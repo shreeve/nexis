@@ -9,9 +9,10 @@
 //!     change, and an attribute whose cardinality ever changed carries
 //!     the whole timeline of its assertions. So a Schema built at basis
 //!     B answers every earlier basis: `attrAt(a, b)` for `b < B` hides
-//!     attributes created after `b`, masks the AVET and full-text flags
-//!     that arrived after `b`, and reads the cardinality in force at `b`
-//!     off the timeline.
+//!     attributes created after `b`, masks `:db/unique`, `:db/index`,
+//!     `:db/isComponent` and `:db/fulltext` each by the `t` of its own
+//!     assertion when that is after `b`, and reads the cardinality in
+//!     force at `b` off the timeline.
 //!   - `:db/fulltext` is the one bootstrap attribute whose id differs
 //!     between stores (`Store.fulltext_aid`); the store supplies it.
 //!   - `count` is the number of current AEVT entries of the attribute at
@@ -43,6 +44,12 @@ pub const Attr = struct {
     component: bool = false,
     /// `t` of the transaction that asserted `:db/valueType`.
     since: u64,
+    /// `t` of the `:db/unique` assertion; 0 without one.
+    unique_t: u64 = 0,
+    /// `t` of the `:db/index` assertion in force; 0 without one.
+    index_t: u64 = 0,
+    /// `t` of the `:db/isComponent` assertion in force; 0 without one.
+    component_t: u64 = 0,
     /// `t` from which AVET carries the attribute (the first assertion of
     /// `:db/index true` or `:db/unique`); 0 when it never did.
     avet_since: u64 = 0,
@@ -156,17 +163,29 @@ pub const Schema = struct {
     }
 
     /// The attribute as it was at basis `at <= self.basis`: absent when
-    /// it did not exist yet, with AVET and full-text flags cleared when
-    /// they arrived after `at`, and the cardinality in force at `at`.
+    /// it did not exist yet; `:db/unique`, `:db/index`, `:db/isComponent`
+    /// and `:db/fulltext` each cleared when its assertion came after
+    /// `at`, AVET availability bounded the same way, and the
+    /// cardinality in force at `at`. A flag reads its assertion in
+    /// force alone, so before that assertion it is clear even when an
+    /// earlier assertion had set it.
     pub fn attrAt(self: *const Schema, a: u32, at: u64) ?Attr {
         const p = self.attrs.getPtr(a) orelse return null;
         if (p.since > at) return null;
         var copy = p.*;
-        if (copy.avet_since > at) {
-            copy.indexed = false;
+        if (copy.unique_t > at) {
             copy.unique = .none;
-            copy.avet_since = 0;
+            copy.unique_t = 0;
         }
+        if (copy.index_t > at) {
+            copy.indexed = false;
+            copy.index_t = 0;
+        }
+        if (copy.component_t > at) {
+            copy.component = false;
+            copy.component_t = 0;
+        }
+        if (copy.avet_since > at) copy.avet_since = 0;
         if (copy.fulltext_since > at) {
             copy.fulltext = false;
             copy.fulltext_since = 0;
@@ -197,6 +216,7 @@ pub const Schema = struct {
         indexed: bool = false,
         index_t: u64 = 0,
         component: bool = false,
+        component_t: u64 = 0,
         fulltext: bool = false,
         fulltext_t: u64 = 0,
 
@@ -246,6 +266,7 @@ pub const Schema = struct {
                 boot.is_component => {
                     if (kv != .val or kv.val != .boolean) return error.Corrupted;
                     self.component = kv.val.boolean;
+                    self.component_t = t;
                 },
                 else => {},
             }
@@ -265,6 +286,9 @@ pub const Schema = struct {
                 .indexed = self.indexed,
                 .component = self.component,
                 .since = self.type_t,
+                .unique_t = self.unique_t,
+                .index_t = self.index_t,
+                .component_t = self.component_t,
                 .avet_since = avet_since,
                 .card_t = self.card_t,
                 .fulltext = self.fulltext,
@@ -376,15 +400,20 @@ test "attrAt masks flags that arrived after the asked basis" {
     const arena = arena_state.allocator();
 
     // The first minted attribute: string, card-one at t=2; index added
-    // at t=3.
+    // at t=3, fulltext at t=4, unique at t=5. The second: ref, card-one
+    // at t=2; component at t=6.
     const a: u32 = boot.next_aid;
+    const r: u32 = boot.next_aid + 1;
     {
         const txn = try store.beginWrite(.none);
         const vt = try key.valBytes(arena, .{ .keyword = boot.type_string });
+        const rt = try key.valBytes(arena, .{ .keyword = boot.type_ref });
         const c1 = try key.valBytes(arena, .{ .keyword = boot.card_one });
         try store.writeBatch(txn, 2, &.{
             .{ .e = a, .a = boot.value_type, .vbytes = vt, .added = true, .avet = false, .vaet = false },
             .{ .e = a, .a = boot.cardinality, .vbytes = c1, .added = true, .avet = false, .vaet = false },
+            .{ .e = r, .a = boot.value_type, .vbytes = rt, .added = true, .avet = false, .vaet = false },
+            .{ .e = r, .a = boot.cardinality, .vbytes = c1, .added = true, .avet = false, .vaet = false },
         }, arena);
         const yes = try key.valBytes(arena, .{ .boolean = true });
         try store.writeBatch(txn, 3, &.{
@@ -393,33 +422,64 @@ test "attrAt masks flags that arrived after the asked basis" {
         try store.writeBatch(txn, 4, &.{
             .{ .e = a, .a = store.fulltext_aid, .vbytes = yes, .added = true, .avet = false, .vaet = false },
         }, arena);
-        try store.writeT(txn, 4);
+        const identity = try key.valBytes(arena, .{ .keyword = boot.unique_identity });
+        try store.writeBatch(txn, 5, &.{
+            .{ .e = a, .a = boot.unique, .vbytes = identity, .added = true, .avet = false, .vaet = false },
+        }, arena);
+        try store.writeBatch(txn, 6, &.{
+            .{ .e = r, .a = boot.is_component, .vbytes = yes, .added = true, .avet = false, .vaet = false },
+        }, arena);
+        try store.writeT(txn, 6);
         try txn.commit();
     }
     const txn = try store.beginRead();
     defer txn.abort();
-    const schema = try Schema.build(testing.allocator, store, txn, 4, 4);
+    const schema = try Schema.build(testing.allocator, store, txn, 6, 6);
     defer schema.deinit();
     const full = schema.attr(a).?;
     try testing.expect(full.indexed);
     try testing.expect(full.fulltext);
+    try testing.expectEqual(Unique.identity, full.unique);
     try testing.expectEqual(@as(u64, 2), full.since);
+    try testing.expectEqual(@as(u64, 3), full.index_t);
     try testing.expectEqual(@as(u64, 3), full.avet_since);
     try testing.expectEqual(@as(u64, 4), full.fulltext_since);
+    try testing.expectEqual(@as(u64, 5), full.unique_t);
+    try testing.expect(schema.attr(r).?.component);
+    try testing.expectEqual(@as(u64, 6), schema.attr(r).?.component_t);
+    // Each flag is masked by its own t: indexed and in AVET from 3,
+    // unique only from 5.
+    const at4 = schema.attrAt(a, 4).?;
+    try testing.expect(at4.indexed and at4.inAvet() and at4.fulltext);
+    try testing.expectEqual(Unique.none, at4.unique);
+    try testing.expectEqual(@as(u64, 0), at4.unique_t);
+    try testing.expectEqual(@as(u64, 3), at4.avet_since);
+    try testing.expectEqual(Unique.identity, schema.attrAt(a, 5).?.unique);
     const at3 = schema.attrAt(a, 3).?;
     try testing.expect(at3.indexed);
     try testing.expect(!at3.fulltext);
     try testing.expectEqual(@as(u64, 0), at3.fulltext_since);
     const at2 = schema.attrAt(a, 2).?;
-    try testing.expect(!at2.indexed);
+    try testing.expect(!at2.indexed and !at2.inAvet());
+    try testing.expectEqual(@as(u64, 0), at2.index_t);
+    try testing.expectEqual(@as(u64, 0), at2.avet_since);
     try testing.expectEqual(ValueType.string, at2.value_type);
     try testing.expect(schema.attrAt(a, 1) == null);
     try testing.expect(!schema.attr(boot.ident).?.fulltext);
+    try testing.expect(!schema.attrAt(r, 5).?.component);
+    try testing.expectEqual(@as(u64, 0), schema.attrAt(r, 5).?.component_t);
+    try testing.expect(schema.attrAt(r, 6).?.component);
 
     // The same shapes fall out of a history build at basis 2.
-    const old = try Schema.build(testing.allocator, store, txn, 2, 4);
+    const old = try Schema.build(testing.allocator, store, txn, 2, 6);
     defer old.deinit();
     try testing.expect(!old.attr(a).?.indexed);
     try testing.expect(!old.attr(a).?.fulltext);
-    try testing.expectEqual(@as(usize, boot.attrs.len + 1), old.count());
+    try testing.expectEqual(Unique.none, old.attr(a).?.unique);
+    try testing.expect(!old.attr(r).?.component);
+    try testing.expectEqual(@as(usize, boot.attrs.len + 2), old.count());
+    const at4h = try Schema.build(testing.allocator, store, txn, 4, 6);
+    defer at4h.deinit();
+    try testing.expect(at4h.attr(a).?.indexed);
+    try testing.expectEqual(Unique.none, at4h.attr(a).?.unique);
 }

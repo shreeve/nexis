@@ -350,11 +350,17 @@ emit the group's newest kept datom iff its `added` is 1.
 **Schema as-of.** `Schema` is built from the attribute partition's
 datoms with `t ≤ basis`, cached per `(store, basis)`; a cache built at
 a later basis serves an earlier one: attributes created after it are
-hidden, `:db/index`, `:db/unique` and `:db/fulltext` that arrived after
-it are masked, and an attribute whose cardinality has changed carries the timeline of
-its `:db/cardinality` assertions, read from the history tree, so the
-cardinality in force at the earlier basis is what `entity`, `pull` and
-the planner see.
+hidden; `:db/index`, `:db/unique`, `:db/isComponent` and `:db/fulltext`
+are each masked by the `t` of its own assertion, so an attribute
+indexed at one `t` and made unique at a later one is indexed and not
+unique in a view between them (`schema` shows it so, and a lookup ref
+on it is refused there); and an attribute whose cardinality has changed
+carries the timeline of its `:db/cardinality` assertions, read from the
+history tree, so the cardinality in force at the earlier basis is what
+`entity`, `pull` and the planner see. A flag reads its assertion in
+force alone: `:db/isComponent`, the one of the four that may be set
+false again, reads as false in every view before the assertion in
+force, even one that saw an earlier `true`.
 
 The txlog is the change feed: `(d/tx-range conn from to)` scans
 `nx/txlog` over `from ≤ t < to`; a bound that is `nil` or not given is
