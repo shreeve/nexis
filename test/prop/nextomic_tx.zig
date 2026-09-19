@@ -435,7 +435,7 @@ const Gen = struct {
             const vb = try key.valBytes(self.arena, d.v);
             try got.put(self.arena, try std.fmt.allocPrint(self.arena, "{d}|{d}|{x}|{}", .{ d.e, d.a, vb, d.added }), {});
         }
-        try expectSameKeys(void, &want, &got);
+        try expectSameKeys(void, "the replayed model", &want, &got);
         try p.commit();
         // Alive set: entities with any current fact.
         m.alive.clearRetainingCapacity();
@@ -471,8 +471,10 @@ const Gen = struct {
     }
 };
 
-fn expectSameKeys(comptime V: type, want: *std.StringHashMapUnmanaged(V), got: *std.StringHashMapUnmanaged(V)) !void {
+/// `got` holds exactly `want`; a difference is printed under `where`.
+fn expectSameKeys(comptime V: type, where: []const u8, want: *std.StringHashMapUnmanaged(V), got: *std.StringHashMapUnmanaged(V)) !void {
     var ok = want.count() == got.count();
+    errdefer std.debug.print("key sets differ at {s} (seed 0x{x})\n", .{ where, prng_seed });
     var it = want.iterator();
     while (it.next()) |e| {
         const g = got.get(e.key_ptr.*);
@@ -536,9 +538,10 @@ fn verifyAllBases(arena_parent: Allocator, model: *Model, tc: *db_mod.TestConn, 
         var want_set = try model.replay(arena, null, t);
         var want = try toCounted(arena, &want_set);
         var got = try viewSet(arena, view, .eavt, .{}, false);
-        try expectSameKeys(u32, &want, &got);
+        const where = try std.fmt.allocPrint(arena, "as-of {d}", .{t});
+        try expectSameKeys(u32, where, &want, &got);
         var got_aevt = try viewSet(arena, view, .aevt, .{}, false);
-        try expectSameKeys(u32, &want, &got_aevt);
+        try expectSameKeys(u32, where, &want, &got_aevt);
 
         // AVET holds exactly the unique attribute's facts; VAET the refs.
         var want_avet: std.StringHashMapUnmanaged(u32) = .empty;
@@ -552,21 +555,21 @@ fn verifyAllBases(arena_parent: Allocator, model: *Model, tc: *db_mod.TestConn, 
             if (a == model.attrs.friend or a == model.attrs.home) try want_vaet.put(arena, k.*, 1);
         }
         var got_avet = try viewSet(arena, view, .avet, .{ .a = model.attrs.email }, false);
-        try expectSameKeys(u32, &want_avet, &got_avet);
+        try expectSameKeys(u32, where, &want_avet, &got_avet);
         var got_vaet = try viewSet(arena, view, .vaet, .{}, false);
-        try expectSameKeys(u32, &want_vaet, &got_vaet);
+        try expectSameKeys(u32, where, &want_vaet, &got_vaet);
 
         // since: a random earlier point, from an empty state.
         const after = rand.uintLessThan(u64, t);
         var want_since_set = try model.replay(arena, after, t);
         var want_since = try toCounted(arena, &want_since_set);
         var got_since = try viewSet(arena, view.sinceT(after), .eavt, .{}, false);
-        try expectSameKeys(u32, &want_since, &got_since);
+        try expectSameKeys(u32, try std.fmt.allocPrint(arena, "since {d} as-of {d}", .{ after, t }), &want_since, &got_since);
 
         // history: every row up to t, with its flag.
         var want_hist = try model.historyRows(arena, t);
         var got_hist = try viewSet(arena, view.withHistory(), .eavt, .{}, true);
-        try expectSameKeys(u32, &want_hist, &got_hist);
+        try expectSameKeys(u32, try std.fmt.allocPrint(arena, "history as-of {d}", .{t}), &want_hist, &got_hist);
     }
     // The plain db equals as-of its basis; the current-tree fast path
     // and the fold agree.
@@ -575,7 +578,7 @@ fn verifyAllBases(arena_parent: Allocator, model: *Model, tc: *db_mod.TestConn, 
     const arena = arena_state.allocator();
     var fast = try viewSet(arena, db, .eavt, .{}, false);
     var folded = try viewSet(arena, db.asOf(db.basis), .eavt, .{}, false);
-    try expectSameKeys(u32, &fast, &folded);
+    try expectSameKeys(u32, "the current trees against the fold", &fast, &folded);
 }
 
 // =============================================================================
@@ -612,6 +615,7 @@ test "T1 random transactions vs the model at every basis, reopen, abort" {
     var last_t: u64 = (try tc.conn.db()).basis;
     var i: usize = 0;
     while (i < transactions) : (i += 1) {
+        errdefer std.debug.print("failed at transaction {d} of seed 0x{x}\n", .{ i, prng_seed });
         if (i == reopen_at) {
             try tc.reopen();
             try testing.expectEqual(last_t, (try tc.conn.db()).basis);

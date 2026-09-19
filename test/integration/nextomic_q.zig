@@ -39,158 +39,7 @@ const key = nextomic.key;
 // Fixture
 // =============================================================================
 
-const Fx = struct {
-    tc: *TestConn,
-    heap: Heap,
-    arena_state: std.heap.ArenaAllocator,
-
-    fn init(name: []const u8) !*Fx {
-        const self = try testing.allocator.create(Fx);
-        self.* = .{
-            .tc = try TestConn.init(name),
-            .heap = Heap.init(testing.allocator),
-            .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
-        };
-        return self;
-    }
-
-    fn deinit(self: *Fx) void {
-        self.arena_state.deinit();
-        self.heap.deinit();
-        self.tc.deinit();
-        testing.allocator.destroy(self);
-    }
-
-    fn arena(self: *Fx) Allocator {
-        return self.arena_state.allocator();
-    }
-
-    fn interner(self: *Fx) *Interner {
-        return &self.tc.interner;
-    }
-
-    fn conn(self: *Fx) *nextomic.Conn {
-        return self.tc.conn;
-    }
-
-    /// Read one form of source text into a VM value.
-    fn read(self: *Fx, src: []const u8) !Value {
-        var parsed = try reader_mod.parser.parseProgram(testing.allocator, src);
-        defer parsed.parser.deinit();
-        var rdr = reader_mod.Reader.init(testing.allocator, src);
-        defer rdr.deinit();
-        const forms = try rdr.readProgram(parsed.sexp);
-        try testing.expectEqual(@as(usize, 1), forms.len);
-        return self.formToValue(forms[0]);
-    }
-
-    fn formToValue(self: *Fx, form: *const reader_mod.Form) anyerror!Value {
-        const a = self.arena();
-        return switch (form.datum) {
-            .nil => value.nilValue(),
-            .bool_ => |b| value.fromBool(b),
-            .int => |n| value.fromFixnum(n).?,
-            .real => |d| value.fromFloat(d),
-            .string => |s| try string_mod.fromBytes(&self.heap, s),
-            .keyword => |name| try self.interner().internKeywordValue(try joinName(a, name)),
-            .symbol => |name| try self.interner().internSymbolValue(try joinName(a, name)),
-            .list => |items| blk: {
-                const vals = try a.alloc(Value, items.len);
-                for (items, vals) |it, *v| v.* = try self.formToValue(it);
-                break :blk try list_mod.fromSlice(&self.heap, vals);
-            },
-            .vector => |items| blk: {
-                const vals = try a.alloc(Value, items.len);
-                for (items, vals) |it, *v| v.* = try self.formToValue(it);
-                break :blk try vector_mod.fromSlice(&self.heap, vals);
-            },
-            .map => |items| blk: {
-                var m = try champ.mapEmpty(&self.heap);
-                var i: usize = 0;
-                while (i < items.len) : (i += 2) {
-                    m = try champ.mapAssoc(&self.heap, m, try self.formToValue(items[i]), try self.formToValue(items[i + 1]), &dispatch.hashValue, &dispatch.equal);
-                }
-                break :blk m;
-            },
-            .set => |items| blk: {
-                var s = try champ.setEmpty(&self.heap);
-                for (items) |it| s = try champ.setConj(&self.heap, s, try self.formToValue(it), &dispatch.hashValue, &dispatch.equal);
-                break :blk s;
-            },
-            else => error.UnsupportedForm,
-        };
-    }
-
-    fn joinName(a: Allocator, name: anytype) ![]const u8 {
-        if (name.ns) |ns| return std.fmt.allocPrint(a, "{s}/{s}", .{ ns, name.name });
-        return name.name;
-    }
-
-    fn transact(self: *Fx, src: []const u8) !nextomic.Report {
-        const tx = try self.read(src);
-        return nextomic.transact.transact(self.conn(), self.arena(), tx, .{});
-    }
-
-    fn db(self: *Fx) !DbValue {
-        return self.conn().db();
-    }
-
-    fn kw(self: *Fx, name: []const u8) !u32 {
-        return self.interner().internKeyword(name);
-    }
-
-    fn str(self: *Fx, s: []const u8) !Value {
-        return string_mod.fromBytes(&self.heap, s);
-    }
-
-    fn hook(self: *Fx) query.CallHook {
-        return .{ .ctx = @ptrCast(self), .call = &hookCall };
-    }
-
-    /// The test's user functions.
-    fn hookCall(ctx: *anyopaque, sym_id: u32, args: []const Value) anyerror!Value {
-        const self: *Fx = @ptrCast(@alignCast(ctx));
-        const name = self.interner().symbolName(sym_id);
-        const a = self.arena();
-        if (std.mem.eql(u8, name, "identity")) return args[0];
-        if (std.mem.eql(u8, name, "inc")) return value.fromFixnum(args[0].asFixnum() + 1).?;
-        if (std.mem.eql(u8, name, "add")) return value.fromFixnum(args[0].asFixnum() + args[1].asFixnum()).?;
-        if (std.mem.eql(u8, name, "even?")) return value.fromBool(@mod(args[0].asFixnum(), 2) == 0);
-        if (std.mem.eql(u8, name, "str")) {
-            var out: std.ArrayList(u8) = .empty;
-            for (args) |x| switch (x.kind()) {
-                .string => try out.appendSlice(a, string_mod.asBytes(x)),
-                .fixnum => try out.print(a, "{d}", .{x.asFixnum()}),
-                .keyword => try out.print(a, ":{s}", .{self.interner().keywordName(x.asKeywordId())}),
-                else => try out.appendSlice(a, "?"),
-            };
-            return string_mod.fromBytes(&self.heap, out.items);
-        }
-        if (std.mem.eql(u8, name, "upper")) {
-            const s = string_mod.asBytes(args[0]);
-            const out = try a.alloc(u8, s.len);
-            for (s, out) |c, *o| o.* = std.ascii.toUpper(c);
-            return string_mod.fromBytes(&self.heap, out);
-        }
-        if (std.mem.eql(u8, name, "range")) {
-            const n: usize = @intCast(args[0].asFixnum());
-            const vals = try a.alloc(Value, n);
-            for (vals, 0..) |*v, i| v.* = value.fromFixnum(@intCast(i)).?;
-            return vector_mod.fromSlice(&self.heap, vals);
-        }
-        if (std.mem.eql(u8, name, "pair")) return vector_mod.fromSlice(&self.heap, args[0..2]);
-        if (std.mem.eql(u8, name, "halves")) {
-            // [[n 0] [n 1]]
-            const rows = try a.alloc(Value, 2);
-            rows[0] = try vector_mod.fromSlice(&self.heap, &.{ args[0], value.fromFixnum(0).? });
-            rows[1] = try vector_mod.fromSlice(&self.heap, &.{ args[0], value.fromFixnum(1).? });
-            return vector_mod.fromSlice(&self.heap, rows);
-        }
-        if (std.mem.eql(u8, name, "maybe")) return if (args[0].asFixnum() > 30) args[0] else value.nilValue();
-        if (std.mem.eql(u8, name, "boom")) return error.ControlTransferred;
-        return error.UnknownFunction;
-    }
-};
+const Fx = @import("nextomic_fx.zig").Fx;
 
 const long_bio_a = "Ann has a biography that runs well past the ninety-six byte inline limit of the sortable string encoding, so it lives out of line with a prefix and a hash.";
 const long_bio_d = "Di also has a long biography, long enough to be stored out of line; the first sixty-four bytes are shared with nothing else in this corpus at all.";
@@ -1112,7 +961,7 @@ test "corpus: every :in form" {
 
     try checkCount(fx, dbv, "[:find ?e :in $ ?n :where [?e :person/name ?n]]", &.{ nil, try fx.str("Cy") }, 1);
     try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e :person/age ?a]]", &.{ nil, value.fromFixnum(30).? }, 2);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?t :where [?e :person/tags ?t]]", &.{ nil, value.fromKeywordId(try fx.kw("green")) }, 2);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?t :where [?e :person/tags ?t]]", &.{ nil, value.fromKeywordId(try fx.kwId("green")) }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, value.fromFixnum(@intCast(key.user_partition_start)).? }, 1);
     try checkCount(fx, dbv, "[:find ?e :in $ [?n ...] :where [?e :person/name ?n]]", &.{ nil, try fx.read("[\"Ann\" \"Bob\" \"Nobody\"]") }, 2);
     try checkCount(fx, dbv, "[:find ?e :in $ [?n ?a] :where [?e :person/name ?n] [?e :person/age ?a]]", &.{ nil, try fx.read("[\"Ann\" 30]") }, 1);
@@ -1121,18 +970,18 @@ test "corpus: every :in form" {
     try checkCount(fx, dbv, "[:find ?e :in $ ?lo ?hi :where [?e :person/age ?a] [(< ?lo ?a ?hi)]]", &.{ nil, value.fromFixnum(29).?, value.fromFixnum(34).? }, 3);
     try checkCount(fx, dbv, "[:find ?n ?x :in $ [?x ...] :where [?e :person/name ?n] [?e :person/age ?a] [(< ?a ?x)]]", &.{ nil, try fx.read("[27 31]") }, 4);
     try checkCount(fx, dbv, "[:find ?p :in $ % :where (admin ?p)]", &.{ nil, try fx.read(rules_src) }, 2);
-    try checkCount(fx, dbv, "[:find ?n :in $ % ?t :where (has-tag ?p ?t) [?p :person/name ?n]]", &.{ nil, try fx.read(rules_src), value.fromKeywordId(try fx.kw("green")) }, 4);
+    try checkCount(fx, dbv, "[:find ?n :in $ % ?t :where (has-tag ?p ?t) [?p :person/name ?n]]", &.{ nil, try fx.read(rules_src), value.fromKeywordId(try fx.kwId("green")) }, 4);
     try checkCount(fx, dbv, "[:find ?x :in $ ?x]", &.{ nil, value.fromFixnum(5).? }, 1);
     // A bound attribute variable, by id and by ident; an unknown ident matches nothing.
-    const name_id = (try dbv.entid(fx.arena(), .{ .ident = try fx.kw("person/name") })).?;
+    const name_id = (try dbv.entid(fx.arena(), .{ .ident = try fx.kwId("person/name") })).?;
     try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromFixnum(@intCast(name_id)).? }, 6);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kw("person/name")) }, 6);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a \"Cy\"]]", &.{ nil, value.fromKeywordId(try fx.kw("person/name")) }, 1);
-    try checkCount(fx, dbv, "[:find ?v :in $ ?a ?e :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kw("person/tags")), value.fromFixnum(@intCast(key.user_partition_start)).? }, 1);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kw("nope/attr")) }, 0);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("person/name")) }, 6);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a \"Cy\"]]", &.{ nil, value.fromKeywordId(try fx.kwId("person/name")) }, 1);
+    try checkCount(fx, dbv, "[:find ?v :in $ ?a ?e :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("person/tags")), value.fromFixnum(@intCast(key.user_partition_start)).? }, 1);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("nope/attr")) }, 0);
     // A bound value with no attribute: a string or keyword is matched across every attribute.
     try checkCount(fx, dbv, "[:find ?e :in $ ?v :where [?e _ ?v]]", &.{ nil, try fx.str("Cy") }, 1);
-    try checkCount(fx, dbv, "[:find ?e ?a :in $ ?v :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kw("green")) }, 2);
+    try checkCount(fx, dbv, "[:find ?e ?a :in $ ?v :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("green")) }, 2);
     try checkCount(fx, dbv, "[:find ?e :where [?e _ \"Cy\"]]", &.{nil}, 1);
     try checkCount(fx, dbv, "[:find ?e ?a :where [?e ?a \"Cy\"]]", &.{nil}, 1);
     try checkCount(fx, dbv, "[:find ?e :where [?e _ \"Nobody\"]]", &.{nil}, 0);
@@ -1145,15 +994,15 @@ test "corpus: every :in form" {
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, ann_ref }, 1);
     const as_eid = try check(fx, dbv, "[:find ?e :in $ ?e :where [?e :person/name _]]", &.{ nil, ann_ref });
     try testing.expectEqual(@as(i64, @intCast(key.user_partition_start)), as_eid.cell(0, 0).int);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?e :where [?e :db/ident _]]", &.{ nil, value.fromKeywordId(try fx.kw("role/admin")) }, 1);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?e :where [?e :db/ident _]]", &.{ nil, value.fromKeywordId(try fx.kwId("role/admin")) }, 1);
     try checkCount(fx, dbv, "[:find ?n :in $ [?e ...] :where [?e :person/name ?n]]", &.{ nil, try fx.read("[[:person/email \"ann@x\"] [:person/email \"bob@x\"] [:person/email \"nobody@x\"]]") }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ ?b :where [?e :person/boss ?b] [?e :person/name ?n]]", &.{ nil, ann_ref }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ [?b ?a] :where [?e :person/boss ?b] [?e :person/age ?a] [?e :person/name ?n]]", &.{ nil, try fx.read("[[:person/email \"ann@x\"] 26]") }, 1);
     try checkCount(fx, dbv, "[:find ?n :in $ [[?e ?a]] :where [?e :person/age ?a] [?e :person/name ?n]]", &.{ nil, try fx.read("[[[:person/email \"ann@x\"] 30] [[:person/email \"bob@x\"] 1] [:role/admin 5]]") }, 1);
-    try checkCount(fx, dbv, "[:find ?n :in $ ?r :where [?e :person/role ?r] [?e :person/name ?n]]", &.{ nil, value.fromKeywordId(try fx.kw("role/admin")) }, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?r :where [?e :person/role ?r] [?e :person/name ?n]]", &.{ nil, value.fromKeywordId(try fx.kwId("role/admin")) }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/email \"nobody@x\"]") }, 0);
     try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/email 5]") }));
-    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, value.fromKeywordId(try fx.kw("role/nobody")) }, 0);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, value.fromKeywordId(try fx.kwId("role/nobody")) }, 0);
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where (not [?e :person/age 30]) [?e :person/name ?n]]", &.{ nil, ann_ref }, 0);
     try testing.expectError(error.TxData, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/name \"Ann\"]") }));
     try testing.expectError(error.UnknownAttribute, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:nope/attr \"Ann\"]") }));
@@ -1164,7 +1013,7 @@ test "corpus: every :in form" {
     // An unknown attribute in a lookup-ref input is named in the diagnostic.
     var in_diag: query.Diag = .{};
     try testing.expectError(error.UnknownAttribute, runEngineDiag(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:nope/attr \"Ann\"]") }, &in_diag));
-    try testing.expectEqual(try fx.kw("nope/attr"), in_diag.attr.?.asKeywordId());
+    try testing.expectEqual(try fx.kwId("nope/attr"), in_diag.attr.?.asKeywordId());
 }
 
 test "corpus: not, not-join, or, or-join, and" {
@@ -1210,7 +1059,7 @@ test "corpus: not, not-join, or, or-join, and" {
     }
     var d_attr: query.Diag = .{};
     try testing.expectError(error.UnknownAttribute, runEngineDiag(fx, fx.arena(), dbv, "[:find ?e :where [?e :nope/attr ?v]]", none, &d_attr));
-    try testing.expectEqual(try fx.kw("nope/attr"), d_attr.attr.?.asKeywordId());
+    try testing.expectEqual(try fx.kwId("nope/attr"), d_attr.attr.?.asKeywordId());
     d_attr = .{};
     try testing.expectError(error.UnknownAttribute, runEngineDiag(fx, fx.arena(), dbv, "[:find ?e :where [?e 4000 ?v]]", none, &d_attr));
     try testing.expectEqual(@as(i64, 4000), d_attr.attr.?.asFixnum());

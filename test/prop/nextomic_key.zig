@@ -82,6 +82,11 @@ fn expectOrdered(gpa: std.mem.Allocator, a: Val, b: Val) !void {
     try testing.expectEqual(want == .eq, a.eql(b));
 }
 
+/// Names the failing trial of a sweep: its seed and iteration.
+fn trial(seed: u64, i: usize) void {
+    std.debug.print("failed at iteration {d} of seed 0x{x}\n", .{ i, seed });
+}
+
 test "K1 fixed-width types: encoding order equals value order" {
     var prng = std.Random.DefaultPrng.init(prng_seed +% 1);
     const rand = prng.random();
@@ -89,6 +94,7 @@ test "K1 fixed-width types: encoding order equals value order" {
     defer arena.deinit();
     var i: usize = 0;
     while (i < pairs_per_type) : (i += 1) {
+        errdefer trial(prng_seed +% 1, i);
         const gpa = arena.reset();
         try expectOrdered(gpa, .{ .boolean = rand.boolean() }, .{ .boolean = rand.boolean() });
         try expectOrdered(gpa, .{ .long = randLong(rand) }, .{ .long = randLong(rand) });
@@ -114,6 +120,7 @@ test "K2 inline strings and bytes: encoding order equals byte order, escape roun
     var bb: [key.inline_max]u8 = undefined;
     var i: usize = 0;
     while (i < pairs_per_type) : (i += 1) {
+        errdefer trial(prng_seed +% 2, i);
         const gpa = arena.reset();
         const sa = randBlob(rand, &ba, key.inline_max);
         var sb = randBlob(rand, &bb, key.inline_max);
@@ -179,6 +186,8 @@ test "K4 every AVET key of an inline value is under 256 bytes" {
     var buf: [key.inline_max]u8 = undefined;
     var i: usize = 0;
     while (i < pairs_per_type) : (i += 1) {
+        errdefer trial(prng_seed +% 4, i);
+        errdefer trial(prng_seed +% 3, i);
         const gpa = arena.reset();
         const v: Val = switch (rand.uintLessThan(u8, 9)) {
             0 => .{ .boolean = rand.boolean() },
@@ -207,6 +216,47 @@ test "K4 every AVET key of an inline value is under 256 bytes" {
     try testing.expectEqual(@as(usize, 210), wk.len);
 }
 
+test "K6 values of different types order by type, whatever their contents" {
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 6);
+    const rand = prng.random();
+    var arena = Arena.init();
+    defer arena.deinit();
+    var ba: [key.inline_max]u8 = undefined;
+    var bb: [key.inline_max]u8 = undefined;
+    var i: usize = 0;
+    while (i < pairs_per_type) : (i += 1) {
+        errdefer trial(prng_seed +% 6, i);
+        const gpa = arena.reset();
+        const a = randVal(rand, &ba);
+        const b = randVal(rand, &bb);
+        if (a.valueType() == b.valueType()) continue;
+        const want = std.math.order(@intFromEnum(a.valueType()), @intFromEnum(b.valueType()));
+        const ea = try key.valBytes(gpa, a);
+        const eb = try key.valBytes(gpa, b);
+        try testing.expectEqual(want, std.mem.order(u8, ea, eb));
+        try testing.expect(!a.eql(b));
+    }
+}
+
+/// A value of a random type; strings and bytes are inline.
+fn randVal(rand: std.Random, buf: []u8) Val {
+    return switch (rand.uintLessThan(u8, 9)) {
+        0 => .{ .boolean = rand.boolean() },
+        1 => .{ .long = randLong(rand) },
+        2 => .{ .double = randDouble(rand) },
+        3 => .{ .instant = randLong(rand) },
+        4 => .{ .keyword = rand.int(u32) },
+        5 => .{ .ref = rand.uintAtMost(u64, key.id_max) },
+        6 => .{ .string = randBlob(rand, buf, buf.len) },
+        7 => blk: {
+            var u: [16]u8 = undefined;
+            rand.bytes(&u);
+            break :blk .{ .uuid = u };
+        },
+        else => .{ .bytes = randBlob(rand, buf, buf.len) },
+    };
+}
+
 test "K5 strings across the inline threshold: one tag, order holds on the 64-byte prefix" {
     var prng = std.Random.DefaultPrng.init(prng_seed +% 5);
     const rand = prng.random();
@@ -216,6 +266,7 @@ test "K5 strings across the inline threshold: one tag, order holds on the 64-byt
     var bb: [1024]u8 = undefined;
     var i: usize = 0;
     while (i < pairs_per_type) : (i += 1) {
+        errdefer trial(prng_seed +% 5, i);
         const gpa = arena.reset();
         const sa = randBlob(rand, &ba, key.inline_max);
         const sb = bb[0 .. key.inline_max + 1 + rand.uintAtMost(usize, bb.len - key.inline_max - 1)];
