@@ -210,9 +210,10 @@ pub const Loader = struct {
                 .{ .user_data = @ptrCast(self), .load = &Loader.loadCallback },
                 &declared,
             ) catch return LoadError.LoadCompileFailed;
+            // A nested call, never a retarget of the top frame: the
+            // VM may be executing the program that required us.
             const routine = compiled.toRoutine("loader");
-            self.vm.retargetTop(&routine) catch return LoadError.OutOfMemory;
-            _ = self.vm.run() catch return LoadError.LoadCompileFailed;
+            _ = self.vm.runRoutine(&routine) catch return LoadError.LoadCompileFailed;
         }
     }
 

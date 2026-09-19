@@ -4133,6 +4133,70 @@ test "runtime errors: a closure called back from a native is the frame named fn"
     try expectFrame(&program, &info, 1, "<top>", 1, 2, "map (fn [x] (/ 1 x)) [1 0");
 }
 
+/// Compile one form of `src` into a routine the caller owns, the
+/// way the loader compiles a required file's forms.
+fn compileRoutineForTest(program: *Program, src: []const u8) !vm.Routine {
+    var parse_result = try reader_mod.parser.parseForm(program.arena.allocator(), src);
+    defer parse_result.parser.deinit();
+    var rdr = reader_mod.Reader.init(program.arena.allocator(), src);
+    defer rdr.deinit();
+    const form = try rdr.readOneForm(parse_result.sexp);
+    var declared = compile.DeclaredNames.init(testing.allocator);
+    defer declared.deinit();
+    try declared.declareForm(form);
+    const compiled = try compile.compileFormWith(program.arena.allocator(), form, .{
+        .namespace = program.registry.current,
+        .interner = program.interner,
+        .host_macros = &program.host_macros,
+        .persistent_allocator = program.v.runtime_arena.allocator(),
+        .registry = program.registry,
+        .declared = &declared,
+    });
+    return compiled.toRoutine("nested");
+}
+
+var nested_routine: ?*const vm.Routine = null;
+
+fn nativeNestedRun(v: *vm.VM, _: []const value_mod.Value) vm.VmError!value_mod.Value {
+    return v.runRoutine(nested_routine.?);
+}
+
+const native_nested_run = vm.NativeFn{ .name = "nested-run", .min_arity = 0, .max_arity = 0, .call = &nativeNestedRun };
+
+test "runRoutine: a top-level routine runs as a nested call inside an executing program" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const nested_var = try program.registry.core.intern("nested-run");
+    nested_var.root = vm.nativeFnValue(&native_nested_run);
+    nested_var.bound = true;
+
+    var adder = try compileRoutineForTest(&program, "(do (def seen 40) (+ seen 2))");
+    nested_routine = &adder;
+    defer nested_routine = null;
+    // Mid-execution: a local is live below the nested frame and
+    // survives it; the defined Var is visible afterwards.
+    const result = try program.run("(let [a 1] (+ a (nested-run)))");
+    try testing.expectEqual(@as(i64, 43), result.asFixnum());
+    try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+    const seen = try program.run("seen");
+    try testing.expectEqual(@as(i64, 40), seen.asFixnum());
+    // Idle: the same call on a VM between runs.
+    const idle = try program.v.runRoutine(&adder);
+    try testing.expectEqual(@as(i64, 42), idle.asFixnum());
+    try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+
+    // A throw out of the nested routine reaches the program's handler.
+    var thrower = try compileRoutineForTest(&program, "(throw :inner)");
+    nested_routine = &thrower;
+    const caught = try program.run("(try (nested-run) (catch :inner e [:caught e]))");
+    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
+    defer buf.deinit();
+    try formatValue(&buf, caught, program.interner);
+    try testing.expectEqualStrings("[:caught :inner]", buf.items);
+    try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+}
+
 test "runtime errors: resetAfterError leaves the VM ready for the next form" {
     var program: Program = undefined;
     try program.init();

@@ -2303,6 +2303,34 @@ pub const VM = struct {
         }
     }
 
+    /// Run a compiled top-level `routine` to its `return` as a
+    /// nested call: a frame above whatever is executing, on the
+    /// stack above its slots, so the loader can run a required
+    /// file's forms from inside a running program (a `require`
+    /// reached through the compiler hooks) without retargeting the
+    /// frame that is executing. The VM is left as it was found,
+    /// idle or mid-execution; a throw the routine does not catch
+    /// propagates as `UncaughtThrow` or, when a handler above the
+    /// call takes it, `ControlTransferred`.
+    pub fn runRoutine(self: *VM, routine: *const Routine) VmError!Value {
+        if (routine.upvalue_count != 0) return VmError.CaptureCountMismatch;
+        const base_slot: usize = self.stack.items.len;
+        self.stack.appendNTimes(self.allocator, value_mod.nilValue(), routine.slot_count) catch return VmError.OutOfMemory;
+        var result_cell = HostCallResult{};
+        const initial_depth = self.frames.items.len;
+        try self.pushFrame(.{
+            .routine = routine,
+            .base_slot = @intCast(base_slot),
+            .entry_stack_len = @intCast(base_slot),
+            .slot_count = routine.slot_count,
+            .pc = 0,
+            .host_result = &result_cell,
+        });
+        try self.runUntilDepth(initial_depth);
+        if (!result_cell.done) return VmError.ControlTransferred;
+        return result_cell.value;
+    }
+
     /// Dispatch instructions until
     /// `frames.items.len == target_depth`. Unlike `run()`, does
     /// NOT toggle global `halted` — termination is purely
