@@ -307,25 +307,20 @@ fn validateTreeNameAndKey(tree_name: []const u8, key_bytes: []const u8) DbError!
 /// emdb's own behavior for the name.
 pub fn treeId(txn: anytype, tree_name: []const u8, create: bool) !?emdb.TreeId {
     const conn = txn.conn;
-    if (conn.tree_ids.get(tree_name)) |id| {
-        if (!txn.opened.isSet(id)) {
-            const loaded = txn.inner.openTree(tree_name, create) catch |err| switch (err) {
-                error.NotFound => return null,
-                else => return err,
-            };
-            std.debug.assert(loaded == id);
-            txn.opened.set(id);
-        }
-        return id;
-    }
+    const cached = conn.tree_ids.get(tree_name);
+    if (cached) |id| if (txn.opened.isSet(id)) return id;
     const id = txn.inner.openTree(tree_name, create) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
     std.debug.assert(id < TreeSet.bit_length);
-    const owned_name = try conn.allocator.dupe(u8, tree_name);
-    errdefer conn.allocator.free(owned_name);
-    try conn.tree_ids.put(conn.allocator, owned_name, id);
+    if (cached) |known| {
+        std.debug.assert(known == id);
+    } else {
+        const owned_name = try conn.allocator.dupe(u8, tree_name);
+        errdefer conn.allocator.free(owned_name);
+        try conn.tree_ids.put(conn.allocator, owned_name, id);
+    }
     txn.opened.set(id);
     return id;
 }
