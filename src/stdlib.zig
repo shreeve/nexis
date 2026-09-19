@@ -728,10 +728,8 @@ fn fnSeq(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(count coll)` → element count. nil → 0. Lists, vectors,
-/// maps, sets, strings supported. For strings: codepoint count
-/// (Phase 5.2a, peer-AI turn 77 §D1 — user-facing count is by
-/// Unicode scalar, not byte; O(n) walk via
-/// `string_mod.codepointCount`).
+/// maps, records, sets and strings; a string counts Unicode
+/// scalars, not bytes.
 fn fnCount(_: *VM, args: []const Value) VmError!Value {
     const c = args[0];
     const n: i64 = switch (c.kind()) {
@@ -739,6 +737,7 @@ fn fnCount(_: *VM, args: []const Value) VmError!Value {
         .list => @intCast(list_mod.count(c)),
         .persistent_vector => @intCast(vector_mod.count(c)),
         .persistent_map => @intCast(champ_mod.mapCount(c)),
+        .record => @intCast(champ_mod.mapCount(record_mod.fieldsOf(c))),
         .persistent_set => @intCast(champ_mod.setCount(c)),
         .string => @intCast(string_mod.codepointCount(c) catch return VmError.Utf8Error),
         else => return VmError.KindMismatch,
@@ -825,6 +824,7 @@ fn fnEmptyQ(_: *VM, args: []const Value) VmError!Value {
         .list => list_mod.isEmpty(c),
         .persistent_vector => vector_mod.isEmpty(c),
         .persistent_map => champ_mod.mapCount(c) == 0,
+        .record => champ_mod.mapCount(record_mod.fieldsOf(c)) == 0,
         .persistent_set => champ_mod.setCount(c) == 0,
         .string => string_mod.byteLen(c) == 0,
         else => return VmError.KindMismatch,
@@ -1511,36 +1511,20 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
             }
             break :blk vector_mod.fromSlice(heap, items.items) catch VmError.OutOfMemory;
         },
-        .persistent_map => blk: {
+        .persistent_map, .record => blk: {
             var result = coll;
             for (xs) |x| {
-                // Each x is a `[k v]` entry, a map whose entries
-                // are all added, or nil (skipped).
+                // Each x is a `[k v]` entry, a map or record whose
+                // entries are all added, or nil (skipped).
                 switch (x.kind()) {
                     .nil => {},
                     .persistent_map, .record => {
                         var it = champ_mod.mapIter(if (x.kind() == .record) record_mod.fieldsOf(x) else x);
-                        while (it.next()) |e| {
-                            result = champ_mod.mapAssoc(
-                                heap,
-                                result,
-                                e.key,
-                                e.value,
-                                &dispatch_mod.hashValue,
-                                &dispatch_mod.equal,
-                            ) catch return VmError.OutOfMemory;
-                        }
+                        while (it.next()) |e| result = try assocOne(vm, result, e.key, e.value);
                     },
                     .persistent_vector => {
                         if (vector_mod.count(x) != 2) return VmError.ArityMismatch;
-                        result = champ_mod.mapAssoc(
-                            heap,
-                            result,
-                            vector_mod.nth(x, 0),
-                            vector_mod.nth(x, 1),
-                            &dispatch_mod.hashValue,
-                            &dispatch_mod.equal,
-                        ) catch return VmError.OutOfMemory;
+                        result = try assocOne(vm, result, vector_mod.nth(x, 0), vector_mod.nth(x, 1));
                     },
                     else => return VmError.KindMismatch,
                 }
@@ -2025,14 +2009,15 @@ fn fnPop(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
-/// `(empty coll)` → an empty collection of the same kind.
+/// `(empty coll)` → an empty collection of the same kind; a
+/// record, being a map, gives `{}`.
 fn fnEmpty(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     return switch (args[0].kind()) {
         .nil => value_mod.nilValue(),
         .list => list_mod.empty(heap) catch VmError.OutOfMemory,
         .persistent_vector => vector_mod.empty(heap) catch VmError.OutOfMemory,
-        .persistent_map => champ_mod.mapEmpty(heap) catch VmError.OutOfMemory,
+        .persistent_map, .record => champ_mod.mapEmpty(heap) catch VmError.OutOfMemory,
         .persistent_set => champ_mod.setEmpty(heap) catch VmError.OutOfMemory,
         .string => string_mod.fromBytes(heap, "") catch VmError.OutOfMemory,
         else => VmError.KindMismatch,
