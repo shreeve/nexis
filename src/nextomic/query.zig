@@ -100,7 +100,7 @@ pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: DbV
     var ctx = try plan.Ctx.init(arena, &read, interner, parsed.query, parsed.rules);
     const p = try plan.plan(&ctx, parsed.query);
     var ex = exec.Exec{ .arena = arena, .read = &read, .heap = heap, .interner = interner, .hook = options.hook };
-    const input = try ex.inputRelation(parsed.query.in, args);
+    const input = try ex.inputRelation(parsed.query, args);
     const rel = try ex.runPlan(p, input);
     const rows = try ex.findRows(parsed.query, rel);
     return ex.materialise(parsed.query.find_spec, rows);

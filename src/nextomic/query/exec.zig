@@ -48,6 +48,7 @@ const Read = db_mod.Read;
 const Var = ir.Var;
 const Cell = ir.Cell;
 const Relation = relation.Relation;
+const Ir = ir.Ir;
 const Plan = plan_mod.Plan;
 const Step = plan_mod.Step;
 const Scan = plan_mod.Scan;
@@ -499,7 +500,14 @@ pub const Exec = struct {
 
     /// The relation the `:in` bindings describe over `args`, which are
     /// positional with `in` (the `$` and `%` positions are ignored).
-    pub fn inputRelation(self: *Exec, in: []const ir.InBinding, args: []const Value) anyerror!Relation {
+    /// The relation the `:in` bindings of `q` make of `args`. A lookup
+    /// ref or an ident bound to a variable in an entity position, or in
+    /// the value position of a ref attribute, becomes the entity id, and
+    /// a row whose reference resolves to nothing is dropped; a keyword
+    /// bound to a variable that is also a keyword attribute's value
+    /// stays a keyword.
+    pub fn inputRelation(self: *Exec, q: *const Ir, args: []const Value) anyerror!Relation {
+        const in = q.in;
         if (args.len != in.len) return error.QuerySyntax;
         var rel = try Relation.unit(self.arena);
         for (in, args) |b, a| {
@@ -532,7 +540,69 @@ pub const Exec = struct {
             };
             rel = try rel.hashJoin(&part);
         }
-        return rel;
+        return self.resolveInputs(q, rel);
+    }
+
+    const InputRole = struct { entity: bool = false, keyword: bool = false };
+
+    /// `rel` with the entity-role columns resolved (see `inputRelation`).
+    fn resolveInputs(self: *Exec, q: *const Ir, rel: Relation) anyerror!Relation {
+        const roles = try self.arena.alloc(InputRole, q.vars.len);
+        @memset(roles, .{});
+        try self.inputRoles(q.where, roles);
+        var cols: std.ArrayList(usize) = .empty;
+        for (rel.vars, 0..) |v, i| if (roles[v].entity and !roles[v].keyword) try cols.append(self.arena, i);
+        if (cols.items.len == 0) return rel;
+
+        var out = try Relation.init(self.arena, rel.vars);
+        const row = try self.arena.alloc(Cell, rel.vars.len);
+        var i: usize = 0;
+        rows: while (i < rel.rows) : (i += 1) {
+            rel.rowInto(i, row);
+            for (cols.items) |c| {
+                if (row[c] != .keyword and row[c] != .vm) continue;
+                const e = (try self.inputEntity(row[c])) orelse continue :rows;
+                row[c] = .{ .int = @intCast(e) };
+            }
+            try out.append(row);
+        }
+        return out;
+    }
+
+    /// Mark the variables in an entity position or a ref attribute's
+    /// value position, and those in a keyword attribute's value position.
+    fn inputRoles(self: *Exec, clauses: []const ir.Clause, roles: []InputRole) anyerror!void {
+        for (clauses) |c| switch (c) {
+            .pattern => |p| {
+                if (p.e.asVar()) |v| roles[v].entity = true;
+                const v = p.v.asVar() orelse continue;
+                if (p.a != .constant or p.a.constant != .cell or p.a.constant.cell != .keyword) continue;
+                const id = (try self.read.db.conn.idents.idOf(self.read.txn, p.a.constant.cell.keyword)) orelse continue;
+                const at = (try self.read.attr(@intCast(id))) orelse continue;
+                if (at.value_type == .ref) roles[v].entity = true;
+                if (at.value_type == .keyword) roles[v].keyword = true;
+            },
+            .not => |n| try self.inputRoles(n.body, roles),
+            .@"or" => |o| for (o.branches) |b| try self.inputRoles(b, roles),
+            .pred, .bind, .rule, .source => {},
+        };
+    }
+
+    /// The entity an ident or lookup-ref input names, or null when
+    /// there is none. A lookup ref on an unknown attribute is
+    /// `UnknownAttribute`; on a non-unique one, `TxData`.
+    fn inputEntity(self: *Exec, c: Cell) anyerror!?u64 {
+        switch (c) {
+            .keyword => |kw| return self.read.entid(self.arena, .{ .ident = kw }),
+            .vm => |v| {
+                if (v.kind() != .persistent_vector or vector_mod.count(v) != 2 or vector_mod.nth(v, 0).kind() != .keyword) return null;
+                const id = (try self.read.db.conn.idents.idOf(self.read.txn, vector_mod.nth(v, 0).asKeywordId())) orelse return error.UnknownAttribute;
+                const at = (try self.read.attr(@intCast(id))) orelse return error.UnknownAttribute;
+                const val = (try plan_mod.encodeCell(self.read, Cell.fromValue(vector_mod.nth(v, 1)), at.value_type)) orelse return null;
+                return self.read.entid(self.arena, .{ .lookup = .{ .a = @intCast(id), .v = val } });
+            },
+            else => return null,
+        }
     }
 
     fn tupleVars(arena: Allocator, ts: []const ?Var) ![]Var {
