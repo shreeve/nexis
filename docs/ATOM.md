@@ -1,18 +1,15 @@
-## ATOM.md — In-memory mutable cells (Phase 5)
+## ATOM.md — In-memory mutable cells
 
-**Status**: Phase 5 deliverable. Authoritative contract for `Kind.atom`
-and the `atom`/`atom?`/`reset!`/`swap!`/`swap-vals!`/`compare-and-set!`
+Authoritative contract for `Kind.atom` (`src/atom.zig`) and the
+`atom`/`atom?`/`reset!`/`swap!`/`swap-vals!`/`compare-and-set!`
 native fns in `nexis.core`. Derivative from `PLAN.md` §23 (Hard
-Decisions — atoms added by amendment, this commit), `docs/VALUE.md` §2.2
-(kind 34 reserved for `atom`), `docs/SEMANTICS.md` §3.2 (equality
-categories), and `HANDOFF.md` §10.1 (peer-AI turn 74 §A initial pins,
-refined this commit by peer-AI turn 75). Those documents win on
-conflict.
+Decisions; atoms enter v1 by Amendment Log entry), `docs/VALUE.md`
+§2.2 (kind 34 `atom`) and `docs/SEMANTICS.md` §3.2 (equality
+categories). Those documents win on conflict.
 
-This document closes the "in-memory mutable identity" gap that Phase 4
-deliberately did not address (Phase 4 covers DURABLE mutation via
-`db/alter!` + `with-tx`; atoms cover EPHEMERAL mutation, single-VM,
-single-thread). Reviewed peer-AI turn 75.
+Atoms are the in-memory mutable identity; durable mutation is
+`db/alter!` + `with-tx` (`docs/DB.md`). Atoms cover EPHEMERAL
+mutation, single-VM, single-thread.
 
 Atoms are NOT a Clojure CAS retry primitive. PLAN.md §23 #5 freezes
 nexis v1 as single-isolate, single-threaded; an atom is a single
@@ -25,7 +22,7 @@ synchronization primitives.
 
 ### 1. Scope
 
-**In (Phase 5 Item 1):**
+**In:**
 - `Kind.atom = 34` — heap kind, 16-byte aligned body, GC-traced.
 - `AtomBox { value: Value, in_flight: bool, _pad: ... }` — heap body.
 - Per-kind dispatch integration: hash by pointer identity, equality by
@@ -33,11 +30,9 @@ synchronization primitives.
   throws `:unserializable`.
 - `nexis.core` native fns: `atom`, `atom?`, `reset!`, `swap!`,
   `swap-vals!`, `compare-and-set!`.
-- Universal `(deref x)` and `@x` extended to atoms by adding an `.atom`
-  arm to `fnDbDeref`'s switch (peer-AI turn 73 already made `db/deref`
-  the universal-deref native fn for `durable_ref` + `var_`; this commit
-  generalizes by installing the same descriptor in `nexis.core` as
-  plain `deref` and adding the atom arm).
+- Universal `(deref x)` and `@x` cover atoms: `fnDbDeref` is the
+  universal-deref native for `durable_ref`, `var_` and `atom`, installed
+  in `nexis.core` as plain `deref` and aliased as `db/deref`.
 - `swap!` re-entrancy detection: an `in_flight` flag on `AtomBox`
   causes nested `swap!`/`reset!`/`compare-and-set!`/`swap-vals!` on the
   SAME atom to throw `:atom-re-entry`. `deref` of an in-flight atom is
@@ -48,11 +43,10 @@ synchronization primitives.
 - Printable representation: `#<atom 0x…>` (pointer identity, NOT the
   contained value — avoids self-reference infinite loops).
 
-**Out (deferred):**
+**Absent:**
 - Validators (`:validator`), watches (`add-watch` / `remove-watch`),
-  metadata on atoms (`:meta`). All keyword opts to `(atom init …)` in
-  this commit throw `:unsupported-arg`. Revisit if a concrete user
-  need appears.
+  metadata on atoms (`:meta`). Every keyword opt to `(atom init …)`
+  throws `:unsupported-arg`.
 - Real CAS / lock-free concurrency primitives. Single-threaded v1 has
   no meaning for these; atoms here are sequential mutable cells.
   Multi-isolate concurrency is post-v1 (PLAN.md §23 #5).
@@ -66,7 +60,7 @@ synchronization primitives.
 
 ```zig
 // src/value.zig — Kind enum, in the heap range (16..63):
-atom = 34,    // Phase 5 Item 1 (peer-AI turn 75): in-memory mutable
+atom = 34,    // in-memory mutable
               // cell. Payload is *HeapHeader → AtomBox in heap body.
 
 // src/atom.zig (new module):
@@ -101,7 +95,7 @@ sweep when unreachable. They are NOT runtime-arena-staged like the
 raw-pointer-in-payload Closure/UpvalCell/Var bodies; those staged
 encodings predate the GC migration and will move to standard heap
 form later. New kinds (this one included) use the standard form
-directly — peer-AI turn 75 §D4 strong-GO.
+directly.
 
 ---
 
@@ -152,11 +146,10 @@ pub fn hashHeader(h: *HeapHeader) u32 {
 
 Caching the pointer-hash is safe BECAUSE the pointer itself never
 changes for the lifetime of the atom. Only the contained `value` can
-change; pointer-hash is invariant under value mutation. (If a moving
-GC ever lands, the atom hash needs to migrate to a stable
-object-identity instead of raw `@intFromPtr` — a TODO carried in
-`docs/GC.md`'s amendment log alongside this commit. Non-moving v1 is
-fine.)
+change; pointer-hash is invariant under value mutation. (A moving
+collector would require the atom hash to migrate to a stable
+object-identity instead of raw `@intFromPtr`; the collector is
+non-moving, `docs/GC.md`.)
 
 **`dispatch.eqCategory` mapping:**
 
@@ -183,7 +176,7 @@ post-v1; see §1).
 (atom 0)              ; => #<atom 0x...>
 (atom :keyword-init)  ; => #<atom 0x...>
 (atom)                ; throws :unsupported-arg (arity)
-(atom 1 :meta {})     ; throws :unsupported-arg (keyword opts deferred)
+(atom 1 :meta {})     ; throws :unsupported-arg (no keyword opts)
 ```
 
 Allocation goes through `heap.alloc(.atom, …)` via `atom.make`. Result
@@ -247,11 +240,11 @@ fn swap_impl(vm: *VM, a_h: *HeapHeader, f: Value, extra: []const Value) !Value {
 
 The `defer body.in_flight = 0` ensures the flag clears on every exit
 path — normal return, thrown VmError, or VM-internal control transfer.
-Per peer-AI turn 75 Q3, no `try/finally` is needed for rollback itself;
+No `try/finally` is needed for rollback itself;
 the write only happens at step 4, which is only reached if `callValue`
 returns normally.
 
-Re-entrancy semantics (peer-AI turn 75 Q2 OPT-A): if `f` calls
+Re-entrancy semantics: if `f` calls
 `swap!`/`reset!`/`compare-and-set!`/`swap-vals!` on the SAME atom,
 those nested calls observe `in_flight = 1` and throw `:atom-re-entry`.
 The outer `swap!` then propagates that error and does NOT write (the
@@ -280,18 +273,16 @@ Order of operations:
 6. return result_vec
 ```
 
-**GC rooting note (peer-AI turn 75 Q9 / current state of GC):** step 5
-allocates a 2-element vector AFTER the atom write at step 4. If the
-GC were to trigger on `vector_mod.fromTwo`'s allocation, `old` (a Zig
-local) would not be in any root set and could be collected if `old`
-is a heap value and `body.value = new_val` removed its last collection
-edge. v1 nexis GC is **explicit-only** per `docs/GC.md` §9 (collect is
-called by callers, NEVER auto-triggered on alloc), so this hazard is
-**inactive** in v1. When GC migrates to alloc-triggered (Phase 6 if
-needed, or post-v1), every native fn that allocates after holding
-Values in Zig locals must be audited — this commit adds an audit
-checklist entry to `docs/GC.md`'s amendment log so the migration
-review catches all such sites at once.
+**GC rooting note:** step 5 allocates a 2-element vector AFTER the
+atom write at step 4. If a collection were to trigger on
+`vector_mod.fromTwo`'s allocation, `old` (a Zig local) would not be
+in any root set and could be collected if `old` is a heap value and
+`body.value = new_val` removed its last collection edge. The
+collector is **explicit-only** and the runtime never invokes it
+(`docs/GC.md` §9), so this hazard is **inactive**. Any
+allocation-triggered collection design must audit every native fn
+that allocates after holding Values in Zig locals; `docs/GC.md`
+§11.5 carries the checklist.
 
 #### 4.6 `(compare-and-set! a old new)`
 
@@ -309,7 +300,7 @@ return value_mod.fromBool(false);
 
 The comparison uses `identical?` semantics (`eq.identicalImmediate`-
 shaped: bit-equality for immediates, pointer-equality for heap kinds),
-NOT `=` (structural). Per peer-AI turn 75 Q4: this matches Clojure's
+NOT `=` (structural). This matches Clojure's
 documented "identical to oldval" CAS contract and avoids the surprise
 of value-equal-but-distinct collections matching by accident.
 
@@ -322,25 +313,22 @@ same atom.
 
 ### 5. `deref` integration
 
-Peer-AI turn 73 already unified `deref` over `{durable_ref, var_}` in
-the native fn now installed at `db/deref`. This commit:
+`deref` is unified over `{durable_ref, var_, atom}` in one native
+fn, `fnDbDeref`:
 
-1. Installs the same descriptor (`&native_db_deref` — name is internal,
-   the descriptor is shared) ALSO in `core_fns` as bare `deref`. Both
-   `(deref x)` and `(db/deref x)` resolve to the same call.
-2. Adds an `.atom` arm to the `fnDbDeref` switch:
+1. The same descriptor (`&native_db_deref` — the name is internal,
+   the descriptor is shared) is installed as `db/deref` AND in
+   `core_fns` as bare `deref`. Both `(deref x)` and `(db/deref x)`
+   resolve to the same call.
+2. The `.atom` arm of the `fnDbDeref` switch:
    ```zig
    .atom => atom.deref(x),
    ```
    where `atom.deref(v: Value) Value` returns `Heap.bodyOf(AtomBox, h).value`.
-3. Leaves the `@x` reader-macro lowering in `expand.zig` line 311-328
-   UNCHANGED — `@x → (db/deref x)`. This is backward-compatible (Phase
-   4 examples still resolve), and dispatches over atoms via the new
-   switch arm. A later cleanup can repoint the lowering at the bare
-   `deref` for cleanliness, but it's a no-op semantic change and not
-   load-bearing for Phase 5 Item 1.
+3. The `@x` reader-macro lowering in `expand.zig` is `@x → (db/deref x)`,
+   which dispatches over atoms through the same switch.
 
-Updated `fnDbDeref` switch:
+The `fnDbDeref` switch:
 
 ```zig
 return switch (x.kind()) {
@@ -435,9 +423,9 @@ the contained value via the normal recursive printer, since `@a` ≡
 | `:kind-mismatch`     | non-atom passed to `reset!`/`swap!`/`swap-vals!`/`CAS`    |
 | `:not-callable`      | non-fn `f` passed to `swap!`/`swap-vals!`                 |
 | `:unserializable`    | codec encounters an atom                                  |
-| `:not-derefable`     | unchanged from peer-AI turn 73; atoms now succeed         |
+| `:not-derefable`     | `deref` of a value that is not a durable ref, Var or atom |
 
-All are catchable via `(try … (catch _ e))` per Phase 3.0c.
+All are catchable via `(try … (catch _ e))` (`docs/VM.md` §12).
 
 ---
 
@@ -462,7 +450,7 @@ convention.
 - `@(atom 5) → 5`
 - `(deref (atom 5)) → 5`
 - `(db/deref (atom 5)) → 5` — alias works
-- Phase 4 demo still passes (durable_ref deref unchanged)
+- `examples/todo-app.nx` passes (durable_ref deref unchanged)
 
 **Rollback on throw:**
 - `(let [a (atom 11)]
@@ -500,13 +488,3 @@ convention.
 
 ---
 
-### 11. Amendment log
-
-- 2026-05-18 (peer-AI turn 75): initial frozen spec for Phase 5 Item 1.
-  Pins identity equality + identity hash, swap-rollback semantics,
-  `in_flight` re-entrancy detection (OPT-A from Q2), universal `deref`
-  generalization, codec unserializable. Notes the v1 GC-rooting hazard
-  for `swap-vals!` step 5 as inactive (gc.zig is explicit-only) but
-  carries a future-proofing entry in `docs/GC.md`'s amendment log to
-  catch on the next GC migration. Authority: PLAN.md §23 amendment
-  log entry landing in the same commit, citing turn 75.
