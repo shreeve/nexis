@@ -59,9 +59,8 @@ collection↔string coercion, no keyword↔symbol coercion.
 - `min = -(2⁴⁷) = -140_737_488_355_328`
 - `max =  2⁴⁷ - 1 = 140_737_488_355_327`
 - Canonicalization must fold any integer in `[min, max]` to `fixnum`.
-  The asymmetric lower bound (one below the symmetric `±(2⁴⁷−1)`
-  statement previous versions of this document carried) is
-  deliberate: it matches the authoritative `src/value.zig` constants
+  The asymmetric lower bound is deliberate: it matches the
+  authoritative `src/value.zig` constants
   `fixnum_min` / `fixnum_max` and the standard signed-i48
   two's-complement range. Bignum construction that sees a magnitude
   equal to `2⁴⁷` with negative sign must canonicalize to

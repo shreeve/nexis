@@ -499,6 +499,11 @@ fn decodeValue(
             if (sign != 0 and sign != 1) return CodecError.MalformedPayload;
             const limb_count_u64 = try readUleb128(bytes, cursor);
             const limb_count: usize = std.math.cast(usize, limb_count_u64) orelse return CodecError.InvalidLeb128;
+            // The limbs are fixed-width, so the count says how much
+            // input must remain; check before allocating so a corrupt
+            // count cannot demand a huge scratch buffer (CODEC.md §2.1).
+            const need = std.math.mul(usize, limb_count, 8) catch return CodecError.TruncatedInput;
+            if (cursor.* + need > bytes.len) return CodecError.TruncatedInput;
             // Read limbs into a temporary buffer (uses the Heap's
             // backing allocator — the Heap is the authoritative
             // runtime allocator source for this decode).
@@ -1015,6 +1020,18 @@ test "decode: typed vector with an unknown element tag → MalformedPayload" {
         CodecError.MalformedPayload,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
     );
+}
+
+test "decode: bignum whose limb count exceeds the input → TruncatedInput without allocating" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    // Non-negative sign, limb count 2^56, one limb of input behind it.
+    const bytes = [_]u8{ 1, 0, @intFromEnum(Kind.bignum), 0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 1, 0, 0, 0, 0, 0, 0, 0 };
+    try testing.expectError(
+        CodecError.TruncatedInput,
+        decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
+    );
+    try testing.expectEqual(@as(usize, 0), ctx.heap.liveCount());
 }
 
 test "decode: typed vector whose count exceeds the input → TruncatedInput without allocating" {

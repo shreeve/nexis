@@ -11,16 +11,15 @@ numeric tower (`docs/VM.md` §10.3, `src/vm.zig`) builds on.
 The module ships construction, canonical form, equality, hash, the
 arithmetic `add sub mul quot rem mod neg abs`, ordering, conversion
 to and from f64 and i64, and decimal parsing and printing. GCD,
-bitwise operations and modular exponentiation are not part of v1
-(PLAN §8.3).
+bitwise operations and modular exponentiation are absent (PLAN §8.3).
 
 ---
 
 ### 1. The canonicalization invariant (central)
 
 **For integers, the runtime guarantees that two mathematically-equal
-integers are always represented by exactly one runtime kind/value form
-in v1.** Everything else in this document is in service of that rule.
+integers are always represented by exactly one runtime kind/value
+form.** Everything else in this document is in service of that rule.
 
 Consequences that the implementation must enforce without exception:
 
@@ -133,6 +132,10 @@ pub fn hashHeader(h: *HeapHeader) u32;
 /// after the cross-kind rule and bit-identity fast path have been
 /// ruled out.
 pub fn limbsEqual(a: *HeapHeader, b: *HeapHeader) bool;
+
+/// GC trace entry point (GC.md §4). A bignum body holds limbs and
+/// no Values, so the visitor is never called.
+pub fn trace(h: *HeapHeader, visitor: anytype) void;
 ```
 
 **Error set.** Whatever `heap.alloc` returns (`error.OutOfMemory`,
@@ -289,28 +292,42 @@ contagion), with `toF64` widening a bignum operand.
 
 Alongside the module:
 
-- `test/prop/bignum.zig` with ~8 properties:
-  1. Round-trip: `fromI64(n)` for random i64 produces either a fixnum
-     (if in range) or a bignum whose reconstructed magnitude equals `|n|`.
-  2. Canonicalization: `fromLimbs(false, &.{5})` returns a fixnum, not a
-     bignum.
-  3. Canonicalization: `fromLimbs(true, &.{0, 0, 0})` returns `fixnum(0)`.
-  4. No trailing zero limbs: every bignum escaping `fromLimbs` passes
-     the invariant check.
-  5. Equality reflexivity / symmetry / transitivity over random bignums.
-  6. `equal ⇒ hash equal` (bedrock) over 500 random bignum pairs built
-     from the same limb sequences in different allocations.
-  7. Cross-kind: a bignum is never `=` to a fixnum, keyword, string,
-     etc.; full `dispatch.hashValue` is different across categories.
-  8. `i64.min` specifically round-trips: `fromI64(-9223372036854775808)`
-     produces a bignum (out of fixnum range, magnitude = 2⁶³); its
-     limb representation matches `{ negative = true, limbs = [2⁶³] }`.
+- `test/prop/bignum.zig` with 16 properties:
+  - N1. `fromI64(n)` for random i64 is a fixnum in the fixnum range
+    (no allocation) and a bignum outside it whose reconstructed
+    magnitude equals `|n|`.
+  - N2. `fromI64(i64.min)` produces a bignum with magnitude 2⁶³: its
+    limb representation is `{ negative = true, limbs = [2⁶³] }`.
+  - N3. `fromLimbs` with a fixnum-range magnitude canonicalizes to a
+    fixnum without allocating.
+  - N4. `fromLimbs` with zero magnitude, any sign and any length, is
+    `fixnum(0)`.
+  - N5. No bignum escaping `fromLimbs` has trailing zero limbs.
+  - N6. Equality is reflexive, symmetric and pairwise transitive over
+    random bignums.
+  - N7. `equal ⇒ hash equal` (bedrock): equal bignums across
+    allocations share `hashValue`.
+  - N8. Cross-kind: a bignum is never `=` to any non-bignum Value;
+    hashes differ.
+  - N9. `fromLimbs` and the accessors round-trip limbs and sign
+    byte-exact.
+  - N10. `hashValue(bignum)` matches xxHash3 over `{sign, limbs}`
+    under `mixKindDomain`.
+  - A1. `add`, `sub` and `compare` agree with `i128` over random
+    pairs; results are canonical.
+  - A2. `mul` agrees with `i128` over random i64 pairs.
+  - A3. `quot`, `rem` and `mod` agree with `@divTrunc`, `@rem` and
+    `@mod` on every sign combination.
+  - A4. The fixnum boundary is crossed both ways and the kind follows
+    the value alone.
+  - A5. Algebraic identities hold on multi-limb values.
+  - A6. Decimal text and doubles round-trip.
 
 ---
 
 ### 11. What BIGNUM.md does not cover
 
-- **Multi-precision floats, rationals, decimals.** Not in v1 per
+- **Multi-precision floats, rationals, decimals.** Absent, per
   PLAN §8.3.
 - **Interned small bignums.** Not applicable — canonicalization
   prevents small-magnitude bignums from existing at all.
