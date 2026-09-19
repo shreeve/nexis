@@ -1834,7 +1834,7 @@ per item.
 ### 20.3 Build steps
 
 - `zig build test` — everything: unit, property, golden, Nextomic corpora, `test/nextomic` scripts, examples (minutes).
-- `zig build quick` (alias `phase2-test`) — unit + property binaries (seconds).
+- `zig build quick` — unit + property binaries (seconds).
 - `zig build golden` — verify golden reader outputs byte-exactly; `-Dupdate=true` regenerates them.
 - `zig build nextomic-test` — Nextomic unit tests, key and transaction property tests, the query and pull corpora.
 - `zig build nextomic-nx` — the `test/nextomic` end-to-end scripts through `bin/nexis`.
