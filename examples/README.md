@@ -31,6 +31,7 @@ their second-run behavior.
 | `stdlib-primitives.nx` | Native fns (`list`/`cons`/`first`/`rest`/`empty?`/...) and a recursive procedural `my-cond` macro |
 | `require-demo.nx` + `lib/geom.nx` | `(require '[lib.geom :as g])` loads a library from disk |
 | `shapes.nx` | Protocols + records in one file: `defprotocol`, `defrecord`, `extend-protocol` over records and built-ins, `satisfies?`, atoms, `str`, `case`/`for` |
+| `typed-vectors.nx` | `i64-vector` / `f64-vector`, the generic functions over them, the `nexis.simd` kernels (`tv/sum`, `tv/dot`, `tv/scale`, `tv/map`), equality rules and the `:kind-mismatch` / `:index-out-of-bounds` errors |
 | `shapes-app.nx` + `lib/shapes/{protocol,records,builtins}.nx` | The same program as a multi-file application: a driver and three required modules; prints one report per shape and `total-area atom = 9650` |
 | `durable-refs.nx` | Durable identity backed by emdb: `db/open`/`db/ref`/`db/put-key!`/`db/get-key`/`db/delete-key!`; values persist across processes |
 | `todo-app.nx` | Persistent to-do tracker over the whole `db/*` surface (`with-tx`, `db/alter!`, `db/scan`, `db/reduce-tree`, `@deref`, rollback on exception). Run twice: the second run shows `:completed 1` |

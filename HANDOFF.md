@@ -62,11 +62,11 @@ git status                        # clean main
 zig build install                 # bin/nexis and bin/nexis-golden
 ./bin/nexis --help                # usage; lists the namespaces available without a file
 zig build quick                   # the inner loop, ~35-50 s warm
-zig build test --summary all      # the gate: 1338 tests, 140 steps, ~4 min wall
+zig build test --summary all      # the gate: 1383 tests, 147 steps, ~4 min wall
 ```
 
-The gate's last line reads `Build Summary: 140/140 steps succeeded;
-1338/1338 tests passed`, preceded by `golden: ok=10 updated=0
+The gate's last line reads `Build Summary: 147/147 steps succeeded;
+1383/1383 tests passed`, preceded by `golden: ok=10 updated=0
 failed=0 missing=0`. Two integration binaries end with a benchmark
 whose row-count checks always run; the build runner echoes their
 stderr as `failed command:` lines while both succeed, so read the
@@ -147,8 +147,9 @@ Immediates: `nil`, `false_`, `true_`, `char`, `fixnum` (48-bit
 payload, `fixnum_max = 2^47 - 1`), `float`, `keyword`, `symbol` (both
 interned ids). Heap kinds, by number: `string 16`, `bignum 17`,
 `persistent_map 18`, `persistent_set 19`, `persistent_vector 20`,
-`list 21`, `byte_vector 22` and `typed_vector 23` (reserved, no
-implementation), `function 24`, `var_ 25`, `durable_ref 26`,
+`list 21`, `byte_vector 22` (reserved, no implementation),
+`typed_vector 23` (unboxed `i64` / `f64` elements,
+`docs/TYPED_VECTOR.md`), `function 24`, `var_ 25`, `durable_ref 26`,
 `transient 27`, `error_ 28`, `meta_symbol 29`, `native_fn 30`,
 `db_connection 31`, `db_write_txn 32`, `db_read_txn 33`, `atom 34`,
 `record 35`, `protocol 36`, `protocol_fn 37`, `nextomic_conn 38`,
@@ -240,6 +241,7 @@ context, or the bare keyword when there is nothing more to say.
 | `nexis.core` (auto-referred) | 139 natives in `src/stdlib.zig` `core_fns` (sequences, HOFs, collections, arithmetic, predicates, strings, I/O) plus 43 definitions in `src/stdlib/core.nx`: 16 macros (`when-let if-let dotimes with-tx with-read-tx with-snapshot declare if-not while letfn doseq cond-> cond->> some-> some->> as->`) and 27 functions (`true? false? second third last reverse take drop constantly complement partial comp every? not-every? some not-any? merge update get-in assoc-in update-in frequencies group-by interpose juxt fnil merge-with`) |
 | `db` | 23 natives: `open close ref ref? put-key! get-key delete-key! present? begin-write begin-read commit! abort-write! abort-read! put! get delete! deref alter! scan reduce-tree snapshot release-snapshot! snapshot?` |
 | `nexis.string` | `lower-case upper-case trim split join replace` |
+| `nexis.simd` | the typed-vector kernels `sum dot scale map` over `i64-vector` / `f64-vector` values (`docs/TYPED_VECTOR.md` §7.2); `(require '[nexis.simd :as tv])` aliases it |
 | `nexis.internal` | the nine `#%...` primitives `defrecord`/`defprotocol` expand to |
 | `nextomic` | 20 natives: `connect release db basis-t transact! entity entid ident datoms as-of since history tx-range schema sync q explain pull pull-many with`, plus the macro `with-conn` from `src/stdlib/nextomic.nx` |
 | `user` | the current namespace at start |
@@ -356,7 +358,7 @@ stack length and frame depth are restored (`expectStackRestored`);
 it) and the eval-pipeline harness is what enforces it.
 `test/integration/runtime_polish.zig` pins the Clojure-fidelity rules
 of the sequence library, records as maps, and the one policy for an
-uncaught keyword throw from a native. `test/prop/*` (fifteen files)
+uncaught keyword throw from a native. `test/prop/*` (sixteen files)
 sweep the collections, codec round trips, interning, heap and
 collector; `src/*.zig` carry the inline unit tests; `test/golden/`
 holds the reader goldens and eight reader-error cases.
@@ -405,9 +407,9 @@ in the VM heap and stay there.
 tests and `test/prop/{gc,transient}.zig`; `src/vm.zig` enumerates no
 roots; closures, Vars and `UpvalCell`s are raw `runtime_arena`
 allocations the collector cannot see; `gc.zig`'s mark switch panics
-on `function`, `var_`, `error_`, `meta_symbol`, `byte_vector` and
-`typed_vector` by design, so the collector cannot be switched on
-until those kinds trace. `docs/GC.md` §9 pins the deferral.
+on `function`, `var_`, `error_`, `meta_symbol` and `byte_vector` by
+design, so the collector cannot be switched on until those kinds
+trace. `docs/GC.md` §9 pins the deferral.
 
 *Approach*: (1) a rooting protocol — VM stack and frames, namespace
 Vars, the interner, atom cells, open `db` and
@@ -477,22 +479,6 @@ calls the cell's value through the `CallHook`.
 row in §5.
 
 *Size*: three files, a few dozen lines each.
-
-### 6.6 `typed_vector`
-
-*Symptom*: `Kind.typed_vector = 23` is reserved with no constructor,
-layout or natives; `nexis.simd` does not exist. PLAN §15.11 NX-2
-expects `Relation` columns to share its representation; `relation.zig`
-uses its own typed columns instead.
-
-*Approach*: a heap kind with i64 and f64 columns, `trace`, `format`,
-codec arms, `vec`/`nth`/`count`/`seq` over it; then kernels.
-
-*Proof*: inline tests plus a `test/prop/typed_vector.zig` codec round
-trip; the codec serializability matrix in `docs/CODEC.md` updated.
-
-*Size*: a new `src/coll/typed_vector.zig` of a few hundred lines
-plus arms in five files.
 
 ### 6.7 `^:dynamic` Vars and `binding`
 
@@ -672,9 +658,8 @@ regenerated file with the grammar).
    full-text (§6.8).** Transaction functions unlock the next class
    of Nextomic programs; they come after 2 so the callback into the
    VM is safe by construction.
-6. **`^:dynamic`/`binding` (§6.7) and `typed_vector` (§6.6)** when a
-   user need appears; both are self-contained and neither blocks the
-   rest.
+6. **`^:dynamic`/`binding` (§6.7)** when a user need appears; it is
+   self-contained and blocks nothing.
 7. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
    inline caches, SIMD CHAMP nodes, zero-copy strings from emdb
    pages, hash-join tuning. Measure first with `zig build bench`;

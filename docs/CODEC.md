@@ -21,18 +21,19 @@ preservation is the contract.
 - Every kind allocatable in the v1 runtime: `nil`, `false_`,
   `true_`, `char`, `fixnum`, `float`, `keyword`, `symbol`,
   `string`, `bignum`, `list`, `persistent_vector`,
-  `persistent_map`, `persistent_set`.
+  `persistent_map`, `persistent_set`, `typed_vector`.
 - Encode: `Value → []u8`. Decode: `[]u8 → Value`.
 - Version envelope for future format evolution.
 - Deterministic within-process round-trip: `(= v (decode(encode(v))))`
   and `hash(v) = hash(decode(encode(v)))`.
 
 **Out (v1 codec):**
-- `byte_vector`, `typed_vector`, `durable_ref`: kinds reserved in
-  VALUE.md §2 but not yet allocatable in the runtime. Public
-  codec API returns `error.UnserializableKind` if encountered;
-  internal assertions may panic loudly for truly-impossible inputs
-  (public API = typed error; "this can't happen" = assert).
+- `byte_vector`: a kind reserved in VALUE.md §2 with no
+  implementation; `durable_ref`: an identity into a store
+  (`docs/DB.md` §9). Public codec API returns
+  `error.UnserializableKind` if encountered; internal assertions may
+  panic loudly for truly-impossible inputs (public API = typed
+  error; "this can't happen" = assert).
 - `function`, `var_`, `transient`, `error_`, `meta_symbol`:
   non-serializable per PLAN §15.10 + §23 #25. Public API returns
   `error.UnserializableKind`.
@@ -91,6 +92,7 @@ VALUE.md §2 numeric values):
 | `persistent_set` (19) | `[19] [unsigned LEB128 count] [element ValueEncoding × count]` |
 | `persistent_vector` (20) | `[20] [unsigned LEB128 count] [element ValueEncoding × count]` |
 | `list` (21) | `[21] [unsigned LEB128 count] [element ValueEncoding × count]` |
+| `typed_vector` (23) | `[23] [elem: u8 ∈ {1 = i64, 3 = f64}] [unsigned LEB128 count] [u64 LE × count]` — i64 as two's-complement bits, f64 as canonical IEEE bits (`docs/TYPED_VECTOR.md` §4) |
 
 #### 2.1 Varint choice
 
@@ -109,6 +111,12 @@ VALUE.md §2 numeric values):
   large by definition (canonicalization guarantees magnitude >
   i48 range per BIGNUM.md §1). Varint overhead per limb would be
   wasted.
+- **Fixed little-endian for typed-vector elements** — the elements
+  are unboxed `i64` / `f64` in memory; the wire form is the same
+  eight bytes each, so decode can bound the input it needs from the
+  count before allocating (a count past the input is
+  `TruncatedInput`, an element tag other than 1 or 3 is
+  `MalformedPayload`).
 
 #### 2.2 Keyword / symbol / string byte-exactness
 
@@ -202,7 +210,7 @@ From PLAN §15.10 / §23 #25 (frozen):
 | `tx handle` / `emdb.Env` connection | Open OS resources. |
 | `error_` | Stack traces carry process-local frame references. |
 | `meta_symbol` | Reserved; not yet allocated; non-serializable per metadata discipline. |
-| `byte_vector`, `typed_vector` | Reserved kinds with no implementation. |
+| `byte_vector` | Reserved kind with no implementation. |
 | `durable_ref` | An identity into a store; the value half of a durable pair is codec bytes, but a ref inside a value is `:unserializable` (`docs/DB.md` §9). |
 
 Attempting to encode any of these returns
@@ -221,8 +229,9 @@ For every Value `v` in the v1 Serializable set (§1 "In"):
 (encode v) == (encode (decode(encode(v))))          — byte-stable re-encode
                                                       for canonical-order kinds
                                                       (scalars, strings, bignums,
-                                                      vectors, lists). NOT for
-                                                      map/set per §2.5.
+                                                      vectors, lists, typed
+                                                      vectors). NOT for map/set
+                                                      per §2.5.
 ```
 
 This is **PLAN §20.2 gate test #5** — exercised on 10k+ randomized
@@ -236,8 +245,7 @@ values in `test/prop/codec.zig`.
 pub const CodecError = error{
     /// Attempt to encode/decode a kind excluded from the v1
     /// Serializable set (§1 "Out"): function, var_, transient,
-    /// namespace, error_, meta_symbol, byte_vector, typed_vector,
-    /// durable_ref.
+    /// namespace, error_, meta_symbol, byte_vector, durable_ref.
     UnserializableKind,
 
     /// Decode ran out of bytes mid-value.
@@ -317,7 +325,8 @@ src/codec.zig
 ├── @import("bignum")
 ├── @import("list")
 ├── @import("vector")
-└── @import("champ")
+├── @import("champ")
+└── @import("typed_vector")
 ```
 
 This matches the `src/dispatch.zig` / `src/gc.zig` / `src/coll/transient.zig`
@@ -369,6 +378,10 @@ either succeed (producing some Value) or return a `CodecError`;
 no panic, no infinite loop, no memory corruption. 1000 trials of
 random bytes.
 
+`test/prop/typed_vector.zig` T1 is the typed-vector round trip
+(both element types, lengths 0, 1, 31, 32, 33 and 1000, equality,
+hash and byte-stable re-encode).
+
 Together C1+C3 deliver the PLAN §20.2 gate test #5 receipt. C2
 strengthens the invariant for canonical-order kinds. C4 is a
 general robustness property against malformed input.
@@ -383,8 +396,9 @@ general robustness property against malformed input.
   homogeneous containers.
 - **Streaming encoder / decoder** (`*std.Io.Writer` / `*std.Io.Reader`
   variants). Encode and decode are fully buffered.
-- **Byte-vector / typed-vector / durable-ref serialization.** Kinds
-  not yet allocatable; ship with the respective kind modules.
+- **Byte-vector serialization.** The kind has no implementation.
+  A durable ref inside a value is `:unserializable` by design
+  (§3).
 - **Versioned compact bignum encoding.** Current limbs-in-bytes
   format is simple but not maximally compact for small bignums
   (which are rare by canonicalization).

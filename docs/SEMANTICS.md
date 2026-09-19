@@ -179,11 +179,14 @@ Worked examples (copy-pasted from PLAN §6.6):
 - `(= (list) [])` → `true` (both empty sequentials).
 - `(= (map inc [1 2 3]) [2 3 4])` → `true` (map returns sequential).
 
-Byte-vectors and typed-vectors (`int32-vector` etc.) are **not** in the
-sequential category in v1. They are their own kinds with identity-free
-equality (element-wise, same element type required). `(= (int32-vector [1
-2]) [1 2])` → `false`. This preserves SIMD-friendly layouts without forcing a
-structural-comparison path through generic sequence code.
+Typed vectors (`i64-vector`, `f64-vector`) are **not** in the
+sequential category. They are their own kind with identity-free
+equality (element-wise, same element type required): `(= (i64-vector
+[1 2]) [1 2])` → `false`, `(= (i64-vector [1 2]) (f64-vector [1.0
+2.0]))` → `false`. This preserves SIMD-friendly layouts without forcing
+a structural-comparison path through generic sequence code
+(`docs/TYPED_VECTOR.md` §3). A byte-vector would be the same; the kind
+has no implementation.
 
 Durable refs (`durable-ref`) compare by identity triple
 `{store-id, tree-id, key-bytes}`, never by dereferenced value (PLAN §8.6,
@@ -384,8 +387,10 @@ For every value kind, a **pr-style** textual representation exists such that:
 - `string` — yes.
 - `keyword`, `symbol` — yes (textual form; re-interned on read).
 - `list`, `vector`, `map`, `set` — yes, recursively.
-- `byte-vector`, `typed-vector` — no. The kinds are reserved with no
-  implementation; `src/format.zig` prints them as `#<value kind=N>`.
+- `typed-vector` — no. It prints as `#i64[1 2 3]` / `#f64[1.0 2.0]`,
+  which the reader rejects at the `#`; the codec is its round trip.
+- `byte-vector` — no. The kind is reserved with no implementation;
+  `src/format.zig` prints it as `#<value kind=22>`.
 - `durable-ref` — no. It prints as the opaque token
   `#<durable-ref :<tree> hex:<key-bytes>>`, which does not read back.
 

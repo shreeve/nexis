@@ -18,6 +18,7 @@ wins and the code is wrong.
 | `src/coll/champ.zig` | [`CHAMP.md`](CHAMP.md) | Persistent map + set via CHAMP (Compressed Hash-Array Mapped Prefix-tree) |
 | `src/coll/vector.zig` | [`VECTOR.md`](VECTOR.md) | Persistent vector via RRB tree |
 | `src/coll/transient.zig` | [`TRANSIENT.md`](TRANSIENT.md) | Transient lifecycle + ownership |
+| `src/coll/typed_vector.zig` | [`TYPED_VECTOR.md`](TYPED_VECTOR.md) | Typed vector: unboxed i64 / f64 elements, codec, `nexis.simd` kernels |
 | `src/eq.zig` | (in [`SEMANTICS.md`](SEMANTICS.md) §2) | Equality predicates; no dedicated spec doc |
 | `src/hash.zig` | (in [`SEMANTICS.md`](SEMANTICS.md) §3) | Hash primitives; no dedicated spec doc |
 | `src/dispatch.zig` | (no dedicated spec) | Cross-kind sequential equality/hash terminal — implementation detail, contract lives in the per-kind specs |

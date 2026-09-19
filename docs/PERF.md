@@ -100,7 +100,7 @@ projected nexis direction vs Clojure. "Measured" column cites the
 | 14 | Durable state | No stdlib primitive | emdb mmap, zero-copy | **orders of magnitude faster** | get-hot 1.04 μs (§3.6) | measured (partial) |
 | 15 | Codec / serialization | `.edn` / Nippy | Binary LEB128/ZigZag | **2–5× size, 5–20× speed** vs `.edn` | encode 18 ns/entry, decode 124 ns/entry (§3.5) | measured (partial) |
 | 16 | Concurrency tax | STM + CAS pervasive | Single-isolate, single-writer | **strictly less overhead**; by design | — | implemented, by design |
-| 17 | SIMD / typed-vector | JIT may autovectorize | `@Vector` + planned typed-vector | **2–8×** on bulk numeric ops | — | absent (kind reserved) |
+| 17 | SIMD / typed-vector | JIT may autovectorize | `@Vector(4, f64)` kernels over unboxed typed vectors (`nexis.simd`) | **2–8×** on bulk numeric ops | — | implemented, not measured |
 | 18 | Startup | 100–500 ms JVM warmup | Native binary | **10–500×** | — | implemented, not yet measured |
 | 19 | Compilation | HotSpot C1+C2 JIT | Bytecode VM, switch dispatch, no specialization | **worse** on sustained compute | — | not measured against Clojure |
 | 20 | Comptime specialization | JIT inlining + escape analysis | Zig `comptime` monomorphization | **~2×** on specialized paths | — | absent |
@@ -732,16 +732,19 @@ multi-isolate design (actor-style), but the plan is many
 single-threaded isolates communicating via emdb transactions, not
 shared-memory multithreading, is the only extension contemplated.
 
-### 5.17 SIMD / typed-vector — absent
+### 5.17 SIMD / typed-vector — implemented, not measured
 
 **Clojure**: JIT occasionally autovectorizes tight `double[]`
 loops. Does not autovectorize `PersistentVector` because entries
 are boxed.
 
-**nexis**: `typed-vector` (VALUE.md kind 23, reserved with no
-implementation). The design is contiguous unboxed element bytes + `@Vector`
-SIMD for map/reduce/dot-product. `byte-vector` + string ops also
-SIMD-eligible.
+**nexis**: `typed-vector` (VALUE.md kind 23, `docs/TYPED_VECTOR.md`):
+contiguous unboxed `i64` / `f64` elements; the `nexis.simd` kernels
+`sum`, `dot` and `scale` run `f64` in four `@Vector` lanes and `i64`
+scalar with overflow checks; `tv/map` calls back into the VM per
+element. No `zig build bench` row measures them. `byte-vector` +
+string ops would also be SIMD-eligible; that kind has no
+implementation.
 
 **Projected delta**: 2–8× on numeric reduce/map/dot; 2–4× on bulk
 byte compare.
@@ -816,7 +819,7 @@ benchmark-harness update.
 6. **HeapHeader slim-down** (§5.1). Pack mark + cached hash;
    investigate 8-byte header for small objects. ~5–10% memory
    win on small-object workloads.
-7. **typed-vector + SIMD** (§5.17). ~2–8× on numeric bulk ops.
+7. **typed-vector + SIMD benchmark rows** (§5.17). The kernels exist; a `bench-simd` row would measure the projected 2–8× on numeric bulk ops.
 8. **Generational GC** (§5.11). ~5–30× on steady-state
    alloc-heavy workloads where slab retention matters.
 9. **Opcode specialization** (§5.19). Gates §5.13 and the

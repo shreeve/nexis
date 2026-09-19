@@ -588,8 +588,9 @@ operationally reachable ownership failure in a single isolate.
   - **Node-level in-place mutation** (Option A, real Clojure-
     style).
   - **Transient vector `assocBang`** (§7).
-  - **Transient byte-vector / typed-vector**: those kinds have no
-    implementation.
+  - **Transient byte-vector / typed-vector**: a typed vector has no
+    update operation to make transient (`docs/TYPED_VECTOR.md` §1);
+    the byte-vector kind has no implementation.
   - **Multi-isolate token mismatch path**: there is one isolate.
   - **A dedicated transient promotion path** for array-map/set
     growing beyond 8 entries: the persistent `mapAssoc` handles
