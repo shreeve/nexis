@@ -2579,13 +2579,15 @@ pub const VM = struct {
     }
 
     /// Discard what a failed run left behind (the frames above the
-    /// top-level one, handlers, pending finallys and the unhandled
+    /// top-level one, handlers, pending finallys, the dynamic
+    /// bindings a `binding` form had in force and the unhandled
     /// throw) so the next `retargetTop` starts from a clean VM. The
     /// error trace stays until the next failing run replaces it.
     pub fn resetAfterError(self: *VM) void {
         while (self.frames.items.len > 1) _ = self.popFrame();
         self.handlers.clearRetainingCapacity();
         self.finally_stack.clearRetainingCapacity();
+        while (self.dyn_frames.items.len > 0) self.popBindings();
         self.unhandled_throw = null;
     }
 

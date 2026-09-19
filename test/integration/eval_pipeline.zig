@@ -4141,6 +4141,31 @@ test "runtime errors: resetAfterError leaves the VM ready for the next form" {
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
 }
 
+test "runtime errors: resetAfterError drops the dynamic bindings a failed run left in force" {
+    // A thrown value and a catchable VmError both unwind through
+    // `binding`'s finally, so their frames are popped before the
+    // error surfaces. A run that fails between a push and its pop
+    // leaves the frame in force; the reset pops it.
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(def ^:dynamic *x* 1)");
+    try testing.expectError(vm.VmError.UncaughtThrow, program.run("(binding [*x* 2] (throw :boom))"));
+    try testing.expectEqual(@as(usize, 0), program.v.dyn_frames.items.len);
+    try testing.expectError(vm.VmError.UncaughtThrow, program.run("(binding [*x* 2] (/ 1 0))"));
+    try testing.expectEqual(@as(usize, 0), program.v.dyn_frames.items.len);
+    try testing.expectError(vm.VmError.DivideByZero, program.run("(do (push-thread-bindings (hash-map (var *x*) 2)) (/ 1 0))"));
+    try testing.expectEqual(@as(usize, 1), program.v.dyn_frames.items.len);
+    const bound = try program.run("*x*");
+    try testing.expectEqual(@as(i64, 2), bound.asFixnum());
+    program.v.resetAfterError();
+    try testing.expectEqual(@as(usize, 0), program.v.dyn_frames.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.dyn_saves.items.len);
+    try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+    const result = try program.run("*x*");
+    try testing.expectEqual(@as(i64, 1), result.asFixnum());
+}
+
 test "runtime errors: a routine without a span table is traced by name alone" {
     var program: Program = undefined;
     try program.init();
