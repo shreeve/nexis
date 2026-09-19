@@ -359,6 +359,10 @@ variants are codegen details.
 - Compound collections lower through `#%list` / `#%vector` /
   `#%map` / `#%set` construction (`lowerQuotePayload`) with each
   element quoted recursively.
+- A quote inside the payload is data: `'(a 'b)` is `(a (quote b))`,
+  the 2-list `formToValue` renders a quote as. Syntax-quote,
+  unquote, `@x`, `#(...)` and `^meta` inside a quoted form are
+  `UnsupportedFeature`.
 - Runtime: `mov:load-const` (scalars) or `coll:*` construction.
 
 #### 5.2 `(if test then else?)`

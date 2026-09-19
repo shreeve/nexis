@@ -1621,9 +1621,10 @@ fn lowerInternalSet(
 ///
 /// Quoted compound collections (lists/vectors/maps/sets) lower
 /// to the matching `*_construct` node whose elements are
-/// themselves quote-lowered; quoted strings need `ctx.heap`.
-/// Quoted reader macros (`'@x`, `'#(...)`, `'^{...}`,
-/// syntax-quote) raise `UnsupportedFeature`.
+/// themselves quote-lowered; quoted strings need `ctx.heap`. A
+/// quote inside the payload is the 2-list `(quote x)`, as
+/// `formToValue` renders it. Quoted reader macros (`'@x`,
+/// `'#(...)`, `'^{...}`, syntax-quote) raise `UnsupportedFeature`.
 fn lowerQuotePayload(
     allocator: std.mem.Allocator,
     payload: *const reader_mod.Form,
@@ -1707,6 +1708,16 @@ fn lowerQuotePayload(
             const h = ctx.heap orelse return CompileError.UnsupportedFeature;
             const v = string_mod.fromBytes(h, bytes) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
+        },
+        // `'(a 'b)` is `(a (quote b))`: the inner quote is data, the
+        // 2-list `formToValue` renders it as.
+        .quote => |inner| blk: {
+            const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
+            const quote_sym = interner.internSymbolValue("quote") catch return CompileError.OutOfMemory;
+            const tiny_items = try allocator.alloc(*const Tiny, 2);
+            tiny_items[0] = try allocTiny(allocator, .{ .literal = quote_sym });
+            tiny_items[1] = try lowerQuotePayload(allocator, inner, ctx);
+            break :blk try allocTiny(allocator, .{ .list_construct = tiny_items });
         },
         else => return CompileError.UnsupportedFeature,
     };

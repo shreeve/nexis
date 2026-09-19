@@ -562,6 +562,12 @@ test "integration: quote vector" {
     try expectOutput("(quote [])", "[]");
 }
 
+test "integration: quote inside a quoted form is the 2-list (quote x)" {
+    try expectOutput("'(a 'b [1 'c])", "(a (quote b) [1 (quote c)])");
+    try expectOutput("(first (rest ''x))", "x");
+    try expectOutput("(= ''x '(quote x))", "true");
+}
+
 test "integration: syntax-quote no unquote" {
     try expectOutput("`(1 2 3)", "(1 2 3)");
     // An unqualified symbol with no Var resolves to the current
