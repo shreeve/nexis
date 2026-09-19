@@ -1,15 +1,14 @@
-//! coll/champ.zig — persistent map + set heap kind (Phase 1).
+//! coll/champ.zig — persistent map + set heap kind.
 //!
 //! Authoritative spec: `docs/CHAMP.md`. Semantic framing:
 //! `docs/SEMANTICS.md` §2.6 (associative equality category) and §3.2
-//! (associative-domain hash byte `0xF1`, map entry-hash formula as
-//! amended 2026-04-19). Physical storage: `docs/HEAP.md`. Representation
-//! choices: `docs/VALUE.md` §2.2 (extended subkind taxonomy for
+//! (associative-domain hash byte `0xF1`, map entry-hash formula).
+//! Physical storage: `docs/HEAP.md`. Representation choices:
+//! `docs/VALUE.md` §2.2 (extended subkind taxonomy for
 //! `persistent_map` — four subkinds 0..3).
 //!
-//! **Commit 1 of two: map only.** `persistent_set` ships in commit 2 as
-//! a parallel subkind family sharing this module's machinery. The set
-//! public API surface is not present in this file yet.
+//! The file has two parts: the persistent map, then `persistent_set`
+//! as a parallel subkind family sharing the map's machinery.
 //!
 //! ## Subkind taxonomy
 //!
@@ -35,23 +34,19 @@
 //! `&dispatch.hashValue` and `&dispatch.equal` into each call at the
 //! `persistent_map` kind switch.
 //!
-//! ## Scope (commit 1)
+//! ## Map surface
 //!
 //!   - construction: `mapEmpty`, `mapFromEntries`
 //!   - mutation (persistent): `mapAssoc`, `mapDissoc`
 //!   - query: `mapGet` (returns `MapLookup` union, nil-safe),
 //!     `mapCount`, `mapIsEmpty`
 //!   - dispatch entry points: `hashMap`, `equalMap`
-//!   - iterator: `MapIter` for hash accumulation + future `seq`
+//!   - iterator: `MapIter` for hash accumulation and entry walks
 //!   - promotion: array-map → CHAMP at count=9; no demotion
 //!   - single-entry-subtree promotion on dissoc (preserves canonicality)
 //!   - keyword-keyed identity fast path in every equality call site
 //!
-//! ## Deferred (commit 2 and beyond)
-//!
-//!   - `persistent_set` kind (commit 2)
-//!   - transients (separate `src/coll/transient.zig` commit)
-//!   - `merge` / `update` / stdlib operators (Phase 3)
+//! Transients are the separate `src/coll/transient.zig` module.
 
 const std = @import("std");
 const value = @import("value");
@@ -91,7 +86,7 @@ pub const COLLISION_DEPTH: u8 = 7;
 pub const array_map_max: u32 = 8;
 
 // =============================================================================
-// Subkind discriminators (VALUE.md §2.2 amended; CHAMP.md §3)
+// Subkind discriminators (VALUE.md §2.2; CHAMP.md §3)
 // =============================================================================
 
 pub const subkind_array_map: u16 = 0;
@@ -363,7 +358,7 @@ inline fn indexHashOf(k: Value, elementHash: *const fn (Value) u64) u32 {
 
 /// Fresh empty map. Subkind 0 (array-map) with count 0. Not a shared
 /// singleton — every call allocates a new header (matches list / vector
-/// precedent; shared-singleton pinning is a Phase 6 optimization).
+/// precedent).
 pub fn mapEmpty(heap: *Heap) !Value {
     const h = try allocArrayMap(heap, 0);
     const body = arrayMapBody(h);
@@ -372,8 +367,8 @@ pub fn mapEmpty(heap: *Heap) !Value {
     return valueFromArrayMap(h);
 }
 
-/// Build a map from an entry slice. Duplicate keys: later wins (per
-/// CHAMP.md §8.1 / peer-AI turn 8). Implementation is a left-fold of
+/// Build a map from an entry slice. Duplicate keys: later wins
+/// (CHAMP.md §8.1). Implementation is a left-fold of
 /// `mapAssoc`, which handles duplicate-key overwrite and promotion
 /// threshold automatically.
 pub fn mapFromEntries(
@@ -1469,7 +1464,7 @@ pub fn hashMap(h: *HeapHeader, elementHash: *const fn (Value) u64) u64 {
 /// 16 ∉ {8, 40, 72, …, 264}, so the discriminator is unambiguous.
 /// Safe builds assert the body size matches one of the known values
 /// to catch corrupted headers before they're interpreted with the
-/// wrong layout (peer-AI turn 11).
+/// wrong layout.
 ///
 /// Subkinds 2 (interior) and 3 (collision) are internal-only and
 /// never flow through this function — user-facing maps are only
@@ -1496,8 +1491,7 @@ fn inferRootSubkind(h: *HeapHeader) u16 {
 }
 
 /// Per-entry hash (CHAMP.md §7.1): two ordered combines, no finalize,
-/// no inner domain mix. SEMANTICS.md §3.2 amended 2026-04-19 to pin
-/// this formula.
+/// no inner domain mix. SEMANTICS.md §3.2 pins this formula.
 inline fn entryHash(k: Value, v: Value, elementHash: *const fn (Value) u64) u64 {
     var acc: u64 = hash_mod.ordered_init;
     acc = hash_mod.combineOrdered(acc, elementHash(k));
@@ -1553,21 +1547,21 @@ pub fn equalMap(
 // =============================================================================
 // Iterator — walks every entry of a user-facing map Value.
 //
-// Used by `hashMap`, `equalMap`, and (eventually) language-surface
-// `(seq m)`. Iteration order is insertion order for array-maps and
+// Used by `hashMap`, `equalMap`, and every external walk of a map's
+// entries. Iteration order is insertion order for array-maps and
 // trie-walk order for CHAMP-backed maps — the language does not
 // guarantee either specifically (maps are unordered at the semantic
 // level); the iterator's order is an implementation detail.
 //
-// Internal-node discrimination (peer-AI turn 11): interior-vs-collision
+// Internal-node discrimination: interior-vs-collision
 // is tracked by **recorded shift depth per frame**, NOT by inspecting
 // body bytes. The assoc/dissoc paths only construct collision nodes
 // at `shift > MAX_TRIE_SHIFT`, so a frame whose child was reached via
 // descent at shift `s` knows deterministically:
 //   - if `s <= MAX_TRIE_SHIFT`: child is another interior.
 //   - if `s > MAX_TRIE_SHIFT`: child is a collision node.
-// This matches the read/write path's shift-driven dispatch and removes
-// the probabilistic body-inspection heuristic entirely.
+// This matches the read/write path's shift-driven dispatch; no
+// body-inspection heuristic is involved.
 // =============================================================================
 
 pub const MapIter = struct {
@@ -1670,7 +1664,7 @@ pub const MapIter = struct {
                     }
                     const child = champInteriorChildren(top.node)[top.cursor];
                     top.cursor += 1;
-                    // Shift-driven child dispatch (peer-AI turn 11):
+                    // Shift-driven child dispatch:
                     // the current frame's `shift` tells us what this
                     // child IS. If `shift == MAX_TRIE_SHIFT`, child
                     // is a collision node (we've consumed all 32
@@ -1767,11 +1761,10 @@ fn traceMapNode(node: *HeapHeader, shift: u8, visitor: anytype) void {
 // (0..3) means different things under different kind bytes, but the
 // meaning is regular across both kinds.
 //
-// Commits where set shipped: this file's commit 2. Retirement
-// receipt: test/prop/champ.zig S1..S9 (the set-category parallel of
-// the map category's M1..M11). After this commit, the three
-// equality categories (.sequential / .associative / .set) all have
-// concrete runtime members and property-test receipts.
+// Property tests: test/prop/champ.zig S1..S9 (the set-category
+// parallel of the map category's M1..M11), so all three equality
+// categories (.sequential / .associative / .set) have concrete
+// runtime members and property-test coverage.
 // =============================================================================
 // =============================================================================
 

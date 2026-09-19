@@ -55,21 +55,24 @@ pub const OpKind = enum(u4) {
     slot = 0,
     /// C — routine's constant pool.
     constant = 1,
-    /// V — namespace Var. Not exercised until the `var` group lands.
+    /// V — namespace Var (`routine.var_table[i]`).
     var_ = 2,
-    /// U — closure upvalue. Not exercised until closures land.
+    /// U — closure upvalue (`frame.upvalues[i]`).
     upvalue = 3,
-    /// I — intern id (keyword/symbol). Not exercised yet.
+    /// I — intern id (keyword/symbol). No opcode resolves it;
+    /// `resolve` raises `UnimplementedOpcode`.
     intern = 4,
-    /// J — bytecode offset (jump target). Used by `jump:*` group.
+    /// J — bytecode offset (jump target). Used by `jump:*` and
+    /// `ctrl:*`.
     jump = 5,
-    /// E — durable ref literal. Phase 4 (`tx:*`).
+    /// E — durable ref literal. No opcode resolves it;
+    /// `resolve` raises `UnimplementedOpcode`.
     durable = 6,
     // 7..14 reserved.
     /// Sentinel for "no operand".
     unused = 15,
-    /// Non-exhaustive marker: bytecode from a future nexis may
-    /// use operand kinds this VM doesn't recognize. Dispatch code
+    /// Non-exhaustive marker: bytecode may carry operand kinds
+    /// this VM doesn't recognize. Dispatch code
     /// catches those via `_` prong and surfaces BytecodeCorruption.
     _,
 };
@@ -94,8 +97,7 @@ pub const Operand = packed struct(u16) {
         return .{ .kind = .upvalue, .index = i };
     }
 
-    /// Step #6a: V-kind operand referencing
-    /// `routine.var_table[i]`.
+    /// V-kind operand referencing `routine.var_table[i]`.
     pub fn varRef(i: u12) Operand {
         return .{ .kind = .var_, .index = i };
     }
@@ -103,17 +105,18 @@ pub const Operand = packed struct(u16) {
 
 /// Instruction kind discriminator — primary vs extension (per PLAN
 /// §12.1). Extension packs 20-bit operand indices for programs that
-/// exceed the 12-bit primary-operand range. Extension is NOT
-/// implemented in this commit — the `ext` encoding remains reserved.
+/// exceed the 12-bit primary-operand range. Extension is not
+/// implemented: an extension instruction raises `UnimplementedOpcode`.
 pub const InstKind = enum(u4) {
     primary = 0,
     extension = 1,
     _,
 };
 
-/// Opcode group (6 bits). Full v1 taxonomy per PLAN §12.3 and
-/// VM.md §10. Only `mov` and `call` have implemented variants in
-/// this commit.
+/// Opcode group (6 bits). Full taxonomy per PLAN §12.3 and
+/// VM.md §10. `transient`, `hash`, `tx`, `io` and `simd` have no
+/// implemented variants; dispatching them raises
+/// `UnimplementedOpcode`.
 pub const Group = enum(u6) {
     jump = 0,
     cmp = 1,
@@ -139,7 +142,6 @@ pub const Mov = enum(u6) {
     load_nil = 2,
     load_true = 3,
     load_false = 4,
-    // load_fixnum_inline, load_keyword, load_symbol — later.
     _,
 };
 
@@ -149,13 +151,10 @@ pub const Call = enum(u6) {
     tailcall = 1,
     @"return" = 2,
     return_nil = 3,
-    // apply, invoke_var — later.
     _,
 };
 
-/// Variants for the `closure` group. Per VM.md §10.4. Step 5a1
-/// wires `make` only (with empty descriptors); 5b adds the cell
-/// access ops, 5c adds the placeholder-cell ops.
+/// Variants for the `closure` group. Per VM.md §10.4.
 pub const Closure_ = enum(u6) {
     make = 0,
     box_local = 1,
@@ -166,10 +165,8 @@ pub const Closure_ = enum(u6) {
 };
 
 /// Variants for the `jump` group. Per PLAN §12.3 / VM.md §10.5.
-/// Step #3 (COMPILER.md §10 #3) wires all three v1 variants —
-/// they're tiny and `if-true` pairs naturally with `if-false`
-/// (the analyzer chooses whichever produces shorter code per
-/// branch direction).
+/// `if-true` pairs with `if-false` so the compiler can choose
+/// whichever produces shorter code per branch direction.
 pub const Jump = enum(u6) {
     jmp = 0,
     if_true = 1,
@@ -177,47 +174,35 @@ pub const Jump = enum(u6) {
     _,
 };
 
-/// Variants for the `coll` group. Per VM.md §10 group #7
-/// (reserved for collection construction/access ops).
-///
-/// Step #8c.1: `list` and `concat` land as the runtime
-/// substrate for syntax-quote's `(#%list ...)` / `(#%concat ...)`
-/// output. Both take a slot-block (A=base, B=argc, C=dst) and
-/// build an immutable List Value via `VM.heap` (arena-backed
-/// for Phase 2; GC-traced in Phase 4 — peer-AI turn 58 §D3
-/// flagged the rooting TODO for the eventual GC integration).
 /// Variants for the `ctrl` group. Per VM.md §10 group #11 +
 /// §12 try/catch/throw spec.
 ///
-/// Step #9.1 (peer-AI turn 59): try-enter / try-exit / throw
-/// land. `finally-exit` reserved (variant 2) — used by #9.2
-/// once finally support comes in.
-///
-/// `halt` variant (5) explicitly unused — the existing
-/// top-level `call:return` path already halts the VM (per
-/// peer-AI turn 59 §D10). Uncaught throw halts via
+/// `halt` variant (5) is unused — the top-level `call:return`
+/// path halts the VM. Uncaught throw halts via
 /// `VmError.UncaughtThrow`.
 pub const CtrlOp = enum(u6) {
-    /// `ctrl:try-enter A=catch_pc B=binding_slot C=unused` —
+    /// `ctrl:try-enter A=catch_pc B=binding_slot C=finally_pc?` —
     /// push a try handler. catch_pc is absolute. binding_slot
     /// is where the thrown value will be stored when the catch
-    /// fires. C is reserved for the finally_pc operand in #9.2;
-    /// MUST be `.unused` kind in #9.1.
+    /// fires. C is either a `.jump` operand carrying the
+    /// absolute finally_pc or `.unused`.
     try_enter = 0,
     /// `ctrl:try-exit A=post_pc B=unused C=unused` — pop the
     /// current handler/cleanup (must belong to this frame) and
-    /// jump to post_pc. In #9.2, if the popped handler has a
-    /// finally_pc, the VM redirects through the finally body
-    /// with a saved post_pc continuation.
+    /// jump to post_pc. If the popped handler has a finally_pc,
+    /// the VM redirects through the finally body with a saved
+    /// post_pc continuation.
     try_exit = 1,
-    /// `ctrl:finally-exit` — reserved for #9.2.
+    /// `ctrl:finally-exit` — pop the finally continuation and
+    /// dispatch on it (`.normal` → resume at post_pc,
+    /// `.throwing` → continue unwinding).
     finally_exit = 2,
     /// `ctrl:throw A=value_operand B=unused C=unused` — throw
     /// the resolved value. A may be any operand kind (slot,
     /// constant, var). Walks the handler stack; if a try
     /// handler matches, replaces it with a cleanup handler
-    /// (peer-AI turn 59 §D5 "classic trap": prevents the
-    /// catch body from being re-caught by its own handler),
+    /// (this prevents the catch body from being re-caught by
+    /// its own handler),
     /// binds the thrown value, and jumps to catch_pc. If no
     /// handler matches in any frame, halts with
     /// `VmError.UncaughtThrow`.
@@ -227,6 +212,11 @@ pub const CtrlOp = enum(u6) {
     _,
 };
 
+/// Variants for the `coll` group. Per VM.md §10 group #7. `list`
+/// and `concat` are the runtime substrate for syntax-quote's
+/// `(#%list ...)` / `(#%concat ...)` output. Every variant takes
+/// a slot-block (A=base, B=argc, C=dst) and builds a value via
+/// `VM.heap`.
 pub const CollOp = enum(u6) {
     /// `coll:list A=arg_base B=argc C=dst` — build a list from
     /// argc consecutive slots starting at A. Empty list (argc=0)
@@ -237,12 +227,12 @@ pub const CollOp = enum(u6) {
     /// concatenation. Empty concat (argc=0) returns the empty
     /// list. Non-list arg traps `KindMismatch`.
     concat = 1,
-    /// Step #8c.3: `coll:vector A=arg_base B=argc C=dst` —
+    /// `coll:vector A=arg_base B=argc C=dst` —
     /// build a persistent vector from argc consecutive slots.
     /// Empty vector (argc=0) via `vector_mod.empty(heap)`.
     /// Allocates via `vector_mod.fromSlice` for argc>0.
     vector = 2,
-    /// Phase 3.1: `coll:map A=arg_base B=argc C=dst` — build
+    /// `coll:map A=arg_base B=argc C=dst` — build
     /// a persistent map from argc slots interpreted as flat
     /// k,v,k,v,... pairs. argc MUST be even
     /// (BytecodeCorruption otherwise — compiler guarantees
@@ -250,7 +240,7 @@ pub const CollOp = enum(u6) {
     /// Hash + equality come from dispatch.hashValue +
     /// dispatch.equal.
     map = 3,
-    /// Phase 3.1: `coll:set A=arg_base B=argc C=dst` — build
+    /// `coll:set A=arg_base B=argc C=dst` — build
     /// a persistent set from argc slot values. Duplicates
     /// collapse (set semantics). Same hash/eq machinery as
     /// `coll:map`.
@@ -259,7 +249,6 @@ pub const CollOp = enum(u6) {
 };
 
 /// Variants for the `var` group. Per VM.md §10 group #6.
-/// #6a wires `load_var`; #6b adds `store_var` and `var_object`.
 pub const VarOp = enum(u6) {
     /// Load the Var's root value into a slot. Traps :unbound-var.
     load_var = 0,
@@ -272,13 +261,10 @@ pub const VarOp = enum(u6) {
     _,
 };
 
-/// Variants for the `cmp` group. Per VM.md §10 group #1 (peer-AI
-/// turn 47 — comparisons live in their own group, NOT in `math`,
-/// to keep arithmetic ISA clean). Step 5d0 wires `lt` only —
-/// the minimum needed to write a terminating loop test for
-/// `recur` / `loop*`. The remaining variants are listed here so
-/// dispatch can distinguish "known but not wired" from
-/// "unrecognized bit pattern" per the turn-31 split.
+/// Variants for the `cmp` group. Per VM.md §10 group #1
+/// (comparisons live in their own group, NOT in `math`, to keep
+/// the arithmetic ISA clean). All five dispatch through
+/// `numCompare`.
 pub const Cmp = enum(u6) {
     lt = 0,
     lte = 1,
@@ -289,12 +275,10 @@ pub const Cmp = enum(u6) {
 };
 
 /// Variants for the `math` group. Per PLAN §12.3 / VM.md §10.
-/// Step #2 (COMPILER.md §10 #2) wires `add` only — the absolute
-/// minimum needed to lower `(+ 1 2)` end-to-end. The remaining
-/// variants are listed here so dispatch can distinguish
-/// "known opcode, not yet wired" (UnimplementedOpcode) from
-/// "unrecognized bit pattern" (BytecodeCorruption) per the
-/// turn-31 split (peer-AI turn 33 confirmation).
+/// Every variant except `pow` dispatches through the numeric
+/// tower; `pow` raises `UnimplementedOpcode`. A variant outside
+/// this enum raises `BytecodeCorruption` ("known opcode, not
+/// wired" and "unrecognized bit pattern" are distinct errors).
 pub const Math = enum(u6) {
     add = 0,
     sub = 1,
@@ -342,12 +326,11 @@ comptime {
 // =============================================================================
 // Routine (VM.md §5)
 //
-// For this commit Routine is a plain Zig struct. Once the `fn*`
-// lowering + closures land, routines will be wrapped in a heap
-// Value of kind 22 (VALUE.md §2.2 `function`).
+// Routine is a plain Zig struct referenced by `*const Routine`
+// from constant pools and closures; it is not a heap Value.
 // =============================================================================
 
-/// Typed entry in a routine's constant pool (peer-AI turn 40).
+/// Typed entry in a routine's constant pool.
 ///
 /// Routine prototypes are NOT user `Value`s; mixing them with
 /// ordinary values would let `mov:load-const` load a prototype
@@ -363,10 +346,7 @@ pub const Const = union(enum) {
 };
 
 /// Source of one upvalue cell when constructing a closure.
-/// (Per VM.md §6 capture descriptor sources, peer-AI turn 34.)
-/// Step 5a1 introduces the type; only zero-source descriptors
-/// are populated. Step 5b populates `local_cell_slot` /
-/// `inherited_upvalue` entries during lazy-boxing capture.
+/// (Per VM.md §6 capture descriptor sources.)
 pub const CaptureSource = union(enum) {
     /// Read raw `*UpvalCell` pointer from `caller.slot[index]`.
     /// The slot must hold a cell pointer (a previous
@@ -380,8 +360,7 @@ pub const CaptureSource = union(enum) {
 
 /// One descriptor used by a `closure:make` instruction. Each
 /// `CaptureSource` corresponds to one upvalue slot in the
-/// constructed closure. v1 step 5a1 only ever uses zero-source
-/// descriptors (no captures).
+/// constructed closure.
 pub const CaptureDescriptor = struct {
     sources: []const CaptureSource,
 };
@@ -394,27 +373,24 @@ pub const Routine = struct {
     /// which `Const` variant is required.
     consts: []const Const,
     /// Capture-descriptor table. Indexed by `closure:make`'s
-    /// operand B per VM.md §5 amendment. v1 step 5a1: only the
-    /// empty descriptor (zero sources) populated.
+    /// operand B per VM.md §5.
     capture_descs: []const CaptureDescriptor = &.{},
     /// Slot count. The frame reserves this many `Value` slots on
     /// invocation.
     slot_count: u16,
     /// Number of FIXED arguments this routine accepts. For a
     /// non-variadic routine, `call:call` must pass exactly
-    /// `fixed_arity` args; mismatch raises `:arity-mismatch`
-    /// (peer-AI turn 40). For a variadic routine
+    /// `fixed_arity` args; mismatch raises `:arity-mismatch`.
+    /// For a variadic routine
     /// (`variadic = true`), `call:call` must pass at least
     /// `fixed_arity` args and the rest are packed into a list
     /// installed at `slot[fixed_arity]` by the VM at call
-    /// time (per VM.md §6 + peer-AI turn 49 Option D).
-    /// (Renamed from `arity` in step 5e0.)
+    /// time (per VM.md §6).
     fixed_arity: u16 = 0,
     /// If true, this routine takes a rest parameter at slot
     /// `fixed_arity`. The VM packs any excess args into a list
     /// at call time. `(fn* [a b & r] body)` lowers to
-    /// `fixed_arity = 2, variadic = true`. Step 5e (peer-AI
-    /// turn 49).
+    /// `fixed_arity = 2, variadic = true`.
     variadic: bool = false,
     /// Number of upvalue cells the routine's body expects in
     /// its callee frame. Validated against the constructed
@@ -422,10 +398,10 @@ pub const Routine = struct {
     /// against `closure:make`'s descriptor source count at
     /// closure-construction time.
     upvalue_count: u16 = 0,
-    /// Step #6a: per-routine Var table. The V operand index
+    /// Per-routine Var table. The V operand index
     /// resolves through this table (analogous to const_pool
     /// for Values, capture_descs for closure construction).
-    /// Caller (compileSymbol fall-through, step #6c) interns
+    /// The compiler (compileSymbol fall-through) interns
     /// each referenced Var in the VM's Namespace and records
     /// the *Var here. Resolution is O(1) at runtime.
     var_table: []const *Var = &.{},
@@ -436,13 +412,12 @@ pub const Routine = struct {
 /// A Var holds a mutable cell of a Value with stable identity
 /// across rebinds (matches Clojure's `def` semantics: `(def x 5)`
 /// then `(def x 10)` does NOT create a new Var; the same Var
-/// object's root is updated). Per PLAN §6.1 + VM.md §6, step #6a.
+/// object's root is updated). Per PLAN §6.1 + VM.md §6.
 ///
-/// Staged allocation (peer-AI turn 49): same pattern as
-/// Closure/UpvalCell. Var lives in VM.runtime_arena; Value
-/// payload is the raw `*Var`. When real GC integration lands,
-/// this migrates to `heap.alloc(.var_, ...)` with a HeapHeader
-/// prefix and the Value encoding becomes `*HeapHeader`.
+/// Allocation: same pattern as Closure/UpvalCell. A Var lives
+/// in VM.runtime_arena and the Value payload is the raw
+/// `*Var`, not a `HeapHeader`-prefixed heap object; the
+/// collector does not trace Vars.
 ///
 /// `bound`: false until the first `(def name val)` runs. Loads
 /// via `var:load-var` trap `:unbound-var` in that case. This
@@ -454,26 +429,27 @@ pub const Var = struct {
     /// owns this Var owns the name's backing storage.
     name: []const u8,
     /// Current root value. Read by `var:load-var` / V-operand
-    /// resolve. Written by `var:store-var` (step #6b).
+    /// resolve. Written by `var:store-var`.
     root: Value = value_mod.nilValue(),
     /// True once `def` has set the root. Distinguishes
     /// "intentionally nil" from "never bound".
     bound: bool = false,
-    /// Phase 3.2 (peer-AI turn 66): true when this Var was
-    /// created by `(defmacro ...)`. The expander dispatches
+    /// True when this Var was created by `(defmacro ...)`.
+    /// The expander dispatches
     /// macro Vars (compile-time evaluation of the macro fn)
     /// instead of compiling `(my-macro ...)` as an ordinary
     /// call. Set ONLY by the expander's defmacro handler;
     /// regular `def` never sets it.
     macro: bool = false,
     /// Reserved for metadata maps (doc, source location, etc.).
-    /// Wired in Phase 3+.
+    /// Nothing reads or writes it; it is always nil.
     meta: Value = value_mod.nilValue(),
 };
 
-/// A namespace mapping symbol names to `*Var`. v1 has a single
-/// global namespace per VM; multi-namespace machinery lands
-/// later (peer-AI turn 49). Step #6a.
+/// A namespace mapping symbol names to `*Var`. A VM holds one
+/// or more namespaces through `NamespaceRegistry`; a bare
+/// `Namespace` without a registry is the single-namespace form
+/// the tests use.
 ///
 /// Lifetime: Var structs themselves live in VM.runtime_arena
 /// and are freed wholesale at `VM.deinit`. The HashMap's
@@ -481,28 +457,27 @@ pub const Var = struct {
 /// its other ArrayLists (VM.allocator); freed in
 /// `Namespace.deinit`.
 pub const Namespace = struct {
-    /// Phase 3.4 (peer-AI turn 69): namespace name. Empty for
-    /// ad-hoc single-ns usage (backward compat with tests that
-    /// construct a Namespace directly without going through
+    /// Namespace name. Empty for ad-hoc single-ns usage (tests
+    /// that construct a Namespace directly without going through
     /// `NamespaceRegistry`). When non-empty, this is the
     /// canonical name (e.g., "nexis.core", "user", "my.app").
     name: []const u8 = "",
-    /// Phase 3.4: auto-refer fallback. When `lookup` doesn't
+    /// Auto-refer fallback. When `lookup` doesn't
     /// find a Var by name in this namespace, it walks the
     /// parent chain. Used to thread `nexis.core` into every
-    /// user-defined namespace (peer-AI turn 69 §D6: "auto-refer
-    /// `nexis.core` from every new namespace by default").
+    /// user-defined namespace (`nexis.core` is auto-referred
+    /// from every new namespace).
     /// `intern` does NOT walk parent — forward references
     /// always land in the current namespace, never silently
     /// shadowing parent Vars.
     parent: ?*Namespace = null,
-    /// Phase 3.4: back-link to the owning registry. Lets
+    /// Back-link to the owning registry. Lets
     /// arbitrary cross-namespace qualified lookups (`other/x`
     /// where `other` is not an ancestor) resolve directly via
     /// `registry.lookupNs(name)`. Null for ad-hoc namespaces
     /// constructed without going through `NamespaceRegistry`.
     registry: ?*NamespaceRegistry = null,
-    /// Phase 3.6: per-namespace alias table. Maps alias name
+    /// Per-namespace alias table. Maps alias name
     /// (e.g., "m") to the canonical namespace name (e.g.,
     /// "my.app"). Populated by `(require '[my.app :as m])` in
     /// the CURRENT namespace. Qualified symbol resolution
@@ -538,7 +513,7 @@ pub const Namespace = struct {
         self.* = undefined;
     }
 
-    /// Phase 3.6: register an alias `alias_name → target_ns_name`
+    /// Register an alias `alias_name → target_ns_name`
     /// in this namespace's alias table. Used by
     /// `(require '[my.ns :as alias])`. Replaces any existing
     /// binding for `alias_name`. Both strings are duped into
@@ -551,7 +526,7 @@ pub const Namespace = struct {
         try self.aliases.put(owned_alias, owned_target);
     }
 
-    /// Phase 3.6: resolve an alias name. Returns the target
+    /// Resolve an alias name. Returns the target
     /// namespace name if `name` is registered as an alias in
     /// this namespace, else null.
     pub fn lookupAlias(self: *const Namespace, name: []const u8) ?[]const u8 {
@@ -560,14 +535,14 @@ pub const Namespace = struct {
 
     /// Look up an existing Var. Returns null if no Var was
     /// ever interned under `name` in this namespace OR in any
-    /// auto-referred parent (Phase 3.4 peer-AI turn 69).
+    /// auto-referred parent.
     pub fn lookup(self: *const Namespace, name: []const u8) ?*Var {
         if (self.vars.get(name)) |v| return v;
         if (self.parent) |p| return p.lookup(name);
         return null;
     }
 
-    /// Phase 3.4: local-only lookup. Does NOT walk parent.
+    /// Local-only lookup. Does NOT walk parent.
     /// Used by interner-style fall-through where a forward-
     /// reference Var should ONLY land in the current
     /// namespace, never in a referred-in parent.
@@ -577,15 +552,12 @@ pub const Namespace = struct {
 
     /// Get or create a Var for `name`. Newly-created Vars are
     /// unbound (root = nil, bound = false). The compiler uses
-    /// this for forward references (step #6c).
+    /// this for forward references.
     ///
-    /// Phase 3.6: the name is duped into `var_allocator` so
-    /// callers can pass slices from transient arenas (e.g., a
-    /// per-form reader arena that dies after `(require ...)`
-    /// loads a file). Pre-3.6 callers passed string literals,
-    /// so this dupe was a (small) leak nobody noticed; with
-    /// loader-driven interning, dupe is required for
-    /// correctness.
+    /// The name is duped into `var_allocator` so callers can
+    /// pass slices from transient arenas (e.g., a per-form
+    /// reader arena that dies after `(require ...)` loads a
+    /// file); loader-driven interning depends on this dupe.
     pub fn intern(self: *Namespace, name: []const u8) !*Var {
         if (self.vars.get(name)) |v| return v;
         const owned_name = try self.var_allocator.dupe(u8, name);
@@ -596,7 +568,7 @@ pub const Namespace = struct {
     }
 };
 
-/// Phase 3.4 (peer-AI turn 69): multi-namespace registry. Owns
+/// Multi-namespace registry. Owns
 /// a map from canonical namespace name to `*Namespace`, plus
 /// pointers to the conventional `nexis.core` (auto-referred by
 /// every new namespace) and the `current` namespace (where
@@ -617,28 +589,22 @@ pub const NamespaceRegistry = struct {
     core: *Namespace = undefined,
     /// Where `def`/`defn`/`defmacro` install.
     current: *Namespace = undefined,
-    /// Phase 5.2a (peer-AI turns 77/78): heap reachable from
-    /// the compile.zig Form-lowering path via
-    /// `namespace.registry.heap`. Used by `LowerCtx.heap` to
+    /// Heap reachable from the compile.zig Form-lowering path
+    /// via `namespace.registry.heap`. Used by `LowerCtx.heap` to
     /// allocate string-literal Values (Tiny.literal carriers).
     /// `VM.ensureRegistry` populates this from `VM.ensureHeap()`.
     /// Ad-hoc test harnesses that init a registry without a VM
-    /// can leave it null; `.string` Forms then defer as before.
-    ///
-    /// TODO(post-5.2): replace with an explicit `CompileContext`
-    /// (peer-AI turn 78 §R1) that bundles allocator + registry +
-    /// current namespace + interner + heap + loader + macros into
-    /// one struct, so compile entry points stop accreting
-    /// optional parameters. Today's registry-as-backchannel is a
-    /// staged shape, not the final architecture.
+    /// can leave it null; `.string` Forms then raise
+    /// `UnsupportedFeature`. The registry is the channel that
+    /// carries the heap to the compiler; there is no bundled
+    /// compile-context struct.
     heap: ?*heap_mod.Heap = null,
 
     /// Two-phase init: caller stores the empty registry FIRST,
     /// then calls `setupDefaults` on the stable pointer.
-    /// Single-phase init was unsafe because `ns.registry = self`
-    /// captured the local `self` pointer, which dangled once
-    /// the registry was copied into its final home (peer-AI
-    /// turn 69 fix during 3.4 integration).
+    /// Single-phase init would be unsafe: `ns.registry = self`
+    /// would capture a local `self` pointer that dangles once
+    /// the registry is copied into its final home.
     pub fn initEmpty(
         map_allocator: std.mem.Allocator,
         var_allocator: std.mem.Allocator,
@@ -709,7 +675,7 @@ pub const NamespaceRegistry = struct {
         name: []const u8,
         parent: ?*Namespace,
     ) !*Namespace {
-        // Phase 3.6 fix: dupe the name into stable storage
+        // Dupe the name into stable storage
         // (var_allocator, typically vm.runtime_arena). The caller's
         // `name` slice may be in a per-form reader arena that
         // dies after the load completes; the registry map key
@@ -725,11 +691,9 @@ pub const NamespaceRegistry = struct {
     }
 };
 
-/// Captured-binding cell. Heap object that holds one Value plus
-/// an `initialized` flag (per VM.md §6 amendment, peer-AI
-/// turn 34). v1 step 5a1: type defined but zero closures
-/// actually capture anything; `closure:box-local` /
-/// `closure:new-cell` / `closure:init-cell` lower in step 5b/5c.
+/// Captured-binding cell: one Value plus an `initialized` flag
+/// (per VM.md §6). Created by `closure:box-local` and
+/// `closure:new-cell`, filled by `closure:init-cell`.
 pub const UpvalCell = struct {
     value: Value,
     initialized: bool,
@@ -738,31 +702,22 @@ pub const UpvalCell = struct {
 /// Runtime closure object: a routine + its upvalue cells.
 /// Per VALUE.md kind 22 = `function`.
 ///
-/// **STAGED REPRESENTATION — TODO before GC integration**
-/// (peer-AI turns 40 / 42 / 43): v1 step 5a1 allocates Closure
-/// from VM-owned `runtime_arena` and stores a raw `*Closure`
-/// pointer in `Value.payload`. **This is a deliberate temporary
-/// violation** of the VALUE.md §4 heap-value contract, which
-/// requires `Value.payload` for heap kinds to point at a
-/// `HeapHeader`-prefixed object. The migration when real GC
-/// integration lands (post-5c) requires:
-///   1. Add a `header: HeapHeader` prefix field here.
-///   2. Switch allocation to `heap.alloc(.function, ...)` so
-///      the GC sees the object.
-///   3. Wire `gc.zig`'s `.function` arm from panic-reserved to
-///      a real trace function that walks `closure.upvalues`.
-///   4. Update `allocClosure` and `asClosure` accordingly.
-/// Field order (routine, upvalues) is migration-compatible
-/// when the header prefix lands.
+/// **Representation**: a Closure is allocated from the VM-owned
+/// `runtime_arena` and `Value.payload` holds the raw `*Closure`
+/// pointer. This is outside the VALUE.md §4 heap-value contract
+/// (which has `Value.payload` for heap kinds point at a
+/// `HeapHeader`-prefixed object): closures are not heap
+/// objects, `gc.zig` does not trace them, and they live as
+/// long as the arena.
 pub const Closure = struct {
     routine: *const Routine,
-    /// Empty in 5a1 (zero captures); populated by `closure:make`
-    /// in step 5b once capture descriptors carry sources.
+    /// One cell per upvalue, filled by `closure:make` from the
+    /// capture descriptor's sources.
     upvalues: []const *UpvalCell,
 };
 
-/// Phase 3.3a (peer-AI turn 67): static descriptor for a
-/// host-Zig function exposed as a first-class Value.
+/// Static descriptor for a host-Zig function exposed as a
+/// first-class Value.
 /// Descriptors live in STATIC storage (one `const NativeFn`
 /// per fn); the Value just packs a pointer to the descriptor.
 /// No heap allocation, no GC concern, immortal lifetime.
@@ -789,9 +744,9 @@ pub fn nativeFnValue(descriptor: *const NativeFn) Value {
     return value_mod.fromNativeFnPtr(@ptrCast(descriptor));
 }
 
-/// Phase 3.3a: dispatch a `call:call` whose callee resolves to
-/// a `.native_fn` Value. Copies args off the stack (peer-AI
-/// turn 67 §3 — args slice lifetime), validates arity,
+/// Dispatch a `call:call` whose callee resolves to
+/// a `.native_fn` Value. Copies args off the stack (so the
+/// args slice outlives any stack growth), validates arity,
 /// invokes the host fn, stores the result.
 fn execCallNative(
     self: *VM,
@@ -843,8 +798,9 @@ fn execCallNative(
 
     // Invoke. Native fns return a Value or propagate VmError;
     // throws are propagated upward via the standard handler
-    // mechanism (3.3a non-reentrant scope: native fns don't
-    // re-enter the VM yet, so no nested throw handling here).
+    // mechanism. A native that re-enters the VM through
+    // `callValue` gets its own synthetic frame and the
+    // `ControlTransferred` signal handles unwinding through it.
     const result = try native.call(self, args_slice);
 
     // Store result at the caller's result_dst slot.
@@ -901,7 +857,7 @@ pub const Frame = struct {
     /// extent the frames beneath it require. Popping this frame,
     /// by return or by unwind, restores the stack to this length.
     entry_stack_len: u32,
-    /// Logical slot count for bounds checks + (future) GC root walk.
+    /// Logical slot count for bounds checks.
     /// Always equals `routine.slot_count` at frame construction;
     /// kept on the frame for direct access in hot dispatch paths.
     slot_count: u16,
@@ -917,11 +873,11 @@ pub const Frame = struct {
     /// ignores this. Per VM.md §6.
     return_pc: u32 = 0,
     /// Upvalue array sourced from the executing closure. Empty
-    /// for the top-level frame and for empty-capture closures
-    /// (5a1 only allocates these); populated by `closure:make` +
-    /// `call:call` chain in step 5b.
+    /// for the top-level frame and for empty-capture closures;
+    /// otherwise the array `closure:make` built, installed by
+    /// `call:call`.
     upvalues: []const *UpvalCell = &.{},
-    /// Phase 3.3b (peer-AI turn 68): when non-null, this frame
+    /// When non-null, this frame
     /// was pushed by `VM.callValue` (a host-Zig fn re-entering
     /// the VM). When `call:return` fires for this frame, it
     /// writes the return value into `host_result.value`, sets
@@ -931,7 +887,7 @@ pub const Frame = struct {
     host_result: ?*HostCallResult = null,
 };
 
-/// Phase 3.3b (peer-AI turn 68): result cell for `VM.callValue`.
+/// Result cell for `VM.callValue`.
 /// The synthetic frame's `call:return` handler writes into this
 /// instead of into a caller's slot.
 pub const HostCallResult = struct {
@@ -943,7 +899,7 @@ pub const HostCallResult = struct {
 // Errors
 // =============================================================================
 
-/// Phase 5.3a (peer-AI turn 84): one entry per `defrecord`.
+/// One entry per `defrecord`.
 /// Names are owned by the registry (duped on registration).
 pub const RecordTypeEntry = struct {
     id: u32,
@@ -953,7 +909,7 @@ pub const RecordTypeEntry = struct {
     field_names: []const []const u8,
 };
 
-/// Phase 5.3b (peer-AI turn 84): one entry per `defprotocol`.
+/// One entry per `defprotocol`.
 /// Methods table is indexed by method-name-id (interned symbol
 /// id). Each method's impls map keys on DispatchKey (record
 /// type_id for records, kind tag for built-in kinds — see
@@ -975,7 +931,8 @@ pub const ProtocolMethod = struct {
     /// (closure / native_fn / etc.) and receives the protocol
     /// receiver as its first arg.
     impls: std.AutoHashMapUnmanaged(DispatchKey, Value) = .empty,
-    /// 5.3d adds Any/Object-fallback. Stub field for now.
+    /// Fallback impl used when no DispatchKey matches. Set by
+    /// `#%extend-default-impl` (`extend-protocol` on `:any`).
     default_impl: ?Value = null,
 };
 
@@ -1014,8 +971,9 @@ pub const DispatchKey = struct {
 
 pub const VmError = error{
     /// Known opcode / group / variant / operand kind that this VM
-    /// commit hasn't wired yet (e.g., upvalue operand before
-    /// closures land, cross-type math operands before promotion).
+    /// does not implement (extension instructions, the
+    /// `transient`/`hash`/`tx`/`io`/`simd` groups, `call:tailcall`,
+    /// `math:pow`, `ctrl:halt`, intern/durable operands).
     /// Distinct from corruption — the encoding IS a recognized
     /// shape.
     UnimplementedOpcode,
@@ -1032,26 +990,20 @@ pub const VmError = error{
     InvalidOperandKind,
     /// `return` executed at the outermost frame (halt).
     Halt,
-    /// Bytecode exhausted without an explicit `return`. Conservative
-    /// error for the v1 skeleton; later commits add an implicit
-    /// `return nil` at code-end.
+    /// Bytecode exhausted without an explicit `return`. There is
+    /// no implicit `return nil` at code-end.
     BytecodeExhausted,
     /// Unknown opcode group / variant / operand kind bit pattern
-    /// (NOT in any recognized v1 enum space). Indicates
-    /// bytecode corruption or bytecode from a newer nexis VM
+    /// (NOT in any recognized enum space). Indicates
+    /// bytecode corruption or bytecode from a nexis VM
     /// that this VM doesn't understand.
     BytecodeCorruption,
     /// `math:*` (or other kind-sensitive op) received an operand
-    /// whose kind the current implementation doesn't support
-    /// (e.g., float when fixnum-only is wired). Mirrors the
-    /// `:kind-mismatch` user-visible error kind from VM.md §13;
-    /// reusing the existing taxonomy avoids a parallel
-    /// "type-error" category drifting in (peer-AI turn 33).
-    /// Step #2 wires fixnum+fixnum for math:add; floats /
-    /// bignums / cross-type all surface this. Subsequent commits
-    /// widen the supported set; the ultimate behavior (per PLAN
-    /// §6.3) is fixnum→bignum promotion on overflow and an
-    /// arithmetic exception on non-numeric operands.
+    /// of a kind the op does not accept (e.g., a non-numeric
+    /// operand to `math:add`, a non-list operand to
+    /// `coll:concat`). Mirrors the `:kind-mismatch` user-visible
+    /// error kind from VM.md §13; reusing that taxonomy keeps a
+    /// parallel "type-error" category from drifting in.
     KindMismatch,
     /// An integer result left the i48 fixnum range. Bignum
     /// promotion (PLAN §6.3 + §8.3) needs bignum arithmetic,
@@ -1065,8 +1017,8 @@ pub const VmError = error{
     DivideByZero,
     /// `call:call` / `call:tailcall` invocation passed a different
     /// number of arguments than the callee closure's routine
-    /// declares. Per VM.md §13 `:arity-mismatch` row (peer-AI
-    /// turn 40 clarification): runtime arity check fired at
+    /// declares. Per VM.md §13 `:arity-mismatch` row: the
+    /// runtime arity check fires at
     /// frame transfer, distinct from compile-time arity errors
     /// in COMPILER.md §4.3.
     ArityMismatch,
@@ -1084,31 +1036,29 @@ pub const VmError = error{
     /// compiler bug.
     CaptureCountMismatch,
     /// Allocator failure during runtime allocation (Closure,
-    /// UpvalCell, stack growth, frame push). v1 surfaces this as
-    /// a generic OutOfMemory; a future commit may grow the
-    /// VM.md §13 taxonomy with a richer `:out-of-memory`
-    /// runtime error category that carries context.
+    /// UpvalCell, stack growth, frame push). Surfaced as a
+    /// generic OutOfMemory carrying no context.
     OutOfMemory,
     /// `U` operand index exceeds the current frame's
     /// `upvalues.len`, OR a `closure:make` `inherited_upvalue`
     /// descriptor source exceeds it. Per VM.md §13
-    /// `:upvalue-out-of-range` (peer-AI turn 34).
+    /// `:upvalue-out-of-range`.
     UpvalueOutOfRange,
     /// An opcode that requires an `UpvalCell*` in a slot (e.g.,
     /// `closure:get-cell`, `closure:make` `local_cell_slot`
     /// source) found a different Value kind in the slot. Per
-    /// VM.md §13 `:expected-cell` (peer-AI turn 34).
+    /// VM.md §13 `:expected-cell`.
     ExpectedCell,
     /// `closure:box-local` invoked on a slot that already holds
     /// an `UpvalCell*` (double-box), OR `closure:init-cell` on
     /// an already-initialized cell. Per VM.md §13
-    /// `:invalid-cell-state` (peer-AI turn 34). Indicates a
+    /// `:invalid-cell-state`. Indicates a
     /// compiler bug — should never reach the runtime.
     InvalidCellState,
     /// `closure:get-cell` (or U-operand resolve) read a cell
     /// whose `initialized = false` — a placeholder cell that
     /// has not yet been filled in. Per VM.md §13
-    /// `:uninitialized-cell` (peer-AI turn 34). Indicates a
+    /// `:uninitialized-cell`. Indicates a
     /// `closure:init-cell` was emitted out of order or skipped
     /// entirely.
     UninitializedCell,
@@ -1123,33 +1073,33 @@ pub const VmError = error{
     /// belong to the current frame, or popping found nothing.
     /// Indicates compiler bug, not user error.
     InvalidHandlerState,
-    /// Phase 3.3a: indexed access on a collection (e.g.,
+    /// Indexed access on a collection (e.g.,
     /// `(nth coll n)`) used an out-of-bounds index. Mapped to
     /// `:index-out-of-bounds` by the catchable-error
     /// translation table.
     IndexOutOfBounds,
-    /// Phase 4.0a: db engine error (file open failure, missing
+    /// db engine error (file open failure, missing
     /// tree, MVCC conflict, etc.). Mapped to `:db-error`.
     DbError,
-    /// Phase 4.0a: operation attempted on a Connection that
+    /// Operation attempted on a Connection that
     /// was already closed (via `db/close` or VM teardown).
     /// Mapped to `:db-closed`.
     DbClosed,
-    /// Phase 4.0a: arg expected to be a `durable_ref` Value
+    /// Arg expected to be a `durable_ref` Value
     /// was not. Mapped to `:invalid-durable-ref`.
     InvalidDurableRef,
-    /// Phase 4.0a: codec encode/decode failed (unserializable
+    /// Codec encode/decode failed (unserializable
     /// value, corrupt bytes, version mismatch). Mapped to
     /// `:codec-failed`.
     CodecFailed,
-    /// Phase 4.0b: tx op attempted on a transaction that was
+    /// tx op attempted on a transaction that was
     /// already committed or aborted. Mapped to `:tx-closed`.
     TxClosed,
-    /// Phase 4.0c: `(db/deref x)` / `@x` invoked on a Value
+    /// `(db/deref x)` / `@x` invoked on a Value
     /// whose kind isn't a durable_ref or Var. Mapped to
     /// `:not-derefable`.
     NotDerefable,
-    /// Phase 3.3b (peer-AI turn 68): INTERNAL control-flow
+    /// INTERNAL control-flow
     /// signal. NOT user-visible, NOT catchable. Raised when a
     /// throw propagated past a `VM.callValue` synthetic frame
     /// (i.e., control transferred to a handler installed BELOW
@@ -1162,11 +1112,11 @@ pub const VmError = error{
     /// V-operand resolve (or `var:load-var`) read a Var whose
     /// `bound = false` — the Var was interned (e.g., by a
     /// forward reference in another `defn`) but no `def` has
-    /// set its root yet. Per VM.md §13 `:unbound-var`
-    /// (peer-AI turn 49). Recoverable error (user can `def`
+    /// set its root yet. Per VM.md §13 `:unbound-var`.
+    /// Recoverable error (user can `def`
     /// the var and retry).
     UnboundVar,
-    /// Phase 5 Item 1 (peer-AI turn 75): a mutating op on an
+    /// A mutating op on an
     /// atom (`swap!`/`reset!`/`compare-and-set!`/`swap-vals!`)
     /// was attempted while ANOTHER mutating op on the same
     /// atom is still in flight. The single-threaded VM cannot
@@ -1174,57 +1124,56 @@ pub const VmError = error{
     /// catchable error instead of being silently allowed.
     /// Mapped to `:atom-re-entry`. See ATOM.md §4.4.
     AtomReEntry,
-    /// Phase 5 Item 2 (peer-AI turn 77 §D9): malformed UTF-8
+    /// Malformed UTF-8
     /// byte sequence encountered during codepoint iteration of
     /// a `.string` Value. Storage is byte-blob; the reader and
     /// codec validate on construction, but a corrupt-codec or
     /// fuzz path could produce one. Mapped to `:utf8-error`.
     Utf8Error,
-    /// Phase 5 Item 2 sub-step 5.2b (peer-AI turn 80 §"Must-fix"
-    /// #2): argument is the right kind but an invalid value for
+    /// Argument is the right kind but an invalid value for
     /// the operation — e.g., empty delimiter for split, empty
     /// match for replace. Distinct from KindMismatch (which is
     /// for wrong-kind args). Mapped to `:invalid-argument`.
     InvalidArgument,
-    /// Phase 5.2c (peer-AI turn 81): generic I/O failure for
+    /// Generic I/O failure for
     /// `slurp`/`spit`/`print`/`println`/`prn` — permissions,
     /// disk full, write failure, vm.io == null, etc. Mapped to
     /// `:io-error`.
     IoError,
-    /// Phase 5.2c: target path does not exist (slurp on a
+    /// Target path does not exist (slurp on a
     /// missing file). Mapped to `:file-not-found`.
     FileNotFound,
-    /// Phase 5.2c: path argument is structurally invalid (empty
+    /// Path argument is structurally invalid (empty
     /// string, contains a NUL byte, etc.). Distinct from
     /// `:io-error` because the issue is at the language boundary,
     /// not in the filesystem. Mapped to `:invalid-path`.
     InvalidPath,
-    /// Phase 5.3a (peer-AI turn 84): `defrecord` with a record
+    /// `defrecord` with a record
     /// type name that already exists in the per-VM registry.
     /// Rejected to avoid the confusing-state hazard where
     /// existing instances reference a stale type_id.
     /// Mapped to `:record-redefinition`.
     RecordRedefinition,
-    /// Phase 5.3a: record-introspection ops expected a record
+    /// Record-introspection ops expected a record
     /// receiver but got something else. Mapped to `:not-a-record`.
     NotARecord,
-    /// Phase 5.3b (peer-AI turn 84): protocol-fn dispatch could
+    /// Protocol-fn dispatch could
     /// not find an impl for the receiver's dispatch key (no
     /// matching record / built-in kind impl, no Any default).
     /// Mapped to `:no-protocol-impl`.
     NoProtocolImpl,
-    /// Phase 5.3b: tried to extend a protocol that does not
+    /// Tried to extend a protocol that does not
     /// have a method with the given name. Mapped to
     /// `:no-protocol-method`.
     NoProtocolMethod,
-    /// Phase 5.3b: `defprotocol` with a name that already
+    /// `defprotocol` with a name that already
     /// exists (same `(ns, name)`). Mapped to
     /// `:protocol-redefinition`.
     ProtocolRedefinition,
 };
 
 // =============================================================================
-// Try / catch / throw machinery (step #9.1, peer-AI turn 59)
+// Try / catch / throw machinery
 // =============================================================================
 
 /// What kind of frame-bound exception handler this is.
@@ -1292,39 +1241,34 @@ pub const VM = struct {
     /// Backing slot storage shared across all frames. Per-frame
     /// access uses `frame.base_slot + slot_index` indirection.
     stack: std.ArrayList(Value) = .empty,
-    /// Frame chain. Step 5a0: always exactly one frame (the
-    /// top-level routine). Step 5a1: `call:call` appends; `call:return`
-    /// pops.
+    /// Frame chain. The top-level routine is frame 0;
+    /// `call:call` appends; `call:return` pops.
     frames: std.ArrayList(Frame) = .empty,
-    /// Runtime allocation arena for `Closure` and `UpvalCell`
-    /// objects (peer-AI turn 40 + 42: VM-owned allocation, defer
-    /// real GC). Lifetime = VM lifetime; freed wholesale in
-    /// `deinit`. When real GC integration lands (post-5c),
-    /// allocations migrate to gc-managed `heap.alloc` calls; the
-    /// Closure/UpvalCell layouts stay trace-compatible.
+    /// Runtime allocation arena for `Closure`, `UpvalCell` and
+    /// `Var` objects (VM-owned allocation outside the GC heap).
+    /// Lifetime = VM lifetime; freed wholesale in `deinit`.
     runtime_arena: std.heap.ArenaAllocator,
-    /// Step 5e: heap for runtime list construction (variadic
-    /// rest args). Backed by `runtime_arena.allocator()` so list
-    /// nodes share the closure/cell lifetime — all freed at
-    /// `VM.deinit`. Initialized lazily on first variadic call
-    /// to avoid the cost on programs that never use variadic
-    /// fns.
+    /// Heap for values the VM constructs itself (variadic rest
+    /// lists, `coll:*` results). Backed by
+    /// `runtime_arena.allocator()` so nodes share the
+    /// closure/cell lifetime — all freed at `VM.deinit`.
+    /// Initialized lazily on first use so programs that never
+    /// construct a value pay nothing.
     heap: ?heap_mod.Heap = null,
-    /// Step #6a: global namespace for Vars. Lazy-initialized
-    /// on first access (no cost for programs that don't use
-    /// Vars). Var structs allocate from `runtime_arena`; the
-    /// HashMap's internal storage uses `allocator`.
-    /// v1 has a single global namespace; multi-namespace
-    /// machinery lands later.
+    /// Single-namespace slot for Vars. Lazy-initialized on first
+    /// access (no cost for programs that don't use Vars). Var
+    /// structs allocate from `runtime_arena`; the HashMap's
+    /// internal storage uses `allocator`. Used only when no
+    /// `registry` exists (ad-hoc test harnesses).
     namespace: ?Namespace = null,
-    /// Phase 3.4: multi-namespace registry. When non-null, the
+    /// Multi-namespace registry. When non-null, the
     /// CURRENT namespace is `registry.current` (which may differ
     /// across REPL evaluations or file forms via `(ns NAME)`).
     /// `ensureNamespace()` returns `registry.current` when the
-    /// registry exists; otherwise it falls back to the legacy
-    /// single `namespace` field (test/ad-hoc compat).
+    /// registry exists; otherwise it falls back to the
+    /// single `namespace` field.
     registry: ?NamespaceRegistry = null,
-    /// Phase 4.0a (peer-AI turn 72): list of OPEN db Connections.
+    /// List of OPEN db Connections.
     /// `db/open` appends; `db/close` removes; `VM.deinit` closes
     /// any still-open as a safety net. Connections own OS
     /// resources (mmap, file handle); they CANNOT live in
@@ -1332,7 +1276,7 @@ pub const VM = struct {
     /// Stored as `*anyopaque` to avoid a vm.zig → db.zig
     /// dependency. db.zig owns the cast back to `*db.Connection`.
     db_connections: std.ArrayList(*anyopaque) = .empty,
-    /// Phase 4.0a: closer callback. Set by db.zig the first
+    /// Closer callback. Set by db.zig the first
     /// time a connection is registered, so VM.deinit can close
     /// connections without importing db.
     db_close_callback: ?*const fn (*anyopaque) void = null,
@@ -1346,9 +1290,9 @@ pub const VM = struct {
     /// teardown through `nextomic_query_close`. The natives own the cast.
     nextomic_query_state: ?*anyopaque = null,
     nextomic_query_close: ?*const fn (*anyopaque) void = null,
-    /// Phase 5.2a polish (chore): Zig 0.16 `std.Io` handle for
-    /// filesystem ops that live below the language surface —
-    /// today only `(db/open path)` uses it to auto-create the
+    /// Zig 0.16 `std.Io` handle for filesystem ops that live
+    /// below the language surface —
+    /// only `(db/open path)` uses it to auto-create the
     /// path's parent directories (emdb does NOT create parents).
     /// Set by the CLI (`runFile`/`runRepl`) right after
     /// `VM.init`; left null in ad-hoc test harnesses (which use
@@ -1356,25 +1300,25 @@ pub const VM = struct {
     /// the auto-create branch is a no-op there).
     io: ?std.Io = null,
 
-    /// Phase 5.3a (peer-AI turn 84): per-VM record-type
+    /// Per-VM record-type
     /// registry. Lazy-init via `ensureRecordRegistry`. Each
     /// `defrecord` allocates a new RecordTypeEntry; the
     /// returned dense u32 id is used as `RecordBody.type_id`.
     /// PROTOCOLS.md §3.
     record_registry: std.ArrayList(RecordTypeEntry) = .empty,
 
-    /// Phase 5.3b (peer-AI turn 84): per-VM protocol registry.
+    /// Per-VM protocol registry.
     /// Each `defprotocol` adds an entry; `extend-protocol` /
     /// inline `defrecord` impls mutate `methods[*].impls`. See
     /// PROTOCOLS.md §3.2.
     protocol_registry: std.ArrayList(ProtocolEntry) = .empty,
-    /// Step #9.1: global try-handler stack (peer-AI turn 59
-    /// §D2). Push on `ctrl:try-enter`, pop on `ctrl:try-exit`,
+    /// Global try-handler stack.
+    /// Push on `ctrl:try-enter`, pop on `ctrl:try-exit`,
     /// walk on `ctrl:throw`. Each Handler is keyed by
     /// `frame_index` so throw-unwind can identify which frame
     /// it belongs to.
     handlers: std.ArrayList(Handler) = .empty,
-    /// Step #9.2: finally continuation stack. Pushed by
+    /// Finally continuation stack. Pushed by
     /// try-exit (when the popped handler has a finally) and by
     /// throw-unwind (when a finally must run before the throw
     /// continues). Popped by finally-exit.
@@ -1392,8 +1336,8 @@ pub const VM = struct {
     /// halt.
     result: Value = value_mod.nilValue(),
     halted: bool = false,
-    /// High-water marks for the backing stack and frame stack
-    /// (peer-AI turn 47). Used by `recur`/`loop*` tests to assert
+    /// High-water marks for the backing stack and frame stack.
+    /// Used by `recur`/`loop*` tests to assert
     /// that long-running iteration runs in bounded stack space
     /// (PLAN §11.3 constant-stack guarantee). Updated on grow
     /// operations only — comparing pre/post run-loop values gives
@@ -1433,22 +1377,22 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *VM) void {
-        // Step #9.1/#9.2: free handler + finally stack backing
-        // storage. Both contain POD entries.
+        // Free handler + finally stack backing storage. Both
+        // contain POD entries.
         self.handlers.deinit(self.allocator);
         self.finally_stack.deinit(self.allocator);
         // Interner owns hash maps allocated via self.allocator;
-        // free explicitly (step E1).
+        // free explicitly.
         if (self.interner) |*it| it.deinit();
         // Namespace's HashMap storage belongs to us (allocated
         // via self.allocator). Free it explicitly. Var struct
         // memory itself is arena-backed and gets freed below.
         if (self.namespace) |*ns| ns.deinit();
-        // Phase 3.4: registry owns its outer HashMap + per-ns
+        // Registry owns its outer HashMap + per-ns
         // HashMaps (both via self.allocator). Free explicitly;
         // Namespace structs themselves are arena-backed.
         if (self.registry) |*reg| reg.deinit();
-        // Phase 4.0a: close any still-open db Connections as a
+        // Close any still-open db Connections as a
         // safety net (callers should explicitly `db/close`).
         // Callback closes the emdb env AND destroys the
         // Connection struct allocated via self.allocator.
@@ -1463,7 +1407,7 @@ pub const VM = struct {
         if (self.nextomic_query_state) |state| {
             if (self.nextomic_query_close) |close_fn| close_fn(state);
         }
-        // Phase 5.3a: free record-registry storage (the entry
+        // Free record-registry storage (the entry
         // structs + their interned-name slices live in
         // self.allocator).
         for (self.record_registry.items) |entry| {
@@ -1473,7 +1417,7 @@ pub const VM = struct {
             self.allocator.free(entry.field_names);
         }
         self.record_registry.deinit(self.allocator);
-        // Phase 5.3b: free protocol-registry storage.
+        // Free protocol-registry storage.
         for (self.protocol_registry.items) |*proto| {
             self.allocator.free(proto.ns_name);
             self.allocator.free(proto.name);
@@ -1484,29 +1428,27 @@ pub const VM = struct {
             proto.methods.deinit(self.allocator);
         }
         self.protocol_registry.deinit(self.allocator);
-        // Heap (if initialized) is arena-backed in this staged
-        // VM path. Its live-list is only bookkeeping; all
-        // memory is reclaimed by `runtime_arena.deinit()`
-        // below. We deliberately skip `heap.deinit()` because
-        // (1) the Heap holds no non-memory resources, (2)
-        // every allocation it owns came from runtime_arena,
-        // and (3) the surrounding `self.* = undefined` makes
-        // the field unreachable after this returns.
-        // Migration warning: if a future change backs `VM.heap`
-        // by `self.allocator` (instead of runtime_arena), this
-        // skip becomes a leak — call `heap.deinit()` then.
+        // Heap (if initialized) is arena-backed. Its live-list
+        // is only bookkeeping; all memory is reclaimed by
+        // `runtime_arena.deinit()` below. We deliberately skip
+        // `heap.deinit()` because (1) the Heap holds no
+        // non-memory resources, (2) every allocation it owns
+        // came from runtime_arena, and (3) the surrounding
+        // `self.* = undefined` makes the field unreachable after
+        // this returns. Invariant: `VM.heap` is backed by
+        // runtime_arena, never by `self.allocator` — backing it
+        // by `self.allocator` would turn this skip into a leak.
         self.runtime_arena.deinit();
         self.stack.deinit(self.allocator);
         self.frames.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Step #6a: lazy-initialize the global Namespace on first
-    /// use. After Phase 3.4: if a NamespaceRegistry was created
+    /// The current namespace. If a NamespaceRegistry exists
     /// (via `ensureRegistry`), this returns `registry.current`
     /// (the namespace where `def`/`defn`/`defmacro` install).
-    /// Otherwise falls back to the legacy single-ns slot for
-    /// ad-hoc test/test-only callers.
+    /// Otherwise it lazily initializes and returns the
+    /// single-namespace slot used by ad-hoc test callers.
     pub fn ensureNamespace(self: *VM) *Namespace {
         if (self.registry) |*reg| return reg.current;
         if (self.namespace == null) {
@@ -1515,7 +1457,7 @@ pub const VM = struct {
         return &self.namespace.?;
     }
 
-    /// Phase 3.4: lazy-initialize a NamespaceRegistry with the
+    /// Lazy-initialize a NamespaceRegistry with the
     /// conventional `nexis.core` (auto-referred) and `user`
     /// (default current) namespaces. Callers that want
     /// multi-namespace semantics use this instead of
@@ -1529,8 +1471,8 @@ pub const VM = struct {
             );
             // Populate AFTER storage so back-pointers are stable.
             try self.registry.?.setupDefaults();
-            // Phase 5.2a (peer-AI turn 77): make the VM heap
-            // reachable from the registry so compile.zig's Form
+            // Make the VM heap reachable from the registry so
+            // compile.zig's Form
             // lowering can allocate string-literal Values into
             // it via `namespace.registry.heap`.
             self.registry.?.heap = self.ensureHeap();
@@ -1538,7 +1480,7 @@ pub const VM = struct {
         return &self.registry.?;
     }
 
-    /// Step E1: lazy-initialize the shared Interner on first
+    /// Lazy-initialize the shared Interner on first
     /// use. The Interner owns hash maps that need realloc/free,
     /// so it's backed by `self.allocator`, NOT runtime_arena.
     /// Symbol/keyword names are owned by the Interner (it
@@ -1551,10 +1493,9 @@ pub const VM = struct {
         return &self.interner.?;
     }
 
-    /// Step 5e: lazy-initialize the rest-list heap on first use
-    /// (peer-AI turn 49). The Heap is just an allocator wrapper
-    /// with a live-list; init is O(1) and there's no cost
-    /// before the first variadic call.
+    /// Lazy-initialize the VM heap on first use. The Heap is
+    /// just an allocator wrapper with a live-list; init is O(1)
+    /// and there's no cost before the first use.
     pub fn ensureHeap(self: *VM) *heap_mod.Heap {
         if (self.heap == null) {
             self.heap = heap_mod.Heap.init(self.runtime_arena.allocator());
@@ -1562,7 +1503,7 @@ pub const VM = struct {
         return &self.heap.?;
     }
 
-    /// Phase 5.3a (peer-AI turn 84): register a new record type
+    /// Register a new record type
     /// in the per-VM record registry. Returns the dense `u32`
     /// type_id, or `RecordRedefinition` if a record type with
     /// the same `(ns, name)` already exists. Names are duped
@@ -1611,7 +1552,7 @@ pub const VM = struct {
         return &self.record_registry.items[id];
     }
 
-    /// Phase 5.3b (peer-AI turn 84): register a new protocol in
+    /// Register a new protocol in
     /// the per-VM protocol registry. Method-spec is a slice of
     /// (interned-method-name-id, method-name-string) pairs;
     /// extend-protocol fills `impls` later. Returns the dense
@@ -1660,9 +1601,9 @@ pub const VM = struct {
         return &self.protocol_registry.items[id];
     }
 
-    /// Phase 5.3b: register an impl `(protocol_id, method_name_id,
+    /// Register an impl `(protocol_id, method_name_id,
     /// dispatch_key) → impl`. Used by `extend-protocol` and by
-    /// inline `defrecord` impls in 5.3c.
+    /// inline `defrecord` impls.
     pub fn extendProtocol(
         self: *VM,
         protocol_id: u32,
@@ -1680,7 +1621,7 @@ pub const VM = struct {
         return error.NoProtocolMethod;
     }
 
-    /// Phase 5.3b (peer-AI turn 84): dispatch a protocol-method
+    /// Dispatch a protocol-method
     /// invocation. Called from `execCallCall` when the callee
     /// has `Kind.protocol_fn`. Walks the protocol registry to
     /// find an impl for the receiver's dispatch key, returns
@@ -1721,13 +1662,8 @@ pub const VM = struct {
 
     /// Allocate a `Closure` from the runtime arena and return a
     /// `Value` of kind `.function` pointing at it. The Value
-    /// payload encoding (raw `*Closure` pointer in payload) is
-    /// 5a1's staged-realization shape per peer-AI turn 42 — when
-    /// real GC integration lands, the closure migrates to a
-    /// `heap.alloc(.function, ...)` call with HeapHeader prefix
-    /// and the Value encoding becomes `*HeapHeader` per VALUE.md
-    /// §4. `asClosure()` is the matched accessor; both must
-    /// migrate together at that future cutover.
+    /// payload is the raw `*Closure` pointer (see `Closure`);
+    /// `asClosure()` is the matched accessor.
     pub fn allocClosure(
         self: *VM,
         routine: *const Routine,
@@ -1751,7 +1687,7 @@ pub const VM = struct {
         return @ptrFromInt(v.payload);
     }
 
-    /// Phase 3.2 (peer-AI turn 66): invoke `closure` with `args`
+    /// Invoke `closure` with `args`
     /// in a FRESH sub-VM, returning the result Value. Used by
     /// the expander for compile-time macro evaluation.
     ///
@@ -1819,7 +1755,7 @@ pub const VM = struct {
         return try out_vm.run();
     }
 
-    /// Phase 3.3b (peer-AI turn 68): invoke `callee` (Closure
+    /// Invoke `callee` (Closure
     /// or native_fn) from inside an already-running VM. Used by
     /// native HOFs (`map`/`reduce`/`filter`/`apply`) to call
     /// user-supplied fns at runtime without the per-call
@@ -1860,8 +1796,8 @@ pub const VM = struct {
                 if (closure.upvalues.len != routine.upvalue_count) {
                     return VmError.CaptureCountMismatch;
                 }
-                // Allocate stack space. Peer-AI turn 68 variadic
-                // gotcha: must accommodate args.len even when
+                // Allocate stack space. Variadic gotcha: must
+                // accommodate args.len even when
                 // > routine.slot_count, otherwise the arg-copy
                 // loop below writes out of bounds. After rest
                 // construction we shrink back to slot_count.
@@ -1887,7 +1823,7 @@ pub const VM = struct {
                     }
                     self.stack.items[base_slot + fixed] = rest;
                     // Nil any slots between fixed+1 .. required_slots
-                    // (these are the dead args we no longer need).
+                    // (these are the dead args).
                     var k: usize = fixed + 1;
                     while (k < required_slots) : (k += 1) {
                         self.stack.items[base_slot + k] = value_mod.nilValue();
@@ -1928,10 +1864,10 @@ pub const VM = struct {
         }
     }
 
-    /// Phase 3.3b helper: dispatch instructions until
+    /// Dispatch instructions until
     /// `frames.items.len == target_depth`. Unlike `run()`, does
     /// NOT toggle global `halted` — termination is purely
-    /// depth-based (peer-AI turn 68 Sharp warning §1). Throws
+    /// depth-based. Throws
     /// propagate identically to `run()` (translated to user
     /// keyword Values when a handler exists; otherwise raw
     /// VmError bubbles back to the caller).
@@ -1966,7 +1902,7 @@ pub const VM = struct {
         }
     }
 
-    /// Step #6b: pack a `*Var` into a `Value` of kind `.var_`.
+    /// Pack a `*Var` into a `Value` of kind `.var_`.
     /// Used by `var:store-var` (returns the Var object so
     /// `(def x 5)` evaluates to the Var, not the value 5) and
     /// by `var:var-object` (Clojure's `(var x)` reader form).
@@ -1986,12 +1922,11 @@ pub const VM = struct {
 
     /// Allocate an UpvalCell from the runtime arena, return a
     /// VM-private `Value` of kind `.cell_internal` whose payload
-    /// points at the cell. Step 5b box-local emission: when the
-    /// compiler discovers a binding is captured, it emits
-    /// `closure:box-local s` which calls `boxCell(slot[s].value)`
-    /// and replaces slot[s] with the returned cell-value. Same
-    /// staged-allocation discipline as `allocClosure` — VM-owned
-    /// arena lifetime, migration-compatible with future GC heap.
+    /// points at the cell. When the compiler determines a
+    /// binding is captured, it emits `closure:box-local s`,
+    /// which calls `boxCell(slot[s].value)` and replaces slot[s]
+    /// with the returned cell-value. Same allocation discipline
+    /// as `allocClosure` — VM-owned arena lifetime.
     pub fn allocCell(self: *VM, initial: Value, initialized: bool) !Value {
         const arena = self.runtime_arena.allocator();
         const cell = try arena.create(UpvalCell);
@@ -2004,8 +1939,8 @@ pub const VM = struct {
 
     /// Decode a `.cell_internal` Value to its underlying
     /// `*UpvalCell`. Returns `ExpectedCell` if the Value's kind
-    /// is anything else (peer-AI turn 34: `:expected-cell` runtime
-    /// trap). Callers that already validated the kind (e.g., via
+    /// is anything else (the `:expected-cell` runtime trap).
+    /// Callers that already validated the kind (e.g., via
     /// a `BindingRef.cell_slot` lookup) can use
     /// `asCellUnchecked`; user-facing handlers should use this
     /// validating variant.
@@ -2027,7 +1962,7 @@ pub const VM = struct {
     /// read the relevant fields into locals or use `currentFrameIdx`.
     inline fn currentFrame(self: *VM) *Frame {
         // Empty frame stack is a VM invariant violation, not a
-        // recoverable runtime condition (peer-AI turn 41).
+        // recoverable runtime condition.
         std.debug.assert(self.frames.items.len > 0);
         return &self.frames.items[self.frames.items.len - 1];
     }
@@ -2045,16 +1980,15 @@ pub const VM = struct {
     /// returned pointer is invalidated by any `stack.append` /
     /// `stack.appendNTimes`.
     ///
-    /// Peer-AI turn 41: two bounds checks, not one.
-    /// - Logical (`slot_count`): catches bad bytecode. Step 5a1's
-    ///   call:call will produce overlapping frame windows where
+    /// Two bounds checks, not one.
+    /// - Logical (`slot_count`): catches bad bytecode.
+    ///   call:call produces overlapping frame windows where
     ///   `stack.items.len > base_slot + slot_count` for the caller
     ///   even after the callee has been popped, so the logical
     ///   check is what defines a frame's visible slot range.
     /// - Physical (`stack.items.len`): catches corrupt VM/frame
-    ///   state. In 5a0 this is always satisfied if the logical
-    ///   check passes, but in 5a1 a stale `slot_count` paired
-    ///   with a shrunken stack could underrun otherwise.
+    ///   state — a stale `slot_count` paired with a shrunken
+    ///   stack would underrun otherwise.
     fn slotPtr(self: *VM, slot_index: u12) VmError!*Value {
         const frame = self.currentFrame();
         if (slot_index >= frame.slot_count) return VmError.OperandOutOfRange;
@@ -2067,12 +2001,12 @@ pub const VM = struct {
     ///
     /// For `.constant` operands the typed `Const` pool requires
     /// the entry to be `Const.value`. A `Const.routine` entry
-    /// raises `InvalidOperandKind` (peer-AI turn 40 typed-pool
-    /// enforcement) — `closure:make` is the only opcode that
+    /// raises `InvalidOperandKind` (typed-pool enforcement) —
+    /// `closure:make` is the only opcode that
     /// reads routine constants, and it does so via a dedicated
     /// path, not through generic `resolve()`.
     ///
-    /// For `.upvalue` operands (step 5b, peer-AI turns 34/40):
+    /// For `.upvalue` operands:
     /// `U` is the **cell-contents** operand kind. `resolve(u:N)`
     /// reads the current frame's `upvalues[N]` (a `*UpvalCell`),
     /// validates it's `initialized = true`, and returns the
@@ -2098,7 +2032,7 @@ pub const VM = struct {
                 if (!cell.initialized) return VmError.UninitializedCell;
                 break :blk cell.value;
             },
-            // Step #6a: V operand kind resolves through the
+            // V operand kind resolves through the
             // current routine's var_table to the Var's root
             // value. Unbound Vars (`!bound`) trap
             // `:unbound-var` — this is what makes forward
@@ -2126,15 +2060,14 @@ pub const VM = struct {
     /// Write a `Value` into a destination operand.
     ///
     /// Only `.slot` is a valid destination for the generic store
-    /// path. Other kinds split into two categories per VM.md §13
-    /// (peer-AI turn 35 alignment with the published taxonomy):
+    /// path. Other kinds split into two categories per VM.md §13:
     ///
-    ///   - `.upvalue`: future-valid destination (Phase 3+ dynamic-
-    ///     binding rebinding will write through cells via the U
-    ///     store path). Returns `UnimplementedOpcode` for now.
+    ///   - `.upvalue`: a recognized destination kind with no
+    ///     store path (nothing writes through cells via U).
+    ///     Returns `UnimplementedOpcode`.
     ///   - `.constant`, `.intern`, `.jump`, `.durable`: read-only
     ///     operand kinds; writing to them is invalid in this
-    ///     opcode context, NOT "not yet wired." Surface
+    ///     opcode context, NOT "not wired." Surface
     ///     `InvalidOperandKind` per VM.md §13's `:invalid-operand-
     ///     kind` row.
     ///   - `.var_`: var writes go through `var:store-var` (a
@@ -2187,20 +2120,20 @@ pub const VM = struct {
                 }
                 const i = frame.routine.code[frame.pc];
                 frame.pc += 1;
-                // Extension instructions are reserved; skip for now.
+                // Extension instructions are unimplemented.
                 if (i.kind == .extension) return VmError.UnimplementedOpcode;
                 break :blk i;
             };
 
             self.dispatch(inst) catch |err| switch (err) {
-                // Phase 3.3b (peer-AI turn 68): internal control-
-                // transfer signal from a callValue/native re-
+                // Internal control-transfer signal from a
+                // callValue/native re-
                 // entry path. Frame + PC already adjusted by
                 // unwindThrow; just continue dispatch.
                 VmError.ControlTransferred => continue,
                 else => {
-                    // Phase 3.0c (peer-AI turn 62): recoverable
-                    // VM errors get translated into user Values
+                    // Recoverable VM errors get translated into
+                    // user Values
                     // and routed through unwindThrow.
                     try self.handleRuntimeError(err);
                 },
@@ -2212,11 +2145,11 @@ pub const VM = struct {
     /// Run bytecode with a step budget. Returns `BytecodeExhausted`
     /// if the routine completes within the budget without halting;
     /// returns the result Value on normal halt. Intended for tests
-    /// that exercise potentially-pathological bytecode (peer-AI
-    /// turn 37) — using `run()` for malformed/unimplemented opcode
-    /// tests risks 22-minute hangs when the bytecode happens to
-    /// decode as a self-targeting jump. Same frame-pointer scoping
-    /// discipline as `run()` (peer-AI turn 41).
+    /// that exercise potentially-pathological bytecode — using
+    /// `run()` for malformed/unimplemented opcode tests risks
+    /// hanging when the bytecode happens to decode as a
+    /// self-targeting jump. Same frame-pointer scoping discipline
+    /// as `run()`.
     pub fn runWithFuel(self: *VM, max_steps: usize) VmError!Value {
         var steps: usize = 0;
         while (!self.halted) : (steps += 1) {
@@ -2239,17 +2172,15 @@ pub const VM = struct {
         return self.result;
     }
 
-    /// Phase 3.0c (peer-AI turn 62): runtime error translation
-    /// to a user-throwable Value. Recoverable errors (per VM.md
+    /// Runtime error translation to a user-throwable Value.
+    /// Recoverable errors (per VM.md
     /// §13 "Recoverable via try/catch" column) become keyword
     /// payloads routed through `unwindThrow`; non-recoverable
     /// errors (bytecode corruption, OOM, etc.) bubble back out
     /// unchanged.
     ///
     /// Translation: each recoverable VmError maps to a keyword
-    /// like `:kind-mismatch`. Per turn 62: keyword for v1
-    /// (simpler than maps; we don't have rich map literals at
-    /// the throw site yet).
+    /// like `:kind-mismatch` (a keyword, not a map).
     ///
     /// Note: throw machinery via unwindThrow may itself raise
     /// UncaughtThrow (if no handler catches the translated
@@ -2271,10 +2202,10 @@ pub const VM = struct {
         try self.unwindThrow(payload);
     }
 
-    /// Two-level switch dispatcher. Tail-call-threaded upgrade is
-    /// deferred (VM.md §8 contract is "tail-call-threaded"; this
-    /// implementation is semantically equivalent via the simpler
-    /// switch — latitude per PLAN §12.5 fallback).
+    /// Two-level switch dispatcher. VM.md §8's contract is
+    /// "tail-call-threaded"; this switch is semantically
+    /// equivalent (latitude per PLAN §12.5 fallback) and is not
+    /// threaded.
     fn dispatch(self: *VM, inst: Inst) VmError!void {
         const g = inst.groupOf();
         switch (g) {
@@ -2287,7 +2218,7 @@ pub const VM = struct {
             .var_ => try self.execVar(inst),
             .coll => try self.execColl(inst),
             .ctrl => try self.execCtrl(inst),
-            // Known but not yet implemented in this commit.
+            // Known groups with no implemented variants.
             .transient, .hash, .tx, .io, .simd => return VmError.UnimplementedOpcode,
             // Unrecognized group byte — bytecode corruption.
             _ => return VmError.BytecodeCorruption,
@@ -2334,14 +2265,15 @@ pub const VM = struct {
             .call => try self.execCallCall(inst),
             .@"return" => try self.execCallReturn(inst),
             .return_nil => try self.execCallReturnNil(),
-            // tailcall lands in step #6 (recur + loop*).
+            // tailcall is unimplemented; `recur` compiles to a
+            // jump instead.
             .tailcall => return VmError.UnimplementedOpcode,
             _ => return VmError.UnimplementedOpcode,
         }
     }
 
     /// `call:call A=call_base B=argc C=result_slot` — range-call
-    /// ABI per VM.md §6 (peer-AI turn 32). Caller has staged
+    /// ABI per VM.md §6. Caller has staged
     /// `slot[A] = closure` and `slot[A+1 .. A+1+argc] = args`.
     /// On return, the call's result lands in `slot[C]` and the
     /// caller resumes at the instruction following this one.
@@ -2357,7 +2289,7 @@ pub const VM = struct {
         const result_dst: u12 = inst.c.index;
 
         // Validate the call block fits within the caller's frame
-        // (peer-AI turn 42: avoid u12 overflow with u32 math).
+        // (u32 math avoids u12 overflow).
         // The closure occupies slot[A], args are at A+1..A+argc.
         // Compiler invariant: caller's slot_count >= A + 1 + argc.
         const caller_idx = self.currentFrameIdx();
@@ -2371,20 +2303,19 @@ pub const VM = struct {
 
         // Read callee value from slot[call_base]. Copy the Value
         // by value (16 bytes) so we don't hold a *Value across
-        // stack growth (peer-AI turn 41 + 42).
+        // stack growth.
         const closure_v = (try self.slotPtr(@intCast(call_base))).*;
 
-        // Phase 3.3a (peer-AI turn 67): native-fn dispatch
-        // branch. Native fns don't push a new frame — they run
-        // host-Zig code directly with the arg slice and write
-        // their result back to the caller's result_dst. Args are
-        // COPIED off the stack first (peer-AI turn 67 §3) so
+        // Native-fn dispatch branch. Native fns don't push a new
+        // frame — they run host-Zig code directly with the arg
+        // slice and write their result back to the caller's
+        // result_dst. Args are COPIED off the stack first so
         // native fns can safely allocate / re-enter / grow the
         // stack without aliasing dead slots.
         if (closure_v.kind() == value_mod.Kind.native_fn) {
             return try execCallNative(self, closure_v, call_base, argc, result_dst);
         }
-        // Phase 5.3b (peer-AI turn 84): protocol-fn dispatch.
+        // Protocol-fn dispatch.
         // Same shape as native — args COPIED off the stack (so
         // the dispatcher's invoked impl can safely grow the
         // stack), result written to result_dst. The receiver
@@ -2420,7 +2351,7 @@ pub const VM = struct {
         const closure = asClosure(closure_v);
         const callee_routine = closure.routine;
 
-        // Arity check (peer-AI turn 42 + step 5e0):
+        // Arity check:
         //   non-variadic: argc must equal fixed_arity
         //   variadic:     argc must be >= fixed_arity (excess
         //                 args get packed into a rest list by
@@ -2438,13 +2369,12 @@ pub const VM = struct {
         // array length must match what the routine expects.
         // Indicates `closure:make` was emitted with a wrong-size
         // descriptor, OR the closure was constructed by a
-        // different routine. Trap as CaptureCountMismatch
-        // (peer-AI turn 42).
+        // different routine. Trap as CaptureCountMismatch.
         if (closure.upvalues.len != callee_routine.upvalue_count) {
             return VmError.CaptureCountMismatch;
         }
-        // Validate result slot fits within caller's frame
-        // (peer-AI turn 43): rejecting at call time is cheaper
+        // Validate result slot fits within caller's frame:
+        // rejecting at call time is cheaper
         // than running the callee and failing on return.
         {
             const caller_frame = self.currentFrame();
@@ -2453,14 +2383,14 @@ pub const VM = struct {
             }
         }
         // Validate the routine's metadata is internally
-        // consistent (peer-AI turn 43, extended in 5e0): a
+        // consistent: a
         // routine with `slot_count < fixed_arity` would underrun
         // on fixed param storage; a variadic routine additionally
         // needs `slot_count > fixed_arity` (room for the rest
         // slot). Indicates compiler bug or corrupt routine.
         // Use u32 for the addition to avoid overflow on
         // malformed routines with fixed_arity == maxInt(u16) and
-        // variadic = true (peer-AI turn 50). Such routines are
+        // variadic = true. Such routines are
         // bytecode corruption regardless; we want to surface
         // BytecodeCorruption, not an integer-overflow panic.
         const min_slots: u32 = @as(u32, callee_routine.fixed_arity) +
@@ -2484,20 +2414,20 @@ pub const VM = struct {
         // are already at callee_base..callee_base+argc (windowed
         // from the caller). Locals/temps beyond args MUST be
         // initialized to nil even though that memory may already
-        // exist as caller's high slots (peer-AI turn 42 catch:
-        // GC roots / next-iteration reads need a valid Value
+        // exist as caller's high slots (GC roots /
+        // next-iteration reads need a valid Value
         // there, not stale caller data).
         if (callee_end > self.stack.items.len) {
             const grow_by: usize = callee_end - self.stack.items.len;
             try self.stack.appendNTimes(self.allocator, value_mod.nilValue(), grow_by);
         }
 
-        // Step 5e: variadic-rest materialization. After this
+        // Variadic-rest materialization. After this
         // block, slot[callee_base + fixed_arity] holds an
         // empty list (if argc == fixed_arity) or a cons list
         // of the excess args in their original order.
         //
-        // CRITICAL ORDERING (peer-AI turn 49):
+        // CRITICAL ORDERING:
         //   (1) build the rest list FIRST, while excess-arg
         //       slots still hold the live values;
         //   (2) install at slot[fixed];
@@ -2521,7 +2451,7 @@ pub const VM = struct {
             self.stack.items[@as(usize, callee_base) + fixed] = rest;
         }
 
-        // Reset dead slots to nil. Coverage (peer-AI turn 50):
+        // Reset dead slots to nil. Coverage:
         //   - Variadic: start at fixed_arity+1 (skip the rest
         //     slot, which was just written); end at
         //     max(callee_base + argc, callee_end). When
@@ -2647,10 +2577,6 @@ pub const VM = struct {
 
     // -------------------------------------------------------------------------
     // Group `closure` (VM.md §10.4)
-    //
-    // Step 5a1: only `make` is wired, and only with empty capture
-    // descriptors (zero sources). 5b populates real descriptors;
-    // 5c adds the placeholder-cell ops.
     // -------------------------------------------------------------------------
 
     fn execClosure(self: *VM, inst: Inst) VmError!void {
@@ -2668,8 +2594,7 @@ pub const VM = struct {
     /// `closure:box-local A=slot _ _` — wrap slot[A]'s current
     /// value into a fresh, initialized UpvalCell. Replaces
     /// slot[A] with the cell-internal Value pointing at the cell.
-    /// Per VM.md §6 (peer-AI turn 34, emission timing peer
-    /// turn 40 lazy-boxing).
+    /// Per VM.md §6.
     ///
     /// Errors:
     ///   - InvalidCellState if slot[A] already holds a cell
@@ -2691,7 +2616,7 @@ pub const VM = struct {
     /// `closure:get-cell A=dst_slot B=cell_slot _` — read the
     /// contents of an UpvalCell whose pointer lives in slot[B];
     /// write to slot[A]. Used by same-frame reads of a boxed
-    /// local (peer-AI turn 34).
+    /// local.
     ///
     /// Errors:
     ///   - ExpectedCell if slot[B] doesn't hold a cell pointer.
@@ -2707,14 +2632,14 @@ pub const VM = struct {
 
     /// `closure:new-cell A=slot _ _` — allocate an
     /// uninitialized UpvalCell, store its cell-internal Value
-    /// at slot[A]. Step 5c: used by `letfn*` lowering and
+    /// at slot[A]. Used by `letfn*` lowering and
     /// named `fn*` self-reference to allocate placeholder
     /// cells that subsequent `closure:make` instructions
     /// capture (raw cell pointer copied), and that
     /// `closure:init-cell` later fills in with the constructed
     /// closure value.
     ///
-    /// Per VM.md §6 (peer-AI turn 34). The cell starts with
+    /// Per VM.md §6. The cell starts with
     /// `initialized = false`; reading it via U-operand or
     /// `closure:get-cell` before init traps `:uninitialized-cell`.
     fn execClosureNewCell(self: *VM, inst: Inst) VmError!void {
@@ -2728,12 +2653,12 @@ pub const VM = struct {
 
     /// `closure:init-cell A=cell_slot B=value_op _` — fill an
     /// uninitialized cell with a value, flip `initialized = true`.
-    /// Step 5c: used by `letfn*` and named `fn*` lowerings to
+    /// Used by `letfn*` and named `fn*` lowerings to
     /// finalize placeholder cells with the constructed closure
     /// value, after `closure:make` has constructed the closure
     /// (which captured the still-uninitialized cell).
     ///
-    /// Per VM.md §6 (peer-AI turn 34).
+    /// Per VM.md §6.
     ///
     /// Errors:
     ///   - ExpectedCell if slot[A] doesn't hold a cell pointer.
@@ -2741,8 +2666,8 @@ pub const VM = struct {
     ///     (double-init). Indicates compiler bug.
     fn execClosureInitCell(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        // Validate destination cell state BEFORE resolving B
-        // (peer-AI turn 46): the destination contract is the
+        // Validate destination cell state BEFORE resolving B:
+        // the destination contract is the
         // primary contract of init-cell. Reading a malformed
         // source operand before checking the cell would surface
         // the wrong error (e.g., UninitializedCell on the
@@ -2758,7 +2683,7 @@ pub const VM = struct {
     }
 
     /// `closure:make A=prototype_const B=cap_desc_imm C=result_slot`
-    /// per VM.md §6 (peer-AI turn 34, descriptor-based encoding).
+    /// per VM.md §6 (descriptor-based encoding).
     fn execClosureMake(self: *VM, inst: Inst) VmError!void {
         // Operand kind validation: A must be a constant (typed
         // pool requires .routine variant; resolve below catches
@@ -2790,8 +2715,8 @@ pub const VM = struct {
             return VmError.CaptureCountMismatch;
         }
 
-        // Step 5b (peer-AI turn 34 descriptor encoding): for
-        // each capture source, read the raw *UpvalCell pointer.
+        // For each capture source, read the raw *UpvalCell
+        // pointer.
         //   .local_cell_slot(s): slot[s] must hold a cell-
         //     internal Value (boxed by prior closure:box-local).
         //   .inherited_upvalue(u): caller's frame.upvalues[u]
@@ -2809,9 +2734,9 @@ pub const VM = struct {
                 upvalues[i] = switch (source) {
                     .local_cell_slot => |s| blk: {
                         const cell_v = (try self.slotPtr(s)).*;
-                        // Must be a cell pointer (peer-AI turn 34:
+                        // Must be a cell pointer (the
                         // `:expected-cell` trap). The compiler's
-                        // lazy-boxing path guarantees this in
+                        // capture pre-analysis guarantees this in
                         // well-formed bytecode; malformed bytecode
                         // (e.g., descriptor source referencing an
                         // un-boxed slot) traps here.
@@ -2821,8 +2746,8 @@ pub const VM = struct {
                         if (u >= frame.upvalues.len) return VmError.UpvalueOutOfRange;
                         // Direct raw-cell access — NOT via
                         // resolve(u), which would deref to
-                        // cell-contents (peer-AI turn 34 raw-vs-
-                        // contents distinction).
+                        // cell-contents (raw-vs-contents
+                        // distinction).
                         break :blk frame.upvalues[u];
                     },
                 };
@@ -2840,15 +2765,14 @@ pub const VM = struct {
     // -------------------------------------------------------------------------
     // Group `math` (VM.md §10 #3 — PLAN §12.3 group 2)
     //
-    // Step #2 (COMPILER.md §10 #2): wires `math:add` for fixnum+fixnum
-    // only. Floats, bignums, and cross-type promotion are deferred to
-    // subsequent commits.
+    // Every variant except `pow` goes through the numeric tower
+    // (`numAdd` … `numAbs`), which handles fixnum, float and bignum
+    // operands and cross-type promotion.
     // -------------------------------------------------------------------------
 
     // -------------------------------------------------------------------------
     // Group `jump` (VM.md §10.5 — PLAN §12.3 group 0)
     //
-    // Step #3 (COMPILER.md §10 #3): all three v1 variants wired.
     // Jump targets are absolute instruction indices within the
     // current routine's `code` array. Per VM.md §4.5, the jump
     // target operand is a "raw index" (kind ignored, index is
@@ -2883,12 +2807,12 @@ pub const VM = struct {
 
     /// Apply a jump-target operand to the current frame's PC.
     ///
-    /// Validates two things (peer-AI turn 37 hardening):
+    /// Validates two things:
     ///   1. `target.kind` is `.jump`. Permissively accepting other
-    ///      kinds (e.g., `.slot`) here turns "stale placeholder
-    ///      bytecode" into "infinite loop reading slot 0" — exactly
-    ///      the bug that almost shipped in step #3. Requiring the
-    ///      `.jump` kind turns that class of corruption into a
+    ///      kinds (e.g., `.slot`) here would turn "stale placeholder
+    ///      bytecode" into "infinite loop reading slot 0".
+    ///      Requiring the `.jump` kind turns that class of
+    ///      corruption into a
     ///      clean `InvalidOperandKind` at the type level.
     ///   2. The target PC is strictly within the routine's code
     ///      range. A target equal to `code.len` is illegal because
@@ -2934,7 +2858,7 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------------------
-    // Group `var` (VM.md §10 #6) — step #6a wires `load_var` only
+    // Group `var` (VM.md §10 #6)
     // -------------------------------------------------------------------------
 
     fn execVar(self: *VM, inst: Inst) VmError!void {
@@ -2949,13 +2873,13 @@ pub const VM = struct {
 
     /// `var:load-var A=dst_slot B=var(index) _` — read the Var
     /// at `routine.var_table[B.index]` and store its root value
-    /// into `slot[A]`. Step #6a. Traps `:unbound-var` if the
+    /// into `slot[A]`. Traps `:unbound-var` if the
     /// Var has never been bound by `def`.
     ///
     /// Semantically equivalent to `mov:move A=slot, B=var(idx)`
     /// (the V operand kind goes through the same resolve()
     /// path). The dedicated opcode exists for symmetry with
-    /// `var:store-var` (#6b) and for diagnostic clarity in
+    /// `var:store-var` and for diagnostic clarity in
     /// disassembly.
     fn execVarLoadVar(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
@@ -2967,7 +2891,7 @@ pub const VM = struct {
     /// `var:store-var A=dst_slot B=var(index) C=value_op` —
     /// set `routine.var_table[B.index].root = resolve(C)`,
     /// mark `bound = true`, and write the Var object (a Value
-    /// of kind `.var_`) into `slot[A]`. Step #6b.
+    /// of kind `.var_`) into `slot[A]`.
     ///
     /// Returning the Var (not the value) matches Clojure's
     /// `def` semantics: `(def x 5)` evaluates to the Var
@@ -2990,7 +2914,7 @@ pub const VM = struct {
     /// Var object itself (Value of kind `.var_`) into
     /// `slot[A]`. Does NOT trap on unbound; taking a reference
     /// to an unbound Var is legal (Clojure's `(var x)` /
-    /// `#'x`). Step #6b.
+    /// `#'x`).
     fn execVarVarObject(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.b.kind != .var_) return VmError.InvalidOperandKind;
@@ -3001,7 +2925,7 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------
-    // Group #7: `coll` — collection construction (step #8c.1)
+    // Group #7: `coll` — collection construction
     // -------------------------------------------------------------
     //
     // Operand convention (range ABI, mirrors call:call):
@@ -3009,10 +2933,9 @@ pub const VM = struct {
     //   B = raw    — argc (raw u12 immediate, kind ignored per §4.5)
     //   C = slot   — destination slot
     //
-    // Both opcodes allocate via `self.ensureHeap()` (arena-backed
-    // through Phase 2; GC integration in Phase 4 will require
-    // rooting partial results during construction — see GC TODO
-    // comments below).
+    // Every variant allocates via `self.ensureHeap()`. The heap is
+    // arena-backed and `Heap.alloc` never collects (GC.md §9), so
+    // partial results need no rooting during construction.
 
     fn execColl(self: *VM, inst: Inst) VmError!void {
         const variant: CollOp = @enumFromInt(inst.variant);
@@ -3028,7 +2951,7 @@ pub const VM = struct {
 
     /// `coll:list A=arg_base B=argc C=dst` — read argc values
     /// from `stack[arg_base .. arg_base+argc]` and build a list
-    /// right-to-left via `list_mod.cons`. Step #8c.1.
+    /// right-to-left via `list_mod.cons`.
     fn execCollList(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
@@ -3043,10 +2966,6 @@ pub const VM = struct {
         if (last_arg_slot > frame.slot_count) return VmError.OperandOutOfRange;
 
         const heap = self.ensureHeap();
-        // GC TODO (peer-AI turn 58 §D3): once `list_mod.cons`
-        // can collect, the partial `result` list must be a GC
-        // root for the duration of this loop. For arena-backed
-        // allocation (Phase 2), no rooting needed.
         var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
         var i: usize = argc;
         while (i > 0) {
@@ -3064,10 +2983,9 @@ pub const VM = struct {
 
     /// `coll:concat A=arg_base B=argc C=dst` — each arg must
     /// be a list Value; result is the left-to-right concat.
-    /// Strategy (peer-AI turn 58 §"Missing trap #4"): traverse
-    /// each input list, collect elements into a temp slice,
-    /// then build the result right-to-left via cons. Avoids
-    /// recursive append on singly-linked lists. Step #8c.1.
+    /// Strategy: traverse each input list, collect elements
+    /// into a temp slice, then build the result right-to-left
+    /// via cons. Avoids recursive append on singly-linked lists.
     fn execCollConcat(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
@@ -3105,8 +3023,6 @@ pub const VM = struct {
         }
 
         // Second pass: build result right-to-left.
-        // GC TODO (peer-AI turn 58 §D3): partial result needs
-        // rooting once cons can collect.
         var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
         var k: usize = elements.items.len;
         while (k > 0) {
@@ -3118,7 +3034,7 @@ pub const VM = struct {
 
     /// `coll:vector A=arg_base B=argc C=dst` — build a
     /// persistent vector from argc slot values via
-    /// `vector_mod.fromSlice`. Step #8c.3.
+    /// `vector_mod.fromSlice`.
     fn execCollVector(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
@@ -3148,9 +3064,7 @@ pub const VM = struct {
             const arg_val = (try self.slotPtr(arg_idx)).*;
             try elems.append(self.runtime_arena.allocator(), arg_val);
         }
-        // GC TODO (peer-AI turn 58 §D3): vector node allocation
-        // can collect once GC integrates; the temp elems slice
-        // must be rooted during the build.
+
         const result = vector_mod.fromSlice(heap, elems.items) catch return VmError.OutOfMemory;
         try self.store(.{ .kind = .slot, .index = dst }, result);
     }
@@ -3159,7 +3073,7 @@ pub const VM = struct {
     /// map from argc slot values interpreted as flat k,v,k,v,...
     /// pairs. argc MUST be even. Iterates left-to-right calling
     /// `champ.mapAssoc`; later duplicate keys overwrite earlier
-    /// (Clojure semantics, peer-AI turn 65 §2). Phase 3.1.
+    /// (Clojure semantics).
     fn execCollMap(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
@@ -3175,9 +3089,6 @@ pub const VM = struct {
 
         const heap = self.ensureHeap();
         var result = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-        // GC TODO (peer-AI turn 58 §D3): each mapAssoc may
-        // collect; partial result must be a root once GC
-        // integrates. Arena-backed for Phase 2/3.
         var i: usize = 0;
         while (i < argc) : (i += 2) {
             const k_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
@@ -3198,7 +3109,7 @@ pub const VM = struct {
 
     /// `coll:set A=arg_base B=argc C=dst` — build a persistent
     /// set from argc slot values. Duplicates collapse (set
-    /// semantics, peer-AI turn 65 §3). Phase 3.1.
+    /// semantics).
     fn execCollSet(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
@@ -3228,14 +3139,12 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------
-    // Group #11: `ctrl` — try / catch / throw (step #9.1)
+    // Group #11: `ctrl` — try / catch / finally / throw
     // -------------------------------------------------------------
     //
-    // Per VM.md §12 + peer-AI turn 59. v1 covers user-thrown
-    // values; VM-detected errors (KindMismatch, etc.) are NOT
-    // catchable in this commit (deferred to post-#10 once the
-    // error reporting layer can convert them to user Values).
-    // finally is reserved for #9.2.
+    // Per VM.md §12. User-thrown values and the recoverable
+    // VM-detected errors (translated by `translateRecoverable`)
+    // are catchable; non-recoverable errors bubble out of `run`.
 
     fn execCtrl(self: *VM, inst: Inst) VmError!void {
         const variant: CtrlOp = @enumFromInt(inst.variant);
@@ -3254,8 +3163,8 @@ pub const VM = struct {
     /// catch_pc is absolute within the current routine.
     /// binding_slot is where the thrown value will be stored.
     ///
-    /// Step #9.2: C may now carry an absolute finally_pc as a
-    /// `.jump` operand, OR remain `.unused` for try forms
+    /// C carries an absolute finally_pc as a `.jump` operand,
+    /// OR is `.unused` for try forms
     /// without a finally clause.
     fn execCtrlTryEnter(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .jump) return VmError.InvalidOperandKind;
@@ -3279,8 +3188,8 @@ pub const VM = struct {
     /// `ctrl:try-exit A=post_pc B=unused C=unused` — pop the
     /// current handler (must belong to this frame).
     ///
-    /// Step #9.1: jumps directly to post_pc.
-    /// Step #9.2: if the popped handler had a finally, push a
+    /// Jumps directly to post_pc, unless the popped handler had
+    /// a finally: then push a
     /// `.normal(post_pc)` FinallyContinuation and jump to
     /// finally_pc instead. The finally-exit opcode pops the
     /// continuation and jumps to post_pc.
@@ -3306,7 +3215,7 @@ pub const VM = struct {
         }
     }
 
-    /// `ctrl:finally-exit` (step #9.2) — pop the topmost
+    /// `ctrl:finally-exit` — pop the topmost
     /// FinallyContinuation and dispatch on its reason.
     fn execCtrlFinallyExit(self: *VM, _: Inst) VmError!void {
         if (self.finally_stack.items.len == 0) return VmError.InvalidHandlerState;
@@ -3329,7 +3238,7 @@ pub const VM = struct {
     /// looking for a `.try_` handler. If found:
     ///   1. Replace the handler with a `.cleanup` (so the catch
     ///      body's own throw isn't re-caught by the same
-    ///      handler — peer-AI turn 59 §"Missing trap 1").
+    ///      handler).
     ///   2. Unwind frames above the handler's frame_index,
     ///      restoring the stack to the lowest popped frame's
     ///      entry length.
@@ -3345,7 +3254,7 @@ pub const VM = struct {
     }
 
     /// Walk the handler stack top-down looking for the topmost
-    /// handler that catches a throw. Per step #9.2:
+    /// handler that catches a throw:
     ///   - `.try_` handlers catch (jump to catch_pc).
     ///   - `.cleanup` handlers do NOT catch but DO run their
     ///     finally (jump to finally_pc with .throwing
@@ -3398,7 +3307,7 @@ pub const VM = struct {
 
         // Discard any handlers above the matched one (cleanup
         // records from inner scopes that we passed over —
-        // they're no longer reachable since their try is
+        // they're unreachable since their try is
         // unwinding through us).
         self.handlers.shrinkRetainingCapacity(handler_idx);
 
@@ -3414,7 +3323,7 @@ pub const VM = struct {
         switch (matched.kind) {
             .try_ => {
                 // Push a cleanup handler in place of the original
-                // try (peer-AI turn 59 §D5 "classic trap" fix).
+                // try.
                 // This protects the catch body from being re-caught
                 // by its own handler and gives the catch body's
                 // `try-exit` something to pop. The cleanup INHERITS
@@ -3453,10 +3362,9 @@ pub const VM = struct {
     }
 };
 
-/// Phase 3.0c: stable taxonomy mapping recoverable VmError
+/// Stable taxonomy mapping recoverable VmError
 /// variants to user-visible keyword names. Per VM.md §13
-/// "Recoverable via try/catch" column + peer-AI turn 62
-/// recoverable-list.
+/// "Recoverable via try/catch" column.
 ///
 /// Returns null for unrecoverable errors — bytecode
 /// corruption, OOM, handler-state malformation, etc. Those
@@ -3845,7 +3753,7 @@ pub fn croutine(r: *const Routine) Const {
     return .{ .routine = r };
 }
 
-/// Encoding helpers. Every opcode used in this commit has a
+/// Encoding helpers. Every opcode the compiler emits has a
 /// corresponding helper. Keeps hand-assembly readable.
 pub const asm_ = struct {
     pub fn loadConst(slot_dst: u12, const_src: u12) Inst {
@@ -3919,8 +3827,7 @@ pub const asm_ = struct {
     }
 
     /// math:add a b c   ;  slot[a] = resolve(b) + resolve(c)
-    /// `b` and `c` may be any kind that `resolve` accepts (slot
-    /// or constant in this commit).
+    /// `b` and `c` may be any kind that `resolve` accepts.
     pub fn mathAdd(slot_dst: u12, lhs: Operand, rhs: Operand) Inst {
         return Inst.primary(
             .math,
@@ -3932,8 +3839,7 @@ pub const asm_ = struct {
     }
 
     /// cmp:lt dst lhs rhs   ; slot[dst] := bool(resolve(lhs) < resolve(rhs))
-    /// Fixnum-only in step 5d0; non-fixnum operands trap
-    /// :kind-mismatch.
+    /// Non-numeric operands trap :kind-mismatch.
     pub fn cmpLt(slot_dst: u12, lhs: Operand, rhs: Operand) Inst {
         return Inst.primary(
             .cmp,
@@ -3945,8 +3851,8 @@ pub const asm_ = struct {
     }
 
     /// var:load-var dst var_idx  ; slot[dst] := routine.var_table[var_idx].root
-    /// Step #6a. Traps :unbound-var if the Var has never been
-    /// bound by `def`.
+    /// Traps :unbound-var if the Var has never been bound by
+    /// `def`.
     pub fn varLoadVar(slot_dst: u12, var_idx: u12) Inst {
         return Inst.primary(
             .var_,
@@ -3959,7 +3865,7 @@ pub const asm_ = struct {
 
     /// var:store-var dst var_idx value_op
     ///   set var.root := resolve(value_op); var.bound := true;
-    ///   slot[dst] := Var-object. Step #6b.
+    ///   slot[dst] := Var-object.
     pub fn varStoreVar(slot_dst: u12, var_idx: u12, value: Operand) Inst {
         return Inst.primary(
             .var_,
@@ -3971,7 +3877,7 @@ pub const asm_ = struct {
     }
 
     /// var:var-object dst var_idx  ; slot[dst] := Var-object
-    /// (does NOT trap on unbound). Step #6b — Clojure's
+    /// (does NOT trap on unbound). Clojure's
     /// `(var x)` / `#'x` reader form lowers to this.
     pub fn varVarObject(slot_dst: u12, var_idx: u12) Inst {
         return Inst.primary(
@@ -3984,7 +3890,7 @@ pub const asm_ = struct {
     }
 
     /// coll:list arg_base argc dst  ; slot[dst] := list from
-    /// argc consecutive slots starting at arg_base. Step #8c.1.
+    /// argc consecutive slots starting at arg_base.
     pub fn collList(arg_base: u12, argc: u12, dst: u12) Inst {
         return Inst.primary(
             .coll,
@@ -3996,7 +3902,7 @@ pub const asm_ = struct {
     }
 
     /// coll:concat arg_base argc dst  ; slot[dst] := concat of
-    /// argc list values starting at arg_base. Step #8c.1.
+    /// argc list values starting at arg_base.
     pub fn collConcat(arg_base: u12, argc: u12, dst: u12) Inst {
         return Inst.primary(
             .coll,
@@ -4008,7 +3914,6 @@ pub const asm_ = struct {
     }
 
     /// ctrl:try-enter catch_pc binding_slot _   ; push handler.
-    /// Step #9.1.
     pub fn tryEnter(catch_pc: u12, binding_slot: u12) Inst {
         return Inst.primary(
             .ctrl,
@@ -4020,7 +3925,7 @@ pub const asm_ = struct {
     }
 
     /// ctrl:try-enter catch_pc binding_slot finally_pc  ; push
-    /// handler with finally. Step #9.2.
+    /// handler with finally.
     pub fn tryEnterFinally(catch_pc: u12, binding_slot: u12, finally_pc: u12) Inst {
         return Inst.primary(
             .ctrl,
@@ -4031,9 +3936,8 @@ pub const asm_ = struct {
         );
     }
 
-    /// ctrl:try-exit post_pc _ _   ; pop handler.
-    /// Step #9.1: jump to post_pc.
-    /// Step #9.2: if popped handler has finally, push
+    /// ctrl:try-exit post_pc _ _   ; pop handler, jump to
+    /// post_pc; if the popped handler has finally, push
     /// `.normal(post_pc)` continuation + jump to finally.
     pub fn tryExit(post_pc: u12) Inst {
         return Inst.primary(
@@ -4047,7 +3951,7 @@ pub const asm_ = struct {
 
     /// ctrl:finally-exit _ _ _   ; pop FinallyContinuation +
     /// dispatch (.normal jumps post_pc, .throwing continues
-    /// unwind). Step #9.2.
+    /// unwind).
     pub fn finallyExit() Inst {
         return Inst.primary(
             .ctrl,
@@ -4059,7 +3963,7 @@ pub const asm_ = struct {
     }
 
     /// ctrl:throw value_operand _ _   ; throw the resolved value.
-    /// Operand kind may be slot, constant, or var. Step #9.1.
+    /// Operand kind may be slot, constant, or var.
     pub fn throwOp(value: Operand) Inst {
         return Inst.primary(
             .ctrl,
@@ -4071,7 +3975,7 @@ pub const asm_ = struct {
     }
 
     /// coll:vector arg_base argc dst  ; slot[dst] := vector
-    /// built from argc consecutive slot values. Step #8c.3.
+    /// built from argc consecutive slot values.
     pub fn collVector(arg_base: u12, argc: u12, dst: u12) Inst {
         return Inst.primary(
             .coll,
@@ -4083,7 +3987,7 @@ pub const asm_ = struct {
     }
 
     /// coll:map arg_base argc dst  ; slot[dst] := persistent map
-    /// from argc/2 k,v pairs (argc MUST be even). Phase 3.1.
+    /// from argc/2 k,v pairs (argc MUST be even).
     pub fn collMap(arg_base: u12, argc: u12, dst: u12) Inst {
         return Inst.primary(
             .coll,
@@ -4095,7 +3999,7 @@ pub const asm_ = struct {
     }
 
     /// coll:set arg_base argc dst  ; slot[dst] := persistent set
-    /// from argc slot values (duplicates collapse). Phase 3.1.
+    /// from argc slot values (duplicates collapse).
     pub fn collSet(arg_base: u12, argc: u12, dst: u12) Inst {
         return Inst.primary(
             .coll,
@@ -4142,14 +4046,13 @@ pub const asm_ = struct {
 
     /// Patch the jump target of an already-emitted jump
     /// instruction. Used by the compiler's back-patching loop
-    /// for forward jumps whose target wasn't known at emit time
-    /// (peer-AI turn 36 simple-backpatch pattern).
+    /// for forward jumps whose target wasn't known at emit time.
     pub fn patchJumpTarget(inst: *Inst, target_pc: u12) void {
         inst.a = Operand.jump(target_pc);
     }
 
     /// `closure:make A=prototype_const B=cap_desc_imm C=result_slot`
-    /// per VM.md §6 (peer-AI turn 34 descriptor-based shape).
+    /// per VM.md §6 (descriptor-based shape).
     /// `cap_desc_index` is encoded as a raw-index immediate per
     /// §4.5; the asm helper hides the encoding by using a slot
     /// kind for the operand bits (handler ignores the kind).
@@ -4164,7 +4067,7 @@ pub const asm_ = struct {
     }
 
     /// `call:call A=call_base B=argc C=result_slot` per VM.md §6
-    /// range-call ABI (peer-AI turn 32). Caller has already
+    /// range-call ABI. Caller has already
     /// staged closure + args at `slot[A..A+1+argc]`.
     pub fn callCall(call_base: u12, argc: u12, result_slot: u12) Inst {
         return Inst.primary(
@@ -4178,7 +4081,7 @@ pub const asm_ = struct {
 
     /// General `mov:move dst, src` where `src` may be any operand
     /// kind that `resolve` accepts (slot / constant / upvalue).
-    /// Used by `compileSymbol` for upvalue reads (step 5b):
+    /// Used by `compileSymbol` for upvalue reads:
     /// `moveFrom(dst, Operand.upvalue(u))` lowers a captured-
     /// binding read. The pre-existing `move(dst, slot_src)`
     /// helper remains for the slot-to-slot common case.
@@ -4194,8 +4097,7 @@ pub const asm_ = struct {
 
     /// `closure:box-local A=slot` — wrap slot[A]'s current value
     /// into a fresh `UpvalCell`, replacing slot[A] with the cell
-    /// pointer. Lazy-boxing emission timing per COMPILER.md §6.1
-    /// (peer-AI turn 40).
+    /// pointer. Emission timing per COMPILER.md §6.1.
     pub fn closureBoxLocal(slot_idx: u12) Inst {
         return Inst.primary(
             .closure,
@@ -4220,8 +4122,8 @@ pub const asm_ = struct {
     }
 
     /// `closure:new-cell A=slot` — allocate an uninitialized
-    /// UpvalCell, store cell pointer at slot[A]. Step 5c
-    /// placeholder cell for letfn* / named fn*.
+    /// UpvalCell, store cell pointer at slot[A]. Placeholder
+    /// cell for letfn* / named fn*.
     pub fn closureNewCell(slot_idx: u12) Inst {
         return Inst.primary(
             .closure,
@@ -4234,7 +4136,7 @@ pub const asm_ = struct {
 
     /// `closure:init-cell A=cell_slot B=value_op` — fill
     /// uninitialized cell at slot[A] with resolve(B); set
-    /// initialized=true. Step 5c letfn* / named fn* finalize.
+    /// initialized=true. letfn* / named fn* finalize.
     pub fn closureInitCell(cell_slot: u12, value: Operand) Inst {
         return Inst.primary(
             .closure,
@@ -4267,7 +4169,7 @@ test "Operand helpers build the right bits" {
     try testing.expectEqual(@as(u12, 42), c.index);
 }
 
-test "VM 5a0: stack and frames structures initialized correctly" {
+test "VM frames: stack and frames structures initialized correctly" {
     // Pins the backing-stack model invariants: after VM.init,
     // `stack.items.len == routine.slot_count`, `frames.items.len == 1`,
     // and frame[0].base_slot == 0.
@@ -4287,13 +4189,12 @@ test "VM 5a0: stack and frames structures initialized correctly" {
     }
 }
 
-test "VM 5a0: slotPtr through backing stack with base_slot indirection" {
+test "VM frames: slotPtr through backing stack with base_slot indirection" {
     // Verify that slot access goes through base_slot, not a
-    // per-frame slice. With base_slot = 0 (the only case in
-    // 5a0), this is functionally equivalent to direct slice
-    // access; the test exists to pin the indirection so a
-    // future "optimization" that stores a slice can't bypass
-    // it silently.
+    // per-frame slice. With base_slot = 0 this is functionally
+    // equivalent to direct slice access; the test exists to
+    // pin the indirection so an "optimization" that stores a
+    // slice can't bypass it silently.
     const consts = [_]Const{cval(value_mod.fromFixnum(42).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0), // s0 = 42
@@ -4314,7 +4215,7 @@ test "VM 5a0: slotPtr through backing stack with base_slot indirection" {
     try testing.expectEqual(@as(i64, 42), vm.stack.items[0].asFixnum());
 }
 
-test "VM 5a0: slotPtr out-of-range surfaces OperandOutOfRange" {
+test "VM frames: slotPtr out-of-range surfaces OperandOutOfRange" {
     const routine = makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 3, "slotptr-oob");
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
@@ -4428,9 +4329,9 @@ test "VM: reading a constant out of range returns OperandOutOfRange" {
     try testing.expectError(VmError.OperandOutOfRange, res);
 }
 
-// ---- Step #8c.1: coll group tests ---------------------------
+// ---- coll group tests ---------------------------
 
-test "VM #8c.1: coll:list with argc=0 builds the empty list" {
+test "VM coll: coll:list with argc=0 builds the empty list" {
     var code = [_]Inst{
         asm_.collList(0, 0, 0), // slot[0] := empty list
         asm_.returnSlot(0),
@@ -4443,7 +4344,7 @@ test "VM #8c.1: coll:list with argc=0 builds the empty list" {
     try testing.expect(list_mod.isEmpty(r));
 }
 
-test "VM #8c.1: coll:list with 3 fixnums builds [1 2 3]" {
+test "VM coll: coll:list with 3 fixnums builds [1 2 3]" {
     // slot[0] := 1, slot[1] := 2, slot[2] := 3
     // slot[3] := list from slots 0..2
     // return slot[3]
@@ -4468,7 +4369,7 @@ test "VM #8c.1: coll:list with 3 fixnums builds [1 2 3]" {
     try testing.expect(list_mod.isEmpty(list_mod.tail(list_mod.tail(list_mod.tail(r)))));
 }
 
-test "VM #8c.1: coll:concat with argc=0 builds the empty list" {
+test "VM coll: coll:concat with argc=0 builds the empty list" {
     var code = [_]Inst{
         asm_.collConcat(0, 0, 0),
         asm_.returnSlot(0),
@@ -4481,7 +4382,7 @@ test "VM #8c.1: coll:concat with argc=0 builds the empty list" {
     try testing.expect(list_mod.isEmpty(r));
 }
 
-test "VM #8c.1: coll:concat ([1 2] [3]) → [1 2 3]" {
+test "VM coll: coll:concat ([1 2] [3]) → [1 2 3]" {
     // slot[0] := 1, slot[1] := 2, slot[2] := 3
     // slot[3] := list from slots 0..1   ; [1 2]
     // slot[4] := list from slots 2..2   ; [3]
@@ -4510,7 +4411,7 @@ test "VM #8c.1: coll:concat ([1 2] [3]) → [1 2 3]" {
     try testing.expect(list_mod.isEmpty(list_mod.tail(list_mod.tail(list_mod.tail(r)))));
 }
 
-test "VM #8c.1: coll:concat on non-list arg traps KindMismatch" {
+test "VM coll: coll:concat on non-list arg traps KindMismatch" {
     const c1 = Const{ .value = value_mod.fromFixnum(99).? };
     var code = [_]Inst{
         asm_.loadConst(0, 0), // slot[0] := 99 (fixnum, NOT list)
@@ -4523,9 +4424,9 @@ test "VM #8c.1: coll:concat on non-list arg traps KindMismatch" {
     try testing.expectError(VmError.KindMismatch, vm.run());
 }
 
-// ---- Step #9.1: ctrl group tests ---------------------------
+// ---- ctrl group tests ---------------------------
 
-test "VM #9.1: try-enter pushes handler, try-exit pops it" {
+test "VM ctrl: try-enter pushes handler, try-exit pops it" {
     // (try 42 (catch any _ 99)) — body returns 42, catch unused.
     // Layout: slot 0 = result; slot 1 = catch binding (unused).
     // Body returns 42 via mov; try-exit jumps past catch; catch
@@ -4561,7 +4462,7 @@ test "VM #9.1: try-enter pushes handler, try-exit pops it" {
     try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
 }
 
-test "VM #9.1: throw caught by current frame's try handler" {
+test "VM ctrl: throw caught by current frame's try handler" {
     // (try (throw 7) (catch any e e)) — should return 7.
     var code = [_]Inst{
         // PC 0: try-enter catch=2, binding=1, _
@@ -4587,7 +4488,7 @@ test "VM #9.1: throw caught by current frame's try handler" {
     try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
 }
 
-test "VM #9.1: throw with no handler raises UncaughtThrow" {
+test "VM ctrl: throw with no handler raises UncaughtThrow" {
     // (throw 13) at top level — uncaught.
     var code = [_]Inst{
         asm_.throwOp(Operand{ .kind = .constant, .index = 0 }),
@@ -4600,18 +4501,18 @@ test "VM #9.1: throw with no handler raises UncaughtThrow" {
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
     try testing.expectError(VmError.UncaughtThrow, vm.run());
-    // Payload stored for diagnostics (step #10 will use this).
+    // Payload stored for diagnostics.
     try testing.expect(vm.unhandled_throw != null);
     try testing.expectEqual(@as(i64, 13), vm.unhandled_throw.?.asFixnum());
 }
 
-test "VM #9.1: throw inside catch body NOT re-caught by same handler" {
+test "VM ctrl: throw inside catch body NOT re-caught by same handler" {
     // (try (throw :a) (catch any e (throw :b)))
     // The inner throw must NOT be caught by the same handler;
     // it should propagate as UncaughtThrow (no outer try here).
-    // This is the "classic trap" from peer-AI turn 59 §"Missing
-    // trap 1": the throw-handler replaces the try with cleanup
-    // so the catch body's own throw bypasses the same handler.
+    // This is the "classic trap": the throw-handler replaces
+    // the try with cleanup so the catch body's own throw
+    // bypasses the same handler.
     var code = [_]Inst{
         // PC 0: try-enter catch=2, binding=1, _
         asm_.tryEnter(2, 1),
@@ -4650,15 +4551,12 @@ test "VM: exhausting bytecode without return surfaces BytecodeExhausted" {
 }
 
 test "VM: known-but-not-implemented group returns UnimplementedOpcode" {
-    // transient group (8) with variant 0 — known group, not wired yet.
-    //
-    // **Placeholder rotation discipline** (peer-AI turn 37): when a
-    // new group lands, this placeholder rotates to the NEXT
-    // still-unwired group. History: math → jump → closure → var_
-    // → coll → transient. Next likely: transient → hash → etc.
-    // Use `runWithFuel` (not `run`) so an accidental rotation bug
-    // trips fuel exhaustion instead of hanging the suite (22-min
-    // hang in step #3 — don't repeat).
+    // transient group (8) with variant 0 — a known group with no
+    // implemented variants. Invariant: this test must name a
+    // group the dispatcher does not implement (transient, hash,
+    // tx, io or simd). Use `runWithFuel` (not `run`) so a
+    // mistake here trips fuel exhaustion instead of hanging the
+    // suite.
     const var_op = Inst.primary(
         .transient,
         @as(Mov, @enumFromInt(0)), // variant 0 — placeholder; only the group matters
@@ -4679,8 +4577,8 @@ test "VM: known-but-not-implemented group returns UnimplementedOpcode" {
 }
 
 test "VM: unrecognized group (bit-pattern 60) returns BytecodeCorruption" {
-    // Build a raw Inst with a group number outside v1's allocated
-    // space (60, well above the 14 v1 groups). The non-exhaustive
+    // Build a raw Inst with a group number outside the allocated
+    // space (60, well above the 14 groups). The non-exhaustive
     // `Group` enum lets us emit this without aborting; dispatch
     // should detect and surface BytecodeCorruption.
     const raw: Inst = .{
@@ -4722,7 +4620,7 @@ test "VM: resolve on .unused operand returns InvalidOperandKind" {
 }
 
 test "VM math:add: constant + constant = fixnum sum" {
-    // The exact bytecode the tiny step-#2 compiler emits for `(+ 1 2)`:
+    // The exact bytecode the compiler emits for `(+ 1 2)`:
     //   math:add  s0, c0, c1     ; s0 = 1 + 2
     //   call:return s0
     const consts = [_]Const{
@@ -5001,8 +4899,8 @@ test "VM math/cmp opcodes cover every wired variant" {
 
 test "VM math:add: i48-range underflow raises ArithmeticOverflow" {
     // The negative-side mirror of the positive overflow test
-    // above (peer-AI turn 33: positive-only coverage missed
-    // half the implementation).
+    // above (positive-only coverage would miss half the
+    // implementation).
     const consts = [_]Const{
         cval(value_mod.fromFixnum(value_mod.fixnum_min).?),
         cval(value_mod.fromFixnum(-1).?),
@@ -5022,8 +4920,8 @@ test "VM math:add: i48-range underflow raises ArithmeticOverflow" {
 test "VM math:add: dst/src aliasing is well-defined (math:add s0, s0, c0)" {
     // The handler must resolve BOTH source operands BEFORE
     // writing the destination. Otherwise an aliased dst+lhs
-    // (or dst+rhs) would silently produce wrong results once
-    // future codegen reuses slots (peer-AI turn 33).
+    // (or dst+rhs) would silently produce wrong results when
+    // codegen reuses slots.
     const consts = [_]Const{
         cval(value_mod.fromFixnum(1).?),
         cval(value_mod.fromFixnum(40).?),
@@ -5077,7 +4975,7 @@ test "VM math:add: mixed slot+constant operand kinds" {
     try testing.expectEqual(@as(i64, 300), result.asFixnum());
 }
 
-// ---- step 5d0: cmp:lt tests ----
+// ---- cmp:lt tests ----
 
 test "VM cmp:lt: true case (1 < 2)" {
     const consts = [_]Const{
@@ -5189,9 +5087,9 @@ test "VM cmp: unrecognized variant returns BytecodeCorruption" {
     try testing.expectError(VmError.BytecodeCorruption, res);
 }
 
-// ---- step #6a: Var + Namespace + var:load-var tests ----
+// ---- Var + Namespace + var:load-var tests ----
 
-test "VM #6a: Namespace.intern creates an unbound Var, lookup returns it" {
+test "VM var: Namespace.intern creates an unbound Var, lookup returns it" {
     var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "init"));
     defer vm.deinit();
     const ns = vm.ensureNamespace();
@@ -5205,7 +5103,7 @@ test "VM #6a: Namespace.intern creates an unbound Var, lookup returns it" {
     try testing.expect(ns.lookup("y") == null);
 }
 
-test "VM #6a: var:load-var returns var.root for bound var" {
+test "VM var: var:load-var returns var.root for bound var" {
     var vm = try VM.init(
         testing.allocator,
         &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
@@ -5220,8 +5118,8 @@ test "VM #6a: var:load-var returns var.root for bound var" {
 
     // Build a routine that references x via var_table[0] and
     // patch the VM's top frame to use it. Direct manipulation —
-    // tests-only API; the compiler will set this up properly
-    // in step #6c.
+    // tests-only API; the compiler sets this up through
+    // `Routine.var_table`.
     const var_table = [_]*Var{x};
     var code = [_]Inst{
         asm_.varLoadVar(0, 0),
@@ -5239,7 +5137,7 @@ test "VM #6a: var:load-var returns var.root for bound var" {
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
 }
 
-test "VM #6a: var:load-var on unbound Var traps :unbound-var" {
+test "VM var: var:load-var on unbound Var traps :unbound-var" {
     var vm = try VM.init(
         testing.allocator,
         &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
@@ -5265,7 +5163,7 @@ test "VM #6a: var:load-var on unbound Var traps :unbound-var" {
     try testing.expectError(VmError.UnboundVar, res);
 }
 
-test "VM #6a: var:load-var operand index out of range traps :operand-out-of-range" {
+test "VM var: var:load-var operand index out of range traps :operand-out-of-range" {
     var vm = try VM.init(
         testing.allocator,
         &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
@@ -5288,7 +5186,7 @@ test "VM #6a: var:load-var operand index out of range traps :operand-out-of-rang
     try testing.expectError(VmError.OperandOutOfRange, res);
 }
 
-test "VM #6a: var:load-var with non-V B operand traps :invalid-operand-kind" {
+test "VM var: var:load-var with non-V B operand traps :invalid-operand-kind" {
     var vm = try VM.init(
         testing.allocator,
         &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
@@ -5317,9 +5215,9 @@ test "VM #6a: var:load-var with non-V B operand traps :invalid-operand-kind" {
     try testing.expectError(VmError.InvalidOperandKind, res);
 }
 
-// ---- step #6b: var:store-var + var:var-object tests ----
+// ---- var:store-var + var:var-object tests ----
 
-test "VM #6b: var:store-var sets root, marks bound, returns Var object" {
+test "VM var store: var:store-var sets root, marks bound, returns Var object" {
     var vm = try VM.init(
         testing.allocator,
         &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
@@ -5353,7 +5251,7 @@ test "VM #6b: var:store-var sets root, marks bound, returns Var object" {
     try testing.expectEqual(@as(i64, 42), x.root.asFixnum());
 }
 
-test "VM #6b: var:store-var twice preserves Var identity (rebind in place)" {
+test "VM var store: var:store-var twice preserves Var identity (rebind in place)" {
     var vm = try VM.init(
         testing.allocator,
         &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
@@ -5389,7 +5287,7 @@ test "VM #6b: var:store-var twice preserves Var identity (rebind in place)" {
     try testing.expectEqual(@as(i64, 10), x.root.asFixnum());
 }
 
-test "VM #6b: var:var-object returns the Var WITHOUT trapping on unbound" {
+test "VM var store: var:var-object returns the Var WITHOUT trapping on unbound" {
     var vm = try VM.init(
         testing.allocator,
         &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
@@ -5568,9 +5466,8 @@ test "VM jump: patchJumpTarget rewrites operand A in place" {
 
 test "VM jump: target with wrong operand kind surfaces InvalidOperandKind" {
     // Hand-build jump:jmp with target encoded as slot(0) instead
-    // of jump(0). Without the kind check this would loop forever
-    // (peer-AI turn 37: this is the bug that almost shipped in
-    // step #3). With the kind check it surfaces a clean error.
+    // of jump(0). Without the kind check this would loop forever.
+    // With the kind check it surfaces a clean error.
     const bad_jump: Inst = .{
         .kind = .primary,
         .group = @intFromEnum(Group.jump),
@@ -5650,8 +5547,7 @@ test "VM math:add: writing to a constant operand surfaces InvalidOperandKind" {
     // the addition succeeds and the failure surfaces at the
     // destination store. Per VM.md §13's `:invalid-operand-kind`
     // row, write-to-constant is an invalid operand kind in the
-    // store context, NOT "known but not yet wired" — peer-AI
-    // turn 35 holistic-review correction.
+    // store context, NOT "known but not wired".
     const consts = [_]Const{
         cval(value_mod.fromFixnum(1).?),
         cval(value_mod.fromFixnum(2).?),
@@ -5673,9 +5569,9 @@ test "VM math:add: writing to a constant operand surfaces InvalidOperandKind" {
     try testing.expectError(VmError.InvalidOperandKind, res);
 }
 
-// ---- step 5a1: closure + call tests (peer-AI turn 42 checklist) ----
+// ---- closure + call tests ----
 
-test "VM 5a1: closure:make produces a function-kind Value" {
+test "VM closure call: closure:make produces a function-kind Value" {
     // Hand-assemble: child routine returns nil. Parent routine
     // makes a closure for it, returns the closure.
     var child_code = [_]Inst{asm_.returnNil()};
@@ -5713,7 +5609,7 @@ test "VM 5a1: closure:make produces a function-kind Value" {
     try testing.expectEqual(@as(usize, 0), c.upvalues.len);
 }
 
-test "VM 5a1: ((fn* [] 42)) — no-arg closure call returns its body value" {
+test "VM closure call: ((fn* [] 42)) — no-arg closure call returns its body value" {
     // Child: load 42 into s0, return.
     const child_consts = [_]Const{cval(value_mod.fromFixnum(42).?)};
     var child_code = [_]Inst{
@@ -5749,7 +5645,7 @@ test "VM 5a1: ((fn* [] 42)) — no-arg closure call returns its body value" {
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
 }
 
-test "VM 5a1: ((fn* [x] (+ x 1)) 5) = 6 — single arg" {
+test "VM closure call: ((fn* [x] (+ x 1)) 5) = 6 — single arg" {
     // Child: math:add s1, s0, c0 (s0 = param x); return s1.
     const child_consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
     var child_code = [_]Inst{
@@ -5788,7 +5684,7 @@ test "VM 5a1: ((fn* [x] (+ x 1)) 5) = 6 — single arg" {
     try testing.expectEqual(@as(i64, 6), result.asFixnum());
 }
 
-test "VM 5a1: ((fn* [x y] (+ x y)) 3 4) = 7 — two-arg call" {
+test "VM closure call: ((fn* [x y] (+ x y)) 3 4) = 7 — two-arg call" {
     // Child: math:add s2, s0, s1; return s2. slot_count=3, arity=2.
     var child_code = [_]Inst{
         asm_.mathAdd(2, Operand.slot(0), Operand.slot(1)),
@@ -5826,7 +5722,7 @@ test "VM 5a1: ((fn* [x y] (+ x y)) 3 4) = 7 — two-arg call" {
     try testing.expectEqual(@as(i64, 7), result.asFixnum());
 }
 
-test "VM 5a1: arity mismatch — too few args traps :arity-mismatch" {
+test "VM closure call: arity mismatch — too few args traps :arity-mismatch" {
     // Child expects 2 args; we pass 1.
     var child_code = [_]Inst{asm_.returnNil()};
     const child_routine = Routine{
@@ -5859,7 +5755,7 @@ test "VM 5a1: arity mismatch — too few args traps :arity-mismatch" {
     try testing.expectError(VmError.ArityMismatch, res);
 }
 
-test "VM 5a1: arity mismatch — too many args traps :arity-mismatch" {
+test "VM closure call: arity mismatch — too many args traps :arity-mismatch" {
     var child_code = [_]Inst{asm_.returnNil()};
     const child_routine = Routine{
         .code = &child_code,
@@ -5893,7 +5789,7 @@ test "VM 5a1: arity mismatch — too many args traps :arity-mismatch" {
     try testing.expectError(VmError.ArityMismatch, res);
 }
 
-test "VM 5a1: not-callable — call:call on a fixnum traps :not-callable" {
+test "VM closure call: not-callable — call:call on a fixnum traps :not-callable" {
     const consts = [_]Const{cval(value_mod.fromFixnum(42).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0), // s0 = 42 (not a closure)
@@ -5912,7 +5808,7 @@ test "VM 5a1: not-callable — call:call on a fixnum traps :not-callable" {
     try testing.expectError(VmError.NotCallable, res);
 }
 
-test "VM 5a1: mov:load-const with routine-typed Const traps :invalid-operand-kind" {
+test "VM closure call: mov:load-const with routine-typed Const traps :invalid-operand-kind" {
     // Pins the typed-Const-pool enforcement: mov:load-const cannot
     // load a Const.routine into a slot.
     var dummy_code = [_]Inst{asm_.returnNil()};
@@ -5930,7 +5826,7 @@ test "VM 5a1: mov:load-const with routine-typed Const traps :invalid-operand-kin
     try testing.expectError(VmError.InvalidOperandKind, res);
 }
 
-test "VM 5a1: closure:make with value-typed Const traps :invalid-operand-kind" {
+test "VM closure call: closure:make with value-typed Const traps :invalid-operand-kind" {
     // Symmetric: closure:make cannot use a Const.value as its
     // prototype operand.
     const consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
@@ -5952,7 +5848,7 @@ test "VM 5a1: closure:make with value-typed Const traps :invalid-operand-kind" {
     try testing.expectError(VmError.InvalidOperandKind, res);
 }
 
-test "VM 5a1: closure:make capture descriptor source-count mismatch traps" {
+test "VM closure call: closure:make capture descriptor source-count mismatch traps" {
     // Child expects 1 upvalue; descriptor has 0 sources.
     var child_code = [_]Inst{asm_.returnNil()};
     const child_routine = Routine{
@@ -5981,7 +5877,7 @@ test "VM 5a1: closure:make capture descriptor source-count mismatch traps" {
     try testing.expectError(VmError.CaptureCountMismatch, res);
 }
 
-test "VM 5a1: callee local slots are nil-initialized even when stack overlaps caller high slots" {
+test "VM closure call: callee local slots are nil-initialized even when stack overlaps caller high slots" {
     // Child has slot_count=3 (slot 0 = arg, slots 1-2 are locals).
     // Body returns slot 2 without writing it — should be nil.
     var child_code = [_]Inst{asm_.returnSlot(2)};
@@ -6023,9 +5919,9 @@ test "VM 5a1: callee local slots are nil-initialized even when stack overlaps ca
     try testing.expect(result.kind() == .nil);
 }
 
-test "VM 5a1: call:call with constant operand as A traps :invalid-operand-kind" {
+test "VM closure call: call:call with constant operand as A traps :invalid-operand-kind" {
     // call:call requires A=slot (the call_base). A=constant is
-    // invalid (peer-AI turn 43 catch).
+    // invalid.
     var dummy_code = [_]Inst{asm_.returnNil()};
     const dummy_routine = Routine{ .code = &dummy_code, .consts = &.{}, .slot_count = 1 };
     const consts = [_]Const{croutine(&dummy_routine)};
@@ -6046,7 +5942,7 @@ test "VM 5a1: call:call with constant operand as A traps :invalid-operand-kind" 
     try testing.expectError(VmError.InvalidOperandKind, res);
 }
 
-test "VM 5a1: call:call with constant operand as C traps :invalid-operand-kind" {
+test "VM closure call: call:call with constant operand as C traps :invalid-operand-kind" {
     // call:call requires C=slot (the result). C=constant is invalid.
     var child_code = [_]Inst{asm_.returnNil()};
     const child_routine = Routine{
@@ -6083,7 +5979,7 @@ test "VM 5a1: call:call with constant operand as C traps :invalid-operand-kind" 
     try testing.expectError(VmError.InvalidOperandKind, res);
 }
 
-test "VM 5a1: closure:make with capture descriptor index out of range traps OperandOutOfRange" {
+test "VM closure call: closure:make with capture descriptor index out of range traps OperandOutOfRange" {
     var child_code = [_]Inst{asm_.returnNil()};
     const child_routine = Routine{ .code = &child_code, .consts = &.{}, .slot_count = 1 };
     const consts = [_]Const{croutine(&child_routine)};
@@ -6105,9 +6001,9 @@ test "VM 5a1: closure:make with capture descriptor index out of range traps Oper
     try testing.expectError(VmError.OperandOutOfRange, res);
 }
 
-// ---- step 5b: cell operations + U-operand tests ----
+// ---- cell operations + U-operand tests ----
 
-test "VM 5b: closure:box-local wraps slot value into an UpvalCell" {
+test "VM capture: closure:box-local wraps slot value into an UpvalCell" {
     // Load 42 into s0, box it, then verify s0 holds a cell and
     // the cell's value is 42.
     const consts = [_]Const{cval(value_mod.fromFixnum(42).?)};
@@ -6128,7 +6024,7 @@ test "VM 5b: closure:box-local wraps slot value into an UpvalCell" {
     try testing.expectEqual(@as(i64, 42), cell.value.asFixnum());
 }
 
-test "VM 5b: closure:box-local on already-boxed slot traps :invalid-cell-state" {
+test "VM capture: closure:box-local on already-boxed slot traps :invalid-cell-state" {
     const consts = [_]Const{cval(value_mod.fromFixnum(7).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0),
@@ -6144,7 +6040,7 @@ test "VM 5b: closure:box-local on already-boxed slot traps :invalid-cell-state" 
     try testing.expectError(VmError.InvalidCellState, res);
 }
 
-test "VM 5b: closure:get-cell reads cell contents back" {
+test "VM capture: closure:get-cell reads cell contents back" {
     const consts = [_]Const{cval(value_mod.fromFixnum(99).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0),
@@ -6160,7 +6056,7 @@ test "VM 5b: closure:get-cell reads cell contents back" {
     try testing.expectEqual(@as(i64, 99), result.asFixnum());
 }
 
-test "VM 5b: closure:get-cell on non-cell traps :expected-cell" {
+test "VM capture: closure:get-cell on non-cell traps :expected-cell" {
     const consts = [_]Const{cval(value_mod.fromFixnum(5).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0), // s0 = fixnum 5 (NOT a cell)
@@ -6175,8 +6071,8 @@ test "VM 5b: closure:get-cell on non-cell traps :expected-cell" {
     try testing.expectError(VmError.ExpectedCell, res);
 }
 
-test "VM 5b: mov:move with U-operand source resolves cell contents (no opcode needed)" {
-    // Per peer-AI turn 34: no dedicated closure:read-upval —
+test "VM capture: mov:move with U-operand source resolves cell contents (no opcode needed)" {
+    // There is no dedicated closure:read-upval —
     // resolve(u:N) deref's the cell. Test it via a hand-assembled
     // single-frame routine where we manually populate frame.upvalues.
     var child_code = [_]Inst{
@@ -6221,7 +6117,7 @@ test "VM 5b: mov:move with U-operand source resolves cell contents (no opcode ne
     try testing.expectEqual(@as(i64, 123), result.asFixnum());
 }
 
-test "VM 5b: U-operand out of range traps :upvalue-out-of-range" {
+test "VM capture: U-operand out of range traps :upvalue-out-of-range" {
     // Child routine has upvalue_count=0 but tries to read u:0.
     var child_code = [_]Inst{
         asm_.moveFrom(0, Operand.upvalue(0)),
@@ -6255,10 +6151,10 @@ test "VM 5b: U-operand out of range traps :upvalue-out-of-range" {
     try testing.expectError(VmError.UpvalueOutOfRange, res);
 }
 
-test "VM 5b: closure:make with local_cell_slot source populates closure.upvalues" {
+test "VM capture: closure:make with local_cell_slot source populates closure.upvalues" {
     // Standalone test of closure:make's descriptor execution
-    // (the existing 5a1 closure:make tests all used empty
-    // descriptors). Box a slot, then closure:make with one
+    // (the closure-call tests all use empty descriptors).
+    // Box a slot, then closure:make with one
     // local_cell_slot source. Verify closure.upvalues has the
     // right cell.
     var child_code = [_]Inst{asm_.returnNil()};
@@ -6299,9 +6195,9 @@ test "VM 5b: closure:make with local_cell_slot source populates closure.upvalues
     try testing.expect(closure.upvalues[0].initialized);
 }
 
-// ---- step 5c: placeholder cell tests ----
+// ---- placeholder cell tests ----
 
-test "VM 5c: closure:new-cell creates uninitialized cell" {
+test "VM cells: closure:new-cell creates uninitialized cell" {
     var code = [_]Inst{
         asm_.closureNewCell(0),
         asm_.returnSlot(0),
@@ -6316,7 +6212,7 @@ test "VM 5c: closure:new-cell creates uninitialized cell" {
     try testing.expect(!cell.initialized);
 }
 
-test "VM 5c: U-operand resolve on uninitialized cell traps :uninitialized-cell" {
+test "VM cells: U-operand resolve on uninitialized cell traps :uninitialized-cell" {
     // Construct a closure with a single upvalue pointing to an
     // uninitialized cell. Inner fn body tries to read it via
     // u:0, which deref's the cell — should trap.
@@ -6354,7 +6250,7 @@ test "VM 5c: U-operand resolve on uninitialized cell traps :uninitialized-cell" 
     try testing.expectError(VmError.UninitializedCell, res);
 }
 
-test "VM 5c: closure:init-cell flips initialized=true and stores value" {
+test "VM cells: closure:init-cell flips initialized=true and stores value" {
     const consts = [_]Const{cval(value_mod.fromFixnum(42).?)};
     var code = [_]Inst{
         asm_.closureNewCell(0), //                     s0 = uninit cell
@@ -6370,7 +6266,7 @@ test "VM 5c: closure:init-cell flips initialized=true and stores value" {
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
 }
 
-test "VM 5c: closure:init-cell on already-initialized cell traps :invalid-cell-state" {
+test "VM cells: closure:init-cell on already-initialized cell traps :invalid-cell-state" {
     const consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
     var code = [_]Inst{
         asm_.closureNewCell(0),
@@ -6386,9 +6282,9 @@ test "VM 5c: closure:init-cell on already-initialized cell traps :invalid-cell-s
     try testing.expectError(VmError.InvalidCellState, res);
 }
 
-test "VM 5c: closure:init-cell with non-slot A traps :invalid-operand-kind" {
-    // Per peer-AI turn 46: validate destination operand kind
-    // before any reads or writes.
+test "VM cells: closure:init-cell with non-slot A traps :invalid-operand-kind" {
+    // Validate destination operand kind before any reads or
+    // writes.
     const consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
     var code = [_]Inst{
         Inst.primary(
@@ -6407,7 +6303,7 @@ test "VM 5c: closure:init-cell with non-slot A traps :invalid-operand-kind" {
     try testing.expectError(VmError.InvalidOperandKind, res);
 }
 
-test "VM 5c: closure:init-cell on non-cell traps :expected-cell" {
+test "VM cells: closure:init-cell on non-cell traps :expected-cell" {
     const consts = [_]Const{cval(value_mod.fromFixnum(7).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0), //                       s0 = 7 (fixnum, not a cell)
@@ -6422,7 +6318,7 @@ test "VM 5c: closure:init-cell on non-cell traps :expected-cell" {
     try testing.expectError(VmError.ExpectedCell, res);
 }
 
-test "VM 5c: placeholder pattern — new-cell + make + init enables self-recursion" {
+test "VM cells: placeholder pattern — new-cell + make + init enables self-recursion" {
     // End-to-end: build a closure that captures itself via the
     // placeholder pattern. Closure body just returns its
     // upvalue (the closure itself). Calling the closure
@@ -6469,7 +6365,7 @@ test "VM 5c: placeholder pattern — new-cell + make + init enables self-recursi
     try testing.expectEqual(&child_routine, c.routine);
 }
 
-test "VM 5a1: same closure called twice — both invocations succeed" {
+test "VM closure call: same closure called twice — both invocations succeed" {
     // Child returns its single arg incremented by 1.
     const child_consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
     var child_code = [_]Inst{

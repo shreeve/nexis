@@ -1,8 +1,8 @@
 # test/fuzz
 
-Reserved for Phase 6+ fuzz testing infrastructure. Empty for now.
+Reserved for fuzz testing infrastructure. Empty.
 
-Likely targets when this lands:
+Targets:
 
 - Reader: feed malformed `.nx` byte sequences; assert the reader either
   produces a Form tree or surfaces a structured error (no panics, no
@@ -14,4 +14,4 @@ Likely targets when this lands:
   assert any failure surfaces as a `VmError` from the published
   taxonomy (VM.md §13) rather than a panic.
 
-See `docs/PERF.md` and `PLAN.md` Phase 6 for the larger context.
+See `docs/PERF.md` for the larger context.

@@ -109,8 +109,8 @@ false
 #_ #_ #_ a b c d
 [1,2,3,4]
 
-; Anon-fn shapes — placeholder rewriting happens in the macroexpander
-; (Phase 3); the reader only produces the (#%anon-fn ...) form.
+; Anon-fn shapes — placeholder rewriting happens in the macroexpander;
+; the reader only produces the (#%anon-fn ...) form.
 
 #(%)
 #(inc %)

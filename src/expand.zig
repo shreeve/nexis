@@ -1,44 +1,44 @@
-//! Phase 2 step #8a — macroexpander scaffold.
+//! Macroexpander.
 //!
 //! See `docs/MACROEXPAND.md` for the full design contract;
-//! this file implements §1 (execution model) + §2b (per-form
-//! traversal rules) + §6 (depth limit) + §8 (error model) for
-//! the no-op-traversal initial commit. Steps #8b (host core
-//! macros) and #8c (syntax-quote + auto-gensym + native list/
-//! concat) build on this scaffold.
+//! this file implements §1 (execution model), §2b (per-form
+//! traversal rules), §5 (syntax-quote), §6 (depth limit) and
+//! §8 (error model).
 //!
-//! What this file DOES (#8a):
+//! What this file does:
 //!   - Defines `ExpandContext`, `MacroFn`, `HostMacroTable`,
 //!     `ExpandEnv`, `ExpandError`.
 //!   - Implements `expandForm`: per-form-rule walker that
-//!     recognizes every Phase-2 special form, threads ExpandEnv
-//!     correctly through binding forms, and dispatches macro
-//!     calls through the host table. With an empty table, the
-//!     output is structurally identical to the input.
-//!   - Treats `quote` and `syntax_quote` as OPAQUE (does not
-//!     recurse into them). syntax_quote will become a transform
-//!     rule in step #8c.
+//!     recognizes every special form, threads ExpandEnv
+//!     through binding forms, and dispatches macro calls
+//!     through the lexical env, the namespace's user macros
+//!     and the host table (in that order). With an empty table
+//!     and no namespace, the output is structurally identical
+//!     to the input.
+//!   - Provides the host core macros (`let`, `fn`, `defn`,
+//!     `loop`, `when`, `and`, `or`, `cond`, `case`, `condp`,
+//!     `for`, `->`, `->>`, `defrecord`, `defprotocol`,
+//!     `extend-type`, `extend-protocol`) via `defaultMacros`.
+//!   - Transforms syntax_quote / unquote / unquote_splicing into
+//!     `#%list` / `#%concat` / `#%vector` construction forms
+//!     with per-form auto-gensym scopes.
+//!   - Handles user `defmacro` through a compile-time eval
+//!     callback and dispatches user-macro calls through a
+//!     sub-VM.
+//!   - Treats `quote` as OPAQUE (does not recurse into it).
 //!   - Enforces a depth limit (256) and reports
 //!     `MacroDepthExceeded` distinctly from
 //!     `MacroExpansionFailure`.
-//!
-//! What this file does NOT do yet:
-//!   - Provide any host macros (`#8b`).
-//!   - Handle syntax_quote / unquote / unquote_splicing
-//!     transformation (`#8c`).
-//!   - User `defmacro` (deferred to Phase 3 with compile-time
-//!     VM eval).
 
 const std = @import("std");
 const reader_mod = @import("reader");
 const intern_mod = @import("intern");
-/// Phase 3.2: needed for Namespace + Var lookup (user-defmacro
-/// dispatch), Value construction (Form→Value conversion for
-/// macro args), and the VM type referenced by the compile-eval
-/// callback type signature. expand.zig was reader+intern only
-/// before this; adding vm here pulls in champ + dispatch +
-/// vector + heap + list transitively. No cycle: compile.zig
-/// imports expand AND vm; vm doesn't import expand.
+/// Needed for Namespace + Var lookup (user-defmacro dispatch),
+/// Value construction (Form→Value conversion for macro args),
+/// and the VM type referenced by the compile-eval callback type
+/// signature. Importing vm pulls in champ + dispatch + vector +
+/// heap + list transitively. No cycle: compile.zig imports
+/// expand AND vm; vm doesn't import expand.
 const vm_mod = @import("vm");
 const value_mod = @import("value");
 const list_mod = @import("list");
@@ -67,8 +67,8 @@ pub const ExpandError = error{
     OutOfMemory,
 };
 
-/// Phase 3.2 (peer-AI turn 66): callback for compile-time
-/// evaluation of arbitrary Form trees. Used by `defmacro` to
+/// Callback for compile-time evaluation of arbitrary Form
+/// trees. Used by `defmacro` to
 /// compile the equivalent `(def name (fn* name [params] body))`
 /// form and evaluate it via a fresh sub-VM. The callback lives
 /// outside expand.zig (in compile.zig) so the expander doesn't
@@ -90,8 +90,8 @@ pub const CompileEvalContext = struct {
     ) anyerror!value_mod.Value,
 };
 
-/// Phase 3.6 (peer-AI turn 71): callback used by `(require ...)`
-/// to load a namespace from disk. Set by the CLI / test harness.
+/// Callback used by `(require ...)` to load a namespace from
+/// disk. Set by the CLI / test harness.
 /// The callback is responsible for ALL file-loading concerns
 /// (path resolution, parsing, compilation, evaluation, registry
 /// updates, cycle detection). The expander just decodes the
@@ -109,37 +109,36 @@ pub const LoadCallback = struct {
 pub const ExpandContext = struct {
     allocator: Allocator,
     interner: *intern_mod.Interner,
-    /// Monotonic auto-gensym counter (peer-AI turn 56 §1.4 +
-    /// §5: lives on the context, NOT the VM). Used by host
-    /// macros that need to avoid double-evaluation (e.g. `or`).
+    /// Monotonic auto-gensym counter (MACROEXPAND.md §5: lives
+    /// on the context, NOT the VM). Used by host macros that
+    /// need to avoid double-evaluation (e.g. `or`).
     gensym_next: u64 = 0,
-    /// Macro registry. May be empty (#8a default → no expansion
-    /// fires).
+    /// Macro registry. May be empty (no host expansion fires).
     host_macros: *const HostMacroTable,
-    /// Phase 3.2: namespace for user-defmacro lookup. When
+    /// Namespace for user-defmacro lookup. When
     /// expanding `(my-fn ...)`, if `my-fn` resolves to a Var
     /// whose `.macro = true`, dispatch as a user macro instead
     /// of an ordinary call. Null = no namespace = no user
     /// macros (useful for tests that exercise host-macro-only
     /// expansion).
     namespace: ?*vm_mod.Namespace = null,
-    /// Phase 3.2: compile-time eval callback. Set by
+    /// Compile-time eval callback. Set by
     /// `compile.zig` when building the ExpandContext. The
     /// `defmacro` handler uses this to compile + evaluate the
     /// macro fn's body via a fresh sub-VM. Null = `defmacro`
     /// raises MacroExpansionFailure.
     compile_eval: ?CompileEvalContext = null,
-    /// Phase 3.4: when set, `(ns NAME)` special form switches
+    /// When set, `(ns NAME)` special form switches
     /// the current namespace via `registry.switchTo(NAME)`. The
     /// CLI sets this; ad-hoc tests can leave it null (in which
     /// case `(ns NAME)` raises MalformedMacroCall).
     registry: ?*vm_mod.NamespaceRegistry = null,
-    /// Phase 3.6: when set, `(require ...)` special form calls
+    /// When set, `(require ...)` special form calls
     /// through this callback to load a namespace from disk.
     /// Null = `(require ...)` raises MalformedMacroCall (useful
     /// for tests that compile in-memory only).
     load_callback: ?LoadCallback = null,
-    /// Phase 3.2: lazy-init heap for arg Value construction.
+    /// Lazy-init heap for arg Value construction.
     /// Macro args that are vectors/maps/sets need a heap for
     /// their backing nodes. We use ExpandContext.allocator
     /// (the compile arena) so the nodes outlive the fresh
@@ -159,8 +158,7 @@ pub const ExpandContext = struct {
 
     /// Allocate a fresh gensym name in the context's arena.
     /// Format: `<base>__<counter>__auto__` per MACROEXPAND.md §4.
-    /// The `__auto__` suffix marks auto-gensym (vs future
-    /// user-controlled `(gensym base)`).
+    /// The `__auto__` suffix marks auto-gensym.
     ///
     /// Lifetime: the returned slice lives in `ctx.allocator`,
     /// which is the macroexpand arena (typically the same as
@@ -181,8 +179,9 @@ pub const MacroFn = *const fn (
     args: []const *Form,
 ) ExpandError!*Form;
 
-/// Maps unqualified symbol name → MacroFn. v1 uses an empty
-/// table by default; #8b populates with when/cond/and/or/etc.
+/// Maps unqualified symbol name → MacroFn. `defaultMacros`
+/// builds the standard table (let/fn/defn/when/cond/and/or/...);
+/// an empty table disables host expansion.
 pub const HostMacroTable = std.StringHashMapUnmanaged(MacroFn);
 
 /// Lexical-name set for macro-shadowing tracking. Mirrors
@@ -263,13 +262,13 @@ fn expandFormDepth(
         .nil, .bool_, .int, .real, .char, .string, .keyword, .symbol => mutCast(form),
         // ---- Lists — special-form recognition + macro dispatch. --
         .list => |items| try expandList(ctx, env, form, items, depth),
-        // Phase 3.1: vector/map/set are now real expressions
-        // (lowerForm builds runtime values via coll:vector /
-        // coll:map / coll:set). Walk into each item so macros
-        // inside collection literals expand.
-        // NB: let*/loop*/fn*/letfn* binding vectors are still
-        // handled by their dedicated walkers (which do their
-        // own per-form traversal); this arm catches top-level
+        // Vector/map/set literals are expressions (lowerForm
+        // builds runtime values via coll:vector / coll:map /
+        // coll:set). Walk into each item so macros inside
+        // collection literals expand.
+        // NB: let*/loop*/fn*/letfn* binding vectors are handled
+        // by their dedicated walkers (which do their own
+        // per-form traversal); this arm catches top-level
         // collection-literal expressions.
         .vector => |items| try expandCollKind(ctx, env, form, items, depth, .vector_),
         .map => |items| try expandCollKind(ctx, env, form, items, depth, .map_),
@@ -279,7 +278,7 @@ fn expandFormDepth(
         // quote form. `(quote (when x y))` MUST NOT expand
         // `when` — it's a literal symbol/list value.
         .quote => mutCast(form),
-        // ---- Syntax-quote — transform per #8c.2. ----------
+        // ---- Syntax-quote — transform per MACROEXPAND.md §5. --
         // Open a fresh GensymScope, walk the payload, return
         // the (#%list ...) / (#%concat ...) structure.
         .syntax_quote => |payload| blk: {
@@ -291,41 +290,33 @@ fn expandFormDepth(
             break :blk try expandFormDepth(ctx, env, expanded, depth);
         },
         // ---- Unquote / unquote-splicing OUTSIDE syntax-quote. --
-        // Per peer-AI turn 58 §D9 + §"Missing trap 1": defensive
-        // error. The reader catches the source-syntax case, but a
-        // macro host fn could synthesize one.
+        // Defensive error. The reader catches the source-syntax
+        // case, but a macro host fn could synthesize one.
         .unquote, .unquote_splicing => return ExpandError.MalformedMacroCall,
         // ---- Reader macros / metadata. -----------------------
-        // Phase 3.0b (peer-AI turn 62): `#(...)` shorthand
-        // expands here. Reader emits Datum.anon_fn carrying
+        // `#(...)` shorthand expands here. Reader emits
+        // Datum.anon_fn carrying
         // the body forms; macroexpand scans for `%`, `%N`,
         // `%&` references, computes arity, and generates the
         // equivalent `(fn* [params] body...)` form. The
         // result is recursively re-expanded so macros nested
         // in the body still fire.
         .anon_fn => |items| try expandAnonFn(ctx, env, form, items, depth),
-        // with_meta is metadata attached to a target form;
-        // #8a passes through. Step #10+ may want to expand
-        // through the target.
+        // with_meta is metadata attached to a target form; it
+        // passes through and the expander does not descend into
+        // the target.
         .with_meta => mutCast(form),
         // deref `@x`: rewrite to QUALIFIED `(nexis.core/deref x)`.
         // The native `deref` is installed in `nexis.core` and
         // dispatches over `{durable_ref, var_, atom, …}` per
-        // ATOM.md §5 / Phase 4.0c peer-AI turn 73 semantics.
+        // ATOM.md §5.
         //
-        // Lowering path history:
-        //   - Phase 4.0c: `@x → (db/deref x)` — qualified, but
-        //     coupled to the `db` namespace.
-        //   - Phase 5 Item 1 first attempt: `@x → (deref x)` —
-        //     bare, but LEXICALLY SHADOWABLE (peer-AI turn 76
-        //     §"Must-fix": `(let [deref (fn [_] 42)] @a)` would
-        //     return 42, which is surprising — reader sugar
-        //     should not be capturable by a local binding).
-        //   - Phase 5 Item 1 final: `@x → (nexis.core/deref x)`
-        //     — qualified through the auto-referred core ns; not
-        //     shadowable by lexical bindings or by user-namespace
-        //     `def deref ...`. `db/deref` remains installed for
-        //     backward-compat with explicit qualified user code.
+        // The call is qualified through the auto-referred core
+        // ns so that reader sugar cannot be captured by a
+        // lexical binding (`(let [deref (fn [_] 42)] @a)` still
+        // derefs `a`) or by a user-namespace `def deref ...`.
+        // `db/deref` is also installed for explicit qualified
+        // user code.
         .deref => |inner| blk: {
             const items = try ctx.allocator.alloc(*Form, 2);
             const deref_sym = try ctx.allocator.create(Form);
@@ -390,21 +381,20 @@ fn expandList(
     if (std.mem.eql(u8, name, "fn*")) return try expandFnStar(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "letfn*")) return try expandLetFnStar(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "def")) return try expandDef(ctx, env, list_form, items, depth);
-    // Phase 3.5a: `defn` is now a HOST MACRO (expandDefnMacro)
-    // that rewrites to `(def name (fn name ...))`. The host
-    // macro lives in the macros table; dispatching here would
-    // bypass the macro path.
+    // `defn` is a HOST MACRO (expandDefnMacro) that rewrites to
+    // `(def name (fn name ...))`. The host macro lives in the
+    // macros table; dispatching here would bypass the macro
+    // path.
     if (std.mem.eql(u8, name, "var")) return mutCast(list_form); // (var X) — X is just a name, don't expand
     if (std.mem.eql(u8, name, "try")) return try expandTry(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "throw")) return try expandOrdinaryCall(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "defmacro")) return try expandDefmacro(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "ns")) return try expandNs(ctx, list_form, items);
     if (std.mem.eql(u8, name, "require")) return try expandRequire(ctx, list_form, items);
-    // Step #8c.1: internal compiler primitives (#%list / #%concat).
+    // Internal compiler primitives (#%list / #%concat / ...).
     // Recognized as special forms — NOT user-shadowable, NOT
     // looked up in the macro table. Args ARE recursively
-    // macroexpanded (per peer-AI turn 58 §D1 + §"Missing trap
-    // #6"): a `(#%list (when x y))` should expand `(when x y)`.
+    // macroexpanded: a `(#%list (when x y))` expands `(when x y)`.
     if (std.mem.eql(u8, name, "#%list") or
         std.mem.eql(u8, name, "#%concat") or
         std.mem.eql(u8, name, "#%vector") or
@@ -415,7 +405,7 @@ fn expandList(
     }
 
     // ---- Macro dispatch (shadowable by lexical bindings). -----
-    // Lookup order (peer-AI turn 66):
+    // Lookup order:
     //   1. lexical env (shadowing) — bail to ordinary call.
     //   2. user macros in the namespace (Var.macro = true).
     //   3. host macros table.
@@ -536,14 +526,10 @@ fn rebuildListIfChanged(
         new_items.?[i] = expanded;
     }
     if (new_items == null) return mutCast(list_form);
-    // Items past the divergence haven't been visited yet — wait,
-    // YES they have (the loop continues), but we only assigned
-    // into new_items on divergence. Need to copy/track post-
-    // divergence items too.
-    //
-    // Simpler model: if ANY item changed, do a second pass
-    // copying every expansion. Cheap because at #8a the macro
-    // table is empty and we never reach this branch.
+    // The loop above only records changed items, so items that
+    // came back unchanged after the first divergence are not in
+    // `new_items`. Once ANY item changed, do a second pass that
+    // copies every expansion.
     const final = try ctx.allocator.alloc(*Form, items.len);
     for (items, 0..) |item, i| {
         final[i] = try expandFormDepth(ctx, env, item, depth);
@@ -647,9 +633,9 @@ fn expandFnStar(
         if (p.datum != .symbol or p.datum.symbol.ns != null) {
             // Skip `&` rest marker and any non-symbol param
             // shapes. Don't add `&` to env (it's not a binding).
-            // For non-symbol params (destructuring), v1 simply
-            // doesn't add anything to env (destructuring is
-            // post-v1).
+            // Non-symbol params add nothing to the env; the `fn`
+            // host macro replaces destructuring patterns with
+            // gensyms before `fn*` is reached.
             continue;
         }
         if (std.mem.eql(u8, p.datum.symbol.name, "&")) continue;
@@ -810,8 +796,8 @@ fn expandDefn(
     return try makeList(ctx, out_items, list_form.origin);
 }
 
-/// Step #9.1 (peer-AI turn 59 §D4): expand `(try body+
-/// (catch MATCHER BINDING handler+) (finally body+)?)`.
+/// Expand `(try body+ (catch MATCHER BINDING handler+)
+/// (finally body+)?)`.
 ///
 /// Traversal rule (per MACROEXPAND.md §2b — each special form
 /// has its own walker):
@@ -922,7 +908,7 @@ fn expandTry(
     return try makeList(ctx, out_slice, list_form.origin);
 }
 
-/// Phase 3.0b (peer-AI turn 62): expand `#(body...)` shorthand.
+/// Expand `#(body...)` shorthand.
 ///
 /// Examples:
 ///   #(+ % %2)   → (fn* [%1 %2] (+ %1 %2))
@@ -1105,10 +1091,10 @@ fn anonRewriteList(
     return try makeList(ctx, slice, list_form.origin);
 }
 
-/// Phase 3.1: discriminator for `expandCollKind`.
+/// Discriminator for `expandCollKind`.
 const CollKind = enum { vector_, map_, set_ };
 
-/// Phase 3.1: walk a vector/map/set literal's items + rebuild
+/// Walk a vector/map/set literal's items + rebuild
 /// the collection Form. Each item is expanded with the current
 /// env (collection literals don't introduce bindings). Re-uses
 /// the input form if no item changed (cheap fast path).
@@ -1145,10 +1131,8 @@ fn expandCollKind(
 }
 
 // =============================================================================
-// Phase 3.2 — user-defined defmacro
+// User-defined defmacro
 // =============================================================================
-//
-// Per peer-AI turn 66:
 //
 //   1. `(defmacro name [params] body)` is recognized by the
 //      EXPANDER (not Tiny/backend). Must execute at expansion
@@ -1167,7 +1151,7 @@ fn expandCollKind(
 //      Var-object load, so REPL/eval print the Var like
 //      `#'name`.
 //
-// User-macro INVOCATION (peer-AI turn 66 §D9):
+// User-macro INVOCATION:
 //   1. Convert each arg Form → Value via `formToValue`.
 //   2. Call `VM.evalClosure(var.root, arg_values, &sub_vm)`.
 //   3. Convert returned Value → Form via `valueToForm` in
@@ -1177,12 +1161,11 @@ fn expandCollKind(
 //      in the macro output expand).
 //
 // Macro args are UNEVALUATED Forms-as-Values; the macro body
-// inspects them as data (lists, symbols, etc.) and builds
-// output via syntax-quote. v1 ships syntax-quote-only macros;
-// `cons`/`first`/`rest`/etc. native fns are a future commit
-// (peer-AI turn 66 §D4).
+// inspects them as data (lists, symbols, etc.) with natives
+// such as `first`/`rest`/`cons` and builds output via
+// syntax-quote.
 
-/// Phase 3.4 (peer-AI turn 69): expand `(ns NAME)`. Switches
+/// Expand `(ns NAME)`. Switches
 /// `ctx.registry.current` to the named namespace, creating it
 /// (with `nexis.core` as auto-referred parent) if not already
 /// registered. Returns nil; the runtime effect already happened
@@ -1206,17 +1189,16 @@ fn expandNs(
     return try makeNil(ctx, list_form.origin);
 }
 
-/// Phase 3.6 (peer-AI turn 71): expand `(require ...)`. Supported
-/// forms:
+/// Expand `(require ...)`. Supported forms:
 ///
 ///   (require 'my.ns)              ; load my.ns; no alias
 ///   (require '[my.ns :as alias])  ; load my.ns + alias `alias` → my.ns
 ///
 /// The side effect (file load + registry update + alias entry)
 /// happens at EXPANSION TIME via `ctx.load_callback`. The
-/// replacement form is `nil` (the runtime no longer has work to
-/// do). Both forms accept `:as` only — `:refer` / `:rename` /
-/// `:exclude` are deferred.
+/// replacement form is `nil` (there is no runtime work left).
+/// Both forms accept `:as` only — `:refer` / `:rename` /
+/// `:exclude` are unsupported and raise MalformedMacroCall.
 ///
 /// Multiple specs in one require call (Clojure-style
 /// `(require '[a] '[b])`) supported.
@@ -1261,7 +1243,7 @@ fn expandRequire(
                         }
                         alias_name = alias_form.datum.symbol.name;
                     } else {
-                        // :refer / :rename / :exclude deferred.
+                        // :refer / :rename / :exclude are unsupported.
                         return ExpandError.MalformedMacroCall;
                     }
                 }
@@ -1285,7 +1267,7 @@ fn unwrapQuote(form: *const Form) *const Form {
     };
 }
 
-/// Phase 3.2: expand `(defmacro name [params] body)`.
+/// Expand `(defmacro name [params] body)`.
 fn expandDefmacro(
     ctx: *ExpandContext,
     env: ?*const ExpandEnv,
@@ -1340,13 +1322,12 @@ fn expandDefmacro(
 
     // Compile-time-eval the def form. Returns the Var Value.
     //
-    // CRITICAL (Phase 3.4 bugfix): we INTENTIONALLY LEAK the
-    // sub-VM here. The macro fn's Closure is allocated in the
-    // sub-VM's `runtime_arena`, which is backed by the
-    // caller's persistent allocator. `ArenaAllocator.free`
-    // RECLAIMS the most-recent allocation (peer-AI turn 69
-    // discovery during 3.4 integration), so `sub_vm.deinit()`
-    // would invalidate the Closure pointer stored in `Var.root`
+    // CRITICAL: we INTENTIONALLY LEAK the sub-VM here. The
+    // macro fn's Closure is allocated in the sub-VM's
+    // `runtime_arena`, which is backed by the caller's
+    // persistent allocator. `ArenaAllocator.free` RECLAIMS the
+    // most-recent allocation, so `sub_vm.deinit()` would
+    // invalidate the Closure pointer stored in `Var.root`
     // \u2014 and the next defmacro's allocations would land on the
     // exact bytes. Leaking the sub-VM here is safe: every
     // allocation it made was from the persistent allocator
@@ -1387,7 +1368,7 @@ fn expandDefmacro(
     return try makeList(ctx, var_items, list_form.origin);
 }
 
-/// Phase 3.2: invoke a user-defined macro.
+/// Invoke a user-defined macro.
 fn invokeUserMacro(
     ctx: *ExpandContext,
     env: ?*const ExpandEnv,
@@ -1433,25 +1414,27 @@ fn invokeUserMacro(
 /// to pass macro args as unevaluated data. Supports the data
 /// shapes a macro typically inspects.
 ///
-/// Mapping (peer-AI turn 66 §D3):
-///   nil/bool/int   → corresponding immediate
+/// Mapping:
+///   nil/bool/int/real/char → corresponding immediate
+///   string         → heap string
 ///   keyword/symbol → interned Value
 ///   list           → cons list of recursively-converted items
 ///   vector         → persistent vector
 ///   map            → persistent map (flat k,v,k,v items)
 ///   set            → persistent set
 ///   quote          → `(quote payload-value)` as a 2-element list
-/// Other Form datums (real, char, string, syntax_quote, unquote,
-/// unquote_splicing, anon_fn, with_meta, deref) are deferred for
-/// v1 — `MalformedMacroCall` if encountered.
+///   deref          → `(deref payload-value)` as a 2-element list
+///   anon_fn        → the `fn*` form it stands for
+/// syntax_quote, unquote, unquote_splicing and with_meta raise
+/// `MalformedMacroCall`.
 fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
     return switch (form.datum) {
         .nil => value_mod.nilValue(),
         .bool_ => |b| value_mod.fromBool(b),
         .int => |n| value_mod.fromFixnum(n) orelse return ExpandError.MalformedMacroCall,
         .symbol => |name| blk: {
-            // Phase 4.0b: qualified symbols intern the full
-            // `ns/name` string; valueToForm splits it back into
+            // Qualified symbols intern the full `ns/name`
+            // string; valueToForm splits it back into
             // ns + name on the way out. Required for macros that
             // receive a body containing qualified calls (e.g.,
             // `(with-tx [tx conn] (db/put! tx ref v))`).
@@ -1511,8 +1494,8 @@ fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
             lst = list_mod.cons(heap, quote_sym, lst) catch return ExpandError.OutOfMemory;
             break :blk lst;
         },
-        // Phase 5.2a (peer-AI turn 78): string literals reach
-        // the macro layer via syntax-quote payloads and direct
+        // String literals reach the macro layer via
+        // syntax-quote payloads and direct
         // arguments to host macros (e.g. `with-tx`'s body forms
         // can be arbitrary Forms containing `(db/put! tx r "x")`).
         // Allocate the heap string in the same arena
@@ -1537,7 +1520,8 @@ fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
         },
         // `#(...)` reaches a macro as the `fn*` form it stands for.
         .anon_fn => |items| try formToValue(ctx, try anonFnForm(ctx, form, items)),
-        // syntax_quote, unquote, unquote_splicing, with_meta → defer.
+        // syntax_quote, unquote, unquote_splicing, with_meta →
+        // MalformedMacroCall.
         else => return ExpandError.MalformedMacroCall,
     };
 }
@@ -1558,8 +1542,8 @@ fn formItemsToList(ctx: *ExpandContext, items: []const *Form) ExpandError!value_
 /// return path). Lifetime: Forms allocated in `ctx.allocator`
 /// (the compile arena), so the result outlives the macro
 /// sub-VM. Each constructed Form gets `origin` as its source
-/// span — typically the macro call site (peer-AI turn 66 §D3
-/// "Span/origin": generated forms use the macro call origin).
+/// span — typically the macro call site (generated forms use
+/// the macro call origin).
 fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSpan) !*Form {
     return switch (v.kind()) {
         .nil => try makeNil(ctx, origin),
@@ -1650,8 +1634,8 @@ fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSp
             form.* = .{ .datum = .{ .set = @as([]const *Form, slice) }, .origin = origin };
             break :blk form;
         },
-        // Phase 5.2a (peer-AI turn 78): macro-returned string
-        // Values surface as `Form.datum.string` byte slices. The
+        // Macro-returned string Values surface as
+        // `Form.datum.string` byte slices. The
         // reader produces string Forms with already-decoded bytes
         // (escapes resolved); macro round-trip mirrors that
         // shape. The byte slice is copied into the macro arena
@@ -1689,10 +1673,10 @@ fn isClauseHead(form: *const Form, name: []const u8) bool {
 // FormBuilder pattern, with origin carried through per §4b)
 // =============================================================================
 //
-// Every helper takes an `origin: SrcSpan` parameter. Per §4b
-// (peer-AI turn 56), synthetic forms get the macro CALL site's
-// origin so that future error messages can say "in macro
-// expansion of WHEN at line 5". Macros typically pass
+// Every helper takes an `origin: SrcSpan` parameter. Per §4b,
+// synthetic forms get the macro CALL site's origin so that
+// error messages can say "in macro expansion of WHEN at line
+// 5". Macros typically pass
 // `call_form.origin` to every helper.
 //
 // Lifetime: every constructed Form lives in `ctx.allocator`
@@ -1720,8 +1704,8 @@ pub fn makeVector(ctx: *ExpandContext, items: []*Form, origin: SrcSpan) ExpandEr
 /// Construct a symbol form. `name` is borrowed (typically a
 /// string literal from the macro fn or a gensym output —
 /// either way the lifetime is at least as long as the
-/// resulting Form's). Always unqualified for host macros;
-/// qualified-symbol construction lands in #8c.
+/// resulting Form's). Always unqualified; `makeQualifiedSymbol`
+/// builds `ns/name` forms.
 pub fn makeSymbol(ctx: *ExpandContext, name: []const u8, origin: SrcSpan) ExpandError!*Form {
     const form = try ctx.allocator.create(Form);
     form.* = .{
@@ -1744,7 +1728,7 @@ pub fn makeBool(ctx: *ExpandContext, value: bool, origin: SrcSpan) ExpandError!*
 }
 
 // =============================================================================
-// Host core macros (MACROEXPAND.md §10 — step #8b)
+// Host core macros (MACROEXPAND.md §10)
 // =============================================================================
 //
 // Each macro fn matches `MacroFn`:
@@ -1765,13 +1749,11 @@ pub fn makeBool(ctx: *ExpandContext, value: bool, origin: SrcSpan) ExpandError!*
 // ---- Rename macros (CLOJURE-REVIEW.md §1.1 primitive `*`) ----
 //
 // These exist because user-facing `let`/`fn`/`loop` are
-// macros that just rename to the compiler primitives
-// `let*`/`fn*`/`loop*`. Phase 3 will redefine `let` to add
-// destructuring; for v1 step #8b, the trivial rename is
-// the entire job.
+// macros over the compiler primitives `let*`/`fn*`/`loop*`.
+// `let` and `fn` also rewrite destructuring patterns; `loop`
+// is a bare rename.
 
-/// Phase 3.5a (peer-AI turn 70): expand `(let bindings body...)`
-/// with destructuring support. The bindings vector may contain
+/// Expand `(let bindings body...)` with destructuring support. The bindings vector may contain
 /// non-symbol PATTERNS (sequential `[a b c]`, associative
 /// `{:keys [...] :or {...} :as name}`); these expand to extra
 /// `(let* ...)` bindings that destructure via `nth`/`get`/`rest`.
@@ -1808,14 +1790,16 @@ fn expandLetRename(
     return renameHead(ctx, call_form, new_args, "let*");
 }
 
-/// Phase 3.5a: expand `(fn ...)` with destructuring in params.
+/// Expand `(fn ...)` with destructuring in params.
 /// Supports `(fn [params] body)`, `(fn name [params] body)`.
 /// Destructured params are replaced with gensyms; the body is
 /// wrapped in a `(let [pattern gensym ...] body)` that itself
 /// expands via destructuring.
 ///
-/// Multi-arity `(fn ([p1] b1) ([p1 p2] b2))` ships with `defn`
-/// in 3.5b.
+/// Multi-arity `(fn ([p1] b1) ([p1 p2] b2))` is unsupported:
+/// the form is renamed to `fn*` unchanged and `expandFnStar`
+/// raises MalformedMacroCall. Only `defn` builds a multi-arity
+/// dispatcher.
 fn expandFnRename(
     ctx: *ExpandContext,
     call_form: *const Form,
@@ -1832,9 +1816,9 @@ fn expandFnRename(
     if (params_idx >= args.len) return ExpandError.MalformedMacroCall;
     const params_form = args[params_idx];
     if (params_form.datum != .vector) {
-        // Multi-arity form: (fn ([p1] b1) ([p1 p2] b2)). Defer
-        // to 3.5b — for now, pass through unchanged (will likely
-        // raise MalformedForm at lowering).
+        // Multi-arity form: (fn ([p1] b1) ([p1 p2] b2)) is
+        // unsupported; pass through unchanged and let
+        // `expandFnStar` raise MalformedMacroCall.
         return renameHead(ctx, call_form, args, "fn*");
     }
     const params = params_form.datum.vector;
@@ -1915,11 +1899,11 @@ fn expandFnRename(
     return renameHead(ctx, call_form, fn_args, "fn*");
 }
 
-/// Phase 3.5a: `(defn name [params] body...)` → `(def name
+/// `(defn name [params] body...)` → `(def name
 /// (fn name [params] body...))`. Routing defn through `fn`
 /// gives us destructured params for free.
 ///
-/// Phase 3.5b: multi-arity form `(defn name ([p1] b1) ([p1 p2] b2))`
+/// The multi-arity form `(defn name ([p1] b1) ([p1 p2] b2))`
 /// expands to a variadic dispatcher:
 ///   (def name
 ///     (fn name [& args__auto__]
@@ -1979,7 +1963,7 @@ fn buildDefForm(
     return try makeList(ctx, def_items, call_form.origin);
 }
 
-/// Phase 3.5b: build the multi-arity dispatcher.
+/// Build the multi-arity dispatcher.
 fn buildDefMultiFn(
     ctx: *ExpandContext,
     call_form: *const Form,
@@ -2180,7 +2164,7 @@ fn buildArityThen(
     return try makeList(ctx, let_items, origin);
 }
 
-/// Phase 3.5a: destructure a single binding pair `pattern = expr`.
+/// Destructure a single binding pair `pattern = expr`.
 /// Appends one or more `[name expr]` pairs to `out`.
 fn destructurePair(
     ctx: *ExpandContext,
@@ -2487,8 +2471,7 @@ fn buildWhen(
 //   (or x y z)   => (let* [g x] (if g g (or y z)))
 //
 // BOTH `and` and `or` MUST gensym to avoid double-evaluating
-// the first operand (per MACROEXPAND.md §10.G/H — peer-AI
-// turn 56 §2.G).
+// the first operand (per MACROEXPAND.md §10.G/H).
 
 fn expandAnd(
     ctx: *ExpandContext,
@@ -2584,10 +2567,10 @@ fn expandOr(
 //   (cond t1 e1)        => (if t1 e1 nil)
 //   (cond t1 e1 t2 e2)  => (if t1 e1 (if t2 e2 nil))
 //
-// Odd-count args raise MalformedMacroCall. No special-case for
-// `:else` in v1 — any truthy test works as a default; users can
-// write `(cond ... :else default)` and the keyword's truthiness
-// makes it pass.
+// Odd-count args raise MalformedMacroCall. There is no special
+// case for `:else` — any truthy test works as a default; users
+// can write `(cond ... :else default)` and the keyword's
+// truthiness makes it pass.
 
 fn expandCond(
     ctx: *ExpandContext,
@@ -2625,13 +2608,12 @@ fn expandCond(
 //                                    terminal else branch when the
 //                                    clause count is odd.
 //
-// Peer-AI turn 83 §D1 OVERRIDE: no-match with no default THROWS
-// `:no-matching-clause`, not returns nil. Forces users to be
-// explicit about exhaustion. Mirrors Clojure semantics modulo
-// the perf shape (Clojure uses hash dispatch; we chain `if` until
-// Phase 6).
+// No-match with no default THROWS `:no-matching-clause`, not
+// returns nil. Forces users to be explicit about exhaustion.
+// Mirrors Clojure semantics modulo the perf shape (Clojure uses
+// hash dispatch; we chain `if`).
 //
-// `expr` is evaluated EXACTLY ONCE via gensym (turn 74 §4 trap).
+// `expr` is evaluated EXACTLY ONCE via gensym.
 
 fn expandCase(
     ctx: *ExpandContext,
@@ -2697,10 +2679,10 @@ fn expandCase(
 //                                              when the clause count is even.
 //   (condp pred expr c1 v1 ... default)     => terminal default.
 //
-// Peer-AI turn 83 §D2 OVERRIDE: same throw-on-no-match policy as
-// case. `pred` and `expr` each evaluated exactly ONCE via gensyms.
-// Predicate call order: `(p# clause expr)` (matches Clojure).
-// No `:>>` thread-result-through-fn syntax in v1.
+// Same throw-on-no-match policy as case. `pred` and `expr` each
+// evaluated exactly ONCE via gensyms. Predicate call order:
+// `(p# clause expr)` (matches Clojure). There is no `:>>`
+// thread-result-through-fn syntax.
 
 fn expandCondp(
     ctx: *ExpandContext,
@@ -2759,7 +2741,7 @@ fn expandCondp(
 
 // ---- for ----------------------------------------------------
 //
-// Eager subset of Clojure's `for`. v1 supports:
+// Eager subset of Clojure's `for`. Supported:
 //   - multi-binding cartesian:
 //       (for [x [1 2] y [10 20]] (+ x y)) => [11 21 12 22]
 //   - `:let` (uses `let` so destructuring works):
@@ -2768,7 +2750,7 @@ fn expandCondp(
 //       (for [x [1 2 3] :when (odd? x)] x)   => [1 3]
 //   - empty source → []
 //
-// Out of scope (turn 74 §4 + turn 83 §D3):
+// Unsupported:
 //   - `:while`
 //   - lazy seqs (we eager-return a vector)
 //   - `:reduce` / `:initial` clauses
@@ -2777,21 +2759,20 @@ fn expandCondp(
 // `reduce` introduces its own accumulator gensym. The body
 // invokes `(conj acc-innermost <body>)` to grow the result.
 // `:let` wraps the inner expression with `(let bindings ...)`
-// (NOT `let*` — peer-AI turn 83 §"`:let` destructuring") so
-// users can destructure inside `:let`. `:when` wraps with
+// (NOT `let*`) so users can destructure inside `:let`. `:when` wraps with
 // `(if pred ...inner... <current-acc>)` — pred false → acc
 // unchanged.
 //
-// Frozen invariants (turn 83):
+// Invariants:
 //   §F1. First segment in the binding vector MUST be a `sym src`
 //        pair. Modifiers before any binding are rejected as
-//        MalformedMacroCall (turn 83 §"modifier before first").
+//        MalformedMacroCall.
 //   §F2. `conj` on `[]` initial accumulator preserves vector
 //        kind (verified via CLI smoke + (conj [] x) → vector).
 //   §F3. Return type is ALWAYS vector. Empty source / all
 //        filtered → `[]`.
 //   §F4. Multiple `:when` / `:let` clauses between bindings are
-//        supported (turn 83 §D3 d). Order matters: a `:let`
+//        supported. Order matters: a `:let`
 //        before a `:when` makes the let-bound name visible to
 //        the when's predicate.
 
@@ -2855,8 +2836,8 @@ fn expandFor(
             },
             // Destructuring patterns (vector / map literals as
             // the binding sym) are NOT supported in `for`'s
-            // direct sym-position for v1. Users can use `:let`
-            // for destructuring (which goes through `let`).
+            // direct sym-position. Users can use `:let` for
+            // destructuring (which goes through `let`).
             else => return ExpandError.MalformedMacroCall,
         }
     }
@@ -2965,7 +2946,7 @@ fn expandFor(
     return inner;
 }
 
-// ---- defrecord (5.3c — records + inline protocol impls) ----
+// ---- defrecord (records + inline protocol impls) ----
 //
 // Spec: PROTOCOLS.md §4.2.
 //
@@ -2981,7 +2962,7 @@ fn expandFor(
 //     (defn ->Counter [n] ...)
 //     (defn map->Counter [m] ...)
 //     (defn Counter? [x] ...)
-//     ;; 5.3c additions — one extend call per method impl:
+//     ;; one extend call per method impl:
 //     (nexis.internal/#%extend-record-impl
 //       IFoo :bar Counter-type-id
 //       (fn [this y] (+ (:n this) y)))
@@ -3186,7 +3167,7 @@ fn expandDefrecord(
         pred_body,
     });
 
-    // ---- 5.3c: parse inline protocol clauses (args[2..]).
+    // ---- Parse inline protocol clauses (args[2..]).
     // Walk clauses tracking a "current protocol symbol". Bare
     // symbol → switch; list → emit one #%extend-record-impl call.
     const extend_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%extend-record-impl", origin);
@@ -3254,7 +3235,7 @@ fn expandDefrecord(
     return try makeList(ctx, top_items, origin);
 }
 
-// ---- defprotocol (5.3b — protocols substrate) ----
+// ---- defprotocol ----
 //
 // Spec: PROTOCOLS.md §4.1.
 //
@@ -3268,10 +3249,9 @@ fn expandDefrecord(
 //     (def bar (nexis.internal/#%protocol-fn IFoo :bar))
 //     (def baz (nexis.internal/#%protocol-fn IFoo :baz)))
 //
-// 5.3b ignores method signatures (arity verification, doc
-// strings) — those land if/when needed. The dispatch path
-// raises `:no-protocol-impl` at call time when no impl matches
-// the receiver.
+// Method signatures (arity, doc strings) are not verified.
+// The dispatch path raises `:no-protocol-impl` at call time
+// when no impl matches the receiver.
 
 fn expandDefprotocol(
     ctx: *ExpandContext,
@@ -3288,7 +3268,7 @@ fn expandDefprotocol(
 
     // Parse method specs: each must be a list whose head is a
     // symbol (the method name). The arg-vector after the name
-    // is currently ignored (5.3b).
+    // is ignored.
     var method_kw_items = try ctx.allocator.alloc(*Form, args.len - 1);
     var method_names = try ctx.allocator.alloc([]const u8, args.len - 1);
     for (args[1..], 0..) |spec, i| {
@@ -3357,7 +3337,7 @@ fn expandDefprotocol(
     return try makeList(ctx, top_items, origin);
 }
 
-// ---- extend-type / extend-protocol (5.3d) ----
+// ---- extend-type / extend-protocol ----
 //
 // Spec: PROTOCOLS.md §4.3.
 //
@@ -3670,14 +3650,14 @@ fn threadStep(
 }
 
 // =============================================================================
-// Syntax-quote / unquote / unquote-splicing (step #8c.2)
+// Syntax-quote / unquote / unquote-splicing
 // =============================================================================
 //
-// Per MACROEXPAND.md §5 + peer-AI turn 58 §D4/D7/D10.
+// Per MACROEXPAND.md §5.
 //
 // `` `payload `` walks the payload, producing a Form that
 // CONSTRUCTS the quoted shape at runtime via #%list / #%concat
-// (the substrate landed in #8c.1).
+// / #%vector.
 //
 // Element rules:
 //   nil / bool / int / real / char / string / keyword
@@ -3695,16 +3675,18 @@ fn threadStep(
 //                    The list walker handles splice; reaching
 //                    one here raises MalformedMacroCall.
 //   list           → expandSyntaxQuoteList (segment-and-concat)
-//   vector/map/set → UnsupportedFeature (deferred per §D10)
-//   quote / syntax-quote / anon_fn / with_meta / deref / nested
-//   syntax_quote   → UnsupportedFeature (deferred per §D7;
-//                    nested syntax-quote needs scope stacking)
+//   vector         → expandSyntaxQuoteVector (`(#%vector ...)`,
+//                    no splices)
+//   map / set / quote / nested syntax-quote / anon_fn /
+//   with_meta / deref → MalformedMacroCall (unsupported; a
+//                    nested syntax-quote would need scope
+//                    stacking)
 //
 // Auto-gensym scope lifecycle:
 //   - Fresh GensymScope opened at every `Datum.syntax_quote`
-//     entry. Per peer-AI turn 56 §1.4: ONE scope per syntax-
-//     quote form. Nested syntax-quote opens another scope but
-//     v1 raises UnsupportedFeature first, so this never fires.
+//     entry: ONE scope per syntax-quote form. A nested
+//     syntax-quote raises MalformedMacroCall before any inner
+//     scope would open.
 //   - Counter is on ExpandContext.gensym_next (monotonic
 //     across the entire compilation unit), so two separate
 //     syntax-quotes never collide even though their scopes
@@ -3755,8 +3737,8 @@ fn expandSyntaxQuotePayload(
         // Symbol → (quote sym) — unless ends with `#`, then
         // gensym lookup. Qualified symbols (`ns/name`) preserve
         // their prefix; auto-gensym applies only to unqualified
-        // symbols (Phase 4.0b: required so `\`(db/begin-write ...)`
-        // works in macros emitted by user code).
+        // symbols (required so `\`(db/begin-write ...)` works in
+        // macros emitted by user code).
         .symbol => |name| blk: {
             // Build the synthesized symbol form. Qualified
             // symbols pass through unchanged. Unqualified
@@ -3783,30 +3765,23 @@ fn expandSyntaxQuotePayload(
         .unquote_splicing => return ExpandError.MalformedMacroCall,
         // List: build the segment-and-concat structure.
         .list => |items| try expandSyntaxQuoteList(ctx, scope, call_form, items, payload.origin),
-        // Step #8c.3: Vector — same pattern as list. The
-        // result wraps in `(#%vector ...)` instead of
-        // `(#%list ...)`. Splices inside a vector are also
-        // supported via concat + apply, but for v1 simplicity
-        // we delegate vector-with-splice via concat of vectors
-        // and a final apply: but easier path — we just don't
-        // support splice inside vector for v1, since vector-
-        // valued macros rarely splice (binding vectors are
-        // built positionally). UnsupportedFeature if splice
-        // appears inside a syntax-quoted vector.
+        // Vector — same pattern as list. The result wraps in
+        // `(#%vector ...)` instead of `(#%list ...)`. Splices
+        // inside a syntax-quoted vector are unsupported and
+        // raise MalformedMacroCall (binding vectors are built
+        // positionally, so vector-valued macros rarely splice).
         .vector => |items| try expandSyntaxQuoteVector(ctx, scope, call_form, items, payload.origin),
-        // Deferred: map/set/nested-syntax-quote and other
-        // reader macros need explicit support (peer-AI turn 58
-        // §D7/D10). v1 raises MalformedMacroCall via the
-        // MacroExpansionFailure bucket.
+        // Map/set/nested-syntax-quote and other reader macros
+        // are unsupported: MalformedMacroCall, which the compile
+        // layer buckets as MacroExpansionFailure.
         else => return ExpandError.MalformedMacroCall,
     };
 }
 
-/// Step #8c.3: walk a syntax-quoted vector. Simpler than the
-/// list walker — no splice support in v1 (binding vectors are
-/// built positionally; splicing into vectors is rare and
-/// requires concat-of-vectors machinery that's not worth the
-/// extra surface).
+/// Walk a syntax-quoted vector. Simpler than the list walker —
+/// no splice support (binding vectors are built positionally;
+/// splicing into vectors is rare and would require
+/// concat-of-vectors machinery).
 fn expandSyntaxQuoteVector(
     ctx: *ExpandContext,
     scope: *GensymScope,
@@ -3814,7 +3789,7 @@ fn expandSyntaxQuoteVector(
     items: []const *Form,
     origin: reader_mod.SrcSpan,
 ) ExpandError!*Form {
-    // Reject splices inside vectors for v1.
+    // Reject splices inside vectors.
     for (items) |it| {
         if (it.datum == .unquote_splicing) return ExpandError.MalformedMacroCall;
     }
@@ -3908,17 +3883,12 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     try table.put(allocator, "cond", expandCond);
     try table.put(allocator, "->", expandThreadFirst);
     try table.put(allocator, "->>", expandThreadLast);
-    // Phase 5 Item 4 (peer-AI turn 83): case + condp + for.
     try table.put(allocator, "case", expandCase);
     try table.put(allocator, "condp", expandCondp);
     try table.put(allocator, "for", expandFor);
-    // Phase 5 Item 3 sub-step 5.3a (peer-AI turn 84): defrecord
-    // (records only; protocol-clause support lands in 5.3c).
+    // defrecord (records + inline protocol clauses).
     try table.put(allocator, "defrecord", expandDefrecord);
-    // Phase 5 Item 3 sub-step 5.3b (peer-AI turn 84): defprotocol.
     try table.put(allocator, "defprotocol", expandDefprotocol);
-    // Phase 5 Item 3 sub-step 5.3d (peer-AI turn 84): extend-type +
-    // extend-protocol.
     try table.put(allocator, "extend-type", expandExtendType);
     try table.put(allocator, "extend-protocol", expandExtendProtocol);
     return table;
@@ -3957,7 +3927,7 @@ fn expandSourceForTest(
     return try expandForm(&ctx, null, form);
 }
 
-test "macroexpand #8a: no-op walks return input unchanged (empty table)" {
+test "macroexpand: no-op walks return input unchanged (empty table)" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4002,7 +3972,7 @@ test "macroexpand #8a: no-op walks return input unchanged (empty table)" {
     }
 }
 
-test "macroexpand #8a: empty list passes through" {
+test "macroexpand: empty list passes through" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4014,7 +3984,7 @@ test "macroexpand #8a: empty list passes through" {
     try testing.expectEqual(@as(usize, 0), result.datum.list.len);
 }
 
-test "macroexpand #8a: depth limit caught for infinite macro loop" {
+test "macroexpand: depth limit caught for infinite macro loop" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4049,7 +4019,7 @@ test "macroexpand #8a: depth limit caught for infinite macro loop" {
     try testing.expectError(ExpandError.ExpansionDepthExceeded, expandForm(&ctx, null, form));
 }
 
-test "macroexpand #8a: lexical shadowing blocks macro expansion" {
+test "macroexpand: lexical shadowing blocks macro expansion" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4101,7 +4071,7 @@ test "macroexpand #8a: lexical shadowing blocks macro expansion" {
     try testing.expect(outer[2].datum == .list);
 }
 
-test "macroexpand #8a: macro fires at top level when not shadowed" {
+test "macroexpand: macro fires at top level when not shadowed" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4143,7 +4113,7 @@ test "macroexpand #8a: macro fires at top level when not shadowed" {
     try testing.expectEqualStrings("fired", expanded.datum.keyword.name);
 }
 
-test "macroexpand #8a: quote is opaque — macro inside quote does NOT fire" {
+test "macroexpand: quote is opaque — macro inside quote does NOT fire" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

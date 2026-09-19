@@ -1,10 +1,9 @@
-//! coll/list.zig — immutable cons list heap kind (Phase 1).
+//! coll/list.zig — immutable cons list heap kind.
 //!
 //! Authoritative spec: `docs/LIST.md`. Physical storage: `src/heap.zig`.
 //! Semantics: `docs/SEMANTICS.md` §2.6 (sequential equality category)
-//! and §3.2 (sequential-domain hash mixing). This is the first
-//! collection kind — its landing amends SEMANTICS.md §3.2 to pin the
-//! equality-category-based domain mixer.
+//! and §3.2 (sequential-domain hash mixing; the domain mixer is chosen
+//! by equality category).
 //!
 //! Subkinds (VALUE.md §2.2):
 //!   - 0 = cons  — body is `{ head: Value, tail: Value }` = 32 bytes;
@@ -61,7 +60,7 @@ pub const ListError = error{
 // Public API — constructors
 // =============================================================================
 
-/// Fresh empty list. Not a shared singleton (v1); every call allocates
+/// Fresh empty list. Not a shared singleton; every call allocates
 /// a new heap block of body_size 0. Two empty lists compare `=`; their
 /// `identical?` relation depends on allocation identity.
 pub fn empty(heap: *Heap) !Value {
@@ -128,7 +127,7 @@ pub fn tail(v: Value) Value {
     return Heap.bodyOf(ConsBody, h).tail;
 }
 
-/// O(n) length. No caching in v1.
+/// O(n) length; the length is not cached.
 pub fn count(v: Value) usize {
     std.debug.assert(v.kind() == .list);
     var cur = v;
@@ -218,7 +217,7 @@ pub fn equalSeq(
 /// invariant) is marked via `visitor.markValue` as a normal heap
 /// object; the collector's `mark` will dispatch to `list.trace`
 /// again on the tail's own cons cell. Mark-bit idempotence prevents
-/// infinite recursion in pathological pre-v1 cycles.
+/// infinite recursion on a cyclic chain.
 ///
 /// Empty-list subkind traces as no-op (body_size == 0).
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
@@ -234,11 +233,10 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
 // Cursor — streaming ordered iteration for cross-kind sequential equality
 // =============================================================================
 //
-// Peer-AI turn-7 review settled the cross-kind walker pattern as
-// streaming ordered traversal rather than random-access-by-index. This
-// cursor is consumed by `dispatch.sequentialEqual` when walking a list
-// against a vector (or any future sequential kind). Not part of the
-// language-surface API.
+// The cross-kind walker pattern is streaming ordered traversal rather
+// than random-access-by-index. This cursor is consumed by
+// `dispatch.sequentialEqual` when walking a list against another
+// sequential kind. Not part of the language-surface API.
 
 pub const Cursor = struct {
     /// The tail of the list still to be yielded. Always `.list` kind.

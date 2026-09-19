@@ -5,8 +5,7 @@
 //!   zig build test                      everything: unit, property, golden, Nextomic corpora,
 //!                                       test/nextomic scripts, examples (minutes)
 //!   zig build quick                     the inner loop: language, eval-pipeline and Nextomic
-//!                                       unit + property binaries (seconds); phase2-test is
-//!                                       the same step under its older name
+//!                                       unit + property binaries (seconds)
 //!   zig build nextomic-test             Nextomic unit, property and corpus binaries
 //!   zig build nextomic-nx               test/nextomic/*.nx through bin/nexis
 //!   zig build examples                  every examples/*.nx through bin/nexis
@@ -97,8 +96,8 @@ pub fn build(b: *std.Build) void {
     string_mod.addImport("heap", heap_mod);
     string_mod.addImport("hash", hash_mod);
 
-    // Phase 5 Item 1 (peer-AI turn 75): in-memory mutable cell.
-    // Identical module-graph shape to string_mod (value+heap+hash).
+    // atom: in-memory mutable cell. Identical module-graph shape
+    // to string_mod (value+heap+hash).
     // No back-edges; consumed only by dispatch / gc / stdlib /
     // codec / cli at their `.atom` arms.
     const atom_mod = b.createModule(.{
@@ -111,11 +110,10 @@ pub fn build(b: *std.Build) void {
     atom_mod.addImport("hash", hash_mod);
 
     // record_mod declared further down (after champ_mod) — needs
-    // champ for field-map hash composition. See Phase 5.3a block.
+    // champ for field-map hash composition.
 
     // format_mod is declared further down (after db_mod) so its
     // addImport calls see every dependency already-created.
-    // Phase 5.2c (peer-AI turn 81).
 
     const list_mod = b.createModule(.{
         .root_source_file = b.path("src/coll/list.zig"),
@@ -163,8 +161,8 @@ pub fn build(b: *std.Build) void {
     transient_mod.addImport("champ", champ_mod);
     transient_mod.addImport("vector", vector_mod);
 
-    // Phase 5.3a (peer-AI turn 84): Kind.record = 35. Needs
-    // champ for field-map hash composition. One-way terminal.
+    // record: Kind.record = 35. Needs champ for field-map hash
+    // composition. One-way terminal.
     const record_mod = b.createModule(.{
         .root_source_file = b.path("src/record.zig"),
         .target = target,
@@ -175,8 +173,8 @@ pub fn build(b: *std.Build) void {
     record_mod.addImport("hash", hash_mod);
     record_mod.addImport("champ", champ_mod);
 
-    // Phase 5.3b (peer-AI turn 84): Kind.protocol = 36 +
-    // Kind.protocol_fn = 37. Identity-valued. Same module-graph
+    // protocol: Kind.protocol = 36 + Kind.protocol_fn = 37.
+    // Identity-valued. Same module-graph
     // shape as atom (value + heap + hash only).
     const protocol_mod = b.createModule(.{
         .root_source_file = b.path("src/protocol.zig"),
@@ -204,7 +202,7 @@ pub fn build(b: *std.Build) void {
     // codec's inline tests import transient to exercise the
     // UnserializableKind error path for transient Values.
     codec_mod.addImport("transient", transient_mod);
-    // Phase 5 Item 1: codec rejects atoms as :unserializable.
+    // codec rejects atoms as :unserializable.
     codec_mod.addImport("atom", atom_mod);
     codec_mod.addImport("record", record_mod);
     codec_mod.addImport("protocol", protocol_mod);
@@ -238,32 +236,30 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     vm_mod.addImport("value", value_mod);
-    // Step 5e: VM owns a `Heap` (backed by its runtime_arena) for
+    // VM owns a `Heap` (backed by its runtime_arena) for
     // variadic rest-list construction. heap+list are tiny pure-
     // allocator wrappers; pulling them in does NOT pull GC.
     vm_mod.addImport("heap", heap_mod);
     vm_mod.addImport("list", list_mod);
-    // Step #8c.3: VM owns `coll:vector` runtime construction.
+    // VM owns `coll:vector` runtime construction.
     vm_mod.addImport("vector", vector_mod);
-    // Phase 3.1: VM also owns `coll:map` / `coll:set`. The
-    // `champ` and `dispatch` addImports happen LATER in the
-    // file (after dispatch_mod is declared) — they're attached
-    // to the same vm_mod via a deferred addImport call (see
-    // the "VM Phase-3.1 deps" block below dispatch_mod).
+    // VM also owns `coll:map` / `coll:set`. The `dispatch`
+    // addImport happens LATER in the file (after dispatch_mod is
+    // declared) — it is attached to the same vm_mod below
+    // dispatch_mod.
     vm_mod.addImport("champ", champ_mod);
-    // Step E1 (pre-#8): VM owns an `Interner` for quoted-symbol /
-    // quoted-keyword Value construction. Per peer-AI turn 55 §K
-    // (macro execution model preflight), the compile-side
-    // `lowerQuotePayload` interns symbols/keywords through this
-    // shared Interner so identity is stable across compile + run.
+    // VM owns an `Interner` for quoted-symbol / quoted-keyword
+    // Value construction. The compile-side `lowerQuotePayload`
+    // interns symbols/keywords through this shared Interner so
+    // identity is stable across compile + run.
     vm_mod.addImport("intern", intern_mod);
-    // Phase 5.3a: DispatchKey.ofValue inspects record type_id.
+    // DispatchKey.ofValue inspects record type_id.
     vm_mod.addImport("record", record_mod);
-    // Phase 5.3b: VM owns the protocol registry + the
+    // VM owns the protocol registry + the
     // dispatchProtocolMethod path used by `call:call`.
     vm_mod.addImport("protocol", protocol_mod);
 
-    // Step #7a: reader exposed as a proper module so compile.zig
+    // reader exposed as a proper module so compile.zig
     // can consume `reader.Form` trees. reader.zig uses sibling-
     // file imports (`@import("parser.zig")`, `@import("nexis.zig")`)
     // which Zig resolves automatically from the file's directory,
@@ -274,7 +270,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Step #8a: Form → Form macro expansion (see
+    // Form → Form macro expansion (see
     // docs/MACROEXPAND.md). Lives between Reader.readOneForm
     // and lowerForm in the pipeline.
     const expand_mod = b.createModule(.{
@@ -284,7 +280,7 @@ pub fn build(b: *std.Build) void {
     });
     expand_mod.addImport("reader", reader_mod);
     expand_mod.addImport("intern", intern_mod);
-    // Phase 3.2: defmacro + user-macro invocation need vm
+    // defmacro + user-macro invocation need vm
     // (Namespace, Var, evalClosure) + value + collection
     // modules for Form↔Value conversion.
     expand_mod.addImport("vm", vm_mod);
@@ -293,14 +289,14 @@ pub fn build(b: *std.Build) void {
     expand_mod.addImport("vector", vector_mod);
     expand_mod.addImport("champ", champ_mod);
     expand_mod.addImport("heap", heap_mod);
-    // Phase 5.2a (peer-AI turn 78): formToValue handles `.string`
+    // formToValue handles `.string`
     // Form datums by allocating via `string.fromBytes` against
     // the macro-arg heap.
     expand_mod.addImport("string", string_mod);
     // dispatch_mod is declared LATER (it depends on db); the
     // addImport for it is attached after that block. See below.
 
-    // Phase 3.3a: standard library — host-Zig native fns
+    // standard library — host-Zig native fns
     // installed into the user's namespace at VM startup.
     const stdlib_mod = b.createModule(.{
         .root_source_file = b.path("src/stdlib.zig"),
@@ -314,14 +310,14 @@ pub fn build(b: *std.Build) void {
     stdlib_mod.addImport("champ", champ_mod);
     stdlib_mod.addImport("intern", intern_mod);
     stdlib_mod.addImport("heap", heap_mod);
-    // Phase 5 Item 1: atom native fns.
+    // atom native fns.
     stdlib_mod.addImport("atom", atom_mod);
-    // Phase 5 Item 2 (5.2a): core string ops + codepoint helpers.
+    // core string ops + codepoint helpers.
     stdlib_mod.addImport("string", string_mod);
-    // Phase 5.3a: records substrate (Kind.record + registry +
+    // records substrate (Kind.record + registry +
     // native helpers + map-like ops over records).
     stdlib_mod.addImport("record", record_mod);
-    // Phase 5.3b: protocols substrate.
+    // protocols substrate.
     stdlib_mod.addImport("protocol", protocol_mod);
     // stdlib_mod's "format" import is wired AFTER format_mod is
     // declared (which is after db_mod). See further down.
@@ -337,31 +333,31 @@ pub fn build(b: *std.Build) void {
     });
     compile_mod.addImport("vm", vm_mod);
     compile_mod.addImport("value", value_mod);
-    // Step 5e: tests inspect rest-list results from variadic
+    // tests inspect rest-list results from variadic
     // fn calls. compile.zig core doesn't depend on list — the
     // VM constructs rest lists at call/prologue time.
     compile_mod.addImport("list", list_mod);
-    // Step #7a: Form-tree input from the reader.
+    // Form-tree input from the reader.
     compile_mod.addImport("reader", reader_mod);
-    // Step E1 (pre-#8): Interner threaded through Form lowering
+    // Interner threaded through Form lowering
     // for quoted-symbol/quoted-keyword Value construction.
     // The Interner instance comes from the VM at runtime; the
     // compile-side just imports the type.
     compile_mod.addImport("intern", intern_mod);
-    // Step #8a: expander is consumed by compileFormFullWithMacros.
+    // expander is consumed by compileFormFullWithMacros.
     compile_mod.addImport("expand", expand_mod);
-    // Phase 3.1: champ used by compile.zig tests to assert
+    // champ used by compile.zig tests to assert
     // mapCount / setCount / mapGet on result Values; the
     // compile-side core itself doesn't need champ (the VM
     // executes coll:map / coll:set).
     compile_mod.addImport("champ", champ_mod);
-    // Phase 5.2a (peer-AI turn 77): string literals lower to
+    // string literals lower to
     // Tiny.literal via `string.fromBytes` against a heap reached
     // through `namespace.registry.heap`.
     compile_mod.addImport("heap", heap_mod);
     compile_mod.addImport("string", string_mod);
 
-    // Phase 3.6: namespace loader (require + file loading).
+    // namespace loader (require + file loading).
     const loader_mod = b.createModule(.{
         .root_source_file = b.path("src/loader.zig"),
         .target = target,
@@ -391,10 +387,11 @@ pub fn build(b: *std.Build) void {
 
     gc_mod.addImport("db", db_mod);
 
-    // Phase 5.2c (peer-AI turn 81): central Value → text formatter
-    // with `.display` and `.readable` modes. Imports the menagerie
-    // of consumer kinds (one-way; nothing depends on format_mod).
-    // Replaces the three formatValue duplicates from before 5.2c.
+    // central Value → text formatter with `.display` and
+    // `.readable` modes. Imports the menagerie of consumer kinds
+    // (one-way; nothing depends on format_mod). The single
+    // formatValue implementation; compile, cli and the integration
+    // tests all delegate to it.
     // Declared here AFTER all leaf-kind modules + db + vm exist.
     const format_mod = b.createModule(.{
         .root_source_file = b.path("src/format.zig"),
@@ -441,23 +438,23 @@ pub fn build(b: *std.Build) void {
     // so the module graph remains acyclic and every test-binary
     // root resolves cleanly.
     //
-    // Phase 3.1 exception: vm_mod + compile_mod need dispatch
+    // Exception: vm_mod + compile_mod need dispatch
     // for `coll:map` / `coll:set` hash + equality (compile_mod's
     // tests use it for assertions; vm_mod for the runtime build).
     // Attaching here so they're not forward-declared above
     // dispatch_mod's creation.
     vm_mod.addImport("dispatch", dispatch_mod);
     compile_mod.addImport("dispatch", dispatch_mod);
-    // Phase 3.2: expand needs dispatch for Form→Value
+    // expand needs dispatch for Form→Value
     // construction of maps/sets (hash + equality).
     expand_mod.addImport("dispatch", dispatch_mod);
-    // Phase 3.3b: stdlib needs dispatch for `=` (value
+    // stdlib needs dispatch for `=` (value
     // equality) implementation.
     stdlib_mod.addImport("dispatch", dispatch_mod);
-    // Phase 4.0a: stdlib's db primitives need db + codec.
+    // stdlib's db primitives need db + codec.
     stdlib_mod.addImport("db", db_mod);
     stdlib_mod.addImport("codec", codec_mod);
-    // Phase 4.0d: db/scan + db/reduce-tree need emdb cursors.
+    // db/scan + db/reduce-tree need emdb cursors.
     stdlib_mod.addImport("emdb", emdb_mod);
 
     // -------------------------------------------------------------------------
@@ -571,7 +568,7 @@ pub fn build(b: *std.Build) void {
     nextomic_test_step.dependOn(&run_integration_nextomic_pull_tests.step);
 
     // -------------------------------------------------------------------------
-    // Phase 0: reader unit tests (src/reader.zig has its own test { ... }
+    // Reader unit tests (src/reader.zig has its own test { ... }
     // blocks; depends on src/parser.zig + src/nexis.zig which live in the
     // same directory and import each other via @import("parser.zig") etc.).
     // -------------------------------------------------------------------------
@@ -585,7 +582,7 @@ pub fn build(b: *std.Build) void {
     const run_reader_tests = b.addRunArtifact(reader_tests);
 
     // -------------------------------------------------------------------------
-    // Phase 1: runtime-core inline tests (hash, value, eq). Each file owns
+    // Runtime-core inline tests (hash, value, eq). Each file owns
     // its own `test "..."` blocks and is compiled as a standalone test
     // binary. The modules share import paths via the standalone modules
     // above.
@@ -676,11 +673,11 @@ pub fn build(b: *std.Build) void {
         .{ .name = "bignum", .path = "src/bignum.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "champ", .path = "src/coll/champ.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "transient", .path = "src/coll/transient.zig", .imports = &.{ "value", "heap", "champ", "vector" } },
-        // Phase 5 Item 1: atom test binary. Same import shape as string.
+        // atom test binary. Same import shape as string.
         .{ .name = "atom", .path = "src/atom.zig", .imports = &.{ "value", "heap", "hash" } },
-        // Phase 5.3a: record test binary (Kind.record = 35).
+        // record test binary (Kind.record = 35).
         .{ .name = "record", .path = "src/record.zig", .imports = &.{ "value", "heap", "hash", "champ" } },
-        // Phase 5.3b: protocol test binary (Kind.protocol = 36 + Kind.protocol_fn = 37).
+        // protocol test binary (Kind.protocol = 36 + Kind.protocol_fn = 37).
         .{ .name = "protocol", .path = "src/protocol.zig", .imports = &.{ "value", "heap", "hash" } },
         .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "champ", "transient", "atom", "record", "protocol" } },
         .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "champ", "transient", "db", "atom", "record", "protocol", "nextomic_handle" } },
@@ -688,7 +685,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "string", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch", "record", "protocol" } },
-        // Phase 5.2c: format test binary. Imports the menagerie of
+        // format test binary. Imports the menagerie of
         // consumer kinds; nothing depends on format itself.
         .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch", "heap", "string" } },
@@ -905,7 +902,7 @@ pub fn build(b: *std.Build) void {
     const prop_db_tests = b.addTest(.{ .root_module = prop_db_mod });
     const run_prop_db_tests = b.addRunArtifact(prop_db_tests);
 
-    // Phase 2 gate items 3 + 4 (COMPILER.md §9.4): closure
+    // Compiler property tests (COMPILER.md §9.4): closure
     // capture depth-10 + syntax-quote structural equality.
     const prop_compile_mod = b.createModule(.{
         .root_source_file = b.path("test/prop/compile.zig"),
@@ -923,8 +920,8 @@ pub fn build(b: *std.Build) void {
     const prop_compile_tests = b.addTest(.{ .root_module = prop_compile_mod });
     const run_prop_compile_tests = b.addRunArtifact(prop_compile_tests);
 
-    // Phase 2 step #11 (COMPILER.md §9.4 + §10): golden + eval
-    // pipeline tests. End-to-end source→VM coverage for every
+    // Golden + eval pipeline tests (COMPILER.md §9.4 + §10).
+    // End-to-end source→VM coverage for every
     // primitive-core form, macro, and exception-handling
     // path. Lives in test/integration/.
     const integration_eval_mod = b.createModule(.{
@@ -942,10 +939,9 @@ pub fn build(b: *std.Build) void {
     integration_eval_mod.addImport("vector", vector_mod);
     integration_eval_mod.addImport("champ", champ_mod);
     integration_eval_mod.addImport("stdlib", stdlib_mod);
-    // Phase 5 Item 2 (5.2a): formatValue prints strings via
-    // string.asBytes.
+    // formatValue prints strings via string.asBytes.
     integration_eval_mod.addImport("string", string_mod);
-    // Phase 5.2c (peer-AI turn 81): integration tests delegate
+    // integration tests delegate
     // value-printing to the central format.zig too, so test
     // expectations match REPL output exactly.
     integration_eval_mod.addImport("format", format_mod);
@@ -1007,7 +1003,7 @@ pub fn build(b: *std.Build) void {
     bench_runner_mod.addImport("db", db_mod);
     bench_runner_mod.addImport("emdb", emdb_mod);
     bench_runner_mod.addImport("pool", pool_mod);
-    // Phase 2 gate item 7 (COMPILER.md §9.4): bench/main.zig
+    // bench/main.zig (COMPILER.md §9.4)
     // measures compile + eval throughput + closure-creation
     // cost + recur per-iter cost.
     bench_runner_mod.addImport("vm", vm_mod);
@@ -1043,7 +1039,7 @@ pub fn build(b: *std.Build) void {
     // -------------------------------------------------------------------------
 
     // -------------------------------------------------------------------------
-    // Step H1 (peer-AI turn 55): minimal CLI runner
+    // CLI runner
     //
     // `zig build nexis` produces bin/nexis. `zig build run -- run foo.nx`
     // builds + runs (forwards args after `--`).
@@ -1065,10 +1061,10 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("champ", champ_mod);
     cli_mod.addImport("stdlib", stdlib_mod);
     cli_mod.addImport("loader", loader_mod);
-    // Phase 5 Item 2 (5.2a, peer-AI turn 77): cli.formatValue
-    // prints strings via string.asBytes (display mode, unquoted).
+    // cli.formatValue prints strings via string.asBytes (display
+    // mode, unquoted).
     cli_mod.addImport("string", string_mod);
-    // Phase 5.2c (peer-AI turn 81): cli delegates value-printing
+    // cli delegates value-printing
     // to the central format.zig (display mode).
     cli_mod.addImport("format", format_mod);
 
@@ -1235,16 +1231,13 @@ pub fn build(b: *std.Build) void {
     // eval-pipeline integration tests and the Nextomic unit and
     // property binaries: seconds. The full `zig build test` adds the
     // randomized collection gates (minutes) and the end-to-end
-    // scripts; run it before committing. `phase2-test` names the same
-    // step.
+    // scripts; run it before committing.
     //
     // A new language module joins by an entry in `runtime_test_files`
     // and the matching `runtime_test_runs[N]` line below.
     // -------------------------------------------------------------------------
 
     const quick_step = b.step("quick", "The inner loop: language, eval-pipeline and Nextomic unit + property binaries (seconds)");
-    const phase2_test_step = b.step("phase2-test", "Same as quick");
-    phase2_test_step.dependOn(quick_step);
     // Indices into runtime_test_files: atom = 11, record = 12,
     // protocol = 13, vm = 19, format = 20, compile = 21,
     // expand = 22, stdlib = 23, loader = 24. Asserted at build

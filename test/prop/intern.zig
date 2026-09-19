@@ -1,9 +1,8 @@
 //! test/prop/intern.zig — randomized property tests for the intern tables.
 //!
-//! Second entry in the Phase 1 gate test suite (PLAN §20.2 test #8:
-//! "Interning invariants: same textual symbol → same intern id across
-//! reads; namespace qualification preserved"). Grows the suite
-//! incrementally as each new runtime module lands.
+//! Covers PLAN §20.2 test #8 ("Interning invariants: same textual
+//! symbol → same intern id across reads; namespace qualification
+//! preserved").
 //!
 //! Properties (INTERN.md §1):
 //!   I1. Idempotence — interning the same bytes twice yields the same id.

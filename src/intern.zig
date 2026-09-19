@@ -1,4 +1,4 @@
-//! intern.zig — keyword + symbol intern tables (Phase 1).
+//! intern.zig — keyword + symbol intern tables.
 //!
 //! Authoritative contract: `docs/INTERN.md`. Physical layout of the
 //! `Value` ids produced here is pinned in `docs/VALUE.md`. The hash
@@ -55,7 +55,7 @@ const Table = struct {
     fn deinit(self: *Table, gpa: Allocator) void {
         // Lockstep invariant: `by_name` keys are borrowed slices into
         // the duped bytes owned via `names`. Check before teardown so
-        // future changes to the mutation paths can't silently break it.
+        // a mutation path can't silently break it.
         std.debug.assert(self.by_name.count() == self.names.items.len);
         // Free each duped name buffer, then drop both containers.
         // Order matters: `by_name.deinit` does NOT free its keys, so
@@ -67,7 +67,7 @@ const Table = struct {
 };
 
 /// Shared insertion logic. Factored into a helper so keyword and symbol
-/// tables cannot drift (INTERN.md §4; peer-AI review point E).
+/// tables cannot drift (INTERN.md §4).
 fn internInto(table: *Table, gpa: Allocator, name: []const u8) InternError!u32 {
     if (name.len == 0) return error.EmptyName;
 
@@ -199,10 +199,10 @@ pub const Interner = struct {
 
     // ---- GC-root tracing seam (PLAN §10.5) ----
     //
-    // v1 implementation is a no-op: name bytes are plain allocations,
-    // not heap objects with a `HeapHeader`. This seam exists so the
-    // future GC wiring can register the interner as a root without
-    // reshaping the public struct. When heap-owned names arrive (e.g.
+    // A no-op: name bytes are plain allocations, not heap objects
+    // with a `HeapHeader`. This seam exists so GC wiring can
+    // register the interner as a root without reshaping the public
+    // struct. If heap-owned names arrive (e.g.
     // if interned names ever move to the runtime heap), iterate
     // `self.keyword.names` and `self.symbol.names` and call
     // `visitor.visit(entry)` here.

@@ -1,7 +1,6 @@
 //! test/prop/string.zig — randomized properties for the string heap kind.
 //!
-//! Exercises the full Value → dispatch → string pipeline established
-//! in commit 5 (conversation `nexis-phase-1` turn 6 + 7). Each
+//! Exercises the full Value → dispatch → string pipeline. Each
 //! property uses a fixed PRNG seed so failures reproduce.
 //!
 //! Properties:

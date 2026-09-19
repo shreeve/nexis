@@ -1,8 +1,8 @@
-//! record.zig — `Kind.record` heap kind (Phase 5 Item 3 / 5.3a).
+//! record.zig — `Kind.record` heap kind.
 //!
 //! Authoritative spec: `docs/PROTOCOLS.md` §2.1 + §3. Derivative from
-//! `PLAN.md` Amendment Log entry (protocols+records, 2026-05-19) +
-//! peer-AI turn 84. Those documents win on conflict.
+//! the `PLAN.md` Amendment Log entry (protocols+records). Those
+//! documents win on conflict.
 //!
 //! ONE kind for all record types. RecordTypeId is a per-VM dense u32
 //! that lives in the heap body alongside a persistent_map of fields.

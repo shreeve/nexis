@@ -1,20 +1,19 @@
-//! test/prop/compile.zig — randomized properties closing COMPILER.md
-//! §9.4 Phase 2 gate items 3 and 4.
+//! test/prop/compile.zig — randomized properties covering COMPILER.md
+//! §9.4 gate items 3 and 4.
 //!
 //! Gate item 3 (closure capture depth-10):
 //!   Build N-level-deep nested fn* expressions where the innermost
 //!   fn captures a binding from the outermost scope. Verify that
 //!   for N in 1..10, the captured value round-trips correctly
 //!   regardless of nesting depth. Exercises the pre-analysis
-//!   capture machinery + CaptureSource chaining (`inherited_upvalue`)
-//!   that lands across step #5.
+//!   capture machinery + CaptureSource chaining (`inherited_upvalue`).
 //!
 //! Gate item 4 (syntax-quote structural equality):
 //!   Generate random list-valued Forms; compare the runtime list
 //!   produced by syntax-quoting them against the runtime list
 //!   produced by directly quoting the same forms. Exercises the
-//!   syntax-quote walker's segment-and-concat logic (#8c.2) against
-//!   the simpler `(quote ...)` lowering (#8c.1).
+//!   syntax-quote walker's segment-and-concat logic against the
+//!   simpler `(quote ...)` lowering.
 //!
 //! Deterministic PRNG seeds so failures reproduce.
 
@@ -98,7 +97,7 @@ fn buildNestedClosureSource(buf: *std.array_list.Managed(u8), value: i64, depth:
     try buf.appendSlice(")");
 }
 
-test "prop #3: closure capture depth 1..10 round-trips value" {
+test "prop capture depth: closure capture depth 1..10 round-trips value" {
     var prng = std.Random.DefaultPrng.init(closure_prng_seed);
     const rand = prng.random();
 
@@ -119,7 +118,7 @@ test "prop #3: closure capture depth 1..10 round-trips value" {
     }
 }
 
-test "prop #3: independent captures don't interfere" {
+test "prop capture depth: independent captures don't interfere" {
     // Two separate closures each capturing a different binding.
     // Force them to be called in sequence; both must return their
     // own captured value.
@@ -204,7 +203,7 @@ fn writeRandomShape(buf: *std.array_list.Managed(u8), rand: std.Random, depth: u
     try buf.append(')');
 }
 
-test "prop #4: syntax-quote ≡ quote for splice-free shapes" {
+test "prop syntax-quote: syntax-quote ≡ quote for splice-free shapes" {
     var prng = std.Random.DefaultPrng.init(sq_prng_seed);
     const rand = prng.random();
 
@@ -277,7 +276,7 @@ test "prop #4: syntax-quote ≡ quote for splice-free shapes" {
     }
 }
 
-test "prop #4: syntax-quote with unquoted integer matches hand-built list" {
+test "prop syntax-quote: syntax-quote with unquoted integer matches hand-built list" {
     // For each trial, generate a fixed list shape with one
     // integer unquoted; verify the resulting list contains
     // that integer at the expected position.

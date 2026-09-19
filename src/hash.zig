@@ -30,7 +30,7 @@ pub const seed: u64 = 0x0000_0000_3173_6978_656E | (@as(u64, '/') << 48) | (@as(
 // Keyword/symbol domain separation is handled by the generic
 // `mixKindDomain` below (each Kind byte lands in a distinct region of
 // u64 space). This subsumes Clojure's `keyword.hash ^= 0x9E3779B9`
-// pattern (PLAN §8.4, §23 #32) for v1 since every Kind participates in
+// pattern (PLAN §8.4, §23 #32) since every Kind participates in
 // the same mechanism rather than keyword alone getting a special offset.
 // The `mixKeywordDomain` helper is kept below as a thin alias for
 // clarity at call sites that want to express "deliberately shifting a
@@ -134,8 +134,8 @@ pub fn canonicalizeFloat(f: f64) f64 {
 /// `symbol(65)` vs `char(65)`) still land in disjoint regions of the
 /// 64-bit hash space. Cheap — a multiply and an add. Applied by the
 /// runtime's `Value.hashValue()` after the per-kind primitive hash so
-/// every kind automatically carries its own domain even when future
-/// kinds are added. Includes keyword-vs-symbol separation as a
+/// every kind automatically carries its own domain, including any
+/// kind added later. Includes keyword-vs-symbol separation as a
 /// special case (their kind bytes differ).
 pub inline fn mixKindDomain(base: u64, kind_tag: u8) u64 {
     return base +% (@as(u64, kind_tag) *% kind_domain_mixer);

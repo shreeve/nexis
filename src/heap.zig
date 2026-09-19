@@ -1,4 +1,4 @@
-//! heap.zig — runtime heap allocator + `HeapHeader` storage (Phase 1).
+//! heap.zig — runtime heap allocator + `HeapHeader` storage.
 //!
 //! Authoritative layout contract: `docs/VALUE.md` §4 (HeapHeader) and
 //! `docs/HEAP.md` (allocator + object-enumeration + minimal sweep).
@@ -19,9 +19,8 @@
 //!   - Double-free is a runtime bug; debug builds panic via a poisoned-
 //!     kind sentinel set on free.
 //!
-//! Peer-AI review (conversation `nexis-phase-1` turn 4) established
-//! the prefix-block strategy over an external registry to avoid a
-//! dual source of truth for live objects.
+//! The prefix-block strategy (rather than an external registry)
+//! avoids a dual source of truth for live objects.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -29,7 +28,7 @@ const value = @import("value");
 
 const Allocator = std.mem.Allocator;
 
-// nexis v1 is pinned to 64-bit single-isolate targets (PLAN §16). Every
+// nexis is pinned to 64-bit single-isolate targets (PLAN §16). Every
 // layout assert below assumes 8-byte pointers and 8-byte `usize`; state
 // that assumption explicitly so a 32-bit build would fail fast and
 // loudly rather than silently mis-size `Block`.
@@ -45,8 +44,8 @@ comptime {
 
 pub const HeapHeader = extern struct {
     /// Finer-grained than `Value.tag.kind`. Mirrors the same `Kind` enum
-    /// for the "what is this?" dimension; extra width allows future
-    /// sub-kind packing if needed without another indirection.
+    /// for the "what is this?" dimension; the extra width leaves
+    /// room for sub-kind packing without another indirection.
     kind: u16 align(16),
     /// GC bits. See `mark_bit_*` constants.
     mark: u8,
@@ -128,8 +127,7 @@ pub const HeapHeader = extern struct {
     //
     // VALUE.md §4 accepts the "hash == 0 means uncomputed" sentinel:
     // a genuine computed-zero hash recomputes on next access. This
-    // saves one flag bit per heap object. Peer-AI review raised the
-    // information-loss concern; the spec decision stands. If a per-
+    // saves one flag bit per heap object. If a per-
     // kind hasher produces output with a non-trivial 0-collision rate
     // (e.g. identity hashes over small domains), that kind's hasher
     // should remap 0 to 1 in its own finalizer before calling
@@ -149,7 +147,7 @@ pub const HeapHeader = extern struct {
 
 pub const mark_bit_marked: u8 = 1 << 0;
 pub const mark_bit_pinned: u8 = 1 << 1;
-// Bits 2..7 reserved for future tri-color / generational / remembered-set use.
+// Bits 2..7 reserved (tri-color / generational / remembered-set use).
 
 pub const flag_has_meta: u8 = 1 << 0;
 pub const flag_interned: u8 = 1 << 1;
@@ -253,8 +251,8 @@ pub const Heap = struct {
             }
         }
 
-        // Unlink from the live list. O(n) in v1; acceptable at Phase 1
-        // scale and replaced wholesale by the eventual slab allocator.
+        // Unlink from the live list. O(n): the live list is singly
+        // linked.
         if (self.live_head == block) {
             self.live_head = block.next;
         } else {
@@ -283,8 +281,7 @@ pub const Heap = struct {
     /// (header starts at a 16-byte boundary and is itself 16 bytes), so
     /// any `Body` with alignment ≤ 16 is safe. Kinds that need >16-byte
     /// alignment (rare) would require an alloc API that takes explicit
-    /// body alignment — intentionally out of scope for v1 because no
-    /// current or committed heap kind needs it.
+    /// body alignment — no heap kind needs it.
     pub inline fn bodyOf(comptime Body: type, h: *HeapHeader) *Body {
         comptime std.debug.assert(@alignOf(Body) <= 16);
         const body_ptr: [*]u8 = @as([*]u8, @ptrCast(h)) + @sizeOf(HeapHeader);

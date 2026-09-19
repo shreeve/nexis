@@ -1,9 +1,9 @@
-//! atom.zig — in-memory mutable cells (Phase 5 Item 1).
+//! atom.zig — in-memory mutable cells.
 //!
-//! Authoritative spec: `docs/ATOM.md`. Derivative from PLAN.md Amendment
-//! Log (atoms entry, 2026-05-18), `docs/VALUE.md` §2.2 (kind 34
+//! Authoritative spec: `docs/ATOM.md`. Derivative from the PLAN.md
+//! Amendment Log (atoms entry), `docs/VALUE.md` §2.2 (kind 34
 //! `atom`), `docs/SEMANTICS.md` §2.6 / §3.2 (atom identity equality +
-//! identity hash). Peer-AI turn 75.
+//! identity hash).
 //!
 //! Responsibilities:
 //!   - `AtomBox` heap body: `{ value: Value, in_flight: u8, _pad }`.
@@ -35,11 +35,10 @@
 //! become unequal to itself after a mutation. See SEMANTICS.md §2.6
 //! addendum for the formal pinning.
 //!
-//! v1 GC migration audit: `swap-vals!` allocates a result vector
-//! AFTER the atom write. Under v1's explicit-only GC (`docs/GC.md`
-//! §9), this is safe — `heap.alloc` never auto-triggers `collect`.
-//! When triggered-GC lands, `docs/GC.md` §11.5 lists this site for
-//! rooting audit.
+//! GC rooting: `swap-vals!` allocates a result vector AFTER the
+//! atom write. The collector is explicit-only (`docs/GC.md` §9), so
+//! this is safe — `heap.alloc` never auto-triggers `collect`.
+//! `docs/GC.md` §11.5 lists this site in the rooting audit.
 
 const std = @import("std");
 const value_mod = @import("value");
@@ -63,8 +62,8 @@ const testing = std.testing;
 /// `compare-and-set!` / `swap-vals!` for the duration of their
 /// critical section.
 ///
-/// Padding makes total size a multiple of 8 so any future fields
-/// remain naturally aligned without re-thinking the layout.
+/// Padding makes total size a multiple of 8 so added fields stay
+/// naturally aligned without re-thinking the layout.
 pub const AtomBox = extern struct {
     value: Value,
     in_flight: u8,
@@ -116,7 +115,7 @@ pub inline fn setValue(v: Value, new: Value) void {
 /// pair with `exitCritical`); `false` if another op already owns
 /// it (caller should throw `:atom-re-entry`).
 ///
-/// v1 is single-threaded so this is a simple read+set, not a CAS.
+/// The VM is single-threaded so this is a simple read+set, not a CAS.
 /// The flag exists purely to detect a user fn (passed to `swap!` or
 /// `swap-vals!`) re-entering a mutating op on the same atom.
 pub inline fn tryEnterCritical(v: Value) bool {
@@ -152,13 +151,11 @@ pub inline fn exitCritical(v: Value) void {
 /// `dispatch.hashValue` on the way out, parallel to every other
 /// kind-local heap kind.
 ///
-/// **Future GC migration note**: if a moving collector ever lands,
-/// `@intFromPtr` is no longer stable across collections. The
-/// migration plan must replace this with a stable object-identity
-/// (e.g., a per-allocation u64 stamp baked into the header at
-/// allocation time). v1's non-moving mark-sweep makes raw pointer
-/// hashing both correct and cheap. Cross-referenced in
-/// `docs/GC.md` §11.5 audit checklist.
+/// **Invariant**: the collector is non-moving mark-sweep, which
+/// makes raw pointer hashing both correct and cheap. A moving
+/// collector would need a stable object identity instead (e.g., a
+/// per-allocation u64 stamp baked into the header at allocation
+/// time). Cross-referenced in the `docs/GC.md` §11.5 audit checklist.
 pub fn hashHeader(h: *HeapHeader) u32 {
     if (h.cachedHash()) |cached| return cached;
     var hasher = std.hash.XxHash3.init(hash_mod.seed);
@@ -185,9 +182,8 @@ pub fn atomsEqual(a: *HeapHeader, b: *HeapHeader) bool {
 // =============================================================================
 
 /// Mark the contained value. `in_flight` is a `u8` — not a Value —
-/// so there's nothing else to walk. The `meta` chain (for atoms
-/// carrying `:meta`, post-v1) is handled centrally by the collector
-/// before `trace` is invoked.
+/// so there's nothing else to walk. The `meta` chain is handled
+/// centrally by the collector before `trace` is invoked.
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
     const body = Heap.bodyOf(AtomBox, h);
     visitor.markValue(body.value);

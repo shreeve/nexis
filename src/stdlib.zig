@@ -70,7 +70,7 @@ pub fn installCore(ns: *Namespace) !void {
     }
 }
 
-/// Phase 4.0a: install db primitives into the `db` namespace
+/// Install db primitives into the `db` namespace
 /// so `(db/open path)` resolves through the registry's
 /// qualified-symbol path. CLI calls this AFTER `installCore`
 /// + after the registry has a "db" namespace registered.
@@ -113,7 +113,7 @@ pub fn installInternal(internal_ns: *Namespace) !void {
 }
 
 const db_fns = [_]CoreEntry{
-    // 4.0a connection + ref + auto-ephemeral primitives.
+    // Connection + ref + auto-ephemeral primitives.
     .{ .name = "open", .descriptor = &native_db_open },
     .{ .name = "close", .descriptor = &native_db_close },
     .{ .name = "ref", .descriptor = &native_db_ref },
@@ -122,7 +122,7 @@ const db_fns = [_]CoreEntry{
     .{ .name = "get-key", .descriptor = &native_db_get_key },
     .{ .name = "delete-key!", .descriptor = &native_db_delete_key },
     .{ .name = "present?", .descriptor = &native_db_present_q },
-    // 4.0b explicit-tx primitives.
+    // Explicit-tx primitives.
     .{ .name = "begin-write", .descriptor = &native_db_begin_write },
     .{ .name = "begin-read", .descriptor = &native_db_begin_read },
     .{ .name = "commit!", .descriptor = &native_db_commit },
@@ -131,19 +131,19 @@ const db_fns = [_]CoreEntry{
     .{ .name = "put!", .descriptor = &native_db_put },
     .{ .name = "get", .descriptor = &native_db_get },
     .{ .name = "delete!", .descriptor = &native_db_delete },
-    // 4.0c
+    // Deref + alter.
     .{ .name = "deref", .descriptor = &native_db_deref },
     .{ .name = "alter!", .descriptor = &native_db_alter },
-    // 4.0d
+    // Tree traversal.
     .{ .name = "scan", .descriptor = &native_db_scan },
     .{ .name = "reduce-tree", .descriptor = &native_db_reduce_tree },
-    // 4.0f snapshot aliases (PLAN.md §15.7 vocabulary).
+    // Snapshot aliases (PLAN.md §15.7 vocabulary).
     .{ .name = "snapshot", .descriptor = &native_db_snapshot },
     .{ .name = "release-snapshot!", .descriptor = &native_db_release_snapshot },
     .{ .name = "snapshot?", .descriptor = &native_db_snapshot_q },
 };
 
-/// Phase 5.2b (peer-AI turn 79): `nexis.string` namespace entries.
+/// `nexis.string` namespace entries.
 /// Installed into `registry.string` via `installString`. NOT
 /// auto-referred — users call qualified `nexis.string/lower-case`.
 const string_fns = [_]CoreEntry{
@@ -155,21 +155,21 @@ const string_fns = [_]CoreEntry{
     .{ .name = "replace", .descriptor = &native_string_replace },
 };
 
-/// Phase 5.3a (peer-AI turn 84): `nexis.internal` namespace
-/// entries. Installed via `installInternal`. NOT auto-referred;
-/// macros emit qualified calls.
+/// `nexis.internal` namespace entries. Installed via
+/// `installInternal`. NOT auto-referred; macros emit qualified
+/// calls.
 const internal_fns = [_]CoreEntry{
-    // 5.3a — records.
+    // Records.
     .{ .name = "#%register-record-type", .descriptor = &native_register_record_type },
     .{ .name = "#%make-record", .descriptor = &native_make_record },
     .{ .name = "#%record?", .descriptor = &native_record_q },
     .{ .name = "#%record-type-id", .descriptor = &native_record_type_id },
-    // 5.3b — protocols.
+    // Protocols.
     .{ .name = "#%register-protocol", .descriptor = &native_register_protocol },
     .{ .name = "#%protocol-fn", .descriptor = &native_protocol_fn },
-    // 5.3c — defrecord inline protocol impls.
+    // defrecord inline protocol impls.
     .{ .name = "#%extend-record-impl", .descriptor = &native_extend_record_impl },
-    // 5.3d — extend-protocol / extend-type / satisfies?.
+    // extend-protocol / extend-type / satisfies?.
     .{ .name = "#%extend-builtin-impl", .descriptor = &native_extend_builtin_impl },
     .{ .name = "#%extend-default-impl", .descriptor = &native_extend_default_impl },
 };
@@ -189,7 +189,7 @@ const CoreEntry = struct {
 };
 
 const core_fns = [_]CoreEntry{
-    // 3.3a sequence primitives.
+    // Sequence primitives.
     .{ .name = "list", .descriptor = &native_list },
     .{ .name = "cons", .descriptor = &native_cons },
     .{ .name = "first", .descriptor = &native_first },
@@ -200,11 +200,10 @@ const core_fns = [_]CoreEntry{
     .{ .name = "identity", .descriptor = &native_identity },
     .{ .name = "nil?", .descriptor = &native_nil_q },
     .{ .name = "some?", .descriptor = &native_some_q },
-    // 3.3b first-class arithmetic + comparison Vars.
-    // Required so `(reduce + 0 xs)` resolves `+` as a Var
-    // (the inlining of `(+ x y)` at the call head continues
-    // to work — known limitation per peer-AI turn 67 §Sharp
-    // warning §2).
+    // First-class arithmetic + comparison Vars.
+    // Required so `(reduce + 0 xs)` resolves `+` as a Var.
+    // `(+ x y)` at the call head is still inlined by the
+    // compiler; the Var is only reached through non-head uses.
     .{ .name = "+", .descriptor = &native_add },
     .{ .name = "-", .descriptor = &native_sub },
     .{ .name = "*", .descriptor = &native_mul },
@@ -235,7 +234,7 @@ const core_fns = [_]CoreEntry{
     .{ .name = "neg?", .descriptor = &native_neg_q },
     .{ .name = "odd?", .descriptor = &native_odd_q },
     .{ .name = "even?", .descriptor = &native_even_q },
-    // 3.3b apply + HOFs.
+    // apply + HOFs.
     .{ .name = "apply", .descriptor = &native_apply },
     .{ .name = "map", .descriptor = &native_map },
     .{ .name = "reduce", .descriptor = &native_reduce },
@@ -304,7 +303,7 @@ const core_fns = [_]CoreEntry{
     .{ .name = "associative?", .descriptor = &native_associative_q },
     .{ .name = "fn?", .descriptor = &native_fn_q },
     .{ .name = "ifn?", .descriptor = &native_ifn_q },
-    // 3.3c collection construction + access.
+    // Collection construction + access.
     .{ .name = "vector", .descriptor = &native_vector },
     .{ .name = "vec", .descriptor = &native_vec },
     .{ .name = "hash-map", .descriptor = &native_hash_map },
@@ -319,9 +318,9 @@ const core_fns = [_]CoreEntry{
     .{ .name = "keys", .descriptor = &native_keys },
     .{ .name = "vals", .descriptor = &native_vals },
     .{ .name = "conj", .descriptor = &native_conj },
-    // Phase 5 Item 1 (peer-AI turn 75): atom primitives.
-    // Identity-valued in-memory mutable cells. `deref` was
-    // already installed (above is `&native_db_deref` aliased in
+    // Atom primitives.
+    // Identity-valued in-memory mutable cells. `deref` is
+    // installed above (`&native_db_deref` aliased in
     // db_fns; we also expose it as bare `deref` here so
     // `(deref atom-or-var-or-durable-ref)` resolves without the
     // `db/` prefix). See `docs/ATOM.md`.
@@ -332,22 +331,21 @@ const core_fns = [_]CoreEntry{
     .{ .name = "swap!", .descriptor = &native_swap_bang },
     .{ .name = "swap-vals!", .descriptor = &native_swap_vals_bang },
     .{ .name = "compare-and-set!", .descriptor = &native_compare_and_set_bang },
-    // Phase 5.3d (peer-AI turn 84): satisfies? predicate.
+    // satisfies? predicate.
     .{ .name = "satisfies?", .descriptor = &native_satisfies_q },
-    // Phase 5 Item 2 sub-step 5.2a (peer-AI turn 77): core
-    // string ops. Indexing semantics are by Unicode scalar
+    // Core string ops. Indexing semantics are by Unicode scalar
     // (codepoint), NOT byte; see `docs/STRING.md` §7.
     .{ .name = "str", .descriptor = &native_str },
     .{ .name = "string?", .descriptor = &native_string_q },
     .{ .name = "subs", .descriptor = &native_subs },
-    // Phase 5 Item 2 sub-step 5.2c (peer-AI turn 81) — printing + I/O.
+    // Printing + I/O.
     .{ .name = "print", .descriptor = &native_print },
     .{ .name = "println", .descriptor = &native_println },
     .{ .name = "prn", .descriptor = &native_prn },
     .{ .name = "pr-str", .descriptor = &native_pr_str },
     .{ .name = "slurp", .descriptor = &native_slurp },
     .{ .name = "spit", .descriptor = &native_spit },
-    // Phase 4.0a: db primitives live in the `db` namespace
+    // db primitives live in the `db` namespace
     // (installed separately via `installDb`) so they appear as
     // qualified `(db/open ...)` calls.
 };
@@ -426,7 +424,7 @@ const native_some_q = NativeFn{
     .call = &fnSomeQ,
 };
 
-// 3.3b arithmetic + comparison.
+// Arithmetic + comparison.
 const native_add = NativeFn{ .name = "+", .min_arity = 0, .max_arity = null, .call = &fnAdd };
 const native_sub = NativeFn{ .name = "-", .min_arity = 1, .max_arity = null, .call = &fnSub };
 const native_mul = NativeFn{ .name = "*", .min_arity = 0, .max_arity = null, .call = &fnMul };
@@ -458,7 +456,7 @@ const native_neg_q = NativeFn{ .name = "neg?", .min_arity = 1, .max_arity = 1, .
 const native_odd_q = NativeFn{ .name = "odd?", .min_arity = 1, .max_arity = 1, .call = &fnOddQ };
 const native_even_q = NativeFn{ .name = "even?", .min_arity = 1, .max_arity = 1, .call = &fnEvenQ };
 
-// 3.3b apply + HOFs.
+// apply + HOFs.
 const native_apply = NativeFn{ .name = "apply", .min_arity = 2, .max_arity = null, .call = &fnApply };
 const native_map = NativeFn{ .name = "map", .min_arity = 2, .max_arity = null, .call = &fnMap };
 const native_reduce = NativeFn{ .name = "reduce", .min_arity = 2, .max_arity = 3, .call = &fnReduce };
@@ -528,7 +526,7 @@ const native_associative_q = NativeFn{ .name = "associative?", .min_arity = 1, .
 const native_fn_q = NativeFn{ .name = "fn?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isFn) };
 const native_ifn_q = NativeFn{ .name = "ifn?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isIfn) };
 
-// 3.3c collection utilities.
+// Collection utilities.
 const native_vector = NativeFn{ .name = "vector", .min_arity = 0, .max_arity = null, .call = &fnVector };
 const native_vec = NativeFn{ .name = "vec", .min_arity = 1, .max_arity = 1, .call = &fnVec };
 const native_hash_map = NativeFn{ .name = "hash-map", .min_arity = 0, .max_arity = null, .call = &fnHashMap };
@@ -544,7 +542,7 @@ const native_keys = NativeFn{ .name = "keys", .min_arity = 1, .max_arity = 1, .c
 const native_vals = NativeFn{ .name = "vals", .min_arity = 1, .max_arity = 1, .call = &fnVals };
 const native_conj = NativeFn{ .name = "conj", .min_arity = 1, .max_arity = null, .call = &fnConj };
 
-// Phase 4.0a db primitives.
+// db primitives.
 const native_db_open = NativeFn{ .name = "db/open", .min_arity = 1, .max_arity = 1, .call = &fnDbOpen };
 const native_db_close = NativeFn{ .name = "db/close", .min_arity = 1, .max_arity = 1, .call = &fnDbClose };
 const native_db_ref = NativeFn{ .name = "db/ref", .min_arity = 3, .max_arity = 3, .call = &fnDbRef };
@@ -553,7 +551,7 @@ const native_db_put_key = NativeFn{ .name = "db/put-key!", .min_arity = 2, .max_
 const native_db_get_key = NativeFn{ .name = "db/get-key", .min_arity = 1, .max_arity = 2, .call = &fnDbGetKey };
 const native_db_delete_key = NativeFn{ .name = "db/delete-key!", .min_arity = 1, .max_arity = 1, .call = &fnDbDeleteKey };
 const native_db_present_q = NativeFn{ .name = "db/present?", .min_arity = 1, .max_arity = 1, .call = &fnDbPresentQ };
-// Phase 4.0b explicit tx primitives.
+// Explicit tx primitives.
 const native_db_begin_write = NativeFn{ .name = "db/begin-write", .min_arity = 1, .max_arity = 1, .call = &fnDbBeginWrite };
 const native_db_begin_read = NativeFn{ .name = "db/begin-read", .min_arity = 1, .max_arity = 1, .call = &fnDbBeginRead };
 const native_db_commit = NativeFn{ .name = "db/commit!", .min_arity = 1, .max_arity = 1, .call = &fnDbCommit };
@@ -562,10 +560,10 @@ const native_db_abort_read = NativeFn{ .name = "db/abort-read!", .min_arity = 1,
 const native_db_put = NativeFn{ .name = "db/put!", .min_arity = 3, .max_arity = 3, .call = &fnDbPut };
 const native_db_get = NativeFn{ .name = "db/get", .min_arity = 2, .max_arity = 3, .call = &fnDbGet };
 const native_db_delete = NativeFn{ .name = "db/delete!", .min_arity = 2, .max_arity = 2, .call = &fnDbDelete };
-// Phase 4.0c — deref + alter.
+// deref + alter.
 const native_db_deref = NativeFn{ .name = "deref", .min_arity = 1, .max_arity = 1, .call = &fnDbDeref };
 
-// Phase 5 Item 1 (peer-AI turn 75) — atoms.
+// Atoms.
 const native_atom = NativeFn{ .name = "atom", .min_arity = 1, .max_arity = 1, .call = &fnAtom };
 const native_atom_q = NativeFn{ .name = "atom?", .min_arity = 1, .max_arity = 1, .call = &fnAtomQ };
 const native_reset_bang = NativeFn{ .name = "reset!", .min_arity = 2, .max_arity = 2, .call = &fnResetBang };
@@ -573,12 +571,12 @@ const native_swap_bang = NativeFn{ .name = "swap!", .min_arity = 2, .max_arity =
 const native_swap_vals_bang = NativeFn{ .name = "swap-vals!", .min_arity = 2, .max_arity = null, .call = &fnSwapValsBang };
 const native_compare_and_set_bang = NativeFn{ .name = "compare-and-set!", .min_arity = 3, .max_arity = 3, .call = &fnCompareAndSetBang };
 
-// Phase 5 Item 2 sub-step 5.2a (peer-AI turn 77) — core string ops.
+// Core string ops.
 const native_str = NativeFn{ .name = "str", .min_arity = 0, .max_arity = null, .call = &fnStr };
 const native_string_q = NativeFn{ .name = "string?", .min_arity = 1, .max_arity = 1, .call = &fnStringQ };
 const native_subs = NativeFn{ .name = "subs", .min_arity = 2, .max_arity = 3, .call = &fnSubs };
 
-// Phase 5.2c (peer-AI turn 81) — printing + I/O.
+// Printing + I/O.
 const native_print = NativeFn{ .name = "print", .min_arity = 0, .max_arity = null, .call = &fnPrint };
 const native_println = NativeFn{ .name = "println", .min_arity = 0, .max_arity = null, .call = &fnPrintln };
 const native_prn = NativeFn{ .name = "prn", .min_arity = 0, .max_arity = null, .call = &fnPrn };
@@ -586,24 +584,24 @@ const native_pr_str = NativeFn{ .name = "pr-str", .min_arity = 0, .max_arity = n
 const native_slurp = NativeFn{ .name = "slurp", .min_arity = 1, .max_arity = 1, .call = &fnSlurp };
 const native_spit = NativeFn{ .name = "spit", .min_arity = 2, .max_arity = 2, .call = &fnSpit };
 
-// Phase 5.3a (peer-AI turn 84) — record internals. All four
+// Record internals. All four
 // install into `nexis.internal`; macros emit qualified calls.
 const native_register_record_type = NativeFn{ .name = "#%register-record-type", .min_arity = 2, .max_arity = 2, .call = &fnRegisterRecordType };
 const native_make_record = NativeFn{ .name = "#%make-record", .min_arity = 2, .max_arity = 2, .call = &fnMakeRecord };
 const native_record_q = NativeFn{ .name = "#%record?", .min_arity = 1, .max_arity = 1, .call = &fnRecordQ };
 const native_record_type_id = NativeFn{ .name = "#%record-type-id", .min_arity = 1, .max_arity = 1, .call = &fnRecordTypeId };
 
-// Phase 5.3b (peer-AI turn 84) — protocol internals.
+// Protocol internals.
 const native_register_protocol = NativeFn{ .name = "#%register-protocol", .min_arity = 2, .max_arity = 2, .call = &fnRegisterProtocol };
 const native_protocol_fn = NativeFn{ .name = "#%protocol-fn", .min_arity = 2, .max_arity = 2, .call = &fnProtocolFn };
-// Phase 5.3c (peer-AI turn 84) — defrecord inline protocol impls.
+// defrecord inline protocol impls.
 const native_extend_record_impl = NativeFn{ .name = "#%extend-record-impl", .min_arity = 4, .max_arity = 4, .call = &fnExtendRecordImpl };
-// Phase 5.3d (peer-AI turn 84) — extend-protocol over built-in kinds + Any default + satisfies?.
+// extend-protocol over built-in kinds + Any default + satisfies?.
 const native_extend_builtin_impl = NativeFn{ .name = "#%extend-builtin-impl", .min_arity = 4, .max_arity = 4, .call = &fnExtendBuiltinImpl };
 const native_extend_default_impl = NativeFn{ .name = "#%extend-default-impl", .min_arity = 3, .max_arity = 3, .call = &fnExtendDefaultImpl };
 const native_satisfies_q = NativeFn{ .name = "satisfies?", .min_arity = 2, .max_arity = 2, .call = &fnSatisfiesQ };
 
-// Phase 5 Item 2 sub-step 5.2b (peer-AI turn 79) — nexis.string namespace.
+// nexis.string namespace.
 const native_string_lower_case = NativeFn{ .name = "nexis.string/lower-case", .min_arity = 1, .max_arity = 1, .call = &fnStringLowerCase };
 const native_string_upper_case = NativeFn{ .name = "nexis.string/upper-case", .min_arity = 1, .max_arity = 1, .call = &fnStringUpperCase };
 const native_string_trim = NativeFn{ .name = "nexis.string/trim", .min_arity = 1, .max_arity = 1, .call = &fnStringTrim };
@@ -627,7 +625,8 @@ const native_db_snapshot_q = NativeFn{ .name = "db/snapshot?", .min_arity = 1, .
 // =============================================================================
 
 /// `(list & xs)` → fresh cons list of the args (left-to-right).
-/// `(list)` is the empty list. GC TODO: root partial result.
+/// `(list)` is the empty list. The partial result is not
+/// rooted; `Heap.alloc` never collects (GC.md §9).
 fn fnList(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
@@ -640,9 +639,8 @@ fn fnList(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(cons x s)` → new cons cell with `x` as head and `s` as
-/// tail. `s` may be nil (treated as empty), a list, or
-/// (Phase 3.3b+) any seqable collection. v1 accepts nil and
-/// lists; other kinds are a `KindMismatch`.
+/// tail. `s` may be nil (treated as empty) or a list; other
+/// kinds are a `KindMismatch`.
 fn fnCons(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     const tail_v = try coerceToList(vm, args[1]);
@@ -740,20 +738,19 @@ fn fnCount(_: *VM, args: []const Value) VmError!Value {
 ///
 /// `(nth coll n default)` → element at index `n`, or `default`
 /// if out-of-bounds. nil coll always returns default. Required
-/// by Phase 3.5 destructuring (peer-AI turn 70 §missing-trap
-/// §9: `[a b c]` against a 2-element source should bind c to
-/// nil, not throw).
+/// by destructuring: `[a b c]` against a 2-element source binds
+/// c to nil, not throw.
 fn fnNth(_: *VM, args: []const Value) VmError!Value {
     const coll = args[0];
     const idx_v = args[1];
     const has_default = args.len > 2;
     const default = if (has_default) args[2] else value_mod.nilValue();
     if (idx_v.kind() != .fixnum) return VmError.KindMismatch;
-    // Phase 5.2a (peer-AI turn 78): kind-check the receiver
-    // BEFORE consulting `idx < 0` / `has_default`. Pre-5.2a the
-    // negative-index path returned `default` even when `coll`
-    // was non-indexable (e.g. `(nth 123 -1 :d) → :d`). That's a
-    // type-soundness violation — `:kind-mismatch` must fire on
+    // Kind-check the receiver BEFORE consulting `idx < 0` /
+    // `has_default`. Otherwise the negative-index path would
+    // return `default` even when `coll` is non-indexable (e.g.
+    // `(nth 123 -1 :d) → :d`), a type-soundness violation —
+    // `:kind-mismatch` must fire on
     // non-indexable receivers regardless of index sign or
     // default arity.
     switch (coll.kind()) {
@@ -785,7 +782,7 @@ fn fnNth(_: *VM, args: []const Value) VmError!Value {
             }
             break :blk vector_mod.nth(coll, u_idx);
         },
-        // Phase 5.2a (peer-AI turn 77 §D2): `(nth s i)` returns a
+        // `(nth s i)` returns a
         // Kind.char at codepoint index `i`. Indexing is by
         // Unicode scalar to match `(count s)`. Out-of-bounds
         // surfaces `:index-out-of-bounds`; malformed UTF-8
@@ -2339,11 +2336,9 @@ fn dbFailure(vm: *VM, err: anyerror) VmError {
 }
 
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
-    // Phase 4.0a accepted keyword OR symbol (interned-name-as-
-    // path). Phase 5.2a (peer-AI turn 78) adds first-class
-    // strings: `(db/open "/tmp/x.edb")` is now the canonical
-    // form; the keyword/symbol overloads remain for backward
-    // compat with the Phase 4 examples.
+    // `(db/open "/tmp/x.edb")` is the canonical form; a keyword
+    // or symbol argument is accepted as well (its interned name
+    // is the path).
     const path_v = args[0];
     const path_slice: []const u8 = blk: {
         if (path_v.kind() == .string) break :blk string_mod.asBytes(path_v);
@@ -2363,8 +2358,8 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     const path_z = vm.allocator.dupeZ(u8, path_slice) catch return VmError.OutOfMemory;
     defer vm.allocator.free(path_z);
 
-    // Phase 5.2a polish (chore): auto-create the path's parent
-    // directories so `(db/open "tmp/x.edb")` / `(db/open
+    // Auto-create the path's parent directories so
+    // `(db/open "tmp/x.edb")` / `(db/open
     // "data/v1/state.edb")` Just Work. emdb does NOT create
     // parents; without this, the open fails with `:db/open-failed`
     // unless the user pre-created the directory.
@@ -2395,7 +2390,7 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
-/// Phase 4.0a: stand-alone closer used by VM.deinit safety net.
+/// Stand-alone closer used by VM.deinit safety net.
 /// Closes the emdb env AND destroys the Connection struct. The
 /// struct's own `allocator` field tells us how it was allocated.
 fn dbCloseCallback(opaque_ptr: *anyopaque) void {
@@ -2430,8 +2425,7 @@ fn fnDbRef(vm: *VM, args: []const Value) VmError!Value {
     // Tree name must be a keyword (its interned name = tree id).
     if (tree_v.kind() != .keyword) return VmError.KindMismatch;
     // Key can be keyword / symbol (interned-name as key bytes)
-    // or string. Phase 5.2a (peer-AI turn 78): first-class
-    // string keys arrived with first-class string literals.
+    // or string.
     if (key_v.kind() != .keyword and key_v.kind() != .symbol and key_v.kind() != .string) {
         return VmError.KindMismatch;
     }
@@ -2667,15 +2661,13 @@ fn fnDbDelete(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(existed);
 }
 
-/// `(deref x)` (also installed as `db/deref` for Phase 4 backward
-/// compatibility) — universal deref:
+/// `(deref x)` (also installed as `db/deref`) — universal deref:
 ///   durable_ref → ephemeral read tx, return decoded value (nil
 ///                 if absent)
-///   var         → Var.root (raises :unbound-var if unbound, per
-///                 peer-AI turn 73 §Q1)
-///   atom        → current contained value (Phase 5 Item 1, peer-
-///                 AI turn 75; deref does NOT touch in_flight and
-///                 is allowed inside a swap! critical section)
+///   var         → Var.root (raises :unbound-var if unbound)
+///   atom        → current contained value (deref does NOT
+///                 touch in_flight and is allowed inside a swap!
+///                 critical section)
 ///   other       → :not-derefable (catchable)
 fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
@@ -2702,8 +2694,8 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
 /// `(apply f current args)` via vm.callValue, writes via putRef.
 /// Returns the new value.
 ///
-/// Per peer-AI turn 73 §Q2: if `f` throws or control transfers,
-/// do NOT write. Connection mismatch on `ref` surfaces as
+/// If `f` throws or control transfers, do NOT write.
+/// Connection mismatch on `ref` surfaces as
 /// :db/store-mismatch via db.zig's assertRefMatchesConn.
 // =============================================================================
 // scan + reduce-tree
@@ -2820,8 +2812,8 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     return vector_mod.fromSlice(vm.ensureHeap(), entries.items) catch VmError.OutOfMemory;
 }
 
-/// Phase 4.0f: predicate for snapshot Values. True if `x` is a
-/// read-tx handle that hasn't yet been released. Released
+/// Predicate for snapshot Values. True if `x` is a
+/// read-tx handle that has not been released. Released
 /// snapshots return false (mirrors Var.bound semantics).
 fn fnDbSnapshotQ(_: *VM, args: []const Value) VmError!Value {
     const v = args[0];
@@ -2848,7 +2840,7 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
         const decoded_v = try tc.decode(vm, kv);
         const key_id = interner.internKeyword(kv.key) catch return VmError.OutOfMemory;
         const key_v = value_mod.fromKeywordId(key_id);
-        // (f acc key value) — peer-AI turn 73 §Q6 shape.
+        // (f acc key value)
         const call_args = [_]Value{ acc, key_v, decoded_v };
         acc = try vm.callValue(f, &call_args);
         maybe_kv = tc.cursor.next();
@@ -2887,7 +2879,7 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Phase 5 Item 1 — atoms (peer-AI turn 75; see docs/ATOM.md)
+// Atoms (see docs/ATOM.md)
 // =============================================================================
 //
 // All six fns enforce identity-equality / identity-hash invariants
@@ -2965,12 +2957,11 @@ fn fnSwapValsBang(vm: *VM, args: []const Value) VmError!Value {
 
     const new_val = try vm.callValue(f, call_args);
 
-    // GC rooting note (peer-AI turn 75 Q9): the [old new] vector
-    // is built AFTER `setValue`. Under v1's explicit-only GC
-    // (docs/GC.md §9), `vector_mod.fromTwo`'s alloc cannot trigger
-    // collection, so `old` (a Zig local) stays alive trivially.
-    // When GC migrates to alloc-triggered (post-v1), this site is
-    // listed in docs/GC.md §11.5 audit checklist.
+    // GC rooting note: the [old new] vector is built AFTER
+    // `setValue`. The collector is explicit-only (docs/GC.md §9),
+    // so `vector_mod.fromTwo`'s alloc cannot trigger collection
+    // and `old` (a Zig local) stays alive trivially. This site is
+    // listed in the docs/GC.md §11.5 audit checklist.
     atom_mod.setValue(a, new_val);
     const pair_elems = [_]Value{ old, new_val };
     return vector_mod.fromSlice(vm.ensureHeap(), &pair_elems) catch return VmError.OutOfMemory;
@@ -2998,24 +2989,24 @@ fn fnCompareAndSetBang(_: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Phase 5 Item 2 sub-step 5.2a — core string ops (peer-AI turn 77)
+// Core string ops
 // =============================================================================
 //
-// `(str & xs)` is display-mode stringify+concat. Phase 5.2c
-// (peer-AI turn 81 §F1) split nil semantics: `format(.display, nil)`
-// writes "nil", so `str` / `join` / `spit` each wrap their element
-// path to convert nil → empty BEFORE delegating to the formatter.
+// `(str & xs)` is display-mode stringify+concat. Nil semantics
+// are split: `format(.display, nil)` writes "nil", so `str` /
+// `join` / `spit` each wrap their element path to convert
+// nil → empty BEFORE delegating to the formatter.
 //
-// GC rooting note (peer-AI turn 81 §D9 #4): str / pr-str allocate
-// the final heap string AFTER walking the args slice. The args
-// slice is held by `vm.invokeNative` for the duration of the call,
-// so input values stay reachable. Listed in `docs/GC.md` §11.5
-// audit checklist for the future triggered-GC migration.
+// GC rooting note: str / pr-str allocate the final heap string
+// AFTER walking the args slice. The args slice is held by
+// `vm.invokeNative` for the duration of the call, so input
+// values stay reachable. Listed in the `docs/GC.md` §11.5 audit
+// checklist.
 
 /// Append a single Value to `out` in `str`-semantics (display mode
 /// with `nil → empty` override). Used by `str`, `join`, and `spit`.
 /// `print`/`println`/`prn` do NOT go through this — they print
-/// `nil` as the literal `"nil"` per turn 81 §F1.
+/// `nil` as the literal `"nil"`.
 fn appendStrValue(
     allocator: std.mem.Allocator,
     w: *std.Io.Writer.Allocating,
@@ -3023,7 +3014,7 @@ fn appendStrValue(
     interner: ?*const intern_mod.Interner,
 ) VmError!void {
     _ = allocator;
-    if (v.kind() == .nil) return; // str/join/spit: nil → "" per turn 81.
+    if (v.kind() == .nil) return; // str/join/spit: nil → "".
     // `format_mod.Error = std.Io.Writer.Error || error{Utf8Error}` —
     // WriteFailed bubbles up from the Allocating writer's drain
     // when the backing allocator fails, so map it to OutOfMemory
@@ -3049,9 +3040,9 @@ fn fnStringQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(subs s start)` / `(subs s start end)` — substring by CODEPOINT
-/// indices (turn 77 §D3). Allocates a fresh heap string; future
-/// zero-copy subkind (subkind 2 reserved for emdb-mmap, NOT for
-/// in-heap slicing) is explicitly out of scope.
+/// indices. Allocates a fresh heap string; there is no zero-copy
+/// slice (subkind 2 is reserved for emdb-mmap, NOT for in-heap
+/// slicing).
 fn fnSubs(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
     if (s.kind() != .string) return VmError.KindMismatch;
@@ -3083,7 +3074,7 @@ fn fnSubs(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Phase 5 Item 2 sub-step 5.2b — nexis.string namespace (peer-AI turn 79)
+// nexis.string namespace
 // =============================================================================
 //
 // ASCII-only case conversion + trim; literal-string split / replace;
@@ -3100,9 +3091,9 @@ fn fnSubs(vm: *VM, args: []const Value) VmError!Value {
 //   :arity-mismatch         enforced by NativeFn descriptor
 //
 // GC rooting: each fn allocates output via string.fromBytes /
-// vector.fromSlice AFTER holding inputs in Zig locals. Under v1's
-// explicit-only GC this is structurally safe; documented in
-// docs/GC.md §11.5.
+// vector.fromSlice AFTER holding inputs in Zig locals. The
+// collector is explicit-only, so this is structurally safe;
+// documented in docs/GC.md §11.5.
 
 fn fnStringLowerCase(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
@@ -3129,7 +3120,7 @@ fn fnStringUpperCase(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `std.ascii.isWhitespace` recognizes the six ASCII whitespace
-/// characters: space, tab, LF, VT, FF, CR (turn 79 §D2). Inlined
+/// characters: space, tab, LF, VT, FF, CR. Inlined
 /// rather than calling so the fn is testable without Zig stdlib
 /// internals.
 inline fn isAsciiSpace(b: u8) bool {
@@ -3148,10 +3139,10 @@ fn fnStringTrim(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(nexis.string/split s delim)` — literal split, preserves
-/// trailing empties (turn 79 §D3 override of Clojure's regex
-/// trimming). Returns a vector.
+/// trailing empties (unlike Clojure's regex trimming). Returns
+/// a vector.
 ///   - Empty delimiter → :invalid-argument
-///   - Invalid UTF-8 in either arg → :utf8-error  (turn 80 §"Must-fix" #1)
+///   - Invalid UTF-8 in either arg → :utf8-error
 fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
     const delim = args[1];
@@ -3159,8 +3150,8 @@ fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
     const src = string_mod.asBytes(s);
     const sep = string_mod.asBytes(delim);
     if (sep.len == 0) return VmError.InvalidArgument;
-    // Phase 5.2b (peer-AI turn 80 §"Must-fix" #1): validate both
-    // arguments as UTF-8 before scanning. Storage is byte-blob
+    // Validate both arguments as UTF-8 before scanning. Storage
+    // is byte-blob
     // (STRING.md §2 invariant 4); without validation a delimiter
     // like a lone 0xC3 byte could match the first byte of a
     // multibyte codepoint and split mid-character, producing
@@ -3194,10 +3185,10 @@ fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(nexis.string/join coll)` / `(nexis.string/join sep coll)` —
 /// concatenate stringified elements, optionally separated.
-/// Elements stringify via `appendStrValue` (str-semantics: nil → "",
-/// per peer-AI turn 81 §F1) so `(join [1 nil 2]) → "12"` and
-/// `(join "," [1 nil 2]) → "1,,2"`. Map rejection per turn 79 §D4:
-/// CHAMP iteration order isn't pinned.
+/// Elements stringify via `appendStrValue` (str-semantics:
+/// nil → "") so `(join [1 nil 2]) → "12"` and
+/// `(join "," [1 nil 2]) → "1,,2"`. Maps are rejected: CHAMP
+/// iteration order isn't pinned.
 fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
     const sep_bytes: []const u8 = if (args.len == 2) blk: {
         if (args[0].kind() != .string) return VmError.KindMismatch;
@@ -3205,8 +3196,8 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
     } else &.{};
     const coll = if (args.len == 2) args[1] else args[0];
 
-    // Validate the collection kind up front (peer-AI turn 78 §"Must-fix":
-    // kind check fires before any other branch).
+    // Validate the collection kind up front (the kind check
+    // fires before any other branch).
     switch (coll.kind()) {
         .nil, .list, .persistent_vector, .persistent_set => {},
         else => return VmError.KindMismatch,
@@ -3259,9 +3250,9 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(nexis.string/replace s match replacement)` — literal,
-/// all-non-overlapping, left-to-right (turn 79 §D5).
+/// all-non-overlapping, left-to-right.
 ///   - Empty `match` → :invalid-argument
-///   - Invalid UTF-8 in any arg → :utf8-error  (turn 80 §"Must-fix" #1)
+///   - Invalid UTF-8 in any arg → :utf8-error
 /// After each match, cursor advances by `match.len` so
 /// `(replace "aaa" "aa" "x") → "xa"`.
 fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
@@ -3275,8 +3266,8 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
     const m = string_mod.asBytes(match);
     const r = string_mod.asBytes(replacement);
     if (m.len == 0) return VmError.InvalidArgument;
-    // Phase 5.2b (peer-AI turn 80 §"Must-fix" #1): validate all
-    // three byte slices as UTF-8 before scanning. Same rationale
+    // Validate all three byte slices as UTF-8 before scanning.
+    // Same rationale
     // as fnStringSplit — keep `nexis.string/*` semantically a
     // Unicode-string operation rather than a raw-byte one.
     if (!std.unicode.utf8ValidateSlice(src)) return VmError.Utf8Error;
@@ -3303,7 +3294,7 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Phase 5 Item 2 sub-step 5.2c — printing + I/O (peer-AI turn 81)
+// Printing + I/O
 // =============================================================================
 //
 // `print` / `println` / `prn` write to the VM's stdout (via
@@ -3313,7 +3304,7 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
 // leave `vm.io` null and these fns surface `:io-error` cleanly.
 // CLI bootstrap (`runFile` / `runRepl`) sets `vm.io = init.io`.
 //
-// Nil semantics (turn 81 §F1):
+// Nil semantics:
 //   - `print` / `println` / `prn`  treat `nil` arg as the literal
 //     `"nil"` because they use `format(.display, ...)` directly.
 //   - `pr-str` similarly. (Readable mode also writes `"nil"`.)
@@ -3324,8 +3315,8 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
 // `println` and `prn` append a trailing newline.
 
 /// Append a single Value to an Allocating buffer with optional
-/// leading separator. Peer-AI turn 82 §R2: the writer is an
-/// Allocating buffer; WriteFailed from it means the backing
+/// leading separator. The writer is an Allocating buffer;
+/// WriteFailed from it means the backing
 /// allocator failed → OutOfMemory (not IoError). Print fns that
 /// drain to stdout later map THAT failure to IoError separately.
 fn writeOneAndSep(
@@ -3423,7 +3414,7 @@ fn fnSlurp(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(spit path content)` — write `(str content)` to a file.
-/// Per peer-AI turn 81 §D5: `spit` does NOT auto-create parent
+/// `spit` does NOT auto-create parent
 /// directories (unlike `db/open`); missing parents surface as
 /// `:file-not-found` / `:io-error`. Content stringifies via the
 /// str-semantics wrapper (nil → empty).
@@ -3449,12 +3440,12 @@ fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Phase 5.3a — record internals (peer-AI turn 84; PROTOCOLS.md §4)
+// Record internals (PROTOCOLS.md §4)
 // =============================================================================
 //
 // Four internal helpers installed in `nexis.internal` (NOT auto-
-// referred). `defrecord` expansion emits qualified calls. v1
-// users don't touch these directly; they're macro-emit-only
+// referred). `defrecord` expansion emits qualified calls. Users
+// don't touch these directly; they're macro-emit-only
 // scaffolding.
 
 /// `(#%register-record-type "ns/name" [:field1 :field2 ...])`
@@ -3463,8 +3454,8 @@ fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
 /// Looks up the receiver VM's namespace registry to derive the
 /// effective ns prefix (the current namespace), then calls
 /// `vm.registerRecordType`. Re-defining a record type with the
-/// same (ns, name) raises `:record-redefinition` (peer-AI turn 84
-/// §3.1 — avoids stale type_id hazard).
+/// same (ns, name) raises `:record-redefinition` (avoids the
+/// stale type_id hazard).
 fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
     const full_name_v = args[0];
     const fields_vec = args[1];
@@ -3520,7 +3511,7 @@ fn fnRecordTypeId(_: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Phase 5.3b — protocol internals (peer-AI turn 84; PROTOCOLS.md §4.1)
+// Protocol internals (PROTOCOLS.md §4.1)
 // =============================================================================
 //
 // Two helpers installed in `nexis.internal` (alongside the
@@ -3593,10 +3584,9 @@ fn fnProtocolFn(vm: *VM, args: []const Value) VmError!Value {
 /// `(#%extend-record-impl protocol method-kw record-type-id impl-fn)`
 ///   → nil
 ///
-/// Phase 5.3c (peer-AI turn 84): wire an impl for a specific
-/// record type into the protocol registry. Used by `defrecord`'s
-/// inline protocol clauses + by `extend-protocol`/`extend-type`
-/// (5.3d) over record receivers.
+/// Wire an impl for a specific record type into the protocol
+/// registry. Used by `defrecord`'s inline protocol clauses + by
+/// `extend-protocol`/`extend-type` over record receivers.
 fn fnExtendRecordImpl(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .protocol) return VmError.KindMismatch;
     if (args[1].kind() != .keyword) return VmError.KindMismatch;
@@ -3620,11 +3610,11 @@ fn fnExtendRecordImpl(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Phase 5.3d — extend-protocol over built-in kinds + Any default + satisfies?
+// extend-protocol over built-in kinds + Any default + satisfies?
 // =============================================================================
 //
 // `extend-type` / `extend-protocol` macros (in expand.zig) emit
-// qualified calls to these helpers. v1 type-tag keywords match
+// qualified calls to these helpers. Type-tag keywords match
 // the `Kind` enum's tag names:
 //
 //   :nil :bool :char :fixnum :bignum :rational :keyword :symbol
@@ -3633,7 +3623,7 @@ fn fnExtendRecordImpl(vm: *VM, args: []const Value) VmError!Value {
 //   :native_fn :db_connection :db_write_txn :db_read_txn :atom
 //   :record :protocol :protocol_fn :var :durable_ref :error_object
 //
-// Plus the v1 friendly aliases:
+// Plus the friendly aliases:
 //   :vector → :persistent_vector
 //   :map    → :persistent_map
 //   :set    → :persistent_set
@@ -3691,7 +3681,7 @@ fn fnSatisfiesQ(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(false);
 }
 
-/// Phase 5.3d: map a friendly type-tag keyword name to a Kind
+/// Map a friendly type-tag keyword name to a Kind
 /// enum value. Friendly aliases (vector/map/set) are accepted
 /// alongside the canonical Kind enum names. Returns null for
 /// unknown names; the caller raises `:invalid-argument`.
@@ -3789,8 +3779,8 @@ fn appendSeqValues(vm: *VM, seq: Value, out: *std.ArrayList(Value)) VmError!void
 }
 
 /// Build a fresh cons list from a slice of Values (left-to-
-/// right). Uses `vm.ensureHeap()`. GC TODO: results aren't
-/// rooted between cons calls.
+/// right). Uses `vm.ensureHeap()`. Results aren't rooted
+/// between cons calls; `Heap.alloc` never collects (GC.md §9).
 fn buildListFromSlice(vm: *VM, items: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     var result = list_mod.empty(heap) catch return VmError.OutOfMemory;

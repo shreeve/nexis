@@ -1,12 +1,11 @@
 //! test/prop/codec.zig — randomized round-trip property tests for
-//! `src/codec.zig`. Closes PLAN §20.2 gate test #5 (codec round-trip).
+//! `src/codec.zig`. Covers PLAN §20.2 test #5 (codec round-trip).
 //!
 //! Properties (CODEC.md §7):
 //!
-//!   C1. **100k randomized Values round-trip** (GATE #5 RECEIPT
-//!       + GATE #1 PRIMARY RECEIPT — scaled 10k → 100k in commit
-//!       post-codec to satisfy PLAN §20.2 test #1 "100k+ randomized
-//!       equality/hash tests across all value kinds"): for every
+//!   C1. **100k randomized Values round-trip** (PLAN §20.2 test #5,
+//!       and test #1 "100k+ randomized equality/hash tests across
+//!       all value kinds"): for every
 //!       serializable kind, nested up to depth 4,
 //!       `dispatch.equal(v, decode(encode(v)))` AND
 //!       `dispatch.hashValue(v) == dispatch.hashValue(decode(encode(v)))`.
@@ -191,7 +190,7 @@ const TestCtx = struct {
 };
 
 // =============================================================================
-// C1. 10k randomized round-trip (GATE #5 RECEIPT)
+// C1. 10k randomized round-trip (PLAN §20.2 test #5)
 // =============================================================================
 
 /// Shared body for the C1 partitioned round-trip test. Each partition
@@ -221,7 +220,7 @@ fn runC1Partition(seed_offset: u64, trials: usize) !void {
 // C1 is partitioned into 10 × 10_000 sub-tests so each sub-test
 // completes within any reasonable per-test timeout (the Zig test
 // runner + build system kills individual tests that run too long).
-// Aggregate = 100,000 random trials, satisfying PLAN §20.2 gate
+// Aggregate = 100,000 random trials, satisfying PLAN §20.2
 // test #1 "100k+ randomized equality/hash tests across all value
 // kinds" — each trial encodes a random Value, decodes, and asserts
 // both structural equality AND hash preservation.
@@ -253,7 +252,7 @@ test "C1h: 10000 random Values round-trip (partition 8/10)" {
 test "C1i: 10000 random Values round-trip (partition 9/10)" {
     try runC1Partition(9, 10_000);
 }
-test "C1j: 10000 random Values round-trip (partition 10/10, closes GATE #1 aggregate to 100k)" {
+test "C1j: 10000 random Values round-trip (partition 10/10, 100k in aggregate)" {
     try runC1Partition(10, 10_000);
 }
 

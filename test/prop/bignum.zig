@@ -1,8 +1,7 @@
 //! test/prop/bignum.zig — randomized properties for the bignum heap kind.
 //!
-//! Primary purpose: retire the Phase 1 gate test #1 "fixnum↔bignum
-//! canonicalization" risk that peer-AI turn-3 flagged as a lurking
-//! semantic hotspot. Every test here stresses the canonicalization
+//! Primary purpose: cover PLAN §20.2 test #1, fixnum↔bignum
+//! canonicalization. Every test here stresses the canonicalization
 //! invariant: a bignum whose magnitude fits in i48 cannot exist, so
 //! two mathematically-equal integers are always represented by exactly
 //! one runtime kind/value form (BIGNUM.md §1).

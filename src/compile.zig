@@ -1,88 +1,95 @@
-//! compile.zig — Phase 2 tiny compiler (steps #2 + #3 + #4).
+//! compile.zig — the compiler: `reader.Form` → `Tiny` IR → bytecode.
 //!
-//! Authoritative spec: `docs/COMPILER.md` §10 #2-#4.
+//! Authoritative spec: `docs/COMPILER.md`.
 //!
-//! **Currently implemented**:
+//! **Pipeline**: `compileSourceWith` / `compileFormWith` macroexpand
+//! the form (`expand.zig`), lower it to a `Tiny` tree (`lowerForm`),
+//! and compile that tree with `compileTinyWithNamespace`. `Tiny` is
+//! the only IR; there is no separate Form → bytecode path.
 //!
-//!   - integer literal           →  `mov:load-const + call:return`
-//!   - boolean literal           →  `mov:load-true / mov:load-false + call:return`
-//!   - nil literal               →  `mov:load-nil + call:return`
-//!   - `(+ <expr> <expr>)`       →  recursive sub-expression lowering;
-//!                                  literal-pair peephole emits direct
-//!                                  `math:add c, c` per peer-AI turn 33
+//! **Forms lowered**:
+//!
+//!   - nil / bool / int literals →  `mov:load-nil` / `mov:load-true` /
+//!                                  `mov:load-false` / `mov:load-const`
+//!   - keywords, strings, floats, chars, quoted symbols
+//!                               →  `Tiny.literal` (a const-pool Value;
+//!                                  keywords and symbols need an
+//!                                  Interner, strings a Heap)
+//!   - `(+ a b)` / `(< a b)`     →  `math:add` / `cmp:lt`; a literal-
+//!                                  pair peephole emits constant
+//!                                  operands directly. These are the
+//!                                  only inlined intrinsics, and only
+//!                                  when not lexically shadowed
 //!   - `(if <test> <then> <else?>)` → `jump:if-false` over then,
 //!                                  unconditional `jump:jmp` past else,
-//!                                  with simple PC back-patching per
-//!                                  peer-AI turn 36; absent else branch
-//!                                  synthesizes nil
-//!   - **`<symbol>`**             →  resolves to a lexical local in the
-//!                                  Emitter's scope stack; emits
-//!                                  `mov:move dst, slot[N]` (no-op when
-//!                                  source slot already equals dst)
-//!   - **`(let* [n1 v1, ...] body)`** → strict left-of-self-visibility
+//!                                  with PC back-patching; an absent
+//!                                  else branch synthesizes nil
+//!   - `<symbol>`                →  lexical local, captured upvalue, or
+//!                                  namespace Var, in that order
+//!                                  (COMPILER.md §4.3)
+//!   - `ns/name`                 →  exact lookup through the namespace
+//!                                  registry (aliases honored)
+//!   - `(let* [n1 v1, ...] body)` → strict left-of-self-visibility
 //!                                  per COMPILER.md §4.3 (binding-i's
 //!                                  RHS sees bindings 1..i-1 only);
 //!                                  `defer scope.shrinkRetainingCapacity(mark)`
 //!                                  pops bindings on let-body exit
-//!   - **`(do e1 e2 ... eN)`**    →  empty → nil; one-expr → compile
+//!   - `(do e1 e2 ... eN)`       →  empty → nil; one-expr → compile
 //!                                  to dst; multi-expr → all non-last
-//!                                  to a SHARED discard slot (peer-AI
-//!                                  turn 38: avoids 999-slot blowup
-//!                                  for `(do e1 ... e1000)`), last
+//!                                  to a SHARED discard slot, last
 //!                                  to dst
+//!   - `(fn* name? [params & rest?] body)` → child routine +
+//!                                  `closure:make`; captures are
+//!                                  pre-analyzed and boxed in
+//!                                  straight-line prelude code
+//!   - `(letfn* ...)`, `(loop* ...)`, `(recur ...)`, `(def ...)`,
+//!     `(defn ...)`, `(var name)`
+//!   - `(try body (catch any e handler) (finally ...)?)`, `(throw v)`
+//!   - `#%list` / `#%concat` / `#%vector` / `#%map` / `#%set` and bare
+//!     `[...]` / `{...}` / `#{...}` literals → `coll:*` opcodes
 //!
-//! **Architecture**: destination-driven internal lowering per peer-AI
-//! turn 36. The public entry point `compileTiny()` returns a
-//! `Compiled` artifact ready for `vm.VM.init`. Internally, an
-//! `Emitter` accumulates code + consts + slot_count, and each form's
-//! `compileExpr(emitter, form, dst)` lowers to write its result into
-//! the caller-chosen destination slot. This is the right shape for
-//! `if`-arms targeting a shared dst, and it's what step #4 (`let*`)
-//! will continue building on.
+//! **Architecture**: destination-driven lowering. An `Emitter`
+//! accumulates code + consts + slot_count, and each form's
+//! `compileExpr(emitter, form, dst, recur_target)` writes its result
+//! into the caller-chosen destination slot, so `if`-arms target a
+//! shared dst.
 //!
-//! **What's deferred**:
-//!   - Real `reader.Form` input. `Tiny` is the bootstrap shape;
-//!     replacement happens with the macroexpander commit (step #8)
-//!     or the resolver commit (step #7), whichever exposes the
-//!     analyzer-output IR first.
-//!   - Variadic `+` (`(+ a b c d)` reducing to chained adds).
-//!   - Other arithmetic primitives (`-`, `*`, `/`, etc.).
-//!   - Slot lifetime analysis / liveness-based reuse. The current
-//!     allocator is monotonic: each fresh result slot bumps
-//!     `slot_count`. Branch-local temps are not reclaimed across
-//!     the merge point (acceptable per peer-AI turn 36).
-//!   - Conditionals, function definitions, closures, `recur`,
-//!     namespaces, macros — all per `COMPILER.md` §10 #4-#11.
+//! **Limits**:
+//!   - The slot allocator is monotonic: each fresh result slot bumps
+//!     `slot_count`; branch-local temps are not reclaimed across the
+//!     merge point. Constants are not deduplicated.
+//!   - `recur` targeting a variadic fn raises `UnsupportedFeature`.
+//!   - The only catch matcher is `any`; a catch binding captured by
+//!     an inner fn raises `UnsupportedFeature`.
+//!   - `letfn*` bindings have no rest param (`UnsupportedFeature`).
+//!   - Var-level shadowing of `+` / `<` does not defeat inlining;
+//!     only lexical shadowing does.
 
 const std = @import("std");
 const vm = @import("vm");
 const value_mod = @import("value");
-/// Step 5e (tests only): inspect rest-list results in variadic
-/// fn tests. The compiler itself doesn't depend on list — the
-/// VM constructs rest lists at call time per VM.md §6.
+/// Tests only: inspect rest-list results in variadic fn tests.
+/// The compiler itself doesn't depend on list — the VM
+/// constructs rest lists at call time per VM.md §6.
 const list_mod = @import("list");
-/// Step #7a: consume reader.Form trees as compiler input. The
-/// `lowerForm` function translates Form → Tiny (the existing IR);
-/// the backend stays unchanged (peer-AI turn 51 — Tiny is the IR,
-/// not a parallel codegen path).
+/// Compiler input. `lowerForm` translates a reader.Form tree
+/// into `Tiny`; the backend compiles `Tiny` only (there is no
+/// parallel Form → bytecode path).
 const reader_mod = @import("reader");
-/// Step E1: Interner for quoted symbols/keywords during Form
-/// lowering. The compile-side `lowerQuotePayload` interns
-/// symbols/keywords through the VM's shared Interner so identity
-/// is stable across compile + runtime + (post-#8) macroexpand.
+/// Interner for quoted symbols/keywords during Form lowering.
+/// `lowerQuotePayload` interns symbols/keywords through the
+/// VM's shared Interner so identity is stable across compile,
+/// runtime and macroexpand.
 const intern_mod = @import("intern");
-/// Step #8a: Form → Form expander (was expand_mod;
-/// renamed in turn 63 since the module does more than
-/// macros — syntax-quote, anon-fn, #%list/#%concat/#%vector
-/// dispatch all live here). Optional — if a `*HostMacroTable`
-/// is passed to `compileFormFull` / `compileSourceFull`, the
-/// form is expanded BEFORE lowering. With null, no expansion
-/// fires (existing behavior preserved).
+/// Form → Form expander: macros, syntax-quote, anon-fn, and the
+/// #%list/#%concat/#%vector dispatch all live there. Expansion
+/// runs BEFORE lowering whenever `compileFormWith` is given an
+/// Interner; without one, no expansion fires.
 const expand_mod = @import("expand");
-/// Phase 5.2a (peer-AI turn 77): Form-lowering allocates string-
-/// literal Values into a stable Heap so `Tiny.literal` can carry
-/// them across compile → run. `LowerCtx.heap` is the optional
-/// heap; when null, `.string` Forms still defer as before.
+/// Form lowering allocates string-literal Values into a stable
+/// Heap so `Tiny.literal` can carry them across compile → run.
+/// `LowerCtx.heap` is the optional heap; when null, `.string`
+/// Forms raise `UnsupportedFeature`.
 const heap_mod = @import("heap");
 const string_mod = @import("string");
 
@@ -92,12 +99,11 @@ pub const Operand = vm.Operand;
 pub const Value = value_mod.Value;
 
 // =============================================================================
-// Tiny — the input AST for this commit's compiler.
+// Tiny — the compiler's IR.
 //
-// Recursive shape per peer-AI turn 36. Step #3 added `nil`, `bool`,
-// `if_`, and made `add`'s operands recursive. Sub-expressions are
-// pointers (the compile-time arena owns them). Hand-construction in
-// tests uses `&Tiny{ ... }` literals.
+// Recursive shape: sub-expressions are pointers (the compile-time
+// arena owns them). Hand-construction in tests uses `&Tiny{ ... }`
+// literals.
 // =============================================================================
 
 pub const Tiny = union(enum) {
@@ -106,19 +112,16 @@ pub const Tiny = union(enum) {
     /// boolean literal (true / false).
     bool: bool,
     /// Integer literal. Must fit in i48 fixnum range; otherwise
-    /// `IntegerOutOfFixnumRange` (bignum literal lifting lands
-    /// with bignum Scope B).
+    /// `IntegerOutOfFixnumRange` (there is no bignum literal
+    /// lifting).
     int: i64,
-    /// Reference to a lexically-bound local (step #4). Resolution
-    /// walks the Emitter's scope stack innermost-first; unresolved
-    /// names raise `CompileError.UnresolvedSymbol`. When step #5
-    /// adds closures + step #7 adds vars, this lookup falls
-    /// through to capture analysis / Var resolution per
-    /// COMPILER.md §4.3 priority list. For step #4, locals are
-    /// the only resolution category that exists.
+    /// Reference to a lexically-bound local, a captured upvalue,
+    /// or a namespace Var. Resolution walks the Emitter's scope
+    /// stack innermost-first, then the parent chain (capture),
+    /// then the namespace, per the COMPILER.md §4.3 priority
+    /// list; unresolved names raise `CompileError.UnresolvedSymbol`.
     symbol: []const u8,
-    /// Phase 3.4 (peer-AI turn 69): namespace-qualified symbol
-    /// `prefix/name`. Resolves DIRECTLY through the namespace
+    /// Namespace-qualified symbol `prefix/name`. Resolves DIRECTLY through the namespace
     /// registry — lexical scope is NOT consulted. The compiler
     /// looks up `prefix` as a registered namespace name, then
     /// fetches `name` from that namespace's local vars (NOT
@@ -126,15 +129,13 @@ pub const Tiny = union(enum) {
     /// Missing ns / missing var both surface as UnresolvedSymbol
     /// at compile time.
     qualified_symbol: struct { ns: []const u8, name: []const u8 },
-    /// Step E1 (pre-#8 macroexpander prereq, peer-AI turn 55):
-    /// generic literal Value constant. Used by `lowerQuotePayload`
+    /// Generic literal Value constant. Used by `lowerQuotePayload`
     /// for quoted symbols/keywords (which become symbol/keyword
-    /// Values via the VM's Interner). Eventually (step #8 macro-
-    /// expander output) for quoted compound collections too.
+    /// Values via the VM's Interner) and by Form lowering for
+    /// keywords, strings, floats and chars.
     ///
-    /// Quoted nil/bool/int still go through the existing Tiny
-    /// variants (peer-AI turn 53 §Q1) — they're cheaper than
-    /// const-pool entries.
+    /// Quoted nil/bool/int go through the plain Tiny variants —
+    /// they're cheaper than const-pool entries.
     ///
     /// **Lifetime constraint**: the Value must be stable for the
     /// lifetime of the Compiled artifact. Interned symbols/
@@ -142,51 +143,50 @@ pub const Tiny = union(enum) {
     /// VM run). Heap-backed Values from arbitrary sources do NOT
     /// — only use `Tiny.literal` for Values with stable identity.
     literal: value_mod.Value,
-    /// Step #8c.1 (peer-AI turn 58): runtime list construction
-    /// from N evaluated subexpressions. The IR representation
-    /// of the internal `#%list` special form emitted by the
-    /// syntax-quote walker (#8c.2) AND by `lowerQuotePayload`
+    /// Runtime list construction from N evaluated subexpressions.
+    /// The IR representation of the internal `#%list` special
+    /// form emitted by the syntax-quote walker AND by `lowerQuotePayload`
     /// when the quoted payload is a compound list. Each item
     /// is recursively compiled into a contiguous slot block;
     /// the backend emits a single `coll:list` opcode.
     list_construct: []const *const Tiny,
-    /// Step #8c.1: runtime list concatenation. The IR
+    /// Runtime list concatenation. The IR
     /// representation of `#%concat`. Each arg must evaluate
     /// to a list at runtime (KindMismatch trap otherwise);
     /// result is the left-to-right concatenation.
     concat: []const *const Tiny,
-    /// Step #8c.3: runtime vector construction. IR for the
+    /// Runtime vector construction. IR for the
     /// `#%vector` special form emitted by syntax-quote and by
     /// `lowerQuotePayload` for vector payloads. Same block-
     /// allocation pattern as `list_construct`; backend emits
     /// `coll:vector`.
     vector_construct: []const *const Tiny,
-    /// Phase 3.1: runtime map construction. IR for the
+    /// Runtime map construction. IR for the
     /// `#%map` special form + bare `{...}` literals. Items
     /// are flat k,v,k,v,... pairs (length MUST be even at
     /// build time — compiler guarantees this). Backend emits
     /// `coll:map`; duplicate keys overwrite earlier (Clojure
     /// semantics).
     map_construct: []const *const Tiny,
-    /// Phase 3.1: runtime set construction. IR for `#%set`
+    /// Runtime set construction. IR for `#%set`
     /// + bare `#{...}` literals. Duplicates collapse at
     /// runtime via `champ.setConj`.
     set_construct: []const *const Tiny,
-    /// Step #9.1 (peer-AI turn 59): try / catch. v1 = catch-any
-    /// only; finally and other type matchers deferred to #9.2/
-    /// later. body and handler are each implicit-do; binding is
-    /// the catch's name (always present in v1 since catch-any
-    /// is the only matcher).
+    /// `try` / `catch` / `finally`. The only catch matcher is
+    /// `any` and the catch clause is mandatory; `finally` is
+    /// optional. body, handler and finally are each implicit-do;
+    /// binding is the catch's name.
     try_: struct {
         body: *const Tiny,
-        /// catch binding name. Must be present for v1 since
-        /// catch is mandatory (finally-only forms land in #9.2).
+        /// catch binding name. Always present since catch is
+        /// mandatory.
         binding: []const u8,
         handler: *const Tiny,
-        /// Reserved for #9.2.
+        /// Optional finally body; sees the OUTER lexical scope,
+        /// not the catch binding.
         finally_: ?*const Tiny = null,
     },
-    /// Step #9.1: `(throw value)`. Compiles the value to a
+    /// `(throw value)`. Compiles the value to a
     /// slot then emits `ctrl:throw <slot>`. Backend never
     /// returns from this opcode (it either jumps to a catch
     /// PC or raises VmError.UncaughtThrow).
@@ -196,9 +196,8 @@ pub const Tiny = union(enum) {
         lhs: *const Tiny,
         rhs: *const Tiny,
     },
-    /// `(< lhs rhs)` — fixnum less-than. Step 5d0: needed to write
-    /// terminating loop tests for `recur` / `loop*`. Lowers to
-    /// `cmp:lt` per VM.md §10 group #1.
+    /// `(< lhs rhs)` — fixnum less-than. Lowers to `cmp:lt` per
+    /// VM.md §10.
     lt: struct {
         lhs: *const Tiny,
         rhs: *const Tiny,
@@ -227,7 +226,7 @@ pub const Tiny = union(enum) {
     /// body that needs multiple expressions wraps them in `do_`.
     do_: []const *const Tiny,
     /// `(fn* name? [params...] body)` per PLAN §6.1.
-    /// `name` is the optional self-name (step 5c); when present,
+    /// `name` is the optional self-name; when present,
     /// the body can reference itself recursively (e.g.,
     /// `(fn* fact [n] ... (fact ...))`). Implementation uses
     /// the placeholder-cell pattern: parent emits
@@ -238,27 +237,26 @@ pub const Tiny = union(enum) {
     fn_star: struct {
         name: ?[]const u8 = null,
         params: []const []const u8,
-        /// Step 5e (peer-AI turn 49): `(fn* [a b & r] body)`
-        /// has `params = ["a","b"]` and `rest_param = "r"`.
-        /// `rest_param` is bound at slot `params.len`. At call
-        /// time, the VM packs excess args into a list and
-        /// installs it in that slot. `null` means fixed-arity.
-        /// Tiny avoids encoding `&` as a fake symbol; reader-
-        /// form integration (step #7) parses `[a b & r]` into
-        /// this explicit shape.
+        /// `(fn* [a b & r] body)` has `params = ["a","b"]` and
+        /// `rest_param = "r"`. `rest_param` is bound at slot
+        /// `params.len`. At call time, the VM packs excess args
+        /// into a list and installs it in that slot. `null` means
+        /// fixed-arity. Tiny avoids encoding `&` as a fake symbol;
+        /// `parseParams` parses `[a b & r]` into this explicit
+        /// shape.
         rest_param: ?[]const u8 = null,
         body: *const Tiny,
     },
     /// `(callee args...)` — function invocation. Lowers to the
     /// range-call ABI per VM.md §6: stage callee + args in a
-    /// contiguous call block, emit `call:call`. Step 5a1 calls
-    /// any closure value (no captures yet).
+    /// contiguous call block, emit `call:call`. The callee may be
+    /// any expression evaluating to a closure.
     call: struct {
         callee: *const Tiny,
         args: []const *const Tiny,
     },
     /// `(loop* [name1 v1 name2 v2 ...] body)` per PLAN §6.1 +
-    /// COMPILER.md §5.7. Step 5d1.
+    /// COMPILER.md §5.7.
     /// Same as `let*` for binding setup (sequential RHS
     /// visibility, captured-binding cells); the loop body
     /// installs a `RecurTarget` so `(recur args...)` inside the
@@ -268,8 +266,8 @@ pub const Tiny = union(enum) {
         body: *const Tiny,
     },
     /// `(recur arg1 arg2 ...)` per PLAN §6.1 + COMPILER.md §5.6.
-    /// Step 5d1. Re-enters the nearest enclosing `loop*` or
-    /// `fn*` (5d2) with the given arguments. Must be in tail
+    /// Re-enters the nearest enclosing `loop*` or `fn*` with the
+    /// given arguments. Must be in tail
     /// position; arity must match the target's binding count.
     /// Lowers to a parallel-assignment move (via temp slots)
     /// into the target's binding slots + `jump:jmp` to the
@@ -278,7 +276,7 @@ pub const Tiny = union(enum) {
     recur: struct {
         args: []const *const Tiny,
     },
-    /// `(def name value?)` per PLAN §6.1. Step #6b.
+    /// `(def name value?)` per PLAN §6.1.
     /// Interns a Var in the namespace (or finds the existing
     /// one), sets its root + bound, returns the Var object
     /// (Clojure semantics: `(def x 5)` evaluates to `#'x`, not
@@ -295,18 +293,18 @@ pub const Tiny = union(enum) {
         name: []const u8,
         value: ?*const Tiny = null,
     },
-    /// `(var name)` per PLAN §6.1. Step #6b. Loads the Var
+    /// `(var name)` per PLAN §6.1. Loads the Var
     /// object itself (not its value) — Clojure's `#'name`
     /// reader form. Does NOT trap on unbound; taking a
     /// reference to a declared-but-unbound Var is legal.
     var_ref: struct {
         name: []const u8,
     },
-    /// `(defn name [params...] body)` per PLAN §6.1. Step #6c.
+    /// `(defn name [params...] body)` per PLAN §6.1.
     /// Sugar for `(def name (fn* name [params...] body))` —
     /// the function carries its own name as the self-name (so
     /// the body can recurse via the lexical name without going
-    /// through the Var, just like step 5c's named-fn*). The
+    /// through the Var, just like a named `fn*`). The
     /// Var binding makes the function reachable from outside
     /// the form. Together: forward references between defns
     /// work because each `defn` interns its Var (possibly
@@ -319,7 +317,7 @@ pub const Tiny = union(enum) {
         body: *const Tiny,
     },
     /// `(letfn* [(name1 params1 body1) (name2 params2 body2) ...] body)`
-    /// per PLAN §6.1 + COMPILER.md §5.6b. Step 5c.
+    /// per PLAN §6.1 + COMPILER.md §5.6b.
     /// Mutually-recursive function bindings: each fn body can
     /// reference any other letfn* binding, including itself.
     /// Implementation uses placeholder cells (one per binding),
@@ -347,11 +345,9 @@ pub const Binding = struct {
 };
 
 /// How a lexical binding is realized in the current routine's
-/// frame (peer-AI turn 40 / 42 lazy-boxing). Step 5b widens
-/// `LocalBinding.ref` from a bare `u12` slot to this union so
-/// that captured bindings can mutate from `.direct_slot` to
-/// `.cell_slot` mid-compilation when an inner closure first
-/// captures them.
+/// frame. A binding that capture pre-analysis marks as captured
+/// is boxed in prelude code and pushed as `.cell_slot`; every
+/// other binding is `.direct_slot`.
 ///
 /// Same-frame read dispatch (in `compileSymbol`):
 ///   .direct_slot(s)  → emit `mov:move dst, slot(s)`
@@ -363,8 +359,8 @@ pub const BindingRef = union(enum) {
     /// `slot[s]`. Most bindings stay here.
     direct_slot: u12,
     /// Slot holds a `*UpvalCell` (boxed); binding's value lives
-    /// inside the cell. Transitions from `direct_slot` happen
-    /// lazily on first capture per COMPILER.md §6.1.
+    /// inside the cell. Chosen at binding time when pre-analysis
+    /// finds a descendant fn capturing the name (COMPILER.md §6.1).
     cell_slot: u12,
     /// Binding is an inherited upvalue of the current routine,
     /// at the given index in `frame.upvalues`. Reads via U
@@ -378,8 +374,7 @@ pub const LocalBinding = struct {
     ref: BindingRef,
 };
 
-/// Routine-level capture cache entry (peer-AI turn 45). Maps
-/// a captured name to its upvalue index, so repeat references
+/// Routine-level capture cache entry. Maps a captured name to its upvalue index, so repeat references
 /// to the same outer name from different lexical scopes share
 /// a single upvalue/descriptor entry.
 pub const CapturedName = struct {
@@ -388,8 +383,7 @@ pub const CapturedName = struct {
 };
 
 /// Where `(recur args...)` should jump and which slots it
-/// rebinds. Threaded through `compileExpr` in tail position
-/// (peer-AI turn 47).
+/// rebinds. Threaded through `compileExpr` in tail position.
 ///
 /// Lifetime: the struct (and the slices it points to) is owned
 /// by whichever compile* function established the target —
@@ -408,20 +402,19 @@ pub const RecurTarget = struct {
     entry_pc: u12,
     binding_slots: []const u12,
     /// Per-binding flag: true iff binding's slot holds a
-    /// `*UpvalCell` (was pre-analyzed as captured by a
-    /// descendant fn). `compileRecur` reads this to decide
+    /// `*UpvalCell` (pre-analysis found a descendant fn
+    /// capturing it). `compileRecur` reads this to decide
     /// between fresh-cell-install (captured) and plain
     /// `mov:move` (direct) for each binding (per VM.md §11
     /// + COMPILER.md §5.6 captured-recur semantics).
     captured_mask: []const bool,
     kind: RecurTargetKind,
-    /// Step 5e: true iff this fn target belongs to a variadic
-    /// fn. `compileRecur` rejects any recur targeting a
-    /// variadic fn with `UnsupportedFeature` for v1 — proper
-    /// variadic recur (rebuild rest list per iteration) is a
-    /// separate sub-step (peer-AI turn 49: "decide before
-    /// coding; implement explicitly or reject explicitly").
-    /// Always false for loop targets (loops never variadic).
+    /// True iff this fn target belongs to a variadic fn.
+    /// `compileRecur` rejects any recur targeting a variadic fn
+    /// with `UnsupportedFeature` (variadic recur would have to
+    /// rebuild the rest list per iteration; it is rejected
+    /// explicitly rather than lowered wrongly). Always false for
+    /// loop targets (loops never variadic).
     variadic: bool = false,
 };
 
@@ -433,48 +426,43 @@ pub const RecurTargetKind = enum { loop_star, fn_star };
 
 pub const CompileError = error{
     /// Compiler encountered a `Tiny` variant it doesn't know how to
-    /// lower. Reserved for when `Tiny` is replaced by `reader.Form`
-    /// in a later step, where arbitrary forms can arrive.
+    /// lower. No `Tiny` variant raises it; `compileExpr` handles
+    /// every variant.
     UnsupportedForm,
 
-    /// Integer literal exceeds i48 fixnum range. Until bignum
-    /// arithmetic Scope B lands and the codegen learns to lift
-    /// out-of-range literals into bignum heap values, this is a
+    /// Integer literal exceeds i48 fixnum range. Out-of-range
+    /// literals are not lifted into bignum heap values; this is a
     /// hard compile-time error.
     IntegerOutOfFixnumRange,
 
     /// Routine has more constants than the 12-bit constant-pool
-    /// operand can address (4096). Extension instructions can
-    /// resolve this in a later commit; until then, it's a hard
-    /// error.
+    /// operand can address (4096). Hard error; there are no
+    /// extension instructions.
     ConstantPoolOverflow,
 
     /// Routine has more bytecode than the 12-bit jump target
-    /// operand can address (4096). Extension instructions can
-    /// resolve this; until then, hard error.
+    /// operand can address (4096). Hard error.
     JumpTargetOutOfRange,
 
     /// Routine has more slots than the 12-bit slot operand can
     /// address (4096).
     SlotOverflow,
 
-    /// Symbol reference doesn't resolve to a lexical local in
-    /// the current scope. Step #4: the only resolution category
-    /// is locals; once vars (step #7) and captured upvalues
-    /// (step #5) land, this error indicates the symbol resolves
-    /// to NONE of (local, upvalue, var, special-form, core-mapping)
-    /// — per COMPILER.md §4.3 rule #8.
+    /// Symbol reference resolves to NONE of (local, upvalue,
+    /// var, special-form, core-mapping) — per COMPILER.md §4.3.
+    /// Without a namespace, anything that is not a local or an
+    /// upvalue raises this.
     UnresolvedSymbol,
 
     /// Two parameter slots in the same `fn*` carry the same
-    /// name. Per peer-AI turn 40 / Clojure semantics: not
-    /// allowed (unlike `let*` where sequential bindings can
-    /// shadow within the same form per COMPILER.md §4.3).
+    /// name. Clojure semantics: not allowed (unlike `let*` where
+    /// sequential bindings can shadow within the same form per
+    /// COMPILER.md §4.3).
     DuplicateParam,
 
     /// Two bindings in the same `letfn*` group carry the same
-    /// name. Step 5c: unlike `let*` (sequential shadowing
-    /// allowed), `letfn*` names are mutually visible — duplicates
+    /// name. Unlike `let*` (sequential shadowing allowed),
+    /// `letfn*` names are mutually visible — duplicates
     /// create resolution ambiguity. Matches Clojure
     /// (`letfn` rejects duplicate names).
     DuplicateBinding,
@@ -483,66 +471,63 @@ pub const CompileError = error{
     /// position of an enclosing `loop*` or `fn*` body. Per
     /// PLAN §11.3 + VM.md §11 + COMPILER.md §5.6: `recur` MUST
     /// be in tail position to preserve the constant-stack
-    /// guarantee. Step 5d1.
+    /// guarantee.
     RecurOutsideTail,
 
     /// `(recur ...)` has a different argument count than the
     /// target's binding count. Per VM.md §11 + COMPILER.md
     /// §5.6. Caught at compile time (no runtime arity
-    /// revalidation — recur is not a call opcode). Step 5d1.
+    /// revalidation — recur is not a call opcode).
     RecurArityMismatch,
 
-    /// A feature is recognized but intentionally not wired in
-    /// the current step. Step 5e: emitted for `(recur ...)`
-    /// targeting a variadic fn (per peer-AI turn 49 — proper
-    /// variadic recur requires rebuilding the rest list per
-    /// iteration; deferred to a separate sub-step). Step #7a:
-    /// also used for `reader.Form` datums that lower in later
-    /// step-#7 sub-steps (lists, vectors, maps, sets, quote,
-    /// syntax-quote, `#(...)`, `^{...}` metadata, qualified
-    /// symbols). Trapping loudly is better than emitting
-    /// subtly-wrong code.
+    /// A feature is recognized but not lowered. Raised for
+    /// `(recur ...)` targeting a variadic fn, a non-`any` catch
+    /// matcher, a catch binding captured by an inner fn, a
+    /// `letfn*` binding with a rest param, quoted symbols /
+    /// keywords / strings without an Interner or Heap, and
+    /// `reader.Form` datums that only the expander consumes
+    /// (syntax-quote, unquote, `#(...)`, `@x`, `^{...}`
+    /// metadata) reaching the lowerer. Trapping loudly is better
+    /// than emitting subtly-wrong code.
     UnsupportedFeature,
 
     /// The parser or reader rejected the source string while
     /// compiling via `compileSource` / `compileSourceWithNamespace`.
-    /// Step #7a: bucketed error wrapping any inferred error from
-    /// `parser.parseForm` / `reader.readOneForm`. Step #10
-    /// (error reporting hardening) will replace this with
-    /// structured errors carrying SrcSpan + the original reader
-    /// ErrorKind.
+    /// Bucketed error wrapping any error from `parser.parseForm`
+    /// / `reader.readOneForm`; the reader's own ErrorKind is not
+    /// carried through.
     ReaderFailure,
 
     /// A list form (call or special form) has the wrong shape.
-    /// Step #7b: emitted for malformed `(if)`, `(quote)`,
+    /// Emitted for malformed `(if)`, `(quote)`,
     /// `(let* ...)` without a binding vector, etc. Covers
     /// arity and structural errors that the reader accepted
     /// as syntactically valid lists but the compiler rejects
     /// as semantically malformed.
     MalformedForm,
 
-    /// Step #8a: macroexpansion exceeded the depth limit (256
-    /// per MACROEXPAND.md §6). Almost always an infinite macro
+    /// Macroexpansion exceeded the depth limit (256 per
+    /// MACROEXPAND.md §6). Almost always an infinite macro
     /// loop. Distinct from `MacroExpansionFailure` because
     /// users debugging macros want this signaled clearly.
     MacroDepthExceeded,
 
-    /// Step #8a: bucket for all other macroexpand errors —
-    /// malformed macro call, macro returned a non-Form, etc.
-    /// Step #10 splits these out with original variant +
-    /// SrcSpan preservation.
+    /// Bucket for all other macroexpand errors — malformed
+    /// macro call, macro returned a non-Form, etc. The original
+    /// variant is not carried through; `out_span` carries the
+    /// form's span.
     MacroExpansionFailure,
 
     /// A position required a symbol but got something else
     /// (e.g., `(let* [1 2] body)` — binding name `1` is not
     /// a symbol; `(def 42 ...)` — def name `42` is not a
-    /// symbol). Step #7b/#7c.
+    /// symbol).
     ExpectedSymbol,
 
     /// A position required a vector but got something else
     /// (e.g., `(let* (x 1) body)` — binding spec is a list,
     /// not a vector; `(fn* (x) body)` — param spec is a
-    /// list, not a vector). Step #7c.
+    /// list, not a vector).
     ExpectedVector,
 
     /// A compiler invariant was violated. Distinct from a
@@ -551,7 +536,7 @@ pub const CompileError = error{
     /// `resolveOrCapture` got back `.direct_slot` for a name
     /// that pre-analysis should have boxed). Surfaces in
     /// release builds as a clean error rather than panicking;
-    /// debug builds also assert (peer-AI turn 45).
+    /// debug builds also assert.
     InternalCompilerBug,
 
     OutOfMemory,
@@ -562,33 +547,28 @@ pub const CompileError = error{
 // =============================================================================
 
 /// The compiler's product. Wrap with `toRoutine(name)` to get a
-/// `vm.Routine` ready for `vm.VM.init`. Step 5a1 added
-/// `capture_descs` to support `closure:make` lowering and
-/// `arity` for call-site validation.
+/// `vm.Routine` ready for `vm.VM.init`. `capture_descs` supports
+/// `closure:make` lowering and `fixed_arity` call-site validation.
 ///
 /// **Ownership**: `code` and `consts` are slices allocated through
 /// the allocator passed to `compileTiny()` and remain valid until
 /// that allocator is reset or destroyed. There is no `deinit`
 /// method — the model is "compile-time arena, drop wholesale after
 /// execution." Callers using a non-arena allocator must free
-/// `code` and `consts` individually. (When step #5's runtime
-/// function heap kind lands, the lifecycle target is `Compiled` →
-/// heap-Value-of-kind-function via deep-copy; that conversion is
-/// deferred until the heap fn-kind is real.)
+/// `code` and `consts` individually.
 pub const Compiled = struct {
     code: []const Inst,
     consts: []const vm.Const,
     capture_descs: []const vm.CaptureDescriptor = &.{},
-    /// Step #6b: per-routine Var table. The V operand index
+    /// Per-routine Var table. The V operand index
     /// resolves through this table at runtime. Lifetime: same
     /// as the rest of the Compiled (compile-arena-owned).
     var_table: []const *vm.Var = &.{},
     slot_count: u16,
     /// Top-level Compiled has fixed_arity 0; child routines built
     /// by `compileFn` set this to their fixed parameter count.
-    /// (Renamed from `arity` in step 5e0.)
     fixed_arity: u16 = 0,
-    /// Step 5e: true for `(fn* [a b & r] ...)`. The VM packs
+    /// True for `(fn* [a b & r] ...)`. The VM packs
     /// excess args into a list at call time.
     variadic: bool = false,
 
@@ -608,7 +588,7 @@ pub const Compiled = struct {
 };
 
 // =============================================================================
-// Emitter — internal mutable accumulator (peer-AI turn 36)
+// Emitter — internal mutable accumulator
 // =============================================================================
 
 /// `Emitter` accumulates a routine's bytecode, constants, slot
@@ -617,30 +597,21 @@ pub const Compiled = struct {
 /// at the end via `finish()`.
 ///
 /// **Slot allocation**: monotonic — each `allocSlot()` call returns
-/// `slot_count` and bumps it. No reuse across branches (step #6
-/// liveness analysis is a future-Phase-6 concern; correctness comes
-/// first per peer-AI turn 36).
+/// `slot_count` and bumps it. No reuse across branches; there is
+/// no liveness analysis.
 ///
-/// **Constant pool**: simple append. Future dedup is an obvious
-/// optimization but doesn't affect correctness; deferred per
-/// COMPILER.md §4.5 deduplication note.
+/// **Constant pool**: simple append; constants are not
+/// deduplicated (COMPILER.md §4.5).
 ///
-/// **Lexical scope** (step #4, per peer-AI turn 38): a stack of
-/// `LocalBinding{name, slot}` pairs. Resolution walks innermost-
-/// first (newest entries shadow older). Bindings push at let*
-/// binding-time (after the RHS is compiled, per COMPILER.md §4.3's
-/// strict left-of-self rule) and pop at let-body exit via
-/// `defer scope.shrinkRetainingCapacity(mark)` — `defer` rather
-/// than success-path restore so an error mid-body doesn't leak
-/// scope into a recovering caller.
-///
-/// **Future evolution** (peer-AI turn 38 caveat): `LocalBinding`
-/// is going to grow into a `BindingRef` union once step #5
-/// closures and step #7 vars land — `local_value_slot |
-/// local_cell_slot | upvalue | var_ref`. The flat name→slot
-/// resolution we use today is correct only across the single
-/// current routine; nested function compilation (step #5) needs
-/// capture analysis at function boundaries.
+/// **Lexical scope**: a stack of `LocalBinding{name, ref}` pairs.
+/// Resolution walks innermost-first (newest entries shadow older).
+/// Bindings push at let* binding-time (after the RHS is compiled,
+/// per COMPILER.md §4.3's strict left-of-self rule) and pop at
+/// let-body exit via `defer scope.shrinkRetainingCapacity(mark)` —
+/// `defer` rather than success-path restore so an error mid-body
+/// doesn't leak scope into a recovering caller. Nested function
+/// compilation resolves free names through the `parent` chain
+/// (capture analysis at function boundaries).
 const Emitter = struct {
     allocator: std.mem.Allocator,
     code: std.ArrayList(Inst) = .empty,
@@ -648,15 +619,14 @@ const Emitter = struct {
     capture_descs: std.ArrayList(vm.CaptureDescriptor) = .empty,
     scope: std.ArrayList(LocalBinding) = .empty,
     slot_count: u16 = 0,
-    /// Step 5b (peer-AI turn 42 linked-Emitter design): pointer
-    /// to the enclosing routine's Emitter, or null for the
+    /// Pointer to the enclosing routine's Emitter, or null for the
     /// top-level routine. Capture discovery walks the parent
     /// chain in `resolveOrCapture`. Synchronous compilation
     /// guarantees the parent pointer remains valid throughout
     /// child compilation (parent is blocked in its
     /// `compileFn` call).
     parent: ?*Emitter = null,
-    /// Step 5b: captures THIS routine has registered (in
+    /// Captures THIS routine has registered (in
     /// upvalue-index order). Each entry is a `CaptureSource`
     /// describing how to source the cell from the PARENT
     /// frame when the parent's `closure:make` runs. The
@@ -666,18 +636,17 @@ const Emitter = struct {
     /// from `child.captures` and registers it in its own
     /// `capture_descs` table.
     captures: std.ArrayList(vm.CaptureSource) = .empty,
-    /// Step 5b (peer-AI turn 45): routine-level cache of
-    /// captured names → upvalue-index. Separate from
+    /// Routine-level cache of captured names → upvalue-index.
+    /// Separate from
     /// `scope` so inner `let_star` scope restoration cannot
     /// pop a captured-binding entry. Without this, the same
     /// outer name referenced in two unrelated inner scopes
     /// would be captured twice (two upvalue indices, two
     /// descriptor sources, double-allocated cell pointer in
-    /// the closure). Lexical locals still take precedence
-    /// (resolved via `scope` first), so shadowing is
-    /// preserved.
+    /// the closure). Lexical locals take precedence (resolved
+    /// via `scope` first), so shadowing is preserved.
     captured_names: std.ArrayList(CapturedName) = .empty,
-    /// Step #6b: per-routine Var table. The compiler appends
+    /// Per-routine Var table. The compiler appends
     /// to this when it sees a `def`, a `(var x)`, or a
     /// symbol-fall-through-to-Var resolution. Index in this
     /// list becomes the V operand index in emitted bytecode.
@@ -686,12 +655,11 @@ const Emitter = struct {
     /// global per-namespace and only the index encoding is
     /// per-routine.
     var_table: std.ArrayList(*vm.Var) = .empty,
-    /// Step #6b: Namespace used for `def` / `var` / symbol
-    /// fall-through. `null` means no namespace was passed to
-    /// `compileTiny`; in that case `def`/`var_ref` raise
-    /// `UnresolvedSymbol` and unresolved symbols stay
-    /// unresolved (existing behavior). Child Emitters inherit
-    /// the parent's namespace pointer.
+    /// Namespace used for `def` / `var` / symbol fall-through.
+    /// `null` means no namespace was passed to `compileTiny`;
+    /// in that case `def`/`var_ref` raise `UnresolvedSymbol`
+    /// and unresolved symbols stay unresolved. Child Emitters
+    /// inherit the parent's namespace pointer.
     namespace: ?*vm.Namespace = null,
 
     fn init(allocator: std.mem.Allocator) Emitter {
@@ -709,8 +677,8 @@ const Emitter = struct {
     }
 
     /// Look up a name in the routine-level capture cache.
-    /// Returns the existing upvalue index if previously
-    /// captured (peer-AI turn 45 dedup); null otherwise.
+    /// Returns the existing upvalue index if this routine has
+    /// already captured `name`; null otherwise.
     fn lookupCapturedName(self: *const Emitter, name: []const u8) ?u12 {
         for (self.captured_names.items) |c| {
             if (std.mem.eql(u8, c.name, name)) return c.upvalue;
@@ -721,8 +689,8 @@ const Emitter = struct {
     /// Push a direct-slot binding onto the lexical scope. Does
     /// NOT allocate a slot — the caller already has one
     /// (typically the slot the binding's RHS was just compiled
-    /// into). Subsequent capture by an inner closure may
-    /// mutate the binding to `.cell_slot` via `ensureBoxed`.
+    /// into). Bindings that pre-analysis marks as captured are
+    /// pushed as `.cell_slot` by the caller instead.
     fn pushBinding(self: *Emitter, name: []const u8, slot: u12) CompileError!void {
         try self.scope.append(self.allocator, .{ .name = name, .ref = .{ .direct_slot = slot } });
     }
@@ -730,10 +698,9 @@ const Emitter = struct {
     /// Resolve `name` to a `BindingRef` via innermost-shadow
     /// lookup of ONLY the current Emitter's scope. Returns null
     /// if no binding matches; callers walk the parent chain via
-    /// `resolveOrCapture` if appropriate.
-    ///
-    /// Step 5b: returns the full BindingRef so callers can
-    /// dispatch on direct/cell/upvalue at emit time.
+    /// `resolveOrCapture` if appropriate. Returns the full
+    /// BindingRef so callers can dispatch on direct/cell/upvalue
+    /// at emit time.
     fn resolveLocalRef(self: *const Emitter, name: []const u8) ?BindingRef {
         var i = self.scope.items.len;
         while (i > 0) {
@@ -757,34 +724,32 @@ const Emitter = struct {
     /// captures from its own parent so the chain delivers a
     /// cell pointer to the innermost level).
     ///
-    /// **Pre-analysis invariant** (peer-AI turn 44): captured
-    /// bindings are guaranteed `.cell_slot` (or `.upvalue`,
-    /// transitively) by the time `resolveOrCapture` walks the
-    /// parent chain. A parent returning `.direct_slot` for a
-    /// captured name indicates pre-analysis missed the capture
-    /// — that's a compiler bug, caught by the assertion below.
-    /// `ensureBoxed` (the lazy-boxing mid-codegen mutation
-    /// helper) was removed in the turn-44 rewrite.
+    /// **Pre-analysis invariant**: captured bindings are
+    /// guaranteed `.cell_slot` (or `.upvalue`, transitively) by
+    /// the time `resolveOrCapture` walks the parent chain. A
+    /// parent returning `.direct_slot` for a captured name
+    /// indicates pre-analysis missed the capture — that's a
+    /// compiler bug, caught by the assertion below. Nothing
+    /// boxes a binding mid-codegen.
     ///
     /// Returns `UnresolvedSymbol` if no enclosing scope (up
     /// the entire parent chain) has the name.
     fn resolveOrCapture(self: *Emitter, name: []const u8) CompileError!BindingRef {
-        // Step 1: lexical scope, innermost-first. Lexical
-        // locals (params, let_star bindings) shadow any
-        // captures with the same name, preserving lexical
-        // scope semantics.
+        // 1. Lexical scope, innermost-first. Lexical locals
+        // (params, let_star bindings) shadow any captures with
+        // the same name, preserving lexical scope semantics.
         if (self.resolveLocalRef(name)) |ref| return ref;
-        // Step 2: routine-level capture cache (peer-AI turn 45).
-        // If THIS routine previously captured `name` (from a
-        // sibling scope, or earlier in the body), reuse the
-        // existing upvalue index instead of registering a new
-        // one. This avoids the "synthetic upvalue popped by
-        // inner let_star scope restoration" hazard.
+        // 2. Routine-level capture cache. If THIS routine has
+        // already captured `name` (from a sibling scope, or
+        // earlier in the body), reuse the existing upvalue index
+        // instead of registering a new one. This avoids the
+        // "synthetic upvalue popped by inner let_star scope
+        // restoration" hazard.
         if (self.lookupCapturedName(name)) |u| return .{ .upvalue = u };
-        // Step 3: walk parent chain.
+        // 3. Walk the parent chain.
         const parent = self.parent orelse return CompileError.UnresolvedSymbol;
         const parent_ref = try parent.resolveOrCapture(name);
-        // Step 3: convert parent's ref into a CaptureSource for
+        // 4. Convert parent's ref into a CaptureSource for
         // self.captures. Pre-analysis guarantees a captured
         // name's parent binding is .cell_slot (or .upvalue);
         // a .direct_slot return here means pre-analysis missed
@@ -793,24 +758,22 @@ const Emitter = struct {
             .cell_slot => |s| .{ .local_cell_slot = s },
             .upvalue => |u| .{ .inherited_upvalue = u },
             .direct_slot => {
-                // Pre-analysis should have boxed this binding
-                // at let_star binding time or fn_star param
-                // entry. Reaching here is a compiler bug
-                // (peer-AI turn 45 — was UnresolvedSymbol
-                // pre-revision; that error was misleading
-                // because the symbol DID resolve, the box just
-                // wasn't emitted).
+                // Pre-analysis boxes every captured binding at
+                // let_star binding time or fn_star param entry.
+                // Reaching here is a compiler bug, reported as
+                // such rather than as UnresolvedSymbol (the
+                // symbol DID resolve; the box is what's missing).
                 std.debug.assert(false);
                 return CompileError.InternalCompilerBug;
             },
         };
-        // Step 4: register the capture. Append the source to
+        // 5. Register the capture. Append the source to
         // self.captures (in upvalue-index order) AND record
         // the name → upvalue mapping in captured_names so
-        // future lookups dedupe (peer-AI turn 45). NOT pushed
-        // into self.scope because scope is for lexical
-        // bindings only — putting captures there meant
-        // inner let_star scope restoration could pop them.
+        // subsequent lookups dedupe. NOT pushed into self.scope
+        // because scope is for lexical bindings only — a
+        // capture there could be popped by inner let_star
+        // scope restoration.
         const u_idx_usize = self.captures.items.len;
         if (u_idx_usize >= 4096) return CompileError.SlotOverflow;
         const u_idx: u12 = @intCast(u_idx_usize);
@@ -819,8 +782,8 @@ const Emitter = struct {
         return .{ .upvalue = u_idx };
     }
 
-    /// Allocate a fresh result slot. Slots are monotonic; no
-    /// reclamation in step #3.
+    /// Allocate a fresh result slot. Slots are monotonic; there
+    /// is no reclamation.
     fn allocSlot(self: *Emitter) CompileError!u12 {
         if (self.slot_count >= 4096) return CompileError.SlotOverflow;
         const s = self.slot_count;
@@ -830,11 +793,11 @@ const Emitter = struct {
 
     /// Allocate a contiguous run of `count` fresh slots, return the
     /// base index. Required by `compileCall` to reserve the call
-    /// block BEFORE compiling sub-expressions (peer-AI turn 43
-    /// catch: per-arg `allocSlot` interleaved with sub-expression
-    /// compilation is incorrect — sub-expressions allocate their
-    /// own temps and the next "arg slot" is no longer adjacent
-    /// to the previous, breaking the range-call ABI invariant).
+    /// block BEFORE compiling sub-expressions: per-arg `allocSlot`
+    /// interleaved with sub-expression compilation would be
+    /// incorrect — sub-expressions allocate their own temps and
+    /// the next "arg slot" would not be adjacent to the previous,
+    /// breaking the range-call ABI invariant.
     fn allocSlotBlock(self: *Emitter, count: u32) CompileError!u12 {
         const base: u32 = self.slot_count;
         const end: u32 = base + count;
@@ -844,10 +807,8 @@ const Emitter = struct {
     }
 
     /// Add a constant to the pool, return its index. Constants are
-    /// not deduplicated in step #3 (correctness over polish).
-    /// Step 5a0.5 widens to typed `Const` per peer-AI turn 40
-    /// — most callers want `addValueConst(v)` for an ordinary
-    /// `Value`; step 5a1 will add `addRoutineConst(*const Routine)`
+    /// not deduplicated. Most callers want `addValueConst(v)` for
+    /// an ordinary `Value` or `addRoutineConst(*const Routine)`
     /// for `closure:make` lowering.
     fn addConst(self: *Emitter, c: vm.Const) CompileError!u12 {
         const idx = self.consts.items.len;
@@ -863,15 +824,15 @@ const Emitter = struct {
 
     /// Convenience: add a `*const Routine` constant. Used by
     /// `compileFn` when registering a child routine in the
-    /// parent's pool for later `closure:make` (peer-AI turn 42).
+    /// parent's pool for `closure:make`.
     fn addRoutineConst(self: *Emitter, r: *const vm.Routine) CompileError!u12 {
         return self.addConst(.{ .routine = r });
     }
 
     /// Add a capture descriptor to the emitter's table; return
     /// the descriptor's index for use as `closure:make`'s B
-    /// operand. Step 5a1: only empty descriptors. 5b populates
-    /// `local_cell_slot` / `inherited_upvalue` sources.
+    /// operand. Sources are `local_cell_slot` /
+    /// `inherited_upvalue` entries, or none for a capture-free fn.
     fn addCaptureDescriptor(self: *Emitter, desc: vm.CaptureDescriptor) CompileError!u12 {
         const idx = self.capture_descs.items.len;
         if (idx >= 4096) return CompileError.ConstantPoolOverflow;
@@ -879,7 +840,7 @@ const Emitter = struct {
         return @intCast(idx);
     }
 
-    /// Step #6b: get-or-create a V operand index for `name` in
+    /// Get-or-create a V operand index for `name` in
     /// the current routine's var_table. Interns the Var in the
     /// namespace (creating an unbound Var if absent), then
     /// dedup-appends to var_table. Returns the V operand index.
@@ -891,8 +852,8 @@ const Emitter = struct {
     /// dedup pattern.
     fn addVarRef(self: *Emitter, name: []const u8) CompileError!u12 {
         const ns = self.namespace orelse return CompileError.InternalCompilerBug;
-        // Phase 3.4: lookup walks the parent chain (auto-refer
-        // fallback to `nexis.core` etc.). If found there, use
+        // Lookup walks the parent chain (auto-refer fallback to
+        // `nexis.core` etc.). If found there, use
         // that Var directly. Only fall through to `intern` (which
         // creates a NEW unbound Var in `ns` itself, supporting
         // forward references) when no existing Var resolves.
@@ -900,8 +861,8 @@ const Emitter = struct {
             existing_v
         else
             ns.intern(name) catch return CompileError.OutOfMemory;
-        // Dedup: linear scan is fine for v1 routines (var_table
-        // length expected to stay small; rarely > a few dozen).
+        // Dedup: linear scan (var_table length stays small;
+        // rarely > a few dozen).
         for (self.var_table.items, 0..) |existing, i| {
             if (existing == v) return @intCast(i);
         }
@@ -956,7 +917,7 @@ const Emitter = struct {
 
     /// Convert the accumulated state into an owned `Compiled`.
     ///
-    /// Ownership transfer is errdefer-safe (peer-AI turn 37): if
+    /// Ownership transfer is errdefer-safe: if
     /// any `toOwnedSlice` fails after a previous one succeeded,
     /// the earlier slice would leak under a non-arena allocator.
     /// The chained errdefers guard against that.
@@ -985,23 +946,18 @@ const Emitter = struct {
 // Public API
 // =============================================================================
 
-/// Compile a `Tiny` form to a `Compiled` artifact.
-///
-/// **Provisional name** (peer-AI turn 35): `compileTiny` rather than
-/// `compile` to make it loud that this is the bootstrap-only entry
-/// point that accepts the local `Tiny` representation. When step
-/// #3+ replaces `Tiny` with `reader.Form`, the public compile
-/// surface evolves; tooling/tests that built against `compileTiny`
-/// get a clean rename signal.
+/// Compile a `Tiny` form to a `Compiled` artifact. Named
+/// `compileTiny` rather than `compile` to make it loud that this
+/// entry point accepts the `Tiny` IR directly; source and Form
+/// callers use `compileSourceWith` / `compileFormWith`.
 pub fn compileTiny(allocator: std.mem.Allocator, form: *const Tiny) CompileError!Compiled {
     return compileTinyWithNamespace(allocator, form, null);
 }
 
-/// Step #6b: compile with a Namespace for `def` / `(var x)` /
-/// symbol-fall-through-to-Var resolution. Existing call sites
-/// that don't use vars can keep calling `compileTiny`
-/// (namespace=null), and unresolved symbols continue to raise
-/// `UnresolvedSymbol`. Tests that exercise `def` build a
+/// Compile with a Namespace for `def` / `(var x)` /
+/// symbol-fall-through-to-Var resolution. Call sites that don't
+/// use vars call `compileTiny` (namespace=null), and unresolved
+/// symbols raise `UnresolvedSymbol`. Tests that exercise `def` build a
 /// Namespace (typically `VM.ensureNamespace()`'s) and pass it
 /// here.
 pub fn compileTinyWithNamespace(
@@ -1024,32 +980,22 @@ pub fn compileTinyWithNamespace(
 }
 
 // =============================================================================
-// Form → Tiny lowering (step #7a, peer-AI turn 51 architecture)
+// Form → Tiny lowering
 // =============================================================================
 //
 // `lowerForm` converts a `reader.Form` tree into a `Tiny` IR tree on the
-// passed allocator. The Tiny tree is then compiled via the existing
-// backend (`compileTinyWithNamespace`), so the entire Phase 2 codegen
-// pipeline (capture pre-analysis, RecurTarget threading, variadic rest,
-// Var fall-through, etc.) reuses the proven Tiny path. There is no
-// parallel "compile Form directly to bytecode" path; that would
-// duplicate ~5000 LOC of backend logic and lose 135 regression tests.
+// passed allocator. The Tiny tree is then compiled via the backend
+// (`compileTinyWithNamespace`), so the entire codegen pipeline (capture
+// pre-analysis, RecurTarget threading, variadic rest, Var fall-through,
+// etc.) runs on the one Tiny path. There is no parallel "compile Form
+// directly to bytecode" path.
 //
-// Step #7a scope (deliberately narrow): literals + symbols only.
-// All compound Form datums (lists, vectors, maps, sets, quote,
-// syntax-quote, etc.) raise `UnsupportedFeature`. The expansion plan:
-//
-//   #7b: list dispatch — ordinary calls + special forms (do, if,
-//        quote-of-scalar) + arithmetic intrinsics (+, < when not
-//        lexically shadowed)
-//   #7c: binding/fn forms (let*, fn*, letfn*, loop*, recur)
-//   #7d: vars/def/defn via Form
-//   #7e: full source-string end-to-end tests
-//
-// The lowering env (`LowerEnv`, peer-AI turn 51 §"load-bearing
-// issue") that tracks lexical-name shadowing for intrinsic
-// dispatch lands in #7b — #7a has no intrinsics and no special
-// forms, so no env is needed yet.
+// Lowering covers literals, symbols, list dispatch (ordinary calls,
+// special forms, the `+` / `<` intrinsics when not lexically shadowed),
+// binding/fn forms (let*, fn*, letfn*, loop*, recur), var forms
+// (def, defn, var), try/throw, quote, and collection literals. The
+// lowering env (`LowerEnv`) tracks lexical-name shadowing for
+// intrinsic dispatch.
 
 /// Allocate and initialize a Tiny node on the given allocator.
 /// Used by `lowerForm` to build the IR tree. The arena passed to
@@ -1060,8 +1006,7 @@ fn allocTiny(allocator: std.mem.Allocator, value: Tiny) CompileError!*Tiny {
     return t;
 }
 
-/// Form-lowering context bundle (step E1, peer-AI turn 55).
-/// Passes both the lexical environment (for intrinsic shadowing)
+/// Form-lowering context bundle. Passes both the lexical environment (for intrinsic shadowing)
 /// and the Interner (for quoted-symbol/quoted-keyword Value
 /// construction) through every `lower*` helper. Small (2
 /// pointers); copied by value at each level — child contexts
@@ -1074,13 +1019,12 @@ fn allocTiny(allocator: std.mem.Allocator, value: Tiny) CompileError!*Tiny {
 pub const LowerCtx = struct {
     env: ?*const LowerEnv = null,
     interner: ?*intern_mod.Interner = null,
-    /// Phase 5.2a (peer-AI turn 77): heap for allocating string-
-    /// literal Values during Form → Tiny lowering. Strings reach
-    /// the lowerer as `Datum.string` ([]const u8 in the reader's
-    /// arena) and need a stable Heap so the resulting Value can
-    /// live in `Tiny.literal` for the artifact's lifetime. When
-    /// null, `.string` Forms lower to `UnsupportedFeature` (same
-    /// as pre-5.2a behavior).
+    /// Heap for allocating string-literal Values during Form →
+    /// Tiny lowering. Strings reach the lowerer as `Datum.string`
+    /// ([]const u8 in the reader's arena) and need a stable Heap
+    /// so the resulting Value can live in `Tiny.literal` for the
+    /// artifact's lifetime. When null, `.string` Forms lower to
+    /// `UnsupportedFeature`.
     heap: ?*heap_mod.Heap = null,
     /// The namespace symbols resolve in. With `declared` set, a
     /// symbol that is neither lexically bound, resolvable here
@@ -1172,13 +1116,12 @@ pub const DeclaredNames = struct {
     }
 };
 
-/// Form-lowering lexical environment (step #7b, peer-AI turn 53).
-/// Tracks lexical names that are visible in operator position so
+/// Form-lowering lexical environment. Tracks lexical names that are visible in operator position so
 /// the dispatcher can decide whether to inline intrinsics like
 /// `+` and `<` or fall through to ordinary call lowering.
 ///
-/// This is NOT slot resolution — that happens later in the backend
-/// via `resolveOrCapture`. LowerEnv ONLY exists to make the
+/// This is NOT slot resolution — that happens in the backend via
+/// `resolveOrCapture`. LowerEnv ONLY exists to make the
 /// shadowing rule for inlineable core fns work correctly:
 ///
 ///   (let* [+ (fn* [a b] 42)] (+ 1 2))   ;; ordinary call, not Tiny.add
@@ -1187,21 +1130,17 @@ pub const DeclaredNames = struct {
 /// Special forms (`if`, `do`, `let*`, `fn*`, `letfn*`, `loop*`,
 /// `recur`, `quote`, `def`, `defn`, `var`) are RESERVED in operator
 /// position — they're recognized regardless of lexical bindings.
-/// Only inlineable core fns (`+`, `<` in #7b) check the env.
+/// Only the inlineable core fns (`+`, `<`) check the env.
 ///
-/// Known limitation (peer-AI turn 53 §"Additional traps"): the
-/// shadowing check is lexical-only. Namespace-level Var
-/// shadowing — `(do (def + f) (+ 1 2))` — still inlines `+` to
-/// `Tiny.add` because the lowerer doesn't track Vars. Fixing this
-/// would require LowerEnv to consult the namespace at lowering
-/// time, which is a Phase 3+ refinement (see CLOJURE-REVIEW.md
-/// §1.7's "core inlining" discussion).
+/// Limit: the shadowing check is lexical-only. Namespace-level
+/// Var shadowing — `(do (def + f) (+ 1 2))` — inlines `+` to
+/// `Tiny.add` because the lowerer doesn't track Vars (see
+/// CLOJURE-REVIEW.md §1.7's "core inlining" discussion).
 pub const LowerEnv = struct {
     /// Names bound at THIS scope level. The full visibility set
     /// is the union of this set with the parent's set,
     /// transitively. Linear-lookup string set (matches the
-    /// backend's NameSet pattern — capture analysis already pays
-    /// this cost and proves it's fine at v1 scale).
+    /// backend's NameSet pattern).
     lexical_names: NameSet = .{},
     parent: ?*const LowerEnv = null,
 
@@ -1270,7 +1209,7 @@ fn lowerFormEnv(
         .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
         .int => |n| try allocTiny(allocator, .{ .int = n }),
         .symbol => |name| blk: {
-            // Phase 3.4: qualified symbols `ns/name` lower to
+            // Qualified symbols `ns/name` lower to
             // `Tiny.qualified_symbol`; compileSymbol handles
             // dispatch through the namespace registry.
             if (name.ns) |ns_prefix| {
@@ -1285,7 +1224,7 @@ fn lowerFormEnv(
             break :blk try allocTiny(allocator, .{ .symbol = name.name });
         },
         .list => |items| try lowerList(allocator, items, ctx),
-        // Step E1: bare keywords are self-evaluating per Clojure
+        // Bare keywords are self-evaluating per Clojure
         // semantics. Lowers to Tiny.literal via the Interner.
         // Without an Interner, falls back to UnsupportedFeature.
         // A qualified keyword interns its full `ns/name` text, the
@@ -1301,21 +1240,19 @@ fn lowerFormEnv(
         .char => |c| try allocTiny(allocator, .{
             .literal = value_mod.fromChar(c) orelse return CompileError.MalformedForm,
         }),
-        // Phase 5.2a (peer-AI turn 77): string literals lower
-        // through the heap plumbed into LowerCtx. The Value goes
-        // into `Tiny.literal`; the heap is the same one routines
-        // and closures use, so the string lifetime tracks the
-        // artifact. When no heap is available (older compile
-        // entry points), the form still defers — string literals
-        // in those code paths weren't supported before either.
+        // String literals lower through the heap plumbed into
+        // LowerCtx. The Value goes into `Tiny.literal`; the heap
+        // is the same one routines and closures use, so the
+        // string lifetime tracks the artifact. Without a heap the
+        // form raises UnsupportedFeature.
         .string => |bytes| blk: {
             const h = ctx.heap orelse return CompileError.UnsupportedFeature;
             const v = string_mod.fromBytes(h, bytes) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
-        // Phase 3.1: `{k1 v1 k2 v2 ...}` as an expression →
-        // each key + value is a normal expression, evaluated
-        // left-to-right (peer-AI turn 65 §4). The runtime
+        // `{k1 v1 k2 v2 ...}` as an expression → each key +
+        // value is a normal expression, evaluated
+        // left-to-right. The runtime
         // map-builder fires after all are evaluated; duplicate
         // keys keep the LATER value.
         .map => |items| blk: {
@@ -1326,7 +1263,7 @@ fn lowerFormEnv(
             }
             break :blk try allocTiny(allocator, .{ .map_construct = tiny_items });
         },
-        // Phase 3.1: `#{a b c}` as an expression. Each element
+        // `#{a b c}` as an expression. Each element
         // is a normal expression; duplicates collapse at
         // runtime via `champ.setConj`.
         .set => |items| blk: {
@@ -1336,10 +1273,7 @@ fn lowerFormEnv(
             }
             break :blk try allocTiny(allocator, .{ .set_construct = tiny_items });
         },
-        // Vectors as expressions: was deferred pre-3.1 but
-        // collections of homogeneous semantics with maps/sets
-        // — implement here for completeness (peer-AI turn 65
-        // §1: scope to runtime literals, not stdlib helpers).
+        // `[a b c]` as an expression: same shape as maps/sets.
         .vector => |items| blk: {
             const tiny_items = try allocator.alloc(*const Tiny, items.len);
             for (items, 0..) |item, i| {
@@ -1350,18 +1284,16 @@ fn lowerFormEnv(
         // Reader macros / meta.
         .quote => |inner| try lowerQuotePayload(allocator, inner, ctx),
         .syntax_quote, .unquote, .unquote_splicing => return CompileError.UnsupportedFeature,
-        // Atoms aren't a Phase 2 feature.
+        // `@x`, `#(...)` and `^{...}` are rewritten by the
+        // expander; the lowerer rejects the raw reader forms.
         .deref => return CompileError.UnsupportedFeature,
-        // #(...) anon-fn shorthand — deferred (likely to step #8
-        // macroexpander; see strategy turn 51 §Q4).
         .anon_fn => return CompileError.UnsupportedFeature,
-        // ^{...} metadata — deferred (Phase 3+).
         .with_meta => return CompileError.UnsupportedFeature,
     };
 }
 
 // =============================================================================
-// Form list dispatch (step #7b): special forms + intrinsics + calls
+// Form list dispatch: special forms + intrinsics + calls
 // =============================================================================
 //
 // Operator-position head-symbol dispatch. Special forms are
@@ -1374,10 +1306,9 @@ fn lowerFormEnv(
 /// any expression evaluating to a closure) or a special form
 /// (head is a reserved symbol like `if`, `do`, `let*`, etc.).
 ///
-/// Empty `()` is rejected (`MalformedForm`) for #7b. Per peer-AI
-/// turn 53: source `()` is invalid as an expression; the empty
-/// list value `'()` requires quoted-compound-collection support
-/// which is deferred.
+/// Empty `()` is rejected (`MalformedForm`): source `()` is
+/// invalid as an expression; the empty list value is written
+/// `'()`.
 fn lowerList(
     allocator: std.mem.Allocator,
     items: []const *reader_mod.Form,
@@ -1393,24 +1324,23 @@ fn lowerList(
         if (std.mem.eql(u8, name, "do")) return try lowerDo(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "if")) return try lowerIf(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "quote")) return try lowerQuote(allocator, items[1..], ctx);
-        // Step #8c.1: internal compiler primitives for list/concat.
+        // Internal compiler primitives for collection construction.
         // NOT user-shadowable (recognized as special forms in the
         // dispatcher, never checked against the macro table or
-        // lexical env). Per MACROEXPAND.md §5 + peer-AI turn 56 §5
-        // Trap-4: this is the unshadowable substrate that syntax-
-        // quote will emit in step #8c.2.
+        // lexical env). Per MACROEXPAND.md §5 this is the
+        // unshadowable substrate that syntax-quote emits.
         if (std.mem.eql(u8, name, "#%list")) return try lowerInternalList(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "#%concat")) return try lowerInternalConcat(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "#%vector")) return try lowerInternalVector(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "#%map")) return try lowerInternalMap(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "#%set")) return try lowerInternalSet(allocator, items[1..], ctx);
-        // Binding forms (step #7c).
+        // Binding forms.
         if (std.mem.eql(u8, name, "let*")) return try lowerLetStar(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "loop*")) return try lowerLoopStar(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "recur")) return try lowerRecur(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "fn*")) return try lowerFnStar(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "letfn*")) return try lowerLetFnStar(allocator, items[1..], ctx);
-        // Var forms (step #7d).
+        // Var forms.
         if (std.mem.eql(u8, name, "def")) return try lowerDef(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "defn")) return try lowerDefn(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "var")) return try lowerVarRef(allocator, items[1..]);
@@ -1465,13 +1395,11 @@ fn lowerIf(
     } });
 }
 
-/// `(quote x)`. Per peer-AI turn 53: scalars that already map to
-/// Tiny variants are lowered to those variants directly (saves
-/// const-pool entries for fixnums/bools/nil). Quoted symbols,
-/// keywords, strings, and compound collections raise
-/// `UnsupportedFeature` for #7b — they'd require a `Tiny.literal`
-/// variant + Interner integration. The macroexpander (step #8)
-/// will need quoted-symbol support before that point.
+/// `(quote x)`. Scalars that already map to Tiny variants are
+/// lowered to those variants directly (saves const-pool entries
+/// for fixnums/bools/nil). Quoted symbols, keywords and compound
+/// collections become `Tiny.literal` through the Interner (see
+/// `lowerQuotePayload`).
 fn lowerQuote(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
@@ -1481,11 +1409,11 @@ fn lowerQuote(
     return lowerQuotePayload(allocator, args[0], ctx);
 }
 
-/// Step #8c.1: lower `(#%list a b c)` — recursively lower each
+/// Lower `(#%list a b c)` — recursively lower each
 /// arg as a normal evaluable expression, then build a
 /// Tiny.list_construct with those subtrees. The args ARE
 /// evaluated (this is NOT quote-like opacity); macros nested
-/// in args do expand. Per peer-AI turn 58 §D1.
+/// in args do expand.
 fn lowerInternalList(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
@@ -1496,7 +1424,7 @@ fn lowerInternalList(
     return try allocTiny(allocator, .{ .list_construct = tiny_items });
 }
 
-/// Step #8c.1: lower `(#%concat a b c)` — same shape as
+/// Lower `(#%concat a b c)` — same shape as
 /// `#%list`. Each arg must evaluate to a list value at runtime
 /// (KindMismatch trap otherwise — enforced by the VM, not the
 /// compiler, since we can't statically know an expression's
@@ -1511,7 +1439,7 @@ fn lowerInternalConcat(
     return try allocTiny(allocator, .{ .concat = tiny_items });
 }
 
-/// Step #8c.3: lower `(#%vector a b c)` — same pattern as
+/// Lower `(#%vector a b c)` — same pattern as
 /// `#%list` but emits Tiny.vector_construct (backend: coll:vector).
 fn lowerInternalVector(
     allocator: std.mem.Allocator,
@@ -1523,7 +1451,7 @@ fn lowerInternalVector(
     return try allocTiny(allocator, .{ .vector_construct = tiny_items });
 }
 
-/// Phase 3.1: lower `(#%map k1 v1 k2 v2 ...)`. Args MUST be
+/// Lower `(#%map k1 v1 k2 v2 ...)`. Args MUST be
 /// even (compiler raises MalformedForm otherwise; the runtime
 /// also enforces). Backend: coll:map → champ.mapAssoc per pair.
 fn lowerInternalMap(
@@ -1537,7 +1465,7 @@ fn lowerInternalMap(
     return try allocTiny(allocator, .{ .map_construct = tiny_items });
 }
 
-/// Phase 3.1: lower `(#%set a b c)`. Duplicates collapse at
+/// Lower `(#%set a b c)`. Duplicates collapse at
 /// runtime via `champ.setConj`. Backend: coll:set.
 fn lowerInternalSet(
     allocator: std.mem.Allocator,
@@ -1552,18 +1480,19 @@ fn lowerInternalSet(
 /// Shared implementation for `(quote x)` and the reader-macro
 /// `'x` (which the reader emits as `Datum.quote`).
 ///
-/// Step E1: quoted symbols/keywords use the Interner from
+/// Quoted symbols/keywords use the Interner from
 /// `ctx.interner` to produce stable symbol/keyword Values
 /// emitted via `Tiny.literal`. Without an Interner
-/// (`ctx.interner == null`), quoted symbols/keywords still
-/// raise `UnsupportedFeature` — the caller is expected to use
-/// `compileSourceFull` / `compileFormFull` to pass an Interner.
+/// (`ctx.interner == null`), quoted symbols/keywords raise
+/// `UnsupportedFeature` — the caller is expected to use
+/// `compileSourceWith` / `compileFormWith` to pass an Interner.
 /// Quoted nil/bool/int never need the Interner.
 ///
-/// Quoted compound collections (lists/vectors/maps/sets) still
-/// raise `UnsupportedFeature`; they require collection-value
-/// construction at compile time which is step #8 macroexpander
-/// work.
+/// Quoted compound collections (lists/vectors/maps/sets) lower
+/// to the matching `*_construct` node whose elements are
+/// themselves quote-lowered; quoted strings need `ctx.heap`.
+/// Quoted reader macros (`'@x`, `'#(...)`, `'^{...}`,
+/// syntax-quote) raise `UnsupportedFeature`.
 fn lowerQuotePayload(
     allocator: std.mem.Allocator,
     payload: *const reader_mod.Form,
@@ -1574,7 +1503,7 @@ fn lowerQuotePayload(
         .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
         .int => |n| try allocTiny(allocator, .{ .int = n }),
         .symbol => |name| blk: {
-            // Phase 4.0b: qualified symbols intern the full
+            // Qualified symbols intern the full
             // `ns/name` string; valueToForm splits it back into
             // ns + name on the way out. This lets macros emit
             // qualified-symbol literals like `(quote db/begin-write)`.
@@ -1593,9 +1522,8 @@ fn lowerQuotePayload(
             const v = interner.internQualifiedKeyword(name.ns, name.name) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
-        // Step #8c.1 (peer-AI turn 58 §D6): quoted compound list.
-        // Closes the deferral from #7 — `(quote (1 2 3))` now
-        // works. Each element is recursively quote-lowered (so a
+        // Quoted compound list, `(quote (1 2 3))`. Each element
+        // is recursively quote-lowered (so a
         // nested `(quote (foo (bar baz)))` builds nested lists
         // of interned symbols). Lowers to `Tiny.list_construct`
         // with each element being a literal/recursive quote
@@ -1608,7 +1536,7 @@ fn lowerQuotePayload(
             }
             break :blk try allocTiny(allocator, .{ .list_construct = tiny_items });
         },
-        // Step #8c.3: quoted compound vector. Same pattern as
+        // Quoted compound vector. Same pattern as
         // quoted list — elements are recursively quote-lowered.
         .vector => |items| blk: {
             const tiny_items = try allocator.alloc(*const Tiny, items.len);
@@ -1617,7 +1545,7 @@ fn lowerQuotePayload(
             }
             break :blk try allocTiny(allocator, .{ .vector_construct = tiny_items });
         },
-        // Phase 3.1: quoted compound map. Items are k,v,k,v...
+        // Quoted compound map. Items are k,v,k,v...
         // recursively quote-lowered. The reader ensures even
         // arity for `{...}` source syntax; defensive check
         // here in case a synthesized map form sneaks in.
@@ -1629,7 +1557,7 @@ fn lowerQuotePayload(
             }
             break :blk try allocTiny(allocator, .{ .map_construct = tiny_items });
         },
-        // Phase 3.1: quoted compound set. Duplicate elements
+        // Quoted compound set. Duplicate elements
         // collapse via runtime `champ.setConj`.
         .set => |items| blk: {
             const tiny_items = try allocator.alloc(*const Tiny, items.len);
@@ -1694,16 +1622,15 @@ fn lowerCall(
 }
 
 // =============================================================================
-// Form binding-form lowering (step #7c)
+// Form binding-form lowering
 // =============================================================================
 //
 // `let*`, `fn*`, `letfn*`, `loop*`, `recur`. All share the same
 // structural-validation primitives + the implicit-do helper
-// (per peer-AI turn 53 §Q4 — multi-form bodies synthesize
-// Tiny.do_).
+// (multi-form bodies synthesize Tiny.do_).
 //
 // LowerEnv must mirror lexical visibility for intrinsic
-// shadowing (peer-AI turn 53 §"Critical trap"). Each binding
+// shadowing. Each binding
 // form constructs a child env that adds its bound names, then
 // passes it through body lowering.
 
@@ -1747,7 +1674,7 @@ fn expectVector(form: *const reader_mod.Form) CompileError![]const *reader_mod.F
 }
 
 /// Parsed param vector for `fn*`/`defn`: split fixed params from
-/// optional `& rest` per peer-AI turn 53 §Q3.
+/// optional `& rest`.
 const ParsedParams = struct {
     params: []const []const u8,
     rest_param: ?[]const u8,
@@ -1804,7 +1731,7 @@ fn lowerLetStar(
     const n_bindings = binding_vec.len / 2;
     const bindings = try allocator.alloc(Binding, n_bindings);
 
-    // Sequential env extension (peer-AI turn 53): each RHS sees
+    // Sequential env extension: each RHS sees
     // prior bindings only. We allocate one child env and grow its
     // name set as we go.
     var local = LowerEnv{ .parent = ctx.env };
@@ -1884,8 +1811,8 @@ fn lowerFnStar(
     const param_vec = try expectVector(args[pos]);
     const parsed = try parseParams(allocator, param_vec);
 
-    // Body env: outer env + params + rest + self-name (per
-    // peer-AI turn 53 §"fn*"). Each name is added so an inner
+    // Body env: outer env + params + rest + self-name.
+    // Each name is added so an inner
     // intrinsic-name reference is correctly shadowed.
     var body_env = LowerEnv{ .parent = ctx.env };
     defer body_env.deinit(allocator);
@@ -1915,7 +1842,7 @@ fn lowerLetFnStar(
     const binding_vec = try expectVector(args[0]);
     const bindings = try allocator.alloc(FnBinding, binding_vec.len);
 
-    // Step 1: extract all binding names into a shared env BEFORE
+    // 1. Extract all binding names into a shared env BEFORE
     // lowering any fn body (mutual visibility per Tiny semantics).
     var local = LowerEnv{ .parent = ctx.env };
     defer local.deinit(allocator);
@@ -1928,19 +1855,18 @@ fn lowerLetFnStar(
         const name = try expectUnqualifiedSymbol(entry_items[0]);
         const param_vec = try expectVector(entry_items[1]);
         const parsed = try parseParams(allocator, param_vec);
-        // letfn* per FnBinding shape doesn't support rest_param
-        // (the existing Tiny.letfn_star.FnBinding has no
-        // rest_param field). Reject for now.
+        // letfn* bindings have no rest param
+        // (Tiny.letfn_star.FnBinding has no rest_param field).
         if (parsed.rest_param != null) return CompileError.UnsupportedFeature;
         bindings[i] = .{
             .name = name,
             .params = parsed.params,
-            .body = undefined, // patched in step 2 below
+            .body = undefined, // patched in 2. below
         };
         try local.lexical_names.put(allocator, name);
     }
 
-    // Step 2: lower each fn body with local env (includes all
+    // 2. Lower each fn body with local env (includes all
     // letfn names) + that fn's params.
     for (binding_vec, 0..) |entry, i| {
         const entry_items = entry.datum.list;
@@ -1950,24 +1876,23 @@ fn lowerLetFnStar(
         bindings[i].body = try lowerBody(allocator, entry_items[2..], ctx.withEnv(&body_env));
     }
 
-    // Step 3: lower letfn body with local env.
+    // 3. Lower the letfn body with local env.
     const body = try lowerBody(allocator, args[1..], ctx.withEnv(&local));
     return try allocTiny(allocator, .{ .letfn_star = .{ .bindings = bindings, .body = body } });
 }
 
 // =============================================================================
-// Form var-form lowering (step #7d)
+// Form var-form lowering
 // =============================================================================
 //
 // `def`, `defn`, `(var x)`. The backend (Tiny.def, Tiny.defn,
-// Tiny.var_ref) already handles forward references, identity-
-// stable rebind, and the named-fn placeholder pattern. #7d is
+// Tiny.var_ref) handles forward references, identity-stable
+// rebind, and the named-fn placeholder pattern. This layer is
 // purely Form-side dispatch + structural validation.
 //
-// Per peer-AI turn 53 §"defn": LowerEnv does NOT add def/defn
-// names — Vars don't shadow intrinsic inlining under the
-// current rule. `(do (def + f) (+ 1 2))` still inlines to 3.
-// Documented as a staged limitation in the LowerEnv doc comment.
+// LowerEnv does NOT add def/defn names — Vars don't shadow
+// intrinsic inlining. `(do (def + f) (+ 1 2))` inlines to 3.
+// See the LowerEnv doc comment.
 
 /// `(def name)` or `(def name value)`. Per Tiny.def shape, the
 /// value is optional (declare-only).
@@ -2026,17 +1951,15 @@ fn lowerVarRef(
     return try allocTiny(allocator, .{ .var_ref = .{ .name = name } });
 }
 
-/// Step #9.1 (peer-AI turn 59): lower `(try body+ (catch any
-/// binding handler+))`. v1 = catch-any only; finally and other
-/// type matchers deferred.
+/// Lower `(try body+ (catch any binding handler+) (finally ...)?)`.
+/// The only catch matcher is `any`.
 ///
 /// Form syntax:
 ///   (try body... (catch any binding handler...))
-///   (try body... (catch any binding handler...) (finally ...))   ; #9.2
+///   (try body... (catch any binding handler...) (finally ...))
 ///
-/// v1 enforcement:
+/// Enforcement:
 ///   - Exactly one body+catch+optional-finally shape.
-///   - finally raises UnsupportedFeature (deferred to #9.2).
 ///   - catch matcher MUST be the unqualified symbol `any`;
 ///     anything else is UnsupportedFeature.
 ///   - catch binding MUST be an unqualified symbol.
@@ -2067,7 +1990,6 @@ fn lowerTry(
             }
         }
     }
-    // Step #9.2: finally is now SUPPORTED.
 
     if (end < 2) return CompileError.MalformedForm;
     const catch_form = args[end - 1];
@@ -2105,7 +2027,7 @@ fn lowerTry(
     try handler_env.lexical_names.put(allocator, binding);
     const handler_body = try lowerBody(allocator, handler_items, ctx.withEnv(&handler_env));
 
-    // Step #9.2: lower the finally body if present. It sees
+    // Lower the finally body if present. It sees
     // the OUTER lexical env (NOT the catch binding).
     var finally_tiny: ?*const Tiny = null;
     if (finally_form) |ff| {
@@ -2125,7 +2047,7 @@ fn lowerTry(
     });
 }
 
-/// Step #9.1: lower `(throw value)` — single arg.
+/// Lower `(throw value)` — single arg.
 fn lowerThrow(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
@@ -2158,7 +2080,7 @@ pub fn compileFormWithNamespace(
     return compileFormFull(allocator, form, namespace, null);
 }
 
-/// Phase 3.2 (peer-AI turn 66): user_data for the
+/// user_data for the
 /// CompileEvalContext callback. The `persistent_allocator` is
 /// CRITICAL — defmacro Closures must outlive the per-form
 /// compile arena (REPL uses a fresh arena per input line; the
@@ -2173,7 +2095,7 @@ const CompileEvalData = struct {
     interner: *intern_mod.Interner,
 };
 
-/// Phase 3.2: compile-time eval callback. Compiles `form`
+/// Compile-time eval callback. Compiles `form`
 /// WITHOUT a macro table (the body has already been expanded by
 /// the expander before this is called) and runs it via a fresh
 /// sub-VM written through `out_vm`.
@@ -2209,7 +2131,7 @@ fn compileEvalCallback(
     return try out_vm.run();
 }
 
-/// Step E1: full form-compile with both namespace AND interner.
+/// Full form-compile with both namespace AND interner.
 /// Without an Interner, quoted symbols/keywords raise
 /// `UnsupportedFeature`. With one (typically `VM.ensureInterner()`),
 /// `(quote foo)` / `'foo` / `(quote :bar)` / `':bar` all work
@@ -2228,7 +2150,7 @@ pub fn compileFormFull(
     return compileFormFullWithMacros(allocator, form, namespace, interner, null);
 }
 
-/// Step #8a: full form-compile with optional macroexpansion.
+/// Full form-compile with optional macroexpansion.
 ///
 /// If `host_macros` is non-null AND `interner` is non-null,
 /// the form is run through the macroexpander BEFORE lowering.
@@ -2251,13 +2173,11 @@ pub fn compileFormFullWithMacros(
     return compileFormFullWithMacrosSpan(allocator, form, namespace, interner, host_macros, null);
 }
 
-/// Step #10.0: variant of `compileFormFullWithMacros` that
-/// surfaces the source span associated with any error raised.
-/// `out_span`, when non-null, is written with the span of the
-/// most recently-walked Form before the error (best-effort
-/// pointer; precise span tracking per error variant is a
-/// post-gate refinement). Callers ignoring spans pass null
-/// (matches the prior signature).
+/// Variant of `compileFormFullWithMacros` that surfaces the
+/// source span associated with any error raised. `out_span`,
+/// when non-null, is written with the span of the last Form
+/// walked before the error (a best-effort pointer, not a
+/// per-variant span). Callers ignoring spans pass null.
 pub fn compileFormFullWithMacrosSpan(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
@@ -2277,7 +2197,7 @@ pub fn compileFormFullWithMacrosSpan(
     );
 }
 
-/// Phase 3.2: variant that accepts a `persistent_allocator`
+/// Variant that accepts a `persistent_allocator`
 /// for defmacro Closure storage. When non-null, the synthetic
 /// `(def name (fn* ...))` form produced by `defmacro` is
 /// compiled into this allocator, so the resulting macro fn
@@ -2285,18 +2205,17 @@ pub fn compileFormFullWithMacrosSpan(
 ///
 /// CLI's REPL passes `vm.runtime_arena.allocator()` so
 /// defmacros defined in one REPL line are usable in
-/// subsequent lines. File runner ALSO passes a persistent
-/// arena (already does, since runFile shares one arena
-/// across the file).
+/// subsequent lines. The file runner also passes a persistent
+/// arena (runFile shares one arena across the file).
 ///
 /// If null, defmacro Closures use the regular `allocator`
 /// (the per-form arena). That's fine when ALL macro uses
 /// fall within the same arena lifetime (e.g., one-shot
 /// source compilation).
 ///
-/// Phase 3.4: `registry` (optional) enables `(ns NAME)`
-/// expansion to switch the current namespace. If null, `(ns
-/// ...)` is a hard error.
+/// `registry` (optional) enables `(ns NAME)` expansion to
+/// switch the current namespace. If null, `(ns ...)` is a hard
+/// error.
 pub fn compileFormFullWithMacrosSpanPersistent(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
@@ -2318,7 +2237,7 @@ pub fn compileFormFullWithMacrosSpanPersistent(
     );
 }
 
-/// Phase 3.4: same as `compileFormFullWithMacrosSpanPersistent`
+/// Same as `compileFormFullWithMacrosSpanPersistent`
 /// but also accepts a `*NamespaceRegistry` for `(ns NAME)`
 /// expansion support.
 pub fn compileFormFullWithMacrosSpanPersistentRegistry(
@@ -2492,8 +2411,8 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
 
 /// End-to-end: parse + read + lower + compile a source string.
 /// Convenience wrapper around `parser.parseForm` + `Reader.readOneForm`
-/// + `compileFormWithNamespace`. Step #7a. No namespace; symbols
-/// must resolve lexically.
+/// + `compileFormWithNamespace`. No namespace; symbols must
+/// resolve lexically.
 pub fn compileSource(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -2502,7 +2421,7 @@ pub fn compileSource(
 }
 
 /// End-to-end with namespace access for `def` / `(var x)` /
-/// symbol fall-through. Step #7a.
+/// symbol fall-through.
 ///
 /// Lifetime: the returned `Compiled` references strings borrowed
 /// from `source` (via Tiny.symbol → routine.var_table[*].name).
@@ -2512,8 +2431,8 @@ pub fn compileSource(
 /// lifetime) or by holding it in the same arena as the
 /// `Compiled`.
 ///
-/// Reader/parser errors are bucketed as `CompileError.ReaderFailure`
-/// for step #7a; structured errors with SrcSpans land in step #10.
+/// Reader/parser errors are bucketed as `CompileError.ReaderFailure`;
+/// the `*Span` entry points surface a SrcSpan alongside the error.
 pub fn compileSourceWithNamespace(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -2522,7 +2441,7 @@ pub fn compileSourceWithNamespace(
     return compileSourceFull(allocator, source, namespace, null);
 }
 
-/// Step E1: end-to-end source compile with namespace AND interner.
+/// End-to-end source compile with namespace AND interner.
 /// Pass `VM.ensureInterner()` to enable quoted-symbol / quoted-
 /// keyword support via real source syntax.
 pub fn compileSourceFull(
@@ -2534,7 +2453,7 @@ pub fn compileSourceFull(
     return compileSourceFullWithMacros(allocator, source, namespace, interner, null);
 }
 
-/// Step #8a: end-to-end source compile with optional macroexpansion.
+/// End-to-end source compile with optional macroexpansion.
 /// See `compileFormFullWithMacros` for macro semantics.
 pub fn compileSourceFullWithMacros(
     allocator: std.mem.Allocator,
@@ -2553,7 +2472,7 @@ pub fn compileSourceFullWithMacros(
     );
 }
 
-/// Step #10.0: end-to-end source compile with span surfacing.
+/// End-to-end source compile with span surfacing.
 /// Mirrors `compileFormFullWithMacrosSpan`. Reader errors set
 /// span to `null` (the reader's own error machinery owns that
 /// surface — see `reader.readOneForm`'s ErrorKind for spans
@@ -2577,7 +2496,7 @@ pub fn compileSourceFullWithMacrosSpan(
     );
 }
 
-/// Phase 3.2: source-string entry with `persistent_allocator`.
+/// Source-string entry with `persistent_allocator`.
 /// Callers that want defmacros to survive beyond the per-form
 /// arena (REPL, file runner) pass `vm.runtime_arena.allocator()`.
 pub fn compileSourceFullWithMacrosSpanPersistent(
@@ -2643,7 +2562,7 @@ pub fn compileSourceFullWithMacrosSpanPersistentRegistryLoader(
     });
 }
 
-/// Phase 3.4: source-string entry with both persistent
+/// Source-string entry with both persistent
 /// allocator AND namespace registry. CLI's REPL + runFile call
 /// this so `(ns NAME)` switches affect subsequent forms in the
 /// session/file.
@@ -2668,11 +2587,11 @@ pub fn compileSourceFullWithMacrosSpanPersistentRegistry(
 }
 
 // =============================================================================
-// Internal lowering — destination-driven (peer-AI turn 36)
+// Internal lowering — destination-driven
 // =============================================================================
 
 // =============================================================================
-// Capture pre-analysis (peer-AI turn 44 — supersedes lazy boxing)
+// Capture pre-analysis
 //
 // The analyzer answers: "given a `Tiny` subtree, which names are
 // referenced by some `fn*` body inside the subtree?" The compiler
@@ -2681,16 +2600,16 @@ pub fn compileSourceFullWithMacrosSpanPersistentRegistry(
 // straight-line prelude code (so the boxing dominates every
 // reachable use, including reads inside or after branches).
 //
-// **Why not lazy-box** (peer-AI turn 44 catch): lazy boxing
-// emitted `closure:box-local` at the moment capture was discovered
-// during inner-fn compilation. If the inner fn was inside a
+// **Why not lazy-box**: lazy boxing would emit
+// `closure:box-local` at the moment capture is discovered
+// during inner-fn compilation. If the inner fn is inside a
 // branch (e.g., `(if false (fn* [] x) 0)`), the box-local lived
 // in the unreachable branch while the compiler's BindingRef
-// scope-state thought x was boxed. Subsequent same-frame reads
-// emitted `closure:get-cell` against an unboxed slot at runtime
+// scope-state thinks x is boxed. Subsequent same-frame reads
+// emit `closure:get-cell` against an unboxed slot at runtime
 // → `:expected-cell` trap on a perfectly valid program.
 //
-// Pre-analysis fixes this by computing the capture set BEFORE
+// Pre-analysis avoids this by computing the capture set BEFORE
 // codegen and emitting box-local in straight-line prelude code
 // that every reachable path traverses.
 //
@@ -2703,8 +2622,8 @@ pub fn compileSourceFullWithMacrosSpanPersistentRegistry(
 // a small wasted instruction, never a correctness issue.
 // =============================================================================
 
-/// Linear-lookup string set. Sufficient at v1's small Tiny
-/// surface; HashMap is overkill until measured otherwise.
+/// Linear-lookup string set. Sufficient for the small name sets
+/// a Tiny tree produces.
 const NameSet = struct {
     items: std.ArrayList([]const u8) = .empty,
 
@@ -2736,7 +2655,7 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
     switch (form.*) {
         .nil, .bool, .int => {},
         .symbol => |name| if (!env.contains(name)) try out.put(allocator, name),
-        // Phase 3.4: qualified symbols resolve through the
+        // Qualified symbols resolve through the
         // namespace registry — never lexically captured.
         .qualified_symbol => {},
         .add => |a| {
@@ -2816,8 +2735,8 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
         },
         .recur => |r| {
             // Recur args may contain nested fn_stars referencing
-            // outer bindings (peer-AI turn 47 §7 catch). Recurse
-            // into each arg with the current env.
+            // outer bindings. Recurse into each arg with the
+            // current env.
             for (r.args) |a| try freeVars(allocator, a, env, out);
         },
         .literal => {}, // leaf — Value constants have no free vars
@@ -2840,12 +2759,12 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
             // def's RHS is the only sub-expression that can carry
             // free vars; the name itself is a NAMESPACE-LEVEL
             // binding, not a local, so it doesn't affect this
-            // routine's lexical env. Step #6b.
+            // routine's lexical env.
             if (d.value) |val| try freeVars(allocator, val, env, out);
         },
         .var_ref => {}, // leaf: no sub-expressions, no free vars
         .defn => |d| {
-            // Step #6c: defn lowers to (def name (fn* name ...)).
+            // defn lowers to (def name (fn* name ...)).
             // For free-var analysis, treat the body's env as
             // outer env + params + rest_param + name (the
             // self-name is bound inside the fn body).
@@ -2867,13 +2786,12 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
 /// inner binding, OR any binding between us and the fn that
 /// shadows the name.
 ///
-/// **Shadowing-aware** (peer-AI turn 45 fix): the `env`
-/// parameter tracks names visible at our level. As the walk
-/// descends into binding-forms (`let_star`, `fn_star` params),
-/// shadowed names are removed from the live env so they don't
-/// pollute the captured set. This avoids the false positive
-/// from turn 44 where an inner shadow caused the outer binding
-/// to be unnecessarily boxed.
+/// **Shadowing-aware**: the `env` parameter tracks names
+/// visible at our level. As the walk descends into
+/// binding-forms (`let_star`, `fn_star` params), shadowed names
+/// are removed from the live env so they don't pollute the
+/// captured set; an inner shadow never causes the outer binding
+/// to be boxed.
 ///
 /// `freeVars` against the descendant fn's own env (params +
 /// inner bindings) gives the names the fn captures. We
@@ -2904,7 +2822,7 @@ fn capturedByDescendantFns(
         .let_star => |l| {
             // As bindings shadow, names with the same name as
             // a binding fall out of `env`. Build an env-without-
-            // shadowed-names for each phase.
+            // shadowed-names for each position.
             // RHS-i sees env shadowed by bindings 1..i-1; body
             // sees env shadowed by all bindings.
             var local_env: NameSet = .{};
@@ -2930,8 +2848,7 @@ fn capturedByDescendantFns(
             // freeVars already recurses through nested fn_stars
             // (with appropriate inner envs), so descendant fns'
             // captures bubble up here correctly. No additional
-            // capturedByDescendantFns recursion needed (peer-AI
-            // turn 45 simplification — was redundant).
+            // capturedByDescendantFns recursion is needed.
             var params_env: NameSet = .{};
             defer params_env.deinit(allocator);
             for (f.params) |p| try params_env.put(allocator, p);
@@ -2992,8 +2909,8 @@ fn capturedByDescendantFns(
             try capturedByDescendantFns(allocator, l.body, &local_env, out);
         },
         .recur => |r| {
-            // Recur args may contain nested fn_stars (peer-AI
-            // turn 47 §7 catch). Recurse into each.
+            // Recur args may contain nested fn_stars. Recurse
+            // into each.
             for (r.args) |a| try capturedByDescendantFns(allocator, a, env, out);
         },
         .literal => {}, // leaf — Value constants have no descendant fns
@@ -3052,8 +2969,7 @@ fn removeFromSet(set: *NameSet, name: []const u8) void {
 /// form's result in `slot[dst]`. `recur_target` carries the
 /// nearest enclosing `loop*` / `fn*` body target, or `null` if
 /// `form` is in a non-tail position relative to any such target
-/// (peer-AI turn 47). Propagation is form-specific; see the
-/// per-arm handlers.
+/// Propagation is form-specific; see the per-arm handlers.
 fn compileExpr(
     e: *Emitter,
     form: *const Tiny,
@@ -3097,7 +3013,7 @@ fn compileIntLiteral(e: *Emitter, n: i64, dst: u12) CompileError!void {
     try e.emit(vm.asm_.loadConst(dst, c));
 }
 
-/// Step E1: emit a generic Value constant. The Value must have
+/// Emit a generic Value constant. The Value must have
 /// stable identity (interned symbols/keywords, immediates,
 /// strings owned by the Interner). See `Tiny.literal` doc for
 /// the lifetime contract.
@@ -3106,14 +3022,14 @@ fn compileLiteral(e: *Emitter, v: value_mod.Value, dst: u12) CompileError!void {
     try e.emit(vm.asm_.loadConst(dst, c));
 }
 
-/// Step #8c.1: compile `#%list` — allocate a contiguous slot
+/// Compile `#%list` — allocate a contiguous slot
 /// block for argc items, compile each arg into its slot, then
 /// emit `coll:list arg_base argc dst`. Empty list is a degenerate
 /// case: emit with argc=0 (the VM handles it specially via
 /// `list_mod.empty`).
 ///
-/// Block-allocation strategy mirrors `compileCall` (peer-AI
-/// turn 36): reserve the entire block upfront so internal
+/// Block-allocation strategy mirrors `compileCall`:
+/// reserve the entire block upfront so internal
 /// temporaries from sub-expression compilation don't fragment
 /// the arg slots.
 fn compileListConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
@@ -3135,7 +3051,7 @@ fn compileListConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) Compi
     try e.emit(vm.asm_.collList(arg_base, argc, dst));
 }
 
-/// Step #8c.1: compile `#%concat`. Same block-allocation
+/// Compile `#%concat`. Same block-allocation
 /// strategy as `compileListConstruct`; backend emits a
 /// single `coll:concat` opcode that does the runtime
 /// traverse-collect-rebuild.
@@ -3156,7 +3072,7 @@ fn compileConcat(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError
     try e.emit(vm.asm_.collConcat(arg_base, argc, dst));
 }
 
-/// Step #8c.3: compile `#%vector`. Same pattern as `#%list`;
+/// Compile `#%vector`. Same pattern as `#%list`;
 /// backend emits `coll:vector` which routes through
 /// `vector_mod.fromSlice` (RRB persistent vector).
 fn compileVectorConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
@@ -3176,7 +3092,7 @@ fn compileVectorConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) Com
     try e.emit(vm.asm_.collVector(arg_base, argc, dst));
 }
 
-/// Phase 3.1: compile `#%map`. Items are flat k,v,k,v,... so
+/// Compile `#%map`. Items are flat k,v,k,v,... so
 /// length MUST be even (compiler enforces; runtime would
 /// reject as BytecodeCorruption otherwise). Backend emits
 /// `coll:map` which iterates pairs through `champ.mapAssoc`.
@@ -3198,7 +3114,7 @@ fn compileMapConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) Compil
     try e.emit(vm.asm_.collMap(arg_base, argc, dst));
 }
 
-/// Phase 3.1: compile `#%set`. Same shape as `#%list`; backend
+/// Compile `#%set`. Same shape as `#%list`; backend
 /// emits `coll:set` which de-duplicates via `champ.setConj`.
 fn compileSetConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
     if (items.len == 0) {
@@ -3218,7 +3134,7 @@ fn compileSetConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) Compil
 }
 
 fn compileAdd(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) CompileError!void {
-    // Literal-pair peephole (per turn 33 + turn 36): if both
+    // Literal-pair peephole: if both
     // operands are integer literals, emit math:add with constant
     // operands directly — no prelude moves, two instructions
     // total (math:add + the eventual return). For non-literal
@@ -3244,7 +3160,7 @@ fn compileAdd(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) Compile
 }
 
 /// Lower `(< lhs rhs)` to `cmp:lt`. Same literal-pair peephole
-/// shape as `compileAdd`. Step 5d0 (peer-AI turn 47).
+/// shape as `compileAdd`.
 fn compileLt(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) CompileError!void {
     if (lhs.* == .int and rhs.* == .int) {
         const v_lhs = value_mod.fromFixnum(lhs.int) orelse
@@ -3264,10 +3180,10 @@ fn compileLt(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) CompileE
     try e.emit(vm.asm_.cmpLt(dst, Operand.slot(t_lhs), Operand.slot(t_rhs)));
 }
 
-/// Phase 3.4: resolve `prefix/name` through the namespace
+/// Resolve `prefix/name` through the namespace
 /// registry attached to the current namespace's parent chain.
 /// Lexical bindings are NOT consulted (qualified symbols
-/// always go through namespaces, peer-AI turn 69 §D3).
+/// always go through namespaces).
 ///
 /// Resolution shape:
 ///   1. Locate the prefix namespace via the registry.
@@ -3284,7 +3200,7 @@ fn compileQualifiedSymbol(
 ) CompileError!void {
     const current_ns = e.namespace orelse return CompileError.UnresolvedSymbol;
     const registry = current_ns.registry orelse return CompileError.UnresolvedSymbol;
-    // Phase 3.6: alias resolution. If the current namespace
+    // Alias resolution. If the current namespace
     // has registered `ns_prefix` as an alias (via
     // `(require '[real.name :as ns_prefix])`), swap it for the
     // canonical name before the registry lookup. Otherwise the
@@ -3311,28 +3227,25 @@ fn compileQualifiedSymbol(
 }
 
 fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
-    // Symbol resolution order for the Tiny backend (peer-AI
-    // turn 54: this is the final fall-through; step #7 added
-    // a Form-frontend ABOVE the Tiny backend, but symbol
-    // resolution itself stayed here unchanged):
+    // Symbol resolution order for the Tiny backend (the Form
+    // frontend sits ABOVE this; resolution itself lives here):
     //   1. local (this routine) → dispatch on BindingRef
     //      (.direct_slot / .cell_slot / .upvalue per the
-    //       capture pre-analysis model from 5b/5c, peer-AI
-    //       turns 44/45)
+    //       capture pre-analysis model)
     //   2. captured upvalue (parent chain) → resolve.upvalue
     //      + capture (also pre-analyzed; bindings are pre-
     //      boxed at binding time so BindingRef is stable
     //      across all control-flow paths)
     //   3. namespace Var (if namespace exists) → var:load-var
-    //      (#6b fall-through; lazy-interns unbound Vars so
-    //      forward references work)
+    //      (lazy-interns unbound Vars so forward references
+    //      work)
     //   4. error → :unresolved-symbol
     //
-    // Form lowering (step #7) does NOT resolve symbols to slots
+    // Form lowering does NOT resolve symbols to slots
     // — it preserves names and dispatches operator-position
     // special forms / intrinsics. Slot resolution happens here.
     const ref = e.resolveOrCapture(name) catch |err| switch (err) {
-        // Step #6b: lexical resolution failed; try the
+        // Lexical resolution failed; try the
         // namespace before giving up. Critical that this is
         // ONLY done for UnresolvedSymbol — other errors
         // (SlotOverflow, OutOfMemory, InternalCompilerBug)
@@ -3352,7 +3265,7 @@ fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
     };
     switch (ref) {
         .direct_slot => |s| {
-            // Skip the no-op self-move (peer-AI turn 38).
+            // Skip the no-op self-move.
             if (s == dst) return;
             try e.emit(vm.asm_.move(dst, s));
         },
@@ -3365,13 +3278,13 @@ fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
         .upvalue => |u| {
             // Captured upvalue: U-operand source via mov:move.
             // resolve(u:N) deref's the cell at runtime per
-            // VM.md §6 amendment (peer-AI turn 34).
+            // VM.md §6.
             try e.emit(vm.asm_.moveFrom(dst, vm.Operand.upvalue(u)));
         },
     }
 }
 
-/// Step #6b: lower `(def name value?)`. Interns the Var in the
+/// Lower `(def name value?)`. Interns the Var in the
 /// namespace (creating an unbound Var if absent), compiles
 /// `value` into a temp slot, emits `var:store-var` to update
 /// the Var's root and write the Var object into `dst`.
@@ -3403,7 +3316,7 @@ fn compileDef(
     }
 }
 
-/// Step #6b: lower `(var name)`. Interns the Var if absent,
+/// Lower `(var name)`. Interns the Var if absent,
 /// emits `var:var-object` to load the Var object itself (NOT
 /// its value). Does not trap on unbound; users can take a
 /// reference to a forward-declared Var.
@@ -3413,10 +3326,10 @@ fn compileVarRef(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
     try e.emit(vm.asm_.varVarObject(dst, idx));
 }
 
-/// Step #6c: lower `(defn name [params...] body)` as sugar for
+/// Lower `(defn name [params...] body)` as sugar for
 /// `(def name (fn* name [params...] body))`. The fn* carries
 /// `name` as its self-name so the body can self-recurse via
-/// the lexical name (handled by step 5c's named-fn placeholder
+/// the lexical name (handled by the named-fn placeholder
 /// pattern, no Var indirection). The outer `def` binds the
 /// Var so the function is callable from outside.
 ///
@@ -3454,13 +3367,13 @@ fn compileLetStar(
     dst: u12,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    // Strict left-of-self visibility per COMPILER.md §4.3
-    // (peer-AI turn 35 + 38): each binding's RHS sees bindings
-    // 1..i-1 only, not its own LHS. The loop pushes each
-    // binding to scope AFTER its RHS has been compiled.
+    // Strict left-of-self visibility per COMPILER.md §4.3:
+    // each binding's RHS sees bindings 1..i-1 only, not its
+    // own LHS. The loop pushes each binding to scope AFTER its
+    // RHS has been compiled.
     //
-    // Pre-analysis capture (peer-AI turn 44, supersedes lazy
-    // boxing): for each binding, walk the rest of the let
+    // Pre-analysis capture: for each binding, walk the rest of
+    // the let
     // (subsequent binding RHSs + body) to determine if any
     // descendant `fn_star` body captures this binding's name.
     // If yes, emit `closure:box-local` UNCONDITIONALLY in the
@@ -3472,7 +3385,7 @@ fn compileLetStar(
     //
     // Scope is restored via `defer` so an error mid-body
     // doesn't leave scope state polluted for a recovering
-    // caller (peer-AI turn 38).
+    // caller.
     const mark = e.scope.items.len;
     defer e.scope.shrinkRetainingCapacity(mark);
 
@@ -3481,7 +3394,7 @@ fn compileLetStar(
         // RHS is non-tail (recur invalid in let-binding RHS).
         try compileExpr(e, b.value, slot, null);
 
-        // Pre-analyze (peer-AI turn 45 env-aware variant): is
+        // Pre-analyze (env-aware): is
         // this binding captured by any inner fn_star in the
         // REMAINING bindings or the body? `env` is just this
         // single name — the analyzer's shadowing handling
@@ -3514,8 +3427,7 @@ fn compileLetStar(
     try compileExpr(e, body, dst, recur_target);
 }
 
-/// Step #9.1/#9.2 (peer-AI turns 59/61): lower `(try body
-/// (catch any binding handler) (finally body))`.
+/// Lower `(try body (catch any binding handler) (finally body))`.
 ///
 /// Layout WITHOUT finally:
 ///   try-enter catch_pc binding_slot _
@@ -3526,7 +3438,7 @@ fn compileLetStar(
 ///   try-exit post_pc
 /// post_pc:
 ///
-/// Layout WITH finally (step #9.2):
+/// Layout WITH finally:
 ///   try-enter catch_pc binding_slot finally_pc
 ///   <body → dst>
 ///   try-exit post_pc          ; VM pushes .normal(post_pc),
@@ -3552,7 +3464,7 @@ fn compileTry(
     finally_: ?*const Tiny,
     dst: u12,
 ) CompileError!void {
-    // Reject captured catch binding per #9.1 staging.
+    // A catch binding captured by an inner fn is unsupported.
     {
         var env: NameSet = .{};
         defer env.deinit(e.allocator);
@@ -3626,7 +3538,7 @@ fn compileTry(
     }
 }
 
-/// Step #9.1: compile `(throw value)`. Compile value into a
+/// Compile `(throw value)`. Compile value into a
 /// fresh slot (we use `dst` since the throw never returns
 /// normally — the dst slot's prior contents don't matter),
 /// then emit `ctrl:throw <dst>`.
@@ -3636,7 +3548,7 @@ fn compileThrow(e: *Emitter, value: *const Tiny, dst: u12) CompileError!void {
 }
 
 /// Lower `(loop* [b1 v1 b2 v2 ...] body)` per COMPILER.md §5.7
-/// + VM.md §11 (peer-AI turn 47).
+/// + VM.md §11.
 ///
 /// Same as `let*` for binding setup (sequential RHS visibility +
 /// captured-binding cells via pre-analysis). After the bindings
@@ -3644,7 +3556,7 @@ fn compileThrow(e: *Emitter, value: *const Tiny, dst: u12) CompileError!void {
 /// loop `RecurTarget` so any `(recur ...)` in tail position
 /// rebinds the loop slots and jumps back to entry.
 ///
-/// Entry-PC placement (peer-AI turn 47 §7 catch): AFTER the
+/// Entry-PC placement: AFTER the
 /// binding setup + captured-binding boxing prelude. Jumping
 /// back must NOT re-evaluate initial RHSs and must NOT re-box
 /// the binding slots — the recur path handles cell installation
@@ -3658,7 +3570,7 @@ fn compileLoopStar(
     const mark = e.scope.items.len;
     defer e.scope.shrinkRetainingCapacity(mark);
 
-    // Step 1-3: bind values, box captured bindings, push scope
+    // 1-3. Bind values, box captured bindings, push scope
     // entries (mirrors compileLetStar logic exactly).
     const binding_slots = try e.allocator.alloc(u12, bindings.len);
     defer e.allocator.free(binding_slots);
@@ -3699,7 +3611,7 @@ fn compileLoopStar(
         }
     }
 
-    // Step 4: mark entry PC (AFTER box-local prelude).
+    // 4. Mark entry PC (AFTER box-local prelude).
     const entry_pc = try e.checkJumpTarget(e.currentPc());
     const loop_target = RecurTarget{
         .entry_pc = entry_pc,
@@ -3708,15 +3620,14 @@ fn compileLoopStar(
         .kind = .loop_star,
     };
 
-    // Step 5: compile body with the loop target installed. The
+    // 5. Compile body with the loop target installed. The
     // body REPLACES (not propagates) any outer recur target —
     // a recur inside the body always targets THIS loop, not an
-    // enclosing one (peer-AI turn 47 §Q1 / nested-loop rule).
+    // enclosing one (nested-loop rule).
     try compileExpr(e, body, dst, &loop_target);
 }
 
-/// Lower `(recur args...)` per COMPILER.md §5.6 + VM.md §11
-/// (peer-AI turn 47).
+/// Lower `(recur args...)` per COMPILER.md §5.6 + VM.md §11.
 ///
 /// `recur_target` is the nearest enclosing `loop*` or `fn*`'s
 /// target, threaded from compileExpr. If `null`, the `recur`
@@ -3738,17 +3649,15 @@ fn compileLoopStar(
 /// `dst` is never written: `recur` jumps unconditionally before
 /// reaching any code that would consume dst. Surrounding control
 /// flow (e.g., `if`'s end-jmp) may emit unreachable code after
-/// the recur — harmless, per peer-AI turn 47 §7 dead-code note.
+/// the recur — harmless dead code.
 fn compileRecur(
     e: *Emitter,
     args: []const *const Tiny,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
     const target = recur_target orelse return CompileError.RecurOutsideTail;
-    // Step 5e: variadic-fn-target recur is deliberately
-    // rejected for v1 (peer-AI turn 49). Proper lowering
-    // requires rebuilding the rest list per iteration; lands
-    // in a separate sub-step.
+    // Variadic-fn-target recur is rejected: proper lowering
+    // would have to rebuild the rest list per iteration.
     if (target.variadic) return CompileError.UnsupportedFeature;
     if (args.len != target.binding_slots.len) return CompileError.RecurArityMismatch;
 
@@ -3799,7 +3708,7 @@ fn compileDo(
         return;
     }
     // Multi-expression: ALL non-last go to a SHARED discard
-    // slot (peer-AI turn 38: avoids the 999-slot blowup that
+    // slot (avoids the 999-slot blowup that
     // `(do e1 e2 ... e1000)` would cause with fresh-per-expr
     // allocation). Reusing one discard slot for all ignored
     // results is the natural meaning of "compile this for its
@@ -3818,15 +3727,10 @@ fn compileDo(
 /// pool, register an empty capture descriptor in the parent's
 /// capture table, emit `closure:make` in the parent.
 ///
-/// **Step 5a1 restriction** (peer-AI turn 42): only empty-capture
-/// closures. The child Emitter has NO parent pointer; any free
-/// variable reference in the body raises `UnresolvedSymbol`.
-/// Capture support lands in 5b.
-///
-/// Named `fn*` (self-name) is deferred to 5c per turn 42 — for
-/// step 5a1, `Tiny.fn_star` carries no name field. When 5c lands,
-/// the name extends `Tiny.fn_star` and a placeholder-cell
-/// pattern handles self-reference.
+/// The child Emitter is linked to the parent, so free variable
+/// references in the body resolve to captures through the
+/// parent chain. A named `fn*` whose body references its own
+/// name uses the placeholder-cell pattern for self-reference.
 fn compileFn(
     parent: *Emitter,
     name: ?[]const u8,
@@ -3835,25 +3739,25 @@ fn compileFn(
     body: *const Tiny,
     dst: u12,
 ) CompileError!void {
-    // Reject duplicate parameter names (peer-AI turn 40).
-    // O(N²) is fine for v1; nexis fns are rarely high-arity.
+    // Reject duplicate parameter names. O(N²); nexis fns are
+    // rarely high-arity.
     for (params, 0..) |p, i| {
         for (params[0..i]) |q| {
             if (std.mem.eql(u8, p, q)) return CompileError.DuplicateParam;
         }
     }
-    // Step 5e: rest param can't shadow any fixed param.
+    // The rest param can't shadow any fixed param.
     if (rest_param) |rp| {
         for (params) |p| {
             if (std.mem.eql(u8, rp, p)) return CompileError.DuplicateParam;
         }
     }
-    // Per peer-AI turn 43: argc encodes in a 12-bit operand
+    // argc encodes in a 12-bit operand
     // (max 4095), AND a fresh result slot must fit above the
     // params (so max practical arity is 4095). Reject > 4095.
     if (params.len > 4095) return CompileError.SlotOverflow;
 
-    // Step 5c (named fn* self-reference): if the fn has a
+    // Named fn* self-reference: if the fn has a
     // self-name AND the body references it, use the placeholder-
     // cell pattern (per COMPILER.md §5.5 + §6 + §6.1). Allocate
     // a cell in PARENT's frame BEFORE compiling the child body
@@ -3883,10 +3787,10 @@ fn compileFn(
         try parent.emit(vm.asm_.closureNewCell(self_cell_slot));
     }
 
-    // Spawn child Emitter linked to parent (step 5b: parent
-    // pointer enables capture discovery; was null in 5a1).
+    // Spawn child Emitter linked to parent (the parent pointer
+    // enables capture discovery).
     //
-    // Use `defer` (not `errdefer`) per peer-AI turn 43: after a
+    // Use `defer` (not `errdefer`): after a
     // successful `child.finish()`, the transferred ArrayLists
     // (code/consts/capture_descs) are emptied via `toOwnedSlice`,
     // but `child.scope` and `child.captures` retain their
@@ -3896,10 +3800,10 @@ fn compileFn(
     // correct.
     var child = Emitter.init(parent.allocator);
     child.parent = parent;
-    child.namespace = parent.namespace; // step #6b: inherit ns for def/var resolution
+    child.namespace = parent.namespace; // inherit ns for def/var resolution
     defer child.deinit();
 
-    // Step 5c: inject self-name as a pre-existing capture so
+    // Inject self-name as a pre-existing capture so
     // the body's references resolve to upvalue 0 (sourced from
     // the placeholder cell allocated above). The capture
     // descriptor's local_cell_slot source for upvalue 0 will
@@ -3909,8 +3813,8 @@ fn compileFn(
         try child.captured_names.append(child.allocator, .{ .name = name.?, .upvalue = 0 });
     }
 
-    // Pre-analyze body to find captured params (peer-AI turn 44,
-    // env-aware per turn 45): pass the param set as `env` so
+    // Pre-analyze body to find captured params (env-aware):
+    // pass the param set as `env` so
     // the analyzer only reports captures matching one of OUR
     // params (and not, e.g., a same-named binding shadowed
     // inside an inner let_star).
@@ -3940,7 +3844,7 @@ fn compileFn(
         }
     }
 
-    // Step 5e: rest parameter lives at slot `params.len`. The VM
+    // The rest parameter lives at slot `params.len`. The VM
     // packs excess args into a list and installs it there at
     // call time (before any of the fn body runs). Treat the
     // rest binding like any other param for capture/scope.
@@ -3958,7 +3862,7 @@ fn compileFn(
         }
     }
 
-    // Step 5d2: set up fn RecurTarget so `(recur ...)` inside
+    // Set up fn RecurTarget so `(recur ...)` inside
     // the body (with no enclosing `loop*`) rebinds the params
     // and jumps back to the entry point. Captured params get
     // fresh cells per iteration (per VM.md §11 + COMPILER.md
@@ -3968,12 +3872,11 @@ fn compileFn(
     // back must NOT re-box params (would lose the previous
     // iteration's mutated cell pointer); it must land where the
     // body begins reading.
-    // RecurTarget covers only FIXED params (step 5e). For
+    // RecurTarget covers only FIXED params. For
     // variadic fns the `variadic` flag is true; compileRecur
-    // traps `UnsupportedFeature` rather than emit subtly-wrong
+    // raises `UnsupportedFeature` rather than emit subtly-wrong
     // code that rebinds fixed params but leaves the rest list
-    // stale (peer-AI turn 49 — proper variadic recur lands
-    // later).
+    // stale.
     const param_slots = try parent.allocator.alloc(u12, params.len);
     defer parent.allocator.free(param_slots);
     const captured_mask = try parent.allocator.alloc(bool, params.len);
@@ -3998,7 +3901,7 @@ fn compileFn(
     try compileExpr(&child, body, result_slot, &fn_target);
     try child.emit(vm.asm_.returnSlot(result_slot));
 
-    // Step 5b: capture descriptor sources come from
+    // Capture descriptor sources come from
     // `child.captures` (accumulated by `resolveOrCapture`
     // during child body compilation). Snapshot them before
     // `child.finish()` clears them, then register the
@@ -4014,8 +3917,8 @@ fn compileFn(
     const child_compiled = try child.finish();
 
     // Allocate the Routine on the parent's compile arena so its
-    // pointer outlives both Compiled artifacts (peer-AI turn 42:
-    // compile-arena-owned routine tree).
+    // pointer outlives both Compiled artifacts
+    // (compile-arena-owned routine tree).
     const child_routine = try parent.allocator.create(vm.Routine);
     child_routine.* = .{
         .code = child_compiled.code,
@@ -4037,7 +3940,7 @@ fn compileFn(
     // Emit closure:make in parent.
     try parent.emit(vm.asm_.closureMake(proto_idx, cap_desc_idx, dst));
 
-    // Step 5c: if self-referenced, finalize the placeholder
+    // If self-referenced, finalize the placeholder
     // cell with the just-constructed closure. The cell now
     // holds the closure; subsequent invocations of the
     // closure deref upvalue 0 to find itself.
@@ -4049,7 +3952,7 @@ fn compileFn(
 /// Lower `letfn*` per COMPILER.md §5.6b: mutually-recursive
 /// function bindings via the placeholder-cell pattern.
 ///
-/// Sequence (peer-AI turn 34 + COMPILER.md §5.6b):
+/// Sequence (COMPILER.md §5.6b):
 ///   1. Allocate placeholder cells: `closure:new-cell` for
 ///      each binding's name. Push each into scope as
 ///      `.cell_slot`.
@@ -4084,7 +3987,7 @@ fn compileLetFnStar(
     const scope_mark = e.scope.items.len;
     defer e.scope.shrinkRetainingCapacity(scope_mark);
 
-    // Step 1: allocate placeholder cells for each binding;
+    // 1. Allocate placeholder cells for each binding;
     // push each into scope as .cell_slot. Cells must exist
     // BEFORE any closure:make so the cap_desc local_cell_slot
     // sources can reference them.
@@ -4100,7 +4003,7 @@ fn compileLetFnStar(
         });
     }
 
-    // Step 2: compile each fn (constructing closures). We
+    // 2. Compile each fn (constructing closures). We
     // allocate a fresh result slot for each closure value.
     // The fn bodies see all letfn* names in scope (as
     // .cell_slot via the entries we just pushed).
@@ -4121,12 +4024,12 @@ fn compileLetFnStar(
         try compileFn(e, null, b.params, null, b.body, cs);
     }
 
-    // Step 3: init each cell with its closure.
+    // 3. Init each cell with its closure.
     for (bindings, 0..) |_, i| {
         try e.emit(vm.asm_.closureInitCell(cell_slots[i], vm.Operand.slot(closure_slots[i])));
     }
 
-    // Step 4: compile body in the now-fully-bound scope. Body
+    // 4. Compile body in the now-fully-bound scope. Body
     // is in tail position relative to the enclosing form; inherit
     // recur target.
     try compileExpr(e, body, dst, recur_target);
@@ -4136,12 +4039,12 @@ fn compileLetFnStar(
 /// contiguous call block per VM.md §6 range-call ABI, emit
 /// `call:call`. The result lands in `dst`.
 ///
-/// **Critical** (peer-AI turn 43): the entire `1 + args.len`
+/// **Critical**: the entire `1 + args.len`
 /// contiguous call block MUST be reserved BEFORE compiling
-/// any sub-expression. An earlier per-arg allocSlot pattern
-/// silently broke when the callee or any arg's compilation
-/// allocated its own temp slots — the next arg's allocated
-/// slot would no longer be adjacent to the previous one,
+/// any sub-expression. A per-arg allocSlot pattern breaks
+/// silently when the callee or any arg's compilation
+/// allocates its own temp slots — the next arg's allocated
+/// slot is then not adjacent to the previous one,
 /// violating the range-call ABI invariant. Reserve up front;
 /// each sub-expression then targets its predetermined slot.
 ///
@@ -4193,7 +4096,7 @@ fn compileIf(
 ) CompileError!void {
     // Lower the test into a fresh temp slot; we can't reuse `dst`
     // because the test value would be overwritten by either arm.
-    // Test is NON-tail (peer-AI turn 47).
+    // Test is NON-tail.
     const t_test = try e.allocSlot();
     try compileExpr(e, test_form, t_test, null);
 
@@ -4207,7 +4110,7 @@ fn compileIf(
     // Emit `jump:jmp PLACEHOLDER` to skip past the else-arm.
     // Remember its PC for back-patching to end-label.
     // (If then_form was a recur, this jump is unreachable but
-    // harmless — see peer-AI turn 47 §7 dead-code note.)
+    // harmless dead code.)
     const end_jmp_pc = try e.emitJumpPlaceholder();
 
     // Else-label is at the current PC.
@@ -4318,9 +4221,9 @@ test "compile + run: (+ fixnum_max 1) compiles but VM traps overflow" {
     try testing.expectError(vm.VmError.ArithmeticOverflow, res);
 }
 
-// ---- step 5d0: cmp:lt tests ----
+// ---- cmp:lt tests ----
 
-test "compile 5d0: (< 1 2) = true" {
+test "compile lt: (< 1 2) = true" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const result = try runTiny(&arena, &.{ .lt = .{ .lhs = &.{ .int = 1 }, .rhs = &.{ .int = 2 } } });
@@ -4328,21 +4231,21 @@ test "compile 5d0: (< 1 2) = true" {
     try testing.expectEqual(true, result.asBool());
 }
 
-test "compile 5d0: (< 2 1) = false" {
+test "compile lt: (< 2 1) = false" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const result = try runTiny(&arena, &.{ .lt = .{ .lhs = &.{ .int = 2 }, .rhs = &.{ .int = 1 } } });
     try testing.expectEqual(false, result.asBool());
 }
 
-test "compile 5d0: (< 3 3) = false — strict less-than" {
+test "compile lt: (< 3 3) = false — strict less-than" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const result = try runTiny(&arena, &.{ .lt = .{ .lhs = &.{ .int = 3 }, .rhs = &.{ .int = 3 } } });
     try testing.expectEqual(false, result.asBool());
 }
 
-test "compile 5d0: (if (< x 5) 'lt' 'ge') threads through if" {
+test "compile lt: (if (< x 5) 'lt' 'ge') threads through if" {
     // (let* [x 3] (if (< x 5) 1 0)) = 1
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4360,7 +4263,7 @@ test "compile 5d0: (if (< x 5) 'lt' 'ge') threads through if" {
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
-test "compile 5d0: nested (< (+ a b) c) — operands are sub-expressions" {
+test "compile lt: nested (< (+ a b) c) — operands are sub-expressions" {
     // (let* [a 1 b 2 c 4] (< (+ a b) c)) = true (3 < 4)
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4378,9 +4281,9 @@ test "compile 5d0: nested (< (+ a b) c) — operands are sub-expressions" {
     try testing.expectEqual(true, result.asBool());
 }
 
-// ---- step 5d1 / 5d2: loop* + recur tests ----
+// ---- loop* + recur tests ----
 
-test "compile 5d1: (loop* [i 0] i) — degenerate loop, body returns binding" {
+test "compile loop: (loop* [i 0] i) — degenerate loop, body returns binding" {
     // No recur — just a single-iteration "loop".
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4392,7 +4295,7 @@ test "compile 5d1: (loop* [i 0] i) — degenerate loop, body returns binding" {
     try testing.expectEqual(@as(i64, 7), result.asFixnum());
 }
 
-test "compile 5d1: (loop* [i 0] (if (< i 1) (recur (+ i 1)) i)) = 1 — one iteration" {
+test "compile loop: (loop* [i 0] (if (< i 1) (recur (+ i 1)) i)) = 1 — one iteration" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const recur_arg: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
@@ -4411,7 +4314,7 @@ test "compile 5d1: (loop* [i 0] (if (< i 1) (recur (+ i 1)) i)) = 1 — one iter
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
-test "compile 5d1: (loop* [i 0 acc 0] (if (< i 10) (recur (+ i 1) (+ acc i)) acc)) = 45" {
+test "compile loop: (loop* [i 0 acc 0] (if (< i 10) (recur (+ i 1) (+ acc i)) acc)) = 45" {
     // Sum 0..9 via two-binding loop.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4435,8 +4338,8 @@ test "compile 5d1: (loop* [i 0 acc 0] (if (< i 10) (recur (+ i 1) (+ acc i)) acc
     try testing.expectEqual(@as(i64, 45), result.asFixnum());
 }
 
-test "compile 5d1: 10k iteration loop runs in CONSTANT stack space" {
-    // Per peer-AI turn 47 §Q5: assert stack_high_water doesn't
+test "compile loop: 10k iteration loop runs in CONSTANT stack space" {
+    // Assert stack_high_water doesn't
     // grow with iteration count. Final-length check is
     // insufficient (buggy impl could grow + shrink to land at
     // the same final value); we check the high-water mark
@@ -4470,7 +4373,7 @@ test "compile 5d1: 10k iteration loop runs in CONSTANT stack space" {
     try testing.expectEqual(frames_before, v.frame_high_water);
 }
 
-test "compile 5d1: (loop* [a 1 b 2] (if false (recur b a) (+ a b))) = 3 — aliasing recur (untaken)" {
+test "compile loop: (loop* [a 1 b 2] (if false (recur b a) (+ a b))) = 3 — aliasing recur (untaken)" {
     // Aliasing pattern `(recur b a)` would corrupt without
     // parallel-assignment temps. Branch untaken, but compiles +
     // verifies no analyzer/codegen error.
@@ -4496,7 +4399,7 @@ test "compile 5d1: (loop* [a 1 b 2] (if false (recur b a) (+ a b))) = 3 — alia
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
 }
 
-test "compile 5d1: (loop* [a 1 b 2] (if true (recur b a) (+ a b))) — recur b a swaps then if continued" {
+test "compile loop: (loop* [a 1 b 2] (if true (recur b a) (+ a b))) — recur b a swaps then if continued" {
     // Same as above but recur IS taken once. Use a counter to
     // limit. Verify parallel-assignment actually swapped:
     //   (loop* [a 1 b 2 c 0]
@@ -4531,7 +4434,7 @@ test "compile 5d1: (loop* [a 1 b 2] (if true (recur b a) (+ a b))) — recur b a
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
 }
 
-test "compile 5d1: captured loop binding gets fresh cell per iteration (peer-AI turn 47 canonical test)" {
+test "compile: captured loop binding gets fresh cell per iteration" {
     // (loop* [i 0 f (fn* [] 999)]
     //   (if (< i 1)
     //     (recur (+ i 1) (fn* [] i))
@@ -4569,7 +4472,7 @@ test "compile 5d1: captured loop binding gets fresh cell per iteration (peer-AI 
     try testing.expectEqual(@as(i64, 0), result.asFixnum());
 }
 
-test "compile 5d2: fn* recur self-call — (fn* [n] (if (< n 5) (recur (+ n 1)) n)) called with 0 = 5" {
+test "compile fn-recur: fn* recur self-call — (fn* [n] (if (< n 5) (recur (+ n 1)) n)) called with 0 = 5" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const n_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 1 } } };
@@ -4586,7 +4489,7 @@ test "compile 5d2: fn* recur self-call — (fn* [n] (if (< n 5) (recur (+ n 1)) 
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5d2: nested fn* RESETS recur target (recur in inner fn targets inner, not outer loop)" {
+test "compile fn-recur: nested fn* RESETS recur target (recur in inner fn targets inner, not outer loop)" {
     // (loop* [i 0]
     //   ((fn* [j] (if (< j 1) (recur (+ j 1)) (+ i j)))
     //    0))
@@ -4618,7 +4521,7 @@ test "compile 5d2: nested fn* RESETS recur target (recur in inner fn targets inn
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
-test "compile 5d1: recur outside tail (in let RHS) → RecurOutsideTail" {
+test "compile loop: recur outside tail (in let RHS) → RecurOutsideTail" {
     // (loop* [i 0] (let* [x (recur 1)] x))
     // recur is in let-binding RHS, which is NON-tail.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -4635,7 +4538,7 @@ test "compile 5d1: recur outside tail (in let RHS) → RecurOutsideTail" {
     try testing.expectError(CompileError.RecurOutsideTail, compileTiny(arena.allocator(), &loop_form));
 }
 
-test "compile 5d1: recur outside any loop/fn → RecurOutsideTail" {
+test "compile loop: recur outside any loop/fn → RecurOutsideTail" {
     // Top-level recur with no enclosing target.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4643,7 +4546,7 @@ test "compile 5d1: recur outside any loop/fn → RecurOutsideTail" {
     try testing.expectError(CompileError.RecurOutsideTail, compileTiny(arena.allocator(), &form));
 }
 
-test "compile 5d1: recur arity mismatch → RecurArityMismatch" {
+test "compile loop: recur arity mismatch → RecurArityMismatch" {
     // (loop* [i 0] (recur 1 2)) — loop has 1 binding, recur gives 2 args.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4655,7 +4558,7 @@ test "compile 5d1: recur arity mismatch → RecurArityMismatch" {
     try testing.expectError(CompileError.RecurArityMismatch, compileTiny(arena.allocator(), &form));
 }
 
-test "compile 5d2: fn* recur arity mismatch → RecurArityMismatch" {
+test "compile fn-recur: fn* recur arity mismatch → RecurArityMismatch" {
     // (fn* [a b] (recur 1)) — fn has 2 params, recur gives 1 arg.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4664,7 +4567,7 @@ test "compile 5d2: fn* recur arity mismatch → RecurArityMismatch" {
     try testing.expectError(CompileError.RecurArityMismatch, compileTiny(arena.allocator(), &fn_form));
 }
 
-test "compile 5d1: recur in (do non-last) is non-tail → RecurOutsideTail" {
+test "compile loop: recur in (do non-last) is non-tail → RecurOutsideTail" {
     // (loop* [i 0] (do (recur 1) i))
     // recur is non-last in do → non-tail.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -4678,7 +4581,7 @@ test "compile 5d1: recur in (do non-last) is non-tail → RecurOutsideTail" {
     try testing.expectError(CompileError.RecurOutsideTail, compileTiny(arena.allocator(), &form));
 }
 
-test "compile 5d1: recur in (do last) IS tail position" {
+test "compile loop: recur in (do last) IS tail position" {
     // (loop* [i 0] (do (if (< i 1) (recur (+ i 1)) i))) = 1
     // recur is inside (do (if ...)) — last of do, then-arm of
     // if, tail of loop body. All tail-inheriting → works.
@@ -4701,9 +4604,9 @@ test "compile 5d1: recur in (do last) IS tail position" {
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
-test "compile 5d1: loop* body can read outer let binding (lexical reference, not a closure capture)" {
+test "compile loop: loop* body can read outer let binding (lexical reference, not a closure capture)" {
     // (let* [x 100] (loop* [i 0] (if (< i 1) (recur (+ i x)) i))) = 100
-    // Renamed per peer-AI turn 48: no closure involved; just a
+    // No closure involved; just a
     // same-routine lexical reference to outer x from inside the
     // loop body. (Actual cross-routine capture goes through fn*.)
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -4728,7 +4631,7 @@ test "compile 5d1: loop* body can read outer let binding (lexical reference, not
     try testing.expectEqual(@as(i64, 100), result.asFixnum());
 }
 
-test "compile 5d2: captured fn* param gets fresh cell across recur (peer-AI turn 48 analog)" {
+test "compile fn-recur: captured fn* param gets fresh cell across recur" {
     // ((fn* [i f]
     //    (if (< i 1)
     //      (recur (+ i 1) (fn* [] i))
@@ -4760,7 +4663,7 @@ test "compile 5d2: captured fn* param gets fresh cell across recur (peer-AI turn
     try testing.expectEqual(@as(i64, 0), result.asFixnum());
 }
 
-test "compile 5d1: letfn* body inherits enclosing loop's recur target" {
+test "compile loop: letfn* body inherits enclosing loop's recur target" {
     // (loop* [i 0]
     //   (letfn* [(f [] 1)]
     //     (if (< i 1)
@@ -4768,7 +4671,7 @@ test "compile 5d1: letfn* body inherits enclosing loop's recur target" {
     //       i))) = 1
     // The recur sits inside letfn* body's if-then. letfn body
     // must propagate the outer loop's recur target so recur
-    // can find it (peer-AI turn 47: letfn body inherits target).
+    // can find it (letfn body inherits the target).
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const i_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "i" }, .rhs = &.{ .int = 1 } } };
@@ -4791,7 +4694,7 @@ test "compile 5d1: letfn* body inherits enclosing loop's recur target" {
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
-test "compile 5d2: recur inside letfn* fn body targets that fn (RESET at fn boundary)" {
+test "compile fn-recur: recur inside letfn* fn body targets that fn (RESET at fn boundary)" {
     // (letfn* [(f [n] (if (< n 3) (recur (+ n 1)) n))] (f 0)) = 3
     // The recur inside f targets f's params (fresh fn RecurTarget
     // set up by compileFn called from compileLetFnStar), NOT any
@@ -4815,9 +4718,9 @@ test "compile 5d2: recur inside letfn* fn body targets that fn (RESET at fn boun
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
 }
 
-test "compile 5d1: recur in if-test position → RecurOutsideTail" {
+test "compile loop: recur in if-test position → RecurOutsideTail" {
     // (loop* [i 0] (if (recur 1) i i))
-    // recur is in if's TEST, which is non-tail (peer-AI turn 48).
+    // recur is in if's TEST, which is non-tail.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const recur_form: Tiny = .{ .recur = .{ .args = &.{&.{ .int = 1 }} } };
@@ -4833,7 +4736,7 @@ test "compile 5d1: recur in if-test position → RecurOutsideTail" {
     try testing.expectError(CompileError.RecurOutsideTail, compileTiny(arena.allocator(), &form));
 }
 
-test "compile 5d1: recur in call-arg position → RecurOutsideTail" {
+test "compile loop: recur in call-arg position → RecurOutsideTail" {
     // (loop* [i 0] ((fn* [x] x) (recur 1)))
     // recur is a call argument, which is non-tail.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -4848,7 +4751,7 @@ test "compile 5d1: recur in call-arg position → RecurOutsideTail" {
     try testing.expectError(CompileError.RecurOutsideTail, compileTiny(arena.allocator(), &form));
 }
 
-test "compile 5d1: nested loop* — inner recur targets inner loop only" {
+test "compile loop: nested loop* — inner recur targets inner loop only" {
     // (loop* [i 0]
     //   (loop* [j 0]
     //     (if (< j 1) (recur (+ j 1)) (+ i j))))
@@ -4877,9 +4780,9 @@ test "compile 5d1: nested loop* — inner recur targets inner loop only" {
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
-// ---- step 5e: variadic params (& rest) tests ----
+// ---- variadic params (& rest) tests ----
 
-test "compile 5e: ((fn* [a & r] a) 1 2 3) = 1 — rest collected but unused" {
+test "compile variadic: ((fn* [a & r] a) 1 2 3) = 1 — rest collected but unused" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const fn_form: Tiny = .{ .fn_star = .{
@@ -4895,7 +4798,7 @@ test "compile 5e: ((fn* [a & r] a) 1 2 3) = 1 — rest collected but unused" {
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
-test "compile 5e: ((fn* [a & r] r) 1 2 3) returns list (2 3)" {
+test "compile variadic: ((fn* [a & r] r) 1 2 3) returns list (2 3)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const fn_form: Tiny = .{ .fn_star = .{
@@ -4916,7 +4819,7 @@ test "compile 5e: ((fn* [a & r] r) 1 2 3) returns list (2 3)" {
     try testing.expectEqual(@as(i64, 3), list_mod.head(tail).asFixnum());
 }
 
-test "compile 5e: ((fn* [a & r] r) 1) returns empty list — argc == fixed_arity" {
+test "compile variadic: ((fn* [a & r] r) 1) returns empty list — argc == fixed_arity" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const fn_form: Tiny = .{ .fn_star = .{
@@ -4934,9 +4837,9 @@ test "compile 5e: ((fn* [a & r] r) 1) returns empty list — argc == fixed_arity
     try testing.expectEqual(@as(usize, 0), list_mod.count(result));
 }
 
-test "compile 5e: ((fn* [& r] r) 1 2 3 4) — fixed_arity 0 variadic, all args to rest" {
-    // Verifies element ORDER and contents, not just count
-    // (peer-AI turn 50): list should be (1 2 3 4), not e.g.
+test "compile variadic: ((fn* [& r] r) 1 2 3 4) — fixed_arity 0 variadic, all args to rest" {
+    // Verifies element ORDER and contents, not just count:
+    // list should be (1 2 3 4), not e.g.
     // reversed or with stale values.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -4959,7 +4862,7 @@ test "compile 5e: ((fn* [& r] r) 1 2 3 4) — fixed_arity 0 variadic, all args t
     }
 }
 
-test "compile 5e: ((fn* [& r] r)) — fixed_arity 0 variadic, no args" {
+test "compile variadic: ((fn* [& r] r)) — fixed_arity 0 variadic, no args" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const fn_form: Tiny = .{ .fn_star = .{
@@ -4972,7 +4875,7 @@ test "compile 5e: ((fn* [& r] r)) — fixed_arity 0 variadic, no args" {
     try testing.expect(list_mod.isEmpty(result));
 }
 
-test "compile 5e: variadic with too few args traps :arity-mismatch at runtime" {
+test "compile variadic: variadic with too few args traps :arity-mismatch at runtime" {
     // (fn* [a b & r] ...) requires >= 2 args; calling with 1
     // must trap.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -4993,11 +4896,11 @@ test "compile 5e: variadic with too few args traps :arity-mismatch at runtime" {
     try testing.expectError(vm.VmError.ArityMismatch, v.run());
 }
 
-test "compile 5e: variadic captured rest param survives across fn returns" {
+test "compile variadic: variadic captured rest param survives across fn returns" {
     // (((fn* [a & r] (fn* [] r)) 1 2 3))
     // Outer fn captures r as upvalue of inner fn; inner returns
     // r. Result should be list (2 3) — verify CONTENTS, not
-    // just count (peer-AI turn 50: count check wouldn't catch
+    // just count (a count check wouldn't catch
     // the "list of nils" hazard if it regressed).
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5019,7 +4922,7 @@ test "compile 5e: variadic captured rest param survives across fn returns" {
     try testing.expectEqual(@as(i64, 3), list_mod.head(list_mod.tail(result)).asFixnum());
 }
 
-test "compile 5e: duplicate rest+fixed name → DuplicateParam" {
+test "compile variadic: duplicate rest+fixed name → DuplicateParam" {
     // (fn* [a & a] a) — rest name shadows fixed param.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5031,9 +4934,8 @@ test "compile 5e: duplicate rest+fixed name → DuplicateParam" {
     try testing.expectError(CompileError.DuplicateParam, compileTiny(arena.allocator(), &fn_form));
 }
 
-test "compile 5e: recur in variadic fn body → UnsupportedFeature" {
-    // (fn* [a & r] (recur 1)) — variadic recur deferred per
-    // peer-AI turn 49.
+test "compile variadic: recur in variadic fn body → UnsupportedFeature" {
+    // (fn* [a & r] (recur 1)) — variadic recur is unsupported.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const recur_form: Tiny = .{ .recur = .{ .args = &.{&.{ .int = 1 }} } };
@@ -5045,9 +4947,9 @@ test "compile 5e: recur in variadic fn body → UnsupportedFeature" {
     try testing.expectError(CompileError.UnsupportedFeature, compileTiny(arena.allocator(), &fn_form));
 }
 
-test "compile 5e: recur in NON-variadic fn body still works (regression check for 5d2)" {
-    // Make sure my variadic-recur rejection didn't break
-    // ordinary fn-recur from 5d2.
+test "compile variadic: recur in NON-variadic fn body is unaffected by the variadic rejection" {
+    // The variadic-recur rejection must not affect ordinary
+    // fn-recur.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const n_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 1 } } };
@@ -5064,12 +4966,12 @@ test "compile 5e: recur in NON-variadic fn body still works (regression check fo
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
 }
 
-// ---- step #6b: def + var + symbol fall-through tests ----
+// ---- def + var + symbol fall-through tests ----
 
 /// Helper: compile + run with a namespace owned by a VM.
 /// Builds a stub VM (just to own the namespace), gets the
 /// namespace, compiles with it, then patches the VM's top
-/// frame to the real routine. Same pattern as the #6a tests.
+/// frame to the real routine.
 fn runTinyWithNs(
     arena: *std.heap.ArenaAllocator,
     form: *const Tiny,
@@ -5085,7 +4987,7 @@ fn runTinyWithNs(
     return try v.run();
 }
 
-test "compile #6b: (def x 5) returns the Var object" {
+test "compile def: (def x 5) returns the Var object" {
     // Manage VM lifetime explicitly — the returned Var pointer
     // lives in vm.runtime_arena, so the VM must outlive the
     // Var-kind result inspection. (The runTinyWithNs helper
@@ -5112,7 +5014,7 @@ test "compile #6b: (def x 5) returns the Var object" {
     try testing.expectEqualStrings("x", var_obj.name);
 }
 
-test "compile #6b: (do (def x 5) x) reads root via symbol fall-through" {
+test "compile def: (do (def x 5) x) reads root via symbol fall-through" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const def_form: Tiny = .{ .def = .{ .name = "x", .value = &.{ .int = 5 } } };
@@ -5122,7 +5024,7 @@ test "compile #6b: (do (def x 5) x) reads root via symbol fall-through" {
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile #6b: (do (def x 5) (def x 10) x) — rebind preserves identity" {
+test "compile def: (do (def x 5) (def x 10) x) — rebind preserves identity" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const def1: Tiny = .{ .def = .{ .name = "x", .value = &.{ .int = 5 } } };
@@ -5132,7 +5034,7 @@ test "compile #6b: (do (def x 5) (def x 10) x) — rebind preserves identity" {
     try testing.expectEqual(@as(i64, 10), result.asFixnum());
 }
 
-test "compile #6b: (var x) returns the Var object (unbound OK)" {
+test "compile def: (var x) returns the Var object (unbound OK)" {
     // Same lifetime pattern as the def test above.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5154,7 +5056,7 @@ test "compile #6b: (var x) returns the Var object (unbound OK)" {
     try testing.expectEqualStrings("unbound-yet", var_obj.name);
 }
 
-test "compile #6b: reading an unbound Var traps :unbound-var at runtime" {
+test "compile def: reading an unbound Var traps :unbound-var at runtime" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     // No def; just reference unresolved symbol — compileSymbol
@@ -5171,23 +5073,23 @@ test "compile #6b: reading an unbound Var traps :unbound-var at runtime" {
     try testing.expectError(vm.VmError.UnboundVar, v.run());
 }
 
-test "compile #6b: without a namespace, unresolved symbol still raises UnresolvedSymbol" {
-    // Regression: compileTiny (no namespace) must keep the
-    // pre-#6b error semantics.
+test "compile def: without a namespace, unresolved symbol still raises UnresolvedSymbol" {
+    // compileTiny (no namespace) keeps the lexical-only error
+    // semantics.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const form: Tiny = .{ .symbol = "x" };
     try testing.expectError(CompileError.UnresolvedSymbol, compileTiny(arena.allocator(), &form));
 }
 
-test "compile #6b: without a namespace, def raises UnresolvedSymbol" {
+test "compile def: without a namespace, def raises UnresolvedSymbol" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const form: Tiny = .{ .def = .{ .name = "x", .value = &.{ .int = 5 } } };
     try testing.expectError(CompileError.UnresolvedSymbol, compileTiny(arena.allocator(), &form));
 }
 
-test "compile #6b: lexical local shadows namespace Var" {
+test "compile def: lexical local shadows namespace Var" {
     // (def x 100)
     // (let* [x 5] x) = 5 — not 100
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -5202,7 +5104,7 @@ test "compile #6b: lexical local shadows namespace Var" {
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile #6b: same Var referenced multiple times shares one var_table index (dedup)" {
+test "compile def: same Var referenced multiple times shares one var_table index (dedup)" {
     // (do (def x 5) (+ x x)) should produce only ONE
     // var_table entry. Hard to assert directly without
     // inspecting Compiled.var_table.len, but easy via the
@@ -5222,9 +5124,9 @@ test "compile #6b: same Var referenced multiple times shares one var_table index
     try testing.expectEqual(@as(usize, 1), compiled.var_table.len);
 }
 
-// ---- step #6c: defn + forward references tests ----
+// ---- defn + forward references tests ----
 
-test "compile #6c: (do (defn add1 [n] (+ n 1)) (add1 5)) = 6" {
+test "compile defn: (do (defn add1 [n] (+ n 1)) (add1 5)) = 6" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 1 } } };
@@ -5242,7 +5144,7 @@ test "compile #6c: (do (defn add1 [n] (+ n 1)) (add1 5)) = 6" {
     try testing.expectEqual(@as(i64, 6), result.asFixnum());
 }
 
-test "compile #6c: (do (defn zero [] 0) (zero)) = 0 — nullary defn" {
+test "compile defn: (do (defn zero [] 0) (zero)) = 0 — nullary defn" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const defn_form: Tiny = .{ .defn = .{
@@ -5256,7 +5158,7 @@ test "compile #6c: (do (defn zero [] 0) (zero)) = 0 — nullary defn" {
     try testing.expectEqual(@as(i64, 0), result.asFixnum());
 }
 
-test "compile #6c: defn supports recur for self-call (named fn* under the hood)" {
+test "compile defn: defn supports recur for self-call (named fn* under the hood)" {
     // (do (defn loop-down [n]
     //       (if (< n 1) n (recur (+ n -1))))
     //     (loop-down 5)) = 0
@@ -5286,7 +5188,7 @@ test "compile #6c: defn supports recur for self-call (named fn* under the hood)"
     try testing.expectEqual(@as(i64, 0), result.asFixnum());
 }
 
-test "compile #6c: forward reference — defn f calls g defined later" {
+test "compile defn: forward reference — defn f calls g defined later" {
     // (do (defn f [] (g))
     //     (defn g [] 42)
     //     (f)) = 42
@@ -5304,7 +5206,7 @@ test "compile #6c: forward reference — defn f calls g defined later" {
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
 }
 
-test "compile #6c: forward reference + call before bind → UnboundVar trap" {
+test "compile defn: forward reference + call before bind → UnboundVar trap" {
     // (do (defn f [] (g))
     //     (f))                ;; g never defined
     // f compiles (g's Var interned unbound), but invoking f
@@ -5327,7 +5229,7 @@ test "compile #6c: forward reference + call before bind → UnboundVar trap" {
     try testing.expectError(vm.VmError.UnboundVar, v.run());
 }
 
-test "compile #6c: defn rebinding preserves Var identity" {
+test "compile defn: defn rebinding preserves Var identity" {
     // (do (defn f [] 1)
     //     (defn f [] 2)
     //     (f)) = 2
@@ -5343,7 +5245,7 @@ test "compile #6c: defn rebinding preserves Var identity" {
     try testing.expectEqual(@as(i64, 2), result.asFixnum());
 }
 
-test "compile #6c: defn with rest param works end-to-end" {
+test "compile defn: defn with rest param works end-to-end" {
     // (do (defn first-of [a & r] a)
     //     (first-of 7 99 100)) = 7
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -5363,7 +5265,7 @@ test "compile #6c: defn with rest param works end-to-end" {
     try testing.expectEqual(@as(i64, 7), result.asFixnum());
 }
 
-// ---- if-form tests (peer-AI turn 36 checklist) ----
+// ---- if-form tests ----
 
 test "compile: (if true 1 2) = 1" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -5483,7 +5385,7 @@ test "compile: (if (+ 1 2) 'truthy 'falsy) — test is a non-trivial expression"
     try testing.expectEqual(@as(i64, 99), result.asFixnum());
 }
 
-// ---- step #4: symbol / let* / do tests (peer-AI turn 38 checklist) ----
+// ---- symbol / let* / do tests ----
 
 test "compile: bare unresolved symbol surfaces UnresolvedSymbol" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -5663,9 +5565,9 @@ test "compile: if inside let RHS: (let* [x (if false 1 2)] x) = 2" {
 }
 
 test "compile: (do unresolved 1) — non-last expressions still compile" {
-    // Pre-empts a future optimization that might skip non-last
-    // do expressions because their values are discarded
-    // (peer-AI turn 39). Discarded value ≠ discarded compilation:
+    // Pins that non-last do expressions are compiled even
+    // though their values are discarded.
+    // Discarded value ≠ discarded compilation:
     // the side effects of compiling/executing must still occur.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5681,7 +5583,7 @@ test "compile: nested let with sequential RHS sees inner shadow, not outer" {
     // Composition of: outer x = 1, inner-let shadows with x = 2,
     // inner-let-binding y's RHS sees the SHADOWED x = 2 (not
     // the outer x = 1). Test pins the interaction of nested
-    // scope + sequential RHS visibility (peer-AI turn 39).
+    // scope + sequential RHS visibility.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const inner: Tiny = .{ .let_star = .{
@@ -5719,9 +5621,9 @@ test "compile: scope restored after compile error" {
     try testing.expectError(CompileError.UnresolvedSymbol, res2);
 }
 
-// ---- step 5a1: fn* + call tests (peer-AI turn 42 checklist) ----
+// ---- fn* + call tests ----
 
-test "compile 5a1: ((fn* [] 42)) = 42" {
+test "compile fn*: ((fn* [] 42)) = 42" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const fn_form: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .int = 42 } } };
@@ -5729,7 +5631,7 @@ test "compile 5a1: ((fn* [] 42)) = 42" {
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
 }
 
-test "compile 5a1: ((fn* [x] (+ x 1)) 5) = 6" {
+test "compile fn*: ((fn* [x] (+ x 1)) 5) = 6" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .int = 1 } } };
@@ -5739,7 +5641,7 @@ test "compile 5a1: ((fn* [x] (+ x 1)) 5) = 6" {
     try testing.expectEqual(@as(i64, 6), result.asFixnum());
 }
 
-test "compile 5a1: ((fn* [x y] (+ x y)) 3 4) = 7" {
+test "compile fn*: ((fn* [x y] (+ x y)) 3 4) = 7" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .symbol = "y" } } };
@@ -5752,7 +5654,7 @@ test "compile 5a1: ((fn* [x y] (+ x y)) 3 4) = 7" {
     try testing.expectEqual(@as(i64, 7), result.asFixnum());
 }
 
-test "compile 5a1: (let* [f (fn* [x] (+ x 1))] (f 5)) = 6 — fn bound in let" {
+test "compile fn*: (let* [f (fn* [x] (+ x 1))] (f 5)) = 6 — fn bound in let" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .int = 1 } } };
@@ -5769,18 +5671,13 @@ test "compile 5a1: (let* [f (fn* [x] (+ x 1))] (f 5)) = 6 — fn bound in let" {
     try testing.expectEqual(@as(i64, 6), result.asFixnum());
 }
 
-test "compile 5b: (let* [x 5] ((fn* [y] x) 3)) = 5 — single capture" {
-    // Step 5b: this is the canonical hand-trace example
-    // (lazy-boxing capture). Outer x = 5 is captured by inner
-    // fn body. compileSymbol for `x` inside the fn body walks
-    // to parent, triggers lazy box-local on outer's x, registers
-    // the capture source, returns BindingRef.upvalue(0).
-    // The fn body emits `mov:move dst, u:0` which deref's the
-    // cell at runtime.
-    //
-    // (In 5a1 this raised UnresolvedSymbol because child
-    // Emitter had no parent pointer. 5b's resolveOrCapture
-    // resolves it correctly.)
+test "compile capture: (let* [x 5] ((fn* [y] x) 3)) = 5 — single capture" {
+    // The canonical hand-trace example. Outer x = 5 is
+    // captured by the inner fn body: pre-analysis boxes x in
+    // the let* prelude; compileSymbol for `x` inside the fn
+    // body walks to the parent, registers the capture source,
+    // and returns BindingRef.upvalue(0). The fn body emits
+    // `mov:move dst, u:0` which deref's the cell at runtime.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const inner_body: Tiny = .{ .symbol = "x" };
@@ -5794,7 +5691,7 @@ test "compile 5b: (let* [x 5] ((fn* [y] x) 3)) = 5 — single capture" {
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5a1: nested call ((fn* [x] x) ((fn* [y] (+ y 1)) 4)) = 5" {
+test "compile fn*: nested call ((fn* [x] x) ((fn* [y] (+ y 1)) 4)) = 5" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const inner_body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "y" }, .rhs = &.{ .int = 1 } } };
@@ -5806,7 +5703,7 @@ test "compile 5a1: nested call ((fn* [x] x) ((fn* [y] (+ y 1)) 4)) = 5" {
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5a1: duplicate param (fn* [x x] x) → DuplicateParam" {
+test "compile fn*: duplicate param (fn* [x x] x) → DuplicateParam" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const fn_form: Tiny = .{ .fn_star = .{
@@ -5817,7 +5714,7 @@ test "compile 5a1: duplicate param (fn* [x x] x) → DuplicateParam" {
     try testing.expectError(CompileError.DuplicateParam, res);
 }
 
-test "compile 5a1: arity mismatch — call with too few args traps :arity-mismatch at runtime" {
+test "compile fn*: arity mismatch — call with too few args traps :arity-mismatch at runtime" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const fn_form: Tiny = .{ .fn_star = .{
@@ -5838,7 +5735,7 @@ test "compile 5a1: arity mismatch — call with too few args traps :arity-mismat
     try testing.expectError(vm.VmError.ArityMismatch, res);
 }
 
-test "compile 5a1: same closure called twice — both invocations succeed" {
+test "compile fn*: same closure called twice — both invocations succeed" {
     // (let* [f (fn* [x] (+ x 1))] (+ (f 5) (f 10))) = 6 + 11 = 17
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5855,7 +5752,7 @@ test "compile 5a1: same closure called twice — both invocations succeed" {
     try testing.expectEqual(@as(i64, 17), result.asFixnum());
 }
 
-test "compile 5a1: fn body uses if + symbol — no captures needed" {
+test "compile fn*: fn body uses if + symbol — no captures needed" {
     // ((fn* [x] (if true x 0)) 7) = 7
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5870,10 +5767,9 @@ test "compile 5a1: fn body uses if + symbol — no captures needed" {
     try testing.expectEqual(@as(i64, 7), result.asFixnum());
 }
 
-// ---- step 5b: capture machinery tests ----
+// ---- capture machinery tests ----
 
-test "compile 5b: (let* [x 5] ((fn* [y] (+ x y)) 3)) = 8 — capture + use" {
-    // The canonical hand-trace from before 5b implementation.
+test "compile capture: (let* [x 5] ((fn* [y] (+ x y)) 3)) = 8 — capture + use" {
     // x is captured, y is a param, body adds them.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5888,7 +5784,7 @@ test "compile 5b: (let* [x 5] ((fn* [y] (+ x y)) 3)) = 8 — capture + use" {
     try testing.expectEqual(@as(i64, 8), result.asFixnum());
 }
 
-test "compile 5b: (let* [x 5 y 10] ((fn* [] (+ x y)))) = 15 — multi-capture" {
+test "compile capture: (let* [x 5 y 10] ((fn* [] (+ x y)))) = 15 — multi-capture" {
     // Two bindings, both captured by the inner fn body.
     // Each goes through ensureBoxed independently; child's
     // capture descriptor gets two local_cell_slot sources.
@@ -5908,7 +5804,7 @@ test "compile 5b: (let* [x 5 y 10] ((fn* [] (+ x y)))) = 15 — multi-capture" {
     try testing.expectEqual(@as(i64, 15), result.asFixnum());
 }
 
-test "compile 5b: (let* [x 5] (let* [f (fn* [] x)] (f))) = 5 — let-bound captured fn" {
+test "compile capture: (let* [x 5] (let* [f (fn* [] x)] (f))) = 5 — let-bound captured fn" {
     // Captured fn stored in a let binding, then called by name.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5926,7 +5822,7 @@ test "compile 5b: (let* [x 5] (let* [f (fn* [] x)] (f))) = 5 — let-bound captu
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5b: (let* [x 5] ((fn* [] ((fn* [] x))))) = 5 — transitive capture" {
+test "compile capture: (let* [x 5] ((fn* [] ((fn* [] x))))) = 5 — transitive capture" {
     // Inner-inner fn captures x. Middle fn doesn't reference
     // x directly but MUST capture it so that the closure:make
     // for the inner-inner fn (which runs inside middle fn's
@@ -5958,7 +5854,7 @@ test "compile 5b: (let* [x 5] ((fn* [] ((fn* [] x))))) = 5 — transitive captur
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5b: same binding captured twice — second capture re-uses existing cell" {
+test "compile capture: same binding captured twice — second capture re-uses existing cell" {
     // (let* [x 5] ((fn* [] x)) ((fn* [] x))) — both fns
     // capture x. After the first fn's compileFn finishes, x
     // is .cell_slot in outer scope. The second fn's compileFn
@@ -5981,7 +5877,7 @@ test "compile 5b: same binding captured twice — second capture re-uses existin
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5b: captured + non-captured params mix" {
+test "compile capture: captured + non-captured params mix" {
     // (let* [x 10] ((fn* [y] (+ x y)) 7)) = 17
     // x is captured (becomes upvalue), y is a normal param
     // (direct_slot). The fn body's `+` reads both via the
@@ -5999,10 +5895,10 @@ test "compile 5b: captured + non-captured params mix" {
     try testing.expectEqual(@as(i64, 17), result.asFixnum());
 }
 
-test "compile 5b: still-unresolved symbol traps UnresolvedSymbol" {
+test "compile capture: still-unresolved symbol traps UnresolvedSymbol" {
     // (let* [x 5] ((fn* [] z))) — z is not in any enclosing
-    // scope. With 5b's parent-chain walk, the chain still
-    // bottoms out at top-level Emitter with no parent →
+    // scope. The parent-chain walk bottoms out at the
+    // top-level Emitter with no parent →
     // UnresolvedSymbol.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -6016,7 +5912,7 @@ test "compile 5b: still-unresolved symbol traps UnresolvedSymbol" {
     try testing.expectError(CompileError.UnresolvedSymbol, res);
 }
 
-test "compile 5b: captured fn used after let binding scope (closure outlives binding)" {
+test "compile capture: captured fn used after let binding scope (closure outlives binding)" {
     // Demonstrates the central reason for boxing-via-cell:
     // when the closure is returned out of the let* and called
     // from elsewhere, the captured x must still work even
@@ -6047,12 +5943,12 @@ test "compile 5b: captured fn used after let binding scope (closure outlives bin
     try testing.expectEqual(@as(i64, 8), result.asFixnum());
 }
 
-test "compile 5b: same-frame read of a captured binding after capture" {
+test "compile capture: same-frame read of a captured binding after capture" {
     // (let* [x 5] (do ((fn* [] x)) x)) — outer let body's
     // second expression reads `x` AFTER the inner fn captured
-    // it. By 5b lazy-boxing, x is now .cell_slot in outer
-    // scope; the second read emits closure:get-cell instead of
-    // mov:move.
+    // it. x is .cell_slot in the outer scope (pre-analysis
+    // boxed it in the let* prelude); the second read emits
+    // closure:get-cell instead of mov:move.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const inner_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
@@ -6066,9 +5962,9 @@ test "compile 5b: same-frame read of a captured binding after capture" {
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-// ---- step 5b control-flow safety tests (peer-AI turn 44) ----
+// ---- capture control-flow safety tests ----
 
-test "compile 5b: capture in unreachable branch — same-frame read works" {
+test "compile capture: capture in unreachable branch — same-frame read works" {
     // (let* [x 5] (do (if false (fn* [] x) 0) x)) = 5
     //
     // The hazard the lazy-boxing model failed: if the closure
@@ -6097,7 +5993,7 @@ test "compile 5b: capture in unreachable branch — same-frame read works" {
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5b: capture in unreachable branch — second closure construction works" {
+test "compile capture: capture in unreachable branch — second closure construction works" {
     // (let* [x 5] (do (if false (fn* [] x) 0) ((fn* [] x)))) = 5
     //
     // Variant of the above: the second occurrence is itself a
@@ -6125,11 +6021,11 @@ test "compile 5b: capture in unreachable branch — second closure construction 
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5b: capture in taken branch still works" {
+test "compile capture: capture in taken branch" {
     // (let* [x 5] (do (if true (fn* [] x) 0) x)) = 5
     //
-    // Sanity: the case the lazy-boxing model did handle
-    // correctly should still work after the pre-analysis fix.
+    // Sanity: a capture in a taken branch works the same as
+    // one in straight-line code.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const fn_form: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
@@ -6147,9 +6043,9 @@ test "compile 5b: capture in taken branch still works" {
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5b: three-level transitive capture (let [x] ((fn () ((fn () ((fn () x))))))) = 5" {
+test "compile capture: three-level transitive capture (let [x] ((fn () ((fn () ((fn () x))))))) = 5" {
     // Pin the recursive resolveOrCapture invariant at deeper
-    // nesting (peer-AI turn 44 sanity check).
+    // nesting.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const innermost_fn: Tiny = .{ .fn_star = .{ .params = &.{}, .body = &.{ .symbol = "x" } } };
@@ -6166,7 +6062,7 @@ test "compile 5b: three-level transitive capture (let [x] ((fn () ((fn () ((fn (
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5b: shadowing capture — inner let-bound x shadows outer for inner fn" {
+test "compile capture: shadowing capture — inner let-bound x shadows outer for inner fn" {
     // (let* [x 1] (let* [f (let* [x 2] (fn* [] x))] (f))) = 2
     //
     // Inner let binds x to 2, then creates fn capturing x = 2.
@@ -6192,7 +6088,7 @@ test "compile 5b: shadowing capture — inner let-bound x shadows outer for inne
     try testing.expectEqual(@as(i64, 2), result.asFixnum());
 }
 
-test "compile 5b: outer x captured by f, inner x shadows for body but not f's captured value" {
+test "compile capture: outer x captured by f, inner x shadows for body but not f's captured value" {
     // (let* [x 1, f (fn* [] x)] (let* [x 2] (f))) = 1
     //
     // f captures the OUTER x = 1 at construction time.
@@ -6217,7 +6113,7 @@ test "compile 5b: outer x captured by f, inner x shadows for body but not f's ca
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
-test "compile 5b: param shadowed by inner let — only inner is captured (peer-AI turn 45)" {
+test "compile capture: param shadowed by inner let — only inner is captured" {
     // (((fn* [x] (let* [x 2] (fn* [] x))) 1)) = 2
     //
     // Outer fn's param x is shadowed by inner let's x = 2.
@@ -6242,7 +6138,7 @@ test "compile 5b: param shadowed by inner let — only inner is captured (peer-A
     try testing.expectEqual(@as(i64, 2), result.asFixnum());
 }
 
-test "compile 5b: captured param + branch — param boxed at fn entry (peer-AI turn 45)" {
+test "compile capture: captured param + branch — param boxed at fn entry" {
     // ((fn* [x] (do (if false (fn* [] x) 0) x)) 5) = 5
     //
     // Param x is captured by the inner fn (in unreachable
@@ -6264,13 +6160,13 @@ test "compile 5b: captured param + branch — param boxed at fn entry (peer-AI t
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-// ---- regression: 5a1 tests continue to work in 5b ----
+// ---- call-block contiguity ----
 
-test "compile 5a1: ((fn* [x y] (+ x y)) ((fn* [a] a) 1) 2) = 3 — call-block contiguity regression" {
-    // Peer-AI turn 43 catch: prior compileCall allocated arg slots
-    // one-at-a-time, so a non-trivial first arg (which itself
-    // allocates temps for its own call block) would push the
-    // second arg's slot past the predetermined position, breaking
+test "compile fn*: ((fn* [x y] (+ x y)) ((fn* [a] a) 1) 2) = 3 — call-block contiguity regression" {
+    // If compileCall allocated arg slots one-at-a-time, a
+    // non-trivial first arg (which itself allocates temps for
+    // its own call block) would push the second arg's slot
+    // past the predetermined position, breaking
     // the range-call ABI. Fixed by reserving the entire
     // contiguous block via allocSlotBlock BEFORE compiling
     // sub-expressions. This test pins the fix.
@@ -6291,7 +6187,7 @@ test "compile 5a1: ((fn* [x y] (+ x y)) ((fn* [a] a) 1) 2) = 3 — call-block co
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
 }
 
-test "compile 5a1: fn body uses inner let* — no captures of outer needed" {
+test "compile fn*: fn body uses inner let* — no captures of outer needed" {
     // ((fn* [x] (let* [y x] y)) 5) = 5
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -6305,9 +6201,9 @@ test "compile 5a1: fn body uses inner let* — no captures of outer needed" {
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-// ---- step 5c: named fn* + letfn* tests ----
+// ---- named fn* + letfn* tests ----
 
-test "compile 5c: named fn* without self-reference compiles as anonymous" {
+test "compile named-fn: named fn* without self-reference compiles as anonymous" {
     // ((fn* foo [x] x) 5) = 5 — body doesn't reference `foo`,
     // so no placeholder cell allocated, no init-cell emitted.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -6322,7 +6218,7 @@ test "compile 5c: named fn* without self-reference compiles as anonymous" {
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5c: named fn* with self-ref in dead branch — placeholder allocated, no infinite recursion" {
+test "compile named-fn: named fn* with self-ref in dead branch — placeholder allocated, no infinite recursion" {
     // ((fn* foo [x] (if true x (foo (+ x 1)))) 7) = 7
     // Body references `foo` but only under the (always-false)
     // else branch. Compiler must STILL emit the placeholder
@@ -6350,7 +6246,7 @@ test "compile 5c: named fn* with self-ref in dead branch — placeholder allocat
     try testing.expectEqual(@as(i64, 7), result.asFixnum());
 }
 
-test "compile 5c: named fn* with recursive ref in untaken branch — placeholder allocated, base branch executes" {
+test "compile named-fn: named fn* with recursive ref in untaken branch — placeholder allocated, base branch executes" {
     // ((fn* foo [x] (if true (+ x 1) (foo x))) 7) = 8
     // The recursive call exists in code (forces placeholder
     // allocation per pre-analysis) but lives in the untaken
@@ -6370,7 +6266,7 @@ test "compile 5c: named fn* with recursive ref in untaken branch — placeholder
     try testing.expectEqual(@as(i64, 8), result.asFixnum());
 }
 
-test "compile 5c: named fn* in let — recursive reference works after let-binding scope" {
+test "compile named-fn: named fn* in let — recursive reference works after let-binding scope" {
     // (let* [f (fn* fact [n] (if true n (fact (+ n 1))))] (f 5)) = 5
     // The named self-ref creates a cell that's INSIDE the
     // fn-creating expression (not in let-binding's slot), so
@@ -6395,7 +6291,7 @@ test "compile 5c: named fn* in let — recursive reference works after let-bindi
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5c: (letfn* [(f [x] (+ x 1))] (f 10)) = 11 — single binding" {
+test "compile named-fn: (letfn* [(f [x] (+ x 1))] (f 10)) = 11 — single binding" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const f_body: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "x" }, .rhs = &.{ .int = 1 } } };
@@ -6408,7 +6304,7 @@ test "compile 5c: (letfn* [(f [x] (+ x 1))] (f 10)) = 11 — single binding" {
     try testing.expectEqual(@as(i64, 11), result.asFixnum());
 }
 
-test "compile 5c: (letfn* [(f [] (g)) (g [] 42)] (f)) = 42 — f calls g (forward ref)" {
+test "compile named-fn: (letfn* [(f [] (g)) (g [] 42)] (f)) = 42 — f calls g (forward ref)" {
     // Demonstrates true forward reference: f's body references
     // g, which is defined later in the binding group. The
     // placeholder-cell pattern makes this work — g's cell
@@ -6430,7 +6326,7 @@ test "compile 5c: (letfn* [(f [] (g)) (g [] 42)] (f)) = 42 — f calls g (forwar
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
 }
 
-test "compile 5c: letfn* mutual recursion (dead branches only)" {
+test "compile named-fn: letfn* mutual recursion (dead branches only)" {
     // (letfn* [(f [n] (if true n (g n)))
     //          (g [n] (if true (+ n 10) (f n)))]
     //   (g 5)) = 15
@@ -6464,7 +6360,7 @@ test "compile 5c: letfn* mutual recursion (dead branches only)" {
     try testing.expectEqual(@as(i64, 15), result.asFixnum());
 }
 
-test "compile 5c: named self shadowed by inner let — no placeholder, returns let value" {
+test "compile named-fn: named self shadowed by inner let — no placeholder, returns let value" {
     // ((fn* foo [x] (let* [foo 5] foo)) 0) = 5
     // The body's only reference to `foo` is inside a `let*`
     // that rebinds it. Pre-analysis sees `foo` is NOT a free
@@ -6483,7 +6379,7 @@ test "compile 5c: named self shadowed by inner let — no placeholder, returns l
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5c: named self shadows outer binding — body sees the closure, not outer foo" {
+test "compile named-fn: named self shadows outer binding — body sees the closure, not outer foo" {
     // (let* [foo 123] ((fn* foo [] foo)))
     // Inside the fn body, `foo` resolves to the self-name
     // (= the closure itself), NOT the outer let-bound 123.
@@ -6500,13 +6396,13 @@ test "compile 5c: named self shadows outer binding — body sees the closure, no
     try testing.expect(result.kind() == .function);
 }
 
-test "compile 5c: named fn* param shadows self-name (intentional Tiny semantics)" {
+test "compile named-fn: named fn* param shadows self-name (intentional Tiny semantics)" {
     // ((fn* foo [foo] foo) 7) = 7
     // The param `foo` shadows the self-name. Pre-analysis
     // sees `foo` is NOT a free var of the body (because the
     // param binds it), so no placeholder is allocated, and
     // the body's `foo` resolves to the param (= 7).
-    // (Peer-AI turn 46: pin behavior with explicit test.)
+    // (Pinned by this explicit test.)
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const fn_form: Tiny = .{ .fn_star = .{ .name = "foo", .params = &.{"foo"}, .body = &.{ .symbol = "foo" } } };
@@ -6515,7 +6411,7 @@ test "compile 5c: named fn* param shadows self-name (intentional Tiny semantics)
     try testing.expectEqual(@as(i64, 7), result.asFixnum());
 }
 
-test "compile 5c: letfn binding captures both another letfn binding and outer let binding" {
+test "compile named-fn: letfn binding captures both another letfn binding and outer let binding" {
     // (let* [x 10]
     //   (letfn* [(f [] (+ x (g)))
     //            (g [] 5)]
@@ -6523,7 +6419,7 @@ test "compile 5c: letfn binding captures both another letfn binding and outer le
     // f's closure capture descriptor has two sources: one for
     // the outer let's x (cell_slot in outer frame) and one
     // for g (cell_slot in letfn frame). Validates mixed-source
-    // capture descriptors compose correctly (peer-AI turn 46).
+    // capture descriptors compose correctly.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const g_call: Tiny = .{ .call = .{ .callee = &.{ .symbol = "g" }, .args = &.{} } };
@@ -6545,7 +6441,7 @@ test "compile 5c: letfn binding captures both another letfn binding and outer le
     try testing.expectEqual(@as(i64, 15), result.asFixnum());
 }
 
-test "compile 5c: letfn* with three bindings, chained calls" {
+test "compile named-fn: letfn* with three bindings, chained calls" {
     // (letfn* [(a [] (b))
     //          (b [] (c))
     //          (c [] 7)]
@@ -6568,7 +6464,7 @@ test "compile 5c: letfn* with three bindings, chained calls" {
     try testing.expectEqual(@as(i64, 7), result.asFixnum());
 }
 
-test "compile 5c: letfn* shadows outer let binding" {
+test "compile named-fn: letfn* shadows outer let binding" {
     // (let* [f 10] (letfn* [(f [] 5)] (f))) = 5
     // Inner letfn* `f` shadows outer let* `f`.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -6587,7 +6483,7 @@ test "compile 5c: letfn* shadows outer let binding" {
     try testing.expectEqual(@as(i64, 5), result.asFixnum());
 }
 
-test "compile 5c: letfn* binding captures outer let binding" {
+test "compile named-fn: letfn* binding captures outer let binding" {
     // (let* [x 100]
     //   (letfn* [(f [] x)]
     //     (f))) = 100
@@ -6608,7 +6504,7 @@ test "compile 5c: letfn* binding captures outer let binding" {
     try testing.expectEqual(@as(i64, 100), result.asFixnum());
 }
 
-test "compile 5c: letfn* — body sees bindings (calls one of them)" {
+test "compile named-fn: letfn* — body sees bindings (calls one of them)" {
     // (letfn* [(f [] 99) (g [] 0)] (f)) = 99
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -6623,7 +6519,7 @@ test "compile 5c: letfn* — body sees bindings (calls one of them)" {
     try testing.expectEqual(@as(i64, 99), result.asFixnum());
 }
 
-test "compile 5c: letfn* duplicate name → DuplicateBinding" {
+test "compile named-fn: letfn* duplicate name → DuplicateBinding" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const form: Tiny = .{ .letfn_star = .{
@@ -6636,7 +6532,7 @@ test "compile 5c: letfn* duplicate name → DuplicateBinding" {
     try testing.expectError(CompileError.DuplicateBinding, compileTiny(arena.allocator(), &form));
 }
 
-test "compile 5c: letfn* body scope properly restored after letfn*" {
+test "compile named-fn: letfn* body scope properly restored after letfn*" {
     // (let* [x 1]
     //   (letfn* [(x [] 99)]  ; shadow x as a fn
     //     (x))
@@ -6669,9 +6565,9 @@ test "compile 5c: letfn* body scope properly restored after letfn*" {
     try testing.expectEqual(@as(i64, 100), result.asFixnum());
 }
 
-// ---- step #7a: Form → Tiny lowering + compileSource tests ----
+// ---- Form → Tiny lowering + compileSource tests ----
 
-test "compile #7a: lowerForm of nil → run → nil" {
+test "compile lowerForm: lowerForm of nil → run → nil" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const form = reader_mod.Form{ .datum = .nil, .origin = .{ .pos = 0, .len = 0 } };
@@ -6683,7 +6579,7 @@ test "compile #7a: lowerForm of nil → run → nil" {
     try testing.expect(result.isNil());
 }
 
-test "compile #7a: lowerForm of bool true → run → true" {
+test "compile lowerForm: lowerForm of bool true → run → true" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const form = reader_mod.Form{ .datum = .{ .bool_ = true }, .origin = .{ .pos = 0, .len = 0 } };
@@ -6695,7 +6591,7 @@ test "compile #7a: lowerForm of bool true → run → true" {
     try testing.expectEqual(true, result.asBool());
 }
 
-test "compile #7a: lowerForm of int 42 → run → 42" {
+test "compile lowerForm: lowerForm of int 42 → run → 42" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const form = reader_mod.Form{ .datum = .{ .int = 42 }, .origin = .{ .pos = 0, .len = 0 } };
@@ -6707,7 +6603,7 @@ test "compile #7a: lowerForm of int 42 → run → 42" {
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
 }
 
-test "compile #7a: compileSource \"nil\" → nil" {
+test "compile lowerForm: compileSource \"nil\" → nil" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const compiled = try compileSource(arena.allocator(), "nil");
@@ -6718,7 +6614,7 @@ test "compile #7a: compileSource \"nil\" → nil" {
     try testing.expect(result.isNil());
 }
 
-test "compile #7a: compileSource \"true\" → true" {
+test "compile lowerForm: compileSource \"true\" → true" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const compiled = try compileSource(arena.allocator(), "true");
@@ -6729,7 +6625,7 @@ test "compile #7a: compileSource \"true\" → true" {
     try testing.expectEqual(true, result.asBool());
 }
 
-test "compile #7a: compileSource \"false\" → false" {
+test "compile lowerForm: compileSource \"false\" → false" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const compiled = try compileSource(arena.allocator(), "false");
@@ -6740,7 +6636,7 @@ test "compile #7a: compileSource \"false\" → false" {
     try testing.expectEqual(false, result.asBool());
 }
 
-test "compile #7a: compileSource \"42\" → 42" {
+test "compile lowerForm: compileSource \"42\" → 42" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const compiled = try compileSource(arena.allocator(), "42");
@@ -6751,7 +6647,7 @@ test "compile #7a: compileSource \"42\" → 42" {
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
 }
 
-test "compile #7a: compileSource \"-7\" → -7" {
+test "compile lowerForm: compileSource \"-7\" → -7" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const compiled = try compileSource(arena.allocator(), "-7");
@@ -6762,7 +6658,7 @@ test "compile #7a: compileSource \"-7\" → -7" {
     try testing.expectEqual(@as(i64, -7), result.asFixnum());
 }
 
-test "compile #7a: compileSource of unqualified symbol with no namespace → UnresolvedSymbol" {
+test "compile lowerForm: compileSource of unqualified symbol with no namespace → UnresolvedSymbol" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(
@@ -6771,7 +6667,7 @@ test "compile #7a: compileSource of unqualified symbol with no namespace → Unr
     );
 }
 
-test "compile #7a: compileSource of symbol resolves via namespace fall-through" {
+test "compile lowerForm: compileSource of symbol resolves via namespace fall-through" {
     // Prove the symbol fall-through path works end-to-end via
     // real source syntax: source "x" with x pre-bound in the
     // namespace returns the bound value.
@@ -6793,14 +6689,14 @@ test "compile #7a: compileSource of symbol resolves via namespace fall-through" 
     try testing.expectEqual(@as(i64, 99), result.asFixnum());
 }
 
-test "compile #7a: lowerForm of string literal → UnsupportedFeature (deferred)" {
+test "compile lowerForm: lowerForm of string literal without a heap → UnsupportedFeature" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const form = reader_mod.Form{ .datum = .{ .string = "hello" }, .origin = .{ .pos = 0, .len = 0 } };
     try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
 }
 
-test "compile #7a: lowerForm of keyword → UnsupportedFeature (deferred)" {
+test "compile lowerForm: lowerForm of keyword without an interner → UnsupportedFeature" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const form = reader_mod.Form{
@@ -6810,9 +6706,9 @@ test "compile #7a: lowerForm of keyword → UnsupportedFeature (deferred)" {
     try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
 }
 
-test "compile #7a: lowerForm of empty list → MalformedForm (per peer-AI turn 53)" {
-    // Empty `()` as an expression is rejected; quoted empty list
-    // requires quoted-compound-collection support (deferred).
+test "compile lowerForm: lowerForm of empty list → MalformedForm" {
+    // Empty `()` as an expression is rejected; the empty list
+    // value is written `'()`.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const empty: []const *reader_mod.Form = &.{};
@@ -6820,9 +6716,7 @@ test "compile #7a: lowerForm of empty list → MalformedForm (per peer-AI turn 5
     try testing.expectError(CompileError.MalformedForm, lowerForm(arena.allocator(), &form));
 }
 
-// (Quote-of-int now succeeds in #7b; covered by the #7b quote tests below.)
-
-test "compile #3.4: lowerForm of qualified symbol → Tiny.qualified_symbol" {
+test "compile qualified: lowerForm of qualified symbol → Tiny.qualified_symbol" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const form = reader_mod.Form{
@@ -6835,7 +6729,7 @@ test "compile #3.4: lowerForm of qualified symbol → Tiny.qualified_symbol" {
     try testing.expectEqualStrings("x", tiny.qualified_symbol.name);
 }
 
-test "compile #7a: compileSource of malformed input → ReaderFailure" {
+test "compile lowerForm: compileSource of malformed input → ReaderFailure" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     // Unmatched paren — reader rejects.
@@ -6845,7 +6739,7 @@ test "compile #7a: compileSource of malformed input → ReaderFailure" {
     );
 }
 
-// ---- step #7b: list dispatch — calls + special forms + intrinsics ----
+// ---- list dispatch — calls + special forms + intrinsics ----
 
 /// Helper: run a source string and assert the result is a fixnum
 /// equal to `expected`. Builds a fresh VM, manages lifetime
@@ -6884,130 +6778,128 @@ fn expectSourceNil(src: []const u8) !void {
     try testing.expect(result.isNil());
 }
 
-test "compile #7b: (+ 1 2) = 3" {
+test "compile source: (+ 1 2) = 3" {
     try expectSourceFixnum("(+ 1 2)", 3);
 }
 
-test "compile #7b: (+ -7 -5) = -12" {
+test "compile source: (+ -7 -5) = -12" {
     try expectSourceFixnum("(+ -7 -5)", -12);
 }
 
-test "compile #7b: (< 1 2) = true" {
+test "compile source: (< 1 2) = true" {
     try expectSourceBool("(< 1 2)", true);
 }
 
-test "compile #7b: (< 2 1) = false" {
+test "compile source: (< 2 1) = false" {
     try expectSourceBool("(< 2 1)", false);
 }
 
-test "compile #7b: (if true 1 2) = 1" {
+test "compile source: (if true 1 2) = 1" {
     try expectSourceFixnum("(if true 1 2)", 1);
 }
 
-test "compile #7b: (if false 1 2) = 2" {
+test "compile source: (if false 1 2) = 2" {
     try expectSourceFixnum("(if false 1 2)", 2);
 }
 
-test "compile #7b: (if true 7) = 7 — no else arm" {
+test "compile source: (if true 7) = 7 — no else arm" {
     try expectSourceFixnum("(if true 7)", 7);
 }
 
-test "compile #7b: (if false 7) — no else, falsy test → nil" {
+test "compile source: (if false 7) — no else, falsy test → nil" {
     try expectSourceNil("(if false 7)");
 }
 
-test "compile #7b: (do) → nil" {
+test "compile source: (do) → nil" {
     try expectSourceNil("(do)");
 }
 
-test "compile #7b: (do 1) → 1" {
+test "compile source: (do 1) → 1" {
     try expectSourceFixnum("(do 1)", 1);
 }
 
-test "compile #7b: (do 1 2 3) → 3" {
+test "compile source: (do 1 2 3) → 3" {
     try expectSourceFixnum("(do 1 2 3)", 3);
 }
 
-test "compile #7b: (quote 42) → 42" {
+test "compile source: (quote 42) → 42" {
     try expectSourceFixnum("(quote 42)", 42);
 }
 
-test "compile #7b: (quote nil) → nil" {
+test "compile source: (quote nil) → nil" {
     try expectSourceNil("(quote nil)");
 }
 
-test "compile #7b: (quote true) → true" {
+test "compile source: (quote true) → true" {
     try expectSourceBool("(quote true)", true);
 }
 
-test "compile #7b: 'true (reader-macro form) → true" {
+test "compile source: 'true (reader-macro form) → true" {
     // `'x` lowers to Datum.quote(x); lowerFormEnv handles it
     // via the .quote arm.
     try expectSourceBool("'true", true);
 }
 
-test "compile #7b: nested (if (< 1 2) (+ 10 20) (+ 100 200)) = 30" {
+test "compile source: nested (if (< 1 2) (+ 10 20) (+ 100 200)) = 30" {
     try expectSourceFixnum("(if (< 1 2) (+ 10 20) (+ 100 200))", 30);
 }
 
-test "compile #7b: (if) malformed → MalformedForm" {
+test "compile source: (if) malformed → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(if)"));
 }
 
-test "compile #7b: (if 1) malformed → MalformedForm" {
+test "compile source: (if 1) malformed → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(if 1)"));
 }
 
-test "compile #7b: (if a b c d) too many args → MalformedForm" {
+test "compile source: (if a b c d) too many args → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(if true 1 2 3)"));
 }
 
-test "compile #7b: (quote) malformed → MalformedForm" {
+test "compile source: (quote) malformed → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(quote)"));
 }
 
-test "compile #7b: (quote a b) too many args → MalformedForm" {
+test "compile source: (quote a b) too many args → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(quote 1 2)"));
 }
 
-test "compile #7b: (quote foo) symbol via compileSource (no interner) → UnsupportedFeature" {
+test "compile source: (quote foo) symbol via compileSource (no interner) → UnsupportedFeature" {
     // Without an Interner, quoted symbols still raise
     // UnsupportedFeature. Use `compileSourceFull` to enable
-    // quoted-symbol support; see the E1 tests below.
+    // quoted-symbol support; see the quote symbol tests below.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.UnsupportedFeature, compileSource(arena.allocator(), "(quote foo)"));
 }
 
-test "compile #7b: () empty list → MalformedForm" {
+test "compile source: () empty list → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "()"));
 }
 
-// Ordinary-call tests with fn* callees land in #7c (which adds
-// fn* lowering). For #7b, ordinary calls work but the only
-// non-special-form callees are symbol references — and resolving
-// a top-level symbol requires either lexical binding (#7c) or
-// namespace lookup (already shipped via #6b). A simple smoke test
-// of that path:
+// Ordinary-call tests with fn* callees are in the binding-form
+// section below. Resolving a top-level symbol requires either a
+// lexical binding or a namespace lookup. A simple smoke test of
+// that path:
 
-test "compile #7b: non-special-form head falls through to ordinary-call dispatch" {
+test "compile source: non-special-form head falls through to ordinary-call dispatch" {
     // Confirms the dispatcher routes `(inc 5)` through lowerCall
     // (treating `inc` as a symbol to resolve), NOT a special form.
     // Without a namespace, the symbol can't resolve → UnresolvedSymbol.
     // (End-to-end calls with fn* callees / namespace-bound fns are
-    // tested in #7c and #7d.)
+    // tested in the binding-form and var-form sections.)
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(
@@ -7016,72 +6908,72 @@ test "compile #7b: non-special-form head falls through to ordinary-call dispatch
     );
 }
 
-// ---- step #7c: binding forms via Form (let*/fn*/letfn*/loop*/recur) ----
+// ---- binding forms via Form (let*/fn*/letfn*/loop*/recur) ----
 
-test "compile #7c: (let* [x 5] x) → 5" {
+test "compile source let: (let* [x 5] x) → 5" {
     try expectSourceFixnum("(let* [x 5] x)", 5);
 }
 
-test "compile #7c: (let* [x 1 y 2] (+ x y)) → 3" {
+test "compile source let: (let* [x 1 y 2] (+ x y)) → 3" {
     try expectSourceFixnum("(let* [x 1 y 2] (+ x y))", 3);
 }
 
-test "compile #7c: (let* [x 5 y x] y) → 5 — sequential RHS sees prior" {
+test "compile source let: (let* [x 5 y x] y) → 5 — sequential RHS sees prior" {
     try expectSourceFixnum("(let* [x 5 y x] y)", 5);
 }
 
-test "compile #7c: nested let — inner shadows outer" {
+test "compile source let: nested let — inner shadows outer" {
     try expectSourceFixnum("(let* [x 1] (let* [x 99] x))", 99);
 }
 
-test "compile #7c: (let* [] 42) → 42 — empty binding vector" {
+test "compile source let: (let* [] 42) → 42 — empty binding vector" {
     try expectSourceFixnum("(let* [] 42)", 42);
 }
 
-test "compile #7c: let* multi-form body (implicit do) — (let* [x 1] x x x) → 1" {
+test "compile source let: let* multi-form body (implicit do) — (let* [x 1] x x x) → 1" {
     // Body is treated as (do x x x); last form is the result.
     try expectSourceFixnum("(let* [x 1] 99 88 x)", 1);
 }
 
-test "compile #7c: ((fn* [x] (+ x 1)) 5) → 6" {
+test "compile source let: ((fn* [x] (+ x 1)) 5) → 6" {
     try expectSourceFixnum("((fn* [x] (+ x 1)) 5)", 6);
 }
 
-test "compile #7c: ((fn* [] 42)) → 42 — nullary fn" {
+test "compile source let: ((fn* [] 42)) → 42 — nullary fn" {
     try expectSourceFixnum("((fn* [] 42))", 42);
 }
 
-test "compile #7c: ((fn* [x y] (+ x y)) 3 4) → 7" {
+test "compile source let: ((fn* [x y] (+ x y)) 3 4) → 7" {
     try expectSourceFixnum("((fn* [x y] (+ x y)) 3 4)", 7);
 }
 
-test "compile #7c: closure captures outer let binding" {
+test "compile source let: closure captures outer let binding" {
     try expectSourceFixnum("(let* [x 10] ((fn* [y] (+ x y)) 5))", 15);
 }
 
-test "compile #7c: named fn* — ((fn* foo [n] (if (< n 3) (recur (+ n 1)) n)) 0) → 3" {
+test "compile source let: named fn* — ((fn* foo [n] (if (< n 3) (recur (+ n 1)) n)) 0) → 3" {
     try expectSourceFixnum("((fn* foo [n] (if (< n 3) (recur (+ n 1)) n)) 0)", 3);
 }
 
-test "compile #7c: (loop* [i 0] (if (< i 5) (recur (+ i 1)) i)) → 5" {
+test "compile source let: (loop* [i 0] (if (< i 5) (recur (+ i 1)) i)) → 5" {
     try expectSourceFixnum("(loop* [i 0] (if (< i 5) (recur (+ i 1)) i))", 5);
 }
 
-test "compile #7c: (loop* [i 0 acc 0] (if (< i 10) (recur (+ i 1) (+ acc i)) acc)) → 45" {
+test "compile source let: (loop* [i 0 acc 0] (if (< i 10) (recur (+ i 1) (+ acc i)) acc)) → 45" {
     try expectSourceFixnum("(loop* [i 0 acc 0] (if (< i 10) (recur (+ i 1) (+ acc i)) acc))", 45);
 }
 
-test "compile #7c: (letfn* [(f [] 42)] (f)) → 42" {
+test "compile source let: (letfn* [(f [] 42)] (f)) → 42" {
     try expectSourceFixnum("(letfn* [(f [] 42)] (f))", 42);
 }
 
-test "compile #7c: (letfn* [(f [] (g)) (g [] 99)] (f)) → 99 — forward ref via letfn*" {
+test "compile source let: (letfn* [(f [] (g)) (g [] 99)] (f)) → 99 — forward ref via letfn*" {
     try expectSourceFixnum("(letfn* [(f [] (g)) (g [] 99)] (f))", 99);
 }
 
-// -- INTRINSIC SHADOWING (the big peer-AI turn 53 trap) --
+// -- INTRINSIC SHADOWING --
 
-test "compile #7c: (let* [+ (fn* [a b] 42)] (+ 1 2)) → 42 — lexical shadow defeats inline" {
+test "compile source let: (let* [+ (fn* [a b] 42)] (+ 1 2)) → 42 — lexical shadow defeats inline" {
     // The LowerEnv must mark `+` as bound inside the let* body
     // so the dispatcher falls through to ordinary call rather
     // than emitting Tiny.add. Result: 42 (the fn returns 42),
@@ -7089,7 +6981,7 @@ test "compile #7c: (let* [+ (fn* [a b] 42)] (+ 1 2)) → 42 — lexical shadow d
     try expectSourceFixnum("(let* [+ (fn* [a b] 42)] (+ 1 2))", 42);
 }
 
-test "compile #7c: (let* [< (fn* [a b] 999)] (if (< 1 2) 1 0)) → 0 — < shadowed" {
+test "compile source let: (let* [< (fn* [a b] 999)] (if (< 1 2) 1 0)) → 0 — < shadowed" {
     // Same idea for <. The fn always returns 999 (truthy), so
     // `if` takes the then-branch... wait, no — the shadowed `<`
     // returns 999, which IS truthy. Hmm let me reconsider.
@@ -7103,7 +6995,7 @@ test "compile #7c: (let* [< (fn* [a b] 999)] (if (< 1 2) 1 0)) → 0 — < shado
     try expectSourceFixnum("(let* [< (fn* [a b] false)] (if (< 1 2) 1 0))", 0);
 }
 
-test "compile #7c: special form `if` is NOT shadowable" {
+test "compile source let: special form `if` is NOT shadowable" {
     // (let* [if 1] (if true 2 3)) — `if` in operator position
     // remains the special form. Result: 2 (then-branch of true).
     // (If `if` were shadowable, the inner `if` would try to call
@@ -7113,59 +7005,59 @@ test "compile #7c: special form `if` is NOT shadowable" {
 
 // -- Variadic params via Form --
 
-test "compile #7c: ((fn* [a & r] a) 1 2 3) → 1 — rest collected but unused" {
+test "compile source let: ((fn* [a & r] a) 1 2 3) → 1 — rest collected but unused" {
     try expectSourceFixnum("((fn* [a & r] a) 1 2 3)", 1);
 }
 
-test "compile #7c: ((fn* [& r] 42)) → 42 — variadic with no args" {
+test "compile source let: ((fn* [& r] 42)) → 42 — variadic with no args" {
     try expectSourceFixnum("((fn* [& r] 42))", 42);
 }
 
 // -- Malformed forms --
 
-test "compile #7c: (let*) → MalformedForm" {
+test "compile source let: (let*) → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(let*)"));
 }
 
-test "compile #7c: (let* [x] x) odd binding count → MalformedForm" {
+test "compile source let: (let* [x] x) odd binding count → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(let* [x] x)"));
 }
 
-test "compile #7c: (let* (x 1) x) binding spec is list not vector → ExpectedVector" {
+test "compile source let: (let* (x 1) x) binding spec is list not vector → ExpectedVector" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.ExpectedVector, compileSource(arena.allocator(), "(let* (x 1) x)"));
 }
 
-test "compile #7c: (let* [1 2] body) binding name is int → ExpectedSymbol" {
+test "compile source let: (let* [1 2] body) binding name is int → ExpectedSymbol" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.ExpectedSymbol, compileSource(arena.allocator(), "(let* [1 2] 3)"));
 }
 
-test "compile #7c: (fn* [x &]) trailing & → MalformedForm" {
+test "compile source let: (fn* [x &]) trailing & → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(fn* [x &] x)"));
 }
 
-test "compile #7c: (fn* [x & r y] body) extra after rest → MalformedForm" {
+test "compile source let: (fn* [x & r y] body) extra after rest → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(fn* [x & r y] x)"));
 }
 
-test "compile #7c: (fn* (x) body) param spec is list not vector → ExpectedVector" {
+test "compile source let: (fn* (x) body) param spec is list not vector → ExpectedVector" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.ExpectedVector, compileSource(arena.allocator(), "(fn* (x) x)"));
 }
 
-// ---- step #7d: var forms via Form (def/defn/var) ----
+// ---- var forms via Form (def/defn/var) ----
 
 /// Helper: run a source string against a fresh VM with its own
 /// namespace, assert the result is a fixnum equal to `expected`.
@@ -7184,34 +7076,34 @@ fn expectSourceFixnumWithNs(src: []const u8, expected: i64) !void {
     try testing.expectEqual(expected, result.asFixnum());
 }
 
-test "compile #7d: (do (def x 5) x) → 5" {
+test "compile source def: (do (def x 5) x) → 5" {
     try expectSourceFixnumWithNs("(do (def x 5) x)", 5);
 }
 
-test "compile #7d: (do (def x 5) (def x 10) x) → 10 — rebind preserves identity" {
+test "compile source def: (do (def x 5) (def x 10) x) → 10 — rebind preserves identity" {
     try expectSourceFixnumWithNs("(do (def x 5) (def x 10) x)", 10);
 }
 
-test "compile #7d: (do (defn add1 [n] (+ n 1)) (add1 5)) → 6" {
+test "compile source def: (do (defn add1 [n] (+ n 1)) (add1 5)) → 6" {
     try expectSourceFixnumWithNs("(do (defn add1 [n] (+ n 1)) (add1 5))", 6);
 }
 
-test "compile #7d: (do (defn id [x] x) (id 42)) → 42" {
+test "compile source def: (do (defn id [x] x) (id 42)) → 42" {
     try expectSourceFixnumWithNs("(do (defn id [x] x) (id 42))", 42);
 }
 
-test "compile #7d: defn with recur — (do (defn loop-down [n] (if (< n 1) n (recur (+ n -1)))) (loop-down 5)) → 0" {
+test "compile source def: defn with recur — (do (defn loop-down [n] (if (< n 1) n (recur (+ n -1)))) (loop-down 5)) → 0" {
     try expectSourceFixnumWithNs(
         "(do (defn loop-down [n] (if (< n 1) n (recur (+ n -1)))) (loop-down 5))",
         0,
     );
 }
 
-test "compile #7d: defn with rest param — (do (defn first-of [a & r] a) (first-of 7 99 100)) → 7" {
+test "compile source def: defn with rest param — (do (defn first-of [a & r] a) (first-of 7 99 100)) → 7" {
     try expectSourceFixnumWithNs("(do (defn first-of [a & r] a) (first-of 7 99 100))", 7);
 }
 
-test "compile #7d: canonical forward reference — (do (defn f [] (g)) (defn g [] 42) (f)) → 42" {
+test "compile source def: canonical forward reference — (do (defn f [] (g)) (defn g [] 42) (f)) → 42" {
     // The big payoff: real source syntax for the forward-reference
     // pattern. f compiles when g is unbound (Var interned lazily
     // via compileSymbol's fall-through); after g is bound, f's
@@ -7219,11 +7111,11 @@ test "compile #7d: canonical forward reference — (do (defn f [] (g)) (defn g [
     try expectSourceFixnumWithNs("(do (defn f [] (g)) (defn g [] 42) (f))", 42);
 }
 
-test "compile #7d: (do (def x 5) (let* [x 99] x)) → 99 — lexical local shadows Var" {
+test "compile source def: (do (def x 5) (let* [x 99] x)) → 99 — lexical local shadows Var" {
     try expectSourceFixnumWithNs("(do (def x 5) (let* [x 99] x))", 99);
 }
 
-test "compile #7d: forward reference + call before bind → UnboundVar at runtime" {
+test "compile source def: forward reference + call before bind → UnboundVar at runtime" {
     // (do (defn f [] (g)) (f)) — g never defined; f's call to
     // g traps :unbound-var when invoked.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -7243,7 +7135,7 @@ test "compile #7d: forward reference + call before bind → UnboundVar at runtim
     try testing.expectError(vm.VmError.UnboundVar, v.run());
 }
 
-test "compile #7d: (var x) returns the Var object" {
+test "compile source def: (var x) returns the Var object" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -7261,33 +7153,32 @@ test "compile #7d: (var x) returns the Var object" {
     try testing.expect(!var_obj.bound);
 }
 
-test "compile #7d: (def) → MalformedForm" {
+test "compile source def: (def) → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(def)"));
 }
 
-test "compile #7d: (def 42 5) → ExpectedSymbol" {
+test "compile source def: (def 42 5) → ExpectedSymbol" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.ExpectedSymbol, compileSource(arena.allocator(), "(def 42 5)"));
 }
 
-test "compile #7d: (defn name) without body → MalformedForm" {
+test "compile source def: (defn name) without body → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(defn f [x])"));
 }
 
-test "compile #7d: (var) → MalformedForm" {
+test "compile source def: (var) → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(var)"));
 }
 
-test "compile #7d: without namespace, def → UnresolvedSymbol (regression)" {
-    // Preserves the no-namespace semantics from #6b: def needs
-    // a namespace to live in.
+test "compile source def: without namespace, def → UnresolvedSymbol (regression)" {
+    // def needs a namespace to live in.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(
@@ -7296,9 +7187,9 @@ test "compile #7d: without namespace, def → UnresolvedSymbol (regression)" {
     );
 }
 
-// ---- step #7 peer-AI turn 54 nice-to-fix items ----
+// ---- intrinsic shadowing edge cases ----
 
-test "compile #7: (let* [+ (+ 1 2)] +) → 3 — let* RHS does NOT see own binding" {
+test "compile shadowing: (let* [+ (+ 1 2)] +) → 3 — let* RHS does NOT see own binding" {
     // Sequential RHS visibility: binding-i's RHS sees only
     // 1..i-1. So `(+ 1 2)` inside the RHS of the `+` binding
     // inlines to Tiny.add → 3. Body's `+` returns the function
@@ -7307,29 +7198,24 @@ test "compile #7: (let* [+ (+ 1 2)] +) → 3 — let* RHS does NOT see own bindi
     try expectSourceFixnum("(let* [+ (+ 1 2)] +)", 3);
 }
 
-test "compile #7: ((fn* [+] (+ 1 2)) (fn* [a b] 42)) → 42 — fn param shadows intrinsic" {
+test "compile shadowing: ((fn* [+] (+ 1 2)) (fn* [a b] 42)) → 42 — fn param shadows intrinsic" {
     try expectSourceFixnum("((fn* [+] (+ 1 2)) (fn* [a b] 42))", 42);
 }
 
-test "compile #7: (letfn* [(+ [a b] 42)] (+ 1 2)) → 42 — letfn name shadows intrinsic" {
+test "compile shadowing: (letfn* [(+ [a b] 42)] (+ 1 2)) → 42 — letfn name shadows intrinsic" {
     try expectSourceFixnum("(letfn* [(+ [a b] 42)] (+ 1 2))", 42);
 }
 
-test "compile #7: (do (def + (fn* [a b] 42)) (+ 1 2)) → 3 — STAGED LIMITATION" {
-    // Pins the documented limitation from #7b: Var-level shadowing
+test "compile shadowing: (do (def + (fn* [a b] 42)) (+ 1 2)) → 3 — Vars do not defeat inlining" {
+    // Pins the documented limitation: Var-level shadowing
     // does NOT defeat intrinsic inlining (LowerEnv only tracks
-    // lexical names, not namespace Vars). Per peer-AI turn 54
-    // §"Nice-to-fix #1", this test makes the staged behavior
-    // explicit and provable. Var-aware inlining is Phase 3+.
+    // lexical names, not namespace Vars).
     try expectSourceFixnumWithNs("(do (def + (fn* [a b] 42)) (+ 1 2))", 3);
 }
 
-test "compile #7: letfn* with rest param → UnsupportedFeature (Tiny FnBinding has no rest yet)" {
-    // The Tiny.letfn_star.FnBinding shape predates 5e's
-    // variadic support and has no rest_param field. Per
-    // peer-AI turn 54 §D, this is documented + tested as a
-    // staged limitation. Resolving requires extending
-    // FnBinding (later commit).
+test "compile shadowing: letfn* with rest param → UnsupportedFeature (Tiny FnBinding has no rest)" {
+    // Tiny.letfn_star.FnBinding has no rest_param field, so a
+    // letfn* binding with `& rest` is rejected.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(
@@ -7338,10 +7224,10 @@ test "compile #7: letfn* with rest param → UnsupportedFeature (Tiny FnBinding 
     );
 }
 
-test "compile #7: 'foo via compileSource (no interner) → UnsupportedFeature" {
+test "compile shadowing: 'foo via compileSource (no interner) → UnsupportedFeature" {
     // Without an Interner, both `'foo` and `(quote foo)` raise
     // UnsupportedFeature symmetrically. compileSourceFull
-    // (step E1) closes this — see the E1 tests below.
+    // passes an Interner — see the quote symbol tests below.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(
@@ -7350,7 +7236,7 @@ test "compile #7: 'foo via compileSource (no interner) → UnsupportedFeature" {
     );
 }
 
-// ---- step E1: Tiny.literal + Interner via compileSourceFull ----
+// ---- Tiny.literal + Interner via compileSourceFull ----
 
 /// Helper: run a source string with both namespace AND interner
 /// from a freshly-built VM, return the result. Caller inspects
@@ -7373,31 +7259,31 @@ fn runSourceFull(src: []const u8) !struct { result: value_mod.Value, vm_owned: v
     return .{ .result = result, .vm_owned = v };
 }
 
-test "compile E1: (quote foo) with interner returns interned symbol Value" {
+test "compile quote symbol: (quote foo) with interner returns interned symbol Value" {
     var r = try runSourceFull("(quote foo)");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .symbol);
 }
 
-test "compile E1: 'foo (reader-macro) with interner returns interned symbol Value" {
+test "compile quote symbol: 'foo (reader-macro) with interner returns interned symbol Value" {
     var r = try runSourceFull("'foo");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .symbol);
 }
 
-test "compile E1: (quote :bar) with interner returns interned keyword Value" {
+test "compile quote symbol: (quote :bar) with interner returns interned keyword Value" {
     var r = try runSourceFull("(quote :bar)");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .keyword);
 }
 
-test "compile E1: ':bar (reader-macro) with interner returns interned keyword Value" {
+test "compile quote symbol: ':bar (reader-macro) with interner returns interned keyword Value" {
     var r = try runSourceFull("':bar");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .keyword);
 }
 
-test "compile E1: 'foo and 'foo intern to the SAME symbol Value (identity stable)" {
+test "compile quote symbol: 'foo and 'foo intern to the SAME symbol Value (identity stable)" {
     // Compile two separate programs in the same VM; both intern
     // `foo` through the same Interner; the resulting Values
     // must be identical.
@@ -7429,9 +7315,9 @@ test "compile E1: 'foo and 'foo intern to the SAME symbol Value (identity stable
     try testing.expectEqual(v1.payload, v2.payload);
 }
 
-test "compile E1: (quote 42) still uses Tiny.int (no const-pool waste)" {
+test "compile quote symbol: (quote 42) still uses Tiny.int (no const-pool waste)" {
     // Quoted scalars (nil/bool/int) lower to existing Tiny
-    // variants directly, per peer-AI turn 53 §Q1. Tiny.literal
+    // variants directly. Tiny.literal
     // only fires for quoted symbols/keywords. We verify behavior
     // here by checking that compileSourceFull succeeds and
     // returns the integer.
@@ -7449,13 +7335,13 @@ test "compile E1: (quote 42) still uses Tiny.int (no const-pool waste)" {
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
 }
 
-test "compile E1: bare :keyword self-evaluates with interner" {
+test "compile quote symbol: bare :keyword self-evaluates with interner" {
     var r = try runSourceFull(":hello");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .keyword);
 }
 
-test "compile E1: (if true :yes :no) — bare keywords in if arms" {
+test "compile quote symbol: (if true :yes :no) — bare keywords in if arms" {
     var r = try runSourceFull("(if true :yes :no)");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .keyword);
@@ -7463,7 +7349,7 @@ test "compile E1: (if true :yes :no) — bare keywords in if arms" {
     try testing.expectEqualStrings("yes", r.vm_owned.ensureInterner().keywordName(id));
 }
 
-test "compile E1: bare keyword without interner → UnsupportedFeature" {
+test "compile quote symbol: bare keyword without interner → UnsupportedFeature" {
     // compileSource (no interner) preserves the prior behavior.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -7473,9 +7359,9 @@ test "compile E1: bare keyword without interner → UnsupportedFeature" {
     );
 }
 
-// ---- step #8a: macroexpand integration ---------------------
+// ---- macroexpand integration ---------------------
 
-test "compile #8a: empty macro table passes through (sanity)" {
+test "compile macros: empty macro table passes through (sanity)" {
     // compileSourceFullWithMacros with an empty macro table
     // should produce the same result as compileSourceFull.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -7500,7 +7386,7 @@ test "compile #8a: empty macro table passes through (sanity)" {
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
 }
 
-test "compile #8a: infinite macro loop → MacroDepthExceeded" {
+test "compile macros: infinite macro loop → MacroDepthExceeded" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -7534,7 +7420,7 @@ test "compile #8a: infinite macro loop → MacroDepthExceeded" {
     );
 }
 
-// ---- step #8b: host core macros end-to-end ------------------
+// ---- host core macros end-to-end ------------------
 
 /// Run a source string with default macros + interner + ns.
 /// Returns the result Value via the helper VM setup. The VM
@@ -7587,15 +7473,15 @@ fn expectKeywordDefaultMacros(src: []const u8, expected: []const u8) !void {
 
 // ---- rename macros ----
 
-test "compile #8b: (let [x 1 y 2] (+ x y)) → 3" {
+test "compile core macros: (let [x 1 y 2] (+ x y)) → 3" {
     try expectFixnumDefaultMacros("(let [x 1 y 2] (+ x y))", 3);
 }
 
-test "compile #8b: (fn [x] (+ x 1)) renamed to fn*" {
+test "compile core macros: (fn [x] (+ x 1)) renamed to fn*" {
     try expectFixnumDefaultMacros("((fn [x] (+ x 1)) 41)", 42);
 }
 
-test "compile #8b: (loop [i 0] ...) renamed to loop*" {
+test "compile core macros: (loop [i 0] ...) renamed to loop*" {
     try expectFixnumDefaultMacros(
         "(loop [i 0 acc 0] (if (< i 5) (recur (+ i 1) (+ acc i)) acc))",
         10,
@@ -7604,27 +7490,27 @@ test "compile #8b: (loop [i 0] ...) renamed to loop*" {
 
 // ---- when / when-not ----
 
-test "compile #8b: (when true 42) → 42" {
+test "compile core macros: (when true 42) → 42" {
     try expectFixnumDefaultMacros("(when true 42)", 42);
 }
 
-test "compile #8b: (when false 42) → nil" {
+test "compile core macros: (when false 42) → nil" {
     try expectNilDefaultMacros("(when false 42)");
 }
 
-test "compile #8b: (when true 1 2 3) returns last body form" {
+test "compile core macros: (when true 1 2 3) returns last body form" {
     try expectFixnumDefaultMacros("(when true 1 2 3)", 3);
 }
 
-test "compile #8b: (when-not false 99) → 99" {
+test "compile core macros: (when-not false 99) → 99" {
     try expectFixnumDefaultMacros("(when-not false 99)", 99);
 }
 
-test "compile #8b: (when-not true 99) → nil" {
+test "compile core macros: (when-not true 99) → nil" {
     try expectNilDefaultMacros("(when-not true 99)");
 }
 
-test "compile #8b: (when) malformed → MacroExpansionFailure" {
+test "compile core macros: (when) malformed → MacroExpansionFailure" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -7642,37 +7528,37 @@ test "compile #8b: (when) malformed → MacroExpansionFailure" {
 
 // ---- and ----
 
-test "compile #8b: (and) → true" {
+test "compile core macros: (and) → true" {
     try expectBoolDefaultMacros("(and)", true);
 }
 
-test "compile #8b: (and 42) → 42" {
+test "compile core macros: (and 42) → 42" {
     try expectFixnumDefaultMacros("(and 42)", 42);
 }
 
-test "compile #8b: (and 1 2 3) → 3 (last truthy)" {
+test "compile core macros: (and 1 2 3) → 3 (last truthy)" {
     try expectFixnumDefaultMacros("(and 1 2 3)", 3);
 }
 
-test "compile #8b: (and 1 false 3) → false (short-circuit)" {
+test "compile core macros: (and 1 false 3) → false (short-circuit)" {
     try expectBoolDefaultMacros("(and 1 false 3)", false);
 }
 
-test "compile #8b: (and nil 99) → nil (returns falsy value, not literal false)" {
+test "compile core macros: (and nil 99) → nil (returns falsy value, not literal false)" {
     // Clojure-style: and returns the FIRST FALSY value, not
     // literal false. Confirms expandAnd uses the let*+gensym
     // shape, not the simpler-but-wrong (if x y false).
     try expectNilDefaultMacros("(and nil 99)");
 }
 
-test "compile #8b: (and falsy ...) uses gensym (no double-eval on falsy)" {
-    // Per peer-AI turn 57: the classic bad `and` expansion is
+test "compile core macros: (and falsy ...) uses gensym (no double-eval on falsy)" {
+    // The classic bad `and` expansion is
     // `(if x y x)`. That double-evals x ONLY when x is falsy
     // (test branch + else branch both evaluate x). So the
     // single-eval test for `and` MUST use a FALSY-returning
-    // side effect to catch the bug. (The earlier truthy
-    // version of this test was sound for `or` but didn't
-    // exercise the right branch for `and`.)
+    // side effect to catch the bug. (A truthy version would be
+    // sound for `or` but would not exercise the right branch
+    // for `and`.)
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -7701,51 +7587,51 @@ test "compile #8b: (and falsy ...) uses gensym (no double-eval on falsy)" {
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
-// ---- Value-semantics pins (peer-AI turn 57 §2): catch the
+// ---- Value-semantics pins: catch the
 // `and`/`or` bug variants more directly than gensym tests
 // alone.
 
-test "compile #8b: (and false 99) → false (returns the FALSE value, not nil)" {
+test "compile core macros: (and false 99) → false (returns the FALSE value, not nil)" {
     try expectBoolDefaultMacros("(and false 99)", false);
 }
 
-test "compile #8b: (or 0 7) → 0 (zero is truthy in Lisp)" {
+test "compile core macros: (or 0 7) → 0 (zero is truthy in Lisp)" {
     // Only nil and false are falsy in nexis (matches Clojure).
     // A regression that treated 0 as falsy would return 7.
     try expectFixnumDefaultMacros("(or 0 7)", 0);
 }
 
-test "compile #8b: (and 0 1) → 1 (zero is truthy → continues)" {
+test "compile core macros: (and 0 1) → 1 (zero is truthy → continues)" {
     try expectFixnumDefaultMacros("(and 0 1)", 1);
 }
 
-test "compile #8b: (or false nil) → nil (returns LAST falsy when all falsy)" {
+test "compile core macros: (or false nil) → nil (returns LAST falsy when all falsy)" {
     try expectNilDefaultMacros("(or false nil)");
 }
 
 // ---- or ----
 
-test "compile #8b: (or) → nil" {
+test "compile core macros: (or) → nil" {
     try expectNilDefaultMacros("(or)");
 }
 
-test "compile #8b: (or 42) → 42" {
+test "compile core macros: (or 42) → 42" {
     try expectFixnumDefaultMacros("(or 42)", 42);
 }
 
-test "compile #8b: (or false nil 42) → 42" {
+test "compile core macros: (or false nil 42) → 42" {
     try expectFixnumDefaultMacros("(or false nil 42)", 42);
 }
 
-test "compile #8b: (or 1 2 3) → 1 (first truthy)" {
+test "compile core macros: (or 1 2 3) → 1 (first truthy)" {
     try expectFixnumDefaultMacros("(or 1 2 3)", 1);
 }
 
-test "compile #8b: (or false false false) → false" {
+test "compile core macros: (or false false false) → false" {
     try expectBoolDefaultMacros("(or false false false)", false);
 }
 
-test "compile #8b: (or expr ...) uses gensym (no double-eval)" {
+test "compile core macros: (or expr ...) uses gensym (no double-eval)" {
     // The classic gensym test: a stateful expression that
     // would yield different results if evaluated twice. We
     // model statelessness here via a defn'd Var that counts
@@ -7785,30 +7671,30 @@ test "compile #8b: (or expr ...) uses gensym (no double-eval)" {
 
 // ---- cond ----
 
-test "compile #8b: (cond) → nil" {
+test "compile core macros: (cond) → nil" {
     try expectNilDefaultMacros("(cond)");
 }
 
-test "compile #8b: (cond true 42) → 42" {
+test "compile core macros: (cond true 42) → 42" {
     try expectFixnumDefaultMacros("(cond true 42)", 42);
 }
 
-test "compile #8b: (cond false 1 true 2 false 3) → 2" {
+test "compile core macros: (cond false 1 true 2 false 3) → 2" {
     try expectFixnumDefaultMacros("(cond false 1 true 2 false 3)", 2);
 }
 
-test "compile #8b: (cond false 1 false 2) → nil (no match)" {
+test "compile core macros: (cond false 1 false 2) → nil (no match)" {
     try expectNilDefaultMacros("(cond false 1 false 2)");
 }
 
-test "compile #8b: cond with :else convention (truthy keyword)" {
+test "compile core macros: cond with :else convention (truthy keyword)" {
     try expectKeywordDefaultMacros(
         "(cond false :a false :b :else :c)",
         "c",
     );
 }
 
-test "compile #8b: (cond odd-args) → MacroExpansionFailure" {
+test "compile core macros: (cond odd-args) → MacroExpansionFailure" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -7826,29 +7712,29 @@ test "compile #8b: (cond odd-args) → MacroExpansionFailure" {
 
 // ---- thread-first / thread-last ----
 
-test "compile #8b: (-> 10) → 10 (single-arg)" {
+test "compile core macros: (-> 10) → 10 (single-arg)" {
     try expectFixnumDefaultMacros("(-> 10)", 10);
 }
 
-test "compile #8b: (-> 1 (+ 2)) → 3 (thread-first)" {
+test "compile core macros: (-> 1 (+ 2)) → 3 (thread-first)" {
     try expectFixnumDefaultMacros("(-> 1 (+ 2))", 3);
 }
 
-test "compile #8b: (-> 1 (+ 2) (+ 3)) chained → 6" {
+test "compile core macros: (-> 1 (+ 2) (+ 3)) chained → 6" {
     try expectFixnumDefaultMacros("(-> 1 (+ 2) (+ 3))", 6);
 }
 
-test "compile #8b: (->> 1 (+ 2) (+ 3)) thread-last → 6" {
+test "compile core macros: (->> 1 (+ 2) (+ 3)) thread-last → 6" {
     // (+ x y) is commutative so first/last give same result here;
     // semantic difference is tested in the asymmetric arg case
     // below.
     try expectFixnumDefaultMacros("(->> 1 (+ 2) (+ 3))", 6);
 }
 
-test "compile #8b: -> with symbol step treats it as (step)" {
+test "compile core macros: -> with symbol step treats it as (step)" {
     // (-> 41 inc) where inc is a fn — symbol step inserts the
-    // threaded value as the sole arg. We use an inline fn since
-    // there's no stdlib yet.
+    // threaded value as the sole arg. The compile tests run
+    // without the stdlib installed, so `inc` is defined inline.
     try expectFixnumDefaultMacros(
         "(do (defn inc [x] (+ x 1)) (-> 41 inc))",
         42,
@@ -7857,22 +7743,22 @@ test "compile #8b: -> with symbol step treats it as (step)" {
 
 // ---- shadowing ----
 
-test "compile #8b: macros are lexically shadowable" {
+test "compile core macros: macros are lexically shadowable" {
     // (let [when 99] when) — `when` is shadowed by a let binding,
     // so the inner `when` resolves to the local, NOT the macro.
     try expectFixnumDefaultMacros("(let [when 99] when)", 99);
 }
 
-test "compile #8b: nested macros expand correctly" {
+test "compile core macros: nested macros expand correctly" {
     try expectKeywordDefaultMacros(
         "(when (and 1 2) (or false :yes))",
         "yes",
     );
 }
 
-// ---- step #8c.1: quoted compound + #%list / #%concat ----
+// ---- quoted compound + #%list / #%concat ----
 
-test "compile #8c.1: (quote (1 2 3)) returns list [1 2 3]" {
+test "compile quote list: (quote (1 2 3)) returns list [1 2 3]" {
     var r = try runSourceFull("(quote (1 2 3))");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .list);
@@ -7885,21 +7771,21 @@ test "compile #8c.1: (quote (1 2 3)) returns list [1 2 3]" {
     try testing.expect(list_mod.isEmpty(list_mod.tail(t2)));
 }
 
-test "compile #8c.1: (quote ()) returns the empty list" {
+test "compile quote list: (quote ()) returns the empty list" {
     var r = try runSourceFull("(quote ())");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .list);
     try testing.expect(list_mod.isEmpty(r.result));
 }
 
-test "compile #8c.1: '(1 2 3) reader-macro form works same as (quote (1 2 3))" {
+test "compile quote list: '(1 2 3) reader-macro form works same as (quote (1 2 3))" {
     var r = try runSourceFull("'(1 2 3)");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .list);
     try testing.expectEqual(@as(i64, 1), list_mod.head(r.result).asFixnum());
 }
 
-test "compile #8c.1: (quote (foo)) — interned symbol inside list" {
+test "compile quote list: (quote (foo)) — interned symbol inside list" {
     var r = try runSourceFull("(quote (foo))");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .list);
@@ -7907,7 +7793,7 @@ test "compile #8c.1: (quote (foo)) — interned symbol inside list" {
     try testing.expect(h.kind() == .symbol);
 }
 
-test "compile #8c.1: (quote (:a :b)) — keywords inside list" {
+test "compile quote list: (quote (:a :b)) — keywords inside list" {
     var r = try runSourceFull("(quote (:a :b))");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .list);
@@ -7915,7 +7801,7 @@ test "compile #8c.1: (quote (:a :b)) — keywords inside list" {
     try testing.expect(h.kind() == .keyword);
 }
 
-test "compile #8c.1: (quote (1 (2 3) 4)) — nested lists" {
+test "compile quote list: (quote (1 (2 3) 4)) — nested lists" {
     var r = try runSourceFull("(quote (1 (2 3) 4))");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .list);
@@ -7931,9 +7817,9 @@ test "compile #8c.1: (quote (1 (2 3) 4)) — nested lists" {
     try testing.expectEqual(@as(i64, 4), fourth.asFixnum());
 }
 
-// ---- step #8c.2: syntax-quote / unquote / splice / gensym ----
+// ---- syntax-quote / unquote / splice / gensym ----
 
-test "compile #8c.2: `(1 2 3) builds (1 2 3)" {
+test "compile syntax-quote: `(1 2 3) builds (1 2 3)" {
     var r = try runSourceFull("`(1 2 3)");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .list);
@@ -7942,27 +7828,28 @@ test "compile #8c.2: `(1 2 3) builds (1 2 3)" {
     try testing.expectEqual(@as(i64, 3), list_mod.head(list_mod.tail(list_mod.tail(r.result))).asFixnum());
 }
 
-test "compile #8c.2: `() builds empty list" {
+test "compile syntax-quote: `() builds empty list" {
     var r = try runSourceFull("`()");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .list);
     try testing.expect(list_mod.isEmpty(r.result));
 }
 
-test "compile #8c.2: `foo → interned symbol via (quote foo)" {
+test "compile syntax-quote: `foo → interned symbol via (quote foo)" {
     var r = try runSourceFull("`foo");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .symbol);
 }
 
-test "compile #8c.2: `:bar self-evaluates" {
+test "compile syntax-quote: `:bar self-evaluates" {
     var r = try runSourceFull("`:bar");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .keyword);
 }
 
-test "compile #8c.2: `(value ~x) — simple unquote" {
-    // Walk the resulting list directly (no stdlib head/tail yet).
+test "compile syntax-quote: `(value ~x) — simple unquote" {
+    // Walk the resulting list directly (the compile tests run
+    // without the stdlib installed).
     // Source: (let [x 42] `(value ~x)) → (value 42)
     var r = try runSourceFull(
         \\(let* [x 42] `(value ~x))
@@ -7976,7 +7863,7 @@ test "compile #8c.2: `(value ~x) — simple unquote" {
     try testing.expect(list_mod.isEmpty(list_mod.tail(tail)));
 }
 
-test "compile #8c.2: ~@xs splices a list" {
+test "compile syntax-quote: ~@xs splices a list" {
     // `(a ~@xs b) → list with xs's elements between a and b.
     var r = try runSourceFull(
         \\(let* [xs (quote (1 2 3))]
@@ -7998,7 +7885,7 @@ test "compile #8c.2: ~@xs splices a list" {
     try testing.expect(list_mod.isEmpty(list_mod.tail(node)));
 }
 
-test "compile #8c.2: auto-gensym — `(g# g#) — both refs share same gensym" {
+test "compile syntax-quote: auto-gensym — `(g# g#) — both refs share same gensym" {
     // Output list should be (g__N__auto__ g__N__auto__) for the
     // same N. We assert the two symbols are IDENTITY-EQUAL.
     var r = try runSourceFull("`(g# g#)");
@@ -8013,7 +7900,7 @@ test "compile #8c.2: auto-gensym — `(g# g#) — both refs share same gensym" {
     try testing.expectEqual(s1.payload, s2.payload);
 }
 
-test "compile #8c.2: two separate syntax-quotes get DIFFERENT gensyms" {
+test "compile syntax-quote: two separate syntax-quotes get DIFFERENT gensyms" {
     // Two adjacent `g# in DIFFERENT syntax-quote scopes must
     // produce different gensyms. Walk both via #%list to compare.
     var r = try runSourceFull("`(~`g# ~`g#)");
@@ -8025,7 +7912,7 @@ test "compile #8c.2: two separate syntax-quotes get DIFFERENT gensyms" {
     try testing.expect(s1.payload != s2.payload);
 }
 
-test "compile #8c.2: unquote outside syntax-quote → MacroExpansionFailure" {
+test "compile syntax-quote: unquote outside syntax-quote → MacroExpansionFailure" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8043,9 +7930,9 @@ test "compile #8c.2: unquote outside syntax-quote → MacroExpansionFailure" {
     );
 }
 
-// ---- step #8c.3: vector support (coll:vector + #%vector) ----
+// ---- vector support (coll:vector + #%vector) ----
 
-test "compile #8c.3: (quote [1 2 3]) builds a persistent vector" {
+test "compile quote vector: (quote [1 2 3]) builds a persistent vector" {
     var r = try runSourceFull("(quote [1 2 3])");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_vector);
@@ -8056,7 +7943,7 @@ test "compile #8c.3: (quote [1 2 3]) builds a persistent vector" {
     try testing.expectEqual(@as(i64, 3), vec_mod.nth(r.result, 2).asFixnum());
 }
 
-test "compile #8c.3: (quote []) builds empty vector" {
+test "compile quote vector: (quote []) builds empty vector" {
     var r = try runSourceFull("(quote [])");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_vector);
@@ -8064,7 +7951,7 @@ test "compile #8c.3: (quote []) builds empty vector" {
     try testing.expectEqual(@as(usize, 0), vec_mod.count(r.result));
 }
 
-test "compile #8c.3: `[~x ~y] syntax-quote with unquote" {
+test "compile quote vector: `[~x ~y] syntax-quote with unquote" {
     var r = try runSourceFull(
         \\(let* [x 10 y 20] `[~x ~y])
     );
@@ -8076,9 +7963,9 @@ test "compile #8c.3: `[~x ~y] syntax-quote with unquote" {
     try testing.expectEqual(@as(i64, 20), vec_mod.nth(r.result, 1).asFixnum());
 }
 
-test "compile #8c.3: syntax-quoted vector + splice → MacroExpansionFailure" {
-    // Vectors don't support splice in v1 (peer-AI turn 58 §D10
-    // simplification — binding vectors are built positionally).
+test "compile quote vector: syntax-quoted vector + splice → MacroExpansionFailure" {
+    // Vectors don't support splice (binding vectors are built
+    // positionally).
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8094,7 +7981,7 @@ test "compile #8c.3: syntax-quoted vector + splice → MacroExpansionFailure" {
     );
 }
 
-test "compile #8c.3: nested vector in quoted list" {
+test "compile quote vector: nested vector in quoted list" {
     var r = try runSourceFull("(quote (a [1 2] b))");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .list);
@@ -8107,9 +7994,9 @@ test "compile #8c.3: nested vector in quoted list" {
     try testing.expectEqual(@as(usize, 2), vec_mod.count(second));
 }
 
-// ---- Phase 3.1: maps/sets as runtime values ----------------
+// ---- maps/sets as runtime values ----------------
 
-test "compile #3.1: (quote {}) builds the empty persistent map" {
+test "compile map/set literals: (quote {}) builds the empty persistent map" {
     var r = try runSourceFull("(quote {})");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_map);
@@ -8117,7 +8004,7 @@ test "compile #3.1: (quote {}) builds the empty persistent map" {
     try testing.expectEqual(@as(usize, 0), cm.mapCount(r.result));
 }
 
-test "compile #3.1: (quote {:a 1 :b 2}) builds 2-entry map" {
+test "compile map/set literals: (quote {:a 1 :b 2}) builds 2-entry map" {
     var r = try runSourceFull("(quote {:a 1 :b 2})");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_map);
@@ -8125,7 +8012,7 @@ test "compile #3.1: (quote {:a 1 :b 2}) builds 2-entry map" {
     try testing.expectEqual(@as(usize, 2), cm.mapCount(r.result));
 }
 
-test "compile #3.1: runtime-computed duplicate key — later wins (Clojure semantics)" {
+test "compile map/set literals: runtime-computed duplicate key — later wins (Clojure semantics)" {
     // Two map keys both evaluate to :a at runtime; the second
     // value (2) wins. The reader catches STATIC duplicates
     // (`{:a 1 :a 2}` → ReaderFailure) but lets computed
@@ -8153,7 +8040,7 @@ test "compile #3.1: runtime-computed duplicate key — later wins (Clojure seman
     try testing.expectEqual(@as(i64, 2), looked_up.present.asFixnum());
 }
 
-test "compile #3.1: static duplicate key {:a 1 :a 2} → ReaderFailure" {
+test "compile map/set literals: static duplicate key {:a 1 :a 2} → ReaderFailure" {
     // The READER catches static duplicate keys with
     // `duplicate_literal_key`. Runtime never sees this case
     // via source literals; the "later wins" semantics applies
@@ -8171,7 +8058,7 @@ test "compile #3.1: static duplicate key {:a 1 :a 2} → ReaderFailure" {
     );
 }
 
-test "compile #3.1: (quote #{}) builds the empty persistent set" {
+test "compile map/set literals: (quote #{}) builds the empty persistent set" {
     var r = try runSourceFull("(quote #{})");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_set);
@@ -8179,7 +8066,7 @@ test "compile #3.1: (quote #{}) builds the empty persistent set" {
     try testing.expectEqual(@as(usize, 0), cm.setCount(r.result));
 }
 
-test "compile #3.1: (quote #{1 2 3}) builds 3-element set" {
+test "compile map/set literals: (quote #{1 2 3}) builds 3-element set" {
     var r = try runSourceFull("(quote #{1 2 3})");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_set);
@@ -8187,7 +8074,7 @@ test "compile #3.1: (quote #{1 2 3}) builds 3-element set" {
     try testing.expectEqual(@as(usize, 3), cm.setCount(r.result));
 }
 
-test "compile #3.1: runtime-computed duplicate elem — set collapses" {
+test "compile map/set literals: runtime-computed duplicate elem — set collapses" {
     // The reader catches static `#{1 1 2}` as
     // duplicate_literal_element. Runtime sees this only via
     // computed elements; here both elements evaluate to 1.
@@ -8208,7 +8095,7 @@ test "compile #3.1: runtime-computed duplicate elem — set collapses" {
     try testing.expectEqual(@as(usize, 2), cm.setCount(result));
 }
 
-test "compile #3.1: static duplicate set elem #{1 1 2} → ReaderFailure" {
+test "compile map/set literals: static duplicate set elem #{1 1 2} → ReaderFailure" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8222,7 +8109,7 @@ test "compile #3.1: static duplicate set elem #{1 1 2} → ReaderFailure" {
     );
 }
 
-test "compile #3.1: runtime map literal {k1 v1} — value expressions evaluated" {
+test "compile map/set literals: runtime map literal {k1 v1} — value expressions evaluated" {
     // Demonstrate that map values can be arbitrary expressions
     // (here: (+ 1 2)), not just literals.
     var r = try runSourceFull("(let* [n 42] {:answer n})");
@@ -8238,7 +8125,7 @@ test "compile #3.1: runtime map literal {k1 v1} — value expressions evaluated"
     try testing.expectEqual(@as(i64, 42), got.present.asFixnum());
 }
 
-test "compile #3.1: (quote {k {:nested :map}}) — nested quoted maps" {
+test "compile map/set literals: (quote {k {:nested :map}}) — nested quoted maps" {
     var r = try runSourceFull("(quote {:outer {:inner 1}})");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_map);
@@ -8250,21 +8137,21 @@ test "compile #3.1: (quote {k {:nested :map}}) — nested quoted maps" {
     try testing.expect(inner_map == .present);
     try testing.expect(inner_map.present.kind() == .persistent_map);
 }
-// ---- step #9.1: try / catch / throw end-to-end ----------
+// ---- try / catch / throw end-to-end ----------
 
-test "compile #9.1: (try 42 (catch any e e)) → 42" {
+test "compile try: (try 42 (catch any e e)) → 42" {
     try expectFixnumDefaultMacros("(try 42 (catch any e e))", 42);
 }
 
-test "compile #9.1: (try (throw 7) (catch any e e)) → 7" {
+test "compile try: (try (throw 7) (catch any e e)) → 7" {
     try expectFixnumDefaultMacros("(try (throw 7) (catch any e e))", 7);
 }
 
-test "compile #9.1: throw propagates a keyword value" {
+test "compile try: throw propagates a keyword value" {
     try expectKeywordDefaultMacros("(try (throw :boom) (catch any e e))", "boom");
 }
 
-test "compile #9.1: cross-frame throw (callee throws, caller catches)" {
+test "compile try: cross-frame throw (callee throws, caller catches)" {
     try expectFixnumDefaultMacros(
         \\(do
         \\  (defn f [] (throw 99))
@@ -8274,9 +8161,8 @@ test "compile #9.1: cross-frame throw (callee throws, caller catches)" {
     );
 }
 
-test "compile #9.1: catch body's own throw NOT re-caught by same handler" {
-    // The classic trap. Peer-AI turn 59 §"Missing trap 1" /
-    // §D5. (try (throw :a) (catch any e (throw :b))) must
+test "compile try: catch body's own throw NOT re-caught by same handler" {
+    // The classic trap: (try (throw :a) (catch any e (throw :b))) must
     // propagate :b as uncaught — the inner throw cannot loop
     // back to the same catch handler.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -8304,7 +8190,7 @@ test "compile #9.1: catch body's own throw NOT re-caught by same handler" {
     try testing.expect(v.unhandled_throw.?.kind() == .keyword);
 }
 
-test "compile #9.1: unhandled top-level throw → UncaughtThrow" {
+test "compile try: unhandled top-level throw → UncaughtThrow" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8327,7 +8213,7 @@ test "compile #9.1: unhandled top-level throw → UncaughtThrow" {
     try testing.expectEqual(@as(i64, 13), v.unhandled_throw.?.asFixnum());
 }
 
-test "compile #9.1: handler binding visible in handler body" {
+test "compile try: handler binding visible in handler body" {
     // The catch body adds 1 to the thrown value.
     try expectFixnumDefaultMacros(
         \\(try (throw 41) (catch any e (+ e 1)))
@@ -8336,7 +8222,7 @@ test "compile #9.1: handler binding visible in handler body" {
     );
 }
 
-test "compile #9.1: try without catch or finally → MalformedForm" {
+test "compile try: try without catch or finally → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8352,9 +8238,9 @@ test "compile #9.1: try without catch or finally → MalformedForm" {
     );
 }
 
-// ---- step #9.2: finally clauses end-to-end ----------
+// ---- finally clauses end-to-end ----------
 
-test "compile #9.2: try/catch/finally — normal exit runs finally" {
+test "compile finally: try/catch/finally — normal exit runs finally" {
     // Body returns 1; catch unused; finally runs but result is
     // discarded — the try expression's value is 1.
     try expectFixnumDefaultMacros(
@@ -8363,7 +8249,7 @@ test "compile #9.2: try/catch/finally — normal exit runs finally" {
     );
 }
 
-test "compile #9.2: try/catch/finally — caught throw + finally" {
+test "compile finally: try/catch/finally — caught throw + finally" {
     // Body throws :a; catch binds e and returns 7; finally runs
     // but result discarded — try expression's value is 7.
     try expectFixnumDefaultMacros(
@@ -8372,7 +8258,7 @@ test "compile #9.2: try/catch/finally — caught throw + finally" {
     );
 }
 
-test "compile #9.2: try/catch/finally — finally side effect via def" {
+test "compile finally: try/catch/finally — finally side effect via def" {
     // The finally body sets a Var; after the try expression
     // returns, the Var holds the new value. Proves finally
     // actually ran.
@@ -8402,7 +8288,7 @@ test "compile #9.2: try/catch/finally — finally side effect via def" {
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
-test "compile #9.2: uncaught throw — finally runs then throw propagates" {
+test "compile finally: uncaught throw — finally runs then throw propagates" {
     // Outer try catches; inner try has only finally. Body
     // throws; inner finally runs (side effect via def); outer
     // catch receives the original thrown value.
@@ -8416,8 +8302,8 @@ test "compile #9.2: uncaught throw — finally runs then throw propagates" {
     const interner = v.ensureInterner();
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
-    // Note: a try with finally but no catch isn't supported by
-    // the v1 grammar (we require catch). So we use catch that
+    // Note: a try with finally but no catch is rejected
+    // (catch is required). So we use catch that
     // rethrows + outer try to test the throw-through-finally
     // path.
     const src =
@@ -8441,9 +8327,9 @@ test "compile #9.2: uncaught throw — finally runs then throw propagates" {
     try testing.expectEqual(@as(i64, 1), fired_var.root.asFixnum());
 }
 
-test "compile #9.2: throw inside finally replaces pending value" {
-    // Body returns 1; finally throws :replaced. Per peer-AI
-    // turn 61 + Clojure semantics: the new throw replaces
+test "compile finally: throw inside finally replaces pending value" {
+    // Body returns 1; finally throws :replaced. Clojure
+    // semantics: the new throw replaces
     // whatever was happening; outer catch receives :replaced
     // (not 1).
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -8473,7 +8359,7 @@ test "compile #9.2: throw inside finally replaces pending value" {
     try testing.expectEqual(@as(i64, 99), result.asFixnum());
 }
 
-test "compile #9.2: finally body runs on caught-throw exit" {
+test "compile finally: finally body runs on caught-throw exit" {
     // Body throws → catch caught it → finally runs after.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -8501,7 +8387,7 @@ test "compile #9.2: finally body runs on caught-throw exit" {
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
 
-test "compile #9.1: non-any matcher → UnsupportedFeature" {
+test "compile try: non-any matcher → UnsupportedFeature" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8523,7 +8409,7 @@ test "compile #9.1: non-any matcher → UnsupportedFeature" {
     );
 }
 
-test "compile #9.1: nested try — outer catches what inner doesn't" {
+test "compile try: nested try — outer catches what inner doesn't" {
     try expectFixnumDefaultMacros(
         \\(try
         \\  (try (throw 100) (catch any e (throw e)))
@@ -8533,7 +8419,7 @@ test "compile #9.1: nested try — outer catches what inner doesn't" {
     );
 }
 
-test "compile #9.1: handler stack doesn't leak across normal exits" {
+test "compile try: handler stack doesn't leak across normal exits" {
     // (do (try 1 (catch any e 2)) (throw :x)) — the second
     // throw must NOT be caught by the popped try handler.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -8557,9 +8443,9 @@ test "compile #9.1: handler stack doesn't leak across normal exits" {
     try testing.expectError(vm.VmError.UncaughtThrow, v.run());
 }
 
-// ---- step #10.0: SrcSpan in compile error reports ----------
+// ---- SrcSpan in compile error reports ----------
 
-test "compile #10.0: out_span set on macro expansion failure" {
+test "compile span: out_span set on macro expansion failure" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8587,7 +8473,7 @@ test "compile #10.0: out_span set on macro expansion failure" {
     try testing.expect(span.?.pos < 10);
 }
 
-test "compile #10.0: out_span on malformed if" {
+test "compile span: out_span on malformed if" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8610,9 +8496,9 @@ test "compile #10.0: out_span on malformed if" {
     try testing.expect(span != null);
 }
 
-test "compile #10.0: legacy compileSourceFullWithMacros API still works (backwards-compat)" {
-    // The pre-#10.0 entry point (no out_span) remains valid;
-    // it delegates to the Span variant with null out_span.
+test "compile span: compileSourceFullWithMacros compiles a source string" {
+    // The entry point without out_span delegates to the Span
+    // variant with null out_span.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8632,8 +8518,8 @@ test "compile #10.0: legacy compileSourceFullWithMacros API still works (backwar
     try testing.expectError(CompileError.MacroExpansionFailure, result);
 }
 
-test "compile 4.0b: qualified symbol in quote interns full ns/name" {
-    // Phase 4.0b: qualified symbols round-trip through the
+test "compile qualified: qualified symbol in quote interns full ns/name" {
+    // Qualified symbols round-trip through the
     // interner as the full `ns/name` string. valueToForm splits
     // them back into ns + name on the way out.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

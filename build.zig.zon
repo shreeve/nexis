@@ -1,14 +1,13 @@
 .{
     .name = .nexis,
     .fingerprint = 0xcb09f0806daea9ef,
-    .version = "0.0.0-phase0",
+    .version = "0.0.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // emdb is nexis's sibling project providing persistent B+-tree
-        // storage (PLAN §2 substrate). Path dependency for local
-        // development; a release commit would pin by commit hash or
-        // tag. emdb.Env / emdb.Txn / emdb.Cursor are the APIs consumed
-        // via `src/db.zig`.
+        // storage (PLAN §2 substrate). Path dependency on the sibling
+        // checkout. emdb.Env / emdb.Txn / emdb.Cursor are the APIs
+        // consumed via `src/db.zig`.
         .emdb = .{ .path = "../emdb" },
     },
     .paths = .{

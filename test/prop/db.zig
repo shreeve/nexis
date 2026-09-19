@@ -1,12 +1,11 @@
 //! test/prop/db.zig — randomized round-trip property tests for
-//! `src/db.zig` + emdb integration. Closes PLAN §20.2 gate test
-//! #6 (emdb round-trip) and completes the Phase 1 gate scorecard
-//! to 8/8.
+//! `src/db.zig` + emdb integration. Covers PLAN §20.2 test #6
+//! (emdb round-trip).
 //!
 //! Properties (DB.md §10):
 //!
-//!   D1. **10k random Values across 5 named trees** (GATE #6
-//!       RECEIPT): every trial writes a random Value to a
+//!   D1. **10k random Values across 5 named trees** (PLAN §20.2
+//!       test #6): every trial writes a random Value to a
 //!       `(tree_name, key_bytes)` pair selected from 5 named trees.
 //!       After commit, a fresh read transaction pulls each entry
 //!       back. Assert:
@@ -20,7 +19,7 @@
 //!       the Connection, reopen the same file with a fresh
 //!       Connection + fresh Heap + fresh Interner, and re-read
 //!       every entry. Strengthens D1 by crossing connection
-//!       lifetime (peer-AI turn 23).
+//!       lifetime.
 //!
 //!   D3. **`durable_ref` identity triple**: 2000 random ref
 //!       construction / equality / hash trials. No DB I/O; pure
@@ -206,7 +205,7 @@ const Gen = struct {
 };
 
 // =============================================================================
-// D1. Gate #6 receipt — 10k Values across 5 named trees
+// D1. 10k Values across 5 named trees (PLAN §20.2 test #6)
 //
 // Partitioned into 5 × 2000-trial sub-tests so that a single sub-
 // test's runtime stays reasonable (matches the codec C1 shape).
@@ -308,12 +307,12 @@ test "D1c: 2000 random Values across 5 trees (partition 3/5)" {
 test "D1d: 2000 random Values across 5 trees (partition 4/5)" {
     try runD1Partition("d1d", 4, 2000);
 }
-test "D1e: 2000 random Values across 5 trees (partition 5/5, aggregates 10k GATE #6 receipt)" {
+test "D1e: 2000 random Values across 5 trees (partition 5/5, 10k in total)" {
     try runD1Partition("d1e", 5, 2000);
 }
 
 // =============================================================================
-// D2. Reopen-connection readback (peer-AI turn 23 strengthening)
+// D2. Reopen-connection readback
 //
 // Writes persist across Connection close / reopen on the same file.
 // =============================================================================

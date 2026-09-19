@@ -1,15 +1,15 @@
 //! test/prop/transient.zig — randomized property tests for the
 //! transient wrapper. Together with test/prop/champ.zig (map/set) and
-//! test/prop/vector.zig (vector), this file closes PLAN §20.2 gate
+//! test/prop/vector.zig (vector), this file covers PLAN §20.2
 //! tests #3 (transient equivalence) and #4 (transient ownership).
 //!
 //! Properties (TRANSIENT.md §12):
 //!
-//!   T1. Equivalence (gate #3): random edit sequences applied via
+//!   T1. Equivalence (test #3): random edit sequences applied via
 //!       (transient → N × ...Bang → persistentBang) produce the same
 //!       persistent Value (by `dispatch.equal` AND `dispatch.hashValue`)
 //!       as the direct persistent path. 300 trials per kind.
-//!   T2. Ownership (gate #4): frozen transients reject every op with
+//!   T2. Ownership (test #4): frozen transients reject every op with
 //!       `error.TransientFrozen`.
 //!   T3. Source immutability: a `...Bang` session on transient
 //!       `t = transientFrom(p)` does NOT mutate the original
@@ -35,10 +35,10 @@ const HeapHeader = heap_mod.HeapHeader;
 const prng_seed: u64 = 0x7472_616E_7369_656E; // "transien" LE
 
 // =============================================================================
-// T1 — Equivalence (GATE TEST #3 RETIREMENT RECEIPT)
+// T1 — Equivalence (PLAN §20.2 test #3)
 // =============================================================================
 
-test "T1a: map equivalence — transient × N ≡ persistent × N (1000 trials, gate #1 scaled)" {
+test "T1a: map equivalence — transient × N ≡ persistent × N (1000 trials)" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -72,7 +72,7 @@ test "T1a: map equivalence — transient × N ≡ persistent × N (1000 trials, 
 
         const persistent_from_transient = try transient.persistentBang(t);
 
-        // Equivalence: gate #3.
+        // Equivalence: PLAN §20.2 test #3.
         try std.testing.expect(dispatch.equal(persistent_path, persistent_from_transient));
         try std.testing.expectEqual(
             dispatch.hashValue(persistent_path),
@@ -81,7 +81,7 @@ test "T1a: map equivalence — transient × N ≡ persistent × N (1000 trials, 
     }
 }
 
-test "T1b: set equivalence — transient × N ≡ persistent × N (1000 trials, gate #1 scaled)" {
+test "T1b: set equivalence — transient × N ≡ persistent × N (1000 trials)" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -116,7 +116,7 @@ test "T1b: set equivalence — transient × N ≡ persistent × N (1000 trials, 
     }
 }
 
-test "T1c: vector equivalence — transient × N conj ≡ persistent × N conj (1000 trials, gate #1 scaled)" {
+test "T1c: vector equivalence — transient × N conj ≡ persistent × N conj (1000 trials)" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -147,7 +147,7 @@ test "T1c: vector equivalence — transient × N conj ≡ persistent × N conj (
 }
 
 // =============================================================================
-// T2 — Ownership (GATE TEST #4 RETIREMENT RECEIPT)
+// T2 — Ownership (PLAN §20.2 test #4)
 // =============================================================================
 
 test "T2a: map transient post-freeze rejects every op with TransientFrozen" {

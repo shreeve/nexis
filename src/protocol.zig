@@ -1,5 +1,5 @@
 //! protocol.zig — `Kind.protocol = 36` + `Kind.protocol_fn = 37`
-//! heap kinds (Phase 5 Item 3 / 5.3b).
+//! heap kinds.
 //!
 //! Authoritative spec: `docs/PROTOCOLS.md` §2.2 + §2.3. Per-VM
 //! protocol registry lives on the VM; this module owns only the

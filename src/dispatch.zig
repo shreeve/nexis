@@ -6,8 +6,7 @@
 //! layers per-kind heap dispatch on top of them.
 //!
 //! Why this split instead of folding heap dispatch into `value` / `eq`?
-//! Peer-AI review (conversation `nexis-phase-1` turn 6) chose the
-//! centralized shape for two reasons: (1) keeping the per-kind import
+//! The centralized shape serves two purposes: (1) keeping the per-kind import
 //! list out of `value` / `eq` so they don't accrete one import per
 //! heap kind, and (2) avoiding the module-graph cycle that results
 //! when `value` or `eq` imports a dispatcher that transitively imports
@@ -33,8 +32,8 @@
 //!                                  associative + set categories)
 //!
 //! No heap-kind module imports `dispatch.zig`. Collection kinds whose
-//! hash/equal is recursive over their elements (list, future
-//! vector/map/set) take the element callback as a function pointer:
+//! hash/equal is recursive over their elements (list, vector, map,
+//! set) take the element callback as a function pointer:
 //! `hashSeq(h, &hashValue)` / `equalSeq(a, b, &equal)`. That keeps
 //! the dependency graph acyclic while letting collection modules
 //! recurse through the full dispatcher.
@@ -104,7 +103,7 @@ pub fn eqCategory(k: Kind) EqCategory {
 /// Shared domain bytes for cross-kind equality categories. Chosen
 /// outside the 0..29 valid-Kind range so they can never collide with
 /// a real kind byte used by kind-local mixing. Frozen; changing these
-/// invalidates any already-serialized hashes (future codec concern).
+/// invalidates any already-serialized hashes.
 pub const sequential_domain_byte: u8 = 0xF0;
 pub const associative_domain_byte: u8 = 0xF1;
 pub const set_domain_byte: u8 = 0xF2;
@@ -140,7 +139,7 @@ pub fn hashValue(v: Value) u64 {
         return hash_mod.mixKindDomain(base, domainByteForKind(k));
     }
     // Sentinels (`unbound`, `undef`) panic inside value.hashImmediate
-    // via its default switch arm. Immediates are all kind-local in v1.
+    // via its default switch arm. Immediates are all kind-local.
     return v.hashImmediate();
 }
 
@@ -165,18 +164,18 @@ pub fn heapHashBase(v: Value) u64 {
         // SEMANTICS.md §3.2. The advisory `conn` pointer is NOT
         // part of the hash (DB.md §7.2).
         .durable_ref => @as(u64, db.hashHeader(h)),
-        // Phase 5 Item 1 (peer-AI turn 75): atoms hash on their
+        // Atoms hash on their
         // *HeapHeader pointer identity only; the contained value
         // is NEVER consulted (mutation must not change an atom's
         // hash, or atom-as-map-key would break across mutations).
         // ATOM.md §3, SEMANTICS.md §2.6 amendment.
         .atom => @as(u64, atom.hashHeader(h)),
-        // Phase 5.3a (peer-AI turn 84): records hash STRUCTURALLY
+        // Records hash STRUCTURALLY
         // over (type_id, field_map). Field-map hash uses
         // dispatch.hashValue recursively (one-way through this
         // function pointer). PROTOCOLS.md §2.1.
         .record => @as(u64, record.hashHeader(h, &hashValue)),
-        // Phase 5.3b: protocol + protocol_fn are identity-valued.
+        // protocol + protocol_fn are identity-valued.
         // Pointer hash, domain-mixed by their own kind byte.
         .protocol, .protocol_fn => @as(u64, protocol.hashHeader(h)),
         // A Nextomic connection is identity-valued; a db-value hashes
@@ -186,9 +185,8 @@ pub fn heapHashBase(v: Value) u64 {
         // Transients are not hashable per SEMANTICS §3.2 / PLAN §9.4:
         // "transient — throws `:no-hash-on-transient`". Using a
         // transient as a map key or set element is a programming error.
-        // Explicit panic arm rather than fast-path fallthrough per
-        // peer-AI turn 17 (equality/hash semantics pinned at
-        // dispatch, not emergent).
+        // Explicit panic arm rather than fast-path fallthrough, so
+        // equality/hash semantics are pinned at dispatch, not emergent.
         .transient => std.debug.panic(
             "dispatch.hashValue: transients are not hashable (SEMANTICS §3.2). " ++
                 "Call persistentBang first, or avoid using transients as map keys / set elements.",
@@ -221,7 +219,7 @@ pub fn equal(a: Value, b: Value) bool {
     const cat_b = eqCategory(kb);
     if (cat_a != cat_b) return false;
     // Cross-kind category paths. All three non-kind-local categories
-    // have v1 runtime members as of CHAMP commit 2.
+    // have runtime members.
     switch (cat_a) {
         .sequential => return sequentialEqual(a, b),
         .associative => return associativeEqual(a, b),
@@ -236,8 +234,8 @@ pub fn equal(a: Value, b: Value) bool {
 
 /// Cross-kind associative equality. Today only `persistent_map` lives
 /// in the `.associative` category so this reduces to kind-local
-/// dispatch; the shape parallels `sequentialEqual` so a future
-/// second associative member (sorted-map in v2+) slots in naturally.
+/// dispatch; the shape parallels `sequentialEqual` so a second
+/// associative member would slot in naturally.
 ///
 /// Semantic strategy is provided by `champ.equalMap` which handles all
 /// four subkind-pair combinations (array-map × array-map, array-map ×
@@ -246,8 +244,8 @@ fn associativeEqual(a: Value, b: Value) bool {
     std.debug.assert(eqCategory(a.kind()) == .associative);
     std.debug.assert(eqCategory(b.kind()) == .associative);
     if (a.kind() != b.kind()) {
-        // v1: only `.persistent_map` in category. Second kind would
-        // add an arm here.
+        // Only `.persistent_map` is in the category; a second kind
+        // would add an arm here.
         return false;
     }
     return champ.equalMap(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &hashValue, &equal);
@@ -269,9 +267,9 @@ fn setEqualCategory(a: Value, b: Value) bool {
 /// Cross-kind sequential equality. Both operands are known to be in
 /// the `.sequential` category; their physical kinds may differ. The
 /// cursor-walk below handles every pair of sequential kinds with one
-/// algorithm (peer-AI turn-7: streaming ordered traversal, not
-/// random-access-by-index, so the pattern scales cleanly to lazy-seq
-/// and cons when those land).
+/// algorithm (streaming ordered traversal, not random-access-by-index,
+/// so the pattern extends to any sequential kind without random
+/// access).
 fn sequentialEqual(a: Value, b: Value) bool {
     std.debug.assert(eqCategory(a.kind()) == .sequential);
     std.debug.assert(eqCategory(b.kind()) == .sequential);
@@ -289,8 +287,8 @@ fn sequentialEqual(a: Value, b: Value) bool {
 
     // Cross-kind: walk both sides pairwise via cursors. Each cursor
     // is a per-kind streaming iterator; this pattern generalizes to
-    // any future sequential (lazy-seq, cons) without requiring it to
-    // expose random-access.
+    // any sequential kind without requiring it to expose
+    // random-access.
     var ca = seqCursorInit(a);
     var cb = seqCursorInit(b);
     while (true) {
@@ -358,16 +356,16 @@ pub fn heapEqual(a: Value, b: Value) bool {
         // (store, tree, key) from different Connection objects
         // compare equal.
         .durable_ref => db.refsEqual(ah, bh),
-        // Phase 5 Item 1 (peer-AI turn 75): atom equality is
+        // Atom equality is
         // pointer identity. Two atoms holding `(= a b)` values are
         // NOT equal — mutable identity values must not participate
         // in structural equality. ATOM.md §3.
         .atom => atom.atomsEqual(ah, bh),
-        // Phase 5.3a (peer-AI turn 84): records use STRUCTURAL
+        // Records use STRUCTURAL
         // equality: same type_id + equal field maps. Field-map
         // equality delegates to dispatch.equal recursively.
         .record => record.recordsEqual(ah, bh, &equal),
-        // Phase 5.3b: protocols + protocol_fn use POINTER
+        // protocols + protocol_fn use POINTER
         // identity (opaque, identity-valued).
         .protocol, .protocol_fn => protocol.pointerEqual(ah, bh),
         // A Nextomic connection equals itself only; db-values are
@@ -379,8 +377,8 @@ pub fn heapEqual(a: Value, b: Value) bool {
         // are equal iff they are the same allocation. The top-level
         // `equal` function's bit-identity fast path (`a.tag == b.tag
         // and a.payload == b.payload`) already catches this before
-        // reaching here; the arm is documented defensively per
-        // peer-AI turn 17 so transient identity semantics are visible
+        // reaching here; the arm is documented defensively so
+        // transient identity semantics are visible
         // in the dispatch table rather than a fast-path accident.
         .transient => ah == bh,
         else => std.debug.panic(
@@ -657,7 +655,7 @@ test "hashValue: sequential domain differs from string's kind domain" {
 }
 
 test "eqCategory + domainByteForKind: exhaustive table matches SEMANTICS §2.6/§3.2" {
-    // Exhaustive table over every Kind in v1. This test is the
+    // Exhaustive table over every Kind. This test is the
     // primary defense against silent drift between the equality-
     // category rule and the hash-domain rule; a missed entry here
     // would create a subtle `(= x y) ⇒ hash(x) = hash(y)` bug.
@@ -666,7 +664,7 @@ test "eqCategory + domainByteForKind: exhaustive table matches SEMANTICS §2.6/�
         cat: EqCategory,
         domain: u8,
     }{
-        // Immediates — all kind-local in v1.
+        // Immediates — all kind-local.
         .{ .kind = .nil, .cat = .kind_local, .domain = 0 },
         .{ .kind = .false_, .cat = .kind_local, .domain = 1 },
         .{ .kind = .true_, .cat = .kind_local, .domain = 2 },
@@ -691,14 +689,14 @@ test "eqCategory + domainByteForKind: exhaustive table matches SEMANTICS §2.6/�
         .{ .kind = .transient, .cat = .kind_local, .domain = 27 },
         .{ .kind = .error_, .cat = .kind_local, .domain = 28 },
         .{ .kind = .meta_symbol, .cat = .kind_local, .domain = 29 },
-        // Phase 5 Item 1 (peer-AI turn 75): atoms are kind-local
+        // Atoms are kind-local
         // identity-valued; domain byte 34 == @intFromEnum(.atom).
         .{ .kind = .atom, .cat = .kind_local, .domain = 34 },
-        // Phase 5.3a (peer-AI turn 84): records are kind-local
+        // Records are kind-local
         // (structural over field map but NOT cross-kind equal to
         // plain maps). Domain byte 35.
         .{ .kind = .record, .cat = .kind_local, .domain = 35 },
-        // Phase 5.3b: protocol + protocol_fn are kind-local
+        // protocol + protocol_fn are kind-local
         // identity-valued. Domain bytes 36 / 37.
         .{ .kind = .protocol, .cat = .kind_local, .domain = 36 },
         .{ .kind = .protocol_fn, .cat = .kind_local, .domain = 37 },
@@ -738,9 +736,8 @@ test "hashValue / equal: same-kind [1 2 3] across two allocations" {
     try testing.expectEqual(hashValue(a), hashValue(b));
 }
 
-// THE cross-kind invariant test — the commit's retirement receipt for
-// peer-AI turn-3's primary hidden fault line: the architecture must
-// survive composition of list + vector as two sequential kinds
+// THE cross-kind invariant test: the architecture must survive
+// composition of list + vector as two sequential kinds
 // sharing one hash domain byte + one equality category.
 
 test "cross-kind: (list 1 2 3) and [1 2 3] are equal and share hashValue" {
@@ -809,16 +806,15 @@ test "cross-kind: nested — (list 1 [2 3] 4) == [1 (2 3) 4] is FALSE (element-l
     });
     // Cross-kind sequential equality all the way down: the outer
     // list↔vector matches at the top, and element 1 (list↔vector)
-    // also matches via sequential equality. So these ARE equal.
-    // (Rename the test; the original expectation in the comment was
-    // wrong — sequential category is cross-kind-equal through every
-    // level of nesting, which is exactly the design.)
+    // also matches via sequential equality. So these ARE equal:
+    // the sequential category is cross-kind-equal through every
+    // level of nesting, which is exactly the design.
     try testing.expect(equal(outer_list, outer_vec));
     try testing.expectEqual(hashValue(outer_list), hashValue(outer_vec));
 }
 
 test "cross-kind: same prefix, one differing element → not equal, different hash" {
-    // Peer-AI turn-7 coverage point: negative cross-kind case where
+    // Negative cross-kind case where
     // prefixes match but one element differs. Stresses the cursor
     // walker's element-by-element mismatch short-circuit at
     // boundary positions.

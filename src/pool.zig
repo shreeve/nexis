@@ -1,9 +1,8 @@
-//! pool.zig — size-class pool allocator (Phase 1 performance lift).
+//! pool.zig — size-class pool allocator.
 //!
 //! Authoritative spec: `docs/POOL.md`. Derivative from
-//! `docs/PERF.md` §5.12 (allocator is the single largest
-//! performance lever before the Phase 2 compiler lands) and
-//! peer-AI turn 26 design review.
+//! `docs/PERF.md` §5.12 (the allocator is the single largest
+//! performance lever below the compiler).
 //!
 //! Single-threaded by design. nexis is single-isolate per
 //! PLAN §16.1; this allocator has NO locking. Using it from
@@ -32,8 +31,8 @@ const Alignment = std.mem.Alignment;
 // =============================================================================
 
 pub const class_sizes = [_]usize{
-    16,    32,    48,    64,    96,    128,   192,   256,
-    384,   512,   768,   1024,  1536,  2048,  3072,  4096,
+    16,  32,  48,  64,   96,   128,  192,  256,
+    384, 512, 768, 1024, 1536, 2048, 3072, 4096,
 };
 
 pub const NUM_CLASSES = class_sizes.len;
@@ -92,7 +91,7 @@ const SizeClass = struct {
     /// Bytes left in the current slab.
     remaining: usize = 0,
     /// All slabs this class has allocated from backing. Retained
-    /// for deinit; never individually reclaimed in v1
+    /// for deinit; never individually reclaimed
     /// (POOL.md §8). Aligned-slice type is preserved so the free
     /// path passes the matching alignment back to backing.
     slabs: std.ArrayListUnmanaged([]align(16) u8) = .empty,

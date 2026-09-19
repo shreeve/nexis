@@ -2,11 +2,9 @@
 //! vector heap kind and, critically, the cross-kind list↔vector
 //! sequential equality + hash invariants.
 //!
-//! Primary purpose: retire the Phase 1 hidden fault line peer-AI
-//! turn-3 flagged — "the combination of dispatch/category routing,
-//! heap object layout/tracing, and cross-kind semantic equality/
-//! hashing at scale." Until this file's V3 / V9 properties pass, that
-//! combination is hypothetical.
+//! Primary purpose: exercise the combination of dispatch/category
+//! routing, heap object layout/tracing, and cross-kind semantic
+//! equality/hashing at scale (V3 / V9).
 //!
 //! Properties:
 //!   V1. fromSlice + nth round-trip byte-exact over 200 random sizes.
@@ -14,7 +12,7 @@
 //!       (equivalent via `dispatch.equal`, same hashValue).
 //!   V3. Cross-kind: 500 random element sequences lifted into BOTH a
 //!       list and a vector produce `dispatch.equal`-true and
-//!       hash-equal Values. THIS IS THE RETIREMENT RECEIPT.
+//!       hash-equal Values.
 //!   V4. Equivalence-relation laws on vectors (reflexive / symmetric
 //!       / pairwise transitive) over 32 random vectors.
 //!   V5. Bedrock `equal ⇒ hashValue equal` over 500 random vector
@@ -107,10 +105,10 @@ test "V2: reduce(conj, empty, elems) ≡ fromSlice(elems)" {
 }
 
 // -----------------------------------------------------------------------------
-// V3. Cross-kind list ↔ vector — THE retirement receipt
+// V3. Cross-kind list ↔ vector
 // -----------------------------------------------------------------------------
 
-test "V3: 2000 random sequences produce list↔vector equal+hash-equal (retirement receipt, gate #1 scaled)" {
+test "V3: 2000 random sequences produce list↔vector equal+hash-equal" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -177,7 +175,7 @@ test "V4: equal is reflexive, symmetric, pairwise transitive on random vectors" 
 // V5. Bedrock: equal ⇒ hashValue equal
 // -----------------------------------------------------------------------------
 
-test "V5: 2000 identically-sequenced vector pairs across allocations share hashValue (gate #1 scaled)" {
+test "V5: 2000 identically-sequenced vector pairs across allocations share hashValue" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();

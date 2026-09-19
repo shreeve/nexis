@@ -1,4 +1,4 @@
-//! db.zig — durable identities + emdb integration (Phase 1).
+//! db.zig — durable identities + emdb integration.
 //!
 //! Authoritative spec: `docs/DB.md`. Derivative from PLAN §15
 //! (durable identities), §20.2 gate test #6 (emdb round-trip),
@@ -6,11 +6,8 @@
 //! §2.2 (kind 26 `durable_ref`), `docs/SEMANTICS.md` §2.6 / §3.2
 //! (identity-triple equality + hash).
 //!
-//! Closes Phase 1 gate test #6, completing the §20.2 scorecard to
-//! **8/8 shipped**.
-//!
 //! Responsibilities:
-//!   - `Connection` type wrapping `emdb.Env` with a v1-interim
+//!   - `Connection` type wrapping `emdb.Env` with
 //!     `store_id = xxHash3-128(realpath(file))`.
 //!   - `durable_ref` heap Value kind (VALUE.md §2.2 kind 26) with
 //!     self-contained identity triple (store_id, tree_name,
@@ -18,15 +15,14 @@
 //!     pointer.
 //!   - `WriteTxn` / `ReadTxn` wrappers around `emdb.Txn`.
 //!   - `put` / `get` / `del` by `(tree_name, key_bytes, value)` —
-//!     keys are **opaque byte slices** (peer-AI turn 23), values
+//!     keys are **opaque byte slices**, values
 //!     are codec-encoded via `src/codec.zig`.
 //!   - `putRef` / `getRef` / `delRef` ref-based convenience.
 //!   - Per-kind hash / equality / trace helpers consumed by
 //!     `src/dispatch.zig` and `src/gc.zig`.
 //!
-//! Scope-frozen commitment (DB.md §1): explicit-transaction
-//! primitives only. No `alter!`, no cursors, no as-of, no
-//! with-tx macro — those are Phase 3 stdlib + Phase 4 work.
+//! Scope (DB.md §1): explicit-transaction primitives only. No
+//! `alter!`, no cursors, no as-of, no with-tx macro live here.
 //!
 //! Module graph (one-way terminal):
 //!
@@ -134,7 +130,7 @@ pub const Connection = struct {
     /// Stored for diagnostic / re-derivation purposes.
     path_owned: [:0]u8,
 
-    /// Is the env currently open? Set true by `open()`, false by
+    /// Is the env open? Set true by `open()`, false by
     /// `close()`. Used to defend against double-close + to signal
     /// `ConnectionUnavailable` for subsequent ops.
     open_flag: bool,
@@ -469,7 +465,7 @@ pub fn ref(
 /// Construct a durable-ref from bytes (no live Connection
 /// context). The `conn` pointer is null; I/O ops on this ref will
 /// return `error.ConnectionUnavailable` until it's paired with a
-/// live Connection (Phase 3 stdlib responsibility).
+/// live Connection (the stdlib's responsibility).
 pub fn refFromBytes(
     heap: *Heap,
     store_id: u128,
@@ -548,8 +544,7 @@ fn assertRefMatchesConn(r: Value, conn: *Connection) DbError!void {
         // Different Connection pointer — check store_id
         // agreement. If a ref was constructed against one
         // Connection but is being used with another pointing at
-        // the SAME store, allow it (peer-AI turn 23: store_id is
-        // the identity).
+        // the SAME store, allow it (store_id is the identity).
         if (refStoreId(r) != conn.storeId()) return DbError.StoreMismatch;
     }
     // else: rc == conn, trivially compatible.

@@ -1,16 +1,14 @@
-//! string.zig — UTF-8 string heap kind (Phase 1).
+//! string.zig — UTF-8 string heap kind.
 //!
 //! Authoritative spec: `docs/STRING.md`. Physical storage lives on
 //! `src/heap.zig`; semantic rules come from `docs/SEMANTICS.md` §2.4
-//! (byte equality) and §3.2 (hash). This is the first real heap kind,
-//! so it exercises the full heap→dispatch→hashValue pipeline end to
-//! end and sets the pattern every subsequent heap kind (bignum, list,
-//! persistent_map, …) will follow.
+//! (byte equality) and §3.2 (hash). It sets the pattern every heap
+//! kind (bignum, list, persistent_map, …) follows.
 //!
-//! v1 scope: **subkind 1 (heap string) only.** Body is raw UTF-8
-//! bytes with no length prefix; length recovered from the heap block.
-//! SSO (subkind 0) and zero-copy (subkind 2) are reserved for future
-//! commits.
+//! **Subkind 1 (heap string) only.** Body is raw UTF-8 bytes with
+//! no length prefix; length recovered from the heap block. SSO
+//! (subkind 0) and zero-copy (subkind 2) are reserved and
+//! unimplemented.
 //!
 //! Invariants (STRING.md §2):
 //!   - Bytes are copied into a fresh heap allocation on `fromBytes`.
@@ -39,7 +37,7 @@ const testing = std.testing;
 // =============================================================================
 
 pub const subkind_heap: u16 = 1;
-// Reserved (not implemented in v1): subkind_inline = 0 (SSO),
+// Reserved (not implemented): subkind_inline = 0 (SSO),
 // subkind_zero_copy = 2 (mmap slice over emdb page).
 
 // =============================================================================
@@ -119,7 +117,7 @@ pub fn bytesEqual(a: *HeapHeader, b: *HeapHeader) bool {
 }
 
 // =============================================================================
-// Codepoint helpers (Phase 5.2a — peer-AI turn 77)
+// Codepoint helpers
 // =============================================================================
 //
 // The language-level surface (`(count s)`, `(nth s i)`, `(subs s
@@ -131,12 +129,11 @@ pub fn bytesEqual(a: *HeapHeader, b: *HeapHeader) bool {
 // Frozen contract (STRING.md §7):
 //   - All four ops return `error.InvalidUtf8` on a malformed body
 //     mid-walk. The runtime caller (`stdlib.zig`) maps that to
-//     `:utf8-error` (catchable). v1's storage layer does not
+//     `:utf8-error` (catchable). The storage layer does not
 //     pre-validate bytes; the user's source had to be well-formed
 //     to reach a string Value, but a fuzzer / corrupt-codec path
 //     could produce one.
-//   - Codepoint count is NOT cached on the HeapHeader. Phase 6 may
-//     add a cache slot if profiling shows hot use.
+//   - Codepoint count is NOT cached on the HeapHeader.
 
 /// Total number of Unicode codepoints in `v`. O(byteLen). Returns
 /// `error.InvalidUtf8` if the body contains an invalid byte
@@ -233,7 +230,7 @@ fn valueFrom(h: *HeapHeader) Value {
 
 // =============================================================================
 // Inline tests — per-module basics. Randomized sweeps live in
-// test/prop/heap.zig (future) or test/prop/string.zig.
+// test/prop/string.zig.
 // =============================================================================
 
 test "fromBytes + asBytes: round-trip byte-exact" {
@@ -366,7 +363,7 @@ test "valueFrom: tag encodes kind + subkind, payload = *HeapHeader" {
     try testing.expectEqual(@intFromPtr(h), v.payload);
 }
 
-test "size boundaries 0/1/15/16/17 all heap-stored in v1" {
+test "size boundaries 0/1/15/16/17 are all heap-stored" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     const sizes = [_]usize{ 0, 1, 15, 16, 17 };
@@ -445,7 +442,7 @@ test "malformed UTF-8 bytes round-trip byte-exact (byte-blob semantics)" {
 }
 
 // =============================================================================
-// Codepoint helper tests (Phase 5.2a — peer-AI turn 77)
+// Codepoint helper tests
 // =============================================================================
 
 test "codepointCount: ASCII + multi-byte sequences" {

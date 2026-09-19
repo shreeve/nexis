@@ -1,9 +1,9 @@
 //! test/prop/gc.zig — randomized property tests for the precise
-//! mark-sweep collector. Upgrades Phase 1 gate test #7 (GC stress)
-//! from the hand-marking workaround in `test/prop/heap.zig` to a
-//! real Collector.collect-driven discipline.
+//! mark-sweep collector. Covers PLAN §20.2 test #7 (GC stress) with
+//! a Collector.collect-driven discipline; `test/prop/heap.zig` covers
+//! the same allocator with hand-marking.
 //!
-//! Properties (GC.md §10 testing / peer-AI turn 14):
+//! Properties (GC.md §10 testing):
 //!
 //!   G1. Flat-root sweep: random allocations, random root subset,
 //!       after collect every root's transitive closure survives and
@@ -95,7 +95,7 @@ test "G2: nested graph — reachable closure exactly matches liveCount" {
     const r = prng.random();
 
     // Build a pool of heterogeneous heap objects. Each new object
-    // MAY reference previously-allocated pool members as children;
+    // MAY reference earlier-allocated pool members as children;
     // we track each object's "reachable set" as a
     // std.AutoHashMap(usize, void) of indices in the pool.
     const pool_size: usize = 60;
