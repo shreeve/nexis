@@ -8,13 +8,15 @@
 //!      entities and card-many collections), resolving attributes through
 //!      the schema at `now` and converting values by the attribute's type;
 //!   3. bind tempids: `:db/ident` binds to the ident's id (minting it),
-//!      unique-identity assertions upsert through an AVET probe, two
-//!      tempids naming one identity unify, the rest take fresh eids;
+//!      unique-identity assertions upsert through an AVET probe (a
+//!      tempid- or lookup-ref-valued claim once its value is known),
+//!      two tempids naming one identity unify, the rest take fresh eids;
 //!   4. expand ops in order against the committed trees plus the
 //!      transaction's own overlay: card-one implicit retracts, no-op
 //!      re-assertions, conflicts, unique-value collisions, lookup refs,
 //!      retract-attribute, retract-entity with VAET cleanup and component
-//!      cascade, then the `:db/txInstant` datom;
+//!      cascade, then the `:db/txInstant` datom unless the tx-data
+//!      asserted one on the transaction entity;
 //!   5. validate schema changes and backfill AVET for attributes that
 //!      become indexed or unique;
 //!   6. write the eight index trees, the txlog, the counts and `sys`;
@@ -148,6 +150,7 @@ pub fn transact(conn: *Conn, arena: Allocator, tx_data: Value, options: Options)
 pub fn transactOps(conn: *Conn, arena: Allocator, ops: []const Op, options: Options) !Report {
     var ctx = try Ctx.begin(conn, arena, options);
     errdefer ctx.abort();
+    try ctx.ops.ensureTotalCapacityPrecise(arena, ops.len);
     for (ops) |op| try ctx.normaliseOp(op);
     return ctx.run();
 }
@@ -161,13 +164,16 @@ pub fn transactOps(conn: *Conn, arena: Allocator, ops: []const Op, options: Opti
 /// ident cache and schema cache are untouched throughout. The write
 /// lock is held until `finish`; meanwhile `transact` and `with` on the
 /// connection, and any write through the view, are `error.Nested`.
-/// Allocated in the caller's arena, which must outlive every use of
-/// the view.
+/// The `With` and its scratch live in the caller's arena, which must
+/// outlive `finish`; the view is allocated on the connection's
+/// allocator so that db-values naming it may outlive the arena, and
+/// `destroy` frees it.
 pub const With = struct {
     ctx: Ctx,
     /// The view: the connection's store and interner, its own ident and
-    /// schema caches, reads through `ctx.txn`.
-    view: Conn,
+    /// schema caches, reads through `ctx.txn`. Allocated on the
+    /// connection's allocator; closed by `finish`, freed by `destroy`.
+    view: *Conn,
     report: Report,
     finished: bool = false,
 
@@ -182,12 +188,18 @@ pub const With = struct {
     pub fn finish(self: *With) void {
         if (self.finished) return;
         self.finished = true;
-        self.view.dropSchema();
-        self.view.idents.deinit();
-        self.view.is_open = false;
+        self.view.close();
         self.view.overlay = null;
         self.ctx.conn.speculative = null;
         self.ctx.abort();
+    }
+
+    /// `finish`, then free the view. Nothing may name the view
+    /// afterwards: a db-value that escaped the scope reads freed
+    /// memory. Once per `With`.
+    pub fn destroy(self: *With) void {
+        self.finish();
+        self.view.destroy();
     }
 
     /// The protocol after normalisation: apply, then open the view over
@@ -195,25 +207,29 @@ pub const With = struct {
     fn speculate(self: *With) !void {
         const conn = self.ctx.conn;
         try self.ctx.apply();
-        self.view = .{
+        const view = try conn.gpa.create(Conn);
+        errdefer conn.gpa.destroy(view);
+        view.* = .{
             .gpa = conn.gpa,
             .store = conn.store,
             .interner = conn.interner,
             .idents = try conn.idents.clone(),
             .sync_mode = self.ctx.sync_mode,
             .is_open = true,
+            .owns_store = false,
             .overlay = self.ctx.txn,
         };
-        errdefer self.view.idents.deinit();
+        errdefer view.idents.deinit();
+        self.view = view;
         self.report = .{
             .db_before = .{ .conn = conn, .basis = self.ctx.now },
-            .db_after = .{ .conn = &self.view, .basis = self.ctx.t },
+            .db_after = .{ .conn = view, .basis = self.ctx.t },
             .t = self.ctx.t,
             .tempids = try self.ctx.userTempids(),
-            .tx_data = try self.ctx.txData(),
+            .tx_data = self.ctx.tx_data,
         };
         self.finished = false;
-        conn.speculative = &self.view;
+        conn.speculative = view;
     }
 };
 
@@ -232,6 +248,7 @@ pub fn withOps(conn: *Conn, arena: Allocator, ops: []const Op, options: Options)
     const self = try arena.create(With);
     self.ctx = try Ctx.begin(conn, arena, options);
     errdefer self.ctx.abort();
+    try self.ctx.ops.ensureTotalCapacityPrecise(arena, ops.len);
     for (ops) |op| try self.ctx.normaliseOp(op);
     try self.speculate();
     return self;
@@ -247,13 +264,14 @@ const Ent = union(enum) {
     eid: u64,
     /// Index into `Ctx.bindings`.
     tempid: u32,
-    lookup: Lookup,
+    /// In the arena: the rare case, kept off the common op's size.
+    lookup: *const Lookup,
 };
 
 const PVal = union(enum) {
     val: Val,
     tempid: u32,
-    lookup: Lookup,
+    lookup: *const Lookup,
 };
 
 const ROp = union(enum) {
@@ -301,8 +319,9 @@ const Ctx = struct {
     overlay: std.ArrayList(Pending) = .empty,
     /// EAVT key of a pending datom -> overlay index.
     facts: std.StringHashMapUnmanaged(u32) = .empty,
-    /// (e a) -> overlay index of the pending card-one assertion.
-    one_adds: std.AutoHashMapUnmanaged(EA, u32) = .empty,
+    /// (e a) -> value bytes of the card-one assertion seen so far,
+    /// pending or already current.
+    one_adds: std.AutoHashMapUnmanaged(EA, []const u8) = .empty,
     /// (e a) -> number of pending assertions.
     ea_adds: std.AutoHashMapUnmanaged(EA, u32) = .empty,
     /// `[a][v]` of a pending assertion -> e.
@@ -314,13 +333,18 @@ const Ctx = struct {
     schema_touched: bool = false,
     /// Per-attribute change in current-datom count.
     deltas: std.AutoHashMapUnmanaged(u32, i64) = .empty,
+    /// The transaction's datoms in write order, built once by `write`.
+    tx_data: []Datom = &.{},
 
     fn begin(conn: *Conn, arena: Allocator, options: Options) !Ctx {
         if (!conn.is_open) return error.Closed;
         if (conn.speculative != null or conn.overlay != null) return error.Nested;
         const sync_mode = options.sync orelse conn.sync_mode;
-        const txn = try conn.store.beginWrite(sync_mode);
-        errdefer txn.abort();
+        const txn = try conn.beginWriteTxn(sync_mode);
+        errdefer {
+            txn.abort();
+            conn.taskDone();
+        }
         const now = try conn.store.readT(txn);
         if (now + 1 >= key.tx_partition_bit) return error.DatabaseFull;
         const schema = try conn.schemaAt(txn, now, now);
@@ -342,6 +366,7 @@ const Ctx = struct {
         if (self.finished) return;
         self.finished = true;
         self.txn.abort();
+        self.conn.taskDone();
     }
 
     // ── attributes ────────────────────────────────────────────────
@@ -361,6 +386,20 @@ const Ctx = struct {
             .id => |id| self.attrById(id),
             .ident => |k| self.attrByIntern(k),
         };
+    }
+
+    // ── entity ids ────────────────────────────────────────────────
+
+    /// An explicit entity id, as an entity or a ref value, must have been
+    /// handed out by its partition's allocator: a user id below the next
+    /// user id, an attribute or ident id below the next ident id, a
+    /// transaction entity no newer than this transaction. Anything else
+    /// would collide with an id minted later: `error.NoEntity`.
+    fn checkEid(self: *Ctx, id: u64) !u64 {
+        if (id == 0 or id > key.id_max) return error.NoEntity;
+        if (key.txOfEntity(id)) |t| return if (t <= self.t) id else error.NoEntity;
+        if (key.isAttrPartition(id)) return if (id < self.minter.next_aid) id else error.NoEntity;
+        return if (id < self.next_eid) id else error.NoEntity;
     }
 
     // ── tempids ───────────────────────────────────────────────────
@@ -426,12 +465,18 @@ const Ctx = struct {
 
     fn entityOf(self: *Ctx, e: Entity) !Ent {
         return switch (e) {
-            .eid => |id| .{ .eid = try checkEid(id) },
+            .eid => |id| .{ .eid = try self.checkEid(id) },
             .tempid => |k| .{ .tempid = try self.tempid(k) },
-            .lookup => |l| .{ .lookup = .{ .attr = try self.lookupAttr(try self.attrOf(l.a), l.v), .v = l.v } },
+            .lookup => |l| .{ .lookup = try self.lookupRef(try self.lookupAttr(try self.attrOf(l.a), l.v), l.v) },
             .ident => |k| .{ .eid = (try self.minter.lookup(k)) orelse return error.NoEntity },
             .tx => .{ .eid = key.txEntity(self.t) },
         };
+    }
+
+    fn lookupRef(self: *Ctx, attr: Attr, v: Val) !*const Lookup {
+        const l = try self.arena.create(Lookup);
+        l.* = .{ .attr = attr, .v = v };
+        return l;
     }
 
     fn lookupAttr(self: *Ctx, attr: Attr, v: Val) !Attr {
@@ -446,7 +491,7 @@ const Ctx = struct {
             .val => |x| {
                 if (x.valueType() != attr.value_type) return error.ValueType;
                 if (x == .double and std.math.isNan(x.double)) return error.ValueType;
-                if (x == .ref) _ = try checkEid(x.ref);
+                if (x == .ref) _ = try self.checkEid(x.ref);
                 return .{ .val = try x.dupe(self.arena) };
             },
             .entity => |e| {
@@ -491,10 +536,12 @@ const Ctx = struct {
     fn normaliseValue(self: *Ctx, tx_data: Value) !void {
         switch (tx_data.kind()) {
             .persistent_vector => {
+                try self.ops.ensureTotalCapacityPrecise(self.arena, vector_mod.count(tx_data));
                 var it = vector_mod.Cursor.init(tx_data);
                 while (it.next()) |form| try self.normaliseForm(form);
             },
             .list => {
+                try self.ops.ensureTotalCapacityPrecise(self.arena, list_mod.count(tx_data));
                 var it = list_mod.Cursor.init(tx_data);
                 while (it.next()) |form| try self.normaliseForm(form);
             },
@@ -551,7 +598,7 @@ const Ctx = struct {
             if (self.kwIs(entry.key, "db/id")) continue;
             const attr = try self.attrFromVm(entry.key);
             const v = entry.value;
-            if (attr.many() and isCollection(v)) {
+            if (attr.many() and isCollection(v) and !(attr.value_type == .ref and try self.isLookupRef(v))) {
                 var elems = try collectionElements(self.arena, v);
                 for (elems[0..]) |el| try self.addFromVm(e, attr, el);
                 elems = &.{};
@@ -560,6 +607,17 @@ const Ctx = struct {
             }
         }
         return e;
+    }
+
+    /// Under a ref attribute a two-element vector whose first element is
+    /// a keyword naming an attribute is a lookup ref, one value; a
+    /// collection of lookup refs is a vector of such vectors.
+    fn isLookupRef(self: *Ctx, v: Value) !bool {
+        if (v.kind() != .persistent_vector or vector_mod.count(v) != 2) return false;
+        const head = vector_mod.nth(v, 0);
+        if (head.kind() != .keyword) return false;
+        const id = (try self.minter.lookup(head.asKeywordId())) orelse return false;
+        return self.schema.attr(id) != null;
     }
 
     fn addFromVm(self: *Ctx, e: Ent, attr: Attr, v: Value) anyerror!void {
@@ -593,7 +651,7 @@ const Ctx = struct {
             .fixnum => {
                 const n = v.asFixnum();
                 if (n < 0) return .{ .tempid = try self.tempid(.{ .fixnum = n }) };
-                return .{ .eid = try checkEid(@intCast(n)) };
+                return .{ .eid = try self.checkEid(@intCast(n)) };
             },
             .string => {
                 const s = string_mod.asBytes(v);
@@ -607,7 +665,7 @@ const Ctx = struct {
                 if (attr.unique == .none) return error.TxData;
                 const lv = try self.valueFromVm(attr, vector_mod.nth(v, 1));
                 if (lv != .val) return error.TxData;
-                return .{ .lookup = .{ .attr = attr, .v = lv.val } };
+                return .{ .lookup = try self.lookupRef(attr, lv.val) };
             },
             else => return error.TxData,
         }
@@ -682,12 +740,18 @@ const Ctx = struct {
     }
 
     /// Step 7: commit, then publish the mints and update the schema
-    /// cache, and report.
+    /// cache, and report. Everything that can fail (the report's tempid
+    /// bindings, the tx-data, room in the ident cache) is prepared
+    /// before the commit; after it only infallible steps remain, so a
+    /// committed transaction is never reported as an error.
     fn commit(self: *Ctx) !Report {
         const db_before: DbValue = .{ .conn = self.conn, .basis = self.now };
+        const tempids = try self.userTempids();
+        try self.minter.reserveCache();
         try self.txn.commit();
         self.finished = true;
-        try self.minter.commitCache();
+        self.conn.taskDone();
+        self.minter.commitCache();
         if (self.schema_touched) {
             self.conn.dropSchema();
         } else if (self.conn.schema_cache) |s| {
@@ -704,8 +768,8 @@ const Ctx = struct {
             .db_before = db_before,
             .db_after = .{ .conn = self.conn, .basis = self.t },
             .t = self.t,
-            .tempids = try self.userTempids(),
-            .tx_data = try self.txData(),
+            .tempids = tempids,
+            .tx_data = self.tx_data,
         };
     }
 
@@ -718,21 +782,65 @@ const Ctx = struct {
             if (op.add.v != .val) return error.ValueType;
             try self.bind(op.add.e.tempid, op.add.v.val.keyword);
         }
-        // Unique-identity assertions upsert; equal identities unify.
+        // Unique-identity assertions upsert; equal identities unify. A
+        // claim whose value is a tempid or a lookup ref waits until the
+        // value is known: a tempid bound by its own identity, a lookup
+        // ref found in the tree or among the claims of this
+        // transaction. Each round settles what the last one bound.
         var claims: std.StringHashMapUnmanaged(u32) = .empty;
-        for (self.ops.items) |op| {
+        var deferred: std.ArrayList(struct { op: usize, e: u32, attr: Attr, v: PVal }) = .empty;
+        for (self.ops.items, 0..) |op, idx| {
             if (op != .add or op.add.e != .tempid) continue;
             const attr = op.add.attr;
-            if (attr.unique != .identity or attr.id == boot.ident or op.add.v != .val) continue;
-            const vb = try key.valBytes(self.arena, op.add.v.val);
-            const av = try self.avKey(attr.id, vb);
-            const g = try claims.getOrPut(self.arena, av);
-            if (g.found_existing) {
-                try self.unify(op.add.e.tempid, g.value_ptr.*);
-            } else {
-                g.value_ptr.* = op.add.e.tempid;
+            if (attr.unique != .identity or attr.id == boot.ident) continue;
+            switch (op.add.v) {
+                .val => |v| try self.claimIdentity(&claims, op.add.e.tempid, attr, v),
+                else => try deferred.append(self.arena, .{ .op = idx, .e = op.add.e.tempid, .attr = attr, .v = op.add.v }),
             }
-            if (try self.probeAvet(attr.id, vb)) |eid| try self.bind(op.add.e.tempid, eid);
+        }
+        var progress = true;
+        while (progress and deferred.items.len > 0) {
+            progress = false;
+            var i: usize = 0;
+            while (i < deferred.items.len) {
+                const d = deferred.items[i];
+                var eid: ?u64 = null;
+                var target: ?u32 = null;
+                switch (d.v) {
+                    .tempid => |t| target = t,
+                    .lookup => |l| {
+                        const vb = try key.valBytes(self.arena, l.v);
+                        eid = try self.probeAvet(l.attr.id, vb);
+                        if (eid == null) target = claims.get(try self.avKey(l.attr.id, vb));
+                        // A lookup ref naming a tempid's identity is that
+                        // tempid, wherever the identity is asserted.
+                        if (target) |t| self.ops.items[d.op].add.v = .{ .tempid = t };
+                    },
+                    .val => unreachable,
+                }
+                if (eid == null) if (target) |t| {
+                    eid = self.bindings.items[self.root(t)].eid;
+                };
+                if (eid) |id| {
+                    try self.claimIdentity(&claims, d.e, d.attr, .{ .ref = id });
+                } else if (target != null) {
+                    // Waits for its target's binding.
+                    i += 1;
+                    continue;
+                }
+                // Resolved, or naming nothing this transaction knows:
+                // expansion resolves or refuses such a lookup ref.
+                progress = true;
+                _ = deferred.swapRemove(i);
+            }
+        }
+        // Claims on entities this transaction creates: equal claims are
+        // one entity, and the tree cannot hold them yet.
+        var by_target: std.AutoHashMapUnmanaged(struct { a: u32, root: u32 }, u32) = .empty;
+        for (deferred.items) |d| {
+            const t: u32 = self.ops.items[d.op].add.v.tempid;
+            const g = try by_target.getOrPut(self.arena, .{ .a = d.attr.id, .root = self.root(t) });
+            if (g.found_existing) try self.unify(d.e, g.value_ptr.*) else g.value_ptr.* = d.e;
         }
         // Fresh eids for the rest.
         for (self.bindings.items, 0..) |*b, i| {
@@ -746,6 +854,20 @@ const Ctx = struct {
         }
     }
 
+    /// One identity claim `(e a v)` with `v` known: equal claims unify,
+    /// and the entity holding `(a v)` in the tree binds the tempid.
+    fn claimIdentity(self: *Ctx, claims: *std.StringHashMapUnmanaged(u32), e: u32, attr: Attr, v: Val) !void {
+        const vb = try key.valBytes(self.arena, v);
+        const av = try self.avKey(attr.id, vb);
+        const g = try claims.getOrPut(self.arena, av);
+        if (g.found_existing) {
+            try self.unify(e, g.value_ptr.*);
+        } else {
+            g.value_ptr.* = e;
+        }
+        if (try self.probeAvet(attr.id, vb)) |eid| try self.bind(e, eid);
+    }
+
     fn avKey(self: *Ctx, a: u32, vbytes: []const u8) ![]u8 {
         const k = try self.arena.alloc(u8, key.attr_len + vbytes.len);
         key.writeAttr(k[0..key.attr_len], a);
@@ -754,11 +876,17 @@ const Ctx = struct {
     }
 
     /// The entity holding `(a v)` in the committed AVET tree, or null.
+    /// The first key under the prefix may carry a longer value whose
+    /// encoding continues past the terminator of `vbytes` (an escaped
+    /// NUL), so the value section is compared exactly.
     fn probeAvet(self: *Ctx, a: u32, vbytes: []const u8) !?u64 {
         const prefix = try key.prefixBytes(self.arena, .avet, .{ .a = a, .v = vbytes });
         var s = try self.conn.store.scan(self.txn, self.conn.store.trees.cur(.avet), prefix);
-        const kv = s.next() orelse return null;
-        return (try key.unpackKey(.avet, false, kv.key)).e;
+        while (s.next()) |kv| {
+            const parts = try key.unpackKey(.avet, false, kv.key);
+            if (std.mem.eql(u8, parts.v, vbytes)) return parts.e;
+        }
+        return null;
     }
 
     /// The entity holding `(a v)` in the tree or the overlay, or null.
@@ -797,6 +925,12 @@ const Ctx = struct {
     // ── step 4: expand ────────────────────────────────────────────
 
     fn expandAll(self: *Ctx) !void {
+        // Room for one datom per op and the transaction's instant; a
+        // card-one overwrite or a cascade grows past it.
+        const n = self.ops.items.len + 1;
+        try self.overlay.ensureTotalCapacityPrecise(self.arena, n);
+        try self.facts.ensureTotalCapacity(self.arena, @intCast(n));
+        try self.ea_adds.ensureTotalCapacity(self.arena, @intCast(n));
         for (self.ops.items) |op| {
             switch (op) {
                 .add => |o| try self.expandAdd(try self.resolveEnt(o.e), o.attr, try self.resolveVal(o.v)),
@@ -835,18 +969,20 @@ const Ctx = struct {
         }
         const already = (try self.txn.getFromTree(self.conn.store.trees.cur(.eavt), fk)) != null;
         if (!attr.many()) {
+            // One value per (e a) per transaction, whether it is
+            // pending or was current already.
             const ea: EA = .{ .e = e, .a = attr.id };
-            if (self.one_adds.get(ea)) |_| return error.Conflict;
+            if (self.one_adds.get(ea)) |seen| return if (std.mem.eql(u8, seen, vb)) {} else error.Conflict;
+            try self.one_adds.put(self.arena, ea, vb);
             if (already) return;
             if (try self.currentOne(e, attr.id)) |old| {
                 try self.pushRetract(e, attr, old.val, old.vbytes);
             }
-            try self.push(e, attr, v, vb, true);
-            try self.one_adds.put(self.arena, ea, @intCast(self.overlay.items.len - 1));
+            try self.push(e, attr, v, vb, true, fk);
             return;
         }
         if (already) return;
-        try self.push(e, attr, v, vb, true);
+        try self.push(e, attr, v, vb, true, fk);
     }
 
     const Current = struct { val: Val, vbytes: []const u8 };
@@ -939,8 +1075,9 @@ const Ctx = struct {
         for (components.items) |c| try self.expandRetractEntity(c, seen);
     }
 
-    fn push(self: *Ctx, e: u64, attr: Attr, v: Val, vbytes: []const u8, added: bool) !void {
-        const fk = try key.keyBytes(self.arena, .eavt, e, attr.id, vbytes, null);
+    /// Queue a datom; `fact_key` is its EAVT key when the caller has it.
+    fn push(self: *Ctx, e: u64, attr: Attr, v: Val, vbytes: []const u8, added: bool, fact_key: ?[]const u8) !void {
+        const fk = fact_key orelse try key.keyBytes(self.arena, .eavt, e, attr.id, vbytes, null);
         const i: u32 = @intCast(self.overlay.items.len);
         try self.overlay.append(self.arena, .{ .e = e, .attr = attr, .v = v, .vbytes = vbytes, .added = added });
         try self.facts.put(self.arena, fk, i);
@@ -954,12 +1091,22 @@ const Ctx = struct {
     }
 
     fn pushRetract(self: *Ctx, e: u64, attr: Attr, v: Val, vbytes: []const u8) !void {
-        try self.push(e, attr, v, vbytes, false);
+        try self.push(e, attr, v, vbytes, false, null);
     }
 
+    /// The transaction's instant: one the tx-data asserted on its own
+    /// transaction entity stands, and is the txlog's instant too;
+    /// otherwise the clock's.
     fn txInstant(self: *Ctx) !void {
+        const tx = key.txEntity(self.t);
+        for (self.overlay.items) |p| {
+            if (p.e == tx and p.attr.id == boot.tx_instant and p.added) {
+                self.now_ms = p.v.instant;
+                return;
+            }
+        }
         const attr = try self.attrById(boot.tx_instant);
-        try self.expandAdd(key.txEntity(self.t), attr, .{ .instant = self.now_ms });
+        try self.expandAdd(tx, attr, .{ .instant = self.now_ms });
     }
 
     // ── step 5: schema ────────────────────────────────────────────
@@ -1023,7 +1170,7 @@ const Ctx = struct {
         for (self.overlay.items) |p| {
             if (p.attr.id != attr.id or !p.added) continue;
             if ((try seen.getOrPut(self.arena, p.vbytes)).found_existing) return error.Unique;
-            if (try self.probeAvet(attr.id, p.vbytes)) |other| if (other != p.e) return error.Unique;
+            if (try self.findByAv(attr.id, p.vbytes)) |other| if (other != p.e) return error.Unique;
         }
     }
 
@@ -1108,9 +1255,13 @@ const Ctx = struct {
             try store.writeAttrCount(self.txn, e.key_ptr.*, @intCast(next));
         }
 
-        const datoms = try self.txData();
+        self.tx_data = try self.txData();
+        // The txlog entry is built through a VM heap of its own; the
+        // store copies the bytes, so that scratch is freed here.
+        var scratch = std.heap.ArenaAllocator.init(self.conn.gpa);
+        defer scratch.deinit();
         const names: datom_mod.NameSource = .{ .ctx = @ptrCast(self), .identName = &identName };
-        const entry = try datom_mod.encodeTxlog(self.arena, self.now_ms, datoms, names);
+        const entry = try datom_mod.encodeTxlog(scratch.allocator(), self.now_ms, self.tx_data, names);
         try store.putTxlog(self.txn, self.t, entry);
 
         try store.writeT(self.txn, self.t);
@@ -1140,11 +1291,6 @@ const Ctx = struct {
         return out.toOwnedSlice(self.arena);
     }
 };
-
-fn checkEid(id: u64) !u64 {
-    if (id == 0 or id > key.id_max) return error.NoEntity;
-    return id;
-}
 
 fn isCollection(v: Value) bool {
     return switch (v.kind()) {
@@ -1610,7 +1756,7 @@ test "with: the view sees the speculative state, the connection does not" {
         .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .string = "h" } } } } },
         .{ .add = .{ .e = .{ .tempid = .{ .string = "h" } }, .a = .{ .id = city }, .v = .{ .val = .{ .string = "Oslo" } } } },
     }, .{});
-    defer w.finish();
+    defer w.destroy();
 
     // The report.
     try testing.expectEqual(before.basis + 1, w.report.t);
@@ -1629,7 +1775,7 @@ test "with: the view sees the speculative state, the connection does not" {
     try testing.expectEqual(@as(usize, 1), (try view.datoms(arena, .vaet, .{ .v = hb })).len);
     try testing.expectEqual(@as(?u64, a), try view.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a@x" } } }));
     try testing.expectEqual(@as(u64, 1), (try view.attr(arena, email)).?.count);
-    const entries = try db_mod.txRange(&w.view, arena, w.report.t, null);
+    const entries = try db_mod.txRange(w.view, arena, w.report.t, null);
     try testing.expectEqual(@as(usize, 1), entries.len);
     try testing.expectEqual(@as(usize, 6), entries[0].datoms.len);
     try testing.expectEqual(w.report.t, (try w.view.db()).basis);
@@ -1640,7 +1786,7 @@ test "with: the view sees the speculative state, the connection does not" {
     // The minted keyword resolves through the view's cache only.
     {
         const txn = try w.view.beginReadTxn();
-        defer txn.abort();
+        defer w.view.endReadTxn(txn);
         try testing.expect((try w.view.idents.idOf(txn, k_new)) != null);
     }
     try testing.expect(tc.conn.idents.by_intern.get(k_new) == null);
@@ -1654,8 +1800,8 @@ test "with: the view sees the speculative state, the connection does not" {
     // One write transaction per store: nothing else may begin one.
     try testing.expectError(error.Nested, withOps(tc.conn, arena, &.{}, .{}));
     try testing.expectError(error.Nested, transactOps(tc.conn, arena, &.{}, .{}));
-    try testing.expectError(error.Nested, transactOps(&w.view, arena, &.{}, .{}));
-    try testing.expectError(error.Nested, withOps(&w.view, arena, &.{}, .{}));
+    try testing.expectError(error.Nested, transactOps(w.view, arena, &.{}, .{}));
+    try testing.expectError(error.Nested, withOps(w.view, arena, &.{}, .{}));
 
     w.finish();
     w.finish();
@@ -1718,7 +1864,7 @@ test "with: errors surface without holding the write transaction; schema changes
         .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_string } } } },
         .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
     }, .{});
-    defer w.finish();
+    defer w.destroy();
     const nick: u32 = @intCast(w.report.tempids[0].eid);
     try testing.expectEqual(key.ValueType.string, (try w.db().attr(arena, nick)).?.value_type);
     try testing.expectEqual(@as(?u64, nick), try w.db().entid(arena, .{ .ident = try kw(tc, "user/nick") }));
@@ -1749,7 +1895,7 @@ test "with: Lisp tx-data" {
         try string_mod.fromBytes(&heap, "Zed"),
     });
     const w = try with(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{add}), .{ .now_ms = 7 });
-    defer w.finish();
+    defer w.destroy();
     const z = w.report.tempids[0].eid;
     const ent = try w.db().entity(arena, z);
     try testing.expectEqual(@as(usize, 1), ent.len);
@@ -1759,4 +1905,622 @@ test "with: Lisp tx-data" {
     w.finish();
     try testing.expectError(error.TxData, with(tc.conn, arena, try string_mod.fromBytes(&heap, "nope"), .{}));
     try testing.expect(tc.conn.speculative == null);
+}
+
+test "a string with an escaped NUL never aliases its prefix under a prefix scan" {
+    const tc = try TestConn.init("tx_nul_alias");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const name = try attrId(tc, "user/name");
+
+    // x's identity is "a\x00b", whose encoding starts with the encoding of "a".
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "x" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a\x00b" } } } },
+    }, .{});
+    const x = r1.tempids[0].eid;
+    const db = try tc.conn.db();
+    const a_bytes = try key.valBytes(arena, .{ .string = "a" });
+
+    // Reads: no datom carries "a".
+    try testing.expect((try db.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a" } } })) == null);
+    try testing.expectEqual(@as(usize, 0), (try db.datoms(arena, .avet, .{ .a = email, .v = a_bytes })).len);
+    try testing.expectEqual(@as(usize, 0), (try db.datoms(arena, .eavt, .{ .e = x, .a = email, .v = a_bytes })).len);
+    try testing.expectEqual(@as(usize, 0), (try db.datoms(arena, .aevt, .{ .a = email, .e = x, .v = a_bytes })).len);
+    try testing.expectEqual(@as(?u64, x), try db.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a\x00b" } } }));
+
+    // Writes: "a" is free, so another entity may take it, and a tempid
+    // claiming it is a new entity rather than an upsert onto x.
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "z" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "z" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Zed" } } } },
+    }, .{});
+    const z = r2.tempids[0].eid;
+    try testing.expect(z != x);
+    const db2 = try tc.conn.db();
+    const xs = try db2.datoms(arena, .eavt, .{ .e = x, .a = email });
+    try testing.expectEqual(@as(usize, 1), xs.len);
+    try testing.expectEqualStrings("a\x00b", xs[0].v.string);
+    try testing.expectEqual(@as(?u64, z), try db2.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a" } } }));
+    // A lookup ref on "a" now names z, not x.
+    try testing.expectError(error.NoEntity, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .lookup = .{ .a = .{ .id = email }, .v = .{ .string = "a\x00" } } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "nobody" } } } },
+    }, .{}));
+    const r3 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .lookup = .{ .a = .{ .id = email }, .v = .{ .string = "a" } } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Zed2" } } } },
+    }, .{});
+    try testing.expectEqual(z, r3.tx_data[0].e);
+}
+
+test "explicit entity ids must have been allocated" {
+    const tc = try TestConn.init("tx_explicit_eid");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const friend = try attrId(tc, "user/friend");
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    const next_aid = blk: {
+        const txn = try tc.conn.store.beginRead();
+        defer txn.abort();
+        break :blk try tc.conn.store.readNextAid(txn);
+    };
+
+    // A user id the allocator has not handed out; an attribute-partition
+    // id no ident holds; a transaction entity that does not exist yet.
+    try testing.expectError(error.NoEntity, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a + 5 }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "ghost" } } } },
+    }, .{}));
+    try testing.expectError(error.NoEntity, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = next_aid + 100 }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "ghost" } } } },
+    }, .{}));
+    try testing.expectError(error.NoEntity, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = key.txEntity(r1.t + 5) }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "ghost" } } } },
+    }, .{}));
+    // The same ids as ref values.
+    try testing.expectError(error.NoEntity, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = friend }, .v = .{ .val = .{ .ref = a + 5 } } } },
+    }, .{}));
+    try testing.expectError(error.NoEntity, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = friend }, .v = .{ .entity = .{ .eid = key.txEntity(r1.t + 5) } } } },
+    }, .{}));
+    try testing.expectEqual(r1.t, (try tc.conn.db()).basis);
+
+    // Allocated ids are fine: an existing entity, an attribute entity, a
+    // past transaction entity and this transaction's own entity, as
+    // entities and as ref values.
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = friend }, .v = .{ .val = .{ .ref = a } } } },
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = friend }, .v = .{ .val = .{ .ref = key.txEntity(r1.t) } } } },
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = friend }, .v = .{ .val = .{ .ref = name } } } },
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "a name" } } } },
+        .{ .add = .{ .e = .{ .eid = key.txEntity(r1.t) }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "old tx" } } } },
+        .{ .add = .{ .e = .{ .eid = key.txEntity(r1.t + 1) }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "this tx" } } } },
+    }, .{});
+    try testing.expectEqual(r1.t + 1, r2.t);
+    try testing.expectEqual(@as(usize, 7), r2.tx_data.len);
+    // An allocated entity stays addressable after every datom is retracted.
+    _ = try transactOps(tc.conn, arena, &.{.{ .retract_entity = .{ .eid = a } }}, .{});
+    const r4 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Back" } } } },
+    }, .{});
+    try testing.expectEqual(a, r4.tx_data[0].e);
+}
+
+/// Transact one new entity with a fresh keyword value while allocation
+/// `fail_index` of `where` fails; returns whether a failure was induced.
+fn transactWithFailure(tc: *TestConn, arena: Allocator, name: u32, tags: u32, where: enum { arena, cache }, fail_index: usize) !bool {
+    var tx_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer tx_arena.deinit();
+    var fa = std.testing.FailingAllocator.init(if (where == .arena) tx_arena.allocator() else testing.allocator, .{ .fail_index = fail_index });
+    const saved_gpa = tc.conn.idents.gpa;
+    if (where == .cache) {
+        // An empty cache has to grow for the mint, so the publication's
+        // own allocation is in the sweep.
+        tc.conn.idents.by_intern.clearAndFree(saved_gpa);
+        tc.conn.idents.by_ident.clearAndFree(saved_gpa);
+        tc.conn.idents.gpa = fa.allocator();
+    }
+    defer tc.conn.idents.gpa = saved_gpa;
+    const tag = try kw(tc, try std.fmt.allocPrint(arena, "tag/oom-{s}-{d}", .{ @tagName(where), fail_index }));
+    const before = (try tc.conn.db()).basis;
+    const result = transactOps(tc.conn, if (where == .arena) fa.allocator() else tx_arena.allocator(), &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "N" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = tags }, .v = .{ .keyword = tag } } },
+    }, .{});
+    const after = (try tc.conn.db()).basis;
+    if (result) |r| {
+        try testing.expectEqual(before + 1, r.t);
+        try testing.expectEqual(before + 1, after);
+        try testing.expectEqual(@as(usize, 1), r.tempids.len);
+        try testing.expectEqual(@as(usize, 3), r.tx_data.len);
+    } else |err| {
+        try testing.expectEqual(error.OutOfMemory, err);
+        try testing.expectEqual(before, after);
+    }
+    return fa.has_induced_failure;
+}
+
+test "an allocation failure never reports an error for a committed transaction" {
+    const tc = try TestConn.init("tx_oom");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const tags = try attrId(tc, "user/tags");
+
+    // Every allocation the transaction makes, first in its arena and
+    // then in the ident cache, fails once at index i. Either the
+    // transaction errors and t is untouched, or it commits and reports.
+    inline for (.{ .arena, .cache }) |where| {
+        var fail_index: usize = 0;
+        while (try transactWithFailure(tc, arena, name, tags, where, fail_index)) : (fail_index += 1) {}
+        try testing.expect(fail_index > @as(usize, if (where == .arena) 8 else 0));
+    }
+}
+
+test "retractEntity expands against the committed state; the transaction's own datoms survive" {
+    const tc = try TestConn.init("tx_retract_pending");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const age = try attrId(tc, "user/age");
+    const friend = try attrId(tc, "user/friend");
+    const home = try attrId(tc, "user/home");
+    const city = try attrId(tc, "addr/city");
+
+    // A tempid asserted and retracted in one transaction: the retraction
+    // sees nothing committed, so the assertion stands.
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "x" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "X" } } } },
+        .{ .retract_entity = .{ .tempid = .{ .string = "x" } } },
+    }, .{});
+    const x = r1.tempids[0].eid;
+    try testing.expectEqual(@as(usize, 2), r1.tx_data.len);
+    try testing.expectEqual(@as(usize, 1), (try (try tc.conn.db()).entity(arena, x)).len);
+
+    // A pending inbound ref is not a current (e' a' e) datom: it stays.
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "A" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 3 } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .string = "h1" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "h1" } }, .a = .{ .id = city }, .v = .{ .val = .{ .string = "Oslo" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "B" } } } },
+    }, .{});
+    const a = r2.tempids[0].eid;
+    const h1 = r2.tempids[1].eid;
+    const b = r2.tempids[2].eid;
+    const r3 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = b }, .a = .{ .id = friend }, .v = .{ .val = .{ .ref = a } } } },
+        .{ .retract_entity = .{ .eid = a } },
+    }, .{});
+    var retracted: usize = 0;
+    for (r3.tx_data) |d| {
+        if (!d.added) retracted += 1;
+    }
+    // a: name, age, home; h1: city.
+    try testing.expectEqual(@as(usize, 4), retracted);
+    const db3 = try tc.conn.db();
+    try testing.expectEqual(@as(usize, 0), (try db3.entity(arena, a)).len);
+    try testing.expectEqual(@as(usize, 0), (try db3.entity(arena, h1)).len);
+    const ab = try key.valBytes(arena, .{ .ref = a });
+    try testing.expectEqual(@as(usize, 1), (try db3.datoms(arena, .vaet, .{ .v = ab })).len);
+
+    // A component replaced and its parent retracted in one transaction:
+    // the committed component goes with the parent, the new one stays.
+    const r4 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "p" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "P" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "p" } }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .string = "old" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "old" } }, .a = .{ .id = city }, .v = .{ .val = .{ .string = "Oslo" } } } },
+    }, .{});
+    const p = r4.tempids[0].eid;
+    const old = r4.tempids[1].eid;
+    const r5 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = p }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .string = "new" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "new" } }, .a = .{ .id = city }, .v = .{ .val = .{ .string = "Rome" } } } },
+        .{ .retract_entity = .{ .eid = p } },
+    }, .{});
+    const new = r5.tempids[0].eid;
+    const db5 = try tc.conn.db();
+    try testing.expectEqual(@as(usize, 0), (try db5.entity(arena, old)).len);
+    const p_now = try db5.entity(arena, p);
+    try testing.expectEqual(@as(usize, 1), p_now.len);
+    try testing.expectEqual(home, p_now[0].a);
+    try testing.expectEqual(new, p_now[0].vals[0].ref);
+    try testing.expectEqualStrings("Rome", (try db5.entity(arena, new))[0].vals[0].string);
+
+    // retractEntity followed by an assertion on the same entity in one
+    // transaction: the assertion is the entity's only datom afterwards.
+    const r6 = try transactOps(tc.conn, arena, &.{
+        .{ .retract_entity = .{ .eid = b } },
+        .{ .add = .{ .e = .{ .eid = b }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 5 } } } },
+    }, .{});
+    _ = r6;
+    const bn = try (try tc.conn.db()).entity(arena, b);
+    try testing.expectEqual(@as(usize, 1), bn.len);
+    try testing.expectEqual(age, bn[0].a);
+}
+
+test "a lookup ref under a card-many ref attribute is one ref; a vector of them is a collection" {
+    const tc = try TestConn.init("tx_lookup_many");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    const dispatch = @import("dispatch");
+    try installSchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const friend = try attrId(tc, "user/friend");
+    const tags = try attrId(tc, "user/tags");
+
+    const r0 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "bob" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "bob@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "cy" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "cy@x" } } } },
+    }, .{});
+    const bob = r0.tempids[0].eid;
+    const cy = r0.tempids[1].eid;
+
+    const K = struct {
+        fn k(t: *TestConn, n: []const u8) !Value {
+            return t.interner.internKeywordValue(n);
+        }
+    };
+    const lookup_bob = try vector_mod.fromSlice(&heap, &.{ try K.k(tc, "user/email"), try string_mod.fromBytes(&heap, "bob@x") });
+    const lookup_cy = try vector_mod.fromSlice(&heap, &.{ try K.k(tc, "user/email"), try string_mod.fromBytes(&heap, "cy@x") });
+
+    // One lookup ref: one friend.
+    var m = try champ.mapEmpty(&heap);
+    m = try champ.mapAssoc(&heap, m, try K.k(tc, "db/id"), try string_mod.fromBytes(&heap, "ann"), &dispatch.hashValue, &dispatch.equal);
+    m = try champ.mapAssoc(&heap, m, try K.k(tc, "user/email"), try string_mod.fromBytes(&heap, "ann@x"), &dispatch.hashValue, &dispatch.equal);
+    m = try champ.mapAssoc(&heap, m, try K.k(tc, "user/friend"), lookup_bob, &dispatch.hashValue, &dispatch.equal);
+    const r1 = try transact(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{m}), .{});
+    try testing.expectEqual(@as(usize, 1), r1.tempids.len);
+    const ann = r1.tempids[0].eid;
+    const friends1 = try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = ann, .a = friend });
+    try testing.expectEqual(@as(usize, 1), friends1.len);
+    try testing.expectEqual(bob, friends1[0].v.ref);
+
+    // A vector of lookup refs and tempids: one friend each.
+    const many = try vector_mod.fromSlice(&heap, &.{ lookup_cy, try string_mod.fromBytes(&heap, "dee") });
+    var m2 = try champ.mapEmpty(&heap);
+    m2 = try champ.mapAssoc(&heap, m2, try K.k(tc, "db/id"), try string_mod.fromBytes(&heap, "ann2"), &dispatch.hashValue, &dispatch.equal);
+    m2 = try champ.mapAssoc(&heap, m2, try K.k(tc, "user/email"), try string_mod.fromBytes(&heap, "ann@x"), &dispatch.hashValue, &dispatch.equal);
+    m2 = try champ.mapAssoc(&heap, m2, try K.k(tc, "user/friend"), many, &dispatch.hashValue, &dispatch.equal);
+    var dee = try champ.mapEmpty(&heap);
+    dee = try champ.mapAssoc(&heap, dee, try K.k(tc, "db/id"), try string_mod.fromBytes(&heap, "dee"), &dispatch.hashValue, &dispatch.equal);
+    dee = try champ.mapAssoc(&heap, dee, try K.k(tc, "user/email"), try string_mod.fromBytes(&heap, "dee@x"), &dispatch.hashValue, &dispatch.equal);
+    const r2 = try transact(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{ m2, dee }), .{});
+    try testing.expectEqual(ann, r2.tempids[0].eid);
+    const dee_e = r2.tempids[1].eid;
+    const friends2 = try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = ann, .a = friend });
+    try testing.expectEqual(@as(usize, 3), friends2.len);
+    try testing.expectEqual(bob, friends2[0].v.ref);
+    try testing.expectEqual(cy, friends2[1].v.ref);
+    try testing.expectEqual(dee_e, friends2[2].v.ref);
+
+    // A two-element keyword vector under a card-many keyword attribute is
+    // still a collection, whatever its first element names.
+    var m3 = try champ.mapEmpty(&heap);
+    m3 = try champ.mapAssoc(&heap, m3, try K.k(tc, "db/id"), try string_mod.fromBytes(&heap, "ann3"), &dispatch.hashValue, &dispatch.equal);
+    m3 = try champ.mapAssoc(&heap, m3, try K.k(tc, "user/email"), try string_mod.fromBytes(&heap, "ann@x"), &dispatch.hashValue, &dispatch.equal);
+    m3 = try champ.mapAssoc(&heap, m3, try K.k(tc, "user/tags"), try vector_mod.fromSlice(&heap, &.{ try K.k(tc, "user/email"), try K.k(tc, "tag/b") }), &dispatch.hashValue, &dispatch.equal);
+    _ = try transact(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{m3}), .{});
+    try testing.expectEqual(@as(usize, 2), (try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = ann, .a = tags })).len);
+}
+
+/// Install `:user/nick` (string, indexed) and `:user/spouse` (ref,
+/// unique identity) beside `installSchema`'s attributes.
+fn installIdentitySchema(tc: *TestConn, arena: Allocator) !void {
+    _ = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.ident }, .v = .{ .keyword = try kw(tc, "user/nick") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_string } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.index }, .v = .{ .val = .{ .boolean = true } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "spouse" } }, .a = .{ .id = boot.ident }, .v = .{ .keyword = try kw(tc, "user/spouse") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "spouse" } }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_ref } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "spouse" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "spouse" } }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_identity } } } },
+    }, .{});
+}
+
+test "an indexed attribute becomes unique while a value moves between entities" {
+    const tc = try TestConn.init("tx_unique_move");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    try installIdentitySchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const nick = try attrId(tc, "user/nick");
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = nick }, .v = .{ .val = .{ .string = "N" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "b@x" } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    const b = r1.tempids[1].eid;
+
+    // Without the retraction, two entities would hold "N": refused.
+    try testing.expectError(error.Unique, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = b }, .a = .{ .id = nick }, .v = .{ .val = .{ .string = "N" } } } },
+        .{ .add = .{ .e = .{ .eid = nick }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_identity } } } },
+    }, .{}));
+    // The value moves from a to b in the transaction that makes the
+    // attribute unique: after it, exactly one entity holds "N".
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .retract = .{ .e = .{ .eid = a }, .a = .{ .id = nick }, .v = .{ .val = .{ .string = "N" } } } },
+        .{ .add = .{ .e = .{ .eid = b }, .a = .{ .id = nick }, .v = .{ .val = .{ .string = "N" } } } },
+        .{ .add = .{ .e = .{ .eid = nick }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_identity } } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 4), r2.tx_data.len);
+    const db = try tc.conn.db();
+    try testing.expectEqual(schema_mod.Unique.identity, (try db.attr(arena, nick)).?.unique);
+    try testing.expectEqual(@as(?u64, b), try db.entid(arena, .{ .lookup = .{ .a = nick, .v = .{ .string = "N" } } }));
+    try testing.expectEqual(@as(usize, 1), (try db.datoms(arena, .aevt, .{ .a = nick })).len);
+}
+
+test "identity claims whose value is a lookup ref or a tempid upsert" {
+    const tc = try TestConn.init("tx_identity_ref");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    try installIdentitySchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const name = try attrId(tc, "user/name");
+    const age = try attrId(tc, "user/age");
+    const spouse = try attrId(tc, "user/spouse");
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "h" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "h@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = spouse }, .v = .{ .entity = .{ .tempid = .{ .string = "h" } } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    const h = r1.tempids[1].eid;
+
+    // The claim's value is a lookup ref: x is a.
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "x" } }, .a = .{ .id = spouse }, .v = .{ .entity = .{ .lookup = .{ .a = .{ .id = email }, .v = .{ .string = "h@x" } } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "x" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    try testing.expectEqual(a, r2.tempids[0].eid);
+    try testing.expectEqual(@as(usize, 2), r2.tx_data.len);
+    for (r2.tx_data) |d| try testing.expect(d.a != spouse);
+
+    // The claim's value is a tempid that itself upserts: x is a, hh is h.
+    const r3 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "x" } }, .a = .{ .id = spouse }, .v = .{ .entity = .{ .tempid = .{ .string = "hh" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "x" } }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 3 } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "hh" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "h@x" } } } },
+    }, .{});
+    try testing.expectEqual(a, r3.tempids[0].eid);
+    try testing.expectEqual(h, r3.tempids[1].eid);
+    try testing.expectEqual(@as(usize, 2), r3.tx_data.len);
+
+    // Two tempids claiming one new entity as spouse are one entity.
+    const r4 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "p" } }, .a = .{ .id = spouse }, .v = .{ .entity = .{ .tempid = .{ .string = "n" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "q" } }, .a = .{ .id = spouse }, .v = .{ .entity = .{ .tempid = .{ .string = "n" } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "q" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Q" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "n@x" } } } },
+    }, .{});
+    // Tempids are listed in order of first mention: p, n, q.
+    try testing.expectEqual(r4.tempids[0].eid, r4.tempids[2].eid);
+    try testing.expect(r4.tempids[1].eid != r4.tempids[0].eid);
+    try testing.expect(r4.tempids[1].eid != a and r4.tempids[1].eid != h);
+    try testing.expectEqual(@as(usize, 4), r4.tx_data.len);
+
+    // A claim through a lookup ref on a new entity's identity, asserted
+    // later in the same transaction: y and m are fresh, y's spouse is m.
+    const r5 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "y" } }, .a = .{ .id = spouse }, .v = .{ .entity = .{ .lookup = .{ .a = .{ .id = email }, .v = .{ .string = "m@x" } } } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "y" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Y" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "m" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "m@x" } } } },
+    }, .{});
+    const y = r5.tempids[0].eid;
+    const m = r5.tempids[1].eid;
+    try testing.expect(y != m and y > h and m > h);
+    try testing.expectEqual(@as(usize, 4), r5.tx_data.len);
+    try testing.expectEqual(@as(?u64, y), try (try tc.conn.db()).entid(arena, .{ .lookup = .{ .a = spouse, .v = .{ .ref = m } } }));
+}
+
+test "a large transaction's arena stays well under a kilobyte per datom" {
+    const tc = try TestConn.init("tx_arena_per_datom");
+    defer tc.deinit();
+    var setup = std.heap.ArenaAllocator.init(testing.allocator);
+    defer setup.deinit();
+    try installSchema(tc, setup.allocator());
+    const email = try attrId(tc, "user/email");
+    const name = try attrId(tc, "user/name");
+    const age = try attrId(tc, "user/age");
+    const bio = try attrId(tc, "user/bio");
+    const home = try attrId(tc, "user/home");
+
+    // The ops live in their own arena; the transaction's arena holds
+    // only what the transaction allocates.
+    const entities = 20_000;
+    const per_entity = 5;
+    const ops = try setup.allocator().alloc(Op, entities * per_entity);
+    for (0..entities) |i| {
+        const id: TempidKey = .{ .fixnum = -@as(i64, @intCast(i + 1)) };
+        const em = try std.fmt.allocPrint(setup.allocator(), "user{d}@example.com", .{i});
+        const nm = try std.fmt.allocPrint(setup.allocator(), "User Number {d}", .{i});
+        ops[i * per_entity + 0] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = email }, .v = .{ .val = .{ .string = em } } } };
+        ops[i * per_entity + 1] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = name }, .v = .{ .val = .{ .string = nm } } } };
+        ops[i * per_entity + 2] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = age }, .v = .{ .val = .{ .long = @intCast(i % 90) } } } };
+        ops[i * per_entity + 3] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = bio }, .v = .{ .val = .{ .string = "A short biography that fits inline in the key." } } } };
+        ops[i * per_entity + 4] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .fixnum = -@as(i64, @intCast((i % entities) + 1)) } } } } };
+    }
+
+    var tx_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer tx_arena.deinit();
+    const r = try transactOps(tc.conn, tx_arena.allocator(), ops, .{});
+    try testing.expectEqual(@as(usize, entities * per_entity + 1), r.tx_data.len);
+    const bytes = tx_arena.queryCapacity();
+    const per_datom = bytes / r.tx_data.len;
+    if (std.c.getenv("NEXTOMIC_BENCH") != null) std.debug.print("\ntransaction arena: {d} bytes for {d} datoms, {d} bytes/datom\n", .{ bytes, r.tx_data.len, per_datom });
+    try testing.expect(per_datom < 1024);
+}
+
+test "history composed with since shows only the rows after since" {
+    const tc = try TestConn.init("tx_history_since");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Anne" } } } },
+    }, .{});
+    const db = try tc.conn.db();
+    // History alone: the assertion, its retraction and the new value.
+    try testing.expectEqual(@as(usize, 3), (try db.withHistory().datoms(arena, .eavt, .{ .e = a })).len);
+    // History since r1: the two rows of r2, whichever way it is composed.
+    for ([_]DbValue{ db.sinceT(r1.t).withHistory(), db.withHistory().sinceT(r1.t) }) |view| {
+        const rows = try view.datoms(arena, .eavt, .{ .e = a });
+        try testing.expectEqual(@as(usize, 2), rows.len);
+        for (rows) |d| try testing.expectEqual(r2.t, d.t);
+        try testing.expect(!rows[0].added and rows[1].added);
+    }
+    // Since r2 there is nothing; since 0 there is everything.
+    try testing.expectEqual(@as(usize, 0), (try db.sinceT(r2.t).withHistory().datoms(arena, .eavt, .{ .e = a })).len);
+    try testing.expectEqual(@as(usize, 3), (try db.sinceT(0).withHistory().datoms(arena, .eavt, .{ .e = a })).len);
+    // As-of composes on top: history since r1 as of r1 is empty.
+    try testing.expectEqual(@as(usize, 0), (try db.sinceT(r1.t).withHistory().asOf(r1.t).datoms(arena, .eavt, .{ .e = a })).len);
+}
+
+test "two card-one values in one transaction conflict even when the first is current" {
+    const tc = try TestConn.init("tx_card_one_current");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const age = try attrId(tc, "user/age");
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 30 } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 30 } } } },
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 31 } } } },
+    }, .{}));
+    // Re-asserting the current value twice writes nothing.
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 30 } } } },
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 30 } } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 1), r2.tx_data.len);
+    try testing.expectEqual(@as(i64, 30), (try (try tc.conn.db()).entity(arena, a))[0].vals[0].long);
+}
+
+test "an explicit :db/txInstant on the transaction entity stands" {
+    const tc = try TestConn.init("tx_explicit_instant");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+
+    const r = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .tx, .a = .{ .id = boot.tx_instant }, .v = .{ .val = .{ .instant = 12345 } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{ .now_ms = 777 });
+    try testing.expectEqual(@as(usize, 2), r.tx_data.len);
+    var instants: usize = 0;
+    for (r.tx_data) |d| if (d.a == boot.tx_instant) {
+        instants += 1;
+        try testing.expectEqual(@as(i64, 12345), d.v.instant);
+    };
+    try testing.expectEqual(@as(usize, 1), instants);
+    const db = try tc.conn.db();
+    try testing.expectEqual(@as(i64, 12345), (try db.entity(arena, key.txEntity(r.t)))[0].vals[0].instant);
+    const entries = try db_mod.txRange(tc.conn, arena, r.t, null);
+    try testing.expectEqual(@as(i64, 12345), entries[0].instant);
+    // Two different instants for one transaction conflict.
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .tx, .a = .{ .id = boot.tx_instant }, .v = .{ .val = .{ .instant = 1 } } } },
+        .{ .add = .{ .e = .tx, .a = .{ .id = boot.tx_instant }, .v = .{ .val = .{ .instant = 2 } } } },
+    }, .{}));
+}
+
+test "the view outlives the scratch arena until destroy" {
+    const tc = try TestConn.init("tx_with_view_lifetime");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    const w = try withOps(tc.conn, scratch.allocator(), &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    const escaped = w.db();
+    const a = w.report.tempids[0].eid;
+    try testing.expectEqual(@as(usize, 1), (try escaped.entity(arena, a)).len);
+    w.finish();
+    // The scratch arena, and the `With` in it, are gone; the view is
+    // not: an escaped db-value answers Closed rather than reading freed
+    // memory, and the connection is free again.
+    scratch.deinit();
+    try testing.expectError(error.Closed, escaped.entity(arena, a));
+    try testing.expect(tc.conn.speculative == null);
+    try testing.expectEqual(@as(usize, 0), (try (try tc.conn.db()).entity(arena, a)).len);
+    escaped.conn.destroy();
+}
+
+test "a held with keeps the store open until finish; a closed connection refuses writes" {
+    const tc = try TestConn.init("tx_busy_with");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+
+    const w = try withOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    defer w.destroy();
+    const a = w.report.tempids[0].eid;
+    try testing.expectError(error.Busy, tc.conn.release());
+    tc.conn.close();
+    try testing.expect(!tc.conn.is_open and tc.conn.close_pending and !tc.conn.store_closed);
+    // The view still reads the speculative state.
+    try testing.expectEqual(@as(usize, 1), (try w.db().entity(arena, a)).len);
+    w.finish();
+    try testing.expect(tc.conn.store_closed);
+    try testing.expectError(error.Closed, w.db().entity(arena, a));
+    try testing.expectError(error.Closed, transactOps(tc.conn, arena, &.{}, .{}));
+    try testing.expectError(error.Closed, withOps(tc.conn, arena, &.{}, .{}));
 }

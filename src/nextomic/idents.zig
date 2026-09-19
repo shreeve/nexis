@@ -5,7 +5,8 @@
 //! back. Invariants:
 //!   - The cache only ever holds committed mappings: a transaction's
 //!     freshly minted idents wait in its `Minter` and enter the cache
-//!     through `Minter.commitCache` after the commit succeeds.
+//!     through `Minter.commitCache` after the commit succeeds, into room
+//!     reserved before it, so the publication cannot fail.
 //!   - An ident id, once committed, never changes its text; a text never
 //!     changes its id.
 //!   - Attribute entities and enum keywords share this id space; an
@@ -54,6 +55,19 @@ pub const Idents = struct {
         try self.by_ident.put(self.gpa, id, intern_id);
     }
 
+    /// Make room for `n` more mappings, so that `rememberAssumeCapacity`
+    /// cannot fail.
+    pub fn reserve(self: *Idents, n: u32) !void {
+        try self.by_intern.ensureUnusedCapacity(self.gpa, n);
+        try self.by_ident.ensureUnusedCapacity(self.gpa, n);
+    }
+
+    /// Record a committed mapping into room made by `reserve`.
+    pub fn rememberAssumeCapacity(self: *Idents, intern_id: u32, id: u32) void {
+        self.by_intern.putAssumeCapacity(intern_id, id);
+        self.by_ident.putAssumeCapacity(id, intern_id);
+    }
+
     /// Ident id of the VM keyword `intern_id`, or null when the store
     /// has no such ident. Reads through `txn` on a cache miss.
     pub fn idOf(self: *Idents, txn: *Txn, intern_id: u32) !?u32 {
@@ -90,7 +104,8 @@ pub const Idents = struct {
 /// Ident resolution inside one write transaction: looks through the
 /// cache, then this transaction's mints, then the tree, and mints a new
 /// id from `sys["aid"]` when asked to. `finish` writes the bumped
-/// counter; `commitCache` publishes the mints after the commit.
+/// counter, `reserveCache` makes room in the cache, and `commitCache`
+/// publishes the mints after the commit without allocating.
 pub const Minter = struct {
     idents: *Idents,
     txn: *Txn,
@@ -156,9 +171,15 @@ pub const Minter = struct {
         if (self.minted.items.len > 0) try self.idents.store.writeNextAid(self.txn, self.next_aid);
     }
 
-    /// Publish the mints to the cache. Call only after a successful commit.
-    pub fn commitCache(self: *Minter) !void {
-        for (self.minted.items) |m| try self.idents.remember(m.intern_id, m.id);
+    /// Make room in the cache for every mint. Call before the commit.
+    pub fn reserveCache(self: *Minter) !void {
+        try self.idents.reserve(@intCast(self.minted.items.len));
+    }
+
+    /// Publish the mints to the room `reserveCache` made. Call only after
+    /// a successful commit; cannot fail.
+    pub fn commitCache(self: *Minter) void {
+        for (self.minted.items) |m| self.idents.rememberAssumeCapacity(m.intern_id, m.id);
     }
 };
 
@@ -210,8 +231,9 @@ test "bootstrap idents resolve both ways and new ones mint after commit" {
         try testing.expectEqual(store_mod.boot.next_aid, try m.resolve(k_color));
         try testing.expectEqual(@as(?u32, store_mod.boot.ident), try m.lookup(k_ident));
         try m.finish();
+        try m.reserveCache();
         try txn.commit();
-        try m.commitCache();
+        m.commitCache();
     }
     {
         const txn = try store.beginRead();

@@ -10,9 +10,12 @@
 //!     in 6 bytes.
 //!   - A value encoding is always followed by fixed-width fields only,
 //!     so `v` is `key[prefix .. len - suffix]` and carries no length.
-//!   - Inline strings and byte arrays are at most `inline_max` bytes;
-//!     longer ones become an equality key (prefix + 128-bit hash) and
-//!     the full payload lives in the EAVT value.
+//!   - Strings and byte arrays carry one tag each. Up to `inline_max`
+//!     bytes they are stored inline; longer ones become an equality key
+//!     (the escaped 64-byte prefix, then `0x00`, `out_of_line_mark` and
+//!     the 128-bit hash) and the full payload lives in the EAVT value.
+//!     The one tag keeps byte order equal to value order across the
+//!     threshold whenever two values differ within their first 64 bytes.
 //!   - `-0.0` is stored as `+0.0`; NaN is refused with `error.ValueType`.
 
 const std = @import("std");
@@ -35,6 +38,10 @@ pub const inline_max = 96;
 pub const prefix_len = 64;
 /// Bytes of the out-of-line hash.
 pub const hash_len = 16;
+/// The byte after the `0x00` that ends an out-of-line prefix. An inline
+/// encoding has no bare `0x00` before its terminator and nothing after
+/// it, so the marker tells the two shapes apart whatever the hash holds.
+pub const out_of_line_mark: u8 = 0x01;
 
 /// Ids are stored in 6 bytes and every id fits the VM's i48 fixnum, so
 /// the usable range is `0 .. 2^47-1`.
@@ -76,10 +83,8 @@ pub const Tag = enum(u8) {
     keyword = 0x30,
     ref = 0x40,
     string = 0x50,
-    string_long = 0x51,
     uuid = 0x60,
     bytes = 0x70,
-    bytes_long = 0x71,
 };
 
 /// Attribute value types (`:db/valueType`).
@@ -345,42 +350,60 @@ pub fn encodeVal(out: *std.ArrayList(u8), gpa: Allocator, v: Val) EncodeError!vo
             writeId(&buf, eid);
             try out.appendSlice(gpa, &buf);
         },
-        .string => |s| try encodeBlob(out, gpa, s, .string, .string_long),
+        .string => |s| try encodeBlob(out, gpa, s, .string),
         .uuid => |u| {
             try out.append(gpa, @intFromEnum(Tag.uuid));
             try out.appendSlice(gpa, &u);
         },
-        .bytes => |b| try encodeBlob(out, gpa, b, .bytes, .bytes_long),
+        .bytes => |b| try encodeBlob(out, gpa, b, .bytes),
     }
 }
 
-fn encodeBlob(out: *std.ArrayList(u8), gpa: Allocator, s: []const u8, short: Tag, long: Tag) !void {
+fn encodeBlob(out: *std.ArrayList(u8), gpa: Allocator, s: []const u8, tag: Tag) !void {
+    try out.append(gpa, @intFromEnum(tag));
     if (s.len <= inline_max) {
-        try out.append(gpa, @intFromEnum(short));
         try escapeInto(out, gpa, s);
         return;
     }
-    try out.append(gpa, @intFromEnum(long));
     // The first `prefix_len` bytes, escaped, without a terminator of
-    // their own; the 0x00 that follows separates prefix from hash.
-    // Because the escaped prefix never ends in a bare 0x00, the
-    // separator is unambiguous.
+    // their own; the 0x00 that follows separates prefix from hash and
+    // the marker after it distinguishes the shape from an inline value
+    // that happens to share the prefix.
+    try out.ensureUnusedCapacity(gpa, 2 * prefix_len + 2 + hash_len);
     for (s[0..prefix_len]) |c| {
         try out.append(gpa, c);
         if (c == 0) try out.append(gpa, 0xFF);
     }
     try out.append(gpa, 0);
+    try out.append(gpa, out_of_line_mark);
     var hbuf: [hash_len]u8 = undefined;
     std.mem.writeInt(u128, &hbuf, hash128(s), .big);
     try out.appendSlice(gpa, &hbuf);
 }
 
+/// The longest value encoding: an inline blob of `inline_max` bytes,
+/// every one escaped, and its terminator.
+pub const max_val_len = 1 + 2 * inline_max + 1;
+/// The longest key: a history key carrying the longest value.
+pub const max_key_len = id_len + attr_len + max_val_len + top_len;
+
+/// The owned-slice encoders build in stack scratch and copy out
+/// exactly: nothing they produce exceeds `max_key_len`, and a list
+/// growing to that length stays within the scratch.
+const scratch_len = 1024;
+
+comptime {
+    std.debug.assert(1 + 2 * prefix_len + 2 + hash_len <= max_val_len);
+    std.debug.assert(std.ArrayList(u8).growCapacity(max_key_len) + std.ArrayList(u8).growCapacity(0) <= scratch_len);
+}
+
 /// The sortable encoding of `v` as an owned slice.
 pub fn valBytes(gpa: Allocator, v: Val) EncodeError![]u8 {
+    var scratch: [scratch_len]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try encodeVal(&out, gpa, v);
-    return out.toOwnedSlice(gpa);
+    try encodeVal(&out, fba.allocator(), v);
+    return gpa.dupe(u8, out.items);
 }
 
 /// An out-of-line equality key: the escaped 64-byte prefix and the
@@ -390,7 +413,7 @@ pub const Digest = struct {
     hash: u128,
 };
 
-/// A value decoded from an index key: exact for inline types, a digest
+/// A value decoded from an index key: exact for inline values, a digest
 /// for out-of-line strings and byte arrays (the full value is in the
 /// EAVT payload).
 pub const KeyVal = union(enum) {
@@ -442,25 +465,23 @@ pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
         },
         .string, .bytes => {
             const r = try unescapeFrom(gpa, body);
-            if (r.consumed != body.len) {
-                gpa.free(r.bytes);
-                return error.Corrupted;
+            if (r.consumed == body.len) {
+                return if (tag == .string) .{ .val = .{ .string = r.bytes } } else .{ .val = .{ .bytes = r.bytes } };
             }
-            return if (tag == .string) .{ .val = .{ .string = r.bytes } } else .{ .val = .{ .bytes = r.bytes } };
+            // Out of line: the bare 0x00 ends the escaped prefix, then the
+            // marker and the hash fill the rest exactly.
+            gpa.free(r.bytes);
+            const sep = r.consumed - 1;
+            if (body.len != sep + 2 + hash_len or body[sep + 1] != out_of_line_mark) return error.Corrupted;
+            const d: Digest = .{
+                .prefix = body[0..sep],
+                .hash = std.mem.readInt(u128, body[sep + 2 ..][0..hash_len], .big),
+            };
+            return if (tag == .string) .{ .string_long = d } else .{ .bytes_long = d };
         },
         .uuid => {
             if (body.len != 16) return error.Corrupted;
             return .{ .val = .{ .uuid = body[0..16].* } };
-        },
-        .string_long, .bytes_long => {
-            if (body.len < 1 + hash_len) return error.Corrupted;
-            const sep = body.len - hash_len - 1;
-            if (body[sep] != 0) return error.Corrupted;
-            const d: Digest = .{
-                .prefix = body[0..sep],
-                .hash = std.mem.readInt(u128, body[sep + 1 ..][0..hash_len], .big),
-            };
-            return if (tag == .string_long) .{ .string_long = d } else .{ .bytes_long = d };
         },
     }
 }
@@ -476,10 +497,6 @@ fn tagFromByte(b: u8) ?Tag {
         if (f.value == b) return @enumFromInt(b);
     }
     return null;
-}
-
-pub fn isOutOfLineTag(t: Tag) bool {
-    return t == .string_long or t == .bytes_long;
 }
 
 // =============================================================================
@@ -513,9 +530,10 @@ pub const Parts = struct {
     top: ?Top,
 };
 
-/// The VAET value section is the referenced entity id without a tag.
-fn vaetValue(vbytes: []const u8) []const u8 {
-    std.debug.assert(vbytes.len == 1 + id_len and vbytes[0] == @intFromEnum(Tag.ref));
+/// The VAET value section is the referenced entity id without a tag;
+/// any other value encoding has no place in VAET.
+fn vaetValue(vbytes: []const u8) error{ValueType}![]const u8 {
+    if (vbytes.len != 1 + id_len or vbytes[0] != @intFromEnum(Tag.ref)) return error.ValueType;
     return vbytes[1..];
 }
 
@@ -543,7 +561,7 @@ pub fn packKey(out: *std.ArrayList(u8), gpa: Allocator, index: Index, e: u64, a:
             try out.appendSlice(gpa, &ebuf);
         },
         .vaet => {
-            try out.appendSlice(gpa, vaetValue(vbytes));
+            try out.appendSlice(gpa, try vaetValue(vbytes));
             try out.appendSlice(gpa, &abuf);
             try out.appendSlice(gpa, &ebuf);
         },
@@ -556,10 +574,11 @@ pub fn packKey(out: *std.ArrayList(u8), gpa: Allocator, index: Index, e: u64, a:
 }
 
 pub fn keyBytes(gpa: Allocator, index: Index, e: u64, a: u32, vbytes: []const u8, top: ?Top) ![]u8 {
+    var scratch: [scratch_len]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try packKey(&out, gpa, index, e, a, vbytes, top);
-    return out.toOwnedSlice(gpa);
+    try packKey(&out, fba.allocator(), index, e, a, vbytes, top);
+    return gpa.dupe(u8, out.items);
 }
 
 /// Decode a key of `index`. `history` selects the trailing `top`.
@@ -645,7 +664,7 @@ pub fn packPrefix(out: *std.ArrayList(u8), gpa: Allocator, index: Index, comps: 
             },
             'v' => {
                 const v = comps.v orelse break;
-                try out.appendSlice(gpa, if (index == .vaet) vaetValue(v) else v);
+                try out.appendSlice(gpa, if (index == .vaet) try vaetValue(v) else v);
             },
             else => unreachable,
         }
@@ -655,10 +674,11 @@ pub fn packPrefix(out: *std.ArrayList(u8), gpa: Allocator, index: Index, comps: 
 }
 
 pub fn prefixBytes(gpa: Allocator, index: Index, comps: Components) ![]u8 {
+    var scratch: [scratch_len]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    _ = try packPrefix(&out, gpa, index, comps);
-    return out.toOwnedSlice(gpa);
+    _ = try packPrefix(&out, fba.allocator(), index, comps);
+    return gpa.dupe(u8, out.items);
 }
 
 /// The least key greater than every key that starts with `prefix`,
@@ -755,7 +775,8 @@ test "long string becomes a digest key" {
     const s = "x" ** 200;
     const x = try enc(.{ .string = s });
     defer testing.allocator.free(x);
-    try testing.expectEqual(@as(usize, 1 + prefix_len + 1 + hash_len), x.len);
+    try testing.expectEqual(@as(usize, 1 + prefix_len + 2 + hash_len), x.len);
+    try testing.expectEqual(@as(u8, @intFromEnum(Tag.string)), x[0]);
     const kv = try decodeVal(testing.allocator, x);
     try testing.expect(kv == .string_long);
     try testing.expectEqual(hash128(s), kv.string_long.hash);
@@ -764,8 +785,8 @@ test "long string becomes a digest key" {
 
 test "every fixed-width type round trips" {
     const vals = [_]Val{
-        .{ .boolean = false }, .{ .boolean = true }, .{ .long = -7 }, .{ .double = 2.5 }, .{ .instant = 1_700_000_000_000 },
-        .{ .keyword = 17 },    .{ .ref = 1 << 40 },   .{ .uuid = [_]u8{9} ** 16 },
+        .{ .boolean = false }, .{ .boolean = true }, .{ .long = -7 },             .{ .double = 2.5 }, .{ .instant = 1_700_000_000_000 },
+        .{ .keyword = 17 },    .{ .ref = 1 << 40 },  .{ .uuid = [_]u8{9} ** 16 },
     };
     for (vals) |v| {
         const x = try enc(v);

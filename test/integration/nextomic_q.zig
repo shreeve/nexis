@@ -654,6 +654,12 @@ const Naive = struct {
         return e2;
     }
 
+    /// The attribute id cell of the attribute with ident `kw`, or null.
+    fn attrCell(self: *Naive, kw: u32) !?Cell {
+        const id = (try self.fx.conn().idents.idOf(self.read.txn, kw)) orelse return null;
+        return .{ .int = id };
+    }
+
     /// The cell a pattern constant compares as at position `pos`.
     fn constCell(self: *Naive, c: ir.Constant, pos: usize, d: [5]Cell) !?Cell {
         const a = self.arena;
@@ -699,7 +705,9 @@ const Naive = struct {
                 .variable => |v| {
                     const cur = if (e2) |e| e[v] else env[v];
                     if (cur) |have| {
-                        if (!have.eql(d[pos])) return null;
+                        // A keyword in the attribute position names the attribute.
+                        const want = if (pos == 1 and have == .keyword) (try self.attrCell(have.keyword)) orelse return null else have;
+                        if (!want.eql(d[pos])) return null;
                     } else {
                         if (e2 == null) e2 = try self.copy(env);
                         e2.?[v] = d[pos];
@@ -1018,6 +1026,19 @@ test "corpus: every :in form" {
     try checkCount(fx, dbv, "[:find ?p :in $ % :where (admin ?p)]", &.{ nil, try fx.read(rules_src) }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ % ?t :where (has-tag ?p ?t) [?p :person/name ?n]]", &.{ nil, try fx.read(rules_src), value.fromKeywordId(try fx.kw("green")) }, 4);
     try checkCount(fx, dbv, "[:find ?x :in $ ?x]", &.{ nil, value.fromFixnum(5).? }, 1);
+    // A bound attribute variable, by id and by ident; an unknown ident matches nothing.
+    const name_id = (try dbv.entid(fx.arena(), .{ .ident = try fx.kw("person/name") })).?;
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromFixnum(@intCast(name_id)).? }, 6);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kw("person/name")) }, 6);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a \"Cy\"]]", &.{ nil, value.fromKeywordId(try fx.kw("person/name")) }, 1);
+    try checkCount(fx, dbv, "[:find ?v :in $ ?a ?e :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kw("person/tags")), value.fromFixnum(@intCast(key.user_partition_start)).? }, 1);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kw("nope/attr")) }, 0);
+    // A bound value with no attribute: a string or keyword is matched across every attribute.
+    try checkCount(fx, dbv, "[:find ?e :in $ ?v :where [?e _ ?v]]", &.{ nil, try fx.str("Cy") }, 1);
+    try checkCount(fx, dbv, "[:find ?e ?a :in $ ?v :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kw("green")) }, 2);
+    try checkCount(fx, dbv, "[:find ?e :where [?e _ \"Cy\"]]", &.{nil}, 1);
+    try checkCount(fx, dbv, "[:find ?e ?a :where [?e ?a \"Cy\"]]", &.{nil}, 1);
+    try checkCount(fx, dbv, "[:find ?e :where [?e _ \"Nobody\"]]", &.{nil}, 0);
     try checkCount(fx, dbv, "[:find ?x ?y :in $ [?x ...] [?y ...]]", &.{ nil, try fx.read("[1 2]"), try fx.read("[3 4 3]") }, 4);
     // Wrong input count and shape.
     try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?e :in $ ?n :where [?e :person/name ?n]]", &.{nil}));
@@ -1330,14 +1351,21 @@ test "benchmark: 200k datoms, three-way join" {
     try testing.expectEqual(emps / depts, champ.setCount(r3));
     try testing.expect(champ.setCount(r_age) > 0);
     try testing.expect(r_hash.asFixnum() > 0);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try query.explain(testing.allocator, fx.interner(), q3, dbv, none, &diag, opts, &out.writer);
+    if (!benchOutput()) return;
     std.debug.print("\n[bench] 200k datoms, {d} employees / {d} departments\n", .{ emps, depts });
     std.debug.print("[bench] 3-way join by department (dept -> vaet -> eavt), {d} rows: {d} us to rows, {d} us with the result set\n", .{ champ.setCount(r3), (r1 - r0) / 1000, (t1 - t0) / 1000 });
     std.debug.print("[bench] 3-way join by age (avet -> eavt -> eavt), {d} rows: {d} us\n", .{ champ.setCount(r_age), (t2 - t1) / 1000 });
     std.debug.print("[bench] active count by department (aevt scan + hash join), {d} rows: {d} us\n", .{ r_hash.asFixnum(), (t3 - t2) / 1000 });
-    var out: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer out.deinit();
-    try query.explain(testing.allocator, fx.interner(), q3, dbv, none, &diag, opts, &out.writer);
     std.debug.print("[bench] plan:\n{s}", .{out.written()});
+}
+
+/// Timings print only when `NEXTOMIC_BENCH` is set; the checks run
+/// regardless.
+fn benchOutput() bool {
+    return std.c.getenv("NEXTOMIC_BENCH") != null;
 }
 
 fn nowNs() u64 {

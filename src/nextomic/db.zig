@@ -61,6 +61,9 @@ pub const Error = error{
     Closed,
     /// Malformed tx-data: `:nextomic/tx-data`.
     TxData,
+    /// `release` while a read, a `transact` or a `with` is in flight on
+    /// the connection: `:nextomic/busy`.
+    Busy,
 };
 
 // =============================================================================
@@ -79,7 +82,21 @@ pub const Conn = struct {
     idents: Idents,
     schema_cache: ?*Schema = null,
     sync_mode: SyncMode,
+    /// Accepting operations. A closed `Conn` stays allocated so that
+    /// db-values still pointing at it fail with `error.Closed`.
     is_open: bool,
+    /// Operations in flight: reads between `beginReadTxn` and
+    /// `endReadTxn`, and the write transaction of a `transact` or a held
+    /// `with` (`beginWriteTxn` until `taskDone`).
+    busy: u32 = 0,
+    /// `close` was asked while busy: the store is freed when the last
+    /// operation ends, so no cursor in flight dangles.
+    close_pending: bool = false,
+    /// The store (when owned), ident cache and schema cache are gone.
+    store_closed: bool = false,
+    /// Closing frees the store; false on the view of a speculative
+    /// `with`, which shares its connection's store.
+    owns_store: bool = true,
     /// The write transaction this connection reads through, as
     /// read-only children: set on the view of a speculative `with`.
     overlay: ?*Txn = null,
@@ -105,35 +122,75 @@ pub const Conn = struct {
         return self;
     }
 
-    /// Release the store and caches. Idempotent; the `Conn` stays
-    /// allocated so db-values that still point at it fail with
-    /// `error.Closed` instead of dangling.
+    /// Stop accepting operations. Idempotent. The `Conn` stays allocated
+    /// so db-values that still point at it fail with `error.Closed`; the
+    /// store and the caches are freed now, or when the last operation in
+    /// flight ends.
     pub fn close(self: *Conn) void {
         if (!self.is_open) return;
-        self.dropSchema();
-        self.idents.deinit();
-        self.store.close();
         self.is_open = false;
+        if (self.busy > 0) {
+            self.close_pending = true;
+            return;
+        }
+        self.closeStore();
     }
 
-    /// Close and free.
-    pub fn destroy(self: *Conn) void {
+    /// `close`, refused while an operation is in flight.
+    pub fn release(self: *Conn) error{Busy}!void {
+        if (self.is_open and self.busy > 0) return error.Busy;
         self.close();
+    }
+
+    fn closeStore(self: *Conn) void {
+        self.close_pending = false;
+        self.dropSchema();
+        self.idents.deinit();
+        if (self.owns_store) self.store.close();
+        self.store_closed = true;
+    }
+
+    /// Free the `Conn`: teardown, when nothing references it any more.
+    pub fn destroy(self: *Conn) void {
+        self.is_open = false;
+        if (!self.store_closed) self.closeStore();
         self.gpa.destroy(self);
     }
 
     /// A read transaction for one operation: a fresh reader, or a
     /// read-only child of the held write transaction on a `with` view.
+    /// Ends with `endReadTxn`.
     pub fn beginReadTxn(self: *Conn) !*Txn {
         if (!self.is_open) return error.Closed;
-        if (self.overlay) |w| return self.store.beginReadChild(w);
-        return self.store.beginRead();
+        const txn = if (self.overlay) |w| try self.store.beginReadChild(w) else try self.store.beginRead();
+        self.busy += 1;
+        return txn;
+    }
+
+    pub fn endReadTxn(self: *Conn, txn: *Txn) void {
+        txn.abort();
+        self.taskDone();
+    }
+
+    /// The write transaction of a `transact` or a `with`; the caller
+    /// commits or aborts it, then calls `taskDone`.
+    pub fn beginWriteTxn(self: *Conn, sync_mode: SyncMode) !*Txn {
+        if (!self.is_open) return error.Closed;
+        const txn = try self.store.beginWrite(sync_mode);
+        self.busy += 1;
+        return txn;
+    }
+
+    /// One operation ended; a pending close completes with the last.
+    pub fn taskDone(self: *Conn) void {
+        self.busy -= 1;
+        if (self.busy == 0 and self.close_pending) self.closeStore();
     }
 
     /// A db-value at the current basis.
     pub fn db(self: *Conn) !DbValue {
         const txn = try self.beginReadTxn();
-        defer txn.abort();
+        defer self.endReadTxn(txn);
         return .{ .conn = self, .basis = try self.store.readT(txn) };
     }
 
@@ -226,7 +283,7 @@ pub const DbValue = struct {
 
     fn window(self: DbValue) Store.Window {
         const up = self.upper();
-        if (self.history) return .{ .all = up };
+        if (self.history) return .{ .all = .{ .after = self.since orelse 0, .upto = up } };
         if (self.since) |after| return .{ .since = .{ .after = after, .upto = up } };
         return .{ .as_of = up };
     }
@@ -234,7 +291,7 @@ pub const DbValue = struct {
     /// Open a read transaction for one operation and check the basis.
     pub fn beginRead(self: DbValue) !Read {
         const txn = try self.conn.beginReadTxn();
-        errdefer txn.abort();
+        errdefer self.conn.endReadTxn(txn);
         const now = try self.conn.store.readT(txn);
         if (now < self.basis) return error.BasisInFuture;
         return .{ .db = self, .txn = txn, .now = now };
@@ -321,7 +378,7 @@ pub const Read = struct {
     now: u64,
 
     pub fn close(self: *Read) void {
-        self.txn.abort();
+        self.db.conn.endReadTxn(self.txn);
     }
 
     /// Current-tree fast path: the plain view at the newest basis.
@@ -406,7 +463,12 @@ pub const DatomScan = struct {
         folded: Store.FoldScan,
     },
 
-    /// Components that came after a gap in the prefix.
+    /// Components the prefix does not pin exactly: those after a gap,
+    /// and always `v`. A value encoding that ends in the `0x00`
+    /// terminator is a byte prefix of every key whose value continues
+    /// with an escaped NUL (`"a"` is a prefix of `"a\x00b"`), so a
+    /// prefix scan covering `v` still admits longer values; comparing
+    /// the row's whole value section makes the match exact.
     pub const Filter = struct {
         e: ?u64 = null,
         a: ?u32 = null,
@@ -419,11 +481,11 @@ pub const DatomScan = struct {
                 .avet => .{ 'a', 'v', 'e' },
                 .vaet => .{ 'v', 'a', 'e' },
             };
-            var f: Filter = .{};
+            var f: Filter = .{ .v = comps.v };
             for (order[covered..]) |c| switch (c) {
                 'e' => f.e = comps.e,
                 'a' => f.a = comps.a,
-                'v' => f.v = comps.v,
+                'v' => {},
                 else => unreachable,
             };
             return f;
@@ -501,7 +563,7 @@ pub const TxEntry = struct {
 /// Txlog entries with `from <= t < to` (an absent `to` runs to the newest).
 pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
     const txn = try conn.beginReadTxn();
-    defer txn.abort();
+    defer conn.endReadTxn(txn);
     const now = try conn.store.readT(txn);
     const schema = try conn.schemaAt(txn, now, now);
 
@@ -650,7 +712,7 @@ test "db at bootstrap: datoms, entity, entid, ident, tx-range" {
     try testing.expectEqual(@as(usize, 0), empty.len);
 
     // A closed connection refuses every operation.
-    tc.conn.close();
+    try tc.conn.release();
     try testing.expectError(error.Closed, db.datoms(arena, .eavt, .{ .e = 1 }));
     try testing.expectError(error.Closed, tc.conn.db());
 }
@@ -664,6 +726,24 @@ test "basis in the future is refused" {
     var db = try tc.conn.db();
     db.basis = 99;
     try testing.expectError(error.BasisInFuture, db.datoms(arena, .eavt, .{ .e = 1 }));
+}
+
+test "a VAET component must be a ref value" {
+    const tc = try TestConn.init("db_vaet_value");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const db = try tc.conn.db();
+    const sb = try key.valBytes(arena, .{ .string = "x" });
+    try testing.expectError(error.ValueType, db.datoms(arena, .vaet, .{ .v = sb }));
+    try testing.expectError(error.ValueType, key.prefixBytes(arena, .vaet, .{ .v = sb }));
+    try testing.expectError(error.ValueType, key.keyBytes(arena, .vaet, 1, 2, sb, null));
+    try testing.expectError(error.ValueType, key.prefixBytes(arena, .vaet, .{ .v = "" }));
+    // A ref value scans; the other indexes take any value.
+    const rb = try key.valBytes(arena, .{ .ref = 1 });
+    _ = try db.datoms(arena, .vaet, .{ .v = rb });
+    _ = try db.datoms(arena, .avet, .{ .a = 1, .v = sb });
 }
 
 test "materialise every value kind into a heap" {
@@ -687,4 +767,60 @@ test "materialise every value kind into a heap" {
     try testing.expectEqualStrings("00000000-0000-0000-0000-000000000000", string_mod.asBytes(u));
     const b = try conn.valToValue(txn, &heap, .{ .bytes = "\x00\x01" });
     try testing.expectEqualStrings("\x00\x01", string_mod.asBytes(b));
+}
+
+test "every operation on a closed connection is error.Closed" {
+    const tc = try TestConn.init("db_closed");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const db = try tc.conn.db();
+    const views = [_]DbValue{ db, db.asOf(1), db.sinceT(0), db.withHistory() };
+    try tc.conn.release();
+    try tc.conn.release();
+    tc.conn.close();
+    try testing.expect(!tc.conn.is_open and tc.conn.store_closed);
+    try testing.expectError(error.Closed, tc.conn.db());
+    try testing.expectError(error.Closed, tc.conn.sync());
+    try testing.expectError(error.Closed, txRange(tc.conn, arena, 0, null));
+    for (views) |v| {
+        try testing.expectError(error.Closed, v.beginRead());
+        try testing.expectError(error.Closed, v.datoms(arena, .eavt, .{ .e = 1 }));
+        try testing.expectError(error.Closed, v.entity(arena, 1));
+        try testing.expectError(error.Closed, v.entid(arena, .{ .eid = 1 }));
+        try testing.expectError(error.Closed, v.entid(arena, .{ .lookup = .{ .a = boot.ident, .v = .{ .keyword = boot.doc } } }));
+        try testing.expectError(error.Closed, v.ident(arena, boot.doc));
+        try testing.expectError(error.Closed, v.attr(arena, boot.ident));
+    }
+}
+
+test "close waits for operations in flight; release refuses them" {
+    const tc = try TestConn.init("db_busy");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const db = try tc.conn.db();
+
+    var rd = try db.beginRead();
+    try testing.expectEqual(@as(u32, 1), tc.conn.busy);
+    try testing.expectError(error.Busy, tc.conn.release());
+    try testing.expect(tc.conn.is_open);
+    // close marks the connection closed at once and keeps the store until
+    // the read ends, so its cursors stay valid.
+    tc.conn.close();
+    try testing.expect(!tc.conn.is_open);
+    try testing.expect(tc.conn.close_pending);
+    try testing.expectError(error.Closed, tc.conn.db());
+    try testing.expectError(error.Closed, db.datoms(arena, .eavt, .{ .e = 1 }));
+    var it = try rd.scan(arena, .eavt, .{ .e = boot.ident });
+    var n: usize = 0;
+    while (try it.next()) |_| n += 1;
+    try testing.expectEqual(@as(usize, 5), n);
+    rd.close();
+    try testing.expectEqual(@as(u32, 0), tc.conn.busy);
+    try testing.expect(!tc.conn.close_pending);
+    try testing.expect(tc.conn.store_closed);
+    try tc.conn.release();
 }

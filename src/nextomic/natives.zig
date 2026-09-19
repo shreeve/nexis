@@ -14,17 +14,18 @@
 //! arguments are `KindMismatch`, as for every other native.
 //!
 //! Connection lifetime: `connect` registers the `Conn` on
-//! `vm.nextomic_connections`; `release` closes it (idempotent) and
-//! leaves the struct allocated so db-values still pointing at it raise
+//! `vm.nextomic_connections`; `release` closes it (idempotent, and
+//! `:nextomic/busy` while an operation on it is in flight) and leaves
+//! the struct allocated so db-values still pointing at it raise
 //! `:nextomic/closed`; VM teardown destroys every connection through
 //! `closeCallback`.
 //!
-//! Per-VM state (`State`): the parsed-query caches and every finished
-//! `with` scope, created on first use and destroyed at VM teardown
-//! through `vm.nextomic_query_close`. A scope's arena holds the view
-//! `Conn` that its db-values name, so it outlives the scope the way a
-//! released connection's struct does: after `finish` the view answers
-//! `:nextomic/closed`.
+//! Per-VM state (`State`): the parsed-query caches and the view of
+//! every finished `with` scope, created on first use and destroyed at
+//! VM teardown through `vm.nextomic_query_close`. A view outlives its
+//! scope the way a released connection's struct does, so a db-value
+//! that escaped the scope answers `:nextomic/closed`; the scope's
+//! scratch is freed when the native returns.
 
 const std = @import("std");
 const value = @import("value");
@@ -132,9 +133,9 @@ pub const State = struct {
     gpa: Allocator,
     ir_cache: query.Cache,
     rules_cache: query.RulesCache,
-    /// Finished `with` scopes. Each arena holds the view `Conn` that
-    /// the scope's db-values name, so it lives until VM teardown.
-    scopes: std.ArrayList(*std.heap.ArenaAllocator) = .empty,
+    /// The views of finished `with` scopes: closed, kept allocated for
+    /// the db-values that name them, destroyed at VM teardown.
+    views: std.ArrayList(*Conn) = .empty,
 };
 
 /// The VM's state, created on first use.
@@ -153,11 +154,8 @@ pub fn state(vm: *VM) !*State {
 
 fn closeState(ptr: *anyopaque) void {
     const s: *State = @ptrCast(@alignCast(ptr));
-    for (s.scopes.items) |scope| {
-        scope.deinit();
-        s.gpa.destroy(scope);
-    }
-    s.scopes.deinit(s.gpa);
+    for (s.views.items) |view| view.destroy();
+    s.views.deinit(s.gpa);
     s.ir_cache.deinit();
     s.rules_cache.deinit();
     s.gpa.destroy(s);
@@ -179,6 +177,7 @@ pub fn errorKeyword(err: anyerror) []const u8 {
         error.NoEntity => "nextomic/no-entity",
         error.BasisInFuture => "nextomic/basis-in-future",
         error.Closed => "nextomic/closed",
+        error.Busy => "nextomic/busy",
         error.TxData => "nextomic/tx-data",
         error.Nested => "nextomic/nested",
         error.PullSyntax => "nextomic/pull-syntax",
@@ -294,9 +293,12 @@ fn connect(vm: *VM, args: []const Value) !Value {
     return handle.makeConn(vm.ensureHeap(), @ptrCast(c), path);
 }
 
+/// `(release conn)`: idempotent; `:nextomic/busy` while a query, pull,
+/// transaction or `with` on the connection is in flight, so nothing
+/// running holds cursors into a freed store.
 fn fnRelease(vm: *VM, args: []const Value) VmError!Value {
     const c = connOf(args[0]) catch |err| return fail(vm, err);
-    c.close();
+    c.release() catch |err| return fail(vm, err);
     return value.nilValue();
 }
 
@@ -497,7 +499,7 @@ fn transactNative(vm: *VM, args: []const Value) !Value {
 /// in the view's cache only.
 fn reportMap(vm: *VM, conn: *Conn, arena: Allocator, report: transact_mod.Report) !Value {
     const txn = try conn.beginReadTxn();
-    defer txn.abort();
+    defer conn.endReadTxn(txn);
     var b = Builder.init(vm, conn, txn);
 
     var tempids = try champ.mapEmpty(b.heap);
@@ -529,27 +531,22 @@ fn fnWith(vm: *VM, args: []const Value) VmError!Value {
 /// `(with conn tx-data f)`: apply tx-data in a held write transaction,
 /// call `f` with a db-value over the uncommitted state and the report
 /// `transact!` would have returned, then abort. Whatever `f` raises
-/// propagates after the abort. The scope's arena goes on the VM state:
-/// it holds the view `Conn` that `db-after`, and every db-value
-/// derived from it, name.
+/// propagates after the abort. The view goes on the VM state, since
+/// `db-after` and every db-value derived from it name it; the scope's
+/// scratch is freed on return.
 fn withNative(vm: *VM, args: []const Value) !Value {
     const c = try openConn(args[0]);
     const f = args[2];
     const st = try state(vm);
-    try st.scopes.ensureUnusedCapacity(vm.allocator, 1);
-    const scope = try vm.allocator.create(std.heap.ArenaAllocator);
-    scope.* = .init(vm.allocator);
-    const w = transact_mod.with(c, scope.allocator(), args[1], .{}) catch |err| {
-        scope.deinit();
-        vm.allocator.destroy(scope);
-        return err;
-    };
-    st.scopes.appendAssumeCapacity(scope);
-    defer w.finish();
-
+    try st.views.ensureUnusedCapacity(vm.allocator, 1);
     var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
     defer arena_state.deinit();
-    const report = try reportMap(vm, &w.view, arena_state.allocator(), w.report);
+    const arena = arena_state.allocator();
+    const w = try transact_mod.with(c, arena, args[1], .{});
+    st.views.appendAssumeCapacity(w.view);
+    defer w.finish();
+
+    const report = try reportMap(vm, w.view, arena, w.report);
     const db_after = try boxDb(vm.ensureHeap(), w.db());
     return vm.callValue(f, &.{ db_after, report });
 }
@@ -879,6 +876,7 @@ test "every nextomic error maps to its §7 keyword; engine errors to the db set"
         .{ .err = error.NoEntity, .name = "nextomic/no-entity" },
         .{ .err = error.BasisInFuture, .name = "nextomic/basis-in-future" },
         .{ .err = error.Closed, .name = "nextomic/closed" },
+        .{ .err = error.Busy, .name = "nextomic/busy" },
         .{ .err = error.TxData, .name = "nextomic/tx-data" },
         .{ .err = error.Nested, .name = "nextomic/nested" },
         .{ .err = error.PullSyntax, .name = "nextomic/pull-syntax" },

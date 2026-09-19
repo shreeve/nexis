@@ -95,19 +95,25 @@ One tag byte orders types; within a type, byte order equals value order.
 | `0x30` | keyword | `[ident-id:4]` |
 | `0x40` | ref | `[eid:6]` |
 | `0x50` | string ≤ 96 bytes | UTF-8 with `0x00 → 0x00 0xFF`, terminated by `0x00` |
-| `0x51` | string > 96 bytes | first 64 escaped bytes, `0x00`, then `xxh3-128` of the whole string |
+| `0x50` | string > 96 bytes | first 64 escaped bytes, `0x00`, `0x01`, then a 128-bit hash of the whole string |
 | `0x60` | uuid | 16 bytes |
-| `0x70` / `0x71` | bytes | as string / long string |
+| `0x70` | bytes | as string, both shapes |
 
 String order is UTF-8 byte order, which is code point order, not
 UTF-16 order; no Unicode normalization is applied. Type tags never
 compare equal across types, so `1` and `1.0` are different keys, in
 line with `(= 1 1.0)` being false.
 
-**Out-of-line values** (`0x51`, `0x71`): the index key is an equality
-key, not an order key. Range predicates over long strings are correct
-only on the 64-byte prefix and are refused by the planner
-(`:nextomic/unsupported-range`). The full value is stored in the
+**Out-of-line values** (strings and byte arrays over 96 bytes): the
+index key is an equality key, not an order key. A string or byte array
+has one tag whatever its length, so byte order equals value order
+across the threshold whenever two values differ within their first 64
+bytes; two values that agree on those 64 bytes order by hash when
+either is out of line. The decoder tells the shapes apart by the bare
+`0x00`: an inline value ends there, an out-of-line value continues with
+the `0x01` marker and the hash (the hash is two seeded xxh3-64 lanes).
+Range predicates over long strings are correct only on the 64-byte
+prefix and are refused by the planner (`:nextomic/unsupported-range`). The full value is stored in the
 `nx/eavt` value after the 6-byte `t` (and in `nx/eavt-h`); an AVET or
 AEVT hit on a long value is confirmed by an EAVT point read before it is
 returned. Two distinct values with the same 64-byte prefix and the same
@@ -146,18 +152,31 @@ so there is no queue; emdb's write lock is the transactor.
 1. `wtxn = env.beginWriteWith(.{ .sync = opt })`; `t = sys["t"] + 1`.
 2. **Normalise** tx-data to `[op e a v]`. Entities may be an eid, a
    tempid (string, or a negative fixnum), a lookup ref `[:unique/attr v]`,
-   a keyword ident, or `"datomic.tx"` for the transaction entity. Map
+   a keyword ident, or `"datomic.tx"` for the transaction entity. An
+   explicit eid, as an entity or as a ref value, must have been handed
+   out by its partition's allocator (a user id below `sys/"eid"`, an
+   ident id below `sys/"aid"`, a transaction entity no newer than this
+   transaction); any other id is `:nextomic/no-entity`, since it would
+   collide with an id minted later. An allocated entity whose datoms
+   were all retracted stays addressable. Map
    forms `{:db/id e :attr v ...}` expand; nested maps under component or
    ref attributes become entities with fresh tempids; vectors under
-   card-many attributes expand to one datom each.
+   card-many attributes expand to one datom each, except that under a
+   ref attribute a two-element vector whose first element names an
+   attribute is one lookup ref (`{:user/friends [:user/email "a@x"]}`
+   is one friend; `[[:user/email "a@x"] "tmp"]` is two).
 3. **Resolve** attributes through the ident cache (unknown →
    `:nextomic/unknown-attribute`); validate each `v` against the
    attribute's `:db/valueType`; mint ident ids for new keyword values
    inside `wtxn`. Resolve lookup refs and unique-identity tempids by an
    AVET probe **through `wtxn`** so datoms earlier in the same
-   transaction are visible. A unique-value collision with a different
-   entity is `:nextomic/unique`. Remaining tempids take eids from
-   `sys/"eid"`, read once and bumped once.
+   transaction are visible. A unique-identity claim whose value is a
+   tempid or a lookup ref upserts once the value is known: a tempid
+   bound by its own identity, a lookup ref found in the tree or naming
+   an identity asserted anywhere in the same transaction; claims on an
+   entity the transaction creates unify their tempids. A unique-value
+   collision with a different entity is `:nextomic/unique`. Remaining
+   tempids take eids from `sys/"eid"`, read once and bumped once.
 4. **Expand**: a card-one assertion whose current value differs writes
    the retraction of the old value and the assertion of the new one in
    this `t`; asserting an already-current datom writes nothing; two
@@ -175,14 +194,16 @@ so there is no queue; emdb's write lock is the transactor.
    then AEVT, then AVET and VAET after sorting the batch (better leaf
    fill for random-order keys). Then `nx/txlog[t]`, then `sys` counters
    including `"t"`.
-6. Append `[tx-entity :db/txInstant now]` as a datom of this transaction.
+6. Append `[tx-entity :db/txInstant now]` as a datom of this transaction,
+   unless the tx-data asserted `:db/txInstant` on `"datomic.tx"` itself:
+   that instant stands, in the datom and in the txlog entry.
 7. `wtxn.commit()`. On any error `wtxn.abort()`: nothing partial can
    exist (emdb INV-SUB04).
 8. Return `{:db-before db :db-after db :tx t :tempids {..} :tx-data
    [[e a v t added] ...]}` with `db-after.basis = t`.
 
-Schema changes are ordinary transactions on attribute entities. In v1
-schema is additive: an attribute's value type and cardinality never
+Schema changes are ordinary transactions on attribute entities. Schema
+is additive: an attribute's value type and cardinality never
 change once written; `:db/index` and `:db/unique` may be added to an
 attribute (the transaction that adds them backfills AVET from AEVT).
 
@@ -196,6 +217,14 @@ batches the meta flush; `:none` is for bulk loads followed by
 
 `(d/db conn)` opens a pooled read transaction, reads `sys["t"]` as the
 basis, closes it, and returns `{store, basis, mode = current}`.
+
+A connection counts its operations in flight (reads, a `transact!`, a
+held `with`). `release` refuses while the count is nonzero
+(`:nextomic/busy`); closing a connection at teardown while it is busy
+marks it closed at once and frees the store when the last operation
+ends, so no cursor in flight dangles. A closed connection keeps its
+struct for as long as db-values can name it; every operation on them
+is `:nextomic/closed`.
 
 Every operation on a db-value opens one read transaction, reads
 `sys["t"]` as `now`, and:
@@ -212,7 +241,8 @@ Every operation on a db-value opens one read transaction, reads
   state: an entity asserted before T and untouched since is invisible;
   a fact retracted after T shows nothing.
 - **history**: history trees, every datom with `t ≤ basis`, no fold,
-  each with its `added` flag. `history ∘ as-of` composes.
+  each with its `added` flag. `history` composes with `as-of` and with
+  `since` (`history ∘ since T`: every datom with `T < t ≤ basis`).
 
 **The fold.** Walk from `setRange(prefix)` while the key carries the
 prefix; consecutive keys with equal `(e a v)` form a group in ascending
@@ -256,7 +286,16 @@ runs:
 | `a` + `v`, not indexed | AEVT `[a]` + filter | entries of `a` |
 | `v` ref, `a` optional | VAET `[v][a?]` | small |
 | `a` only | AEVT `[a]` | entries of `a` |
+| `a` a bound variable (id or ident) | AEVT `[a]` + filter | entries / attributes |
+| `v` only, not a ref | AEVT, every datom + filter | entries of AEVT |
 | nothing | refused (`:nextomic/unbound-pattern`) | |
+
+A value with no attribute is a ref when it can be an entity id (an
+integer, a lookup ref, or a variable at plan time); a variable whose cell
+turns out to be a string, keyword, double or boolean falls back at run
+time to the scan of every datom. That scan costs the whole database and
+is the price of `[?e _ ?v]` without an attribute; give the attribute
+when it is known.
 
 Clauses are ordered greedily by estimate given the variables bound so
 far; predicates run at the first point all their variables are bound.
@@ -300,7 +339,7 @@ sub-plans with the same output variables.
 | form | semantics |
 |---|---|
 | `(d/connect path)` / `(d/connect path {:sync ...})` | open or create, bootstrap on first open, cache idents and schema; returns a connection |
-| `(d/release conn)` | close, idempotent |
+| `(d/release conn)` | close, idempotent; `:nextomic/busy` while a query, pull, `transact!` or `with` on the connection is in flight (a released connection keeps its struct, so its db-values raise `:nextomic/closed`) |
 | `(d/db conn)` | db-value at the current basis |
 | `(d/basis-t db)` | the basis |
 | `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report |
@@ -338,8 +377,10 @@ All errors are keywords in the `nextomic` namespace and are catchable:
 `:nextomic/unknown-attribute`, `:nextomic/value-type`,
 `:nextomic/unique`, `:nextomic/conflict`, `:nextomic/no-entity`,
 `:nextomic/unbound-pattern`, `:nextomic/unsupported-range`,
-`:nextomic/basis-in-future`, `:nextomic/closed`, `:nextomic/tx-data`
-for malformed tx-data or a lookup ref on a non-unique attribute,
+`:nextomic/basis-in-future`, `:nextomic/closed`, `:nextomic/busy`
+(`release` while an operation on the connection is in flight),
+`:nextomic/tx-data` for malformed tx-data or a lookup ref on a
+non-unique attribute,
 `:nextomic/history-view` (pull on a history db) and `:nextomic/nested`
 (`transact!` or `with` while a `with` holds the write transaction). Two
 carry their reason as a map: a query syntax error throws
