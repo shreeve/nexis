@@ -37,6 +37,7 @@ const RuleSet = ir.RuleSet;
 const Ctx = plan_mod.Ctx;
 const Plan = plan_mod.Plan;
 const Step = plan_mod.Step;
+const Failure = plan_mod.Failure;
 const Relation = relation.Relation;
 
 /// Planner cost of a recursive rule call: after every pattern that
@@ -200,14 +201,14 @@ fn collectRuleCalls(arena: Allocator, clauses: []const Clause, name: u32, out: *
 // =============================================================================
 
 fn defsOf(ctx: *Ctx, name: u32, args: []const ir.Arg) ![]const ir.Rule {
-    const defs = ctx.rules.byName(name) orelse return error.QuerySyntax;
-    if (defs[0].head.len != args.len) return error.QuerySyntax;
+    const defs = ctx.rules.byName(name) orelse return ctx.syntax("unknown rule");
+    if (defs[0].head.len != args.len) return ctx.syntax("a rule is called with the wrong number of arguments");
     return defs;
 }
 
 /// The planner's cost for calling `name`, or null while a required
 /// argument is unbound.
-pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: []const Var) anyerror!?u64 {
+pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: []const Var) Failure!?u64 {
     const defs = try defsOf(ctx, name, args);
     for (args[0..defs[0].required]) |a| {
         if (a == .variable and !ir.containsVar(bound, a.variable)) return null;
@@ -219,7 +220,7 @@ pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: []const V
 
 /// Append the steps of a rule call: grounding binds for constant
 /// arguments, then an `or` (non-recursive) or a `fix` (recursive).
-pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) anyerror!void {
+pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
     const defs = try defsOf(ctx, name, args);
     const arg_vars = try ctx.arena.alloc(Var, args.len);
     for (args, arg_vars) |a, *v| {
@@ -232,11 +233,11 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: *std.ArrayLis
                 try bound.append(ctx.arena, fresh);
                 break :blk fresh;
             },
-            .src => return error.QuerySyntax,
+            .src => return ctx.syntax("$ cannot be a rule argument"),
         };
     }
     for (arg_vars[0..defs[0].required]) |v| {
-        if (!ir.containsVar(bound.items, v)) return error.QuerySyntax;
+        if (!ir.containsVar(bound.items, v)) return ctx.syntax("a required rule argument is unbound");
     }
 
     const info = try ctx.ruleInfo();
@@ -289,7 +290,7 @@ pub const Fix = struct {
     fresh: []const Var,
 };
 
-fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, bound: []const Var, rows: u64) anyerror!Fix {
+fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, bound: []const Var, rows: u64) Failure!Fix {
     const info = try ctx.ruleInfo();
     const members = try info.members(ctx.arena, name);
 
@@ -413,13 +414,13 @@ const Renamer = struct {
         return out;
     }
 
-    fn clauses(self: *Renamer, cs: []const Clause) anyerror![]Clause {
+    fn clauses(self: *Renamer, cs: []const Clause) Failure![]Clause {
         var out: std.ArrayList(Clause) = .empty;
         for (cs) |c| try self.clause(c, &out);
         return out.toOwnedSlice(self.ctx.arena);
     }
 
-    fn clause(self: *Renamer, c: Clause, out: *std.ArrayList(Clause)) anyerror!void {
+    fn clause(self: *Renamer, c: Clause, out: *std.ArrayList(Clause)) Failure!void {
         const arena = self.ctx.arena;
         switch (c) {
             .pattern => |p| try out.append(arena, .{ .pattern = .{
@@ -455,7 +456,7 @@ const Renamer = struct {
                                 try out.append(arena, .{ .bind = .{ .call = g, .out = .{ .scalar = fresh } } });
                                 break :blk fresh;
                             },
-                            .src => return error.QuerySyntax,
+                            .src => return self.ctx.syntax("$ cannot be a rule argument"),
                         };
                         const slot = try arena.create(plan_mod.SourceSlot);
                         slot.* = .{};
@@ -536,27 +537,7 @@ pub fn execFix(ex: *exec_mod.Exec, fix: *const Fix, rel: Relation) anyerror!Rela
     }
 
     // Rename the target's rows to the call's arguments.
-    const total = &totals[fix.target].rel;
-    var distinct: std.ArrayList(Var) = .empty;
-    for (fix.args) |a| try ir.addVar(arena, &distinct, a);
-    var result: Relation = undefined;
-    if (distinct.items.len == fix.args.len) {
-        result = .{ .arena = arena, .vars = fix.args, .cols = total.cols, .rows = total.rows };
-    } else {
-        result = try Relation.init(arena, distinct.items);
-        const cells = try arena.alloc(relation.Cell, distinct.items.len);
-        var i: usize = 0;
-        rows: while (i < total.rows) : (i += 1) {
-            for (fix.args, 0..) |a, pos| {
-                const c = total.cell(i, pos);
-                const d = std.mem.indexOfScalar(Var, distinct.items, a).?;
-                if (pos == std.mem.indexOfScalar(Var, fix.args, a).?) {
-                    cells[d] = c;
-                } else if (!cells[d].eql(c)) continue :rows;
-            }
-            try result.append(cells);
-        }
-    }
+    const result = try Relation.viewAs(arena, fix.args, &totals[fix.target].rel);
     return rel.hashJoin(&result);
 }
 
@@ -614,7 +595,7 @@ test "call graph: self loop, mutual recursion, acyclic" {
         .{ .name = 4, .required = 0, .head = &.{}, .body = &.{ call.c(1), call.c(2) } },
         .{ .name = 5, .required = 0, .head = &.{}, .body = &.{} },
     };
-    const set: RuleSet = .{ .arena_state = undefined, .vars = &.{}, .rules = &rules };
+    const set: RuleSet = .{ .arena_state = null, .vars = &.{}, .rules = &rules };
     const info = try analyze(arena, &set);
     try testing.expect(info.isRecursive(1));
     try testing.expect(info.isRecursive(2) and info.isRecursive(3));
@@ -636,7 +617,7 @@ test "pass-through positions" {
             .{ .pattern = .{ .e = .{ .variable = 2 }, .a = .blank, .v = .{ .variable = 1 } } },
         } },
     };
-    const set: RuleSet = .{ .arena_state = undefined, .vars = &.{}, .rules = &rules };
+    const set: RuleSet = .{ .arena_state = null, .vars = &.{}, .rules = &rules };
     try testing.expect(try passThrough(arena, &set, 1, 0));
     try testing.expect(!try passThrough(arena, &set, 1, 1));
 }

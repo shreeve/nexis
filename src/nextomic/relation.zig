@@ -103,6 +103,13 @@ pub const Cell = union(enum) {
         };
     }
 
+    /// The order of two values of one type (numbers are one type), or
+    /// null when they are not comparable.
+    pub fn compare(a: Cell, b: Cell) ?std.math.Order {
+        if (a.rank() != b.rank()) return null;
+        return a.order(b);
+    }
+
     /// A total order: nil < booleans < numbers < strings < keywords <
     /// other VM values. Numbers compare numerically across int and
     /// double; strings by bytes; keywords by intern id; VM values by
@@ -164,13 +171,6 @@ pub const Column = union(enum) {
     cell: std.ArrayList(Cell),
 
     pub const empty: Column = .{ .int = .empty };
-
-    pub fn len(self: *const Column) usize {
-        return switch (self.*) {
-            .int => |c| c.items.len,
-            .cell => |c| c.items.len,
-        };
-    }
 
     pub fn get(self: *const Column, i: usize) Cell {
         return switch (self.*) {
@@ -256,6 +256,14 @@ pub const Relation = struct {
         self.rows += 1;
     }
 
+    /// Append row `row` of `src`, whose columns are this relation's
+    /// columns in the same order.
+    pub fn copyRow(self: *Relation, src: *const Relation, row: usize) !void {
+        std.debug.assert(src.cols.len == self.cols.len);
+        for (self.cols, 0..) |*c, i| try c.append(self.arena, src.cell(row, i));
+        self.rows += 1;
+    }
+
     /// Column indexes in `src` of this relation's variables.
     pub fn mapFrom(self: *const Relation, src: *const Relation) ![]usize {
         const map = try self.arena.alloc(usize, self.vars.len);
@@ -284,7 +292,7 @@ pub const Relation = struct {
     }
 
     /// The set of distinct row indexes of `self`, as a hash index from
-    /// row hash to the first row with that content.
+    /// row hash to the rows with that hash, compared for equality.
     const RowSet = struct {
         rel: *const Relation,
         map: std.AutoHashMapUnmanaged(u64, std.ArrayList(usize)) = .empty,
@@ -317,8 +325,7 @@ pub const Relation = struct {
         var seen: RowSet = .{ .rel = &out };
         var i: usize = 0;
         while (i < self.rows) : (i += 1) {
-            const map = identityMap(self.cols.len);
-            try out.appendFrom(self, i, map[0..self.cols.len]);
+            try out.copyRow(self, i);
             if (!try seen.insert(self.arena, out.rows - 1)) try out.dropLast();
         }
         return out;
@@ -377,28 +384,36 @@ pub const Relation = struct {
 
         const keyed = try self.project(on, false);
         var out = try init(self.arena, self.vars);
-        const map = identityMap(self.cols.len);
         i = 0;
         while (i < self.rows) : (i += 1) {
-            if (!index.contains(&keyed, i, keyed.rowHash(i))) try out.appendFrom(self, i, map[0..self.cols.len]);
+            if (!index.contains(&keyed, i, keyed.rowHash(i))) try out.copyRow(self, i);
         }
         return out;
     }
 
-    /// The rows of `self` whose values on `on` appear in `other`
-    /// (the semi-join).
-    pub fn semiJoin(self: *const Relation, other: *const Relation, on: []const Var) !Relation {
-        const probe = try other.project(on, true);
-        var index: RowSet = .{ .rel = &probe };
+    /// `src` seen through `vars`, one per column of `src`: the relation
+    /// over the distinct variables whose rows are those of `src` on
+    /// which a repeated variable's columns agree. Without repeats it
+    /// borrows the columns.
+    pub fn viewAs(arena: Allocator, vars: []const Var, src: *const Relation) !Relation {
+        std.debug.assert(vars.len == src.cols.len);
+        var distinct: std.ArrayList(Var) = .empty;
+        for (vars) |v| {
+            if (std.mem.indexOfScalar(Var, distinct.items, v) == null) try distinct.append(arena, v);
+        }
+        if (distinct.items.len == vars.len) return .{ .arena = arena, .vars = vars, .cols = src.cols, .rows = src.rows };
+        var out = try init(arena, distinct.items);
+        const cells = try arena.alloc(Cell, distinct.items.len);
         var i: usize = 0;
-        while (i < probe.rows) : (i += 1) _ = try index.insert(self.arena, i);
-
-        const keyed = try self.project(on, false);
-        var out = try init(self.arena, self.vars);
-        const map = identityMap(self.cols.len);
-        i = 0;
-        while (i < self.rows) : (i += 1) {
-            if (index.contains(&keyed, i, keyed.rowHash(i))) try out.appendFrom(self, i, map[0..self.cols.len]);
+        rows: while (i < src.rows) : (i += 1) {
+            for (vars, 0..) |v, pos| {
+                const d = std.mem.indexOfScalar(Var, distinct.items, v).?;
+                const c = src.cell(i, pos);
+                if (std.mem.indexOfScalar(Var, vars, v).? == pos) {
+                    cells[d] = c;
+                } else if (!cells[d].eql(c)) continue :rows;
+            }
+            try out.append(cells);
         }
         return out;
     }
@@ -444,14 +459,13 @@ pub const Relation = struct {
         const self_key = try self.project(on, false);
         const extra_map = try self.arena.alloc(usize, extra.len);
         for (extra, extra_map) |v, *m| m.* = other.colOf(v).?;
-        const self_map = identityMap(self.cols.len);
 
         i = 0;
         while (i < self.rows) : (i += 1) {
             const bucket = index.get(self_key.rowHash(i)) orelse continue;
             for (bucket.items) |j| {
                 if (!self_key.rowsEql(i, &other_key, j)) continue;
-                for (out.cols[0..self.cols.len], self_map[0..self.cols.len]) |*c, sc| try c.append(self.arena, self.cell(i, sc));
+                for (out.cols[0..self.cols.len], 0..) |*c, sc| try c.append(self.arena, self.cell(i, sc));
                 for (out.cols[self.cols.len..], extra_map) |*c, oc| try c.append(self.arena, other.cell(j, oc));
                 out.rows += 1;
             }
@@ -534,22 +548,6 @@ pub const Accumulator = struct {
     }
 };
 
-const max_identity = 64;
-const identity_table = blk: {
-    var t: [max_identity]usize = undefined;
-    for (&t, 0..) |*x, i| x.* = i;
-    break :blk t;
-};
-
-/// `0..n` as a slice; relations have at most `max_identity` columns.
-fn identityMap(n: usize) []const usize {
-    std.debug.assert(n <= max_identity);
-    return identity_table[0..n];
-}
-
-/// The largest number of variables one relation can carry.
-pub const max_vars = max_identity;
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -594,7 +592,6 @@ test "column widens from int to cell" {
     try testing.expect(c == .int);
     try c.append(arena, .{ .str = "x" });
     try testing.expect(c == .cell);
-    try testing.expectEqual(@as(usize, 3), c.len());
     try testing.expect(c.get(0).eql(.{ .int = 1 }));
     try testing.expect(c.get(2).eql(.{ .str = "x" }));
 }
@@ -628,8 +625,6 @@ test "dedup, project, union, difference, sort" {
     const diff = try r.difference(&s, &.{0});
     try testing.expectEqual(@as(usize, 1), diff.rows);
     try testing.expect(diff.cell(0, 0).eql(.{ .int = 2 }));
-    const semi = try r.semiJoin(&s, &.{0});
-    try testing.expectEqual(@as(usize, 3), semi.rows);
 
     var sorted = try r.dedup();
     try sorted.sort();
@@ -639,6 +634,48 @@ test "dedup, project, union, difference, sort" {
     var again = try r.dedup();
     try again.sort();
     try testing.expect(sorted.eqlRows(&again));
+}
+
+test "viewAs collapses repeated variables" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const src = try rel(arena, &.{ 0, 1, 2 }, &.{
+        &.{ .{ .int = 1 }, .{ .int = 1 }, .{ .int = 3 } },
+        &.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 } },
+        &.{ .{ .int = 2 }, .{ .int = 2 }, .{ .int = 2 } },
+    });
+    const same = try Relation.viewAs(arena, &.{ 7, 8, 9 }, &src);
+    try testing.expectEqual(@as(usize, 3), same.rows);
+    try testing.expectEqualSlices(Var, &.{ 7, 8, 9 }, same.vars);
+    const folded = try Relation.viewAs(arena, &.{ 7, 7, 9 }, &src);
+    try testing.expectEqual(@as(usize, 2), folded.rows);
+    try testing.expectEqualSlices(Var, &.{ 7, 9 }, folded.vars);
+    try testing.expect(folded.cell(1, 1).eql(.{ .int = 2 }));
+    const all = try Relation.viewAs(arena, &.{ 7, 7, 7 }, &src);
+    try testing.expectEqual(@as(usize, 1), all.rows);
+}
+
+test "a relation has no column cap" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const n = 100;
+    var vars: [n]Var = undefined;
+    for (&vars, 0..) |*v, i| v.* = @intCast(i);
+    var row: [n]Cell = undefined;
+    for (&row, 0..) |*c, i| c.* = .{ .int = @intCast(i) };
+    var r = try Relation.init(arena, &vars);
+    try r.append(&row);
+    try r.append(&row);
+    const d = try r.dedup();
+    try testing.expectEqual(@as(usize, 1), d.rows);
+    const none = try rel(arena, vars[0..1], &.{});
+    const diff = try d.difference(&none, vars[0..1]);
+    try testing.expectEqual(@as(usize, 1), diff.rows);
+    const j = try d.hashJoin(&d);
+    try testing.expectEqual(@as(usize, 1), j.rows);
+    try testing.expectEqual(@as(usize, n), j.cols.len);
 }
 
 test "hash join on shared vars and cross product" {

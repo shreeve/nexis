@@ -1,31 +1,31 @@
 //! transact.zig — the transaction protocol (NEXTOMIC.md §3).
 //!
 //! One `transact` is one emdb write transaction; emdb's write lock is
-//! the transactor. The pipeline:
+//! the transactor. The pipeline, named as the banners below name it:
 //!
-//!   1. begin the write transaction, `t = sys["t"] + 1`;
-//!   2. normalise tx-data to ops (vector forms, map forms with nested
-//!      entities and card-many collections), resolving attributes through
-//!      the schema at `now` and converting values by the attribute's type;
-//!   3. bind tempids: `:db/ident` binds to the ident's id (minting it),
-//!      unique-identity assertions upsert through an AVET probe (a
-//!      tempid- or lookup-ref-valued claim once its value is known),
-//!      two tempids naming one identity unify, the rest take fresh eids;
-//!   4. expand ops in order against the committed trees plus the
-//!      transaction's own overlay: card-one implicit retracts, no-op
-//!      re-assertions, conflicts, unique-value collisions, lookup refs,
-//!      retract-attribute, retract-entity with VAET cleanup and component
-//!      cascade, then the `:db/txInstant` datom unless the tx-data
-//!      asserted one on the transaction entity;
-//!   5. validate schema changes and backfill AVET for attributes that
-//!      become indexed or unique;
-//!   6. write the eight index trees, the txlog, the counts and `sys`;
-//!   7. commit, then publish minted idents to the cache.
+//!   - begin: the write transaction, `t = sys["t"] + 1`;
+//!   - normalise: tx-data to ops (vector forms, map forms with nested
+//!     entities and card-many collections), resolving attributes through
+//!     the schema at `now` and converting values by the attribute's type;
+//!   - tempids: `:db/ident` binds to the ident's id (minting it),
+//!     unique-identity assertions upsert through an AVET probe (a
+//!     tempid- or lookup-ref-valued claim once its value is known),
+//!     two tempids naming one identity unify, the rest take fresh eids;
+//!   - expand: ops in order against the committed trees plus the
+//!     transaction's own overlay: card-one implicit retracts, no-op
+//!     re-assertions, conflicts, unique-value collisions, lookup refs,
+//!     retract-attribute, retract-entity with VAET cleanup and component
+//!     cascade, then the `:db/txInstant` datom unless the tx-data
+//!     asserted one on the transaction entity;
+//!   - schema: validate schema changes and backfill AVET for attributes
+//!     that become indexed or unique;
+//!   - write: the eight index trees, the txlog, the counts and `sys`;
+//!   - commit: then publish minted idents to the cache.
 //!
 //! Any error aborts the write transaction; nothing partial can exist.
 //! Everything the transaction allocates lives in the caller's arena.
 //!
-//! A speculative `with` runs steps 1-6 and stops: the write transaction
+//! A speculative `with` stops before the commit: the write transaction
 //! stays open, a view connection reads it through read-only children,
 //! and `finish` aborts it. Only one write transaction exists per store,
 //! so `transact` and `with` are `error.Nested` while one is held.
@@ -44,6 +44,7 @@ const store_mod = @import("store.zig");
 const idents_mod = @import("idents.zig");
 const schema_mod = @import("schema.zig");
 const db_mod = @import("db.zig");
+const marshal = @import("marshal.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -54,6 +55,7 @@ const Schema = schema_mod.Schema;
 const Attr = schema_mod.Attr;
 const Conn = db_mod.Conn;
 const DbValue = db_mod.DbValue;
+const Fault = db_mod.Fault;
 const Val = key.Val;
 const Datom = datom_mod.Datom;
 const boot = store_mod.boot;
@@ -69,11 +71,17 @@ pub const Error = error{
     Nested,
 };
 
+/// Everything a transaction can fail with: its own errors, the
+/// db-value's, the value contract's and the store's.
+pub const Failure = Error || db_mod.Error || marshal.Error || db_mod.ErrorsOf(Minter.lookup) || db_mod.ErrorsOf(Minter.resolve) || db_mod.ErrorsOf(Minter.lookupName) || db_mod.ErrorsOf(Store.scan) || db_mod.ErrorsOf(Txn.getFromTree) || db_mod.ErrorsOf(Store.currentPayload) || db_mod.ErrorsOf(champ.mapEmpty);
+
 pub const Options = struct {
     /// Overrides the connection's sync mode for this commit.
     sync: ?SyncMode = null,
     /// Wall-clock milliseconds for `:db/txInstant`; the clock when null.
     now_ms: ?i64 = null,
+    /// Filled with what a failing step was looking at.
+    fault: ?*Fault = null,
 };
 
 /// A tempid as the caller wrote it.
@@ -309,6 +317,7 @@ const Ctx = struct {
     sync_mode: SyncMode,
     schema: *Schema,
     minter: Minter,
+    fault: ?*Fault,
     finished: bool = false,
 
     bindings: std.ArrayList(Binding) = .empty,
@@ -358,8 +367,41 @@ const Ctx = struct {
             .sync_mode = sync_mode,
             .schema = schema,
             .minter = try Minter.init(&conn.idents, txn, arena),
+            .fault = options.fault,
             .next_eid = try conn.store.readNextEid(txn),
         };
+    }
+
+    // ── faults ────────────────────────────────────────────────────
+
+    /// `Unique`: `attr` already holds `v` on another entity.
+    fn unique(self: *Ctx, attr: Attr, v: ?Val) error{Unique} {
+        if (self.fault) |f| f.* = .{ .attr = self.attrValue(attr.id), .value = v };
+        return error.Unique;
+    }
+
+    /// `Conflict`: two claims about `(e a)` in one transaction.
+    fn conflict(self: *Ctx, e: u64, a: u32) error{Conflict} {
+        if (self.fault) |f| f.* = .{ .attr = self.attrValue(a), .e = e };
+        return error.Conflict;
+    }
+
+    /// `UnknownAttribute` for the attribute a program named as `attr`.
+    fn unknownAttr(self: *Ctx, attr: Value) error{UnknownAttribute} {
+        if (self.fault) |f| f.* = .{ .attr = attr };
+        return error.UnknownAttribute;
+    }
+
+    /// `TxData` with the reason.
+    fn malformed(self: *Ctx, message: []const u8) error{TxData} {
+        if (self.fault) |f| f.* = .{ .message = message };
+        return error.TxData;
+    }
+
+    /// The attribute as a program names it: its ident, else its id.
+    fn attrValue(self: *Ctx, a: u32) ?Value {
+        const k = (self.conn.idents.internOf(self.txn, a) catch null) orelse return value.fromFixnum(a);
+        return value.fromKeywordId(k);
     }
 
     fn abort(self: *Ctx) void {
@@ -372,13 +414,14 @@ const Ctx = struct {
     // ── attributes ────────────────────────────────────────────────
 
     fn attrById(self: *Ctx, id: u32) !Attr {
-        const a = self.schema.attr(id) orelse return error.UnknownAttribute;
+        const a = self.schema.attr(id) orelse return self.unknownAttr(value.fromFixnum(id) orelse unreachable);
         return a.*;
     }
 
     fn attrByIntern(self: *Ctx, intern_id: u32) !Attr {
-        const id = (try self.minter.lookup(intern_id)) orelse return error.UnknownAttribute;
-        return self.attrById(id);
+        const id = (try self.minter.lookup(intern_id)) orelse return self.unknownAttr(value.fromKeywordId(intern_id));
+        const a = self.schema.attr(id) orelse return self.unknownAttr(value.fromKeywordId(intern_id));
+        return a.*;
     }
 
     fn attrOf(self: *Ctx, ref: AttrRef) !Attr {
@@ -480,8 +523,7 @@ const Ctx = struct {
     }
 
     fn lookupAttr(self: *Ctx, attr: Attr, v: Val) !Attr {
-        _ = self;
-        if (attr.unique == .none) return error.TxData;
+        if (attr.unique == .none) return self.malformed("a lookup ref needs a unique attribute");
         if (v.valueType() != attr.value_type) return error.ValueType;
         return attr;
     }
@@ -545,7 +587,7 @@ const Ctx = struct {
                 var it = list_mod.Cursor.init(tx_data);
                 while (it.next()) |form| try self.normaliseForm(form);
             },
-            else => return error.TxData,
+            else => return self.malformed("tx-data is a vector or a list of forms"),
         }
     }
 
@@ -553,15 +595,15 @@ const Ctx = struct {
         switch (form.kind()) {
             .persistent_vector => {
                 const n = vector_mod.count(form);
-                if (n < 2) return error.TxData;
+                if (n < 2) return self.malformed("a vector form is [op e ...]");
                 const op = vector_mod.nth(form, 0);
                 if (self.kwIs(op, "db/add")) {
-                    if (n != 4) return error.TxData;
+                    if (n != 4) return self.malformed(":db/add is [:db/add e a v]");
                     const attr = try self.attrFromVm(vector_mod.nth(form, 2));
                     const e = try self.entityFromVm(vector_mod.nth(form, 1));
                     try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, vector_mod.nth(form, 3)) } });
                 } else if (self.kwIs(op, "db/retract")) {
-                    if (n != 3 and n != 4) return error.TxData;
+                    if (n != 3 and n != 4) return self.malformed(":db/retract is [:db/retract e a] or [:db/retract e a v]");
                     const attr = try self.attrFromVm(vector_mod.nth(form, 2));
                     const e = try self.entityFromVm(vector_mod.nth(form, 1));
                     if (n == 3) {
@@ -570,19 +612,19 @@ const Ctx = struct {
                         try self.ops.append(self.arena, .{ .retract = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, vector_mod.nth(form, 3)) } });
                     }
                 } else if (self.kwIs(op, "db/retractEntity")) {
-                    if (n != 2) return error.TxData;
+                    if (n != 2) return self.malformed(":db/retractEntity is [:db/retractEntity e]");
                     try self.ops.append(self.arena, .{ .retract_entity = try self.entityFromVm(vector_mod.nth(form, 1)) });
-                } else return error.TxData;
+                } else return self.malformed("unknown op; one of :db/add, :db/retract, :db/retractEntity");
             },
-            .persistent_map => _ = try self.normaliseMap(form, null),
-            else => return error.TxData,
+            .persistent_map => _ = try self.normaliseMap(form),
+            else => return self.malformed("a form is a vector or a map"),
         }
     }
 
-    /// Expand a map form into adds; returns the entity. `parent` is the
-    /// attribute under which a nested map appeared.
-    fn normaliseMap(self: *Ctx, m: Value, parent: ?Attr) anyerror!Ent {
-        _ = parent;
+    /// Expand a map form into adds; returns the entity. A key
+    /// `:ns/_attr` is a reverse ref: its value names the entities that
+    /// refer to this one through `:ns/attr`.
+    fn normaliseMap(self: *Ctx, m: Value) Failure!Ent {
         var ent: ?Ent = null;
         var it = champ.mapIter(m);
         while (it.next()) |entry| {
@@ -596,17 +638,65 @@ const Ctx = struct {
         var it2 = champ.mapIter(m);
         while (it2.next()) |entry| {
             if (self.kwIs(entry.key, "db/id")) continue;
-            const attr = try self.attrFromVm(entry.key);
             const v = entry.value;
+            if (try self.reverseAttr(entry.key)) |attr| {
+                if (isCollection(v) and !try self.isLookupRef(v)) {
+                    for (try collectionElements(self.arena, v)) |el| try self.addReverse(e, attr, el);
+                } else {
+                    try self.addReverse(e, attr, v);
+                }
+                continue;
+            }
+            const attr = try self.attrFromVm(entry.key);
             if (attr.many() and isCollection(v) and !(attr.value_type == .ref and try self.isLookupRef(v))) {
-                var elems = try collectionElements(self.arena, v);
-                for (elems[0..]) |el| try self.addFromVm(e, attr, el);
-                elems = &.{};
+                for (try collectionElements(self.arena, v)) |el| try self.addFromVm(e, attr, el);
             } else {
                 try self.addFromVm(e, attr, v);
             }
         }
         return e;
+    }
+
+    /// The ref attribute a `:ns/_attr` key reverses, or null for any
+    /// other key.
+    fn reverseAttr(self: *Ctx, k: Value) !?Attr {
+        if (k.kind() != .keyword) return null;
+        const name = self.conn.interner.keywordName(k.asKeywordId());
+        const slash = std.mem.indexOfScalar(u8, name, '/') orelse return null;
+        if (slash + 1 >= name.len or name[slash + 1] != '_') return null;
+        const forward = try std.mem.concat(self.arena, u8, &.{ name[0 .. slash + 1], name[slash + 2 ..] });
+        const id = (try self.minter.lookupName(forward)) orelse return self.unknownAttr(k);
+        const attr = self.schema.attr(id) orelse return self.unknownAttr(k);
+        if (attr.value_type != .ref) return self.malformed("a reverse ref needs a ref attribute");
+        return attr.*;
+    }
+
+    /// `[referrer attr e]` for one value under a reverse ref: an entity,
+    /// or a map form of one.
+    fn addReverse(self: *Ctx, e: Ent, attr: Attr, referrer: Value) Failure!void {
+        const from = if (referrer.kind() == .persistent_map) try self.normaliseMap(referrer) else try self.entityFromVm(referrer);
+        try self.ops.append(self.arena, .{ .add = .{ .e = from, .attr = attr, .v = pvalOf(e) } });
+    }
+
+    fn pvalOf(e: Ent) PVal {
+        return switch (e) {
+            .eid => |id| .{ .val = .{ .ref = id } },
+            .tempid => |i| .{ .tempid = i },
+            .lookup => |l| .{ .lookup = l },
+        };
+    }
+
+    /// Does a map form name its entity: a `:db/id`, or a unique
+    /// attribute?
+    fn carriesIdentity(self: *Ctx, m: Value) !bool {
+        var it = champ.mapIter(m);
+        while (it.next()) |entry| {
+            if (self.kwIs(entry.key, "db/id")) return true;
+            if (entry.key.kind() != .keyword) continue;
+            const attr = self.attrFromVm(entry.key) catch continue;
+            if (attr.unique != .none) return true;
+        }
+        return false;
     }
 
     /// Under a ref attribute a two-element vector whose first element is
@@ -620,15 +710,14 @@ const Ctx = struct {
         return self.schema.attr(id) != null;
     }
 
-    fn addFromVm(self: *Ctx, e: Ent, attr: Attr, v: Value) anyerror!void {
+    /// One value under `attr`. A nested map under a ref attribute is an
+    /// entity; unless the attribute is a component it must carry an
+    /// identity, or nothing could ever reach it.
+    fn addFromVm(self: *Ctx, e: Ent, attr: Attr, v: Value) Failure!void {
         if (v.kind() == .persistent_map and attr.value_type == .ref) {
-            const nested = try self.normaliseMap(v, attr);
-            const pv: PVal = switch (nested) {
-                .eid => |id| .{ .val = .{ .ref = id } },
-                .tempid => |i| .{ .tempid = i },
-                .lookup => |l| .{ .lookup = l },
-            };
-            try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = pv } });
+            if (!attr.component and !try self.carriesIdentity(v)) return self.malformed("a nested map under a non-component ref needs :db/id or a unique attribute");
+            const nested = try self.normaliseMap(v);
+            try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = pvalOf(nested) } });
             return;
         }
         try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, v) } });
@@ -639,14 +728,14 @@ const Ctx = struct {
             .keyword => self.attrByIntern(v.asKeywordId()),
             .fixnum => blk: {
                 const n = v.asFixnum();
-                if (n <= 0 or n > std.math.maxInt(u32)) return error.UnknownAttribute;
+                if (n <= 0 or n > std.math.maxInt(u32)) return self.unknownAttr(v);
                 break :blk self.attrById(@intCast(n));
             },
-            else => error.TxData,
+            else => self.malformed("an attribute is a keyword or an id"),
         };
     }
 
-    fn entityFromVm(self: *Ctx, v: Value) anyerror!Ent {
+    fn entityFromVm(self: *Ctx, v: Value) Failure!Ent {
         switch (v.kind()) {
             .fixnum => {
                 const n = v.asFixnum();
@@ -660,19 +749,19 @@ const Ctx = struct {
             },
             .keyword => return .{ .eid = (try self.minter.lookup(v.asKeywordId())) orelse return error.NoEntity },
             .persistent_vector => {
-                if (vector_mod.count(v) != 2) return error.TxData;
+                if (vector_mod.count(v) != 2) return self.malformed("a lookup ref is [attr value]");
                 const attr = try self.attrFromVm(vector_mod.nth(v, 0));
-                if (attr.unique == .none) return error.TxData;
+                if (attr.unique == .none) return self.malformed("a lookup ref needs a unique attribute");
                 const lv = try self.valueFromVm(attr, vector_mod.nth(v, 1));
-                if (lv != .val) return error.TxData;
+                if (lv != .val) return self.malformed("a lookup ref value is a plain value");
                 return .{ .lookup = try self.lookupRef(attr, lv.val) };
             },
-            else => return error.TxData,
+            else => return self.malformed("an entity is an id, a tempid, a lookup ref, an ident or \"datomic.tx\""),
         }
     }
 
     /// Convert a VM value by the attribute's type.
-    fn valueFromVm(self: *Ctx, attr: Attr, v: Value) anyerror!PVal {
+    fn valueFromVm(self: *Ctx, attr: Attr, v: Value) Failure!PVal {
         switch (attr.value_type) {
             .boolean => {
                 if (!v.isBool()) return error.ValueType;
@@ -729,8 +818,9 @@ const Ctx = struct {
         return self.commit();
     }
 
-    /// Steps 3-6: everything up to the commit, leaving the write
-    /// transaction open with the datoms, txlog and counters written.
+    /// Everything after normalisation and before the commit, leaving
+    /// the write transaction open with the datoms, txlog and counters
+    /// written.
     fn apply(self: *Ctx) !void {
         try self.bindTempids();
         try self.expandAll();
@@ -739,7 +829,7 @@ const Ctx = struct {
         try self.write();
     }
 
-    /// Step 7: commit, then publish the mints and update the schema
+    /// Commit, then publish the mints and update the schema
     /// cache, and report. Everything that can fail (the report's tempid
     /// bindings, the tx-data, room in the ident cache) is prepared
     /// before the commit; after it only infallible steps remain, so a
@@ -773,7 +863,7 @@ const Ctx = struct {
         };
     }
 
-    // ── step 3: tempids ───────────────────────────────────────────
+    // ── tempids ───────────────────────────────────────────────────
 
     fn bindTempids(self: *Ctx) !void {
         // `:db/ident` names the entity: its id is the ident's id.
@@ -843,10 +933,9 @@ const Ctx = struct {
             if (g.found_existing) try self.unify(d.e, g.value_ptr.*) else g.value_ptr.* = d.e;
         }
         // Fresh eids for the rest.
-        for (self.bindings.items, 0..) |*b, i| {
+        for (self.bindings.items) |*b| {
             if (b.alias != null) continue;
             if (b.eid != null) continue;
-            _ = i;
             if (self.next_eid >= key.user_partition_end) return error.DatabaseFull;
             b.eid = self.next_eid;
             self.next_eid += 1;
@@ -881,7 +970,7 @@ const Ctx = struct {
     /// NUL), so the value section is compared exactly.
     fn probeAvet(self: *Ctx, a: u32, vbytes: []const u8) !?u64 {
         const prefix = try key.prefixBytes(self.arena, .avet, .{ .a = a, .v = vbytes });
-        var s = try self.conn.store.scan(self.txn, self.conn.store.trees.cur(.avet), prefix);
+        var s = try Store.scan(self.txn, self.conn.store.trees.cur(.avet), prefix);
         while (s.next()) |kv| {
             const parts = try key.unpackKey(.avet, false, kv.key);
             if (std.mem.eql(u8, parts.v, vbytes)) return parts.e;
@@ -922,7 +1011,7 @@ const Ctx = struct {
         };
     }
 
-    // ── step 4: expand ────────────────────────────────────────────
+    // ── expand ────────────────────────────────────────────────────
 
     fn expandAll(self: *Ctx) !void {
         // Room for one datom per op and the transaction's instant; a
@@ -945,13 +1034,12 @@ const Ctx = struct {
     }
 
     fn checkAttrValue(self: *Ctx, e: u64, attr: Attr, v: Val) !void {
-        _ = self;
         if (attr.value_type == .ref and !key.isAttrPartition(v.ref) and v.ref < key.user_partition_start) return error.NoEntity;
         switch (attr.id) {
             boot.value_type => if (boot.valueTypeOf(v.keyword) == null) return error.ValueType,
             boot.cardinality => if (v.keyword != boot.card_one and v.keyword != boot.card_many) return error.ValueType,
             boot.unique => if (v.keyword != boot.unique_identity and v.keyword != boot.unique_value) return error.ValueType,
-            boot.ident => if (e != v.keyword) return error.Conflict,
+            boot.ident => if (e != v.keyword) return self.conflict(e, attr.id),
             else => {},
         }
     }
@@ -961,18 +1049,18 @@ const Ctx = struct {
         const vb = try key.valBytes(self.arena, v);
         const fk = try key.keyBytes(self.arena, .eavt, e, attr.id, vb, null);
         if (self.facts.get(fk)) |i| {
-            if (!self.overlay.items[i].added) return error.Conflict;
+            if (!self.overlay.items[i].added) return self.conflict(e, attr.id);
             return;
         }
         if (attr.unique != .none) {
-            if (try self.findByAv(attr.id, vb)) |other| if (other != e) return error.Unique;
+            if (try self.findByAv(attr.id, vb)) |other| if (other != e) return self.unique(attr, v);
         }
         const already = (try self.txn.getFromTree(self.conn.store.trees.cur(.eavt), fk)) != null;
         if (!attr.many()) {
             // One value per (e a) per transaction, whether it is
             // pending or was current already.
             const ea: EA = .{ .e = e, .a = attr.id };
-            if (self.one_adds.get(ea)) |seen| return if (std.mem.eql(u8, seen, vb)) {} else error.Conflict;
+            if (self.one_adds.get(ea)) |seen| return if (std.mem.eql(u8, seen, vb)) {} else self.conflict(e, attr.id);
             try self.one_adds.put(self.arena, ea, vb);
             if (already) return;
             if (try self.currentOne(e, attr.id)) |old| {
@@ -987,15 +1075,44 @@ const Ctx = struct {
 
     const Current = struct { val: Val, vbytes: []const u8 };
 
+    /// A committed row of a current tree with this transaction's
+    /// pending fact about it, if any.
+    const LiveRow = struct { parts: key.Parts, kv: Store.KeyValue, pending: ?Pending };
+
+    /// The committed rows of a current tree under a prefix, each with
+    /// the overlay's pending fact about it. Under VAET, `comps.v` must
+    /// be the whole value section, since the rows carry it untagged.
+    const LiveScan = struct {
+        ctx: *Ctx,
+        index: key.Index,
+        vbytes: ?[]const u8,
+        scan: Store.Scan,
+
+        fn next(self: *LiveScan) !?LiveRow {
+            const kv = self.scan.next() orelse return null;
+            const parts = try key.unpackKey(self.index, false, kv.key);
+            const fk = switch (self.index) {
+                .eavt => kv.key,
+                .vaet => try key.keyBytes(self.ctx.arena, .eavt, parts.e, parts.a, self.vbytes.?, null),
+                else => try key.keyBytes(self.ctx.arena, .eavt, parts.e, parts.a, parts.v, null),
+            };
+            const pending: ?Pending = if (self.ctx.facts.get(fk)) |i| self.ctx.overlay.items[i] else null;
+            return .{ .parts = parts, .kv = kv, .pending = pending };
+        }
+    };
+
+    fn liveRows(self: *Ctx, index: key.Index, comps: key.Components) !LiveScan {
+        const prefix = try key.prefixBytes(self.arena, index, comps);
+        return .{ .ctx = self, .index = index, .vbytes = comps.v, .scan = try Store.scan(self.txn, self.conn.store.trees.cur(index), prefix) };
+    }
+
     /// The committed value of a card-one `(e a)` that is not already
     /// retracted in this transaction.
     fn currentOne(self: *Ctx, e: u64, a: u32) !?Current {
-        const prefix = try key.prefixBytes(self.arena, .eavt, .{ .e = e, .a = a });
-        var s = try self.conn.store.scan(self.txn, self.conn.store.trees.cur(.eavt), prefix);
-        while (s.next()) |kv| {
-            if (self.facts.get(kv.key)) |i| if (!self.overlay.items[i].added) continue;
-            const parts = try key.unpackKey(.eavt, false, kv.key);
-            return .{ .val = try self.valFromParts(parts), .vbytes = try self.arena.dupe(u8, parts.v) };
+        var rows = try self.liveRows(.eavt, .{ .e = e, .a = a });
+        while (try rows.next()) |r| {
+            if (r.pending) |p| if (!p.added) continue;
+            return .{ .val = try self.valFromParts(r.parts), .vbytes = try self.arena.dupe(u8, r.parts.v) };
         }
         return null;
     }
@@ -1005,9 +1122,7 @@ const Ctx = struct {
     fn valFromParts(self: *Ctx, parts: key.Parts) !Val {
         const kv = try key.decodeVal(self.arena, parts.v);
         if (kv == .val) return kv.val;
-        const raw = (try self.conn.store.getCurrent(self.txn, .eavt, parts.e, parts.a, parts.v, self.arena)) orelse return error.Corrupted;
-        if (raw.len < key.id_len) return error.Corrupted;
-        const payload = try self.arena.dupe(u8, raw[key.id_len..]);
+        const payload = (try self.conn.store.currentPayload(self.txn, parts.e, parts.a, parts.v, self.arena)) orelse return error.Corrupted;
         return switch (kv) {
             .string_long => .{ .string = payload },
             .bytes_long => .{ .bytes = payload },
@@ -1019,7 +1134,7 @@ const Ctx = struct {
         const vb = try key.valBytes(self.arena, v);
         const fk = try key.keyBytes(self.arena, .eavt, e, attr.id, vb, null);
         if (self.facts.get(fk)) |i| {
-            if (self.overlay.items[i].added) return error.Conflict;
+            if (self.overlay.items[i].added) return self.conflict(e, attr.id);
             return;
         }
         if ((try self.txn.getFromTree(self.conn.store.trees.cur(.eavt), fk)) == null) return;
@@ -1027,49 +1142,42 @@ const Ctx = struct {
     }
 
     fn expandRetractAttr(self: *Ctx, e: u64, attr: Attr) !void {
-        if (self.ea_adds.get(.{ .e = e, .a = attr.id })) |_| return error.Conflict;
-        const prefix = try key.prefixBytes(self.arena, .eavt, .{ .e = e, .a = attr.id });
-        var s = try self.conn.store.scan(self.txn, self.conn.store.trees.cur(.eavt), prefix);
-        while (s.next()) |kv| {
-            if (self.facts.get(kv.key)) |_| continue;
-            const parts = try key.unpackKey(.eavt, false, kv.key);
-            try self.pushRetract(e, attr, try self.valFromParts(parts), try self.arena.dupe(u8, parts.v));
+        if (self.ea_adds.get(.{ .e = e, .a = attr.id })) |_| return self.conflict(e, attr.id);
+        var rows = try self.liveRows(.eavt, .{ .e = e, .a = attr.id });
+        while (try rows.next()) |r| {
+            if (r.pending != null) continue;
+            try self.pushRetract(e, attr, try self.valFromParts(r.parts), try self.arena.dupe(u8, r.parts.v));
         }
     }
 
-    fn expandRetractEntity(self: *Ctx, e: u64, seen: *std.AutoHashMapUnmanaged(u64, void)) anyerror!void {
+    fn expandRetractEntity(self: *Ctx, e: u64, seen: *std.AutoHashMapUnmanaged(u64, void)) Failure!void {
         if ((try seen.getOrPut(self.arena, e)).found_existing) return;
         var components: std.ArrayList(u64) = .empty;
         // Its own datoms.
         {
-            const prefix = try key.prefixBytes(self.arena, .eavt, .{ .e = e });
-            var s = try self.conn.store.scan(self.txn, self.conn.store.trees.cur(.eavt), prefix);
-            while (s.next()) |kv| {
-                const parts = try key.unpackKey(.eavt, false, kv.key);
-                const attr = try self.attrById(parts.a);
-                const v = try self.valFromParts(parts);
+            var rows = try self.liveRows(.eavt, .{ .e = e });
+            while (try rows.next()) |r| {
+                const attr = try self.attrById(r.parts.a);
+                const v = try self.valFromParts(r.parts);
                 if (attr.component and v == .ref) try components.append(self.arena, v.ref);
-                if (self.facts.get(kv.key)) |i| {
-                    if (self.overlay.items[i].added) return error.Conflict;
+                if (r.pending) |p| {
+                    if (p.added) return self.conflict(e, attr.id);
                     continue;
                 }
-                try self.pushRetract(e, attr, v, try self.arena.dupe(u8, parts.v));
+                try self.pushRetract(e, attr, v, try self.arena.dupe(u8, r.parts.v));
             }
         }
         // Datoms pointing at it.
         {
             const vb = try key.valBytes(self.arena, .{ .ref = e });
-            const prefix = try key.prefixBytes(self.arena, .vaet, .{ .v = vb });
-            var s = try self.conn.store.scan(self.txn, self.conn.store.trees.cur(.vaet), prefix);
-            while (s.next()) |kv| {
-                const parts = try key.unpackKey(.vaet, false, kv.key);
-                const attr = try self.attrById(parts.a);
-                const fk = try key.keyBytes(self.arena, .eavt, parts.e, parts.a, vb, null);
-                if (self.facts.get(fk)) |i| {
-                    if (self.overlay.items[i].added) return error.Conflict;
+            var rows = try self.liveRows(.vaet, .{ .v = vb });
+            while (try rows.next()) |r| {
+                const attr = try self.attrById(r.parts.a);
+                if (r.pending) |p| {
+                    if (p.added) return self.conflict(r.parts.e, r.parts.a);
                     continue;
                 }
-                try self.pushRetract(parts.e, attr, .{ .ref = e }, vb);
+                try self.pushRetract(r.parts.e, attr, .{ .ref = e }, vb);
             }
         }
         for (components.items) |c| try self.expandRetractEntity(c, seen);
@@ -1109,30 +1217,33 @@ const Ctx = struct {
         try self.expandAdd(tx, attr, .{ .instant = self.now_ms });
     }
 
-    // ── step 5: schema ────────────────────────────────────────────
+    // ── schema ────────────────────────────────────────────────────
 
     /// Attribute entities: a new attribute needs `:db/valueType` and
     /// `:db/cardinality`; an existing one keeps both; adding
     /// `:db/index` or `:db/unique` backfills AVET from AEVT.
     fn applySchema(self: *Ctx) !void {
         if (!self.schema_touched) return;
-        var new_attrs: std.AutoHashMapUnmanaged(u32, struct { has_type: bool = false, has_card: bool = false }) = .empty;
+        var new_attrs: std.AutoHashMapUnmanaged(u32, struct { has_type: bool = false, has_card: bool = false, many: bool = false }) = .empty;
         var backfill: std.AutoHashMapUnmanaged(u32, Attr) = .empty;
+        var unique_added: std.AutoHashMapUnmanaged(u32, void) = .empty;
         for (self.overlay.items) |p| {
             if (!key.isAttrPartition(p.e)) continue;
             const a: u32 = @intCast(p.e);
             const existing = self.schema.attr(a);
             switch (p.attr.id) {
                 boot.value_type, boot.cardinality => {
-                    if (!p.added) return error.Conflict;
-                    if (existing != null) return error.Conflict;
+                    if (!p.added) return self.conflict(p.e, p.attr.id);
+                    if (existing != null) return self.conflict(p.e, p.attr.id);
                     const g = try new_attrs.getOrPut(self.arena, a);
                     if (!g.found_existing) g.value_ptr.* = .{};
                     if (p.attr.id == boot.value_type) g.value_ptr.has_type = true else g.value_ptr.has_card = true;
+                    if (p.attr.id == boot.cardinality and p.v.keyword == boot.card_many) g.value_ptr.many = true;
                 },
                 boot.unique, boot.index => {
-                    if (!p.added) return error.Conflict;
+                    if (!p.added) return self.conflict(p.e, p.attr.id);
                     if (p.attr.id == boot.index and !p.v.boolean) continue;
+                    if (p.attr.id == boot.unique) try unique_added.put(self.arena, a, {});
                     if (existing) |ex| {
                         if (!ex.inAvet()) {
                             try backfill.put(self.arena, a, ex.*);
@@ -1146,7 +1257,14 @@ const Ctx = struct {
         }
         var it = new_attrs.iterator();
         while (it.next()) |e| {
-            if (!e.value_ptr.has_type or !e.value_ptr.has_card) return error.TxData;
+            if (!e.value_ptr.has_type or !e.value_ptr.has_card) return self.malformed("a new attribute needs :db/valueType and :db/cardinality");
+        }
+        // A unique attribute identifies one entity by one value, so it
+        // is card-one.
+        var uit = unique_added.keyIterator();
+        while (uit.next()) |a| {
+            const many = if (self.schema.attr(a.*)) |ex| ex.many() else new_attrs.get(a.*).?.many;
+            if (many) return self.malformed("a unique attribute is cardinality one");
         }
         var bit = backfill.iterator();
         while (bit.next()) |e| try self.backfillAvet(e.value_ptr.*);
@@ -1155,22 +1273,18 @@ const Ctx = struct {
     /// An indexed attribute becoming unique: no value may be held by two
     /// entities, in the tree or in this transaction.
     fn checkUniqueAvet(self: *Ctx, attr: Attr) !void {
-        const store = self.conn.store;
-        const prefix = try key.prefixBytes(self.arena, .avet, .{ .a = attr.id });
-        var s = try store.scan(self.txn, store.trees.cur(.avet), prefix);
+        var rows = try self.liveRows(.avet, .{ .a = attr.id });
         var prev: ?[]const u8 = null;
-        while (s.next()) |kv| {
-            const parts = try key.unpackKey(.avet, false, kv.key);
-            const fk = try key.keyBytes(self.arena, .eavt, parts.e, parts.a, parts.v, null);
-            if (self.facts.get(fk)) |i| if (!self.overlay.items[i].added) continue;
-            if (prev) |pv| if (std.mem.eql(u8, pv, parts.v)) return error.Unique;
-            prev = try self.arena.dupe(u8, parts.v);
+        while (try rows.next()) |r| {
+            if (r.pending) |p| if (!p.added) continue;
+            if (prev) |pv| if (std.mem.eql(u8, pv, r.parts.v)) return self.unique(attr, try self.valFromParts(r.parts));
+            prev = try self.arena.dupe(u8, r.parts.v);
         }
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         for (self.overlay.items) |p| {
             if (p.attr.id != attr.id or !p.added) continue;
-            if ((try seen.getOrPut(self.arena, p.vbytes)).found_existing) return error.Unique;
-            if (try self.findByAv(attr.id, p.vbytes)) |other| if (other != p.e) return error.Unique;
+            if ((try seen.getOrPut(self.arena, p.vbytes)).found_existing) return self.unique(attr, p.v);
+            if (try self.findByAv(attr.id, p.vbytes)) |other| if (other != p.e) return self.unique(attr, p.v);
         }
     }
 
@@ -1178,30 +1292,27 @@ const Ctx = struct {
     /// and AVET-h with its original `t`, refusing duplicate values when
     /// the attribute becomes unique.
     fn backfillAvet(self: *Ctx, attr: Attr) !void {
-        var unique = false;
+        var becomes_unique = false;
         for (self.overlay.items) |p| {
-            if (p.e == attr.id and p.attr.id == boot.unique and p.added) unique = true;
+            if (p.e == attr.id and p.attr.id == boot.unique and p.added) becomes_unique = true;
         }
         const store = self.conn.store;
-        const prefix = try key.prefixBytes(self.arena, .aevt, .{ .a = attr.id });
         var rows: std.ArrayList(struct { e: u64, vbytes: []const u8, t: u64 }) = .empty;
-        var s = try store.scan(self.txn, store.trees.cur(.aevt), prefix);
+        var live = try self.liveRows(.aevt, .{ .a = attr.id });
         var seen: std.StringHashMapUnmanaged(void) = .empty;
-        while (s.next()) |kv| {
-            const parts = try key.unpackKey(.aevt, false, kv.key);
-            if (kv.value.len < key.id_len) return error.Corrupted;
-            const fk = try key.keyBytes(self.arena, .eavt, parts.e, parts.a, parts.v, null);
-            if (self.facts.get(fk)) |i| if (!self.overlay.items[i].added) continue;
-            const vb = try self.arena.dupe(u8, parts.v);
-            if (unique) {
-                if ((try seen.getOrPut(self.arena, vb)).found_existing) return error.Unique;
+        while (try live.next()) |r| {
+            if (r.kv.value.len < key.id_len) return error.Corrupted;
+            if (r.pending) |p| if (!p.added) continue;
+            const vb = try self.arena.dupe(u8, r.parts.v);
+            if (becomes_unique) {
+                if ((try seen.getOrPut(self.arena, vb)).found_existing) return self.unique(attr, try self.valFromParts(r.parts));
             }
-            try rows.append(self.arena, .{ .e = parts.e, .vbytes = vb, .t = key.readId(kv.value[0..key.id_len]) });
+            try rows.append(self.arena, .{ .e = r.parts.e, .vbytes = vb, .t = key.readId(r.kv.value[0..key.id_len]) });
         }
-        if (unique) {
+        if (becomes_unique) {
             for (self.overlay.items) |p| {
                 if (p.attr.id != attr.id or !p.added) continue;
-                if ((try seen.getOrPut(self.arena, p.vbytes)).found_existing) return error.Unique;
+                if ((try seen.getOrPut(self.arena, p.vbytes)).found_existing) return self.unique(attr, p.v);
             }
         }
         for (rows.items) |r| {
@@ -1216,12 +1327,12 @@ const Ctx = struct {
         for (self.overlay.items) |*p| {
             if (p.attr.id == attr.id) {
                 p.attr.indexed = true;
-                if (unique) p.attr.unique = .identity;
+                if (becomes_unique) p.attr.unique = .identity;
             }
         }
     }
 
-    // ── step 6: write ─────────────────────────────────────────────
+    // ── write ─────────────────────────────────────────────────────
 
     fn write(self: *Ctx) !void {
         const store = self.conn.store;
@@ -1300,23 +1411,7 @@ fn isCollection(v: Value) bool {
 }
 
 fn collectionElements(arena: Allocator, v: Value) ![]Value {
-    var out: std.ArrayList(Value) = .empty;
-    switch (v.kind()) {
-        .persistent_vector => {
-            var it = vector_mod.Cursor.init(v);
-            while (it.next()) |x| try out.append(arena, x);
-        },
-        .persistent_set => {
-            var it = champ.setIter(v);
-            while (it.next()) |x| try out.append(arena, x);
-        },
-        .list => {
-            var it = list_mod.Cursor.init(v);
-            while (it.next()) |x| try out.append(arena, x);
-        },
-        else => unreachable,
-    }
-    return out.toOwnedSlice(arena);
+    return (try marshal.collection(arena, v)).?;
 }
 
 // =============================================================================
@@ -1432,8 +1527,8 @@ test "schema install then asserts, card-one overwrite, no-op, retract" {
     const after = try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = a });
     try testing.expectEqual(@as(usize, 1), after.len);
     try testing.expectEqual(email, after[0].a);
-    try testing.expectEqual(@as(u64, 0), (try (try tc.conn.db()).attr(arena, name)).?.count);
-    try testing.expectEqual(@as(u64, 1), (try (try tc.conn.db()).attr(arena, email)).?.count);
+    try testing.expectEqual(@as(u64, 0), (try (try tc.conn.db()).attr(name)).?.count);
+    try testing.expectEqual(@as(u64, 1), (try (try tc.conn.db()).attr(email)).?.count);
 
     // Errors.
     try testing.expectError(error.UnknownAttribute, transactOps(tc.conn, arena, &.{
@@ -1578,8 +1673,8 @@ test "schema changes: index backfill, unique backfill refusal, immutable type" {
     try testing.expectEqual(r1.t, hits[0].t);
     const ab = try key.valBytes(arena, .{ .string = "Anne" });
     try testing.expectEqual(@as(usize, 1), (try db2.datoms(arena, .avet, .{ .a = name, .v = ab })).len);
-    try testing.expect((try db2.attr(arena, name)).?.indexed);
-    try testing.expect(!(try db2.asOf(r1.t).attr(arena, name)).?.indexed);
+    try testing.expect((try db2.attr(name)).?.indexed);
+    try testing.expect(!(try db2.asOf(r1.t).attr(name)).?.indexed);
     _ = r2;
 
     // Unique on age is fine (distinct values); unique on name would collide.
@@ -1696,6 +1791,207 @@ test "Lisp tx-data: vector forms, map forms, nested maps, card-many vectors, dat
     try testing.expectError(error.TxData, transact(tc.conn, arena, try s.s(&heap, "nope"), .{}));
 }
 
+/// Lisp values for tx-data tests.
+const Lisp = struct {
+    tc: *TestConn,
+    heap: *@import("heap").Heap,
+
+    const dispatch = @import("dispatch");
+    const KV = struct { []const u8, Value };
+
+    fn kw(self: Lisp, name: []const u8) !Value {
+        return self.tc.interner.internKeywordValue(name);
+    }
+    fn str(self: Lisp, text: []const u8) !Value {
+        return string_mod.fromBytes(self.heap, text);
+    }
+    fn vec(self: Lisp, items: []const Value) !Value {
+        return vector_mod.fromSlice(self.heap, items);
+    }
+    fn map(self: Lisp, entries: []const KV) !Value {
+        var m = try champ.mapEmpty(self.heap);
+        for (entries) |e| m = try champ.mapAssoc(self.heap, m, try self.kw(e[0]), e[1], &dispatch.hashValue, &dispatch.equal);
+        return m;
+    }
+};
+
+test "a reverse ref in a map form asserts the forward datom" {
+    const tc = try TestConn.init("tx_reverse");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    const l = Lisp{ .tc = tc, .heap = &heap };
+    try installSchema(tc, arena);
+    const friend = try attrId(tc, "user/friend");
+    const home = try attrId(tc, "user/home");
+
+    // Ann and Bob befriend Cy through Cy's map; Cy's home names its
+    // owner through a reverse component ref, from a nested map.
+    const r = try transact(tc.conn, arena, try l.vec(&.{
+        try l.map(&.{ .{ "db/id", try l.str("ann") }, .{ "user/email", try l.str("ann@x") } }),
+        try l.map(&.{ .{ "db/id", try l.str("bob") }, .{ "user/email", try l.str("bob@x") } }),
+        try l.map(&.{
+            .{ "db/id", try l.str("cy") },
+            .{ "user/email", try l.str("cy@x") },
+            .{ "user/_friend", try l.vec(&.{ try l.str("ann"), try l.vec(&.{ try l.kw("user/email"), try l.str("bob@x") }) }) },
+        }),
+        try l.map(&.{ .{ "addr/city", try l.str("Rome") }, .{ "user/_home", try l.str("cy") } }),
+        try l.map(&.{ .{ "db/id", try l.str("di") }, .{ "user/email", try l.str("di@x") }, .{ "user/_friend", try l.map(&.{.{ "user/email", try l.str("ed@x") }}) } }),
+    }), .{});
+    var ann: u64 = 0;
+    var bob: u64 = 0;
+    var cy: u64 = 0;
+    var di: u64 = 0;
+    for (r.tempids) |b| {
+        if (std.mem.eql(u8, b.key.string, "ann")) ann = b.eid;
+        if (std.mem.eql(u8, b.key.string, "bob")) bob = b.eid;
+        if (std.mem.eql(u8, b.key.string, "cy")) cy = b.eid;
+        if (std.mem.eql(u8, b.key.string, "di")) di = b.eid;
+    }
+    const db = try tc.conn.db();
+    const ann_friends = try db.datoms(arena, .eavt, .{ .e = ann, .a = friend });
+    try testing.expectEqual(@as(usize, 1), ann_friends.len);
+    try testing.expectEqual(cy, ann_friends[0].v.ref);
+    const bob_friends = try db.datoms(arena, .eavt, .{ .e = bob, .a = friend });
+    try testing.expectEqual(cy, bob_friends[0].v.ref);
+    try testing.expectEqual(@as(usize, 0), (try db.datoms(arena, .eavt, .{ .e = cy, .a = friend })).len);
+    const cy_home = try db.datoms(arena, .eavt, .{ .e = cy, .a = home });
+    try testing.expectEqual(@as(usize, 1), cy_home.len);
+    const ed_friends = try db.datoms(arena, .vaet, .{ .a = friend, .v = try key.valBytes(arena, .{ .ref = di }) });
+    try testing.expectEqual(@as(usize, 1), ed_friends.len);
+
+    // A reverse ref needs a ref attribute and an entity value.
+    try testing.expectError(error.TxData, transact(tc.conn, arena, try l.vec(&.{
+        try l.map(&.{ .{ "db/id", try l.str("x") }, .{ "user/_email", try l.str("ann@x") } }),
+    }), .{}));
+    try testing.expectError(error.UnknownAttribute, transact(tc.conn, arena, try l.vec(&.{
+        try l.map(&.{ .{ "db/id", try l.str("x") }, .{ "user/_nope", try l.str("ann") } }),
+    }), .{}));
+    try testing.expectError(error.TxData, transact(tc.conn, arena, try l.vec(&.{
+        try l.map(&.{ .{ "db/id", try l.str("x") }, .{ "user/_friend", value.fromBool(true) } }),
+    }), .{}));
+}
+
+test "a nested map under a plain ref must carry an identity" {
+    const tc = try TestConn.init("tx_nested_identity");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    const l = Lisp{ .tc = tc, .heap = &heap };
+    try installSchema(tc, arena);
+
+    // Under a component, or with a unique attribute or a :db/id, a
+    // nested map is an entity; otherwise it would be an orphan.
+    const ok = try transact(tc.conn, arena, try l.vec(&.{
+        try l.map(&.{
+            .{ "user/email", try l.str("ann@x") },
+            .{ "user/home", try l.map(&.{.{ "addr/city", try l.str("Rome") }}) },
+            .{ "user/friend", try l.vec(&.{
+                try l.map(&.{.{ "user/email", try l.str("bob@x") }}),
+                try l.map(&.{ .{ "db/id", try l.str("cy") }, .{ "user/name", try l.str("Cy") } }),
+            }) },
+        }),
+    }), .{});
+    try testing.expectEqual(@as(usize, 1), ok.tempids.len);
+    const ann = (try (try tc.conn.db()).entid(arena, .{ .lookup = .{ .a = try attrId(tc, "user/email"), .v = .{ .string = "ann@x" } } })).?;
+    try testing.expectEqual(@as(usize, 2), (try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = ann, .a = try attrId(tc, "user/friend") })).len);
+    try testing.expectError(error.TxData, transact(tc.conn, arena, try l.vec(&.{
+        try l.map(&.{
+            .{ "user/email", try l.str("ann@x") },
+            .{ "user/friend", try l.map(&.{.{ "user/name", try l.str("Orphan") }}) },
+        }),
+    }), .{}));
+}
+
+test "a failing transaction reports what it was looking at" {
+    const tc = try TestConn.init("tx_fault");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    const l = Lisp{ .tc = tc, .heap = &heap };
+    try installSchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const age = try attrId(tc, "user/age");
+    const k_email = try kw(tc, "user/email");
+    const k_age = try kw(tc, "user/age");
+    const r = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "b@x" } } } },
+    }, .{});
+    const a = r.tempids[0].eid;
+
+    var fault: Fault = .{};
+    // Unique: the attribute and the value.
+    try testing.expectError(error.Unique, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "b@x" } } } },
+    }, .{ .fault = &fault }));
+    try testing.expectEqual(k_email, fault.attr.?.asKeywordId());
+    try testing.expectEqualStrings("b@x", fault.value.?.string);
+    try testing.expect(fault.e == null);
+    // Conflict: the entity and the attribute.
+    fault = .{};
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 1 } } } },
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 2 } } } },
+    }, .{ .fault = &fault }));
+    try testing.expectEqual(k_age, fault.attr.?.asKeywordId());
+    try testing.expectEqual(a, fault.e.?);
+    // Unknown attribute: as the program named it.
+    fault = .{};
+    const k_nope = try kw(tc, "user/nope");
+    try testing.expectError(error.UnknownAttribute, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .ident = k_nope }, .v = .{ .val = .{ .long = 1 } } } },
+    }, .{ .fault = &fault }));
+    try testing.expectEqual(k_nope, fault.attr.?.asKeywordId());
+    fault = .{};
+    try testing.expectError(error.UnknownAttribute, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = 4000 }, .v = .{ .val = .{ .long = 1 } } } },
+    }, .{ .fault = &fault }));
+    try testing.expectEqual(@as(i64, 4000), fault.attr.?.asFixnum());
+    // Malformed tx-data: the reason.
+    fault = .{};
+    try testing.expectError(error.TxData, transact(tc.conn, arena, try l.vec(&.{
+        try l.vec(&.{ try l.kw("db/add"), value.fromFixnum(@intCast(a)).?, try l.kw("user/age") }),
+    }), .{ .fault = &fault }));
+    try testing.expect(fault.message != null);
+    // Nothing is reported when nothing fails, and a fault is optional.
+    fault = .{};
+    _ = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 3 } } } },
+    }, .{ .fault = &fault });
+    try testing.expect(fault.attr == null and fault.message == null);
+}
+
+test "a card-many attribute cannot be unique" {
+    const tc = try TestConn.init("tx_unique_many");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const tags = try attrId(tc, "user/tags");
+
+    try testing.expectError(error.TxData, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = tags }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_value } } } },
+    }, .{}));
+    try testing.expectError(error.TxData, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.ident }, .v = .{ .keyword = try kw(tc, "user/nick") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_string } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_many } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_identity } } } },
+    }, .{}));
+    try testing.expect((try (try tc.conn.db()).attr(tags)).?.unique == .none);
+}
+
 test "long strings round trip through the payload in every view" {
     const tc = try TestConn.init("tx_long");
     defer tc.deinit();
@@ -1774,7 +2070,7 @@ test "with: the view sees the speculative state, the connection does not" {
     const hb = try key.valBytes(arena, .{ .ref = h });
     try testing.expectEqual(@as(usize, 1), (try view.datoms(arena, .vaet, .{ .v = hb })).len);
     try testing.expectEqual(@as(?u64, a), try view.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a@x" } } }));
-    try testing.expectEqual(@as(u64, 1), (try view.attr(arena, email)).?.count);
+    try testing.expectEqual(@as(u64, 1), (try view.attr(email)).?.count);
     const entries = try db_mod.txRange(w.view, arena, w.report.t, null);
     try testing.expectEqual(@as(usize, 1), entries.len);
     try testing.expectEqual(@as(usize, 6), entries[0].datoms.len);
@@ -1795,7 +2091,7 @@ test "with: the view sees the speculative state, the connection does not" {
     try testing.expectEqual(before.basis, (try tc.conn.db()).basis);
     try testing.expectEqual(@as(usize, 0), (try before.entity(arena, a)).len);
     try testing.expectEqual(@as(usize, 0), (try w.report.db_before.entity(arena, a)).len);
-    try testing.expectEqual(@as(u64, 0), (try before.attr(arena, email)).?.count);
+    try testing.expectEqual(@as(u64, 0), (try before.attr(email)).?.count);
 
     // One write transaction per store: nothing else may begin one.
     try testing.expectError(error.Nested, withOps(tc.conn, arena, &.{}, .{}));
@@ -1866,11 +2162,11 @@ test "with: errors surface without holding the write transaction; schema changes
     }, .{});
     defer w.destroy();
     const nick: u32 = @intCast(w.report.tempids[0].eid);
-    try testing.expectEqual(key.ValueType.string, (try w.db().attr(arena, nick)).?.value_type);
+    try testing.expectEqual(key.ValueType.string, (try w.db().attr(nick)).?.value_type);
     try testing.expectEqual(@as(?u64, nick), try w.db().entid(arena, .{ .ident = try kw(tc, "user/nick") }));
-    try testing.expect((try (try tc.conn.db()).attr(arena, nick)) == null);
+    try testing.expect((try (try tc.conn.db()).attr(nick)) == null);
     w.finish();
-    try testing.expect((try (try tc.conn.db()).attr(arena, nick)) == null);
+    try testing.expect((try (try tc.conn.db()).attr(nick)) == null);
     try testing.expectEqual(r0.t, (try tc.conn.db()).basis);
     const r1 = try transactOps(tc.conn, arena, &.{
         .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 3 } } } },
@@ -2272,7 +2568,7 @@ test "an indexed attribute becomes unique while a value moves between entities" 
     }, .{});
     try testing.expectEqual(@as(usize, 4), r2.tx_data.len);
     const db = try tc.conn.db();
-    try testing.expectEqual(schema_mod.Unique.identity, (try db.attr(arena, nick)).?.unique);
+    try testing.expectEqual(schema_mod.Unique.identity, (try db.attr(nick)).?.unique);
     try testing.expectEqual(@as(?u64, b), try db.entid(arena, .{ .lookup = .{ .a = nick, .v = .{ .string = "N" } } }));
     try testing.expectEqual(@as(usize, 1), (try db.datoms(arena, .aevt, .{ .a = nick })).len);
 }

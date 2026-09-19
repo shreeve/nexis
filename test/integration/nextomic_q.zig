@@ -39,157 +39,7 @@ const key = nextomic.key;
 // Fixture
 // =============================================================================
 
-const Fx = struct {
-    tc: *TestConn,
-    heap: Heap,
-    arena_state: std.heap.ArenaAllocator,
-
-    fn init(name: []const u8) !*Fx {
-        const self = try testing.allocator.create(Fx);
-        self.* = .{
-            .tc = try TestConn.init(name),
-            .heap = Heap.init(testing.allocator),
-            .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
-        };
-        return self;
-    }
-
-    fn deinit(self: *Fx) void {
-        self.arena_state.deinit();
-        self.heap.deinit();
-        self.tc.deinit();
-        testing.allocator.destroy(self);
-    }
-
-    fn arena(self: *Fx) Allocator {
-        return self.arena_state.allocator();
-    }
-
-    fn interner(self: *Fx) *Interner {
-        return &self.tc.interner;
-    }
-
-    fn conn(self: *Fx) *nextomic.Conn {
-        return self.tc.conn;
-    }
-
-    /// Read one form of source text into a VM value.
-    fn read(self: *Fx, src: []const u8) !Value {
-        var parsed = try reader_mod.parser.parseProgram(testing.allocator, src);
-        defer parsed.parser.deinit();
-        var rdr = reader_mod.Reader.init(testing.allocator, src);
-        defer rdr.deinit();
-        const forms = try rdr.readProgram(parsed.sexp);
-        try testing.expectEqual(@as(usize, 1), forms.len);
-        return self.formToValue(forms[0]);
-    }
-
-    fn formToValue(self: *Fx, form: *const reader_mod.Form) anyerror!Value {
-        const a = self.arena();
-        return switch (form.datum) {
-            .nil => value.nilValue(),
-            .bool_ => |b| value.fromBool(b),
-            .int => |n| value.fromFixnum(n).?,
-            .real => |d| value.fromFloat(d),
-            .string => |s| try string_mod.fromBytes(&self.heap, s),
-            .keyword => |name| try self.interner().internKeywordValue(try joinName(a, name)),
-            .symbol => |name| try self.interner().internSymbolValue(try joinName(a, name)),
-            .list => |items| blk: {
-                const vals = try a.alloc(Value, items.len);
-                for (items, vals) |it, *v| v.* = try self.formToValue(it);
-                break :blk try list_mod.fromSlice(&self.heap, vals);
-            },
-            .vector => |items| blk: {
-                const vals = try a.alloc(Value, items.len);
-                for (items, vals) |it, *v| v.* = try self.formToValue(it);
-                break :blk try vector_mod.fromSlice(&self.heap, vals);
-            },
-            .map => |items| blk: {
-                var m = try champ.mapEmpty(&self.heap);
-                var i: usize = 0;
-                while (i < items.len) : (i += 2) {
-                    m = try champ.mapAssoc(&self.heap, m, try self.formToValue(items[i]), try self.formToValue(items[i + 1]), &dispatch.hashValue, &dispatch.equal);
-                }
-                break :blk m;
-            },
-            .set => |items| blk: {
-                var s = try champ.setEmpty(&self.heap);
-                for (items) |it| s = try champ.setConj(&self.heap, s, try self.formToValue(it), &dispatch.hashValue, &dispatch.equal);
-                break :blk s;
-            },
-            else => error.UnsupportedForm,
-        };
-    }
-
-    fn joinName(a: Allocator, name: anytype) ![]const u8 {
-        if (name.ns) |ns| return std.fmt.allocPrint(a, "{s}/{s}", .{ ns, name.name });
-        return name.name;
-    }
-
-    fn transact(self: *Fx, src: []const u8) !nextomic.Report {
-        const tx = try self.read(src);
-        return nextomic.transact.transact(self.conn(), self.arena(), tx, .{});
-    }
-
-    fn db(self: *Fx) !DbValue {
-        return self.conn().db();
-    }
-
-    fn kw(self: *Fx, name: []const u8) !u32 {
-        return self.interner().internKeyword(name);
-    }
-
-    fn str(self: *Fx, s: []const u8) !Value {
-        return string_mod.fromBytes(&self.heap, s);
-    }
-
-    fn hook(self: *Fx) query.CallHook {
-        return .{ .ctx = @ptrCast(self), .call = &hookCall };
-    }
-
-    /// The test's user functions.
-    fn hookCall(ctx: *anyopaque, sym_id: u32, args: []const Value) anyerror!Value {
-        const self: *Fx = @ptrCast(@alignCast(ctx));
-        const name = self.interner().symbolName(sym_id);
-        const a = self.arena();
-        if (std.mem.eql(u8, name, "inc")) return value.fromFixnum(args[0].asFixnum() + 1).?;
-        if (std.mem.eql(u8, name, "add")) return value.fromFixnum(args[0].asFixnum() + args[1].asFixnum()).?;
-        if (std.mem.eql(u8, name, "even?")) return value.fromBool(@mod(args[0].asFixnum(), 2) == 0);
-        if (std.mem.eql(u8, name, "str")) {
-            var out: std.ArrayList(u8) = .empty;
-            for (args) |x| switch (x.kind()) {
-                .string => try out.appendSlice(a, string_mod.asBytes(x)),
-                .fixnum => try out.print(a, "{d}", .{x.asFixnum()}),
-                .keyword => try out.print(a, ":{s}", .{self.interner().keywordName(x.asKeywordId())}),
-                else => try out.appendSlice(a, "?"),
-            };
-            return string_mod.fromBytes(&self.heap, out.items);
-        }
-        if (std.mem.eql(u8, name, "upper")) {
-            const s = string_mod.asBytes(args[0]);
-            const out = try a.alloc(u8, s.len);
-            for (s, out) |c, *o| o.* = std.ascii.toUpper(c);
-            return string_mod.fromBytes(&self.heap, out);
-        }
-        if (std.mem.eql(u8, name, "range")) {
-            const n: usize = @intCast(args[0].asFixnum());
-            const vals = try a.alloc(Value, n);
-            for (vals, 0..) |*v, i| v.* = value.fromFixnum(@intCast(i)).?;
-            return vector_mod.fromSlice(&self.heap, vals);
-        }
-        if (std.mem.eql(u8, name, "pair")) return vector_mod.fromSlice(&self.heap, args[0..2]);
-        if (std.mem.eql(u8, name, "halves")) {
-            // [[n 0] [n 1]]
-            const rows = try a.alloc(Value, 2);
-            rows[0] = try vector_mod.fromSlice(&self.heap, &.{ args[0], value.fromFixnum(0).? });
-            rows[1] = try vector_mod.fromSlice(&self.heap, &.{ args[0], value.fromFixnum(1).? });
-            return vector_mod.fromSlice(&self.heap, rows);
-        }
-        if (std.mem.eql(u8, name, "maybe")) return if (args[0].asFixnum() > 30) args[0] else value.nilValue();
-        if (std.mem.eql(u8, name, "boom")) return error.ControlTransferred;
-        return error.UnknownFunction;
-    }
-};
+const Fx = @import("nextomic_fx.zig").Fx;
 
 const long_bio_a = "Ann has a biography that runs well past the ninety-six byte inline limit of the sortable string encoding, so it lives out of line with a prefix and a hash.";
 const long_bio_d = "Di also has a long biography, long enough to be stored out of line; the first sixty-four bytes are shared with nothing else in this corpus at all.";
@@ -253,26 +103,33 @@ const Row = []const Cell;
 
 /// Rows through the pipeline, in `arena`.
 fn runEngine(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args: []const Value) anyerror![]const Row {
-    const qv = try fx.read(src);
     var diag: query.Diag = .{};
-    const parsed = try query.parse.parse(testing.allocator, fx.interner(), qv, &diag);
+    return runEngineDiag(fx, arena, dbv, src, args, &diag);
+}
+
+fn runEngineDiag(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args: []const Value, diag: *query.Diag) anyerror![]const Row {
+    const qv = try fx.read(src);
+    const parsed = try query.parse.parse(testing.allocator, fx.interner(), qv, diag);
     defer parsed.deinit();
-    if (args.len != parsed.in.len) return error.QuerySyntax;
+    if (args.len != parsed.in.len) {
+        diag.* = .{ .message = "wrong number of inputs" };
+        return error.QuerySyntax;
+    }
     var rules: *const ir.RuleSet = &ir.no_rules;
     var owned_rules: ?*ir.RuleSet = null;
     defer if (owned_rules) |r| r.deinit();
     for (parsed.in, args) |b, a| {
         if (b == .rules) {
-            owned_rules = try query.parse.parseRules(testing.allocator, fx.interner(), a, &diag);
+            owned_rules = try query.parse.parseRules(testing.allocator, fx.interner(), a, diag);
             rules = owned_rules.?;
         }
     }
     var read = try dbv.beginRead();
     defer read.close();
-    var ctx = try query.plan.Ctx.init(arena, &read, fx.interner(), parsed, rules);
+    var ctx = try query.plan.Ctx.init(arena, &read, fx.interner(), parsed, rules, diag);
     const p = try query.plan.plan(&ctx, parsed);
-    var ex = query.Exec{ .arena = arena, .read = &read, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook() };
-    const input = try ex.inputRelation(parsed.in, args);
+    var ex = query.Exec{ .arena = arena, .read = &read, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook(), .diag = diag };
+    const input = try ex.inputRelation(parsed, args);
     const rel = try ex.runPlan(p, input);
     return ex.findRows(parsed, rel);
 }
@@ -405,6 +262,22 @@ const Naive = struct {
             }
             envs = next;
         }
+
+        // Entity-role inputs resolve to entity ids.
+        const roles = try arena.alloc(InputRole, parsed.vars.len);
+        @memset(roles, .{});
+        try self.inputRoles(parsed.where, roles);
+        var resolved: std.ArrayList(Env) = .empty;
+        envs: for (envs.items) |e| {
+            for (roles, 0..) |r, v| {
+                if (!r.entity or r.keyword) continue;
+                const c = e[v] orelse continue;
+                if (c != .keyword and c != .vm) continue;
+                e[v] = .{ .int = @intCast((try self.inputEntity(c)) orelse continue :envs) };
+            }
+            try resolved.append(arena, e);
+        }
+        envs = resolved;
 
         var solved: std.ArrayList(Env) = .empty;
         for (envs.items) |e| try self.solve(parsed.where, e, &solved);
@@ -660,6 +533,41 @@ const Naive = struct {
         return .{ .int = id };
     }
 
+    const InputRole = struct { entity: bool = false, keyword: bool = false };
+
+    /// Mark the variables in an entity position or a ref attribute's
+    /// value position, and those in a keyword attribute's value position.
+    fn inputRoles(self: *Naive, clauses: []const ir.Clause, roles: []InputRole) !void {
+        for (clauses) |c| switch (c) {
+            .pattern => |p| {
+                if (p.e.asVar()) |v| roles[v].entity = true;
+                const v = p.v.asVar() orelse continue;
+                if (p.a != .constant or p.a.constant != .cell or p.a.constant.cell != .keyword) continue;
+                const id = (try self.fx.conn().idents.idOf(self.read.txn, p.a.constant.cell.keyword)) orelse continue;
+                const at = (try self.read.attr(id)) orelse continue;
+                if (at.value_type == .ref) roles[v].entity = true;
+                if (at.value_type == .keyword) roles[v].keyword = true;
+            },
+            .not => |n| try self.inputRoles(n.body, roles),
+            .@"or" => |o| for (o.branches) |b| try self.inputRoles(b, roles),
+            else => {},
+        };
+    }
+
+    fn inputEntity(self: *Naive, c: Cell) !?u64 {
+        switch (c) {
+            .keyword => |kw| return self.read.entid(self.arena, .{ .ident = kw }),
+            .vm => |v| {
+                if (v.kind() != .persistent_vector or vector_mod.count(v) != 2 or vector_mod.nth(v, 0).kind() != .keyword) return null;
+                const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, vector_mod.nth(v, 0).asKeywordId())) orelse return error.UnknownAttribute;
+                const vt = self.attr_types.get(attr_id) orelse return error.UnknownAttribute;
+                const val = (try cellToVal(Cell.fromValue(vector_mod.nth(v, 1)), vt)) orelse return error.ValueType;
+                return self.read.entid(self.arena, .{ .lookup = .{ .a = attr_id, .v = val } });
+            },
+            else => return null,
+        }
+    }
+
     /// The cell a pattern constant compares as at position `pos`.
     fn constCell(self: *Naive, c: ir.Constant, pos: usize, d: [5]Cell) !?Cell {
         const a = self.arena;
@@ -667,7 +575,7 @@ const Naive = struct {
             .lookup => |l| {
                 const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, l.attr)) orelse return null;
                 const vt = self.attr_types.get(attr_id) orelse return null;
-                const val = (try cellToVal(a, l.v, vt)) orelse return null;
+                const val = (try cellToVal(l.v, vt)) orelse return null;
                 const eid = (try self.dbv.entid(a, .{ .lookup = .{ .a = attr_id, .v = val } })) orelse return null;
                 return .{ .int = @intCast(eid) };
             },
@@ -738,7 +646,7 @@ const Naive = struct {
                 .lt, .le, .gt, .ge => {
                     var i: usize = 0;
                     while (i + 1 < cells.len) : (i += 1) {
-                        const o = cells[i].order(cells[i + 1]);
+                        const o = cells[i].compare(cells[i + 1]) orelse return error.ValueType;
                         const ok = switch (b) {
                             .lt => o == .lt,
                             .le => o != .gt,
@@ -795,40 +703,45 @@ const Naive = struct {
         return self.arena.dupe(Value, &.{result});
     }
 
+    /// Bind `x` to `c` in `e`: a variable bound already unifies, so
+    /// the environment is kept only when the values agree.
+    fn unify(e: Env, x: Var, c: Cell) bool {
+        if (e[x]) |have| return have.eql(c);
+        e[x] = c;
+        return true;
+    }
+
+    fn unifyTuple(self: *Naive, ts: []const ?Var, v: Value, env: Env) !?Env {
+        const e2 = try self.copy(env);
+        for (ts, (try seq(self.arena, v))[0..ts.len]) |t, item| if (t) |x| {
+            if (!unify(e2, x, Cell.fromValue(item))) return null;
+        };
+        return e2;
+    }
+
     fn bind(self: *Naive, b: ir.Binding, v: Value, env: Env) ![]Env {
         var out: std.ArrayList(Env) = .empty;
         switch (b) {
             .scalar => |x| if (!v.isNil()) {
                 const e2 = try self.copy(env);
-                e2[x] = Cell.fromValue(v);
-                try out.append(self.arena, e2);
+                if (unify(e2, x, Cell.fromValue(v))) try out.append(self.arena, e2);
             },
             .collection => |x| for (try seq(self.arena, v)) |item| {
                 const e2 = try self.copy(env);
-                e2[x] = Cell.fromValue(item);
-                try out.append(self.arena, e2);
+                if (unify(e2, x, Cell.fromValue(item))) try out.append(self.arena, e2);
             },
             .tuple => |ts| if (!v.isNil()) {
-                const e2 = try self.copy(env);
-                for (ts, (try seq(self.arena, v))[0..ts.len]) |t, item| if (t) |x| {
-                    e2[x] = Cell.fromValue(item);
-                };
-                try out.append(self.arena, e2);
+                if (try self.unifyTuple(ts, v, env)) |e2| try out.append(self.arena, e2);
             },
             .relation => |ts| for (try seq(self.arena, v)) |row| {
-                const e2 = try self.copy(env);
-                for (ts, (try seq(self.arena, row))[0..ts.len]) |t, item| if (t) |x| {
-                    e2[x] = Cell.fromValue(item);
-                };
-                try out.append(self.arena, e2);
+                if (try self.unifyTuple(ts, row, env)) |e2| try out.append(self.arena, e2);
             },
         }
         return out.toOwnedSlice(self.arena);
     }
 };
 
-fn cellToVal(arena: Allocator, c: Cell, vt: key.ValueType) !?key.Val {
-    _ = arena;
+fn cellToVal(c: Cell, vt: key.ValueType) !?key.Val {
     return switch (vt) {
         .string => if (c == .str) .{ .string = c.str } else null,
         .long => if (c == .int) .{ .long = c.int } else null,
@@ -961,6 +874,17 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/age ?a] [(< ?a 30)] [?e :person/name ?n]]", none, 1);
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/age ?a] [(>= ?a 30)] [(<= ?a 41)] [?e :person/name ?n]]", none, 4);
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(> ?n \"C\")]]", none, 4);
+    // A comparison across value types is an error, never a row.
+    for ([_][]const u8{
+        "[:find ?n :where [?e :person/name ?n] [(> ?n 5)]]",
+        "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(< ?a ?n)]]",
+        "[:find ?n :where [?e :person/name ?n] [?e :person/active ?x] [(<= ?x 1)]]",
+        "[:find ?n :where [?e :person/name ?n] [?e :person/role ?r] [(>= ?r :role/admin)] [(< ?r \"z\")]]",
+    }) |src| {
+        try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, src, none));
+        try testing.expectError(error.ValueType, Naive.run(fx, fx.arena(), dbv, src, none));
+    }
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/height ?h] [(< ?h 2)]]", none, 3);
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/height ?h] [(< 1.66 ?h)] [?e :person/name ?n]]", none, 2);
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(= ?n \"Cy\")]]", none, 1);
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(not= ?n \"Cy\")]]", none, 5);
@@ -983,6 +907,28 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     try checkCount(fx, dbv, "[:find ?t :where [?e :person/name \"Ann\"] [?e :person/age ?a] [(tuple ?a \"x\") ?t]]", none, 1);
     try checkCount(fx, dbv, "[:find ?a ?b :where [(ground [10 20]) ?t] [(untuple ?t) [?a ?b]]]", none, 1);
     try checkCount(fx, dbv, "[:find ?n ?a2 :where [?e :person/name ?n] [?e :person/age ?a] [(add ?a ?a) ?a2] [(> ?a2 60)]]", none, 3);
+    // An output variable bound before the step unifies: the clause
+    // keeps the rows whose result equals the bound value, including
+    // when the planner runs a cheaper pattern before the function.
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(identity ?e) ?e]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(str ?n \"!\") ?n]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/age ?a] [(inc ?a) ?a] [?e :person/name ?n]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?a :where [?e :person/age ?a] [(identity ?e) ?e2] [?e2 :person/email \"ann@x\"]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(pair ?a ?n) [?a ?x]]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(pair ?n ?a) [?a ?x]]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(range 31) [?a ...]]]", none, 3);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(halves ?a) [[_ ?a]]]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(halves ?a) [[?a ?h]]]]", none, 6);
+
+    // A query is not capped in its number of variables.
+    {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(testing.allocator);
+        try src.appendSlice(testing.allocator, "[:find ?v99 :where [?e :person/age ?v0]");
+        for (1..100) |i| try src.print(testing.allocator, " [(inc ?v{d}) ?v{d}]", .{ i - 1, i });
+        try src.append(testing.allocator, ']');
+        try checkCount(fx, dbv, src.items, none, 5);
+    }
 
     // Aggregates and :with.
     try checkCount(fx, dbv, "[:find (count ?e) :where [?e :person/name _]]", none, 1);
@@ -1015,7 +961,7 @@ test "corpus: every :in form" {
 
     try checkCount(fx, dbv, "[:find ?e :in $ ?n :where [?e :person/name ?n]]", &.{ nil, try fx.str("Cy") }, 1);
     try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e :person/age ?a]]", &.{ nil, value.fromFixnum(30).? }, 2);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?t :where [?e :person/tags ?t]]", &.{ nil, value.fromKeywordId(try fx.kw("green")) }, 2);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?t :where [?e :person/tags ?t]]", &.{ nil, value.fromKeywordId(try fx.kwId("green")) }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, value.fromFixnum(@intCast(key.user_partition_start)).? }, 1);
     try checkCount(fx, dbv, "[:find ?e :in $ [?n ...] :where [?e :person/name ?n]]", &.{ nil, try fx.read("[\"Ann\" \"Bob\" \"Nobody\"]") }, 2);
     try checkCount(fx, dbv, "[:find ?e :in $ [?n ?a] :where [?e :person/name ?n] [?e :person/age ?a]]", &.{ nil, try fx.read("[\"Ann\" 30]") }, 1);
@@ -1024,25 +970,50 @@ test "corpus: every :in form" {
     try checkCount(fx, dbv, "[:find ?e :in $ ?lo ?hi :where [?e :person/age ?a] [(< ?lo ?a ?hi)]]", &.{ nil, value.fromFixnum(29).?, value.fromFixnum(34).? }, 3);
     try checkCount(fx, dbv, "[:find ?n ?x :in $ [?x ...] :where [?e :person/name ?n] [?e :person/age ?a] [(< ?a ?x)]]", &.{ nil, try fx.read("[27 31]") }, 4);
     try checkCount(fx, dbv, "[:find ?p :in $ % :where (admin ?p)]", &.{ nil, try fx.read(rules_src) }, 2);
-    try checkCount(fx, dbv, "[:find ?n :in $ % ?t :where (has-tag ?p ?t) [?p :person/name ?n]]", &.{ nil, try fx.read(rules_src), value.fromKeywordId(try fx.kw("green")) }, 4);
+    try checkCount(fx, dbv, "[:find ?n :in $ % ?t :where (has-tag ?p ?t) [?p :person/name ?n]]", &.{ nil, try fx.read(rules_src), value.fromKeywordId(try fx.kwId("green")) }, 4);
     try checkCount(fx, dbv, "[:find ?x :in $ ?x]", &.{ nil, value.fromFixnum(5).? }, 1);
     // A bound attribute variable, by id and by ident; an unknown ident matches nothing.
-    const name_id = (try dbv.entid(fx.arena(), .{ .ident = try fx.kw("person/name") })).?;
+    const name_id = (try dbv.entid(fx.arena(), .{ .ident = try fx.kwId("person/name") })).?;
     try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromFixnum(@intCast(name_id)).? }, 6);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kw("person/name")) }, 6);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a \"Cy\"]]", &.{ nil, value.fromKeywordId(try fx.kw("person/name")) }, 1);
-    try checkCount(fx, dbv, "[:find ?v :in $ ?a ?e :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kw("person/tags")), value.fromFixnum(@intCast(key.user_partition_start)).? }, 1);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kw("nope/attr")) }, 0);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("person/name")) }, 6);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a \"Cy\"]]", &.{ nil, value.fromKeywordId(try fx.kwId("person/name")) }, 1);
+    try checkCount(fx, dbv, "[:find ?v :in $ ?a ?e :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("person/tags")), value.fromFixnum(@intCast(key.user_partition_start)).? }, 1);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("nope/attr")) }, 0);
     // A bound value with no attribute: a string or keyword is matched across every attribute.
     try checkCount(fx, dbv, "[:find ?e :in $ ?v :where [?e _ ?v]]", &.{ nil, try fx.str("Cy") }, 1);
-    try checkCount(fx, dbv, "[:find ?e ?a :in $ ?v :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kw("green")) }, 2);
+    try checkCount(fx, dbv, "[:find ?e ?a :in $ ?v :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("green")) }, 2);
     try checkCount(fx, dbv, "[:find ?e :where [?e _ \"Cy\"]]", &.{nil}, 1);
     try checkCount(fx, dbv, "[:find ?e ?a :where [?e ?a \"Cy\"]]", &.{nil}, 1);
     try checkCount(fx, dbv, "[:find ?e :where [?e _ \"Nobody\"]]", &.{nil}, 0);
     try checkCount(fx, dbv, "[:find ?x ?y :in $ [?x ...] [?y ...]]", &.{ nil, try fx.read("[1 2]"), try fx.read("[3 4 3]") }, 4);
+    // A lookup ref or an ident bound to a variable in an entity position, or
+    // in the value position of a ref attribute, is the entity id; one that
+    // resolves to nothing binds nothing. Keyword-attribute values stay
+    // keywords.
+    const ann_ref = try fx.read("[:person/email \"ann@x\"]");
+    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, ann_ref }, 1);
+    const as_eid = try check(fx, dbv, "[:find ?e :in $ ?e :where [?e :person/name _]]", &.{ nil, ann_ref });
+    try testing.expectEqual(@as(i64, @intCast(key.user_partition_start)), as_eid.cell(0, 0).int);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?e :where [?e :db/ident _]]", &.{ nil, value.fromKeywordId(try fx.kwId("role/admin")) }, 1);
+    try checkCount(fx, dbv, "[:find ?n :in $ [?e ...] :where [?e :person/name ?n]]", &.{ nil, try fx.read("[[:person/email \"ann@x\"] [:person/email \"bob@x\"] [:person/email \"nobody@x\"]]") }, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?b :where [?e :person/boss ?b] [?e :person/name ?n]]", &.{ nil, ann_ref }, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ [?b ?a] :where [?e :person/boss ?b] [?e :person/age ?a] [?e :person/name ?n]]", &.{ nil, try fx.read("[[:person/email \"ann@x\"] 26]") }, 1);
+    try checkCount(fx, dbv, "[:find ?n :in $ [[?e ?a]] :where [?e :person/age ?a] [?e :person/name ?n]]", &.{ nil, try fx.read("[[[:person/email \"ann@x\"] 30] [[:person/email \"bob@x\"] 1] [:role/admin 5]]") }, 1);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?r :where [?e :person/role ?r] [?e :person/name ?n]]", &.{ nil, value.fromKeywordId(try fx.kwId("role/admin")) }, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/email \"nobody@x\"]") }, 0);
+    try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/email 5]") }));
+    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, value.fromKeywordId(try fx.kwId("role/nobody")) }, 0);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where (not [?e :person/age 30]) [?e :person/name ?n]]", &.{ nil, ann_ref }, 0);
+    try testing.expectError(error.TxData, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/name \"Ann\"]") }));
+    try testing.expectError(error.UnknownAttribute, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:nope/attr \"Ann\"]") }));
     // Wrong input count and shape.
     try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?e :in $ ?n :where [?e :person/name ?n]]", &.{nil}));
-    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?e :in $ [?n ...] :where [?e :person/name ?n]]", &.{ nil, value.fromFixnum(1).? }));
+    try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, "[:find ?e :in $ [?n ...] :where [?e :person/name ?n]]", &.{ nil, value.fromFixnum(1).? }));
+    try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, "[:find ?e :in $ [[?n ?a]] :where [?e :person/name ?n]]", &.{ nil, try fx.read("[[\"Ann\"]]") }));
+    // An unknown attribute in a lookup-ref input is named in the diagnostic.
+    var in_diag: query.Diag = .{};
+    try testing.expectError(error.UnknownAttribute, runEngineDiag(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:nope/attr \"Ann\"]") }, &in_diag));
+    try testing.expectEqual(try fx.kwId("nope/attr"), in_diag.attr.?.asKeywordId());
 }
 
 test "corpus: not, not-join, or, or-join, and" {
@@ -1070,8 +1041,28 @@ test "corpus: not, not-join, or, or-join, and" {
     try checkCount(fx, dbv, "[:find ?n :where (and [?e :person/name ?n] [?e :person/active true])]", none, 3);
     try checkCount(fx, dbv, "[:find ?o :where (or-join [?o] (and [?o :order/total ?t] [(> ?t 50.0)]) [?o :order/items \"pear\"])]", none, 2);
     // Errors: not with nothing bound outside, or branches with different vars, unbound pattern.
-    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?n :where [?e :person/name ?n] (not [?x :person/tags :blue])]", none));
-    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?n :where [?e :person/name ?n] (or [?e :person/tags :blue] [?x :person/tags :green])]", none));
+    // Every planner refusal carries a reason.
+    for ([_][]const u8{
+        "[:find ?n :where [?e :person/name ?n] (not [?x :person/tags :blue])]",
+        "[:find ?n :where [?e :person/name ?n] (or [?e :person/tags :blue] [?x :person/tags :green])]",
+        "[:find ?e :where [?e :person/name ?n] [(< ?zz 3)]]",
+        "[:find ?e :where [?e [:person/email \"ann@x\"] ?v]]",
+        "[:find ?e :where [?e \"name\" ?v]]",
+        "[:find ?e :where [?e :person/name ?v \"tx\"]]",
+        "[:find ?e :where [?e :person/name ?v _ 1]]",
+        "[:find ?e :where [\"ann\" :person/name ?v]]",
+        "[:find ?e :where [[:person/name \"Ann\"] :person/age ?e]]",
+    }) |src| {
+        var d: query.Diag = .{};
+        try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, src, none, &d));
+        try testing.expect(d.message.len > 0);
+    }
+    var d_attr: query.Diag = .{};
+    try testing.expectError(error.UnknownAttribute, runEngineDiag(fx, fx.arena(), dbv, "[:find ?e :where [?e :nope/attr ?v]]", none, &d_attr));
+    try testing.expectEqual(try fx.kwId("nope/attr"), d_attr.attr.?.asKeywordId());
+    d_attr = .{};
+    try testing.expectError(error.UnknownAttribute, runEngineDiag(fx, fx.arena(), dbv, "[:find ?e :where [?e 4000 ?v]]", none, &d_attr));
+    try testing.expectEqual(@as(i64, 4000), d_attr.attr.?.asFixnum());
     try testing.expectError(error.UnboundPattern, runEngine(fx, fx.arena(), dbv, "[:find ?e :where [?e ?a ?v]]", none));
     try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?e :where [?e :person/name ?n] [(< ?zz 3)]]", none));
 }
@@ -1109,9 +1100,16 @@ test "corpus: rules" {
     try checkCount(fx, dbv, "[:find ?l :in $ % :where [?n :node/label ?l] (reach ?n ?n)]", args, 3);
     try checkCount(fx, dbv, "[:find (count ?b) :in $ % :where [?a :node/label \"n3\"] (reach ?a ?b)]", args, 1);
     // Errors: unknown rule, arity, required argument unbound.
-    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?a :in $ % :where (nope ?a)]", args));
-    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?a :in $ % :where (admin ?a ?b)]", args));
-    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?a ?l :in $ % :where (reach-label ?a ?l)]", args));
+    for ([_][]const u8{
+        "[:find ?a :in $ % :where (nope ?a)]",
+        "[:find ?a :in $ % :where (admin ?a ?b)]",
+        "[:find ?a ?l :in $ % :where (reach-label ?a ?l)]",
+        "[:find ?a :in $ % :where (admin $)]",
+    }) |src| {
+        var d: query.Diag = .{};
+        try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, src, args, &d));
+        try testing.expect(d.message.len > 0);
+    }
 }
 
 test "corpus: as-of, since, history views" {
@@ -1220,6 +1218,9 @@ test "results materialise as set, scalar, collection, tuple; caches; explain" {
     try testing.expect(std.mem.indexOf(u8, text, "scan [?e! :person/name ?n _ _] eavt est=1") != null);
     try testing.expect(std.mem.indexOf(u8, text, "not-join [?e]") != null);
     try testing.expect(std.mem.indexOf(u8, text, "or-join [?e] branches=1") != null);
+    out.clearRetainingCapacity();
+    try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?a :where [?e :person/age ?a] [(identity ?e) ?e2] [?e2 :person/email \"ann@x\"]]"), dbv, none, &diag, opts, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "3. bind (identity ?e) -> ?e2!") != null);
 }
 
 test "transitive closure over a 5k-edge chain" {

@@ -233,12 +233,6 @@ pub const Ir = struct {
         return self.arena_state.allocator();
     }
 
-    /// Is every element of `find` an aggregate?
-    pub fn allAggregates(self: *const Ir) bool {
-        for (self.find) |f| if (f == .variable) return false;
-        return true;
-    }
-
     pub fn hasAggregates(self: *const Ir) bool {
         for (self.find) |f| if (f == .agg) return true;
         return false;
@@ -256,30 +250,34 @@ pub const Rule = struct {
 };
 
 /// A parsed `%` input. Rules have their own variable table; a call
-/// site renames them into the plan's.
+/// site renames them into the plan's. Invariants:
+///   - Rules with one name are contiguous in `rules`, in source order
+///     (`parse.zig` groups them), so `byName` is one slice.
+///   - A set with `arena_state` owns its rules and is freed by
+///     `deinit`; one without (`no_rules`, or a set a test builds over
+///     static rules) is not, and `deinit` is a no-op.
 pub const RuleSet = struct {
-    arena_state: std.heap.ArenaAllocator,
+    arena_state: ?std.heap.ArenaAllocator,
     vars: []const VarInfo,
     rules: []const Rule,
 
     pub fn deinit(self: *RuleSet) void {
-        const gpa = self.arena_state.child_allocator;
-        self.arena_state.deinit();
-        gpa.destroy(self);
+        if (self.arena_state) |*state| {
+            const gpa = state.child_allocator;
+            state.deinit();
+            gpa.destroy(self);
+        }
     }
 
-    pub fn arena(self: *RuleSet) Allocator {
-        return self.arena_state.allocator();
-    }
-
+    /// Every rule named `name`, or null.
     pub fn byName(self: *const RuleSet, name: u32) ?[]const Rule {
         var lo: ?usize = null;
         var hi: usize = 0;
         for (self.rules, 0..) |r, i| {
-            if (r.name == name) {
-                if (lo == null) lo = i;
-                hi = i + 1;
-            }
+            if (r.name != name) continue;
+            std.debug.assert(lo == null or hi == i);
+            if (lo == null) lo = i;
+            hi = i + 1;
         }
         const start = lo orelse return null;
         return self.rules[start..hi];
@@ -288,7 +286,7 @@ pub const RuleSet = struct {
 
 /// The empty rule set, for queries without `%`.
 pub const no_rules: RuleSet = .{
-    .arena_state = undefined,
+    .arena_state = null,
     .vars = &.{},
     .rules = &.{},
 };

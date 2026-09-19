@@ -22,6 +22,9 @@
 //!   - `finish` forms the basis set (distinct tuples over the find and
 //!     `:with` variables), groups and aggregates it, and copies the
 //!     result into the VM heap as the find spec asks.
+//!
+//! Every function on a path to the call hook is `anyerror`: the hook
+//! raises whatever the VM raises, and that passes through untouched.
 
 const std = @import("std");
 const value = @import("value");
@@ -39,6 +42,7 @@ const relation = @import("../relation.zig");
 const ir = @import("ir.zig");
 const plan_mod = @import("plan.zig");
 const rules_mod = @import("rules.zig");
+const marshal = @import("../marshal.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -48,6 +52,8 @@ const Read = db_mod.Read;
 const Var = ir.Var;
 const Cell = ir.Cell;
 const Relation = relation.Relation;
+const Ir = ir.Ir;
+const Diag = plan_mod.Diag;
 const Plan = plan_mod.Plan;
 const Step = plan_mod.Step;
 const Scan = plan_mod.Scan;
@@ -65,6 +71,8 @@ pub const Exec = struct {
     heap: *Heap,
     interner: *Interner,
     hook: ?CallHook,
+    /// Where an `UnknownAttribute` in an input leaves its name.
+    diag: ?*Diag = null,
 
     /// Run `p` from `input`, which binds at least `p.input`.
     pub fn runPlan(self: *Exec, p: *const Plan, input: Relation) anyerror!Relation {
@@ -90,19 +98,7 @@ pub const Exec = struct {
     /// The cell of a datom value: ids as `int`, keywords as VM keyword
     /// ids, uuids as text.
     pub fn valCell(self: *Exec, v: key.Val) !Cell {
-        return switch (v) {
-            .boolean => |b| .{ .boolean = b },
-            .long, .instant => |n| .{ .int = n },
-            .double => |d| .{ .double = d },
-            .keyword => |id| .{ .keyword = (try self.read.db.conn.idents.internOf(self.read.txn, id)) orelse return error.Corrupted },
-            .ref => |e| .{ .int = @intCast(e) },
-            .string, .bytes => |s| .{ .str = s },
-            .uuid => |u| blk: {
-                const text = try self.arena.alloc(u8, 36);
-                datom_mod.uuidToText(text[0..36], u);
-                break :blk .{ .str = text };
-            },
-        };
+        return marshal.cellOf(self.read, self.arena, v);
     }
 
     fn datomCells(self: *Exec, d: datom_mod.Datom) ![5]Cell {
@@ -223,7 +219,7 @@ pub const Exec = struct {
             if (slots[2] == .constant and slots[2].constant.bytes != null) {
                 comps.v = slots[2].constant.bytes;
             } else if (attr) |at| {
-                const val = (try plan_mod.encodeCell(self.read, c, at.value_type)) orelse return;
+                const val = (try marshal.encodeCell(self.read, c, at.value_type)) orelse return;
                 comps.v = key.valBytes(self.arena, val) catch |err| switch (err) {
                     error.ValueType => return,
                     else => return err,
@@ -275,7 +271,7 @@ pub const Exec = struct {
     }
 
     fn callUser(self: *Exec, sym: u32, cells: []const Cell) anyerror!Value {
-        const hook = self.hook orelse return error.QuerySyntax;
+        const hook = self.hook orelse return error.NoHook;
         const args = try self.arena.alloc(Value, cells.len);
         for (cells, args) |c, *a| a.* = try self.cellValue(c);
         return hook.call(hook.ctx, sym, args);
@@ -299,9 +295,8 @@ pub const Exec = struct {
     fn builtinPred(self: *Exec, b: ir.Builtin, args: []const Cell) anyerror!bool {
         switch (b) {
             .lt, .le, .gt, .ge => {
-                if (args.len < 2) return error.QuerySyntax;
                 for (args[0 .. args.len - 1], args[1..]) |x, y| {
-                    const o = x.order(y);
+                    const o = x.compare(y) orelse return error.ValueType;
                     const ok = switch (b) {
                         .lt => o == .lt,
                         .le => o != .gt,
@@ -314,20 +309,15 @@ pub const Exec = struct {
                 return true;
             },
             .eq => {
-                if (args.len < 2) return error.QuerySyntax;
                 for (args[1..]) |y| if (!args[0].eql(y)) return false;
                 return true;
             },
             .ne => {
-                if (args.len < 2) return error.QuerySyntax;
                 for (args[1..]) |y| if (!args[0].eql(y)) return true;
                 return false;
             },
-            .missing => {
-                if (args.len != 3) return error.QuerySyntax;
-                return (try self.firstValue(args[1], args[2])) == null;
-            },
-            .ground, .get_else, .tuple, .untuple => return error.QuerySyntax,
+            .missing => return (try self.firstValue(args[1], args[2])) == null,
+            .ground, .get_else, .tuple, .untuple => unreachable,
         }
     }
 
@@ -335,7 +325,7 @@ pub const Exec = struct {
     /// entity `e`, or null.
     fn firstValue(self: *Exec, e: Cell, attr: Cell) anyerror!?Cell {
         const eid = e.asEid() orelse return null;
-        if (attr != .keyword) return error.QuerySyntax;
+        if (attr != .keyword) return error.ValueType;
         const a = (try self.read.db.conn.idents.idOf(self.read.txn, attr.keyword)) orelse return null;
         var it = try self.read.scan(self.arena, .eavt, .{ .e = eid, .a = a });
         const d = (try it.next()) orelse return null;
@@ -351,12 +341,8 @@ pub const Exec = struct {
             const cells = try self.argCells(&rel, i, b.call.args);
             const result: Value = switch (b.call.f) {
                 .builtin => |bi| switch (bi) {
-                    .ground, .untuple => blk: {
-                        if (cells.len != 1) return error.QuerySyntax;
-                        break :blk try self.cellValue(cells[0]);
-                    },
+                    .ground, .untuple => try self.cellValue(cells[0]),
                     .get_else => blk: {
-                        if (cells.len != 4) return error.QuerySyntax;
                         const found = try self.firstValue(cells[1], cells[2]);
                         break :blk try self.cellValue(found orelse cells[3]);
                     },
@@ -365,7 +351,7 @@ pub const Exec = struct {
                         for (cells, vals) |c, *v| v.* = try self.cellValue(c);
                         break :blk try vector_mod.fromSlice(self.heap, vals);
                     },
-                    else => return error.QuerySyntax,
+                    .lt, .le, .gt, .ge, .eq, .ne, .missing => unreachable,
                 },
                 .user => |sym| try self.callUser(sym, cells),
             };
@@ -379,66 +365,60 @@ pub const Exec = struct {
     }
 
     /// Append the rows `result` binds under `b.out`; `row[0..base]`
-    /// holds the input row and the rest is filled here.
+    /// holds the input row. An output variable bound before the step
+    /// unifies: the row is kept only when the result equals its value.
+    /// A result that is not the collection its binding form needs is
+    /// `ValueType`.
     fn bindValue(self: *Exec, b: *const plan_mod.Bind, result: Value, row: []Cell, base: usize, out: *Relation) anyerror!void {
         switch (b.out) {
-            .scalar => {
+            .scalar => |v| {
                 if (result.isNil()) return;
-                row[base] = Cell.fromValue(result);
-                try out.append(row);
+                if (put(out, row, base, v, Cell.fromValue(result))) try out.append(row);
             },
-            .collection => {
-                const items = (try self.seqElems(result)) orelse return error.QuerySyntax;
+            .collection => |v| {
+                const items = (try self.seqElems(result)) orelse return error.ValueType;
                 for (items) |x| {
-                    row[base] = Cell.fromValue(x);
-                    try out.append(row);
+                    if (put(out, row, base, v, Cell.fromValue(x))) try out.append(row);
                 }
             },
             .tuple => |ts| {
                 if (result.isNil()) return;
-                try self.fillTuple(ts, result, row, base);
-                try out.append(row);
+                if (try self.fillTuple(out, ts, result, row, base)) try out.append(row);
             },
             .relation => |ts| {
-                const items = (try self.seqElems(result)) orelse return error.QuerySyntax;
+                const items = (try self.seqElems(result)) orelse return error.ValueType;
                 for (items) |x| {
-                    try self.fillTuple(ts, x, row, base);
-                    try out.append(row);
+                    if (try self.fillTuple(out, ts, x, row, base)) try out.append(row);
                 }
             },
         }
     }
 
-    fn fillTuple(self: *Exec, ts: []const ?Var, v: Value, row: []Cell, base: usize) anyerror!void {
-        const items = (try self.seqElems(v)) orelse return error.QuerySyntax;
-        if (items.len < ts.len) return error.QuerySyntax;
-        var k: usize = base;
+    /// Place `cell` in the row for `v`: written when the step binds
+    /// `v` (its column is past `base`), compared when an earlier step
+    /// did. False when the comparison fails.
+    fn put(out: *const Relation, row: []Cell, base: usize, v: Var, cell: Cell) bool {
+        const col = out.colOf(v).?;
+        if (col < base) return row[col].eql(cell);
+        row[col] = cell;
+        return true;
+    }
+
+    /// Fill the tuple binding `ts` from `v`; false when a bound
+    /// variable disagrees with its element.
+    fn fillTuple(self: *Exec, out: *const Relation, ts: []const ?Var, v: Value, row: []Cell, base: usize) anyerror!bool {
+        const items = (try self.seqElems(v)) orelse return error.ValueType;
+        if (items.len < ts.len) return error.ValueType;
         for (ts, items[0..ts.len]) |t, x| {
-            if (t == null) continue;
-            row[k] = Cell.fromValue(x);
-            k += 1;
+            const tv = t orelse continue;
+            if (!put(out, row, base, tv, Cell.fromValue(x))) return false;
         }
+        return true;
     }
 
     /// The elements of a vector, list or set value, or null.
     pub fn seqElems(self: *Exec, v: Value) !?[]Value {
-        var out: std.ArrayList(Value) = .empty;
-        switch (v.kind()) {
-            .persistent_vector => {
-                var it = vector_mod.Cursor.init(v);
-                while (it.next()) |x| try out.append(self.arena, x);
-            },
-            .list => {
-                var it = list_mod.Cursor.init(v);
-                while (it.next()) |x| try out.append(self.arena, x);
-            },
-            .persistent_set => {
-                var it = champ.setIter(v);
-                while (it.next()) |x| try out.append(self.arena, x);
-            },
-            else => return null,
-        }
-        return try out.toOwnedSlice(self.arena);
+        return marshal.collection(self.arena, v);
     }
 
     // ── not, or, source ───────────────────────────────────────────
@@ -463,27 +443,8 @@ pub const Exec = struct {
     }
 
     fn execSource(self: *Exec, src: *const plan_mod.Source, rel: Relation) anyerror!Relation {
-        const slot = src.slot.rel orelse return error.QuerySyntax;
-        var distinct: std.ArrayList(Var) = .empty;
-        for (src.vars) |v| try ir.addVar(self.arena, &distinct, v);
-        var view: Relation = undefined;
-        if (distinct.items.len == src.vars.len) {
-            view = .{ .arena = self.arena, .vars = src.vars, .cols = slot.cols, .rows = slot.rows };
-        } else {
-            view = try Relation.init(self.arena, distinct.items);
-            const cells = try self.arena.alloc(Cell, distinct.items.len);
-            var i: usize = 0;
-            rows: while (i < slot.rows) : (i += 1) {
-                for (src.vars, 0..) |v, pos| {
-                    const d = std.mem.indexOfScalar(Var, distinct.items, v).?;
-                    const c = slot.cell(i, pos);
-                    if (std.mem.indexOfScalar(Var, src.vars, v).? == pos) {
-                        cells[d] = c;
-                    } else if (!cells[d].eql(c)) continue :rows;
-                }
-                try view.append(cells);
-            }
-        }
+        // A fix step fills every slot of its instances before running them.
+        const view = try Relation.viewAs(self.arena, src.vars, src.slot.rel.?);
         return rel.hashJoin(&view);
     }
 
@@ -491,8 +452,16 @@ pub const Exec = struct {
 
     /// The relation the `:in` bindings describe over `args`, which are
     /// positional with `in` (the `$` and `%` positions are ignored).
-    pub fn inputRelation(self: *Exec, in: []const ir.InBinding, args: []const Value) anyerror!Relation {
-        if (args.len != in.len) return error.QuerySyntax;
+    /// The relation the `:in` bindings of `q` make of `args`, one per
+    /// binding. A lookup ref or an ident bound to a variable in an
+    /// entity position, or in the value position of a ref attribute,
+    /// becomes the entity id, and a row whose reference resolves to
+    /// nothing is dropped; a keyword bound to a variable that is also a
+    /// keyword attribute's value stays a keyword. An input that is not
+    /// the collection its binding form needs is `ValueType`.
+    pub fn inputRelation(self: *Exec, q: *const Ir, args: []const Value) anyerror!Relation {
+        const in = q.in;
+        std.debug.assert(args.len == in.len);
         var rel = try Relation.unit(self.arena);
         for (in, args) |b, a| {
             const part: Relation = switch (b) {
@@ -504,29 +473,88 @@ pub const Exec = struct {
                 },
                 .collection => |v| blk: {
                     var r = try Relation.init(self.arena, &.{v});
-                    for ((try self.seqElems(a)) orelse return error.QuerySyntax) |x| try r.append(&.{Cell.fromValue(x)});
+                    for ((try self.seqElems(a)) orelse return error.ValueType) |x| try r.append(&.{Cell.fromValue(x)});
                     break :blk try r.dedup();
                 },
                 .tuple => |ts| blk: {
                     var r = try Relation.init(self.arena, try tupleVars(self.arena, ts));
                     const row = try self.arena.alloc(Cell, r.vars.len);
-                    try self.fillTuple(ts, a, row, 0);
-                    try r.append(row);
+                    if (try self.fillTuple(&r, ts, a, row, 0)) try r.append(row);
                     break :blk r;
                 },
                 .relation => |ts| blk: {
                     var r = try Relation.init(self.arena, try tupleVars(self.arena, ts));
                     const row = try self.arena.alloc(Cell, r.vars.len);
-                    for ((try self.seqElems(a)) orelse return error.QuerySyntax) |x| {
-                        try self.fillTuple(ts, x, row, 0);
-                        try r.append(row);
+                    for ((try self.seqElems(a)) orelse return error.ValueType) |x| {
+                        if (try self.fillTuple(&r, ts, x, row, 0)) try r.append(row);
                     }
                     break :blk try r.dedup();
                 },
             };
             rel = try rel.hashJoin(&part);
         }
-        return rel;
+        return self.resolveInputs(q, rel);
+    }
+
+    const InputRole = struct { entity: bool = false, keyword: bool = false };
+
+    /// `rel` with the entity-role columns resolved (see `inputRelation`).
+    fn resolveInputs(self: *Exec, q: *const Ir, rel: Relation) anyerror!Relation {
+        const roles = try self.arena.alloc(InputRole, q.vars.len);
+        @memset(roles, .{});
+        try self.inputRoles(q.where, roles);
+        var cols: std.ArrayList(usize) = .empty;
+        for (rel.vars, 0..) |v, i| if (roles[v].entity and !roles[v].keyword) try cols.append(self.arena, i);
+        if (cols.items.len == 0) return rel;
+
+        var out = try Relation.init(self.arena, rel.vars);
+        const row = try self.arena.alloc(Cell, rel.vars.len);
+        var i: usize = 0;
+        rows: while (i < rel.rows) : (i += 1) {
+            rel.rowInto(i, row);
+            for (cols.items) |c| {
+                if (row[c] != .keyword and row[c] != .vm) continue;
+                const e = (try self.inputEntity(row[c])) orelse continue :rows;
+                row[c] = .{ .int = @intCast(e) };
+            }
+            try out.append(row);
+        }
+        return out;
+    }
+
+    /// Mark the variables in an entity position or a ref attribute's
+    /// value position, and those in a keyword attribute's value position.
+    fn inputRoles(self: *Exec, clauses: []const ir.Clause, roles: []InputRole) anyerror!void {
+        for (clauses) |c| switch (c) {
+            .pattern => |p| {
+                if (p.e.asVar()) |v| roles[v].entity = true;
+                const v = p.v.asVar() orelse continue;
+                if (p.a != .constant or p.a.constant != .cell or p.a.constant.cell != .keyword) continue;
+                const id = (try self.read.db.conn.idents.idOf(self.read.txn, p.a.constant.cell.keyword)) orelse continue;
+                const at = (try self.read.attr(@intCast(id))) orelse continue;
+                if (at.value_type == .ref) roles[v].entity = true;
+                if (at.value_type == .keyword) roles[v].keyword = true;
+            },
+            .not => |n| try self.inputRoles(n.body, roles),
+            .@"or" => |o| for (o.branches) |b| try self.inputRoles(b, roles),
+            .pred, .bind, .rule, .source => {},
+        };
+    }
+
+    /// The entity an ident or lookup-ref input names (the `marshal`
+    /// contract), or null when there is none; the diagnostic carries
+    /// what a failing lookup ref named.
+    fn inputEntity(self: *Exec, c: Cell) anyerror!?u64 {
+        const v: Value = switch (c) {
+            .keyword => |kw| value.fromKeywordId(kw),
+            .vm => |v| v,
+            else => return null,
+        };
+        var fault: db_mod.Fault = .{};
+        return marshal.entity(self.read, self.arena, v, &fault) catch |err| {
+            if (self.diag) |d| d.* = .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr };
+            return err;
+        };
     }
 
     fn tupleVars(arena: Allocator, ts: []const ?Var) ![]Var {

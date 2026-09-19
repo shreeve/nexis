@@ -45,9 +45,11 @@ const key = @import("key.zig");
 const db_mod = @import("db.zig");
 const schema_mod = @import("schema.zig");
 const store_mod = @import("store.zig");
+const idents_mod = @import("idents.zig");
 const relation = @import("relation.zig");
 const parse_mod = @import("query/parse.zig");
 const plan_mod = @import("query/plan.zig");
+const marshal = @import("marshal.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -69,6 +71,10 @@ pub const Error = error{
     HistoryView,
 };
 
+/// Everything a pull can fail with: its own errors, the entity
+/// contract's and the store's.
+pub const Failure = Error || marshal.Error || db_mod.Error || db_mod.ErrorsOf(DbValue.beginRead) || db_mod.ErrorsOf(Read.scan) || db_mod.ErrorsOf(db_mod.DatomScan.next) || db_mod.ErrorsOf(Read.ident) || db_mod.ErrorsOf(db_mod.Conn.valToValue) || db_mod.ErrorsOf(champ.mapEmpty) || db_mod.ErrorsOf(champ.mapAssoc) || db_mod.ErrorsOf(vector_mod.fromSlice) || db_mod.ErrorsOf(string_mod.fromBytes) || db_mod.ErrorsOf(idents_mod.Idents.internOf);
+
 /// Card-many values are cut here unless the spec says otherwise.
 pub const default_limit: u32 = 1000;
 
@@ -79,7 +85,7 @@ pub const default_limit: u32 = 1000;
 /// Pull `pattern` for the entity `e` (an eid, a lookup ref `[:attr v]`
 /// or an ident keyword) in `db`. The result lives in `heap`: a map, or
 /// nil when the entity has no datoms in this view.
-pub fn pull(gpa: Allocator, interner: *Interner, heap: *Heap, db: DbValue, pattern: Value, e: Value, diag: *Diag) anyerror!Value {
+pub fn pull(gpa: Allocator, interner: *Interner, heap: *Heap, db: DbValue, pattern: Value, e: Value, diag: *Diag) Failure!Value {
     var run: Run = undefined;
     try run.begin(gpa, interner, heap, db, pattern, diag);
     defer run.deinit();
@@ -87,7 +93,7 @@ pub fn pull(gpa: Allocator, interner: *Interner, heap: *Heap, db: DbValue, patte
 }
 
 /// Pull `pattern` for every entity of `es`, as a vector in their order.
-pub fn pullMany(gpa: Allocator, interner: *Interner, heap: *Heap, db: DbValue, pattern: Value, es: []const Value, diag: *Diag) anyerror!Value {
+pub fn pullMany(gpa: Allocator, interner: *Interner, heap: *Heap, db: DbValue, pattern: Value, es: []const Value, diag: *Diag) Failure!Value {
     var run: Run = undefined;
     try run.begin(gpa, interner, heap, db, pattern, diag);
     defer run.deinit();
@@ -105,7 +111,7 @@ const Run = struct {
     pattern: *const Pattern,
     puller: Puller,
 
-    fn begin(self: *Run, gpa: Allocator, interner: *Interner, heap: *Heap, db: DbValue, pattern: Value, diag: *Diag) anyerror!void {
+    fn begin(self: *Run, gpa: Allocator, interner: *Interner, heap: *Heap, db: DbValue, pattern: Value, diag: *Diag) Failure!void {
         if (db.history) return error.HistoryView;
         self.arena_state = std.heap.ArenaAllocator.init(gpa);
         errdefer self.arena_state.deinit();
@@ -126,7 +132,7 @@ const Run = struct {
         return self.arena_state.allocator();
     }
 
-    fn one(self: *Run, e: Value) anyerror!Value {
+    fn one(self: *Run, e: Value) Failure!Value {
         const eid = try self.puller.resolveEntity(e);
         return (try self.puller.root(self.pattern, eid)) orelse value.nilValue();
     }
@@ -223,7 +229,7 @@ const Parser = struct {
         return v.isSymbol() and std.mem.eql(u8, self.interner.symbolName(v.asSymbolId()), name);
     }
 
-    fn parsePattern(self: *Parser, v: Value) anyerror!*Pattern {
+    fn parsePattern(self: *Parser, v: Value) Failure!*Pattern {
         const items = try self.elems(v);
         if (items.len == 0) return self.fail("empty pattern");
         const top = self.index == null;
@@ -242,7 +248,7 @@ const Parser = struct {
         return pat;
     }
 
-    fn parseSpec(self: *Parser, v: Value, pat: *Pattern, specs: *std.ArrayList(Spec)) anyerror!void {
+    fn parseSpec(self: *Parser, v: Value, pat: *Pattern, specs: *std.ArrayList(Spec)) Failure!void {
         switch (v.kind()) {
             .keyword => {
                 if (v.asKeywordId() == self.k_db_id) return;
@@ -271,7 +277,7 @@ const Parser = struct {
     }
 
     /// A map key: an attribute name or an attribute expression.
-    fn parseKey(self: *Parser, v: Value) anyerror!Spec {
+    fn parseKey(self: *Parser, v: Value) Failure!Spec {
         return switch (v.kind()) {
             .keyword => self.attrSpec(v.asKeywordId()),
             .list, .persistent_vector => self.parseExpr(v),
@@ -279,7 +285,7 @@ const Parser = struct {
         };
     }
 
-    fn parseSub(self: *Parser, v: Value) anyerror!Sub {
+    fn parseSub(self: *Parser, v: Value) Failure!Sub {
         switch (v.kind()) {
             .symbol => {
                 if (self.isSym(v, "...")) return .{ .recurse = null };
@@ -296,7 +302,7 @@ const Parser = struct {
     }
 
     /// `(attr opt+)`, `[attr opt+]`, `(limit attr n)` or `(default attr v)`.
-    fn parseExpr(self: *Parser, v: Value) anyerror!Spec {
+    fn parseExpr(self: *Parser, v: Value) Failure!Spec {
         const items = try self.elems(v);
         if (items.len == 0) return self.fail("empty attribute expression");
         const head = items[0];
@@ -339,7 +345,7 @@ const Parser = struct {
 
     /// The spec of an attribute name, forward or reverse, with the
     /// default limit and no sub-pattern.
-    fn attrSpec(self: *Parser, k: u32) anyerror!Spec {
+    fn attrSpec(self: *Parser, k: u32) Failure!Spec {
         const name = self.interner.keywordName(k);
         const slash = std.mem.lastIndexOfScalar(u8, name, '/');
         const local_start = if (slash) |s| s + 1 else 0;
@@ -348,8 +354,13 @@ const Parser = struct {
             const forward = try std.mem.concat(self.arena, u8, &.{ name[0..local_start], name[local_start + 1 ..] });
             break :blk try self.interner.internKeyword(forward);
         } else k;
-        const id = (try self.read.db.conn.idents.idOf(self.read.txn, attr_k)) orelse return error.UnknownAttribute;
-        const attr = (try self.read.attr(id)) orelse return error.UnknownAttribute;
+        const attr = blk: {
+            if (try self.read.db.conn.idents.idOf(self.read.txn, attr_k)) |id| {
+                if (try self.read.attr(id)) |attr| break :blk attr;
+            }
+            self.diag.* = .{ .clause = self.index, .message = "unknown attribute", .attr = value.fromKeywordId(k) };
+            return error.UnknownAttribute;
+        };
         if (reverse and attr.value_type != .ref) return self.fail("reverse reference on a non-ref attribute");
         const spec: Spec = .{
             .attr = attr,
@@ -396,27 +407,18 @@ const Puller = struct {
     }
 
     /// The eid of an entity argument: an eid, a lookup ref or an ident.
-    fn resolveEntity(self: *Puller, e: Value) anyerror!u64 {
-        switch (e.kind()) {
-            .fixnum => {
-                const n = e.asFixnum();
-                if (n <= 0 or n > key.id_max) return error.NoEntity;
-                return @intCast(n);
-            },
-            .keyword => return (try self.read.entid(self.arena, .{ .ident = e.asKeywordId() })) orelse error.NoEntity,
-            .persistent_vector => {
-                if (vector_mod.count(e) != 2 or vector_mod.nth(e, 0).kind() != .keyword) return self.fail("lookup ref must be [attr value]");
-                const k = vector_mod.nth(e, 0).asKeywordId();
-                const id = (try self.read.db.conn.idents.idOf(self.read.txn, k)) orelse return error.UnknownAttribute;
-                const attr = (try self.read.attr(id)) orelse return error.UnknownAttribute;
-                const v = (try plan_mod.encodeCell(self.read, Cell.fromValue(vector_mod.nth(e, 1)), attr.value_type)) orelse return error.ValueType;
-                return (try self.read.entid(self.arena, .{ .lookup = .{ .a = id, .v = v } })) orelse error.NoEntity;
-            },
-            else => return self.fail("entity must be an eid, a lookup ref or an ident"),
-        }
+    /// The entity to pull: the `marshal` contract, where a reference
+    /// that names nothing is `NoEntity`.
+    fn resolveEntity(self: *Puller, e: Value) Failure!u64 {
+        var fault: db_mod.Fault = .{};
+        const eid = marshal.entity(self.read, self.arena, e, &fault) catch |err| {
+            self.diag.* = .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr };
+            return err;
+        };
+        return eid orelse error.NoEntity;
     }
 
-    fn root(self: *Puller, pat: *const Pattern, e: u64) anyerror!?Value {
+    fn root(self: *Puller, pat: *const Pattern, e: u64) Failure!?Value {
         self.path.clearRetainingCapacity();
         try self.path.append(self.arena, e);
         return self.entity(pat, e, pat.budget);
@@ -436,7 +438,7 @@ const Puller = struct {
 
     /// `{:db/id e}` with `:db/ident` when the entity has one; idents
     /// live in the attribute partition, so only those ids are probed.
-    fn refMap(self: *Puller, e: u64) anyerror!Value {
+    fn refMap(self: *Puller, e: u64) Failure!Value {
         var m = try champ.mapEmpty(self.heap);
         m = try self.assoc(m, self.k_db_id, try eidValue(e));
         if (key.isAttrPartition(e)) {
@@ -447,7 +449,7 @@ const Puller = struct {
 
     /// The pattern applied to `e`: null when the entity has no datoms
     /// in this view. `budget` is the remaining depth per spec.
-    fn entity(self: *Puller, pat: *const Pattern, e: u64, budget: []const ?u32) anyerror!?Value {
+    fn entity(self: *Puller, pat: *const Pattern, e: u64, budget: []const ?u32) Failure!?Value {
         var m = try champ.mapEmpty(self.heap);
         m = try self.assoc(m, self.k_db_id, try eidValue(e));
         var any = false;
@@ -487,17 +489,18 @@ const Puller = struct {
     }
 
     /// One attribute of a `*` pull, as a bare spec.
-    fn wildAttr(self: *Puller, m: Value, a: u32, vals: []const Val, covered: *const std.AutoHashMapUnmanaged(u32, void)) anyerror!Value {
+    fn wildAttr(self: *Puller, m: Value, a: u32, vals: []const Val, covered: *const std.AutoHashMapUnmanaged(u32, void)) Failure!Value {
         if (covered.contains(a)) return m;
         const attr = (try self.read.attr(a)) orelse return error.Corrupted;
         const k = (try self.read.db.conn.idents.internOf(self.read.txn, a)) orelse return error.Corrupted;
         const spec: Spec = .{ .attr = attr, .reverse = false, .key = k, .limit = default_limit, .default = null, .sub = .none };
-        const v = try self.render(&wildcard_pattern, &spec, 0, &.{}, vals);
+        const cut = if (spec.many()) @min(vals.len, default_limit) else 1;
+        const v = try self.render(&wildcard_pattern, &spec, 0, &.{}, vals[0..cut]);
         return self.assoc(m, value.fromKeywordId(k), v);
     }
 
     /// The value of spec `i` of `pat` on `e`, or null when absent.
-    fn specValue(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, e: u64, budget: []const ?u32) anyerror!?Value {
+    fn specValue(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, e: u64, budget: []const ?u32) Failure!?Value {
         var vals: std.ArrayList(Val) = .empty;
         const cap: usize = if (s.many()) (s.limit orelse std.math.maxInt(u32)) else 1;
         if (cap == 0) return null;
@@ -520,14 +523,14 @@ const Puller = struct {
     }
 
     /// One value, or a vector of them, for a spec.
-    fn render(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, budget: []const ?u32, vals: []const Val) anyerror!Value {
+    fn render(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, budget: []const ?u32, vals: []const Val) Failure!Value {
         if (!s.many()) return self.renderVal(pat, s, i, budget, vals[0]);
         const out = try self.arena.alloc(Value, vals.len);
         for (vals, out) |v, *o| o.* = try self.renderVal(pat, s, i, budget, v);
         return vector_mod.fromSlice(self.heap, out);
     }
 
-    fn renderVal(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, budget: []const ?u32, v: Val) anyerror!Value {
+    fn renderVal(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, budget: []const ?u32, v: Val) Failure!Value {
         if (v == .ref) return self.renderRef(pat, s, i, budget, v.ref);
         return self.read.db.conn.valToValue(self.read.txn, self.heap, v);
     }
@@ -535,7 +538,7 @@ const Puller = struct {
     /// A referenced entity: pulled with the spec's sub-pattern, the
     /// enclosing pattern on recursion, `[*]` for a component, else a
     /// plain ref. Anything on the path or past the depth is a plain ref.
-    fn renderRef(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, budget: []const ?u32, target: u64) anyerror!Value {
+    fn renderRef(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, budget: []const ?u32, target: u64) Failure!Value {
         switch (s.sub) {
             .pattern => |p| return self.nested(p, target, p.budget),
             .recurse => {
@@ -554,7 +557,7 @@ const Puller = struct {
         }
     }
 
-    fn nested(self: *Puller, pat: *const Pattern, target: u64, budget: []const ?u32) anyerror!Value {
+    fn nested(self: *Puller, pat: *const Pattern, target: u64, budget: []const ?u32) Failure!Value {
         if (self.onPath(target)) return self.refMap(target);
         try self.path.append(self.arena, target);
         defer _ = self.path.pop();
@@ -650,7 +653,7 @@ const Fx = struct {
         return self.tc.conn.db();
     }
 
-    fn pullOne(self: *Fx, dbv: DbValue, pattern: Value, e: Value) anyerror!Value {
+    fn pullOne(self: *Fx, dbv: DbValue, pattern: Value, e: Value) Failure!Value {
         return pull(testing.allocator, &self.tc.interner, &self.heap, dbv, pattern, e, &self.diag);
     }
 
@@ -897,9 +900,10 @@ test "limit, default, as, expression forms, pull-many, syntax diagnostics" {
         try testing.expectEqualStrings(b.message, fx.diag.message);
         try testing.expectEqual(b.clause, fx.diag.clause);
     }
-    try testing.expectError(error.PullSyntax, fx.pullOne(dbv, try fx.vec(&.{try fx.sym("*")}), try fx.str("ann")));
-    try testing.expectEqualStrings("entity must be an eid, a lookup ref or an ident", fx.diag.message);
-    try testing.expectError(error.PullSyntax, fx.pullOne(dbv, try fx.vec(&.{try fx.sym("*")}), try fx.vec(&.{try fx.kw("p/email")})));
+    // The entity argument follows the marshal contract.
+    try testing.expectError(error.KindMismatch, fx.pullOne(dbv, try fx.vec(&.{try fx.sym("*")}), try fx.str("ann")));
+    try testing.expectError(error.TxData, fx.pullOne(dbv, try fx.vec(&.{try fx.sym("*")}), try fx.vec(&.{try fx.kw("p/email")})));
+    try testing.expectEqualStrings("a lookup ref is [attr value]", fx.diag.message);
     try testing.expectError(error.ValueType, fx.pullOne(dbv, try fx.vec(&.{try fx.sym("*")}), try fx.vec(&.{ try fx.kw("p/email"), Fx.int(1) })));
 }
 

@@ -51,7 +51,26 @@ pub const SyncMode = store_mod.SyncMode;
 // =============================================================================
 
 /// The Nextomic error set; each maps to a `:nextomic/*` keyword.
+/// The error set of `f`, for naming a module's failures by the
+/// operations it performs.
+pub fn ErrorsOf(comptime f: anytype) type {
+    return @typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?).error_union.error_set;
+}
+
+/// What an operation was looking at when it failed, for the error
+/// payload the program sees (NEXTOMIC.md §7). A caller that wants the
+/// detail passes one in; every field is set only when the failing
+/// step has it at hand.
+pub const Fault = struct {
+    /// The attribute, as a keyword when it has an ident, else its id.
+    attr: ?Value = null,
+    e: ?u64 = null,
+    value: ?Val = null,
+    message: ?[]const u8 = null,
+};
+
 pub const Error = error{
+    HistoryView,
     UnknownAttribute,
     ValueType,
     Unique,
@@ -318,8 +337,10 @@ pub const DbValue = struct {
     };
 
     /// Every current attribute of `e` with its values, in attribute
-    /// order; empty when the entity has no datoms in this view.
+    /// order; empty when the entity has no datoms in this view. Not
+    /// defined on a history view, whose datoms are not a state.
     pub fn entity(self: DbValue, arena: Allocator, e: u64) ![]EntityAttr {
+        if (self.history) return error.HistoryView;
         const ds = try self.datoms(arena, .eavt, .{ .e = e });
         var out: std.ArrayList(EntityAttr) = .empty;
         var i: usize = 0;
@@ -360,8 +381,7 @@ pub const DbValue = struct {
     }
 
     /// The attribute `a` as this view sees it.
-    pub fn attr(self: DbValue, arena: Allocator, a: u32) !?Attr {
-        _ = arena;
+    pub fn attr(self: DbValue, a: u32) !?Attr {
         var rd = try self.beginRead();
         defer rd.close();
         return rd.attr(a);
@@ -410,7 +430,7 @@ pub const Read = struct {
                 .arena = arena,
                 .index = index,
                 .filter = filter,
-                .source = .{ .current = try store.scan(self.txn, store.trees.cur(index), prefix) },
+                .source = .{ .current = try Store.scan(self.txn, store.trees.cur(index), prefix) },
             };
         }
         const end = try key.successor(arena, prefix);
@@ -419,7 +439,7 @@ pub const Read = struct {
             .arena = arena,
             .index = index,
             .filter = filter,
-            .source = .{ .folded = try store.foldScan(self.txn, store.trees.hist(index), prefix, end, self.db.window()) },
+            .source = .{ .folded = try Store.foldScan(self.txn, store.trees.hist(index), prefix, end, self.db.window()) },
         };
     }
 
@@ -475,18 +495,11 @@ pub const DatomScan = struct {
         v: ?[]const u8 = null,
 
         fn after(index: Index, covered: u8, comps: key.Components) Filter {
-            const order: [3]u8 = switch (index) {
-                .eavt => .{ 'e', 'a', 'v' },
-                .aevt => .{ 'a', 'e', 'v' },
-                .avet => .{ 'a', 'v', 'e' },
-                .vaet => .{ 'v', 'a', 'e' },
-            };
             var f: Filter = .{ .v = comps.v };
-            for (order[covered..]) |c| switch (c) {
-                'e' => f.e = comps.e,
-                'a' => f.a = comps.a,
-                'v' => {},
-                else => unreachable,
+            for (index.order()[covered..]) |c| switch (c) {
+                .e => f.e = comps.e,
+                .a => f.a = comps.a,
+                .v => {},
             };
             return f;
         }
@@ -541,9 +554,7 @@ pub const DatomScan = struct {
         const store = self.read.db.conn.store;
         const vbytes = if (self.index == .vaet) unreachable else parts.v;
         if (self.source == .current) {
-            const raw = (try store.getCurrent(self.read.txn, .eavt, parts.e, parts.a, vbytes, self.arena)) orelse return error.Corrupted;
-            if (raw.len < key.id_len) return error.Corrupted;
-            return self.arena.dupe(u8, raw[key.id_len..]);
+            return (try store.currentPayload(self.read.txn, parts.e, parts.a, vbytes, self.arena)) orelse error.Corrupted;
         }
         const raw = (try store.getHistory(self.read.txn, .eavt, parts.e, parts.a, vbytes, .{ .t = t, .added = added }, self.arena)) orelse return error.Corrupted;
         return self.arena.dupe(u8, raw);
@@ -579,7 +590,7 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
     } else null;
 
     var out: std.ArrayList(TxEntry) = .empty;
-    var s = try conn.store.scanRange(txn, conn.store.trees.txlog, &start, end);
+    var s = try Store.scanRange(txn, conn.store.trees.txlog, &start, end);
     while (s.next()) |kv| {
         if (kv.key.len != key.id_len) return error.Corrupted;
         const t = key.readId(kv.key[0..key.id_len]);
@@ -681,11 +692,12 @@ test "db at bootstrap: datoms, entity, entid, ident, tx-range" {
     try testing.expectEqual(@as(usize, 1), hit.len);
     try testing.expectEqual(@as(u64, boot.doc), hit[0].e);
 
-    // entity
+    // entity: current, as-of and since views; never a history view.
     const ent = try db.entity(arena, boot.tx_instant);
     try testing.expectEqual(@as(usize, 4), ent.len);
     try testing.expectEqual(boot.ident, ent[0].a);
     try testing.expectEqual(@as(u32, boot.tx_instant), ent[0].vals[0].keyword);
+    try testing.expectError(error.HistoryView, db.withHistory().entity(arena, boot.tx_instant));
 
     // entid / ident
     const k_doc = try tc.interner.internKeyword("db/doc");
@@ -699,8 +711,8 @@ test "db at bootstrap: datoms, entity, entid, ident, tx-range" {
     try testing.expect((try db.asOf(0).entid(arena, .{ .ident = k_doc })) == null);
 
     // attr as-of
-    try testing.expect((try db.attr(arena, boot.ident)).?.indexed);
-    try testing.expect((try db.asOf(0).attr(arena, boot.ident)) == null);
+    try testing.expect((try db.attr(boot.ident)).?.indexed);
+    try testing.expect((try db.asOf(0).attr(boot.ident)) == null);
 
     // tx-range
     const entries = try txRange(tc.conn, arena, 0, null);
@@ -787,11 +799,11 @@ test "every operation on a closed connection is error.Closed" {
     for (views) |v| {
         try testing.expectError(error.Closed, v.beginRead());
         try testing.expectError(error.Closed, v.datoms(arena, .eavt, .{ .e = 1 }));
-        try testing.expectError(error.Closed, v.entity(arena, 1));
+        if (!v.history) try testing.expectError(error.Closed, v.entity(arena, 1));
         try testing.expectError(error.Closed, v.entid(arena, .{ .eid = 1 }));
         try testing.expectError(error.Closed, v.entid(arena, .{ .lookup = .{ .a = boot.ident, .v = .{ .keyword = boot.doc } } }));
         try testing.expectError(error.Closed, v.ident(arena, boot.doc));
-        try testing.expectError(error.Closed, v.attr(arena, boot.ident));
+        try testing.expectError(error.Closed, v.attr(boot.ident));
     }
 }
 

@@ -32,9 +32,12 @@ const key = @import("../key.zig");
 const datom_mod = @import("../datom.zig");
 const schema_mod = @import("../schema.zig");
 const db_mod = @import("../db.zig");
+const store_mod = @import("../store.zig");
+const marshal = @import("../marshal.zig");
 const relation = @import("../relation.zig");
 const ir = @import("ir.zig");
 const rules_mod = @import("rules.zig");
+const parse_mod = @import("parse.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -47,6 +50,7 @@ const Clause = ir.Clause;
 const Ir = ir.Ir;
 const RuleSet = ir.RuleSet;
 const Relation = relation.Relation;
+pub const Diag = parse_mod.Diag;
 
 pub const Error = error{
     QuerySyntax,
@@ -54,6 +58,10 @@ pub const Error = error{
     UnknownAttribute,
     OutOfMemory,
 };
+
+/// Everything planning can fail with: the planner's own errors and
+/// the store's, through the attribute and constant lookups.
+pub const Failure = Error || marshal.Error || db_mod.ErrorsOf(marshal.cellOf) || db_mod.ErrorsOf(Interner.internSymbol) || db_mod.ErrorsOf(store_mod.Store.treeEntries);
 
 // =============================================================================
 // Steps
@@ -82,10 +90,6 @@ pub const Slot = union(enum) {
     /// datom must carry the same value in both positions.
     same: Var,
     constant: Const,
-
-    pub fn isBound(self: Slot) bool {
-        return self == .bound or self == .constant;
-    }
 };
 
 pub const Scan = struct {
@@ -193,11 +197,25 @@ pub const Ctx = struct {
     sources: std.ArrayList(*SourceSlot) = .empty,
     /// Entries of the AEVT tree this view reads, once asked.
     aevt_entries: ?u64 = null,
+    /// Where a syntax or attribute error leaves its reason.
+    diag: *Diag,
 
-    pub fn init(arena: Allocator, read: *Read, interner: *Interner, query: *const Ir, rules: *const RuleSet) !Ctx {
+    pub fn init(arena: Allocator, read: *Read, interner: *Interner, query: *const Ir, rules: *const RuleSet, diag: *Diag) !Ctx {
         var vars: std.ArrayList(ir.VarInfo) = .empty;
         try vars.appendSlice(arena, query.vars);
-        return .{ .arena = arena, .read = read, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len };
+        return .{ .arena = arena, .read = read, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .diag = diag };
+    }
+
+    /// `QuerySyntax` with its reason.
+    pub fn syntax(self: *Ctx, message: []const u8) error{QuerySyntax} {
+        self.diag.* = .{ .message = message };
+        return error.QuerySyntax;
+    }
+
+    /// `UnknownAttribute` for the attribute the query wrote as `attr`.
+    pub fn unknownAttr(self: *Ctx, attr: Value) error{UnknownAttribute} {
+        self.diag.* = .{ .message = "unknown attribute", .attr = attr };
+        return error.UnknownAttribute;
     }
 
     pub fn freshVar(self: *Ctx, sym: u32) !Var {
@@ -225,7 +243,7 @@ pub const Ctx = struct {
         if (self.aevt_entries) |n| return n;
         const store = self.read.db.conn.store;
         const tree = if (self.read.fast()) store.trees.cur(.aevt) else store.trees.hist(.aevt);
-        const n = try store.treeEntries(self.read.txn, tree);
+        const n = try store_mod.Store.treeEntries(self.read.txn, tree);
         self.aevt_entries = n;
         return n;
     }
@@ -248,7 +266,7 @@ pub const Ctx = struct {
 
 /// Plan `query` for `read`. The returned plan starts from the relation
 /// over the `:in` variables.
-pub fn plan(ctx: *Ctx, query: *const Ir) anyerror!*Plan {
+pub fn plan(ctx: *Ctx, query: *const Ir) Failure!*Plan {
     var bound: std.ArrayList(Var) = .empty;
     for (query.in) |b| switch (b) {
         .scalar, .collection => |v| try ir.addVar(ctx.arena, &bound, v),
@@ -261,7 +279,7 @@ pub fn plan(ctx: *Ctx, query: *const Ir) anyerror!*Plan {
 }
 
 /// Plan `clauses` starting from a relation over `input`.
-pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: u64) anyerror!*Plan {
+pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: u64) Failure!*Plan {
     const out = try ctx.arena.create(Plan);
     var bound: std.ArrayList(Var) = .empty;
     try bound.appendSlice(ctx.arena, input);
@@ -277,7 +295,7 @@ const Pending = struct {
     done: bool = false,
 };
 
-fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) anyerror!void {
+fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
     const pending = try ctx.arena.alloc(Pending, clauses.len);
     for (clauses, pending) |c, *p| p.* = .{ .clause = c };
 
@@ -368,7 +386,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
         }
         const p = best orelse {
             if (unbound_pattern) return error.UnboundPattern;
-            return error.QuerySyntax;
+            return ctx.syntax("a predicate, function or rule argument is never bound");
         };
         switch (p.clause) {
             .pattern => |pat| {
@@ -401,7 +419,7 @@ fn clampRows(n: u128) u64 {
     return if (n > std.math.maxInt(u64) / 4) std.math.maxInt(u64) / 4 else @intCast(n);
 }
 
-fn placeRule(ctx: *Ctx, r: anytype, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) anyerror!void {
+fn placeRule(ctx: *Ctx, r: anytype, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
     try rules_mod.planCall(ctx, r.name, r.args, bound, steps, rows);
 }
 
@@ -442,7 +460,7 @@ fn notJoin(ctx: *Ctx, n: anytype, scope: []const Var) ![]const Var {
     for (body_vars.items) |v| {
         if (ir.containsVar(scope, v)) try join.append(ctx.arena, v);
     }
-    if (join.items.len == 0) return error.QuerySyntax;
+    if (join.items.len == 0) return ctx.syntax("not needs a variable bound outside it");
     return join.toOwnedSlice(ctx.arena);
 }
 
@@ -456,7 +474,7 @@ fn orJoin(ctx: *Ctx, o: anytype) ![]const Var {
 
 /// Plan an `or`: every branch starts from the join variables already
 /// bound and must end with every join variable bound.
-pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: []const Var, rows: u64) anyerror!Step {
+pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: []const Var, rows: u64) Failure!Step {
     var bound_join: std.ArrayList(Var) = .empty;
     for (join) |v| {
         if (ir.containsVar(bound, v)) try bound_join.append(ctx.arena, v);
@@ -468,12 +486,12 @@ pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: 
         var ends: std.ArrayList(Var) = .empty;
         try ends.appendSlice(ctx.arena, bound_join.items);
         try ir.boundVars(ctx.arena, br, &ends);
-        for (join) |v| if (!ir.containsVar(ends.items, v)) return error.QuerySyntax;
+        for (join) |v| if (!ir.containsVar(ends.items, v)) return ctx.syntax("an or branch leaves a join variable unbound");
     }
     return .{ .@"or" = .{ .join = join, .bound = try bound_join.toOwnedSlice(ctx.arena), .fresh = fresh, .branches = plans } };
 }
 
-fn orEstimate(ctx: *Ctx, o: anytype, bound: []const Var) anyerror!u64 {
+fn orEstimate(ctx: *Ctx, o: anytype, bound: []const Var) Failure!u64 {
     var total: u64 = 0;
     for (o.branches) |br| total +|= try clausesEstimate(ctx, br, bound);
     return total;
@@ -481,7 +499,7 @@ fn orEstimate(ctx: *Ctx, o: anytype, bound: []const Var) anyerror!u64 {
 
 /// The smallest pattern estimate among `clauses` given `bound`; 1 for a
 /// branch without runnable patterns.
-pub fn clausesEstimate(ctx: *Ctx, clauses: []const Clause, bound: []const Var) anyerror!u64 {
+pub fn clausesEstimate(ctx: *Ctx, clauses: []const Clause, bound: []const Var) Failure!u64 {
     var best: u64 = std.math.maxInt(u64);
     for (clauses) |c| {
         const est: u64 = switch (c) {
@@ -529,14 +547,15 @@ fn patternAttr(ctx: *Ctx, a: ir.Term) !?Attr {
     if (a != .constant) return null;
     switch (a.constant) {
         .cell => |c| switch (c) {
-            .keyword => |kw| return (try ctx.attrByKeyword(kw)) orelse error.UnknownAttribute,
+            .keyword => |kw| return (try ctx.attrByKeyword(kw)) orelse ctx.unknownAttr(value.fromKeywordId(kw)),
             .int => |n| {
-                if (n <= 0 or n >= key.attr_partition_end) return error.UnknownAttribute;
-                return (try ctx.read.attr(@intCast(n))) orelse error.UnknownAttribute;
+                const id = value.fromFixnum(n) orelse unreachable;
+                if (n <= 0 or n >= key.attr_partition_end) return ctx.unknownAttr(id);
+                return (try ctx.read.attr(@intCast(n))) orelse ctx.unknownAttr(id);
             },
-            else => return error.QuerySyntax,
+            else => return ctx.syntax("an attribute is a keyword or an id"),
         },
-        .lookup => return error.QuerySyntax,
+        .lookup => return ctx.syntax("an attribute cannot be a lookup ref"),
     }
 }
 
@@ -587,7 +606,7 @@ fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !u64 {
     return (try choose(ctx, p, bound)).estimate;
 }
 
-fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) anyerror!Scan {
+fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) Failure!Scan {
     const choice = try choose(ctx, p, bound);
     const hash_choice: ?Choice = choose(ctx, p, &.{}) catch |err| switch (err) {
         error.UnboundPattern => null,
@@ -623,7 +642,7 @@ fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) anyerror!Scan {
         (history and (slots[3] == .blank or slots[4] == .blank));
     const store = ctx.read.db.conn.store;
     const tree = if (ctx.read.fast()) store.trees.cur(choice.index) else store.trees.hist(choice.index);
-    const entries = try store.treeEntries(ctx.read.txn, tree);
+    const entries = try store_mod.Store.treeEntries(ctx.read.txn, tree);
 
     return .{
         .e = slots[0],
@@ -645,14 +664,14 @@ fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) anyerror!Scan {
 
 /// Resolve a pattern constant at position `pos` (0 e, 1 a, 2 v, 3 tx,
 /// 4 added). Null when no datom can carry it.
-fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) anyerror!?Const {
+fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) Failure!?Const {
     switch (pos) {
         0 => {
             const eid = (try resolveEntity(ctx, c)) orelse return null;
             return .{ .cell = .{ .int = @intCast(eid) }, .name = if (c == .cell and c.cell == .keyword) c.cell.keyword else null };
         },
         1 => {
-            const at = attr orelse return error.QuerySyntax;
+            const at = attr orelse return ctx.syntax("an attribute is a keyword or an id");
             return .{ .cell = .{ .int = at.id }, .name = if (c == .cell and c.cell == .keyword) c.cell.keyword else null };
         },
         2 => {
@@ -662,7 +681,7 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) anyerror!?Co
                     error.ValueType => return null,
                     else => return err,
                 };
-                return .{ .cell = cellOfVal(ctx, val), .bytes = bytes };
+                return .{ .cell = try marshal.cellOf(ctx.read, ctx.arena, val), .bytes = bytes };
             }
             return switch (c) {
                 .cell => |cell| .{ .cell = cell },
@@ -673,7 +692,7 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) anyerror!?Co
             };
         },
         3 => {
-            if (c != .cell or c.cell != .int) return error.QuerySyntax;
+            if (c != .cell or c.cell != .int) return ctx.syntax("the tx position takes a t or a transaction id");
             const n = c.cell.int;
             if (n < 0) return null;
             const t = key.txOfEntity(@intCast(n)) orelse @as(u64, @intCast(n));
@@ -681,7 +700,7 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) anyerror!?Co
             return .{ .cell = .{ .int = @intCast(key.txEntity(t)) } };
         },
         4 => {
-            if (c != .cell or c.cell != .boolean) return error.QuerySyntax;
+            if (c != .cell or c.cell != .boolean) return ctx.syntax("the added position takes a boolean");
             return .{ .cell = c.cell };
         },
         else => unreachable,
@@ -691,7 +710,7 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) anyerror!?Co
 /// An entity id from an entity-position constant: an integer, a
 /// keyword ident or a lookup ref. Null when the view has no such
 /// entity.
-pub fn resolveEntity(ctx: *Ctx, c: ir.Constant) anyerror!?u64 {
+pub fn resolveEntity(ctx: *Ctx, c: ir.Constant) Failure!?u64 {
     switch (c) {
         .cell => |cell| switch (cell) {
             .int => |n| {
@@ -704,11 +723,11 @@ pub fn resolveEntity(ctx: *Ctx, c: ir.Constant) anyerror!?u64 {
                 const id = (try ctx.read.db.conn.idents.idOf(ctx.read.txn, kw)) orelse return null;
                 return id;
             },
-            else => return error.QuerySyntax,
+            else => return ctx.syntax("an entity is an id, an ident or a lookup ref"),
         },
         .lookup => |l| {
-            const at = (try ctx.attrByKeyword(l.attr)) orelse return error.UnknownAttribute;
-            if (at.unique == .none) return error.QuerySyntax;
+            const at = (try ctx.attrByKeyword(l.attr)) orelse return ctx.unknownAttr(value.fromKeywordId(l.attr));
+            if (at.unique == .none) return ctx.syntax("a lookup ref needs a unique attribute");
             const val = (try resolveTyped(ctx, .{ .cell = l.v }, at.value_type)) orelse return null;
             return ctx.read.entid(ctx.arena, .{ .lookup = .{ .a = at.id, .v = val } }) catch |err| switch (err) {
                 error.ValueType, error.TxData => null,
@@ -720,7 +739,7 @@ pub fn resolveEntity(ctx: *Ctx, c: ir.Constant) anyerror!?u64 {
 
 /// The datom value of constant `c` under an attribute of type `vt`, or
 /// null when no value of that type equals it.
-pub fn resolveTyped(ctx: *Ctx, c: ir.Constant, vt: key.ValueType) anyerror!?key.Val {
+pub fn resolveTyped(ctx: *Ctx, c: ir.Constant, vt: key.ValueType) Failure!?key.Val {
     switch (c) {
         .lookup => {
             if (vt != .ref) return null;
@@ -732,56 +751,9 @@ pub fn resolveTyped(ctx: *Ctx, c: ir.Constant, vt: key.ValueType) anyerror!?key.
                 const eid = (try ctx.read.db.conn.idents.idOf(ctx.read.txn, cell.keyword)) orelse return null;
                 return .{ .ref = eid };
             }
-            return try encodeCell(ctx.read, cell, vt);
+            return try marshal.encodeCell(ctx.read, cell, vt);
         },
     }
-}
-
-/// The datom value of `cell` under type `vt`, or null when no value of
-/// that type equals it. Keywords are resolved through the store's
-/// idents; an unknown ident is null.
-pub fn encodeCell(read: *Read, cell: Cell, vt: key.ValueType) anyerror!?key.Val {
-    return switch (vt) {
-        .boolean => if (cell == .boolean) .{ .boolean = cell.boolean } else null,
-        .long => if (cell == .int) .{ .long = cell.int } else null,
-        .double => if (cell == .double) .{ .double = cell.double } else null,
-        .instant => if (cell == .int) .{ .instant = cell.int } else null,
-        .keyword => blk: {
-            if (cell != .keyword) break :blk null;
-            const id = (try read.db.conn.idents.idOf(read.txn, cell.keyword)) orelse break :blk null;
-            break :blk .{ .keyword = id };
-        },
-        .ref => blk: {
-            const eid = cell.asEid() orelse break :blk null;
-            break :blk .{ .ref = eid };
-        },
-        .string => if (cell == .str) .{ .string = cell.str } else null,
-        .uuid => blk: {
-            if (cell != .str) break :blk null;
-            const u = datom_mod.uuidFromText(cell.str) orelse break :blk null;
-            break :blk .{ .uuid = u };
-        },
-        .bytes => if (cell == .str) .{ .bytes = cell.str } else null,
-    };
-}
-
-/// The cell a resolved datom value compares as: ids as `int`, keyword
-/// values as VM keyword ids (the constant came from one, so the
-/// intern exists).
-fn cellOfVal(ctx: *Ctx, v: key.Val) Cell {
-    return switch (v) {
-        .boolean => |b| .{ .boolean = b },
-        .long, .instant => |n| .{ .int = n },
-        .double => |d| .{ .double = d },
-        .keyword => |id| .{ .keyword = ctx.read.db.conn.idents.by_ident.get(id).? },
-        .ref => |e| .{ .int = @intCast(e) },
-        .string, .bytes => |s| .{ .str = s },
-        .uuid => |u| blk: {
-            const text = ctx.arena.alloc(u8, 36) catch unreachable;
-            datom_mod.uuidToText(text[0..36], u);
-            break :blk .{ .str = text };
-        },
-    };
 }
 
 // =============================================================================
@@ -798,7 +770,7 @@ fn indent(w: *std.Io.Writer, depth: usize) !void {
     while (i < depth) : (i += 1) try w.writeAll("  ");
 }
 
-pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usize) anyerror!void {
+pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usize) (Failure || std.Io.Writer.Error)!void {
     for (p.steps, 1..) |step, num| {
         try indent(w, depth);
         try w.print("{d}. ", .{num});
@@ -827,10 +799,7 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usi
                 try w.writeAll("bind ");
                 try explainCall(b.call, ctx, w);
                 try w.writeAll(" -> ");
-                for (b.fresh, 0..) |v, i| {
-                    if (i > 0) try w.writeByte(' ');
-                    try w.writeAll(ctx.varName(v));
-                }
+                try explainBinding(b, ctx, w);
                 try w.writeByte('\n');
             },
             .not => |n| {
@@ -859,6 +828,23 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usi
     }
     try indent(w, depth);
     try w.print("rows~{d}\n", .{p.rows_estimate});
+}
+
+/// The binding's variables; one bound before the step (which the
+/// step unifies rather than binds) is marked `!` like a scan slot.
+fn explainBinding(b: Bind, ctx: *const Ctx, w: *std.Io.Writer) !void {
+    const outs: []const ?Var = switch (b.out) {
+        .scalar, .collection => |v| &.{v},
+        .tuple, .relation => |ts| ts,
+    };
+    var first = true;
+    for (outs) |t| {
+        const v = t orelse continue;
+        if (!first) try w.writeByte(' ');
+        first = false;
+        try w.writeAll(ctx.varName(v));
+        if (!ir.containsVar(b.fresh, v)) try w.writeByte('!');
+    }
 }
 
 fn explainVars(vars: []const Var, ctx: *const Ctx, w: *std.Io.Writer) !void {

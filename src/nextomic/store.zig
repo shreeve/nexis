@@ -19,7 +19,6 @@
 //!     always read with `getFromTree` on its exact key.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const emdb = @import("emdb");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
@@ -75,16 +74,6 @@ pub const SyncMode = enum {
 
 pub const Options = struct {
     map_size: u64 = 256 * 1024 * 1024,
-    read_only: bool = false,
-};
-
-pub const StoreError = error{
-    /// The file's Nextomic format number is not `format_version`.
-    Format,
-    /// A sys entry or key has an impossible shape.
-    Corrupted,
-    /// The store is closed.
-    Closed,
 };
 
 // =============================================================================
@@ -180,20 +169,6 @@ pub const boot = struct {
             else => null,
         };
     }
-
-    pub fn typeIdentOf(vt: key.ValueType) u32 {
-        return switch (vt) {
-            .long => type_long,
-            .double => type_double,
-            .instant => type_instant,
-            .keyword => type_keyword,
-            .ref => type_ref,
-            .string => type_string,
-            .uuid => type_uuid,
-            .bytes => type_bytes,
-            .boolean => type_boolean,
-        };
-    }
 };
 
 // =============================================================================
@@ -223,32 +198,25 @@ pub const Store = struct {
             .pageSize = page_size,
             .maxNamedTrees = 128,
             .mapSize = options.map_size,
-            .readOnly = options.read_only,
             .allocator = allocator,
         });
         errdefer self.env.close();
 
-        if (options.read_only) {
-            const txn = try self.env.beginRead();
-            defer txn.abort();
-            try self.openTrees(txn, false);
+        const txn = try self.env.beginWrite();
+        errdefer txn.abort();
+        try self.openTrees(txn);
+        if (try self.sysGet(txn, "format")) |_| {
             try self.readHeader(txn);
         } else {
-            const txn = try self.env.beginWrite();
-            errdefer txn.abort();
-            try self.openTrees(txn, true);
-            if (try self.sysGet(txn, "format")) |_| {
-                try self.readHeader(txn);
-            } else {
-                try self.bootstrap(txn);
-            }
-            try txn.commit();
+            try self.bootstrap(txn);
         }
+        try txn.commit();
         self.is_open = true;
         return self;
     }
 
-    /// Close and free the store. Idempotent.
+    /// Close the environment, if it is still open, and free the store.
+    /// Called once; the connection owns the store.
     pub fn close(self: *Store) void {
         if (self.is_open) {
             self.env.close();
@@ -257,10 +225,10 @@ pub const Store = struct {
         self.allocator.destroy(self);
     }
 
-    fn openTrees(self: *Store, txn: *Txn, create: bool) !void {
+    fn openTrees(self: *Store, txn: *Txn) !void {
         var ids: [tree_names.len]TreeId = undefined;
         for (tree_names, 0..) |name, i| {
-            ids[i] = try txn.openTree(name, create);
+            ids[i] = try txn.openTree(name, true);
         }
         self.trees = .{
             .current = ids[0..4].*,
@@ -550,6 +518,15 @@ pub const Store = struct {
         return txn.getFromTree(self.trees.cur(index), k);
     }
 
+    /// The out-of-line payload of the current datom `(e a v)`: the bytes
+    /// after the `t` header of its EAVT value, copied into `arena`.
+    /// Null when there is no such datom.
+    pub fn currentPayload(self: *Store, txn: *Txn, e: u64, a: u32, vbytes: []const u8, arena: Allocator) !?[]const u8 {
+        const raw = (try self.getCurrent(txn, .eavt, e, a, vbytes, arena)) orelse return null;
+        if (raw.len < key.id_len) return error.Corrupted;
+        return try arena.dupe(u8, raw[key.id_len..]);
+    }
+
     /// The history-tree value of `(e a v top)` in `index`, or null.
     pub fn getHistory(self: *Store, txn: *Txn, index: Index, e: u64, a: u32, vbytes: []const u8, top: key.Top, arena: Allocator) !?[]const u8 {
         const k = try key.keyBytes(arena, index, e, a, vbytes, top);
@@ -560,12 +537,14 @@ pub const Store = struct {
 
     pub const KeyValue = emdb.Cursor.KeyValue;
 
-    /// Forward scan of one tree over the keys starting with `prefix`
-    /// (every key when the prefix is empty). Keys and values borrow the
+    /// Forward scan of one tree: the keys starting with a prefix (every
+    /// key when it is empty), or the keys in `[start, end)` (an absent
+    /// `end` runs to the tree's last key). Keys and values borrow the
     /// transaction's snapshot; cursor values are clamped to one page.
     pub const Scan = struct {
         cursor: emdb.Cursor,
-        prefix: []const u8,
+        start: []const u8,
+        stop: union(enum) { prefix: []const u8, end: ?[]const u8 },
         started: bool = false,
         done: bool = false,
 
@@ -573,48 +552,26 @@ pub const Store = struct {
             if (self.done) return null;
             const kv = if (!self.started) blk: {
                 self.started = true;
-                break :blk if (self.prefix.len == 0) self.cursor.first() else self.cursor.setRange(self.prefix);
-            } else self.cursor.next();
-            if (kv) |e| {
-                if (key.hasPrefix(e.key, self.prefix)) return e;
-            }
-            self.done = true;
-            return null;
-        }
-    };
-
-    pub fn scan(self: *Store, txn: *Txn, tree: TreeId, prefix: []const u8) !Scan {
-        _ = self;
-        return .{ .cursor = try txn.openCursorForTree(tree), .prefix = prefix };
-    }
-
-    /// Forward scan over `[start, end)`; an absent `end` runs to the
-    /// tree's last key.
-    pub const RangeScan = struct {
-        cursor: emdb.Cursor,
-        start: []const u8,
-        end: ?[]const u8,
-        started: bool = false,
-        done: bool = false,
-
-        pub fn next(self: *RangeScan) ?KeyValue {
-            if (self.done) return null;
-            const kv = if (!self.started) blk: {
-                self.started = true;
                 break :blk if (self.start.len == 0) self.cursor.first() else self.cursor.setRange(self.start);
             } else self.cursor.next();
             if (kv) |e| {
-                const below_end = if (self.end) |end| std.mem.order(u8, e.key, end) == .lt else true;
-                if (below_end) return e;
+                const inside = switch (self.stop) {
+                    .prefix => |p| key.hasPrefix(e.key, p),
+                    .end => |end| if (end) |x| std.mem.order(u8, e.key, x) == .lt else true,
+                };
+                if (inside) return e;
             }
             self.done = true;
             return null;
         }
     };
 
-    pub fn scanRange(self: *Store, txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8) !RangeScan {
-        _ = self;
-        return .{ .cursor = try txn.openCursorForTree(tree), .start = start, .end = end };
+    pub fn scan(txn: *Txn, tree: TreeId, prefix: []const u8) !Scan {
+        return .{ .cursor = try txn.openCursorForTree(tree), .start = prefix, .stop = .{ .prefix = prefix } };
+    }
+
+    pub fn scanRange(txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8) !Scan {
+        return .{ .cursor = try txn.openCursorForTree(tree), .start = start, .stop = .{ .end = end } };
     }
 
     /// Which history rows a fold sees (NEXTOMIC.md §4).
@@ -650,7 +607,7 @@ pub const Store = struct {
     /// and is emitted iff it is an assertion. `.all` emits every row in
     /// the window unfolded.
     pub const FoldScan = struct {
-        inner: RangeScan,
+        inner: Scan,
         window: Window,
         pending: ?HistoryRow = null,
         exhausted: bool = false,
@@ -686,13 +643,12 @@ pub const Store = struct {
         }
     };
 
-    pub fn foldScan(self: *Store, txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8, window: Window) !FoldScan {
-        return .{ .inner = try self.scanRange(txn, tree, start, end), .window = window };
+    pub fn foldScan(txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8, window: Window) !FoldScan {
+        return .{ .inner = try scanRange(txn, tree, start, end), .window = window };
     }
 
     /// Number of entries in `tree` at the transaction's snapshot.
-    pub fn treeEntries(self: *Store, txn: *Txn, tree: TreeId) !u64 {
-        _ = self;
+    pub fn treeEntries(txn: *Txn, tree: TreeId) !u64 {
         return (try txn.treeStat(tree)).entries;
     }
 
@@ -706,7 +662,7 @@ pub const Store = struct {
         var fmt: [2]u8 = undefined;
         std.mem.writeInt(u16, &fmt, format_version, .big);
         try self.sysPut(txn, "format", &fmt);
-        fillRandom(&self.uuid);
+        std.Io.Threaded.global_single_threaded.io().random(&self.uuid);
         try self.sysPut(txn, "uuid", &self.uuid);
 
         for (boot.idents) |id| try self.putIdent(txn, id.name, id.id);
@@ -766,7 +722,7 @@ pub const Store = struct {
 };
 
 // =============================================================================
-// Clock and entropy
+// Clock
 // =============================================================================
 
 /// Wall-clock milliseconds since the Unix epoch.
@@ -774,46 +730,6 @@ pub fn nowMillis() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.REALTIME, &ts);
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
-}
-
-fn fillRandom(buf: []u8) void {
-    switch (builtin.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {
-            std.c.arc4random_buf(buf.ptr, buf.len);
-        },
-        .linux => {
-            var off: usize = 0;
-            while (off < buf.len) {
-                const rc = std.os.linux.getrandom(buf.ptr + off, buf.len - off, 0);
-                if (std.os.linux.E.init(rc) != .SUCCESS) break;
-                off += rc;
-            }
-            if (off < buf.len) mixClockEntropy(buf);
-        },
-        else => mixClockEntropy(buf),
-    }
-}
-
-fn mixClockEntropy(buf: []u8) void {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    var mono: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &mono);
-    var seed: [32]u8 = undefined;
-    std.mem.writeInt(i64, seed[0..8], @intCast(ts.sec), .little);
-    std.mem.writeInt(i64, seed[8..16], @intCast(ts.nsec), .little);
-    std.mem.writeInt(i64, seed[16..24], @intCast(mono.nsec), .little);
-    std.mem.writeInt(u64, seed[24..32], @intFromPtr(buf.ptr), .little);
-    var i: usize = 0;
-    var counter: u64 = 0;
-    while (i < buf.len) : (counter += 1) {
-        const h = std.hash.XxHash3.hash(counter, &seed);
-        var hb: [8]u8 = undefined;
-        std.mem.writeInt(u64, &hb, h, .little);
-        const n = @min(8, buf.len - i);
-        @memcpy(buf[i .. i + n], hb[0..n]);
-        i += n;
-    }
 }
 
 // =============================================================================
@@ -885,7 +801,7 @@ test "bootstrap datoms are in every index they belong to" {
 
     // EAVT [1]: :db/ident has ident, valueType, cardinality, unique, index.
     const p = try key.prefixBytes(arena, .eavt, .{ .e = boot.ident });
-    var s = try store.scan(txn, store.trees.cur(.eavt), p);
+    var s = try Store.scan(txn, store.trees.cur(.eavt), p);
     var n: usize = 0;
     while (s.next()) |kv| : (n += 1) {
         try testing.expectEqual(@as(usize, key.id_len), kv.value.len);
@@ -895,17 +811,17 @@ test "bootstrap datoms are in every index they belong to" {
 
     // AVET [:db/ident] holds every ident; [:db/valueType] is not indexed.
     const pa = try key.prefixBytes(arena, .avet, .{ .a = boot.ident });
-    var sa = try store.scan(txn, store.trees.cur(.avet), pa);
+    var sa = try Store.scan(txn, store.trees.cur(.avet), pa);
     n = 0;
     while (sa.next()) |_| n += 1;
     try testing.expectEqual(@as(usize, boot.idents.len), n);
     const pv = try key.prefixBytes(arena, .avet, .{ .a = boot.value_type });
-    var sv = try store.scan(txn, store.trees.cur(.avet), pv);
+    var sv = try Store.scan(txn, store.trees.cur(.avet), pv);
     try testing.expect(sv.next() == null);
 
     // History mirrors current with top = (1 << 1) | 1.
     const ph = try key.prefixBytes(arena, .eavt, .{ .e = boot.ident });
-    var sh = try store.scan(txn, store.trees.hist(.eavt), ph);
+    var sh = try Store.scan(txn, store.trees.hist(.eavt), ph);
     n = 0;
     while (sh.next()) |kv| : (n += 1) {
         const parts = try key.unpackKey(.eavt, true, kv.key);
@@ -916,7 +832,7 @@ test "bootstrap datoms are in every index they belong to" {
     try testing.expectEqual(@as(usize, 5), n);
 
     // Empty prefix walks the whole tree.
-    var all = try store.scan(txn, store.trees.cur(.aevt), &.{});
+    var all = try Store.scan(txn, store.trees.cur(.aevt), &.{});
     n = 0;
     while (all.next()) |_| n += 1;
     try testing.expect(n > boot.idents.len);
@@ -983,7 +899,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
         .{ .window = .{ .since = .{ .after = 4, .upto = 5 } }, .facts = &.{} },
     };
     for (cases) |c| {
-        var fs = try store.foldScan(txn, tree, prefix, end, c.window);
+        var fs = try Store.foldScan(txn, tree, prefix, end, c.window);
         var got: std.ArrayList(u64) = .empty;
         while (fs.next()) |r| {
             try testing.expect(r.added);
@@ -994,7 +910,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
         try testing.expectEqualSlices(u64, c.facts, got.items);
     }
     // History mode sees all five rows in t order with their flags.
-    var all = try store.foldScan(txn, tree, prefix, end, .{ .all = .{ .after = 0, .upto = 5 } });
+    var all = try Store.foldScan(txn, tree, prefix, end, .{ .all = .{ .after = 0, .upto = 5 } });
     var n: usize = 0;
     var adds: usize = 0;
     while (all.next()) |r| {
@@ -1004,7 +920,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     try testing.expectEqual(@as(usize, 5), n);
     try testing.expectEqual(@as(usize, 3), adds);
     // Current trees hold only attribute 101 now.
-    var cur = try store.scan(txn, store.trees.cur(.eavt), prefix);
+    var cur = try Store.scan(txn, store.trees.cur(.eavt), prefix);
     const only = cur.next().?;
     try testing.expectEqual(@as(u32, 101), (try key.unpackKey(.eavt, false, only.key)).a);
     try testing.expect(cur.next() == null);

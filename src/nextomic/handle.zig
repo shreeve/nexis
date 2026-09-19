@@ -30,7 +30,7 @@ const HeapHeader = heap_mod.HeapHeader;
 // Connection handle
 // =============================================================================
 
-pub const ConnBox = extern struct {
+const ConnBox = extern struct {
     /// The `nextomic.Conn`, owned by the VM's connection list.
     conn: *anyopaque,
     /// Length of the path text that follows the struct in the body.
@@ -99,7 +99,7 @@ pub const DbShape = struct {
     history: bool = false,
 };
 
-pub const DbBox = extern struct {
+const DbBox = extern struct {
     conn: *anyopaque,
     basis: u64,
     as_of: u64,

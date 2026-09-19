@@ -32,6 +32,7 @@ const Heap = heap_mod.Heap;
 const Interner = intern_mod.Interner;
 const query = nextomic.query;
 const pull = nextomic.pull;
+const default_limit = pull.default_limit;
 const DbValue = nextomic.DbValue;
 const TestConn = nextomic.db.TestConn;
 const key = nextomic.key;
@@ -42,127 +43,7 @@ const Attr = nextomic.Attr;
 // Fixture
 // =============================================================================
 
-const Fx = struct {
-    tc: *TestConn,
-    heap: Heap,
-    arena_state: std.heap.ArenaAllocator,
-    diag: pull.Diag = .{},
-
-    /// The allocator behind the heap, the arena and each pull's
-    /// scratch: the testing allocator, or a plain one for the benchmark.
-    gpa: Allocator,
-
-    fn init(name: []const u8) !*Fx {
-        return initWith(name, testing.allocator);
-    }
-
-    fn initWith(name: []const u8, gpa: Allocator) !*Fx {
-        const self = try testing.allocator.create(Fx);
-        self.* = .{
-            .tc = try TestConn.init(name),
-            .heap = Heap.init(gpa),
-            .arena_state = std.heap.ArenaAllocator.init(gpa),
-            .gpa = gpa,
-        };
-        return self;
-    }
-
-    fn deinit(self: *Fx) void {
-        self.arena_state.deinit();
-        self.heap.deinit();
-        self.tc.deinit();
-        testing.allocator.destroy(self);
-    }
-
-    fn arena(self: *Fx) Allocator {
-        return self.arena_state.allocator();
-    }
-
-    fn interner(self: *Fx) *Interner {
-        return &self.tc.interner;
-    }
-
-    fn conn(self: *Fx) *nextomic.Conn {
-        return self.tc.conn;
-    }
-
-    /// Read one form of source text into a VM value.
-    fn read(self: *Fx, src: []const u8) !Value {
-        var parsed = try reader_mod.parser.parseProgram(testing.allocator, src);
-        defer parsed.parser.deinit();
-        var rdr = reader_mod.Reader.init(testing.allocator, src);
-        defer rdr.deinit();
-        const forms = try rdr.readProgram(parsed.sexp);
-        try testing.expectEqual(@as(usize, 1), forms.len);
-        return self.formToValue(forms[0]);
-    }
-
-    fn formToValue(self: *Fx, form: *const reader_mod.Form) anyerror!Value {
-        const a = self.arena();
-        return switch (form.datum) {
-            .nil => value.nilValue(),
-            .bool_ => |b| value.fromBool(b),
-            .int => |n| value.fromFixnum(n).?,
-            .real => |d| value.fromFloat(d),
-            .string => |s| try string_mod.fromBytes(&self.heap, s),
-            .keyword => |name| try self.interner().internKeywordValue(try joinName(a, name)),
-            .symbol => |name| try self.interner().internSymbolValue(try joinName(a, name)),
-            .list => |items| blk: {
-                const vals = try a.alloc(Value, items.len);
-                for (items, vals) |it, *v| v.* = try self.formToValue(it);
-                break :blk try list_mod.fromSlice(&self.heap, vals);
-            },
-            .vector => |items| blk: {
-                const vals = try a.alloc(Value, items.len);
-                for (items, vals) |it, *v| v.* = try self.formToValue(it);
-                break :blk try vector_mod.fromSlice(&self.heap, vals);
-            },
-            .map => |items| blk: {
-                var m = try champ.mapEmpty(&self.heap);
-                var i: usize = 0;
-                while (i < items.len) : (i += 2) {
-                    m = try champ.mapAssoc(&self.heap, m, try self.formToValue(items[i]), try self.formToValue(items[i + 1]), &dispatch.hashValue, &dispatch.equal);
-                }
-                break :blk m;
-            },
-            else => error.UnsupportedForm,
-        };
-    }
-
-    fn joinName(a: Allocator, name: anytype) ![]const u8 {
-        if (name.ns) |ns| return std.fmt.allocPrint(a, "{s}/{s}", .{ ns, name.name });
-        return name.name;
-    }
-
-    fn transact(self: *Fx, src: []const u8) !nextomic.Report {
-        const tx = try self.read(src);
-        return nextomic.transact.transact(self.conn(), self.arena(), tx, .{});
-    }
-
-    fn db(self: *Fx) !DbValue {
-        return self.conn().db();
-    }
-
-    fn kw(self: *Fx, name: []const u8) !Value {
-        return self.interner().internKeywordValue(name);
-    }
-
-    fn pullSrc(self: *Fx, dbv: DbValue, pattern: []const u8, entity: []const u8) anyerror!Value {
-        return pull.pull(self.gpa, self.interner(), &self.heap, dbv, try self.read(pattern), try self.read(entity), &self.diag);
-    }
-
-    fn getName(self: *Fx, m: Value, name: []const u8) !?Value {
-        return switch (champ.mapGet(m, try self.kw(name), &dispatch.hashValue, &dispatch.equal)) {
-            .present => |v| v,
-            .absent => null,
-        };
-    }
-
-    fn q(self: *Fx, dbv: DbValue, src: []const u8) anyerror!Value {
-        var diag: query.Diag = .{};
-        return query.q(testing.allocator, self.interner(), &self.heap, try self.read(src), dbv, &.{value.nilValue()}, &diag, .{});
-    }
-};
+const Fx = @import("nextomic_fx.zig").Fx;
 
 const long_bio = "Ann has a biography that runs well past the ninety-six byte inline limit of the sortable string encoding, so it lives out of line with a prefix and a hash.";
 
@@ -211,6 +92,12 @@ fn loadCorpus(fx: *Fx) !void {
         \\ {:db/id "n3" :node/label "n3" :edge/to ["n1" "n4"]} {:db/id "n4" :node/label "n4" :edge/to ["n5"]}
         \\ {:db/id "n5" :node/label "n5"} {:db/id "n6" :node/label "n6"}]
     );
+    // Order 9 has one more item than the default card-many cut.
+    var big: std.ArrayList(u8) = .empty;
+    try big.appendSlice(fx.arena(), "[{:order/number 9 :order/items [");
+    for (0..default_limit + 1) |i| try big.print(fx.arena(), "\"item{d:0>4}\" ", .{i});
+    try big.appendSlice(fx.arena(), "]}]");
+    _ = try fx.transact(big.items);
 }
 
 /// The update after which the as-of corpus runs: a retraction, a
@@ -298,7 +185,7 @@ const Naive = struct {
     fn attrByName(self: *Naive, name: []const u8) !Attr {
         const k = try self.fx.interner().internKeyword(name);
         const id = (try self.dbv.conn.idents.idOf(self.txn, k)) orelse return error.UnknownAttribute;
-        return (try self.dbv.attr(self.arena, id)) orelse error.UnknownAttribute;
+        return (try self.dbv.attr(id)) orelse error.UnknownAttribute;
     }
 
     fn specOf(self: *Naive, k: Value) !Spec {
@@ -307,7 +194,7 @@ const Naive = struct {
         const reverse = name[slash + 1] == '_';
         const forward = if (reverse) try std.mem.concat(self.arena, u8, &.{ name[0 .. slash + 1], name[slash + 2 ..] }) else name;
         const attr = try self.attrByName(forward);
-        return .{ .attr = attr, .reverse = reverse, .k = k, .limit = 1000, .default = null };
+        return .{ .attr = attr, .reverse = reverse, .k = k, .limit = default_limit, .default = null };
     }
 
     /// `(attr opts)`, `[attr opts]`, `(limit attr n)`, `(default attr v)`.
@@ -487,9 +374,9 @@ const Naive = struct {
             for (ent) |ea| {
                 any = true;
                 if (covered.contains(ea.a)) continue;
-                const attr = (try self.dbv.attr(self.arena, ea.a)).?;
+                const attr = (try self.dbv.attr(ea.a)).?;
                 const k = (try self.dbv.conn.idents.internOf(self.txn, ea.a)).?;
-                const spec: Spec = .{ .attr = attr, .reverse = false, .k = value.fromKeywordId(k), .limit = 1000, .default = null };
+                const spec: Spec = .{ .attr = attr, .reverse = false, .k = value.fromKeywordId(k), .limit = default_limit, .default = null };
                 _ = try self.emit(&m, pattern, ent, e, spec, .none, budget);
             }
         }
@@ -578,6 +465,10 @@ const corpus = [_]Case{
     .{ .pattern = "[:person/bio :person/height :person/active]", .entity = ann },
     .{ .pattern = "[:order/items :order/customer]", .entity = "[:order/number 1]" },
     .{ .pattern = "[:order/items :order/customer]", .entity = "[:order/number 2]" },
+    .{ .pattern = "[*]", .entity = "[:order/number 9]" },
+    .{ .pattern = "[:order/items]", .entity = "[:order/number 9]" },
+    .{ .pattern = "[(:order/items :limit nil)]", .entity = "[:order/number 9]" },
+    .{ .pattern = "[(:order/items :limit 1001)]", .entity = "[:order/number 9]" },
     // Components.
     .{ .pattern = "[:person/house]", .entity = ann },
     .{ .pattern = "[:person/name :person/house]", .entity = bob },

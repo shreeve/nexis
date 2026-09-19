@@ -26,6 +26,7 @@ const list_mod = @import("list");
 const vector_mod = @import("vector");
 const champ = @import("champ");
 const dispatch = @import("dispatch");
+const marshal = @import("../marshal.zig");
 const ir = @import("ir.zig");
 
 const Allocator = std.mem.Allocator;
@@ -45,6 +46,8 @@ pub const Error = error{ QuerySyntax, OutOfMemory };
 pub const Diag = struct {
     clause: ?usize = null,
     message: []const u8 = "",
+    /// The attribute an `UnknownAttribute` names, as the query wrote it.
+    attr: ?Value = null,
 };
 
 // =============================================================================
@@ -76,8 +79,8 @@ pub fn parseRules(gpa: Allocator, interner: *Interner, rules: Value, diag: *Diag
     const out = try gpa.create(RuleSet);
     errdefer gpa.destroy(out);
     out.* = .{ .arena_state = std.heap.ArenaAllocator.init(gpa), .vars = &.{}, .rules = &.{} };
-    errdefer out.arena_state.deinit();
-    var p = Parser{ .arena = out.arena_state.allocator(), .interner = interner, .diag = diag };
+    errdefer out.arena_state.?.deinit();
+    var p = Parser{ .arena = out.arena_state.?.allocator(), .interner = interner, .diag = diag };
     out.rules = try p.parseRuleSet(rules);
     out.vars = try p.vars.toOwnedSlice(p.arena);
     return out;
@@ -138,19 +141,7 @@ const Parser = struct {
     }
 
     fn elems(self: *Parser, v: Value) Error![]Value {
-        var out: std.ArrayList(Value) = .empty;
-        switch (v.kind()) {
-            .persistent_vector => {
-                var it = vector_mod.Cursor.init(v);
-                while (it.next()) |x| try out.append(self.arena, x);
-            },
-            .list => {
-                var it = list_mod.Cursor.init(v);
-                while (it.next()) |x| try out.append(self.arena, x);
-            },
-            else => return self.fail("expected a vector or list"),
-        }
-        return out.toOwnedSlice(self.arena);
+        return (try marshal.sequence(self.arena, v)) orelse self.fail("expected a vector or list");
     }
 
     fn keywordIs(self: *Parser, v: Value, name: []const u8) bool {
@@ -465,15 +456,40 @@ const Parser = struct {
         const name = self.symName(call_parts[0]) orelse return self.fail("function name must be a symbol");
         const f: ir.FnRef = if (ir.Builtin.fromName(name)) |b| .{ .builtin = b } else .{ .user = call_parts[0].asSymbolId() };
         const call: ir.Call = .{ .f = f, .args = try self.parseArgs(call_parts[1..], false) };
-        if (parts.len == 1) {
-            if (f == .builtin) switch (f.builtin) {
-                .ground, .get_else, .tuple, .untuple => return self.fail("function needs a binding form"),
-                else => {},
-            };
-            return .{ .pred = call };
-        }
+        if (f == .builtin) try self.checkBuiltin(f.builtin, call.args, parts.len == 1);
+        if (parts.len == 1) return .{ .pred = call };
         if (parts.len != 2) return self.fail("function clause is [(f args) binding]");
         return .{ .bind = .{ .call = call, .out = try self.parseBinding(parts[1]) } };
+    }
+
+    /// A built-in's arity and role: predicates stand alone, functions
+    /// need a binding form.
+    fn checkBuiltin(self: *Parser, b: ir.Builtin, args: []const ir.Arg, predicate: bool) Error!void {
+        switch (b) {
+            .lt, .le, .gt, .ge, .eq, .ne => {
+                if (!predicate) return self.fail("a comparison is a predicate; it binds nothing");
+                if (args.len < 2) return self.fail("a comparison needs at least two arguments");
+            },
+            .missing => {
+                if (!predicate) return self.fail("missing? is a predicate; it binds nothing");
+                if (args.len != 3 or args[0] != .src) return self.fail("missing? is (missing? $ ?e :attr)");
+            },
+            .ground => {
+                if (predicate) return self.fail("ground needs a binding form");
+                if (args.len != 1) return self.fail("ground takes one value");
+            },
+            .get_else => {
+                if (predicate) return self.fail("get-else needs a binding form");
+                if (args.len != 4 or args[0] != .src) return self.fail("get-else is (get-else $ ?e :attr default)");
+            },
+            .tuple => {
+                if (predicate) return self.fail("tuple needs a binding form");
+            },
+            .untuple => {
+                if (predicate) return self.fail("untuple needs a binding form");
+                if (args.len != 1) return self.fail("untuple takes one tuple");
+            },
+        }
     }
 
     fn parseArgs(self: *Parser, items: []Value, rule_call: bool) Error![]ir.Arg {
@@ -511,11 +527,13 @@ const Parser = struct {
     fn bindTuple(self: *Parser, items: []Value) Error![]?Var {
         if (items.len == 0) return self.fail("empty tuple binding");
         const out = try self.arena.alloc(?Var, items.len);
-        for (items, out) |x, *slot| {
+        for (items, out, 0..) |x, *slot, i| {
             if (self.isSym(x, "_")) {
                 slot.* = null;
             } else if (self.isVarSym(x)) {
-                slot.* = try self.varOf(x.asSymbolId());
+                const v = try self.varOf(x.asSymbolId());
+                for (out[0..i]) |prev| if (prev == v) return self.fail("duplicate variable in tuple binding");
+                slot.* = v;
             } else return self.fail("tuple binding takes variables");
         }
         return out;
@@ -559,7 +577,14 @@ const Parser = struct {
             const body = try self.parseClauses(parts[1..], false);
             try out.append(self.arena, .{ .name = name, .required = required, .head = try vars.toOwnedSlice(self.arena), .body = body });
         }
+        // Group the bodies of one rule: `RuleSet.byName` is one slice.
+        // The sort is stable, so bodies keep their source order.
+        std.mem.sort(ir.Rule, out.items, {}, ruleNameLess);
         return out.toOwnedSlice(self.arena);
+    }
+
+    fn ruleNameLess(_: void, a: ir.Rule, b: ir.Rule) bool {
+        return a.name < b.name;
     }
 };
 
@@ -765,6 +790,26 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
     // Unknown section.
     const q7 = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("keys"), b.sym("e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
     try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, q7, &diag));
+
+    // Built-in arity and role are checked here, with a reason.
+    for ([_]Value{
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.lst(&.{ b.sym("<"), b.sym("?v") })}) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("<"), b.sym("?v"), b.int(3) }), b.sym("?x") }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.lst(&.{ b.sym("missing?"), b.sym("?e"), b.kw("a") })}) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("ground"), b.int(1), b.int(2) }), b.sym("?x") }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("get-else"), b.sym("?e"), b.kw("a"), b.int(0) }), b.sym("?x") }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.lst(&.{ b.sym("tuple"), b.sym("?v") })}) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("untuple"), b.sym("?v"), b.sym("?v") }), b.vec(&.{ b.sym("?x"), b.sym("?y") }) }) }),
+    }) |bad_call| {
+        try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, bad_call, &diag));
+        try testing.expect(diag.message.len > 0);
+        try testing.expectEqual(@as(?usize, 1), diag.clause);
+    }
+
+    // A variable twice in one tuple binding.
+    const q8 = b.vec(&.{ b.kw("find"), b.sym("?x"), b.kw("where"), b.vec(&.{ b.lst(&.{ b.sym("f"), b.int(1) }), b.vec(&.{ b.sym("?x"), b.sym("?x") }) }) });
+    try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, q8, &diag));
+    try testing.expectEqualStrings("duplicate variable in tuple binding", diag.message);
 }
 
 test "rules parse with required groups and arity checks; caches hit by identity and structure" {
@@ -785,6 +830,30 @@ test "rules parse with required groups and arity checks; caches hit by identity 
     try testing.expectEqual(@as(usize, 1), rs.rules[0].required);
     try testing.expectEqual(@as(usize, 2), rs.rules[1].head.len);
     try testing.expectEqual(@as(usize, 2), rs.byName(rs.rules[0].name).?.len);
+
+    // Interleaved names are grouped, bodies in source order, and the
+    // empty set frees nothing.
+    const mixed = b.vec(&.{
+        b.vec(&.{ b.lst(&.{ b.sym("r"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(1) }) }),
+        b.vec(&.{ b.lst(&.{ b.sym("s"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(2) }) }),
+        b.vec(&.{ b.lst(&.{ b.sym("r"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(3) }) }),
+        b.vec(&.{ b.lst(&.{ b.sym("s"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(4) }) }),
+    });
+    const ms = try parseRules(testing.allocator, &interner, mixed, &diag);
+    defer ms.deinit();
+    const r_name = (try interner.internSymbol("r"));
+    const s_name = (try interner.internSymbol("s"));
+    const rs_r = ms.byName(r_name).?;
+    const rs_s = ms.byName(s_name).?;
+    try testing.expectEqual(@as(usize, 2), rs_r.len);
+    try testing.expectEqual(@as(usize, 2), rs_s.len);
+    try testing.expectEqual(@as(i64, 1), rs_r[0].body[0].pattern.v.constant.cell.int);
+    try testing.expectEqual(@as(i64, 3), rs_r[1].body[0].pattern.v.constant.cell.int);
+    try testing.expectEqual(@as(i64, 2), rs_s[0].body[0].pattern.v.constant.cell.int);
+    try testing.expectEqual(@as(i64, 4), rs_s[1].body[0].pattern.v.constant.cell.int);
+    try testing.expect(ms.byName(try interner.internSymbol("t")) == null);
+    var empty = ir.no_rules;
+    empty.deinit();
 
     const bad = b.vec(&.{
         b.vec(&.{ b.lst(&.{ b.sym("r"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(1) }) }),

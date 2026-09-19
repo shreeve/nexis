@@ -74,7 +74,7 @@ const native_explain = NativeFn{ .name = "nextomic/explain", .min_arity = 2, .ma
 
 /// The keyword a pipeline error throws as, or null for a VM error,
 /// which passes through unchanged.
-pub fn keywordFor(err: anyerror) ?[]const u8 {
+fn keywordFor(err: anyerror) ?[]const u8 {
     switch (err) {
         error.QuerySyntax => return "nextomic/query-syntax",
         error.UnboundPattern => return "nextomic/unbound-pattern",
@@ -86,14 +86,22 @@ pub fn keywordFor(err: anyerror) ?[]const u8 {
     return natives.errorKeyword(err);
 }
 
-/// Surface `err` to the program.
+/// Surface `err` to the program with what `diag` knows: the reason of
+/// a syntax error or of malformed input, the attribute of an unknown one.
 fn fail(vm: *VM, err: anyerror, diag: *const Diag) VmError {
     if (err == error.QuerySyntax) return throwSyntax(vm, diag.message, diag.clause);
+    if (err == error.UnknownAttribute) return natives.failWith(vm, err, .{ .attr = diag.attr });
+    if (err == error.TxData) return natives.failWith(vm, err, .{ .message = messageOf(diag), .attr = diag.attr });
     if (keywordFor(err)) |name| return vm.throwKeyword(name);
     inline for (@typeInfo(VmError).error_set.?) |e| {
         if (err == @field(anyerror, e.name)) return @field(VmError, e.name);
     }
     unreachable;
+}
+
+/// The message `diag` carries, when it carries one.
+fn messageOf(diag: *const Diag) ?[]const u8 {
+    return if (diag.message.len == 0) null else diag.message;
 }
 
 /// Throw the `:nextomic/query-syntax` map.
@@ -150,7 +158,7 @@ const Qualified = struct { ns: []const u8, name: []const u8 };
 
 /// `ns/name` split at its first `/`; null for a bare name, for `/`
 /// itself and for a name with nothing on one side of the slash.
-pub fn splitQualified(name: []const u8) ?Qualified {
+fn splitQualified(name: []const u8) ?Qualified {
     const i = std.mem.indexOfScalar(u8, name, '/') orelse return null;
     if (i == 0 or i + 1 == name.len) return null;
     return .{ .ns = name[0..i], .name = name[i + 1 ..] };

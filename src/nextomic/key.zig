@@ -486,12 +486,6 @@ pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
     }
 }
 
-/// The type an encoded value carries, from its tag byte.
-pub fn tagOf(vbytes: []const u8) DecodeError!Tag {
-    if (vbytes.len == 0) return error.Corrupted;
-    return tagFromByte(vbytes[0]) orelse error.Corrupted;
-}
-
 fn tagFromByte(b: u8) ?Tag {
     inline for (@typeInfo(Tag).@"enum".fields) |f| {
         if (f.value == b) return @enumFromInt(b);
@@ -508,6 +502,19 @@ pub const Index = enum(u8) {
     aevt,
     avet,
     vaet,
+
+    /// A key component.
+    pub const Component = enum { e, a, v };
+
+    /// The order of the components in this index's keys.
+    pub fn order(self: Index) [3]Component {
+        return switch (self) {
+            .eavt => .{ .e, .a, .v },
+            .aevt => .{ .a, .e, .v },
+            .avet => .{ .a, .v, .e },
+            .vaet => .{ .v, .a, .e },
+        };
+    }
 
     pub fn name(self: Index) []const u8 {
         return switch (self) {
@@ -643,30 +650,21 @@ pub fn packPrefix(out: *std.ArrayList(u8), gpa: Allocator, index: Index, comps: 
     var abuf: [attr_len]u8 = undefined;
     if (comps.e) |e| writeId(&ebuf, e);
     if (comps.a) |a| writeAttr(&abuf, a);
-    const order: [3]u8 = switch (index) {
-        .eavt => .{ 'e', 'a', 'v' },
-        .aevt => .{ 'a', 'e', 'v' },
-        .avet => .{ 'a', 'v', 'e' },
-        .vaet => .{ 'v', 'a', 'e' },
-    };
     var n: u8 = 0;
-    for (order) |c| {
+    for (index.order()) |c| {
         switch (c) {
-            'e' => {
-                const e = comps.e orelse break;
-                _ = e;
+            .e => {
+                if (comps.e == null) break;
                 try out.appendSlice(gpa, &ebuf);
             },
-            'a' => {
-                const a = comps.a orelse break;
-                _ = a;
+            .a => {
+                if (comps.a == null) break;
                 try out.appendSlice(gpa, &abuf);
             },
-            'v' => {
+            .v => {
                 const v = comps.v orelse break;
                 try out.appendSlice(gpa, if (index == .vaet) try vaetValue(v) else v);
             },
-            else => unreachable,
         }
         n += 1;
     }

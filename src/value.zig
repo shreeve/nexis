@@ -110,9 +110,10 @@ pub const Kind = enum(u8) {
     /// a pointer to a `nextomic.Conn` owned by the VM, closed
     /// explicitly or by the VM's teardown; identity-valued.
     nextomic_conn = 38,
-    /// Nextomic db-value (docs/NEXTOMIC.md §4). Payload is a pointer
-    /// to a heap-allocated `nextomic.DbValue` `{conn, basis, as-of,
-    /// since, history}`; a plain value with no open transaction.
+    /// Nextomic db-value (docs/NEXTOMIC.md §4). The heap body is the
+    /// inline `DbBox` `{conn, basis, as-of, since, history}` of
+    /// src/nextomic/handle.zig; a plain value with no open transaction,
+    /// compared and hashed structurally.
     nextomic_db = 39,
     // 40..63 reserved for future heap kinds.
 
