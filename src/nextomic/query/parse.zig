@@ -1,7 +1,8 @@
 //! query/parse.zig — query value to IR (NEXTOMIC.md §5 "Parse").
 //!
-//! Accepts the vector form `[:find ... :in ... :with ... :where ...]`
-//! and the map form `{:find [...] :in [...] :with [...] :where [...]}`.
+//! Accepts the vector form `[:find ... :keys ... :in ... :with ...
+//! :where ...]` and the map form `{:find [...] :keys [...] :in [...]
+//! :with [...] :where [...]}` (`:strs` and `:syms` in place of `:keys`).
 //! Every syntax error is `error.QuerySyntax` with the clause index and
 //! a message left in the caller's `Diag`. Invariants:
 //!   - The IR is pure syntax (see `ir.zig`); nothing here touches a
@@ -158,6 +159,9 @@ const Parser = struct {
         var in: ?[]Value = null;
         var with: ?[]Value = null;
         var where: ?[]Value = null;
+        var keys: ?[]Value = null;
+        var strs: ?[]Value = null;
+        var syms: ?[]Value = null;
 
         switch (query.kind()) {
             .persistent_vector, .list => {
@@ -176,7 +180,7 @@ const Parser = struct {
                         } else if (acc.items.len > 0) return self.fail("query must start with :find");
                         if (at_end) break;
                         const k = items[i];
-                        section = if (self.keywordIs(k, "find")) &find else if (self.keywordIs(k, "in")) &in else if (self.keywordIs(k, "with")) &with else if (self.keywordIs(k, "where")) &where else return self.fail("unknown query section");
+                        section = self.sectionOf(k, &find, &in, &with, &where, &keys, &strs, &syms) orelse return self.fail("unknown query section");
                         continue;
                     }
                     try acc.append(self.arena, items[i]);
@@ -186,7 +190,7 @@ const Parser = struct {
                 var it = champ.mapIter(query);
                 while (it.next()) |e| {
                     const k = e.key;
-                    const target: *?[]Value = if (self.keywordIs(k, "find")) &find else if (self.keywordIs(k, "in")) &in else if (self.keywordIs(k, "with")) &with else if (self.keywordIs(k, "where")) &where else return self.fail("unknown query section");
+                    const target = self.sectionOf(k, &find, &in, &with, &where, &keys, &strs, &syms) orelse return self.fail("unknown query section");
                     target.* = try self.elems(e.value);
                 }
             },
@@ -196,6 +200,7 @@ const Parser = struct {
         const find_items = find orelse return self.fail("query has no :find");
         if (find_items.len == 0) return self.fail(":find is empty");
         try self.parseFind(find_items, out);
+        try self.parseKeys(out, keys, strs, syms);
 
         out.in = if (in) |items| try self.parseIn(items) else try self.arena.dupe(ir.InBinding, &.{.src});
 
@@ -212,6 +217,37 @@ const Parser = struct {
         out.where = try self.parseClauses(where_items, true);
 
         try self.checkBound(out);
+    }
+
+    fn sectionOf(self: *Parser, k: Value, find: *?[]Value, in: *?[]Value, with: *?[]Value, where: *?[]Value, keys: *?[]Value, strs: *?[]Value, syms: *?[]Value) ?*?[]Value {
+        if (self.keywordIs(k, "find")) return find;
+        if (self.keywordIs(k, "in")) return in;
+        if (self.keywordIs(k, "with")) return with;
+        if (self.keywordIs(k, "where")) return where;
+        if (self.keywordIs(k, "keys")) return keys;
+        if (self.keywordIs(k, "strs")) return strs;
+        if (self.keywordIs(k, "syms")) return syms;
+        return null;
+    }
+
+    /// At most one of `:keys`, `:strs`, `:syms`: symbols, one per find
+    /// element, with the relation find spec.
+    fn parseKeys(self: *Parser, out: *Ir, keys: ?[]Value, strs: ?[]Value, syms: ?[]Value) Error!void {
+        var given: usize = 0;
+        if (keys != null) given += 1;
+        if (strs != null) given += 1;
+        if (syms != null) given += 1;
+        if (given == 0) return;
+        if (given > 1) return self.fail("a query takes one of :keys, :strs and :syms");
+        const items = keys orelse strs orelse syms.?;
+        if (out.find_spec != .relation) return self.fail(":keys, :strs and :syms take the relation find spec");
+        if (items.len != out.find.len) return self.fail(":keys, :strs and :syms take one name per :find element");
+        const names = try self.arena.alloc(u32, items.len);
+        for (items, names) |x, *n| {
+            if (!x.isSymbol() or self.isVarSym(x)) return self.fail(":keys, :strs and :syms take symbols");
+            n.* = x.asSymbolId();
+        }
+        out.keys = .{ .kind = if (keys != null) .keyword else if (strs != null) .string else .symbol, .names = names };
     }
 
     fn parseFind(self: *Parser, items: []Value, out: *Ir) Error!void {
@@ -245,12 +281,17 @@ const Parser = struct {
         if (self.isVarSym(v)) return .{ .variable = try self.varOf(v.asSymbolId()) };
         if (v.kind() == .list) {
             const parts = try self.elems(v);
-            if (parts.len != 2 or !self.isVarSym(parts[1])) return self.fail("aggregate takes one variable");
             const name = self.symName(parts[0]) orelse return self.fail("aggregate head must be a symbol");
+            if (std.mem.eql(u8, name, "pull")) {
+                if (parts.len != 3 or !self.isVarSym(parts[1])) return self.fail("pull is (pull ?e pattern)");
+                if (parts[2].kind() != .persistent_vector) return self.fail("pull takes a pattern vector");
+                return .{ .pull = .{ .e = try self.varOf(parts[1].asSymbolId()), .pattern = parts[2] } };
+            }
+            if (parts.len != 2 or !self.isVarSym(parts[1])) return self.fail("aggregate takes one variable");
             const op = ir.AggOp.fromName(name) orelse return self.fail("unknown aggregate");
             return .{ .agg = .{ .op = op, .arg = try self.varOf(parts[1].asSymbolId()) } };
         }
-        return self.fail(":find takes variables and aggregates");
+        return self.fail(":find takes variables, aggregates and pull expressions");
     }
 
     fn parseIn(self: *Parser, items: []Value) Error![]ir.InBinding {
@@ -798,8 +839,30 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
     try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, q6, &diag));
 
     // Unknown section.
-    const q7 = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("keys"), b.sym("e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
+    const q7 = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("keyz"), b.sym("e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
     try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, q7, &diag));
+
+    // :keys / :strs / :syms name every find element; pull expressions.
+    const q_keys = b.vec(&.{ b.kw("find"), b.sym("?e"), b.lst(&.{ b.sym("pull"), b.sym("?e"), b.vec(&.{b.kw("a")}) }), b.kw("keys"), b.sym("id"), b.sym("row"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
+    const pk = try parse(testing.allocator, &interner, q_keys, &diag);
+    defer pk.deinit();
+    try testing.expect(pk.keys.?.kind == .keyword and pk.keys.?.names.len == 2);
+    try testing.expect(pk.find[1] == .pull and pk.find[1].pull.e == pk.find[0].variable);
+    const q_syms = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("syms"), b.sym("id"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
+    const ps = try parse(testing.allocator, &interner, q_syms, &diag);
+    defer ps.deinit();
+    try testing.expect(ps.keys.?.kind == .symbol);
+    for ([_]Value{
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("keys"), b.sym("a"), b.sym("b"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.sym("."), b.kw("strs"), b.sym("a"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("keys"), b.kw("a"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("keys"), b.sym("a"), b.kw("syms"), b.sym("a"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),
+        b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("pull"), b.sym("?e") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),
+        b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("pull"), b.sym("?e"), b.kw("a") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),
+    }) |bad| {
+        try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, bad, &diag));
+        try testing.expect(diag.message.len > 0);
+    }
 
     // Built-in arity and role are checked here, with a reason.
     for ([_]Value{

@@ -19,9 +19,10 @@
 //!     untouched (the caller closes the `Read` on the way out).
 //!   - A function result of nil drops the row; collection and relation
 //!     bindings fan out one row per element.
-//!   - `finish` forms the basis set (distinct tuples over the find and
-//!     `:with` variables), groups and aggregates it, and copies the
-//!     result into the VM heap as the find spec asks.
+//!   - `findRows` forms the basis set (distinct tuples over the find and
+//!     `:with` variables) and groups and aggregates it; `materialise`
+//!     applies pull expressions in the same snapshot and copies the
+//!     result into the VM heap as the find spec and `:keys` ask.
 //!
 //! Every function on a path to the call hook is `anyerror`: the hook
 //! raises whatever the VM raises, and that passes through untouched.
@@ -43,6 +44,7 @@ const ir = @import("ir.zig");
 const plan_mod = @import("plan.zig");
 const rules_mod = @import("rules.zig");
 const marshal = @import("../marshal.zig");
+const pull_mod = @import("../pull.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -592,7 +594,7 @@ pub const Exec = struct {
         var rows: std.ArrayList([]const Cell) = .empty;
         if (!query.hasAggregates()) {
             const find_vars = try self.arena.alloc(Var, query.find.len);
-            for (query.find, find_vars) |f, *v| v.* = f.variable;
+            for (query.find, find_vars) |f, *v| v.* = f.variable_of();
             const tuples = try basis.project(find_vars, query.with.len > 0);
             var i: usize = 0;
             while (i < tuples.rows) : (i += 1) {
@@ -603,9 +605,10 @@ pub const Exec = struct {
             return rows.toOwnedSlice(self.arena);
         }
 
-        // Group by the plain find variables, in first-seen order.
+        // Group by the plain find variables (a pull expression groups
+        // by its entity), in first-seen order.
         var group_vars: std.ArrayList(Var) = .empty;
-        for (query.find) |f| if (f == .variable) try ir.addVar(self.arena, &group_vars, f.variable);
+        for (query.find) |f| if (f != .agg) try ir.addVar(self.arena, &group_vars, f.variable_of());
         const keys = try basis.project(group_vars.items, false);
         var groups: std.ArrayList(std.ArrayList(usize)) = .empty;
         var index: std.AutoHashMapUnmanaged(u64, std.ArrayList(usize)) = .empty;
@@ -633,7 +636,7 @@ pub const Exec = struct {
             const row = try self.arena.alloc(Cell, query.find.len);
             for (query.find, row) |f, *cell| {
                 cell.* = switch (f) {
-                    .variable => |v| basis.get(members.items[0], v).?,
+                    .variable, .pull => basis.get(members.items[0], f.variable_of()).?,
                     .agg => |a| try self.aggregate(a.op, &basis, basis.colOf(a.arg).?, members.items),
                 };
             }
@@ -690,10 +693,14 @@ pub const Exec = struct {
         }
     }
 
-    /// Copy `rows` into the VM heap as `spec` asks: a set of vectors, a
-    /// vector of values, one value, or one vector.
-    pub fn materialise(self: *Exec, spec: ir.FindSpec, rows: []const []const Cell) anyerror!Value {
-        switch (spec) {
+    /// Copy `rows` into the VM heap as the find spec asks: a set of
+    /// vectors (a vector of maps under `:keys`, `:strs` or `:syms`), a
+    /// vector of values, one value, or one vector. Pull expressions are
+    /// applied here, in the query's own snapshot.
+    pub fn materialise(self: *Exec, query: *const Ir, rows_in: []const []const Cell) anyerror!Value {
+        const rows = try self.pullColumns(query, rows_in);
+        if (query.keys) |keys| return self.rowMaps(keys, rows);
+        switch (query.find_spec) {
             .relation => {
                 var set = try champ.setEmpty(self.heap);
                 for (rows) |row| set = try champ.setConj(self.heap, set, try self.rowVector(row), &dispatch.hashValue, &dispatch.equal);
@@ -719,5 +726,53 @@ pub const Exec = struct {
         const vals = try self.arena.alloc(Value, row.len);
         for (row, vals) |c, *v| v.* = try self.cellValue(c);
         return vector_mod.fromSlice(self.heap, vals);
+    }
+
+    /// `rows` with every `(pull ?e pattern)` column replaced by the
+    /// pattern's map for the row's entity (nil for an entity with no
+    /// datoms); a cell that is not an entity id is `ValueType`. Each
+    /// pattern is resolved once; a syntax error leaves its reason in
+    /// the diagnostic.
+    fn pullColumns(self: *Exec, query: *const Ir, rows: []const []const Cell) anyerror![]const []const Cell {
+        var any = false;
+        for (query.find) |f| if (f == .pull) {
+            any = true;
+        };
+        if (!any) return rows;
+        var scratch: Diag = .{};
+        const diag = self.diag orelse &scratch;
+        const prepared = try self.arena.alloc(?pull_mod.Prepared, query.find.len);
+        for (query.find, prepared) |f, *p| p.* = if (f == .pull) try pull_mod.Prepared.prepare(self.arena, self.read, self.heap, self.interner, f.pull.pattern, diag) else null;
+        const out = try self.arena.alloc([]const Cell, rows.len);
+        for (rows, out) |row, *o| {
+            const cells = try self.arena.dupe(Cell, row);
+            for (prepared, cells) |*p, *c| {
+                const pr = &(p.* orelse continue);
+                const e = c.asEid() orelse return error.ValueType;
+                c.* = .{ .vm = try pr.eid(e) };
+            }
+            o.* = cells;
+        }
+        return out;
+    }
+
+    /// The rows as a vector of maps, one key per find element.
+    fn rowMaps(self: *Exec, keys: ir.Keys, rows: []const []const Cell) anyerror!Value {
+        const names = try self.arena.alloc(Value, keys.names.len);
+        for (keys.names, names) |sym, *n| {
+            const text = self.interner.symbolName(sym);
+            n.* = switch (keys.kind) {
+                .keyword => try self.interner.internKeywordValue(text),
+                .string => try string_mod.fromBytes(self.heap, text),
+                .symbol => value.fromSymbolId(sym),
+            };
+        }
+        const maps = try self.arena.alloc(Value, rows.len);
+        for (rows, maps) |row, *m| {
+            var map = try champ.mapEmpty(self.heap);
+            for (names, row) |k, c| map = try champ.mapAssoc(self.heap, map, k, try self.cellValue(c), &dispatch.hashValue, &dispatch.equal);
+            m.* = map;
+        }
+        return vector_mod.fromSlice(self.heap, maps);
     }
 };

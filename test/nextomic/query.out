@@ -50,6 +50,15 @@ nil
 (Bob Cy Di)
 [Cy 41]
 nil
+{:db/id 4294967298, :person/name Cy, :person/age 41}
+(Cy Edward)
+([Ann 2] [Bob 1] [Cy 1])
+(Ann Bob Cy Di Edward Flo)
+(Ann Di)
+(Ann Bob Cy Di Edward Flo)
+{:error :nextomic/query-syntax, :message :keys, :strs and :syms take one name per :find element}
+{:error :nextomic/unknown-attribute, :attr :nope/attr}
+:nextomic/history-view
 ([Di] [Flo])
 ([Ann] [Cy] [Di] [Edward])
 ([Bob] [Di] [Edward] [Flo])

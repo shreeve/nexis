@@ -297,7 +297,7 @@ const Naive = struct {
         if (!parsed.hasAggregates()) {
             for (basis.items) |b| {
                 const row = try arena.alloc(Cell, parsed.find.len);
-                for (parsed.find, row) |f, *c| c.* = b[indexOf(basis_vars.items, f.variable)];
+                for (parsed.find, row) |f, *c| c.* = b[indexOf(basis_vars.items, f.variable_of())];
                 if (parsed.with.len == 0 or !containsRow(out.items, row)) try out.append(arena, row);
             }
             return out.toOwnedSlice(arena);
@@ -305,7 +305,7 @@ const Naive = struct {
 
         // Group by the plain find variables.
         var group_vars: std.ArrayList(Var) = .empty;
-        for (parsed.find) |f| if (f == .variable) try ir.addVar(arena, &group_vars, f.variable);
+        for (parsed.find) |f| if (f != .agg) try ir.addVar(arena, &group_vars, f.variable_of());
         var keys: std.ArrayList(Row) = .empty;
         var groups: std.ArrayList(std.ArrayList(Row)) = .empty;
         for (basis.items) |b| {
@@ -326,7 +326,7 @@ const Naive = struct {
             const row = try arena.alloc(Cell, parsed.find.len);
             for (parsed.find, row) |f, *c| {
                 c.* = switch (f) {
-                    .variable => |v| members.items[0][indexOf(basis_vars.items, v)],
+                    .variable, .pull => members.items[0][indexOf(basis_vars.items, f.variable_of())],
                     .agg => |ag| try self.aggregate(ag.op, members.items, indexOf(basis_vars.items, ag.arg)),
                 };
             }
@@ -954,8 +954,17 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     try checkCount(fx, dbv, "[:find (count ?e) . :where [?e :person/tags :green]]", none, 1);
     try checkCount(fx, dbv, "[:find [(min ?a) (max ?a)] :where [_ :person/age ?a]]", none, 1);
 
+    // Pull expressions and :keys shape the value, not the rows.
+    try checkCount(fx, dbv, "[:find (pull ?e [:person/name]) :where [?e :person/age 30]]", none, 2);
+    try checkCount(fx, dbv, "[:find (pull ?e [*]) ?n :where [?e :person/name ?n] [?e :person/tags _]]", none, 4);
+    try checkCount(fx, dbv, "[:find (pull ?c [:person/name]) (count ?o) :where [?o :order/customer ?c]]", none, 3);
+    try checkCount(fx, dbv, "[:find [(pull ?e [:person/name]) ...] :where [?e :person/tags :green]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?n ?a :keys name age :where [?e :person/name ?n] [?e :person/age ?a]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?st (sum ?t) :strs status total :where [?o :order/status ?st] [?o :order/total ?t]]", none, 2);
+
     // Map form.
     try checkCount(fx, dbv, "{:find [?n] :where [[?e :person/name ?n] [?e :person/tags :green]]}", none, 2);
+    try checkCount(fx, dbv, "{:find [?n ?a] :keys [n a] :where [[?e :person/name ?n] [?e :person/age ?a]]}", none, 6);
 }
 
 test "corpus: every :in form" {
@@ -1219,10 +1228,49 @@ test "results materialise as set, scalar, collection, tuple; caches; explain" {
     try testing.expectApproxEqAbs(@as(f64, 215.0 / 6.0), vector_mod.nth(agg, 2).asFloat(), 1e-9);
     try testing.expectEqual(@as(usize, 5), champ.setCount(vector_mod.nth(agg, 3)));
 
+    // Pull expressions in :find yield the pattern's map per row, in
+    // every find spec and beside an aggregate; a history db refuses them.
+    const pulled = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (pull ?e [:person/name :person/age]) :where [?e :person/email \"cy@x\"]]"), dbv, none, &diag, opts);
+    try testing.expectEqual(@as(usize, 1), champ.setCount(pulled));
+    var pit = champ.setIter(pulled);
+    const cy_row = pit.next().?;
+    const cy_map = vector_mod.nth(cy_row, 0);
+    try testing.expect(cy_map.kind() == .persistent_map);
+    try testing.expectEqualStrings("Cy", string_mod.asBytes((try fx.getName(cy_map, "person/name")).?));
+    try testing.expectEqual(@as(i64, 41), (try fx.getName(cy_map, "person/age")).?.asFixnum());
+    const pulled_one = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (pull ?e [:person/name]) . :where [?e :person/email \"cy@x\"]]"), dbv, none, &diag, opts);
+    try testing.expectEqualStrings("Cy", string_mod.asBytes((try fx.getName(pulled_one, "person/name")).?));
+    const pulled_many = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [(pull ?e [:person/name]) ...] :where [?e :person/tags :green]]"), dbv, none, &diag, opts);
+    try testing.expectEqual(@as(usize, 2), vector_mod.count(pulled_many));
+    try testing.expect(vector_mod.nth(pulled_many, 0).kind() == .persistent_map);
+    const pulled_agg = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [(pull ?c [:person/name]) (count ?o)] :where [?o :order/customer ?c] [?c :person/email \"ann@x\"]]"), dbv, none, &diag, opts);
+    try testing.expectEqualStrings("Ann", string_mod.asBytes((try fx.getName(vector_mod.nth(pulled_agg, 0), "person/name")).?));
+    try testing.expectEqual(@as(i64, 2), vector_mod.nth(pulled_agg, 1).asFixnum());
+    try testing.expectError(error.HistoryView, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (pull ?e [:person/name]) :where [?e :person/age 30]]"), dbv.withHistory(), none, &diag, opts));
+    try testing.expectError(error.PullSyntax, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (pull ?e [bogus]) :where [?e :person/age 30]]"), dbv, none, &diag, opts));
+    try testing.expect(diag.message.len > 0);
+    try testing.expectError(error.ValueType, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (pull ?n [:person/name]) :where [?e :person/name ?n]]"), dbv, none, &diag, opts));
+
+    // :keys, :strs and :syms return a vector of maps under those names.
+    const keyed = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n ?a :keys name age :where [?e :person/name ?n] [?e :person/age ?a] [(< ?a 31)]]"), dbv, none, &diag, opts);
+    try testing.expect(keyed.kind() == .persistent_vector);
+    try testing.expectEqual(@as(usize, 3), vector_mod.count(keyed));
+    const first = vector_mod.nth(keyed, 0);
+    try testing.expect((try fx.getName(first, "name")).?.kind() == .string);
+    try testing.expect((try fx.getName(first, "age")).?.kind() == .fixnum);
+    const strs = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n :strs name :where [?e :person/email \"cy@x\"] [?e :person/name ?n]]"), dbv, none, &diag, opts);
+    const strs_v = champ.mapGet(vector_mod.nth(strs, 0), try fx.str("name"), &dispatch.hashValue, &dispatch.equal);
+    try testing.expectEqualStrings("Cy", string_mod.asBytes(strs_v.present));
+    const syms = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n (count ?e) :syms name n :where [?e :person/name ?n]]"), dbv, none, &diag, opts);
+    try testing.expectEqual(@as(usize, 6), vector_mod.count(syms));
+    const syms_v = champ.mapGet(vector_mod.nth(syms, 0), try fx.read("n"), &dispatch.hashValue, &dispatch.equal);
+    try testing.expectEqual(@as(i64, 1), syms_v.present.asFixnum());
+    try testing.expectError(error.QuerySyntax, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n ?a :keys name :where [?e :person/name ?n] [?e :person/age ?a]]"), dbv, none, &diag, opts));
+
     // Keyword and string values come back as VM values; the cache serves repeats.
     const kws = try query.q(testing.allocator, fx.interner(), &fx.heap, rel_q, dbv, none, &diag, opts);
     try testing.expectEqual(@as(usize, 3), champ.setCount(kws));
-    try testing.expectEqual(@as(usize, 6), cache.count());
+    try testing.expectEqual(@as(usize, 16), cache.count());
     const rules_q = try fx.read("[:find [?n ...] :in $ % :where (admin ?p) [?p :person/name ?n]]");
     const rules_v = try fx.read(rules_src);
     const admins = try query.q(testing.allocator, fx.interner(), &fx.heap, rules_q, dbv, &.{ value.nilValue(), rules_v }, &diag, opts);

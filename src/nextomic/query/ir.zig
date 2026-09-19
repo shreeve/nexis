@@ -197,16 +197,29 @@ pub const AggOp = enum {
 pub const FindElem = union(enum) {
     variable: Var,
     agg: struct { op: AggOp, arg: Var },
+    /// `(pull ?e pattern)`: the pattern value is resolved against the
+    /// db when the result is materialised; the element groups and
+    /// dedups as its variable.
+    pull: struct { e: Var, pattern: Value },
 
     pub fn variable_of(self: FindElem) Var {
         return switch (self) {
             .variable => |v| v,
             .agg => |a| a.arg,
+            .pull => |p| p.e,
         };
     }
 };
 
 pub const FindSpec = enum { relation, scalar, collection, tuple };
+
+/// `:keys`, `:strs` or `:syms`: one name per find element; the result
+/// is a vector of maps under those names.
+pub const Keys = struct {
+    kind: enum { keyword, string, symbol },
+    /// VM symbol intern ids, in find order.
+    names: []const u32,
+};
 
 pub const InBinding = union(enum) {
     src,
@@ -222,6 +235,7 @@ pub const Ir = struct {
     vars: []const VarInfo,
     find_spec: FindSpec,
     find: []const FindElem,
+    keys: ?Keys = null,
     with: []const Var,
     in: []const InBinding,
     where: []const Clause,

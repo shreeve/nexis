@@ -102,6 +102,26 @@ pub fn pullMany(gpa: Allocator, interner: *Interner, heap: *Heap, db: DbValue, p
     return vector_mod.fromSlice(heap, out);
 }
 
+/// A pattern resolved against a `Read` the caller holds, for pulls
+/// inside another operation's snapshot: `q` applies `(pull ?e pattern)`
+/// find elements this way. Everything lives in the caller's arena.
+pub const Prepared = struct {
+    pattern: *const Pattern,
+    puller: Puller,
+
+    pub fn prepare(arena: Allocator, read: *Read, heap: *Heap, interner: *Interner, pattern: Value, diag: *Diag) Failure!Prepared {
+        if (read.db.history) return error.HistoryView;
+        var parser = try Parser.init(arena, read, interner, diag);
+        return .{ .pattern = try parser.parsePattern(pattern), .puller = try Puller.init(arena, read, heap, interner, diag) };
+    }
+
+    /// The pattern's map for `e`; nil when the entity has no datoms in
+    /// the view.
+    pub fn eid(self: *Prepared, e: u64) Failure!Value {
+        return (try self.puller.root(self.pattern, e)) orelse value.nilValue();
+    }
+};
+
 /// One call: the arena, the `Read`, the resolved pattern and the
 /// puller. Initialised in place, since the arena's allocator and the
 /// puller's `Read` pointer refer into it.

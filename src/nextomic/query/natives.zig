@@ -31,6 +31,8 @@
 //! Errors: `QuerySyntax` throws `{:error :nextomic/query-syntax
 //! :message "..." :clause i}` (`:clause` only when the parser was
 //! inside a `:where` clause), so the reason travels with the throw;
+//! `PullSyntax` from a `(pull ?e pattern)` find element throws the
+//! `:nextomic/pull-syntax` map the same way;
 //! `UnboundPattern` throws `:nextomic/unbound-pattern`; every other
 //! error takes the `natives.zig` mapping. VM errors pass through.
 
@@ -93,6 +95,7 @@ fn keywordFor(err: anyerror) ?[]const u8 {
 /// a syntax error or of malformed input, the attribute of an unknown one.
 fn fail(vm: *VM, err: anyerror, diag: *const Diag) VmError {
     if (err == error.QuerySyntax) return throwSyntax(vm, diag.message, diag.clause);
+    if (err == error.PullSyntax) return natives.throwSyntax(vm, "nextomic/pull-syntax", diag.message, diag.clause);
     if (err == error.UnknownAttribute) return natives.failWith(vm, err, .{ .attr = diag.attr });
     if (err == error.TxData) return natives.failWith(vm, err, .{ .message = messageOf(diag), .attr = diag.attr });
     if (keywordFor(err)) |name| return vm.throwKeyword(name);

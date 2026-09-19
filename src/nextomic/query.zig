@@ -103,7 +103,7 @@ pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: DbV
     const input = try ex.inputRelation(parsed.query, args);
     const rel = try ex.runPlan(p, input);
     const rows = try ex.findRows(parsed.query, rel);
-    return ex.materialise(parsed.query.find_spec, rows);
+    return ex.materialise(parsed.query, rows);
 }
 
 /// Print the plan of `query` against `db` to `w`.

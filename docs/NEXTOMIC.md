@@ -362,7 +362,15 @@ or collection as the language applies them, anything else is the VM's
 **Relation** is a Zig-private columnar struct in the query arena
 (`vars`, typed columns for eids and longs, a `Value` column otherwise);
 never a VM value. Results are copied into the VM heap as a persistent
-set of vectors (or the `.`, `[...]`, `[[...]]` find specs).
+set of vectors (or the `.`, `[...]`, `[[...]]` find specs). A find
+element `(pull ?e pattern)` (a pattern vector, §6) groups and dedups as
+`?e` and is applied when the result is copied, in the query's own
+snapshot: the pattern's map, nil for an entity with no datoms,
+`:nextomic/value-type` when `?e` is not an entity id,
+`:nextomic/pull-syntax` for a bad pattern, `:nextomic/history-view` on a
+history db. `:keys`, `:strs` or `:syms` name every find element (one
+symbol each, relation find spec only) and the result is a vector of
+maps under those names as keywords, strings or symbols.
 
 **Rules.** `:in $ %` binds a rule set. Non-recursive rules inline as
 sub-plans (cached per binding signature). Recursive rules run
@@ -386,7 +394,7 @@ sub-plans with the same output variables.
 | `(d/entity db e)` | eager map `{:db/id e :attr v ...}`, card-many as sets, refs as eids; nil when the entity has no datoms in this view; `:nextomic/history-view` on a history db |
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
 | `(d/datoms db :eavt e a v)` (index and optional components in index order; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
-| `(d/q query db & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]` and aggregates, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] %` with inputs positional after the db, `:where` with patterns, predicates, function bindings, `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors |
+| `(d/q query db & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]`, aggregates and `(pull ?e pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] %` with inputs positional after the db, `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
 | `(d/explain query db & inputs)` | the plan `q` would run, as a string: one numbered line per step with index, estimate and bound variables |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4); `t` is a transaction number or a transaction's entity id |
 | `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}` for `from ≤ t < to`, oldest first; a bound that is `nil` or not given is open |
@@ -437,7 +445,7 @@ keyword. The shapes:
 | `:nextomic/no-entity` | bare |
 | `:nextomic/tx-data` | `:message`; `:attr` when an attribute is at fault |
 | `:nextomic/query-syntax` | `:message`; `:clause`, the index into `:where`, when the parser or planner was inside a clause (an unbound function name is reported the same way at run time) |
-| `:nextomic/pull-syntax` | `:message`; `:clause`, the index of the spec in the pattern |
+| `:nextomic/pull-syntax` | `:message`; `:clause`, the index of the spec in the pattern (from `pull`, `pull-many` or a `(pull ?e pattern)` find element) |
 
 The map is what `catch` receives; `(:error m)` is the keyword. A key is
 present only when its value is known. Engine errors surface as the
