@@ -209,8 +209,8 @@ we pay the recomputation cost once. Saves one u32 and one flag bit per
 heap object over a separate `hash_valid` flag.
 
 **Alignment.** The allocator returns 16-byte-aligned `HeapHeader*`
-pointers. This lets us stash up to 4 bits of tag into a pointer's low
-bits in a future NaN-boxing migration without touching the heap layout.
+pointers, so a NaN-boxed layout could carry up to 4 bits of tag in a
+pointer's low bits without touching the heap layout.
 
 ---
 

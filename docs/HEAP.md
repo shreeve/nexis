@@ -56,7 +56,7 @@ or a VALUE.md amendment, not just a HEAP.md edit):
 1. Returned `*HeapHeader` is 16-byte aligned.
 2. `HeapHeader` layout and field order match VALUE.md §4 exactly.
    `@sizeOf(HeapHeader) == 16`, `@alignOf(HeapHeader) == 16`.
-3. `HeapHeader.hash == 0` means "not yet computed". Genuine computed-zero
+3. `HeapHeader.hash == 0` means "not computed". Genuine computed-zero
    hashes recompute on next access (VALUE.md §4). The heap module provides
    `cachedHash` / `setCachedHash` helpers that encode this sentinel.
 4. Fresh allocations are **zero-initialized** — both header (except `kind`
