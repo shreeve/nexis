@@ -910,44 +910,6 @@ fn withVarMeta(ctx: *ExpandContext, def_form: *Form, meta_items: []const *Form, 
     return try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "let*", origin), try makeVector(ctx, bindings, origin), reset_call, v_sym });
 }
 
-fn expandDefn(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    list_form: *const Form,
-    items: []const *Form,
-    depth: u32,
-) ExpandError!*Form {
-    // (defn name [params] body...)
-    if (items.len < 3) return ExpandError.MalformedMacroCall;
-    const head = items[0];
-    const name_form = items[1];
-    if (name_form.datum != .symbol) return ExpandError.MalformedMacroCall;
-    const params_form = items[2];
-    if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
-    const body = items[3..];
-
-    // Body env = self-name + params.
-    var local: ExpandEnv = .{ .parent = env };
-    defer local.deinit(ctx.allocator);
-    _ = try local.lexical_names.getOrPut(ctx.allocator, name_form.datum.symbol.name);
-    for (params_form.datum.vector) |p| {
-        if (p.datum != .symbol or p.datum.symbol.ns != null) continue;
-        if (std.mem.eql(u8, p.datum.symbol.name, "&")) continue;
-        _ = try local.lexical_names.getOrPut(ctx.allocator, p.datum.symbol.name);
-    }
-    const new_body = try ctx.allocator.alloc(*Form, body.len);
-    for (body, 0..) |b, j| {
-        new_body[j] = try expandFormDepth(ctx, &local, b, depth);
-    }
-    const total = 3 + body.len;
-    const out_items = try ctx.allocator.alloc(*Form, total);
-    out_items[0] = mutCast(head);
-    out_items[1] = mutCast(name_form);
-    out_items[2] = mutCast(params_form);
-    for (new_body, 0..) |b, k| out_items[3 + k] = b;
-    return try makeList(ctx, out_items, list_form.origin);
-}
-
 /// Expand `(try body* (catch MATCHER BINDING handler*)* (finally
 /// body*)?)` onto the compiler's primitive, which takes exactly one
 /// `(catch any g ...)`:
@@ -1506,8 +1468,7 @@ fn expandDefmacro(
     const ceval = ctx.compile_eval orelse return ExpandError.MalformedMacroCall;
 
     // First: macroexpand the body BEFORE compiling it. Body
-    // env includes the self-name + params (matches expandDefn
-    // semantics).
+    // env includes the self-name + params.
     var local: ExpandEnv = .{ .parent = env };
     defer local.deinit(ctx.allocator);
     _ = try local.lexical_names.getOrPut(ctx.allocator, name_form.datum.symbol.name);
@@ -2340,7 +2301,7 @@ fn buildMultiArityFn(
 
     // (let* [n_sym (count args_sym)] current_else)
     const count_items = try ctx.allocator.alloc(*Form, 2);
-    count_items[0] = try makeSymbol(ctx, "count", call_form.origin);
+    count_items[0] = try coreSym(ctx, "count", call_form.origin);
     count_items[1] = args_sym;
     const let_bindings = try ctx.allocator.alloc(*Form, 2);
     let_bindings[0] = n_sym;
@@ -2404,7 +2365,7 @@ fn buildThrowArity(ctx: *ExpandContext, origin: reader_mod.SrcSpan) ExpandError!
 
 fn buildFixedCondition(ctx: *ExpandContext, origin: reader_mod.SrcSpan, n_sym: *Form, k: usize) ExpandError!*Form {
     const items = try ctx.allocator.alloc(*Form, 3);
-    items[0] = try makeSymbol(ctx, "=", origin);
+    items[0] = try coreSym(ctx, "=", origin);
     items[1] = n_sym;
     const k_form = try ctx.allocator.create(Form);
     k_form.* = .{ .datum = .{ .int = @intCast(k) }, .origin = origin };
@@ -2412,32 +2373,31 @@ fn buildFixedCondition(ctx: *ExpandContext, origin: reader_mod.SrcSpan, n_sym: *
     return try makeList(ctx, items, origin);
 }
 
-/// Variadic with `fixed_count` args before `&`: matches when
-/// argc >= fixed_count. Built as `(not (< n fixed_count))` which
-/// avoids needing `<=`.
+/// The test for a variadic clause with `fixed_count` params before
+/// `&`: `(not (< n fixed_count))`, true when argc >= fixed_count.
 fn buildVariadicCondition(ctx: *ExpandContext, origin: reader_mod.SrcSpan, n_sym: *Form, fixed_count: usize) ExpandError!*Form {
     const lt_items = try ctx.allocator.alloc(*Form, 3);
-    lt_items[0] = try makeSymbol(ctx, "<", origin);
+    lt_items[0] = try coreSym(ctx, "<", origin);
     lt_items[1] = n_sym;
     const k_form = try ctx.allocator.create(Form);
     k_form.* = .{ .datum = .{ .int = @intCast(fixed_count) }, .origin = origin };
     lt_items[2] = k_form;
     const lt_call = try makeList(ctx, lt_items, origin);
     const not_items = try ctx.allocator.alloc(*Form, 2);
-    not_items[0] = try makeSymbol(ctx, "not", origin);
+    not_items[0] = try coreSym(ctx, "not", origin);
     not_items[1] = lt_call;
     return try makeList(ctx, not_items, origin);
 }
 
-/// Build the body of an arity branch: `(loop [params... from
-/// args_sym] body...)`. For fixed arity, each param i gets `(nth
-/// args_sym i)`. For variadic, the rest param gets `args_sym`'s
-/// suffix through `fixed` nested `rest` calls (no `drop` native).
-/// The clause's parameters are loop locals, so a `recur` in the
-/// clause's tail rebinds exactly them and jumps to the clause
-/// body: Clojure's rule that `recur` re-enters the clause with
-/// the clause's own arity. A `recur` inside a nested `loop` in
-/// the clause targets that inner loop, as everywhere else.
+/// The body of an arity branch: `(loop [params...] body...)` over
+/// `args_sym`, the packed argument list. Param `i` binds
+/// `(nth args_sym i nil)`; a variadic clause's rest param binds
+/// `rest` applied `fixed` times to `args_sym`. The clause's
+/// parameters are loop locals, so a `recur` in the clause's tail
+/// rebinds exactly them and jumps to the clause body: Clojure's
+/// rule that `recur` re-enters the clause with the clause's own
+/// arity. A `recur` inside a nested `loop` in the clause targets
+/// that inner loop, as everywhere else.
 fn buildArityThen(
     ctx: *ExpandContext,
     origin: reader_mod.SrcSpan,
@@ -2458,7 +2418,7 @@ fn buildArityThen(
         // params[fixed] is `&`; params[fixed+1] is the rest binding.
         if (fixed + 1 >= params.len) return ExpandError.MalformedMacroCall;
         const rest_pat = params[fixed + 1];
-        const rest_expr = try restSourceFor(ctx, rest_pat, try buildNestedRest(ctx, args_sym, fixed, origin), origin);
+        const rest_expr = try restSourceFor(ctx, rest_pat, try buildNestedRest(ctx, args_sym, fixed, .rest, origin), origin);
         try bindings.append(ctx.allocator, @constCast(rest_pat));
         try bindings.append(ctx.allocator, rest_expr);
     }
@@ -2511,8 +2471,9 @@ fn destructurePair(
 /// Destructure a vector pattern over a source expression that's
 /// already bound to `src` (a symbol form).
 ///
-/// Pattern elements: symbols bind to (nth src i nil); `&` rest
-/// binds to repeated rest; `:as name` binds name to src.
+/// Pattern elements: symbols bind to (nth src i nil); `& r` binds
+/// `r` to `next` applied once per preceding element, so an
+/// exhausted rest is nil; `:as name` binds name to src.
 fn destructureVector(
     ctx: *ExpandContext,
     elems: []const *Form,
@@ -2537,9 +2498,9 @@ fn destructureVector(
         if (e.datum == .symbol and e.datum.symbol.ns == null and std.mem.eql(u8, e.datum.symbol.name, "&")) {
             if (i + 1 >= elems.len) return ExpandError.MalformedMacroCall;
             const rest_pat = elems[i + 1];
-            // Build expression: (rest (rest ... (rest src) ...))
-            // applied `i` times to skip the first `i` elements.
-            const rest_expr = try restSourceFor(ctx, rest_pat, try buildNestedRest(ctx, src, i, origin), origin);
+            // `(next (next ... src))` applied `i` times skips the
+            // first `i` elements.
+            const rest_expr = try restSourceFor(ctx, rest_pat, try buildNestedRest(ctx, src, i, .next, origin), origin);
             try destructurePair(ctx, rest_pat, rest_expr, out, origin);
             i += 1;
             continue;
@@ -2697,7 +2658,7 @@ fn genTempSym(ctx: *ExpandContext, origin: reader_mod.SrcSpan) ExpandError!*Form
 /// Build `(nth src idx nil)` as a Form.
 fn buildNthCall(ctx: *ExpandContext, src: *Form, idx: usize, origin: reader_mod.SrcSpan) ExpandError!*Form {
     const items = try ctx.allocator.alloc(*Form, 4);
-    items[0] = try makeSymbol(ctx, "nth", origin);
+    items[0] = try coreSym(ctx, "nth", origin);
     items[1] = src;
     const idx_form = try ctx.allocator.create(Form);
     idx_form.* = .{ .datum = .{ .int = @intCast(idx) }, .origin = origin };
@@ -2706,13 +2667,19 @@ fn buildNthCall(ctx: *ExpandContext, src: *Form, idx: usize, origin: reader_mod.
     return try makeList(ctx, items, origin);
 }
 
-/// Build `(rest (rest ... (rest src) ...))` applied `n` times.
-fn buildNestedRest(ctx: *ExpandContext, src: *Form, n: usize, origin: reader_mod.SrcSpan) ExpandError!*Form {
+/// How a rest binding drops the elements before it: `next` yields
+/// nil once the source is exhausted (a vector pattern's `& r`,
+/// Clojure's `nthnext`); `rest` yields the empty list (an overload
+/// clause's rest over the list the VM packs, `VM.md` §6).
+const RestOp = enum { rest, next };
+
+/// `(op (op ... (op src) ...))` applied `n` times.
+fn buildNestedRest(ctx: *ExpandContext, src: *Form, n: usize, op: RestOp, origin: reader_mod.SrcSpan) ExpandError!*Form {
     var expr: *Form = src;
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const items = try ctx.allocator.alloc(*Form, 2);
-        items[0] = try makeSymbol(ctx, "rest", origin);
+        items[0] = try coreSym(ctx, @tagName(op), origin);
         items[1] = expr;
         expr = try makeList(ctx, items, origin);
     }
@@ -2724,7 +2691,7 @@ fn buildNestedRest(ctx: *ExpandContext, src: *Form, n: usize, origin: reader_mod
 fn buildGetCall(ctx: *ExpandContext, src: *Form, key: *Form, default: ?*Form, origin: reader_mod.SrcSpan) ExpandError!*Form {
     const argc: usize = if (default != null) 4 else 3;
     const items = try ctx.allocator.alloc(*Form, argc);
-    items[0] = try makeSymbol(ctx, "get", origin);
+    items[0] = try coreSym(ctx, "get", origin);
     items[1] = src;
     items[2] = key;
     if (default) |d| items[3] = d;
@@ -3105,7 +3072,7 @@ fn buildCaseEq(ctx: *ExpandContext, g_name: []const u8, key: *const Form, origin
     quote_items[0] = try makeSymbol(ctx, "quote", origin);
     quote_items[1] = @constCast(key);
     const eq_items = try ctx.allocator.alloc(*Form, 3);
-    eq_items[0] = try makeSymbol(ctx, "=", origin);
+    eq_items[0] = try coreSym(ctx, "=", origin);
     eq_items[1] = try makeSymbol(ctx, g_name, origin);
     eq_items[2] = try makeList(ctx, quote_items, origin);
     return try makeList(ctx, eq_items, origin);
@@ -3273,13 +3240,13 @@ fn buildForLevel(
     const level = levels[idx];
     const s_sym = try genTempSym(ctx, origin);
     const acc_sym = try genTempSym(ctx, origin);
-    const next_s = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "next", origin), s_sym });
+    const next_s = try makeListInline(ctx, origin, &.{ try coreSym(ctx, "next", origin), s_sym });
 
     // What the element contributes: the nested loop or the body.
     const contribution: *Form = if (idx + 1 < levels.len)
         try buildForLevel(ctx, levels, idx + 1, acc_sym, body, origin)
     else
-        try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "conj", origin), acc_sym, @constCast(body) });
+        try makeListInline(ctx, origin, &.{ try coreSym(ctx, "conj", origin), acc_sym, @constCast(body) });
     var inner: *Form = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "recur", origin), next_s, contribution });
 
     var m: usize = level.modifiers.items.len;
@@ -3297,7 +3264,7 @@ fn buildForLevel(
         };
     }
 
-    const first_s = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "first", origin), s_sym });
+    const first_s = try makeListInline(ctx, origin, &.{ try coreSym(ctx, "first", origin), s_sym });
     const elem_bindings = try ctx.allocator.alloc(*Form, 2);
     elem_bindings[0] = level.pattern;
     elem_bindings[1] = first_s;
@@ -3305,7 +3272,7 @@ fn buildForLevel(
 
     const loop_bindings = try ctx.allocator.alloc(*Form, 4);
     loop_bindings[0] = s_sym;
-    loop_bindings[1] = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "seq", origin), level.src });
+    loop_bindings[1] = try makeListInline(ctx, origin, &.{ try coreSym(ctx, "seq", origin), level.src });
     loop_bindings[2] = acc_sym;
     loop_bindings[3] = outer_acc;
     return try makeListInline(ctx, origin, &.{
@@ -3468,7 +3435,7 @@ fn expandDefrecord(
             };
             const sym_form = try makeSymbol(ctx, sym_name, origin);
             acc = try makeListInline(ctx, origin, &.{
-                try makeSymbol(ctx, "assoc", origin),
+                try coreSym(ctx, "assoc", origin),
                 acc,
                 kw,
                 sym_form,
@@ -3519,7 +3486,7 @@ fn expandDefrecord(
             try makeSymbol(ctx, "x", origin),
         }),
         try makeListInline(ctx, origin, &.{
-            try makeSymbol(ctx, "=", origin),
+            try coreSym(ctx, "=", origin),
             try makeSymbol(ctx, type_id_name, origin),
             try makeListInline(ctx, origin, &.{
                 record_type_id_sym,
@@ -3889,6 +3856,15 @@ fn expandExtendProtocol(
     top_items[0] = try makeSymbol(ctx, "do", origin);
     for (calls.items, 0..) |c, i| top_items[1 + i] = c;
     return try makeList(ctx, top_items, origin);
+}
+
+/// The `nexis.core` function `name` as a qualified symbol: what a
+/// host macro emits wherever its output calls a core function, so a
+/// user local or Var of the same name cannot capture the call
+/// (MACROEXPAND.md §5). Heads that are themselves host macros or
+/// special forms stay bare.
+fn coreSym(ctx: *ExpandContext, name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    return try makeQualifiedSymbol(ctx, "nexis.core", name, origin);
 }
 
 /// Helper: make a qualified symbol form (`ns/name`).

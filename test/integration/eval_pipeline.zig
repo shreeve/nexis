@@ -1014,9 +1014,16 @@ test "integration: sequential destructuring (let)" {
 }
 
 test "integration: sequential destructuring with rest" {
+    // MACROEXPAND.md §10 `let`: a vector pattern's rest is `next`,
+    // nil once the source is exhausted; a fn rest parameter is the
+    // list the VM packs, `()` when empty (VM.md §6).
     try expectOutput("(let [[a & rest] [1 2 3 4]] rest)", "(2 3 4)");
     try expectOutput("(let [[a b & rest] [1 2 3 4 5]] rest)", "(3 4 5)");
-    try expectOutput("(let [[a & rest] [1]] rest)", "()");
+    try expectOutput("(let [[a & r] [1 2 3]] r)", "(2 3)");
+    try expectOutput("(nil? (let [[a & r] [1]] r))", "true");
+    try expectOutput("(nil? (let [[a b & r] [1]] r))", "true");
+    try expectOutput("((fn [& r] r))", "()");
+    try expectOutput("((fn ([x & r] r)) 1)", "()");
 }
 
 test "integration: sequential destructuring with :as" {
@@ -1073,6 +1080,19 @@ test "destructuring: loop bindings destructure and recur rebinds them" {
     try expectOutput("(loop [[x & xs] [1 2 3] acc 0] (if x (recur xs (+ acc x)) acc))", "6");
     try expectOutput("(loop [{:keys [n]} {:n 3} out []] (if (pos? n) (recur {:n (dec n)} (conj out n)) out))", "[3 2 1]");
     try expectOutput("(loop [[a b] [1 2]] (+ a b))", "3");
+}
+
+test "hygiene: a local or Var named after a core function cannot capture host-macro output" {
+    // MACROEXPAND.md §5: host macros emit `nexis.core/name`.
+    try expectOutput("(let [nth (fn [& _] :captured)] (let [[a b] [1 2]] [a b]))", "[1 2]");
+    try expectOutput("(let [count (fn [& _] 99)] ((fn ([x] :one) ([x y] :two)) 1))", ":one");
+    try expectOutputProgram("(defn nth [& _] :user-nth) (let [[a b] [1 2]] [a b])", "[1 2]");
+    try expectOutput("(let [= (fn [& _] false)] (case 1 1 :one :none))", ":one");
+    try expectOutput("(let [seq (fn [& _] nil)] (for [x [1 2]] x))", "[1 2]");
+    try expectOutput("(let [get (fn [& _] :g)] (let [{a :a} {:a 1}] a))", "1");
+    try expectOutput("(let [< (fn [& _] false) not (fn [& _] false)] ((fn ([x] :one) ([x & r] :var)) 1 2))", ":var");
+    try expectOutput("(let [first (fn [& _] :f) next (fn [& _] nil) conj (fn [& _] :c)] (for [x [1 2]] x))", "[1 2]");
+    try expectOutput("(let [rest (fn [& _] :r)] (let [[a & r] [1 2 3]] r))", "(2 3)");
 }
 
 test "integration: fn with destructured params" {

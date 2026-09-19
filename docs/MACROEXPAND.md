@@ -445,15 +445,37 @@ written bare inside syntax-quote, `` `(let [x ~a] x) ``, becomes
 `user/x`, which cannot be bound. Write `x#` (fresh per
 expansion) or `~'x` (deliberate capture), as in Clojure.
 
-**Shadowing safety**: syntax-quote output must not be capturable
-by user lexical or Var bindings. If a user writes
-`(let* [list 99] `(~x))`, the emitted list construction must not
-resolve to the user's `list`. Therefore syntax-quote emits the
-internal special forms `#%list` / `#%concat` / `#%vector` /
-`#%map` / `#%set`, which the compiler recognizes in its
-special-form dispatcher and which are never user-shadowable
+**Shadowing safety**: syntax-quote output and host-macro output
+must not be capturable by user lexical or Var bindings. If a user
+writes `(let* [list 99] `(~x))`, the emitted list construction
+must not resolve to the user's `list`. Therefore syntax-quote
+emits the internal special forms `#%list` / `#%concat` /
+`#%vector` / `#%map` / `#%set`, which the compiler recognizes in
+its special-form dispatcher and which are never user-shadowable
 (`COMPILER.md` §4.3); the rebuild calls are qualified
 `nexis.core/...` symbols for the same reason.
+
+A host macro follows the same rule: every core function its
+output calls is emitted as the qualified symbol `nexis.core/name`
+through `coreSym` (§10b), never bare. `let` destructures through
+`nexis.core/nth`, `nexis.core/next` and `nexis.core/get`; `fn`
+overload dispatch counts and tests through `nexis.core/count`,
+`nexis.core/=`, `nexis.core/<` and `nexis.core/not` and takes a
+clause's rest through `nexis.core/rest`; `case` compares with
+`nexis.core/=`; `for` walks with `nexis.core/seq`,
+`nexis.core/first`, `nexis.core/next` and `nexis.core/conj`;
+`defrecord` builds with `nexis.core/assoc` and tests with
+`nexis.core/=`; `case` and `condp` report through
+`nexis.core/str`; `@x` is `nexis.core/deref`. So
+`(let [nth (fn [& _] :captured)] (let [[a b] [1 2]] [a b]))` is
+`[1 2]` and `(defn nth ...)` in the user's namespace changes
+nothing about destructuring. A qualified `nexis.core/+` or
+`nexis.core/<` is still the inlined intrinsic (`COMPILER.md`
+§4.3), so the qualification costs overload dispatch nothing.
+Only heads that are special forms or host macros (`let`, `let*`,
+`fn`, `fn*`, `loop*`, `if`, `and`, `or`, `recur`, `throw`,
+`quote`, `var`, `defn`, `catch`) stay bare, because the compiler
+and the macro table recognize them regardless of bindings (§3).
 
 ---
 
@@ -563,8 +585,8 @@ rewrites it:
 
 | Macro | Expands to |
 |---|---|
-| `let` | `let*` with destructuring: a vector pattern binds by `nth`, `& rest` and `:as`; a map pattern binds `{a :k}`, `:keys` / `:strs` / `:syms` vectors (an entry's own namespace or a `:p/keys` group namespace qualifies the key; a keyword entry in `:keys` is the key), `:or` defaults for an absent key and `:as`; patterns nest; plain symbols pass through. |
-| `fn` | `fn*` with destructured params: a pattern param is replaced by a gensym and the body wrapped in a `(let [pattern gensym ...] ...)` that itself destructures; a map pattern after `&` takes keyword arguments (the rest seq becomes the map `nexis.internal/#%kwargs` builds from alternating keys and values or one trailing map). Overload clauses `(fn name? ([x] ...) ([x y] ...) ([x & r] ...))` lower to one variadic `fn*` that binds the argument count and tests the fixed arities in source order, then the variadic clause, then throws `:arity-mismatch`; at most one variadic clause, no fixed arity below it or repeated (Clojure's rules). Each clause binds its params from the argument list through `loop`, so `recur` in a clause's tail re-enters that clause with the clause's own arity (a variadic clause's rest param receives the one seq passed), a pattern param destructures again on every iteration, a `recur` count that differs from the clause's param count is `RecurArityMismatch`, and a `loop` nested in the clause owns the `recur`s in its own body. A named `fn` may call itself. |
+| `let` | `let*` with destructuring: a vector pattern binds each element by `nth`, `& r` to `next` of the source past the elements before it (so `(let [[a & r] [1]] r)` is nil, as `nthnext` gives in Clojure) and `:as` to the source; a map pattern binds `{a :k}`, `:keys` / `:strs` / `:syms` vectors (an entry's own namespace or a `:p/keys` group namespace qualifies the key; a keyword entry in `:keys` is the key), `:or` defaults for an absent key and `:as`; patterns nest; plain symbols pass through. |
+| `fn` | `fn*` with destructured params: a pattern param is replaced by a gensym and the body wrapped in a `(let [pattern gensym ...] ...)` that itself destructures; a map pattern after `&` takes keyword arguments (the rest seq becomes the map `nexis.internal/#%kwargs` builds from alternating keys and values or one trailing map). Overload clauses `(fn name? ([x] ...) ([x y] ...) ([x & r] ...))` lower to one variadic `fn*` that binds the argument count and tests the fixed arities in source order, then the variadic clause, then throws `:arity-mismatch`; a clause's rest is `rest` of the packed argument list past its fixed params, so an empty rest is `()` for every `fn`, single-clause or overloaded (`VM.md` §6 packs the empty list); at most one variadic clause, no fixed arity below it or repeated (Clojure's rules). Each clause binds its params from the argument list through `loop`, so `recur` in a clause's tail re-enters that clause with the clause's own arity (a variadic clause's rest param receives the one seq passed), a pattern param destructures again on every iteration, a `recur` count that differs from the clause's param count is `RecurArityMismatch`, and a `loop` nested in the clause owns the `recur`s in its own body. A named `fn` may call itself. |
 | `defn` | `(def name (fn name ...))`, so params destructure and overload clauses work as for `fn`. `^meta` on the name (`^:private f` reads as `{:private true}`), a docstring after the name (`:doc`) and an attribute map after that land on the Var: `(defn f "doc" {:k 1} [x] ...)` → `(let* [v# (def f (fn f [x] ...))] (nexis.core/reset-meta! v# {:doc "doc" :k 1 :arglists (quote ([x]))}) v#)`; a definition with none of them leaves the Var's metadata nil. `def` and `defmacro` take `^meta` and a docstring the same way. `(doc f)` prints the `:arglists` and `:doc` of `f`'s Var. |
 | `loop` | `loop*`; each pattern is bound to a gensym and destructured again on every iteration, so `recur` rebinds the gensyms. |
 | `when` | `(if test (do body...) nil)` |
@@ -607,7 +629,10 @@ pub fn makeBool(ctx, value: bool, origin: SrcSpan) ExpandError!*Form;
 ```
 
 Every helper takes `origin` per §4b. Host macros build all of
-their output through them.
+their output through them. `makeQualifiedSymbol(ctx, ns, name,
+origin)` builds `ns/name`, and `coreSym(ctx, name, origin)` is
+`nexis.core/name`: the form of every core function a host macro's
+output calls (§5).
 
 ---
 

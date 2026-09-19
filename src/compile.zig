@@ -1491,6 +1491,13 @@ fn lowerList(
         if (std.mem.eql(u8, name, "<") and items.len == 3 and !isIntrinsicShadowed(ctx.env, name)) {
             return try lowerLt(allocator, items[1], items[2], ctx);
         }
+    } else if (items[0].datum == .symbol and items.len == 3 and std.mem.eql(u8, items[0].datum.symbol.ns.?, "nexis.core")) {
+        // The qualified intrinsics `nexis.core/+` and `nexis.core/<`:
+        // a qualified head is never a lexical local, so these inline
+        // unconditionally. Host macros emit them (MACROEXPAND.md §5).
+        const name = items[0].datum.symbol.name;
+        if (std.mem.eql(u8, name, "+")) return try lowerAdd(allocator, items[1], items[2], ctx);
+        if (std.mem.eql(u8, name, "<")) return try lowerLt(allocator, items[1], items[2], ctx);
     }
     // Ordinary call: lower head as callee, rest as args.
     return try lowerCall(allocator, items, ctx);
@@ -7599,6 +7606,14 @@ test "compile shadowing: (do (def + (fn* [a b] 42)) (+ 1 2)) → 3 — Vars do n
     // does NOT defeat intrinsic inlining (LowerEnv only tracks
     // lexical names, not namespace Vars).
     try expectSourceFixnumWithNs("(do (def + (fn* [a b] 42)) (+ 1 2))", 3);
+}
+
+test "compile shadowing: nexis.core/+ and nexis.core/< inline under a lexical + or <" {
+    // A qualified head is never a local, so the intrinsic fires
+    // with no namespace to resolve it through (COMPILER.md §4.3).
+    try expectSourceFixnum("(let* [+ 9] (nexis.core/+ 1 2))", 3);
+    try expectSourceBool("(let* [< 9] (nexis.core/< 1 2))", true);
+    try expectSourceBool("((fn* [<] (nexis.core/< 2 1)) 9)", false);
 }
 
 test "compile letfn*: a binding takes a rest param" {
