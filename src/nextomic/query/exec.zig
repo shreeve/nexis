@@ -302,7 +302,7 @@ pub const Exec = struct {
             .lt, .le, .gt, .ge => {
                 if (args.len < 2) return error.QuerySyntax;
                 for (args[0 .. args.len - 1], args[1..]) |x, y| {
-                    const o = x.order(y);
+                    const o = x.compare(y) orelse return error.ValueType;
                     const ok = switch (b) {
                         .lt => o == .lt,
                         .le => o != .gt,

@@ -103,6 +103,13 @@ pub const Cell = union(enum) {
         };
     }
 
+    /// The order of two values of one type (numbers are one type), or
+    /// null when they are not comparable.
+    pub fn compare(a: Cell, b: Cell) ?std.math.Order {
+        if (a.rank() != b.rank()) return null;
+        return a.order(b);
+    }
+
     /// A total order: nil < booleans < numbers < strings < keywords <
     /// other VM values. Numbers compare numerically across int and
     /// double; strings by bytes; keywords by intern id; VM values by

@@ -790,7 +790,7 @@ const Naive = struct {
                 .lt, .le, .gt, .ge => {
                     var i: usize = 0;
                     while (i + 1 < cells.len) : (i += 1) {
-                        const o = cells[i].order(cells[i + 1]);
+                        const o = cells[i].compare(cells[i + 1]) orelse return error.ValueType;
                         const ok = switch (b) {
                             .lt => o == .lt,
                             .le => o != .gt,
@@ -1019,6 +1019,17 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/age ?a] [(< ?a 30)] [?e :person/name ?n]]", none, 1);
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/age ?a] [(>= ?a 30)] [(<= ?a 41)] [?e :person/name ?n]]", none, 4);
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(> ?n \"C\")]]", none, 4);
+    // A comparison across value types is an error, never a row.
+    for ([_][]const u8{
+        "[:find ?n :where [?e :person/name ?n] [(> ?n 5)]]",
+        "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(< ?a ?n)]]",
+        "[:find ?n :where [?e :person/name ?n] [?e :person/active ?x] [(<= ?x 1)]]",
+        "[:find ?n :where [?e :person/name ?n] [?e :person/role ?r] [(>= ?r :role/admin)] [(< ?r \"z\")]]",
+    }) |src| {
+        try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, src, none));
+        try testing.expectError(error.ValueType, Naive.run(fx, fx.arena(), dbv, src, none));
+    }
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/height ?h] [(< ?h 2)]]", none, 3);
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/height ?h] [(< 1.66 ?h)] [?e :person/name ?n]]", none, 2);
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(= ?n \"Cy\")]]", none, 1);
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(not= ?n \"Cy\")]]", none, 5);
