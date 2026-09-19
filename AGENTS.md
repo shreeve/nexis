@@ -1,266 +1,149 @@
 # AGENTS.md — routing guide for contributors and AI sessions
 
-Short version: read `PLAN.md` end-to-end before you do anything else,
-then `HANDOFF.md` for the ranked next-work list.
+Read `HANDOFF.md` first: what nexis and Nextomic are, how to verify the
+tree, the architecture map, the contracts, what is proven, the known
+gaps and the order of work. This file is the short index: what to read
+in what order, the build steps, the authority order, the owner's rules
+and the layout.
 
 ---
 
 ## What this project is
 
-**nexis** is a Zig-native Lisp with Clojure semantics, a first-class
-durable identity model backed by `emdb`, and **Nextomic**, a
-Datomic-class database (datoms in emdb named trees, logical
-transaction numbers in the history keys, Datalog `q`, `pull`,
-speculative `with`) in the same binary. See `PLAN.md` §0–§1 for the
-pitch and `docs/NEXTOMIC.md` for the database.
-
-Status: the language runs real programs end to end (`bin/nexis run`,
-`bin/nexis repl`): reader, macroexpander, compiler, bytecode VM, host
-and user macros, multi-namespace with `require`, destructuring and
-multi-arity `defn`, doubles with Clojure contagion, keyword/map/set/
-vector as functions, atoms, strings and I/O, records and protocols,
-`case`/`condp`/`for`, durable refs with explicit transactions and
-snapshots, and the `nextomic` namespace with `with-conn`. `zig build
-test` runs 1282 tests across 135 steps. What does not exist is
-listed under "Known gaps" in `README.md` and ranked in `HANDOFF.md`:
-the collector is implemented but never invoked at runtime, bignum
-arithmetic and `binding` are absent, and PLAN §21 Phase 5 as defined
-(test runner, `nexis.test`/`math`/`pprint`, `--disasm`, source-mapped
-stack traces) is open.
+**nexis** is a Zig 0.16 Lisp with Clojure semantics on its own runtime
+(reader, macroexpander, compiler, bytecode VM, persistent collections,
+16-byte tagged value), durable refs backed by the emdb storage engine
+(`db/*`), and **Nextomic**, a Datomic-class database in the same
+binary: datoms in eleven emdb named trees, logical transaction numbers
+in the history keys, Datalog `q`, `pull`, `as-of`/`since`/`history`,
+speculative `with`. `bin/nexis run FILE.nx` and `bin/nexis repl` run
+real programs. Zero changes to emdb.
 
 ---
 
-## Required reading (in order)
+## Required reading, in order
 
-1. **`PLAN.md`** — the authoritative design. Budget 60–90 minutes. Especially:
-   - §5 (three representations — non-negotiable boundary)
-   - §21 (roadmap — which phase rows shipped, which are open)
-   - §23 (hard decisions — frozen commitments; changing one requires an amendment)
-   - the Amendment Log at the end of the file (every §23 change since v1.1, dated)
-   - §24 (open questions — deliberately undecided)
-   - §28 / Appendix C (canonical Form schema)
-2. **`HANDOFF.md`** — what exists, how to verify it, the ranked next-work list.
-3. **`CLOJURE-REVIEW.md`** — what we take, adapt, and reject from Clojure.
-4. **`docs/NEXTOMIC.md`** — the v1 Datomic-class database on nexis +
-   emdb: store layout, transactions, db-values and time, query
-   pipeline, Lisp API, errors, module layout. Binding for anything
-   under `src/nextomic/`.
-5. **`docs/FORMS.md`** — Appendix C lifted into a standalone contract plus
-   the pretty-printer spec and stage-ownership table.
-6. **`docs/SEMANTICS.md`** — equality/hash/numeric spec (frozen; §2 carries
-   the number-tower contagion rules).
-7. **`docs/COMPILER.md`** and **`docs/VM.md`** — the compiler and runtime
-   contracts, each with its own amendment log.
-8. **`docs/DB.md`** — the `db/*` key-value layer and the emdb seam
-   (page size pin, tree-id cache, `:db/*` error names).
-9. **`ZIG-0.16.0.md`** — mandatory before writing any Zig. 30+ stdlib
-   APIs changed between 0.15 and 0.16 in ways that silently break
-   training-data code.
-
-`docs/README.md` maps every module to its spec.
-
----
-
-## Authority order
-
-When these sources disagree:
-
-1. `PLAN.md` §23 frozen decisions — highest authority.
-2. `PLAN.md` Appendix C (§28) canonical schema.
-3. `docs/FORMS.md`, `docs/SEMANTICS.md`, `docs/CODEC.md` — derivative; must
-   track PLAN.md. If a conflict arises, fix the doc in the same commit.
-4. Code comments — lowest. If code says one thing and PLAN.md says another,
-   PLAN.md wins and the code is wrong.
-
-Do **not** silently extend syntax, Form variants, serializable kinds, or
-value kinds. Each of these is a frozen commitment. Amend `PLAN.md` first.
+1. `HANDOFF.md` — the whole file; §2 to verify the tree before editing.
+2. `PLAN.md` — §5 (three representations), §21 (roadmap), §23 (frozen
+   decisions), the Amendment Log at the end, §24 (open questions),
+   §28 / Appendix C (canonical Form schema). Budget an hour.
+3. `docs/NEXTOMIC.md` — authoritative for `src/nextomic/` and the
+   `nextomic` namespace. `../emdb/NEXTOMIC.md` §1 is the reader's
+   introduction to Datomic; where the rest of that note describes
+   Nextomic, `docs/NEXTOMIC.md` wins.
+4. `CLOJURE-REVIEW.md` — what nexis takes, adapts and rejects from
+   Clojure's source.
+5. `docs/FORMS.md`, `docs/SEMANTICS.md`, `docs/COMPILER.md`,
+   `docs/VM.md`, `docs/DB.md` — the per-layer contracts; `docs/README.md`
+   maps every module to its spec.
+6. `ZIG-0.16.0.md` — mandatory before writing Zig.
 
 ---
 
 ## Build steps
 
-- `zig build install` — `bin/nexis` (CLI: `run`, `repl`) and `bin/nexis-golden`.
-- `zig build quick` — the inner loop, seconds: atom, record,
-  protocol, vm, format, compile, expand, stdlib and loader module
-  tests, the compile property tests, the eval-pipeline integration
-  tests, and the Nextomic unit, key and transaction property tests.
-  `zig build phase2-test` names the same step.
-- `zig build nextomic-test` — only Nextomic: `src/nextomic/` unit tests,
-  `test/prop/nextomic_key.zig`, `test/prop/nextomic_tx.zig`, and the
-  query and pull corpora in `test/integration/nextomic_{q,pull}.zig`
-  (each corpus ends with a benchmark whose row-count checks always
-  run; its `[bench]` timing lines print to stderr only when the
-  `NEXTOMIC_BENCH` environment variable is set).
-- `zig build nextomic-nx` — runs `test/nextomic/*.nx` through `bin/nexis`
-  in a scratch directory that also holds the shared `prelude.nx`, and
-  diffs stdout against the `.out` files. `persist-1` and `persist-2`
-  share one store across two processes.
-- `zig build examples` — runs every `examples/*.nx` through `bin/nexis`
-  from a generated working directory; the three store-backed examples
-  run twice.
-- `zig build test --summary all` — everything above plus the reader
-  goldens and the randomized collection gates (~100k CHAMP ops; peaks
-  near 1 GB, minutes). Run before commits, not in the inner loop.
-- `zig build golden` — reader golden diff alone;
-  `zig build golden -Dupdate=true` rewrites expected files in place (use
-  only when intentionally changing the schema; commit the diffs together).
-- `zig build parser` — regenerates `src/parser.zig` from `nexis.grammar`
-  by invoking `../nexus/bin/nexus` (the nexus binary must exist).
-- `zig build bench` — the ReleaseFast benchmark harness (`docs/BENCH.md`);
-  `-- --out bench/baseline.json` writes the machine-readable run.
+- `zig build install` — `bin/nexis` (`run`, `repl`, `--help`) and
+  `bin/nexis-golden`.
+- `zig build quick` — the inner loop (seconds to a minute): the language
+  binaries, the compile property tests, the eval-pipeline integration
+  tests, the Nextomic unit and property binaries.
+- `zig build nextomic-test` — Nextomic unit, property and corpus tests;
+  `NEXTOMIC_BENCH=1` turns on the corpora's `[bench]` timing lines.
+- `zig build nextomic-nx` — `test/nextomic/*.nx` through `bin/nexis`,
+  diffed against the `.out` files.
+- `zig build examples` — every `examples/*.nx` through `bin/nexis`; the
+  store-backed ones twice.
+- `zig build test --summary all` — everything (minutes). Before every
+  commit. `HANDOFF.md` §2 carries the test count of record.
+- `zig build golden` (`-Dupdate=true` rewrites), `zig build parser`
+  (regenerates the committed `src/parser.zig` from `nexis.grammar`),
+  `zig build bench` (ReleaseFast harness, `docs/BENCH.md`).
 
-Every switch is a build option or a CLI argument; the one environment
-variable, `NEXTOMIC_BENCH`, only turns on the corpus benchmarks'
-timing output. The generated `src/parser.zig` **is** committed — it is
-the authoritative artifact for consumers. Regenerate it whenever you
-edit `nexis.grammar`.
+`-Doptimize=ReleaseFast` applies to any step. `NEXTOMIC_BENCH` is the
+only environment variable.
 
 ---
 
-## Repository layout
+## Authority order
+
+When sources disagree:
+
+1. `PLAN.md` §23 frozen decisions; a change is a dated Amendment Log entry.
+2. `PLAN.md` Appendix C (§28), the canonical Form schema.
+3. `docs/*.md` — derivative; `docs/NEXTOMIC.md` is authoritative for the
+   database. Fix a doc that conflicts with PLAN in the same commit.
+4. Code comments — lowest. Code that disagrees with its spec is wrong.
+
+Do not silently extend syntax, Form variants, serializable kinds or
+value kinds; each is a frozen commitment. Amend first.
+---
+
+## The owner's rules
+
+- **Zero changes to emdb.** Anything the engine seems to lack is solved
+  on the nexis side (`docs/NEXTOMIC.md` §11 lists the two wishes and
+  their workarounds; `../emdb/NEXTOMIC.md` §6 the temptations to refuse).
+- **Timeless code and comments.** Describe what is; no era framing, no
+  "now"/"previously"/"used to", no phase or turn numbers. Delete the old
+  thing, do not narrate the transition. Dates live in amendment logs and
+  commit messages only.
+- **No AI attribution lines** in commits, pull requests or comments.
+- **Every behaviour change starts with a failing test**; a Nextomic
+  change also updates its `.out` and its `docs/NEXTOMIC.md` row.
+- **The full gate before every commit.**
+- **Spec first**: the governing section is written or amended in the
+  same commit as the code.
+- Commits: short imperative subject with an area prefix, a body citing
+  the governing section, no attribution trailers; never `--amend` or
+  force-push anything published. Work in a worktree per task; merge as a
+  true merge and delete the branch.
+
+---
+
+## Layout
 
 ```
 nexis/
-├── PLAN.md                      authoritative design + amendment log
-├── HANDOFF.md                   state + ranked next work
-├── AGENTS.md                    this file
-├── CLOJURE-REVIEW.md
-├── ZIG-0.16.0.md
-├── README.md
-├── build.zig, build.zig.zon     emdb is a path dependency
-├── nexis.grammar                reader grammar (source of truth)
+├── HANDOFF.md, AGENTS.md, README.md, PLAN.md, CLOJURE-REVIEW.md, ZIG-0.16.0.md
+├── build.zig, build.zig.zon     emdb is a path dependency (../emdb)
+├── nexis.grammar                reader grammar (source of truth for src/parser.zig)
 ├── src/
-│   ├── nexis.zig                @lang module: Tag enum + Lexer wrapper
 │   ├── parser.zig               GENERATED — do not edit by hand
-│   ├── reader.zig               Sexp → Form normalizer + pretty-printer
-│   ├── expand.zig               macroexpander, syntax-quote, user macros
-│   ├── compile.zig              Form → Tiny IR → bytecode
-│   ├── vm.zig                   bytecode VM, frames, handlers, callValue
+│   ├── reader.zig, expand.zig, compile.zig, vm.zig
 │   ├── value.zig, heap.zig, gc.zig, pool.zig, intern.zig, hash.zig, eq.zig
 │   ├── coll/                    champ, vector, list, transient
-│   ├── string.zig, bignum.zig, codec.zig, format.zig
-│   ├── atom.zig, record.zig, protocol.zig, dispatch.zig
+│   ├── string.zig, bignum.zig, codec.zig, format.zig, atom.zig, record.zig, protocol.zig, dispatch.zig
 │   ├── db.zig                   emdb connection, durable refs, txn handles
-│   ├── stdlib.zig               native fn tables; embeds src/stdlib/*.nx
-│   ├── stdlib/core.nx           macros + fns written in nexis
-│   ├── stdlib/nextomic.nx       with-conn
+│   ├── stdlib.zig, stdlib/*.nx  native tables; core.nx and nextomic.nx embedded at build
 │   ├── loader.zig, cli.zig, bench.zig, golden.zig
-│   └── nextomic/
-│       ├── root.zig             module root
-│       ├── key.zig, datom.zig, store.zig, idents.zig, schema.zig
-│       ├── transact.zig, db.zig, relation.zig, pull.zig
-│       ├── query/{ir,parse,plan,exec,rules,natives}.zig
-│       ├── natives.zig          nextomic/* NativeFn table, error mapping
-│       └── handle.zig           heap bodies of nextomic_conn / nextomic_db
+│   └── nextomic/                key datom store idents schema transact db handle
+│                                marshal relation pull natives query.zig query/{ir,parse,plan,exec,rules,natives}
 ├── docs/                        one spec per module; NEXTOMIC.md for the database
-├── test/
-│   ├── prop/                    property tests (incl. nextomic_key, nextomic_tx)
-│   ├── integration/             eval_pipeline, nextomic_q, nextomic_pull corpora
-│   ├── golden/                  reader goldens
-│   └── nextomic/                *.nx end-to-end scripts + *.out, prelude.nx
+├── test/prop/ integration/ golden/ nextomic/
 ├── examples/                    working .nx programs (examples/README.md)
-├── bench/main.zig               benchmark driver
 └── bin/                         build output
 ```
 
----
+Stage boundaries are strict (PLAN §5, `docs/FORMS.md` §4): reader →
+Form → expander → compiler → bytecode → VM; no stage peeks past the
+next. Nextomic sits above `dispatch` and `vm`, is imported by `stdlib`
+only, holds raw `*emdb.Txn` handles and byte keys, and shares only the
+engine and the `:db/*` error names with the `db/*` layer.
 
-## Stage boundaries (strict — `PLAN.md` §11.2, FORMS.md §4)
+## Traps
 
-```
-source.nx
-   │
-   ▼   nexus-generated src/parser.zig
-raw Sexp tree
-   │
-   ▼   src/reader.zig     (normalize, merge meta, lower #(), drop #_)
-canonical Form tree
-   │
-   ▼   src/expand.zig     (syntax-quote, host + user macros, namespaces)
-expanded Form
-   │
-   ▼   src/compile.zig    (lower to Tiny IR, then emit bytecode)
-bytecode
-   │
-   ▼   src/vm.zig
-```
+- Zig 0.16: `std.heap.DebugAllocator(.{})`, `std.Io.Dir.cwd()` with
+  `io: std.Io` threaded through, `std.ArrayList(T)` is `.empty`.
+- A source file cannot be both a test binary's root and a named import
+  of the same graph: `dispatch` is a one-way terminal and
+  `nextomic_handle` its own module for this reason.
+- nexus: the number token must be named `integer`; identifier dispatch
+  fires only for a token named `ident`; multi-char literals need `@op`.
+- emdb's page size is fixed for a file's life; `db.zig` and
+  `nextomic/store.zig` pin 16 KiB. Never open a store another way.
+- Native functions must not hold VM-heap pointers across a call back
+  into the VM unless they root them (latent while the collector is
+  unwired; the GC work depends on it). `zig fmt --check` the files you
+  touch (`HANDOFF.md` §6.9 names the five that fail).
 
-Violating a stage boundary is how language projects turn into tar pits
-(`PLAN.md` §5). If you find yourself wanting to peek past the current stage
-because it's convenient, stop.
-
-Nextomic sits above `dispatch` and `vm` and is imported by `stdlib` only.
-It holds raw `*emdb.Txn` handles and byte keys and never goes through the
-`db/*` codec path; the two layers share the engine and the `:db/*` error
-keywords and nothing else (`docs/DB.md` §11.1).
-
----
-
-## Common traps (save yourself time)
-
-- `std.heap.GeneralPurposeAllocator` is **gone** in 0.16.0. Use
-  `std.heap.DebugAllocator(.{})` or the `init.gpa` from `pub fn main(init:
-  std.process.Init)`. See `ZIG-0.16.0.md`.
-- `std.fs.cwd()` → `std.Io.Dir.cwd()`; most FS ops take `io: std.Io`.
-- `std.io.Writer.fixed` → `std.Io.Writer.fixed`. `std.io.fixedBufferStream`
-  is gone.
-- **Nexus-specific:** the token name `integer` is hardcoded inside the
-  generated scanner. Name your number token `integer`, not `int`. Likewise,
-  nexus only emits the `isLetter → scanIdent` dispatch when your token is
-  named `ident`; use `IDENT` in parser rules and wrap it into whatever
-  semantic tag you want via the action template.
-- **Multi-char literals** in grammar rules (e.g. `"~@"`, `"#{"`) are **not**
-  auto-mapped to their tokens. Add an `@op` directive.
-- **Build-graph self-collision**: a source file cannot be both a test
-  binary's root and a named import of the same graph; `dispatch` is a
-  one-way terminal for this reason, and `nextomic_handle` is its own
-  module below `dispatch`/`format`/`gc` for the same reason.
-- **emdb page size is fixed for a file's life.** `db.zig` and
-  `nextomic/store.zig` open every store with `pageSize = 16384`; the
-  Linux engine default is 4 KiB, so never open a nexis store through a
-  path that omits the option.
-- **Native functions must not hold VM-heap pointers across a call back
-  into the VM** unless they root them; the collector is not wired, so
-  this is latent rather than fatal, but it is the rule the GC wiring
-  in `HANDOFF.md` depends on.
-
----
-
-## Session workflow for contributors / AI sessions
-
-1. `zig build test --summary all` before your first edit. If the tree
-   doesn't build clean, stop and fix the environment first.
-2. Make the smallest change that actually addresses the task.
-3. If you touch `nexis.grammar`, `src/nexis.zig`, or `src/reader.zig`:
-   regenerate the parser and re-run goldens. If a golden changed
-   semantically, update it with `-Dupdate=true` and inspect the diff in
-   your commit.
-4. If you touch `src/nextomic/`: run `zig build nextomic-test`,
-   `zig build nextomic-nx` and `zig build examples`; a behavior change
-   updates the matching `test/nextomic/*.out` and the row in
-   `docs/NEXTOMIC.md` §6 or §7 in the same commit. An error a native
-   throws is a map with `:error` (§7); keep new ones on that contract.
-5. If you touch documentation, cite the PLAN.md section that grounds your
-   change. A §23 decision changes only through a dated Amendment Log entry.
-6. Write Zig tests inline in the module you edited. Don't add a new test
-   file unless scoping truly demands it.
-7. Wording is timeless: describe what is, not what was or when it changed.
-   Dates belong in amendment logs and commit messages only.
-
----
-
-## Non-negotiable discipline (from `PLAN.md` §"Start here")
-
-1. **Do not break the three-representations boundary** (§5). Form, Value,
-   Durable Encoded are distinct. They only fuse through explicit codec ops.
-2. **Respect SCVU operand-kind encoding** (§12.2).
-3. **Do not widen the v1 non-goals list** (§4) without an amendment.
-4. **Do not expose benchmarks publicly** until they satisfy `docs/BENCH.md`
-   (numerical, accurate, fair, relevant). The plan intentionally
-   under-promises and over-delivers.
-5. **Zero changes to emdb.** Nextomic is built on the engine as it is;
-   anything the engine seems to lack is solved on the nexis side
-   (`docs/NEXTOMIC.md` §11).
-
-If any of this conflicts with what you believe the user wants, **ask**.
-Do not silently deviate from frozen decisions.
+If any of this conflicts with what you believe the user wants, ask.
