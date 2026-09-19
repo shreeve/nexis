@@ -953,6 +953,21 @@ pub fn build(b: *std.Build) void {
     const integration_eval_tests = b.addTest(.{ .root_module = integration_eval_mod });
     const run_integration_eval_tests = b.addRunArtifact(integration_eval_tests);
 
+    // Runtime completeness tests: numeric tower, callable
+    // collections, core functions, throw policy.
+    const runtime_polish_mod = b.createModule(.{
+        .root_source_file = b.path("test/integration/runtime_polish.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    for ([_]struct { []const u8, *std.Build.Module }{
+        .{ "value", value_mod },   .{ "vm", vm_mod },         .{ "compile", compile_mod },
+        .{ "intern", intern_mod }, .{ "reader", reader_mod }, .{ "expand", expand_mod },
+        .{ "stdlib", stdlib_mod }, .{ "format", format_mod },
+    }) |imp| runtime_polish_mod.addImport(imp[0], imp[1]);
+    const runtime_polish_tests = b.addTest(.{ .root_module = runtime_polish_mod });
+    const run_runtime_polish_tests = b.addRunArtifact(runtime_polish_tests);
+
     // -------------------------------------------------------------------------
     // Benchmark harness (src/bench.zig) + benchmark runner (bench/main.zig).
     //
@@ -1260,6 +1275,7 @@ pub fn build(b: *std.Build) void {
     quick_step.dependOn(&run_prop_compile_tests.step);
     // Eval-pipeline integration tests.
     quick_step.dependOn(&run_integration_eval_tests.step);
+    quick_step.dependOn(&run_runtime_polish_tests.step);
     // Nextomic unit binaries and the key and transaction property tests.
     quick_step.dependOn(&run_nextomic_handle_tests.step);
     quick_step.dependOn(&run_nextomic_tests.step);
@@ -1287,6 +1303,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_integration_nextomic_pull_tests.step);
     test_step.dependOn(&run_prop_compile_tests.step);
     test_step.dependOn(&run_integration_eval_tests.step);
+    test_step.dependOn(&run_runtime_polish_tests.step);
     test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);

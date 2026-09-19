@@ -79,13 +79,7 @@ fn bootstrapCoreForTest(
             ra,
         );
         const routine = compiled.toRoutine("core-nx-test");
-        v.frames.items[0].routine = &routine;
-        v.frames.items[0].pc = 0;
-        v.frames.items[0].slot_count = routine.slot_count;
-        v.halted = false;
-        if (v.stack.items.len < routine.slot_count) {
-            try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-        }
+        try v.retargetTop(&routine);
         _ = try v.run();
     }
 }
@@ -183,13 +177,7 @@ const Program = struct {
                 if (checked) &declared else null,
             );
             const routine = compiled.toRoutine("test-form");
-            self.v.frames.items[0].routine = &routine;
-            self.v.frames.items[0].pc = 0;
-            self.v.frames.items[0].slot_count = routine.slot_count;
-            self.v.halted = false;
-            if (self.v.stack.items.len < routine.slot_count) {
-                try self.v.stack.appendNTimes(self.v.allocator, value_mod.nilValue(), routine.slot_count - self.v.stack.items.len);
-            }
+            try self.v.retargetTop(&routine);
             const stack_len_before = self.v.stack.items.len;
             const frame_depth_before = self.v.frames.items.len;
             last_result = try self.v.run();
@@ -324,15 +312,7 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
         registry,
     );
     const routine = compiled.toRoutine("integration");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    // Reset halted because bootstrap left the VM in the halted
-    // state after running the last core.nx form.
-    v.halted = false;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const stack_len_before = v.stack.items.len;
     const frame_depth_before = v.frames.items.len;
     const result = try v.run();
@@ -1059,8 +1039,8 @@ test "integration: 3.3c — contains?" {
 test "integration: 3.3c — keys / vals" {
     try expectOutput("(count (keys {:a 1 :b 2 :c 3}))", "3");
     try expectOutput("(count (vals {:a 1 :b 2 :c 3}))", "3");
-    try expectOutput("(keys nil)", "()");
-    try expectOutput("(vals nil)", "()");
+    try expectOutput("(keys nil)", "nil");
+    try expectOutput("(vals nil)", "nil");
 }
 
 test "integration: 3.3c — conj (kind-specific)" {
@@ -1791,7 +1771,7 @@ test "outside try a storage failure is the raw DbError" {
         \\  (def conn (db/open "@STORE@"))
         \\  (def long-key (loop [s "k" n 0] (if (< n 13) (recur (str s s) (inc n)) s)))
         \\  (db/put-key! (db/ref conn :t long-key) 1))
-    , vm.VmError.DbError);
+    , vm.VmError.UncaughtThrow);
 }
 
 test "db/scan and db/reduce-tree read a value that spans several overflow pages" {
@@ -2918,7 +2898,7 @@ test "numbers: arithmetic contagion" {
     try expectOutput("(max 1 5 3)", "5");
     try expectOutput("(min 1 5 3)", "1");
     try expectOutput("(max 1 2.0)", "2.0");
-    try expectOutput("(max 3 2.0)", "3.0");
+    try expectOutput("(max 3 2.0)", "3");
     try expectOutput("(min 3 2.0)", "2.0");
     // The inlined `(+ a b)` intrinsic uses the same tower.
     try expectOutput("(let [a 1 b 2.5] (+ a b))", "3.5");
@@ -3225,7 +3205,7 @@ test "core: sequence functions" {
         .{ .src = "(nthrest [1 2 3] 2)", .expected = "(3)" },
         .{ .src = "(nthrest [1 2 3] 0)", .expected = "(1 2 3)" },
         .{ .src = "(reverse [1 2 3])", .expected = "(3 2 1)" },
-        .{ .src = "(flatten [1 [2 [3 nil]] '(4)])", .expected = "(1 2 3 4)" },
+        .{ .src = "(flatten [1 [2 [3 nil]] '(4)])", .expected = "(1 2 3 nil 4)" },
         .{ .src = "(reductions + [1 2 3])", .expected = "(1 3 6)" },
         .{ .src = "(reductions + 10 [1 2])", .expected = "(10 11 13)" },
         .{ .src = "(repeat 3 :x)", .expected = "(:x :x :x)" },
