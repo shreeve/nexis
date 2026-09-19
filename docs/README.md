@@ -29,7 +29,8 @@ wins and the code is wrong.
 | `src/reader.zig` | [`FORMS.md`](FORMS.md) | Sexp → Form normalizer + pretty-printer + canonical Form schema |
 | `src/vm.zig` | [`VM.md`](VM.md) | Bytecode VM: ISA + execution contracts, frames, handlers, natives, namespaces |
 | `src/compile.zig` | [`COMPILER.md`](COMPILER.md) | Compiler: Form → Tiny → bytecode, per-special-form lowering, capture analysis |
-| `src/cli.zig` | (no dedicated spec) | CLI runner — `nexis run FILE.nx` / `nexis repl`; wires the pipeline into `bin/nexis` |
+| `src/cli.zig` | [`TOOLING.md`](TOOLING.md) §1 | CLI runner — `nexis run FILE.nx` / `nexis repl` / `nexis disasm FILE.nx`; wires the pipeline into `bin/nexis`; runtime error output |
+| `src/disasm.zig` | [`TOOLING.md`](TOOLING.md) §2 | Bytecode disassembler behind `nexis disasm` |
 | `src/expand.zig` | [`MACROEXPAND.md`](MACROEXPAND.md) | Form → Form rewriter (macros, syntax-quote, anon-fn, `#%list`/`#%concat`/`#%vector` dispatch); host-Zig macros and user `defmacro` |
 | `src/atom.zig` | [`ATOM.md`](ATOM.md) | In-memory mutable cells: `atom` / `swap!` / `reset!` / `compare-and-set!` |
 | `src/protocol.zig`, `src/record.zig` | [`PROTOCOLS.md`](PROTOCOLS.md) | Records + protocols: per-VM registries, `defrecord` / `defprotocol` / `extend-*` dispatch |

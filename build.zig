@@ -699,6 +699,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string", "bignum" } },
         .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol", "nextomic" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
+        .{ .name = "disasm", .path = "src/disasm.zig", .imports = &.{ "vm", "value", "format", "intern" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
@@ -1089,6 +1090,19 @@ pub fn build(b: *std.Build) void {
     // cli delegates value-printing
     // to the central format.zig (display mode).
     cli_mod.addImport("format", format_mod);
+    // `nexis disasm` prints routines through src/disasm.zig, which
+    // reads Routine and the opcode decoders and is imported by the
+    // CLI only.
+    const disasm_mod = b.createModule(.{
+        .root_source_file = b.path("src/disasm.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    disasm_mod.addImport("vm", vm_mod);
+    disasm_mod.addImport("value", value_mod);
+    disasm_mod.addImport("format", format_mod);
+    disasm_mod.addImport("intern", intern_mod);
+    cli_mod.addImport("disasm", disasm_mod);
 
     const nexis_exe = b.addExecutable(.{
         .name = "nexis",
@@ -1267,7 +1281,7 @@ pub fn build(b: *std.Build) void {
             ) catch @panic("test/golden/cli: missing expected-output file");
             const run = b.addRunArtifact(nexis_exe);
             run.addArg(case.verb);
-            run.addArg(b.fmt("test/golden/cli/{s}.nx", .{case.name}));
+            run.addArg(case.file);
             run.expectExitCode(case.exit_code);
             switch (case.stream) {
                 .stdout => run.expectStdOutEqual(expected),
@@ -1326,6 +1340,7 @@ pub fn build(b: *std.Build) void {
     quick_step.dependOn(&runtime_test_runs[22].step);
     quick_step.dependOn(&runtime_test_runs[23].step);
     quick_step.dependOn(&runtime_test_runs[24].step);
+    quick_step.dependOn(&runtime_test_runs[25].step);
     // Closure-capture and emitter property tests (COMPILER.md §9.4).
     quick_step.dependOn(&run_prop_compile_tests.step);
     // Eval-pipeline integration tests.

@@ -1,6 +1,7 @@
-//! nexis CLI: `nexis run FILE.nx` and `nexis repl`.
+//! nexis CLI: `nexis run FILE.nx`, `nexis repl` and `nexis disasm
+//! FILE.nx`.
 //!
-//! Both commands boot one `Runtime` (a VM with every namespace
+//! The first two boot one `Runtime` (a VM with every namespace
 //! installed, the embedded core.nx and nextomic.nx bootstrapped,
 //! and a namespace loader for `require`), then compile and run
 //! top-level forms on it one at a time. Vars, the interner and
@@ -18,6 +19,7 @@ const expand_mod = @import("expand");
 const stdlib = @import("stdlib");
 const loader_mod = @import("loader");
 const format_mod = @import("format");
+const disasm_mod = @import("disasm");
 
 const Value = value_mod.Value;
 
@@ -84,6 +86,12 @@ pub fn main(init: std.process.Init) !void {
         try runFile(io, allocator, args[2]);
     } else if (std.mem.eql(u8, cmd, "repl")) {
         try runRepl(io, allocator);
+    } else if (std.mem.eql(u8, cmd, "disasm") or std.mem.eql(u8, cmd, "--disasm")) {
+        if (args.len < 3) {
+            try printUsage(io);
+            std.process.exit(1);
+        }
+        try disasmFile(io, allocator, args[2]);
     } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         try printUsage(io);
     } else {
@@ -570,4 +578,64 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     };
     try std.Io.File.stdout().writeStreamingAll(io, stream.buffered());
     try std.Io.File.stdout().writeStreamingAll(io, "\n");
+}
+
+/// Read FILE.nx, parse and compile each top-level form the way
+/// `run` does, and print every routine's disassembly to stdout
+/// instead of running it. Macro expansion, `(ns ...)` and
+/// `(require ...)` still take effect at compile time; a `def` does
+/// not run, so a macro that calls a function the same file defines
+/// cannot expand here.
+fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
+    const stderr = std.Io.File.stderr();
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| {
+        try stderr.writeStreamingAll(io, "nexis: failed to read '");
+        try stderr.writeStreamingAll(io, path);
+        try stderr.writeStreamingAll(io, "': ");
+        try stderr.writeStreamingAll(io, @errorName(err));
+        try stderr.writeStreamingAll(io, "\n");
+        std.process.exit(2);
+    };
+    defer allocator.free(source);
+
+    var parser = reader_mod.parser.Parser.init(allocator, source);
+    defer parser.deinit();
+    const sexp = parser.parseProgram() catch {
+        try emitParseError(io, path, source, &parser);
+        std.process.exit(3);
+    };
+    var reader = reader_mod.Reader.init(allocator, source);
+    defer reader.deinit();
+    const forms = reader.readProgram(sexp) catch |err| {
+        try emitReaderError(io, path, source, &reader, err);
+        std.process.exit(3);
+    };
+    if (forms.len == 0) return;
+
+    const file_dir = std.fs.path.dirname(path) orelse ".";
+    const load_paths = [_][]const u8{ ".", file_dir };
+    var rt: Runtime = undefined;
+    try bootRuntime(&rt, io, allocator, &load_paths);
+    defer rt.deinit();
+
+    var compile_arena = std.heap.ArenaAllocator.init(allocator);
+    defer compile_arena.deinit();
+    var declared = compile.DeclaredNames.init(allocator);
+    defer declared.deinit();
+    for (forms) |form| try declared.declareForm(form);
+
+    const file_source = vm.SourceInfo{ .path = path, .text = source };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    for (forms, 0..) |form, i| {
+        var error_span: ?reader_mod.SrcSpan = null;
+        const compiled = compile.compileFormWith(compile_arena.allocator(), form, rt.compileOptions(&error_span, &declared, &file_source)) catch |err| {
+            try emitCompileError(io, path, source, err, error_span);
+            std.process.exit(4);
+        };
+        const routine = compiled.toRoutine("<top>");
+        if (i > 0) try out.writer.writeAll("\n");
+        try disasm_mod.disassemble(&routine, rt.interner, &out.writer);
+    }
+    try std.Io.File.stdout().writeStreamingAll(io, out.written());
 }
