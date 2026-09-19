@@ -253,6 +253,34 @@ test "G3: collect twice with same roots — second call frees 0 blocks" {
 }
 
 // -----------------------------------------------------------------------------
+// G3b. A long list is walked without recursion (GC.md §5)
+// -----------------------------------------------------------------------------
+
+test "G3b: a list of half a million cells survives a cycle intact and is freed by the next" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+
+    // Half a million cons cells: a recursive walk of the tail chain
+    // would exhaust the thread stack long before the end.
+    const n: usize = 500_000;
+    var xs = try list_mod.empty(&heap);
+    var i: usize = 0;
+    while (i < n) : (i += 1) xs = try list_mod.cons(&heap, value.fromFixnum(@intCast(i)).?, xs);
+    _ = try string.fromBytes(&heap, "orphan");
+
+    var collector = Collector.init(&heap);
+    const roots = [_]*HeapHeader{Heap.asHeapHeader(xs)};
+    const freed = collector.collect(&roots);
+    try std.testing.expectEqual(@as(usize, 1), freed);
+    try std.testing.expectEqual(n, list_mod.count(xs));
+    try std.testing.expectEqual(n + 1, heap.liveCount());
+
+    const freed_all = collector.collect(&.{});
+    try std.testing.expectEqual(n + 1, freed_all);
+    try std.testing.expectEqual(@as(usize, 0), heap.liveCount());
+}
+
+// -----------------------------------------------------------------------------
 // G4. Pinning
 // -----------------------------------------------------------------------------
 

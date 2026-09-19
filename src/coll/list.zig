@@ -212,21 +212,30 @@ pub fn equalSeq(
 // GC trace (GC.md §5)
 // =============================================================================
 
-/// Walk `h` as a single cons cell, marking head and tail values if
-/// they're heap kinds. The tail (always `.list` by the proper-list
-/// invariant) is marked via `visitor.markValue` as a normal heap
-/// object; the collector's `mark` will dispatch to `list.trace`
-/// again on the tail's own cons cell. Mark-bit idempotence prevents
-/// infinite recursion on a cyclic chain.
+/// Walk the chain that starts at `h`: mark every head as a normal
+/// heap value, and mark each following cons cell directly (its
+/// mark bit through `visitor.markInternal`, its meta through
+/// `visitor.mark`) instead of handing the tail back to the
+/// collector, so a list of any length is walked in a loop and the
+/// collector's recursion depth follows nesting, never length. The
+/// walk stops at the empty list or at the first cell that is
+/// already marked, which is also what ends a cyclic chain.
 ///
 /// Empty-list subkind traces as no-op (body_size == 0).
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    const body = Heap.bodyBytes(h);
-    if (body.len == 0) return; // empty list; no children
-    std.debug.assert(body.len == @sizeOf(ConsBody));
-    const cons_body: *ConsBody = @ptrCast(@alignCast(body.ptr));
-    visitor.markValue(cons_body.head);
-    visitor.markValue(cons_body.tail);
+    var cell = h;
+    while (true) {
+        const body = Heap.bodyBytes(cell);
+        if (body.len == 0) return; // empty list; no children
+        std.debug.assert(body.len == @sizeOf(ConsBody));
+        const cons_body: *ConsBody = @ptrCast(@alignCast(body.ptr));
+        visitor.markValue(cons_body.head);
+        std.debug.assert(cons_body.tail.kind() == .list);
+        const next = Heap.asHeapHeader(cons_body.tail);
+        if (!visitor.markInternal(next)) return;
+        if (next.meta) |m| visitor.mark(m);
+        cell = next;
+    }
 }
 
 // =============================================================================

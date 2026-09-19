@@ -310,7 +310,7 @@ Kind dispatch table (`Collector.mark`):
 |-----------------------|----------------------------|---------------------------------------------|
 | `.string`             | `string.trace`             | nothing (byte bodies)                       |
 | `.bignum`             | `bignum.trace`             | nothing (limb bodies)                       |
-| `.list`               | `list.trace`               | cons head + tail; empty-list is no-op       |
+| `.list`               | `list.trace`               | every head; the tail chain in a loop (cells via `markInternal`, their meta via `mark`), so depth follows nesting, not length |
 | `.persistent_vector`  | `vector.trace`             | trie (internal nodes via `markInternal`) + tail |
 | `.persistent_map`     | `hamt.traceMap`            | array-map entries OR CHAMP subtree          |
 | `.persistent_set`     | `hamt.traceSet`            | array-set elements OR CHAMP subtree         |
@@ -514,6 +514,9 @@ Property tests in `test/prop/gc.zig` exercise randomized graphs:
 - G2: nested graph — the reachable closure, tracked in a parallel
   model, exactly matches `liveCount` after `collect`.
 - G3: collect twice with the same roots — second call frees 0.
+- G3b: a list of half a million cells survives a cycle intact and
+  is freed by the next; the walk is a loop, so length never
+  becomes recursion depth.
 - G4: pinned block survives without roots; unpinning releases it.
 - G5: repeated allocate-and-collect cycles do not leak.
 - G6: a program that allocates a vector, a string and a map on
