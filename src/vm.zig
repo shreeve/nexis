@@ -2344,8 +2344,9 @@ pub const VM = struct {
     /// keyword Values when a handler exists; otherwise raw
     /// VmError bubbles back to the caller).
     fn runUntilDepth(self: *VM, target_depth: usize) VmError!void {
+        var check_gc = true;
         while (self.frames.items.len > target_depth) {
-            if (self.gcDue()) self.collectGarbage();
+            if (check_gc and self.gcDue()) self.collectGarbage();
             // Fetch.
             const frame = self.currentFrame();
             if (frame.pc >= frame.routine.code.len) {
@@ -2358,14 +2359,17 @@ pub const VM = struct {
             // Dispatch with the same error-handling shape as
             // run(): ControlTransferred continues; other errors
             // route through handleRuntimeError.
-            self.dispatch(inst) catch |err| switch (err) {
-                VmError.ControlTransferred => continue,
-                else => self.handleRuntimeError(err) catch |err2| switch (err2) {
-                    // If unwindThrow popped us past our target
-                    // depth, the throw escaped — let caller
-                    // (callValue) detect via result_cell.done.
-                    VmError.UncaughtThrow => return err2,
-                    else => return err2,
+            check_gc = self.step(frame, inst) catch |err| switch (err) {
+                VmError.ControlTransferred => true,
+                else => blk: {
+                    self.handleRuntimeError(err) catch |err2| switch (err2) {
+                        // If unwindThrow popped us past our target
+                        // depth, the throw escaped — let caller
+                        // (callValue) detect via result_cell.done.
+                        VmError.UncaughtThrow => return err2,
+                        else => return err2,
+                    };
+                    break :blk true;
                 },
             };
             // If unwindThrow inside dispatch popped frames past
@@ -2461,7 +2465,13 @@ pub const VM = struct {
     ///   state — a stale `slot_count` paired with a shrunken
     ///   stack would underrun otherwise.
     fn slotPtr(self: *VM, slot_index: u12) VmError!*Value {
-        const frame = self.currentFrame();
+        return self.slotPtrIn(self.currentFrame(), slot_index);
+    }
+
+    /// `slotPtr` against `frame`, the current frame a caller has
+    /// already fetched: the hot handlers resolve every operand
+    /// through one frame pointer instead of re-deriving it.
+    inline fn slotPtrIn(self: *VM, frame: *const Frame, slot_index: u12) VmError!*Value {
         if (slot_index >= frame.slot_count) return VmError.OperandOutOfRange;
         const absolute: usize = @as(usize, frame.base_slot) + slot_index;
         if (absolute >= self.stack.items.len) return VmError.BytecodeCorruption;
@@ -2486,10 +2496,15 @@ pub const VM = struct {
     /// reads `frame.upvalues[u]` directly via a dedicated path
     /// in `execClosureMake`. Do not conflate the two.
     fn resolve(self: *VM, op: Operand) VmError!Value {
+        return self.resolveIn(self.currentFrame(), op);
+    }
+
+    /// `resolve` against `frame`, the current frame.
+    inline fn resolveIn(self: *VM, frame: *const Frame, op: Operand) VmError!Value {
         return switch (op.kind) {
-            .slot => (try self.slotPtr(op.index)).*,
+            .slot => (try self.slotPtrIn(frame, op.index)).*,
             .constant => blk: {
-                const consts = self.currentFrame().routine.consts;
+                const consts = frame.routine.consts;
                 if (op.index >= consts.len) return VmError.OperandOutOfRange;
                 break :blk switch (consts[op.index]) {
                     .value => |v| v,
@@ -2497,7 +2512,6 @@ pub const VM = struct {
                 };
             },
             .upvalue => blk: {
-                const frame = self.currentFrame();
                 if (op.index >= frame.upvalues.len) return VmError.UpvalueOutOfRange;
                 const cell = frame.upvalues[op.index];
                 if (!cell.initialized) return VmError.UninitializedCell;
@@ -2511,7 +2525,7 @@ pub const VM = struct {
             // runtime traps only if the Var is read before
             // any `def` has bound it.
             .var_ => blk: {
-                const var_table = self.currentFrame().routine.var_table;
+                const var_table = frame.routine.var_table;
                 if (op.index >= var_table.len) return VmError.OperandOutOfRange;
                 const v = var_table[op.index];
                 // A dynamic Var under `binding` answers with the
@@ -2551,8 +2565,13 @@ pub const VM = struct {
     ///   - `.unused`: invalid in any context with a destination
     ///     operand.
     fn store(self: *VM, op: Operand, v: Value) VmError!void {
+        return self.storeIn(self.currentFrame(), op, v);
+    }
+
+    /// `store` against `frame`, the current frame.
+    inline fn storeIn(self: *VM, frame: *const Frame, op: Operand, v: Value) VmError!void {
         switch (op.kind) {
-            .slot => (try self.slotPtr(op.index)).* = v,
+            .slot => (try self.slotPtrIn(frame, op.index)).* = v,
             .upvalue => return VmError.UnimplementedOpcode,
             .constant, .var_, .intern, .jump, .durable, .unused => return VmError.InvalidOperandKind,
             _ => return VmError.BytecodeCorruption,
@@ -2638,31 +2657,30 @@ pub const VM = struct {
     /// nested block so it cannot be reused after `dispatch()`, which
     /// may grow `frames` and invalidate it.
     fn runLoop(self: *VM) VmError!Value {
+        var check_gc = true;
         while (!self.halted) {
-            if (self.gcDue()) self.collectGarbage();
-            const inst = blk: {
-                const frame = self.currentFrame();
-                if (frame.pc >= frame.routine.code.len) {
-                    return VmError.BytecodeExhausted;
-                }
-                const i = frame.routine.code[frame.pc];
-                frame.pc += 1;
-                // Extension instructions are unimplemented.
-                if (i.kind == .extension) return VmError.UnimplementedOpcode;
-                break :blk i;
-            };
+            if (check_gc and self.gcDue()) self.collectGarbage();
+            const frame = self.currentFrame();
+            if (frame.pc >= frame.routine.code.len) {
+                return VmError.BytecodeExhausted;
+            }
+            const inst = frame.routine.code[frame.pc];
+            frame.pc += 1;
+            // Extension instructions are unimplemented.
+            if (inst.kind == .extension) return VmError.UnimplementedOpcode;
 
-            self.dispatch(inst) catch |err| switch (err) {
+            check_gc = self.step(frame, inst) catch |err| switch (err) {
                 // Internal control-transfer signal from a
                 // callValue/native re-
                 // entry path. Frame + PC already adjusted by
                 // unwindThrow; just continue dispatch.
-                VmError.ControlTransferred => continue,
-                else => {
+                VmError.ControlTransferred => true,
+                else => blk: {
                     // Recoverable VM errors get translated into
                     // user Values
                     // and routed through unwindThrow.
                     try self.handleRuntimeError(err);
+                    break :blk true;
                 },
             };
         }
@@ -2679,22 +2697,23 @@ pub const VM = struct {
     /// as `run()`.
     pub fn runWithFuel(self: *VM, max_steps: usize) VmError!Value {
         var steps: usize = 0;
+        var check_gc = true;
         while (!self.halted) : (steps += 1) {
             if (steps >= max_steps) return VmError.BytecodeExhausted;
-            if (self.gcDue()) self.collectGarbage();
-            const inst = blk: {
-                const frame = self.currentFrame();
-                if (frame.pc >= frame.routine.code.len) {
-                    return VmError.BytecodeExhausted;
-                }
-                const i = frame.routine.code[frame.pc];
-                frame.pc += 1;
-                if (i.kind == .extension) return VmError.UnimplementedOpcode;
-                break :blk i;
-            };
-            self.dispatch(inst) catch |err| switch (err) {
-                VmError.ControlTransferred => continue,
-                else => try self.handleRuntimeError(err),
+            if (check_gc and self.gcDue()) self.collectGarbage();
+            const frame = self.currentFrame();
+            if (frame.pc >= frame.routine.code.len) {
+                return VmError.BytecodeExhausted;
+            }
+            const inst = frame.routine.code[frame.pc];
+            frame.pc += 1;
+            if (inst.kind == .extension) return VmError.UnimplementedOpcode;
+            check_gc = self.step(frame, inst) catch |err| switch (err) {
+                VmError.ControlTransferred => true,
+                else => blk: {
+                    try self.handleRuntimeError(err);
+                    break :blk true;
+                },
             };
         }
         return self.result;
@@ -2737,13 +2756,13 @@ pub const VM = struct {
     fn dispatch(self: *VM, inst: Inst) VmError!void {
         const g = inst.groupOf();
         switch (g) {
-            .mov => try self.execMov(inst),
+            .mov => try self.execMov(self.currentFrame(), inst),
             .call => try self.execCall(inst),
-            .math => try self.execMath(inst),
-            .cmp => try self.execCmp(inst),
-            .jump => try self.execJump(inst),
+            .math => try self.execMath(self.currentFrame(), inst),
+            .cmp => try self.execCmp(self.currentFrame(), inst),
+            .jump => try self.execJump(self.currentFrame(), inst),
             .closure => try self.execClosure(inst),
-            .var_ => try self.execVar(inst),
+            .var_ => try self.execVar(self.currentFrame(), inst),
             .coll => try self.execColl(inst),
             .ctrl => try self.execCtrl(inst),
             // Known groups with no implemented variants.
@@ -2753,31 +2772,68 @@ pub const VM = struct {
         }
     }
 
+    /// One instruction of the loops, fetched from `frame`. The
+    /// groups that never allocate and never push or pop a frame
+    /// (`mov`, `cmp`, `jump`, `var`) run against `frame` directly;
+    /// `math` allocates only on the heap and runs the same way;
+    /// every other group goes through `dispatch`. Returns whether
+    /// the instruction could have allocated, which is when the next
+    /// safe point has to test for a due collection: the heap's
+    /// counter cannot move otherwise.
+    inline fn step(self: *VM, frame: *Frame, inst: Inst) VmError!bool {
+        switch (inst.groupOf()) {
+            .mov => {
+                try self.execMov(frame, inst);
+                return false;
+            },
+            .cmp => {
+                try self.execCmp(frame, inst);
+                return false;
+            },
+            .jump => {
+                try self.execJump(frame, inst);
+                return false;
+            },
+            .var_ => {
+                try self.execVar(frame, inst);
+                return false;
+            },
+            .math => {
+                try self.execMath(frame, inst);
+                return true;
+            },
+            else => {
+                try self.dispatch(inst);
+                return true;
+            },
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Group `mov` (VM.md §10 #3)
     // -------------------------------------------------------------------------
 
-    fn execMov(self: *VM, inst: Inst) VmError!void {
+    fn execMov(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         const variant: Mov = @enumFromInt(inst.variant);
         switch (variant) {
             .move => {
                 // mov:move a b _      ;  slot[a] = resolve(b)
-                const v = try self.resolve(inst.b);
-                try self.store(inst.a, v);
+                const v = try self.resolveIn(frame, inst.b);
+                try self.storeIn(frame, inst.a, v);
             },
             .load_const => {
                 // mov:load-const a c _  ;  slot[a] = consts[c]
-                const v = try self.resolve(inst.b);
-                try self.store(inst.a, v);
+                const v = try self.resolveIn(frame, inst.b);
+                try self.storeIn(frame, inst.a, v);
             },
             .load_nil => {
-                try self.store(inst.a, value_mod.nilValue());
+                try self.storeIn(frame, inst.a, value_mod.nilValue());
             },
             .load_true => {
-                try self.store(inst.a, value_mod.fromBool(true));
+                try self.storeIn(frame, inst.a, value_mod.fromBool(true));
             },
             .load_false => {
-                try self.store(inst.a, value_mod.fromBool(false));
+                try self.storeIn(frame, inst.a, value_mod.fromBool(false));
             },
             _ => return VmError.UnimplementedOpcode,
         }
@@ -3299,25 +3355,25 @@ pub const VM = struct {
     // where N is the destination PC.
     // -------------------------------------------------------------------------
 
-    fn execJump(self: *VM, inst: Inst) VmError!void {
+    fn execJump(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         const variant: Jump = @enumFromInt(inst.variant);
         switch (variant) {
             .jmp => {
                 // jump:jmp A=target _ _   ; pc := A.index
-                try self.applyJump(inst.a);
+                try applyJump(frame, inst.a);
             },
             .if_true => {
                 // jump:if-true A=target B=test _   ; if truthy(B) pc := A.index
-                const test_v = try self.resolve(inst.b);
+                const test_v = try self.resolveIn(frame, inst.b);
                 if (test_v.isTruthy()) {
-                    try self.applyJump(inst.a);
+                    try applyJump(frame, inst.a);
                 }
             },
             .if_false => {
                 // jump:if-false A=target B=test _  ; if falsy(B) pc := A.index
-                const test_v = try self.resolve(inst.b);
+                const test_v = try self.resolveIn(frame, inst.b);
                 if (test_v.isFalsy()) {
-                    try self.applyJump(inst.a);
+                    try applyJump(frame, inst.a);
                 }
             },
             _ => return VmError.BytecodeCorruption,
@@ -3336,57 +3392,56 @@ pub const VM = struct {
     ///   2. The target PC is strictly within the routine's code
     ///      range. A target equal to `code.len` is illegal because
     ///      the next dispatch would surface BytecodeExhausted.
-    fn applyJump(self: *VM, target: Operand) VmError!void {
+    fn applyJump(frame: *Frame, target: Operand) VmError!void {
         if (target.kind != .jump) return VmError.InvalidOperandKind;
         const pc: u32 = @intCast(target.index);
-        const frame = self.currentFrame();
         if (pc >= frame.routine.code.len) return VmError.OperandOutOfRange;
         frame.pc = pc;
     }
 
-    fn execMath(self: *VM, inst: Inst) VmError!void {
+    fn execMath(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         const variant: Math = @enumFromInt(inst.variant);
         // Resolve every source operand BEFORE storing so that
         // dst/src aliasing (e.g., math:add s0, s0, c0) is correct.
-        const lhs = try self.resolve(inst.b);
+        const lhs = try self.resolveIn(frame, inst.b);
         const heap = self.ensureHeap();
         const result = switch (variant) {
-            .add => try numAdd(heap, lhs, try self.resolve(inst.c)),
-            .sub => try numSub(heap, lhs, try self.resolve(inst.c)),
-            .mul => try numMul(heap, lhs, try self.resolve(inst.c)),
-            .div => try numDiv(heap, lhs, try self.resolve(inst.c)),
-            .idiv => try numQuot(heap, lhs, try self.resolve(inst.c)),
-            .mod => try numMod(heap, lhs, try self.resolve(inst.c)),
+            .add => try numAdd(heap, lhs, try self.resolveIn(frame, inst.c)),
+            .sub => try numSub(heap, lhs, try self.resolveIn(frame, inst.c)),
+            .mul => try numMul(heap, lhs, try self.resolveIn(frame, inst.c)),
+            .div => try numDiv(heap, lhs, try self.resolveIn(frame, inst.c)),
+            .idiv => try numQuot(heap, lhs, try self.resolveIn(frame, inst.c)),
+            .mod => try numMod(heap, lhs, try self.resolveIn(frame, inst.c)),
             .neg => try numNeg(heap, lhs),
             .abs => try numAbs(heap, lhs),
             .pow => return VmError.UnimplementedOpcode,
             _ => return VmError.BytecodeCorruption,
         };
-        try self.store(inst.a, result);
+        try self.storeIn(frame, inst.a, result);
     }
 
     // -------------------------------------------------------------------------
     // Group `cmp` (VM.md §10 #1)
     // -------------------------------------------------------------------------
 
-    fn execCmp(self: *VM, inst: Inst) VmError!void {
+    fn execCmp(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         // cmp:<op> a b c   ;  slot[a] = bool(resolve(b) <op> resolve(c))
         const cmp = std.enums.fromInt(NumCmp, inst.variant) orelse return VmError.BytecodeCorruption;
-        const lhs = try self.resolve(inst.b);
-        const rhs = try self.resolve(inst.c);
-        try self.store(inst.a, value_mod.fromBool(try numCompare(cmp, lhs, rhs)));
+        const lhs = try self.resolveIn(frame, inst.b);
+        const rhs = try self.resolveIn(frame, inst.c);
+        try self.storeIn(frame, inst.a, value_mod.fromBool(try numCompare(cmp, lhs, rhs)));
     }
 
     // -------------------------------------------------------------------------
     // Group `var` (VM.md §10 #6)
     // -------------------------------------------------------------------------
 
-    fn execVar(self: *VM, inst: Inst) VmError!void {
+    fn execVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         const variant: VarOp = @enumFromInt(inst.variant);
         switch (variant) {
-            .load_var => try self.execVarLoadVar(inst),
-            .store_var => try self.execVarStoreVar(inst),
-            .var_object => try self.execVarVarObject(inst),
+            .load_var => try self.execVarLoadVar(frame, inst),
+            .store_var => try self.execVarStoreVar(frame, inst),
+            .var_object => try self.execVarVarObject(frame, inst),
             _ => return VmError.BytecodeCorruption,
         }
     }
@@ -3401,11 +3456,11 @@ pub const VM = struct {
     /// path). The dedicated opcode exists for symmetry with
     /// `var:store-var` and for diagnostic clarity in
     /// disassembly.
-    fn execVarLoadVar(self: *VM, inst: Inst) VmError!void {
+    fn execVarLoadVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.b.kind != .var_) return VmError.InvalidOperandKind;
-        const v = try self.resolve(inst.b);
-        try self.store(inst.a, v);
+        const v = try self.resolveIn(frame, inst.b);
+        try self.storeIn(frame, inst.a, v);
     }
 
     /// `var:store-var A=dst_slot B=var(index) C=value_op` —
@@ -3418,16 +3473,16 @@ pub const VM = struct {
     /// `#'x`. Rebinding the same name updates the SAME Var in
     /// place (identity-stable), so existing closures that
     /// captured `x`'s Var continue to see the new value.
-    fn execVarStoreVar(self: *VM, inst: Inst) VmError!void {
+    fn execVarStoreVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.b.kind != .var_) return VmError.InvalidOperandKind;
-        const var_table = self.currentFrame().routine.var_table;
+        const var_table = frame.routine.var_table;
         if (inst.b.index >= var_table.len) return VmError.OperandOutOfRange;
         const target = var_table[inst.b.index];
-        const new_value = try self.resolve(inst.c);
+        const new_value = try self.resolveIn(frame, inst.c);
         target.root = new_value;
         target.bound = true;
-        try self.store(inst.a, VM.varToValue(target));
+        try self.storeIn(frame, inst.a, VM.varToValue(target));
     }
 
     /// `var:var-object A=dst_slot B=var(index) _` — write the
@@ -3435,13 +3490,13 @@ pub const VM = struct {
     /// `slot[A]`. Does NOT trap on unbound; taking a reference
     /// to an unbound Var is legal (Clojure's `(var x)` /
     /// `#'x`).
-    fn execVarVarObject(self: *VM, inst: Inst) VmError!void {
+    fn execVarVarObject(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.b.kind != .var_) return VmError.InvalidOperandKind;
-        const var_table = self.currentFrame().routine.var_table;
+        const var_table = frame.routine.var_table;
         if (inst.b.index >= var_table.len) return VmError.OperandOutOfRange;
         const target = var_table[inst.b.index];
-        try self.store(inst.a, VM.varToValue(target));
+        try self.storeIn(frame, inst.a, VM.varToValue(target));
     }
 
     // -------------------------------------------------------------
