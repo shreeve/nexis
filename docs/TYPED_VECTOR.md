@@ -178,6 +178,7 @@ switch have an arm:
 | `(count tv)` | the length |
 | `(nth tv i)`, `(nth tv i default)` | the element; out of range is `:index-out-of-bounds`, or `default` |
 | `(get tv i)`, `(get tv i default)` | the element, or `default` (nil) for a non-fixnum or out-of-range key |
+| `(contains? tv i)` | `true` for a fixnum index within `0..count`, as for a persistent vector |
 | `(empty? tv)` | `(zero? (count tv))` |
 | `(= a b)`, `(hash tv)`, `(identical? a b)` | §3 |
 | `(str tv)`, `(pr-str tv)`, `(println tv)` | §6 |

@@ -1691,6 +1691,13 @@ fn fnContainsQ(vm: *VM, args: []const Value) VmError!Value {
             break :blk value_mod.fromBool(u_idx < vector_mod.count(coll));
         },
         .string => value_mod.fromBool((try stringIndex(coll, k)) != null),
+        .typed_vector => blk: {
+            if (k.kind() != .fixnum) break :blk value_mod.fromBool(false);
+            const idx = k.asFixnum();
+            if (idx < 0) break :blk value_mod.fromBool(false);
+            const u_idx: usize = @intCast(idx);
+            break :blk value_mod.fromBool(u_idx < typed_vector_mod.count(coll));
+        },
         .record => value_mod.fromBool(switch (champ_mod.mapGet(
             record_mod.fieldsOf(coll),
             k,

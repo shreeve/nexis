@@ -3934,6 +3934,8 @@ test "typed vectors: constructors, type, printing and the generic natives" {
         .{ .src = "(get (i64-vector [10 20]) 2)", .expected = "nil" },
         .{ .src = "(get (i64-vector [10 20]) -1 :d)", .expected = ":d" },
         .{ .src = "(get (i64-vector [10 20]) :k :d)", .expected = ":d" },
+        .{ .src = "[(contains? (i64-vector [10 20]) 0) (contains? (i64-vector [10 20]) 1) (contains? (f64-vector [10 20]) 1)]", .expected = "[true true true]" },
+        .{ .src = "[(contains? (i64-vector [10 20]) 2) (contains? (i64-vector [10 20]) -1) (contains? (i64-vector [10 20]) :k) (contains? (f64-vector []) 0)]", .expected = "[false false false false]" },
         .{ .src = "(seq (i64-vector [1 2]))", .expected = "(1 2)" },
         .{ .src = "(seq (i64-vector []))", .expected = "nil" },
         .{ .src = "(first (f64-vector [1.5 2]))", .expected = "1.5" },
