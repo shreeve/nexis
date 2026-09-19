@@ -87,10 +87,10 @@
 (check "the connection writes again after the throw" (= (inc (:tx committed)) (:tx (d/transact! c [[:db/add ann :person/tags :blue]]))))
 
 ; A speculative schema attribute exists in the view only.
-(d/with c [{:db/ident :person/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+(d/with c [{:db/id "nick" :db/ident :person/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
   (fn [db-after report]
     (check "the view has the new attribute" (= :db.type/string (:db/valueType (get (d/schema db-after) :person/nick))))
-    (check "and its ident" (= (get (:tempids report) "nick" (d/entid db-after :person/nick)) (d/entid db-after :person/nick)))
+    (check "and its ident" (= (get (:tempids report) "nick") (d/entid db-after :person/nick)))
     (check "the connection does not" (nil? (get (d/schema (d/db c)) :person/nick)))))
 (println (caught (d/transact! c [[:db/add ann :person/nick "Annie"]])))
 
