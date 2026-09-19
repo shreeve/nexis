@@ -561,7 +561,14 @@ const Parser = struct {
             const body = try self.parseClauses(parts[1..], false);
             try out.append(self.arena, .{ .name = name, .required = required, .head = try vars.toOwnedSlice(self.arena), .body = body });
         }
+        // Group the bodies of one rule: `RuleSet.byName` is one slice.
+        // The sort is stable, so bodies keep their source order.
+        std.mem.sort(ir.Rule, out.items, {}, ruleNameLess);
         return out.toOwnedSlice(self.arena);
+    }
+
+    fn ruleNameLess(_: void, a: ir.Rule, b: ir.Rule) bool {
+        return a.name < b.name;
     }
 };
 
@@ -792,6 +799,27 @@ test "rules parse with required groups and arity checks; caches hit by identity 
     try testing.expectEqual(@as(usize, 1), rs.rules[0].required);
     try testing.expectEqual(@as(usize, 2), rs.rules[1].head.len);
     try testing.expectEqual(@as(usize, 2), rs.byName(rs.rules[0].name).?.len);
+
+    // Interleaved names are grouped, bodies in source order.
+    const mixed = b.vec(&.{
+        b.vec(&.{ b.lst(&.{ b.sym("r"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(1) }) }),
+        b.vec(&.{ b.lst(&.{ b.sym("s"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(2) }) }),
+        b.vec(&.{ b.lst(&.{ b.sym("r"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(3) }) }),
+        b.vec(&.{ b.lst(&.{ b.sym("s"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(4) }) }),
+    });
+    const ms = try parseRules(testing.allocator, &interner, mixed, &diag);
+    defer ms.deinit();
+    const r_name = (try interner.internSymbol("r"));
+    const s_name = (try interner.internSymbol("s"));
+    const rs_r = ms.byName(r_name).?;
+    const rs_s = ms.byName(s_name).?;
+    try testing.expectEqual(@as(usize, 2), rs_r.len);
+    try testing.expectEqual(@as(usize, 2), rs_s.len);
+    try testing.expectEqual(@as(i64, 1), rs_r[0].body[0].pattern.v.constant.cell.int);
+    try testing.expectEqual(@as(i64, 3), rs_r[1].body[0].pattern.v.constant.cell.int);
+    try testing.expectEqual(@as(i64, 2), rs_s[0].body[0].pattern.v.constant.cell.int);
+    try testing.expectEqual(@as(i64, 4), rs_s[1].body[0].pattern.v.constant.cell.int);
+    try testing.expect(ms.byName(try interner.internSymbol("t")) == null);
 
     const bad = b.vec(&.{
         b.vec(&.{ b.lst(&.{ b.sym("r"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(1) }) }),
