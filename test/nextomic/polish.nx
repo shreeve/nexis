@@ -1,0 +1,135 @@
+; test/nextomic/polish.nx — the behaviours a program can see that the
+; other scripts do not pin: a function binding on a bound variable,
+; rule bodies of one name apart in the rule set, a wide query, the
+; pull cut, lookup refs and idents as inputs, transaction entity ids as
+; time arguments, the history view refusing entity and pull, reverse
+; refs and nested maps in map forms, unique being card-one, cross-type
+; comparisons, the error payloads, and connect making the directory.
+; Runs from a scratch directory; the store is fresh.
+
+(require '[nextomic :as d])
+
+(defn check [label ok]
+  (println (if ok "ok" "FAIL") label)
+  (when-not ok (throw :check-failed)))
+
+(defmacro caught [& body]
+  `(try (do ~@body :no-error) (catch any e# e#)))
+
+; Results are persistent sets; sorting makes the output stable.
+(defn rows [res] (sort res))
+
+(def c (d/connect "sub/dir/polish.edb"))
+(check "connect makes the parent directories" (= 1 (d/basis-t (d/db c))))
+
+(d/transact! c [{:db/ident :user/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+                 :db/unique :db.unique/identity}
+                {:db/ident :user/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+                {:db/ident :user/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+                {:db/ident :user/next :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+                {:db/ident :user/role :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}
+                {:db/ident :user/boss :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
+                {:db/ident :user/friends :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+                {:db/ident :user/items :db/valueType :db.type/long :db/cardinality :db.cardinality/many}
+                {:db/ident :role/admin} {:db/ident :role/staff}])
+(def r (d/transact! c [{:db/id "ann" :user/email "ann@x" :user/name "Ann" :user/age 30 :user/next 31 :user/role :role/admin}
+                       {:db/id "bob" :user/email "bob@x" :user/name "Bob" :user/age 25 :user/next 30 :user/role :role/staff
+                        :user/boss "ann"}
+                       {:db/id "big" :user/email "big@x" :user/items (vec (range 1001))}]))
+(def ann (get (:tempids r) "ann"))
+(def bob (get (:tempids r) "bob"))
+(def big (get (:tempids r) "big"))
+(def db (d/db c))
+
+; --- a function binding whose variable is already bound unifies --------
+(println (rows (d/q '[:find ?n :where [?e :user/age ?a] [?e :user/next ?b] [(+ ?a 1) ?b] [?e :user/name ?n]] db)))
+(println (rows (d/q '[:find ?n :where [?e :user/age ?a] [(+ ?a 1) ?b] [?e :user/next ?b] [?e :user/name ?n]] db)))
+
+; --- rule bodies of one name need not be adjacent -------------------------
+(def rules '[[(named ?e ?n) [?e :user/name ?n]]
+             [(older ?e) [?e :user/age ?a] [(> ?a 26)]]
+             [(named ?e ?n) [?e :user/email ?n]]])
+(println (rows (d/q '[:find ?n :in $ % :where (named ?e ?n) (older ?e)] db rules)))
+
+; --- a query has no variable cap ----------------------------------------
+(def wide (into '[:find ?v69 :where [?v0 :user/email "ann@x"]]
+                (mapv (fn [i] ['?v0 :user/age (symbol (str "?v" i))]) (range 1 70))))
+(println (d/q wide db))
+
+; --- pull cuts card-many at 1000 unless :limit says otherwise -------------
+(println (count (:user/items (d/pull db '[*] big))))
+(println (count (:user/items (d/pull db '[:user/items] big))))
+(println (count (:user/items (d/pull db '[(:user/items :limit nil)] big))))
+(println (count (:user/items (d/pull db '[(:user/items :limit 5)] big))))
+
+; --- an integer with no attribute is an entity id -------------------------
+(check "an integer with no attribute is an entity id, not a long" (empty? (d/q '[:find ?e :where [?e _ 30]] db)))
+(println (rows (d/q '[:find ?n :in $ ?a :where [?e _ ?a] [?e :user/name ?n]] db ann)))
+
+; --- lookup refs and idents as inputs, by the role of their variable ------
+(println (d/q '[:find ?n . :in $ ?e :where [?e :user/name ?n]] db [:user/email "bob@x"]))
+(println (d/q '[:find ?n . :in $ ?b :where [?e :user/boss ?b] [?e :user/name ?n]] db [:user/email "ann@x"]))
+(println (d/q '[:find ?i . :in $ ?e :where [?e :db/ident ?i]] db :role/admin))
+(println (d/q '[:find ?n . :in $ ?r :where [?e :user/role ?r] [?e :user/name ?n]] db :role/admin))
+(println (rows (d/q '[:find ?n :in $ [?e ...] :where [?e :user/name ?n]] db [[:user/email "ann@x"] [:user/email "bob@x"]])))
+(println (rows (d/q '[:find ?n ?a :in $ [[?e ?a]] :where [?e :user/name ?n]] db [[[:user/email "ann@x"] 1] [bob 2]])))
+(println (d/q '[:find ?n :in $ ?e :where [?e :user/name ?n]] db [:user/email "zed@x"]))
+(println (caught (d/q '[:find ?n :in $ ?e :where [?e :user/name ?n]] db [:user/email 5])))
+(println (caught (d/q '[:find ?n :in $ ?e :where [?e :user/name ?n]] db [:user/name "Ann"])))
+
+; --- comparisons: int and double are one order; other types do not mix ---
+(println (rows (d/q '[:find ?n :where [?e :user/age ?a] [(< ?a 27.5)] [?e :user/name ?n]] db)))
+(println (caught (d/q '[:find ?n :where [?e :user/age ?a] [(< ?a "x")] [?e :user/name ?n]] db)))
+(println (caught (d/q '[:find ?n :where [?e :user/name ?n] [(< ?n :role/admin)]] db)))
+
+; --- errors carry what they know ----------------------------------------
+(println (caught (d/q '[:find ?n :where [?e :user/nope ?n]] db)))
+(println (caught (d/q '[:find ?n :where [?e :user/name ?n] [(> ?a 1)]] db)))
+(println (caught (d/q '[:find ?n :where [?e :user/name ?n] [(missing? ?e)]] db)))
+(println (caught (d/q '[:find ?e :in $ % :where (nope ?e)] db rules)))
+(println (caught (d/transact! c [[:db/add bob :user/email "ann@x"]])))
+(println (caught (d/transact! c [[:db/add bob :user/nope 1]])))
+(println (caught (d/transact! c [{:db/id bob :user/boss {:user/name "Nobody"}}])))
+(println (caught (d/pull db '[:user/nope] ann)))
+(println (caught (d/pull db '[*] "ann")))
+(println (caught (d/pull db '[*] [:user/email])))
+(println (caught (d/pull db '[*] [:user/name "Ann"])))
+(println (caught (d/pull db '[*] [:user/email 5])))
+(println (caught (d/pull db '[*] [:user/email "zed@x"])))
+(println (caught (d/pull db '[*] 0)))
+
+; --- unique is cardinality one -----------------------------------------
+(println (caught (d/transact! c [{:db/ident :user/tags :db/valueType :db.type/string :db/cardinality :db.cardinality/many
+                                  :db/unique :db.unique/identity}])))
+(println (caught (d/transact! c [[:db/add :user/items :db/unique :db.unique/value]])))
+(check "failed transactions leave the basis alone" (= (d/basis-t db) (d/basis-t (d/db c))))
+
+; --- reverse refs and nested maps in map forms ---------------------------
+(d/transact! c [{:db/id "cy" :user/email "cy@x" :user/name "Cy" :user/_friends [ann bob]}
+                {:db/id "dee" :user/email "dee@x" :user/name "Dee" :user/_boss {:user/email "bob@x"}}
+                {:db/id ann :user/boss {:user/email "eve@x" :user/name "Eve"}}])
+(def db2 (d/db c))
+(println (rows (d/q '[:find ?n :in $ ?f :where [?e :user/friends ?f] [?e :user/name ?n]] db2 [:user/email "cy@x"])))
+(println (:user/name (d/entity db2 (:user/boss (d/entity db2 bob)))))
+(println (:user/name (d/entity db2 (:user/boss (d/entity db2 ann)))))
+(println (:user/name (d/pull db2 '[:user/name] [:user/email "eve@x"])))
+
+; --- the history view has no entities to map ----------------------------
+(println (caught (d/entity (d/history db2) ann)))
+(println (caught (d/pull (d/history db2) '[*] ann)))
+(println (rows (d/q '[:find ?a ?added :in $ ?e :where [?e :user/age ?a _ ?added]] (d/history db2) ann)))
+
+; --- a transaction's entity id names its t --------------------------------
+(def r2 (d/transact! c [[:db/add bob :user/age 26]]))
+(def r3 (d/transact! c [[:db/add bob :user/age 27]]))
+(def db3 (d/db c))
+(def tx2 (d/q '[:find ?tx . :in $ ?e :where [?e :user/age 26 ?tx]] (d/history db3) bob))
+(check "the transaction entity is not the t" (not= tx2 (:tx r2)))
+(println (d/q '[:find ?a . :in $ ?e :where [?e :user/age ?a]] (d/as-of db3 tx2) bob))
+(println (d/q '[:find ?a . :in $ ?e :where [?e :user/age ?a]] (d/since db3 tx2) bob))
+(check "tx-range takes the entity id as its t" (= [(:tx r2) (:tx r3)] (mapv :t (d/tx-range c tx2))))
+(check "tx-range bounds are half-open" (= [(:tx r2)] (mapv :t (d/tx-range c tx2 (:tx r3)))))
+(check "as-of by t and by entity id agree" (= (d/as-of db3 tx2) (d/as-of db3 (:tx r2))))
+
+(d/release c)
+:polish-done

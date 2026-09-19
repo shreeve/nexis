@@ -1,0 +1,54 @@
+ok connect makes the parent directories
+([Ann])
+([Ann])
+([Ann] [ann@x])
+#{[30]}
+1000
+1000
+1001
+5
+ok an integer with no attribute is an entity id, not a long
+([Bob])
+Bob
+Bob
+:role/admin
+Ann
+([Ann] [Bob])
+([Ann 1] [Bob 2])
+#{}
+:nextomic/value-type
+{:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :user/name}
+([Bob])
+:nextomic/value-type
+:nextomic/value-type
+{:error :nextomic/unknown-attribute, :attr :user/nope}
+{:error :nextomic/query-syntax, :message a predicate, function or rule argument is never bound}
+{:error :nextomic/query-syntax, :message missing? is (missing? $ ?e :attr), :clause 1}
+{:error :nextomic/query-syntax, :message unknown rule}
+{:error :nextomic/unique, :attr :user/email, :value ann@x}
+{:error :nextomic/unknown-attribute, :attr :user/nope}
+{:error :nextomic/tx-data, :message a nested map under a non-component ref needs :db/id or a unique attribute}
+{:error :nextomic/unknown-attribute, :attr :user/nope}
+:kind-mismatch
+{:error :nextomic/tx-data, :message a lookup ref is [attr value]}
+{:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :user/name}
+:nextomic/value-type
+:nextomic/no-entity
+:nextomic/no-entity
+{:error :nextomic/tx-data, :message a unique attribute is cardinality one}
+{:error :nextomic/tx-data, :message a unique attribute is cardinality one}
+ok failed transactions leave the basis alone
+([Ann] [Bob])
+Dee
+Eve
+Eve
+:nextomic/history-view
+:nextomic/history-view
+([30 true])
+ok the transaction entity is not the t
+26
+27
+ok tx-range takes the entity id as its t
+ok tx-range bounds are half-open
+ok as-of by t and by entity id agree
+:polish-done
