@@ -667,8 +667,14 @@ Macro semantics (peer-AI turn 56 §2.G-J):
   (-> x f (g a))    => (g (f x) a)
   ```
 - `->>` (thread-last): same but inserts as LAST arg.
-- `let` / `fn` / `loop`: trivial rename to `let*` / `fn*` /
-  `loop*`. Pure (cons 'let* decl) shape.
+- `let` / `fn` / `loop`: rename to `let*` / `fn*` / `loop*` after
+  lowering destructuring patterns to gensym bindings. `fn` and
+  `defn` also take overload clauses, `(fn name? ([x] ...) ([x y]
+  ...) ([x & r] ...))`, lowered to one variadic `fn*` that binds
+  `n` to the argument count and tests the fixed arities in source
+  order, then the variadic clause, then throws `:arity-mismatch`;
+  a `letfn` binding takes the same clauses. At most one variadic
+  clause, no fixed arity below it or repeated (Clojure's rules).
 
 Each expander uses FormBuilder. NO runtime list/concat needed
 (macros construct output Forms directly via builder).

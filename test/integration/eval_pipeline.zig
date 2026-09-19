@@ -829,6 +829,28 @@ test "integration: multi-arity with destructured params" {
     , "12");
 }
 
+test "multi-arity fn: anonymous, named and letfn clauses dispatch by argc" {
+    try expectOutput("((fn ([x] x) ([x y] (+ x y))) 1 2)", "3");
+    try expectOutput("((fn ([x] x) ([x y] (+ x y))) 1)", "1");
+    try expectOutput("((fn ([x] x)) 7)", "7");
+    try expectOutput("((fn ([] 0) ([x & r] (count r))) 1 2 3)", "2");
+    // The exact fixed arity wins over the variadic one, in any order.
+    try expectOutput("((fn ([x & r] :var) ([x] :one)) 1)", ":one");
+    try expectOutput("((fn ([x & r] :var) ([x] :one)) 1 2)", ":var");
+    try expectOutput("((fn f ([n] (f n 0)) ([n acc] (if (zero? n) acc (f (dec n) (+ acc n))))) 4)", "10");
+    try expectOutput("(letfn [(f ([x] x) ([x y] y))] [(f 1) (f 1 2)])", "[1 2]");
+    try expectOutput("(letfn [(f [[a b]] (+ a b))] (f [1 2]))", "3");
+    try expectOutput("(let [f (fn ([[a b]] (+ a b)) ([m k] (get m k)))] [(f [1 2]) (f {:k 3} :k)])", "[3 3]");
+    try expectOutput("(try ((fn ([x] x)) 1 2) (catch any e e))", ":arity-mismatch");
+    try expectProgramError("(fn ([x] 1) ([x] 2))", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(fn ([x y] 1) ([x & r] 2))", compile.CompileError.MacroExpansionFailure);
+}
+
+test "named fn: the name is the function itself inside its body" {
+    try expectOutput("((fn f [n] (if (pos? n) (f (dec n)) :done)) 3)", ":done");
+    try expectOutput("(let [g (fn f [n] (if (zero? n) 1 (* n (f (dec n)))))] (g 5))", "120");
+}
+
 // =============================================================================
 // Destructuring (let / fn / defn params)
 // =============================================================================

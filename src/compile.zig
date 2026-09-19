@@ -61,7 +61,6 @@
 //!   - `recur` targeting a variadic fn raises `UnsupportedFeature`.
 //!   - The only catch matcher is `any`; a catch binding captured by
 //!     an inner fn raises `UnsupportedFeature`.
-//!   - `letfn*` bindings have no rest param (`UnsupportedFeature`).
 //!   - Var-level shadowing of `+` / `<` does not defeat inlining;
 //!     only lexical shadowing does.
 
@@ -335,6 +334,8 @@ pub const Tiny = union(enum) {
 pub const FnBinding = struct {
     name: []const u8,
     params: []const []const u8,
+    /// `& rest` binding name, when the fn is variadic.
+    rest_param: ?[]const u8 = null,
     body: *const Tiny,
 };
 
@@ -1876,12 +1877,10 @@ fn lowerLetFnStar(
         const name = try expectUnqualifiedSymbol(entry_items[0]);
         const param_vec = try expectVector(entry_items[1]);
         const parsed = try parseParams(allocator, param_vec);
-        // letfn* bindings have no rest param
-        // (Tiny.letfn_star.FnBinding has no rest_param field).
-        if (parsed.rest_param != null) return CompileError.UnsupportedFeature;
         bindings[i] = .{
             .name = name,
             .params = parsed.params,
+            .rest_param = parsed.rest_param,
             .body = undefined, // patched in 2. below
         };
         try local.lexical_names.put(allocator, name);
@@ -1894,6 +1893,7 @@ fn lowerLetFnStar(
         var body_env = LowerEnv{ .parent = &local };
         defer body_env.deinit(allocator);
         for (bindings[i].params) |p| try body_env.lexical_names.put(allocator, p);
+        if (bindings[i].rest_param) |rp| try body_env.lexical_names.put(allocator, rp);
         bindings[i].body = try lowerBody(allocator, entry_items[2..], ctx.withEnv(&body_env));
     }
 
@@ -2738,6 +2738,7 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
                 defer fn_env.deinit(allocator);
                 try fn_env.unionWith(allocator, &local_env);
                 for (b.params) |p| try fn_env.put(allocator, p);
+                if (b.rest_param) |rp| try fn_env.put(allocator, rp);
                 try freeVars(allocator, b.body, &fn_env, out);
             }
             try freeVars(allocator, l.body, &local_env, out);
@@ -2904,6 +2905,7 @@ fn capturedByDescendantFns(
                 var fn_env: NameSet = .{};
                 defer fn_env.deinit(allocator);
                 for (b.params) |p| try fn_env.put(allocator, p);
+                if (b.rest_param) |rp| try fn_env.put(allocator, rp);
                 for (l.bindings) |b2| try fn_env.put(allocator, b2.name);
                 var fn_free: NameSet = .{};
                 defer fn_free.deinit(allocator);
@@ -4041,9 +4043,7 @@ fn compileLetFnStar(
         // is already in scope (so the fn body's references
         // resolve via parent-chain capture); using the
         // self-name machinery here would double-allocate.
-        // letfn* bindings are always fixed-arity (no rest param
-        // syntax in (letfn* [(name [params] body) ...]) form).
-        try compileFn(e, null, b.params, null, b.body, cs);
+        try compileFn(e, null, b.params, b.rest_param, b.body, cs);
     }
 
     // 3. Init each cell with its closure.
@@ -7235,15 +7235,10 @@ test "compile shadowing: (do (def + (fn* [a b] 42)) (+ 1 2)) → 3 — Vars do n
     try expectSourceFixnumWithNs("(do (def + (fn* [a b] 42)) (+ 1 2))", 3);
 }
 
-test "compile shadowing: letfn* with rest param → UnsupportedFeature (Tiny FnBinding has no rest)" {
-    // Tiny.letfn_star.FnBinding has no rest_param field, so a
-    // letfn* binding with `& rest` is rejected.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    try testing.expectError(
-        CompileError.UnsupportedFeature,
-        compileSource(arena.allocator(), "(letfn* [(f [a & r] a)] (f 1 2))"),
-    );
+test "compile letfn*: a binding takes a rest param" {
+    try expectSourceFixnum("(letfn* [(f [a & r] a)] (f 1 2))", 1);
+    try expectSourceFixnum("(letfn* [(f [& r] 7)] (f))", 7);
+    try expectSourceFixnum("(letfn* [(f [& r] 7) (g [a & r] (+ a (f)))] (g 1 2 3))", 8);
 }
 
 test "compile shadowing: 'foo via compileSource (no interner) → UnsupportedFeature" {

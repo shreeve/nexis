@@ -710,10 +710,12 @@ fn expandLetFnStar(
     }
 
     // Second pass: expand each fn body under (local + that fn's
-    // params).
+    // params). An entry is first put through the `fn` expander,
+    // so overload clauses become one dispatching function and
+    // destructuring patterns become plain params.
     const new_entries = try ctx.allocator.alloc(*Form, fn_entries.len);
     for (fn_entries, 0..) |entry, idx| {
-        const entry_items = entry.datum.list;
+        const entry_items = try normalizeLetFnEntry(ctx, entry);
         const fn_params = entry_items[1];
         if (fn_params.datum != .vector) return ExpandError.MalformedMacroCall;
         const fn_body = entry_items[2..];
@@ -750,6 +752,21 @@ fn expandLetFnStar(
     out_items[1] = new_binding_vec;
     for (new_body, 0..) |b, k| out_items[2 + k] = b;
     return try makeList(ctx, out_items, list_form.origin);
+}
+
+/// A `letfn*` entry `(name params-or-clauses body...)` as `(name
+/// [params] body...)`: `expandFnRename` on `(fn name ...)` lowers
+/// overload clauses and destructuring, and the entry keeps its
+/// name with the resulting param vector and body.
+fn normalizeLetFnEntry(ctx: *ExpandContext, entry: *const Form) ExpandError![]const *Form {
+    const entry_items = entry.datum.list;
+    var fn_form = try expandFnRename(ctx, entry, entry_items);
+    // Overload clauses come back as `(fn name [& args] body)`;
+    // one more pass renames that to `fn*`.
+    if (std.mem.eql(u8, fn_form.datum.list[0].datum.symbol.name, "fn")) {
+        fn_form = try expandFnRename(ctx, entry, fn_form.datum.list[1..]);
+    }
+    return fn_form.datum.list[1..];
 }
 
 // ---- def / defn -----------------------------------------------------------
@@ -1810,15 +1827,12 @@ fn expandLetRename(
 }
 
 /// Expand `(fn ...)` with destructuring in params.
-/// Supports `(fn [params] body)`, `(fn name [params] body)`.
-/// Destructured params are replaced with gensyms; the body is
-/// wrapped in a `(let [pattern gensym ...] body)` that itself
-/// expands via destructuring.
-///
-/// Multi-arity `(fn ([p1] b1) ([p1 p2] b2))` is unsupported:
-/// the form is renamed to `fn*` unchanged and `expandFnStar`
-/// raises MalformedMacroCall. Only `defn` builds a multi-arity
-/// dispatcher.
+/// Supports `(fn [params] body)`, `(fn name [params] body)` and
+/// the overload form `(fn name? ([p1] b1) ([p1 p2] b2) ...)`, which
+/// lowers through `buildMultiArityFn` to one variadic function
+/// dispatching on argument count. Destructured params are
+/// replaced with gensyms; the body is wrapped in a `(let [pattern
+/// gensym ...] body)` that itself expands via destructuring.
 fn expandFnRename(
     ctx: *ExpandContext,
     call_form: *const Form,
@@ -1834,12 +1848,10 @@ fn expandFnRename(
     }
     if (params_idx >= args.len) return ExpandError.MalformedMacroCall;
     const params_form = args[params_idx];
-    if (params_form.datum != .vector) {
-        // Multi-arity form: (fn ([p1] b1) ([p1 p2] b2)) is
-        // unsupported; pass through unchanged and let
-        // `expandFnStar` raise MalformedMacroCall.
-        return renameHead(ctx, call_form, args, "fn*");
+    if (params_form.datum == .list) {
+        return try buildMultiArityFn(ctx, call_form, if (name_form) |n| n else null, args[params_idx..]);
     }
+    if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
     const params = params_form.datum.vector;
     const body = args[params_idx + 1 ..];
 
@@ -1920,20 +1932,9 @@ fn expandFnRename(
 
 /// `(defn name [params] body...)` → `(def name
 /// (fn name [params] body...))`. Routing defn through `fn`
-/// gives us destructured params for free.
-///
-/// The multi-arity form `(defn name ([p1] b1) ([p1 p2] b2))`
-/// expands to a variadic dispatcher:
-///   (def name
-///     (fn name [& args__auto__]
-///       (let* [n__auto__ (count args__auto__)]
-///         (if (= n__auto__ 1) (let* [p1 (nth args__auto__ 0)] b1)
-///         (if (= n__auto__ 2) (let* [p1 (nth args__auto__ 0)
-///                                    p2 (nth args__auto__ 1)] b2)
-///         (throw :arity-mismatch))))))
-///
-/// At-most-one variadic overload allowed; its fixed-count must
-/// exceed every fixed-arity overload's count (Clojure rule).
+/// gives us destructured params for free. The overload form
+/// `(defn name ([p1] b1) ([p1 p2] b2))` is `(def name <fn>)` with
+/// the dispatcher `buildMultiArityFn` builds.
 fn expandDefnMacro(
     ctx: *ExpandContext,
     call_form: *const Form,
@@ -1982,15 +1983,38 @@ fn buildDefForm(
     return try makeList(ctx, def_items, call_form.origin);
 }
 
-/// Build the multi-arity dispatcher.
 fn buildDefMultiFn(
     ctx: *ExpandContext,
     call_form: *const Form,
     name_form: *const Form,
     arity_forms: []const *Form,
 ) ExpandError!*Form {
-    // Each arity_form should be `(params body...)`.
-    // Collect (fixed_count, is_variadic, params_form, body_forms) per overload.
+    const fn_form = try buildMultiArityFn(ctx, call_form, name_form, arity_forms);
+    return try buildDefForm(ctx, call_form, name_form, fn_form);
+}
+
+/// Overload clauses `([params] body...)+` of `fn`, `defn` or a
+/// `letfn` binding lowered to one variadic function dispatching
+/// on argument count:
+///   (fn name? [& args__auto__]
+///     (let* [n__auto__ (count args__auto__)]
+///       (if (= n__auto__ 1) (let [p1 (nth args__auto__ 0)] b1)
+///       (if (= n__auto__ 2) (let [p1 (nth args__auto__ 0)
+///                                 p2 (nth args__auto__ 1)] b2)
+///       (if (not (< n__auto__ k)) (let [... rest (rest ...)] bv)
+///       (throw :arity-mismatch))))))
+/// Fixed arities are tested in source order and the variadic
+/// clause last, so an exact arity always wins over the variadic
+/// one. At most one variadic clause; its fixed count must not be
+/// below any fixed arity, and no fixed arity repeats (Clojure's
+/// rules). Each clause binds through `let`, so its params
+/// destructure.
+fn buildMultiArityFn(
+    ctx: *ExpandContext,
+    call_form: *const Form,
+    name_form: ?*const Form,
+    arity_forms: []const *Form,
+) ExpandError!*Form {
     const ArityInfo = struct {
         fixed: usize,
         variadic: bool,
@@ -1999,9 +2023,10 @@ fn buildDefMultiFn(
     };
     var arities: std.ArrayList(ArityInfo) = .empty;
     defer arities.deinit(ctx.allocator);
-    var variadic_seen: ?usize = null; // index into arities
+    var variadic: ?ArityInfo = null;
     var max_fixed: usize = 0;
 
+    if (arity_forms.len == 0) return ExpandError.MalformedMacroCall;
     for (arity_forms) |af| {
         if (af.datum != .list) return ExpandError.MalformedMacroCall;
         const items = af.datum.list;
@@ -2009,7 +2034,6 @@ fn buildDefMultiFn(
         const params_form = items[0];
         if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
         const params = params_form.datum.vector;
-        // Detect & rest position.
         var fixed_count: usize = 0;
         var is_variadic = false;
         for (params) |p| {
@@ -2019,92 +2043,99 @@ fn buildDefMultiFn(
             }
             fixed_count += 1;
         }
-        if (is_variadic) {
-            if (variadic_seen != null) return ExpandError.MalformedMacroCall;
-            variadic_seen = arities.items.len;
-        } else {
-            // Reject duplicate fixed arities.
-            for (arities.items) |a| {
-                if (!a.variadic and a.fixed == fixed_count) return ExpandError.MalformedMacroCall;
-            }
-            if (fixed_count > max_fixed) max_fixed = fixed_count;
-        }
-        try arities.append(ctx.allocator, .{
+        const info: ArityInfo = .{
             .fixed = fixed_count,
             .variadic = is_variadic,
             .params = params_form,
             .body = items[1..],
-        });
+        };
+        if (is_variadic) {
+            if (variadic != null) return ExpandError.MalformedMacroCall;
+            variadic = info;
+        } else {
+            for (arities.items) |a| {
+                if (a.fixed == fixed_count) return ExpandError.MalformedMacroCall;
+            }
+            if (fixed_count > max_fixed) max_fixed = fixed_count;
+            try arities.append(ctx.allocator, info);
+        }
     }
-    // Variadic overload must take MORE args than any fixed overload.
-    if (variadic_seen) |i| {
-        if (arities.items[i].fixed < max_fixed) return ExpandError.MalformedMacroCall;
+    if (variadic) |v| {
+        if (v.fixed < max_fixed) return ExpandError.MalformedMacroCall;
     }
 
-    // Build the dispatcher body. Synthesize symbols.
     const args_sym = try genTempSym(ctx, call_form.origin);
     const n_sym = try genTempSym(ctx, call_form.origin);
 
-    // Innermost else: (throw :arity-mismatch).
+    // Innermost: the variadic clause when present, else the throw;
+    // then the fixed clauses wrap it in reverse so source order
+    // is tested first.
     var current_else: *Form = try buildThrowArity(ctx, call_form.origin);
-
-    // Walk overloads in REVERSE so the first one becomes outermost.
-    // Variadic goes innermost-after-fixed for correctness (its
-    // condition is "argc >= variadic.fixed").
-    // Strategy: emit fixed clauses first (in reverse), then wrap
-    // variadic clause as the outermost so it catches argc >=
-    // variadic.fixed when no fixed clause matched. Actually
-    // simplest: emit ALL clauses outermost-to-innermost in
-    // user-declared order. Build by walking REVERSE order, each
-    // step wrapping current_else in `(if cond then current_else)`.
+    if (variadic) |v| {
+        current_else = try buildArityBranch(ctx, call_form.origin, args_sym, n_sym, v.params.datum.vector, v.fixed, true, v.body, current_else);
+    }
     var i: usize = arities.items.len;
     while (i > 0) {
         i -= 1;
         const a = arities.items[i];
-        const params = a.params.datum.vector;
-        // Build the let* with param bindings.
-        const then_form = try buildArityThen(ctx, call_form.origin, args_sym, params, a.fixed, a.variadic, a.body);
-        // Build the condition: fixed → (= n K); variadic → (< (- K 1) n) for "at least K-1 args".
-        const cond_form = if (a.variadic)
-            try buildVariadicCondition(ctx, call_form.origin, n_sym, a.fixed)
-        else
-            try buildFixedCondition(ctx, call_form.origin, n_sym, a.fixed);
-        // Wrap: (if cond then current_else).
-        const if_items = try ctx.allocator.alloc(*Form, 4);
-        if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
-        if_items[1] = cond_form;
-        if_items[2] = then_form;
-        if_items[3] = current_else;
-        current_else = try makeList(ctx, if_items, call_form.origin);
+        current_else = try buildArityBranch(ctx, call_form.origin, args_sym, n_sym, a.params.datum.vector, a.fixed, false, a.body, current_else);
     }
 
-    // Build (let* [n_sym (count args_sym)] current_else).
-    const let_bindings = try ctx.allocator.alloc(*Form, 4);
-    let_bindings[0] = n_sym;
+    // (let* [n_sym (count args_sym)] current_else)
     const count_items = try ctx.allocator.alloc(*Form, 2);
     count_items[0] = try makeSymbol(ctx, "count", call_form.origin);
     count_items[1] = args_sym;
+    const let_bindings = try ctx.allocator.alloc(*Form, 2);
+    let_bindings[0] = n_sym;
     let_bindings[1] = try makeList(ctx, count_items, call_form.origin);
-    const let_binds_vec = try makeVector(ctx, let_bindings[0..2], call_form.origin);
     const let_items = try ctx.allocator.alloc(*Form, 3);
     let_items[0] = try makeSymbol(ctx, "let*", call_form.origin);
-    let_items[1] = let_binds_vec;
+    let_items[1] = try makeVector(ctx, let_bindings, call_form.origin);
     let_items[2] = current_else;
     const let_form = try makeList(ctx, let_items, call_form.origin);
 
-    // Build outer (fn name [& args_sym] let_form).
+    // (fn name? [& args_sym] let_form)
     const fn_params_items = try ctx.allocator.alloc(*Form, 2);
     fn_params_items[0] = try makeSymbol(ctx, "&", call_form.origin);
     fn_params_items[1] = args_sym;
     const fn_params_vec = try makeVector(ctx, fn_params_items, call_form.origin);
-    const fn_items = try ctx.allocator.alloc(*Form, 4);
+    const fn_len: usize = if (name_form != null) 4 else 3;
+    const fn_items = try ctx.allocator.alloc(*Form, fn_len);
     fn_items[0] = try makeSymbol(ctx, "fn", call_form.origin);
-    fn_items[1] = @constCast(name_form);
-    fn_items[2] = fn_params_vec;
-    fn_items[3] = let_form;
-    const fn_form = try makeList(ctx, fn_items, call_form.origin);
+    var idx: usize = 1;
+    if (name_form) |n| {
+        fn_items[idx] = @constCast(n);
+        idx += 1;
+    }
+    fn_items[idx] = fn_params_vec;
+    fn_items[idx + 1] = let_form;
+    return try makeList(ctx, fn_items, call_form.origin);
+}
 
-    return try buildDefForm(ctx, call_form, name_form, fn_form);
+/// `(if <argc test> <clause body over its params> else_form)` for
+/// one overload clause.
+fn buildArityBranch(
+    ctx: *ExpandContext,
+    origin: reader_mod.SrcSpan,
+    args_sym: *Form,
+    n_sym: *Form,
+    params: []const *Form,
+    fixed: usize,
+    variadic: bool,
+    body: []const *Form,
+    else_form: *Form,
+) ExpandError!*Form {
+    const then_form = try buildArityThen(ctx, origin, args_sym, params, fixed, variadic, body);
+    const cond_form = if (variadic)
+        try buildVariadicCondition(ctx, origin, n_sym, fixed)
+    else
+        try buildFixedCondition(ctx, origin, n_sym, fixed);
+    const if_items = try ctx.allocator.alloc(*Form, 4);
+    if_items[0] = try makeSymbol(ctx, "if", origin);
+    if_items[1] = cond_form;
+    if_items[2] = then_form;
+    if_items[3] = else_form;
+    return try makeList(ctx, if_items, origin);
 }
 
 fn buildThrowArity(ctx: *ExpandContext, origin: reader_mod.SrcSpan) ExpandError!*Form {
