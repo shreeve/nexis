@@ -292,7 +292,7 @@ pub const Relation = struct {
     }
 
     /// The set of distinct row indexes of `self`, as a hash index from
-    /// row hash to the first row with that content.
+    /// row hash to the rows with that hash, compared for equality.
     const RowSet = struct {
         rel: *const Relation,
         map: std.AutoHashMapUnmanaged(u64, std.ArrayList(usize)) = .empty,

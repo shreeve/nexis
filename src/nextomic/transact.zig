@@ -1,31 +1,31 @@
 //! transact.zig — the transaction protocol (NEXTOMIC.md §3).
 //!
 //! One `transact` is one emdb write transaction; emdb's write lock is
-//! the transactor. The pipeline:
+//! the transactor. The pipeline, named as the banners below name it:
 //!
-//!   1. begin the write transaction, `t = sys["t"] + 1`;
-//!   2. normalise tx-data to ops (vector forms, map forms with nested
-//!      entities and card-many collections), resolving attributes through
-//!      the schema at `now` and converting values by the attribute's type;
-//!   3. bind tempids: `:db/ident` binds to the ident's id (minting it),
-//!      unique-identity assertions upsert through an AVET probe (a
-//!      tempid- or lookup-ref-valued claim once its value is known),
-//!      two tempids naming one identity unify, the rest take fresh eids;
-//!   4. expand ops in order against the committed trees plus the
-//!      transaction's own overlay: card-one implicit retracts, no-op
-//!      re-assertions, conflicts, unique-value collisions, lookup refs,
-//!      retract-attribute, retract-entity with VAET cleanup and component
-//!      cascade, then the `:db/txInstant` datom unless the tx-data
-//!      asserted one on the transaction entity;
-//!   5. validate schema changes and backfill AVET for attributes that
-//!      become indexed or unique;
-//!   6. write the eight index trees, the txlog, the counts and `sys`;
-//!   7. commit, then publish minted idents to the cache.
+//!   - begin: the write transaction, `t = sys["t"] + 1`;
+//!   - normalise: tx-data to ops (vector forms, map forms with nested
+//!     entities and card-many collections), resolving attributes through
+//!     the schema at `now` and converting values by the attribute's type;
+//!   - tempids: `:db/ident` binds to the ident's id (minting it),
+//!     unique-identity assertions upsert through an AVET probe (a
+//!     tempid- or lookup-ref-valued claim once its value is known),
+//!     two tempids naming one identity unify, the rest take fresh eids;
+//!   - expand: ops in order against the committed trees plus the
+//!     transaction's own overlay: card-one implicit retracts, no-op
+//!     re-assertions, conflicts, unique-value collisions, lookup refs,
+//!     retract-attribute, retract-entity with VAET cleanup and component
+//!     cascade, then the `:db/txInstant` datom unless the tx-data
+//!     asserted one on the transaction entity;
+//!   - schema: validate schema changes and backfill AVET for attributes
+//!     that become indexed or unique;
+//!   - write: the eight index trees, the txlog, the counts and `sys`;
+//!   - commit: then publish minted idents to the cache.
 //!
 //! Any error aborts the write transaction; nothing partial can exist.
 //! Everything the transaction allocates lives in the caller's arena.
 //!
-//! A speculative `with` runs steps 1-6 and stops: the write transaction
+//! A speculative `with` stops before the commit: the write transaction
 //! stays open, a view connection reads it through read-only children,
 //! and `finish` aborts it. Only one write transaction exists per store,
 //! so `transact` and `with` are `error.Nested` while one is held.
@@ -818,8 +818,9 @@ const Ctx = struct {
         return self.commit();
     }
 
-    /// Steps 3-6: everything up to the commit, leaving the write
-    /// transaction open with the datoms, txlog and counters written.
+    /// Everything after normalisation and before the commit, leaving
+    /// the write transaction open with the datoms, txlog and counters
+    /// written.
     fn apply(self: *Ctx) !void {
         try self.bindTempids();
         try self.expandAll();
@@ -828,7 +829,7 @@ const Ctx = struct {
         try self.write();
     }
 
-    /// Step 7: commit, then publish the mints and update the schema
+    /// Commit, then publish the mints and update the schema
     /// cache, and report. Everything that can fail (the report's tempid
     /// bindings, the tx-data, room in the ident cache) is prepared
     /// before the commit; after it only infallible steps remain, so a
@@ -862,7 +863,7 @@ const Ctx = struct {
         };
     }
 
-    // ── step 3: tempids ───────────────────────────────────────────
+    // ── tempids ───────────────────────────────────────────────────
 
     fn bindTempids(self: *Ctx) !void {
         // `:db/ident` names the entity: its id is the ident's id.
@@ -1010,7 +1011,7 @@ const Ctx = struct {
         };
     }
 
-    // ── step 4: expand ────────────────────────────────────────────
+    // ── expand ────────────────────────────────────────────────────
 
     fn expandAll(self: *Ctx) !void {
         // Room for one datom per op and the transaction's instant; a
@@ -1216,7 +1217,7 @@ const Ctx = struct {
         try self.expandAdd(tx, attr, .{ .instant = self.now_ms });
     }
 
-    // ── step 5: schema ────────────────────────────────────────────
+    // ── schema ────────────────────────────────────────────────────
 
     /// Attribute entities: a new attribute needs `:db/valueType` and
     /// `:db/cardinality`; an existing one keeps both; adding
@@ -1331,7 +1332,7 @@ const Ctx = struct {
         }
     }
 
-    // ── step 6: write ─────────────────────────────────────────────
+    // ── write ─────────────────────────────────────────────────────
 
     fn write(self: *Ctx) !void {
         const store = self.conn.store;

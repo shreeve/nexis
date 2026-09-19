@@ -215,7 +215,8 @@ pub const Store = struct {
         return self;
     }
 
-    /// Close and free the store. Idempotent.
+    /// Close the environment, if it is still open, and free the store.
+    /// Called once; the connection owns the store.
     pub fn close(self: *Store) void {
         if (self.is_open) {
             self.env.close();
