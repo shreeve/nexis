@@ -1,35 +1,30 @@
-## VECTOR.md — Persistent Vector Heap Kind (Phase 1)
+## VECTOR.md — Persistent Vector Heap Kind
 
-**Status**: Phase 1 deliverable. Authoritative body-layout and semantic
-contract for the `persistent_vector` heap kind. Derivative from
+Authoritative body-layout and semantic contract for the `persistent_vector` heap kind. Derivative from
 `PLAN.md` §9.2 + §23 #30, `docs/VALUE.md` §2.2, `docs/SEMANTICS.md`
-§2.6 / §3.2 (as amended in `accbb83` for shared sequential hash
-domain), `docs/HEAP.md`, and `docs/LIST.md`. Those documents win on
+§2.6 / §3.2 (shared sequential hash domain), `docs/HEAP.md`, and `docs/LIST.md`. Those documents win on
 conflict.
 
-This is the **second sequential collection kind** and the first direct
-stress test of the cross-kind sequential equality/hash story the
-architecture committed to two sessions ago. It lands with:
+This is the **second sequential collection kind** and the direct
+stress test of the cross-kind sequential equality/hash story. It
+consists of:
 
-1. A **streaming cursor abstraction** (peer-AI turn-7 review) that
-   replaces the `count + nth` proposal — sequential equality across
+1. A **streaming cursor abstraction** — sequential equality across
    kinds is streaming ordered traversal, not random-access-by-index.
-   This sets the pattern for lazy-seq / cons / any future sequential.
+   This is the pattern for cons / any sequential kind.
 2. A **4-subkind representation** for root / interior / leaf / tail,
    each a distinct subkind within `kind = .persistent_vector`. This
    cleanly separates the "exactly 32 values" leaf invariant from the
-   "0..32 values, partial" tail invariant, and gives the future GC a
+   "0..32 values, partial" tail invariant, and gives the collector a
    per-subkind trace dispatch.
-3. The **critical cross-kind property test**: `(= (list 1 2 3) [1 2 3])`
-   and `(hash (list 1 2 3)) == (hash [1 2 3])` land green. If that
-   passes, the architectural composition risk peer-AI flagged as the
-   primary hidden fault line is retired.
+3. The **cross-kind property test**: `(= (list 1 2 3) [1 2 3])` and
+   `(hash (list 1 2 3)) == (hash [1 2 3])` hold.
 
-Scope-frozen commitment: **this module ships construction +
-canonical trie/tail representation + core accessors + cross-kind
-integration only.** `assoc`, `pop`, `subvec`, `concat`, transients,
-and the small-vector-inline (subkind 0) space optimization are
-deferred to later commits.
+**The module provides construction, the canonical trie/tail
+representation, `conj`, `assoc`, `nth`, `count`, the cursor and
+cross-kind integration.** `pop`, `subvec`, `concat` and the
+small-vector-inline (subkind 0) space optimization do not exist;
+transients wrap the persistent ops (`docs/TRANSIENT.md`).
 
 ---
 
@@ -74,7 +69,7 @@ deferred to later commits.
 
 VALUE.md §2.2 names persistent_vector as kind 20 with "0 = inline
 (≤32); 1 = trie + tail." This commit extends that with two internal
-subkinds peer-AI turn-7 refined:
+subkinds:
 
 | Subkind | Name          | Role                                                       |
 |---------|---------------|------------------------------------------------------------|
@@ -131,7 +126,7 @@ element lives in the tail (e.g., `count == 5 → tail_len == 5`, not
 
 ---
 
-### 4. Cursor abstraction (peer-AI turn-7 recommendation)
+### 4. Cursor abstraction
 
 The architectural pattern for cross-kind sequential equality is
 **streaming ordered traversal**, not random-access. Each sequential
@@ -151,8 +146,8 @@ pub const Cursor = struct {
 ```
 
 For v1 the vector cursor uses `nth(v, i)` per step (O(log₃₂ n) per
-call). Total list↔vector equality is O(n · log₃₂ n). A Phase 6
-optimization can rewrite the cursor to track current leaf and local
+call). Total list↔vector equality is O(n · log₃₂ n). An
+optimization could rewrite the cursor to track current leaf and local
 offset, reducing to O(n) amortized, without changing the public
 `Cursor.init` / `Cursor.next` shape.
 
@@ -196,16 +191,15 @@ fn sequentialEqual(a: Value, b: Value) bool {
 Where `seqCursorInit(v)` returns a union-of-cursors dispatching on
 `v.kind()`. The cursor pattern is **not** exposed as a public
 language-level API in v1 — it's an internal composition tool for
-dispatch. A user-facing `seq` abstraction is PLAN §6.7 / Phase 3
-work.
+dispatch. The user-facing `seq` natives in `src/stdlib.zig` are
+built on it (PLAN §6.7).
 
 ---
 
 ### 5. Public API
 
-Lives in `src/coll/vector.zig` (renamed from `rrb.zig` on 2026-05-16,
-peer-AI turn 52, to match the user-facing concept; the v1
-impl is plain trie, not RRB, per PLAN §23 #30).
+Lives in `src/coll/vector.zig` (a plain trie, not RRB, per PLAN §23
+#30).
 
 ```zig
 pub fn empty(heap: *Heap) !value.Value;
@@ -229,7 +223,7 @@ pub const Cursor = struct { ... };
 
 ---
 
-### 6. Implementation traps (peer-AI turn-7 catalogue)
+### 6. Implementation traps
 
 Each of these is a classic Clojure-PersistentVector implementer
 misstep; the impl + tests must cover all of them explicitly.
@@ -309,8 +303,7 @@ terminal depending on every heap kind, this is additive.
 
 ### 9. Testing strategy
 
-**The cross-kind invariant test** (the commit's retirement receipt
-for peer-AI's #1 hidden fault line):
+**The cross-kind invariant test**:
 
 ```zig
 test "cross-kind: (list 1 2 3) and [1 2 3] are = and share hashValue" {
@@ -362,14 +355,14 @@ list/vector cross-kind equality:
 
 ### 10. What VECTOR.md does not cover
 
-- **`assoc n v`, `pop`, `subvec`, `concat`** — each lands in its own
-  commit with its own invariants.
-- **Transients** — lands with the transients module alongside map/set.
-- **RRB relaxation** — v2+ per PLAN §23 #30.
-- **Small-vector inline (subkind 0)** — Phase 6 space optimization.
-- **Language-surface `seq` API** — PLAN §6.7 / Phase 3.
+- **`pop`, `subvec`, `concat`** — do not exist (`assoc n v` does, §5).
+- **Transients** — `docs/TRANSIENT.md`.
+- **RRB relaxation** — absent per PLAN §23 #30.
+- **Small-vector inline (subkind 0)** — reserved, no implementation.
+- **Language-surface `seq` API** — PLAN §6.7; natives in
+  `src/stdlib.zig`.
 - **Iteration in user code** — user-facing iteration via `map`,
-  `reduce`, `for`, etc. lives in stdlib macros / core.nx (Phase 3).
-- **Print/read round-trip for vectors** — reader already parses
-  `[1 2 3]`; the runtime → textual direction reuses the pretty-printer
-  when the full Value-print story lands.
+  `reduce`, `for`, etc. lives in `src/stdlib.zig` and
+  `src/stdlib/core.nx`.
+- **Print/read round-trip for vectors** — the reader parses
+  `[1 2 3]`; `src/format.zig` (`formatVector`) prints it.
