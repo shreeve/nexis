@@ -259,19 +259,20 @@ pub const Rule = struct {
 /// site renames them into the plan's. Invariants:
 ///   - Rules with one name are contiguous in `rules`, in source order
 ///     (`parse.zig` groups them), so `byName` is one slice.
+///   - A set with `arena_state` owns its rules and is freed by
+///     `deinit`; one without (`no_rules`, or a set a test builds over
+///     static rules) is not, and `deinit` is a no-op.
 pub const RuleSet = struct {
-    arena_state: std.heap.ArenaAllocator,
+    arena_state: ?std.heap.ArenaAllocator,
     vars: []const VarInfo,
     rules: []const Rule,
 
     pub fn deinit(self: *RuleSet) void {
-        const gpa = self.arena_state.child_allocator;
-        self.arena_state.deinit();
-        gpa.destroy(self);
-    }
-
-    pub fn arena(self: *RuleSet) Allocator {
-        return self.arena_state.allocator();
+        if (self.arena_state) |*state| {
+            const gpa = state.child_allocator;
+            state.deinit();
+            gpa.destroy(self);
+        }
     }
 
     /// Every rule named `name`, or null.
@@ -291,7 +292,7 @@ pub const RuleSet = struct {
 
 /// The empty rule set, for queries without `%`.
 pub const no_rules: RuleSet = .{
-    .arena_state = undefined,
+    .arena_state = null,
     .vars = &.{},
     .rules = &.{},
 };

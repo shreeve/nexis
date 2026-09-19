@@ -76,8 +76,8 @@ pub fn parseRules(gpa: Allocator, interner: *Interner, rules: Value, diag: *Diag
     const out = try gpa.create(RuleSet);
     errdefer gpa.destroy(out);
     out.* = .{ .arena_state = std.heap.ArenaAllocator.init(gpa), .vars = &.{}, .rules = &.{} };
-    errdefer out.arena_state.deinit();
-    var p = Parser{ .arena = out.arena_state.allocator(), .interner = interner, .diag = diag };
+    errdefer out.arena_state.?.deinit();
+    var p = Parser{ .arena = out.arena_state.?.allocator(), .interner = interner, .diag = diag };
     out.rules = try p.parseRuleSet(rules);
     out.vars = try p.vars.toOwnedSlice(p.arena);
     return out;
@@ -800,7 +800,8 @@ test "rules parse with required groups and arity checks; caches hit by identity 
     try testing.expectEqual(@as(usize, 2), rs.rules[1].head.len);
     try testing.expectEqual(@as(usize, 2), rs.byName(rs.rules[0].name).?.len);
 
-    // Interleaved names are grouped, bodies in source order.
+    // Interleaved names are grouped, bodies in source order, and the
+    // empty set frees nothing.
     const mixed = b.vec(&.{
         b.vec(&.{ b.lst(&.{ b.sym("r"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(1) }) }),
         b.vec(&.{ b.lst(&.{ b.sym("s"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(2) }) }),
@@ -820,6 +821,8 @@ test "rules parse with required groups and arity checks; caches hit by identity 
     try testing.expectEqual(@as(i64, 2), rs_s[0].body[0].pattern.v.constant.cell.int);
     try testing.expectEqual(@as(i64, 4), rs_s[1].body[0].pattern.v.constant.cell.int);
     try testing.expect(ms.byName(try interner.internSymbol("t")) == null);
+    var empty = ir.no_rules;
+    empty.deinit();
 
     const bad = b.vec(&.{
         b.vec(&.{ b.lst(&.{ b.sym("r"), b.sym("?a") }), b.vec(&.{ b.sym("?a"), b.kw("edge"), b.int(1) }) }),

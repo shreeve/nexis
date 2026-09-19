@@ -614,7 +614,7 @@ test "call graph: self loop, mutual recursion, acyclic" {
         .{ .name = 4, .required = 0, .head = &.{}, .body = &.{ call.c(1), call.c(2) } },
         .{ .name = 5, .required = 0, .head = &.{}, .body = &.{} },
     };
-    const set: RuleSet = .{ .arena_state = undefined, .vars = &.{}, .rules = &rules };
+    const set: RuleSet = .{ .arena_state = null, .vars = &.{}, .rules = &rules };
     const info = try analyze(arena, &set);
     try testing.expect(info.isRecursive(1));
     try testing.expect(info.isRecursive(2) and info.isRecursive(3));
@@ -636,7 +636,7 @@ test "pass-through positions" {
             .{ .pattern = .{ .e = .{ .variable = 2 }, .a = .blank, .v = .{ .variable = 1 } } },
         } },
     };
-    const set: RuleSet = .{ .arena_state = undefined, .vars = &.{}, .rules = &rules };
+    const set: RuleSet = .{ .arena_state = null, .vars = &.{}, .rules = &rules };
     try testing.expect(try passThrough(arena, &set, 1, 0));
     try testing.expect(!try passThrough(arena, &set, 1, 1));
 }
