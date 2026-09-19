@@ -450,12 +450,15 @@ row hash, sized up front.
 Estimates come from `treeStat` and per-attribute counts kept in
 `Schema`.
 
-**Sources.** `:in` starts with `$`; further `$name` bindings (`$2`,
-`$hist`) take db values, positional like every input, and may name
-another connection or a time view of the same one. A data pattern, a
-`missing?` or `get-else` call, or a rule call prefixed with a source
-reads it: `[$2 ?e :a ?v]`, `[(missing? $2 ?e :a)]`, `($2 rule ?x)`; an
-unprefixed clause reads `$`. A rule body writes `$` or nothing and reads
+**Sources.** `:in` starts with a data source, `$` or any `$name`
+(`:in $db ?x`); further `$name` bindings (`$2`, `$hist`) take db
+values, positional like every input, and may name another connection
+or a time view of the same one. A data pattern, a `missing?` or
+`get-else` call, or a rule call prefixed with a source reads it: `[$2
+?e :a ?v]`, `[(missing? $2 ?e :a)]`, `($2 rule ?x)`; an unprefixed
+clause reads the first source, and so does `$`, whatever `:in` calls
+it, so `$` is declared first or not at all (`:nextomic/query-syntax`
+elsewhere). A rule body writes `$` or nothing and reads
 the source its call names, so one rule set serves every source; a
 recursive component runs under one source. Each source is one read
 transaction for the whole query; attributes, idents, lookup refs and
@@ -583,7 +586,8 @@ Schema install is `transact!` of attribute entities: `{:db/ident
 :db.cardinality/one :db/unique :db.unique/identity :db/index true}`;
 what a later transaction may change is §3 step 5.
 
-Later: a datom heap kind.
+There is no datom heap kind: a datom is the vector `[e a v t added]`
+every read returns.
 
 ---
 
@@ -685,19 +689,29 @@ the `Env`.
 
 ---
 
-## 9. Runtime prerequisites
+## 9. What the runtime provides
 
-- **Page size pinned** and the `db.zig` double free fixed (blocking; the
-  seam work).
-- **VM stack invariant on nested calls** (blocking for user-function
-  predicates and transaction functions; built-in predicates need
-  nothing).
-- **GC**: every Nextomic operation allocates in its own arena and
-  copies only results into the VM heap; the collector's only demands
-  here are the cache clearing above and the `q` hook rooting every
-  user-function result for the query's life (`docs/GC.md` §3).
-- **Number tower**: blocking only for double predicates and aggregates.
-  Doubles are storable from the start.
+- **Page size**: every store is created with 16 KiB pages (`db.zig`
+  `page_size`, `store.zig`); emdb reads a file's page size from its
+  meta, so a store is never opened another way and the 4078-byte key
+  bound of §2 holds on every platform.
+- **Memory**: every operation allocates in its own arena and copies
+  only results into the VM heap (§1 commitment 8); the arena dies with
+  the operation on every path out of it, a throw included.
+- **The collector**: the query caches (§5) hold query values by
+  address, so a cycle empties them through `vm.nextomic_query_clear`,
+  deferred to the query's return while one is in flight; the `q` hook
+  roots every user-function result for the query's life; the entity
+  box keeps its db box and the map of its last full read reachable
+  (`docs/GC.md` §3, §11.5).
+- **Nested calls**: user-function predicates, custom aggregates and
+  transaction functions run through `vm.callValue` from inside a
+  native; a throw inside them unwinds through the native, which
+  closes its read transaction or aborts its write on the way out
+  (§3, §5).
+- **Numbers**: `long` and `double` are the stored numeric types; a
+  predicate or aggregate compares and sums them numerically across the
+  two (§5).
 
 ---
 
@@ -725,3 +739,15 @@ Two wishes noted and worked around, so that the engine stays untouched:
    page): index trees carry only `[t]` in current trees and nothing in
    history trees; out-of-line payloads and txlog entries are read with
    `Txn.getFromTree` on the exact key, which assembles every page.
+
+---
+
+## 12. Differences from Datomic
+
+- **An ident rename retires the old keyword in every view.** An
+  ident's text is a property of its id, not a datom value (§2.1, §3
+  step 5): after `[:db/add :person/name :db/ident :person/full-name]`
+  every view spells the attribute `:person/full-name`, an as-of view
+  before the rename included, and `:person/name` names nothing
+  anywhere and is never minted again. Datomic keeps the old ident
+  resolving to the entity beside the new one.
