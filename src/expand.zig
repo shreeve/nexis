@@ -1414,9 +1414,12 @@ fn expandRequire(
 
 /// Unwrap one level of `(quote X)` from a Form. Returns X if
 /// the form is a quote; else returns the form unchanged.
+/// The form under one level of quoting: the reader's `'x` datum or
+/// the written-out `(quote x)`; any other form is itself.
 fn unwrapQuote(form: *const Form) *const Form {
     return switch (form.datum) {
         .quote => |inner| inner,
+        .list => |items| if (items.len == 2 and items[0].datum == .symbol and items[0].datum.symbol.ns == null and std.mem.eql(u8, items[0].datum.symbol.name, "quote")) items[1] else form,
         else => form,
     };
 }
