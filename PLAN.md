@@ -1940,12 +1940,14 @@ Clojure-compatibility breadth:
 - [x] `nexis.core` breadth: `src/stdlib/core.nx` (`doseq` / `while` / `letfn` / `if-not`, `cond->` / `some->` / `as->`, `merge` / `update` / `get-in` / `assoc-in` / `update-in` / `merge-with`, `frequencies` / `group-by` / `interpose` / `juxt` / `fnil` / `comp` / `partial` / `constantly` / `complement`, `every?` / `some` / `not-any?`) plus the native sequence library in `src/stdlib.zig` (`partition`, `distinct`, `zipmap`, `sort-by`, `reductions`, `iterate`, `select-keys`, ...).
 - [x] `examples/shapes-app.nx`, a multi-file protocols + records + atoms application.
 
-Tooling (open, ranked in `HANDOFF.md` §4):
+Tooling (`docs/TOOLING.md`):
 
-- [ ] `nexis.test`, `nexis.pprint`, `nexis.math`, `nexis.repl`.
-- [ ] `nexis --compile` / `--run` / `--disasm` subcommands.
-- [ ] Test runner.
-- [ ] Source-mapped stack traces end-to-end.
+- [x] `nexis.test`, `nexis.pprint`, `nexis.math` (`src/stdlib/{test,pprint,math}.nx`, `src/stdlib.zig` `math_fns`).
+- [ ] `nexis.repl`.
+- [x] `nexis disasm` / `--disasm` (`src/disasm.zig`).
+- [ ] `nexis --compile` / `--run` of object files.
+- [x] Test runner: `deftest` / `is` / `testing` / `run-tests` / `run-all-tests`.
+- [x] Source-mapped stack traces end-to-end: a PC → span table per Routine, the frame chain recorded when an error leaves `run`, `file:line:col` with caret and `at` lines in the CLI.
 
 ### Nextomic — Datomic-class database
 

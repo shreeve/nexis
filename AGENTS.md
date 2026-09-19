@@ -17,7 +17,8 @@ and the layout.
 binary: datoms in eleven emdb named trees, logical transaction numbers
 in the history keys, Datalog `q`, `pull`, `as-of`/`since`/`history`,
 speculative `with`. `bin/nexis run FILE.nx` and `bin/nexis repl` run
-real programs. Zero changes to emdb.
+real programs and `bin/nexis disasm FILE.nx` shows their bytecode.
+Zero changes to emdb.
 
 ---
 
@@ -34,15 +35,17 @@ real programs. Zero changes to emdb.
 4. `CLOJURE-REVIEW.md` — what nexis takes, adapts and rejects from
    Clojure's source.
 5. `docs/FORMS.md`, `docs/SEMANTICS.md`, `docs/COMPILER.md`,
-   `docs/VM.md`, `docs/DB.md` — the per-layer contracts; `docs/README.md`
-   maps every module to its spec.
+   `docs/VM.md`, `docs/DB.md` — the per-layer contracts;
+   `docs/TOOLING.md` the error report, disassembler, test runner,
+   `pprint` and `math`; `docs/README.md` maps every module to its
+   spec.
 6. `ZIG-0.16.0.md` — mandatory before writing Zig.
 
 ---
 
 ## Build steps
 
-- `zig build install` — `bin/nexis` (`run`, `repl`, `--help`) and
+- `zig build install` — `bin/nexis` (`run`, `repl`, `disasm`, `--help`) and
   `bin/nexis-golden`.
 - `zig build quick` — the inner loop (seconds to a minute): the language
   binaries, the compile property tests, the eval-pipeline integration
@@ -114,8 +117,8 @@ nexis/
 │   ├── coll/                    champ, vector, list, transient
 │   ├── string.zig, bignum.zig, codec.zig, format.zig, atom.zig, record.zig, protocol.zig, dispatch.zig
 │   ├── db.zig                   emdb connection, durable refs, txn handles
-│   ├── stdlib.zig, stdlib/*.nx  native tables; core.nx and nextomic.nx embedded at build
-│   ├── loader.zig, cli.zig, bench.zig, golden.zig
+│   ├── stdlib.zig, stdlib/*.nx  native tables; core, nextomic, test, pprint and math .nx embedded at build
+│   ├── loader.zig, cli.zig, disasm.zig, bench.zig, golden.zig
 │   └── nextomic/                key datom store idents schema transact db handle
 │                                marshal relation pull natives query.zig query/{ir,parse,plan,exec,rules,natives}
 ├── docs/                        one spec per module; NEXTOMIC.md for the database

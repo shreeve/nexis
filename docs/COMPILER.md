@@ -961,6 +961,8 @@ the VM's namespace, interner and macro table.
 - `docs/SEMANTICS.md` — equality, hash, numeric edges
   (runtime-side; compiler must respect).
 - `docs/VALUE.md` — heap kinds; `function` is kind 22.
+- `docs/TOOLING.md` — what the §8 span table serves: located
+  runtime errors and `nexis disasm`.
 - `../em/docs/architecture/PIPELINE.md` — em compiler pipeline
   (template; nexis adapts for macros + closures + persistent
   collections).

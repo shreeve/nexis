@@ -35,7 +35,7 @@ wins and the code is wrong.
 | `src/atom.zig` | [`ATOM.md`](ATOM.md) | In-memory mutable cells: `atom` / `swap!` / `reset!` / `compare-and-set!` |
 | `src/protocol.zig`, `src/record.zig` | [`PROTOCOLS.md`](PROTOCOLS.md) | Records + protocols: per-VM registries, `defrecord` / `defprotocol` / `extend-*` dispatch |
 | `src/loader.zig` | (in [`MACROEXPAND.md`](MACROEXPAND.md) §2b) | `(require ...)` file loading: ns-to-path mapping, load path, cycle detection |
-| `src/stdlib.zig`, `src/stdlib/*.nx` | (no dedicated spec) | Native functions + the embedded `nexis.core` / `nextomic` sources; `stdlib/README.md` |
+| `src/stdlib.zig`, `src/stdlib/*.nx` | [`TOOLING.md`](TOOLING.md) §3–§4 for `test.nx`, `pprint.nx`, `math.nx` | Native functions + the embedded `nexis.core` / `nextomic` / `nexis.test` / `nexis.pprint` / `nexis.math` sources |
 | `src/format.zig` | (in [`STRING.md`](STRING.md) §9) | Value printing (`pr-str` / `str` modes) |
 | `src/nextomic/*` | [`NEXTOMIC.md`](NEXTOMIC.md) | The database: store layout, transactions, db-values and time, query pipeline, pull, Lisp API, errors |
 | `src/parser.zig` | (no dedicated spec) | **Generated** from `nexis.grammar` by the external `nexus` tool. Do not edit by hand. |

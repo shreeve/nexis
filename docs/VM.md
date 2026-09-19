@@ -1117,6 +1117,8 @@ Three layers, paralleling `COMPILER.md` §9:
   VM must respect.
 - `docs/GC.md` — the collector, and why the VM never runs it.
 - `docs/PROTOCOLS.md` — `protocol_fn` dispatch.
+- `docs/TOOLING.md` — the runtime error report built on §13's
+  trace and the disassembler that reads §5's tables.
 - `../em/docs/architecture/ISA.md` — em's ISA (adapted).
 - `../em/docs/architecture/RUNTIME.md` — em's VM runtime
   (adapted).

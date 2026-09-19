@@ -29,7 +29,7 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Reader | Grammar-driven parser, canonical Form schema, pretty-printer, golden tests |
 | Runtime core | 16-byte tagged Value, CHAMP map/set, 32-way persistent vector, list, transients, bignum kind, codec, precise mark-sweep collector (`src/gc.zig`; see Known gaps) |
 | Compiler + VM | Form → Tiny IR → 64-bit bytecode; slot VM with closures, `recur`, `letfn*`, try/catch/finally, catchable VM errors as keywords; a frame restores its entry stack length on return and unwind |
-| Errors | Compile errors carry `file:line:col` and a source caret; a symbol that names nothing is `UnresolvedSymbol` at its own span |
+| Errors | Compile errors carry `file:line:col` and a source caret; a symbol that names nothing is `UnresolvedSymbol` at its own span; a runtime error is reported at its instruction's `file:line:col` with the caret and a stack trace, one `at f (file:line:col)` line per frame ([`docs/TOOLING.md`](docs/TOOLING.md) §1) |
 | Macros | Host macros, user `defmacro` (compile-time sub-VM), syntax-quote with `~`/`~@`/auto-gensym, procedural macros over native fns, qualified macro heads (`alias/name`) |
 | Namespaces | `(ns NAME)`, qualified symbols and keywords (`:person/name`), `require` with `:as`, ns-to-file loading, cycle detection |
 | Numbers | Integers of any size (48-bit fixnums promote to bignums and demote back) and f64 with Clojure contagion; `(= 1 1.0)` is `false`, `(== 1 1.0)` is `true`; `/` on two integers yields a float when inexact; `:divide-by-zero` is catchable |
@@ -39,7 +39,7 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Clojure breadth | Atoms (`atom`/`swap!`/`reset!`/`compare-and-set!`), `str`/`subs`/`print`/`println`/`slurp`/`spit`, records, protocols, `extend-protocol`/`extend-type`/`satisfies?`, `case`/`condp`/`for` |
 | Durable refs (`db/*`) | Refs backed by emdb named trees: `db/open`/`db/ref`/`db/put-key!`/`db/get-key`, `with-tx`/`with-read-tx` with rollback on throw, `@deref`, `db/alter!`, `db/scan`, `db/reduce-tree`, MVCC snapshots via `with-snapshot`; page size pinned to 16 KiB, tree ids cached per connection, engine failures as named `:db/*` keywords |
 | Nextomic | The `nextomic` namespace: `connect`/`release`/`db`/`basis-t`/`transact!`/`entity`/`entid`/`ident`/`datoms`/`as-of`/`since`/`history`/`tx-range`/`schema`/`sync`/`q`/`explain`/`pull`/`pull-many`/`with`, `with-conn`; every error catchable by `try` (the taxonomy is under Nextomic below). Spec: [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) |
-| Tooling | `nexis run FILE.nx`, `nexis repl`, `zig build bench` (ReleaseFast harness, [`docs/BENCH.md`](docs/BENCH.md)), `zig build golden` |
+| Tooling | `nexis run FILE.nx`, `nexis repl`, `nexis disasm FILE.nx` (every routine's bytecode with source positions), `nexis.test` (`deftest`/`is`/`testing`/`run-tests`), `nexis.pprint`, `nexis.math` ([`docs/TOOLING.md`](docs/TOOLING.md)), `zig build bench` (ReleaseFast harness, [`docs/BENCH.md`](docs/BENCH.md)), `zig build golden` (reader goldens and pinned CLI output) |
 
 ## Build & run
 
@@ -48,6 +48,7 @@ zig build install                  # bin/nexis, bin/nexis-golden
 
 ./bin/nexis run examples/hello.nx  # run a file
 ./bin/nexis repl                   # interactive REPL
+./bin/nexis disasm examples/sum10.nx  # every routine's bytecode
 ./bin/nexis --help                 # usage
 ```
 
@@ -222,11 +223,13 @@ Stated so nobody rediscovers them:
   docstrings, `:strs`/`:syms` destructuring, `int`,
   `ex-info`, `macroexpand`, `read-string`, ...); `HANDOFF.md` §4
   lists them.
-- **No tooling layer** (PLAN §21, Phase 5): no test runner, no
-  `nexis.test`/`nexis.math`/`nexis.pprint`, no `--disasm`, and
-  runtime errors carry no source spans (stack traces are not
-  source-mapped). The Clojure-breadth stdlib is listed in the status
-  table.
+- **The tooling layer is the runtime error report, `nexis disasm`,
+  `nexis.test`, `nexis.pprint` and `nexis.math`**
+  ([`docs/TOOLING.md`](docs/TOOLING.md)); there is no `nexis.repl`
+  namespace, no `--compile`/`--run` of object files, no REPL line
+  editing or history, no `dbg`/`tap>`, and a stack trace carries no
+  macro-expansion provenance (a form a macro produced reports at the
+  macro call).
 - **`(vec #{...})` and `(vec {...})` raise `:kind-mismatch`**; `vec`
   accepts nil, vectors and lists. Use `(into [] s)`.
 - **Datalog function-position variables** are unsupported: the
