@@ -285,53 +285,58 @@ pub const Lexer = struct {
         return .{ .cat = .ident, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
     }
 
+    /// A number token: `-?`, then `0x`/`0b` and radix digits, or decimal
+    /// digits with an optional fraction and exponent. The token ends
+    /// where a symbol would, at whitespace, a delimiter or a reader
+    /// macro character; the symbol constituents that follow the digits
+    /// belong to the token. `1abc`, `1-2`, `1.5x`, `1/2`, `1N` and `0x`
+    /// each reach the reader as one number-shaped token, never as a
+    /// number followed by a symbol, and the reader judges the text
+    /// (FORMS.md §3, "Number token boundary").
     fn scanNumber(self: *Lexer, start: u32, pre: u8, has_minus: bool) Token {
         const src = self.base.source;
         self.base.pos = if (has_minus) start + 1 else start;
+        var is_real = false;
 
         // Hex `0x...` / binary `0b...`.
+        var radix = false;
         if (self.base.pos + 1 < src.len and src[self.base.pos] == '0') {
             const d = src[self.base.pos + 1];
             if (d == 'x' or d == 'X') {
+                radix = true;
                 self.base.pos += 2;
-                const hex_body = self.base.pos;
                 while (self.base.pos < src.len and isHexDigit(src[self.base.pos])) : (self.base.pos += 1) {}
-                if (self.base.pos == hex_body) {
-                    return .{ .cat = .err, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
-                }
-                return .{ .cat = .integer, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
-            }
-            if (d == 'b' or d == 'B') {
+            } else if (d == 'b' or d == 'B') {
+                radix = true;
                 self.base.pos += 2;
-                const bin_body = self.base.pos;
                 while (self.base.pos < src.len and isBinDigit(src[self.base.pos])) : (self.base.pos += 1) {}
-                if (self.base.pos == bin_body) {
-                    return .{ .cat = .err, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
-                }
-                return .{ .cat = .integer, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
             }
         }
 
         // Decimal integer / real.
-        while (self.base.pos < src.len and isAsciiDigit(src[self.base.pos])) : (self.base.pos += 1) {}
-        var is_real = false;
-        if (self.base.pos < src.len and src[self.base.pos] == '.') {
-            const after = self.base.pos + 1;
-            if (after < src.len and isAsciiDigit(src[after])) {
-                is_real = true;
-                self.base.pos = after;
-                while (self.base.pos < src.len and isAsciiDigit(src[self.base.pos])) : (self.base.pos += 1) {}
+        if (!radix) {
+            while (self.base.pos < src.len and isAsciiDigit(src[self.base.pos])) : (self.base.pos += 1) {}
+            if (self.base.pos < src.len and src[self.base.pos] == '.') {
+                const after = self.base.pos + 1;
+                if (after < src.len and isAsciiDigit(src[after])) {
+                    is_real = true;
+                    self.base.pos = after;
+                    while (self.base.pos < src.len and isAsciiDigit(src[self.base.pos])) : (self.base.pos += 1) {}
+                }
+            }
+            if (self.base.pos < src.len and (src[self.base.pos] == 'e' or src[self.base.pos] == 'E')) {
+                var pp = self.base.pos + 1;
+                if (pp < src.len and (src[pp] == '+' or src[pp] == '-')) pp += 1;
+                if (pp < src.len and isAsciiDigit(src[pp])) {
+                    is_real = true;
+                    self.base.pos = pp + 1;
+                    while (self.base.pos < src.len and isAsciiDigit(src[self.base.pos])) : (self.base.pos += 1) {}
+                }
             }
         }
-        if (self.base.pos < src.len and (src[self.base.pos] == 'e' or src[self.base.pos] == 'E')) {
-            var pp = self.base.pos + 1;
-            if (pp < src.len and (src[pp] == '+' or src[pp] == '-')) pp += 1;
-            if (pp < src.len and isAsciiDigit(src[pp])) {
-                is_real = true;
-                self.base.pos = pp + 1;
-                while (self.base.pos < src.len and isAsciiDigit(src[self.base.pos])) : (self.base.pos += 1) {}
-            }
-        }
+
+        // Whatever symbol constituents follow stay in the token.
+        while (self.base.pos < src.len and isIdentCont(src[self.base.pos])) : (self.base.pos += 1) {}
         return .{ .cat = if (is_real) .real else .integer, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
     }
 };

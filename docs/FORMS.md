@@ -105,6 +105,22 @@ see. Mirrors PLAN §28.3 exactly.
 | `#(#(inc %))` | **reader error**: `:nested-anon-fn` |
 | `~x` outside `` `...` `` | **reader error**: `:unquote-outside-syntax-quote` |
 | `~@x` outside `` `...` `` | **reader error**: `:unquote-splice-outside-syntax-quote` |
+| `42N`, `0xFFN`, `18446744073709551616N` | the integer, as without the suffix: `(int 42)`, `(int 255)`, `(bigint 18446744073709551616)` |
+| `1abc`, `1-2`, `1.5x`, `1/2`, `1.`, `0x`, `3.14M` | **reader error**: `:bad-number-literal`, detail the token's text |
+
+**Number token boundary.** A token that begins with a digit, or with
+`-` and a digit, ends where a symbol would: at whitespace, a comma,
+a delimiter (`( ) [ ] { }`), `"`, `;`, a reader macro character
+(`' ` ~ @ ^ \`) or the end of input. Every symbol constituent that
+follows the digits belongs to the token, so the lexer never splits
+`1abc` into `1` and `abc` or `1-2` into `1` and `-2`; the reader
+receives the whole run, reads it as a number when the text is one of
+the §2 spellings (with an optional `N` suffix on an integer) and
+fails with `:bad-number-literal` otherwise, its span the whole token.
+The CLI reports the failure as `reader error: :bad-number-literal
+1abc` with the caret under the token (`TOOLING.md` §1). Consequences
+that differ from Clojure are listed in `CLOJURE-REVIEW.md` §4.2: `1.`
+and `22/7` are errors, `017` is decimal 17, `3.14M` is an error.
 
 **Duplicate detection rule.** Only *statically-detectable literal* keys or
 elements count. `{:a 1 (keyword "a") 2}` is **not** a reader error — the second

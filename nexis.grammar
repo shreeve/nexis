@@ -70,7 +70,12 @@ tokens
 
 # Numbers. Order matters: reals before integers, with optional leading minus.
 # The reader decodes the textual representation (§28.2 / §28.5 example 10
-# pins `-1` as a single numeric token; this lexer does the same).
+# pins `-1` as a single numeric token; this lexer does the same). A number
+# token ends where a symbol would: the symbol constituents that follow the
+# digits belong to the token, so `1abc`, `1-2`, `1.5x`, `1/2` and `42N`
+# reach the reader whole, and the reader accepts the `N` suffix and
+# rejects the rest as `:bad-number-literal` (FORMS.md §3, "Number token
+# boundary"; `src/nexis.zig` `scanNumber` is the scanner that runs).
 '-'? [0-9]+ '.' [0-9]+ ([eE] ('+'|'-')? [0-9]+)? → real
 '-'? [0-9]+ [eE] ('+'|'-')? [0-9]+               → real
 '-'? '0x' [0-9a-fA-F]+                           → integer
