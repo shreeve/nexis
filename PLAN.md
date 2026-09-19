@@ -1439,7 +1439,7 @@ If nexis ships with a credible Datomic-class embedded database as a library, the
 
 This is the strongest version of the "database-as-value" story. Nextomic exists (`src/nextomic/`, `docs/NEXTOMIC.md`) and rests on:
 
-- emdb named trees as the index store (§15.11 NX-6 as amended: eleven trees, key bytes carry the datom).
+- emdb named trees as the index store (§15.11 NX-6 as amended: twelve trees, key bytes carry the datom).
 - Transactions (§15.3) as the foundation for the datom-assertion model.
 - Persistent collections as the return type for query results.
 
@@ -1870,7 +1870,7 @@ checklist of what exists (`[x]`) and what does not (`[ ]`).
 - [x] `src/heap.zig`: allocator + HeapHeader + type-tagged dispatch.
 - [x] `src/intern.zig`: symbol and keyword intern tables.
 - [x] `src/string.zig`: string heap kind.
-- [x] `src/bignum.zig`: bignum kind with canonicalization, hashing and codec. No bignum arithmetic and no literal lifting: fixnum overflow raises `:arithmetic-overflow`; an out-of-range literal is a compile error.
+- [x] `src/bignum.zig`: the integer tower above the fixnum: arithmetic promotes past ±2^47 and demotes back, literals of any size read as bignums, one canonical form so `=` and `hash` agree across the seam (`docs/BIGNUM.md` §9).
 - [x] `src/coll/champ.zig`: persistent map and set.
 - [x] `src/coll/vector.zig`: persistent vector.
 - [x] `src/coll/list.zig`: immutable cons list.
@@ -1894,7 +1894,7 @@ separate modules: they are folded into `src/compile.zig` and
 - [x] `src/expand.zig`: macroexpander (`docs/MACROEXPAND.md`).
 - [x] `src/cli.zig`: `bin/nexis run FILE.nx` + `bin/nexis repl`.
 - [x] Every primitive-core form end-to-end; try/catch/throw/finally with cross-frame unwind; quoted compound lists/vectors; syntax-quote with splicing + auto-gensym; SrcSpans in compile errors.
-- [ ] `call:tailcall`, extension instructions, constant folding, a bytecode cache (`.nx.o`), a disassembler.
+- [ ] `call:tailcall`, extension instructions, constant folding, a bytecode cache (`.nx.o`).
 
 ### Phase 3 — Macros, namespaces, REPL
 
@@ -1912,8 +1912,8 @@ separate modules: they are folded into `src/compile.zig` and
 - [x] Destructuring (sequential / associative / nested / `& rest` / `:as` / `:keys` / `:or`) in `let` / `fn` / `defn` params + multi-arity `defn` (dispatch on argc via expansion to variadic + `let` + nested `if`).
 - [x] `require` + aliases + file loading: `(require 'my.ns)` and `(require '[my.ns :as a])`; ns-to-file mapping (`my.app.foo` → `my/app/foo.nx`), load path, cycle detection, idempotent loaded set, namespace-mismatch validation.
 - [ ] `:refer` / `:rename` / `:exclude`, relative requires, reload.
-- [ ] Dynamic binding: `^:dynamic` Vars + `binding` (`(binding ...)` is an unresolved symbol). Nothing blocks it: transactions are explicit handles (Phase 4). Ranked in `HANDOFF.md` §4.
-- [ ] `:strs` / `:syms` destructuring, `defn` docstrings, multi-arity `fn`.
+- [x] Dynamic binding: `^:dynamic` Vars, `binding`, `set!` (`docs/VM.md` §6.5).
+- [x] `:strs` / `:syms` destructuring, `defn` docstrings, multi-arity `fn`.
 
 ### Phase 4 — emdb integration as a first-class concept
 
@@ -1954,14 +1954,15 @@ Tooling (`docs/TOOLING.md`):
 Authoritative design: `docs/NEXTOMIC.md`. Built on the engine as it
 is — zero changes to emdb (§11 there).
 
-- [x] Store: eleven emdb named trees — four current indexes, four history indexes with the logical `t` in the key, `nx/txlog`, `nx/idents`, `nx/sys`; sortable value encodings; `test/prop/nextomic_key.zig` (§2).
+- [x] Store: twelve emdb named trees — four current indexes, four history indexes with the logical `t` in the key, `nx/txlog`, `nx/idents`, `nx/sys`, `nx/fulltext`; sortable value encodings; `test/prop/nextomic_key.zig` (§2).
 - [x] Transactions: tempids, upserts by unique identity, cardinality, components, retractions, `:db/txInstant`; `test/prop/nextomic_tx.zig` against an in-memory model at every basis (§3).
 - [x] Db-values and time: `db`, `basis-t`, `as-of`, `since`, `history`, `tx-range`, `entity`, `entid` / `ident`, `datoms` (§4).
 - [x] Query: `q` as a native over a query value — patterns, every `:in` form, predicates and function bindings through the namespace registry, aggregates, every find spec, `not` / `or` and their `-join` forms, rules; greedy planner over the §5 index table; `explain`; `test/integration/nextomic_q.zig` against a naive evaluator (§5).
 - [x] Pull: `pull` / `pull-many` with nested, reverse, recursive, `:limit` / `:default` / `:as` specs; `test/integration/nextomic_pull.zig`.
 - [x] Speculative `with` over a held write transaction.
 - [x] Natives, the `nextomic_conn` / `nextomic_db` value kinds, `with-conn`, `:nextomic/*` errors (§6, §7); `test/nextomic/*.nx` under `zig build test`; `examples/nextomic-app.nx`.
-- [ ] Transaction functions and `:db.fn/cas`, excision, full-text, lazy entities, a datom heap kind (§6); Datalog function-position variables (§5).
+- [x] Transaction functions and `:db.fn/cas`, excision, full-text, lazy entities (§6); Datalog function-position variables (§5).
+- [ ] A datom heap kind (§6): reads return `[e a v t added]` vectors.
 
 ### Phase 6 — Performance pass
 

@@ -47,7 +47,8 @@ transactions are data too. Nextomic maps that onto emdb with byte
 keys whose order is the index order: four current trees answer
 ordinary reads with no per-fact fold, four history trees carry the
 transaction in the key and answer the time views, and `nx/txlog`,
-`nx/idents` and `nx/sys` complete twelve named trees in one file. One
+`nx/idents`, `nx/sys` and `nx/fulltext` complete twelve named trees
+in one file. One
 process, one file, no transactor, and any number of processes can
 open the file and see each other's writes.
 
@@ -216,6 +217,8 @@ imported by `stdlib` only. Files, one sentence each:
 | `idents.zig` | durable keyword ↔ id mapping with a per-connection cache; a transaction's mints wait in a `Minter` and publish after commit |
 | `schema.zig` | attributes as-of a basis, built from the attribute partition's datoms; per-attribute counts for the planner |
 | `transact.zig` | the transaction protocol: begin, normalise, tempids, expand, schema checks, write, commit; the overlay model that makes implicit retracts and same-transaction unique claims O(1) |
+| `excise.zig` | excision: the deletes across every tree and the txlog rewrite that leaves `{:excised [...]}` markers (`docs/NEXTOMIC.md` §4) |
+| `fulltext.zig` | the tokenizer and the `nx/fulltext` rows: put, delete, search |
 | `db.zig` | `Conn` and `DbValue`; entity, entid/ident, datoms, tx-range; a speculative `with` is a second `Conn` over the held write transaction |
 | `handle.zig` | heap bodies of `nextomic_conn`, `nextomic_db` and `nextomic_entity`; its own build module `nextomic_handle` below `dispatch`/`format`/`gc`/`vm`, whose `lookup` reads a lazy entity through the hook its box carries |
 | `marshal.zig` | VM values to and from datom values: the entity, value and cell contracts shared by natives, query, pull and transactions |
@@ -252,7 +255,7 @@ context, or the bare keyword when there is nothing more to say.
 | `db` | 23 natives: `open close ref ref? put-key! get-key delete-key! present? begin-write begin-read commit! abort-write! abort-read! put! get delete! deref alter! scan reduce-tree snapshot release-snapshot! snapshot?` |
 | `nexis.string` | `lower-case upper-case trim split join replace` |
 | `nexis.simd` | the typed-vector kernels `sum dot scale map` over `i64-vector` / `f64-vector` values (`docs/TYPED_VECTOR.md` §7.2); `(require '[nexis.simd :as tv])` aliases it |
-| `nexis.internal` | the ten `#%...` primitives `defrecord`/`defprotocol`/`try`/`deftest` expand to |
+| `nexis.internal` | the twelve `#%...` primitives `defrecord`/`defprotocol`/`try`/`deftest`, keyword arguments and syntax-quote expand to |
 | `nexis.test` | `deftest is testing run-tests run-all-tests` and the registry and reporter they share, in `src/stdlib/test.nx` (`docs/TOOLING.md` §3) |
 | `nexis.pprint` | `pprint pprint-str` in `src/stdlib/pprint.nx` (`docs/TOOLING.md` §4) |
 | `nexis.math` | 5 natives `sqrt pow floor ceil round` plus `PI` and `E` from `src/stdlib/math.nx` (`docs/TOOLING.md` §4) |
@@ -273,10 +276,10 @@ then PLAN Appendix C / §28 (the canonical Form schema); then
 `docs/*.md`, which are derivative and must track PLAN; then code
 comments. When sources disagree, the higher one wins and the lower one
 is fixed in the same commit. A §23 decision changes only through a
-dated entry in the Amendment Log at the end of `PLAN.md`; per-doc
-amendment logs (`docs/COMPILER.md` §13, `docs/VM.md` §18, `ATOM.md`,
-`PROTOCOLS.md`, `PERF.md` §11) record the downstream detail. The
-Amendment Log is the one place dates belong outside commit messages.
+dated entry in the Amendment Log at the end of `PLAN.md`; the only
+per-doc record is `docs/PERF.md` §11, the provenance of each
+measurement. The Amendment Log is the one place dates belong outside
+commit messages.
 
 **Nextomic**: `docs/NEXTOMIC.md` is authoritative for everything under
 `src/nextomic/` and the `nextomic` namespace: §2 store layout, §3
@@ -348,14 +351,16 @@ an aborted transaction. `test/prop/nextomic_key.zig` sweeps 100,000
 random pairs per value type for `order(enc a, enc b) == cmp(a, b)`,
 the NUL escape round trip, order across the inline threshold, and the
 256-byte search-clue bound. `test/integration/nextomic_fx.zig` is the
-fixture the corpora share. `test/integration/nextomic_entity.zig` runs
+fixture the corpora share. `test/integration/nextomic_fn.zig` runs
+transaction functions, `:db.fn/cas`, schema alteration, excision and
+full-text end to end. `test/integration/nextomic_entity.zig` runs
 programs against a VM with `nextomic` installed: every access path of
 the lazy entity, refs navigating, `touch`, identity, a released
 connection, and an entity kept in a Var under the collector's stress
 policy.
 
 **Scripts.** `test/nextomic/{basics,indexes,time,errors,query,pull,
-with,with-conn,polish,persist-1,persist-2}.nx` run through
+with,with-conn,polish,datoms,persist-1,persist-2,gc}.nx` run through
 `bin/nexis` from a scratch directory that also holds `prelude.nx`;
 each script's stdout must equal its `.out`. `persist-1` and
 `persist-2` share one store across two processes. `polish.nx` pins
@@ -489,7 +494,7 @@ fix the environment before the first edit.
 **Adding a native.** In `src/stdlib.zig`: a `NativeFn` descriptor
 (`name`, `min_arity`, `max_arity` or `null` for variadic, `call`) and
 an entry in the table of its namespace (`core_fns`, `db_fns`,
-`string_fns`, `internal_fns`). The VM enforces arity; the function
+`string_fns`, `internal_fns`, `math_fns`, `simd_fns`). The VM enforces arity; the function
 receives `(vm, args)` and returns a `Value` or a `VmError`. Throw with
 `vm.throwKeyword("name")` or `vm.throwValue(v)`; a callback result
 kept across a further `vm.callValue` goes on a `vm.rootScope()`

@@ -78,8 +78,7 @@ backing allocator underneath this list.
 The list is the canonical source of truth for "what's live." Sweep walks
 it; tests enumerate it to assert leak counts.
 
-**Why not an external registry?** Peer-AI review concluded (and I agreed):
-a prefix block keeps allocation lifetime metadata physically adjacent to
+**Why not an external registry?** A prefix block keeps allocation lifetime metadata physically adjacent to
 the object, avoids a dual source of truth (allocator + registry), and
 transitions cleanly to slab-based allocation.
 

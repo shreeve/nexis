@@ -1199,7 +1199,7 @@ Three layers, paralleling `COMPILER.md` §9:
   closure carrier.
 - `docs/SEMANTICS.md` — equality / hash / numeric invariants the
   VM must respect.
-- `docs/GC.md` — the collector, and why the VM never runs it.
+- `docs/GC.md` — the collector the VM hosts (§9).
 - `docs/PROTOCOLS.md` — `protocol_fn` dispatch.
 - `docs/TOOLING.md` — the runtime error report built on §13's
   trace and the disassembler that reads §5's tables.

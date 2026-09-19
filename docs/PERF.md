@@ -14,7 +14,7 @@ improvement runway.
   than same-machine head-to-head.
 - `estimated` — projected from published work or first
   principles; no nexis measurement yet.
-- `planned` — specified but not yet implemented.
+- `planned` — specified, with no implementation in the tree.
 
 Every "we're N× faster than Clojure" claim outside this document
 must cite a specific `measured` row here, or the claim gets
@@ -31,15 +31,15 @@ per-kind specs. PLAN.md wins on conflict.
 
 1. What we mean by "performance"
 2. Scorecard
-3. Measured baseline (first run)
+3. Measured baseline
 4. Tier analysis — how good are these numbers?
 5. Per-category design detail
 6. Priority sequence
 7. Non-goals
-8. Biggest findings
+8. Biggest findings from the first baseline
 9. Honesty receipts
 10. Cross-references
-11. Amendment log
+11. Measurement provenance
 
 ---
 
@@ -84,7 +84,7 @@ projected nexis direction vs Clojure. "Measured" column cites the
 
 | # | Category | Clojure | nexis | Δ | Measured | Status |
 |---|---|---|---|---|---|---|
-| 1 | Value cell size | 16–56 B boxed | 16 B NaN-boxed tagged | **2–3× smaller** | — | implemented, not yet measured |
+| 1 | Value cell size | 16–56 B boxed | 16 B NaN-boxed tagged | **2–3× smaller** | — | implemented, not measured |
 | 2 | Fixnum arithmetic | Boxed `Long` / `unchecked-*` | Inline 62-bit tagged | **3–10×** on tight loops | ~1 ns/op (§3.1) | measured |
 | 3 | Float arithmetic | Boxed `Double` / `^double` | Inline NaN-boxed f64 | **2–5×** on idiomatic | <1 ns/op† (§3.1) | measured |
 | 4 | Persistent map | HAMT (Bagwell 2001) | CHAMP (Steindorfer 2015) | **15–25%** faster lookup, **30–40%** less memory | get 15.5 ns/op @ N=4096 on M1 (§3.4); 13.3 ns/op on M5 (§3.8) | measured (partial) |
@@ -101,7 +101,7 @@ projected nexis direction vs Clojure. "Measured" column cites the
 | 15 | Codec / serialization | `.edn` / Nippy | Binary LEB128/ZigZag | **2–5× size, 5–20× speed** vs `.edn` | encode 18 ns/entry, decode 124 ns/entry (§3.5) | measured (partial) |
 | 16 | Concurrency tax | STM + CAS pervasive | Single-isolate, single-writer | **strictly less overhead**; by design | — | implemented, by design |
 | 17 | SIMD / typed-vector | JIT may autovectorize | `@Vector(4, f64)` kernels over unboxed typed vectors (`nexis.simd`) | **2–8×** on bulk numeric ops | — | implemented, not measured |
-| 18 | Startup | 100–500 ms JVM warmup | Native binary | **10–500×** | — | implemented, not yet measured |
+| 18 | Startup | 100–500 ms JVM warmup | Native binary | **10–500×** | — | implemented, not measured |
 | 19 | Compilation | HotSpot C1+C2 JIT | Bytecode VM, switch dispatch, no specialization | **worse** on sustained compute | — | not measured against Clojure |
 | 20 | Comptime specialization | JIT inlining + escape analysis | Zig `comptime` monomorphization | **~2×** on specialized paths | — | absent |
 | 21 | Datalog over datoms (Nextomic) | Datomic (peer + transactor, JVM) | in-process, emdb named trees, arena per operation | not head-to-head measured | 3-way join over 200k datoms 0.72 ms to rows; 20k `[*]` pulls 12.9 ms (§3.7) | measured (corpus benchmark, best of 5 runs) |

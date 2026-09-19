@@ -14,7 +14,7 @@ and the layout.
 (reader, macroexpander, compiler, bytecode VM, persistent collections,
 16-byte tagged value), durable refs backed by the emdb storage engine
 (`db/*`), and **Nextomic**, a Datomic-class database in the same
-binary: datoms in eleven emdb named trees, logical transaction numbers
+binary: datoms in twelve emdb named trees, logical transaction numbers
 in the history keys, Datalog `q`, `pull`, `as-of`/`since`/`history`,
 speculative `with`. `bin/nexis run FILE.nx` and `bin/nexis repl` run
 real programs and `bin/nexis disasm FILE.nx` shows their bytecode.
@@ -120,7 +120,7 @@ nexis/
 │   ├── db.zig                   emdb connection, durable refs, txn handles
 │   ├── stdlib.zig, stdlib/*.nx  native tables; core, nextomic, test, pprint and math .nx embedded at build
 │   ├── loader.zig, cli.zig, disasm.zig, bench.zig, golden.zig
-│   └── nextomic/                key datom store idents schema transact db handle
+│   └── nextomic/                key datom store idents schema transact excise fulltext db handle
 │                                marshal relation pull natives query.zig query/{ir,parse,plan,exec,rules,natives}
 ├── docs/                        one spec per module; NEXTOMIC.md for the database
 ├── test/prop/ integration/ golden/ nextomic/

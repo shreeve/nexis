@@ -209,7 +209,7 @@ From PLAN §15.10 / §23 #25 (frozen):
 | `namespace` | Process-local binding table. |
 | `tx handle` / `emdb.Env` connection | Open OS resources. |
 | `error_` | Stack traces carry process-local frame references. |
-| `meta_symbol` | Reserved; not yet allocated; non-serializable per metadata discipline. |
+| `meta_symbol` | Process-local wrapper (kind 29); non-serializable per the metadata discipline. |
 | `byte_vector` | Reserved kind with no implementation. |
 | `durable_ref` | An identity into a store; the value half of a durable pair is codec bytes, but a ref inside a value is `:unserializable` (`docs/DB.md` §9). |
 | `nextomic_conn`, `nextomic_db`, `nextomic_entity` | Process-local: a Nextomic connection, the db-values taken from it and the entities read through them name a `Conn` the VM owns (`docs/NEXTOMIC.md` §6, §8). |

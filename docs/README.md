@@ -16,7 +16,7 @@ wins and the code is wrong.
 | `src/bignum.zig` | [`BIGNUM.md`](BIGNUM.md) | Bignum canonicalization, arithmetic, ordering, conversion, decimal text |
 | `src/coll/list.zig` | [`LIST.md`](LIST.md) | Immutable cons list |
 | `src/coll/champ.zig` | [`CHAMP.md`](CHAMP.md) | Persistent map + set via CHAMP (Compressed Hash-Array Mapped Prefix-tree) |
-| `src/coll/vector.zig` | [`VECTOR.md`](VECTOR.md) | Persistent vector via RRB tree |
+| `src/coll/vector.zig` | [`VECTOR.md`](VECTOR.md) | Persistent vector: 32-way trie with a tail |
 | `src/coll/transient.zig` | [`TRANSIENT.md`](TRANSIENT.md) | Transient lifecycle + ownership |
 | `src/coll/typed_vector.zig` | [`TYPED_VECTOR.md`](TYPED_VECTOR.md) | Typed vector: unboxed i64 / f64 elements, codec, `nexis.simd` kernels |
 | `src/eq.zig` | (in [`SEMANTICS.md`](SEMANTICS.md) §2) | Equality predicates; no dedicated spec doc |
@@ -62,7 +62,7 @@ These are governance / meta docs and live at the repository root:
 |---|---|
 | [`PLAN.md`](../PLAN.md) | Authoritative design spec — read first; §23 frozen decisions are binding |
 | [`AGENTS.md`](../AGENTS.md) | Routing guide for contributors + AI sessions |
-| [`HANDOFF.md`](../HANDOFF.md) | Inter-session handoff prompt — current state + next task |
+| [`HANDOFF.md`](../HANDOFF.md) | The guide for a new session: what exists, how to verify it, how to work here, known gaps |
 | [`CLOJURE-REVIEW.md`](../CLOJURE-REVIEW.md) | What we take / adapt / reject from Clojure's source |
 | [`README.md`](../README.md) | Short project pitch + status |
 | [`ZIG-0.16.0.md`](../ZIG-0.16.0.md) | Project-specific Zig 0.16 stdlib reference + gotchas |
@@ -90,4 +90,4 @@ When sources disagree:
 3. `docs/*.md` — derivative; must track `PLAN.md`.
 4. Code comments — lowest. If code says one thing and `PLAN.md` says another, `PLAN.md` wins and the code is wrong.
 
-Every doc describes the module as it is. Where a doc states an absence ("`eval` is absent"), that absence is a fact about the tree, not a schedule; `PLAN.md` §21 and `HANDOFF.md` §4 hold the roadmap.
+Every doc describes the module as it is. Where a doc states an absence ("`byte_vector` has no implementation"), that absence is a fact about the tree, not a schedule; `PLAN.md` §21 and `HANDOFF.md` §4 hold the roadmap.

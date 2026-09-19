@@ -324,16 +324,16 @@ Design decisions the review flagged as worth studying; each is pinned in `docs/S
 
 ---
 
-## PLAN.md changes driven by this review
+## Where PLAN.md carries these conclusions
 
-| Section | Change | Rationale |
+| Section | What it states | Rationale |
 |---|---|---|
-| §4 non-goals | Changed "seq non-goal" row to a nuanced one, now pointing at §6.6 | seq IS core, just not a straitjacket |
-| §6.1 | Rewrote to separate compiler primitives (`*`-suffixed) from user macros | Mirrors Clojure's architecture exactly |
-| §6.6 | New subsection: seq as core abstraction | Corrects earlier "non-goal" overstatement |
-| §8.4 | Rewrote interning for keyword/symbol asymmetry | Correcting the earlier "same intern-id" model |
-| §8.7 | New subsection: keyword-as-function as v1 feature | Promoted to a language-level commitment |
-| §9.2 | Demoted RRB, made plain 32-way the v1 default | Clojure ships plain — so do we |
+| §4 non-goals | seq is core, not a straitjacket; the row points at §6.6 | seq IS core, just not a straitjacket |
+| §6.1 | Compiler primitives (`*`-suffixed) are separate from user macros | Mirrors Clojure's architecture exactly |
+| §6.6 | seq as the core abstraction | The sequence library is written against it |
+| §8.4 | Interning is asymmetric between keywords and symbols | Keywords are identities; symbols are names |
+| §8.7 | Keywords are functions | A language-level commitment |
+| §9.2 | The vector is a plain 32-way trie; RRB is absent | Clojure ships plain — so do we |
 | §14.1 | Updated macro signature to `(&form, &env, args...)` | Adds scope-aware expansion capability |
 | §23 | Added frozen decisions #30–35 | Captures the new commitments |
 | §25 | Resolved RRB-complexity risk #11 | Demotion removed the risk |

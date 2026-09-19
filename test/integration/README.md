@@ -19,6 +19,12 @@ and Nextomic through its public Zig API:
 - `nextomic_pull.zig`: the pull corpus, checked against `entity()` and
   `datoms(.vaet)`; also speculative `with` through `q`, `entity` and
   `pull`.
+- `nextomic_fx.zig`: the fixture the two corpora share.
+- `nextomic_fn.zig`: transaction functions, `:db.fn/cas`, schema
+  alteration, excision and full-text end to end.
+- `nextomic_entity.zig`: every access path of the lazy entity, refs
+  navigating, `touch`, identity, a released connection, and an entity
+  kept in a Var under the collector's stress policy.
 
 Both Nextomic corpora end with a benchmark over ~200k datoms whose
 row-count checks always run; the `[bench]` timing lines print to
