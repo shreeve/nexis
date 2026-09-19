@@ -1,11 +1,11 @@
-//! codec.zig — serialize / deserialize Value ↔ bytes (Phase 1).
+//! codec.zig — serialize / deserialize Value ↔ bytes.
 //!
 //! Authoritative spec: `docs/CODEC.md`. Derivative from PLAN
 //! §15.6 / §15.10 / §23 #25 (serialization scope frozen),
 //! `docs/SEMANTICS.md` §2.2 / §3.2 (numeric canonical form +
 //! hash invariants), and `docs/VALUE.md` §2 (Kind numbering).
 //!
-//! Ships the v1 interim wire format pinned in CODEC.md §2:
+//! Implements the wire format pinned in CODEC.md §2:
 //!
 //!   [major: u8 = 1] [minor: u8 = 0] [ValueEncoding]
 //!
@@ -22,8 +22,6 @@
 //!        byte_vector, typed_vector, durable_ref (non-serializable
 //!        or reserved-unallocated). Public API returns
 //!        `error.UnserializableKind`.
-//!
-//! Closes PLAN §20.2 gate test #5 (codec round-trip).
 //!
 //! Module graph (one-way terminal; dispatch / gc / transient /
 //! codec all share this shape):
@@ -71,10 +69,10 @@ pub const version_minor: u8 = 0;
 // =============================================================================
 
 pub const CodecError = error{
-    /// Attempt to encode/decode a kind excluded from the v1
+    /// Attempt to encode/decode a kind excluded from the
     /// Serializable set — function, var_, transient, error_,
     /// meta_symbol, byte_vector, typed_vector, durable_ref. Public
-    /// API typed error (peer-AI turn 20 wording).
+    /// API typed error.
     UnserializableKind,
 
     /// Decode ran out of bytes mid-value.
@@ -85,7 +83,7 @@ pub const CodecError = error{
     TrailingBytes,
 
     /// Envelope version bytes don't match a version this build
-    /// understands. v1 accepts only `[1, 0]`.
+    /// understands. Only `[1, 0]` is accepted.
     InvalidVersion,
 
     /// First byte of a ValueEncoding isn't a recognized Kind
@@ -104,7 +102,7 @@ pub const CodecError = error{
     /// Per-kind payload field is structurally invalid: bignum
     /// sign byte not in {0, 1}, or similar per-kind field.
     /// Distinct from InvalidKindByte (which is about the top-level
-    /// kind tag) per peer-AI turn 21.
+    /// kind tag).
     MalformedPayload,
 };
 
@@ -160,9 +158,9 @@ fn readUleb128(bytes: []const u8, cursor: *usize) CodecError!u64 {
 
 /// ZigZag: signed i64 → u64 for compact LEB128 encoding of small
 /// signed values. Both encode and decode operate entirely in u64
-/// space — no signed left shift (defensive against future
-/// `i64.min` / `i64.max` edge cases per peer-AI turn 22 even
-/// though fixnum range is i48 and can't reach them).
+/// space — no signed left shift (defensive against `i64.min` /
+/// `i64.max` edge cases even though fixnum range is i48 and can't
+/// reach them).
 inline fn zigzagEncode(v: i64) u64 {
     const uv: u64 = @bitCast(v);
     // Top bit of v → 0 (non-negative) or 1 (negative). Negating
@@ -247,7 +245,7 @@ fn readBytes(bytes: []const u8, cursor: *usize, len: usize) CodecError![]const u
 // =============================================================================
 
 /// Encode `v` to a freshly-allocated byte slice. Caller frees.
-/// Returns `UnserializableKind` if `v` is not in the v1
+/// Returns `UnserializableKind` if `v` is not in the
 /// serializable set (CODEC.md §1).
 pub fn encode(
     allocator: std.mem.Allocator,
@@ -394,17 +392,17 @@ fn encodeValue(
         .transient,
         .error_,
         .meta_symbol,
-        // Phase 5 Item 1 (peer-AI turn 75): atoms are process-local
-        // mutable identity values; encoding them would be misleading.
-        // PLAN §23 #25 v1-serializable set explicitly excludes them.
+        // Atoms are process-local mutable identity values; encoding
+        // them would be misleading. The PLAN §23 #25 serializable set
+        // explicitly excludes them.
         // ATOM.md §6.
         .atom,
-        // Phase 5.3a (peer-AI turn 84): records are NOT in the
+        // Records are NOT in the
         // §23 #25 serializable set. RecordTypeId is a per-VM
         // u32 with no stable cross-process meaning; encoding
         // it would mislead. PROTOCOLS.md §0 boundary.
         .record,
-        // Phase 5.3b: protocols + protocol_fn are likewise per-VM
+        // protocols + protocol_fn are likewise per-VM
         // identity-valued. NOT in §23 #25.
         .protocol,
         .protocol_fn,
@@ -543,7 +541,7 @@ fn decodeValue(
         },
         // Recognized-but-non-serializable kinds (CODEC.md §3).
         // These kind bytes ARE valid `Kind` enum values; they're
-        // just not in the v1 serializable subset.
+        // just not in the serializable subset.
         @intFromEnum(Kind.byte_vector),
         @intFromEnum(Kind.typed_vector),
         @intFromEnum(Kind.function),
@@ -653,7 +651,7 @@ test "LEB128 unsigned: overlong input errors" {
     try testing.expectError(CodecError.InvalidLeb128, readUleb128(&bytes, &cursor));
 }
 
-test "LEB128 unsigned: 10-byte encoding with invalid high payload bits (peer-AI turn 22)" {
+test "LEB128 unsigned: 10-byte encoding with invalid high payload bits" {
     // Max u64 encodes in 10 bytes; the 10th byte may use at most
     // 1 payload bit (the high bit of u64). An encoding whose 10th
     // byte carries more than 1 payload bit overflows u64.

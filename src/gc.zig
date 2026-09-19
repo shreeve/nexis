@@ -1,24 +1,22 @@
-//! gc.zig — precise mark-sweep tracing garbage collector (Phase 1).
+//! gc.zig — precise mark-sweep tracing garbage collector.
 //!
 //! Authoritative spec: `docs/GC.md`. Strategy and root model:
 //! `PLAN.md` §10. Mark-bit layout: `docs/VALUE.md` §5. Heap / sweep
 //! scaffold: `docs/HEAP.md` and `src/heap.zig`.
 //!
-//! This module closes Phase 1 gate test #7 (GC stress) by replacing
-//! the hand-marking workaround in `test/prop/heap.zig` with a real
-//! precise mark-sweep driver. Every heap kind that currently
-//! allocates blocks (string, bignum, list, persistent_vector,
-//! persistent_map, persistent_set) exposes a `trace` function this
-//! collector dispatches to during the mark phase.
+//! Every heap kind that allocates blocks (string, bignum, list,
+//! persistent_vector, persistent_map, persistent_set, ...) exposes a
+//! `trace` function this collector dispatches to during the mark
+//! phase.
 //!
-//! v1 collector contract (GC.md §9 scope cut, peer-AI turn 14):
+//! Collector contract (GC.md §9):
 //!   - Explicit-only — callers invoke `collect(roots)` directly. No
 //!     auto-trigger based on allocation threshold.
 //!   - Non-reentrant — `collect` panics if called from inside a
 //!     visitor callback. Flag-guarded via `self.collecting`.
 //!   - Precise — caller supplies a complete root set; collector
 //!     does NOT scan stacks or registers.
-//!   - No write barriers (STW, single-threaded v1).
+//!   - No write barriers (STW, single-threaded).
 //!   - No generational / concurrent phases.
 //!
 //! Module graph (one-way terminal, like dispatch.zig):
@@ -108,28 +106,28 @@ pub const Collector = struct {
             // Durable refs have no heap children — store_id,
             // tree_name, key_bytes are all inline body bytes; the
             // advisory `conn` pointer is NOT heap-managed (per
-            // DB.md §7.3 / peer-AI turn 23).
+            // DB.md §7.3).
             .durable_ref => db_mod.trace(h, self),
-            // Phase 5 Item 1 (peer-AI turn 75): atom trace walks
+            // Atom trace walks
             // the contained value. `in_flight` is a u8, not a
             // Value. Self-references work via mark-bit short-
             // circuit in `mark`. ATOM.md §7.
             .atom => atom_mod.trace(h, self),
-            // Phase 5.3a (peer-AI turn 84): record trace walks
+            // Record trace walks
             // the contained field map (type_id is a plain u32,
             // not a heap value). PROTOCOLS.md §2.1.
             .record => record_mod.trace(h, self),
-            // Phase 5.3b: protocol + protocol_fn are LEAFS
+            // protocol + protocol_fn are LEAFS
             // (no inner heap values).
             .protocol, .protocol_fn => protocol_mod.trace(h, self),
             // Nextomic handles are leaves: the connection box holds a
             // pointer the VM owns plus inline path text, the db box
             // that pointer and numbers (nextomic_handle).
             .nextomic_conn, .nextomic_db => {},
-            // Reserved heap kinds without implementations in v1.
-            // PANIC, not silent no-op, per GC.md §5 / peer-AI turn 14:
-            // a silent no-op on a kind that SHOULD trace would create
-            // invisible retention bugs once that kind ships.
+            // Reserved heap kinds without implementations.
+            // PANIC, not silent no-op, per GC.md §5: a silent no-op
+            // on a kind that SHOULD trace would create invisible
+            // retention bugs.
             .byte_vector,
             .typed_vector,
             .function,
@@ -137,7 +135,7 @@ pub const Collector = struct {
             .error_,
             .meta_symbol,
             => std.debug.panic(
-                "gc.mark: kind {s} is reserved but has no v1 trace implementation; allocating with this kind is a bug until the kind ships",
+                "gc.mark: kind {s} is reserved and has no trace implementation; allocating with this kind is a bug",
                 .{@tagName(k)},
             ),
             // Immediates + sentinels cannot be heap-allocated; reaching
@@ -157,7 +155,7 @@ pub const Collector = struct {
     /// to decide whether to walk the node's payload.
     ///
     /// Does NOT walk `h.meta` — internal nodes have no metadata
-    /// semantics in v1 (CHAMP.md §8.2, VECTOR.md §3 invariants).
+    /// semantics (CHAMP.md §8.2, VECTOR.md §3 invariants).
     /// Does NOT dispatch on `h.kind` — the caller knows the
     /// structural context and will walk the payload itself (vector
     /// trie walking via `traceTrie`; CHAMP walking via
@@ -425,8 +423,7 @@ test "collect: persistent set survives (>8 elements exercises CHAMP internals)" 
 }
 
 test "collect: atom contained value survives via trace" {
-    // Phase 5 Item 1 (peer-AI turn 76 §"Strongly recommended"):
-    // confirms `atom_mod.trace` walks `body.value` so the
+    // Confirms `atom_mod.trace` walks `body.value` so the
     // contained heap value is reachable purely through the atom
     // (no other root). If trace returned a no-op, the contained
     // string would be swept and the post-collect read would
@@ -447,7 +444,7 @@ test "collect: atom contained value survives via trace" {
     // Both atom + string must survive.
     try testing.expectEqual(live_before, live_after);
     // And the contained string is the same Value we put in (the
-    // collector is non-moving in v1, so pointer identity is
+    // collector is non-moving, so pointer identity is
     // preserved).
     const fetched = atom_mod.getValue(a);
     try testing.expectEqual(contained.payload, fetched.payload);
@@ -587,7 +584,7 @@ test "metadata chain: reachable through h.meta" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
 
-    // Allocate a "meta map" — in v1 it's just a separate heap block;
+    // Allocate a "meta map" — here it's just a separate heap block;
     // semantically it would be a persistent-map root. We use a
     // string here because it has no child references, keeping the
     // test focused on the meta traversal itself.

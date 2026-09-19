@@ -4,9 +4,9 @@
 //! produces the canonical `Form` tree documented in `docs/FORMS.md`. All
 //! normalization rules from PLAN §28.3 / FORMS.md §3 are enforced here;
 //! anything that requires namespace resolution or macro context is left for
-//! later stages (`src/expand.zig`, `src/resolve.zig`).
+//! later stages (`src/expand.zig`, `src/compile.zig`).
 //!
-//! Phase 0 scope:
+//! Scope:
 //!   - Parse atom text into typed datums (int, real, char, string, kw, sym).
 //!   - Detect nil/true/false from symbol text.
 //!   - Recognize and reject reader errors per FORMS.md §3:
@@ -28,11 +28,11 @@
 //! unquote/splice expansion live in the macroexpander, not here.
 //!
 //! Integers are parsed into `i64`. Values outside the i64 range are rejected
-//! with `:bignum-out-of-phase-0-range`; full bignum support lands in Phase 1
-//! alongside the runtime Value layer (PLAN §21, Phase 1 gate test #1).
+//! with `:bignum-out-of-phase-0-range`; there is no bignum literal lifting
+//! (bignums arise only from runtime promotion).
 
 const std = @import("std");
-/// Step #7a: re-exported as `pub` so downstream modules
+/// Re-exported as `pub` so downstream modules
 /// (specifically `src/compile.zig` for the `compileSource`
 /// end-to-end entry point) can access `parser.parseForm`
 /// without needing their own `@import("parser.zig")` (which
@@ -686,8 +686,7 @@ fn expectSrcText(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError![
 /// Parse an integer literal with explicit radix support and strict i64
 /// range enforcement. Returns null for malformed input OR for values that
 /// are syntactically valid but outside i64 range — callers report the
-/// out-of-range case separately so Phase 1's bignum promotion can light up
-/// without disturbing the bad-number-literal path.
+/// out-of-range case separately from the bad-number-literal path.
 fn parseIntLiteral(text: []const u8) ?i64 {
     if (text.len == 0) return null;
     var negative = false;
@@ -740,7 +739,7 @@ fn parseCharLiteral(body: []const u8) ?u21 {
         return null;
     }
     // Single-byte literal (ASCII). Multi-byte UTF-8 chars need broader
-    // handling; Phase 0 accepts ASCII directly and `\u{HEX}` for the rest.
+    // handling; the reader accepts ASCII directly and `\u{HEX}` for the rest.
     return body[0];
 }
 
@@ -765,7 +764,7 @@ fn splitNamespace(text: []const u8) ?Name {
 
 /// A Form is a "literal key" eligible for static duplicate detection iff it
 /// is an atom (nil/bool/int/real/char/string/keyword/symbol) AND its value
-/// is compile-time known. For Phase 0 we treat every atom as literal.
+/// is compile-time known. Every atom is treated as literal.
 fn isLiteralKey(f: *const Form) bool {
     return switch (f.datum) {
         .nil, .bool_, .int, .real, .char, .string, .keyword, .symbol => true,
@@ -778,7 +777,7 @@ fn formLiteralEq(a: *const Form, b: *const Form) bool {
         .nil => b.datum == .nil,
         .bool_ => |ab| b.datum == .bool_ and b.datum.bool_ == ab,
         .int => |ai| b.datum == .int and b.datum.int == ai,
-        .real => |ar| b.datum == .real and b.datum.real == ar, // naive; NaN semantics in Phase 1
+        .real => |ar| b.datum == .real and b.datum.real == ar, // naive: NaN never equals itself
         .char => |ac| b.datum == .char and b.datum.char == ac,
         .string => |s| b.datum == .string and std.mem.eql(u8, s, b.datum.string),
         .keyword => |ak| b.datum == .keyword and nameEq(ak, b.datum.keyword),
@@ -847,8 +846,8 @@ fn writeCompound(tag: []const u8, children: []const *const Form, w: *std.Io.Writ
         return;
     }
     // Inline when all children are atoms (single-line compound); break
-    // onto indented new lines otherwise. Width-aware wrapping is a future
-    // tooling pass — FORMS.md §5 calls this out.
+    // onto indented new lines otherwise. There is no width-aware
+    // wrapping (FORMS.md §5).
     if (allAtoms(children)) {
         for (children) |c| {
             try w.writeByte(' ');
@@ -971,7 +970,7 @@ test "integer radix normalization" {
     // Boundary: i64.min/max are representable.
     try std.testing.expectEqual(std.math.minInt(i64), parseIntLiteral("-9223372036854775808").?);
     try std.testing.expectEqual(std.math.maxInt(i64), parseIntLiteral("9223372036854775807").?);
-    // Out-of-range is rejected (Phase 1 promotes to bignum).
+    // Out-of-range is rejected.
     try std.testing.expect(parseIntLiteral("9223372036854775808") == null);
     try std.testing.expect(parseIntLiteral("-9223372036854775809") == null);
     // Malformed.

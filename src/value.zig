@@ -1,13 +1,13 @@
-//! value.zig — 16-byte tagged runtime Value (Phase 1, immediates only).
+//! value.zig — 16-byte tagged runtime Value.
 //!
 //! Authoritative physical layout spec is `docs/VALUE.md`. Equality and
 //! hashing semantics live in `docs/SEMANTICS.md`. This file is the
 //! implementation; frozen decisions belong in those docs.
 //!
-//! Phase 1 commit 1 scope: every immediate kind (nil, bool, char, fixnum,
-//! float, keyword, symbol). Heap kinds (string, bignum, collections,
-//! var, durable-ref, ...) are defined in the Kind enum but constructors
-//! and accessors for them land in the per-module commits that actually
+//! This file owns every immediate kind (nil, bool, char, fixnum, float,
+//! keyword, symbol). Heap kinds (string, bignum, collections, var,
+//! durable-ref, ...) are defined in the Kind enum here, but their
+//! constructors and accessors live in the per-kind modules that
 //! allocate the body.
 //!
 //! Design invariants enforced here (VALUE.md §3):
@@ -20,8 +20,7 @@
 //!     §3.2). NaN bit patterns are collapsed at construction.
 //!   - `fromChar` rejects UTF-16 surrogate codepoints.
 //!   - `fromFixnum` rejects values outside i48 range (±140 trillion);
-//!     callers that need larger integers must go via the bignum path
-//!     once it lands.
+//!     callers that need larger integers must go via the bignum path.
 
 const std = @import("std");
 const hash = @import("hash");
@@ -29,9 +28,9 @@ const hash = @import("hash");
 // =============================================================================
 // Kind discriminator
 //
-// Numeric values are frozen per VALUE.md §2 so the Phase 2 bytecode
-// dispatcher and the Phase 4 codec can use them as jump-table indices and
-// wire tags with no remapping layer.
+// Numeric values are frozen per VALUE.md §2 so the bytecode dispatcher
+// and the codec can use them as jump-table indices and wire tags with no
+// remapping layer.
 // =============================================================================
 
 pub const Kind = enum(u8) {
@@ -44,7 +43,7 @@ pub const Kind = enum(u8) {
     float = 5,
     keyword = 6,
     symbol = 7,
-    // 8..15 reserved for future immediate kinds.
+    // 8..15 reserved for immediate kinds.
 
     // ---- Heap-allocated (payload is *HeapHeader) ----
     string = 16,
@@ -61,49 +60,46 @@ pub const Kind = enum(u8) {
     transient = 27,
     error_ = 28,
     meta_symbol = 29,
-    /// Phase 3.3a (peer-AI turn 67): host-Zig function exposed
-    /// as a first-class Value. Payload is a pointer to a STATIC
+    /// Host-Zig function exposed as a first-class Value. Payload is a pointer to a STATIC
     /// `NativeFn` descriptor (no heap allocation per fn).
     /// Distinguished from `.function` (user closure) at
     /// `call:call` dispatch.
     native_fn = 30,
-    /// Phase 4.0a (peer-AI turn 72): emdb connection handle.
+    /// emdb connection handle.
     /// Payload is a pointer to a `db.Connection` struct owned
     /// by the VM (NOT the runtime arena — Connections hold OS
     /// resources and must be closed explicitly or by VM.deinit
     /// safety-net).
     db_connection = 31,
-    /// Phase 4.0b: write transaction handle. Payload is a
+    /// Write transaction handle. Payload is a
     /// pointer to a heap-allocated `db.WriteTxn`. Single-owner,
     /// invalidated on commit/abort.
     db_write_txn = 32,
-    /// Phase 4.0b: read transaction handle. Payload is a
+    /// Read transaction handle. Payload is a
     /// pointer to a heap-allocated `db.ReadTxn`.
     db_read_txn = 33,
-    /// Phase 5 Item 1 (peer-AI turn 75): in-memory mutable cell.
+    /// In-memory mutable cell.
     /// Payload is `*HeapHeader` → `AtomBox { value, in_flight,
     /// _pad }` in heap body. Identity equality + identity hash;
     /// GC traces the contained value; codec rejects as
     /// `:unserializable`. See `docs/ATOM.md`.
     atom = 34,
-    /// Phase 5 Item 3 / 5.3a (peer-AI turn 84): user-defined
-    /// record value. Payload is `*HeapHeader` → `RecordBody
+    /// User-defined record value. Payload is `*HeapHeader` → `RecordBody
     /// { type_id, _pad, fields }`. STRUCTURAL equality + hash
     /// (same type_id + equal field maps). NOT serializable.
     /// See `docs/PROTOCOLS.md` §2.1.
     record = 35,
-    /// Phase 5.3b (peer-AI turn 84): protocol handle.
+    /// Protocol handle.
     /// Opaque, identity-valued. Payload `*HeapHeader` →
     /// `ProtocolBody { id }`. Per-VM dense `id` indexes into
     /// `VM.protocol_registry`. See `docs/PROTOCOLS.md` §2.2.
     protocol = 36,
-    /// Phase 5.3b: protocol-method dispatcher. Opaque,
+    /// Protocol-method dispatcher. Opaque,
     /// identity-valued. Payload `*HeapHeader` →
     /// `ProtocolFnBody { protocol_id, method_name_id }`. The
     /// `call:call` dispatch arm routes invocations to
     /// `vm.dispatchProtocolMethod`. Solves the "NativeFn is a
-    /// static descriptor with no per-instance state" hazard
-    /// (peer-AI turn 84 §"Big missing implementation concern").
+    /// static descriptor with no per-instance state" hazard.
     /// See `docs/PROTOCOLS.md` §2.3.
     protocol_fn = 37,
     /// Nextomic connection handle (docs/NEXTOMIC.md §8). Payload is
@@ -115,23 +111,20 @@ pub const Kind = enum(u8) {
     /// src/nextomic/handle.zig; a plain value with no open transaction,
     /// compared and hashed structurally.
     nextomic_db = 39,
-    // 40..63 reserved for future heap kinds.
-
+    // 40..63 reserved for heap kinds.
 
     // ---- Runtime-private sentinels (never escape public API) ----
     unbound = 64,
     undef = 65,
-    /// Step 5b (peer-AI turn 40 lazy-boxing): a slot's stored
-    /// Value is a pointer to a runtime-arena `UpvalCell` rather
+    /// Lazy boxing: a slot's stored Value is a pointer to a runtime-arena `UpvalCell` rather
     /// than an ordinary user value. Set by `closure:box-local`,
     /// consumed by `closure:get-cell` and `closure:make`'s
     /// `local_cell_slot` source. Never observable by user code;
     /// the binding's `BindingRef` in the compiler's scope is
     /// what records "this slot is now a cell" so subsequent
     /// reads dispatch to `closure:get-cell` instead of plain
-    /// `mov:move`. GC integration (post-5c) walks these slots
-    /// via the closure trace path; until then, the VM-owned
-    /// runtime arena holds the cell.
+    /// `mov:move`. The collector does not trace these slots; the
+    /// VM-owned runtime arena holds the cell.
     cell_internal = 66,
     _,
 
@@ -165,9 +158,9 @@ pub const flag_hash_cached: u8 = 1 << 1;
 pub const flag_durable: u8 = 1 << 2;
 // Bits 3..7 reserved.
 //
-// `flag_interned` was considered and rejected: the information is already
-// carried by `kind == .keyword or kind == .symbol` (plus the future
-// `meta_symbol` heap kind). A redundant flag creates a perpetual
+// There is no `flag_interned`: the information is already carried by
+// `kind == .keyword or kind == .symbol` (plus the reserved `meta_symbol`
+// heap kind). A redundant flag creates a perpetual
 // consistency invariant to maintain for no measurable speedup. Add it
 // back only when a concrete hot path demonstrates it pays rent.
 
@@ -259,9 +252,8 @@ pub const Value = extern struct {
     /// Inverse of `isTruthy`. Provided as a named predicate for
     /// jump-handler / cmp-handler / analyzer code paths that read
     /// more naturally as `if (v.isFalsy())` than as
-    /// `if (!v.isTruthy())`. Same single-comparison hot path
-    /// (peer-AI turn 36 confirmation that this belongs in
-    /// value.zig as the language-level truthiness predicate).
+    /// `if (!v.isTruthy())`. Same single-comparison hot path; this
+    /// is the language-level truthiness predicate.
     pub inline fn isFalsy(self: Value) bool {
         const k = @intFromEnum(self.kind());
         return k == 0 or k == 1;
@@ -309,7 +301,7 @@ pub const Value = extern struct {
         return self.tag == other.tag and self.payload == other.payload;
     }
 
-    // ---- Hash (immediates only in this commit) ----
+    // ---- Hash (immediates only; heap kinds hash in dispatch.zig) ----
 
     /// Immediate-kind semantic hash. Collapses `-0.0 / +0.0`, treats
     /// canonical NaN as reflexive, and mixes the kind byte so
@@ -403,7 +395,7 @@ pub fn fromFloat(f: f64) Value {
 }
 
 /// Wrap an already-interned keyword id. Callers obtain the id from the
-/// intern table (`src/intern.zig`, future commit).
+/// intern table (`src/intern.zig`).
 pub fn fromKeywordId(intern_id: u32) Value {
     return Value{
         .tag = @intFromEnum(Kind.keyword),
@@ -412,7 +404,7 @@ pub fn fromKeywordId(intern_id: u32) Value {
 }
 
 /// Wrap an already-interned (non-metadata-bearing) symbol id.
-/// Metadata-bearing symbols use the future `meta_symbol` heap kind.
+/// Metadata-bearing symbols use the reserved `meta_symbol` heap kind.
 pub fn fromSymbolId(intern_id: u32) Value {
     return Value{
         .tag = @intFromEnum(Kind.symbol),
@@ -420,8 +412,7 @@ pub fn fromSymbolId(intern_id: u32) Value {
     };
 }
 
-/// Phase 3.3a (peer-AI turn 67): pack a STATIC `NativeFn`
-/// descriptor pointer into a Value of kind `.native_fn`. The
+/// Pack a STATIC `NativeFn` descriptor pointer into a Value of kind `.native_fn`. The
 /// descriptor lives in static storage (no heap, no GC, no
 /// lifetime concern). The runtime treats the Value as
 /// equivalent to a Closure for call dispatch purposes (see

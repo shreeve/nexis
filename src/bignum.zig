@@ -1,12 +1,11 @@
-//! bignum.zig — arbitrary-precision integer heap kind (Phase 1, Scope A).
+//! bignum.zig — arbitrary-precision integer heap kind.
 //!
 //! Authoritative spec: `docs/BIGNUM.md`. Integer-tower semantics:
 //! `docs/SEMANTICS.md` §2.2. Physical storage: `src/heap.zig`.
 //!
-//! This module ships **construction + canonical form + equality + hash
-//! only**. Arithmetic (add/sub/mul) and division/GCD/bitwise ops land
-//! in subsequent commits per peer-AI strategy review (conversation
-//! `nexis-phase-1` turn 6).
+//! This module provides **construction + canonical form + equality + hash
+//! only**. It has no arithmetic (add/sub/mul), division, GCD or bitwise
+//! ops.
 //!
 //! The central invariant (BIGNUM.md §1): for integers, the runtime
 //! guarantees that two mathematically-equal integers are always
@@ -41,7 +40,7 @@ pub const subkind_limbs: u16 = 0;
 
 /// Body prefix. 8 bytes; followed by a variable-length `[N]u64` limb
 /// array. `_pad` is layout-only — it is NEVER fed into hashing or
-/// equality (peer-AI turn-6 catch). Semantic bytes are only the
+/// equality. Semantic bytes are only the
 /// `negative` field and the limb bytes.
 const BignumBody = extern struct {
     /// 0 = non-negative, 1 = negative. Any other value is a runtime
@@ -179,15 +178,15 @@ pub fn limbsEqual(a: *HeapHeader, b: *HeapHeader) bool {
 ///   3. Fixnum-range magnitude → fixnum.
 ///   4. Otherwise allocate a heap bignum with trimmed limbs.
 fn canonicalizeToValue(heap: *Heap, negative: bool, input_limbs: []const u64) !Value {
-    // Step 1: trim trailing zeros.
+    // 1. Trim trailing zeros.
     var trimmed_len: usize = input_limbs.len;
     while (trimmed_len > 0 and input_limbs[trimmed_len - 1] == 0) : (trimmed_len -= 1) {}
     const trimmed = input_limbs[0..trimmed_len];
 
-    // Step 2: zero magnitude → fixnum(0). Ignores `negative`.
+    // 2. Zero magnitude → fixnum(0). Ignores `negative`.
     if (trimmed.len == 0) return value.fromFixnum(0).?;
 
-    // Step 3: fixnum-range magnitude → fixnum. Only a single-limb
+    // 3. Fixnum-range magnitude → fixnum. Only a single-limb
     // magnitude can possibly fit; multi-limb is automatically out of
     // i48 range.
     if (trimmed.len == 1) {
@@ -214,11 +213,10 @@ fn canonicalizeToValue(heap: *Heap, negative: bool, input_limbs: []const u64) !V
         }
     }
 
-    // Step 4: allocate a heap bignum with the trimmed limbs.
+    // 4. Allocate a heap bignum with the trimmed limbs.
     // Overflow-safe: `trimmed.len * limb_bytes` could wrap in non-
     // safe release builds. `std.math.mul` + `std.math.add` reject
-    // pathological inputs with `error.Overflow` (peer-AI turn-6
-    // review catch).
+    // pathological inputs with `error.Overflow`.
     const limbs_size = try std.math.mul(usize, trimmed.len, limb_bytes);
     const body_size = try std.math.add(usize, prefix_bytes, limbs_size);
     const h = try heap.alloc(.bignum, body_size);
@@ -244,8 +242,8 @@ fn canonicalizeToValue(heap: *Heap, negative: bool, input_limbs: []const u64) !V
 
 /// Private accessor for the body prefix. Centralizes the
 /// `body.len >= prefix_bytes` invariant check so every caller
-/// doesn't have to re-assert (peer-AI turn-6 review: read-side
-/// invariants must be enforced, not assumed).
+/// doesn't have to re-assert (read-side invariants are enforced,
+/// not assumed).
 fn headerPrefix(h: *HeapHeader) *const BignumBody {
     const body = Heap.bodyBytes(h);
     std.debug.assert(body.len >= prefix_bytes);
@@ -551,7 +549,7 @@ test "valueFrom: tag encodes kind + subkind, payload = *HeapHeader" {
 }
 
 test "cross-constructor canonical coherence: fromI64(n) ≡ fromLimbs(false, &{n, 0, 0})" {
-    // Per BIGNUM.md §1 and peer-AI turn-6 review: semantically-equal
+    // Per BIGNUM.md §1: semantically-equal
     // integers produced through different constructor paths must be
     // byte-identical `Value`s (same kind, same payload when fixnum;
     // or equal-by-structure bignums that share hashValue).
@@ -612,10 +610,10 @@ test "fromLimbs: pathological length rejected with error.Overflow" {
     // practice; the test covers the contract rather than the
     // physical impossibility.
     //
-    // Deferred: a stronger test requires fabricating a real slice
-    // of @as(usize, maxInt(usize) / 8 + 1) u64s, which isn't
+    // A stronger test would require fabricating a real slice of
+    // @as(usize, maxInt(usize) / 8 + 1) u64s, which isn't
     // materializable. The overflow-safe mul is correctness-by-
-    // construction and reviewed by peer AI.
+    // construction.
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     // Degenerate: empty slice → fixnum(0), no allocation.

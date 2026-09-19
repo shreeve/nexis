@@ -1,14 +1,14 @@
 // =============================================================================
-// src/loader.zig — Phase 3.6 namespace loader
+// src/loader.zig — namespace loader
 // =============================================================================
 //
-// Per peer-AI turns 69 + 71: `(require ...)` resolves a namespace
+// `(require ...)` resolves a namespace
 // name to a `.nx` file, parses + compiles + evaluates it in its
 // own declared namespace, and returns control to the caller's
 // namespace. Idempotent: re-requiring an already-loaded ns is a
 // no-op. Cycle detection via a `loading` set.
 //
-// v1 SCOPE (peer-AI turn 71 §2):
+// SCOPE:
 //   - `(require 'my.ns)` and `(require '[my.ns :as alias])`
 //   - Ns-to-file mapping: `my.app.foo` → `my/app/foo.nx`
 //   - Load path: each entry is a directory to search
@@ -17,7 +17,7 @@
 //   - Required file's `(ns ...)` declaration MUST match the
 //     requested name (else `LoadError.NamespaceMismatch`)
 //
-// DEFERRED:
+// NOT SUPPORTED:
 //   - `:refer`, `:rename`, `:exclude`, `:reload`
 //   - Relative requires
 //   - Private vars
@@ -25,9 +25,9 @@
 //
 // The loader is wired into the expander via a callback on
 // `ExpandContext.load_callback` (set by the CLI / test harness).
-// Approach mirrors the compile-eval callback pattern from Phase
-// 3.2: the expander doesn't depend on compile/loader machinery
-// directly; just calls through an opaque user_data pointer.
+// Approach mirrors the compile-eval callback pattern: the
+// expander doesn't depend on compile/loader machinery directly;
+// it just calls through an opaque user_data pointer.
 
 const std = @import("std");
 const reader_mod = @import("reader");
@@ -46,8 +46,7 @@ pub const LoadError = error{
     /// quoted symbol or quoted `[ns :as alias]` vector).
     MalformedRequire,
     /// `(require ...)` would form a cycle (namespace is already
-    /// in the loading set). v1 surfaces this; future commits may
-    /// add reload-detection semantics.
+    /// in the loading set).
     CyclicRequire,
     /// The loaded file's `(ns ...)` declaration differs from
     /// the requested namespace name. Catches typos and rename
@@ -58,7 +57,7 @@ pub const LoadError = error{
     OutOfMemory,
 };
 
-/// Phase 3.6: stable load context. Owns the loaded-set and
+/// Stable load context. Owns the loaded-set and
 /// loading-set across all `(require ...)` calls in a compilation
 /// session. CLI creates one at startup; tests can create their
 /// own. The expander invokes `loadNamespaceCallback` indirectly
@@ -192,7 +191,7 @@ pub const Loader = struct {
 
         for (forms) |form| {
             const current_ns = self.registry.current;
-            // Phase 5 EXIT polish: pass `self` as the load_callback
+            // Pass `self` as the load_callback
             // so that `(require ...)` forms INSIDE the file we're
             // loading work transitively. Without this, a required
             // file's nested require would expand into UnboundVar /
@@ -217,7 +216,7 @@ pub const Loader = struct {
         }
     }
 
-    /// Phase 3.6 callback: expander's `ExpandContext.load_callback`
+    /// Callback: expander's `ExpandContext.load_callback`
     /// is set to this. Translates the opaque `user_data` back to
     /// `*Loader` + invokes `loadNamespace`.
     pub fn loadCallback(user_data: *anyopaque, ns_name: []const u8) anyerror!void {

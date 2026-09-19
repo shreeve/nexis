@@ -1,4 +1,4 @@
-//! golden.zig — Phase 0 golden test runner.
+//! golden.zig — reader golden test runner.
 //!
 //! Usage:
 //!   nexis-golden --verify <dir>     (default via `zig build golden`)
@@ -30,9 +30,7 @@ pub fn main(init: std.process.Init) !u8 {
     var mode: Mode = .verify;
     var dir_path: ?[]const u8 = null;
     for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--verify")) mode = .verify
-        else if (std.mem.eql(u8, arg, "--update")) mode = .update
-        else if (std.mem.startsWith(u8, arg, "--")) {
+        if (std.mem.eql(u8, arg, "--verify")) mode = .verify else if (std.mem.eql(u8, arg, "--update")) mode = .update else if (std.mem.startsWith(u8, arg, "--")) {
             std.debug.print("unknown flag: {s}\n", .{arg});
             return 2;
         } else dir_path = arg;

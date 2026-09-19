@@ -6,9 +6,9 @@
 //! `src/dispatch.zig` as `dispatch.equal(a, b)`, which is the canonical
 //! full-Value entry point.
 //!
-//! The split is an architectural consequence (peer-AI review
-//! conversation `nexis-phase-1` turns 3+5): putting the dispatcher in
-//! this module would create a module-graph cycle that Zig's test
+//! The split is an architectural consequence: putting the
+//! dispatcher in this module would create a module-graph cycle
+//! that Zig's test
 //! runner cannot resolve when any cycle member is used as a test-
 //! binary root. Rather than hide the partial-ness behind a total-
 //! looking API, the function name carries the contract: `equalImmediate`.

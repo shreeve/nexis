@@ -1,4 +1,4 @@
-//! format.zig — Value → text presentation (Phase 5.2c, peer-AI turn 81).
+//! format.zig — Value → text presentation.
 //!
 //! Two modes:
 //!   - `.display`  strings UNQUOTED; chars as their UTF-8 bytes;
@@ -11,10 +11,9 @@
 //!                 printable ASCII / `\u{HEX}` for the rest;
 //!                 nil → `"nil"`. Used by `prn` and `pr-str`.
 //!
-//! Replaces three duplicate `formatValue` helpers from before 5.2c:
-//!   - `src/cli.zig` formatValue        (REPL + run output)
-//!   - `test/integration/eval_pipeline.zig` formatValue
-//!   - `src/stdlib.zig` appendStringified (the 5.2a minimal local)
+//! The single formatter: `src/cli.zig` (REPL + run output),
+//! `test/integration/eval_pipeline.zig` and `src/stdlib.zig` all
+//! delegate here.
 //!
 //! Authoritative contract: `docs/STRING.md` §9 (and the readable
 //! escape table). Non-readable value kinds (atom, function, var,
@@ -25,7 +24,7 @@
 //! source form. The codec (`src/codec.zig`) is the serialization
 //! layer; format.zig is presentation.
 //!
-//! Frozen invariants (peer-AI turn 81):
+//! Frozen invariants:
 //!   §F1. `format(.display, nil)` writes `"nil"`. `str`/`join`/`spit`
 //!        each layer their OWN nil → empty wrapping ON TOP of
 //!        format; format itself never special-cases nil.
@@ -33,12 +32,11 @@
 //!        Value containing malformed UTF-8 surfaces `error.Utf8Error`
 //!        in readable mode (display mode preserves raw bytes
 //!        unmodified, since storage is byte-blob per STRING.md §2).
-//!   §F3. Recursion has no depth cap in v1. Persistent collections
+//!   §F3. Recursion has no depth cap. Persistent collections
 //!        can't self-cycle without an atom in the way, and atoms
 //!        format opaquely — so no infinite recursion is possible
-//!        under v1's heap-kind set. A depth cap can land if a
-//!        future Kind introduces non-opaque cycles (peer-AI turn 81
-//!        §D9 #2).
+//!        with the heap-kind set; every Kind that can hold a
+//!        reference cycle formats opaquely.
 
 const std = @import("std");
 const value_mod = @import("value");
@@ -123,18 +121,17 @@ pub fn format(
             try writer.print("#<native-fn {s}>", .{nf.name});
         },
         // Identity-valued kinds format opaquely in BOTH modes per
-        // turn 81 §D9 — they have no canonical source form, so
+        // — they have no canonical source form, so
         // readable mode's output is intentionally not reader-
         // round-trippable. The codec is the serialization layer;
         // these kinds throw `:unserializable` there.
         .atom => try writer.writeAll("#<atom>"),
-        // Phase 5.3a (peer-AI turn 84): records render as
-        // `#<record type-id={id}>` opaque in both modes (turn 84
-        // §"Format" — intentionally NOT reader-roundtrippable
-        // until tagged-literal reader support exists). The full
-        // `#my.ns/Counter{:n 1}` shape is deferred.
+        // Records render as `#<record type-id={id}>` opaque in
+        // both modes (NOT reader-roundtrippable: the reader has no
+        // tagged-literal support, so there is no
+        // `#my.ns/Counter{:n 1}` shape).
         .record => try writer.print("#<record type-id={d}>", .{record_mod.typeId(v)}),
-        // Phase 5.3b: protocols + protocol_fn are opaque
+        // Protocols + protocol_fn are opaque
         // identity-valued. Format prints `#<protocol id=N>` and
         // `#<protocol-fn proto=P method=M>` (interned-name
         // resolution lives in the VM and is intentionally not
@@ -223,7 +220,7 @@ fn formatString(v: Value, mode: FormatMode, writer: *std.Io.Writer) Error!void {
         try writer.writeAll(bytes);
         return;
     }
-    // Readable: validate UTF-8 first (turn 81 §F2). The reader cannot
+    // Readable: validate UTF-8 first (§F2). The reader cannot
     // construct a malformed string Value, but a corrupt codec / fuzzer
     // could; refusing to emit invalid source is the safer policy.
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.Utf8Error;
@@ -351,8 +348,8 @@ fn formatDurableRef(
     _: ?*const intern_mod.Interner,
 ) Error!void {
     // Identity-triple shape: store_id is u128 (large but stable);
-    // tree_name + key_bytes are typically short strings. Peer-AI
-    // turn 82 §R5: KEY BYTES are arbitrary (any byte 0x00..0xFF
+    // tree_name + key_bytes are typically short strings.
+    // KEY BYTES are arbitrary (any byte 0x00..0xFF
     // is legal), so printing them raw can sneak control chars,
     // `>`, newlines, or invalid UTF-8 into the output and break
     // the opaque-token envelope. Hex-encode them so the printed
