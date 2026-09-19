@@ -4,12 +4,12 @@
 //! `docs/HEAP.md` (allocator + object-enumeration + minimal sweep).
 //!
 //! This is the bedrock every heap-kind Value sits on. String, bignum,
-//! CHAMP map/set, persistent vector, cons list, transient wrapper, Var,
-//! durable-ref — all of them land on a `*HeapHeader` returned from
-//! `Heap.alloc`. Full garbage collection (root enumeration, precise
-//! tracing, trigger policy) lands later in `src/gc.zig`; this file
-//! delivers the allocation + enumeration + mark-sweep scaffold the
-//! collector will build on top of.
+//! CHAMP map/set, persistent vector, cons list, transient wrapper,
+//! closure, upvalue cell, durable-ref — all of them land on a
+//! `*HeapHeader` returned from `Heap.alloc`. The collector in
+//! `src/gc.zig` marks from roots and sweeps through `sweepUnmarked`;
+//! this file owns allocation, enumeration, the byte counters the
+//! trigger policy reads and the sweep primitive.
 //!
 //! Frozen invariants (VALUE.md §4 + HEAP.md §1):
 //!   - Returned `*HeapHeader` is 16-byte aligned.
@@ -200,6 +200,14 @@ inline fn blockOf(h: *HeapHeader) *Block {
 pub const Heap = struct {
     backing: Allocator,
     live_head: ?*Block = null,
+    /// Bytes held by every live block, header and body included.
+    live_bytes: usize = 0,
+    /// The largest `live_bytes` has been: the high-water mark a
+    /// bounded-memory test asserts against.
+    peak_live_bytes: usize = 0,
+    /// Bytes allocated since `resetAllocationCounter`: what the
+    /// collector's trigger compares against its threshold.
+    allocated_since_collect: usize = 0,
 
     pub fn init(backing: Allocator) Heap {
         return .{ .backing = backing };
@@ -218,8 +226,21 @@ pub const Heap = struct {
         self.* = undefined;
     }
 
+    /// Which `Kind`s carry a `*HeapHeader` in `Value.payload`: every
+    /// heap kind except the ones whose payload is a pointer the VM
+    /// or static storage owns (`native_fn`, `var_`, the three db
+    /// handles), plus the `cell_internal` sentinel, whose blocks
+    /// hold upvalue cells. The collector marks only these.
+    pub fn isBlockKind(kind: value.Kind) bool {
+        return switch (kind) {
+            .native_fn, .var_, .db_connection, .db_write_txn, .db_read_txn => false,
+            .cell_internal => true,
+            else => kind.isHeap(),
+        };
+    }
+
     pub fn alloc(self: *Heap, kind: value.Kind, body_size: usize) !*HeapHeader {
-        std.debug.assert(kind.isHeap());
+        std.debug.assert(kind.isHeap() or kind == .cell_internal);
         // Overflow-safe: on a 32-bit usize + near-maxInt body_size we'd
         // wrap and under-allocate silently in non-safe release builds.
         // `std.math.add` returns `error.Overflow`; the caller's error
@@ -239,7 +260,16 @@ pub const Heap = struct {
         // mark / flags / hash / meta are already 0 from the memset.
 
         self.live_head = block;
+        self.live_bytes += total;
+        if (self.live_bytes > self.peak_live_bytes) self.peak_live_bytes = self.live_bytes;
+        self.allocated_since_collect += total;
         return &block.header;
+    }
+
+    /// Start a new allocation-counting window; the collector calls
+    /// this after every cycle.
+    pub fn resetAllocationCounter(self: *Heap) void {
+        self.allocated_since_collect = 0;
     }
 
     pub fn free(self: *Heap, h: *HeapHeader) void {
@@ -272,6 +302,7 @@ pub const Heap = struct {
 
         h.kind = poisoned_kind;
         const slice = blockSlice(block);
+        self.live_bytes -= slice.len;
         self.backing.free(slice);
     }
 
@@ -388,7 +419,9 @@ pub const Heap = struct {
             } else {
                 if (prev) |p| p.next = next else self.live_head = next;
                 b.header.kind = poisoned_kind;
-                self.backing.free(blockSlice(b));
+                const slice = blockSlice(b);
+                self.live_bytes -= slice.len;
+                self.backing.free(slice);
                 freed += 1;
             }
             cur = next;
@@ -815,4 +848,44 @@ test "alloc stress: 256 allocations, sweep half, deinit the rest" {
     for (headers, 0..) |h, i| {
         if (i % 2 == 0) try testing.expect(!h.isMarked());
     }
+}
+
+test "byte counters: alloc adds, free and sweep subtract, peak holds, the window resets" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    try testing.expectEqual(@as(usize, 0), heap.live_bytes);
+
+    const a = try heap.alloc(.string, 16);
+    const b = try heap.alloc(.string, 48);
+    const per = header_and_body_offset;
+    try testing.expectEqual(per * 2 + 64, heap.live_bytes);
+    try testing.expectEqual(per * 2 + 64, heap.peak_live_bytes);
+    try testing.expectEqual(per * 2 + 64, heap.allocated_since_collect);
+
+    heap.free(b);
+    try testing.expectEqual(per + 16, heap.live_bytes);
+    try testing.expectEqual(per * 2 + 64, heap.peak_live_bytes);
+
+    heap.resetAllocationCounter();
+    try testing.expectEqual(@as(usize, 0), heap.allocated_since_collect);
+
+    _ = try heap.alloc(.list, 0); // unmarked: swept
+    a.setMarked();
+    _ = heap.sweepUnmarked();
+    try testing.expectEqual(per + 16, heap.live_bytes);
+    try testing.expectEqual(per, heap.allocated_since_collect);
+}
+
+test "isBlockKind: pointer payloads the collector must not dereference" {
+    try testing.expect(Heap.isBlockKind(.string));
+    try testing.expect(Heap.isBlockKind(.function));
+    try testing.expect(Heap.isBlockKind(.cell_internal));
+    try testing.expect(Heap.isBlockKind(.atom));
+    try testing.expect(!Heap.isBlockKind(.native_fn));
+    try testing.expect(!Heap.isBlockKind(.var_));
+    try testing.expect(!Heap.isBlockKind(.db_connection));
+    try testing.expect(!Heap.isBlockKind(.db_write_txn));
+    try testing.expect(!Heap.isBlockKind(.db_read_txn));
+    try testing.expect(!Heap.isBlockKind(.fixnum));
+    try testing.expect(!Heap.isBlockKind(.nil));
 }

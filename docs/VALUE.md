@@ -117,8 +117,8 @@ Payload = `u64` pointer to a heap object with a standard `HeapHeader`
 | 21 | `list` | cons list | 0 = normal cons; 1 = empty singleton |
 | 22 | `byte_vector` | packed u8 slice | |
 | 23 | `typed_vector` | homogeneous numeric slice | 0 = i32, 1 = i64, 2 = f32, 3 = f64 |
-| 24 | `function` | closure (routine + upvalues) | Payload is a raw `*Closure` allocated from the VM's runtime arena, not a `HeapHeader` block (`docs/VM.md` §6) |
-| 25 | `var_` | namespace var cell | |
+| 24 | `function` | closure (routine + upvalues) | Body `Closure { routine, upvalues }` with the cell pointers in the block's tail (`docs/VM.md` §6); identity-valued |
+| 25 | `var_` | namespace var cell | Payload is a raw `*Var` in the VM's runtime arena, not a `HeapHeader` block: Vars are immortal and the collector roots their contents through the namespaces (`docs/GC.md` §3); identity-valued |
 | 26 | `durable_ref` | emdb identity triple | |
 | 27 | `transient` | mutable wrapper | 0 = transient map, 1 = transient set, 2 = transient vector (local enum, pinned in `docs/TRANSIENT.md` §2; the subkind classifies within the kind and does not mirror the inner collection's kind byte) |
 | 28 | `error_` | exception value | |
@@ -146,6 +146,7 @@ API).
 |---|---|
 | `unbound` (kind = 64) | `Var.root` when the var has no root (PLAN §13.3). Calling an unbound var throws `:unbound-var`. Never serializable. |
 | `undef` (kind = 65) | Compile-time placeholder in IR construction. Never reaches the VM. |
+| `cell_internal` (kind = 66) | A slot whose binding has been boxed into an upvalue cell: the payload is the `*HeapHeader` of a cell block of this kind (`docs/VM.md` §6). Never observable by user code; the collector traces the block through the VM. |
 
 Sentinels satisfy `identical?` but never `=` — attempting `(= unbound x)`
 at the language level throws `:sentinel-escape`, since a user-observable
@@ -223,8 +224,8 @@ The `mark: u8` field uses two bits in v1:
 | 2..7 | reserved | Future generational / tri-color / remembered-set use |
 
 The collector is precise stop-the-world mark-sweep (PLAN §23 #2, #18; `docs/GC.md`).
-`marked` is cleared by sweep; `pinned` is set by open transactions /
-durable-ref handles / REPL history / intern tables (PLAN §10.5).
+`marked` is cleared by sweep; `pinned` survives a sweep unmarked and
+no runtime module sets it (`docs/GC.md` §3).
 
 ---
 

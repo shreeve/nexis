@@ -236,10 +236,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     vm_mod.addImport("value", value_mod);
-    // VM owns a `Heap` (backed by its runtime_arena) for
-    // variadic rest-list construction. heap+list are tiny pure-
-    // allocator wrappers; pulling them in does NOT pull GC.
+    // The VM owns the collected heap and is the collector's host
+    // (docs/VM.md §9).
     vm_mod.addImport("heap", heap_mod);
+    vm_mod.addImport("gc", gc_mod);
     vm_mod.addImport("list", list_mod);
     // VM owns `coll:vector` runtime construction.
     vm_mod.addImport("vector", vector_mod);
@@ -691,7 +691,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db", "atom", "record", "protocol", "nextomic_handle" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "string", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
-        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch", "record", "protocol", "bignum" } },
+        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "gc", "list", "intern", "vector", "champ", "dispatch", "record", "protocol", "bignum" } },
         // format test binary. Imports the menagerie of
         // consumer kinds; nothing depends on format itself.
         .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle", "bignum" } },
@@ -846,6 +846,14 @@ pub fn build(b: *std.Build) void {
     prop_gc_mod.addImport("champ", champ_mod);
     prop_gc_mod.addImport("dispatch", dispatch_mod);
     prop_gc_mod.addImport("gc", gc_mod);
+    // The program-level case runs source through the whole pipeline
+    // on a VM whose collector is forced frequent.
+    prop_gc_mod.addImport("vm", vm_mod);
+    prop_gc_mod.addImport("compile", compile_mod);
+    prop_gc_mod.addImport("intern", intern_mod);
+    prop_gc_mod.addImport("reader", reader_mod);
+    prop_gc_mod.addImport("expand", expand_mod);
+    prop_gc_mod.addImport("stdlib", stdlib_mod);
 
     const prop_gc_tests = b.addTest(.{ .root_module = prop_gc_mod });
     const run_prop_gc_tests = b.addRunArtifact(prop_gc_tests);
@@ -1135,6 +1143,7 @@ pub fn build(b: *std.Build) void {
             "datoms",
             "persist-1",
             "persist-2",
+            "gc",
         };
         const scratch = b.addWriteFiles();
         // The binary is copied only so the directory's hash, and with
@@ -1158,6 +1167,9 @@ pub fn build(b: *std.Build) void {
             run.setCwd(scratch.getDirectory());
             run.expectExitCode(0);
             run.expectStdOutEqual(expected);
+            // gc.nx proves the collector inside query callbacks: it
+            // runs with a cycle due every few kilobytes.
+            if (std.mem.eql(u8, name, "gc")) run.setEnvironmentVariable("NEXIS_GC_STRESS", "1");
             // persist-2 reads what persist-1 wrote; every other script
             // owns its store.
             if (std.mem.eql(u8, name, "persist-1")) persist_1 = &run.step;

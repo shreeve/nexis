@@ -9,13 +9,15 @@
 //! `trace` function this collector dispatches to during the mark
 //! phase.
 //!
-//! Collector contract (GC.md §9):
-//!   - Explicit-only — callers invoke `collect(roots)` directly. No
-//!     auto-trigger based on allocation threshold.
+//! Collector contract (GC.md §4):
+//!   - A cycle is `collect(roots)`: the caller's roots, then the
+//!     host's (`Host.roots`), then the sweep. The VM decides when a
+//!     cycle is due (GC.md §7); the collector has no policy of its
+//!     own.
 //!   - Non-reentrant — `collect` panics if called from inside a
 //!     visitor callback. Flag-guarded via `self.collecting`.
-//!   - Precise — caller supplies a complete root set; collector
-//!     does NOT scan stacks or registers.
+//!   - Precise — the roots are complete; the collector does NOT
+//!     scan stacks or registers.
 //!   - No write barriers (STW, single-threaded).
 //!   - No generational / concurrent phases.
 //!
@@ -30,8 +32,11 @@
 //!     ├─ @import("vector")  — vector.trace
 //!     └─ @import("champ")    — champ.traceMap + champ.traceSet
 //!
-//! Nothing imports gc.zig. Per-kind modules take the visitor as
-//! `anytype`; `gc.Collector` satisfies the duck-typed visitor ABI
+//! `vm.zig` imports gc.zig and is the collector's host: it
+//! enumerates the runtime's roots and traces the two block kinds
+//! whose layout it owns (closures and upvalue cells) through
+//! `Host`. Per-kind modules take the visitor as `anytype`;
+//! `gc.Collector` satisfies the duck-typed visitor ABI
 //! `{ markValue, mark, markInternal }`.
 
 const std = @import("std");
@@ -67,6 +72,25 @@ pub const Collector = struct {
     /// are legal (tests exercise them to verify individual primitives);
     /// they do not touch this flag.
     collecting: bool = false,
+    /// The runtime behind this heap, when there is one. A collector
+    /// over a bare heap (the property tests) has none: its roots are
+    /// all explicit and a closure or cell block cannot appear.
+    host: ?Host = null,
+
+    /// What the collector needs from the runtime that owns the heap
+    /// (GC.md §3, §5): its roots, and the tracing of the two block
+    /// kinds whose bodies `vm.zig` lays out.
+    pub const Host = struct {
+        ctx: *anyopaque,
+        /// Mark every root the host holds through `collector`
+        /// (`markValue` / `mark`); called once per cycle after the
+        /// explicit roots.
+        roots: *const fn (ctx: *anyopaque, collector: *Collector) void,
+        /// Walk the children of `h`, a `function` block (a closure:
+        /// its upvalue cells) or a `cell_internal` block (an upvalue
+        /// cell: its value). `h` is already marked.
+        trace: *const fn (ctx: *anyopaque, h: *HeapHeader, collector: *Collector) void,
+    };
 
     pub fn init(heap: *Heap) Collector {
         return .{ .heap = heap };
@@ -74,14 +98,19 @@ pub const Collector = struct {
 
     /// Start a reachability walk from a `Value`. Immediate-kind
     /// Values (nil, bool, char, fixnum, float, keyword, symbol) have
-    /// no heap allocation underneath; they are silently ignored.
-    /// Heap-kind Values are dereferenced to their `*HeapHeader` and
-    /// marked + traced. This is the safe entry point for callers
-    /// holding Values (e.g. from a VM frame slot) rather than raw
-    /// heap headers.
+    /// no heap allocation underneath, and the pointer kinds the VM or
+    /// static storage owns (`native_fn`, `var_`, the db handles;
+    /// `Heap.isBlockKind`) have no block to mark: both are silently
+    /// ignored. A Var's root, metadata and thread value are marked by
+    /// the host's namespace walk, so skipping the `var_` Value loses
+    /// nothing. Every other Value is dereferenced to its
+    /// `*HeapHeader` and marked + traced. This is the safe entry
+    /// point for callers holding Values (e.g. from a VM frame slot)
+    /// rather than raw heap headers.
     pub fn markValue(self: *Collector, v: Value) void {
-        if (!v.kind().isHeap()) return;
-        self.mark(Heap.asHeapHeader(v));
+        if (!Heap.isBlockKind(v.kind())) return;
+        std.debug.assert(v.payload != 0 and (v.payload & 0xF) == 0);
+        self.mark(@ptrFromInt(v.payload));
     }
 
     /// Mark a full heap object and recursively walk its children.
@@ -124,13 +153,24 @@ pub const Collector = struct {
             // pointer the VM owns plus inline path text, the db box
             // that pointer and numbers (nextomic_handle).
             .nextomic_conn, .nextomic_db => {},
-            // Reserved heap kinds without implementations.
+            // Closures and upvalue cells: the host lays them out and
+            // walks them (VM.md §6, GC.md §5).
+            .function, .cell_internal => {
+                const host = self.host orelse std.debug.panic(
+                    "gc.mark: a {s} block reached a collector with no host; only a runtime allocates this kind",
+                    .{@tagName(k)},
+                );
+                host.trace(host.ctx, h, self);
+            },
+            // Vars are arena objects the namespace registry roots
+            // (GC.md §3); a `var_` header is a corrupted kind byte.
+            // `typed_vector` has no instances and traces no children.
+            // The remaining reserved kinds have no implementation.
             // PANIC, not silent no-op, per GC.md §5: a silent no-op
             // on a kind that SHOULD trace would create invisible
             // retention bugs.
             .byte_vector,
             .typed_vector,
-            .function,
             .var_,
             .error_,
             .meta_symbol,
@@ -175,9 +215,11 @@ pub const Collector = struct {
     }
 
     /// Run a full collection cycle:
-    ///   1. Mark each root (transitive closure via `mark`).
+    ///   1. Mark each root (transitive closure via `mark`), then the
+    ///      host's roots when there is a host.
     ///   2. Sweep: free every unmarked, non-pinned heap block.
     ///   3. Clear mark bits on survivors (handled inside sweepUnmarked).
+    ///   4. Start a new allocation-counting window on the heap.
     /// Returns the number of blocks freed.
     ///
     /// **Not reentrant.** Panics if called while already collecting.
@@ -192,7 +234,10 @@ pub const Collector = struct {
         defer self.collecting = false;
 
         for (roots) |r| self.mark(r);
-        return self.heap.sweepUnmarked();
+        if (self.host) |host| host.roots(host.ctx, self);
+        const freed = self.heap.sweepUnmarked();
+        self.heap.resetAllocationCounter();
+        return freed;
     }
 };
 
@@ -613,5 +658,53 @@ test "metadata chain: meta-only unreachable block is swept" {
     var gc = Collector.init(&heap);
     const freed = gc.collect(&.{}); // no roots
     try testing.expectEqual(@as(usize, 1), freed);
+    try testing.expectEqual(@as(usize, 0), heap.liveCount());
+}
+
+test "host: roots are marked after the explicit roots and closure/cell blocks trace through it" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    // A cell block whose value is a string, a root string held only
+    // by the host, and an orphan. The fake host traces a cell by its
+    // one value and roots the cell itself.
+    const kept = try string.fromBytes(&heap, "kept");
+    const cell_h = try heap.alloc(.cell_internal, @sizeOf(Value));
+    Heap.bodyOf(Value, cell_h).* = kept;
+    const host_root = try string.fromBytes(&heap, "host-root");
+    _ = try string.fromBytes(&heap, "orphan");
+    try testing.expectEqual(@as(usize, 4), heap.liveCount());
+
+    const FakeHost = struct {
+        cell: *HeapHeader,
+        root: Value,
+        fn roots(ctx: *anyopaque, c: *Collector) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            c.markValue(self.root);
+            c.mark(self.cell);
+        }
+        fn trace(_: *anyopaque, h: *HeapHeader, c: *Collector) void {
+            std.debug.assert(h.kind == @intFromEnum(Kind.cell_internal));
+            c.markValue(Heap.bodyOf(Value, h).*);
+        }
+    };
+    var fake = FakeHost{ .cell = cell_h, .root = host_root };
+    var collector = Collector.init(&heap);
+    collector.host = .{ .ctx = @ptrCast(&fake), .roots = &FakeHost.roots, .trace = &FakeHost.trace };
+    const freed = collector.collect(&.{});
+    try testing.expectEqual(@as(usize, 1), freed);
+    try testing.expectEqual(@as(usize, 3), heap.liveCount());
+    try testing.expectEqual(@as(usize, 0), heap.allocated_since_collect);
+}
+
+test "markValue ignores the pointer kinds that carry no block" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var collector = Collector.init(&heap);
+    // A `native_fn` Value whose payload is a stack address: marking
+    // must not dereference it.
+    var descriptor: u64 = 0;
+    collector.markValue(value.fromNativeFnPtr(@ptrCast(&descriptor)));
+    collector.markValue(.{ .tag = @intFromEnum(Kind.var_), .payload = @intFromPtr(&descriptor) });
     try testing.expectEqual(@as(usize, 0), heap.liveCount());
 }

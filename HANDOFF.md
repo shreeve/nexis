@@ -85,9 +85,12 @@ The build steps, and what each is for:
 | `zig build bench` | the ReleaseFast benchmark harness (`docs/BENCH.md`) | minutes |
 | `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` via `../nexus/bin/nexus` | seconds |
 
-The one environment variable is `NEXTOMIC_BENCH`: when set, the two
+Two environment variables. `NEXTOMIC_BENCH`: when set, the two
 Nextomic corpora print `[bench]` timing lines to stderr
-(`NEXTOMIC_BENCH=1 zig build nextomic-test --summary all`). Debug
+(`NEXTOMIC_BENCH=1 zig build nextomic-test --summary all`).
+`NEXIS_GC_STRESS`: when set, every VM collects every 4 KiB of
+allocation instead of every 16 MiB (`NEXIS_GC_STRESS=1 zig build test
+--summary all` proves the natives' rooting; `docs/GC.md` §7). Debug
 numbers under the testing allocator are not performance
 measurements; `docs/PERF.md` §3.7 has the ReleaseFast ones and the
 command that reproduces them.
@@ -174,11 +177,16 @@ domains are separated; metadata never affects either.
 `src/coll/champ.zig` (map and set), `src/coll/vector.zig` (plain
 32-way trie with tail; `conj` and `assoc` are O(log n)),
 `src/coll/list.zig`, `src/coll/transient.zig`. `src/heap.zig` owns the
-blocks; the VM's `Heap` is backed by `VM.runtime_arena`, and closures,
-Vars and upvalue cells are raw arena allocations. `src/gc.zig` is a
-precise mark-sweep collector with caller-supplied roots; it passes
-its property tests and **no allocation path ever calls
-`Collector.collect`**, so a process grows until it exits (§6.1).
+blocks and counts the bytes; every runtime value, closure and upvalue
+cell is a block on the VM's `Heap`, while Vars and namespaces are
+immortal arena objects. `src/gc.zig` is a precise, non-moving
+mark-sweep collector whose host is the VM (`docs/GC.md` §3, §7):
+`VM.gcRoots` enumerates the stack, frames, Vars, binding stack, root
+stack and pending throws, and a cycle runs at the instruction-fetch
+safe point once the heap has allocated its threshold (16 MiB or the
+live size, whichever is larger; `NEXIS_GC_STRESS=1` makes it 4 KiB
+for every VM). A native that keeps a callback's result across a
+further call back into the VM pushes it on a `vm.rootScope()` first.
 
 ### 3.4 The db seam
 
@@ -390,43 +398,7 @@ polish; their findings are folded into tests. What they left open is
 ## 6. Known gaps
 
 Each gap: symptom, cause, approach, the test that would prove it,
-size. Nothing here is a data-corruption risk; the first bounds
-process lifetime.
-
-### 6.1 The collector is never invoked
-
-*Symptom*: process memory grows without bound; a loader that
-transacts millions of datoms in one process peaks in gigabytes.
-Nextomic's own work is arena-scoped and freed per operation; the
-tx-data a program builds, the reports and query results it holds live
-in the VM heap and stay there.
-
-*Cause*: `src/gc.zig` `Collector.collect` has callers only in its own
-tests and `test/prop/{gc,transient}.zig`; `src/vm.zig` enumerates no
-roots; closures, Vars and `UpvalCell`s are raw `runtime_arena`
-allocations the collector cannot see; `gc.zig`'s mark switch panics
-on `function`, `var_`, `error_`, `meta_symbol`, `byte_vector` and
-`typed_vector` by design, so the collector cannot be switched on
-until those kinds trace. `docs/GC.md` §9 pins the deferral.
-
-*Approach*: (1) a rooting protocol — VM stack and frames, namespace
-Vars, the interner, atom cells, open `db` and
-`nextomic` handles, the per-VM Nextomic query and rule caches (which
-hold query values by heap identity; `docs/NEXTOMIC.md` §5 says a
-collector that frees or moves values must clear both), and a scoped
-root set native functions push values onto before calling
-`vm.callValue`; (2) move closures, Vars and cells onto the heap with
-`trace` arms; (3) a byte counter in `Heap.alloc` and a threshold on
-`Collector`. Nextomic needs nothing beyond cache clearing.
-
-*Proof*: a `test/prop/gc.zig` case that runs a program allocating in
-a loop under a small threshold and asserts a bounded high-water mark
-and unchanged results; an `eval_pipeline` case where a native HOF
-(`map`, `reduce`, `db/reduce-tree`, a query predicate) survives a
-collection triggered inside its callback.
-
-*Size*: `vm.zig`, `gc.zig`, `heap.zig`, `stdlib.zig`, `nextomic/
-query/natives.zig`, `docs/GC.md`; on the order of a thousand lines.
+size. Nothing here is a data-corruption risk.
 
 ### 6.3 Clojure surface gaps
 
@@ -496,19 +468,18 @@ plus arms in five files.
 
 ### 6.7 `^:dynamic` Vars and `binding`
 
-*Symptom*: `(binding [x 2] x)` is `UnresolvedSymbol`; `(def ^:dynamic
-x 1)` is `MacroExpansionFailure`, so the marker cannot even be
-written. PLAN §21 Phase 3.7.
+*Symptom*: `(binding [x 2] x)` is `UnresolvedSymbol`. PLAN §21
+Phase 3.7.
 
-*Approach*: a dynamic-binding stack on the VM; `binding` as a macro
-over push/pop with a `finally`; Var loads check the stack only for
-Vars marked dynamic so ordinary loads stay one indirection.
+*Approach*: the VM holds the binding stack (`docs/VM.md` §6.5 names
+its shape); `binding` as a macro over push/pop with a `finally`; the
+natives, the macro, `set!` and the tests are what remain.
 
 *Proof*: `eval_pipeline` cases for nesting, a throw through
 `binding`, and a closure capturing a dynamic Var seeing the binding
 in force at call time.
 
-*Size*: `vm.zig`, `compile.zig`, `core.nx`; a couple of hundred lines.
+*Size*: `stdlib.zig`, `core.nx`; a couple of hundred lines.
 
 ### 6.8 Nextomic follow-ups
 
@@ -519,7 +490,7 @@ case and its `.out`:
 - **Transaction functions and `:db.fn/cas`**: a Lisp function called
   inside `transact!` with `db-before`, returning tx-data. Functions
   are not serializable, so the function resolves through a namespace
-  Var by symbol; it needs §6.1's rooting rule once the collector runs.
+  Var by symbol; it follows the rooting rule of `docs/GC.md` §11.5.
   `transact.zig` normalise stage plus the `CallHook` pattern of
   `query/exec.zig`.
 - **Excision**: removing datoms from history. EAVT is a prefix
@@ -590,8 +561,9 @@ fix the environment before the first edit.
 an entry in the table of its namespace (`core_fns`, `db_fns`,
 `string_fns`, `internal_fns`). The VM enforces arity; the function
 receives `(vm, args)` and returns a `Value` or a `VmError`. Throw with
-`vm.throwKeyword("name")` or `vm.throwValue(v)`; never hold a VM-heap
-pointer across `vm.callValue` without rooting it (§6.1). Nextomic
+`vm.throwKeyword("name")` or `vm.throwValue(v)`; a callback result
+kept across a further `vm.callValue` goes on a `vm.rootScope()`
+first (`docs/GC.md` §11.5). Nextomic
 natives go in `src/nextomic/natives.zig`'s table (or
 `query/natives.zig` for query entry points) and wrap their body in a
 `Scope` so the arena and read close on every path.
@@ -651,31 +623,26 @@ regenerated file with the grammar).
 
 ## 8. Recommended order of work
 
-1. **The collector (§6.1).** The largest gap and the one that bounds
-   every long-running use, including a Nextomic loader. It touches
-   the VM, the natives and the Nextomic caches, so it is best done
-   before the natives multiply further; transaction functions (§6.8)
-   wait on its rooting rule.
-2. **Clojure surface gaps (§6.3), `case` and syntax-quote first.**
+1. **Clojure surface gaps (§6.3), `case` and syntax-quote first.**
    Each is a morning's work with an obvious test; together they are
    most of what a Clojure programmer trips over in the first hour.
    `defn` docstrings, multi-arity `fn`, finally-only `try` and the
    conversions follow in whatever order the next program needs.
-3. **Runtime source spans and the test runner (§6.4).** Once programs
+2. **Runtime source spans and the test runner (§6.4).** Once programs
    are longer than a screen, an unlocated `DivideByZero` is the
    worst remaining experience; the span table is the substrate for
    `nexis.test` output and for `--disasm`.
-4. **Datalog function-position variables (§6.5)** and the query
+3. **Datalog function-position variables (§6.5)** and the query
    surface items in §6.8, driven by the first real query that needs
    them; each is a parse/plan/exec triple with a corpus case.
-5. **Transaction functions and `:db.fn/cas`, then excision and
+4. **Transaction functions and `:db.fn/cas`, then excision and
    full-text (§6.8).** Transaction functions unlock the next class
-   of Nextomic programs; they come after 2 so the callback into the
-   VM is safe by construction.
-6. **`^:dynamic`/`binding` (§6.7) and `typed_vector` (§6.6)** when a
+   of Nextomic programs; the callback into the VM follows the
+   rooting rule of `docs/GC.md` §11.5.
+5. **`^:dynamic`/`binding` (§6.7) and `typed_vector` (§6.6)** when a
    user need appears; both are self-contained and neither blocks the
    rest.
-7. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
+6. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
    inline caches, SIMD CHAMP nodes, zero-copy strings from emdb
    pages, hash-join tuning. Measure first with `zig build bench`;
    `docs/BENCH.md` is the honesty gate.

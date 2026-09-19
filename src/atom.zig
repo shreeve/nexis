@@ -36,9 +36,9 @@
 //! addendum for the formal pinning.
 //!
 //! GC rooting: `swap-vals!` allocates a result vector AFTER the
-//! atom write. The collector is explicit-only (`docs/GC.md` §9), so
-//! this is safe — `heap.alloc` never auto-triggers `collect`.
-//! `docs/GC.md` §11.5 lists this site in the rooting audit.
+//! atom write, with no safe point in between: a cycle runs only at
+//! the VM's instruction fetch and `heap.alloc` never collects
+//! (`docs/GC.md` §7, §11.5).
 
 const std = @import("std");
 const value_mod = @import("value");
@@ -155,7 +155,7 @@ pub inline fn exitCritical(v: Value) void {
 /// makes raw pointer hashing both correct and cheap. A moving
 /// collector would need a stable object identity instead (e.g., a
 /// per-allocation u64 stamp baked into the header at allocation
-/// time). Cross-referenced in the `docs/GC.md` §11.5 audit checklist.
+/// time).
 pub fn hashHeader(h: *HeapHeader) u32 {
     if (h.cachedHash()) |cached| return cached;
     var hasher = std.hash.XxHash3.init(hash_mod.seed);

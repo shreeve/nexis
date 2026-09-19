@@ -140,18 +140,18 @@ pub const ExpandContext = struct {
     /// Null = `(require ...)` raises MalformedMacroCall (useful
     /// for tests that compile in-memory only).
     load_callback: ?LoadCallback = null,
-    /// Lazy-init heap for arg Value construction.
-    /// Macro args that are vectors/maps/sets need a heap for
-    /// their backing nodes. We use ExpandContext.allocator
-    /// (the compile arena) so the nodes outlive the fresh
-    /// sub-VM (which has its OWN heap for the macro fn's
-    /// runtime allocations). Reuse across macro invocations
-    /// — cheap because allocator is an arena.
+    /// Lazy-init heap for arg Value construction when no
+    /// `value_heap` is given. Macro args that are vectors/maps/sets
+    /// need a heap for their backing nodes; this one lives on
+    /// ExpandContext.allocator (the compile arena) and is reused
+    /// across macro invocations.
     _arg_heap: ?heap_mod.Heap = null,
     /// A heap to build values on instead of `_arg_heap`: the
-    /// calling VM's heap when the expander runs on behalf of a
-    /// native (`macroexpand-1`, `read-string`), so the values it
-    /// returns outlive the context.
+    /// calling VM's heap, which the compiler passes whenever a
+    /// namespace registry carries one and the run-time hooks
+    /// (`macroexpand-1`, `read-string`) always pass. Macro
+    /// arguments, the macro sub-VM's allocations and the values
+    /// it returns then live where the VM's Vars can hold them.
     value_heap: ?*heap_mod.Heap = null,
 
     /// The heap for arg Value construction: `value_heap` when set,
@@ -1304,9 +1304,10 @@ fn expandCollKind(
 //
 // User-macro INVOCATION:
 //   1. Convert each arg Form → Value via `formToValue`.
-//   2. Call `VM.evalClosure(var.root, arg_values, &sub_vm, interner)`;
-//      the sub-VM borrows the compile-time interner so names in
-//      its arguments resolve.
+//   2. Call `VM.evalClosure(var.root, arg_values, &sub_vm, interner,
+//      heap)`; the sub-VM borrows the compile-time interner so names
+//      in its arguments resolve, and the calling VM's heap when the
+//      context has one.
 //   3. Convert returned Value → Form via `valueToForm` in
 //      `ctx.allocator` (the compile arena).
 //   4. Deinit the sub-VM.
@@ -1571,9 +1572,12 @@ fn callUserMacro(
         arg_values[i] = formToValue(ctx, a) catch return ExpandError.MalformedMacroCall;
     }
 
-    // Invoke in a fresh sub-VM. The sub-VM's heap holds the
-    // macro fn's runtime state; we must convert the result back
-    // to a Form (in ctx.allocator) BEFORE deinit.
+    // Invoke in a fresh sub-VM that allocates on the calling VM's
+    // heap when the context knows it (`heapForArgs`), so a value
+    // the macro stores into a Var outlives the call; otherwise the
+    // sub-VM's own heap holds the macro fn's runtime state and the
+    // result is converted to a Form (in ctx.allocator) BEFORE
+    // deinit.
     var sub_vm: vm_mod.VM = undefined;
     var sub_vm_ready = false;
     defer if (sub_vm_ready) sub_vm.deinit();
@@ -1583,6 +1587,7 @@ fn callUserMacro(
         arg_values,
         &sub_vm,
         ctx.interner,
+        ctx.value_heap,
     ) catch {
         return ExpandError.MalformedMacroCall;
     };

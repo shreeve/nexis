@@ -2637,3 +2637,16 @@ entry stating the decision and its rationale.
   §2.2 and §6.3 and `docs/FORMS.md` §3 track this entry; it
   supersedes the "until bignum arithmetic lands" clauses of the two
   number-tower entries above.
+
+- **2026-09-18 — The collector runs (§10.5, §10.6).** The VM is the
+  collector's host: it enumerates the §10.5 roots (every frame's
+  slots, closure, cells and routine constants; every Var's root,
+  metadata and thread binding; the dynamic-binding save stack; a
+  root stack natives push callback results onto; pending throws; the
+  protocol registry) and runs a cycle at one safe point, the
+  instruction fetch, once the heap has allocated a threshold of bytes
+  since the last cycle (§10.6: the larger of 16 MiB and the bytes
+  that survived; `NEXIS_GC_STRESS` lowers it to 4 KiB). Closures and
+  upvalue cells are heap blocks; Vars stay immortal arena objects
+  rooted through the namespaces. `docs/GC.md` §3, §7 and
+  `docs/VM.md` §9 are the authority.

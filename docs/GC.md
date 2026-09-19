@@ -4,22 +4,27 @@ Authoritative contract for `src/gc.zig`. Derivative from `PLAN.md`
 §10, `docs/VALUE.md` §5 (mark bits), and `docs/HEAP.md` (allocator +
 `sweepUnmarked`). Those documents win on conflict.
 
-`src/gc.zig`'s `Collector.collect` drives the mark phase via caller-
-supplied roots and per-kind tracing; `Heap.sweepUnmarked` is the
-sweep half. Every heap kind is designed for this collector: each
-exports a `trace` function (§5).
+`src/gc.zig`'s `Collector.collect` drives the mark phase from the
+caller's roots and the host's, with per-kind tracing;
+`Heap.sweepUnmarked` is the sweep half. Every heap kind is designed
+for this collector: each exports a `trace` function (§5), and the
+two kinds whose layout the VM owns (closures, upvalue cells) trace
+through the host hook.
 
-**The collector is explicit-only, non-reentrant, precise mark-sweep
-with caller-supplied roots.** No auto-trigger, no allocation-
-threshold policy, no stack scanning, no generational/concurrent
-phases, no write barriers. Each absence is pinned in §9.
+**The collector is precise, non-moving, stop-the-world mark-sweep,
+non-reentrant, run by the VM at its safe points.** The VM is the
+host: `src/vm.zig` imports `gc.zig`, enumerates the runtime's roots
+(§3), traces closures and cells, and runs a cycle between two
+instructions once the heap has allocated a threshold of bytes since
+the last one (§7). No stack scanning, no generational or concurrent
+phases, no write barriers, no finalizers (§9).
 
-**The runtime never invokes the collector.** Nothing in `src/vm.zig`,
-`src/cli.zig`, or `src/stdlib.zig` imports `gc.zig` or calls
-`Collector.collect`. The VM's `Heap` is backed by `VM.runtime_arena`
-(`VM.ensureHeap`) and behaves as a runtime arena released at VM
-teardown. The collector is driven by `src/gc.zig`'s inline tests,
-`test/prop/gc.zig`, and `test/prop/transient.zig` (§10).
+A VM with a borrowed heap (the compile-time sub-VMs of `evalClosure`
+and the `defmacro` evaluation, which allocate on the heap of the VM
+whose Vars they use) never collects: it cannot enumerate the owner's
+roots. The collector is also driven directly, over a bare heap with
+explicit roots, by `src/gc.zig`'s inline tests, `test/prop/gc.zig`
+and `test/prop/transient.zig` (§10).
 
 ---
 
@@ -49,12 +54,14 @@ boundaries that matter:
 | Storage                                      | Owner         | Collected? |
 |----------------------------------------------|---------------|------------|
 | `*HeapHeader` blocks from `Heap.alloc`       | `src/heap.zig`| YES |
+| Closures and upvalue cells (`VM.allocClosure`, `VM.allocCell`) | `src/heap.zig` (kinds `function`, `cell_internal`) | YES — traced through the host (§5) |
+| String and bignum literals in `Routine.consts` | registry heap (`Heap.alloc`) | YES — rooted through every frame and closure over the routine (§3) |
 | Intern-table name-byte duplications          | `src/intern.zig` | NO — freed on Interner.deinit |
 | Intern-table StringHashMap / ArrayList storage | `src/intern.zig` | NO — freed on Interner.deinit |
 | Parser / reader Form trees                   | Caller arena  | NO — arena-freed per PLAN §10.7 |
 | Macro-expansion intermediates                | Caller arena  | NO — arena-freed |
-| Closures (`VM.allocClosure`) and Vars        | `VM.runtime_arena` | NO — not `HeapHeader` blocks |
-| String literals in `Routine.consts`          | registry heap (`Heap.alloc`) | YES in principle (§11.5) |
+| Vars and namespaces                          | `VM.runtime_arena` | NO — immortal by design; their values are roots (§3) |
+| `NativeFn` descriptors, `db.Connection`, db transaction handles | static storage / the VM | NO — pointer kinds with no block; `markValue` skips them (`Heap.isBlockKind`) |
 
 The collector **does not** touch any of the "NO" categories. If a
 runtime heap object points into non-collected storage (e.g. a
@@ -72,36 +79,83 @@ heap.
 
 ### 3. Root model (what counts as a root)
 
-A **root** is a `*HeapHeader` the caller declares "definitely live."
+A **root** is a block or Value the collector starts marking from.
 The collector marks each root and recursively traces children.
 Anything unreachable from the root set, not `isPinned`, is freed.
 
-**The runtime supplies no roots.** Roots are exclusively
-caller-supplied (test fixtures). The collector API has the shape a
-runtime-driven collection would use; no runtime module enumerates
-its state as roots.
+Two sources: the explicit `roots` slice `collect` takes (the tests'
+fixtures) and the host's `Host.roots` callback, which the VM
+implements as `VM.gcRoots`. The VM's roots (PLAN §10.5), in the
+order it marks them:
 
-PLAN §10.5 names the root set a runtime-driven collection would
-enumerate. Its status in the tree:
+1. **The backing stack, in full** (`vm.stack.items`): every slot of
+   every frame's window, and the slots between and above them. A
+   slot above a popped frame keeps its stale value until the slot
+   is grown into again (`appendNTimes(nil)` on every growth), which
+   retains garbage for a while and is sound. A slot holding a
+   `.cell_internal` Value marks the cell block like any other.
+2. **Every frame**: the closure it runs (`Frame.closure`, which
+   keeps the `upvalues` array in the closure block's tail alive),
+   each cell of `Frame.upvalues`, and the heap constants of its
+   routine, recursively through the routines in the constant pool
+   (string and bignum literals).
+3. **Every Var of every namespace** in the registry, and of the
+   single ad-hoc namespace: `root`, `meta` and `thread_value`. Vars
+   are immortal arena objects, so a `var_` Value is never marked
+   itself (`Heap.isBlockKind` excludes it); its contents are reached
+   only here.
+4. **The dynamic-binding stack**: the value each open `binding`
+   frame saved (`vm.dyn_saves`); the bindings in force are the Vars'
+   `thread_value`, covered by 3.
+5. **The root stack** (`vm.roots`): what natives and `callValue`
+   push (below).
+6. **Pending `finally` throws** (`vm.finally_stack`, the `.throwing`
+   continuations), **the unhandled throw** and **the halt result**
+   (`vm.result`).
+7. **The protocol registry**: every method implementation and
+   default implementation.
 
-1. Executing VM frames (`VM.frames`: slot windows, upvalue arrays).
-   — exist; not enumerated.
-2. Namespace var tables (`Namespace.vars` in the
-   `NamespaceRegistry`). — exist; not enumerated.
-3. Intern tables (symbol, keyword, string). — `Interner.trace`
-   seam exists and is a no-op.
-4. Dynamic-binding stack. — the VM has none.
-5. Pinned objects: open transactions, durable-ref handles with
-   active reads. — no runtime module pins a block (below).
-6. REPL history buffer. — the CLI keeps none.
+The interner holds no heap values (symbols and keywords are
+immediates), so `Interner.trace` is a no-op seam. Open `db` and
+`nextomic` connections hold no heap values; a `durable_ref`,
+`db_read_txn` or `nextomic_db` handle is reachable from wherever the
+program keeps it. The Nextomic query caches hold query values by
+heap identity and are emptied after every cycle instead of being
+rooted (`vm.nextomic_query_clear`; `docs/NEXTOMIC.md` §5); with a
+query in flight the clearing waits for it to return, because the
+query borrows its parsed IR from the cache.
+
+**The root stack.** A cycle can run inside any `VM.callValue`, so a
+native that holds a heap Value only in a Zig local across a call
+back into the VM must root it first:
+
+- `callValue` pushes a native callee's `args` for the call's
+  duration, so a native's arguments are always rooted: through the
+  caller's slots when reached by `call:call`, through the root stack
+  when reached by `callValue`. A closure callee receives its
+  arguments in its own slots.
+- Everything reachable from a rooted value is rooted, so an element
+  of an argument collection needs nothing.
+- A value a callback returned is rooted while it is the next call's
+  argument (`reduce`, `reduce-kv`, `swap!`, `db/alter!`,
+  `db/reduce-tree` need nothing) and not otherwise: a native that
+  accumulates callback results across further callbacks (`map`,
+  `filter` in `keep` mode, `map-indexed`, `reductions`, `repeatedly`,
+  `iterate`, `sort-by` keys, `max-key`/`min-key` keys) opens a
+  `VM.RootScope` and pushes each result; the deferred `release`
+  drops them on every exit path, a `ControlTransferred` unwind
+  included. The Nextomic `q` hook pushes every value a user function
+  returns to the pipeline for the query's life, since it may sit in
+  a relation cell.
+- Between two callbacks no cycle can run: `Heap.alloc` never
+  collects (§7), so a native may allocate freely while holding
+  unrooted locals as long as it does not call back in.
 
 **`pinned` vs root.** A root is what the collector starts marking
 from. A pinned block (`HeapHeader.isPinned() == true`) survives
 sweep regardless of mark state, even if unreachable from any root.
-Pinning is for resources the collector must not reclaim but cannot
-prove reachable through normal tracing — e.g. a durable-ref holding
-an open read cursor against emdb. The heap provides the bit and
-`sweepUnmarked` honors it; only tests call `setPinned`.
+The heap provides the bit and `sweepUnmarked` honors it; no runtime
+module pins a block, and only tests call `setPinned`.
 
 ---
 
@@ -111,13 +165,26 @@ an open read cursor against emdb. The heap provides the bit and
 pub const Collector = struct {
     heap: *Heap,
     collecting: bool = false,
+    /// The runtime behind the heap, when there is one.
+    host: ?Host = null,
+
+    pub const Host = struct {
+        ctx: *anyopaque,
+        /// Mark every root the host holds; called once per cycle
+        /// after the explicit roots.
+        roots: *const fn (ctx: *anyopaque, collector: *Collector) void,
+        /// Walk the children of an already-marked `function` block
+        /// (a closure) or `cell_internal` block (an upvalue cell).
+        trace: *const fn (ctx: *anyopaque, h: *HeapHeader, collector: *Collector) void,
+    };
 
     pub fn init(heap: *Heap) Collector;
 
-    /// Start a reachability walk from a `Value`. If `v` is an
-    /// immediate, does nothing. If `v` is a heap-kind Value, marks
-    /// the underlying *HeapHeader (and recursively its children).
-    /// Safe entry point for callers holding Values.
+    /// Start a reachability walk from a `Value`. Immediates and the
+    /// pointer kinds with no block (`native_fn`, `var_`, the db
+    /// handles; `Heap.isBlockKind`) are ignored. Any other Value
+    /// marks the underlying *HeapHeader (and recursively its
+    /// children). Safe entry point for callers holding Values.
     pub fn markValue(self: *Collector, v: Value) void;
 
     /// Mark a full heap object and recursively walk its children.
@@ -142,8 +209,10 @@ pub const Collector = struct {
     /// is centralized on the collector even for internal nodes.
     pub fn markInternal(self: *Collector, h: *HeapHeader) bool;
 
-    /// Run a full collection cycle: mark every root, then sweep
-    /// unmarked. Returns the number of blocks freed.
+    /// Run a full collection cycle: mark every root, then the
+    /// host's roots, then sweep unmarked and start a new
+    /// allocation-counting window on the heap. Returns the number
+    /// of blocks freed.
     ///
     /// Not reentrant. Calling `collect` from inside a trace
     /// function or a `mark` callback panics via the
@@ -251,24 +320,26 @@ Kind dispatch table (`Collector.mark`):
 | `.record`             | `record.trace`             | the field map; `type_id` is a plain `u32` (PROTOCOLS.md §2.1) |
 | `.protocol`, `.protocol_fn` | `protocol.trace`     | nothing (leaf bodies)                       |
 | `.nextomic_conn`, `.nextomic_db` | inline `{}`     | nothing (a VM-owned pointer plus inline text / numbers) |
+| `.function`           | `Host.trace` (`VM.gcTrace`) | every upvalue cell (`markInternal`-free: cells are blocks of their own kind, marked through `mark`), then the routine's heap constants recursively through nested routines (VM.md §6) |
+| `.cell_internal`      | `Host.trace` (`VM.gcTrace`) | the cell's value (VM.md §6) |
 | `.byte_vector`        | *panic (unallocated)*      | — |
-| `.typed_vector`       | *panic (unallocated)*      | — |
-| `.function`           | *panic (unallocated)*      | — |
-| `.var_`               | *panic (unallocated)*      | — |
+| `.typed_vector`       | *panic (no instances)*     | traces no children |
+| `.var_`               | *panic (not a block)*      | — |
 | `.error_`             | *panic (unallocated)*      | — |
 | `.meta_symbol`        | *panic (unallocated)*      | — |
 
 "Panic (unallocated)" means: the kind byte is reserved in VALUE.md
 §2.2 but no module allocates blocks with that kind through
-`Heap.alloc`. (`.function` Values point at `Closure` structs in
-`VM.runtime_arena`, not at `HeapHeader` blocks, so a `.function`
-Value must never reach `mark`.) The collector panics loudly if it
-encounters one of these kinds during `mark` because hitting the arm
-implies memory corruption OR a caller-side bug (constructed a Value
-with the wrong kind byte). **Panic, not silent no-op**, because a
-silent no-op on a kind that SHOULD trace would create invisible
-retention bugs. Any other kind byte (immediates, sentinels) also
-panics: it cannot appear on a heap header.
+`Heap.alloc`. `.var_` is a Value kind whose payload is an arena
+`*Var` (§3), so a `var_` header byte is a corrupted block. A
+`.function` or `.cell_internal` block reaching a collector without a
+host panics too: only a runtime allocates those kinds. The collector
+panics loudly because hitting such an arm implies memory corruption
+OR a caller-side bug (constructed a Value with the wrong kind byte).
+**Panic, not silent no-op**, because a silent no-op on a kind that
+SHOULD trace would create invisible retention bugs. Any other kind
+byte (immediates, sentinels) also panics: it cannot appear on a heap
+header.
 
 ---
 
@@ -297,7 +368,7 @@ skips the meta walk.
 
 ---
 
-### 7. Collection cycle
+### 7. Collection cycle, trigger and safe point
 
 ```
 collect(roots):
@@ -307,9 +378,11 @@ collect(roots):
 
     for each r in roots:
         self.mark(r)             // marks reachable transitive closure
+    if host: host.roots(host.ctx, self)
 
     freed = self.heap.sweepUnmarked()  // clears marked bit on survivors;
                                         // frees unmarked, non-pinned blocks
+    self.heap.resetAllocationCounter()
     return freed
 ```
 
@@ -318,10 +391,39 @@ collect(roots):
   - Clears `marked` on surviving blocks so the next cycle starts
     fresh.
   - Poisons freed blocks' kind bytes for double-free detection.
+  - Subtracts each freed block from `Heap.live_bytes`.
 
 The collector is stateless between cycles. Each call to `collect`
 starts from cleared mark bits (from the previous cycle's sweep) and
 ends with cleared mark bits (from the current cycle's sweep).
+
+**Trigger** (PLAN §10.6). `Heap.alloc` counts every byte it hands
+out in `allocated_since_collect`; `collect` resets the counter. The
+VM owns the policy (`VM.gcDue`): a cycle is due once the counter
+reaches `gc_next_at`, which each cycle sets to the larger of
+`gc_threshold` (bytes allocated since the last cycle) and
+`gc_growth_percent` percent of `Heap.live_bytes` after the sweep, so
+a large live set is not re-marked every few kilobytes. The defaults
+are `GcPolicy.default` (16 MiB, 100 %); with `NEXIS_GC_STRESS` set
+in the environment every VM starts with `GcPolicy.stress` (4 KiB,
+0 %), which makes a cycle due every few kilobytes and is how the
+suite proves the rooting rules; a test sets the three fields on its
+VM to the same effect.
+
+**Safe point.** The VM checks `gcDue` at exactly one place: before
+fetching an instruction, in each of its three run loops (`run`,
+`runWithFuel`, `runUntilDepth`). Between two instructions every
+live value is in a slot, a frame, a Var, the root stack or one of
+the other roots §3 lists, so a cycle there frees nothing live. A
+cycle can therefore run inside a native only through a call back
+into the VM (`callValue` runs `runUntilDepth`), which is what the
+root-stack rule in §3 accounts for. `Heap.alloc` never collects: a
+native, the compiler and the `coll:*` instructions allocate as many
+blocks as they like between callbacks with no rooting. Everything
+the VM allocates inside one instruction (a variadic rest list, a
+closure block and its cells) is in a slot before the next fetch.
+`VM.collectGarbage` runs a cycle on demand from a safe point; tests
+call it directly.
 
 ---
 
@@ -351,11 +453,6 @@ with no API changes.
 Each of the following does not exist. The shape of the collector
 is forward-compatible with all of them:
 
-- **Auto-trigger.** PLAN §10.6 specifies allocation-threshold-based
-  triggering (`N bytes since last collection`). The collector is
-  explicit-only — callers invoke `collect` directly. `Heap.alloc`
-  keeps no byte counter, `Collector` has no threshold config, and
-  no allocation path checks either.
 - **Stack scanning.** Not planned per PLAN §10.5 — the VM is
   frame/slot-based and maintains its own precise slot windows. A
   conservative stack scanner is not required and does not exist.
@@ -372,6 +469,11 @@ is forward-compatible with all of them:
   machinery lives at the kind level (`src/coll/transient.zig`); GC
   treats transients as regular heap objects (their `trace` walks
   the inner structure; their mutability is orthogonal).
+- **A per-PC liveness map.** The whole backing stack is a root, so
+  a dead slot retains its value until it is overwritten or its frame
+  is popped and the slot grown into again.
+- **Collection in a sub-VM.** A VM over a borrowed heap never
+  collects; its garbage is the owner's to collect after it returns.
 
 ---
 
@@ -409,11 +511,29 @@ Property tests in `test/prop/gc.zig` exercise randomized graphs:
 - G3: collect twice with the same roots — second call frees 0.
 - G4: pinned block survives without roots; unpinning releases it.
 - G5: repeated allocate-and-collect cycles do not leak.
+- G6: a program that allocates a vector, a string and a map on
+  every iteration of a 20,000-step loop, run on a VM under
+  `GcPolicy.stress`, computes the exact total and keeps
+  `Heap.peak_live_bytes` within a fixed budget above what bootstrap
+  left live; G6b builds closures, strings and vectors across many
+  cycles and reads them back intact.
 
 `test/prop/heap.zig` (H2, H3, H6) drives `sweepUnmarked` directly
 with mark bits set by hand; it tests the sweep primitive, not the
 collector. `test/prop/transient.zig` T4/T4b collect with a transient
 wrapper as the sole root.
+
+Under the runtime, `test/integration/eval_pipeline.zig` ("gc: …")
+runs `map`, `filter`, `keep`, `map-indexed`, `mapv`, `reduce`,
+`reductions`, `sort-by`, `max-key`, `repeatedly`, `iterate`,
+`swap!`, `alter-meta!`, `apply`, closures over a loop,
+`db/reduce-tree` and `db/alter!` with callbacks that each allocate
+a few kilobytes on a VM under `GcPolicy.stress`, asserting the
+results and that cycles ran; `test/nextomic/gc.nx` does the same
+through `bin/nexis` with `NEXIS_GC_STRESS=1` for a `q` predicate, a
+function binding and a custom aggregate. `NEXIS_GC_STRESS=1 zig
+build test` runs the whole suite with every VM under the stress
+policy.
 
 ---
 
@@ -436,123 +556,46 @@ gc.zig
 └─ @import("nextomic_handle")  — kind constants (leaf handles)
 ```
 
-One-way terminal, same discipline as `dispatch.zig`. No heap-kind
-module imports `gc.zig`. Per-kind modules receive the visitor as
-`anytype`; `gc.Collector` satisfies the duck-typed interface
-(`markValue`, `mark`, `markInternal`).
+No heap-kind module imports `gc.zig`; `vm.zig` does, as the host
+(`Collector.Host`), and nothing below `vm` does. Per-kind modules
+receive the visitor as `anytype`; `gc.Collector` satisfies the
+duck-typed interface (`markValue`, `mark`, `markInternal`).
 
 ---
 
-### 11.5 Rooting hazards under a triggered collector
+### 11.5 The rooting rule for natives
 
-The collector is explicit-only (§9); `heap.alloc` never triggers a
-collection. Under any allocation-triggered design (or a generational
-nursery), every native fn that allocates **after** holding Values
-only in Zig locals is a rooting hazard. The pattern looks like:
+A native fn's arguments are rooted for its whole call (§3) and
+`Heap.alloc` never collects (§7), so the only hazard is a heap
+Value the native holds in a Zig local across a call back into the
+VM after the value stopped being reachable from a root. The rule
+each native follows, in order of what it is holding:
 
-```zig
-old = read_some_value();
-new = try vm.callValue(f, args);
-mutate_some_state(new);              // may drop last edge to `old`
-return try build_vector(old, new);   // alloc may trigger GC; `old`
-                                     // only in Zig local — at risk
-```
+1. **An argument, or anything reachable from one** — nothing to do.
+   `fnStr`, `fnSubs`, the `nexis.string` fns, the printers,
+   `buildListFromSlice`, `fnSwapValsBang` (its `[old new]` vector is
+   built after the callback with no safe point in between) and every
+   native that never calls back in are in this class.
+2. **The next callback's argument** — nothing to do: `callValue`
+   roots it for the call. `fnReduce`, `fnReduceKv`, `fnSwapBang`,
+   `fnDbAlter`, `fnDbReduceTree`, `fnAlterMeta` and the Nextomic
+   `with` native hold only this.
+3. **Callback results kept across further callbacks** — a
+   `RootScope` pushes each one: `mapInto` (`map`, `mapv`, `mapcat`,
+   `into` through it), `sieveInto` in `keep` mode, `indexedMap`,
+   `fnReductions`, `repeatInto` (`repeatedly`, `iterate`),
+   `keyExtremum`, `sortImpl` when a key fn is given, and the
+   `nextomic/q` hook for every user-function result.
 
-**General rule:** any native fn that calls `heap.alloc` (or any
-allocating helper that may transitively call it) while holding
-non-rooted `Value`s in Zig locals must either root those Values
-(via a root-stack API, which does not exist) or prove they are still
-reachable from VM slots / Vars / heap collections that are themselves
-rooted.
+A new native that calls back into the VM states which class it is
+in next to its `callValue`.
 
-Sites in `src/stdlib.zig` with this shape:
-
-- `fnAtom` — single `atom_mod.make` call; the init arg lives in the
-  args slice, which the native-call path keeps reachable through
-  the caller's slot window for the duration of the call. Safe under
-  an explicit-only collector; audit under any triggered design.
-- `fnSwapValsBang` — builds `[old new]` vector AFTER writing
-  `body.value = new`. (`docs/ATOM.md` §4.5)
-- `fnStr`, `fnSubs` — build output strings via `string.fromBytes`
-  after the input args have been copied off the stack into the args
-  slice (which is reachable from the calling frame).
-- `nexis.string/*` fns (`fnStringLowerCase`, `fnStringUpperCase`,
-  `fnStringTrim`, `fnStringSplit`, `fnStringJoin`,
-  `fnStringReplace`) — allocate output strings/vectors after holding
-  inputs in Zig locals: `fromBytes` outputs; `split` collects
-  fragments into a `vector.fromSlice`; `join` and `replace` build a
-  byte buffer then `fromBytes`. Each call's input args are reachable
-  through the args slice; the intermediate byte buffers are owned by
-  the function's local `std.ArrayList(u8)` freed on return.
-- Printing + I/O fns — build into a `std.Io.Writer.Allocating`
-  buffer before either writing to stdout or producing a heap-string
-  Value: `fnPrint`/`fnPrintln`/`fnPrn` (display/readable into
-  buffer, then `writeStreamingAll` to stdout); `fnPrStr` (readable
-  into buffer, then `string.fromBytes`); `fnSlurp` (read file into
-  caller-allocator byte slice, validate UTF-8, then
-  `string.fromBytes`); `fnSpit` (str-stringify into buffer, then
-  `writeFile`). Input args stay reachable through the args slice;
-  intermediate buffers are freed on return; output string Values
-  are allocated AFTER all input use is complete. The central
-  `src/format.zig` formatter walks any Value tree into a writer with
-  no inputs held in Zig locals across allocations (pure-write, not
-  allocate-then-mutate). The audit point under a triggered design is
-  the `Allocating` buffer's intermediate bytes if a collection fires
-  between the buffer's first write and the final `fromBytes`.
-- `buildListFromSlice` — cons calls between iterations hold the
-  intermediate `result` in a Zig local; the function's doc comment
-  flags the un-rooted partial result.
-- `fnApply` / HOF callbacks generally — any `vm.callValue`
-  invocation called between allocations.
-- `fnDbAlter` — the write happens AFTER `callValue`, so `old`/`new`
-  are not at risk in this fn specifically, but the reentrancy of
-  `vm.callValue` itself is the hazard class.
-- **Catch-all**: every entry in `core_fns` / `db_fns` that calls
-  `heap.alloc` directly or indirectly is in scope; the list above is
-  the known-non-trivial subset. Every native fn documents its rooting
-  story or extends this list.
-
-**Routine const pools.** Compile-time-allocated heap Values appear
-in `Routine.consts[i].value`: **source string literals** (`"hello"`
-lowers via `string.fromBytes` against the heap reachable through
-`namespace.registry.heap`). Reals and chars lower to immediates, so
-string literals are the only heap Values in const pools. Under a
-triggered design the VM root walk MUST enumerate the const pool of
-every reachable `Routine`:
-
-```text
-for each frame F on VM.frames:
-    for each entry e in F.routine.consts:
-        if e == .value and e.value.isHeap():
-            mark(e.value's *HeapHeader)
-        if e == .routine:
-            recurse into e.routine.consts (no allocation, just walk)
-```
-
-Plus any `Routine` reachable via closure `prototype` pointers or
-the `var_table` `Var.root` chain — those must also have their
-const pools walked. None of this is wired because the collector is
-explicit-only (§9). Manual `collect` tests build Values directly
-from the test harness and never go through routine consts, so the
-hazard is structurally absent from the test suite. The
-bytecode-load-const + load-var paths DO copy `consts[i].value` into
-a slot before any user code can allocate, so a slot-only-tracing
-collector that runs strictly between bytecode instructions is still
-safe; the hazard window opens with any pre-emption point inside a
-sequence of instructions that may allocate (e.g., concurrent /
-write-barrier designs).
-
-Requirements for any triggered-collection design:
-
-1. Enumerate `vm.callValue` call sites in `src/stdlib.zig` (and
-   `src/db.zig` if it grows similar patterns).
-2. For each: classify whether any local Value could become unrooted
-   between `callValue` and the next use of that local.
-3. Add a root-stack push/pop API (PLAN §10) and wrap exposed sites.
-4. Verify with a randomized property test that forces GC at every
-   allocation boundary during a `swap!` / `apply` / `reduce` cascade.
-
----
+**Routine constant pools.** String and bignum literals lower to
+heap Values in `Routine.consts` (`compile.zig` allocates them on
+`registry.heap`, the VM's heap). They are rooted through every
+frame running the routine and every closure over it, recursively
+through the routines nested in the pool (§3), so a literal lives as
+long as any code that can load it and no longer.
 
 ### 12. What GC.md does not cover
 
@@ -565,4 +608,5 @@ Requirements for any triggered-collection design:
 - **Intern table internals.** INTERN.md §5 is authoritative on the
   `trace` seam; this doc only notes the ownership boundary.
 - **Codec serialization interaction.** None. Codec operations
-  do not trigger GC (PLAN §10.6).
+  do not trigger GC (PLAN §10.6): the only safe point is the VM's
+  instruction fetch (§7).

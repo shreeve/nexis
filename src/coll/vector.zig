@@ -301,9 +301,9 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
     // GC-interaction note: this function allocates 3–5 heap objects
     // (new_tail, promoted_leaf, possibly clones and new interiors,
     // new_root_h) before any of them is reachable from a user-held
-    // Value. `Heap.alloc` never triggers a collection (GC.md §9:
-    // collection is explicit-only), so no temporary root-stack is
-    // needed to protect the partial tree.
+    // Value. `Heap.alloc` never triggers a collection (GC.md §7: a
+    // cycle runs only at the VM's instruction fetch), so no
+    // temporary root-stack is needed to protect the partial tree.
     if (src.root_node == null or elems_after_promotion > capacityAtShift(src.shift)) {
         const old_shift = src.shift;
         new_shift = if (src.root_node == null) branch_bits else src.shift + branch_bits;

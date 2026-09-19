@@ -11,9 +11,16 @@
 //! per-VM state (`natives.state`). A parsed query is pure syntax over
 //! the VM's symbol table, so one cache serves every connection the VM
 //! opens. The caches hold the query values themselves (by heap identity
-//! first, then by structure); no collector frees or moves a heap value,
-//! so an entry stays valid for the VM's life. One that does must
-//! `clear` both caches.
+//! first, then by structure); the collector empties both after every
+//! cycle (`natives.clearState`), since a freed value's address may be
+//! reused. A query borrows its IR from the cache for its duration, so
+//! `q` and `explain` bracket their run with `State.enter` / `leave`
+//! and a cycle inside a callback defers the clearing to `leave`.
+//!
+//! Rooting: a value a user function returns to the pipeline may end up
+//! in a relation cell that the next call back into the VM must not see
+//! collected, so the hook pushes every result on a root scope that
+//! lives as long as the `q` call (GC.md §3).
 //!
 //! Functions: a predicate or function-binding symbol that is not a
 //! built-in resolves through the namespace registry the way the
@@ -121,6 +128,16 @@ fn throwSyntax(vm: *VM, message: []const u8, clause: ?usize) VmError {
 
 const Hook = struct {
     vm: *VM,
+    /// Roots every result a callback returns for the query's life.
+    scope: vm_mod.RootScope,
+
+    fn init(vm: *VM) Hook {
+        return .{ .vm = vm, .scope = vm.rootScope() };
+    }
+
+    fn deinit(self: *Hook) void {
+        self.scope.release();
+    }
 
     fn callHook(self: *Hook) query.CallHook {
         return .{ .ctx = @ptrCast(self), .call = &call, .apply = &apply };
@@ -129,7 +146,9 @@ const Hook = struct {
     fn call(ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value {
         const self: *Hook = @ptrCast(@alignCast(ctx));
         const callee = try self.resolve(sym);
-        return self.vm.callValue(callee, args);
+        const result = try self.vm.callValue(callee, args);
+        try self.scope.push(result);
+        return result;
     }
 
     /// Apply the value a variable in function position holds: a
@@ -138,7 +157,9 @@ const Hook = struct {
     fn apply(ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value {
         const self: *Hook = @ptrCast(@alignCast(ctx));
         if (vm_mod.isLookupCallable(f.kind())) return vm_mod.callLookup(f, args);
-        return self.vm.callValue(f, args);
+        const result = try self.vm.callValue(f, args);
+        try self.scope.push(result);
+        return result;
     }
 
     /// The bound value the symbol names, or a thrown
@@ -190,7 +211,10 @@ fn fnQ(vm: *VM, args: []const Value) VmError!Value {
 fn qNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     const d = try natives.dbOf(args[1]);
     const st = try natives.state(vm);
-    var hook = Hook{ .vm = vm };
+    st.enter();
+    defer st.leave();
+    var hook = Hook.init(vm);
+    defer hook.deinit();
     const options: query.Options = .{ .hook = hook.callHook(), .db_of = &natives.dbOf, .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };
     return query.q(vm.allocator, vm.ensureInterner(), vm.ensureHeap(), args[0], d, args[1..], diag, options);
 }
@@ -203,7 +227,10 @@ fn fnExplain(vm: *VM, args: []const Value) VmError!Value {
 fn explainNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     const d = try natives.dbOf(args[1]);
     const st = try natives.state(vm);
-    var hook = Hook{ .vm = vm };
+    st.enter();
+    defer st.leave();
+    var hook = Hook.init(vm);
+    defer hook.deinit();
     const options: query.Options = .{ .hook = hook.callHook(), .db_of = &natives.dbOf, .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };
     var out: std.Io.Writer.Allocating = .init(vm.allocator);
     defer out.deinit();

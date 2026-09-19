@@ -250,18 +250,23 @@ is empty).
 - Routine reference.
 - Upvalue cell array `[]const *UpvalCell`.
 
-**Closure value representation**: `Closure` is a struct allocated
-from the VM-owned `runtime_arena`, with `Value.payload` carrying a
-raw `*Closure` pointer. This is a **deliberate exception to the
-VALUE.md §4 heap-value contract** (heap kinds carrying
-`*HeapHeader` payloads): no code path calls `Heap.asHeapHeader` on
-a closure value, the collector never runs against the VM heap
-(§9), and closures have VM-lifetime ownership — the arena is freed
-wholesale at `VM.deinit`. The field layout (`routine`, `upvalues`)
-is prefix-compatible with a `HeapHeader`-carrying block.
+**Closure value representation**: a closure is a heap block of
+kind `function` (VALUE.md §4): the body is `Closure { routine,
+upvalues }` and the block's tail holds the cell pointers
+`upvalues` points at, so one allocation carries the whole closure
+and the slice stays valid because the collector never moves a
+block. `closure:make` allocates the block and fills the tail with
+nothing allocated in between. `VM.asClosure` reads the body. The
+collector traces a closure by its cells and by the heap constants
+of its routine (§9).
 
 **UpvalCell**:
-- Allocated from `runtime_arena`, VM-lifetime.
+- A heap block of kind `cell_internal` whose body is
+  `UpvalCell { value, initialized }`; the `.cell_internal` Value a
+  slot holds and the `*UpvalCell` a closure or frame holds both name
+  the block. Reachable from the slot that boxed it, from every
+  closure that captured it and from every frame running such a
+  closure; the collector traces it by its value.
 - Carries exactly one `Value` slot, plus an `initialized: bool`
   flag so that placeholder cells (used for `letfn*` mutual
   recursion and named `fn*` self-reference) can be detected when
@@ -590,6 +595,9 @@ A **frame** represents one invocation of a routine.
   grown; a return or an unwind restores it.
 - **Upvalue array**: the closure's upvalue cells (shared with the
   closure; not owned by the frame).
+- **Closure** (`closure`): the `.function` Value the frame runs,
+  nil for the top-level frame; a root that keeps the closure block,
+  and the upvalue array in its tail, alive for the frame's life.
 - **Return destination** (`return_dst`, `return_pc`): where the
   caller receives the result and resumes.
 
@@ -641,22 +649,44 @@ loop:
 
 ### 9. Memory and the collector
 
-The VM allocates closures, upvalue cells, rest-arg lists and the
-values built by `coll:*` from `VM.runtime_arena` (`VM.ensureHeap`
-initializes a `Heap` on that arena lazily). Everything lives until
-`VM.deinit`.
+Every runtime value lives on the VM's `Heap` (`VM.ensureHeap`,
+backed by `VM.allocator`): closures, upvalue cells, rest-arg lists,
+the values `coll:*` builds, everything the natives allocate, and
+the string and bignum literals the compiler lowers onto
+`registry.heap`, which is the same heap. Vars, namespaces and the
+routines live in `VM.runtime_arena` or the compiler's persistent
+allocator for the VM's life. `VM.deinit` frees the heap block by
+block and the arena wholesale.
 
-**The VM never runs the collector.** `src/gc.zig` is not imported
-by `vm.zig`, `cli.zig` or `stdlib.zig`; no root enumeration
-callback exists; frame slots, constant pools, Vars and handler
-state are never walked. `docs/GC.md` §9 states the consequences.
+**The VM is the collector's host** (`docs/GC.md` §3, §7).
+`vm.zig` imports `gc.zig`; `VM.gcRoots` enumerates the roots, in
+this order: the whole backing stack (every slot, the conservative
+overapproximation that needs no per-PC liveness map), every frame's
+closure, cells and routine constants (recursively through nested
+routines), every Var of every namespace (`root`, `meta`,
+`thread_value`), the dynamic-binding stack's saved values, the root
+stack (`vm.roots`), pending `finally` throws, `vm.unhandled_throw`,
+`vm.result`, and the protocol registry's implementations.
+`VM.gcTrace` walks a closure (its cells, then its routine's
+constants) and a cell (its value).
 
-What a root set would have to contain, should a collection ever be
-driven from the runtime: every frame's window (all slots — the
-conservative overapproximation, sound without a per-PC liveness
-map), every closure and cell reachable from them, every routine's
-constant pool, every Var in the registry, the handler stack's
-pending thrown values and `vm.unhandled_throw`.
+**Trigger and safe point.** `VM.gcDue` is checked once per
+instruction fetch in `run`, `runWithFuel` and `runUntilDepth`, and
+nowhere else: a cycle is due when the heap has allocated
+`gc_next_at` bytes since the last one, `gc_next_at` being the larger
+of `gc_threshold` and `gc_growth_percent` percent of the bytes that
+survived (`GcPolicy.default`: 16 MiB, 100 %; `GcPolicy.stress`,
+selected by `NEXIS_GC_STRESS` in the environment: 4 KiB, 0 %).
+`Heap.alloc` never collects, so anything the VM or a native builds
+inside one instruction needs no rooting; a native that keeps a
+callback's result across a further call back into the VM roots it
+on a `VM.RootScope`, and `callValue` roots a native callee's
+arguments for the call (`docs/GC.md` §3, §11.5). A VM over a
+borrowed heap (`evalClosure`, the `defmacro` evaluation) has
+`gc_enabled = false` and never collects. `VM.collectGarbage` runs
+one cycle from a safe point, clears the Nextomic query caches
+(`nextomic_query_clear`) and sizes the next window; `gc_cycles`
+counts them.
 
 ---
 
@@ -783,7 +813,7 @@ handlers must be revisited.
 
 | Var | Name | Operands | Semantics |
 |---|---|---|---|
-| 0 | `var:load-var` | A=dst_slot, B=var, _ | `slot[A] := var_table[B.index].root`. Traps `:unbound-var` if the Var has never been bound by `def`. Equivalent to `mov:move A, v:B`; the dedicated opcode exists for symmetry with `store-var` |
+| 0 | `var:load-var` | A=dst_slot, B=var, _ | `slot[A] :=` the Var's `thread_value` when a binding of it is in force (`thread_bound`), else its `root`. Traps `:unbound-var` if the Var has never been bound by `def` and has no binding. Equivalent to `mov:move A, v:B`; the dedicated opcode exists for symmetry with `store-var` |
 | 1 | `var:store-var` | A=dst_slot, B=var, C=any | `var_table[B.index].root := resolve(C)`, mark bound; `slot[A] :=` the Var object (kind `var_`). Rebinding the same name updates the SAME Var in place (identity-stable), so closures compiled against it see the new root |
 | 2 | `var:var-object` | A=dst_slot, B=var, _ | `slot[A] :=` the Var object; does not trap on an unbound Var |
 

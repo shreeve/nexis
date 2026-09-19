@@ -135,7 +135,9 @@ pub fn domainByteForKind(k: Kind) u8 {
 pub fn hashValue(v: Value) u64 {
     const k = v.kind();
     if (k.isHeap()) {
-        const base = heapHashBase(v);
+        // The pointer kinds (a Var, a native descriptor, a db
+        // handle) are identity-valued and carry no block to read.
+        const base = if (Heap.isBlockKind(k)) heapHashBase(v) else hash_mod.hashU64(v.payload);
         return hash_mod.mixKindDomain(base, domainByteForKind(k));
     }
     // Sentinels (`unbound`, `undef`) panic inside value.hashImmediate
@@ -182,6 +184,8 @@ pub fn heapHashBase(v: Value) u64 {
         // over the fields its equality reads (connection, basis, mode).
         .nextomic_conn => @as(u64, nextomic_handle.connHash(h)),
         .nextomic_db => @as(u64, nextomic_handle.dbHash(h)),
+        // A closure is identity-valued.
+        .function => hash_mod.hashU64(@intFromPtr(h)),
         // Transients are not hashable per SEMANTICS §3.2 / PLAN §9.4:
         // "transient — throws `:no-hash-on-transient`". Using a
         // transient as a map key or set element is a programming error.
@@ -226,7 +230,10 @@ pub fn equal(a: Value, b: Value) bool {
         .set => return setEqualCategory(a, b),
         .kind_local => {
             if (ka != kb) return false;
-            if (ka.isHeap()) return heapEqual(a, b);
+            // A pointer kind (Var, native descriptor, db handle) is
+            // equal to itself only, and the fast path above has
+            // already said no.
+            if (ka.isHeap()) return Heap.isBlockKind(ka) and heapEqual(a, b);
             return eq.equalImmediate(a, b);
         },
     }
@@ -372,6 +379,8 @@ pub fn heapEqual(a: Value, b: Value) bool {
         // equal when they name the same connection, basis and mode.
         .nextomic_conn => nextomic_handle.connEqual(ah, bh),
         .nextomic_db => nextomic_handle.dbEqual(ah, bh),
+        // A closure equals itself only.
+        .function => ah == bh,
         // Transient equality is bit-identity on the wrapper header
         // (TRANSIENT.md §9, SEMANTICS §2.6). Two transient wrappers
         // are equal iff they are the same allocation. The top-level

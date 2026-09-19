@@ -116,15 +116,16 @@ pub const Kind = enum(u8) {
     // ---- Runtime-private sentinels (never escape public API) ----
     unbound = 64,
     undef = 65,
-    /// Lazy boxing: a slot's stored Value is a pointer to a runtime-arena `UpvalCell` rather
-    /// than an ordinary user value. Set by `closure:box-local`,
-    /// consumed by `closure:get-cell` and `closure:make`'s
-    /// `local_cell_slot` source. Never observable by user code;
-    /// the binding's `BindingRef` in the compiler's scope is
-    /// what records "this slot is now a cell" so subsequent
+    /// Lazy boxing: a slot's stored Value is the `*HeapHeader` of an
+    /// upvalue cell block (a heap block of this kind whose body is
+    /// `vm.UpvalCell`) rather than an ordinary user value. Set by
+    /// `closure:box-local`, consumed by `closure:get-cell` and
+    /// `closure:make`'s `local_cell_slot` source. Never observable
+    /// by user code; the binding's `BindingRef` in the compiler's
+    /// scope is what records "this slot is now a cell" so subsequent
     /// reads dispatch to `closure:get-cell` instead of plain
-    /// `mov:move`. The collector does not trace these slots; the
-    /// VM-owned runtime arena holds the cell.
+    /// `mov:move`. The collector traces the cell through the VM
+    /// (`docs/GC.md` §5).
     cell_internal = 66,
     _,
 

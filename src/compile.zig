@@ -2137,6 +2137,9 @@ const CompileEvalData = struct {
     persistent_allocator: std.mem.Allocator,
     namespace: ?*vm.Namespace,
     interner: *intern_mod.Interner,
+    /// The user VM's heap through its namespace registry; the
+    /// sub-VM allocates on it.
+    registry_heap: ?*heap_mod.Heap,
 };
 
 /// Compile-time eval callback. Compiles `form`
@@ -2173,6 +2176,10 @@ fn compileEvalCallback(
     routine_storage.* = compiled.toRoutine("defmacro-eval");
     out_vm.* = try vm.VM.init(data.persistent_allocator, routine_storage);
     out_vm.borrowed_interner = data.interner;
+    // The macro closure lands on the user VM's heap, where the Var
+    // that roots it lives; a sub-VM never collects.
+    out_vm.borrowed_heap = data.registry_heap;
+    out_vm.gc_enabled = false;
     return try out_vm.run();
 }
 
@@ -2440,10 +2447,12 @@ pub fn compileFormWith(
         // `(def name (fn* ...))` form in a sub-VM; the macro fn
         // is stored in the persistent allocator so it outlives
         // the per-form arena.
+        const registry_heap: ?*heap_mod.Heap = if (namespace) |n| (if (n.registry) |r| r.heap else null) else null;
         var ceval_data = CompileEvalData{
             .persistent_allocator = opts.persistent_allocator orelse allocator,
             .namespace = namespace,
             .interner = interner.?,
+            .registry_heap = registry_heap,
         };
         var mctx = expand_mod.ExpandContext{
             .allocator = allocator,
@@ -2456,6 +2465,7 @@ pub fn compileFormWith(
             },
             .registry = opts.registry,
             .load_callback = opts.load_callback,
+            .value_heap = registry_heap,
         };
         working_form = expand_mod.expandForm(&mctx, null, form) catch |err| switch (err) {
             error.ExpansionDepthExceeded => {
@@ -4259,12 +4269,22 @@ fn compileIf(
 const testing = std.testing;
 
 /// Helper: run a Tiny program and return the resulting Value.
+/// Compile and run `form` on a VM whose memory the test arena owns,
+/// so the result value outlives the VM and the arena frees it.
 fn runTiny(arena: *std.heap.ArenaAllocator, form: *const Tiny) !Value {
     const compiled = try compileTiny(arena.allocator(), form);
     const routine = compiled.toRoutine("test");
-    var v = try vm.VM.init(testing.allocator, &routine);
-    defer v.deinit();
+    var v = try vm.VM.init(arena.allocator(), &routine);
+    defer detachHeapAndDeinit(&v);
     return try v.run();
+}
+
+/// Tear `v` down without freeing its heap blocks: they came from the
+/// test arena, which frees them, and the returned value points at
+/// them.
+fn detachHeapAndDeinit(v: *vm.VM) void {
+    v.heap = null;
+    v.deinit();
 }
 
 test "compile: integer literal evaluates to itself" {
@@ -5099,8 +5119,8 @@ fn runTinyWithNs(
 ) !value_mod.Value {
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
     const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
+    var v = try vm.VM.init(arena.allocator(), &stub);
+    defer detachHeapAndDeinit(&v);
     const ns = v.ensureNamespace();
     const compiled = try compileTinyWithNamespace(arena.allocator(), form, ns);
     const routine = compiled.toRoutine("test-with-ns");

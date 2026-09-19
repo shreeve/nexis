@@ -59,8 +59,9 @@ real programs. Zero changes to emdb.
   (regenerates the committed `src/parser.zig` from `nexis.grammar`),
   `zig build bench` (ReleaseFast harness, `docs/BENCH.md`).
 
-`-Doptimize=ReleaseFast` applies to any step. `NEXTOMIC_BENCH` is the
-only environment variable.
+`-Doptimize=ReleaseFast` applies to any step. Two environment
+variables: `NEXTOMIC_BENCH` (corpus timings) and `NEXIS_GC_STRESS`
+(every VM collects every 4 KiB; `docs/GC.md` §7).
 
 ---
 
@@ -141,9 +142,10 @@ engine and the `:db/*` error names with the `db/*` layer.
   fires only for a token named `ident`; multi-char literals need `@op`.
 - emdb's page size is fixed for a file's life; `db.zig` and
   `nextomic/store.zig` pin 16 KiB. Never open a store another way.
-- Native functions must not hold VM-heap pointers across a call back
-  into the VM unless they root them (latent while the collector is
-  unwired; the GC work depends on it). `zig fmt --check` the files you
-  touch (`HANDOFF.md` §6.9 names the five that fail).
+- A native's arguments are rooted for its call; a callback result it
+  keeps across a further `vm.callValue` is not, and goes on a
+  `vm.rootScope()` first (`docs/GC.md` §11.5). `NEXIS_GC_STRESS=1 zig
+  build test` makes every rooting gap show. `zig fmt --check` the
+  files you touch (`HANDOFF.md` §6.9 names the five that fail).
 
 If any of this conflicts with what you believe the user wants, ask.

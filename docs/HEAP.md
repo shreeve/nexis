@@ -8,7 +8,7 @@ the 16-byte `HeapHeader` freeze pinned in VALUE.md.
 This is the module that makes every heap kind possible. It is deliberately
 tiny: allocation, free, object enumeration, and a minimal `sweepUnmarked`
 that implements the sweep half of mark-sweep. Full GC (root enumeration,
-precise tracing, explicit `collect(roots)` driver) ships in `src/gc.zig`
+precise tracing, the `collect(roots)` driver) ships in `src/gc.zig`
 and is specified in `docs/GC.md`. This file is the allocator + sweep
 bedrock the collector builds on; the kind dispatch + mark phase live
 in `gc.zig`.
@@ -92,10 +92,27 @@ pub const Heap = struct {
     pub fn init(gpa: std.mem.Allocator) Heap;
     pub fn deinit(self: *Heap) void;             // frees every remaining live block
 
+    // Bytes held by every live block (header and body), the largest that
+    // figure has been, and the bytes allocated since the last
+    // `resetAllocationCounter`; the collector's trigger reads the last
+    // (docs/GC.md §7), a bounded-memory test the second.
+    live_bytes: usize,
+    peak_live_bytes: usize,
+    allocated_since_collect: usize,
+
     // Allocate a new heap object of the given kind with `body_size` body bytes.
-    // Returns a 16-byte-aligned `*HeapHeader`. Header and body are zero-initialized
-    // except `HeapHeader.kind` which is set to `kind`.
+    // `kind` is a heap kind or the `cell_internal` sentinel (an upvalue cell
+    // block, docs/VM.md §6). Returns a 16-byte-aligned `*HeapHeader`. Header
+    // and body are zero-initialized except `HeapHeader.kind` which is set to
+    // `kind`.
     pub fn alloc(self: *Heap, kind: value.Kind, body_size: usize) !*HeapHeader;
+
+    pub fn resetAllocationCounter(self: *Heap) void;
+
+    // Which kinds carry a `*HeapHeader` in `Value.payload`: every heap kind
+    // except the pointer kinds (`native_fn`, `var_`, the three db handles),
+    // plus `cell_internal`. The collector marks only these.
+    pub fn isBlockKind(kind: value.Kind) bool;
 
     // Free a single heap object. Removes it from the live list and releases
     // the backing allocation. Debug builds panic on double-free (the block's
@@ -204,10 +221,14 @@ flag_hash_cached is reserved and not operationally used yet.
   allocated on this heap.
 - **GC (`src/gc.zig`, see `docs/GC.md`).** Collector.collect(roots)
   drives a full cycle: mark each root via per-kind `trace` functions
-  (each heap kind exports `pub fn trace(h, visitor)`), then call
-  `sweepUnmarked`. The collector is explicit-only and non-reentrant in
-  v1. `forEachLive` remains available for diagnostics. The trace seam
-  on `Interner` is a no-op (intern-owned storage is not heap-managed).
+  (each heap kind exports `pub fn trace(h, visitor)`; closures and
+  cells trace through the VM, the collector's host), then call
+  `sweepUnmarked` and reset the allocation counter. The VM runs a
+  cycle at its instruction-fetch safe point once
+  `allocated_since_collect` reaches its threshold; the collector is
+  non-reentrant. `forEachLive` remains available for diagnostics. The
+  trace seam on `Interner` is a no-op (intern-owned storage is not
+  heap-managed).
 - **Codec (future `src/codec.zig`).** Does not allocate directly on this
   heap; instead uses per-kind `decode` helpers that do. The heap module
   is codec-unaware.
