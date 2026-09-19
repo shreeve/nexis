@@ -121,6 +121,9 @@ Cross-type operators (PLAN §8.3):
   `140737488355328`). Ordering, `compare`, `max`, `min`, `zero?`,
   `pos?`, `neg?`, `even?` and `odd?` are exact over bignums. No
   arithmetic raises `:arithmetic-overflow`.
+- `zero?`, `pos?` and `neg?` are all `false` on NaN, which is neither
+  zero, positive nor negative (Clojure's `isZero`, `isPos` and `isNeg`
+  agree); `-0.0` is zero. The infinities are positive and negative.
 - Integer `/` by zero, and `quot` / `rem` / `mod` by zero of any kind,
   raise `:divide-by-zero`. Float `/` by zero is IEEE: `Infinity`,
   `-Infinity` or `NaN`.

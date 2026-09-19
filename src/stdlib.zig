@@ -1165,16 +1165,21 @@ fn fnNot(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(!args[0].isTruthy());
 }
 
+/// `zero?` / `pos?` / `neg?`: all three are false on NaN, which
+/// `numSign` reports as no order at all.
 fn fnZeroQ(_: *VM, args: []const Value) VmError!Value {
-    return value_mod.fromBool(try vm_mod.numSign(args[0]) == .eq);
+    const sign = (try vm_mod.numSign(args[0])) orelse return value_mod.fromBool(false);
+    return value_mod.fromBool(sign == .eq);
 }
 
 fn fnPosQ(_: *VM, args: []const Value) VmError!Value {
-    return value_mod.fromBool(try vm_mod.numSign(args[0]) == .gt);
+    const sign = (try vm_mod.numSign(args[0])) orelse return value_mod.fromBool(false);
+    return value_mod.fromBool(sign == .gt);
 }
 
 fn fnNegQ(_: *VM, args: []const Value) VmError!Value {
-    return value_mod.fromBool(try vm_mod.numSign(args[0]) == .lt);
+    const sign = (try vm_mod.numSign(args[0])) orelse return value_mod.fromBool(false);
+    return value_mod.fromBool(sign == .lt);
 }
 
 /// `even?` / `odd?` are integer-only, as in Clojure.
@@ -2381,7 +2386,7 @@ const SortOrder = struct {
         return switch (r.kind()) {
             .true_ => true,
             .false_, .nil => false,
-            else => (try vm_mod.numSign(r)) == .lt,
+            else => ((try vm_mod.numSign(r)) orelse return false) == .lt,
         };
     }
 };
