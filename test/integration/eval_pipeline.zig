@@ -3786,3 +3786,113 @@ test "read-string: forms as data, the first form only, errors thrown" {
     try expectOutput("(try (read-string \"\") (catch :reader-error e :empty))", ":empty");
     try expectOutput("(macroexpand-1 (read-string \"(when a b)\"))", "(if a (do b) nil)");
 }
+
+// =============================================================================
+// Runtime errors carry their source location and the frame chain
+// =============================================================================
+
+/// Run `src` the way the CLI does, with one `SourceInfo` every
+/// routine points at; the error the run fails with is returned and
+/// `program.v.error_trace` is left for the caller to inspect.
+fn runLocated(program: *Program, info: *const vm.SourceInfo) anyerror!value_mod.Value {
+    var parse_result = try reader_mod.parser.parseProgram(testing.allocator, info.text);
+    defer parse_result.parser.deinit();
+    var rdr = reader_mod.Reader.init(testing.allocator, info.text);
+    defer rdr.deinit();
+    const forms = try rdr.readProgram(parse_result.sexp);
+    var declared = compile.DeclaredNames.init(testing.allocator);
+    defer declared.deinit();
+    for (forms) |form| try declared.declareForm(form);
+    var last: value_mod.Value = value_mod.nilValue();
+    for (forms) |form| {
+        const compiled = try compile.compileFormWith(program.arena.allocator(), form, .{
+            .namespace = program.registry.current,
+            .interner = program.interner,
+            .host_macros = &program.host_macros,
+            .persistent_allocator = program.v.runtime_arena.allocator(),
+            .registry = program.registry,
+            .declared = &declared,
+            .source = info,
+        });
+        const routine = compiled.toRoutine("<top>");
+        try program.v.retargetTop(&routine);
+        last = try program.v.run();
+    }
+    return last;
+}
+
+/// The frame at `index` of the recorded trace must be named `name`
+/// and sit on `line`:`col` of the source, over the text `covers`.
+fn expectFrame(program: *Program, info: *const vm.SourceInfo, index: usize, name: []const u8, line: u32, col: u32, covers: []const u8) !void {
+    const trace = program.v.error_trace.items;
+    try testing.expect(index < trace.len);
+    const frame = trace[index];
+    try testing.expectEqualStrings(name, frame.name);
+    try testing.expect(frame.source == info);
+    const span = frame.span orelse return error.TestFailed;
+    const loc = info.lineCol(span.pos);
+    try testing.expectEqual(line, loc.line);
+    try testing.expectEqual(col, loc.col);
+    try testing.expectEqualStrings(covers, info.text[span.pos .. span.pos + span.len]);
+}
+
+test "runtime errors: a VmError is located at the form that raised it, with the frame chain" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "(defn f [x]\n  (/ 10 x))\n\n(defn g [x] (f x))\n(g 0)" };
+    try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
+    try testing.expectEqual(@as(usize, 3), program.v.error_trace.items.len);
+    try expectFrame(&program, &info, 0, "f", 2, 4, "/ 10 x");
+    try expectFrame(&program, &info, 1, "g", 4, 14, "f x");
+    try expectFrame(&program, &info, 2, "<top>", 5, 2, "g 0");
+}
+
+test "runtime errors: an uncaught throw records the value and a two-deep chain" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "(defn inner [] (throw :boom))\n(defn outer [] (inner))\n(outer)" };
+    try testing.expectError(vm.VmError.UncaughtThrow, runLocated(&program, &info));
+    const thrown = program.v.unhandled_throw orelse return error.TestFailed;
+    try testing.expectEqualStrings("boom", program.interner.keywordName(thrown.asKeywordId()));
+    try expectFrame(&program, &info, 0, "inner", 1, 17, "throw :boom");
+    try expectFrame(&program, &info, 1, "outer", 2, 17, "inner");
+    try expectFrame(&program, &info, 2, "<top>", 3, 2, "outer");
+}
+
+test "runtime errors: a closure called back from a native is the frame named fn" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "(map (fn [x] (/ 1 x)) [1 0])" };
+    try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
+    try expectFrame(&program, &info, 0, "fn", 1, 15, "/ 1 x");
+    try expectFrame(&program, &info, 1, "<top>", 1, 2, "map (fn [x] (/ 1 x)) [1 0");
+}
+
+test "runtime errors: resetAfterError leaves the VM ready for the next form" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "(defn f [] (/ 1 0))\n(f)" };
+    try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
+    try testing.expect(program.v.frames.items.len > 1);
+    program.v.resetAfterError();
+    try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+    const result = try program.run("(+ 1 2)");
+    try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+test "runtime errors: a routine without a span table is traced by name alone" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(vm.VmError.DivideByZero, program.run("(defn f [] (/ 1 0)) (f)"));
+    const trace = program.v.error_trace.items;
+    try testing.expectEqual(@as(usize, 2), trace.len);
+    try testing.expectEqualStrings("f", trace[0].name);
+    try testing.expect(trace[0].span != null);
+    try testing.expect(trace[0].source == null);
+    try testing.expectEqualStrings("test-form", trace[1].name);
+}

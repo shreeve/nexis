@@ -1000,6 +1000,22 @@ caught and the run loop resumes at the handler), `UncaughtThrow`
 
 There is no `:stack-overflow`: frame depth is unbounded.
 
+**What the VM records when an error leaves `run`**: the frame
+chain as it stood, in `VM.error_trace`, innermost first, one
+`TraceFrame{name, pc, span, source}` per frame: the routine's
+name, the index of the instruction the frame was executing (the
+failing instruction for the innermost frame, the `call:call` for
+each caller; every frame's `pc` is one past it because the loop
+increments before it dispatches), that instruction's span from
+the routine's table (null without one) and the routine's
+`source`. Neither an untranslated `VmError` nor an uncaught throw
+pops a frame, so the chain is complete, including the frames
+`callValue` pushed for a closure a native called back. The trace
+is rebuilt by the next failing run. `resetAfterError` discards
+what the failed run left (the frames above the top-level one,
+handlers, pending finallys, the unhandled throw) so `retargetTop`
+can run the next form; the CLI's REPL calls it after reporting.
+
 ---
 
 ### 14. Interaction with other subsystems

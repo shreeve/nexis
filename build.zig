@@ -1240,6 +1240,43 @@ pub fn build(b: *std.Build) void {
     const golden_step = b.step("golden", "Run reader golden tests");
     golden_step.dependOn(&run_golden.step);
 
+    // test/golden/cli — what bin/nexis prints for a script, pinned
+    // byte for byte: a runtime error's stderr (`<name>.nx` +
+    // `<name>.err`, exit 5). Each runs from the build root so the
+    // paths in the output are the relative ones committed. To
+    // refresh an expected file, run the command from the build root
+    // and redirect the stream it pins.
+    {
+        const CliGolden = struct {
+            name: []const u8,
+            verb: []const u8 = "run",
+            expected: []const u8,
+            stream: enum { stdout, stderr } = .stdout,
+            exit_code: u8 = 0,
+        };
+        const cases = [_]CliGolden{
+            .{ .name = "divide-by-zero", .expected = "divide-by-zero.err", .stream = .stderr, .exit_code = 5 },
+            .{ .name = "uncaught-throw", .expected = "uncaught-throw.err", .stream = .stderr, .exit_code = 5 },
+        };
+        for (cases) |case| {
+            const expected = b.build_root.handle.readFileAlloc(
+                b.graph.io,
+                b.fmt("test/golden/cli/{s}", .{case.expected}),
+                b.allocator,
+                .limited(1 << 20),
+            ) catch @panic("test/golden/cli: missing expected-output file");
+            const run = b.addRunArtifact(nexis_exe);
+            run.addArg(case.verb);
+            run.addArg(b.fmt("test/golden/cli/{s}.nx", .{case.name}));
+            run.expectExitCode(case.exit_code);
+            switch (case.stream) {
+                .stdout => run.expectStdOutEqual(expected),
+                .stderr => run.expectStdErrEqual(expected),
+            }
+            golden_step.dependOn(&run.step);
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Aggregate `zig build test` — everything
     // -------------------------------------------------------------------------

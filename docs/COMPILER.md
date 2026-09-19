@@ -799,9 +799,28 @@ the path and reads the next line. A parse failure is reported the
 same way at the token the parser stopped on (`parse error:
 unexpected `)``, `unexpected end of input`), a reader failure at
 the form the reader rejected with its kind and detail (`reader
-error: :duplicate-literal-key (keyword :a)`); both exit 3. A
-runtime error carries no location: the VM reports its `VmError`
-name and, for an uncaught throw, the thrown value.
+error: :duplicate-literal-key (keyword :a)`); both exit 3.
+
+A runtime error is reported at the instruction that raised it,
+through the span table of §8: the same header, source line and
+caret with `runtime error: <VmError name>` as the label (an
+uncaught throw appends the thrown value as `pr-str` prints it),
+then the frame chain the VM recorded (`VM.md` §13), innermost
+first, one `at <name> (<path>:<line>:<col>)` line per frame:
+
+    nexis: t.nx:2:4: runtime error: DivideByZero
+        (/ 10 x))
+         ^^^^^^
+      at f (t.nx:2:4)
+      at g (t.nx:4:14)
+      at <top> (t.nx:6:2)
+
+A `defn` or named `fn*` frame carries its name, an anonymous
+closure is `fn`, a top-level form `<top>`; a caller frame's
+location is its call. `run` exits 5. The REPL reports under
+`<repl>` and, since a line's definitions are called from later
+lines, every line keeps its own source (`vm.SourceInfo`) for the
+routines compiled from it.
 
 ---
 

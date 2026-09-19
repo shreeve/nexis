@@ -1,0 +1,10 @@
+; A runtime error two calls deep: the report locates the failing
+; form and lists every frame, innermost first.
+
+(defn average [total n]
+  (/ total n))
+
+(defn report [xs]
+  (average (reduce + 0 xs) (count xs)))
+
+(report [])

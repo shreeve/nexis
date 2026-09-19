@@ -975,6 +975,17 @@ pub const HostCallResult = struct {
     value: Value = value_mod.nilValue(),
 };
 
+/// One frame of `VM.error_trace`: the routine that was running,
+/// the index of the instruction it was executing (for a caller
+/// frame, the call), that instruction's source span when the
+/// routine carries a span table, and the source the span indexes.
+pub const TraceFrame = struct {
+    name: []const u8,
+    pc: u32,
+    span: ?SourceSpan,
+    source: ?*const SourceInfo,
+};
+
 // =============================================================================
 // Errors
 // =============================================================================
@@ -1419,6 +1430,10 @@ pub const VM = struct {
     /// `VmError.UncaughtThrow`; the host prints it alongside the
     /// error.
     unhandled_throw: ?Value = null,
+    /// The frame chain at the moment an error left `run`, innermost
+    /// first; each entry names the routine and the instruction it was
+    /// executing. Rebuilt on every failing run.
+    error_trace: std.ArrayList(TraceFrame) = .empty,
     /// Shared Interner for symbol/keyword Value construction,
     /// initialized on first access. Backed by `self.allocator`
     /// (not `runtime_arena`) because its hash maps need realloc
@@ -1486,6 +1501,7 @@ pub const VM = struct {
         // contain POD entries.
         self.handlers.deinit(self.allocator);
         self.finally_stack.deinit(self.allocator);
+        self.error_trace.deinit(self.allocator);
         // Interner owns hash maps allocated via self.allocator;
         // free explicitly.
         if (self.interner) |*it| it.deinit();
@@ -2223,12 +2239,52 @@ pub const VM = struct {
 
     /// Run bytecode to completion (halt). Returns the VM's `result`
     /// slot. If bytecode exhausts without a `return`, returns
-    /// `BytecodeExhausted`.
-    ///
-    /// The `frame` pointer is scoped inside a nested block so it
-    /// cannot be reused after `dispatch()`, which may grow `frames`
-    /// and invalidate it.
+    /// `BytecodeExhausted`. Any error that leaves the run records
+    /// the frame chain in `error_trace` first.
     pub fn run(self: *VM) VmError!Value {
+        return self.runLoop() catch |err| {
+            self.recordErrorTrace();
+            return err;
+        };
+    }
+
+    /// Where an error left the run: every frame, innermost first,
+    /// with the instruction it was executing. Every frame's `pc` is
+    /// already past that instruction (the loop increments before it
+    /// dispatches), so the failing index is `pc - 1`. Frames are
+    /// intact here: an uncaught throw and an untranslated `VmError`
+    /// both leave the chain as it was.
+    fn recordErrorTrace(self: *VM) void {
+        self.error_trace.clearRetainingCapacity();
+        var i = self.frames.items.len;
+        while (i > 0) {
+            i -= 1;
+            const f = self.frames.items[i];
+            const pc: u32 = if (f.pc > 0) f.pc - 1 else 0;
+            self.error_trace.append(self.allocator, .{
+                .name = f.routine.name,
+                .pc = pc,
+                .span = f.routine.spanAt(pc),
+                .source = f.routine.source,
+            }) catch return;
+        }
+    }
+
+    /// Discard what a failed run left behind (the frames above the
+    /// top-level one, handlers, pending finallys and the unhandled
+    /// throw) so the next `retargetTop` starts from a clean VM. The
+    /// error trace stays until the next failing run replaces it.
+    pub fn resetAfterError(self: *VM) void {
+        while (self.frames.items.len > 1) _ = self.popFrame();
+        self.handlers.clearRetainingCapacity();
+        self.finally_stack.clearRetainingCapacity();
+        self.unhandled_throw = null;
+    }
+
+    /// The dispatch loop. The `frame` pointer is scoped inside a
+    /// nested block so it cannot be reused after `dispatch()`, which
+    /// may grow `frames` and invalidate it.
+    fn runLoop(self: *VM) VmError!Value {
         while (!self.halted) {
             const inst = blk: {
                 const frame = self.currentFrame();
