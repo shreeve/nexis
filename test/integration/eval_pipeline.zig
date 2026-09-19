@@ -49,20 +49,20 @@ fn formatValue(buf: *std.array_list.Managed(u8), v: value_mod.Value, interner: *
     try buf.appendSlice(w.written());
 }
 
-/// Compile + run the embedded core.nx layer
-/// against `v` so test programs can use composite definitions
-/// (second, last, reverse, range, take, drop, when-let,
-/// if-let, dotimes). Uses the VM's runtime arena as the
-/// compile arena so closures + routines outlive bootstrap.
-fn bootstrapCoreForTest(
+/// Compile + run one embedded source (core.nx, test.nx, pprint.nx)
+/// into `ns` against `v` so test programs can use its definitions.
+/// Uses the VM's runtime arena as the compile arena so closures +
+/// routines outlive bootstrap.
+fn bootstrapEmbeddedForTest(
     v: *vm.VM,
     ns: *vm.Namespace,
+    source: []const u8,
     interner: *intern_mod.Interner,
     host_macros: *const expand_mod.HostMacroTable,
 ) !void {
-    var parse_result = try reader_mod.parser.parseProgram(testing.allocator, stdlib.CORE_NX_SOURCE);
+    var parse_result = try reader_mod.parser.parseProgram(testing.allocator, source);
     defer parse_result.parser.deinit();
-    var rdr = reader_mod.Reader.init(testing.allocator, stdlib.CORE_NX_SOURCE);
+    var rdr = reader_mod.Reader.init(testing.allocator, source);
     defer rdr.deinit();
     const forms = try rdr.readProgram(parse_result.sexp);
     const ra = v.runtime_arena.allocator();
@@ -93,9 +93,9 @@ fn expectStackRestored(v: *vm.VM, stack_len_before: usize, frame_depth_before: u
 }
 
 /// A VM with core, `db`, `nexis.string` and `nexis.internal`
-/// installed and core.nx bootstrapped, ready to run one program of
-/// top-level forms. Integration tests leave `v.io` null (see
-/// `expectOutput`).
+/// installed and core.nx, test.nx and pprint.nx bootstrapped, ready
+/// to run one program of top-level forms. Integration tests leave
+/// `v.io` null (see `expectOutput`).
 const Program = struct {
     arena: std.heap.ArenaAllocator,
     v: vm.VM,
@@ -123,9 +123,15 @@ const Program = struct {
         try stdlib.installInternal(internal_ns);
         self.host_macros = try expand_mod.defaultMacros(testing.allocator);
         errdefer self.host_macros.deinit(testing.allocator);
+        const test_ns = try self.registry.getOrCreate("nexis.test", self.registry.core);
+        const pprint_ns = try self.registry.getOrCreate("nexis.pprint", self.registry.core);
         const saved_current = self.registry.current;
         self.registry.current = self.registry.core;
-        try bootstrapCoreForTest(&self.v, self.registry.core, self.interner, &self.host_macros);
+        try bootstrapEmbeddedForTest(&self.v, self.registry.core, stdlib.CORE_NX_SOURCE, self.interner, &self.host_macros);
+        self.registry.current = test_ns;
+        try bootstrapEmbeddedForTest(&self.v, test_ns, stdlib.TEST_NX_SOURCE, self.interner, &self.host_macros);
+        self.registry.current = pprint_ns;
+        try bootstrapEmbeddedForTest(&self.v, pprint_ns, stdlib.PPRINT_NX_SOURCE, self.interner, &self.host_macros);
         self.registry.current = saved_current;
         self.hooks = .{ .host_macros = &self.host_macros, .registry = self.registry, .interner = self.interner };
         self.hooks.install(&self.v);
@@ -296,7 +302,7 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     // Bootstrap the composite core.nx layer into core.
     const saved_current = registry.current;
     registry.current = registry.core;
-    try bootstrapCoreForTest(&v, registry.core, interner, &host_macros);
+    try bootstrapEmbeddedForTest(&v, registry.core, stdlib.CORE_NX_SOURCE, interner, &host_macros);
     registry.current = saved_current;
     var hooks = compile.RuntimeHooks{ .host_macros = &host_macros, .registry = registry, .interner = interner };
     hooks.install(&v);
@@ -4036,4 +4042,239 @@ test "binding: only a dynamic Var can be bound; set! rebinds the innermost bindi
     try expectOutputProgram("(def ^:dynamic *x* 1) (try (set! *x* 5) (catch :no-thread-binding e [e *x*]))", "[:no-thread-binding 1]");
     try expectOutputProgram("(def plain 1) (try (set! plain 5) (catch :not-dynamic e [e plain]))", "[:not-dynamic 1]");
     try expectOutputProgram("(def ^:dynamic *x* 1) (meta (var *x*))", "{:dynamic true}");
+}
+
+// =============================================================================
+// Runtime errors carry their source location and the frame chain
+// =============================================================================
+
+/// Run `src` the way the CLI does, with one `SourceInfo` every
+/// routine points at; the error the run fails with is returned and
+/// `program.v.error_trace` is left for the caller to inspect.
+fn runLocated(program: *Program, info: *const vm.SourceInfo) anyerror!value_mod.Value {
+    var parse_result = try reader_mod.parser.parseProgram(testing.allocator, info.text);
+    defer parse_result.parser.deinit();
+    var rdr = reader_mod.Reader.init(testing.allocator, info.text);
+    defer rdr.deinit();
+    const forms = try rdr.readProgram(parse_result.sexp);
+    var declared = compile.DeclaredNames.init(testing.allocator);
+    defer declared.deinit();
+    for (forms) |form| try declared.declareForm(form);
+    var last: value_mod.Value = value_mod.nilValue();
+    for (forms) |form| {
+        const compiled = try compile.compileFormWith(program.arena.allocator(), form, .{
+            .namespace = program.registry.current,
+            .interner = program.interner,
+            .host_macros = &program.host_macros,
+            .persistent_allocator = program.v.runtime_arena.allocator(),
+            .registry = program.registry,
+            .declared = &declared,
+            .source = info,
+        });
+        const routine = compiled.toRoutine("<top>");
+        try program.v.retargetTop(&routine);
+        last = try program.v.run();
+    }
+    return last;
+}
+
+/// The frame at `index` of the recorded trace must be named `name`
+/// and sit on `line`:`col` of the source, over the text `covers`.
+fn expectFrame(program: *Program, info: *const vm.SourceInfo, index: usize, name: []const u8, line: u32, col: u32, covers: []const u8) !void {
+    const trace = program.v.error_trace.items;
+    try testing.expect(index < trace.len);
+    const frame = trace[index];
+    try testing.expectEqualStrings(name, frame.name);
+    try testing.expect(frame.source == info);
+    const span = frame.span orelse return error.TestFailed;
+    const loc = info.lineCol(span.pos);
+    try testing.expectEqual(line, loc.line);
+    try testing.expectEqual(col, loc.col);
+    try testing.expectEqualStrings(covers, info.text[span.pos .. span.pos + span.len]);
+}
+
+test "runtime errors: a VmError is located at the form that raised it, with the frame chain" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "(defn f [x]\n  (/ 10 x))\n\n(defn g [x] (f x))\n(g 0)" };
+    try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
+    try testing.expectEqual(@as(usize, 3), program.v.error_trace.items.len);
+    try expectFrame(&program, &info, 0, "f", 2, 4, "/ 10 x");
+    try expectFrame(&program, &info, 1, "g", 4, 14, "f x");
+    try expectFrame(&program, &info, 2, "<top>", 5, 2, "g 0");
+}
+
+test "runtime errors: an uncaught throw records the value and a two-deep chain" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "(defn inner [] (throw :boom))\n(defn outer [] (inner))\n(outer)" };
+    try testing.expectError(vm.VmError.UncaughtThrow, runLocated(&program, &info));
+    const thrown = program.v.unhandled_throw orelse return error.TestFailed;
+    try testing.expectEqualStrings("boom", program.interner.keywordName(thrown.asKeywordId()));
+    try expectFrame(&program, &info, 0, "inner", 1, 17, "throw :boom");
+    try expectFrame(&program, &info, 1, "outer", 2, 17, "inner");
+    try expectFrame(&program, &info, 2, "<top>", 3, 2, "outer");
+}
+
+test "runtime errors: a closure called back from a native is the frame named fn" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "(map (fn [x] (/ 1 x)) [1 0])" };
+    try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
+    try expectFrame(&program, &info, 0, "fn", 1, 15, "/ 1 x");
+    try expectFrame(&program, &info, 1, "<top>", 1, 2, "map (fn [x] (/ 1 x)) [1 0");
+}
+
+test "runtime errors: resetAfterError leaves the VM ready for the next form" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "(defn f [] (/ 1 0))\n(f)" };
+    try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
+    try testing.expect(program.v.frames.items.len > 1);
+    program.v.resetAfterError();
+    try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+    const result = try program.run("(+ 1 2)");
+    try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+test "runtime errors: a routine without a span table is traced by name alone" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(vm.VmError.DivideByZero, program.run("(defn f [] (/ 1 0)) (f)"));
+    const trace = program.v.error_trace.items;
+    try testing.expectEqual(@as(usize, 2), trace.len);
+    try testing.expectEqualStrings("f", trace[0].name);
+    try testing.expect(trace[0].span != null);
+    try testing.expect(trace[0].source == null);
+    try testing.expectEqualStrings("test-form", trace[1].name);
+}
+
+// =============================================================================
+// nexis.test and nexis.pprint
+// =============================================================================
+
+test "nexis.test: run-tests counts tests, assertions, failures and errors and reports each failure" {
+    // Report lines go to an atom instead of stdout (the harness has
+    // no `io`); the summary map comes back from run-tests.
+    try expectOutputProgram(
+        \\(def log (atom []))
+        \\(reset! nexis.test/out (fn [line] (swap! log conj line)))
+        \\(defn area [w h] (* w h))
+        \\(nexis.test/deftest area-test
+        \\  (nexis.test/testing "rectangles"
+        \\    (nexis.test/is (= 6 (area 2 3)))
+        \\    (nexis.test/testing "degenerate"
+        \\      (nexis.test/is (= 0 (area 0 9))))))
+        \\(nexis.test/deftest failing-test
+        \\  (nexis.test/testing "wrong"
+        \\    (nexis.test/is (= 5 (area 2 2)) "areas multiply")
+        \\    (nexis.test/is (empty? [1]))))
+        \\(nexis.test/deftest throwing-test
+        \\  (nexis.test/is (nexis.test/thrown? :divide-by-zero (/ 1 0)))
+        \\  (nexis.test/is (nexis.test/thrown? any (throw "x")))
+        \\  (nexis.test/is (nexis.test/thrown? :boom (+ 1 1))))
+        \\(nexis.test/deftest erroring-test
+        \\  (nexis.test/is (= 1 (/ 1 0))))
+        \\(def r (nexis.test/run-tests))
+        \\[(:test r) (:pass r) (:fail r) (:error r) @log]
+    ,
+        \\[4 4 3 1 [FAIL in user/failing-test (wrong): (= 5 (area 2 2)) expected: 5 actual: 4 ; areas multiply FAIL in user/failing-test (wrong): (empty? [1]) expected: true actual: false FAIL in user/throwing-test: (nexis.test/thrown? :boom (+ 1 1)) expected: :boom actual: 2 ERROR in user/erroring-test: :divide-by-zero Ran 4 tests containing 7 assertions. 3 failures, 1 errors.]]
+    );
+}
+
+test "nexis.test: tests register per namespace, replace by name, and run-all-tests spans namespaces" {
+    try expectOutputProgram(
+        \\(reset! nexis.test/out (fn [line] nil))
+        \\(nexis.test/deftest t1 (nexis.test/is (= 1 2)))
+        \\(nexis.test/deftest t1 (nexis.test/is (= 1 1)))
+        \\(ns other)
+        \\(nexis.test/deftest t2 (nexis.test/is true) (nexis.test/is true))
+        \\(def here (nexis.test/run-tests))
+        \\(def user-only (nexis.test/run-tests 'user))
+        \\(def all (nexis.test/run-all-tests))
+        \\[(:test here) (:pass here) (:test user-only) (:pass user-only) (:fail user-only) (:test all) (:pass all)]
+    , "[1 2 1 1 0 2 3]");
+}
+
+test "nexis.test: is returns whether the assertion passed and deftest yields the Var" {
+    try expectOutputProgram(
+        \\(reset! nexis.test/out (fn [line] nil))
+        \\(nexis.test/deftest t (nexis.test/is (= 1 1)))
+        \\(reset! nexis.test/counts {"test" 0 "pass" 0 "fail" 0 "error" 0})
+        \\[(nexis.test/is (= 1 1)) (nexis.test/is (= 1 2)) (nexis.test/is nil) (fn? @(var t))]
+    , "[true false false true]");
+}
+
+test "nexis.pprint: a short collection prints flat, a long one breaks from its column" {
+    try expectOutputProgram(
+        \\[(nexis.pprint/pprint-str {:a [1 2] :b "x"})
+        \\ (nexis.pprint/pprint-str (vec (range 30)))
+        \\ (nexis.pprint/pprint-str {:k (vec (range 30)) :m {:deep [1 2]}})
+        \\ (nexis.pprint/pprint-str [(vec (range 20)) (vec (range 20))])]
+    ,
+        \\[{:a [1 2], :b "x"} [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26
+        \\ 27 28 29] {:k [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25
+        \\     26 27 28 29],
+        \\ :m {:deep [1 2]}} [[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19]
+        \\ [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19]]]
+    );
+}
+
+// =============================================================================
+// A definition binds the current namespace's own Var
+// =============================================================================
+
+test "def in a user namespace shadows the referred core Var without rebinding it" {
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(defn inc [x] (+ x 100))
+        \\[(inc 1) (nexis.core/inc 1) (my.app/inc 1)]
+    , "[101 2 101]");
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(def inc 7)
+        \\(ns user)
+        \\[(inc 1) my.app/inc]
+    , "[2 7]");
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(declare later)
+        \\(defn f [] (later 1))
+        \\(defn later [x] (* x 3))
+        \\[(f) (nexis.core/inc 1)]
+    , "[3 2]");
+}
+
+test "syntax-quote qualifies a symbol to the namespace whose own Var it names" {
+    try expectOutputProgram("`(inc 1)", "(nexis.core/inc 1)");
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(defn inc [x] (+ x 100))
+        \\`(inc 1)
+    , "(my.app/inc 1)");
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(defn inc [x] (+ x 100))
+        \\(defmacro m [] `(inc 1))
+        \\[(m) (nexis.core/inc 1)]
+    , "[101 2]");
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(defmacro m [] `(helper 2))
+        \\(defn helper [x] (* x 5))
+        \\(m)
+    , "10");
+}
+
+test "a user macro named like a core macro is the namespace's own" {
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(defmacro when-let [b & body] :mine)
+        \\[(when-let [x 1] x) (nexis.core/when-let [x 1] x)]
+    , "[:mine 1]");
 }

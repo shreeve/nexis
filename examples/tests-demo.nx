@@ -1,0 +1,33 @@
+; examples/tests-demo.nx — nexis.test: deftest, is, testing and
+; run-tests, with one failing test and one that throws, so the
+; report shows every outcome. The last form's value, the summary
+; map, is what `nexis run` prints at the end.
+
+(require '[nexis.test :as t])
+
+(defn area [w h] (* w h))
+
+(t/deftest area-test
+  (t/testing "rectangles"
+    (t/is (= 6 (area 2 3)))
+    (t/is (= 0 (area 0 9))))
+  (t/testing "squares"
+    (t/is (= 16 (area 4 4)))))
+
+(t/deftest failing-test
+  (t/testing "a wrong expectation"
+    (t/is (= 5 (area 2 2)) "areas multiply")))
+
+(t/deftest throwing-test
+  (t/is (t/thrown? :divide-by-zero (/ 1 0)))
+  (t/is (t/thrown? :boom (throw {:error :boom :n 1})))
+  (t/is (t/thrown? any (throw "anything"))))
+
+(t/deftest erroring-test
+  (t/is (= 1 (/ 1 0))))
+
+(t/deftest bare-test
+  (t/is (pos? (area 3 3)))
+  (t/is (empty? [1]) "a bare assertion that fails"))
+
+(t/run-tests)

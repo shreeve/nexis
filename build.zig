@@ -733,6 +733,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string", "bignum" } },
         .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "typed_vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol", "nextomic" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
+        .{ .name = "disasm", .path = "src/disasm.zig", .imports = &.{ "vm", "value", "format", "intern" } },
         // Appended after `loader` so the `quick` step's index
         // assertions below hold.
         .{ .name = "typed_vector", .path = "src/coll/typed_vector.zig", .imports = &.{ "value", "heap", "hash", "bignum" } },
@@ -1152,6 +1153,19 @@ pub fn build(b: *std.Build) void {
     // cli delegates value-printing
     // to the central format.zig (display mode).
     cli_mod.addImport("format", format_mod);
+    // `nexis disasm` prints routines through src/disasm.zig, which
+    // reads Routine and the opcode decoders and is imported by the
+    // CLI only.
+    const disasm_mod = b.createModule(.{
+        .root_source_file = b.path("src/disasm.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    disasm_mod.addImport("vm", vm_mod);
+    disasm_mod.addImport("value", value_mod);
+    disasm_mod.addImport("format", format_mod);
+    disasm_mod.addImport("intern", intern_mod);
+    cli_mod.addImport("disasm", disasm_mod);
 
     const nexis_exe = b.addExecutable(.{
         .name = "nexis",
@@ -1262,6 +1276,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "shapes" },
             .{ .name = "shapes-app" },
             .{ .name = "typed-vectors" },
+            .{ .name = "tests-demo" },
             .{ .name = "durable-refs", .twice = true },
             .{ .name = "todo-app", .twice = true },
             .{ .name = "nextomic-app", .twice = true },
@@ -1308,6 +1323,47 @@ pub fn build(b: *std.Build) void {
 
     const golden_step = b.step("golden", "Run reader golden tests");
     golden_step.dependOn(&run_golden.step);
+
+    // test/golden/cli — what bin/nexis prints for a script, pinned
+    // byte for byte: a runtime error's stderr (`<name>.nx` +
+    // `<name>.err`, exit 5), a disassembly's stdout (`.disasm`) and
+    // a script's stdout (`.out`).
+    // Each runs from the build root so the paths in the output are
+    // the relative ones committed. To refresh an expected file, run
+    // the command from the build root and redirect the stream it
+    // pins.
+    {
+        const CliGolden = struct {
+            verb: []const u8 = "run",
+            file: []const u8,
+            expected: []const u8,
+            stream: enum { stdout, stderr } = .stdout,
+            exit_code: u8 = 0,
+        };
+        const cases = [_]CliGolden{
+            .{ .file = "test/golden/cli/divide-by-zero.nx", .expected = "divide-by-zero.err", .stream = .stderr, .exit_code = 5 },
+            .{ .file = "test/golden/cli/uncaught-throw.nx", .expected = "uncaught-throw.err", .stream = .stderr, .exit_code = 5 },
+            .{ .verb = "disasm", .file = "examples/sum10.nx", .expected = "sum10.disasm" },
+            .{ .file = "test/golden/cli/pprint.nx", .expected = "pprint.out" },
+        };
+        for (cases) |case| {
+            const expected = b.build_root.handle.readFileAlloc(
+                b.graph.io,
+                b.fmt("test/golden/cli/{s}", .{case.expected}),
+                b.allocator,
+                .limited(1 << 20),
+            ) catch @panic("test/golden/cli: missing expected-output file");
+            const run = b.addRunArtifact(nexis_exe);
+            run.addArg(case.verb);
+            run.addArg(case.file);
+            run.expectExitCode(case.exit_code);
+            switch (case.stream) {
+                .stdout => run.expectStdOutEqual(expected),
+                .stderr => run.expectStdErrEqual(expected),
+            }
+            golden_step.dependOn(&run.step);
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Aggregate `zig build test` — everything
@@ -1358,6 +1414,7 @@ pub fn build(b: *std.Build) void {
     quick_step.dependOn(&runtime_test_runs[22].step);
     quick_step.dependOn(&runtime_test_runs[23].step);
     quick_step.dependOn(&runtime_test_runs[24].step);
+    quick_step.dependOn(&runtime_test_runs[25].step);
     // Closure-capture and emitter property tests (COMPILER.md §9.4).
     quick_step.dependOn(&run_prop_compile_tests.step);
     // Eval-pipeline integration tests.

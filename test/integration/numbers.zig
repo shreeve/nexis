@@ -42,11 +42,15 @@ const Program = struct {
         try stdlib.installString(string_ns);
         const internal_ns = try self.registry.getOrCreate("nexis.internal", self.registry.core);
         try stdlib.installInternal(internal_ns);
+        const math_ns = try self.registry.getOrCreate("nexis.math", self.registry.core);
+        try stdlib.installMath(math_ns);
         self.host_macros = try expand_mod.defaultMacros(testing.allocator);
         errdefer self.host_macros.deinit(testing.allocator);
         const saved_current = self.registry.current;
         self.registry.current = self.registry.core;
         _ = try self.runForms(stdlib.CORE_NX_SOURCE, self.v.runtime_arena.allocator(), false);
+        self.registry.current = math_ns;
+        _ = try self.runForms(stdlib.MATH_NX_SOURCE, self.v.runtime_arena.allocator(), false);
         self.registry.current = saved_current;
     }
 
@@ -323,4 +327,35 @@ test "programs: factorial and a product fold grow past 2^47 and come back" {
     try expectOutput("(let [f (fn [n] (loop [i n acc 1] (if (= i 0) acc (recur (dec i) (* acc i)))))] (integer? (f 25)))", "true");
     try expectOutput("(let [f (fn [n] (loop [i n acc 1] (if (= i 0) acc (recur (dec i) (* acc i)))))] (rem (f 25) 1000000007))", "440732388");
     try expectOutput("(let [b (* " ++ fm ++ " " ++ fm ++ ")] (loop [x b n 0] (if (< x 1) n (recur (quot x 2) (inc n)))))", "94");
+}
+
+// =============================================================================
+// nexis.math (TOOLING.md §4)
+// =============================================================================
+
+test "nexis.math: sqrt and pow are over doubles for every number" {
+    try expectOutput("(nexis.math/sqrt 16)", "4.0");
+    try expectOutput("(nexis.math/sqrt 2.25)", "1.5");
+    try expectOutput("(nexis.math/sqrt 100000000000000000000)", "1.0E10");
+    try expectOutput("(nexis.math/pow 2 10)", "1024.0");
+    try expectOutput("(nexis.math/pow 2.0 0.5)", "1.4142135623730951");
+    try expectOutput("(nexis.math/pow 10 -1)", "0.1");
+    try expectOutput("(NaN? (nexis.math/sqrt -1))", "true");
+    try expectOutput("(try (nexis.math/sqrt :x) (catch any e e))", ":kind-mismatch");
+}
+
+test "nexis.math: floor, ceil and round keep integers and convert floats" {
+    try expectOutput("[(nexis.math/floor 7) (nexis.math/ceil 7) (nexis.math/round 7)]", "[7 7 7]");
+    try expectOutput("[(nexis.math/floor 2.7) (nexis.math/ceil 2.2) (nexis.math/floor -2.2) (nexis.math/ceil -2.7)]", "[2.0 3.0 -3.0 -2.0]");
+    try expectOutput("[(nexis.math/round 2.5) (nexis.math/round 2.4) (nexis.math/round -2.5) (nexis.math/round -2.6)]", "[3 2 -2 -3]");
+    try expectOutput("(nexis.math/round 1.0E20)", "100000000000000000000");
+    try expectOutput("(nexis.math/floor 100000000000000000000)", "100000000000000000000");
+    try expectOutput("(integer? (nexis.math/round 2.5))", "true");
+    try expectOutput("(try (nexis.math/round (/ 1.0 0)) (catch any e e))", ":invalid-argument");
+}
+
+test "nexis.math: PI and E" {
+    try expectOutput("nexis.math/PI", "3.141592653589793");
+    try expectOutput("nexis.math/E", "2.718281828459045");
+    try expectOutput("(nexis.math/round (* 2 nexis.math/PI))", "6");
 }

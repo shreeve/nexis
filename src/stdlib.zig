@@ -113,6 +113,16 @@ pub fn installString(string_ns: *Namespace) !void {
     }
 }
 
+/// Install `nexis.math/*` (docs/TOOLING.md §4) into the `nexis.math`
+/// namespace; `MATH_NX_SOURCE` adds the constants. Not auto-referred.
+pub fn installMath(math_ns: *Namespace) !void {
+    for (math_fns) |entry| {
+        const v = try math_ns.intern(entry.name);
+        v.root = vm_mod.nativeFnValue(entry.descriptor);
+        v.bound = true;
+    }
+}
+
 /// Install the `#%`-prefixed helpers into the `nexis.internal`
 /// namespace. Not auto-referred: the `defrecord`/`defprotocol`
 /// macros emit qualified calls (`nexis.internal/#%register-record-type`
@@ -189,6 +199,18 @@ const internal_fns = [_]CoreEntry{
     .{ .name = "#%catch-matches?", .descriptor = &native_catch_matches },
     // `& {:keys ...}`: the rest seq as a map.
     .{ .name = "#%kwargs", .descriptor = &native_kwargs },
+    // deftest and run-tests: the name of the current namespace.
+    .{ .name = "#%current-ns", .descriptor = &native_current_ns },
+};
+
+/// `nexis.math` namespace entries (docs/TOOLING.md §4). `abs` is in
+/// `nexis.core`; `PI` and `E` come from `math.nx`.
+const math_fns = [_]CoreEntry{
+    .{ .name = "sqrt", .descriptor = &native_math_sqrt },
+    .{ .name = "pow", .descriptor = &native_math_pow },
+    .{ .name = "floor", .descriptor = &native_math_floor },
+    .{ .name = "ceil", .descriptor = &native_math_ceil },
+    .{ .name = "round", .descriptor = &native_math_round },
 };
 
 /// The part of nexis.core written in nexis itself, embedded at
@@ -203,6 +225,13 @@ pub const CORE_NX_SOURCE: []const u8 = @embedFile("stdlib/core.nx");
 /// The `nextomic` namespace's sugar (`with-conn`), bootstrapped after
 /// `installNextomic` with that namespace current.
 pub const NEXTOMIC_NX_SOURCE: []const u8 = @embedFile("stdlib/nextomic.nx");
+/// `nexis.test` (deftest, is, testing, run-tests), bootstrapped with
+/// that namespace current after core.nx; docs/TOOLING.md §3.
+pub const TEST_NX_SOURCE: []const u8 = @embedFile("stdlib/test.nx");
+/// `nexis.pprint` (pprint, pprint-str); docs/TOOLING.md §4.
+pub const PPRINT_NX_SOURCE: []const u8 = @embedFile("stdlib/pprint.nx");
+/// The constants of `nexis.math`, bootstrapped after `installMath`.
+pub const MATH_NX_SOURCE: []const u8 = @embedFile("stdlib/math.nx");
 
 const CoreEntry = struct {
     name: []const u8,
@@ -661,6 +690,7 @@ const native_spit = NativeFn{ .name = "spit", .min_arity = 2, .max_arity = 2, .c
 const native_register_record_type = NativeFn{ .name = "#%register-record-type", .min_arity = 2, .max_arity = 2, .call = &fnRegisterRecordType };
 const native_make_record = NativeFn{ .name = "#%make-record", .min_arity = 2, .max_arity = 2, .call = &fnMakeRecord };
 const native_record_q = NativeFn{ .name = "#%record?", .min_arity = 1, .max_arity = 1, .call = &fnRecordQ };
+const native_current_ns = NativeFn{ .name = "#%current-ns", .min_arity = 0, .max_arity = 0, .call = &fnCurrentNs };
 const native_record_type_id = NativeFn{ .name = "#%record-type-id", .min_arity = 1, .max_arity = 1, .call = &fnRecordTypeId };
 
 // Protocol internals.
@@ -1080,6 +1110,50 @@ fn fnMin(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnAbs(vm: *VM, args: []const Value) VmError!Value {
     return vm_mod.numAbs(vm.ensureHeap(), args[0]);
+}
+
+// ---- nexis.math (docs/TOOLING.md §4) ----
+//
+// `sqrt` and `pow` are over doubles and return a float for any
+// number, as `Math/sqrt` and `Math/pow` do; `floor`, `ceil` and
+// `round` return an integer unchanged, `floor` and `ceil` of a
+// float the float they name, `round` of a float the nearest integer
+// (halves up, `Math/round`) as a fixnum or bignum.
+
+const native_math_sqrt = NativeFn{ .name = "nexis.math/sqrt", .min_arity = 1, .max_arity = 1, .call = &fnMathSqrt };
+const native_math_pow = NativeFn{ .name = "nexis.math/pow", .min_arity = 2, .max_arity = 2, .call = &fnMathPow };
+const native_math_floor = NativeFn{ .name = "nexis.math/floor", .min_arity = 1, .max_arity = 1, .call = &fnMathFloor };
+const native_math_ceil = NativeFn{ .name = "nexis.math/ceil", .min_arity = 1, .max_arity = 1, .call = &fnMathCeil };
+const native_math_round = NativeFn{ .name = "nexis.math/round", .min_arity = 1, .max_arity = 1, .call = &fnMathRound };
+
+fn asDouble(v: Value) VmError!f64 {
+    return (try vm_mod.numDouble(v)).asFloat();
+}
+
+fn fnMathSqrt(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromFloat(@sqrt(try asDouble(args[0])));
+}
+
+fn fnMathPow(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromFloat(std.math.pow(f64, try asDouble(args[0]), try asDouble(args[1])));
+}
+
+fn fnMathFloor(_: *VM, args: []const Value) VmError!Value {
+    if (vm_mod.isInteger(args[0])) return args[0];
+    return value_mod.fromFloat(@floor(try asDouble(args[0])));
+}
+
+fn fnMathCeil(_: *VM, args: []const Value) VmError!Value {
+    if (vm_mod.isInteger(args[0])) return args[0];
+    return value_mod.fromFloat(@ceil(try asDouble(args[0])));
+}
+
+/// A float that is NaN or infinite has no nearest integer:
+/// `:invalid-argument`, as `long` says.
+fn fnMathRound(vm: *VM, args: []const Value) VmError!Value {
+    if (vm_mod.isInteger(args[0])) return args[0];
+    const f = try asDouble(args[0]);
+    return vm_mod.numLong(vm.ensureHeap(), value_mod.fromFloat(@floor(f + 0.5)));
 }
 
 fn fnNot(_: *VM, args: []const Value) VmError!Value {
@@ -3898,6 +3972,12 @@ fn fnMakeRecord(vm: *VM, args: []const Value) VmError!Value {
     if (id < 0) return VmError.KindMismatch;
     if (args[1].kind() != .persistent_map) return VmError.KindMismatch;
     return record_mod.make(vm.ensureHeap(), @intCast(id), args[1]) catch return VmError.OutOfMemory;
+}
+
+/// `(#%current-ns)` → the name of the current namespace as a string:
+/// what `deftest` registers under and `run-tests` runs by default.
+fn fnCurrentNs(vm: *VM, _: []const Value) VmError!Value {
+    return string_mod.fromBytes(vm.ensureHeap(), vm.ensureNamespace().name) catch VmError.OutOfMemory;
 }
 
 /// `(#%record? x)` → bool.

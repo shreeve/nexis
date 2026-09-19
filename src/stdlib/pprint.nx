@@ -1,0 +1,65 @@
+; src/stdlib/pprint.nx — the `nexis.pprint` namespace (docs/TOOLING.md
+; §4): pprint prints nested collections with indentation. Embedded
+; via @embedFile and bootstrapped at VM startup with nexis.pprint as
+; the current namespace, after core.nx. No keyword literal appears
+; here (see test.nx).
+
+; A collection whose one-line form fits within `width` columns from
+; its indent prints on one line, exactly as pr-str prints it.
+(def width 72)
+
+(defn spaces [n] (apply str (repeat n " ")))
+
+(defn breakable? [x]
+  (and (coll? x)
+       (not (empty? x))
+       (not (nexis.internal/#%record? x))))
+
+; The strings in `strs` packed onto lines of at most `width`
+; columns from column `indent`, joined by newline and indent.
+(defn fill-lines [strs indent]
+  (let* [lines (reduce (fn* [lines s]
+                         (let* [cur (peek lines)]
+                           (if (and (not (empty? cur))
+                                    (> (+ indent (count cur) 1 (count s)) width))
+                             (conj lines s)
+                             (conj (pop lines) (if (empty? cur) s (str cur " " s))))))
+                       [""]
+                       strs)]
+    (apply str (interpose (str "\n" (spaces indent)) lines))))
+
+; The text of x laid out from column `indent` when its one-line
+; form does not fit: a map one `key value` pair per line, each value
+; laid out from the column after its key; a vector, list or set of
+; scalars filled line by line; one holding a collection one element
+; per line, each laid out from its own column.
+(defn layout [x indent]
+  (let* [flat (pr-str x)]
+    (if (or (not (breakable? x)) (<= (+ indent (count flat)) width))
+      flat
+      (if (map? x)
+        (str "{"
+             (apply str
+                    (interpose (str ",\n" (spaces (inc indent)))
+                               (map (fn* [e]
+                                      (let* [k (pr-str (key e))]
+                                        (str k " " (layout (val e) (+ indent 2 (count k))))))
+                                    x)))
+             "}")
+        (let* [open (if (vector? x) "[" (if (set? x) "#{" "("))
+               close (if (vector? x) "]" (if (set? x) "}" ")"))
+               inner (+ indent (count open))]
+          (str open
+               (if (some breakable? x)
+                 (apply str (interpose (str "\n" (spaces inner))
+                                       (map (fn* [e] (layout e inner)) x)))
+                 (fill-lines (map pr-str x) inner))
+               close))))))
+
+; (pprint x) → prints x laid out from column 0, then a newline; nil.
+(defn pprint [x]
+  (println (layout x 0)))
+
+; (pprint-str x) → the same text as a string.
+(defn pprint-str [x]
+  (layout x 0))

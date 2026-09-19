@@ -15,7 +15,8 @@ its own runtime: a grammar-generated reader, a macroexpander, a
 compiler to a 64-bit bytecode, a slot VM, persistent collections
 (CHAMP map and set, 32-way vector, cons list, transients), a 16-byte
 tagged value, and the emdb storage engine underneath. `bin/nexis run
-FILE.nx` and `bin/nexis repl` run real programs: `defn`, `defmacro`,
+FILE.nx` and `bin/nexis repl` run real programs (`bin/nexis disasm
+FILE.nx` shows their bytecode): `defn`, `defmacro`,
 namespaces with `require`, destructuring, multi-arity `defn`, atoms,
 records and protocols, keywords and collections as functions, doubles
 with Clojure contagion, `try`/`catch`/`finally` with every error a
@@ -76,11 +77,11 @@ The build steps, and what each is for:
 
 | step | runs | time (warm, Debug) |
 |---|---|---|
-| `zig build quick` | the language binaries (`vm`, `compile`, `expand`, `stdlib`, `loader`, `atom`, `record`, `protocol`, `format`), the compile property tests, `test/integration/{eval_pipeline,runtime_polish,numbers}.zig`, the Nextomic unit binary and its two property tests | ~35-50 s |
+| `zig build quick` | the language binaries (`vm`, `compile`, `expand`, `stdlib`, `loader`, `disasm`, `atom`, `record`, `protocol`, `format`), the compile property tests, `test/integration/{eval_pipeline,runtime_polish,numbers}.zig`, the Nextomic unit binary and its two property tests | ~35-50 s |
 | `zig build nextomic-test` | `src/nextomic/*` unit tests, `test/prop/nextomic_{key,tx}.zig`, `test/integration/nextomic_{q,pull}.zig` | ~33 s |
 | `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis`, stdout diffed against its `.out` | seconds |
 | `zig build examples` | every `examples/*.nx` through `bin/nexis`; `durable-refs`, `todo-app` and `nextomic-app` twice | seconds |
-| `zig build golden` | reader goldens (`-Dupdate=true` rewrites them) | seconds |
+| `zig build golden` | reader goldens (`-Dupdate=true` rewrites them) and the CLI goldens under `test/golden/cli` (a runtime error's stderr, a disassembly, a `pprint` script's stdout, pinned byte for byte) | seconds |
 | `zig build test --summary all` | all of the above plus every module's inline tests and the randomized collection gates | ~4 min |
 | `zig build bench` | the ReleaseFast benchmark harness (`docs/BENCH.md`) | minutes |
 | `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` via `../nexus/bin/nexus` | seconds |
@@ -140,8 +141,9 @@ The three representations — Form, Value, Encoded — fuse only through
 the codec (PLAN §5). Compile errors carry `file:line:col` and a source
 caret; a symbol that names nothing is `UnresolvedSymbol` at its own
 span; a parse or reader failure is reported the same way, at the
-token or form the reader rejected. Runtime errors carry no location
-(§6).
+token or form the reader rejected. A runtime error is reported at
+the instruction that raised it through each routine's PC → span
+table, with the frame chain the VM recorded (`docs/TOOLING.md` §1).
 
 ### 3.2 The value model
 
@@ -250,13 +252,17 @@ context, or the bare keyword when there is nothing more to say.
 | `db` | 23 natives: `open close ref ref? put-key! get-key delete-key! present? begin-write begin-read commit! abort-write! abort-read! put! get delete! deref alter! scan reduce-tree snapshot release-snapshot! snapshot?` |
 | `nexis.string` | `lower-case upper-case trim split join replace` |
 | `nexis.simd` | the typed-vector kernels `sum dot scale map` over `i64-vector` / `f64-vector` values (`docs/TYPED_VECTOR.md` §7.2); `(require '[nexis.simd :as tv])` aliases it |
-| `nexis.internal` | the nine `#%...` primitives `defrecord`/`defprotocol` expand to |
+| `nexis.internal` | the ten `#%...` primitives `defrecord`/`defprotocol`/`try`/`deftest` expand to |
+| `nexis.test` | `deftest is testing run-tests run-all-tests` and the registry and reporter they share, in `src/stdlib/test.nx` (`docs/TOOLING.md` §3) |
+| `nexis.pprint` | `pprint pprint-str` in `src/stdlib/pprint.nx` (`docs/TOOLING.md` §4) |
+| `nexis.math` | 5 natives `sqrt pow floor ceil round` plus `PI` and `E` from `src/stdlib/math.nx` (`docs/TOOLING.md` §4) |
 | `nextomic` | 20 natives: `connect release db basis-t transact! entity entid ident datoms as-of since history tx-range schema sync q explain pull pull-many with`, plus the macro `with-conn` from `src/stdlib/nextomic.nx` |
 | `user` | the current namespace at start |
 
 `src/cli.zig` `bootRuntime` installs the tables, bootstraps `core.nx`
-into `nexis.core` and `nextomic.nx` into `nextomic`, and gives both
-`run` and `repl` one `Runtime`.
+into `nexis.core`, `nextomic.nx` into `nextomic`, `test.nx`,
+`pprint.nx` and `math.nx` into their namespaces, and gives `run`,
+`repl` and `disasm` one `Runtime`.
 
 ---
 
@@ -369,7 +375,13 @@ of the sequence library, records as maps, and the one policy for an
 uncaught keyword throw from a native. `test/prop/*` (sixteen files)
 sweep the collections, codec round trips, interning, heap and
 collector; `src/*.zig` carry the inline unit tests; `test/golden/`
-holds the reader goldens and eight reader-error cases.
+holds the reader goldens, eight reader-error cases and, under
+`cli/`, the CLI's output for two runtime errors, a disassembly and
+a `pprint` script, compared byte for byte by `zig build golden`.
+`test/integration/eval_pipeline.zig` also asserts the line, column
+and frame names a runtime error records and the counts and report
+lines of `nexis.test`; `src/disasm.zig`'s tests walk every opcode
+enum so a variant cannot exist without a listing name.
 
 **Review passes.** Three independent reviews (an analyst of declared
 objectives against delivered code, an adversary of the design, an
@@ -414,27 +426,6 @@ through `bin/nexis`:
 | `eval` | `UnresolvedSymbol` | a form compiled and run in the calling VM; `macroexpand-1` and `read-string` reach the compiler through `vm.CompilerHooks` and are the pattern |
 | symbols not callable | `('a {'a 1})` → `:not-callable` | `vm.zig` lookup arm; PLAN §23 #33 promises keywords only, so state or extend |
 | macros receive only their arguments | no `&form`/`&env` (PLAN §23 #34) | `expand.zig` `callUserMacro` passes the arg forms as values; `macroexpand-1` at run time has no lexical environment to offer either |
-
-### 6.4 Phase 5 as PLAN §21 defines it
-
-*Symptom*: no test runner, no `nexis.test` (`deftest`/`is`/
-`run-tests`), `nexis.math`, `nexis.pprint`; `bin/nexis` has `run`,
-`repl` and `--help` only, no `--disasm`; runtime errors print
-`nexis: runtime error: DivideByZero` with no source span or stack.
-
-*Approach*: a PC → span table per Routine emitted by `compile.zig`,
-read by the VM's error path and the CLI (`docs/COMPILER.md` and
-`docs/VM.md` amendment logs); `nexis.test` in `core.nx` over `throw`
-and atoms; `--disasm` walking a Routine's instructions with the
-existing operand decoders. Refresh `src/cli.zig`'s usage text in the
-same pass.
-
-*Proof*: an `eval_pipeline` case asserting a runtime error's line and
-column; a `.nx` script under `zig build examples` that defines tests
-and runs them; a golden of `--disasm` output for `examples/sum10.nx`.
-
-*Size*: `compile.zig`, `vm.zig`, `cli.zig`, `core.nx`; several
-hundred lines each for spans and the runner.
 
 ### 6.5 Datalog function-position variables
 
@@ -538,7 +529,10 @@ natives go in `src/nextomic/natives.zig`'s table (or
 **Adding a `core.nx` macro or function.** `src/stdlib/core.nx` is
 embedded with `@embedFile` and evaluated into `nexis.core` at boot
 after the natives; a definition may use only what precedes it and
-the natives. Macros here are user `defmacro`s and run in the
+the natives. `test.nx`, `pprint.nx` and `math.nx` follow it into
+their own namespaces and may use all of `nexis.core`; none of the
+four may hold a keyword literal (`src/stdlib.zig` `CORE_NX_SOURCE`
+says why). Macros here are user `defmacro`s and run in the
 compile-time sub-VM; host macros (Zig) are registered in
 `src/expand.zig`'s table.
 
@@ -595,10 +589,6 @@ regenerated file with the grammar).
    most of what a Clojure programmer trips over in the first hour.
    `defn` docstrings, multi-arity `fn`, finally-only `try` and the
    conversions follow in whatever order the next program needs.
-2. **Runtime source spans and the test runner (§6.4).** Once programs
-   are longer than a screen, an unlocated `DivideByZero` is the
-   worst remaining experience; the span table is the substrate for
-   `nexis.test` output and for `--disasm`.
 3. **Datalog function-position variables (§6.5)** and the query
    surface items in §6.8, driven by the first real query that needs
    them; each is a parse/plan/exec triple with a corpus case.

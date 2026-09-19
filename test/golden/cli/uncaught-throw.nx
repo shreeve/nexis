@@ -1,0 +1,8 @@
+; An uncaught throw: the report prints the thrown value as pr-str
+; does, at the throw, with the frame chain.
+
+(defn check [x]
+  (when (neg? x)
+    (throw {:error :negative :value x})))
+
+(check -3)

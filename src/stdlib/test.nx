@@ -1,0 +1,144 @@
+; src/stdlib/test.nx — the `nexis.test` namespace (docs/TOOLING.md
+; §3): deftest, is, testing, run-tests and run-all-tests over
+; atoms and throw. Embedded via @embedFile and bootstrapped at VM
+; startup with nexis.test as the current namespace, after core.nx.
+;
+; No keyword literal appears in this file: it is compiled at boot,
+; ahead of every keyword a script reads, and a map's layout is a
+; function of intern order. The keywords of the result map are
+; built when run-tests returns; the counters use string keys.
+
+; ---- registry ----
+
+; namespace name → vector of [test-name fn] in definition order;
+; ns-order lists the namespaces in the order they first registered.
+(def tests (atom {}))
+(def ns-order (atom []))
+
+; Register or replace the test `test-name` of `ns-name`.
+(defn register! [ns-name test-name f]
+  (let* [entries (get @tests ns-name [])
+         present (some (fn* [e] (= (first e) test-name)) entries)]
+    (when (nil? (get @tests ns-name))
+      (swap! ns-order conj ns-name))
+    (swap! tests assoc ns-name
+           (if present
+             (mapv (fn* [e] (if (= (first e) test-name) [test-name f] e)) entries)
+             (conj entries [test-name f])))
+    nil))
+
+; (deftest name body...) → defines `name` as a no-argument function
+; and registers it under the current namespace; the Var.
+(defmacro deftest [name & body]
+  `(do (def ~name (fn* [] ~@body))
+       (nexis.test/register! (nexis.internal/#%current-ns) '~name ~name)
+       (var ~name)))
+
+; ---- the state of one run ----
+
+; Every report line goes through the function in `out`; a program
+; that wants the lines instead of the printing replaces it.
+(def out (atom println))
+; {"test" n "pass" n "fail" n "error" n} while a run is on.
+(def counts (atom nil))
+; {"ns" name "name" name} of the running test.
+(def current (atom nil))
+; The `testing` descriptions in force, outermost first.
+(def contexts (atom []))
+
+(defn emit! [line] (@out line))
+(defn bump! [k] (swap! counts update k inc))
+
+(defn describe-current []
+  (str (get @current "ns") "/" (get @current "name")
+       (if (empty? @contexts)
+         ""
+         (str " (" (apply str (interpose " > " @contexts)) ")"))))
+
+; The three outcomes of an assertion or a test. `pass!` is true and
+; `fail!` false so `is` yields what it asserted.
+(defn pass! [] (bump! "pass") true)
+
+(defn fail! [form expected actual msg]
+  (bump! "fail")
+  (emit! (str "FAIL in " (describe-current) ": " (pr-str form)
+              " expected: " (pr-str expected)
+              " actual: " (pr-str actual)
+              (if msg (str " ; " msg) "")))
+  false)
+
+(defn error! [e]
+  (bump! "error")
+  (emit! (str "ERROR in " (describe-current) ": " (pr-str e))))
+
+; ---- assertions ----
+
+; (is (= expected actual) msg?) → reports the two values on failure.
+; (is (thrown? MATCHER expr) msg?) → passes when expr throws a value
+;   `(catch MATCHER ...)` would take: a keyword tag or `any`; a value
+;   the matcher does not take propagates and counts as an error.
+; (is expr msg?) → passes when expr is truthy.
+; Each returns whether it passed.
+(defmacro is [form & more]
+  (let* [msg (first more)
+         head (if (seq? form) (name (first form)) nil)]
+    (cond
+      (and (= head "=") (= (count form) 3))
+      `(let* [e# ~(second form) a# ~(third form)]
+         (if (= e# a#)
+           (nexis.test/pass!)
+           (nexis.test/fail! '~form e# a# ~msg)))
+      (= head "thrown?")
+      `(try
+         (let* [v# ~(third form)]
+           (nexis.test/fail! '~form '~(second form) v# ~msg))
+         (catch ~(second form) e# (nexis.test/pass!)))
+      true
+      `(let* [v# ~form]
+         (if v#
+           (nexis.test/pass!)
+           (nexis.test/fail! '~form true v# ~msg))))))
+
+; (testing "description" body...) → runs body with the description
+; on the context stack, popped on every exit.
+(defmacro testing [desc & body]
+  `(do (swap! nexis.test/contexts conj ~desc)
+       (try (do ~@body)
+            (finally (swap! nexis.test/contexts pop)))))
+
+; ---- running ----
+
+(defn run-test [ns-name entry]
+  (reset! current {"ns" ns-name "name" (first entry)})
+  (reset! contexts [])
+  (bump! "test")
+  (try ((second entry))
+       (catch any e (error! e))))
+
+; Run every registered test of the named namespaces in order and
+; report; {:test n :pass n :fail n :error n} where :test counts the
+; tests run, :pass and :fail the assertions, :error the tests that
+; threw.
+(defn run-namespaces [ns-names]
+  (reset! counts {"test" 0 "pass" 0 "fail" 0 "error" 0})
+  (doseq [n ns-names]
+    (doseq [entry (get @tests n [])]
+      (run-test n entry)))
+  (let* [c @counts]
+    (emit! (str "Ran " (get c "test") " tests containing "
+                (+ (get c "pass") (get c "fail")) " assertions."))
+    (emit! (str (get c "fail") " failures, " (get c "error") " errors."))
+    (hash-map (keyword "test") (get c "test")
+              (keyword "pass") (get c "pass")
+              (keyword "fail") (get c "fail")
+              (keyword "error") (get c "error"))))
+
+; (run-tests) → the current namespace's tests; (run-tests 'my.ns) →
+; that namespace's.
+(defn run-tests
+  ([] (run-namespaces [(nexis.internal/#%current-ns)]))
+  ([ns] (run-namespaces [(name ns)])))
+
+; (run-all-tests) → every namespace that registered a test.
+(defn run-all-tests []
+  (run-namespaces @ns-order))

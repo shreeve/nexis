@@ -1,6 +1,7 @@
-//! nexis CLI: `nexis run FILE.nx` and `nexis repl`.
+//! nexis CLI: `nexis run FILE.nx`, `nexis repl` and `nexis disasm
+//! FILE.nx`.
 //!
-//! Both commands boot one `Runtime` (a VM with every namespace
+//! The first two boot one `Runtime` (a VM with every namespace
 //! installed, the embedded core.nx and nextomic.nx bootstrapped,
 //! and a namespace loader for `require`), then compile and run
 //! top-level forms on it one at a time. Vars, the interner and
@@ -18,6 +19,7 @@ const expand_mod = @import("expand");
 const stdlib = @import("stdlib");
 const loader_mod = @import("loader");
 const format_mod = @import("format");
+const disasm_mod = @import("disasm");
 
 const Value = value_mod.Value;
 
@@ -38,14 +40,24 @@ const Usage =
     \\                       final result.
     \\  nexis repl           Interactive read-eval-print loop.
     \\                       :quit or EOF to exit.
+    \\  nexis disasm FILE.nx Compiles FILE.nx without running it and
+    \\                       prints every routine's bytecode: pc,
+    \\                       opcode, operands, constants and the
+    \\                       source line:col each run of
+    \\                       instructions comes from.
+    \\                       `--disasm FILE.nx` is the same.
     \\
     \\For `run`, Vars and the interner persist across forms within
-    \\the file; for `repl`, across the whole session.
+    \\the file; for `repl`, across the whole session. A runtime error
+    \\is reported at its source position with the frame chain.
     \\
     \\Namespaces available without a file: nexis.core (auto-referred),
     \\db (key-value storage on emdb), nextomic (Datomic-class datoms:
     \\transact!, q, pull, as-of/since/history, with), nexis.string,
-    \\nexis.internal. See README.md and docs/NEXTOMIC.md.
+    \\nexis.test (deftest, is, testing, run-tests), nexis.pprint
+    \\(pprint), nexis.math (sqrt, pow, floor, ceil, round, PI, E),
+    \\nexis.internal. See README.md, docs/TOOLING.md and
+    \\docs/NEXTOMIC.md.
     \\
     \\Examples: examples/*.nx (examples/nextomic-app.nx for Nextomic).
     \\
@@ -84,6 +96,12 @@ pub fn main(init: std.process.Init) !void {
         try runFile(io, allocator, args[2]);
     } else if (std.mem.eql(u8, cmd, "repl")) {
         try runRepl(io, allocator);
+    } else if (std.mem.eql(u8, cmd, "disasm") or std.mem.eql(u8, cmd, "--disasm")) {
+        if (args.len < 3) {
+            try printUsage(io);
+            std.process.exit(1);
+        }
+        try disasmFile(io, allocator, args[2]);
     } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         try printUsage(io);
     } else {
@@ -175,11 +193,12 @@ fn emitSourceError(
     span: reader_mod.SrcSpan,
 ) !void {
     const stderr = std.Io.File.stderr();
-    const loc = byteOffsetToLineCol(source, span.pos);
+    const info = vm.SourceInfo{ .path = path, .text = source };
+    const loc = info.lineCol(span.pos);
     var buf: [512]u8 = undefined;
     const header = try std.fmt.bufPrint(&buf, "nexis: {s}:{d}:{d}: {s}\n", .{ path, loc.line, loc.col, label });
     try stderr.writeStreamingAll(io, header);
-    const line_text = lineAt(source, loc.line);
+    const line_text = info.lineText(loc.line);
     if (line_text.len > 0) {
         try stderr.writeStreamingAll(io, "    ");
         try stderr.writeStreamingAll(io, line_text);
@@ -194,47 +213,23 @@ fn emitSourceError(
     }
 }
 
-const LineCol = struct { line: u32, col: u32 };
-
-fn byteOffsetToLineCol(source: []const u8, offset: u32) LineCol {
-    var line: u32 = 1;
-    var col: u32 = 1;
-    var i: u32 = 0;
-    const cap: u32 = if (offset < source.len) offset else @intCast(source.len);
-    while (i < cap) : (i += 1) {
-        if (source[i] == '\n') {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    return .{ .line = line, .col = col };
-}
-
-fn lineAt(source: []const u8, line: u32) []const u8 {
-    var current_line: u32 = 1;
-    var start: usize = 0;
-    var i: usize = 0;
-    while (i < source.len) : (i += 1) {
-        if (source[i] == '\n') {
-            if (current_line == line) return source[start..i];
-            current_line += 1;
-            start = i + 1;
-        }
-    }
-    if (current_line == line) return source[start..];
-    return "";
-}
+/// The embedded sources, as the routines compiled from them name
+/// them in a stack trace.
+const core_source = vm.SourceInfo{ .path = "core.nx", .text = stdlib.CORE_NX_SOURCE };
+const nextomic_source = vm.SourceInfo{ .path = "nextomic.nx", .text = stdlib.NEXTOMIC_NX_SOURCE };
+const test_source = vm.SourceInfo{ .path = "test.nx", .text = stdlib.TEST_NX_SOURCE };
+const pprint_source = vm.SourceInfo{ .path = "pprint.nx", .text = stdlib.PPRINT_NX_SOURCE };
+const math_source = vm.SourceInfo{ .path = "math.nx", .text = stdlib.MATH_NX_SOURCE };
 
 /// The routine the VM is created around; `retargetTop` replaces it
 /// before anything runs.
 const stub_code = [_]vm.Inst{vm.asm_.returnNil()};
 const stub_routine = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
 
-/// A VM with `nexis.core`, `db`, `nexis.string`, `nexis.internal`
-/// and `nextomic` installed, the embedded core.nx and nextomic.nx
-/// bootstrapped into their namespaces, and a namespace loader
+/// A VM with `nexis.core`, `db`, `nexis.string`, `nexis.internal`,
+/// `nexis.math` and `nextomic` installed, the embedded core.nx,
+/// nextomic.nx, test.nx, pprint.nx and math.nx bootstrapped into
+/// their namespaces, and a namespace loader
 /// that searches `load_paths` when `(require ...)` fires. The
 /// current namespace is `user`.
 const Runtime = struct {
@@ -259,9 +254,9 @@ const Runtime = struct {
         return self.v.runtime_arena.allocator();
     }
 
-    /// Everything the compiler needs from the runtime; `declared`
-    /// and `out_span` are per call.
-    fn compileOptions(self: *Runtime, out_span: ?*?reader_mod.SrcSpan, declared: ?*compile.DeclaredNames) compile.CompileOptions {
+    /// Everything the compiler needs from the runtime; `declared`,
+    /// `out_span` and `source` are per call.
+    fn compileOptions(self: *Runtime, out_span: ?*?reader_mod.SrcSpan, declared: ?*compile.DeclaredNames, source: *const vm.SourceInfo) compile.CompileOptions {
         return .{
             .namespace = self.registry.current,
             .interner = self.interner,
@@ -271,33 +266,65 @@ const Runtime = struct {
             .registry = self.registry,
             .load_callback = .{ .user_data = @ptrCast(&self.loader), .load = &loader_mod.Loader.loadCallback },
             .declared = declared,
+            .source = source,
         };
     }
 
-    /// Run one compiled top-level form on the VM.
-    fn runCompiled(self: *Runtime, compiled: compile.Compiled, label: []const u8) vm.VmError!Value {
-        const routine = compiled.toRoutine(label);
+    /// Run one compiled top-level form on the VM; `<top>` is how a
+    /// stack trace names its frame.
+    fn runCompiled(self: *Runtime, compiled: compile.Compiled) vm.VmError!Value {
+        const routine = compiled.toRoutine("<top>");
         try self.v.retargetTop(&routine);
         return self.v.run();
     }
 
-    /// Print a runtime error and, for an uncaught throw, its payload.
+    /// Report a runtime error at the instruction that raised it and
+    /// print the frame chain, innermost first:
+    ///
+    ///   nexis: <path>:<line>:<col>: runtime error: DivideByZero
+    ///       <source line>
+    ///       <caret>
+    ///     at f (<path>:<line>:<col>)
+    ///     at <top> (<path>:<line>:<col>)
+    ///
+    /// An uncaught throw names the thrown value after the error, as
+    /// `pr-str` prints it. A frame whose routine carries no span
+    /// table is listed by name alone.
     fn reportRuntimeError(self: *Runtime, io: std.Io, err: anyerror) !void {
         const stderr = std.Io.File.stderr();
-        try stderr.writeStreamingAll(io, "nexis: runtime error: ");
-        try stderr.writeStreamingAll(io, @errorName(err));
-        try stderr.writeStreamingAll(io, "\n");
-        if (err != vm.VmError.UncaughtThrow) return;
-        if (self.v.unhandled_throw) |payload| {
-            var buf: [4096]u8 = undefined;
-            var stream = std.Io.Writer.fixed(&buf);
-            if (formatValue(payload, self.interner, &stream)) |_| {
-                try stderr.writeStreamingAll(io, "  payload: ");
-                try stderr.writeStreamingAll(io, stream.buffered());
-                try stderr.writeStreamingAll(io, "\n");
-            } else |_| {
-                try stderr.writeStreamingAll(io, "  (payload too large to print)\n");
+        var label_buf: [4096]u8 = undefined;
+        var label_stream = std.Io.Writer.fixed(&label_buf);
+        try label_stream.print("runtime error: {s}", .{@errorName(err)});
+        if (err == vm.VmError.UncaughtThrow) {
+            if (self.v.unhandled_throw) |payload| {
+                try label_stream.writeAll(" ");
+                format_mod.format(payload, .readable, &label_stream, self.interner) catch {
+                    try label_stream.writeAll("#<value too large to print>");
+                };
             }
+        }
+        const label = label_stream.buffered();
+
+        const trace = self.v.error_trace.items;
+        const located = trace.len > 0 and trace[0].span != null and trace[0].source != null;
+        if (located) {
+            const src = trace[0].source.?;
+            try emitSourceError(io, src.path, src.text, label, .{ .pos = trace[0].span.?.pos, .len = trace[0].span.?.len });
+        } else {
+            try stderr.writeStreamingAll(io, "nexis: ");
+            try stderr.writeStreamingAll(io, label);
+            try stderr.writeStreamingAll(io, "\n");
+        }
+        for (trace) |frame| {
+            var buf: [1024]u8 = undefined;
+            const line = if (frame.source) |src| blk: {
+                if (frame.span) |span| {
+                    const loc = src.lineCol(span.pos);
+                    break :blk try std.fmt.bufPrint(&buf, "  at {s} ({s}:{d}:{d})\n", .{ frame.name, src.path, loc.line, loc.col });
+                }
+                break :blk try std.fmt.bufPrint(&buf, "  at {s} ({s})\n", .{ frame.name, src.path });
+            } else try std.fmt.bufPrint(&buf, "  at {s}\n", .{frame.name});
+            try stderr.writeStreamingAll(io, line);
         }
     }
 };
@@ -324,12 +351,19 @@ fn bootRuntime(rt: *Runtime, io: std.Io, allocator: std.mem.Allocator, load_path
     try stdlib.installInternal(internal_ns);
     const nextomic_ns = try rt.registry.getOrCreate("nextomic", rt.registry.core);
     try stdlib.installNextomic(nextomic_ns);
+    const test_ns = try rt.registry.getOrCreate("nexis.test", rt.registry.core);
+    const pprint_ns = try rt.registry.getOrCreate("nexis.pprint", rt.registry.core);
+    const math_ns = try rt.registry.getOrCreate("nexis.math", rt.registry.core);
+    try stdlib.installMath(math_ns);
     rt.host_macros = try expand_mod.defaultMacros(allocator);
     errdefer rt.host_macros.deinit(allocator);
     // The embedded sources define into their own namespaces; core.nx
     // first so nextomic.nx can use it.
-    try bootstrapEmbedded(rt, rt.registry.core, stdlib.CORE_NX_SOURCE, "core.nx");
-    try bootstrapEmbedded(rt, nextomic_ns, stdlib.NEXTOMIC_NX_SOURCE, "nextomic.nx");
+    try bootstrapEmbedded(rt, rt.registry.core, &core_source);
+    try bootstrapEmbedded(rt, nextomic_ns, &nextomic_source);
+    try bootstrapEmbedded(rt, test_ns, &test_source);
+    try bootstrapEmbedded(rt, pprint_ns, &pprint_source);
+    try bootstrapEmbedded(rt, math_ns, &math_source);
     rt.loader = loader_mod.Loader.init(
         allocator,
         rt.persistent(),
@@ -354,8 +388,10 @@ fn bootRuntime(rt: *Runtime, io: std.Io, allocator: std.mem.Allocator, load_path
 /// the forms after it. Errors here are bugs in the embedded
 /// source, not in user code: the process panics rather than come
 /// up with half a stdlib.
-fn bootstrapEmbedded(rt: *Runtime, ns: *vm.Namespace, source: []const u8, label: []const u8) !void {
+fn bootstrapEmbedded(rt: *Runtime, ns: *vm.Namespace, info: *const vm.SourceInfo) !void {
     const allocator = rt.allocator;
+    const source = info.text;
+    const label = info.path;
     var parse_result = reader_mod.parser.parseProgram(allocator, source) catch |err| {
         std.debug.panic("nexis: {s} parse error: {s}\n", .{ label, @errorName(err) });
     };
@@ -383,10 +419,11 @@ fn bootstrapEmbedded(rt: *Runtime, ns: *vm.Namespace, source: []const u8, label:
             .out_span = &error_span,
             .persistent_allocator = rt.persistent(),
             .registry = rt.registry,
+            .source = info,
         }) catch |err| {
             std.debug.panic("nexis: {s} compile error: {s} (form span: {?})\n", .{ label, @errorName(err), error_span });
         };
-        _ = rt.runCompiled(compiled, label) catch |err| {
+        _ = rt.runCompiled(compiled) catch |err| {
             std.debug.panic("nexis: {s} runtime error: {s}\n", .{ label, @errorName(err) });
         };
     }
@@ -441,6 +478,9 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         // the persistent arena. The source bytes go there too:
         // Tiny.symbol slices borrow from them.
         const src = try rt.persistent().dupe(u8, trimmed);
+        // Routines defined on this line name it in later traces.
+        const line_source = try rt.persistent().create(vm.SourceInfo);
+        line_source.* = .{ .path = "<repl>", .text = src };
 
         // A REPL line may only refer to what exists or what the
         // line itself defines; the compiler reports anything else
@@ -461,17 +501,16 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
             continue;
         };
         var error_span: ?reader_mod.SrcSpan = null;
-        const compiled = compile.compileFormWith(rt.persistent(), form, rt.compileOptions(&error_span, &declared)) catch |err| {
+        const compiled = compile.compileFormWith(rt.persistent(), form, rt.compileOptions(&error_span, &declared, line_source)) catch |err| {
             try emitCompileError(io, "<repl>", src, err, error_span);
             continue;
         };
 
-        const result = rt.runCompiled(compiled, "repl") catch |err| {
+        const result = rt.runCompiled(compiled) catch |err| {
             try rt.reportRuntimeError(io, err);
-            // An aborted try must not leak handlers into the next line.
-            rt.v.handlers.shrinkRetainingCapacity(0);
-            rt.v.finally_stack.shrinkRetainingCapacity(0);
-            rt.v.unhandled_throw = null;
+            // The frames and handlers an aborted run left must
+            // not leak into the next line.
+            rt.v.resetAfterError();
             continue;
         };
 
@@ -538,14 +577,15 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     defer declared.deinit();
     for (forms) |form| try declared.declareForm(form);
 
+    const file_source = vm.SourceInfo{ .path = path, .text = source };
     var last_result: Value = value_mod.nilValue();
     for (forms) |form| {
         var error_span: ?reader_mod.SrcSpan = null;
-        const compiled = compile.compileFormWith(compile_arena.allocator(), form, rt.compileOptions(&error_span, &declared)) catch |err| {
+        const compiled = compile.compileFormWith(compile_arena.allocator(), form, rt.compileOptions(&error_span, &declared, &file_source)) catch |err| {
             try emitCompileError(io, path, source, err, error_span);
             std.process.exit(4);
         };
-        last_result = rt.runCompiled(compiled, "file-form") catch |err| {
+        last_result = rt.runCompiled(compiled) catch |err| {
             try rt.reportRuntimeError(io, err);
             std.process.exit(5);
         };
@@ -559,4 +599,64 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     };
     try std.Io.File.stdout().writeStreamingAll(io, stream.buffered());
     try std.Io.File.stdout().writeStreamingAll(io, "\n");
+}
+
+/// Read FILE.nx, parse and compile each top-level form the way
+/// `run` does, and print every routine's disassembly to stdout
+/// instead of running it. Macro expansion, `(ns ...)` and
+/// `(require ...)` still take effect at compile time; a `def` does
+/// not run, so a macro that calls a function the same file defines
+/// cannot expand here.
+fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
+    const stderr = std.Io.File.stderr();
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| {
+        try stderr.writeStreamingAll(io, "nexis: failed to read '");
+        try stderr.writeStreamingAll(io, path);
+        try stderr.writeStreamingAll(io, "': ");
+        try stderr.writeStreamingAll(io, @errorName(err));
+        try stderr.writeStreamingAll(io, "\n");
+        std.process.exit(2);
+    };
+    defer allocator.free(source);
+
+    var parser = reader_mod.parser.Parser.init(allocator, source);
+    defer parser.deinit();
+    const sexp = parser.parseProgram() catch {
+        try emitParseError(io, path, source, &parser);
+        std.process.exit(3);
+    };
+    var reader = reader_mod.Reader.init(allocator, source);
+    defer reader.deinit();
+    const forms = reader.readProgram(sexp) catch |err| {
+        try emitReaderError(io, path, source, &reader, err);
+        std.process.exit(3);
+    };
+    if (forms.len == 0) return;
+
+    const file_dir = std.fs.path.dirname(path) orelse ".";
+    const load_paths = [_][]const u8{ ".", file_dir };
+    var rt: Runtime = undefined;
+    try bootRuntime(&rt, io, allocator, &load_paths);
+    defer rt.deinit();
+
+    var compile_arena = std.heap.ArenaAllocator.init(allocator);
+    defer compile_arena.deinit();
+    var declared = compile.DeclaredNames.init(allocator);
+    defer declared.deinit();
+    for (forms) |form| try declared.declareForm(form);
+
+    const file_source = vm.SourceInfo{ .path = path, .text = source };
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    for (forms, 0..) |form, i| {
+        var error_span: ?reader_mod.SrcSpan = null;
+        const compiled = compile.compileFormWith(compile_arena.allocator(), form, rt.compileOptions(&error_span, &declared, &file_source)) catch |err| {
+            try emitCompileError(io, path, source, err, error_span);
+            std.process.exit(4);
+        };
+        const routine = compiled.toRoutine("<top>");
+        if (i > 0) try out.writer.writeAll("\n");
+        try disasm_mod.disassemble(&routine, rt.interner, &out.writer);
+    }
+    try std.Io.File.stdout().writeStreamingAll(io, out.written());
 }

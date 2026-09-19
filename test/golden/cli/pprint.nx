@@ -1,0 +1,17 @@
+; nexis.pprint: a collection that fits on one line prints as pr-str
+; does; a longer one breaks one entry per line, nested values laid
+; out from their own column.
+
+(require '[nexis.pprint :as pp])
+
+(pp/pprint {:name "widget" :tags [:a :b] :dims {:w 10 :h 20}})
+
+(pp/pprint {:users [{:name "Ada" :langs ["nexis" "clojure" "zig"] :id 1}
+                    {:name "Linus" :langs ["c" "zig"] :id 2}]
+            :settings {:theme "dark" :columns 80 :flags #{:beta :verbose :trace}}
+            :history (list :opened :edited :saved :closed :reopened :edited)})
+
+(pp/pprint (vec (range 40)))
+
+(print (pp/pprint-str [1 [2 [3]]]))
+(println)

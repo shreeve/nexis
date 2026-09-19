@@ -322,8 +322,14 @@ compiler relies on:
 - **Output**: routines whose `var_table` holds `*Var` pointers.
 
 - **Responsibilities**:
-  - `def` / `defn` intern the Var in the current namespace at
-    compile time (possibly unbound until the form runs).
+  - `def` / `defn` intern the Var in the current namespace itself
+    at compile time (possibly unbound until the form runs), never
+    in a referred one: `(ns my.app) (defn inc ...)` binds
+    `my.app/inc`, leaves `nexis.core/inc` as it was, and from then
+    on a bare `inc` in `my.app` resolves to the local Var (rule 6
+    finds it before the parent chain), as in Clojure. A symbol
+    qualified with the current namespace's own name is its own
+    Var, interned unbound when the definition is still to come.
   - Every Var reference is resolved to a `*Var` at compile time
     and stored in the routine's var table; the VM reads the Var's
     root at execution time, so forward references between
@@ -799,9 +805,28 @@ the path and reads the next line. A parse failure is reported the
 same way at the token the parser stopped on (`parse error:
 unexpected `)``, `unexpected end of input`), a reader failure at
 the form the reader rejected with its kind and detail (`reader
-error: :duplicate-literal-key (keyword :a)`); both exit 3. A
-runtime error carries no location: the VM reports its `VmError`
-name and, for an uncaught throw, the thrown value.
+error: :duplicate-literal-key (keyword :a)`); both exit 3.
+
+A runtime error is reported at the instruction that raised it,
+through the span table of §8: the same header, source line and
+caret with `runtime error: <VmError name>` as the label (an
+uncaught throw appends the thrown value as `pr-str` prints it),
+then the frame chain the VM recorded (`VM.md` §13), innermost
+first, one `at <name> (<path>:<line>:<col>)` line per frame:
+
+    nexis: t.nx:2:4: runtime error: DivideByZero
+        (/ 10 x))
+         ^^^^^^
+      at f (t.nx:2:4)
+      at g (t.nx:4:14)
+      at <top> (t.nx:6:2)
+
+A `defn` or named `fn*` frame carries its name, an anonymous
+closure is `fn`, a top-level form `<top>`; a caller frame's
+location is its call. `run` exits 5. The REPL reports under
+`<repl>` and, since a line's definitions are called from later
+lines, every line keeps its own source (`vm.SourceInfo`) for the
+routines compiled from it.
 
 ---
 
@@ -812,7 +837,30 @@ name and, for an uncaught throw, the thrown value.
   and keeps the source span of forms it passes through.
 - Lowering reports the span of the symbol it rejects through
   `LowerDiag`; `compileFormWith` falls back to the form's.
-- Bytecode carries no spans: nothing maps a PC back to a form.
+- Lowering allocates every Tiny node as a `TinyNode{span, tiny}`
+  and `lowerFormEnv` stamps the node with its Form's span; a
+  node lowering synthesizes without a Form (the `do` around a
+  body, the `fn*` a `defn` stands for) has none and inherits the
+  span of the form enclosing it. A hand-built `&Tiny{...}` tree
+  compiles without spans (`compileTiny`).
+- The Emitter attributes every instruction it emits to the span
+  of the innermost node being compiled: `compileExpr` sets the
+  current span on entry and restores the parent's on exit, so an
+  instruction a parent emits after its children (`call:call`
+  after the arguments, `call:return` after a body) carries the
+  parent's span. `emit` grows a run-length table, one
+  `SpanEntry{pc, span}` per change of span, ascending by pc.
+- Each `Routine` carries that table (`spans`), the span of the
+  form it was lowered from (`origin`) and the source the spans
+  index into (`source`, a `vm.SourceInfo{path, text}` the
+  caller of `compileFormWith` owns through `CompileOptions.source`);
+  a nested closure prototype carries its own. Forms a macro
+  produced carry the macro call's span, so instructions from an
+  expansion resolve to the call. `Routine.spanAt(pc)` is a
+  binary search; nothing reads the table while instructions
+  execute (VM.md §5).
+- A `defn` routine is named after its Var (the name copied onto
+  the compile allocator), an anonymous closure `fn`.
 
 ---
 
@@ -913,6 +961,8 @@ the VM's namespace, interner and macro table.
 - `docs/SEMANTICS.md` — equality, hash, numeric edges
   (runtime-side; compiler must respect).
 - `docs/VALUE.md` — heap kinds; `function` is kind 22.
+- `docs/TOOLING.md` — what the §8 span table serves: located
+  runtime errors and `nexis disasm`.
 - `../em/docs/architecture/PIPELINE.md` — em compiler pipeline
   (template; nexis adapts for macros + closures + persistent
   collections).

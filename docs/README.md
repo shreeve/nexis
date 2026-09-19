@@ -30,12 +30,13 @@ wins and the code is wrong.
 | `src/reader.zig` | [`FORMS.md`](FORMS.md) | Sexp → Form normalizer + pretty-printer + canonical Form schema |
 | `src/vm.zig` | [`VM.md`](VM.md) | Bytecode VM: ISA + execution contracts, frames, handlers, natives, namespaces |
 | `src/compile.zig` | [`COMPILER.md`](COMPILER.md) | Compiler: Form → Tiny → bytecode, per-special-form lowering, capture analysis |
-| `src/cli.zig` | (no dedicated spec) | CLI runner — `nexis run FILE.nx` / `nexis repl`; wires the pipeline into `bin/nexis` |
+| `src/cli.zig` | [`TOOLING.md`](TOOLING.md) §1 | CLI runner — `nexis run FILE.nx` / `nexis repl` / `nexis disasm FILE.nx`; wires the pipeline into `bin/nexis`; runtime error output |
+| `src/disasm.zig` | [`TOOLING.md`](TOOLING.md) §2 | Bytecode disassembler behind `nexis disasm` |
 | `src/expand.zig` | [`MACROEXPAND.md`](MACROEXPAND.md) | Form → Form rewriter (macros, syntax-quote, anon-fn, `#%list`/`#%concat`/`#%vector` dispatch); host-Zig macros and user `defmacro` |
 | `src/atom.zig` | [`ATOM.md`](ATOM.md) | In-memory mutable cells: `atom` / `swap!` / `reset!` / `compare-and-set!` |
 | `src/protocol.zig`, `src/record.zig` | [`PROTOCOLS.md`](PROTOCOLS.md) | Records + protocols: per-VM registries, `defrecord` / `defprotocol` / `extend-*` dispatch |
 | `src/loader.zig` | (in [`MACROEXPAND.md`](MACROEXPAND.md) §2b) | `(require ...)` file loading: ns-to-path mapping, load path, cycle detection |
-| `src/stdlib.zig`, `src/stdlib/*.nx` | (no dedicated spec) | Native functions + the embedded `nexis.core` / `nextomic` sources; `stdlib/README.md` |
+| `src/stdlib.zig`, `src/stdlib/*.nx` | [`TOOLING.md`](TOOLING.md) §3–§4 for `test.nx`, `pprint.nx`, `math.nx` | Native functions + the embedded `nexis.core` / `nextomic` / `nexis.test` / `nexis.pprint` / `nexis.math` sources |
 | `src/format.zig` | (in [`STRING.md`](STRING.md) §9) | Value printing (`pr-str` / `str` modes) |
 | `src/nextomic/*` | [`NEXTOMIC.md`](NEXTOMIC.md) | The database: store layout, transactions, db-values and time, query pipeline, pull, Lisp API, errors |
 | `src/parser.zig` | (no dedicated spec) | **Generated** from `nexis.grammar` by the external `nexus` tool. Do not edit by hand. |
