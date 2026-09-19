@@ -419,8 +419,7 @@ test "Runner: runs a trivial benchmark and computes stats" {
             // resolution, so the per-op median is never rounded to
             // zero and the throughput assertion below is exact.
             const vp: *volatile u64 = &c.counter;
-            var i: usize = 0;
-            while (i < 1000) : (i += 1) vp.* = vp.* +% 1;
+            for (0..1000) |_| vp.* = vp.* +% 1;
         }
     }.run);
 

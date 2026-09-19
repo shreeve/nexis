@@ -1,34 +1,28 @@
 // =============================================================================
-// src/stdlib.zig — Phase 3.3 standard library installation
+// src/stdlib.zig — the native standard library
 // =============================================================================
 //
-// Phase 3.3a (peer-AI turn 67): host-Zig functions exposed as
-// first-class `Value`s of kind `.native_fn`. Each fn has a
-// STATIC `NativeFn` descriptor (no heap allocation, immortal
-// lifetime) and is installed as a Var in the user's namespace
-// at VM startup.
+// Host-Zig functions exposed as first-class `Value`s of kind
+// `.native_fn`. Each has a static `NativeFn` descriptor (no heap
+// allocation, immortal) that the install functions bind as Vars
+// in `nexis.core`, `db`, `nexis.string`, `nexis.internal` and
+// `nextomic` at VM startup. The rest of nexis.core is written in
+// nexis itself (`stdlib/core.nx`, embedded below) on top of these.
 //
-// Phase 3.3a scope (intentionally narrow per peer-AI turn 67
-// §D8 — bound first commit to non-reentrant primitives):
-//   - sequence:   list, cons, first, rest, count, nth, empty?
-//   - utility:    identity, nil?, some?
-//
-// NO higher-order fns (map/reduce/filter/apply) — those require
-// `VM.callValue` reentrancy and ship in Phase 3.3b. NO arithmetic
-// Vars (+, <, =) — also 3.3b. NO collection ops beyond list (no
-// assoc/get/conj/etc.) — 3.3c.
-//
-// `nil`-as-empty-seq semantics (peer-AI turn 67 §D8 + §Sharp
-// warnings §8) match Clojure:
+// Every native declares its arity in its descriptor and the VM
+// enforces it; a native never indexes `args` past its declared
+// minimum. Any seqable receiver goes through `makeSeqIter`, so
+// nil, lists, vectors, maps, records, sets and strings behave the
+// same way in every sequence function. Arithmetic delegates to the
+// VM's numeric tower. nil is the empty sequence, as in Clojure:
 //   (first nil)   => nil
 //   (rest nil)    => ()
 //   (count nil)   => 0
 //   (empty? nil)  => true
 //
-// Native fns are visible to BOTH runtime AND compile-time macro
-// eval, because the persistent-namespace design from Phase 3.2
-// (peer-AI turn 66) means `routine.var_table` resolves to the
-// SAME Var pointer regardless of which VM evaluates it.
+// Natives are visible to runtime and compile-time macro eval
+// alike because `routine.var_table` resolves to the same Var
+// regardless of which VM evaluates it.
 
 const std = @import("std");
 const value_mod = @import("value");
@@ -60,11 +54,8 @@ const VmError = vm_mod.VmError;
 // Installation
 // =============================================================================
 
-/// Phase 3.3a (peer-AI turn 67 §D2): install core native fns
-/// into `ns`. Idempotent: re-installing replaces the root
-/// without disturbing the Var's `.macro` flag. Callers
-/// typically invoke this ONCE at VM startup (REPL, file runner,
-/// test harness).
+/// Install the core natives into `ns`. Idempotent: re-installing
+/// replaces the root without disturbing the Var's `.macro` flag.
 ///
 /// Native fn NAMES are string literals (`.rodata`, immortal),
 /// so the Namespace's existing `intern(name)` overload (which
@@ -97,13 +88,10 @@ pub fn installNextomic(nextomic_ns: *Namespace) !void {
     try nextomic_mod.natives.install(nextomic_ns);
 }
 
-/// Phase 5.2b (peer-AI turn 79): install `nexis.string/*` ops
-/// into the `nexis.string` namespace. NOT auto-referred (matches
-/// Clojure's `clojure.string`); users call qualified
-/// `(nexis.string/lower-case ...)`. CLI ordering must be
-/// installCore → installDb → installString → bootstrap core.nx
-/// (turn 79 §D7) so future composite definitions in core.nx
-/// can reference `nexis.string/*` without a load-order trap.
+/// Install `nexis.string/*` into the `nexis.string` namespace. Not
+/// auto-referred (like Clojure's `clojure.string`): users call
+/// `(nexis.string/lower-case ...)`. Installed before core.nx is
+/// bootstrapped so composite definitions may refer to it.
 pub fn installString(string_ns: *Namespace) !void {
     for (string_fns) |entry| {
         const v = try string_ns.intern(entry.name);
@@ -112,11 +100,10 @@ pub fn installString(string_ns: *Namespace) !void {
     }
 }
 
-/// Phase 5.3a (peer-AI turn 84): install `#%`-prefixed internal
-/// helpers into the `nexis.internal` namespace. NOT auto-
-/// referred; the `defrecord`/`defprotocol` macros emit qualified
-/// calls (`nexis.internal/#%register-record-type` etc.). User
-/// code does not call these directly.
+/// Install the `#%`-prefixed helpers into the `nexis.internal`
+/// namespace. Not auto-referred: the `defrecord`/`defprotocol`
+/// macros emit qualified calls (`nexis.internal/#%register-record-type`
+/// etc.); user code does not call these directly.
 pub fn installInternal(internal_ns: *Namespace) !void {
     for (internal_fns) |entry| {
         const v = try internal_ns.intern(entry.name);
@@ -187,15 +174,10 @@ const internal_fns = [_]CoreEntry{
     .{ .name = "#%extend-default-impl", .descriptor = &native_extend_default_impl },
 };
 
-/// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
-/// layer written in nexis itself, embedded at compile time.
-/// CLI / test harnesses compile + evaluate this AFTER calling
-/// `installCore` so the composite definitions can use the
-/// native primitives.
-///
-/// Lives in `src/stdlib/core.nx`. Add new macros/fns there,
-/// not here — keeping the composite layer in nexis source
-/// matches CLOJURE-REVIEW.md §1.1 two-stage bootstrap.
+/// The part of nexis.core written in nexis itself, embedded at
+/// compile time. Evaluated after `installCore` so its definitions
+/// can use the natives. Add composite macros and fns to
+/// `src/stdlib/core.nx`, not here.
 pub const CORE_NX_SOURCE: []const u8 = @embedFile("stdlib/core.nx");
 /// The `nextomic` namespace's sugar (`with-conn`), bootstrapped after
 /// `installNextomic` with that namespace current.
@@ -629,10 +611,10 @@ const native_string_split = NativeFn{ .name = "nexis.string/split", .min_arity =
 const native_string_join = NativeFn{ .name = "nexis.string/join", .min_arity = 1, .max_arity = 2, .call = &fnStringJoin };
 const native_string_replace = NativeFn{ .name = "nexis.string/replace", .min_arity = 3, .max_arity = 3, .call = &fnStringReplace };
 const native_db_alter = NativeFn{ .name = "db/alter!", .min_arity = 3, .max_arity = null, .call = &fnDbAlter };
-// Phase 4.0d — scan + reduce-tree.
+// scan + reduce-tree.
 const native_db_scan = NativeFn{ .name = "db/scan", .min_arity = 2, .max_arity = 4, .call = &fnDbScan };
 const native_db_reduce_tree = NativeFn{ .name = "db/reduce-tree", .min_arity = 4, .max_arity = 4, .call = &fnDbReduceTree };
-// Phase 4.0f — snapshot aliases. emdb read transactions ARE
+// Snapshot aliases. emdb read transactions ARE
 // snapshots (pinned to the commit generation at begin time).
 // These names give users PLAN.md §15.7 vocabulary without
 // duplicating the underlying mechanism.
@@ -1049,13 +1031,13 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// apply + HOFs (3.3b)
+// apply + HOFs
 // =============================================================================
 //
-// `apply` + `map` / `reduce` / `filter` are the FIRST users of
-// `VM.callValue` (peer-AI turn 68). They MUST propagate
-// `VmError.ControlTransferred` unchanged so throws from inside
-// user fns escape to the outer handler correctly.
+// `apply`, `map`, `reduce`, `filter` and the rest call back into
+// the VM through `VM.callValue`. They propagate
+// `VmError.ControlTransferred` unchanged so a throw from inside a
+// user fn lands at the outer handler.
 
 /// `(apply f x1 x2 ... xs)` calls `f` with the elements of
 /// the last arg seq spliced in after the leading args.
@@ -2320,16 +2302,15 @@ fn isIfn(k: Kind) bool {
 }
 
 // =============================================================================
-// db primitives (Phase 4.0a)
+// db primitives
 // =============================================================================
 //
-// Per peer-AI turn 72: Path B (explicit transaction threading).
 // `(db/open path)` opens a connection; `db/close` closes it.
-// `(db/ref conn tree-keyword key-string)` constructs a durable
-// ref Value. `db/put-key!` / `db/get-key` / `db/delete-key!` /
-// `db/present?` operate via AUTO-EPHEMERAL transactions for
-// v1.alpha (4.0a). Explicit `with-tx` + tx-threaded ops land in
-// 4.0b.
+// `(db/ref conn tree-keyword key)` constructs a durable ref Value.
+// `db/put-key!` / `db/get-key` / `db/delete-key!` / `db/present?`
+// each run inside a transaction of their own; the explicit
+// transaction primitives below thread one through several
+// operations.
 //
 // Errors land as catchable keyword payloads:
 //   :db/<reason>         a named emdb / db-layer failure, see
@@ -2530,11 +2511,11 @@ fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// db explicit-tx primitives (Phase 4.0b)
+// db explicit-transaction primitives
 // =============================================================================
 //
-// Per peer-AI turn 72: PATH B (explicit tx threading). The
-// `with-tx` / `with-read-tx` macros (in core.nx) generate
+// Transactions are threaded explicitly. The `with-tx` /
+// `with-read-tx` macros (in core.nx) generate
 // `(let [tx (db/begin-write conn)] (try ...body... (catch any e (db/abort-write! tx) (throw e))))`
 // with commit at the end of the body.
 //
@@ -2725,28 +2706,20 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
 /// do NOT write. Connection mismatch on `ref` surfaces as
 /// :db/store-mismatch via db.zig's assertRefMatchesConn.
 // =============================================================================
-// scan + reduce-tree (Phase 4.0d)
+// scan + reduce-tree
 // =============================================================================
 //
 // `(db/scan tx tree-keyword)` returns a vector of `[key value]`
-// 2-vectors in key-ordered iteration order.
+// 2-vectors in key order; `(db/scan tx tree-keyword start-key)`
+// starts at `start-key` (inclusive) and
+// `(db/scan tx tree-keyword start-key end-key)` stops before
+// `end-key`. `(db/reduce-tree tx tree-keyword f init)` walks the
+// whole tree applying `(f acc key value)` and returns the final
+// accumulator.
 //
-// `(db/scan tx tree-keyword start-key)` — start-inclusive scan.
-// `(db/scan tx tree-keyword start-key end-key)` — start-inclusive,
-// end-exclusive (peer-AI turn 73 §Q5).
-//
-// `(db/reduce-tree tx tree-keyword f init)` — server-side-ish
-// reduction. Walks the whole tree applying `(f acc key value)`
-// to each entry. Returns final accumulator.
-//
-// v1 LIMITATIONS (peer-AI turn 73 §Q8 traps):
-//   - Keys are returned as keyword Values (interned from key
-//     bytes). Matches the v1.alpha key model where db/ref's key
-//     arg is a keyword/symbol. Arbitrary byte keys await
-//     first-class string support.
-//   - Values are FULLY DECODED + Heap-allocated per entry. The
-//     cursor advances safely because we decode BEFORE moving.
-//   - Eager vector (peer §Q4). Lazy seqs are a future polish.
+// Keys come back as keyword Values interned from the key bytes
+// (the key model of `db/ref`). Each value is fully decoded onto
+// the heap before the cursor advances. Results are eager.
 
 /// A cursor over one named tree inside an active transaction.
 const TreeCursor = struct {
