@@ -39,6 +39,7 @@ const relation = @import("../relation.zig");
 const ir = @import("ir.zig");
 const plan_mod = @import("plan.zig");
 const rules_mod = @import("rules.zig");
+const marshal = @import("../marshal.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -94,19 +95,7 @@ pub const Exec = struct {
     /// The cell of a datom value: ids as `int`, keywords as VM keyword
     /// ids, uuids as text.
     pub fn valCell(self: *Exec, v: key.Val) !Cell {
-        return switch (v) {
-            .boolean => |b| .{ .boolean = b },
-            .long, .instant => |n| .{ .int = n },
-            .double => |d| .{ .double = d },
-            .keyword => |id| .{ .keyword = (try self.read.db.conn.idents.internOf(self.read.txn, id)) orelse return error.Corrupted },
-            .ref => |e| .{ .int = @intCast(e) },
-            .string, .bytes => |s| .{ .str = s },
-            .uuid => |u| blk: {
-                const text = try self.arena.alloc(u8, 36);
-                datom_mod.uuidToText(text[0..36], u);
-                break :blk .{ .str = text };
-            },
-        };
+        return marshal.cellOf(self.read, self.arena, v);
     }
 
     fn datomCells(self: *Exec, d: datom_mod.Datom) ![5]Cell {
@@ -227,7 +216,7 @@ pub const Exec = struct {
             if (slots[2] == .constant and slots[2].constant.bytes != null) {
                 comps.v = slots[2].constant.bytes;
             } else if (attr) |at| {
-                const val = (try plan_mod.encodeCell(self.read, c, at.value_type)) orelse return;
+                const val = (try marshal.encodeCell(self.read, c, at.value_type)) orelse return;
                 comps.v = key.valBytes(self.arena, val) catch |err| switch (err) {
                     error.ValueType => return,
                     else => return err,
@@ -426,23 +415,7 @@ pub const Exec = struct {
 
     /// The elements of a vector, list or set value, or null.
     pub fn seqElems(self: *Exec, v: Value) !?[]Value {
-        var out: std.ArrayList(Value) = .empty;
-        switch (v.kind()) {
-            .persistent_vector => {
-                var it = vector_mod.Cursor.init(v);
-                while (it.next()) |x| try out.append(self.arena, x);
-            },
-            .list => {
-                var it = list_mod.Cursor.init(v);
-                while (it.next()) |x| try out.append(self.arena, x);
-            },
-            .persistent_set => {
-                var it = champ.setIter(v);
-                while (it.next()) |x| try out.append(self.arena, x);
-            },
-            else => return null,
-        }
-        return try out.toOwnedSlice(self.arena);
+        return marshal.collection(self.arena, v);
     }
 
     // ── not, or, source ───────────────────────────────────────────
@@ -585,28 +558,20 @@ pub const Exec = struct {
         };
     }
 
-    /// The entity an ident or lookup-ref input names, or null when
-    /// there is none. A lookup ref on an unknown attribute is
-    /// `UnknownAttribute`; on a non-unique one, `TxData`.
+    /// The entity an ident or lookup-ref input names (the `marshal`
+    /// contract), or null when there is none; the diagnostic carries
+    /// what a failing lookup ref named.
     fn inputEntity(self: *Exec, c: Cell) anyerror!?u64 {
-        switch (c) {
-            .keyword => |kw| return self.read.entid(self.arena, .{ .ident = kw }),
-            .vm => |v| {
-                if (v.kind() != .persistent_vector or vector_mod.count(v) != 2 or vector_mod.nth(v, 0).kind() != .keyword) return null;
-                const name = vector_mod.nth(v, 0);
-                const at = blk: {
-                    if (try self.read.db.conn.idents.idOf(self.read.txn, name.asKeywordId())) |id| {
-                        if (try self.read.attr(@intCast(id))) |at| break :blk at;
-                    }
-                    if (self.diag) |d| d.* = .{ .message = "unknown attribute", .attr = name };
-                    return error.UnknownAttribute;
-                };
-                const id = at.id;
-                const val = (try plan_mod.encodeCell(self.read, Cell.fromValue(vector_mod.nth(v, 1)), at.value_type)) orelse return null;
-                return self.read.entid(self.arena, .{ .lookup = .{ .a = @intCast(id), .v = val } });
-            },
+        const v: Value = switch (c) {
+            .keyword => |kw| value.fromKeywordId(kw),
+            .vm => |v| v,
             else => return null,
-        }
+        };
+        var fault: db_mod.Fault = .{};
+        return marshal.entity(self.read, self.arena, v, &fault) catch |err| {
+            if (self.diag) |d| d.* = .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr };
+            return err;
+        };
     }
 
     fn tupleVars(arena: Allocator, ts: []const ?Var) ![]Var {

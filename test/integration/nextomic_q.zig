@@ -712,7 +712,7 @@ const Naive = struct {
                 if (v.kind() != .persistent_vector or vector_mod.count(v) != 2 or vector_mod.nth(v, 0).kind() != .keyword) return null;
                 const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, vector_mod.nth(v, 0).asKeywordId())) orelse return error.UnknownAttribute;
                 const vt = self.attr_types.get(attr_id) orelse return error.UnknownAttribute;
-                const val = (try cellToVal(Cell.fromValue(vector_mod.nth(v, 1)), vt)) orelse return null;
+                const val = (try cellToVal(Cell.fromValue(vector_mod.nth(v, 1)), vt)) orelse return error.ValueType;
                 return self.read.entid(self.arena, .{ .lookup = .{ .a = attr_id, .v = val } });
             },
             else => return null,
@@ -1152,7 +1152,7 @@ test "corpus: every :in form" {
     try checkCount(fx, dbv, "[:find ?n :in $ [[?e ?a]] :where [?e :person/age ?a] [?e :person/name ?n]]", &.{ nil, try fx.read("[[[:person/email \"ann@x\"] 30] [[:person/email \"bob@x\"] 1] [:role/admin 5]]") }, 1);
     try checkCount(fx, dbv, "[:find ?n :in $ ?r :where [?e :person/role ?r] [?e :person/name ?n]]", &.{ nil, value.fromKeywordId(try fx.kw("role/admin")) }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/email \"nobody@x\"]") }, 0);
-    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/email 5]") }, 0);
+    try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/email 5]") }));
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, value.fromKeywordId(try fx.kw("role/nobody")) }, 0);
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where (not [?e :person/age 30]) [?e :person/name ?n]]", &.{ nil, ann_ref }, 0);
     try testing.expectError(error.TxData, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/name \"Ann\"]") }));

@@ -48,6 +48,7 @@ const store_mod = @import("store.zig");
 const relation = @import("relation.zig");
 const parse_mod = @import("query/parse.zig");
 const plan_mod = @import("query/plan.zig");
+const marshal = @import("marshal.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -401,30 +402,15 @@ const Puller = struct {
     }
 
     /// The eid of an entity argument: an eid, a lookup ref or an ident.
+    /// The entity to pull: the `marshal` contract, where a reference
+    /// that names nothing is `NoEntity`.
     fn resolveEntity(self: *Puller, e: Value) anyerror!u64 {
-        switch (e.kind()) {
-            .fixnum => {
-                const n = e.asFixnum();
-                if (n <= 0 or n > key.id_max) return error.NoEntity;
-                return @intCast(n);
-            },
-            .keyword => return (try self.read.entid(self.arena, .{ .ident = e.asKeywordId() })) orelse error.NoEntity,
-            .persistent_vector => {
-                if (vector_mod.count(e) != 2 or vector_mod.nth(e, 0).kind() != .keyword) return self.fail("lookup ref must be [attr value]");
-                const k = vector_mod.nth(e, 0).asKeywordId();
-                const attr = blk: {
-                    if (try self.read.db.conn.idents.idOf(self.read.txn, k)) |id| {
-                        if (try self.read.attr(id)) |attr| break :blk attr;
-                    }
-                    self.diag.* = .{ .message = "unknown attribute", .attr = vector_mod.nth(e, 0) };
-                    return error.UnknownAttribute;
-                };
-                const id = attr.id;
-                const v = (try plan_mod.encodeCell(self.read, Cell.fromValue(vector_mod.nth(e, 1)), attr.value_type)) orelse return error.ValueType;
-                return (try self.read.entid(self.arena, .{ .lookup = .{ .a = id, .v = v } })) orelse error.NoEntity;
-            },
-            else => return self.fail("entity must be an eid, a lookup ref or an ident"),
-        }
+        var fault: db_mod.Fault = .{};
+        const eid = marshal.entity(self.read, self.arena, e, &fault) catch |err| {
+            self.diag.* = .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr };
+            return err;
+        };
+        return eid orelse error.NoEntity;
     }
 
     fn root(self: *Puller, pat: *const Pattern, e: u64) anyerror!?Value {
@@ -909,9 +895,10 @@ test "limit, default, as, expression forms, pull-many, syntax diagnostics" {
         try testing.expectEqualStrings(b.message, fx.diag.message);
         try testing.expectEqual(b.clause, fx.diag.clause);
     }
-    try testing.expectError(error.PullSyntax, fx.pullOne(dbv, try fx.vec(&.{try fx.sym("*")}), try fx.str("ann")));
-    try testing.expectEqualStrings("entity must be an eid, a lookup ref or an ident", fx.diag.message);
-    try testing.expectError(error.PullSyntax, fx.pullOne(dbv, try fx.vec(&.{try fx.sym("*")}), try fx.vec(&.{try fx.kw("p/email")})));
+    // The entity argument follows the marshal contract.
+    try testing.expectError(error.KindMismatch, fx.pullOne(dbv, try fx.vec(&.{try fx.sym("*")}), try fx.str("ann")));
+    try testing.expectError(error.TxData, fx.pullOne(dbv, try fx.vec(&.{try fx.sym("*")}), try fx.vec(&.{try fx.kw("p/email")})));
+    try testing.expectEqualStrings("a lookup ref is [attr value]", fx.diag.message);
     try testing.expectError(error.ValueType, fx.pullOne(dbv, try fx.vec(&.{try fx.sym("*")}), try fx.vec(&.{ try fx.kw("p/email"), Fx.int(1) })));
 }
 

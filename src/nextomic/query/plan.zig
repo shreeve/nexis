@@ -33,6 +33,7 @@ const datom_mod = @import("../datom.zig");
 const schema_mod = @import("../schema.zig");
 const db_mod = @import("../db.zig");
 const store_mod = @import("../store.zig");
+const marshal = @import("../marshal.zig");
 const relation = @import("../relation.zig");
 const ir = @import("ir.zig");
 const rules_mod = @import("rules.zig");
@@ -676,7 +677,7 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) anyerror!?Co
                     error.ValueType => return null,
                     else => return err,
                 };
-                return .{ .cell = cellOfVal(ctx, val), .bytes = bytes };
+                return .{ .cell = try marshal.cellOf(ctx.read, ctx.arena, val), .bytes = bytes };
             }
             return switch (c) {
                 .cell => |cell| .{ .cell = cell },
@@ -746,56 +747,9 @@ pub fn resolveTyped(ctx: *Ctx, c: ir.Constant, vt: key.ValueType) anyerror!?key.
                 const eid = (try ctx.read.db.conn.idents.idOf(ctx.read.txn, cell.keyword)) orelse return null;
                 return .{ .ref = eid };
             }
-            return try encodeCell(ctx.read, cell, vt);
+            return try marshal.encodeCell(ctx.read, cell, vt);
         },
     }
-}
-
-/// The datom value of `cell` under type `vt`, or null when no value of
-/// that type equals it. Keywords are resolved through the store's
-/// idents; an unknown ident is null.
-pub fn encodeCell(read: *Read, cell: Cell, vt: key.ValueType) anyerror!?key.Val {
-    return switch (vt) {
-        .boolean => if (cell == .boolean) .{ .boolean = cell.boolean } else null,
-        .long => if (cell == .int) .{ .long = cell.int } else null,
-        .double => if (cell == .double) .{ .double = cell.double } else null,
-        .instant => if (cell == .int) .{ .instant = cell.int } else null,
-        .keyword => blk: {
-            if (cell != .keyword) break :blk null;
-            const id = (try read.db.conn.idents.idOf(read.txn, cell.keyword)) orelse break :blk null;
-            break :blk .{ .keyword = id };
-        },
-        .ref => blk: {
-            const eid = cell.asEid() orelse break :blk null;
-            break :blk .{ .ref = eid };
-        },
-        .string => if (cell == .str) .{ .string = cell.str } else null,
-        .uuid => blk: {
-            if (cell != .str) break :blk null;
-            const u = datom_mod.uuidFromText(cell.str) orelse break :blk null;
-            break :blk .{ .uuid = u };
-        },
-        .bytes => if (cell == .str) .{ .bytes = cell.str } else null,
-    };
-}
-
-/// The cell a resolved datom value compares as: ids as `int`, keyword
-/// values as VM keyword ids (the constant came from one, so the
-/// intern exists).
-fn cellOfVal(ctx: *Ctx, v: key.Val) Cell {
-    return switch (v) {
-        .boolean => |b| .{ .boolean = b },
-        .long, .instant => |n| .{ .int = n },
-        .double => |d| .{ .double = d },
-        .keyword => |id| .{ .keyword = ctx.read.db.conn.idents.by_ident.get(id).? },
-        .ref => |e| .{ .int = @intCast(e) },
-        .string, .bytes => |s| .{ .str = s },
-        .uuid => |u| blk: {
-            const text = ctx.arena.alloc(u8, 36) catch unreachable;
-            datom_mod.uuidToText(text[0..36], u);
-            break :blk .{ .str = text };
-        },
-    };
 }
 
 // =============================================================================

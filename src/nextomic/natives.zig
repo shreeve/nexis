@@ -48,6 +48,7 @@ const transact_mod = @import("transact.zig");
 const pull_mod = @import("pull.zig");
 const query = @import("query.zig");
 const query_natives = @import("query/natives.zig");
+const marshal = @import("marshal.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -382,98 +383,6 @@ fn fixnum(n: u64) !Value {
     return value.fromFixnum(@intCast(n)) orelse error.ArithmeticOverflow;
 }
 
-/// The attribute a program named as `v`: a keyword ident or a fixnum
-/// id. `UnknownAttribute`, naming it in `fault`, when there is none.
-fn attrOf(rd: *Read, v: Value, fault: *Fault) !Attr {
-    const id: u32 = switch (v.kind()) {
-        .keyword => (try rd.db.conn.idents.idOf(rd.txn, v.asKeywordId())) orelse 0,
-        .fixnum => blk: {
-            const n = v.asFixnum();
-            break :blk if (n <= 0 or n > std.math.maxInt(u32)) 0 else @intCast(n);
-        },
-        else => return error.KindMismatch,
-    };
-    if (id != 0) {
-        if (try rd.attr(id)) |attr| return attr;
-    }
-    fault.* = .{ .attr = v };
-    return error.UnknownAttribute;
-}
-
-/// An entity position: an eid, an ident keyword or a lookup ref
-/// `[attr v]`. Null when the ident or lookup names nothing in this view.
-fn entityRef(rd: *Read, arena: Allocator, v: Value, fault: *Fault) anyerror!?u64 {
-    switch (v.kind()) {
-        .fixnum => {
-            const n = v.asFixnum();
-            if (n <= 0 or n > @as(i64, @intCast(key.id_max))) return error.NoEntity;
-            return @intCast(n);
-        },
-        .keyword => return rd.entid(arena, .{ .ident = v.asKeywordId() }),
-        .persistent_vector => {
-            if (vector_mod.count(v) != 2) return error.KindMismatch;
-            const attr = try attrOf(rd, vector_mod.nth(v, 0), fault);
-            if (attr.unique == .none) {
-                fault.* = .{ .message = "a lookup ref needs a unique attribute", .attr = vector_mod.nth(v, 0) };
-                return error.TxData;
-            }
-            const lv = (try valFrom(rd, arena, attr.value_type, vector_mod.nth(v, 1), fault)) orelse return null;
-            return rd.entid(arena, .{ .lookup = .{ .a = attr.id, .v = lv } });
-        },
-        else => return error.KindMismatch,
-    }
-}
-
-/// Convert a Lisp value by an attribute's value type. Null when a
-/// keyword or entity reference names nothing in this view, so that no
-/// datom can match it; `error.ValueType` on a kind mismatch.
-fn valFrom(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *Fault) anyerror!?Val {
-    switch (vt) {
-        .boolean => {
-            if (!v.isBool()) return error.ValueType;
-            return .{ .boolean = v.asBool() };
-        },
-        .long => {
-            if (v.kind() != .fixnum) return error.ValueType;
-            return .{ .long = v.asFixnum() };
-        },
-        .double => {
-            if (v.kind() != .float) return error.ValueType;
-            const d = v.asFloat();
-            if (std.math.isNan(d)) return error.ValueType;
-            return .{ .double = d };
-        },
-        .instant => {
-            if (v.kind() != .fixnum) return error.ValueType;
-            return .{ .instant = v.asFixnum() };
-        },
-        .keyword => {
-            if (v.kind() != .keyword) return error.ValueType;
-            const id = (try rd.db.conn.idents.idOf(rd.txn, v.asKeywordId())) orelse return null;
-            return .{ .keyword = id };
-        },
-        .ref => {
-            const e = entityRef(rd, arena, v, fault) catch |err| switch (err) {
-                error.KindMismatch => return error.ValueType,
-                else => return err,
-            };
-            return .{ .ref = e orelse return null };
-        },
-        .string => {
-            if (v.kind() != .string) return error.ValueType;
-            return .{ .string = string_mod.asBytes(v) };
-        },
-        .uuid => {
-            if (v.kind() != .string) return error.ValueType;
-            return .{ .uuid = datom_mod.uuidFromText(string_mod.asBytes(v)) orelse return error.ValueType };
-        },
-        .bytes => {
-            if (v.kind() != .string) return error.ValueType;
-            return .{ .bytes = string_mod.asBytes(v) };
-        },
-    }
-}
-
 // =============================================================================
 // Marshalling: datoms → Lisp
 // =============================================================================
@@ -635,7 +544,7 @@ fn pullManyNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     const d = try dbOf(args[0]);
     var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
     defer arena_state.deinit();
-    const es = try entities(arena_state.allocator(), args[2]);
+    const es = (try marshal.sequence(arena_state.allocator(), args[2])) orelse return error.KindMismatch;
     return pull_mod.pullMany(vm.allocator, vm.ensureInterner(), vm.ensureHeap(), d, args[1], es, diag);
 }
 
@@ -644,23 +553,6 @@ fn failPull(vm: *VM, err: anyerror, diag: *const Diag) VmError {
     if (err == error.PullSyntax) return throwSyntax(vm, "nextomic/pull-syntax", diag.message, diag.clause);
     if (err == error.UnknownAttribute) return failWith(vm, err, .{ .attr = diag.attr });
     return fail(vm, err);
-}
-
-/// The elements of a vector or list.
-fn entities(arena: Allocator, v: Value) ![]Value {
-    var out: std.ArrayList(Value) = .empty;
-    switch (v.kind()) {
-        .persistent_vector => {
-            var it = vector_mod.Cursor.init(v);
-            while (it.next()) |x| try out.append(arena, x);
-        },
-        .list => {
-            var it = list_mod.Cursor.init(v);
-            while (it.next()) |x| try out.append(arena, x);
-        },
-        else => return error.KindMismatch,
-    }
-    return out.items;
 }
 
 // =============================================================================
@@ -682,7 +574,7 @@ fn entityNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
     const arena = arena_state.allocator();
     var rd = try d.beginRead();
     defer rd.close();
-    const e = (try entityRef(&rd, arena, args[1], fault)) orelse return value.nilValue();
+    const e = (try marshal.entity(&rd, arena, args[1], fault)) orelse return value.nilValue();
     var b = Builder.init(vm, d.conn, rd.txn);
 
     var it = try rd.scan(arena, .eavt, .{ .e = e });
@@ -725,7 +617,7 @@ fn entidNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
     defer arena_state.deinit();
     var rd = try d.beginRead();
     defer rd.close();
-    const e = (try entityRef(&rd, arena_state.allocator(), args[1], fault)) orelse return value.nilValue();
+    const e = (try marshal.entity(&rd, arena_state.allocator(), args[1], fault)) orelse return value.nilValue();
     return value.fromFixnum(@intCast(e)) orelse error.ArithmeticOverflow;
 }
 
@@ -787,16 +679,16 @@ fn datomsNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
     for (args[2..], 0..) |arg, i| {
         if (arg.isNil()) continue;
         switch (order[i]) {
-            'e' => comps.e = (try entityRef(&rd, arena, arg, fault)) orelse return empty,
+            'e' => comps.e = (try marshal.entity(&rd, arena, arg, fault)) orelse return empty,
             'a' => {
-                attr = try attrOf(&rd, arg, fault);
+                attr = try marshal.attrOf(&rd, arg, fault);
                 comps.a = attr.?.id;
             },
             'v' => {
                 const val: Val = if (index == .vaet)
-                    .{ .ref = (try entityRef(&rd, arena, arg, fault)) orelse return empty }
+                    .{ .ref = (try marshal.entity(&rd, arena, arg, fault)) orelse return empty }
                 else
-                    (try valFrom(&rd, arena, (attr orelse return error.ValueType).value_type, arg, fault)) orelse return empty;
+                    (try marshal.valOf(&rd, arena, (attr orelse return error.ValueType).value_type, arg, fault)) orelse return empty;
                 comps.v = try key.valBytes(arena, val);
             },
             else => unreachable,
@@ -966,92 +858,4 @@ test "a time argument is a t or the entity id of a transaction" {
     try testing.expectEqual(@as(u64, 0), try tArg(value.fromFixnum(0).?));
     try testing.expectError(error.InvalidArgument, tArg(value.fromFixnum(-1).?));
     try testing.expectError(error.KindMismatch, tArg(value.nilValue()));
-}
-
-test "marshalling both ways for every value type" {
-    const tc = try TestConn.init("natives_marshal");
-    defer tc.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const db = try tc.conn.db();
-    var rd = try db.beginRead();
-    defer rd.close();
-    const conn = tc.conn;
-    var fault: Fault = .{};
-
-    // Lisp → Val → Lisp, one round trip per type.
-    const kw_string = try tc.interner.internKeywordValue("db.type/string");
-    const kw_ident = try tc.interner.internKeywordValue("db/ident");
-    const kw_doc = try tc.interner.internKeywordValue("db/doc");
-    const uuid_text = try string_mod.fromBytes(&heap, "0123abcd-4567-89ef-0123-456789abcdef");
-    const lookup = try vector_mod.fromSlice(&heap, &.{ kw_ident, kw_doc });
-
-    const b = (try valFrom(&rd, arena, .boolean, value.fromBool(true), &fault)).?;
-    try testing.expect(b.boolean);
-    try testing.expect((try conn.valToValue(rd.txn, &heap, b)).asBool());
-
-    const n = (try valFrom(&rd, arena, .long, value.fromFixnum(-42).?, &fault)).?;
-    try testing.expectEqual(@as(i64, -42), n.long);
-    try testing.expectEqual(@as(i64, -42), (try conn.valToValue(rd.txn, &heap, n)).asFixnum());
-
-    const f = (try valFrom(&rd, arena, .double, value.fromFloat(2.5), &fault)).?;
-    try testing.expectEqual(@as(f64, 2.5), f.double);
-    try testing.expectEqual(@as(f64, 2.5), (try conn.valToValue(rd.txn, &heap, f)).asFloat());
-
-    const i = (try valFrom(&rd, arena, .instant, value.fromFixnum(1_700_000_000_000).?, &fault)).?;
-    try testing.expectEqual(@as(i64, 1_700_000_000_000), i.instant);
-    try testing.expectEqual(@as(i64, 1_700_000_000_000), (try conn.valToValue(rd.txn, &heap, i)).asFixnum());
-
-    const k = (try valFrom(&rd, arena, .keyword, kw_string, &fault)).?;
-    try testing.expectEqual(@as(u32, boot.type_string), k.keyword);
-    try testing.expectEqual(kw_string.asKeywordId(), (try conn.valToValue(rd.txn, &heap, k)).asKeywordId());
-
-    const r = (try valFrom(&rd, arena, .ref, value.fromFixnum(boot.doc).?, &fault)).?;
-    try testing.expectEqual(@as(u64, boot.doc), r.ref);
-    try testing.expectEqual(@as(i64, boot.doc), (try conn.valToValue(rd.txn, &heap, r)).asFixnum());
-    try testing.expectEqual(@as(u64, boot.doc), (try valFrom(&rd, arena, .ref, kw_doc, &fault)).?.ref);
-    try testing.expectEqual(@as(u64, boot.doc), (try valFrom(&rd, arena, .ref, lookup, &fault)).?.ref);
-
-    const s = (try valFrom(&rd, arena, .string, try string_mod.fromBytes(&heap, "héllo"), &fault)).?;
-    try testing.expectEqualStrings("héllo", s.string);
-    try testing.expectEqualStrings("héllo", string_mod.asBytes(try conn.valToValue(rd.txn, &heap, s)));
-
-    const u = (try valFrom(&rd, arena, .uuid, uuid_text, &fault)).?;
-    try testing.expectEqual(@as(u8, 0x01), u.uuid[0]);
-    try testing.expectEqualStrings("0123abcd-4567-89ef-0123-456789abcdef", string_mod.asBytes(try conn.valToValue(rd.txn, &heap, u)));
-
-    const by = (try valFrom(&rd, arena, .bytes, try string_mod.fromBytes(&heap, "\x00\x01"), &fault)).?;
-    try testing.expectEqualStrings("\x00\x01", by.bytes);
-    try testing.expectEqualStrings("\x00\x01", string_mod.asBytes(try conn.valToValue(rd.txn, &heap, by)));
-
-    // Names that resolve to nothing match nothing.
-    const kw_none = try tc.interner.internKeywordValue("nope/nope");
-    try testing.expect((try valFrom(&rd, arena, .keyword, kw_none, &fault)) == null);
-    try testing.expect((try valFrom(&rd, arena, .ref, kw_none, &fault)) == null);
-
-    // Kind mismatches are `:nextomic/value-type` for every type.
-    const wrong = try string_mod.fromBytes(&heap, "x");
-    try testing.expectError(error.ValueType, valFrom(&rd, arena, .boolean, wrong, &fault));
-    try testing.expectError(error.ValueType, valFrom(&rd, arena, .long, wrong, &fault));
-    try testing.expectError(error.ValueType, valFrom(&rd, arena, .double, wrong, &fault));
-    try testing.expectError(error.ValueType, valFrom(&rd, arena, .instant, wrong, &fault));
-    try testing.expectError(error.ValueType, valFrom(&rd, arena, .keyword, wrong, &fault));
-    try testing.expectError(error.ValueType, valFrom(&rd, arena, .ref, wrong, &fault));
-    try testing.expectError(error.ValueType, valFrom(&rd, arena, .string, value.fromFixnum(1).?, &fault));
-    try testing.expectError(error.ValueType, valFrom(&rd, arena, .uuid, wrong, &fault));
-    try testing.expectError(error.ValueType, valFrom(&rd, arena, .bytes, value.fromFixnum(1).?, &fault));
-    try testing.expectError(error.ValueType, valFrom(&rd, arena, .double, value.fromFloat(std.math.nan(f64)), &fault));
-
-    // Entity references.
-    try testing.expectEqual(@as(?u64, boot.doc), try entityRef(&rd, arena, kw_doc, &fault));
-    try testing.expect((try entityRef(&rd, arena, kw_none, &fault)) == null);
-    try testing.expectError(error.NoEntity, entityRef(&rd, arena, value.fromFixnum(0).?, &fault));
-    try testing.expectError(error.KindMismatch, entityRef(&rd, arena, wrong, &fault));
-    const bad_lookup = try vector_mod.fromSlice(&heap, &.{ kw_doc, wrong });
-    try testing.expectError(error.TxData, entityRef(&rd, arena, bad_lookup, &fault));
-    try testing.expectError(error.UnknownAttribute, attrOf(&rd, kw_none, &fault));
-    try testing.expectEqual(kw_none.asKeywordId(), fault.attr.?.asKeywordId());
 }

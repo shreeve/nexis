@@ -26,6 +26,7 @@ const list_mod = @import("list");
 const vector_mod = @import("vector");
 const champ = @import("champ");
 const dispatch = @import("dispatch");
+const marshal = @import("../marshal.zig");
 const ir = @import("ir.zig");
 
 const Allocator = std.mem.Allocator;
@@ -140,19 +141,7 @@ const Parser = struct {
     }
 
     fn elems(self: *Parser, v: Value) Error![]Value {
-        var out: std.ArrayList(Value) = .empty;
-        switch (v.kind()) {
-            .persistent_vector => {
-                var it = vector_mod.Cursor.init(v);
-                while (it.next()) |x| try out.append(self.arena, x);
-            },
-            .list => {
-                var it = list_mod.Cursor.init(v);
-                while (it.next()) |x| try out.append(self.arena, x);
-            },
-            else => return self.fail("expected a vector or list"),
-        }
-        return out.toOwnedSlice(self.arena);
+        return (try marshal.sequence(self.arena, v)) orelse self.fail("expected a vector or list");
     }
 
     fn keywordIs(self: *Parser, v: Value, name: []const u8) bool {

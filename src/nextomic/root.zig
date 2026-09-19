@@ -15,6 +15,7 @@ pub const relation = @import("relation.zig");
 pub const query = @import("query.zig");
 pub const pull = @import("pull.zig");
 pub const natives = @import("natives.zig");
+pub const marshal = @import("marshal.zig");
 
 pub const Val = key.Val;
 pub const ValueType = key.ValueType;
@@ -46,4 +47,5 @@ test {
     _ = query;
     _ = pull;
     _ = natives;
+    _ = marshal;
 }

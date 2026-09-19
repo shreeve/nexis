@@ -44,6 +44,7 @@ const store_mod = @import("store.zig");
 const idents_mod = @import("idents.zig");
 const schema_mod = @import("schema.zig");
 const db_mod = @import("db.zig");
+const marshal = @import("marshal.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -1392,23 +1393,7 @@ fn isCollection(v: Value) bool {
 }
 
 fn collectionElements(arena: Allocator, v: Value) ![]Value {
-    var out: std.ArrayList(Value) = .empty;
-    switch (v.kind()) {
-        .persistent_vector => {
-            var it = vector_mod.Cursor.init(v);
-            while (it.next()) |x| try out.append(arena, x);
-        },
-        .persistent_set => {
-            var it = champ.setIter(v);
-            while (it.next()) |x| try out.append(arena, x);
-        },
-        .list => {
-            var it = list_mod.Cursor.init(v);
-            while (it.next()) |x| try out.append(arena, x);
-        },
-        else => unreachable,
-    }
-    return out.toOwnedSlice(arena);
+    return (try marshal.collection(arena, v)).?;
 }
 
 // =============================================================================
