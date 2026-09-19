@@ -1,22 +1,18 @@
-## DB.md — Durable identities & emdb integration (Phase 1)
+## DB.md — Durable identities & emdb integration
 
-**Status**: Phase 1 deliverable. Authoritative contract for
-`src/db.zig`. Derivative from `PLAN.md` §15 (durable identities,
+Authoritative contract for `src/db.zig`. Derivative from `PLAN.md` §15 (durable identities,
 connection model, transactions, codec boundary) + §20.2 gate test
 #6 (emdb round-trip) + `docs/CODEC.md` (value-bytes serialization)
 + `docs/VALUE.md` §2.2 (kind 26 reserved for `durable_ref`). Those
-documents win on conflict. Reviewed peer-AI turn 23.
+documents win on conflict.
 
-This commit closes the last pending Phase 1 gate test (#6) and
-completes the §20.2 gate scorecard to **8/8 shipped**. Codec bytes
-(landed in commit `f745604`) are the value half of every
-durable-ref round-trip; this commit ships the emdb bridge + the
+Codec bytes are the value half of every durable-ref round-trip;
+this module is the emdb bridge + the
 `durable_ref` heap Value kind to complete the picture.
 
-Phase 4 per PLAN §21 schedules richer surface area (lexical
-transactions via `with-tx` macros, `as-of` snapshots, cursors, the
-stdlib `db/...` namespace). Phase 1's job is the Zig-level runtime
-primitives + the gate #6 receipt.
+The language surface (`with-tx` macros, snapshots, `db/scan`, the
+`db/...` namespace) is built on these Zig-level primitives; §12
+lists what exists above them.
 
 ---
 
@@ -45,18 +41,15 @@ primitives + the gate #6 receipt.
 - Gate #6 property test: 10k values × multiple named trees ×
   reopen-connection readback.
 
-**Out (deferred to later commits / phases):**
-- `alter!` (derivable from get+put; stdlib macro in Phase 3).
-- `as-of` / snapshots / historical reads (PLAN §15.7).
-- Cursors / `reduce-tree` / `scan` (PLAN §15.8) — Phase 3 tooling.
-- Language-surface `(with-tx ...)` macro — Phase 3 stdlib.
-- emdb file-UUID integration (§2 v1 interim workaround).
-- Multi-isolate / multi-process durability semantics — v2+.
-- Performance benchmarking — Phase 6 per PLAN §19.
+**Out of this module** (built above it, §12): `db/alter!`,
+snapshots, `db/scan` / `db/reduce-tree`, `(with-tx ...)`.
+
+**Absent:** emdb file-UUID identity (§2), multi-isolate /
+multi-process durability semantics.
 
 ---
 
-### 2. `store_id` derivation (v1 interim)
+### 2. `store_id` derivation
 
 PLAN §15.1: "A connection has a stable `store-id: u128` derived
 from the file UUID written in emdb's meta page."
@@ -67,7 +60,7 @@ lastPgno, canary, pageSize — no UUID slot). Adding one is an emdb
 spec change; this commit defers that to a later coordinated
 emdb+nexis amendment.
 
-**v1 interim** (peer-AI turn 23): derive `store_id` as:
+`store_id` is derived as:
 
 ```
 store_id = xxHash3-128(realpath(file))
@@ -81,12 +74,11 @@ is:
   but different paths have different store_ids;
 - **sufficient for gate #6** (within-process round-trip).
 
-When emdb ships a real file UUID (targeted Phase 4 or earlier if
-expedient), the envelope version in CODEC.md §2 bumps and
-`store_id` derivation switches to reading the UUID from the meta
-page on `Connection.open`. `Connection` exposes `storeId() u128`
-as a read-only accessor so downstream code doesn't hardwire the
-derivation.
+emdb has no file UUID. Should one exist, the envelope version in
+CODEC.md §2 would bump and `store_id` derivation would switch to
+reading it from the meta page on `Connection.open`. `Connection`
+exposes `storeId() u128` as a read-only accessor so downstream
+code doesn't hardwire the derivation.
 
 **Parent directories.** emdb's `open()` requires the path's parent
 directory to exist. The language-surface `(db/open path)`
@@ -195,7 +187,7 @@ const DurableRefBody = extern struct {
 };
 ```
 
-**`conn: ?*Connection` is advisory**, per peer-AI turn 23:
+**`conn: ?*Connection` is advisory**:
 - NOT part of identity — equality and hash ignore it.
 - NOT GC-traced — `*Connection` is not a heap Value.
 - MAY be `null` for refs reconstructed from bytes without a live
@@ -258,8 +250,8 @@ pub fn abortRead(txn: *ReadTxn) void;
 
 // ---- Tree-name + key-bytes API (opaque keys) ----
 //
-// Keys are OPAQUE BYTE SLICES at the Zig runtime layer (peer-AI
-// turn 23). They are NOT codec-encoded. Callers supply a byte
+// Keys are OPAQUE BYTE SLICES at the Zig runtime layer. They are
+// NOT codec-encoded. Callers supply a byte
 // sequence that becomes the emdb key directly. Values are
 // codec-encoded on put and codec-decoded on get.
 
@@ -335,7 +327,7 @@ The callbacks are parameterized (rather than `db.zig` importing
 `db.zig` to route `.durable_ref` hash / equality arms. Passing
 them in keeps the module graph one-way terminal.
 
-**Soundness requirement** (peer-AI turn 24): the callbacks MUST
+**Soundness requirement**: the callbacks MUST
 produce the SAME hash / equality relation as `dispatch.hashValue`
 / `dispatch.equal` for every kind that may appear as a map key or
 set element in decoded bytes. A mismatched hash callback silently
@@ -364,9 +356,9 @@ const tree_id = try txn.inner.openTree(tree_name, /* create */ true);
 try txn.inner.putInTree(tree_id, key_bytes, encoded_value_bytes);
 ```
 
-Caching `TreeId` per `(connection, tree_name)` pair with
-invalidation rules (tree closed, connection closed) is a Phase 6
-performance optimization per PLAN §19; not in v1.
+`TreeId`s are cached per connection (`Connection.tree_ids`,
+keyed by tree name); a tree id is fixed for the life of the file, so
+no invalidation is needed.
 
 Empty tree names (length 0) and empty keys return
 `error.InvalidTreeName` / `error.InvalidKey`.
@@ -422,7 +414,7 @@ centrally by the collector.
 
 ### 8. Failure semantics
 
-Per peer-AI turn 23, pinned explicitly:
+Pinned explicitly:
 
 | Condition | Behavior |
 |---|---|
@@ -455,7 +447,7 @@ key_bytes)` returns a ref with `conn = null`. I/O operations
 (`putRef`, `getRef`, `delRef`) will return
 `error.ConnectionUnavailable` until the ref is "bound" to a live
 Connection. The low-level API does not bind refs; callers that
-need binding do it at a higher layer (stdlib Phase 3).
+need binding do it at a higher layer (the stdlib natives).
 
 ---
 
@@ -470,23 +462,16 @@ CODEC.md §2. The wire form is the identity triple:
      [u64 LE store_id_lo] [u64 LE store_id_hi]
 ```
 
-This commit DOES NOT add `.durable_ref` to `src/codec.zig`'s
-encode/decode arms. That's a follow-on codec amendment. The
-reason: codec bytes for durable-ref are exclusively for
-**ref-containing values** (e.g., a map whose values are refs),
-and the primary use case in Phase 1 is `get(tree, key)` returning
-a ref from a stored Value blob. Gate #6 tests direct-ref round-
-trip via the `durable_ref` body layout, not via codec-encoded refs
-inside other Values.
-
-Adding the codec arm is trivial (~30 LOC); it's explicitly
-deferred here so this commit stays focused on the DB bridge. A
-follow-up commit can land the codec integration with a small
-property-test extension.
+`src/codec.zig` has no `.durable_ref` encode/decode arm: a ref
+inside a value (e.g., a map whose values are refs) is
+`:unserializable`. Codec bytes for a durable ref would only ever
+serve **ref-containing values**; the round-trip property tests
+direct-ref identity via the `durable_ref` body layout, not
+codec-encoded refs inside other Values.
 
 ---
 
-### 10. Gate #6 property test (PLAN §20.2 test #6)
+### 10. Round-trip property test (PLAN §20.2 #6)
 
 `test/prop/db.zig` D1:
 
@@ -505,8 +490,7 @@ Assertions:
     tree B have distinct values when the writer set them distinct.
 ```
 
-D2: **Reopen-connection readback** (peer-AI turn 23
-strengthening). After all writes commit and the Connection is
+D2: **Reopen-connection readback**. After all writes commit and the Connection is
 closed, reopen the same file and read every key back; assert
 values match what was written.
 
@@ -555,35 +539,23 @@ and never goes through the codec or per-operation tree opens.
 
 ---
 
-### 12. Deferred (explicitly)
+### 12. Surface above this module, and absences
 
-Shipped, and so not deferred: `(with-tx
-...)` / `(with-read-tx ...)` (PLAN §21 Phase 4.0b), `db/snapshot` /
-`with-snapshot` (4.0f), `db/scan` / `db/reduce-tree` (4.0d),
-`db/alter!` (4.0c), and the per-connection `TreeId` cache (4.0g).
-Datomic-style `as-of` db-values are Nextomic's (`docs/NEXTOMIC.md`
-§4). Open:
+Built above these primitives (PLAN §21 Phase 4): `(with-tx ...)` /
+`(with-read-tx ...)`, `db/snapshot` / `db/release-snapshot!` /
+`with-snapshot`, `db/scan` / `db/reduce-tree`, `db/alter!`, and the
+per-connection `TreeId` cache. Datomic-style `as-of` db-values are
+Nextomic's (`docs/NEXTOMIC.md` §4). Absent:
 
 - Cursors as raw Values — PLAN §15.8; `db/scan` and `db/reduce-tree`
   are the eager surface.
-- `db/snapshot-stats` — PLAN §15.7 (pinned snapshots and their page
-  cost).
-- emdb file-UUID integration — coordinated emdb amendment.
+- `db/snapshot-stats` (PLAN §15.7: pinned snapshots and their page
+  cost) — does not exist.
+- emdb file-UUID identity (§2).
 - Multi-process concurrent writes — emdb handles single-writer
   discipline; nexis surface stays single-isolate per PLAN §16.1.
-- `.durable_ref` codec encode/decode arms — §9 follow-up; the codec
-  raises `:unserializable` for the kind.
+- `.durable_ref` codec encode/decode arms — the codec raises
+  `:unserializable` for the kind (§9).
 
 ---
 
-### 13. Amendment note
-
-This file is new in the commit that lands `src/db.zig`. No
-pre-existing doc is replaced. Cross-refs updated in `README.md`
-and `HANDOFF.md` §7 (pending-modules checklist).
-
-`docs/VALUE.md` §2.2 row 26 (`durable_ref`) remains as pinned:
-"subkind 0 = v1 canonical; reserved 1..15 for future variants."
-
-`docs/SEMANTICS.md` §2.6 and §3.2: `durable_ref` equality /
-hash rules are already pinned there; this commit realizes them.
