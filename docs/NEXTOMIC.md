@@ -209,7 +209,16 @@ so there is no queue; emdb's write lock is the transactor.
    `:nextomic/conflict`. `[:db/retract e a]` retracts every current value
    of `a`. `[:db/retractEntity e]` retracts every current `(e a v)` from
    an EAVT `[e]` scan plus every current `(e' a' e)` from a VAET `[e]`
-   scan, recursively through component attributes. Then
+   scan, recursively through component attributes. tx-data is a set:
+   the two bare forms expand against the values current before the
+   transaction, never against what the transaction asserts, so an
+   assertion under the same `(e a)` stands whichever form comes first
+   (`[[:db/add e :p/age 9] [:db/retract e :p/age]]` and its reverse
+   both leave `9`), and an assertion of a value they retract is the
+   same conflict as the explicit pair: re-asserting a current datom is
+   a claim on it even though it writes nothing, so it and a retraction
+   of that datom in one transaction, by any form and in either order,
+   are `:nextomic/conflict`. Then
    `[tx-entity :db/txInstant now]` is appended as a datom of this
    transaction, unless the tx-data asserted `:db/txInstant` on
    `"datomic.tx"` itself: that instant stands, in the datom and in the

@@ -164,5 +164,22 @@
 (println (t/caught (d/transact! c [[:db/add :person/email :db/cardinality :db.cardinality/many]])))
 (println (t/caught (d/transact! c [[:db/add :person/age :db/valueType :db.type/string]])))
 
+; tx-data is a set: a bare retract or a retractEntity expands against
+; the committed values, so an add under the same attribute stands in
+; either order; re-asserting a current datom and retracting it in one
+; transaction is a conflict in either order.
+(d/transact! c [[:db/add bob :person/age 9] [:db/retract bob :person/age]])
+(println (:person/age (d/entity (d/db c) bob)))
+(d/transact! c [[:db/retract bob :person/age] [:db/add bob :person/age 10]])
+(println (:person/age (d/entity (d/db c) bob)))
+(println (t/caught (d/transact! c [[:db/add bob :person/age 10] [:db/retract bob :person/age]])))
+(println (t/caught (d/transact! c [[:db/retract bob :person/age] [:db/add bob :person/age 10]])))
+(println (t/caught (d/transact! c [[:db/add bob :person/age 10] [:db/retract bob :person/age 10]])))
+(println (t/caught (d/transact! c [[:db/add bob :person/age 10] [:db/retractEntity bob]])))
+(d/transact! c [[:db/add bob :person/age 11] [:db/retractEntity bob]])
+(println (d/touch (d/entity (d/db c) bob)))
+(d/transact! c [[:db/retractEntity bob] [:db/add bob :person/age 12]])
+(println (d/touch (d/entity (d/db c) bob)))
+
 (d/release c)
 :basics-done

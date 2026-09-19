@@ -395,8 +395,10 @@ const Ctx = struct {
     /// (e a) -> value bytes of the card-one assertion seen so far,
     /// pending or already current.
     one_adds: std.AutoHashMapUnmanaged(EA, []const u8) = .empty,
-    /// (e a) -> number of pending assertions.
-    ea_adds: std.AutoHashMapUnmanaged(EA, u32) = .empty,
+    /// EAVT keys of the current datoms this transaction re-asserts: a
+    /// claim on the datom that writes nothing, and that a retraction
+    /// of the same datom in this transaction conflicts with.
+    kept: std.StringHashMapUnmanaged(void) = .empty,
     /// `[a][v]` of a pending assertion -> e.
     av_adds: std.StringHashMapUnmanaged(u64) = .empty,
 
@@ -1257,7 +1259,6 @@ const Ctx = struct {
         const n = self.ops.items.len + 1;
         try self.overlay.ensureTotalCapacityPrecise(self.arena, n);
         try self.facts.ensureTotalCapacity(self.arena, @intCast(n));
-        try self.ea_adds.ensureTotalCapacity(self.arena, @intCast(n));
         for (self.ops.items) |op| {
             switch (op) {
                 .add => |o| try self.expandAdd(try self.resolveEnt(o.e), o.attr, try self.resolveVal(o.v)),
@@ -1316,22 +1317,24 @@ const Ctx = struct {
             const ea: EA = .{ .e = e, .a = attr.id };
             if (self.one_adds.get(ea)) |seen| return if (std.mem.eql(u8, seen, vb)) {} else self.conflict(e, attr.id);
             try self.one_adds.put(self.arena, ea, vb);
-            if (already) return;
+            if (already) return self.kept.put(self.arena, fk, {});
             if (try self.currentOne(e, attr.id)) |old| {
                 try self.pushRetract(e, attr, old.val, old.vbytes);
             }
             try self.push(e, attr, v, vb, true, fk);
             return;
         }
-        if (already) return;
+        if (already) return self.kept.put(self.arena, fk, {});
         try self.push(e, attr, v, vb, true, fk);
     }
 
     const Current = struct { val: Val, vbytes: []const u8 };
 
-    /// A committed row of a current tree with this transaction's
-    /// pending fact about it, if any.
-    const LiveRow = struct { parts: key.Parts, kv: Store.KeyValue, pending: ?Pending };
+    /// A committed row of a current tree with this transaction's claim
+    /// on it: the pending retraction, if any (a pending assertion of a
+    /// committed row never exists, since re-asserting one writes
+    /// nothing), or `kept` when the transaction re-asserted it.
+    const LiveRow = struct { parts: key.Parts, kv: Store.KeyValue, pending: ?Pending, kept: bool };
 
     /// The committed rows of a current tree under a prefix, each with
     /// the overlay's pending fact about it. Under VAET, `comps.v` must
@@ -1351,7 +1354,7 @@ const Ctx = struct {
                 else => try key.keyBytes(self.ctx.arena, .eavt, parts.e, parts.a, parts.v, null),
             };
             const pending: ?Pending = if (self.ctx.facts.get(fk)) |i| self.ctx.overlay.items[i] else null;
-            return .{ .parts = parts, .kv = kv, .pending = pending };
+            return .{ .parts = parts, .kv = kv, .pending = pending, .kept = self.ctx.kept.contains(fk) };
         }
     };
 
@@ -1391,14 +1394,20 @@ const Ctx = struct {
             if (self.overlay.items[i].added) return self.conflict(e, attr.id);
             return;
         }
+        if (self.kept.contains(fk)) return self.conflict(e, attr.id);
         if ((try self.txn.getFromTree(self.conn.store.trees.cur(.eavt), fk)) == null) return;
         try self.pushRetract(e, attr, v, vb);
     }
 
+    /// `[:db/retract e a]` and `[:db/retractEntity e]` expand against
+    /// the committed rows, so tx-data is a set: an assertion under the
+    /// same `(e a)` stands whichever form comes first, a row this
+    /// transaction already retracted is skipped, and a row it
+    /// re-asserted is the assertion-and-retraction conflict.
     fn expandRetractAttr(self: *Ctx, e: u64, attr: Attr) !void {
-        if (self.ea_adds.get(.{ .e = e, .a = attr.id })) |_| return self.conflict(e, attr.id);
         var rows = try self.liveRows(.eavt, .{ .e = e, .a = attr.id });
         while (try rows.next()) |r| {
+            if (r.kept) return self.conflict(e, attr.id);
             if (r.pending != null) continue;
             try self.pushRetract(e, attr, try self.valFromParts(r.parts), try self.arena.dupe(u8, r.parts.v));
         }
@@ -1414,10 +1423,8 @@ const Ctx = struct {
                 const attr = try self.attrById(r.parts.a);
                 const v = try self.valFromParts(r.parts);
                 if (attr.component and v == .ref) try components.append(self.arena, v.ref);
-                if (r.pending) |p| {
-                    if (p.added) return self.conflict(e, attr.id);
-                    continue;
-                }
+                if (r.kept) return self.conflict(e, attr.id);
+                if (r.pending != null) continue;
                 try self.pushRetract(e, attr, v, try self.arena.dupe(u8, r.parts.v));
             }
         }
@@ -1427,10 +1434,8 @@ const Ctx = struct {
             var rows = try self.liveRows(.vaet, .{ .v = vb });
             while (try rows.next()) |r| {
                 const attr = try self.attrById(r.parts.a);
-                if (r.pending) |p| {
-                    if (p.added) return self.conflict(r.parts.e, r.parts.a);
-                    continue;
-                }
+                if (r.kept) return self.conflict(r.parts.e, r.parts.a);
+                if (r.pending != null) continue;
                 try self.pushRetract(r.parts.e, attr, .{ .ref = e }, vb);
             }
         }
@@ -1443,12 +1448,7 @@ const Ctx = struct {
         const i: u32 = @intCast(self.overlay.items.len);
         try self.overlay.append(self.arena, .{ .e = e, .attr = attr, .v = v, .vbytes = vbytes, .added = added });
         try self.facts.put(self.arena, fk, i);
-        if (added) {
-            const g = try self.ea_adds.getOrPut(self.arena, .{ .e = e, .a = attr.id });
-            if (!g.found_existing) g.value_ptr.* = 0;
-            g.value_ptr.* += 1;
-            if (attr.unique != .none) try self.av_adds.put(self.arena, try self.avKey(attr.id, vbytes), e);
-        }
+        if (added and attr.unique != .none) try self.av_adds.put(self.arena, try self.avKey(attr.id, vbytes), e);
         if (key.isAttrPartition(e)) self.schema_touched = true;
     }
 
@@ -3076,6 +3076,98 @@ test "two card-one values in one transaction conflict even when the first is cur
     }, .{});
     try testing.expectEqual(@as(usize, 1), r2.tx_data.len);
     try testing.expectEqual(@as(i64, 30), (try (try tc.conn.db()).entity(arena, a))[0].vals[0].long);
+}
+
+test "a bare retract and an add under one attribute commute; a re-asserted datom conflicts with its retraction" {
+    const tc = try TestConn.init("tx_retract_order");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const age = try attrId(tc, "user/age");
+    const tags = try attrId(tc, "user/tags");
+    const red = try kw(tc, "tag/red");
+    const blue = try kw(tc, "tag/blue");
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 30 } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = tags }, .v = .{ .keyword = red } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    var red_id: u32 = 0;
+    for (r1.tx_data) |d| if (d.a == tags) {
+        red_id = d.v.keyword;
+    };
+
+    // The add stands whichever form comes first: the bare retract
+    // expands against the committed value.
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 9 } } } },
+        .{ .retract_attr = .{ .e = .{ .eid = a }, .a = .{ .id = age } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 3), r2.tx_data.len);
+    var ages = try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = a, .a = age });
+    try testing.expectEqual(@as(usize, 1), ages.len);
+    try testing.expectEqual(@as(i64, 9), ages[0].v.long);
+    const r3 = try transactOps(tc.conn, arena, &.{
+        .{ .retract_attr = .{ .e = .{ .eid = a }, .a = .{ .id = age } } },
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 10 } } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 3), r3.tx_data.len);
+    ages = try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = a, .a = age });
+    try testing.expectEqual(@as(usize, 1), ages.len);
+    try testing.expectEqual(@as(i64, 10), ages[0].v.long);
+
+    // Card-many: the committed tag goes, the asserted one stays.
+    _ = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = tags }, .v = .{ .keyword = blue } } },
+        .{ .retract_attr = .{ .e = .{ .eid = a }, .a = .{ .id = tags } } },
+    }, .{});
+    var tag_rows = try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = a, .a = tags });
+    try testing.expectEqual(@as(usize, 1), tag_rows.len);
+    try testing.expect(tag_rows[0].v.keyword != red_id);
+    _ = try transactOps(tc.conn, arena, &.{
+        .{ .retract_attr = .{ .e = .{ .eid = a }, .a = .{ .id = tags } } },
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = tags }, .v = .{ .keyword = red } } },
+    }, .{});
+    tag_rows = try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = a, .a = tags });
+    try testing.expectEqual(@as(usize, 1), tag_rows.len);
+    try testing.expectEqual(red_id, tag_rows[0].v.keyword);
+
+    // Re-asserting a current datom and retracting it in one transaction
+    // is the assertion-and-retraction conflict, in either order and
+    // under every retraction form.
+    const add_age: Op = .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 10 } } } };
+    const bare: Op = .{ .retract_attr = .{ .e = .{ .eid = a }, .a = .{ .id = age } } };
+    const exact: Op = .{ .retract = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 10 } } } };
+    const add_name: Op = .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } };
+    const whole: Op = .{ .retract_entity = .{ .eid = a } };
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{ add_age, bare }, .{}));
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{ bare, add_age }, .{}));
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{ add_age, exact }, .{}));
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{ exact, add_age }, .{}));
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{ add_name, whole }, .{}));
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{ whole, add_name }, .{}));
+
+    // retractEntity and an add of a fresh value commute: the entity
+    // keeps the added datom alone.
+    _ = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Bea" } } } },
+        whole,
+    }, .{});
+    var rows = try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = a });
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("Bea", rows[0].v.string);
+    _ = try transactOps(tc.conn, arena, &.{
+        whole,
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Cy" } } } },
+    }, .{});
+    rows = try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = a });
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("Cy", rows[0].v.string);
 }
 
 test "an explicit :db/txInstant on the transaction entity stands" {

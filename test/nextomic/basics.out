@@ -64,4 +64,12 @@ Bob
 Robert
 {:error :nextomic/schema, :message a unique attribute is cardinality one, :attr :person/email}
 {:error :nextomic/conflict, :e 25, :a :db/valueType}
+9
+10
+{:error :nextomic/conflict, :e 4294967298, :a :person/age}
+{:error :nextomic/conflict, :e 4294967298, :a :person/age}
+{:error :nextomic/conflict, :e 4294967298, :a :person/age}
+{:error :nextomic/conflict, :e 4294967298, :a :person/age}
+{:db/id 4294967298, :person/age 11}
+{:db/id 4294967298, :person/age 12}
 :basics-done
