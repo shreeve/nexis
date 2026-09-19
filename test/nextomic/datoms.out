@@ -1,0 +1,22 @@
+([:item/qty 501 4 true])
+([:item/qty 501 4])
+ok a t and its transaction entity name the same datoms
+ok a t nobody wrote matches nothing
+ok added true is every current datom
+ok added false is empty on a current view
+([:item/name Nut false])
+([500 true])
+([501 true])
+:kind-mismatch
+:kind-mismatch
+[20 75]
+[75 501]
+[20]
+[20 75 501]
+[N-1]
+[500]
+ok an empty range
+{:error :nextomic/tx-data, :message index-range reads an indexed or unique attribute, :attr :item/name}
+:nextomic/value-type
+{:error :nextomic/unknown-attribute, :attr :item/nope}
+:datoms-done
