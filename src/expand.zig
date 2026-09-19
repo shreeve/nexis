@@ -902,44 +902,6 @@ fn withVarMeta(ctx: *ExpandContext, def_form: *Form, meta_items: []const *Form, 
     return try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "let*", origin), try makeVector(ctx, bindings, origin), reset_call, v_sym });
 }
 
-fn expandDefn(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    list_form: *const Form,
-    items: []const *Form,
-    depth: u32,
-) ExpandError!*Form {
-    // (defn name [params] body...)
-    if (items.len < 3) return ExpandError.MalformedMacroCall;
-    const head = items[0];
-    const name_form = items[1];
-    if (name_form.datum != .symbol) return ExpandError.MalformedMacroCall;
-    const params_form = items[2];
-    if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
-    const body = items[3..];
-
-    // Body env = self-name + params.
-    var local: ExpandEnv = .{ .parent = env };
-    defer local.deinit(ctx.allocator);
-    _ = try local.lexical_names.getOrPut(ctx.allocator, name_form.datum.symbol.name);
-    for (params_form.datum.vector) |p| {
-        if (p.datum != .symbol or p.datum.symbol.ns != null) continue;
-        if (std.mem.eql(u8, p.datum.symbol.name, "&")) continue;
-        _ = try local.lexical_names.getOrPut(ctx.allocator, p.datum.symbol.name);
-    }
-    const new_body = try ctx.allocator.alloc(*Form, body.len);
-    for (body, 0..) |b, j| {
-        new_body[j] = try expandFormDepth(ctx, &local, b, depth);
-    }
-    const total = 3 + body.len;
-    const out_items = try ctx.allocator.alloc(*Form, total);
-    out_items[0] = mutCast(head);
-    out_items[1] = mutCast(name_form);
-    out_items[2] = mutCast(params_form);
-    for (new_body, 0..) |b, k| out_items[3 + k] = b;
-    return try makeList(ctx, out_items, list_form.origin);
-}
-
 /// Expand `(try body* (catch MATCHER BINDING handler*)* (finally
 /// body*)?)` onto the compiler's primitive, which takes exactly one
 /// `(catch any g ...)`:
@@ -1413,8 +1375,6 @@ fn expandRequire(
     return try makeNil(ctx, list_form.origin);
 }
 
-/// Unwrap one level of `(quote X)` from a Form. Returns X if
-/// the form is a quote; else returns the form unchanged.
 /// The form under one level of quoting: the reader's `'x` datum or
 /// the written-out `(quote x)`; any other form is itself.
 fn unwrapQuote(form: *const Form) *const Form {
@@ -1487,8 +1447,7 @@ fn expandDefmacro(
     const ceval = ctx.compile_eval orelse return ExpandError.MalformedMacroCall;
 
     // First: macroexpand the body BEFORE compiling it. Body
-    // env includes the self-name + params (matches expandDefn
-    // semantics).
+    // env includes the self-name + params.
     var local: ExpandEnv = .{ .parent = env };
     defer local.deinit(ctx.allocator);
     _ = try local.lexical_names.getOrPut(ctx.allocator, name_form.datum.symbol.name);
@@ -2391,9 +2350,8 @@ fn buildFixedCondition(ctx: *ExpandContext, origin: reader_mod.SrcSpan, n_sym: *
     return try makeList(ctx, items, origin);
 }
 
-/// Variadic with `fixed_count` args before `&`: matches when
-/// argc >= fixed_count. Built as `(not (< n fixed_count))` which
-/// avoids needing `<=`.
+/// The test for a variadic clause with `fixed_count` params before
+/// `&`: `(not (< n fixed_count))`, true when argc >= fixed_count.
 fn buildVariadicCondition(ctx: *ExpandContext, origin: reader_mod.SrcSpan, n_sym: *Form, fixed_count: usize) ExpandError!*Form {
     const lt_items = try ctx.allocator.alloc(*Form, 3);
     lt_items[0] = try coreSym(ctx, "<", origin);
@@ -2408,12 +2366,10 @@ fn buildVariadicCondition(ctx: *ExpandContext, origin: reader_mod.SrcSpan, n_sym
     return try makeList(ctx, not_items, origin);
 }
 
-/// Build the body of an arity branch: `(let* [params... from args_sym] body...)`.
-/// For fixed arity, each param i gets `(nth args_sym i)`. For
-/// variadic, the rest param gets a list built from
-/// `args_sym`'s suffix (here, we already passed args as a list,
-/// so the rest is `(drop fixed_count args_sym)` — but we don't
-/// have `drop` as a native fn. Use repeated `rest` instead.
+/// The body of an arity branch: `(let [params... body...)` over
+/// `args_sym`, the packed argument list. Param `i` binds
+/// `(nth args_sym i nil)`; a variadic clause's rest param binds
+/// `rest` applied `fixed` times to `args_sym`.
 fn buildArityThen(
     ctx: *ExpandContext,
     origin: reader_mod.SrcSpan,
