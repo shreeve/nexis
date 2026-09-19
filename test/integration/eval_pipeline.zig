@@ -3923,3 +3923,16 @@ test "typed vectors: nexis.simd kernels" {
         .{ .src = "(nexis.simd/map (fn [x] (* x 140737488355328)) (i64-vector [1 2]))", .expected = "#i64[140737488355328 281474976710656]" },
     });
 }
+
+test "typed vectors: a store round trip through the codec" {
+    try expectOutputProgramWithStore("typed-vectors",
+        \\(do
+        \\  (def conn (db/open "@STORE@"))
+        \\  (def r (db/ref conn :tv "k"))
+        \\  (with-tx [tx conn] (db/put! tx r (i64-vector [1 -2 140737488355328])))
+        \\  (def i (with-read-tx [tx conn] (db/get tx r)))
+        \\  (with-tx [tx conn] (db/put! tx r (f64-vector [0.5 -0.0 (/ 1.0 0)])))
+        \\  (def f (with-read-tx [tx conn] (db/get tx r)))
+        \\  [i (typed-vector-type i) (= i (i64-vector [1 -2 140737488355328])) f (typed-vector-type f) (= f (f64-vector [0.5 0.0 (/ 1.0 0)]))])
+    , "[#i64[1 -2 140737488355328] :i64 true #f64[0.5 -0.0 Infinity] :f64 true]");
+}

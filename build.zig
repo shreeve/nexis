@@ -1234,6 +1234,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "require-demo" },
             .{ .name = "shapes" },
             .{ .name = "shapes-app" },
+            .{ .name = "typed-vectors" },
             .{ .name = "durable-refs", .twice = true },
             .{ .name = "todo-app", .twice = true },
             .{ .name = "nextomic-app", .twice = true },
