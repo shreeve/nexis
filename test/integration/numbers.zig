@@ -274,6 +274,47 @@ test "literals: macros carry bignums in and out" {
     try expectOutput("(do (defmacro sq [x] (* x x)) (sq 18446744073709551616))", "340282366920938463463374607431768211456");
 }
 
+/// A store path under the test's own temporary directory, so
+/// concurrent runs never share a file.
+const StorePath = struct {
+    tmp: std.testing.TmpDir,
+    path: []u8,
+
+    fn init(name: []const u8) !StorePath {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/{s}.edb", .{ tmp.sub_path, name });
+        return .{ .tmp = tmp, .path = path };
+    }
+
+    fn deinit(self: *StorePath) void {
+        testing.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+};
+
+test "codec: bignums round-trip through db/put-key! and db/get-key, alone and inside collections" {
+    var store = try StorePath.init("bignum-codec");
+    defer store.deinit();
+    const src = try std.fmt.allocPrint(testing.allocator,
+        \\(do
+        \\  (def conn (db/open "{s}"))
+        \\  (def big (db/ref conn :t "big"))
+        \\  (def neg (db/ref conn :t "neg"))
+        \\  (def edge (db/ref conn :t "edge"))
+        \\  (def coll (db/ref conn :t "coll"))
+        \\  (db/put-key! big 18446744073709551616)
+        \\  (db/put-key! neg (- (* 140737488355327 140737488355327)))
+        \\  (db/put-key! edge (+ 140737488355327 1))
+        \\  (db/put-key! coll [1 18446744073709551616 {{:k -18446744073709551617}} #{{340282366920938463463374607431768211456}}])
+        \\  [(db/get-key big) (integer? (db/get-key big)) (= (db/get-key big) 18446744073709551616)
+        \\   (db/get-key neg) @edge (= @edge 140737488355328) (integer? (- @edge 1))
+        \\   (db/get-key coll) (contains? (nth (db/get-key coll) 3) (* 18446744073709551616 18446744073709551616))])
+    , .{store.path});
+    defer testing.allocator.free(src);
+    try expectOutput(src, "[18446744073709551616 true true -19807040628565802923409276929 140737488355328 true true [1 18446744073709551616 {:k -18446744073709551617} #{340282366920938463463374607431768211456}] true]");
+}
+
 test "programs: factorial and a product fold grow past 2^47 and come back" {
     try expectOutput("(reduce * (range 1 30))", "8841761993739701954543616000000");
     try expectOutput("(= (reduce * (range 1 30)) (* (reduce * (range 1 29)) 29))", "true");
