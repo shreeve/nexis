@@ -130,7 +130,7 @@ const native_with = NativeFn{ .name = "nextomic/with", .min_arity = 3, .max_arit
 // Per-VM state
 // =============================================================================
 
-pub const State = struct {
+const State = struct {
     gpa: Allocator,
     ir_cache: query.Cache,
     rules_cache: query.RulesCache,
@@ -378,6 +378,10 @@ fn fnSync(vm: *VM, args: []const Value) VmError!Value {
 // Marshalling: Lisp → Val
 // =============================================================================
 
+fn fixnum(n: u64) !Value {
+    return value.fromFixnum(@intCast(n)) orelse error.ArithmeticOverflow;
+}
+
 /// The attribute a program named as `v`: a keyword ident or a fixnum
 /// id. `UnknownAttribute`, naming it in `fault`, when there is none.
 fn attrOf(rd: *Read, v: Value, fault: *Fault) !Attr {
@@ -398,7 +402,7 @@ fn attrOf(rd: *Read, v: Value, fault: *Fault) !Attr {
 
 /// An entity position: an eid, an ident keyword or a lookup ref
 /// `[attr v]`. Null when the ident or lookup names nothing in this view.
-pub fn entityRef(rd: *Read, arena: Allocator, v: Value, fault: *Fault) anyerror!?u64 {
+fn entityRef(rd: *Read, arena: Allocator, v: Value, fault: *Fault) anyerror!?u64 {
     switch (v.kind()) {
         .fixnum => {
             const n = v.asFixnum();
@@ -423,7 +427,7 @@ pub fn entityRef(rd: *Read, arena: Allocator, v: Value, fault: *Fault) anyerror!
 /// Convert a Lisp value by an attribute's value type. Null when a
 /// keyword or entity reference names nothing in this view, so that no
 /// datom can match it; `error.ValueType` on a kind mismatch.
-pub fn valFrom(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *Fault) anyerror!?Val {
+fn valFrom(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *Fault) anyerror!?Val {
     switch (vt) {
         .boolean => {
             if (!v.isBool()) return error.ValueType;
@@ -488,11 +492,6 @@ const Builder = struct {
         return self.vm.ensureInterner().internKeywordValue(name);
     }
 
-    fn fixnum(self: *Builder, n: u64) !Value {
-        _ = self;
-        return value.fromFixnum(@intCast(n)) orelse error.ArithmeticOverflow;
-    }
-
     fn attrKeyword(self: *Builder, a: u32) !Value {
         const k = (try self.conn.idents.internOf(self.txn, a)) orelse return error.Corrupted;
         return value.fromKeywordId(k);
@@ -505,10 +504,10 @@ const Builder = struct {
     /// `[e a v t added]`.
     fn datom(self: *Builder, d: Datom) !Value {
         const elems = [_]Value{
-            try self.fixnum(d.e),
+            try fixnum(d.e),
             try self.attrKeyword(d.a),
             try self.val(d.v),
-            try self.fixnum(d.t),
+            try fixnum(d.t),
             value.fromBool(d.added),
         };
         return vector_mod.fromSlice(self.heap, &elems);
@@ -565,13 +564,13 @@ fn reportMap(vm: *VM, conn: *Conn, arena: Allocator, report: transact_mod.Report
             .string => |s| try string_mod.fromBytes(b.heap, s),
             .fixnum => |n| value.fromFixnum(n) orelse return error.ArithmeticOverflow,
         };
-        tempids = try b.put(tempids, k, try b.fixnum(t.eid));
+        tempids = try b.put(tempids, k, try fixnum(t.eid));
     }
 
     var m = try champ.mapEmpty(b.heap);
     m = try b.putKw(m, "db-before", try boxDb(b.heap, report.db_before));
     m = try b.putKw(m, "db-after", try boxDb(b.heap, report.db_after));
-    m = try b.putKw(m, "tx", try b.fixnum(report.t));
+    m = try b.putKw(m, "tx", try fixnum(report.t));
     m = try b.putKw(m, "tempids", tempids);
     m = try b.putKw(m, "tx-data", try b.datoms(arena, report.tx_data));
     return m;
@@ -693,7 +692,7 @@ fn entityNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
     var many: ?Value = null;
     while (try it.next()) |dt| {
         if (m == null) {
-            m = try b.putKw(try champ.mapEmpty(b.heap), "db/id", try b.fixnum(e));
+            m = try b.putKw(try champ.mapEmpty(b.heap), "db/id", try fixnum(e));
         }
         if (many != null and dt.a != cur_a) {
             m = try b.put(m.?, try b.attrKeyword(cur_a), many.?);
@@ -873,7 +872,7 @@ fn txRangeNative(vm: *VM, args: []const Value) !Value {
     const out = try arena.alloc(Value, entries.len);
     for (out, entries) |*slot, entry| {
         var m = try champ.mapEmpty(b.heap);
-        m = try b.putKw(m, "t", try b.fixnum(entry.t));
+        m = try b.putKw(m, "t", try fixnum(entry.t));
         m = try b.putKw(m, "instant", value.fromFixnum(entry.instant) orelse return error.ArithmeticOverflow);
         m = try b.putKw(m, "data", try b.datoms(arena, entry.datoms));
         slot.* = m;
@@ -904,7 +903,7 @@ fn schemaNative(vm: *VM, args: []const Value) !Value {
         const attr = schema.attrAt(entry.key_ptr.*, at) orelse continue;
         const ident = try b.attrKeyword(attr.id);
         var m = try champ.mapEmpty(b.heap);
-        m = try b.putKw(m, "db/id", try b.fixnum(attr.id));
+        m = try b.putKw(m, "db/id", try fixnum(attr.id));
         m = try b.putKw(m, "db/ident", ident);
         m = try b.putKw(m, "db/valueType", try b.kw(attr.value_type.identName()));
         m = try b.putKw(m, "db/cardinality", try b.kw(if (attr.many()) "db.cardinality/many" else "db.cardinality/one"));
@@ -926,7 +925,6 @@ fn schemaNative(vm: *VM, args: []const Value) !Value {
 
 const testing = std.testing;
 const TestConn = db_mod.TestConn;
-const intern_mod = @import("intern");
 
 test {
     _ = query_natives;

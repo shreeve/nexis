@@ -74,7 +74,7 @@ const native_explain = NativeFn{ .name = "nextomic/explain", .min_arity = 2, .ma
 
 /// The keyword a pipeline error throws as, or null for a VM error,
 /// which passes through unchanged.
-pub fn keywordFor(err: anyerror) ?[]const u8 {
+fn keywordFor(err: anyerror) ?[]const u8 {
     switch (err) {
         error.QuerySyntax => return "nextomic/query-syntax",
         error.UnboundPattern => return "nextomic/unbound-pattern",
@@ -152,7 +152,7 @@ const Qualified = struct { ns: []const u8, name: []const u8 };
 
 /// `ns/name` split at its first `/`; null for a bare name, for `/`
 /// itself and for a name with nothing on one side of the slash.
-pub fn splitQualified(name: []const u8) ?Qualified {
+fn splitQualified(name: []const u8) ?Qualified {
     const i = std.mem.indexOfScalar(u8, name, '/') orelse return null;
     if (i == 0 or i + 1 == name.len) return null;
     return .{ .ns = name[0..i], .name = name[i + 1 ..] };

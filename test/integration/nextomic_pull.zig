@@ -305,7 +305,7 @@ const Naive = struct {
     fn attrByName(self: *Naive, name: []const u8) !Attr {
         const k = try self.fx.interner().internKeyword(name);
         const id = (try self.dbv.conn.idents.idOf(self.txn, k)) orelse return error.UnknownAttribute;
-        return (try self.dbv.attr(self.arena, id)) orelse error.UnknownAttribute;
+        return (try self.dbv.attr(id)) orelse error.UnknownAttribute;
     }
 
     fn specOf(self: *Naive, k: Value) !Spec {
@@ -494,7 +494,7 @@ const Naive = struct {
             for (ent) |ea| {
                 any = true;
                 if (covered.contains(ea.a)) continue;
-                const attr = (try self.dbv.attr(self.arena, ea.a)).?;
+                const attr = (try self.dbv.attr(ea.a)).?;
                 const k = (try self.dbv.conn.idents.internOf(self.txn, ea.a)).?;
                 const spec: Spec = .{ .attr = attr, .reverse = false, .k = value.fromKeywordId(k), .limit = default_limit, .default = null };
                 _ = try self.emit(&m, pattern, ent, e, spec, .none, budget);

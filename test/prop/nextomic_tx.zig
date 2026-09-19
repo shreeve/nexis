@@ -636,11 +636,11 @@ test "T1 random transactions vs the model at every basis, reopen, abort" {
     {
         const txn = try tc.conn.store.beginRead();
         defer txn.abort();
-        for (0..4) |k| before[k] = try tc.conn.store.treeEntries(txn, tc.conn.store.trees.current[k]);
-        for (0..4) |k| before[4 + k] = try tc.conn.store.treeEntries(txn, tc.conn.store.trees.history[k]);
-        before[8] = try tc.conn.store.treeEntries(txn, tc.conn.store.trees.txlog);
-        before[9] = try tc.conn.store.treeEntries(txn, tc.conn.store.trees.idents);
-        before[10] = try tc.conn.store.treeEntries(txn, tc.conn.store.trees.sys);
+        for (0..4) |k| before[k] = try nextomic.Store.treeEntries(txn, tc.conn.store.trees.current[k]);
+        for (0..4) |k| before[4 + k] = try nextomic.Store.treeEntries(txn, tc.conn.store.trees.history[k]);
+        before[8] = try nextomic.Store.treeEntries(txn, tc.conn.store.trees.txlog);
+        before[9] = try nextomic.Store.treeEntries(txn, tc.conn.store.trees.idents);
+        before[10] = try nextomic.Store.treeEntries(txn, tc.conn.store.trees.sys);
     }
     try testing.expectError(error.Conflict, transact.transactOps(tc.conn, arena, &.{
         .{ .add = .{ .e = .{ .eid = e }, .a = .{ .id = attrs.tags }, .v = .{ .keyword = try kw(tc, "tag/aborted") } } },
@@ -651,12 +651,12 @@ test "T1 random transactions vs the model at every basis, reopen, abort" {
         const txn = try tc.conn.store.beginRead();
         defer txn.abort();
         try testing.expectEqual(last_t, try tc.conn.store.readT(txn));
-        try testing.expectEqual(before[0], try tc.conn.store.treeEntries(txn, tc.conn.store.trees.current[0]));
-        for (0..4) |k| try testing.expectEqual(before[k], try tc.conn.store.treeEntries(txn, tc.conn.store.trees.current[k]));
-        for (0..4) |k| try testing.expectEqual(before[4 + k], try tc.conn.store.treeEntries(txn, tc.conn.store.trees.history[k]));
-        try testing.expectEqual(before[8], try tc.conn.store.treeEntries(txn, tc.conn.store.trees.txlog));
-        try testing.expectEqual(before[9], try tc.conn.store.treeEntries(txn, tc.conn.store.trees.idents));
-        try testing.expectEqual(before[10], try tc.conn.store.treeEntries(txn, tc.conn.store.trees.sys));
+        try testing.expectEqual(before[0], try nextomic.Store.treeEntries(txn, tc.conn.store.trees.current[0]));
+        for (0..4) |k| try testing.expectEqual(before[k], try nextomic.Store.treeEntries(txn, tc.conn.store.trees.current[k]));
+        for (0..4) |k| try testing.expectEqual(before[4 + k], try nextomic.Store.treeEntries(txn, tc.conn.store.trees.history[k]));
+        try testing.expectEqual(before[8], try nextomic.Store.treeEntries(txn, tc.conn.store.trees.txlog));
+        try testing.expectEqual(before[9], try nextomic.Store.treeEntries(txn, tc.conn.store.trees.idents));
+        try testing.expectEqual(before[10], try nextomic.Store.treeEntries(txn, tc.conn.store.trees.sys));
         try testing.expect((try tc.conn.idents.idOfName(txn, "tag/aborted")) == null);
     }
     // And the store still transacts afterwards.

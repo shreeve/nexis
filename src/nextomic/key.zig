@@ -486,12 +486,6 @@ pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
     }
 }
 
-/// The type an encoded value carries, from its tag byte.
-pub fn tagOf(vbytes: []const u8) DecodeError!Tag {
-    if (vbytes.len == 0) return error.Corrupted;
-    return tagFromByte(vbytes[0]) orelse error.Corrupted;
-}
-
 fn tagFromByte(b: u8) ?Tag {
     inline for (@typeInfo(Tag).@"enum".fields) |f| {
         if (f.value == b) return @enumFromInt(b);
@@ -653,13 +647,11 @@ pub fn packPrefix(out: *std.ArrayList(u8), gpa: Allocator, index: Index, comps: 
     for (order) |c| {
         switch (c) {
             'e' => {
-                const e = comps.e orelse break;
-                _ = e;
+                if (comps.e == null) break;
                 try out.appendSlice(gpa, &ebuf);
             },
             'a' => {
-                const a = comps.a orelse break;
-                _ = a;
+                if (comps.a == null) break;
                 try out.appendSlice(gpa, &abuf);
             },
             'v' => {

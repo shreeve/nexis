@@ -75,16 +75,6 @@ pub const SyncMode = enum {
 
 pub const Options = struct {
     map_size: u64 = 256 * 1024 * 1024,
-    read_only: bool = false,
-};
-
-pub const StoreError = error{
-    /// The file's Nextomic format number is not `format_version`.
-    Format,
-    /// A sys entry or key has an impossible shape.
-    Corrupted,
-    /// The store is closed.
-    Closed,
 };
 
 // =============================================================================
@@ -180,20 +170,6 @@ pub const boot = struct {
             else => null,
         };
     }
-
-    pub fn typeIdentOf(vt: key.ValueType) u32 {
-        return switch (vt) {
-            .long => type_long,
-            .double => type_double,
-            .instant => type_instant,
-            .keyword => type_keyword,
-            .ref => type_ref,
-            .string => type_string,
-            .uuid => type_uuid,
-            .bytes => type_bytes,
-            .boolean => type_boolean,
-        };
-    }
 };
 
 // =============================================================================
@@ -223,27 +199,19 @@ pub const Store = struct {
             .pageSize = page_size,
             .maxNamedTrees = 128,
             .mapSize = options.map_size,
-            .readOnly = options.read_only,
             .allocator = allocator,
         });
         errdefer self.env.close();
 
-        if (options.read_only) {
-            const txn = try self.env.beginRead();
-            defer txn.abort();
-            try self.openTrees(txn, false);
+        const txn = try self.env.beginWrite();
+        errdefer txn.abort();
+        try self.openTrees(txn);
+        if (try self.sysGet(txn, "format")) |_| {
             try self.readHeader(txn);
         } else {
-            const txn = try self.env.beginWrite();
-            errdefer txn.abort();
-            try self.openTrees(txn, true);
-            if (try self.sysGet(txn, "format")) |_| {
-                try self.readHeader(txn);
-            } else {
-                try self.bootstrap(txn);
-            }
-            try txn.commit();
+            try self.bootstrap(txn);
         }
+        try txn.commit();
         self.is_open = true;
         return self;
     }
@@ -257,10 +225,10 @@ pub const Store = struct {
         self.allocator.destroy(self);
     }
 
-    fn openTrees(self: *Store, txn: *Txn, create: bool) !void {
+    fn openTrees(self: *Store, txn: *Txn) !void {
         var ids: [tree_names.len]TreeId = undefined;
         for (tree_names, 0..) |name, i| {
-            ids[i] = try txn.openTree(name, create);
+            ids[i] = try txn.openTree(name, true);
         }
         self.trees = .{
             .current = ids[0..4].*,
@@ -583,8 +551,7 @@ pub const Store = struct {
         }
     };
 
-    pub fn scan(self: *Store, txn: *Txn, tree: TreeId, prefix: []const u8) !Scan {
-        _ = self;
+    pub fn scan(txn: *Txn, tree: TreeId, prefix: []const u8) !Scan {
         return .{ .cursor = try txn.openCursorForTree(tree), .prefix = prefix };
     }
 
@@ -612,8 +579,7 @@ pub const Store = struct {
         }
     };
 
-    pub fn scanRange(self: *Store, txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8) !RangeScan {
-        _ = self;
+    pub fn scanRange(txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8) !RangeScan {
         return .{ .cursor = try txn.openCursorForTree(tree), .start = start, .end = end };
     }
 
@@ -686,13 +652,12 @@ pub const Store = struct {
         }
     };
 
-    pub fn foldScan(self: *Store, txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8, window: Window) !FoldScan {
-        return .{ .inner = try self.scanRange(txn, tree, start, end), .window = window };
+    pub fn foldScan(txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8, window: Window) !FoldScan {
+        return .{ .inner = try scanRange(txn, tree, start, end), .window = window };
     }
 
     /// Number of entries in `tree` at the transaction's snapshot.
-    pub fn treeEntries(self: *Store, txn: *Txn, tree: TreeId) !u64 {
-        _ = self;
+    pub fn treeEntries(txn: *Txn, tree: TreeId) !u64 {
         return (try txn.treeStat(tree)).entries;
     }
 
@@ -885,7 +850,7 @@ test "bootstrap datoms are in every index they belong to" {
 
     // EAVT [1]: :db/ident has ident, valueType, cardinality, unique, index.
     const p = try key.prefixBytes(arena, .eavt, .{ .e = boot.ident });
-    var s = try store.scan(txn, store.trees.cur(.eavt), p);
+    var s = try Store.scan(txn, store.trees.cur(.eavt), p);
     var n: usize = 0;
     while (s.next()) |kv| : (n += 1) {
         try testing.expectEqual(@as(usize, key.id_len), kv.value.len);
@@ -895,17 +860,17 @@ test "bootstrap datoms are in every index they belong to" {
 
     // AVET [:db/ident] holds every ident; [:db/valueType] is not indexed.
     const pa = try key.prefixBytes(arena, .avet, .{ .a = boot.ident });
-    var sa = try store.scan(txn, store.trees.cur(.avet), pa);
+    var sa = try Store.scan(txn, store.trees.cur(.avet), pa);
     n = 0;
     while (sa.next()) |_| n += 1;
     try testing.expectEqual(@as(usize, boot.idents.len), n);
     const pv = try key.prefixBytes(arena, .avet, .{ .a = boot.value_type });
-    var sv = try store.scan(txn, store.trees.cur(.avet), pv);
+    var sv = try Store.scan(txn, store.trees.cur(.avet), pv);
     try testing.expect(sv.next() == null);
 
     // History mirrors current with top = (1 << 1) | 1.
     const ph = try key.prefixBytes(arena, .eavt, .{ .e = boot.ident });
-    var sh = try store.scan(txn, store.trees.hist(.eavt), ph);
+    var sh = try Store.scan(txn, store.trees.hist(.eavt), ph);
     n = 0;
     while (sh.next()) |kv| : (n += 1) {
         const parts = try key.unpackKey(.eavt, true, kv.key);
@@ -916,7 +881,7 @@ test "bootstrap datoms are in every index they belong to" {
     try testing.expectEqual(@as(usize, 5), n);
 
     // Empty prefix walks the whole tree.
-    var all = try store.scan(txn, store.trees.cur(.aevt), &.{});
+    var all = try Store.scan(txn, store.trees.cur(.aevt), &.{});
     n = 0;
     while (all.next()) |_| n += 1;
     try testing.expect(n > boot.idents.len);
@@ -983,7 +948,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
         .{ .window = .{ .since = .{ .after = 4, .upto = 5 } }, .facts = &.{} },
     };
     for (cases) |c| {
-        var fs = try store.foldScan(txn, tree, prefix, end, c.window);
+        var fs = try Store.foldScan(txn, tree, prefix, end, c.window);
         var got: std.ArrayList(u64) = .empty;
         while (fs.next()) |r| {
             try testing.expect(r.added);
@@ -994,7 +959,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
         try testing.expectEqualSlices(u64, c.facts, got.items);
     }
     // History mode sees all five rows in t order with their flags.
-    var all = try store.foldScan(txn, tree, prefix, end, .{ .all = .{ .after = 0, .upto = 5 } });
+    var all = try Store.foldScan(txn, tree, prefix, end, .{ .all = .{ .after = 0, .upto = 5 } });
     var n: usize = 0;
     var adds: usize = 0;
     while (all.next()) |r| {
@@ -1004,7 +969,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     try testing.expectEqual(@as(usize, 5), n);
     try testing.expectEqual(@as(usize, 3), adds);
     // Current trees hold only attribute 101 now.
-    var cur = try store.scan(txn, store.trees.cur(.eavt), prefix);
+    var cur = try Store.scan(txn, store.trees.cur(.eavt), prefix);
     const only = cur.next().?;
     try testing.expectEqual(@as(u32, 101), (try key.unpackKey(.eavt, false, only.key)).a);
     try testing.expect(cur.next() == null);

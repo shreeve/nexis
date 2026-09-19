@@ -76,14 +76,14 @@ pub const Schema = struct {
 
         var acc = Accumulator{};
         if (basis == now) {
-            var s = try store.scanRange(txn, store.trees.cur(.eavt), &start, &end);
+            var s = try Store.scanRange(txn, store.trees.cur(.eavt), &start, &end);
             while (s.next()) |kv| {
                 if (kv.value.len < key.id_len) return error.Corrupted;
                 const t = key.readId(kv.value[0..key.id_len]);
                 try acc.row(self, arena, kv.key, t);
             }
         } else {
-            var fs = try store.foldScan(txn, store.trees.hist(.eavt), &start, &end, .{ .as_of = basis });
+            var fs = try Store.foldScan(txn, store.trees.hist(.eavt), &start, &end, .{ .as_of = basis });
             while (fs.next()) |r| try acc.row(self, arena, r.fact, r.t);
         }
         try acc.flush(self, arena);

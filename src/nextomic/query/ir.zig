@@ -233,12 +233,6 @@ pub const Ir = struct {
         return self.arena_state.allocator();
     }
 
-    /// Is every element of `find` an aggregate?
-    pub fn allAggregates(self: *const Ir) bool {
-        for (self.find) |f| if (f == .variable) return false;
-        return true;
-    }
-
     pub fn hasAggregates(self: *const Ir) bool {
         for (self.find) |f| if (f == .agg) return true;
         return false;

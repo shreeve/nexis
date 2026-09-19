@@ -32,6 +32,7 @@ const key = @import("../key.zig");
 const datom_mod = @import("../datom.zig");
 const schema_mod = @import("../schema.zig");
 const db_mod = @import("../db.zig");
+const store_mod = @import("../store.zig");
 const relation = @import("../relation.zig");
 const ir = @import("ir.zig");
 const rules_mod = @import("rules.zig");
@@ -84,10 +85,6 @@ pub const Slot = union(enum) {
     /// datom must carry the same value in both positions.
     same: Var,
     constant: Const,
-
-    pub fn isBound(self: Slot) bool {
-        return self == .bound or self == .constant;
-    }
 };
 
 pub const Scan = struct {
@@ -241,7 +238,7 @@ pub const Ctx = struct {
         if (self.aevt_entries) |n| return n;
         const store = self.read.db.conn.store;
         const tree = if (self.read.fast()) store.trees.cur(.aevt) else store.trees.hist(.aevt);
-        const n = try store.treeEntries(self.read.txn, tree);
+        const n = try store_mod.Store.treeEntries(self.read.txn, tree);
         self.aevt_entries = n;
         return n;
     }
@@ -640,7 +637,7 @@ fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) anyerror!Scan {
         (history and (slots[3] == .blank or slots[4] == .blank));
     const store = ctx.read.db.conn.store;
     const tree = if (ctx.read.fast()) store.trees.cur(choice.index) else store.trees.hist(choice.index);
-    const entries = try store.treeEntries(ctx.read.txn, tree);
+    const entries = try store_mod.Store.treeEntries(ctx.read.txn, tree);
 
     return .{
         .e = slots[0],

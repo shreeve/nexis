@@ -172,13 +172,6 @@ pub const Column = union(enum) {
 
     pub const empty: Column = .{ .int = .empty };
 
-    pub fn len(self: *const Column) usize {
-        return switch (self.*) {
-            .int => |c| c.items.len,
-            .cell => |c| c.items.len,
-        };
-    }
-
     pub fn get(self: *const Column, i: usize) Cell {
         return switch (self.*) {
             .int => |c| .{ .int = c.items[i] },
@@ -398,23 +391,6 @@ pub const Relation = struct {
         return out;
     }
 
-    /// The rows of `self` whose values on `on` appear in `other`
-    /// (the semi-join).
-    pub fn semiJoin(self: *const Relation, other: *const Relation, on: []const Var) !Relation {
-        const probe = try other.project(on, true);
-        var index: RowSet = .{ .rel = &probe };
-        var i: usize = 0;
-        while (i < probe.rows) : (i += 1) _ = try index.insert(self.arena, i);
-
-        const keyed = try self.project(on, false);
-        var out = try init(self.arena, self.vars);
-        i = 0;
-        while (i < self.rows) : (i += 1) {
-            if (index.contains(&keyed, i, keyed.rowHash(i))) try out.copyRow(self, i);
-        }
-        return out;
-    }
-
     /// The variables of `other` that `self` lacks.
     pub fn newVars(self: *const Relation, other: *const Relation) ![]Var {
         var out: std.ArrayList(Var) = .empty;
@@ -589,7 +565,6 @@ test "column widens from int to cell" {
     try testing.expect(c == .int);
     try c.append(arena, .{ .str = "x" });
     try testing.expect(c == .cell);
-    try testing.expectEqual(@as(usize, 3), c.len());
     try testing.expect(c.get(0).eql(.{ .int = 1 }));
     try testing.expect(c.get(2).eql(.{ .str = "x" }));
 }
@@ -623,8 +598,6 @@ test "dedup, project, union, difference, sort" {
     const diff = try r.difference(&s, &.{0});
     try testing.expectEqual(@as(usize, 1), diff.rows);
     try testing.expect(diff.cell(0, 0).eql(.{ .int = 2 }));
-    const semi = try r.semiJoin(&s, &.{0});
-    try testing.expectEqual(@as(usize, 3), semi.rows);
 
     var sorted = try r.dedup();
     try sorted.sort();
@@ -653,8 +626,6 @@ test "a relation has no column cap" {
     const none = try rel(arena, vars[0..1], &.{});
     const diff = try d.difference(&none, vars[0..1]);
     try testing.expectEqual(@as(usize, 1), diff.rows);
-    const semi = try d.semiJoin(&d, vars[0..1]);
-    try testing.expectEqual(@as(usize, 1), semi.rows);
     const j = try d.hashJoin(&d);
     try testing.expectEqual(@as(usize, 1), j.rows);
     try testing.expectEqual(@as(usize, n), j.cols.len);

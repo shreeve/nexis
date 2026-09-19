@@ -71,8 +71,6 @@ pub const IdSource = struct {
     attrType: *const fn (ctx: *anyopaque, a: u32) anyerror!?ValueType,
 };
 
-pub const TxlogError = error{ Corrupted, UnknownIdent, OutOfMemory };
-
 // =============================================================================
 // Encode
 // =============================================================================

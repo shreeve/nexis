@@ -375,8 +375,7 @@ pub const DbValue = struct {
     }
 
     /// The attribute `a` as this view sees it.
-    pub fn attr(self: DbValue, arena: Allocator, a: u32) !?Attr {
-        _ = arena;
+    pub fn attr(self: DbValue, a: u32) !?Attr {
         var rd = try self.beginRead();
         defer rd.close();
         return rd.attr(a);
@@ -425,7 +424,7 @@ pub const Read = struct {
                 .arena = arena,
                 .index = index,
                 .filter = filter,
-                .source = .{ .current = try store.scan(self.txn, store.trees.cur(index), prefix) },
+                .source = .{ .current = try Store.scan(self.txn, store.trees.cur(index), prefix) },
             };
         }
         const end = try key.successor(arena, prefix);
@@ -434,7 +433,7 @@ pub const Read = struct {
             .arena = arena,
             .index = index,
             .filter = filter,
-            .source = .{ .folded = try store.foldScan(self.txn, store.trees.hist(index), prefix, end, self.db.window()) },
+            .source = .{ .folded = try Store.foldScan(self.txn, store.trees.hist(index), prefix, end, self.db.window()) },
         };
     }
 
@@ -594,7 +593,7 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
     } else null;
 
     var out: std.ArrayList(TxEntry) = .empty;
-    var s = try conn.store.scanRange(txn, conn.store.trees.txlog, &start, end);
+    var s = try Store.scanRange(txn, conn.store.trees.txlog, &start, end);
     while (s.next()) |kv| {
         if (kv.key.len != key.id_len) return error.Corrupted;
         const t = key.readId(kv.key[0..key.id_len]);
@@ -715,8 +714,8 @@ test "db at bootstrap: datoms, entity, entid, ident, tx-range" {
     try testing.expect((try db.asOf(0).entid(arena, .{ .ident = k_doc })) == null);
 
     // attr as-of
-    try testing.expect((try db.attr(arena, boot.ident)).?.indexed);
-    try testing.expect((try db.asOf(0).attr(arena, boot.ident)) == null);
+    try testing.expect((try db.attr(boot.ident)).?.indexed);
+    try testing.expect((try db.asOf(0).attr(boot.ident)) == null);
 
     // tx-range
     const entries = try txRange(tc.conn, arena, 0, null);
@@ -807,7 +806,7 @@ test "every operation on a closed connection is error.Closed" {
         try testing.expectError(error.Closed, v.entid(arena, .{ .eid = 1 }));
         try testing.expectError(error.Closed, v.entid(arena, .{ .lookup = .{ .a = boot.ident, .v = .{ .keyword = boot.doc } } }));
         try testing.expectError(error.Closed, v.ident(arena, boot.doc));
-        try testing.expectError(error.Closed, v.attr(arena, boot.ident));
+        try testing.expectError(error.Closed, v.attr(boot.ident));
     }
 }
 

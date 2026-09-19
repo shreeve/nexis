@@ -712,7 +712,7 @@ const Naive = struct {
                 if (v.kind() != .persistent_vector or vector_mod.count(v) != 2 or vector_mod.nth(v, 0).kind() != .keyword) return null;
                 const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, vector_mod.nth(v, 0).asKeywordId())) orelse return error.UnknownAttribute;
                 const vt = self.attr_types.get(attr_id) orelse return error.UnknownAttribute;
-                const val = (try cellToVal(self.arena, Cell.fromValue(vector_mod.nth(v, 1)), vt)) orelse return null;
+                const val = (try cellToVal(Cell.fromValue(vector_mod.nth(v, 1)), vt)) orelse return null;
                 return self.read.entid(self.arena, .{ .lookup = .{ .a = attr_id, .v = val } });
             },
             else => return null,
@@ -726,7 +726,7 @@ const Naive = struct {
             .lookup => |l| {
                 const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, l.attr)) orelse return null;
                 const vt = self.attr_types.get(attr_id) orelse return null;
-                const val = (try cellToVal(a, l.v, vt)) orelse return null;
+                const val = (try cellToVal(l.v, vt)) orelse return null;
                 const eid = (try self.dbv.entid(a, .{ .lookup = .{ .a = attr_id, .v = val } })) orelse return null;
                 return .{ .int = @intCast(eid) };
             },
@@ -892,8 +892,7 @@ const Naive = struct {
     }
 };
 
-fn cellToVal(arena: Allocator, c: Cell, vt: key.ValueType) !?key.Val {
-    _ = arena;
+fn cellToVal(c: Cell, vt: key.ValueType) !?key.Val {
     return switch (vt) {
         .string => if (c == .str) .{ .string = c.str } else null,
         .long => if (c == .int) .{ .long = c.int } else null,

@@ -927,10 +927,9 @@ const Ctx = struct {
             if (g.found_existing) try self.unify(d.e, g.value_ptr.*) else g.value_ptr.* = d.e;
         }
         // Fresh eids for the rest.
-        for (self.bindings.items, 0..) |*b, i| {
+        for (self.bindings.items) |*b| {
             if (b.alias != null) continue;
             if (b.eid != null) continue;
-            _ = i;
             if (self.next_eid >= key.user_partition_end) return error.DatabaseFull;
             b.eid = self.next_eid;
             self.next_eid += 1;
@@ -965,7 +964,7 @@ const Ctx = struct {
     /// NUL), so the value section is compared exactly.
     fn probeAvet(self: *Ctx, a: u32, vbytes: []const u8) !?u64 {
         const prefix = try key.prefixBytes(self.arena, .avet, .{ .a = a, .v = vbytes });
-        var s = try self.conn.store.scan(self.txn, self.conn.store.trees.cur(.avet), prefix);
+        var s = try Store.scan(self.txn, self.conn.store.trees.cur(.avet), prefix);
         while (s.next()) |kv| {
             const parts = try key.unpackKey(.avet, false, kv.key);
             if (std.mem.eql(u8, parts.v, vbytes)) return parts.e;
@@ -1074,7 +1073,7 @@ const Ctx = struct {
     /// retracted in this transaction.
     fn currentOne(self: *Ctx, e: u64, a: u32) !?Current {
         const prefix = try key.prefixBytes(self.arena, .eavt, .{ .e = e, .a = a });
-        var s = try self.conn.store.scan(self.txn, self.conn.store.trees.cur(.eavt), prefix);
+        var s = try Store.scan(self.txn, self.conn.store.trees.cur(.eavt), prefix);
         while (s.next()) |kv| {
             if (self.facts.get(kv.key)) |i| if (!self.overlay.items[i].added) continue;
             const parts = try key.unpackKey(.eavt, false, kv.key);
@@ -1112,7 +1111,7 @@ const Ctx = struct {
     fn expandRetractAttr(self: *Ctx, e: u64, attr: Attr) !void {
         if (self.ea_adds.get(.{ .e = e, .a = attr.id })) |_| return self.conflict(e, attr.id);
         const prefix = try key.prefixBytes(self.arena, .eavt, .{ .e = e, .a = attr.id });
-        var s = try self.conn.store.scan(self.txn, self.conn.store.trees.cur(.eavt), prefix);
+        var s = try Store.scan(self.txn, self.conn.store.trees.cur(.eavt), prefix);
         while (s.next()) |kv| {
             if (self.facts.get(kv.key)) |_| continue;
             const parts = try key.unpackKey(.eavt, false, kv.key);
@@ -1126,7 +1125,7 @@ const Ctx = struct {
         // Its own datoms.
         {
             const prefix = try key.prefixBytes(self.arena, .eavt, .{ .e = e });
-            var s = try self.conn.store.scan(self.txn, self.conn.store.trees.cur(.eavt), prefix);
+            var s = try Store.scan(self.txn, self.conn.store.trees.cur(.eavt), prefix);
             while (s.next()) |kv| {
                 const parts = try key.unpackKey(.eavt, false, kv.key);
                 const attr = try self.attrById(parts.a);
@@ -1143,7 +1142,7 @@ const Ctx = struct {
         {
             const vb = try key.valBytes(self.arena, .{ .ref = e });
             const prefix = try key.prefixBytes(self.arena, .vaet, .{ .v = vb });
-            var s = try self.conn.store.scan(self.txn, self.conn.store.trees.cur(.vaet), prefix);
+            var s = try Store.scan(self.txn, self.conn.store.trees.cur(.vaet), prefix);
             while (s.next()) |kv| {
                 const parts = try key.unpackKey(.vaet, false, kv.key);
                 const attr = try self.attrById(parts.a);
@@ -1250,7 +1249,7 @@ const Ctx = struct {
     fn checkUniqueAvet(self: *Ctx, attr: Attr) !void {
         const store = self.conn.store;
         const prefix = try key.prefixBytes(self.arena, .avet, .{ .a = attr.id });
-        var s = try store.scan(self.txn, store.trees.cur(.avet), prefix);
+        var s = try Store.scan(self.txn, store.trees.cur(.avet), prefix);
         var prev: ?[]const u8 = null;
         while (s.next()) |kv| {
             const parts = try key.unpackKey(.avet, false, kv.key);
@@ -1278,7 +1277,7 @@ const Ctx = struct {
         const store = self.conn.store;
         const prefix = try key.prefixBytes(self.arena, .aevt, .{ .a = attr.id });
         var rows: std.ArrayList(struct { e: u64, vbytes: []const u8, t: u64 }) = .empty;
-        var s = try store.scan(self.txn, store.trees.cur(.aevt), prefix);
+        var s = try Store.scan(self.txn, store.trees.cur(.aevt), prefix);
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         while (s.next()) |kv| {
             const parts = try key.unpackKey(.aevt, false, kv.key);
@@ -1525,8 +1524,8 @@ test "schema install then asserts, card-one overwrite, no-op, retract" {
     const after = try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = a });
     try testing.expectEqual(@as(usize, 1), after.len);
     try testing.expectEqual(email, after[0].a);
-    try testing.expectEqual(@as(u64, 0), (try (try tc.conn.db()).attr(arena, name)).?.count);
-    try testing.expectEqual(@as(u64, 1), (try (try tc.conn.db()).attr(arena, email)).?.count);
+    try testing.expectEqual(@as(u64, 0), (try (try tc.conn.db()).attr(name)).?.count);
+    try testing.expectEqual(@as(u64, 1), (try (try tc.conn.db()).attr(email)).?.count);
 
     // Errors.
     try testing.expectError(error.UnknownAttribute, transactOps(tc.conn, arena, &.{
@@ -1671,8 +1670,8 @@ test "schema changes: index backfill, unique backfill refusal, immutable type" {
     try testing.expectEqual(r1.t, hits[0].t);
     const ab = try key.valBytes(arena, .{ .string = "Anne" });
     try testing.expectEqual(@as(usize, 1), (try db2.datoms(arena, .avet, .{ .a = name, .v = ab })).len);
-    try testing.expect((try db2.attr(arena, name)).?.indexed);
-    try testing.expect(!(try db2.asOf(r1.t).attr(arena, name)).?.indexed);
+    try testing.expect((try db2.attr(name)).?.indexed);
+    try testing.expect(!(try db2.asOf(r1.t).attr(name)).?.indexed);
     _ = r2;
 
     // Unique on age is fine (distinct values); unique on name would collide.
@@ -1987,7 +1986,7 @@ test "a card-many attribute cannot be unique" {
         .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_many } } } },
         .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_identity } } } },
     }, .{}));
-    try testing.expect((try (try tc.conn.db()).attr(arena, tags)).?.unique == .none);
+    try testing.expect((try (try tc.conn.db()).attr(tags)).?.unique == .none);
 }
 
 test "long strings round trip through the payload in every view" {
@@ -2068,7 +2067,7 @@ test "with: the view sees the speculative state, the connection does not" {
     const hb = try key.valBytes(arena, .{ .ref = h });
     try testing.expectEqual(@as(usize, 1), (try view.datoms(arena, .vaet, .{ .v = hb })).len);
     try testing.expectEqual(@as(?u64, a), try view.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a@x" } } }));
-    try testing.expectEqual(@as(u64, 1), (try view.attr(arena, email)).?.count);
+    try testing.expectEqual(@as(u64, 1), (try view.attr(email)).?.count);
     const entries = try db_mod.txRange(w.view, arena, w.report.t, null);
     try testing.expectEqual(@as(usize, 1), entries.len);
     try testing.expectEqual(@as(usize, 6), entries[0].datoms.len);
@@ -2089,7 +2088,7 @@ test "with: the view sees the speculative state, the connection does not" {
     try testing.expectEqual(before.basis, (try tc.conn.db()).basis);
     try testing.expectEqual(@as(usize, 0), (try before.entity(arena, a)).len);
     try testing.expectEqual(@as(usize, 0), (try w.report.db_before.entity(arena, a)).len);
-    try testing.expectEqual(@as(u64, 0), (try before.attr(arena, email)).?.count);
+    try testing.expectEqual(@as(u64, 0), (try before.attr(email)).?.count);
 
     // One write transaction per store: nothing else may begin one.
     try testing.expectError(error.Nested, withOps(tc.conn, arena, &.{}, .{}));
@@ -2160,11 +2159,11 @@ test "with: errors surface without holding the write transaction; schema changes
     }, .{});
     defer w.destroy();
     const nick: u32 = @intCast(w.report.tempids[0].eid);
-    try testing.expectEqual(key.ValueType.string, (try w.db().attr(arena, nick)).?.value_type);
+    try testing.expectEqual(key.ValueType.string, (try w.db().attr(nick)).?.value_type);
     try testing.expectEqual(@as(?u64, nick), try w.db().entid(arena, .{ .ident = try kw(tc, "user/nick") }));
-    try testing.expect((try (try tc.conn.db()).attr(arena, nick)) == null);
+    try testing.expect((try (try tc.conn.db()).attr(nick)) == null);
     w.finish();
-    try testing.expect((try (try tc.conn.db()).attr(arena, nick)) == null);
+    try testing.expect((try (try tc.conn.db()).attr(nick)) == null);
     try testing.expectEqual(r0.t, (try tc.conn.db()).basis);
     const r1 = try transactOps(tc.conn, arena, &.{
         .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = age }, .v = .{ .val = .{ .long = 3 } } } },
@@ -2566,7 +2565,7 @@ test "an indexed attribute becomes unique while a value moves between entities" 
     }, .{});
     try testing.expectEqual(@as(usize, 4), r2.tx_data.len);
     const db = try tc.conn.db();
-    try testing.expectEqual(schema_mod.Unique.identity, (try db.attr(arena, nick)).?.unique);
+    try testing.expectEqual(schema_mod.Unique.identity, (try db.attr(nick)).?.unique);
     try testing.expectEqual(@as(?u64, b), try db.entid(arena, .{ .lookup = .{ .a = nick, .v = .{ .string = "N" } } }));
     try testing.expectEqual(@as(usize, 1), (try db.datoms(arena, .aevt, .{ .a = nick })).len);
 }
