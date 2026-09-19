@@ -1411,7 +1411,7 @@ NX-4, NX-5, NX-6) the Amendment Log records the decision and
 | # | Decision | Short rationale |
 |---|---|---|
 | NX-1 | **Integer entity ids** (fixnum), NOT durable-refs. Attr ids = `u32` keyword intern ids. Durable-refs stay the `nexis.db` handle type but are NOT Nextomic's entity identity. | Fitting eids into the Value payload is 8 bytes vs ~40; lex-sort is one instruction; entity identity must not encode storage topology. |
-| NX-2 | **Internal Relation type** — column-oriented, backed by existing `typed_vector` Value kinds. API results stay persistent-set-of-persistent-vector; the engine does NOT use that representation internally. | Generic persistent collections all the way is correct and slow. This is the single highest-leverage decision Nextomic will make. |
+| NX-2 | **Internal Relation type** — column-oriented; `relation.zig` keeps its own typed columns, and the `typed_vector` heap kind is the user-facing type. API results stay persistent-set-of-persistent-vector; the engine does NOT use that representation internally. | Generic persistent collections all the way is correct and slow. This is the single highest-leverage decision Nextomic will make. |
 | NX-3 | **Macro → IR → runtime-plan split.** Macro compiles query literal to IR (embedded as a bytecode constant). Runtime planner lowers IR to a plan using current schema + bound inputs. | Macros alone cannot plan (schema and bindings are runtime). Runtime alone pays parse cost per call. The split is roughly 40 / 30 / 30 between the three stages. |
 | NX-4 | **tx-in-key filtering for history, NOT emdb snapshot pinning.** Datoms are append-only with `tx` in the key; `as-of T` is a range filter. emdb snapshots are reserved for operational reproducibility, not semantic history. | Pinned snapshots prevent page reclamation; tx-in-key does not. Datomic semantics demand history-as-data, not history-as-page-retention. |
 | NX-5 | **`datom` as a heap Value kind** — five accessors (`.e .a .v .tx .added?`), user-facing projection only. Execution operates on `Relation` columns, not on datom values. Serializes via projection to existing §15.10 kinds; no codec amendment. | Nicer ergonomics and cheaper accessors than vector-of-five-Values, without leaking into the hot execution path. |
@@ -1972,7 +1972,7 @@ maps to a projected speedup:
 - [ ] **Perfect-hash keyword tables** (T2.4) — compile-time generation of keyword text → intern id.
 - [ ] **LuaJIT-style operand-specialized opcodes** (T2.5) — `math:add-ss`, `math:add-sc`, etc.
 - [ ] **Generational GC nursery** (T2.6) — only if mark-sweep pauses become visible in benchmarks; the collector must be wired to the runtime first (`docs/GC.md`).
-- [ ] **`nexis.simd` kernels on typed vectors with benchmarks** (T2.7) — `vdot`, `vsum`, `vmap`, `vfilter`. `typed_vector` is a reserved kind with no implementation.
+- [x] **`nexis.simd` kernels on typed vectors** (T2.7) — `sum`, `dot`, `scale` and `map` over `i64`/`f64` typed vectors (`docs/TYPED_VECTOR.md`); no `filter` kernel and no benchmark rows.
 - [ ] **Branchless CHAMP lookup for small bitmaps** (T2.8).
 - [ ] **Precomputed compact source maps** (T2.9) — lazy stack-trace materialization.
 - [ ] **`bench-vs-clojure.nx`** and other benchmark suites for CI regression detection.
