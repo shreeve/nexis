@@ -971,16 +971,20 @@ fn fnDec(_: *VM, args: []const Value) VmError!Value {
     return vm_mod.numSub(args[0], value_mod.fromFixnum(1).?);
 }
 
+fn numMax(a: Value, b: Value) VmError!Value {
+    return vm_mod.numExtremum(true, a, b);
+}
+
+fn numMin(a: Value, b: Value) VmError!Value {
+    return vm_mod.numExtremum(false, a, b);
+}
+
 fn fnMax(_: *VM, args: []const Value) VmError!Value {
-    var acc = try requireNumber(args[0]);
-    for (args[1..]) |x| acc = try vm_mod.numExtremum(true, acc, x);
-    return acc;
+    return foldNumbers(&numMax, args);
 }
 
 fn fnMin(_: *VM, args: []const Value) VmError!Value {
-    var acc = try requireNumber(args[0]);
-    for (args[1..]) |x| acc = try vm_mod.numExtremum(false, acc, x);
-    return acc;
+    return foldNumbers(&numMin, args);
 }
 
 fn fnAbs(_: *VM, args: []const Value) VmError!Value {
@@ -1069,19 +1073,22 @@ fn fnApply(vm: *VM, args: []const Value) VmError!Value {
 /// stopping at the shortest collection. Throws inside `f`
 /// propagate via `ControlTransferred`.
 fn fnMap(vm: *VM, args: []const Value) VmError!Value {
-    const f = args[0];
-    const colls = args[1..];
-
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
+    try mapInto(vm, args[0], args[1..], &results);
+    return try buildListFromSlice(vm, results.items);
+}
 
+/// Append `(f x1 x2 ...)` for every position of the shortest of
+/// `colls` to `out`.
+fn mapInto(vm: *VM, f: Value, colls: []const Value, out: *std.ArrayList(Value)) VmError!void {
     if (colls.len == 1) {
         var it = try makeSeqIter(vm, colls[0]);
         while (try it.next()) |x| {
             const one = [_]Value{x};
-            results.append(vm.allocator, try vm.callValue(f, &one)) catch return VmError.OutOfMemory;
+            out.append(vm.allocator, try vm.callValue(f, &one)) catch return VmError.OutOfMemory;
         }
-        return try buildListFromSlice(vm, results.items);
+        return;
     }
 
     const iters = vm.allocator.alloc(SeqIter, colls.len) catch return VmError.OutOfMemory;
@@ -1093,9 +1100,8 @@ fn fnMap(vm: *VM, args: []const Value) VmError!Value {
         for (iters, 0..) |*it, i| {
             call_args[i] = (try it.next()) orelse break :outer;
         }
-        results.append(vm.allocator, try vm.callValue(f, call_args)) catch return VmError.OutOfMemory;
+        out.append(vm.allocator, try vm.callValue(f, call_args)) catch return VmError.OutOfMemory;
     }
-    return try buildListFromSlice(vm, results.items);
 }
 
 /// `(reduce f coll)` / `(reduce f init coll)` → left fold. With
@@ -1105,12 +1111,7 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     const f = args[0];
     const coll = args[args.len - 1];
     var it = try makeSeqIter(vm, coll);
-    var acc: Value = undefined;
-    if (args.len == 3) {
-        acc = args[1];
-    } else {
-        acc = (try it.next()) orelse return try vm.callValue(f, &.{});
-    }
+    var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try vm.callValue(f, &.{});
     while (try it.next()) |x| {
         const pair = [_]Value{ acc, x };
         acc = try vm.callValue(f, &pair);
@@ -1150,18 +1151,22 @@ const Sieve = enum { keep_truthy, keep_falsy, keep_result };
 fn sieve(vm: *VM, mode: Sieve, pred: Value, coll: Value) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
+    try sieveInto(vm, mode, pred, coll, &results);
+    return try buildListFromSlice(vm, results.items);
+}
+
+fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, out: *std.ArrayList(Value)) VmError!void {
     var it = try makeSeqIter(vm, coll);
     while (try it.next()) |x| {
         const one = [_]Value{x};
         const r = try vm.callValue(pred, &one);
-        const out: ?Value = switch (mode) {
+        const kept: ?Value = switch (mode) {
             .keep_truthy => if (r.isTruthy()) x else null,
             .keep_falsy => if (r.isTruthy()) null else x,
             .keep_result => if (r.isNil()) null else r,
         };
-        if (out) |v| results.append(vm.allocator, v) catch return VmError.OutOfMemory;
+        if (kept) |v| out.append(vm.allocator, v) catch return VmError.OutOfMemory;
     }
-    return try buildListFromSlice(vm, results.items);
 }
 
 /// `(filter pred coll)` → eager list of x where `(pred x)` is truthy.
@@ -1180,14 +1185,13 @@ fn fnKeep(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Collection utilities (3.3c)
+// Collection utilities
 // =============================================================================
 //
-// Persistent collection construction + access. Per peer-AI
-// turn 67 §D8 Group B:
+// Persistent collection construction + access:
 //
 //   vector       (& xs)     persistent vector from args
-//   vec          (s)        persistent vector from seq
+//   vec          (s)        persistent vector from any seqable
 //   hash-map     (& kvs)    persistent map from k/v pairs
 //   hash-set     (& xs)     persistent set from args
 //   assoc        (m k v)    persistent put (map or vector)
@@ -1200,9 +1204,8 @@ fn fnKeep(vm: *VM, args: []const Value) VmError!Value {
 //   conj         (coll & xs) persistent add (list: cons; vector: push;
 //                            map: assoc with [k v] pair; set: include)
 //
-// HAMT iteration order is unspecified (peer-AI turn 67 §Sharp
-// warning §7). Tests using `keys`/`vals` should compare as
-// sets, not by exact order.
+// Map and set iteration order is unspecified. Tests using
+// `keys`/`vals` should compare as sets, not by exact order.
 
 fn fnVector(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
@@ -1217,19 +1220,11 @@ fn fnVec(vm: *VM, args: []const Value) VmError!Value {
             return vector_mod.empty(heap) catch VmError.OutOfMemory;
         },
         .persistent_vector => s,
-        .list => blk: {
-            const heap = vm.ensureHeap();
-            // Materialize the list into a slice then fromSlice.
-            var items: std.ArrayList(Value) = .empty;
+        else => blk: {
+            var items = try collectSeq(vm, s);
             defer items.deinit(vm.allocator);
-            var node = s;
-            while (!list_mod.isEmpty(node)) {
-                items.append(vm.allocator, list_mod.head(node)) catch return VmError.OutOfMemory;
-                node = list_mod.tail(node);
-            }
-            break :blk vector_mod.fromSlice(heap, items.items) catch VmError.OutOfMemory;
+            break :blk vector_mod.fromSlice(vm.ensureHeap(), items.items) catch VmError.OutOfMemory;
         },
-        else => VmError.KindMismatch,
     };
 }
 
@@ -1561,22 +1556,10 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
 /// → list of fixnums. A zero step is `:invalid-argument` (there
 /// is no infinite sequence to return).
 fn fnRange(vm: *VM, args: []const Value) VmError!Value {
-    var start: i64 = 0;
-    var end: i64 = undefined;
-    var step: i64 = 1;
-    switch (args.len) {
-        1 => end = try requireFixnum(args[0]),
-        2 => {
-            start = try requireFixnum(args[0]);
-            end = try requireFixnum(args[1]);
-        },
-        else => {
-            start = try requireFixnum(args[0]);
-            end = try requireFixnum(args[1]);
-            step = try requireFixnum(args[2]);
-            if (step == 0) return VmError.InvalidArgument;
-        },
-    }
+    const start: i64 = if (args.len == 1) 0 else try requireFixnum(args[0]);
+    const end: i64 = try requireFixnum(args[if (args.len == 1) 0 else 1]);
+    const step: i64 = if (args.len == 3) try requireFixnum(args[2]) else 1;
+    if (step == 0) return VmError.InvalidArgument;
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(vm.allocator);
     var i = start;
@@ -1618,11 +1601,17 @@ fn fnInto(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(mapv f & colls)` / `(filterv pred coll)` — vector results.
 fn fnMapv(vm: *VM, args: []const Value) VmError!Value {
-    return fnVec(vm, &.{try fnMap(vm, args)});
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    try mapInto(vm, args[0], args[1..], &results);
+    return vector_mod.fromSlice(vm.ensureHeap(), results.items) catch VmError.OutOfMemory;
 }
 
 fn fnFilterv(vm: *VM, args: []const Value) VmError!Value {
-    return fnVec(vm, &.{try fnFilter(vm, args)});
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    try sieveInto(vm, .keep_truthy, args[0], args[1], &results);
+    return vector_mod.fromSlice(vm.ensureHeap(), results.items) catch VmError.OutOfMemory;
 }
 
 /// `(map-indexed f coll)` → `(f i x)`; `(keep-indexed f coll)` →
@@ -1649,18 +1638,29 @@ fn fnKeepIndexed(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(distinct coll)` → first occurrences, in order.
 fn fnDistinct(vm: *VM, args: []const Value) VmError!Value {
-    const heap = vm.ensureHeap();
-    var seen = champ_mod.setEmpty(heap) catch return VmError.OutOfMemory;
+    var seen: ValueSet = .empty;
+    defer seen.deinit(vm.allocator);
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
     var it = try makeSeqIter(vm, args[0]);
     while (try it.next()) |x| {
-        if (champ_mod.setContains(seen, x, &dispatch_mod.hashValue, &dispatch_mod.equal)) continue;
-        seen = champ_mod.setConj(heap, seen, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+        const entry = seen.getOrPut(vm.allocator, x) catch return VmError.OutOfMemory;
+        if (entry.found_existing) continue;
         results.append(vm.allocator, x) catch return VmError.OutOfMemory;
     }
     return try buildListFromSlice(vm, results.items);
 }
+
+/// A scratch set of Values under the language's hash and equality,
+/// on the VM allocator; freed when the native returns.
+const ValueSet = std.HashMapUnmanaged(Value, void, struct {
+    pub fn hash(_: @This(), v: Value) u64 {
+        return dispatch_mod.hashValue(v);
+    }
+    pub fn eql(_: @This(), a: Value, b: Value) bool {
+        return dispatch_mod.equal(a, b);
+    }
+}, std.hash_map.default_max_load_percentage);
 
 /// `(partition n coll)` / `(partition n step coll)` /
 /// `(partition n step pad coll)` → list of n-element lists; a
@@ -1851,12 +1851,7 @@ fn fnReductions(vm: *VM, args: []const Value) VmError!Value {
     var it = try makeSeqIter(vm, args[args.len - 1]);
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
-    var acc: Value = undefined;
-    if (args.len == 3) {
-        acc = args[1];
-    } else {
-        acc = (try it.next()) orelse return try buildListFromSlice(vm, &.{try vm.callValue(f, &.{})});
-    }
+    var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try buildListFromSlice(vm, &.{try vm.callValue(f, &.{})});
     results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
     while (try it.next()) |x| {
         acc = try vm.callValue(f, &.{ acc, x });
@@ -2050,7 +2045,7 @@ fn fnNotEmpty(vm: *VM, args: []const Value) VmError!Value {
 /// by bytes; chars by scalar; false before true; vectors by count
 /// then elementwise. Comparing different kinds is a
 /// `KindMismatch`.
-pub fn compareValues(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
+fn compareValues(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
     const ka = a.kind();
     const kb = b.kind();
     if (ka == .nil and kb == .nil) return .eq;
@@ -2185,7 +2180,7 @@ fn fnHash(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromFixnum(@intCast(h & @as(u64, @intCast(value_mod.fixnum_max)))).?;
 }
 
-fn interned_name(vm: *VM, v: Value) VmError![]const u8 {
+fn internedName(vm: *VM, v: Value) VmError![]const u8 {
     return switch (v.kind()) {
         .keyword => vm.ensureInterner().keywordName(v.asKeywordId()),
         .symbol => vm.ensureInterner().symbolName(v.asSymbolId()),
@@ -2198,7 +2193,7 @@ fn interned_name(vm: *VM, v: Value) VmError![]const u8 {
 /// its own name.
 fn fnName(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .string) return args[0];
-    const full = try interned_name(vm, args[0]);
+    const full = try internedName(vm, args[0]);
     const local = if (std.mem.indexOfScalar(u8, full, '/')) |i| full[i + 1 ..] else full;
     return string_mod.fromBytes(vm.ensureHeap(), local) catch VmError.OutOfMemory;
 }
@@ -2207,13 +2202,13 @@ fn fnName(vm: *VM, args: []const Value) VmError!Value {
 /// or symbol.
 fn fnKeyword(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .keyword) return args[0];
-    const text = try interned_name(vm, args[0]);
+    const text = try internedName(vm, args[0]);
     return vm.ensureInterner().internKeywordValue(text) catch VmError.OutOfMemory;
 }
 
 fn fnSymbol(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .symbol) return args[0];
-    const text = try interned_name(vm, args[0]);
+    const text = try internedName(vm, args[0]);
     return vm.ensureInterner().internSymbolValue(text) catch VmError.OutOfMemory;
 }
 
@@ -2428,13 +2423,19 @@ fn fnDbRefQ(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(args[0].kind() == .durable_ref);
 }
 
-/// `(db/put-key! ref value)` — auto-ephemeral write tx for v1.alpha.
-fn fnDbPutKey(vm: *VM, args: []const Value) VmError!Value {
-    const r = args[0];
-    const v = args[1];
+/// The open connection a durable ref belongs to.
+fn liveConnOf(vm: *VM, r: Value) VmError!*db_mod.Connection {
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
     const conn = db_mod.refConn(r) orelse return vm.throwKeyword("db/no-connection");
     if (!conn.open_flag) return VmError.DbClosed;
+    return conn;
+}
+
+/// `(db/put-key! ref value)` — one write transaction around one put.
+fn fnDbPutKey(vm: *VM, args: []const Value) VmError!Value {
+    const r = args[0];
+    const v = args[1];
+    const conn = try liveConnOf(vm, r);
     var txn = db_mod.beginWrite(conn) catch |err| return dbFailure(vm, err);
     db_mod.putRef(&txn, r, v) catch |err| {
         db_mod.abortWrite(&txn);
@@ -2444,13 +2445,12 @@ fn fnDbPutKey(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.nilValue();
 }
 
-/// `(db/get-key ref)` or `(db/get-key ref default)` — auto-ephemeral read tx.
+/// `(db/get-key ref)` or `(db/get-key ref default)` — one read
+/// transaction around one get.
 fn fnDbGetKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const default = if (args.len > 1) args[1] else value_mod.nilValue();
-    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return vm.throwKeyword("db/no-connection");
-    if (!conn.open_flag) return VmError.DbClosed;
+    const conn = try liveConnOf(vm, r);
     var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
     defer db_mod.abortRead(&txn);
     const result = db_mod.getRef(&txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
@@ -2459,9 +2459,7 @@ fn fnDbGetKey(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnDbDeleteKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
-    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return vm.throwKeyword("db/no-connection");
-    if (!conn.open_flag) return VmError.DbClosed;
+    const conn = try liveConnOf(vm, r);
     var txn = db_mod.beginWrite(conn) catch |err| return dbFailure(vm, err);
     const existed = db_mod.delRef(&txn, r) catch |err| {
         db_mod.abortWrite(&txn);
@@ -2473,9 +2471,7 @@ fn fnDbDeleteKey(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
-    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return vm.throwKeyword("db/no-connection");
-    if (!conn.open_flag) return VmError.DbClosed;
+    const conn = try liveConnOf(vm, r);
     var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
     defer db_mod.abortRead(&txn);
     const tree = db_mod.refTreeName(r);
@@ -2524,6 +2520,28 @@ fn writeTxnHandle(v: Value) ?*WriteTxnHandle {
 fn readTxnHandle(v: Value) ?*ReadTxnHandle {
     if (v.kind() != .db_read_txn) return null;
     return @ptrFromInt(v.payload);
+}
+
+/// A transaction Value of either kind that is still open.
+const ActiveTxn = union(enum) {
+    write: *WriteTxnHandle,
+    read: *ReadTxnHandle,
+};
+
+fn activeTxn(v: Value) VmError!ActiveTxn {
+    switch (v.kind()) {
+        .db_write_txn => {
+            const h = writeTxnHandle(v).?;
+            if (!h.active) return VmError.TxClosed;
+            return .{ .write = h };
+        },
+        .db_read_txn => {
+            const h = readTxnHandle(v).?;
+            if (!h.active) return VmError.TxClosed;
+            return .{ .read = h };
+        },
+        else => return VmError.KindMismatch,
+    }
 }
 
 fn fnDbBeginWrite(vm: *VM, args: []const Value) VmError!Value {
@@ -2604,18 +2622,8 @@ fn fnDbGet(vm: *VM, args: []const Value) VmError!Value {
     const r = args[1];
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const result: ?Value = switch (tx_v.kind()) {
-        .db_write_txn => blk: {
-            const h = writeTxnHandle(tx_v).?;
-            if (!h.active) return VmError.TxClosed;
-            break :blk db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
-        },
-        .db_read_txn => blk: {
-            const h = readTxnHandle(tx_v).?;
-            if (!h.active) return VmError.TxClosed;
-            break :blk db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
-        },
-        else => return VmError.KindMismatch,
+    const result: ?Value = switch (try activeTxn(tx_v)) {
+        inline else => |h| db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err),
     };
     return result orelse default;
 }
@@ -2643,8 +2651,7 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     return switch (x.kind()) {
         .durable_ref => blk: {
-            const conn = db_mod.refConn(x) orelse return vm.throwKeyword("db/no-connection");
-            if (!conn.open_flag) return VmError.DbClosed;
+            const conn = try liveConnOf(vm, x);
             var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
             defer db_mod.abortRead(&txn);
             const result = db_mod.getRef(&txn, x, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
@@ -2705,26 +2712,12 @@ const TreeCursor = struct {
     /// exist, which every caller treats as an empty tree.
     fn open(vm: *VM, tx_v: Value, tree_name: []const u8) VmError!?TreeCursor {
         const Resolved = struct { conn: *db_mod.Connection, inner: *emdb_mod.Txn, tree_id: ?emdb_mod.TreeId };
-        const r: Resolved = switch (tx_v.kind()) {
-            .db_write_txn => blk: {
-                const h = writeTxnHandle(tx_v).?;
-                if (!h.active) return VmError.TxClosed;
-                break :blk .{
-                    .conn = h.txn.conn,
-                    .inner = h.txn.inner,
-                    .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err),
-                };
+        const r: Resolved = switch (try activeTxn(tx_v)) {
+            inline else => |h| .{
+                .conn = h.txn.conn,
+                .inner = h.txn.inner,
+                .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err),
             },
-            .db_read_txn => blk: {
-                const h = readTxnHandle(tx_v).?;
-                if (!h.active) return VmError.TxClosed;
-                break :blk .{
-                    .conn = h.txn.conn,
-                    .inner = h.txn.inner,
-                    .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err),
-                };
-            },
-            else => return VmError.KindMismatch,
         };
         const tree_id = r.tree_id orelse return null;
         const cursor = r.inner.openCursorForTree(tree_id) catch |err| return dbFailure(vm, err);
