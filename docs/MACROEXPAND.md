@@ -501,9 +501,19 @@ pub const ExpandError = error{
     ExpansionDepthExceeded,     // → CompileError.MacroDepthExceeded
     MalformedMacroCall,         // → CompileError.MacroExpansionFailure
     MacroReturnedNull,          // → CompileError.MacroExpansionFailure
+    RequiredFileFailed,         // → CompileError.RequiredFileFailed
+    ControlTransferred,         // → CompileError.ControlTransferred
     OutOfMemory,                // → CompileError.OutOfMemory
 };
 ```
+
+`RequiredFileFailed` and `ControlTransferred` are not expansion
+errors: they are what the loader returns when a `require` ran a
+file whose form failed (with no handler in force, or with the
+running program's handler taking its throw), passed through under
+their own names so that `eval` and the CLI report a runtime
+failure as one (COMPILER.md §7, TOOLING.md §1). A file that could
+not be found, read or compiled is a malformed `require`.
 
 `MacroDepthExceeded` is distinct because infinite expansion is a
 common enough failure mode to warrant its own test category. Every

@@ -40,7 +40,14 @@ nexis: test/golden/cli/divide-by-zero.nx:5:4: runtime error: DivideByZero
 - The REPL reports under `<repl>` and keeps every line's source,
   so a function defined on one line and failing on a later one
   points into the line that defined it. A file loaded by `require`
-  reports under its own path.
+  reports under its own path, its top-level forms as `<top>`. The
+  file runs while the requiring form is being compiled, so when a
+  form of the file fails with no handler in force the report is
+  this one (exit 5), not a compile error's, and the chain ends at
+  the file's `<top>`: the requiring form was not running. A file
+  required through `eval` runs inside the program, so its frames
+  sit above the caller's and a handler in the caller takes its
+  throw (`test/golden/cli/require-runtime-error.nx`).
 - A routine without a span table (one built from hand-written
   bytecode) is listed by name alone; when the innermost frame has
   none the header carries no position.

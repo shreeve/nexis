@@ -35,6 +35,7 @@ const champ_mod = @import("champ");
 const stdlib = @import("stdlib");
 const string_mod = @import("string");
 const format_mod = @import("format");
+const loader_mod = @import("loader");
 
 const testing = std.testing;
 
@@ -4317,6 +4318,147 @@ test "between runs the top frame rests on the idle routine, so a collection is s
     program.v.collectGarbage();
     const after = try program.run("(count xs)");
     try testing.expectEqual(@as(i64, 3), after.asFixnum());
+}
+
+// =============================================================================
+// `require` through the loader (TOOLING.md §1, VM.md §13)
+// =============================================================================
+
+/// A temporary directory of `.nx` files and a Loader over it,
+/// attached to `program` as its load callback.
+const RequireDir = struct {
+    tmp: std.testing.TmpDir,
+    dir_path: []u8,
+    load_paths: [1][]const u8,
+    loader: loader_mod.Loader,
+
+    fn init(self: *RequireDir, program: *Program, files: []const [2][]const u8) !void {
+        self.tmp = std.testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        self.dir_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{self.tmp.sub_path});
+        errdefer testing.allocator.free(self.dir_path);
+        const io = std.testing.io;
+        for (files) |f| {
+            const path = try std.fs.path.join(testing.allocator, &.{ self.dir_path, f[0] });
+            defer testing.allocator.free(path);
+            const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+            defer file.close(io);
+            try file.writeStreamingAll(io, f[1]);
+        }
+        self.load_paths = .{self.dir_path};
+        self.loader = loader_mod.Loader.init(
+            testing.allocator,
+            program.v.runtime_arena.allocator(),
+            io,
+            &self.load_paths,
+            &program.v,
+            program.interner,
+            program.registry,
+            &program.host_macros,
+        );
+        program.hooks.load_callback = self.callback();
+    }
+
+    fn callback(self: *RequireDir) expand_mod.LoadCallback {
+        return .{ .user_data = @ptrCast(&self.loader), .load = &loader_mod.Loader.loadCallback };
+    }
+
+    fn deinit(self: *RequireDir) void {
+        self.loader.deinit();
+        testing.allocator.free(self.dir_path);
+        self.tmp.cleanup();
+    }
+
+    /// Compile `src` (one form) with the loader in place, so a
+    /// `require` in it runs while the form is being compiled.
+    fn compileOne(self: *RequireDir, program: *Program, src: []const u8) !compile.Compiled {
+        var parse_result = try reader_mod.parser.parseProgram(testing.allocator, src);
+        defer parse_result.parser.deinit();
+        var rdr = reader_mod.Reader.init(testing.allocator, src);
+        defer rdr.deinit();
+        const forms = try rdr.readProgram(parse_result.sexp);
+        return compile.compileFormWith(program.arena.allocator(), forms[0], .{
+            .namespace = program.registry.current,
+            .interner = program.interner,
+            .host_macros = &program.host_macros,
+            .persistent_allocator = program.v.runtime_arena.allocator(),
+            .registry = program.registry,
+            .load_callback = self.callback(),
+        });
+    }
+};
+
+const throwsns = [2][]const u8{ "throwsns.nx", "(ns throwsns)\n(throw :boom)\n" };
+const badns = [2][]const u8{ "badns.nx", "(ns badns)\n(defn f [] (/ 1 0))\n(f)\n" };
+
+test "require: a required file's throw that the caller's handler takes reaches that handler through eval" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var files: RequireDir = undefined;
+    try files.init(&program, &.{throwsns});
+    defer files.deinit();
+    const caught = try program.run("(try (eval '(require 'throwsns)) (catch any e [:caught e]))");
+    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
+    defer buf.deinit();
+    try formatValue(&buf, caught, program.interner);
+    try testing.expectEqualStrings("[:caught :boom]", buf.items);
+    try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.handlers.items.len);
+    // The file's throw left nothing behind; the program goes on.
+    try testing.expectEqual(@as(i64, 3), (try program.run("(+ 1 2)")).asFixnum());
+}
+
+test "require: a required file's runtime error reached through eval leaves with the whole chain located" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var files: RequireDir = undefined;
+    try files.init(&program, &.{badns});
+    defer files.deinit();
+    try testing.expectError(vm.VmError.DivideByZero, program.run("(defn g [] (eval '(require 'badns)))\n(g)"));
+    const trace = program.v.error_trace.items;
+    try testing.expect(trace.len >= 3);
+    try testing.expectEqualStrings("f", trace[0].name);
+    try testing.expectEqualStrings("<top>", trace[1].name);
+    try testing.expectEqualStrings("g", trace[2].name);
+    const src = trace[0].source orelse return error.TestFailed;
+    try testing.expect(std.mem.endsWith(u8, src.path, "badns.nx"));
+    try testing.expect(trace[1].source == src);
+    const loc = src.lineCol(trace[0].span.?.pos);
+    try testing.expectEqual(@as(u32, 2), loc.line);
+    try testing.expectEqual(@as(u32, 12), loc.col);
+    try testing.expectEqualStrings("(/ 1 0)", src.text[trace[0].span.?.pos .. trace[0].span.?.pos + trace[0].span.?.len]);
+    program.v.resetAfterError();
+    try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+}
+
+test "require: a required file that fails while a form is compiled is a runtime failure with its trace, not a compile error" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var files: RequireDir = undefined;
+    try files.init(&program, &.{ badns, throwsns });
+    defer files.deinit();
+
+    try testing.expectError(compile.CompileError.RequiredFileFailed, files.compileOne(&program, "(require 'badns)"));
+    try testing.expectEqual(vm.VmError.DivideByZero, program.v.traced_error.?);
+    var trace = program.v.error_trace.items;
+    try testing.expectEqual(@as(usize, 2), trace.len);
+    try testing.expectEqualStrings("f", trace[0].name);
+    try testing.expectEqualStrings("<top>", trace[1].name);
+    try testing.expect(trace[0].span != null and trace[0].source != null);
+    program.v.resetAfterError();
+
+    try testing.expectError(compile.CompileError.RequiredFileFailed, files.compileOne(&program, "(require 'throwsns)"));
+    try testing.expectEqual(vm.VmError.UncaughtThrow, program.v.traced_error.?);
+    trace = program.v.error_trace.items;
+    try testing.expectEqual(@as(usize, 1), trace.len);
+    try testing.expectEqualStrings("<top>", trace[0].name);
+    program.v.resetAfterError();
+
+    // The VM is ready for the next form.
+    try testing.expectEqual(@as(i64, 3), (try program.run("(+ 1 2)")).asFixnum());
 }
 
 test "runtime errors: resetAfterError leaves the VM ready for the next form" {

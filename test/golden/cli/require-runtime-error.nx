@@ -1,0 +1,6 @@
+; A runtime error inside a required file: the file ran while this
+; form was being compiled, so the report is the runtime error's,
+; under the file's own path, and the chain ends at that file's
+; top-level form.
+
+(require '[lib.failing :as f])

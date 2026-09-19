@@ -52,8 +52,18 @@ pub const LoadError = error{
     /// the requested namespace name. Catches typos and rename
     /// errors early.
     NamespaceMismatch,
-    /// Underlying compile / parse / runtime error during load.
+    /// The file did not parse, read or compile.
     LoadCompileFailed,
+    /// A form of the file failed at run time with no handler in
+    /// force anywhere; the VM's `traced_error` names the error and
+    /// its `error_trace` locates it.
+    RunFailed,
+    /// A form of the file threw and a handler in the program that
+    /// required it took the throw: the VM has already unwound to
+    /// that handler. Passed through unchanged by everything between
+    /// the loader and the VM, as every caller of `callValue` passes
+    /// it (VM.md §13).
+    ControlTransferred,
     OutOfMemory,
 };
 
@@ -136,14 +146,15 @@ pub const Loader = struct {
         const path = file_path orelse return LoadError.FileNotFound;
         defer self.allocator.free(path);
 
-        // Read the file source via Zig 0.16 std.Io.Dir API.
+        // The text and the path outlive the load: every routine
+        // compiled from the file points at them for its error
+        // reports (TOOLING.md §1).
         const source = std.Io.Dir.cwd().readFileAlloc(
             self.io,
             path,
-            self.allocator,
+            self.persistent_allocator,
             .limited(16 * 1024 * 1024),
         ) catch return LoadError.FileReadError;
-        defer self.allocator.free(source);
 
         // Dupe ns_name into a stable storage so `loaded` set
         // entries outlive the requesting expander's call (the
@@ -168,7 +179,6 @@ pub const Loader = struct {
     }
 
     fn evalFile(self: *Loader, ns_name: []const u8, source: []const u8, path: []const u8) LoadError!void {
-        _ = path;
         var parse_result = reader_mod.parser.parseProgram(self.allocator, source) catch return LoadError.LoadCompileFailed;
         defer parse_result.parser.deinit();
         var rdr = reader_mod.Reader.init(self.allocator, source);
@@ -189,35 +199,43 @@ pub const Loader = struct {
         defer declared.deinit();
         for (forms) |form| declared.declareForm(form) catch return LoadError.OutOfMemory;
 
+        const info = ra.create(vm_mod.SourceInfo) catch return LoadError.OutOfMemory;
+        info.* = .{
+            .path = ra.dupe(u8, path) catch return LoadError.OutOfMemory,
+            .text = source,
+        };
+
         for (forms) |form| {
             const current_ns = self.registry.current;
-            // Pass `self` as the load_callback
-            // so that `(require ...)` forms INSIDE the file we're
-            // loading work transitively. Without this, a required
-            // file's nested require would expand into UnboundVar /
-            // MacroExpansionFailure because the inner expander has
-            // no loader to dispatch to. Caught by the multi-file
-            // shapes demo (shapes-app.nx → records.nx → protocol.nx).
-            const compiled = compile_mod.compileFormFullWithMacrosSpanPersistentRegistryLoader(
-                ra,
-                form,
-                current_ns,
-                self.interner,
-                self.host_macros,
-                null,
-                ra,
-                self.registry,
-                .{ .user_data = @ptrCast(self), .load = &Loader.loadCallback },
-                &declared,
-            ) catch return LoadError.LoadCompileFailed;
+            // The loader is the form's load callback too, so a
+            // `(require ...)` inside the file resolves the same way.
+            const compiled = compile_mod.compileFormWith(ra, form, .{
+                .namespace = current_ns,
+                .interner = self.interner,
+                .host_macros = self.host_macros,
+                .persistent_allocator = ra,
+                .registry = self.registry,
+                .load_callback = .{ .user_data = @ptrCast(self), .load = &Loader.loadCallback },
+                .declared = &declared,
+                .source = info,
+            }) catch |err| return switch (err) {
+                error.OutOfMemory => LoadError.OutOfMemory,
+                error.ControlTransferred => LoadError.ControlTransferred,
+                error.RequiredFileFailed => LoadError.RunFailed,
+                else => LoadError.LoadCompileFailed,
+            };
             // A nested call, never a retarget of the top frame: the
             // VM may be executing the program that required us. The
             // routine lives in the persistent allocator because a run
             // that fails leaves its frame in place for the error
             // trace, and that frame must not point at a dead local.
             const routine = ra.create(vm_mod.Routine) catch return LoadError.OutOfMemory;
-            routine.* = compiled.toRoutine("loader");
-            _ = self.vm.runRoutine(routine) catch return LoadError.LoadCompileFailed;
+            routine.* = compiled.toRoutine("<top>");
+            _ = self.vm.runRoutine(routine) catch |err| return switch (err) {
+                error.OutOfMemory => LoadError.OutOfMemory,
+                error.ControlTransferred => LoadError.ControlTransferred,
+                else => LoadError.RunFailed,
+            };
         }
     }
 

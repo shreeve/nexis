@@ -782,8 +782,8 @@ closure that references the binding.
   `DuplicateParam`, `DuplicateBinding`, `RecurOutsideTail`,
   `RecurArityMismatch`, `UnsupportedFeature`, `ReaderFailure`,
   `MalformedForm`, `MacroDepthExceeded`, `MacroExpansionFailure`,
-  `ExpectedSymbol`, `ExpectedVector`, `InternalCompilerBug`,
-  `OutOfMemory`.
+  `RequiredFileFailed`, `ControlTransferred`, `ExpectedSymbol`,
+  `ExpectedVector`, `InternalCompilerBug`, `OutOfMemory`.
 - A **primary SrcSpan** in `CompileOptions.out_span`: the
   symbol's own span when lowering can locate it (the `LowerDiag`
   out-parameter), otherwise the macroexpanded form's. Forms a
@@ -795,7 +795,15 @@ Errors raised inside macro expansion are bucketed:
 everything else (a malformed macro call, a macro returning a
 non-Form, an integer literal out of range inside a macro
 argument). `MalformedForm` / `ExpectedSymbol` / `ExpectedVector`
-are lowering errors about special-form shape.
+are lowering errors about special-form shape. Two variants are
+not compile errors at all but the loader's run signals passed
+through under their own names (MACROEXPAND.md §8):
+`RequiredFileFailed`, a required file's form failed at run time
+with no handler in force (the VM's `traced_error` and
+`error_trace` carry it, and the CLI reports it as the runtime
+error it is), and `ControlTransferred`, a required file's throw
+that a handler in the running program took, which only `eval`
+can see and which it returns as the VM signal of the same name.
 
 There is no secondary span, no expansion-provenance chain and
 no structured error value for compile errors the CLI reports. A

@@ -1012,6 +1012,8 @@ pub fn build(b: *std.Build) void {
     integration_eval_mod.addImport("vector", vector_mod);
     integration_eval_mod.addImport("champ", champ_mod);
     integration_eval_mod.addImport("stdlib", stdlib_mod);
+    // `require` cases run a Loader over files in a temporary directory.
+    integration_eval_mod.addImport("loader", loader_mod);
     // formatValue prints strings via string.asBytes.
     integration_eval_mod.addImport("string", string_mod);
     // integration tests delegate
@@ -1363,6 +1365,7 @@ pub fn build(b: *std.Build) void {
         const cases = [_]CliGolden{
             .{ .file = "test/golden/cli/divide-by-zero.nx", .expected = "divide-by-zero.err", .stream = .stderr, .exit_code = 5 },
             .{ .file = "test/golden/cli/uncaught-throw.nx", .expected = "uncaught-throw.err", .stream = .stderr, .exit_code = 5 },
+            .{ .file = "test/golden/cli/require-runtime-error.nx", .expected = "require-runtime-error.err", .stream = .stderr, .exit_code = 5 },
             .{ .verb = "disasm", .file = "examples/sum10.nx", .expected = "sum10.disasm" },
             .{ .file = "test/golden/cli/pprint.nx", .expected = "pprint.out" },
         };

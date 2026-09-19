@@ -1,0 +1,5 @@
+(ns lib.failing)
+
+(defn boom [x] (/ x 0))
+
+(boom 1)

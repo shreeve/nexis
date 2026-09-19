@@ -521,6 +521,18 @@ pub const CompileError = error{
     /// form's span.
     MacroExpansionFailure,
 
+    /// A `require` in the form ran a file whose form failed at run
+    /// time with no handler in force. The failure is a runtime
+    /// error, not a compile error: the VM's `traced_error` names
+    /// it and `error_trace` locates it (TOOLING.md §1).
+    RequiredFileFailed,
+
+    /// A `require` in the form ran a file whose form threw, and a
+    /// handler in the running program took the throw: the VM has
+    /// already unwound to that handler. Reaches only `eval`, which
+    /// returns it as the VM signal of the same name.
+    ControlTransferred,
+
     /// A position required a symbol but got something else
     /// (e.g., `(let* [1 2] body)` — binding name `1` is not
     /// a symbol; `(def 42 ...)` — def name `42` is not a
@@ -2396,7 +2408,16 @@ pub const RuntimeHooks = struct {
             .registry = self.registry,
             .load_callback = self.load_callback,
             .declared = &declared,
-        }) catch |err| return compileFailure(v, err, @errorName(err), form_value);
+        }) catch |err| switch (err) {
+            // A required file's throw that the caller's handler took:
+            // the VM is already at the handler.
+            error.ControlTransferred => return vm.VmError.ControlTransferred,
+            // A required file's form failed with no handler anywhere;
+            // its frames are still in place above this call, so the
+            // error leaves through the run loop with the full chain.
+            error.RequiredFileFailed => return v.traced_error orelse vm.VmError.UncaughtThrow,
+            else => return compileFailure(v, err, @errorName(err), form_value),
+        };
         const routine = persistent.create(vm.Routine) catch return vm.VmError.OutOfMemory;
         routine.* = compiled.toRoutine("<eval>");
         return v.runRoutine(routine);
@@ -2459,6 +2480,7 @@ pub fn compileFormFull(
 /// the form is run through the macroexpander BEFORE lowering.
 /// Macro errors are bucketed per `ExpandError`:
 ///   ExpansionDepthExceeded → CompileError.MacroDepthExceeded
+///   RequiredFileFailed / ControlTransferred → the same names
 ///   everything else        → CompileError.MacroExpansionFailure
 ///
 /// Without either, behavior is identical to `compileFormFull`
@@ -2661,6 +2683,11 @@ pub fn compileFormWith(
                 if (out_span) |s| s.* = form.origin;
                 return CompileError.MacroExpansionFailure;
             },
+            error.RequiredFileFailed => {
+                if (out_span) |s| s.* = form.origin;
+                return CompileError.RequiredFileFailed;
+            },
+            error.ControlTransferred => return CompileError.ControlTransferred,
             error.OutOfMemory => return CompileError.OutOfMemory,
         };
     }

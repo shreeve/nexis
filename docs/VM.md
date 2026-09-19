@@ -1089,8 +1089,13 @@ increments before it dispatches), that instruction's span from
 the routine's table (null without one) and the routine's
 `source`. Neither an untranslated `VmError` nor an uncaught throw
 pops a frame, so the chain is complete, including the frames
-`callValue` pushed for a closure a native called back. The trace
-is rebuilt by the next failing run. `resetAfterError` discards
+`callValue` pushed for a closure a native called back. A parked
+top frame (one resting on `idle_routine`) is not part of any run
+and is left out. `VM.traced_error` names the error the trace was
+recorded for. `runRoutine` records the same way when a nested run
+fails, so a host that learns of the failure indirectly (the loader
+ran a required file while a form was being compiled) reports it
+with its chain. The trace is rebuilt by the next failing run. `resetAfterError` discards
 what the failed run left (the frames above the top-level one,
 handlers, pending finallys, the unhandled throw) so `retargetTop`
 can run the next form; the CLI's REPL calls it after reporting.

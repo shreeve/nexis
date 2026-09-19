@@ -66,6 +66,14 @@ pub const ExpandError = error{
     ExpansionDepthExceeded,
     MalformedMacroCall,
     MacroReturnedNull,
+    /// A `require` ran a file whose form failed at run time with no
+    /// handler in force; the VM's `traced_error` and `error_trace`
+    /// carry the failure.
+    RequiredFileFailed,
+    /// A `require` ran a file whose form threw, and a handler in
+    /// the running program took the throw; the VM has already
+    /// unwound to it. Passed through unchanged.
+    ControlTransferred,
     OutOfMemory,
 };
 
@@ -1373,7 +1381,7 @@ fn expandRequire(
         switch (spec.datum) {
             .symbol => |sym| {
                 if (sym.ns != null) return ExpandError.MalformedMacroCall;
-                cb.load(cb.user_data, sym.name) catch return ExpandError.MalformedMacroCall;
+                cb.load(cb.user_data, sym.name) catch |err| return loadFailure(err);
             },
             .vector => |elems| {
                 if (elems.len < 1) return ExpandError.MalformedMacroCall;
@@ -1402,7 +1410,7 @@ fn expandRequire(
                         return ExpandError.MalformedMacroCall;
                     }
                 }
-                cb.load(cb.user_data, ns_name) catch return ExpandError.MalformedMacroCall;
+                cb.load(cb.user_data, ns_name) catch |err| return loadFailure(err);
                 if (alias_name) |an| {
                     reg.current.putAlias(an, ns_name) catch return ExpandError.OutOfMemory;
                 }
@@ -1413,8 +1421,19 @@ fn expandRequire(
     return try makeNil(ctx, list_form.origin);
 }
 
-/// Unwrap one level of `(quote X)` from a Form. Returns X if
-/// the form is a quote; else returns the form unchanged.
+/// What a load callback's failure means to the expander: the two
+/// signals of a file that ran and failed pass through under their
+/// own names; a file that could not be found, read or compiled is
+/// a malformed `require`.
+fn loadFailure(err: anyerror) ExpandError {
+    return switch (err) {
+        error.OutOfMemory => ExpandError.OutOfMemory,
+        error.RunFailed => ExpandError.RequiredFileFailed,
+        error.ControlTransferred => ExpandError.ControlTransferred,
+        else => ExpandError.MalformedMacroCall,
+    };
+}
+
 /// The form under one level of quoting: the reader's `'x` datum or
 /// the written-out `(quote x)`; any other form is itself.
 fn unwrapQuote(form: *const Form) *const Form {

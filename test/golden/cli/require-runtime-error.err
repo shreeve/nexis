@@ -1,0 +1,5 @@
+nexis: test/golden/cli/lib/failing.nx:3:16: runtime error: DivideByZero
+    (defn boom [x] (/ x 0))
+                   ^^^^^^^
+  at boom (test/golden/cli/lib/failing.nx:3:16)
+  at <top> (test/golden/cli/lib/failing.nx:5:1)

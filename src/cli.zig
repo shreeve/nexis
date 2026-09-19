@@ -140,6 +140,19 @@ fn emitCompileError(
     }
 }
 
+/// Report a compile failure and return the exit code it carries:
+/// 4 at its span, or 5 when a `require` inside the form ran a
+/// file whose form failed at run time, which is reported as the
+/// runtime error it is, with the trace the failed run left.
+fn reportCompileFailure(rt: *Runtime, io: std.Io, path: []const u8, source: []const u8, err: anyerror, maybe_span: ?reader_mod.SrcSpan) !u8 {
+    if (err == compile.CompileError.RequiredFileFailed) {
+        try rt.reportRuntimeError(io, rt.v.traced_error orelse err);
+        return 5;
+    }
+    try emitCompileError(io, path, source, err, maybe_span);
+    return 4;
+}
+
 /// Report a parse failure at the token the parser stopped on:
 ///
 ///   nexis: <path>:<line>:<col>: parse error: unexpected `)`
@@ -223,9 +236,6 @@ const math_source = vm.SourceInfo{ .path = "math.nx", .text = stdlib.MATH_NX_SOU
 
 /// The routine the VM is created around; `retargetTop` replaces it
 /// before anything runs.
-const stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-const stub_routine = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-
 /// A VM with `nexis.core`, `db`, `nexis.string`, `nexis.internal`,
 /// `nexis.math` and `nextomic` installed, the embedded core.nx,
 /// nextomic.nx, test.nx, pprint.nx and math.nx bootstrapped into
@@ -332,7 +342,7 @@ const Runtime = struct {
 /// Build a `Runtime` in place. `load_paths` must outlive it.
 fn bootRuntime(rt: *Runtime, io: std.Io, allocator: std.mem.Allocator, load_paths: []const []const u8) !void {
     rt.allocator = allocator;
-    rt.v = try vm.VM.init(allocator, &stub_routine);
+    rt.v = try vm.VM.init(allocator, &vm.VM.idle_routine);
     errdefer rt.v.deinit();
     // `(db/open path)` creates the path's parent directories through
     // the CLI's std.Io; emdb itself does not.
@@ -502,7 +512,7 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         };
         var error_span: ?reader_mod.SrcSpan = null;
         const compiled = compile.compileFormWith(rt.persistent(), form, rt.compileOptions(&error_span, &declared, line_source)) catch |err| {
-            try emitCompileError(io, "<repl>", src, err, error_span);
+            _ = try reportCompileFailure(&rt, io, "<repl>", src, err, error_span);
             // A `require` inside the form may have run a file whose
             // form failed; that run's frames must not leak either.
             rt.v.resetAfterError();
@@ -585,8 +595,7 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     for (forms) |form| {
         var error_span: ?reader_mod.SrcSpan = null;
         const compiled = compile.compileFormWith(compile_arena.allocator(), form, rt.compileOptions(&error_span, &declared, &file_source)) catch |err| {
-            try emitCompileError(io, path, source, err, error_span);
-            std.process.exit(4);
+            std.process.exit(try reportCompileFailure(&rt, io, path, source, err, error_span));
         };
         last_result = rt.runCompiled(compiled) catch |err| {
             try rt.reportRuntimeError(io, err);
@@ -654,8 +663,7 @@ fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     for (forms, 0..) |form, i| {
         var error_span: ?reader_mod.SrcSpan = null;
         const compiled = compile.compileFormWith(compile_arena.allocator(), form, rt.compileOptions(&error_span, &declared, &file_source)) catch |err| {
-            try emitCompileError(io, path, source, err, error_span);
-            std.process.exit(4);
+            std.process.exit(try reportCompileFailure(&rt, io, path, source, err, error_span));
         };
         const routine = compiled.toRoutine("<top>");
         if (i > 0) try out.writer.writeAll("\n");

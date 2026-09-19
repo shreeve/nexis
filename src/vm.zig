@@ -1567,6 +1567,10 @@ pub const VM = struct {
     /// first; each entry names the routine and the instruction it was
     /// executing. Rebuilt on every failing run.
     error_trace: std.ArrayList(TraceFrame) = .empty,
+    /// The error `error_trace` was recorded for, so a host that
+    /// learns of the failure indirectly (a `require` whose file
+    /// failed while a form was being compiled) can still name it.
+    traced_error: ?VmError = null,
     /// Shared Interner for symbol/keyword Value construction,
     /// initialized on first access. Backed by `self.allocator`
     /// (not `runtime_arena`) because its hash maps need realloc
@@ -2331,7 +2335,10 @@ pub const VM = struct {
             .pc = 0,
             .host_result = &result_cell,
         });
-        try self.runUntilDepth(initial_depth);
+        self.runUntilDepth(initial_depth) catch |err| {
+            self.recordErrorTrace(err);
+            return err;
+        };
         if (!result_cell.done) return VmError.ControlTransferred;
         return result_cell.value;
     }
@@ -2610,25 +2617,29 @@ pub const VM = struct {
     /// the frame chain in `error_trace` first.
     pub fn run(self: *VM) VmError!Value {
         const result = self.runLoop() catch |err| {
-            self.recordErrorTrace();
+            self.recordErrorTrace(err);
             return err;
         };
         self.frames.items[0].routine = &idle_routine;
         return result;
     }
 
-    /// Where an error left the run: every frame, innermost first,
-    /// with the instruction it was executing. Every frame's `pc` is
+    /// Where `err` left the run: every frame, innermost first, with
+    /// the instruction it was executing. Every frame's `pc` is
     /// already past that instruction (the loop increments before it
     /// dispatches), so the failing index is `pc - 1`. Frames are
     /// intact here: an uncaught throw and an untranslated `VmError`
-    /// both leave the chain as it was.
-    fn recordErrorTrace(self: *VM) void {
+    /// both leave the chain as it was. A parked top frame (one
+    /// resting on `idle_routine`) is not part of any run and is
+    /// left out.
+    fn recordErrorTrace(self: *VM, err: VmError) void {
         self.error_trace.clearRetainingCapacity();
+        self.traced_error = err;
         var i = self.frames.items.len;
         while (i > 0) {
             i -= 1;
             const f = self.frames.items[i];
+            if (f.routine == &idle_routine) continue;
             const pc: u32 = if (f.pc > 0) f.pc - 1 else 0;
             self.error_trace.append(self.allocator, .{
                 .name = f.routine.name,
