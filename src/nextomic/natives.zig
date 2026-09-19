@@ -263,13 +263,6 @@ fn detailOf(vm: *VM, conn: *Conn, fault: *const Fault) Detail {
     return d;
 }
 
-/// Surface an error from an operation on the connection or db-value
-/// `target` that filled `fault`.
-fn failFault(vm: *VM, target: Value, err: anyerror, fault: *const Fault) VmError {
-    const c = connOf(target) catch (dbOf(target) catch return fail(vm, err)).conn;
-    return failWith(vm, err, detailOf(vm, c, fault));
-}
-
 // =============================================================================
 // Connections
 // =============================================================================
@@ -412,14 +405,15 @@ const Scope = struct {
     }
 };
 
-/// The `NativeFn.call` of a native that fills a `Fault`: the fault's
-/// detail travels with the error, rendered through the connection of
-/// the handle in `args[0]`.
+/// The `NativeFn.call` of a native that leaves a `Detail` on failure:
+/// the detail travels with the error. The native renders its `Fault`
+/// into the detail with `detailOf` before the memory the fault's value
+/// lives in goes away.
 fn wrap(comptime native: anytype) fn (*VM, []const Value) VmError!Value {
     return struct {
         fn call(vm: *VM, args: []const Value) VmError!Value {
-            var fault: Fault = .{};
-            return native(vm, args, &fault) catch |err| failFault(vm, args[0], err, &fault);
+            var detail: Detail = .{};
+            return native(vm, args, &detail) catch |err| failWith(vm, err, detail);
         }
     }.call;
 }
@@ -480,12 +474,15 @@ const Builder = struct {
 
 const fnTransact = wrap(transactNative);
 
-fn transactNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
+fn transactNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     const c = try openConn(args[0]);
-    var options: transact_mod.Options = .{ .fault = fault };
+    var fault: Fault = .{};
+    var options: transact_mod.Options = .{ .fault = &fault };
     if (args.len == 3) options.sync = try syncOption(vm, args[2]);
     var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
     defer arena_state.deinit();
+    // The fault's value lives in the arena: rendered before the arena goes.
+    errdefer detail.* = detailOf(vm, c, &fault);
     const arena = arena_state.allocator();
 
     const report = try transact_mod.transact(c, arena, args[1], options);
@@ -531,15 +528,18 @@ const fnWith = wrap(withNative);
 /// propagates after the abort. The view goes on the VM state, since
 /// `db-after` and every db-value derived from it name it; the scope's
 /// scratch is freed on return.
-fn withNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
+fn withNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     const c = try openConn(args[0]);
     const f = args[2];
     const st = try state(vm);
     try st.views.ensureUnusedCapacity(vm.allocator, 1);
+    var fault: Fault = .{};
     var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
     defer arena_state.deinit();
+    // The fault's value lives in the arena: rendered before the arena goes.
+    errdefer detail.* = detailOf(vm, c, &fault);
     const arena = arena_state.allocator();
-    const w = try transact_mod.with(c, arena, args[1], .{ .fault = fault });
+    const w = try transact_mod.with(c, arena, args[1], .{ .fault = &fault });
     st.views.appendAssumeCapacity(w.view);
     defer w.finish();
 
@@ -595,12 +595,14 @@ const fnEntity = wrap(entityNative);
 
 /// `{:db/id e :attr v ...}` with card-many values as sets; nil when the
 /// entity has no datoms in this view.
-fn entityNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
+fn entityNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     var sc = try Scope.open(vm, args[0]);
     defer sc.close();
+    var fault: Fault = .{};
+    errdefer detail.* = detailOf(vm, sc.db.conn, &fault);
     if (sc.db.history) return error.HistoryView;
     const arena = sc.arena();
-    const e = (try marshal.entity(&sc.rd, arena, args[1], fault)) orelse return value.nilValue();
+    const e = (try marshal.entity(&sc.rd, arena, args[1], &fault)) orelse return value.nilValue();
     const b = &sc.b;
 
     var it = try sc.rd.scan(arena, .eavt, .{ .e = e });
@@ -634,10 +636,12 @@ fn entityNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
 
 const fnEntid = wrap(entidNative);
 
-fn entidNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
+fn entidNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     var sc = try Scope.open(vm, args[0]);
     defer sc.close();
-    const e = (try marshal.entity(&sc.rd, sc.arena(), args[1], fault)) orelse return value.nilValue();
+    var fault: Fault = .{};
+    errdefer detail.* = detailOf(vm, sc.db.conn, &fault);
+    const e = (try marshal.entity(&sc.rd, sc.arena(), args[1], &fault)) orelse return value.nilValue();
     return fixnum(e);
 }
 
@@ -671,9 +675,11 @@ const fnDatoms = wrap(datomsNative);
 
 /// `(datoms db index & components)`: components follow the index's
 /// order; nil leaves a position unbound and later ones filter.
-fn datomsNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
+fn datomsNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     var sc = try Scope.open(vm, args[0]);
     defer sc.close();
+    var fault: Fault = .{};
+    errdefer detail.* = detailOf(vm, sc.db.conn, &fault);
     const index = try indexOf(vm, args[1]);
     const arena = sc.arena();
     const b = &sc.b;
@@ -684,16 +690,16 @@ fn datomsNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
     for (args[2..], index.order()[0 .. args.len - 2]) |arg, c| {
         if (arg.isNil()) continue;
         switch (c) {
-            .e => comps.e = (try marshal.entity(&sc.rd, arena, arg, fault)) orelse return empty,
+            .e => comps.e = (try marshal.entity(&sc.rd, arena, arg, &fault)) orelse return empty,
             .a => {
-                attr = try marshal.attrOf(&sc.rd, arg, fault);
+                attr = try marshal.attrOf(&sc.rd, arg, &fault);
                 comps.a = attr.?.id;
             },
             .v => {
                 const val: Val = if (index == .vaet)
-                    .{ .ref = (try marshal.entity(&sc.rd, arena, arg, fault)) orelse return empty }
+                    .{ .ref = (try marshal.entity(&sc.rd, arena, arg, &fault)) orelse return empty }
                 else
-                    (try marshal.valOf(&sc.rd, arena, (attr orelse return error.ValueType).value_type, arg, fault)) orelse return empty;
+                    (try marshal.valOf(&sc.rd, arena, (attr orelse return error.ValueType).value_type, arg, &fault)) orelse return empty;
                 comps.v = try key.valBytes(arena, val);
             },
         }
