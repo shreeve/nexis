@@ -1,29 +1,12 @@
-//! nexis CLI — minimal source runner.
+//! nexis CLI: `nexis run FILE.nx` and `nexis repl`.
 //!
-//! Step H1 (peer-AI turn 55). Tiny integration-shell that lets
-//! users execute `.nx` source files without going through Zig
-//! tests. Deliberately small: no REPL, no module loading, no
-//! pretty diagnostics, no watch mode. Future scope (Phase 3):
-//! REPL via `nexis repl`, module loading via `:require`,
-//! structured error rendering with SrcSpans (step #10).
-//!
-//! Usage:
-//!   nexis run FILE.nx     read FILE, parse all top-level forms,
-//!                         compile + run each in order, print
-//!                         the final result.
-//!
-//! Pipeline:
-//!   source bytes
-//!   → parser.parseProgram → Sexp
-//!   → Reader.readProgram  → []const *Form
-//!   → for each form:
-//!       → compileFormFull (VM's ns + interner)
-//!       → VM.run
-//!   → print last result via formatValue
-//!
-//! Multi-form files work because the VM (and its namespace +
-//! interner) persists across iterations; each form re-uses the
-//! same frame, recycled by replacing routine + pc + slot_count.
+//! Both commands boot one `Runtime` (a VM with every namespace
+//! installed, the embedded core.nx and nextomic.nx bootstrapped,
+//! and a namespace loader for `require`), then compile and run
+//! top-level forms on it one at a time. Vars, the interner and
+//! runtime values persist across the forms of a file and across
+//! the lines of a REPL session because every form runs on the same
+//! VM through `VM.retargetTop`.
 
 const std = @import("std");
 const value_mod = @import("value");
@@ -32,21 +15,14 @@ const compile = @import("compile");
 const reader_mod = @import("reader");
 const intern_mod = @import("intern");
 const expand_mod = @import("expand");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ_mod = @import("champ");
 const stdlib = @import("stdlib");
 const loader_mod = @import("loader");
-const string_mod = @import("string");
 const format_mod = @import("format");
 
 const Value = value_mod.Value;
 
-/// Pretty-print a Value via the canonical `src/format.zig`
-/// formatter in display mode. Phase 5.2c extracted the per-kind
-/// switch into format.zig so cli.zig, the integration test
-/// harness, and `(str ...)` / `(print ...)` all share one
-/// source of truth.
+/// Print a Value the way `(print ...)` does, through the one
+/// formatter in `src/format.zig`.
 fn formatValue(v: Value, interner: *const intern_mod.Interner, writer: *std.Io.Writer) !void {
     try format_mod.format(v, .display, writer, interner);
 }
@@ -122,12 +98,9 @@ fn printUsage(io: std.Io) !void {
     try std.Io.File.stderr().writeStreamingAll(io, Usage);
 }
 
-/// Step #10.0: format a compile error with file:line:col +
-/// source-line caret. Closes COMPILER.md §9.4 gate item 5
-/// for compile-side errors (runtime VmError SrcSpans defer
-/// to post-gate).
+/// Report a compile error with file:line:col and a source-line
+/// caret:
 ///
-/// Format:
 ///   nexis: <path>:<line>:<col>: <ErrorKind>
 ///       <source line>
 ///       <spaces><caret>
@@ -200,55 +173,126 @@ fn lineAt(source: []const u8, line: u32) []const u8 {
     return "";
 }
 
-/// Step Phase-3.0a (peer-AI turn 62): interactive read-eval-
-/// print loop. One form per input line; persistent namespace +
-/// interner across iterations; errors print + continue (REPL
-/// never crashes on user code).
-///
-/// MVP scope (peer recommendation):
-///   - single-form-per-line (no multiline continuation in v1)
-///   - persistent ns/interner across the session
-///   - default macro table active
-///   - `:quit` / `:q` / EOF exits
-///   - errors caught + printed without exiting the loop
-/// Phase 3.3d (peer-AI turn 67 §3.3d): compile + evaluate the
-/// embedded `core.nx` source against the supplied VM. Each
-/// top-level form runs sequentially in a fresh stub frame, so
-/// `def`/`defn`/`defmacro` mutations land in `ns` and become
-/// visible to subsequent forms (and to user code that runs
-/// after bootstrap).
-///
-/// Errors here are FATAL — they indicate a bug in `core.nx`
-/// itself, not user code. We print and exit so the CLI doesn't
-/// silently come up with a half-loaded stdlib.
-fn bootstrapCoreNx(
-    v: *vm.VM,
-    ns: *vm.Namespace,
-    interner: *intern_mod.Interner,
+/// The routine the VM is created around; `retargetTop` replaces it
+/// before anything runs.
+const stub_code = [_]vm.Inst{vm.asm_.returnNil()};
+const stub_routine = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+
+/// A VM with `nexis.core`, `db`, `nexis.string`, `nexis.internal`
+/// and `nextomic` installed, the embedded core.nx and nextomic.nx
+/// bootstrapped into their namespaces, and a namespace loader
+/// that searches `load_paths` when `(require ...)` fires. The
+/// current namespace is `user`.
+const Runtime = struct {
     allocator: std.mem.Allocator,
-) !void {
-    try bootstrapEmbedded(v, ns, interner, allocator, stdlib.CORE_NX_SOURCE, "core.nx");
+    v: vm.VM,
+    host_macros: expand_mod.HostMacroTable,
+    loader: loader_mod.Loader,
+    interner: *intern_mod.Interner,
+    registry: *vm.NamespaceRegistry,
+
+    fn deinit(self: *Runtime) void {
+        self.loader.deinit();
+        self.host_macros.deinit(self.allocator);
+        self.v.deinit();
+    }
+
+    /// Where `defmacro` closures and bootstrap routines live: the
+    /// VM's runtime arena, so they outlive any per-form arena.
+    fn persistent(self: *Runtime) std.mem.Allocator {
+        return self.v.runtime_arena.allocator();
+    }
+
+    /// Everything the compiler needs from the runtime; `declared`
+    /// and `out_span` are per call.
+    fn compileOptions(self: *Runtime, out_span: ?*?reader_mod.SrcSpan, declared: ?*compile.DeclaredNames) compile.CompileOptions {
+        return .{
+            .namespace = self.registry.current,
+            .interner = self.interner,
+            .host_macros = &self.host_macros,
+            .out_span = out_span,
+            .persistent_allocator = self.persistent(),
+            .registry = self.registry,
+            .load_callback = .{ .user_data = @ptrCast(&self.loader), .load = &loader_mod.Loader.loadCallback },
+            .declared = declared,
+        };
+    }
+
+    /// Run one compiled top-level form on the VM.
+    fn runCompiled(self: *Runtime, compiled: compile.Compiled, label: []const u8) vm.VmError!Value {
+        const routine = compiled.toRoutine(label);
+        try self.v.retargetTop(&routine);
+        return self.v.run();
+    }
+
+    /// Print a runtime error and, for an uncaught throw, its payload.
+    fn reportRuntimeError(self: *Runtime, io: std.Io, err: anyerror) !void {
+        const stderr = std.Io.File.stderr();
+        try stderr.writeStreamingAll(io, "nexis: runtime error: ");
+        try stderr.writeStreamingAll(io, @errorName(err));
+        try stderr.writeStreamingAll(io, "\n");
+        if (err != vm.VmError.UncaughtThrow) return;
+        if (self.v.unhandled_throw) |payload| {
+            var buf: [4096]u8 = undefined;
+            var stream = std.Io.Writer.fixed(&buf);
+            if (formatValue(payload, self.interner, &stream)) |_| {
+                try stderr.writeStreamingAll(io, "  payload: ");
+                try stderr.writeStreamingAll(io, stream.buffered());
+                try stderr.writeStreamingAll(io, "\n");
+            } else |_| {
+                try stderr.writeStreamingAll(io, "  (payload too large to print)\n");
+            }
+        }
+    }
+};
+
+/// Build a `Runtime` in place. `load_paths` must outlive it.
+fn bootRuntime(rt: *Runtime, io: std.Io, allocator: std.mem.Allocator, load_paths: []const []const u8) !void {
+    rt.allocator = allocator;
+    rt.v = try vm.VM.init(allocator, &stub_routine);
+    errdefer rt.v.deinit();
+    // `(db/open path)` creates the path's parent directories through
+    // the CLI's std.Io; emdb itself does not.
+    rt.v.io = io;
+    rt.interner = rt.v.ensureInterner();
+    rt.registry = try rt.v.ensureRegistry();
+    // Natives live in nexis.core (auto-referred by user) and in the
+    // qualified-only namespaces; each qualified namespace has
+    // nexis.core as its parent.
+    try stdlib.installCore(rt.registry.core);
+    const db_ns = try rt.registry.getOrCreate("db", rt.registry.core);
+    try stdlib.installDb(db_ns);
+    const string_ns = try rt.registry.getOrCreate("nexis.string", rt.registry.core);
+    try stdlib.installString(string_ns);
+    const internal_ns = try rt.registry.getOrCreate("nexis.internal", rt.registry.core);
+    try stdlib.installInternal(internal_ns);
+    const nextomic_ns = try rt.registry.getOrCreate("nextomic", rt.registry.core);
+    try stdlib.installNextomic(nextomic_ns);
+    rt.host_macros = try expand_mod.defaultMacros(allocator);
+    errdefer rt.host_macros.deinit(allocator);
+    // The embedded sources define into their own namespaces; core.nx
+    // first so nextomic.nx can use it.
+    try bootstrapEmbedded(rt, rt.registry.core, stdlib.CORE_NX_SOURCE, "core.nx");
+    try bootstrapEmbedded(rt, nextomic_ns, stdlib.NEXTOMIC_NX_SOURCE, "nextomic.nx");
+    rt.loader = loader_mod.Loader.init(
+        allocator,
+        rt.persistent(),
+        io,
+        load_paths,
+        &rt.v,
+        rt.interner,
+        rt.registry,
+        &rt.host_macros,
+    );
 }
 
-/// Bootstrap the embedded `nextomic.nx` sugar into the `nextomic`
-/// namespace, after its natives are installed.
-fn bootstrapNextomicNx(
-    v: *vm.VM,
-    ns: *vm.Namespace,
-    interner: *intern_mod.Interner,
-    allocator: std.mem.Allocator,
-) !void {
-    try bootstrapEmbedded(v, ns, interner, allocator, stdlib.NEXTOMIC_NX_SOURCE, "nextomic.nx");
-}
-
-fn bootstrapEmbedded(
-    v: *vm.VM,
-    ns: *vm.Namespace,
-    interner: *intern_mod.Interner,
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    label: []const u8,
-) !void {
+/// Compile and evaluate one embedded source into `ns`, one
+/// top-level form at a time, so each definition is visible to
+/// the forms after it. Errors here are bugs in the embedded
+/// source, not in user code: the process panics rather than come
+/// up with half a stdlib.
+fn bootstrapEmbedded(rt: *Runtime, ns: *vm.Namespace, source: []const u8, label: []const u8) !void {
+    const allocator = rt.allocator;
     var parse_result = reader_mod.parser.parseProgram(allocator, source) catch |err| {
         std.debug.panic("nexis: {s} parse error: {s}\n", .{ label, @errorName(err) });
     };
@@ -260,126 +304,46 @@ fn bootstrapEmbedded(
         std.debug.panic("nexis: {s} reader error: {s}\n", .{ label, @errorName(err) });
     };
 
-    var host_macros = try expand_mod.defaultMacros(allocator);
-    defer host_macros.deinit(allocator);
+    const saved_current = rt.registry.current;
+    rt.registry.current = ns;
+    defer rt.registry.current = saved_current;
 
-    // CRITICAL: use the VM's runtime arena as the compile arena
-    // for bootstrap. ORDINARY `defn` compiled Routines live in
-    // the compile arena and are referenced by Closures stored in
-    // Var.roots. Those Vars must outlive bootstrap, so the
-    // routines must too. A separate temp compile_arena would
-    // dangle on bootstrap exit and crash on first user call to
-    // any core.nx fn. (Macros already use the persistent
-    // allocator via `compileFormFullWithMacrosSpanPersistent`,
-    // but ordinary fns need it too.)
-    const ra = v.runtime_arena.allocator();
-
+    // The routines of ordinary defns are referenced by closures in
+    // Var roots that outlive bootstrap, so they are compiled into
+    // the persistent allocator, not a temporary arena.
     for (forms) |form| {
         var error_span: ?reader_mod.SrcSpan = null;
-        const compiled = compile.compileFormFullWithMacrosSpanPersistent(
-            ra,
-            form,
-            ns,
-            interner,
-            &host_macros,
-            &error_span,
-            ra,
-        ) catch |err| {
+        const compiled = compile.compileFormWith(rt.persistent(), form, .{
+            .namespace = ns,
+            .interner = rt.interner,
+            .host_macros = &rt.host_macros,
+            .out_span = &error_span,
+            .persistent_allocator = rt.persistent(),
+            .registry = rt.registry,
+        }) catch |err| {
             std.debug.panic("nexis: {s} compile error: {s} (form span: {?})\n", .{ label, @errorName(err), error_span });
         };
-        const routine = compiled.toRoutine(label);
-        try v.retargetTop(&routine);
-        _ = v.run() catch |err| {
+        _ = rt.runCompiled(compiled, label) catch |err| {
             std.debug.panic("nexis: {s} runtime error: {s}\n", .{ label, @errorName(err) });
         };
     }
 }
 
+/// Interactive read-eval-print loop: one form per input line,
+/// evaluated on a runtime that persists for the session; errors
+/// are printed and the loop continues. `:quit`, `:q` or EOF exits.
 fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
     const stderr = std.Io.File.stderr();
 
-    // Initialize the persistent VM + namespace + interner +
-    // macro table. These outlive every REPL evaluation.
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(allocator, &stub);
-    defer v.deinit();
-    // Phase 5.2a polish: hand the VM the CLI's std.Io so
-    // `(db/open path)` can create the path's parent directories
-    // before emdb opens the file. emdb itself does not create
-    // parents; without this, `(db/open "data/x.edb")` fails
-    // unless the user pre-creates `data/`.
-    v.io = io;
-    const interner = v.ensureInterner();
-    // Phase 3.4: set up the namespace registry (creates
-    // `nexis.core` + `user`, with user.parent = core for
-    // auto-refer). After this, `v.ensureNamespace()` returns
-    // `registry.current` (initially `user`).
-    const registry = try v.ensureRegistry();
-    // Phase 3.3a: install core native fns into nexis.core (NOT
-    // user) so they're visible via auto-refer + qualified
-    // lookup (`nexis.core/map`). User code that defs the same
-    // names creates a local shadow.
-    try stdlib.installCore(registry.core);
-    // Phase 4.0a: install db primitives into a `db` namespace
-    // so qualified-form `(db/open ...)` resolves through the
-    // registry. The `db` ns is registered with `nexis.core` as
-    // its auto-refer parent (matches user/core relationship).
-    const db_ns = try registry.getOrCreate("db", registry.core);
-    try stdlib.installDb(db_ns);
-    // Phase 5.2b (peer-AI turn 79): install `nexis.string` ops
-    // into the `nexis.string` namespace, with `nexis.core` as
-    // parent. NOT auto-referred into `user` — qualified calls
-    // only. Order is fixed: installCore → installDb → installString
-    // → bootstrapCoreNx, so any future core.nx form can refer to
-    // `nexis.string/*` without a load-order trap.
-    const string_ns = try registry.getOrCreate("nexis.string", registry.core);
-    try stdlib.installString(string_ns);
-    // Phase 5.3a (peer-AI turn 84): install `nexis.internal`
-    // helpers (#%register-record-type / #%make-record / etc.).
-    // Macros emit qualified calls; users don't touch these.
-    const internal_ns = try registry.getOrCreate("nexis.internal", registry.core);
-    try stdlib.installInternal(internal_ns);
-    // The `nextomic` namespace (docs/NEXTOMIC.md §6): natives now,
-    // its embedded sugar after core.nx.
-    const nextomic_ns = try registry.getOrCreate("nextomic", registry.core);
-    try stdlib.installNextomic(nextomic_ns);
-    var host_macros = try expand_mod.defaultMacros(allocator);
-    defer host_macros.deinit(allocator);
-    // Phase 3.3d: bootstrap the embedded core.nx composite
-    // layer INTO nexis.core (so user code inherits via auto-
-    // refer). Temporarily switch current → core for bootstrap;
-    // switch back to user after.
-    const saved_current = registry.current;
-    registry.current = registry.core;
-    try bootstrapCoreNx(&v, registry.core, interner, allocator);
-    registry.current = nextomic_ns;
-    try bootstrapNextomicNx(&v, nextomic_ns, interner, allocator);
-    registry.current = saved_current;
-    // Phase 3.6: namespace loader. Searches CWD for .nx files
-    // when `(require 'my.ns)` fires. Load path is just CWD for
-    // v1; a `--load-path DIR` CLI flag is post-v1 polish.
-    var load_paths = [_][]const u8{"."};
-    var loader = loader_mod.Loader.init(
-        allocator,
-        v.runtime_arena.allocator(),
-        io,
-        load_paths[0..],
-        &v,
-        interner,
-        registry,
-        &host_macros,
-    );
-    defer loader.deinit();
+    const load_paths = [_][]const u8{"."};
+    var rt: Runtime = undefined;
+    try bootRuntime(&rt, io, allocator, &load_paths);
+    defer rt.deinit();
 
-    // Each evaluation gets its own arena so we can release
-    // form/Tiny/Compiled memory between iterations. The VM's
-    // runtime_arena holds the long-lived values (closures,
-    // cells, list nodes).
     try stdout.writeStreamingAll(io,
-        \\nexis repl — Phase 3.0a
+        \\nexis repl
         \\Type `:quit` or hit Ctrl-D to exit.
         \\
         \\
@@ -390,12 +354,10 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
 
     while (true) {
         try stdout.writeStreamingAll(io, "user=> ");
-        // takeDelimiter returns ?[]u8 — null at EOF.
-        // The returned slice excludes the delimiter, but the
-        // reader's seek position advances past it (unlike
-        // takeDelimiterExclusive which leaves the delimiter
-        // in the buffer — that variant infinite-loops on
-        // empty lines).
+        // takeDelimiter returns null at EOF. The returned slice
+        // excludes the delimiter and the reader advances past it
+        // (takeDelimiterExclusive leaves it in the buffer and
+        // loops forever on empty lines).
         const maybe_line = (reader.interface.takeDelimiter('\n')) catch |err| {
             try stderr.writeStreamingAll(io, "nexis: stdin read error: ");
             try stderr.writeStreamingAll(io, @errorName(err));
@@ -410,87 +372,36 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         if (trimmed.len == 0) continue;
         if (std.mem.eql(u8, trimmed, ":quit") or std.mem.eql(u8, trimmed, ":q")) return;
 
-        // Phase 3.5b fix: use the VM's runtime_arena as the
-        // compile arena. Closures + their Routines reference
-        // sub-routine pointers that live in the compile arena;
-        // freeing the arena at end of REPL line would dangle
-        // those pointers for next line's calls (manifested as
-        // segfaults on multi-arity defn, but the bug was
-        // pre-existing — small defns just happened to land in
-        // chunks that weren't immediately reused).
-        //
-        // Cost: per-line compile allocations accumulate for the
-        // session lifetime. Acceptable for v1; a per-session
-        // session-arena policy is post-v1 polish.
-        const arena_alloc = v.runtime_arena.allocator();
+        // Closures and their routines reference sub-routine pointers
+        // that live in the compile arena, and a line's definitions
+        // are called from later lines, so every line compiles into
+        // the persistent arena. The source bytes go there too:
+        // Tiny.symbol slices borrow from them.
+        const src = try rt.persistent().dupe(u8, trimmed);
 
-        // Source bytes need to live AT LEAST through the
-        // compile call (Tiny.symbol slices borrow from
-        // source). dupe into the arena.
-        const src = try arena_alloc.dupe(u8, trimmed);
-
-        var error_span: ?reader_mod.SrcSpan = null;
-        // Phase 3.2: pass v.runtime_arena.allocator() as the
-        // persistent allocator so defmacro Closures defined
-        // on one REPL line survive into subsequent lines.
-        // Phase 3.4: re-read registry.current each iteration so
-        // `(ns NAME)` switches affect subsequent forms.
-        const current_ns = registry.current;
         // A REPL line may only refer to what exists or what the
         // line itself defines; the compiler reports anything else
         // at the symbol.
         var declared = compile.DeclaredNames.init(allocator);
         defer declared.deinit();
-        const compiled = compile.compileSourceFullWithMacrosSpanPersistentRegistryLoader(
-            arena_alloc,
-            src,
-            current_ns,
-            interner,
-            &host_macros,
-            &error_span,
-            v.runtime_arena.allocator(),
-            registry,
-            .{ .user_data = @ptrCast(&loader), .load = &loader_mod.Loader.loadCallback },
-            &declared,
-        ) catch |err| {
+        var error_span: ?reader_mod.SrcSpan = null;
+        const compiled = compile.compileSourceWith(rt.persistent(), src, rt.compileOptions(&error_span, &declared)) catch |err| {
             try emitCompileError(io, "<repl>", src, err, error_span);
             continue;
         };
 
-        // Bind the new routine onto frame 0 + reset the VM
-        // state for a fresh run.
-        const routine = compiled.toRoutine("repl");
-        try v.retargetTop(&routine);
-
-        const result = v.run() catch |err| {
-            try stderr.writeStreamingAll(io, "nexis: runtime error: ");
-            try stderr.writeStreamingAll(io, @errorName(err));
-            try stderr.writeStreamingAll(io, "\n");
-            // Print throw payload if available.
-            if (err == vm.VmError.UncaughtThrow and v.unhandled_throw != null) {
-                var buf: [4096]u8 = undefined;
-                var stream = std.Io.Writer.fixed(&buf);
-                formatValue(v.unhandled_throw.?, interner, &stream) catch {
-                    try stderr.writeStreamingAll(io, "  (payload too large to print)\n");
-                    continue;
-                };
-                try stderr.writeStreamingAll(io, "  payload: ");
-                try stderr.writeStreamingAll(io, stream.buffered());
-                try stderr.writeStreamingAll(io, "\n");
-            }
-            // Clear handler/finally state so next iteration
-            // starts clean. Otherwise an aborted try leaks
-            // handlers across REPL inputs.
-            v.handlers.shrinkRetainingCapacity(0);
-            v.finally_stack.shrinkRetainingCapacity(0);
-            v.unhandled_throw = null;
+        const result = rt.runCompiled(compiled, "repl") catch |err| {
+            try rt.reportRuntimeError(io, err);
+            // An aborted try must not leak handlers into the next line.
+            rt.v.handlers.shrinkRetainingCapacity(0);
+            rt.v.finally_stack.shrinkRetainingCapacity(0);
+            rt.v.unhandled_throw = null;
             continue;
         };
 
-        // Print the result.
         var out_buf: [4096]u8 = undefined;
         var out_stream = std.Io.Writer.fixed(&out_buf);
-        formatValue(result, interner, &out_stream) catch {
+        formatValue(result, rt.interner, &out_stream) catch {
             try stdout.writeStreamingAll(io, "#<value too large to print>\n");
             continue;
         };
@@ -499,174 +410,80 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     }
 }
 
-/// Read FILE.nx, parse, compile, run each top-level form. Print
-/// the final result to stdout.
+/// Read FILE.nx, parse, compile and run each top-level form, and
+/// print the final result to stdout.
 fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
-    // Read entire file. 16 MB cap is plenty for v1; Phase 3 may
-    // grow when stdlib bootstrap files arrive.
+    const stderr = std.Io.File.stderr();
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| {
-        try std.Io.File.stderr().writeStreamingAll(io, "nexis: failed to read '");
-        try std.Io.File.stderr().writeStreamingAll(io, path);
-        try std.Io.File.stderr().writeStreamingAll(io, "': ");
-        try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
-        try std.Io.File.stderr().writeStreamingAll(io, "\n");
+        try stderr.writeStreamingAll(io, "nexis: failed to read '");
+        try stderr.writeStreamingAll(io, path);
+        try stderr.writeStreamingAll(io, "': ");
+        try stderr.writeStreamingAll(io, @errorName(err));
+        try stderr.writeStreamingAll(io, "\n");
         std.process.exit(2);
     };
     defer allocator.free(source);
 
-    // Parser owns its own arena for the Sexp tree.
+    // The parser owns the Sexp tree, the reader the Form tree.
     var parse_result = reader_mod.parser.parseProgram(allocator, source) catch |err| {
-        try std.Io.File.stderr().writeStreamingAll(io, "nexis: parse error: ");
-        try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
-        try std.Io.File.stderr().writeStreamingAll(io, "\n");
+        try stderr.writeStreamingAll(io, "nexis: parse error: ");
+        try stderr.writeStreamingAll(io, @errorName(err));
+        try stderr.writeStreamingAll(io, "\n");
         std.process.exit(3);
     };
     defer parse_result.parser.deinit();
 
-    // Reader owns its own arena for the Form tree.
     var reader = reader_mod.Reader.init(allocator, source);
     defer reader.deinit();
 
     const forms = reader.readProgram(parse_result.sexp) catch |err| {
-        try std.Io.File.stderr().writeStreamingAll(io, "nexis: reader error: ");
-        try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
-        try std.Io.File.stderr().writeStreamingAll(io, "\n");
+        try stderr.writeStreamingAll(io, "nexis: reader error: ");
+        try stderr.writeStreamingAll(io, @errorName(err));
+        try stderr.writeStreamingAll(io, "\n");
         std.process.exit(3);
     };
 
-    if (forms.len == 0) {
-        // Empty file → nothing to print. Exit cleanly.
-        return;
-    }
+    // An empty file prints nothing.
+    if (forms.len == 0) return;
 
-    // Initialize VM with a stub routine; we'll rebind it per
-    // form. The VM owns the namespace + interner that persist
-    // across forms.
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(allocator, &stub);
-    defer v.deinit();
-    // Phase 5.2a polish: see `runFile` — hand the VM the CLI's
-    // std.Io so `(db/open path)` can auto-create parent dirs.
-    v.io = io;
-    const interner = v.ensureInterner();
-    // Phase 3.4: namespace registry (nexis.core + user).
-    const registry = try v.ensureRegistry();
-    // Phase 3.3a: install core native fns into nexis.core.
-    try stdlib.installCore(registry.core);
-    // Phase 4.0a: install db primitives into the `db` ns.
-    const db_ns = try registry.getOrCreate("db", registry.core);
-    try stdlib.installDb(db_ns);
-    // Phase 5.2b (peer-AI turn 79): install `nexis.string` ops
-    // (qualified-only; not auto-referred). Install order is
-    // installCore → installDb → installString → bootstrapCoreNx.
-    const string_ns = try registry.getOrCreate("nexis.string", registry.core);
-    try stdlib.installString(string_ns);
-    // Phase 5.3a (peer-AI turn 84): nexis.internal (qualified-only).
-    const internal_ns = try registry.getOrCreate("nexis.internal", registry.core);
-    try stdlib.installInternal(internal_ns);
-    // The `nextomic` namespace (docs/NEXTOMIC.md §6): natives now,
-    // its embedded sugar after core.nx.
-    const nextomic_ns = try registry.getOrCreate("nextomic", registry.core);
-    try stdlib.installNextomic(nextomic_ns);
-    // Step #8b: default host macro table.
-    var host_macros = try expand_mod.defaultMacros(allocator);
-    defer host_macros.deinit(allocator);
-    // Phase 3.3d: bootstrap core.nx INTO nexis.core (so user
-    // code inherits via auto-refer).
-    const saved_current = registry.current;
-    registry.current = registry.core;
-    try bootstrapCoreNx(&v, registry.core, interner, allocator);
-    registry.current = nextomic_ns;
-    try bootstrapNextomicNx(&v, nextomic_ns, interner, allocator);
-    registry.current = saved_current;
-    // Phase 3.6: namespace loader. Searches CWD + the directory
-    // of the source file being run for `.nx` files when
-    // `(require ...)` fires.
+    // `require` searches the working directory and the file's own.
     const file_dir = std.fs.path.dirname(path) orelse ".";
-    var file_load_paths = [_][]const u8{ ".", file_dir };
-    var loader = loader_mod.Loader.init(
-        allocator,
-        v.runtime_arena.allocator(),
-        io,
-        file_load_paths[0..],
-        &v,
-        interner,
-        registry,
-        &host_macros,
-    );
-    defer loader.deinit();
+    const load_paths = [_][]const u8{ ".", file_dir };
+    var rt: Runtime = undefined;
+    try bootRuntime(&rt, io, allocator, &load_paths);
+    defer rt.deinit();
 
-    // Compile arena: shared across all top-level forms in this
-    // file. Form trees + Tiny IR + Compiled routines all live
-    // here. Released wholesale at the end.
+    // One compile arena for the whole file: Form trees, Tiny IR and
+    // Compiled routines, released together at the end.
     var compile_arena = std.heap.ArenaAllocator.init(allocator);
     defer compile_arena.deinit();
 
-    var last_result: Value = value_mod.nilValue();
-
-    // Every name the file defines at top level may be referred to
-    // from any form in it (forward references); a symbol that
-    // resolves to nothing else is a compile error at its span.
+    // Every name the file defines may be referred to from any form
+    // in it (forward references); a symbol that resolves to nothing
+    // else is a compile error at its span.
     var declared = compile.DeclaredNames.init(allocator);
     defer declared.deinit();
     for (forms) |form| try declared.declareForm(form);
 
+    var last_result: Value = value_mod.nilValue();
     for (forms) |form| {
-        // Step #10.0: surface SrcSpan from compile errors.
-        // The CLI converts byte offsets to file:line:col +
-        // shows the source line with a caret.
         var error_span: ?reader_mod.SrcSpan = null;
-        // Phase 3.4: re-read registry.current per-form so
-        // `(ns NAME)` switches mid-file affect subsequent forms.
-        const current_ns = registry.current;
-        const compiled = compile.compileFormFullWithMacrosSpanPersistentRegistryLoader(
-            compile_arena.allocator(),
-            form,
-            current_ns,
-            interner,
-            &host_macros,
-            &error_span,
-            v.runtime_arena.allocator(),
-            registry,
-            .{ .user_data = @ptrCast(&loader), .load = &loader_mod.Loader.loadCallback },
-            &declared,
-        ) catch |err| {
+        const compiled = compile.compileFormWith(compile_arena.allocator(), form, rt.compileOptions(&error_span, &declared)) catch |err| {
             try emitCompileError(io, path, source, err, error_span);
             std.process.exit(4);
         };
-        const routine = compiled.toRoutine("file-form");
-        try v.retargetTop(&routine);
-        last_result = v.run() catch |err| {
-            try std.Io.File.stderr().writeStreamingAll(io, "nexis: runtime error: ");
-            try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
-            try std.Io.File.stderr().writeStreamingAll(io, "\n");
-            if (err == vm.VmError.UncaughtThrow and v.unhandled_throw != null) {
-                var buf: [4096]u8 = undefined;
-                var stream = std.Io.Writer.fixed(&buf);
-                if (formatValue(v.unhandled_throw.?, interner, &stream)) |_| {
-                    try std.Io.File.stderr().writeStreamingAll(io, "  payload: ");
-                    try std.Io.File.stderr().writeStreamingAll(io, stream.buffered());
-                    try std.Io.File.stderr().writeStreamingAll(io, "\n");
-                } else |_| {}
-            }
+        last_result = rt.runCompiled(compiled, "file-form") catch |err| {
+            try rt.reportRuntimeError(io, err);
             std.process.exit(5);
         };
     }
 
-    // Print the final result via a small stack buffer + write to
-    // stdout. Avoids needing a writer adapter; Phase 3+ refactor
-    // can introduce a proper Value formatter.
     var buf: [4096]u8 = undefined;
     var stream = std.Io.Writer.fixed(&buf);
-    formatValue(last_result, interner, &stream) catch {
-        // Buffer overflow on a deep/large value — fall back to a
-        // kind tag. Phase 3 replaces this with a streaming
-        // formatter.
+    formatValue(last_result, rt.interner, &stream) catch {
         try std.Io.File.stdout().writeStreamingAll(io, "#<value too large to print>\n");
         return;
     };
-    const written = stream.buffered();
-    try std.Io.File.stdout().writeStreamingAll(io, written);
+    try std.Io.File.stdout().writeStreamingAll(io, stream.buffered());
     try std.Io.File.stdout().writeStreamingAll(io, "\n");
 }
