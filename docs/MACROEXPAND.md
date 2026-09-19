@@ -152,11 +152,35 @@ is an ordinary call. User macros shadow host macros.
    expanded, no lexical environment) or the form itself;
    `macroexpand` repeats until the head is not a macro.
    `(read-string s)` reads the first form of `s` as data.
-   Both reach the compiler through `vm.CompilerHooks`
-   (`compile.RuntimeHooks`, installed by the runtime that boots
-   the VM); their values are built on the VM heap. Failures
-   throw `:macro-expansion-failure` / `:reader-error`; a VM
-   without hooks throws `:no-compiler`.
+   `(eval form)` takes a form as data, macroexpands and compiles
+   it in the current namespace with the registry, interner, host
+   macro table, loader and a fresh set of declared names, exactly
+   as the REPL compiles a line, and runs the routine on the
+   calling VM as a nested call (`vm.runRoutine`), returning its
+   value: a `def` inside it binds in the current namespace and is
+   visible afterwards, a `defmacro` inside it serves a later
+   `eval`, `(ns ...)` inside it switches the current namespace,
+   a closure it returns is callable afterwards, a dynamic
+   binding in force is seen, and `eval` nests. The evaluated
+   form has no lexical environment: a `let`-bound name of the
+   caller is `UnresolvedSymbol` inside it. The Form tree, the
+   routine, its constants and every closure prototype are
+   allocated in the VM's runtime arena, so what the form defines
+   or returns outlives the call. All three reach the compiler
+   through `vm.CompilerHooks` (`compile.RuntimeHooks`, installed
+   by the runtime that boots the VM); their values are built on
+   the VM heap. Failures throw: `:macro-expansion-failure` and
+   `:reader-error` as bare keywords; a form `eval` cannot compile
+   throws the map `{:error :compile-error :message "<CompileError
+   name>" :form <the form>}` (a value that is not a form, such as
+   a list holding a function, is `"UnsupportedForm"`), so
+   `(catch :compile-error e ...)` takes it and `ex-message` reads
+   the name; a throw inside the evaluated form propagates as an
+   ordinary throw. A VM without hooks throws `:no-compiler`.
+   Syntax-quote is not data at run time: a quoted form that
+   holds one is `UnsupportedFeature` at its own compile and
+   `read-string` rejects it, so a macro body given to `eval`
+   builds its expansion with `list`, `cons` and quote.
 
 ---
 

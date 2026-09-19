@@ -359,6 +359,10 @@ variants are codegen details.
 - Compound collections lower through `#%list` / `#%vector` /
   `#%map` / `#%set` construction (`lowerQuotePayload`) with each
   element quoted recursively.
+- A quote inside the payload is data: `'(a 'b)` is `(a (quote b))`,
+  the 2-list `formToValue` renders a quote as. Syntax-quote,
+  unquote, `@x`, `#(...)` and `^meta` inside a quoted form are
+  `UnsupportedFeature`.
 - Runtime: `mov:load-const` (scalars) or `coll:*` construction.
 
 #### 5.2 `(if test then else?)`
@@ -794,7 +798,13 @@ argument). `MalformedForm` / `ExpectedSymbol` / `ExpectedVector`
 are lowering errors about special-form shape.
 
 There is no secondary span, no expansion-provenance chain and
-no structured error value for compile errors. The CLI prints
+no structured error value for compile errors the CLI reports. A
+compile error inside `eval` is not reported by the CLI: the hook
+throws the map `{:error :compile-error :message "<variant name>"
+:form <the form>}` on the calling VM, a catchable value like any
+other throw (MACROEXPAND.md §1.2 item 9); uncaught, it reaches
+the CLI as `UncaughtThrow` with the map as its value. The CLI
+prints
 
     nexis: <path>:<line>:<col>: <ErrorName>
         <source line>
@@ -822,8 +832,9 @@ first, one `at <name> (<path>:<line>:<col>)` line per frame:
       at <top> (t.nx:6:2)
 
 A `defn` or named `fn*` frame carries its name, an anonymous
-closure is `fn`, a top-level form `<top>`; a caller frame's
-location is its call. `run` exits 5. The REPL reports under
+closure is `fn`, a top-level form `<top>`, a form `eval` runs
+`<eval>` (it has no source, so it is listed by name alone); a
+caller frame's location is its call. `run` exits 5. The REPL reports under
 `<repl>` and, since a line's definitions are called from later
 lines, every line keeps its own source (`vm.SourceInfo`) for the
 routines compiled from it.

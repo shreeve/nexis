@@ -1621,9 +1621,10 @@ fn lowerInternalSet(
 ///
 /// Quoted compound collections (lists/vectors/maps/sets) lower
 /// to the matching `*_construct` node whose elements are
-/// themselves quote-lowered; quoted strings need `ctx.heap`.
-/// Quoted reader macros (`'@x`, `'#(...)`, `'^{...}`,
-/// syntax-quote) raise `UnsupportedFeature`.
+/// themselves quote-lowered; quoted strings need `ctx.heap`. A
+/// quote inside the payload is the 2-list `(quote x)`, as
+/// `formToValue` renders it. Quoted reader macros (`'@x`,
+/// `'#(...)`, `'^{...}`, syntax-quote) raise `UnsupportedFeature`.
 fn lowerQuotePayload(
     allocator: std.mem.Allocator,
     payload: *const reader_mod.Form,
@@ -1707,6 +1708,16 @@ fn lowerQuotePayload(
             const h = ctx.heap orelse return CompileError.UnsupportedFeature;
             const v = string_mod.fromBytes(h, bytes) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
+        },
+        // `'(a 'b)` is `(a (quote b))`: the inner quote is data, the
+        // 2-list `formToValue` renders it as.
+        .quote => |inner| blk: {
+            const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
+            const quote_sym = interner.internSymbolValue("quote") catch return CompileError.OutOfMemory;
+            const tiny_items = try allocator.alloc(*const Tiny, 2);
+            tiny_items[0] = try allocTiny(allocator, .{ .literal = quote_sym });
+            tiny_items[1] = try lowerQuotePayload(allocator, inner, ctx);
+            break :blk try allocTiny(allocator, .{ .list_construct = tiny_items });
         },
         else => return CompileError.UnsupportedFeature,
     };
@@ -2289,9 +2300,9 @@ fn compileEvalCallback(
     return try out_vm.run();
 }
 
-/// The compiler as `macroexpand-1` and `read-string` reach it at
-/// run time (`vm.CompilerHooks`). The runtime that boots a VM owns
-/// one of these for as long as the VM lives and calls `install`.
+/// The compiler as `macroexpand-1`, `read-string` and `eval` reach
+/// it at run time (`vm.CompilerHooks`). The runtime that boots a VM
+/// owns one of these for as long as the VM lives and calls `install`.
 pub const RuntimeHooks = struct {
     host_macros: *const expand_mod.HostMacroTable,
     registry: *vm.NamespaceRegistry,
@@ -2303,6 +2314,7 @@ pub const RuntimeHooks = struct {
             .user_data = @ptrCast(self),
             .expand_once = &expandOnceHook,
             .read_string = &readStringHook,
+            .eval = &evalHook,
         };
     }
 
@@ -2356,11 +2368,69 @@ pub const RuntimeHooks = struct {
             return failure(v, err, "reader-error");
     }
 
+    /// `(eval form)`: `form_value` as a Form, compiled the way the
+    /// REPL compiles a line (the current namespace, this registry,
+    /// interner, host macro table and loader, a fresh set of
+    /// declared names) and run on `v` as a nested call. The Form
+    /// tree, the routine, its constants and every closure prototype
+    /// live in the VM's runtime arena: a closure the form returns, a
+    /// Var it defines and the frame an escaping throw leaves in
+    /// place all outlive the call. During the run the routine is a
+    /// frame, so its constants are roots. A value that is not a
+    /// form and a form that does not compile both throw the map
+    /// `compileFailure` builds.
+    fn evalHook(user_data: *anyopaque, v: *vm.VM, form_value: value_mod.Value) vm.VmError!value_mod.Value {
+        const self: *RuntimeHooks = @ptrCast(@alignCast(user_data));
+        const persistent = v.runtime_arena.allocator();
+        var ctx = self.context(persistent, v);
+        const origin = reader_mod.SrcSpan{ .pos = 0, .len = 0 };
+        const form = expand_mod.valueToForm(&ctx, form_value, origin) catch |err|
+            return compileFailure(v, err, "UnsupportedForm", form_value);
+        var declared = DeclaredNames.init(v.allocator);
+        defer declared.deinit();
+        const compiled = compileFormWith(persistent, form, .{
+            .namespace = self.registry.current,
+            .interner = self.interner,
+            .host_macros = self.host_macros,
+            .persistent_allocator = persistent,
+            .registry = self.registry,
+            .load_callback = self.load_callback,
+            .declared = &declared,
+        }) catch |err| return compileFailure(v, err, @errorName(err), form_value);
+        const routine = persistent.create(vm.Routine) catch return vm.VmError.OutOfMemory;
+        routine.* = compiled.toRoutine("<eval>");
+        return v.runRoutine(routine);
+    }
+
     /// Out of memory stays an error; anything else the hook could
     /// not do throws `tag`.
     fn failure(v: *vm.VM, err: anyerror, tag: []const u8) vm.VmError {
         if (err == error.OutOfMemory) return vm.VmError.OutOfMemory;
         return v.throwKeyword(tag);
+    }
+
+    /// Out of memory stays an error; anything else `eval` could not
+    /// compile throws `{:error :compile-error :message name :form
+    /// form}`, where `name` is the `CompileError` variant.
+    fn compileFailure(v: *vm.VM, err: anyerror, name: []const u8, form: value_mod.Value) vm.VmError {
+        if (err == error.OutOfMemory) return vm.VmError.OutOfMemory;
+        const champ = @import("champ");
+        const dispatch = @import("dispatch");
+        const heap = v.ensureHeap();
+        const interner = v.ensureInterner();
+        const message = string_mod.fromBytes(heap, name) catch return vm.VmError.OutOfMemory;
+        const tag = interner.internKeywordValue("compile-error") catch return vm.VmError.OutOfMemory;
+        var m = champ.mapEmpty(heap) catch return vm.VmError.OutOfMemory;
+        const entries = [_]struct { key: []const u8, value: value_mod.Value }{
+            .{ .key = "error", .value = tag },
+            .{ .key = "message", .value = message },
+            .{ .key = "form", .value = form },
+        };
+        for (entries) |e| {
+            const key = interner.internKeywordValue(e.key) catch return vm.VmError.OutOfMemory;
+            m = champ.mapAssoc(heap, m, key, e.value, &dispatch.hashValue, &dispatch.equal) catch return vm.VmError.OutOfMemory;
+        }
+        return v.throwValue(m);
     }
 };
 

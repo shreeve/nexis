@@ -1,0 +1,34 @@
+; examples/eval.nx — `eval`: a form as data, compiled in the current
+; namespace and run on the calling VM.
+;
+; `read-string` turns text into a form; `eval` macroexpands, compiles
+; and runs it exactly as the REPL compiles a line, so a `def` inside
+; it binds a Var that later forms see, a `defmacro` inside it serves
+; a later `eval`, and a closure it returns is callable afterwards.
+
+(def source "(defn square [x] (* x x))")
+(eval (read-string source))
+(println "square 12 =" (square 12))
+
+(def forms ['(+ 1 2) '(let [x 2] (* x x)) '(str "a" "b")])
+(println "each form:" (map eval forms))
+
+(eval '(def answer 42))
+(println "answer =" answer)
+
+(let [f (eval '(fn [n] (* n answer)))]
+  (println "closure from eval:" (f 2)))
+
+(eval '(defmacro unless [test & body] (list 'if test nil (cons 'do body))))
+(println "macro from eval:" (eval '(unless false :ran)))
+
+; A form that does not compile throws a map the caller can catch.
+(println "compile error:"
+  (try (eval '(no-such-fn 1))
+       (catch :compile-error e [(:message e) (:form e)])))
+
+; A throw inside the evaluated form is an ordinary throw.
+(try (eval '(throw :boom))
+     (catch :boom e (println "caught" e)))
+
+(eval '(+ answer 1))

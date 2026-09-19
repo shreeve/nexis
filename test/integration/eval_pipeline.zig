@@ -562,6 +562,13 @@ test "integration: quote vector" {
     try expectOutput("(quote [])", "[]");
 }
 
+test "integration: quote inside a quoted form is the 2-list (quote x)" {
+    try expectOutput("'(a 'b [1 'c])", "(a (quote b) [1 (quote c)])");
+    try expectOutput("(first (rest ''x))", "x");
+    try expectOutput("(= ''x '(quote x))", "true");
+    try expectOutput("(eval ''x)", "x");
+}
+
 test "integration: syntax-quote no unquote" {
     try expectOutput("`(1 2 3)", "(1 2 3)");
     // An unqualified symbol with no Var resolves to the current
@@ -3796,6 +3803,103 @@ test "read-string: forms as data, the first form only, errors thrown" {
     try expectOutput("(try (read-string \"(\") (catch :reader-error e :bad))", ":bad");
     try expectOutput("(try (read-string \"\") (catch :reader-error e :empty))", ":empty");
     try expectOutput("(macroexpand-1 (read-string \"(when a b)\"))", "(if a (do b) nil)");
+}
+
+// =============================================================================
+// eval: a form as data, compiled and run on the calling VM
+// (MACROEXPAND.md §1.2 item 9, COMPILER.md §7)
+// =============================================================================
+
+test "eval: a form as data compiles in the current namespace and runs on the calling VM" {
+    try expectOutput("(eval '(+ 1 2))", "3");
+    try expectOutput("(eval (read-string \"(let [x 2] (* x x))\"))", "4");
+    try expectOutput("[(eval 5) (eval nil) (eval true) (eval :k) (eval \"s\") (eval '[1 2]) (eval '{:a 1})]", "[5 nil true :k s [1 2] {:a 1}]");
+    try expectOutput("(eval (list '+ 1 2 3))", "6");
+    try expectOutput("(eval '(eval '(+ 1 1)))", "2");
+    try expectOutput("(eval '(eval (read-string \"(eval '(* 3 3))\")))", "9");
+    try expectOutput("(let [f (eval '(fn [x] (* x 10)))] (f 4))", "40");
+    try expectOutput("(map eval ['(+ 1 1) '(str \"a\" \"b\")])", "(2 ab)");
+    // A lexical name is not in scope for the evaluated form.
+    try expectOutput("(let [x 1] (try (eval 'x) (catch :compile-error e (:message e))))", "UnresolvedSymbol");
+}
+
+test "eval: def binds in the current namespace; a macro it defines serves a later eval" {
+    try expectOutputProgram("(eval '(def y 5)) y", "5");
+    try expectOutputProgram("(def x 10) (eval '(+ x 1))", "11");
+    try expectOutputProgram("(eval '(defn sq [x] (* x x))) (sq 7)", "49");
+    try expectOutputProgram("(eval '(defn hello [] \"hello\")) (hello)", "hello");
+    try expectOutputProgram("(eval '(defmacro m [x] (list '+ x 1))) [(eval '(m 41)) (m 1)]", "[42 2]");
+    try expectOutputProgram("(ns my.app) (eval '(def z 9)) (ns user) [my.app/z (eval 'my.app/z)]", "[9 9]");
+    // `(ns ...)` inside eval switches the current namespace, as at the REPL.
+    try expectOutputProgram("(eval '(ns other)) (def w 1) (ns user) other/w", "1");
+    // A `def` after an `(ns ...)` inside one form binds in the
+    // namespace current when the form's compile started, as at the REPL.
+    try expectOutputProgram("(eval '(do (ns other) (def w 2))) (ns user) w", "2");
+}
+
+test "eval: a compile error is a catchable map; a throw inside the form is an ordinary throw" {
+    try expectOutput("(try (eval '(nope 1)) (catch :compile-error e [(:error e) (:message e) (:form e)]))", "[:compile-error UnresolvedSymbol (nope 1)]");
+    try expectOutput("(try (eval '(recur 1)) (catch :compile-error e (:message e)))", "RecurOutsideTail");
+    try expectOutput("(try (eval '(quote)) (catch :compile-error e (:message e)))", "MalformedForm");
+    try expectOutput("(try (eval '(let* [x] x)) (catch :compile-error e (:message e)))", "MacroExpansionFailure");
+    try expectOutput("(try (eval (list 'a (fn [] 1))) (catch :compile-error e (:message e)))", "UnsupportedForm");
+    try expectOutput("(ex-message (try (eval '(nope)) (catch :compile-error e e)))", "UnresolvedSymbol");
+    try expectOutput("(try (eval '(throw :x)) (catch :x e [:caught e]))", "[:caught :x]");
+    try expectOutput("(try (eval '(/ 1 0)) (catch :divide-by-zero e e))", ":divide-by-zero");
+    try expectOutput("(eval '(try (throw :in) (catch :in e :handled)))", ":handled");
+    try expectOutput("(try (eval '(eval '(throw :deep))) (catch :deep e e))", ":deep");
+    try expectOutput("[(try (eval '(throw :x)) (catch :x e e)) (eval '(+ 1 1))]", "[:x 2]");
+}
+
+test "eval: a form evaluated inside a binding sees the binding" {
+    try expectOutputProgram("(def ^:dynamic *x* 1) [(binding [*x* 7] (eval '*x*)) (eval '*x*)]", "[7 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (binding [*x* 7] [(eval '(do (set! *x* 8) *x*)) *x*])", "[8 8]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) [(eval '(binding [*x* 3] *x*)) *x*]", "[3 1]");
+}
+
+test "eval: a throw out of an evaluated form leaves the caller's frames and trace clean" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const caught = try program.run("(try (eval '(throw :x)) (catch :x e e))");
+    try testing.expectEqualStrings("x", program.interner.keywordName(caught.asKeywordId()));
+    try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.handlers.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.error_trace.items.len);
+    try testing.expect(program.v.unhandled_throw == null);
+    // Uncaught: the evaluated routine is the frame named `<eval>`
+    // above the form that called it.
+    try testing.expectError(vm.VmError.UncaughtThrow, program.run("(eval '(throw :boom))"));
+    const trace = program.v.error_trace.items;
+    try testing.expectEqual(@as(usize, 2), trace.len);
+    try testing.expectEqualStrings("<eval>", trace[0].name);
+    try testing.expectEqualStrings("test-form", trace[1].name);
+    program.v.resetAfterError();
+    const again = try program.run("(eval '(+ 1 1))");
+    try testing.expectEqual(@as(i64, 2), again.asFixnum());
+}
+
+test "eval: what an evaluated form allocates survives a collection" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(eval '(defn greet [] \"hello\")) (def f (eval '(fn [] (str \"a\" \"b\")))) (def q (eval ''(1 \"two\" :three)))");
+    // Between runs the top frame still names the last run's
+    // routine, a local of `runWith`; a collection here roots
+    // through the stub instead.
+    try program.v.retargetTop(&Program.stub);
+    program.v.collectGarbage();
+    const out = try program.run("(str (greet) (f) q)");
+    try testing.expectEqualStrings("helloab(1 two :three)", string_mod.asBytes(out));
+}
+
+test "eval: a VM without compiler hooks throws :no-compiler" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.compiler_hooks = null;
+    const out = try program.run("(try (eval '(+ 1 1)) (catch :no-compiler e e))");
+    try testing.expectEqualStrings("no-compiler", program.interner.keywordName(out.asKeywordId()));
 }
 
 // =============================================================================

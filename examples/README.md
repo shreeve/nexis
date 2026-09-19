@@ -29,6 +29,7 @@ their second-run behavior.
 | `binding.nx` | `^:dynamic` Vars and `binding`: nested extents, a function called inside one seeing the binding in force, restoration on throw, `set!` on the innermost binding, `:not-dynamic` |
 | `maps-sets.nx` | `{...}` and `#{...}` literals |
 | `defmacro.nx` | User macros: a fresh sub-VM per compile-time invocation |
+| `eval.nx` | `eval` with `read-string`: a form as data compiled and run on the calling VM; a `def` and a `defmacro` inside it visible afterwards, a returned closure, the catchable `:compile-error` map, a throw from inside the form |
 | `stdlib-primitives.nx` | Native fns (`list`/`cons`/`first`/`rest`/`empty?`/...) and a recursive procedural `my-cond` macro |
 | `require-demo.nx` + `lib/geom.nx` | `(require '[lib.geom :as g])` loads a library from disk |
 | `shapes.nx` | Protocols + records in one file: `defprotocol`, `defrecord`, `extend-protocol` over records and built-ins, `satisfies?`, atoms, `str`, `case`/`for` |

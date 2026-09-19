@@ -30,7 +30,8 @@ nexis: test/golden/cli/divide-by-zero.nx:5:4: runtime error: DivideByZero
 - One `at` line per frame of the chain the VM recorded
   (`VM.md` §13), innermost first: the routine's name (`defn` and
   named `fn*` routines carry their name, an anonymous closure is
-  `fn`, a top-level form `<top>`) and the position of the
+  `fn`, a top-level form `<top>`, a form `eval` runs `<eval>`,
+  listed by name alone since it has no source) and the position of the
   instruction that frame was executing, which for a caller is its
   call. A closure a native called back (`map`, `reduce`) appears
   as its own frame; the native itself has none.
