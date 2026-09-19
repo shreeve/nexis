@@ -90,4 +90,4 @@ When sources disagree:
 3. `docs/*.md` — derivative; must track `PLAN.md`.
 4. Code comments — lowest. If code says one thing and `PLAN.md` says another, `PLAN.md` wins and the code is wrong.
 
-Every doc describes the module as it is. Where a doc states an absence ("the collector is never invoked at runtime"), that absence is a fact about the tree, not a schedule; `PLAN.md` §21 and `HANDOFF.md` §4 hold the roadmap.
+Every doc describes the module as it is. Where a doc states an absence ("`eval` is absent"), that absence is a fact about the tree, not a schedule; `PLAN.md` §21 and `HANDOFF.md` §4 hold the roadmap.

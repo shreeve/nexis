@@ -149,6 +149,6 @@ engine and the `:db/*` error names with the `db/*` layer.
   keeps across a further `vm.callValue` is not, and goes on a
   `vm.rootScope()` first (`docs/GC.md` §11.5). `NEXIS_GC_STRESS=1 zig
   build test` makes every rooting gap show. `zig fmt --check` the
-  files you touch (`HANDOFF.md` §6.9 names the five that fail).
+  files you touch (only the generated `src/parser.zig` fails).
 
 If any of this conflicts with what you believe the user wants, ask.

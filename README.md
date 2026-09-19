@@ -19,7 +19,7 @@ not a library bolted on top.
 ## Status
 
 Every row below is runnable through `bin/nexis`. `zig build test`
-runs **1307 tests** across 138 build steps (unit, property, golden,
+runs **1439 tests** across 154 build steps (unit, property, golden,
 Nextomic corpora, and the `test/nextomic/*.nx` end-to-end scripts).
 See [`PLAN.md`](PLAN.md) §21 for the phase map and
 [`HANDOFF.md`](HANDOFF.md) for the ranked next-work list.
@@ -60,7 +60,7 @@ zig build quick                    # seconds — language, eval-pipeline and Nex
 zig build nextomic-test            # Nextomic unit, property and corpus tests
 zig build nextomic-nx              # test/nextomic/*.nx through bin/nexis
 zig build examples                 # every examples/*.nx through bin/nexis
-zig build test --summary all       # minutes — everything (1307 tests)
+zig build test --summary all       # minutes — everything (1439 tests)
 zig build parser                   # regenerate src/parser.zig from nexis.grammar
 zig build bench                    # ReleaseFast benchmark suite
 ```
@@ -208,22 +208,9 @@ where it does not.
 
 Stated so nobody rediscovers them:
 
-- **The collector is never invoked at runtime.** `src/gc.zig`
-  implements precise mark-sweep and passes its property tests, but
-  no allocation path calls `collect`; a long-running process grows
-  without bound. Nextomic allocates in per-operation arenas, but the
-  tx-data a program builds, the reports and the query results live
-  in the VM heap and stay there, so a loader that transacts millions
-  of datoms should batch the work into processes that exit and
-  restart rather than run as one process. Wiring the collector needs
-  a rooting protocol for native functions (see `HANDOFF.md`).
-- **No `^:dynamic` Vars, no `binding`.** `(binding ...)` is an
-  unresolved symbol.
-- **Several Clojure core forms and functions are absent** (`case`
-  with evaluated keys, finally-only `try`, multi-arity `fn`, `defn`
-  docstrings, `:strs`/`:syms` destructuring, `int`,
-  `ex-info`, `macroexpand`, `read-string`, ...); `HANDOFF.md` §4
-  lists them.
+- **`eval` is absent.** `macroexpand-1` and `read-string` reach the
+  compiler through hooks; a form compiled and run in the calling VM
+  is the one Clojure surface form still missing (`HANDOFF.md` §6.1).
 - **The tooling layer is the runtime error report, `nexis disasm`,
   `nexis.test`, `nexis.pprint` and `nexis.math`**
   ([`docs/TOOLING.md`](docs/TOOLING.md)); there is no `nexis.repl`
@@ -233,18 +220,14 @@ Stated so nobody rediscovers them:
   macro call).
 - **`(vec #{...})` and `(vec {...})` raise `:kind-mismatch`**; `vec`
   accepts nil, vectors and lists. Use `(into [] s)`.
-- **Datalog function-position variables** are unsupported: the
-  function position of a predicate or function clause takes a
-  symbol naming a function, never a `?var` bound to one
-  (`docs/NEXTOMIC.md` §5).
 - **`byte_vector`** is a reserved Value kind with no
   implementation; `nexis.simd` has no `bench` row and no off-CPU
   dispatch.
 - **Not serializable**: functions, vars, transients, namespaces,
   tx handles, records, protocols (`:unserializable`).
-- **Nextomic follow-ups** (listed in `docs/NEXTOMIC.md` §6):
-  transaction functions and `:db.fn/cas`, excision, full-text,
-  lazy entities, a datom heap kind.
+- **Nextomic follow-ups** (`HANDOFF.md` §6.2): a lazy entity kind,
+  a datom heap kind, Unicode case folding for full-text, hash-join
+  estimate quality.
 
 ## Permanent differences from Clojure/JVM
 

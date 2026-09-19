@@ -47,7 +47,7 @@ transactions are data too. Nextomic maps that onto emdb with byte
 keys whose order is the index order: four current trees answer
 ordinary reads with no per-fact fold, four history trees carry the
 transaction in the key and answer the time views, and `nx/txlog`,
-`nx/idents` and `nx/sys` complete eleven named trees in one file. One
+`nx/idents` and `nx/sys` complete twelve named trees in one file. One
 process, one file, no transactor, and any number of processes can
 open the file and see each other's writes.
 
@@ -63,11 +63,11 @@ git status                        # clean main
 zig build install                 # bin/nexis and bin/nexis-golden
 ./bin/nexis --help                # usage; lists the namespaces available without a file
 zig build quick                   # the inner loop, ~35-50 s warm
-zig build test --summary all      # the gate: 1383 tests, 147 steps, ~4 min wall
+zig build test --summary all      # the gate: 1439 tests, 154 steps, ~4 min wall
 ```
 
-The gate's last line reads `Build Summary: 147/147 steps succeeded;
-1383/1383 tests passed`, preceded by `golden: ok=10 updated=0
+The gate's last line reads `Build Summary: 154/154 steps succeeded;
+1439/1439 tests passed`, preceded by `golden: ok=10 updated=0
 failed=0 missing=0`. Two integration binaries end with a benchmark
 whose row-count checks always run; the build runner echoes their
 stderr as `failed command:` lines while both succeed, so read the
@@ -212,7 +212,7 @@ imported by `stdlib` only. Files, one sentence each:
 | `root.zig` | module root; re-exports |
 | `key.zig` | sortable value encodings and index key layout: one tag byte orders types, byte order equals value order within a type, ids are 6-byte big-endian, attributes 4-byte, `top = (t << 1) \| added`; `v` is always followed by fixed-width fields so it carries no length |
 | `datom.zig` | the `Datom` struct and the txlog entry codec |
-| `store.zig` | `Env` ownership, the eleven `TreeId`s opened in one bootstrap transaction, `sys` counters, bootstrap ids, raw put/delete/scan and the `FoldScan` that implements as-of/since/history as one window over the history trees |
+| `store.zig` | `Env` ownership, the twelve `TreeId`s opened in one bootstrap transaction, `sys` counters, bootstrap ids, raw put/delete/scan and the `FoldScan` that implements as-of/since/history as one window over the history trees |
 | `idents.zig` | durable keyword ↔ id mapping with a per-connection cache; a transaction's mints wait in a `Minter` and publish after commit |
 | `schema.zig` | attributes as-of a basis, built from the attribute partition's datoms; per-attribute counts for the planner |
 | `transact.zig` | the transaction protocol: begin, normalise, tempids, expand, schema checks, write, commit; the overlay model that makes implicit retracts and same-transaction unique claims O(1) |
@@ -248,7 +248,7 @@ context, or the bare keyword when there is nothing more to say.
 
 | namespace | contents |
 |---|---|
-| `nexis.core` (auto-referred) | 143 natives in `src/stdlib.zig` `core_fns` (sequences, HOFs, collections, arithmetic, predicates, strings, I/O, dynamic bindings) plus 45 definitions in `src/stdlib/core.nx`: 18 macros (`when-let if-let dotimes with-tx with-read-tx with-snapshot binding set! declare if-not while letfn doseq cond-> cond->> some-> some->> as->`) and 27 functions (`true? false? second third last reverse take drop constantly complement partial comp every? not-every? some not-any? merge update get-in assoc-in update-in frequencies group-by interpose juxt fnil merge-with`) |
+| `nexis.core` (auto-referred) | 163 natives in `src/stdlib.zig` `core_fns` (sequences, HOFs, collections, arithmetic, predicates, strings, I/O, dynamic bindings) plus 45 definitions in `src/stdlib/core.nx`: 18 macros (`when-let if-let dotimes with-tx with-read-tx with-snapshot binding set! declare if-not while letfn doseq cond-> cond->> some-> some->> as->`) and 27 functions (`true? false? second third last reverse take drop constantly complement partial comp every? not-every? some not-any? merge update get-in assoc-in update-in frequencies group-by interpose juxt fnil merge-with`) |
 | `db` | 23 natives: `open close ref ref? put-key! get-key delete-key! present? begin-write begin-read commit! abort-write! abort-read! put! get delete! deref alter! scan reduce-tree snapshot release-snapshot! snapshot?` |
 | `nexis.string` | `lower-case upper-case trim split join replace` |
 | `nexis.simd` | the typed-vector kernels `sum dot scale map` over `i64-vector` / `f64-vector` values (`docs/TYPED_VECTOR.md` §7.2); `(require '[nexis.simd :as tv])` aliases it |
@@ -256,7 +256,7 @@ context, or the bare keyword when there is nothing more to say.
 | `nexis.test` | `deftest is testing run-tests run-all-tests` and the registry and reporter they share, in `src/stdlib/test.nx` (`docs/TOOLING.md` §3) |
 | `nexis.pprint` | `pprint pprint-str` in `src/stdlib/pprint.nx` (`docs/TOOLING.md` §4) |
 | `nexis.math` | 5 natives `sqrt pow floor ceil round` plus `PI` and `E` from `src/stdlib/math.nx` (`docs/TOOLING.md` §4) |
-| `nextomic` | 20 natives: `connect release db basis-t transact! entity entid ident datoms as-of since history tx-range schema sync q explain pull pull-many with`, plus the macro `with-conn` from `src/stdlib/nextomic.nx` |
+| `nextomic` | 22 natives: `connect release db basis-t transact! excise! entity entid ident datoms index-range as-of since history tx-range schema sync q explain pull pull-many with`, plus the macro `with-conn` from `src/stdlib/nextomic.nx` |
 | `user` | the current namespace at start |
 
 `src/cli.zig` `bootRuntime` installs the tables, bootstraps `core.nx`
@@ -414,7 +414,7 @@ polish; their findings are folded into tests. What they left open is
 Each gap: symptom, cause, approach, the test that would prove it,
 size. Nothing here is a data-corruption risk.
 
-### 6.3 Clojure surface gaps
+### 6.1 Clojure surface gaps
 
 Each is small and self-contained in `src/expand.zig`,
 `src/compile.zig`, `src/stdlib.zig` or `src/stdlib/core.nx`; each
@@ -427,24 +427,7 @@ through `bin/nexis`:
 | symbols not callable | `('a {'a 1})` → `:not-callable` | `vm.zig` lookup arm; PLAN §23 #33 promises keywords only, so state or extend |
 | macros receive only their arguments | no `&form`/`&env` (PLAN §23 #34) | `expand.zig` `callUserMacro` passes the arg forms as values; `macroexpand-1` at run time has no lexical environment to offer either |
 
-### 6.5 Datalog function-position variables
-
-*Symptom*: `[(?f ?x) ?y]` and `[(?pred ?x)]` are `:nextomic/
-query-syntax`; the function position takes a symbol naming a function
-(`docs/NEXTOMIC.md` §5, last sentence of "Execute").
-
-*Approach*: `query/parse.zig` accepts a variable in function position;
-`query/plan.zig` treats it as bound like any input; `query/exec.zig`
-calls the cell's value through the `CallHook`.
-
-*Proof*: corpus cases in `nextomic_q.zig` with `:in $ ?f` bound to a
-`defn`'d function and to a keyword; a `.nx` line in `query.nx`; a
-row in §5.
-
-*Size*: three files, a few dozen lines each.
-
-
-### 6.8 Nextomic follow-ups
+### 6.2 Nextomic follow-ups
 
 In the order they unblock users; each wants its `docs/NEXTOMIC.md`
 row, a corpus or `.nx` case and its `.out`:
@@ -477,12 +460,10 @@ row, a corpus or `.nx` case and its `.out`:
   runtime does not carry; adding one changes the rows the tokens tree
   holds, so it comes with a rebuild of the tree at open.
 
-### 6.9 Smaller items
+### 6.3 Smaller items
 
-- `zig fmt --check` fails on `src/pool.zig`, `src/value.zig`,
-  `src/golden.zig`, `src/nexis.zig` and the generated
-  `src/parser.zig`; every other file under `src/` and `test/` is
-  clean.
+- `zig fmt --check` fails on the generated `src/parser.zig`; every
+  other file under `src/`, `test/` and `build.zig` is clean.
 - `for` returns a vector, not a seq; `map`/`filter`/`reduce` are
   eager (PLAN §23 #14; a `stream` library is an open question).
 - Not serializable (`:unserializable`): functions, vars, transients,
@@ -572,8 +553,8 @@ runs the gate optimized and `NEXTOMIC_BENCH=1 zig build nextomic-test
 A Debug binary under the testing allocator is not a performance
 measurement.
 
-**Formatting.** `zig fmt --check <files you touched>`; the five files
-in §6.9 are the only ones that fail, and `src/parser.zig` is generated
+**Formatting.** `zig fmt --check <files you touched>`; the generated
+`src/parser.zig` is the only file that fails, and it is generated
 (`zig build parser` after any change to `nexis.grammar`; commit the
 regenerated file with the grammar).
 
@@ -584,22 +565,16 @@ regenerated file with the grammar).
 
 ## 8. Recommended order of work
 
-1. **Clojure surface gaps (§6.3), `case` and syntax-quote first.**
-   Each is a morning's work with an obvious test; together they are
-   most of what a Clojure programmer trips over in the first hour.
-   `defn` docstrings, multi-arity `fn`, finally-only `try` and the
-   conversions follow in whatever order the next program needs.
-3. **Datalog function-position variables (§6.5)** and the query
-   surface items in §6.8, driven by the first real query that needs
-   them; each is a parse/plan/exec triple with a corpus case.
-4. **Transaction functions and `:db.fn/cas`, then excision and
-   full-text (§6.8).** Transaction functions unlock the next class
-   of Nextomic programs; the callback into the VM follows the
-   rooting rule of `docs/GC.md` §11.5.
-6. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
+1. **`eval` (§6.1)**, the one Clojure surface form still absent; the
+   compiler hooks `macroexpand-1` and `read-string` use are the
+   pattern, and the missing piece is a routine compiled and run in
+   the calling VM rather than a sub-VM.
+2. **A lazy entity kind (§6.2)** when a program reads a few
+   attributes of many entities; the design is written out there.
+3. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
    inline caches, SIMD CHAMP nodes, zero-copy strings from emdb
-   pages, hash-join tuning. Measure first with `zig build bench`;
-   `docs/BENCH.md` is the honesty gate.
+   pages, hash-join estimate quality. Measure first with `zig build
+   bench`; `docs/BENCH.md` is the honesty gate.
 
 Take them in this order unless a user need reorders them; every item
 starts with its spec section and its failing test.
