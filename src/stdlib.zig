@@ -1829,23 +1829,20 @@ fn fnDropLast(vm: *VM, args: []const Value) VmError!Value {
     return try buildListFromSlice(vm, items.items[0 .. items.items.len - drop]);
 }
 
-/// `(flatten coll)` → every non-sequential leaf, depth first.
+/// `(flatten coll)` → every non-sequential leaf of a list or
+/// vector, depth first; nil leaves are kept. Anything that is not
+/// sequential, nil included, flattens to `()`.
 fn fnFlatten(vm: *VM, args: []const Value) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
-    try flattenInto(vm, args[0], &results);
+    if (isSequential(args[0].kind())) try flattenInto(vm, args[0], &results);
     return try buildListFromSlice(vm, results.items);
 }
 
 fn flattenInto(vm: *VM, v: Value, out: *std.ArrayList(Value)) VmError!void {
-    switch (v.kind()) {
-        .list, .persistent_vector => {
-            var it = try makeSeqIter(vm, v);
-            while (try it.next()) |x| try flattenInto(vm, x, out);
-        },
-        .nil => {},
-        else => out.append(vm.allocator, v) catch return VmError.OutOfMemory,
-    }
+    if (!isSequential(v.kind())) return out.append(vm.allocator, v) catch VmError.OutOfMemory;
+    var it = try makeSeqIter(vm, v);
+    while (try it.next()) |x| try flattenInto(vm, x, out);
 }
 
 /// `(reductions f coll)` / `(reductions f init coll)` → every
