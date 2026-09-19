@@ -909,12 +909,28 @@ fn indent(w: *std.Io.Writer, depth: usize) !void {
     while (i < depth) : (i += 1) try w.writeAll("  ");
 }
 
+/// Scanned rows one seek is worth per doubling of the tree: a seek
+/// costs `log2(entries)` page-level comparisons against a hot tree, a
+/// scanned row one cursor step, one decode and one hash-index insert.
+/// Measured on the 200k-datom benchmark, where a hash join over a
+/// 40k-entry attribute costs what 9k seeks do.
+pub const hash_weight: u64 = 4;
+
+/// Does a scan of `s` over `rows` input rows run as an index nested
+/// loop (one seek per row) rather than as one scan of its constant
+/// prefix hash-joined on the shared variables? A pattern with no
+/// constant to seek by, or whose attribute arrives with the row (an
+/// ident a hash join could not match against attribute ids), always
+/// seeks.
+pub fn nestedLoop(s: *const Scan, rows: u64) bool {
+    const log_n: u64 = std.math.log2_int_ceil(u64, s.tree_entries + 2);
+    return s.hash_index == null or s.a == .bound or (std.math.mulWide(u64, rows, log_n) < std.math.mulWide(u64, s.hash_estimate, hash_weight));
+}
+
 /// The join `execScan` runs for `s` on `rows` input rows.
 fn joinKind(s: *const Scan, rows: u64) []const u8 {
     if (s.unsatisfiable) return "none";
-    const log_n: u64 = std.math.log2_int_ceil(u64, s.tree_entries + 2);
-    const nested = s.hash_index == null or s.a == .bound or (std.math.mulWide(u64, rows, log_n) < s.hash_estimate);
-    return if (nested) "nested" else "hash";
+    return if (nestedLoop(s, rows)) "nested" else "hash";
 }
 
 pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), depth: usize) (Failure || std.Io.Writer.Error)!void {

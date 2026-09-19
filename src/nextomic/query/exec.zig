@@ -14,9 +14,8 @@
 //!     transaction entity id and `added` the datom's flag. The mode of
 //!     the db-value is inside the `Read`, so scans see folded datoms.
 //!   - Per scan the join is an index nested loop (one seek per input
-//!     row) when `rows × log2(tree entries)` is below the estimate of
-//!     the single constant-prefix scan, else that one scan hash-joined
-//!     on the shared variables.
+//!     row) or one constant-prefix scan hash-joined on the shared
+//!     variables, as `plan.nestedLoop` decides from the input rows.
 //!   - Built-in predicates and functions are Zig over cells; any other
 //!     symbol goes to the `CallHook` with VM values, as does the value
 //!     of a variable in function position, and its errors propagate
@@ -154,10 +153,7 @@ pub const Exec = struct {
         var out = try Relation.init(self.arena, out_vars);
         if (s.unsatisfiable or rel.rows == 0) return out;
 
-        const log_n: u64 = std.math.log2_int_ceil(u64, s.tree_entries + 2);
-        // A bound attribute variable seeks per row: its cell may be an
-        // ident, which a hash join would not match against attribute ids.
-        const nested = s.hash_index == null or s.a == .bound or (std.math.mulWide(u64, rel.rows, log_n) < s.hash_estimate);
+        const nested = plan_mod.nestedLoop(s, rel.rows);
         const slots = s.slots();
 
         if (nested) {

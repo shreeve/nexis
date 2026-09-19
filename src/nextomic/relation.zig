@@ -284,6 +284,13 @@ pub const Relation = struct {
         return map;
     }
 
+    /// Column indexes of `vars`, each of which this relation has.
+    pub fn mapOf(self: *const Relation, vars: []const Var) ![]usize {
+        const map = try self.arena.alloc(usize, vars.len);
+        for (vars, map) |v, *m| m.* = self.colOf(v) orelse return error.MissingVar;
+        return map;
+    }
+
     /// Gather one row into `out`.
     pub fn rowInto(self: *const Relation, row: usize, out: []Cell) void {
         std.debug.assert(out.len == self.cols.len);
@@ -304,30 +311,90 @@ pub const Relation = struct {
         return true;
     }
 
-    /// The set of distinct row indexes of `self`, as a hash index from
-    /// row hash to the rows with that hash, compared for equality.
+    /// The hash of row `row` over the columns `cols`.
+    pub fn rowHashOn(self: *const Relation, cols: []const usize, row: usize) u64 {
+        var h: u64 = 0x1234_5678_9ABC_DEF0;
+        for (cols) |c| h = hash_mod.hashU64(h ^ self.cols[c].get(row).hash());
+        return h;
+    }
+
+    /// Cell-wise equality of row `a` over `cols` with row `b` of
+    /// `other` over `ocols`.
+    pub fn rowsEqlOn(self: *const Relation, cols: []const usize, a: usize, other: *const Relation, ocols: []const usize, b: usize) bool {
+        std.debug.assert(cols.len == ocols.len);
+        for (cols, ocols) |x, y| {
+            if (!self.cols[x].get(a).eql(other.cols[y].get(b))) return false;
+        }
+        return true;
+    }
+
+    /// A hash index over rows: row hash to the chain of rows with that
+    /// hash. The row hash mixes every cell already, so the map takes
+    /// it as the key as is; a chain is a linked list through `next`,
+    /// which costs nothing per row beyond its slot, and reads from the
+    /// row added last, so rows added last to first read in row order.
+    const RowIndex = struct {
+        head: std.HashMapUnmanaged(u64, u32, Identity, std.hash_map.default_max_load_percentage) = .empty,
+        next: std.ArrayList(u32) = .empty,
+
+        const none = std.math.maxInt(u32);
+
+        const Identity = struct {
+            pub fn hash(_: Identity, k: u64) u64 {
+                return k;
+            }
+            pub fn eql(_: Identity, a: u64, b: u64) bool {
+                return a == b;
+            }
+        };
+
+        /// Room for rows `0..n` before any `add`, so the map never
+        /// rehashes while it is built.
+        fn reserve(self: *RowIndex, arena: Allocator, n: usize) !void {
+            try self.head.ensureTotalCapacity(arena, @intCast(n));
+            try self.next.resize(arena, n);
+        }
+
+        /// The first row in the chain of hash `h`, or null.
+        fn first(self: *const RowIndex, h: u64) ?u32 {
+            return self.head.get(h);
+        }
+
+        /// The row after `row` in its chain, or null.
+        fn after(self: *const RowIndex, row: u32) ?u32 {
+            const n = self.next.items[row];
+            return if (n == none) null else n;
+        }
+
+        /// Add row `row` with hash `h` at the front of its chain.
+        fn add(self: *RowIndex, arena: Allocator, row: u32, h: u64) !void {
+            if (row >= self.next.items.len) try self.next.resize(arena, row + 1);
+            const gop = try self.head.getOrPut(arena, h);
+            self.next.items[row] = if (gop.found_existing) gop.value_ptr.* else none;
+            gop.value_ptr.* = row;
+        }
+    };
+
+    /// The set of distinct rows of `rel`, a `RowIndex` over every row
+    /// kept, compared cell-wise.
     const RowSet = struct {
         rel: *const Relation,
-        map: std.AutoHashMapUnmanaged(u64, std.ArrayList(usize)) = .empty,
+        index: RowIndex = .{},
 
         fn contains(self: *RowSet, other: *const Relation, row: usize, h: u64) bool {
-            const bucket = self.map.getPtr(h) orelse return false;
-            for (bucket.items) |r| {
-                if (self.rel.rowsEql(r, other, row)) return true;
+            var r = self.index.first(h);
+            while (r) |i| : (r = self.index.after(i)) {
+                if (self.rel.rowsEql(i, other, row)) return true;
             }
             return false;
         }
 
-        /// Insert row `row` of `self.rel`; false when an equal row was
-        /// already present.
+        /// Insert row `row` of `self.rel`, which is its last row; false
+        /// when an equal row was already present.
         fn insert(self: *RowSet, arena: Allocator, row: usize) !bool {
             const h = self.rel.rowHash(row);
-            const gop = try self.map.getOrPut(arena, h);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            for (gop.value_ptr.items) |r| {
-                if (self.rel.rowsEql(r, self.rel, row)) return false;
-            }
-            try gop.value_ptr.append(arena, row);
+            if (self.contains(self.rel, row, h)) return false;
+            try self.index.add(arena, @intCast(row), h);
             return true;
         }
     };
@@ -452,7 +519,8 @@ pub const Relation = struct {
     /// The natural join of `self` and `other` on their shared variables
     /// (a cross product when they share none). `other` is hashed on
     /// the shared variables; the result's columns are `self`'s followed
-    /// by `other`'s new variables.
+    /// by `other`'s new variables, its rows in `self`'s order with the
+    /// matches of a row in `other`'s order.
     pub fn hashJoin(self: *const Relation, other: *const Relation) !Relation {
         const on = try self.sharedVars(other);
         const extra = try self.newVars(other);
@@ -460,24 +528,25 @@ pub const Relation = struct {
         var out = try init(self.arena, out_vars);
         if (self.rows == 0 or other.rows == 0) return out;
 
-        const other_key = try other.project(on, false);
-        var index: std.AutoHashMapUnmanaged(u64, std.ArrayList(usize)) = .empty;
-        var i: usize = 0;
-        while (i < other.rows) : (i += 1) {
-            const gop = try index.getOrPut(self.arena, other_key.rowHash(i));
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(self.arena, i);
+        const on_self = try self.mapOf(on);
+        const on_other = try other.mapOf(on);
+        // Rows go in last to first, so the matches of a row come out
+        // in `other`'s row order and the result's order is settled.
+        var index: RowIndex = .{};
+        try index.reserve(self.arena, other.rows);
+        var i: usize = other.rows;
+        while (i > 0) {
+            i -= 1;
+            try index.add(self.arena, @intCast(i), other.rowHashOn(on_other, i));
         }
 
-        const self_key = try self.project(on, false);
         const extra_map = try self.arena.alloc(usize, extra.len);
         for (extra, extra_map) |v, *m| m.* = other.colOf(v).?;
 
-        i = 0;
         while (i < self.rows) : (i += 1) {
-            const bucket = index.get(self_key.rowHash(i)) orelse continue;
-            for (bucket.items) |j| {
-                if (!self_key.rowsEql(i, &other_key, j)) continue;
+            var r = index.first(self.rowHashOn(on_self, i));
+            while (r) |j| : (r = index.after(j)) {
+                if (!self.rowsEqlOn(on_self, i, other, on_other, j)) continue;
                 for (out.cols[0..self.cols.len], 0..) |*c, sc| try c.append(self.arena, self.cell(i, sc));
                 for (out.cols[self.cols.len..], extra_map) |*c, oc| try c.append(self.arena, other.cell(j, oc));
                 out.rows += 1;
@@ -709,6 +778,10 @@ test "hash join on shared vars and cross product" {
     var j = try people.hashJoin(&ages);
     try testing.expectEqualSlices(Var, &.{ 0, 1, 2 }, j.vars);
     try testing.expectEqual(@as(usize, 3), j.rows);
+    // Rows in `people` order, the matches of a row in `ages` order.
+    try testing.expect(j.cell(0, 2).eql(.{ .int = 30 }));
+    try testing.expect(j.cell(1, 2).eql(.{ .int = 31 }));
+    try testing.expect(j.cell(2, 2).eql(.{ .int = 40 }));
     try j.sort();
     try testing.expect(j.cell(0, 2).eql(.{ .int = 30 }));
     try testing.expect(j.cell(2, 1).eql(.{ .str = "cy" }));

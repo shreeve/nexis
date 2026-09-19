@@ -333,7 +333,10 @@ without an attribute; give the attribute when it is known.
 Clauses are ordered greedily by estimate given the variables bound so
 far; predicates run at the first point all their variables are bound.
 Join per step: index nested loop (seek per row) when `rows × log n` is
-below the scan estimate, otherwise a hash join on the shared variables.
+below four times the scan estimate, otherwise one scan of the constant
+prefix hash-joined on the shared variables (`plan.nestedLoop`; `explain`
+prints the kind per step). The hash side is a chained index keyed by
+row hash, sized up front.
 Estimates come from `treeStat` and per-attribute counts kept in
 `Schema`.
 

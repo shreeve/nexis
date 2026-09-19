@@ -1611,7 +1611,8 @@ test "transitive closure over a 5k-edge chain" {
 }
 
 test "benchmark: 200k datoms, three-way join" {
-    const fx = try Fx.init("q_bench");
+    // A benchmark measures the engine, not the testing allocator.
+    const fx = try Fx.initWith("q_bench", std.heap.c_allocator);
     defer fx.deinit();
     _ = try fx.transact(
         \\[{:db/ident :emp/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -1647,7 +1648,7 @@ test "benchmark: 200k datoms, three-way join" {
     const rnd = prng.random();
     while (start < emps) : (start += batch) {
         var ops: std.ArrayList(nextomic.Op) = .empty;
-        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         for (start..start + batch) |i| {
@@ -1669,32 +1670,71 @@ test "benchmark: 200k datoms, three-way join" {
     const q3 = try fx.read("[:find ?n ?dn :where [?d :dept/name \"d7\"] [?e :emp/dept ?d] [?e :emp/name ?n] [?d :dept/name ?dn]]");
     const q_age = try fx.read("[:find ?n ?dn :where [?e :emp/age 33] [?e :emp/dept ?d] [?d :dept/name ?dn] [?e :emp/name ?n]]");
     const q_hash = try fx.read("[:find (count ?e) . :where [?e :emp/active true] [?e :emp/dept ?d] [?d :dept/name \"d3\"]]");
+    // Two joins either side of the nested-loop/hash-join crossover: the
+    // rows out of the age seeks decide how :emp/name and :emp/salary run.
+    const q_join = try fx.read("[:find (count ?n) . :in $ [?a ...] :where [?e :emp/age ?a] [?e :emp/name ?n] [?e :emp/salary ?s]]");
+    const ages_one = try fx.read("[33]");
+    const ages_mid = try fx.read("[33 34 35]");
+    const ages_big = try fx.read("[20 21 22 23 24 25 26]");
 
-    // Warm, then time; rows first (no heap copy), then the full call.
-    _ = try query.q(testing.allocator, fx.interner(), &fx.heap, q3, dbv, none, &diag, opts);
-    const r0 = nowNs();
-    const rows3 = try runEngine(fx, fx.arena(), dbv, "[:find ?n ?dn :where [?d :dept/name \"d7\"] [?e :emp/dept ?d] [?e :emp/name ?n] [?d :dept/name ?dn]]", none);
-    const r1 = nowNs();
+    // Rows first (no heap copy), then the full call; each timing is
+    // the best of a few runs, so a cold page or a stray page fault
+    // does not stand for the engine.
+    const reps: usize = 5;
+    var best_rows: u64 = std.math.maxInt(u64);
+    var rows3: []const Row = &.{};
+    for (0..reps) |_| {
+        const r0 = nowNs();
+        rows3 = try runEngine(fx, fx.arena(), dbv, "[:find ?n ?dn :where [?d :dept/name \"d7\"] [?e :emp/dept ?d] [?e :emp/name ?n] [?d :dept/name ?dn]]", none);
+        best_rows = @min(best_rows, nowNs() - r0);
+    }
     try testing.expectEqual(emps / depts, rows3.len);
-    const t0 = nowNs();
-    const r3 = try query.q(testing.allocator, fx.interner(), &fx.heap, q3, dbv, none, &diag, opts);
-    const t1 = nowNs();
-    const r_age = try query.q(testing.allocator, fx.interner(), &fx.heap, q_age, dbv, none, &diag, opts);
-    const t2 = nowNs();
-    const r_hash = try query.q(testing.allocator, fx.interner(), &fx.heap, q_hash, dbv, none, &diag, opts);
-    const t3 = nowNs();
+    const b3 = try timeQuery(fx, q3, dbv, none, reps);
+    const b_age = try timeQuery(fx, q_age, dbv, none, reps);
+    const b_hash = try timeQuery(fx, q_hash, dbv, none, reps);
+    const b_one = try timeQuery(fx, q_join, dbv, &.{ value.nilValue(), ages_one }, reps);
+    const b_mid = try timeQuery(fx, q_join, dbv, &.{ value.nilValue(), ages_mid }, reps);
+    const b_big = try timeQuery(fx, q_join, dbv, &.{ value.nilValue(), ages_big }, reps);
+    const r3 = b3.result;
+    const r_age = b_age.result;
+    const r_hash = b_hash.result;
+    const r_one = b_one.result;
+    const r_mid = b_mid.result;
+    const r_big = b_big.result;
+    try testing.expect(r_one.asFixnum() > 0 and r_mid.asFixnum() > r_one.asFixnum() and r_big.asFixnum() > r_mid.asFixnum());
     try testing.expectEqual(emps / depts, champ.setCount(r3));
     try testing.expect(champ.setCount(r_age) > 0);
     try testing.expect(r_hash.asFixnum() > 0);
-    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    var out: std.Io.Writer.Allocating = .init(fx.gpa);
     defer out.deinit();
-    try query.explain(testing.allocator, fx.interner(), q3, dbv, none, &diag, opts, &out.writer);
+    try query.explain(fx.gpa, fx.interner(), q3, dbv, none, &diag, opts, &out.writer);
     if (!benchOutput()) return;
     std.debug.print("\n[bench] 200k datoms, {d} employees / {d} departments\n", .{ emps, depts });
-    std.debug.print("[bench] 3-way join by department (dept -> vaet -> eavt), {d} rows: {d} us to rows, {d} us with the result set\n", .{ champ.setCount(r3), (r1 - r0) / 1000, (t1 - t0) / 1000 });
-    std.debug.print("[bench] 3-way join by age (avet -> eavt -> eavt), {d} rows: {d} us\n", .{ champ.setCount(r_age), (t2 - t1) / 1000 });
-    std.debug.print("[bench] active count by department (aevt scan + hash join), {d} rows: {d} us\n", .{ r_hash.asFixnum(), (t3 - t2) / 1000 });
+    std.debug.print("[bench] 3-way join by department (dept -> vaet -> eavt), {d} rows: {d} us to rows, {d} us with the result set\n", .{ champ.setCount(r3), best_rows / 1000, b3.ns / 1000 });
+    std.debug.print("[bench] 3-way join by age (avet -> eavt -> eavt), {d} rows: {d} us\n", .{ champ.setCount(r_age), b_age.ns / 1000 });
+    std.debug.print("[bench] active count by department (aevt scan + hash join), {d} rows: {d} us\n", .{ r_hash.asFixnum(), b_hash.ns / 1000 });
+    std.debug.print("[bench] 3-way join from 1 age (avet seek, then name/salary), {d} rows: {d} us\n", .{ r_one.asFixnum(), b_one.ns / 1000 });
+    std.debug.print("[bench] 3-way join from 3 ages (avet seeks, then name/salary), {d} rows: {d} us\n", .{ r_mid.asFixnum(), b_mid.ns / 1000 });
+    std.debug.print("[bench] 3-way join from 7 ages (avet seeks, then name/salary), {d} rows: {d} us\n", .{ r_big.asFixnum(), b_big.ns / 1000 });
     std.debug.print("[bench] plan:\n{s}", .{out.written()});
+    out.clearRetainingCapacity();
+    try query.explain(fx.gpa, fx.interner(), q_join, dbv, &.{ value.nilValue(), ages_big }, &diag, opts, &out.writer);
+    std.debug.print("[bench] plan, 7 ages:\n{s}", .{out.written()});
+}
+
+/// The result of `q` and the fastest of `reps` timed runs.
+const Timed = struct { result: Value, ns: u64 };
+
+fn timeQuery(fx: *Fx, q: Value, dbv: DbValue, inputs: []const Value, reps: usize) !Timed {
+    var diag: query.Diag = .{};
+    var best: u64 = std.math.maxInt(u64);
+    var result = value.nilValue();
+    for (0..reps) |_| {
+        const t0 = nowNs();
+        result = try query.q(fx.gpa, fx.interner(), &fx.heap, q, dbv, inputs, &diag, .{});
+        best = @min(best, nowNs() - t0);
+    }
+    return .{ .result = result, .ns = best };
 }
 
 /// Timings print only when `NEXTOMIC_BENCH` is set; the checks run
