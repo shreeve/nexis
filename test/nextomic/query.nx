@@ -249,6 +249,47 @@
        (let [res (d/q '[:find ?n ?a :where [?e :person/name ?n] [?e :person/age ?a]] (d/db c))]
          (and (set? res) (= 6 (count res)) (= ["Ann" "Bob" "Cy" "Di" "Edward" "Flo"] (sort (map first res)))
               (contains? res ["Bob" 26]))))
+
+; --- full-text ------------------------------------------------------------
+
+; :person/bio is full-text from its creation; :order/items gains the flag
+; after its values exist and is backfilled.
+(d/transact! c [{:db/ident :person/bio :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/fulltext true}])
+(d/transact! c [{:person/email "ann@x" :person/bio "Ann runs the red team; loves Café Noir."}
+                {:person/email "bob@x" :person/bio "Bob, the Red Baron of billing"}
+                {:person/email "cy@x" :person/bio "Cy: blue-team lead, x2"}])
+(def before-items (d/db c))
+(d/transact! c [[:db/add :order/items :db/fulltext true]])
+(def ft (d/db c))
+(println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "red") [[?e ?v]]] [?e :person/name ?n]] ft)))
+(println (rows (d/q '[:find ?n ?v :where [(fulltext $ :person/bio "RED team") [[?e ?v]]] [?e :person/name ?n]] ft)))
+(println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "café") [[?e ?v]]] [?e :person/name ?n]] ft)))
+(println (rows (d/q '[:find ?n :in $ ?needle :where [(fulltext $ :person/bio ?needle) [[?e ?v]]] [?e :person/name ?n]] ft "team blue x2")))
+(println (d/q '[:find ?e :where [(fulltext $ :person/bio "red green") [[?e ?v]]]] ft))
+(println (d/q '[:find ?e :where [(fulltext $ :person/bio "...") [[?e ?v]]]] ft))
+(println (rows (d/q '[:find ?o ?v :where [(fulltext $ :order/items "apple") [[?e ?v]]] [?e :order/number ?o]] ft)))
+; Retracting and asserting keep the tokens in step; earlier views
+; re-tokenise the values as they were.
+(d/transact! c [[:db/retract [:person/email "bob@x"] :person/bio "Bob, the Red Baron of billing"]
+                {:person/email "bob@x" :person/bio "Bob now bills in blue"}
+                [:db/retract [:order/number 1] :order/items "apple"]])
+(println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "red") [[?e ?v]]] [?e :person/name ?n]] (d/db c))))
+(println (rows (d/q '[:find ?o :where [(fulltext $ :order/items "apple") [[?e ?v]]] [?e :order/number ?o]] (d/db c))))
+(println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "red") [[?e ?v]]] [?e :person/name ?n]] (d/as-of (d/db c) (d/basis-t ft)))))
+(println (d/q '[:find ?v :where [(fulltext $ :person/bio "blue") [[?e ?v]]]] (d/since (d/db c) (d/basis-t ft))))
+; Excision drops the entity's tokens with its datoms.
+(d/excise! c (d/entid ft [:person/email "ann@x"]) :person/bio)
+(println (d/q '[:find ?n :where [(fulltext $ :person/bio "red") [[?e ?v]]] [?e :person/name ?n]] (d/db c)))
+(println (t/caught (d/q '[:find ?v :where [(fulltext $ :order/items "apple") [[?e ?v]]]] before-items)))
+(println (t/caught (d/q '[:find ?v :where [(fulltext $ :person/name "ann") [[?e ?v]]]] ft)))
+(println (t/caught (d/q '[:find ?v :where [(fulltext $ :person/nope "ann") [[?e ?v]]]] ft)))
+(println (t/caught (d/q '[:find ?v :where [(fulltext $ :person/bio 42) [[?e ?v]]]] ft)))
+(println (t/caught (d/q '[:find ?v :where [(fulltext :person/bio "ann") [[?e ?v]]]] ft)))
+(println (t/caught (d/transact! c [[:db/add :person/age :db/fulltext true]])))
+(println (t/caught (d/transact! c [{:db/ident :person/nick :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one :db/fulltext true}])))
+(println (t/caught (d/transact! c [[:db/retract :person/bio :db/fulltext true]])))
+(t/check ":db/fulltext is a bootstrap attribute" (= 22 (d/entid ft :db/fulltext)))
+
 (d/release c)
 (println (t/caught (d/q ages db)))
 :query-done

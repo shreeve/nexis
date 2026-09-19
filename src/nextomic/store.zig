@@ -1,17 +1,21 @@
-//! store.zig — Env ownership, the eleven trees, sys counters, bootstrap
+//! store.zig — Env ownership, the twelve trees, sys counters, bootstrap
 //! and the raw datom write / scan primitives (NEXTOMIC.md §2).
 //!
 //! Invariants:
 //!   - The environment is opened with `pageSize = 16384` and
 //!     `maxNamedTrees = 128`; the page size is fixed for the file's life.
-//!   - All eleven trees are opened in one write transaction at open and
+//!   - All twelve trees are opened in one write transaction at open and
 //!     their `TreeId`s are cached for the store's life (tree registration
-//!     is the only non-thread-safe engine call).
+//!     is the only non-thread-safe engine call); a tree absent from the
+//!     file is created then, so a store written without one gains it.
 //!   - `sys["t"]` is the last committed logical transaction number and
 //!     commits atomically with the datoms it counts.
 //!   - Bootstrap ids are fixed (`boot`): a store created by any build has
-//!     `:db/ident` at 1 and `:db.unique/value` at 21, and a reopened store
-//!     reads the same ids back from the file.
+//!     `:db/ident` at 1, `:db.unique/value` at 21 and `:db/fulltext` at
+//!     22, and a reopened store reads the same ids back from the file. A
+//!     store whose idents lack `:db/fulltext` receives it at open, minted
+//!     at the store's next ident id in a transaction of its own, and the
+//!     id it took is `fulltext_aid`.
 //!   - Current-tree values are `[t:6]`, plus the payload in `nx/eavt`
 //!     for out-of-line values; history-tree values are empty, plus the
 //!     payload in `nx/eavt-h`.
@@ -39,7 +43,7 @@ pub const format_version: u16 = 1;
 pub const tree_names = [_][]const u8{
     "nx/eavt",   "nx/aevt",   "nx/avet",   "nx/vaet",
     "nx/eavt-h", "nx/aevt-h", "nx/avet-h", "nx/vaet-h",
-    "nx/txlog",  "nx/idents", "nx/sys",
+    "nx/txlog",  "nx/idents", "nx/sys",    "nx/fulltext",
 };
 
 pub const Trees = struct {
@@ -48,6 +52,8 @@ pub const Trees = struct {
     txlog: TreeId,
     idents: TreeId,
     sys: TreeId,
+    /// The tokens of `:db/fulltext` string values (NEXTOMIC.md §2).
+    fulltext: TreeId,
 
     pub inline fn cur(self: Trees, index: Index) TreeId {
         return self.current[@intFromEnum(index)];
@@ -74,6 +80,10 @@ pub const SyncMode = enum {
 
 pub const Options = struct {
     map_size: u64 = 256 * 1024 * 1024,
+    /// False leaves `:db/fulltext` out of the bootstrap, making a store
+    /// as one written without the attribute, for the test of its mint
+    /// at open.
+    fulltext_attr: bool = true,
 };
 
 // =============================================================================
@@ -106,8 +116,10 @@ pub const boot = struct {
     // Unique idents.
     pub const unique_identity: u32 = 20;
     pub const unique_value: u32 = 21;
+    /// The `:db/fulltext` attribute, in a store bootstrapped with it.
+    pub const fulltext: u32 = 22;
     /// First id minted after bootstrap.
-    pub const next_aid: u32 = 22;
+    pub const next_aid: u32 = 23;
     /// The bootstrap transaction.
     pub const t: u64 = 1;
 
@@ -134,7 +146,11 @@ pub const boot = struct {
         .{ .id = card_many, .name = "db.cardinality/many" },
         .{ .id = unique_identity, .name = "db.unique/identity" },
         .{ .id = unique_value, .name = "db.unique/value" },
+        .{ .id = fulltext, .name = "db/fulltext" },
     };
+    /// The idents through `unique_value`: the bootstrap without
+    /// `:db/fulltext`.
+    pub const idents_without_fulltext = idents[0 .. idents.len - 1];
 
     pub const Attr = struct {
         id: u32,
@@ -152,7 +168,10 @@ pub const boot = struct {
         .{ .id = is_component, .type_ident = type_boolean },
         .{ .id = doc, .type_ident = type_string },
         .{ .id = tx_instant, .type_ident = type_instant, .indexed = true },
+        .{ .id = fulltext, .type_ident = type_boolean },
     };
+    /// The ident and attribute datoms of `:db/fulltext`.
+    pub const fulltext_attr: Attr = attrs[attrs.len - 1];
 
     /// Value type named by a `:db.type/*` ident, or null.
     pub fn valueTypeOf(type_ident: u32) ?key.ValueType {
@@ -181,6 +200,8 @@ pub const Store = struct {
     trees: Trees,
     uuid: [16]u8,
     is_open: bool,
+    /// The id of the `:db/fulltext` attribute in this store.
+    fulltext_aid: u32,
 
     /// Open or create the store at `path`. The store is heap-allocated
     /// so the environment never moves while transactions reference it.
@@ -193,6 +214,7 @@ pub const Store = struct {
             .trees = undefined,
             .uuid = undefined,
             .is_open = false,
+            .fulltext_aid = boot.fulltext,
         };
         self.env = try emdb.Env.open(path, .{
             .pageSize = page_size,
@@ -207,8 +229,9 @@ pub const Store = struct {
         try self.openTrees(txn);
         if (try self.sysGet(txn, "format")) |_| {
             try self.readHeader(txn);
+            try self.ensureFulltextAttr(txn);
         } else {
-            try self.bootstrap(txn);
+            try self.bootstrap(txn, options.fulltext_attr);
         }
         try txn.commit();
         self.is_open = true;
@@ -236,6 +259,7 @@ pub const Store = struct {
             .txlog = ids[8],
             .idents = ids[9],
             .sys = ids[10],
+            .fulltext = ids[11],
         };
     }
 
@@ -249,7 +273,7 @@ pub const Store = struct {
 
     // ── Transactions ──────────────────────────────────────────────
 
-    /// Begin a read transaction with all eleven trees loaded.
+    /// Begin a read transaction with all twelve trees loaded.
     pub fn beginRead(self: *Store) !*Txn {
         if (!self.is_open) return error.Closed;
         const txn = try self.env.beginRead();
@@ -259,7 +283,7 @@ pub const Store = struct {
     }
 
     /// Begin a read-only child of the open write transaction `parent`,
-    /// seeing its uncommitted state, with all eleven trees loaded. The
+    /// seeing its uncommitted state, with all twelve trees loaded. The
     /// parent refuses mutations and commit until the child is finished.
     pub fn beginReadChild(self: *Store, parent: *Txn) !*Txn {
         if (!self.is_open) return error.Closed;
@@ -269,7 +293,7 @@ pub const Store = struct {
         return txn;
     }
 
-    /// Begin the write transaction with all eleven trees loaded.
+    /// Begin the write transaction with all twelve trees loaded.
     pub fn beginWrite(self: *Store, sync_mode: SyncMode) !*Txn {
         if (!self.is_open) return error.Closed;
         const txn = try self.env.beginWriteWith(.{ .sync = sync_mode.override() });
@@ -289,7 +313,8 @@ pub const Store = struct {
                 4...7 => self.trees.history[i - 4],
                 8 => self.trees.txlog,
                 9 => self.trees.idents,
-                else => self.trees.sys,
+                10 => self.trees.sys,
+                else => self.trees.fulltext,
             };
             if (id != expected) return error.Corrupted;
         }
@@ -708,7 +733,7 @@ pub const Store = struct {
 
     // ── bootstrap (§2.4) ──────────────────────────────────────────
 
-    fn bootstrap(self: *Store, txn: *Txn) !void {
+    fn bootstrap(self: *Store, txn: *Txn, with_fulltext: bool) !void {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -719,24 +744,40 @@ pub const Store = struct {
         std.Io.Threaded.global_single_threaded.io().random(&self.uuid);
         try self.sysPut(txn, "uuid", &self.uuid);
 
-        for (boot.idents) |id| try self.putIdent(txn, id.name, id.id);
+        const idents = if (with_fulltext) &boot.idents else boot.idents_without_fulltext;
+        const attrs = if (with_fulltext) &boot.attrs else boot.attrs[0 .. boot.attrs.len - 1];
+        for (idents) |id| try self.putIdent(txn, id.name, id.id);
 
         var datoms: std.ArrayList(Datom) = .empty;
         const now = nowMillis();
-        for (boot.attrs) |a| {
-            try datoms.append(arena, .{ .e = a.id, .a = boot.ident, .v = .{ .keyword = a.id }, .t = boot.t, .added = true });
-            try datoms.append(arena, .{ .e = a.id, .a = boot.value_type, .v = .{ .keyword = a.type_ident }, .t = boot.t, .added = true });
-            try datoms.append(arena, .{ .e = a.id, .a = boot.cardinality, .v = .{ .keyword = if (a.many) boot.card_many else boot.card_one }, .t = boot.t, .added = true });
-            if (a.unique_ident) |u| try datoms.append(arena, .{ .e = a.id, .a = boot.unique, .v = .{ .keyword = u }, .t = boot.t, .added = true });
-            if (a.indexed) try datoms.append(arena, .{ .e = a.id, .a = boot.index, .v = .{ .boolean = true }, .t = boot.t, .added = true });
-        }
-        for (boot.idents[boot.attrs.len..]) |id| {
+        for (attrs) |a| try appendAttrDatoms(arena, &datoms, a, boot.t);
+        for (idents[boot.attrs.len - 1 .. idents.len - @intFromBool(with_fulltext)]) |id| {
             try datoms.append(arena, .{ .e = id.id, .a = boot.ident, .v = .{ .keyword = id.id }, .t = boot.t, .added = true });
         }
         try datoms.append(arena, .{ .e = key.txEntity(boot.t), .a = boot.tx_instant, .v = .{ .instant = now }, .t = boot.t, .added = true });
+        try self.writeSystemTransaction(txn, arena, boot.t, now, datoms.items);
 
-        const batch = try arena.alloc(Prepared, datoms.items.len);
-        for (datoms.items, 0..) |d, i| {
+        try self.writeNextEid(txn, key.user_partition_start);
+        try self.writeNextAid(txn, if (with_fulltext) boot.next_aid else boot.fulltext);
+    }
+
+    /// The ident, value type, cardinality, unique and index datoms of a
+    /// bootstrap attribute at `t`.
+    fn appendAttrDatoms(arena: Allocator, datoms: *std.ArrayList(Datom), a: boot.Attr, t: u64) !void {
+        try datoms.append(arena, .{ .e = a.id, .a = boot.ident, .v = .{ .keyword = a.id }, .t = t, .added = true });
+        try datoms.append(arena, .{ .e = a.id, .a = boot.value_type, .v = .{ .keyword = a.type_ident }, .t = t, .added = true });
+        try datoms.append(arena, .{ .e = a.id, .a = boot.cardinality, .v = .{ .keyword = if (a.many) boot.card_many else boot.card_one }, .t = t, .added = true });
+        if (a.unique_ident) |u| try datoms.append(arena, .{ .e = a.id, .a = boot.unique, .v = .{ .keyword = u }, .t = t, .added = true });
+        if (a.indexed) try datoms.append(arena, .{ .e = a.id, .a = boot.index, .v = .{ .boolean = true }, .t = t, .added = true });
+    }
+
+    /// Write assertions the store makes on its own behalf as
+    /// transaction `t`: the index trees, the counts, the txlog entry and
+    /// `sys["t"]`. Every keyword value is an ident already in
+    /// `nx/idents`.
+    fn writeSystemTransaction(self: *Store, txn: *Txn, arena: Allocator, t: u64, now: i64, datoms: []const Datom) !void {
+        const batch = try arena.alloc(Prepared, datoms.len);
+        for (datoms, 0..) |d, i| {
             const avet = d.a == boot.ident or d.a == boot.tx_instant;
             batch[i] = .{
                 .e = d.e,
@@ -747,31 +788,59 @@ pub const Store = struct {
                 .vaet = false,
             };
         }
-        try self.writeBatch(txn, boot.t, batch, arena);
+        try self.writeBatch(txn, t, batch, arena);
 
         var counts = std.AutoHashMapUnmanaged(u32, u64).empty;
-        for (datoms.items) |d| {
+        for (datoms) |d| {
             const g = try counts.getOrPut(arena, d.a);
             if (!g.found_existing) g.value_ptr.* = 0;
             g.value_ptr.* += 1;
         }
         var it = counts.iterator();
-        while (it.next()) |e| try self.writeAttrCount(txn, e.key_ptr.*, e.value_ptr.*);
+        while (it.next()) |e| try self.writeAttrCount(txn, e.key_ptr.*, (try self.attrCount(txn, e.key_ptr.*)) + e.value_ptr.*);
 
-        const names: datom_mod.NameSource = .{ .ctx = @ptrCast(self), .identName = &bootIdentName };
-        const entry = try datom_mod.encodeTxlog(arena, now, datoms.items, &.{}, names);
-        try self.putTxlog(txn, boot.t, entry);
-
-        try self.writeT(txn, boot.t);
-        try self.writeNextEid(txn, key.user_partition_start);
-        try self.writeNextAid(txn, boot.next_aid);
+        var names = IdentNames{ .store = self, .txn = txn };
+        const entry = try datom_mod.encodeTxlog(arena, now, datoms, &.{}, .{ .ctx = @ptrCast(&names), .identName = &IdentNames.identName });
+        try self.putTxlog(txn, t, entry);
+        try self.writeT(txn, t);
     }
 
-    fn bootIdentName(_: *anyopaque, id: u32) anyerror!?[]const u8 {
-        for (boot.idents) |i| {
-            if (i.id == id) return i.name;
+    /// Ident names for the txlog encoder, from `nx/idents` through the
+    /// transaction that is writing.
+    const IdentNames = struct {
+        store: *Store,
+        txn: *Txn,
+
+        fn identName(ctx: *anyopaque, id: u32) anyerror!?[]const u8 {
+            const self: *IdentNames = @ptrCast(@alignCast(ctx));
+            return self.store.identNameById(self.txn, id);
         }
-        return null;
+    };
+
+    /// A store whose idents lack `:db/fulltext` receives the attribute
+    /// as a transaction of its own at the store's next ident id.
+    fn ensureFulltextAttr(self: *Store, txn: *Txn) !void {
+        if (try self.identIdByName(txn, "db/fulltext")) |id| {
+            self.fulltext_aid = id;
+            return;
+        }
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const id = try self.readNextAid(txn);
+        if (id == std.math.maxInt(u32)) return error.DatabaseFull;
+        const t = (try self.readT(txn)) + 1;
+        if (t >= key.tx_partition_bit) return error.DatabaseFull;
+        try self.putIdent(txn, "db/fulltext", id);
+        var attr = boot.fulltext_attr;
+        attr.id = id;
+        var datoms: std.ArrayList(Datom) = .empty;
+        const now = nowMillis();
+        try appendAttrDatoms(arena, &datoms, attr, t);
+        try datoms.append(arena, .{ .e = key.txEntity(t), .a = boot.tx_instant, .v = .{ .instant = now }, .t = t, .added = true });
+        try self.writeSystemTransaction(txn, arena, t, now, datoms.items);
+        try self.writeNextAid(txn, id + 1);
+        self.fulltext_aid = id;
     }
 };
 
@@ -839,6 +908,68 @@ test "open bootstraps once and reopen finds the same ids" {
         try testing.expectEqual(@as(?u32, boot.ident), try store.identIdByName(txn, "db/ident"));
         try testing.expectEqual(@as(u64, boot.idents.len), try store.attrCount(txn, boot.ident));
     }
+}
+
+test "a store without :db/fulltext receives it at open, at its next ident id" {
+    var td = try TestDir.init("store_fulltext_open");
+    defer td.deinit();
+    {
+        const store = try Store.open(testing.allocator, td.path.ptr, .{ .fulltext_attr = false });
+        defer store.close();
+        const txn = try store.beginRead();
+        defer txn.abort();
+        try testing.expect((try store.identIdByName(txn, "db/fulltext")) == null);
+        try testing.expectEqual(boot.fulltext, try store.readNextAid(txn));
+        try testing.expectEqual(@as(u64, 1), try store.readT(txn));
+    }
+    {
+        const store = try Store.open(testing.allocator, td.path.ptr, .{});
+        defer store.close();
+        try testing.expectEqual(boot.fulltext, store.fulltext_aid);
+        const txn = try store.beginRead();
+        defer txn.abort();
+        try testing.expectEqual(@as(?u32, boot.fulltext), try store.identIdByName(txn, "db/fulltext"));
+        try testing.expectEqual(boot.next_aid, try store.readNextAid(txn));
+        try testing.expectEqual(@as(u64, 2), try store.readT(txn));
+        try testing.expect((try store.getTxlog(txn, 2)) != null);
+        try testing.expectEqual(@as(u64, boot.idents.len), try store.attrCount(txn, boot.ident));
+        const prefix = try key.prefixBytes(testing.allocator, .eavt, .{ .e = boot.fulltext });
+        defer testing.allocator.free(prefix);
+        var s = try Store.scan(txn, store.trees.cur(.eavt), prefix);
+        var n: usize = 0;
+        while (s.next()) |_| n += 1;
+        try testing.expectEqual(@as(usize, 3), n);
+    }
+    // Opening again mints nothing more.
+    {
+        const store = try Store.open(testing.allocator, td.path.ptr, .{});
+        defer store.close();
+        const txn = try store.beginRead();
+        defer txn.abort();
+        try testing.expectEqual(@as(u64, 2), try store.readT(txn));
+        try testing.expectEqual(boot.next_aid, try store.readNextAid(txn));
+    }
+}
+
+test "a store whose next ident id is taken mints :db/fulltext past it" {
+    var td = try TestDir.init("store_fulltext_taken");
+    defer td.deinit();
+    {
+        const store = try Store.open(testing.allocator, td.path.ptr, .{ .fulltext_attr = false });
+        defer store.close();
+        const txn = try store.beginWrite(.none);
+        try store.putIdent(txn, "user/name", boot.fulltext);
+        try store.writeNextAid(txn, boot.fulltext + 1);
+        try txn.commit();
+    }
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    try testing.expectEqual(boot.fulltext + 1, store.fulltext_aid);
+    const txn = try store.beginRead();
+    defer txn.abort();
+    try testing.expectEqual(@as(?u32, boot.fulltext + 1), try store.identIdByName(txn, "db/fulltext"));
+    try testing.expectEqual(@as(?u32, boot.fulltext), try store.identIdByName(txn, "user/name"));
+    try testing.expectEqual(boot.fulltext + 2, try store.readNextAid(txn));
 }
 
 test "bootstrap datoms are in every index they belong to" {
@@ -988,17 +1119,17 @@ test "renaming an ident retires the old name and bumps the generation" {
     {
         const txn = try store.beginWrite(.none);
         try testing.expectEqual(@as(u64, 0), try store.readIdentGen(txn));
-        try store.putIdent(txn, "user/email", 22);
-        try store.renameIdent(txn, 22, "user/mail");
+        try store.putIdent(txn, "user/email", boot.next_aid);
+        try store.renameIdent(txn, boot.next_aid, "user/mail");
         try txn.commit();
     }
     const txn = try store.beginRead();
     defer txn.abort();
     try testing.expect((try store.identIdByName(txn, "user/email")) == null);
-    try testing.expectEqual(@as(?u32, 22), try store.retiredIdentId(txn, "user/email"));
-    try testing.expectEqual(@as(?u32, 22), try store.identIdByName(txn, "user/mail"));
+    try testing.expectEqual(@as(?u32, boot.next_aid), try store.retiredIdentId(txn, "user/email"));
+    try testing.expectEqual(@as(?u32, boot.next_aid), try store.identIdByName(txn, "user/mail"));
     try testing.expect((try store.retiredIdentId(txn, "user/mail")) == null);
-    try testing.expectEqualStrings("user/mail", (try store.identNameById(txn, 22)).?);
+    try testing.expectEqualStrings("user/mail", (try store.identNameById(txn, boot.next_aid)).?);
     try testing.expectEqual(@as(u64, 1), try store.readIdentGen(txn));
 }
 

@@ -14,7 +14,8 @@
 //!     up empty stays, with its instant and its marker, so `tx-range`
 //!     replays the same transactions with the datoms gone;
 //!   - the per-attribute current counts drop by the current rows
-//!     removed.
+//!     removed, and the tokens tree loses the rows of every current
+//!     string value of a `:db/fulltext` attribute.
 //! Datoms that refer to the entity through a ref attribute are not
 //! its datoms and stay. Nothing here touches `sys["t"]` or the
 //! transaction's own entry: those are the transaction's.
@@ -25,6 +26,7 @@ const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
 const store_mod = @import("store.zig");
 const schema_mod = @import("schema.zig");
+const fulltext = @import("fulltext.zig");
 
 const Allocator = std.mem.Allocator;
 const Txn = emdb.Txn;
@@ -81,6 +83,7 @@ pub fn removeDatoms(store: *Store, txn: *Txn, arena: Allocator, schema: *const S
     for (rows.items) |r| {
         const attr = schema.attr(r.a) orelse return error.Corrupted;
         const history = r.top != null;
+        if (!history and attr.fulltext) try fulltext.unindexRow(store, txn, arena, r.a, e, r.vbytes);
         // AEVT under a given attribute is one prefix delete below.
         if (a == null) try delete(store, txn, arena, .aevt, history, e, r);
         if (attr.inAvet()) try delete(store, txn, arena, .avet, history, e, r);
@@ -160,6 +163,7 @@ test "removeDatoms empties every tree of the entity and reports its transactions
             .{ .e = 100, .a = boot.value_type, .vbytes = vt_s, .added = true, .avet = false, .vaet = false },
             .{ .e = 100, .a = boot.cardinality, .vbytes = c1, .added = true, .avet = false, .vaet = false },
             .{ .e = 100, .a = boot.index, .vbytes = yes, .added = true, .avet = false, .vaet = false },
+            .{ .e = 100, .a = store.fulltext_aid, .vbytes = yes, .added = true, .avet = false, .vaet = false },
             .{ .e = 101, .a = boot.value_type, .vbytes = vt_r, .added = true, .avet = false, .vaet = false },
             .{ .e = 101, .a = boot.cardinality, .vbytes = c1, .added = true, .avet = false, .vaet = false },
             .{ .e = e, .a = 100, .vbytes = s1, .added = true, .avet = true, .vaet = false },
@@ -172,6 +176,7 @@ test "removeDatoms empties every tree of the entity and reports its transactions
         }, arena);
         try store.writeAttrCount(txn, 100, 1);
         try store.writeAttrCount(txn, 101, 2);
+        try fulltext.index(store, txn, arena, 100, e, "two", true);
         try store.writeT(txn, 3);
         try txn.commit();
     }
@@ -198,6 +203,7 @@ test "removeDatoms empties every tree of the entity and reports its transactions
     try testing.expect(none.next() == null);
     var vaet = try Store.scan(txn, store.trees.cur(.vaet), try key.prefixBytes(arena, .vaet, .{ .v = re }));
     try testing.expectEqual(f, (try key.unpackKey(.vaet, false, vaet.next().?.key)).e);
+    try testing.expectEqual(@as(usize, 0), (try fulltext.search(store, txn, arena, 100, try fulltext.tokens(arena, "two"))).len);
 
     // Attribute-only excision leaves the other attribute alone.
     const g: u64 = (1 << 33) + 2;

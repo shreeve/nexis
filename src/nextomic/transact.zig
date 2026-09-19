@@ -46,6 +46,7 @@ const schema_mod = @import("schema.zig");
 const db_mod = @import("db.zig");
 const marshal = @import("marshal.zig");
 const excise_mod = @import("excise.zig");
+const fulltext = @import("fulltext.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -1479,9 +1480,14 @@ const Ctx = struct {
     /// `:db/unique` backfills AVET from AEVT; none of them is retracted.
     fn applySchema(self: *Ctx) !void {
         if (!self.schema_touched) return;
-        var new_attrs: std.AutoHashMapUnmanaged(u32, struct { has_type: bool = false, has_card: bool = false, many: bool = false }) = .empty;
+        var new_attrs: std.AutoHashMapUnmanaged(u32, struct { has_type: bool = false, has_card: bool = false, many: bool = false, string: bool = false }) = .empty;
         var backfill: std.AutoHashMapUnmanaged(u32, Attr) = .empty;
         var unique_added: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        // Attributes gaining `:db/fulltext true`: existing ones backfill
+        // the tokens tree, new ones must be strings.
+        var fulltext_backfill: std.AutoHashMapUnmanaged(u32, Attr) = .empty;
+        var fulltext_new: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        const fulltext_aid = self.conn.store.fulltext_aid;
         // The card-one overwrite of `:db/cardinality` retracts the old
         // value beside the new one; that retraction is the change, not
         // a removal.
@@ -1493,12 +1499,22 @@ const Ctx = struct {
             if (!key.isAttrPartition(p.e)) continue;
             const a: u32 = @intCast(p.e);
             const existing = self.schema.attr(a);
+            if (p.attr.id == fulltext_aid) {
+                if (!p.added) return self.conflict(p.e, p.attr.id);
+                if (!p.v.boolean) continue;
+                if (existing) |ex| {
+                    if (ex.value_type != .string) return self.schemaRefused(a, null, ":db/fulltext takes a string attribute");
+                    if (!ex.fulltext) try fulltext_backfill.put(self.arena, a, ex.*);
+                } else try fulltext_new.put(self.arena, a, {});
+                continue;
+            }
             switch (p.attr.id) {
                 boot.value_type => {
                     if (!p.added or existing != null) return self.conflict(p.e, p.attr.id);
                     const g = try new_attrs.getOrPut(self.arena, a);
                     if (!g.found_existing) g.value_ptr.* = .{};
                     g.value_ptr.has_type = true;
+                    g.value_ptr.string = p.v.keyword == boot.type_string;
                 },
                 boot.cardinality => {
                     const many = p.v.keyword == boot.card_many;
@@ -1543,8 +1559,32 @@ const Ctx = struct {
             const many = if (self.schema.attr(a.*)) |ex| (if (card_changed.get(a.*) != null) !ex.many() else ex.many()) else new_attrs.get(a.*).?.many;
             if (many) return self.malformed("a unique attribute is cardinality one");
         }
+        var fit = fulltext_new.keyIterator();
+        while (fit.next()) |a| {
+            const n = new_attrs.get(a.*) orelse return self.schemaRefused(a.*, null, ":db/fulltext takes a string attribute");
+            if (!n.string) return self.schemaRefused(a.*, null, ":db/fulltext takes a string attribute");
+        }
         var bit = backfill.iterator();
         while (bit.next()) |e| try self.backfillAvet(e.value_ptr.*);
+        var fbit = fulltext_backfill.iterator();
+        while (fbit.next()) |e| try self.backfillFulltext(e.value_ptr.*);
+        // Pending string datoms of an attribute that is full-text from
+        // this transaction on belong in the tokens tree too.
+        for (self.overlay.items) |*p| {
+            if (fulltext_backfill.contains(p.attr.id) or fulltext_new.contains(p.attr.id)) p.attr.fulltext = true;
+        }
+    }
+
+    /// Index every current string value of the attribute in the tokens
+    /// tree, less this transaction's retractions.
+    fn backfillFulltext(self: *Ctx, attr: Attr) !void {
+        const store = self.conn.store;
+        var live = try self.liveRows(.aevt, .{ .a = attr.id });
+        while (try live.next()) |r| {
+            if (r.pending) |p| if (!p.added) continue;
+            const v = try self.valFromParts(r.parts);
+            try fulltext.index(store, self.txn, self.arena, attr.id, r.parts.e, v.string, true);
+        }
     }
 
     /// An attribute becoming cardinality one: no entity may hold two
@@ -1655,6 +1695,7 @@ const Ctx = struct {
             const g = try counts.getOrPut(self.arena, p.attr.id);
             if (!g.found_existing) g.value_ptr.* = 0;
             g.value_ptr.* += if (p.added) 1 else -1;
+            if (p.attr.fulltext and p.v == .string) try fulltext.index(store, self.txn, self.arena, p.attr.id, p.e, p.v.string, p.added);
         }
         try store.writeBatch(self.txn, self.t, batch, self.arena);
 

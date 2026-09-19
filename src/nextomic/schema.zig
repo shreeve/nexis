@@ -4,13 +4,16 @@
 //! Invariants:
 //!   - An entity in the attribute partition is an attribute iff it has a
 //!     `:db/valueType`; its entity id is its attribute id.
-//!   - Value type never changes once written; `:db/index` and
-//!     `:db/unique` can only be added; `:db/cardinality` may change, and
-//!     an attribute whose cardinality ever changed carries the whole
-//!     timeline of its assertions. So a Schema built at basis B answers
-//!     every earlier basis: `attrAt(a, b)` for `b < B` hides attributes
-//!     created after `b`, masks the AVET flags that arrived after `b`,
-//!     and reads the cardinality in force at `b` off the timeline.
+//!   - Value type never changes once written; `:db/index`, `:db/unique`
+//!     and `:db/fulltext` can only be added; `:db/cardinality` may
+//!     change, and an attribute whose cardinality ever changed carries
+//!     the whole timeline of its assertions. So a Schema built at basis
+//!     B answers every earlier basis: `attrAt(a, b)` for `b < B` hides
+//!     attributes created after `b`, masks the AVET and full-text flags
+//!     that arrived after `b`, and reads the cardinality in force at `b`
+//!     off the timeline.
+//!   - `:db/fulltext` is the one bootstrap attribute whose id differs
+//!     between stores (`Store.fulltext_aid`); the store supplies it.
 //!   - `count` is the number of current AEVT entries of the attribute at
 //!     the transaction the schema was built in; it is a planner estimate.
 
@@ -45,6 +48,11 @@ pub const Attr = struct {
     avet_since: u64 = 0,
     /// `t` of the `:db/cardinality` assertion in force.
     card_t: u64 = 0,
+    /// `:db/fulltext true`: the tokens tree carries the attribute's
+    /// string values.
+    fulltext: bool = false,
+    /// `t` of the `:db/fulltext true` assertion; 0 without one.
+    fulltext_since: u64 = 0,
     /// Every `:db/cardinality` assertion up to the schema's basis, in
     /// `t` order, for an attribute whose cardinality has changed; empty
     /// when it never did.
@@ -85,7 +93,7 @@ pub const Schema = struct {
         key.writeId(&start, 1);
         key.writeId(&end, key.attr_partition_end);
 
-        var acc = Accumulator{};
+        var acc = Accumulator{ .fulltext_aid = store.fulltext_aid };
         if (basis == now) {
             var s = try Store.scanRange(txn, store.trees.cur(.eavt), &start, &end);
             while (s.next()) |kv| {
@@ -148,8 +156,8 @@ pub const Schema = struct {
     }
 
     /// The attribute as it was at basis `at <= self.basis`: absent when
-    /// it did not exist yet, with AVET flags cleared when they arrived
-    /// after `at`, and the cardinality in force at `at`.
+    /// it did not exist yet, with AVET and full-text flags cleared when
+    /// they arrived after `at`, and the cardinality in force at `at`.
     pub fn attrAt(self: *const Schema, a: u32, at: u64) ?Attr {
         const p = self.attrs.getPtr(a) orelse return null;
         if (p.since > at) return null;
@@ -158,6 +166,10 @@ pub const Schema = struct {
             copy.indexed = false;
             copy.unique = .none;
             copy.avet_since = 0;
+        }
+        if (copy.fulltext_since > at) {
+            copy.fulltext = false;
+            copy.fulltext_since = 0;
         }
         for (copy.card_changes) |c| {
             if (c.t > at) break;
@@ -174,6 +186,7 @@ pub const Schema = struct {
     /// Accumulates one attribute entity's rows; rows arrive in `(e a)`
     /// order so an entity is complete when `e` changes.
     const Accumulator = struct {
+        fulltext_aid: u32,
         e: u64 = 0,
         value_type: ?ValueType = null,
         type_t: u64 = 0,
@@ -184,12 +197,21 @@ pub const Schema = struct {
         indexed: bool = false,
         index_t: u64 = 0,
         component: bool = false,
+        fulltext: bool = false,
+        fulltext_t: u64 = 0,
 
         fn row(self: *Accumulator, schema: *Schema, arena: Allocator, fact: []const u8, t: u64) !void {
             const parts = try key.unpackKey(.eavt, false, fact);
             if (parts.e != self.e) {
                 try self.flush(schema, arena);
-                self.* = .{ .e = parts.e };
+                self.* = .{ .fulltext_aid = self.fulltext_aid, .e = parts.e };
+            }
+            if (parts.a == self.fulltext_aid) {
+                const kv = try key.decodeVal(arena, parts.v);
+                if (kv != .val or kv.val != .boolean) return error.Corrupted;
+                self.fulltext = kv.val.boolean;
+                self.fulltext_t = t;
+                return;
             }
             const kv = try key.decodeVal(arena, parts.v);
             switch (parts.a) {
@@ -245,6 +267,8 @@ pub const Schema = struct {
                 .since = self.type_t,
                 .avet_since = avet_since,
                 .card_t = self.card_t,
+                .fulltext = self.fulltext,
+                .fulltext_since = if (self.fulltext) self.fulltext_t else 0,
             });
         }
     };
@@ -298,8 +322,9 @@ test "a cardinality change carries its timeline for every basis" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Attribute 22: string, card-one at t=2; many at t=3; one again at t=5.
-    const a: u32 = 22;
+    // The first minted attribute: string, card-one at t=2; many at t=3;
+    // one again at t=5.
+    const a: u32 = boot.next_aid;
     {
         const txn = try store.beginWrite(.none);
         const vt = try key.valBytes(arena, .{ .keyword = boot.type_string });
@@ -350,8 +375,9 @@ test "attrAt masks flags that arrived after the asked basis" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Attribute 22: string, card-one at t=2; index added at t=3.
-    const a: u32 = 22;
+    // The first minted attribute: string, card-one at t=2; index added
+    // at t=3.
+    const a: u32 = boot.next_aid;
     {
         const txn = try store.beginWrite(.none);
         const vt = try key.valBytes(arena, .{ .keyword = boot.type_string });
@@ -364,25 +390,36 @@ test "attrAt masks flags that arrived after the asked basis" {
         try store.writeBatch(txn, 3, &.{
             .{ .e = a, .a = boot.index, .vbytes = yes, .added = true, .avet = false, .vaet = false },
         }, arena);
-        try store.writeT(txn, 3);
+        try store.writeBatch(txn, 4, &.{
+            .{ .e = a, .a = store.fulltext_aid, .vbytes = yes, .added = true, .avet = false, .vaet = false },
+        }, arena);
+        try store.writeT(txn, 4);
         try txn.commit();
     }
     const txn = try store.beginRead();
     defer txn.abort();
-    const schema = try Schema.build(testing.allocator, store, txn, 3, 3);
+    const schema = try Schema.build(testing.allocator, store, txn, 4, 4);
     defer schema.deinit();
     const full = schema.attr(a).?;
     try testing.expect(full.indexed);
+    try testing.expect(full.fulltext);
     try testing.expectEqual(@as(u64, 2), full.since);
     try testing.expectEqual(@as(u64, 3), full.avet_since);
+    try testing.expectEqual(@as(u64, 4), full.fulltext_since);
+    const at3 = schema.attrAt(a, 3).?;
+    try testing.expect(at3.indexed);
+    try testing.expect(!at3.fulltext);
+    try testing.expectEqual(@as(u64, 0), at3.fulltext_since);
     const at2 = schema.attrAt(a, 2).?;
     try testing.expect(!at2.indexed);
     try testing.expectEqual(ValueType.string, at2.value_type);
     try testing.expect(schema.attrAt(a, 1) == null);
+    try testing.expect(!schema.attr(boot.ident).?.fulltext);
 
     // The same shapes fall out of a history build at basis 2.
-    const old = try Schema.build(testing.allocator, store, txn, 2, 3);
+    const old = try Schema.build(testing.allocator, store, txn, 2, 4);
     defer old.deinit();
     try testing.expect(!old.attr(a).?.indexed);
+    try testing.expect(!old.attr(a).?.fulltext);
     try testing.expectEqual(@as(usize, boot.attrs.len + 1), old.count());
 }

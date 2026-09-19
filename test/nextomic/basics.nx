@@ -33,7 +33,7 @@
                   {:db/ident :person/uuid :db/valueType :db.type/uuid :db/cardinality :db.cardinality/one}
                   {:db/ident :person/photo :db/valueType :db.type/bytes :db/cardinality :db.cardinality/one}]))
 (t/check "schema transaction is t=2" (= 2 (:tx schema-report)))
-(t/check "attribute entities take ids in the attribute partition" (= 22 (d/entid (d/db c) :person/name)))
+(t/check "attribute entities take ids in the attribute partition" (= 23 (d/entid (d/db c) :person/name)))
 (t/check "db-before and db-after bracket the transaction"
        (and (= 1 (d/basis-t (:db-before schema-report))) (= 2 (d/basis-t (:db-after schema-report)))))
 (println (get (d/schema (d/db c)) :person/email))
@@ -136,7 +136,7 @@
 ; freely and many -> one while no entity holds two values.
 (def db-named (d/db c))
 (println (facts (d/transact! c [[:db/add :person/name :db/ident :person/full-name]])))
-(println [(d/entid (d/db c) :person/name) (d/entid (d/db c) :person/full-name) (d/ident (d/db c) 22)])
+(println [(d/entid (d/db c) :person/name) (d/entid (d/db c) :person/full-name) (d/ident (d/db c) 23)])
 (println (:person/full-name (d/entity (d/db c) bob)))
 (t/check "the old name is gone from every view" (= (keys (d/entity db-named bob)) (keys (d/entity (d/db c) bob))))
 (t/check "tx-range decodes the entries written under the old name"

@@ -1,6 +1,6 @@
 //! test/integration/nextomic_fn.zig — transaction functions,
-//! `:db.fn/cas`, schema alteration and excision through the shared
-//! fixture (NEXTOMIC.md §3, §4).
+//! `:db.fn/cas`, schema alteration, excision and full-text through the
+//! shared fixture (NEXTOMIC.md §3, §4, §5).
 //!
 //! Tx-data is read from source text, the functions a `:db.fn/call`
 //! names live in `nextomic_fx.zig`, and every case checks the report's
@@ -196,4 +196,80 @@ test "excision empties the entity for pull and q on every view, and tx-range rep
     }
     try testing.expectEqual(@as(usize, 4), marked);
     try testing.expectEqual(y.report.t, (try fx.db()).basis);
+}
+
+/// The rows of the tokens tree.
+fn tokenRows(fx: *Fx) !usize {
+    const store = fx.conn().store;
+    const txn = try store.beginRead();
+    defer txn.abort();
+    var s = try nextomic.Store.scan(txn, store.trees.fulltext, &.{});
+    var n: usize = 0;
+    while (s.next()) |_| n += 1;
+    return n;
+}
+
+fn count(v: Value) usize {
+    return @import("champ").setCount(v);
+}
+
+test "full-text stays in step under assert, retract, backfill and excision, on a store that gained :db/fulltext at open" {
+    const fx = try Fx.initWithoutFulltext("fn_fulltext");
+    defer fx.deinit();
+    const a = fx.arena();
+    // The mint took the store's next ident id, as its own transaction.
+    try testing.expectEqual(boot.fulltext, fx.conn().store.fulltext_aid);
+    try testing.expectEqual(@as(u64, 2), (try fx.db()).basis);
+    try testing.expectEqual(@as(usize, 0), try tokenRows(fx));
+
+    _ = try fx.transact(
+        \\[{:db/ident :doc/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :doc/title :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/fulltext true}
+        \\ {:db/ident :doc/body :db/valueType :db.type/string :db/cardinality :db.cardinality/many}]
+    );
+    const r = try fx.transact(
+        \\[{:db/id "a" :doc/n 1 :doc/title "Red Apple Pie" :doc/body ["sweet red filling" "flaky crust"]}
+        \\ {:db/id "b" :doc/n 2 :doc/title "Green apple" :doc/body ["tart"]}]
+    );
+    const doc_a = r.tempids[0].eid;
+    const eid = try std.fmt.allocPrint(a, "{d}", .{doc_a});
+    // "red apple pie" → red, apple, pie; "green apple" → green, apple.
+    try testing.expectEqual(@as(usize, 5), try tokenRows(fx));
+    const titled = try fx.db();
+    try testing.expectEqual(@as(usize, 1), count(try fx.q(titled, "[:find ?n :where [(fulltext $ :doc/title \"apple RED\") [[?e ?v]]] [?e :doc/n ?n]]")));
+    try testing.expectEqual(@as(usize, 2), count(try fx.q(titled, "[:find ?n :where [(fulltext $ :doc/title \"apple\") [[?e ?v]]] [?e :doc/n ?n]]")));
+    try testing.expectEqual(@as(usize, 0), count(try fx.q(titled, "[:find ?n :where [(fulltext $ :doc/title \"apple plum\") [[?e ?v]]] [?e :doc/n ?n]]")));
+    try testing.expectError(error.TxData, fx.q(titled, "[:find ?v :where [(fulltext $ :doc/body \"red\") [[?e ?v]]]]"));
+    try testing.expectError(error.Schema, fx.transact("[[:db/add :doc/n :db/fulltext true]]"));
+
+    // The flag's arrival backfills every current value of the attribute.
+    _ = try fx.transact("[[:db/add :doc/body :db/fulltext true]]");
+    try testing.expectEqual(@as(usize, 11), try tokenRows(fx));
+    const backfilled = try fx.db();
+    try testing.expectEqual(@as(usize, 1), count(try fx.q(backfilled, "[:find ?v :where [(fulltext $ :doc/body \"red\") [[?e ?v]]]]")));
+    try testing.expectEqual(@as(usize, 1), count(try fx.q(backfilled, "[:find ?v :where [(fulltext $ :doc/body \"crust\") [[?e ?v]]]]")));
+    // An earlier view does not know the flag.
+    try testing.expectError(error.TxData, fx.q(titled, "[:find ?v :where [(fulltext $ :doc/body \"red\") [[?e ?v]]]]"));
+
+    // Retracting one value of the many attribute leaves the other's rows.
+    _ = try fx.transact(try std.fmt.allocPrint(a, "[[:db/retract {d} :doc/body \"sweet red filling\"] [:db/add {d} :doc/title \"Red Plum Pie\"]]", .{ doc_a, doc_a }));
+    try testing.expectEqual(@as(usize, 8), try tokenRows(fx));
+    const retracted = try fx.db();
+    try testing.expectEqual(@as(usize, 0), count(try fx.q(retracted, "[:find ?v :where [(fulltext $ :doc/body \"red\") [[?e ?v]]]]")));
+    try testing.expectEqual(@as(usize, 1), count(try fx.q(retracted, "[:find ?v :where [(fulltext $ :doc/body \"crust\") [[?e ?v]]]]")));
+    try testing.expectEqual(@as(usize, 1), count(try fx.q(retracted, "[:find ?v :where [(fulltext $ :doc/title \"plum\") [[?e ?v]]]]")));
+    try testing.expectEqual(@as(usize, 1), count(try fx.q(retracted, "[:find ?v :where [(fulltext $ :doc/title \"apple\") [[?e ?v]]]]")));
+    // Earlier and history views re-tokenise the values they hold.
+    try testing.expectEqual(@as(usize, 1), count(try fx.q(backfilled, "[:find ?v :where [(fulltext $ :doc/body \"red\") [[?e ?v]]]]")));
+    try testing.expectEqual(@as(usize, 2), count(try fx.q(retracted.withHistory(), "[:find ?v :where [(fulltext $ :doc/title \"red\") [[?e ?v]]]]")));
+    try testing.expectEqual(@as(usize, 1), count(try fx.q(retracted.sinceT(backfilled.basis), "[:find ?v :where [(fulltext $ :doc/title \"plum\") [[?e ?v]]]]")));
+
+    // Excision drops the entity's rows and only those.
+    const x = try nextomic.transact.excise(fx.conn(), a, try fx.read(eid), null, .{});
+    try testing.expect(x.removed > 0);
+    try testing.expectEqual(@as(usize, 3), try tokenRows(fx));
+    const excised = try fx.db();
+    try testing.expectEqual(@as(usize, 0), count(try fx.q(excised, "[:find ?v :where [(fulltext $ :doc/body \"crust\") [[?e ?v]]]]")));
+    try testing.expectEqual(@as(usize, 1), count(try fx.q(excised, "[:find ?v :where [(fulltext $ :doc/title \"apple\") [[?e ?v]]]]")));
+    try testing.expectEqual(@as(usize, 0), count(try fx.q(backfilled, "[:find ?v :where [(fulltext $ :doc/body \"red\") [[?e ?v]]]]")));
 }

@@ -36,7 +36,7 @@ ok as-of before the update sees the old facts
 ok an older db-value is unchanged
 ok since shows only the new facts
 ok since has nothing for an untouched entity
-[{:db/id 4294967296, :person/name Ann} {:db/id 4294967300, :person/name Bob} nil {:db/id 36}]
+[{:db/id 4294967296, :person/name Ann} {:db/id 4294967300, :person/name Bob} nil {:db/id 37}]
 ok pull-many over a list
 ok pull-many over nothing
 :nextomic/history-view

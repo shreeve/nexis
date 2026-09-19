@@ -49,6 +49,30 @@ pub const Fx = struct {
         return self;
     }
 
+    /// A fixture over a store bootstrapped without `:db/fulltext`, so
+    /// the connection's open minted the attribute.
+    pub fn initWithoutFulltext(name: []const u8) !*Fx {
+        const tc = try testing.allocator.create(TestConn);
+        errdefer testing.allocator.destroy(tc);
+        tc.td = try nextomic.store.TestDir.init(name);
+        errdefer tc.td.deinit();
+        {
+            const store = try nextomic.Store.open(testing.allocator, tc.td.path.ptr, .{ .fulltext_attr = false });
+            store.close();
+        }
+        tc.interner = Interner.init(testing.allocator);
+        errdefer tc.interner.deinit();
+        tc.conn = try nextomic.Conn.open(testing.allocator, &tc.interner, tc.td.path.ptr, .{ .sync = .none });
+        const self = try testing.allocator.create(Fx);
+        self.* = .{
+            .tc = tc,
+            .heap = Heap.init(testing.allocator),
+            .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
+            .gpa = testing.allocator,
+        };
+        return self;
+    }
+
     pub fn deinit(self: *Fx) void {
         self.arena_state.deinit();
         self.heap.deinit();

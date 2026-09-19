@@ -608,6 +608,10 @@ const Parser = struct {
                 if (predicate) return self.fail("untuple needs a binding form");
                 if (args.len != 1) return self.fail("untuple takes one tuple");
             },
+            .fulltext => {
+                if (predicate) return self.fail("fulltext needs a binding form");
+                if (args.len != 3 or args[0] != .src) return self.fail("fulltext is (fulltext $ :attr \"needle\")");
+            },
         }
     }
 
@@ -1017,6 +1021,8 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("get-else"), b.sym("?e"), b.kw("a"), b.int(0) }), b.sym("?x") }) }),
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.lst(&.{ b.sym("tuple"), b.sym("?v") })}) }),
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("untuple"), b.sym("?v"), b.sym("?v") }), b.vec(&.{ b.sym("?x"), b.sym("?y") }) }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.lst(&.{ b.sym("fulltext"), b.sym("$"), b.kw("a"), b.sym("?v") })}) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("fulltext"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.vec(&.{ b.sym("?x"), b.sym("?y") })}) }) }),
     }) |bad_call| {
         try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, bad_call, &diag));
         try testing.expect(diag.message.len > 0);

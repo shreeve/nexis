@@ -12,6 +12,7 @@ pub const schema = @import("schema.zig");
 pub const db = @import("db.zig");
 pub const transact = @import("transact.zig");
 pub const excise = @import("excise.zig");
+pub const fulltext = @import("fulltext.zig");
 pub const relation = @import("relation.zig");
 pub const query = @import("query.zig");
 pub const pull = @import("pull.zig");
@@ -45,6 +46,7 @@ test {
     _ = db;
     _ = transact;
     _ = excise;
+    _ = fulltext;
     _ = relation;
     _ = query;
     _ = pull;
