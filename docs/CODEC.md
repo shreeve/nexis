@@ -1,21 +1,17 @@
-## CODEC.md — Durable Wire Format (Phase 1)
+## CODEC.md — Durable Wire Format
 
-**Status**: Phase 1 deliverable. Authoritative wire-format and API
-contract for `src/codec.zig`. Derivative from `PLAN.md` §15.6 /
+Authoritative wire-format and API contract for `src/codec.zig`. Derivative from `PLAN.md` §15.6 /
 §15.10 / §23 #25 (serialization scope frozen), `docs/SEMANTICS.md`
 §2.2 / §3.2 (numeric canonical form + hash invariants), and
 `docs/VALUE.md` §2 (Kind numbering). Those documents win on
-conflict. Reviewed peer-AI turn 20.
+conflict.
 
-This commit upgrades CODEC.md from the Phase 0 stub state to a full
-Phase 1 specification. The previous stub punted exact byte layout
-and varint choice to Phase 4; this amendment pins a **v1 interim
-wire format** sufficient to close PLAN §20.2 **gate test #5 (codec
-round-trip)** while leaving room for a Phase 4 "v2" format via the
-version envelope. Cross-process byte-canonicality for
-collections with non-deterministic iteration order (map, set)
-remains a Phase 4 concern; within-process round-trip equality +
-hash preservation is v1's contract.
+The format is the **v1 wire format**: it satisfies the PLAN §20.2
+codec round-trip property and leaves room for a byte-incompatible
+successor via the version envelope. Cross-process byte-canonicality
+for collections with non-deterministic iteration order (map, set)
+is not provided; within-process round-trip equality + hash
+preservation is the contract.
 
 ---
 
@@ -36,8 +32,7 @@ hash preservation is v1's contract.
   VALUE.md §2 but not yet allocatable in the runtime. Public
   codec API returns `error.UnserializableKind` if encountered;
   internal assertions may panic loudly for truly-impossible inputs
-  (peer-AI turn 20 wording nuance: public API = typed error;
-  "this can't happen" = assert).
+  (public API = typed error; "this can't happen" = assert).
 - `function`, `var_`, `transient`, `error_`, `meta_symbol`:
   non-serializable per PLAN §15.10 + §23 #25. Public API returns
   `error.UnserializableKind`.
@@ -50,17 +45,17 @@ hash preservation is v1's contract.
   Round-trip equality is unaffected because metadata never
   participates in equality (PLAN §23 #12).
 - **Cross-process byte-canonicality** for map/set (sorted-key
-  encoding). v1 encodes in iteration order. Phase 4 can add a
-  canonical-order minor version.
+  encoding). v1 encodes in iteration order. A canonical-order minor
+  version would add it.
 - **Schema-aware compact encoding** (skipping redundant kind
   tags when a sequential/associative container's element type is
-  homogeneous). Phase 4+ optimization.
+  homogeneous).
 
 ---
 
 ### 2. Wire format — v1
 
-**Envelope (top level only, peer-AI turn 20):**
+**Envelope (top level only):**
 
 ```
 [major: u8 = 1] [minor: u8 = 0] [ValueEncoding]
@@ -73,8 +68,8 @@ encoding, not a nested envelope.
 
 Major version bumps indicate breaking format changes. Minor
 version bumps indicate non-breaking additions (new kinds, new
-optional subformats). v1 ships `[1, 0]`. Phase 4's real canonical
-format may bump to `[2, 0]` if it's byte-incompatible or
+optional subformats). The version is `[1, 0]`. A canonical
+format would bump to `[2, 0]` if it's byte-incompatible or
 `[1, 1]` if additive.
 
 **Per-kind `ValueEncoding`** (kind byte always first, matching
@@ -102,8 +97,8 @@ VALUE.md §2 numeric values):
 - **Unsigned LEB128** for all lengths / counts (strings,
   keyword/symbol names, list/vector/map/set counts, bignum limb
   counts). Standard, compact, stdlib-friendly.
-- **Signed ZigZag LEB128** for `fixnum` values (peer-AI turn 20
-  pushback on fixed-width i64). Small integers (the common case)
+- **Signed ZigZag LEB128** for `fixnum` values (not fixed-width
+  i64). Small integers (the common case)
   encode in 1–2 bytes; worst-case i48 fits in 8 bytes (one more
   byte than fixed i64 LE, but rare). Net win for realistic
   workloads.
@@ -160,10 +155,10 @@ orders may encode to different byte sequences.
 
 Gate #5 (`decode(encode(v)) = v`) is satisfied; a hypothetical
 "canonical byte form for content-addressed storage" is NOT
-satisfied. Phase 4+ can add a minor-version bump introducing
-sorted-by-key encoding when that requirement lands.
+satisfied. A minor-version bump introducing sorted-by-key encoding
+would satisfy it.
 
-#### 2.6 Decode canonicalization policies (peer-AI turn 20)
+#### 2.6 Decode canonicalization policies
 
 Decode is **lenient** about input that is structurally valid but
 not canonical. Policies:
@@ -189,8 +184,8 @@ not canonical. Policies:
 
 Encode **always produces canonical output** for these cases (e.g.,
 encode never emits a non-canonical bignum in v1). Decode leniency
-is defensive against input that a Phase 4+ encoder, older encoder
-version, or external producer might emit.
+is defensive against input that another encoder version or an
+external producer might emit.
 
 ---
 
@@ -203,11 +198,12 @@ From PLAN §15.10 / §23 #25 (frozen):
 | `function` / closure | Code, upvalues, captured VM state are process-local. |
 | `var_` | Identity + mutation machinery are process-local. Serialize the root value instead. |
 | `transient` | Mutable by definition. Only `persistentBang`-ed results cross the codec. |
-| `namespace` | Process-local binding table (Phase 3). |
+| `namespace` | Process-local binding table. |
 | `tx handle` / `emdb.Env` connection | Open OS resources. |
 | `error_` | Stack traces carry process-local frame references. |
 | `meta_symbol` | Reserved; not yet allocated; non-serializable per metadata discipline. |
-| `byte_vector`, `typed_vector`, `durable_ref` | Reserved kinds not yet implemented; will serialize when their modules ship (Phase 4+). |
+| `byte_vector`, `typed_vector` | Reserved kinds with no implementation. |
+| `durable_ref` | An identity into a store; the value half of a durable pair is codec bytes, but a ref inside a value is `:unserializable` (`docs/DB.md` §9). |
 
 Attempting to encode any of these returns
 `error.UnserializableKind` at the public API. No silent stubs, no
@@ -263,8 +259,8 @@ pub const CodecError = error{
 
     /// Per-kind payload field is structurally invalid: bignum sign
     /// byte not in {0, 1}, or similar per-kind field that doesn't
-    /// fit a more specific error. Peer-AI turn 21 recommendation
-    /// against overloading `InvalidKindByte` for per-kind fields.
+    /// fit a more specific error. `InvalidKindByte` is not
+    /// overloaded for per-kind fields.
     MalformedPayload,
 
     /// Unsigned LEB128 decode produced a value that doesn't fit
@@ -382,33 +378,23 @@ general robustness property against malformed input.
 ### 8. Deferred (explicitly)
 
 - **Cross-process byte-canonicality** for maps and sets (sorted
-  keys). Phase 4+ minor version bump.
+  keys). Would be a minor version bump.
 - **Schema-aware encoders** that skip redundant kind tags for
-  homogeneous containers. Phase 4+ optimization.
+  homogeneous containers.
 - **Streaming encoder / decoder** (`*std.Io.Writer` / `*std.Io.Reader`
-  variants). Phase 4+; v1 uses fully-buffered encode/decode.
+  variants). Encode and decode are fully buffered.
 - **Byte-vector / typed-vector / durable-ref serialization.** Kinds
   not yet allocatable; ship with the respective kind modules.
 - **Versioned compact bignum encoding.** Current limbs-in-bytes
   format is simple but not maximally compact for small bignums
-  (which are rare by canonicalization). Phase 4+ if profiling
-  justifies.
-- **Emdb integration** (`src/db.zig`) — codec bytes become the
-  value half of durable-ref key-value pairs. Phase 4 per PLAN §21.
+  (which are rare by canonicalization).
+- **Emdb integration** (`src/db.zig`) — codec bytes are the value
+  half of durable key-value pairs; `docs/DB.md`.
 
 ---
 
-### 9. Amendment note
+### 9. Stability
 
-This file replaces the Phase 0 stub version of CODEC.md. Previous
-content said "Exact byte layout per kind / Varint choice /
-Versioning byte(s) — all Phase 4 deliverables." Phase 1 needed a
-concrete implementation to close gate test #5; this amendment
-pins a v1 interim wire format that satisfies the gate with
-room for a Phase 4 canonical format evolution via the version
-envelope.
-
-The v1 format is considered **stable within a process for Phase 1
-purposes** but NOT frozen for cross-version byte compatibility.
-Phase 4 is the final byte-freeze point; any changes at that time
-will bump the major or minor version in the envelope.
+The v1 format is **stable within a process** but NOT frozen for
+cross-version byte compatibility; any byte-level change bumps the
+major or minor version in the envelope.
