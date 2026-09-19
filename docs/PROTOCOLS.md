@@ -57,12 +57,12 @@ Facts about the boundary:
 
 ---
 
-### 1. Relationship to the v1 decision record
+### 1. Relationship to the decision record
 
-Protocols and records are a v1 scope addition, not a change to any
-architecturally load-bearing decision: v1 stays single-isolate,
-single-threaded, so protocols are static-dispatch + per-VM
-registries. Built-in polymorphism (`count`, `get`, `=`, ...) stays
+Protocols and records add scope without changing any
+architecturally load-bearing decision: the runtime is
+single-isolate and single-threaded, so protocols are static-dispatch
++ per-VM registries. Built-in polymorphism (`count`, `get`, `=`, ...) stays
 kind-switch based in Zig; user protocols sit beside it.
 
 ---

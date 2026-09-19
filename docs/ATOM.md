@@ -3,7 +3,7 @@
 Authoritative contract for `Kind.atom` (`src/atom.zig`) and the
 `atom`/`atom?`/`reset!`/`swap!`/`swap-vals!`/`compare-and-set!`
 native fns in `nexis.core`. Derivative from `PLAN.md` §23 (Hard
-Decisions; atoms enter v1 by Amendment Log entry), `docs/VALUE.md`
+Decisions; atoms enter by Amendment Log entry), `docs/VALUE.md`
 §2.2 (kind 34 `atom`) and `docs/SEMANTICS.md` §3.2 (equality
 categories). Those documents win on conflict.
 
@@ -12,7 +12,7 @@ Atoms are the in-memory mutable identity; durable mutation is
 mutation, single-VM, single-thread.
 
 Atoms are NOT a Clojure CAS retry primitive. PLAN.md §23 #5 freezes
-nexis v1 as single-isolate, single-threaded; an atom is a single
+nexis as single-isolate, single-threaded; an atom is a single
 mutable cell whose API mirrors `clojure.core/atom` for portability,
 but whose `compare-and-set!` is a deterministic check-and-set under
 the single-threaded execution model — no retry loop, no
@@ -47,11 +47,10 @@ synchronization primitives.
 - Validators (`:validator`), watches (`add-watch` / `remove-watch`),
   metadata on atoms (`:meta`). Every keyword opt to `(atom init …)`
   throws `:unsupported-arg`.
-- Real CAS / lock-free concurrency primitives. Single-threaded v1 has
-  no meaning for these; atoms here are sequential mutable cells.
-  Multi-isolate concurrency is post-v1 (PLAN.md §23 #5).
-- `agent` / `ref` / `dosync` — explicitly removed from v1 per
-  Appendix A.
+- Real CAS / lock-free concurrency primitives. A single-threaded
+  runtime has no meaning for these; atoms here are sequential mutable
+  cells. There is no multi-isolate concurrency (PLAN.md §23 #5).
+- `agent` / `ref` / `dosync` — excluded per Appendix A.
 - Codec round-trip — atoms are NOT serializable (see §6).
 
 ---
@@ -86,8 +85,8 @@ pub fn make(heap: *Heap, init: Value) !Value {
 ```
 
 The header carries the standard mark bit, flags, cached hash slot, and
-optional meta pointer. `flag_has_meta` is unused for v1 atoms (no
-`:meta` opt); reserved for post-v1.
+optional meta pointer. `flag_has_meta` is unused for atoms (no
+`:meta` opt).
 
 Atoms are heap kinds in the standard sense — they live on the live
 list owned by `Heap`, participate in mark-sweep, and are reclaimed in
@@ -168,9 +167,8 @@ resolve without a namespace prefix. None are macros.
 
 #### 4.1 `(atom init)`
 
-Single-arity only in this commit. Any extra args throw
-`:unsupported-arg` (validators/watches/meta keyword opts are reserved
-post-v1; see §1).
+Single-arity only. Any extra args throw `:unsupported-arg`
+(validators, watches and meta keyword opts are absent; see §1).
 
 ```clojure
 (atom 0)              ; => #<atom 0x...>
@@ -340,7 +338,7 @@ return switch (x.kind()) {
 
 ### 6. Codec
 
-Atoms are NOT serializable. Per `PLAN.md` §23 #25, the v1 codec
+Atoms are NOT serializable. Per `PLAN.md` §23 #25, the codec's
 serializable set is fixed; atoms are NOT in it (they join functions,
 Vars, transients, tx handles, error traces).
 

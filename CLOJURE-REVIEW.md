@@ -62,7 +62,7 @@ Clojure's compiler knows ~20 primitives. User-facing `let`/`fn`/`loop`/`letfn`/`
 
 `Keyword` implements `IFn` directly: `invoke(obj) = RT.get(obj, this)`. This is the language, not an optimization.
 
-**nexis adoption**: §8.7 of PLAN.md, language-level commitment in v1. Arity 1 and 2 only.
+**nexis adoption**: §8.7 of PLAN.md, a language-level commitment. Arity 1 and 2 only.
 
 #### 1.5 Unbound-as-IFn-sentinel
 
@@ -116,9 +116,9 @@ Clojure has `hashCode()` (Java compat) and `hasheq()` (Clojure value hash). The 
 
 #### 2.5 Macro signature `(Form, Env) → Form`
 
-Clojure macros receive `&form` (invocation form) and `&env` (lexical environment map of `symbol → LocalBinding`) as invisible first args. Our PLAN originally said `Form → Form` — too weak.
+Clojure macros receive `&form` (invocation form) and `&env` (lexical environment map of `symbol → LocalBinding`) as invisible first args.
 
-**nexis adaptation**: commit to `(Form, Env) → Form` in v1, but keep `Env` deliberately shallow. PLAN.md §14.1.
+**nexis adaptation**: `Form → Form` over the user arguments only, with no `&form` or `&env` injection (PLAN.md §14.1, §23 #34).
 
 #### 2.6 Read-time syntax-quote → post-parse syntax normalization
 
@@ -134,7 +134,7 @@ Clojure has a single global `Var.rev` int that increments on any root change. Si
 
 #### 2.8 Per-thread `threadBound` AtomicBoolean → isolate-global dynamic-binding depth
 
-Clojure puts an `AtomicBoolean threadBound` on every Var as a fast-path flag. Overkill for our single-isolate v1.
+Clojure puts an `AtomicBoolean threadBound` on every Var as a fast-path flag. Overkill for a single isolate.
 
 **nexis adaptation**: no walk at all. The binding in force lives on the Var (`thread_value` + a `thread_bound` flag); the VM keeps only the save stack `binding` pushes and pops (`docs/VM.md` §6.5). A load is one flag test, a Var never bound costs nothing, and `set!` writes the Var directly. One isolate, one thread, so "thread-local" is process-global and a compile-time sub-VM sees the caller's bindings.
 
@@ -160,7 +160,7 @@ Coarse; per-Var is better.
 
 #### 3.5 `AtomicReference<Thread>` transient ownership
 
-Thread identity is meaningless in our single-isolate v1. Use an isolate-local token epoch.
+Thread identity is meaningless in a single isolate. Use an isolate-local token epoch.
 
 #### 3.6 JVM bytecode + ASM compilation path
 
@@ -240,14 +240,14 @@ the long version lives in PLAN §23 frozen decisions and `docs/FORMS.md` §8.
 | Namespaced map | `#:ns{:a 1}` | unsupported | use a plain map |
 | Auto-resolved keyword | `::k`, `::ns/k` | unsupported | no current-ns at read time |
 | Reader conditional | `#?(:clj ...)`, `#?@(...)` | unsupported | single target (§4) |
-| Tagged literal | `#inst "..."`, `#uuid ...`, user-ext | unsupported | v1 non-goal (§4) |
+| Tagged literal | `#inst "..."`, `#uuid ...`, user-ext | unsupported | non-goal (§4) |
 | Regex literal | `#"pattern"` | unsupported | library call (§4) |
 | Read-time eval | `#=(form)` (gated by `*read-eval*`) | unsupported | no ambient execution at parse |
 | Unreadable marker | `#<...>` always errors at read | unsupported | compat surface only |
 | Old-style metadata | `#^{...} x` (still parsed) | unsupported | one canonical `^` spelling |
 | `#!` comment | comment to end of line, anywhere | unsupported | no shebang interop |
 
-Complete `#`-dispatch inventory in nexis v1: **`#{}` (set)**, **`#(...)`
+Complete `#`-dispatch inventory in nexis: **`#{}` (set)**, **`#(...)`
 (anon-fn)**, **`#_` (discard)**. Nothing else is recognized; any other
 byte after `#` is a lexer error.
 
@@ -289,7 +289,7 @@ These are the semantic traps a Clojure programmer will hit.
 
 ### 4.4 Explicit omissions (by PLAN §4 non-goals)
 
-These are committed absences for v1. Each has a frozen rationale in
+These are committed absences. Each has a frozen rationale in
 PLAN §4 / §23; atoms and protocols left this list by PLAN Amendment Log
 entries.
 
@@ -303,7 +303,7 @@ entries.
 - **Agents** (`send`, `send-off`) — JVM-era artifact; isolates later.
 - **`core.async`** — huge scheduling sink.
 - **Full hygienic macros** — auto-gensym + syntax-quote qualification only.
-- **Lazy sequences everywhere** — eager by default; explicit streams in v2.
+- **Lazy sequences everywhere** — eager by default; a `stream` library is an open question (PLAN §23 #14).
 - **Regex / reader conditionals / tagged literals** — see §4.2.
 - **Rationals / BigDecimal** — see §4.2.
 - **Multi-target compilation** — Zig-native only.

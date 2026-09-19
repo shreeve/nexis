@@ -93,7 +93,7 @@ projected nexis direction vs Clojure. "Measured" column cites the
 | 7 | Persistent list | Cons cells | Cons cells | **parity** | cons 14.7 ns/op @ N=4096 (§3.2) | measured |
 | 8 | Hashing | Murmur3 | xxHash3-64 | **2–3×** faster on long bytes | ~34 GB/s (§3.1) | measured (partial) |
 | 9 | Keyword identity | Intern + identity | Intern + identity | **parity** | hash 2 ns (§3.1) | measured |
-| 10 | Transients | Mutation token | Owner-token (Option B wrapper) | **parity** in v1; node-owner in-place edit is the open lever | ~parity with persistent (§3.3) | measured |
+| 10 | Transients | Mutation token | Owner-token (Option B wrapper) | **parity**; node-owner in-place edit is the open lever | ~parity with persistent (§3.3) | measured |
 | 11 | GC | Generational tracing (G1/ZGC) | Precise non-moving mark-sweep | **worse** short-term; addressable | — | implemented, acknowledged weakness |
 | 12 | Allocator | TLAB bump pointer | size-class pool (POOL.md) | **parity-to-edge vs TLAB** on hot paths | list cons **3.94×**, map assoc **1.80×** vs pre-pool (§3.2) | measured |
 | 13 | Dispatch / polymorphism | Inline-cached via JIT | 26-way switch per op | **worse** at warm steady state; inline caches absent | hashValue ~1–2 ns (§3.1); 2.9 ns per bytecode instruction, 20 ns per global fn call on M5 (§3.8) | measured (partial) |
@@ -623,8 +623,8 @@ See `docs/CHAMP.md` Part 2.
 ### 5.6 Persistent vector
 
 Both Clojure and nexis ship the 32-way radix trie with tail
-buffer (PLAN.md §8.3 + VECTOR.md). RRB relaxation is not in v1
-for either (Clojure ships RRB separately as `core.rrb-vector`;
+buffer (PLAN.md §8.3 + VECTOR.md). Neither has RRB relaxation
+built in (Clojure ships RRB separately as `core.rrb-vector`;
 nexis has none, PLAN §23 #30).
 
 **Measured**: conj 63.3 ns/op, nth ~1 ns/op @ N=4096 (§3.2/§3.4).
@@ -661,7 +661,7 @@ Both sides implement Bagwell/Hickey-style transients semantically:
 O(1) conversion from persistent, mutation guarded by owner token,
 `persistent!` finalizes + invalidates.
 
-**nexis v1 discipline** (TRANSIENT.md): **Option B** — wrapper
+**nexis discipline** (TRANSIENT.md): **Option B** — wrapper
 over persistent with owner-token check + subkind dispatch +
 delegated persistent ops. Correctness-first. The node-owner
 in-place-edit optimization used by Clojure's optimized transients
@@ -711,7 +711,7 @@ no locking.
 - codec decode map entry: ~103 ns → ~85 ns (**1.14×**)
 
 **Retained capacity**: slabs are held until `pool.deinit()` (no
-empty-slab reclamation in v1). Documented at POOL.md §8 as a
+empty-slab reclamation). Documented at POOL.md §8 as a
 deliberate tradeoff, not a leak. Per-slab refcounting + empty-slab release would serve long-lived REPL sessions.
 
 **Status**: default for `zig build bench` and for any code that
@@ -926,7 +926,7 @@ Explicitly **not** chasing, for reasons worth recording:
 - **Multi-threaded shared-memory concurrency inside one isolate.**
   Clojure's STM is a tour de force, but the concurrency tax is
   not one we intend to pay. See §5.16.
-- **JIT in v1 / v2.** A production JIT is 5+ person-years. We get
+- **JIT.** A production JIT is 5+ person-years. We get
   80% of the win from bytecode + comptime specialization + inline
   caches.
 - **Beating C/Zig on tight compute loops.** Parity on anything

@@ -18,7 +18,7 @@ lists what exists above them.
 
 ### 1. Scope
 
-**In (v1):**
+**In:**
 - `Connection` — wrapper around `emdb.Env` with a stable
   `store_id: u128` and an `*Interner` pointer for codec
   integration.
@@ -199,9 +199,8 @@ const DurableRefBody = extern struct {
 
 #### 4.2 Subkind
 
-Subkind byte is unused in v1 (single canonical durable-ref shape).
-Reserved for future variants (e.g., weak refs, snapshot-bound
-refs). Always `0`.
+Subkind byte is unused (single canonical durable-ref shape) and
+always `0`.
 
 ---
 
@@ -346,7 +345,7 @@ generation.
 ### 6. Named-tree discovery
 
 emdb exposes `txn.openTree(name, create)` returning a
-transaction-scoped `TreeId`. v1 calls `openTree` **per operation**,
+transaction-scoped `TreeId`. `db.zig` calls `openTree` **per operation**,
 accepting the small lookup cost in exchange for a simpler
 implementation:
 

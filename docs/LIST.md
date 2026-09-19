@@ -22,7 +22,7 @@ therefore exercises two new pieces of runtime machinery for the first time:
 
 ### 1. Scope
 
-v1 ships both subkinds defined in VALUE.md §2.2:
+The list kind has the two subkinds VALUE.md §2.2 defines:
 
 - **Subkind 0 — cons.** Body is exactly `{ head: Value, tail: Value }` =
   32 bytes. The `tail` is always a `.list`-kind Value (proper lists
@@ -30,12 +30,12 @@ v1 ships both subkinds defined in VALUE.md §2.2:
 - **Subkind 1 — empty.** Body size 0. `kind = .list, subkind = 1` is the
   empty list.
 
-v1 does **not** share an empty-list singleton across allocations — each
+There is **no** shared empty-list singleton across allocations — each
 `empty(heap)` call produces a fresh `*HeapHeader`. Two empty lists are
 always `=` (they have the same byte content: zero bytes); `identical?`
 distinguishes them by address. There is no shared-singleton pinning.
 
-v1 does **not** cache `count`. List is reader / macros material per
+`count` is **not** cached. List is reader / macros material per
 PLAN §9.3; user code uses vectors for large sequences. If a benchmark
 surfaces hot `count` on long lists, a cached `u32` in the cons body
 is the remedy.
@@ -65,10 +65,8 @@ is the remedy.
    `&dispatch.hashValue` — already fully mixed per-kind. The returned
    `u64` is the pre-domain base; `dispatch.hashValue` applies the
    **sequential-category** domain byte on the way out.
-6. **Metadata** (SEMANTICS §7). Lists can carry metadata via
-   `with-meta` once the language surface supports it; the
-   `HeapHeader.meta` slot is the storage. Not used operationally
-   until `with-meta` lands.
+6. **Metadata** (SEMANTICS §7). Lists carry metadata through
+   `with-meta`; the `HeapHeader.meta` slot is the storage.
 
 ---
 
@@ -101,7 +99,7 @@ pub fn head(v: value.Value) value.Value;
 /// `v` is empty.
 pub fn tail(v: value.Value) value.Value;
 
-/// O(n) length count. No caching in v1.
+/// O(n) length count; nothing caches it.
 pub fn count(v: value.Value) usize;
 
 /// Per-kind hash entry point called by `dispatch.heapHashBase` with
@@ -147,11 +145,9 @@ first). The language surface will expose nil-returning variants
    (today just `.list`) and the kind byte otherwise.
 2. **Category-aware equality.** `dispatch.equal` grows an equality-
    category check: two Values whose categories match can still
-   be `=` even when their kinds differ (v2+ cross-type sequential),
-   while two Values whose categories differ are always `!=` without
-   further dispatch. Today only `list` is sequential, so the code
-   path reduces to the existing same-kind dispatch — but the shape
-   is correct for when vector arrives.
+   be `=` even when their kinds differ (list and vector are both
+   sequential), while two Values whose categories differ are always
+   `!=` without further dispatch.
 
 ---
 
@@ -161,13 +157,13 @@ first). The language surface will expose nil-returning variants
 lists of any length walk in constant stack. Element-level hashing /
 equality can recurse through `dispatch.hashValue` / `dispatch.equal`,
 which may land back on `hashSeq` / `equalSeq` when an element is
-itself a list (or later, a vector). Nested structural depth of `N`
+itself a list or a vector. Nested structural depth of `N`
 consumes `O(N)` stack frames.
 
-v1 does not bound this depth. Deeply nested values may overflow the
+Nothing bounds this depth. Deeply nested values may overflow the
 stack; actual threshold depends on OS, ABI, build mode, and frame
 size. Matches Clojure, which structurally recurses through
-`IHashEq`/`equiv` for the same reason. v1 does not need cycle
+`IHashEq`/`equiv` for the same reason. There is no cycle
 detection because persistent values cannot form cycles (no interior
 mutability). An iterative / explicit-stack walker is the fallback if
 real workloads hit the limit.
@@ -181,9 +177,8 @@ real workloads hit the limit.
 - **Heap layer.** `heap.alloc(.list, 0)` → empty; `heap.alloc(.list,
   32)` → cons. Bodies get zero-initialized by the allocator; cons
   `head` / `tail` Values are overwritten inside `cons`.
-- **GC (future).** When `src/gc.zig` lands, the list kind's trace
-  function must visit both `head` and `tail` for cons cells; empty
-  lists have no outgoing references.
+- **GC.** `list.trace` marks every head and walks the tail chain in
+  a loop (`docs/GC.md` §5); empty lists have no outgoing references.
 - **Intern layer.** No interaction; lists hold arbitrary Values,
   intern has no notion of collection kinds.
 - **Reader / compiler.** `src/reader.zig` emits list Forms; quoted
@@ -195,16 +190,13 @@ real workloads hit the limit.
 ### 7. What LIST.md does not cover
 
 - **Persistent-vector** (`src/coll/vector.zig`, kind 20). The second
-  member of the sequential equality category. When it lands, the
-  `equalSeq` callback pattern generalizes to a cross-kind sequential
-  comparator — list-vs-vector equality reuses the same element
-  callback but iterates one side via list and the other via vector.
-- **Lazy-seq / cons values from `seq`.** PLAN §6.7. v1's collection
-  APIs return eager vectors; lazy-seq lands in v2.
+  member of the sequential equality category: `dispatch.sequentialEqual`
+  compares a list against a vector element by element, iterating one
+  side through the list cursor and the other through the vector's.
+- **Lazy-seq / cons values from `seq`.** PLAN §6.7. The collection
+  APIs return eager vectors; there is no lazy-seq.
 - **Destructive operations** (`set-car!` etc.). Out of scope —
-  nexis lists are immutable. Transients are a v1 concept but apply
-  to maps/sets/vectors, not cons lists (list updates are already
-  O(1) via `cons`).
-- **Print/read round-trip.** The reader already parses `(a b c)`
-  into Form lists; the runtime→textual direction will reuse the
-  pretty-printer when the full Value-print story lands.
+  nexis lists are immutable. Transients apply to maps/sets/vectors,
+  not cons lists (list updates are already O(1) via `cons`).
+- **Print/read round-trip.** The reader parses `(a b c)` into Form
+  lists; the runtime→textual direction is `src/format.zig`.

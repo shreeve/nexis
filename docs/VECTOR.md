@@ -33,7 +33,7 @@ transients wrap the persistent ops (`docs/TRANSIENT.md`).
 **In:**
 
 - Representation: plain 32-way radix trie + separate tail node, per
-  PLAN §9.2 + §23 #30. No RRB relaxation in v1.
+  PLAN §9.2 + §23 #30. There is no RRB relaxation.
 - Construction: `empty(heap)`, `fromSlice(heap, elems)`, `conj(heap,
   v, elem)` (O(1) amortized append with automatic tail promotion and
   root-shift growth).
@@ -52,16 +52,15 @@ transients wrap the persistent ops (`docs/TRANSIENT.md`).
   commit is retiring.
 - `pop` — has a non-trivial tail-promotion case when tail becomes
   empty and must be pulled up from the trie.
-- `subvec`, `concat` — O(n) in v1 regardless of implementation
+- `subvec`, `concat` — O(n) regardless of implementation
   choice (PLAN §9.2); not architecturally interesting.
-- **Transients** — lands with the transients commit, alongside map/set
-  transient support.
+- **Transients** — `docs/TRANSIENT.md`, alongside map/set transient
+  support.
 - **Small-vector-inline subkind 0** — space optimization; all vectors
   including the empty one use subkind 1 (root + possibly null root
-  trie) for the first landing. Small-vector inline slots into subkind
-  0 as a future optimization, exactly like string SSO (subkind 0 is
-  reserved, subkind 1 is where v1 lives).
-- **RRB relaxation** — v2+ per PLAN §23 #30, frozen decision.
+  trie). Subkind 0 is reserved for a small-vector inline form, as
+  string SSO reserves its subkind 0; every vector is subkind 1.
+- **RRB relaxation** — absent per PLAN §23 #30, frozen decision.
 
 ---
 
@@ -73,7 +72,7 @@ subkinds:
 
 | Subkind | Name          | Role                                                       |
 |---------|---------------|------------------------------------------------------------|
-| 0       | reserved      | Future small-vector inline optimization; not used in v1.   |
+| 0       | reserved      | A small-vector inline form; unused.                        |
 | 1       | `root`        | The user-facing vector Value. Body = root metadata + pointers to tail and (optionally) root trie node. |
 | 2       | `interior`    | Internal trie node. Body = `[32]?*HeapHeader` child pointers. |
 | 3       | `leaf`        | Trie leaf node. Body = exactly `[32]Value`. Always full.   |
@@ -145,7 +144,7 @@ pub const Cursor = struct {
 };
 ```
 
-For v1 the vector cursor uses `nth(v, i)` per step (O(log₃₂ n) per
+The vector cursor uses `nth(v, i)` per step (O(log₃₂ n) per
 call). Total list↔vector equality is O(n · log₃₂ n). An
 optimization could rewrite the cursor to track current leaf and local
 offset, reducing to O(n) amortized, without changing the public
@@ -190,7 +189,7 @@ fn sequentialEqual(a: Value, b: Value) bool {
 
 Where `seqCursorInit(v)` returns a union-of-cursors dispatching on
 `v.kind()`. The cursor pattern is **not** exposed as a public
-language-level API in v1 — it's an internal composition tool for
+language-level API — it is an internal composition tool for
 dispatch. The user-facing `seq` natives in `src/stdlib.zig` are
 built on it (PLAN §6.7).
 

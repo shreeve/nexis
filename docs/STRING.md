@@ -14,7 +14,7 @@ alongside this module.
 
 ### 1. Scope
 
-v1 ships **one** string subkind:
+The string kind has **one** subkind in use:
 
 - **Subkind 1 — heap string.** Body is the raw UTF-8 bytes, no length
   prefix. Length is recovered from `Heap.bodyBytes(h).len`.
@@ -43,7 +43,7 @@ lands.
    length prefix, no padding. Empty strings (`N == 0`) are legal.
 2. **Byte-level equality** (SEMANTICS §2.4). Two strings are `=` iff
    their byte sequences are identical. No Unicode normalization
-   (NFC/NFD) — v1 is deliberately byte-blob.
+   (NFC/NFD) — strings are deliberately byte blobs.
 3. **Hash** (SEMANTICS §3.2). `hashHeader(h)` returns
    `xxHash3(seed, bytes)` truncated to `u32`, where `seed` is the
    project-wide constant in `src/hash.zig`. The final `Value.hashValue`
@@ -137,8 +137,8 @@ integration lives in one module where "have we accounted for every
 heap kind?" is a single-file audit.
 
 `dispatch.zig` depends on every heap-kind module; no heap-kind module
-depends on `dispatch.zig`. When a new kind lands, exactly one
-`switch` arm in each dispatch function is added.
+depends on `dispatch.zig`. A new kind adds exactly one `switch`
+arm to each dispatch function.
 
 ---
 
@@ -152,9 +152,9 @@ depends on `dispatch.zig`. When a new kind lands, exactly one
   to `false` without touching string-specific code.
 - **Heap layer.** `heap.alloc(.string, len)` is the only path to a
   string heap-header. `HeapHeader.hash` caches the computed hash
-  (nonzero only). `HeapHeader.flags` bits are unused for strings in
-  v1 — `flag_interned` is reserved and `flag_zero_copy` will be set
-  by subkind 2 when it lands.
+  (nonzero only). `HeapHeader.flags` bits are unused for strings:
+  `flag_interned` is reserved and `flag_zero_copy` belongs to the
+  reserved subkind 2.
 - **Hash layer.** `string.hashHeader` calls `hash.hashBytes(bytes)`
   and truncates. No new hash primitives needed.
 - **Intern layer.** No direct interaction — strings are not interned.
@@ -177,17 +177,14 @@ depends on `dispatch.zig`. When a new kind lands, exactly one
 - **Unicode operations** (grapheme iteration, case folding, normalization,
   collation). Case conversion + trim in `nexis.string` are
   **ASCII-only** (§8). Full Unicode case folding,
-  grapheme clustering, normalization, and collation are post-v1 and
-  will require a dedicated Unicode tables module.
-- **String interning** (explicit `(intern s)`). PLAN §8.4 defers this
-  to v2+ or an opt-in string module; not v1 runtime.
+  grapheme clustering, normalization, and collation are absent; they
+  need a Unicode tables module the runtime does not carry.
+- **String interning** (explicit `(intern s)`). Absent (PLAN §8.4).
 - **Print-time escape encoding** (`\n`, `\t`, `\u{HEX}`). That's
-  already handled by `src/reader.zig`'s pretty-printer for Forms; the
-  runtime `Value` → textual form path will reuse the same encoder
-  when the reverse lifting pass lands.
+  handled by `src/reader.zig`'s pretty-printer for Forms and by
+  `src/format.zig` for runtime Values.
 - **Mutability / transient strings.** Strings are persistent (immutable)
-  at the Value layer. Mutable string builders will be a separate
-  transient-kind facility if/when needed (not committed for v1).
+  at the Value layer. There is no mutable string builder.
 
 ---
 
@@ -201,8 +198,8 @@ for the user-facing API:
 and not byte.** Picked over byte indexing because
 `count` / `nth` / `subs` must agree, and surfacing UTF-8 byte
 positions through a user-facing `(count s)` would surprise users
-porting Clojure code where `(.length s)` is character-flavored. v1
-makes no claim about graphemes (`🇺🇸` is multiple codepoints; that's
+porting Clojure code where `(.length s)` is character-flavored. The
+runtime makes no claim about graphemes (`🇺🇸` is multiple codepoints; that's
 out of scope and documented).
 
 **Native fns in `nexis.core`:**
@@ -232,17 +229,17 @@ using `std.unicode.utf8ByteSequenceLength`-style decoding;
 codepoint range to a byte range in a second walk;
 `string.codepointAt(v, i)` returns a `Kind.char` Value via a
 front-to-position walk. None of these store side-cache state on
-the HeapHeader — codepoint count IS NOT cached today (v1; if
-profiling shows hot use, a cache slot or full
-codepoint-counted subkind could land).
+the HeapHeader — the codepoint count is not cached (a cache slot
+or a codepoint-counted subkind is the lever if profiling shows hot
+use).
 
 **Storage shape unchanged.** Byte layout (§2) is invariant: the body
 is still raw UTF-8 bytes; codepoint indexing is purely a presentation
 view. `subs` allocates a fresh heap string via `fromBytes` — no
-zero-copy slicing in v1 (subkind 2 is reserved for emdb-page
-mmap, not for slicing our own heap).
+zero-copy slicing (subkind 2 is reserved for emdb-page mmap, not
+for slicing our own heap).
 
-**v1 invalid-UTF-8 policy.** If a corrupted byte sequence makes
+**Invalid-UTF-8 policy.** If a corrupted byte sequence makes
 codepoint iteration fail mid-string, `string.codepointAt` /
 `codepointCount` / `byteRangeForCodepoints` SHOULD return
 `error.InvalidUtf8` (or equivalent). The caller (stdlib) maps that
@@ -345,10 +342,9 @@ so today.
    - `set` → walk in iteration order (implementation-defined
      for CHAMP; users requiring deterministic order should
      sort beforehand)
-   - `map` → `:kind-mismatch` until map seq shape is pinned
+   - `map` → `:kind-mismatch`
    Each element stringifies via the same display formatter
-   used by `(str ...)` (5.2a's `appendStringified`; 5.2c
-   replaces with `src/format.zig`). The separator must be a
+   used by `(str ...)` (`src/format.zig`). The separator must be a
    `Kind.string`; non-string separator → `:kind-mismatch`.
    `join` does NOT auto-stringify the separator.
 
@@ -369,7 +365,7 @@ so today.
    rationale as `split` — the user-surface API is a Unicode
    string operation, not a raw-byte one.
 
-**v1 errors (catchable keywords):**
+**Errors (catchable keywords):**
 
 | Keyword              | Source                                       |
 |----------------------|----------------------------------------------|
@@ -385,9 +381,7 @@ so today.
 **Module split.** Value→text formatting lives in `src/format.zig`,
 not in `src/stdlib.zig` or `src/cli.zig`. format.zig is the single
 source of truth for both display + readable modes; cli.zig and
-the integration-test harness delegate to it. The 5.2a / 5.2b /
-5.2c arc removed two prior duplicate `formatValue` helpers and one
-mini `appendStringified` in stdlib.zig.
+the integration-test harness delegate to it.
 
 **`src/format.zig` API:**
 
@@ -472,7 +466,7 @@ with null io and exercise the error path; the CLI sets
 specific convenience; file I/O is not auto-creating.
 
 §9.3. `slurp` size cap is **16 MiB**. Larger
-files surface `:io-error`. No size-limit-arg overload in v1.
+files surface `:io-error`. There is no size-limit argument.
 
 §9.4. `pr-str` does NOT print a trailing newline; `println` and
 `prn` DO. `print` does not.

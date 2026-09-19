@@ -11,7 +11,7 @@ identity). Those documents win on conflict.
 This module satisfies the transient-equivalence and
 transient-ownership properties of PLAN §20.2.
 
-**v1 transients are "shallow" wrappers** — they hold an owner-token and a mutable
+**Transients are "shallow" wrappers** — they hold an owner-token and a mutable
 pointer to a persistent inner root. Mutating ops call the
 persistent backing operations underneath, reassigning the wrapper's
 `inner_header` field in place. Token discipline enforced at every
@@ -20,7 +20,7 @@ advantage) does not exist (PLAN §19.6 Tier 2).
 
 ---
 
-### 1. The two-option fork, and why v1 picks "shallow"
+### 1. The two-option fork, and why nexis picks "shallow"
 
 **Option A — full Clojure-style transients** with per-node owner
 tags: every CHAMP interior / collision / vector interior / leaf /
@@ -31,14 +31,14 @@ owner-mismatched ones. Real O(1) amortized `conjBang` etc. Cost:
 transient-aware variant, structural invariants loosen in
 transient-mode.
 
-**Option B — shallow wrappers** (v1): `.transient` is a thin heap
+**Option B — shallow wrappers** (what nexis has): `.transient` is a thin heap
 kind with `{owner_token, inner_header}`. Mutation ops call
 `mapAssoc` / `setConj` / `vector.conj` on the inner, receive a new
 persistent root, atomically update the wrapper's `inner_header`
 field. No existing hamt/rrb code changes. Gate-test discipline
 (#3 equivalence, #4 ownership) satisfied by construction.
 
-**v1 picks B.** Reasons:
+**nexis picks B.** Reasons:
   - Gate tests measure semantics, not performance. B delivers
     semantics with ~800 LOC of new code + zero changes to stable
     persistent paths.
@@ -67,12 +67,11 @@ kind bytes (18/19/20) of the inner collection. The taxonomy is a
 | 2       | transient vector                 | `.persistent_vector` |
 | 3..15   | reserved                         | —           |
 
-No other kinds are transient-wrappable in v1. Attempting to wrap a
+No other kind is transient-wrappable. Attempting to wrap a
 list, string, bignum, byte-vector, typed-vector, function, var,
 durable-ref, or error Value in `transientFrom` returns
-`error.InvalidTransientInner`. (Byte/typed vectors and the rest
-may earn transients in a future commit if profiling justifies; not
-committed for v1.)
+`error.InvalidTransientInner`. (Typed vectors and the rest have no
+transient form.)
 
 Kind 27 + subkind 0/1/2 together give enough information to
 dispatch any operation without inspecting the inner header's kind.
@@ -141,7 +140,7 @@ fn issueOwnerToken() u64 {
     next_token += 1;
     // Overflow-safe on u64 for every practical workload. Wraparound
     // after 2^64 - 1 tokens is theoretically reachable in a long-
-    // running multi-isolate system; v1 single-isolate cannot.
+    // running multi-isolate system; a single isolate cannot.
     // A multi-isolate runtime would have to revisit this.
     return t;
 }
@@ -156,14 +155,14 @@ inspects tokens directly.
     initial allocator-zero state BEFORE `transientFrom` stamps.
     Any op on a wrapper whose `owner_token == 0` returns
     `error.TransientFrozen`.
-  - Nonzero = active owner. In v1 single-threaded, the token is
-    effectively an aliveness signal. A multi-isolate runtime would
+  - Nonzero = active owner. The runtime is single-threaded, so the
+    token is effectively an aliveness signal. A multi-isolate runtime would
     additionally check that the **current isolate's epoch** matches
     the token's issuing epoch; that check is absent because there
     is no second isolate to mismatch against.
 
 **Token exhaustion.** Owner tokens are issued from a monotonically
-increasing `u64` counter. Exhaustion is not handled in v1;
+increasing `u64` counter. Exhaustion is not handled;
 wraparound is practically unreachable for single-isolate
 workloads. No saturation / error path is provided.
 
@@ -172,7 +171,7 @@ workloads. No saturation / error path is provided.
 single-isolate, single-threaded execution has no legitimate way
 for a transient to encounter a mismatched-but-nonzero owner. Gate test #4 is satisfied by the
 frozen-rejection path alone: "using a transient after
-`persistentBang`" IS the v1 operational manifestation of "using a
+`persistentBang`" IS the operational manifestation of "using a
 transient from the wrong owner" (the owner has become the
 nobody-token `0`). The `TransientWrongOwner` code path is wired in
 `transient.zig` so a multi-isolate runtime can light it up by adding

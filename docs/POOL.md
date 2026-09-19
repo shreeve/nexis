@@ -13,7 +13,7 @@ The pool is the default backing allocator for `Heap`, replacing
 
 ### 1. Scope
 
-**In (v1):**
+**In:**
 - `PoolAllocator` — single-threaded, bump-pointer + free-list
   allocator with 16 size classes.
 - `std.mem.Allocator` vtable adapter (`pool.allocator()`).
@@ -73,7 +73,7 @@ index in a single cache-line read.
 
 Allocations strictly greater than 4096 bytes, or with alignment
 > 16 bytes, **delegate to the backing allocator**. These paths are
-rare in v1 (long strings, huge bignums, cache-line-aligned special
+rare (long strings, huge bignums, cache-line-aligned special
 cases) and the overhead of passthrough is not worth optimizing.
 
 ---
@@ -293,11 +293,11 @@ only point where memory returns to the OS / backing.
 
 ---
 
-### 8. Memory retention (v1 framing)
+### 8. Memory retention
 
 **Not a leak; deliberate retained capacity.**
 
-- Empty slabs are not returned to backing in v1.
+- Empty slabs are not returned to backing.
 - Memory footprint may stay above post-GC live size until
   `pool.deinit()`.
 - For the default nexis workload — single-isolate, process-
@@ -338,7 +338,7 @@ happens at the backing (std.testing.allocator) layer underneath.
 - Double-free of a pool block: **undefined behavior** in release.
   Debug builds may catch via the Heap's own double-free detection
   (kind byte poisoning on free) before the block reaches the
-  pool. No separate pool-level double-free detection in v1.
+  pool. There is no separate pool-level double-free detection.
 - Cross-allocator free (block from pool passed to page, or vice
   versa): undefined behavior. Every `alloc` and `free` MUST go
   through the same allocator.

@@ -99,9 +99,9 @@ Every published result documents:
   noted-and-disclaimed on macOS where user control is limited).
 - Thermal state if relevant (long-running benchmarks may throttle).
 
-Cross-machine results are not comparable. A benchmark suite
-published at v1 ship runs on one canonical machine; the exact machine
-is documented. Re-running on other hardware is encouraged and
+Cross-machine results are not comparable. A published benchmark
+suite runs on one canonical machine; the exact machine is
+documented. Re-running on other hardware is encouraged and
 published separately with full disclosure.
 
 ---

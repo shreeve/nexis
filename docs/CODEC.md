@@ -37,7 +37,7 @@ preservation is the contract.
 - `function`, `var_`, `transient`, `error_`, `meta_symbol`:
   non-serializable per PLAN §15.10 + §23 #25. Public API returns
   `error.UnserializableKind`.
-- **Metadata is never serialized in v1.** SEMANTICS §7 /
+- **Metadata is never serialized.** SEMANTICS §7 /
   PLAN §8.5: metadata never participates in equality or hash; the
   codec respects this by discarding `HeapHeader.meta` during
   encode. Decode produces values with `h.meta = null` always —
@@ -191,7 +191,7 @@ not canonical. Policies:
   output bits.
 
 Encode **always produces canonical output** for these cases (e.g.,
-encode never emits a non-canonical bignum in v1). Decode leniency
+encode never emits a non-canonical bignum). Decode leniency
 is defensive against input that another encoder version or an
 external producer might emit.
 
@@ -261,9 +261,9 @@ pub const CodecError = error{
     InvalidVersion,
 
     /// First byte of a ValueEncoding doesn't map to any recognized
-    /// Kind in v1's Kind enum (i.e., byte is outside the valid
+    /// Kind in the Kind enum (i.e., byte is outside the valid
     /// numeric range). Distinct from `UnserializableKind`, which is
-    /// returned when the kind IS recognized but not v1-serializable.
+    /// returned when the kind IS recognized but not serializable.
     InvalidKindByte,
 
     /// Per-kind payload field is structurally invalid: bignum sign

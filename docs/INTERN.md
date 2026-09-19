@@ -44,9 +44,9 @@ Non-negotiable invariants:
    may pass transient buffers (e.g. slices into a parser buffer); the
    returned name slice from `keywordName`/`symbolName` lives as long as
    the interner.
-6. **No unintern, no weak semantics, no rehash-to-different-ids** in v1.
-   Long-lived REPL sessions are noted as risk #16 in PLAN §25; revisit in
-   v2 when a concrete workload demands it.
+6. **No unintern, no weak semantics, no rehash-to-different-ids.** A
+   long-lived REPL session grows the tables monotonically (risk #16 in
+   PLAN §25).
 7. **Empty names are rejected** at the intern layer. The reader already
    won't produce them, but the intern API is also reachable from codec
    decode and direct runtime construction, so the
@@ -84,7 +84,7 @@ pub const Interner = struct {
     pub fn keywordCount(self: *const Interner) u32;
     pub fn symbolCount (self: *const Interner) u32;
 
-    // GC-root tracing seam. v1 implementation is a no-op — name bytes
+    // GC-root tracing seam. A no-op — name bytes
     // are not heap objects in the `HeapHeader` sense. Exists so the
     // a root enumeration can list the interner without a struct
     // refactor (PLAN §10.5).
@@ -240,6 +240,6 @@ silently leaking.
   Those live in `src/vm.zig` (`Namespace`, `NamespaceRegistry`). The
   interner stores
   the *textual* `"ns/local"` form only.
-- **Multi-isolate sharing.** v1 is single-isolate; each isolate has its
-  own `Interner`. Cross-isolate intern sharing is a v2+ research
-  direction (PLAN §16.4).
+- **Multi-isolate sharing.** The runtime is single-isolate; each
+  isolate has its own `Interner`. Cross-isolate intern sharing is an
+  open research direction (PLAN §16.4).

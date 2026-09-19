@@ -47,14 +47,14 @@ happens at the accessor boundary, never implicitly.
 
 PLAN §23 decision 1 freezes the plain 16-byte struct over NaN-boxing. The
 alternative would pack everything into 8 bytes using NaN payload bits for
-non-float tags. Rejected for v1 because:
+non-float tags. Rejected because:
 
 - Doubled register pressure on equality / move / load paths is acceptable.
 - Debuggers, disassemblers, and core dumps read the struct layout
   directly; NaN-boxing is hostile to those tools.
 - Heap pointers on macOS-arm64 already consume 48 bits; NaN-boxing
   assumes 48-bit canonical pointers, which AArch64 breaks under
-  pointer authentication (PAC) features we might eventually adopt.
+  pointer authentication (PAC).
 
 Reviewable in v3+ if profile data shows the indirection hurting.
 
@@ -203,7 +203,7 @@ pub const HeapHeader = extern struct {
 `HeapHeader` (the root of a persistent-map Value) rather than a
 `*Value` because the metadata root is always a map; no tag is needed.
 
-**Hash caching.** A cached hash of `0` means "not yet computed." The
+**Hash caching.** A cached hash of `0` means "not computed." The
 value `0` is a tiny fraction of the 32-bit range; on the rare collision,
 we pay the recomputation cost once. Saves one u32 and one flag bit per
 heap object over a separate `hash_valid` flag.
@@ -216,7 +216,7 @@ bits in a future NaN-boxing migration without touching the heap layout.
 
 ### 5. GC bits (placeholder spec — pinned here so collectors can evolve)
 
-The `mark: u8` field uses two bits in v1:
+The `mark: u8` field uses two bits:
 
 | Bit | Name | Meaning |
 |---|---|---|
@@ -256,12 +256,11 @@ across randomized pairs drawn from every kind. Implementation obligations:
 ### 7. What VALUE.md does not cover
 
 - **Memory layout of specific heap kinds** (string body, HAMT node,
-  RRB trie) — lives in the per-module docs (`docs/COLL.md` pending).
+  vector trie) — lives in the per-module docs (`LIST.md`, `CHAMP.md`, `VECTOR.md`).
 - **Serialization wire format** — lives in `docs/CODEC.md`.
-- **GC roots and sweep algorithm** — lives in PLAN §10; detailed
-  procedure will land in `docs/GC.md` when sweep ships.
+- **GC roots and sweep algorithm** — PLAN §10 and `docs/GC.md`.
 - **Durable-ref identity triple** — lives in PLAN §15.2 and
-  `docs/DB.md` (future).
+  `docs/DB.md`.
 
 If you need one of these to proceed, stop and draft the companion doc
 first: spec-first, even when the code shape seems obvious.

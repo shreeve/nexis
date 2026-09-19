@@ -71,7 +71,7 @@ or a VALUE.md amendment, not just a HEAP.md edit):
 
 Every live block is on a single intrusive linked list rooted in
 `Heap.live_head`. Alloc prepends (O(1)); free detaches (O(1) if you hold
-the prev pointer, O(n) otherwise). For v1, `free` does a linear scan to
+the prev pointer, O(n) otherwise). `free` does a linear scan to
 find the predecessor. The size-class pool (`docs/POOL.md`) is the
 backing allocator underneath this list.
 
@@ -162,7 +162,7 @@ pub fn HeapHeader.setCachedHash(self: *HeapHeader, h: u32) void;
 ```
 
 **Error set.** `alloc` returns `error.OutOfMemory` from the backing
-allocator. No other error cases in v1.
+allocator. There is no other error case.
 
 **Zero-body-size alloc** is legal. The returned `*HeapHeader` is valid;
 `bodyBytes` returns a length-0 slice; `bodyOf(T, h)` for `@sizeOf(T) == 0`
@@ -199,8 +199,8 @@ flag bytes on two different data structures:
   embedded in `Value.aux`" if that optimization ever lands).
 - `HeapHeader.flags` describes the heap object itself.
 
-For v1, the authoritative hash cache is `HeapHeader.hash`. `Value.tag`
-flag_hash_cached is reserved and not operationally used yet.
+The authoritative hash cache is `HeapHeader.hash`. `Value.tag`
+flag_hash_cached is reserved and unused.
 
 ---
 
@@ -247,8 +247,8 @@ flag_hash_cached is reserved and not operationally used yet.
   direct-mmap). PLAN §10.4 describes the target shape (`PLAN §19.6`
   T2.6 generational, T1.4 slab pools); the size-class pool is what
   exists (`docs/POOL.md`).
-- **Large-object threshold.** v1 uses a single strategy for every size.
+- **Large-object threshold.** One strategy serves every size.
   PLAN §10.4's >4 KiB direct-from-OS path does not exist; the pool
   delegates large requests to its backing allocator.
-- **Finalization hooks.** Not in v1. Objects that own OS resources (open
+- **Finalization hooks.** None. Objects that own OS resources (open
   files, durable-ref pins) are tracked separately at the tx/db layer.

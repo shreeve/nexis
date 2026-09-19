@@ -412,9 +412,8 @@ symbol survives a Value → Form round trip, a `def` anywhere in a form
 declares its name, float `mod` is floored, vector `conj`/`assoc` are
 O(log n), `(merge {} {})` is `{}`, `set`/`subvec`/`identical?` exist,
 `(keys {})` is nil, `max` returns its operand, `get` reads strings,
-and `vec` takes sets and maps. Review reports were used to drive the
-polish; their findings are folded into tests. What they left open is
-§6.
+and `vec` takes sets and maps. The review findings behind the polish
+are folded into tests. What they left open is §6.
 
 ---
 

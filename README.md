@@ -284,4 +284,4 @@ source.
 
 ## License
 
-TBD (v1 ships under a permissive license).
+TBD (a permissive license).
