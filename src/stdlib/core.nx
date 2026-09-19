@@ -282,6 +282,10 @@
   (fn* [& args]
     (mapv (fn* [f] (apply f args)) fs)))
 
+; (vary-meta obj f & args) → obj carrying (apply f (meta obj) args).
+(defn vary-meta [obj f & args]
+  (with-meta obj (apply f (meta obj) args)))
+
 ; (fnil f default) → f, with a nil first argument replaced by
 ; default.
 (defn fnil [f default]
@@ -306,6 +310,17 @@
 ; ============================================================
 ; Control-flow macros
 ; ============================================================
+
+; (doc name) → prints the Var's :arglists and :doc, the way a
+; REPL shows them; nil. A defn carries them once it is given a
+; docstring or attribute map.
+(defmacro doc [name]
+  `(let* [m# (meta (var ~name))]
+     (println "-------------------------")
+     (println '~name)
+     (when (:arglists m#) (println (:arglists m#)))
+     (when (:doc m#) (println " " (:doc m#)))
+     nil))
 
 ; (declare a b ...) → interns each name as an unbound Var so a
 ; later definition can be referred to before it appears, even

@@ -273,6 +273,7 @@ These are the semantic traps a Clojure programmer will hit.
 | `(empty record)` | throws `UnsupportedOperationException` | `{}`: a record is a map to every collection function | SEMANTICS §4 |
 | Syntax-quote expansion | at read time, auto-qualifies + auto-gensyms | reader emits marker only; the macroexpander qualifies by the same rule (a Var's namespace, else the current one; special forms, `&`, `any` and `#()` parameters stay bare) and auto-gensyms; `~@` splices any seqable into lists, vectors, maps and sets | PLAN §14.2, MACROEXPAND.md §5 |
 | `(try ... (catch Exception e ...))` | catches by class hierarchy | `(catch any e ...)` takes every thrown value; `(catch :tag e ...)` takes the value `:tag` or a map whose `:error` is `:tag`; clauses are tried in order and the rest is rethrown through `finally` | MACROEXPAND.md §8b, PLAN §6.4 |
+| `(meta f)` on a function, `(with-meta 'sym m)` | metadata on fns and symbols | nil / `:no-metadata-on-immediate`; collections and Vars carry metadata, `defn`'s Var carries `:doc`, `:arglists` and its attribute map once given any of them, else nil | SEMANTICS.md §7 |
 | `(case x ...)` with no matching clause | throws `IllegalArgumentException` "No matching clause: x" | throws the map `{:error :no-matching-clause :message "No matching clause: x" :value x}`; `condp` throws the same. Keys are constants exactly as in Clojure: `(1 2)` groups, `sym` is the symbol | MACROEXPAND.md §8b |
 
 ### 4.4 Explicit omissions (by PLAN §4 non-goals)

@@ -651,6 +651,14 @@ Macro semantics (peer-AI turn 56 §2.G-J):
 - `cond`: `(cond t1 e1 t2 e2 ...)` → nested if. Odd arg
   count = `MacroExpansionFailure`. No `:else` special case
   in v1 (keyword used as truthy test works).
+- `def` / `defn` / `defmacro` metadata: `^meta` on the name
+  (`^:private f` reads as `{:private true}`), a docstring after
+  the name (`:doc`) and, for `defn`, an attribute map after that
+  all land on the Var: `(defn f "doc" {:k 1} [x] ...)` →
+  `(let* [v# (def f (fn f [x] ...))] (nexis.core/reset-meta! v#
+  {:doc "doc" :k 1 :arglists (quote ([x]))}) v#)`. A definition
+  with none of them leaves the Var's metadata nil. `(doc f)`
+  prints the `:arglists` and `:doc` of `f`'s Var.
 - `case`: `(case expr k1 v1 k2 v2 ... default?)` → `(let* [g expr]
   (if (= g 'k1) v1 (if (= g 'k2) v2 ... terminal)))`. Every key is
   a constant and is never evaluated: a symbol key is that symbol,

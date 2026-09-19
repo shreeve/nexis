@@ -1099,8 +1099,10 @@ pub const DeclaredNames = struct {
         for (items) |item| try self.declareForm(item);
         if (items.len < 2 or items[0].datum != .symbol or items[0].datum.symbol.ns != null) return;
         const head = items[0].datum.symbol.name;
-        if (items[1].datum != .symbol or items[1].datum.symbol.ns != null) return;
-        const name = items[1].datum.symbol.name;
+        // `^meta` on the name wraps it in with_meta.
+        const name_form = if (items[1].datum == .with_meta) items[1].datum.with_meta.target else items[1];
+        if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return;
+        const name = name_form.datum.symbol.name;
         if (std.mem.eql(u8, head, "def") or std.mem.eql(u8, head, "defn") or std.mem.eql(u8, head, "defmacro")) {
             try self.declare(name);
         } else if (std.mem.eql(u8, head, "defrecord")) {

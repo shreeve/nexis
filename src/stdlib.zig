@@ -290,6 +290,11 @@ const core_fns = [_]CoreEntry{
     .{ .name = "namespace", .descriptor = &native_namespace },
     .{ .name = "keyword", .descriptor = &native_keyword },
     .{ .name = "symbol", .descriptor = &native_symbol },
+    // Metadata (PLAN §8.5).
+    .{ .name = "meta", .descriptor = &native_meta },
+    .{ .name = "with-meta", .descriptor = &native_with_meta },
+    .{ .name = "reset-meta!", .descriptor = &native_reset_meta },
+    .{ .name = "alter-meta!", .descriptor = &native_alter_meta },
     .{ .name = "boolean", .descriptor = &native_boolean },
     .{ .name = "list?", .descriptor = &native_list_q },
     .{ .name = "seq?", .descriptor = &native_seq_q },
@@ -512,6 +517,10 @@ const native_name = NativeFn{ .name = "name", .min_arity = 1, .max_arity = 1, .c
 const native_namespace = NativeFn{ .name = "namespace", .min_arity = 1, .max_arity = 1, .call = &fnNamespace };
 const native_keyword = NativeFn{ .name = "keyword", .min_arity = 1, .max_arity = 2, .call = &fnKeyword };
 const native_symbol = NativeFn{ .name = "symbol", .min_arity = 1, .max_arity = 2, .call = &fnSymbol };
+const native_meta = NativeFn{ .name = "meta", .min_arity = 1, .max_arity = 1, .call = &fnMeta };
+const native_with_meta = NativeFn{ .name = "with-meta", .min_arity = 2, .max_arity = 2, .call = &fnWithMeta };
+const native_reset_meta = NativeFn{ .name = "reset-meta!", .min_arity = 2, .max_arity = 2, .call = &fnResetMeta };
+const native_alter_meta = NativeFn{ .name = "alter-meta!", .min_arity = 2, .max_arity = null, .call = &fnAlterMeta };
 const native_boolean = NativeFn{ .name = "boolean", .min_arity = 1, .max_arity = 1, .call = &fnBoolean };
 const native_list_q = NativeFn{ .name = "list?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
 const native_seq_q = NativeFn{ .name = "seq?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
@@ -2241,6 +2250,72 @@ fn fnSymbol(vm: *VM, args: []const Value) VmError!Value {
     }
     if (args[0].kind() == .symbol) return args[0];
     return vm.ensureInterner().internSymbolValue(try internedName(vm, args[0])) catch |err| internFailure(err);
+}
+
+// =============================================================================
+// Metadata (PLAN §8.5, SEMANTICS.md §7)
+// =============================================================================
+//
+// A list, vector, map or set carries its metadata map in the heap
+// header's `meta` slot; a Var carries it in `Var.meta`. Metadata
+// never takes part in equality, hashing, printing or the codec.
+
+fn carriesHeaderMeta(k: Kind) bool {
+    return k == .list or k == .persistent_vector or k == .persistent_map or k == .persistent_set;
+}
+
+/// `(meta x)` → the metadata map of a list, vector, map, set or Var;
+/// nil for anything else or when none is attached.
+fn fnMeta(_: *VM, args: []const Value) VmError!Value {
+    const x = args[0];
+    if (x.kind() == .var_) return VM.asVar(x).meta;
+    if (!carriesHeaderMeta(x.kind())) return value_mod.nilValue();
+    const m = heap_mod.Heap.asHeapHeader(x).getMeta() orelse return value_mod.nilValue();
+    return champ_mod.valueFromMapHeader(m);
+}
+
+/// `(with-meta x m)` → a value equal to `x` carrying `m` (a map or
+/// nil) as its metadata. The root object is copied, so `x` keeps its
+/// own; the copy shares every node below the root. A kind that
+/// cannot carry metadata is `:no-metadata-on-immediate`; a Var's
+/// metadata changes in place through `reset-meta!` / `alter-meta!`.
+fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
+    const x = args[0];
+    const m = args[1];
+    if (!m.isNil() and m.kind() != .persistent_map) return VmError.KindMismatch;
+    if (!carriesHeaderMeta(x.kind())) return vm.throwKeyword("no-metadata-on-immediate");
+    const h = heap_mod.Heap.asHeapHeader(x);
+    const body = heap_mod.Heap.bodyBytes(h);
+    const copy = vm.ensureHeap().alloc(x.kind(), body.len) catch return VmError.OutOfMemory;
+    @memcpy(heap_mod.Heap.bodyBytes(copy), body);
+    copy.kind = h.kind;
+    copy.flags = h.flags & ~heap_mod.flag_has_meta;
+    copy.setMeta(if (m.isNil()) null else heap_mod.Heap.asHeapHeader(m));
+    return .{ .tag = x.tag, .payload = @intFromPtr(copy) };
+}
+
+/// `(reset-meta! v m)` → sets the Var's metadata to `m` (a map or
+/// nil) and returns it.
+fn fnResetMeta(_: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .var_) return VmError.KindMismatch;
+    if (!args[1].isNil() and args[1].kind() != .persistent_map) return VmError.KindMismatch;
+    VM.asVar(args[0]).meta = args[1];
+    return args[1];
+}
+
+/// `(alter-meta! v f & args)` → sets the Var's metadata to
+/// `(apply f (meta v) args)` and returns it.
+fn fnAlterMeta(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .var_) return VmError.KindMismatch;
+    const v = VM.asVar(args[0]);
+    const call_args = vm.allocator.alloc(Value, args.len - 1) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(call_args);
+    call_args[0] = v.meta;
+    @memcpy(call_args[1..], args[2..]);
+    const next = try vm.callValue(args[1], call_args);
+    if (!next.isNil() and next.kind() != .persistent_map) return VmError.KindMismatch;
+    v.meta = next;
+    return next;
 }
 
 fn fnBoolean(_: *VM, args: []const Value) VmError!Value {

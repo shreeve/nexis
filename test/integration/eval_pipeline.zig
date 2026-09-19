@@ -443,6 +443,46 @@ test "integration: defn" {
     try expectOutput("(do (defn inc [x] (+ x 1)) (inc 41))", "42");
 }
 
+test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
+    try expectOutputProgram("(defn f \"doc\" [x] x) [(f 1) (:doc (meta (var f))) (:arglists (meta (var f)))]", "[1 doc ([x])]");
+    try expectOutputProgram("(defn g {:private true} [x] x) [(g 1) (:private (meta (var g)))]", "[1 true]");
+    try expectOutputProgram("(defn h \"doc\" {:k 1} [x] x) (select-keys (meta (var h)) [:doc :k])", "{:doc doc, :k 1}");
+    try expectOutputProgram("(defn ^:private p [x] x) [(p 2) (:private (meta (var p)))]", "[2 true]");
+    try expectOutputProgram("(defn ^{:doc \"d\"} q [x] x) (:doc (meta (var q)))", "d");
+    try expectOutputProgram("(defn m \"two\" ([x] x) ([x y] y)) [(m 1 2) (:arglists (meta (var m)))]", "[2 ([x] [x y])]");
+    // Without metadata a defn's Var carries none.
+    try expectOutputProgram("(defn plain [x] x) (meta (var plain))", "nil");
+    // def and defmacro take the same spellings.
+    try expectOutputProgram("(def ^:private v 1) [v (:private (meta (var v)))]", "[1 true]");
+    try expectOutputProgram("(def ^{:doc \"dv\"} dv \"x\") [dv (:doc (meta (var dv)))]", "[x dv]");
+    try expectOutputProgram("(def dd \"doc\" 3) [dd (:doc (meta (var dd)))]", "[3 doc]");
+    try expectOutputProgram("(defmacro mm \"doc\" [x] x) [(mm 1) (:doc (meta (var mm)))]", "[1 doc]");
+    try expectOutputProgram("(defmacro ^:private pm [x] x) [(pm 1) (:private (meta (var pm)))]", "[1 true]");
+    // A ^meta name is still declared for forward references.
+    try expectOutputProgram("(defn a [] (b)) (defn ^:private b [] :b) (a)", ":b");
+    // reset-meta! / alter-meta! change a Var in place.
+    try expectOutputProgram("(defn f [x] x) (reset-meta! (var f) {:z 1}) (alter-meta! (var f) assoc :y 2) (meta (var f))", "{:z 1, :y 2}");
+}
+
+test "meta / with-meta / vary-meta on collections never touch equality, hash or printing" {
+    try expectOutput("(meta [1 2])", "nil");
+    try expectOutput("(meta (with-meta [1 2] {:a 1}))", "{:a 1}");
+    try expectOutput("(let [v [1 2] w (with-meta v {:a 1})] [(= v w) (= (hash v) (hash w)) (meta v) w (conj w 3)])", "[true true nil [1 2] [1 2 3]]");
+    try expectOutput("(meta (with-meta {:k 1} {:m 2}))", "{:m 2}");
+    try expectOutput("(meta (with-meta #{1} {:m 2}))", "{:m 2}");
+    try expectOutput("(meta (with-meta '(1 2) {:m 2}))", "{:m 2}");
+    try expectOutput("(meta (with-meta () {:m 2}))", "{:m 2}");
+    try expectOutput("(let [m (with-meta {:k 1} {:m 2})] [(get m :k) (assoc m :j 2) (meta (assoc m :j 2))])", "[1 {:k 1, :j 2} nil]");
+    try expectOutput("(meta (vary-meta [1] assoc :b 2))", "{:b 2}");
+    try expectOutput("(meta (vary-meta (with-meta [1] {:a 1}) assoc :b 2))", "{:a 1, :b 2}");
+    try expectOutput("(meta (with-meta (with-meta [1] {:a 1}) nil))", "nil");
+    try expectOutput("(try (with-meta 1 {}) (catch any e e))", ":no-metadata-on-immediate");
+    try expectOutput("(try (with-meta \"s\" {}) (catch any e e))", ":no-metadata-on-immediate");
+    try expectOutput("(try (with-meta (var meta) {}) (catch any e e))", ":no-metadata-on-immediate");
+    try expectOutput("(try (with-meta [1] 5) (catch any e e))", ":kind-mismatch");
+    try expectOutput("[(meta \"s\") (meta 1) (meta nil) (meta :k)]", "[nil nil nil nil]");
+}
+
 test "integration: defn forward reference (Var late-binding)" {
     try expectOutput("(do (defn f [] (g)) (defn g [] 99) (f))", "99");
 }

@@ -778,20 +778,76 @@ fn expandDef(
     items: []const *Form,
     depth: u32,
 ) ExpandError!*Form {
-    // (def name) | (def name value)
-    if (items.len < 2 or items.len > 3) return ExpandError.MalformedMacroCall;
+    // (def name) | (def name value) | (def name "doc" value); the
+    // name may carry `^meta`, which lands on the Var.
+    if (items.len < 2 or items.len > 4) return ExpandError.MalformedMacroCall;
     const head = items[0];
-    const name_form = items[1];
-    if (name_form.datum != .symbol) return ExpandError.MalformedMacroCall;
-    if (items.len == 2) return mutCast(list_form);
-    // Expand value only.
-    const new_value = try expandFormDepth(ctx, env, items[2], depth);
-    if (new_value == items[2]) return mutCast(list_form);
-    const out_items = try ctx.allocator.alloc(*Form, 3);
-    out_items[0] = mutCast(head);
-    out_items[1] = mutCast(name_form);
-    out_items[2] = new_value;
-    return try makeList(ctx, out_items, list_form.origin);
+    const named = try splitMetaName(items[1]);
+    const name_form = named.name;
+    var meta_items: std.ArrayList(*Form) = .empty;
+    defer meta_items.deinit(ctx.allocator);
+    if (named.meta) |m| try meta_items.appendSlice(ctx.allocator, m);
+    var value_idx: usize = 2;
+    if (items.len == 4) {
+        if (items[2].datum != .string) return ExpandError.MalformedMacroCall;
+        try meta_items.append(ctx.allocator, try makeKeyword(ctx, "doc", items[2].origin));
+        try meta_items.append(ctx.allocator, mutCast(items[2]));
+        value_idx = 3;
+    }
+    if (meta_items.items.len == 0 and named.meta == null and items.len < 4) {
+        if (items.len == 2) return mutCast(list_form);
+        // Expand value only.
+        const new_value = try expandFormDepth(ctx, env, items[2], depth);
+        if (new_value == items[2]) return mutCast(list_form);
+        const out_items = try ctx.allocator.alloc(*Form, 3);
+        out_items[0] = mutCast(head);
+        out_items[1] = mutCast(name_form);
+        out_items[2] = new_value;
+        return try makeList(ctx, out_items, list_form.origin);
+    }
+    var def_items: std.ArrayList(*Form) = .empty;
+    defer def_items.deinit(ctx.allocator);
+    try def_items.append(ctx.allocator, mutCast(head));
+    try def_items.append(ctx.allocator, mutCast(name_form));
+    if (value_idx < items.len) try def_items.append(ctx.allocator, try expandFormDepth(ctx, env, items[value_idx], depth));
+    const def_form = try makeListInline(ctx, list_form.origin, def_items.items);
+    return try withVarMeta(ctx, def_form, meta_items.items, list_form.origin);
+}
+
+/// A definition's name form split into the symbol and the entries
+/// of any `^meta` it carries (`^:private f` reads as `{:private
+/// true}`); a name that is neither is malformed.
+fn splitMetaName(form: *const Form) ExpandError!struct { name: *const Form, meta: ?[]const *Form } {
+    switch (form.datum) {
+        .symbol => |sym| {
+            if (sym.ns != null) return ExpandError.MalformedMacroCall;
+            return .{ .name = form, .meta = null };
+        },
+        .with_meta => |wm| {
+            if (wm.target.datum != .symbol or wm.target.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
+            if (wm.meta.datum != .map) return ExpandError.MalformedMacroCall;
+            return .{ .name = wm.target, .meta = wm.meta.datum.map };
+        },
+        else => return ExpandError.MalformedMacroCall,
+    }
+}
+
+/// `def_form` (a `def`, which yields its Var) wrapped so the Var
+/// then carries the map built from `meta_items` (flat k v ...):
+///   (let* [v# def_form] (nexis.core/reset-meta! v# {k v ...}) v#)
+/// No items: `def_form` itself.
+fn withVarMeta(ctx: *ExpandContext, def_form: *Form, meta_items: []const *Form, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    if (meta_items.len == 0) return def_form;
+    const v_sym = try genTempSym(ctx, origin);
+    const map_form = try ctx.allocator.create(Form);
+    const map_items = try ctx.allocator.alloc(*Form, meta_items.len);
+    for (meta_items, 0..) |it, i| map_items[i] = mutCast(it);
+    map_form.* = .{ .datum = .{ .map = @as([]const *Form, map_items) }, .origin = origin };
+    const reset_call = try makeListInline(ctx, origin, &.{ try makeQualifiedSymbol(ctx, "nexis.core", "reset-meta!", origin), v_sym, map_form });
+    const bindings = try ctx.allocator.alloc(*Form, 2);
+    bindings[0] = v_sym;
+    bindings[1] = def_form;
+    return try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "let*", origin), try makeVector(ctx, bindings, origin), reset_call, v_sym });
 }
 
 fn expandDefn(
@@ -1319,15 +1375,24 @@ fn expandDefmacro(
     items: []const *Form,
     depth: u32,
 ) ExpandError!*Form {
-    // (defmacro NAME [PARAMS] BODY...)
-    if (items.len < 4) return ExpandError.MalformedMacroCall;
-    const name_form = items[1];
-    const params_form = items[2];
-    if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) {
-        return ExpandError.MalformedMacroCall;
+    // (defmacro NAME "doc"? [PARAMS] BODY...); `^meta` on NAME and
+    // the docstring land on the Var like defn's.
+    if (items.len < 3) return ExpandError.MalformedMacroCall;
+    const named = try splitMetaName(items[1]);
+    const name_form = named.name;
+    var meta_items: std.ArrayList(*Form) = .empty;
+    defer meta_items.deinit(ctx.allocator);
+    if (named.meta) |m| try meta_items.appendSlice(ctx.allocator, m);
+    var params_idx: usize = 2;
+    if (items[2].datum == .string) {
+        try meta_items.append(ctx.allocator, try makeKeyword(ctx, "doc", items[2].origin));
+        try meta_items.append(ctx.allocator, mutCast(items[2]));
+        params_idx = 3;
     }
+    if (params_idx >= items.len) return ExpandError.MalformedMacroCall;
+    const params_form = items[params_idx];
     if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
-    const body_forms = items[3..];
+    const body_forms = items[params_idx + 1 ..];
 
     // Need both a namespace (to mark the Var) and a compile-
     // eval callback (to compile+run the synthetic def form).
@@ -1387,6 +1452,15 @@ fn expandDefmacro(
     if (result_value.kind() != .var_) return ExpandError.MalformedMacroCall;
     const target_var = vm_mod.VM.asVar(result_value);
     target_var.macro = true;
+    if (meta_items.items.len > 0) {
+        target_var.meta = formToValue(ctx, blk: {
+            const map_form = try ctx.allocator.create(Form);
+            const map_items = try ctx.allocator.alloc(*Form, meta_items.items.len);
+            for (meta_items.items, 0..) |it, i| map_items[i] = it;
+            map_form.* = .{ .datum = .{ .map = @as([]const *Form, map_items) }, .origin = list_form.origin };
+            break :blk map_form;
+        }) catch return ExpandError.MalformedMacroCall;
+    }
 
     // Replacement form: (var name) — evaluates to the same Var
     // at runtime so the REPL prints `#'name`.
@@ -1949,18 +2023,50 @@ fn expandDefnMacro(
     args: []const *Form,
 ) ExpandError!*Form {
     if (args.len < 2) return ExpandError.MalformedMacroCall;
-    const name_form = args[0];
-    if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) {
-        return ExpandError.MalformedMacroCall;
+    const named = try splitMetaName(args[0]);
+    const name_form = named.name;
+    const origin = call_form.origin;
+
+    // Optional docstring, then optional attribute map, before the
+    // params or clauses. Together with `^meta` on the name they
+    // become the Var's metadata, with `:arglists` added.
+    var meta_items: std.ArrayList(*Form) = .empty;
+    defer meta_items.deinit(ctx.allocator);
+    if (named.meta) |m| try meta_items.appendSlice(ctx.allocator, m);
+    var rest: usize = 1;
+    if (rest < args.len and args[rest].datum == .string) {
+        try meta_items.append(ctx.allocator, try makeKeyword(ctx, "doc", args[rest].origin));
+        try meta_items.append(ctx.allocator, mutCast(args[rest]));
+        rest += 1;
     }
+    if (rest < args.len and args[rest].datum == .map) {
+        try meta_items.appendSlice(ctx.allocator, args[rest].datum.map);
+        rest += 1;
+    }
+    if (rest >= args.len) return ExpandError.MalformedMacroCall;
+    const fn_args = args[rest..];
+
     // Detect single-arity vs multi-arity:
-    //   single: args[1] is vector (params)
-    //   multi:  args[1..] are lists each shaped (params body...)
-    const single_arity = args[1].datum == .vector;
-    if (single_arity) {
-        return try buildDefSingleFn(ctx, call_form, name_form, args[1..]);
+    //   single: fn_args[0] is vector (params)
+    //   multi:  fn_args are lists each shaped (params body...)
+    const def_form = if (fn_args[0].datum == .vector)
+        try buildDefSingleFn(ctx, call_form, name_form, fn_args)
+    else
+        try buildDefMultiFn(ctx, call_form, name_form, fn_args);
+    if (meta_items.items.len == 0) return def_form;
+
+    // :arglists (quote ([params] ...))
+    var lists: std.ArrayList(*Form) = .empty;
+    defer lists.deinit(ctx.allocator);
+    if (fn_args[0].datum == .vector) {
+        try lists.append(ctx.allocator, mutCast(fn_args[0]));
+    } else for (fn_args) |clause| {
+        if (clause.datum != .list or clause.datum.list.len == 0) return ExpandError.MalformedMacroCall;
+        try lists.append(ctx.allocator, mutCast(clause.datum.list[0]));
     }
-    return try buildDefMultiFn(ctx, call_form, name_form, args[1..]);
+    try meta_items.append(ctx.allocator, try makeKeyword(ctx, "arglists", origin));
+    try meta_items.append(ctx.allocator, try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "quote", origin), try makeListInline(ctx, origin, lists.items) }));
+    return try withVarMeta(ctx, def_form, meta_items.items, origin);
 }
 
 fn buildDefSingleFn(

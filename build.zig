@@ -1163,6 +1163,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "syntax-quote" },
             .{ .name = "macro-author" },
             .{ .name = "try-catch" },
+            .{ .name = "metadata" },
             .{ .name = "maps-sets" },
             .{ .name = "defmacro" },
             .{ .name = "stdlib-primitives" },

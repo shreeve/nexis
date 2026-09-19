@@ -423,25 +423,19 @@ strings (PLAN §7.2 — source may not contain raw newlines inside a string).
 
 ### 7. Value attachability matrix for metadata
 
-Copied from PLAN §8.5 so implementation can consult one file.
+PLAN §8.5 is the target matrix; this is what the runtime does.
 
-| Kind | Attachable? |
-|---|---|
-| `nil`, `bool`, `char`, `fixnum`, `bignum`, `float` | ❌ |
-| `keyword` | ❌ |
-| `string` | ❌ (v1) |
-| `symbol` | ✅ (wrapped heap form) |
-| `list`, `vector`, `map`, `set` | ✅ |
-| `byte-vector`, `typed-vector` | ✅ |
-| `function` / closure | ✅ |
-| `var` | ✅ |
-| `durable-ref` | ❌ |
-| `transient` | ❌ |
-| `error` | ✅ (the error map IS its metadata payload) |
+| Kind | `with-meta` | `meta` |
+|---|---|---|
+| `list`, `vector`, `map`, `set` | a copy of the root object carrying the map (`with-meta`, `vary-meta`); every node below the root is shared | the map or nil |
+| `var` | `:no-metadata-on-immediate`; a Var's metadata changes in place with `reset-meta!` / `alter-meta!`, and `def`, `defn` and `defmacro` set it from `^meta` on the name, a docstring (`:doc`) and an attribute map, `defn` adding `:arglists` | the map or nil |
+| `nil`, `bool`, `char`, `fixnum`, `bignum`, `float`, `keyword`, `string`, `durable-ref`, `transient`, the db and Nextomic handles | `:no-metadata-on-immediate` | nil |
+| `symbol`, `function`, `record`, `byte-vector`, `typed-vector` | `:no-metadata-on-immediate`: PLAN §8.5 lists them attachable, and no heap form for a symbol with metadata nor a heap closure exists to carry it | nil |
 
-Attempting `with-meta` on a non-attachable kind throws
-`:no-metadata-on-immediate`. Adding a kind to the ✅ column requires a
-PLAN.md amendment.
+Metadata never takes part in `=`, `hash`, printing or the codec
+(PLAN §23 #12): `(= v (with-meta v m))` is true and the two hash
+alike. The metadata argument is a map or nil; anything else is
+`:kind-mismatch`.
 
 ---
 
