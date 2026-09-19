@@ -518,23 +518,21 @@ in force at call time.
 
 ### 6.8 Nextomic follow-ups
 
-In the order they unblock users; each is listed as later in
-`docs/NEXTOMIC.md` §6 and wants a §3/§5/§6 row, a corpus or `.nx`
-case and its `.out`:
+In the order they unblock users; each wants its `docs/NEXTOMIC.md`
+row, a corpus or `.nx` case and its `.out`:
 
-- **Transaction functions and `:db.fn/cas`**: a Lisp function called
-  inside `transact!` with `db-before`, returning tx-data. Functions
-  are not serializable, so the function resolves through a namespace
-  Var by symbol; it needs §6.1's rooting rule once the collector runs.
-  `transact.zig` normalise stage plus the `CallHook` pattern of
-  `query/exec.zig`.
-- **Excision**: removing datoms from history. EAVT is a prefix
-  (`Txn.delPrefixFromTree` exists in emdb); AEVT, AVET and VAET are
-  per-datom deletes and the txlog entry must be rewritten.
-- **Full-text**: a `:db/fulltext` attribute flag, a tokens tree, a
-  `fulltext` function in queries.
-- **Lazy entities**: an `entity` that reads attributes on access
-  instead of the eager map.
+- **A lazy entity kind**: `entity` returns an eager map read in one
+  pass (`docs/NEXTOMIC.md` §6). An entity that reads attributes on
+  access is a heap kind of its own, holding the connection, the basis
+  and mode and the eid, with arms in `value.zig`'s `Kind`,
+  `dispatch.zig` (lookup, `get`, `keys`, `seq`, `count`, equality by
+  identity of connection, basis and eid), `format.zig`, `gc.zig` and
+  the codec, and a `nextomic_handle.zig` body beside the two existing
+  boxes. Each access opens a read transaction and folds the view, so
+  `entity` on a history db can stay refused and a ref can return
+  another lazy entity. The `.nx` scripts that print entity maps
+  (`basics`, `polish`, `pull`, `time`) pin the eager shapes and would
+  change.
 - **Hash-join tuning**: the planner's estimates come from `treeStat`
   and per-attribute counts; `exec.zig` chooses nested loop when
   `rows × log n` is below the scan estimate. Measure
@@ -544,15 +542,12 @@ case and its `.out`:
   run should produce byte-identical stores; there is no CI in this
   repository, so the proof is a run on a Linux host of `zig build
   test` plus a store written on one platform and read on the other.
-- **Query surface**: `:keys`/`:strs`/`:syms` in `:find`, a second
-  database `:in $ $2`, `(pull ?e [...])` in `:find`, `get-some`,
-  `median`/`variance`/`(max n ?x)`/`(sample n ?x)`, and a fourth
-  component to `datoms` are `:nextomic/query-syntax` or
-  `:arity-mismatch`; `query/parse.zig` is where each starts.
-- **Schema alteration**: `:db/ident` rename and cardinality one → many
-  are `:nextomic/conflict`; `docs/NEXTOMIC.md` §3 states schema is
-  additive.
 - **A datom heap kind**: reads return `[e a v t added]` vectors.
+- **Full-text over Unicode case**: `fulltext.zig` lowercases ASCII
+  letters and keeps every non-ASCII byte as it is, so `Café` and
+  `CAFÉ` are two tokens. Case folding beyond ASCII needs a table the
+  runtime does not carry; adding one changes the rows the tokens tree
+  holds, so it comes with a rebuild of the tree at open.
 
 ### 6.9 Smaller items
 
