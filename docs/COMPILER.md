@@ -812,7 +812,30 @@ name and, for an uncaught throw, the thrown value.
   and keeps the source span of forms it passes through.
 - Lowering reports the span of the symbol it rejects through
   `LowerDiag`; `compileFormWith` falls back to the form's.
-- Bytecode carries no spans: nothing maps a PC back to a form.
+- Lowering allocates every Tiny node as a `TinyNode{span, tiny}`
+  and `lowerFormEnv` stamps the node with its Form's span; a
+  node lowering synthesizes without a Form (the `do` around a
+  body, the `fn*` a `defn` stands for) has none and inherits the
+  span of the form enclosing it. A hand-built `&Tiny{...}` tree
+  compiles without spans (`compileTiny`).
+- The Emitter attributes every instruction it emits to the span
+  of the innermost node being compiled: `compileExpr` sets the
+  current span on entry and restores the parent's on exit, so an
+  instruction a parent emits after its children (`call:call`
+  after the arguments, `call:return` after a body) carries the
+  parent's span. `emit` grows a run-length table, one
+  `SpanEntry{pc, span}` per change of span, ascending by pc.
+- Each `Routine` carries that table (`spans`), the span of the
+  form it was lowered from (`origin`) and the source the spans
+  index into (`source`, a `vm.SourceInfo{path, text}` the
+  caller of `compileFormWith` owns through `CompileOptions.source`);
+  a nested closure prototype carries its own. Forms a macro
+  produced carry the macro call's span, so instructions from an
+  expansion resolve to the call. `Routine.spanAt(pc)` is a
+  binary search; nothing reads the table while instructions
+  execute (VM.md §5).
+- A `defn` routine is named after its Var (the name copied onto
+  the compile allocator), an anonymous closure `fn`.
 
 ---
 

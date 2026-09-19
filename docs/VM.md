@@ -228,9 +228,20 @@ them (§6).
   `argc >= fixed_arity` for a variadic one; a variadic routine's
   `slot_count` is at least `fixed_arity + 1` (room for the rest
   slot) or the routine is `BytecodeCorruption`.
-- **Name**: for diagnostics (`<anonymous>` by default).
+- **Name**: for diagnostics (`<anonymous>` by default; the
+  compiler names a `defn` routine after its Var, an anonymous
+  closure `fn`, and the CLI a top-level form `<top>`).
+- **Span table** (`spans`): `SpanEntry{pc, span}` runs ascending
+  by pc, one per change of source span, so `spanAt(pc)` (a
+  binary search) gives the `SourceSpan{pos, len}` of the form
+  the instruction at `pc` was lowered from. `origin` is the span
+  of the routine's own form and `source` the `SourceInfo{path,
+  text}` the spans index into (null when unknown). The compiler
+  fills all three (`COMPILER.md` §8); a routine built by hand
+  has an empty table. Execution never reads them: the error path
+  (§13) and the disassembler do.
 
-Routines carry no source-span table and no metadata map.
+Routines carry no metadata map.
 
 **Routine identity**: two routines compiled from the same source
 are NOT required to be `identical?`. Structural equality between

@@ -367,6 +367,62 @@ pub const CaptureDescriptor = struct {
     sources: []const CaptureSource,
 };
 
+/// A byte range of a source text: the span the reader gives a Form,
+/// carried by the compiler to the instructions lowered from it.
+pub const SourceSpan = struct {
+    pos: u32,
+    len: u32,
+};
+
+/// One run of instructions lowered from the same form: every pc
+/// from `pc` up to the next entry's pc carries `span`.
+pub const SpanEntry = struct {
+    pc: u32,
+    span: SourceSpan,
+};
+
+/// The text a routine was compiled from and the path it is reported
+/// under. Owned by whoever compiled the routine and outlives it.
+pub const SourceInfo = struct {
+    path: []const u8,
+    text: []const u8,
+
+    pub const LineCol = struct { line: u32, col: u32 };
+
+    /// 1-based line and column of byte offset `pos`; an offset past
+    /// the end lands on the last position.
+    pub fn lineCol(self: *const SourceInfo, pos: u32) LineCol {
+        var line: u32 = 1;
+        var col: u32 = 1;
+        const cap: usize = @min(pos, self.text.len);
+        for (self.text[0..cap]) |ch| {
+            if (ch == '\n') {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        return .{ .line = line, .col = col };
+    }
+
+    /// The text of 1-based `line` without its newline; empty past
+    /// the end.
+    pub fn lineText(self: *const SourceInfo, line: u32) []const u8 {
+        var current: u32 = 1;
+        var start: usize = 0;
+        for (self.text, 0..) |ch, i| {
+            if (ch == '\n') {
+                if (current == line) return self.text[start..i];
+                current += 1;
+                start = i + 1;
+            }
+        }
+        if (current == line) return self.text[start..];
+        return "";
+    }
+};
+
 pub const Routine = struct {
     /// Bytecode instructions.
     code: []const Inst,
@@ -409,6 +465,28 @@ pub const Routine = struct {
     var_table: []const *Var = &.{},
     /// Human-readable name for diagnostics. Non-owning.
     name: []const u8 = "<anonymous>",
+    /// PC → source span table, run-length encoded and ascending by
+    /// pc; empty for a routine built from hand-written Tiny or
+    /// bytecode. Never consulted while instructions execute: the
+    /// error path and the disassembler read it.
+    spans: []const SpanEntry = &.{},
+    /// The span of the form the routine was lowered from.
+    origin: ?SourceSpan = null,
+    /// The source the spans index into.
+    source: ?*const SourceInfo = null,
+
+    /// The source span of the instruction at `pc`, or null when the
+    /// table has no entry at or before it.
+    pub fn spanAt(self: *const Routine, pc: u32) ?SourceSpan {
+        var lo: usize = 0;
+        var hi: usize = self.spans.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.spans[mid].pc <= pc) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return null;
+        return self.spans[lo - 1].span;
+    }
 };
 
 /// A Var holds a mutable cell of a Value with stable identity
