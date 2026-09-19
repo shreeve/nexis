@@ -10,7 +10,7 @@
 
 ### What this document is
 
-`PLAN.md` is the **authoritative design specification** for nexis. It is the product of deep iterative review (including 10 rounds of adversarial critique with a peer AI and a direct read of ~30k lines of Clojure source). Commitments in §23 (Hard Decisions) require an amendment to this document to change. Everything else may be refined during implementation but should respect the architecture laid out here.
+`PLAN.md` is the **authoritative design specification** for nexis. It is the product of deep iterative review (including a direct read of ~30k lines of Clojure source (`CLOJURE-REVIEW.md`)). Commitments in §23 (Hard Decisions) require an amendment to this document to change. Everything else may be refined during implementation but should respect the architecture laid out here.
 
 ### Required reading (in order)
 
@@ -27,32 +27,22 @@
 | `/Users/shreeve/Data/Code/emdb/` | **Storage engine** — mmap'd B+ tree, MVCC, named trees | Read `README.md` and `SPEC.md`. This is what nexis uses for durable refs (§15). |
 | `/Users/shreeve/Data/Code/em/` | **MUMPS engine** — template for compiler/bytecode/runtime | Read `docs/architecture/ISA.md` for the 64-bit bytecode format we inherit. `src/mumps.zig` shows the `@lang` module contract. `src/mumps.grammar` shows a real production grammar. |
 
-### Companion documents (some exist, some to produce)
+### Companion documents
 
-| Doc | Status | Purpose |
-|---|---|---|
-| `CLOJURE-REVIEW.md` | ✅ exists at repo root | Source review findings (230 lines) |
-| `docs/SEMANTICS.md` | **to produce in Phase 0** | Numeric corner cases (NaN, -0.0, ±Inf, overflow), print/read contract, cross-type equality examples, nil/empty semantics, metadata matrix (§8.5) |
-| `docs/FORMS.md` | **to produce in Phase 0** | Canonical Form schema (lift from Appendix C §28 for easy reference), reader-to-Form normalization rules, reader/normalizer/macroexpander responsibility boundaries |
-| `docs/CODEC.md` (stub) | **to produce in Phase 0** | Serializability matrix (from §15.10), wire format, round-trip invariants |
-| `AGENTS.md` | **to produce in Phase 0** | Short routing guide: "read PLAN.md end-to-end, then CLOJURE-REVIEW.md, then ZIG-0.16.0.md; follow §23 frozen decisions; see §24 for open questions." |
-
-### Your Phase 0 deliverables
-
-Detailed in §21, but summarized:
-
-- `nexis.grammar`, `src/nexis.zig`, `build.zig`, `build.zig.zon` — the parser and build wiring
-- `docs/SEMANTICS.md`, `docs/FORMS.md`, `docs/CODEC.md` (stub)
-- `test/golden/basic.{nx,sexp}`, `test/golden/reader-literals.{nx,sexp}`, `test/golden/errors/*`
-- `README.md` updated, `AGENTS.md` created
-- Directory layout per §22
-
-**Exit**: grammar parses, forms match Appendix C shapes, SEMANTICS.md is reviewed, all golden tests pass.
+| Doc | Purpose |
+|---|---|
+| `CLOJURE-REVIEW.md` | Source review findings: what nexis takes, adapts and rejects from Clojure |
+| `docs/SEMANTICS.md` | Numeric corner cases (NaN, -0.0, ±Inf, overflow), print/read contract, cross-type equality examples, nil/empty semantics, metadata matrix (§8.5) |
+| `docs/FORMS.md` | Canonical Form schema (Appendix C §28 lifted into its own doc), reader-to-Form normalization rules, reader/normalizer/macroexpander responsibility boundaries |
+| `docs/CODEC.md` | Serializability matrix (from §15.10), wire format, round-trip invariants |
+| `docs/README.md` | Module ↔ spec map for every `docs/*.md` |
+| `AGENTS.md` | Short routing guide for contributors and AI sessions |
+| `HANDOFF.md` | What exists, how to verify it, ranked next work |
 
 ### How to navigate this document
 
 - **TOC below** is 28 sections + 3 appendices.
-- **Appendix C (§28)** is the single most important artifact for Phase 0 — the canonical Form schema with worked examples.
+- **Appendix C (§28)** is the single most important artifact for reader work — the canonical Form schema with worked examples.
 - **§23 Hard Decisions** is the list of 38 frozen commitments. If you're about to do something that contradicts one, STOP and ask.
 - **§24 Open Questions** is what's deliberately not decided yet — those are your call, guided by the design principles (§3).
 - **§25 Risk Register** — 17 named risks with mitigations. Refer to this when tempted to shortcut.
@@ -62,7 +52,7 @@ Detailed in §21, but summarized:
 1. **Do not break the three-representations boundary** (§5): Form, Value, Durable Encoded are distinct layers. They never fuse except through explicit codec operations.
 2. **Respect the SCVU operand-kind encoding** (§12.2): hot-path S/C/V/U, context-local I/J/E.
 3. **Do not widen the v1 non-goals list** (§4) without writing an amendment.
-4. **Do not expose benchmarks publicly** until Phase 6 runs real numbers (§19.7). The plan intentionally under-promises and over-delivers.
+4. **Do not expose benchmarks publicly** until benchmarks against Clojure produce real numbers (§19.7). The plan intentionally under-promises and over-delivers.
 
 If any of this conflicts with what you believe the user wants, **ask**. Do not silently deviate from frozen decisions.
 
@@ -90,7 +80,7 @@ If any of this conflicts with what you believe the user wants, **ask**. Do not s
 17. [Standard Library Shape](#17-standard-library-shape)
 18. [Tooling](#18-tooling)
 19. [SIMD & Performance](#19-simd--performance)
-20. [Testing Strategy & Phase Gates](#20-testing-strategy--phase-gates)
+20. [Testing Strategy & Gates](#20-testing-strategy--gates)
 21. [Roadmap & Milestones](#21-roadmap--milestones)
 22. [Repository Layout](#22-repository-layout)
 23. [Hard Decisions (Frozen)](#23-hard-decisions-frozen)
@@ -140,7 +130,7 @@ Every architectural decision in this document either directly enables or preserv
 - **Substantially faster database reads** of large strings/blobs via zero-copy paths from emdb mmap — measured target in `bench-db.nx`.
 - **Very high throughput on typed-vector numerics** via native `@Vector(N, T)` SIMD kernels — measured target in `bench-simd.nx`.
 
-Specific multiplier claims are **withheld until Phase 6 benchmarks against Clojure produce real numbers**; the numbers in §19.7 are projections based on well-understood structural advantages, published alongside v1 with honest side-by-side comparisons. We intend the phrase *"fastest interpreter-tier Lisp ever shipped"* as an aspirational north star, not a shipping commitment.
+Specific multiplier claims are **withheld until benchmarks against Clojure produce real numbers**; the numbers in §19.7 are projections based on well-understood structural advantages, published alongside v1 with honest side-by-side comparisons. We intend the phrase *"fastest interpreter-tier Lisp ever shipped"* as an aspirational north star, not a shipping commitment.
 
 ---
 
@@ -218,7 +208,7 @@ Nothing in nexis is conceptually new. Every major design choice has a clear ance
 | **Clojure** (Rich Hickey, 2007) | Persistent immutable collections, keywords, `[]`/`{}`/`#{}` literals, macros + syntax-quote + auto-gensym, namespaces + vars, REPL redefinition, threading macros | Essentially the surface language |
 | **CHAMP** (Steindorfer & Vinju, OOPSLA 2015) | Bitmap-indexed trie with separate data/node bitmaps, canonicalization for equality speed | `src/coll/champ.zig` — persistent map and set |
 | **RRB Trees** (Bagwell & Rompf, 2011) | Relaxed radix balanced tree for vectors with fast `concat` and `subvec` | `src/coll/vector.zig` — persistent vector |
-| **LuaJIT** (Mike Pall) | Register/slot VM, tail-call dispatch, operand-specialized opcodes (`ADDVV`/`ADDVN`), fixnum fast paths | The em-inherited ISA + our planned Phase 6 specialization |
+| **LuaJIT** (Mike Pall) | Register/slot VM, tail-call dispatch, operand-specialized opcodes (`ADDVV`/`ADDVN`), fixnum fast paths | The em-inherited ISA; operand specialization is a §19.6 Tier 2 item |
 | **Lua 5.0** (Ierusalimschy et al., 2005) | Upvalue closure representation, register-based VM simplicity | Closure and upvalue model |
 | **Copy-and-Patch JIT** (Xu et al., PLDI 2021) | Template-based near-native code generation with ~500 LOC of glue | Future v2 JIT path (§19.5) |
 | **Scheme R7RS / Racket** | Tail-call correctness, `syntax-rules` spirit (without full hygiene), error-as-value thinking | Tail call discipline, `try`/`catch`/`finally` model |
@@ -243,7 +233,7 @@ Eleven principles. Every architectural decision in this document is checkable ag
 5. **Durable identity is explicit.** There is no "maybe durable" value. A durable ref is a distinct, visibly-named kind.
 6. **One coherent model.** The user sees one story for values, identities, transactions, and persistence. No impedance mismatch.
 7. **Minimal reader, macro-powered surface.** The reader handles only what cannot be expressed as a macro: literals, collection punctuation, quote/unquote/deref/metadata.
-8. **Interactive development is sacred.** REPL redefinition, macroexpand, disassembly, introspection are first-class. They are not "tooling added later."
+8. **Interactive development is sacred.** REPL redefinition, macroexpand, disassembly, introspection are first-class. They are not afterthoughts.
 9. **Explicit, predictable performance.** No hidden laziness, no surprise boxing, no implicit allocations in hot loops.
 10. **Separation of concerns.** Reader/Form, runtime Value, and durable encoding are three distinct layers. They may share conventions; they never fuse until benchmarks justify it.
 11. **Boring first, brilliant later.** Start with the simplest thing that is known to work. Optimize only with measurements. Research lives in a branch.
@@ -303,7 +293,7 @@ The product of parsing source text. Immutable tree of syntactic data.
 The product of the compiler; what bytecode manipulates. 16-byte tagged value (§8).
 
 - Immediates: `nil`, `bool`, `char`, `fixnum`, interned `keyword` id, interned `symbol` id.
-- Heap kinds: string, bignum, f64 box (if not inline), persistent map, persistent set, persistent vector, byte vector, typed vector, list (cons), function/closure, var, durable-ref, transient wrapper, error. (Records deferred to v2; see §24.)
+- Heap kinds: string, bignum, f64 box (if not inline), persistent map, persistent set, persistent vector, byte vector, typed vector, list (cons), function/closure, var, durable-ref, transient wrapper, error, atom, record, protocol.
 - Equality is structural for collections, identity-like for durable refs and vars, standard IEEE comparisons for floats (with a defined total-order for hashing/sort where floats participate).
 
 ### Layer 3 — Durable Encoding
@@ -563,7 +553,7 @@ Heap-allocated (payload = pointer to heap object with its own header):
 | `transient` | Mutable wrapper with `{owner-token, frozen?, kind}` |
 | `error` | Exception value |
 
-*(Records with named fixed fields are deferred to v2 — see §24.10. v1 uses tagged maps for record-like data.)*
+*(Records are `Kind.record` (35): a field map plus a type id, structurally equal and hashable; `docs/PROTOCOLS.md` §2. `protocol` (36), `protocol_fn` (37), `atom` (34), `native_fn` (30), the db handles (31–33) and the Nextomic handles complete the kind table in `docs/VALUE.md` §2.2.)*
 
 All heap objects share a header:
 
@@ -669,7 +659,7 @@ This applies to maps and other lookup-capable values that participate in `get`. 
 
 ### 9.2 Vector — plain 32-way persistent vector (v1)
 
-v1 ships a **plain 32-way persistent vector with a tail buffer**: the same broad shape Clojure has shipped successfully for 17+ years and the same structure Clojure's own source uses today (no relaxed balancing).
+v1 ships a **plain 32-way persistent vector with a tail buffer**: the same structure Clojure's own source uses (no relaxed balancing).
 
 - **32-way branching** (5 bits per level), radix trie layout.
 - **Tail buffer** for `conj` = amortized O(1) append.
@@ -677,9 +667,9 @@ v1 ships a **plain 32-way persistent vector with a tail buffer**: the same broad
 - `pop` is efficient when it only affects the tail or a short path back into the trie.
 - **Small-vector optimization**: up to 32 elements stored inline in a single node.
 
-This is the default v1 plan. It is sufficient, well-understood, validated in production Clojure for 17+ years, and removes one of the largest schedule risks from Phase 1.
+It is sufficient, well-understood and validated in production Clojure.
 
-**Deferred to v2+**: Relaxed radix balancing (RRB, Bagwell-Rompf 2011) for better `concat` / `subvec` / slice behavior. If added later, it should preserve the language-level vector contract and remain an implementation upgrade rather than a semantic change. `concat` and `subvec` in v1 degrade to O(n) copy in the worst case — exactly as in Clojure.
+**Absent**: relaxed radix balancing (RRB, Bagwell-Rompf 2011) for better `concat` / `subvec` / slice behavior. Adding it would have to preserve the language-level vector contract and remain an implementation upgrade rather than a semantic change. `concat` and `subvec` degrade to O(n) copy in the worst case — exactly as in Clojure.
 
 ### 9.3 List — immutable cons
 
@@ -718,7 +708,7 @@ Implementation note: the "arena" is an internal allocator detail; the **semantic
 
 All collection types cache size and hash on their root node.
 
-### 9.7 Storage-aware variants — explicitly deferred
+### 9.7 Storage-aware variants — explicitly out of scope
 
 Making the HAMT mmap-native, page-aligned, and zero-copy over emdb is explicitly a **post-v1 research direction**. v1 persists collections by serializing to a blob (§15.4). This is not where we get clever.
 
@@ -757,7 +747,7 @@ No reference counting. No cycle detection. No hybrid.
 
 GC roots are enumerated precisely from:
 
-1. The currently executing VM frames (slot pools, upvalue arrays, operand stack if any).
+1. The executing VM frames (slot pools, upvalue arrays, operand stack if any).
 2. The isolate's var table (namespace → symbol → Var).
 3. The intern tables (symbol, keyword, optional string).
 4. The dynamic-binding stack.
@@ -824,7 +814,7 @@ Stage boundaries are **strict**. A fresh implementation session must not let wor
   - The call is in tail position of a function (not inside `try`/`catch`/`finally`/binding/with-tx with pending unwind).
   - The frame can be replaced (no dynamic bindings to restore beyond the callee's control).
 - Otherwise emit ordinary `call` + `return`.
-- Tail calls are **not semantically guaranteed** in arbitrary contexts — only `recur` is. The compiler will document which calls were elided via a `--emit-tailcall-report` flag.
+- Tail calls are **not semantically guaranteed** in arbitrary contexts — only `recur` is. The compiler emits no general tail calls; `recur` is the only frame-eliding construct (`docs/VM.md` §6).
 
 ### 11.4 Literal lifting and constant pools
 
@@ -992,7 +982,7 @@ Four opcodes, four handlers, **two kind dispatches in total** — only at the tw
 | 7–14 | Reserved — future typed-vector slots, foreign handles, protocol method indices, etc. |
 | 15 | Unused — `FFFF` sentinel for missing operand |
 
-#### LuaJIT-style operand-specialized opcodes (reserved for Phase 6)
+#### LuaJIT-style operand-specialized opcodes (reserved)
 
 Even the 1-bit kind branch on hot math/cmp ops can be eliminated by **baking operand kinds into the opcode itself.** LuaJIT does this: instead of one `ADD` opcode, it has `ADDVV`, `ADDVN`, `ADDNV`, each taking fixed-kind operands with zero runtime dispatch.
 
@@ -1003,11 +993,11 @@ We reserve variant slots in groups 0–3 (jump/cmp/math/mov) for specialized for
 - `jump:if-eq-ss`, `jump:if-eq-sc`
 - `mov:load-from-c`, `mov:load-from-s`, `mov:load-from-v`
 
-This is **not** a v1 feature. The ISA reserves the variant space so these can be added in Phase 6 as a pure optimization pass without any ABI break. Expected speedup on numeric hot loops: ~10–30%, at the cost of a few dozen extra opcode slots (out of 4,096). Essentially free real estate.
+This is **not** a v1 feature. The ISA reserves the variant space so these can be added as a pure optimization pass without any ABI break. Expected speedup on numeric hot loops: ~10–30%, at the cost of a few dozen extra opcode slots (out of 4,096). Essentially free real estate.
 
 ### 12.3 Opcode groups (v1)
 
-64 groups available; v1 uses ~14. Each group has 64 variant slots.
+64 groups available; 14 are named. Each group has 64 variant slots. The variant names below are the design sketch; `docs/VM.md` §10 is the executed set.
 
 | # | Group | Purpose | Notable variants |
 |---|---|---|---|
@@ -1257,11 +1247,11 @@ emdb's copy-on-write + MVCC already provides everything we need for `as-of` read
 - **`(db/as-of conn snap) → db-value`** — returns a *database-as-value* bound to that snapshot. A `db-value` is the ambient snapshot context: `(deref ref :using db-value)` or `(with-db db-value ...)` reads through it. Borrowed directly from Datomic's `(d/as-of db #inst ...)`.
 - **Ephemeral snapshots** — every `with-read-tx` implicitly captures a snapshot; you can name it and keep it alive past the tx's scope with `(db/pin-snapshot tx)`.
 
-**Caveats in v1:** snapshots consume disk space — emdb cannot reclaim pages that any pinned snapshot still references. Long-held snapshots cause the file to grow. We document this as the single cost users pay for time travel. Phase 5 tooling includes `(db/snapshot-stats conn)` showing pinned snapshots and their page cost.
+**Caveats in v1:** snapshots consume disk space — emdb cannot reclaim pages that any pinned snapshot still references. Long-held snapshots cause the file to grow. We document this as the single cost users pay for time travel. `db/release-snapshot!` is the reclamation lever; no tooling reports pinned snapshots.
 
 **Why we promoted this:** when your storage engine already implements MVCC correctly, exposing time travel is a few hundred lines of library code, not a research project. Leaving it out of v1 would be self-imposed amnesia about what the substrate can do.
 
-**What is still deferred to v2:** historical range queries (`(db/history ref start-snap end-snap)` returning a sequence of `[snap, value]` pairs), because that requires walking emdb's free list of page generations — straightforward but not needed for the core value proposition.
+**Absent:** historical range queries over durable refs (`(db/history ref start-snap end-snap)` returning a sequence of `[snap, value]` pairs); that would require walking emdb's free list of page generations. Nextomic's `history` / `since` db-values cover the datom side.
 
 ### 15.8 Iterators over trees
 
@@ -1310,7 +1300,7 @@ They are **transactional identity cells backed by a memory-mapped B+ tree**. Cal
 | `tx handle` / `emdb.Env` connection | Handles to open OS resources. |
 | `error` | Exception values include stack traces with process-local frame references. Serializable subset TBD; v1 rejects. |
 | Any handle to open files, devices, cursors | OS resources. |
-| Future: `record` (currently deferred) | Undefined in v1. See §24. |
+| `record`, `protocol`, `protocol_fn` | `:unserializable` (`docs/PROTOCOLS.md`). |
 
 #### Attempting to serialize a non-serializable value
 
@@ -1324,7 +1314,7 @@ For every value `v` whose kind is in the "Serializable" table above:
 - `(= (hash v) (hash (codec/decode (codec/encode v))))` — hash preserved
 - `(= v (codec/decode-bytes (codec/encode-to-bytes v)))` — byte-level round-trip stable
 
-This is the Phase 1 gate property test #5, exercised on 10k+ randomized values.
+`test/prop/codec.zig` exercises this on randomized values.
 
 ### 15.11 The "Nextomic" opportunity — a Datomic-class database inside nexis
 
@@ -1410,13 +1400,12 @@ Implementation estimate (revised in `docs/NEXTOMIC.md` §10 after deeper review)
 
 #### 15.11.1 Frozen-once-scoped architectural decisions
 
-After a two-round peer-AI architectural review (GPT-5.4 via the
-`user-ai` MCP, conversation `nextomic-on-nexis-emdb`), six
-architectural decisions were identified as the separators between
-"serious 2026+-class contender" and "beautiful proof-of-concept."
-Full rationale is in [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) §3;
-these become binding in the same way PLAN §23 decisions bind v1,
-but only when Nextomic is actually scoped as an active project.
+Six architectural decisions separate a serious contender from a
+proof-of-concept. Full rationale is in
+[`docs/NEXTOMIC.md`](docs/NEXTOMIC.md); they bind in the same way
+PLAN §23 decisions bind v1. Where the built system diverges (NX-3,
+NX-4, NX-5, NX-6) the Amendment Log records the decision and
+`docs/NEXTOMIC.md` is the authority.
 
 | # | Decision | Short rationale |
 |---|---|---|
@@ -1424,7 +1413,7 @@ but only when Nextomic is actually scoped as an active project.
 | NX-2 | **Internal Relation type** — column-oriented, backed by existing `typed_vector` Value kinds. API results stay persistent-set-of-persistent-vector; the engine does NOT use that representation internally. | Generic persistent collections all the way is correct and slow. This is the single highest-leverage decision Nextomic will make. |
 | NX-3 | **Macro → IR → runtime-plan split.** Macro compiles query literal to IR (embedded as a bytecode constant). Runtime planner lowers IR to a plan using current schema + bound inputs. | Macros alone cannot plan (schema and bindings are runtime). Runtime alone pays parse cost per call. The split is roughly 40 / 30 / 30 between the three stages. |
 | NX-4 | **tx-in-key filtering for history, NOT emdb snapshot pinning.** Datoms are append-only with `tx` in the key; `as-of T` is a range filter. emdb snapshots are reserved for operational reproducibility, not semantic history. | Pinned snapshots prevent page reclamation; tx-in-key does not. Datomic semantics demand history-as-data, not history-as-page-retention. |
-| NX-5 | **`datom` as a new heap Value kind** — five accessors (`.e .a .v .tx .added?`), user-facing projection only. Execution operates on `Relation` columns, not on datom values. Serializes via projection to existing §15.10 kinds; no codec amendment. | Nicer ergonomics and cheaper accessors than vector-of-five-Values, without leaking into the hot execution path. |
+| NX-5 | **`datom` as a heap Value kind** — five accessors (`.e .a .v .tx .added?`), user-facing projection only. Execution operates on `Relation` columns, not on datom values. Serializes via projection to existing §15.10 kinds; no codec amendment. | Nicer ergonomics and cheaper accessors than vector-of-five-Values, without leaking into the hot execution path. |
 | NX-6 | **One named sub-DB per concern** (`:nextomic/txlog`, `:nextomic/eavt`, `:nextomic/aevt`, `:nextomic/avet`, `:nextomic/vaet`, `:nextomic/schema`, `:nextomic/idents`, `:nextomic/sys`). Keys are binary-sortable byte strings; emdb default lex comparator is exactly the needed order. Index values are empty — the key IS the datom. | Atomic multi-index commit falls out of emdb's single meta-page flip. Branch-page prefix compression (G=1/G>1/G<0) compresses composite EAVT keys maximally. |
 
 **Three things `docs/NEXTOMIC.md` explicitly rejects as temptations:**
@@ -1447,16 +1436,13 @@ If nexis ships with a credible Datomic-class embedded database as a library, the
 - **Common Lisp (SBCL)**: third-party libraries exist but nothing vertically integrated.
 - **nexis**: language + VM + storage + durable-ref + (eventual) Datalog, all in one coherent design.
 
-This is the strongest version of the "database-as-value" story. The PLAN does not commit to building Nextomic in v1 — doing so would miss the single-coherent-thing target. We *aim* not to preclude it:
+This is the strongest version of the "database-as-value" story. Nextomic exists (`src/nextomic/`, `docs/NEXTOMIC.md`) and rests on:
 
-- Durable-ref encoding leaves room for an EAVT representation (tree-id = index-name, key-bytes = composite e-a-v-tx key).
-- Snapshot semantics (§15.7) are already the foundation for `as-of`.
-- Transactions (§15.3) are already the foundation for the datom-assertion model.
-- Persistent collections are the natural return type for query results.
+- emdb named trees as the index store (§15.11 NX-6 as amended: eleven trees, key bytes carry the datom).
+- Transactions (§15.3) as the foundation for the datom-assertion model.
+- Persistent collections as the return type for query results.
 
-**This is an aspiration, not a guarantee.** As v1 semantics lock in, some choices may prove constraining; we'll revisit each one honestly when the Nextomic library is actually scoped.
-
-**Naming.** "Nextomic" is the working codename; the shipped library would likely have a cleaner name (`nexis.datalog`, `nexis.log`, or similar). But the idea is the thing.
+**Naming.** "Nextomic" is the working codename; the namespace is `nextomic`.
 
 ---
 
@@ -1498,7 +1484,7 @@ Multi-isolate version would:
 - emdb: unchanged — its single-writer multi-reader model composes naturally with isolates.
 - Shared immutable durable state is available read-only via zero-copy mmap views.
 
-This is **out of scope** until v1 has shipped and stabilized.
+This is **out of scope** for v1.
 
 ---
 
@@ -1619,8 +1605,6 @@ Low-risk wins that v1 takes:
 - **Static collection literals** — fully static `[1 2 3]` or `{:a 1}` is built once at load time and placed in the literal pool.
 - **Branch prediction hints** on `nil?`, `zero?` — common predicates emit a hinted `jump:f` / `jump:t`.
 
-*(Keyword-as-function — `(:foo m)` as sugar for `(get m :foo)` — is not a v1 language feature. If added later, it's a macro or a compiler specialization and requires a §6 / §17 amendment first. See §24.)*
-
 ### 19.3 What we deliberately defer
 
 - Inline caches on Var loads (the revision counter is there; the mechanism isn't).
@@ -1643,7 +1627,7 @@ Low-risk wins that v1 takes:
 | Uniform tagged Value | Single shape for type-check prefix + fast-path + slow-path fallback |
 | Revision counter on Vars | Built-in invalidation token for inline caching |
 | Single-threaded v1 | No thread safety in generated code yet |
-| Safepoint discipline (backward branches, call sites) | Preserved from v1 even without a JIT, so Phase 2+ doesn't retrofit |
+| Safepoint discipline (backward branches, call sites) | Part of the ISA contract even without a JIT, so a JIT does not retrofit it |
 
 Three plausible JIT paths, ranked by effort:
 
@@ -1666,11 +1650,11 @@ This is a **v2 feature**. The PLAN ensures `nexis.simd` is the delegation bounda
 
 A v3+ possibility worth naming: **GPU kernels over emdb pages.** Because emdb pages are mmap'd into the same physical pool the GPU can access on UMA, in principle a Metal kernel could scan a named tree directly with no copy. DuckDB and a few column stores have begun experimenting with similar UMA-aware query offload. Not a v1 goal; just not architecturally blocked.
 
-### 19.6 Zig-specific performance wins — the reason nexis will be the fastest Lisp ever shipped
+### 19.6 Zig-specific performance wins — the architectural case
 
 Clojure's performance ceiling is set by the JVM: every value is a reference to a heap object with a 12–16 byte header, collection elements are boxed, class-loading is slow, the GC pauses are what they are, and source code lives in UTF-16 Strings. nexis on Zig is not bound by any of those.
 
-Wins organized by tier: **v1 (free from architecture)**, **Phase 6 (dedicated engineering)**, **v2+ (research / ambitious)**.
+Wins organized by tier: **Tier 1 (free from architecture)**, **Tier 2 (dedicated engineering)**, **Tier 3 (research / ambitious)**.
 
 #### Tier 1 — v1-gettable (baked into our architecture)
 
@@ -1687,9 +1671,9 @@ These are wins we inherit directly from the design choices already in this PLAN.
 | T1.7 | **SIMD string equality and hashing** | `std.mem.eql` auto-vectorizes; xxHash3 is natively SIMD. | **~2× faster** than Java's char-by-char String comparison on strings >16 bytes. |
 | T1.8 | **Direct-indexed interned keyword table** | `u32` intern ids → direct array index, one memory access. Java does `ConcurrentHashMap` lookup + weak-ref deref. | **~5× faster keyword equality** on already-interned keywords. |
 
-#### Tier 2 — Phase 6 performance pass (known techniques, real engineering)
+#### Tier 2 — performance pass (known techniques, real engineering)
 
-Wins that require dedicated work in Phase 6 but rest on well-documented algorithms.
+Wins that require dedicated work but rest on well-documented algorithms. None is implemented; §21 lists them as open.
 
 | # | Win | Mechanism | Expected impact |
 |---|---|---|---|
@@ -1697,7 +1681,7 @@ Wins that require dedicated work in Phase 6 but rest on well-documented algorith
 | T2.2 | **Zero-copy string/bytes from emdb** | Immutable strings/byte-vectors read from emdb carry a Value whose payload points directly into the mmap page. No allocation, no copy. Lifetime tied to read-tx. | **10–50× speedup** on database reads of large string/blob values. |
 | T2.3 | **Inline caches on Var loads** | Per-Var revision counter (§13.3) drives compile-time inline cache cells in bytecode. First call fills; subsequent calls bypass Var indirection. | **2–5× on call-heavy code** once caches warm. V8/HotSpot-tier technique. |
 | T2.4 | **Perfect hash for load-time keywords** | Compile-time generation (gperf/CHD-style) of keyword-text → intern-id mapping for each routine. | Sub-nanosecond keyword materialization. |
-| T2.5 | **LuaJIT-style operand-specialized opcodes** | Phase 6 emits `math:add-ss`, `math:add-sc`, etc. instead of the generic op. Zero kind dispatch on the hot path. | **10–30% on numeric loops.** |
+| T2.5 | **LuaJIT-style operand-specialized opcodes** | Emit `math:add-ss`, `math:add-sc`, etc. instead of the generic op. Zero kind dispatch on the hot path. | **10–30% on numeric loops.** |
 | T2.6 | **Generational GC nursery** (if STW pauses become visible) | Add a bump-allocator nursery with a write barrier; promote survivors to the non-moving old generation. | Sub-millisecond young-gen pauses even on large heaps. |
 | T2.7 | **SIMD kernels on typed homogeneous vectors** | `float64-vector`, `int32-vector`, etc. use Zig's `@Vector(N, T)` compiling to optimal native SIMD. | `vdot` / `vsum` / `vfilter` approach **~40 GFLOPS peak** on modern cores. |
 | T2.8 | **Branchless CHAMP lookup for small bitmaps** | When a node has ≤8 entries, linear SIMD-compare beats bitmap math. | Sub-3-ns lookup for small maps. |
@@ -1790,7 +1774,7 @@ favorable measurements.
 
 ---
 
-## 20. Testing Strategy & Phase Gates
+## 20. Testing Strategy & Gates
 
 ### 20.1 Layered tests
 
@@ -1803,346 +1787,195 @@ favorable measurements.
 | Fuzz | Parser + codec robustness | Malformed source, malformed blobs |
 | Bench | Performance regression | Throughput/latency tables over time |
 
-### 20.2 Phase exit gates
+### 20.2 Gates
 
-#### Phase 0 gate
+Each gate is a checklist of what the tree pins. Status is stated
+per item.
+
+#### Foundations gate — holds
 - `nexis.grammar` compiles via `nexus` to `src/parser.zig`.
 - Parser round-trips representative source files to `Sexp`.
-- Golden test covers every reader construct in §7.2.
+- `test/golden/` covers every reader construct in §7.2 byte-exactly.
 
-#### Phase 1 gate (THE BIG ONE — this is the runtime testbed)
-Before any compiler work proceeds, the following must pass:
+#### Runtime-core gate — the runtime testbed
+1. **Randomized equality/hash tests** (`test/prop/*.zig`): reflexivity, symmetry, transitivity, hash consistency, metadata non-effect on equality/hash, across all value kinds. Holds.
+2. **Persistent immutability property**: arbitrary sequences of `assoc/dissoc/conj/pop` on maps/sets/vectors never mutate the source value. Holds.
+3. **Transient equivalence**: for any edit sequence, persistent path and transient-then-persistent path yield `=` results. Holds.
+4. **Transient ownership**: using a transient after `persistent!` throws. Holds (single owner; the wrong-owner path has no isolate to exercise it, `docs/TRANSIENT.md` §7).
+5. **Codec round-trip**: `(= v (decode (encode v)))` for randomized values; hash preserved. Holds.
+6. **emdb round-trip**: values written across N named trees read back structurally equal; named trees are independent. Holds.
+7. **GC stress**: allocate-heavy workloads interleaved with forced collections; no leaked/corrupted objects; all live data survives. Holds for the collector driven from tests; the runtime never invokes it (`docs/GC.md`).
+8. **Interning invariants**: same textual symbol → same intern id across reads; namespace qualification preserved. Holds.
 
-1. **100k+ randomized equality/hash tests**: reflexivity, symmetry, transitivity, hash consistency, metadata non-effect on equality/hash, across all value kinds.
-2. **Persistent immutability property**: arbitrary sequences of `assoc/dissoc/conj/pop` on maps/sets/vectors never mutate the source value.
-3. **Transient equivalence**: for any edit sequence, persistent path and transient-then-persistent path yield `=` results.
-4. **Transient ownership**: using a transient after `persistent!` throws; using from "wrong" owner throws.
-5. **Codec round-trip**: `(= v (decode (encode v)))` for 10k randomized values; hash preserved.
-6. **emdb round-trip**: writing 10k values across N named trees, then reading them back, yields structural equality for all; named trees are independent.
-7. **GC stress**: allocate-heavy workloads interleaved with forced collections; no leaked/corrupted objects; all live data survives; no dangling headers.
-8. **Interning invariants**: same textual symbol → same intern id across reads; namespace qualification preserved.
+#### Compiler-and-VM gate — holds
+- Every primitive-core form compiles and executes end-to-end (`test/integration/eval_pipeline.zig`).
+- `recur` in a 10k-iteration loop runs in constant stack space (high-water marks unchanged).
+- Closure capture is correct at nesting depth 10; captured loop bindings get fresh cells per iteration.
+- `try`/`catch`/`finally`/`throw` with cross-frame unwind.
 
-**Only after these pass does Phase 2 start.** This is the single most important gate in the project.
+#### Macros-namespaces-REPL gate — holds
+- Macro expansion reaches fixed point with a 256-deep guard.
+- Syntax-quote + auto-gensym for `when`, `->`, `cond`, `defn`.
+- `defmacro`, multi-namespace `(ns ...)` / `(require ...)`, the REPL.
+- Namespace load/reload preserves Var identities (redefinition updates the same Var in place).
 
-#### Phase 2 gate
-- Compiler round-trips: every Phase 1 value constructible as a Form → compiled → executed produces an `=` runtime value.
-- VM executes core forms: `if`, `let`, `fn`, `loop`/`recur`, `do`, `quote`, `throw`/`try`.
-- Tail-call stress test: deeply recursive `recur` runs in constant space.
-- Closure capture/mutation correctness.
+#### emdb-integration gate — holds
+- `with-tx` / `with-read-tx` abort on exception and rethrow.
+- Read transactions hold a snapshot while writers commit.
+- Durable-ref equality/hash are identity-only.
+- `db/scan` returns keys in sorted order.
+- `examples/todo-app.nx` persists state across runs.
 
-#### Phase 3 gate
-- Macro expansion fixpoint on representative test suite.
-- Namespace load/reload preserves Var identities.
-- Syntax-quote + auto-gensym works for canonical macros (`when`, `-> `, `cond`, `defn`).
+#### Tooling gate — open
+- No test runner, no `nexis.test` / `nexis.pprint` / `nexis.math`, no `--disasm`.
+- Runtime errors carry no source spans; stack traces are not source-mapped.
+- No measurement of REPL memory over a long session (the collector never runs, so memory grows with allocation).
 
-#### Phase 4 gate
-- `with-tx` / `with-read-tx` correctly abort on exception.
-- Concurrent read + writer on a single DB: readers see snapshot consistency, writers succeed (even though v1 only actually runs one at a time, the read-tx holds a snapshot).
-- Durable-ref equality/hash based on identity only.
-- `db/cursor` scans match insertion order for sorted keys.
+### 20.3 Build steps
 
-#### Phase 5 gate
-- REPL survives 10k-line session without leaking.
-- Stack traces correctly source-map to original files and lines.
-- Test runner discovers, runs, and reports.
+- `zig build test` — everything: unit, property, golden, Nextomic corpora, `test/nextomic` scripts, examples (minutes).
+- `zig build quick` — unit + property binaries (seconds).
+- `zig build golden` — verify golden reader outputs byte-exactly; `-Dupdate=true` regenerates them.
+- `zig build nextomic-test` — Nextomic unit tests, key and transaction property tests, the query and pull corpora.
+- `zig build nextomic-nx` — the `test/nextomic` end-to-end scripts through `bin/nexis`.
+- `zig build examples` — every `examples/*.nx` through `bin/nexis`.
+- `zig build bench` — the benchmark suite (ReleaseFast).
+- `zig build nexis` / `zig build run -- ...` — build / run the CLI.
+- `zig build parser` — regenerate `src/parser.zig` from `nexis.grammar`.
 
-### 20.3 CI structure
-
-- `zig build test` — all unit + property tests (target: <10s).
-- `zig build integration` — end-to-end suite (target: <60s).
-- `zig build fuzz` — fuzz parser and codec (longer, on-demand).
-- `zig build bench` — benchmarks.
-- `zig build golden` — golden compiler output + regenerate flag.
+There is no fuzz step (`test/fuzz/` holds only a README).
 
 ---
 
 ## 21. Roadmap & Milestones
 
-Each phase has a crisp entry criterion (previous gate passed) and exit criterion (next gate).
+The phase names are the roadmap's structure. Each entry is a
+checklist of what exists (`[x]`) and what does not (`[ ]`).
 
-### Phase 0 — Foundations (weeks 1–2) — **✅ SHIPPED**
+### Phase 0 — Foundations
 
-**Goal**: commit to semantics before code. Land the minimum artifacts a fresh implementation session needs to begin Phase 1 without ambiguity.
+- [x] `nexis.grammar` — the reader grammar covering §7.2, producing canonical Form shapes (Appendix C).
+- [x] `src/nexis.zig` — the `@lang` module: Tag enum + lexer wrapper.
+- [x] `build.zig` with `zig build parser`, `zig build test`, `zig build golden`; `build.zig.zon` pinning Zig 0.16.0 and emdb.
+- [x] `docs/SEMANTICS.md` — equality rules for every value kind, hash consistency, nil propagation (§6.5), cross-type equality examples, truthiness (§6.2), print/read round-trip contract.
+- [x] `docs/FORMS.md` — canonical Form schema, reader-to-Form normalization rules, reader/normalizer/macroexpander responsibility boundaries.
+- [x] `docs/CODEC.md` — serializability matrix (§15.10), wire format, round-trip invariants.
+- [x] `test/golden/basic.{nx,sexp}`, `test/golden/reader-literals.{nx,sexp}` (every reader construct), `test/golden/errors/` (odd map arity, duplicate literal keys, nested `#(...)`, `~@` outside syntax-quote).
+- [x] `README.md`, `AGENTS.md`, directory layout per §22.
 
-**Deliverables**:
+### Phase 1 — Runtime core
 
-- [ ] `nexis.grammar` — the full reader grammar covering §7.2, designed to produce canonical Form shapes (see Appendix C).
-- [ ] `src/nexis.zig` — the `@lang` module: Tag enum, any lexer wrapper (expected minimal/none), plus re-exports nexus needs.
-- [ ] `build.zig` with `zig build parser` (runs `../nexus/bin/nexus nexis.grammar src/parser.zig`), `zig build test`, `zig build golden`.
-- [ ] `build.zig.zon` pinning Zig 0.16.0 and emdb version.
-- [ ] `docs/SEMANTICS.md` — pinned short spec covering:
-  - equality rules for every value kind (cross-type collection equality from §6.6, numeric corner cases including NaN / -0.0 / ±Inf / overflow promotion, metadata non-interference)
-  - hash consistency invariants
-  - nil propagation rules (§6.5)
-  - cross-type equality examples with expected results
-  - truthiness (§6.2)
-  - print/read round-trip contract for each serializable kind
-- [ ] `docs/FORMS.md` — canonical Form schema (Appendix C lifted into its own doc for easy reference), reader-to-Form normalization rules, reader/normalizer/macroexpander responsibility boundaries.
-- [ ] `docs/CODEC.md` (stub) — serializability matrix (from §15.10), wire-format specification, round-trip invariants.
-- [ ] `test/golden/basic.{nx,sexp}` — canonical reader round-trip over a representative source file.
-- [ ] `test/golden/reader-literals.{nx,sexp}` — explicit coverage of every reader construct: numbers (int/hex/binary/real, negative), strings with all escapes, chars (named + `\u{HEX}`), keywords (with and without namespace), symbols (same), maps/vectors/sets/lists, quote/syntax-quote/unquote/splice, `@deref`, metadata sugar (`^:kw`, `^{...}`, `^sym`), `#_` discard, `#(...)` anon-fn.
-- [ ] `test/golden/errors/` — negative reader tests:
-  - odd map arity
-  - duplicate statically-detectable literal keys in maps/sets
-  - nested `#(...)` (must reject)
-  - `~@` outside a syntax-quote context
-- [ ] `README.md` updated with mission statement, status, and pointers to PLAN.md / CLOJURE-REVIEW.md.
-- [ ] `AGENTS.md` — AI/contributor routing guide: "read PLAN.md, FORMS.md, SEMANTICS.md; ZIG-0.16.0.md is mandatory before writing Zig."
-- [ ] Directory layout established (§22).
+- [x] `src/value.zig`: 16-byte Value type, tag accessors, immediates, heap pointer handling.
+- [x] `src/heap.zig`: allocator + HeapHeader + type-tagged dispatch.
+- [x] `src/intern.zig`: symbol and keyword intern tables.
+- [x] `src/string.zig`: string heap kind.
+- [x] `src/bignum.zig`: bignum kind with canonicalization, hashing and codec. No bignum arithmetic and no literal lifting: fixnum overflow raises `:arithmetic-overflow`; an out-of-range literal is a compile error.
+- [x] `src/coll/champ.zig`: persistent map and set.
+- [x] `src/coll/vector.zig`: persistent vector.
+- [x] `src/coll/list.zig`: immutable cons list.
+- [x] `src/coll/transient.zig`: transient wrappers with owner token.
+- [x] `src/hash.zig`: hashing with structural combine for collections.
+- [x] `src/eq.zig`: `identical?` and `=`.
+- [x] `src/gc.zig`: mark-sweep with caller-supplied roots. Never invoked by the runtime (`docs/GC.md`).
+- [x] `src/codec.zig`: serialize/deserialize Value ↔ bytes.
+- [x] `src/db.zig`: emdb connection, durable-ref value, `put/get/delete/cursor/scan` raw ops.
+- [x] `test/prop/*.zig`: the property tests of §20.2.
 
-**Exit**:
-- Source parses via `zig build parser && zig build test`.
-- Forms come out matching Appendix C / FORMS.md canonical shapes.
-- `docs/SEMANTICS.md` is reviewed and signed off — every semantic corner case has an explicit decision.
-- All golden tests pass byte-for-byte.
+### Phase 2 — Compiler and VM
 
-### Phase 1 — Runtime core, no compiler (weeks 3–8) — **✅ SHIPPED**
-
-**Goal**: have the entire data universe working before a single bytecode instruction executes.
-
-- [ ] `src/value.zig`: 16-byte Value type, tag accessors, immediates, heap pointer handling.
-- [ ] `src/heap.zig`: allocator + HeapHeader + type-tagged dispatch.
-- [ ] `src/intern.zig`: symbol and keyword intern tables.
-- [ ] `src/string.zig`: string heap kind.
-- [ ] `src/bignum.zig`: minimum viable arbitrary-precision integer (could wrap a library; prefer pure Zig).
-- [ ] `src/coll/champ.zig`: persistent map and set.
-- [ ] `src/coll/vector.zig`: persistent vector.
-- [ ] `src/coll/list.zig`: immutable cons list.
-- [ ] `src/coll/transient.zig`: transient wrappers with owner token.
-- [ ] `src/hash.zig`: xxHash3-based hashing with structural combine for collections.
-- [ ] `src/eq.zig`: `identical?` and `=` implementations.
-- [ ] `src/gc.zig`: mark-sweep, precise root enumeration interface (roots registered by caller).
-- [ ] `src/codec.zig`: serialize/deserialize Value ↔ bytes.
-- [ ] `src/db.zig`: emdb connection, durable-ref value, `put/get/delete/cursor/scan` raw ops.
-- [ ] `test/prop/*.zig`: property-based tests listed in §20.2 Phase 1 gate.
-
-**Exit**: all Phase 1 gate tests pass.
-
-### Phase 2 — Compiler and VM (weeks 9–14) — **✅ SHIPPED**
-
-All 11 sub-steps of COMPILER.md §10 complete + all 7 gate items
-from §9.4 satisfied. The original deliverable list below merged
-slightly with reality: `resolve.zig`/`analyze.zig`/`bytecode.zig`/
-`loader.zig`/`fn.zig` are folded into `compile.zig` + `vm.zig` for
-v1 simplicity. `expand.zig` (macroexpander) lives where peer-AI
-turn 28 originally placed it in Phase 3 but landed early because
-the Phase 2 gate required it.
+`resolve` / `analyze` / `bytecode` / `loader` / `fn` are not
+separate modules: they are folded into `src/compile.zig` and
+`src/vm.zig`.
 
 - [x] `src/reader.zig`: Sexp → Form.
-- [x] `src/compile.zig`: Form → Tiny IR → bytecode (`resolve` +
-      `analyze` + `bytecode` + `loader` + `fn` consolidated here).
-- [x] `src/vm.zig`: frame/slot machine + dispatch + 9 wired opcode
-      groups (mov/call/math/cmp/jump/closure/var/coll/ctrl).
-- [x] `src/expand.zig`: macroexpander (was planned for Phase 3;
-      shipped in Phase 2 #8 because gate item 5 — error SrcSpans —
-      required macro origin tracking).
+- [x] `src/compile.zig`: Form → Tiny IR → bytecode (`docs/COMPILER.md`).
+- [x] `src/vm.zig`: frame/slot machine + dispatch + nine executed opcode groups (mov/call/math/cmp/jump/closure/var/coll/ctrl) (`docs/VM.md`).
+- [x] `src/expand.zig`: macroexpander (`docs/MACROEXPAND.md`).
 - [x] `src/cli.zig`: `bin/nexis run FILE.nx` + `bin/nexis repl`.
+- [x] Every primitive-core form end-to-end; try/catch/throw/finally with cross-frame unwind; quoted compound lists/vectors; syntax-quote with splicing + auto-gensym; SrcSpans in compile errors.
+- [ ] `call:tailcall`, extension instructions, constant folding, a bytecode cache (`.nx.o`), a disassembler.
 
-**Exit (achieved)**: every primitive-core form compiles + executes
-end-to-end; try/catch/throw/finally working with cross-frame
-unwind; quoted compound lists/vectors; syntax-quote with splicing
-+ auto-gensym; SrcSpans in compile errors. 472 phase2 tests
-green in ~3s.
+### Phase 3 — Macros, namespaces, REPL
 
-### Phase 3 — Macros, namespaces, REPL (weeks 15–18) — **✅ SHIPPED** (3.7 open)
+- [x] Fixpoint expander with syntax-quote and auto-gensym.
+- [x] `nexis repl`.
+- [x] `#(...)` anon-fn shorthand.
+- [x] Catchable VmError → keyword payload.
+- [x] Maps/sets as runtime values (`coll:map` / `coll:set`).
+- [x] User-defined `defmacro`: compile-time evaluation in a fresh sub-VM per invocation; macros defined earlier in a do-block are visible to later forms; lexical bindings shadow macros; user macros shadow host macros.
+- [x] Native-fn infrastructure (`Kind.native_fn` + static `NativeFn` descriptors + `call:call` dispatch + `stdlib.installCore`) and the macro-authoring primitives (`list`, `cons`, `first`, `rest`, `count`, `nth`, `empty?`, `identity`, `nil?`, `some?`).
+- [x] `VM.callValue` (reentrant VM execution), `apply`, higher-order fns (`map` / `reduce` / `filter`), first-class arithmetic / comparison Vars.
+- [x] Collection utilities (`vector` / `vec` / `hash-map` / `hash-set` / `assoc` / `dissoc` / `get` / `contains?` / `keys` / `vals` / `conj`).
+- [x] Embedded `src/stdlib/core.nx`: composite macros + fns in nexis (`when-let`, `if-let`, `dotimes`, `second` / `last` / `reverse` / `range` / `take` / `drop`, `true?` / `false?`, ...) per CLOJURE-REVIEW.md §1.1 two-stage bootstrap.
+- [x] Multi-namespace: `NamespaceRegistry` + `nexis.core` / `user` + auto-refer + qualified symbols + `(ns NAME)`.
+- [x] Destructuring (sequential / associative / nested / `& rest` / `:as` / `:keys` / `:or`) in `let` / `fn` / `defn` params + multi-arity `defn` (dispatch on argc via expansion to variadic + `let` + nested `if`).
+- [x] `require` + aliases + file loading: `(require 'my.ns)` and `(require '[my.ns :as a])`; ns-to-file mapping (`my.app.foo` → `my/app/foo.nx`), load path, cycle detection, idempotent loaded set, namespace-mismatch validation.
+- [ ] `:refer` / `:rename` / `:exclude`, relative requires, reload.
+- [ ] Dynamic binding: `^:dynamic` Vars + `binding` (`(binding ...)` is an unresolved symbol). Nothing blocks it: transactions are explicit handles (Phase 4). Ranked in `HANDOFF.md` §4.
+- [ ] `:strs` / `:syms` destructuring, `defn` docstrings, multi-arity `fn`.
 
-Phase 3 reshuffled: `expand.zig` and the syntax-quote work landed
-in Phase 2 because the Phase 2 gate needed them. Every row below
-ships except 3.7.
+### Phase 4 — emdb integration as a first-class concept
 
-- [x] `src/expand.zig`: fixpoint expander (shipped in Phase 2 #8).
-- [x] Syntax-quote, auto-gensym (folded into `expand.zig`, shipped
-      in Phase 2 #8c.2).
-- [x] **Phase 3.0a** `src/cli.zig` REPL (commit 1c4d7df).
-- [x] **Phase 3.0b** `#(...)` anon-fn shorthand (commit 64c2c15).
-- [x] **Phase 3.0c** Catchable VmError → keyword payload (commit
-      4122532).
-- [x] **Phase 3.1** Maps/sets as runtime values (`coll:map` /
-      `coll:set` opcodes + `Tiny.map_construct` / `Tiny.set_construct`,
-      commit 8461ae9).
-- [x] **Phase 3.2** User-defined `defmacro` — compile-time VM
-      eval via a fresh sub-VM per invocation. Macros defined
-      earlier in a do-block are visible to later forms. Lexical
-      bindings shadow macros; user macros shadow host macros.
-      Peer-AI turn 66 architectural pin.
-- [x] **Phase 3.3a** Native-fn infrastructure (`Kind.native_fn` +
-      static `NativeFn` descriptors + `call:call` dispatch +
-      `stdlib.installCore`) + 10 macro-authoring primitives
-      (`list`, `cons`, `first`, `rest`, `count`, `nth`, `empty?`,
-      `identity`, `nil?`, `some?`). Procedural macros now
-      possible via `first`/`rest`/`empty?` at compile time.
-      Peer-AI turn 67 architectural pin.
-- [x] **Phase 3.3b** `VM.callValue` (reentrant VM execution) +
-      `apply` + higher-order fns (`map`/`reduce`/`filter`) +
-      first-class arithmetic/comparison Vars (`+`/`<`/`=`/`inc`/
-      `dec`/predicates). Peer-AI turn 68 architectural pin.
-- [x] **Phase 3.3c** Collection utilities (`vector`/`vec`/
-      `hash-map`/`hash-set`/`assoc`/`dissoc`/`get`/`contains?`/
-      `keys`/`vals`/`conj`).
-- [x] **Phase 3.3d** Embedded `src/stdlib/core.nx`: composite
-      macros + fns in nexis (`when-let`, `if-let`, `dotimes`,
-      `second`/`last`/`reverse`/`range`/`take`/`drop`,
-      `true?`/`false?`) per CLOJURE-REVIEW.md §1.1 two-stage
-      bootstrap.
-- [x] **Phase 3.4** Multi-namespace: `NamespaceRegistry` +
-      `nexis.core` / `user` + auto-refer + qualified symbols
-      + `(ns NAME)` special form. Peer-AI turn 69 architectural
-      pin. (Deferred: `require` + aliases + file loading —
-      separate strategy turn.)
-- [x] **Phase 3.5** Destructuring (sequential / associative /
-      nested / `& rest` / `:as` / `:keys` / `:or`) in `let`/
-      `fn`/`defn` params + multi-arity `defn` (dispatch on
-      argc via expansion to variadic + `let` + nested `if`).
-      Peer-AI turn 70 architectural pin.
-- [x] **Phase 3.6** `require` + aliases + file loading: `(require
-      'my.ns)` and `(require '[my.ns :as a])`. Ns-to-file mapping
-      (`my.app.foo` → `my/app/foo.nx`), load path, cycle
-      detection, idempotent loaded set, namespace-mismatch
-      validation. Per peer-AI turn 71 v1 scope; `:refer`/
-      `:rename`/`:exclude`/relative requires/reload deferred.
-- [ ] **Phase 3.7** `src/dynamic.zig`: dynamic-binding
-      stack (`^:dynamic` Vars + `binding`). Open. Phase 4 settled
-      on explicit transaction handles (Path B), so nothing blocks
-      it; ranked in `HANDOFF.md` §4.
+**Path B** — explicit transaction threading. No ambient tx via a
+dynamic Var.
 
-**Exit**: Phase 3 gate; REPL usable for real programs; core stdlib loaded.
+- [x] Connection + durable-ref + auto-ephemeral tx primitives. `Kind.db_connection`. `db/open` / `db/close` / `db/ref` / `db/put-key!` / `db/get-key` / `db/delete-key!` / `db/present?` / `db/ref?` as natives in the `db` namespace. The VM tracks open connections. Cross-process persistence.
+- [x] Explicit `(with-tx ...)` / `(with-read-tx ...)` macros (in `src/stdlib/core.nx`) + `Kind.db_write_txn` / `Kind.db_read_txn` + `db/begin-write` / `db/begin-read` / `db/commit!` / `db/abort-write!` / `db/abort-read!` / `db/put!` / `db/get` / `db/delete!`. Single-owner enforcement via an `active` flag on the handle. Exceptions inside `with-tx` abort and rethrow.
+- [x] `@deref` (reader macro → `db/deref`) + `db/alter!` (read-modify-write inside tx). Universal deref: durable_ref → ephemeral read; Var → root; atom → value; else `:not-derefable`.
+- [x] `db/scan` (eager `[[k v]...]`, start-inclusive, end-exclusive) + `db/reduce-tree` (server-side reduce). Cursors are not exposed as raw Values (stateful, lifetime-sensitive).
+- [x] `examples/todo-app.nx` — persistent to-do tracker exercising the whole surface; state persists across runs.
+- [x] Snapshot vocabulary (§15.7): `db/snapshot` + `db/release-snapshot!` + `db/snapshot?` + `(with-snapshot [snap conn] ...)`. emdb's MVCC read transactions ARE pinned snapshots; a snapshot captured before subsequent writes still reads the historical state after those writes commit. The Datomic-style ambient `as-of` db-value is Nextomic's `as-of` (below).
+- [x] Engine seam: every store opens with `pageSize = 16384` and 128 named trees (fixed for the file's life; the Linux engine default is 4 KiB), the path is released once when emdb refuses to open, tree ids are resolved once per connection, cursor natives read whole values, and every engine failure is a named `:db/*` keyword (`docs/DB.md`).
+- [ ] Historical range queries over durable refs (§15.7).
 
-### Phase 4 — emdb integration as a first-class concept (weeks 19–22) — **✅ SHIPPED**
+### Phase 5 — Standard library and tooling
 
-Per peer-AI turn 72 strategic pin: **Path B** (explicit
-transaction threading). No ambient tx via dynamic Var in v1.
+Clojure-compatibility breadth:
 
-- [x] **Phase 4.0a** Connection + durable-ref + auto-ephemeral
-      tx primitives. `Kind.db_connection`. `db/open` / `db/close`
-      / `db/ref` / `db/put-key!` / `db/get-key` / `db/delete-key!`
-      / `db/present?` / `db/ref?` as native fns installed in a
-      `db` namespace. VM safety-net tracks open connections.
-      Cross-process persistence verified.
-- [x] **Phase 4.0b** Explicit `(with-tx ...)` / `(with-read-tx ...)`
-      macros (in `stdlib/core.nx`) + `Kind.db_write_txn` /
-      `Kind.db_read_txn` + `db/begin-write` / `db/begin-read` /
-      `db/commit!` / `db/abort-write!` / `db/abort-read!` /
-      `db/put!` / `db/get` / `db/delete!` native fns.
-      Single-owner enforcement via `active: bool` flag on the
-      handle. Try/catch-safe rollback verified end-to-end:
-      exceptions inside `with-tx` abort and rethrow.
-      Per peer-AI turn 72 §Q1 PATH B (explicit threading).
-- [x] **Phase 4.0c** `@deref` operator (reader macro → `db/deref`)
-      + `db/alter!` (read-modify-write inside tx). Universal
-      deref dispatches durable_ref → ephemeral read; Var →
-      root; else → `:not-derefable`.
-- [x] **Phase 4.0d** `db/scan` (eager `[[k v]...]`, start-
-      inclusive, end-exclusive) + `db/reduce-tree`
-      (server-side reduce). Cursors not exposed as raw Value
-      (peer-AI turn 73 §Q3 deferred — stateful + lifetime-
-      sensitive).
-- [x] **Phase 4.0e** `examples/todo-app.nx` — Phase 4 EXIT
-      DEMO. Persistent to-do tracker exercising the entire
-      Phase 4 surface. Verified: state persists across runs.
-- [x] **Phase 4.0f** Snapshot vocabulary (PLAN.md §15.7 aliases):
-      `db/snapshot` + `db/release-snapshot!` + `db/snapshot?` +
-      `(with-snapshot [snap conn] ...)` macro. emdb's MVCC read
-      transactions already ARE pinned snapshots; this commit
-      ships the user-facing naming. Verified: snap-N captured
-      before subsequent writes still reads the historical state
-      after those writes commit. The `db/as-of` ambient-db-value
-      abstraction (Datomic-style) is Nextomic's `as-of` (below).
-- [x] **Phase 4.0g** Engine seam: every store opens with
-      `pageSize = 16384` and 128 named trees (fixed for the file's
-      life; the Linux engine default is 4 KiB), the path is released
-      once when emdb refuses to open, tree ids are resolved once per
-      connection, cursor natives read whole values, and every engine
-      failure is a named `:db/*` keyword (`docs/DB.md`).
+- [x] Atoms: `atom` / `reset!` / `swap!` / `swap-vals!` / `compare-and-set!` / `atom?`, `@a` (`docs/ATOM.md`).
+- [x] Strings and I/O: `str` / `string?` / `subs`, `nexis.string` (`lower-case` / `upper-case` / `trim` / `split` / `join` / `replace`), `print` / `println` / `prn` / `pr-str` / `slurp` / `spit`.
+- [x] Records and protocols: `defrecord`, `defprotocol`, `extend-protocol` / `extend-type`, `satisfies?`, `:any` fallback (`docs/PROTOCOLS.md`).
+- [x] `case` / `condp` / `for` macros.
+- [x] `nexis.core` breadth: `src/stdlib/core.nx` (`doseq` / `while` / `letfn` / `if-not`, `cond->` / `some->` / `as->`, `merge` / `update` / `get-in` / `assoc-in` / `update-in` / `merge-with`, `frequencies` / `group-by` / `interpose` / `juxt` / `fnil` / `comp` / `partial` / `constantly` / `complement`, `every?` / `some` / `not-any?`) plus the native sequence library in `src/stdlib.zig` (`partition`, `distinct`, `zipmap`, `sort-by`, `reductions`, `iterate`, `select-keys`, ...).
+- [x] `examples/shapes-app.nx`, a multi-file protocols + records + atoms application.
 
-**Exit**: Phase 4 gate; a small application (e.g. a to-do tracker with persistent state) works end-to-end.
-
-### Phase 5 — Standard library and tooling (weeks 23–26) — **breadth shipped, tooling open**
-
-Two definitions of Phase 5 exist. The Clojure-breadth definition
-(Amendment Log entries of 2026-05-18 and 2026-05-19) shipped in
-full; the tooling definition below is open and ranked in
-`HANDOFF.md` §4.
-
-As shipped (Clojure compatibility breadth):
-
-- [x] **5.1** Atoms: `atom`/`reset!`/`swap!`/`swap-vals!`/
-      `compare-and-set!`/`atom?`, `@a` (`docs/ATOM.md`).
-- [x] **5.2** Strings and I/O: `str`/`string?`/`subs`, `nexis.string`
-      (`lower-case`/`upper-case`/`trim`/`split`/`join`/`replace`),
-      `print`/`println`/`prn`/`pr-str`/`slurp`/`spit`.
-- [x] **5.3** Records and protocols: `defrecord`, `defprotocol`,
-      `extend-protocol`/`extend-type`, `satisfies?`, `:any` fallback
-      (`docs/PROTOCOLS.md`).
-- [x] **5.4** `case`/`condp`/`for` macros.
-- [x] **5.5** `nexis.core` breadth: `src/stdlib/core.nx` (`doseq`/
-      `while`/`letfn`/`if-not`, `cond->`/`some->`/`as->`, `merge`/
-      `update`/`get-in`/`assoc-in`/`update-in`/`merge-with`,
-      `frequencies`/`group-by`/`interpose`/`juxt`/`fnil`/`comp`/
-      `partial`/`constantly`/`complement`, `every?`/`some`/`not-any?`)
-      plus the native sequence library in `src/stdlib.zig`
-      (`partition`, `distinct`, `zipmap`, `sort-by`, `reductions`,
-      `iterate`, `select-keys`, ...).
-- [x] Exit as shipped: `examples/shapes-app.nx`, a multi-file
-      protocols + records + atoms application, runs unchanged.
-
-As defined (tooling), open:
+Tooling (open, ranked in `HANDOFF.md` §4):
 
 - [ ] `nexis.test`, `nexis.pprint`, `nexis.math`, `nexis.repl`.
 - [ ] `nexis --compile` / `--run` / `--disasm` subcommands.
 - [ ] Test runner.
 - [ ] Source-mapped stack traces end-to-end.
 
-**Exit as defined**: Phase 5 gate (§20.2); realistic user experience.
-
-### Nextomic — Datomic-class database — **✅ SHIPPED**
+### Nextomic — Datomic-class database
 
 Authoritative design: `docs/NEXTOMIC.md`. Built on the engine as it
 is — zero changes to emdb (§11 there).
 
-- [x] Store: eleven emdb named trees — four current indexes, four
-      history indexes with the logical `t` in the key, `nx/txlog`,
-      `nx/idents`, `nx/sys`; sortable value encodings;
-      `test/prop/nextomic_key.zig` (§2).
-- [x] Transactions: tempids, upserts by unique identity, cardinality,
-      components, retractions, `:db/txInstant`;
-      `test/prop/nextomic_tx.zig` against an in-memory model at every
-      basis (§3).
-- [x] Db-values and time: `db`, `basis-t`, `as-of`, `since`,
-      `history`, `tx-range`, `entity`, `entid`/`ident`, `datoms` (§4).
-- [x] Query: `q` as a native over a query value — patterns, every
-      `:in` form, predicates and function bindings through the
-      namespace registry, aggregates, every find spec, `not`/`or` and
-      their `-join` forms, rules; greedy planner over the §5 index
-      table; `explain`; `test/integration/nextomic_q.zig` against a
-      naive evaluator (§5).
-- [x] Pull: `pull`/`pull-many` with nested, reverse, recursive,
-      `:limit`/`:default`/`:as` specs;
-      `test/integration/nextomic_pull.zig`.
+- [x] Store: eleven emdb named trees — four current indexes, four history indexes with the logical `t` in the key, `nx/txlog`, `nx/idents`, `nx/sys`; sortable value encodings; `test/prop/nextomic_key.zig` (§2).
+- [x] Transactions: tempids, upserts by unique identity, cardinality, components, retractions, `:db/txInstant`; `test/prop/nextomic_tx.zig` against an in-memory model at every basis (§3).
+- [x] Db-values and time: `db`, `basis-t`, `as-of`, `since`, `history`, `tx-range`, `entity`, `entid` / `ident`, `datoms` (§4).
+- [x] Query: `q` as a native over a query value — patterns, every `:in` form, predicates and function bindings through the namespace registry, aggregates, every find spec, `not` / `or` and their `-join` forms, rules; greedy planner over the §5 index table; `explain`; `test/integration/nextomic_q.zig` against a naive evaluator (§5).
+- [x] Pull: `pull` / `pull-many` with nested, reverse, recursive, `:limit` / `:default` / `:as` specs; `test/integration/nextomic_pull.zig`.
 - [x] Speculative `with` over a held write transaction.
-- [x] Natives, the `nextomic_conn`/`nextomic_db` value kinds,
-      `with-conn`, `:nextomic/*` errors (§6, §7); `test/nextomic/*.nx`
-      under `zig build test`; `examples/nextomic-app.nx`.
-- [ ] Listed as later in §6: transaction functions and `:db.fn/cas`,
-      excision, full-text, lazy entities, a datom heap kind; Datalog
-      function-position variables (§5).
+- [x] Natives, the `nextomic_conn` / `nextomic_db` value kinds, `with-conn`, `:nextomic/*` errors (§6, §7); `test/nextomic/*.nx` under `zig build test`; `examples/nextomic-app.nx`.
+- [ ] Transaction functions and `:db.fn/cas`, excision, full-text, lazy entities, a datom heap kind (§6); Datalog function-position variables (§5).
 
-### Phase 6 — Performance pass (weeks 27–30)
+### Phase 6 — Performance pass
 
-Phase 6 delivers the **Tier 2 performance wins** from §19.6. Each item maps to a specific projected speedup:
+The **Tier 2 performance wins** from §19.6. None exists; each item
+maps to a projected speedup:
 
 - [ ] **Inline caches on Var loads** (T2.3) — use the per-Var revision counter. Target: 2–5× on call-heavy code.
 - [ ] **SIMD-packed CHAMP nodes** (T2.1) — NEON `CNT`, parallel key-compare via `@Vector(8, u64)`, prefix-sum for insertion position. Target: 2–3× faster map lookup.
-- [ ] **Zero-copy string/bytes from emdb** (T2.2) — Value payload can point directly into mmap pages for immutable strings/byte-vectors. Target: 10–50× on DB reads of large values.
+- [ ] **Zero-copy string/bytes from emdb** (T2.2) — Value payload pointing directly into mmap pages for immutable strings/byte-vectors. Target: 10–50× on DB reads of large values.
 - [ ] **Perfect-hash keyword tables** (T2.4) — compile-time generation of keyword text → intern id.
 - [ ] **LuaJIT-style operand-specialized opcodes** (T2.5) — `math:add-ss`, `math:add-sc`, etc.
-- [ ] **Generational GC nursery** (T2.6) — only if mark-sweep pauses become visible in benchmarks.
-- [ ] **`nexis.simd` kernels on typed vectors with benchmarks** (T2.7) — `vdot`, `vsum`, `vmap`, `vfilter`.
+- [ ] **Generational GC nursery** (T2.6) — only if mark-sweep pauses become visible in benchmarks; the collector must be wired to the runtime first (`docs/GC.md`).
+- [ ] **`nexis.simd` kernels on typed vectors with benchmarks** (T2.7) — `vdot`, `vsum`, `vmap`, `vfilter`. `typed_vector` is a reserved kind with no implementation.
 - [ ] **Branchless CHAMP lookup for small bitmaps** (T2.8).
 - [ ] **Precomputed compact source maps** (T2.9) — lazy stack-trace materialization.
 - [ ] **`bench-vs-clojure.nx`** and other benchmark suites for CI regression detection.
-- [ ] **Publish performance report** with v1 shipping numbers vs Clojure and LuaJIT.
-
-**Exit**: performance numbers published; clear comparison table vs Clojure and vs bare emdb.
+- [ ] **Publish performance report** with v1 numbers vs Clojure and LuaJIT.
 
 ### Phase 7 — 1.0 polish
 
@@ -2241,7 +2074,7 @@ nexis/
 
 ## 23. Hard Decisions (Frozen)
 
-The following are architectural decisions committed to now, before code is written, to prevent drift. Each requires a PLAN.md amendment with stated rationale to change.
+The following are architectural decisions committed to, to prevent drift. Each requires a PLAN.md amendment with stated rationale to change.
 
 1. **16-byte tagged Value**, not NaN-boxed, not 24-byte.
 2. **Tracing mark-sweep GC**, not reference counting, not hybrid.
@@ -2263,8 +2096,8 @@ The following are architectural decisions committed to now, before code is writt
 18. **Mark-sweep first, generational only if needed.**
 19. **`recur` is semantically guaranteed constant-space; general TCO is a best-effort compiler optimization.**
 20. **Vars are the REPL redefinition mechanism.** Global function references are invoked via Var indirection by default (new calls see the latest root). Lexical locals and captured upvalues compile directly without indirection (no redefinition effect on captures).
-21. **Operand kinds**: 4 hot-path `SCVU` (S=0 slot, C=1 constant, V=2 var, U=3 upvalue) + 3 context-local (`i` intern, `j` jump, `e` durable). Encoding order *is* the mnemonic, ordered by hot-path frequency. LuaJIT-style operand-specialized opcode variants reserved for Phase 6.
-22. **`as-of` reads are v1**, not deferred. emdb's MVCC already provides the machinery; exposing it is library code.
+21. **Operand kinds**: 4 hot-path `SCVU` (S=0 slot, C=1 constant, V=2 var, U=3 upvalue) + 3 context-local (`i` intern, `j` jump, `e` durable). Encoding order *is* the mnemonic, ordered by hot-path frequency. LuaJIT-style operand-specialized opcode variants reserved.
+22. **`as-of` reads are v1.** emdb's MVCC already provides the machinery; exposing it is library code.
 23. **LMDB is emdb's ancestor. Datomic is the semantic reference for durable-as-value.** When a design choice is ambiguous, first ask what LMDB / Datomic / Clojure / LuaJIT do.
 24. **Form is a recursive wrapper type with inline fields.** `{datum, origin, user_meta, ann}`. No global side-tables. Macros see/produce Forms.
 25. **Serialization has a fixed v1 scope** (§15.10). nil, bool, char, fixnum, bignum, f64, string, kw/sym (as text), list, vector, map, set, byte-vector, typed-vector, durable-ref. Functions, vars, transients, namespaces, tx handles, and error traces are **not serializable** in v1; the codec throws `:unserializable`.
@@ -2272,15 +2105,15 @@ The following are architectural decisions committed to now, before code is writt
 27. **Block comments dropped.** Only `;` (line), `#_` (discard next form), `(comment ...)` (macro).
 28. **`#(...)` anonymous fn** is lowered post-read to an internal form (e.g. `#%anon-fn`), not resolved by the reader. Nested `#(...)` is an error.
 29. **Backtick reads as `syntax-quote`**, not `quasiquote`. Full Clojure-style qualification + auto-gensym semantics implemented at the macro-expansion layer.
-30. **Persistent vector is plain 32-way trie with tail buffer in v1** (§9.2). RRB relaxation is v2+. This matches exactly what Clojure has shipped for 17+ years.
-31. **Compiler knows only `*`-suffixed primitives** (§6.1): `let*`, `fn*`, `loop*`, `letfn*` plus the un-starred `def`, `if`, `do`, `quote`, `var`, `set!`, `recur`, `try`, `throw`. All user-facing `let`, `fn`, `loop`, `letfn`, `defn` are macros in `stdlib/core.nx`. Two-stage bootstrap.
+30. **Persistent vector is plain 32-way trie with tail buffer in v1** (§9.2). No RRB relaxation. This matches Clojure's own vector.
+31. **Compiler knows only `*`-suffixed primitives** (§6.1): `let*`, `fn*`, `loop*`, `letfn*` plus the un-starred `def`, `if`, `do`, `quote`, `var`, `set!`, `recur`, `try`, `throw`. All user-facing `let`, `fn`, `loop`, `letfn`, `defn` are macros (`docs/MACROEXPAND.md` §10; `letfn` in `src/stdlib/core.nx`). Two-stage bootstrap.
 32. **Keyword / symbol asymmetry** (§8.4): keywords interned, metadata-less, callable; symbols interned in common case, heap-wrapped when metadata-bearing. Hash domains are separated to avoid HAMT collision.
 33. **Keyword-as-function is a v1 language feature** (§8.7): `(:k m)` = `(get m :k)`, `(:k m default)` = `(get m :k default)`. Not a late specialization.
 34. **Macros receive `(&form, &env, user-args...)`** (§14.1), not just `Form → Form`. `&env` is a deliberately shallow `symbol → LocalBinding` map in v1.
-35. **`seq` is a core v1 abstraction** (§6.6), not a deferred niceness — confirmed by reading Clojure source. Direct fast paths on maps/vectors/typed-vectors bypass seq when that's clearer.
+35. **`seq` is a core v1 abstraction** (§6.6) — confirmed by reading Clojure source. Direct fast paths on maps/vectors/typed-vectors bypass seq when that's clearer.
 36. **Cross-type sequential equality** (§6.7): list, vector, lazy-seq, and cons are mutually equal if element-wise equal. Map and set are their own equality categories. Hashes are constructed so the invariant holds by design.
 37. **CHAMP is the committed persistent-map target** (§9.1), not a stretch goal. Separate data/node bitmaps, canonical layout. Classic HAMT is a fallback only if CHAMP implementation hits a specific blocker.
-38. **Performance is a first-class goal, not a v2 concern.** Tier 1 wins (§19.6) are baked into v1 by architecture. Tier 2 wins are committed Phase 6 targets with specific, named mechanisms. Headline performance claims are published only alongside v1 with measured benchmarks, not asserted in advance.
+38. **Performance is a first-class goal, not a v2 concern.** Tier 1 wins (§19.6) are baked into v1 by architecture. Tier 2 wins are committed targets with specific, named mechanisms. Headline performance claims are published only alongside v1 with measured benchmarks, not asserted in advance.
 
 ---
 
@@ -2294,12 +2127,12 @@ Deliberately unresolved. Each tracked so we don't drift into them accidentally.
 4. **AOT compilation?** Out of scope. `.nx.o` files are bytecode only.
 5. **Schema / spec language?** Likely a core feature in v2. Not v1.
 6. **Content-addressed values for deduplication?** Specifically disallowed from v1 because it changes hash stability rules.
-7. **Multi-version concurrency across isolates?** Depends on multi-isolate runtime; deferred.
-8. **REPL-over-network (nREPL-style)?** Nice-to-have; deferred.
-9. **Regex library integration**. Which regex engine (v1 bundled Zig-native vs. none)? Deferred.
-10. **Record types with fixed fields and custom print.** v1 uses tagged maps; real records are a v2 feature. Remove `record` from the §8.2 heap-kinds list for v1 and treat it as a post-v1 addition.
-11. **Keyword-as-function** (`(:foo m)` as sugar for `(get m :foo)`). Clojure has it; nexis v1 does not. Revisit once the core language has shipped.
-12. **`io` and `simd` ISA groups.** Listed in §12.3 for future reservation, but v1 may implement their operations as ordinary native/core function calls rather than dedicated opcode groups. Decide during Phase 2 compiler bring-up whether a dedicated group pays off.
+7. **Multi-version concurrency across isolates?** Depends on multi-isolate runtime; not in v1.
+8. **REPL-over-network (nREPL-style)?** Nice-to-have; not in v1.
+9. **Regex library integration**. Which regex engine (bundled Zig-native vs. none)? Undecided; none in v1.
+10. **Record types with fixed fields and custom print.** Superseded: `defrecord` records exist (`Kind.record`, `docs/PROTOCOLS.md`); they print opaquely and are not reader-roundtrippable.
+11. **Keyword-as-function** (`(:foo m)` as sugar for `(get m :foo)`). Superseded: it is v1 (§8.7, §23 #33).
+12. **`io` and `simd` ISA groups.** Listed in §12.3 as reserved group numbers; their operations are natives, and an instruction in either group traps `UnimplementedOpcode` (`docs/VM.md` §10).
 
 ---
 
@@ -2310,22 +2143,22 @@ The things most likely to go wrong, with mitigations.
 | # | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|---|
 | 1 | Semantic drift between Value, Form, and durable encoding as v1 grows | High | Severe | §5 is non-negotiable; review every new kind against all three layers. |
-| 2 | GC bugs that corrupt heap under stress | High | Severe | Phase 1 gate's GC stress test; precise root enumeration; no write barriers in v1. |
-| 3 | Equality/hash inconsistency between heap and decoded values | Medium | Severe | Phase 1 gate property test #5 explicitly checks round-trip hash preservation. |
+| 2 | GC bugs that corrupt heap under stress | High | Severe | `test/prop/gc.zig` stress test; precise root enumeration; no write barriers in v1. |
+| 3 | Equality/hash inconsistency between heap and decoded values | Medium | Severe | `test/prop/codec.zig` explicitly checks round-trip hash preservation. |
 | 4 | Transient ownership violations slipping through | Medium | Moderate | Runtime check on every op; property tests. |
 | 5 | Macro expansion non-termination or stack overflow | Medium | Moderate | Expansion depth limit + clear error. |
-| 6 | Tail-call elision breaking debuggability | Low | Moderate | `--emit-tailcall-report` flag; only emit tailcall where safe. |
+| 6 | Tail-call elision breaking debuggability | Low | Moderate | The compiler emits no general tail calls; only `recur` elides frames. |
 | 7 | emdb API changes underneath us | Low | Moderate | Pinned version in `build.zig.zon`; our own tests catch regressions. |
 | 8 | Zig 0.16 stdlib churn | Medium | Moderate | Pinned Zig version; `ZIG-0.16.0.md` as authoritative. |
 | 9 | Over-ambition in stdlib leading to shallow v1 | High | Moderate | §17 is the shipping list; things not on it don't ship. |
 | 10 | Scope creep toward "Clojure compatibility" | Medium | Severe | §4 non-goals are doctrine, not wishes. |
-| 11 | ~~RRB implementation complexity stalls Phase 1~~ **Mitigated**: v1 now ships plain 32-way persistent vector (matching Clojure); RRB is v2+. | — | — | Resolved by Clojure source review (§9.2). |
+| 11 | RRB implementation complexity | — | — | Not applicable: v1 is a plain 32-way persistent vector, matching Clojure (§9.2). |
 | 12 | **Codec serialization boundary creeps** (functions, vars, records sneak in) | High | Severe | §15.10 lists exactly what's serializable; anything else throws `:unserializable`. Amendment required to add a kind. |
-| 13 | **Numeric corner cases poison eq/hash/codec** (NaN, −0, fixnum↔bignum promotion, f64↔int equality) | Medium | Severe | Phase 0 deliverable: `docs/SEMANTICS.md` freezes every numeric edge case before Phase 1 eq/hash code. |
-| 14 | **Macro-expansion provenance inadequate for good errors** | Medium | Moderate | `Form.ann` is inline and carries expansion parent; validate in Phase 3 with tests that errors inside macros point at both expansion and definition sites. |
+| 13 | **Numeric corner cases poison eq/hash/codec** (NaN, −0, fixnum↔bignum promotion, f64↔int equality) | Medium | Severe | `docs/SEMANTICS.md` freezes every numeric edge case. |
+| 14 | **Macro-expansion provenance inadequate for good errors** | Medium | Moderate | `Form.ann` is inline and carries expansion parent; validate with tests that errors inside macros point at the call site. |
 | 15 | **Durable-ref consistency surprises outside tx** (two `@r` in the same `let` may see different snapshots) | Medium | Moderate | §15.3 warns explicitly; stdlib provides `with-read-tx` and `db/as-of`; docs push snapshot scopes as the default. |
-| 16 | **Intern table grows unbounded in long-lived REPL sessions** | Low | Moderate | Monitor in Phase 5 tooling; consider weak-intern semantics or manual `unintern` in v2. |
-| 17 | **emdb snapshot pinning causes apparent leaks** (user holds a `db/snapshot` and file grows) | Medium | Moderate | `db/snapshot-stats` in Phase 5 exposes pinned snapshots; REPL warns on long-held snapshots. |
+| 16 | **Intern table grows unbounded in long-lived REPL sessions** | Low | Moderate | No mitigation in v1; weak-intern semantics or a manual `unintern` are v2 candidates. |
+| 17 | **emdb snapshot pinning causes apparent leaks** (user holds a `db/snapshot` and file grows) | Medium | Moderate | `db/release-snapshot!` releases a pinned snapshot; no tooling reports pinned snapshots. |
 
 ---
 
@@ -2340,11 +2173,11 @@ The things most likely to go wrong, with mitigations.
 | `(= 1 1.0)` | true | **false** (use `==` for cross-type) |
 | Laziness | Pervasive `seq` | Eager, explicit streams later |
 | STM | `ref`, `dosync`, `alter` | **Removed.** emdb transactions only |
-| Atoms | In-memory CAS | **Kept** (Phase 5 Item 1, peer-AI turn 75). In-memory mutable cell; single-threaded v1 makes `compare-and-set!` a deterministic check-and-set, not a lock-free retry loop. Durable refs cover durable mutation; atoms cover ephemeral mutation. See `docs/ATOM.md`. |
+| Atoms | In-memory CAS | **Kept.** In-memory mutable cell; single-threaded v1 makes `compare-and-set!` a deterministic check-and-set, not a lock-free retry loop. Durable refs cover durable mutation; atoms cover ephemeral mutation. See `docs/ATOM.md`. |
 | Agents | `send`, `send-off` | **Removed.** |
 | `core.async` | Channels, go blocks | **Removed.** |
 | Multimethods | `defmulti`, `defmethod` | **Removed.** |
-| Protocols | `defprotocol`, `extend-type` | **Kept** (Phase 5 Item 3, peer-AI turn 84). Per-VM registries for records + protocols; `Kind.record = 35` (structural equality + hash), `Kind.protocol = 36`, `Kind.protocol_fn = 37`. `defprotocol` / `defrecord` / `extend-protocol` / `extend-type` / `satisfies?` host macros. Built-in dispatch types + `Any` / `Object` default. NOT serializable. Static dispatch in v1; inline caches deferred to Phase 6. Full spec in `docs/PROTOCOLS.md`. |
+| Protocols | `defprotocol`, `extend-type` | **Kept.** Per-VM registries for records + protocols; `Kind.record = 35` (structural equality + hash), `Kind.protocol = 36`, `Kind.protocol_fn = 37`. `defprotocol` / `defrecord` / `extend-protocol` / `extend-type` / `satisfies?` host macros. Built-in dispatch types + `Any` / `Object` default. NOT serializable. Static dispatch in v1; inline caches deferred to Phase 6. Full spec in `docs/PROTOCOLS.md`. |
 | Reader conditionals | `#?(...)` | **Removed.** |
 | Tagged literals | `#inst`, `#uuid`, user-extensible | **Removed.** |
 | Namespaces | `ns`, `require`, `refer`, `alias` | **Kept.** Simplified. |
@@ -2483,7 +2316,7 @@ user=> (g 5)                   ; g sees new f on next call
 
 ## 28. Appendix C — Canonical Form Schema
 
-**The single most important artifact for Phase 0 implementation.** This is the authoritative contract between the `nexis.grammar` parser output and the `src/reader.zig` Form tree that macros/compiler consume.
+**The single most important artifact for reader work.** This is the authoritative contract between the `nexis.grammar` parser output and the `src/reader.zig` Form tree that macros/compiler consume.
 
 ### 28.1 Form shape
 
@@ -2686,79 +2519,64 @@ It fails if it feels like:
 
 ---
 
-*Document version: 1.1 — Finalized after exhaustive Clojure source review and 8 rounds of peer-AI (GPT-5.4) adversarial critique. Ready to drive Phase 0 implementation.*
-
-*Companion documents: `CLOJURE-REVIEW.md` (source review findings), `docs/SEMANTICS.md` (Phase 0 deliverable — numeric corner cases, nil/empty semantics, print contract), `docs/FORMS.md` (Phase 0 deliverable — canonical Form schema).*
-
-*Last updated: 2026-04-19*
+*Companion documents: `CLOJURE-REVIEW.md` (source review findings), `docs/SEMANTICS.md` (numeric corner cases, nil/empty semantics, print contract), `docs/FORMS.md` (canonical Form schema).*
 
 ---
 
 ## Amendment Log
 
 PLAN.md is the highest-authority document in the project (AGENTS.md
-authority order). Substantive changes since v1.1 are logged here with
-their rationale and peer-AI turn citation. Per-doc amendment logs
-(COMPILER.md §13, VM.md §18, ATOM.md §11, etc.) record finer-grained
-spec changes downstream of each PLAN entry.
+authority order). Substantive changes are logged here, dated, each
+entry stating the decision and its rationale.
 
-- **2026-05-18 — Atoms (Phase 5 Item 1) added.** Appendix A's
-  "Atoms — Removed" row was a v1 scoping decision predating the Phase
-  5 framing in HANDOFF.md §10. Atoms re-enter v1 as in-memory mutable
+- **2026-05-18 — Atoms added.** Appendix A's "Atoms — Removed" row
+  was a v1 scoping decision. Atoms are in v1 as in-memory mutable
   cells consistent with §23 #5 (single-isolate, single-threaded): the
   Clojure-canonical API (`atom`/`reset!`/`swap!`/`swap-vals!`/
   `compare-and-set!`/`atom?` + `@a` via universal `deref`) is provided
-  for source-portability, but `compare-and-set!` is a deterministic
+  for source-portability, and `compare-and-set!` is a deterministic
   check-and-set under the single-threaded execution model — not a
-  lock-free retry primitive. Validators / watches / metadata on atoms
-  remain deferred (post-v1 only on concrete user demand). Authority:
-  peer-AI turn 75. Full spec: `docs/ATOM.md`. No frozen-decision in
-  §23 needed amending (the prior "Removed" line lived in Appendix A
-  comparison only); this log entry IS the authority record.
+  lock-free retry primitive. Validators, watches and metadata on atoms
+  are absent. Full spec: `docs/ATOM.md`. No frozen decision in §23
+  needed amending (the prior "Removed" line lived in Appendix A
+  only); this log entry IS the authority record.
 
-- **2026-05-19 — Protocols + records (Phase 5 Item 3) added.**
-  §23 #8 ("No user protocols in v1") and Appendix A
-  ("Protocols — Removed in v1") were v1-scoping decisions
-  pre-Phase-5. The HANDOFF.md §10.3 Phase 5 framing (peer-AI
-  turn 74) and the design freeze in `docs/PROTOCOLS.md` (peer-AI
-  turn 84) reframe these as Phase 5 scope additions, not changes
-  to architecturally load-bearing decisions. v1 keeps its other
-  §23 #5 constraint (single-isolate, single-threaded), so
-  protocols here are static-dispatch + per-VM registries;
-  no STM, no agents, no concurrency. Per-VM `RecordType` and
-  `Protocol` registries; new heap kinds 35–37 (`record` /
-  `protocol` / `protocol_fn`); structural equality + hash for
-  records; opaque identity for protocols / protocol_fns. Records
-  + protocols are NOT in the §23 #25 serializable set
-  (`:unserializable`). 4-sub-commit implementation split (5.3a–d).
-  See `docs/PROTOCOLS.md` for the full spec, hand-trace, and
-  amendment-log entry. Authority: peer-AI turn 84.
+- **2026-05-19 — Protocols + records added.** §23 #8 ("No user
+  protocols in v1") and Appendix A ("Protocols — Removed in v1") were
+  v1-scoping decisions; this entry reframes them as scope additions,
+  not changes to architecturally load-bearing decisions. v1 keeps
+  §23 #5 (single-isolate, single-threaded), so protocols are
+  static-dispatch + per-VM registries; no STM, no agents, no
+  concurrency. Per-VM `RecordType` and `Protocol` registries; heap
+  kinds 35–37 (`record` / `protocol` / `protocol_fn`); structural
+  equality + hash for records; opaque identity for protocols /
+  protocol_fns. Records + protocols are NOT in the §23 #25
+  serializable set (`:unserializable`). Full spec: `docs/PROTOCOLS.md`.
 
 - **2026-09-18 — Number tower contagion (§8.3 / §6.3).** Arithmetic
-  and ordered comparison between fixnum and float now follow Clojure
-  contagion instead of raising `:type-error`, `==` ships in v1 as the
-  cross-type numeric equality (§23 #11 keeps `(= 1 1.0)` false), and
-  `/` on two integers yields a float when the quotient is inexact,
-  since §23 #10 has no rationals. Fixnum overflow raises the catchable
-  `:arithmetic-overflow` until bignum arithmetic lands. SEMANTICS.md
+  and ordered comparison between fixnum and float follow Clojure
+  contagion instead of raising `:type-error`; `==` is the cross-type
+  numeric equality (§23 #11 keeps `(= 1 1.0)` false); `/` on two
+  integers yields a float when the quotient is inexact, since §23 #10
+  has no rationals. Fixnum overflow raises the catchable
+  `:arithmetic-overflow`; there is no bignum arithmetic. SEMANTICS.md
   §2.2 and §6.3 track this entry.
 
-- **2026-09-18 — Doubles as landed; addendum to the number-tower
-  entry.** Integer division by zero (`/`, `quot`, `rem`, `mod`) raises
-  the catchable `:divide-by-zero`; float division by zero is IEEE
-  (`(/ 1.0 0)` is `Infinity`). The fixnum payload is 48
-  bits (`value.zig`: `fixnum_max = 2^47 - 1`); an integer literal
-  outside that range is the compile error `IntegerOutOfFixnumRange`.
-  §23 #10 ("fixnum + bignum") is realized as a `bignum` kind with
-  codec and hashing and no arithmetic or literal lifting; both are
-  ranked first in `HANDOFF.md` §4.
+- **2026-09-18 — Doubles; addendum to the number-tower entry.**
+  Integer division by zero (`/`, `quot`, `rem`, `mod`) raises the
+  catchable `:divide-by-zero`; float division by zero is IEEE
+  (`(/ 1.0 0)` is `Infinity`). The fixnum payload is 48 bits
+  (`value.zig`: `fixnum_max = 2^47 - 1`); an integer literal outside
+  that range is the compile error `IntegerOutOfFixnumRange`. §23 #10
+  ("fixnum + bignum") is realized as a `bignum` kind with codec and
+  hashing and no arithmetic or literal lifting; both are listed in
+  `HANDOFF.md` §4.
 
-- **2026-09-18 — Keyword-as-function shipped (§8.7, §23 #33).**
-  `(:k m)` and `(:k m default)` are handled by the VM's call path
-  for a keyword in function position; maps, sets and vectors are invocable
-  the same way (`(m :k)`, `(#{1 2} 2)`, `([10 20] 1)`). The §19 note
-  before §19.3 ("not a v1 language feature") and §24 #11 are
-  superseded by this entry; §8.7 and §23 #33 are the authority.
+- **2026-09-18 — Keyword-as-function (§8.7, §23 #33).** `(:k m)` and
+  `(:k m default)` are handled by the VM's call path for a keyword in
+  function position; maps, sets and vectors are invocable the same
+  way (`(m :k)`, `(#{1 2} 2)`, `([10 20] 1)`). §24 #11 is superseded;
+  §8.7 and §23 #33 are the authority.
 
 - **2026-09-18 — `q` is a native, not a macro (§15.11 NX-3).** The
   query is a value (vector or map form) parsed at run time into IR
@@ -2779,12 +2597,11 @@ spec changes downstream of each PLAN entry.
   counter in `nx/sys`, never the engine's `txnId`. NX-6's
   `:nextomic/schema` tree does not exist: schema is datoms on
   attribute entities read as-of the basis. NX-5's `datom` heap kind
-  is not shipped; `datoms`, `tx-range` and `history` reads return
-  `[e a v t added]` vectors, and the kind is listed as later in
+  does not exist; `datoms`, `tx-range` and `history` reads return
+  `[e a v t added]` vectors, and the kind is listed as absent in
   `docs/NEXTOMIC.md` §6. `docs/NEXTOMIC.md` §1–§2 are the authority.
 
 - **2026-09-18 — `as-of` removed from §21 "Beyond 1.0".** §23 #22
-  makes `as-of` reads v1, and they ship twice: `db/snapshot` /
-  `with-snapshot` over MVCC read transactions (Phase 4.0f) and
-  Nextomic's `as-of`/`since`/`history` db-values over tx-in-key
-  history.
+  makes `as-of` reads v1, and they exist twice: `db/snapshot` /
+  `with-snapshot` over MVCC read transactions (§15.7) and Nextomic's
+  `as-of`/`since`/`history` db-values over tx-in-key history.

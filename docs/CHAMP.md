@@ -1,39 +1,30 @@
-## CHAMP.md — Persistent Map & Set Heap Kinds (Phase 1)
+## CHAMP.md — Persistent Map & Set Heap Kinds
 
-**Status**: Phase 1 deliverable. Authoritative body-layout and semantic
-contract for the `persistent_map` and `persistent_set` heap kinds.
-Derivative from `PLAN.md` §9.1 + §23 #37, `docs/VALUE.md` §2.2,
-`docs/SEMANTICS.md` §2.6 / §3.2, `docs/HEAP.md`, and the precedents
-set by `docs/LIST.md` and `docs/VECTOR.md`. Those documents win on
-conflict. Reviewed against `CLOJURE-REVIEW.md` §2.2 and peer-AI turn 8.
+Authoritative body-layout and semantic contract for the
+`persistent_map` and `persistent_set` heap kinds, implemented in
+`src/coll/champ.zig`. Derivative from `PLAN.md` §9.1 + §23 #37,
+`docs/VALUE.md` §2.2, `docs/SEMANTICS.md` §2.6 / §3.2, `docs/HEAP.md`,
+and the precedents set by `docs/LIST.md` and `docs/VECTOR.md`. Those
+documents win on conflict.
 
-**Filename note.** The module ships as `src/coll/champ.zig` (renamed
-from `hamt.zig` on 2026-05-16, peer-AI turn 52, to remove the
-doc/source name mismatch). The **algorithm is CHAMP** (Steindorfer &
-Vinju, OOPSLA 2015 — separate data and node bitmaps, canonical layout),
-not classic Bagwell HAMT. Classic HAMT was documented as a fallback
-(§1 "Out") only if CHAMP implementation hit an unforeseen blocker —
-it did not.
+The **algorithm is CHAMP** (Steindorfer & Vinju, OOPSLA 2015 —
+separate data and node bitmaps, canonical layout), not classic
+Bagwell HAMT.
 
-This module ships the **associative** and **set** equality categories
-(hash-domain bytes `0xF1` and `0xF2`). These are the only two equality
-categories whose machinery is pre-wired in `dispatch.zig` but whose
-runtime members are, prior to this commit, design fiction — the
-category/domain scaffolding and exhaustive table tests already pin
-`.persistent_map` and `.persistent_set` to their categories; this
-commit gives them bodies.
-
-This is the single largest implementation item remaining in Phase 1
-per PLAN §25's risk register. Scope-frozen commitment: **this doc
-specifies both kinds; implementation splits across two commits —
-map core + associative infrastructure first, then set as a parallel
-subkind family reusing the shared CHAMP machinery.**
+This module is the sole runtime member of the **associative** and
+**set** equality categories (hash-domain bytes `0xF1` and `0xF2`).
+The category/domain scaffolding and exhaustive table tests in
+`dispatch.zig` pin `.persistent_map` and `.persistent_set` to those
+categories; this module gives them bodies. The two kinds are a
+parallel subkind family sharing one CHAMP machinery: map core plus
+associative infrastructure, and set as a parallel implementation
+reusing it.
 
 ---
 
 ### 1. Scope
 
-**In (combined across both commits):**
+**In:**
 
 - Representation: classic CHAMP layout — separate data and node
   bitmaps per Steindorfer & Vinju (OOPSLA 2015) — plus a flat
@@ -45,39 +36,38 @@ subkind family reusing the shared CHAMP machinery.**
 - Accessors: `count` (O(1)), `get` / `contains`, `isEmpty`.
 - Per-kind dispatch: `hashMap` / `hashSet`, `equalMap` / `equalSet`,
   element/entry iterator for unordered hash accumulation.
-- Three composition helpers in `dispatch.zig`: `associativeEqual`
-  and `setEqual` parallel to the existing `sequentialEqual`. (These
-  handle within-category equality; since each category currently has
-  one kind, they reduce to kind-local dispatch today, but the shape
-  is correct for future cross-kind associative / set extensions.)
+- Two category-equality helpers in `dispatch.zig`: `associativeEqual`
+  and `setEqualCategory`, parallel to `sequentialEqual`. (These
+  handle within-category equality; each category has exactly one
+  kind, so they reduce to kind-local dispatch, but the shape is the
+  seam for any cross-kind associative / set member.)
 
-**Out (each deferred to a named later commit or v2+):**
+**Out (owned elsewhere or absent):**
 
-- **Transients**. Owner-token editable copies land with
-  `src/coll/transient.zig`. This commit designs node layouts for
-  persistent semantics only; if transients require layout revision
-  when they land, that revision is an explicit transient-commit
-  concern. Per peer-AI turn 8: no speculative reservation of transient
-  fields in CHAMP nodes today.
+- **Transients**. Owner-token editable copies live in
+  `src/coll/transient.zig` (spec: `docs/TRANSIENT.md`). CHAMP node
+  layouts carry no transient-specific fields; the transient wrapper
+  owns its edit state.
 - `merge` / `merge-with` / `update` / `select-keys` / `zipmap` and
   other stdlib-level map operators. Those compose over `assoc` /
-  `dissoc` / `get` and are Phase 3 material.
-- Set operators (`union` / `intersection` / `difference`). Same
-  status as the stdlib map operators.
-- RRB-style balancing for maps. Not a thing — CHAMP is already the
-  committed layout. Listed here only to pre-empt the question.
-- Cross-kind associative or set members. v1 has one kind per
-  category; future kinds in the same category (e.g. sorted-map) are
-  v2+ territory and require an amendment.
+  `dissoc` / `get` and live in the stdlib (`src/stdlib.zig` natives
+  and `src/stdlib/core.nx`).
+- Set operators (`union` / `intersection` / `difference`). Not
+  implemented; no stdlib binding exists for them.
+- RRB-style balancing for maps. Not a thing — CHAMP is the committed
+  layout. Listed here only to pre-empt the question.
+- Cross-kind associative or set members. Each category has one kind;
+  no sorted-map or similar kind exists. Adding one requires a spec
+  amendment.
 
 ---
 
 ### 2. The three-layer canonicality model (central)
 
-**Peer-AI turn 8 flagged overclaiming canonical representation as
-the single most likely spec mistake here.** The rule set below is
-deliberately narrower than a naive "CHAMP guarantees a unique layout
-for any logical entry set" reading of PLAN §9.1.
+**Overclaiming canonical representation is the single most likely
+spec mistake here.** The rule set below is deliberately narrower
+than a naive "CHAMP guarantees a unique layout for any logical entry
+set" reading of PLAN §9.1.
 
 nexis claims canonical representation at **three distinct levels**,
 each with its own scope:
@@ -117,7 +107,7 @@ each with its own scope:
   (sorting keys by some byte encoding), which is a huge semantic
   commitment — it entangles equality-internals with a canonical-order
   contract that would propagate into serialization, stable iteration,
-  and potentially language-level ordering primitives. v1 does not
+  and potentially language-level ordering primitives. nexis does not
   accept that commitment.
 - Collision-node equality is **semantic membership comparison**:
   same count, then every entry in `a` has an equal-keyed entry in
@@ -128,8 +118,8 @@ each with its own scope:
 #### 2.4 Cross-subkind equality
 
 - Two maps with the same entry set but different subkinds (e.g. an
-  array-map built to 8 entries vs. a CHAMP-backed map that was once
-  9 entries and then had one `dissoc`-ed out) compare `=` and hash
+  array-map built to 8 entries vs. a CHAMP-backed map built to 9
+  entries and then reduced by one `dissoc`) compare `=` and hash
   equal.
 - Equality across subkinds **cannot** use bitmap early-exit. It falls
   back to **semantic associative comparison** — count equality, then
@@ -176,9 +166,8 @@ must be read as a bug in the claim, not a property of the spec.
 
 Per VALUE.md §2.2, `Kind.persistent_map = 18` and
 `Kind.persistent_set = 19` are frozen. The subkind byte disambiguates
-representation families within each kind; peer-AI turn 8 recommended
-**parallel subkind numbering across both kinds** to keep dispatch and
-future GC logic regular.
+representation families within each kind; subkind numbering is
+**parallel across both kinds** to keep dispatch and GC logic regular.
 
 | Subkind | Map role | Set role | User-facing? |
 |---------|---------|---------|---|
@@ -190,16 +179,15 @@ future GC logic regular.
 
 Only subkinds 0 and 1 ever flow through `dispatch.heapHashBase` /
 `dispatch.heapEqual`. Subkinds 2 and 3 are internal allocations —
-the heap holds them, GC will trace them, but they never escape into
-a user-visible `Value`. Each accessor safe-asserts the subkind of
-the header it receives.
+the heap holds them, the GC traces them (`traceMap` / `traceSet`),
+but they never escape into a user-visible `Value`. Each accessor
+safe-asserts the subkind of the header it receives.
 
 **Empty collections.** A fresh empty map is `subkind = 0, count = 0`
 (a zero-entry array-map). Same for sets. Per the list / vector
 precedent, empty collections are **not** a shared singleton — each
-`empty(heap)` call allocates a fresh header. Shared-singleton
-pinning is a Phase 6 allocator optimization, tracked but not
-scheduled.
+`empty(heap)` call allocates a fresh header. There is no pinned
+shared-empty singleton.
 
 ---
 
@@ -233,9 +221,9 @@ const ArraySetBody = extern struct {
   order, with replace-value updating in place). This ordering is a
   representation detail, NOT a semantic commitment — equality and
   hash ignore it.
-- `_pad` bytes are never fed into hash or equality. (Peer-AI caught
-  the same trap in `bignum.zig`: layout detail leaking into hash
-  output.)
+- `_pad` bytes are never fed into hash or equality (the same
+  discipline as `bignum.zig`: layout detail must not leak into hash
+  output).
 - Empty array-map / array-set: body size = 8 bytes; no trailing
   entries.
 
@@ -350,17 +338,20 @@ const CollisionBody = extern struct {
 #### 5.1 Indexing hash
 
 Keys are indexed by the **low 32 bits** of the key's `dispatch.hashValue(key)`
-result. Peer-AI turn 8: compute the hash once per lookup/update, reuse
-it throughout. Since `dispatch.hashValue` already applies the
+result. The hash is computed once per lookup/update and reused
+throughout. Since `dispatch.hashValue` already applies the
 equality-category domain mixer, this is the same hash value that
 would be written to `HeapHeader.hash` for heap-kind keys; no second
 xxHash3 invocation per key per op.
 
 ```zig
-fn indexHash(key: Value) u32 {
-    return @truncate(dispatch.hashValue(key));
+inline fn indexHashOf(key: Value, elementHash: *const fn (Value) u64) u32 {
+    return @truncate(elementHash(key));
 }
 ```
+
+(`elementHash` is `&dispatch.hashValue` at every real call site; the
+module takes it as a parameter rather than importing `dispatch.zig`.)
 
 Rationale for low-32 (vs. high-32 / XOR-fold): freeze one rule;
 pick the simpler. Truncation does not bias distribution because
@@ -393,8 +384,7 @@ pub const MAX_TRIE_SHIFT: u5 = 30;  // shift at the deepest interior level
 pub const COLLISION_DEPTH: u8 = 7;  // total levels (0..6) before collision
 ```
 
-Not configurable in v1. Future 64-bit indexing would be a spec
-amendment anyway.
+Not configurable. 64-bit indexing would be a spec amendment.
 
 #### 5.3 Array-map → CHAMP promotion
 
@@ -414,10 +404,10 @@ work.
 #### 5.4 No demotion on dissoc
 
 A CHAMP root that shrinks below 8 entries via `dissoc` does NOT
-demote back to array-map. Peer-AI turn 8 confirmed this matches
-Clojure's `PersistentHashMap.without` behavior and is the right call:
-demotion churn at the 8↔9 boundary would dominate real workloads that
-bounce around that threshold.
+demote back to array-map. This matches Clojure's
+`PersistentHashMap.without` behavior: demotion churn at the 8↔9
+boundary would dominate real workloads that bounce around that
+threshold.
 
 Consequence: two logically-equal maps may have different subkinds
 depending on their construction history. Equality and hash handle
@@ -464,16 +454,16 @@ this doc inherits the guarantee.
 #### 6.2 Within-category dispatch
 
 For two Values in the `.associative` category, `dispatch.equal`
-routes through a new helper:
+routes through:
 
 ```zig
-pub fn associativeEqual(a: Value, b: Value) bool;
+fn associativeEqual(a: Value, b: Value) bool;
 ```
 
-Today this reduces to same-kind dispatch (only `persistent_map`
-exists in the category), but the shape is correct for future
-cross-kind associative members. Same shape for `setEqual` in the
-set category.
+This reduces to same-kind dispatch (only `persistent_map` exists in
+the category), but the shape is the seam for any cross-kind
+associative member. Same shape for `setEqualCategory` in the set
+category.
 
 #### 6.3 Same-kind, same-subkind equality
 
@@ -497,7 +487,7 @@ Subkind pairs (0, 1) and (1, 0) — array-map vs. CHAMP root:
 
 - Count match first.
 - Then iterate the side with the cheaper iteration / smaller bound
-  (for v1, always the array-map side since it's capped at 8 entries).
+  (always the array-map side, since it is capped at 8 entries).
   For each entry (k, v), call `mapGet(otherMap, k)`:
   - `.absent` → return false.
   - `.present = v'` → compare `v == v'` via `dispatch.equal`; unequal
@@ -517,8 +507,8 @@ level; this §6.4 strategy depends on that fix.
 
 #### 6.5 Keyword-keyed fast path
 
-Per PLAN §9.1 and peer-AI turn 8: when both the search key and the
-candidate key are `.keyword`, compare via **interned-id identity**
+Per PLAN §9.1: when both the search key and the candidate key are
+`.keyword`, compare via **interned-id identity**
 instead of calling through `dispatch.equal`. Scope narrowly — this
 shortcut applies only to same-kind keyword pairs. Every other key
 kind pair routes through `dispatch.equal`.
@@ -537,7 +527,7 @@ an approximation.
 
 #### 6.6 `mapGet` returns `MapLookup`, not `?Value`
 
-Peer-AI turn 8 / turn 9 flagged two distinct points here:
+Two distinct points:
 
 1. **Absence is normal programmatic flow**, not a contract violation
    (unlike `vector.nth` out-of-bounds). Map lookup must not panic
@@ -548,7 +538,7 @@ Peer-AI turn 8 / turn 9 flagged two distinct points here:
    `(nil-propagation) (assoc m k nil)` idioms). The API must
    distinguish the two cases explicitly.
 
-The v1 API:
+The API:
 
 ```zig
 pub const MapLookup = union(enum) {
@@ -556,14 +546,18 @@ pub const MapLookup = union(enum) {
     present: value.Value,
 };
 
-pub fn mapGet(m: value.Value, key: value.Value) MapLookup;
-pub fn setContains(s: value.Value, elem: value.Value) bool;  // set: presence-only
+pub fn mapGet(m: value.Value, key: value.Value,
+              elementHash: *const fn (Value) u64,
+              elementEq: *const fn (Value, Value) bool) MapLookup;
+pub fn setContains(s: value.Value, elem: value.Value,
+                   elementHash: *const fn (Value) u64,
+                   elementEq: *const fn (Value, Value) bool) bool;  // set: presence-only
 ```
 
 The language-surface `(get m k)` returns `nil` on absent;
 `(get m k default)` returns the default; `(contains? s e)` returns
-a bool. Those wrappers switch on the union at the macro / stdlib
-layer.
+a bool. Those wrappers switch on the union in the stdlib natives
+(`src/stdlib.zig`).
 
 ---
 
@@ -583,14 +577,13 @@ entry_hash(k, v) =
 = `31 * (31 + hash(k)) + hash(v)` (with wrap-around u64 arithmetic).
 
 This is **two `combineOrdered` calls, no `finalizeOrdered`, no
-sequential-domain mix**. SEMANTICS.md §3.2 was amended (2026-04-19,
-in the same commit as this doc) to pin this formula; the previous
-informal prose `h += hasheq(list(k, v))` was ambiguous — a strict
-reading would route entries through the full sequential hash
-pipeline (which adds a `finalizeOrdered(..., 2)` + `mixKindDomain(..., 0xF0)`
-per entry), which is both more expensive and semantically wrong
-(the 0xF0 sequential-domain byte has no business inside a map's
-internal entry hash).
+sequential-domain mix**. SEMANTICS.md §3.2 pins this formula. The
+informal reading `h += hasheq(list(k, v))` is NOT the contract: it
+would route entries through the full sequential hash pipeline (which
+adds a `finalizeOrdered(..., 2)` + `mixKindDomain(..., 0xF0)` per
+entry), which is both more expensive and semantically wrong (the
+0xF0 sequential-domain byte has no business inside a map's internal
+entry hash).
 
 Rationale:
 - Two ordered combines keep the hash sensitive to swapped key/value
@@ -667,9 +660,17 @@ the root body caches via the standard `HeapHeader.hash` slot.
 Lives in `src/coll/champ.zig`. Map and set operations are prefixed for
 clarity because both live in the same module.
 
+Every operation that must hash or compare keys takes the hash and
+equality functions as explicit parameters (`elementHash` /
+`elementEq`); callers pass `&dispatch.hashValue` / `&dispatch.equal`.
+The module never imports `dispatch.zig` directly.
+
 ```zig
+const ElementHash = *const fn (value.Value) u64;
+const ElementEq = *const fn (value.Value, value.Value) bool;
+
 // -- Map --
-pub const Entry = struct { key: value.Value, value: value.Value };
+pub const Entry = extern struct { key: value.Value, value: value.Value };  // 32 bytes
 
 pub const MapLookup = union(enum) {
     absent,
@@ -677,33 +678,37 @@ pub const MapLookup = union(enum) {
 };
 
 pub fn mapEmpty(heap: *Heap) !value.Value;
-pub fn mapFromEntries(heap: *Heap, entries: []const Entry) !value.Value;
-pub fn mapAssoc(heap: *Heap, m: value.Value, key: value.Value, val: value.Value) !value.Value;
-pub fn mapDissoc(heap: *Heap, m: value.Value, key: value.Value) !value.Value;
-pub fn mapGet(m: value.Value, key: value.Value) MapLookup;
+pub fn mapFromEntries(heap: *Heap, entries: []const Entry, elementHash: ElementHash, elementEq: ElementEq) !value.Value;
+pub fn mapAssoc(heap: *Heap, m: value.Value, key: value.Value, val: value.Value, elementHash: ElementHash, elementEq: ElementEq) !value.Value;
+pub fn mapDissoc(heap: *Heap, m: value.Value, key: value.Value, elementHash: ElementHash, elementEq: ElementEq) !value.Value;
+pub fn mapGet(m: value.Value, key: value.Value, elementHash: ElementHash, elementEq: ElementEq) MapLookup;
 pub fn mapCount(m: value.Value) usize;
 pub fn mapIsEmpty(m: value.Value) bool;
 
 // -- Set --
 pub fn setEmpty(heap: *Heap) !value.Value;
-pub fn setFromElements(heap: *Heap, elems: []const value.Value) !value.Value;
-pub fn setConj(heap: *Heap, s: value.Value, elem: value.Value) !value.Value;
-pub fn setDisj(heap: *Heap, s: value.Value, elem: value.Value) !value.Value;
-pub fn setContains(s: value.Value, elem: value.Value) bool;
+pub fn setFromElements(heap: *Heap, elems: []const value.Value, elementHash: ElementHash, elementEq: ElementEq) !value.Value;
+pub fn setConj(heap: *Heap, s: value.Value, elem: value.Value, elementHash: ElementHash, elementEq: ElementEq) !value.Value;
+pub fn setDisj(heap: *Heap, s: value.Value, elem: value.Value, elementHash: ElementHash, elementEq: ElementEq) !value.Value;
+pub fn setContains(s: value.Value, elem: value.Value, elementHash: ElementHash, elementEq: ElementEq) bool;
 pub fn setCount(s: value.Value) usize;
 pub fn setIsEmpty(s: value.Value) bool;
 
 // -- Dispatch entry points (called by dispatch.zig) --
-pub fn hashMap(h: *HeapHeader, elementHash: *const fn (value.Value) u64) u64;
-pub fn hashSet(h: *HeapHeader, elementHash: *const fn (value.Value) u64) u64;
-pub fn equalMap(a: *HeapHeader, b: *HeapHeader, elementEq: *const fn (value.Value, value.Value) bool) bool;
-pub fn equalSet(a: *HeapHeader, b: *HeapHeader, elementEq: *const fn (value.Value, value.Value) bool) bool;
+pub fn hashMap(h: *HeapHeader, elementHash: ElementHash) u64;
+pub fn hashSet(h: *HeapHeader, elementHash: ElementHash) u64;
+pub fn equalMap(a: *HeapHeader, b: *HeapHeader, elementHash: ElementHash, elementEq: ElementEq) bool;
+pub fn equalSet(a: *HeapHeader, b: *HeapHeader, elementHash: ElementHash, elementEq: ElementEq) bool;
 
-// -- Iterators for hash accumulation and future seq --
+// -- Iterators for hash accumulation and seq --
 pub const MapIter = struct { ... };
 pub const SetIter = struct { ... };
-pub fn mapIter(h: *HeapHeader) MapIter;
-pub fn setIter(h: *HeapHeader) SetIter;
+pub fn mapIter(m: value.Value) MapIter;
+pub fn setIter(s: value.Value) SetIter;
+
+// -- GC trace entry points (called by gc.zig) --
+pub fn traceMap(h: *HeapHeader, visitor: anytype) void;
+pub fn traceSet(h: *HeapHeader, visitor: anytype) void;
 ```
 
 #### 8.1 Error set and semantic details
@@ -711,7 +716,7 @@ pub fn setIter(h: *HeapHeader) SetIter;
 - All constructing / updating functions may return `error.OutOfMemory`
   from `heap.alloc`. No other error paths.
 - `mapFromEntries` on an input with duplicate keys does NOT error —
-  **later entry wins** (per peer-AI turn 8). This is Clojure's
+  **later entry wins**. This is Clojure's
   runtime behavior for programmatically-built maps with duplicate
   keys, distinct from the reader's static duplicate-literal-key
   rejection. `setFromElements` same: duplicate elements are
@@ -755,45 +760,43 @@ pub fn setIter(h: *HeapHeader) SetIter;
 - `mapCount(m)`, `mapIsEmpty(m)` — safe-assert the Value is a map
   kind; panic otherwise (caller bug).
 - `mapAssoc` / `mapDissoc` on a non-map Value panic. Language surface
-  provides the nil-propagation layer (`(assoc nil k v) → {k v}`, a
-  macro in stdlib/core.nx).
+  provides the nil-propagation layer (`(assoc nil k v) → {k v}`, in
+  the `assoc` native in `src/stdlib.zig`).
 
 ---
 
 ### 9. Dispatch integration
 
-`dispatch.zig` gains:
+`dispatch.zig` integrates the module at three points:
 
 1. Two kind arms in `heapHashBase`:
 
 ```zig
-.persistent_map => hamt.hashMap(h, &hashValue),
-.persistent_set => hamt.hashSet(h, &hashValue),
+.persistent_map => champ.hashMap(h, &hashValue),
+.persistent_set => champ.hashSet(h, &hashValue),
 ```
 
-2. Two new category-equality helpers paralleling `sequentialEqual`:
+2. Two category-equality helpers paralleling `sequentialEqual`:
 
 ```zig
 fn associativeEqual(a: Value, b: Value) bool;
-fn setEqual(a: Value, b: Value) bool;
+fn setEqualCategory(a: Value, b: Value) bool;
 ```
 
-Today these reduce to same-kind dispatch because each category has
-one kind. The `dispatch.equal` switch grows:
+These reduce to same-kind dispatch because each category has one
+kind. The `dispatch.equal` switch routes:
 
 ```zig
 .associative => return associativeEqual(a, b),
-.set => return setEqual(a, b),
+.set => return setEqualCategory(a, b),
 ```
 
-(Replacing the current `.associative, .set, .kind_local => {...}`
-fused arm which reduces to kind-local today.)
+(`heapEqual` also carries `.persistent_map` / `.persistent_set` arms
+calling `champ.equalMap` / `champ.equalSet` for the same-kind path.)
 
-3. Nothing else changes. `eqCategory`, `domainByteForKind`, the
-category domain-byte constants, and the exhaustive
-`eqCategory + domainByteForKind` table test all already include
-map and set rows; they light up on this commit without source
-edits.
+3. `eqCategory`, `domainByteForKind`, the category domain-byte
+constants, and the exhaustive `eqCategory + domainByteForKind` table
+test all include map and set rows.
 
 ---
 
@@ -832,120 +835,75 @@ Checklist of classic mistakes — tests must cover each.
 11. **`mapGet` on absent key in CHAMP.** Must walk slot-index path;
     must NOT return `null` early just because a slot is empty — the
     key might be in a collision node nested deeper.
-12. **`_pad` bytes never hashed / compared.** Already covered in
-    bignum.zig's turn-6 peer-AI review; same discipline applies to
-    array-map and CHAMP root.
+12. **`_pad` bytes never hashed / compared.** The same discipline as
+    `bignum.zig` applies to array-map and CHAMP root.
 13. **Hash cache discipline.** Cache only nonzero u32 results at the
     root; never cache on interior/collision subkind bodies.
 
 ---
 
-### 11. Two-commit split (both landed)
+### 11. Map / set parallelism in the module
 
-Per peer-AI turn 8 and user confirmation:
+`src/coll/champ.zig` is organized as two parallel parts: the map
+kind first, then the set kind reusing the same CHAMP machinery.
 
-**Commit 1 — map core + associative infrastructure.** [LANDED at `b20c306`]
-
-- `docs/CHAMP.md` (this file).
-- `src/coll/champ.zig` with:
-  - `.persistent_map` subkinds 0–3 fully implemented.
-  - Map public API (`mapEmpty`, `mapFromEntries`, `mapAssoc`,
-    `mapDissoc`, `mapGet`, `mapCount`, `mapIsEmpty`).
-  - `hashMap`, `equalMap`, `MapIter`, dispatch integration.
-- `test/prop/champ.zig` with map property tests M1–M11.
-- Inline map tests in `champ.zig` (29 tests).
-- `dispatch.zig` updates:
-  - `heapHashBase` map arm.
-  - `associativeEqual` helper.
-  - `equal` switch update (split `.associative` out of fused arm).
-- Green: 247 → 294 tests (+47).
-
-**Commit 2 — set parallel implementation.** [LANDED this commit]
-
-- `src/coll/champ.zig` extended with the full set kind (parallel
-  PART 2 section):
-  - `.persistent_set` subkinds 0–3. Bodies share header layout
-    structs with the map side (`ChampSetRootBody`, `SetInteriorHeader`,
-    `SetCollisionHeader` are type aliases); entry storage differs
-    (16-byte `Value` per element vs. 32-byte `Entry` per map
-    key-value pair).
-  - Set public API (`setEmpty`, `setFromElements`, `setConj`,
-    `setDisj`, `setContains`, `setCount`, `setIsEmpty`).
-  - `hashSet`, `equalSet`, `SetIter`, dispatch integration.
-  - Parallel clone helpers: `cloneSetInteriorReplaceChild`,
-    `cloneSetInteriorInsertElement`,
-    `cloneSetInteriorMigrateDataToChild`,
-    `cloneSetInteriorRemoveElement`,
-    `cloneSetInteriorMigrateChildToData`.
-  - Parallel recursive ops: `champSetConjInNode`,
-    `champSetDisjFromNode`, `champSetContains`, collision node
-    versions of each.
-- `test/prop/champ.zig` extended with set properties S1–S9
-  (retirement receipt is S5 — cross-subkind array-set vs. CHAMP).
-- Inline set tests (13 tests parallel to the map ones).
-- `dispatch.zig` updates:
-  - `heapHashBase` set arm (`hamt.hashSet`).
-  - `heapEqual` set arm (`hamt.equalSet`).
-  - `setEqualCategory` helper paralleling `associativeEqual` /
-    `sequentialEqual`.
-  - `equal` switch: fused `.set, .kind_local` arm split — `.set`
-    now has its own arm.
-- Green: 294 → 323 tests (+29). 10 goldens unchanged = 333 gates total.
-
-Each commit shipped with spec coverage, peer-AI review, and property-
-test receipts. Commit 1 retired the associative equality category's
-hidden fault line; commit 2 retires the set category's. All three
-equality categories (`.sequential`, `.associative`, `.set`) now have
-concrete runtime members and property-test retirement receipts.
+- The set side's body types are **type aliases** of the map side's
+  header structs (`ChampSetRootBody = ChampRootBody`,
+  `SetInteriorHeader = ChampInteriorHeader`,
+  `SetCollisionHeader = ChampCollisionHeader`). Bitmap semantics,
+  subkind numbering, promotion, and dissoc rules are identical.
+- Entry storage differs: 16-byte `Value` per set element vs. 32-byte
+  `Entry` per map key-value pair. Every payload-size computation
+  selects the width by kind.
+- The interior-node clone helpers and recursive assoc / dissoc /
+  lookup operations exist in a map version and a set version with
+  the same structure (module-internal; see §14).
+- All three equality categories (`.sequential`, `.associative`,
+  `.set`) have concrete runtime members and property-test coverage
+  of the `(= a b) ⇒ (hash a) = (hash b)` invariant (§12).
 
 ---
 
 ### 12. Testing strategy
 
-#### 12.1 The cross-category invariant tests (retirement receipts)
+#### 12.1 The cross-category invariant tests
 
 The parallel of `test/prop/vector.zig` V3 for associative and set:
 
-**A1 (commit 1).** 500 random entry sequences. For each sequence,
-build a map by random `assoc` order and another by reverse order;
-assert `=` and `hashValue`-equal. Varies sizes across the array-map
-→ CHAMP boundary and well beyond.
+**Build-order independence (M11; inline `hashMap` / `hashSet`
+insertion-order tests).** Random entry sequences built in different
+`assoc` orders must compare `=` and hash equal. Sizes vary across the
+array-map → CHAMP boundary.
 
-**S1 (commit 2).** Same shape for sets. Random element sequences,
-two build orders, `=` and hash equal.
-
-**A2 (commit 1).** Cross-subkind: force one map to stay subkind 0
+**Cross-subkind (M6, S5).** Force one map to stay subkind 0
 (count ≤ 8), force another of the same entries to be subkind 1 via
-promote-then-dissoc. Assert `=` and hash equal.
+promote-then-dissoc. Assert `=` and hash equal. Same for sets.
 
-**S2 (commit 2).** Same for sets.
+#### 12.2 Same-category, different-kind
 
-#### 12.2 Same-category, different-kind (v1-future)
+`.associative` has one member. If another kind joins (a sorted map),
+the equivalent of `test/prop/vector.zig` V3's list↔vector cross-kind
+test slots in via the `associativeEqual` helper.
 
-Today `.associative` has one member. If a future kind joins (sorted
-map in v2+), the equivalent of `test/prop/vector.zig` V3's list↔vector
-cross-kind test slots in naturally via the `associativeEqual`
-cursor-like helper.
+#### 12.3 Structural cliff edges
 
-#### 12.3 Boundary tests
-
-At structural cliff edges:
+The counts at which representation changes, and which boundary
+tests target:
 
 - count 0, 1, 7, 8 (array-map only)
 - count 9 (first promotion; single interior node)
 - count 32, 33 (bitmap boundary within a node)
 - count 1024 (level-2 first promotion; trie depth 2)
-- count 100,000 (realistic deep trie)
-- Hash-collision stress: 10 keys all hashing to the same 32-bit
-  value (use a custom hash-colliding test fixture) forcing collision
-  nodes.
+- Hash-collision stress: keys all hashing to the same 32-bit value
+  (a hash-colliding test fixture: low 32 bits pinned to
+  `0xDEAD_BEEF`) forcing collision nodes.
 
 #### 12.4 Property tests (`test/prop/champ.zig`)
 
-Commit 1 (map):
+Map:
 
 - M1. `mapFromEntries` + `mapGet` round-trip: every inserted (k, v)
-  looks up to exactly `v`; absent keys return null.
+  looks up to exactly `v`; absent keys return `.absent`.
 - M2. `mapAssoc` + `mapDissoc` random sequences on random starting
   maps preserve the entry multiset minus dissoc'd keys.
 - M3. `mapAssoc` replace-value: associng `(k, v1)` then `(k, v2)`
@@ -964,43 +922,48 @@ Commit 1 (map):
 - M10. Collision-bucket stress: synthetic collision fixture builds
   a map with 5+ collision-bucket entries, asserts `mapGet` finds
   each, `mapDissoc` removes each, `=` and hash invariants hold.
+- M11. `=` ⇒ `hashValue`-equal over random map pairs built in two
+  insertion orders.
 
-Commit 2 (set): parallel S1–S9 over set operations.
+Set: S1–S9, parallel over set operations (S5 is the cross-subkind
+array-set vs. CHAMP receipt).
 
 ---
 
-### 13. Deferred, explicitly
+### 13. Outside this module, explicitly
 
 Listed so nothing silently slips the scope boundary.
 
-- **Transients.** Phase 1 separate commit (`src/coll/transient.zig`).
+- **Transients.** `src/coll/transient.zig`, spec `docs/TRANSIENT.md`.
 - **`merge` / `merge-with` / `update` / `select-keys` / `reduce-kv` /
-  `group-by` / etc.** Phase 3 stdlib material; compose over `assoc` /
-  `dissoc` / `get`.
-- **Set operators** (`union` / `intersection` / `difference`). Same.
-- **SIMD-accelerated bitmap operations** (T2.1 per PLAN §19.6). Phase 6.
-- **Branchless small-bitmap lookup** (T2.8). Phase 6.
-- **Zero-copy map nodes from emdb pages.** Phase 6 T2.2.
-- **Cross-kind associative members** (sorted-map or similar). v2+
-  with amendment.
+  `group-by` / etc.** Stdlib material composing over `assoc` /
+  `dissoc` / `get` (`src/stdlib.zig` natives and
+  `src/stdlib/core.nx`).
+- **Set operators** (`union` / `intersection` / `difference`). Not
+  implemented anywhere.
+- **SIMD-accelerated bitmap operations** (T2.1 per PLAN §19.6). Not
+  implemented; `champ.zig` uses scalar popcount.
+- **Branchless small-bitmap lookup** (T2.8). Not implemented.
+- **Zero-copy map nodes from emdb pages** (T2.2). Not implemented.
+- **Cross-kind associative members** (sorted-map or similar). None
+  exist; adding one requires a spec amendment.
 
 ---
 
 ### 14. What CHAMP.md does not cover
 
-- **`champ.zig` implementation details** — lookup table for popcount,
+- **`champ.zig` implementation details** — popcount rank helpers,
   recursive node construction helpers, layout access functions. Those
-  are module-internal and will be documented via inline comments, not
-  here.
-- **Serialization wire format** — lives in `docs/CODEC.md` (Phase 4).
-  Map and set are on the frozen-serializable list (PLAN §23 #25).
-- **Language-surface `seq` API** — PLAN §6.7 / Phase 3. The
-  `MapIter` / `SetIter` types in §8 are the runtime-internal
-  iteration seam; user-facing `(seq m)` / `(keys m)` / `(vals m)`
-  come later.
-- **Print/read round-trip** — the reader already parses `{:a 1}` and
-  `#{1 2}` into Form trees; the Value→textual direction reuses the
-  pretty-printer when the full Value-print story lands.
+  are module-internal and documented via inline comments, not here.
+- **Serialization wire format** — lives in `docs/CODEC.md`. Map and
+  set are on the frozen-serializable list (PLAN §23 #25).
+- **Language-surface `seq` API** — PLAN §6.7. The `MapIter` /
+  `SetIter` types in §8 are the runtime-internal iteration seam;
+  user-facing `(seq m)` / `(keys m)` / `(vals m)` are stdlib natives
+  in `src/stdlib.zig` built on them.
+- **Print/read round-trip** — the reader parses `{:a 1}` and
+  `#{1 2}` into Form trees; the Value→textual direction lives in
+  `src/format.zig` (`formatMap` / `formatSet`).
 - **Metadata** — maps and sets are metadata-attachable per
   SEMANTICS.md §7. The `HeapHeader.meta` slot is the storage; no
   special map/set logic. Metadata never affects equality or hash

@@ -1,6 +1,6 @@
 ; examples/cond.nx — classification via cond + when.
-; Showcases the host macros landed in step #8b: cond, when,
-; and, or, ->, plus the user-facing `let`/`fn`/`loop` renames.
+; Showcases the host macros cond, when, and, or, ->, plus the
+; user-facing `let`/`fn`/`loop` names.
 
 (defn classify [n]
   (cond

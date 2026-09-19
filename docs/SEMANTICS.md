@@ -1,8 +1,8 @@
 ## SEMANTICS.md — Value-Layer Semantics for nexis
 
-**Status**: Phase 0 deliverable. Freezes the numeric corner cases, truthiness,
-equality, hashing, nil-propagation, interning, and print/read contract **before
-any Phase 1 eq/hash/GC code is written**. Derivative from `PLAN.md` §6 and §8.
+Freezes the numeric corner cases, truthiness, equality, hashing,
+nil-propagation, interning, and print/read contract that `value.zig`,
+`eq.zig`, `hash.zig` and `dispatch.zig` implement. Derivative from `PLAN.md` §6 and §8.
 PLAN.md wins on any apparent conflict.
 
 Risk-register entry #13 (PLAN §25) is this document: "Numeric corner cases
@@ -181,7 +181,7 @@ Vars compare by identity (PLAN §13.3).
 Functions, closures, transients: equality is identity-based; serialization
 is disallowed (PLAN §15.10).
 
-Atoms (`atom`, Phase 5 Item 1) compare by identity (pointer-to-AtomBox);
+Atoms (`docs/ATOM.md`) compare by identity (pointer-to-AtomBox);
 the contained value is NEVER consulted during equality or hash. Two
 atoms holding `(= a b)` values are still `(not (= atom-a atom-b))`. This
 matches Clojure and is load-bearing: mutable identity values participating
@@ -196,8 +196,8 @@ The bedrock invariant (PLAN §6.3):
 
 > `(= x y) ⇒ (= (hash x) (hash y))`
 
-Non-negotiable. Phase 1 gate property test #5 exercises this on 100k+
-randomized values.
+Non-negotiable. `test/prop/codec.zig` exercises this on randomized
+values.
 
 #### 3.1 Scope and stability
 
@@ -283,10 +283,9 @@ Choices here are frozen so that §2 equality and §3 hash cannot drift:
     route through the full sequential hash pipeline — that pipeline
     would fold in the `0xF0` sequential domain byte, which is
     irrelevant for a map-internal pair and would waste a `mixKindDomain`
-    call per entry. This clarification (amended 2026-04-19 during the
-    CHAMP spec draft; originally wrote `h += hasheq(list(k, v))` as
-    informal pseudocode that strict-read would double-domain-mix and
-    finalize-with-count-2 per entry).
+    call per entry. (`h += hasheq(list(k, v))` as pseudocode would
+    double-domain-mix and finalize-with-count-2 per entry; the
+    per-entry mix above is the contract.)
 - **Set collections** — unordered combine:
   `h = 0; for each x: h += hasheq(x); finalize h with count`.
 - **`durable-ref`** — xxHash3-32 over `store-id ++ tree-id-bytes ++
@@ -350,7 +349,7 @@ Records are maps to every collection function: `count`, `empty?`,
 - Intern ids are process-local. Serialization always emits textual form
   (PLAN §15.10) and the receiver re-interns.
 - The intern table API is designed to allow future multi-isolate sharing
-  (Phase 7+). v1 assumes single-isolate.
+  (a multi-isolate runtime). v1 assumes single-isolate.
 
 **Hash domain separation.** Keyword and symbol hashes differ by
 `0x9E3779B9`. This prevents `(:foo)` and `(foo)` from collocating in the
@@ -372,14 +371,10 @@ For every value kind, a **pr-style** textual representation exists such that:
 - `string` — yes.
 - `keyword`, `symbol` — yes (textual form; re-interned on read).
 - `list`, `vector`, `map`, `set` — yes, recursively.
-- `byte-vector`, `typed-vector` — yes via tagged-literal surface planned for
-  v1 stdlib but **not** via bare reader syntax. Typed-vectors print as
-  e.g. `#nx/f64v [1.0 2.0]` (exact syntax locked in Phase 4 alongside the
-  codec). Subject to change; currently tracked as an open question in
-  PLAN §24.
-- `durable-ref` — yes, by its identity triple:
-  `#nx/ref [<store-id> <tree-id-keyword> <key-bytes-base64>]`. Subject to
-  change pre-Phase 4.
+- `byte-vector`, `typed-vector` — no. The kinds are reserved with no
+  implementation; `src/format.zig` prints them as `#<value kind=N>`.
+- `durable-ref` — no. It prints as the opaque token
+  `#<durable-ref :<tree> hex:<key-bytes>>`, which does not read back.
 
 #### 6.2 Which kinds do **not** round-trip
 
@@ -397,10 +392,10 @@ For every value kind, a **pr-style** textual representation exists such that:
   `100.0`), switching to exponent form with a one-digit integer part at
   or above `1e7` and below `1e-3` (`1.0E10`, `1.23456785E7`, `1.0E-4`).
   Specials:
-  - `+inf` → `"Infinity"`; reading it back requires `##Inf` (reserved for
-    a reader extension; `docs/CODEC.md` will pin this).
+  - `+inf` → `"Infinity"`; the reader has no `##Inf` literal, so it
+    does not read back (`docs/FORMS.md` §8).
   - `-inf` → `"-Infinity"`; same caveat.
-  - Canonical NaN → `"NaN"`; reading it back is planned as `##NaN`.
+  - Canonical NaN → `"NaN"`; the reader has no `##NaN` literal.
 - `0.0` prints as `"0.0"`, `-0.0` prints as `"-0.0"`. Both read back as
   their respective bit patterns; equality collapses them but identity does
   not.
@@ -453,7 +448,8 @@ and must not be silently decided in implementation:
 - Protocols (PLAN §24.1): out of v1, no surface syntax.
 - Laziness of `map`/`filter`/`reduce` (PLAN §24.2): v1 is eager, returning
   vectors.
-- Record types with fixed fields (PLAN §24.10): use tagged maps in v1.
-- Schema/spec (PLAN §24.5): deferred.
+- Record types: `defrecord` records exist (`docs/PROTOCOLS.md`); their
+  print form is opaque and not reader-roundtrippable.
+- Schema/spec (PLAN §24.5): none.
 
-If you need one of these to complete Phase 0, stop and amend PLAN.md first.
+If you need one of these, stop and amend PLAN.md first.

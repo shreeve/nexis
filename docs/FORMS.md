@@ -1,6 +1,6 @@
 ## FORMS.md — Canonical Form Schema for nexis
 
-**Status**: Phase 0 deliverable. Authoritative contract between the `nexis.grammar`
+Authoritative contract between the `nexis.grammar`
 parser output and the `src/reader.zig` normalizer. **This document is strictly
 derivative from `PLAN.md` Appendix C (§28) and the frozen decisions in §23.** No
 shape or rule in this file invents anything not already committed to in the plan.
@@ -179,8 +179,8 @@ tolerate whitespace churn.
   `syntax-quote`, `unquote`, `unquote-splicing`, `deref`, `with-meta`,
   `#%anon-fn`).
 - Map children render in **source order**. The reader preserves the input
-  order of `(map k1 v1 k2 v2 ...)` as a flat list. A sorted canonical order is
-  deferred until a runtime persistent-map is involved.
+  order of `(map k1 v1 k2 v2 ...)` as a flat list. Forms have no sorted
+  canonical order; runtime persistent maps are unordered.
 - Set children render in **source order** for the same reason. Duplicate
   detection already fired at the reader.
 - `user_meta`, when present, is emitted as a second line after the target
@@ -227,8 +227,8 @@ range that produced it. Policy:
   `#{`, `'`, `` ` ``, `~`, `~@`, `@`, `^`, `#_`, `#(`) to the matching close.
 - **Reader-introduced constructs** (`with-meta`, `syntax-quote`, `quote`,
   `#%anon-fn`) cover the full source extent of their origin sugar.
-- `None` appears only for Forms synthesized by macros; Phase 0 never produces
-  `None`.
+- `None` appears only for Forms synthesized by macros; the reader never
+  produces `None`.
 
 Spans are **not** printed in golden outputs by default. Including them would
 churn goldens on unrelated edits. A future `nexis -s --with-spans` flag may
@@ -262,45 +262,40 @@ change so reviewers see both.
 
 ---
 
-### 8. Phase 0 implementation notes (non-binding)
+### 8. Reader limits (non-binding)
 
-These are **not** language-level commitments — they document the current
-state of the reader and will lift as Phase 1 lands. Readers should treat
-them as implementation quirks, not contract.
+These are **not** language-level commitments — they document the
+reader as it is. Readers should treat them as implementation
+quirks, not contract.
 
 - **Integer range.** `src/reader.zig` stores ints in `i64`. Literals whose
-  magnitude exceeds i64 range are rejected with `:bad-number-literal`; they
-  will be promoted to bignum in Phase 1 and this error path will light up
-  `:bignum-out-of-phase-0-range` instead (the error kind is reserved today).
-- **NaN / ±Inf literal syntax.** The reader does not yet accept a source
-  spelling for NaN or infinity (Clojure uses `##NaN` / `##Inf`; we defer
-  the exact token to Phase 3 with the rest of the reader-extension surface).
-  `SEMANTICS.md` §3.2 pins the runtime semantics; goldens do not exercise
-  these until the reader accepts them.
+  magnitude exceeds i64 range are rejected with `:bad-number-literal`. The
+  compiler further rejects literals outside the i48 fixnum range
+  (`IntegerOutOfFixnumRange`); there is no bignum literal.
+- **NaN / ±Inf literal syntax.** The reader accepts no source spelling for
+  NaN or infinity (Clojure uses `##NaN` / `##Inf`). `SEMANTICS.md` §3.2
+  pins the runtime semantics; float division by zero produces infinity.
 - **String escape re-encoding.** The pretty-printer escapes non-ASCII
   bytes individually rather than re-encoding codepoints, so `"☃"` round-
   trips as `\u{E2}\u{98}\u{83}` in goldens. This is stable and correct for
-  byte-level equality, but a Phase 1 tooling pass will tighten to
-  codepoint-aware output for readability.
+  byte-level equality.
 - **`#%anon-fn` reservation.** The lexer rejects a bare `#` followed by
   anything other than `{`, `(`, or `_` as `err`, so user code cannot write
   a symbol whose text begins with `#%`. The reader exploits this to claim
-  `#%anon-fn` (and any future `#%*` name) as internal. If the lexer is
+  `#%anon-fn` (and every other `#%*` name) as internal. If the lexer is
   ever broadened to admit `#%` prefixes, the reader must add an explicit
   collision check.
 - **Anon-fn placeholder status.** `#(body)` lowers to `(#%anon-fn body)`
   with no transformation of `%`, `%1`, `%2`, `%&` inside the body — those
-  remain ordinary symbols at this stage. The macroexpander (Phase 3) is
-  the owner of positional-arg scanning and `(fn* [...] body)` synthesis.
-  Nested `#(...)` is still rejected by the reader because nesting would
-  ambiguate placeholder scoping once the expansion lands.
+  remain ordinary symbols at the reader. The macroexpander
+  (`docs/MACROEXPAND.md` §9) owns positional-arg scanning and
+  `(fn* [...] body)` synthesis. Nested `#(...)` is rejected by the reader
+  because nesting would ambiguate placeholder scoping.
 - **Duplicate-literal detection for numeric keys.** The reader's
   `formLiteralEq` compares `real`s with naive `==`, meaning `{0.0 x -0.0
-  y}` is flagged as a duplicate but `{##NaN x ##NaN y}` (once the literal
-  syntax arrives) will not be. The runtime's canonical-NaN equality
-  decision (SEMANTICS §2.2) will land in Phase 1 together with the
-  runtime Value layer; the reader's literal-key logic will be revisited
-  then.
+  y}` is flagged as a duplicate. The runtime's canonical-NaN equality
+  (SEMANTICS §2.2) is a Value-layer rule; the reader has no NaN literal
+  to compare.
 
 ### 9. What FORMS.md does not cover (and why)
 

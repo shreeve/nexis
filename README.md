@@ -19,7 +19,7 @@ not a library bolted on top.
 ## Status
 
 Every row below is runnable through `bin/nexis`. `zig build test`
-runs **1282 tests** across 135 build steps (unit, property, golden,
+runs **1307 tests** across 138 build steps (unit, property, golden,
 Nextomic corpora, and the `test/nextomic/*.nx` end-to-end scripts).
 See [`PLAN.md`](PLAN.md) §21 for the phase map and
 [`HANDOFF.md`](HANDOFF.md) for the ranked next-work list.
@@ -58,7 +58,7 @@ zig build quick                    # seconds — language, eval-pipeline and Nex
 zig build nextomic-test            # Nextomic unit, property and corpus tests
 zig build nextomic-nx              # test/nextomic/*.nx through bin/nexis
 zig build examples                 # every examples/*.nx through bin/nexis
-zig build test --summary all       # minutes — everything (1282 tests)
+zig build test --summary all       # minutes — everything (1307 tests)
 zig build parser                   # regenerate src/parser.zig from nexis.grammar
 zig build bench                    # ReleaseFast benchmark suite
 ```
@@ -227,11 +227,11 @@ Stated so nobody rediscovers them:
   docstrings, `:strs`/`:syms` destructuring, `int`/`long`/`double`,
   `ex-info`, `macroexpand`, `read-string`, ...); `HANDOFF.md` §4
   lists them.
-- **Phase 5 as PLAN §21 defines it is open**: no test runner, no
+- **No tooling layer** (PLAN §21, Phase 5): no test runner, no
   `nexis.test`/`nexis.math`/`nexis.pprint`, no `--disasm`, and
   runtime errors carry no source spans (stack traces are not
-  source-mapped). The Clojure-breadth work that shipped under the
-  Phase 5 name is listed in the status table.
+  source-mapped). The Clojure-breadth stdlib is listed in the status
+  table.
 - **`(vec #{...})` and `(vec {...})` raise `:kind-mismatch`**; `vec`
   accepts nil, vectors and lists. Use `(into [] s)`.
 - **Datalog function-position variables** are unsupported: the

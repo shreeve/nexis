@@ -25,7 +25,7 @@ Direct reading of `misc/clojure/src/jvm/clojure/lang/` (the Java core) and `src/
 | `Compiler.java` | 9681 (special-forms + bootstrap) | Tiny primitive set; `*` convention; two-stage macro bootstrap |
 | `core.clj` | 8233 (first 200 lines) | Bootstrap pattern: trivial macros first, redefine later |
 
-Cross-examined with GPT-5.4 (Claude-4.6-sonnet peer via `user-ai` MCP) at every major checkpoint. See conversation `nexis-plan-review` turns 5–7 for full dialogue.
+Cross-examined with a second model at every major checkpoint.
 
 ---
 
@@ -44,7 +44,7 @@ Clojure's compiler knows ~20 primitives. User-facing `let`/`fn`/`loop`/`letfn`/`
 1. Define trivial renaming macros: `(defmacro let [&form &env & decl] (cons 'let* decl))`.
 2. Later, after destructuring helpers exist, **redefine** `let` with the full destructuring-aware version.
 
-**nexis adoption**: exact. See PLAN.md §6.1 (compiler primitives table + user macros table + two-stage bootstrap note), §21 Phase 3 (stdlib/core.nx with the bootstrap sequence).
+**nexis adoption**: exact. See PLAN.md §6.1 (compiler primitives table + user macros table + two-stage bootstrap note), §21 Phase 3 (`src/stdlib/core.nx` with the bootstrap sequence).
 
 #### 1.2 Transient ownership via editable-check
 
@@ -130,7 +130,7 @@ Clojure's reader expands `` `form `` recursively at read time using `GENSYM_ENV`
 
 Clojure has a single global `Var.rev` int that increments on any root change. Simple but coarse — invalidates every inline cache even when only one Var changed.
 
-**nexis adaptation**: per-Var `revision: u32` field. Finer granularity, better for future inline caching. GPT-5.4 confirmed this was already better. PLAN.md §13.3, §23.20.
+**nexis adaptation**: per-Var `revision: u32` field. Finer granularity, better for future inline caching. PLAN.md §13.3, §23.20.
 
 #### 2.8 Per-thread `threadBound` AtomicBoolean → isolate-global dynamic-binding depth
 
@@ -172,7 +172,7 @@ See §2.2 above — CHAMP is better. Clojure hasn't switched because changing th
 
 #### 3.8 RRB — but for a different reason than expected
 
-We *planned* RRB and were worried about complexity. Turns out Clojure doesn't ship RRB at all — plain radix trie is what's in production. We can safely demote RRB to v2+ and are no worse off than Clojure itself. PLAN.md §9.2.
+Clojure doesn't ship RRB at all — plain radix trie is what's in production. nexis uses the same plain trie and is no worse off than Clojure itself. PLAN.md §9.2.
 
 #### 3.9 Protocols, multimethods, STM, agents, core.async, reader conditionals, tagged literals
 
@@ -222,9 +222,9 @@ the long version lives in PLAN §23 frozen decisions and `docs/FORMS.md` §8.
 | Radix integer | `2r101`, `16rFF`, `36rZZ` | none — `0x`, `0b`, decimal only | simpler grammar |
 | Leading `+` on a number | `+42` → integer `42` | `+42` → symbol | no sign-variant tokenization |
 | Ratio | `22/7` → `Ratio` | unsupported | number tower is int+bignum+f64 only (§23 #10) |
-| BigInt suffix | `42N` | unsupported | Phase 1 auto-promotion |
+| BigInt suffix | `42N` | unsupported | no bignum arithmetic or literal (PLAN Amendment Log, doubles) |
 | BigDecimal suffix | `3.14M` | unsupported | no decimal tower (§23 #10) |
-| NaN / ±Inf literal | `##NaN`, `##Inf`, `##-Inf` | unsupported | Phase 3 reader extension |
+| NaN / ±Inf literal | `##NaN`, `##Inf`, `##-Inf` | unsupported | `(/ 1.0 0)` and `(- 0.0 (/ 1.0 0))` produce them; no literal syntax |
 | `##`-dispatch in general | symbolic values | unsupported | as above |
 | **Chars and strings** | | | |
 | Char unicode escape | `\u2603` (exactly 4 hex) | `\u{2603}` (variable, braced) | unified escape language (§23 #26) |
@@ -234,7 +234,7 @@ the long version lives in PLAN §23 frozen decisions and `docs/FORMS.md` §8.
 | String escape set | `\0 \b \f \n \t \r \\ \" \uHHHH` + octal | `\n \t \r \\ \" \u{HEX}` | narrower surface |
 | **Dispatch under `#`** | | | |
 | Var-quote | `#'foo` → `(var foo)` | unsupported — write `(var foo)` | minimal reader |
-| Namespaced map | `#:ns{:a 1}` | unsupported | deferred; use plain map |
+| Namespaced map | `#:ns{:a 1}` | unsupported | use a plain map |
 | Auto-resolved keyword | `::k`, `::ns/k` | unsupported | no current-ns at read time |
 | Reader conditional | `#?(:clj ...)`, `#?@(...)` | unsupported | single target (§4) |
 | Tagged literal | `#inst "..."`, `#uuid ...`, user-ext | unsupported | v1 non-goal (§4) |
@@ -268,15 +268,16 @@ These are the semantic traps a Clojure programmer will hit.
 | `(= 1 1.0)` | `true` | `false`; `(== 1 1.0)` is `true` | PLAN §23 #11; `==` is the cross-type numeric equality (PLAN Amendment Log, number tower) |
 | `(= Double/NaN Double/NaN)` | `false` | `true` (canonical bit pattern) | SEMANTICS §2.2 |
 | Integer overflow | auto-promotes to `BigInteger` | raises the catchable `:arithmetic-overflow`; a literal outside ±2^47 is a compile error (no bignum arithmetic; `HANDOFF.md` §4 item 1) | PLAN §23 #10, Amendment Log (doubles as landed) |
-| `number?` / `integer?` on a bignum | `true` | the value layer has a `bignum` kind (`src/bignum.zig`, SEMANTICS §2.2), but no literal, operation or native produces one at runtime, so the predicates are defined over `fixnum` and `float` only (`vm.isNumber`); they will widen when bignum arithmetic lands | value.zig `Kind.bignum` |
+| `number?` / `integer?` on a bignum | `true` | the value layer has a `bignum` kind (`src/bignum.zig`, SEMANTICS §2.2), but no literal, operation or native produces one at runtime, so the predicates are defined over `fixnum` and `float` only (`vm.isNumber`) | value.zig `Kind.bignum` |
 | `(iterate f x)`, `(repeat x)`, `(repeatedly f)`, `(range)` | infinite lazy seqs | sequences are eager, so each takes an explicit count: `(iterate f x n)`, `(repeat n x)`, `(repeatedly n f)`; `(range)` is an arity error. `(take n (iterate f x))` ported from Clojure fails at the `iterate` arity | PLAN §4 (no lazy seqs) |
 | `(empty record)` | throws `UnsupportedOperationException` | `{}`: a record is a map to every collection function | SEMANTICS §4 |
 | Syntax-quote expansion | at read time, auto-qualifies + auto-gensyms | reader emits marker only; macroexpander qualifies | PLAN §14.2 (see §2.6 above) |
 
 ### 4.4 Explicit omissions (by PLAN §4 non-goals)
 
-These are not "deferred" — they are committed absences for v1. Each has a
-frozen rationale in PLAN §4 / §23.
+These are committed absences for v1. Each has a frozen rationale in
+PLAN §4 / §23; atoms and protocols left this list by PLAN Amendment Log
+entries.
 
 - **Protocols** (`defprotocol`, `extend-type`) — pick a built-in
   polymorphism story first.
@@ -300,7 +301,7 @@ in this list is *"on purpose — see PLAN §4."*
 
 ## Things I didn't study deeply but should track
 
-GPT-5.4 explicitly flagged these as pending design decisions worth studying before Phase 1:
+Design decisions the review flagged as worth studying; each is pinned in `docs/SEMANTICS.md`:
 
 1. **Printing / readability contract** — which values print in a form that reads back to the same value? Metadata printing, unreadable markers for functions/vars/transients, durable-ref printing.
 2. **Collection equality across concrete types** — is `(list 1 2 3) = (vector 1 2 3)`? Clojure says yes for `sequential?` collections; need explicit decision.
@@ -308,7 +309,7 @@ GPT-5.4 explicitly flagged these as pending design decisions worth studying befo
 4. **Exception / error value design** — stack trace representation, cause chaining, catch matching rules.
 5. **Numbers** — deliberately skipped the 4242-line `Numbers.java`. Need to check NaN/−0 handling, overflow promotion rules, equality across fixnum/bignum/f64 boundaries.
 
-These should be pinned down in `docs/SEMANTICS.md` (Phase 0 deliverable) before Phase 1 implementation starts.
+`docs/SEMANTICS.md` pins all five.
 
 ---
 
@@ -318,9 +319,9 @@ These should be pinned down in `docs/SEMANTICS.md` (Phase 0 deliverable) before 
 |---|---|---|
 | §4 non-goals | Changed "seq non-goal" row to a nuanced one, now pointing at §6.6 | seq IS core, just not a straitjacket |
 | §6.1 | Rewrote to separate compiler primitives (`*`-suffixed) from user macros | Mirrors Clojure's architecture exactly |
-| §6.6 | NEW subsection: seq as core abstraction | Corrects earlier "non-goal" overstatement |
+| §6.6 | New subsection: seq as core abstraction | Corrects earlier "non-goal" overstatement |
 | §8.4 | Rewrote interning for keyword/symbol asymmetry | Correcting the earlier "same intern-id" model |
-| §8.7 | NEW subsection: keyword-as-function as v1 feature | Promoted from deferred to language-level commitment |
+| §8.7 | New subsection: keyword-as-function as v1 feature | Promoted to a language-level commitment |
 | §9.2 | Demoted RRB, made plain 32-way the v1 default | Clojure ships plain — so do we |
 | §14.1 | Updated macro signature to `(&form, &env, args...)` | Adds scope-aware expansion capability |
 | §23 | Added frozen decisions #30–35 | Captures the new commitments |
@@ -334,15 +335,13 @@ Reading Clojure's source fundamentally sharpened the PLAN. The biggest wins were
 
 1. **The `*` primitive + macro layering** architecture that keeps the compiler tiny.
 2. **The keyword/symbol asymmetry** — a design insight I would never have guessed from blog posts alone.
-3. **The confirmation that plain persistent vector is enough** — removing my single biggest Phase 1 schedule risk.
+3. **The confirmation that plain persistent vector is enough** — removing the single biggest runtime-core schedule risk.
 4. **The macro `&form` / `&env` convention** — adding capability we'd have missed.
 
-None of these were visible from reading Clojure tutorials or my earlier design conversations. They were visible only in the actual source. This review paid for itself many times over before we write a line of nexis code.
+None of these are visible from Clojure tutorials. They are visible only in the actual source.
 
 **Source citation policy**: all Clojure files are EPL 1.0 licensed. We take architectural ideas, not code. Every implementation is fresh Zig. No direct copy-paste.
 
 ---
-
-*Document version: 1.0 — Produced 2026-04-19 after deep source review.*
 
 *Companion to PLAN.md. For the authoritative commitments, see PLAN.md §23.*

@@ -1,17 +1,13 @@
-## POOL.md — size-class pool allocator (Phase 1 performance lift)
+## POOL.md — size-class pool allocator
 
-**Status**: Phase 1 deliverable. Authoritative contract for
-`src/pool.zig`. Derivative from `docs/PERF.md` §5.12 / §6 #1
-(size-class pool is the highest-leverage available optimization
-before the Phase 2 compiler lands), `docs/HEAP.md` (the consumer
-of this allocator), and peer-AI turn 26 design review.
+Authoritative contract for `src/pool.zig`. Derivative from `docs/PERF.md` §5.12 / §6 #1
+(the size-class pool is the largest allocator-side lift) and
+`docs/HEAP.md` (the consumer of this allocator).
 
-This commit replaces `std.heap.page_allocator` with a fast
-size-class pool as the default backing allocator for `Heap`.
-Projected impact per PERF.md §4.3: **map assoc at N=4096 drops
-from ~200 ns/op to ~60 ns/op (~3.3× lift)**; proportional wins on
-every alloc-heavy benchmark. Measured A/B vs
-`bench/baseline.json` from commit `7e5bb1a`.
+The pool is the default backing allocator for `Heap`, replacing
+`std.heap.page_allocator`. Measured A/B against the `std` allocator
+(PERF.md §4.3): list cons 3.94×, vector conj 2.59×, map assoc
+1.80×, set conj 1.84× at N=4096.
 
 ---
 
@@ -33,16 +29,16 @@ every alloc-heavy benchmark. Measured A/B vs
 - Bench suite numbers recorded to `bench/baseline-pool.json`.
 - PERF.md §3 scorecard updated with measured pool numbers.
 
-**Out (explicitly deferred):**
+**Absent:**
 - Empty-slab reclamation to backing. Slabs are retained until
   `pool.deinit()`. See §7 for framing.
 - Multi-threaded allocation. nexis is single-isolate per
   PLAN §16.1; no locking needed.
-- Cache-line-aware placement / per-CPU pools. Phase 7+.
-- Huge-page slab backing (`MADV_HUGEPAGE`). Phase 7+.
+- Cache-line-aware placement / per-CPU pools.
+- Huge-page slab backing (`MADV_HUGEPAGE`).
 - Per-kind specialization (e.g., a dedicated pool for map
-  nodes with a hot path skipping the class lookup). Phase 6.
-- Memory-pressure heuristics / slab trimming. Phase 7+.
+  nodes with a hot path skipping the class lookup).
+- Memory-pressure heuristics / slab trimming.
 
 ---
 
@@ -222,7 +218,7 @@ of fast-path allocs.
 
 ### 6. Allocator vtable — `resize` / `remap`
 
-Peer-AI turn 26 flagged these as load-bearing for correctness.
+These are load-bearing for correctness.
 
 #### 6.1 Resize
 
@@ -286,7 +282,7 @@ resident.
 ArrayList and frees each slab via `backing.free`. This is the
 only point where memory returns to the OS / backing.
 
-**Consequence** (peer-AI turn 26):
+**Consequence**:
 
 > Once `pool.deinit()` is called, every outstanding block from
 > this pool is invalidated regardless of whether the Heap has
@@ -299,7 +295,7 @@ only point where memory returns to the OS / backing.
 
 ### 8. Memory retention (v1 framing)
 
-Per peer-AI turn 26: **not a leak; deliberate retained capacity.**
+**Not a leak; deliberate retained capacity.**
 
 - Empty slabs are not returned to backing in v1.
 - Memory footprint may stay above post-GC live size until
@@ -325,7 +321,7 @@ doesn't explicitly request `std.heap.page_allocator`**. The
 `bench/main.zig` driver adds `--allocator {pool|page}` so A/B
 comparisons can run on demand.
 
-Tests currently using `std.testing.allocator` (leak-detecting)
+Tests using `std.testing.allocator` (leak-detecting)
 continue to use it directly — we don't route tests through the
 pool because leak detection must see the individual `alloc`/`free`
 calls. The pool is a middle-tier optimization; leak detection
@@ -392,9 +388,3 @@ plugs into `Heap.init` via `std.mem.Allocator`.
 
 ---
 
-### 13. Amendment note
-
-New doc in the same commit that lands `src/pool.zig`. No existing
-doc is replaced. `docs/HEAP.md` gets a short cross-reference note.
-`docs/PERF.md` §5.12 status tag moves from `acknowledged weakness`
-to `measured (post-lift)` once the bench numbers are in the tree.

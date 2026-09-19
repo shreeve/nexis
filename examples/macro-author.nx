@@ -1,19 +1,18 @@
-; examples/macro-author.nx — what a user macro will look like
-; when `defmacro` lands in Phase 3.
+; examples/macro-author.nx — syntax-quote as the macro author's
+; tool, without the `defmacro` sugar (see defmacro.nx for that).
 ;
-; Step #8c.3 closed the last piece: syntax-quote of vectors.
-; The macroexpander can now synthesize the full Lisp shape
-; library: `let*` bindings (vector), `fn*` params (vector),
-; `loop*` bindings (vector), `cond` clauses (list of pairs).
+; Syntax-quote covers vectors as well as lists, so the
+; macroexpander can synthesize the full Lisp shape library:
+; `let*` bindings (vector), `fn*` params (vector), `loop*`
+; bindings (vector), `cond` clauses (list of pairs).
 ;
-; Today, host macros use direct FormBuilder. After #8d (Phase
-; 3), users will write:
+; Host macros are built with FormBuilder directly; a user writes
 ;
 ;   (defmacro unless [test & body]
 ;     \`(if ~test nil (do ~@body)))
 ;
-; The runtime expansion is already proved out here — just
-; without the (defmacro ...) sugar:
+; The expansion below is the same mechanism without the
+; (defmacro ...) wrapper:
 
 (let [name (quote my-binding) value 99]
   ; Construct (let* [my-binding 99] my-binding) — a fully

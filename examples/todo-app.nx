@@ -1,17 +1,17 @@
 ; examples/todo-app.nx
 ;
 ; ============================================================
-; Phase 4 EXIT DEMO: persistent to-do tracker.
+; DEMO: persistent to-do tracker.
 ; ============================================================
 ;
-; Per PLAN.md §21 Phase 4 EXIT CRITERION: "a small application
-; (e.g. a to-do tracker with persistent state) works end-to-end."
+; A small application with persistent state, end-to-end (the
+; PLAN.md §21 Phase 4 exit criterion).
 ;
 ; Run it twice:
 ;   $ ./bin/nexis run examples/todo-app.nx
 ;   $ ./bin/nexis run examples/todo-app.nx   # state PERSISTS
 ;
-; Demonstrates the full Phase 4 surface:
+; Demonstrates the durable-state surface:
 ;   - db/open + db/close (Connection lifecycle)
 ;   - db/ref + qualified namespace addressing
 ;   - (with-tx [tx conn] ...) atomic multi-write
@@ -23,12 +23,9 @@
 ;   - @deref ephemeral read
 ;   - exception-driven rollback (try / throw inside with-tx)
 ;
-; v1 NOTE on keys: db/ref accepts keyword/symbol keys.
-; Runtime keyword construction isn't in v1 yet, so this demo
-; uses a fixed set of pre-defined keyword keys for clarity.
-; Real apps with dynamic ids can use the first-class string
-; keys that landed in Phase 5.2a (db/ref + db/open both accept
-; string paths/keys now).
+; Keys: db/ref accepts keyword, symbol or string keys. This demo
+; uses a fixed set of keyword keys for clarity; apps with dynamic
+; ids use string keys (or `(keyword s)`).
 
 ; tmp/ is gitignored; running this demo from the repo root
 ; lands data files out of the way.

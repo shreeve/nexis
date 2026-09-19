@@ -1,18 +1,17 @@
-; examples/durable-refs.nx — Phase 4.0a durable identity demo
+; examples/durable-refs.nx — durable identity demo
 ;
 ; The OTHER big arc: durable identities are first-class language
 ; values, not a library bolted on top. Backed by emdb (LMDB-class
 ; B+ tree, MVCC, zero-copy reads).
 ;
 ; This example uses both APIs:
-;   - v1.alpha auto-ephemeral: db/put-key! / db/get-key
-;   - Phase 4.0b explicit-tx: with-tx + db/put! / db/get
+;   - auto-ephemeral: db/put-key! / db/get-key
+;   - explicit-tx: with-tx + db/put! / db/get
 
-; Open (or create) a connection to a database file. Phase 5.2a
-; first-class strings (and the prior keyword/symbol path overloads)
-; both work; we pick the string form here since it's the canonical
-; Phase 5+ shape. `tmp/` is gitignored, so running this from the
-; repo root keeps data files out of the way.
+; Open (or create) a connection to a database file. db/open accepts
+; a string path (the canonical shape) or a keyword/symbol. `tmp/` is
+; gitignored, so running this from the repo root keeps data files
+; out of the way.
 (def conn (db/open "tmp/app.edb"))
 
 ; Construct a durable ref. Its identity is the triple
@@ -41,7 +40,7 @@
 
 (db/get-key history-key)
 
-; Phase 4.0b: explicit transactions via `with-tx` / `with-read-tx`.
+; Explicit transactions via `with-tx` / `with-read-tx`.
 ; Multi-write atomicity: the body either fully commits OR fully
 ; aborts. An exception inside the body aborts; the read after
 ; sees the pre-tx state.

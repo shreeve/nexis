@@ -1,9 +1,8 @@
 ## BENCH.md — Benchmarking Methodology & Reporting Discipline
 
-**Status**: Phase 1 deliverable (methodology only — no benchmark code yet).
 This document pre-commits to the shape of every performance claim nexis
-will make about itself, especially in comparison to Clojure. Landing
-before any benchmark code or numbers exist is intentional: the
+will make about itself, especially in comparison to Clojure. The
+methodology precedes the numbers by design: the
 commitments here are strongest when they cannot be post-rationalized
 against favorable measurements.
 
@@ -41,7 +40,7 @@ Performance does not have one number. Clojure has three legitimate
 performance regimes (cold JVM start, warmed but short-lived,
 fully-hot JIT'd steady state), and mixing them is the fastest way to
 produce a dishonest chart. nexis has its own regimes (cold-start
-interpreter, warm interpreter loop, future Phase 6 specialized ops).
+VM, warm VM loop; there are no specialized ops).
 
 Every published measurement must be tagged with exactly one category:
 
@@ -110,7 +109,7 @@ published separately with full disclosure.
 ### 5. Clojure-side fairness — conventions we adopt
 
 These are community-standard and omitting them is a credibility
-mistake per peer-AI methodology review (`nexis-phase-1` turn 4):
+mistake:
 
 - **`criterium`** for every microbenchmark. `(require '[criterium.core :refer [quick-bench bench]])`. Non-criterium timing of Clojure microbenchmarks is rejected by default.
 - **`*warn-on-reflection*` is enabled** for every benchmark file and
@@ -145,21 +144,20 @@ mistake per peer-AI methodology review (`nexis-phase-1` turn 4):
 
 The symmetric rules, enforced on our own side:
 
-- **Baseline benchmarks use the v1 interpreter**. Once Phase 6
-  optimizations land (SIMD CHAMP, perfect-hash keywords, operand-
-  specialized ops), those are published as their own rows labeled
-  as optimization-tier measurements, not folded into the baseline.
+- **Baseline benchmarks use the unspecialized VM**. Optimizations
+  (SIMD CHAMP, perfect-hash keywords, operand-specialized ops), if
+  any exist, are published as their own rows labeled as
+  optimization-tier measurements, not folded into the baseline.
 - **Idiomatic nexis code**, not hand-unrolled core-primitives
-  invocation. When stdlib macros like `defn`, `->>`, `reduce`
-  land, they are used in the benchmark code the same way a nexis
-  user would use them.
+  invocation. Stdlib forms like `defn`, `->>`, `reduce` are used
+  in benchmark code the same way a nexis user would use them.
 - **No disabled safety paths for benchmark runs.** Everything runs
   with the same runtime safety settings a user would run. If a
   "release-unsafe" variant is published, it's its own row and
   labeled.
-- **Bytecode vs JIT disclosure.** Phase 6 Tier 2 work includes
-  opcode specialization but not a real JIT; Phase 7+ Tier 3 may add
-  copy-and-patch. Claims like "faster than Clojure's JIT steady-
+- **Bytecode vs JIT disclosure.** nexis has a bytecode VM with no
+  opcode specialization and no JIT (PLAN §19.6 Tier 2 names
+  specialization; Tier 3 names copy-and-patch; neither exists). Claims like "faster than Clojure's JIT steady-
   state" are labeled explicitly — nexis's advantages come from
   architecture (tagged values, CHAMP, xxHash3), not from execution
   strategy. Readers shouldn't have to infer that.
@@ -197,8 +195,7 @@ credibility engineering, not altruism. A report that claims universal
 victory is trusted by nobody who has shipped a language before. A
 report that says "nexis dominates cold start and script-style
 workloads; competitive-to-faster on collection work; Clojure's JIT
-wins on long-running hot numeric inner loops until Phase 6 Tier 2
-opcode specialization lands" is believable because it admits the
+wins on long-running hot numeric inner loops" is believable because it admits the
 obvious.
 
 Concretely:
@@ -239,12 +236,13 @@ Before any comparative benchmark report is published:
 
 ### 10. What this doc does not cover
 
-- **Specific benchmark content.** `test/bench/` populates as Phase 6
-  lands; each benchmark gets its own `README.md` per §7. This doc
-  is methodology, not suite design.
+- **Specific benchmark content.** The suite is `src/bench.zig` +
+  `bench/main.zig` (`docs/PERF.md` §3); each published report gets
+  its own `README.md` per §7. This doc is methodology, not suite
+  design.
 - **Benchmark-driven performance tuning.** PLAN §19 defines the
-  Tier 1/2/3 wins with projected magnitudes; Phase 6 is where they
-  get measured and published. This doc is the publication contract,
+  Tier 1/2/3 wins with projected magnitudes; `docs/PERF.md` is
+  where measurements are published. This doc is the publication contract,
   not the implementation plan.
 - **Marketing copy.** Headline positioning (PLAN §19.7) is allowed
   to be aspirational; the comparative benchmark report is where

@@ -1,13 +1,13 @@
-## VALUE.md — Runtime Value Layer (Phase 1)
+## VALUE.md — Runtime Value Layer
 
-**Status**: Phase 1 deliverable. Authoritative physical-layout contract for
+Authoritative physical-layout contract for
 the runtime `Value` type and the heap-object header that backs non-immediate
 kinds. Derivative from `PLAN.md` §8 and §23; PLAN.md wins on conflict.
 
 Risk-register entries #1 (three-representations boundary) and #3 (eq/hash
 inconsistency) are the two this document is built to prevent. Every
 physical-bit decision here is frozen; changing one requires a PLAN
-amendment and a re-run of the Phase 1 gate tests (PLAN §20.2).
+amendment and a re-run of the PLAN §20.2 property tests.
 
 ---
 
@@ -63,8 +63,8 @@ Reviewable in v3+ if profile data shows the indirection hurting.
 ### 2. Kind discriminator
 
 Canonical `kind: u8` values. Numeric assignments are frozen so that the
-runtime switch dispatcher can use them as jump-table indices in Phase 2
-and beyond without any re-mapping layer.
+runtime switch dispatcher can use them as jump-table indices without
+any re-mapping layer.
 
 #### 2.1 Immediates (payload lives in the `Value` itself)
 
@@ -109,7 +109,7 @@ Payload = `u64` pointer to a heap object with a standard `HeapHeader`
 
 | # | `kind` | Name | subkind uses |
 |---|---|---|---|
-| 16 | `string` | UTF-8 string | 0 = inline short string (≤ 15 bytes, bytes live in payload + aux); 1 = heap string; 2 = zero-copy slice over mmap page (Phase 6 T2.2) |
+| 16 | `string` | UTF-8 string | 1 = heap string (the only implemented subkind); 0 = inline short string and 2 = zero-copy slice over mmap page are reserved with no implementation (`docs/STRING.md`) |
 | 17 | `bignum` | arbitrary-precision integer | 0 = limbs stored in heap object |
 | 18 | `persistent_map` | CHAMP map | 0 = array-map (inline ≤8 entries, user-facing); 1 = CHAMP root (user-facing); 2 = CHAMP interior node (internal, never escapes as a user Value); 3 = collision node (internal) |
 | 19 | `persistent_set` | CHAMP set | Parallel subkind numbering to map: 0 = array-set; 1 = CHAMP root; 2 = CHAMP interior; 3 = collision. Pinned in `docs/CHAMP.md` §3. |
@@ -117,21 +117,26 @@ Payload = `u64` pointer to a heap object with a standard `HeapHeader`
 | 21 | `list` | cons list | 0 = normal cons; 1 = empty singleton |
 | 22 | `byte_vector` | packed u8 slice | |
 | 23 | `typed_vector` | homogeneous numeric slice | 0 = i32, 1 = i64, 2 = f32, 3 = f64 |
-| 24 | `function` | compiled routine + upvalues | 0 = fn, 1 = closure, 2 = macro-valued var callee |
+| 24 | `function` | closure (routine + upvalues) | Payload is a raw `*Closure` allocated from the VM's runtime arena, not a `HeapHeader` block (`docs/VM.md` §6) |
 | 25 | `var_` | namespace var cell | |
 | 26 | `durable_ref` | emdb identity triple | |
-| 27 | `transient` | mutable wrapper | 0 = transient map, 1 = transient set, 2 = transient vector (local enum, pinned in `docs/TRANSIENT.md` §2; peer-AI turn 17 flagged the original "mirrors inner collection kind" phrasing as pulling external kind numbering into the transient namespace) |
+| 27 | `transient` | mutable wrapper | 0 = transient map, 1 = transient set, 2 = transient vector (local enum, pinned in `docs/TRANSIENT.md` §2; the subkind classifies within the kind and does not mirror the inner collection's kind byte) |
 | 28 | `error_` | exception value | |
 | 29 | `meta_symbol` | metadata-bearing symbol wrapper | wraps base-symbol id + meta map (PLAN §8.4) |
-| 30 | `native_fn` | host-Zig function exposed as a first-class Value | Payload is `*const NativeFn` (static descriptor). Phase 3.3a, peer-AI turn 67. |
-| 31 | `db_connection` | emdb connection handle | Payload is `*db.Connection` owned by the VM. Phase 4.0a, peer-AI turn 72. |
-| 32 | `db_write_txn` | write transaction handle | Single-owner; invalidated on commit/abort. Phase 4.0b. |
-| 33 | `db_read_txn` | read transaction handle | Phase 4.0b. |
-| 34 | `atom` | in-memory mutable cell | Payload is `*HeapHeader → AtomBox { value, in_flight, _pad }`. Identity equality + identity hash; GC traces contained value; codec rejects as `:unserializable`. Phase 5 Item 1, peer-AI turn 75. See `docs/ATOM.md`. |
+| 30 | `native_fn` | host-Zig function exposed as a first-class Value | Payload is `*const NativeFn` (static descriptor). |
+| 31 | `db_connection` | emdb connection handle | Payload is `*db.Connection` owned by the VM. |
+| 32 | `db_write_txn` | write transaction handle | Single-owner; invalidated on commit/abort. |
+| 33 | `db_read_txn` | read transaction handle | |
+| 34 | `atom` | in-memory mutable cell | Payload is `*HeapHeader → AtomBox { value, in_flight, _pad }`. Identity equality + identity hash; GC traces contained value; codec rejects as `:unserializable`. `docs/ATOM.md`. |
+| 35 | `record` | `defrecord` instance | Field map + type id; structural equality + hash (`docs/PROTOCOLS.md` §2) |
+| 36 | `protocol` | protocol object | Opaque identity (`docs/PROTOCOLS.md`) |
+| 37 | `protocol_fn` | protocol method fn | Opaque identity; dispatches on the receiver's kind or record type in `call:call` |
+| 38 | `nextomic_conn` | Nextomic connection handle | VM-owned pointer (`docs/NEXTOMIC.md` §6) |
+| 39 | `nextomic_db` | Nextomic db-value | VM-owned pointer plus inline basis data (`docs/NEXTOMIC.md` §4) |
 
-Values 8–15 are **reserved** for future immediate kinds (e.g. a second
-fixnum flavor, or a tagged inline byte burst). Values 35–63 are
-**reserved** for future heap kinds. Values 64+ are **reserved** for
+Values 8–15 are **reserved** for immediate kinds (e.g. a second
+fixnum flavor, or a tagged inline byte burst). Values 40–63 are
+**reserved** for heap kinds. Values 64+ are **reserved** for
 runtime-private use (internal sentinels that must never escape a public
 API).
 
@@ -217,7 +222,7 @@ The `mark: u8` field uses two bits in v1:
 | 1 | `pinned` | Do not free; live root |
 | 2..7 | reserved | Future generational / tri-color / remembered-set use |
 
-Phase 1 GC is precise stop-the-world mark-sweep (PLAN §23 #2, #18).
+The collector is precise stop-the-world mark-sweep (PLAN §23 #2, #18; `docs/GC.md`).
 `marked` is cleared by sweep; `pinned` is set by open transactions /
 durable-ref handles / REPL history / intern tables (PLAN §10.5).
 
@@ -232,8 +237,8 @@ The Value layer must satisfy, for every `x` and `y`:
 (= x y)          ⇒ (hash x) = (hash y)
 ```
 
-No exception. Phase 1 gate test #1 (PLAN §20.2) checks this across 100k+
-randomized pairs drawn from every kind. Implementation obligations:
+No exception. The PLAN §20.2 equality/hash property tests check this
+across randomized pairs drawn from every kind. Implementation obligations:
 
 - `identical?` is bit-equality on the 16-byte struct for immediates; for
   heap kinds, pointer identity on the `HeapHeader*` (the same header
@@ -250,13 +255,11 @@ randomized pairs drawn from every kind. Implementation obligations:
 
 - **Memory layout of specific heap kinds** (string body, HAMT node,
   RRB trie) — lives in the per-module docs (`docs/COLL.md` pending).
-- **Serialization wire format** — lives in `docs/CODEC.md` (frozen
-  Phase 4).
+- **Serialization wire format** — lives in `docs/CODEC.md`.
 - **GC roots and sweep algorithm** — lives in PLAN §10; detailed
   procedure will land in `docs/GC.md` when sweep ships.
 - **Durable-ref identity triple** — lives in PLAN §15.2 and
   `docs/DB.md` (future).
 
-If you need one of these to proceed with a Phase 1 module, stop and draft
-the companion doc first. The Phase 0 lesson: spec-first, even when the
-code shape seems obvious.
+If you need one of these to proceed, stop and draft the companion doc
+first: spec-first, even when the code shape seems obvious.

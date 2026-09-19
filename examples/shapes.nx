@@ -1,12 +1,11 @@
 ; examples/shapes.nx
 ;
 ; ============================================================
-; Phase 5 EXIT DEMO: shapes + areas via protocols + records.
+; DEMO: shapes + areas via protocols + records.
 ; ============================================================
 ;
-; Per PLAN.md §21 Phase 5 EXIT CRITERION + HANDOFF.md §10.8:
-; demonstrate the full Item 3 (protocols + records) surface
-; end-to-end via a non-trivial program. This file is a
+; Demonstrates the protocols + records surface end-to-end via a
+; non-trivial program. This file is a
 ; near-line-for-line port of the canonical Clojure example.
 ;
 ; Run:
@@ -14,21 +13,20 @@
 ;
 ; Demonstrates:
 ;   - defprotocol with multiple methods
-;   - defrecord with inline protocol clauses (5.3a / 5.3c)
-;   - extend-type over a record defined elsewhere (5.3d)
+;   - defrecord with inline protocol clauses
+;   - extend-type over a record defined elsewhere
 ;   - extend-protocol over a built-in kind (`:fixnum` / `:string`)
 ;   - extend-protocol with `:any` default fallback
 ;   - satisfies? predicate
 ;   - structural record equality (records-as-map-keys)
-;   - cross-phase integration: atoms (5.1) + str (5.2) +
-;     case (5.4) all working alongside the new constructs.
+;   - atoms + str + case working alongside protocols and records.
 
 (defprotocol Shape
   (area [s])
   (describe [s]))
 
 ; -------------------------------------------------------------
-; Records with inline protocol impls (5.3c)
+; Records with inline protocol impls
 ; -------------------------------------------------------------
 
 (defrecord Circle [radius]
@@ -94,7 +92,7 @@
    "hi"                 :greeting})
 
 ; -------------------------------------------------------------
-; Atoms (Phase 5.1) for stateful tracking + case (Phase 5.4)
+; Atoms for stateful tracking + case
 ; -------------------------------------------------------------
 
 (def total-area (atom 0))
@@ -111,7 +109,7 @@
 ; Drive the dispatch surface
 ; -------------------------------------------------------------
 
-(println "=== Phase 5 EXIT demo: shapes + areas ===")
+(println "=== shapes + areas demo ===")
 (println "")
 
 (def shapes
@@ -127,7 +125,7 @@
   (println "  " (report s)))
 
 (println "")
-(println "Aggregate state (Phase 5.1 atom):")
+(println "Aggregate state (atom):")
 (println "  total area =" (deref total-area))
 
 (println "")

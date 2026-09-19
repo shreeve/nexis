@@ -1,6 +1,6 @@
-## INTERN.md — Keyword & Symbol Intern Tables (Phase 1)
+## INTERN.md — Keyword & Symbol Intern Tables
 
-**Status**: Phase 1 deliverable. Authoritative contract for the process-local
+Authoritative contract for the process-local
 keyword and symbol intern tables that back `Value.fromKeywordId` /
 `Value.fromSymbolId`. Derivative from `PLAN.md` §8.4, §10.5, §15.10 and
 `docs/SEMANTICS.md` §5. PLAN.md wins on conflict.
@@ -49,7 +49,7 @@ Non-negotiable invariants:
    v2 when a concrete workload demands it.
 7. **Empty names are rejected** at the intern layer. The reader already
    won't produce them, but the intern API is also reachable from codec
-   decode (future Phase 4) and direct runtime construction, so the
+   decode and direct runtime construction, so the
    rejection is pinned here rather than delegated upstream.
 8. **ID-space bound.** An intern call that would make the table exceed
    `maxInt(u32)` entries returns `error.InternTableFull`. In practice
@@ -86,8 +86,8 @@ pub const Interner = struct {
 
     // GC-root tracing seam. v1 implementation is a no-op — name bytes
     // are not heap objects in the `HeapHeader` sense. Exists so the
-    // GC wiring in Phase 1 can list the interner as a root without a
-    // later struct refactor (PLAN §10.5).
+    // a root enumeration can list the interner without a struct
+    // refactor (PLAN §10.5).
     pub fn trace(self: *Interner, visitor: anytype) void;
 };
 ```
@@ -96,7 +96,7 @@ pub const Interner = struct {
 variants return a union of:
 
 - `error.OutOfMemory` — allocator rejected the name dup or map growth
-- `error.EmptyName` — input was a zero-length slice
+- `error.EmptyName` — the input is a zero-length slice
 - `error.InternTableFull` — would exceed `maxInt(u32)` entries
 
 These errors are surfaced; callers decide whether to map them to
@@ -195,8 +195,8 @@ key stays valid for the interner's lifetime. This is exercised by the
 Two hash-map probes occur on the insert path (one `get`, one `put`);
 on the hit path only one. A single-probe `getOrPut` refactor that
 also carries the caller's transient slice into the new-entry branch
-and then overwrites the key pointer with `dup` is deliberately
-deferred — the intern table is cold outside startup, and the simpler
+and then overwrites the key pointer with `dup` is not done — the
+intern table is cold outside startup, and the simpler
 code is easier to audit for errdefer correctness.
 
 `deinit` frees every duped name, then clears both containers, after
@@ -215,7 +215,7 @@ silently leaking.
   keyword/symbol disjointness via `Kind` byte and `mixKindDomain`. The
   interner is not consulted by `hashValue` or `equal` — hashing an id
   is independent of whether the id is in the table.
-- **Codec (Phase 4).** Serialization always emits textual form
+- **Codec.** Serialization always emits textual form
   (PLAN §15.10 / SEMANTICS §5). Deserialization calls `internKeyword` /
   `internSymbol` on the receiving end. Ids are **never** serialized;
   they are process-local.
@@ -234,10 +234,11 @@ silently leaking.
 - **Metadata-bearing symbols** — the heap `meta_symbol` kind. Future
   `heap.zig` / `docs/META-SYMBOL.md`.
 - **String interning.** Strings are not interned by default (PLAN §8.4).
-  An explicit `(intern s)` operation on strings may arrive in Phase 5;
-  if so, it would live in the string module, not here.
+  There is no `(intern s)` operation on strings; one would live in
+  the string module, not here.
 - **Namespace objects** (the Clojure-style `Namespace` bearing Vars).
-  Those are a Phase 3 concern (`src/namespace.zig`). The interner stores
+  Those live in `src/vm.zig` (`Namespace`, `NamespaceRegistry`). The
+  interner stores
   the *textual* `"ns/local"` form only.
 - **Multi-isolate sharing.** v1 is single-isolate; each isolate has its
   own `Interner`. Cross-isolate intern sharing is a v2+ research

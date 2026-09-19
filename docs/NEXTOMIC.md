@@ -9,7 +9,7 @@ introduction to Datomic and Nextomic is §1 of that file.
 
 Nextomic requires **zero changes to emdb**. Every engine capability used
 below is a public function or a committed invariant of emdb as it stands
-(§11 lists the two places a wish was noted and the workaround chosen).
+(§11 lists the two engine capabilities Nextomic works around).
 
 ---
 

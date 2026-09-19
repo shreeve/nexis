@@ -3,8 +3,6 @@
 ; Demonstrates the macro author's primary tool. The runtime
 ; constructs lists, splices in computed lists, and auto-gensyms
 ; hygenic names — all without any stdlib.
-;
-; Step #8c.2.
 
 (def parts (quote (b c d)))
 
