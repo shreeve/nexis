@@ -2434,7 +2434,7 @@ fn buildArityThen(
         // params[fixed] is `&`; params[fixed+1] is the rest binding.
         if (fixed + 1 >= params.len) return ExpandError.MalformedMacroCall;
         const rest_pat = params[fixed + 1];
-        const rest_expr = try restSourceFor(ctx, rest_pat, try buildNestedRest(ctx, args_sym, fixed, origin), origin);
+        const rest_expr = try restSourceFor(ctx, rest_pat, try buildNestedRest(ctx, args_sym, fixed, .rest, origin), origin);
         try bindings.append(ctx.allocator, @constCast(rest_pat));
         try bindings.append(ctx.allocator, rest_expr);
     }
@@ -2486,8 +2486,9 @@ fn destructurePair(
 /// Destructure a vector pattern over a source expression that's
 /// already bound to `src` (a symbol form).
 ///
-/// Pattern elements: symbols bind to (nth src i nil); `&` rest
-/// binds to repeated rest; `:as name` binds name to src.
+/// Pattern elements: symbols bind to (nth src i nil); `& r` binds
+/// `r` to `next` applied once per preceding element, so an
+/// exhausted rest is nil; `:as name` binds name to src.
 fn destructureVector(
     ctx: *ExpandContext,
     elems: []const *Form,
@@ -2512,9 +2513,9 @@ fn destructureVector(
         if (e.datum == .symbol and e.datum.symbol.ns == null and std.mem.eql(u8, e.datum.symbol.name, "&")) {
             if (i + 1 >= elems.len) return ExpandError.MalformedMacroCall;
             const rest_pat = elems[i + 1];
-            // Build expression: (rest (rest ... (rest src) ...))
-            // applied `i` times to skip the first `i` elements.
-            const rest_expr = try restSourceFor(ctx, rest_pat, try buildNestedRest(ctx, src, i, origin), origin);
+            // `(next (next ... src))` applied `i` times skips the
+            // first `i` elements.
+            const rest_expr = try restSourceFor(ctx, rest_pat, try buildNestedRest(ctx, src, i, .next, origin), origin);
             try destructurePair(ctx, rest_pat, rest_expr, out, origin);
             i += 1;
             continue;
@@ -2681,13 +2682,19 @@ fn buildNthCall(ctx: *ExpandContext, src: *Form, idx: usize, origin: reader_mod.
     return try makeList(ctx, items, origin);
 }
 
-/// Build `(rest (rest ... (rest src) ...))` applied `n` times.
-fn buildNestedRest(ctx: *ExpandContext, src: *Form, n: usize, origin: reader_mod.SrcSpan) ExpandError!*Form {
+/// How a rest binding drops the elements before it: `next` yields
+/// nil once the source is exhausted (a vector pattern's `& r`,
+/// Clojure's `nthnext`); `rest` yields the empty list (an overload
+/// clause's rest over the list the VM packs, `VM.md` §6).
+const RestOp = enum { rest, next };
+
+/// `(op (op ... (op src) ...))` applied `n` times.
+fn buildNestedRest(ctx: *ExpandContext, src: *Form, n: usize, op: RestOp, origin: reader_mod.SrcSpan) ExpandError!*Form {
     var expr: *Form = src;
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const items = try ctx.allocator.alloc(*Form, 2);
-        items[0] = try coreSym(ctx, "rest", origin);
+        items[0] = try coreSym(ctx, @tagName(op), origin);
         items[1] = expr;
         expr = try makeList(ctx, items, origin);
     }
