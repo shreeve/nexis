@@ -87,15 +87,21 @@ fn keywordFor(err: anyerror) ?[]const u8 {
 }
 
 /// Surface `err` to the program with what `diag` knows: the reason of
-/// a syntax error, the attribute of an unknown one.
+/// a syntax error or of malformed input, the attribute of an unknown one.
 fn fail(vm: *VM, err: anyerror, diag: *const Diag) VmError {
     if (err == error.QuerySyntax) return throwSyntax(vm, diag.message, diag.clause);
     if (err == error.UnknownAttribute) return natives.failWith(vm, err, .{ .attr = diag.attr });
+    if (err == error.TxData) return natives.failWith(vm, err, .{ .message = messageOf(diag), .attr = diag.attr });
     if (keywordFor(err)) |name| return vm.throwKeyword(name);
     inline for (@typeInfo(VmError).error_set.?) |e| {
         if (err == @field(anyerror, e.name)) return @field(VmError, e.name);
     }
     unreachable;
+}
+
+/// The message `diag` carries, when it carries one.
+fn messageOf(diag: *const Diag) ?[]const u8 {
+    return if (diag.message.len == 0) null else diag.message;
 }
 
 /// Throw the `:nextomic/query-syntax` map.

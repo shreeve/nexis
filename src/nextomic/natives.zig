@@ -583,6 +583,7 @@ fn pullManyNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
 fn failPull(vm: *VM, err: anyerror, diag: *const Diag) VmError {
     if (err == error.PullSyntax) return throwSyntax(vm, "nextomic/pull-syntax", diag.message, diag.clause);
     if (err == error.UnknownAttribute) return failWith(vm, err, .{ .attr = diag.attr });
+    if (err == error.TxData) return failWith(vm, err, .{ .message = if (diag.message.len == 0) null else diag.message, .attr = diag.attr });
     return fail(vm, err);
 }
 
