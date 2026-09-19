@@ -219,7 +219,7 @@ Stated so nobody rediscovers them:
   unresolved symbol.
 - **Several Clojure core forms and functions are absent** (`case`
   with evaluated keys, finally-only `try`, multi-arity `fn`, `defn`
-  docstrings, `:strs`/`:syms` destructuring, `int`/`long`/`double`,
+  docstrings, `:strs`/`:syms` destructuring, `int`,
   `ex-info`, `macroexpand`, `read-string`, ...); `HANDOFF.md` §4
   lists them.
 - **Phase 5 as PLAN §21 defines it is open**: no test runner, no
