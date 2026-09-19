@@ -659,6 +659,18 @@ Macro semantics (peer-AI turn 56 §2.G-J):
   terminal is the trailing odd form when present, otherwise
   `(throw {:error :no-matching-clause :message "No matching
   clause: <expr>" :value expr})`; `condp` throws the same map.
+- `try`: `(try body* (catch M b h*)* (finally f*)?)` → the
+  primitive `(try body* (catch any g <chain>) (finally f*)?)`
+  where the chain tries the clauses in order, `(if
+  (nexis.internal/#%catch-matches? g M) (let* [b g] h*) ...)`, an
+  `any` matcher needing no test, and ends in `(throw g)` so a
+  value no clause takes unwinds through the `finally` to the
+  enclosing `try`. A matcher is `any` or a keyword `:tag`, which
+  takes a thrown value equal to `:tag` or a map whose `:error`
+  entry is `:tag` (the shape of Nextomic's error maps and of the
+  `case` no-match map); anything else is `MacroExpansionFailure`.
+  No clause at all is a finally-only `try`; neither catch nor
+  finally makes the form `(do body*)`.
 - `->` (thread-first):
   ```clojure
   (-> x)            => x

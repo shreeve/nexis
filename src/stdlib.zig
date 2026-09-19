@@ -172,6 +172,8 @@ const internal_fns = [_]CoreEntry{
     // extend-protocol / extend-type / satisfies?.
     .{ .name = "#%extend-builtin-impl", .descriptor = &native_extend_builtin_impl },
     .{ .name = "#%extend-default-impl", .descriptor = &native_extend_default_impl },
+    // try: the keyword-matcher test the expander emits.
+    .{ .name = "#%catch-matches?", .descriptor = &native_catch_matches },
 };
 
 /// The part of nexis.core written in nexis itself, embedded at
@@ -599,6 +601,7 @@ const native_extend_record_impl = NativeFn{ .name = "#%extend-record-impl", .min
 // extend-protocol over built-in kinds + Any default + satisfies?.
 const native_extend_builtin_impl = NativeFn{ .name = "#%extend-builtin-impl", .min_arity = 4, .max_arity = 4, .call = &fnExtendBuiltinImpl };
 const native_extend_default_impl = NativeFn{ .name = "#%extend-default-impl", .min_arity = 3, .max_arity = 3, .call = &fnExtendDefaultImpl };
+const native_catch_matches = NativeFn{ .name = "#%catch-matches?", .min_arity = 2, .max_arity = 2, .call = &fnCatchMatches };
 const native_satisfies_q = NativeFn{ .name = "satisfies?", .min_arity = 2, .max_arity = 2, .call = &fnSatisfiesQ };
 
 // nexis.string namespace.
@@ -3650,6 +3653,18 @@ fn fnExtendBuiltinImpl(vm: *VM, args: []const Value) VmError!Value {
         error.OutOfMemory => return VmError.OutOfMemory,
     };
     return value_mod.nilValue();
+}
+
+/// `(#%catch-matches? v tag)` → whether `(catch tag e ...)` takes the
+/// thrown `v`: `v` is `tag` itself, or a map or record whose
+/// `:error` entry is `tag`.
+fn fnCatchMatches(vm: *VM, args: []const Value) VmError!Value {
+    const v = args[0];
+    const tag = args[1];
+    if (dispatch_mod_alias.equal(v, tag)) return value_mod.fromBool(true);
+    if (v.kind() != .persistent_map and v.kind() != .record) return value_mod.fromBool(false);
+    const error_key = vm.ensureInterner().internKeywordValue("error") catch return VmError.OutOfMemory;
+    return value_mod.fromBool(dispatch_mod_alias.equal(try vm_mod.lookup(v, error_key, value_mod.nilValue()), tag));
 }
 
 fn fnExtendDefaultImpl(vm: *VM, args: []const Value) VmError!Value {

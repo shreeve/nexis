@@ -59,8 +59,10 @@
 //!     `slot_count`; branch-local temps are not reclaimed across the
 //!     merge point. Constants are not deduplicated.
 //!   - `recur` targeting a variadic fn raises `UnsupportedFeature`.
-//!   - The only catch matcher is `any`; a catch binding captured by
-//!     an inner fn raises `UnsupportedFeature`.
+//!   - The primitive `try` takes one `(catch any binding ...)`; the
+//!     expander lowers several catch clauses and keyword matchers
+//!     onto it (MACROEXPAND.md §8b). A catch binding captured by an
+//!     inner fn raises `UnsupportedFeature`.
 //!   - Var-level shadowing of `+` / `<` does not defeat inlining;
 //!     only lexical shadowing does.
 
@@ -1328,15 +1330,13 @@ fn lowerFormEnv(
 /// any expression evaluating to a closure) or a special form
 /// (head is a reserved symbol like `if`, `do`, `let*`, etc.).
 ///
-/// Empty `()` is rejected (`MalformedForm`): source `()` is
-/// invalid as an expression; the empty list value is written
-/// `'()`.
+/// The literal `()` is the empty list, as in Clojure.
 fn lowerList(
     allocator: std.mem.Allocator,
     items: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (items.len == 0) return CompileError.MalformedForm;
+    if (items.len == 0) return try allocTiny(allocator, .{ .list_construct = &.{} });
     // Head-symbol dispatch only fires when head is an unqualified
     // symbol. Qualified symbols (`foo/x`) and non-symbol heads
     // (calls of computed values) fall through to ordinary call.
@@ -1658,15 +1658,13 @@ fn lowerCall(
 
 /// Lower a sequence of body forms into a single Tiny expression.
 /// Multi-form bodies wrap in `Tiny.do_`; single-form bodies pass
-/// through; empty body forms raise `MalformedForm` (caller's
-/// responsibility — `(do)` is fine because it goes through
-/// lowerDo directly, not this helper).
+/// through; an empty body is nil, as `(do)` is.
 fn lowerBody(
     allocator: std.mem.Allocator,
     body_items: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (body_items.len == 0) return CompileError.MalformedForm;
+    if (body_items.len == 0) return try allocTiny(allocator, .nil);
     if (body_items.len == 1) return try lowerFormEnv(allocator, body_items[0], ctx);
     const exprs = try allocator.alloc(*const Tiny, body_items.len);
     for (body_items, 0..) |item, i| {
@@ -1747,7 +1745,7 @@ fn lowerLetStar(
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (args.len < 2) return CompileError.MalformedForm;
+    if (args.len < 1) return CompileError.MalformedForm;
     const binding_vec = try expectVector(args[0]);
     if (binding_vec.len % 2 != 0) return CompileError.MalformedForm;
     const n_bindings = binding_vec.len / 2;
@@ -1777,7 +1775,7 @@ fn lowerLoopStar(
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (args.len < 2) return CompileError.MalformedForm;
+    if (args.len < 1) return CompileError.MalformedForm;
     const binding_vec = try expectVector(args[0]);
     if (binding_vec.len % 2 != 0) return CompileError.MalformedForm;
     const n_bindings = binding_vec.len / 2;
@@ -1821,12 +1819,12 @@ fn lowerFnStar(
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (args.len < 2) return CompileError.MalformedForm;
-    // Optional self-name: first arg is a symbol (and we have
-    // at least 3 args total: name, params, body...).
+    if (args.len < 1) return CompileError.MalformedForm;
+    // Optional self-name: first arg is a symbol, the param vector
+    // follows it; the body may be empty.
     var pos: usize = 0;
     var self_name: ?[]const u8 = null;
-    if (args[0].datum == .symbol and args.len >= 3) {
+    if (args[0].datum == .symbol and args.len >= 2) {
         self_name = try expectUnqualifiedSymbol(args[0]);
         pos = 1;
     }
@@ -1860,7 +1858,7 @@ fn lowerLetFnStar(
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (args.len < 2) return CompileError.MalformedForm;
+    if (args.len < 1) return CompileError.MalformedForm;
     const binding_vec = try expectVector(args[0]);
     const bindings = try allocator.alloc(FnBinding, binding_vec.len);
 
@@ -1873,7 +1871,7 @@ fn lowerLetFnStar(
             .list => |items| items,
             else => return CompileError.MalformedForm,
         };
-        if (entry_items.len < 3) return CompileError.MalformedForm;
+        if (entry_items.len < 2) return CompileError.MalformedForm;
         const name = try expectUnqualifiedSymbol(entry_items[0]);
         const param_vec = try expectVector(entry_items[1]);
         const parsed = try parseParams(allocator, param_vec);
@@ -1939,7 +1937,7 @@ fn lowerDefn(
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (args.len < 3) return CompileError.MalformedForm;
+    if (args.len < 2) return CompileError.MalformedForm;
     const name = try expectUnqualifiedSymbol(args[0]);
     const param_vec = try expectVector(args[1]);
     const parsed = try parseParams(allocator, param_vec);
@@ -1973,7 +1971,8 @@ fn lowerVarRef(
 }
 
 /// Lower `(try body+ (catch any binding handler+) (finally ...)?)`.
-/// The only catch matcher is `any`.
+/// The only catch matcher at this level is `any`; the expander
+/// lowers keyword matchers and several clauses onto it.
 ///
 /// Form syntax:
 ///   (try body... (catch any binding handler...))
@@ -1989,7 +1988,7 @@ fn lowerTry(
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (args.len < 2) return CompileError.MalformedForm;
+    if (args.len < 1) return CompileError.MalformedForm;
 
     // Last arg should be the catch (or finally).
     // Partition by walking from the end: optional finally
@@ -2012,9 +2011,9 @@ fn lowerTry(
         }
     }
 
-    if (end < 2) return CompileError.MalformedForm;
+    if (end < 1) return CompileError.MalformedForm;
     const catch_form = args[end - 1];
-    if (catch_form.datum != .list or catch_form.datum.list.len < 4) {
+    if (catch_form.datum != .list or catch_form.datum.list.len < 3) {
         return CompileError.MalformedForm;
     }
     const catch_items = catch_form.datum.list;
@@ -6728,14 +6727,14 @@ test "compile lowerForm: lowerForm of keyword without an interner → Unsupporte
     try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
 }
 
-test "compile lowerForm: lowerForm of empty list → MalformedForm" {
-    // Empty `()` as an expression is rejected; the empty list
-    // value is written `'()`.
+test "compile lowerForm: the empty list lowers to an empty list construction" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const empty: []const *reader_mod.Form = &.{};
     const form = reader_mod.Form{ .datum = .{ .list = empty }, .origin = .{ .pos = 0, .len = 0 } };
-    try testing.expectError(CompileError.MalformedForm, lowerForm(arena.allocator(), &form));
+    const t = try lowerForm(arena.allocator(), &form);
+    try testing.expect(t.* == .list_construct);
+    try testing.expectEqual(@as(usize, 0), t.list_construct.len);
 }
 
 test "compile qualified: lowerForm of qualified symbol → Tiny.qualified_symbol" {
@@ -6905,10 +6904,22 @@ test "compile source: (quote foo) symbol via compileSource (no interner) → Uns
     try testing.expectError(CompileError.UnsupportedFeature, compileSource(arena.allocator(), "(quote foo)"));
 }
 
-test "compile source: () empty list → MalformedForm" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "()"));
+test "compile source: () is the empty list" {
+    var r = try runSourceFull("()");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    try testing.expect(list_mod.isEmpty(r.result));
+}
+
+test "compile source: empty bodies are nil" {
+    try expectSourceNil("((fn* []))");
+    try expectSourceNil("((fn* f []))");
+    try expectSourceNil("((fn* [x]) 1)");
+    try expectSourceNil("(let* [x 1])");
+    try expectSourceNil("(loop* [x 1])");
+    try expectSourceNil("(letfn* [(f [])] (f))");
+    try expectSourceNil("(try (throw 1) (catch any e))");
+    try expectSourceNil("(try (catch any e 1))");
 }
 
 // Ordinary-call tests with fn* callees are in the binding-form
@@ -7187,10 +7198,10 @@ test "compile source def: (def 42 5) → ExpectedSymbol" {
     try testing.expectError(CompileError.ExpectedSymbol, compileSource(arena.allocator(), "(def 42 5)"));
 }
 
-test "compile source def: (defn name) without body → MalformedForm" {
+test "compile source def: (defn name) without params → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(defn f [x])"));
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(defn f)"));
 }
 
 test "compile source def: (var) → MalformedForm" {
@@ -8221,7 +8232,19 @@ test "compile try: handler binding visible in handler body" {
     );
 }
 
-test "compile try: try without catch or finally → MalformedForm" {
+test "compile try: try without catch or finally is its body" {
+    var r = try runSourceWithDefaultMacros("(try 1)");
+    defer r.vm_owned.deinit();
+    try testing.expectEqual(@as(i64, 1), r.result.asFixnum());
+}
+
+test "compile try: the primitive accepts only the any matcher" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.UnsupportedFeature, compileSource(arena.allocator(), "(try 1 (catch :my-error e e))"));
+}
+
+test "compile try: a symbol matcher other than any is a macro error" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8233,178 +8256,7 @@ test "compile try: try without catch or finally → MalformedForm" {
     defer host_macros.deinit(testing.allocator);
     try testing.expectError(
         CompileError.MacroExpansionFailure,
-        compileSourceFullWithMacros(arena.allocator(), "(try 1)", null, interner, &host_macros),
-    );
-}
-
-// ---- finally clauses end-to-end ----------
-
-test "compile finally: try/catch/finally — normal exit runs finally" {
-    // Body returns 1; catch unused; finally runs but result is
-    // discarded — the try expression's value is 1.
-    try expectFixnumDefaultMacros(
-        "(try 1 (catch any e 99) (finally 42))",
-        1,
-    );
-}
-
-test "compile finally: try/catch/finally — caught throw + finally" {
-    // Body throws :a; catch binds e and returns 7; finally runs
-    // but result discarded — try expression's value is 7.
-    try expectFixnumDefaultMacros(
-        "(try (throw 13) (catch any e 7) (finally 99))",
-        7,
-    );
-}
-
-test "compile finally: try/catch/finally — finally side effect via def" {
-    // The finally body sets a Var; after the try expression
-    // returns, the Var holds the new value. Proves finally
-    // actually ran.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    const ns = v.ensureNamespace();
-    const interner = v.ensureInterner();
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    const src =
-        \\(do
-        \\  (def fired 0)
-        \\  (try
-        \\    1
-        \\    (catch any e e)
-        \\    (finally (def fired 1)))
-        \\  fired)
-    ;
-    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
-    const routine = compiled.toRoutine("p");
-    try v.retargetTop(&routine);
-    const result = try v.run();
-    try testing.expectEqual(@as(i64, 1), result.asFixnum());
-}
-
-test "compile finally: uncaught throw — finally runs then throw propagates" {
-    // Outer try catches; inner try has only finally. Body
-    // throws; inner finally runs (side effect via def); outer
-    // catch receives the original thrown value.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    const ns = v.ensureNamespace();
-    const interner = v.ensureInterner();
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    // Note: a try with finally but no catch is rejected
-    // (catch is required). So we use catch that
-    // rethrows + outer try to test the throw-through-finally
-    // path.
-    const src =
-        \\(do
-        \\  (def fired 0)
-        \\  (try
-        \\    (try
-        \\      (throw 42)
-        \\      (catch any e (throw e))
-        \\      (finally (def fired 1)))
-        \\    (catch any e e)))
-    ;
-    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
-    const routine = compiled.toRoutine("p");
-    try v.retargetTop(&routine);
-    const result = try v.run();
-    // The outer try received 42 from the inner rethrow.
-    try testing.expectEqual(@as(i64, 42), result.asFixnum());
-    // The inner finally ran (fired = 1).
-    const fired_var = v.namespace.?.lookup("fired").?;
-    try testing.expectEqual(@as(i64, 1), fired_var.root.asFixnum());
-}
-
-test "compile finally: throw inside finally replaces pending value" {
-    // Body returns 1; finally throws :replaced. Clojure
-    // semantics: the new throw replaces
-    // whatever was happening; outer catch receives :replaced
-    // (not 1).
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    const ns = v.ensureNamespace();
-    const interner = v.ensureInterner();
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    const src =
-        \\(try
-        \\  (try
-        \\    1
-        \\    (catch any e e)
-        \\    (finally (throw 99)))
-        \\  (catch any e e))
-    ;
-    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
-    const routine = compiled.toRoutine("p");
-    try v.retargetTop(&routine);
-    const result = try v.run();
-    // The outer catch sees 99 (the finally's throw), not the
-    // body's value 1.
-    try testing.expectEqual(@as(i64, 99), result.asFixnum());
-}
-
-test "compile finally: finally body runs on caught-throw exit" {
-    // Body throws → catch caught it → finally runs after.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    const ns = v.ensureNamespace();
-    const interner = v.ensureInterner();
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    const src =
-        \\(do
-        \\  (def fired 0)
-        \\  (try
-        \\    (throw 7)
-        \\    (catch any e e)
-        \\    (finally (def fired 1)))
-        \\  fired)
-    ;
-    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
-    const routine = compiled.toRoutine("p");
-    try v.retargetTop(&routine);
-    const result = try v.run();
-    try testing.expectEqual(@as(i64, 1), result.asFixnum());
-}
-
-test "compile try: non-any matcher → UnsupportedFeature" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    const interner = v.ensureInterner();
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    try testing.expectError(
-        CompileError.UnsupportedFeature,
-        compileSourceFullWithMacros(
-            arena.allocator(),
-            "(try 1 (catch :my-error e e))",
-            null,
-            interner,
-            &host_macros,
-        ),
+        compileSourceFullWithMacros(arena.allocator(), "(try 1 (catch Exception e e))", null, interner, &host_macros),
     );
 }
 

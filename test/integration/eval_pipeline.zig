@@ -643,6 +643,47 @@ test "integration: nested try — outer catches what inner rethrows" {
     );
 }
 
+test "try: finally alone, no clause at all, and empty bodies" {
+    try expectOutput("(try 1 (finally 2))", "1");
+    try expectOutput("(let [a (atom 0)] [(try (throw :x) (catch any e e) (finally (reset! a 1))) @a])", "[:x 1]");
+    try expectOutput("(let [a (atom [])] (try (try (throw :x) (finally (swap! a conj :fin))) (catch any e (swap! a conj e))) @a)", "[:fin :x]");
+    try expectOutput("(try 1)", "1");
+    try expectOutput("(try)", "nil");
+    try expectOutput("(try (throw :x) (catch any e))", "nil");
+    try expectOutput("(try (catch any e 1))", "nil");
+}
+
+test "try: catch clauses match by keyword tag, in order, or rethrow" {
+    try expectOutput("(try (throw :a) (catch :a e :got-a) (catch :b e :got-b))", ":got-a");
+    try expectOutput("(try (throw :b) (catch :a e :got-a) (catch :b e :got-b))", ":got-b");
+    try expectOutput("(try (throw :c) (catch :a e 1) (catch any e [:any e]))", "[:any :c]");
+    try expectOutput("(try (try (throw :c) (catch :a e 1)) (catch any e [:outer e]))", "[:outer :c]");
+    try expectOutput("(let [a (atom 0)] [(try (try (throw :c) (catch :a e 1) (finally (swap! a inc))) (catch :c e :outer)) @a])", "[:outer 1]");
+    // A map matches by its :error entry.
+    try expectOutput("(try (throw {:error :boom :n 1}) (catch :boom e (:n e)))", "1");
+    try expectOutput("(try (/ 1 0) (catch :divide-by-zero e :dz))", ":dz");
+    try expectOutput("(try (case 3 1 :a) (catch :no-matching-clause e (:value e)))", "3");
+    try expectOutput("(try (throw {:error :other}) (catch :boom e 1) (catch any e (:error e)))", ":other");
+    // A caught binding may be captured by an inner fn.
+    try expectOutput("(try (throw 5) (catch any e ((fn [] (inc e)))))", "6");
+    try expectProgramError("(try 1 (catch 'sym e 1))", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(try 1 (catch any e 1) 2)", compile.CompileError.MacroExpansionFailure);
+}
+
+test "empty bodies are nil and () is the empty list" {
+    try expectOutput("((fn []))", "nil");
+    try expectOutput("(do (defn e0 []) (e0))", "nil");
+    try expectOutput("((fn [x]) 1)", "nil");
+    try expectOutput("(let [x 1])", "nil");
+    try expectOutput("(loop [x 1])", "nil");
+    try expectOutput("(letfn [(f [])] (f))", "nil");
+    try expectOutput("(do)", "nil");
+    try expectOutput("()", "()");
+    try expectOutput("(= () '())", "true");
+    try expectOutput("(count ())", "0");
+    try expectOutput("(list? ())", "true");
+}
+
 // =============================================================================
 // Composite programs — every category at once
 // =============================================================================

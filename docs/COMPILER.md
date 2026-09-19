@@ -401,6 +401,10 @@ entirely — no dead code emitted.
 - Lower each `expr` for its effect only; discard the result
   slot.
 - The final `expr` lowers into the result slot of the `do`.
+- `(do)` is nil, and so is every empty body: `(fn* [])`,
+  `(let* [x 1])`, `(loop* [x 1])`, a `letfn*` binding without a
+  body, a `try` body or handler with no forms. The literal `()`
+  is the empty list, as `'()` is.
 
 #### 5.4 `(let* [b1 v1 b2 v2 ...] body...)`
 
@@ -593,19 +597,24 @@ this out for ordinary `letfn*` use.
 - Returns the Var object itself (not its root value); used by
   macros and tooling.
 
-#### 5.10 `(try body... (catch type binding catch-body...)?
+#### 5.10 `(try body... (catch any binding catch-body...)
     (finally finally-body...)?)`
 
-**Minimal v1 semantics** (peer-AI turn 28):
+The primitive takes exactly one `(catch any binding ...)` and an
+optional `finally`; the expander lowers the surface form, with
+any number of `(catch MATCHER b ...)` clauses, a keyword
+matcher, or a `finally` alone, onto it (MACROEXPAND.md §8b).
 
 - `try` installs a handler region via `ctrl:try-enter`.
 - `body` executes normally.
-- On a caught exception, control transfers to the matching
-  `catch`'s entry; the thrown value is bound to `binding`.
-- `finally` runs on both normal and exceptional paths.
-- Exact exception-object mechanics (stack traces, error chains,
-  cause fields) are **not** fully specified here; spec will
-  grow in the implementation commit based on code contact.
+- On a throw, control transfers to the catch entry; the thrown
+  value is bound to `binding`.
+- `finally` runs on both normal and exceptional paths, including
+  a rethrow from the handler.
+- A thrown value is any value; there is no exception object. A
+  keyword matcher `(catch :tag b ...)` takes a thrown value equal
+  to `:tag` or a map whose `:error` entry is `:tag` (PLAN §6.4,
+  Amendment Log).
 
 #### 5.11 `(throw expr)`
 

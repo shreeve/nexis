@@ -832,8 +832,25 @@ fn expandDefn(
     return try makeList(ctx, out_items, list_form.origin);
 }
 
-/// Expand `(try body+ (catch MATCHER BINDING handler+)
-/// (finally body+)?)`.
+/// Expand `(try body* (catch MATCHER BINDING handler*)* (finally
+/// body*)?)` onto the compiler's primitive, which takes exactly one
+/// `(catch any g ...)`:
+///
+///   (try body...
+///     (catch any g#
+///       (if (nexis.internal/#%catch-matches? g# :tag) (let* [b1 g#] h1...)
+///       (if ... (let* [bn g#] hn...)
+///       (throw g#))))
+///     (finally ...)?)
+///
+/// A MATCHER is `any` (every value, no test) or a keyword TAG,
+/// which matches a thrown value equal to TAG or a map whose
+/// `:error` entry is TAG: the shape Nextomic's error maps and the
+/// no-matching-clause map already have. Clauses are tried in
+/// order; a value no clause matches is rethrown, so it unwinds
+/// through the `finally` to the enclosing `try`. With no clause at
+/// all the handler is the rethrow, which is finally-only `try`;
+/// with neither catch nor finally the form is `(do body...)`.
 ///
 /// Traversal rule (per MACROEXPAND.md §2b — each special form
 /// has its own walker):
@@ -848,100 +865,91 @@ fn expandTry(
     items: []const *Form,
     depth: u32,
 ) ExpandError!*Form {
-    if (items.len < 2) return ExpandError.MalformedMacroCall;
     const head = items[0];
+    const origin = list_form.origin;
 
-    // Partition the args into body + clauses. Walk from the end
-    // detecting `(catch ...)` and `(finally ...)` lists.
+    // Partition: body forms, then catch clauses, then an optional
+    // finally. Clojure's order; anything else is malformed.
     var end = items.len;
     var finally_form: ?*Form = null;
-    var catch_form: ?*Form = null;
+    if (end > 1 and isClauseHead(items[end - 1], "finally")) {
+        finally_form = mutCast(items[end - 1]);
+        end -= 1;
+    }
+    var catch_start = end;
+    while (catch_start > 1 and isClauseHead(items[catch_start - 1], "catch")) catch_start -= 1;
+    const body = items[1..catch_start];
+    const catches = items[catch_start..end];
+    for (body) |b| if (isClauseHead(b, "catch") or isClauseHead(b, "finally")) return ExpandError.MalformedMacroCall;
 
-    // Detect optional finally as last clause.
-    if (end > 1) {
-        const last = items[end - 1];
-        if (isClauseHead(last, "finally")) {
-            finally_form = mutCast(last);
-            end -= 1;
-        }
-    }
-    // Detect catch as next-to-last (or last if no finally).
-    if (end > 1) {
-        const cl = items[end - 1];
-        if (isClauseHead(cl, "catch")) {
-            catch_form = mutCast(cl);
-            end -= 1;
-        }
-    }
-    // At least one of catch / finally must be present.
-    if (catch_form == null and finally_form == null) {
-        return ExpandError.MalformedMacroCall;
-    }
-
-    // Body (items[1..end]) expanded with outer env.
-    const body_count = end - 1;
     var out_items: std.ArrayList(*Form) = .empty;
     defer out_items.deinit(ctx.allocator);
-    try out_items.append(ctx.allocator, mutCast(head));
 
-    var i: usize = 1;
-    while (i < end) : (i += 1) {
-        const expanded = try expandFormDepth(ctx, env, items[i], depth);
-        try out_items.append(ctx.allocator, expanded);
+    if (catches.len == 0 and finally_form == null) {
+        try out_items.append(ctx.allocator, try makeSymbol(ctx, "do", origin));
+        for (body) |b| try out_items.append(ctx.allocator, try expandFormDepth(ctx, env, b, depth));
+        return try makeListInline(ctx, origin, out_items.items);
     }
-    _ = body_count; // (unused; structural reference)
 
-    // Expand catch clause. catch_items = [catch MATCHER BINDING handler...]
-    // MATCHER and BINDING are literal symbols — pass through.
-    if (catch_form) |cf| {
-        if (cf.datum.list.len < 4) return ExpandError.MalformedMacroCall;
-        const ci = cf.datum.list;
-        const cf_head = ci[0];
+    try out_items.append(ctx.allocator, mutCast(head));
+    for (body) |b| try out_items.append(ctx.allocator, try expandFormDepth(ctx, env, b, depth));
+
+    // The single primitive catch binds g; its handler is the
+    // clause chain ending in a rethrow.
+    const g_name = try ctx.gensym("caught");
+    var handler: *Form = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "throw", origin), try makeSymbol(ctx, g_name, origin) });
+    var i: usize = catches.len;
+    while (i > 0) {
+        i -= 1;
+        const ci = catches[i].datum.list;
+        if (ci.len < 3) return ExpandError.MalformedMacroCall;
         const matcher = ci[1];
         const binding = ci[2];
-        if (binding.datum != .symbol or binding.datum.symbol.ns != null) {
-            return ExpandError.MalformedMacroCall;
-        }
-        // Build env for handler body.
+        if (binding.datum != .symbol or binding.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
+
         var handler_env: ExpandEnv = .{ .parent = env };
         defer handler_env.deinit(ctx.allocator);
         _ = try handler_env.lexical_names.getOrPut(ctx.allocator, binding.datum.symbol.name);
-        // Expand handler body.
-        var new_catch_items: std.ArrayList(*Form) = .empty;
-        defer new_catch_items.deinit(ctx.allocator);
-        try new_catch_items.append(ctx.allocator, mutCast(cf_head));
-        try new_catch_items.append(ctx.allocator, mutCast(matcher));
-        try new_catch_items.append(ctx.allocator, mutCast(binding));
-        for (ci[3..]) |h| {
-            const ex = try expandFormDepth(ctx, &handler_env, h, depth);
-            try new_catch_items.append(ctx.allocator, ex);
-        }
-        const new_catch_slice = try ctx.allocator.alloc(*Form, new_catch_items.items.len);
-        for (new_catch_items.items, 0..) |item, j| new_catch_slice[j] = item;
-        const new_catch = try makeList(ctx, new_catch_slice, cf.origin);
-        try out_items.append(ctx.allocator, new_catch);
-    }
+        // (let* [binding g] handler...)
+        var let_items: std.ArrayList(*Form) = .empty;
+        defer let_items.deinit(ctx.allocator);
+        try let_items.append(ctx.allocator, try makeSymbol(ctx, "let*", origin));
+        const bind_items = try ctx.allocator.alloc(*Form, 2);
+        bind_items[0] = mutCast(binding);
+        bind_items[1] = try makeSymbol(ctx, g_name, origin);
+        try let_items.append(ctx.allocator, try makeVector(ctx, bind_items, origin));
+        for (ci[3..]) |h| try let_items.append(ctx.allocator, try expandFormDepth(ctx, &handler_env, h, depth));
+        const clause_body = try makeListInline(ctx, origin, let_items.items);
 
-    // Expand finally clause if present.
+        const is_any = matcher.datum == .symbol and matcher.datum.symbol.ns == null and std.mem.eql(u8, matcher.datum.symbol.name, "any");
+        if (is_any) {
+            handler = clause_body;
+            continue;
+        }
+        if (matcher.datum != .keyword) return ExpandError.MalformedMacroCall;
+        const test_form = try makeListInline(ctx, origin, &.{
+            try makeQualifiedSymbol(ctx, "nexis.internal", "#%catch-matches?", origin),
+            try makeSymbol(ctx, g_name, origin),
+            mutCast(matcher),
+        });
+        handler = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "if", origin), test_form, clause_body, handler });
+    }
+    try out_items.append(ctx.allocator, try makeListInline(ctx, origin, &.{
+        try makeSymbol(ctx, "catch", origin),
+        try makeSymbol(ctx, "any", origin),
+        try makeSymbol(ctx, g_name, origin),
+        handler,
+    }));
+
     if (finally_form) |ff| {
-        if (ff.datum.list.len < 1) return ExpandError.MalformedMacroCall;
         const fi = ff.datum.list;
         var new_finally_items: std.ArrayList(*Form) = .empty;
         defer new_finally_items.deinit(ctx.allocator);
         try new_finally_items.append(ctx.allocator, mutCast(fi[0]));
-        for (fi[1..]) |f| {
-            const ex = try expandFormDepth(ctx, env, f, depth);
-            try new_finally_items.append(ctx.allocator, ex);
-        }
-        const new_finally_slice = try ctx.allocator.alloc(*Form, new_finally_items.items.len);
-        for (new_finally_items.items, 0..) |item, j| new_finally_slice[j] = item;
-        const new_finally = try makeList(ctx, new_finally_slice, ff.origin);
-        try out_items.append(ctx.allocator, new_finally);
+        for (fi[1..]) |f| try new_finally_items.append(ctx.allocator, try expandFormDepth(ctx, env, f, depth));
+        try out_items.append(ctx.allocator, try makeListInline(ctx, ff.origin, new_finally_items.items));
     }
-
-    const out_slice = try ctx.allocator.alloc(*Form, out_items.items.len);
-    for (out_items.items, 0..) |item, j| out_slice[j] = item;
-    return try makeList(ctx, out_slice, list_form.origin);
+    return try makeListInline(ctx, origin, out_items.items);
 }
 
 /// Expand `#(body...)` shorthand.
