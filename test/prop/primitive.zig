@@ -1,14 +1,14 @@
 //! test/prop/primitive.zig — randomized property tests for immediates.
 //!
-//! This is the first entry in the Phase 1 gate test suite (PLAN §20.2
-//! test #1). It exercises the bedrock invariants of `identical?`, `=`,
+//! Covers PLAN §20.2 test #1. It exercises the bedrock invariants of
+//! `identical?`, `=`,
 //! and `hash` across the full immediate kind space, using a deterministic
 //! PRNG so failures are reproducible.
 //!
 //! Each property runs `iterations` times with a fixed seed. The counts
 //! are small here (1 000 × 7 properties = 7 000 checks) because
-//! immediates are a closed world; the big 100k-iteration sweep lands
-//! once heap kinds come online and the matrix actually has weight.
+//! immediates are a closed world; the heap-kind property files carry
+//! the large sweeps.
 //!
 //! Invariants exercised (SEMANTICS §2, VALUE.md §6):
 //!   P1. `identical?` is reflexive.
@@ -166,8 +166,9 @@ test "P6: cross-kind = is false (except within {true_, false_} / {keyword×keywo
         const a = randValue(r);
         const b = randValue(r);
         if (a.kind() != b.kind() and eq.equalImmediate(a, b)) {
-            // There are zero legitimate cross-kind equalities in v1.
-            // (Cross-type numeric `==` is v2 work — PLAN §23 #11.)
+            // There are zero legitimate cross-kind equalities among
+            // immediates; cross-type numeric `==` does not exist
+            // (PLAN §23 #11).
             try std.testing.expect(false);
         }
     }

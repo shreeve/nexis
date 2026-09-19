@@ -22,7 +22,7 @@ convention; there is no `test/unit/`.
   `compile`, `expand`, `stdlib`, `loader`, `atom`, `record`,
   `protocol`, `format`), the compile property tests, the eval-pipeline
   integration tests and the Nextomic unit and property binaries. The
-  inner edit/test loop. `zig build phase2-test` names the same step.
+  inner edit/test loop.
 - **`zig build test`** (minutes) — the full suite: every module's
   inline tests, property tests, golden verification, the Nextomic
   corpora, the `.nx` scripts and the examples. The runtime is

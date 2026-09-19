@@ -1,6 +1,6 @@
 //! test/prop/heap.zig — randomized property tests for the heap allocator.
 //!
-//! Covers PLAN §20.2 Phase 1 gate test #7 ("GC stress: allocate-heavy
+//! Covers PLAN §20.2 test #7 ("GC stress: allocate-heavy
 //! workloads interleaved with forced collections; no leaked/corrupted
 //! objects; all live data survives; no dangling headers"). Builds on
 //! the inline tests in `src/heap.zig`; this file exists to hammer the
@@ -85,8 +85,8 @@ fn randHeapKind(rand: std.Random) value.Kind {
     return options[idx];
 }
 
-/// Fill a body with a deterministic pattern keyed on `seed`; used to
-/// verify body bytes survive sweep cycles without corruption.
+/// Fill a body with a deterministic pattern keyed on `seed`, so body
+/// bytes can be checked to survive sweep cycles intact.
 fn paintBody(h: *HeapHeader, seed: u8) void {
     const bytes = Heap.bodyBytes(h);
     for (bytes, 0..) |*b, i| b.* = seed +% @as(u8, @truncate(i));

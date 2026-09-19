@@ -1,5 +1,5 @@
-//! test/integration/eval_pipeline.zig — Phase 2 gate close-out
-//! (COMPILER.md §9.4 + §10 step #11 + §11 golden+eval tests).
+//! test/integration/eval_pipeline.zig — end-to-end golden + eval
+//! tests (COMPILER.md §9.4, §10, §11).
 //!
 //! End-to-end pipeline coverage: source → reader → macroexpand →
 //! lowerForm → Tiny → compile → VM → printed Value. Each test
@@ -17,7 +17,7 @@
 //!   - quote / syntax-quote / collections
 //!   - try / catch / finally / throw
 //!
-//! Per peer-AI turn 28 §"Golden test discipline": every
+//! Golden test discipline: every
 //! primitive-core form has at least one golden here; every
 //! macro from defaultMacros has at least one golden; every
 //! exit path of try/catch/finally has at least one golden.
@@ -39,11 +39,9 @@ const format_mod = @import("format");
 const testing = std.testing;
 
 /// Format a runtime Value via the canonical `src/format.zig`
-/// formatter in display mode. Phase 5.2c (peer-AI turn 81)
-/// pulled this from the prior per-kind duplicate (and the
-/// matching helpers in `cli.zig` and `stdlib.zig`) into one
-/// source of truth so test expectations match REPL output
-/// byte-for-byte.
+/// formatter in display mode, the one source of truth shared with
+/// `cli.zig` and `stdlib.zig`, so test expectations match REPL
+/// output byte-for-byte.
 fn formatValue(buf: *std.array_list.Managed(u8), v: value_mod.Value, interner: *const intern_mod.Interner) anyerror!void {
     var w = std.Io.Writer.Allocating.init(buf.allocator);
     defer w.deinit();
@@ -51,7 +49,7 @@ fn formatValue(buf: *std.array_list.Managed(u8), v: value_mod.Value, interner: *
     try buf.appendSlice(w.written());
 }
 
-/// Phase 3.3d: compile + run the embedded core.nx layer
+/// Compile + run the embedded core.nx layer
 /// against `v` so test programs can use composite definitions
 /// (second, last, reverse, range, take, drop, when-let,
 /// if-let, dotimes). Uses the VM's runtime arena as the
@@ -187,7 +185,7 @@ const Program = struct {
     }
 };
 
-/// Phase 3.4: multi-form test helper that processes top-level
+/// Multi-form test helper that processes top-level
 /// forms sequentially (matching runFile semantics). Use this
 /// when `(ns NAME)` switching needs to affect subsequent
 /// forms within the same test. The final form's value is the
@@ -271,34 +269,34 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
     var v = try vm.VM.init(testing.allocator, &stub);
     defer v.deinit();
-    // Phase 5.2c (peer-AI turn 81 §D6): tests leave `v.io` null;
-    // see `expectOutputProgram` for the rationale.
+    // Tests leave `v.io` null; see the I/O error-path tests for
+    // the contract.
     const interner = v.ensureInterner();
-    // Phase 3.4: set up the namespace registry so tests can
+    // Set up the namespace registry so tests can
     // exercise `(ns NAME)` + qualified symbol resolution.
     const registry = try v.ensureRegistry();
-    // Phase 3.3a: install core native fns into nexis.core (auto-
+    // Install core native fns into nexis.core (auto-
     // referred by user via parent).
     try stdlib.installCore(registry.core);
-    // Phase 5 Item 1: install db namespace so qualified `db/...`
+    // Install the db namespace so qualified `db/...`
     // calls and the `db/deref` alias resolve in tests.
     const db_ns_single = try registry.getOrCreate("db", registry.core);
     try stdlib.installDb(db_ns_single);
-    // Phase 5.2b: nexis.string namespace (qualified-only).
+    // nexis.string namespace (qualified-only).
     const string_ns_single = try registry.getOrCreate("nexis.string", registry.core);
     try stdlib.installString(string_ns_single);
-    // Phase 5.3a: nexis.internal (qualified-only macro scaffolding).
+    // nexis.internal (qualified-only macro scaffolding).
     const internal_ns_single = try registry.getOrCreate("nexis.internal", registry.core);
     try stdlib.installInternal(internal_ns_single);
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
-    // Phase 3.3d: bootstrap composite core.nx layer into core.
+    // Bootstrap the composite core.nx layer into core.
     const saved_current = registry.current;
     registry.current = registry.core;
     try bootstrapCoreForTest(&v, registry.core, interner, &host_macros);
     registry.current = saved_current;
 
-    // Phase 3.4: each test compiles in the CURRENT namespace
+    // Each test compiles in the CURRENT namespace
     // (initially user). `(ns NAME)` in src can switch mid-test.
     const current_ns = registry.current;
     const compiled = try compile.compileSourceFullWithMacrosSpanPersistentRegistry(
@@ -626,7 +624,7 @@ test "integration: composite — try with macros" {
 }
 
 // =============================================================================
-// Phase 3.3a — native fns (macro-authoring primitives)
+// Native fns (macro-authoring primitives)
 // =============================================================================
 
 test "integration: native list — empty + variadic" {
@@ -691,11 +689,10 @@ test "integration: native identity / nil? / some?" {
 }
 
 test "integration: my-cond — user procedural macro using native fns" {
-    // The canonical 3.3a payoff: a user-written recursive
-    // procedural macro that uses first/rest/empty? at COMPILE
-    // TIME. Native fns work in defmacro bodies because the
-    // persistent-namespace design from 3.2 makes them visible
-    // to the compile-time sub-VM.
+    // A user-written recursive procedural macro that uses
+    // first/rest/empty? at COMPILE TIME. Native fns work in
+    // defmacro bodies because the persistent-namespace design
+    // makes them visible to the compile-time sub-VM.
     try expectOutput(
         \\(do (defmacro my-cond [& clauses]
         \\      (if (empty? clauses)
@@ -722,10 +719,10 @@ test "integration: native fn — arity mismatch is catchable" {
 }
 
 // =============================================================================
-// Phase 3.5b — multi-arity defn
+// Multi-arity defn
 // =============================================================================
 
-test "integration: 3.5b — multi-arity dispatch by argc" {
+test "integration: multi-arity dispatch by argc" {
     try expectOutput(
         \\(do (defn f ([x] :one) ([x y] :two) ([x y z] :three))
         \\    (f :a))
@@ -740,14 +737,14 @@ test "integration: 3.5b — multi-arity dispatch by argc" {
     , ":three");
 }
 
-test "integration: 3.5b — multi-arity arity-mismatch is catchable" {
+test "integration: multi-arity arity-mismatch is catchable" {
     try expectOutput(
         \\(do (defn f ([x] :one) ([x y] :two))
         \\    (try (f 1 2 3) (catch any e e)))
     , ":arity-mismatch");
 }
 
-test "integration: 3.5b — multi-arity with variadic overload" {
+test "integration: multi-arity with variadic overload" {
     try expectOutput(
         \\(do (defn f ([x] x) ([x & rest] (+ x (reduce + 0 rest))))
         \\    (f 100))
@@ -758,7 +755,7 @@ test "integration: 3.5b — multi-arity with variadic overload" {
     , "15");
 }
 
-test "integration: 3.5b — multi-arity with destructured params" {
+test "integration: multi-arity with destructured params" {
     try expectOutput(
         \\(do (defn f ([[a b]] (+ a b)) ([x y] (* x y)))
         \\    (f [10 20]))
@@ -770,48 +767,48 @@ test "integration: 3.5b — multi-arity with destructured params" {
 }
 
 // =============================================================================
-// Phase 3.5a — destructuring (let / fn / defn params)
+// Destructuring (let / fn / defn params)
 // =============================================================================
 
-test "integration: 3.5a — sequential destructuring (let)" {
+test "integration: sequential destructuring (let)" {
     try expectOutput("(let [[a b c] [10 20 30]] (+ a b c))", "60");
     try expectOutput("(let [[a b] [1 2 3]] (+ a b))", "3");
     try expectOutput("(let [[a b c] [1 2]] (nil? c))", "true");
 }
 
-test "integration: 3.5a — sequential with rest" {
+test "integration: sequential destructuring with rest" {
     try expectOutput("(let [[a & rest] [1 2 3 4]] rest)", "(2 3 4)");
     try expectOutput("(let [[a b & rest] [1 2 3 4 5]] rest)", "(3 4 5)");
     try expectOutput("(let [[a & rest] [1]] rest)", "()");
 }
 
-test "integration: 3.5a — sequential with :as" {
+test "integration: sequential destructuring with :as" {
     try expectOutput("(let [[a b :as v] [10 20]] (+ a b (count v)))", "32");
 }
 
-test "integration: 3.5a — nested sequential destructuring" {
+test "integration: nested sequential destructuring" {
     try expectOutput("(let [[a [b c] d] [1 [2 3] 4]] (+ a b c d))", "10");
 }
 
-test "integration: 3.5a — associative destructuring (:keys)" {
+test "integration: associative destructuring (:keys)" {
     try expectOutput("(let [{:keys [x y]} {:x 1 :y 2}] (+ x y))", "3");
 }
 
-test "integration: 3.5a — associative with explicit keys" {
+test "integration: associative destructuring with explicit keys" {
     try expectOutput("(let [{a :alpha b :beta} {:alpha 10 :beta 20}] (+ a b))", "30");
 }
 
-test "integration: 3.5a — associative with :or defaults" {
+test "integration: associative destructuring with :or defaults" {
     try expectOutput("(let [{:keys [x y] :or {y 99}} {:x 5}] (+ x y))", "104");
     // :or default applies only when key is missing.
     try expectOutput("(let [{:keys [y] :or {y 99}} {:y 7}] y)", "7");
 }
 
-test "integration: 3.5a — associative with :as" {
+test "integration: associative destructuring with :as" {
     try expectOutput("(let [{:keys [a] :as m} {:a 1 :b 2}] (count m))", "2");
 }
 
-test "integration: 3.5a — fn with destructured params" {
+test "integration: fn with destructured params" {
     try expectOutput(
         \\(do (defn point-sum [[x y]] (+ x y))
         \\    (point-sum [3 4]))
@@ -822,14 +819,14 @@ test "integration: 3.5a — fn with destructured params" {
     , "30");
 }
 
-test "integration: 3.5a — defn with destructured params + rest" {
+test "integration: defn with destructured params + rest" {
     try expectOutput(
         \\(do (defn first-of [[a & _]] a)
         \\    (first-of [99 1 2 3]))
     , "99");
 }
 
-test "integration: 3.5a — let preserves single-evaluation of source" {
+test "integration: destructuring let preserves single-evaluation of source" {
     // The source expression should be evaluated once and bound to
     // a gensym; destructuring reads from that gensym. Side-effect
     // semantics matter for `(let [[a b] (some-effecting-call) ...])`.
@@ -841,21 +838,21 @@ test "integration: 3.5a — let preserves single-evaluation of source" {
 }
 
 // =============================================================================
-// Phase 3.4 — multi-namespace (auto-refer core + qualified symbols + (ns NAME))
+// Multi-namespace (auto-refer core + qualified symbols + (ns NAME))
 // =============================================================================
 
-test "integration: 3.4 — auto-refer nexis.core from user" {
+test "integration: auto-refer nexis.core from user" {
     try expectOutput("(map inc [1 2 3])", "(2 3 4)");
     try expectOutput("(reduce + 0 (range 5))", "10");
 }
 
-test "integration: 3.4 — qualified core symbol" {
+test "integration: qualified core symbol" {
     try expectOutput("(nexis.core/+ 1 2 3)", "6");
     try expectOutput("(nexis.core/* 2 3 4)", "24");
     try expectOutput("(nexis.core/inc 41)", "42");
 }
 
-test "integration: 3.4 — (ns NAME) switches current namespace" {
+test "integration: (ns NAME) switches current namespace" {
     try expectOutputProgram(
         \\(ns my.app)
         \\(def x 100)
@@ -864,7 +861,7 @@ test "integration: 3.4 — (ns NAME) switches current namespace" {
     , "100");
 }
 
-test "integration: 3.4 — defn in a namespace + qualified call" {
+test "integration: defn in a namespace + qualified call" {
     try expectOutputProgram(
         \\(ns my.app)
         \\(defn double [n] (* n 2))
@@ -873,7 +870,7 @@ test "integration: 3.4 — defn in a namespace + qualified call" {
     , "42");
 }
 
-test "integration: 3.4 — qualified symbol resolves via registry not lexical" {
+test "integration: qualified symbol resolves via registry not lexical" {
     // Qualified `my.app/x` is parsed as a single symbol with
     // `ns="my.app"`. Lexical `let` binding form `[my.app/x 99]`
     // is rejected at expand-time (let* binding names must be
@@ -888,7 +885,7 @@ test "integration: 3.4 — qualified symbol resolves via registry not lexical" {
     , "100");
 }
 
-test "integration: 3.4 — defs in different namespaces don't collide" {
+test "integration: defs in different namespaces don't collide" {
     try expectOutputProgram(
         \\(ns a) (def x 1)
         \\(ns b) (def x 2)
@@ -897,7 +894,7 @@ test "integration: 3.4 — defs in different namespaces don't collide" {
     , "3");
 }
 
-test "integration: 3.4 — unqualified def shadows core in current ns" {
+test "integration: unqualified def shadows core in current ns" {
     try expectOutputProgram(
         \\(ns my.app)
         \\(def map :i-am-not-a-function)
@@ -905,7 +902,7 @@ test "integration: 3.4 — unqualified def shadows core in current ns" {
     , ":i-am-not-a-function");
 }
 
-test "integration: 3.4 — missing qualified ns is UnresolvedSymbol" {
+test "integration: missing qualified ns is UnresolvedSymbol" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -933,10 +930,10 @@ test "integration: 3.4 — missing qualified ns is UnresolvedSymbol" {
 }
 
 // =============================================================================
-// Phase 3.3d — embedded core.nx composite layer
+// Embedded core.nx composite layer
 // =============================================================================
 
-test "integration: 3.3d — second / third / last" {
+test "integration: core.nx second / third / last" {
     try expectOutput("(second [10 20 30])", "20");
     try expectOutput("(third [10 20 30])", "30");
     try expectOutput("(last [10 20 30])", "30");
@@ -944,19 +941,19 @@ test "integration: 3.3d — second / third / last" {
     try expectOutput("(last (list))", "nil");
 }
 
-test "integration: 3.3d — reverse" {
+test "integration: core.nx reverse" {
     try expectOutput("(reverse [1 2 3 4 5])", "(5 4 3 2 1)");
     try expectOutput("(reverse (list))", "()");
     try expectOutput("(reverse nil)", "()");
 }
 
-test "integration: 3.3d — range" {
+test "integration: core.nx range" {
     try expectOutput("(range 0)", "()");
     try expectOutput("(range 1)", "(0)");
     try expectOutput("(range 5)", "(0 1 2 3 4)");
 }
 
-test "integration: 3.3d — take / drop" {
+test "integration: core.nx take / drop" {
     try expectOutput("(take 3 [1 2 3 4 5])", "(1 2 3)");
     try expectOutput("(take 0 [1 2 3])", "()");
     try expectOutput("(take 10 [1 2 3])", "(1 2 3)");
@@ -965,7 +962,7 @@ test "integration: 3.3d — take / drop" {
     try expectOutput("(drop 0 (list :a :b))", "(:a :b)");
 }
 
-test "integration: 3.3d — true? / false?" {
+test "integration: core.nx true? / false?" {
     try expectOutput("(true? true)", "true");
     try expectOutput("(true? 1)", "false");
     try expectOutput("(true? :a)", "false");
@@ -973,51 +970,51 @@ test "integration: 3.3d — true? / false?" {
     try expectOutput("(false? nil)", "false");
 }
 
-test "integration: 3.3d — when-let" {
+test "integration: core.nx when-let" {
     try expectOutput("(when-let [x 42] (+ x 1))", "43");
     try expectOutput("(when-let [x nil] :unreached)", "nil");
     try expectOutput("(when-let [x false] :unreached)", "nil");
     try expectOutput("(when-let [x (list 1 2)] (first x))", "1");
 }
 
-test "integration: 3.3d — if-let" {
+test "integration: core.nx if-let" {
     try expectOutput("(if-let [x 7] (* x x) :nope)", "49");
     try expectOutput("(if-let [x nil] :nope :else-branch)", ":else-branch");
     try expectOutput("(if-let [x (get {:a 1} :missing)] x :default)", ":default");
 }
 
-test "integration: 3.3d — composite + HOFs" {
+test "integration: core.nx composite + HOFs" {
     try expectOutput("(reduce + 0 (range 10))", "45");
     try expectOutput("(count (filter odd? (range 10)))", "5");
     try expectOutput("(reverse (map inc [1 2 3]))", "(4 3 2)");
 }
 
 // =============================================================================
-// Phase 3.3c — collection utilities
+// Collection utilities
 // =============================================================================
 
-test "integration: 3.3c — vector / vec" {
+test "integration: vector / vec" {
     try expectOutput("(vector 1 2 3)", "[1 2 3]");
     try expectOutput("(vector)", "[]");
     try expectOutput("(vec (list :a :b :c))", "[:a :b :c]");
     try expectOutput("(vec nil)", "[]");
 }
 
-test "integration: 3.3c — hash-map / hash-set" {
+test "integration: hash-map / hash-set" {
     try expectOutput("(hash-set 1 2 3 1 2)", "#{1 2 3}");
     // hash-map iteration order is unspecified (HAMT); test via count + get
     try expectOutput("(count (hash-map :a 1 :b 2 :c 3))", "3");
     try expectOutput("(get (hash-map :a 1 :b 2) :a)", "1");
 }
 
-test "integration: 3.3c — assoc / dissoc" {
+test "integration: assoc / dissoc" {
     try expectOutput("(get (assoc {:a 1} :b 2) :b)", "2");
     try expectOutput("(get (assoc nil :x 99) :x)", "99");
     try expectOutput("(contains? (dissoc {:a 1 :b 2} :a) :a)", "false");
     try expectOutput("(contains? (dissoc {:a 1 :b 2} :a) :b)", "true");
 }
 
-test "integration: 3.3c — get (2-arg + 3-arg default)" {
+test "integration: get (2-arg + 3-arg default)" {
     try expectOutput("(get {:a 1} :a)", "1");
     try expectOutput("(get {:a 1} :missing)", "nil");
     try expectOutput("(get {:a 1} :missing :default)", ":default");
@@ -1027,7 +1024,7 @@ test "integration: 3.3c — get (2-arg + 3-arg default)" {
     try expectOutput("(get nil :anything :fallback)", ":fallback");
 }
 
-test "integration: 3.3c — contains?" {
+test "integration: contains?" {
     try expectOutput("(contains? {:a 1} :a)", "true");
     try expectOutput("(contains? {:a 1} :b)", "false");
     try expectOutput("(contains? #{1 2 3} 2)", "true");
@@ -1036,14 +1033,14 @@ test "integration: 3.3c — contains?" {
     try expectOutput("(contains? nil :anything)", "false");
 }
 
-test "integration: 3.3c — keys / vals" {
+test "integration: keys / vals" {
     try expectOutput("(count (keys {:a 1 :b 2 :c 3}))", "3");
     try expectOutput("(count (vals {:a 1 :b 2 :c 3}))", "3");
     try expectOutput("(keys nil)", "nil");
     try expectOutput("(vals nil)", "nil");
 }
 
-test "integration: 3.3c — conj (kind-specific)" {
+test "integration: conj (kind-specific)" {
     try expectOutput("(conj nil 1 2 3)", "(3 2 1)"); // Clojure reverses for nil/list
     try expectOutput("(conj (list 1 2 3) 0)", "(0 1 2 3)");
     try expectOutput("(conj [10 20] 30 40)", "[10 20 30 40]");
@@ -1051,7 +1048,7 @@ test "integration: 3.3c — conj (kind-specific)" {
     try expectOutput("(contains? (conj #{1 2} 3 4) 4)", "true");
 }
 
-test "integration: 3.3c — collection ops compose with HOFs" {
+test "integration: collection ops compose with HOFs" {
     try expectOutput(
         \\(reduce (fn* [m k] (assoc m k true)) {} [:a :b :c])
     , "{:a true, :b true, :c true}");
@@ -1059,10 +1056,10 @@ test "integration: 3.3c — collection ops compose with HOFs" {
 }
 
 // =============================================================================
-// Phase 3.3b — VM.callValue + apply + HOFs + first-class arithmetic
+// VM.callValue + apply + HOFs + first-class arithmetic
 // =============================================================================
 
-test "integration: 3.3b — variadic native + / * / - / <" {
+test "integration: variadic native + / * / - / <" {
     try expectOutput("(+)", "0");
     try expectOutput("(+ 1 2 3 4 5)", "15");
     try expectOutput("(*)", "1");
@@ -1074,7 +1071,7 @@ test "integration: 3.3b — variadic native + / * / - / <" {
     try expectOutput("(< 1 3 2)", "false");
 }
 
-test "integration: 3.3b — value equality `=` (variadic, structural)" {
+test "integration: value equality `=` (variadic, structural)" {
     try expectOutput("(=)", "true");
     try expectOutput("(= 1)", "true");
     try expectOutput("(= 1 1 1)", "true");
@@ -1084,7 +1081,7 @@ test "integration: 3.3b — value equality `=` (variadic, structural)" {
     try expectOutput("(= {:a 1} {:a 1})", "true");
 }
 
-test "integration: 3.3b — inc / dec / not / predicates" {
+test "integration: inc / dec / not / predicates" {
     try expectOutput("(inc 41)", "42");
     try expectOutput("(dec 1)", "0");
     try expectOutput("(not nil)", "true");
@@ -1097,62 +1094,62 @@ test "integration: 3.3b — inc / dec / not / predicates" {
     try expectOutput("(even? 4)", "true");
 }
 
-test "integration: 3.3b — apply (no leading args)" {
+test "integration: apply (no leading args)" {
     try expectOutput("(apply + (list 1 2 3 4 5))", "15");
     try expectOutput("(apply * [2 3 4])", "24");
 }
 
-test "integration: 3.3b — apply with leading args" {
+test "integration: apply with leading args" {
     try expectOutput("(apply + 10 (list 1 2 3))", "16");
     try expectOutput("(apply + 1 2 3 (list 4 5))", "15");
 }
 
-test "integration: 3.3b — apply with user fn" {
+test "integration: apply with user fn" {
     try expectOutput(
         \\(do (defn square [x] (* x x))
         \\    (apply square (list 7)))
     , "49");
 }
 
-test "integration: 3.3b — map (eager) on list + vector" {
+test "integration: map (eager) on list + vector" {
     try expectOutput("(map inc (list 1 2 3 4))", "(2 3 4 5)");
     try expectOutput("(map inc [10 20 30])", "(11 21 31)");
     try expectOutput("(map inc nil)", "()");
 }
 
-test "integration: 3.3b — reduce" {
+test "integration: reduce" {
     try expectOutput("(reduce + 0 [1 2 3 4 5])", "15");
     try expectOutput("(reduce + 0 (list))", "0");
     try expectOutput("(reduce * 1 [1 2 3 4])", "24");
     try expectOutput("(reduce + 100 nil)", "100");
 }
 
-test "integration: 3.3b — filter" {
+test "integration: filter" {
     try expectOutput("(filter odd? [1 2 3 4 5 6 7])", "(1 3 5 7)");
     try expectOutput("(filter pos? [-2 -1 0 1 2])", "(1 2)");
     try expectOutput("(filter some? (list 1 nil 2 nil 3))", "(1 2 3)");
 }
 
-test "integration: 3.3b — map with user lambda" {
+test "integration: map with user lambda" {
     try expectOutput(
         \\(map (fn* [x] (* x x)) [1 2 3 4])
     , "(1 4 9 16)");
 }
 
-test "integration: 3.3b — reduce with user lambda" {
+test "integration: reduce with user lambda" {
     try expectOutput(
         \\(reduce (fn* [acc x] (+ acc (* x x))) 0 [1 2 3])
     , "14");
 }
 
-test "integration: 3.3b — throw inside map propagates to outer catch" {
+test "integration: throw inside map propagates to outer catch" {
     try expectOutput(
         \\(try (map (fn* [x] (throw :boom)) [1 2 3])
         \\     (catch any e e))
     , ":boom");
 }
 
-test "integration: 3.3b — throw inside reduce propagates" {
+test "integration: throw inside reduce propagates" {
     try expectOutput(
         \\(try (reduce (fn* [acc x]
         \\               (if (< 10 acc)
@@ -1163,14 +1160,14 @@ test "integration: 3.3b — throw inside reduce propagates" {
     , ":too-big");
 }
 
-test "integration: 3.3b — throw through apply" {
+test "integration: throw through apply" {
     try expectOutput(
         \\(try (apply (fn* [x] (throw :inside-apply)) (list 99))
         \\     (catch any e e))
     , ":inside-apply");
 }
 
-test "integration: 3.3b — HOFs composed" {
+test "integration: HOFs composed" {
     try expectOutput(
         \\(reduce + 0 (filter odd? (map inc [0 1 2 3 4 5])))
     , "9");
@@ -1180,7 +1177,7 @@ test "integration: 3.3b — HOFs composed" {
 }
 
 // =============================================================================
-// Phase 3.2 — user-defined defmacro
+// User-defined defmacro
 // =============================================================================
 
 test "integration: defmacro — define then use in same do-block" {
@@ -1219,7 +1216,7 @@ test "integration: defmacro — user macro shadows host macro" {
 }
 
 test "integration: defmacro — macro can use already-defined macros in body" {
-    // outer's body uses unless (a previously-defined macro);
+    // twice's body uses unless (a macro defined above it);
     // when outer is invoked, the macro fn body is already
     // expanded so the unless call is already turned into (if).
     try expectOutput(
@@ -1230,7 +1227,7 @@ test "integration: defmacro — macro can use already-defined macros in body" {
 }
 
 // =============================================================================
-// Phase 3.1 — maps/sets as runtime values
+// Maps/sets as runtime values
 // =============================================================================
 
 test "integration: quoted empty map" {
@@ -1266,13 +1263,12 @@ test "integration: bare vector literal as expression" {
 }
 
 // =============================================================================
-// Phase 3.0c — catchable VmErrors
+// Catchable VmErrors
 // =============================================================================
 //
-// Per peer-AI turn 62: recoverable VmError variants are
-// translated into keyword Values when an active handler can
-// catch them. Without a handler, the raw VmError propagates
-// unchanged (backward compat).
+// Recoverable VmError variants are translated into keyword Values
+// when an active handler can catch them. Without a handler, the raw
+// VmError propagates unchanged.
 
 test "integration: catchable — KindMismatch caught as :kind-mismatch" {
     try expectOutput("(try (+ 1 :hello) (catch any e e))", ":kind-mismatch");
@@ -1313,7 +1309,7 @@ test "integration: catchable — KindMismatch BYPASSES translation when no handl
 }
 
 // =============================================================================
-// Phase 3.0b — anon-fn #(...) shorthand
+// Anon-fn #(...) shorthand
 // =============================================================================
 
 test "integration: anon-fn — bare #(+ 1 2)" {
@@ -1346,7 +1342,7 @@ test "integration: composite — syntax-quote inside defn" {
 }
 
 // =============================================================================
-// Phase 5 Item 1 — atoms (peer-AI turn 75; docs/ATOM.md)
+// Atoms (docs/ATOM.md)
 // =============================================================================
 //
 // Coverage map (every spec invariant in ATOM.md should have at
@@ -1359,10 +1355,10 @@ test "integration: composite — syntax-quote inside defn" {
 //   §4.5 `(swap-vals! a f & args)`               → swap-vals test
 //   §4.6 `(compare-and-set! a old new)`          → CAS tests
 //   §5 universal `deref` / `@a` / `db/deref`     → deref tests
-//   §6 codec :unserializable (atom + nested)     → wire later via DB
+//   §6 codec :unserializable (atom + nested)     → not covered here
 //   §9 catchable errors                          → error keyword tests
 
-test "phase5 atom: ctor + atom? predicate" {
+test "atom: ctor + atom? predicate" {
     try expectOutput("(atom? (atom 0))", "true");
     try expectOutput("(atom? (atom :anything))", "true");
     try expectOutput("(atom? 1)", "false");
@@ -1371,7 +1367,7 @@ test "phase5 atom: ctor + atom? predicate" {
     try expectOutput("(atom? [1 2])", "false");
 }
 
-test "phase5 atom: deref via @a, (deref a), (db/deref a)" {
+test "atom: deref via @a, (deref a), (db/deref a)" {
     try expectOutput("@(atom 42)", "42");
     try expectOutput("(deref (atom 42))", "42");
     try expectOutput("(db/deref (atom 42))", "42");
@@ -1380,7 +1376,7 @@ test "phase5 atom: deref via @a, (deref a), (db/deref a)" {
     try expectOutput("@(atom [1 2 3])", "[1 2 3]");
 }
 
-test "phase5 atom: identity equality (= a a) vs (= (atom v) (atom v))" {
+test "atom: identity equality (= a a) vs (= (atom v) (atom v))" {
     // Same atom compares equal to itself.
     try expectOutput("(let [a (atom 1)] (= a a))", "true");
     // Two distinct atoms holding equal values are NOT equal.
@@ -1395,20 +1391,20 @@ test "phase5 atom: identity equality (= a a) vs (= (atom v) (atom v))" {
     , "true");
 }
 
-test "phase5 atom: reset! sets value, returns new value" {
+test "atom: reset! sets value, returns new value" {
     try expectOutput("(let [a (atom 0)] (reset! a 42))", "42");
     try expectOutput("(let [a (atom 0)] (reset! a 42) @a)", "42");
     try expectOutput("(let [a (atom :before)] (reset! a :after) @a)", ":after");
 }
 
-test "phase5 atom: swap! with inc / + / variadic args" {
+test "atom: swap! with inc / + / variadic args" {
     try expectOutput("(let [a (atom 0)] (swap! a inc))", "1");
     try expectOutput("(let [a (atom 0)] (swap! a inc) (swap! a inc) @a)", "2");
     try expectOutput("(let [a (atom 10)] (swap! a + 32))", "42");
     try expectOutput("(let [a (atom 10)] (swap! a + 1 2 3 4))", "20");
 }
 
-test "phase5 atom: swap! rollback on throw — value unchanged" {
+test "atom: swap! rollback on throw — value unchanged" {
     try expectOutput(
         \\(let [a (atom 11)]
         \\  (try (swap! a (fn [_] (throw :bad))) (catch any e e))
@@ -1423,7 +1419,7 @@ test "phase5 atom: swap! rollback on throw — value unchanged" {
     , ":nope");
 }
 
-test "phase5 atom: swap! re-entrancy detection (:atom-re-entry)" {
+test "atom: swap! re-entrancy detection (:atom-re-entry)" {
     try expectOutput(
         \\(let [a (atom 0)]
         \\  (try (swap! a (fn [_] (reset! a 999))) (catch any e e)))
@@ -1442,7 +1438,7 @@ test "phase5 atom: swap! re-entrancy detection (:atom-re-entry)" {
     , ":atom-re-entry");
 }
 
-test "phase5 atom: swap! deref of in-flight atom is allowed" {
+test "atom: swap! deref of in-flight atom is allowed" {
     // deref does NOT touch in_flight, so a swap! function may
     // legally call @a (e.g., to inspect the staging value).
     // This is the canonical "side-effecting log inside swap!"
@@ -1453,7 +1449,7 @@ test "phase5 atom: swap! deref of in-flight atom is allowed" {
     , "14");
 }
 
-test "phase5 atom: swap-vals! returns [old new] vector" {
+test "atom: swap-vals! returns [old new] vector" {
     try expectOutput("(let [a (atom 10)] (swap-vals! a inc))", "[10 11]");
     try expectOutput("(let [a (atom 10)] (swap-vals! a inc) @a)", "11");
     try expectOutput(
@@ -1461,7 +1457,7 @@ test "phase5 atom: swap-vals! returns [old new] vector" {
     , "[1 10]");
 }
 
-test "phase5 atom: swap-vals! rollback on throw" {
+test "atom: swap-vals! rollback on throw" {
     try expectOutput(
         \\(let [a (atom 1)]
         \\  (try (swap-vals! a (fn [_] (throw :bad))) (catch any e :caught))
@@ -1469,7 +1465,7 @@ test "phase5 atom: swap-vals! rollback on throw" {
     , "1");
 }
 
-test "phase5 atom: compare-and-set! identity-based" {
+test "atom: compare-and-set! identity-based" {
     try expectOutput(
         \\(let [a (atom 11)] (compare-and-set! a 11 100))
     , "true");
@@ -1484,7 +1480,7 @@ test "phase5 atom: compare-and-set! identity-based" {
     , "11");
 }
 
-test "phase5 atom: compare-and-set! uses identity, not =" {
+test "atom: compare-and-set! uses identity, not =" {
     // Two distinct vectors are structurally equal but NOT
     // pointer-identical. CAS must reject the swap.
     try expectOutput(
@@ -1501,19 +1497,19 @@ test "phase5 atom: compare-and-set! uses identity, not =" {
     , "true");
 }
 
-test "phase5 atom: reset!/swap!/CAS type errors caught as :kind-mismatch" {
+test "atom: reset!/swap!/CAS type errors caught as :kind-mismatch" {
     try expectOutput("(try (reset! 1 2) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (swap! 1 inc) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (compare-and-set! 1 1 2) (catch any e e))", ":kind-mismatch");
 }
 
-test "phase5 atom: swap! with non-callable f surfaces :not-callable" {
+test "atom: swap! with non-callable f surfaces :not-callable" {
     try expectOutput(
         \\(try (swap! (atom 1) 2) (catch any e e))
     , ":not-callable");
 }
 
-test "phase5 atom: atoms as map keys distinguish by identity" {
+test "atom: atoms as map keys distinguish by identity" {
     // Same atom used twice as a key resolves to its single
     // entry's value. Identity-based; lookup with the same atom
     // succeeds.
@@ -1528,33 +1524,30 @@ test "phase5 atom: atoms as map keys distinguish by identity" {
     , "nil");
 }
 
-test "phase5 atom: universal deref still serves Vars" {
-    // deref over Var: still works after the .atom arm was added
-    // (regression guard for peer-AI turn 73's behavior).
+test "atom: universal deref still serves Vars" {
+    // deref over Var: the .atom arm does not displace the Var arm.
     try expectOutput("(do (def x 5) (deref (var x)))", "5");
 }
 
-test "phase5 atom: @-lowering is not lexically shadowable" {
-    // Peer-AI turn 76 §"Must-fix": reader-macro `@` must NOT be
-    // captured by a local binding named `deref`. `@x` lowers to
-    // QUALIFIED `(nexis.core/deref x)` which resolves through the
-    // registry, not through lexical fall-through. Confirms the
-    // turn-76 fix.
+test "atom: @-lowering is not lexically shadowable" {
+    // Reader-macro `@` must NOT be captured by a local binding
+    // named `deref`. `@x` lowers to QUALIFIED `(nexis.core/deref x)`
+    // which resolves through the registry, not through lexical
+    // fall-through.
     try expectOutput(
         \\(let [deref (fn [_] 42)
         \\      a    (atom 5)]
         \\  @a)
     , "5");
     // Note: `(def deref ...)` at top level does NOT prove a
-    // separate shadowing case because Phase 3.4 auto-refer makes
-    // `def` of an auto-referred name UPDATE the shared
-    // `nexis.core/deref` Var in place (compile.zig addVarRef walks
-    // the parent chain). That's a pre-existing language behavior,
-    // not specific to atoms or `@`. The lexical-binding case above
-    // is the load-bearing one for the turn-76 fix.
+    // separate shadowing case because auto-refer makes `def` of an
+    // auto-referred name UPDATE the shared `nexis.core/deref` Var in
+    // place (compile.zig addVarRef walks the parent chain). That is
+    // general language behavior, not specific to atoms or `@`. The
+    // lexical-binding case above is the load-bearing one.
 }
 
-test "phase5 atom: self-reference does not break equality / count" {
+test "atom: self-reference does not break equality / count" {
     // An atom holding itself satisfies (= @a a). Pins the
     // GC self-reference safety + cycle behavior at the
     // language level.
@@ -1564,17 +1557,17 @@ test "phase5 atom: self-reference does not break equality / count" {
 }
 
 // =============================================================================
-// Phase 5 Item 2 sub-step 5.2a — core string ops (peer-AI turn 77)
+// Core string ops
 // =============================================================================
 //
 // User-facing string ops index by Unicode SCALAR (codepoint), not
-// byte. Test coverage hits the four corners turn 77 §Tests:
+// byte. Test coverage hits four corners:
 //   - ASCII baseline                  → count/nth/subs on ASCII
 //   - Multi-byte codepoint sanity     → count of "é", "🦀", mixed
 //   - Bounds                          → :index-out-of-bounds keyword
 //   - str shape                       → Clojure-canonical for nil/kw/sym/atom
 
-test "phase5.2a string?: kind predicate" {
+test "string: string?: kind predicate" {
     try expectOutput("(string? \"hi\")", "true");
     try expectOutput("(string? \"\")", "true");
     try expectOutput("(string? :hello)", "false");
@@ -1583,7 +1576,7 @@ test "phase5.2a string?: kind predicate" {
     try expectOutput("(string? [\"a\"])", "false");
 }
 
-test "phase5.2a count: ASCII + multibyte codepoints" {
+test "string: count: ASCII + multibyte codepoints" {
     try expectOutput("(count \"\")", "0");
     try expectOutput("(count \"a\")", "1");
     try expectOutput("(count \"hello\")", "5");
@@ -1595,13 +1588,13 @@ test "phase5.2a count: ASCII + multibyte codepoints" {
     try expectOutput("(count \"aéb🦀\")", "4");
 }
 
-test "phase5.2a empty?: byteLen == 0 fast path" {
+test "string: empty?: byteLen == 0 fast path" {
     try expectOutput("(empty? \"\")", "true");
     try expectOutput("(empty? \"x\")", "false");
     try expectOutput("(empty? \"🦀\")", "false");
 }
 
-test "phase5.2a nth on string: returns Kind.char at codepoint index" {
+test "string: nth on string: returns Kind.char at codepoint index" {
     try expectOutput("(nth \"abc\" 0)", "a");
     try expectOutput("(nth \"abc\" 1)", "b");
     try expectOutput("(nth \"abc\" 2)", "c");
@@ -1613,17 +1606,17 @@ test "phase5.2a nth on string: returns Kind.char at codepoint index" {
     try expectOutput("(nth \"a🦀b\" 1)", "🦀");
 }
 
-test "phase5.2a nth on string: out-of-bounds + default" {
+test "string: nth on string: out-of-bounds + default" {
     try expectOutput("(try (nth \"ab\" 2) (catch any e e))", ":index-out-of-bounds");
     try expectOutput("(try (nth \"\" 0) (catch any e e))", ":index-out-of-bounds");
-    // Negative index: same keyword (peer-AI turn 77 §D2).
+    // Negative index: same keyword.
     try expectOutput("(try (nth \"ab\" -1) (catch any e e))", ":index-out-of-bounds");
     // Default branch: out-of-bounds returns default instead of throwing.
     try expectOutput("(nth \"ab\" 5 :missing)", ":missing");
     try expectOutput("(nth \"ab\" -1 :neg)", ":neg");
 }
 
-test "phase5.2a subs: codepoint indices, two- and three-arity" {
+test "string: subs: codepoint indices, two- and three-arity" {
     try expectOutput("(subs \"hello\" 1)", "ello");
     try expectOutput("(subs \"hello\" 0)", "hello");
     try expectOutput("(subs \"hello\" 1 4)", "ell");
@@ -1636,7 +1629,7 @@ test "phase5.2a subs: codepoint indices, two- and three-arity" {
     try expectOutput("(subs \"aéb🦀\" 3)", "🦀");
 }
 
-test "phase5.2a subs: bounds errors as :index-out-of-bounds" {
+test "string: subs: bounds errors as :index-out-of-bounds" {
     try expectOutput("(try (subs \"ab\" -1) (catch any e e))", ":index-out-of-bounds");
     try expectOutput("(try (subs \"ab\" 0 -1) (catch any e e))", ":index-out-of-bounds");
     try expectOutput("(try (subs \"ab\" 3) (catch any e e))", ":index-out-of-bounds");
@@ -1645,13 +1638,13 @@ test "phase5.2a subs: bounds errors as :index-out-of-bounds" {
     try expectOutput("(try (subs \"abc\" 2 1) (catch any e e))", ":index-out-of-bounds");
 }
 
-test "phase5.2a subs: kind-mismatch on non-string / non-fixnum index" {
+test "string: subs: kind-mismatch on non-string / non-fixnum index" {
     try expectOutput("(try (subs 42 0) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (subs \"ab\" :nope) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (subs \"ab\" 0 :nope) (catch any e e))", ":kind-mismatch");
 }
 
-test "phase5.2a str: Clojure-canonical concat shape" {
+test "string: str: Clojure-canonical concat shape" {
     try expectOutput("(str)", "");
     try expectOutput("(str nil)", "");
     try expectOutput("(str \"a\" \"b\" \"c\")", "abc");
@@ -1662,51 +1655,49 @@ test "phase5.2a str: Clojure-canonical concat shape" {
     try expectOutput("(str -7)", "-7");
     // Char concatenates as its UTF-8 bytes (matches display mode).
     try expectOutput("(str (nth \"é\" 0))", "é");
-    // Atom prints opaquely as `#<atom>` (turn 77 §D4 deterministic).
+    // Atom prints opaquely as `#<atom>` (deterministic).
     try expectOutput("(str (atom 1))", "#<atom>");
 }
 
-test "phase5.2a str: result is itself a string" {
+test "string: str: result is itself a string" {
     try expectOutput("(string? (str \"a\" 1 :b))", "true");
     try expectOutput("(count (str \"héllo\"))", "5");
 }
 
-test "phase5.2a string? after subs returns true" {
+test "string: string? after subs returns true" {
     try expectOutput("(string? (subs \"hello\" 1 4))", "true");
 }
 
-test "phase5.2a nth: kind-mismatch fires on non-indexable receiver (peer-AI turn 78)" {
-    // Pre-5.2a bug: the negative-index + default path returned
-    // the default even when the receiver was non-indexable. The
-    // turn-78 fix moves the kind check ABOVE the index-sign
-    // branch. `(nth 123 -1 :d)` must be `:kind-mismatch`, NOT
-    // `:d`.
+test "string: nth: kind-mismatch fires on non-indexable receiver" {
+    // The kind check sits ABOVE the index-sign branch, so the
+    // negative-index + default path never returns the default for
+    // a non-indexable receiver. `(nth 123 -1 :d)` must be
+    // `:kind-mismatch`, NOT `:d`.
     try expectOutput("(try (nth 123 -1 :d) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (nth :keyword 0 :d) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (nth {:a 1} 0 :d) (catch any e e))", ":kind-mismatch");
-    // Strings + vectors + lists + nil still honor the default-
-    // on-OOB contract from Phase 3.5.
+    // Strings + vectors + lists + nil honor the default-on-OOB
+    // contract.
     try expectOutput("(nth \"ab\" -1 :d)", ":d");
     try expectOutput("(nth nil 0 :d)", ":d");
     try expectOutput("(nth [1 2] 5 :d)", ":d");
 }
 
-test "phase5.2a subs: boundary case (start == end at count)" {
-    // Peer-AI turn 78 §R4: `(subs s n n)` for any `n` in
-    // `[0, count]` returns `""`. The end-at-end boundary should
-    // succeed, not throw.
+test "string: subs: boundary case (start == end at count)" {
+    // `(subs s n n)` for any `n` in `[0, count]` returns `""`.
+    // The end-at-end boundary succeeds rather than throwing.
     try expectOutput("(subs \"abc\" 3 3)", "");
     try expectOutput("(count (subs \"abc\" 3 3))", "0");
 }
 
-test "phase5.2a nth: char-at-default on out-of-bounds + multibyte" {
-    // Peer-AI turn 78 §R5: `(nth s i :default)` returns default
-    // when `i >= codepointCount`. Multi-byte boundary.
+test "string: nth: char-at-default on out-of-bounds + multibyte" {
+    // `(nth s i :default)` returns default when
+    // `i >= codepointCount`. Multi-byte boundary.
     try expectOutput("(nth \"é\" 0 :default)", "é");
     try expectOutput("(nth \"é\" 1 :default)", ":default");
 }
 
-test "phase5.2a end-to-end DB persistence of a string value (peer-AI turn 78 §R9)" {
+test "string: end-to-end DB persistence of a string value" {
     // Direct test that string literals survive the entire
     // compile → durable codec → emdb → decode → user path. The
     // todo-app demo uses keyword values; this test pins the
@@ -1794,7 +1785,7 @@ test "db/scan and db/reduce-tree read a value that spans several overflow pages"
 }
 
 // =============================================================================
-// Phase 5 Item 2 sub-step 5.2b — nexis.string namespace (peer-AI turn 79)
+// nexis.string namespace
 // =============================================================================
 //
 // Coverage map (every STRING.md §8 invariant gets at least one row):
@@ -1806,17 +1797,16 @@ test "db/scan and db/reduce-tree read a value that spans several overflow pages"
 //
 // Also pins: qualified-only (NOT auto-referred into user).
 
-test "phase5.2b nexis.string is qualified-only (not auto-referred)" {
+test "nexis.string: qualified-only (not auto-referred)" {
     // Bare `(lower-case ...)` from user namespace must NOT
-    // resolve to nexis.string/lower-case. The user-friendly
-    // surface for short names will be require/alias (Phase 3.6
-    // already supports this) or `:refer`. Until then, qualified
-    // calls are the only path.
+    // resolve to nexis.string/lower-case. Short names reach it
+    // only through `(require ... :as ...)`; `:refer` is unsupported,
+    // so qualified calls are the only other path.
     try expectOutput("(try (lower-case \"HI\") (catch any e e))", ":unbound-var");
     try expectOutput("(nexis.string/lower-case \"HI\")", "hi");
 }
 
-test "phase5.2b lower-case + upper-case: ASCII baseline" {
+test "nexis.string: lower-case + upper-case: ASCII baseline" {
     try expectOutput("(nexis.string/lower-case \"HELLO\")", "hello");
     try expectOutput("(nexis.string/lower-case \"Hello, World!\")", "hello, world!");
     try expectOutput("(nexis.string/upper-case \"hello\")", "HELLO");
@@ -1825,9 +1815,9 @@ test "phase5.2b lower-case + upper-case: ASCII baseline" {
     try expectOutput("(nexis.string/upper-case \"\")", "");
 }
 
-test "phase5.2b lower-case + upper-case: non-ASCII passes through unchanged" {
+test "nexis.string: lower-case + upper-case: non-ASCII passes through unchanged" {
     // ASCII letters map; non-ASCII bytes are preserved verbatim
-    // (peer-AI turn 79 §D1). UTF-8 validity is preserved by
+    // (STRING.md §8.1). UTF-8 validity is preserved by
     // construction because bytes ≥ 0x80 are never modified.
     try expectOutput("(nexis.string/lower-case \"HéLLO\")", "héllo");
     try expectOutput("(nexis.string/upper-case \"abç\")", "ABç");
@@ -1836,7 +1826,7 @@ test "phase5.2b lower-case + upper-case: non-ASCII passes through unchanged" {
     try expectOutput("(count (nexis.string/lower-case \"HéLLO\"))", "5");
 }
 
-test "phase5.2b trim: six ASCII whitespace chars; both sides" {
+test "nexis.string: trim: six ASCII whitespace chars; both sides" {
     try expectOutput("(nexis.string/trim \"   hello   \")", "hello");
     try expectOutput("(nexis.string/trim \"hello\")", "hello");
     try expectOutput("(nexis.string/trim \"\")", "");
@@ -1847,13 +1837,13 @@ test "phase5.2b trim: six ASCII whitespace chars; both sides" {
     try expectOutput("(nexis.string/trim \"\\t\\nhi\\r\\n\")", "hi");
     // All-whitespace input → empty.
     try expectOutput("(nexis.string/trim \"   \\t\\n\")", "");
-    // Unicode whitespace (U+00A0 NBSP) is NOT recognized in v1
-    // (turn 79 §D2). Bytes 0xC2 0xA0 pass through.
+    // Unicode whitespace (U+00A0 NBSP) is NOT recognized
+    // (STRING.md §8.2). Bytes 0xC2 0xA0 pass through.
     try expectOutput("(nexis.string/trim \"\u{00A0}x\u{00A0}\")", "\u{00A0}x\u{00A0}");
 }
 
-test "phase5.2b split: literal delimiter, preserves trailing empties" {
-    // Turn 79 §D3 override of Clojure's regex-trim behavior.
+test "nexis.string: split: literal delimiter, preserves trailing empties" {
+    // Differs from Clojure's regex-trim behavior (STRING.md §8.3).
     try expectOutput("(nexis.string/split \"a,b,c\" \",\")", "[a b c]");
     try expectOutput("(nexis.string/split \"a,b,\" \",\")", "[a b ]");
     try expectOutput("(nexis.string/split \",,\" \",\")", "[  ]");
@@ -1866,7 +1856,7 @@ test "phase5.2b split: literal delimiter, preserves trailing empties" {
     try expectOutput("(nexis.string/split \"é,🦀,b\" \",\")", "[é 🦀 b]");
 }
 
-test "phase5.2b split: empty delim and non-string args (peer-AI turn 80 §#2)" {
+test "nexis.string: split: empty delim and non-string args" {
     // Empty delimiter is a string of the wrong VALUE (not the
     // wrong KIND), so it surfaces `:invalid-argument` per turn
     // 80's taxonomy improvement; non-string args remain
@@ -1876,12 +1866,12 @@ test "phase5.2b split: empty delim and non-string args (peer-AI turn 80 §#2)" {
     try expectOutput("(try (nexis.string/split 1 \",\") (catch any e e))", ":kind-mismatch");
 }
 
-test "phase5.2b split: returns a vector" {
+test "nexis.string: split: returns a vector" {
     try expectOutput("(let [parts (nexis.string/split \"a,b,c\" \",\")] (count parts))", "3");
     try expectOutput("(nth (nexis.string/split \"a,b,c\" \",\") 1)", "b");
 }
 
-test "phase5.2b join: 1-arity concatenates without separator" {
+test "nexis.string: join: 1-arity concatenates without separator" {
     try expectOutput("(nexis.string/join [])", "");
     try expectOutput("(nexis.string/join nil)", "");
     try expectOutput("(nexis.string/join [\"a\" \"b\" \"c\"])", "abc");
@@ -1889,7 +1879,7 @@ test "phase5.2b join: 1-arity concatenates without separator" {
     try expectOutput("(nexis.string/join (list :x :y :z))", ":x:y:z");
 }
 
-test "phase5.2b join: 2-arity inserts separator between elements" {
+test "nexis.string: join: 2-arity inserts separator between elements" {
     try expectOutput("(nexis.string/join \",\" [])", "");
     try expectOutput("(nexis.string/join \",\" [\"a\"])", "a");
     try expectOutput("(nexis.string/join \",\" [\"a\" \"b\" \"c\"])", "a,b,c");
@@ -1897,7 +1887,7 @@ test "phase5.2b join: 2-arity inserts separator between elements" {
     try expectOutput("(nexis.string/join \"::\" [\"x\" \"y\" \"z\"])", "x::y::z");
 }
 
-test "phase5.2b join: rejects map; rejects non-string sep" {
+test "nexis.string: join: rejects map; rejects non-string sep" {
     // Turn 79 §D4: maps excluded until CHAMP iteration order is
     // pinned; non-string sep surfaces :kind-mismatch.
     try expectOutput("(try (nexis.string/join {:a 1 :b 2}) (catch any e e))", ":kind-mismatch");
@@ -1906,9 +1896,9 @@ test "phase5.2b join: rejects map; rejects non-string sep" {
     try expectOutput("(try (nexis.string/join \",\" 42) (catch any e e))", ":kind-mismatch");
 }
 
-test "phase5.2b join: round-trips with split" {
+test "nexis.string: join: round-trips with split" {
     // Useful pin: (join sep (split s sep)) == s when sep is in s
-    // and trailing empties are preserved (turn 79 §D3).
+    // and trailing empties are preserved (STRING.md §8.3).
     try expectOutput(
         \\(let [s "x,y,z" sep ","]
         \\  (nexis.string/join sep (nexis.string/split s sep)))
@@ -1919,7 +1909,7 @@ test "phase5.2b join: round-trips with split" {
     , "a,b,,");
 }
 
-test "phase5.2b replace: literal, all-non-overlapping" {
+test "nexis.string: replace: literal, all-non-overlapping" {
     try expectOutput("(nexis.string/replace \"abc\" \"b\" \"X\")", "aXc");
     try expectOutput("(nexis.string/replace \"abababab\" \"ab\" \"X\")", "XXXX");
     // Turn 79 §D5: after match, cursor jumps by match.len, so
@@ -1935,7 +1925,7 @@ test "phase5.2b replace: literal, all-non-overlapping" {
     try expectOutput("(nexis.string/replace \"foobar\" \"foo\" \"\")", "bar");
 }
 
-test "phase5.2b replace: empty match / non-string args (peer-AI turn 80 §#2)" {
+test "nexis.string: replace: empty match / non-string args" {
     // Empty match → :invalid-argument (right kind, wrong value);
     // non-string args → :kind-mismatch.
     try expectOutput("(try (nexis.string/replace \"abc\" \"\" \"x\") (catch any e e))", ":invalid-argument");
@@ -1944,7 +1934,7 @@ test "phase5.2b replace: empty match / non-string args (peer-AI turn 80 §#2)" {
     try expectOutput("(try (nexis.string/replace 42 \"b\" \"x\") (catch any e e))", ":kind-mismatch");
 }
 
-test "phase5.2b replace: UTF-8 boundary safety" {
+test "nexis.string: replace: UTF-8 boundary safety" {
     // Valid UTF-8 in, valid UTF-8 out. `é` (0xC3 0xA9) won't be
     // matched by ASCII `c` (UTF-8 continuation bytes never equal
     // ASCII delimiter targets).
@@ -1952,17 +1942,16 @@ test "phase5.2b replace: UTF-8 boundary safety" {
 }
 
 // =============================================================================
-// Phase 5 Item 2 sub-step 5.2c — printing + I/O (peer-AI turn 81)
+// Printing + I/O
 // =============================================================================
 //
 // Print fns (print/println/prn) return nil; the test harness
-// compares the FINAL VALUE per peer-AI turn 81 §D8. Stdout
-// capture isn't worth the harness surgery for v1 — the
+// compares the FINAL VALUE. Stdout is not captured here — the
 // formatter's output shape is fully tested in src/format.zig.
 //
 // Slurp + spit are tested via round-trip in /tmp.
 
-test "phase5.2c pr-str: readable string output" {
+test "io: pr-str: readable string output" {
     try expectOutput("(pr-str)", "");
     try expectOutput("(pr-str nil)", "nil");
     try expectOutput("(pr-str 42)", "42");
@@ -1982,7 +1971,7 @@ test "phase5.2c pr-str: readable string output" {
     try expectOutput("(pr-str (nth \"abc\" 1))", "\\b");
 }
 
-test "phase5.2c str vs pr-str: nil semantics (peer-AI turn 81 §F1)" {
+test "io: str vs pr-str: nil semantics" {
     // `str` uses str-semantics: nil → "".
     try expectOutput("(str nil)", "");
     try expectOutput("(str nil :x nil)", ":x");
@@ -1991,7 +1980,7 @@ test "phase5.2c str vs pr-str: nil semantics (peer-AI turn 81 §F1)" {
     try expectOutput("(pr-str nil :x nil)", "nil :x nil");
 }
 
-test "phase5.2c join: nil-element semantics (turn 81 §D9 #1)" {
+test "io: join: nil-element semantics" {
     // `join` uses str-semantics for each element, so nil → empty
     // (no `nil` literal emitted between separators).
     try expectOutput("(nexis.string/join [1 nil 2])", "12");
@@ -1999,16 +1988,16 @@ test "phase5.2c join: nil-element semantics (turn 81 §D9 #1)" {
 }
 
 // =============================================================================
-// Phase 5.2c I/O error paths (peer-AI turn 81 §D6)
+// I/O error paths
 // =============================================================================
 //
 // Integration tests leave `vm.io` null (the test harness has no
-// std.Io context). Per turn 81 §D6 pin, that surfaces :io-error
-// — pinned here so the contract is grep-able. End-to-end I/O
+// std.Io context). That surfaces :io-error — pinned here so the
+// contract is grep-able. End-to-end I/O
 // is exercised via `bin/nexis run examples/...` smoke tests, not
 // here.
 
-test "phase5.2c print / println / prn / pr-str: no vm.io → :io-error" {
+test "io: print / println / prn / pr-str: no vm.io → :io-error" {
     try expectOutput("(try (print :a) (catch any e e))", ":io-error");
     try expectOutput("(try (println :a) (catch any e e))", ":io-error");
     try expectOutput("(try (prn :a) (catch any e e))", ":io-error");
@@ -2017,32 +2006,31 @@ test "phase5.2c print / println / prn / pr-str: no vm.io → :io-error" {
     try expectOutput("(pr-str :a)", ":a");
 }
 
-test "phase5.2c slurp / spit: no vm.io → :io-error" {
+test "io: slurp / spit: no vm.io → :io-error" {
     try expectOutput("(try (slurp \"/tmp/anything.txt\") (catch any e e))", ":io-error");
     try expectOutput("(try (spit \"/tmp/anything.txt\" \"x\") (catch any e e))", ":io-error");
 }
 
-test "phase5.2c slurp / spit: non-string path is :kind-mismatch" {
+test "io: slurp / spit: non-string path is :kind-mismatch" {
     try expectOutput("(try (slurp 42) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (spit :nope \"x\") (catch any e e))", ":kind-mismatch");
 }
 
-test "phase5.2c slurp / spit: empty path is :invalid-path" {
+test "io: slurp / spit: empty path is :invalid-path" {
     try expectOutput("(try (slurp \"\") (catch any e e))", ":invalid-path");
     try expectOutput("(try (spit \"\" \"x\") (catch any e e))", ":invalid-path");
 }
 
 // =============================================================================
-// Phase 5 Item 4 — case / condp macros (peer-AI turn 83)
+// case / condp / for macros
 // =============================================================================
 //
-// `for` ships in a follow-up commit per turn 83's split rec.
 // `case` + `condp` are pure expansion + single-eval gensym
 // patterns; both throw `:no-matching-clause` when no clause
-// matches and no default is supplied (peer-AI turn 83 §D1/§D2
-// OVERRIDE — returning nil silently masks bugs).
+// matches and no default is supplied (returning nil would
+// silently mask bugs).
 
-test "phase5.4 case: basic match + default" {
+test "case: basic match + default" {
     try expectOutput("(case 1 1 :one 2 :two :default)", ":one");
     try expectOutput("(case 2 1 :one 2 :two :default)", ":two");
     try expectOutput("(case 99 1 :one 2 :two :default)", ":default");
@@ -2051,7 +2039,7 @@ test "phase5.4 case: basic match + default" {
     try expectOutput("(case :anything :default)", ":default");
 }
 
-test "phase5.4 case: no match without default throws :no-matching-clause" {
+test "case: no match without default throws :no-matching-clause" {
     try expectOutput(
         \\(try (case 99 1 :one 2 :two) (catch any e e))
     , ":no-matching-clause");
@@ -2061,7 +2049,7 @@ test "phase5.4 case: no match without default throws :no-matching-clause" {
     , ":no-matching-clause");
 }
 
-test "phase5.4 case: heterogeneous keys + nested expressions" {
+test "case: heterogeneous keys + nested expressions" {
     // Keywords, integers, strings all compare via `=`.
     try expectOutput(
         \\(case :hi 1 :one :hi :greet :default)
@@ -2076,7 +2064,7 @@ test "phase5.4 case: heterogeneous keys + nested expressions" {
     , "102");
 }
 
-test "phase5.4 case: expression evaluated EXACTLY ONCE" {
+test "case: expression evaluated EXACTLY ONCE" {
     // Use an atom-mutating step fn to count evaluations.
     try expectOutput(
         \\(let [counter (atom 0)
@@ -2086,7 +2074,7 @@ test "phase5.4 case: expression evaluated EXACTLY ONCE" {
     , "1");
 }
 
-test "phase5.4 condp: predicate + default" {
+test "condp: predicate + default" {
     try expectOutput("(condp = 1 1 :one 2 :two :default)", ":one");
     try expectOutput("(condp = 2 1 :one 2 :two :default)", ":two");
     try expectOutput("(condp = 99 1 :one 2 :two :default)", ":default");
@@ -2094,13 +2082,13 @@ test "phase5.4 condp: predicate + default" {
     try expectOutput("(condp = 99 :default)", ":default");
 }
 
-test "phase5.4 condp: no match without default throws :no-matching-clause" {
+test "condp: no match without default throws :no-matching-clause" {
     try expectOutput(
         \\(try (condp = 99 1 :one 2 :two) (catch any e e))
     , ":no-matching-clause");
 }
 
-test "phase5.4 condp: predicate is called as (pred clause expr)" {
+test "condp: predicate is called as (pred clause expr)" {
     // `(condp < 5 ...)` invokes `(< clause 5)` per clause.
     // `(< 3 5)` is true → `:gt3`. `(< 10 5)` is false.
     try expectOutput(
@@ -2111,7 +2099,7 @@ test "phase5.4 condp: predicate is called as (pred clause expr)" {
     , ":gt3");
 }
 
-test "phase5.4 condp: pred + expr each evaluated EXACTLY ONCE" {
+test "condp: pred + expr each evaluated EXACTLY ONCE" {
     try expectOutput(
         \\(let [p-count (atom 0)
         \\      e-count (atom 0)
@@ -2124,32 +2112,30 @@ test "phase5.4 condp: pred + expr each evaluated EXACTLY ONCE" {
 
 // ---- for -----------------------------------------------------
 
-test "phase5.4 for: single binding maps over the source" {
+test "for: single binding maps over the source" {
     try expectOutput("(for [x [1 2 3]] (* x x))", "[1 4 9]");
     try expectOutput("(for [x []] (* x x))", "[]");
     try expectOutput("(for [x [42]] x)", "[42]");
 }
 
-test "phase5.4 for: multi-binding cartesian product" {
+test "for: multi-binding cartesian product" {
     // Cartesian order: outermost iterates first, innermost
-    // varies fastest. (Peer-AI turn 83 §D3 verified output
-    // expectation.)
+    // varies fastest.
     try expectOutput("(for [x [1 2] y [10 20]] (+ x y))", "[11 21 12 22]");
     try expectOutput(
         \\(for [x [:a :b] y [1 2 3]] [x y])
     , "[[:a 1] [:a 2] [:a 3] [:b 1] [:b 2] [:b 3]]");
 }
 
-test "phase5.4 for: :when filter" {
+test "for: :when filter" {
     // `<` is in core (not `>`); use `<` consistently in tests.
     try expectOutput("(for [x [1 2 3 4 5] :when (< 0 x)] x)", "[1 2 3 4 5]");
     try expectOutput("(for [x [1 2 3 4 5] :when (< 2 x)] x)", "[3 4 5]");
     try expectOutput("(for [x [1 2 3] :when (< 99 x)] x)", "[]");
 }
 
-test "phase5.4 for: :let modifier with destructuring-capable bindings" {
-    // `:let` uses `let` (NOT `let*`) so destructuring works —
-    // peer-AI turn 83 §\"`:let` destructuring\".
+test "for: :let modifier with destructuring-capable bindings" {
+    // `:let` uses `let` (NOT `let*`) so destructuring works.
     try expectOutput("(for [x [1 2 3] :let [y (* x 10)]] y)", "[10 20 30]");
     // Compose :let + :when (order matters; let-bound name
     // visible to the when's predicate).
@@ -2171,10 +2157,10 @@ test "phase5.4 for: :let modifier with destructuring-capable bindings" {
 // than surfacing them as catchable values.
 
 // =============================================================================
-// Phase 5 Item 3 sub-step 5.3a — records substrate (peer-AI turn 84)
+// Records substrate
 // =============================================================================
 
-test "phase5.3a defrecord: constructor + predicate + Counter-type-id" {
+test "defrecord: constructor + predicate + Counter-type-id" {
     try expectOutputProgram(
         \\(do
         \\  (defrecord Counter [n])
@@ -2192,7 +2178,7 @@ test "phase5.3a defrecord: constructor + predicate + Counter-type-id" {
     , "false");
 }
 
-test "phase5.3a defrecord: structural equality (turn 84 §D1)" {
+test "defrecord: structural equality" {
     // Two distinct constructor calls with the same field map
     // are STRUCTURALLY equal.
     try expectOutputProgram(
@@ -2215,7 +2201,7 @@ test "phase5.3a defrecord: structural equality (turn 84 §D1)" {
     , "false");
 }
 
-test "phase5.3a defrecord: map-like get / assoc / dissoc / contains?" {
+test "defrecord: map-like get / assoc / dissoc / contains?" {
     try expectOutputProgram(
         \\(do
         \\  (defrecord Counter [n])
@@ -2254,9 +2240,9 @@ test "phase5.3a defrecord: map-like get / assoc / dissoc / contains?" {
     , "false");
 }
 
-test "phase5.3a defrecord: extra keys allowed via map->Counter" {
+test "defrecord: extra keys allowed via map->Counter" {
     // Declared fields are constructor metadata, NOT a storage
-    // restriction (turn 84 §D4). map->Counter passes its arg
+    // restriction. map->Counter passes its arg
     // verbatim as the field map.
     try expectOutputProgram(
         \\(do
@@ -2266,7 +2252,7 @@ test "phase5.3a defrecord: extra keys allowed via map->Counter" {
     , "[true :hi]");
 }
 
-test "phase5.3a defrecord: keys + vals walk the field map" {
+test "defrecord: keys + vals walk the field map" {
     // Single-key map → deterministic key/value output via
     // `count` to avoid CHAMP iteration-order brittleness.
     try expectOutputProgram(
@@ -2282,10 +2268,10 @@ test "phase5.3a defrecord: keys + vals walk the field map" {
 }
 
 // =============================================================================
-// Phase 5 Item 3 sub-step 5.3b — protocols substrate (peer-AI turn 84)
+// Protocols substrate
 // =============================================================================
 
-test "phase5.3b defprotocol: registers protocol + method dispatchers" {
+test "defprotocol: registers protocol + method dispatchers" {
     // Smoke: both IFoo and bar end up bound to the right kinds.
     // (Use `str` rather than `println` because the test harness
     // has no `vm.io` and println→:io-error there.)
@@ -2296,11 +2282,11 @@ test "phase5.3b defprotocol: registers protocol + method dispatchers" {
     , "#<protocol id=0> true");
 }
 
-test "phase5.3b protocol dispatch with NO impl raises :no-protocol-impl" {
+test "protocol dispatch with NO impl raises :no-protocol-impl" {
     // Hand-trace from PROTOCOLS.md §5: registering IFoo then
     // calling `(bar receiver y)` with no impl for receiver's
     // dispatch key must raise a catchable :no-protocol-impl
-    // (NOT panic, NOT silently return nil). turn 84 §D6.
+    // (NOT panic, NOT silently return nil).
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this y]))
@@ -2317,7 +2303,7 @@ test "phase5.3b protocol dispatch with NO impl raises :no-protocol-impl" {
     , ":no-protocol-impl");
 }
 
-test "phase5.3b protocol dispatch with zero args raises :arity-mismatch" {
+test "protocol dispatch with zero args raises :arity-mismatch" {
     // `(bar)` has no receiver to dispatch on; dispatchProtocolMethod
     // raises ArityMismatch which surfaces as the catchable
     // keyword `:arity-mismatch`.
@@ -2329,11 +2315,11 @@ test "phase5.3b protocol dispatch with zero args raises :arity-mismatch" {
 }
 
 // =============================================================================
-// Phase 5 Item 3 sub-step 5.3c — defrecord with inline protocol impls
-// (peer-AI turn 84). The canonical hand-trace from PROTOCOLS.md §5.
+// defrecord with inline protocol impls. The canonical hand-trace
+// from PROTOCOLS.md §5.
 // =============================================================================
 
-test "phase5.3c hand-trace: (bar (->Counter 5) 7) -> 12" {
+test "protocol hand-trace: (bar (->Counter 5) 7) -> 12" {
     // The canonical hand-trace from PROTOCOLS.md §5 — verifies
     // end-to-end that defprotocol + defrecord-with-impl wire up
     // protocol dispatch correctly.
@@ -2348,7 +2334,7 @@ test "phase5.3c hand-trace: (bar (->Counter 5) 7) -> 12" {
     , "12");
 }
 
-test "phase5.3c defrecord impls: receiver-typed dispatch" {
+test "defrecord impls: receiver-typed dispatch" {
     // Two distinct records each with their own impl. Each
     // dispatches to its own body.
     try expectOutputProgram(
@@ -2360,7 +2346,7 @@ test "phase5.3c defrecord impls: receiver-typed dispatch" {
     , "[105 50]");
 }
 
-test "phase5.3c defrecord impls: multiple methods" {
+test "defrecord impls: multiple methods" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo
@@ -2374,7 +2360,7 @@ test "phase5.3c defrecord impls: multiple methods" {
     , "[5 12]");
 }
 
-test "phase5.3c defrecord impls: multiple protocols on one record" {
+test "defrecord impls: multiple protocols on one record" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this]))
@@ -2386,10 +2372,10 @@ test "phase5.3c defrecord impls: multiple protocols on one record" {
     , "[:i-am-bar :i-am-baz]");
 }
 
-test "phase5.3c defrecord impls: this is the literal record value" {
+test "defrecord impls: this is the literal record value" {
     // The first arg to a protocol method is the receiver itself
     // (NOT a magic this-pointer). It's just the value that gets
-    // passed in — peer-AI turn 84 §D2.
+    // passed in.
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this]))
@@ -2401,11 +2387,10 @@ test "phase5.3c defrecord impls: this is the literal record value" {
 }
 
 // =============================================================================
-// Phase 5 Item 3 sub-step 5.3d — extend-protocol/extend-type + satisfies? +
-// :any default (peer-AI turn 84).
+// extend-protocol/extend-type + satisfies? + :any default
 // =============================================================================
 
-test "phase5.3d extend-protocol: built-in kinds" {
+test "extend-protocol: built-in kinds" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this y]))
@@ -2416,7 +2401,7 @@ test "phase5.3d extend-protocol: built-in kinds" {
     , "[hi-7 35]");
 }
 
-test "phase5.3d extend-type: record and built-in mixed" {
+test "extend-type: record and built-in mixed" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this y]))
@@ -2427,7 +2412,7 @@ test "phase5.3d extend-type: record and built-in mixed" {
     , "[12 hi-7]");
 }
 
-test "phase5.3d :any default fallback" {
+test "protocol :any default fallback" {
     // :any catches receivers with no specific impl.
     try expectOutputProgram(
         \\(do
@@ -2439,7 +2424,7 @@ test "phase5.3d :any default fallback" {
     , "[:got-fixnum :got-any :got-any]");
 }
 
-test "phase5.3d satisfies?: identifies impl presence" {
+test "satisfies?: identifies impl presence" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this]))
@@ -2453,7 +2438,7 @@ test "phase5.3d satisfies?: identifies impl presence" {
     , "[true true false]");
 }
 
-test "phase5.3d satisfies? with :any default: always true" {
+test "satisfies? with :any default: always true" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this]))
@@ -2464,7 +2449,7 @@ test "phase5.3d satisfies? with :any default: always true" {
     , "[true true true]");
 }
 
-test "phase5.3d extend with :vector / :map friendly aliases" {
+test "extend-protocol with :vector / :map friendly aliases" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this]))
@@ -2475,7 +2460,7 @@ test "phase5.3d extend with :vector / :map friendly aliases" {
     , "[:v :m]");
 }
 
-test "phase5.3d extend-protocol with bogus type-kw: :invalid-argument" {
+test "extend-protocol with bogus type-kw: :invalid-argument" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this]))
@@ -2487,10 +2472,10 @@ test "phase5.3d extend-protocol with bogus type-kw: :invalid-argument" {
 }
 
 // =============================================================================
-// Phase 5 Item 5 — broader core.nx stdlib (peer-AI turn 74 §10.5)
+// Broader core.nx stdlib
 // =============================================================================
 
-test "phase5.5 core.nx: constantly / complement / partial / comp" {
+test "core.nx: constantly / complement / partial / comp" {
     try expectOutputProgram(
         \\((constantly 42))
     , "42");
@@ -2509,7 +2494,7 @@ test "phase5.5 core.nx: constantly / complement / partial / comp" {
     , "6");
 }
 
-test "phase5.5 core.nx: every? truthy + falsy cases" {
+test "core.nx: every? truthy + falsy cases" {
     try expectOutputProgram(
         \\(every? pos? [1 2 3])
     , "true");
@@ -2518,13 +2503,13 @@ test "phase5.5 core.nx: every? truthy + falsy cases" {
     , "false");
 }
 
-test "phase5.5 core.nx: every? empty seq is vacuously true" {
+test "core.nx: every? empty seq is vacuously true" {
     try expectOutputProgram(
         \\(every? pos? [])
     , "true");
 }
 
-test "phase5.5 core.nx: not-every?" {
+test "core.nx: not-every?" {
     try expectOutputProgram(
         \\(not-every? pos? [1 -2 3])
     , "true");
@@ -2533,7 +2518,7 @@ test "phase5.5 core.nx: not-every?" {
     , "false");
 }
 
-test "phase5.5 core.nx: some + not-any?" {
+test "core.nx: some + not-any?" {
     try expectOutputProgram(
         \\(some even? [1 3 5])
     , "nil");
@@ -2548,7 +2533,7 @@ test "phase5.5 core.nx: some + not-any?" {
     , "false");
 }
 
-test "phase5.5 core.nx: merge / update / get-in / assoc-in / update-in" {
+test "core.nx: merge / update / get-in / assoc-in / update-in" {
     try expectOutputProgram(
         \\(merge {:a 1} {:b 2} {:a 99})
     , "{:a 99, :b 2}");
@@ -2569,7 +2554,7 @@ test "phase5.5 core.nx: merge / update / get-in / assoc-in / update-in" {
     , "{:a {:b 2}}");
 }
 
-test "phase5.5 core.nx: frequencies / group-by / interpose" {
+test "core.nx: frequencies / group-by / interpose" {
     try expectOutputProgram(
         \\(get (frequencies [:a :b :a :c :a :b]) :a)
     , "3");
@@ -2584,7 +2569,7 @@ test "phase5.5 core.nx: frequencies / group-by / interpose" {
     , "()");
 }
 
-test "phase5.3b defprotocol: protocol-fn passes through map-as-key" {
+test "defprotocol: protocol-fn passes through map-as-key" {
     // protocol_fn values are identity-valued; storing two distinct
     // calls to defprotocol-emitted protocol_fn under the same key
     // verifies hash + equality agree.
@@ -2596,7 +2581,7 @@ test "phase5.3b defprotocol: protocol-fn passes through map-as-key" {
     , ":hi");
 }
 
-test "phase5.3a defrecord: records-as-map-keys use structural identity" {
+test "defrecord: records-as-map-keys use structural identity" {
     // Two structurally-equal records hash + compare equal so
     // they're the SAME key in a map. (Verified by storing under
     // the first record and looking up with the second.)
@@ -2610,7 +2595,7 @@ test "phase5.3a defrecord: records-as-map-keys use structural identity" {
     , ":found");
 }
 
-test "phase5.2b end-to-end: case + trim + split + join chain" {
+test "nexis.string: end-to-end case + trim + split + join chain" {
     // Composite test pinning that the six fns interop cleanly.
     try expectOutput(
         \\(let [raw     "  HELLO,WORLD,FROM,NEXIS  "

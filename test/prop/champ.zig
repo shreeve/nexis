@@ -296,8 +296,7 @@ test "M6: cross-subkind (array-map vs CHAMP) same entries hash AND equal (2000 t
     // and dissocs one back out (forcing CHAMP subkind). Both must be
     // `dispatch.equal` and produce identical `dispatch.hashValue`
     // outputs, proving the associative-category architecture holds
-    // across subkinds. This retires the fault line analogous to
-    // V3 for sequential. Bumped 500 → 2000 for gate #1 scaling.
+    // across subkinds (the associative analogue of vector V3).
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -535,7 +534,7 @@ test "M10: collision node stress — ≥5 distinct keys sharing an indexing hash
 // M11 (bonus): bedrock `equal ⇒ hashValue equal` over a large random pool
 // -----------------------------------------------------------------------------
 
-test "M11: equal ⇒ hashValue equal over 2000 random map pairs (gate #1 scaled)" {
+test "M11: equal ⇒ hashValue equal over 2000 random map pairs" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -718,7 +717,7 @@ test "S4: set equality laws (reflexive, symmetric, pairwise transitive)" {
     }
 }
 
-test "S5: cross-subkind (array-set vs CHAMP) retirement receipt (2000 trials, gate #1 scaled)" {
+test "S5: cross-subkind (array-set vs CHAMP) equal + hash-equal (2000 trials)" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
