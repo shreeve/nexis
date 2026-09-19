@@ -2234,17 +2234,19 @@ fn buildDefMultiFn(
 /// on argument count:
 ///   (fn name? [& args__auto__]
 ///     (let* [n__auto__ (count args__auto__)]
-///       (if (= n__auto__ 1) (let [p1 (nth args__auto__ 0)] b1)
-///       (if (= n__auto__ 2) (let [p1 (nth args__auto__ 0)
-///                                 p2 (nth args__auto__ 1)] b2)
-///       (if (not (< n__auto__ k)) (let [... rest (rest ...)] bv)
+///       (if (= n__auto__ 1) (loop [p1 (nth args__auto__ 0)] b1)
+///       (if (= n__auto__ 2) (loop [p1 (nth args__auto__ 0)
+///                                  p2 (nth args__auto__ 1)] b2)
+///       (if (not (< n__auto__ k)) (loop [... rest (rest ...)] bv)
 ///       (throw :arity-mismatch))))))
 /// Fixed arities are tested in source order and the variadic
 /// clause last, so an exact arity always wins over the variadic
 /// one. At most one variadic clause; its fixed count must not be
 /// below any fixed arity, and no fixed arity repeats (Clojure's
-/// rules). Each clause binds through `let`, so its params
-/// destructure.
+/// rules). Each clause binds through `loop`, so its params
+/// destructure and a `recur` in the clause's tail re-enters that
+/// clause with the clause's own arity (a variadic clause's rest
+/// parameter receives one seq), without touching the dispatch.
 fn buildMultiArityFn(
     ctx: *ExpandContext,
     call_form: *const Form,
@@ -2408,12 +2410,15 @@ fn buildVariadicCondition(ctx: *ExpandContext, origin: reader_mod.SrcSpan, n_sym
     return try makeList(ctx, not_items, origin);
 }
 
-/// Build the body of an arity branch: `(let* [params... from args_sym] body...)`.
-/// For fixed arity, each param i gets `(nth args_sym i)`. For
-/// variadic, the rest param gets a list built from
-/// `args_sym`'s suffix (here, we already passed args as a list,
-/// so the rest is `(drop fixed_count args_sym)` — but we don't
-/// have `drop` as a native fn. Use repeated `rest` instead.
+/// Build the body of an arity branch: `(loop [params... from
+/// args_sym] body...)`. For fixed arity, each param i gets `(nth
+/// args_sym i)`. For variadic, the rest param gets `args_sym`'s
+/// suffix through `fixed` nested `rest` calls (no `drop` native).
+/// The clause's parameters are loop locals, so a `recur` in the
+/// clause's tail rebinds exactly them and jumps to the clause
+/// body: Clojure's rule that `recur` re-enters the clause with
+/// the clause's own arity. A `recur` inside a nested `loop` in
+/// the clause targets that inner loop, as everywhere else.
 fn buildArityThen(
     ctx: *ExpandContext,
     origin: reader_mod.SrcSpan,
@@ -2441,13 +2446,14 @@ fn buildArityThen(
     const bindings_slice = try ctx.allocator.alloc(*Form, bindings.items.len);
     for (bindings.items, 0..) |b, j| bindings_slice[j] = b;
     const binds_vec = try makeVector(ctx, bindings_slice, origin);
-    // Use `let` (not `let*`) so param patterns themselves can be
-    // destructured (e.g., (defn f ([[x y]] (+ x y)))).
-    const let_items = try ctx.allocator.alloc(*Form, 2 + body.len);
-    let_items[0] = try makeSymbol(ctx, "let", origin);
-    let_items[1] = binds_vec;
-    for (body, 0..) |b, j| let_items[2 + j] = @constCast(b);
-    return try makeList(ctx, let_items, origin);
+    // `loop` (not `loop*`) so a param pattern destructures on
+    // entry and again after every `recur` (e.g., (defn f ([[x y]]
+    // (+ x y)))): `expandLoopRename` binds the pattern's gensym.
+    const loop_items = try ctx.allocator.alloc(*Form, 2 + body.len);
+    loop_items[0] = try makeSymbol(ctx, "loop", origin);
+    loop_items[1] = binds_vec;
+    for (body, 0..) |b, j| loop_items[2 + j] = @constCast(b);
+    return try makeList(ctx, loop_items, origin);
 }
 
 /// Destructure a single binding pair `pattern = expr`.
