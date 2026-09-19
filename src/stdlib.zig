@@ -2290,35 +2290,20 @@ fn isIfn(k: Kind) bool {
 //   :codec-failed        encode/decode error
 //   :tx-closed           op on a finished transaction
 //
-// Outside any `try`, the raw VmError propagates instead (the same
-// rule the VM applies to every recoverable error).
+// Storage failures are thrown through `VM.throwKeyword`, so outside
+// any `try` they surface as `UncaughtThrow` with the keyword in
+// `vm.unhandled_throw`, exactly like `(throw :db/key-too-large)`.
 //
 // Connection lifetime: each `db/open` allocates a Connection
 // on the VM's main allocator (NOT the runtime arena) + appends
 // it to vm.db_connections. `db/close` removes from the list +
 // frees. VM.deinit closes any remaining as a safety net.
 
-/// Throw the keyword `name` through `VM.throwKeyword`. When a
-/// handler catches it the result is `ControlTransferred`, which the
-/// run loop resumes from. With no handler anywhere the throw is
-/// withdrawn and `raw` is returned instead, so a program that does
-/// not opt into `try` sees the same VmError taxonomy as for every
-/// other recoverable error.
-fn throwKeyword(vm: *VM, name: []const u8, raw: VmError) VmError {
-    const err = vm.throwKeyword(name);
-    if (err == VmError.UncaughtThrow) {
-        vm.unhandled_throw = null;
-        return raw;
-    }
-    return err;
-}
-
-/// Surface a db.zig / emdb / codec error to the program.
+/// Throw a db.zig / emdb / codec error to the program as its
+/// keyword (`db.failureName`).
 fn dbFailure(vm: *VM, err: anyerror) VmError {
     if (err == error.OutOfMemory) return VmError.OutOfMemory;
-    const name = db_mod.failureName(err);
-    const raw: VmError = if (std.mem.eql(u8, name, "codec-failed")) VmError.CodecFailed else VmError.DbError;
-    return throwKeyword(vm, name, raw);
+    return vm.throwKeyword(db_mod.failureName(err));
 }
 
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
@@ -2441,7 +2426,7 @@ fn fnDbPutKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const v = args[1];
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
+    const conn = db_mod.refConn(r) orelse return vm.throwKeyword("db/no-connection");
     if (!conn.open_flag) return VmError.DbClosed;
     var txn = db_mod.beginWrite(conn) catch |err| return dbFailure(vm, err);
     db_mod.putRef(&txn, r, v) catch |err| {
@@ -2457,7 +2442,7 @@ fn fnDbGetKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const default = if (args.len > 1) args[1] else value_mod.nilValue();
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
+    const conn = db_mod.refConn(r) orelse return vm.throwKeyword("db/no-connection");
     if (!conn.open_flag) return VmError.DbClosed;
     var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
     defer db_mod.abortRead(&txn);
@@ -2468,7 +2453,7 @@ fn fnDbGetKey(vm: *VM, args: []const Value) VmError!Value {
 fn fnDbDeleteKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
+    const conn = db_mod.refConn(r) orelse return vm.throwKeyword("db/no-connection");
     if (!conn.open_flag) return VmError.DbClosed;
     var txn = db_mod.beginWrite(conn) catch |err| return dbFailure(vm, err);
     const existed = db_mod.delRef(&txn, r) catch |err| {
@@ -2482,7 +2467,7 @@ fn fnDbDeleteKey(vm: *VM, args: []const Value) VmError!Value {
 fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
+    const conn = db_mod.refConn(r) orelse return vm.throwKeyword("db/no-connection");
     if (!conn.open_flag) return VmError.DbClosed;
     var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
     defer db_mod.abortRead(&txn);
@@ -2651,7 +2636,7 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     return switch (x.kind()) {
         .durable_ref => blk: {
-            const conn = db_mod.refConn(x) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
+            const conn = db_mod.refConn(x) orelse return vm.throwKeyword("db/no-connection");
             if (!conn.open_flag) return VmError.DbClosed;
             var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
             defer db_mod.abortRead(&txn);
