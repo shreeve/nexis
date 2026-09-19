@@ -274,15 +274,12 @@ Order of operations:
 ```
 
 **GC rooting note:** step 5 allocates a 2-element vector AFTER the
-atom write at step 4. If a collection were to trigger on
-`vector_mod.fromTwo`'s allocation, `old` (a Zig local) would not be
-in any root set and could be collected if `old` is a heap value and
-`body.value = new_val` removed its last collection edge. The
-collector is **explicit-only** and the runtime never invokes it
-(`docs/GC.md` §9), so this hazard is **inactive**. Any
-allocation-triggered collection design must audit every native fn
-that allocates after holding Values in Zig locals; `docs/GC.md`
-§11.5 carries the checklist.
+atom write at step 4, when `old` (a Zig local) is no longer
+reachable from the atom. A collection cannot run there: the only
+safe point is the VM's instruction fetch and `Heap.alloc` never
+collects (`docs/GC.md` §7), so `old` is only ever at risk during
+the callback of step 3, where it is the atom's value and rooted
+through it. `docs/GC.md` §11.5 states the rule every native follows.
 
 #### 4.6 `(compare-and-set! a old new)`
 

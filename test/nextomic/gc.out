@@ -1,0 +1,6 @@
+ok predicate survives collections
+ok function binding results survive collections
+ok custom aggregate survives collections
+ok the same query parses again after the caches emptied
+done
+nil

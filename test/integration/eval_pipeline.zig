@@ -3936,3 +3936,104 @@ test "typed vectors: a store round trip through the codec" {
         \\  [i (typed-vector-type i) (= i (i64-vector [1 -2 140737488355328])) f (typed-vector-type f) (= f (f64-vector [0.5 0.0 (/ 1.0 0)]))])
     , "[#i64[1 -2 140737488355328] :i64 true #f64[0.5 -0.0 Infinity] :f64 true]");
 }
+
+// =============================================================================
+// The collector under a forced-frequent trigger (VM.md §9, GC.md §7)
+// =============================================================================
+
+/// `expectOutputProgram` on a VM whose collector is due every few
+/// kilobytes, so a native's callback runs through many cycles; the
+/// program must yield `expected` and at least one cycle must have run.
+fn expectOutputUnderGc(src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.gc_threshold = vm.GcPolicy.stress.threshold;
+    program.v.gc_growth_percent = vm.GcPolicy.stress.growth_percent;
+    program.v.gc_next_at = vm.GcPolicy.stress.threshold;
+    const last_result = try program.run(src);
+    try testing.expect(program.v.gc_cycles > 0);
+
+    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
+    defer buf.deinit();
+    try formatValue(&buf, last_result, program.interner);
+    testing.expectEqualStrings(expected, buf.items) catch |err| {
+        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
+        return err;
+    };
+}
+
+/// Every callback of these programs allocates a few kilobytes of
+/// garbage, so a cycle runs inside the native while it holds earlier
+/// results, and the results must still be intact afterwards.
+const churn = "(defn churn [x] (count (apply str (map (fn [i] (str x i)) (range 200))))) ";
+
+test "gc: map, filter, keep, map-indexed and mapv keep their earlier results across cycles" {
+    try expectOutputUnderGc(churn ++ "(let [xs (map (fn [x] (churn x) (str x \"!\")) (range 60))] [(count xs) (first xs) (last xs)])", "[60 0! 59!]");
+    try expectOutputUnderGc(churn ++ "(count (filter (fn [x] (churn x) (even? x)) (range 60)))", "30");
+    try expectOutputUnderGc(churn ++ "(last (keep (fn [x] (churn x) (when (even? x) (str x))) (range 60)))", "58");
+    try expectOutputUnderGc(churn ++ "(last (map-indexed (fn [i x] (churn i) (str i x)) (range 40)))", "3939");
+    try expectOutputUnderGc(churn ++ "(peek (mapv (fn [x] (churn x) (vector x x)) (range 40)))", "[39 39]");
+}
+
+test "gc: reduce, reductions, sort-by, max-key, repeatedly and iterate survive cycles inside their callbacks" {
+    try expectOutputUnderGc(churn ++ "(reduce (fn [acc x] (churn x) (str acc x)) \"\" (range 30))", "01234567891011121314151617181920212223242526272829");
+    try expectOutputUnderGc(churn ++ "(last (reductions (fn [acc x] (churn x) (str acc x)) \"\" (range 30)))", "01234567891011121314151617181920212223242526272829");
+    try expectOutputUnderGc(churn ++ "(sort-by (fn [x] (churn x) (str (- 10 x))) (range 12))", "(11 10 9 0 8 7 6 5 4 3 2 1)");
+    try expectOutputUnderGc(churn ++ "(apply max-key (fn [x] (churn x) (count (str x))) (range 30))", "29");
+    try expectOutputUnderGc(churn ++ "(count (repeatedly 30 (fn [] (churn 1) (str \"r\"))))", "30");
+    try expectOutputUnderGc(churn ++ "(last (iterate (fn [s] (churn s) (str s \"x\")) \"\" 20))", "xxxxxxxxxxxxxxxxxxx");
+}
+
+test "gc: swap!, alter-meta!, apply and a closure over a loop survive cycles" {
+    try expectOutputUnderGc(churn ++ "(let [a (atom [])] (dotimes [i 40] (swap! a (fn [v] (churn i) (conj v (str i))))) [(count @a) (last @a)])", "[40 39]");
+    try expectOutputUnderGc(churn ++ "(def v 1) (dotimes [i 20] (alter-meta! (var v) (fn [m] (churn i) (assoc m :i (str i))))) (meta (var v))", "{:i 19}");
+    try expectOutputUnderGc(churn ++ "(apply str (map (fn [x] (churn x) (str x)) (range 20)))", "012345678910111213141516171819");
+    try expectOutputUnderGc(churn ++ "(let [fs (map (fn [x] (fn [] (churn x) (str x))) (range 20))] (apply str (map (fn [f] (f)) fs)))", "012345678910111213141516171819");
+}
+
+test "gc: db/reduce-tree and db/alter! survive cycles inside their callbacks" {
+    var store = try SeamStore.init("gc-reduce-tree");
+    defer store.deinit();
+    // One digit per value: 30 values.
+    const src = try store.source(churn ++
+        \\(def conn (db/open "@STORE@"))
+        \\(with-tx [tx conn] (dotimes [i 30] (db/put! tx (db/ref conn :t (str "k" i)) (str "v" i))))
+        \\(with-tx [tx conn] (db/alter! tx (db/ref conn :t "k0") (fn [old] (churn old) (str old "+"))))
+        \\(def total (with-read-tx [tx conn] (db/reduce-tree tx :t (fn [acc k v] (churn v) (str acc (count v))) "")))
+        \\(def first-value (with-read-tx [tx conn] (db/get tx (db/ref conn :t "k0"))))
+        \\(db/close conn)
+        \\[(count total) first-value]
+    );
+    defer testing.allocator.free(src);
+    try expectOutputUnderGc(src, "[30 v0+]");
+}
+
+// =============================================================================
+// ^:dynamic Vars and binding (VM.md §6.5)
+// =============================================================================
+
+test "binding: nesting, restoration, and a closure seeing the binding in force at the call" {
+    try expectOutputProgram("(def ^:dynamic *x* 1) (defn read-x [] *x*) [(binding [*x* 2] [*x* (read-x)]) *x* (read-x)]", "[[2 2] 1 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (def ^:dynamic *y* 10) (binding [*x* 2 *y* 3] [*x* *y* (binding [*x* 4] [*x* *y*]) *x*])", "[2 3 [4 3] 2]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (let [f (fn [] *x*)] [(f) (binding [*x* 5] (f)) (f)])", "[1 5 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (binding [*x* (+ *x* 10)] (binding [*x* (+ *x* 100)] *x*))", "111");
+    try expectOutputProgram("(def ^:dynamic *x* 1) [(thread-bound? (var *x*)) (binding [*x* 0] (thread-bound? (var *x*)))]", "[false true]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (def ^:dynamic *y* 2) (binding [*x* *y* *y* *x*] [*x* *y*])", "[2 1]");
+}
+
+test "binding: a throw through binding restores the root before the catch runs" {
+    try expectOutputProgram("(def ^:dynamic *x* 1) (try (binding [*x* 9] (throw :boom)) (catch :boom e [e *x*]))", "[:boom 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (defn boom [] (throw :boom)) [(try (binding [*x* 2] (binding [*x* 3] (boom))) (catch :boom _ *x*)) *x*]", "[1 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) [(binding [*x* 2] (try (binding [*x* 3] (throw :in)) (catch :in _ *x*))) *x*]", "[2 1]");
+}
+
+test "binding: only a dynamic Var can be bound; set! rebinds the innermost binding" {
+    try expectOutputProgram("(def plain 1) (try (binding [plain 2] plain) (catch :not-dynamic e e))", ":not-dynamic");
+    try expectOutputProgram("(def plain 1) (def ^:dynamic *x* 1) [(try (binding [*x* 2 plain 2] plain) (catch :not-dynamic e e)) (thread-bound? (var *x*))]", "[:not-dynamic false]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (defn read-x [] *x*) [(binding [*x* 2] (set! *x* 7) (read-x)) *x*]", "[7 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (binding [*x* 2] (binding [*x* 3] (set! *x* 4)) *x*)", "2");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (try (set! *x* 5) (catch :no-thread-binding e [e *x*]))", "[:no-thread-binding 1]");
+    try expectOutputProgram("(def plain 1) (try (set! plain 5) (catch :not-dynamic e [e plain]))", "[:not-dynamic 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (meta (var *x*))", "{:dynamic true}");
+}

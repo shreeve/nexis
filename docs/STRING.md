@@ -480,9 +480,8 @@ files surface `:io-error`. No size-limit-arg overload in v1.
 §9.5. Print args separate with a single space (Clojure parity).
 Empty argc is legal: `(println) → "\n"`, returns `nil`.
 
-**GC-rooting checklist (`docs/GC.md` §11.5):** all six
-fns allocate output strings/vectors via `string.fromBytes` /
-`vector.fromSlice` AFTER holding their argument Values in Zig
-locals. Under v1's explicit-only GC this is structurally safe;
-the future-migration audit must walk each one. Tracked in
-`docs/GC.md` §11.5.
+**GC rooting (`docs/GC.md` §11.5):** all six fns allocate output
+strings/vectors via `string.fromBytes` / `vector.fromSlice` while
+holding only their argument Values, which are rooted for the call,
+and none calls back into the VM; `Heap.alloc` never collects, so
+nothing here needs a root.

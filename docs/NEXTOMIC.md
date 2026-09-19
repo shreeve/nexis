@@ -388,9 +388,11 @@ error throws `{:error :nextomic/query-syntax :message "..." :clause i}`
 with the clause index when the error is inside `:where`. The IR is pure
 syntax over the VM's symbol table, so it is cached per VM by query value
 (heap identity first, structural hash second) and reused across every
-db and basis; the rule set bound to `%` is cached the same way. No
-collector frees or moves a heap value, so a cache entry lives as long as
-the VM; one that does must clear both caches. Constants in data patterns are
+db and basis; the rule set bound to `%` is cached the same way. The
+collector empties both caches after every cycle, since a freed value's
+address may be reused; a query in flight borrows its IR from the cache,
+so a cycle inside one of its callbacks defers the clearing to the
+query's return (`natives.State`). Constants in data patterns are
 encoded to their sortable bytes, and lookup refs and idents in constant
 positions resolve against the db, at plan time. `:in` inputs resolve
 by the role their variable plays in `:where`: one bound in an entity
@@ -661,9 +663,10 @@ the `Env`.
 - **VM stack invariant on nested calls** (blocking for user-function
   predicates and transaction functions; built-in predicates need
   nothing).
-- **GC**: not blocking. Every Nextomic operation allocates in its own
-  arena and copies only results into the VM heap. Wiring the collector
-  bounds process lifetime, not correctness.
+- **GC**: every Nextomic operation allocates in its own arena and
+  copies only results into the VM heap; the collector's only demands
+  here are the cache clearing above and the `q` hook rooting every
+  user-function result for the query's life (`docs/GC.md` §3).
 - **Number tower**: blocking only for double predicates and aggregates.
   Doubles are storable from the start.
 

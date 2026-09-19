@@ -135,13 +135,35 @@ const native_with = NativeFn{ .name = "nextomic/with", .min_arity = 3, .max_arit
 // Per-VM state
 // =============================================================================
 
-const State = struct {
+pub const State = struct {
     gpa: Allocator,
     ir_cache: query.Cache,
     rules_cache: query.RulesCache,
     /// The views of finished `with` scopes: closed, kept allocated for
     /// the db-values that name them, destroyed at VM teardown.
     views: std.ArrayList(*Conn) = .empty,
+    /// Queries in flight: each borrows its parsed IR from the caches
+    /// for its duration, so a collection that happens inside one of
+    /// its callbacks defers the clearing (`clear_pending`) to the
+    /// moment the outermost query returns.
+    active: usize = 0,
+    clear_pending: bool = false,
+
+    /// Enter a query; `leave` is its pair.
+    pub fn enter(self: *State) void {
+        self.active += 1;
+    }
+
+    pub fn leave(self: *State) void {
+        self.active -= 1;
+        if (self.active == 0 and self.clear_pending) self.clearCaches();
+    }
+
+    fn clearCaches(self: *State) void {
+        self.clear_pending = false;
+        self.ir_cache.clear();
+        self.rules_cache.clear();
+    }
 };
 
 /// The VM's state, created on first use.
@@ -155,7 +177,20 @@ pub fn state(vm: *VM) !*State {
     };
     vm.nextomic_query_state = @ptrCast(s);
     vm.nextomic_query_close = &closeState;
+    vm.nextomic_query_clear = &clearState;
     return s;
+}
+
+/// Empty both query caches: the collector calls this after every
+/// cycle because the caches key on heap identity (§5). With a query
+/// in flight the clearing waits until it returns.
+fn clearState(ptr: *anyopaque) void {
+    const s: *State = @ptrCast(@alignCast(ptr));
+    if (s.active > 0) {
+        s.clear_pending = true;
+        return;
+    }
+    s.clearCaches();
 }
 
 fn closeState(ptr: *anyopaque) void {

@@ -329,6 +329,12 @@ const core_fns = [_]CoreEntry{
     .{ .name = "with-meta", .descriptor = &native_with_meta },
     .{ .name = "reset-meta!", .descriptor = &native_reset_meta },
     .{ .name = "alter-meta!", .descriptor = &native_alter_meta },
+    // Dynamic bindings (VM.md §6.5); `binding` and `set!` in
+    // core.nx expand to these.
+    .{ .name = "push-thread-bindings", .descriptor = &native_push_thread_bindings },
+    .{ .name = "pop-thread-bindings", .descriptor = &native_pop_thread_bindings },
+    .{ .name = "var-set", .descriptor = &native_var_set },
+    .{ .name = "thread-bound?", .descriptor = &native_thread_bound_q },
     .{ .name = "boolean", .descriptor = &native_boolean },
     .{ .name = "list?", .descriptor = &native_list_q },
     .{ .name = "seq?", .descriptor = &native_seq_q },
@@ -572,6 +578,10 @@ const native_meta = NativeFn{ .name = "meta", .min_arity = 1, .max_arity = 1, .c
 const native_with_meta = NativeFn{ .name = "with-meta", .min_arity = 2, .max_arity = 2, .call = &fnWithMeta };
 const native_reset_meta = NativeFn{ .name = "reset-meta!", .min_arity = 2, .max_arity = 2, .call = &fnResetMeta };
 const native_alter_meta = NativeFn{ .name = "alter-meta!", .min_arity = 2, .max_arity = null, .call = &fnAlterMeta };
+const native_push_thread_bindings = NativeFn{ .name = "push-thread-bindings", .min_arity = 1, .max_arity = 1, .call = &fnPushThreadBindings };
+const native_pop_thread_bindings = NativeFn{ .name = "pop-thread-bindings", .min_arity = 0, .max_arity = 0, .call = &fnPopThreadBindings };
+const native_var_set = NativeFn{ .name = "var-set", .min_arity = 2, .max_arity = 2, .call = &fnVarSet };
+const native_thread_bound_q = NativeFn{ .name = "thread-bound?", .min_arity = 1, .max_arity = 1, .call = &fnThreadBoundQ };
 const native_boolean = NativeFn{ .name = "boolean", .min_arity = 1, .max_arity = 1, .call = &fnBoolean };
 const native_list_q = NativeFn{ .name = "list?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
 const native_seq_q = NativeFn{ .name = "seq?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
@@ -1127,6 +1137,18 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 // the VM through `VM.callValue`. They propagate
 // `VmError.ControlTransferred` unchanged so a throw from inside a
 // user fn lands at the outer handler.
+//
+// Rooting (GC.md §3): a collection can run inside any `callValue`.
+// A native's own arguments are rooted for its whole call (the
+// caller's slots, or the root stack when reached through
+// `callValue`), and so is everything reachable from them; a value
+// a callback returned is not, once the native holds it only in a
+// Zig local and calls back again. Every native below that keeps
+// callback results across a further callback pushes them on a
+// `RootScope` first; one whose only held value is the next call's
+// argument (`reduce`, `reduce-kv`, `swap!`, `db/alter!`,
+// `db/reduce-tree`) needs nothing, because an argument is rooted
+// for the call that could collect.
 
 /// `(apply f x1 x2 ... xs)` calls `f` with the elements of
 /// the last arg seq spliced in after the leading args.
@@ -1161,11 +1183,15 @@ fn fnMap(vm: *VM, args: []const Value) VmError!Value {
 /// Append `(f x1 x2 ...)` for every position of the shortest of
 /// `colls` to `out`.
 fn mapInto(vm: *VM, f: Value, colls: []const Value, out: *std.ArrayList(Value)) VmError!void {
+    const scope = vm.rootScope();
+    defer scope.release();
     if (colls.len == 1) {
         var it = try makeSeqIter(vm, colls[0]);
         while (try it.next()) |x| {
             const one = [_]Value{x};
-            out.append(vm.allocator, try vm.callValue(f, &one)) catch return VmError.OutOfMemory;
+            const r = try vm.callValue(f, &one);
+            try scope.push(r);
+            out.append(vm.allocator, r) catch return VmError.OutOfMemory;
         }
         return;
     }
@@ -1179,7 +1205,9 @@ fn mapInto(vm: *VM, f: Value, colls: []const Value, out: *std.ArrayList(Value)) 
         for (iters, 0..) |*it, i| {
             call_args[i] = (try it.next()) orelse break :outer;
         }
-        out.append(vm.allocator, try vm.callValue(f, call_args)) catch return VmError.OutOfMemory;
+        const r = try vm.callValue(f, call_args);
+        try scope.push(r);
+        out.append(vm.allocator, r) catch return VmError.OutOfMemory;
     }
 }
 
@@ -1266,6 +1294,8 @@ fn sieve(vm: *VM, mode: Sieve, pred: Value, coll: Value) VmError!Value {
 }
 
 fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, out: *std.ArrayList(Value)) VmError!void {
+    const scope = vm.rootScope();
+    defer scope.release();
     var it = try makeSeqIter(vm, coll);
     while (try it.next()) |x| {
         const one = [_]Value{x};
@@ -1275,7 +1305,12 @@ fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, out: *std.ArrayList
             .keep_falsy => if (r.isTruthy()) null else x,
             .keep_result => if (r.isNil()) null else r,
         };
-        if (kept) |v| out.append(vm.allocator, v) catch return VmError.OutOfMemory;
+        if (kept) |v| {
+            // A kept element is reachable from `coll`; a kept
+            // result is not.
+            if (mode == .keep_result) try scope.push(v);
+            out.append(vm.allocator, v) catch return VmError.OutOfMemory;
+        }
     }
 }
 
@@ -1758,11 +1793,16 @@ fn fnFilterv(vm: *VM, args: []const Value) VmError!Value {
 fn indexedMap(vm: *VM, keep_nil: bool, f: Value, coll: Value) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
+    const scope = vm.rootScope();
+    defer scope.release();
     var it = try makeSeqIter(vm, coll);
     var i: i64 = 0;
     while (try it.next()) |x| : (i += 1) {
         const r = try vm.callValue(f, &.{ value_mod.fromFixnum(i).?, x });
-        if (keep_nil or !r.isNil()) results.append(vm.allocator, r) catch return VmError.OutOfMemory;
+        if (keep_nil or !r.isNil()) {
+            try scope.push(r);
+            results.append(vm.allocator, r) catch return VmError.OutOfMemory;
+        }
     }
     return try buildListFromSlice(vm, results.items);
 }
@@ -1991,11 +2031,14 @@ fn fnReductions(vm: *VM, args: []const Value) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
     var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try buildListFromSlice(vm, &.{try vm.callValue(f, &.{})});
+    const scope = vm.rootScope();
+    defer scope.release();
     results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
     while (try it.next()) |x| {
         acc = try vm.callValue(f, &.{ acc, x });
         const stop = isReduced(vm, acc);
         if (stop) acc = reducedValue(acc);
+        try scope.push(acc);
         results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
         if (stop) break;
     }
@@ -2044,7 +2087,13 @@ fn repeatInto(vm: *VM, n: usize, producer: anytype) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
     results.ensureTotalCapacity(vm.allocator, n) catch return VmError.OutOfMemory;
-    for (0..n) |_| results.appendAssumeCapacity(try producer.next(vm));
+    const scope = vm.rootScope();
+    defer scope.release();
+    for (0..n) |_| {
+        const r = try producer.next(vm);
+        try scope.push(r);
+        results.appendAssumeCapacity(r);
+    }
     return try buildListFromSlice(vm, results.items);
 }
 
@@ -2054,7 +2103,10 @@ fn keyExtremum(vm: *VM, want_max: bool, args: []const Value) VmError!Value {
     const k = args[0];
     var best = args[1];
     var best_key = try vm.callValue(k, &.{best});
+    const scope = vm.rootScope();
+    defer scope.release();
     for (args[2..]) |x| {
+        try scope.push(best_key);
         const key = try vm.callValue(k, &.{x});
         const keep_best = try vm_mod.numCompare(if (want_max) .gt else .lt, best_key, key);
         if (!keep_best) {
@@ -2294,8 +2346,12 @@ fn sortImpl(vm: *VM, keyfn: ?Value, comparator: ?Value, coll: Value) VmError!Val
     defer vm.allocator.free(keyed);
     const scratch = vm.allocator.alloc(Keyed, items.items.len) catch return VmError.OutOfMemory;
     defer vm.allocator.free(scratch);
+    const scope = vm.rootScope();
+    defer scope.release();
     for (items.items, 0..) |v, i| {
-        keyed[i] = .{ .key = if (keyfn) |kf| try vm.callValue(kf, &.{v}) else v, .val = v };
+        const key = if (keyfn) |kf| try vm.callValue(kf, &.{v}) else v;
+        if (keyfn != null) try scope.push(key);
+        keyed[i] = .{ .key = key, .val = v };
     }
     try mergeSort(keyed, scratch, .{ .vm = vm, .comparator = comparator });
     for (keyed, 0..) |e, i| items.items[i] = e.val;
@@ -2486,11 +2542,25 @@ fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(reset-meta! v m)` → sets the Var's metadata to `m` (a map or
 /// nil) and returns it.
-fn fnResetMeta(_: *VM, args: []const Value) VmError!Value {
+fn fnResetMeta(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .var_) return VmError.KindMismatch;
     if (!args[1].isNil() and args[1].kind() != .persistent_map) return VmError.KindMismatch;
-    VM.asVar(args[0]).meta = args[1];
+    try setVarMeta(vm, VM.asVar(args[0]), args[1]);
     return args[1];
+}
+
+/// Store `m` as `v`'s metadata; `:dynamic true` in it marks the
+/// Var dynamic for good (`(def ^:dynamic *x* ...)`, VM.md §6.5).
+fn setVarMeta(vm: *VM, v: *vm_mod.Var, m: Value) VmError!void {
+    v.meta = m;
+    if (m.isNil()) return;
+    const key = vm.ensureInterner().internKeywordValue("dynamic") catch return VmError.OutOfMemory;
+    switch (champ_mod.mapGet(m, key, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal)) {
+        .present => |flag| if (flag.isTruthy()) {
+            v.dynamic = true;
+        },
+        .absent => {},
+    }
 }
 
 /// `(alter-meta! v f & args)` → sets the Var's metadata to
@@ -2504,8 +2574,61 @@ fn fnAlterMeta(vm: *VM, args: []const Value) VmError!Value {
     @memcpy(call_args[1..], args[2..]);
     const next = try vm.callValue(args[1], call_args);
     if (!next.isNil() and next.kind() != .persistent_map) return VmError.KindMismatch;
-    v.meta = next;
+    try setVarMeta(vm, v, next);
     return next;
+}
+
+// =============================================================================
+// Dynamic bindings (VM.md §6.5)
+// =============================================================================
+
+/// `(push-thread-bindings {#'a 1 #'b 2})` → opens a binding frame
+/// rebinding each Var to its value; `binding` pairs it with
+/// `pop-thread-bindings` in a `finally`. A key that is not a Var is
+/// `:kind-mismatch`; a Var that is not dynamic is `:not-dynamic`
+/// and nothing is rebound.
+fn fnPushThreadBindings(vm: *VM, args: []const Value) VmError!Value {
+    const m = args[0];
+    if (m.kind() != .persistent_map) return VmError.KindMismatch;
+    const n = champ_mod.mapCount(m);
+    const vars = vm.allocator.alloc(*vm_mod.Var, n) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(vars);
+    const values = vm.allocator.alloc(Value, n) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(values);
+    var it = champ_mod.mapIter(m);
+    var i: usize = 0;
+    while (it.next()) |e| : (i += 1) {
+        if (e.key.kind() != .var_) return VmError.KindMismatch;
+        vars[i] = VM.asVar(e.key);
+        values[i] = e.value;
+    }
+    try vm.pushBindings(vars, values);
+    return value_mod.nilValue();
+}
+
+/// `(pop-thread-bindings)` → closes the innermost binding frame.
+fn fnPopThreadBindings(vm: *VM, _: []const Value) VmError!Value {
+    vm.popBindings();
+    return value_mod.nilValue();
+}
+
+/// `(var-set v x)` → rebinds the innermost binding of the dynamic
+/// Var `v` to `x` and returns `x`; `set!` expands to it. A Var that
+/// is not dynamic is `:not-dynamic`; one with no binding in force
+/// is `:no-thread-binding`.
+fn fnVarSet(_: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .var_) return VmError.KindMismatch;
+    const v = VM.asVar(args[0]);
+    if (!v.dynamic) return VmError.NotDynamic;
+    if (!v.thread_bound) return VmError.NoThreadBinding;
+    v.thread_value = args[1];
+    return args[1];
+}
+
+/// `(thread-bound? v)` → whether a `binding` of `v` is in force.
+fn fnThreadBoundQ(_: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .var_) return VmError.KindMismatch;
+    return value_mod.fromBool(VM.asVar(args[0]).thread_bound);
 }
 
 /// `(gensym)` / `(gensym prefix)` → a fresh symbol `prefix__N`
@@ -3238,11 +3361,10 @@ fn fnSwapValsBang(vm: *VM, args: []const Value) VmError!Value {
 
     const new_val = try vm.callValue(f, call_args);
 
-    // GC rooting note: the [old new] vector is built AFTER
-    // `setValue`. The collector is explicit-only (docs/GC.md §9),
-    // so `vector_mod.fromTwo`'s alloc cannot trigger collection
-    // and `old` (a Zig local) stays alive trivially. This site is
-    // listed in the docs/GC.md §11.5 audit checklist.
+    // `old` is the atom's value, hence rooted, throughout the
+    // callback; the [old new] vector is built after `setValue` with
+    // no safe point in between (a cycle runs only between
+    // instructions, VM.md §9).
     atom_mod.setValue(a, new_val);
     const pair_elems = [_]Value{ old, new_val };
     return vector_mod.fromSlice(vm.ensureHeap(), &pair_elems) catch return VmError.OutOfMemory;
@@ -3278,11 +3400,9 @@ fn fnCompareAndSetBang(_: *VM, args: []const Value) VmError!Value {
 // `join` / `spit` each wrap their element path to convert
 // nil → empty BEFORE delegating to the formatter.
 //
-// GC rooting note: str / pr-str allocate the final heap string
-// AFTER walking the args slice. The args slice is held by
-// `vm.invokeNative` for the duration of the call, so input
-// values stay reachable. Listed in the `docs/GC.md` §11.5 audit
-// checklist.
+// GC rooting: str / pr-str allocate the final heap string after
+// walking the args slice, which is rooted for the call, and never
+// call back into the VM (`docs/GC.md` §11.5, class 1).
 
 /// Append a single Value to `out` in `str`-semantics (display mode
 /// with `nil → empty` override). Used by `str`, `join`, and `spit`.
@@ -3372,9 +3492,9 @@ fn fnSubs(vm: *VM, args: []const Value) VmError!Value {
 //   :arity-mismatch         enforced by NativeFn descriptor
 //
 // GC rooting: each fn allocates output via string.fromBytes /
-// vector.fromSlice AFTER holding inputs in Zig locals. The
-// collector is explicit-only, so this is structurally safe;
-// documented in docs/GC.md §11.5.
+// vector.fromSlice while holding only its arguments, which are
+// rooted for the call, and never calls back into the VM
+// (docs/GC.md §11.5, class 1).
 
 fn fnStringLowerCase(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
@@ -4104,8 +4224,8 @@ fn appendSeqValues(vm: *VM, seq: Value, out: *std.ArrayList(Value)) VmError!void
 }
 
 /// Build a fresh cons list from a slice of Values (left-to-
-/// right). Uses `vm.ensureHeap()`. Results aren't rooted
-/// between cons calls; `Heap.alloc` never collects (GC.md §9).
+/// right). Uses `vm.ensureHeap()`. The partial list needs no
+/// root: `Heap.alloc` never collects (VM.md §9).
 fn buildListFromSlice(vm: *VM, items: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     var result = list_mod.empty(heap) catch return VmError.OutOfMemory;

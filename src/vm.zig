@@ -20,11 +20,15 @@
 
 const std = @import("std");
 const value_mod = @import("value");
-/// The VM owns a `Heap` backed by `runtime_arena` for the values
-/// it constructs itself (rest-arg lists, vectors, maps and sets
-/// built by `coll:*`). heap, list, vector and champ are pure
-/// allocator modules; pulling them in does not pull GC.
+/// The VM owns the `Heap` every runtime value lives on: rest-arg
+/// lists, the collections `coll:*` builds, closures and upvalue
+/// cells, and everything the natives and the compiler allocate
+/// through `ensureHeap` / `registry.heap`.
 const heap_mod = @import("heap");
+/// The collector. The VM is its host (VM.md §9, GC.md §3): it
+/// enumerates the roots, traces closures and cells, and decides
+/// when a cycle is due.
+const gc_mod = @import("gc");
 const bignum_mod = @import("bignum");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
@@ -416,10 +420,12 @@ pub const Routine = struct {
 /// then `(def x 10)` does NOT create a new Var; the same Var
 /// object's root is updated). Per PLAN §6.1 + VM.md §6.
 ///
-/// Allocation: same pattern as Closure/UpvalCell. A Var lives
-/// in VM.runtime_arena and the Value payload is the raw
-/// `*Var`, not a `HeapHeader`-prefixed heap object; the
-/// collector does not trace Vars.
+/// Allocation: a Var lives in VM.runtime_arena for the VM's
+/// life and the Value payload is the raw `*Var`, not a
+/// `HeapHeader`-prefixed heap object. Vars are immortal by
+/// design (a namespace never removes one), so the collector
+/// does not sweep them; it reaches their `root`, `meta` and
+/// `thread_value` through the namespace walk (GC.md §3).
 ///
 /// `bound`: false until the first `(def name val)` runs. Loads
 /// via `var:load-var` trap `:unbound-var` in that case. This
@@ -443,9 +449,18 @@ pub const Var = struct {
     /// call. Set ONLY by the expander's defmacro handler;
     /// regular `def` never sets it.
     macro: bool = false,
-    /// Reserved for metadata maps (doc, source location, etc.).
-    /// Nothing reads or writes it; it is always nil.
+    /// The metadata map, or nil: `^meta` on the name, a docstring
+    /// and an attribute map land here through `reset-meta!`.
     meta: Value = value_mod.nilValue(),
+    /// True once the Var's metadata has carried `:dynamic true`
+    /// (`(def ^:dynamic *x* ...)`); only a dynamic Var can be
+    /// rebound by `binding`. Never cleared.
+    dynamic: bool = false,
+    /// The binding in force when `thread_bound` is true: what a
+    /// load returns instead of `root`. Pushed by `binding`
+    /// (`VM.pushBindings`), written by `set!`, restored by the pop.
+    thread_value: Value = value_mod.nilValue(),
+    thread_bound: bool = false,
 };
 
 /// A namespace mapping symbol names to `*Var`. A VM holds one
@@ -696,27 +711,40 @@ pub const NamespaceRegistry = struct {
 /// Captured-binding cell: one Value plus an `initialized` flag
 /// (per VM.md §6). Created by `closure:box-local` and
 /// `closure:new-cell`, filled by `closure:init-cell`.
+///
+/// A cell is the body of a heap block of kind `cell_internal`
+/// (VALUE.md §2.3): the `.cell_internal` Value a slot holds and
+/// the `*UpvalCell` a closure or frame holds both name that
+/// block. The collector traces a cell by its value through
+/// `VM.gcTrace`; a cell is reachable from the slot that boxed
+/// it, from every closure that captured it and from every frame
+/// running such a closure.
 pub const UpvalCell = struct {
     value: Value,
     initialized: bool,
 };
 
 /// Runtime closure object: a routine + its upvalue cells.
-/// Per VALUE.md kind 22 = `function`.
+/// Per VALUE.md kind 24 = `function`.
 ///
-/// **Representation**: a Closure is allocated from the VM-owned
-/// `runtime_arena` and `Value.payload` holds the raw `*Closure`
-/// pointer. This is outside the VALUE.md §4 heap-value contract
-/// (which has `Value.payload` for heap kinds point at a
-/// `HeapHeader`-prefixed object): closures are not heap
-/// objects, `gc.zig` does not trace them, and they live as
-/// long as the arena.
+/// **Representation**: the body of a heap block of kind
+/// `function` whose tail holds the cell pointers; `upvalues`
+/// points into that tail, which is safe because the collector
+/// never moves a block. `Value.payload` is the block's
+/// `*HeapHeader`, as for every heap kind (VALUE.md §4). The
+/// collector traces a closure by its cells and by the heap
+/// constants of its routine (`VM.gcTrace`).
 pub const Closure = struct {
     routine: *const Routine,
     /// One cell per upvalue, filled by `closure:make` from the
     /// capture descriptor's sources.
     upvalues: []const *UpvalCell,
 };
+
+/// The block header of a cell reached through its body pointer.
+inline fn cellHeader(cell: *UpvalCell) *heap_mod.HeapHeader {
+    return @ptrFromInt(@intFromPtr(cell) - @sizeOf(heap_mod.HeapHeader));
+}
 
 /// Static descriptor for a host-Zig function exposed as a
 /// first-class Value.
@@ -879,6 +907,10 @@ pub const Frame = struct {
     /// otherwise the array `closure:make` built, installed by
     /// `call:call`.
     upvalues: []const *UpvalCell = &.{},
+    /// The closure this frame runs, nil for the top-level frame:
+    /// a root that keeps the closure block (and with it the
+    /// `upvalues` array in its tail) alive for the frame's life.
+    closure: Value = value_mod.nilValue(),
     /// When non-null, this frame
     /// was pushed by `VM.callValue` (a host-Zig fn re-entering
     /// the VM). When `call:return` fires for this frame, it
@@ -1130,6 +1162,12 @@ pub const VmError = error{
     /// Recoverable error (user can `def`
     /// the var and retry).
     UnboundVar,
+    /// `binding` or `set!` on a Var not marked `^:dynamic`
+    /// (`:not-dynamic`).
+    NotDynamic,
+    /// `set!` on a dynamic Var with no binding in force
+    /// (`:no-thread-binding`).
+    NoThreadBinding,
     /// A mutating op on an
     /// atom (`swap!`/`reset!`/`compare-and-set!`/`swap-vals!`)
     /// was attempted while ANOTHER mutating op on the same
@@ -1246,6 +1284,58 @@ pub const FinallyContinuation = struct {
     reason: FinallyReason,
 };
 
+/// The collector's trigger settings (GC.md §7). `default` is what
+/// a VM starts with; `stress` is what `NEXIS_GC_STRESS` in the
+/// environment selects so a run collects every few kilobytes and
+/// every rooting gap shows.
+pub const GcPolicy = struct {
+    /// Bytes allocated since the last cycle before the next is due,
+    /// at least.
+    threshold: usize,
+    /// The next cycle is also no sooner than this percentage of the
+    /// bytes that survived the last one, so a large live set is not
+    /// re-marked every few kilobytes.
+    growth_percent: usize,
+
+    pub const default: GcPolicy = .{ .threshold = 16 * 1024 * 1024, .growth_percent = 100 };
+    pub const stress: GcPolicy = .{ .threshold = 4096, .growth_percent = 0 };
+};
+
+/// One entry of the dynamic-binding stack: what `v`'s thread
+/// binding was before the frame that holds this entry rebound it.
+pub const DynSave = struct {
+    v: *Var,
+    value: Value,
+    bound: bool,
+};
+
+/// A window on the VM's root stack for a native that keeps values
+/// across a call back into the VM: `push` what must survive a
+/// collection, `release` (normally deferred) drops everything the
+/// scope pushed. Scopes nest as calls do.
+pub const RootScope = struct {
+    vm: *VM,
+    base: usize,
+
+    pub fn push(self: RootScope, v: Value) VmError!void {
+        self.vm.roots.append(self.vm.allocator, v) catch return VmError.OutOfMemory;
+    }
+
+    pub fn pushAll(self: RootScope, vs: []const Value) VmError!void {
+        self.vm.roots.appendSlice(self.vm.allocator, vs) catch return VmError.OutOfMemory;
+    }
+
+    /// The values this scope has pushed, in order. Valid until the
+    /// next push.
+    pub fn items(self: RootScope) []const Value {
+        return self.vm.roots.items[self.base..];
+    }
+
+    pub fn release(self: RootScope) void {
+        self.vm.roots.shrinkRetainingCapacity(self.base);
+    }
+};
+
 // =============================================================================
 // VM
 // =============================================================================
@@ -1258,17 +1348,51 @@ pub const VM = struct {
     /// Frame chain. The top-level routine is frame 0;
     /// `call:call` appends; `call:return` pops.
     frames: std.ArrayList(Frame) = .empty,
-    /// Runtime allocation arena for `Closure`, `UpvalCell` and
-    /// `Var` objects (VM-owned allocation outside the GC heap).
-    /// Lifetime = VM lifetime; freed wholesale in `deinit`.
+    /// Runtime allocation arena for `Var` and `Namespace` objects
+    /// and everything else that lives exactly as long as the VM
+    /// (VM-owned allocation outside the collected heap). Freed
+    /// wholesale in `deinit`.
     runtime_arena: std.heap.ArenaAllocator,
-    /// Heap for values the VM constructs itself (variadic rest
-    /// lists, `coll:*` results). Backed by
-    /// `runtime_arena.allocator()` so nodes share the
-    /// closure/cell lifetime — all freed at `VM.deinit`.
-    /// Initialized lazily on first use so programs that never
-    /// construct a value pay nothing.
+    /// The collected heap: every runtime value, closure and cell.
+    /// Backed by `allocator`, so a sweep returns memory; freed
+    /// block by block in `deinit`. Initialized lazily on first use
+    /// so programs that never construct a value pay nothing.
     heap: ?heap_mod.Heap = null,
+    /// A heap this VM allocates on instead of its own: the
+    /// compile-time sub-VMs (`evalClosure`, the `defmacro`
+    /// evaluation) share the heap of the VM whose Vars they read
+    /// and write, so a value a macro stores into a Var outlives the
+    /// sub-VM. Not owned; never freed here. A VM with a borrowed
+    /// heap never collects (`gc_enabled`): it cannot enumerate the
+    /// owner's roots.
+    borrowed_heap: ?*heap_mod.Heap = null,
+    /// Whether this VM runs the collector at its safe points
+    /// (VM.md §9). False for the compile-time sub-VMs.
+    gc_enabled: bool = true,
+    /// The trigger (GC.md §7): a cycle is due at a safe point once
+    /// `heap.allocated_since_collect` reaches `gc_next_at`, which
+    /// each cycle resets to the larger of `gc_threshold` and
+    /// `gc_growth_percent` percent of the bytes that survived. The
+    /// defaults come from `GcPolicy`; `NEXIS_GC_STRESS` in the
+    /// environment selects `GcPolicy.stress` for every VM.
+    gc_threshold: usize = GcPolicy.default.threshold,
+    gc_growth_percent: usize = GcPolicy.default.growth_percent,
+    gc_next_at: usize = GcPolicy.default.threshold,
+    /// Cycles run so far; tests read it to prove a collection
+    /// happened.
+    gc_cycles: usize = 0,
+    /// The root stack (GC.md §3): values a native holds in Zig
+    /// locals across a call back into the VM. `callValue` pushes a
+    /// native callee's arguments for the call's duration; a native
+    /// that accumulates results across callbacks pushes them
+    /// through a `RootScope`.
+    roots: std.ArrayList(Value) = .empty,
+    /// The dynamic-binding stack (VM.md §6.5): one `DynSave` per
+    /// Var a `binding` frame rebound, holding what the Var's thread
+    /// binding was before, and one `dyn_frames` entry per frame
+    /// with the index its saves start at.
+    dyn_saves: std.ArrayList(DynSave) = .empty,
+    dyn_frames: std.ArrayList(u32) = .empty,
     /// Single-namespace slot for Vars. Lazy-initialized on first
     /// access (no cost for programs that don't use Vars). Var
     /// structs allocate from `runtime_arena`; the HashMap's
@@ -1302,8 +1426,12 @@ pub const VM = struct {
     /// The nextomic natives' per-VM state (parsed-query caches and
     /// finished `with` scopes), created on first use and destroyed at
     /// teardown through `nextomic_query_close`. The natives own the cast.
+    /// `nextomic_query_clear` empties the caches, which hold query
+    /// values by heap identity, after every collection
+    /// (docs/NEXTOMIC.md §5).
     nextomic_query_state: ?*anyopaque = null,
     nextomic_query_close: ?*const fn (*anyopaque) void = null,
+    nextomic_query_clear: ?*const fn (*anyopaque) void = null,
     /// Zig 0.16 `std.Io` handle for filesystem ops that live
     /// below the language surface —
     /// only `(db/open path)` uses it to auto-create the
@@ -1393,17 +1521,28 @@ pub const VM = struct {
             .pc = 0,
         });
 
+        const policy: GcPolicy = if (std.c.getenv("NEXIS_GC_STRESS") != null) .stress else .default;
         return .{
             .allocator = allocator,
             .stack = stack,
             .frames = frames,
             .runtime_arena = std.heap.ArenaAllocator.init(allocator),
+            .gc_threshold = policy.threshold,
+            .gc_growth_percent = policy.growth_percent,
+            .gc_next_at = policy.threshold,
             .stack_high_water = stack.items.len,
             .frame_high_water = frames.items.len,
         };
     }
 
     pub fn deinit(self: *VM) void {
+        // A binding frame still open (a sub-VM abandoned by an
+        // error before its `finally` ran) is popped so the Vars,
+        // which outlive this VM, keep no binding of its making.
+        while (self.dyn_frames.items.len > 0) self.popBindings();
+        self.dyn_saves.deinit(self.allocator);
+        self.dyn_frames.deinit(self.allocator);
+        self.roots.deinit(self.allocator);
         // Free handler + finally stack backing storage. Both
         // contain POD entries.
         self.handlers.deinit(self.allocator);
@@ -1455,16 +1594,9 @@ pub const VM = struct {
             proto.methods.deinit(self.allocator);
         }
         self.protocol_registry.deinit(self.allocator);
-        // Heap (if initialized) is arena-backed. Its live-list
-        // is only bookkeeping; all memory is reclaimed by
-        // `runtime_arena.deinit()` below. We deliberately skip
-        // `heap.deinit()` because (1) the Heap holds no
-        // non-memory resources, (2) every allocation it owns
-        // came from runtime_arena, and (3) the surrounding
-        // `self.* = undefined` makes the field unreachable after
-        // this returns. Invariant: `VM.heap` is backed by
-        // runtime_arena, never by `self.allocator` — backing it
-        // by `self.allocator` would turn this skip into a leak.
+        // The heap is backed by `allocator`: free every block still
+        // live. A borrowed heap belongs to another VM.
+        if (self.heap) |*h| h.deinit();
         self.runtime_arena.deinit();
         self.stack.deinit(self.allocator);
         self.frames.deinit(self.allocator);
@@ -1521,14 +1653,163 @@ pub const VM = struct {
         return &self.interner.?;
     }
 
-    /// Lazy-initialize the VM heap on first use. The Heap is
-    /// just an allocator wrapper with a live-list; init is O(1)
-    /// and there's no cost before the first use.
+    /// The heap this VM allocates on: the borrowed one when set,
+    /// else its own, initialized on first use. The Heap is just an
+    /// allocator wrapper with a live-list; init is O(1) and there's
+    /// no cost before the first use.
     pub fn ensureHeap(self: *VM) *heap_mod.Heap {
+        if (self.borrowed_heap) |h| return h;
         if (self.heap == null) {
-            self.heap = heap_mod.Heap.init(self.runtime_arena.allocator());
+            self.heap = heap_mod.Heap.init(self.allocator);
         }
         return &self.heap.?;
+    }
+
+    /// A root scope starting at the top of the root stack.
+    pub fn rootScope(self: *VM) RootScope {
+        return .{ .vm = self, .base = self.roots.items.len };
+    }
+
+    // -------------------------------------------------------------------------
+    // The collector's host (VM.md §9, GC.md §3)
+    // -------------------------------------------------------------------------
+
+    /// Whether a cycle is due at this safe point: the VM collects,
+    /// owns its heap, and the heap has allocated `gc_next_at` bytes
+    /// since the last cycle.
+    inline fn gcDue(self: *VM) bool {
+        if (!self.gc_enabled or self.borrowed_heap != null) return false;
+        const h = &(self.heap orelse return false);
+        return h.allocated_since_collect >= self.gc_next_at;
+    }
+
+    /// Run one collection cycle over this VM's heap from this VM's
+    /// roots, then size the next window. Callable from a safe point
+    /// only: between two instructions, when every live value is in
+    /// a slot, a frame, a Var, the root stack or one of the other
+    /// roots `gcRoots` walks. Tests call it directly to force a
+    /// cycle.
+    pub fn collectGarbage(self: *VM) void {
+        std.debug.assert(self.borrowed_heap == null);
+        const heap = self.ensureHeap();
+        var collector = gc_mod.Collector.init(heap);
+        collector.host = .{ .ctx = @ptrCast(self), .roots = &gcRoots, .trace = &gcTrace };
+        _ = collector.collect(&.{});
+        self.gc_cycles += 1;
+        // The query caches hold query values by heap identity
+        // (docs/NEXTOMIC.md §5); a freed value's address may be
+        // reused, so the caches empty with every cycle.
+        if (self.nextomic_query_state) |state| {
+            if (self.nextomic_query_clear) |clear| clear(state);
+        }
+        const by_growth = heap.live_bytes / 100 * self.gc_growth_percent;
+        self.gc_next_at = @max(self.gc_threshold, by_growth);
+    }
+
+    /// Every root this VM holds (GC.md §3): the backing stack in
+    /// full (a stale slot above a popped frame retains its value
+    /// until the slot is reused, which is sound), every frame's
+    /// closure, cells and routine constants, every Var of every
+    /// namespace (root, metadata, thread binding), the saved
+    /// bindings of every open `binding` frame, the root stack,
+    /// pending `finally` throws, the unhandled throw, the halt
+    /// result, and the protocol registry's implementations.
+    fn gcRoots(ctx: *anyopaque, c: *gc_mod.Collector) void {
+        const self: *VM = @ptrCast(@alignCast(ctx));
+        for (self.stack.items) |v| c.markValue(v);
+        for (self.frames.items) |*f| {
+            c.markValue(f.closure);
+            for (f.upvalues) |cell| c.mark(cellHeader(cell));
+            markRoutineConsts(c, f.routine);
+        }
+        if (self.registry) |*reg| {
+            var it = reg.map.valueIterator();
+            while (it.next()) |ns| markNamespaceVars(c, ns.*);
+        }
+        if (self.namespace) |*ns| markNamespaceVars(c, ns);
+        for (self.dyn_saves.items) |save| c.markValue(save.value);
+        for (self.roots.items) |v| c.markValue(v);
+        for (self.finally_stack.items) |cont| switch (cont.reason) {
+            .throwing => |v| c.markValue(v),
+            .normal => {},
+        };
+        if (self.unhandled_throw) |v| c.markValue(v);
+        c.markValue(self.result);
+        for (self.protocol_registry.items) |*proto| {
+            for (proto.methods.items) |*method| {
+                var impls = method.impls.valueIterator();
+                while (impls.next()) |impl| c.markValue(impl.*);
+                if (method.default_impl) |d| c.markValue(d);
+            }
+        }
+    }
+
+    fn markNamespaceVars(c: *gc_mod.Collector, ns: *const Namespace) void {
+        var it = ns.vars.valueIterator();
+        while (it.next()) |v| {
+            c.markValue(v.*.root);
+            c.markValue(v.*.meta);
+            c.markValue(v.*.thread_value);
+        }
+    }
+
+    /// The heap constants of `routine` and, recursively, of the
+    /// routines in its pool: string and bignum literals live on the
+    /// heap and a routine is reachable from every frame running it
+    /// and every closure over it.
+    fn markRoutineConsts(c: *gc_mod.Collector, routine: *const Routine) void {
+        for (routine.consts) |k| switch (k) {
+            .value => |v| c.markValue(v),
+            .routine => |r| markRoutineConsts(c, r),
+        };
+    }
+
+    /// Trace a closure (its cells and its routine's constants) or a
+    /// cell (its value); the collector has marked `h` already.
+    fn gcTrace(_: *anyopaque, h: *heap_mod.HeapHeader, c: *gc_mod.Collector) void {
+        const k: value_mod.Kind = @enumFromInt(h.kind);
+        switch (k) {
+            .function => {
+                const closure = heap_mod.Heap.bodyOf(Closure, h);
+                for (closure.upvalues) |cell| c.mark(cellHeader(cell));
+                markRoutineConsts(c, closure.routine);
+            },
+            .cell_internal => c.markValue(heap_mod.Heap.bodyOf(UpvalCell, h).value),
+            else => unreachable,
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Dynamic bindings (VM.md §6.5)
+    // -------------------------------------------------------------------------
+
+    /// Open a binding frame: every `(var, value)` pair rebinds a
+    /// dynamic Var for the frame's extent, saving the binding it
+    /// replaces. A Var that is not dynamic is `NotDynamic` and
+    /// nothing is pushed. `binding` pairs the call with
+    /// `popBindings` in a `finally`.
+    pub fn pushBindings(self: *VM, vars: []const *Var, values: []const Value) VmError!void {
+        std.debug.assert(vars.len == values.len);
+        for (vars) |v| if (!v.dynamic) return VmError.NotDynamic;
+        self.dyn_saves.ensureUnusedCapacity(self.allocator, vars.len) catch return VmError.OutOfMemory;
+        self.dyn_frames.append(self.allocator, @intCast(self.dyn_saves.items.len)) catch return VmError.OutOfMemory;
+        for (vars, values) |v, value| {
+            self.dyn_saves.appendAssumeCapacity(.{ .v = v, .value = v.thread_value, .bound = v.thread_bound });
+            v.thread_value = value;
+            v.thread_bound = true;
+        }
+    }
+
+    /// Close the innermost binding frame, restoring each Var's
+    /// previous binding in reverse order. With no frame open it
+    /// does nothing.
+    pub fn popBindings(self: *VM) void {
+        const start = self.dyn_frames.pop() orelse return;
+        while (self.dyn_saves.items.len > start) {
+            const save = self.dyn_saves.pop().?;
+            save.v.thread_value = save.value;
+            save.v.thread_bound = save.bound;
+        }
     }
 
     /// Register a new record type
@@ -1697,31 +1978,33 @@ pub const VM = struct {
         return try self.callValue(impl_v, args);
     }
 
-    /// Allocate a `Closure` from the runtime arena and return a
-    /// `Value` of kind `.function` pointing at it. The Value
-    /// payload is the raw `*Closure` pointer (see `Closure`);
-    /// `asClosure()` is the matched accessor.
-    pub fn allocClosure(
-        self: *VM,
-        routine: *const Routine,
-        upvalues: []const *UpvalCell,
-    ) !Value {
-        const arena = self.runtime_arena.allocator();
-        const c = try arena.create(Closure);
-        c.* = .{ .routine = routine, .upvalues = upvalues };
-        return Value{
-            .tag = @as(u64, @intFromEnum(value_mod.Kind.function)),
-            .payload = @intFromPtr(c),
-        };
+    /// Allocate a closure block on the heap with room for
+    /// `upvalue_count` cell pointers in its tail and return the
+    /// `.function` Value naming it. The tail is the closure's
+    /// `upvalues` array; the caller fills it before the Value can
+    /// reach a slot. `asClosure()` is the matched accessor.
+    pub fn allocClosure(self: *VM, routine: *const Routine, upvalue_count: usize) !Value {
+        const heap = self.ensureHeap();
+        const body_size = @sizeOf(Closure) + upvalue_count * @sizeOf(*UpvalCell);
+        const h = try heap.alloc(.function, body_size);
+        const body = heap_mod.Heap.bodyOf(Closure, h);
+        const tail: [*]*UpvalCell = @ptrCast(@alignCast(@as([*]u8, @ptrCast(body)) + @sizeOf(Closure)));
+        body.* = .{ .routine = routine, .upvalues = tail[0..upvalue_count] };
+        return heap_mod.Heap.valueFromHeader(.function, h);
     }
 
-    /// Inverse of `allocClosure`. Asserts `v.kind() == .function`
-    /// in safety builds; in release the cast is direct. Migration
-    /// note: when closures move to heap.alloc, this will need to
-    /// translate the `*HeapHeader` payload to `*Closure` body.
+    /// The closure body of a `.function` Value. Asserts the kind in
+    /// safety builds; in release the cast is direct.
     pub fn asClosure(v: Value) *const Closure {
         std.debug.assert(v.kind() == .function);
-        return @ptrFromInt(v.payload);
+        return heap_mod.Heap.bodyOf(Closure, heap_mod.Heap.asHeapHeader(v));
+    }
+
+    /// The writable cell-pointer tail of a closure block; only
+    /// `closure:make` writes it, once, right after `allocClosure`.
+    fn closureUpvaluesMut(v: Value) []*UpvalCell {
+        const body = heap_mod.Heap.bodyOf(Closure, heap_mod.Heap.asHeapHeader(v));
+        return @constCast(body.upvalues);
     }
 
     /// Invoke `closure` with `args`
@@ -1739,19 +2022,27 @@ pub const VM = struct {
     /// Vars. Symbols/keywords emitted by the macro come from
     /// the caller's interner via the routine's literal pool.
     ///
+    /// **Heap**: with `heap` given, the sub-VM allocates on it (the
+    /// calling VM's heap, reached through the namespace registry),
+    /// so whatever the macro stores into a Var stays valid after
+    /// the sub-VM is gone; without one the sub-VM's own heap holds
+    /// its values until `deinit`. A sub-VM never collects: the
+    /// values it reads through Vars and arguments live on heaps
+    /// whose roots it cannot enumerate.
+    ///
     /// **Lifetime**: the returned Value may reference the
-    /// sub-VM's `runtime_arena` (list nodes, closures, maps,
-    /// vectors). The caller MUST convert the result to a
-    /// caller-arena-owned form (typically by walking it into a
-    /// Form tree on the compile arena) BEFORE calling `deinit`
-    /// on the sub-VM. `out_vm` is written so the caller controls
-    /// the deinit timing.
+    /// sub-VM's own heap when no heap was shared. The caller MUST
+    /// convert the result to a caller-arena-owned form (typically
+    /// by walking it into a Form tree on the compile arena) BEFORE
+    /// calling `deinit` on the sub-VM. `out_vm` is written so the
+    /// caller controls the deinit timing.
     pub fn evalClosure(
         allocator: std.mem.Allocator,
         closure_v: Value,
         args: []const Value,
         out_vm: *VM,
         interner: ?*intern_mod.Interner,
+        shared_heap: ?*heap_mod.Heap,
     ) !Value {
         if (closure_v.kind() != .function) return error.NotCallable;
         const closure = VM.asClosure(closure_v);
@@ -1766,9 +2057,12 @@ pub const VM = struct {
 
         out_vm.* = try VM.init(allocator, routine);
         out_vm.borrowed_interner = interner;
+        out_vm.borrowed_heap = shared_heap;
+        out_vm.gc_enabled = false;
 
         // Wire the frame's upvalues to the closure's captures.
         out_vm.frames.items[0].upvalues = closure.upvalues;
+        out_vm.frames.items[0].closure = closure_v;
 
         // Populate the fixed-arity args into slots.
         const fixed: usize = routine.fixed_arity;
@@ -1813,6 +2107,14 @@ pub const VM = struct {
     /// The main run loop catches `ControlTransferred` and
     /// continues dispatch (frame + PC already adjusted by
     /// `unwindThrow`).
+    ///
+    /// **Rooting**: a native callee's `args` are pushed on the
+    /// root stack for the call, so a native reached this way holds
+    /// rooted arguments exactly as one reached by `call:call`
+    /// holds them in the caller's slots; a closure callee receives
+    /// them in its own slots. Values a native derives and keeps
+    /// across a nested `callValue` are its own to root
+    /// (`RootScope`; GC.md §3).
     pub fn callValue(self: *VM, callee: Value, args: []const Value) VmError!Value {
         switch (callee.kind()) {
             value_mod.Kind.native_fn => {
@@ -1821,6 +2123,9 @@ pub const VM = struct {
                 if (native.max_arity) |max| {
                     if (args.len > max) return VmError.ArityMismatch;
                 }
+                const scope = self.rootScope();
+                defer scope.release();
+                try scope.pushAll(args);
                 return native.call(self, args);
             },
             value_mod.Kind.function => {
@@ -1885,6 +2190,7 @@ pub const VM = struct {
                     .slot_count = routine.slot_count,
                     .pc = 0,
                     .upvalues = closure.upvalues,
+                    .closure = callee,
                     .host_result = &result_cell,
                 });
 
@@ -1912,6 +2218,7 @@ pub const VM = struct {
     /// VmError bubbles back to the caller).
     fn runUntilDepth(self: *VM, target_depth: usize) VmError!void {
         while (self.frames.items.len > target_depth) {
+            if (self.gcDue()) self.collectGarbage();
             // Fetch.
             const frame = self.currentFrame();
             if (frame.pc >= frame.routine.code.len) {
@@ -1945,8 +2252,8 @@ pub const VM = struct {
     /// Used by `var:store-var` (returns the Var object so
     /// `(def x 5)` evaluates to the Var, not the value 5) and
     /// by `var:var-object` (Clojure's `(var x)` reader form).
-    /// Staged encoding (raw *Var in payload, NOT *HeapHeader)
-    /// matches Closure/UpvalCell; migrates with the GC cutover.
+    /// The payload is the raw `*Var`, not a `*HeapHeader`: Vars
+    /// are immortal arena objects the collector never sweeps.
     pub fn varToValue(v: *Var) Value {
         return Value{
             .tag = @as(u64, @intFromEnum(value_mod.Kind.var_)),
@@ -1959,20 +2266,17 @@ pub const VM = struct {
         return @ptrFromInt(v.payload);
     }
 
-    /// Allocate an UpvalCell from the runtime arena, return a
-    /// VM-private `Value` of kind `.cell_internal` whose payload
-    /// points at the cell. When the compiler determines a
-    /// binding is captured, it emits `closure:box-local s`,
-    /// which calls `boxCell(slot[s].value)` and replaces slot[s]
-    /// with the returned cell-value. Same allocation discipline
-    /// as `allocClosure` — VM-owned arena lifetime.
+    /// Allocate an UpvalCell block on the heap and return the
+    /// VM-private `Value` of kind `.cell_internal` whose payload is
+    /// the block header. When the compiler determines a binding is
+    /// captured, it emits `closure:box-local s`, which boxes
+    /// `slot[s]` and replaces it with the returned cell-value.
     pub fn allocCell(self: *VM, initial: Value, initialized: bool) !Value {
-        const arena = self.runtime_arena.allocator();
-        const cell = try arena.create(UpvalCell);
-        cell.* = .{ .value = initial, .initialized = initialized };
+        const h = try self.ensureHeap().alloc(.cell_internal, @sizeOf(UpvalCell));
+        heap_mod.Heap.bodyOf(UpvalCell, h).* = .{ .value = initial, .initialized = initialized };
         return Value{
             .tag = @as(u64, @intFromEnum(value_mod.Kind.cell_internal)),
-            .payload = @intFromPtr(cell),
+            .payload = @intFromPtr(h),
         };
     }
 
@@ -1985,14 +2289,15 @@ pub const VM = struct {
     /// validating variant.
     pub fn asCell(v: Value) VmError!*UpvalCell {
         if (v.kind() != value_mod.Kind.cell_internal) return VmError.ExpectedCell;
-        return @ptrFromInt(v.payload);
+        return asCellUnchecked(v);
     }
 
     /// Unchecked variant of `asCell` for paths that have already
     /// validated the Value's kind. Safety builds still assert.
     pub fn asCellUnchecked(v: Value) *UpvalCell {
         std.debug.assert(v.kind() == value_mod.Kind.cell_internal);
-        return @ptrFromInt(v.payload);
+        const h: *heap_mod.HeapHeader = @ptrFromInt(v.payload);
+        return heap_mod.Heap.bodyOf(UpvalCell, h);
     }
 
     /// Pointer to the currently-executing frame. **Single-shot use
@@ -2082,6 +2387,9 @@ pub const VM = struct {
                 const var_table = self.currentFrame().routine.var_table;
                 if (op.index >= var_table.len) return VmError.OperandOutOfRange;
                 const v = var_table[op.index];
+                // A dynamic Var under `binding` answers with the
+                // binding in force; every other load is the root.
+                if (v.thread_bound) break :blk v.thread_value;
                 if (!v.bound) return VmError.UnboundVar;
                 break :blk v.root;
             },
@@ -2152,6 +2460,7 @@ pub const VM = struct {
     /// and invalidate it.
     pub fn run(self: *VM) VmError!Value {
         while (!self.halted) {
+            if (self.gcDue()) self.collectGarbage();
             const inst = blk: {
                 const frame = self.currentFrame();
                 if (frame.pc >= frame.routine.code.len) {
@@ -2193,6 +2502,7 @@ pub const VM = struct {
         var steps: usize = 0;
         while (!self.halted) : (steps += 1) {
             if (steps >= max_steps) return VmError.BytecodeExhausted;
+            if (self.gcDue()) self.collectGarbage();
             const inst = blk: {
                 const frame = self.currentFrame();
                 if (frame.pc >= frame.routine.code.len) {
@@ -2529,6 +2839,7 @@ pub const VM = struct {
             .return_dst = result_dst,
             .return_pc = caller_pc_after_call,
             .upvalues = closure.upvalues,
+            .closure = closure_v,
         });
     }
 
@@ -2646,9 +2957,8 @@ pub const VM = struct {
             return VmError.InvalidCellState;
         }
         const cell_value = self.allocCell(current, true) catch return VmError.OutOfMemory;
-        // ptr may have been invalidated by stack growth inside
-        // allocCell? No — allocCell only touches runtime_arena,
-        // not vm.stack. Safe to reuse ptr.
+        // allocCell touches the heap, not `vm.stack`, so `ptr` is
+        // still valid.
         ptr.* = cell_value;
     }
 
@@ -2754,49 +3064,39 @@ pub const VM = struct {
             return VmError.CaptureCountMismatch;
         }
 
-        // For each capture source, read the raw *UpvalCell
-        // pointer.
+        // Allocate the closure block, then fill its cell array
+        // from the capture sources in descriptor order:
         //   .local_cell_slot(s): slot[s] must hold a cell-
         //     internal Value (boxed by prior closure:box-local).
         //   .inherited_upvalue(u): caller's frame.upvalues[u]
         //     is already a *UpvalCell pointer — copy directly.
-        // Construct the closure's upvalues[] by appending each
-        // resolved cell pointer in descriptor order.
-        const arena = self.runtime_arena.allocator();
-        var upvalues: []*UpvalCell = undefined;
-        if (desc.sources.len == 0) {
-            upvalues = &.{};
-        } else {
-            upvalues = arena.alloc(*UpvalCell, desc.sources.len) catch
-                return VmError.OutOfMemory;
-            for (desc.sources, 0..) |source, i| {
-                upvalues[i] = switch (source) {
-                    .local_cell_slot => |s| blk: {
-                        const cell_v = (try self.slotPtr(s)).*;
-                        // Must be a cell pointer (the
-                        // `:expected-cell` trap). The compiler's
-                        // capture pre-analysis guarantees this in
-                        // well-formed bytecode; malformed bytecode
-                        // (e.g., descriptor source referencing an
-                        // un-boxed slot) traps here.
-                        break :blk try VM.asCell(cell_v);
-                    },
-                    .inherited_upvalue => |u| blk: {
-                        if (u >= frame.upvalues.len) return VmError.UpvalueOutOfRange;
-                        // Direct raw-cell access — NOT via
-                        // resolve(u), which would deref to
-                        // cell-contents (raw-vs-contents
-                        // distinction).
-                        break :blk frame.upvalues[u];
-                    },
-                };
-            }
-        }
-
-        // Allocate the closure with the populated upvalue array.
-        // (Allocator failure surfaces as VmError.OutOfMemory.)
-        const closure_v = self.allocClosure(child_routine, upvalues) catch
+        // Nothing allocates between the two steps, so the block is
+        // complete before a safe point can see it.
+        const closure_v = self.allocClosure(child_routine, desc.sources.len) catch
             return VmError.OutOfMemory;
+        const upvalues = closureUpvaluesMut(closure_v);
+        for (desc.sources, 0..) |source, i| {
+            upvalues[i] = switch (source) {
+                .local_cell_slot => |s| blk: {
+                    const cell_v = (try self.slotPtr(s)).*;
+                    // Must be a cell pointer (the
+                    // `:expected-cell` trap). The compiler's
+                    // capture pre-analysis guarantees this in
+                    // well-formed bytecode; malformed bytecode
+                    // (e.g., descriptor source referencing an
+                    // un-boxed slot) traps here.
+                    break :blk try VM.asCell(cell_v);
+                },
+                .inherited_upvalue => |u| blk: {
+                    if (u >= frame.upvalues.len) return VmError.UpvalueOutOfRange;
+                    // Direct raw-cell access — NOT via
+                    // resolve(u), which would deref to
+                    // cell-contents (raw-vs-contents
+                    // distinction).
+                    break :blk frame.upvalues[u];
+                },
+            };
+        }
 
         try self.store(inst.c, closure_v);
     }
@@ -2974,9 +3274,10 @@ pub const VM = struct {
     //   B = raw    — argc (raw u12 immediate, kind ignored per §4.5)
     //   C = slot   — destination slot
     //
-    // Every variant allocates via `self.ensureHeap()`. The heap is
-    // arena-backed and `Heap.alloc` never collects (GC.md §9), so
-    // partial results need no rooting during construction.
+    // Every variant allocates via `self.ensureHeap()`. `Heap.alloc`
+    // never collects (a cycle runs only at the safe point between
+    // instructions, VM.md §9), so partial results need no rooting
+    // during construction.
 
     fn execColl(self: *VM, inst: Inst) VmError!void {
         const variant: CollOp = @enumFromInt(inst.variant);
@@ -3439,6 +3740,8 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.ArityMismatch => "arity-mismatch",
         VmError.NotCallable => "not-callable",
         VmError.UnboundVar => "unbound-var",
+        VmError.NotDynamic => "not-dynamic",
+        VmError.NoThreadBinding => "no-thread-binding",
         VmError.ArithmeticOverflow => "arithmetic-overflow",
         VmError.DivideByZero => "divide-by-zero",
         VmError.IndexOutOfBounds => "index-out-of-bounds",

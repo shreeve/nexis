@@ -555,8 +555,11 @@ build time, define further macros in nexis itself through
 `defmacro`: `when-let`, `if-let`, `if-not`, `dotimes`, `doseq`,
 `while`, `letfn`, `declare`, `cond->`, `cond->>`, `some->`,
 `some->>`, `as->`, `with-tx`, `with-read-tx`, `with-snapshot`,
-`with-conn`. `doseq` takes the same modifiers as `for` and runs the
-body for effect, yielding nil.
+`binding`, `set!`, `with-conn`. `doseq` takes the same modifiers as
+`for` and runs the body for effect, yielding nil. `binding` expands to
+`(do (push-thread-bindings (hash-map (var a) va ...)) (try (do body...)
+(finally (pop-thread-bindings))))` and `set!` to `(var-set (var a) v)`
+(`docs/VM.md` §6.5).
 
 ## 10b. Form construction helpers
 

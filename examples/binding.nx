@@ -1,0 +1,45 @@
+; examples/binding.nx — dynamic Vars and `binding`.
+;
+; A Var defined with ^:dynamic can be rebound for the dynamic extent
+; of a `binding` form: every load of it inside that extent, from any
+; function called there, sees the binding; the root value is back
+; when the form exits, by return or by throw. `set!` changes the
+; innermost binding in force.
+
+(def ^:dynamic *indent* 0)
+(def ^:dynamic *out-prefix* "> ")
+
+(defn emit [text]
+  (println (str *out-prefix* (apply str (repeat *indent* " ")) text)))
+
+(defn section [title body-fn]
+  (emit title)
+  (binding [*indent* (+ *indent* 2)]
+    (body-fn)))
+
+(section "outer"
+  (fn []
+    (emit "one")
+    (section "inner"
+      (fn []
+        (emit "two")
+        (binding [*out-prefix* "! "]
+          (emit "three"))
+        (emit "four")))
+    (emit "five")))
+
+; The bindings are gone after the form.
+(emit "root again")
+
+; A throw unwinds through binding: the root is restored before the
+; catch runs.
+(println (try
+           (binding [*indent* 40] (throw :boom))
+           (catch :boom _ [*indent* :restored])))
+
+; set! rebinds the innermost binding.
+(println (binding [*indent* 1] (set! *indent* 5) *indent*))
+
+; Only a dynamic Var can be bound.
+(def plain 1)
+(println (try (binding [plain 2] plain) (catch :not-dynamic e e)))

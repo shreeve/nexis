@@ -330,3 +330,130 @@ test "G5: repeated allocate-and-collect cycles do not leak" {
     _ = collector.collect(&.{});
     try std.testing.expectEqual(@as(usize, 0), heap.liveCount());
 }
+
+// -----------------------------------------------------------------------------
+// G6. A program's heap stays bounded under a forced-frequent trigger
+// -----------------------------------------------------------------------------
+
+const vm_mod = @import("vm");
+const compile = @import("compile");
+const intern_mod = @import("intern");
+const reader_mod = @import("reader");
+const expand_mod = @import("expand");
+const stdlib = @import("stdlib");
+
+/// A VM with the core natives and core.nx, whose collector is due
+/// every few kilobytes (`GcPolicy.stress`), running one program of
+/// top-level forms through the whole pipeline.
+const StressProgram = struct {
+    arena: std.heap.ArenaAllocator,
+    v: vm_mod.VM,
+    host_macros: expand_mod.HostMacroTable,
+    registry: *vm_mod.NamespaceRegistry,
+    interner: *intern_mod.Interner,
+
+    const stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
+    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+
+    fn init(self: *StressProgram) !void {
+        self.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        errdefer self.arena.deinit();
+        self.v = try vm_mod.VM.init(std.testing.allocator, &stub);
+        errdefer self.v.deinit();
+        self.v.gc_threshold = vm_mod.GcPolicy.stress.threshold;
+        self.v.gc_growth_percent = vm_mod.GcPolicy.stress.growth_percent;
+        self.v.gc_next_at = vm_mod.GcPolicy.stress.threshold;
+        self.interner = self.v.ensureInterner();
+        self.registry = try self.v.ensureRegistry();
+        try stdlib.installCore(self.registry.core);
+        self.host_macros = try expand_mod.defaultMacros(std.testing.allocator);
+        errdefer self.host_macros.deinit(std.testing.allocator);
+        const saved = self.registry.current;
+        self.registry.current = self.registry.core;
+        _ = try self.run(stdlib.CORE_NX_SOURCE, self.v.runtime_arena.allocator());
+        self.registry.current = saved;
+    }
+
+    fn deinit(self: *StressProgram) void {
+        self.host_macros.deinit(std.testing.allocator);
+        self.v.deinit();
+        self.arena.deinit();
+    }
+
+    /// Run every top-level form of `src`; the last form's value is
+    /// the result. Routines compile into `compile_allocator`.
+    fn run(self: *StressProgram, src: []const u8, compile_allocator: std.mem.Allocator) !Value {
+        var parse_result = try reader_mod.parser.parseProgram(std.testing.allocator, src);
+        defer parse_result.parser.deinit();
+        var rdr = reader_mod.Reader.init(std.testing.allocator, src);
+        defer rdr.deinit();
+        const forms = try rdr.readProgram(parse_result.sexp);
+        var last: Value = value.nilValue();
+        for (forms) |form| {
+            const compiled = try compile.compileFormWith(compile_allocator, form, .{
+                .namespace = self.registry.current,
+                .interner = self.interner,
+                .host_macros = &self.host_macros,
+                .persistent_allocator = self.v.runtime_arena.allocator(),
+                .registry = self.registry,
+            });
+            const routine = compiled.toRoutine("gc-prop");
+            try self.v.retargetTop(&routine);
+            last = try self.v.run();
+        }
+        return last;
+    }
+};
+
+test "G6: a loop that allocates every iteration runs in bounded heap and computes the same result" {
+    var program: StressProgram = undefined;
+    try program.init();
+    defer program.deinit();
+    const heap = program.v.ensureHeap();
+    const after_boot = heap.live_bytes;
+    // Each iteration builds and drops a 64-element vector, a string
+    // and a map; only the running total survives. 20,000 iterations
+    // allocate tens of megabytes in total.
+    const src =
+        \\(loop [i 0 total 0]
+        \\  (if (< i 20000)
+        \\    (recur (inc i) (+ total (count (vec (range 64))) (count (str "item-" i)) (count (assoc {} :k i))))
+        \\    total))
+    ;
+    const result = try program.run(src, program.arena.allocator());
+    // (64 + 5..10 + 1) per iteration, summed exactly.
+    var expected: i64 = 0;
+    var i: i64 = 0;
+    while (i < 20000) : (i += 1) {
+        var buf: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "item-{d}", .{i});
+        expected += 64 + @as(i64, @intCast(text.len)) + 1;
+    }
+    try std.testing.expectEqual(expected, result.asFixnum());
+    try std.testing.expect(program.v.gc_cycles > 100);
+    // The high-water mark stays within a fixed budget above what
+    // bootstrap left live: the collector reclaimed each iteration's
+    // garbage rather than letting it accumulate.
+    try std.testing.expect(heap.peak_live_bytes < after_boot + 512 * 1024);
+    try std.testing.expect(heap.live_bytes < after_boot + 512 * 1024);
+}
+
+test "G6b: results built across many cycles are intact: strings, vectors and closures" {
+    var program: StressProgram = undefined;
+    try program.init();
+    defer program.deinit();
+    const src =
+        \\(defn churn [x] (count (apply str (map (fn [i] (str x i)) (range 100)))))
+        \\(def fs (mapv (fn [x] (fn [] (churn x) (str "f" x))) (range 50)))
+        \\(def parts (mapv (fn [f] (f)) fs))
+        \\(dotimes [i 200] (churn i))
+        \\[(count parts) (first parts) (last parts) (apply str (take 5 parts))]
+    ;
+    const result = try program.run(src, program.arena.allocator());
+    try std.testing.expect(program.v.gc_cycles > 0);
+    try std.testing.expect(result.kind() == .persistent_vector);
+    try std.testing.expectEqual(@as(i64, 50), vector_mod.nth(result, 0).asFixnum());
+    try std.testing.expectEqualStrings("f0", string.asBytes(vector_mod.nth(result, 1)));
+    try std.testing.expectEqualStrings("f49", string.asBytes(vector_mod.nth(result, 2)));
+    try std.testing.expectEqualStrings("f0f1f2f3f4", string.asBytes(vector_mod.nth(result, 3)));
+}

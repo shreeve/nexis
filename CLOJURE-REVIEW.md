@@ -136,7 +136,7 @@ Clojure has a single global `Var.rev` int that increments on any root change. Si
 
 Clojure puts an `AtomicBoolean threadBound` on every Var as a fast-path flag. Overkill for our single-isolate v1.
 
-**nexis adaptation**: a single isolate-level `dynamic_bindings_depth: u32` counter. If zero, skip the binding-stack walk entirely for any dynamic var lookup. Cleaner.
+**nexis adaptation**: no walk at all. The binding in force lives on the Var (`thread_value` + a `thread_bound` flag); the VM keeps only the save stack `binding` pushes and pops (`docs/VM.md` §6.5). A load is one flag test, a Var never bound costs nothing, and `set!` writes the Var directly. One isolate, one thread, so "thread-local" is process-global and a compile-time sub-VM sees the caller's bindings.
 
 ---
 
