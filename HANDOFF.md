@@ -56,16 +56,24 @@ Nextomic (`src/nextomic/`, spec `docs/NEXTOMIC.md`):
   datoms as-of since history tx-range schema sync q explain pull
   pull-many with`; `with-conn` in `src/stdlib/nextomic.nx`. `q` is a
   native over a query value, cached per VM by value.
-- Every error is a catchable `:nextomic/*` keyword (§7).
+- Errors (§7): a Nextomic-semantic error is a map whose `:error` is a
+  `:nextomic/*` keyword and whose other keys carry the context
+  (`{:error :nextomic/unique :attr ... :value ...}`); an argument of
+  the wrong shape is the VM's `:kind-mismatch` / `:invalid-argument` /
+  `:arity-mismatch`; an engine failure is a `:db/*` keyword. All are
+  catchable by `try`.
 - Memory: every Nextomic operation allocates in its own arena and
-  copies only results into the VM heap.
+  copies only results into the VM heap; the tx-data, reports and
+  results a program holds stay in the VM heap, where nothing is
+  collected.
 - Zero changes to emdb.
 
-Tests: `zig build test --summary all` runs **1265 tests across 111
+Tests: `zig build test --summary all` runs **1282 tests across 135
 steps**: inline unit tests, `test/prop/*` (including `nextomic_key`,
 `nextomic_tx`), the query and pull corpora in `test/integration/`
-against naive evaluators, reader goldens, and `test/nextomic/*.nx`
-end-to-end scripts diffed against `.out` files.
+against naive evaluators, reader goldens, `test/nextomic/*.nx`
+end-to-end scripts diffed against `.out` files, and every
+`examples/*.nx` through `bin/nexis` (the store-backed ones twice).
 
 Examples: `examples/nextomic-app.nx` (clinic chart: schema, upserts,
 components, `q`, `pull`, time views, `with`, a caught
@@ -81,7 +89,7 @@ atoms). See `examples/README.md`.
 cd /path/to/nexis                       # ../emdb must be a sibling
 git status                              # clean main
 zig build install
-zig build test --summary all            # expect 1265/1265 tests, 111/111 steps
+zig build test --summary all            # expect 1282/1282 tests, 135/135 steps
 ./bin/nexis run examples/nextomic-app.nx
 ./bin/nexis run examples/nextomic-app.nx   # second run: same store, upserts, no new patients
 ./bin/nexis run examples/todo-app.nx
@@ -89,13 +97,15 @@ zig build test --summary all            # expect 1265/1265 tests, 111/111 steps
 ./bin/nexis run examples/shapes-app.nx     # "total-area atom = 9650", every satisfies?=true
 ```
 
-Loops: `zig build phase2-test` (seconds) for language work,
+Loops: `zig build quick` (seconds) for language work,
 `zig build nextomic-test` + `zig build nextomic-nx` for Nextomic,
-the full suite before every commit. The two corpus binaries print
-`[bench]` lines to stderr; the build runner shows them under a
-"failed command" banner even when they pass — trust the summary line.
-Debug-build bench numbers under the testing allocator are not
-performance measurements; `docs/PERF.md` §3.7 has the ReleaseFast ones.
+`zig build examples` after touching anything an example uses, the
+full suite before every commit. The two corpus binaries end with a
+benchmark whose row-count checks always run; its `[bench]` timing
+lines print only when the `NEXTOMIC_BENCH` environment variable is
+set, and Debug-build numbers under the testing allocator are not
+performance measurements (`docs/PERF.md` §3.7 has the ReleaseFast
+ones).
 
 ---
 
@@ -103,7 +113,7 @@ performance measurements; `docs/PERF.md` §3.7 has the ReleaseFast ones.
 
 | Gap | Where it shows |
 |---|---|
-| Collector never invoked at runtime | `src/gc.zig` `collect` has no caller; process memory grows without bound |
+| Collector never invoked at runtime | `src/gc.zig` `collect` has no caller; process memory grows without bound, so a loader that transacts millions of datoms batches the work across processes |
 | No bignum arithmetic | overflow raises `:arithmetic-overflow`; an integer literal outside ±2^47 is `IntegerOutOfFixnumRange` at compile time |
 | No `^:dynamic` / `binding` | `(binding ...)` is `UnresolvedSymbol` |
 | PLAN §21 Phase 5 as defined | no test runner, `nexis.test`/`math`/`pprint`, `--disasm`; runtime errors carry no source spans |
@@ -138,29 +148,53 @@ inline tests, then `zig build test` green, then commit.
    (`callValue`). Trigger from the allocator on a byte threshold.
    `docs/GC.md` is the spec; `test/prop/gc.zig` the gate. Nextomic
    is arena-scoped and needs no changes beyond cache clearing.
-3. **Phase 5 as PLAN §21 defines it.** A test runner and `nexis.test`
+3. **Clojure surface gaps.** Core forms and functions a Clojure
+   programmer reaches for that are absent or diverge; each is a
+   small, self-contained change in `src/expand.zig`, `src/compile.zig`
+   or `src/stdlib.zig` + `core.nx`:
+   - `case` evaluates its keys: `(case 1 (1 2) :a :d)` fails; keys
+     must be constants and a list key an alternative set.
+   - Syntax-quote: `~@` of a vector or nil, quoted maps, sets and
+     vectors with `~@`, nested `#()` outside macro arguments, and
+     symbol qualification (PLAN §23 #29 promises it; the expander
+     leaves symbols bare).
+   - Multi-arity anonymous `fn` (`defn` has it; `fn` and `letfn` do
+     not).
+   - `try` without `catch` (finally-only) is `MalformedForm`.
+   - Empty-body `fn`/`defn`/`let` and the literal `()` are compile
+     errors where Clojure yields nil / `()`.
+   - `defn` docstrings, attribute maps and `^:private`.
+   - Destructuring `:strs`/`:syms`, namespaced `:keys`, keyword
+     arguments (`& {:keys [...]}`), and `loop` bindings.
+   - `doseq` `:when`/`:let`/`:while`.
+   - `int`/`long`/`double` conversions (no way to turn a double into
+     an integer).
+   - `meta`/`with-meta`, `ex-info`/`ex-data`, `macroexpand`,
+     `read-string`, `list*`, `reduced`.
+   - Reader errors carry no file, line or column.
+4. **Phase 5 as PLAN §21 defines it.** A test runner and `nexis.test`
    (`deftest`/`is`/`run-tests`), `nexis.math`, `nexis.pprint`,
    `nexis --disasm`, and source-mapped runtime errors (a PC → span
    table per Routine; `docs/COMPILER.md` and `docs/VM.md` amendment
    logs). Refresh the `src/cli.zig` usage text in the same pass.
-4. **Datalog function-position variables.** Allow `[(?f ?x) ?y]` and
+5. **Datalog function-position variables.** Allow `[(?f ?x) ?y]` and
    `[(?pred ?x)]` where `?f` is bound to a function value by an `:in`
    input or an earlier clause; `query/parse.zig` accepts a
    symbol only, `query/exec.zig` calls through the CallHook. Add
    corpus cases in `test/integration/nextomic_q.zig` and a row in
    `docs/NEXTOMIC.md` §5.
-5. **`typed_vector`.** PLAN §8 reserves the kind and PLAN §15.11
+6. **`typed_vector`.** PLAN §8 reserves the kind and PLAN §15.11
    NX-2 expects Relation columns to share its representation. Ship
    the kind (i64/f64 columns), codec arms, and `vec`/`nth`/`count`
    over it before any `nexis.simd` kernel.
-6. **`^:dynamic` Vars and `binding`.** PLAN §21 Phase 3.7. A dynamic
+7. **`^:dynamic` Vars and `binding`.** PLAN §21 Phase 3.7. A dynamic
    binding stack on the VM, `binding` as a macro over push/pop with a
    `finally`, Var loads checking the stack only for Vars marked
    dynamic so ordinary Var loads stay a single indirection.
-7. **`vec` over sets and maps.** Add `.persistent_set` and
+8. **`vec` over sets and maps.** Add `.persistent_set` and
    `.persistent_map` arms to `fnVec` in `src/stdlib.zig` (map →
    `[k v]` pairs).
-8. **Nextomic follow-ups**, in the order they unblock users:
+9. **Nextomic follow-ups**, in the order they unblock users:
    - Transaction functions and `:db.fn/cas` (a Lisp function called
      inside `transact!` with `db-before` and returning tx-data; needs
      item 2's rooting rule when the function allocates).
@@ -173,7 +207,7 @@ inline tests, then `zig build test` green, then commit.
    - Linux 4K-page CI run: the page size is pinned to 16 KiB in code,
      so a Linux run should produce byte-identical stores; add it to
      CI to prove the pin holds where the engine default differs.
-9. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): inline
+10. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): inline
    caches on Var loads, SIMD CHAMP nodes, zero-copy strings from emdb
    pages. Measure first with `zig build bench`; `docs/BENCH.md` is the
    honesty gate.

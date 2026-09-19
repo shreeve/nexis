@@ -21,7 +21,7 @@ multi-arity `defn`, doubles with Clojure contagion, keyword/map/set/
 vector as functions, atoms, strings and I/O, records and protocols,
 `case`/`condp`/`for`, durable refs with explicit transactions and
 snapshots, and the `nextomic` namespace with `with-conn`. `zig build
-test` runs 1265 tests across 111 steps. What does not exist is
+test` runs 1282 tests across 135 steps. What does not exist is
 listed under "Known gaps" in `README.md` and ranked in `HANDOFF.md`:
 the collector is implemented but never invoked at runtime, bignum
 arithmetic and `binding` are absent, and PLAN §21 Phase 5 as defined
@@ -80,23 +80,27 @@ value kinds. Each of these is a frozen commitment. Amend `PLAN.md` first.
 ## Build steps
 
 - `zig build install` — `bin/nexis` (CLI: `run`, `repl`) and `bin/nexis-golden`.
-- `zig build phase2-test` — the inner loop, seconds: atom, record,
+- `zig build quick` — the inner loop, seconds: atom, record,
   protocol, vm, format, compile, expand, stdlib and loader module
   tests, the compile property tests, the eval-pipeline integration
   tests, and the Nextomic unit, key and transaction property tests.
+  `zig build phase2-test` names the same step.
 - `zig build nextomic-test` — only Nextomic: `src/nextomic/` unit tests,
   `test/prop/nextomic_key.zig`, `test/prop/nextomic_tx.zig`, and the
   query and pull corpora in `test/integration/nextomic_{q,pull}.zig`
-  (each corpus ends with a benchmark that prints `[bench]` lines to
-  stderr; the build runner echoes them under "failed command" even
-  when the step passes — read the summary line).
+  (each corpus ends with a benchmark whose row-count checks always
+  run; its `[bench]` timing lines print to stderr only when the
+  `NEXTOMIC_BENCH` environment variable is set).
 - `zig build nextomic-nx` — runs `test/nextomic/*.nx` through `bin/nexis`
-  in a scratch directory, in order, and diffs stdout against the `.out`
-  files. `persist-1` and `persist-2` share one store across two
-  processes.
+  in a scratch directory that also holds the shared `prelude.nx`, and
+  diffs stdout against the `.out` files. `persist-1` and `persist-2`
+  share one store across two processes.
+- `zig build examples` — runs every `examples/*.nx` through `bin/nexis`
+  from a generated working directory; the three store-backed examples
+  run twice.
 - `zig build test --summary all` — everything above plus the reader
-  goldens and the Phase 1 randomized property gates (~100k HAMT ops;
-  peaks near 1 GB, minutes). Run before commits, not in the inner loop.
+  goldens and the randomized collection gates (~100k CHAMP ops; peaks
+  near 1 GB, minutes). Run before commits, not in the inner loop.
 - `zig build golden` — reader golden diff alone;
   `zig build golden -Dupdate=true` rewrites expected files in place (use
   only when intentionally changing the schema; commit the diffs together).
@@ -105,8 +109,9 @@ value kinds. Each of these is a frozen commitment. Amend `PLAN.md` first.
 - `zig build bench` — the ReleaseFast benchmark harness (`docs/BENCH.md`);
   `-- --out bench/baseline.json` writes the machine-readable run.
 
-There are no environment variables: every switch is a build option or
-a CLI argument. The generated `src/parser.zig` **is** committed — it is
+Every switch is a build option or a CLI argument; the one environment
+variable, `NEXTOMIC_BENCH`, only turns on the corpus benchmarks'
+timing output. The generated `src/parser.zig` **is** committed — it is
 the authoritative artifact for consumers. Regenerate it whenever you
 edit `nexis.grammar`.
 
@@ -152,7 +157,7 @@ nexis/
 │   ├── prop/                    property tests (incl. nextomic_key, nextomic_tx)
 │   ├── integration/             eval_pipeline, nextomic_q, nextomic_pull corpora
 │   ├── golden/                  reader goldens
-│   └── nextomic/                *.nx end-to-end scripts + *.out
+│   └── nextomic/                *.nx end-to-end scripts + *.out, prelude.nx
 ├── examples/                    working .nx programs (examples/README.md)
 ├── bench/main.zig               benchmark driver
 └── bin/                         build output
@@ -230,10 +235,11 @@ keywords and nothing else (`docs/DB.md` §11.1).
    regenerate the parser and re-run goldens. If a golden changed
    semantically, update it with `-Dupdate=true` and inspect the diff in
    your commit.
-4. If you touch `src/nextomic/`: run `zig build nextomic-test` and
-   `zig build nextomic-nx`; a behavior change updates the matching
-   `test/nextomic/*.out` and the row in `docs/NEXTOMIC.md` §6 or §7 in
-   the same commit.
+4. If you touch `src/nextomic/`: run `zig build nextomic-test`,
+   `zig build nextomic-nx` and `zig build examples`; a behavior change
+   updates the matching `test/nextomic/*.out` and the row in
+   `docs/NEXTOMIC.md` §6 or §7 in the same commit. An error a native
+   throws is a map with `:error` (§7); keep new ones on that contract.
 5. If you touch documentation, cite the PLAN.md section that grounds your
    change. A §23 decision changes only through a dated Amendment Log entry.
 6. Write Zig tests inline in the module you edited. Don't add a new test

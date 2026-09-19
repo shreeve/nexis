@@ -19,7 +19,7 @@ not a library bolted on top.
 ## Status
 
 Every row below is runnable through `bin/nexis`. `zig build test`
-runs **1265 tests** across 111 build steps (unit, property, golden,
+runs **1282 tests** across 135 build steps (unit, property, golden,
 Nextomic corpora, and the `test/nextomic/*.nx` end-to-end scripts).
 See [`PLAN.md`](PLAN.md) §21 for the phase map and
 [`HANDOFF.md`](HANDOFF.md) for the ranked next-work list.
@@ -58,7 +58,7 @@ zig build quick                    # seconds — language, eval-pipeline and Nex
 zig build nextomic-test            # Nextomic unit, property and corpus tests
 zig build nextomic-nx              # test/nextomic/*.nx through bin/nexis
 zig build examples                 # every examples/*.nx through bin/nexis
-zig build test --summary all       # minutes — everything (1265 tests)
+zig build test --summary all       # minutes — everything (1282 tests)
 zig build parser                   # regenerate src/parser.zig from nexis.grammar
 zig build bench                    # ReleaseFast benchmark suite
 ```
@@ -162,12 +162,13 @@ nested and reverse `pull` patterns, `history`/`tx-range`, a
 speculative `with`, and a caught `:nextomic/unique`. It is safe to
 run twice: upserts by unique identity make the second run a no-op.
 
-What the query layer accepts: patterns, every `:in` form (`$`, scalar,
-collection, tuple, relation, `%` rules), predicates and function
-bindings that call any Lisp function including one you `defn`'d,
-aggregates, every find spec (`.`, `[...]`, `[[...]]`, relation),
-`not`/`not-join`/`or`/`or-join`/`and`, recursive rules, and the time
-views. `(d/explain query db)` returns the plan as a string. Parsed
+What the query layer accepts: patterns, the `:in` forms `$`, scalar,
+collection, tuple, relation and `%` rules (one database per query;
+no `:keys`/`:strs`/`:syms`), predicates and function bindings that
+call any Lisp function including one you `defn`'d, the aggregates
+`min max sum avg count count-distinct distinct`, the find specs `.`,
+`[...]`, `[[...]]` and relation, `not`/`not-join`/`or`/`or-join`/
+`and`, recursive rules, and the time views. `(d/explain query db)` returns the plan as a string. Parsed
 queries are cached per VM by value.
 
 Two calls differ from Datomic's. `(d/with conn tx-data f)` is the
@@ -221,6 +222,11 @@ Stated so nobody rediscovers them:
   reported as `MacroExpansionFailure` over the whole form).
 - **No `^:dynamic` Vars, no `binding`.** `(binding ...)` is an
   unresolved symbol.
+- **Several Clojure core forms and functions are absent** (`case`
+  with evaluated keys, finally-only `try`, multi-arity `fn`, `defn`
+  docstrings, `:strs`/`:syms` destructuring, `int`/`long`/`double`,
+  `ex-info`, `macroexpand`, `read-string`, ...); `HANDOFF.md` §4
+  lists them.
 - **Phase 5 as PLAN §21 defines it is open**: no test runner, no
   `nexis.test`/`nexis.math`/`nexis.pprint`, no `--disasm`, and
   runtime errors carry no source spans (stack traces are not
