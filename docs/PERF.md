@@ -87,8 +87,8 @@ projected nexis direction vs Clojure. "Measured" column cites the
 | 1 | Value cell size | 16–56 B boxed | 16 B NaN-boxed tagged | **2–3× smaller** | — | implemented, not yet measured |
 | 2 | Fixnum arithmetic | Boxed `Long` / `unchecked-*` | Inline 62-bit tagged | **3–10×** on tight loops | ~1 ns/op (§3.1) | measured |
 | 3 | Float arithmetic | Boxed `Double` / `^double` | Inline NaN-boxed f64 | **2–5×** on idiomatic | <1 ns/op† (§3.1) | measured |
-| 4 | Persistent map | HAMT (Bagwell 2001) | CHAMP (Steindorfer 2015) | **15–25%** faster lookup, **30–40%** less memory | get 15.5 ns/op @ N=4096 (§3.4) | measured (partial) |
-| 5 | Persistent set | HAMT | CHAMP | same as #4 | contains 9.4 ns/op @ N=4096 (§3.4) | measured (partial) |
+| 4 | Persistent map | HAMT (Bagwell 2001) | CHAMP (Steindorfer 2015) | **15–25%** faster lookup, **30–40%** less memory | get 15.5 ns/op @ N=4096 on M1 (§3.4); 13.3 ns/op on M5 (§3.8) | measured (partial) |
+| 5 | Persistent set | HAMT | CHAMP | same as #4 | contains 9.4 ns/op @ N=4096 on M1 (§3.4); 6.9 ns/op on M5 (§3.8) | measured (partial) |
 | 6 | Persistent vector | 32-way trie + tail | 32-way trie + tail | **parity** expected | nth ~1 ns/op @ N=4096 (§3.4)‡ | measured (partial) |
 | 7 | Persistent list | Cons cells | Cons cells | **parity** | cons 14.7 ns/op @ N=4096 (§3.2) | measured |
 | 8 | Hashing | Murmur3 | xxHash3-64 | **2–3×** faster on long bytes | ~34 GB/s (§3.1) | measured (partial) |
@@ -96,7 +96,7 @@ projected nexis direction vs Clojure. "Measured" column cites the
 | 10 | Transients | Mutation token | Owner-token (Option B wrapper) | **parity** in v1; node-owner in-place edit is the open lever | ~parity with persistent (§3.3) | measured |
 | 11 | GC | Generational tracing (G1/ZGC) | Precise non-moving mark-sweep | **worse** short-term; addressable | — | implemented, acknowledged weakness |
 | 12 | Allocator | TLAB bump pointer | size-class pool (POOL.md) | **parity-to-edge vs TLAB** on hot paths | list cons **3.94×**, map assoc **1.80×** vs pre-pool (§3.2) | measured |
-| 13 | Dispatch / polymorphism | Inline-cached via JIT | 26-way switch per op | **worse** at warm steady state; inline caches absent | hashValue ~1–2 ns (§3.1) | measured (partial) |
+| 13 | Dispatch / polymorphism | Inline-cached via JIT | 26-way switch per op | **worse** at warm steady state; inline caches absent | hashValue ~1–2 ns (§3.1); 2.9 ns per bytecode instruction, 20 ns per global fn call on M5 (§3.8) | measured (partial) |
 | 14 | Durable state | No stdlib primitive | emdb mmap, zero-copy | **orders of magnitude faster** | get-hot 1.04 μs (§3.6) | measured (partial) |
 | 15 | Codec / serialization | `.edn` / Nippy | Binary LEB128/ZigZag | **2–5× size, 5–20× speed** vs `.edn` | encode 18 ns/entry, decode 124 ns/entry (§3.5) | measured (partial) |
 | 16 | Concurrency tax | STM + CAS pervasive | Single-isolate, single-writer | **strictly less overhead**; by design | — | implemented, by design |
@@ -104,7 +104,7 @@ projected nexis direction vs Clojure. "Measured" column cites the
 | 18 | Startup | 100–500 ms JVM warmup | Native binary | **10–500×** | — | implemented, not yet measured |
 | 19 | Compilation | HotSpot C1+C2 JIT | Bytecode VM, switch dispatch, no specialization | **worse** on sustained compute | — | not measured against Clojure |
 | 20 | Comptime specialization | JIT inlining + escape analysis | Zig `comptime` monomorphization | **~2×** on specialized paths | — | absent |
-| 21 | Datalog over datoms (Nextomic) | Datomic (peer + transactor, JVM) | in-process, emdb named trees, arena per operation | not head-to-head measured | 3-way join over 200k datoms 1.43 ms to rows; 20k `[*]` pulls 15.7 ms (§3.7) | measured (single sample, corpus benchmark) |
+| 21 | Datalog over datoms (Nextomic) | Datomic (peer + transactor, JVM) | in-process, emdb named trees, arena per operation | not head-to-head measured | 3-way join over 200k datoms 0.72 ms to rows; 20k `[*]` pulls 12.9 ms (§3.7) | measured (corpus benchmark, best of 5 runs) |
 
 **†** NaN-box pair inlines through arithmetic; measured median is
 at or below harness timer resolution. See §3.1 footnote.
@@ -353,35 +353,79 @@ is set. Reproduce with
 The store is emdb with 16 KiB pages; the datom set is 40,000
 employees in 20 departments, five attributes each (~200k datoms).
 
+Each query row is the best of five runs inside the test; the table
+is the best of five invocations of the step, with the spread across
+them in brackets (Apple M5, 32 GiB, macOS 26.6, Zig 0.16.0,
+ReleaseFast, idle machine).
+
 | Op | ReleaseFast, Apple M5 | Notes |
 |---|---:|---|
-| 3-way join by department (`avet` seek → `vaet` → `eavt`), 2000 rows | 1.43 ms to rows | 38.3 ms including the persistent result set — see the allocator caveat |
-| 3-way join by age (`avet` range → `eavt` → `eavt`), 851 rows | 19.8 ms | includes the result set |
-| `(count ?e)` by department (`aevt` scan + hash join), 667 rows | 1.10 ms | |
-| `pull-many [*]` over 20,000 entities (5 datoms each) | 15.7 ms | one read transaction for the whole call |
-| `pull-many` nested ref + `:limit` over 20,000 entities | 23.8 ms | |
-| reverse-ref pull of the 2,000 employees of one department | 0.45 ms | |
-
-The landing reports for the query and pull work measured the same
-three headline rows at 1.2 ms (join to rows), 16.5 ms (`[*]` pulls)
-and 0.9 ms (count query); the spread against the table is single-
-sample run-to-run noise, not a regression.
+| 3-way join by department (`avet` seek → `vaet` → `eavt`), 2000 rows | 0.72 ms to rows [0.72–0.79] | 1.27 ms [1.27–1.37] including the persistent result set |
+| 3-way join by age (`avet` range → `eavt` → `eavt`), 851 rows | 2.63 ms [2.63–2.76] | includes the result set |
+| `(count ?e)` by department (`aevt` scan + hash join), 667 rows | 0.43 ms [0.43–0.45] | |
+| 3-way join from 1 age (`avet` seek, then name and salary), 851 rows | 0.40 ms [0.40–0.42] | nested loop |
+| 3-way join from 3 ages, 2602 rows | 1.33 ms [1.33–1.36] | nested loop |
+| 3-way join from 7 ages, 6259 rows | 3.25 ms [3.25–3.44] | hash join on name and salary |
+| `pull-many [*]` over 20,000 entities (5 datoms each) | 12.9 ms [12.9–13.2] | one read transaction for the whole call; single sample per run |
+| `pull-many` nested ref + `:limit` over 20,000 entities | 18.0 ms [18.0–18.3] | single sample per run |
+| reverse-ref pull of the 2,000 employees of one department | 0.20 ms [0.20–0.22] | single sample per run |
 
 **Caveats:**
 
-- **The query corpus's VM heap is `std.testing.allocator`** even in
-  the benchmark (`Fx.init` in `nextomic_q.zig`), so the "with the
-  result set" column measures the testing allocator's per-allocation
-  bookkeeping while materializing 2000 persistent vectors into a
-  persistent set, not the engine. The "to rows" column is the engine
-  and planner alone. The pull corpus's benchmark uses `c_allocator`
-  (`Fx.initWith`) and pays no such tax.
-- Single sample per row, not the 30-sample median the §3.1–§3.6
-  harness reports; these rows do not enter the §2 scorecard as
-  `measured` until `src/bench.zig` carries them.
-- In a Debug build under the testing allocator the same rows read
-  16.3 ms to rows, 1.33 s with the result set, and 203 ms for the
-  `[*]` pulls; they are not performance measurements.
+- Both corpora build their fixture with `c_allocator` for the
+  benchmark (`Fx.initWith`), so the result-set columns measure the
+  VM heap's allocator, not a testing allocator's bookkeeping.
+- The pull rows are one sample per run of the step; the query rows
+  are the best of five inside the test. Neither is the 30-sample
+  median the §3.1–§3.6 harness reports, so these rows enter the §2
+  scorecard as corpus measurements, not harness ones.
+- A profile of the query rows (`sample` on the ReleaseFast test
+  binary with the repetitions raised) puts about 30 % of the time in
+  the engine's page search (`page.searchPage`, `simd.compare`), 10 %
+  in `Exec.scanInto`, and about 5 % in decoding string values out of
+  keys into the arena; the rest is relation building and the arena.
+- In a Debug build under the testing allocator the same rows are an
+  order of magnitude slower; they are not performance measurements.
+
+### 3.8 Dispatch and lookup rows, Apple M5
+
+`zig build bench -Doptimize=ReleaseFast` on Apple M5 (32 GiB, macOS
+26.6, Zig 0.16.0, pool allocator, idle machine): the best of five
+invocations of the 30-sample median, the spread across the five in
+brackets. "Before" is the tree at `739d24f` (the harness rows
+themselves), "after" is the tree with the two optimizations below.
+Cross-machine numbers are not comparable (docs/BENCH.md §4); the M1
+rows in §3.1–§3.6 stand as that machine's baseline.
+
+The `vm` rows run a routine compiled once on one VM, so a sample is
+the dispatch loop alone; each loops 10,000 times.
+
+| Row | Before | After | Change |
+|---|---:|---:|---|
+| `vm_loop_10k` (9 instructions per iteration) | 340.71 μs [340.7–344.4] | 265.12 μs [265.1–288.6] | `vm` commit: hot groups run against the fetched frame; the collection check follows allocating groups |
+| `vm_global_call_10k` (`(inc1 i)` through a Var per iteration) | 588.10 μs [588.1–600.3] | 469.73 μs [469.7–497.0] | same |
+| `vm_keyword_get_10k` (`(:k m)` on a 12-entry map per iteration) | 665.51 μs [665.5–669.6] | 517.11 μs [517.1–536.1] | same |
+| `eval_simple_loop` (compile + run a 100-iteration loop) | 5.99 μs [5.99–6.05] | 5.06 μs [5.06–5.40] | same |
+| `eval_arith`, `closure_create`, `compile_simple` | 1.41 μs, 1.02 μs, 550 ns | within noise | — |
+| `map_get_n_hit` N=256 | 2.65 μs [2.65–2.69] | 2.10 μs [2.10–2.17] | `champ` commit: an immediate key hashes inline |
+| `map_get_n_hit` N=4096 | 60.66 μs [60.7–63.5] | 54.32 μs [54.3–54.9] | same; 13.3 ns per get |
+| `set_contains_n_hit` N=256 | 1.90 μs [1.90–1.93] | 1.19 μs [1.19–1.23] | same |
+| `set_contains_n_hit` N=4096 | 36.71 μs [36.7–37.2] | 28.17 μs [28.2–28.3] | same; 6.9 ns per contains |
+| `map_assoc_n` / `set_conj_n` at 16, 256, 4096 | 463 ns / 390 ns, 11.5 μs / 10.4 μs, 318 μs / 298 μs | within noise | construction is allocation-bound |
+
+The `vm` commit's message carries the pair measured when it landed
+(267.22, 483.06 and 534.74 μs); the table is a later five-run
+measurement of the same tree. Per instruction, the counting loop
+costs 2.9 ns after the change (9 instructions per iteration; 3.8 ns
+before); a global fn call (`var:load-var`, `call:call`, the callee's
+four instructions, `call:return`) adds 20 ns per iteration. A Var load is one read of
+the routine's `var_table` entry and its `root` (`docs/VM.md` §10 #6);
+there is no inline cache to add on that path.
+
+Rows the pass measured but did not change, same machine, best of
+five: `list_cons_n` 4096 17.96 μs, `vector_conj_n` 4096 78.59 μs,
+`vector_nth_n_sequential` 4096 2.89 μs, `codec_decode_map_n64`
+4.48 μs, `db_put_commit_scalar` 6.00 ms, `db_get_hit_scalar` 60 ns.
 
 ---
 
@@ -486,9 +530,10 @@ is at the hardware fsync floor.
   nth, durable state, startup (not measured but structurally
   obvious).
 - **At parity**: map/set/vector construction.
-- **Behind**: GC (the collector is never invoked at runtime,
-  `docs/GC.md`), dispatch in warm steady state, sustained compute
-  (no opcode specialization).
+- **Behind**: GC (a non-generational mark-sweep the VM runs between
+  two instructions once the heap has allocated its threshold,
+  `docs/GC.md` §1, §7), dispatch in warm steady state, sustained
+  compute (no opcode specialization).
 
 Generational GC would close the throughput-under-alloc-churn
 gap; opcode specialization and inline caches would close the
@@ -643,8 +688,9 @@ only after traversing the entire live heap.
 for generational collection. Estimated 5–30× faster on
 steady-state allocation-heavy workloads.
 
-**Status**: implemented (non-generational) and never invoked by
-the runtime (`docs/GC.md` §1); acknowledged weakness.
+**Status**: implemented, non-generational, run by the VM at its
+safe point once the heap has allocated its threshold (`docs/GC.md`
+§1, §7); acknowledged weakness.
 
 ### 5.12 Allocator — **measured win**
 
@@ -685,9 +731,16 @@ inline caching.
 **Measured**: hashValue ~1–2 ns (§3.1) — the switch predicts
 well enough at hot paths to be ~single-cycle.
 
-**Plan**: comptime monomorphization for statically-known kinds;
-inline caches at dynamic call sites; per-kind fast paths at
-dispatch entry. None of these exist.
+**What exists**: the run loops fetch through one frame pointer and
+hand it to the handlers of the groups that never push or pop a frame
+(`mov`, `cmp`, `jump`, `var`, `math`), so their operands resolve
+without re-deriving the frame; the collection check runs only after
+an instruction that could have allocated (`docs/VM.md` §8, §9). A
+Var load reads the `var_table` entry and its `root` directly. There
+are no inline caches at call sites, no comptime monomorphization of
+`dispatch.hashValue`/`dispatch.equal`, and no per-kind fast paths at
+dispatch entry. Measured: 2.9 ns per bytecode instruction, 20 ns per
+global fn call, on M5 (§3.8).
 
 ### 5.14 Durable state — **one-way architectural win**
 
@@ -783,13 +836,17 @@ parity on fully-warmed workloads. Neither number is measured.
 opportunistically by HotSpot.
 
 **nexis**: Zig `comptime` is a first-class monomorphization
-tool. `mapAssoc` specialized for keyword keys → skip hash
-dispatch; `(reduce + xs)` specialized for fixnum-only xs →
-unrolled arithmetic without per-element tag checks; `equal`
-specialized by kind-pair → direct function pointer.
+tool. What exists: CHAMP hashes an immediate key (keyword, fixnum,
+char, symbol, boolean, nil) through `Value.hashImmediate` without
+the hash callback (`docs/CHAMP.md` §5.1), and compares two keyword
+keys by intern id without the equality callback. Measured: map get
+14.8 → 13.3 ns and set contains 9.0 → 6.9 ns per op at N=4096 on
+M5 (§3.8); assoc and conj did not move, being allocation-bound.
+Absent: `(reduce + xs)` specialized for fixnum-only `xs`; `equal`
+specialized by kind pair.
 
-**Projected delta**: 1.5–3× on specialized hot paths vs generic
-dispatch. Fully orthogonal to JIT/compiler strategy.
+**Projected delta** for what is absent: 1.5–3× on specialized hot
+paths vs generic dispatch. Fully orthogonal to JIT/compiler strategy.
 
 ---
 
@@ -802,36 +859,63 @@ benchmark-harness update.
    matching each §3 row. Same-machine head-to-head replaces
    external-reference disclaimers and converts "plausibly faster
    than Clojure" into hard numbers.
-2. **Comptime monomorphization of hot collection dispatch**
-   (§5.13, §5.20). Specialize `mapAssoc`/`mapGet`/`setConj` for
-   statically-known kinds (keyword-keyed map is the common
-   case). Projected ~10–20% additional on map/set ops after the
-   pool lift.
-3. **GC benchmarks** (`bench/gc.zig`). Adds steady-state
+2. **GC benchmarks** (`bench/gc.zig`). Adds steady-state
    allocation-pressure measurements so the generational GC lift
    is quantifiable.
-4. **Memory footprint benchmark**. `/usr/bin/time -l` on macOS +
+3. **Memory footprint benchmark**. `/usr/bin/time -l` on macOS +
    allocation-counting allocator wrapper. Satisfies row #1 of
    the scorecard.
-5. **Cold-cache vector nth variant**. Random-access on a
+4. **Cold-cache vector nth variant**. Random-access on a
    flushed-cache vector; pairs with the sequential number in
    §3.4 to give the full profile.
-6. **HeapHeader slim-down** (§5.1). Pack mark + cached hash;
+5. **HeapHeader slim-down** (§5.1). Pack mark + cached hash;
    investigate 8-byte header for small objects. ~5–10% memory
    win on small-object workloads.
-7. **typed-vector + SIMD benchmark rows** (§5.17). The kernels exist; a `bench-simd` row would measure the projected 2–8× on numeric bulk ops.
-8. **Generational GC** (§5.11). ~5–30× on steady-state
+6. **typed-vector + SIMD benchmark rows** (§5.17). The kernels exist; a `bench-simd` row would measure the projected 2–8× on numeric bulk ops.
+7. **Generational GC** (§5.11). ~5–30× on steady-state
    alloc-heavy workloads where slab retention matters.
-9. **Opcode specialization** (§5.19). Gates §5.13 and the
+8. **Opcode specialization** (§5.19). Gates §5.13 and the
    sustained-compute rows.
-10. **Node-owner in-place-edit transients** (§5.10). The
-    Clojure-class transient win; absent in favor of the Option B
-    wrapper design.
-11. **Inline caches** (§5.13). Depends on #9.
+9. **Node-owner in-place-edit transients** (§5.10). The
+   Clojure-class transient win; absent in favor of the Option B
+   wrapper design.
+10. **Inline caches at call sites** (§5.13). Depends on #8. A Var
+    load itself is already one table read (§3.8).
 
 Re-ordering is fine; the only invariant is **measurement gates
 every optimization** — no commits claim a speedup without a
 before/after number from `bench/`.
+
+**Dead ends, measured** (each reverted; the rows and machine are
+§3.7 and §3.8):
+
+- *Keeping the run loop's frame pointer across instructions* (the
+  fetch re-derives it only after a group that can change `frames`):
+  `vm_loop_10k` 267 → 314 μs in one run and within noise in three
+  more against the committed loop. The loads it saves are cheaper
+  than what the loop-carried pointer costs the register allocator.
+- *A single copy for string values leaving an index key*
+  (`key.unescapeFrom` copies the run before the first NUL whole
+  instead of appending byte by byte): no §3.7 row moved outside its
+  spread. The profile puts the whole decode at about 5 % of a query
+  row, under the run-to-run spread, so the second copy those rows
+  pay (key bytes → arena → VM heap for the result set) is not where
+  their time goes; a borrow of the page bytes would save the same 5 %
+  and bind the relation's lifetime to the read transaction's.
+- *A measured `refs_per_value` for the planner* (`plan.zig`): the
+  store keeps a per-attribute datom count but no distinct-value
+  count, so a measurement would be a sampling scan of VAET at plan
+  time or a new `sys` counter maintained by every ref write. Neither
+  can move a §3.7 row: the join kind is decided per step from the
+  actual input rows (`plan.nestedLoop`), and every corpus query's
+  clause order is already the one a correct estimate would pick
+  (the VAET step follows a unique seek, or the `avet` range is the
+  only seekable pattern). Only a skewed corpus would show a
+  difference; that row does not exist.
+- *Comptime monomorphization of `mapAssoc`/`setConj` for keyword
+  keys* beyond the inline hash: assoc and conj at every N stayed
+  within noise once the hash callback was gone; the remaining cost
+  is path copying and allocation (§3.2).
 
 ---
 
@@ -946,7 +1030,12 @@ iterations**.
   default pool under the per-invocation heap methodology (§3).
 - §3.7 Nextomic numbers come from the corpus benchmarks in
   `test/integration/nextomic_{q,pull}.zig` under
-  `-Doptimize=ReleaseFast` on an Apple M5, single sample, with the
-  testing-allocator caveat on result materialization. They are not
-  harness numbers; scorecard row 21 is `measured` in the §2 sense
-  only once `src/bench.zig` carries the scenarios.
+  `NEXTOMIC_BENCH=1 zig build nextomic-test -Doptimize=ReleaseFast
+  --summary all` on an Apple M5, the best of five invocations of the
+  step. They are not harness numbers; scorecard row 21 is `measured`
+  in the §2 sense only once `src/bench.zig` carries the scenarios.
+- §3.8 numbers come from `zig build bench -Doptimize=ReleaseFast --
+  --filter vm,compiler,collection-lookup-update,collection-construction`
+  on the same Apple M5, five invocations per state of the tree, the
+  best 30-sample median of the five with the spread; the commits
+  named in the table carry the same before/after pairs.

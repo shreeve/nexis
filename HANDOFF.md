@@ -63,11 +63,11 @@ git status                        # clean main
 zig build install                 # bin/nexis and bin/nexis-golden
 ./bin/nexis --help                # usage; lists the namespaces available without a file
 zig build quick                   # the inner loop, ~35-50 s warm
-zig build test --summary all      # the gate: 1459 tests, 157 steps, ~4 min wall
+zig build test --summary all      # the gate: 1460 tests, 157 steps, ~4 min wall
 ```
 
 The gate's last line reads `Build Summary: 157/157 steps succeeded;
-1459/1459 tests passed`, preceded by `golden: ok=10 updated=0
+1460/1460 tests passed`, preceded by `golden: ok=10 updated=0
 failed=0 missing=0`. Two integration binaries end with a benchmark
 whose row-count checks always run; the build runner echoes their
 stderr as `failed command:` lines while both succeed, so read the
@@ -556,10 +556,16 @@ regenerated file with the grammar).
 
 ## 8. Recommended order of work
 
-1. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
-   inline caches, SIMD CHAMP nodes, zero-copy strings from emdb
-   pages, hash-join estimate quality. Measure first with `zig build
-   bench`; `docs/BENCH.md` is the honesty gate.
+1. **Performance** (PLAN §21 Phase 6, `docs/PERF.md` §6): the
+   remaining levers are the GC and memory-footprint benchmark rows,
+   generational GC, opcode specialization and inline caches at call
+   sites, and node-owner transients. `docs/PERF.md` §3.8 holds the
+   M5 rows for the dispatch loop and CHAMP lookup, and §6 the
+   measured dead ends (frame pointer across instructions, string
+   copies out of index keys, a measured planner `refs_per_value`,
+   keyword-key monomorphization of assoc and conj) so they are not
+   re-tried without a new row. Measure first with `zig build bench`;
+   `docs/BENCH.md` is the honesty gate.
 
 Take them in this order unless a user need reorders them; every item
 starts with its spec section and its failing test.
