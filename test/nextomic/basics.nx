@@ -109,5 +109,27 @@
 (t/check "refs to it are gone" (nil? (:person/friends (d/entity (d/db c) bob))))
 (t/check "its email is free again" (nil? (d/entid (d/db c) [:person/email "ann@example.com"])))
 
+; Transaction functions: [:db.fn/call f arg ...] calls f with db-before
+; and the args; its tx-data takes the form's place. A symbol names a
+; var; the function value itself is never stored.
+(defn older [db e years]
+  [[:db/add e :person/age (+ years (:person/age (d/entity db e)))]])
+(defn older-twice [db e] [[:db.fn/call older e 1] [:db.fn/call older e 1]])
+(println (facts (d/transact! c [[:db.fn/call older bob 5]])))
+(println (facts (d/transact! c '[[:db.fn/call older 4294967298 1]])))
+(t/check "nested calls see the same db-before, so equal claims are one datom"
+       (= 37 (:person/age (d/entity (:db-after (d/transact! c [[:db.fn/call older-twice bob]])) bob))))
+(t/check "a nil result is no tx-data" (empty? (facts (d/transact! c [[:db.fn/call (fn [db] nil)]]))))
+(t/check "a call inside with is speculative"
+       (= [38 37] [(d/with c [[:db.fn/call older bob 1]] (fn [db r] (:person/age (d/entity db bob))))
+                   (:person/age (d/entity (d/db c) bob))]))
+
+; :db.fn/cas asserts new when the current value is old; nil old means absent.
+(println (facts (d/transact! c [[:db.fn/cas bob :person/age 37 40]])))
+(println (t/caught (d/transact! c [[:db.fn/cas bob :person/age 37 41]])))
+(println (t/caught (d/transact! c [[:db.fn/cas bob :person/height nil 1.8] [:db.fn/cas bob :person/height nil 1.9]])))
+(t/check "cas against an absent attribute" (= 1.8 (:person/height (d/entity (:db-after (d/transact! c [[:db.fn/cas bob :person/height nil 1.8]])) bob))))
+(println (t/caught (d/transact! c [[:db.fn/cas bob :person/height nil 1.9]])))
+
 (d/release c)
 :basics-done

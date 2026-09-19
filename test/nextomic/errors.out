@@ -7,9 +7,17 @@
 :nextomic/no-entity
 :nextomic/no-entity
 {:error :nextomic/tx-data, :message :db/add is [:db/add e a v]}
-{:error :nextomic/tx-data, :message unknown op; one of :db/add, :db/retract, :db/retractEntity}
+{:error :nextomic/tx-data, :message unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas}
 {:error :nextomic/tx-data, :message tx-data is a vector or a list of forms}
 {:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :user/age}
+{:error :nextomic/cas, :attr :user/age, :expected 2, :actual 1}
+{:error :nextomic/tx-data, :message :db.fn/cas is [:db.fn/cas e a old new]}
+:inside
+:nextomic/nested
+{:error :nextomic/tx-data, :message tx-data is a vector or a list of forms}
+{:error :nextomic/tx-data, :message :db.fn/call takes a function or a symbol naming one}
+{:error :nextomic/tx-fn, :message unknown function: no-such-fn}
+{:error :nextomic/tx-fn, :message transaction functions nest past the depth limit}
 :db/open-failed
 ok a failed transaction leaves the basis alone
 ok the store still works after every failure

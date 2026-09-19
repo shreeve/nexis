@@ -37,4 +37,14 @@ ok retracted entity is gone
 ok its component is gone
 ok refs to it are gone
 ok its email is free again
+[[4294967298 :person/age 30 12 false] [4294967298 :person/age 35 12 true]]
+[[4294967298 :person/age 35 13 false] [4294967298 :person/age 36 13 true]]
+ok nested calls see the same db-before, so equal claims are one datom
+ok a nil result is no tx-data
+ok a call inside with is speculative
+[[4294967298 :person/age 37 16 false] [4294967298 :person/age 40 16 true]]
+{:error :nextomic/cas, :attr :person/age, :expected 37, :actual 40}
+{:error :nextomic/conflict, :e 4294967298, :a :person/height}
+ok cas against an absent attribute
+{:error :nextomic/cas, :attr :person/height, :expected nil, :actual 1.8}
 :basics-done

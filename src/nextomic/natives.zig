@@ -184,6 +184,8 @@ pub fn errorKeyword(err: anyerror) []const u8 {
         error.Busy => "nextomic/busy",
         error.TxData => "nextomic/tx-data",
         error.Nested => "nextomic/nested",
+        error.TxFn => "nextomic/tx-fn",
+        error.Cas => "nextomic/cas",
         error.PullSyntax => "nextomic/pull-syntax",
         error.HistoryView => "nextomic/history-view",
         error.Format, error.UnknownIdent => "db/corrupted",
@@ -198,9 +200,12 @@ pub const Detail = struct {
     attr: ?Value = null,
     value: ?Value = null,
     e: ?u64 = null,
+    /// `:expected` and `:actual` of a failed `:db.fn/cas`; nil is a
+    /// value here, meaning the attribute has none.
+    cas: ?struct { expected: Value, actual: Value } = null,
 
     fn empty(self: Detail) bool {
-        return self.message == null and self.clause == null and self.attr == null and self.value == null and self.e == null;
+        return self.message == null and self.clause == null and self.attr == null and self.value == null and self.e == null and self.cas == null;
     }
 };
 
@@ -248,6 +253,10 @@ fn payloadMap(vm: *VM, name: []const u8, detail: Detail, attr_key: []const u8) !
     }
     if (detail.attr) |a| m = try champ.mapAssoc(heap, m, try it.internKeywordValue(attr_key), a, &dispatch.hashValue, &dispatch.equal);
     if (detail.value) |v| m = try champ.mapAssoc(heap, m, try it.internKeywordValue("value"), v, &dispatch.hashValue, &dispatch.equal);
+    if (detail.cas) |c| {
+        m = try champ.mapAssoc(heap, m, try it.internKeywordValue("expected"), c.expected, &dispatch.hashValue, &dispatch.equal);
+        m = try champ.mapAssoc(heap, m, try it.internKeywordValue("actual"), c.actual, &dispatch.hashValue, &dispatch.equal);
+    }
     return m;
 }
 
@@ -256,10 +265,15 @@ fn payloadMap(vm: *VM, name: []const u8, detail: Detail, attr_key: []const u8) !
 /// by the failed transaction) is left out.
 fn detailOf(vm: *VM, conn: *Conn, fault: *const Fault) Detail {
     var d: Detail = .{ .message = fault.message, .attr = fault.attr, .e = fault.e };
-    if (fault.value) |v| {
+    if (fault.value != null or fault.cas != null) {
         if (conn.store.beginRead()) |txn| {
             defer txn.abort();
-            d.value = conn.valToValue(txn, vm.ensureHeap(), v) catch null;
+            const heap = vm.ensureHeap();
+            if (fault.value) |v| d.value = conn.valToValue(txn, heap, v) catch null;
+            if (fault.cas) |c| d.cas = .{
+                .expected = if (c.expected) |v| conn.valToValue(txn, heap, v) catch value.nilValue() else value.nilValue(),
+                .actual = if (c.actual) |v| conn.valToValue(txn, heap, v) catch value.nilValue() else value.nilValue(),
+            };
         } else |_| {}
     }
     return d;
@@ -476,10 +490,41 @@ const Builder = struct {
 
 const fnTransact = wrap(transactNative);
 
+/// Runs `:db.fn/call` forms (NEXTOMIC.md §3 "Transaction functions"):
+/// a symbol resolves as a query function does (`query/natives.zig`
+/// `Hook.resolve`), and the function is called through `vm.callValue`
+/// with the boxed `db-before` ahead of the form's arguments. Whatever it
+/// throws propagates through the transaction, which aborts.
+const TxHook = struct {
+    vm: *VM,
+
+    fn hook(self: *TxHook) transact_mod.CallHook {
+        return .{ .ctx = @ptrCast(self), .call = &call };
+    }
+
+    fn call(ctx: *anyopaque, f: Value, db_before: DbValue, args: []const Value) anyerror!Value {
+        const self: *TxHook = @ptrCast(@alignCast(ctx));
+        const vm = self.vm;
+        var resolver = query_natives.Hook{ .vm = vm };
+        const callee = if (f.kind() == .symbol) (try resolver.lookup(f.asSymbolId())) orelse {
+            const name = vm.ensureInterner().symbolName(f.asSymbolId());
+            const message = try std.fmt.allocPrint(vm.allocator, "unknown function: {s}", .{name});
+            defer vm.allocator.free(message);
+            return throwSyntax(vm, "nextomic/tx-fn", message, null);
+        } else f;
+        const all = try vm.allocator.alloc(Value, args.len + 1);
+        defer vm.allocator.free(all);
+        all[0] = try boxDb(vm.ensureHeap(), db_before);
+        @memcpy(all[1..], args);
+        return vm.callValue(callee, all);
+    }
+};
+
 fn transactNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     const c = try openConn(args[0]);
     var fault: Fault = .{};
-    var options: transact_mod.Options = .{ .fault = &fault };
+    var tx_hook = TxHook{ .vm = vm };
+    var options: transact_mod.Options = .{ .fault = &fault, .hook = tx_hook.hook() };
     if (args.len == 3) options.sync = try syncOption(vm, args[2]);
     var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
     defer arena_state.deinit();
@@ -541,7 +586,8 @@ fn withNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     // The fault's value lives in the arena: rendered before the arena goes.
     errdefer detail.* = detailOf(vm, c, &fault);
     const arena = arena_state.allocator();
-    const w = try transact_mod.with(c, arena, args[1], .{ .fault = &fault });
+    var tx_hook = TxHook{ .vm = vm };
+    const w = try transact_mod.with(c, arena, args[1], .{ .fault = &fault, .hook = tx_hook.hook() });
     st.views.appendAssumeCapacity(w.view);
     defer w.finish();
 
@@ -891,6 +937,8 @@ test "every nextomic error maps to its §7 keyword; engine errors to the db set"
         .{ .err = error.Busy, .name = "nextomic/busy" },
         .{ .err = error.TxData, .name = "nextomic/tx-data" },
         .{ .err = error.Nested, .name = "nextomic/nested" },
+        .{ .err = error.TxFn, .name = "nextomic/tx-fn" },
+        .{ .err = error.Cas, .name = "nextomic/cas" },
         .{ .err = error.PullSyntax, .name = "nextomic/pull-syntax" },
         .{ .err = error.HistoryView, .name = "nextomic/history-view" },
         .{ .err = error.Format, .name = "db/corrupted" },

@@ -67,6 +67,9 @@ pub const Fault = struct {
     e: ?u64 = null,
     value: ?Val = null,
     message: ?[]const u8 = null,
+    /// A failed `:db.fn/cas`: what it expected and what it found, either
+    /// absent when the attribute had no value.
+    cas: ?struct { expected: ?Val, actual: ?Val } = null,
 };
 
 pub const Error = error{

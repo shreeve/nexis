@@ -225,6 +225,30 @@ so there is no queue; emdb's write lock is the transactor.
 8. Return `{:db-before db :db-after db :tx t :tempids {..} :tx-data
    [[e a v t added] ...]}` with `db-after.basis = t`.
 
+**Transaction functions.** A form `[:db.fn/call f arg ...]` calls `f`
+during normalisation with `db-before` (a db-value at the connection's
+basis, the state every function in the transaction sees) followed by
+the args, and the tx-data it returns takes the form's place: it is
+normalised like any other tx-data, so it may hold map forms, tempids
+and further calls, to a depth of 16 (`:nextomic/tx-fn` past it). `f` is
+a function value, or a symbol naming a var resolved as a query
+function is (§5); anything else is `:nextomic/tx-data`, and an unbound
+symbol `:nextomic/tx-fn` naming it. A nil result is no tx-data. The
+function value is called and never stored: the trees and the txlog
+hold only the datoms it returned. Its reads of `db-before`, or of
+`(d/db conn)`, open ordinary read transactions beside the held write;
+a `transact!` or `with` inside it, on this connection or on another to
+the same file, is `:nextomic/nested`, since the engine has one writer.
+A throw inside it aborts the transaction and reaches the caller's
+`try`. The built-in `[:db.fn/cas e a old new]` asserts `new` on the
+cardinality-one attribute `a` when the value the transaction sees
+(the committed value, less what an earlier form of the same
+transaction retracted) is `old`, nil meaning absent; otherwise it is
+`:nextomic/cas` with `:attr`, `:expected` and `:actual`. A card-many
+attribute is `:nextomic/tx-data`. The assertion then follows the
+card-one rule of step 4, so two cas forms on one `(e a)` in one
+transaction conflict as two values would.
+
 **Sync mode.** `:full` (default) syncs data and meta; `:no-meta`
 batches the meta flush; `:none` is for bulk loads followed by
 `(d/sync conn)`. A fully durable commit is two device flushes.
@@ -425,7 +449,7 @@ sub-plans with the same output variables.
 | `(d/release conn)` | close, idempotent; `:nextomic/busy` while a query, pull, `transact!` or `with` on the connection is in flight (a released connection keeps its struct, so its db-values raise `:nextomic/closed`) |
 | `(d/db conn)` | db-value at the current basis |
 | `(d/basis-t db)` | the basis |
-| `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report |
+| `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report. tx-data forms: `[:db/add e a v]`, `[:db/retract e a v?]`, `[:db/retractEntity e]`, `[:db.fn/call f arg ...]`, `[:db.fn/cas e a old new]` and map forms |
 | `(d/entity db e)` | eager map `{:db/id e :attr v ...}`, card-many as sets, refs as eids; nil when the entity has no datoms in this view; `:nextomic/history-view` on a history db |
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
 | `(d/datoms db :eavt e a v tx added)` (index, its components in index order, then `tx` as a t or a transaction entity id and `added` as a boolean; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
@@ -450,8 +474,7 @@ Schema install is `transact!` of attribute entities: `{:db/ident
 :user/email :db/valueType :db.type/string :db/cardinality
 :db.cardinality/one :db/unique :db.unique/identity :db/index true}`.
 
-Later: transaction functions, `:db.fn/cas`, excision, lazy entities,
-full-text, a datom heap kind.
+Later: excision, lazy entities, full-text, a datom heap kind.
 
 ---
 
@@ -465,8 +488,11 @@ All errors are keywords in the `nextomic` namespace and are catchable:
 the connection is in flight), `:nextomic/tx-data` for malformed
 tx-data, a lookup ref on a non-unique attribute, a nested map nothing
 could reach, or a unique card-many attribute, `:nextomic/history-view`
-(`entity` or `pull` on a history db) and `:nextomic/nested`
-(`transact!` or `with` while a `with` holds the write transaction).
+(`entity` or `pull` on a history db), `:nextomic/nested`
+(`transact!` or `with` while a `with` holds the write transaction, or
+inside a transaction function), `:nextomic/tx-fn` (a transaction
+function that cannot run) and `:nextomic/cas` (a `:db.fn/cas` whose
+expectation failed).
 
 An error that can say more travels as a map, `{:error keyword ...}`,
 whose other keys name what went wrong; one that cannot is the bare
@@ -480,6 +506,8 @@ keyword. The shapes:
 | `:nextomic/conflict` | `:e` and `:a`, the datom the two claims disagree on |
 | `:nextomic/no-entity` | bare |
 | `:nextomic/tx-data` | `:message`; `:attr` when an attribute is at fault |
+| `:nextomic/tx-fn` | `:message`: the unbound symbol, or the depth limit |
+| `:nextomic/cas` | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
 | `:nextomic/query-syntax` | `:message`; `:clause`, the index into `:where`, when the parser or planner was inside a clause (an unbound function name is reported the same way at run time). A scoping refusal names what is wrong: the variable an `or` branch mentions and another does not, the join variable an `or-join` branch leaves unbound, the variable a `not` body has that nothing outside binds, the argument or function-position variable no clause ever binds |
 | `:nextomic/pull-syntax` | `:message`; `:clause`, the index of the spec in the pattern (from `pull`, `pull-many` or a `(pull ?e pattern)` find element) |
 

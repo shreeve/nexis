@@ -126,6 +126,41 @@ pub const Fx = struct {
         return nextomic.transact.transact(self.conn(), self.arena(), tx, .{});
     }
 
+    /// `transact` with the test's transaction functions available to
+    /// `:db.fn/call`, leaving what a failure looked at in `fault`.
+    pub fn transactFn(self: *Fx, src: []const u8, fault: *nextomic.db.Fault) !nextomic.Report {
+        const tx = try self.read(src);
+        return nextomic.transact.transact(self.conn(), self.arena(), tx, .{ .hook = self.txHook(), .fault = fault });
+    }
+
+    pub fn txHook(self: *Fx) nextomic.transact.CallHook {
+        return .{ .ctx = @ptrCast(self), .call = &txHookCall };
+    }
+
+    /// The test's transaction functions, named by symbol:
+    /// `(bump-age e n)` adds `n` to the entity's `:person/age`;
+    /// `(twice e)` calls `bump-age` twice through nested call forms;
+    /// `(nothing)` returns nil; `(forever)` calls itself.
+    pub fn txHookCall(ctx: *anyopaque, f: Value, db_before: DbValue, args: []const Value) anyerror!Value {
+        const self: *Fx = @ptrCast(@alignCast(ctx));
+        if (f.kind() != .symbol) return error.NotCallable;
+        const name = self.interner().symbolName(f.asSymbolId());
+        const a = self.arena();
+        if (std.mem.eql(u8, name, "bump-age")) {
+            const e = args[0].asFixnum();
+            const eid_text = try std.fmt.allocPrint(a, "{d}", .{e});
+            const before = try self.pullSrc(db_before, "[:person/age]", eid_text);
+            const cur = (try self.getName(before, "person/age")) orelse value.fromFixnum(0).?;
+            return self.read(try std.fmt.allocPrint(a, "[[:db/add {d} :person/age {d}]]", .{ e, cur.asFixnum() + args[1].asFixnum() }));
+        }
+        if (std.mem.eql(u8, name, "twice")) {
+            return self.read(try std.fmt.allocPrint(a, "[[:db.fn/call bump-age {d} 1] [:db.fn/call bump-age {d} 1]]", .{ args[0].asFixnum(), args[0].asFixnum() }));
+        }
+        if (std.mem.eql(u8, name, "nothing")) return value.nilValue();
+        if (std.mem.eql(u8, name, "forever")) return self.read("[[:db.fn/call forever]]");
+        return error.UnknownFunction;
+    }
+
     pub fn db(self: *Fx) !DbValue {
         return self.conn().db();
     }

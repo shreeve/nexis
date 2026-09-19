@@ -69,6 +69,25 @@ pub const Error = error{
     /// A speculative `with` holds the connection's write transaction, so
     /// another `transact` or `with` cannot begin: `:nextomic/nested`.
     Nested,
+    /// A transaction function could not run: no hook to call it through,
+    /// or calls nested past `max_call_depth`: `:nextomic/tx-fn`.
+    TxFn,
+    /// A `:db.fn/cas` found a value other than the one it expected:
+    /// `:nextomic/cas`.
+    Cas,
+};
+
+/// How deep `:db.fn/call` results may nest further calls.
+pub const max_call_depth: u32 = 16;
+
+/// Calls a transaction function (NEXTOMIC.md §3 "Transaction
+/// functions"). `f` is the value in the `:db.fn/call` form: a function,
+/// or a symbol the hook resolves through the namespace registry. The
+/// hook boxes `db_before` for the VM, calls `f` with it ahead of
+/// `args`, and returns the tx-data the function produced.
+pub const CallHook = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, f: Value, db_before: DbValue, args: []const Value) anyerror!Value,
 };
 
 /// Everything a transaction can fail with: its own errors, the
@@ -82,6 +101,8 @@ pub const Options = struct {
     now_ms: ?i64 = null,
     /// Filled with what a failing step was looking at.
     fault: ?*Fault = null,
+    /// Runs `:db.fn/call` forms; without it they are `error.TxFn`.
+    hook: ?CallHook = null,
 };
 
 /// A tempid as the caller wrote it.
@@ -282,11 +303,17 @@ const PVal = union(enum) {
     lookup: *const Lookup,
 };
 
+/// `[:db.fn/cas e a old new]`: assert `new` when the current value of
+/// the card-one `(e a)` is `old` (absent when `old` is null). In the
+/// arena: the rare case, kept off the common op's size.
+const CasOp = struct { e: Ent, attr: Attr, old: ?PVal, new: PVal };
+
 const ROp = union(enum) {
     add: struct { e: Ent, attr: Attr, v: PVal },
     retract: struct { e: Ent, attr: Attr, v: PVal },
     retract_attr: struct { e: Ent, attr: Attr },
     retract_entity: Ent,
+    cas: *const CasOp,
 };
 
 const Binding = struct {
@@ -318,7 +345,10 @@ const Ctx = struct {
     schema: *Schema,
     minter: Minter,
     fault: ?*Fault,
+    hook: ?CallHook,
     finished: bool = false,
+    /// Nesting of the `:db.fn/call` whose result is being normalised.
+    call_depth: u32 = 0,
 
     bindings: std.ArrayList(Binding) = .empty,
     str_tempids: std.StringHashMapUnmanaged(u32) = .empty,
@@ -349,7 +379,13 @@ const Ctx = struct {
         if (!conn.is_open) return error.Closed;
         if (conn.speculative != null or conn.overlay != null) return error.Nested;
         const sync_mode = options.sync orelse conn.sync_mode;
-        const txn = try conn.beginWriteTxn(sync_mode);
+        // The engine has one writer: a transaction function that
+        // transacts on its own connection, or on another connection to
+        // the same file, meets the write transaction it runs inside.
+        const txn = conn.beginWriteTxn(sync_mode) catch |err| switch (err) {
+            error.WriterActive => return error.Nested,
+            else => return err,
+        };
         errdefer {
             txn.abort();
             conn.taskDone();
@@ -368,6 +404,7 @@ const Ctx = struct {
             .schema = schema,
             .minter = try Minter.init(&conn.idents, txn, arena),
             .fault = options.fault,
+            .hook = options.hook,
             .next_eid = try conn.store.readNextEid(txn),
         };
     }
@@ -396,6 +433,18 @@ const Ctx = struct {
     fn malformed(self: *Ctx, message: []const u8) error{TxData} {
         if (self.fault) |f| f.* = .{ .message = message };
         return error.TxData;
+    }
+
+    /// `TxFn` with the reason.
+    fn txFn(self: *Ctx, message: []const u8) error{TxFn} {
+        if (self.fault) |f| f.* = .{ .message = message };
+        return error.TxFn;
+    }
+
+    /// `Cas`: `attr` holds `actual` where the form expected `expected`.
+    fn cas(self: *Ctx, attr: Attr, expected: ?Val, actual: ?Val) error{Cas} {
+        if (self.fault) |f| f.* = .{ .attr = self.attrValue(attr.id), .cas = .{ .expected = expected, .actual = actual } };
+        return error.Cas;
     }
 
     /// The attribute as a program names it: its ident, else its id.
@@ -575,7 +624,7 @@ const Ctx = struct {
         return v.kind() == .keyword and std.mem.eql(u8, self.conn.interner.keywordName(v.asKeywordId()), name);
     }
 
-    fn normaliseValue(self: *Ctx, tx_data: Value) !void {
+    fn normaliseValue(self: *Ctx, tx_data: Value) anyerror!void {
         switch (tx_data.kind()) {
             .persistent_vector => {
                 try self.ops.ensureTotalCapacityPrecise(self.arena, vector_mod.count(tx_data));
@@ -591,13 +640,23 @@ const Ctx = struct {
         }
     }
 
-    fn normaliseForm(self: *Ctx, form: Value) !void {
+    fn normaliseForm(self: *Ctx, form: Value) anyerror!void {
         switch (form.kind()) {
             .persistent_vector => {
                 const n = vector_mod.count(form);
                 if (n < 2) return self.malformed("a vector form is [op e ...]");
                 const op = vector_mod.nth(form, 0);
-                if (self.kwIs(op, "db/add")) {
+                if (self.kwIs(op, "db.fn/call")) {
+                    try self.normaliseCall(form);
+                } else if (self.kwIs(op, "db.fn/cas")) {
+                    if (n != 5) return self.malformed(":db.fn/cas is [:db.fn/cas e a old new]");
+                    const attr = try self.attrFromVm(vector_mod.nth(form, 2));
+                    const e = try self.entityFromVm(vector_mod.nth(form, 1));
+                    const old_v = vector_mod.nth(form, 3);
+                    const op_cas = try self.arena.create(CasOp);
+                    op_cas.* = .{ .e = e, .attr = attr, .old = if (old_v.isNil()) null else try self.valueFromVm(attr, old_v), .new = try self.valueFromVm(attr, vector_mod.nth(form, 4)) };
+                    try self.ops.append(self.arena, .{ .cas = op_cas });
+                } else if (self.kwIs(op, "db/add")) {
                     if (n != 4) return self.malformed(":db/add is [:db/add e a v]");
                     const attr = try self.attrFromVm(vector_mod.nth(form, 2));
                     const e = try self.entityFromVm(vector_mod.nth(form, 1));
@@ -614,11 +673,36 @@ const Ctx = struct {
                 } else if (self.kwIs(op, "db/retractEntity")) {
                     if (n != 2) return self.malformed(":db/retractEntity is [:db/retractEntity e]");
                     try self.ops.append(self.arena, .{ .retract_entity = try self.entityFromVm(vector_mod.nth(form, 1)) });
-                } else return self.malformed("unknown op; one of :db/add, :db/retract, :db/retractEntity");
+                } else return self.malformed("unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas");
             },
             .persistent_map => _ = try self.normaliseMap(form),
             else => return self.malformed("a form is a vector or a map"),
         }
+    }
+
+    /// `[:db.fn/call f arg ...]`: call `f` with `db-before` and the
+    /// arguments, then normalise the tx-data it returns in place of the
+    /// form, where further calls may nest to `max_call_depth`. The
+    /// function value is called, never stored: only the datoms it
+    /// returns reach the trees and the txlog. A nil result is no
+    /// tx-data.
+    fn normaliseCall(self: *Ctx, form: Value) anyerror!void {
+        const hook = self.hook orelse return self.txFn("transaction functions run inside transact! and with only");
+        const f = vector_mod.nth(form, 1);
+        switch (f.kind()) {
+            .function, .native_fn, .symbol => {},
+            else => return self.malformed(":db.fn/call takes a function or a symbol naming one"),
+        }
+        if (self.call_depth >= max_call_depth) return self.txFn("transaction functions nest past the depth limit");
+        const n = vector_mod.count(form);
+        const args = try self.arena.alloc(Value, n - 2);
+        for (args, 2..) |*a, i| a.* = vector_mod.nth(form, i);
+        const db_before: DbValue = .{ .conn = self.conn, .basis = self.now };
+        const result = try hook.call(hook.ctx, f, db_before, args);
+        if (result.isNil()) return;
+        self.call_depth += 1;
+        defer self.call_depth -= 1;
+        try self.normaliseValue(result);
     }
 
     /// Expand a map form into adds; returns the entity. A key
@@ -1029,8 +1113,24 @@ const Ctx = struct {
                     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
                     try self.expandRetractEntity(try self.resolveEnt(e), &seen);
                 },
+                .cas => |o| {
+                    const old: ?Val = if (o.old) |v| try self.resolveVal(v) else null;
+                    try self.expandCas(try self.resolveEnt(o.e), o.attr, old, try self.resolveVal(o.new));
+                },
             }
         }
+    }
+
+    /// `:db.fn/cas`: the committed value of the card-one `(e a)`, less
+    /// what this transaction retracted, must be `old` (absent when `old`
+    /// is null); then `new` is asserted as an ordinary add.
+    fn expandCas(self: *Ctx, e: u64, attr: Attr, old: ?Val, new: Val) !void {
+        if (attr.many()) return self.malformed(":db.fn/cas takes a cardinality-one attribute");
+        const current = try self.currentOne(e, attr.id);
+        const actual: ?Val = if (current) |c| c.val else null;
+        const matches = if (old) |o| (if (actual) |a| a.eql(o) else false) else actual == null;
+        if (!matches) return self.cas(attr, old, actual);
+        try self.expandAdd(e, attr, new);
     }
 
     fn checkAttrValue(self: *Ctx, e: u64, attr: Attr, v: Val) !void {
@@ -2819,4 +2919,179 @@ test "a held with keeps the store open until finish; a closed connection refuses
     try testing.expectError(error.Closed, w.db().entity(arena, a));
     try testing.expectError(error.Closed, transactOps(tc.conn, arena, &.{}, .{}));
     try testing.expectError(error.Closed, withOps(tc.conn, arena, &.{}, .{}));
+}
+
+/// `[:db.fn/cas e a old new]` as a VM value; `old` may be nil.
+fn casForm(heap: *@import("heap").Heap, tc: *TestConn, e: Value, attr: []const u8, old: Value, new: Value) !Value {
+    const it = &tc.interner;
+    const form = try vector_mod.fromSlice(heap, &.{ try it.internKeywordValue("db.fn/cas"), e, try it.internKeywordValue(attr), old, new });
+    return vector_mod.fromSlice(heap, &.{form});
+}
+
+test "cas asserts against the committed value and reports what it found" {
+    const tc = try TestConn.init("tx_cas");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    try installSchema(tc, arena);
+    const age = try attrId(tc, "user/age");
+    const name = try attrId(tc, "user/name");
+    const r0 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    const a = r0.tempids[0].eid;
+    const eid = value.fromFixnum(@intCast(a)).?;
+    const nil = value.nilValue();
+    const n = struct {
+        fn n(x: i64) Value {
+            return value.fromFixnum(x).?;
+        }
+    }.n;
+    var fault: Fault = .{};
+
+    // An absent attribute: nil expected succeeds, a value expected fails.
+    const r1 = try transact(tc.conn, arena, try casForm(&heap, tc, eid, "user/age", nil, n(1)), .{});
+    try testing.expectEqual(@as(usize, 2), r1.tx_data.len);
+    try testing.expectEqual(@as(i64, 1), r1.tx_data[0].v.long);
+    try testing.expectError(error.Cas, transact(tc.conn, arena, try casForm(&heap, tc, eid, "user/age", nil, n(2)), .{ .fault = &fault }));
+    try testing.expect(fault.cas.?.expected == null);
+    try testing.expectEqual(@as(i64, 1), fault.cas.?.actual.?.long);
+    try testing.expectEqual(try kw(tc, "user/age"), fault.attr.?.asKeywordId());
+
+    // The right expectation swaps; the wrong one names both values.
+    const r2 = try transact(tc.conn, arena, try casForm(&heap, tc, eid, "user/age", n(1), n(2)), .{});
+    try testing.expectEqual(@as(usize, 3), r2.tx_data.len);
+    try testing.expect(!r2.tx_data[0].added and r2.tx_data[1].added);
+    try testing.expectError(error.Cas, transact(tc.conn, arena, try casForm(&heap, tc, eid, "user/age", n(1), n(3)), .{ .fault = &fault }));
+    try testing.expectEqual(@as(i64, 1), fault.cas.?.expected.?.long);
+    try testing.expectEqual(@as(i64, 2), fault.cas.?.actual.?.long);
+
+    // A retraction earlier in the transaction counts; card-many is refused.
+    const retract = try vector_mod.fromSlice(&heap, &.{ try tc.interner.internKeywordValue("db/retract"), eid, try tc.interner.internKeywordValue("user/age"), n(2) });
+    const both = try vector_mod.fromSlice(&heap, &.{ retract, vector_mod.nth(try casForm(&heap, tc, eid, "user/age", nil, n(9)), 0) });
+    const r3 = try transact(tc.conn, arena, both, .{});
+    try testing.expectEqual(@as(usize, 3), r3.tx_data.len);
+    try testing.expectError(error.TxData, transact(tc.conn, arena, try casForm(&heap, tc, eid, "user/tags", nil, try tc.interner.internKeywordValue("tag/x")), .{}));
+    const ent = try (try tc.conn.db()).entity(arena, a);
+    try testing.expectEqual(age, ent[1].a);
+    try testing.expectEqual(@as(i64, 9), ent[1].vals[0].long);
+}
+
+/// A transaction-function hook for the tests: `f` is a symbol naming
+/// a behaviour, and the hook builds the tx-data the behaviour returns.
+const TestTxHook = struct {
+    tc: *TestConn,
+    heap: *@import("heap").Heap,
+    calls: usize = 0,
+    /// The basis the last call saw.
+    basis: u64 = 0,
+
+    fn hook(self: *TestTxHook) CallHook {
+        return .{ .ctx = @ptrCast(self), .call = &call };
+    }
+
+    fn call(ctx: *anyopaque, f: Value, db_before: DbValue, args: []const Value) anyerror!Value {
+        const self: *TestTxHook = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.basis = db_before.basis;
+        const heap = self.heap;
+        const it = &self.tc.interner;
+        const name = it.symbolName(f.asSymbolId());
+        // Age of `args[0]` becomes `args[1]`.
+        if (std.mem.eql(u8, name, "age!")) {
+            const form = try vector_mod.fromSlice(heap, &.{ try it.internKeywordValue("db/add"), args[0], try it.internKeywordValue("user/age"), args[1] });
+            return vector_mod.fromSlice(heap, &.{form});
+        }
+        // Calls `age!` through a nested call form.
+        if (std.mem.eql(u8, name, "via")) {
+            const form = try vector_mod.fromSlice(heap, &.{ try it.internKeywordValue("db.fn/call"), try it.internSymbolValue("age!"), args[0], args[1] });
+            return vector_mod.fromSlice(heap, &.{form});
+        }
+        // Calls itself forever.
+        if (std.mem.eql(u8, name, "forever")) {
+            const form = try vector_mod.fromSlice(heap, &.{ try it.internKeywordValue("db.fn/call"), f });
+            return vector_mod.fromSlice(heap, &.{form});
+        }
+        // Nothing.
+        if (std.mem.eql(u8, name, "nothing")) return value.nilValue();
+        // Not tx-data.
+        if (std.mem.eql(u8, name, "text")) return string_mod.fromBytes(heap, "nope");
+        return error.UnknownBehaviour;
+    }
+};
+
+test "transaction functions splice their tx-data in place, nest to a bound, and see db-before" {
+    const tc = try TestConn.init("tx_fn");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    try installSchema(tc, arena);
+    const age = try attrId(tc, "user/age");
+    const name = try attrId(tc, "user/name");
+    const r0 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+    }, .{});
+    const a = r0.tempids[0].eid;
+    var th = TestTxHook{ .tc = tc, .heap = &heap };
+    const it = &tc.interner;
+    const call_kw = try it.internKeywordValue("db.fn/call");
+    const eid = value.fromFixnum(@intCast(a)).?;
+    var fault: Fault = .{};
+
+    // Without a hook the form cannot run; nothing is written.
+    const direct = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("age!"), eid, value.fromFixnum(30).? })});
+    try testing.expectError(error.TxFn, transact(tc.conn, arena, direct, .{ .fault = &fault }));
+    try testing.expect(fault.message != null);
+    try testing.expectEqual(r0.t, (try tc.conn.db()).basis);
+
+    // The call's datoms land in place, between the surrounding forms.
+    const add_kw = try it.internKeywordValue("db/add");
+    const name_kw = try it.internKeywordValue("user/name");
+    const before = try vector_mod.fromSlice(&heap, &.{ add_kw, eid, name_kw, try string_mod.fromBytes(&heap, "Anne") });
+    const tx = try vector_mod.fromSlice(&heap, &.{ before, try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("via"), eid, value.fromFixnum(30).? }) });
+    const r1 = try transact(tc.conn, arena, tx, .{ .hook = th.hook() });
+    try testing.expectEqual(@as(usize, 2), th.calls);
+    try testing.expectEqual(r0.t, th.basis);
+    // Anne retract+add, age add, txInstant.
+    try testing.expectEqual(@as(usize, 4), r1.tx_data.len);
+    try testing.expectEqual(name, r1.tx_data[0].a);
+    try testing.expectEqual(age, r1.tx_data[2].a);
+    try testing.expectEqual(@as(i64, 30), r1.tx_data[2].v.long);
+
+    // Unbounded nesting stops at the depth limit with nothing written.
+    const forever = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("forever") })});
+    try testing.expectError(error.TxFn, transact(tc.conn, arena, forever, .{ .hook = th.hook(), .fault = &fault }));
+    try testing.expectEqual(r1.t, (try tc.conn.db()).basis);
+
+    // A nil result is no tx-data; a non-tx-data result is malformed.
+    const nothing = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("nothing") })});
+    const r2 = try transact(tc.conn, arena, nothing, .{ .hook = th.hook() });
+    try testing.expectEqual(@as(usize, 1), r2.tx_data.len);
+    const bad = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("text") })});
+    try testing.expectError(error.TxData, transact(tc.conn, arena, bad, .{ .hook = th.hook() }));
+    // Only a function or a symbol may sit in function position.
+    const not_fn = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try string_mod.fromBytes(&heap, "f") })});
+    try testing.expectError(error.TxData, transact(tc.conn, arena, not_fn, .{ .hook = th.hook() }));
+
+    // A second write on the connection inside a call is nested.
+    const Inner = struct {
+        fn call(ctx: *anyopaque, _: Value, db_before: DbValue, _: []const Value) anyerror!Value {
+            const c: *TestConn = @ptrCast(@alignCast(ctx));
+            var inner_arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer inner_arena.deinit();
+            try testing.expectError(error.Nested, transactOps(c.conn, inner_arena.allocator(), &.{}, .{}));
+            try testing.expectError(error.Nested, withOps(c.conn, inner_arena.allocator(), &.{}, .{}));
+            // Reads of db-before work while the write is held.
+            try testing.expect((try db_before.datoms(inner_arena.allocator(), .eavt, .{ .e = boot.ident })).len > 0);
+            return value.nilValue();
+        }
+    };
+    const inner_hook: CallHook = .{ .ctx = @ptrCast(tc), .call = &Inner.call };
+    _ = try transact(tc.conn, arena, nothing, .{ .hook = inner_hook });
 }
