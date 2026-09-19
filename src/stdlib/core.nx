@@ -157,13 +157,12 @@
          (do ~@body)
          (finally (pop-thread-bindings)))))
 
-; (set! *a* v) rebinds the innermost binding of *a* to v and
-; returns v: :not-dynamic outside a dynamic Var, :no-thread-binding
-; outside any binding of it. The root binding never changes here;
-; def is the only root write.
-
-(defmacro set! [target v]
-  `(var-set (var ~target) ~v))
+; (set! *a* v) is a special form of the expander (docs/MACROEXPAND.md
+; §2b): it rebinds the innermost binding of *a* to v through var-set
+; and returns v, :not-dynamic outside a dynamic Var, :no-thread-binding
+; outside any binding of it, and refuses a lexical name at compile
+; time. The root binding never changes here; def is the only root
+; write.
 
 ; ============================================================
 ; Function combinators and collection helpers

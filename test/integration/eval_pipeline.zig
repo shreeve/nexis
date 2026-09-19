@@ -718,6 +718,11 @@ test "try: catch clauses match by keyword tag, in order, or rethrow" {
     // A caught binding may be captured by an inner fn.
     try expectOutput("(try (throw 5) (catch any e ((fn [] (inc e)))))", "6");
     try expectProgramError("(try 1 (catch 'sym e 1))", compile.CompileError.MacroExpansionFailure);
+    // set! on a lexical name has no binding to rebind: refused at
+    // compile time, not as a run-time :not-dynamic.
+    try expectProgramError("(let [x 1] (set! x 2))", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("((fn [x] (set! x 2)) 1)", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(loop [i 0] (set! i 2))", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(try 1 (catch any e 1) 2)", compile.CompileError.MacroExpansionFailure);
 }
 

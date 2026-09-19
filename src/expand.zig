@@ -276,7 +276,7 @@ pub fn expandOnce(ctx: *ExpandContext, form: *const Form) ExpandError!?*Form {
 /// primitives: never macros, never shadowable.
 fn isSpecialFormName(name: []const u8) bool {
     const names = [_][]const u8{
-        "quote", "if", "do", "let*", "loop*", "recur", "fn*", "letfn*", "def", "var", "try", "throw", "defmacro", "ns", "require",
+        "quote", "if", "do", "let*", "loop*", "recur", "fn*", "letfn*", "def", "var", "set!", "try", "throw", "defmacro", "ns", "require",
     };
     for (names) |n| if (std.mem.eql(u8, name, n)) return true;
     return std.mem.startsWith(u8, name, "#%");
@@ -441,6 +441,7 @@ fn expandList(
     // macros table; dispatching here would bypass the macro
     // path.
     if (std.mem.eql(u8, name, "var")) return mutCast(list_form); // (var X) — X is just a name, don't expand
+    if (std.mem.eql(u8, name, "set!")) return try expandSetBang(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "try")) return try expandTry(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "throw")) return try expandOrdinaryCall(ctx, env, list_form, items, depth);
     if (std.mem.eql(u8, name, "defmacro")) return try expandDefmacro(ctx, env, list_form, items, depth);
@@ -1422,6 +1423,35 @@ fn unwrapQuote(form: *const Form) *const Form {
         .list => |items| if (items.len == 2 and items[0].datum == .symbol and items[0].datum.symbol.ns == null and std.mem.eql(u8, items[0].datum.symbol.name, "quote")) items[1] else form,
         else => form,
     };
+}
+
+/// `(set! target v)` rebinds the innermost thread binding of the
+/// dynamic Var `target` names: it expands to
+/// `(nexis.core/var-set (var target) v)`. A target that is a
+/// lexical name is refused here, at compile time, because a local
+/// has no binding to rebind (VM.md §6.5).
+fn expandSetBang(
+    ctx: *ExpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) ExpandError!*Form {
+    if (items.len != 3) return ExpandError.MalformedMacroCall;
+    const target = items[1];
+    if (target.datum != .symbol) return ExpandError.MalformedMacroCall;
+    if (target.datum.symbol.ns == null) {
+        if (env) |e| if (e.contains(target.datum.symbol.name)) return ExpandError.MalformedMacroCall;
+    }
+    const origin = list_form.origin;
+    const var_items = try ctx.allocator.alloc(*Form, 2);
+    var_items[0] = try makeSymbol(ctx, "var", origin);
+    var_items[1] = mutCast(target);
+    const out_items = try ctx.allocator.alloc(*Form, 3);
+    out_items[0] = try makeQualifiedSymbol(ctx, "nexis.core", "var-set", origin);
+    out_items[1] = try makeList(ctx, var_items, origin);
+    out_items[2] = try expandFormDepth(ctx, env, items[2], depth + 1);
+    return try makeList(ctx, out_items, origin);
 }
 
 /// Expand `(defmacro name [params] body)`.
@@ -4305,6 +4335,52 @@ fn expandSourceForTest(
         .host_macros = host_macros,
     };
     return try expandForm(&ctx, null, form);
+}
+
+test "unwrapQuote: the reader's quote datum and a written-out (quote x) both unwrap" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ "'x", "(quote x)" }) |src| {
+        var p = try reader_mod.parser.parseForm(arena, src);
+        defer p.parser.deinit();
+        var rdr = reader_mod.Reader.init(arena, src);
+        defer rdr.deinit();
+        const form = try rdr.readOneForm(p.sexp);
+        const inner = unwrapQuote(form);
+        try testing.expect(inner.datum == .symbol);
+        try testing.expectEqualStrings("x", inner.datum.symbol.name);
+    }
+    for ([_][]const u8{ "x", "(quote x y)", "(other x)" }) |src| {
+        var p = try reader_mod.parser.parseForm(arena, src);
+        defer p.parser.deinit();
+        var rdr = reader_mod.Reader.init(arena, src);
+        defer rdr.deinit();
+        const form = try rdr.readOneForm(p.sexp);
+        try testing.expect(unwrapQuote(form) == form);
+    }
+}
+
+test "set!: expands to var-set on the Var; a lexical target is refused at expansion" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty: HostMacroTable = .{};
+    const out = try expandSourceForTest(arena, "(set! *x* (+ 1 2))", &empty);
+    try testing.expect(out.datum == .list);
+    const items = out.datum.list;
+    try testing.expectEqual(@as(usize, 3), items.len);
+    try testing.expectEqualStrings("nexis.core", items[0].datum.symbol.ns.?);
+    try testing.expectEqualStrings("var-set", items[0].datum.symbol.name);
+    const var_form = items[1].datum.list;
+    try testing.expectEqual(@as(usize, 2), var_form.len);
+    try testing.expectEqualStrings("var", var_form[0].datum.symbol.name);
+    try testing.expectEqualStrings("*x*", var_form[1].datum.symbol.name);
+    try testing.expect(items[2].datum == .list);
+    try testing.expectError(ExpandError.MalformedMacroCall, expandSourceForTest(arena, "(let* [x 1] (set! x 2))", &empty));
+    try testing.expectError(ExpandError.MalformedMacroCall, expandSourceForTest(arena, "(fn* [x] (set! x 2))", &empty));
+    try testing.expectError(ExpandError.MalformedMacroCall, expandSourceForTest(arena, "(set! 1 2)", &empty));
+    try testing.expectError(ExpandError.MalformedMacroCall, expandSourceForTest(arena, "(set! *x*)", &empty));
 }
 
 test "macroexpand: no-op walks return input unchanged (empty table)" {

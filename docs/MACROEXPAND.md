@@ -274,6 +274,7 @@ that should be expanded.
 | `var` | Do NOT expand name. |
 | `recur` | Expand each arg (no env change). |
 | `try` | Expand the body forms; `catch MATCHER BINDING handler...` passes the matcher and binding symbols through and expands the handler with the binding in env; expand the `finally` body. |
+| `set!` | `(set! target v)` → `(nexis.core/var-set (var target) v)` with `v` expanded; `target` must be a symbol, and one bound in the lexical env is refused (`MalformedMacroCall`): a local has no thread binding to rebind. The Var's own checks (`:not-dynamic`, `:no-thread-binding`) happen at run time. |
 | `throw`, `do`, `if`, ordinary call, `#%*` constructors | Expand all sub-forms with current env. |
 | `defmacro` | §1.2 — evaluated at expansion time; replaced by `(var name)`. |
 | `ns` | `(ns NAME)` switches `ctx.registry.current` to the named namespace at expansion time, creating it (parent `nexis.core`) if unregistered; replaced by `nil`. |
@@ -555,7 +556,7 @@ build time, define further macros in nexis itself through
 `defmacro`: `when-let`, `if-let`, `if-not`, `dotimes`, `doseq`,
 `while`, `letfn`, `declare`, `cond->`, `cond->>`, `some->`,
 `some->>`, `as->`, `with-tx`, `with-read-tx`, `with-snapshot`,
-`binding`, `set!`, `with-conn`. `doseq` takes the same modifiers as
+`binding`, `with-conn`. `doseq` takes the same modifiers as
 `for` and runs the body for effect, yielding nil. `binding` expands to
 `(do (push-thread-bindings (hash-map (var a) va ...)) (try (do body...)
 (finally (pop-thread-bindings))))` and `set!` to `(var-set (var a) v)`
