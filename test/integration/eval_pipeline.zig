@@ -864,9 +864,9 @@ test "integration: (ns NAME) switches current namespace" {
 test "integration: defn in a namespace + qualified call" {
     try expectOutputProgram(
         \\(ns my.app)
-        \\(defn double [n] (* n 2))
+        \\(defn twice [n] (* n 2))
         \\(ns user)
-        \\(my.app/double 21)
+        \\(my.app/twice 21)
     , "42");
 }
 

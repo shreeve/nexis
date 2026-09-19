@@ -220,6 +220,8 @@ const core_fns = [_]CoreEntry{
     .{ .name = "not=", .descriptor = &native_not_eq },
     .{ .name = "inc", .descriptor = &native_inc },
     .{ .name = "dec", .descriptor = &native_dec },
+    .{ .name = "long", .descriptor = &native_long },
+    .{ .name = "double", .descriptor = &native_double },
     .{ .name = "max", .descriptor = &native_max },
     .{ .name = "min", .descriptor = &native_min },
     .{ .name = "abs", .descriptor = &native_abs },
@@ -440,6 +442,8 @@ const native_num_eq = NativeFn{ .name = "==", .min_arity = 0, .max_arity = null,
 const native_eq = NativeFn{ .name = "=", .min_arity = 0, .max_arity = null, .call = &fnEq };
 const native_not_eq = NativeFn{ .name = "not=", .min_arity = 1, .max_arity = null, .call = &fnNotEq };
 const native_inc = NativeFn{ .name = "inc", .min_arity = 1, .max_arity = 1, .call = &fnInc };
+const native_long = NativeFn{ .name = "long", .min_arity = 1, .max_arity = 1, .call = &fnLong };
+const native_double = NativeFn{ .name = "double", .min_arity = 1, .max_arity = 1, .call = &fnDouble };
 const native_dec = NativeFn{ .name = "dec", .min_arity = 1, .max_arity = 1, .call = &fnDec };
 const native_max = NativeFn{ .name = "max", .min_arity = 1, .max_arity = null, .call = &fnMax };
 const native_min = NativeFn{ .name = "min", .min_arity = 1, .max_arity = null, .call = &fnMin };
@@ -958,6 +962,16 @@ fn fnInc(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnDec(vm: *VM, args: []const Value) VmError!Value {
     return vm_mod.numSub(vm.ensureHeap(), args[0], value_mod.fromFixnum(1).?);
+}
+
+/// `(long x)`: a number as an integer, a float by its integer part.
+fn fnLong(vm: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numLong(vm.ensureHeap(), args[0]);
+}
+
+/// `(double x)`: a number as an f64.
+fn fnDouble(_: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numDouble(args[0]);
 }
 
 fn numMax(_: *heap_mod.Heap, a: Value, b: Value) VmError!Value {

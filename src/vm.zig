@@ -3755,6 +3755,22 @@ pub fn numEven(a: value_mod.Value) VmError!bool {
     return bignum_mod.isEven(a);
 }
 
+/// `long`: a number as an integer. An integer is itself; a finite
+/// float is its integer part (toward zero), a bignum when that is
+/// wide; NaN and the infinities have no integer and raise
+/// `InvalidArgument`.
+pub fn numLong(heap: *heap_mod.Heap, a: value_mod.Value) VmError!value_mod.Value {
+    if (isInteger(a)) return a;
+    if (!a.isFloat()) return VmError.KindMismatch;
+    const converted = bignum_mod.fromF64(heap, a.asFloat()) catch return VmError.OutOfMemory;
+    return converted orelse VmError.InvalidArgument;
+}
+
+/// `double`: a number as an f64, a bignum through its nearest double.
+pub fn numDouble(a: value_mod.Value) VmError!value_mod.Value {
+    return value_mod.fromFloat(try toFloat(a));
+}
+
 /// `max`/`min` over two operands: the winning operand itself, of
 /// its own kind (`(max 2 1.0)` is 2); on a tie the second, as
 /// Clojure's `(if (> x y) x y)`; NaN wins.
@@ -4940,6 +4956,18 @@ test "numeric tower: comparison across kinds and NaN" {
     try testing.expect(dispatch_mod.equal(try numExtremum(false, under, over), under));
     const over1 = try numAdd(h, over, fx(1));
     try testing.expect(dispatch_mod.equal(try numExtremum(true, over, over1), over1));
+    // Conversions.
+    try testing.expect(dispatch_mod.equal(try numLong(h, over), over));
+    try testing.expectEqual(@as(i64, 3), (try numLong(h, fl(3.99))).asFixnum());
+    try testing.expectEqual(@as(i64, -3), (try numLong(h, fl(-3.99))).asFixnum());
+    try testing.expect(dispatch_mod.equal(try numLong(h, fl(140737488355328.0)), over));
+    try testing.expectError(VmError.InvalidArgument, numLong(h, nan));
+    try testing.expectError(VmError.InvalidArgument, numLong(h, fl(std.math.inf(f64))));
+    try testing.expectError(VmError.KindMismatch, numLong(h, value_mod.nilValue()));
+    try testing.expectEqual(@as(f64, 140737488355328.0), (try numDouble(over)).asFloat());
+    try testing.expectEqual(@as(f64, 3.0), (try numDouble(fx(3))).asFloat());
+    try testing.expectEqual(@as(f64, 1.5), (try numDouble(fl(1.5))).asFloat());
+    try testing.expectError(VmError.KindMismatch, numDouble(value_mod.fromBool(true)));
     // Parity.
     try testing.expect(try numEven(over));
     try testing.expect(!try numEven(over1));

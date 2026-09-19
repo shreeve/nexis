@@ -125,6 +125,11 @@ Cross-type operators (PLAN §8.3):
   raise `:divide-by-zero`. Float `/` by zero is IEEE: `Infinity`,
   `-Infinity` or `NaN`.
 - `even?` / `odd?` accept integers only (`:kind-mismatch` on a float).
+- `(long x)` is `x` for an integer and the integer part of a finite
+  float (toward zero, a bignum when wide: `(long 1e30)` →
+  `1000000000000000019884624838656`); NaN and the infinities raise
+  `:invalid-argument`. `(double x)` is the nearest f64 of any number.
+  The integer tower has one type, so `long` never rejects a size.
 
 #### 2.3 Characters
 

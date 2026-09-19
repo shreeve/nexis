@@ -219,6 +219,20 @@ test "predicates over bignums" {
     try expectOutput("(let [b (+ " ++ fm ++ " 1)] [(NaN? b) (infinite? b)])", "[false false]");
 }
 
+test "conversions: long truncates a float toward zero at any size, double widens" {
+    try expectOutput("[(long 5) (long 3.99) (long -3.99) (long 0.5) (long -0.5)]", "[5 3 -3 0 0]");
+    try expectOutput("(long 18446744073709551616)", "18446744073709551616");
+    try expectOutput("(long 1e30)", "1000000000000000019884624838656");
+    try expectOutput("(long -1.8446744073709552E19)", "-18446744073709551616");
+    try expectOutput("[(long 140737488355328.0) (integer? (long 140737488355328.0)) (= (long 140737488355327.0) 140737488355327)]", "[140737488355328 true true]");
+    try expectOutput("[(double 3) (double 1.5) (double 18446744073709551616) (double -140737488355328)]", "[3.0 1.5 1.8446744073709552E19 -1.40737488355328E14]");
+    try expectOutput("(float? (double 18446744073709551616))", "true");
+    try expectOutput("(try (long (/ 0.0 0.0)) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (long (/ 1.0 0.0)) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (long \"7\") (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (double nil) (catch any e e))", ":kind-mismatch");
+}
+
 test "errors: division by zero and kind mismatch are the catchable keywords" {
     try expectOutput("(try (/ (+ " ++ fm ++ " 1) 0) (catch any e e))", ":divide-by-zero");
     try expectOutput("(try (quot (+ " ++ fm ++ " 1) 0) (catch any e e))", ":divide-by-zero");
