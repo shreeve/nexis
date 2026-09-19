@@ -19,7 +19,6 @@
 //!     always read with `getFromTree` on its exact key.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const emdb = @import("emdb");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
@@ -662,7 +661,7 @@ pub const Store = struct {
         var fmt: [2]u8 = undefined;
         std.mem.writeInt(u16, &fmt, format_version, .big);
         try self.sysPut(txn, "format", &fmt);
-        fillRandom(&self.uuid);
+        std.Io.Threaded.global_single_threaded.io().random(&self.uuid);
         try self.sysPut(txn, "uuid", &self.uuid);
 
         for (boot.idents) |id| try self.putIdent(txn, id.name, id.id);
@@ -722,7 +721,7 @@ pub const Store = struct {
 };
 
 // =============================================================================
-// Clock and entropy
+// Clock
 // =============================================================================
 
 /// Wall-clock milliseconds since the Unix epoch.
@@ -730,46 +729,6 @@ pub fn nowMillis() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.REALTIME, &ts);
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
-}
-
-fn fillRandom(buf: []u8) void {
-    switch (builtin.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => {
-            std.c.arc4random_buf(buf.ptr, buf.len);
-        },
-        .linux => {
-            var off: usize = 0;
-            while (off < buf.len) {
-                const rc = std.os.linux.getrandom(buf.ptr + off, buf.len - off, 0);
-                if (std.os.linux.E.init(rc) != .SUCCESS) break;
-                off += rc;
-            }
-            if (off < buf.len) mixClockEntropy(buf);
-        },
-        else => mixClockEntropy(buf),
-    }
-}
-
-fn mixClockEntropy(buf: []u8) void {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    var mono: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &mono);
-    var seed: [32]u8 = undefined;
-    std.mem.writeInt(i64, seed[0..8], @intCast(ts.sec), .little);
-    std.mem.writeInt(i64, seed[8..16], @intCast(ts.nsec), .little);
-    std.mem.writeInt(i64, seed[16..24], @intCast(mono.nsec), .little);
-    std.mem.writeInt(u64, seed[24..32], @intFromPtr(buf.ptr), .little);
-    var i: usize = 0;
-    var counter: u64 = 0;
-    while (i < buf.len) : (counter += 1) {
-        const h = std.hash.XxHash3.hash(counter, &seed);
-        var hb: [8]u8 = undefined;
-        std.mem.writeInt(u64, &hb, h, .little);
-        const n = @min(8, buf.len - i);
-        @memcpy(buf[i .. i + n], hb[0..n]);
-        i += n;
-    }
 }
 
 // =============================================================================
