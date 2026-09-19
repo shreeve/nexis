@@ -397,9 +397,12 @@ For every value kind, a **pr-style** textual representation exists such that:
 
 #### 6.3 Numeric print rules
 
-- Integers print in decimal, no leading zeros, with `-` for negatives.
-  Hex/binary source literals do **not** round-trip: `(pr-str 0x2A)` is
-  `"42"`, and reading `"42"` back yields the same integer value.
+- Integers print in decimal, no leading zeros, with `-` for negatives,
+  at any size and with no suffix: `(str (* 4294967296 4294967296))` is
+  `"18446744073709551616"`, and reading that text back yields the same
+  bignum. Hex/binary source literals do **not** round-trip: `(pr-str
+  0x2A)` is `"42"`, and reading `"42"` back yields the same integer
+  value.
 - Floats print the way Clojure prints doubles: the shortest decimal that
   reads back to the same f64, always with a fraction (`1.0`, `2.5`,
   `100.0`), switching to exponent form with a one-digit integer part at

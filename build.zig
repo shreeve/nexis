@@ -295,6 +295,8 @@ pub fn build(b: *std.Build) void {
     // Form datums by allocating via `string.fromBytes` against
     // the macro-arg heap.
     expand_mod.addImport("string", string_mod);
+    // Form↔Value conversion of integers beyond the fixnum range.
+    expand_mod.addImport("bignum", bignum_mod);
     // dispatch_mod is declared LATER (it depends on db); the
     // addImport for it is attached after that block. See below.
 
@@ -358,6 +360,8 @@ pub fn build(b: *std.Build) void {
     // through `namespace.registry.heap`.
     compile_mod.addImport("heap", heap_mod);
     compile_mod.addImport("string", string_mod);
+    // integer literals beyond the fixnum range lower to bignums.
+    compile_mod.addImport("bignum", bignum_mod);
 
     // namespace loader (require + file loading).
     const loader_mod = b.createModule(.{
@@ -412,6 +416,7 @@ pub fn build(b: *std.Build) void {
     format_mod.addImport("vm", vm_mod);
     format_mod.addImport("record", record_mod);
     format_mod.addImport("protocol", protocol_mod);
+    format_mod.addImport("bignum", bignum_mod);
 
     // Late-binding addImport for stdlib_mod (declared earlier).
     stdlib_mod.addImport("format", format_mod);
@@ -689,9 +694,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch", "record", "protocol", "bignum" } },
         // format test binary. Imports the menagerie of
         // consumer kinds; nothing depends on format itself.
-        .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle" } },
-        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch", "heap", "string" } },
-        .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string" } },
+        .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle", "bignum" } },
+        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch", "heap", "string", "bignum" } },
+        .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string", "bignum" } },
         .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol", "nextomic" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
     };

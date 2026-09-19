@@ -32,7 +32,7 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Errors | Compile errors carry `file:line:col` and a source caret; a symbol that names nothing is `UnresolvedSymbol` at its own span |
 | Macros | Host macros, user `defmacro` (compile-time sub-VM), syntax-quote with `~`/`~@`/auto-gensym, procedural macros over native fns, qualified macro heads (`alias/name`) |
 | Namespaces | `(ns NAME)`, qualified symbols and keywords (`:person/name`), `require` with `:as`, ns-to-file loading, cycle detection |
-| Numbers | Fixnum (48-bit) and f64 with Clojure contagion; `(= 1 1.0)` is `false`, `(== 1 1.0)` is `true`; `/` on two integers yields a float when inexact; `:divide-by-zero` and `:arithmetic-overflow` are catchable |
+| Numbers | Integers of any size (48-bit fixnums promote to bignums and demote back) and f64 with Clojure contagion; `(= 1 1.0)` is `false`, `(== 1 1.0)` is `true`; `/` on two integers yields a float when inexact; `:divide-by-zero` is catchable |
 | Invocation | Keywords, maps, sets and vectors are callable: `(:a m)`, `(m :a)`, `(#{1 2} 2)`, `([10 20] 1)` |
 | Destructuring | Sequential, associative, nested, `& rest`, `:as`, `:keys`, `:or` in `let`/`fn`/`defn`; multi-arity `defn`; `#(...)` shorthand |
 | Core library | 162 native functions in `nexis.core` (`src/stdlib.zig`: sequences, HOFs, collections, arithmetic, predicates, strings, I/O) plus 44 macros and functions in `src/stdlib/core.nx` (`when-let`, `doseq`, `cond->`, `some->`, `as->`, `update-in`, `group-by`, `frequencies`, ...); `nexis.string` |
@@ -215,11 +215,6 @@ Stated so nobody rediscovers them:
   of datoms should batch the work into processes that exit and
   restart rather than run as one process. Wiring the collector needs
   a rooting protocol for native functions (see `HANDOFF.md`).
-- **No bignum arithmetic.** The `bignum` kind, codec and hashing
-  exist; arithmetic does not promote. Fixnum overflow raises
-  `:arithmetic-overflow`; an integer literal outside ±2^47 is a
-  compile error (`IntegerOutOfFixnumRange`; inside a macro call it is
-  reported as `MacroExpansionFailure` over the whole form).
 - **No `^:dynamic` Vars, no `binding`.** `(binding ...)` is an
   unresolved symbol.
 - **Several Clojure core forms and functions are absent** (`case`

@@ -45,6 +45,7 @@ const list_mod = @import("list");
 const vector_mod = @import("vector");
 const champ_mod = @import("champ");
 const heap_mod = @import("heap");
+const bignum_mod = @import("bignum");
 
 const Form = reader_mod.Form;
 const Datum = reader_mod.Datum;
@@ -259,7 +260,7 @@ fn expandFormDepth(
 
     return switch (form.datum) {
         // ---- Leaves — pass through unchanged. -----------------
-        .nil, .bool_, .int, .real, .char, .string, .keyword, .symbol => mutCast(form),
+        .nil, .bool_, .int, .bigint, .real, .char, .string, .keyword, .symbol => mutCast(form),
         // ---- Lists — special-form recognition + macro dispatch. --
         .list => |items| try expandList(ctx, env, form, items, depth),
         // Vector/map/set literals are expressions (lowerForm
@@ -1431,7 +1432,12 @@ fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
     return switch (form.datum) {
         .nil => value_mod.nilValue(),
         .bool_ => |b| value_mod.fromBool(b),
-        .int => |n| value_mod.fromFixnum(n) orelse return ExpandError.MalformedMacroCall,
+        .int => |n| value_mod.fromFixnum(n) orelse
+            (bignum_mod.fromI64(try ctx.heapForArgs(), n) catch return ExpandError.OutOfMemory),
+        .bigint => |text| blk: {
+            const parsed = bignum_mod.parseDecimal(try ctx.heapForArgs(), text) catch return ExpandError.OutOfMemory;
+            break :blk parsed orelse return ExpandError.MalformedMacroCall;
+        },
         .symbol => |name| blk: {
             // Qualified symbols intern the full `ns/name`
             // string; valueToForm splits it back into
@@ -1552,6 +1558,20 @@ fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSp
         .fixnum => blk: {
             const form = try ctx.allocator.create(Form);
             form.* = .{ .datum = .{ .int = v.asFixnum() }, .origin = origin };
+            break :blk form;
+        },
+        // A bignum within i64 is an `int` like any other integer of
+        // that size; beyond i64 it is a `bigint` in decimal.
+        .bignum => blk: {
+            const form = try ctx.allocator.create(Form);
+            if (bignum_mod.toI64(v)) |n| {
+                form.* = .{ .datum = .{ .int = n }, .origin = origin };
+            } else {
+                var w = std.Io.Writer.Allocating.init(ctx.allocator);
+                defer w.deinit();
+                bignum_mod.formatDecimal(v, &w.writer) catch return ExpandError.OutOfMemory;
+                form.* = .{ .datum = .{ .bigint = try ctx.allocator.dupe(u8, w.written()) }, .origin = origin };
+            }
             break :blk form;
         },
         .float => blk: {
@@ -3733,7 +3753,7 @@ fn expandSyntaxQuotePayload(
     return switch (payload.datum) {
         // Self-evaluating leaves: pass through. Lowered as
         // existing Tiny variants — no quote wrap needed.
-        .nil, .bool_, .int, .real, .char, .string, .keyword => mutCast(payload),
+        .nil, .bool_, .int, .bigint, .real, .char, .string, .keyword => mutCast(payload),
         // Symbol → (quote sym) — unless ends with `#`, then
         // gensym lookup. Qualified symbols (`ns/name`) preserve
         // their prefix; auto-gensym applies only to unqualified

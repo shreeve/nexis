@@ -230,8 +230,40 @@ test "errors: division by zero and kind mismatch are the catchable keywords" {
     try expectProgramError("(* (+ " ++ fm ++ " 1) \"x\")", vm.VmError.KindMismatch);
 }
 
+test "literals: integers beyond the fixnum range read as bignums and print in decimal" {
+    try expectOutput("140737488355328", "140737488355328");
+    try expectOutput("-140737488355329", "-140737488355329");
+    try expectOutput("1000000000000000000", "1000000000000000000");
+    try expectOutput("9223372036854775807", "9223372036854775807");
+    try expectOutput("-9223372036854775808", "-9223372036854775808");
+    try expectOutput("18446744073709551616", "18446744073709551616");
+    try expectOutput("-18446744073709551616", "-18446744073709551616");
+    try expectOutput("0x10000000000000000", "18446744073709551616");
+    try expectOutput("123456789012345678901234567890123456789012345678901234567890", "123456789012345678901234567890123456789012345678901234567890");
+    try expectOutput("[(integer? 18446744073709551616) (= 18446744073709551616 (* 4294967296 4294967296))]", "[true true]");
+    try expectOutput("(= 140737488355328 (+ 140737488355327 1))", "true");
+    try expectOutput("(- 140737488355328 1)", "140737488355327");
+    try expectOutput("(integer? (- 140737488355328 1))", "true");
+    try expectOutput("'(1 18446744073709551616)", "(1 18446744073709551616)");
+    try expectOutput("[18446744073709551616 {:n -18446744073709551616}]", "[18446744073709551616 {:n -18446744073709551616}]");
+    try expectOutput("(str 18446744073709551616)", "18446744073709551616");
+    try expectOutput("(pr-str [18446744073709551616 \"s\"])", "[18446744073709551616 \"s\"]");
+    try expectOutput("(str (* 140737488355327 140737488355327))", "19807040628565802923409276929");
+    try expectOutput("(let [a 100000000000000000000] (+ a a))", "200000000000000000000");
+}
+
+test "literals: macros carry bignums in and out" {
+    try expectOutput("(do (defmacro big [] 18446744073709551616) (big))", "18446744073709551616");
+    try expectOutput("(do (defmacro big [] 9223372036854775807) (big))", "9223372036854775807");
+    try expectOutput("(do (defmacro twice [x] `(* 2 ~x)) (twice 18446744073709551616))", "36893488147419103232");
+    try expectOutput("(do (defmacro sq [x] (* x x)) (sq 4294967296))", "18446744073709551616");
+    try expectOutput("(do (defmacro sq [x] (* x x)) (sq 18446744073709551616))", "340282366920938463463374607431768211456");
+}
+
 test "programs: factorial and a product fold grow past 2^47 and come back" {
+    try expectOutput("(reduce * (range 1 30))", "8841761993739701954543616000000");
     try expectOutput("(= (reduce * (range 1 30)) (* (reduce * (range 1 29)) 29))", "true");
+    try expectOutput("(let [f (fn [n] (loop [i n acc 1] (if (= i 0) acc (recur (dec i) (* acc i)))))] (f 25))", "15511210043330985984000000");
     try expectOutput("(let [f (fn [n] (loop [i n acc 1] (if (= i 0) acc (recur (dec i) (* acc i)))))] (= (quot (f 25) (f 24)) 25))", "true");
     try expectOutput("(let [f (fn [n] (loop [i n acc 1] (if (= i 0) acc (recur (dec i) (* acc i)))))] (integer? (f 25)))", "true");
     try expectOutput("(let [f (fn [n] (loop [i n acc 1] (if (= i 0) acc (recur (dec i) (* acc i)))))] (rem (f 25) 1000000007))", "440732388");

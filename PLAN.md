@@ -584,7 +584,7 @@ Deliberately minimal:
 - `fixnum` (i48) and `bignum` form the integer tower; promotion on overflow.
 - `float` (f64) is a separate type. `(= 1 1.0)` is **false**; use `(== 1 1.0)` helper if cross-type numeric equality is desired.
 - No rationals. No decimals. No complex.
-- Arithmetic and ordered comparison use Clojure contagion: any float operand makes the operation f64. `/` of two integers yields an integer when exact and a float otherwise (`(/ 6 3)` → `2`, `(/ 7 2)` → `3.5`). A fixnum result outside i48 raises the catchable `:arithmetic-overflow` until bignum arithmetic exists; integer division by zero raises `:divide-by-zero`.
+- Arithmetic and ordered comparison use Clojure contagion: any float operand makes the operation f64. `/` of two integers yields an integer when exact and a float otherwise (`(/ 6 3)` → `2`, `(/ 7 2)` → `3.5`). An integer result outside i48 is a bignum and one that fits is a fixnum (canonical form, so `=` and `hash` agree); integer division by zero raises `:divide-by-zero`.
 - *(Decimal support can be resurrected later by borrowing em's Math module wholesale — the infrastructure is proven.)*
 
 ### 8.4 Interning — keyword / symbol asymmetry
@@ -2509,7 +2509,8 @@ pub const Form = struct {
 ;; Atoms (leaves; Form's datum is an Atom variant)
 nil                                  ;; nil
 true, false                          ;; bool
-42, 0x2A, 0b101                      ;; int (normalized from any radix)
+42, 0x2A, 0b101                      ;; int (normalized from any radix; within i64)
+18446744073709551616                 ;; bigint (an integer beyond i64, as decimal text)
 3.14, 1e9, 1.5e-3                    ;; real (f64)
 "hello"                              ;; string
 \a, \newline, \u{2603}               ;; char (Unicode scalar)
@@ -2788,3 +2789,18 @@ spec changes downstream of each PLAN entry.
   `with-snapshot` over MVCC read transactions (Phase 4.0f) and
   Nextomic's `as-of`/`since`/`history` db-values over tx-in-key
   history.
+
+- **2026-09-18 — Bignum arithmetic and literals (§8.3, §23 #10, §28.2).**
+  The integer tower is fixnum + bignum as §23 #10 states: `+ - * /
+  quot rem mod inc dec abs` and unary `-` promote an i48 overflow to a
+  bignum and demote a result that fits back to a fixnum, ordering and
+  the predicates are exact over bignums, contagion with f64 is
+  unchanged, and no arithmetic raises `:arithmetic-overflow` (the
+  keyword remains for a count or id that does not fit a fixnum). The
+  reader's canonical datum set (§28.2) gains `bigint`, an integer
+  literal beyond i64 as decimal text; `int` stays i64 and the
+  compiler lifts either into a bignum constant. Bignums print in
+  decimal with no suffix. `docs/BIGNUM.md` §9, `docs/SEMANTICS.md`
+  §2.2 and §6.3 and `docs/FORMS.md` §3 track this entry; it
+  supersedes the "until bignum arithmetic lands" clauses of the two
+  number-tower entries above.

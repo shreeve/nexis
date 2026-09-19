@@ -45,7 +45,8 @@ else is a bug.
 ;; Atoms (leaves; Form's datum is an Atom variant)
 nil                                  ;; nil
 true, false                          ;; bool
-42, 0x2A, 0b101                      ;; int  (normalized from any radix)
+42, 0x2A, 0b101                      ;; int  (normalized from any radix; within i64)
+18446744073709551616                 ;; bigint (an integer beyond i64, as decimal text)
 3.14, 1e9, 1.5e-3                    ;; real (f64)
 "hello"                              ;; string
 \a, \newline, \u{2603}               ;; char (Unicode scalar)
@@ -163,7 +164,8 @@ tolerate whitespace churn.
   - `nil`, `true`, `false` — bare.
   - Integers: decimal, with a leading `-` for negatives. Hex and binary source
     literals are normalized to decimal in the Form's `datum` — the pretty-
-    printer does not preserve the source radix.
+    printer does not preserve the source radix. An integer beyond i64 is a
+    `bigint` whose datum is that decimal text; `(bigint N)` prints it.
   - Floats: Zig's default `{d}` formatting, except special values:
     `+inf`, `-inf`, `+nan` (canonical NaN; the Form stores NaN as a single
     canonical bit pattern — see SEMANTICS §3.2).
@@ -208,7 +210,7 @@ Pretty-printed Form:
   (map (keyword :private) true))
 ```
 
-The exact atomic tags in the pretty-printer — `(int N)`, `(real R)`, `(string
+The exact atomic tags in the pretty-printer — `(int N)`, `(bigint N)`, `(real R)`, `(string
 S)`, `(char C)`, `(keyword K)`, `(symbol S)`, `(bool B)`, `nil` — make atom
 types unambiguous in goldens. Bare source text like `defn` never appears as a
 standalone leaf; it is always wrapped in its datum tag. This costs a few bytes
@@ -268,10 +270,6 @@ These are **not** language-level commitments — they document the current
 state of the reader and will lift as Phase 1 lands. Readers should treat
 them as implementation quirks, not contract.
 
-- **Integer range.** `src/reader.zig` stores ints in `i64`. Literals whose
-  magnitude exceeds i64 range are rejected with `:bad-number-literal`; they
-  will be promoted to bignum in Phase 1 and this error path will light up
-  `:bignum-out-of-phase-0-range` instead (the error kind is reserved today).
 - **NaN / ±Inf literal syntax.** The reader does not yet accept a source
   spelling for NaN or infinity (Clojure uses `##NaN` / `##Inf`; we defer
   the exact token to Phase 3 with the rest of the reader-extension surface).
