@@ -617,6 +617,7 @@ fn fnEntity(vm: *VM, args: []const Value) VmError!Value {
 /// entity has no datoms in this view.
 fn entityNative(vm: *VM, args: []const Value) !Value {
     const d = try dbOf(args[0]);
+    if (d.history) return error.HistoryView;
     var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -758,11 +759,14 @@ fn indexOf(vm: *VM, v: Value) !Index {
 // Time
 // =============================================================================
 
+/// A point in time: a `t`, or a transaction's entity id, which
+/// stands for its `t`.
 fn tArg(v: Value) !u64 {
     if (v.kind() != .fixnum) return error.KindMismatch;
     const n = v.asFixnum();
     if (n < 0) return error.InvalidArgument;
-    return @intCast(n);
+    const u: u64 = @intCast(n);
+    return key.txOfEntity(u) orelse u;
 }
 
 fn fnAsOf(vm: *VM, args: []const Value) VmError!Value {
@@ -895,6 +899,14 @@ test "every nextomic error maps to its §7 keyword; engine errors to the db set"
             try testing.expect(std.mem.startsWith(u8, name, "nextomic/"));
         }
     }
+}
+
+test "a time argument is a t or the entity id of a transaction" {
+    try testing.expectEqual(@as(u64, 7), try tArg(value.fromFixnum(7).?));
+    try testing.expectEqual(@as(u64, 7), try tArg(value.fromFixnum(@intCast(key.txEntity(7))).?));
+    try testing.expectEqual(@as(u64, 0), try tArg(value.fromFixnum(0).?));
+    try testing.expectError(error.InvalidArgument, tArg(value.fromFixnum(-1).?));
+    try testing.expectError(error.KindMismatch, tArg(value.nilValue()));
 }
 
 test "marshalling both ways for every value type" {

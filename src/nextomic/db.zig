@@ -52,6 +52,7 @@ pub const SyncMode = store_mod.SyncMode;
 
 /// The Nextomic error set; each maps to a `:nextomic/*` keyword.
 pub const Error = error{
+    HistoryView,
     UnknownAttribute,
     ValueType,
     Unique,
@@ -318,8 +319,10 @@ pub const DbValue = struct {
     };
 
     /// Every current attribute of `e` with its values, in attribute
-    /// order; empty when the entity has no datoms in this view.
+    /// order; empty when the entity has no datoms in this view. Not
+    /// defined on a history view, whose datoms are not a state.
     pub fn entity(self: DbValue, arena: Allocator, e: u64) ![]EntityAttr {
+        if (self.history) return error.HistoryView;
         const ds = try self.datoms(arena, .eavt, .{ .e = e });
         var out: std.ArrayList(EntityAttr) = .empty;
         var i: usize = 0;
@@ -681,11 +684,12 @@ test "db at bootstrap: datoms, entity, entid, ident, tx-range" {
     try testing.expectEqual(@as(usize, 1), hit.len);
     try testing.expectEqual(@as(u64, boot.doc), hit[0].e);
 
-    // entity
+    // entity: current, as-of and since views; never a history view.
     const ent = try db.entity(arena, boot.tx_instant);
     try testing.expectEqual(@as(usize, 4), ent.len);
     try testing.expectEqual(boot.ident, ent[0].a);
     try testing.expectEqual(@as(u32, boot.tx_instant), ent[0].vals[0].keyword);
+    try testing.expectError(error.HistoryView, db.withHistory().entity(arena, boot.tx_instant));
 
     // entid / ident
     const k_doc = try tc.interner.internKeyword("db/doc");
@@ -787,7 +791,7 @@ test "every operation on a closed connection is error.Closed" {
     for (views) |v| {
         try testing.expectError(error.Closed, v.beginRead());
         try testing.expectError(error.Closed, v.datoms(arena, .eavt, .{ .e = 1 }));
-        try testing.expectError(error.Closed, v.entity(arena, 1));
+        if (!v.history) try testing.expectError(error.Closed, v.entity(arena, 1));
         try testing.expectError(error.Closed, v.entid(arena, .{ .eid = 1 }));
         try testing.expectError(error.Closed, v.entid(arena, .{ .lookup = .{ .a = boot.ident, .v = .{ .keyword = boot.doc } } }));
         try testing.expectError(error.Closed, v.ident(arena, boot.doc));
