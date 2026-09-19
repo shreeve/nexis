@@ -632,6 +632,14 @@ Macro semantics (peer-AI turn 56 §2.G-J):
 - `cond`: `(cond t1 e1 t2 e2 ...)` → nested if. Odd arg
   count = `MacroExpansionFailure`. No `:else` special case
   in v1 (keyword used as truthy test works).
+- `case`: `(case expr k1 v1 k2 v2 ... default?)` → `(let* [g expr]
+  (if (= g 'k1) v1 (if (= g 'k2) v2 ... terminal)))`. Every key is
+  a constant and is never evaluated: a symbol key is that symbol,
+  a vector or map key is that literal, and a list key `(k1 k2)`
+  groups alternatives (`(if (= g 'k1) true (= g 'k2))`). The
+  terminal is the trailing odd form when present, otherwise
+  `(throw {:error :no-matching-clause :message "No matching
+  clause: <expr>" :value expr})`; `condp` throws the same map.
 - `->` (thread-first):
   ```clojure
   (-> x)            => x

@@ -2026,8 +2026,8 @@ test "io: slurp / spit: empty path is :invalid-path" {
 // =============================================================================
 //
 // `case` + `condp` are pure expansion + single-eval gensym
-// patterns; both throw `:no-matching-clause` when no clause
-// matches and no default is supplied (returning nil would
+// patterns; both throw `{:error :no-matching-clause ...}` when no
+// clause matches and no default is supplied (returning nil would
 // silently mask bugs).
 
 test "case: basic match + default" {
@@ -2039,13 +2039,34 @@ test "case: basic match + default" {
     try expectOutput("(case :anything :default)", ":default");
 }
 
-test "case: no match without default throws :no-matching-clause" {
+test "case: constants are data, never evaluated" {
+    // A list groups alternatives; a symbol is the symbol itself.
+    try expectOutput("(case 1 (1 2) :a :d)", ":a");
+    try expectOutput("(case 2 (1 2) :a 3 :b :d)", ":a");
+    try expectOutput("(case 3 (1 2) :a 3 :b :d)", ":b");
+    try expectOutput("(case 'x x :a :d)", ":a");
+    try expectOutput("(case 'y x :a y :b :d)", ":b");
+    try expectOutput("(case 'z (x y) :a (z w) :b :d)", ":b");
+    try expectOutput("(case nil nil :nil :d)", ":nil");
+    try expectOutput("(case [1 2] [1 2] :vec :d)", ":vec");
+    try expectOutput("(case {:a 1} {:a 1} :map :d)", ":map");
+    try expectOutput("(case :k (:j :k) :kw :d)", ":kw");
+    try expectOutput("(case \"s\" (\"a\" \"s\") :str :d)", ":str");
+    try expectOutput("(case \\c \\c :char :d)", ":char");
+    try expectOutput("(case 1.5 1.5 :f :d)", ":f");
+    try expectOutput("(case true true :t false :f)", ":t");
+    // The dispatch expression is evaluated; a symbol there is a lookup.
+    try expectOutput("(let [x 5] (case x 5 :five :d))", ":five");
+    try expectOutput("(let [x 5] (case x (4 5 6) :mid :d))", ":mid");
+}
+
+test "case: no match without default throws a map naming the value" {
     try expectOutput(
-        \\(try (case 99 1 :one 2 :two) (catch any e e))
-    , ":no-matching-clause");
+        \\(try (case 99 1 :one 2 :two) (catch any e [(:error e) (:value e) (:message e)]))
+    , "[:no-matching-clause 99 No matching clause: 99]");
     // Even count = no default; still throws.
     try expectOutput(
-        \\(try (case 5 1 :one) (catch any e e))
+        \\(try (case :k 1 :one) (catch any e (:error e)))
     , ":no-matching-clause");
 }
 
@@ -2082,10 +2103,10 @@ test "condp: predicate + default" {
     try expectOutput("(condp = 99 :default)", ":default");
 }
 
-test "condp: no match without default throws :no-matching-clause" {
+test "condp: no match without default throws a map naming the value" {
     try expectOutput(
-        \\(try (condp = 99 1 :one 2 :two) (catch any e e))
-    , ":no-matching-clause");
+        \\(try (condp = 99 1 :one 2 :two) (catch any e [(:error e) (:value e)]))
+    , "[:no-matching-clause 99]");
 }
 
 test "condp: predicate is called as (pred clause expr)" {

@@ -2598,18 +2598,26 @@ fn expandCond(
 
 // ---- case ----------------------------------------------------
 //
-//   (case expr)                  => (throw :no-matching-clause)
+//   (case expr)                  => (throw {:error :no-matching-clause ...})
 //   (case expr default)          => (let* [g# expr] default)
-//   (case expr k1 v1 k2 v2 ...)  => chained `(if (= g# k_i) v_i ...)`
-//                                   with a `(throw :no-matching-clause)`
-//                                   default if the clause count is even
-//                                   (i.e., no trailing default supplied).
+//   (case expr k1 v1 k2 v2 ...)  => chained `(if (= g# 'k_i) v_i ...)`
+//                                   with the no-match throw as the
+//                                   terminal branch when the clause
+//                                   count is even (no default).
 //   (case expr k1 v1 ... default) => same, with `default` as the
 //                                    terminal else branch when the
 //                                    clause count is odd.
 //
-// No-match with no default THROWS `:no-matching-clause`, not
-// returns nil. Forces users to be explicit about exhaustion.
+// Each key is a constant, never evaluated: a symbol key is the
+// symbol itself, a vector or map key is that literal, and a list
+// key `(k1 k2 ...)` groups alternatives, any of which matches. The
+// test for a key is `(= g# (quote k))`; a group nests the tests as
+// `(if (= g# 'k1) true (= g# 'k2))`.
+//
+// No-match with no default THROWS `{:error :no-matching-clause
+// :message "No matching clause: <expr>" :value expr}`, not
+// returns nil (Clojure's IllegalArgumentException carries the same
+// message). Forces users to be explicit about exhaustion.
 // Mirrors Clojure semantics modulo the perf shape (Clojure uses
 // hash dispatch; we chain `if`).
 //
@@ -2624,18 +2632,18 @@ fn expandCase(
     const expr_form = args[0];
     const clauses = args[1..];
 
-    // Terminal default branch: `:no-matching-clause` throw OR the
+    // gensym the test expression so it's evaluated exactly once.
+    const g_name = try ctx.gensym("case");
+
+    // Terminal default branch: the no-match throw OR the
     // odd-arity terminal form.
     const has_default = (clauses.len % 2 == 1);
     var terminal: *Form = if (has_default)
         @constCast(clauses[clauses.len - 1])
     else
-        try makeThrow(ctx, "no-matching-clause", call_form.origin);
+        try makeNoMatchThrow(ctx, g_name, call_form.origin);
 
-    // gensym the test expression so it's evaluated exactly once.
-    const g_name = try ctx.gensym("case");
-
-    // Walk pairs right-to-left, wrapping in `(if (= g k) v rest)`.
+    // Walk pairs right-to-left, wrapping in `(if <test> v rest)`.
     const pair_count = clauses.len / 2;
     var i: usize = pair_count;
     while (i > 0) {
@@ -2643,15 +2651,11 @@ fn expandCase(
         const key = clauses[i * 2];
         const value = clauses[i * 2 + 1];
 
-        const eq_items = try ctx.allocator.alloc(*Form, 3);
-        eq_items[0] = try makeSymbol(ctx, "=", call_form.origin);
-        eq_items[1] = try makeSymbol(ctx, g_name, call_form.origin);
-        eq_items[2] = @constCast(key);
-        const eq_form = try makeList(ctx, eq_items, call_form.origin);
+        const test_form = try buildCaseTest(ctx, g_name, key, call_form.origin);
 
         const if_items = try ctx.allocator.alloc(*Form, 4);
         if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
-        if_items[1] = eq_form;
+        if_items[1] = test_form;
         if_items[2] = @constCast(value);
         if_items[3] = terminal;
         terminal = try makeList(ctx, if_items, call_form.origin);
@@ -2670,12 +2674,46 @@ fn expandCase(
     return try makeList(ctx, let_items, call_form.origin);
 }
 
+/// The test for one `case` key: `(= g 'k)` for a single constant;
+/// for a list of alternatives, `(if (= g 'k1) true <rest>)` nested
+/// over the group so any alternative matches. An empty group never
+/// matches.
+fn buildCaseTest(ctx: *ExpandContext, g_name: []const u8, key: *const Form, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    const alternatives: []const *Form = if (key.datum == .list) key.datum.list else &.{@constCast(key)};
+    if (alternatives.len == 0) return try makeBool(ctx, false, origin);
+    var test_form: *Form = try buildCaseEq(ctx, g_name, alternatives[alternatives.len - 1], origin);
+    var i: usize = alternatives.len - 1;
+    while (i > 0) {
+        i -= 1;
+        const if_items = try ctx.allocator.alloc(*Form, 4);
+        if_items[0] = try makeSymbol(ctx, "if", origin);
+        if_items[1] = try buildCaseEq(ctx, g_name, alternatives[i], origin);
+        if_items[2] = try makeBool(ctx, true, origin);
+        if_items[3] = test_form;
+        test_form = try makeList(ctx, if_items, origin);
+    }
+    return test_form;
+}
+
+/// `(= g (quote k))`: the key is data, so a symbol compares as a
+/// symbol and a compound literal as that literal.
+fn buildCaseEq(ctx: *ExpandContext, g_name: []const u8, key: *const Form, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    const quote_items = try ctx.allocator.alloc(*Form, 2);
+    quote_items[0] = try makeSymbol(ctx, "quote", origin);
+    quote_items[1] = @constCast(key);
+    const eq_items = try ctx.allocator.alloc(*Form, 3);
+    eq_items[0] = try makeSymbol(ctx, "=", origin);
+    eq_items[1] = try makeSymbol(ctx, g_name, origin);
+    eq_items[2] = try makeList(ctx, quote_items, origin);
+    return try makeList(ctx, eq_items, origin);
+}
+
 // ---- condp ---------------------------------------------------
 //
-//   (condp pred expr)                       => (throw :no-matching-clause)
+//   (condp pred expr)                       => (throw {:error :no-matching-clause ...})
 //   (condp pred expr default)               => default
 //   (condp pred expr c1 v1 c2 v2 ...)       => chained `(if (p# c_i e#) v_i ...)`
-//                                              with `:no-matching-clause` throw
+//                                              with the no-match throw
 //                                              when the clause count is even.
 //   (condp pred expr c1 v1 ... default)     => terminal default.
 //
@@ -2694,14 +2732,14 @@ fn expandCondp(
     const expr_form = args[1];
     const clauses = args[2..];
 
+    const p_name = try ctx.gensym("condp-pred");
+    const e_name = try ctx.gensym("condp-expr");
+
     const has_default = (clauses.len % 2 == 1);
     var terminal: *Form = if (has_default)
         @constCast(clauses[clauses.len - 1])
     else
-        try makeThrow(ctx, "no-matching-clause", call_form.origin);
-
-    const p_name = try ctx.gensym("condp-pred");
-    const e_name = try ctx.gensym("condp-expr");
+        try makeNoMatchThrow(ctx, e_name, call_form.origin);
 
     const pair_count = clauses.len / 2;
     var i: usize = pair_count;
@@ -3553,17 +3591,32 @@ fn makeListInline(ctx: *ExpandContext, origin: reader_mod.SrcSpan, items: []cons
     return try makeList(ctx, buf, origin);
 }
 
-/// Helper: build `(throw :KEYWORD)` for the no-matching-clause
-/// fallthrough used by `case` and `condp`.
-fn makeThrow(ctx: *ExpandContext, kw_name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
+/// The no-match fallthrough of `case` and `condp`:
+/// `(throw {:error :no-matching-clause :message (nexis.core/str
+/// "No matching clause: " g) :value g})`, `g` being the symbol the
+/// dispatch value is bound to. `str` is qualified so a lexical
+/// `str` cannot capture it.
+fn makeNoMatchThrow(ctx: *ExpandContext, g_name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    const str_items = try ctx.allocator.alloc(*Form, 3);
+    str_items[0] = try makeQualifiedSymbol(ctx, "nexis.core", "str", origin);
+    const prefix = try ctx.allocator.create(Form);
+    prefix.* = .{ .datum = .{ .string = "No matching clause: " }, .origin = origin };
+    str_items[1] = prefix;
+    str_items[2] = try makeSymbol(ctx, g_name, origin);
+
+    const map_items = try ctx.allocator.alloc(*Form, 6);
+    map_items[0] = try makeKeyword(ctx, "error", origin);
+    map_items[1] = try makeKeyword(ctx, "no-matching-clause", origin);
+    map_items[2] = try makeKeyword(ctx, "message", origin);
+    map_items[3] = try makeList(ctx, str_items, origin);
+    map_items[4] = try makeKeyword(ctx, "value", origin);
+    map_items[5] = try makeSymbol(ctx, g_name, origin);
+    const map_form = try ctx.allocator.create(Form);
+    map_form.* = .{ .datum = .{ .map = @as([]const *Form, map_items) }, .origin = origin };
+
     const items = try ctx.allocator.alloc(*Form, 2);
     items[0] = try makeSymbol(ctx, "throw", origin);
-    const kw_form = try ctx.allocator.create(Form);
-    kw_form.* = .{
-        .datum = .{ .keyword = .{ .ns = null, .name = kw_name } },
-        .origin = origin,
-    };
-    items[1] = kw_form;
+    items[1] = map_form;
     return try makeList(ctx, items, origin);
 }
 
