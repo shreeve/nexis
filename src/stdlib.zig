@@ -525,8 +525,8 @@ const native_sort_by = NativeFn{ .name = "sort-by", .min_arity = 2, .max_arity =
 const native_hash = NativeFn{ .name = "hash", .min_arity = 1, .max_arity = 1, .call = &fnHash };
 const native_name = NativeFn{ .name = "name", .min_arity = 1, .max_arity = 1, .call = &fnName };
 const native_namespace = NativeFn{ .name = "namespace", .min_arity = 1, .max_arity = 1, .call = &fnNamespace };
-const native_keyword = NativeFn{ .name = "keyword", .min_arity = 1, .max_arity = 1, .call = &fnKeyword };
-const native_symbol = NativeFn{ .name = "symbol", .min_arity = 1, .max_arity = 1, .call = &fnSymbol };
+const native_keyword = NativeFn{ .name = "keyword", .min_arity = 1, .max_arity = 2, .call = &fnKeyword };
+const native_symbol = NativeFn{ .name = "symbol", .min_arity = 1, .max_arity = 2, .call = &fnSymbol };
 const native_boolean = NativeFn{ .name = "boolean", .min_arity = 1, .max_arity = 1, .call = &fnBoolean };
 const native_list_q = NativeFn{ .name = "list?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
 const native_seq_q = NativeFn{ .name = "seq?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
@@ -2208,18 +2208,34 @@ fn fnNamespace(vm: *VM, args: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), ns) catch VmError.OutOfMemory;
 }
 
+/// An interner refusal as the program sees it: the empty name is
+/// `:invalid-argument`.
+fn internFailure(err: intern_mod.InternError) VmError {
+    return switch (err) {
+        error.EmptyName => VmError.InvalidArgument,
+        error.OutOfMemory, error.InternTableFull => VmError.OutOfMemory,
+    };
+}
+
 /// `(keyword x)` / `(symbol x)` → interned from a string, keyword
-/// or symbol.
+/// or symbol. `(keyword ns name)` / `(symbol ns name)` → the
+/// qualified name; a nil `ns` leaves it unqualified.
 fn fnKeyword(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 2) {
+        const ns = if (args[0].isNil()) null else try internedName(vm, args[0]);
+        return vm.ensureInterner().internQualifiedKeyword(ns, try internedName(vm, args[1])) catch |err| internFailure(err);
+    }
     if (args[0].kind() == .keyword) return args[0];
-    const text = try internedName(vm, args[0]);
-    return vm.ensureInterner().internKeywordValue(text) catch VmError.OutOfMemory;
+    return vm.ensureInterner().internKeywordValue(try internedName(vm, args[0])) catch |err| internFailure(err);
 }
 
 fn fnSymbol(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 2) {
+        const ns = if (args[0].isNil()) null else try internedName(vm, args[0]);
+        return vm.ensureInterner().internQualifiedSymbol(ns, try internedName(vm, args[1])) catch |err| internFailure(err);
+    }
     if (args[0].kind() == .symbol) return args[0];
-    const text = try internedName(vm, args[0]);
-    return vm.ensureInterner().internSymbolValue(text) catch VmError.OutOfMemory;
+    return vm.ensureInterner().internSymbolValue(try internedName(vm, args[0])) catch |err| internFailure(err);
 }
 
 fn fnBoolean(_: *VM, args: []const Value) VmError!Value {

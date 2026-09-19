@@ -153,6 +153,14 @@ pub const Interner = struct {
         return self.internKeywordValue(full);
     }
 
+    /// `internQualifiedKeyword` for symbols.
+    pub fn internQualifiedSymbol(self: *Interner, ns: ?[]const u8, name: []const u8) InternError!value.Value {
+        const ns_prefix = ns orelse return self.internSymbolValue(name);
+        const full = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ ns_prefix, name });
+        defer self.gpa.free(full);
+        return self.internSymbolValue(full);
+    }
+
     /// Split an interned `ns/name` text back into its parts at its
     /// first slash; `ns` is null for an unqualified name. The bare
     /// division symbol `/` is an unqualified name, as in `split`.

@@ -271,3 +271,14 @@ test "mod on floats takes the sign of the divisor" {
         \\[(mod 7.5 -2) (mod 5.5 -2) (mod 5 -1.5) (mod -7.5 2) (mod 7.5 2) (mod -7 3) (mod 7 -3) (mod 6.0 -2)]
     , "[-0.5 -0.5 -1.0 0.5 1.5 2 -2 0.0]");
 }
+
+// ---- keyword / symbol construction ----
+
+test "keyword and symbol refuse an empty name catchably and take a namespace" {
+    try expectOutput(
+        \\[(try (keyword "") (catch any e e))
+        \\ (try (symbol "") (catch any e e))
+        \\ (keyword "a" "b") (symbol "a" "b") (keyword nil "b")
+        \\ (namespace (keyword "a" "b")) (name (symbol "a" "b"))]
+    , "[:invalid-argument :invalid-argument :a/b a/b :b a b]");
+}
