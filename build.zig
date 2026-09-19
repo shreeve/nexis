@@ -1102,6 +1102,7 @@ pub fn build(b: *std.Build) void {
         };
         const scratch = b.addWriteFiles();
         _ = scratch.addCopyFile(nexis_exe.getEmittedBin(), "nexis");
+        _ = scratch.addCopyFile(b.path("test/nextomic/prelude.nx"), "prelude.nx");
         for (scripts) |name| {
             _ = scratch.addCopyFile(b.path(b.fmt("test/nextomic/{s}.nx", .{name})), b.fmt("{s}.nx", .{name}));
             _ = scratch.addCopyFile(b.path(b.fmt("test/nextomic/{s}.out", .{name})), b.fmt("{s}.out", .{name}));

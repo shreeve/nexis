@@ -1,0 +1,19 @@
+; test/nextomic/prelude.nx — shared by every script in this directory
+; through `(require '[prelude :as t])`; the build copies it into the
+; scripts' scratch directory next to them.
+
+(ns prelude)
+
+; Entity-id partitions (docs/NEXTOMIC.md §2): user entities start at
+; 2^32; a transaction entity is tx-partition + t.
+(def user-partition 4294967296)
+(def tx-partition 70368744177664)
+
+; Print "ok <label>" or "FAIL <label>"; a failure ends the script.
+(defn check [label ok]
+  (println (if ok "ok" "FAIL") label)
+  (when-not ok (throw :check-failed)))
+
+; The value body throws, or :no-error.
+(defmacro caught [& body]
+  `(try (do ~@body :no-error) (catch any e# e#)))

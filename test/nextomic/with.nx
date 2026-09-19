@@ -5,13 +5,7 @@
 ; fresh.
 
 (require '[nextomic :as d])
-
-(defn check [label ok]
-  (println (if ok "ok" "FAIL") label)
-  (when-not ok (throw :check-failed)))
-
-(defmacro caught [& body]
-  `(try (do ~@body :no-error) (catch any e# e#)))
+(require '[prelude :as t])
 
 ; Drop the transaction's own :db/txInstant datom: its value is the clock.
 (defn facts [report]
@@ -43,61 +37,61 @@
       (reset! escaped db-after)
       (reset! gus (get (:tempids report) "gus"))
       (println db-after)
-      (check "db-after is the report's db-after" (= db-after (:db-after report)))
-      (check "db-before is the committed view" (= before (:db-before report)))
-      (check "the speculative t follows the basis" (= (inc (d/basis-t before)) (:tx report) (d/basis-t db-after)))
+      (t/check "db-after is the report's db-after" (= db-after (:db-after report)))
+      (t/check "db-before is the committed view" (= before (:db-before report)))
+      (t/check "the speculative t follows the basis" (= (inc (d/basis-t before)) (:tx report) (d/basis-t db-after)))
       (println (facts report))
-      (check "q sees the new person and the tag change"
+      (t/check "q sees the new person and the tag change"
              (and (= ["Ann" "Bob" "Gus"] (names db-after))
                   (= #{[:green]} (d/q '[:find ?t :where [?e :person/email "ann@x"] [?e :person/tags ?t]] db-after))))
-      (check "entity sees the new person" (= "Gus" (:person/name (d/entity db-after @gus))))
-      (check "pull follows a speculative ref"
+      (t/check "entity sees the new person" (= "Gus" (:person/name (d/entity db-after @gus))))
+      (t/check "pull follows a speculative ref"
              (= {:db/id @gus :person/name "Gus" :person/boss {:db/id ann :person/name "Ann"}}
                 (d/pull db-after '[:person/name {:person/boss [:person/name]}] [:person/email "gus@x"])))
-      (check "datoms sees the speculative datom" (= 1 (count (d/datoms db-after :avet :person/email "gus@x"))))
-      (check "the tx position binds the speculative transaction"
+      (t/check "datoms sees the speculative datom" (= 1 (count (d/datoms db-after :avet :person/email "gus@x"))))
+      (t/check "the tx position binds the speculative transaction"
              (= (d/q '[:find ?tx . :where [?e :person/name "Gus" ?tx]] db-after)
                 (d/q '[:find ?tx . :where [?e :person/tags :green ?tx]] db-after)))
-      (check "as-of on db-after folds the speculative rows away"
+      (t/check "as-of on db-after folds the speculative rows away"
              (= ["Ann" "Bob"] (names (d/as-of db-after (d/basis-t before)))))
-      (check "the committed view is untouched inside the scope" (= ["Ann" "Bob"] (names (d/db c))))
-      (check "transact! inside the scope is nested"
-             (= :nextomic/nested (caught (d/transact! c [[:db/add ann :person/tags :blue]]))))
-      (check "with inside the scope is nested"
-             (= :nextomic/nested (caught (d/with c [] (fn [inner r] inner)))))
+      (t/check "the committed view is untouched inside the scope" (= ["Ann" "Bob"] (names (d/db c))))
+      (t/check "transact! inside the scope is nested"
+             (= :nextomic/nested (t/caught (d/transact! c [[:db/add ann :person/tags :blue]]))))
+      (t/check "with inside the scope is nested"
+             (= :nextomic/nested (t/caught (d/with c [] (fn [inner r] inner)))))
       :speculated)))
-(check "with returns f's value" (= :speculated outcome))
+(t/check "with returns f's value" (= :speculated outcome))
 
 ; After the scope: nothing was committed, the view is closed, and the
 ; connection is free again.
-(check "the committed basis is unchanged" (= (d/basis-t before) (d/basis-t (d/db c))))
-(check "the speculative entity does not exist" (nil? (d/entity (d/db c) @gus)))
-(check "the speculative tag change did not happen" (= #{:red} (:person/tags (d/entity (d/db c) ann))))
-(println (caught (d/entity @escaped ann)))
-(println (caught (d/basis-t (d/as-of @escaped 1))))
-(println (caught (d/pull @escaped '[*] ann)))
+(t/check "the committed basis is unchanged" (= (d/basis-t before) (d/basis-t (d/db c))))
+(t/check "the speculative entity does not exist" (nil? (d/entity (d/db c) @gus)))
+(t/check "the speculative tag change did not happen" (= #{:red} (:person/tags (d/entity (d/db c) ann))))
+(println (t/caught (d/entity @escaped ann)))
+(println (t/caught (d/basis-t (d/as-of @escaped 1))))
+(println (t/caught (d/pull @escaped '[*] ann)))
 (def committed (d/transact! c [{:db/id "gus" :person/name "Gus" :person/email "gus@x"}]))
-(check "transact! afterwards takes the t the scope reported" (= (inc (d/basis-t before)) (:tx committed)))
-(check "and its tempid" (= @gus (get (:tempids committed) "gus")))
+(t/check "transact! afterwards takes the t the scope reported" (= (inc (d/basis-t before)) (:tx committed)))
+(t/check "and its tempid" (= @gus (get (:tempids committed) "gus")))
 
 ; A throw inside f propagates after the scope is cleaned up.
-(println (caught (d/with c [{:db/id "x" :person/name "X" :person/email "x@x"}]
+(println (t/caught (d/with c [{:db/id "x" :person/name "X" :person/email "x@x"}]
                    (fn [db-after report] (throw :boom)))))
-(check "the basis is still the committed one" (= (:tx committed) (d/basis-t (d/db c))))
-(check "the connection writes again after the throw" (= (inc (:tx committed)) (:tx (d/transact! c [[:db/add ann :person/tags :blue]]))))
+(t/check "the basis is still the committed one" (= (:tx committed) (d/basis-t (d/db c))))
+(t/check "the connection writes again after the throw" (= (inc (:tx committed)) (:tx (d/transact! c [[:db/add ann :person/tags :blue]]))))
 
 ; A speculative schema attribute exists in the view only.
 (d/with c [{:db/id "nick" :db/ident :person/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
   (fn [db-after report]
-    (check "the view has the new attribute" (= :db.type/string (:db/valueType (get (d/schema db-after) :person/nick))))
-    (check "and its ident" (= (get (:tempids report) "nick") (d/entid db-after :person/nick)))
-    (check "the connection does not" (nil? (get (d/schema (d/db c)) :person/nick)))))
-(println (caught (d/transact! c [[:db/add ann :person/nick "Annie"]])))
+    (t/check "the view has the new attribute" (= :db.type/string (:db/valueType (get (d/schema db-after) :person/nick))))
+    (t/check "and its ident" (= (get (:tempids report) "nick") (d/entid db-after :person/nick)))
+    (t/check "the connection does not" (nil? (get (d/schema (d/db c)) :person/nick)))))
+(println (t/caught (d/transact! c [[:db/add ann :person/nick "Annie"]])))
 
 ; Errors before f runs: bad tx-data, and a released connection.
-(println (caught (d/with c [[:db/add ann :person/nope 1]] (fn [db-after report] :unreached))))
-(println (caught (d/with c "not tx-data" (fn [db-after report] :unreached))))
-(check "a failed with leaves the connection writable" (= 6 (:tx (d/transact! c [[:db/add ann :person/tags :teal]]))))
+(println (t/caught (d/with c [[:db/add ann :person/nope 1]] (fn [db-after report] :unreached))))
+(println (t/caught (d/with c "not tx-data" (fn [db-after report] :unreached))))
+(t/check "a failed with leaves the connection writable" (= 6 (:tx (d/transact! c [[:db/add ann :person/tags :teal]]))))
 (d/release c)
-(println (caught (d/with c [] (fn [db-after report] :unreached))))
+(println (t/caught (d/with c [] (fn [db-after report] :unreached))))
 :with-done

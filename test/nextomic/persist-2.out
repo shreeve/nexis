@@ -7,4 +7,4 @@ ok the schema survives a reopen
 [1 2 3 4]
 ok writing continues from the persisted t
 3
-nil
+:persist-2-done

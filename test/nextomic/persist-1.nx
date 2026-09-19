@@ -2,6 +2,7 @@
 ; three transactions. persist-2.nx reads them back in a new process.
 
 (require '[nextomic :as d])
+(require '[prelude :as t])
 
 (d/with-conn [c "persist.edb"]
   (d/transact! c [{:db/ident :city/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one
@@ -12,3 +13,4 @@
                   {:city/name "Genoa" :city/population 560000}])
   (d/transact! c [[:db/add [:city/name "Turin"] :city/population 870000]])
   (println (d/basis-t (d/db c))))
+:persist-1-done

@@ -2,10 +2,7 @@
 ; ident, schema. Runs from a scratch directory; the store is fresh.
 
 (require '[nextomic :as d])
-
-(defn check [label ok]
-  (println (if ok "ok" "FAIL") label)
-  (when-not ok (throw :check-failed)))
+(require '[prelude :as t])
 
 ; Drop the transaction's own :db/txInstant datom: its value is the clock.
 (defn facts [report]
@@ -14,9 +11,9 @@
 (def c (d/connect "basics.edb"))
 (println c)
 (println (d/db c))
-(check "fresh store is at the bootstrap basis" (= 1 (d/basis-t (d/db c))))
-(check "db-values are values" (= (d/db c) (d/db c)))
-(check "a db-value is not its history view" (not= (d/db c) (d/history (d/db c))))
+(t/check "fresh store is at the bootstrap basis" (= 1 (d/basis-t (d/db c))))
+(t/check "db-values are values" (= (d/db c) (d/db c)))
+(t/check "a db-value is not its history view" (not= (d/db c) (d/history (d/db c))))
 
 ; Schema install is an ordinary transaction of attribute entities.
 (def schema-report
@@ -35,16 +32,16 @@
                    :db/index true}
                   {:db/ident :person/uuid :db/valueType :db.type/uuid :db/cardinality :db.cardinality/one}
                   {:db/ident :person/photo :db/valueType :db.type/bytes :db/cardinality :db.cardinality/one}]))
-(check "schema transaction is t=2" (= 2 (:tx schema-report)))
-(check "attribute entities take ids in the attribute partition" (= 22 (d/entid (d/db c) :person/name)))
-(check "db-before and db-after bracket the transaction"
+(t/check "schema transaction is t=2" (= 2 (:tx schema-report)))
+(t/check "attribute entities take ids in the attribute partition" (= 22 (d/entid (d/db c) :person/name)))
+(t/check "db-before and db-after bracket the transaction"
        (and (= 1 (d/basis-t (:db-before schema-report))) (= 2 (d/basis-t (:db-after schema-report)))))
 (println (get (d/schema (d/db c)) :person/email))
 (println (get (d/schema (d/db c)) :person/home))
 (println (get (d/schema (d/db c)) :addr/city))
-(check "ident round trips" (= :person/tags (d/ident (d/db c) (d/entid (d/db c) :person/tags))))
-(check "ident of an unknown eid is nil" (nil? (d/ident (d/db c) 12345)))
-(check "entid of an unknown ident is nil" (nil? (d/entid (d/db c) :person/nope)))
+(t/check "ident round trips" (= :person/tags (d/ident (d/db c) (d/entid (d/db c) :person/tags))))
+(t/check "ident of an unknown eid is nil" (nil? (d/ident (d/db c) 12345)))
+(t/check "entid of an unknown ident is nil" (nil? (d/entid (d/db c) :person/nope)))
 
 ; Map forms with tempids, card-many vectors, nested component maps, and
 ; vector forms that refer to the same tempids.
@@ -64,20 +61,20 @@
 (def bob (get (:tempids r1) "bob"))
 (println (d/entity (d/db c) ann))
 (println (d/entity (d/db c) bob))
-(check "the transaction entity carries its doc"
-       (= "first import" (:db/doc (d/entity (d/db c) (+ 70368744177664 (:tx r1))))))
-(check "a component entity is reachable through its ref"
+(t/check "the transaction entity carries its doc"
+       (= "first import" (:db/doc (d/entity (d/db c) (+ t/tx-partition (:tx r1))))))
+(t/check "a component entity is reachable through its ref"
        (= "Rome" (:addr/city (d/entity (d/db c) (:person/home (d/entity (d/db c) ann))))))
-(check "entity by lookup ref" (= ann (:db/id (d/entity (d/db c) [:person/email "ann@example.com"]))))
-(check "entity by unknown lookup ref is nil" (nil? (d/entity (d/db c) [:person/email "nobody@example.com"])))
-(check "entid by lookup ref" (= bob (d/entid (d/db c) [:person/email "bob@example.com"])))
-(check "an entity with no datoms is nil" (nil? (d/entity (d/db c) 4294967999)))
+(t/check "entity by lookup ref" (= ann (:db/id (d/entity (d/db c) [:person/email "ann@example.com"]))))
+(t/check "entity by unknown lookup ref is nil" (nil? (d/entity (d/db c) [:person/email "nobody@example.com"])))
+(t/check "entid by lookup ref" (= bob (d/entid (d/db c) [:person/email "bob@example.com"])))
+(t/check "an entity with no datoms is nil" (nil? (d/entity (d/db c) (+ t/user-partition 999))))
 
 ; Card-one overwrite retracts the old value in the same transaction;
 ; re-asserting a current value writes nothing.
 (def r2 (d/transact! c [[:db/add ann :person/age 42]]))
 (println (facts r2))
-(check "no-op re-assertion writes only :db/txInstant" (empty? (facts (d/transact! c [[:db/add ann :person/age 42]]))))
+(t/check "no-op re-assertion writes only :db/txInstant" (empty? (facts (d/transact! c [[:db/add ann :person/age 42]]))))
 
 ; Card-many accumulates; explicit retract removes one value.
 (d/transact! c [[:db/add ann :person/tags :founder]])
@@ -86,11 +83,11 @@
 (println (:person/tags (d/entity (d/db c) ann)))
 ; Retracting the attribute drops every value.
 (d/transact! c [[:db/retract ann :person/tags]])
-(check "retract-attribute leaves no values" (nil? (:person/tags (d/entity (d/db c) ann))))
+(t/check "retract-attribute leaves no values" (nil? (:person/tags (d/entity (d/db c) ann))))
 
 ; Unique identity upserts: a map keyed by the same email updates Ann.
 (def r3 (d/transact! c [{:db/id "who" :person/email "ann@example.com" :person/name "Ann Lee"}]))
-(check "upsert resolves the tempid to the existing entity" (= ann (get (:tempids r3) "who")))
+(t/check "upsert resolves the tempid to the existing entity" (= ann (get (:tempids r3) "who")))
 (println (:person/name (d/entity (d/db c) ann)))
 
 ; Negative fixnum tempids, lookup refs in entity position, refs by
@@ -99,18 +96,18 @@
                         [:db/add -1 :person/friends [:person/email "ann@example.com"]]
                         [:db/add [:person/email "bob@example.com"] :person/age 30]]))
 (println (:tempids r4))
-(check "ref by lookup ref resolves" (= #{ann} (:person/friends (d/entity (d/db c) (get (:tempids r4) -1)))))
-(check "lookup ref in entity position" (= 30 (:person/age (d/entity (d/db c) bob))))
+(t/check "ref by lookup ref resolves" (= #{ann} (:person/friends (d/entity (d/db c) (get (:tempids r4) -1)))))
+(t/check "lookup ref in entity position" (= 30 (:person/age (d/entity (d/db c) bob))))
 
 ; retractEntity removes the entity's datoms, the refs pointing at it and
 ; its components.
 (def home (:person/home (d/entity (d/db c) ann)))
 (def r5 (d/transact! c [[:db/retractEntity ann]]))
 (println (count (facts r5)))
-(check "retracted entity is gone" (nil? (d/entity (d/db c) ann)))
-(check "its component is gone" (nil? (d/entity (d/db c) home)))
-(check "refs to it are gone" (nil? (:person/friends (d/entity (d/db c) bob))))
-(check "its email is free again" (nil? (d/entid (d/db c) [:person/email "ann@example.com"])))
+(t/check "retracted entity is gone" (nil? (d/entity (d/db c) ann)))
+(t/check "its component is gone" (nil? (d/entity (d/db c) home)))
+(t/check "refs to it are gone" (nil? (:person/friends (d/entity (d/db c) bob))))
+(t/check "its email is free again" (nil? (d/entid (d/db c) [:person/email "ann@example.com"])))
 
 (d/release c)
 :basics-done
