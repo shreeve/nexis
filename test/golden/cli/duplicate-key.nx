@@ -1,0 +1,4 @@
+; A duplicate literal key: the report names the kind in nexis
+; spelling and the key exactly as the source wrote it.
+
+(println {:a_b 1 :a_b 2})

@@ -1364,6 +1364,7 @@ pub fn build(b: *std.Build) void {
             .{ .file = "test/golden/cli/divide-by-zero.nx", .expected = "divide-by-zero.err", .stream = .stderr, .exit_code = 5 },
             .{ .file = "test/golden/cli/uncaught-throw.nx", .expected = "uncaught-throw.err", .stream = .stderr, .exit_code = 5 },
             .{ .file = "test/golden/cli/bad-number.nx", .expected = "bad-number.err", .stream = .stderr, .exit_code = 3 },
+            .{ .file = "test/golden/cli/duplicate-key.nx", .expected = "duplicate-key.err", .stream = .stderr, .exit_code = 3 },
             .{ .verb = "disasm", .file = "examples/sum10.nx", .expected = "sum10.disasm" },
             .{ .file = "test/golden/cli/pprint.nx", .expected = "pprint.out" },
         };
