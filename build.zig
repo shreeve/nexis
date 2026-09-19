@@ -1037,6 +1037,23 @@ pub fn build(b: *std.Build) void {
     const runtime_polish_tests = b.addTest(.{ .root_module = runtime_polish_mod });
     const run_runtime_polish_tests = b.addRunArtifact(runtime_polish_tests);
 
+    // The lazy entity through the pipeline (test/integration/
+    // nextomic_entity.zig): every access path as a program sees it,
+    // and an entity kept in a Var under the collector's stress policy.
+    const integration_nextomic_entity_mod = b.createModule(.{
+        .root_source_file = b.path("test/integration/nextomic_entity.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    for ([_]struct { []const u8, *std.Build.Module }{
+        .{ "value", value_mod },   .{ "vm", vm_mod },         .{ "compile", compile_mod },
+        .{ "intern", intern_mod }, .{ "reader", reader_mod }, .{ "expand", expand_mod },
+        .{ "stdlib", stdlib_mod }, .{ "format", format_mod },
+    }) |imp| integration_nextomic_entity_mod.addImport(imp[0], imp[1]);
+    const integration_nextomic_entity_tests = b.addTest(.{ .root_module = integration_nextomic_entity_mod });
+    const run_integration_nextomic_entity_tests = b.addRunArtifact(integration_nextomic_entity_tests);
+    nextomic_test_step.dependOn(&run_integration_nextomic_entity_tests.step);
+
     // The numeric tower end to end: promotion, demotion, contagion,
     // literals, printing, predicates, conversions and the codec.
     const numbers_mod = b.createModule(.{
@@ -1450,6 +1467,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_integration_nextomic_q_tests.step);
     test_step.dependOn(&run_integration_nextomic_pull_tests.step);
     test_step.dependOn(&run_integration_nextomic_fn_tests.step);
+    test_step.dependOn(&run_integration_nextomic_entity_tests.step);
     test_step.dependOn(&run_prop_compile_tests.step);
     test_step.dependOn(&run_integration_eval_tests.step);
     test_step.dependOn(&run_runtime_polish_tests.step);

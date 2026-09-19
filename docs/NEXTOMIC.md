@@ -646,6 +646,7 @@ test/integration/nextomic_fx.zig    the fixture the corpora share
 test/integration/nextomic_q.zig     query corpus vs a naive evaluator
 test/integration/nextomic_pull.zig  pull corpus vs a naive evaluator
 test/integration/nextomic_fn.zig    transaction functions, cas, schema alteration, excision, full-text
+test/integration/nextomic_entity.zig the lazy entity through the pipeline, and under the collector's stress policy
 test/nextomic/*.nx             end-to-end scripts
 ```
 
