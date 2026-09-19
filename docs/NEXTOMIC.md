@@ -536,7 +536,9 @@ sub-plans with the same output variables.
 | `(d/db conn)` | db-value at the current basis |
 | `(d/basis-t db)` | the basis |
 | `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report. tx-data forms: `[:db/add e a v]`, `[:db/retract e a v?]`, `[:db/retractEntity e]`, `[:db.fn/call f arg ...]`, `[:db.fn/cas e a old new]` and map forms |
-| `(d/entity db e)` | the map `{:db/id e :attr v ...}`, card-many as sets, refs as eids; nil when the entity has no datoms in this view; `:nextomic/history-view` on a history db. Access is eager: the map is read from the view in one read when `entity` returns, so `(:attr ent)`, `(get ent :attr)`, `(keys ent)` and `(into {} ent)` are map operations that open nothing, and a later transaction never changes the map. It is a plain map, equal by content: two entity maps of one entity from views that agree are equal, and maps from views that differ are not; a ref is the eid, not a map, so the referred entity is read with another `entity` call |
+| `(d/entity db e)` | a lazy entity: a value of the `nextomic_entity` kind holding the db-value and the eid, whose attributes are read on access; nil when the entity has no datoms in this view (one read resolves `e`, an eid, ident or lookup ref under the entity contract `pull` states, and confirms a datom); `:nextomic/history-view` on a history db. `(:attr ent)`, `(get ent :attr default)` and `(contains? ent :attr)` open one read at the entity's basis and mode and fold that attribute: a card-many value is a set, a ref is a lazy entity of the same db-value, so `(:addr/city (:person/home ent))` navigates and `(map :db/id (:person/friends ent))` names the referents; an attribute the entity lacks, an unknown attribute or a non-keyword key yields the default (nil for `contains?`, false); `(:db/id ent)` is the eid and opens nothing. `(keys ent)`, `(vals ent)`, `(seq ent)` (entries as `[k v]`), `(count ent)` (attributes plus `:db/id`) and `(into {} ent)` read every attribute in one pass, refs as entities. Reverse refs (`:ns/_attr`) belong to `pull`: an entity has none. `(map? ent)` is false and `assoc`/`dissoc`/`find` take the map `touch` returns. The db-value is fixed, so a later transaction never changes what an entity reads; a released connection, or a `with` scope that has ended, makes every access but `:db/id` `:nextomic/closed`. An entity is a value: two are equal when their db-values are equal and their eids agree (`(= (d/entity db e) (d/entity db e))`, `(= (:person/home ent) (d/entity db (:db/id (:person/home ent))))`), and hash accordingly; entities of views that differ are not equal |
+| `(d/touch ent)` | the map `{:db/id e :attr v ...}` of every attribute read in one pass, card-many as sets, refs as eids; `{:db/id e}` alone when the view holds no datom of `e` (a ref to an excised entity) |
+| `(d/entity-db ent)` | the db-value the entity reads through |
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
 | `(d/datoms db :eavt e a v tx added)` (index, its components in index order, then `tx` as a t or a transaction entity id and `added` as a boolean; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
 | `(d/index-range db attr start end)` | the AVET datoms of an indexed or unique attribute with `start <= v < end` in value order; a nil bound is open; another attribute is `:nextomic/tx-data` naming it, a bound of the wrong type `:nextomic/value-type` |
@@ -554,15 +556,19 @@ sub-plans with the same output variables.
 
 A connection prints as `#nextomic/conn "path"`, a db-value as
 `#nextomic/db {:basis-t 7 :mode :current}` (`:as-of`, `:since`,
-`:history` with their bounds). A connection is identity-valued; db-values
-are values, equal when they name the same connection, basis and mode.
+`:history` with their bounds), an entity as `#nextomic/entity {:db/id
+4294967296}`: the eid alone, since the attributes are read on access
+and `touch` prints them. A connection is identity-valued; db-values
+are values, equal when they name the same connection, basis and mode;
+entities are values, equal when their db-values are equal and their
+eids agree.
 
 Schema install is `transact!` of attribute entities: `{:db/ident
 :user/email :db/valueType :db.type/string :db/cardinality
 :db.cardinality/one :db/unique :db.unique/identity :db/index true}`;
 what a later transaction may change is §3 step 5.
 
-Later: a lazy entity kind, a datom heap kind.
+Later: a datom heap kind.
 
 ---
 
@@ -624,8 +630,8 @@ src/nextomic/
   excise.zig     §4 "Excision": the tree deletes and the txlog rewrite
   fulltext.zig   the tokenizer and the nx/fulltext rows: put, delete, search
   db.zig         DbValue, fold, datoms, entity, entid/ident, tx-range
-  handle.zig     heap bodies of the two value kinds; its own module
-                 `nextomic_handle` below dispatch/format/gc, so their
+  handle.zig     heap bodies of the three value kinds; its own module
+                 `nextomic_handle` below dispatch/format/gc/vm, so their
                  kind arms need nothing from the module above them
   marshal.zig    VM values to and from datom values: the entity, value and cell contracts
   relation.zig   columnar Relation
@@ -646,10 +652,17 @@ test/nextomic/*.nx             end-to-end scripts
 `nextomic` is one build module above `dispatch` and `vm`, imported by
 `stdlib` only; `cli` installs it through `stdlib.installNextomic` and
 bootstraps `stdlib/nextomic.nx` with the `nextomic` namespace current.
-Value kinds: `nextomic_conn`, `nextomic_db` (heap boxes from
-`handle.zig`; the connection box holds the `Conn` the VM owns on
-`vm.nextomic_connections` plus its path text, the db box that pointer
-and the basis/mode numbers; both are collector leaves). Nextomic never uses the
+Value kinds: `nextomic_conn`, `nextomic_db`, `nextomic_entity` (heap
+boxes from `handle.zig`; the connection box holds the `Conn` the VM
+owns on `vm.nextomic_connections` plus its path text, the db box that
+pointer and the basis/mode numbers, both collector leaves; the entity
+box holds its db box, the eid, the VM and the read hook `natives.zig`
+installs, and the map of its last full read, kept so an iteration over
+it survives a collection, and the collector marks the db box and that
+map). `vm.lookup` reaches the hook for `(:attr ent)` and `get`; the
+`stdlib` arms for `contains?`, `keys`, `vals`, `seq`, `count`, `empty?`
+and `into` call `natives.entityHas` and `natives.entityMap`, so every
+access is one read like any other native's. Nextomic never uses the
 `db/*` layer's per-operation tree opens or codec-encoded keys; it holds
 raw `*emdb.Txn` handles and byte keys, and uses `db.Connection` only for
 the `Env`.

@@ -4,7 +4,8 @@
 ; pull cut, lookup refs and idents as inputs, transaction entity ids as
 ; time arguments, the history view refusing entity and pull, reverse
 ; refs and nested maps in map forms, unique being card-one, cross-type
-; comparisons, the error payloads, and connect making the directory.
+; comparisons, the error payloads, an entity reading on access, and
+; connect making the directory.
 ; Runs from a scratch directory; the store is fresh.
 
 (require '[nextomic :as d])
@@ -110,19 +111,24 @@
                 {:db/id ann :user/boss {:user/email "eve@x" :user/name "Eve"}}])
 (def db2 (d/db c))
 (println (rows (d/q '[:find ?n :in $ ?f :where [?e :user/friends ?f] [?e :user/name ?n]] db2 [:user/email "cy@x"])))
-(println (:user/name (d/entity db2 (:user/boss (d/entity db2 bob)))))
-(println (:user/name (d/entity db2 (:user/boss (d/entity db2 ann)))))
+(println (:user/name (:user/boss (d/entity db2 bob))))
+(println (:user/name (:user/boss (d/entity db2 ann))))
 (println (:user/name (d/pull db2 '[:user/name] [:user/email "eve@x"])))
 
-; --- an entity is an eager map, equal by content -------------------------
+; --- an entity reads its attributes on access; touch is the map ----------
 (def ent (d/entity db2 bob))
+(println ent)
 (println [(:user/name ent) (get ent :user/nope :none) (sort (keys ent)) (:db/id ent) (count ent)])
-(check "an entity is a map" (and (map? ent) (= (into {} ent) ent) (contains? ent :user/email)))
-(check "entity maps of one view are equal" (= ent (d/entity db2 bob) (d/entity (d/db c) bob)))
-(check "an entity map from a view that differs is not" (not= ent (d/entity db bob)))
+(check "an entity is not a map; its touch is" (and (not (map? ent)) (map? (d/touch ent)) (contains? ent :user/email) (not (contains? ent :user/nope))))
+(def dee (d/entid db2 [:user/email "dee@x"]))
+(check "a ref reads as an entity of the same view" (= (:user/boss ent) (:user/boss (into {} ent)) (d/entity db2 dee)))
+(check "touch carries refs as eids" (and (= dee (:user/boss (d/touch ent)))
+                                         (= (dissoc (d/touch ent) :user/boss :user/friends) (dissoc (into {} ent) :user/boss :user/friends))))
+(check "entities of one view are equal" (= ent (d/entity db2 bob) (d/entity (d/db c) bob)))
+(check "an entity of a view that differs is not" (not= ent (d/entity db bob)))
+(check "entity-db is the view" (= db2 (d/entity-db ent)))
 (def r-age (d/transact! c [[:db/add bob :user/age 99]]))
-(check "the map is read once; a later transaction leaves it alone" (= [25 99] [(:user/age ent) (:user/age (d/entity (d/db c) bob))]))
-(check "assoc yields a new map, the entity map is unchanged" (= ["Bob" "Rob"] [(:user/name ent) (:user/name (assoc ent :user/name "Rob"))]))
+(check "the entity reads its own view; a later transaction shows through a newer db" (= [25 99] [(:user/age ent) (:user/age (d/entity (d/db c) bob))]))
 (d/transact! c [[:db/add bob :user/age 25]])
 
 ; --- the history view has no entities to map ----------------------------

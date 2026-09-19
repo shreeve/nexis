@@ -1,5 +1,6 @@
-; test/nextomic/basics.nx — connect, schema, transact!, entity, entid,
-; ident, schema. Runs from a scratch directory; the store is fresh.
+; test/nextomic/basics.nx — connect, schema, transact!, entity (lazy,
+; read on access; touch for the map), entid, ident, schema. Runs from a
+; scratch directory; the store is fresh.
 
 (require '[nextomic :as d])
 (require '[prelude :as t])
@@ -60,11 +61,18 @@
 (def ann (get (:tempids r1) "ann"))
 (def bob (get (:tempids r1) "bob"))
 (println (d/entity (d/db c) ann))
-(println (d/entity (d/db c) bob))
+(println (d/touch (d/entity (d/db c) ann)))
+(println (d/touch (d/entity (d/db c) bob)))
 (t/check "the transaction entity carries its doc"
        (= "first import" (:db/doc (d/entity (d/db c) (+ t/tx-partition (:tx r1))))))
-(t/check "a component entity is reachable through its ref"
-       (= "Rome" (:addr/city (d/entity (d/db c) (:person/home (d/entity (d/db c) ann))))))
+(t/check "a ref reads as an entity of the same view, so access navigates"
+       (= "Rome" (:addr/city (:person/home (d/entity (d/db c) ann)))))
+(t/check "entities of one view are equal; entity-db is the view"
+       (let [ent (d/entity (d/db c) ann)]
+         (and (= ent (d/entity (d/db c) ann))
+              (= (:person/home ent) (d/entity (d/db c) (:db/id (:person/home ent))))
+              (= (d/db c) (d/entity-db ent))
+              (not= ent (d/entity (d/db c) bob)))))
 (t/check "entity by lookup ref" (= ann (:db/id (d/entity (d/db c) [:person/email "ann@example.com"]))))
 (t/check "entity by unknown lookup ref is nil" (nil? (d/entity (d/db c) [:person/email "nobody@example.com"])))
 (t/check "entid by lookup ref" (= bob (d/entid (d/db c) [:person/email "bob@example.com"])))
@@ -96,12 +104,12 @@
                         [:db/add -1 :person/friends [:person/email "ann@example.com"]]
                         [:db/add [:person/email "bob@example.com"] :person/age 30]]))
 (println (:tempids r4))
-(t/check "ref by lookup ref resolves" (= #{ann} (:person/friends (d/entity (d/db c) (get (:tempids r4) -1)))))
+(t/check "ref by lookup ref resolves" (= #{ann} (set (map :db/id (:person/friends (d/entity (d/db c) (get (:tempids r4) -1)))))))
 (t/check "lookup ref in entity position" (= 30 (:person/age (d/entity (d/db c) bob))))
 
 ; retractEntity removes the entity's datoms, the refs pointing at it and
 ; its components.
-(def home (:person/home (d/entity (d/db c) ann)))
+(def home (:db/id (:person/home (d/entity (d/db c) ann))))
 (def r5 (d/transact! c [[:db/retractEntity ann]]))
 (println (count (facts r5)))
 (t/check "retracted entity is gone" (nil? (d/entity (d/db c) ann)))

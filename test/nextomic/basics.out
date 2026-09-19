@@ -14,10 +14,12 @@ ok ident of an unknown eid is nil
 ok entid of an unknown ident is nil
 {ann 4294967296, bob 4294967298}
 [[4294967296 :person/name Ann 3 true] [4294967296 :person/email ann@example.com 3 true] [4294967296 :person/height 1.7 3 true] [4294967296 :person/born 1000000 3 true] [4294967296 :person/tags :staff 3 true] [4294967296 :person/tags :admin 3 true] [4294967296 :person/photo raw bytes 3 true] [4294967296 :person/uuid 0123abcd-4567-89ef-0123-456789abcdef 3 true] [4294967297 :addr/city Rome 3 true] [4294967296 :person/home 4294967297 3 true] [4294967296 :person/age 41 3 true] [4294967296 :person/active true 3 true] [4294967298 :person/name Bob 3 true] [4294967298 :person/email bob@example.com 3 true] [4294967298 :person/friends 4294967296 3 true] [70368744177667 :db/doc first import 3 true]]
+#nextomic/entity {:db/id 4294967296}
 {:person/name Ann, :person/email ann@example.com, :person/height 1.7, :person/born 1000000, :person/tags #{:staff :admin}, :person/photo raw bytes, :person/uuid 0123abcd-4567-89ef-0123-456789abcdef, :person/home 4294967297, :person/age 41, :person/active true, :db/id 4294967296}
 {:db/id 4294967298, :person/name Bob, :person/email bob@example.com, :person/friends #{4294967296}}
 ok the transaction entity carries its doc
-ok a component entity is reachable through its ref
+ok a ref reads as an entity of the same view, so access navigates
+ok entities of one view are equal; entity-db is the view
 ok entity by lookup ref
 ok entity by unknown lookup ref is nil
 ok entid by lookup ref
