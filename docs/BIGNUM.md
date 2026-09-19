@@ -1,19 +1,19 @@
-## BIGNUM.md — Arbitrary-Precision Integer Heap Kind (Phase 1)
+## BIGNUM.md — Arbitrary-Precision Integer Heap Kind
 
-**Status**: Phase 1 deliverable. Authoritative body-layout and semantic
-contract for the `bignum` heap kind. Derivative from `PLAN.md` §8.3,
-`docs/VALUE.md` §2.2, `docs/SEMANTICS.md` §2.2 / §3.2, and `docs/HEAP.md`.
-Those documents win on conflict. This doc pins the rules that are specific
+**Status**: authoritative body-layout and semantic contract for the
+`bignum` heap kind. Derivative from `PLAN.md` §8.3, `docs/VALUE.md`
+§2.2, `docs/SEMANTICS.md` §2.2 / §3.2, and `docs/HEAP.md`. Those
+documents win on conflict. This doc pins the rules that are specific
 to bignums — most importantly the **canonicalization invariant** that
 makes the integer tower's equality and hash consistent without any
-cross-kind comparison.
+cross-kind comparison — and the arithmetic contract (§9) that the VM's
+numeric tower (`docs/VM.md` §10.3, `src/vm.zig`) builds on.
 
-Scope-frozen commitment: **this module ships construction + canonical
-form + equality + hash only.** Arithmetic operators (add/sub/mul) land
-in a separate commit, per peer-AI strategy review (conversation
-`nexis-phase-1` turn 6). General division, modulo, GCD, bitwise ops,
-modular exponentiation are deferred beyond v1 per PLAN §8.3 / peer-AI's
-early advice.
+The module ships construction, canonical form, equality, hash, the
+arithmetic `add sub mul quot rem mod neg abs`, ordering, conversion
+to and from f64 and i64, and decimal parsing and printing. GCD,
+bitwise operations and modular exponentiation are not part of v1
+(PLAN §8.3).
 
 ---
 
@@ -35,7 +35,7 @@ Consequences that the implementation must enforce without exception:
 
 Every code path that could construct a bignum goes through exactly
 one canonicalization function (§3). Arithmetic results, codec decode
-(Phase 4), and direct API constructors all funnel there. If any path
+and direct API constructors all funnel there. If any path
 bypasses it, integer equality silently breaks.
 
 ---
@@ -56,7 +56,7 @@ const BignumBody = extern struct {
 - **u64 limbs** — natural on the 64-bit-only target.
 - **`negative` is a byte holding 0 or 1 only**; `isNegative(v)` reads this byte and safe-asserts the value is in `{0, 1}`.
 - **Limb count is inferred** from body length: `limb_count = (body.len - 8) / 8`. No redundant count field in the body.
-- **`_pad` is semantically invisible** — hashing and equality explicitly ignore it (peer-AI turn-6 review catch: hashing raw body bytes would bake layout detail into the hash output).
+- **`_pad` is semantically invisible** — hashing and equality explicitly ignore it: hashing raw body bytes would bake layout detail into the hash output.
 
 **Canonical constraints** (every bignum on the heap satisfies all of these):
 
@@ -142,6 +142,32 @@ bignum-specific error conditions.
 
 ---
 
+
+**Arithmetic, ordering and conversion** (§9). Every integer operand
+may be a fixnum or a bignum; every result is canonical.
+
+```zig
+pub const Limb = std.math.big.Limb;        // u64 on the 64-bit target
+pub fn view(v: Value, scratch: *[1]Limb) std.math.big.int.Const;
+pub fn isInteger(v: Value) bool;
+pub fn fromI128(heap: *Heap, n: i128) !Value;
+pub fn add(heap: *Heap, a: Value, b: Value) !Value;
+pub fn sub(heap: *Heap, a: Value, b: Value) !Value;
+pub fn mul(heap: *Heap, a: Value, b: Value) !Value;
+pub fn quot(heap: *Heap, a: Value, b: Value) !Value;   // truncated quotient
+pub fn rem(heap: *Heap, a: Value, b: Value) !Value;    // dividend's sign
+pub fn mod(heap: *Heap, a: Value, b: Value) !Value;    // divisor's sign
+pub fn neg(heap: *Heap, a: Value) !Value;
+pub fn abs(heap: *Heap, a: Value) !Value;
+pub fn compare(a: Value, b: Value) std.math.Order;
+pub fn isEven(v: Value) bool;
+pub fn toF64(v: Value) f64;
+pub fn fromF64(heap: *Heap, f: f64) !?Value;           // null for NaN / ±Inf
+pub fn toI64(v: Value) ?i64;
+pub fn formatDecimal(v: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void;
+pub fn parseDecimal(heap: *Heap, text: []const u8) !?Value;
+```
+
 ### 5. Hash — semantic bytes only
 
 SEMANTICS.md §3.2: "xxHash3-32 over the canonical magnitude byte stream
@@ -153,7 +179,7 @@ hash_input := [negative_byte] ++ limbs_as_little_endian_bytes
 
 Where `limbs_as_little_endian_bytes` is `std.mem.sliceAsBytes(limbs)` on
 our LE-only target. The `_pad` bytes from the body are **not** fed into
-the hash. Peer-AI turn-6 caught this: hashing raw body memory would
+the hash: hashing raw body memory would
 leak the 7 pad bytes into the hash output and couple hash stability to
 layout detail.
 
@@ -223,27 +249,43 @@ and no new domain byte — bignum uses the kind-byte domain like string.
 
 ---
 
-### 9. Deferred, explicitly
+### 9. Arithmetic
 
-Not in this commit; each has its own landing path:
+The limb arithmetic is `std.math.big.int`. A heap bignum's body —
+sign byte, padding, little-endian `u64` limbs — is read in place as a
+`big.int.Const` (`view`); a fixnum is viewed through a one-limb
+scratch cell. Results are computed into a scratch buffer (on the
+stack up to 64 limbs, from the heap's backing allocator beyond) and
+copied onto the heap once through `canonicalizeToValue`, so every
+result obeys §1 by construction: `(- (+ a b) b)` is a fixnum again
+whenever `a` was, and a zero result is `fixnum(0)` whatever the signs
+of the operands.
 
-- **Arithmetic operators** (`add`, `sub`, `mul`). Next session. Requires:
-  - `add(Value, Value)` covering fixnum+fixnum, fixnum+bignum, bignum+bignum with
-    overflow-promotion and result canonicalization.
-  - Subtraction with result canonicalization back down into fixnum range
-    when applicable.
-  - Schoolbook multiplication with canonicalization of the result.
-- **Division / modulo / GCD / bitwise / modular exponentiation.** Out of
-  scope for v1 per PLAN §8.3 + peer-AI advice. Candidate for v2.
-- **Print / read round-trip.** The reader currently only lexes integer
-  literals up to i64 range; bignum literals require a reader extension
-  (lexer → arbitrary-precision decimal parse → `fromLimbs`). Lives with
-  the arithmetic commit.
-- **Cross-type numeric `==`** (`(= 1 1.0)` opt-in). v2 per PLAN §23 #11.
+Semantics, matching Clojure's `Numbers` for BigInt:
 
----
+- `add`, `sub`, `mul`: exact.
+- `quot`: truncated quotient; `rem`: remainder of truncated division,
+  the dividend's sign; `mod`: remainder of floored division, the
+  divisor's sign. A zero divisor is the caller's error to raise
+  (`:divide-by-zero`); the functions assert it away.
+- `neg`, `abs`: `(neg fixnum_min)` and `(abs fixnum_min)` are the
+  fixnum inputs whose results promote (2⁴⁷).
+- `compare`: exact ordering of any two integers.
+- `toF64`: the nearest double, ties to even; an infinity beyond
+  f64's range. `fromF64`: the integer part of a finite double
+  (toward zero), `null` for NaN and the infinities.
+- `toI64`: the value when it fits, `null` otherwise.
+- `formatDecimal` / `parseDecimal`: decimal text with a leading `-`
+  for a negative value and no suffix; the parser accepts exactly
+  `-?[0-9]+` and returns `null` for anything else.
 
-### 10. Property test coverage (this commit)
+The VM's tower (`src/vm.zig` `numAdd` … `numCompare`) keeps the
+fixnum × fixnum fast path in `i64` and reaches this module only when
+a result leaves the fixnum range or an operand is already a bignum;
+any float operand takes the f64 path instead (SEMANTICS §2.2
+contagion), with `toF64` widening a bignum operand.
+
+### 10. Property test coverage
 
 Alongside the module:
 
@@ -268,11 +310,12 @@ Alongside the module:
 
 ### 11. What BIGNUM.md does not cover
 
-- **Arithmetic semantics.** Lands with the arithmetic commit.
-- **Printing and reader extension.** Tied to the arithmetic commit.
 - **Multi-precision floats, rationals, decimals.** Not in v1 per
   PLAN §8.3.
 - **Interned small bignums.** Not applicable — canonicalization
   prevents small-magnitude bignums from existing at all.
 - **Metadata.** Bignums are not metadata-attachable per PLAN §8.5 /
   SEMANTICS §7.
+- **Literals.** The reader and compiler own the literal path
+  (`docs/FORMS.md` §3, `docs/SEMANTICS.md` §6); this module only
+  parses the decimal text they hand it.
