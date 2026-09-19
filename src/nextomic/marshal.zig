@@ -35,6 +35,8 @@ const db_mod = @import("db.zig");
 const schema_mod = @import("schema.zig");
 const relation = @import("relation.zig");
 
+const idents_mod = @import("idents.zig");
+
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
 const Read = db_mod.Read;
@@ -42,6 +44,10 @@ const Fault = db_mod.Fault;
 const Attr = schema_mod.Attr;
 const Val = key.Val;
 const Cell = relation.Cell;
+
+/// Everything a conversion can fail with: the contract's own errors,
+/// the store's, and allocation.
+pub const Error = error{ NoEntity, UnknownAttribute, TxData, ValueType, KindMismatch, Corrupted } || key.EncodeError || key.DecodeError || Allocator.Error || db_mod.ErrorsOf(Read.entid) || db_mod.ErrorsOf(Read.attr) || db_mod.ErrorsOf(idents_mod.Idents.idOf);
 
 // =============================================================================
 // Sequences
@@ -99,7 +105,7 @@ pub fn attrOf(rd: *Read, v: Value, fault: *Fault) !Attr {
 }
 
 /// The entity `v` refers to (see the module contract).
-pub fn entity(rd: *Read, arena: Allocator, v: Value, fault: *Fault) anyerror!?u64 {
+pub fn entity(rd: *Read, arena: Allocator, v: Value, fault: *Fault) Error!?u64 {
     switch (v.kind()) {
         .fixnum => {
             const n = v.asFixnum();
@@ -130,7 +136,7 @@ pub fn entity(rd: *Read, arena: Allocator, v: Value, fault: *Fault) anyerror!?u6
 
 /// The datom value of a VM value under type `vt` (see the module
 /// contract).
-pub fn valOf(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *Fault) anyerror!?Val {
+pub fn valOf(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *Fault) Error!?Val {
     switch (vt) {
         .boolean => {
             if (!v.isBool()) return error.ValueType;
@@ -180,7 +186,7 @@ pub fn valOf(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *F
 /// The datom value of `cell` under type `vt` (see the module contract).
 /// Keywords are resolved through the store's idents; an unknown ident
 /// is null.
-pub fn encodeCell(read: *Read, cell: Cell, vt: key.ValueType) anyerror!?Val {
+pub fn encodeCell(read: *Read, cell: Cell, vt: key.ValueType) Error!?Val {
     return switch (vt) {
         .boolean => if (cell == .boolean) .{ .boolean = cell.boolean } else null,
         .long => if (cell == .int) .{ .long = cell.int } else null,

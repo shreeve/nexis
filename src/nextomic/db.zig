@@ -51,6 +51,12 @@ pub const SyncMode = store_mod.SyncMode;
 // =============================================================================
 
 /// The Nextomic error set; each maps to a `:nextomic/*` keyword.
+/// The error set of `f`, for naming a module's failures by the
+/// operations it performs.
+pub fn ErrorsOf(comptime f: anytype) type {
+    return @typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?).error_union.error_set;
+}
+
 /// What an operation was looking at when it failed, for the error
 /// payload the program sees (NEXTOMIC.md §7). A caller that wants the
 /// detail passes one in; every field is set only when the failing

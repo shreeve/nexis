@@ -71,6 +71,10 @@ pub const Error = error{
     Nested,
 };
 
+/// Everything a transaction can fail with: its own errors, the
+/// db-value's, the value contract's and the store's.
+pub const Failure = Error || db_mod.Error || marshal.Error || db_mod.ErrorsOf(Minter.lookup) || db_mod.ErrorsOf(Minter.resolve) || db_mod.ErrorsOf(Minter.lookupName) || db_mod.ErrorsOf(Store.scan) || db_mod.ErrorsOf(Txn.getFromTree) || db_mod.ErrorsOf(Store.currentPayload) || db_mod.ErrorsOf(champ.mapEmpty);
+
 pub const Options = struct {
     /// Overrides the connection's sync mode for this commit.
     sync: ?SyncMode = null,
@@ -620,7 +624,7 @@ const Ctx = struct {
     /// Expand a map form into adds; returns the entity. A key
     /// `:ns/_attr` is a reverse ref: its value names the entities that
     /// refer to this one through `:ns/attr`.
-    fn normaliseMap(self: *Ctx, m: Value) anyerror!Ent {
+    fn normaliseMap(self: *Ctx, m: Value) Failure!Ent {
         var ent: ?Ent = null;
         var it = champ.mapIter(m);
         while (it.next()) |entry| {
@@ -669,7 +673,7 @@ const Ctx = struct {
 
     /// `[referrer attr e]` for one value under a reverse ref: an entity,
     /// or a map form of one.
-    fn addReverse(self: *Ctx, e: Ent, attr: Attr, referrer: Value) anyerror!void {
+    fn addReverse(self: *Ctx, e: Ent, attr: Attr, referrer: Value) Failure!void {
         const from = if (referrer.kind() == .persistent_map) try self.normaliseMap(referrer) else try self.entityFromVm(referrer);
         try self.ops.append(self.arena, .{ .add = .{ .e = from, .attr = attr, .v = pvalOf(e) } });
     }
@@ -709,7 +713,7 @@ const Ctx = struct {
     /// One value under `attr`. A nested map under a ref attribute is an
     /// entity; unless the attribute is a component it must carry an
     /// identity, or nothing could ever reach it.
-    fn addFromVm(self: *Ctx, e: Ent, attr: Attr, v: Value) anyerror!void {
+    fn addFromVm(self: *Ctx, e: Ent, attr: Attr, v: Value) Failure!void {
         if (v.kind() == .persistent_map and attr.value_type == .ref) {
             if (!attr.component and !try self.carriesIdentity(v)) return self.malformed("a nested map under a non-component ref needs :db/id or a unique attribute");
             const nested = try self.normaliseMap(v);
@@ -731,7 +735,7 @@ const Ctx = struct {
         };
     }
 
-    fn entityFromVm(self: *Ctx, v: Value) anyerror!Ent {
+    fn entityFromVm(self: *Ctx, v: Value) Failure!Ent {
         switch (v.kind()) {
             .fixnum => {
                 const n = v.asFixnum();
@@ -757,7 +761,7 @@ const Ctx = struct {
     }
 
     /// Convert a VM value by the attribute's type.
-    fn valueFromVm(self: *Ctx, attr: Attr, v: Value) anyerror!PVal {
+    fn valueFromVm(self: *Ctx, attr: Attr, v: Value) Failure!PVal {
         switch (attr.value_type) {
             .boolean => {
                 if (!v.isBool()) return error.ValueType;
@@ -1145,7 +1149,7 @@ const Ctx = struct {
         }
     }
 
-    fn expandRetractEntity(self: *Ctx, e: u64, seen: *std.AutoHashMapUnmanaged(u64, void)) anyerror!void {
+    fn expandRetractEntity(self: *Ctx, e: u64, seen: *std.AutoHashMapUnmanaged(u64, void)) Failure!void {
         if ((try seen.getOrPut(self.arena, e)).found_existing) return;
         var components: std.ArrayList(u64) = .empty;
         // Its own datoms.

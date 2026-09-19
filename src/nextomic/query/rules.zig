@@ -37,6 +37,7 @@ const RuleSet = ir.RuleSet;
 const Ctx = plan_mod.Ctx;
 const Plan = plan_mod.Plan;
 const Step = plan_mod.Step;
+const Failure = plan_mod.Failure;
 const Relation = relation.Relation;
 
 /// Planner cost of a recursive rule call: after every pattern that
@@ -207,7 +208,7 @@ fn defsOf(ctx: *Ctx, name: u32, args: []const ir.Arg) ![]const ir.Rule {
 
 /// The planner's cost for calling `name`, or null while a required
 /// argument is unbound.
-pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: []const Var) anyerror!?u64 {
+pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: []const Var) Failure!?u64 {
     const defs = try defsOf(ctx, name, args);
     for (args[0..defs[0].required]) |a| {
         if (a == .variable and !ir.containsVar(bound, a.variable)) return null;
@@ -219,7 +220,7 @@ pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: []const V
 
 /// Append the steps of a rule call: grounding binds for constant
 /// arguments, then an `or` (non-recursive) or a `fix` (recursive).
-pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) anyerror!void {
+pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
     const defs = try defsOf(ctx, name, args);
     const arg_vars = try ctx.arena.alloc(Var, args.len);
     for (args, arg_vars) |a, *v| {
@@ -289,7 +290,7 @@ pub const Fix = struct {
     fresh: []const Var,
 };
 
-fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, bound: []const Var, rows: u64) anyerror!Fix {
+fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, bound: []const Var, rows: u64) Failure!Fix {
     const info = try ctx.ruleInfo();
     const members = try info.members(ctx.arena, name);
 
@@ -413,13 +414,13 @@ const Renamer = struct {
         return out;
     }
 
-    fn clauses(self: *Renamer, cs: []const Clause) anyerror![]Clause {
+    fn clauses(self: *Renamer, cs: []const Clause) Failure![]Clause {
         var out: std.ArrayList(Clause) = .empty;
         for (cs) |c| try self.clause(c, &out);
         return out.toOwnedSlice(self.ctx.arena);
     }
 
-    fn clause(self: *Renamer, c: Clause, out: *std.ArrayList(Clause)) anyerror!void {
+    fn clause(self: *Renamer, c: Clause, out: *std.ArrayList(Clause)) Failure!void {
         const arena = self.ctx.arena;
         switch (c) {
             .pattern => |p| try out.append(arena, .{ .pattern = .{

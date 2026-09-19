@@ -22,6 +22,9 @@
 //!   - `finish` forms the basis set (distinct tuples over the find and
 //!     `:with` variables), groups and aggregates it, and copies the
 //!     result into the VM heap as the find spec asks.
+//!
+//! Every function on a path to the call hook is `anyerror`: the hook
+//! raises whatever the VM raises, and that passes through untouched.
 
 const std = @import("std");
 const value = @import("value");

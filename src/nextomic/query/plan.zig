@@ -59,6 +59,10 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// Everything planning can fail with: the planner's own errors and
+/// the store's, through the attribute and constant lookups.
+pub const Failure = Error || marshal.Error || db_mod.ErrorsOf(marshal.cellOf) || db_mod.ErrorsOf(Interner.internSymbol) || db_mod.ErrorsOf(store_mod.Store.treeEntries);
+
 // =============================================================================
 // Steps
 // =============================================================================
@@ -262,7 +266,7 @@ pub const Ctx = struct {
 
 /// Plan `query` for `read`. The returned plan starts from the relation
 /// over the `:in` variables.
-pub fn plan(ctx: *Ctx, query: *const Ir) anyerror!*Plan {
+pub fn plan(ctx: *Ctx, query: *const Ir) Failure!*Plan {
     var bound: std.ArrayList(Var) = .empty;
     for (query.in) |b| switch (b) {
         .scalar, .collection => |v| try ir.addVar(ctx.arena, &bound, v),
@@ -275,7 +279,7 @@ pub fn plan(ctx: *Ctx, query: *const Ir) anyerror!*Plan {
 }
 
 /// Plan `clauses` starting from a relation over `input`.
-pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: u64) anyerror!*Plan {
+pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: u64) Failure!*Plan {
     const out = try ctx.arena.create(Plan);
     var bound: std.ArrayList(Var) = .empty;
     try bound.appendSlice(ctx.arena, input);
@@ -291,7 +295,7 @@ const Pending = struct {
     done: bool = false,
 };
 
-fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) anyerror!void {
+fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
     const pending = try ctx.arena.alloc(Pending, clauses.len);
     for (clauses, pending) |c, *p| p.* = .{ .clause = c };
 
@@ -415,7 +419,7 @@ fn clampRows(n: u128) u64 {
     return if (n > std.math.maxInt(u64) / 4) std.math.maxInt(u64) / 4 else @intCast(n);
 }
 
-fn placeRule(ctx: *Ctx, r: anytype, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) anyerror!void {
+fn placeRule(ctx: *Ctx, r: anytype, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
     try rules_mod.planCall(ctx, r.name, r.args, bound, steps, rows);
 }
 
@@ -470,7 +474,7 @@ fn orJoin(ctx: *Ctx, o: anytype) ![]const Var {
 
 /// Plan an `or`: every branch starts from the join variables already
 /// bound and must end with every join variable bound.
-pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: []const Var, rows: u64) anyerror!Step {
+pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: []const Var, rows: u64) Failure!Step {
     var bound_join: std.ArrayList(Var) = .empty;
     for (join) |v| {
         if (ir.containsVar(bound, v)) try bound_join.append(ctx.arena, v);
@@ -487,7 +491,7 @@ pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: 
     return .{ .@"or" = .{ .join = join, .bound = try bound_join.toOwnedSlice(ctx.arena), .fresh = fresh, .branches = plans } };
 }
 
-fn orEstimate(ctx: *Ctx, o: anytype, bound: []const Var) anyerror!u64 {
+fn orEstimate(ctx: *Ctx, o: anytype, bound: []const Var) Failure!u64 {
     var total: u64 = 0;
     for (o.branches) |br| total +|= try clausesEstimate(ctx, br, bound);
     return total;
@@ -495,7 +499,7 @@ fn orEstimate(ctx: *Ctx, o: anytype, bound: []const Var) anyerror!u64 {
 
 /// The smallest pattern estimate among `clauses` given `bound`; 1 for a
 /// branch without runnable patterns.
-pub fn clausesEstimate(ctx: *Ctx, clauses: []const Clause, bound: []const Var) anyerror!u64 {
+pub fn clausesEstimate(ctx: *Ctx, clauses: []const Clause, bound: []const Var) Failure!u64 {
     var best: u64 = std.math.maxInt(u64);
     for (clauses) |c| {
         const est: u64 = switch (c) {
@@ -602,7 +606,7 @@ fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !u64 {
     return (try choose(ctx, p, bound)).estimate;
 }
 
-fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) anyerror!Scan {
+fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) Failure!Scan {
     const choice = try choose(ctx, p, bound);
     const hash_choice: ?Choice = choose(ctx, p, &.{}) catch |err| switch (err) {
         error.UnboundPattern => null,
@@ -660,7 +664,7 @@ fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) anyerror!Scan {
 
 /// Resolve a pattern constant at position `pos` (0 e, 1 a, 2 v, 3 tx,
 /// 4 added). Null when no datom can carry it.
-fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) anyerror!?Const {
+fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) Failure!?Const {
     switch (pos) {
         0 => {
             const eid = (try resolveEntity(ctx, c)) orelse return null;
@@ -706,7 +710,7 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) anyerror!?Co
 /// An entity id from an entity-position constant: an integer, a
 /// keyword ident or a lookup ref. Null when the view has no such
 /// entity.
-pub fn resolveEntity(ctx: *Ctx, c: ir.Constant) anyerror!?u64 {
+pub fn resolveEntity(ctx: *Ctx, c: ir.Constant) Failure!?u64 {
     switch (c) {
         .cell => |cell| switch (cell) {
             .int => |n| {
@@ -735,7 +739,7 @@ pub fn resolveEntity(ctx: *Ctx, c: ir.Constant) anyerror!?u64 {
 
 /// The datom value of constant `c` under an attribute of type `vt`, or
 /// null when no value of that type equals it.
-pub fn resolveTyped(ctx: *Ctx, c: ir.Constant, vt: key.ValueType) anyerror!?key.Val {
+pub fn resolveTyped(ctx: *Ctx, c: ir.Constant, vt: key.ValueType) Failure!?key.Val {
     switch (c) {
         .lookup => {
             if (vt != .ref) return null;
@@ -766,7 +770,7 @@ fn indent(w: *std.Io.Writer, depth: usize) !void {
     while (i < depth) : (i += 1) try w.writeAll("  ");
 }
 
-pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usize) anyerror!void {
+pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usize) (Failure || std.Io.Writer.Error)!void {
     for (p.steps, 1..) |step, num| {
         try indent(w, depth);
         try w.print("{d}. ", .{num});
