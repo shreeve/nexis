@@ -438,6 +438,15 @@ test "integration: variadic & rest" {
     try expectOutput("((fn* [x & xs] x) 1 2 3)", "1");
 }
 
+test "integration: recur into a variadic fn passes the rest param one seq" {
+    // COMPILER.md §5.6: the rest slot is the last binding of the
+    // target; `(next r)` lands in `r` as it is.
+    try expectOutput("((fn [& r] (if (seq r) (recur (next r)) :done)) 1 2 3)", ":done");
+    try expectOutput("((fn [acc & r] (if (seq r) (recur (+ acc (first r)) (next r)) acc)) 0 1 2 3)", "6");
+    try expectOutput("((fn [acc & r] (if (seq r) (recur (+ acc (first r)) (rest r)) acc)) 0 1 2 3)", "6");
+    try expectProgramError("(fn [x & r] (recur x))", compile.CompileError.RecurArityMismatch);
+}
+
 // =============================================================================
 // Vars and definitions
 // =============================================================================

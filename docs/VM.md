@@ -914,7 +914,9 @@ WITHOUT growing the call stack.
 
 **Compiler validation** (`COMPILER.md` §4.4):
 - `recur` MUST be in tail position of its target.
-- `recur`'s arity MUST match the target's binding count.
+- `recur`'s arity MUST match the target's binding count; a
+  variadic `fn*`'s rest param is one binding and receives the
+  seq passed.
 - Errors: `RecurOutsideTail`, `RecurArityMismatch`.
 
 **Codegen lowering** (`COMPILER.md` §5.6):

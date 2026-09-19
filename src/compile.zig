@@ -58,7 +58,6 @@
 //!   - The slot allocator is monotonic: each fresh result slot bumps
 //!     `slot_count`; branch-local temps are not reclaimed across the
 //!     merge point. Constants are not deduplicated.
-//!   - `recur` targeting a variadic fn raises `UnsupportedFeature`.
 //!   - The primitive `try` takes one `(catch any binding ...)`; the
 //!     expander lowers several catch clauses and keyword matchers
 //!     onto it (MACROEXPAND.md §8b). A catch binding captured by an
@@ -403,6 +402,10 @@ pub const CapturedName = struct {
 ///   - all other positions: pass `null` (recur invalid here)
 pub const RecurTarget = struct {
     entry_pc: u12,
+    /// The slots `recur` rebinds, in argument order: a loop's
+    /// bindings, or a fn's fixed params followed by its rest
+    /// slot when it has one (the rest slot takes the seq `recur`
+    /// passes, exactly as it would take any value).
     binding_slots: []const u12,
     /// Per-binding flag: true iff binding's slot holds a
     /// `*UpvalCell` (pre-analysis found a descendant fn
@@ -412,13 +415,6 @@ pub const RecurTarget = struct {
     /// + COMPILER.md §5.6 captured-recur semantics).
     captured_mask: []const bool,
     kind: RecurTargetKind,
-    /// True iff this fn target belongs to a variadic fn.
-    /// `compileRecur` rejects any recur targeting a variadic fn
-    /// with `UnsupportedFeature` (variadic recur would have to
-    /// rebuild the rest list per iteration; it is rejected
-    /// explicitly rather than lowered wrongly). Always false for
-    /// loop targets (loops never variadic).
-    variadic: bool = false,
 };
 
 pub const RecurTargetKind = enum { loop_star, fn_star };
@@ -483,9 +479,8 @@ pub const CompileError = error{
     /// revalidation — recur is not a call opcode).
     RecurArityMismatch,
 
-    /// A feature is recognized but not lowered. Raised for
-    /// `(recur ...)` targeting a variadic fn, a non-`any` catch
-    /// matcher, a catch binding captured by an inner fn, a
+    /// A feature is recognized but not lowered. Raised for a
+    /// non-`any` catch matcher, a catch binding captured by an inner fn, a
     /// `letfn*` binding with a rest param, quoted symbols /
     /// keywords / strings without an Interner or Heap, and
     /// `reader.Form` datums that only the expander consumes
@@ -3970,9 +3965,6 @@ fn compileRecur(
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
     const target = recur_target orelse return CompileError.RecurOutsideTail;
-    // Variadic-fn-target recur is rejected: proper lowering
-    // would have to rebuild the rest list per iteration.
-    if (target.variadic) return CompileError.UnsupportedFeature;
     if (args.len != target.binding_slots.len) return CompileError.RecurArityMismatch;
 
     // Evaluate each arg into a fresh temp slot. Using temps
@@ -4190,18 +4182,23 @@ fn compileFn(
     // back must NOT re-box params (would lose the previous
     // iteration's mutated cell pointer); it must land where the
     // body begins reading.
-    // RecurTarget covers only FIXED params. For
-    // variadic fns the `variadic` flag is true; compileRecur
-    // raises `UnsupportedFeature` rather than emit subtly-wrong
-    // code that rebinds fixed params but leaves the rest list
-    // stale.
-    const param_slots = try parent.allocator.alloc(u12, params.len);
+    // The target covers the fixed params and, for a variadic fn,
+    // the rest slot as one more binding: `(recur a b s)` into
+    // `(fn* [a b & r] ...)` installs `s` in `r`'s slot as it is,
+    // so the rest param receives whatever seq the recur passes
+    // (COMPILER.md §5.6).
+    const binding_count = params.len + @as(usize, if (rest_param != null) 1 else 0);
+    const param_slots = try parent.allocator.alloc(u12, binding_count);
     defer parent.allocator.free(param_slots);
-    const captured_mask = try parent.allocator.alloc(bool, params.len);
+    const captured_mask = try parent.allocator.alloc(bool, binding_count);
     defer parent.allocator.free(captured_mask);
     for (params, 0..) |p, i| {
         param_slots[i] = @intCast(i); // fixed params live at slots 0..fixed_arity-1
         captured_mask[i] = captured_in_body.contains(p);
+    }
+    if (rest_param) |rp| {
+        param_slots[params.len] = @intCast(params.len);
+        captured_mask[params.len] = captured_in_body.contains(rp);
     }
     const fn_entry_pc = try child.checkJumpTarget(child.currentPc());
     const fn_target = RecurTarget{
@@ -4209,7 +4206,6 @@ fn compileFn(
         .binding_slots = param_slots,
         .captured_mask = captured_mask,
         .kind = .fn_star,
-        .variadic = rest_param != null,
     };
 
     // Allocate a fresh result slot for the body so a self-move
@@ -5265,8 +5261,32 @@ test "compile variadic: duplicate rest+fixed name → DuplicateParam" {
     try testing.expectError(CompileError.DuplicateParam, compileTiny(arena.allocator(), &fn_form));
 }
 
-test "compile variadic: recur in variadic fn body → UnsupportedFeature" {
-    // (fn* [a & r] (recur 1)) — variadic recur is unsupported.
+test "compile variadic: recur into a variadic fn rebinds the rest slot with its last argument" {
+    // ((fn* [a & r] (if (< a 1) (recur (+ a 1) 42) r)) 0 7) → 42:
+    // the recur count is fixed params + 1 and the last argument
+    // lands in the rest slot as it is (COMPILER.md §5.6).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "a" }, .rhs = &.{ .int = 1 } } };
+    const recur_form: Tiny = .{ .recur = .{ .args = &.{ &a_plus_1, &.{ .int = 42 } } } };
+    const cond: Tiny = .{ .lt = .{ .lhs = &.{ .symbol = "a" }, .rhs = &.{ .int = 1 } } };
+    const body: Tiny = .{ .if_ = .{
+        .test_ = &cond,
+        .then = &recur_form,
+        .else_ = &.{ .symbol = "r" },
+    } };
+    const fn_form: Tiny = .{ .fn_star = .{
+        .params = &.{"a"},
+        .rest_param = "r",
+        .body = &body,
+    } };
+    const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{ &.{ .int = 0 }, &.{ .int = 7 } } } };
+    const result = try runTiny(&arena, &call_form);
+    try testing.expectEqual(@as(i64, 42), result.asFixnum());
+}
+
+test "compile variadic: a recur into a variadic fn that omits the rest argument is RecurArityMismatch" {
+    // (fn* [a & r] (recur 1)) — the target has two bindings.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const recur_form: Tiny = .{ .recur = .{ .args = &.{&.{ .int = 1 }} } };
@@ -5275,12 +5295,10 @@ test "compile variadic: recur in variadic fn body → UnsupportedFeature" {
         .rest_param = "r",
         .body = &recur_form,
     } };
-    try testing.expectError(CompileError.UnsupportedFeature, compileTiny(arena.allocator(), &fn_form));
+    try testing.expectError(CompileError.RecurArityMismatch, compileTiny(arena.allocator(), &fn_form));
 }
 
-test "compile variadic: recur in NON-variadic fn body is unaffected by the variadic rejection" {
-    // The variadic-recur rejection must not affect ordinary
-    // fn-recur.
+test "compile variadic: recur in a non-variadic fn body rebinds the fixed params" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const n_plus_1: Tiny = .{ .add = .{ .lhs = &.{ .symbol = "n" }, .rhs = &.{ .int = 1 } } };
