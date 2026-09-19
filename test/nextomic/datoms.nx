@@ -1,0 +1,51 @@
+; test/nextomic/datoms.nx — datoms with the tx and added components
+; on every view, and index-range over an indexed attribute. Runs from
+; a scratch directory; the store is fresh.
+
+(require '[nextomic :as d])
+(require '[prelude :as t])
+
+(def c (d/connect "datoms.edb"))
+(d/transact! c [{:db/ident :item/sku :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+                 :db/unique :db.unique/identity}
+                {:db/ident :item/qty :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/index true}
+                {:db/ident :item/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
+(def r1 (d/transact! c [{:db/id "b" :item/sku "B-1" :item/qty 500 :item/name "Bolt"}
+                        {:db/id "n" :item/sku "N-1" :item/qty 20 :item/name "Nut"}
+                        {:db/id "w" :item/sku "W-1" :item/qty 75 :item/name "Washer"}]))
+(def r2 (d/transact! c [[:db/add [:item/sku "B-1"] :item/qty 501]
+                        [:db/retract [:item/sku "N-1"] :item/name "Nut"]]))
+(def db (d/db c))
+(def bolt (d/entid db [:item/sku "B-1"]))
+(def nut (d/entid db [:item/sku "N-1"]))
+
+; --- tx and added after the index components ------------------------------
+
+(println (map (fn [[e a v t added]] [a v t added]) (d/datoms db :eavt bolt nil nil (:tx r2))))
+(println (map (fn [[e a v t added]] [a v t]) (d/datoms db :eavt bolt nil nil (d/basis-t db))))
+(t/check "a t and its transaction entity name the same datoms"
+       (= (d/datoms db :eavt bolt nil nil (:tx r1)) (d/datoms db :eavt bolt nil nil (- (d/basis-t db) 1))))
+(t/check "a t nobody wrote matches nothing" (empty? (d/datoms db :eavt bolt nil nil 99)))
+(t/check "added true is every current datom" (= 3 (count (d/datoms db :eavt bolt nil nil nil true))))
+(t/check "added false is empty on a current view" (empty? (d/datoms db :eavt bolt nil nil nil false)))
+(println (map (fn [[e a v tx added]] [a v added]) (d/datoms (d/history db) :eavt nut :item/name nil nil false)))
+(println (map (fn [[e a v tx added]] [v added]) (d/datoms (d/history db) :eavt bolt :item/qty nil (:tx r1))))
+(println (map (fn [[e a v tx added]] [v added]) (d/datoms (d/history db) :avet :item/qty nil nil (:tx r2) true)))
+(println (t/caught (d/datoms db :eavt bolt nil nil "tx")))
+(println (t/caught (d/datoms db :eavt bolt nil nil nil 1)))
+
+; --- index-range ----------------------------------------------------------
+
+(defn qtys [ds] (mapv (fn [[e a v tx added]] v) ds))
+(println (qtys (d/index-range db :item/qty 20 500)))
+(println (qtys (d/index-range db :item/qty 21 nil)))
+(println (qtys (d/index-range db :item/qty nil 75)))
+(println (qtys (d/index-range db :item/qty nil nil)))
+(println (qtys (d/index-range db :item/sku "N" "W")))
+(println (qtys (d/index-range (d/as-of db (:tx r1)) :item/qty 500 502)))
+(t/check "an empty range" (empty? (d/index-range db :item/qty 30 30)))
+(println (t/caught (d/index-range db :item/name "A" "Z")))
+(println (t/caught (d/index-range db :item/qty "a" nil)))
+(println (t/caught (d/index-range db :item/nope 1 2)))
+(d/release c)
+:datoms-done

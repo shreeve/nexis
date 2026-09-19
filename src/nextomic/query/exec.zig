@@ -2,26 +2,30 @@
 //! "Execute").
 //!
 //! Invariants:
-//!   - One `Read` (one emdb snapshot) serves every scan of a query; the
-//!     caller opens it before planning and closes it after the result
-//!     is materialised, on success or error.
+//!   - One `Read` (one emdb snapshot) per data source serves every scan
+//!     of a query; the caller opens them before planning and closes
+//!     them after the result is materialised, on success or error. A
+//!     scan, `missing?` and `get-else` read the source their clause
+//!     names; an input resolves its idents and lookup refs in the
+//!     source of the first pattern that gives it an entity role; a pull
+//!     expression reads `$`.
 //!   - A scan seeks by the constants and bound variables that lead its
 //!     index and post-filters everything else; `tx` binds the
 //!     transaction entity id and `added` the datom's flag. The mode of
 //!     the db-value is inside the `Read`, so scans see folded datoms.
 //!   - Per scan the join is an index nested loop (one seek per input
-//!     row) when `rows × log2(tree entries)` is below the estimate of
-//!     the single constant-prefix scan, else that one scan hash-joined
-//!     on the shared variables.
+//!     row) or one constant-prefix scan hash-joined on the shared
+//!     variables, as `plan.nestedLoop` decides from the input rows.
 //!   - Built-in predicates and functions are Zig over cells; any other
-//!     symbol goes to the `CallHook` with VM values and its errors
-//!     propagate untouched (the caller closes the `Read` on the way
-//!     out).
+//!     symbol goes to the `CallHook` with VM values, as does the value
+//!     of a variable in function position, and its errors propagate
+//!     untouched (the caller closes the `Read` on the way out).
 //!   - A function result of nil drops the row; collection and relation
 //!     bindings fan out one row per element.
-//!   - `finish` forms the basis set (distinct tuples over the find and
-//!     `:with` variables), groups and aggregates it, and copies the
-//!     result into the VM heap as the find spec asks.
+//!   - `findRows` forms the basis set (distinct tuples over the find and
+//!     `:with` variables) and groups and aggregates it; `materialise`
+//!     applies pull expressions in the same snapshot and copies the
+//!     result into the VM heap as the find spec and `:keys` ask.
 //!
 //! Every function on a path to the call hook is `anyerror`: the hook
 //! raises whatever the VM raises, and that passes through untouched.
@@ -43,6 +47,7 @@ const ir = @import("ir.zig");
 const plan_mod = @import("plan.zig");
 const rules_mod = @import("rules.zig");
 const marshal = @import("../marshal.zig");
+const pull_mod = @import("../pull.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -58,21 +63,26 @@ const Plan = plan_mod.Plan;
 const Step = plan_mod.Step;
 const Scan = plan_mod.Scan;
 
-/// Calls a user function by VM symbol. `args` are VM values built in
+/// Calls a user function: `call` by VM symbol, `apply` by the value a
+/// variable in function position holds. `args` are VM values built in
 /// the query's result heap; the result must be a VM value.
 pub const CallHook = struct {
     ctx: *anyopaque,
     call: *const fn (ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value,
+    apply: *const fn (ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value,
 };
 
 pub const Exec = struct {
     arena: Allocator,
-    read: *Read,
+    /// One `Read` per data source, `$` first.
+    reads: []const *Read,
     heap: *Heap,
     interner: *Interner,
     hook: ?CallHook,
     /// Where an `UnknownAttribute` in an input leaves its name.
     diag: ?*Diag = null,
+    /// The random source of `sample` and `rand`, made on first use.
+    prng: ?std.Random.DefaultPrng = null,
 
     /// Run `p` from `input`, which binds at least `p.input`.
     pub fn runPlan(self: *Exec, p: *const Plan, input: Relation) anyerror!Relation {
@@ -95,17 +105,22 @@ pub const Exec = struct {
 
     // ── datoms to cells ───────────────────────────────────────────
 
-    /// The cell of a datom value: ids as `int`, keywords as VM keyword
-    /// ids, uuids as text.
-    pub fn valCell(self: *Exec, v: key.Val) !Cell {
-        return marshal.cellOf(self.read, self.arena, v);
+    /// The `Read` of a source (null: `$`).
+    fn readOf(self: *Exec, src: ?ir.Src) *Read {
+        return self.reads[src orelse 0];
     }
 
-    fn datomCells(self: *Exec, d: datom_mod.Datom) ![5]Cell {
+    /// The cell of a datom value read from `read`: ids as `int`,
+    /// keywords as VM keyword ids, uuids as text.
+    pub fn valCell(self: *Exec, read: *Read, v: key.Val) !Cell {
+        return marshal.cellOf(read, self.arena, v);
+    }
+
+    fn datomCells(self: *Exec, read: *Read, d: datom_mod.Datom) ![5]Cell {
         return .{
             .{ .int = @intCast(d.e) },
             .{ .int = d.a },
-            try self.valCell(d.v),
+            try self.valCell(read, d.v),
             .{ .int = @intCast(key.txEntity(d.t)) },
             .{ .boolean = d.added },
         };
@@ -138,10 +153,7 @@ pub const Exec = struct {
         var out = try Relation.init(self.arena, out_vars);
         if (s.unsatisfiable or rel.rows == 0) return out;
 
-        const log_n: u64 = std.math.log2_int_ceil(u64, s.tree_entries + 2);
-        // A bound attribute variable seeks per row: its cell may be an
-        // ident, which a hash join would not match against attribute ids.
-        const nested = s.hash_index == null or s.a == .bound or (std.math.mulWide(u64, rel.rows, log_n) < s.hash_estimate);
+        const nested = plan_mod.nestedLoop(s, rel.rows);
         const slots = s.slots();
 
         if (nested) {
@@ -193,6 +205,7 @@ pub const Exec = struct {
     /// VAET scan whose value cell is not an entity id becomes a scan
     /// of every datom in AEVT, filtered on the value.
     fn scanInto(self: *Exec, s: *const Scan, planned: key.Index, rel: ?*const Relation, row: []const Cell, srcs: []const Src, out: *Relation) anyerror!void {
+        const read = self.reads[s.src];
         const slots = s.slots();
         var comps: key.Components = .{};
         var index = planned;
@@ -206,20 +219,20 @@ pub const Exec = struct {
         var attr = s.attr;
         if (wants[1]) |c| {
             const n: i64 = switch (c) {
-                .keyword => |kw| (try self.read.db.conn.idents.idOf(self.read.txn, kw)) orelse return,
+                .keyword => |kw| (try read.db.conn.idents.idOf(read.txn, kw)) orelse return,
                 else => c.asInt() orelse return,
             };
             if (n <= 0 or n >= key.attr_partition_end) return;
             comps.a = @intCast(n);
             wants[1] = .{ .int = n };
-            if (attr == null) attr = (try self.read.attr(comps.a.?)) orelse return;
+            if (attr == null) attr = (try read.attr(comps.a.?)) orelse return;
         }
 
         if (wants[2]) |c| {
             if (slots[2] == .constant and slots[2].constant.bytes != null) {
                 comps.v = slots[2].constant.bytes;
             } else if (attr) |at| {
-                const val = (try marshal.encodeCell(self.read, c, at.value_type)) orelse return;
+                const val = (try marshal.encodeCell(read, c, at.value_type)) orelse return;
                 comps.v = key.valBytes(self.arena, val) catch |err| switch (err) {
                     error.ValueType => return,
                     else => return err,
@@ -233,10 +246,10 @@ pub const Exec = struct {
             }
         }
 
-        var it = try self.read.scan(self.arena, index, comps);
+        var it = try read.scan(self.arena, index, comps);
         const cells = try self.arena.alloc(Cell, out.cols.len);
         datoms: while (try it.next()) |d| {
-            const dc = try self.datomCells(d);
+            const dc = try self.datomCells(read, d);
             for (slots, 0..) |slot, pos| {
                 switch (slot) {
                     .blank, .fresh => {},
@@ -272,9 +285,21 @@ pub const Exec = struct {
 
     fn callUser(self: *Exec, sym: u32, cells: []const Cell) anyerror!Value {
         const hook = self.hook orelse return error.NoHook;
+        return hook.call(hook.ctx, sym, try self.argValues(cells));
+    }
+
+    /// Apply the value in `f`'s column of `row`, a function bound
+    /// through `:in` or an earlier clause.
+    fn applyVar(self: *Exec, rel: *const Relation, row: usize, f: Var, cells: []const Cell) anyerror!Value {
+        const hook = self.hook orelse return error.NoHook;
+        const callee = try self.cellValue(rel.get(row, f).?);
+        return hook.apply(hook.ctx, callee, try self.argValues(cells));
+    }
+
+    fn argValues(self: *Exec, cells: []const Cell) ![]Value {
         const args = try self.arena.alloc(Value, cells.len);
         for (cells, args) |c, *a| a.* = try self.cellValue(c);
-        return hook.call(hook.ctx, sym, args);
+        return args;
     }
 
     fn execPred(self: *Exec, p: *const plan_mod.Pred, rel: Relation) anyerror!Relation {
@@ -284,15 +309,17 @@ pub const Exec = struct {
         while (i < rel.rows) : (i += 1) {
             const cells = try self.argCells(&rel, i, p.call.args);
             const keep = switch (p.call.f) {
-                .builtin => |b| try self.builtinPred(b, cells),
+                .builtin => |b| try self.builtinPred(b, p.call.args, cells),
                 .user => |sym| (try self.callUser(sym, cells)).isTruthy(),
+                .variable => |f| (try self.applyVar(&rel, i, f, cells)).isTruthy(),
             };
             if (keep) try out.appendFrom(&rel, i, map);
         }
         return out;
     }
 
-    fn builtinPred(self: *Exec, b: ir.Builtin, args: []const Cell) anyerror!bool {
+    /// `call_args` carry what a cell cannot: the source of `missing?`.
+    fn builtinPred(self: *Exec, b: ir.Builtin, call_args: []const ir.Arg, args: []const Cell) anyerror!bool {
         switch (b) {
             .lt, .le, .gt, .ge => {
                 for (args[0 .. args.len - 1], args[1..]) |x, y| {
@@ -316,20 +343,21 @@ pub const Exec = struct {
                 for (args[1..]) |y| if (!args[0].eql(y)) return true;
                 return false;
             },
-            .missing => return (try self.firstValue(args[1], args[2])) == null,
-            .ground, .get_else, .tuple, .untuple => unreachable,
+            .missing => return (try self.firstValue(call_args[0].src, args[1], args[2])) == null,
+            .ground, .get_else, .get_some, .tuple, .untuple => unreachable,
         }
     }
 
-    /// The first current value of attribute `attr` (a keyword cell) on
-    /// entity `e`, or null.
-    fn firstValue(self: *Exec, e: Cell, attr: Cell) anyerror!?Cell {
+    /// The first value of attribute `attr` (a keyword cell) on entity
+    /// `e` in source `src`, or null.
+    fn firstValue(self: *Exec, src: ?ir.Src, e: Cell, attr: Cell) anyerror!?Cell {
+        const read = self.readOf(src);
         const eid = e.asEid() orelse return null;
         if (attr != .keyword) return error.ValueType;
-        const a = (try self.read.db.conn.idents.idOf(self.read.txn, attr.keyword)) orelse return null;
-        var it = try self.read.scan(self.arena, .eavt, .{ .e = eid, .a = a });
+        const a = (try read.db.conn.idents.idOf(read.txn, attr.keyword)) orelse return null;
+        var it = try read.scan(self.arena, .eavt, .{ .e = eid, .a = a });
         const d = (try it.next()) orelse return null;
-        return try self.valCell(d.v);
+        return try self.valCell(read, d.v);
     }
 
     fn execBind(self: *Exec, b: *const plan_mod.Bind, rel: Relation) anyerror!Relation {
@@ -343,8 +371,16 @@ pub const Exec = struct {
                 .builtin => |bi| switch (bi) {
                     .ground, .untuple => try self.cellValue(cells[0]),
                     .get_else => blk: {
-                        const found = try self.firstValue(cells[1], cells[2]);
+                        const found = try self.firstValue(b.call.args[0].src, cells[1], cells[2]);
                         break :blk try self.cellValue(found orelse cells[3]);
+                    },
+                    // `[attr value]` for the first attribute the entity has, else nil.
+                    .get_some => blk: {
+                        for (cells[2..]) |attr| {
+                            const found = (try self.firstValue(b.call.args[0].src, cells[1], attr)) orelse continue;
+                            break :blk try vector_mod.fromSlice(self.heap, &.{ try self.cellValue(attr), try self.cellValue(found) });
+                        }
+                        break :blk value.nilValue();
                     },
                     .tuple => blk: {
                         const vals = try self.arena.alloc(Value, cells.len);
@@ -354,6 +390,7 @@ pub const Exec = struct {
                     .lt, .le, .gt, .ge, .eq, .ne, .missing => unreachable,
                 },
                 .user => |sym| try self.callUser(sym, cells),
+                .variable => |f| try self.applyVar(&rel, i, f, cells),
             };
             rel.rowInto(i, row[0..rel.cols.len]);
             try self.bindValue(b, result, row, rel.cols.len, &out);
@@ -496,7 +533,9 @@ pub const Exec = struct {
         return self.resolveInputs(q, rel);
     }
 
-    const InputRole = struct { entity: bool = false, keyword: bool = false };
+    /// `src` is the source of the first pattern that put the variable
+    /// in an entity role; its idents and lookups resolve there.
+    const InputRole = struct { entity: bool = false, keyword: bool = false, src: ir.Src = 0 };
 
     /// `rel` with the entity-role columns resolved (see `inputRelation`).
     fn resolveInputs(self: *Exec, q: *const Ir, rel: Relation) anyerror!Relation {
@@ -514,7 +553,7 @@ pub const Exec = struct {
             rel.rowInto(i, row);
             for (cols.items) |c| {
                 if (row[c] != .keyword and row[c] != .vm) continue;
-                const e = (try self.inputEntity(row[c])) orelse continue :rows;
+                const e = (try self.inputEntity(self.reads[roles[rel.vars[c]].src], row[c])) orelse continue :rows;
                 row[c] = .{ .int = @intCast(e) };
             }
             try out.append(row);
@@ -527,12 +566,13 @@ pub const Exec = struct {
     fn inputRoles(self: *Exec, clauses: []const ir.Clause, roles: []InputRole) anyerror!void {
         for (clauses) |c| switch (c) {
             .pattern => |p| {
-                if (p.e.asVar()) |v| roles[v].entity = true;
+                const read = self.readOf(p.src);
+                if (p.e.asVar()) |v| markEntity(&roles[v], p.src orelse 0);
                 const v = p.v.asVar() orelse continue;
                 if (p.a != .constant or p.a.constant != .cell or p.a.constant.cell != .keyword) continue;
-                const id = (try self.read.db.conn.idents.idOf(self.read.txn, p.a.constant.cell.keyword)) orelse continue;
-                const at = (try self.read.attr(@intCast(id))) orelse continue;
-                if (at.value_type == .ref) roles[v].entity = true;
+                const id = (try read.db.conn.idents.idOf(read.txn, p.a.constant.cell.keyword)) orelse continue;
+                const at = (try read.attr(@intCast(id))) orelse continue;
+                if (at.value_type == .ref) markEntity(&roles[v], p.src orelse 0);
                 if (at.value_type == .keyword) roles[v].keyword = true;
             },
             .not => |n| try self.inputRoles(n.body, roles),
@@ -541,17 +581,22 @@ pub const Exec = struct {
         };
     }
 
-    /// The entity an ident or lookup-ref input names (the `marshal`
-    /// contract), or null when there is none; the diagnostic carries
-    /// what a failing lookup ref named.
-    fn inputEntity(self: *Exec, c: Cell) anyerror!?u64 {
+    fn markEntity(role: *InputRole, src: ir.Src) void {
+        if (!role.entity) role.src = src;
+        role.entity = true;
+    }
+
+    /// The entity an ident or lookup-ref input names in `read` (the
+    /// `marshal` contract), or null when there is none; the diagnostic
+    /// carries what a failing lookup ref named.
+    fn inputEntity(self: *Exec, read: *Read, c: Cell) anyerror!?u64 {
         const v: Value = switch (c) {
             .keyword => |kw| value.fromKeywordId(kw),
             .vm => |v| v,
             else => return null,
         };
         var fault: db_mod.Fault = .{};
-        return marshal.entity(self.read, self.arena, v, &fault) catch |err| {
+        return marshal.entity(read, self.arena, v, &fault) catch |err| {
             if (self.diag) |d| d.* = .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr };
             return err;
         };
@@ -576,7 +621,7 @@ pub const Exec = struct {
         var rows: std.ArrayList([]const Cell) = .empty;
         if (!query.hasAggregates()) {
             const find_vars = try self.arena.alloc(Var, query.find.len);
-            for (query.find, find_vars) |f, *v| v.* = f.variable;
+            for (query.find, find_vars) |f, *v| v.* = f.variable_of();
             const tuples = try basis.project(find_vars, query.with.len > 0);
             var i: usize = 0;
             while (i < tuples.rows) : (i += 1) {
@@ -587,9 +632,10 @@ pub const Exec = struct {
             return rows.toOwnedSlice(self.arena);
         }
 
-        // Group by the plain find variables, in first-seen order.
+        // Group by the plain find variables (a pull expression groups
+        // by its entity), in first-seen order.
         var group_vars: std.ArrayList(Var) = .empty;
-        for (query.find) |f| if (f == .variable) try ir.addVar(self.arena, &group_vars, f.variable);
+        for (query.find) |f| if (f != .agg) try ir.addVar(self.arena, &group_vars, f.variable_of());
         const keys = try basis.project(group_vars.items, false);
         var groups: std.ArrayList(std.ArrayList(usize)) = .empty;
         var index: std.AutoHashMapUnmanaged(u64, std.ArrayList(usize)) = .empty;
@@ -617,8 +663,8 @@ pub const Exec = struct {
             const row = try self.arena.alloc(Cell, query.find.len);
             for (query.find, row) |f, *cell| {
                 cell.* = switch (f) {
-                    .variable => |v| basis.get(members.items[0], v).?,
-                    .agg => |a| try self.aggregate(a.op, &basis, basis.colOf(a.arg).?, members.items),
+                    .variable, .pull => basis.get(members.items[0], f.variable_of()).?,
+                    .agg => |a| try self.aggregate(a, &basis, basis.colOf(a.arg).?, members.items),
                 };
             }
             try rows.append(self.arena, row);
@@ -626,20 +672,46 @@ pub const Exec = struct {
         return rows.toOwnedSlice(self.arena);
     }
 
-    fn aggregate(self: *Exec, op: ir.AggOp, basis: *const Relation, col: usize, members: []const usize) anyerror!Cell {
+    /// One aggregate over the group's `members` of `col`. `median` of
+    /// an even count is the mean of the two middle values as a double;
+    /// `variance` divides by the count (population variance) and
+    /// `stddev` is its square root; `(min n ?x)` and `(max n ?x)` are
+    /// the n smallest or largest values in order, `(sample n ?x)` up to
+    /// n distinct values and `(rand n ?x)` n values with repetition,
+    /// each a vector; a custom aggregate receives the vector of values.
+    fn aggregate(self: *Exec, agg: ir.Agg, basis: *const Relation, col: usize, members: []const usize) anyerror!Cell {
+        const op = agg.op;
         switch (op) {
             .count => return .{ .int = @intCast(members.len) },
-            .count_distinct, .distinct => {
+            .count_distinct, .distinct, .sample => {
                 var seen = try Relation.init(self.arena, &.{0});
                 for (members) |m| try seen.append(&.{basis.cell(m, col)});
                 const d = try seen.dedup();
                 if (op == .count_distinct) return .{ .int = @intCast(d.rows) };
+                if (op == .sample) {
+                    const cells = try self.arena.alloc(Cell, d.rows);
+                    for (cells, 0..) |*c, i| c.* = d.cell(i, 0);
+                    self.random().shuffle(Cell, cells);
+                    return self.cellVector(cells[0..@min(cells.len, agg.n.?)]);
+                }
                 var set = try champ.setEmpty(self.heap);
                 var i: usize = 0;
                 while (i < d.rows) : (i += 1) set = try champ.setConj(self.heap, set, try self.cellValue(d.cell(i, 0)), &dispatch.hashValue, &dispatch.equal);
                 return .{ .vm = set };
             },
+            .rand => {
+                const n = agg.n.?;
+                const cells = try self.arena.alloc(Cell, if (members.len == 0) 0 else n);
+                for (cells) |*c| c.* = basis.cell(members[self.random().uintLessThan(usize, members.len)], col);
+                return self.cellVector(cells);
+            },
             .min, .max => {
+                if (agg.n) |n| {
+                    const cells = try self.arena.alloc(Cell, members.len);
+                    for (members, cells) |m, *c| c.* = basis.cell(m, col);
+                    std.mem.sort(Cell, cells, op == .max, cellLess);
+                    return self.cellVector(cells[0..@min(cells.len, n)]);
+                }
                 var best: ?Cell = null;
                 for (members) |m| {
                     const c = basis.cell(m, col);
@@ -651,6 +723,36 @@ pub const Exec = struct {
                     if ((op == .min and o == .lt) or (op == .max and o == .gt)) best = c;
                 }
                 return best orelse .nil;
+            },
+            .median => {
+                const cells = try self.arena.alloc(Cell, members.len);
+                for (members, cells) |m, *c| c.* = basis.cell(m, col);
+                std.mem.sort(Cell, cells, false, cellLess);
+                if (cells.len == 0) return .nil;
+                if (cells.len % 2 == 1) return cells[cells.len / 2];
+                const lo = try numberOf(cells[cells.len / 2 - 1]);
+                const hi = try numberOf(cells[cells.len / 2]);
+                return .{ .double = (lo + hi) / 2 };
+            },
+            .variance, .stddev => {
+                if (members.len == 0) return .nil;
+                var mean: f64 = 0;
+                for (members) |m| mean += try numberOf(basis.cell(m, col));
+                mean /= @floatFromInt(members.len);
+                var acc: f64 = 0;
+                for (members) |m| {
+                    const d = (try numberOf(basis.cell(m, col))) - mean;
+                    acc += d * d;
+                }
+                const variance = acc / @as(f64, @floatFromInt(members.len));
+                return .{ .double = if (op == .variance) variance else @sqrt(variance) };
+            },
+            .custom => {
+                const hook = self.hook orelse return error.NoHook;
+                const vals = try self.arena.alloc(Value, members.len);
+                for (members, vals) |m, *v| v.* = try self.cellValue(basis.cell(m, col));
+                const result = try hook.call(hook.ctx, agg.sym, &.{try vector_mod.fromSlice(self.heap, vals)});
+                return Cell.fromValue(result);
             },
             .sum, .avg => {
                 var isum: i64 = 0;
@@ -674,10 +776,43 @@ pub const Exec = struct {
         }
     }
 
-    /// Copy `rows` into the VM heap as `spec` asks: a set of vectors, a
-    /// vector of values, one value, or one vector.
-    pub fn materialise(self: *Exec, spec: ir.FindSpec, rows: []const []const Cell) anyerror!Value {
-        switch (spec) {
+    fn cellLess(descending: bool, a: Cell, b: Cell) bool {
+        const o = a.order(b);
+        return if (descending) o == .gt else o == .lt;
+    }
+
+    /// A numeric cell as a double; anything else is `ValueType`.
+    fn numberOf(c: Cell) error{ValueType}!f64 {
+        return switch (c) {
+            .int => |n| @floatFromInt(n),
+            .double => |d| d,
+            else => error.ValueType,
+        };
+    }
+
+    fn cellVector(self: *Exec, cells: []const Cell) !Cell {
+        return .{ .vm = try self.rowVector(cells) };
+    }
+
+    /// The query's random source, seeded once per query from the clock.
+    fn random(self: *Exec) std.Random {
+        if (self.prng == null) {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &ts);
+            const seed = (@as(u64, @intCast(ts.sec)) *% 1_000_000_007) ^ @as(u64, @intCast(ts.nsec)) ^ @intFromPtr(self);
+            self.prng = std.Random.DefaultPrng.init(seed);
+        }
+        return self.prng.?.random();
+    }
+
+    /// Copy `rows` into the VM heap as the find spec asks: a set of
+    /// vectors (a vector of maps under `:keys`, `:strs` or `:syms`), a
+    /// vector of values, one value, or one vector. Pull expressions are
+    /// applied here, in the query's own snapshot.
+    pub fn materialise(self: *Exec, query: *const Ir, rows_in: []const []const Cell) anyerror!Value {
+        const rows = try self.pullColumns(query, rows_in);
+        if (query.keys) |keys| return self.rowMaps(keys, rows);
+        switch (query.find_spec) {
             .relation => {
                 var set = try champ.setEmpty(self.heap);
                 for (rows) |row| set = try champ.setConj(self.heap, set, try self.rowVector(row), &dispatch.hashValue, &dispatch.equal);
@@ -703,5 +838,53 @@ pub const Exec = struct {
         const vals = try self.arena.alloc(Value, row.len);
         for (row, vals) |c, *v| v.* = try self.cellValue(c);
         return vector_mod.fromSlice(self.heap, vals);
+    }
+
+    /// `rows` with every `(pull ?e pattern)` column replaced by the
+    /// pattern's map for the row's entity (nil for an entity with no
+    /// datoms); a cell that is not an entity id is `ValueType`. Each
+    /// pattern is resolved once; a syntax error leaves its reason in
+    /// the diagnostic.
+    fn pullColumns(self: *Exec, query: *const Ir, rows: []const []const Cell) anyerror![]const []const Cell {
+        var any = false;
+        for (query.find) |f| if (f == .pull) {
+            any = true;
+        };
+        if (!any) return rows;
+        var scratch: Diag = .{};
+        const diag = self.diag orelse &scratch;
+        const prepared = try self.arena.alloc(?pull_mod.Prepared, query.find.len);
+        for (query.find, prepared) |f, *p| p.* = if (f == .pull) try pull_mod.Prepared.prepare(self.arena, self.reads[0], self.heap, self.interner, f.pull.pattern, diag) else null;
+        const out = try self.arena.alloc([]const Cell, rows.len);
+        for (rows, out) |row, *o| {
+            const cells = try self.arena.dupe(Cell, row);
+            for (prepared, cells) |*p, *c| {
+                const pr = &(p.* orelse continue);
+                const e = c.asEid() orelse return error.ValueType;
+                c.* = .{ .vm = try pr.eid(e) };
+            }
+            o.* = cells;
+        }
+        return out;
+    }
+
+    /// The rows as a vector of maps, one key per find element.
+    fn rowMaps(self: *Exec, keys: ir.Keys, rows: []const []const Cell) anyerror!Value {
+        const names = try self.arena.alloc(Value, keys.names.len);
+        for (keys.names, names) |sym, *n| {
+            const text = self.interner.symbolName(sym);
+            n.* = switch (keys.kind) {
+                .keyword => try self.interner.internKeywordValue(text),
+                .string => try string_mod.fromBytes(self.heap, text),
+                .symbol => value.fromSymbolId(sym),
+            };
+        }
+        const maps = try self.arena.alloc(Value, rows.len);
+        for (rows, maps) |row, *m| {
+            var map = try champ.mapEmpty(self.heap);
+            for (names, row) |k, c| map = try champ.mapAssoc(self.heap, map, k, try self.cellValue(c), &dispatch.hashValue, &dispatch.equal);
+            m.* = map;
+        }
+        return vector_mod.fromSlice(self.heap, maps);
     }
 };

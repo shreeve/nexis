@@ -5,7 +5,7 @@
 //! result; `(explain query db & inputs)` returns the plan as a string.
 //! The inputs follow `:in` positionally after `$`, so the db is the
 //! `$` argument and the rest bind `?x`, `[?x ...]`, `[?a ?b]`,
-//! `[[?a ?b]]` and `%`.
+//! `[[?a ?b]]`, `%` and further db values for `$name` sources.
 //!
 //! Caches: one IR cache and one rules cache per VM, on the natives'
 //! per-VM state (`natives.state`). A parsed query is pure syntax over
@@ -20,7 +20,10 @@
 //! compiler resolves a symbol (an alias-qualified `ns/name` to that
 //! namespace's own var; a bare name in the current namespace, then its
 //! auto-referred parents) and is called through `VM.callValue` with
-//! the clause's arguments as values. Whatever that call raises
+//! the clause's arguments as values. A `?variable` in function
+//! position applies the value it holds: a function through
+//! `VM.callValue`, a keyword or collection as the language applies
+//! them, anything else `:not-callable`. Whatever that call raises
 //! propagates untouched: a throw inside a predicate reaches the
 //! caller's `try` as the thrown value after `query.q` has closed its
 //! `Read`, and `ControlTransferred` passes through unchanged.
@@ -28,6 +31,8 @@
 //! Errors: `QuerySyntax` throws `{:error :nextomic/query-syntax
 //! :message "..." :clause i}` (`:clause` only when the parser was
 //! inside a `:where` clause), so the reason travels with the throw;
+//! `PullSyntax` from a `(pull ?e pattern)` find element throws the
+//! `:nextomic/pull-syntax` map the same way;
 //! `UnboundPattern` throws `:nextomic/unbound-pattern`; every other
 //! error takes the `natives.zig` mapping. VM errors pass through.
 
@@ -90,6 +95,7 @@ fn keywordFor(err: anyerror) ?[]const u8 {
 /// a syntax error or of malformed input, the attribute of an unknown one.
 fn fail(vm: *VM, err: anyerror, diag: *const Diag) VmError {
     if (err == error.QuerySyntax) return throwSyntax(vm, diag.message, diag.clause);
+    if (err == error.PullSyntax) return natives.throwSyntax(vm, "nextomic/pull-syntax", diag.message, diag.clause);
     if (err == error.UnknownAttribute) return natives.failWith(vm, err, .{ .attr = diag.attr });
     if (err == error.TxData) return natives.failWith(vm, err, .{ .message = messageOf(diag), .attr = diag.attr });
     if (keywordFor(err)) |name| return vm.throwKeyword(name);
@@ -117,7 +123,7 @@ const Hook = struct {
     vm: *VM,
 
     fn callHook(self: *Hook) query.CallHook {
-        return .{ .ctx = @ptrCast(self), .call = &call };
+        return .{ .ctx = @ptrCast(self), .call = &call, .apply = &apply };
     }
 
     fn call(ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value {
@@ -126,12 +132,20 @@ const Hook = struct {
         return self.vm.callValue(callee, args);
     }
 
+    /// Apply the value a variable in function position holds: a
+    /// function, or a keyword or collection looked up as the language
+    /// applies them; anything else is the VM's `:not-callable`.
+    fn apply(ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value {
+        const self: *Hook = @ptrCast(@alignCast(ctx));
+        if (vm_mod.isLookupCallable(f.kind())) return vm_mod.callLookup(f, args);
+        return self.vm.callValue(f, args);
+    }
+
     /// The bound value the symbol names, or a thrown
     /// `:nextomic/query-syntax` naming what is missing.
     fn resolve(self: *Hook, sym: u32) anyerror!Value {
         const vm = self.vm;
         const name = vm.ensureInterner().symbolName(sym);
-        if (std.mem.startsWith(u8, name, "?")) return self.unknown("function position takes a function name, not a variable", name);
         const registry = try vm.ensureRegistry();
         const current = registry.current;
         const found: ?*Var = blk: {
@@ -177,7 +191,7 @@ fn qNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     const d = try natives.dbOf(args[1]);
     const st = try natives.state(vm);
     var hook = Hook{ .vm = vm };
-    const options: query.Options = .{ .hook = hook.callHook(), .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };
+    const options: query.Options = .{ .hook = hook.callHook(), .db_of = &natives.dbOf, .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };
     return query.q(vm.allocator, vm.ensureInterner(), vm.ensureHeap(), args[0], d, args[1..], diag, options);
 }
 
@@ -190,7 +204,7 @@ fn explainNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     const d = try natives.dbOf(args[1]);
     const st = try natives.state(vm);
     var hook = Hook{ .vm = vm };
-    const options: query.Options = .{ .hook = hook.callHook(), .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };
+    const options: query.Options = .{ .hook = hook.callHook(), .db_of = &natives.dbOf, .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };
     var out: std.Io.Writer.Allocating = .init(vm.allocator);
     defer out.deinit();
     try query.explain(vm.allocator, vm.ensureInterner(), args[0], d, args[1..], diag, options, &out.writer);

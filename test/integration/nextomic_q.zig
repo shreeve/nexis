@@ -124,14 +124,39 @@ fn runEngineDiag(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args:
             rules = owned_rules.?;
         }
     }
-    var read = try dbv.beginRead();
-    defer read.close();
-    var ctx = try query.plan.Ctx.init(arena, &read, fx.interner(), parsed, rules, diag);
+    const reads = try openReads(arena, dbv, parsed, args);
+    defer for (reads) |r| r.close();
+    var ctx = try query.plan.Ctx.init(arena, reads, fx.interner(), parsed, rules, diag);
     const p = try query.plan.plan(&ctx, parsed);
-    var ex = query.Exec{ .arena = arena, .read = &read, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook(), .diag = diag };
+    var ex = query.Exec{ .arena = arena, .reads = reads, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook(), .diag = diag };
     const input = try ex.inputRelation(parsed, args);
     const rel = try ex.runPlan(p, input);
     return ex.findRows(parsed, rel);
+}
+
+/// The db-values of a query's sources: `dbv` for `$`, the boxed
+/// db-value at each later source's `:in` position.
+fn sourceDbs(arena: Allocator, dbv: DbValue, parsed: *const ir.Ir, args: []const Value) ![]DbValue {
+    const out = try arena.alloc(DbValue, parsed.sources.len);
+    for (parsed.in, args) |b, a| {
+        if (b != .src) continue;
+        out[b.src] = if (b.src == 0) dbv else try nextomic.natives.dbOf(a);
+    }
+    return out;
+}
+
+/// One open `Read` per source.
+fn openReads(arena: Allocator, dbv: DbValue, parsed: *const ir.Ir, args: []const Value) ![]*nextomic.db.Read {
+    const dbs = try sourceDbs(arena, dbv, parsed, args);
+    const out = try arena.alloc(*nextomic.db.Read, dbs.len);
+    var opened: usize = 0;
+    errdefer for (out[0..opened]) |r| r.close();
+    for (dbs, out) |d, *r| {
+        r.* = try arena.create(nextomic.db.Read);
+        r.*.* = try d.beginRead();
+        opened += 1;
+    }
+    return out;
 }
 
 fn sortedRelation(arena: Allocator, rows: []const Row, width: usize) !Relation {
@@ -199,12 +224,25 @@ const Env = []?Cell;
 const Naive = struct {
     fx: *Fx,
     arena: Allocator,
-    dbv: DbValue,
-    datoms: []const [5]Cell,
+    /// Per source: the db-value, its open read, every datom of the
+    /// view as cells.
+    dbvs: []const DbValue,
+    reads: []const *nextomic.db.Read,
+    datoms: []const []const [5]Cell,
     rules: *const ir.RuleSet,
-    read: *nextomic.db.Read,
-    facts: std.AutoHashMapUnmanaged(u32, std.ArrayList(Row)) = .empty,
-    attr_types: std.AutoHashMapUnmanaged(u32, key.ValueType) = .empty,
+    /// Rule facts per (rule name, source): a rule body reads the
+    /// source it is called under.
+    facts: std.AutoHashMapUnmanaged(u64, std.ArrayList(Row)) = .empty,
+    /// Attribute types per source, by attribute id.
+    attr_types: []std.AutoHashMapUnmanaged(u32, key.ValueType),
+
+    fn factKey(name: u32, src: ir.Src) u64 {
+        return (@as(u64, name) << 32) | src;
+    }
+
+    fn connOf(self: *Naive, src: ir.Src) *nextomic.Conn {
+        return self.dbvs[src].conn;
+    }
 
     fn run(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args: []const Value) anyerror![]const Row {
         const qv = try fx.read(src);
@@ -222,9 +260,12 @@ const Naive = struct {
             }
         }
 
-        var read = try dbv.beginRead();
-        defer read.close();
-        var self = Naive{ .fx = fx, .arena = arena, .dbv = dbv, .datoms = &.{}, .rules = rules, .read = &read };
+        const dbvs = try sourceDbs(arena, dbv, parsed, args);
+        const reads = try openReads(arena, dbv, parsed, args);
+        defer for (reads) |r| r.close();
+        const attr_types = try arena.alloc(std.AutoHashMapUnmanaged(u32, key.ValueType), dbvs.len);
+        @memset(attr_types, .empty);
+        var self = Naive{ .fx = fx, .arena = arena, .dbvs = dbvs, .reads = reads, .datoms = &.{}, .rules = rules, .attr_types = attr_types };
         try self.loadDatoms();
         try self.computeFacts();
 
@@ -273,14 +314,14 @@ const Naive = struct {
                 if (!r.entity or r.keyword) continue;
                 const c = e[v] orelse continue;
                 if (c != .keyword and c != .vm) continue;
-                e[v] = .{ .int = @intCast((try self.inputEntity(c)) orelse continue :envs) };
+                e[v] = .{ .int = @intCast((try self.inputEntity(c, r.src)) orelse continue :envs) };
             }
             try resolved.append(arena, e);
         }
         envs = resolved;
 
         var solved: std.ArrayList(Env) = .empty;
-        for (envs.items) |e| try self.solve(parsed.where, e, &solved);
+        for (envs.items) |e| try self.solve(parsed.where, e, &solved, 0);
 
         // Basis: distinct tuples over find ∪ with variables.
         var basis_vars: std.ArrayList(Var) = .empty;
@@ -297,7 +338,7 @@ const Naive = struct {
         if (!parsed.hasAggregates()) {
             for (basis.items) |b| {
                 const row = try arena.alloc(Cell, parsed.find.len);
-                for (parsed.find, row) |f, *c| c.* = b[indexOf(basis_vars.items, f.variable)];
+                for (parsed.find, row) |f, *c| c.* = b[indexOf(basis_vars.items, f.variable_of())];
                 if (parsed.with.len == 0 or !containsRow(out.items, row)) try out.append(arena, row);
             }
             return out.toOwnedSlice(arena);
@@ -305,7 +346,7 @@ const Naive = struct {
 
         // Group by the plain find variables.
         var group_vars: std.ArrayList(Var) = .empty;
-        for (parsed.find) |f| if (f == .variable) try ir.addVar(arena, &group_vars, f.variable);
+        for (parsed.find) |f| if (f != .agg) try ir.addVar(arena, &group_vars, f.variable_of());
         var keys: std.ArrayList(Row) = .empty;
         var groups: std.ArrayList(std.ArrayList(Row)) = .empty;
         for (basis.items) |b| {
@@ -326,8 +367,8 @@ const Naive = struct {
             const row = try arena.alloc(Cell, parsed.find.len);
             for (parsed.find, row) |f, *c| {
                 c.* = switch (f) {
-                    .variable => |v| members.items[0][indexOf(basis_vars.items, v)],
-                    .agg => |ag| try self.aggregate(ag.op, members.items, indexOf(basis_vars.items, ag.arg)),
+                    .variable, .pull => members.items[0][indexOf(basis_vars.items, f.variable_of())],
+                    .agg => |ag| try self.aggregate(ag, members.items, indexOf(basis_vars.items, ag.arg)),
                 };
             }
             try out.append(arena, row);
@@ -335,9 +376,37 @@ const Naive = struct {
         return out.toOwnedSlice(arena);
     }
 
-    fn aggregate(self: *Naive, op: ir.AggOp, members: []const Row, col: usize) !Cell {
+    /// The naive aggregate: sorting where the engine sorts, a random
+    /// vector's length only for `sample` and `rand` (compared by count
+    /// in the tests), the same custom call through the fixture.
+    fn aggregate(self: *Naive, ag: ir.Agg, members: []const Row, col: usize) !Cell {
+        const op = ag.op;
+        const sorted = try self.arena.alloc(Cell, members.len);
+        for (members, sorted) |m, *c| c.* = m[col];
+        std.mem.sort(Cell, sorted, {}, cellAsc);
         switch (op) {
             .count => return .{ .int = @intCast(members.len) },
+            .median => {
+                if (sorted.len == 0) return .nil;
+                if (sorted.len % 2 == 1) return sorted[sorted.len / 2];
+                return .{ .double = (try num(sorted[sorted.len / 2 - 1]) + try num(sorted[sorted.len / 2])) / 2 };
+            },
+            .variance, .stddev => {
+                if (sorted.len == 0) return .nil;
+                var mean: f64 = 0;
+                for (sorted) |c| mean += try num(c);
+                mean /= @floatFromInt(sorted.len);
+                var acc: f64 = 0;
+                for (sorted) |c| acc += (try num(c) - mean) * (try num(c) - mean);
+                const v = acc / @as(f64, @floatFromInt(sorted.len));
+                return .{ .double = if (op == .variance) v else @sqrt(v) };
+            },
+            .sample, .rand => return error.Unsupported,
+            .custom => {
+                const vals = try self.arena.alloc(Value, members.len);
+                for (members, vals) |m, *v| v.* = try self.cellValue(m[col]);
+                return Cell.fromValue(try Fx.hookCall(@ptrCast(self.fx), ag.sym, &.{try vector_mod.fromSlice(&self.fx.heap, vals)}));
+            },
             .count_distinct, .distinct => {
                 var seen: std.ArrayList(Cell) = .empty;
                 for (members) |m| {
@@ -353,6 +422,12 @@ const Naive = struct {
                 return .{ .vm = set };
             },
             .min, .max => {
+                if (ag.n) |n| {
+                    if (op == .max) std.mem.reverse(Cell, sorted);
+                    const vals = try self.arena.alloc(Value, @min(n, sorted.len));
+                    for (sorted[0..vals.len], vals) |c, *v| v.* = try self.cellValue(c);
+                    return .{ .vm = try vector_mod.fromSlice(&self.fx.heap, vals) };
+                }
                 var best = members[0][col];
                 for (members[1..]) |m| {
                     const o = m[col].order(best);
@@ -403,45 +478,50 @@ const Naive = struct {
         return self.arena.dupe(?Cell, e);
     }
 
-    /// Every datom of the view as cells, plus attribute types.
+    /// Every datom of every source's view as cells, plus attribute types.
     fn loadDatoms(self: *Naive) !void {
-        const read = self.read;
-        const ds = try self.dbv.datoms(self.arena, .eavt, .{});
-        const out = try self.arena.alloc([5]Cell, ds.len);
-        for (ds, out) |d, *o| {
-            const v: Cell = switch (d.v) {
-                .boolean => |b| .{ .boolean = b },
-                .long, .instant => |n| .{ .int = n },
-                .double => |x| .{ .double = x },
-                .keyword => |id| .{ .keyword = (try self.fx.conn().idents.internOf(read.txn, id)).? },
-                .ref => |r| .{ .int = @intCast(r) },
-                .string, .bytes => |s| .{ .str = s },
-                .uuid => |u| blk: {
-                    const text = try self.arena.alloc(u8, 36);
-                    nextomic.datom.uuidToText(text[0..36], u);
-                    break :blk .{ .str = text };
-                },
-            };
-            o.* = .{ .{ .int = @intCast(d.e) }, .{ .int = d.a }, v, .{ .int = @intCast(key.txEntity(d.t)) }, .{ .boolean = d.added } };
-            if (!self.attr_types.contains(d.a)) {
-                if (try read.attr(d.a)) |at| try self.attr_types.put(self.arena, d.a, at.value_type);
+        const all = try self.arena.alloc([]const [5]Cell, self.dbvs.len);
+        for (self.dbvs, self.reads, all, 0..) |dbv, read, *slot, src| {
+            const ds = try dbv.datoms(self.arena, .eavt, .{});
+            const out = try self.arena.alloc([5]Cell, ds.len);
+            for (ds, out) |d, *o| {
+                const v: Cell = switch (d.v) {
+                    .boolean => |b| .{ .boolean = b },
+                    .long, .instant => |n| .{ .int = n },
+                    .double => |x| .{ .double = x },
+                    .keyword => |id| .{ .keyword = (try dbv.conn.idents.internOf(read.txn, id)).? },
+                    .ref => |r| .{ .int = @intCast(r) },
+                    .string, .bytes => |s| .{ .str = s },
+                    .uuid => |u| blk: {
+                        const text = try self.arena.alloc(u8, 36);
+                        nextomic.datom.uuidToText(text[0..36], u);
+                        break :blk .{ .str = text };
+                    },
+                };
+                o.* = .{ .{ .int = @intCast(d.e) }, .{ .int = d.a }, v, .{ .int = @intCast(key.txEntity(d.t)) }, .{ .boolean = d.added } };
+                if (!self.attr_types[src].contains(d.a)) {
+                    if (try read.attr(d.a)) |at| try self.attr_types[src].put(self.arena, d.a, at.value_type);
+                }
             }
+            slot.* = out;
         }
-        self.datoms = out;
+        self.datoms = all;
     }
 
-    /// Bottom-up naive fixpoint of every rule over the whole view.
+    /// Bottom-up naive fixpoint of every rule over the whole view of
+    /// every source.
     fn computeFacts(self: *Naive) !void {
-        for (self.rules.rules) |r| {
-            if (!self.facts.contains(r.name)) try self.facts.put(self.arena, r.name, .empty);
-        }
+        for (self.rules.rules) |r| for (0..self.dbvs.len) |src| {
+            const k = factKey(r.name, @intCast(src));
+            if (!self.facts.contains(k)) try self.facts.put(self.arena, k, .empty);
+        };
         var changed = true;
         while (changed) {
             changed = false;
-            for (self.rules.rules) |r| {
+            for (self.rules.rules) |r| for (0..self.dbvs.len) |src| {
                 var solved: std.ArrayList(Env) = .empty;
-                try self.solve(r.body, try self.emptyEnv(self.rules.vars.len), &solved);
-                const list = self.facts.getPtr(r.name).?;
+                try self.solve(r.body, try self.emptyEnv(self.rules.vars.len), &solved, @intCast(src));
+                const list = self.facts.getPtr(factKey(r.name, @intCast(src))).?;
                 for (solved.items) |e| {
                     const tuple = try self.arena.alloc(Cell, r.head.len);
                     var complete = true;
@@ -455,30 +535,31 @@ const Naive = struct {
                         changed = true;
                     }
                 }
-            }
+            };
         }
     }
 
-    fn solve(self: *Naive, clauses: []const ir.Clause, env: Env, out: *std.ArrayList(Env)) anyerror!void {
+    /// `src` is the source an unprefixed clause reads.
+    fn solve(self: *Naive, clauses: []const ir.Clause, env: Env, out: *std.ArrayList(Env), src: ir.Src) anyerror!void {
         if (clauses.len == 0) return out.append(self.arena, env);
         const rest = clauses[1..];
         switch (clauses[0]) {
-            .pattern => |p| for (self.datoms) |d| {
-                const e2 = (try self.matchPattern(p, d, env)) orelse continue;
-                try self.solve(rest, e2, out);
+            .pattern => |p| for (self.datoms[p.src orelse src]) |d| {
+                const e2 = (try self.matchPattern(p, d, env, p.src orelse src)) orelse continue;
+                try self.solve(rest, e2, out, src);
             },
-            .pred => |call| if (try self.evalPred(call, env)) try self.solve(rest, env, out),
+            .pred => |call| if (try self.evalPred(call, env, src)) try self.solve(rest, env, out, src),
             .bind => |b| {
-                const results = try self.evalFn(b.call, env);
+                const results = try self.evalFn(b.call, env, src);
                 for (results) |r| {
                     const bound = try self.bind(b.out, r, env);
-                    for (bound) |e2| try self.solve(rest, e2, out);
+                    for (bound) |e2| try self.solve(rest, e2, out, src);
                 }
             },
             .not => |n| {
                 var sub: std.ArrayList(Env) = .empty;
-                try self.solve(n.body, env, &sub);
-                if (sub.items.len == 0) try self.solve(rest, env, out);
+                try self.solve(n.body, env, &sub, src);
+                if (sub.items.len == 0) try self.solve(rest, env, out, src);
             },
             .@"or" => |o| {
                 var join: std.ArrayList(Var) = .empty;
@@ -488,7 +569,7 @@ const Naive = struct {
                 var seen: std.ArrayList(Env) = .empty;
                 for (o.branches) |br| {
                     var sub: std.ArrayList(Env) = .empty;
-                    try self.solve(br, env, &sub);
+                    try self.solve(br, env, &sub, src);
                     for (sub.items) |s| {
                         const e2 = try self.copy(env);
                         for (join.items) |v| e2[v] = s[v];
@@ -498,15 +579,15 @@ const Naive = struct {
                         };
                         if (dup) continue;
                         try seen.append(self.arena, e2);
-                        try self.solve(rest, e2, out);
+                        try self.solve(rest, e2, out, src);
                     }
                 }
             },
             .rule => |r| {
-                const list = self.facts.get(r.name) orelse return error.UnknownRule;
+                const list = self.facts.get(factKey(r.name, r.src orelse src)) orelse return error.UnknownRule;
                 for (list.items) |tuple| {
                     const e2 = (try self.unifyArgs(r.args, tuple, env)) orelse continue;
-                    try self.solve(rest, e2, out);
+                    try self.solve(rest, e2, out, src);
                 }
             },
             .source => unreachable,
@@ -527,25 +608,31 @@ const Naive = struct {
         return e2;
     }
 
-    /// The attribute id cell of the attribute with ident `kw`, or null.
-    fn attrCell(self: *Naive, kw: u32) !?Cell {
-        const id = (try self.fx.conn().idents.idOf(self.read.txn, kw)) orelse return null;
+    /// The attribute id cell of the attribute with ident `kw` in `src`, or null.
+    fn attrCell(self: *Naive, kw: u32, src: ir.Src) !?Cell {
+        const id = (try self.connOf(src).idents.idOf(self.reads[src].txn, kw)) orelse return null;
         return .{ .int = id };
     }
 
-    const InputRole = struct { entity: bool = false, keyword: bool = false };
+    const InputRole = struct { entity: bool = false, keyword: bool = false, src: ir.Src = 0 };
+
+    fn markEntity(role: *InputRole, src: ir.Src) void {
+        if (!role.entity) role.src = src;
+        role.entity = true;
+    }
 
     /// Mark the variables in an entity position or a ref attribute's
     /// value position, and those in a keyword attribute's value position.
     fn inputRoles(self: *Naive, clauses: []const ir.Clause, roles: []InputRole) !void {
         for (clauses) |c| switch (c) {
             .pattern => |p| {
-                if (p.e.asVar()) |v| roles[v].entity = true;
+                const src = p.src orelse 0;
+                if (p.e.asVar()) |v| markEntity(&roles[v], src);
                 const v = p.v.asVar() orelse continue;
                 if (p.a != .constant or p.a.constant != .cell or p.a.constant.cell != .keyword) continue;
-                const id = (try self.fx.conn().idents.idOf(self.read.txn, p.a.constant.cell.keyword)) orelse continue;
-                const at = (try self.read.attr(id)) orelse continue;
-                if (at.value_type == .ref) roles[v].entity = true;
+                const id = (try self.connOf(src).idents.idOf(self.reads[src].txn, p.a.constant.cell.keyword)) orelse continue;
+                const at = (try self.reads[src].attr(id)) orelse continue;
+                if (at.value_type == .ref) markEntity(&roles[v], src);
                 if (at.value_type == .keyword) roles[v].keyword = true;
             },
             .not => |n| try self.inputRoles(n.body, roles),
@@ -554,29 +641,31 @@ const Naive = struct {
         };
     }
 
-    fn inputEntity(self: *Naive, c: Cell) !?u64 {
+    fn inputEntity(self: *Naive, c: Cell, src: ir.Src) !?u64 {
+        const read = self.reads[src];
         switch (c) {
-            .keyword => |kw| return self.read.entid(self.arena, .{ .ident = kw }),
+            .keyword => |kw| return read.entid(self.arena, .{ .ident = kw }),
             .vm => |v| {
                 if (v.kind() != .persistent_vector or vector_mod.count(v) != 2 or vector_mod.nth(v, 0).kind() != .keyword) return null;
-                const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, vector_mod.nth(v, 0).asKeywordId())) orelse return error.UnknownAttribute;
-                const vt = self.attr_types.get(attr_id) orelse return error.UnknownAttribute;
+                const attr_id = (try self.connOf(src).idents.idOf(read.txn, vector_mod.nth(v, 0).asKeywordId())) orelse return error.UnknownAttribute;
+                const vt = self.attr_types[src].get(attr_id) orelse return error.UnknownAttribute;
                 const val = (try cellToVal(Cell.fromValue(vector_mod.nth(v, 1)), vt)) orelse return error.ValueType;
-                return self.read.entid(self.arena, .{ .lookup = .{ .a = attr_id, .v = val } });
+                return read.entid(self.arena, .{ .lookup = .{ .a = attr_id, .v = val } });
             },
             else => return null,
         }
     }
 
-    /// The cell a pattern constant compares as at position `pos`.
-    fn constCell(self: *Naive, c: ir.Constant, pos: usize, d: [5]Cell) !?Cell {
+    /// The cell a pattern constant compares as at position `pos` in `src`.
+    fn constCell(self: *Naive, c: ir.Constant, pos: usize, d: [5]Cell, src: ir.Src) !?Cell {
         const a = self.arena;
+        const read = self.reads[src];
         switch (c) {
             .lookup => |l| {
-                const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, l.attr)) orelse return null;
-                const vt = self.attr_types.get(attr_id) orelse return null;
+                const attr_id = (try self.connOf(src).idents.idOf(read.txn, l.attr)) orelse return null;
+                const vt = self.attr_types[src].get(attr_id) orelse return null;
                 const val = (try cellToVal(l.v, vt)) orelse return null;
-                const eid = (try self.dbv.entid(a, .{ .lookup = .{ .a = attr_id, .v = val } })) orelse return null;
+                const eid = (try self.dbvs[src].entid(a, .{ .lookup = .{ .a = attr_id, .v = val } })) orelse return null;
                 return .{ .int = @intCast(eid) };
             },
             .cell => |cell| {
@@ -584,13 +673,13 @@ const Naive = struct {
                     const is_ref = switch (pos) {
                         0, 1 => true,
                         2 => blk: {
-                            const vt = self.attr_types.get(@intCast(d[1].int)) orelse break :blk false;
+                            const vt = self.attr_types[src].get(@intCast(d[1].int)) orelse break :blk false;
                             break :blk vt == .ref;
                         },
                         else => false,
                     };
                     if (is_ref) {
-                        const eid = (try self.fx.conn().idents.idOf(self.read.txn, cell.keyword)) orelse return null;
+                        const eid = (try self.connOf(src).idents.idOf(read.txn, cell.keyword)) orelse return null;
                         return .{ .int = @intCast(eid) };
                     }
                 }
@@ -605,7 +694,7 @@ const Naive = struct {
         }
     }
 
-    fn matchPattern(self: *Naive, p: ir.Pattern, d: [5]Cell, env: Env) !?Env {
+    fn matchPattern(self: *Naive, p: ir.Pattern, d: [5]Cell, env: Env, src: ir.Src) !?Env {
         var e2: ?Env = null;
         for (p.terms(), 0..) |t, pos| {
             switch (t) {
@@ -614,7 +703,7 @@ const Naive = struct {
                     const cur = if (e2) |e| e[v] else env[v];
                     if (cur) |have| {
                         // A keyword in the attribute position names the attribute.
-                        const want = if (pos == 1 and have == .keyword) (try self.attrCell(have.keyword)) orelse return null else have;
+                        const want = if (pos == 1 and have == .keyword) (try self.attrCell(have.keyword, src)) orelse return null else have;
                         if (!want.eql(d[pos])) return null;
                     } else {
                         if (e2 == null) e2 = try self.copy(env);
@@ -622,7 +711,7 @@ const Naive = struct {
                     }
                 },
                 .constant => |c| {
-                    const want = (try self.constCell(c, pos, d)) orelse return null;
+                    const want = (try self.constCell(c, pos, d, src)) orelse return null;
                     if (!want.eql(d[pos])) return null;
                 },
             }
@@ -638,7 +727,7 @@ const Naive = struct {
         };
     }
 
-    fn evalPred(self: *Naive, call: ir.Call, env: Env) !bool {
+    fn evalPred(self: *Naive, call: ir.Call, env: Env, src: ir.Src) !bool {
         const cells = try self.arena.alloc(Cell, call.args.len);
         for (call.args, cells) |a, *c| c.* = try argCell(a, env);
         switch (call.f) {
@@ -666,7 +755,7 @@ const Naive = struct {
                     for (cells[1..]) |c| if (!cells[0].eql(c)) return true;
                     return false;
                 },
-                .missing => return (try self.lookup(cells[1], cells[2])) == null,
+                .missing => return (try self.lookup(cells[1], cells[2], call.args[0].src orelse src)) == null,
                 else => return error.Unsupported,
             },
             .user => |sym| {
@@ -674,19 +763,24 @@ const Naive = struct {
                 for (cells, vals) |c, *v| v.* = try self.cellValue(c);
                 return (try Fx.hookCall(@ptrCast(self.fx), sym, vals)).isTruthy();
             },
+            .variable => |f| {
+                const vals = try self.arena.alloc(Value, cells.len);
+                for (cells, vals) |c, *v| v.* = try self.cellValue(c);
+                return (try Fx.hookApply(@ptrCast(self.fx), try self.cellValue(env[f] orelse return error.Unbound), vals)).isTruthy();
+            },
         }
     }
 
-    /// First value of attribute `attr` (keyword cell) on `e` in the view.
-    fn lookup(self: *Naive, e: Cell, attr: Cell) !?Cell {
-        const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, attr.keyword)) orelse return null;
-        for (self.datoms) |d| {
+    /// First value of attribute `attr` (keyword cell) on `e` in `src`.
+    fn lookup(self: *Naive, e: Cell, attr: Cell, src: ir.Src) !?Cell {
+        const attr_id = (try self.connOf(src).idents.idOf(self.reads[src].txn, attr.keyword)) orelse return null;
+        for (self.datoms[src]) |d| {
             if (d[0].eql(e) and d[1].int == attr_id) return d[2];
         }
         return null;
     }
 
-    fn evalFn(self: *Naive, call: ir.Call, env: Env) ![]Value {
+    fn evalFn(self: *Naive, call: ir.Call, env: Env, src: ir.Src) ![]Value {
         const cells = try self.arena.alloc(Cell, call.args.len);
         for (call.args, cells) |a, *c| c.* = try argCell(a, env);
         const vals = try self.arena.alloc(Value, cells.len);
@@ -694,11 +788,19 @@ const Naive = struct {
         const result: Value = switch (call.f) {
             .builtin => |b| switch (b) {
                 .ground, .untuple => vals[0],
-                .get_else => try self.cellValue((try self.lookup(cells[1], cells[2])) orelse cells[3]),
+                .get_else => try self.cellValue((try self.lookup(cells[1], cells[2], call.args[0].src orelse src)) orelse cells[3]),
+                .get_some => blk: {
+                    for (cells[2..]) |attr| {
+                        const found = (try self.lookup(cells[1], attr, call.args[0].src orelse src)) orelse continue;
+                        break :blk try vector_mod.fromSlice(&self.fx.heap, &.{ try self.cellValue(attr), try self.cellValue(found) });
+                    }
+                    break :blk value.nilValue();
+                },
                 .tuple => try vector_mod.fromSlice(&self.fx.heap, vals),
                 else => return error.Unsupported,
             },
             .user => |sym| try Fx.hookCall(@ptrCast(self.fx), sym, vals),
+            .variable => |f| try Fx.hookApply(@ptrCast(self.fx), try self.cellValue(env[f] orelse return error.Unbound), vals),
         };
         return self.arena.dupe(Value, &.{result});
     }
@@ -740,6 +842,18 @@ const Naive = struct {
         return out.toOwnedSlice(self.arena);
     }
 };
+
+fn cellAsc(_: void, a: Cell, b: Cell) bool {
+    return a.order(b) == .lt;
+}
+
+fn num(c: Cell) !f64 {
+    return switch (c) {
+        .int => |n| @floatFromInt(n),
+        .double => |d| d,
+        else => error.ValueType,
+    };
+}
 
 fn cellToVal(c: Cell, vt: key.ValueType) !?key.Val {
     return switch (vt) {
@@ -907,6 +1021,28 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     try checkCount(fx, dbv, "[:find ?t :where [?e :person/name \"Ann\"] [?e :person/age ?a] [(tuple ?a \"x\") ?t]]", none, 1);
     try checkCount(fx, dbv, "[:find ?a ?b :where [(ground [10 20]) ?t] [(untuple ?t) [?a ?b]]]", none, 1);
     try checkCount(fx, dbv, "[:find ?n ?a2 :where [?e :person/name ?n] [?e :person/age ?a] [(add ?a ?a) ?a2] [(> ?a2 60)]]", none, 3);
+    // get-some binds [attr value] for the first attribute present; != is not=;
+    // identity, str, subs and count are ordinary functions through the hook.
+    try checkCount(fx, dbv, "[:find ?n ?a ?v :where [?e :person/name ?n] [(get-some $ ?e :person/bio :person/height :person/age) [?a ?v]]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(get-some $ ?e :person/bio :person/height) [?a ?v]] [(= ?a :person/bio)]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(get-some $ ?e :person/tags :person/bio) [_ ?v]]]", none, 5);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(get-some $ ?e :person/role :person/bio) [?a ?v]]]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(!= ?n \"Cy\")]]", none, 5);
+    try checkCount(fx, dbv, "[:find ?n ?m :where [?e :person/name ?n] [(identity ?n) ?m]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?s :where [?e :person/name ?n] [(str ?n \"!\") ?s]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?p :where [?e :person/name ?n] [(subs ?n 0 1) ?p]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(count ?n) ?c] [(< ?c 3)]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?x :where [(ground [7 8]) ?t] [(untuple ?t) [?x _]]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?t :where [?e :person/name \"Ann\"] [?e :person/age ?a] [(tuple ?a ?e) ?t] [(untuple ?t) [?a2 ?e2]] [(= ?a ?a2)] [(= ?e ?e2)]]", none, 1);
+    for ([_][]const u8{
+        "[:find ?n :where [?e :person/name ?n] [(get-some $ ?e) [?a ?v]]]",
+        "[:find ?n :where [?e :person/name ?n] [(get-some $ ?e \"bio\") [?a ?v]]]",
+        "[:find ?n :where [?e :person/name ?n] [(get-some $ ?e :person/bio)]]",
+    }) |src| {
+        var d: query.Diag = .{};
+        try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, src, none, &d));
+        try testing.expect(d.message.len > 0);
+    }
     // An output variable bound before the step unifies: the clause
     // keeps the rows whose result equals the bound value, including
     // when the planner runs a cheaper pattern before the function.
@@ -940,6 +1076,21 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     try checkCount(fx, dbv, "[:find ?n (distinct ?i) :where [?o :order/customer ?c] [?c :person/name ?n] [?o :order/items ?i]]", none, 3);
     try checkCount(fx, dbv, "[:find (max ?n) :where [_ :person/name ?n]]", none, 1);
     try checkCount(fx, dbv, "[:find ?t :with ?o :where [?o :order/status :status/open] [?o :order/total ?t]]", none, 2);
+    // Statistics, n-ary min and max, a custom aggregate over the group.
+    try checkCount(fx, dbv, "[:find (median ?a) (variance ?a) (stddev ?a) :with ?e :where [?e :person/age ?a]]", none, 1);
+    try checkCount(fx, dbv, "[:find (median ?h) :where [_ :person/height ?h]]", none, 1);
+    try checkCount(fx, dbv, "[:find (median ?n) :where [?e :person/boss _] [?e :person/name ?n]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?st (median ?t) (max 2 ?t) (min 1 ?t) :where [?o :order/status ?st] [?o :order/total ?t]]", none, 2);
+    try checkCount(fx, dbv, "[:find (max 3 ?a) (min 10 ?a) :with ?e :where [?e :person/age ?a]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?n (total ?a) :with ?o :where [?o :order/customer ?c] [?c :person/name ?n] [?o :order/number ?a]]", none, 3);
+    try checkCount(fx, dbv, "[:find (total ?a) :with ?e :where [?e :person/age ?a]]", none, 1);
+    for ([_][]const u8{
+        "[:find (median ?n) (variance ?n) :where [_ :person/name ?n]]",
+        "[:find (stddev ?r) :where [_ :person/role ?r]]",
+    }) |src| {
+        try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, src, none));
+        try testing.expectError(error.ValueType, Naive.run(fx, fx.arena(), dbv, src, none));
+    }
 
     // Find specs (the row shape is the same; the value shape is checked below).
     try checkCount(fx, dbv, "[:find ?n . :where [?e :person/name ?n] [?e :person/age 55]]", none, 1);
@@ -948,8 +1099,17 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     try checkCount(fx, dbv, "[:find (count ?e) . :where [?e :person/tags :green]]", none, 1);
     try checkCount(fx, dbv, "[:find [(min ?a) (max ?a)] :where [_ :person/age ?a]]", none, 1);
 
+    // Pull expressions and :keys shape the value, not the rows.
+    try checkCount(fx, dbv, "[:find (pull ?e [:person/name]) :where [?e :person/age 30]]", none, 2);
+    try checkCount(fx, dbv, "[:find (pull ?e [*]) ?n :where [?e :person/name ?n] [?e :person/tags _]]", none, 4);
+    try checkCount(fx, dbv, "[:find (pull ?c [:person/name]) (count ?o) :where [?o :order/customer ?c]]", none, 3);
+    try checkCount(fx, dbv, "[:find [(pull ?e [:person/name]) ...] :where [?e :person/tags :green]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?n ?a :keys name age :where [?e :person/name ?n] [?e :person/age ?a]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?st (sum ?t) :strs status total :where [?o :order/status ?st] [?o :order/total ?t]]", none, 2);
+
     // Map form.
     try checkCount(fx, dbv, "{:find [?n] :where [[?e :person/name ?n] [?e :person/tags :green]]}", none, 2);
+    try checkCount(fx, dbv, "{:find [?n ?a] :keys [n a] :where [[?e :person/name ?n] [?e :person/age ?a]]}", none, 6);
 }
 
 test "corpus: every :in form" {
@@ -972,6 +1132,31 @@ test "corpus: every :in form" {
     try checkCount(fx, dbv, "[:find ?p :in $ % :where (admin ?p)]", &.{ nil, try fx.read(rules_src) }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ % ?t :where (has-tag ?p ?t) [?p :person/name ?n]]", &.{ nil, try fx.read(rules_src), value.fromKeywordId(try fx.kwId("green")) }, 4);
     try checkCount(fx, dbv, "[:find ?x :in $ ?x]", &.{ nil, value.fromFixnum(5).? }, 1);
+    // A variable in function position applies the value it holds: as
+    // a predicate, as a function binding under every binding form, in
+    // a rule body, and bound by an earlier clause rather than `:in`.
+    const even_fn = try fx.read("even?");
+    const inc_fn = try fx.read("inc");
+    try checkCount(fx, dbv, "[:find ?n :in $ ?pred :where [?e :person/name ?n] [?e :person/age ?a] [(?pred ?a)]]", &.{ nil, even_fn }, 3);
+    try checkCount(fx, dbv, "[:find ?n ?a1 :in $ ?f :where [?e :person/name ?n] [?e :person/age ?a] [(?f ?a) ?a1]]", &.{ nil, inc_fn }, 6);
+    try checkCount(fx, dbv, "[:find ?n ?i :in $ ?f :where [?e :person/name ?n] [(?f 2) [?i ...]]]", &.{ nil, try fx.read("range") }, 12);
+    try checkCount(fx, dbv, "[:find ?n ?x ?y :in $ ?f :where [?e :person/name ?n] [?e :person/age ?a] [(?f ?a ?n) [?x ?y]]]", &.{ nil, try fx.read("pair") }, 6);
+    try checkCount(fx, dbv, "[:find ?n ?h :in $ ?f :where [?e :person/name ?n] [?e :person/age ?a] [(?f ?a) [[_ ?h]]]]", &.{ nil, try fx.read("halves") }, 12);
+    try checkCount(fx, dbv, "[:find ?n :in $ [?f ...] :where [?e :person/name ?n] [?e :person/age ?a] [(?f ?a) ?r] [(> ?r 41)]]", &.{ nil, try fx.read("[inc identity]") }, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?f :where [(ground [1 2]) [?x ...]] [(?f ?x ?x) ?y] [?e :person/age ?a] [(< ?y 3)] [?e :person/name ?n]]", &.{ nil, try fx.read("add") }, 6);
+    // The naive fixpoint runs rule bodies with nothing bound, so a rule
+    // that applies a head-bound function is checked by row count.
+    const via_rule = try runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ % ?pred :where (age-ok ?p ?pred) [?p :person/name ?n]]", &.{ nil, try fx.read("[[(age-ok ?p ?f) [?p :person/age ?a] [(?f ?a)]]]"), even_fn });
+    try testing.expectEqual(@as(usize, 3), via_rule.len);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?g :where [(identity ?g) ?pred] [?e :person/age ?a] [(?pred ?a)] [?e :person/name ?n]]", &.{ nil, even_fn }, 3);
+    // A keyword in function position looks itself up in a map.
+    try checkCount(fx, dbv, "[:find ?n ?v :in $ ?k :where [?e :person/name ?n] [(ground {:x 1}) ?m] [(?k ?m) ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("x")) }, 6);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?k :where [?e :person/name ?n] [(ground {:x 1}) ?m] [(?k ?m) ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("y")) }, 0);
+    // A value that is not callable is an error, and the function
+    // variable must be bound before the call runs.
+    try testing.expectError(error.NotCallable, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?f :where [?e :person/name ?n] [(?f ?n)]]", &.{ nil, value.fromFixnum(7).? }));
+    try testing.expectError(error.NotCallable, Naive.run(fx, fx.arena(), dbv, "[:find ?n :in $ ?f :where [?e :person/name ?n] [(?f ?n)]]", &.{ nil, value.fromFixnum(7).? }));
+    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?n :where [?e :person/name ?n] [(?f ?n)]]", &.{nil}));
     // A bound attribute variable, by id and by ident; an unknown ident matches nothing.
     const name_id = (try dbv.entid(fx.arena(), .{ .ident = try fx.kwId("person/name") })).?;
     try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromFixnum(@intCast(name_id)).? }, 6);
@@ -1041,11 +1226,22 @@ test "corpus: not, not-join, or, or-join, and" {
     try checkCount(fx, dbv, "[:find ?n :where (and [?e :person/name ?n] [?e :person/active true])]", none, 3);
     try checkCount(fx, dbv, "[:find ?o :where (or-join [?o] (and [?o :order/total ?t] [(> ?t 50.0)]) [?o :order/items \"pear\"])]", none, 2);
     // Errors: not with nothing bound outside, or branches with different vars, unbound pattern.
-    // Every planner refusal carries a reason.
+    // A scoping refusal names the variable and the clause it is in.
+    const Case = struct { src: []const u8, message: []const u8, clause: ?usize };
+    for ([_]Case{
+        .{ .src = "[:find ?n :where [?e :person/name ?n] (not [?x :person/tags :blue])]", .message = "not shares no variable with the clauses around it: ?x is bound nowhere outside; not joins on a variable bound outside it", .clause = 1 },
+        .{ .src = "[:find ?n :where [?e :person/name ?n] (or [?e :person/tags :blue] [?x :person/tags :green])]", .message = "or branch 2 does not mention ?e, which branch 1 does; every or branch uses the same variables (or-join names the join variables)", .clause = 1 },
+        .{ .src = "[:find ?n :where [?e :person/name ?n] (or-join [?e ?w] [?e :person/tags ?w] [?e :person/age 30])]", .message = "or-join branch 2 leaves ?w unbound; every branch binds every join variable", .clause = 1 },
+        .{ .src = "[:find ?e :where [?e :person/name ?n] [(< ?zz 3)]]", .message = "?zz is never bound; a predicate, function or rule argument needs a pattern, an input or an earlier clause to bind it", .clause = 1 },
+        .{ .src = "[:find ?e :where [?e :person/name ?n] [(?f ?n)] [?e :person/age 30]]", .message = "?f in function position is never bound", .clause = 1 },
+        .{ .src = "[:find ?e :where [?e :person/name ?n] (not-join [?e] (not [?q :person/tags :blue]))]", .message = "not shares no variable with the clauses around it: ?q is bound nowhere outside; not joins on a variable bound outside it", .clause = 1 },
+    }) |case| {
+        var d: query.Diag = .{};
+        try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, case.src, none, &d));
+        try testing.expectEqualStrings(case.message, d.message);
+        try testing.expectEqual(case.clause, d.clause);
+    }
     for ([_][]const u8{
-        "[:find ?n :where [?e :person/name ?n] (not [?x :person/tags :blue])]",
-        "[:find ?n :where [?e :person/name ?n] (or [?e :person/tags :blue] [?x :person/tags :green])]",
-        "[:find ?e :where [?e :person/name ?n] [(< ?zz 3)]]",
         "[:find ?e :where [?e [:person/email \"ann@x\"] ?v]]",
         "[:find ?e :where [?e \"name\" ?v]]",
         "[:find ?e :where [?e :person/name ?v \"tx\"]]",
@@ -1148,6 +1344,58 @@ test "corpus: as-of, since, history views" {
     try checkCount(fx, hist, "[:find ?n :where [?e :person/name ?n] (not [?e :person/name _ _ false])]", none, 5);
 }
 
+test "corpus: multiple data sources" {
+    const fx = try Fx.init("q_sources");
+    defer fx.deinit();
+    try loadCorpus(fx);
+    const now = try fx.db();
+    const before = try nextomic.natives.boxDb(&fx.heap, now.asOf(5));
+    const hist = try nextomic.natives.boxDb(&fx.heap, now.withHistory());
+    const nil = value.nilValue();
+    const rules = try fx.read(rules_src);
+
+    // A prefixed pattern reads its source; unprefixed and `$` read the db.
+    try checkCount(fx, now, "[:find ?n ?a ?b :in $ $2 :where [?e :person/name ?n] [?e :person/age ?a] [$2 ?e :person/age ?b] [(not= ?a ?b)]]", &.{ nil, before }, 1);
+    try checkCount(fx, now, "[:find ?n :in $ $2 :where [$ ?e :person/name ?n] (not [$2 ?e :person/name ?n])]", &.{ nil, before }, 2);
+    try checkCount(fx, now, "[:find ?n :in $ $2 :where [?e :person/name ?n] [$2 ?e :person/tags :red _ false]]", &.{ nil, hist }, 1);
+    try checkCount(fx, now, "[:find ?e :in $ $2 :where [$2 ?e :person/name ?n] (not [?e :person/name ?n])]", &.{ nil, before }, 1);
+    try checkCount(fx, now, "[:find ?n :in $ $2 :where [?e :person/name ?n] (or [$2 ?e :person/age 25] [?e :person/age 55])]", &.{ nil, before }, 2);
+    // missing? and get-else read the source they name.
+    try checkCount(fx, now, "[:find ?n :in $ $2 :where [?e :person/name ?n] [(missing? $2 ?e :person/name)]]", &.{ nil, before }, 1);
+    try checkCount(fx, now, "[:find ?n ?a :in $ $2 :where [?e :person/name ?n] [(get-else $2 ?e :person/age 0) ?a]]", &.{ nil, before }, 6);
+    // A rule called under a source reads it, non-recursive and recursive.
+    try checkCount(fx, now, "[:find ?p :in $ $2 % :where ($2 admin ?p)]", &.{ nil, before, rules }, 2);
+    try checkCount(fx, now, "[:find ?n :in $ $2 % :where [?b :person/email \"bob@x\"] ($2 friend ?a ?b) [?a :person/name ?n]]", &.{ nil, before, rules }, 2);
+    try checkCount(fx, now, "[:find ?n :in $ $2 % :where [?b :person/email \"bob@x\"] (friend ?a ?b) [?a :person/name ?n]]", &.{ nil, before, rules }, 2);
+    try checkCount(fx, now, "[:find ?a ?b :in $ $2 % :where ($2 reach ?a ?b)]", &.{ nil, before, rules }, 16);
+    try checkCount(fx, now, "[:find ?l :in $ $2 % :where [?a :node/label \"n1\"] ($2 reach ?a ?b) [?b :node/label ?l]]", &.{ nil, before, rules }, 5);
+    // Aggregates and :with over a join across sources.
+    try checkCount(fx, now, "[:find ?n (count ?o) :in $ $2 :where [$2 ?e :person/name ?n] [?o :order/customer ?e]]", &.{ nil, before }, 3);
+    try checkCount(fx, now, "[:find (sum ?a) :with ?e :in $ $2 :where [?e :person/name _] [$2 ?e :person/age ?a]]", &.{ nil, before }, 1);
+    // An input in an entity role resolves in the source of the pattern that gave it the role.
+    const ann_ref = try fx.read("[:person/email \"ann@x\"]");
+    try checkCount(fx, now, "[:find ?a :in $ $2 ?e :where [$2 ?e :person/age ?a]]", &.{ nil, before, ann_ref }, 1);
+    try checkCount(fx, now, "[:find ?a :in $ $2 ?e :where [$2 ?e :person/age ?a]]", &.{ nil, before, try fx.read("[:person/email \"flo@x\"]") }, 0);
+    // Three sources.
+    try checkCount(fx, now, "[:find ?n :in $ $2 $3 :where [?e :person/name ?n] [$2 ?e :person/age 25] [$3 ?e :person/age 26 _ true]]", &.{ nil, before, hist }, 1);
+    // Errors: an undeclared source, a missing input, an input that is not a db.
+    var d: query.Diag = .{};
+    try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), now, "[:find ?n :in $ $2 :where [$3 ?e :person/name ?n]]", &.{ nil, before }, &d));
+    try testing.expect(d.message.len > 0);
+    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), now, "[:find ?n :in $ $2 :where [$2 ?e :person/name ?n]]", &.{nil}));
+    try testing.expectError(error.KindMismatch, runEngine(fx, fx.arena(), now, "[:find ?n :in $ $2 :where [$2 ?e :person/name ?n]]", &.{ nil, value.fromFixnum(1).? }));
+
+    // explain names the source of a scan; q without a db_of refuses a second source.
+    var diag: query.Diag = .{};
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :in $ $2 :where [?e :person/name ?n] [$2 ?e :person/age 25]]"), now, &.{ nil, before }, &diag, .{ .db_of = &nextomic.natives.dbOf }, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "scan [$2 ?e") != null);
+    try testing.expectError(error.QuerySyntax, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n :in $ $2 :where [$2 ?e :person/name ?n]]"), now, &.{ nil, before }, &diag, .{}));
+    const res = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n . :in $ $2 :where [?e :person/name ?n] [$2 ?e :person/age 25]]"), now, &.{ nil, before }, &diag, .{ .db_of = &nextomic.natives.dbOf });
+    try testing.expectEqualStrings("Bob", string_mod.asBytes(res));
+}
+
 test "results materialise as set, scalar, collection, tuple; caches; explain" {
     const fx = try Fx.init("q_values");
     defer fx.deinit();
@@ -1188,10 +1436,76 @@ test "results materialise as set, scalar, collection, tuple; caches; explain" {
     try testing.expectApproxEqAbs(@as(f64, 215.0 / 6.0), vector_mod.nth(agg, 2).asFloat(), 1e-9);
     try testing.expectEqual(@as(usize, 5), champ.setCount(vector_mod.nth(agg, 3)));
 
+    // Statistics and random samples as values: an even median is the
+    // mean of the two middle values, variance is over the count, sample
+    // is distinct, rand repeats, both are cut at n and empty for no rows.
+    const stats = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [(median ?a) (variance ?a) (stddev ?a) (max 2 ?a) (min 2 ?a) (total ?a)] :with ?e :where [?e :person/age ?a]]"), dbv, none, &diag, opts);
+    // ages 26 30 30 33 41 55: median 31.5, mean 35.8333, variance 94.4722
+    try testing.expectApproxEqAbs(@as(f64, 31.5), vector_mod.nth(stats, 0).asFloat(), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 94.47222222222223), vector_mod.nth(stats, 1).asFloat(), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, @sqrt(94.47222222222223)), vector_mod.nth(stats, 2).asFloat(), 1e-9);
+    try testing.expectEqual(@as(i64, 55), vector_mod.nth(vector_mod.nth(stats, 3), 0).asFixnum());
+    try testing.expectEqual(@as(i64, 41), vector_mod.nth(vector_mod.nth(stats, 3), 1).asFixnum());
+    try testing.expectEqual(@as(i64, 26), vector_mod.nth(vector_mod.nth(stats, 4), 0).asFixnum());
+    try testing.expectEqual(@as(i64, 30), vector_mod.nth(vector_mod.nth(stats, 4), 1).asFixnum());
+    try testing.expectEqual(@as(i64, 215), vector_mod.nth(stats, 5).asFixnum());
+    const odd_median = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (median ?a) . :where [?e :person/age ?a] [(< ?a 41)]]"), dbv, none, &diag, opts);
+    try testing.expectEqual(@as(i64, 30), odd_median.asFixnum());
+    const picks = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [(sample 3 ?a) (rand 8 ?a) (sample 100 ?a) (sample 0 ?a)] :where [?e :person/age ?a]]"), dbv, none, &diag, opts);
+    try testing.expectEqual(@as(usize, 3), vector_mod.count(vector_mod.nth(picks, 0)));
+    try testing.expectEqual(@as(usize, 8), vector_mod.count(vector_mod.nth(picks, 1)));
+    try testing.expectEqual(@as(usize, 5), vector_mod.count(vector_mod.nth(picks, 2)));
+    try testing.expectEqual(@as(usize, 0), vector_mod.count(vector_mod.nth(picks, 3)));
+    const all_ages = try fx.read("#{26 30 33 41 55}");
+    var sit = vector_mod.Cursor.init(vector_mod.nth(picks, 2));
+    while (sit.next()) |x| try testing.expect(champ.setContains(all_ages, x, &dispatch.hashValue, &dispatch.equal));
+    // No rows form no group: an aggregate-only result is empty, not zero.
+    const no_rows = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [(sample 3 ?a) (rand 3 ?a) (median ?a) (max 2 ?a)] :where [?e :person/age ?a] [(> ?a 100)]]"), dbv, none, &diag, opts);
+    try testing.expect(no_rows.isNil());
+
+    // Pull expressions in :find yield the pattern's map per row, in
+    // every find spec and beside an aggregate; a history db refuses them.
+    const pulled = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (pull ?e [:person/name :person/age]) :where [?e :person/email \"cy@x\"]]"), dbv, none, &diag, opts);
+    try testing.expectEqual(@as(usize, 1), champ.setCount(pulled));
+    var pit = champ.setIter(pulled);
+    const cy_row = pit.next().?;
+    const cy_map = vector_mod.nth(cy_row, 0);
+    try testing.expect(cy_map.kind() == .persistent_map);
+    try testing.expectEqualStrings("Cy", string_mod.asBytes((try fx.getName(cy_map, "person/name")).?));
+    try testing.expectEqual(@as(i64, 41), (try fx.getName(cy_map, "person/age")).?.asFixnum());
+    const pulled_one = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (pull ?e [:person/name]) . :where [?e :person/email \"cy@x\"]]"), dbv, none, &diag, opts);
+    try testing.expectEqualStrings("Cy", string_mod.asBytes((try fx.getName(pulled_one, "person/name")).?));
+    const pulled_many = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [(pull ?e [:person/name]) ...] :where [?e :person/tags :green]]"), dbv, none, &diag, opts);
+    try testing.expectEqual(@as(usize, 2), vector_mod.count(pulled_many));
+    try testing.expect(vector_mod.nth(pulled_many, 0).kind() == .persistent_map);
+    const pulled_agg = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [(pull ?c [:person/name]) (count ?o)] :where [?o :order/customer ?c] [?c :person/email \"ann@x\"]]"), dbv, none, &diag, opts);
+    try testing.expectEqualStrings("Ann", string_mod.asBytes((try fx.getName(vector_mod.nth(pulled_agg, 0), "person/name")).?));
+    try testing.expectEqual(@as(i64, 2), vector_mod.nth(pulled_agg, 1).asFixnum());
+    try testing.expectError(error.HistoryView, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (pull ?e [:person/name]) :where [?e :person/age 30]]"), dbv.withHistory(), none, &diag, opts));
+    try testing.expectError(error.PullSyntax, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (pull ?e [bogus]) :where [?e :person/age 30]]"), dbv, none, &diag, opts));
+    try testing.expect(diag.message.len > 0);
+    try testing.expectError(error.ValueType, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (pull ?n [:person/name]) :where [?e :person/name ?n]]"), dbv, none, &diag, opts));
+
+    // :keys, :strs and :syms return a vector of maps under those names.
+    const keyed = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n ?a :keys name age :where [?e :person/name ?n] [?e :person/age ?a] [(< ?a 31)]]"), dbv, none, &diag, opts);
+    try testing.expect(keyed.kind() == .persistent_vector);
+    try testing.expectEqual(@as(usize, 3), vector_mod.count(keyed));
+    const first = vector_mod.nth(keyed, 0);
+    try testing.expect((try fx.getName(first, "name")).?.kind() == .string);
+    try testing.expect((try fx.getName(first, "age")).?.kind() == .fixnum);
+    const strs = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n :strs name :where [?e :person/email \"cy@x\"] [?e :person/name ?n]]"), dbv, none, &diag, opts);
+    const strs_v = champ.mapGet(vector_mod.nth(strs, 0), try fx.str("name"), &dispatch.hashValue, &dispatch.equal);
+    try testing.expectEqualStrings("Cy", string_mod.asBytes(strs_v.present));
+    const syms = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n (count ?e) :syms name n :where [?e :person/name ?n]]"), dbv, none, &diag, opts);
+    try testing.expectEqual(@as(usize, 6), vector_mod.count(syms));
+    const syms_v = champ.mapGet(vector_mod.nth(syms, 0), try fx.read("n"), &dispatch.hashValue, &dispatch.equal);
+    try testing.expectEqual(@as(i64, 1), syms_v.present.asFixnum());
+    try testing.expectError(error.QuerySyntax, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n ?a :keys name :where [?e :person/name ?n] [?e :person/age ?a]]"), dbv, none, &diag, opts));
+
     // Keyword and string values come back as VM values; the cache serves repeats.
     const kws = try query.q(testing.allocator, fx.interner(), &fx.heap, rel_q, dbv, none, &diag, opts);
     try testing.expectEqual(@as(usize, 3), champ.setCount(kws));
-    try testing.expectEqual(@as(usize, 6), cache.count());
+    try testing.expectEqual(@as(usize, 20), cache.count());
     const rules_q = try fx.read("[:find [?n ...] :in $ % :where (admin ?p) [?p :person/name ?n]]");
     const rules_v = try fx.read(rules_src);
     const admins = try query.q(testing.allocator, fx.interner(), &fx.heap, rules_q, dbv, &.{ value.nilValue(), rules_v }, &diag, opts);
@@ -1221,6 +1535,26 @@ test "results materialise as set, scalar, collection, tuple; caches; explain" {
     out.clearRetainingCapacity();
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?a :where [?e :person/age ?a] [(identity ?e) ?e2] [?e2 :person/email \"ann@x\"]]"), dbv, none, &diag, opts, &out.writer);
     try testing.expect(std.mem.indexOf(u8, out.written(), "3. bind (identity ?e) -> ?e2!") != null);
+    // Every step ends with its join kind (scans) and estimated rows; a
+    // seek per row is `nested`, a constant-prefix scan joined on the
+    // shared variables is `hash`.
+    out.clearRetainingCapacity();
+    try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :where [?e :person/age 30] [?e :person/name ?n]]"), dbv, none, &diag, opts, &out.writer);
+    const table = out.written();
+    try testing.expect(std.mem.indexOf(u8, table, "1. scan [?e :person/age 30 _ _] aevt") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "hash    rows~6") != null);
+    var lines = std.mem.splitScalar(u8, table, '\n');
+    var steps: usize = 0;
+    while (lines.next()) |l| {
+        if (l.len == 0 or std.mem.startsWith(u8, l, "rows~")) continue;
+        steps += 1;
+        try testing.expect(std.mem.indexOf(u8, l, " rows~") != null);
+    }
+    try testing.expectEqual(@as(usize, 2), steps);
+    // A bound attribute variable seeks per row.
+    out.clearRetainingCapacity();
+    try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?v :in $ ?a ?e :where [?e ?a ?v]]"), dbv, &.{ value.nilValue(), try fx.kw("person/name"), value.fromFixnum(1).? }, &diag, opts, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "nested  rows~") != null);
 }
 
 test "transitive closure over a 5k-edge chain" {
@@ -1277,7 +1611,8 @@ test "transitive closure over a 5k-edge chain" {
 }
 
 test "benchmark: 200k datoms, three-way join" {
-    const fx = try Fx.init("q_bench");
+    // A benchmark measures the engine, not the testing allocator.
+    const fx = try Fx.initWith("q_bench", std.heap.c_allocator);
     defer fx.deinit();
     _ = try fx.transact(
         \\[{:db/ident :emp/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -1313,7 +1648,7 @@ test "benchmark: 200k datoms, three-way join" {
     const rnd = prng.random();
     while (start < emps) : (start += batch) {
         var ops: std.ArrayList(nextomic.Op) = .empty;
-        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         for (start..start + batch) |i| {
@@ -1335,32 +1670,71 @@ test "benchmark: 200k datoms, three-way join" {
     const q3 = try fx.read("[:find ?n ?dn :where [?d :dept/name \"d7\"] [?e :emp/dept ?d] [?e :emp/name ?n] [?d :dept/name ?dn]]");
     const q_age = try fx.read("[:find ?n ?dn :where [?e :emp/age 33] [?e :emp/dept ?d] [?d :dept/name ?dn] [?e :emp/name ?n]]");
     const q_hash = try fx.read("[:find (count ?e) . :where [?e :emp/active true] [?e :emp/dept ?d] [?d :dept/name \"d3\"]]");
+    // Two joins either side of the nested-loop/hash-join crossover: the
+    // rows out of the age seeks decide how :emp/name and :emp/salary run.
+    const q_join = try fx.read("[:find (count ?n) . :in $ [?a ...] :where [?e :emp/age ?a] [?e :emp/name ?n] [?e :emp/salary ?s]]");
+    const ages_one = try fx.read("[33]");
+    const ages_mid = try fx.read("[33 34 35]");
+    const ages_big = try fx.read("[20 21 22 23 24 25 26]");
 
-    // Warm, then time; rows first (no heap copy), then the full call.
-    _ = try query.q(testing.allocator, fx.interner(), &fx.heap, q3, dbv, none, &diag, opts);
-    const r0 = nowNs();
-    const rows3 = try runEngine(fx, fx.arena(), dbv, "[:find ?n ?dn :where [?d :dept/name \"d7\"] [?e :emp/dept ?d] [?e :emp/name ?n] [?d :dept/name ?dn]]", none);
-    const r1 = nowNs();
+    // Rows first (no heap copy), then the full call; each timing is
+    // the best of a few runs, so a cold page or a stray page fault
+    // does not stand for the engine.
+    const reps: usize = 5;
+    var best_rows: u64 = std.math.maxInt(u64);
+    var rows3: []const Row = &.{};
+    for (0..reps) |_| {
+        const r0 = nowNs();
+        rows3 = try runEngine(fx, fx.arena(), dbv, "[:find ?n ?dn :where [?d :dept/name \"d7\"] [?e :emp/dept ?d] [?e :emp/name ?n] [?d :dept/name ?dn]]", none);
+        best_rows = @min(best_rows, nowNs() - r0);
+    }
     try testing.expectEqual(emps / depts, rows3.len);
-    const t0 = nowNs();
-    const r3 = try query.q(testing.allocator, fx.interner(), &fx.heap, q3, dbv, none, &diag, opts);
-    const t1 = nowNs();
-    const r_age = try query.q(testing.allocator, fx.interner(), &fx.heap, q_age, dbv, none, &diag, opts);
-    const t2 = nowNs();
-    const r_hash = try query.q(testing.allocator, fx.interner(), &fx.heap, q_hash, dbv, none, &diag, opts);
-    const t3 = nowNs();
+    const b3 = try timeQuery(fx, q3, dbv, none, reps);
+    const b_age = try timeQuery(fx, q_age, dbv, none, reps);
+    const b_hash = try timeQuery(fx, q_hash, dbv, none, reps);
+    const b_one = try timeQuery(fx, q_join, dbv, &.{ value.nilValue(), ages_one }, reps);
+    const b_mid = try timeQuery(fx, q_join, dbv, &.{ value.nilValue(), ages_mid }, reps);
+    const b_big = try timeQuery(fx, q_join, dbv, &.{ value.nilValue(), ages_big }, reps);
+    const r3 = b3.result;
+    const r_age = b_age.result;
+    const r_hash = b_hash.result;
+    const r_one = b_one.result;
+    const r_mid = b_mid.result;
+    const r_big = b_big.result;
+    try testing.expect(r_one.asFixnum() > 0 and r_mid.asFixnum() > r_one.asFixnum() and r_big.asFixnum() > r_mid.asFixnum());
     try testing.expectEqual(emps / depts, champ.setCount(r3));
     try testing.expect(champ.setCount(r_age) > 0);
     try testing.expect(r_hash.asFixnum() > 0);
-    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    var out: std.Io.Writer.Allocating = .init(fx.gpa);
     defer out.deinit();
-    try query.explain(testing.allocator, fx.interner(), q3, dbv, none, &diag, opts, &out.writer);
+    try query.explain(fx.gpa, fx.interner(), q3, dbv, none, &diag, opts, &out.writer);
     if (!benchOutput()) return;
     std.debug.print("\n[bench] 200k datoms, {d} employees / {d} departments\n", .{ emps, depts });
-    std.debug.print("[bench] 3-way join by department (dept -> vaet -> eavt), {d} rows: {d} us to rows, {d} us with the result set\n", .{ champ.setCount(r3), (r1 - r0) / 1000, (t1 - t0) / 1000 });
-    std.debug.print("[bench] 3-way join by age (avet -> eavt -> eavt), {d} rows: {d} us\n", .{ champ.setCount(r_age), (t2 - t1) / 1000 });
-    std.debug.print("[bench] active count by department (aevt scan + hash join), {d} rows: {d} us\n", .{ r_hash.asFixnum(), (t3 - t2) / 1000 });
+    std.debug.print("[bench] 3-way join by department (dept -> vaet -> eavt), {d} rows: {d} us to rows, {d} us with the result set\n", .{ champ.setCount(r3), best_rows / 1000, b3.ns / 1000 });
+    std.debug.print("[bench] 3-way join by age (avet -> eavt -> eavt), {d} rows: {d} us\n", .{ champ.setCount(r_age), b_age.ns / 1000 });
+    std.debug.print("[bench] active count by department (aevt scan + hash join), {d} rows: {d} us\n", .{ r_hash.asFixnum(), b_hash.ns / 1000 });
+    std.debug.print("[bench] 3-way join from 1 age (avet seek, then name/salary), {d} rows: {d} us\n", .{ r_one.asFixnum(), b_one.ns / 1000 });
+    std.debug.print("[bench] 3-way join from 3 ages (avet seeks, then name/salary), {d} rows: {d} us\n", .{ r_mid.asFixnum(), b_mid.ns / 1000 });
+    std.debug.print("[bench] 3-way join from 7 ages (avet seeks, then name/salary), {d} rows: {d} us\n", .{ r_big.asFixnum(), b_big.ns / 1000 });
     std.debug.print("[bench] plan:\n{s}", .{out.written()});
+    out.clearRetainingCapacity();
+    try query.explain(fx.gpa, fx.interner(), q_join, dbv, &.{ value.nilValue(), ages_big }, &diag, opts, &out.writer);
+    std.debug.print("[bench] plan, 7 ages:\n{s}", .{out.written()});
+}
+
+/// The result of `q` and the fastest of `reps` timed runs.
+const Timed = struct { result: Value, ns: u64 };
+
+fn timeQuery(fx: *Fx, q: Value, dbv: DbValue, inputs: []const Value, reps: usize) !Timed {
+    var diag: query.Diag = .{};
+    var best: u64 = std.math.maxInt(u64);
+    var result = value.nilValue();
+    for (0..reps) |_| {
+        const t0 = nowNs();
+        result = try query.q(fx.gpa, fx.interner(), &fx.heap, q, dbv, inputs, &diag, .{});
+        best = @min(best, nowNs() - t0);
+    }
+    return .{ .result = result, .ns = best };
 }
 
 /// Timings print only when `NEXTOMIC_BENCH` is set; the checks run

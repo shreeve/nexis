@@ -12,7 +12,8 @@
 //!     the smallest estimate given the variables bound so far runs next.
 //!   - A data pattern with nothing bound in `e`, `a` or `v` is refused
 //!     with `error.UnboundPattern`; a predicate or function whose inputs
-//!     can never be bound is `error.QuerySyntax`.
+//!     (its arguments, and its function when that is a variable) can
+//!     never be bound is `error.QuerySyntax`.
 //!   - Index choice follows the §5 table from what is bound when the
 //!     pattern runs; estimates come from `Schema` attribute counts.
 //!   - A constant that cannot exist in the store (an unknown ident, a
@@ -21,6 +22,9 @@
 //!     is not an error.
 //!   - Sub-plans (`not`, `or`, rule bodies) are planned with their join
 //!     variables bound and start from a relation over those variables.
+//!   - Every source has its own `Read`; a pattern is resolved and
+//!     estimated against the source it names (`$` when it names none),
+//!     and the scan step records that source.
 //!   - Plan variables extend the IR's table; renamed rule variables are
 //!     appended and never alias a query variable.
 //!   - Everything a plan allocates lives in the query arena.
@@ -93,6 +97,8 @@ pub const Slot = union(enum) {
 };
 
 pub const Scan = struct {
+    /// The data source the scan reads.
+    src: ir.Src,
     e: Slot,
     a: Slot,
     v: Slot,
@@ -176,39 +182,92 @@ pub const Plan = struct {
     /// The variables this plan starts with (bound by its input relation).
     input: []const Var,
     steps: []const Step,
+    /// Estimated rows of the input relation.
+    rows_in: u64,
+    /// Estimated rows after each step, one per step.
+    rows_after: []const u64,
     /// Estimated rows after the last step.
     rows_estimate: u64,
+
+    /// Estimated rows before step `i`.
+    pub fn rowsBefore(self: *const Plan, i: usize) u64 {
+        return if (i == 0) self.rows_in else self.rows_after[i - 1];
+    }
 };
 
-/// Everything planning needs about the query: the `Read`, the variable
-/// table (shared by every sub-plan) and the rule set.
+/// One data source at plan time: its `Read` and what has been
+/// resolved against it.
+pub const DbSource = struct {
+    read: *Read,
+    /// Attributes resolved so far, by VM keyword id.
+    attr_cache: std.AutoHashMapUnmanaged(u32, ?Attr) = .empty,
+    /// Entries of the AEVT tree this view reads, once asked.
+    aevt_entries: ?u64 = null,
+};
+
+/// Everything planning needs about the query: the `Read` of every
+/// source (`read` is the selected one), the variable table (shared by
+/// every sub-plan) and the rule set.
 pub const Ctx = struct {
     arena: Allocator,
+    /// The selected source's `Read`; `select` switches it.
     read: *Read,
     interner: *Interner,
     vars: std.ArrayList(ir.VarInfo),
     rules: *const RuleSet,
     rule_info: ?*rules_mod.Info = null,
-    /// Attributes resolved so far, by VM keyword id.
+    /// The selected source's resolved attributes.
     attr_cache: std.AutoHashMapUnmanaged(u32, ?Attr) = .empty,
     /// The query's `Ir` table size; variables at or past it are renames.
     ir_vars: usize,
     /// Run-time relation slots, by `Clause.source.id`.
     sources: std.ArrayList(*SourceSlot) = .empty,
-    /// Entries of the AEVT tree this view reads, once asked.
+    /// The selected source's AEVT entries, once asked.
     aevt_entries: ?u64 = null,
+    /// The data sources by `Src`; `$` first.
+    dbs: []DbSource,
+    /// VM symbol ids of the sources, for `explain`.
+    source_names: []const u32,
+    selected: ir.Src = 0,
+    /// Nesting of `planSub` calls; 1 while placing the query's own
+    /// clauses, whose index a refusal then reports.
+    depth: usize = 0,
+    clause_index: ?usize = null,
     /// Where a syntax or attribute error leaves its reason.
     diag: *Diag,
 
-    pub fn init(arena: Allocator, read: *Read, interner: *Interner, query: *const Ir, rules: *const RuleSet, diag: *Diag) !Ctx {
+    /// `reads` has one `Read` per query source, `$` first.
+    pub fn init(arena: Allocator, reads: []const *Read, interner: *Interner, query: *const Ir, rules: *const RuleSet, diag: *Diag) !Ctx {
+        std.debug.assert(reads.len == query.sources.len);
         var vars: std.ArrayList(ir.VarInfo) = .empty;
         try vars.appendSlice(arena, query.vars);
-        return .{ .arena = arena, .read = read, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .diag = diag };
+        const dbs = try arena.alloc(DbSource, reads.len);
+        for (reads, dbs) |r, *d| d.* = .{ .read = r };
+        return .{ .arena = arena, .read = reads[0], .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
     }
 
-    /// `QuerySyntax` with its reason.
+    /// Make `src` (null: `$`) the source the resolvers read.
+    pub fn select(self: *Ctx, src: ?ir.Src) void {
+        const next = src orelse 0;
+        if (next == self.selected) return;
+        self.dbs[self.selected].attr_cache = self.attr_cache;
+        self.dbs[self.selected].aevt_entries = self.aevt_entries;
+        self.selected = next;
+        self.read = self.dbs[next].read;
+        self.attr_cache = self.dbs[next].attr_cache;
+        self.aevt_entries = self.dbs[next].aevt_entries;
+    }
+
+    /// `QuerySyntax` with its reason and the top-level clause it was
+    /// found in.
     pub fn syntax(self: *Ctx, message: []const u8) error{QuerySyntax} {
-        self.diag.* = .{ .message = message };
+        self.diag.* = .{ .clause = self.clause_index, .message = message };
+        return error.QuerySyntax;
+    }
+
+    /// `QuerySyntax` with a formatted reason naming what is wrong.
+    pub fn syntaxFmt(self: *Ctx, comptime fmt: []const u8, args: anytype) error{QuerySyntax} {
+        self.diag.set(self.clause_index, fmt, args);
         return error.QuerySyntax;
     }
 
@@ -280,14 +339,23 @@ pub fn plan(ctx: *Ctx, query: *const Ir) Failure!*Plan {
 
 /// Plan `clauses` starting from a relation over `input`.
 pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: u64) Failure!*Plan {
+    ctx.depth += 1;
+    defer ctx.depth -= 1;
     const out = try ctx.arena.create(Plan);
     var bound: std.ArrayList(Var) = .empty;
     try bound.appendSlice(ctx.arena, input);
     var steps: std.ArrayList(Step) = .empty;
+    var rows_after: std.ArrayList(u64) = .empty;
     var rows = rows_in;
-    try planClauses(ctx, clauses, &bound, &steps, &rows);
-    out.* = .{ .input = try ctx.arena.dupe(Var, input), .steps = try steps.toOwnedSlice(ctx.arena), .rows_estimate = rows };
+    try planClauses(ctx, clauses, &bound, &steps, &rows_after, &rows);
+    out.* = .{ .input = try ctx.arena.dupe(Var, input), .steps = try steps.toOwnedSlice(ctx.arena), .rows_in = rows_in, .rows_after = try rows_after.toOwnedSlice(ctx.arena), .rows_estimate = rows };
     return out;
+}
+
+/// Record `rows` as the estimate after every step placed since the
+/// last note.
+fn noteRows(ctx: *Ctx, rows_after: *std.ArrayList(u64), steps: usize, rows: u64) !void {
+    while (rows_after.items.len < steps) try rows_after.append(ctx.arena, rows);
 }
 
 const Pending = struct {
@@ -295,7 +363,7 @@ const Pending = struct {
     done: bool = false,
 };
 
-fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
+fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows_after: *std.ArrayList(u64), rows: *u64) Failure!void {
     const pending = try ctx.arena.alloc(Pending, clauses.len);
     for (clauses, pending) |c, *p| p.* = .{ .clause = c };
 
@@ -309,16 +377,17 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
     while (remaining > 0) {
         // Cost-free steps first.
         var progress = false;
-        for (pending) |*p| {
+        for (pending, 0..) |*p, idx| {
             if (p.done) continue;
+            if (ctx.depth == 1) ctx.clause_index = idx;
             const placed = switch (p.clause) {
                 .pred => |call| blk: {
-                    if (!argsBound(call.args, bound.items)) break :blk false;
+                    if (!callBound(call, bound.items)) break :blk false;
                     try steps.append(ctx.arena, .{ .pred = .{ .call = call } });
                     break :blk true;
                 },
                 .bind => |b| blk: {
-                    if (!argsBound(b.call.args, bound.items)) break :blk false;
+                    if (!callBound(b.call, bound.items)) break :blk false;
                     const outs = try b.out.vars(ctx.arena);
                     const fresh = try newVars(ctx.arena, outs, bound.items);
                     for (fresh) |v| try bound.append(ctx.arena, v);
@@ -354,6 +423,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
                 p.done = true;
                 remaining -= 1;
                 progress = true;
+                try noteRows(ctx, rows_after, steps.items.len, rows.*);
             }
         }
         if (progress) continue;
@@ -363,8 +433,9 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
         var best: ?*Pending = null;
         var best_cost: u64 = std.math.maxInt(u64);
         var unbound_pattern = false;
-        for (pending) |*p| {
+        for (pending, 0..) |*p, idx| {
             if (p.done) continue;
+            if (ctx.depth == 1) ctx.clause_index = idx;
             const cost: ?u64 = switch (p.clause) {
                 .pattern => |pat| patternEstimate(ctx, pat, bound.items) catch |err| switch (err) {
                     error.UnboundPattern => {
@@ -386,8 +457,9 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
         }
         const p = best orelse {
             if (unbound_pattern) return error.UnboundPattern;
-            return ctx.syntax("a predicate, function or rule argument is never bound");
+            return neverBound(ctx, pending, bound.items);
         };
+        if (ctx.depth == 1) ctx.clause_index = (@intFromPtr(p) - @intFromPtr(pending.ptr)) / @sizeOf(Pending);
         switch (p.clause) {
             .pattern => |pat| {
                 const scan = try planScan(ctx, pat, bound.items);
@@ -410,9 +482,35 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
             },
             else => unreachable,
         }
+        try noteRows(ctx, rows_after, steps.items.len, rows.*);
         p.done = true;
         remaining -= 1;
     }
+}
+
+/// The refusal for a level whose remaining clauses can never run: the
+/// first unbound variable of the first of them, by name and clause.
+fn neverBound(ctx: *Ctx, pending: []const Pending, bound: []const Var) error{QuerySyntax} {
+    for (pending, 0..) |p, idx| {
+        if (p.done) continue;
+        if (ctx.depth == 1) ctx.clause_index = idx;
+        const args: []const ir.Arg = switch (p.clause) {
+            .pred => |call| call.args,
+            .bind => |b| b.call.args,
+            .rule => |r| r.args,
+            else => continue,
+        };
+        const f: ?ir.FnRef = switch (p.clause) {
+            .pred => |call| call.f,
+            .bind => |b| b.call.f,
+            else => null,
+        };
+        if (f != null and f.? == .variable and !ir.containsVar(bound, f.?.variable)) return ctx.syntaxFmt("{s} in function position is never bound", .{ctx.varName(f.?.variable)});
+        for (args) |a| {
+            if (a == .variable and !ir.containsVar(bound, a.variable)) return ctx.syntaxFmt("{s} is never bound; a predicate, function or rule argument needs a pattern, an input or an earlier clause to bind it", .{ctx.varName(a.variable)});
+        }
+    }
+    return ctx.syntax("a predicate, function or rule argument is never bound");
 }
 
 fn clampRows(n: u128) u64 {
@@ -420,7 +518,7 @@ fn clampRows(n: u128) u64 {
 }
 
 fn placeRule(ctx: *Ctx, r: anytype, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
-    try rules_mod.planCall(ctx, r.name, r.args, bound, steps, rows);
+    try rules_mod.planCall(ctx, r.name, r.args, r.src, bound, steps, rows);
 }
 
 /// Plan a run-time relation source: a join on its already-bound
@@ -428,6 +526,13 @@ fn placeRule(ctx: *Ctx, r: anytype, bound: *std.ArrayList(Var), steps: *std.Arra
 fn planSource(ctx: *Ctx, s: anytype, bound: []const Var) !Step {
     const fresh = try newVars(ctx.arena, s.vars, bound);
     return .{ .source = .{ .slot = ctx.sources.items[s.id], .vars = s.vars, .fresh = fresh } };
+}
+
+/// A call can run once its function (when a variable) and every
+/// argument variable are bound.
+fn callBound(call: ir.Call, bound: []const Var) bool {
+    if (call.f == .variable and !ir.containsVar(bound, call.f.variable)) return false;
+    return argsBound(call.args, bound);
 }
 
 fn argsBound(args: []const ir.Arg, bound: []const Var) bool {
@@ -460,7 +565,10 @@ fn notJoin(ctx: *Ctx, n: anytype, scope: []const Var) ![]const Var {
     for (body_vars.items) |v| {
         if (ir.containsVar(scope, v)) try join.append(ctx.arena, v);
     }
-    if (join.items.len == 0) return ctx.syntax("not needs a variable bound outside it");
+    if (join.items.len == 0) {
+        std.debug.assert(body_vars.items.len > 0);
+        return ctx.syntaxFmt("not shares no variable with the clauses around it: {s} is bound nowhere outside; not joins on a variable bound outside it", .{ctx.varName(body_vars.items[0])});
+    }
     return join.toOwnedSlice(ctx.arena);
 }
 
@@ -481,12 +589,12 @@ pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: 
     }
     const fresh = try newVars(ctx.arena, join, bound);
     const plans = try ctx.arena.alloc(*Plan, branches.len);
-    for (branches, plans) |br, *p| {
+    for (branches, plans, 1..) |br, *p, n| {
         p.* = try planSub(ctx, br, bound_join.items, rows);
         var ends: std.ArrayList(Var) = .empty;
         try ends.appendSlice(ctx.arena, bound_join.items);
         try ir.boundVars(ctx.arena, br, &ends);
-        for (join) |v| if (!ir.containsVar(ends.items, v)) return ctx.syntax("an or branch leaves a join variable unbound");
+        for (join) |v| if (!ir.containsVar(ends.items, v)) return ctx.syntaxFmt("or-join branch {d} leaves {s} unbound; every branch binds every join variable", .{ n, ctx.varName(v) });
     }
     return .{ .@"or" = .{ .join = join, .bound = try bound_join.toOwnedSlice(ctx.arena), .fresh = fresh, .branches = plans } };
 }
@@ -603,10 +711,12 @@ fn choose(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !Choice {
 }
 
 fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !u64 {
+    ctx.select(p.src);
     return (try choose(ctx, p, bound)).estimate;
 }
 
 fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) Failure!Scan {
+    ctx.select(p.src);
     const choice = try choose(ctx, p, bound);
     const hash_choice: ?Choice = choose(ctx, p, &.{}) catch |err| switch (err) {
         error.UnboundPattern => null,
@@ -645,6 +755,7 @@ fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) Failure!Scan {
     const entries = try store_mod.Store.treeEntries(ctx.read.txn, tree);
 
     return .{
+        .src = ctx.selected,
         .e = slots[0],
         .a = slots[1],
         .v = slots[2],
@@ -760,25 +871,81 @@ pub fn resolveTyped(ctx: *Ctx, c: ir.Constant, vt: key.ValueType) Failure!?key.V
 // Explain
 // =============================================================================
 
-/// Print the ordered steps with their index and estimate.
+/// Print the plan as a table: one numbered line per step with its
+/// description (index, estimate, tree size, bound variables), the join
+/// the executor will run for a scan (`nested`: one seek per input row;
+/// `hash`: one scan of the constant prefix hash-joined on the shared
+/// variables) and the estimated rows after the step; sub-plans indent
+/// under their step and end with their own `rows~` line.
 pub fn explain(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer) !void {
-    try explainSub(p, ctx, w, 0);
+    var lines: std.ArrayList(Line) = .empty;
+    try explainSub(p, ctx, &lines, 0);
+    var width: usize = 0;
+    for (lines.items) |l| width = @max(width, l.text.len);
+    for (lines.items) |l| {
+        if (l.join == null and l.rows == null) {
+            try w.print("{s}\n", .{l.text});
+            continue;
+        }
+        try w.writeAll(l.text);
+        var pad = width - l.text.len + 2;
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        try w.print("{s: <7}", .{l.join orelse ""});
+        if (l.rows) |r| try w.print(" rows~{d}", .{r});
+        try w.writeByte('\n');
+    }
 }
+
+/// One line of the table: the description, the join kind of a scan,
+/// the estimated rows after the step.
+const Line = struct {
+    text: []const u8,
+    join: ?[]const u8 = null,
+    rows: ?u64 = null,
+};
 
 fn indent(w: *std.Io.Writer, depth: usize) !void {
     var i: usize = 0;
     while (i < depth) : (i += 1) try w.writeAll("  ");
 }
 
-pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usize) (Failure || std.Io.Writer.Error)!void {
-    for (p.steps, 1..) |step, num| {
+/// Scanned rows one seek is worth per doubling of the tree: a seek
+/// costs `log2(entries)` page-level comparisons against a hot tree, a
+/// scanned row one cursor step, one decode and one hash-index insert.
+/// Measured on the 200k-datom benchmark, where a hash join over a
+/// 40k-entry attribute costs what 9k seeks do.
+pub const hash_weight: u64 = 4;
+
+/// Does a scan of `s` over `rows` input rows run as an index nested
+/// loop (one seek per row) rather than as one scan of its constant
+/// prefix hash-joined on the shared variables? A pattern with no
+/// constant to seek by, or whose attribute arrives with the row (an
+/// ident a hash join could not match against attribute ids), always
+/// seeks.
+pub fn nestedLoop(s: *const Scan, rows: u64) bool {
+    const log_n: u64 = std.math.log2_int_ceil(u64, s.tree_entries + 2);
+    return s.hash_index == null or s.a == .bound or (std.math.mulWide(u64, rows, log_n) < std.math.mulWide(u64, s.hash_estimate, hash_weight));
+}
+
+/// The join `execScan` runs for `s` on `rows` input rows.
+fn joinKind(s: *const Scan, rows: u64) []const u8 {
+    if (s.unsatisfiable) return "none";
+    return if (nestedLoop(s, rows)) "nested" else "hash";
+}
+
+pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), depth: usize) (Failure || std.Io.Writer.Error)!void {
+    for (p.steps, 0..) |step, i| {
+        var out: std.Io.Writer.Allocating = .init(ctx.arena);
+        const w = &out.writer;
         try indent(w, depth);
-        try w.print("{d}. ", .{num});
+        try w.print("{d}. ", .{i + 1});
+        var line: Line = .{ .text = "", .rows = p.rows_after[i] };
         switch (step) {
             .scan => |s| {
                 try w.writeAll("scan [");
-                for (s.slots(), 0..) |slot, i| {
-                    if (i > 0) try w.writeByte(' ');
+                if (s.src != 0) try w.print("{s} ", .{ctx.interner.symbolName(ctx.source_names[s.src])});
+                for (s.slots(), 0..) |slot, j| {
+                    if (j > 0) try w.writeByte(' ');
                     try explainSlot(slot, ctx, w);
                 }
                 try w.print("] {s}", .{s.index.name()});
@@ -788,46 +955,67 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usi
                     try w.print(" est={d} tree={d}", .{ s.estimate, s.tree_entries });
                     if (s.dedup) try w.writeAll(" dedup");
                 }
-                try w.writeByte('\n');
+                line.join = joinKind(&s, p.rowsBefore(i));
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
             },
             .pred => |pr| {
                 try w.writeAll("pred ");
                 try explainCall(pr.call, ctx, w);
-                try w.writeByte('\n');
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
             },
             .bind => |b| {
                 try w.writeAll("bind ");
                 try explainCall(b.call, ctx, w);
                 try w.writeAll(" -> ");
                 try explainBinding(b, ctx, w);
-                try w.writeByte('\n');
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
             },
             .not => |n| {
                 try w.writeAll("not-join [");
                 try explainVars(n.join, ctx, w);
-                try w.writeAll("]\n");
-                try explainSub(n.sub, ctx, w, depth + 1);
+                try w.writeAll("]");
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
+                try explainSub(n.sub, ctx, lines, depth + 1);
             },
             .@"or" => |o| {
                 try w.writeAll("or-join [");
                 try explainVars(o.join, ctx, w);
-                try w.print("] branches={d}\n", .{o.branches.len});
+                try w.print("] branches={d}", .{o.branches.len});
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
                 for (o.branches) |br| {
-                    try indent(w, depth + 1);
-                    try w.writeAll("branch\n");
-                    try explainSub(br, ctx, w, depth + 2);
+                    var bw: std.Io.Writer.Allocating = .init(ctx.arena);
+                    try indent(&bw.writer, depth + 1);
+                    try bw.writer.writeAll("branch");
+                    try lines.append(ctx.arena, .{ .text = bw.written() });
+                    try explainSub(br, ctx, lines, depth + 2);
                 }
             },
             .source => |s| {
                 try w.writeAll("source [");
                 try explainVars(s.vars, ctx, w);
-                try w.writeAll("]\n");
+                try w.writeAll("]");
+                line.join = "hash";
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
             },
-            .fix => |f| try rules_mod.explainFix(&f, ctx, w, depth),
+            .fix => |f| {
+                try rules_mod.explainFix(&f, ctx, w);
+                line.join = "fixpoint";
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
+                try rules_mod.explainFixBodies(&f, ctx, lines, depth + 1);
+            },
         }
     }
-    try indent(w, depth);
-    try w.print("rows~{d}\n", .{p.rows_estimate});
+    var tail: std.Io.Writer.Allocating = .init(ctx.arena);
+    try indent(&tail.writer, depth);
+    try tail.writer.print("rows~{d}", .{p.rows_estimate});
+    try lines.append(ctx.arena, .{ .text = tail.written() });
 }
 
 /// The binding's variables; one bound before the step (which the
@@ -883,13 +1071,14 @@ fn explainCall(call: ir.Call, ctx: *const Ctx, w: *std.Io.Writer) !void {
     switch (call.f) {
         .builtin => |b| try w.writeAll(b.name()),
         .user => |s| try w.writeAll(ctx.interner.symbolName(s)),
+        .variable => |v| try w.print("{s}!", .{ctx.varName(v)}),
     }
     for (call.args) |a| {
         try w.writeByte(' ');
         switch (a) {
             .variable => |v| try w.writeAll(ctx.varName(v)),
             .constant => |c| try explainCell(c, ctx, w),
-            .src => try w.writeAll("$"),
+            .src => |x| try w.writeAll(ctx.interner.symbolName(ctx.source_names[x orelse 0])),
         }
     }
     try w.writeByte(')');

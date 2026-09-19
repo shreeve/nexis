@@ -22,9 +22,9 @@ Ann
 :nextomic/value-type
 :nextomic/value-type
 {:error :nextomic/unknown-attribute, :attr :user/nope}
-{:error :nextomic/query-syntax, :message a predicate, function or rule argument is never bound}
+{:error :nextomic/query-syntax, :message ?a is never bound; a predicate, function or rule argument needs a pattern, an input or an earlier clause to bind it, :clause 1}
 {:error :nextomic/query-syntax, :message missing? is (missing? $ ?e :attr), :clause 1}
-{:error :nextomic/query-syntax, :message unknown rule}
+{:error :nextomic/query-syntax, :message unknown rule, :clause 0}
 {:error :nextomic/unique, :attr :user/email, :value ann@x}
 {:error :nextomic/unknown-attribute, :attr :user/nope}
 {:error :nextomic/tx-data, :message a nested map under a non-component ref needs :db/id or a unique attribute}

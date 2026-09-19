@@ -333,16 +333,35 @@ without an attribute; give the attribute when it is known.
 Clauses are ordered greedily by estimate given the variables bound so
 far; predicates run at the first point all their variables are bound.
 Join per step: index nested loop (seek per row) when `rows × log n` is
-below the scan estimate, otherwise a hash join on the shared variables.
+below four times the scan estimate, otherwise one scan of the constant
+prefix hash-joined on the shared variables (`plan.nestedLoop`; `explain`
+prints the kind per step). The hash side is a chained index keyed by
+row hash, sized up front.
 Estimates come from `treeStat` and per-attribute counts kept in
 `Schema`.
 
-**Execute** over one read transaction for the whole query (one snapshot
-for every cursor, emdb INV-T02). Scans drive `openCursorForTree` +
+**Sources.** `:in` starts with `$`; further `$name` bindings (`$2`,
+`$hist`) take db values, positional like every input, and may name
+another connection or a time view of the same one. A data pattern, a
+`missing?` or `get-else` call, or a rule call prefixed with a source
+reads it: `[$2 ?e :a ?v]`, `[(missing? $2 ?e :a)]`, `($2 rule ?x)`; an
+unprefixed clause reads `$`. A rule body writes `$` or nothing and reads
+the source its call names, so one rule set serves every source; a
+recursive component runs under one source. Each source is one read
+transaction for the whole query; attributes, idents, lookup refs and
+keyword values resolve per source (an ident is an entity of the store
+that holds it). An input in an entity role resolves in the source of the
+first pattern that gives it that role. A clause naming an undeclared
+source is `:nextomic/query-syntax`; a source input that is not a db value
+is `:kind-mismatch`.
+
+**Execute** over one read transaction per source for the whole query
+(one snapshot for every cursor, emdb INV-T02). Scans drive `openCursorForTree` +
 `setRange` with the §4 fold inline; constants in the prefix narrow the
-seek, constants after an unbound position filter. Built-in predicates
-(`< <= > >= = not= missing?`, later `ground tuple untuple get-else`) are
-Zig over `Value`; an int and a double compare numerically, and a
+seek, constants after an unbound position filter. Built-in predicates and functions (`< <= > >= = not= missing?`, `!=` as
+`not=`; `ground`, `tuple`, `untuple`, `get-else`, and `get-some`, which
+binds `[attr value]` for the first of its attributes the entity has and
+drops the row when it has none) are Zig over cells; an int and a double compare numerically, and a
 comparison across other types (a string against a number, a number
 against a keyword) is `:nextomic/value-type`, as is an input or a
 function result whose shape does not fit its binding form. Any other symbol resolves through the namespace
@@ -352,13 +371,41 @@ its auto-referred parents) and is called with `vm.callValue`; an
 unbound name throws `:nextomic/query-syntax` naming it. A throw inside
 the function aborts the query, the read transaction closes, and the
 thrown value reaches the caller's `try`; `ControlTransferred` propagates
-unchanged. Function position takes a symbol naming a function, not a
-`:in`-bound variable.
+unchanged. Function position also takes a variable, `[(?pred ?x)]` or
+`[(?f ?x) ?y]`: it is an input of the clause, bound through `:in` or an
+earlier clause (so a rule head may carry it), and the value it holds is
+applied when the clause runs: a function through `callValue`, a keyword
+or collection as the language applies them, anything else is the VM's
+`:not-callable`. A function is identity-valued in a relation.
+
+**Aggregates** group the basis set (the distinct tuples over the `:find`
+and `:with` variables) by the plain find elements: `count`, `sum`,
+`avg`, `min`, `max`, `median`, `variance`, `stddev`, `count-distinct`,
+`distinct` (a set), `(min n ?x)` and `(max n ?x)` (the n smallest or
+largest, a vector), `(sample n ?x)` (up to n distinct values, a vector)
+and `(rand n ?x)` (n values with repetition, a vector). `min` and `max`
+compare any type in the cell order; `sum`, `avg`, `variance` and `stddev`
+take numbers (`:nextomic/value-type` otherwise); `median` of an odd
+count is the middle value of any type, of an even count the mean of the
+two middle numbers as a double; `variance` divides by the count
+(population variance) and `stddev` is its square root. Any other symbol
+in aggregate position, `(my.ns/total ?x)`, is a custom aggregate: it
+resolves like a function clause and is called with the vector of the
+group's values. No rows form no group, so an aggregate-only query over
+nothing is empty (nil for `.` and `[...]`), not zero.
 
 **Relation** is a Zig-private columnar struct in the query arena
 (`vars`, typed columns for eids and longs, a `Value` column otherwise);
 never a VM value. Results are copied into the VM heap as a persistent
-set of vectors (or the `.`, `[...]`, `[[...]]` find specs).
+set of vectors (or the `.`, `[...]`, `[[...]]` find specs). A find
+element `(pull ?e pattern)` (a pattern vector, §6) groups and dedups as
+`?e` and is applied when the result is copied, in the query's own
+snapshot: the pattern's map, nil for an entity with no datoms,
+`:nextomic/value-type` when `?e` is not an entity id,
+`:nextomic/pull-syntax` for a bad pattern, `:nextomic/history-view` on a
+history db. `:keys`, `:strs` or `:syms` name every find element (one
+symbol each, relation find spec only) and the result is a vector of
+maps under those names as keywords, strings or symbols.
 
 **Rules.** `:in $ %` binds a rule set. Non-recursive rules inline as
 sub-plans (cached per binding signature). Recursive rules run
@@ -381,9 +428,10 @@ sub-plans with the same output variables.
 | `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report |
 | `(d/entity db e)` | eager map `{:db/id e :attr v ...}`, card-many as sets, refs as eids; nil when the entity has no datoms in this view; `:nextomic/history-view` on a history db |
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
-| `(d/datoms db :eavt e a v)` (index and optional components in index order; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
-| `(d/q query db & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]` and aggregates, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] %` with inputs positional after the db, `:where` with patterns, predicates, function bindings, `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors |
-| `(d/explain query db & inputs)` | the plan `q` would run, as a string: one numbered line per step with index, estimate and bound variables |
+| `(d/datoms db :eavt e a v tx added)` (index, its components in index order, then `tx` as a t or a transaction entity id and `added` as a boolean; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
+| `(d/index-range db attr start end)` | the AVET datoms of an indexed or unique attribute with `start <= v < end` in value order; a nil bound is open; another attribute is `:nextomic/tx-data` naming it, a bound of the wrong type `:nextomic/value-type` |
+| `(d/q query db & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]`, aggregates (built-in and custom) and `(pull ?e pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] % $2` with inputs positional after the db (a `$name` source takes a db value; `[$2 ?e :a ?v]` and `($2 rule ?x)` read it), `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
+| `(d/explain query db & inputs)` | the plan `q` would run, as an aligned table: one numbered line per step with its description (index, estimate, tree size, source when not `$`, bound variables marked `!`), the join a scan will run (`nested`, one seek per input row; `hash`, one scan of the constant prefix hash-joined on the shared variables; `fixpoint` for a recursive rule) and the estimated rows after the step; sub-plans indent under their step and end with `rows~` |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4); `t` is a transaction number or a transaction's entity id |
 | `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}` for `from ≤ t < to`, oldest first; a bound that is `nil` or not given is open |
 | `(d/schema db)` | map ident → attribute map |
@@ -432,8 +480,8 @@ keyword. The shapes:
 | `:nextomic/conflict` | `:e` and `:a`, the datom the two claims disagree on |
 | `:nextomic/no-entity` | bare |
 | `:nextomic/tx-data` | `:message`; `:attr` when an attribute is at fault |
-| `:nextomic/query-syntax` | `:message`; `:clause`, the index into `:where`, when the parser or planner was inside a clause (an unbound function name is reported the same way at run time) |
-| `:nextomic/pull-syntax` | `:message`; `:clause`, the index of the spec in the pattern |
+| `:nextomic/query-syntax` | `:message`; `:clause`, the index into `:where`, when the parser or planner was inside a clause (an unbound function name is reported the same way at run time). A scoping refusal names what is wrong: the variable an `or` branch mentions and another does not, the join variable an `or-join` branch leaves unbound, the variable a `not` body has that nothing outside binds, the argument or function-position variable no clause ever binds |
+| `:nextomic/pull-syntax` | `:message`; `:clause`, the index of the spec in the pattern (from `pull`, `pull-many` or a `(pull ?e pattern)` find element) |
 
 The map is what `catch` receives; `(:error m)` is the keyword. A key is
 present only when its value is known. Engine errors surface as the

@@ -86,6 +86,7 @@ const natives = [_]Entry{
     .{ .name = "entid", .descriptor = &native_entid },
     .{ .name = "ident", .descriptor = &native_ident },
     .{ .name = "datoms", .descriptor = &native_datoms },
+    .{ .name = "index-range", .descriptor = &native_index_range },
     .{ .name = "as-of", .descriptor = &native_as_of },
     .{ .name = "since", .descriptor = &native_since },
     .{ .name = "history", .descriptor = &native_history },
@@ -116,7 +117,8 @@ const native_transact = NativeFn{ .name = "nextomic/transact!", .min_arity = 2, 
 const native_entity = NativeFn{ .name = "nextomic/entity", .min_arity = 2, .max_arity = 2, .call = &fnEntity };
 const native_entid = NativeFn{ .name = "nextomic/entid", .min_arity = 2, .max_arity = 2, .call = &fnEntid };
 const native_ident = NativeFn{ .name = "nextomic/ident", .min_arity = 2, .max_arity = 2, .call = &fnIdent };
-const native_datoms = NativeFn{ .name = "nextomic/datoms", .min_arity = 2, .max_arity = 5, .call = &fnDatoms };
+const native_datoms = NativeFn{ .name = "nextomic/datoms", .min_arity = 2, .max_arity = 7, .call = &fnDatoms };
+const native_index_range = NativeFn{ .name = "nextomic/index-range", .min_arity = 4, .max_arity = 4, .call = &fnIndexRange };
 const native_as_of = NativeFn{ .name = "nextomic/as-of", .min_arity = 2, .max_arity = 2, .call = &fnAsOf };
 const native_since = NativeFn{ .name = "nextomic/since", .min_arity = 2, .max_arity = 2, .call = &fnSince };
 const native_history = NativeFn{ .name = "nextomic/history", .min_arity = 1, .max_arity = 1, .call = &fnHistory };
@@ -294,7 +296,7 @@ pub fn dbOf(v: Value) !DbValue {
     return .{ .conn = c, .basis = s.basis, .as_of = s.as_of, .since = s.since, .history = s.history };
 }
 
-fn boxDb(heap: *Heap, d: DbValue) !Value {
+pub fn boxDb(heap: *Heap, d: DbValue) !Value {
     return handle.makeDb(heap, .{ .conn = @ptrCast(d.conn), .basis = d.basis, .as_of = d.as_of, .since = d.since, .history = d.history });
 }
 
@@ -673,8 +675,9 @@ fn identNative(vm: *VM, args: []const Value) !Value {
 
 const fnDatoms = wrap(datomsNative);
 
-/// `(datoms db index & components)`: components follow the index's
-/// order; nil leaves a position unbound and later ones filter.
+/// `(datoms db index & components)`: the index's three components in
+/// its order, then `tx` (a t or a transaction entity id) and `added`
+/// (a boolean); nil leaves a position unbound, and a later one filters.
 fn datomsNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     var sc = try Scope.open(vm, args[0]);
     defer sc.close();
@@ -687,7 +690,8 @@ fn datomsNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
 
     var comps: key.Components = .{};
     var attr: ?Attr = null;
-    for (args[2..], index.order()[0 .. args.len - 2]) |arg, c| {
+    const positional: usize = @min(args.len - 2, 3);
+    for (args[2 .. 2 + positional], index.order()[0..positional]) |arg, c| {
         if (arg.isNil()) continue;
         switch (c) {
             .e => comps.e = (try marshal.entity(&sc.rd, arena, arg, &fault)) orelse return empty,
@@ -704,10 +708,54 @@ fn datomsNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
             },
         }
     }
+    const want_t: ?u64 = if (args.len > 5 and !args[5].isNil()) try txOf(args[5]) else null;
+    const want_added: ?bool = if (args.len > 6 and !args[6].isNil()) (if (args[6].isBool()) args[6].asBool() else return error.KindMismatch) else null;
 
     var out: std.ArrayList(Value) = .empty;
     var it = try sc.rd.scan(arena, index, comps);
-    while (try it.next()) |dt| try out.append(arena, try b.datom(dt));
+    while (try it.next()) |dt| {
+        if (want_t) |t| if (dt.t != t) continue;
+        if (want_added) |a| if (dt.added != a) continue;
+        try out.append(arena, try b.datom(dt));
+    }
+    return vector_mod.fromSlice(b.heap, out.items);
+}
+
+/// A transaction as a program names it: its t or its entity id.
+fn txOf(v: Value) !u64 {
+    if (v.kind() != .fixnum or v.asFixnum() < 0) return error.KindMismatch;
+    const n: u64 = @intCast(v.asFixnum());
+    return key.txOfEntity(n) orelse n;
+}
+
+const fnIndexRange = wrap(indexRangeNative);
+
+/// `(index-range db attr start end)`: the AVET datoms of an indexed or
+/// unique attribute with `start <= v < end` in value order, either
+/// bound open when nil.
+fn indexRangeNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
+    var sc = try Scope.open(vm, args[0]);
+    defer sc.close();
+    var fault: Fault = .{};
+    errdefer detail.* = detailOf(vm, sc.db.conn, &fault);
+    const arena = sc.arena();
+    const b = &sc.b;
+    const attr = try marshal.attrOf(&sc.rd, args[1], &fault);
+    if (!attr.inAvet()) {
+        fault = .{ .message = "index-range reads an indexed or unique attribute", .attr = args[1] };
+        return error.TxData;
+    }
+    const start: ?[]const u8 = if (args[2].isNil()) null else try key.valBytes(arena, (try marshal.valOf(&sc.rd, arena, attr.value_type, args[2], &fault)) orelse return error.ValueType);
+    const end: ?[]const u8 = if (args[3].isNil()) null else try key.valBytes(arena, (try marshal.valOf(&sc.rd, arena, attr.value_type, args[3], &fault)) orelse return error.ValueType);
+
+    var out: std.ArrayList(Value) = .empty;
+    var it = try sc.rd.scan(arena, .avet, .{ .a = attr.id });
+    while (try it.next()) |dt| {
+        const vb = try key.valBytes(arena, dt.v);
+        if (start) |lo| if (std.mem.order(u8, vb, lo) == .lt) continue;
+        if (end) |hi| if (std.mem.order(u8, vb, hi) != .lt) break;
+        try out.append(arena, try b.datom(dt));
+    }
     return vector_mod.fromSlice(b.heap, out.items);
 }
 

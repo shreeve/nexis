@@ -1,7 +1,8 @@
 ; test/nextomic/query.nx — q and explain: patterns, joins, every :in
 ; form, constants and lookup refs, predicates and functions (built-in,
-; defn'd, core, qualified), aggregates, every find spec, not/or and
-; their -join forms, rules, time views, errors. Runs from a scratch
+; defn'd, core, qualified, a variable in function position),
+; aggregates, every find spec, pull expressions and :keys, not/or and
+; their -join forms, several data sources, rules, time views, errors. Runs from a scratch
 ; directory; the store is fresh.
 
 (require '[nextomic :as d])
@@ -103,12 +104,23 @@
 (println (rows (d/q '[:find ?n :where [?e :person/name ?n] [(string? ?n)]] db)))
 (println (rows (d/q '[:find ?n :where [?e :person/name ?n] [(s/lower-case ?n) ?l] [(= ?l "ann")]] db)))
 
+; --- a variable in function position: bound to a function, a keyword, a map --
+
+(println (rows (d/q '[:find ?n :in $ ?pred :where [?e :person/age ?a] [(?pred ?a)] [?e :person/name ?n]] db adult?)))
+(println (rows (d/q '[:find ?n ?next :in $ ?f :where [?e :person/age ?a] [(?f ?a) ?next] [?e :person/name ?n]] db inc)))
+(println (rows (d/q '[:find ?n :in $ ?f :where [?e :person/name ?n] [(?f ?n) ?len] [(< ?len 3)]] db count)))
+(println (rows (d/q '[:find ?n ?v :in $ ?k :where [?e :person/name ?n] [(ground {:x 1}) ?m] [(?k ?m) ?v]] db :x)))
+(println (rows (d/q '[:find ?n ?v :in $ ?m :where [?e :person/name ?n] [(?m ?n) ?v]] db {"Ann" 1 "Bob" 2})))
+(println (rows (d/q '[:find ?n :in $ [?f ...] :where [?e :person/age ?a] [(?f ?a) ?r] [(> ?r 41)] [?e :person/name ?n]] db [inc identity])))
+
 ; --- function bindings ----------------------------------------------------
 
 (println (rows (d/q '[:find ?s :where [?e :person/name ?n] [?e :person/age ?a] [(str ?n " is " ?a) ?s]] db)))
 (println (rows (d/q '[:find ?n ?next :where [?e :person/name ?n] [?e :person/age ?a] [(+ ?a 1) ?next]] db)))
 (println (rows (d/q '[:find ?u :where [?e :person/name ?n] [(nexis.string/upper-case ?n) ?u]] db)))
 (println (rows (d/q '[:find ?n ?a :where [?e :person/name ?n] [(get-else $ ?e :person/age -1) ?a]] db)))
+(println (rows (d/q '[:find ?n ?a ?v :where [?e :person/name ?n] [(get-some $ ?e :person/height :person/age) [?a ?v]]] db)))
+(println (rows (d/q '[:find ?n ?i ?s ?l :where [?e :person/name ?n] [(!= ?n "Ann")] [(identity ?n) ?i] [(subs ?n 0 1) ?s] [(count ?n) ?l]] db)))
 (println (rows (d/q '[:find ?n ?t :where [(ground [:red :green]) [?t ...]] [?e :person/tags ?t] [?e :person/name ?n]] db)))
 (println (rows (d/q '[:find ?pair :where [?e :person/name ?n] [?e :person/age ?a] [(tuple ?n ?a) ?pair]] db)))
 (defn name-and-length [n] [n (count n)])
@@ -125,12 +137,31 @@
 (println (d/q '[:find (sum ?a) . :where [?e :person/age ?a]] db))
 (println (d/q '[:find (sum ?a) . :with ?e :where [?e :person/age ?a]] db))
 (println (rows (d/q '[:find ?b (count ?e) :where [?e :person/boss ?x] [?x :person/name ?b]] db)))
+(println (d/q '[:find [(median ?a) (variance ?a) (stddev ?a) (max 2 ?a) (min 2 ?a)] :with ?e :where [?e :person/age ?a]] db))
+(println (d/q '[:find (median ?a) . :where [?e :person/age ?a] [(< ?a 41)]] db))
+(defn total [xs] (reduce + 0 xs))
+(println (rows (d/q '[:find ?n (total ?num) :with ?o :where [?o :order/customer ?c] [?c :person/name ?n] [?o :order/number ?num]] db)))
+(println (map count (d/q '[:find [(sample 3 ?a) (rand 8 ?a) (sample 100 ?a)] :where [?e :person/age ?a]] db)))
+(println (t/caught (d/q '[:find (variance ?n) :where [_ :person/name ?n]] db)))
 (println (sort (d/q '[:find (distinct ?t) . :where [_ :person/tags ?t]] db)))
 (println (d/q '[:find ?n . :where [?e :person/age 55] [?e :person/name ?n]] db))
 (println (d/q '[:find ?n . :where [?e :person/age 99] [?e :person/name ?n]] db))
 (println (sort (d/q '[:find [?n ...] :where [?e :person/boss _] [?e :person/name ?n]] db)))
 (println (d/q '[:find [?n ?a] :where [?e :person/email "cy@x"] [?e :person/name ?n] [?e :person/age ?a]] db))
 (println (d/q '[:find [?n ?a] :where [?e :person/email "nobody@x"] [?e :person/name ?n] [?e :person/age ?a]] db))
+
+; --- pull expressions in :find, :keys / :strs / :syms ---------------------
+
+(println (d/q '[:find (pull ?e [:person/name :person/age]) . :where [?e :person/email "cy@x"]] db))
+(println (sort (map :person/name (d/q '[:find [(pull ?e [:person/name]) ...] :where [?e :person/tags :green]] db))))
+(println (sort (map (fn [[m n]] [(:person/name m) n])
+                    (d/q '[:find (pull ?c [:person/name]) (count ?o) :where [?o :order/customer ?c]] db))))
+(println (sort (map :name (d/q '[:find ?n ?a :keys name age :where [?e :person/name ?n] [?e :person/age ?a]] db))))
+(println (sort (map (fn [m] (get m "name")) (d/q '[:find ?n :strs name :where [?e :person/age 30] [?e :person/name ?n]] db))))
+(println (sort (map (fn [m] (get m 'n)) (d/q '[:find ?n (count ?e) :syms n c :where [?e :person/name ?n]] db))))
+(println (t/caught (d/q '[:find ?n ?a :keys name :where [?e :person/name ?n] [?e :person/age ?a]] db)))
+(println (t/caught (d/q '[:find (pull ?e [:nope/attr]) :where [?e :person/age 30]] db)))
+(println (t/caught (d/q '[:find (pull ?e [:person/name]) :where [?e :person/age 30]] (d/history db))))
 
 ; --- not, or, not-join, or-join ------------------------------------------
 
@@ -142,6 +173,32 @@
                      (or-join [?e] [?e :person/role :role/admin]
                                    (and [?e :person/boss ?b] [?b :person/role :role/admin]))] db)))
 
+; --- several data sources: $2 is a time view, or another store --------------
+
+(def before (d/as-of db (:tx people)))
+(println (rows (d/q '[:find ?n ?then ?now :in $ $2 :where [?e :person/name ?n] [?e :person/age ?now]
+                     [$2 ?e :person/age ?then] [(not= ?then ?now)]] db before)))
+(println (rows (d/q '[:find ?n :in $ $2 :where [?e :person/name ?n] (not [$2 ?e :person/name ?n])] db before)))
+(println (rows (d/q '[:find ?n :in $ $2 :where [?e :person/name ?n] [(missing? $2 ?e :person/name)]] db before)))
+(println (rows (d/q '[:find ?n :in $ $hist :where [?e :person/name ?n] [$hist ?e :person/tags :red _ false]] db (d/history db))))
+(def c2 (d/connect "query2.edb"))
+(d/transact! c2 [{:db/ident :city/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+                  :db/unique :db.unique/identity}
+                 {:db/ident :city/mayor :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+                 {:db/ident :city/size :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}])
+(d/transact! c2 [{:city/name "Ann Arbor" :city/mayor "Ann" :city/size :size/small}
+                 {:city/name "Cyprus" :city/mayor "Cy" :city/size :size/large}
+                 {:city/name "Nowhere" :city/mayor "Zed" :city/size :size/small}])
+(println (rows (d/q '[:find ?n ?city ?size :in $ $2 :where [?e :person/name ?n] [$2 ?c :city/mayor ?n]
+                     [$2 ?c :city/name ?city] [$2 ?c :city/size ?size]] db (d/db c2))))
+(println (rows (d/q '[:find ?size (count ?e) :in $ $2 :where [$2 ?c :city/mayor ?n] [$2 ?c :city/size ?size]
+                     [?e :person/name ?n]] db (d/db c2))))
+(println (t/caught (d/q '[:find ?n :in $ $2 :where [$3 ?e :person/name ?n]] db before)))
+(println (t/caught (d/q '[:find ?n :in $ $2 :where [$2 ?e :person/name ?n]] db 7)))
+(t/check "explain names a scan's source"
+       (string? (d/explain '[:find ?n :in $ $2 :where [?e :person/name ?n] [$2 ?e :person/age 25]] db before)))
+(d/release c2)
+
 ; --- rules: responsible over the supervision chain ------------------------
 
 (def rules '[[(responsible ?boss ?e) [?e :person/boss ?boss]]
@@ -149,6 +206,7 @@
 (println (sort (d/q '[:find [?n ...] :in $ % :where [?b :person/email "ann@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)))
 (println (sort (d/q '[:find [?n ...] :in $ % :where [?b :person/email "cy@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)))
 (println (rows (d/q '[:find ?b ?n :in $ % :where (responsible ?x ?e) [?x :person/name ?b] [?e :person/name ?n]] db rules)))
+(println (sort (d/q '[:find [?n ...] :in $ $2 % :where [?b :person/email "ann@x"] ($2 responsible ?b ?e) [?e :person/name ?n]] db before rules)))
 (t/check "a repeated query and rule set are served from the caches"
        (= (d/q '[:find [?n ...] :in $ % :where [?b :person/email "ann@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)
           (d/q '[:find [?n ...] :in $ % :where [?b :person/email "ann@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)))
@@ -174,7 +232,11 @@
 (println (t/caught (d/q '[:find ?x :where [?e :person/name ?n]] db)))
 (println (t/caught (d/q '[:find ?n :in $ ?a :where [?e :person/name ?n]] db)))
 (println (t/caught (d/q '[:find ?e :where [?e :person/name ?n] [(nope ?n)]] db)))
-(println (t/caught (d/q '[:find ?e :in $ ?pred :where [?e :person/name ?n] [(?pred ?n)]] db adult?)))
+(println (t/caught (d/q '[:find ?e :in $ ?pred :where [?e :person/name ?n] [(?pred ?n)]] db 42)))
+(println (t/caught (d/q '[:find ?e :where [?e :person/name ?n] [(?pred ?n)]] db)))
+(println (t/caught (d/q '[:find ?n :where [?e :person/name ?n] (not [?x :person/tags :blue])] db)))
+(println (t/caught (d/q '[:find ?n :where [?e :person/name ?n] (or [?e :person/tags :blue] [?x :person/tags :green])] db)))
+(println (t/caught (d/q '[:find ?n :where [?e :person/name ?n] (or-join [?e ?w] [?e :person/tags ?w] [?e :person/age 30])] db)))
 (println (t/caught (d/q '[:find ?e ?a ?v :where [?e ?a ?v]] db)))
 (println (t/caught (d/q '[:find ?e :where [?e :nope/attr ?v]] db)))
 (println (t/caught (d/q '[:find ?e :where [?e :person/boss [:nope/attr 1]]] db)))

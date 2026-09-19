@@ -160,7 +160,24 @@ pub const Fx = struct {
     }
 
     pub fn hook(self: *Fx) query.CallHook {
-        return .{ .ctx = @ptrCast(self), .call = &hookCall };
+        return .{ .ctx = @ptrCast(self), .call = &hookCall, .apply = &hookApply };
+    }
+
+    /// A value in function position: a symbol names one of the
+    /// functions below, a keyword looks itself up in a map argument,
+    /// anything else is not callable.
+    pub fn hookApply(ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value {
+        switch (f.kind()) {
+            .symbol => return hookCall(ctx, f.asSymbolId(), args),
+            .keyword => {
+                if (args.len == 0 or args[0].kind() != .persistent_map) return error.NotCallable;
+                return switch (champ.mapGet(args[0], f, &dispatch.hashValue, &dispatch.equal)) {
+                    .present => |v| v,
+                    .absent => value.nilValue(),
+                };
+            },
+            else => return error.NotCallable,
+        }
     }
 
     /// The test's user functions.
@@ -195,6 +212,13 @@ pub const Fx = struct {
             return vector_mod.fromSlice(&self.heap, vals);
         }
         if (std.mem.eql(u8, name, "pair")) return vector_mod.fromSlice(&self.heap, args[0..2]);
+        if (std.mem.eql(u8, name, "count")) return value.fromFixnum(@intCast(string_mod.asBytes(args[0]).len)).?;
+        if (std.mem.eql(u8, name, "subs")) {
+            const s = string_mod.asBytes(args[0]);
+            const from: usize = @intCast(args[1].asFixnum());
+            const to: usize = if (args.len > 2) @intCast(args[2].asFixnum()) else s.len;
+            return string_mod.fromBytes(&self.heap, s[from..to]);
+        }
         if (std.mem.eql(u8, name, "halves")) {
             // [[n 0] [n 1]]
             const rows = try a.alloc(Value, 2);
@@ -203,6 +227,13 @@ pub const Fx = struct {
             return vector_mod.fromSlice(&self.heap, rows);
         }
         if (std.mem.eql(u8, name, "maybe")) return if (args[0].asFixnum() > 30) args[0] else value.nilValue();
+        if (std.mem.eql(u8, name, "total")) {
+            // A custom aggregate: the sum of a vector of integers.
+            var sum: i64 = 0;
+            var it = vector_mod.Cursor.init(args[0]);
+            while (it.next()) |x| sum += x.asFixnum();
+            return value.fromFixnum(sum).?;
+        }
         if (std.mem.eql(u8, name, "boom")) return error.ControlTransferred;
         return error.UnknownFunction;
     }

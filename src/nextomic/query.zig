@@ -4,9 +4,10 @@
 //! (`query/plan.zig`) resolves it against one `Read` and orders the
 //! steps; exec (`query/exec.zig`) runs the plan and materialises the
 //! result into the VM heap; rules (`query/rules.zig`) expand rule
-//! calls. `q` is the one-call entry point: it opens the `Read`, runs
-//! the whole pipeline in one arena, closes the `Read` on every path
-//! and returns the result value. `explain` prints the plan instead.
+//! calls. `q` is the one-call entry point: it opens one `Read` per
+//! data source, runs the whole pipeline in one arena, closes the
+//! `Read`s on every path and returns the result value. `explain`
+//! prints the plan instead.
 
 const std = @import("std");
 const value = @import("value");
@@ -37,6 +38,9 @@ pub const Exec = exec.Exec;
 
 pub const Options = struct {
     hook: ?CallHook = null,
+    /// The db-value a `$name` source after `$` is bound to, from its
+    /// input; without it a query with a second source is refused.
+    db_of: ?*const fn (v: Value) anyerror!DbValue = null,
     /// Parsed queries are looked up here when given; otherwise parsed
     /// afresh and freed after the run.
     ir_cache: ?*Cache = null,
@@ -83,9 +87,42 @@ fn parseAll(gpa: Allocator, interner: *Interner, query: Value, args: []const Val
     return out;
 }
 
+/// One `Read` per data source, `$` first, open together and closed
+/// together.
+const Reads = struct {
+    items: []*db_mod.Read,
+
+    /// `db` is `$`; every later source comes from its input through
+    /// `options.db_of`.
+    fn open(arena: Allocator, db: DbValue, query: *const Ir, args: []const Value, options: Options, diag: *Diag) !Reads {
+        const items = try arena.alloc(*db_mod.Read, query.sources.len);
+        var opened: usize = 0;
+        errdefer for (items[0..opened]) |r| r.close();
+        for (query.in, args) |b, a| {
+            if (b != .src) continue;
+            const d: DbValue = if (b.src == 0) db else blk: {
+                const db_of = options.db_of orelse {
+                    diag.* = .{ .message = "a data source after $ takes a db value" };
+                    return error.QuerySyntax;
+                };
+                break :blk try db_of(a);
+            };
+            const r = try arena.create(db_mod.Read);
+            r.* = try d.beginRead();
+            items[b.src] = r;
+            opened += 1;
+        }
+        return .{ .items = items };
+    }
+
+    fn close(self: Reads) void {
+        for (self.items) |r| r.close();
+    }
+};
+
 /// Run `query` against `db` with `args` positional to its `:in` (the
-/// `$` and `%` positions carry the db and the rules; pass anything
-/// there). The result lives in `heap`.
+/// `$` and `%` positions carry the db and the rules; a source after
+/// `$` is a db value). The result lives in `heap`.
 pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: DbValue, args: []const Value, diag: *Diag, options: Options) anyerror!Value {
     var parsed = try parseAll(gpa, interner, query, args, diag, options);
     defer parsed.deinit();
@@ -94,16 +131,16 @@ pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: DbV
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var read = try db.beginRead();
-    defer read.close();
+    const reads = try Reads.open(arena, db, parsed.query, args, options, diag);
+    defer reads.close();
 
-    var ctx = try plan.Ctx.init(arena, &read, interner, parsed.query, parsed.rules, diag);
+    var ctx = try plan.Ctx.init(arena, reads.items, interner, parsed.query, parsed.rules, diag);
     const p = try plan.plan(&ctx, parsed.query);
-    var ex = exec.Exec{ .arena = arena, .read = &read, .heap = heap, .interner = interner, .hook = options.hook, .diag = diag };
+    var ex = exec.Exec{ .arena = arena, .reads = reads.items, .heap = heap, .interner = interner, .hook = options.hook, .diag = diag };
     const input = try ex.inputRelation(parsed.query, args);
     const rel = try ex.runPlan(p, input);
     const rows = try ex.findRows(parsed.query, rel);
-    return ex.materialise(parsed.query.find_spec, rows);
+    return ex.materialise(parsed.query, rows);
 }
 
 /// Print the plan of `query` against `db` to `w`.
@@ -115,10 +152,10 @@ pub fn explain(gpa: Allocator, interner: *Interner, query: Value, db: DbValue, a
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var read = try db.beginRead();
-    defer read.close();
+    const reads = try Reads.open(arena, db, parsed.query, args, options, diag);
+    defer reads.close();
 
-    var ctx = try plan.Ctx.init(arena, &read, interner, parsed.query, parsed.rules, diag);
+    var ctx = try plan.Ctx.init(arena, reads.items, interner, parsed.query, parsed.rules, diag);
     const p = try plan.plan(&ctx, parsed.query);
     try plan.explain(p, &ctx, w);
 }

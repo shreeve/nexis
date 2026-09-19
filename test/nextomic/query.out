@@ -25,10 +25,18 @@ Cy
 ([Ann] [Bob] [Di])
 ([Ann] [Bob] [Cy] [Di] [Edward] [Flo])
 ([Ann])
+([Ann] [Cy] [Di] [Edward] [Flo])
+([Ann 31] [Bob 27] [Cy 42] [Di 31] [Edward 56] [Flo 34])
+([Cy] [Di])
+([Ann 1] [Bob 1] [Cy 1] [Di 1] [Edward 1] [Flo 1])
+([Ann 1] [Bob 2])
+([Cy] [Edward])
 ([Ann is 30] [Bob is 26] [Cy is 41] [Di is 30] [Edward is 55] [Flo is 33])
 ([Ann 31] [Bob 27] [Cy 42] [Di 31] [Edward 56] [Flo 34])
 ([ANN] [BOB] [CY] [DI] [EDWARD] [FLO])
 ([Ann 30] [Bob 26] [Cy 41] [Di 30] [Edward 55] [Flo 33])
+([Ann :person/height 1.7] [Bob :person/height 1.8] [Cy :person/height 1.65] [Di :person/age 30] [Edward :person/age 55] [Flo :person/age 33])
+([Bob Bob B 3] [Cy Cy C 2] [Di Di D 2] [Edward Edward E 6] [Flo Flo F 3])
 ([Cy :green] [Cy :red] [Edward :green])
 ([[Ann 30]] [[Bob 26]] [[Cy 41]] [[Di 30]] [[Edward 55]] [[Flo 33]])
 ([Ann 3] [Bob 3] [Cy 2] [Di 2] [Edward 6] [Flo 3])
@@ -38,19 +46,43 @@ ok a nil function result drops the row
 185
 215
 ([Ann 2] [Cy 1])
+[31.5 94.47222222222223 9.719682207882222 [55 41] [26 30]]
+30
+([Ann 4] [Bob 2] [Cy 4])
+(3 8 5)
+:nextomic/value-type
 (:blue :green :red)
 Edward
 nil
 (Bob Cy Di)
 [Cy 41]
 nil
+{:db/id 4294967298, :person/name Cy, :person/age 41}
+(Cy Edward)
+([Ann 2] [Bob 1] [Cy 1])
+(Ann Bob Cy Di Edward Flo)
+(Ann Di)
+(Ann Bob Cy Di Edward Flo)
+{:error :nextomic/query-syntax, :message :keys, :strs and :syms take one name per :find element}
+{:error :nextomic/unknown-attribute, :attr :nope/attr}
+:nextomic/history-view
 ([Di] [Flo])
 ([Ann] [Cy] [Di] [Edward])
 ([Bob] [Di] [Edward] [Flo])
 ([Ann] [Bob] [Cy] [Edward])
+([Bob 25 26])
+([Edward] [Flo])
+([Flo])
+([Ann])
+([Ann Ann Arbor :size/small] [Cy Cyprus :size/large])
+([:size/large 1] [:size/small 1])
+{:error :nextomic/query-syntax, :message unknown data source; declare it in :in, :clause 0}
+:kind-mismatch
+ok explain names a scan's source
 (Bob Cy Di)
 (Di)
 ([Ann Bob] [Ann Cy] [Ann Di] [Cy Di])
+(Bob Cy Di)
 ok a repeated query and rule set are served from the caches
 ([Ann 30] [Bob 25] [Cy 41] [Di 30] [Ed 55])
 ([Flo 33])
@@ -61,7 +93,11 @@ ok explain returns the plan as text
 {:error :nextomic/query-syntax, :message :find variable is not bound by :in or :where}
 {:error :nextomic/query-syntax, :message wrong number of inputs}
 {:error :nextomic/query-syntax, :message unknown function: nope}
-{:error :nextomic/query-syntax, :message function position takes a function name, not a variable: ?pred}
+:not-callable
+{:error :nextomic/query-syntax, :message ?pred in function position is never bound, :clause 1}
+{:error :nextomic/query-syntax, :message not shares no variable with the clauses around it: ?x is bound nowhere outside; not joins on a variable bound outside it, :clause 1}
+{:error :nextomic/query-syntax, :message or branch 2 does not mention ?e, which branch 1 does; every or branch uses the same variables (or-join names the join variables), :clause 1}
+{:error :nextomic/query-syntax, :message or-join branch 2 leaves ?w unbound; every branch binds every join variable, :clause 1}
 :nextomic/unbound-pattern
 {:error :nextomic/unknown-attribute, :attr :nope/attr}
 {:error :nextomic/unknown-attribute, :attr :nope/attr}

@@ -9,6 +9,8 @@
 //!   - `vars[i].sym` is unique; every `Var` in the tree is `< vars.len`.
 //!   - Every `find` and `with` variable is bound by some `in` binding
 //!     or by some `where` clause (`parse.zig` checks this).
+//!   - `sources[0]` is `$`; every explicit `Src` in the tree is
+//!     `< sources.len`.
 //!   - Everything hangs off `arena`; `deinit` frees it all.
 
 const std = @import("std");
@@ -20,6 +22,11 @@ const Value = value.Value;
 
 pub const Var = relation.Var;
 pub const Cell = relation.Cell;
+
+/// A data source: the index of a `$` binding in `:in`, in order (`$`
+/// itself is 0). A clause whose source is null reads the default
+/// source: `$` at the top level, the call's source inside a rule body.
+pub const Src = u32;
 
 pub const VarInfo = struct {
     /// VM symbol intern id.
@@ -51,6 +58,7 @@ pub const Term = union(enum) {
 /// `[e a v]`, `[e a v tx]` or `[e a v tx added]`; absent trailing
 /// positions are `blank`.
 pub const Pattern = struct {
+    src: ?Src = null,
     e: Term,
     a: Term,
     v: Term,
@@ -72,6 +80,7 @@ pub const Builtin = enum {
     missing,
     ground,
     get_else,
+    get_some,
     tuple,
     untuple,
 
@@ -86,6 +95,7 @@ pub const Builtin = enum {
             .missing => "missing?",
             .ground => "ground",
             .get_else => "get-else",
+            .get_some => "get-some",
             .tuple => "tuple",
             .untuple => "untuple",
         };
@@ -105,14 +115,17 @@ pub const FnRef = union(enum) {
     builtin: Builtin,
     /// VM symbol intern id, resolved by the caller's `CallHook`.
     user: u32,
+    /// A variable whose cell is the function value: bound through
+    /// `:in` or an earlier clause, applied by the `CallHook`.
+    variable: Var,
 };
 
 /// A predicate or function argument.
 pub const Arg = union(enum) {
     variable: Var,
     constant: Cell,
-    /// The `$` data source.
-    src,
+    /// A data source (`$`, `$2`); null is the default source.
+    src: ?Src,
 };
 
 pub const Call = struct {
@@ -153,8 +166,9 @@ pub const Clause = union(enum) {
     /// `or` (every branch binds the same variables, all of which join)
     /// or `or-join` (join on `join`; other variables are branch-local).
     @"or": struct { join: ?[]const Var, branches: []const Branch },
-    /// `(rule-name arg ...)`.
-    rule: struct { name: u32, args: []const Arg },
+    /// `(rule-name arg ...)` or `($src rule-name arg ...)`; the body's
+    /// unprefixed clauses read `src` (null: the default source).
+    rule: struct { name: u32, args: []const Arg, src: ?Src = null },
     /// A join with a relation supplied at run time, by slot id in the
     /// plan context; rule expansion replaces recursive calls with it.
     /// `vars` bind the relation's columns positionally.
@@ -167,8 +181,16 @@ pub const AggOp = enum {
     min,
     max,
     avg,
+    median,
+    variance,
+    stddev,
     count_distinct,
     distinct,
+    sample,
+    rand,
+    /// A symbol that names no built-in: called through the `CallHook`
+    /// with the vector of the group's values.
+    custom,
 
     pub fn name(self: AggOp) []const u8 {
         return switch (self) {
@@ -177,36 +199,74 @@ pub const AggOp = enum {
             .min => "min",
             .max => "max",
             .avg => "avg",
+            .median => "median",
+            .variance => "variance",
+            .stddev => "stddev",
             .count_distinct => "count-distinct",
             .distinct => "distinct",
+            .sample => "sample",
+            .rand => "rand",
+            .custom => "custom",
         };
     }
 
     pub fn fromName(s: []const u8) ?AggOp {
         inline for (@typeInfo(AggOp).@"enum".fields) |f| {
             const op: AggOp = @enumFromInt(f.value);
-            if (std.mem.eql(u8, s, op.name())) return op;
+            if (op != .custom and std.mem.eql(u8, s, op.name())) return op;
         }
         return null;
     }
+
+    /// Does the aggregate take a leading count: `(op n ?x)`?
+    pub fn takesN(self: AggOp) ?enum { required, optional } {
+        return switch (self) {
+            .sample, .rand => .required,
+            .min, .max => .optional,
+            else => null,
+        };
+    }
+};
+
+pub const Agg = struct {
+    op: AggOp,
+    arg: Var,
+    /// The `n` of `(sample n ?x)`, `(rand n ?x)`, `(min n ?x)`, `(max n ?x)`.
+    n: ?u32 = null,
+    /// The symbol of a `custom` aggregate.
+    sym: u32 = 0,
 };
 
 pub const FindElem = union(enum) {
     variable: Var,
-    agg: struct { op: AggOp, arg: Var },
+    agg: Agg,
+    /// `(pull ?e pattern)`: the pattern value is resolved against the
+    /// db when the result is materialised; the element groups and
+    /// dedups as its variable.
+    pull: struct { e: Var, pattern: Value },
 
     pub fn variable_of(self: FindElem) Var {
         return switch (self) {
             .variable => |v| v,
             .agg => |a| a.arg,
+            .pull => |p| p.e,
         };
     }
 };
 
 pub const FindSpec = enum { relation, scalar, collection, tuple };
 
+/// `:keys`, `:strs` or `:syms`: one name per find element; the result
+/// is a vector of maps under those names.
+pub const Keys = struct {
+    kind: enum { keyword, string, symbol },
+    /// VM symbol intern ids, in find order.
+    names: []const u32,
+};
+
 pub const InBinding = union(enum) {
-    src,
+    /// A data source, numbered by its position among the sources.
+    src: Src,
     rules,
     scalar: Var,
     collection: Var,
@@ -219,8 +279,11 @@ pub const Ir = struct {
     vars: []const VarInfo,
     find_spec: FindSpec,
     find: []const FindElem,
+    keys: ?Keys = null,
     with: []const Var,
     in: []const InBinding,
+    /// VM symbol ids of the sources, by `Src`: `$` first.
+    sources: []const u32,
     where: []const Clause,
 
     pub fn deinit(self: *Ir) void {
@@ -345,6 +408,7 @@ pub fn allVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(Va
 }
 
 fn callVars(arena: Allocator, call: Call, out: *std.ArrayList(Var)) !void {
+    if (call.f == .variable) try addVar(arena, out, call.f.variable);
     for (call.args) |a| {
         if (a == .variable) try addVar(arena, out, a.variable);
     }
