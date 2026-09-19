@@ -492,7 +492,8 @@ const Puller = struct {
         const attr = (try self.read.attr(a)) orelse return error.Corrupted;
         const k = (try self.read.db.conn.idents.internOf(self.read.txn, a)) orelse return error.Corrupted;
         const spec: Spec = .{ .attr = attr, .reverse = false, .key = k, .limit = default_limit, .default = null, .sub = .none };
-        const v = try self.render(&wildcard_pattern, &spec, 0, &.{}, vals);
+        const cut = if (spec.many()) @min(vals.len, default_limit) else 1;
+        const v = try self.render(&wildcard_pattern, &spec, 0, &.{}, vals[0..cut]);
         return self.assoc(m, value.fromKeywordId(k), v);
     }
 

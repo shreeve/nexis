@@ -32,6 +32,7 @@ const Heap = heap_mod.Heap;
 const Interner = intern_mod.Interner;
 const query = nextomic.query;
 const pull = nextomic.pull;
+const default_limit = pull.default_limit;
 const DbValue = nextomic.DbValue;
 const TestConn = nextomic.db.TestConn;
 const key = nextomic.key;
@@ -211,6 +212,12 @@ fn loadCorpus(fx: *Fx) !void {
         \\ {:db/id "n3" :node/label "n3" :edge/to ["n1" "n4"]} {:db/id "n4" :node/label "n4" :edge/to ["n5"]}
         \\ {:db/id "n5" :node/label "n5"} {:db/id "n6" :node/label "n6"}]
     );
+    // Order 9 has one more item than the default card-many cut.
+    var big: std.ArrayList(u8) = .empty;
+    try big.appendSlice(fx.arena(), "[{:order/number 9 :order/items [");
+    for (0..default_limit + 1) |i| try big.print(fx.arena(), "\"item{d:0>4}\" ", .{i});
+    try big.appendSlice(fx.arena(), "]}]");
+    _ = try fx.transact(big.items);
 }
 
 /// The update after which the as-of corpus runs: a retraction, a
@@ -307,7 +314,7 @@ const Naive = struct {
         const reverse = name[slash + 1] == '_';
         const forward = if (reverse) try std.mem.concat(self.arena, u8, &.{ name[0 .. slash + 1], name[slash + 2 ..] }) else name;
         const attr = try self.attrByName(forward);
-        return .{ .attr = attr, .reverse = reverse, .k = k, .limit = 1000, .default = null };
+        return .{ .attr = attr, .reverse = reverse, .k = k, .limit = default_limit, .default = null };
     }
 
     /// `(attr opts)`, `[attr opts]`, `(limit attr n)`, `(default attr v)`.
@@ -489,7 +496,7 @@ const Naive = struct {
                 if (covered.contains(ea.a)) continue;
                 const attr = (try self.dbv.attr(self.arena, ea.a)).?;
                 const k = (try self.dbv.conn.idents.internOf(self.txn, ea.a)).?;
-                const spec: Spec = .{ .attr = attr, .reverse = false, .k = value.fromKeywordId(k), .limit = 1000, .default = null };
+                const spec: Spec = .{ .attr = attr, .reverse = false, .k = value.fromKeywordId(k), .limit = default_limit, .default = null };
                 _ = try self.emit(&m, pattern, ent, e, spec, .none, budget);
             }
         }
@@ -578,6 +585,10 @@ const corpus = [_]Case{
     .{ .pattern = "[:person/bio :person/height :person/active]", .entity = ann },
     .{ .pattern = "[:order/items :order/customer]", .entity = "[:order/number 1]" },
     .{ .pattern = "[:order/items :order/customer]", .entity = "[:order/number 2]" },
+    .{ .pattern = "[*]", .entity = "[:order/number 9]" },
+    .{ .pattern = "[:order/items]", .entity = "[:order/number 9]" },
+    .{ .pattern = "[(:order/items :limit nil)]", .entity = "[:order/number 9]" },
+    .{ .pattern = "[(:order/items :limit 1001)]", .entity = "[:order/number 9]" },
     // Components.
     .{ .pattern = "[:person/house]", .entity = ann },
     .{ .pattern = "[:person/name :person/house]", .entity = bob },
