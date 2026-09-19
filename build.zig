@@ -1207,6 +1207,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "require-demo" },
             .{ .name = "shapes" },
             .{ .name = "shapes-app" },
+            .{ .name = "tests-demo" },
             .{ .name = "durable-refs", .twice = true },
             .{ .name = "todo-app", .twice = true },
             .{ .name = "nextomic-app", .twice = true },
@@ -1256,21 +1257,25 @@ pub fn build(b: *std.Build) void {
 
     // test/golden/cli — what bin/nexis prints for a script, pinned
     // byte for byte: a runtime error's stderr (`<name>.nx` +
-    // `<name>.err`, exit 5). Each runs from the build root so the
-    // paths in the output are the relative ones committed. To
-    // refresh an expected file, run the command from the build root
-    // and redirect the stream it pins.
+    // `<name>.err`, exit 5), a disassembly's stdout (`.disasm`) and
+    // a script's stdout (`.out`).
+    // Each runs from the build root so the paths in the output are
+    // the relative ones committed. To refresh an expected file, run
+    // the command from the build root and redirect the stream it
+    // pins.
     {
         const CliGolden = struct {
-            name: []const u8,
             verb: []const u8 = "run",
+            file: []const u8,
             expected: []const u8,
             stream: enum { stdout, stderr } = .stdout,
             exit_code: u8 = 0,
         };
         const cases = [_]CliGolden{
-            .{ .name = "divide-by-zero", .expected = "divide-by-zero.err", .stream = .stderr, .exit_code = 5 },
-            .{ .name = "uncaught-throw", .expected = "uncaught-throw.err", .stream = .stderr, .exit_code = 5 },
+            .{ .file = "test/golden/cli/divide-by-zero.nx", .expected = "divide-by-zero.err", .stream = .stderr, .exit_code = 5 },
+            .{ .file = "test/golden/cli/uncaught-throw.nx", .expected = "uncaught-throw.err", .stream = .stderr, .exit_code = 5 },
+            .{ .verb = "disasm", .file = "examples/sum10.nx", .expected = "sum10.disasm" },
+            .{ .file = "test/golden/cli/pprint.nx", .expected = "pprint.out" },
         };
         for (cases) |case| {
             const expected = b.build_root.handle.readFileAlloc(

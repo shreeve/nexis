@@ -40,14 +40,24 @@ const Usage =
     \\                       final result.
     \\  nexis repl           Interactive read-eval-print loop.
     \\                       :quit or EOF to exit.
+    \\  nexis disasm FILE.nx Compiles FILE.nx without running it and
+    \\                       prints every routine's bytecode: pc,
+    \\                       opcode, operands, constants and the
+    \\                       source line:col each run of
+    \\                       instructions comes from.
+    \\                       `--disasm FILE.nx` is the same.
     \\
     \\For `run`, Vars and the interner persist across forms within
-    \\the file; for `repl`, across the whole session.
+    \\the file; for `repl`, across the whole session. A runtime error
+    \\is reported at its source position with the frame chain.
     \\
     \\Namespaces available without a file: nexis.core (auto-referred),
     \\db (key-value storage on emdb), nextomic (Datomic-class datoms:
     \\transact!, q, pull, as-of/since/history, with), nexis.string,
-    \\nexis.internal. See README.md and docs/NEXTOMIC.md.
+    \\nexis.test (deftest, is, testing, run-tests), nexis.pprint
+    \\(pprint), nexis.math (sqrt, pow, floor, ceil, round, PI, E),
+    \\nexis.internal. See README.md, docs/TOOLING.md and
+    \\docs/NEXTOMIC.md.
     \\
     \\Examples: examples/*.nx (examples/nextomic-app.nx for Nextomic).
     \\
@@ -207,15 +217,19 @@ fn emitSourceError(
 /// them in a stack trace.
 const core_source = vm.SourceInfo{ .path = "core.nx", .text = stdlib.CORE_NX_SOURCE };
 const nextomic_source = vm.SourceInfo{ .path = "nextomic.nx", .text = stdlib.NEXTOMIC_NX_SOURCE };
+const test_source = vm.SourceInfo{ .path = "test.nx", .text = stdlib.TEST_NX_SOURCE };
+const pprint_source = vm.SourceInfo{ .path = "pprint.nx", .text = stdlib.PPRINT_NX_SOURCE };
+const math_source = vm.SourceInfo{ .path = "math.nx", .text = stdlib.MATH_NX_SOURCE };
 
 /// The routine the VM is created around; `retargetTop` replaces it
 /// before anything runs.
 const stub_code = [_]vm.Inst{vm.asm_.returnNil()};
 const stub_routine = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
 
-/// A VM with `nexis.core`, `db`, `nexis.string`, `nexis.internal`
-/// and `nextomic` installed, the embedded core.nx and nextomic.nx
-/// bootstrapped into their namespaces, and a namespace loader
+/// A VM with `nexis.core`, `db`, `nexis.string`, `nexis.internal`,
+/// `nexis.math` and `nextomic` installed, the embedded core.nx,
+/// nextomic.nx, test.nx, pprint.nx and math.nx bootstrapped into
+/// their namespaces, and a namespace loader
 /// that searches `load_paths` when `(require ...)` fires. The
 /// current namespace is `user`.
 const Runtime = struct {
@@ -337,12 +351,19 @@ fn bootRuntime(rt: *Runtime, io: std.Io, allocator: std.mem.Allocator, load_path
     try stdlib.installInternal(internal_ns);
     const nextomic_ns = try rt.registry.getOrCreate("nextomic", rt.registry.core);
     try stdlib.installNextomic(nextomic_ns);
+    const test_ns = try rt.registry.getOrCreate("nexis.test", rt.registry.core);
+    const pprint_ns = try rt.registry.getOrCreate("nexis.pprint", rt.registry.core);
+    const math_ns = try rt.registry.getOrCreate("nexis.math", rt.registry.core);
+    try stdlib.installMath(math_ns);
     rt.host_macros = try expand_mod.defaultMacros(allocator);
     errdefer rt.host_macros.deinit(allocator);
     // The embedded sources define into their own namespaces; core.nx
     // first so nextomic.nx can use it.
     try bootstrapEmbedded(rt, rt.registry.core, &core_source);
     try bootstrapEmbedded(rt, nextomic_ns, &nextomic_source);
+    try bootstrapEmbedded(rt, test_ns, &test_source);
+    try bootstrapEmbedded(rt, pprint_ns, &pprint_source);
+    try bootstrapEmbedded(rt, math_ns, &math_source);
     rt.loader = loader_mod.Loader.init(
         allocator,
         rt.persistent(),
