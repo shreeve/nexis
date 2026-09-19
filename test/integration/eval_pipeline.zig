@@ -3889,3 +3889,37 @@ test "typed vectors: constructor errors and the absent update operations" {
         .{ .src = "(try (with-meta (i64-vector [1]) {}) (catch any e e))", .expected = ":no-metadata-on-immediate" },
     });
 }
+
+test "typed vectors: nexis.simd kernels" {
+    // The harness has no loader, so `(require '[nexis.simd :as tv])`
+    // is not available here; the namespace is installed beside core
+    // and reached by its full name.
+    try runCoreCases(&.{
+        .{ .src = "(nexis.simd/sum (i64-vector [1 2 3]))", .expected = "6" },
+        .{ .src = "(nexis.simd/sum (f64-vector [1 2 3 4 5 6 7 8 9]))", .expected = "45.0" },
+        .{ .src = "(nexis.simd/sum (i64-vector []))", .expected = "0" },
+        .{ .src = "(nexis.simd/sum (f64-vector []))", .expected = "0.0" },
+        .{ .src = "(nexis.simd/sum (i64-vector [9223372036854775807]))", .expected = "9223372036854775807" },
+        .{ .src = "(try (nexis.simd/sum (i64-vector [9223372036854775807 1])) (catch any e e))", .expected = ":arithmetic-overflow" },
+        .{ .src = "(nexis.simd/dot (i64-vector [1 2 3]) (i64-vector [4 5 6]))", .expected = "32" },
+        .{ .src = "(nexis.simd/dot (f64-vector [1 2 3 4 5]) (f64-vector [1 1 1 1 1]))", .expected = "15.0" },
+        .{ .src = "(nexis.simd/dot (f64-vector []) (f64-vector []))", .expected = "0.0" },
+        .{ .src = "(try (nexis.simd/dot (i64-vector [1]) (f64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (nexis.simd/dot (i64-vector [1]) (i64-vector [1 2])) (catch any e e))", .expected = ":invalid-argument" },
+        .{ .src = "(try (nexis.simd/dot (i64-vector [4611686018427387904]) (i64-vector [4])) (catch any e e))", .expected = ":arithmetic-overflow" },
+        .{ .src = "(try (nexis.simd/dot [1] (i64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(nexis.simd/scale (i64-vector [1 2 3]) 10)", .expected = "#i64[10 20 30]" },
+        .{ .src = "(nexis.simd/scale (f64-vector [1 2 3 4 5]) 0.5)", .expected = "#f64[0.5 1.0 1.5 2.0 2.5]" },
+        .{ .src = "(nexis.simd/scale (f64-vector [1 2]) 2)", .expected = "#f64[2.0 4.0]" },
+        .{ .src = "(try (nexis.simd/scale (i64-vector [1]) 1.5) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (nexis.simd/scale (i64-vector [4611686018427387904]) 2) (catch any e e))", .expected = ":arithmetic-overflow" },
+        .{ .src = "(nexis.simd/map (fn [x] (* x x)) (i64-vector [1 2 3]))", .expected = "#i64[1 4 9]" },
+        .{ .src = "(nexis.simd/map (fn [x] (/ x 2)) (f64-vector [1 2 3]))", .expected = "#f64[0.5 1.0 1.5]" },
+        .{ .src = "(nexis.simd/map (fn [x] (/ x 2)) (i64-vector [4 6]))", .expected = "#i64[2 3]" },
+        .{ .src = "(nexis.simd/map inc (f64-vector []))", .expected = "#f64[]" },
+        .{ .src = "(try (nexis.simd/map (fn [x] (/ x 2)) (i64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (nexis.simd/map str (f64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
+        .{ .src = "(try (nexis.simd/map (fn [x] (throw :inner)) (i64-vector [1])) (catch :inner e :caught))", .expected = ":caught" },
+        .{ .src = "(nexis.simd/map (fn [x] (* x 140737488355328)) (i64-vector [1 2]))", .expected = "#i64[140737488355328 281474976710656]" },
+    });
+}

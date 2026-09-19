@@ -226,7 +226,7 @@ pub const Loader = struct {
 };
 
 /// Namespaces the CLI populates before any file runs.
-const installed_namespaces = [_][]const u8{ "nexis.core", "db", "nexis.string", "nexis.internal", "nextomic" };
+const installed_namespaces = [_][]const u8{ "nexis.core", "db", "nexis.string", "nexis.internal", "nexis.simd", "nextomic" };
 
 /// Map `my.app.foo` → `my/app/foo.nx`. Caller owns returned slice.
 fn nsNameToRelPath(allocator: std.mem.Allocator, ns_name: []const u8) ![]u8 {
