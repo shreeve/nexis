@@ -3858,3 +3858,32 @@ test "gc: db/reduce-tree and db/alter! survive cycles inside their callbacks" {
     defer testing.allocator.free(src);
     try expectOutputUnderGc(src, "[30 v0+]");
 }
+
+// =============================================================================
+// ^:dynamic Vars and binding (VM.md §6.5)
+// =============================================================================
+
+test "binding: nesting, restoration, and a closure seeing the binding in force at the call" {
+    try expectOutputProgram("(def ^:dynamic *x* 1) (defn read-x [] *x*) [(binding [*x* 2] [*x* (read-x)]) *x* (read-x)]", "[[2 2] 1 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (def ^:dynamic *y* 10) (binding [*x* 2 *y* 3] [*x* *y* (binding [*x* 4] [*x* *y*]) *x*])", "[2 3 [4 3] 2]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (let [f (fn [] *x*)] [(f) (binding [*x* 5] (f)) (f)])", "[1 5 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (binding [*x* (+ *x* 10)] (binding [*x* (+ *x* 100)] *x*))", "111");
+    try expectOutputProgram("(def ^:dynamic *x* 1) [(thread-bound? (var *x*)) (binding [*x* 0] (thread-bound? (var *x*)))]", "[false true]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (def ^:dynamic *y* 2) (binding [*x* *y* *y* *x*] [*x* *y*])", "[2 1]");
+}
+
+test "binding: a throw through binding restores the root before the catch runs" {
+    try expectOutputProgram("(def ^:dynamic *x* 1) (try (binding [*x* 9] (throw :boom)) (catch :boom e [e *x*]))", "[:boom 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (defn boom [] (throw :boom)) [(try (binding [*x* 2] (binding [*x* 3] (boom))) (catch :boom _ *x*)) *x*]", "[1 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) [(binding [*x* 2] (try (binding [*x* 3] (throw :in)) (catch :in _ *x*))) *x*]", "[2 1]");
+}
+
+test "binding: only a dynamic Var can be bound; set! rebinds the innermost binding" {
+    try expectOutputProgram("(def plain 1) (try (binding [plain 2] plain) (catch :not-dynamic e e))", ":not-dynamic");
+    try expectOutputProgram("(def plain 1) (def ^:dynamic *x* 1) [(try (binding [*x* 2 plain 2] plain) (catch :not-dynamic e e)) (thread-bound? (var *x*))]", "[:not-dynamic false]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (defn read-x [] *x*) [(binding [*x* 2] (set! *x* 7) (read-x)) *x*]", "[7 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (binding [*x* 2] (binding [*x* 3] (set! *x* 4)) *x*)", "2");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (try (set! *x* 5) (catch :no-thread-binding e [e *x*]))", "[:no-thread-binding 1]");
+    try expectOutputProgram("(def plain 1) (try (set! plain 5) (catch :not-dynamic e [e plain]))", "[:not-dynamic 1]");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (meta (var *x*))", "{:dynamic true}");
+}

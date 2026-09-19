@@ -1199,6 +1199,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "macro-author" },
             .{ .name = "try-catch" },
             .{ .name = "metadata" },
+            .{ .name = "binding" },
             .{ .name = "maps-sets" },
             .{ .name = "defmacro" },
             .{ .name = "stdlib-primitives" },

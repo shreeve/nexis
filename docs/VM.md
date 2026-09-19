@@ -580,6 +580,39 @@ macroexpander uses it for `defmacro` bodies).
 
 ---
 
+#### 6.5 Dynamic bindings
+
+A Var whose metadata carries `:dynamic true` (`(def ^:dynamic *x*
+1)`; `reset-meta!` and `alter-meta!` set `Var.dynamic`, which is
+never cleared) can be rebound for a dynamic extent. The binding in
+force lives on the Var itself: `Var.thread_value` with
+`Var.thread_bound` set, so a load is one flag test and a Var that
+was never bound costs nothing. The VM keeps the save stack:
+`vm.dyn_saves` holds, for each Var a frame rebound, the binding it
+replaced, and `vm.dyn_frames` the index each frame starts at.
+
+- `VM.pushBindings(vars, values)` (the `push-thread-bindings`
+  native, which takes a map of Vars to values): every Var must be
+  dynamic, else `NotDynamic` and nothing is rebound; then each is
+  saved and set.
+- `VM.popBindings()` (`pop-thread-bindings`): restores the innermost
+  frame's Vars in reverse order.
+- `var-set` (`set!`): writes `thread_value` of a dynamic Var with a
+  binding in force; `NotDynamic` / `NoThreadBinding` otherwise. The
+  root is written only by `def`.
+- `thread-bound?`: whether a binding of the Var is in force.
+
+`binding` (`src/stdlib/core.nx`) evaluates its values in the
+bindings outside the form, calls `push-thread-bindings` once, and
+runs the body inside `(try ... (finally (pop-thread-bindings)))`, so
+a throw through the form restores the previous bindings before the
+handler runs. A closure sees the binding in force when it is
+called, wherever it was created. The scope is the process (one
+thread): a compile-time sub-VM running inside a `binding` extent
+sees it too, and `VM.deinit` pops whatever frames a VM abandoned
+with an error before its `finally` ran. Every value on the save
+stack and every `thread_value` is a collector root (§9).
+
 ### 7. Call frame
 
 A **frame** represents one invocation of a routine.
@@ -813,7 +846,7 @@ handlers must be revisited.
 
 | Var | Name | Operands | Semantics |
 |---|---|---|---|
-| 0 | `var:load-var` | A=dst_slot, B=var, _ | `slot[A] :=` the Var's `thread_value` when a binding of it is in force (`thread_bound`), else its `root`. Traps `:unbound-var` if the Var has never been bound by `def` and has no binding. Equivalent to `mov:move A, v:B`; the dedicated opcode exists for symmetry with `store-var` |
+| 0 | `var:load-var` | A=dst_slot, B=var, _ | `slot[A] :=` the Var's `thread_value` when a `binding` of it is in force (`thread_bound`, §6.5), else its `root`. Traps `:unbound-var` if the Var has never been bound by `def` and has no binding. Equivalent to `mov:move A, v:B`; the dedicated opcode exists for symmetry with `store-var` |
 | 1 | `var:store-var` | A=dst_slot, B=var, C=any | `var_table[B.index].root := resolve(C)`, mark bound; `slot[A] :=` the Var object (kind `var_`). Rebinding the same name updates the SAME Var in place (identity-stable), so closures compiled against it see the new root |
 | 2 | `var:var-object` | A=dst_slot, B=var, _ | `slot[A] :=` the Var object; does not trap on an unbound Var |
 
@@ -984,6 +1017,8 @@ handler is active):
 | `:arity-mismatch` | `call:call` (or `callValue`) passes an argument count the callee does not accept |
 | `:not-callable` | `call:call` on a value that is not a function, native, protocol fn, keyword, map, set or vector |
 | `:unbound-var` | A `v` operand or `var:load-var` on a Var never bound by `def` |
+| `:not-dynamic` | `binding` (`push-thread-bindings`) or `set!` (`var-set`) on a Var not marked `^:dynamic` (§6.5) |
+| `:no-thread-binding` | `set!` (`var-set`) on a dynamic Var with no `binding` of it in force (§6.5) |
 | `:arithmetic-overflow` | A count or identifier the runtime produces does not fit in a fixnum. No `math:*` opcode or arithmetic native raises it: an integer result outside i48 promotes to a bignum |
 | `:divide-by-zero` | Integer `/`, `quot`, `rem`, `mod` with a zero divisor (float division by zero is IEEE) |
 | `:index-out-of-bounds` | `nth` and friends past the end |

@@ -334,7 +334,7 @@ The compiler recognizes a **small primitive core**. User-facing ergonomics (`let
 | `(try body... (catch bind pat handler) (finally cleanup))` | Exception handling. Frames with pending `finally` / unwind obligations are not tailcall-replaceable. |
 | `(var sym)` | Yield the `Var` object (not its root value). |
 
-`set!` does not exist: there are no dynamic bindings, and `def` is the only Var write.
+`def` is the only root write. `binding` rebinds `^:dynamic` Vars for a dynamic extent and `set!` writes the innermost binding in force (§13.4); both are macros in `src/stdlib/core.nx` over natives, not special forms.
 
 #### User-facing forms provided as macros
 
@@ -2650,3 +2650,13 @@ entry stating the decision and its rationale.
   upvalue cells are heap blocks; Vars stay immortal arena objects
   rooted through the namespaces. `docs/GC.md` §3, §7 and
   `docs/VM.md` §9 are the authority.
+
+- **2026-09-18 — Dynamic Vars and `binding` (§8, §13.4).** `(def
+  ^:dynamic *x* ...)` marks a Var dynamic through its metadata;
+  `binding` is a `core.nx` macro over `push-thread-bindings` /
+  `pop-thread-bindings` with the pop in a `finally`, and `set!` a
+  macro over `var-set`, which writes the innermost binding in force
+  and never the root. The binding in force lives on the Var, so a
+  load is one flag test; §13.4's `push-dynamic` / `pop-dynamic`
+  opcodes do not exist, and the §8 sentence "`set!` does not exist"
+  is replaced. `docs/VM.md` §6.5 is the authority.

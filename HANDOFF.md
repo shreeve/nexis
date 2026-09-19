@@ -245,7 +245,7 @@ context, or the bare keyword when there is nothing more to say.
 
 | namespace | contents |
 |---|---|
-| `nexis.core` (auto-referred) | 139 natives in `src/stdlib.zig` `core_fns` (sequences, HOFs, collections, arithmetic, predicates, strings, I/O) plus 43 definitions in `src/stdlib/core.nx`: 16 macros (`when-let if-let dotimes with-tx with-read-tx with-snapshot declare if-not while letfn doseq cond-> cond->> some-> some->> as->`) and 27 functions (`true? false? second third last reverse take drop constantly complement partial comp every? not-every? some not-any? merge update get-in assoc-in update-in frequencies group-by interpose juxt fnil merge-with`) |
+| `nexis.core` (auto-referred) | 143 natives in `src/stdlib.zig` `core_fns` (sequences, HOFs, collections, arithmetic, predicates, strings, I/O, dynamic bindings) plus 45 definitions in `src/stdlib/core.nx`: 18 macros (`when-let if-let dotimes with-tx with-read-tx with-snapshot binding set! declare if-not while letfn doseq cond-> cond->> some-> some->> as->`) and 27 functions (`true? false? second third last reverse take drop constantly complement partial comp every? not-every? some not-any? merge update get-in assoc-in update-in frequencies group-by interpose juxt fnil merge-with`) |
 | `db` | 23 natives: `open close ref ref? put-key! get-key delete-key! present? begin-write begin-read commit! abort-write! abort-read! put! get delete! deref alter! scan reduce-tree snapshot release-snapshot! snapshot?` |
 | `nexis.string` | `lower-case upper-case trim split join replace` |
 | `nexis.internal` | the nine `#%...` primitives `defrecord`/`defprotocol` expand to |
@@ -466,21 +466,6 @@ trip; the codec serializability matrix in `docs/CODEC.md` updated.
 *Size*: a new `src/coll/typed_vector.zig` of a few hundred lines
 plus arms in five files.
 
-### 6.7 `^:dynamic` Vars and `binding`
-
-*Symptom*: `(binding [x 2] x)` is `UnresolvedSymbol`. PLAN §21
-Phase 3.7.
-
-*Approach*: the VM holds the binding stack (`docs/VM.md` §6.5 names
-its shape); `binding` as a macro over push/pop with a `finally`; the
-natives, the macro, `set!` and the tests are what remain.
-
-*Proof*: `eval_pipeline` cases for nesting, a throw through
-`binding`, and a closure capturing a dynamic Var seeing the binding
-in force at call time.
-
-*Size*: `stdlib.zig`, `core.nx`; a couple of hundred lines.
-
 ### 6.8 Nextomic follow-ups
 
 In the order they unblock users; each is listed as later in
@@ -639,9 +624,8 @@ regenerated file with the grammar).
    full-text (§6.8).** Transaction functions unlock the next class
    of Nextomic programs; the callback into the VM follows the
    rooting rule of `docs/GC.md` §11.5.
-5. **`^:dynamic`/`binding` (§6.7) and `typed_vector` (§6.6)** when a
-   user need appears; both are self-contained and neither blocks the
-   rest.
+5. **`typed_vector` (§6.6)** when a user need appears; it is
+   self-contained and blocks nothing.
 6. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
    inline caches, SIMD CHAMP nodes, zero-copy strings from emdb
    pages, hash-join tuning. Measure first with `zig build bench`;

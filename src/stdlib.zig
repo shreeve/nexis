@@ -316,6 +316,12 @@ const core_fns = [_]CoreEntry{
     .{ .name = "with-meta", .descriptor = &native_with_meta },
     .{ .name = "reset-meta!", .descriptor = &native_reset_meta },
     .{ .name = "alter-meta!", .descriptor = &native_alter_meta },
+    // Dynamic bindings (VM.md §6.5); `binding` and `set!` in
+    // core.nx expand to these.
+    .{ .name = "push-thread-bindings", .descriptor = &native_push_thread_bindings },
+    .{ .name = "pop-thread-bindings", .descriptor = &native_pop_thread_bindings },
+    .{ .name = "var-set", .descriptor = &native_var_set },
+    .{ .name = "thread-bound?", .descriptor = &native_thread_bound_q },
     .{ .name = "boolean", .descriptor = &native_boolean },
     .{ .name = "list?", .descriptor = &native_list_q },
     .{ .name = "seq?", .descriptor = &native_seq_q },
@@ -554,6 +560,10 @@ const native_meta = NativeFn{ .name = "meta", .min_arity = 1, .max_arity = 1, .c
 const native_with_meta = NativeFn{ .name = "with-meta", .min_arity = 2, .max_arity = 2, .call = &fnWithMeta };
 const native_reset_meta = NativeFn{ .name = "reset-meta!", .min_arity = 2, .max_arity = 2, .call = &fnResetMeta };
 const native_alter_meta = NativeFn{ .name = "alter-meta!", .min_arity = 2, .max_arity = null, .call = &fnAlterMeta };
+const native_push_thread_bindings = NativeFn{ .name = "push-thread-bindings", .min_arity = 1, .max_arity = 1, .call = &fnPushThreadBindings };
+const native_pop_thread_bindings = NativeFn{ .name = "pop-thread-bindings", .min_arity = 0, .max_arity = 0, .call = &fnPopThreadBindings };
+const native_var_set = NativeFn{ .name = "var-set", .min_arity = 2, .max_arity = 2, .call = &fnVarSet };
+const native_thread_bound_q = NativeFn{ .name = "thread-bound?", .min_arity = 1, .max_arity = 1, .call = &fnThreadBoundQ };
 const native_boolean = NativeFn{ .name = "boolean", .min_arity = 1, .max_arity = 1, .call = &fnBoolean };
 const native_list_q = NativeFn{ .name = "list?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
 const native_seq_q = NativeFn{ .name = "seq?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
@@ -2496,11 +2506,25 @@ fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(reset-meta! v m)` → sets the Var's metadata to `m` (a map or
 /// nil) and returns it.
-fn fnResetMeta(_: *VM, args: []const Value) VmError!Value {
+fn fnResetMeta(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .var_) return VmError.KindMismatch;
     if (!args[1].isNil() and args[1].kind() != .persistent_map) return VmError.KindMismatch;
-    VM.asVar(args[0]).meta = args[1];
+    try setVarMeta(vm, VM.asVar(args[0]), args[1]);
     return args[1];
+}
+
+/// Store `m` as `v`'s metadata; `:dynamic true` in it marks the
+/// Var dynamic for good (`(def ^:dynamic *x* ...)`, VM.md §6.5).
+fn setVarMeta(vm: *VM, v: *vm_mod.Var, m: Value) VmError!void {
+    v.meta = m;
+    if (m.isNil()) return;
+    const key = vm.ensureInterner().internKeywordValue("dynamic") catch return VmError.OutOfMemory;
+    switch (champ_mod.mapGet(m, key, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal)) {
+        .present => |flag| if (flag.isTruthy()) {
+            v.dynamic = true;
+        },
+        .absent => {},
+    }
 }
 
 /// `(alter-meta! v f & args)` → sets the Var's metadata to
@@ -2514,8 +2538,61 @@ fn fnAlterMeta(vm: *VM, args: []const Value) VmError!Value {
     @memcpy(call_args[1..], args[2..]);
     const next = try vm.callValue(args[1], call_args);
     if (!next.isNil() and next.kind() != .persistent_map) return VmError.KindMismatch;
-    v.meta = next;
+    try setVarMeta(vm, v, next);
     return next;
+}
+
+// =============================================================================
+// Dynamic bindings (VM.md §6.5)
+// =============================================================================
+
+/// `(push-thread-bindings {#'a 1 #'b 2})` → opens a binding frame
+/// rebinding each Var to its value; `binding` pairs it with
+/// `pop-thread-bindings` in a `finally`. A key that is not a Var is
+/// `:kind-mismatch`; a Var that is not dynamic is `:not-dynamic`
+/// and nothing is rebound.
+fn fnPushThreadBindings(vm: *VM, args: []const Value) VmError!Value {
+    const m = args[0];
+    if (m.kind() != .persistent_map) return VmError.KindMismatch;
+    const n = champ_mod.mapCount(m);
+    const vars = vm.allocator.alloc(*vm_mod.Var, n) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(vars);
+    const values = vm.allocator.alloc(Value, n) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(values);
+    var it = champ_mod.mapIter(m);
+    var i: usize = 0;
+    while (it.next()) |e| : (i += 1) {
+        if (e.key.kind() != .var_) return VmError.KindMismatch;
+        vars[i] = VM.asVar(e.key);
+        values[i] = e.value;
+    }
+    try vm.pushBindings(vars, values);
+    return value_mod.nilValue();
+}
+
+/// `(pop-thread-bindings)` → closes the innermost binding frame.
+fn fnPopThreadBindings(vm: *VM, _: []const Value) VmError!Value {
+    vm.popBindings();
+    return value_mod.nilValue();
+}
+
+/// `(var-set v x)` → rebinds the innermost binding of the dynamic
+/// Var `v` to `x` and returns `x`; `set!` expands to it. A Var that
+/// is not dynamic is `:not-dynamic`; one with no binding in force
+/// is `:no-thread-binding`.
+fn fnVarSet(_: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .var_) return VmError.KindMismatch;
+    const v = VM.asVar(args[0]);
+    if (!v.dynamic) return VmError.NotDynamic;
+    if (!v.thread_bound) return VmError.NoThreadBinding;
+    v.thread_value = args[1];
+    return args[1];
+}
+
+/// `(thread-bound? v)` → whether a `binding` of `v` is in force.
+fn fnThreadBoundQ(_: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .var_) return VmError.KindMismatch;
+    return value_mod.fromBool(VM.asVar(args[0]).thread_bound);
 }
 
 /// `(gensym)` / `(gensym prefix)` → a fresh symbol `prefix__N`
