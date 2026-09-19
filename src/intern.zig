@@ -153,9 +153,11 @@ pub const Interner = struct {
         return self.internKeywordValue(full);
     }
 
-    /// Split an interned `ns/name` text back into its parts;
-    /// `ns` is null for an unqualified name.
+    /// Split an interned `ns/name` text back into its parts at its
+    /// first slash; `ns` is null for an unqualified name. The bare
+    /// division symbol `/` is an unqualified name, as in `split`.
     pub fn splitQualified(full: []const u8) struct { ns: ?[]const u8, name: []const u8 } {
+        if (std.mem.eql(u8, full, "/")) return .{ .ns = null, .name = full };
         const slash = std.mem.indexOfScalar(u8, full, '/') orelse return .{ .ns = null, .name = full };
         return .{ .ns = full[0..slash], .name = full[slash + 1 ..] };
     }

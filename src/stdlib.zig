@@ -304,6 +304,7 @@ const core_fns = [_]CoreEntry{
     .{ .name = "sort-by", .descriptor = &native_sort_by },
     .{ .name = "hash", .descriptor = &native_hash },
     .{ .name = "name", .descriptor = &native_name },
+    .{ .name = "namespace", .descriptor = &native_namespace },
     .{ .name = "keyword", .descriptor = &native_keyword },
     .{ .name = "symbol", .descriptor = &native_symbol },
     .{ .name = "boolean", .descriptor = &native_boolean },
@@ -523,6 +524,7 @@ const native_sort = NativeFn{ .name = "sort", .min_arity = 1, .max_arity = 2, .c
 const native_sort_by = NativeFn{ .name = "sort-by", .min_arity = 2, .max_arity = 3, .call = &fnSortBy };
 const native_hash = NativeFn{ .name = "hash", .min_arity = 1, .max_arity = 1, .call = &fnHash };
 const native_name = NativeFn{ .name = "name", .min_arity = 1, .max_arity = 1, .call = &fnName };
+const native_namespace = NativeFn{ .name = "namespace", .min_arity = 1, .max_arity = 1, .call = &fnNamespace };
 const native_keyword = NativeFn{ .name = "keyword", .min_arity = 1, .max_arity = 1, .call = &fnKeyword };
 const native_symbol = NativeFn{ .name = "symbol", .min_arity = 1, .max_arity = 1, .call = &fnSymbol };
 const native_boolean = NativeFn{ .name = "boolean", .min_arity = 1, .max_arity = 1, .call = &fnBoolean };
@@ -2193,9 +2195,17 @@ fn internedName(vm: *VM, v: Value) VmError![]const u8 {
 /// its own name.
 fn fnName(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .string) return args[0];
-    const full = try internedName(vm, args[0]);
-    const local = if (std.mem.indexOfScalar(u8, full, '/')) |i| full[i + 1 ..] else full;
-    return string_mod.fromBytes(vm.ensureHeap(), local) catch VmError.OutOfMemory;
+    const parts = intern_mod.Interner.splitQualified(try internedName(vm, args[0]));
+    return string_mod.fromBytes(vm.ensureHeap(), parts.name) catch VmError.OutOfMemory;
+}
+
+/// `(namespace x)` → the namespace part of a keyword or symbol, or
+/// nil when it has none.
+fn fnNamespace(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .keyword and args[0].kind() != .symbol) return VmError.KindMismatch;
+    const parts = intern_mod.Interner.splitQualified(try internedName(vm, args[0]));
+    const ns = parts.ns orelse return value_mod.nilValue();
+    return string_mod.fromBytes(vm.ensureHeap(), ns) catch VmError.OutOfMemory;
 }
 
 /// `(keyword x)` / `(symbol x)` → interned from a string, keyword

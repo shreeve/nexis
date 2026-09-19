@@ -1581,26 +1581,14 @@ fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSp
             break :blk form;
         },
         .symbol => blk: {
+            // The interner stores the full `ns/name` text.
             const id: u32 = @intCast(v.payload);
-            const full_name = ctx.interner.symbolName(id);
-            // Phase 4.0b: split on first `/` to recover ns/name
-            // for qualified symbols round-tripped through the
-            // interner (the interner stores the full string).
+            const parts = intern_mod.Interner.splitQualified(ctx.interner.symbolName(id));
             const form = try ctx.allocator.create(Form);
-            if (std.mem.indexOfScalar(u8, full_name, '/')) |slash_idx| {
-                form.* = .{
-                    .datum = .{ .symbol = .{
-                        .ns = full_name[0..slash_idx],
-                        .name = full_name[slash_idx + 1 ..],
-                    } },
-                    .origin = origin,
-                };
-            } else {
-                form.* = .{
-                    .datum = .{ .symbol = .{ .ns = null, .name = full_name } },
-                    .origin = origin,
-                };
-            }
+            form.* = .{
+                .datum = .{ .symbol = .{ .ns = parts.ns, .name = parts.name } },
+                .origin = origin,
+            };
             break :blk form;
         },
         .keyword => blk: {

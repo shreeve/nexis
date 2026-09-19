@@ -211,3 +211,12 @@ test "outside try a storage failure is an uncaught throw of its keyword" {
     defer testing.allocator.free(printed);
     try testing.expectEqualStrings(":db/key-too-large", printed);
 }
+
+// ---- the division symbol survives a Value → Form round trip ----
+
+test "/ resolves after passing through a user macro, and names as itself" {
+    try expectOutput(
+        \\(defmacro sq [x] `(* ~x ~x))
+        \\[(sq (/ 6 3)) (some-> 6 (/ 3)) (cond-> 6 true (/ 3)) (name '/) (name :/) (namespace '/)]
+    , "[4 2 2 / / nil]");
+}
