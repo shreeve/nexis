@@ -327,6 +327,9 @@ const core_fns = [_]CoreEntry{
     .{ .name = "vec", .descriptor = &native_vec },
     .{ .name = "hash-map", .descriptor = &native_hash_map },
     .{ .name = "hash-set", .descriptor = &native_hash_set },
+    .{ .name = "set", .descriptor = &native_set },
+    .{ .name = "subvec", .descriptor = &native_subvec },
+    .{ .name = "identical?", .descriptor = &native_identical_q },
     .{ .name = "assoc", .descriptor = &native_assoc },
     .{ .name = "dissoc", .descriptor = &native_dissoc },
     .{ .name = "get", .descriptor = &native_get },
@@ -548,6 +551,9 @@ const native_vector = NativeFn{ .name = "vector", .min_arity = 0, .max_arity = n
 const native_vec = NativeFn{ .name = "vec", .min_arity = 1, .max_arity = 1, .call = &fnVec };
 const native_hash_map = NativeFn{ .name = "hash-map", .min_arity = 0, .max_arity = null, .call = &fnHashMap };
 const native_hash_set = NativeFn{ .name = "hash-set", .min_arity = 0, .max_arity = null, .call = &fnHashSet };
+const native_set = NativeFn{ .name = "set", .min_arity = 1, .max_arity = 1, .call = &fnSet };
+const native_subvec = NativeFn{ .name = "subvec", .min_arity = 2, .max_arity = 3, .call = &fnSubvec };
+const native_identical_q = NativeFn{ .name = "identical?", .min_arity = 2, .max_arity = 2, .call = &fnIdenticalQ };
 const native_assoc = NativeFn{ .name = "assoc", .min_arity = 3, .max_arity = null, .call = &fnAssoc };
 const native_dissoc = NativeFn{ .name = "dissoc", .min_arity = 1, .max_arity = null, .call = &fnDissoc };
 const native_get = NativeFn{ .name = "get", .min_arity = 2, .max_arity = 3, .call = &fnGet };
@@ -1263,6 +1269,35 @@ fn fnHashSet(vm: *VM, args: []const Value) VmError!Value {
     return s;
 }
 
+/// `(set coll)` → the elements of any seqable as a set.
+fn fnSet(vm: *VM, args: []const Value) VmError!Value {
+    var items = try collectSeq(vm, args[0]);
+    defer items.deinit(vm.allocator);
+    return fnHashSet(vm, items.items);
+}
+
+/// `(subvec v start)` / `(subvec v start end)` → the elements
+/// `start..end` of a vector as a new vector; bounds outside
+/// `0..count` are `:index-out-of-bounds`.
+fn fnSubvec(vm: *VM, args: []const Value) VmError!Value {
+    const v = args[0];
+    if (v.kind() != .persistent_vector) return VmError.KindMismatch;
+    const n = vector_mod.count(v);
+    const start = try requireFixnum(args[1]);
+    const end = if (args.len == 3) try requireFixnum(args[2]) else @as(i64, @intCast(n));
+    if (start < 0 or end < start or end > n) return VmError.IndexOutOfBounds;
+    const items = vm.allocator.alloc(Value, @intCast(end - start)) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(items);
+    for (items, @as(usize, @intCast(start))..) |*slot, i| slot.* = vector_mod.nth(v, i);
+    return vector_mod.fromSlice(vm.ensureHeap(), items) catch VmError.OutOfMemory;
+}
+
+/// `(identical? a b)` → whether the two Values are the same bits:
+/// the same immediate, or the same heap object.
+fn fnIdenticalQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(args[0].tag == args[1].tag and args[0].payload == args[1].payload);
+}
+
 /// `(assoc coll k v & kvs)` → persistent put. Maps and records
 /// key by value; vectors index by fixnum where the index may be
 /// at most the count (one past the end appends); nil becomes a
@@ -1378,7 +1413,20 @@ fn fnDisj(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnGet(_: *VM, args: []const Value) VmError!Value {
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
+    if (args[0].kind() == .string) return (try stringIndex(args[0], args[1])) orelse default;
     return vm_mod.lookup(args[0], args[1], default);
+}
+
+/// The char at fixnum index `k` of string `s`, or null when `k` is
+/// not a fixnum or not in range (the same tolerance `get` shows a
+/// vector).
+fn stringIndex(s: Value, k: Value) VmError!?Value {
+    if (k.kind() != .fixnum or k.asFixnum() < 0) return null;
+    const scalar = string_mod.codepointAt(s, @intCast(k.asFixnum())) catch |err| switch (err) {
+        error.OutOfBounds => return null,
+        error.InvalidUtf8 => return VmError.Utf8Error,
+    };
+    return value_mod.fromChar(scalar) orelse VmError.Utf8Error;
 }
 
 fn fnContainsQ(_: *VM, args: []const Value) VmError!Value {
@@ -1408,7 +1456,7 @@ fn fnContainsQ(_: *VM, args: []const Value) VmError!Value {
             const u_idx: usize = @intCast(idx);
             break :blk value_mod.fromBool(u_idx < vector_mod.count(coll));
         },
-        // Phase 5.3a: records are map-like for `contains?`.
+        .string => value_mod.fromBool((try stringIndex(coll, k)) != null),
         .record => value_mod.fromBool(switch (champ_mod.mapGet(
             record_mod.fieldsOf(coll),
             k,
@@ -1423,29 +1471,20 @@ fn fnContainsQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnKeys(vm: *VM, args: []const Value) VmError!Value {
-    const m = args[0];
-    const map_v: Value = switch (m.kind()) {
-        .nil => return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory,
-        .persistent_map => m,
-        // Phase 5.3a: records expose their field-map keys.
-        .record => record_mod.fieldsOf(m),
-        else => return VmError.KindMismatch,
-    };
-    var collected: std.ArrayList(Value) = .empty;
-    defer collected.deinit(vm.allocator);
-    var it = champ_mod.mapIter(map_v);
-    while (it.next()) |e| {
-        collected.append(vm.allocator, e.key) catch return VmError.OutOfMemory;
-    }
-    return try buildListFromSlice(vm, collected.items);
+    return mapPart(vm, args[0], .key);
 }
 
 fn fnVals(vm: *VM, args: []const Value) VmError!Value {
-    const m = args[0];
+    return mapPart(vm, args[0], .value);
+}
+
+/// `(keys m)` / `(vals m)`: the keys or values of a map or record
+/// as a list, nil when there are none (so `(if (keys m) ...)`
+/// reads as in Clojure).
+fn mapPart(vm: *VM, m: Value, part: enum { key, value }) VmError!Value {
     const map_v: Value = switch (m.kind()) {
-        .nil => return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory,
+        .nil => return value_mod.nilValue(),
         .persistent_map => m,
-        // Phase 5.3a: records expose their field-map values.
         .record => record_mod.fieldsOf(m),
         else => return VmError.KindMismatch,
     };
@@ -1453,8 +1492,9 @@ fn fnVals(vm: *VM, args: []const Value) VmError!Value {
     defer collected.deinit(vm.allocator);
     var it = champ_mod.mapIter(map_v);
     while (it.next()) |e| {
-        collected.append(vm.allocator, e.value) catch return VmError.OutOfMemory;
+        collected.append(vm.allocator, if (part == .key) e.key else e.value) catch return VmError.OutOfMemory;
     }
+    if (collected.items.len == 0) return value_mod.nilValue();
     return try buildListFromSlice(vm, collected.items);
 }
 

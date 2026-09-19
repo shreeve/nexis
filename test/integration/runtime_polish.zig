@@ -304,3 +304,16 @@ test "merge of empty maps is a map, merge of nothing is nil" {
         \\ (R? (merge (->R 1) {:b 2})) (:b (merge (->R 1) {:b 2}))]
     , "[{} {} nil nil {:a 1} 2 2 3 true 2]");
 }
+
+// ---- small Clojure conveniences ----
+
+test "set, subvec, identical?, keys/vals of {}, max/min operands, strings under get and contains?" {
+    try expectOutput(
+        \\[(count (set [1 1 2])) (set? (set '(1 2))) (set nil)
+        \\ (subvec [1 2 3 4] 1 3) (subvec [1 2 3] 1) (subvec [1 2] 2) (try (subvec [1 2] 1 3) (catch any e e))
+        \\ (identical? :a :a) (identical? [1] [1]) (identical? 1 1) (identical? nil nil)
+        \\ (keys {}) (vals {}) (keys nil) (count (keys {:a 1}))
+        \\ (max 2 1.0) (max 1 2.0) (min 2 1.0) (min 2.0 1) (max 1 1.0) (min 0.0 -0.0)
+        \\ (get "ab" 1) (get "ab" 5) (get "ab" -1 :d) (get "ab" :k) (contains? "ab" 0) (contains? "ab" 2)]
+    , "[2 true #{} [2 3] [2 3] [] :index-out-of-bounds true false true true nil nil nil 1 2 2.0 1.0 1 1.0 -0.0 b nil :d nil true false]");
+}

@@ -3797,19 +3797,20 @@ pub fn numSign(a: value_mod.Value) VmError!std.math.Order {
     };
 }
 
-/// `max`/`min` over two operands. A float operand makes the
-/// result a float; NaN wins, as in Clojure.
+/// `max`/`min` over two operands: the winning operand itself, of
+/// its own kind (`(max 2 1.0)` is 2); on a tie the second, as
+/// Clojure's `(if (> x y) x y)`; NaN wins.
 pub fn numExtremum(want_max: bool, a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
     if (a.isFixnum() and b.isFixnum()) {
         const x = a.asFixnum();
         const y = b.asFixnum();
-        return if ((x > y) == want_max) a else b;
+        return if (if (want_max) x > y else x < y) a else b;
     }
     const x = try toFloat(a);
     const y = try toFloat(b);
-    if (std.math.isNan(x)) return value_mod.fromFloat(x);
-    if (std.math.isNan(y)) return value_mod.fromFloat(y);
-    return value_mod.fromFloat(if ((x > y) == want_max) x else y);
+    if (std.math.isNan(x)) return a;
+    if (std.math.isNan(y)) return b;
+    return if (if (want_max) x > y else x < y) a else b;
 }
 
 // =============================================================================
@@ -4920,7 +4921,9 @@ test "numeric tower: comparison across kinds and NaN" {
     try testing.expectEqual(std.math.Order.gt, try numSign(fx(3)));
     try testing.expectEqual(@as(i64, 4), (try numExtremum(true, fx(3), fx(4))).asFixnum());
     try testing.expectEqual(@as(f64, 4.0), (try numExtremum(true, fx(3), fl(4.0))).asFloat());
-    try testing.expectEqual(@as(f64, 3.0), (try numExtremum(false, fx(3), fl(4.0))).asFloat());
+    try testing.expectEqual(@as(i64, 3), (try numExtremum(false, fx(3), fl(4.0))).asFixnum());
+    try testing.expectEqual(@as(i64, 2), (try numExtremum(true, fx(2), fl(1.0))).asFixnum());
+    try testing.expectEqual(@as(f64, 1.0), (try numExtremum(true, fx(1), fl(1.0))).asFloat());
     try testing.expect(std.math.isNan((try numExtremum(true, nan, fx(4))).asFloat()));
 }
 
