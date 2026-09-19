@@ -671,14 +671,23 @@ Per PLAN §12.5 fallback: a **two-level switch**.
 
 ```
 loop:
-  inst = routine.code[frame.pc]; frame.pc += 1
-  switch inst.group:
-    .mov     => execMov(inst)      -> switch variant
-    .call    => execCall(inst)
-    ...
-    .transient, .hash, .tx, .io, .simd => UnimplementedOpcode
-    other    => BytecodeCorruption
+  frame = current frame
+  inst = frame.routine.code[frame.pc]; frame.pc += 1
+  switch inst.group:                       -- step
+    .mov, .cmp, .jump, .var, .math => exec<Group>(frame, inst) -> switch variant
+    other => dispatch(inst):
+      .call    => execCall(inst)
+      ...
+      .transient, .hash, .tx, .io, .simd => UnimplementedOpcode
+      other    => BytecodeCorruption
 ```
+
+The groups that never push or pop a frame (`mov`, `cmp`, `jump`,
+`var`, `math`) resolve their operands through the frame pointer the
+fetch took (`resolveIn`, `storeIn`, `slotPtrIn`); the others go
+through `dispatch`, whose handlers re-derive the current frame
+because a call or a native may have grown `frames`. The bounds
+checks are the same on both paths.
 
 **Contract**:
 - PC increment happens before handler entry: handlers see the
@@ -715,9 +724,13 @@ stack (`vm.roots`), pending `finally` throws, `vm.unhandled_throw`,
 `VM.gcTrace` walks a closure (its cells, then its routine's
 constants) and a cell (its value).
 
-**Trigger and safe point.** `VM.gcDue` is checked once per
+**Trigger and safe point.** `VM.gcDue` is checked at the
 instruction fetch in `run`, `runWithFuel` and `runUntilDepth`, and
-nowhere else: a cycle is due when the heap has allocated
+nowhere else: at a loop's first fetch and at every fetch that
+follows an instruction of a group that can allocate (`math`,
+`call`, `closure`, `coll`, `ctrl`); the fetch after a `mov`, `cmp`,
+`jump` or `var` instruction skips the test because the heap's
+counter cannot have moved. A cycle is due when the heap has allocated
 `gc_next_at` bytes since the last one, `gc_next_at` being the larger
 of `gc_threshold` and `gc_growth_percent` percent of the bytes that
 survived (`GcPolicy.default`: 16 MiB, 100 %; `GcPolicy.stress`,

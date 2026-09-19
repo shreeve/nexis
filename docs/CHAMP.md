@@ -346,12 +346,17 @@ xxHash3 invocation per key per op.
 
 ```zig
 inline fn indexHashOf(key: Value, elementHash: *const fn (Value) u64) u32 {
+    if (!key.kind().isHeap()) return @truncate(key.hashImmediate());
     return @truncate(elementHash(key));
 }
 ```
 
 (`elementHash` is `&dispatch.hashValue` at every real call site; the
-module takes it as a parameter rather than importing `dispatch.zig`.)
+module takes it as a parameter rather than importing `dispatch.zig`.
+An immediate key hashes through `Value.hashImmediate` directly: that
+is the value `dispatch.hashValue` computes for every non-heap kind,
+so the index is the same either way and a keyword or fixnum key
+skips the callback.)
 
 Rationale for low-32 (vs. high-32 / XOR-fold): freeze one rule;
 pick the simpler. Truncation does not bias distribution because

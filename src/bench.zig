@@ -15,7 +15,8 @@
 //!   - Stats reported: min, p5, median, p95, p99, max, mean,
 //!     stddev. Median is the headline (§3 mandate).
 //!   - For nanosecond-scale operations: adaptive inner loop —
-//!     pilot once, choose `inner_reps` so a single measurement
+//!     a pilot that repeats the body until one timing spans a
+//!     millisecond chooses `inner_reps` so a single measurement
 //!     takes at least `min_time_ns` (default 50 ms). Per-op cost
 //!     = elapsed / inner_reps.
 //!   - For operations that already take ≥min_time_ns per run:
@@ -164,6 +165,10 @@ pub const RunnerOptions = struct {
     max_inner_reps: usize = 100_000_000,
 };
 
+/// The span one pilot timing must cover before its per-run estimate
+/// is trusted: a thousand ticks of a microsecond clock.
+const pilot_min_ns: u64 = 1_000_000;
+
 pub const Runner = struct {
     allocator: std.mem.Allocator,
     results: std.ArrayListUnmanaged(BenchResult),
@@ -203,18 +208,30 @@ pub const Runner = struct {
         ctx: anytype,
         comptime run_fn: anytype,
     ) !void {
-        // ---- Pilot: one run to choose `inner_reps`. ----
-        const pilot_start = nowNs();
-        try run_fn(ctx);
-        const pilot_end = nowNs();
-        const pilot_ns: u64 = pilot_end - pilot_start;
+        // ---- Pilot: time the body to choose `inner_reps`. ----
+        //
+        // The clock resolves to about a microsecond on macOS, so a
+        // body of a few nanoseconds reads as zero elapsed in one run.
+        // The pilot doubles its repetitions until one timing spans
+        // `pilot_min_ns`, and the per-run estimate comes from that
+        // span.
+        var pilot_reps: usize = 1;
+        var pilot_total_ns: u64 = 0;
+        while (true) {
+            const pilot_start = nowNs();
+            var pr: usize = 0;
+            while (pr < pilot_reps) : (pr += 1) try run_fn(ctx);
+            pilot_total_ns = nowNs() - pilot_start;
+            if (pilot_total_ns >= pilot_min_ns or pilot_reps >= self.opts.max_inner_reps) break;
+            pilot_reps *= 2;
+        }
+        const pilot_ns: u64 = @max(pilot_total_ns / pilot_reps, 1);
 
         const inner_reps: usize = if (pilot_ns >= self.opts.min_time_ns)
             1
         else blk: {
-            // ceil(min_time_ns / max(pilot_ns, 1))
-            const p = @max(pilot_ns, 1);
-            const reps = (self.opts.min_time_ns + p - 1) / p;
+            // ceil(min_time_ns / pilot_ns)
+            const reps = (self.opts.min_time_ns + pilot_ns - 1) / pilot_ns;
             break :blk @min(@as(usize, @intCast(reps)), self.opts.max_inner_reps);
         };
 
