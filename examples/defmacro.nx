@@ -1,12 +1,10 @@
-; examples/defmacro.nx — user-defined macros via defmacro
-; (Phase 3.2).
+; examples/defmacro.nx — user-defined macros via defmacro.
 ;
 ; A user macro is a fn that runs at COMPILE TIME, takes
 ; unevaluated arg Forms as data, and returns a Form that
 ; replaces the call site. v1 macros use syntax-quote to
 ; build their output (`/`~`/`~@`); collection-manipulation
-; fns like cons/first/rest land later as host builtins
-; alongside the stdlib (Phase 3.3).
+; fns like cons/first/rest are host builtins in the stdlib.
 ;
 ; defmacro mechanics:
 ;   - The macro fn body is evaluated at expansion time in a

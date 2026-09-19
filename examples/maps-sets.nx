@@ -1,4 +1,4 @@
-; examples/maps-sets.nx — collection literals (Phase 3.1).
+; examples/maps-sets.nx — collection literals.
 ;
 ; nexis now supports maps {} and sets #{} as runtime values.
 ; Both quoted compound literals and runtime-computed forms work.
@@ -6,7 +6,7 @@
 ; collapse per Clojure semantics (later-wins for maps, set-
 ; semantics for sets).
 ;
-; The runtime backing is the Phase 1 CHAMP persistent map/set
+; The runtime backing is the CHAMP persistent map/set
 ; with structural sharing. Hash + equality come from the
 ; dispatch layer (same machinery used everywhere else).
 

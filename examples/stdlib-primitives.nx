@@ -1,16 +1,16 @@
-; examples/stdlib-primitives.nx — Phase 3.3a stdlib primitives
+; examples/stdlib-primitives.nx — stdlib primitives
 ;
-; Phase 3.3a ships 10 native fns for macro authoring + basic
-; collection inspection: list, cons, first, rest, count, nth,
-; empty?, identity, nil?, some?
+; Ten native fns for macro authoring + basic collection
+; inspection: list, cons, first, rest, count, nth, empty?,
+; identity, nil?, some?
 ;
 ; These are pure host-Zig fns installed into the user's
 ; namespace at VM startup. They're callable from both runtime
 ; code AND inside `defmacro` bodies at compile time.
 ;
-; Higher-order fns (map/reduce/filter/apply) + first-class
-; arithmetic (+, <, =, inc, ...) + map/set utilities (assoc,
-; get, conj, ...) ship in Phase 3.3b/c.
+; Higher-order fns (map/reduce/filter/apply), first-class
+; arithmetic (+, <, =, inc, ...) and map/set utilities (assoc,
+; get, conj, ...) are natives too; this file sticks to the ten.
 
 ; ---- Sequence inspection on nil/list/vector ---------------
 ;

@@ -1,5 +1,5 @@
-; examples/hello.nx — the first nexis program to compile from
-; actual source through bin/nexis. Step H1 (peer-AI turn 55).
+; examples/hello.nx — the smallest nexis program that compiles from
+; source through bin/nexis.
 
 (defn greet [name]
   name)
