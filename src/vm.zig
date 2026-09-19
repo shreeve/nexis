@@ -2559,6 +2559,13 @@ pub const VM = struct {
         }
     }
 
+    const idle_code = [_]Inst{asm_.returnNil()};
+    /// What the top frame points at between runs: a routine that
+    /// returns nil and owns nothing, so the stack-local routine a
+    /// runner passed to `retargetTop` is never referenced after its
+    /// run, and a collection between runs marks nothing dead.
+    pub const idle_routine: Routine = .{ .code = &idle_code, .consts = &.{}, .slot_count = 1, .name = "<idle>" };
+
     /// Point the top-level frame at `routine` and clear the halt
     /// flag so the next `run` executes it from its first
     /// instruction. The frame keeps its base slot; the backing
@@ -2583,10 +2590,12 @@ pub const VM = struct {
     /// `BytecodeExhausted`. Any error that leaves the run records
     /// the frame chain in `error_trace` first.
     pub fn run(self: *VM) VmError!Value {
-        return self.runLoop() catch |err| {
+        const result = self.runLoop() catch |err| {
             self.recordErrorTrace();
             return err;
         };
+        self.frames.items[0].routine = &idle_routine;
+        return result;
     }
 
     /// Where an error left the run: every frame, innermost first,
@@ -2622,6 +2631,7 @@ pub const VM = struct {
         self.finally_stack.clearRetainingCapacity();
         while (self.dyn_frames.items.len > 0) self.popBindings();
         self.unhandled_throw = null;
+        self.frames.items[0].routine = &idle_routine;
     }
 
     /// The dispatch loop. The `frame` pointer is scoped inside a

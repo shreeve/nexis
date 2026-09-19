@@ -3884,10 +3884,8 @@ test "eval: what an evaluated form allocates survives a collection" {
     try program.init();
     defer program.deinit();
     _ = try program.run("(eval '(defn greet [] \"hello\")) (def f (eval '(fn [] (str \"a\" \"b\")))) (def q (eval ''(1 \"two\" :three)))");
-    // Between runs the top frame still names the last run's
-    // routine, a local of `runWith`; a collection here roots
-    // through the stub instead.
-    try program.v.retargetTop(&Program.stub);
+    // Between runs the top frame rests on the VM's idle routine, so
+    // a collection here marks nothing of the last run's routine.
     program.v.collectGarbage();
     const out = try program.run("(str (greet) (f) q)");
     try testing.expectEqualStrings("helloab(1 two :three)", string_mod.asBytes(out));
@@ -4299,6 +4297,26 @@ test "runRoutine: a top-level routine runs as a nested call inside an executing 
     try formatValue(&buf, caught, program.interner);
     try testing.expectEqualStrings("[:caught :inner]", buf.items);
     try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+}
+
+test "between runs the top frame rests on the idle routine, so a collection is safe" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(def xs (mapv inc [1 2 3]))");
+    try testing.expect(program.v.frames.items[0].routine == &vm.VM.idle_routine);
+    program.v.collectGarbage();
+    const again = try program.run("(reduce + xs)");
+    try testing.expectEqual(@as(i64, 9), again.asFixnum());
+    try testing.expect(program.v.frames.items[0].routine == &vm.VM.idle_routine);
+    // A failed run keeps its frames for the trace; the reset parks
+    // the top frame on the idle routine too.
+    try testing.expectError(vm.VmError.DivideByZero, program.run("(/ 1 0)"));
+    program.v.resetAfterError();
+    try testing.expect(program.v.frames.items[0].routine == &vm.VM.idle_routine);
+    program.v.collectGarbage();
+    const after = try program.run("(count xs)");
+    try testing.expectEqual(@as(i64, 3), after.asFixnum());
 }
 
 test "runtime errors: resetAfterError leaves the VM ready for the next form" {
