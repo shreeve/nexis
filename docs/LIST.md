@@ -1,6 +1,6 @@
-## LIST.md — Immutable Cons List Heap Kind (Phase 1)
+## LIST.md — Immutable Cons List Heap Kind
 
-**Status**: Phase 1 deliverable. Authoritative body-layout and API contract for
+Authoritative body-layout and API contract for
 the `list` heap kind (singly-linked immutable cons list). Derivative from
 `PLAN.md` §9.3, `docs/VALUE.md` §2.2, `docs/SEMANTICS.md` §2.6 / §3.2, and
 `docs/HEAP.md`.
@@ -33,13 +33,12 @@ v1 ships both subkinds defined in VALUE.md §2.2:
 v1 does **not** share an empty-list singleton across allocations — each
 `empty(heap)` call produces a fresh `*HeapHeader`. Two empty lists are
 always `=` (they have the same byte content: zero bytes); `identical?`
-distinguishes them by address. Shared-singleton pinning is a Phase 6
-allocator optimization, tracked but not scheduled.
+distinguishes them by address. There is no shared-singleton pinning.
 
 v1 does **not** cache `count`. List is reader / macros material per
 PLAN §9.3; user code uses vectors for large sequences. If a benchmark
-surfaces hot `count` on long lists, Phase 6 adds a cached `u32` to the
-cons body.
+surfaces hot `count` on long lists, a cached `u32` in the cons body
+is the remedy.
 
 ---
 
@@ -170,8 +169,8 @@ stack; actual threshold depends on OS, ABI, build mode, and frame
 size. Matches Clojure, which structurally recurses through
 `IHashEq`/`equiv` for the same reason. v1 does not need cycle
 detection because persistent values cannot form cycles (no interior
-mutability). An iterative / explicit-stack walker is a Phase 6
-fallback if real workloads hit the limit.
+mutability). An iterative / explicit-stack walker is the fallback if
+real workloads hit the limit.
 
 ---
 
@@ -187,9 +186,9 @@ fallback if real workloads hit the limit.
   lists have no outgoing references.
 - **Intern layer.** No interaction; lists hold arbitrary Values,
   intern has no notion of collection kinds.
-- **Reader.** `src/reader.zig` currently emits list Forms. The
-  reader→Value lifting pass (Phase 2 material) will call
-  `fromSlice` / `cons` to build runtime lists from Forms.
+- **Reader / compiler.** `src/reader.zig` emits list Forms; quoted
+  lists reach runtime through the `coll:list` opcode, which builds the
+  list with `cons` (`docs/VM.md` §10.8).
 
 ---
 

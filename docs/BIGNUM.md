@@ -1,19 +1,18 @@
-## BIGNUM.md — Arbitrary-Precision Integer Heap Kind (Phase 1)
+## BIGNUM.md — Arbitrary-Precision Integer Heap Kind
 
-**Status**: Phase 1 deliverable. Authoritative body-layout and semantic
-contract for the `bignum` heap kind. Derivative from `PLAN.md` §8.3,
+Authoritative body-layout and semantic contract for the `bignum` heap kind. Derivative from `PLAN.md` §8.3,
 `docs/VALUE.md` §2.2, `docs/SEMANTICS.md` §2.2 / §3.2, and `docs/HEAP.md`.
 Those documents win on conflict. This doc pins the rules that are specific
 to bignums — most importantly the **canonicalization invariant** that
 makes the integer tower's equality and hash consistent without any
 cross-kind comparison.
 
-Scope-frozen commitment: **this module ships construction + canonical
-form + equality + hash only.** Arithmetic operators (add/sub/mul) land
-in a separate commit, per peer-AI strategy review (conversation
-`nexis-phase-1` turn 6). General division, modulo, GCD, bitwise ops,
-modular exponentiation are deferred beyond v1 per PLAN §8.3 / peer-AI's
-early advice.
+**This module provides construction + canonical form + equality +
+hash + codec only.** There is no bignum arithmetic: no add/sub/mul,
+no division, modulo, GCD, bitwise ops or modular exponentiation.
+Fixnum overflow raises `:arithmetic-overflow` rather than promoting
+(PLAN Amendment Log, number tower), and no literal, operation or
+native produces a bignum at runtime.
 
 ---
 
@@ -35,7 +34,7 @@ Consequences that the implementation must enforce without exception:
 
 Every code path that could construct a bignum goes through exactly
 one canonicalization function (§3). Arithmetic results, codec decode
-(Phase 4), and direct API constructors all funnel there. If any path
+and direct API constructors all funnel there. If any path
 bypasses it, integer equality silently breaks.
 
 ---
@@ -56,7 +55,7 @@ const BignumBody = extern struct {
 - **u64 limbs** — natural on the 64-bit-only target.
 - **`negative` is a byte holding 0 or 1 only**; `isNegative(v)` reads this byte and safe-asserts the value is in `{0, 1}`.
 - **Limb count is inferred** from body length: `limb_count = (body.len - 8) / 8`. No redundant count field in the body.
-- **`_pad` is semantically invisible** — hashing and equality explicitly ignore it (peer-AI turn-6 review catch: hashing raw body bytes would bake layout detail into the hash output).
+- **`_pad` is semantically invisible** — hashing and equality explicitly ignore it (hashing raw body bytes would bake layout detail into the hash output).
 
 **Canonical constraints** (every bignum on the heap satisfies all of these):
 
@@ -234,12 +233,15 @@ Not in this commit; each has its own landing path:
     when applicable.
   - Schoolbook multiplication with canonicalization of the result.
 - **Division / modulo / GCD / bitwise / modular exponentiation.** Out of
-  scope for v1 per PLAN §8.3 + peer-AI advice. Candidate for v2.
-- **Print / read round-trip.** The reader currently only lexes integer
-  literals up to i64 range; bignum literals require a reader extension
-  (lexer → arbitrary-precision decimal parse → `fromLimbs`). Lives with
-  the arithmetic commit.
-- **Cross-type numeric `==`** (`(= 1 1.0)` opt-in). v2 per PLAN §23 #11.
+  scope for v1 per PLAN §8.3.
+- **Print / read round-trip.** The reader lexes integer literals up to
+  i64 range and the compiler rejects literals outside the i48 fixnum
+  range (`IntegerOutOfFixnumRange`); a bignum literal would require a
+  reader extension (lexer → arbitrary-precision decimal parse →
+  `fromLimbs`). `src/format.zig` prints a bignum as an opaque
+  `#<value kind=17>`.
+- **Cross-type numeric `==`.** `(= 1 1.0)` is false per PLAN §23 #11;
+  `(== 1 1.0)` is true (PLAN Amendment Log, number tower).
 
 ---
 
