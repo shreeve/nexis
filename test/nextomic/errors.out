@@ -1,15 +1,15 @@
-:nextomic/unknown-attribute
-:nextomic/unknown-attribute
+{:error :nextomic/unknown-attribute, :attr :user/nope}
+{:error :nextomic/unknown-attribute, :attr :user/nope}
 :nextomic/value-type
 :nextomic/value-type
-:nextomic/unique
-:nextomic/conflict
+{:error :nextomic/unique, :attr :user/email, :value b@x}
+{:error :nextomic/conflict, :e 4294967296, :a :user/age}
 :nextomic/no-entity
 :nextomic/no-entity
-:nextomic/tx-data
-:nextomic/tx-data
-:nextomic/tx-data
-:nextomic/tx-data
+{:error :nextomic/tx-data, :message :db/add is [:db/add e a v]}
+{:error :nextomic/tx-data, :message unknown op; one of :db/add, :db/retract, :db/retractEntity}
+{:error :nextomic/tx-data, :message tx-data is a vector or a list of forms}
+{:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :user/age}
 :db/open-failed
 ok a failed transaction leaves the basis alone
 ok the store still works after every failure

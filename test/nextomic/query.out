@@ -63,8 +63,8 @@ ok explain returns the plan as text
 {:error :nextomic/query-syntax, :message unknown function: nope}
 {:error :nextomic/query-syntax, :message function position takes a function name, not a variable: ?pred}
 :nextomic/unbound-pattern
-:nextomic/unknown-attribute
-:nextomic/unknown-attribute
+{:error :nextomic/unknown-attribute, :attr :nope/attr}
+{:error :nextomic/unknown-attribute, :attr :nope/attr}
 :nextomic/value-type
 {:error :nextomic/query-syntax, :message unknown symbol in data pattern, :clause 0}
 :boom

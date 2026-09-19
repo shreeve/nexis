@@ -27,9 +27,9 @@ ok the connection writes again after the throw
 ok the view has the new attribute
 ok and its ident
 ok the connection does not
-:nextomic/unknown-attribute
-:nextomic/unknown-attribute
-:nextomic/tx-data
+{:error :nextomic/unknown-attribute, :attr :person/nick}
+{:error :nextomic/unknown-attribute, :attr :person/nope}
+{:error :nextomic/tx-data, :message tx-data is a vector or a list of forms}
 ok a failed with leaves the connection writable
 :nextomic/closed
 :with-done

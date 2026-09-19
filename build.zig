@@ -1113,6 +1113,7 @@ pub fn build(b: *std.Build) void {
             "pull",
             "with",
             "with-conn",
+            "polish",
             "persist-1",
             "persist-2",
         };

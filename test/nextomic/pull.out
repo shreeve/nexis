@@ -42,10 +42,10 @@ ok pull-many over nothing
 :nextomic/history-view
 {:error :nextomic/pull-syntax, :message unknown element in pattern, :clause 1}
 {:error :nextomic/pull-syntax, :message :limit needs a non-negative integer or nil, :clause 0}
-{:error :nextomic/pull-syntax, :message entity must be an eid, a lookup ref or an ident}
-:nextomic/tx-data
+:kind-mismatch
+{:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :person/name}
 :nextomic/no-entity
-:nextomic/unknown-attribute
+{:error :nextomic/unknown-attribute, :attr :person/nope}
 :kind-mismatch
 ok a caught error leaves the db usable
 :nextomic/closed
