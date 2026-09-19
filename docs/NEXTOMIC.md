@@ -507,7 +507,7 @@ sub-plans with the same output variables.
 | `(d/db conn)` | db-value at the current basis |
 | `(d/basis-t db)` | the basis |
 | `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report. tx-data forms: `[:db/add e a v]`, `[:db/retract e a v?]`, `[:db/retractEntity e]`, `[:db.fn/call f arg ...]`, `[:db.fn/cas e a old new]` and map forms |
-| `(d/entity db e)` | eager map `{:db/id e :attr v ...}`, card-many as sets, refs as eids; nil when the entity has no datoms in this view; `:nextomic/history-view` on a history db |
+| `(d/entity db e)` | the map `{:db/id e :attr v ...}`, card-many as sets, refs as eids; nil when the entity has no datoms in this view; `:nextomic/history-view` on a history db. Access is eager: the map is read from the view in one read when `entity` returns, so `(:attr ent)`, `(get ent :attr)`, `(keys ent)` and `(into {} ent)` are map operations that open nothing, and a later transaction never changes the map. It is a plain map, equal by content: two entity maps of one entity from views that agree are equal, and maps from views that differ are not; a ref is the eid, not a map, so the referred entity is read with another `entity` call |
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
 | `(d/datoms db :eavt e a v tx added)` (index, its components in index order, then `tx` as a t or a transaction entity id and `added` as a boolean; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
 | `(d/index-range db attr start end)` | the AVET datoms of an indexed or unique attribute with `start <= v < end` in value order; a nil bound is open; another attribute is `:nextomic/tx-data` naming it, a bound of the wrong type `:nextomic/value-type` |
@@ -533,7 +533,7 @@ Schema install is `transact!` of attribute entities: `{:db/ident
 :db.cardinality/one :db/unique :db.unique/identity :db/index true}`;
 what a later transaction may change is §3 step 5.
 
-Later: lazy entities, full-text, a datom heap kind.
+Later: a lazy entity kind, full-text, a datom heap kind.
 
 ---
 

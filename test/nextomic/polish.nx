@@ -114,6 +114,17 @@
 (println (:user/name (d/entity db2 (:user/boss (d/entity db2 ann)))))
 (println (:user/name (d/pull db2 '[:user/name] [:user/email "eve@x"])))
 
+; --- an entity is an eager map, equal by content -------------------------
+(def ent (d/entity db2 bob))
+(println [(:user/name ent) (get ent :user/nope :none) (sort (keys ent)) (:db/id ent) (count ent)])
+(check "an entity is a map" (and (map? ent) (= (into {} ent) ent) (contains? ent :user/email)))
+(check "entity maps of one view are equal" (= ent (d/entity db2 bob) (d/entity (d/db c) bob)))
+(check "an entity map from a view that differs is not" (not= ent (d/entity db bob)))
+(def r-age (d/transact! c [[:db/add bob :user/age 99]]))
+(check "the map is read once; a later transaction leaves it alone" (= [25 99] [(:user/age ent) (:user/age (d/entity (d/db c) bob))]))
+(check "assoc yields a new map, the entity map is unchanged" (= ["Bob" "Rob"] [(:user/name ent) (:user/name (assoc ent :user/name "Rob"))]))
+(d/transact! c [[:db/add bob :user/age 25]])
+
 ; --- the history view has no entities to map ----------------------------
 (println (caught (d/entity (d/history db2) ann)))
 (println (caught (d/pull (d/history db2) '[*] ann)))
