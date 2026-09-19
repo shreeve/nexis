@@ -353,6 +353,7 @@ const core_fns = [_]CoreEntry{
     .{ .name = "macroexpand-1", .descriptor = &native_macroexpand_1 },
     .{ .name = "macroexpand", .descriptor = &native_macroexpand },
     .{ .name = "read-string", .descriptor = &native_read_string },
+    .{ .name = "eval", .descriptor = &native_eval },
     // Metadata (PLAN §8.5).
     .{ .name = "meta", .descriptor = &native_meta },
     .{ .name = "with-meta", .descriptor = &native_with_meta },
@@ -602,6 +603,7 @@ const native_reduced_q = NativeFn{ .name = "reduced?", .min_arity = 1, .max_arit
 const native_macroexpand_1 = NativeFn{ .name = "macroexpand-1", .min_arity = 1, .max_arity = 1, .call = &fnMacroexpand1 };
 const native_macroexpand = NativeFn{ .name = "macroexpand", .min_arity = 1, .max_arity = 1, .call = &fnMacroexpand };
 const native_read_string = NativeFn{ .name = "read-string", .min_arity = 1, .max_arity = 1, .call = &fnReadString };
+const native_eval = NativeFn{ .name = "eval", .min_arity = 1, .max_arity = 1, .call = &fnEval };
 const native_list_star = NativeFn{ .name = "list*", .min_arity = 1, .max_arity = null, .call = &fnListStar };
 const native_meta = NativeFn{ .name = "meta", .min_arity = 1, .max_arity = 1, .call = &fnMeta };
 const native_with_meta = NativeFn{ .name = "with-meta", .min_arity = 2, .max_arity = 2, .call = &fnWithMeta };
@@ -2570,6 +2572,14 @@ fn fnReadString(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
     const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
     return try hooks.read_string(hooks.user_data, vm, string_mod.asBytes(args[0]));
+}
+
+/// `(eval form)` → the value of `form` compiled in the current
+/// namespace and run on this VM; a form that does not compile throws
+/// `{:error :compile-error :message "<CompileError>" :form form}`.
+fn fnEval(vm: *VM, args: []const Value) VmError!Value {
+    const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
+    return try hooks.eval(hooks.user_data, vm, args[0]);
 }
 
 // =============================================================================
