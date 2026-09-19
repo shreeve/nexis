@@ -371,6 +371,10 @@ variants are codegen details.
 - Lower each `expr` for its effect only; discard the result
   slot.
 - The final `expr` lowers into the result slot of the `do`.
+- `(do)` is nil, and so is every empty body: `(fn* [])`,
+  `(let* [x 1])`, `(loop* [x 1])`, a `letfn*` binding without a
+  body, a `try` body or handler with no forms. The literal `()`
+  is the empty list, as `'()` is.
 
 #### 5.4 `(let* [b1 v1 b2 v2 ...] body...)`
 
@@ -579,22 +583,31 @@ through the var table picks up whatever is bound by then.
 - Returns the Var object itself (not its root value); used by
   macros and tooling. Does not trap on an unbound Var.
 
-#### 5.10 `(try body... (catch any binding catch-body...)?
+#### 5.10 `(try body... (catch any binding catch-body...)
     (finally finally-body...)?)`
+
+The primitive takes exactly one `(catch any binding ...)` and an
+optional `finally`; the expander lowers the surface form, with
+any number of `(catch MATCHER b ...)` clauses, a keyword
+matcher, or a `finally` alone, onto it (MACROEXPAND.md §10).
 
 - `try` installs a handler via `ctrl:try-enter` (catch entry
   pc, binding slot, optional finally pc).
 - `body` executes normally; `ctrl:try-exit` pops the handler on
   the normal path.
 - On a throw, control transfers to the `catch` entry; the thrown
-  value is bound to `binding`. The matcher is `any`; there is no
-  type dispatch.
+  value is bound to `binding`. The primitive's matcher is `any`;
+  keyword matching is the expander's chain of
+  `nexis.internal/#%catch-matches?` tests.
 - `finally` runs on every exit path (normal, caught throw,
-  uncaught throw). A throw inside `finally` replaces the pending
-  one. The VM models this with a `FinallyContinuation` stack
-  (`VM.md §12`).
-- Thrown values are ordinary Values; there are no stack traces
-  or cause chains.
+  uncaught throw, a rethrow from the handler). A throw inside
+  `finally` replaces the pending one. The VM models this with a
+  `FinallyContinuation` stack (`VM.md §12`).
+- A thrown value is any value; there is no exception object, no
+  stack trace and no cause chain. A keyword matcher `(catch :tag
+  b ...)` takes a thrown value equal to `:tag`, a map whose
+  `:error` entry is `:tag`, or an `ex-info` map whose data's
+  `:error` is `:tag` (PLAN §6.4, Amendment Log).
 
 #### 5.11 `(throw expr)`
 
@@ -761,10 +774,11 @@ closure that references the binding.
   `MalformedForm`, `MacroDepthExceeded`, `MacroExpansionFailure`,
   `ExpectedSymbol`, `ExpectedVector`, `InternalCompilerBug`,
   `OutOfMemory`.
-- A **primary SrcSpan** via the `LowerDiag` out-parameter — the
-  span of the Form being lowered at the point the error is raised. An
-  error inside a macro's output is reported at the macro call
-  form (synthetic forms carry the call site's origin).
+- A **primary SrcSpan** in `CompileOptions.out_span`: the
+  symbol's own span when lowering can locate it (the `LowerDiag`
+  out-parameter), otherwise the macroexpanded form's. Forms a
+  macro produced carry the macro call's span (MACROEXPAND.md
+  §4b), so an error inside an expansion is reported at the call.
 
 Errors raised inside macro expansion are bucketed:
 `MacroDepthExceeded` for depth, `MacroExpansionFailure` for
@@ -774,20 +788,31 @@ argument). `MalformedForm` / `ExpectedSymbol` / `ExpectedVector`
 are lowering errors about special-form shape.
 
 There is no secondary span, no expansion-provenance chain and
-no structured error value for compile errors; the CLI prints the
-variant name, `file:line:col`, the source line and a caret.
+no structured error value for compile errors. The CLI prints
+
+    nexis: <path>:<line>:<col>: <ErrorName>
+        <source line>
+        <caret under the span>
+
+and exits 4 in `run`; the REPL prints the same with `<repl>` as
+the path and reads the next line. A parse failure is reported the
+same way at the token the parser stopped on (`parse error:
+unexpected `)``, `unexpected end of input`), a reader failure at
+the form the reader rejected with its kind and detail (`reader
+error: :duplicate-literal-key (keyword :a)`); both exit 3. A
+runtime error carries no location: the VM reports its `VmError`
+name and, for an uncaught throw, the thrown value.
 
 ---
 
 ### 8. SrcSpan threading
 
-- Every Form has a `SrcSpan` (`origin`) attached by the reader.
-- The macroexpander gives synthetic Forms the macro call's
-  `origin` and leaves reused subforms untouched.
-- `lowerForm` tracks the span of the Form it is lowering and
-  reports it with any error.
-- Codegen does not record spans; runtime errors carry no
-  location.
+- Every Form has a `SrcSpan` from the reader (`Form.origin`).
+- The macroexpander gives synthetic forms the macro call's span
+  and keeps the source span of forms it passes through.
+- Lowering reports the span of the symbol it rejects through
+  `LowerDiag`; `compileFormWith` falls back to the form's.
+- Bytecode carries no spans: nothing maps a PC back to a form.
 
 ---
 

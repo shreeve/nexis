@@ -145,6 +145,18 @@ is an ordinary call. User macros shadow host macros.
    body inspects them as data through the core natives (`first`,
    `rest`, `cons`, `list`, `count`, `nth`, `empty?`, ...) and
    builds output with syntax-quote or those natives.
+9. **The expander at run time**: `(macroexpand-1 form)` takes a
+   form as data and returns one macro step (`expandOnce`: a
+   user or host macro at the head, special forms and the `#%`
+   primitives excluded; the raw output, nothing inside it
+   expanded, no lexical environment) or the form itself;
+   `macroexpand` repeats until the head is not a macro.
+   `(read-string s)` reads the first form of `s` as data.
+   Both reach the compiler through `vm.CompilerHooks`
+   (`compile.RuntimeHooks`, installed by the runtime that boots
+   the VM); their values are built on the VM heap. Failures
+   throw `:macro-expansion-failure` / `:reader-error`; a VM
+   without hooks throws `:no-compiler`.
 
 ---
 
@@ -258,7 +270,7 @@ that should be expanded.
 | `fn*` | Do NOT expand param vector or self-name symbol. Expand body with params + rest + self-name added to env. |
 | `letfn*` | Do NOT expand binding names or param vectors. Add all binding names to env FIRST. Expand each fn body with that env + the fn's params. Expand letfn body with the env. |
 | `def` | Do NOT expand def name. Expand value if present. Do NOT add def name to lexical env (Vars don't enter the env). |
-| `defn` | Do NOT expand name or param vector. Expand body with params + rest + self-name added to env. |
+| `defn` | `(def name (fn name ...))`, so params destructure and overload clauses work as for `fn`. `^meta` on the name (`^:private f` reads as `{:private true}`), a docstring after the name (`:doc`) and an attribute map after that land on the Var: `(defn f "doc" {:k 1} [x] ...)` → `(let* [v# (def f (fn f [x] ...))] (nexis.core/reset-meta! v# {:doc "doc" :k 1 :arglists (quote ([x]))}) v#)`; a definition with none of them leaves the Var's metadata nil. `def` and `defmacro` take `^meta` and a docstring the same way. `(doc f)` prints the `:arglists` and `:doc` of `f`'s Var. |
 | `var` | Do NOT expand name. |
 | `recur` | Expand each arg (no env change). |
 | `try` | Expand the body forms; `catch MATCHER BINDING handler...` passes the matcher and binding symbols through and expands the handler with the binding in env; expand the `finally` body. |
@@ -360,29 +372,63 @@ interner is present.
 **Element rules**:
 
 ```text
-sq(nil / bool / int / real / char / string / keyword)
-                     → the literal itself (self-evaluating)
-sq(symbol)           → (quote symbol)
-sq(symbol#)          → (quote <gensym from the current scope>)
-sq(unquote-X)        → X                     ; expanded and evaluated normally
-sq(unquote-splice-X) → ILLEGAL outside list-element position
-sq(list [...])       → (#%list sq(e1) sq(e2) ...)
-                       or, with splices,
-                       (#%concat (#%list ...) X (#%list ...) ...)
-sq(vector [...])     → (#%vector sq(e1) ...)  ; same splice handling
-sq(map / set / quote / nested syntax-quote / anon-fn /
-   with-meta / deref)
-                     → MalformedMacroCall
+sq(literal)          → literal
+sq(symbol)           → (quote <qualified-symbol>)     ; see qualification
+sq(symbol-with-#)    → (quote <fresh-gensym>)         ; auto-gensym scope
+sq(unquote-X)        → X                              ; passthrough
+sq(unquote-splice-X) → ILLEGAL outside a collection
+sq(list [...])       → (#%list sq(e1) sq(e2) ...)     ; with splice handling
+sq(vector [...])     → (#%vector sq(e1) ...)          ; same
+sq(map {...})        → (#%map sq(k1) sq(v1) ...)      ; same
+sq(set #{...})       → (#%set sq(e1) ...)             ; same
+sq('x)               → (#%list 'quote sq(x))          ; `'a → (quote ns/a)
+sq(@x)               → (#%list 'nexis.core/deref sq(x))
+sq(#(...))           → sq of the fn* form it stands for
 ```
+
+For `unquote-splicing` inside a collection: the element runs
+become `(#%concat (#%list e1 ...) X (#%list e2 ...) ...)` where
+`X` is the spliced expression, and a vector, map or set is
+rebuilt from the resulting list with `nexis.core/vec`,
+`(nexis.core/apply nexis.core/hash-map ...)` or
+`(nexis.core/apply nexis.core/hash-set ...)`. `coll:concat`
+accepts every seqable (nil, list, vector, map as `[k v]`
+entries, set), so `~@` splices whatever a seq function returns.
+A nested syntax-quote and `^meta` inside syntax-quote are
+`MacroExpansionFailure`.
+
+**Qualification** (PLAN §23 #29, Clojure's rule): an unqualified
+symbol becomes `ns/name` where `ns` is the namespace whose own
+Var it names, searched from the current namespace along its
+refer chain (`nexis.core` last), or `nexis.core` when it names
+a host macro; a symbol nothing holds qualifies to the current
+namespace, so `` `(helper) `` written before `(defn helper ...)`
+still meets it. Left bare: auto-gensyms, the special forms
+(`quote if do let* loop* recur fn* letfn* def var set! try catch
+finally throw defmacro ns require`), `&`, the catch matcher `any`,
+`#%` internals and the `%` parameters of `#()`. A qualified
+symbol keeps its prefix, an alias resolving to the namespace it
+names. Without a named namespace (a bare `Namespace` in tests)
+nothing qualifies. A head qualified to `nexis.core` reaches the
+host macro table, so `` `(let [x# 1] x#) `` expands through
+`nexis.core/let` exactly as `let` does; a qualified symbol
+naming the current namespace resolves like a bare one, including
+forward references the file declares.
+
+The consequence a macro author meets first: a binding name
+written bare inside syntax-quote, `` `(let [x ~a] x) ``, becomes
+`user/x`, which cannot be bound. Write `x#` (fresh per
+expansion) or `~'x` (deliberate capture), as in Clojure.
 
 **Shadowing safety**: syntax-quote output must not be capturable
 by user lexical or Var bindings. If a user writes
 `(let* [list 99] `(~x))`, the emitted list construction must not
 resolve to the user's `list`. Therefore syntax-quote emits the
-internal special forms `#%list` / `#%concat` / `#%vector`, which
-the compiler recognizes in its special-form dispatcher and which
-are never user-shadowable (`COMPILER.md` §4.3). `#%map` / `#%set`
-serve quoted compound map / set literals the same way.
+internal special forms `#%list` / `#%concat` / `#%vector` /
+`#%map` / `#%set`, which the compiler recognizes in its
+special-form dispatcher and which are never user-shadowable
+(`COMPILER.md` §4.3); the rebuild calls are qualified
+`nexis.core/...` symbols for the same reason.
 
 ---
 
@@ -482,18 +528,19 @@ rewrites it:
 
 | Macro | Expands to |
 |---|---|
-| `let` | `let*` with destructuring: non-symbol patterns (sequential `[a b c]`, associative `{:keys [...] :or {...} :as name}`, nested, `& rest`) expand to extra `let*` bindings over `nth` / `get` / `rest`; plain symbols pass through. |
-| `fn` | `fn*` with destructured params: a pattern param is replaced by a gensym and the body wrapped in a `(let [pattern gensym ...] ...)` that itself destructures. |
-| `defn` | `(def name (fn name [params] body...))`, so params destructure. Multi-arity `(defn name ([p1] b1) ([p1 p2] b2))` becomes one variadic `fn` over `[& args]` that `count`s the arguments and dispatches through nested `if`s to a `let*` per arity, throwing `:arity-mismatch` when none matches. At most one variadic overload; its fixed count must exceed every fixed-arity overload's (Clojure's rule). |
-| `loop` | `loop*` (rename). |
+| `let` | `let*` with destructuring: a vector pattern binds by `nth`, `& rest` and `:as`; a map pattern binds `{a :k}`, `:keys` / `:strs` / `:syms` vectors (an entry's own namespace or a `:p/keys` group namespace qualifies the key; a keyword entry in `:keys` is the key), `:or` defaults for an absent key and `:as`; patterns nest; plain symbols pass through. |
+| `fn` | `fn*` with destructured params: a pattern param is replaced by a gensym and the body wrapped in a `(let [pattern gensym ...] ...)` that itself destructures; a map pattern after `&` takes keyword arguments (the rest seq becomes the map `nexis.internal/#%kwargs` builds from alternating keys and values or one trailing map). Overload clauses `(fn name? ([x] ...) ([x y] ...) ([x & r] ...))` lower to one variadic `fn*` that binds the argument count and tests the fixed arities in source order, then the variadic clause, then throws `:arity-mismatch`; at most one variadic clause, no fixed arity below it or repeated (Clojure's rules). A named `fn` may call itself. |
+| `defn` | `(def name (fn name ...))`, so params destructure and overload clauses work as for `fn`. `^meta` on the name (`^:private f` reads as `{:private true}`), a docstring after the name (`:doc`) and an attribute map after that land on the Var: `(defn f "doc" {:k 1} [x] ...)` → `(let* [v# (def f (fn f [x] ...))] (nexis.core/reset-meta! v# {:doc "doc" :k 1 :arglists (quote ([x]))}) v#)`; a definition with none of them leaves the Var's metadata nil. `def` and `defmacro` take `^meta` and a docstring the same way. `(doc f)` prints the `:arglists` and `:doc` of `f`'s Var. |
+| `loop` | `loop*`; each pattern is bound to a gensym and destructured again on every iteration, so `recur` rebinds the gensyms. |
 | `when` | `(if test (do body...) nil)` |
 | `when-not` | `(if test nil (do body...))` |
 | `and` | `(and)` → `true`; `(and x)` → `x`; `(and x y)` → `(let* [g x] (if g y g))`; `(and x y z)` → `(let* [g x] (if g (and y z) g))`. Returns the first falsy value or the last value. |
 | `or` | `(or)` → `nil`; `(or x)` → `x`; `(or x y)` → `(let* [g x] (if g g y))`; `(or x y z)` → `(let* [g x] (if g g (or y z)))`. Returns the first truthy value or the last value. Both `and` and `or` gensym so the first operand is evaluated once. |
 | `cond` | `(cond t1 e1 t2 e2 ...)` → nested `if`. Odd arg count is `MacroExpansionFailure`. No `:else` special case — a keyword test is truthy, so `:else` works by truthiness. |
-| `case` | `expr` evaluated once via gensym; `(case e k1 v1 k2 v2 ...)` → chained `(if (= g k_i) v_i ...)`; a trailing odd form is the default; with no default and no match it throws `:no-matching-clause`. Keys are compared with `=`, not hash-dispatched. |
-| `condp` | `pred` and `expr` each evaluated once; clauses become `(if (p c_i e) v_i ...)` with the same default / `:no-matching-clause` policy as `case`. No `:>>` syntax. |
-| `for` | Eager: nested `reduce` calls, one per binding pair, `conj`ing onto a `[]` accumulator; the result is always a vector. Supports multi-binding cartesian products, `:let` (through `let`, so it destructures) and `:when`; several modifiers between bindings, in order. The first segment must be a `sym src` pair. No `:while`, no laziness. |
+| `case` | `(case expr k1 v1 k2 v2 ... default?)` → `(let* [g expr] (if (= g 'k1) v1 (if (= g 'k2) v2 ... terminal)))`. Every key is a constant and is never evaluated: a symbol key is that symbol, a vector or map key is that literal, and a list key `(k1 k2)` groups alternatives. The terminal is the trailing odd form when present, otherwise `(throw {:error :no-matching-clause :message "No matching clause: <expr>" :value expr})`. Keys are compared with `=`, not hash-dispatched. |
+| `condp` | `pred` and `expr` each evaluated once; clauses become `(if (p c_i e) v_i ...)` with the same default policy as `case`; no match throws the same `:no-matching-clause` map. No `:>>` syntax. |
+| `try` | `(try body* (catch M b h*)* (finally f*)?)` → the primitive `(try body* (catch any g <chain>) (finally f*)?)`, where the chain tries the clauses in order, `(if (nexis.internal/#%catch-matches? g M) (let* [b g] h*) ...)`, an `any` matcher needing no test, and ends in `(throw g)` so a value no clause takes unwinds through the `finally` to the enclosing `try`. A matcher is `any` or a keyword `:tag`, which takes a thrown value equal to `:tag`, a map whose `:error` entry is `:tag` (the shape of Nextomic's error maps and of the `case` no-match map), or an `ex-info` map (`{:message m :data d}`, `:cause` when given) whose data's `:error` is `:tag`; anything else is `MacroExpansionFailure`. No clause at all is a finally-only `try`; neither catch nor finally makes the form `(do body*)`. |
+| `for` | Eager: one loop per binding pair (`(loop* [s# (seq src) acc# outer] (if s# (let [pat (first s#)] ... (recur (next s#) (conj acc# body))) acc#))`), each pair followed by any number of `:let [b]`, `:when t` and `:while t` in any order; a pattern destructures through `let`. `:when` skips the element, `:while` ends the loop it modifies (outer loops carry on), and both see the pattern and earlier `:let` names. The result is always a vector; no laziness. |
 | `->` | `(-> x)` → `x`; `(-> x f)` → `(f x)`; `(-> x (f a b))` → `(f x a b)`; steps chain left to right. A bare-symbol step is `(f)`; any other non-list step is `MacroExpansionFailure`. |
 | `->>` | Same, inserting the threaded value as the LAST argument. |
 | `defrecord` | Registers the record type and defines `T`, `->T`, `map->T` and one impl per `(method [params] body)` clause under the protocol named by the preceding bare symbol (`docs/PROTOCOLS.md` §4). The Vars it defines besides `T` are visible to `DeclaredNames`, so a form may refer to `->T` before the `defrecord`. |
@@ -508,7 +555,8 @@ build time, define further macros in nexis itself through
 `defmacro`: `when-let`, `if-let`, `if-not`, `dotimes`, `doseq`,
 `while`, `letfn`, `declare`, `cond->`, `cond->>`, `some->`,
 `some->>`, `as->`, `with-tx`, `with-read-tx`, `with-snapshot`,
-`with-conn`.
+`with-conn`. `doseq` takes the same modifiers as `for` and runs the
+body for effect, yielding nil.
 
 ## 10b. Form construction helpers
 

@@ -100,6 +100,7 @@ const Program = struct {
     arena: std.heap.ArenaAllocator,
     v: vm.VM,
     host_macros: expand_mod.HostMacroTable,
+    hooks: compile.RuntimeHooks,
     registry: *vm.NamespaceRegistry,
     interner: *intern_mod.Interner,
 
@@ -126,6 +127,8 @@ const Program = struct {
         self.registry.current = self.registry.core;
         try bootstrapCoreForTest(&self.v, self.registry.core, self.interner, &self.host_macros);
         self.registry.current = saved_current;
+        self.hooks = .{ .host_macros = &self.host_macros, .registry = self.registry, .interner = self.interner };
+        self.hooks.install(&self.v);
     }
 
     fn deinit(self: *Program) void {
@@ -295,6 +298,8 @@ fn expectOutput(src: []const u8, expected: []const u8) !void {
     registry.current = registry.core;
     try bootstrapCoreForTest(&v, registry.core, interner, &host_macros);
     registry.current = saved_current;
+    var hooks = compile.RuntimeHooks{ .host_macros = &host_macros, .registry = registry, .interner = interner };
+    hooks.install(&v);
 
     // Each test compiles in the CURRENT namespace
     // (initially user). `(ns NAME)` in src can switch mid-test.
@@ -443,6 +448,46 @@ test "integration: defn" {
     try expectOutput("(do (defn inc [x] (+ x 1)) (inc 41))", "42");
 }
 
+test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
+    try expectOutputProgram("(defn f \"doc\" [x] x) [(f 1) (:doc (meta (var f))) (:arglists (meta (var f)))]", "[1 doc ([x])]");
+    try expectOutputProgram("(defn g {:private true} [x] x) [(g 1) (:private (meta (var g)))]", "[1 true]");
+    try expectOutputProgram("(defn h \"doc\" {:k 1} [x] x) (select-keys (meta (var h)) [:doc :k])", "{:doc doc, :k 1}");
+    try expectOutputProgram("(defn ^:private p [x] x) [(p 2) (:private (meta (var p)))]", "[2 true]");
+    try expectOutputProgram("(defn ^{:doc \"d\"} q [x] x) (:doc (meta (var q)))", "d");
+    try expectOutputProgram("(defn m \"two\" ([x] x) ([x y] y)) [(m 1 2) (:arglists (meta (var m)))]", "[2 ([x] [x y])]");
+    // Without metadata a defn's Var carries none.
+    try expectOutputProgram("(defn plain [x] x) (meta (var plain))", "nil");
+    // def and defmacro take the same spellings.
+    try expectOutputProgram("(def ^:private v 1) [v (:private (meta (var v)))]", "[1 true]");
+    try expectOutputProgram("(def ^{:doc \"dv\"} dv \"x\") [dv (:doc (meta (var dv)))]", "[x dv]");
+    try expectOutputProgram("(def dd \"doc\" 3) [dd (:doc (meta (var dd)))]", "[3 doc]");
+    try expectOutputProgram("(defmacro mm \"doc\" [x] x) [(mm 1) (:doc (meta (var mm)))]", "[1 doc]");
+    try expectOutputProgram("(defmacro ^:private pm [x] x) [(pm 1) (:private (meta (var pm)))]", "[1 true]");
+    // A ^meta name is still declared for forward references.
+    try expectOutputProgram("(defn a [] (b)) (defn ^:private b [] :b) (a)", ":b");
+    // reset-meta! / alter-meta! change a Var in place.
+    try expectOutputProgram("(defn f [x] x) (reset-meta! (var f) {:z 1}) (alter-meta! (var f) assoc :y 2) (meta (var f))", "{:z 1, :y 2}");
+}
+
+test "meta / with-meta / vary-meta on collections never touch equality, hash or printing" {
+    try expectOutput("(meta [1 2])", "nil");
+    try expectOutput("(meta (with-meta [1 2] {:a 1}))", "{:a 1}");
+    try expectOutput("(let [v [1 2] w (with-meta v {:a 1})] [(= v w) (= (hash v) (hash w)) (meta v) w (conj w 3)])", "[true true nil [1 2] [1 2 3]]");
+    try expectOutput("(meta (with-meta {:k 1} {:m 2}))", "{:m 2}");
+    try expectOutput("(meta (with-meta #{1} {:m 2}))", "{:m 2}");
+    try expectOutput("(meta (with-meta '(1 2) {:m 2}))", "{:m 2}");
+    try expectOutput("(meta (with-meta () {:m 2}))", "{:m 2}");
+    try expectOutput("(let [m (with-meta {:k 1} {:m 2})] [(get m :k) (assoc m :j 2) (meta (assoc m :j 2))])", "[1 {:k 1, :j 2} nil]");
+    try expectOutput("(meta (vary-meta [1] assoc :b 2))", "{:b 2}");
+    try expectOutput("(meta (vary-meta (with-meta [1] {:a 1}) assoc :b 2))", "{:a 1, :b 2}");
+    try expectOutput("(meta (with-meta (with-meta [1] {:a 1}) nil))", "nil");
+    try expectOutput("(try (with-meta 1 {}) (catch any e e))", ":no-metadata-on-immediate");
+    try expectOutput("(try (with-meta \"s\" {}) (catch any e e))", ":no-metadata-on-immediate");
+    try expectOutput("(try (with-meta (var meta) {}) (catch any e e))", ":no-metadata-on-immediate");
+    try expectOutput("(try (with-meta [1] 5) (catch any e e))", ":kind-mismatch");
+    try expectOutput("[(meta \"s\") (meta 1) (meta nil) (meta :k)]", "[nil nil nil nil]");
+}
+
 test "integration: defn forward reference (Var late-binding)" {
     try expectOutput("(do (defn f [] (g)) (defn g [] 99) (f))", "99");
 }
@@ -513,17 +558,19 @@ test "integration: quote vector" {
 
 test "integration: syntax-quote no unquote" {
     try expectOutput("`(1 2 3)", "(1 2 3)");
-    try expectOutput("`(a b c)", "(a b c)");
+    // An unqualified symbol with no Var resolves to the current
+    // namespace, as in Clojure.
+    try expectOutput("`(a b c)", "(user/a user/b user/c)");
 }
 
 test "integration: syntax-quote with unquote" {
-    try expectOutput("(let* [x 5] `(value ~x))", "(value 5)");
+    try expectOutput("(let* [x 5] `(value ~x))", "(user/value 5)");
 }
 
 test "integration: syntax-quote with splicing" {
     try expectOutput(
         "(let* [xs (quote (b c d))] `(a ~@xs e))",
-        "(a b c d e)",
+        "(user/a b c d user/e)",
     );
 }
 
@@ -536,6 +583,67 @@ test "integration: synthesize let* form (the macro author's pattern)" {
         "(let* [name (quote x) val 42] `(let* [~name ~val] ~name))",
         "(let* [x 42] x)",
     );
+}
+
+test "syntax-quote: ~@ splices any seqable, in lists and vectors" {
+    try expectOutput("(let [x 1] `(~x ~@[2 3]))", "(1 2 3)");
+    try expectOutput("(let [x 1] `(~x ~@nil))", "(1)");
+    try expectOutput("(let [x 1] `(~x ~@(list 2) ~@(seq [3]) ~@(map inc [3])))", "(1 2 3 4)");
+    try expectOutput("(let [xs [2 3]] `[1 ~@xs 4])", "[1 2 3 4]");
+    try expectOutput("(let [xs [2 3]] `[~@xs])", "[2 3]");
+    try expectOutput("(let [xs '(1 2)] `(~@xs))", "(1 2)");
+    try expectOutput("`(~@#{1})", "(1)");
+    try expectOutput("(let [kvs [:a 1] more '(:b 2)] `{~@kvs ~@more})", "{:a 1, :b 2}");
+    try expectOutput("(let [xs [1 2 1]] `#{~@xs})", "#{1 2}");
+    try expectOutput("(let [xs [2 3]] `(1 ~@xs (4 ~@xs)))", "(1 2 3 (4 2 3))");
+    // A vector built by splicing is a vector, not a seq.
+    try expectOutput("(let [xs [2 3]] (vector? `[1 ~@xs]))", "true");
+    try expectOutput("(let [xs [2 3]] (list? `(1 ~@xs)))", "true");
+}
+
+test "syntax-quote: maps, sets, quote, #() and @ are payloads" {
+    try expectOutput("`{:a 1}", "{:a 1}");
+    try expectOutput("(let [x 2] `{:a ~x})", "{:a 2}");
+    try expectOutput("(let [x 2] `{~x :a})", "{2 :a}");
+    try expectOutput("`#{1}", "#{1}");
+    try expectOutput("(let [x 1] `#{~x})", "#{1}");
+    try expectOutput("`'a", "(quote user/a)");
+    try expectOutput("(let [x 1] `'~x)", "(quote 1)");
+    try expectOutput("`(#(inc %) 1)", "((fn* [%1] (nexis.core/inc %1)) 1)");
+    try expectOutput("`@a", "(nexis.core/deref user/a)");
+    try expectOutput("(let [m `{:f (fn* [x#] x#)}] (= (first (nth (:f m) 1)) (nth (:f m) 2)))", "true");
+}
+
+test "syntax-quote: symbols qualify to the namespace that defines them" {
+    try expectOutput("`(+ 1 2)", "(nexis.core/+ 1 2)");
+    try expectOutput("`(if a b)", "(if user/a user/b)");
+    try expectOutputProgram("(defn helper [] 1) `(helper)", "(user/helper)");
+    try expectOutput("(= `a 'a)", "false");
+    try expectOutput("(= `a 'user/a)", "true");
+    try expectOutput("(= `+ 'nexis.core/+)", "true");
+    try expectOutput("`nexis.core/+", "nexis.core/+");
+    try expectOutput("`db/open", "db/open");
+    try expectOutputProgram("(ns other) `(foo)", "(other/foo)");
+    // Special forms, `&`, catch matchers and `#()` parameters stay bare.
+    try expectOutput("`(do (let* [a 1] (fn* [& r] (try a (catch any e e) (finally 1)))))", "(do (let* [user/a 1] (fn* [& user/r] (try user/a (catch any user/e user/e) (finally 1)))))");
+    try expectOutput("`(quote a)", "(quote user/a)");
+    try expectOutput("`(def x (var y))", "(def user/x (var user/y))");
+    try expectOutput("`(recur (throw 1))", "(recur (throw 1))");
+    // Host macros qualify to nexis.core and still expand from there.
+    try expectOutput("(first `(let [x 1] x))", "nexis.core/let");
+    try expectOutput("(nexis.core/let [x 1] (nexis.core/when true x))", "1");
+    try expectOutputProgram("(defmacro m [x] `(let [y# ~x] (inc y#))) (m 1)", "2");
+    try expectOutputProgram("(defmacro m [x] `(when ~x (-> ~x inc))) (m 1)", "2");
+    // A forward reference through a macro resolves like a bare one.
+    try expectOutputProgram("(defmacro m [] `(later)) (defn f [] (m)) (defn later [] :late) (f)", ":late");
+    // Auto-gensym never qualifies; `~'x` keeps a bare symbol.
+    try expectOutput("(let [f (fn [] `(x# ~'x))] [(namespace (first (f))) (subs (name (first (f))) 0 3)])", "[nil x__]");
+    try expectOutput("(second `(a ~'b))", "b");
+}
+
+test "syntax-quote: a bare binding name inside syntax-quote is the Clojure mistake" {
+    // `(let [x ~a] x)` qualifies `x`; a qualified name cannot be bound.
+    try expectProgramError("(defmacro bad [a] `(let [x ~a] x)) (bad 1)", compile.CompileError.MacroExpansionFailure);
 }
 
 // =============================================================================
@@ -578,6 +686,47 @@ test "integration: nested try — outer catches what inner rethrows" {
         "(try (try (throw 100) (catch any e (throw e))) (catch any e e))",
         "100",
     );
+}
+
+test "try: finally alone, no clause at all, and empty bodies" {
+    try expectOutput("(try 1 (finally 2))", "1");
+    try expectOutput("(let [a (atom 0)] [(try (throw :x) (catch any e e) (finally (reset! a 1))) @a])", "[:x 1]");
+    try expectOutput("(let [a (atom [])] (try (try (throw :x) (finally (swap! a conj :fin))) (catch any e (swap! a conj e))) @a)", "[:fin :x]");
+    try expectOutput("(try 1)", "1");
+    try expectOutput("(try)", "nil");
+    try expectOutput("(try (throw :x) (catch any e))", "nil");
+    try expectOutput("(try (catch any e 1))", "nil");
+}
+
+test "try: catch clauses match by keyword tag, in order, or rethrow" {
+    try expectOutput("(try (throw :a) (catch :a e :got-a) (catch :b e :got-b))", ":got-a");
+    try expectOutput("(try (throw :b) (catch :a e :got-a) (catch :b e :got-b))", ":got-b");
+    try expectOutput("(try (throw :c) (catch :a e 1) (catch any e [:any e]))", "[:any :c]");
+    try expectOutput("(try (try (throw :c) (catch :a e 1)) (catch any e [:outer e]))", "[:outer :c]");
+    try expectOutput("(let [a (atom 0)] [(try (try (throw :c) (catch :a e 1) (finally (swap! a inc))) (catch :c e :outer)) @a])", "[:outer 1]");
+    // A map matches by its :error entry.
+    try expectOutput("(try (throw {:error :boom :n 1}) (catch :boom e (:n e)))", "1");
+    try expectOutput("(try (/ 1 0) (catch :divide-by-zero e :dz))", ":dz");
+    try expectOutput("(try (case 3 1 :a) (catch :no-matching-clause e (:value e)))", "3");
+    try expectOutput("(try (throw {:error :other}) (catch :boom e 1) (catch any e (:error e)))", ":other");
+    // A caught binding may be captured by an inner fn.
+    try expectOutput("(try (throw 5) (catch any e ((fn [] (inc e)))))", "6");
+    try expectProgramError("(try 1 (catch 'sym e 1))", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(try 1 (catch any e 1) 2)", compile.CompileError.MacroExpansionFailure);
+}
+
+test "empty bodies are nil and () is the empty list" {
+    try expectOutput("((fn []))", "nil");
+    try expectOutput("(do (defn e0 []) (e0))", "nil");
+    try expectOutput("((fn [x]) 1)", "nil");
+    try expectOutput("(let [x 1])", "nil");
+    try expectOutput("(loop [x 1])", "nil");
+    try expectOutput("(letfn [(f [])] (f))", "nil");
+    try expectOutput("(do)", "nil");
+    try expectOutput("()", "()");
+    try expectOutput("(= () '())", "true");
+    try expectOutput("(count ())", "0");
+    try expectOutput("(list? ())", "true");
 }
 
 // =============================================================================
@@ -713,6 +862,14 @@ test "integration: my-cond — user procedural macro using native fns" {
     , ":yes");
 }
 
+test "integration: a macro body reads names of its keyword and symbol arguments" {
+    // The macro runs in a sub-VM that borrows the compile-time
+    // interner, so the ids in its arguments resolve.
+    try expectOutput("(do (defmacro kw-name [k] (name k)) (kw-name :abc))", "abc");
+    try expectOutput("(do (defmacro tagged [k v] `[~(keyword (str (name k) \"-tag\")) ~v]) (tagged :a 1))", "[:a-tag 1]");
+    try expectOutput("(do (defmacro same? [k] (= k (keyword \"x\"))) [(same? :x) (same? :y)])", "[true false]");
+}
+
 test "integration: native fn — arity mismatch is catchable" {
     try expectOutput("(try (first) (catch any e e))", ":arity-mismatch");
     try expectOutput("(try (cons 1) (catch any e e))", ":arity-mismatch");
@@ -766,6 +923,28 @@ test "integration: multi-arity with destructured params" {
     , "12");
 }
 
+test "multi-arity fn: anonymous, named and letfn clauses dispatch by argc" {
+    try expectOutput("((fn ([x] x) ([x y] (+ x y))) 1 2)", "3");
+    try expectOutput("((fn ([x] x) ([x y] (+ x y))) 1)", "1");
+    try expectOutput("((fn ([x] x)) 7)", "7");
+    try expectOutput("((fn ([] 0) ([x & r] (count r))) 1 2 3)", "2");
+    // The exact fixed arity wins over the variadic one, in any order.
+    try expectOutput("((fn ([x & r] :var) ([x] :one)) 1)", ":one");
+    try expectOutput("((fn ([x & r] :var) ([x] :one)) 1 2)", ":var");
+    try expectOutput("((fn f ([n] (f n 0)) ([n acc] (if (zero? n) acc (f (dec n) (+ acc n))))) 4)", "10");
+    try expectOutput("(letfn [(f ([x] x) ([x y] y))] [(f 1) (f 1 2)])", "[1 2]");
+    try expectOutput("(letfn [(f [[a b]] (+ a b))] (f [1 2]))", "3");
+    try expectOutput("(let [f (fn ([[a b]] (+ a b)) ([m k] (get m k)))] [(f [1 2]) (f {:k 3} :k)])", "[3 3]");
+    try expectOutput("(try ((fn ([x] x)) 1 2) (catch any e e))", ":arity-mismatch");
+    try expectProgramError("(fn ([x] 1) ([x] 2))", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(fn ([x y] 1) ([x & r] 2))", compile.CompileError.MacroExpansionFailure);
+}
+
+test "named fn: the name is the function itself inside its body" {
+    try expectOutput("((fn f [n] (if (pos? n) (f (dec n)) :done)) 3)", ":done");
+    try expectOutput("(let [g (fn f [n] (if (zero? n) 1 (* n (f (dec n)))))] (g 5))", "120");
+}
+
 // =============================================================================
 // Destructuring (let / fn / defn params)
 // =============================================================================
@@ -806,6 +985,36 @@ test "integration: associative destructuring with :or defaults" {
 
 test "integration: associative destructuring with :as" {
     try expectOutput("(let [{:keys [a] :as m} {:a 1 :b 2}] (count m))", "2");
+}
+
+test "destructuring: :strs, :syms, namespaced keys, keyword entries and :or" {
+    try expectOutput("(let [{:strs [a]} {\"a\" 1}] a)", "1");
+    try expectOutput("(let [{:syms [a]} {'a 2}] a)", "2");
+    try expectOutput("(let [{:keys [x/y]} {:x/y 3}] y)", "3");
+    try expectOutput("(let [{:keys [:a :b/c]} {:a 1 :b/c 2}] [a c])", "[1 2]");
+    try expectOutput("(let [{:p/keys [n m]} {:p/n 1 :p/m 2}] [n m])", "[1 2]");
+    try expectOutput("(let [{:p/syms [n]} {'p/n 1}] n)", "1");
+    try expectOutput("(let [{:keys [a] :or {a 9}} {}] a)", "9");
+    try expectOutput("(let [{:strs [a] :or {a 9}} {}] a)", "9");
+    try expectOutput("(let [{:keys [a b] :or {b 5} :as m} {:a 1}] [a b m])", "[1 5 {:a 1}]");
+    try expectOutput("(let [{:keys [a] :or {a 9}} {:a nil}] a)", "nil");
+}
+
+test "destructuring: a map pattern after & takes keyword arguments" {
+    try expectOutput("((fn [& {:keys [a b]}] [a b]) :a 1 :b 2)", "[1 2]");
+    try expectOutput("((fn [x & {:keys [a]}] [x a]) 0 :a 1)", "[0 1]");
+    try expectOutput("((fn [& {:keys [a] :or {a 7}}] a))", "7");
+    try expectOutput("((fn [& {:keys [a]}] a) {:a 3})", "3");
+    try expectOutput("(do (defn kw [& {:keys [a]}] a) (kw :a 1))", "1");
+    try expectOutput("(let [[x & {:keys [k]}] [1 :k 2]] [x k])", "[1 2]");
+    try expectOutput("(do (defn ma ([x] x) ([x & {:keys [a]}] [x a])) [(ma 1) (ma 1 :a 2)])", "[1 [1 2]]");
+    try expectOutput("(try ((fn [& {:keys [a]}] a) :a) (catch any e e))", ":invalid-argument");
+}
+
+test "destructuring: loop bindings destructure and recur rebinds them" {
+    try expectOutput("(loop [[x & xs] [1 2 3] acc 0] (if x (recur xs (+ acc x)) acc))", "6");
+    try expectOutput("(loop [{:keys [n]} {:n 3} out []] (if (pos? n) (recur {:n (dec n)} (conj out n)) out))", "[3 2 1]");
+    try expectOutput("(loop [[a b] [1 2]] (+ a b))", "3");
 }
 
 test "integration: fn with destructured params" {
@@ -1338,7 +1547,7 @@ test "integration: composite — syntax-quote inside defn" {
         \\  (defn build [a b]
         \\    `(pair ~a ~b))
         \\  (build 1 2))
-    , "(pair 1 2)");
+    , "(user/pair 1 2)");
 }
 
 // =============================================================================
@@ -2026,8 +2235,8 @@ test "io: slurp / spit: empty path is :invalid-path" {
 // =============================================================================
 //
 // `case` + `condp` are pure expansion + single-eval gensym
-// patterns; both throw `:no-matching-clause` when no clause
-// matches and no default is supplied (returning nil would
+// patterns; both throw `{:error :no-matching-clause ...}` when no
+// clause matches and no default is supplied (returning nil would
 // silently mask bugs).
 
 test "case: basic match + default" {
@@ -2039,13 +2248,34 @@ test "case: basic match + default" {
     try expectOutput("(case :anything :default)", ":default");
 }
 
-test "case: no match without default throws :no-matching-clause" {
+test "case: constants are data, never evaluated" {
+    // A list groups alternatives; a symbol is the symbol itself.
+    try expectOutput("(case 1 (1 2) :a :d)", ":a");
+    try expectOutput("(case 2 (1 2) :a 3 :b :d)", ":a");
+    try expectOutput("(case 3 (1 2) :a 3 :b :d)", ":b");
+    try expectOutput("(case 'x x :a :d)", ":a");
+    try expectOutput("(case 'y x :a y :b :d)", ":b");
+    try expectOutput("(case 'z (x y) :a (z w) :b :d)", ":b");
+    try expectOutput("(case nil nil :nil :d)", ":nil");
+    try expectOutput("(case [1 2] [1 2] :vec :d)", ":vec");
+    try expectOutput("(case {:a 1} {:a 1} :map :d)", ":map");
+    try expectOutput("(case :k (:j :k) :kw :d)", ":kw");
+    try expectOutput("(case \"s\" (\"a\" \"s\") :str :d)", ":str");
+    try expectOutput("(case \\c \\c :char :d)", ":char");
+    try expectOutput("(case 1.5 1.5 :f :d)", ":f");
+    try expectOutput("(case true true :t false :f)", ":t");
+    // The dispatch expression is evaluated; a symbol there is a lookup.
+    try expectOutput("(let [x 5] (case x 5 :five :d))", ":five");
+    try expectOutput("(let [x 5] (case x (4 5 6) :mid :d))", ":mid");
+}
+
+test "case: no match without default throws a map naming the value" {
     try expectOutput(
-        \\(try (case 99 1 :one 2 :two) (catch any e e))
-    , ":no-matching-clause");
+        \\(try (case 99 1 :one 2 :two) (catch any e [(:error e) (:value e) (:message e)]))
+    , "[:no-matching-clause 99 No matching clause: 99]");
     // Even count = no default; still throws.
     try expectOutput(
-        \\(try (case 5 1 :one) (catch any e e))
+        \\(try (case :k 1 :one) (catch any e (:error e)))
     , ":no-matching-clause");
 }
 
@@ -2082,10 +2312,10 @@ test "condp: predicate + default" {
     try expectOutput("(condp = 99 :default)", ":default");
 }
 
-test "condp: no match without default throws :no-matching-clause" {
+test "condp: no match without default throws a map naming the value" {
     try expectOutput(
-        \\(try (condp = 99 1 :one 2 :two) (catch any e e))
-    , ":no-matching-clause");
+        \\(try (condp = 99 1 :one 2 :two) (catch any e [(:error e) (:value e)]))
+    , "[:no-matching-clause 99]");
 }
 
 test "condp: predicate is called as (pred clause expr)" {
@@ -2148,13 +2378,32 @@ test "for: :let modifier with destructuring-capable bindings" {
     , "[[:a 1] [:b 2]]");
 }
 
-// Note: malformed `for` shapes (empty bindings, unknown modifier
-// keyword, dangling symbol) raise MalformedMacroCall at EXPAND
-// time, which surfaces as CompileError.MacroExpansionFailure —
-// not catchable via runtime try/catch. The rejection is verified
-// by the impl (expand.zig:expandFor); we don't add an integration
-// test because the test harness panics on compile errors rather
-// than surfacing them as catchable values.
+test "for: :while ends its loop, patterns destructure, modifiers compose" {
+    try expectOutput("(for [x [1 2 3] :while (< x 3)] x)", "[1 2]");
+    try expectOutput("(for [x [1 2] y [3 4] :while (< y 4)] [x y])", "[[1 3] [2 3]]");
+    try expectOutput("(for [x [1 2] :while (< x 2) y [1 2]] [x y])", "[[1 1] [1 2]]");
+    try expectOutput("(for [x [1 2 3] :let [y (* x 10)] :when (< 10 y)] y)", "[20 30]");
+    try expectOutput("(for [x (range 5) :while (< x 3) :when (odd? x)] x)", "[1]");
+    try expectOutput("(for [x (range 10) :when (odd? x) :while (< x 6) :let [y (* x x)]] y)", "[1 9 25]");
+    try expectOutput("(for [[a b] [[1 2] [3 4]]] (+ a b))", "[3 7]");
+    try expectOutput("(for [[k v] {:a 1}] [v k])", "[[1 :a]]");
+    try expectOutput("(for [{:keys [n]} [{:n 1} {:n 2}]] n)", "[1 2]");
+    try expectOutput("(for [x nil] x)", "[]");
+    try expectProgramError("(for [:when true x [1]] x)", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(for [x [1] :reduce +] x)", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(for [x] x)", compile.CompileError.MacroExpansionFailure);
+}
+
+test "doseq: :when, :while and :let modifiers, destructuring, nil result" {
+    try expectOutput("(let [a (atom [])] (doseq [x [1 2 3] :when (odd? x)] (swap! a conj x)) @a)", "[1 3]");
+    try expectOutput("(let [a (atom [])] (doseq [x [1 2 3] :while (< x 3)] (swap! a conj x)) @a)", "[1 2]");
+    try expectOutput("(let [a (atom [])] (doseq [x [1 2] :let [y (* x 10)]] (swap! a conj y)) @a)", "[10 20]");
+    try expectOutput("(let [a (atom [])] (doseq [x [1 2 3] :while (< x 3) y [1]] (swap! a conj [x y])) @a)", "[[1 1] [2 1]]");
+    try expectOutput("(let [a (atom [])] (doseq [x [1 2] y [10 20] :when (< 15 y)] (swap! a conj (+ x y))) @a)", "[21 22]");
+    try expectOutput("(let [a (atom [])] (doseq [[k v] {:a 1}] (swap! a conj [v k])) @a)", "[[1 :a]]");
+    try expectOutput("(let [a (atom [])] (doseq [x [1] :let [y 2] :when (= y 2)] (swap! a conj [x y])) @a)", "[[1 2]]");
+    try expectOutput("(doseq [x [1 2] :when (odd? x)] x)", "nil");
+}
 
 // =============================================================================
 // Records substrate
@@ -3271,6 +3520,8 @@ test "core: predicates, names and conversions" {
         .{ .src = "((juxt :a :b) {:a 1 :b 2})", .expected = "[1 2]" },
         .{ .src = "((fnil inc 10) nil)", .expected = "11" },
         .{ .src = "((fnil + 10) 1 2)", .expected = "3" },
+        .{ .src = "((fnil + 10 20) nil nil 1)", .expected = "31" },
+        .{ .src = "((fnil vector 1 2 3) nil 0 nil)", .expected = "[1 0 3]" },
         .{ .src = "((complement odd?) 2)", .expected = "true" },
         .{ .src = "(apply + 1 2 [3 4])", .expected = "10" },
         .{ .src = "(apply max [1 5 2])", .expected = "5" },
@@ -3476,4 +3727,62 @@ test "unresolved symbols: nothing is interned for a rejected form" {
     var span: ?reader_mod.SrcSpan = null;
     try testing.expectError(compile.CompileError.UnresolvedSymbol, program.runChecked("(defn f [] (ghost))", &span));
     try testing.expect(program.registry.current.lookupLocal("ghost") == null);
+}
+
+test "ex-info: a map thrown and caught, read back with ex-data and ex-message" {
+    try expectOutputProgram(
+        "(try (throw (ex-info \"boom\" {:code 7})) (catch any e [(ex-message e) (ex-data e)]))",
+        "[boom {:code 7}]",
+    );
+    try expectOutputProgram(
+        "(let [e (ex-info \"m\" {:a 1} :why)] [(:message e) (:data e) (:cause e) (map? e)])",
+        "[m {:a 1} :why true]",
+    );
+    try expectOutputProgram("[(ex-data 1) (ex-message :k) (ex-data {:x 1}) (:cause (ex-info \"m\" {}))]", "[nil nil nil nil]");
+    // A tag catches an ex-info map through the `:error` of its data.
+    try expectOutputProgram(
+        "(try (throw (ex-info \"nf\" {:error :not-found :id 3})) (catch :other e :no) (catch :not-found e [(ex-message e) (:id (ex-data e))]))",
+        "[nf 3]",
+    );
+}
+
+test "list*: leading elements before a seq" {
+    try expectOutput("(list* 1 2 [3 4])", "(1 2 3 4)");
+    try expectOutput("(list* [1 2])", "(1 2)");
+    try expectOutput("(list* 1 nil)", "(1)");
+    try expectOutput("(list* nil)", "nil");
+    try expectOutput("(apply + (list* 1 2 '(3)))", "6");
+}
+
+test "reduced: reduce, reductions and reduce-kv stop and unwrap" {
+    try expectOutput("(reduce (fn [acc x] (if (> acc 10) (reduced acc) (+ acc x))) 0 [1 2 3 4 5 6 7 8 9])", "15");
+    try expectOutput("(reduce (fn [acc x] (if (= x 3) (reduced :stop) (+ acc x))) [1 2 3 4])", ":stop");
+    try expectOutput("(reduce (fn [acc x] (reduced x)) 0 [])", "0");
+    try expectOutput("(reductions (fn [acc x] (if (= x 3) (reduced :stop) (+ acc x))) 0 [1 2 3 4])", "(0 1 3 :stop)");
+    try expectOutput("(reduce-kv (fn [acc i x] (if (= i 2) (reduced acc) (conj acc x))) [] [10 20 30 40])", "[10 20]");
+    try expectOutput("[(reduced? (reduced 1)) (reduced? 1) (reduced? {:val 1}) @(reduced 5)]", "[true false false 5]");
+    try expectOutput("[(unreduced (reduced 2)) (unreduced 2) (reduced? (ensure-reduced 3)) (reduced? (ensure-reduced (reduced 3)))]", "[2 2 true true]");
+}
+
+test "macroexpand: host and user macros, one step and to a fixed head" {
+    try expectOutput("(macroexpand-1 '(when a b))", "(if a (do b) nil)");
+    try expectOutput("(macroexpand-1 '(+ 1 2))", "(+ 1 2)");
+    try expectOutput("(macroexpand-1 'x)", "x");
+    try expectOutput("(macroexpand-1 '(if a b))", "(if a b)");
+    try expectOutput("(macroexpand '(-> x f g))", "(g (f x))");
+    try expectOutput("(macroexpand '(when-not a b))", "(if a nil (do b))");
+    try expectOutputProgram("(defmacro twice [x] `(do ~x ~x)) (macroexpand-1 '(twice 1))", "(do 1 1)");
+    try expectOutputProgram("(defmacro w [x] `(when ~x 1)) [(macroexpand-1 '(w a)) (macroexpand '(w a))]", "[(nexis.core/when a 1) (if a (do 1) nil)]");
+}
+
+test "read-string: forms as data, the first form only, errors thrown" {
+    try expectOutput("(read-string \"(+ 1 2)\")", "(+ 1 2)");
+    try expectOutput("(read-string \"[1 :a \\\"s\\\" nil true]\")", "[1 :a s nil true]");
+    try expectOutput("(first (read-string \"(a b)\"))", "a");
+    try expectOutput("(read-string \"{:a 1}\")", "{:a 1}");
+    try expectOutput("(read-string \"'x\")", "(quote x)");
+    try expectOutput("(read-string \" 42 ; comment\\n 43\")", "42");
+    try expectOutput("(try (read-string \"(\") (catch :reader-error e :bad))", ":bad");
+    try expectOutput("(try (read-string \"\") (catch :reader-error e :empty))", ":empty");
+    try expectOutput("(macroexpand-1 (read-string \"(when a b)\"))", "(if a (do b) nil)");
 }

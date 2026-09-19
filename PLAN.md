@@ -2603,6 +2603,21 @@ entry stating the decision and its rationale.
   `[e a v t added]` vectors, and the kind is listed as absent in
   `docs/NEXTOMIC.md` §6. `docs/NEXTOMIC.md` §1–§2 are the authority.
 
+- **2026-09-18 — Exceptions are values; catch by keyword tag
+  (§6.4, §13.5).** A thrown value is any value and there is no
+  `:error` kind: an error that can say more travels as a map
+  `{:error :tag ...}` (the shape `docs/NEXTOMIC.md` §7 and
+  `case`'s no-match map use), one that cannot is the bare keyword.
+  `(catch any e ...)` takes every value; `(catch :tag e ...)` takes
+  the value `:tag`, a map whose `:error` entry is `:tag`, or an
+  `ex-info` map whose data's `:error` is `:tag`; clauses are tried
+  in order and an untaken value is rethrown through `finally`.
+  `ex-info` builds `{:message m :data d}` (`:cause` when given) and
+  `ex-data`/`ex-message` read it back. §6.4's `:kind` and
+  `:trace` fields and its destructuring catch pattern are not
+  shipped; `docs/MACROEXPAND.md` §10 and `docs/COMPILER.md` §5.10
+  are the authority.
+
 - **2026-09-18 — `as-of` removed from §21 "Beyond 1.0".** §23 #22
   makes `as-of` reads v1, and they exist twice: `db/snapshot` /
   `with-snapshot` over MVCC read transactions (§15.7) and Nextomic's

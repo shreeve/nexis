@@ -111,31 +111,85 @@ fn emitCompileError(
     err: anyerror,
     maybe_span: ?reader_mod.SrcSpan,
 ) !void {
-    const stderr = std.Io.File.stderr();
     if (maybe_span) |span| {
-        const loc = byteOffsetToLineCol(source, span.pos);
-        var buf: [256]u8 = undefined;
-        const header = try std.fmt.bufPrint(&buf, "nexis: {s}:{d}:{d}: {s}\n", .{ path, loc.line, loc.col, @errorName(err) });
-        try stderr.writeStreamingAll(io, header);
-        // Show source line + caret.
-        const line_text = lineAt(source, loc.line);
-        if (line_text.len > 0) {
-            try stderr.writeStreamingAll(io, "    ");
-            try stderr.writeStreamingAll(io, line_text);
-            try stderr.writeStreamingAll(io, "\n    ");
-            var i: usize = 1;
-            while (i < loc.col) : (i += 1) try stderr.writeStreamingAll(io, " ");
-            // Caret(s): one for each byte in the span, but cap
-            // at the line length so we don't run off.
-            const span_len: usize = if (span.len < 1) 1 else span.len;
-            var j: usize = 0;
-            while (j < span_len) : (j += 1) try stderr.writeStreamingAll(io, "^");
-            try stderr.writeStreamingAll(io, "\n");
-        }
+        try emitSourceError(io, path, source, @errorName(err), span);
     } else {
-        // No span — fall back to the prior bare-error format.
+        // An error without a span is reported bare.
+        const stderr = std.Io.File.stderr();
         try stderr.writeStreamingAll(io, "nexis: compile error: ");
         try stderr.writeStreamingAll(io, @errorName(err));
+        try stderr.writeStreamingAll(io, "\n");
+    }
+}
+
+/// Report a parse failure at the token the parser stopped on:
+///
+///   nexis: <path>:<line>:<col>: parse error: unexpected `)`
+///
+/// or `unexpected end of input` past the last token.
+fn emitParseError(io: std.Io, path: []const u8, source: []const u8, p: *const reader_mod.parser.Parser) !void {
+    const pos: u32 = @intCast(@min(p.current.pos, source.len));
+    var buf: [128]u8 = undefined;
+    const label = if (pos >= source.len)
+        "parse error: unexpected end of input"
+    else
+        try std.fmt.bufPrint(&buf, "parse error: unexpected `{s}`", .{source[pos..@min(source.len, pos + @as(usize, @max(p.current.len, 1)))]});
+    const len: u32 = if (pos >= source.len) 1 else @max(p.current.len, 1);
+    try emitSourceError(io, path, source, label, .{ .pos = pos, .len = len });
+}
+
+/// Report a reader failure at the form it rejected, with the kind
+/// the golden `.err` files name (`:map-odd-count`) and the reader's
+/// detail when it has one:
+///
+///   nexis: <path>:<line>:<col>: reader error: :duplicate-literal-key :a
+///
+/// A failure the reader did not record (out of memory, invalid
+/// UTF-8) is reported bare.
+fn emitReaderError(io: std.Io, path: []const u8, source: []const u8, rdr: *const reader_mod.Reader, err: anyerror) !void {
+    const e = rdr.err orelse {
+        const stderr = std.Io.File.stderr();
+        try stderr.writeStreamingAll(io, "nexis: reader error: ");
+        try stderr.writeStreamingAll(io, @errorName(err));
+        try stderr.writeStreamingAll(io, "\n");
+        return;
+    };
+    var buf: [256]u8 = undefined;
+    const kind = @tagName(e.kind);
+    const label = if (e.detail) |detail|
+        try std.fmt.bufPrint(&buf, "reader error: :{s} {s}", .{ kind, detail })
+    else
+        try std.fmt.bufPrint(&buf, "reader error: :{s}", .{kind});
+    // Kinds are spelled with underscores in Zig and dashes in nexis.
+    std.mem.replaceScalar(u8, buf[0..label.len], '_', '-');
+    try emitSourceError(io, path, source, label, e.span);
+}
+
+/// `nexis: <path>:<line>:<col>: <label>`, then the source line
+/// and a caret under the span.
+fn emitSourceError(
+    io: std.Io,
+    path: []const u8,
+    source: []const u8,
+    label: []const u8,
+    span: reader_mod.SrcSpan,
+) !void {
+    const stderr = std.Io.File.stderr();
+    const loc = byteOffsetToLineCol(source, span.pos);
+    var buf: [512]u8 = undefined;
+    const header = try std.fmt.bufPrint(&buf, "nexis: {s}:{d}:{d}: {s}\n", .{ path, loc.line, loc.col, label });
+    try stderr.writeStreamingAll(io, header);
+    const line_text = lineAt(source, loc.line);
+    if (line_text.len > 0) {
+        try stderr.writeStreamingAll(io, "    ");
+        try stderr.writeStreamingAll(io, line_text);
+        try stderr.writeStreamingAll(io, "\n    ");
+        var i: usize = 1;
+        while (i < loc.col) : (i += 1) try stderr.writeStreamingAll(io, " ");
+        // One caret per byte of the span, at least one.
+        const span_len: usize = if (span.len < 1) 1 else span.len;
+        var j: usize = 0;
+        while (j < span_len) : (j += 1) try stderr.writeStreamingAll(io, "^");
         try stderr.writeStreamingAll(io, "\n");
     }
 }
@@ -188,6 +242,8 @@ const Runtime = struct {
     v: vm.VM,
     host_macros: expand_mod.HostMacroTable,
     loader: loader_mod.Loader,
+    /// What `macroexpand-1` and `read-string` call into.
+    hooks: compile.RuntimeHooks,
     interner: *intern_mod.Interner,
     registry: *vm.NamespaceRegistry,
 
@@ -284,6 +340,13 @@ fn bootRuntime(rt: *Runtime, io: std.Io, allocator: std.mem.Allocator, load_path
         rt.registry,
         &rt.host_macros,
     );
+    rt.hooks = .{
+        .host_macros = &rt.host_macros,
+        .registry = rt.registry,
+        .interner = rt.interner,
+        .load_callback = .{ .user_data = @ptrCast(&rt.loader), .load = &loader_mod.Loader.loadCallback },
+    };
+    rt.hooks.install(&rt.v);
 }
 
 /// Compile and evaluate one embedded source into `ns`, one
@@ -384,8 +447,21 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         // at the symbol.
         var declared = compile.DeclaredNames.init(allocator);
         defer declared.deinit();
+        // One form per line, located like a file's.
+        var parser = reader_mod.parser.Parser.init(allocator, src);
+        defer parser.deinit();
+        const sexp = parser.parseForm() catch {
+            try emitParseError(io, "<repl>", src, &parser);
+            continue;
+        };
+        var line_reader = reader_mod.Reader.init(allocator, src);
+        defer line_reader.deinit();
+        const form = line_reader.readOneForm(sexp) catch |err| {
+            try emitReaderError(io, "<repl>", src, &line_reader, err);
+            continue;
+        };
         var error_span: ?reader_mod.SrcSpan = null;
-        const compiled = compile.compileSourceWith(rt.persistent(), src, rt.compileOptions(&error_span, &declared)) catch |err| {
+        const compiled = compile.compileFormWith(rt.persistent(), form, rt.compileOptions(&error_span, &declared)) catch |err| {
             try emitCompileError(io, "<repl>", src, err, error_span);
             continue;
         };
@@ -425,21 +501,18 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     defer allocator.free(source);
 
     // The parser owns the Sexp tree, the reader the Form tree.
-    var parse_result = reader_mod.parser.parseProgram(allocator, source) catch |err| {
-        try stderr.writeStreamingAll(io, "nexis: parse error: ");
-        try stderr.writeStreamingAll(io, @errorName(err));
-        try stderr.writeStreamingAll(io, "\n");
+    var parser = reader_mod.parser.Parser.init(allocator, source);
+    defer parser.deinit();
+    const sexp = parser.parseProgram() catch {
+        try emitParseError(io, path, source, &parser);
         std.process.exit(3);
     };
-    defer parse_result.parser.deinit();
 
     var reader = reader_mod.Reader.init(allocator, source);
     defer reader.deinit();
 
-    const forms = reader.readProgram(parse_result.sexp) catch |err| {
-        try stderr.writeStreamingAll(io, "nexis: reader error: ");
-        try stderr.writeStreamingAll(io, @errorName(err));
-        try stderr.writeStreamingAll(io, "\n");
+    const forms = reader.readProgram(sexp) catch |err| {
+        try emitReaderError(io, path, source, &reader, err);
         std.process.exit(3);
     };
 

@@ -24,7 +24,8 @@ their second-run behavior.
 | `quoted-list.nx` | `(quote (...))` builds a runtime list |
 | `syntax-quote.nx` | `` ` `` / `~` / `~@` with splicing |
 | `macro-author.nx` | Synthesizing a `(let* [x 99] x)` form with a vector syntax-quote |
-| `try-catch.nx` | `try` / `catch` / `throw` across frames |
+| `try-catch.nx` | `try` / `catch` / `throw` across frames; catch by keyword tag; `finally` alone |
+| `metadata.nx` | `defn` docstrings and attribute maps, `(doc f)`, `^:private`, `with-meta` / `vary-meta` on collections |
 | `maps-sets.nx` | `{...}` and `#{...}` literals |
 | `defmacro.nx` | User macros: a fresh sub-VM per compile-time invocation |
 | `stdlib-primitives.nx` | Native fns (`list`/`cons`/`first`/`rest`/`empty?`/...) and a recursive procedural `my-cond` macro |

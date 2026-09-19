@@ -8,6 +8,7 @@
 
 ; Splice parts into the middle of a quoted list. The ~@ form
 ; spreads the elements of `parts` inline; bracketing `a` and `e`
-; stay as literal symbols.
+; are literal symbols, qualified to the current namespace the
+; way Clojure's syntax-quote does.
 `(a ~@parts e)
-; => (a b c d e)
+; => (user/a b c d user/e)

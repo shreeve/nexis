@@ -142,8 +142,17 @@
 ; ============================================================
 ;
 ; Each defn builds on the natives: reduce, loop*, cons, assoc,
-; apply. Where Clojure short-circuits through `reduced`, these
-; iterate with `loop*` and an explicit exit.
+; apply. A fold over `reduce` stops on a `reduced` value the way
+; Clojure's does; the others iterate with `loop*` and an explicit
+; exit.
+
+; (unreduced x) → the value inside a reduced, else x.
+(defn unreduced [x]
+  (if (reduced? x) @x x))
+
+; (ensure-reduced x) → x if already reduced, else (reduced x).
+(defn ensure-reduced [x]
+  (if (reduced? x) x (reduced x)))
 
 ; ---- function composition helpers ----
 
@@ -282,11 +291,22 @@
   (fn* [& args]
     (mapv (fn* [f] (apply f args)) fs)))
 
-; (fnil f default) → f, with a nil first argument replaced by
-; default.
-(defn fnil [f default]
-  (fn* [x & more]
-    (apply f (if (nil? x) default x) more)))
+; (vary-meta obj f & args) → obj carrying (apply f (meta obj) args).
+(defn vary-meta [obj f & args]
+  (with-meta obj (apply f (meta obj) args)))
+
+; (fnil f d1 d2? d3?) → f, with nil leading arguments replaced
+; by the defaults, one per position.
+(defn fnil
+  ([f d1]
+   (fn* [x & more]
+     (apply f (if (nil? x) d1 x) more)))
+  ([f d1 d2]
+   (fn* [x y & more]
+     (apply f (if (nil? x) d1 x) (if (nil? y) d2 y) more)))
+  ([f d1 d2 d3]
+   (fn* [x y z & more]
+     (apply f (if (nil? x) d1 x) (if (nil? y) d2 y) (if (nil? z) d3 z) more))))
 
 ; (merge-with f & maps) → merge where a key present on both
 ; sides keeps (f left right).
@@ -306,6 +326,21 @@
 ; ============================================================
 ; Control-flow macros
 ; ============================================================
+
+; (doc name) → prints the Var's :arglists and :doc, the way a
+; REPL shows them; nil. A defn carries them once it is given a
+; docstring or attribute map. The keys are built when doc runs:
+; a keyword literal here would be interned at boot and shift the
+; intern order every script's map layout depends on.
+(defmacro doc [name]
+  `(let* [m# (meta (var ~name))
+          arglists# (get m# (keyword "arglists"))
+          docstring# (get m# (keyword "doc"))]
+     (println "-------------------------")
+     (println '~name)
+     (when arglists# (println arglists#))
+     (when docstring# (println " " docstring#))
+     nil))
 
 ; (declare a b ...) → interns each name as an unbound Var so a
 ; later definition can be referred to before it appears, even
@@ -329,18 +364,38 @@
 (defmacro letfn [bindings & body]
   `(letfn* ~bindings ~@body))
 
-; (doseq [x xs y ys ...] body...) → runs body for each x in xs
-; and, nested inside, each y in ys. The binding form may
-; destructure. Returns nil.
+; (doseq [x xs modifiers... y ys ...] body...) → runs body for
+; each x in xs and, nested inside, each y in ys; nil. A binding
+; form may destructure, and each pair may be followed by
+; `:let [b]`, `:when t` (skip the element) and `:while t` (end
+; that loop), as in `for`; the modifier names are compared as
+; strings so no keyword is interned at boot. One loop per pair:
+;   (loop* [s (seq xs)]
+;     (if s (let [x (first s)] <modifiers around
+;                               (do (doseq [rest...] body...) (recur (next s)))>)
+;           nil))
 (defmacro doseq [bindings & body]
   (if (empty? bindings)
     `(do ~@body nil)
-    `(loop* [s# (seq ~(second bindings))]
-       (if s#
-         (let [~(first bindings) (first s#)]
-           (doseq ~(vec (rest (rest bindings))) ~@body)
-           (recur (next s#)))
-         nil))))
+    (let* [pat (first bindings)
+           src (second bindings)
+           s (gensym "s")]
+      (loop* [more (rest (rest bindings)) mods (list)]
+        (if (and (seq more) (keyword? (first more)))
+          (recur (rest (rest more)) (cons [(first more) (second more)] mods))
+          (let* [inner (reduce (fn* [inner mod]
+                                 (let* [k (name (first mod)) v (second mod)]
+                                   (cond
+                                     (= k "let") `(let ~v ~inner)
+                                     (= k "when") `(if ~v ~inner (recur (next ~s)))
+                                     (= k "while") `(if ~v ~inner nil)
+                                     true (throw (str "doseq: unknown modifier :" k)))))
+                               `(do (doseq ~(vec more) ~@body) (recur (next ~s)))
+                               mods)]
+            `(loop* [~s (seq ~src)]
+               (if ~s
+                 (let [~pat (first ~s)] ~inner)
+                 nil))))))))
 
 ; ============================================================
 ; Threading macros

@@ -172,12 +172,20 @@ const internal_fns = [_]CoreEntry{
     // extend-protocol / extend-type / satisfies?.
     .{ .name = "#%extend-builtin-impl", .descriptor = &native_extend_builtin_impl },
     .{ .name = "#%extend-default-impl", .descriptor = &native_extend_default_impl },
+    // try: the keyword-matcher test the expander emits.
+    .{ .name = "#%catch-matches?", .descriptor = &native_catch_matches },
+    // `& {:keys ...}`: the rest seq as a map.
+    .{ .name = "#%kwargs", .descriptor = &native_kwargs },
 };
 
 /// The part of nexis.core written in nexis itself, embedded at
 /// compile time. Evaluated after `installCore` so its definitions
 /// can use the natives. Add composite macros and fns to
-/// `src/stdlib/core.nx`, not here.
+/// `src/stdlib/core.nx`, not here. A keyword literal in that file
+/// is interned at boot, ahead of every keyword a script reads, and
+/// a map's iteration order is a function of intern order, so the
+/// file builds any keyword it needs at run time (`(keyword "x")`)
+/// and `test/nextomic/*.out` stay as they are.
 pub const CORE_NX_SOURCE: []const u8 = @embedFile("stdlib/core.nx");
 /// The `nextomic` namespace's sugar (`with-conn`), bootstrapped after
 /// `installNextomic` with that namespace current.
@@ -191,6 +199,7 @@ const CoreEntry = struct {
 const core_fns = [_]CoreEntry{
     // Sequence primitives.
     .{ .name = "list", .descriptor = &native_list },
+    .{ .name = "list*", .descriptor = &native_list_star },
     .{ .name = "cons", .descriptor = &native_cons },
     .{ .name = "first", .descriptor = &native_first },
     .{ .name = "rest", .descriptor = &native_rest },
@@ -290,6 +299,23 @@ const core_fns = [_]CoreEntry{
     .{ .name = "namespace", .descriptor = &native_namespace },
     .{ .name = "keyword", .descriptor = &native_keyword },
     .{ .name = "symbol", .descriptor = &native_symbol },
+    .{ .name = "gensym", .descriptor = &native_gensym },
+    // Exceptions as maps (PLAN Amendment Log, exceptions are values).
+    .{ .name = "ex-info", .descriptor = &native_ex_info },
+    .{ .name = "ex-data", .descriptor = &native_ex_data },
+    .{ .name = "ex-message", .descriptor = &native_ex_message },
+    // Early exit from a fold.
+    .{ .name = "reduced", .descriptor = &native_reduced },
+    .{ .name = "reduced?", .descriptor = &native_reduced_q },
+    // The compiler at run time.
+    .{ .name = "macroexpand-1", .descriptor = &native_macroexpand_1 },
+    .{ .name = "macroexpand", .descriptor = &native_macroexpand },
+    .{ .name = "read-string", .descriptor = &native_read_string },
+    // Metadata (PLAN §8.5).
+    .{ .name = "meta", .descriptor = &native_meta },
+    .{ .name = "with-meta", .descriptor = &native_with_meta },
+    .{ .name = "reset-meta!", .descriptor = &native_reset_meta },
+    .{ .name = "alter-meta!", .descriptor = &native_alter_meta },
     .{ .name = "boolean", .descriptor = &native_boolean },
     .{ .name = "list?", .descriptor = &native_list_q },
     .{ .name = "seq?", .descriptor = &native_seq_q },
@@ -514,6 +540,20 @@ const native_name = NativeFn{ .name = "name", .min_arity = 1, .max_arity = 1, .c
 const native_namespace = NativeFn{ .name = "namespace", .min_arity = 1, .max_arity = 1, .call = &fnNamespace };
 const native_keyword = NativeFn{ .name = "keyword", .min_arity = 1, .max_arity = 2, .call = &fnKeyword };
 const native_symbol = NativeFn{ .name = "symbol", .min_arity = 1, .max_arity = 2, .call = &fnSymbol };
+const native_gensym = NativeFn{ .name = "gensym", .min_arity = 0, .max_arity = 1, .call = &fnGensym };
+const native_ex_info = NativeFn{ .name = "ex-info", .min_arity = 2, .max_arity = 3, .call = &fnExInfo };
+const native_ex_data = NativeFn{ .name = "ex-data", .min_arity = 1, .max_arity = 1, .call = &fnExData };
+const native_ex_message = NativeFn{ .name = "ex-message", .min_arity = 1, .max_arity = 1, .call = &fnExMessage };
+const native_reduced = NativeFn{ .name = "reduced", .min_arity = 1, .max_arity = 1, .call = &fnReduced };
+const native_reduced_q = NativeFn{ .name = "reduced?", .min_arity = 1, .max_arity = 1, .call = &fnReducedQ };
+const native_macroexpand_1 = NativeFn{ .name = "macroexpand-1", .min_arity = 1, .max_arity = 1, .call = &fnMacroexpand1 };
+const native_macroexpand = NativeFn{ .name = "macroexpand", .min_arity = 1, .max_arity = 1, .call = &fnMacroexpand };
+const native_read_string = NativeFn{ .name = "read-string", .min_arity = 1, .max_arity = 1, .call = &fnReadString };
+const native_list_star = NativeFn{ .name = "list*", .min_arity = 1, .max_arity = null, .call = &fnListStar };
+const native_meta = NativeFn{ .name = "meta", .min_arity = 1, .max_arity = 1, .call = &fnMeta };
+const native_with_meta = NativeFn{ .name = "with-meta", .min_arity = 2, .max_arity = 2, .call = &fnWithMeta };
+const native_reset_meta = NativeFn{ .name = "reset-meta!", .min_arity = 2, .max_arity = 2, .call = &fnResetMeta };
+const native_alter_meta = NativeFn{ .name = "alter-meta!", .min_arity = 2, .max_arity = null, .call = &fnAlterMeta };
 const native_boolean = NativeFn{ .name = "boolean", .min_arity = 1, .max_arity = 1, .call = &fnBoolean };
 const native_list_q = NativeFn{ .name = "list?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
 const native_seq_q = NativeFn{ .name = "seq?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
@@ -603,6 +643,8 @@ const native_extend_record_impl = NativeFn{ .name = "#%extend-record-impl", .min
 // extend-protocol over built-in kinds + Any default + satisfies?.
 const native_extend_builtin_impl = NativeFn{ .name = "#%extend-builtin-impl", .min_arity = 4, .max_arity = 4, .call = &fnExtendBuiltinImpl };
 const native_extend_default_impl = NativeFn{ .name = "#%extend-default-impl", .min_arity = 3, .max_arity = 3, .call = &fnExtendDefaultImpl };
+const native_kwargs = NativeFn{ .name = "#%kwargs", .min_arity = 1, .max_arity = 1, .call = &fnKwargs };
+const native_catch_matches = NativeFn{ .name = "#%catch-matches?", .min_arity = 2, .max_arity = 2, .call = &fnCatchMatches };
 const native_satisfies_q = NativeFn{ .name = "satisfies?", .min_arity = 2, .max_arity = 2, .call = &fnSatisfiesQ };
 
 // nexis.string namespace.
@@ -640,6 +682,18 @@ fn fnList(vm: *VM, args: []const Value) VmError!Value {
         result = list_mod.cons(heap, args[i], result) catch return VmError.OutOfMemory;
     }
     return result;
+}
+
+/// `(list* a b ... seq)` → list of the leading args followed by
+/// every element of `seq`; nil when there is nothing at all, the
+/// way Clojure's returns a nil seq.
+fn fnListStar(vm: *VM, args: []const Value) VmError!Value {
+    var items: std.ArrayList(Value) = .empty;
+    defer items.deinit(vm.allocator);
+    items.appendSlice(vm.allocator, args[0 .. args.len - 1]) catch return VmError.OutOfMemory;
+    try appendSeqValues(vm, args[args.len - 1], &items);
+    if (items.items.len == 0) return value_mod.nilValue();
+    return try buildListFromSlice(vm, items.items);
 }
 
 /// `(cons x s)` → new cons cell with `x` as head and `s` as
@@ -1116,8 +1170,37 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     while (try it.next()) |x| {
         const pair = [_]Value{ acc, x };
         acc = try vm.callValue(f, &pair);
+        if (isReduced(vm, acc)) return reducedValue(acc);
     }
     return acc;
+}
+
+/// `(reduced x)` → a value `reduce` returns at once, unwrapped;
+/// a one-field record of the type `nexis.core/Reduced`, so
+/// `reduced?` is a type test and `@` reads the value back.
+fn fnReduced(vm: *VM, args: []const Value) VmError!Value {
+    const type_id = vm.ensureReducedType() catch return VmError.OutOfMemory;
+    const heap = vm.ensureHeap();
+    const key = vm.ensureInterner().internKeywordValue("val") catch return VmError.OutOfMemory;
+    const empty = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    const fields = champ_mod.mapAssoc(heap, empty, key, args[0], &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+    return record_mod.make(heap, type_id, fields) catch VmError.OutOfMemory;
+}
+
+fn fnReducedQ(vm: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(isReduced(vm, args[0]));
+}
+
+fn isReduced(vm: *const VM, v: Value) bool {
+    const type_id = vm.reduced_type_id orelse return false;
+    return v.kind() == .record and record_mod.typeId(v) == type_id;
+}
+
+/// The value inside a `reduced` record.
+fn reducedValue(r: Value) Value {
+    var it = champ_mod.mapIter(record_mod.fieldsOf(r));
+    const entry = it.next() orelse return value_mod.nilValue();
+    return entry.value;
 }
 
 /// `(reduce-kv f init m)` → `(f acc k v)` over a map's entries or
@@ -1132,6 +1215,7 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
             var it = champ_mod.mapIter(if (coll.kind() == .record) record_mod.fieldsOf(coll) else coll);
             while (it.next()) |e| {
                 acc = try vm.callValue(f, &.{ acc, e.key, e.value });
+                if (isReduced(vm, acc)) return reducedValue(acc);
             }
         },
         .persistent_vector => {
@@ -1139,6 +1223,7 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
             var i: usize = 0;
             while (i < n) : (i += 1) {
                 acc = try vm.callValue(f, &.{ acc, value_mod.fromFixnum(@intCast(i)).?, vector_mod.nth(coll, i) });
+                if (isReduced(vm, acc)) return reducedValue(acc);
             }
         },
         else => return VmError.KindMismatch,
@@ -1873,7 +1958,10 @@ fn fnReductions(vm: *VM, args: []const Value) VmError!Value {
     results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
     while (try it.next()) |x| {
         acc = try vm.callValue(f, &.{ acc, x });
+        const stop = isReduced(vm, acc);
+        if (stop) acc = reducedValue(acc);
         results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
+        if (stop) break;
     }
     return try buildListFromSlice(vm, results.items);
 }
@@ -2252,6 +2340,148 @@ fn fnSymbol(vm: *VM, args: []const Value) VmError!Value {
     }
     if (args[0].kind() == .symbol) return args[0];
     return vm.ensureInterner().internSymbolValue(try internedName(vm, args[0])) catch |err| internFailure(err);
+}
+
+// =============================================================================
+// Exceptions as maps
+// =============================================================================
+
+/// `(ex-info msg data)` / `(ex-info msg data cause)` → the map
+/// `{:message msg :data data}` (+ `:cause`) for `throw`; `catch`
+/// takes it by `any` or by the `:error` of its data. Keys are
+/// interned at the call, not at boot.
+fn fnExInfo(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    const interner = vm.ensureInterner();
+    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    const names = [_][]const u8{ "message", "data", "cause" };
+    for (args, 0..) |v, i| {
+        const key = interner.internKeywordValue(names[i]) catch return VmError.OutOfMemory;
+        m = champ_mod.mapAssoc(heap, m, key, v, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+    }
+    return m;
+}
+
+/// `(ex-data e)` → the `:data` of a map, nil for anything else.
+fn fnExData(vm: *VM, args: []const Value) VmError!Value {
+    return exEntry(vm, args[0], "data");
+}
+
+/// `(ex-message e)` → the `:message` of a map, nil for anything else.
+fn fnExMessage(vm: *VM, args: []const Value) VmError!Value {
+    return exEntry(vm, args[0], "message");
+}
+
+fn exEntry(vm: *VM, e: Value, name: []const u8) VmError!Value {
+    if (e.kind() != .persistent_map) return value_mod.nilValue();
+    const key = vm.ensureInterner().internKeywordValue(name) catch return VmError.OutOfMemory;
+    return try vm_mod.lookup(e, key, value_mod.nilValue());
+}
+
+// =============================================================================
+// The compiler at run time (vm.CompilerHooks)
+// =============================================================================
+
+/// `(macroexpand-1 form)` → the form after one macro step; a form
+/// that is not a macro call comes back as it is.
+fn fnMacroexpand1(vm: *VM, args: []const Value) VmError!Value {
+    const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
+    return (try hooks.expand_once(hooks.user_data, vm, args[0])) orelse args[0];
+}
+
+/// `(macroexpand form)` → `macroexpand-1` repeated until the head
+/// is no longer a macro; subforms are left alone, as in Clojure.
+fn fnMacroexpand(vm: *VM, args: []const Value) VmError!Value {
+    const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
+    var form = args[0];
+    while (try hooks.expand_once(hooks.user_data, vm, form)) |next| form = next;
+    return form;
+}
+
+/// `(read-string s)` → the first form of `s` as data; a string
+/// that does not read throws `:reader-error`.
+fn fnReadString(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
+    return try hooks.read_string(hooks.user_data, vm, string_mod.asBytes(args[0]));
+}
+
+// =============================================================================
+// Metadata (PLAN §8.5, SEMANTICS.md §7)
+// =============================================================================
+//
+// A list, vector, map or set carries its metadata map in the heap
+// header's `meta` slot; a Var carries it in `Var.meta`. Metadata
+// never takes part in equality, hashing, printing or the codec.
+
+fn carriesHeaderMeta(k: Kind) bool {
+    return k == .list or k == .persistent_vector or k == .persistent_map or k == .persistent_set;
+}
+
+/// `(meta x)` → the metadata map of a list, vector, map, set or Var;
+/// nil for anything else or when none is attached.
+fn fnMeta(_: *VM, args: []const Value) VmError!Value {
+    const x = args[0];
+    if (x.kind() == .var_) return VM.asVar(x).meta;
+    if (!carriesHeaderMeta(x.kind())) return value_mod.nilValue();
+    const m = heap_mod.Heap.asHeapHeader(x).getMeta() orelse return value_mod.nilValue();
+    return champ_mod.valueFromMapHeader(m);
+}
+
+/// `(with-meta x m)` → a value equal to `x` carrying `m` (a map or
+/// nil) as its metadata. The root object is copied, so `x` keeps its
+/// own; the copy shares every node below the root. A kind that
+/// cannot carry metadata is `:no-metadata-on-immediate`; a Var's
+/// metadata changes in place through `reset-meta!` / `alter-meta!`.
+fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
+    const x = args[0];
+    const m = args[1];
+    if (!m.isNil() and m.kind() != .persistent_map) return VmError.KindMismatch;
+    if (!carriesHeaderMeta(x.kind())) return vm.throwKeyword("no-metadata-on-immediate");
+    const h = heap_mod.Heap.asHeapHeader(x);
+    const body = heap_mod.Heap.bodyBytes(h);
+    const copy = vm.ensureHeap().alloc(x.kind(), body.len) catch return VmError.OutOfMemory;
+    @memcpy(heap_mod.Heap.bodyBytes(copy), body);
+    copy.kind = h.kind;
+    copy.flags = h.flags & ~heap_mod.flag_has_meta;
+    copy.setMeta(if (m.isNil()) null else heap_mod.Heap.asHeapHeader(m));
+    return .{ .tag = x.tag, .payload = @intFromPtr(copy) };
+}
+
+/// `(reset-meta! v m)` → sets the Var's metadata to `m` (a map or
+/// nil) and returns it.
+fn fnResetMeta(_: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .var_) return VmError.KindMismatch;
+    if (!args[1].isNil() and args[1].kind() != .persistent_map) return VmError.KindMismatch;
+    VM.asVar(args[0]).meta = args[1];
+    return args[1];
+}
+
+/// `(alter-meta! v f & args)` → sets the Var's metadata to
+/// `(apply f (meta v) args)` and returns it.
+fn fnAlterMeta(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .var_) return VmError.KindMismatch;
+    const v = VM.asVar(args[0]);
+    const call_args = vm.allocator.alloc(Value, args.len - 1) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(call_args);
+    call_args[0] = v.meta;
+    @memcpy(call_args[1..], args[2..]);
+    const next = try vm.callValue(args[1], call_args);
+    if (!next.isNil() and next.kind() != .persistent_map) return VmError.KindMismatch;
+    v.meta = next;
+    return next;
+}
+
+/// `(gensym)` / `(gensym prefix)` → a fresh symbol `prefix__N`
+/// (`G__N` by default), N counting up for the process.
+var gensym_next: u64 = 0;
+
+fn fnGensym(vm: *VM, args: []const Value) VmError!Value {
+    const prefix: []const u8 = if (args.len == 1) try internedName(vm, args[0]) else "G";
+    gensym_next += 1;
+    var buf: [256]u8 = undefined;
+    const name = std.fmt.bufPrint(&buf, "{s}__{d}", .{ prefix, gensym_next }) catch return VmError.InvalidArgument;
+    return vm.ensureInterner().internSymbolValue(name) catch |err| internFailure(err);
 }
 
 fn fnBoolean(_: *VM, args: []const Value) VmError!Value {
@@ -2699,6 +2929,7 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
             break :blk var_obj.root;
         },
         .atom => atom_mod.getValue(x),
+        .record => if (isReduced(vm, x)) reducedValue(x) else VmError.NotDerefable,
         else => VmError.NotDerefable,
     };
 }
@@ -3664,6 +3895,42 @@ fn fnExtendBuiltinImpl(vm: *VM, args: []const Value) VmError!Value {
         error.OutOfMemory => return VmError.OutOfMemory,
     };
     return value_mod.nilValue();
+}
+
+/// `(#%kwargs rest)` → the map a `& {...}` pattern destructures:
+/// `rest` as alternating keys and values, a single trailing map
+/// as itself, nil or empty as `{}`; an odd count is
+/// `:invalid-argument`.
+fn fnKwargs(vm: *VM, args: []const Value) VmError!Value {
+    var items = try collectSeq(vm, args[0]);
+    defer items.deinit(vm.allocator);
+    if (items.items.len == 1 and (items.items[0].kind() == .persistent_map or items.items[0].kind() == .record)) return items.items[0];
+    if (items.items.len % 2 != 0) return VmError.InvalidArgument;
+    const heap = vm.ensureHeap();
+    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    var i: usize = 0;
+    while (i < items.items.len) : (i += 2) {
+        m = champ_mod.mapAssoc(heap, m, items.items[i], items.items[i + 1], &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+    }
+    return m;
+}
+
+/// `(#%catch-matches? v tag)` → whether `(catch tag e ...)` takes the
+/// thrown `v`: `v` is `tag` itself, or a map or record whose
+/// `:error` entry is `tag`.
+fn fnCatchMatches(vm: *VM, args: []const Value) VmError!Value {
+    const v = args[0];
+    const tag = args[1];
+    if (dispatch_mod_alias.equal(v, tag)) return value_mod.fromBool(true);
+    if (v.kind() != .persistent_map and v.kind() != .record) return value_mod.fromBool(false);
+    const interner = vm.ensureInterner();
+    const error_key = interner.internKeywordValue("error") catch return VmError.OutOfMemory;
+    if (dispatch_mod_alias.equal(try vm_mod.lookup(v, error_key, value_mod.nilValue()), tag)) return value_mod.fromBool(true);
+    // An `ex-info` map: its data's `:error`.
+    const data_key = interner.internKeywordValue("data") catch return VmError.OutOfMemory;
+    const data = try vm_mod.lookup(v, data_key, value_mod.nilValue());
+    if (data.kind() != .persistent_map) return value_mod.fromBool(false);
+    return value_mod.fromBool(dispatch_mod_alias.equal(try vm_mod.lookup(data, error_key, value_mod.nilValue()), tag));
 }
 
 fn fnExtendDefaultImpl(vm: *VM, args: []const Value) VmError!Value {

@@ -59,9 +59,10 @@
 //!     `slot_count`; branch-local temps are not reclaimed across the
 //!     merge point. Constants are not deduplicated.
 //!   - `recur` targeting a variadic fn raises `UnsupportedFeature`.
-//!   - The only catch matcher is `any`; a catch binding captured by
-//!     an inner fn raises `UnsupportedFeature`.
-//!   - `letfn*` bindings have no rest param (`UnsupportedFeature`).
+//!   - The primitive `try` takes one `(catch any binding ...)`; the
+//!     expander lowers several catch clauses and keyword matchers
+//!     onto it (MACROEXPAND.md §8b). A catch binding captured by an
+//!     inner fn raises `UnsupportedFeature`.
 //!   - Var-level shadowing of `+` / `<` does not defeat inlining;
 //!     only lexical shadowing does.
 
@@ -335,6 +336,8 @@ pub const Tiny = union(enum) {
 pub const FnBinding = struct {
     name: []const u8,
     params: []const []const u8,
+    /// `& rest` binding name, when the fn is variadic.
+    rest_param: ?[]const u8 = null,
     body: *const Tiny,
 };
 
@@ -1096,8 +1099,10 @@ pub const DeclaredNames = struct {
         for (items) |item| try self.declareForm(item);
         if (items.len < 2 or items[0].datum != .symbol or items[0].datum.symbol.ns != null) return;
         const head = items[0].datum.symbol.name;
-        if (items[1].datum != .symbol or items[1].datum.symbol.ns != null) return;
-        const name = items[1].datum.symbol.name;
+        // `^meta` on the name wraps it in with_meta.
+        const name_form = if (items[1].datum == .with_meta) items[1].datum.with_meta.target else items[1];
+        if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return;
+        const name = name_form.datum.symbol.name;
         if (std.mem.eql(u8, head, "def") or std.mem.eql(u8, head, "defn") or std.mem.eql(u8, head, "defmacro")) {
             try self.declare(name);
         } else if (std.mem.eql(u8, head, "defrecord")) {
@@ -1169,6 +1174,16 @@ fn symbolResolves(ctx: LowerCtx, declared: *const DeclaredNames, name: []const u
     return declared.contains(name);
 }
 
+/// The namespace a qualified symbol's prefix names from `ns`: an
+/// alias registered there resolves to its target, any other
+/// prefix is a namespace name. Null when nothing is registered
+/// under it.
+fn qualifiedTarget(ns: *const vm.Namespace, ns_prefix: []const u8) ?*vm.Namespace {
+    const registry = ns.registry orelse return null;
+    const effective = if (ns.aliases_initialized) (ns.lookupAlias(ns_prefix) orelse ns_prefix) else ns_prefix;
+    return registry.lookupNs(effective);
+}
+
 /// Helper used by `lowerList` to test whether a head symbol is a
 /// shadowable intrinsic. Special forms are NOT shadowable; they
 /// have their own switch arm.
@@ -1212,8 +1227,19 @@ fn lowerFormEnv(
         .symbol => |name| blk: {
             // Qualified symbols `ns/name` lower to
             // `Tiny.qualified_symbol`; compileSymbol handles
-            // dispatch through the namespace registry.
+            // dispatch through the namespace registry. One that
+            // names the current namespace is checked like a bare
+            // symbol, so a forward reference a macro qualified
+            // still resolves through the file's declarations.
             if (name.ns) |ns_prefix| {
+                if (ctx.declared) |declared| {
+                    if (ctx.namespace) |ns| {
+                        if (qualifiedTarget(ns, ns_prefix) == ns and ns.lookupLocal(name.name) == null and !declared.contains(name.name)) {
+                            if (ctx.diag) |d| d.span = form.origin;
+                            return CompileError.UnresolvedSymbol;
+                        }
+                    }
+                }
                 break :blk try allocTiny(allocator, .{ .qualified_symbol = .{ .ns = ns_prefix, .name = name.name } });
             }
             if (ctx.declared) |declared| {
@@ -1307,15 +1333,13 @@ fn lowerFormEnv(
 /// any expression evaluating to a closure) or a special form
 /// (head is a reserved symbol like `if`, `do`, `let*`, etc.).
 ///
-/// Empty `()` is rejected (`MalformedForm`): source `()` is
-/// invalid as an expression; the empty list value is written
-/// `'()`.
+/// The literal `()` is the empty list, as in Clojure.
 fn lowerList(
     allocator: std.mem.Allocator,
     items: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (items.len == 0) return CompileError.MalformedForm;
+    if (items.len == 0) return try allocTiny(allocator, .{ .list_construct = &.{} });
     // Head-symbol dispatch only fires when head is an unqualified
     // symbol. Qualified symbols (`foo/x`) and non-symbol heads
     // (calls of computed values) fall through to ordinary call.
@@ -1658,15 +1682,13 @@ fn lowerCall(
 
 /// Lower a sequence of body forms into a single Tiny expression.
 /// Multi-form bodies wrap in `Tiny.do_`; single-form bodies pass
-/// through; empty body forms raise `MalformedForm` (caller's
-/// responsibility — `(do)` is fine because it goes through
-/// lowerDo directly, not this helper).
+/// through; an empty body is nil, as `(do)` is.
 fn lowerBody(
     allocator: std.mem.Allocator,
     body_items: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (body_items.len == 0) return CompileError.MalformedForm;
+    if (body_items.len == 0) return try allocTiny(allocator, .nil);
     if (body_items.len == 1) return try lowerFormEnv(allocator, body_items[0], ctx);
     const exprs = try allocator.alloc(*const Tiny, body_items.len);
     for (body_items, 0..) |item, i| {
@@ -1747,7 +1769,7 @@ fn lowerLetStar(
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (args.len < 2) return CompileError.MalformedForm;
+    if (args.len < 1) return CompileError.MalformedForm;
     const binding_vec = try expectVector(args[0]);
     if (binding_vec.len % 2 != 0) return CompileError.MalformedForm;
     const n_bindings = binding_vec.len / 2;
@@ -1777,7 +1799,7 @@ fn lowerLoopStar(
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (args.len < 2) return CompileError.MalformedForm;
+    if (args.len < 1) return CompileError.MalformedForm;
     const binding_vec = try expectVector(args[0]);
     if (binding_vec.len % 2 != 0) return CompileError.MalformedForm;
     const n_bindings = binding_vec.len / 2;
@@ -1821,12 +1843,12 @@ fn lowerFnStar(
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (args.len < 2) return CompileError.MalformedForm;
-    // Optional self-name: first arg is a symbol (and we have
-    // at least 3 args total: name, params, body...).
+    if (args.len < 1) return CompileError.MalformedForm;
+    // Optional self-name: first arg is a symbol, the param vector
+    // follows it; the body may be empty.
     var pos: usize = 0;
     var self_name: ?[]const u8 = null;
-    if (args[0].datum == .symbol and args.len >= 3) {
+    if (args[0].datum == .symbol and args.len >= 2) {
         self_name = try expectUnqualifiedSymbol(args[0]);
         pos = 1;
     }
@@ -1860,7 +1882,7 @@ fn lowerLetFnStar(
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (args.len < 2) return CompileError.MalformedForm;
+    if (args.len < 1) return CompileError.MalformedForm;
     const binding_vec = try expectVector(args[0]);
     const bindings = try allocator.alloc(FnBinding, binding_vec.len);
 
@@ -1873,16 +1895,14 @@ fn lowerLetFnStar(
             .list => |items| items,
             else => return CompileError.MalformedForm,
         };
-        if (entry_items.len < 3) return CompileError.MalformedForm;
+        if (entry_items.len < 2) return CompileError.MalformedForm;
         const name = try expectUnqualifiedSymbol(entry_items[0]);
         const param_vec = try expectVector(entry_items[1]);
         const parsed = try parseParams(allocator, param_vec);
-        // letfn* bindings have no rest param
-        // (Tiny.letfn_star.FnBinding has no rest_param field).
-        if (parsed.rest_param != null) return CompileError.UnsupportedFeature;
         bindings[i] = .{
             .name = name,
             .params = parsed.params,
+            .rest_param = parsed.rest_param,
             .body = undefined, // patched in 2. below
         };
         try local.lexical_names.put(allocator, name);
@@ -1895,6 +1915,7 @@ fn lowerLetFnStar(
         var body_env = LowerEnv{ .parent = &local };
         defer body_env.deinit(allocator);
         for (bindings[i].params) |p| try body_env.lexical_names.put(allocator, p);
+        if (bindings[i].rest_param) |rp| try body_env.lexical_names.put(allocator, rp);
         bindings[i].body = try lowerBody(allocator, entry_items[2..], ctx.withEnv(&body_env));
     }
 
@@ -1940,7 +1961,7 @@ fn lowerDefn(
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (args.len < 3) return CompileError.MalformedForm;
+    if (args.len < 2) return CompileError.MalformedForm;
     const name = try expectUnqualifiedSymbol(args[0]);
     const param_vec = try expectVector(args[1]);
     const parsed = try parseParams(allocator, param_vec);
@@ -1974,7 +1995,8 @@ fn lowerVarRef(
 }
 
 /// Lower `(try body+ (catch any binding handler+) (finally ...)?)`.
-/// The only catch matcher is `any`.
+/// The only catch matcher at this level is `any`; the expander
+/// lowers keyword matchers and several clauses onto it.
 ///
 /// Form syntax:
 ///   (try body... (catch any binding handler...))
@@ -1990,7 +2012,7 @@ fn lowerTry(
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (args.len < 2) return CompileError.MalformedForm;
+    if (args.len < 1) return CompileError.MalformedForm;
 
     // Last arg should be the catch (or finally).
     // Partition by walking from the end: optional finally
@@ -2013,9 +2035,9 @@ fn lowerTry(
         }
     }
 
-    if (end < 2) return CompileError.MalformedForm;
+    if (end < 1) return CompileError.MalformedForm;
     const catch_form = args[end - 1];
-    if (catch_form.datum != .list or catch_form.datum.list.len < 4) {
+    if (catch_form.datum != .list or catch_form.datum.list.len < 3) {
         return CompileError.MalformedForm;
     }
     const catch_items = catch_form.datum.list;
@@ -2150,8 +2172,84 @@ fn compileEvalCallback(
     const routine_storage = try data.persistent_allocator.create(vm.Routine);
     routine_storage.* = compiled.toRoutine("defmacro-eval");
     out_vm.* = try vm.VM.init(data.persistent_allocator, routine_storage);
+    out_vm.borrowed_interner = data.interner;
     return try out_vm.run();
 }
+
+/// The compiler as `macroexpand-1` and `read-string` reach it at
+/// run time (`vm.CompilerHooks`). The runtime that boots a VM owns
+/// one of these for as long as the VM lives and calls `install`.
+pub const RuntimeHooks = struct {
+    host_macros: *const expand_mod.HostMacroTable,
+    registry: *vm.NamespaceRegistry,
+    interner: *intern_mod.Interner,
+    load_callback: ?expand_mod.LoadCallback = null,
+
+    pub fn install(self: *RuntimeHooks, v: *vm.VM) void {
+        v.compiler_hooks = .{
+            .user_data = @ptrCast(self),
+            .expand_once = &expandOnceHook,
+            .read_string = &readStringHook,
+        };
+    }
+
+    /// An expander over the current namespace that builds its
+    /// values on the VM's heap; Forms live in `arena`.
+    fn context(self: *RuntimeHooks, arena: std.mem.Allocator, v: *vm.VM) expand_mod.ExpandContext {
+        return .{
+            .allocator = arena,
+            .interner = self.interner,
+            .host_macros = self.host_macros,
+            .namespace = self.registry.current,
+            .registry = self.registry,
+            .load_callback = self.load_callback,
+            .value_heap = v.ensureHeap(),
+        };
+    }
+
+    fn expandOnceHook(user_data: *anyopaque, v: *vm.VM, form_value: value_mod.Value) vm.VmError!?value_mod.Value {
+        const self: *RuntimeHooks = @ptrCast(@alignCast(user_data));
+        var arena = std.heap.ArenaAllocator.init(v.allocator);
+        defer arena.deinit();
+        var ctx = self.context(arena.allocator(), v);
+        const origin = reader_mod.SrcSpan{ .pos = 0, .len = 0 };
+        const form = expand_mod.valueToForm(&ctx, form_value, origin) catch |err|
+            return failure(v, err, "macro-expansion-failure");
+        const expanded = expand_mod.expandOnce(&ctx, form) catch |err|
+            return failure(v, err, "macro-expansion-failure");
+        const out = expanded orelse return null;
+        return expand_mod.formToValue(&ctx, out) catch |err|
+            return failure(v, err, "macro-expansion-failure");
+    }
+
+    /// The first form of `source`; the rest is ignored, as in
+    /// Clojure. Syntax-quote, unquote and `^meta` do not read as
+    /// data and are reader errors here.
+    fn readStringHook(user_data: *anyopaque, v: *vm.VM, source: []const u8) vm.VmError!value_mod.Value {
+        const self: *RuntimeHooks = @ptrCast(@alignCast(user_data));
+        var arena = std.heap.ArenaAllocator.init(v.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var p = reader_mod.parser.parseProgram(a, source) catch |err|
+            return failure(v, err, "reader-error");
+        defer p.parser.deinit();
+        var reader = reader_mod.Reader.init(a, source);
+        defer reader.deinit();
+        const forms = reader.readProgram(p.sexp) catch |err|
+            return failure(v, err, "reader-error");
+        if (forms.len == 0) return v.throwKeyword("reader-error");
+        var ctx = self.context(a, v);
+        return expand_mod.formToValue(&ctx, forms[0]) catch |err|
+            return failure(v, err, "reader-error");
+    }
+
+    /// Out of memory stays an error; anything else the hook could
+    /// not do throws `tag`.
+    fn failure(v: *vm.VM, err: anyerror, tag: []const u8) vm.VmError {
+        if (err == error.OutOfMemory) return vm.VmError.OutOfMemory;
+        return v.throwKeyword(tag);
+    }
+};
 
 /// Full form-compile with both namespace AND interner.
 /// Without an Interner, quoted symbols/keywords raise
@@ -2739,6 +2837,7 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
                 defer fn_env.deinit(allocator);
                 try fn_env.unionWith(allocator, &local_env);
                 for (b.params) |p| try fn_env.put(allocator, p);
+                if (b.rest_param) |rp| try fn_env.put(allocator, rp);
                 try freeVars(allocator, b.body, &fn_env, out);
             }
             try freeVars(allocator, l.body, &local_env, out);
@@ -2905,6 +3004,7 @@ fn capturedByDescendantFns(
                 var fn_env: NameSet = .{};
                 defer fn_env.deinit(allocator);
                 for (b.params) |p| try fn_env.put(allocator, p);
+                if (b.rest_param) |rp| try fn_env.put(allocator, rp);
                 for (l.bindings) |b2| try fn_env.put(allocator, b2.name);
                 var fn_free: NameSet = .{};
                 defer fn_free.deinit(allocator);
@@ -3221,17 +3321,18 @@ fn compileQualifiedSymbol(
     dst: u12,
 ) CompileError!void {
     const current_ns = e.namespace orelse return CompileError.UnresolvedSymbol;
-    const registry = current_ns.registry orelse return CompileError.UnresolvedSymbol;
-    // Alias resolution. If the current namespace
-    // has registered `ns_prefix` as an alias (via
-    // `(require '[real.name :as ns_prefix])`), swap it for the
-    // canonical name before the registry lookup. Otherwise the
-    // prefix is treated as a literal namespace name.
-    const effective_prefix = if (current_ns.aliases_initialized)
-        (current_ns.lookupAlias(ns_prefix) orelse ns_prefix)
-    else
-        ns_prefix;
-    const target_ns = registry.lookupNs(effective_prefix) orelse return CompileError.UnresolvedSymbol;
+    // Alias resolution: a prefix the current namespace registered
+    // via `(require '[real.name :as ns_prefix])` names its target;
+    // any other prefix is a namespace name.
+    const target_ns = qualifiedTarget(current_ns, ns_prefix) orelse return CompileError.UnresolvedSymbol;
+    // The current namespace's own name interns like a bare
+    // symbol, so a forward reference qualified by syntax-quote
+    // works as the bare one does.
+    if (target_ns == current_ns) {
+        const idx = try e.addVarRef(name);
+        try e.emit(vm.asm_.varLoadVar(dst, idx));
+        return;
+    }
     const v = target_ns.lookupLocal(name) orelse return CompileError.UnresolvedSymbol;
     // Reuse the var_table machinery (dedup + table append). We
     // bypass `addVarRef`'s lookup-then-intern path because we
@@ -4041,9 +4142,7 @@ fn compileLetFnStar(
         // is already in scope (so the fn body's references
         // resolve via parent-chain capture); using the
         // self-name machinery here would double-allocate.
-        // letfn* bindings are always fixed-arity (no rest param
-        // syntax in (letfn* [(name [params] body) ...]) form).
-        try compileFn(e, null, b.params, null, b.body, cs);
+        try compileFn(e, null, b.params, b.rest_param, b.body, cs);
     }
 
     // 3. Init each cell with its closure.
@@ -6728,14 +6827,14 @@ test "compile lowerForm: lowerForm of keyword without an interner → Unsupporte
     try testing.expectError(CompileError.UnsupportedFeature, lowerForm(arena.allocator(), &form));
 }
 
-test "compile lowerForm: lowerForm of empty list → MalformedForm" {
-    // Empty `()` as an expression is rejected; the empty list
-    // value is written `'()`.
+test "compile lowerForm: the empty list lowers to an empty list construction" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const empty: []const *reader_mod.Form = &.{};
     const form = reader_mod.Form{ .datum = .{ .list = empty }, .origin = .{ .pos = 0, .len = 0 } };
-    try testing.expectError(CompileError.MalformedForm, lowerForm(arena.allocator(), &form));
+    const t = try lowerForm(arena.allocator(), &form);
+    try testing.expect(t.* == .list_construct);
+    try testing.expectEqual(@as(usize, 0), t.list_construct.len);
 }
 
 test "compile qualified: lowerForm of qualified symbol → Tiny.qualified_symbol" {
@@ -6905,10 +7004,22 @@ test "compile source: (quote foo) symbol via compileSource (no interner) → Uns
     try testing.expectError(CompileError.UnsupportedFeature, compileSource(arena.allocator(), "(quote foo)"));
 }
 
-test "compile source: () empty list → MalformedForm" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "()"));
+test "compile source: () is the empty list" {
+    var r = try runSourceFull("()");
+    defer r.vm_owned.deinit();
+    try testing.expect(r.result.kind() == .list);
+    try testing.expect(list_mod.isEmpty(r.result));
+}
+
+test "compile source: empty bodies are nil" {
+    try expectSourceNil("((fn* []))");
+    try expectSourceNil("((fn* f []))");
+    try expectSourceNil("((fn* [x]) 1)");
+    try expectSourceNil("(let* [x 1])");
+    try expectSourceNil("(loop* [x 1])");
+    try expectSourceNil("(letfn* [(f [])] (f))");
+    try expectSourceNil("(try (throw 1) (catch any e))");
+    try expectSourceNil("(try (catch any e 1))");
 }
 
 // Ordinary-call tests with fn* callees are in the binding-form
@@ -7187,10 +7298,10 @@ test "compile source def: (def 42 5) → ExpectedSymbol" {
     try testing.expectError(CompileError.ExpectedSymbol, compileSource(arena.allocator(), "(def 42 5)"));
 }
 
-test "compile source def: (defn name) without body → MalformedForm" {
+test "compile source def: (defn name) without params → MalformedForm" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(defn f [x])"));
+    try testing.expectError(CompileError.MalformedForm, compileSource(arena.allocator(), "(defn f)"));
 }
 
 test "compile source def: (var) → MalformedForm" {
@@ -7235,15 +7346,10 @@ test "compile shadowing: (do (def + (fn* [a b] 42)) (+ 1 2)) → 3 — Vars do n
     try expectSourceFixnumWithNs("(do (def + (fn* [a b] 42)) (+ 1 2))", 3);
 }
 
-test "compile shadowing: letfn* with rest param → UnsupportedFeature (Tiny FnBinding has no rest)" {
-    // Tiny.letfn_star.FnBinding has no rest_param field, so a
-    // letfn* binding with `& rest` is rejected.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    try testing.expectError(
-        CompileError.UnsupportedFeature,
-        compileSource(arena.allocator(), "(letfn* [(f [a & r] a)] (f 1 2))"),
-    );
+test "compile letfn*: a binding takes a rest param" {
+    try expectSourceFixnum("(letfn* [(f [a & r] a)] (f 1 2))", 1);
+    try expectSourceFixnum("(letfn* [(f [& r] 7)] (f))", 7);
+    try expectSourceFixnum("(letfn* [(f [& r] 7) (g [a & r] (+ a (f)))] (g 1 2 3))", 8);
 }
 
 test "compile shadowing: 'foo via compileSource (no interner) → UnsupportedFeature" {
@@ -7985,24 +8091,6 @@ test "compile quote vector: `[~x ~y] syntax-quote with unquote" {
     try testing.expectEqual(@as(i64, 20), vec_mod.nth(r.result, 1).asFixnum());
 }
 
-test "compile quote vector: syntax-quoted vector + splice → MacroExpansionFailure" {
-    // Vectors don't support splice (binding vectors are built
-    // positionally).
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    const interner = v.ensureInterner();
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    try testing.expectError(
-        CompileError.MacroExpansionFailure,
-        compileSourceFullWithMacros(arena.allocator(), "(let [xs '(1 2)] `[~@xs])", null, interner, &host_macros),
-    );
-}
-
 test "compile quote vector: nested vector in quoted list" {
     var r = try runSourceFull("(quote (a [1 2] b))");
     defer r.vm_owned.deinit();
@@ -8244,7 +8332,19 @@ test "compile try: handler binding visible in handler body" {
     );
 }
 
-test "compile try: try without catch or finally → MalformedForm" {
+test "compile try: try without catch or finally is its body" {
+    var r = try runSourceWithDefaultMacros("(try 1)");
+    defer r.vm_owned.deinit();
+    try testing.expectEqual(@as(i64, 1), r.result.asFixnum());
+}
+
+test "compile try: the primitive accepts only the any matcher" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(CompileError.UnsupportedFeature, compileSource(arena.allocator(), "(try 1 (catch :my-error e e))"));
+}
+
+test "compile try: a symbol matcher other than any is a macro error" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8256,178 +8356,7 @@ test "compile try: try without catch or finally → MalformedForm" {
     defer host_macros.deinit(testing.allocator);
     try testing.expectError(
         CompileError.MacroExpansionFailure,
-        compileSourceFullWithMacros(arena.allocator(), "(try 1)", null, interner, &host_macros),
-    );
-}
-
-// ---- finally clauses end-to-end ----------
-
-test "compile finally: try/catch/finally — normal exit runs finally" {
-    // Body returns 1; catch unused; finally runs but result is
-    // discarded — the try expression's value is 1.
-    try expectFixnumDefaultMacros(
-        "(try 1 (catch any e 99) (finally 42))",
-        1,
-    );
-}
-
-test "compile finally: try/catch/finally — caught throw + finally" {
-    // Body throws :a; catch binds e and returns 7; finally runs
-    // but result discarded — try expression's value is 7.
-    try expectFixnumDefaultMacros(
-        "(try (throw 13) (catch any e 7) (finally 99))",
-        7,
-    );
-}
-
-test "compile finally: try/catch/finally — finally side effect via def" {
-    // The finally body sets a Var; after the try expression
-    // returns, the Var holds the new value. Proves finally
-    // actually ran.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    const ns = v.ensureNamespace();
-    const interner = v.ensureInterner();
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    const src =
-        \\(do
-        \\  (def fired 0)
-        \\  (try
-        \\    1
-        \\    (catch any e e)
-        \\    (finally (def fired 1)))
-        \\  fired)
-    ;
-    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
-    const routine = compiled.toRoutine("p");
-    try v.retargetTop(&routine);
-    const result = try v.run();
-    try testing.expectEqual(@as(i64, 1), result.asFixnum());
-}
-
-test "compile finally: uncaught throw — finally runs then throw propagates" {
-    // Outer try catches; inner try has only finally. Body
-    // throws; inner finally runs (side effect via def); outer
-    // catch receives the original thrown value.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    const ns = v.ensureNamespace();
-    const interner = v.ensureInterner();
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    // Note: a try with finally but no catch is rejected
-    // (catch is required). So we use catch that
-    // rethrows + outer try to test the throw-through-finally
-    // path.
-    const src =
-        \\(do
-        \\  (def fired 0)
-        \\  (try
-        \\    (try
-        \\      (throw 42)
-        \\      (catch any e (throw e))
-        \\      (finally (def fired 1)))
-        \\    (catch any e e)))
-    ;
-    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
-    const routine = compiled.toRoutine("p");
-    try v.retargetTop(&routine);
-    const result = try v.run();
-    // The outer try received 42 from the inner rethrow.
-    try testing.expectEqual(@as(i64, 42), result.asFixnum());
-    // The inner finally ran (fired = 1).
-    const fired_var = v.namespace.?.lookup("fired").?;
-    try testing.expectEqual(@as(i64, 1), fired_var.root.asFixnum());
-}
-
-test "compile finally: throw inside finally replaces pending value" {
-    // Body returns 1; finally throws :replaced. Clojure
-    // semantics: the new throw replaces
-    // whatever was happening; outer catch receives :replaced
-    // (not 1).
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    const ns = v.ensureNamespace();
-    const interner = v.ensureInterner();
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    const src =
-        \\(try
-        \\  (try
-        \\    1
-        \\    (catch any e e)
-        \\    (finally (throw 99)))
-        \\  (catch any e e))
-    ;
-    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
-    const routine = compiled.toRoutine("p");
-    try v.retargetTop(&routine);
-    const result = try v.run();
-    // The outer catch sees 99 (the finally's throw), not the
-    // body's value 1.
-    try testing.expectEqual(@as(i64, 99), result.asFixnum());
-}
-
-test "compile finally: finally body runs on caught-throw exit" {
-    // Body throws → catch caught it → finally runs after.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    const ns = v.ensureNamespace();
-    const interner = v.ensureInterner();
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    const src =
-        \\(do
-        \\  (def fired 0)
-        \\  (try
-        \\    (throw 7)
-        \\    (catch any e e)
-        \\    (finally (def fired 1)))
-        \\  fired)
-    ;
-    const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
-    const routine = compiled.toRoutine("p");
-    try v.retargetTop(&routine);
-    const result = try v.run();
-    try testing.expectEqual(@as(i64, 1), result.asFixnum());
-}
-
-test "compile try: non-any matcher → UnsupportedFeature" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    const interner = v.ensureInterner();
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    try testing.expectError(
-        CompileError.UnsupportedFeature,
-        compileSourceFullWithMacros(
-            arena.allocator(),
-            "(try 1 (catch :my-error e e))",
-            null,
-            interner,
-            &host_macros,
-        ),
+        compileSourceFullWithMacros(arena.allocator(), "(try 1 (catch Exception e e))", null, interner, &host_macros),
     );
 }
 

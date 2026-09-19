@@ -1,17 +1,17 @@
 ; examples/try-catch.nx — try / catch / throw / finally
-; (steps #9.1 + #9.2).
 ;
-; v1 supports:
-;   - throw any value (slot/constant/var operand)
-;   - catch-any binding
+;   - throw any value; a map {:error :tag ...} says more, and
+;     (ex-info msg data) builds {:message msg :data data}
+;   - (catch any e ...) takes every value, (catch :tag e ...) the
+;     value :tag or a map whose :error is :tag; clauses in order
 ;   - cross-frame propagation (callee throws, caller catches)
-;   - finally clauses (runs on normal exit, caught throw,
-;     uncaught throw); throw inside finally overrides
+;   - finally runs on normal exit, caught throw and uncaught
+;     throw, with or without a catch; throw inside finally
+;     overrides
+;   - runtime errors (:divide-by-zero, :kind-mismatch, ...) are
+;     thrown keywords, so they are caught the same way
 ;
-; Limitations:
-;   - recur inside try not supported (wrap try around loop)
-;   - runtime VM errors (KindMismatch etc.) not catchable
-;   - only `(catch any binding handler)` matcher in v1
+; recur inside try is not supported (wrap try around loop).
 
 (defn safe-divide [a b]
   (try
@@ -24,4 +24,18 @@
     (finally :always-runs)))   ; finally body runs but value discarded
 
 ; Result: 42. Finally body always runs; its value is ignored.
-(safe-divide 42 1)
+(println (safe-divide 42 1))
+
+; Catch by tag: the runtime's :divide-by-zero, a map by its :error,
+; and a finally without any catch.
+(println (try (/ 1 0) (catch :divide-by-zero e :dz)))
+(println (try (throw {:error :boom :detail 7})
+              (catch :other e :not-this)
+              (catch :boom e (:detail e))))
+(println (try (try (throw :x) (finally (println :cleanup)))
+              (catch any e [:outer e])))
+
+; ex-info: a map with :message and :data; a tag catches it through
+; the :error of its data, and ex-message / ex-data read it back.
+(println (try (throw (ex-info "missing" {:error :not-found :id 3}))
+              (catch :not-found e [(ex-message e) (:id (ex-data e))])))
