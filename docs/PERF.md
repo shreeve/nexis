@@ -62,8 +62,8 @@ weak on memory density (boxing), and weak on startup (JVM warmup).
 nexis's architectural targets, by axis:
 
 - **Throughput**: parity or better than Clojure's fully-JIT'd
-  steady state after Phase 6 optimizations land. Weaker until
-  the compiler is in.
+  steady state is the target; the bytecode VM has no opcode
+  specialization, so sustained compute is behind (§5.19).
 - **Latency**: strictly better than Clojure on durable-state ops
   (emdb zero-copy vs no comparable feature in Clojure stdlib).
   Parity or better on pure-compute tails (precise explicit GC has
@@ -93,17 +93,17 @@ projected nexis direction vs Clojure. "Measured" column cites the
 | 7 | Persistent list | Cons cells | Cons cells | **parity** | cons 14.7 ns/op @ N=4096 (§3.2) | measured |
 | 8 | Hashing | Murmur3 | xxHash3-64 | **2–3×** faster on long bytes | ~34 GB/s (§3.1) | measured (partial) |
 | 9 | Keyword identity | Intern + identity | Intern + identity | **parity** | hash 2 ns (§3.1) | measured |
-| 10 | Transients | Mutation token | Owner-token (Option B wrapper) | **parity** in v1; Phase-6 opportunity | ~parity with persistent (§3.3) | measured |
+| 10 | Transients | Mutation token | Owner-token (Option B wrapper) | **parity** in v1; node-owner in-place edit is the open lever | ~parity with persistent (§3.3) | measured |
 | 11 | GC | Generational tracing (G1/ZGC) | Precise non-moving mark-sweep | **worse** short-term; addressable | — | implemented, acknowledged weakness |
-| 12 | Allocator | TLAB bump pointer | size-class pool (POOL.md) | **parity-to-edge vs TLAB** on hot paths | list cons **3.94×**, map assoc **1.80×** vs pre-pool (§3.2) | measured (pool landed) |
-| 13 | Dispatch / polymorphism | Inline-cached via JIT | 26-way switch per op | **worse** at warm steady state; Phase 6 flips | hashValue ~1–2 ns (§3.1) | measured (partial) |
+| 12 | Allocator | TLAB bump pointer | size-class pool (POOL.md) | **parity-to-edge vs TLAB** on hot paths | list cons **3.94×**, map assoc **1.80×** vs pre-pool (§3.2) | measured |
+| 13 | Dispatch / polymorphism | Inline-cached via JIT | 26-way switch per op | **worse** at warm steady state; inline caches absent | hashValue ~1–2 ns (§3.1) | measured (partial) |
 | 14 | Durable state | No stdlib primitive | emdb mmap, zero-copy | **orders of magnitude faster** | get-hot 1.04 μs (§3.6) | measured (partial) |
 | 15 | Codec / serialization | `.edn` / Nippy | Binary LEB128/ZigZag | **2–5× size, 5–20× speed** vs `.edn` | encode 18 ns/entry, decode 124 ns/entry (§3.5) | measured (partial) |
 | 16 | Concurrency tax | STM + CAS pervasive | Single-isolate, single-writer | **strictly less overhead**; by design | — | implemented, by design |
-| 17 | SIMD / typed-vector | JIT may autovectorize | `@Vector` + planned typed-vector | **2–8×** on bulk numeric ops | — | planned (Phase 6) |
+| 17 | SIMD / typed-vector | JIT may autovectorize | `@Vector` + planned typed-vector | **2–8×** on bulk numeric ops | — | absent (kind reserved) |
 | 18 | Startup | 100–500 ms JVM warmup | Native binary | **10–500×** | — | implemented, not yet measured |
-| 19 | Compilation | HotSpot C1+C2 JIT | Tree-walking interpreter today | **worse** today, winning after Phase 2/6 | — | acknowledged; Phase 2/6 |
-| 20 | Comptime specialization | JIT inlining + escape analysis | Zig `comptime` monomorphization | **~2×** on specialized paths | — | planned (Phase 6) |
+| 19 | Compilation | HotSpot C1+C2 JIT | Bytecode VM, switch dispatch, no specialization | **worse** on sustained compute | — | not measured against Clojure |
+| 20 | Comptime specialization | JIT inlining + escape analysis | Zig `comptime` monomorphization | **~2×** on specialized paths | — | absent |
 | 21 | Datalog over datoms (Nextomic) | Datomic (peer + transactor, JVM) | in-process, emdb named trees, arena per operation | not head-to-head measured | 3-way join over 200k datoms 1.43 ms to rows; 20k `[*]` pulls 15.7 ms (§3.7) | measured (single sample, corpus benchmark) |
 
 **†** NaN-box pair inlines through arithmetic; measured median is
@@ -125,26 +125,25 @@ cold-cache measurement is a follow-up. See §3.4 footnote.
 | Zig | 0.16.0 |
 | Allocator | `PoolAllocator` (size-class pool, `docs/POOL.md`) — default |
 | Harness | `src/bench.zig` (criterion-style, 30 samples × ≥50 ms per measurement) |
-| Date of current baseline | 2026-04-19 |
+| Baseline run date | 2026-04-19 |
 | Baseline numbers | Inline in §3.1–§3.6 below |
 | Local artifacts (`.gitignore`d) | `bench/baseline.json` (pool default), `bench/baseline-std.json` (A/B), `bench/baseline-pool.json` (A/B) |
 
 **On the JSON files.** `bench/*.json` are **local run artifacts,
-not committed**. The numbers of record live inline in §3.1–§3.6
-and in the amendment log (§11). Regenerate locally with
+not committed**. The numbers of record live inline in §3.1–§3.7.
+Regenerate locally with
 `zig build bench -- --out bench/baseline.json`. Per-machine /
 per-conditions runs should NOT be committed — diffing them is
 the job of the in-doc numbers, which are curated.
 
-**Important methodology note** (introduced in the pool-allocator
-commit): every collection-construction benchmark now creates a
-fresh `Heap` per measurement invocation and `Heap.deinit()`s it
-when the invocation returns. This prevents unbounded memory growth
-across `inner_reps` on N=4096 workloads and is how the A/B below
-is fair. The very first baseline (commit `7e5bb1a`, from before
-per-bench heap reset) had different numbers for N=4096
-construction because of the accumulation effect; the §3.2 / §3.3
-tables below are the corrected numbers from `baseline-std.json`.
+**Methodology note**: every collection-construction benchmark
+creates a fresh `Heap` per measurement invocation and
+`Heap.deinit()`s it when the invocation returns. This prevents
+unbounded memory growth across `inner_reps` on N=4096 workloads
+(without it both allocators OOM at N=4096) and is what makes the
+A/B below fair. A run without per-invocation heap reset reports
+different N=4096 construction numbers because of the accumulation
+effect; the §3.2 / §3.3 tables are per-invocation numbers.
 
 Reproducing:
 
@@ -222,13 +221,10 @@ columns**: `std` = Zig debug allocator (pre-lift reference);
   (~4× lift) — pure allocator cost. Map assoc from ~150 ns/op →
   **~84 ns/op** (~1.8× lift). Every construction op is
   measurably faster; no regressions.
-- **PERF.md §5.12 projection** was "3–10× from allocator pass"
-  applied broadly, and "map_assoc ~200 ns → ~60 ns". The measured
-  map assoc lift is **~1.8× rather than 3×**; the "~80% allocator-
-  bound" decomposition was too aggressive for deep trie workloads.
-  In reality map_assoc at N=4096 is closer to 45% allocator-bound
-  (the rest is hash + memcpy + trie navigation). Projection
-  rewritten.
+- Map assoc at N=4096 is roughly 45% allocator-bound (the rest is
+  hash + memcpy + trie navigation), which bounds the allocator
+  lift on deep-trie paths at ~1.8× rather than the 3× a purely
+  allocator-bound model would give.
 - Small-N wins are larger (list cons at N=16 is **5.4×**)
   because allocator overhead is a larger fraction when per-op
   work is small.
@@ -260,9 +256,9 @@ Same N, via `transientFrom` / `*Bang` / `persistentBang`.
   The primary explanation is our Option B implementation choice
   (wrapper over persistent with owner token + subkind dispatch +
   delegated persistent ops), not the node-owner in-place edit
-  design. Parity is the expected outcome; node-owner in-place
-  edit is deferred to Phase 6+.
-- Phase-6 opportunity: node-owner in-place-edit transient +
+  design. Parity is the expected outcome; there is no node-owner
+  in-place edit.
+- Open lever: node-owner in-place-edit transient +
   comptime monomorphization of `!Bang` dispatch is the path to
   larger transient wins.
 
@@ -432,11 +428,10 @@ the hash dispatch (~2–4 ns potential recovery).
 + return. Same story. External Clojure reference 25–40 ns
 post-JIT. Another ~3–5 ns to squeeze via monomorphized dispatch.
 
-### 4.3 Realized lift: allocator pass landed
+### 4.3 Allocator A/B (std vs pool)
 
-This tier was empty as a projection; it's now where the realized
-wins live. The pool-allocator commit measured the following A/B
-against the pre-pool `init.gpa` baseline (§3.2):
+The realized wins live here. `zig build bench -- --allocator std`
+against the default pool gives the following A/B (§3.2):
 
 | Measurement | Before | After (pool) | Lift |
 |---|---:|---:|---:|
@@ -446,16 +441,13 @@ against the pre-pool `init.gpa` baseline (§3.2):
 | set conj @ N=4096 | 143 ns/op | **77.9 ns/op** | **1.84×** |
 | codec decode map entry | ~103 ns | **~85 ns** | 1.14× |
 
-**What the numbers told us that the projection didn't.** PERF.md
-§5.12 projected "map_assoc ~200 ns → ~60 ns" (~3×). Measured
-lift is ~1.8×, meaningfully smaller. The "~80% allocator-bound"
-decomposition was too aggressive for deep-trie paths; real
-breakdown for map assoc at N=4096 is closer to **45% allocator-
-bound** (rest is hash + byte-copy + trie navigation). **List
-cons** (shallowest per-op work) saw the largest lift because it
-was the most allocator-dominated.
+**Reading the numbers.** Map assoc at N=4096 is closer to **45%
+allocator-bound** (rest is hash + byte-copy + trie navigation),
+which caps its lift at ~1.8×. **List cons** (shallowest per-op
+work) shows the largest lift because it is the most
+allocator-dominated.
 
-**Where further lift is available** (next commits):
+**Where further lift is available**:
 - **Comptime monomorphization** of `mapAssoc`'s hash/equal for
   keyword-keyed maps: skip the dispatch switch entirely on the
   hot path. Projected additional ~10–20% on map/set.
@@ -463,10 +455,9 @@ was the most allocator-dominated.
   bytes lets more blocks fit in a cache line. Projected ~5–10%.
 - **Node-owner in-place-edit transients** (§5.10): for workloads
   that actually use transients, this is the Clojure-class win.
-  Phase 6+.
 
 The large projected lift (5–30×) from generational GC (§5.11) is
-still on the table. Construction workloads under sustained
+unrealized. Construction workloads under sustained
 pressure on a long-lived process will see it; a single-shot
 benchmark like the current suite does not.
 
@@ -494,15 +485,15 @@ is at the hardware fsync floor.
 - **Already plausibly ahead**: hashing, map/set lookup, vector
   nth, durable state, startup (not measured but structurally
   obvious).
-- **Currently at parity**: map/set/vector construction.
-- **Currently behind (pending)**: GC, dispatch in warm steady
-  state, sustained compute (no compiler yet).
+- **At parity**: map/set/vector construction.
+- **Behind**: GC (the collector is never invoked at runtime,
+  `docs/GC.md`), dispatch in warm steady state, sustained compute
+  (no opcode specialization).
 
-The allocator commit closes the construction gap and likely
-opens a clear lead. Generational GC closes the throughput-under-
-alloc-churn gap. The compiler (Phase 2) closes the sustained-
-compute gap. Each of those is its own measured commit — the
-harness now exists to prove or refute every claim.
+Generational GC would close the throughput-under-alloc-churn
+gap; opcode specialization and inline caches would close the
+sustained-compute gap. Each is its own measured change — the
+harness exists to prove or refute every claim.
 
 ---
 
@@ -589,7 +580,7 @@ See `docs/CHAMP.md` Part 2.
 Both Clojure and nexis ship the 32-way radix trie with tail
 buffer (PLAN.md §8.3 + VECTOR.md). RRB relaxation is not in v1
 for either (Clojure ships RRB separately as `core.rrb-vector`;
-nexis defers to Phase 6).
+nexis has none, PLAN §23 #30).
 
 **Measured**: conj 63.3 ns/op, nth ~1 ns/op @ N=4096 (§3.2/§3.4).
 
@@ -629,7 +620,7 @@ O(1) conversion from persistent, mutation guarded by owner token,
 over persistent with owner-token check + subkind dispatch +
 delegated persistent ops. Correctness-first. The node-owner
 in-place-edit optimization used by Clojure's optimized transients
-is deliberately deferred.
+is absent by decision.
 
 **Measured**: parity with persistent paths at N=4096 (§3.3) —
 expected consequence of Option B choice.
@@ -648,13 +639,14 @@ intermediate allocations (path-copy in `mapAssoc` creates
 O(log₃₂ N) interior nodes per op). Mark-sweep reclaims them, but
 only after traversing the entire live heap.
 
-**Plan** (PLAN.md §9 + §19.6): Phase 6 nursery allocator + write
-barriers for generational collection. Estimated 5–30× faster on
+**Plan** (PLAN.md §9 + §19.6): nursery allocator + write barriers
+for generational collection. Estimated 5–30× faster on
 steady-state allocation-heavy workloads.
 
-**Status**: implemented (non-generational), acknowledged weakness.
+**Status**: implemented (non-generational) and never invoked by
+the runtime (`docs/GC.md` §1); acknowledged weakness.
 
-### 5.12 Allocator — **landed**
+### 5.12 Allocator — **measured win**
 
 **Clojure (JVM)**: TLAB bump pointer. Young-gen allocation is
 2–5 ns.
@@ -674,13 +666,11 @@ no locking.
 
 **Retained capacity**: slabs are held until `pool.deinit()` (no
 empty-slab reclamation in v1). Documented at POOL.md §8 as a
-deliberate tradeoff, not a leak. Phase 7+ can add per-slab
-refcounting + empty-slab release for long-lived REPL sessions.
+deliberate tradeoff, not a leak. Per-slab refcounting + empty-slab release would serve long-lived REPL sessions.
 
-**Status**: **landed** — default for `zig build bench` and for
-any downstream code that constructs a `Heap` from
-`pool.allocator()`. Legacy `init.gpa` path still available via
-`--allocator std` for A/B.
+**Status**: default for `zig build bench` and for any code that
+constructs a `Heap` from `pool.allocator()`; `--allocator std`
+selects the general-purpose allocator for A/B.
 
 ### 5.13 Dispatch / polymorphism — medium-term leverage
 
@@ -696,8 +686,8 @@ inline caching.
 well enough at hot paths to be ~single-cycle.
 
 **Plan**: comptime monomorphization for statically-known kinds;
-inline caches at dynamic call sites once the compiler lands
-(Phase 2+); per-kind fast paths at dispatch entry.
+inline caches at dynamic call sites; per-kind fast paths at
+dispatch entry. None of these exist.
 
 ### 5.14 Durable state — **one-way architectural win**
 
@@ -737,19 +727,19 @@ internals.
 memory fences, no CAS at the runtime level. emdb enforces
 single-writer at the durable layer.
 
-**Deliberate product choice**, not a forever position. Phase 7+
-may add multi-isolate (actor-style), but the plan is many
+**Deliberate product choice**, not a forever position. A
+multi-isolate design (actor-style), but the plan is many
 single-threaded isolates communicating via emdb transactions, not
-shared-memory multithreading.
+shared-memory multithreading, is the only extension contemplated.
 
-### 5.17 SIMD / typed-vector — Phase 6
+### 5.17 SIMD / typed-vector — absent
 
 **Clojure**: JIT occasionally autovectorizes tight `double[]`
 loops. Does not autovectorize `PersistentVector` because entries
 are boxed.
 
-**nexis**: `typed-vector` (VALUE.md kind 21, reserved). Phase 6
-implements with contiguous unboxed element bytes + `@Vector`
+**nexis**: `typed-vector` (VALUE.md kind 23, reserved with no
+implementation). The design is contiguous unboxed element bytes + `@Vector`
 SIMD for map/reduce/dot-product. `byte-vector` + string ops also
 SIMD-eligible.
 
@@ -767,23 +757,22 @@ For CLI tools, shell integrations, short-lived scripts nexis is
 a strictly better deployment target regardless of sustained
 throughput.
 
-### 5.19 Compilation — current deficit, future win
+### 5.19 Compilation — deficit
 
 **Clojure**: HotSpot JIT. C1 (first tier) warms in ~1k
 invocations; C2 (second tier) ~10k. Steady-state JIT'd Clojure
 is within 2× of Java, within 2× of equivalent C++ on most
 workloads.
 
-**nexis**: tree-walking interpreter post-reader is the current
-state. Every form evaluation walks the parsed form data
-structure. Acknowledged-slow by design; Phase 2 lands a bytecode
-VM, Phase 6 lands opcode specialization, Phase 7+ may add
-copy-and-patch or a proper JIT.
+**nexis**: forms compile to bytecode (`docs/COMPILER.md`) run by
+a switch-dispatch VM (`docs/VM.md` §8). There is no opcode
+specialization, no inline caching and no JIT. `+` and `<` on two
+operands are the only inlined intrinsics.
 
-**Rough ballpark today (pre-Phase-2)**: tree-walking nexis
-probably 20–100× slower than JIT'd Clojure on sustained compute.
-**After Phase 2 bytecode**: 2–5× slower. **After Phase 6
-specialization**: parity or edge on fully-warmed workloads.
+**Not measured against Clojure.** The structural expectation for
+an unspecialized bytecode VM is 2–5× slower than JIT'd Clojure on
+sustained compute; opcode specialization would be the path to
+parity on fully-warmed workloads. Neither number is measured.
 
 ### 5.20 Comptime specialization — Zig's unique lever
 
@@ -830,11 +819,11 @@ benchmark-harness update.
 7. **typed-vector + SIMD** (§5.17). ~2–8× on numeric bulk ops.
 8. **Generational GC** (§5.11). ~5–30× on steady-state
    alloc-heavy workloads where slab retention matters.
-9. **Phase 2 bytecode compiler**. Covered by PLAN.md §21;
-   gates §5.13 and §5.19.
+9. **Opcode specialization** (§5.19). Gates §5.13 and the
+   sustained-compute rows.
 10. **Node-owner in-place-edit transients** (§5.10). The
-    Clojure-class transient win; deferred past Phase 1 in favor
-    of the Option B wrapper design.
+    Clojure-class transient win; absent in favor of the Option B
+    wrapper design.
 11. **Inline caches** (§5.13). Depends on #9.
 
 Re-ordering is fine; the only invariant is **measurement gates
@@ -852,7 +841,7 @@ Explicitly **not** chasing, for reasons worth recording:
   not one we intend to pay. See §5.16.
 - **JIT in v1 / v2.** A production JIT is 5+ person-years. We get
   80% of the win from bytecode + comptime specialization + inline
-  caches. Phase 7+ may reconsider.
+  caches.
 - **Beating C/Zig on tight compute loops.** Parity on anything
   involving dynamic dispatch is aspirational; beating is
   architecturally impossible. We measure against Clojure and
@@ -885,22 +874,16 @@ numbers, not same-machine head-to-head runs.
    consequence of our Option B wrapper-over-persistent
    implementation, not evidence of persistent-path superiority.
    Node-owner in-place-edit transient is the path to
-   Clojure-class transient speedups; deferred post-Phase-1.
+   Clojure-class transient speedups; absent.
 5. **Allocator is the single largest leverage point** for
-   construction-heavy workloads. Map assoc at ~200 ns/op is
-   ~80% `page_allocator` overhead; §5.12's projection of 3–10×
-   from a size-class pool is directionally supported by the cost
-   breakdown.
+   construction-heavy workloads: the size-class pool lifts list
+   cons 3.94× and map assoc 1.80× over the general-purpose
+   allocator (§4.3); map assoc is ~45% allocator-bound.
 6. **emdb durable `get` at ~1 μs end-to-end** is dramatically
    faster than any Clojure-ecosystem durable-state alternative
    the author is aware of (Datomic deref, Redis round-trip, SQL
    via JDBC), but this is not a same-machine head-to-head
    measurement.
-7. **A latent production bug was caught by the benchmark** —
-   `src/codec.zig` had two uses of `std.testing.allocator` inside
-   production decode paths that only worked because the code path
-   wasn't exercised outside tests. Fixed to use `heap.backing`.
-   The harness earned its keep on the first run.
 
 ---
 
@@ -939,10 +922,10 @@ iterations**.
 
 - `docs/BENCH.md` — measurement methodology (companion).
 - `PLAN.md` §19 — performance strategy, Tier 1/2 roadmap.
-- `PLAN.md` §21 — phase roadmap (when each optimization lands).
+- `PLAN.md` §21 — roadmap checklist.
 - `docs/VALUE.md` §3 — tagged value encoding.
 - `docs/CHAMP.md` — persistent map/set implementation.
-- `docs/GC.md` — current collector; future-work section outlines
+- `docs/GC.md` — the collector; its future-work section outlines
   the generational path.
 - `docs/DB.md` — emdb integration (durable-state performance).
 - `docs/CODEC.md` — serialization format.
@@ -950,46 +933,17 @@ iterations**.
 
 ---
 
-## 11. Amendment log
+## 11. Measurement provenance
 
-- **2026-04-19** (commit `d129f06`): Initial PERF.md draft. Twenty
-  categories cataloged; all status tags `estimated` or
-  `implemented, not yet measured`.
-- **2026-04-19** (commit `7e5bb1a`): Bench harness landed
-  (`src/bench.zig` + `bench/main.zig`). `bench/baseline.json`
-  was initially committed as a checked-in artifact; later
-  gitignored (see pool-allocator commit below) because per-machine
-  run JSON was churning without adding signal beyond the inline
-  numbers.
-  First measured numbers captured in a separate PERF-MEASURED.md.
-  Status tags promoted to `measured` for rows 2, 3, 4 (partial),
-  5, 6, 8 (partial), 14 (partial), 15.
-- **2026-04-19** (commit `97b019e`): **PERF-MEASURED.md merged
-  into PERF.md**; single source of truth for performance. New §3
-  (measured baseline, full interpretation) and §4 (tier analysis
-  against theoretical ceilings and external references) added.
-  PERF-MEASURED.md deleted.
-- **2026-04-19** (pool allocator commit): **Size-class pool
-  landed**. §3.2 collection-construction + §3.3 transient +
-  §3.5 codec now report A/B numbers (std vs pool). Headline
-  lifts: list cons **3.94×**, vector conj **2.59×**, map assoc
-  **1.80×**, set conj **1.84×**. The PERF.md §5.12 projection
-  of "~80% allocator-bound, map assoc 200 ns → 60 ns" was **too
-  aggressive for deep-trie paths** — measured map_assoc is ~45%
-  allocator-bound in practice. §4.3 rewritten from
-  "clear improvement runway" to "realized lift." §5.12 status
-  tag: `landed`. Methodology change in the same commit: bench
-  driver now uses per-invocation heap (create + `Heap.deinit`)
-  for construction benchmarks; without this change both `std`
-  and `pool` OOM at N=4096 due to accumulation across
-  `inner_reps`. Also in this commit: **`bench/*.json` moved to
-  `.gitignore`** — per-machine / per-run JSON artifacts do not
-  belong in version control. The curated numbers live inline in
-  §3 and in this amendment log; regenerate JSON locally via
-  `zig build bench -- --out bench/baseline.json`.
-- **2026-09-18**: **§3.7 Nextomic numbers** from the corpus
-  benchmarks in `test/integration/nextomic_{q,pull}.zig` under
+- §3.1–§3.6 numbers come from `src/bench.zig` + `bench/main.zig`
+  (`zig build bench`, ReleaseFast, Apple M1, pool allocator
+  default, 30 samples × ≥50 ms). `bench/*.json` run artifacts are
+  `.gitignore`d; the curated numbers live inline here.
+- §3.2 / §3.3 / §3.5 A/B rows compare `--allocator std` against the
+  default pool under the per-invocation heap methodology (§3).
+- §3.7 Nextomic numbers come from the corpus benchmarks in
+  `test/integration/nextomic_{q,pull}.zig` under
   `-Doptimize=ReleaseFast` on an Apple M5, single sample, with the
-  testing-allocator caveat on result materialization. Scorecard row
-  21 added. Not harness numbers; promoted to `measured` in the §2
-  sense only once `src/bench.zig` carries the scenarios.
+  testing-allocator caveat on result materialization. They are not
+  harness numbers; scorecard row 21 is `measured` in the §2 sense
+  only once `src/bench.zig` carries the scenarios.
