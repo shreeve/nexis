@@ -38,7 +38,7 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Core library | 162 native functions in `nexis.core` (`src/stdlib.zig`: sequences, HOFs, collections, arithmetic, predicates, strings, I/O) plus 44 macros and functions in `src/stdlib/core.nx` (`when-let`, `doseq`, `cond->`, `some->`, `as->`, `update-in`, `group-by`, `frequencies`, ...); `nexis.string` |
 | Clojure breadth | Atoms (`atom`/`swap!`/`reset!`/`compare-and-set!`), `str`/`subs`/`print`/`println`/`slurp`/`spit`, records, protocols, `extend-protocol`/`extend-type`/`satisfies?`, `case`/`condp`/`for` |
 | Durable refs (`db/*`) | Refs backed by emdb named trees: `db/open`/`db/ref`/`db/put-key!`/`db/get-key`, `with-tx`/`with-read-tx` with rollback on throw, `@deref`, `db/alter!`, `db/scan`, `db/reduce-tree`, MVCC snapshots via `with-snapshot`; page size pinned to 16 KiB, tree ids cached per connection, engine failures as named `:db/*` keywords |
-| Nextomic | The `nextomic` namespace: `connect`/`release`/`db`/`basis-t`/`transact!`/`entity`/`entid`/`ident`/`datoms`/`as-of`/`since`/`history`/`tx-range`/`schema`/`sync`/`q`/`explain`/`pull`/`pull-many`/`with`, `with-conn`; every error a catchable `:nextomic/*` keyword. Spec: [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) |
+| Nextomic | The `nextomic` namespace: `connect`/`release`/`db`/`basis-t`/`transact!`/`entity`/`entid`/`ident`/`datoms`/`as-of`/`since`/`history`/`tx-range`/`schema`/`sync`/`q`/`explain`/`pull`/`pull-many`/`with`, `with-conn`; every error catchable by `try` (the taxonomy is under Nextomic below). Spec: [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) |
 | Tooling | `nexis run FILE.nx`, `nexis repl`, `zig build bench` (ReleaseFast harness, [`docs/BENCH.md`](docs/BENCH.md)), `zig build golden` |
 
 ## Build & run
@@ -54,9 +54,10 @@ zig build install                  # bin/nexis, bin/nexis-golden
 For developers:
 
 ```bash
-zig build phase2-test              # seconds — vm + compile + stdlib inner loop
+zig build quick                    # seconds — language, eval-pipeline and Nextomic unit + property binaries
 zig build nextomic-test            # Nextomic unit, property and corpus tests
 zig build nextomic-nx              # test/nextomic/*.nx through bin/nexis
+zig build examples                 # every examples/*.nx through bin/nexis
 zig build test --summary all       # minutes — everything (1265 tests)
 zig build parser                   # regenerate src/parser.zig from nexis.grammar
 zig build bench                    # ReleaseFast benchmark suite
@@ -166,12 +167,35 @@ collection, tuple, relation, `%` rules), predicates and function
 bindings that call any Lisp function including one you `defn`'d,
 aggregates, every find spec (`.`, `[...]`, `[[...]]`, relation),
 `not`/`not-join`/`or`/`or-join`/`and`, recursive rules, and the time
-views. `(d/explain query db)` prints the plan. Parsed queries are
-cached per VM by value.
+views. `(d/explain query db)` returns the plan as a string. Parsed
+queries are cached per VM by value.
+
+Two calls differ from Datomic's. `(d/with conn tx-data f)` is the
+speculative transaction: it takes the connection, not a db-value,
+and calls `f` with `db-after` and the report inside a held write
+transaction that is aborted when `f` returns; Datomic's `(with db
+tx-data)` returns the report instead. `(d/tx-range conn)`,
+`(d/tx-range conn from)` and `(d/tx-range conn from to)` return the
+log entries with `from <= t < to`; a `nil` or absent bound is open.
+
+Errors are values a `try` catches. A Nextomic-semantic error is a
+map whose `:error` names it and whose other keys carry the context:
+`{:error :nextomic/unique :attr :patient/mrn :value "MRN-1001"}`,
+`{:error :nextomic/query-syntax :message "..." :clause 2}`;
+`(:error e)` is the classifier. An argument of the wrong shape is
+the VM's own keyword — `:kind-mismatch` for a db-value where a
+connection belongs, `:invalid-argument` for an unknown index or
+option, `:arity-mismatch` — and an engine failure is the `db/*`
+layer's keyword (`:db/open-failed`, `:db/corrupted`, ...).
+
+On disk: `connect` creates the path's missing parent directories,
+and a store file is a sparse 256 MB reservation that grows when it
+fills, so `ls -l` reports the reservation and `du` the bytes in use.
 
 `test/nextomic/{basics,indexes,time,errors,query,pull,with,with-conn,
 persist-1,persist-2}.nx` are the executable specification; each
-`.out` file is the expected stdout. [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md)
+`.out` file is the expected stdout, and `query.nx` is the fastest
+tour of the surface. [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md)
 is the authoritative design: §2 store layout, §3 transactions, §4
 db-values and time, §5 query pipeline, §6 Lisp API, §7 errors, §8
 module layout, §9 runtime prerequisites, §10 where Nextomic wins and
@@ -184,14 +208,17 @@ Stated so nobody rediscovers them:
 - **The collector is never invoked at runtime.** `src/gc.zig`
   implements precise mark-sweep and passes its property tests, but
   no allocation path calls `collect`; a long-running process grows
-  without bound. Nextomic allocates in per-operation arenas and
-  copies only results into the VM heap, so it does not make this
-  worse. Wiring it needs a rooting protocol for native functions
-  (see `HANDOFF.md`).
+  without bound. Nextomic allocates in per-operation arenas, but the
+  tx-data a program builds, the reports and the query results live
+  in the VM heap and stay there, so a loader that transacts millions
+  of datoms should batch the work into processes that exit and
+  restart rather than run as one process. Wiring the collector needs
+  a rooting protocol for native functions (see `HANDOFF.md`).
 - **No bignum arithmetic.** The `bignum` kind, codec and hashing
   exist; arithmetic does not promote. Fixnum overflow raises
   `:arithmetic-overflow`; an integer literal outside ±2^47 is a
-  compile error (`IntegerOutOfFixnumRange`).
+  compile error (`IntegerOutOfFixnumRange`; inside a macro call it is
+  reported as `MacroExpansionFailure` over the whole form).
 - **No `^:dynamic` Vars, no `binding`.** `(binding ...)` is an
   unresolved symbol.
 - **Phase 5 as PLAN §21 defines it is open**: no test runner, no

@@ -346,14 +346,16 @@ random-access variant is a follow-up.
 
 ### 3.7 Nextomic — query and pull over 200k datoms
 
-The two integration corpora end with a benchmark test that prints
-`[bench]` lines to stderr (`test/integration/nextomic_q.zig`
-"benchmark: 200k datoms, three-way join";
-`test/integration/nextomic_pull.zig` "benchmark: pull-many [*] and a
-nested pattern over 20k entities"). Reproduce with
-`zig build nextomic-test -Doptimize=ReleaseFast --summary all`. The
-store is emdb with 16 KiB pages; the datom set is 40,000 employees
-in 20 departments, five attributes each (~200k datoms).
+The two integration corpora end with a benchmark test
+(`test/integration/nextomic_q.zig` "benchmark: 200k datoms,
+three-way join"; `test/integration/nextomic_pull.zig` "benchmark:
+pull-many [*] and a nested pattern over 20k entities"). The row-count
+checks run under every `zig build test`; the `[bench]` timing lines
+print to stderr only when the `NEXTOMIC_BENCH` environment variable
+is set. Reproduce with
+`NEXTOMIC_BENCH=1 zig build nextomic-test -Doptimize=ReleaseFast --summary all`.
+The store is emdb with 16 KiB pages; the datom set is 40,000
+employees in 20 departments, five attributes each (~200k datoms).
 
 | Op | ReleaseFast, Apple M5 | Notes |
 |---|---:|---|
@@ -381,10 +383,9 @@ sample run-to-run noise, not a regression.
 - Single sample per row, not the 30-sample median the §3.1–§3.6
   harness reports; these rows do not enter the §2 scorecard as
   `measured` until `src/bench.zig` carries them.
-- Under `zig build test` (Debug, testing allocator) the same rows
-  read 16.3 ms to rows, 1.33 s with the result set, and 203 ms for
-  the `[*]` pulls; those are the numbers a contributor sees in the
-  summary and they are not performance measurements.
+- In a Debug build under the testing allocator the same rows read
+  16.3 ms to rows, 1.33 s with the result set, and 203 ms for the
+  `[*]` pulls; they are not performance measurements.
 
 ---
 
