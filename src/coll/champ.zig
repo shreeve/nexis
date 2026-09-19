@@ -52,6 +52,7 @@ const std = @import("std");
 const value = @import("value");
 const heap_mod = @import("heap");
 const hash_mod = @import("hash");
+const string_mod = @import("string");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -352,9 +353,61 @@ inline fn indexHashOf(k: Value, elementHash: *const fn (Value) u64) u32 {
     // An immediate hashes kind-locally through `Value.hashImmediate`,
     // which is what `dispatch.hashValue` computes for it; taking that
     // path here skips the callback for keyword, fixnum and the other
-    // immediate keys. Heap keys go through the callback.
+    // immediate keys. Only a heap key reaches the callback, so a
+    // fixture that shapes the indexing hash through `elementHash`
+    // must key by heap values (CHAMP.md §5.1).
     if (!k.kind().isHeap()) return @truncate(k.hashImmediate());
     return @truncate(elementHash(k));
+}
+
+// =============================================================================
+// Trie introspection for tests (CHAMP.md §12.3)
+// =============================================================================
+
+/// The node reached by descending `root` along `hash32` through every
+/// trie level, i.e. the collision node its keys share, or `null` when
+/// the descent leaves the trie earlier: a slot with no child, at any
+/// level, means the keys hashing to `hash32` did not collide all the
+/// way down.
+fn collisionNodeFor(
+    root: *HeapHeader,
+    hash32: u32,
+    children: *const fn (*HeapHeader) []*HeapHeader,
+) ?*HeapHeader {
+    var node = root;
+    var shift: u8 = 0;
+    while (shift <= MAX_TRIE_SHIFT) : (shift += branch_bits) {
+        const hdr = champInteriorHeaderConst(node);
+        const slot: u32 = (hash32 >> @intCast(shift)) & branch_mask;
+        const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
+        if ((hdr.node_bitmap & slot_bit) == 0) return null;
+        node = children(node)[childIndex(hdr.node_bitmap, slot)];
+    }
+    return node;
+}
+
+/// The entry count of the collision node holding every key of `m`
+/// whose indexing hash is `hash32`, or `null` when no such node
+/// exists (an array-map, or a descent that ends above the collision
+/// layer). A collision fixture asserts through this that its keys
+/// reached the collision node at `MAX_TRIE_SHIFT`.
+pub fn mapCollisionCount(m: Value, hash32: u32) ?u32 {
+    if (m.subkind() != subkind_champ_root) return null;
+    const root = champRootBodyConst(Heap.asHeapHeader(m)).root_node;
+    const node = collisionNodeFor(root, hash32, &champInteriorChildren) orelse return null;
+    const hdr = collisionHeaderConst(node);
+    std.debug.assert(hdr.shared_hash == hash32);
+    return hdr.count;
+}
+
+/// Set counterpart of `mapCollisionCount`.
+pub fn setCollisionCount(s: Value, hash32: u32) ?u32 {
+    if (s.subkind() != subkind_champ_root) return null;
+    const root = champSetRootBodyConst(Heap.asHeapHeader(s)).root_node;
+    const node = collisionNodeFor(root, hash32, &setInteriorChildren) orelse return null;
+    const hdr = setCollisionHeaderConst(node);
+    std.debug.assert(hdr.shared_hash == hash32);
+    return hdr.count;
 }
 
 // =============================================================================
@@ -3010,31 +3063,40 @@ fn synthEq(a: Value, b: Value) bool {
         .fixnum => a.asFixnum() == b.asFixnum(),
         .keyword => a.asKeywordId() == b.asKeywordId(),
         .char => a.asChar() == b.asChar(),
+        .string => string_mod.bytesEqual(Heap.asHeapHeader(a), Heap.asHeapHeader(b)),
         else => false,
     };
 }
 
-/// Hash-colliding synthetic for collision-node tests.
+/// Hash-colliding synthetic for collision-node tests: the low 32
+/// bits are pinned to `0xDEAD_BEEF` for every key, the high 32 bits
+/// are the key's own content hash.
 ///
-/// Contract: pins the **low 32 bits** of every output to `0xDEAD_BEEF`.
-/// The high 32 bits vary by input (derived from the input's own
-/// hashImmediate).
+/// The keys are heap strings from `collidingKey`, never immediates:
+/// `indexHashOf` (§5.1) hashes an immediate key inline and consults
+/// `elementHash` for heap keys only, so a keyword or fixnum key would
+/// never see this function and the trie would partition the keys
+/// cleanly instead of colliding them. Each collision test asserts
+/// through `mapCollisionCount` / `setCollisionCount` that its keys
+/// did reach the collision node.
 ///
-/// Why this is the right fixture: `indexHash` (§5.1) truncates to low
-/// 32 bits. A fixture that varied the low 32 bits but pinned the high
-/// 32 bits would not collide — CHAMP would partition keys cleanly
-/// through the trie. Only fixing the low 32 bits forces every distinct
-/// key to the same slot at every trie level and ultimately into a
-/// single collision node at MAX_TRIE_SHIFT.
-///
-/// DO NOT "optimize" this to a constant u64 — the high 32 bits must
-/// stay input-dependent so the full `dispatch.hashValue` pipeline
-/// (which IS used when this fixture feeds into entry_hash for map
-/// contents, not here) still produces distinct hashes for distinct
-/// entries. The pattern here is specifically for keys routed through
-/// hamt's indexHash + elementEq side-channel.
+/// Why the low 32 bits are the pinned half: `indexHashOf` truncates
+/// to them. Pinning the high half instead would not collide. The high
+/// half stays input-dependent because the same callback hashes the
+/// map's own entries when a colliding-keyed map is itself hashed,
+/// and distinct entries must keep distinct hashes there.
 fn collidingHash(x: Value) u64 {
-    return (@as(u64, x.hashImmediate() >> 32) << 32) | 0xDEAD_BEEF;
+    return (@as(u64, string_mod.hashHeader(Heap.asHeapHeader(x))) << 32) | 0xDEAD_BEEF;
+}
+
+/// The `i`-th key of a collision fixture: a fresh heap string, so the
+/// indexing hash goes through the `elementHash` callback (§5.1).
+/// Equal by content under `synthEq`, so any call with the same `i`
+/// names the same key.
+fn collidingKey(heap: *Heap, i: u32) !Value {
+    var buf: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "collider-{d}", .{i}) catch unreachable;
+    return string_mod.fromBytes(heap, text);
 }
 
 // ---- Body layout tests ----
@@ -3431,31 +3493,55 @@ test "collision nodes: many keys with the same indexing hash survive the trie" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     var m = try mapEmpty(&heap);
-    // Insert 10 distinct keys (all keyword ids) — with the `collidingHash`
-    // fn the low 32 bits are always `0xDEAD_BEEF`, so every key descends
-    // the same path and ultimately lands in a collision node.
+    // Insert 10 distinct string keys: with `collidingHash` the low 32
+    // bits are always `0xDEAD_BEEF`, so every key descends the same
+    // path and lands in one collision node at MAX_TRIE_SHIFT.
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
-        m = try mapAssoc(&heap, m, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &collidingHash, &synthEq);
+        m = try mapAssoc(&heap, m, try collidingKey(&heap, i), value.fromFixnum(@intCast(i)).?, &collidingHash, &synthEq);
     }
     try testing.expectEqual(@as(usize, 10), mapCount(m));
+    try testing.expectEqual(@as(?u32, 10), mapCollisionCount(m, 0xDEAD_BEEF));
     // Every key must still look up correctly.
     i = 0;
     while (i < 10) : (i += 1) {
-        switch (mapGet(m, value.fromKeywordId(i), &collidingHash, &synthEq)) {
+        switch (mapGet(m, try collidingKey(&heap, i), &collidingHash, &synthEq)) {
             .present => |v| try testing.expectEqual(@as(i64, @intCast(i)), v.asFixnum()),
             .absent => try testing.expect(false),
         }
     }
     // Dissoc from the collision bucket works end-to-end.
-    m = try mapDissoc(&heap, m, value.fromKeywordId(5), &collidingHash, &synthEq);
+    m = try mapDissoc(&heap, m, try collidingKey(&heap, 5), &collidingHash, &synthEq);
     try testing.expectEqual(@as(usize, 9), mapCount(m));
-    try testing.expect(mapGet(m, value.fromKeywordId(5), &collidingHash, &synthEq) == .absent);
+    try testing.expectEqual(@as(?u32, 9), mapCollisionCount(m, 0xDEAD_BEEF));
+    try testing.expect(mapGet(m, try collidingKey(&heap, 5), &collidingHash, &synthEq) == .absent);
     // Other keys still present.
-    switch (mapGet(m, value.fromKeywordId(3), &collidingHash, &synthEq)) {
+    switch (mapGet(m, try collidingKey(&heap, 3), &collidingHash, &synthEq)) {
         .present => |v| try testing.expectEqual(@as(i64, 3), v.asFixnum()),
         .absent => try testing.expect(false),
     }
+}
+
+test "collision nodes: an immediate key hashes inline and never reaches the callback" {
+    // The counterpart of the stress test: keyword keys under the same
+    // `collidingHash`-shaped callback partition cleanly, because
+    // `indexHashOf` hashes an immediate through `hashImmediate` and
+    // consults `elementHash` for heap keys only (§5.1). A collision
+    // fixture keyed by immediates would exercise no collision node.
+    const pinned = struct {
+        fn f(_: Value) u64 {
+            return 0xDEAD_BEEF;
+        }
+    };
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var m = try mapEmpty(&heap);
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        m = try mapAssoc(&heap, m, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &pinned.f, &synthEq);
+    }
+    try testing.expectEqual(@as(usize, 10), mapCount(m));
+    try testing.expectEqual(@as(?u32, null), mapCollisionCount(m, 0xDEAD_BEEF));
 }
 
 // ---- Bitmap positional arithmetic ----
@@ -3503,19 +3589,17 @@ test "single-entry-subtree promotion: dissoc inside a deep subtree pulls entry u
     // one of those keys and confirm the other is pulled back up into
     // the parent's data area.
     //
-    // Setup: we force a level-0 collision using `collidingHash` for
-    // just TWO specific keys. For simplicity, we use a custom fixture.
+    // Setup: two string keys (heap keys, so the callback shapes their
+    // indexing hash; §5.1) share the level-0 slot and split at
+    // level 1. The eight filler keys are keywords and hash inline.
     const twoColliders = struct {
         fn f(x: Value) u64 {
-            // Two keywords collide at level-0 slot but at level-1
-            // they land in different slots (simulated).
-            const id = x.asKeywordId();
-            if (id == 100 or id == 101) {
-                // Same low-5 bits (slot 0); different level-1 bits.
-                // Put id 100 → slot 0 at level-1; id 101 → slot 1.
-                return (@as(u64, id) << 5) & 0xFFFF_FFFF;
-            }
-            return x.hashImmediate();
+            // Low 5 bits zero for both (slot 0 at level 0); bits 5..9
+            // differ (slot 4 and slot 5 at level 1).
+            const bytes = string_mod.asBytes(x);
+            if (std.mem.eql(u8, bytes, "collider-100")) return 100 << 5;
+            if (std.mem.eql(u8, bytes, "collider-101")) return 101 << 5;
+            return string_mod.hashHeader(Heap.asHeapHeader(x));
         }
     };
     var heap = Heap.init(testing.allocator);
@@ -3527,13 +3611,13 @@ test "single-entry-subtree promotion: dissoc inside a deep subtree pulls entry u
         m = try mapAssoc(&heap, m, value.fromKeywordId(i + 200), value.fromFixnum(@intCast(i)).?, &twoColliders.f, &synthEq);
     }
     // Then add the two colliders.
-    m = try mapAssoc(&heap, m, value.fromKeywordId(100), value.fromFixnum(1000).?, &twoColliders.f, &synthEq);
-    m = try mapAssoc(&heap, m, value.fromKeywordId(101), value.fromFixnum(1001).?, &twoColliders.f, &synthEq);
+    m = try mapAssoc(&heap, m, try collidingKey(&heap, 100), value.fromFixnum(1000).?, &twoColliders.f, &synthEq);
+    m = try mapAssoc(&heap, m, try collidingKey(&heap, 101), value.fromFixnum(1001).?, &twoColliders.f, &synthEq);
     try testing.expectEqual(@as(usize, 10), mapCount(m));
     // Dissoc one collider — the other should still be findable.
-    m = try mapDissoc(&heap, m, value.fromKeywordId(100), &twoColliders.f, &synthEq);
+    m = try mapDissoc(&heap, m, try collidingKey(&heap, 100), &twoColliders.f, &synthEq);
     try testing.expectEqual(@as(usize, 9), mapCount(m));
-    switch (mapGet(m, value.fromKeywordId(101), &twoColliders.f, &synthEq)) {
+    switch (mapGet(m, try collidingKey(&heap, 101), &twoColliders.f, &synthEq)) {
         .present => |v| try testing.expectEqual(@as(i64, 1001), v.asFixnum()),
         .absent => try testing.expect(false),
     }
@@ -3727,18 +3811,20 @@ test "set: collision-node stress with colliding fixture" {
     var s = try setEmpty(&heap);
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
-        s = try setConj(&heap, s, value.fromKeywordId(i), &collidingHash, &synthEq);
+        s = try setConj(&heap, s, try collidingKey(&heap, i), &collidingHash, &synthEq);
     }
     try testing.expectEqual(@as(usize, 10), setCount(s));
+    try testing.expectEqual(@as(?u32, 10), setCollisionCount(s, 0xDEAD_BEEF));
     i = 0;
     while (i < 10) : (i += 1) {
-        try testing.expect(setContains(s, value.fromKeywordId(i), &collidingHash, &synthEq));
+        try testing.expect(setContains(s, try collidingKey(&heap, i), &collidingHash, &synthEq));
     }
     // Disj alternating elements.
-    s = try setDisj(&heap, s, value.fromKeywordId(0), &collidingHash, &synthEq);
-    s = try setDisj(&heap, s, value.fromKeywordId(5), &collidingHash, &synthEq);
+    s = try setDisj(&heap, s, try collidingKey(&heap, 0), &collidingHash, &synthEq);
+    s = try setDisj(&heap, s, try collidingKey(&heap, 5), &collidingHash, &synthEq);
     try testing.expectEqual(@as(usize, 8), setCount(s));
-    try testing.expect(!setContains(s, value.fromKeywordId(0), &collidingHash, &synthEq));
-    try testing.expect(!setContains(s, value.fromKeywordId(5), &collidingHash, &synthEq));
-    try testing.expect(setContains(s, value.fromKeywordId(3), &collidingHash, &synthEq));
+    try testing.expectEqual(@as(?u32, 8), setCollisionCount(s, 0xDEAD_BEEF));
+    try testing.expect(!setContains(s, try collidingKey(&heap, 0), &collidingHash, &synthEq));
+    try testing.expect(!setContains(s, try collidingKey(&heap, 5), &collidingHash, &synthEq));
+    try testing.expect(setContains(s, try collidingKey(&heap, 3), &collidingHash, &synthEq));
 }
