@@ -1,293 +1,721 @@
-# HANDOFF.md — state of nexis and the ranked next work
+# HANDOFF.md — nexis and Nextomic for a new session
 
 Self-contained. Everything a new session needs is in this repository
-and its sibling `../emdb`; no external conversation, tool, or
-transcript is a prerequisite. Read `AGENTS.md` for routing and
-`PLAN.md` for the design before acting on anything here.
+and its sibling `../emdb`; no conversation, tool or transcript is a
+prerequisite. `AGENTS.md` is the short routing guide; this file is the
+long one. Every number here comes from the tree this file
+describes; when the tree moves, the counts in §2 move with it.
 
 ---
 
-## 1. What exists
+## 1. What this is
 
-**nexis** is a Zig 0.16 Lisp with Clojure semantics on the emdb storage
-engine, plus **Nextomic**, a Datomic-class database in the same binary.
-`bin/nexis run FILE.nx` and `bin/nexis repl` run real programs.
+**nexis** is a Lisp with Clojure semantics implemented in Zig 0.16 on
+its own runtime: a grammar-generated reader, a macroexpander, a
+compiler to a 64-bit bytecode, a slot VM, persistent collections
+(CHAMP map and set, 32-way vector, cons list, transients), a 16-byte
+tagged value, and the emdb storage engine underneath. `bin/nexis run
+FILE.nx` and `bin/nexis repl` run real programs: `defn`, `defmacro`,
+namespaces with `require`, destructuring, multi-arity `defn`, atoms,
+records and protocols, keywords and collections as functions, doubles
+with Clojure contagion, `try`/`catch`/`finally` with every error a
+catchable value. It is not a Clojure port: there is no Java interop,
+no STM, no JVM ecosystem, one isolate and one thread. The trade is a
+static binary that starts instantly and carries durable storage and a
+database in the same process.
 
-Language and runtime (`src/`):
+**emdb** is the storage engine: a memory-mapped, copy-on-write, MVCC
+B+ tree with named trees, one writer, wait-free readers, byte keys in
+unsigned lexicographic order. nexis uses it two ways. The `db`
+namespace exposes durable refs: named-tree key-value storage with
+explicit `with-tx`/`with-read-tx` transactions, `@deref`, `db/alter!`,
+`db/scan`, `db/reduce-tree` and MVCC snapshots. Nextomic uses the
+engine directly, below that layer, and shares only the `Env` and the
+`:db/*` error names with it. emdb is unchanged for either; that is a
+standing rule (§4).
 
-- Reader: nexus-generated parser, canonical Form schema, pretty-printer,
-  goldens (`docs/FORMS.md`).
-- Values: 16-byte tagged Value; CHAMP map/set, 32-way persistent
-  vector, list, transients; 48-bit fixnum and f64 with Clojure
-  contagion (`(= 1 1.0)` false, `(== 1 1.0)` true, inexact integer
-  `/` yields a float, `:divide-by-zero` and `:arithmetic-overflow`
-  catchable); a `bignum` kind with codec and hashing but no
-  arithmetic; strings; atoms; records; protocols.
-- Compiler and VM: Form → Tiny IR → 64-bit bytecode; slot VM with
-  closures, `recur`, `letfn*`, try/catch/finally, catchable VM errors as
-  keywords, reentrant `VM.callValue`, `VM.throwValue`/`VM.throwKeyword`
-  for native code. Every frame records its entry stack length and
-  restores it on return and unwind, so nested calls through native
-  functions keep the stack invariant. A symbol that names nothing is
-  `UnresolvedSymbol` at its own source span.
-- Macros and namespaces: host macros, user `defmacro` in a compile-time
-  sub-VM, syntax-quote with auto-gensym, qualified macro heads,
-  namespaced keywords, `(ns ...)`, `require` with `:as`, file loading.
-- Core library: 162 native functions in `src/stdlib.zig`, 44 macros and
-  functions in `src/stdlib/core.nx`, `nexis.string`; keyword, map, set
-  and vector are invocable.
-- Durable refs (`db/*`): emdb named trees, explicit `with-tx`/
-  `with-read-tx`, `@deref`, `db/alter!`, `db/scan`, `db/reduce-tree`,
-  snapshots. Seam guarantees: page size pinned to 16 KiB and 128 named
-  trees, one release of the path when emdb refuses to open, tree ids
-  resolved once per connection, cursor natives read whole values,
-  every engine failure a named `:db/*` keyword (`docs/DB.md`).
-
-Nextomic (`src/nextomic/`, spec `docs/NEXTOMIC.md`):
-
-- Eleven emdb named trees: four current indexes (`nx/eavt`, `nx/aevt`,
-  `nx/avet`, `nx/vaet`), four history indexes with the logical
-  transaction `t` in the key, `nx/txlog`, `nx/idents`, `nx/sys`.
-- Modules: `key` (sortable encodings), `datom`, `store`, `idents`,
-  `schema`, `transact`, `db` (db-values, fold, entity, tx-range),
-  `relation` (columnar), `query/{ir,parse,plan,exec,rules,natives}`,
-  `pull`, `natives`, `handle` (the `nextomic_conn` / `nextomic_db` kinds).
-- Natives: `connect release db basis-t transact! entity entid ident
-  datoms as-of since history tx-range schema sync q explain pull
-  pull-many with`; `with-conn` in `src/stdlib/nextomic.nx`. `q` is a
-  native over a query value, cached per VM by value.
-- Errors (§7): a Nextomic-semantic error is a map whose `:error` is a
-  `:nextomic/*` keyword and whose other keys carry the context
-  (`{:error :nextomic/unique :attr ... :value ...}`); an argument of
-  the wrong shape is the VM's `:kind-mismatch` / `:invalid-argument` /
-  `:arity-mismatch`; an engine failure is a `:db/*` keyword. All are
-  catchable by `try`.
-- Memory: every Nextomic operation allocates in its own arena and
-  copies only results into the VM heap; the tx-data, reports and
-  results a program holds stay in the VM heap, where nothing is
-  collected.
-- Zero changes to emdb.
-
-Tests: `zig build test --summary all` runs **1282 tests across 135
-steps**: inline unit tests, `test/prop/*` (including `nextomic_key`,
-`nextomic_tx`), the query and pull corpora in `test/integration/`
-against naive evaluators, reader goldens, `test/nextomic/*.nx`
-end-to-end scripts diffed against `.out` files, and every
-`examples/*.nx` through `bin/nexis` (the store-backed ones twice).
-
-Examples: `examples/nextomic-app.nx` (clinic chart: schema, upserts,
-components, `q`, `pull`, time views, `with`, a caught
-`:nextomic/unique`), `examples/todo-app.nx` (durable refs across
-processes), `examples/shapes-app.nx` (multi-file protocols + records +
-atoms). See `examples/README.md`.
+**Nextomic** is a Datomic-class database inside the binary. Datomic's
+idea is that a database is a value: it stores facts, not rows, never
+overwrites them, and stamps every fact with the transaction that
+added it, so "what did we know at transaction 900?" and "what changed
+since?" are ordinary reads rather than archaeology. A fact is a datom
+`[e a v t added]`; the store keeps every datom it ever learned; a
+db-value is an immutable view at a basis `t`; `as-of`, `since` and
+`history` are views of the same trees; queries are Datalog data;
+transactions are data too. Nextomic maps that onto emdb with byte
+keys whose order is the index order: four current trees answer
+ordinary reads with no per-fact fold, four history trees carry the
+transaction in the key and answer the time views, and `nx/txlog`,
+`nx/idents` and `nx/sys` complete eleven named trees in one file. One
+process, one file, no transactor, and any number of processes can
+open the file and see each other's writes.
 
 ---
 
 ## 2. Verify on arrival
 
+`../emdb` must be a sibling checkout and `zig` must be 0.16.0
+(`ZIG-0.16.0.md`). Everything below runs from the repository root.
+
 ```bash
-cd /path/to/nexis                       # ../emdb must be a sibling
-git status                              # clean main
-zig build install
-zig build test --summary all            # expect 1282/1282 tests, 135/135 steps
-./bin/nexis run examples/nextomic-app.nx
-./bin/nexis run examples/nextomic-app.nx   # second run: same store, upserts, no new patients
-./bin/nexis run examples/todo-app.nx
-./bin/nexis run examples/todo-app.nx       # second run shows :completed 1
-./bin/nexis run examples/shapes-app.nx     # "total-area atom = 9650", every satisfies?=true
+git status                        # clean main
+zig build install                 # bin/nexis and bin/nexis-golden
+./bin/nexis --help                # usage; lists the namespaces available without a file
+zig build quick                   # the inner loop, ~35-50 s warm
+zig build test --summary all      # the gate: 1307 tests, 138 steps, ~4 min wall
 ```
 
-Loops: `zig build quick` (seconds) for language work,
-`zig build nextomic-test` + `zig build nextomic-nx` for Nextomic,
-`zig build examples` after touching anything an example uses, the
-full suite before every commit. The two corpus binaries end with a
-benchmark whose row-count checks always run; its `[bench]` timing
-lines print only when the `NEXTOMIC_BENCH` environment variable is
-set, and Debug-build numbers under the testing allocator are not
-performance measurements (`docs/PERF.md` §3.7 has the ReleaseFast
-ones).
+The gate's last line reads `Build Summary: 138/138 steps succeeded;
+1307/1307 tests passed`, preceded by `golden: ok=10 updated=0
+failed=0 missing=0`. Two integration binaries end with a benchmark
+whose row-count checks always run; the build runner echoes their
+stderr as `failed command:` lines while both succeed, so read the
+summary line, not the noise.
+
+The build steps, and what each is for:
+
+| step | runs | time (warm, Debug) |
+|---|---|---|
+| `zig build quick` | the language binaries (`vm`, `compile`, `expand`, `stdlib`, `loader`, `atom`, `record`, `protocol`, `format`), the compile property tests, `test/integration/eval_pipeline.zig`, the Nextomic unit binary and its two property tests | ~35-50 s |
+| `zig build nextomic-test` | `src/nextomic/*` unit tests, `test/prop/nextomic_{key,tx}.zig`, `test/integration/nextomic_{q,pull}.zig` | ~33 s |
+| `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis`, stdout diffed against its `.out` | seconds |
+| `zig build examples` | every `examples/*.nx` through `bin/nexis`; `durable-refs`, `todo-app` and `nextomic-app` twice | seconds |
+| `zig build golden` | reader goldens (`-Dupdate=true` rewrites them) | seconds |
+| `zig build test --summary all` | all of the above plus every module's inline tests and the randomized collection gates | ~4 min |
+| `zig build bench` | the ReleaseFast benchmark harness (`docs/BENCH.md`) | minutes |
+| `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` via `../nexus/bin/nexus` | seconds |
+
+The one environment variable is `NEXTOMIC_BENCH`: when set, the two
+Nextomic corpora print `[bench]` timing lines to stderr
+(`NEXTOMIC_BENCH=1 zig build nextomic-test --summary all`). Debug
+numbers under the testing allocator are not performance
+measurements; `docs/PERF.md` §3.7 has the ReleaseFast ones and the
+command that reproduces them.
+
+The examples are the fastest end-to-end check:
+
+```bash
+./bin/nexis run examples/nextomic-app.nx   # clinic chart; run it twice, the second run upserts
+./bin/nexis run examples/todo-app.nx       # durable refs across processes; second run shows :completed 1
+./bin/nexis run examples/shapes-app.nx     # multi-file protocols + records + atoms; total-area atom = 9650
+./bin/nexis repl                           # :quit or EOF exits
+```
+
+`test/nextomic/query.nx` is the fastest tour of the Nextomic surface;
+the `.nx` scripts are the executable specification.
 
 ---
 
-## 3. Known gaps (do not rediscover)
+## 3. Architecture map
 
-| Gap | Where it shows |
+### 3.1 The pipeline
+
+```
+source.nx
+   │  src/parser.zig      generated by nexus from nexis.grammar (committed)
+   ▼
+raw Sexp
+   │  src/reader.zig      normalize to the canonical Form schema, merge ^meta,
+   ▼                      lower #(), drop #_; pretty-printer; goldens
+Form  {datum, origin, user_meta, ann}
+   │  src/expand.zig      per-form-rule walker: host macros (18, Zig-implemented:
+   ▼                      let fn defn loop when when-not and or cond -> ->> case
+                          condp for defrecord defprotocol extend-type extend-protocol),
+                          user defmacro in a compile-time sub-VM, syntax-quote with
+                          auto-gensym, qualified macro heads, (ns ...) and require
+expanded Form
+   │  src/compile.zig     lowerForm → Tiny IR → 64-bit bytecode; capture analysis
+   ▼                      is a pre-pass; Vars are identity-stable heap cells and
+                          global calls go through Var indirection
+bytecode
+   │  src/vm.zig          slot VM, group-based opcode dispatch, closures, recur,
+   ▼                      letfn*, try/catch/finally, reentrant callValue
+value
+```
+
+The three representations — Form, Value, Encoded — fuse only through
+the codec (PLAN §5). Compile errors carry `file:line:col` and a source
+caret; a symbol that names nothing is `UnresolvedSymbol` at its own
+span. Runtime errors and reader errors carry no location (§6).
+
+### 3.2 The value model
+
+`src/value.zig`: a 16-byte tagged `Value` with a `Kind` byte.
+Immediates: `nil`, `false_`, `true_`, `char`, `fixnum` (48-bit
+payload, `fixnum_max = 2^47 - 1`), `float`, `keyword`, `symbol` (both
+interned ids). Heap kinds, by number: `string 16`, `bignum 17`,
+`persistent_map 18`, `persistent_set 19`, `persistent_vector 20`,
+`list 21`, `byte_vector 22` and `typed_vector 23` (reserved, no
+implementation), `function 24`, `var_ 25`, `durable_ref 26`,
+`transient 27`, `error_ 28`, `meta_symbol 29`, `native_fn 30`,
+`db_connection 31`, `db_write_txn 32`, `db_read_txn 33`, `atom 34`,
+`record 35`, `protocol 36`, `protocol_fn 37`, `nextomic_conn 38`,
+`nextomic_db 39`; 40-63 are free. A new kind adds an enum value and
+arms in `dispatch.zig` (equality, hash, category), `format.zig`,
+`gc.zig` and `codec.zig`; `nextomic_handle` is the pattern for a kind
+whose body lives above `dispatch`.
+
+Numbers: fixnum and f64 with Clojure contagion; `(= 1 1.0)` is
+false, `(== 1 1.0)` true; `/` on two integers yields a float when
+inexact; `:divide-by-zero` and `:arithmetic-overflow` are catchable
+keywords; fixnum overflow raises rather than promoting (§6.2).
+
+Equality and hash (`docs/SEMANTICS.md`): list, vector and seq are one
+sequential category, map and set their own; keyword and symbol hash
+domains are separated; metadata never affects either.
+
+### 3.3 Collections, heap, collector
+
+`src/coll/champ.zig` (map and set), `src/coll/vector.zig` (plain
+32-way trie with tail; `conj` and `assoc` are O(log n)),
+`src/coll/list.zig`, `src/coll/transient.zig`. `src/heap.zig` owns the
+blocks; the VM's `Heap` is backed by `VM.runtime_arena`, and closures,
+Vars and upvalue cells are raw arena allocations. `src/gc.zig` is a
+precise mark-sweep collector with caller-supplied roots; it passes
+its property tests and **no allocation path ever calls
+`Collector.collect`**, so a process grows until it exits (§6.1).
+
+### 3.4 The db seam
+
+`src/db.zig` (`docs/DB.md`) owns the `emdb.Env` behind a
+`db.Connection`, pins `pageSize = 16384` and `maxNamedTrees = 128`
+(the page size is fixed for a file's life and the Linux engine
+default is 4 KiB), resolves tree ids once per connection, reads whole
+values off cursors, and names every engine failure as a `:db/*`
+keyword. Nextomic borrows the `Env` from a `db.Connection` and holds
+raw `*emdb.Txn` handles and byte keys; the two layers share the
+engine and the `:db/*` names and nothing else.
+
+### 3.5 Nextomic
+
+`src/nextomic/` is one build module above `dispatch` and `vm`,
+imported by `stdlib` only. Files, one sentence each:
+
+| file | role |
 |---|---|
-| Collector never invoked at runtime | `src/gc.zig` `collect` has no caller; process memory grows without bound, so a loader that transacts millions of datoms batches the work across processes |
-| No bignum arithmetic | overflow raises `:arithmetic-overflow`; an integer literal outside ±2^47 is `IntegerOutOfFixnumRange` at compile time |
-| No `^:dynamic` / `binding` | `(binding ...)` is `UnresolvedSymbol` |
-| PLAN §21 Phase 5 as defined | no test runner, `nexis.test`/`math`/`pprint`, `--disasm`; runtime errors carry no source spans |
-| `(vec #{...})`, `(vec {...})` | `:kind-mismatch`; `vec` takes nil, vector, list |
-| Datalog function-position variables | function position takes a symbol, never a `?var` (`docs/NEXTOMIC.md` §5) |
-| `typed_vector` | reserved kind, no implementation, no `nexis.simd` |
-| Records, protocols, functions, vars, transients, namespaces, tx handles | `:unserializable` |
-| CLI usage text | `src/cli.zig` `--help` describes the Phase 2 surface only |
+| `root.zig` | module root; re-exports |
+| `key.zig` | sortable value encodings and index key layout: one tag byte orders types, byte order equals value order within a type, ids are 6-byte big-endian, attributes 4-byte, `top = (t << 1) \| added`; `v` is always followed by fixed-width fields so it carries no length |
+| `datom.zig` | the `Datom` struct and the txlog entry codec |
+| `store.zig` | `Env` ownership, the eleven `TreeId`s opened in one bootstrap transaction, `sys` counters, bootstrap ids, raw put/delete/scan and the `FoldScan` that implements as-of/since/history as one window over the history trees |
+| `idents.zig` | durable keyword ↔ id mapping with a per-connection cache; a transaction's mints wait in a `Minter` and publish after commit |
+| `schema.zig` | attributes as-of a basis, built from the attribute partition's datoms; per-attribute counts for the planner |
+| `transact.zig` | the transaction protocol: begin, normalise, tempids, expand, schema checks, write, commit; the overlay model that makes implicit retracts and same-transaction unique claims O(1) |
+| `db.zig` | `Conn` and `DbValue`; entity, entid/ident, datoms, tx-range; a speculative `with` is a second `Conn` over the held write transaction |
+| `handle.zig` | heap bodies of `nextomic_conn` and `nextomic_db`; its own build module `nextomic_handle` below `dispatch`/`format`/`gc` |
+| `marshal.zig` | VM values to and from datom values: the entity, value and cell contracts shared by natives, query, pull and transactions |
+| `relation.zig` | the columnar `Relation` of the query pipeline, arena-scoped, never a VM value; hash join, difference, union |
+| `query.zig` | the query pipeline's root: `q` opens one read, runs parse → plan → exec in one arena, closes on every path |
+| `query/ir.zig` | the parsed query: pure syntax over the VM's symbol table, cacheable across dbs |
+| `query/parse.zig` | query value → IR, with clause-indexed `:nextomic/query-syntax` diagnostics |
+| `query/plan.zig` | greedy selectivity ordering against one read; index choice from the §5 table; constants pre-encoded |
+| `query/exec.zig` | runs the plan: index nested loop or hash join per step, built-in predicates, user functions through the `CallHook` (`vm.callValue`) |
+| `query/rules.zig` | rule expansion; recursive components run the semi-naive fixpoint |
+| `query/natives.zig` | `q` and `explain`; the per-VM IR and rule-set caches |
+| `pull.zig` | pull patterns over one read: `*`, nesting, reverse refs, recursion, `:limit`/`:default`/`:as` |
+| `natives.zig` | the `nextomic` namespace table, `errorKeyword` (every error variant has a keyword; a test asserts totality), error payload maps, connection lifetime |
+
+Key invariants (`docs/NEXTOMIC.md` §1): datoms are bytes-only keys
+whose order is the index order; current and history trees are
+separate; `t` is Nextomic's own monotonic counter in `nx/sys`, never
+the engine's `txnId`; a db-value is a plain value `{store, basis,
+mode}` with no open read transaction, and every operation opens a
+pooled read for its own duration; integer entity ids in partitions
+(attributes and idents `1 .. 2^32-1`, user entities from `2^32`,
+transaction entities `2^46 | t`); schema is datoms read as-of the
+basis; `q` is a native over a query value, cached per VM by heap
+identity then structural hash; every operation allocates in its own
+arena and copies only results into the VM heap; a Nextomic-semantic
+error is a map `{:error :nextomic/... ...}` whose other keys carry the
+context, or the bare keyword when there is nothing more to say.
+
+### 3.6 Namespaces available without a file
+
+| namespace | contents |
+|---|---|
+| `nexis.core` (auto-referred) | 139 natives in `src/stdlib.zig` `core_fns` (sequences, HOFs, collections, arithmetic, predicates, strings, I/O) plus 43 definitions in `src/stdlib/core.nx`: 16 macros (`when-let if-let dotimes with-tx with-read-tx with-snapshot declare if-not while letfn doseq cond-> cond->> some-> some->> as->`) and 27 functions (`true? false? second third last reverse take drop constantly complement partial comp every? not-every? some not-any? merge update get-in assoc-in update-in frequencies group-by interpose juxt fnil merge-with`) |
+| `db` | 23 natives: `open close ref ref? put-key! get-key delete-key! present? begin-write begin-read commit! abort-write! abort-read! put! get delete! deref alter! scan reduce-tree snapshot release-snapshot! snapshot?` |
+| `nexis.string` | `lower-case upper-case trim split join replace` |
+| `nexis.internal` | the nine `#%...` primitives `defrecord`/`defprotocol` expand to |
+| `nextomic` | 20 natives: `connect release db basis-t transact! entity entid ident datoms as-of since history tx-range schema sync q explain pull pull-many with`, plus the macro `with-conn` from `src/stdlib/nextomic.nx` |
+| `user` | the current namespace at start |
+
+`src/cli.zig` `bootRuntime` installs the tables, bootstraps `core.nx`
+into `nexis.core` and `nextomic.nx` into `nextomic`, and gives both
+`run` and `repl` one `Runtime`.
 
 ---
 
-## 4. Ranked next work
+## 4. The contracts, and where they live
 
-Each item is self-contained; take them in order unless a user need
-reorders them. Spec first (the governing doc section), then code with
-inline tests, then `zig build test` green, then commit.
+**Authority order** (`AGENTS.md`): `PLAN.md` §23 frozen decisions;
+then PLAN Appendix C / §28 (the canonical Form schema); then
+`docs/*.md`, which are derivative and must track PLAN; then code
+comments. When sources disagree, the higher one wins and the lower one
+is fixed in the same commit. A §23 decision changes only through a
+dated entry in the Amendment Log at the end of `PLAN.md`; per-doc
+amendment logs (`docs/COMPILER.md` §13, `docs/VM.md` §18, `ATOM.md`,
+`PROTOCOLS.md`, `PERF.md` §11) record the downstream detail. The
+Amendment Log is the one place dates belong outside commit messages.
 
-1. **Bignum arithmetic and promotion.** `src/bignum.zig` holds the
-   kind; `docs/BIGNUM.md` the layout. Wire `+ - * quot rem inc dec`
-   and comparisons to promote on fixnum overflow instead of raising
-   `:arithmetic-overflow`, canonicalize results that fit back to
-   fixnum (BIGNUM.md's canonicalization invariant), lift out-of-range
-   integer literals in `src/compile.zig` (the `IntegerOutOfFixnumRange`
-   site), keep contagion with f64. Update SEMANTICS.md §2 and the
-   PLAN Amendment Log entry on the number tower.
-2. **GC wiring with a native-function rooting protocol.** Define
-   roots: VM stack and frames, namespace Vars, the interner, atom
-   cells, open `db`/`nextomic` handles, the Nextomic query and rule
-   caches (`docs/NEXTOMIC.md` §5 says a collector that frees or moves
-   values must clear both caches), and a scoped root set that native
-   functions push values onto before calling back into the VM
-   (`callValue`). Trigger from the allocator on a byte threshold.
-   `docs/GC.md` is the spec; `test/prop/gc.zig` the gate. Nextomic
-   is arena-scoped and needs no changes beyond cache clearing.
-3. **Clojure surface gaps.** Core forms and functions a Clojure
-   programmer reaches for that are absent or diverge; each is a
-   small, self-contained change in `src/expand.zig`, `src/compile.zig`
-   or `src/stdlib.zig` + `core.nx`:
-   - `case` evaluates its keys: `(case 1 (1 2) :a :d)` fails; keys
-     must be constants and a list key an alternative set.
-   - Syntax-quote: `~@` of a vector or nil, quoted maps, sets and
-     vectors with `~@`, nested `#()` outside macro arguments, and
-     symbol qualification (PLAN §23 #29 promises it; the expander
-     leaves symbols bare).
-   - Multi-arity anonymous `fn` (`defn` has it; `fn` and `letfn` do
-     not).
-   - `try` without `catch` (finally-only) is `MalformedForm`.
-   - Empty-body `fn`/`defn`/`let` and the literal `()` are compile
-     errors where Clojure yields nil / `()`.
-   - `defn` docstrings, attribute maps and `^:private`.
-   - Destructuring `:strs`/`:syms`, namespaced `:keys`, keyword
-     arguments (`& {:keys [...]}`), and `loop` bindings.
-   - `doseq` `:when`/`:let`/`:while`.
-   - `int`/`long`/`double` conversions (no way to turn a double into
-     an integer).
-   - `meta`/`with-meta`, `ex-info`/`ex-data`, `macroexpand`,
-     `read-string`, `list*`, `reduced`.
-   - Reader errors carry no file, line or column.
-4. **Phase 5 as PLAN §21 defines it.** A test runner and `nexis.test`
-   (`deftest`/`is`/`run-tests`), `nexis.math`, `nexis.pprint`,
-   `nexis --disasm`, and source-mapped runtime errors (a PC → span
-   table per Routine; `docs/COMPILER.md` and `docs/VM.md` amendment
-   logs). Refresh the `src/cli.zig` usage text in the same pass.
-5. **Datalog function-position variables.** Allow `[(?f ?x) ?y]` and
-   `[(?pred ?x)]` where `?f` is bound to a function value by an `:in`
-   input or an earlier clause; `query/parse.zig` accepts a
-   symbol only, `query/exec.zig` calls through the CallHook. Add
-   corpus cases in `test/integration/nextomic_q.zig` and a row in
-   `docs/NEXTOMIC.md` §5.
-6. **`typed_vector`.** PLAN §8 reserves the kind and PLAN §15.11
-   NX-2 expects Relation columns to share its representation. Ship
-   the kind (i64/f64 columns), codec arms, and `vec`/`nth`/`count`
-   over it before any `nexis.simd` kernel.
-7. **`^:dynamic` Vars and `binding`.** PLAN §21 Phase 3.7. A dynamic
-   binding stack on the VM, `binding` as a macro over push/pop with a
-   `finally`, Var loads checking the stack only for Vars marked
-   dynamic so ordinary Var loads stay a single indirection.
-8. **`vec` over sets and maps.** Add `.persistent_set` and
-   `.persistent_map` arms to `fnVec` in `src/stdlib.zig` (map →
-   `[k v]` pairs).
-9. **Nextomic follow-ups**, in the order they unblock users:
-   - Transaction functions and `:db.fn/cas` (a Lisp function called
-     inside `transact!` with `db-before` and returning tx-data; needs
-     item 2's rooting rule when the function allocates).
-   - Excision (remove datoms from history; listed in `docs/NEXTOMIC.md` §6).
-   - Full-text (`:db/fulltext` attribute flag; a tokens tree).
-   - Lazy entities (an `entity` that reads attributes on access).
-   - Hash-join tuning: the planner's estimates come from tree counts;
-     measure `test/integration/nextomic_q.zig`'s three-way joins in
-     ReleaseFast before and after any change (`docs/PERF.md` §3.7).
-   - Linux 4K-page CI run: the page size is pinned to 16 KiB in code,
-     so a Linux run should produce byte-identical stores; add it to
-     CI to prove the pin holds where the engine default differs.
-10. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): inline
-   caches on Var loads, SIMD CHAMP nodes, zero-copy strings from emdb
-   pages. Measure first with `zig build bench`; `docs/BENCH.md` is the
-   honesty gate.
+**Nextomic**: `docs/NEXTOMIC.md` is authoritative for everything under
+`src/nextomic/` and the `nextomic` namespace: §2 store layout, §3
+transactions, §4 db-values and time, §5 query pipeline, §6 Lisp API,
+§7 errors, §8 module layout, §11 what is not asked of the engine.
+The engine-side note `../emdb/NEXTOMIC.md` is the maintainers' view of
+emdb and its §1 is the reader's introduction to Datomic; where it
+describes Nextomic it differs from the shipped design in three places
+(it takes the basis from the engine `txnId`, has a db-value hold a
+read transaction, and counts eight trees with a wider key layout);
+`docs/NEXTOMIC.md` wins on each, and that note is edited only from the
+emdb repository.
 
----
+**The engine**: `../emdb/SPEC.md` (the invariant catalogue: INV-*,
+API-*) and `../emdb/PERFORMANCE.md` are the contracts Nextomic's
+design cites by name (page size and key bound, cursor value clamping,
+one writer, tree registration, sync modes, `delPrefixFromTree`).
 
-## 5. Architecture you must not reshape
+**The owner's rules**:
 
-These interfaces are settled; new work builds on them:
-
-- **Three representations** (PLAN §5): Form, Value, Encoded fuse only
-  through the codec.
-- **Value model**: 16-byte tagged Value, `Kind` enum (heap kinds up to
-  `nextomic_db = 39`). New kinds add to the enum and need dispatch,
-  format and gc arms; `nextomic_handle` shows the pattern for a kind
-  whose body lives above `dispatch`.
-- **dispatch is a one-way terminal**: nothing below it imports it.
-- **Equality-category hash domains**: cross-type sequential equality
-  (list = vector) holds by construction; map and set are their own
-  categories; keyword and symbol hash domains are separated.
-- **VM**: group-based opcode dispatch, `entry_stack_len` per frame,
-  handler and finally stacks, `callValue` reentrancy, range-call ABI.
-- **Compiler**: `lowerForm` → Tiny → emitter; capture analysis is a
-  pre-pass, not lazy boxing; Vars are heap-allocated identity-stable
-  cells and global calls go through Var indirection (PLAN §23 #20).
-- **Expander**: per-form-rule walker, syntax-quote, host + user
-  macros, compile-eval callback, namespace and load callbacks.
-- **db seam**: `db.Connection` owns the `Env`; Nextomic borrows the
-  `Env` and holds raw `*emdb.Txn` handles and byte keys; the two
-  layers share only the engine and the `:db/*` error names.
-- **Nextomic commitments** (`docs/NEXTOMIC.md` §1): bytes-only keys,
-  current and history trees separate, logical `t`, db-value as a
-  plain value with no open read transaction, integer entity ids in
-  partitions, schema as datoms, `q` a native, arena per operation.
-- **Zero changes to emdb.**
-
----
-
-## 6. Discipline
-
-- Spec first for anything substantive: the governing doc section is
-  written or amended before the code, in the same commit.
-- A PLAN §23 decision changes only through a dated Amendment Log entry
-  at the end of `PLAN.md`. Per-doc amendment logs (COMPILER.md, VM.md,
-  ATOM.md, PROTOCOLS.md, PERF.md) record the downstream detail.
-- Hand-trace before code for anything touching the Value model,
-  `call:call` dispatch, or the GC integration.
-- Inline `test` blocks for structural invariants; `test/prop/*.zig`
-  with deterministic seeds for statistical laws; every Nextomic
-  behavior change updates a `test/nextomic/*.out`.
+- **Zero changes to emdb.** Anything the engine seems to lack is
+  solved on the nexis side. The "emdb wants" list is two items,
+  both worked around (`docs/NEXTOMIC.md` §11): a transaction id
+  accessor (Nextomic reads its own `t` from `sys` inside the same
+  snapshot instead) and full multi-page values off a cursor (index
+  trees carry only `[t]` or nothing; payloads and txlog entries are
+  read with `Txn.getFromTree` on the exact key, which assembles every
+  page). `../emdb/NEXTOMIC.md` §6 lists the temptations to refuse.
+- **Timeless code and comments.** Describe what is. No "now",
+  "previously", "used to", phase or turn numbers, or era framing in
+  code, comments or docs; a review treats such phrasing as a defect.
+  Delete the old thing rather than narrate the transition.
+- **No AI attribution lines** in commits, pull requests or comments,
+  whatever a harness suggests.
+- **Every behaviour change starts with a failing test**: an inline
+  `test` block for a structural invariant, a `test/prop/*` sweep for
+  a statistical law, a corpus case for query or pull, a `.nx` script
+  line and its `.out` for anything a program can see.
+- **The full gate before every commit** (`zig build test --summary
+  all`), the quick step in the loop.
+- **Spec first** for anything substantive: the governing doc section
+  is written or amended in the same commit as the code.
 - Read the actual Clojure source and the actual Zig 0.16 stdlib
   before asserting what either does; `CLOJURE-REVIEW.md` records what
   the Clojure source settled, `ZIG-0.16.0.md` the APIs that differ
   from training data.
-- Timeless wording in code and docs: describe what is. Dates live in
-  amendment logs and commit messages only.
-- Commits: short imperative subject, substantive body citing the
-  governing sections, split along logical lines, no attribution
-  trailers, never `--amend` or force-push anything published.
 - Performance claims only from `zig build bench` in ReleaseFast under
-  `docs/BENCH.md`'s rules; publish where Clojure wins too.
+  `docs/BENCH.md`; publish where Clojure wins too.
 
 ---
 
-## 7. Zig 0.16 gotchas that have bitten this tree
+## 5. What is proven, and how
 
-- `std.ArrayList(T){}` → `.empty`; `std.heap.GeneralPurposeAllocator`
-  → `std.heap.DebugAllocator(.{})`; `std.fs.cwd()` → `std.Io.Dir.cwd()`
-  with `io: std.Io` threaded through.
-- `std.io.Writer.Allocating`: `.writer` is a field, not a method.
-- `@intCast(v)` infers its target; `@ptrCast` needs `@alignCast` when
-  the target alignment is larger (heap headers are `align(16)`).
-- `std.math.add`/`mul` for checked arithmetic; `std.hash.XxHash3`.
-- Unused locals must be `const`.
-- A source file cannot be both a test binary's root and a named import
-  of the same graph (why `dispatch` is a terminal and `nextomic_handle`
-  is its own module).
-- Packed structs have field-order layout; `vm.Inst`/`vm.Operand`
-  depend on it.
-- nexus: the number token must be named `integer`; identifier dispatch
-  fires only for a token named `ident`; multi-char literals need `@op`.
-- emdb: page size is fixed for a file's life; always open through
-  `db.zig`/`nextomic/store.zig`, which pin 16 KiB.
+**Oracle corpora.** `test/integration/nextomic_q.zig` runs every query
+twice: through parse → plan → exec, and through `Naive`, a
+nested-loop evaluator over the view's datoms that knows nothing of
+relations, plans or indexes; the sorted row sets must agree and each
+query also pins a hand-counted row count. Rules in `Naive` run
+bottom-up to a naive fixpoint, so the rule corpus uses a small graph
+and the 5k-edge chain is checked against its known closure.
+`test/integration/nextomic_pull.zig` runs every pattern through `pull`
+and through a reference interpreter over `DbValue.entity` and
+`DbValue.datoms`, on the current view, an as-of view and a `with`
+view. `test/prop/nextomic_tx.zig` replays sixty random transactions
+against an in-memory model that expands the §3 rules itself, checks
+the report's datoms after each commit and, at the end, every basis
+through every index plus `since` and `history`, across a reopen and
+an aborted transaction. `test/prop/nextomic_key.zig` sweeps 100,000
+random pairs per value type for `order(enc a, enc b) == cmp(a, b)`,
+the NUL escape round trip, order across the inline threshold, and the
+256-byte search-clue bound. `test/integration/nextomic_fx.zig` is the
+fixture the corpora share.
+
+**Scripts.** `test/nextomic/{basics,indexes,time,errors,query,pull,
+with,with-conn,polish,persist-1,persist-2}.nx` run through
+`bin/nexis` from a scratch directory that also holds `prelude.nx`;
+each script's stdout must equal its `.out`. `persist-1` and
+`persist-2` share one store across two processes. `polish.nx` pins
+the behaviours the others do not: a function binding on a bound
+variable, rule bodies of one name apart in the rule set, a wide
+query, the pull cut at 1000, lookup refs and idents as `:in` inputs,
+transaction entity ids as time arguments, the history view refusing
+`entity` and `pull`, reverse refs and nested maps in map forms, unique
+being card-one, cross-type comparisons, the error payload maps, and
+`connect` making its directories.
+
+**Language.** `test/integration/eval_pipeline.zig` runs source through
+the whole pipeline for every primitive form, macro and
+try/catch/finally path, and asserts after every run that the VM's
+stack length and frame depth are restored (`expectStackRestored`);
+`vm.zig` states the invariant once (every frame records
+`entry_stack_len` and both return paths and `unwindThrow` shrink to
+it) and the eval-pipeline harness is what enforces it.
+`test/integration/runtime_polish.zig` pins the Clojure-fidelity rules
+of the sequence library, records as maps, and the one policy for an
+uncaught keyword throw from a native. `test/prop/*` (fifteen files)
+sweep the collections, codec round trips, interning, heap and
+collector; `src/*.zig` carry the inline unit tests; `test/golden/`
+holds the reader goldens and eight reader-error cases.
+
+**Review passes.** Three independent reviews (an analyst of declared
+objectives against delivered code, an adversary of the design, an
+architect of the ideal shape) drove the Nextomic build: the
+current/history tree split, the logical `t`, the partitioned id
+space, the sortable key encoding with its property test, the plain
+db-value, `q` as a native, the arena-per-operation rule and the
+page-size pin all answer findings from those passes. Three further
+reviews (code quality, a Datomic user's probes, a Clojure-fidelity
+sweep of the language) drove the polish: a function clause on an
+already-bound variable unifies instead of panicking, lookup refs and
+idents as `:in` inputs bind, reverse refs work in map forms, a nested
+map under a plain ref must carry an identity, `:db/unique` on a
+card-many attribute is refused, `since` and `tx-range` take a
+transaction entity id, `entity` refuses a history view, an explicit
+`:db/txInstant` stands, error payloads carry the attribute, value or
+clause that failed, the marshalling lives in one module, the `/`
+symbol survives a Value → Form round trip, a `def` anywhere in a form
+declares its name, float `mod` is floored, vector `conj`/`assoc` are
+O(log n), `(merge {} {})` is `{}`, `set`/`subvec`/`identical?` exist,
+`(keys {})` is nil, `max` returns its operand, `get` reads strings,
+and `vec` takes sets and maps. Review reports were used to drive the
+polish; their findings are folded into tests. What they left open is
+§6.
+
+---
+
+## 6. Known gaps
+
+Each gap: symptom, cause, approach, the test that would prove it,
+size. Nothing here is a data-corruption risk; the first two bound
+process lifetime and the integer range.
+
+### 6.1 The collector is never invoked
+
+*Symptom*: process memory grows without bound; a loader that
+transacts millions of datoms in one process peaks in gigabytes.
+Nextomic's own work is arena-scoped and freed per operation; the
+tx-data a program builds, the reports and query results it holds live
+in the VM heap and stay there.
+
+*Cause*: `src/gc.zig` `Collector.collect` has callers only in its own
+tests and `test/prop/{gc,transient}.zig`; `src/vm.zig` enumerates no
+roots; closures, Vars and `UpvalCell`s are raw `runtime_arena`
+allocations the collector cannot see; `gc.zig`'s mark switch panics
+on `function`, `var_`, `error_`, `meta_symbol`, `byte_vector` and
+`typed_vector` by design, so the collector cannot be switched on
+until those kinds trace. `docs/GC.md` §9 pins the deferral.
+
+*Approach*: (1) a rooting protocol — VM stack and frames, namespace
+Vars, the interner, atom cells, open `db` and
+`nextomic` handles, the per-VM Nextomic query and rule caches (which
+hold query values by heap identity; `docs/NEXTOMIC.md` §5 says a
+collector that frees or moves values must clear both), and a scoped
+root set native functions push values onto before calling
+`vm.callValue`; (2) move closures, Vars and cells onto the heap with
+`trace` arms; (3) a byte counter in `Heap.alloc` and a threshold on
+`Collector`. Nextomic needs nothing beyond cache clearing.
+
+*Proof*: a `test/prop/gc.zig` case that runs a program allocating in
+a loop under a small threshold and asserts a bounded high-water mark
+and unchanged results; an `eval_pipeline` case where a native HOF
+(`map`, `reduce`, `db/reduce-tree`, a query predicate) survives a
+collection triggered inside its callback.
+
+*Size*: `vm.zig`, `gc.zig`, `heap.zig`, `stdlib.zig`, `nextomic/
+query/natives.zig`, `docs/GC.md`; on the order of a thousand lines.
+
+### 6.2 Bignum arithmetic and fixnum promotion
+
+*Symptom*: `(* 100000000 10000000000)` raises `:arithmetic-overflow`;
+the literal `1000000000000000000` is the compile error
+`IntegerOutOfFixnumRange` (through a macro it surfaces as
+`MacroExpansionFailure` over the whole form).
+
+*Cause*: `src/bignum.zig` has construction (`fromI64`, `fromLimbs`),
+canonical form, equality and hash only; `vm.zig` `numAdd`/`numSub`/
+`numMul` return `ArithmeticOverflow` when a result leaves i48;
+`compile.zig` rejects the literal at its one
+`IntegerOutOfFixnumRange` site.
+
+*Approach*: limb arithmetic in `bignum.zig` (`add sub mul quot rem`,
+compare), promotion on overflow in the VM's numeric tower,
+canonicalization of results that fit back to fixnum (`docs/BIGNUM.md`
+§1), literal lifting in the compiler, contagion with f64 unchanged,
+`:db.type/long` refusing bignums (`docs/NEXTOMIC.md` §2.2). Update
+`docs/SEMANTICS.md` §2 and add a PLAN Amendment Log entry.
+
+*Proof*: `test/prop/bignum.zig` sweeps (`(- (+ a b) b) = a` across
+the fixnum boundary, canonical kind after every op), inline VM tests
+at ±2^47, an `eval_pipeline` case for the literal.
+
+*Size*: `bignum.zig`, `vm.zig`, `compile.zig`, `stdlib.zig`
+(`quot`/`rem`/`mod`), two docs; several hundred lines.
+
+### 6.3 Clojure surface gaps
+
+Each is small and self-contained in `src/expand.zig`,
+`src/compile.zig`, `src/stdlib.zig` or `src/stdlib/core.nx`; each
+wants an `eval_pipeline` case that pins the Clojure result. Observed
+through `bin/nexis`:
+
+| gap | observed | where |
+|---|---|---|
+| `case` evaluates its keys | `(case 1 (1 2) :a :d)` → `NotCallable`; `(case 'x x :a :d)` → `UnresolvedSymbol` | `expand.zig` `expandCase` emits `(= g key)` with the raw key form; quote each key and turn a list key into an `or` of alternatives |
+| syntax-quote gaps | `` `(~x ~@[2 3]) `` → `KindMismatch`; `` `{:a 1} `` → `MacroExpansionFailure`; `` `(+ 1 2) `` stays unqualified though PLAN §23 #29 promises qualification | `expand.zig` `expandSyntaxQuote*`: add map, set, quote and anon-fn payloads; seq the `#%concat` operands; decide qualification and either implement it or amend §23 #29 |
+| multi-arity anonymous `fn` | `((fn ([x] x) ([x y] (+ x y))) 1 2)` → `MacroExpansionFailure` | `expandFnRename`; reuse `defn`'s arity dispatcher (`expandDefnMacro`) |
+| finally-only `try`, keyword matchers | `(try 1 (finally 2))` → `MalformedForm`; `(catch :divide-by-zero e ...)` → `UnsupportedFeature` | `compile.zig` `lowerTry` requires one `catch any` |
+| empty bodies and `()` | `((fn []))`, `(let [x 1])`, the literal `()` → `MalformedForm` | `compile.zig` (`items.len == 0` rejection); Clojure yields nil / `()` |
+| `defn` docstrings and attr-maps | `(defn f "doc" [x] x)` → `MacroExpansionFailure` | `expandDefn` |
+| destructuring extras | `{:strs [a]}`, `{:syms [a]}`, namespaced `:keys`, `& {:keys [a]}` keyword args, `loop` bindings | the destructuring expander (`:keys`/`:or`/`:as` at `expand.zig` ~2261) and `loop`'s binding path |
+| `doseq` and `for` modifiers | `doseq` rejects `:when`/`:let`/`:while`; `for` has `:when`/`:let`, not `:while`, and does not destructure | `core.nx` `doseq`; `expand.zig` `expandFor` |
+| `int`/`long`/`double` | `UnresolvedSymbol`; no way to turn a double into an integer | `stdlib.zig` natives |
+| `meta`/`with-meta`, `ex-info`/`ex-data`, `macroexpand`, `read-string`, `list*`, `reduced`, three-arity `fnil` | `UnresolvedSymbol` (`fnil` → `ArityMismatch`) | `stdlib.zig`; `reduced` needs the reducing natives to check for it; `read-string` needs the reader reachable from a native |
+| symbols not callable | `('a {'a 1})` → `:not-callable` | `vm.zig` lookup arm; PLAN §23 #33 promises keywords only, so state or extend |
+| reader errors carry no location | `nexis: parse error: ParseError` for `(println (1 2` | `src/cli.zig` reports compile errors with `file:line:col` and a caret; the reader path has no span; the golden `.err` files carry kinds like `:map-odd-count` that the CLI does not print |
+
+### 6.4 Phase 5 as PLAN §21 defines it
+
+*Symptom*: no test runner, no `nexis.test` (`deftest`/`is`/
+`run-tests`), `nexis.math`, `nexis.pprint`; `bin/nexis` has `run`,
+`repl` and `--help` only, no `--disasm`; runtime errors print
+`nexis: runtime error: DivideByZero` with no source span or stack.
+
+*Approach*: a PC → span table per Routine emitted by `compile.zig`,
+read by the VM's error path and the CLI (`docs/COMPILER.md` and
+`docs/VM.md` amendment logs); `nexis.test` in `core.nx` over `throw`
+and atoms; `--disasm` walking a Routine's instructions with the
+existing operand decoders. Refresh `src/cli.zig`'s usage text in the
+same pass.
+
+*Proof*: an `eval_pipeline` case asserting a runtime error's line and
+column; a `.nx` script under `zig build examples` that defines tests
+and runs them; a golden of `--disasm` output for `examples/sum10.nx`.
+
+*Size*: `compile.zig`, `vm.zig`, `cli.zig`, `core.nx`; several
+hundred lines each for spans and the runner.
+
+### 6.5 Datalog function-position variables
+
+*Symptom*: `[(?f ?x) ?y]` and `[(?pred ?x)]` are `:nextomic/
+query-syntax`; the function position takes a symbol naming a function
+(`docs/NEXTOMIC.md` §5, last sentence of "Execute").
+
+*Approach*: `query/parse.zig` accepts a variable in function position;
+`query/plan.zig` treats it as bound like any input; `query/exec.zig`
+calls the cell's value through the `CallHook`.
+
+*Proof*: corpus cases in `nextomic_q.zig` with `:in $ ?f` bound to a
+`defn`'d function and to a keyword; a `.nx` line in `query.nx`; a
+row in §5.
+
+*Size*: three files, a few dozen lines each.
+
+### 6.6 `typed_vector`
+
+*Symptom*: `Kind.typed_vector = 23` is reserved with no constructor,
+layout or natives; `nexis.simd` does not exist. PLAN §15.11 NX-2
+expects `Relation` columns to share its representation; `relation.zig`
+uses its own typed columns instead.
+
+*Approach*: a heap kind with i64 and f64 columns, `trace`, `format`,
+codec arms, `vec`/`nth`/`count`/`seq` over it; then kernels.
+
+*Proof*: inline tests plus a `test/prop/typed_vector.zig` codec round
+trip; the codec serializability matrix in `docs/CODEC.md` updated.
+
+*Size*: a new `src/coll/typed_vector.zig` of a few hundred lines
+plus arms in five files.
+
+### 6.7 `^:dynamic` Vars and `binding`
+
+*Symptom*: `(binding [x 2] x)` is `UnresolvedSymbol`; `(def ^:dynamic
+x 1)` is `MacroExpansionFailure`, so the marker cannot even be
+written. PLAN §21 Phase 3.7.
+
+*Approach*: a dynamic-binding stack on the VM; `binding` as a macro
+over push/pop with a `finally`; Var loads check the stack only for
+Vars marked dynamic so ordinary loads stay one indirection.
+
+*Proof*: `eval_pipeline` cases for nesting, a throw through
+`binding`, and a closure capturing a dynamic Var seeing the binding
+in force at call time.
+
+*Size*: `vm.zig`, `compile.zig`, `core.nx`; a couple of hundred lines.
+
+### 6.8 Nextomic follow-ups
+
+In the order they unblock users; each is listed as later in
+`docs/NEXTOMIC.md` §6 and wants a §3/§5/§6 row, a corpus or `.nx`
+case and its `.out`:
+
+- **Transaction functions and `:db.fn/cas`**: a Lisp function called
+  inside `transact!` with `db-before`, returning tx-data. Functions
+  are not serializable, so the function resolves through a namespace
+  Var by symbol; it needs §6.1's rooting rule once the collector runs.
+  `transact.zig` normalise stage plus the `CallHook` pattern of
+  `query/exec.zig`.
+- **Excision**: removing datoms from history. EAVT is a prefix
+  (`Txn.delPrefixFromTree` exists in emdb); AEVT, AVET and VAET are
+  per-datom deletes and the txlog entry must be rewritten.
+- **Full-text**: a `:db/fulltext` attribute flag, a tokens tree, a
+  `fulltext` function in queries.
+- **Lazy entities**: an `entity` that reads attributes on access
+  instead of the eager map.
+- **Hash-join tuning**: the planner's estimates come from `treeStat`
+  and per-attribute counts; `exec.zig` chooses nested loop when
+  `rows × log n` is below the scan estimate. Measure
+  `nextomic_q.zig`'s three-way joins in ReleaseFast before and after
+  any change (`docs/PERF.md` §3.7).
+- **Linux 4K-page run**: the page size is pinned in code, so a Linux
+  run should produce byte-identical stores; there is no CI in this
+  repository, so the proof is a run on a Linux host of `zig build
+  test` plus a store written on one platform and read on the other.
+- **Query surface**: `:keys`/`:strs`/`:syms` in `:find`, a second
+  database `:in $ $2`, `(pull ?e [...])` in `:find`, `get-some`,
+  `median`/`variance`/`(max n ?x)`/`(sample n ?x)`, and a fourth
+  component to `datoms` are `:nextomic/query-syntax` or
+  `:arity-mismatch`; `query/parse.zig` is where each starts.
+- **Schema alteration**: `:db/ident` rename and cardinality one → many
+  are `:nextomic/conflict`; `docs/NEXTOMIC.md` §3 states schema is
+  additive.
+- **A datom heap kind**: reads return `[e a v t added]` vectors.
+
+### 6.9 Smaller items
+
+- `zig fmt --check` fails on `src/pool.zig`, `src/value.zig`,
+  `src/golden.zig`, `src/nexis.zig` and the generated
+  `src/parser.zig`; every other file under `src/` and `test/` is
+  clean.
+- `for` returns a vector, not a seq; `map`/`filter`/`reduce` are
+  eager (PLAN §23 #14; a `stream` library is an open question).
+- Not serializable (`:unserializable`): functions, vars, transients,
+  namespaces, tx handles, records, protocols, the Nextomic handles.
+- Reader edges: `1.` reads as a symbol; `:a/b/c` and `'a//b` are
+  `ReaderFailure`; `\é` is a `ParseError` (`\u{HEX}` is the escape).
+- Two connections to one file in one process work; their db-values at
+  the same basis are unequal (equality is by connection identity).
+
+---
+
+## 7. How to work here
+
+**Worktree per task.** `git worktree add ../nexis-wt-<name> -b <name>`
+from the repository root; every worktree has its own `.zig-cache` and
+`bin/`, and `../emdb` resolves from any of them. Merge to `main` as a
+true merge, then delete the branch locally and remotely. Never
+`--amend` or force-push anything published.
+
+**Commits.** Short imperative subject with the area as prefix
+(`nextomic:`, `stdlib:`, `compile:`, `vm:`, `docs:`, `test/nextomic:`),
+a body that says what the behaviour is and cites the governing
+section, split along logical lines, no attribution trailers. Spec and
+test land in the same commit as the code.
+
+**The gate.** `zig build quick` in the loop; `zig build nextomic-test`,
+`nextomic-nx` and `examples` after touching `src/nextomic/`,
+`stdlib.zig` or anything an example uses; `zig build test --summary
+all` before every commit. If the tree does not build clean on arrival,
+fix the environment before the first edit.
+
+**Adding a native.** In `src/stdlib.zig`: a `NativeFn` descriptor
+(`name`, `min_arity`, `max_arity` or `null` for variadic, `call`) and
+an entry in the table of its namespace (`core_fns`, `db_fns`,
+`string_fns`, `internal_fns`). The VM enforces arity; the function
+receives `(vm, args)` and returns a `Value` or a `VmError`. Throw with
+`vm.throwKeyword("name")` or `vm.throwValue(v)`; never hold a VM-heap
+pointer across `vm.callValue` without rooting it (§6.1). Nextomic
+natives go in `src/nextomic/natives.zig`'s table (or
+`query/natives.zig` for query entry points) and wrap their body in a
+`Scope` so the arena and read close on every path.
+
+**Adding a `core.nx` macro or function.** `src/stdlib/core.nx` is
+embedded with `@embedFile` and evaluated into `nexis.core` at boot
+after the natives; a definition may use only what precedes it and
+the natives. Macros here are user `defmacro`s and run in the
+compile-time sub-VM; host macros (Zig) are registered in
+`src/expand.zig`'s table.
+
+**Adding a Nextomic tree or error.** A tree: `store.zig` `tree_names`
+and `Trees`, a `docs/NEXTOMIC.md` §2 row, the `sys` format number if
+the layout changes, and a bootstrap test. An error: a variant in the
+explicit error set of the function that raises it, its keyword in
+`natives.zig` `errorKeyword` (the totality test fails until it is
+there), its payload keys in `failWith`'s `Detail`, a §7 row, and the
+`.out` line that shows the map.
+
+**Adding a `.nx` script.** Write `test/nextomic/<name>.nx` starting
+with `(require '[nextomic :as d])` and `(require '[prelude :as t])`
+for `t/check`, `t/caught`, `t/user-partition` and `t/tx-partition`;
+add the name to the `scripts` list in `build.zig`'s `nextomic-nx`
+block; produce the `.out` by running the script once from a scratch
+directory that holds a copy of `prelude.nx` (`bin/nexis run
+<name>.nx > <name>.out` with the scratch directory as cwd), read
+every line before committing it, and
+keep the store path relative so the build's scratch directory owns
+it. A map prints in CHAMP trie order, which for keyword keys is a
+function of each keyword's intern id: stable for a given script, not
+alphabetical, and different when a key is interned earlier; sort
+before printing when a line needs a readable order.
+
+**Running one test binary.** `zig build quick --verbose` (or any test
+step) prints each binary's command line as `.zig-cache/o/<hash>/test
+--listen=-`; run that path with no arguments and it prints `All N
+tests passed`. The binaries are Debug builds under
+`std.testing.allocator`, which reports leaks.
+
+**ReleaseFast.** `zig build -Doptimize=ReleaseFast install` builds
+`bin/nexis` optimized in about 12 s warm; `-Doptimize=ReleaseFast`
+applies to every step, so `zig build -Doptimize=ReleaseFast test`
+runs the gate optimized and `NEXTOMIC_BENCH=1 zig build nextomic-test
+-Doptimize=ReleaseFast --summary all` reproduces `docs/PERF.md` §3.7.
+A Debug binary under the testing allocator is not a performance
+measurement.
+
+**Formatting.** `zig fmt --check <files you touched>`; the five files
+in §6.9 are the only ones that fail, and `src/parser.zig` is generated
+(`zig build parser` after any change to `nexis.grammar`; commit the
+regenerated file with the grammar).
+
+**Zig 0.16 traps** that have bitten this tree are listed in
+`AGENTS.md`; `ZIG-0.16.0.md` has the rest.
+
+---
+
+## 8. Recommended order of work
+
+1. **Bignum arithmetic and promotion (§6.2).** The number tower is a
+   frozen decision (PLAN §23 #10) that the tree only half honours;
+   the work is contained in four files, its oracle is a property
+   sweep, and it removes the one compile error a program hits by
+   writing an ordinary integer. Nothing else depends on it, and it
+   does not depend on anything.
+2. **The collector (§6.1).** The largest gap and the one that bounds
+   every long-running use, including a Nextomic loader. It touches
+   the VM, the natives and the Nextomic caches, so it is best done
+   before the natives multiply further; transaction functions (§6.8)
+   wait on its rooting rule.
+3. **Clojure surface gaps (§6.3), `case` and syntax-quote first.**
+   Each is a morning's work with an obvious test; together they are
+   most of what a Clojure programmer trips over in the first hour.
+   `defn` docstrings, multi-arity `fn`, finally-only `try` and the
+   conversions follow in whatever order the next program needs.
+4. **Runtime source spans and the test runner (§6.4).** Once programs
+   are longer than a screen, an unlocated `DivideByZero` is the
+   worst remaining experience; the span table is the substrate for
+   `nexis.test` output and for `--disasm`.
+5. **Datalog function-position variables (§6.5)** and the query
+   surface items in §6.8, driven by the first real query that needs
+   them; each is a parse/plan/exec triple with a corpus case.
+6. **Transaction functions and `:db.fn/cas`, then excision and
+   full-text (§6.8).** Transaction functions unlock the next class
+   of Nextomic programs; they come after 2 so the callback into the
+   VM is safe by construction.
+7. **`^:dynamic`/`binding` (§6.7) and `typed_vector` (§6.6)** when a
+   user need appears; both are self-contained and neither blocks the
+   rest.
+8. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
+   inline caches, SIMD CHAMP nodes, zero-copy strings from emdb
+   pages, hash-join tuning. Measure first with `zig build bench`;
+   `docs/BENCH.md` is the honesty gate.
+
+Take them in this order unless a user need reorders them; every item
+starts with its spec section and its failing test.
