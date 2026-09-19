@@ -374,6 +374,22 @@ applied when the clause runs: a function through `callValue`, a keyword
 or collection as the language applies them, anything else is the VM's
 `:not-callable`. A function is identity-valued in a relation.
 
+**Aggregates** group the basis set (the distinct tuples over the `:find`
+and `:with` variables) by the plain find elements: `count`, `sum`,
+`avg`, `min`, `max`, `median`, `variance`, `stddev`, `count-distinct`,
+`distinct` (a set), `(min n ?x)` and `(max n ?x)` (the n smallest or
+largest, a vector), `(sample n ?x)` (up to n distinct values, a vector)
+and `(rand n ?x)` (n values with repetition, a vector). `min` and `max`
+compare any type in the cell order; `sum`, `avg`, `variance` and `stddev`
+take numbers (`:nextomic/value-type` otherwise); `median` of an odd
+count is the middle value of any type, of an even count the mean of the
+two middle numbers as a double; `variance` divides by the count
+(population variance) and `stddev` is its square root. Any other symbol
+in aggregate position, `(my.ns/total ?x)`, is a custom aggregate: it
+resolves like a function clause and is called with the vector of the
+group's values. No rows form no group, so an aggregate-only query over
+nothing is empty (nil for `.` and `[...]`), not zero.
+
 **Relation** is a Zig-private columnar struct in the query arena
 (`vars`, typed columns for eids and longs, a `Value` column otherwise);
 never a VM value. Results are copied into the VM heap as a persistent
@@ -409,7 +425,7 @@ sub-plans with the same output variables.
 | `(d/entity db e)` | eager map `{:db/id e :attr v ...}`, card-many as sets, refs as eids; nil when the entity has no datoms in this view; `:nextomic/history-view` on a history db |
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
 | `(d/datoms db :eavt e a v)` (index and optional components in index order; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
-| `(d/q query db & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]`, aggregates and `(pull ?e pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] % $2` with inputs positional after the db (a `$name` source takes a db value; `[$2 ?e :a ?v]` and `($2 rule ?x)` read it), `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
+| `(d/q query db & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]`, aggregates (built-in and custom) and `(pull ?e pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] % $2` with inputs positional after the db (a `$name` source takes a db value; `[$2 ?e :a ?v]` and `($2 rule ?x)` read it), `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
 | `(d/explain query db & inputs)` | the plan `q` would run, as a string: one numbered line per step with index, estimate, source (when not `$`) and bound variables |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4); `t` is a transaction number or a transaction's entity id |
 | `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}` for `from ≤ t < to`, oldest first; a bound that is `nil` or not given is open |

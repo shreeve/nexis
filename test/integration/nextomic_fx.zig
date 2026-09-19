@@ -220,6 +220,13 @@ pub const Fx = struct {
             return vector_mod.fromSlice(&self.heap, rows);
         }
         if (std.mem.eql(u8, name, "maybe")) return if (args[0].asFixnum() > 30) args[0] else value.nilValue();
+        if (std.mem.eql(u8, name, "total")) {
+            // A custom aggregate: the sum of a vector of integers.
+            var sum: i64 = 0;
+            var it = vector_mod.Cursor.init(args[0]);
+            while (it.next()) |x| sum += x.asFixnum();
+            return value.fromFixnum(sum).?;
+        }
         if (std.mem.eql(u8, name, "boom")) return error.ControlTransferred;
         return error.UnknownFunction;
     }

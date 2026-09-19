@@ -44,6 +44,11 @@ ok a nil function result drops the row
 185
 215
 ([Ann 2] [Cy 1])
+[31.5 94.47222222222223 9.719682207882222 [55 41] [26 30]]
+30
+([Ann 4] [Bob 2] [Cy 4])
+(3 8 5)
+:nextomic/value-type
 (:blue :green :red)
 Edward
 nil

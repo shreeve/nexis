@@ -314,9 +314,21 @@ const Parser = struct {
                 if (parts[2].kind() != .persistent_vector) return self.fail("pull takes a pattern vector");
                 return .{ .pull = .{ .e = try self.varOf(parts[1].asSymbolId()), .pattern = parts[2] } };
             }
-            if (parts.len != 2 or !self.isVarSym(parts[1])) return self.fail("aggregate takes one variable");
-            const op = ir.AggOp.fromName(name) orelse return self.fail("unknown aggregate");
-            return .{ .agg = .{ .op = op, .arg = try self.varOf(parts[1].asSymbolId()) } };
+            if (self.isVarSym(parts[0])) return self.fail("an aggregate is named by a symbol");
+            const op = ir.AggOp.fromName(name) orelse .custom;
+            var n: ?u32 = null;
+            var arg_at: usize = 1;
+            if (op.takesN()) |takes| {
+                const given = parts.len == 3;
+                if (takes == .required and !given) return self.fail("this aggregate is (op n ?x)");
+                if (given) {
+                    if (parts[1].kind() != .fixnum or parts[1].asFixnum() < 0) return self.fail("an aggregate's n is a non-negative integer");
+                    n = std.math.cast(u32, parts[1].asFixnum()) orelse return self.fail("an aggregate's n is too large");
+                    arg_at = 2;
+                }
+            }
+            if (parts.len != arg_at + 1 or !self.isVarSym(parts[arg_at])) return self.fail("aggregate takes one variable");
+            return .{ .agg = .{ .op = op, .n = n, .sym = parts[0].asSymbolId(), .arg = try self.varOf(parts[arg_at].asSymbolId()) } };
         }
         return self.fail(":find takes variables, aggregates and pull expressions");
     }
@@ -813,7 +825,7 @@ test "vector form: find specs, in bindings, where clause kinds" {
     defer parsed.deinit();
     try testing.expectEqual(ir.FindSpec.relation, parsed.find_spec);
     try testing.expectEqual(@as(usize, 2), parsed.find.len);
-    try testing.expect(parsed.find[1] == .agg and parsed.find[1].agg.op == .count);
+    try testing.expect(parsed.find[1] == .agg and parsed.find[1].agg.op == .count and parsed.find[1].agg.n == null);
     try testing.expectEqual(@as(usize, 7), parsed.in.len);
     try testing.expect(parsed.in[0] == .src and parsed.in[1] == .scalar and parsed.in[2] == .collection and parsed.in[3] == .relation and parsed.in[4] == .rules);
     try testing.expect(parsed.in[5] == .scalar and parsed.in[6] == .scalar);
@@ -925,6 +937,24 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
     // Unknown section.
     const q7 = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("keyz"), b.sym("e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
     try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, q7, &diag));
+
+    // Aggregates with a count, custom aggregates, and their errors.
+    const q_agg = b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("max"), b.int(2), b.sym("?v") }), b.lst(&.{ b.sym("sample"), b.int(3), b.sym("?v") }), b.lst(&.{ b.sym("my/total"), b.sym("?v") }), b.lst(&.{ b.sym("median"), b.sym("?v") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }) });
+    const pa = try parse(testing.allocator, &interner, q_agg, &diag);
+    defer pa.deinit();
+    try testing.expect(pa.find[0].agg.op == .max and pa.find[0].agg.n.? == 2);
+    try testing.expect(pa.find[1].agg.op == .sample and pa.find[1].agg.n.? == 3);
+    try testing.expect(pa.find[2].agg.op == .custom and pa.find[2].agg.sym == b.sym("my/total").asSymbolId());
+    try testing.expect(pa.find[3].agg.op == .median and pa.find[3].agg.n == null);
+    for ([_]Value{
+        b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("sample"), b.sym("?v") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }) }),
+        b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("rand"), b.int(-1), b.sym("?v") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }) }),
+        b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("sum"), b.int(2), b.sym("?v") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }) }),
+        b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("?f"), b.sym("?v") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }) }),
+    }) |bad| {
+        try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, bad, &diag));
+        try testing.expect(diag.message.len > 0);
+    }
 
     // :keys / :strs / :syms name every find element; pull expressions.
     const q_keys = b.vec(&.{ b.kw("find"), b.sym("?e"), b.lst(&.{ b.sym("pull"), b.sym("?e"), b.vec(&.{b.kw("a")}) }), b.kw("keys"), b.sym("id"), b.sym("row"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });

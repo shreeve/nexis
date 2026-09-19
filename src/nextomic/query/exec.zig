@@ -82,6 +82,8 @@ pub const Exec = struct {
     hook: ?CallHook,
     /// Where an `UnknownAttribute` in an input leaves its name.
     diag: ?*Diag = null,
+    /// The random source of `sample` and `rand`, made on first use.
+    prng: ?std.Random.DefaultPrng = null,
 
     /// Run `p` from `input`, which binds at least `p.input`.
     pub fn runPlan(self: *Exec, p: *const Plan, input: Relation) anyerror!Relation {
@@ -658,7 +660,7 @@ pub const Exec = struct {
             for (query.find, row) |f, *cell| {
                 cell.* = switch (f) {
                     .variable, .pull => basis.get(members.items[0], f.variable_of()).?,
-                    .agg => |a| try self.aggregate(a.op, &basis, basis.colOf(a.arg).?, members.items),
+                    .agg => |a| try self.aggregate(a, &basis, basis.colOf(a.arg).?, members.items),
                 };
             }
             try rows.append(self.arena, row);
@@ -666,20 +668,46 @@ pub const Exec = struct {
         return rows.toOwnedSlice(self.arena);
     }
 
-    fn aggregate(self: *Exec, op: ir.AggOp, basis: *const Relation, col: usize, members: []const usize) anyerror!Cell {
+    /// One aggregate over the group's `members` of `col`. `median` of
+    /// an even count is the mean of the two middle values as a double;
+    /// `variance` divides by the count (population variance) and
+    /// `stddev` is its square root; `(min n ?x)` and `(max n ?x)` are
+    /// the n smallest or largest values in order, `(sample n ?x)` up to
+    /// n distinct values and `(rand n ?x)` n values with repetition,
+    /// each a vector; a custom aggregate receives the vector of values.
+    fn aggregate(self: *Exec, agg: ir.Agg, basis: *const Relation, col: usize, members: []const usize) anyerror!Cell {
+        const op = agg.op;
         switch (op) {
             .count => return .{ .int = @intCast(members.len) },
-            .count_distinct, .distinct => {
+            .count_distinct, .distinct, .sample => {
                 var seen = try Relation.init(self.arena, &.{0});
                 for (members) |m| try seen.append(&.{basis.cell(m, col)});
                 const d = try seen.dedup();
                 if (op == .count_distinct) return .{ .int = @intCast(d.rows) };
+                if (op == .sample) {
+                    const cells = try self.arena.alloc(Cell, d.rows);
+                    for (cells, 0..) |*c, i| c.* = d.cell(i, 0);
+                    self.random().shuffle(Cell, cells);
+                    return self.cellVector(cells[0..@min(cells.len, agg.n.?)]);
+                }
                 var set = try champ.setEmpty(self.heap);
                 var i: usize = 0;
                 while (i < d.rows) : (i += 1) set = try champ.setConj(self.heap, set, try self.cellValue(d.cell(i, 0)), &dispatch.hashValue, &dispatch.equal);
                 return .{ .vm = set };
             },
+            .rand => {
+                const n = agg.n.?;
+                const cells = try self.arena.alloc(Cell, if (members.len == 0) 0 else n);
+                for (cells) |*c| c.* = basis.cell(members[self.random().uintLessThan(usize, members.len)], col);
+                return self.cellVector(cells);
+            },
             .min, .max => {
+                if (agg.n) |n| {
+                    const cells = try self.arena.alloc(Cell, members.len);
+                    for (members, cells) |m, *c| c.* = basis.cell(m, col);
+                    std.mem.sort(Cell, cells, op == .max, cellLess);
+                    return self.cellVector(cells[0..@min(cells.len, n)]);
+                }
                 var best: ?Cell = null;
                 for (members) |m| {
                     const c = basis.cell(m, col);
@@ -691,6 +719,36 @@ pub const Exec = struct {
                     if ((op == .min and o == .lt) or (op == .max and o == .gt)) best = c;
                 }
                 return best orelse .nil;
+            },
+            .median => {
+                const cells = try self.arena.alloc(Cell, members.len);
+                for (members, cells) |m, *c| c.* = basis.cell(m, col);
+                std.mem.sort(Cell, cells, false, cellLess);
+                if (cells.len == 0) return .nil;
+                if (cells.len % 2 == 1) return cells[cells.len / 2];
+                const lo = try numberOf(cells[cells.len / 2 - 1]);
+                const hi = try numberOf(cells[cells.len / 2]);
+                return .{ .double = (lo + hi) / 2 };
+            },
+            .variance, .stddev => {
+                if (members.len == 0) return .nil;
+                var mean: f64 = 0;
+                for (members) |m| mean += try numberOf(basis.cell(m, col));
+                mean /= @floatFromInt(members.len);
+                var acc: f64 = 0;
+                for (members) |m| {
+                    const d = (try numberOf(basis.cell(m, col))) - mean;
+                    acc += d * d;
+                }
+                const variance = acc / @as(f64, @floatFromInt(members.len));
+                return .{ .double = if (op == .variance) variance else @sqrt(variance) };
+            },
+            .custom => {
+                const hook = self.hook orelse return error.NoHook;
+                const vals = try self.arena.alloc(Value, members.len);
+                for (members, vals) |m, *v| v.* = try self.cellValue(basis.cell(m, col));
+                const result = try hook.call(hook.ctx, agg.sym, &.{try vector_mod.fromSlice(self.heap, vals)});
+                return Cell.fromValue(result);
             },
             .sum, .avg => {
                 var isum: i64 = 0;
@@ -712,6 +770,35 @@ pub const Exec = struct {
                 return .{ .double = total / @as(f64, @floatFromInt(members.len)) };
             },
         }
+    }
+
+    fn cellLess(descending: bool, a: Cell, b: Cell) bool {
+        const o = a.order(b);
+        return if (descending) o == .gt else o == .lt;
+    }
+
+    /// A numeric cell as a double; anything else is `ValueType`.
+    fn numberOf(c: Cell) error{ValueType}!f64 {
+        return switch (c) {
+            .int => |n| @floatFromInt(n),
+            .double => |d| d,
+            else => error.ValueType,
+        };
+    }
+
+    fn cellVector(self: *Exec, cells: []const Cell) !Cell {
+        return .{ .vm = try self.rowVector(cells) };
+    }
+
+    /// The query's random source, seeded once per query from the clock.
+    fn random(self: *Exec) std.Random {
+        if (self.prng == null) {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &ts);
+            const seed = (@as(u64, @intCast(ts.sec)) *% 1_000_000_007) ^ @as(u64, @intCast(ts.nsec)) ^ @intFromPtr(self);
+            self.prng = std.Random.DefaultPrng.init(seed);
+        }
+        return self.prng.?.random();
     }
 
     /// Copy `rows` into the VM heap as the find spec asks: a set of

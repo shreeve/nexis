@@ -368,7 +368,7 @@ const Naive = struct {
             for (parsed.find, row) |f, *c| {
                 c.* = switch (f) {
                     .variable, .pull => members.items[0][indexOf(basis_vars.items, f.variable_of())],
-                    .agg => |ag| try self.aggregate(ag.op, members.items, indexOf(basis_vars.items, ag.arg)),
+                    .agg => |ag| try self.aggregate(ag, members.items, indexOf(basis_vars.items, ag.arg)),
                 };
             }
             try out.append(arena, row);
@@ -376,9 +376,37 @@ const Naive = struct {
         return out.toOwnedSlice(arena);
     }
 
-    fn aggregate(self: *Naive, op: ir.AggOp, members: []const Row, col: usize) !Cell {
+    /// The naive aggregate: sorting where the engine sorts, a random
+    /// vector's length only for `sample` and `rand` (compared by count
+    /// in the tests), the same custom call through the fixture.
+    fn aggregate(self: *Naive, ag: ir.Agg, members: []const Row, col: usize) !Cell {
+        const op = ag.op;
+        const sorted = try self.arena.alloc(Cell, members.len);
+        for (members, sorted) |m, *c| c.* = m[col];
+        std.mem.sort(Cell, sorted, {}, cellAsc);
         switch (op) {
             .count => return .{ .int = @intCast(members.len) },
+            .median => {
+                if (sorted.len == 0) return .nil;
+                if (sorted.len % 2 == 1) return sorted[sorted.len / 2];
+                return .{ .double = (try num(sorted[sorted.len / 2 - 1]) + try num(sorted[sorted.len / 2])) / 2 };
+            },
+            .variance, .stddev => {
+                if (sorted.len == 0) return .nil;
+                var mean: f64 = 0;
+                for (sorted) |c| mean += try num(c);
+                mean /= @floatFromInt(sorted.len);
+                var acc: f64 = 0;
+                for (sorted) |c| acc += (try num(c) - mean) * (try num(c) - mean);
+                const v = acc / @as(f64, @floatFromInt(sorted.len));
+                return .{ .double = if (op == .variance) v else @sqrt(v) };
+            },
+            .sample, .rand => return error.Unsupported,
+            .custom => {
+                const vals = try self.arena.alloc(Value, members.len);
+                for (members, vals) |m, *v| v.* = try self.cellValue(m[col]);
+                return Cell.fromValue(try Fx.hookCall(@ptrCast(self.fx), ag.sym, &.{try vector_mod.fromSlice(&self.fx.heap, vals)}));
+            },
             .count_distinct, .distinct => {
                 var seen: std.ArrayList(Cell) = .empty;
                 for (members) |m| {
@@ -394,6 +422,12 @@ const Naive = struct {
                 return .{ .vm = set };
             },
             .min, .max => {
+                if (ag.n) |n| {
+                    if (op == .max) std.mem.reverse(Cell, sorted);
+                    const vals = try self.arena.alloc(Value, @min(n, sorted.len));
+                    for (sorted[0..vals.len], vals) |c, *v| v.* = try self.cellValue(c);
+                    return .{ .vm = try vector_mod.fromSlice(&self.fx.heap, vals) };
+                }
                 var best = members[0][col];
                 for (members[1..]) |m| {
                     const o = m[col].order(best);
@@ -802,6 +836,18 @@ const Naive = struct {
     }
 };
 
+fn cellAsc(_: void, a: Cell, b: Cell) bool {
+    return a.order(b) == .lt;
+}
+
+fn num(c: Cell) !f64 {
+    return switch (c) {
+        .int => |n| @floatFromInt(n),
+        .double => |d| d,
+        else => error.ValueType,
+    };
+}
+
 fn cellToVal(c: Cell, vt: key.ValueType) !?key.Val {
     return switch (vt) {
         .string => if (c == .str) .{ .string = c.str } else null,
@@ -1001,6 +1047,21 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     try checkCount(fx, dbv, "[:find ?n (distinct ?i) :where [?o :order/customer ?c] [?c :person/name ?n] [?o :order/items ?i]]", none, 3);
     try checkCount(fx, dbv, "[:find (max ?n) :where [_ :person/name ?n]]", none, 1);
     try checkCount(fx, dbv, "[:find ?t :with ?o :where [?o :order/status :status/open] [?o :order/total ?t]]", none, 2);
+    // Statistics, n-ary min and max, a custom aggregate over the group.
+    try checkCount(fx, dbv, "[:find (median ?a) (variance ?a) (stddev ?a) :with ?e :where [?e :person/age ?a]]", none, 1);
+    try checkCount(fx, dbv, "[:find (median ?h) :where [_ :person/height ?h]]", none, 1);
+    try checkCount(fx, dbv, "[:find (median ?n) :where [?e :person/boss _] [?e :person/name ?n]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?st (median ?t) (max 2 ?t) (min 1 ?t) :where [?o :order/status ?st] [?o :order/total ?t]]", none, 2);
+    try checkCount(fx, dbv, "[:find (max 3 ?a) (min 10 ?a) :with ?e :where [?e :person/age ?a]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?n (total ?a) :with ?o :where [?o :order/customer ?c] [?c :person/name ?n] [?o :order/number ?a]]", none, 3);
+    try checkCount(fx, dbv, "[:find (total ?a) :with ?e :where [?e :person/age ?a]]", none, 1);
+    for ([_][]const u8{
+        "[:find (median ?n) (variance ?n) :where [_ :person/name ?n]]",
+        "[:find (stddev ?r) :where [_ :person/role ?r]]",
+    }) |src| {
+        try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, src, none));
+        try testing.expectError(error.ValueType, Naive.run(fx, fx.arena(), dbv, src, none));
+    }
 
     // Find specs (the row shape is the same; the value shape is checked below).
     try checkCount(fx, dbv, "[:find ?n . :where [?e :person/name ?n] [?e :person/age 55]]", none, 1);
@@ -1335,6 +1396,33 @@ test "results materialise as set, scalar, collection, tuple; caches; explain" {
     try testing.expectApproxEqAbs(@as(f64, 215.0 / 6.0), vector_mod.nth(agg, 2).asFloat(), 1e-9);
     try testing.expectEqual(@as(usize, 5), champ.setCount(vector_mod.nth(agg, 3)));
 
+    // Statistics and random samples as values: an even median is the
+    // mean of the two middle values, variance is over the count, sample
+    // is distinct, rand repeats, both are cut at n and empty for no rows.
+    const stats = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [(median ?a) (variance ?a) (stddev ?a) (max 2 ?a) (min 2 ?a) (total ?a)] :with ?e :where [?e :person/age ?a]]"), dbv, none, &diag, opts);
+    // ages 26 30 30 33 41 55: median 31.5, mean 35.8333, variance 94.4722
+    try testing.expectApproxEqAbs(@as(f64, 31.5), vector_mod.nth(stats, 0).asFloat(), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 94.47222222222223), vector_mod.nth(stats, 1).asFloat(), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, @sqrt(94.47222222222223)), vector_mod.nth(stats, 2).asFloat(), 1e-9);
+    try testing.expectEqual(@as(i64, 55), vector_mod.nth(vector_mod.nth(stats, 3), 0).asFixnum());
+    try testing.expectEqual(@as(i64, 41), vector_mod.nth(vector_mod.nth(stats, 3), 1).asFixnum());
+    try testing.expectEqual(@as(i64, 26), vector_mod.nth(vector_mod.nth(stats, 4), 0).asFixnum());
+    try testing.expectEqual(@as(i64, 30), vector_mod.nth(vector_mod.nth(stats, 4), 1).asFixnum());
+    try testing.expectEqual(@as(i64, 215), vector_mod.nth(stats, 5).asFixnum());
+    const odd_median = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (median ?a) . :where [?e :person/age ?a] [(< ?a 41)]]"), dbv, none, &diag, opts);
+    try testing.expectEqual(@as(i64, 30), odd_median.asFixnum());
+    const picks = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [(sample 3 ?a) (rand 8 ?a) (sample 100 ?a) (sample 0 ?a)] :where [?e :person/age ?a]]"), dbv, none, &diag, opts);
+    try testing.expectEqual(@as(usize, 3), vector_mod.count(vector_mod.nth(picks, 0)));
+    try testing.expectEqual(@as(usize, 8), vector_mod.count(vector_mod.nth(picks, 1)));
+    try testing.expectEqual(@as(usize, 5), vector_mod.count(vector_mod.nth(picks, 2)));
+    try testing.expectEqual(@as(usize, 0), vector_mod.count(vector_mod.nth(picks, 3)));
+    const all_ages = try fx.read("#{26 30 33 41 55}");
+    var sit = vector_mod.Cursor.init(vector_mod.nth(picks, 2));
+    while (sit.next()) |x| try testing.expect(champ.setContains(all_ages, x, &dispatch.hashValue, &dispatch.equal));
+    // No rows form no group: an aggregate-only result is empty, not zero.
+    const no_rows = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find [(sample 3 ?a) (rand 3 ?a) (median ?a) (max 2 ?a)] :where [?e :person/age ?a] [(> ?a 100)]]"), dbv, none, &diag, opts);
+    try testing.expect(no_rows.isNil());
+
     // Pull expressions in :find yield the pattern's map per row, in
     // every find spec and beside an aggregate; a history db refuses them.
     const pulled = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find (pull ?e [:person/name :person/age]) :where [?e :person/email \"cy@x\"]]"), dbv, none, &diag, opts);
@@ -1377,7 +1465,7 @@ test "results materialise as set, scalar, collection, tuple; caches; explain" {
     // Keyword and string values come back as VM values; the cache serves repeats.
     const kws = try query.q(testing.allocator, fx.interner(), &fx.heap, rel_q, dbv, none, &diag, opts);
     try testing.expectEqual(@as(usize, 3), champ.setCount(kws));
-    try testing.expectEqual(@as(usize, 16), cache.count());
+    try testing.expectEqual(@as(usize, 20), cache.count());
     const rules_q = try fx.read("[:find [?n ...] :in $ % :where (admin ?p) [?p :person/name ?n]]");
     const rules_v = try fx.read(rules_src);
     const admins = try query.q(testing.allocator, fx.interner(), &fx.heap, rules_q, dbv, &.{ value.nilValue(), rules_v }, &diag, opts);

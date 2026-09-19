@@ -179,8 +179,16 @@ pub const AggOp = enum {
     min,
     max,
     avg,
+    median,
+    variance,
+    stddev,
     count_distinct,
     distinct,
+    sample,
+    rand,
+    /// A symbol that names no built-in: called through the `CallHook`
+    /// with the vector of the group's values.
+    custom,
 
     pub fn name(self: AggOp) []const u8 {
         return switch (self) {
@@ -189,23 +197,47 @@ pub const AggOp = enum {
             .min => "min",
             .max => "max",
             .avg => "avg",
+            .median => "median",
+            .variance => "variance",
+            .stddev => "stddev",
             .count_distinct => "count-distinct",
             .distinct => "distinct",
+            .sample => "sample",
+            .rand => "rand",
+            .custom => "custom",
         };
     }
 
     pub fn fromName(s: []const u8) ?AggOp {
         inline for (@typeInfo(AggOp).@"enum".fields) |f| {
             const op: AggOp = @enumFromInt(f.value);
-            if (std.mem.eql(u8, s, op.name())) return op;
+            if (op != .custom and std.mem.eql(u8, s, op.name())) return op;
         }
         return null;
     }
+
+    /// Does the aggregate take a leading count: `(op n ?x)`?
+    pub fn takesN(self: AggOp) ?enum { required, optional } {
+        return switch (self) {
+            .sample, .rand => .required,
+            .min, .max => .optional,
+            else => null,
+        };
+    }
+};
+
+pub const Agg = struct {
+    op: AggOp,
+    arg: Var,
+    /// The `n` of `(sample n ?x)`, `(rand n ?x)`, `(min n ?x)`, `(max n ?x)`.
+    n: ?u32 = null,
+    /// The symbol of a `custom` aggregate.
+    sym: u32 = 0,
 };
 
 pub const FindElem = union(enum) {
     variable: Var,
-    agg: struct { op: AggOp, arg: Var },
+    agg: Agg,
     /// `(pull ?e pattern)`: the pattern value is resolved against the
     /// db when the result is materialised; the element groups and
     /// dedups as its variable.
