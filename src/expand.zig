@@ -1253,7 +1253,9 @@ fn expandCollKind(
 //
 // User-macro INVOCATION:
 //   1. Convert each arg Form → Value via `formToValue`.
-//   2. Call `VM.evalClosure(var.root, arg_values, &sub_vm)`.
+//   2. Call `VM.evalClosure(var.root, arg_values, &sub_vm, interner)`;
+//      the sub-VM borrows the compile-time interner so names in
+//      its arguments resolve.
 //   3. Convert returned Value → Form via `valueToForm` in
 //      `ctx.allocator` (the compile arena).
 //   4. Deinit the sub-VM.
@@ -1515,6 +1517,7 @@ fn invokeUserMacro(
         macro_var.root,
         arg_values,
         &sub_vm,
+        ctx.interner,
     ) catch {
         return ExpandError.MalformedMacroCall;
     };
@@ -1946,14 +1949,15 @@ fn expandFnRename(
     var saw_rest = false;
     for (params) |p| {
         if (saw_rest) {
-            // After `&` — the rest param. If pattern, destructure.
+            // After `&` — the rest param. If pattern, destructure;
+            // a map pattern takes keyword arguments.
             if (p.datum == .symbol) {
                 try new_params.append(ctx.allocator, @constCast(p));
             } else {
                 const tmp = try genTempSym(ctx, call_form.origin);
                 try new_params.append(ctx.allocator, tmp);
                 try destruct_bindings.append(ctx.allocator, @constCast(p));
-                try destruct_bindings.append(ctx.allocator, tmp);
+                try destruct_bindings.append(ctx.allocator, try restSourceFor(ctx, p, tmp, call_form.origin));
             }
             continue;
         }
@@ -2312,7 +2316,7 @@ fn buildArityThen(
         // params[fixed] is `&`; params[fixed+1] is the rest binding.
         if (fixed + 1 >= params.len) return ExpandError.MalformedMacroCall;
         const rest_pat = params[fixed + 1];
-        const rest_expr = try buildNestedRest(ctx, args_sym, fixed, origin);
+        const rest_expr = try restSourceFor(ctx, rest_pat, try buildNestedRest(ctx, args_sym, fixed, origin), origin);
         try bindings.append(ctx.allocator, @constCast(rest_pat));
         try bindings.append(ctx.allocator, rest_expr);
     }
@@ -2392,7 +2396,7 @@ fn destructureVector(
             const rest_pat = elems[i + 1];
             // Build expression: (rest (rest ... (rest src) ...))
             // applied `i` times to skip the first `i` elements.
-            const rest_expr = try buildNestedRest(ctx, src, i, origin);
+            const rest_expr = try restSourceFor(ctx, rest_pat, try buildNestedRest(ctx, src, i, origin), origin);
             try destructurePair(ctx, rest_pat, rest_expr, out, origin);
             i += 1;
             continue;
@@ -2406,9 +2410,13 @@ fn destructureVector(
 /// Destructure a map pattern.
 ///
 /// Recognizes:
-///   {:keys [a b]}      → a (get src :a nil)  b (get src :b nil)
-///   {a :a-key}         → a (get src :a-key nil)
-///   {... :or {a 10}}   → a (get src :a 10) (overrides default)
+///   {:keys [a b]}      → a (get src :a)  b (get src :b)
+///   {:keys [p/a :b]}   → a (get src :p/a)  b (get src :b)
+///   {:p/keys [a]}      → a (get src :p/a)
+///   {:strs [a]}        → a (get src "a")
+///   {:syms [a]}        → a (get src 'a);  {:p/syms [a]} → (get src 'p/a)
+///   {a :a-key}         → a (get src :a-key)
+///   {... :or {a 10}}   → a (get src ... 10) when the key is absent
 ///   {... :as name}     → name src
 fn destructureMap(
     ctx: *ExpandContext,
@@ -2440,23 +2448,20 @@ fn destructureMap(
     while (i < entries.len) : (i += 2) {
         const k = entries[i];
         const v = entries[i + 1];
-        // Skip :or / :as (handled above).
-        if (k.datum == .keyword and k.datum.keyword.ns == null) {
-            if (std.mem.eql(u8, k.datum.keyword.name, "or") or
-                std.mem.eql(u8, k.datum.keyword.name, "as"))
-            {
-                continue;
-            }
-            if (std.mem.eql(u8, k.datum.keyword.name, "keys")) {
+        if (k.datum == .keyword) {
+            const kw = k.datum.keyword;
+            if (kw.ns == null and (std.mem.eql(u8, kw.name, "or") or std.mem.eql(u8, kw.name, "as"))) continue;
+            const group: ?KeyGroup = if (std.mem.eql(u8, kw.name, "keys"))
+                .keys
+            else if (std.mem.eql(u8, kw.name, "syms"))
+                .syms
+            else if (kw.ns == null and std.mem.eql(u8, kw.name, "strs"))
+                .strs
+            else
+                null;
+            if (group) |g| {
                 if (v.datum != .vector) return ExpandError.MalformedMacroCall;
-                for (v.datum.vector) |name_sym| {
-                    if (name_sym.datum != .symbol) return ExpandError.MalformedMacroCall;
-                    const sym_name = name_sym.datum.symbol.name;
-                    const key_form = try makeKeyword(ctx, sym_name, origin);
-                    const default_expr = lookupDefault(defaults, sym_name);
-                    const get_expr = try buildGetCall(ctx, src, key_form, default_expr, origin);
-                    try destructurePair(ctx, name_sym, get_expr, out, origin);
-                }
+                for (v.datum.vector) |entry| try destructureKeyEntry(ctx, g, kw.ns, entry, src, defaults, out, origin);
                 continue;
             }
         }
@@ -2472,6 +2477,58 @@ fn destructureMap(
         try out.append(ctx.allocator, n);
         try out.append(ctx.allocator, src);
     }
+}
+
+const KeyGroup = enum { keys, strs, syms };
+
+/// One entry of a `:keys` / `:strs` / `:syms` vector: the local is
+/// the entry's name part; the key is that name as a keyword, string
+/// or symbol, qualified by the entry's own namespace or by the
+/// group's (`:p/keys`). A keyword entry in `:keys` is itself the key.
+fn destructureKeyEntry(
+    ctx: *ExpandContext,
+    group: KeyGroup,
+    group_ns: ?[]const u8,
+    entry: *const Form,
+    src: *Form,
+    defaults: ?[]const *Form,
+    out: *std.ArrayList(*Form),
+    origin: reader_mod.SrcSpan,
+) ExpandError!void {
+    const parts: reader_mod.Name = switch (entry.datum) {
+        .symbol => |sym| sym,
+        .keyword => |kw| if (group == .keys) kw else return ExpandError.MalformedMacroCall,
+        else => return ExpandError.MalformedMacroCall,
+    };
+    const key_ns = parts.ns orelse group_ns;
+    const key_form: *Form = switch (group) {
+        .keys => blk: {
+            const f = try ctx.allocator.create(Form);
+            f.* = .{ .datum = .{ .keyword = .{ .ns = key_ns, .name = parts.name } }, .origin = origin };
+            break :blk f;
+        },
+        .strs => blk: {
+            const f = try ctx.allocator.create(Form);
+            f.* = .{ .datum = .{ .string = parts.name }, .origin = origin };
+            break :blk f;
+        },
+        .syms => blk: {
+            const sym = if (key_ns) |ns| try makeQualifiedSymbol(ctx, ns, parts.name, origin) else try makeSymbol(ctx, parts.name, origin);
+            break :blk try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "quote", origin), sym });
+        },
+    };
+    const local = try makeSymbol(ctx, parts.name, origin);
+    const get_expr = try buildGetCall(ctx, src, key_form, lookupDefault(defaults, parts.name), origin);
+    try destructurePair(ctx, local, get_expr, out, origin);
+}
+
+/// The source a rest pattern destructures: a map pattern after `&`
+/// takes keyword arguments, so the rest seq becomes the map
+/// `nexis.internal/#%kwargs` builds from it (`k v k v ...`, or one
+/// trailing map); any other pattern takes the seq itself.
+fn restSourceFor(ctx: *ExpandContext, rest_pat: *const Form, rest_expr: *Form, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    if (rest_pat.datum != .map) return rest_expr;
+    return try makeListInline(ctx, origin, &.{ try makeQualifiedSymbol(ctx, "nexis.internal", "#%kwargs", origin), rest_expr });
 }
 
 fn lookupDefault(defaults: ?[]const *Form, name: []const u8) ?*Form {
@@ -2537,12 +2594,51 @@ fn makeKeyword(ctx: *ExpandContext, name: []const u8, origin: reader_mod.SrcSpan
     return form;
 }
 
+/// `(loop [pattern init ...] body...)` → `(loop* [g init ...] (let
+/// [pattern g ...] body...))`: each non-symbol pattern binds a
+/// gensym in the loop and destructures it again on every
+/// iteration, so `recur` rebinds the gensyms. Symbol bindings and
+/// a pattern-free loop rename to `loop*` unchanged.
 fn expandLoopRename(
     ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
 ) ExpandError!*Form {
-    return renameHead(ctx, call_form, args, "loop*");
+    if (args.len < 1 or args[0].datum != .vector) return ExpandError.MalformedMacroCall;
+    const pairs = args[0].datum.vector;
+    if (pairs.len % 2 != 0) return ExpandError.MalformedMacroCall;
+    var has_pattern = false;
+    for (pairs, 0..) |p, i| {
+        if (i % 2 == 0 and p.datum != .symbol) has_pattern = true;
+    }
+    if (!has_pattern) return renameHead(ctx, call_form, args, "loop*");
+
+    const origin = call_form.origin;
+    const loop_bindings = try ctx.allocator.alloc(*Form, pairs.len);
+    var let_bindings: std.ArrayList(*Form) = .empty;
+    defer let_bindings.deinit(ctx.allocator);
+    var i: usize = 0;
+    while (i < pairs.len) : (i += 2) {
+        loop_bindings[i + 1] = @constCast(pairs[i + 1]);
+        if (pairs[i].datum == .symbol) {
+            loop_bindings[i] = @constCast(pairs[i]);
+        } else {
+            const g = try genTempSym(ctx, origin);
+            loop_bindings[i] = g;
+            try let_bindings.append(ctx.allocator, @constCast(pairs[i]));
+            try let_bindings.append(ctx.allocator, g);
+        }
+    }
+    var let_items: std.ArrayList(*Form) = .empty;
+    defer let_items.deinit(ctx.allocator);
+    try let_items.append(ctx.allocator, try makeSymbol(ctx, "let", origin));
+    try let_items.append(ctx.allocator, try makeVector(ctx, try ctx.allocator.dupe(*Form, let_bindings.items), origin));
+    for (args[1..]) |b| try let_items.append(ctx.allocator, @constCast(b));
+    return try makeListInline(ctx, origin, &.{
+        try makeSymbol(ctx, "loop*", origin),
+        try makeVector(ctx, loop_bindings, origin),
+        try makeListInline(ctx, origin, let_items.items),
+    });
 }
 
 /// Generic rename helper: emit (NEW_HEAD args...). Args are
@@ -2943,45 +3039,38 @@ fn expandCondp(
 
 // ---- for ----------------------------------------------------
 //
-// Eager subset of Clojure's `for`. Supported:
-//   - multi-binding cartesian:
-//       (for [x [1 2] y [10 20]] (+ x y)) => [11 21 12 22]
-//   - `:let` (uses `let` so destructuring works):
-//       (for [x [1 2 3] :let [y (* x 10)]] y) => [10 20 30]
-//   - `:when` (filter):
-//       (for [x [1 2 3] :when (odd? x)] x)   => [1 3]
-//   - empty source → []
+// Eager `for`: `(for [pattern src modifiers... ...] body)` builds a
+// vector. Each binding pair may be followed by `:let [bindings]`,
+// `:when test` and `:while test`, in any number and order; a
+// pattern destructures through `let`. One loop per binding pair,
+// nested, carrying the vector as its accumulator:
 //
-// Unsupported:
-//   - `:while`
-//   - lazy seqs (we eager-return a vector)
-//   - `:reduce` / `:initial` clauses
+//   (loop* [s# (seq src) acc# <outer acc or []>]
+//     (if s#
+//       (let [pattern (first s#)]
+//         <modifiers, innermost first:
+//            :let [b]  → (let [b] inner)
+//            :when t   → (if t inner (recur (next s#) acc#))
+//            :while t  → (if t inner acc#)
+//          where inner is (recur (next s#) <next loop over acc#>)
+//          or, at the last pair, (recur (next s#) (conj acc# body))>)
+//       acc#))
 //
-// Expansion: nested `reduce` calls, one per binding pair. Each
-// `reduce` introduces its own accumulator gensym. The body
-// invokes `(conj acc-innermost <body>)` to grow the result.
-// `:let` wraps the inner expression with `(let bindings ...)`
-// (NOT `let*`) so users can destructure inside `:let`. `:when` wraps with
-// `(if pred ...inner... <current-acc>)` — pred false → acc
-// unchanged.
-//
-// Invariants:
-//   §F1. First segment in the binding vector MUST be a `sym src`
-//        pair. Modifiers before any binding are rejected as
-//        MalformedMacroCall.
-//   §F2. `conj` on `[]` initial accumulator preserves vector
-//        kind (verified via CLI smoke + (conj [] x) → vector).
-//   §F3. Return type is ALWAYS vector. Empty source / all
-//        filtered → `[]`.
-//   §F4. Multiple `:when` / `:let` clauses between bindings are
-//        supported. Order matters: a `:let`
-//        before a `:when` makes the let-bound name visible to
-//        the when's predicate.
+// `:while` ends the loop it modifies (its accumulator is returned
+// as is), `:when` skips the element, and both see the pattern and
+// any earlier `:let`. Modifiers before the first pair, an odd
+// vector or a body count other than one are MalformedMacroCall.
 
-const ForSegment = union(enum) {
-    sym_src: struct { sym: *Form, src: *Form },
-    when_pred: *Form,
+const ForModifier = union(enum) {
     let_bindings: *Form,
+    when_test: *Form,
+    while_test: *Form,
+};
+
+const ForLevel = struct {
+    pattern: *Form,
+    src: *Form,
+    modifiers: std.ArrayList(ForModifier) = .empty,
 };
 
 fn expandFor(
@@ -2994,158 +3083,93 @@ fn expandFor(
     if (bindings_form.datum != .vector) return ExpandError.MalformedMacroCall;
     const bindings = bindings_form.datum.vector;
     const body = args[1];
-
     if (bindings.len == 0) return ExpandError.MalformedMacroCall;
 
-    // Parse the binding vector into segments.
-    var segments: std.ArrayList(ForSegment) = .empty;
-    defer segments.deinit(ctx.allocator);
-
+    var levels: std.ArrayList(ForLevel) = .empty;
+    defer {
+        for (levels.items) |*l| l.modifiers.deinit(ctx.allocator);
+        levels.deinit(ctx.allocator);
+    }
     var i: usize = 0;
-    while (i < bindings.len) {
+    while (i + 1 < bindings.len) : (i += 2) {
         const item = bindings[i];
-        switch (item.datum) {
-            .keyword => |kw| {
-                if (kw.ns != null) return ExpandError.MalformedMacroCall;
-                // `:when` consumes a predicate Form.
-                if (std.mem.eql(u8, kw.name, "when")) {
-                    if (i + 1 >= bindings.len) return ExpandError.MalformedMacroCall;
-                    segments.append(ctx.allocator, .{ .when_pred = @constCast(bindings[i + 1]) }) catch return ExpandError.OutOfMemory;
-                    i += 2;
-                } else if (std.mem.eql(u8, kw.name, "let")) {
-                    // `:let` consumes a vector of bindings (which
-                    // `let` will then handle, including any
-                    // destructuring patterns).
-                    if (i + 1 >= bindings.len) return ExpandError.MalformedMacroCall;
-                    const lb = bindings[i + 1];
-                    if (lb.datum != .vector) return ExpandError.MalformedMacroCall;
-                    segments.append(ctx.allocator, .{ .let_bindings = @constCast(lb) }) catch return ExpandError.OutOfMemory;
-                    i += 2;
-                } else {
-                    // Unknown modifier keyword (e.g. `:while`,
-                    // `:reduce`) → reject explicitly so users
-                    // don't get silent wrong behavior.
-                    return ExpandError.MalformedMacroCall;
-                }
-            },
-            .symbol => {
-                if (i + 1 >= bindings.len) return ExpandError.MalformedMacroCall;
-                segments.append(ctx.allocator, .{ .sym_src = .{
-                    .sym = @constCast(bindings[i]),
-                    .src = @constCast(bindings[i + 1]),
-                } }) catch return ExpandError.OutOfMemory;
-                i += 2;
-            },
-            // Destructuring patterns (vector / map literals as
-            // the binding sym) are NOT supported in `for`'s
-            // direct sym-position. Users can use `:let` for
-            // destructuring (which goes through `let`).
-            else => return ExpandError.MalformedMacroCall,
+        const value = @constCast(bindings[i + 1]);
+        if (item.datum == .keyword) {
+            const kw = item.datum.keyword;
+            if (kw.ns != null or levels.items.len == 0) return ExpandError.MalformedMacroCall;
+            const level = &levels.items[levels.items.len - 1];
+            const modifier: ForModifier = if (std.mem.eql(u8, kw.name, "let")) blk: {
+                if (value.datum != .vector) return ExpandError.MalformedMacroCall;
+                break :blk .{ .let_bindings = value };
+            } else if (std.mem.eql(u8, kw.name, "when"))
+                .{ .when_test = value }
+            else if (std.mem.eql(u8, kw.name, "while"))
+                .{ .while_test = value }
+            else
+                return ExpandError.MalformedMacroCall;
+            try level.modifiers.append(ctx.allocator, modifier);
+        } else {
+            try levels.append(ctx.allocator, .{ .pattern = @constCast(item), .src = value });
         }
     }
+    if (i != bindings.len) return ExpandError.MalformedMacroCall;
 
-    if (segments.items.len == 0) return ExpandError.MalformedMacroCall;
-    // §F1: first segment must be a sym_src pair.
-    if (segments.items[0] != .sym_src) return ExpandError.MalformedMacroCall;
+    const empty_items = try ctx.allocator.alloc(*Form, 0);
+    return try buildForLevel(ctx, levels.items, 0, try makeVector(ctx, empty_items, call_form.origin), body, call_form.origin);
+}
 
-    // Count sym segments + gensym one accumulator name per.
-    var n_sym: usize = 0;
-    for (segments.items) |seg| {
-        if (seg == .sym_src) n_sym += 1;
-    }
-    const acc_names = ctx.allocator.alloc([]const u8, n_sym) catch return ExpandError.OutOfMemory;
-    for (acc_names) |*name_slot| {
-        name_slot.* = try ctx.gensym("for-acc");
-    }
+/// The loop for `levels[idx]` accumulating onto `outer_acc`.
+fn buildForLevel(
+    ctx: *ExpandContext,
+    levels: []const ForLevel,
+    idx: usize,
+    outer_acc: *Form,
+    body: *const Form,
+    origin: reader_mod.SrcSpan,
+) ExpandError!*Form {
+    const level = levels[idx];
+    const s_sym = try genTempSym(ctx, origin);
+    const acc_sym = try genTempSym(ctx, origin);
+    const next_s = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "next", origin), s_sym });
 
-    // Build innermost: (conj acc[n_sym - 1] body).
-    var inner: *Form = blk: {
-        const items = try ctx.allocator.alloc(*Form, 3);
-        items[0] = try makeSymbol(ctx, "conj", call_form.origin);
-        items[1] = try makeSymbol(ctx, acc_names[n_sym - 1], call_form.origin);
-        items[2] = @constCast(body);
-        break :blk try makeList(ctx, items, call_form.origin);
-    };
+    // What the element contributes: the nested loop or the body.
+    const contribution: *Form = if (idx + 1 < levels.len)
+        try buildForLevel(ctx, levels, idx + 1, acc_sym, body, origin)
+    else
+        try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "conj", origin), acc_sym, @constCast(body) });
+    var inner: *Form = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "recur", origin), next_s, contribution });
 
-    // Walk segments right-to-left. `k` tracks the current
-    // sym-acc index (the acc-name in scope at the current
-    // expansion level). Starts at n_sym - 1 (deepest sym's
-    // acc) and decrements as we walk OUT through sym segments.
-    var k: usize = n_sym - 1;
-    // We need to enter the loop with k pointing at the
-    // innermost-sym's acc index. After the first sym we
-    // encounter (the rightmost sym), we'll decrement k.
-    // But `k` is unsigned, so we sentinel via `done_with_syms`.
-    var done_with_syms = false;
-
-    var r_idx: usize = segments.items.len;
-    while (r_idx > 0) {
-        r_idx -= 1;
-        const seg = segments.items[r_idx];
-        switch (seg) {
-            .let_bindings => |lb| {
-                const items = try ctx.allocator.alloc(*Form, 3);
-                items[0] = try makeSymbol(ctx, "let", call_form.origin);
-                items[1] = lb;
-                items[2] = inner;
-                inner = try makeList(ctx, items, call_form.origin);
-            },
-            .when_pred => |pred| {
-                // §F1 guarantees we've already processed at
-                // least one sym to the RIGHT of any modifier
-                // (modifiers come AFTER the first sym in
-                // source order; in reverse walk, that means
-                // we hit them only after we've processed at
-                // least the rightmost sym). So `k` is the
-                // valid current-level acc-name index.
-                std.debug.assert(!done_with_syms);
-                const items = try ctx.allocator.alloc(*Form, 4);
-                items[0] = try makeSymbol(ctx, "if", call_form.origin);
-                items[1] = pred;
-                items[2] = inner;
-                items[3] = try makeSymbol(ctx, acc_names[k], call_form.origin);
-                inner = try makeList(ctx, items, call_form.origin);
-            },
-            .sym_src => |ss| {
-                // Build the outer-acc form: acc[k-1] if k > 0,
-                // else the literal `[]` (outermost seed).
-                const outer_acc: *Form = if (k > 0) blk2: {
-                    break :blk2 try makeSymbol(ctx, acc_names[k - 1], call_form.origin);
-                } else blk2: {
-                    // (vector) — empty literal initial accumulator.
-                    const empty_items = try ctx.allocator.alloc(*Form, 0);
-                    break :blk2 try makeVector(ctx, empty_items, call_form.origin);
-                };
-
-                // (fn [acc[k] sym] inner)
-                const fn_params = try ctx.allocator.alloc(*Form, 2);
-                fn_params[0] = try makeSymbol(ctx, acc_names[k], call_form.origin);
-                fn_params[1] = ss.sym;
-                const fn_param_vec = try makeVector(ctx, fn_params, call_form.origin);
-                const fn_items = try ctx.allocator.alloc(*Form, 3);
-                fn_items[0] = try makeSymbol(ctx, "fn", call_form.origin);
-                fn_items[1] = fn_param_vec;
-                fn_items[2] = inner;
-                const fn_form = try makeList(ctx, fn_items, call_form.origin);
-
-                // (reduce <fn> <outer-acc> <src>)
-                const reduce_items = try ctx.allocator.alloc(*Form, 4);
-                reduce_items[0] = try makeSymbol(ctx, "reduce", call_form.origin);
-                reduce_items[1] = fn_form;
-                reduce_items[2] = outer_acc;
-                reduce_items[3] = ss.src;
-                inner = try makeList(ctx, reduce_items, call_form.origin);
-
-                if (k == 0) {
-                    done_with_syms = true;
-                } else {
-                    k -= 1;
-                }
-            },
-        }
+    var m: usize = level.modifiers.items.len;
+    while (m > 0) {
+        m -= 1;
+        inner = switch (level.modifiers.items[m]) {
+            .let_bindings => |lb| try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "let", origin), lb, inner }),
+            .when_test => |t| try makeListInline(ctx, origin, &.{
+                try makeSymbol(ctx, "if", origin),
+                t,
+                inner,
+                try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "recur", origin), next_s, acc_sym }),
+            }),
+            .while_test => |t| try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "if", origin), t, inner, acc_sym }),
+        };
     }
 
-    return inner;
+    const first_s = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "first", origin), s_sym });
+    const elem_bindings = try ctx.allocator.alloc(*Form, 2);
+    elem_bindings[0] = level.pattern;
+    elem_bindings[1] = first_s;
+    const with_elem = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "let", origin), try makeVector(ctx, elem_bindings, origin), inner });
+
+    const loop_bindings = try ctx.allocator.alloc(*Form, 4);
+    loop_bindings[0] = s_sym;
+    loop_bindings[1] = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "seq", origin), level.src });
+    loop_bindings[2] = acc_sym;
+    loop_bindings[3] = outer_acc;
+    return try makeListInline(ctx, origin, &.{
+        try makeSymbol(ctx, "loop*", origin),
+        try makeVector(ctx, loop_bindings, origin),
+        try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "if", origin), s_sym, with_elem, acc_sym }),
+    });
 }
 
 // ---- defrecord (records + inline protocol impls) ----

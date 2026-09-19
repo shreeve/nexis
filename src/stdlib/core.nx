@@ -348,18 +348,38 @@
 (defmacro letfn [bindings & body]
   `(letfn* ~bindings ~@body))
 
-; (doseq [x xs y ys ...] body...) → runs body for each x in xs
-; and, nested inside, each y in ys. The binding form may
-; destructure. Returns nil.
+; (doseq [x xs modifiers... y ys ...] body...) → runs body for
+; each x in xs and, nested inside, each y in ys; nil. A binding
+; form may destructure, and each pair may be followed by
+; `:let [b]`, `:when t` (skip the element) and `:while t` (end
+; that loop), as in `for`; the modifier names are compared as
+; strings so no keyword is interned at boot. One loop per pair:
+;   (loop* [s (seq xs)]
+;     (if s (let [x (first s)] <modifiers around
+;                               (do (doseq [rest...] body...) (recur (next s)))>)
+;           nil))
 (defmacro doseq [bindings & body]
   (if (empty? bindings)
     `(do ~@body nil)
-    `(loop* [s# (seq ~(second bindings))]
-       (if s#
-         (let [~(first bindings) (first s#)]
-           (doseq ~(vec (rest (rest bindings))) ~@body)
-           (recur (next s#)))
-         nil))))
+    (let* [pat (first bindings)
+           src (second bindings)
+           s (gensym "s")]
+      (loop* [more (rest (rest bindings)) mods (list)]
+        (if (and (seq more) (keyword? (first more)))
+          (recur (rest (rest more)) (cons [(first more) (second more)] mods))
+          (let* [inner (reduce (fn* [inner mod]
+                                 (let* [k (name (first mod)) v (second mod)]
+                                   (cond
+                                     (= k "let") `(let ~v ~inner)
+                                     (= k "when") `(if ~v ~inner (recur (next ~s)))
+                                     (= k "while") `(if ~v ~inner nil)
+                                     true (throw (str "doseq: unknown modifier :" k)))))
+                               `(do (doseq ~(vec more) ~@body) (recur (next ~s)))
+                               mods)]
+            `(loop* [~s (seq ~src)]
+               (if ~s
+                 (let [~pat (first ~s)] ~inner)
+                 nil))))))))
 
 ; ============================================================
 ; Threading macros

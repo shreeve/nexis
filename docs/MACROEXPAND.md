@@ -659,6 +659,26 @@ Macro semantics (peer-AI turn 56 §2.G-J):
   {:doc "doc" :k 1 :arglists (quote ([x]))}) v#)`. A definition
   with none of them leaves the Var's metadata nil. `(doc f)`
   prints the `:arglists` and `:doc` of `f`'s Var.
+- destructuring (`let`, `fn`, `defn`, `loop`, `for`, `doseq`,
+  `:let`): a vector pattern binds by `nth`, `& rest` and `:as`; a
+  map pattern binds `{a :k}`, `:keys` / `:strs` / `:syms` vectors
+  (an entry's own namespace or a `:p/keys` group namespace
+  qualifies the key; a keyword entry in `:keys` is the key),
+  `:or` defaults for an absent key and `:as`. A map pattern after
+  `&` takes keyword arguments: the rest seq becomes the map
+  `nexis.internal/#%kwargs` builds from alternating keys and
+  values or one trailing map. `loop` binds each pattern to a
+  gensym and destructures it again on every iteration, so `recur`
+  rebinds the gensyms.
+- `for` / `doseq`: one loop per binding pair, each pair followed
+  by any number of `:let [b]`, `:when t` and `:while t` in any
+  order; a pattern destructures through `let`. `:when` skips the
+  element, `:while` ends the loop it modifies (outer loops carry
+  on), and both see the pattern and earlier `:let` names. `for`
+  accumulates a vector through the loops (`(loop* [s# (seq src)
+  acc# outer] (if s# (let [pat (first s#)] ... (recur (next s#)
+  (conj acc# body))) acc#))`); `doseq` (core.nx) runs the body
+  and yields nil.
 - `case`: `(case expr k1 v1 k2 v2 ... default?)` → `(let* [g expr]
   (if (= g 'k1) v1 (if (= g 'k2) v2 ... terminal)))`. Every key is
   a constant and is never evaluated: a symbol key is that symbol,

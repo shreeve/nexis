@@ -1333,6 +1333,11 @@ pub const VM = struct {
     /// (not `runtime_arena`) because its hash maps need realloc
     /// and free.
     interner: ?intern_mod.Interner = null,
+    /// An interner this VM reads and writes instead of its own: a
+    /// macro sub-VM shares the compile-time interner so the keyword
+    /// and symbol ids in its arguments resolve. Not owned; never
+    /// freed here.
+    borrowed_interner: ?*intern_mod.Interner = null,
     /// Where the top-level `call:return` stores the returned Value on
     /// halt.
     result: Value = value_mod.nilValue(),
@@ -1488,6 +1493,7 @@ pub const VM = struct {
     /// dupes on intern). Interner.deinit in `VM.deinit` frees
     /// every interned name.
     pub fn ensureInterner(self: *VM) *intern_mod.Interner {
+        if (self.borrowed_interner) |shared| return shared;
         if (self.interner == null) {
             self.interner = intern_mod.Interner.init(self.allocator);
         }
@@ -1715,6 +1721,7 @@ pub const VM = struct {
         closure_v: Value,
         args: []const Value,
         out_vm: *VM,
+        interner: ?*intern_mod.Interner,
     ) !Value {
         if (closure_v.kind() != .function) return error.NotCallable;
         const closure = VM.asClosure(closure_v);
@@ -1728,6 +1735,7 @@ pub const VM = struct {
         }
 
         out_vm.* = try VM.init(allocator, routine);
+        out_vm.borrowed_interner = interner;
 
         // Wire the frame's upvalues to the closure's captures.
         out_vm.frames.items[0].upvalues = closure.upvalues;

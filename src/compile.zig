@@ -2150,6 +2150,7 @@ fn compileEvalCallback(
     const routine_storage = try data.persistent_allocator.create(vm.Routine);
     routine_storage.* = compiled.toRoutine("defmacro-eval");
     out_vm.* = try vm.VM.init(data.persistent_allocator, routine_storage);
+    out_vm.borrowed_interner = data.interner;
     return try out_vm.run();
 }
 

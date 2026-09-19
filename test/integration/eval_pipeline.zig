@@ -857,6 +857,14 @@ test "integration: my-cond — user procedural macro using native fns" {
     , ":yes");
 }
 
+test "integration: a macro body reads names of its keyword and symbol arguments" {
+    // The macro runs in a sub-VM that borrows the compile-time
+    // interner, so the ids in its arguments resolve.
+    try expectOutput("(do (defmacro kw-name [k] (name k)) (kw-name :abc))", "abc");
+    try expectOutput("(do (defmacro tagged [k v] `[~(keyword (str (name k) \"-tag\")) ~v]) (tagged :a 1))", "[:a-tag 1]");
+    try expectOutput("(do (defmacro same? [k] (= k (keyword \"x\"))) [(same? :x) (same? :y)])", "[true false]");
+}
+
 test "integration: native fn — arity mismatch is catchable" {
     try expectOutput("(try (first) (catch any e e))", ":arity-mismatch");
     try expectOutput("(try (cons 1) (catch any e e))", ":arity-mismatch");
@@ -972,6 +980,36 @@ test "integration: associative destructuring with :or defaults" {
 
 test "integration: associative destructuring with :as" {
     try expectOutput("(let [{:keys [a] :as m} {:a 1 :b 2}] (count m))", "2");
+}
+
+test "destructuring: :strs, :syms, namespaced keys, keyword entries and :or" {
+    try expectOutput("(let [{:strs [a]} {\"a\" 1}] a)", "1");
+    try expectOutput("(let [{:syms [a]} {'a 2}] a)", "2");
+    try expectOutput("(let [{:keys [x/y]} {:x/y 3}] y)", "3");
+    try expectOutput("(let [{:keys [:a :b/c]} {:a 1 :b/c 2}] [a c])", "[1 2]");
+    try expectOutput("(let [{:p/keys [n m]} {:p/n 1 :p/m 2}] [n m])", "[1 2]");
+    try expectOutput("(let [{:p/syms [n]} {'p/n 1}] n)", "1");
+    try expectOutput("(let [{:keys [a] :or {a 9}} {}] a)", "9");
+    try expectOutput("(let [{:strs [a] :or {a 9}} {}] a)", "9");
+    try expectOutput("(let [{:keys [a b] :or {b 5} :as m} {:a 1}] [a b m])", "[1 5 {:a 1}]");
+    try expectOutput("(let [{:keys [a] :or {a 9}} {:a nil}] a)", "nil");
+}
+
+test "destructuring: a map pattern after & takes keyword arguments" {
+    try expectOutput("((fn [& {:keys [a b]}] [a b]) :a 1 :b 2)", "[1 2]");
+    try expectOutput("((fn [x & {:keys [a]}] [x a]) 0 :a 1)", "[0 1]");
+    try expectOutput("((fn [& {:keys [a] :or {a 7}}] a))", "7");
+    try expectOutput("((fn [& {:keys [a]}] a) {:a 3})", "3");
+    try expectOutput("(do (defn kw [& {:keys [a]}] a) (kw :a 1))", "1");
+    try expectOutput("(let [[x & {:keys [k]}] [1 :k 2]] [x k])", "[1 2]");
+    try expectOutput("(do (defn ma ([x] x) ([x & {:keys [a]}] [x a])) [(ma 1) (ma 1 :a 2)])", "[1 [1 2]]");
+    try expectOutput("(try ((fn [& {:keys [a]}] a) :a) (catch any e e))", ":invalid-argument");
+}
+
+test "destructuring: loop bindings destructure and recur rebinds them" {
+    try expectOutput("(loop [[x & xs] [1 2 3] acc 0] (if x (recur xs (+ acc x)) acc))", "6");
+    try expectOutput("(loop [{:keys [n]} {:n 3} out []] (if (pos? n) (recur {:n (dec n)} (conj out n)) out))", "[3 2 1]");
+    try expectOutput("(loop [[a b] [1 2]] (+ a b))", "3");
 }
 
 test "integration: fn with destructured params" {
@@ -2335,13 +2373,32 @@ test "for: :let modifier with destructuring-capable bindings" {
     , "[[:a 1] [:b 2]]");
 }
 
-// Note: malformed `for` shapes (empty bindings, unknown modifier
-// keyword, dangling symbol) raise MalformedMacroCall at EXPAND
-// time, which surfaces as CompileError.MacroExpansionFailure —
-// not catchable via runtime try/catch. The rejection is verified
-// by the impl (expand.zig:expandFor); we don't add an integration
-// test because the test harness panics on compile errors rather
-// than surfacing them as catchable values.
+test "for: :while ends its loop, patterns destructure, modifiers compose" {
+    try expectOutput("(for [x [1 2 3] :while (< x 3)] x)", "[1 2]");
+    try expectOutput("(for [x [1 2] y [3 4] :while (< y 4)] [x y])", "[[1 3] [2 3]]");
+    try expectOutput("(for [x [1 2] :while (< x 2) y [1 2]] [x y])", "[[1 1] [1 2]]");
+    try expectOutput("(for [x [1 2 3] :let [y (* x 10)] :when (< 10 y)] y)", "[20 30]");
+    try expectOutput("(for [x (range 5) :while (< x 3) :when (odd? x)] x)", "[1]");
+    try expectOutput("(for [x (range 10) :when (odd? x) :while (< x 6) :let [y (* x x)]] y)", "[1 9 25]");
+    try expectOutput("(for [[a b] [[1 2] [3 4]]] (+ a b))", "[3 7]");
+    try expectOutput("(for [[k v] {:a 1}] [v k])", "[[1 :a]]");
+    try expectOutput("(for [{:keys [n]} [{:n 1} {:n 2}]] n)", "[1 2]");
+    try expectOutput("(for [x nil] x)", "[]");
+    try expectProgramError("(for [:when true x [1]] x)", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(for [x [1] :reduce +] x)", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(for [x] x)", compile.CompileError.MacroExpansionFailure);
+}
+
+test "doseq: :when, :while and :let modifiers, destructuring, nil result" {
+    try expectOutput("(let [a (atom [])] (doseq [x [1 2 3] :when (odd? x)] (swap! a conj x)) @a)", "[1 3]");
+    try expectOutput("(let [a (atom [])] (doseq [x [1 2 3] :while (< x 3)] (swap! a conj x)) @a)", "[1 2]");
+    try expectOutput("(let [a (atom [])] (doseq [x [1 2] :let [y (* x 10)]] (swap! a conj y)) @a)", "[10 20]");
+    try expectOutput("(let [a (atom [])] (doseq [x [1 2 3] :while (< x 3) y [1]] (swap! a conj [x y])) @a)", "[[1 1] [2 1]]");
+    try expectOutput("(let [a (atom [])] (doseq [x [1 2] y [10 20] :when (< 15 y)] (swap! a conj (+ x y))) @a)", "[21 22]");
+    try expectOutput("(let [a (atom [])] (doseq [[k v] {:a 1}] (swap! a conj [v k])) @a)", "[[1 :a]]");
+    try expectOutput("(let [a (atom [])] (doseq [x [1] :let [y 2] :when (= y 2)] (swap! a conj [x y])) @a)", "[[1 2]]");
+    try expectOutput("(doseq [x [1 2] :when (odd? x)] x)", "nil");
+}
 
 // =============================================================================
 // Records substrate

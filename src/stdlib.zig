@@ -174,6 +174,8 @@ const internal_fns = [_]CoreEntry{
     .{ .name = "#%extend-default-impl", .descriptor = &native_extend_default_impl },
     // try: the keyword-matcher test the expander emits.
     .{ .name = "#%catch-matches?", .descriptor = &native_catch_matches },
+    // `& {:keys ...}`: the rest seq as a map.
+    .{ .name = "#%kwargs", .descriptor = &native_kwargs },
 };
 
 /// The part of nexis.core written in nexis itself, embedded at
@@ -294,6 +296,7 @@ const core_fns = [_]CoreEntry{
     .{ .name = "namespace", .descriptor = &native_namespace },
     .{ .name = "keyword", .descriptor = &native_keyword },
     .{ .name = "symbol", .descriptor = &native_symbol },
+    .{ .name = "gensym", .descriptor = &native_gensym },
     // Metadata (PLAN §8.5).
     .{ .name = "meta", .descriptor = &native_meta },
     .{ .name = "with-meta", .descriptor = &native_with_meta },
@@ -521,6 +524,7 @@ const native_name = NativeFn{ .name = "name", .min_arity = 1, .max_arity = 1, .c
 const native_namespace = NativeFn{ .name = "namespace", .min_arity = 1, .max_arity = 1, .call = &fnNamespace };
 const native_keyword = NativeFn{ .name = "keyword", .min_arity = 1, .max_arity = 2, .call = &fnKeyword };
 const native_symbol = NativeFn{ .name = "symbol", .min_arity = 1, .max_arity = 2, .call = &fnSymbol };
+const native_gensym = NativeFn{ .name = "gensym", .min_arity = 0, .max_arity = 1, .call = &fnGensym };
 const native_meta = NativeFn{ .name = "meta", .min_arity = 1, .max_arity = 1, .call = &fnMeta };
 const native_with_meta = NativeFn{ .name = "with-meta", .min_arity = 2, .max_arity = 2, .call = &fnWithMeta };
 const native_reset_meta = NativeFn{ .name = "reset-meta!", .min_arity = 2, .max_arity = 2, .call = &fnResetMeta };
@@ -614,6 +618,7 @@ const native_extend_record_impl = NativeFn{ .name = "#%extend-record-impl", .min
 // extend-protocol over built-in kinds + Any default + satisfies?.
 const native_extend_builtin_impl = NativeFn{ .name = "#%extend-builtin-impl", .min_arity = 4, .max_arity = 4, .call = &fnExtendBuiltinImpl };
 const native_extend_default_impl = NativeFn{ .name = "#%extend-default-impl", .min_arity = 3, .max_arity = 3, .call = &fnExtendDefaultImpl };
+const native_kwargs = NativeFn{ .name = "#%kwargs", .min_arity = 1, .max_arity = 1, .call = &fnKwargs };
 const native_catch_matches = NativeFn{ .name = "#%catch-matches?", .min_arity = 2, .max_arity = 2, .call = &fnCatchMatches };
 const native_satisfies_q = NativeFn{ .name = "satisfies?", .min_arity = 2, .max_arity = 2, .call = &fnSatisfiesQ };
 
@@ -2322,6 +2327,18 @@ fn fnAlterMeta(vm: *VM, args: []const Value) VmError!Value {
     return next;
 }
 
+/// `(gensym)` / `(gensym prefix)` → a fresh symbol `prefix__N`
+/// (`G__N` by default), N counting up for the process.
+var gensym_next: u64 = 0;
+
+fn fnGensym(vm: *VM, args: []const Value) VmError!Value {
+    const prefix: []const u8 = if (args.len == 1) try internedName(vm, args[0]) else "G";
+    gensym_next += 1;
+    var buf: [256]u8 = undefined;
+    const name = std.fmt.bufPrint(&buf, "{s}__{d}", .{ prefix, gensym_next }) catch return VmError.InvalidArgument;
+    return vm.ensureInterner().internSymbolValue(name) catch |err| internFailure(err);
+}
+
 fn fnBoolean(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(args[0].isTruthy());
 }
@@ -3732,6 +3749,24 @@ fn fnExtendBuiltinImpl(vm: *VM, args: []const Value) VmError!Value {
         error.OutOfMemory => return VmError.OutOfMemory,
     };
     return value_mod.nilValue();
+}
+
+/// `(#%kwargs rest)` → the map a `& {...}` pattern destructures:
+/// `rest` as alternating keys and values, a single trailing map
+/// as itself, nil or empty as `{}`; an odd count is
+/// `:invalid-argument`.
+fn fnKwargs(vm: *VM, args: []const Value) VmError!Value {
+    var items = try collectSeq(vm, args[0]);
+    defer items.deinit(vm.allocator);
+    if (items.items.len == 1 and (items.items[0].kind() == .persistent_map or items.items[0].kind() == .record)) return items.items[0];
+    if (items.items.len % 2 != 0) return VmError.InvalidArgument;
+    const heap = vm.ensureHeap();
+    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    var i: usize = 0;
+    while (i < items.items.len) : (i += 2) {
+        m = champ_mod.mapAssoc(heap, m, items.items[i], items.items[i + 1], &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+    }
+    return m;
 }
 
 /// `(#%catch-matches? v tag)` → whether `(catch tag e ...)` takes the
