@@ -439,6 +439,15 @@ test "integration: variadic & rest" {
     try expectOutput("((fn* [x & xs] x) 1 2 3)", "1");
 }
 
+test "integration: recur into a variadic fn passes the rest param one seq" {
+    // COMPILER.md §5.6: the rest slot is the last binding of the
+    // target; `(next r)` lands in `r` as it is.
+    try expectOutput("((fn [& r] (if (seq r) (recur (next r)) :done)) 1 2 3)", ":done");
+    try expectOutput("((fn [acc & r] (if (seq r) (recur (+ acc (first r)) (next r)) acc)) 0 1 2 3)", "6");
+    try expectOutput("((fn [acc & r] (if (seq r) (recur (+ acc (first r)) (rest r)) acc)) 0 1 2 3)", "6");
+    try expectProgramError("(fn [x & r] (recur x))", compile.CompileError.RecurArityMismatch);
+}
+
 // =============================================================================
 // Vars and definitions
 // =============================================================================
@@ -957,6 +966,36 @@ test "multi-arity fn: anonymous, named and letfn clauses dispatch by argc" {
     try expectOutput("(try ((fn ([x] x)) 1 2) (catch any e e))", ":arity-mismatch");
     try expectProgramError("(fn ([x] 1) ([x] 2))", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(fn ([x y] 1) ([x & r] 2))", compile.CompileError.MacroExpansionFailure);
+}
+
+test "multi-arity fn: recur re-enters the clause with the clause's own arity" {
+    // Each clause binds its params through `loop`, so `recur` in
+    // a clause's tail rebinds that clause's params and never sees
+    // the dispatcher's `[& args]` (MACROEXPAND.md §10, `fn`).
+    try expectOutput(
+        \\(do (defn fact ([n] (fact n 1)) ([n acc] (if (< n 2) acc (recur (dec n) (* n acc)))))
+        \\    (fact 20))
+    , "2432902008176640000");
+    try expectOutput("((fn ([n] (if (pos? n) (recur (dec n)) :zero)) ([a b] :two)) 5)", ":zero");
+    try expectOutput("(letfn [(f ([n] (f n 0)) ([n acc] (if (zero? n) acc (recur (dec n) (+ acc n)))))] (f 10))", "55");
+    // A variadic clause's rest param receives the one seq `recur` passes.
+    try expectOutput("((fn ([] :none) ([x & r] (if (seq r) (recur (first r) (next r)) x))) 1 2 3 4)", "4");
+    // A pattern param destructures again after every recur.
+    try expectOutput("((fn ([[a b]] (if (pos? a) (recur [(dec a) (+ b a)]) b))) [3 0])", "6");
+    // A captured clause param gets a fresh cell per iteration.
+    try expectOutput(
+        \\(do (defn cl ([n] (cl n [])) ([n fs] (if (< n 3) (recur (inc n) (conj fs (fn [] n))) (mapv (fn [f] (f)) fs))))
+        \\    (cl 0))
+    , "[0 1 2]");
+}
+
+test "multi-arity fn: a nested loop in a clause owns its recur, and a wrong-count recur is a compile error" {
+    try expectOutput(
+        \\(do (defn g ([n] (g n [])) ([n acc] (if (zero? n) acc (recur (dec n) (conj acc (loop [i 0 s 0] (if (< i n) (recur (inc i) (+ s i)) s)))))))
+        \\    (g 4))
+    , "[6 3 1 0]");
+    try expectProgramError("(defn bad ([n] 1) ([n acc] (recur n)))", compile.CompileError.RecurArityMismatch);
+    try expectProgramError("(defn bad ([n] (recur)))", compile.CompileError.RecurArityMismatch);
 }
 
 test "named fn: the name is the function itself inside its body" {

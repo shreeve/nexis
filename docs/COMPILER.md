@@ -260,8 +260,8 @@ compiler relies on:
     other position (`if` test, non-last `do` forms, `let*` RHS,
     callee, call arguments, `recur` arguments, intrinsic
     operands) has none.
-  - `recur` into a variadic `fn*` is rejected
-    (`UnsupportedFeature`).
+  - `recur` into a variadic `fn*` takes the fixed params plus one
+    argument for the rest binding.
   - Frame-slot assignment: each local and each compiler-generated
     temporary gets a slot number from a per-routine bump
     counter. Slots are not reused across disjoint lifetimes.
@@ -513,8 +513,16 @@ above is the only mechanism.
 the function's own parameters: the `Emitter` installs a fn
 `RecurTarget` after the captured-param boxing prelude, so the
 rebind + jump re-enters the function body without a call
-(constant-stack self-recursion). A variadic `fn*` is not a valid
-`recur` target (`UnsupportedFeature`).
+(constant-stack self-recursion). The target's bindings are the
+fixed params followed, for a variadic `fn*`, by the rest slot:
+`(recur a b s)` into `(fn* [a b & r] ...)` installs `s` in `r`'s
+slot as it is, so the rest param receives whatever seq the `recur`
+passes (Clojure's rule), and a `recur` that omits it is
+`RecurArityMismatch`. A captured rest param gets a fresh cell per
+iteration like any other binding. Overload clauses never reach
+this path: the expander binds each clause's params through `loop`,
+so a `recur` in a clause re-enters that clause with the clause's
+own arity (`MACROEXPAND.md` §10, `fn`).
 
 #### 5.6b `(letfn* [name1 (fn* ...) name2 (fn* ...) ...] body...)`
 
