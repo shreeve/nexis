@@ -1132,6 +1132,7 @@ pub fn build(b: *std.Build) void {
             "with",
             "with-conn",
             "polish",
+            "datoms",
             "persist-1",
             "persist-2",
         };
