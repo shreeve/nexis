@@ -461,17 +461,10 @@ through `bin/nexis`:
 
 | gap | observed | where |
 |---|---|---|
-| `case` evaluates its keys | `(case 1 (1 2) :a :d)` → `NotCallable`; `(case 'x x :a :d)` → `UnresolvedSymbol` | `expand.zig` `expandCase` emits `(= g key)` with the raw key form; quote each key and turn a list key into an `or` of alternatives |
-| syntax-quote gaps | `` `(~x ~@[2 3]) `` → `KindMismatch`; `` `{:a 1} `` → `MacroExpansionFailure`; `` `(+ 1 2) `` stays unqualified though PLAN §23 #29 promises qualification | `expand.zig` `expandSyntaxQuote*`: add map, set, quote and anon-fn payloads; seq the `#%concat` operands; decide qualification and either implement it or amend §23 #29 |
-| multi-arity anonymous `fn` | `((fn ([x] x) ([x y] (+ x y))) 1 2)` → `MacroExpansionFailure` | `expandFnRename`; reuse `defn`'s arity dispatcher (`expandDefnMacro`) |
-| finally-only `try`, keyword matchers | `(try 1 (finally 2))` → `MalformedForm`; `(catch :divide-by-zero e ...)` → `UnsupportedFeature` | `compile.zig` `lowerTry` requires one `catch any` |
-| empty bodies and `()` | `((fn []))`, `(let [x 1])`, the literal `()` → `MalformedForm` | `compile.zig` (`items.len == 0` rejection); Clojure yields nil / `()` |
-| `defn` docstrings and attr-maps | `(defn f "doc" [x] x)` → `MacroExpansionFailure` | `expandDefn` |
-| destructuring extras | `{:strs [a]}`, `{:syms [a]}`, namespaced `:keys`, `& {:keys [a]}` keyword args, `loop` bindings | the destructuring expander (`:keys`/`:or`/`:as` at `expand.zig` ~2261) and `loop`'s binding path |
-| `doseq` and `for` modifiers | `doseq` rejects `:when`/`:let`/`:while`; `for` has `:when`/`:let`, not `:while`, and does not destructure | `core.nx` `doseq`; `expand.zig` `expandFor` |
 | `int`/`long`/`double` | `UnresolvedSymbol`; no way to turn a double into an integer | `stdlib.zig` natives |
-| `meta`/`with-meta`, `ex-info`/`ex-data`, `macroexpand`, `read-string`, `list*`, `reduced`, three-arity `fnil` | `UnresolvedSymbol` (`fnil` → `ArityMismatch`) | `stdlib.zig`; `reduced` needs the reducing natives to check for it; `read-string` needs the reader reachable from a native |
+| `eval` | `UnresolvedSymbol` | a form compiled and run in the calling VM; `macroexpand-1` and `read-string` reach the compiler through `vm.CompilerHooks` and are the pattern |
 | symbols not callable | `('a {'a 1})` → `:not-callable` | `vm.zig` lookup arm; PLAN §23 #33 promises keywords only, so state or extend |
+| macros receive only their arguments | no `&form`/`&env` (PLAN §23 #34) | `expand.zig` `callUserMacro` passes the arg forms as values; `macroexpand-1` at run time has no lexical environment to offer either |
 
 ### 6.4 Phase 5 as PLAN §21 defines it
 

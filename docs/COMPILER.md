@@ -786,39 +786,37 @@ closure that references the binding.
 
 ### 7. Error reporting
 
-**Every error** raised by the compiler carries:
+A compile error is a `CompileError` variant (`UnresolvedSymbol`,
+`MacroExpansionFailure`, `MalformedForm`, `ArityMismatch`, ...)
+plus the span the compiler puts in `CompileOptions.out_span`: the
+symbol's own span when lowering can locate it (`LowerDiag`),
+otherwise the macroexpanded form's. Forms a macro produced carry
+the macro call's span (MACROEXPAND.md §4b), so an error inside an
+expansion is reported at the call. The CLI prints
 
-- A stable **error kind** keyword (e.g., `:unresolved-symbol`,
-  `:arity-mismatch`, `:recur-outside-tail`). These keywords
-  form a stable taxonomy tools can match on; additions are
-  non-breaking, renames are breaking.
-- A **primary SrcSpan** — where the error was detected.
-- An optional **secondary SrcSpan** — for errors inside macro-
-  expanded code, the macro's own source location.
-- An expansion-provenance chain when applicable — a list of
-  macro-call-sites leading up to the error site.
-- A human-readable message.
-- Contextual data (e.g., for `:arity-mismatch`, the expected
-  and actual arities).
+    nexis: <path>:<line>:<col>: <ErrorName>
+        <source line>
+        <caret under the span>
 
-Errors are **structured values**, not just strings, so REPL and
-editor tooling can render them richly.
-
-The full taxonomy is documented inline with each stage (§4).
+and exits 4 in `run`; the REPL prints the same with `<repl>` as
+the path and reads the next line. A parse failure is reported the
+same way at the token the parser stopped on (`parse error:
+unexpected `)``, `unexpected end of input`), a reader failure at
+the form the reader rejected with its kind and detail (`reader
+error: :duplicate-literal-key (keyword :a)`); both exit 3. A
+runtime error carries no location: the VM reports its `VmError`
+name and, for an uncaught throw, the thrown value.
 
 ---
 
 ### 8. SrcSpan threading
 
-- Every Form has a `SrcSpan` attached by the reader (Phase 0).
-- Macroexpander copies the call-site SrcSpan onto expanded
-  Forms; original macro source SrcSpan is attached to the
-  Form's annotation field.
-- Resolver/Analyzer carry SrcSpans forward unchanged.
-- Codegen maps every emitted instruction to the originating
-  Form's SrcSpan via the routine's source-span map.
-- Runtime errors (from the VM) resolve their location by
-  looking up the current PC in the map.
+- Every Form has a `SrcSpan` from the reader (`Form.origin`).
+- The macroexpander gives synthetic forms the macro call's span
+  and keeps the source span of forms it passes through.
+- Lowering reports the span of the symbol it rejects through
+  `LowerDiag`; `compileFormWith` falls back to the form's.
+- Bytecode carries no spans: nothing maps a PC back to a form.
 
 ---
 
