@@ -1936,12 +1936,17 @@ fn fnMinKey(vm: *VM, args: []const Value) VmError!Value {
     return keyExtremum(vm, false, args);
 }
 
-/// `(select-keys m ks)` → map of the entries of m whose keys are in ks.
+/// `(select-keys m ks)` → map of the entries of m whose keys are
+/// in ks; a vector's entries are its `[index element]` pairs, as
+/// for `find`.
 fn fnSelectKeys(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     var out = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
     const src = args[0];
-    if (!(src.kind() == .nil or src.kind() == .persistent_map or src.kind() == .record)) return VmError.KindMismatch;
+    switch (src.kind()) {
+        .nil, .persistent_map, .record, .persistent_vector => {},
+        else => return VmError.KindMismatch,
+    }
     var ks = try makeSeqIter(vm, args[1]);
     while (try ks.next()) |k| {
         const entry = try fnFind(vm, &.{ src, k });
@@ -2189,10 +2194,12 @@ fn interned_name(vm: *VM, v: Value) VmError![]const u8 {
     };
 }
 
-/// `(name x)` → the name part of a keyword, symbol or string.
+/// `(name x)` → the name part of a keyword or symbol; a string is
+/// its own name.
 fn fnName(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() == .string) return args[0];
     const full = try interned_name(vm, args[0]);
-    const local = if (args[0].kind() == .string) full else if (std.mem.indexOfScalar(u8, full, '/')) |i| full[i + 1 ..] else full;
+    const local = if (std.mem.indexOfScalar(u8, full, '/')) |i| full[i + 1 ..] else full;
     return string_mod.fromBytes(vm.ensureHeap(), local) catch VmError.OutOfMemory;
 }
 
@@ -3839,6 +3846,16 @@ test "stdlib: a string that is not UTF-8 seqs as :utf8-error" {
     try testing.expectError(VmError.Utf8Error, fnSeq(&vm, &.{bad}));
     const good = try string_mod.fromBytes(vm.ensureHeap(), "é");
     try testing.expectEqual(@as(u21, 0xE9), (try fnFirst(&vm, &.{good})).asChar());
+}
+
+test "stdlib: name of a string is the string itself" {
+    var stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
+    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var vm = try VM.init(testing.allocator, &stub);
+    defer vm.deinit();
+    const s = try string_mod.fromBytes(vm.ensureHeap(), "abc");
+    const named = try fnName(&vm, &.{s});
+    try testing.expectEqual(s.payload, named.payload);
 }
 
 test "stdlib: nativeFnValue round-trips" {
