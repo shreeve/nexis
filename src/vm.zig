@@ -1,90 +1,39 @@
-//! vm.zig — Phase 2 VM kernel.
+//! vm.zig — the bytecode interpreter.
 //!
-//! Authoritative spec: `docs/VM.md`. Adapted from `../em/src/{bytecode,
-//! runtime}.zig` per the user's latitude to lift + modify em freely.
+//! Spec: `docs/VM.md`. This file holds:
 //!
-//! **Currently implemented** (COMPILER.md §10 steps #1–#2):
-//!
-//!   - 64-bit instruction encoding + operand packing (VM.md §3, §4).
-//!   - `Routine` (compiled code + constants; plain Zig struct,
-//!     not a heap Value yet — heap-kind promotion lands with
-//!     closures per VM.md §5 staged-realization note).
-//!   - `Frame` (base_slot + slot_count + pc + routine pointer)
-//!     windowing into a VM-shared backing `stack: ArrayList(Value)`
-//!     per VM.md §7 (peer-AI turn 40 backing-stack model). Frames
-//!     live in `frames: ArrayList(Frame)`; step 5a0 still has
-//!     exactly one frame at runtime, but the storage model is
-//!     ready for `call:call` / `call:tailcall` (step 5a1) without
-//!     a second restructuring.
-//!   - `VM` with two-level-switch dispatch. Tail-call-threaded
-//!     upgrade is deferred per VM.md §8 staged-realization note.
-//!   - 6 opcodes wired across 3 groups:
-//!       mov: load-const, move, load-nil, load-true, load-false
-//!       call: return, return-nil
-//!       math: add (fixnum/float tower, i48 overflow raises ArithmeticOverflow,
-//!             traps non-fixnum as KindMismatch)
-//!   - Hand-assembled bytecode tests. The `src/compile.zig` tiny
-//!     compiler lowers `(+ 1 2)`-style forms directly to math:add
-//!     bytecode and the `Tiny` form representation.
-//!
-//! What's NOT here yet (deferred per COMPILER.md §10):
-//!
-//!   - `call:call` / `call:tailcall` — step #5 (range-call ABI per
-//!     VM.md §6 amendment). Requires the multi-frame backing-stack
-//!     evolution noted in VM.md §7.
-//!   - `closure:*` group (`make`, `box-local`, `new-cell`,
-//!     `init-cell`, `get-cell`) — step #5.
-//!   - `jump:*` group + `if` lowering — step #3.
-//!   - `cmp:*` group — step #3.
-//!   - `var:*` group + `def` lowering — step #7.
-//!   - `coll:*` / `transient:*` / `hash:*` groups — Phase 2 mid-late.
-//!   - `ctrl:*` (try/catch/throw) — step #9.
-//!   - `tx:*` group — Phase 4.
-//!   - `simd:*` group — Phase 6.
-//!   - GC root enumeration from frames — lands when the multi-frame
-//!     stack does.
-//!
-//! Implementation sequence (COMPILER.md §10):
-//!   1. VM kernel skeleton (mov, call:return)            ✓ done
-//!   2. Tiny compiler for (+ 1 2) + math:add             ✓ done
-//!   3. Conditionals (jump:*, if lowering)               ← next
-//!   4. Locals + let*
-//!   5. Functions + closures (range-call ABI + closure:*)
-//!   6. recur + loop* (with captured-binding fresh cells per VM.md §6)
-//!   7. Vars + def
-//!   8. Macroexpand + syntax-quote + #%anon-fn
-//!   9. try/catch/throw
-//!  10. Error-reporting hardening
-//!  11. Golden + eval tests
+//!   - The 64-bit instruction encoding (`Inst`, `Operand`) and the
+//!     opcode groups the two-level `dispatch` switch understands.
+//!   - `Routine`, a unit of compiled code with its constant pool,
+//!     and `Closure`, a routine plus captured upvalue cells.
+//!   - `Frame`s that window one shared backing `stack`; a call
+//!     grows the stack into the callee's window and a return or an
+//!     unwind restores the length the frame recorded on entry.
+//!   - The handler stack behind `try`/`catch`/`finally`/`throw`,
+//!     shared by bytecode throws and by natives (`throwValue`).
+//!   - The numeric tower (`numAdd` … `numCompare`): the single
+//!     implementation behind the `math:*` and `cmp:*` opcodes and
+//!     the arithmetic natives.
+//!   - `lookup`, the one implementation of `get`, `(:k m)`,
+//!     `(m :k)`, `(s x)` and `(v i)`.
+//!   - Namespaces, Vars and the namespace registry.
 
 const std = @import("std");
 const value_mod = @import("value");
-/// Step 5e (peer-AI turn 49 Option D): the VM owns a `Heap`
-/// backed by `runtime_arena` for constructing rest-arg lists
-/// at variadic call sites. heap + list are pure-allocator
-/// modules; pulling them in does NOT pull GC. The Heap shares
-/// the closure/cell allocator so all VM-side runtime values
-/// are freed together at `VM.deinit`.
+/// The VM owns a `Heap` backed by `runtime_arena` for the values
+/// it constructs itself (rest-arg lists, vectors, maps and sets
+/// built by `coll:*`). heap, list, vector and champ are pure
+/// allocator modules; pulling them in does not pull GC.
 const heap_mod = @import("heap");
 const list_mod = @import("list");
-/// Step #8c.3: persistent vector for `coll:vector` opcode +
-/// runtime vector construction (the `(#%vector ...)` IR).
-/// Like list_mod, vector_mod is a pure-allocator wrapper —
-/// no GC dependency.
 const vector_mod = @import("vector");
-/// Phase 3.1: persistent map/set (CHAMP) for `coll:map` /
-/// `coll:set` opcodes. Map/set construction requires hash +
-/// equality, so we also pull in dispatch_mod (the canonical
-/// hashValue + equal entry points per dispatch.zig docs).
 const champ_mod = @import("champ");
+/// Canonical `hashValue` + `equal` entry points for map and set
+/// construction.
 const dispatch_mod = @import("dispatch");
-/// Step E1 (pre-#8 macroexpander prereq, peer-AI turn 55):
-/// the VM owns an `Interner` used by the Form-lowering layer
-/// to convert quoted symbols/keywords into stable `Value`s. The
-/// macroexpander (step #8) will use the same Interner for
-/// auto-gensym + syntax-quote output. Single shared Interner
-/// means symbol/keyword Value identity is consistent across the
-/// whole VM lifetime.
+/// One shared `Interner` per VM keeps symbol and keyword identity
+/// consistent between the compiler, the macroexpander and runtime
+/// values.
 const intern_mod = @import("intern");
 const protocol_mod = @import("protocol");
 const record_mod = @import("record");
@@ -906,23 +855,19 @@ fn execCallNative(
 // =============================================================================
 // Frame (VM.md §7)
 //
-// Step 5a0: backing-stack model (peer-AI turn 40). Each frame is a
-// window into the VM's shared `stack` ArrayList, denoted by
-// `base_slot..base_slot + slot_count`. This refactor preserves the
-// single-frame runtime semantics — call:call / multi-frame dispatch
-// land in step 5a1 — but evolves the storage so the range-call ABI
-// (VM.md §6) can window the callee's slots over the caller's
-// `[call_base + 1 .. call_base + 1 + argc]` region with zero copy.
+// Each frame is a window into the VM's shared `stack` ArrayList,
+// `base_slot..base_slot + slot_count`. The range-call ABI (VM.md
+// §6) windows the callee's slots over the caller's
+// `[call_base + 1 .. call_base + 1 + argc]` region, so arguments
+// are never copied.
 //
-// **Critical discipline** (peer-AI turn 40):
-//   - Never store a `[]Value` slice into `vm.stack.items` and hold
-//     it across any operation that might grow `stack` — ArrayList
-//     can reallocate and invalidate the slice. Use the slotPtr()
-//     helper for one-shot access; if you need stable references
-//     mid-handler, snapshot the frame's `base_slot` into a local.
-//   - Never hold a `*Frame` across `vm.frames.append()` for the
-//     same reason. Step 5a1 will do `frames.append`, so all helpers
-//     that take a frame pointer must be one-shot.
+// Discipline:
+//   - Never hold a `[]Value` slice into `vm.stack.items` across an
+//     operation that might grow `stack`; ArrayList reallocation
+//     invalidates it. Use `slotPtr()` for one-shot access, or
+//     snapshot the frame's `base_slot` into a local.
+//   - Never hold a `*Frame` across `pushFrame`, for the same
+//     reason. Helpers that take a frame pointer are one-shot.
 // =============================================================================
 
 // Backing-stack extent invariant
@@ -1168,13 +1113,12 @@ pub const VmError = error{
     /// entirely.
     UninitializedCell,
 
-    /// Step #9.1 (peer-AI turn 59): a `ctrl:throw` walked the
-    /// entire frame chain without finding a matching handler.
-    /// Halts the VM; the thrown value is preserved in
-    /// `VM.unhandled_throw` for diagnostics (#10 will surface
-    /// this with source span context).
+    /// A throw, from `ctrl:throw` or from a native through
+    /// `throwValue`, found no handler on the handler stack. The
+    /// VM halts and the thrown value is left in
+    /// `VM.unhandled_throw` for the host to report.
     UncaughtThrow,
-    /// Step #9.1: handler stack is in an invalid state —
+    /// Handler stack is in an invalid state —
     /// `ctrl:try-exit` referenced a handler that doesn't
     /// belong to the current frame, or popping found nothing.
     /// Indicates compiler bug, not user error.
@@ -1288,21 +1232,17 @@ pub const HandlerKind = enum {
     /// A `(try body (catch any x handler))` is active —
     /// catch_pc + binding_slot are valid; throw routes here.
     try_,
-    /// The catch body of a fired try is running — preserves
-    /// per-handler bookkeeping (e.g., per-#9.2 finally_pc)
-    /// for the catch body's `try-exit`. Prevents the catch
-    /// body's own throw from being re-caught by the same
-    /// handler (peer-AI turn 59 §"Missing trap 1" — the
-    /// classic catch-body-rethrow trap).
+    /// The catch body of a fired try is running. Keeps the
+    /// handler's bookkeeping (its `finally_pc`) for the catch
+    /// body's `try-exit` while making sure a throw from inside
+    /// the catch body is not caught by the same handler again.
     cleanup,
 };
 
-/// Per-handler state stored on `VM.handlers`. Per peer-AI
-/// turn 59 §D2: a VM-global stack keyed by `frame_index`
-/// (instead of per-frame ArrayLists). Cheaper to manage, no
-/// per-frame init/deinit, frame indices stable under
-/// `frames.append` reallocations because frames only pop
-/// from the top.
+/// Per-handler state stored on `VM.handlers`: one VM-wide stack
+/// keyed by `frame_index` rather than a list per frame. Frame
+/// indices stay valid across `frames.append` reallocations
+/// because frames only pop from the top.
 pub const Handler = struct {
     kind: HandlerKind,
     /// Index into `VM.frames`. Identifies which frame this
@@ -1316,15 +1256,13 @@ pub const Handler = struct {
     /// Slot into which the thrown value is stored when the
     /// catch fires. Valid only when kind == .try_.
     binding_slot: u12,
-    /// Step #9.2: PC of the finally entry. null when the try
-    /// has no finally clause. Both .try_ and .cleanup handlers
-    /// carry this so unwind through either kind runs the
-    /// finally.
+    /// PC of the finally entry. null when the try has no finally
+    /// clause. Both .try_ and .cleanup handlers carry this so
+    /// unwind through either kind runs the finally.
     finally_pc: ?u32 = null,
 };
 
-/// Step #9.2 (peer-AI turn 59 §D5): tagged continuation for
-/// finally bodies. When a try-exit / catch-exit / throw-unwind
+/// Tagged continuation for finally bodies. When a try-exit / catch-exit / throw-unwind
 /// path needs to run a finally, it pushes a continuation onto
 /// `VM.finally_stack` describing what to do AFTER the finally
 /// finishes.
@@ -1441,20 +1379,14 @@ pub const VM = struct {
     /// throw-unwind (when a finally must run before the throw
     /// continues). Popped by finally-exit.
     finally_stack: std.ArrayList(FinallyContinuation) = .empty,
-    /// Step #9.1: if a `ctrl:throw` walks the entire frame
-    /// chain without finding a matching handler, the VM halts
-    /// with `VmError.UncaughtThrow` AND stores the thrown
-    /// payload here. Step #10 will surface this with source
-    /// span context.
+    /// The payload of the throw that halted the VM with
+    /// `VmError.UncaughtThrow`; the host prints it alongside the
+    /// error.
     unhandled_throw: ?Value = null,
-    /// Step E1 (pre-#8): shared Interner for symbol/keyword
-    /// Value construction. Lazy-initialized on first access.
-    /// Used by the compiler's `lowerQuotePayload` for quoted
-    /// symbols/keywords and (post-#8) by the macroexpander for
-    /// auto-gensym and syntax-quote output. Backed by
-    /// `self.allocator` (NOT runtime_arena) because the
-    /// Interner's internal hash maps need a real allocator
-    /// that supports realloc/free, which arena doesn't.
+    /// Shared Interner for symbol/keyword Value construction,
+    /// initialized on first access. Backed by `self.allocator`
+    /// (not `runtime_arena`) because its hash maps need realloc
+    /// and free.
     interner: ?intern_mod.Interner = null,
     /// Where the top-level `call:return` stores the returned Value on
     /// halt.
@@ -5120,7 +5052,7 @@ test "VM math:add: dst/rhs aliasing (math:add s0, c0, s0)" {
 
 test "VM math:add: mixed slot+constant operand kinds" {
     // Pins resolve() behavior across kind combinations the
-    // codegen will actually emit (peer-AI turn 33).
+    // codegen emits.
     const consts = [_]Const{cval(value_mod.fromFixnum(100).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0), //                       s0 = 100
