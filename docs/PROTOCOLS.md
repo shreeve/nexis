@@ -1,34 +1,21 @@
-## PROTOCOLS.md — Records + Protocols (Phase 5 Item 3, design phase)
+## PROTOCOLS.md — Records + Protocols
 
-**Status**: Phase 5 Item 3 design freeze. Authoritative contract for
-the runtime-side `Kind.record = 35`, `Kind.protocol = 36`,
-`Kind.protocol_fn = 37` (introduced in this item) and the
+Authoritative contract for the runtime-side `Kind.record = 35`,
+`Kind.protocol = 36`, `Kind.protocol_fn = 37` and the
 language-surface `defprotocol` / `defrecord` / `extend-protocol` /
-`extend-type` / `satisfies?` macros. Derivative from `PLAN.md`
-Amendment Log (protocols-and-records entry; lands with `5.3a`),
-`HANDOFF.md` §10.3, `docs/VALUE.md` §2.2, `docs/SEMANTICS.md` §2.6
-(structural-equality category extension), and peer-AI turns 74 + 84.
-Those documents win on conflict.
+`extend-type` / `satisfies?` macros and natives. Related contracts:
+`docs/VALUE.md` §2.2 (kind numbering) and `docs/SEMANTICS.md` §2.6
+(structural-equality categories). Those documents win on conflict.
 
-This is the **design phase** of Item 3. No code lands with this
-commit — only the spec + hand-trace + the PLAN.md amendment that
-unblocks the four `5.3a` – `5.3d` implementation commits.
-
-Per HANDOFF §12 #9 + the project's spec-first discipline, the
-hand-trace below is required before any code is written for this
-item. The closure-design hand-trace (Phase 2 turn 34) caught three
-load-bearing bugs; the variadic-rest hand-trace (Phase 2 turn 49)
-caught the Option-D construction order. Protocols/records is the
-only Phase 5 item complex enough to repeat that pattern.
+Protocols are static-dispatch over per-VM registries: single
+isolate, single thread, no STM, no agents, no concurrency.
 
 ---
 
-### 0. v1 boundary commitments
-
-What ships in v1 (Items 5.3a–d):
+### 0. Surface
 
 - `Kind.record = 35` — one heap kind for all record types; the
-  `RecordTypeId` lives in the heap body, NOT as a separate Kind.
+  record type id lives in the heap body, NOT as a separate Kind.
   Structural equality + structural hash by `(type_id, field_map)`.
 - `Kind.protocol = 36` — opaque protocol handle. Identity equality;
   not serializable; user code holds them only as Var roots.
@@ -36,67 +23,47 @@ What ships in v1 (Items 5.3a–d):
   equality. Carries `(protocol_id, method_name_id)` so the
   generic dispatcher knows what to look up. Distinct from
   `Kind.native_fn` because `NativeFn` is a static descriptor with
-  no per-method state (peer-AI turn 84 §"Big missing implementation
-  concern").
-- `defprotocol`, `defrecord`, `extend-protocol`, `extend-type`,
-  `satisfies?` — host macros + native dispatch fns.
+  no per-method state.
+- `defprotocol`, `defrecord`, `extend-protocol`, `extend-type` —
+  host macros; `satisfies?` — native fn in `nexis.core`.
 - `(->Counter n)` positional constructor; `(map->Counter {:n 1})`
   map constructor; `Counter?` predicate.
 - `(get rec :k)`, `(:k rec)`, `(assoc rec :k v)`, `(dissoc rec :k)`,
-  `(contains? rec :k)`, `(keys rec)`, `(vals rec)` — records behave
-  map-like for these.
-- Built-in dispatch types for `extend-protocol`: `Nil`, `Boolean`,
-  `Number` (fixnum only in v1; documented), `String`, `Keyword`,
-  `Symbol`, `List`, `Vector`, `Map`, `Set`, `Atom`, plus `Any` /
-  `Object` for the default fallback.
+  `(contains? rec :k)`, `(keys rec)`, `(vals rec)`, `(count rec)`,
+  `(empty? rec)`, `(find rec :k)`, `(seq rec)` — records behave
+  map-like for these. `assoc` / `dissoc` return a record of the
+  same type; `empty` on a record returns `{}`.
+- Built-in dispatch targets for `extend-protocol` / `extend-type`
+  are keywords naming a `Kind` (see §4.3), plus `:any` for the
+  default fallback.
 
-What is explicitly OUT of v1 (deferred):
+Facts about the boundary:
 
-- `Counter.` (dot-suffix) reader syntax — `->Counter` is sufficient.
-- `:>>` thread-result-through-fn syntax in `condp`'s sibling
-  positions (already deferred from 5.4).
-- Records / protocols in the codec serializable set — both throw
-  `:unserializable` (matches PLAN §23 #25 + the protocol/record
-  unserializability per turn 84).
-- Inline-cache dispatch for protocol method calls (Phase 6 perf).
-- User-extensible protocols across namespaces with hot-swap
-  semantics — single-isolate v1 means redefinition is well-behaved
-  but cross-isolate semantics don't apply.
-- Duplicate record/protocol name redefinition — REJECTED with a
-  clear error (peer-AI turn 84 § "Redefinition"); avoiding the
-  confusing-state hazard.
-- Numeric tower beyond fixnum mapping to `Number` — when bignum/
-  float gain `extend-protocol` support, they get their own dispatch
-  type names.
+- There is no `Counter.` (dot-suffix) constructor syntax; `->Counter`
+  is the constructor.
+- Records and protocols are not in the codec serializable set; both
+  throw `:unserializable`.
+- Protocol method calls have no inline cache; every call walks the
+  registry (§5.5).
+- Redefining a record type or protocol with the same `(ns, name)`
+  is rejected with `:record-redefinition` / `:protocol-redefinition`
+  (§3.1).
+- A protocol method has exactly one arity: the impl fn's own. The
+  registry stores no per-method arity, and `defprotocol` ignores the
+  parameter vectors in its method specs (§4.1).
+- Every `Kind` tag name is a valid dispatch keyword, so `:fixnum`,
+  `:bignum`, and `:float` are three distinct dispatch targets; there
+  is no umbrella `Number` target.
 
 ---
 
-### 1. PLAN.md amendment context
+### 1. Relationship to the v1 decision record
 
-`PLAN.md` §23 #8 says "No user protocols in v1. Built-in
-polymorphism only." Appendix A repeats "Protocols — Removed in v1".
-
-This is the same shape as the Phase 5.1 atoms situation. The §23
-frozen-decision text remains intact; the Amendment Log entry
-(landing with `5.3a`) IS the authority record:
-
-```
-- 2026-05-19 — Protocols + records (Phase 5 Item 3) added.
-  §23 #8 ("No user protocols in v1") and Appendix A
-  ("Protocols — Removed in v1") were v1-scoping decisions
-  pre-Phase-5; the HANDOFF.md §10.3 Phase 5 framing (peer-AI
-  turn 74) and the design freeze below (turn 84) reframe these
-  as Phase 5 scope additions, not changes to architecturally
-  load-bearing decisions. v1 keeps its other §23 #5 constraint
-  (single-isolate, single-threaded), so protocols here are
-  static-dispatch + per-VM registries; no STM, no agents,
-  no concurrency. Authority: peer-AI turn 84. See
-  `docs/PROTOCOLS.md` for the full spec + hand-trace.
-```
-
-`5.3a` lands the amendment + the runtime substrate. `5.3b–d`
-build on that without further PLAN amendments unless a real
-contradiction surfaces.
+Protocols and records are a v1 scope addition, not a change to any
+architecturally load-bearing decision: v1 stays single-isolate,
+single-threaded, so protocols are static-dispatch + per-VM
+registries. Built-in polymorphism (`count`, `get`, `=`, ...) stays
+kind-switch based in Zig; user protocols sit beside it.
 
 ---
 
@@ -105,21 +72,23 @@ contradiction surfaces.
 #### 2.1 `Kind.record = 35`
 
 ```zig
-RecordValue {
+RecordBody extern struct {
     type_id: u32,                     // dense index into VM.record_registry
-    fields: Value (persistent_map),   // keyword → value
+    _pad: [4]u8,
+    fields: Value,                    // persistent_map (keyword → value)
 }
 ```
+
+`@sizeOf(RecordBody) == 24`, alignment ≤ 16.
 
 - **`type_id` is a per-VM dense `u32`**, NOT a pointer. Stable
   across allocations within a VM; not stable across VMs (single
   isolate = irrelevant) and not stable across serialization
-  (records are unserializable in v1).
+  (records are unserializable).
 - **`fields` is a `Kind.persistent_map`** — CHAMP/array-map per
   CHAMP.md. Keys are keywords (or symbols, for completeness).
-  Extra keys not in the declared field list are ALLOWED (peer-AI
-  turn 84 §D4 "Extra keys"); the declared list is constructor
-  metadata, not a storage restriction.
+  Extra keys not in the declared field list are ALLOWED; the
+  declared list is constructor metadata, not a storage restriction.
 
 **Equality** (kind-local, structural):
 
@@ -132,12 +101,12 @@ equal(record_a, record_b) :=
 **Hash** (kind-local, structural):
 
 ```
-hash(record) := mixKindDomain(combine(type_id_hash, field_map_hash), 35)
+hash(record) := mixKindDomain(xxh3(type_id_le ++ field_map_hash_le), 35)
 ```
 
 Two `(->Counter 5)` instances are `=` regardless of which `->Counter`
 call produced them. Records-as-map-keys WORK because hash + equality
-are structural.
+are structural. The hash is cached in the header hash slot.
 
 **Codec**: records throw `:unserializable` (same arm as functions /
 Vars / atoms / etc.).
@@ -145,12 +114,15 @@ Vars / atoms / etc.).
 **GC trace**: walk `fields`. The `type_id` is a `u32`, not a heap
 pointer.
 
+**Format**: `#<record type-id=N>` in both display and readable
+modes (opaque, not reader-roundtrippable).
+
 #### 2.2 `Kind.protocol = 36`
 
 ```zig
-ProtocolValue {
+ProtocolBody extern struct {
     id: u32,           // dense index into VM.protocol_registry
-    name_id: u32,      // interned symbol id (qualified name)
+    _pad: [4]u8,
 }
 ```
 
@@ -158,20 +130,21 @@ ProtocolValue {
 - **Identity equality** (pointer-to-heap-header). Two `IFoo`
   references resolve to the same Var → same protocol value.
 - **Unserializable.**
-- **Format**: `#<protocol my.ns/IFoo>` in both display and
-  readable modes (turn 84 § "Format" — opaque, not pretending
-  to be reader-roundtrippable).
+- **Format**: `#<protocol id=N>` in both display and readable
+  modes (opaque, not pretending to be reader-roundtrippable).
+- **GC trace**: leaf; no inner heap to mark.
 
-The protocol's METHOD TABLE lives in `VM.protocol_registry[id]`,
-not in the heap body — that way mutation via `extend-protocol`
-doesn't have to clone the protocol Value.
+The protocol's name and METHOD TABLE live in
+`VM.protocol_registry[id]`, not in the heap body — that way
+mutation via `extend-protocol` doesn't have to clone the protocol
+Value.
 
 #### 2.3 `Kind.protocol_fn = 37`
 
 ```zig
-ProtocolFnValue {
+ProtocolFnBody extern struct {
     protocol_id: u32,
-    method_name_id: u32,    // interned symbol id of the method name
+    method_name_id: u32,    // keyword-pool id of the method name
 }
 ```
 
@@ -181,68 +154,68 @@ ProtocolFnValue {
   method_name_id)`).
 - **Identity equality.**
 - **Unserializable.**
-- **Format**: `#<protocol-fn my.ns/IFoo/bar>`.
-- **Call dispatch**: `call:call` on a `protocol_fn` routes to a
-  generic VM helper `dispatchProtocolMethod(vm, protocol_id,
-  method_name_id, args)` which walks
-  `VM.protocol_registry[protocol_id].methods[method_name_id].impls[dispatch_key(args[0])]`
+- **Format**: `#<protocol-fn proto=P method=M>` (numeric ids).
+- **GC trace**: leaf.
+- **Call dispatch**: `call:call` on a `protocol_fn` routes to the
+  VM helper `dispatchProtocolMethod(vm, callee, args)` which walks
+  `VM.protocol_registry[protocol_id].methods[method_name_id].impls[DispatchKey.ofValue(args[0])]`
   and invokes the resulting closure / native_fn / fn.
 
-Peer-AI turn 84 §"Big missing implementation concern": this is the
-key insight. `NativeFn` is a static descriptor with `{name, min_arity,
-max_arity, fn_ptr}` — no per-instance state. Protocol dispatchers
+`NativeFn` is a static descriptor with `{name, min_arity,
+max_arity, call}` — no per-instance state. Protocol dispatchers
 NEED to know which protocol + which method they belong to. A
-fresh `Kind.protocol_fn` with that state in the payload is the
-cleanest fix, isolated from `NativeFn`'s static-descriptor design.
+separate `Kind.protocol_fn` with that state in the payload keeps
+`NativeFn`'s static-descriptor design intact.
 
 ---
 
 ### 3. VM-side registries
 
-The VM grows two new lazy-init fields:
+The VM owns two registries:
 
 ```zig
-record_registry: ?std.ArrayList(RecordType) = null,
-protocol_registry: ?std.ArrayList(ProtocolEntry) = null,
+record_registry: std.ArrayList(RecordTypeEntry) = .empty,
+protocol_registry: std.ArrayList(ProtocolEntry) = .empty,
 ```
 
 where:
 
 ```zig
-RecordType {
+RecordTypeEntry {
     id: u32,                       // dense, == index into the ArrayList
     ns_name: []const u8,           // qualified namespace name
     type_name: []const u8,         // short name (e.g. "Counter")
-    declared_fields: []const u32,  // interned keyword ids in declared order
+    field_names: []const []const u8, // declared field keyword names, in order
 }
 
 ProtocolEntry {
     id: u32,
     ns_name: []const u8,
     name: []const u8,
-    methods: std.StringHashMapUnmanaged(MethodSpec),
+    methods: std.ArrayList(ProtocolMethod),
 }
 
-MethodSpec {
-    name: []const u8,
-    arity: u16,                    // arity including `this`
-    impls: std.AutoHashMapUnmanaged(DispatchKey, Value),  // each Value is a fn
-    default_impl: ?Value = null,
+ProtocolMethod {
+    name_id: u32,                  // keyword-pool id; matches ProtocolFnBody.method_name_id
+    name: []const u8,              // for error messages
+    impls: std.AutoHashMapUnmanaged(DispatchKey, Value),  // each Value is callable
+    default_impl: ?Value = null,   // installed by extend-* on :any
 }
 
-DispatchKey = union(enum) {
-    builtin_kind: Value.Kind,      // for extend-protocol on Map / String / etc.
-    record_type: u32,              // RecordType.id
-    any,                           // Object / Any fallback
-};
+DispatchKey {
+    tag: enum(u8) { builtin = 0, record = 1 },
+    id: u32,                       // Kind byte for builtin; RecordTypeEntry.id for record
+}
 ```
 
-`VM.deinit` frees both registries (the ArrayList + the per-Method
+`DispatchKey.ofValue(v)` returns `{ .record, typeId(v) }` when
+`v.kind() == .record` and `{ .builtin, @intFromEnum(v.kind()) }`
+otherwise.
+
+`VM.deinit` frees both registries (the ArrayLists + the per-method
 maps). Names are owned by the registries (duped on registration).
 
 #### 3.1 Lifetime + redefinition
-
-Per peer-AI turn 84 §"Redefinition":
 
 - Defining a record type with a name that's already in
   `record_registry` for the same `(ns, name)` → reject with
@@ -250,20 +223,24 @@ Per peer-AI turn 84 §"Redefinition":
   where existing instances reference an old type_id.
 - Defining a protocol with an existing `(ns, name)` → same
   treatment: `:protocol-redefinition`.
-- Adding new impls to an existing protocol via
-  `extend-protocol` / `defrecord` is allowed (that's the whole
-  point of those macros). Mutation of an existing impl for the
-  same `(protocol_id, method, dispatch_key)` triple → overwrite
-  silently (Clojure-canonical behavior; users redefining at the
-  REPL is the common case).
+- Adding impls to an existing protocol via
+  `extend-protocol` / `extend-type` / `defrecord` is allowed (that's
+  the whole point of those macros). Registering an impl for a
+  `(protocol_id, method, dispatch_key)` triple that already has one
+  → overwrite silently (Clojure-canonical behavior; users
+  redefining at the REPL is the common case). Registering a
+  `:any` impl overwrites the method's `default_impl`.
 
 ---
 
 ### 4. Macros
 
-All four are host macros in `src/expand.zig` next to `defmacro` /
-`defn`. They expand to combinations of `def` + native-fn
-registrations + RecordType / Protocol registry calls.
+`defprotocol`, `defrecord`, `extend-protocol` and `extend-type` are
+host macros in `src/expand.zig` next to `defmacro` / `defn`. They
+expand to combinations of `def` + calls to internal natives that
+live in the `nexis.internal` namespace (NOT auto-referred); the
+macros emit fully-qualified calls. Method names travel as keywords
+so the natives see homogeneous values and one interning pool.
 
 #### 4.1 `defprotocol`
 
@@ -273,22 +250,24 @@ registrations + RecordType / Protocol registry calls.
   (baz [this x y]))
 ```
 
-Expansion (effective shape; actual emits use synthetic gensyms):
+Expansion:
 
 ```clojure
 (do
   ;; Register the protocol in VM.protocol_registry.
-  (def IFoo  (#%register-protocol "my.ns/IFoo"
-                                  ["bar" 2]
-                                  ["baz" 3]))
+  (def IFoo (nexis.internal/#%register-protocol "my.ns/IFoo" [:bar :baz]))
   ;; Each method gets a Var whose root is a `Kind.protocol_fn`.
-  (def bar (#%protocol-fn IFoo "bar"))
-  (def baz (#%protocol-fn IFoo "baz")))
+  (def bar (nexis.internal/#%protocol-fn IFoo :bar))
+  (def baz (nexis.internal/#%protocol-fn IFoo :baz)))
 ```
 
-`#%register-protocol` and `#%protocol-fn` are internal native fns
-exposed only via the expansion. They're not part of the user
-surface.
+Each method spec must be a list headed by an unqualified symbol.
+The parameter vector after the method name is accepted and ignored:
+the registry records no arity or doc string, and arity is enforced
+by whichever impl fn the dispatcher invokes.
+
+`#%register-protocol` returns the `Kind.protocol` Value carrying the
+protocol's id; `#%protocol-fn` reads that id out of the Value.
 
 #### 4.2 `defrecord`
 
@@ -303,31 +282,39 @@ Expansion:
 
 ```clojure
 (do
-  ;; Register the record type; gets a fresh type_id.
-  (def ^:record-type-id Counter-type-id
-       (#%register-record-type "my.ns/Counter" [:n]))
+  ;; Register the record type; gets a fresh type_id (a fixnum).
+  (def Counter-type-id
+       (nexis.internal/#%register-record-type "my.ns/Counter" [:n]))
   ;; Positional constructor.
   (defn ->Counter [n]
-    (#%make-record Counter-type-id {:n n}))
+    (nexis.internal/#%make-record Counter-type-id (assoc {} :n n)))
   ;; Map constructor.
   (defn map->Counter [m]
-    (#%make-record Counter-type-id m))
+    (nexis.internal/#%make-record Counter-type-id m))
   ;; Predicate.
   (defn Counter? [x]
-    (and (#%record? x)
-         (= Counter-type-id (#%record-type-id x))))
+    (and (nexis.internal/#%record? x)
+         (= Counter-type-id (nexis.internal/#%record-type-id x))))
   ;; Per-protocol impls registered into the protocol's method table.
-  (#%register-protocol-impl IFoo "bar"
-                            (record-type Counter-type-id)
-                            (fn [this x] (assoc this :n (+ x (:n this)))))
-  (#%register-protocol-impl IFoo "baz"
-                            (record-type Counter-type-id)
-                            (fn [this x y] [:counter (+ x y)])))
+  (nexis.internal/#%extend-record-impl IFoo :bar Counter-type-id
+    (fn [this x] (assoc this :n (+ x (:n this)))))
+  (nexis.internal/#%extend-record-impl IFoo :baz Counter-type-id
+    (fn [this x y] [:counter (+ x y)])))
 ```
 
-`#%register-record-type`, `#%make-record`, `#%record?`,
-`#%record-type-id`, `#%register-protocol-impl`, `(record-type ...)`
-are internal native fns / forms — emitted only by the macro layer.
+Clauses after the field vector are parsed in order: a bare symbol
+switches the current protocol; a list `(method [params] body...)`
+emits one `#%extend-record-impl` call against the current protocol.
+A method clause before any protocol symbol is a malformed macro
+call.
+
+`map->Counter` passes its argument through unchanged; the map may
+carry extra keys or omit declared ones (§2.1).
+
+The four Vars a `defrecord` defines besides the type (`T-type-id`,
+`->T`, `map->T`, `T?`) are also known to the compiler's declared-name
+table, so a form may refer to `->T` before the `defrecord` that
+produces it.
 
 The `assoc this :n (...)` inside the body works because records
 are map-like for `get` / `assoc` / `dissoc`. The returned value
@@ -338,11 +325,11 @@ field map (NOT a plain map).
 
 ```clojure
 (extend-protocol IFoo
-  Map
+  :map
   (bar [m x] (assoc m :extended x))
   (baz [m x y] [:map x y]))
 
-(extend-type Map
+(extend-type :map
   IFoo
   (bar [m x] (assoc m :extended x))
   (baz [m x y] [:map x y]))
@@ -352,46 +339,46 @@ Both expand to:
 
 ```clojure
 (do
-  (#%register-protocol-impl IFoo "bar"
-                            (builtin-kind :persistent-map)
-                            (fn [m x] (assoc m :extended x)))
-  (#%register-protocol-impl IFoo "baz"
-                            (builtin-kind :persistent-map)
-                            (fn [m x y] [:map x y])))
+  (nexis.internal/#%extend-builtin-impl IFoo :bar :map
+    (fn [m x] (assoc m :extended x)))
+  (nexis.internal/#%extend-builtin-impl IFoo :baz :map
+    (fn [m x y] [:map x y])))
 ```
 
-Built-in dispatch type names (resolved at expand time):
+`extend-type` takes one type and any number of
+`Protocol (method ...)...` groups; `extend-protocol` takes one
+protocol and any number of `type (method ...)...` groups. Both walk
+the same clause parser with the fixed and iterated positions
+swapped.
 
-| Name | Maps to |
-|---|---|
-| `Nil` | `.nil` |
-| `Boolean` | `.true_` and `.false_` (both) |
-| `Number` | `.fixnum` (v1 only; document) |
-| `String` | `.string` |
-| `Keyword` | `.keyword` |
-| `Symbol` | `.symbol` |
-| `Char` | `.char` |
-| `List` | `.list` |
-| `Vector` | `.persistent_vector` |
-| `Map` | `.persistent_map` |
-| `Set` | `.persistent_set` |
-| `Atom` | `.atom` |
-| `Any` / `Object` | default fallback (`DispatchKey.any`) |
+Type forms:
 
-Unknown type names → `:unknown-dispatch-type` at expansion time.
+| Type form | Emits | Dispatch key |
+|---|---|---|
+| keyword naming a `Kind` tag (`:nil`, `:false_`, `:true_`, `:char`, `:fixnum`, `:float`, `:keyword`, `:symbol`, `:string`, `:bignum`, `:persistent_map`, `:persistent_set`, `:persistent_vector`, `:list`, `:function`, `:native_fn`, `:atom`, `:record`, ...) | `#%extend-builtin-impl` | `{ .builtin, kind }` |
+| `:vector` / `:map` / `:set` | `#%extend-builtin-impl` | aliases for `:persistent_vector` / `:persistent_map` / `:persistent_set` |
+| `:any` | `#%extend-default-impl` | sets the method's `default_impl` |
+| symbol `Counter` | `#%extend-record-impl` with `Counter-type-id` | `{ .record, type_id }` |
+
+The keyword → `Kind` mapping is derived from the `Kind` enum's field
+names at compile time, so every kind tag is accepted. A keyword
+that names no kind and no alias raises `:invalid-argument` when the
+expansion runs (the macro does not validate type names). The record
+symbol resolves to `<Name>-type-id` at runtime; using a name that no
+`defrecord` produced fails as an unbound symbol.
 
 #### 4.4 `satisfies?`
 
 ```clojure
-(satisfies? IFoo (Counter. 5))   ; => true
-(satisfies? IFoo 42)              ; => false (unless Number was extended)
+(satisfies? IFoo (->Counter 5))   ; => true
+(satisfies? IFoo 42)              ; => false when neither :fixnum nor :any has an impl
 ```
 
-Implementation: for the receiver's dispatch key (record_type or
-Kind), walk every method in the protocol and verify there's an
-impl (or a default). All-present → true, any-missing → false.
-
-Zero-method protocols → always true (degenerate but well-defined).
+Native fn in `nexis.core`, arity 2. For the receiver's dispatch key
+(record type or Kind), walk the protocol's methods; the result is
+true if ANY method has an impl for that key or a `default_impl`,
+false otherwise. A zero-method protocol therefore yields false. A
+first argument that is not a protocol raises `:kind-mismatch`.
 
 ---
 
@@ -399,8 +386,7 @@ Zero-method protocols → always true (degenerate but well-defined).
 
 This is the load-bearing section. The hand-trace walks `(bar
 (->Counter 5))` end-to-end through reader → expand → compile →
-VM, with EVERY step annotated. Per HANDOFF §12 #9, this catches
-spec holes before any code can violate them.
+VM, with EVERY step annotated.
 
 #### 5.1 Source
 
@@ -436,17 +422,17 @@ A 4-element list of forms: `do`, `defprotocol`-form,
 (defprotocol IFoo (bar [this x]))
 →
 (do
-  (def IFoo (#%register-protocol "user/IFoo" ["bar" 2]))
-  (def bar  (#%protocol-fn IFoo "bar")))
+  (def IFoo (nexis.internal/#%register-protocol "user/IFoo" [:bar]))
+  (def bar  (nexis.internal/#%protocol-fn IFoo :bar)))
 ```
 
 After execution:
 - `VM.protocol_registry[0]` exists, named `user/IFoo`, with
-  one method `bar` (arity 2).
+  one method `bar`.
 - The `IFoo` Var's root is a `Kind.protocol` Value carrying
-  `{ id: 0, name_id: <intern("user/IFoo")> }`.
+  `{ id: 0 }`.
 - The `bar` Var's root is a `Kind.protocol_fn` Value carrying
-  `{ protocol_id: 0, method_name_id: <intern("bar")> }`.
+  `{ protocol_id: 0, method_name_id: <keyword id of :bar> }`.
 
 ##### 5.3.b `defrecord`
 
@@ -457,26 +443,25 @@ After execution:
 →
 (do
   (def Counter-type-id
-       (#%register-record-type "user/Counter" [:n]))
+       (nexis.internal/#%register-record-type "user/Counter" [:n]))
   (defn ->Counter [n]
-    (#%make-record Counter-type-id {:n n}))
+    (nexis.internal/#%make-record Counter-type-id (assoc {} :n n)))
   (defn map->Counter [m]
-    (#%make-record Counter-type-id m))
+    (nexis.internal/#%make-record Counter-type-id m))
   (defn Counter? [x]
-    (and (#%record? x)
-         (= Counter-type-id (#%record-type-id x))))
-  (#%register-protocol-impl IFoo "bar"
-                            (record-type Counter-type-id)
-                            (fn [this x] (+ x (:n this)))))
+    (and (nexis.internal/#%record? x)
+         (= Counter-type-id (nexis.internal/#%record-type-id x))))
+  (nexis.internal/#%extend-record-impl IFoo :bar Counter-type-id
+    (fn [this x] (+ x (:n this)))))
 ```
 
 After execution:
 - `VM.record_registry[0]` exists with `{ id: 0, ns_name: "user",
-  type_name: "Counter", declared_fields: [<:n keyword id>] }`.
+  type_name: "Counter", field_names: ["n"] }`.
 - `Counter-type-id` Var's root is `Value.fromFixnum(0).?`.
 - `->Counter` / `map->Counter` / `Counter?` Vars hold compiled
   closures.
-- `VM.protocol_registry[0].methods["bar"].impls[.record_type(0)]`
+- `VM.protocol_registry[0].methods[bar].impls[{record, 0}]`
   is the closure for `(fn [this x] (+ x (:n this)))`.
 
 ##### 5.3.c Call site
@@ -512,37 +497,38 @@ At runtime:
 ```text
 callee_kind := slot[X+0].kind()
 switch callee_kind:
-    .function       → existing Closure dispatch
-    .native_fn      → existing NativeFn dispatch
-    .protocol_fn    → dispatchProtocolMethod(vm, slot[X+0], &slot[X+1..X+1+argc])
+    .function       → Closure dispatch
+    .native_fn      → NativeFn dispatch
+    .protocol_fn    → copy args off the stack;
+                      dispatchProtocolMethod(vm, slot[X+0], args)
     else            → :not-callable
 ```
+
+The args are COPIED off the stack (same shape as the native arm) so
+the invoked impl can safely grow the stack; the result is written to
+the caller's `result_dst` slot.
 
 `dispatchProtocolMethod(vm, fn_value, args)`:
 
 ```text
+if args.len == 0 → throw :arity-mismatch
 pfn         := asProtocolFn(fn_value)        // {protocol_id, method_name_id}
 proto       := vm.protocol_registry[pfn.protocol_id]
-method      := proto.methods[interner.name(pfn.method_name_id)]
+            or throw :no-protocol-impl
+method      := proto.methods[name_id == pfn.method_name_id]
             or throw :no-protocol-method
 
-if args.len < method.arity → throw :arity-mismatch
 receiver    := args[0]
-dkey        := dispatchKeyFor(receiver)      // record_type, builtin_kind, or any
+dkey        := DispatchKey.ofValue(receiver)  // record or builtin
 impl        := method.impls[dkey]
-            or method.impls[.any]
             or method.default_impl
             or throw :no-protocol-impl
 
 return vm.callValue(impl, args)
 ```
 
-`dispatchKeyFor(v)`:
-```text
-if v.kind() == .record:
-    return .record_type(asRecord(v).type_id)
-return .builtin_kind(v.kind())
-```
+`callValue` applies the impl's own arity check; a wrong argument
+count surfaces as that fn's `:arity-mismatch`.
 
 #### 5.6 Worked numbers for `(bar (->Counter 5) 7)`
 
@@ -554,11 +540,11 @@ return .builtin_kind(v.kind())
 
 2. `(bar <record> 7)` runs:
    - `bar` Var → `Kind.protocol_fn` Value `{protocol_id: 0,
-     method_name_id: <intern("bar")>}`.
+     method_name_id: <:bar>}`.
    - `call:call` sees `.protocol_fn` → routes to
      `dispatchProtocolMethod`.
-   - `dispatchKeyFor(<record>)` → `.record_type(0)`.
-   - Lookup: `protocol_registry[0].methods["bar"].impls[.record_type(0)]`
+   - `DispatchKey.ofValue(<record>)` → `{record, 0}`.
+   - Lookup: `protocol_registry[0].methods[bar].impls[{record, 0}]`
      → the `(fn [this x] (+ x (:n this)))` closure.
    - `vm.callValue(impl, [<record>, 7])` runs the closure:
      - `this` = the record. `x` = 7.
@@ -568,32 +554,29 @@ return .builtin_kind(v.kind())
 
 3. The outer `do` returns the result of its last subform → `12`. ✓
 
-#### 5.7 What the hand-trace surfaces
-
-Holes / decisions pinned by walking through:
+#### 5.7 Decisions the hand-trace pins
 
 - `#%register-protocol` returns a `Kind.protocol` Value with the
-  protocol's id — needed by the `(#%protocol-fn IFoo "bar")` form
+  protocol's id — needed by the `(#%protocol-fn IFoo :bar)` form
   immediately below in the same `do`. The id is captured at
   registration time.
 - `#%register-record-type` returns a fixnum (the type_id) so the
   `->Counter` constructor body can reference it as an ordinary
   value. Stored in a Var.
-- `#%register-protocol-impl` takes the protocol VALUE (not Var),
-  the method NAME (string), and a DispatchKey (either
-  `(record-type <type-id-value>)` or `(builtin-kind <kw>)`).
-- The dispatcher's `call:call` arm must fire BEFORE the
-  `:not-callable` fallback; this means `Kind.protocol_fn` joins
-  `.function` and `.native_fn` as the three callable kinds.
+- `#%extend-record-impl` / `#%extend-builtin-impl` /
+  `#%extend-default-impl` take the protocol VALUE (not Var), the
+  method NAME (keyword), and — for the first two — a dispatch
+  target (a type-id fixnum, or a kind keyword).
+- The dispatcher's `call:call` arm fires BEFORE the
+  `:not-callable` fallback; `Kind.protocol_fn` joins `.function`
+  and `.native_fn` as the three callable kinds.
 - `Kind.record`'s field-map operations (`get`, `assoc`, `dissoc`,
-  `:k` keyword-as-fn) must route through the record's field
-  map; `assoc` on a record returns a record (same type_id), NOT
-  a plain map.
-- All five `#%`-prefixed internal forms need to be in
-  `compile.zig`'s special-form set or as native-fn calls. Lean:
-  native fns installed in the `#nexis.internal` namespace (NOT
-  auto-referred); macros emit fully-qualified calls. Cleaner
-  than special-form extensions.
+  `:k` keyword-as-fn) route through the record's field map;
+  `assoc` on a record returns a record (same type_id), NOT a plain
+  map.
+- All `#%`-prefixed internal forms are native fns installed in the
+  `nexis.internal` namespace (NOT auto-referred); macros emit
+  fully-qualified calls. No special-form extensions.
 
 ---
 
@@ -601,80 +584,46 @@ Holes / decisions pinned by walking through:
 
 | Keyword | Source |
 |---|---|
-| `:no-protocol-method` | Calling a method-name not defined on the protocol |
-| `:no-protocol-impl` | Receiver kind has no impl + no default |
-| `:not-a-record` | Operations expecting a record receiver got something else |
+| `:no-protocol-method` | Calling a method-name not defined on the protocol; extending a method the protocol does not declare |
+| `:no-protocol-impl` | Receiver kind has no impl + no default; protocol id not in the registry |
+| `:not-a-record` | `#%record-type-id` on a non-record |
 | `:record-redefinition` | `defrecord` with an existing `(ns, name)` |
 | `:protocol-redefinition` | `defprotocol` with an existing `(ns, name)` |
-| `:unknown-dispatch-type` | `extend-protocol`/`extend-type` referenced an unknown type name |
-| `:arity-mismatch` | Protocol method called with wrong number of args |
-| `:kind-mismatch` | `Counter?` predicate-style fns getting non-record |
+| `:invalid-argument` | `extend-protocol`/`extend-type` keyword that names no kind and no alias |
+| `:arity-mismatch` | Protocol method called with no receiver; impl fn called with the wrong number of args |
+| `:kind-mismatch` | Internal natives / `satisfies?` receiving a value of the wrong kind (non-protocol, non-keyword method name, non-map fields, ...) |
 
 ---
 
-### 7. Implementation sub-commit split (per peer-AI turn 84)
+### 7. Internal natives (`nexis.internal`)
 
-- **5.3a — records substrate + PLAN amendment.**
-  Lands `Kind.record = 35`, the record registry, `->Counter` /
-  `map->Counter` / `Counter?`, `get` / `assoc` / `dissoc` /
-  keyword-as-fn / `contains?` / `keys` / `vals` over records,
-  format/codec/equality/hash, PLAN.md Amendment Log entry,
-  Appendix A update.
+| Native | Arity | Returns |
+|---|---|---|
+| `#%register-record-type "ns/Name" [:f ...]` | 2 | fixnum type_id |
+| `#%make-record type-id field-map` | 2 | record |
+| `#%record? x` | 1 | bool |
+| `#%record-type-id rec` | 1 | fixnum |
+| `#%register-protocol "ns/IFoo" [:m ...]` | 2 | protocol |
+| `#%protocol-fn IFoo :m` | 2 | protocol_fn |
+| `#%extend-record-impl IFoo :m type-id f` | 4 | nil |
+| `#%extend-builtin-impl IFoo :m :kind f` | 4 | nil |
+| `#%extend-default-impl IFoo :m f` | 3 | nil |
 
-- **5.3b — protocols substrate.**
-  Lands `Kind.protocol = 36`, `Kind.protocol_fn = 37`, the
-  protocol registry, `defprotocol` macro, dispatcher routing
-  in `call:call`, `:no-protocol-method` / `:no-protocol-impl` /
-  `:arity-mismatch` taxonomy. Calling a method-name fails
-  cleanly until `defrecord` / `extend-protocol` install impls.
-
-- **5.3c — defrecord with inline impls.**
-  Lands `defrecord` macro with inline `Protocol (method ...)`
-  clauses. Registers impls in the protocol method table during
-  compile-time eval. End-to-end `(bar (->Counter 5) 7) → 12`
-  starts working here.
-
-- **5.3d — extend-protocol/extend-type + satisfies? + default.**
-  Lands `extend-protocol` / `extend-type` (aliases for the same
-  expansion), `satisfies?`, `Any` / `Object` default fallback,
-  the built-in dispatch-type name table.
-
-After 5.3d: Phase 5 EXIT criterion (HANDOFF §10.8) becomes
-testable — port a non-trivial Clojure-style app that uses
-atoms + protocols + records + require + multiple stdlib utilities
-and verify it runs.
+`#%register-record-type` and `#%register-protocol` split the name
+string on its LAST `/` into `(ns, name)`; a string with no `/` has
+an empty ns. The `extend-*` natives do not validate that `f` is
+callable; a non-callable impl surfaces as `:not-callable` at the
+first dispatch that selects it, pointing at the user's impl form.
 
 ---
 
-### 8. Open questions (deferred, not blockers for 5.3a)
+### 8. Absences
 
-- `Counter.` reader syntax for constructor call — defer; `->Counter`
-  is sufficient for v1 (peer-AI turn 84 §D4).
-- `defrecord` field auto-promotion to map keys — already implicit
-  in the `fields: persistent_map` storage choice; no special
-  affordance needed.
-- Protocol method default impls expressed in `defprotocol` body —
-  shape is `(defprotocol IFoo (bar [this] default-body))`. Defer
-  to 5.3e (post-Phase-5) if surfaced as a need; the v1 hand-trace
-  doesn't require defaults.
-- `Number` dispatch type covering bignum/float when those gain
-  protocol-extension targets — defer; ship fixnum-only in 5.3d
-  with a documented limitation.
-- Multi-arity protocol methods — defer; v1 fixes arity per method.
-
----
-
-### 9. Amendment log
-
-- **2026-05-19 (peer-AI turn 84)**: initial design freeze.
-  Pins one `Kind.record` with structural equality + structural
-  hash; per-VM registries for records + protocols; opaque
-  `Kind.protocol` + `Kind.protocol_fn` heap kinds (distinct from
-  the existing static `Kind.native_fn` — peer-AI turn 84 §"Big
-  missing implementation concern"); `->Counter` + `map->Counter`
-  constructors; map-like `get`/`assoc`/`dissoc`/keyword-as-fn on
-  records; `extend-protocol`/`extend-type` aliasing; `Any` /
-  `Object` default fallback; opaque `#<record my.ns/Counter>` /
-  `#<protocol my.ns/IFoo>` format (NOT reader-roundtrippable);
-  4-sub-commit split (5.3a–d); hand-trace below as the spec-hole
-  surface. Authority: peer-AI turn 84.
+- No `Counter.` reader syntax for constructor calls.
+- No default impl syntax inside `defprotocol` (a body after the
+  parameter vector is ignored); defaults are installed with
+  `extend-protocol ... :any`.
+- No multi-arity protocol methods and no arity declared per method.
+- No umbrella numeric dispatch target; `:fixnum`, `:bignum`, `:float`
+  are separate keys.
+- No inline caching of protocol dispatch.
