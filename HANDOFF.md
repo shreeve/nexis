@@ -64,11 +64,11 @@ git status                        # clean main
 zig build install                 # bin/nexis and bin/nexis-golden
 ./bin/nexis --help                # usage; lists the namespaces available without a file
 zig build quick                   # the inner loop, ~35-50 s warm
-zig build test --summary all      # the gate: 1462 tests, 157 steps, ~4 min wall
+zig build test --summary all      # the gate: 1472 tests, 157 steps, ~4 min wall
 ```
 
 The gate's last line reads `Build Summary: 157/157 steps succeeded;
-1462/1462 tests passed`, preceded by `golden: ok=11 updated=0
+1462/1472 tests passed`, preceded by `golden: ok=11 updated=0
 failed=0 missing=0`. Two integration binaries end with a benchmark
 whose row-count checks always run; the build runner echoes their
 stderr as `failed command:` lines while both succeed, so read the
