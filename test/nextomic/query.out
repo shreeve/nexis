@@ -94,7 +94,10 @@ ok explain returns the plan as text
 {:error :nextomic/query-syntax, :message wrong number of inputs}
 {:error :nextomic/query-syntax, :message unknown function: nope}
 :not-callable
-{:error :nextomic/query-syntax, :message a predicate, function or rule argument is never bound}
+{:error :nextomic/query-syntax, :message ?pred in function position is never bound, :clause 1}
+{:error :nextomic/query-syntax, :message not shares no variable with the clauses around it: ?x is bound nowhere outside; not joins on a variable bound outside it, :clause 1}
+{:error :nextomic/query-syntax, :message or branch 2 does not mention ?e, which branch 1 does; every or branch uses the same variables (or-join names the join variables), :clause 1}
+{:error :nextomic/query-syntax, :message or-join branch 2 leaves ?w unbound; every branch binds every join variable, :clause 1}
 :nextomic/unbound-pattern
 {:error :nextomic/unknown-attribute, :attr :nope/attr}
 {:error :nextomic/unknown-attribute, :attr :nope/attr}

@@ -220,6 +220,10 @@ pub const Ctx = struct {
     /// VM symbol ids of the sources, for `explain`.
     source_names: []const u32,
     selected: ir.Src = 0,
+    /// Nesting of `planSub` calls; 1 while placing the query's own
+    /// clauses, whose index a refusal then reports.
+    depth: usize = 0,
+    clause_index: ?usize = null,
     /// Where a syntax or attribute error leaves its reason.
     diag: *Diag,
 
@@ -245,9 +249,16 @@ pub const Ctx = struct {
         self.aevt_entries = self.dbs[next].aevt_entries;
     }
 
-    /// `QuerySyntax` with its reason.
+    /// `QuerySyntax` with its reason and the top-level clause it was
+    /// found in.
     pub fn syntax(self: *Ctx, message: []const u8) error{QuerySyntax} {
-        self.diag.* = .{ .message = message };
+        self.diag.* = .{ .clause = self.clause_index, .message = message };
+        return error.QuerySyntax;
+    }
+
+    /// `QuerySyntax` with a formatted reason naming what is wrong.
+    pub fn syntaxFmt(self: *Ctx, comptime fmt: []const u8, args: anytype) error{QuerySyntax} {
+        self.diag.set(self.clause_index, fmt, args);
         return error.QuerySyntax;
     }
 
@@ -319,6 +330,8 @@ pub fn plan(ctx: *Ctx, query: *const Ir) Failure!*Plan {
 
 /// Plan `clauses` starting from a relation over `input`.
 pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: u64) Failure!*Plan {
+    ctx.depth += 1;
+    defer ctx.depth -= 1;
     const out = try ctx.arena.create(Plan);
     var bound: std.ArrayList(Var) = .empty;
     try bound.appendSlice(ctx.arena, input);
@@ -348,8 +361,9 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
     while (remaining > 0) {
         // Cost-free steps first.
         var progress = false;
-        for (pending) |*p| {
+        for (pending, 0..) |*p, idx| {
             if (p.done) continue;
+            if (ctx.depth == 1) ctx.clause_index = idx;
             const placed = switch (p.clause) {
                 .pred => |call| blk: {
                     if (!callBound(call, bound.items)) break :blk false;
@@ -402,8 +416,9 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
         var best: ?*Pending = null;
         var best_cost: u64 = std.math.maxInt(u64);
         var unbound_pattern = false;
-        for (pending) |*p| {
+        for (pending, 0..) |*p, idx| {
             if (p.done) continue;
+            if (ctx.depth == 1) ctx.clause_index = idx;
             const cost: ?u64 = switch (p.clause) {
                 .pattern => |pat| patternEstimate(ctx, pat, bound.items) catch |err| switch (err) {
                     error.UnboundPattern => {
@@ -425,8 +440,9 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
         }
         const p = best orelse {
             if (unbound_pattern) return error.UnboundPattern;
-            return ctx.syntax("a predicate, function or rule argument is never bound");
+            return neverBound(ctx, pending, bound.items);
         };
+        if (ctx.depth == 1) ctx.clause_index = (@intFromPtr(p) - @intFromPtr(pending.ptr)) / @sizeOf(Pending);
         switch (p.clause) {
             .pattern => |pat| {
                 const scan = try planScan(ctx, pat, bound.items);
@@ -452,6 +468,31 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
         p.done = true;
         remaining -= 1;
     }
+}
+
+/// The refusal for a level whose remaining clauses can never run: the
+/// first unbound variable of the first of them, by name and clause.
+fn neverBound(ctx: *Ctx, pending: []const Pending, bound: []const Var) error{QuerySyntax} {
+    for (pending, 0..) |p, idx| {
+        if (p.done) continue;
+        if (ctx.depth == 1) ctx.clause_index = idx;
+        const args: []const ir.Arg = switch (p.clause) {
+            .pred => |call| call.args,
+            .bind => |b| b.call.args,
+            .rule => |r| r.args,
+            else => continue,
+        };
+        const f: ?ir.FnRef = switch (p.clause) {
+            .pred => |call| call.f,
+            .bind => |b| b.call.f,
+            else => null,
+        };
+        if (f != null and f.? == .variable and !ir.containsVar(bound, f.?.variable)) return ctx.syntaxFmt("{s} in function position is never bound", .{ctx.varName(f.?.variable)});
+        for (args) |a| {
+            if (a == .variable and !ir.containsVar(bound, a.variable)) return ctx.syntaxFmt("{s} is never bound; a predicate, function or rule argument needs a pattern, an input or an earlier clause to bind it", .{ctx.varName(a.variable)});
+        }
+    }
+    return ctx.syntax("a predicate, function or rule argument is never bound");
 }
 
 fn clampRows(n: u128) u64 {
@@ -506,7 +547,10 @@ fn notJoin(ctx: *Ctx, n: anytype, scope: []const Var) ![]const Var {
     for (body_vars.items) |v| {
         if (ir.containsVar(scope, v)) try join.append(ctx.arena, v);
     }
-    if (join.items.len == 0) return ctx.syntax("not needs a variable bound outside it");
+    if (join.items.len == 0) {
+        std.debug.assert(body_vars.items.len > 0);
+        return ctx.syntaxFmt("not shares no variable with the clauses around it: {s} is bound nowhere outside; not joins on a variable bound outside it", .{ctx.varName(body_vars.items[0])});
+    }
     return join.toOwnedSlice(ctx.arena);
 }
 
@@ -527,12 +571,12 @@ pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: 
     }
     const fresh = try newVars(ctx.arena, join, bound);
     const plans = try ctx.arena.alloc(*Plan, branches.len);
-    for (branches, plans) |br, *p| {
+    for (branches, plans, 1..) |br, *p, n| {
         p.* = try planSub(ctx, br, bound_join.items, rows);
         var ends: std.ArrayList(Var) = .empty;
         try ends.appendSlice(ctx.arena, bound_join.items);
         try ir.boundVars(ctx.arena, br, &ends);
-        for (join) |v| if (!ir.containsVar(ends.items, v)) return ctx.syntax("an or branch leaves a join variable unbound");
+        for (join) |v| if (!ir.containsVar(ends.items, v)) return ctx.syntaxFmt("or-join branch {d} leaves {s} unbound; every branch binds every join variable", .{ n, ctx.varName(v) });
     }
     return .{ .@"or" = .{ .join = join, .bound = try bound_join.toOwnedSlice(ctx.arena), .fresh = fresh, .branches = plans } };
 }

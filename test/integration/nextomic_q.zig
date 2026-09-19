@@ -1226,11 +1226,22 @@ test "corpus: not, not-join, or, or-join, and" {
     try checkCount(fx, dbv, "[:find ?n :where (and [?e :person/name ?n] [?e :person/active true])]", none, 3);
     try checkCount(fx, dbv, "[:find ?o :where (or-join [?o] (and [?o :order/total ?t] [(> ?t 50.0)]) [?o :order/items \"pear\"])]", none, 2);
     // Errors: not with nothing bound outside, or branches with different vars, unbound pattern.
-    // Every planner refusal carries a reason.
+    // A scoping refusal names the variable and the clause it is in.
+    const Case = struct { src: []const u8, message: []const u8, clause: ?usize };
+    for ([_]Case{
+        .{ .src = "[:find ?n :where [?e :person/name ?n] (not [?x :person/tags :blue])]", .message = "not shares no variable with the clauses around it: ?x is bound nowhere outside; not joins on a variable bound outside it", .clause = 1 },
+        .{ .src = "[:find ?n :where [?e :person/name ?n] (or [?e :person/tags :blue] [?x :person/tags :green])]", .message = "or branch 2 does not mention ?e, which branch 1 does; every or branch uses the same variables (or-join names the join variables)", .clause = 1 },
+        .{ .src = "[:find ?n :where [?e :person/name ?n] (or-join [?e ?w] [?e :person/tags ?w] [?e :person/age 30])]", .message = "or-join branch 2 leaves ?w unbound; every branch binds every join variable", .clause = 1 },
+        .{ .src = "[:find ?e :where [?e :person/name ?n] [(< ?zz 3)]]", .message = "?zz is never bound; a predicate, function or rule argument needs a pattern, an input or an earlier clause to bind it", .clause = 1 },
+        .{ .src = "[:find ?e :where [?e :person/name ?n] [(?f ?n)] [?e :person/age 30]]", .message = "?f in function position is never bound", .clause = 1 },
+        .{ .src = "[:find ?e :where [?e :person/name ?n] (not-join [?e] (not [?q :person/tags :blue]))]", .message = "not shares no variable with the clauses around it: ?q is bound nowhere outside; not joins on a variable bound outside it", .clause = 1 },
+    }) |case| {
+        var d: query.Diag = .{};
+        try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, case.src, none, &d));
+        try testing.expectEqualStrings(case.message, d.message);
+        try testing.expectEqual(case.clause, d.clause);
+    }
     for ([_][]const u8{
-        "[:find ?n :where [?e :person/name ?n] (not [?x :person/tags :blue])]",
-        "[:find ?n :where [?e :person/name ?n] (or [?e :person/tags :blue] [?x :person/tags :green])]",
-        "[:find ?e :where [?e :person/name ?n] [(< ?zz 3)]]",
         "[:find ?e :where [?e [:person/email \"ann@x\"] ?v]]",
         "[:find ?e :where [?e \"name\" ?v]]",
         "[:find ?e :where [?e :person/name ?v \"tx\"]]",

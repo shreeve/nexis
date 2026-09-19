@@ -53,6 +53,17 @@ pub const Diag = struct {
     message: []const u8 = "",
     /// The attribute an `UnknownAttribute` names, as the query wrote it.
     attr: ?Value = null,
+    /// Backing store of a formatted message, so one that names a
+    /// variable outlives the arena of the parse or plan that failed.
+    buf: [160]u8 = undefined,
+
+    /// Leave a formatted message for `clause`; a message past the
+    /// buffer is cut.
+    pub fn set(self: *Diag, clause: ?usize, comptime fmt: []const u8, args: anytype) void {
+        self.clause = clause;
+        self.attr = null;
+        self.message = std.fmt.bufPrint(&self.buf, fmt, args) catch &self.buf;
+    }
 };
 
 // =============================================================================
@@ -112,6 +123,15 @@ const Parser = struct {
     fn fail(self: *Parser, message: []const u8) Error {
         self.diag.* = .{ .clause = self.clause_index, .message = message };
         return error.QuerySyntax;
+    }
+
+    fn failFmt(self: *Parser, comptime fmt: []const u8, args: anytype) Error {
+        self.diag.set(self.clause_index, fmt, args);
+        return error.QuerySyntax;
+    }
+
+    fn varName(self: *Parser, v: Var) []const u8 {
+        return self.interner.symbolName(self.vars.items[v].sym);
     }
 
     fn varOf(self: *Parser, sym: u32) !Var {
@@ -478,14 +498,16 @@ const Parser = struct {
         return out;
     }
 
+    /// Every `or` branch mentions the same variables; the message names
+    /// the first variable one branch has and another lacks.
     fn checkOrBranches(self: *Parser, branches: []const ir.Branch) Error!void {
         var first: std.ArrayList(Var) = .empty;
         try ir.allVars(self.arena, branches[0], &first);
-        for (branches[1..]) |b| {
+        for (branches[1..], 2..) |b, n| {
             var vs: std.ArrayList(Var) = .empty;
             try ir.allVars(self.arena, b, &vs);
-            if (vs.items.len != first.items.len) return self.fail("or branches must use the same variables");
-            for (vs.items) |v| if (!ir.containsVar(first.items, v)) return self.fail("or branches must use the same variables");
+            for (first.items) |v| if (!ir.containsVar(vs.items, v)) return self.failFmt("or branch {d} does not mention {s}, which branch 1 does; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
+            for (vs.items) |v| if (!ir.containsVar(first.items, v)) return self.failFmt("or branch {d} mentions {s}, which branch 1 does not; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
         }
     }
 
@@ -935,9 +957,12 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
     try testing.expectEqual(@as(?usize, 1), diag.clause);
     try testing.expectEqualStrings("unknown symbol in data pattern", diag.message);
 
-    // or branches with different vars.
-    const q6 = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.lst(&.{ b.sym("or"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?z") }) }) });
+    // or branches with different vars: the message names the variable
+    // and the branch, and the clause index is kept.
+    const q6 = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }), b.lst(&.{ b.sym("or"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?z") }) }) });
     try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, q6, &diag));
+    try testing.expectEqual(@as(?usize, 1), diag.clause);
+    try testing.expectEqualStrings("or branch 2 mentions ?z, which branch 1 does not; every or branch uses the same variables (or-join names the join variables)", diag.message);
 
     // Unknown section.
     const q7 = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("keyz"), b.sym("e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
