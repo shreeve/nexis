@@ -1271,6 +1271,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "binding" },
             .{ .name = "maps-sets" },
             .{ .name = "defmacro" },
+            .{ .name = "eval" },
             .{ .name = "stdlib-primitives" },
             .{ .name = "require-demo" },
             .{ .name = "shapes" },
