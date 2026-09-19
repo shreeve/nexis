@@ -864,9 +864,9 @@ test "integration: (ns NAME) switches current namespace" {
 test "integration: defn in a namespace + qualified call" {
     try expectOutputProgram(
         \\(ns my.app)
-        \\(defn double [n] (* n 2))
+        \\(defn twice [n] (* n 2))
         \\(ns user)
-        \\(my.app/double 21)
+        \\(my.app/twice 21)
     , "42");
 }
 
@@ -2959,18 +2959,6 @@ test "numbers: float equality and hashing agree with SEMANTICS" {
     try expectOutput("(contains? #{1.5 2.5} 2.5)", "true");
     try expectOutput("(= [1.0 2.0] [1.0 2.0])", "true");
     try expectOutput("(= [1 2] [1.0 2.0])", "false");
-}
-
-test "numbers: fixnum overflow is a catchable :arithmetic-overflow" {
-    try expectOutput("(+ 140737488355326 1)", "140737488355327");
-    try expectOutput("(try (+ 140737488355327 1) (catch any e e))", ":arithmetic-overflow");
-    try expectOutput("(try (- -140737488355328 1) (catch any e e))", ":arithmetic-overflow");
-    try expectOutput("(try (* 100000000 100000000) (catch any e e))", ":arithmetic-overflow");
-    try expectOutput("(try (inc 140737488355327) (catch any e e))", ":arithmetic-overflow");
-    try expectOutput("(try (let [a 140737488355327] (+ a 1)) (catch any e e))", ":arithmetic-overflow");
-    // Floats never overflow into an error.
-    try expectOutput("(* 140737488355327.0 140737488355327)", "1.9807040628565803E28");
-    try expectProgramError("(+ 140737488355327 1)", vm.VmError.ArithmeticOverflow);
 }
 
 test "numbers: macros can return float and char literals" {

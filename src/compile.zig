@@ -92,6 +92,7 @@ const expand_mod = @import("expand");
 /// Forms raise `UnsupportedFeature`.
 const heap_mod = @import("heap");
 const string_mod = @import("string");
+const bignum_mod = @import("bignum");
 
 pub const Inst = vm.Inst;
 pub const Routine = vm.Routine;
@@ -111,9 +112,8 @@ pub const Tiny = union(enum) {
     nil,
     /// boolean literal (true / false).
     bool: bool,
-    /// Integer literal. Must fit in i48 fixnum range; otherwise
-    /// `IntegerOutOfFixnumRange` (there is no bignum literal
-    /// lifting).
+    /// Integer literal in the i48 fixnum range. Form lowering puts a
+    /// wider integer literal into `literal` as a bignum.
     int: i64,
     /// Reference to a lexically-bound local, a captured upvalue,
     /// or a namespace Var. Resolution walks the Emitter's scope
@@ -430,9 +430,9 @@ pub const CompileError = error{
     /// every variant.
     UnsupportedForm,
 
-    /// Integer literal exceeds i48 fixnum range. Out-of-range
-    /// literals are not lifted into bignum heap values; this is a
-    /// hard compile-time error.
+    /// A hand-built `Tiny.int` outside the i48 fixnum range. Form
+    /// lowering never produces one: a wider literal lowers to a
+    /// bignum `Tiny.literal`.
     IntegerOutOfFixnumRange,
 
     /// Routine has more constants than the 12-bit constant-pool
@@ -1207,7 +1207,8 @@ fn lowerFormEnv(
     return switch (form.datum) {
         .nil => try allocTiny(allocator, .nil),
         .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
-        .int => |n| try allocTiny(allocator, .{ .int = n }),
+        .int => |n| try lowerInt(allocator, n, ctx),
+        .bigint => |text| try lowerBigInt(allocator, text, ctx),
         .symbol => |name| blk: {
             // Qualified symbols `ns/name` lower to
             // `Tiny.qualified_symbol`; compileSymbol handles
@@ -1501,7 +1502,8 @@ fn lowerQuotePayload(
     return switch (payload.datum) {
         .nil => try allocTiny(allocator, .nil),
         .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
-        .int => |n| try allocTiny(allocator, .{ .int = n }),
+        .int => |n| try lowerInt(allocator, n, ctx),
+        .bigint => |text| try lowerBigInt(allocator, text, ctx),
         .symbol => |name| blk: {
             // Qualified symbols intern the full
             // `ns/name` string; valueToForm splits it back into
@@ -1578,6 +1580,26 @@ fn lowerQuotePayload(
         },
         else => return CompileError.UnsupportedFeature,
     };
+}
+
+/// An integer literal: `Tiny.int` in the fixnum range, otherwise a
+/// bignum `Tiny.literal` on the heap plumbed into `LowerCtx`
+/// (without a heap the literal is `UnsupportedFeature`, as a string
+/// literal is).
+fn lowerInt(allocator: std.mem.Allocator, n: i64, ctx: LowerCtx) CompileError!*Tiny {
+    if (value_mod.isFixnumRange(n)) return allocTiny(allocator, .{ .int = n });
+    const h = ctx.heap orelse return CompileError.UnsupportedFeature;
+    const v = bignum_mod.fromI64(h, n) catch return CompileError.OutOfMemory;
+    return allocTiny(allocator, .{ .literal = v });
+}
+
+/// A `bigint` literal (the reader's canonical decimal text) as a
+/// bignum `Tiny.literal`.
+fn lowerBigInt(allocator: std.mem.Allocator, text: []const u8, ctx: LowerCtx) CompileError!*Tiny {
+    const h = ctx.heap orelse return CompileError.UnsupportedFeature;
+    const parsed = bignum_mod.parseDecimal(h, text) catch return CompileError.OutOfMemory;
+    const v = parsed orelse return CompileError.MalformedForm;
+    return allocTiny(allocator, .{ .literal = v });
 }
 
 /// `(+ a b)`. Caller has already verified arity (3 list items)
@@ -4207,7 +4229,7 @@ test "compile: integer literal beyond i48 range rejected" {
     try testing.expectError(CompileError.IntegerOutOfFixnumRange, res);
 }
 
-test "compile + run: (+ fixnum_max 1) compiles but VM traps overflow" {
+test "compile + run: (+ fixnum_max 1) compiles and the VM promotes the sum to a bignum" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const compiled = try compileTiny(
@@ -4217,8 +4239,8 @@ test "compile + run: (+ fixnum_max 1) compiles but VM traps overflow" {
     const routine = compiled.toRoutine("(+ fixnum_max 1)");
     var v = try vm.VM.init(testing.allocator, &routine);
     defer v.deinit();
-    const res = v.run();
-    try testing.expectError(vm.VmError.ArithmeticOverflow, res);
+    const res = try v.run();
+    try testing.expect(res.kind() == .bignum);
 }
 
 // ---- cmp:lt tests ----

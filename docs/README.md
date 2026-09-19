@@ -13,7 +13,7 @@ wins and the code is wrong.
 | `src/heap.zig` | [`HEAP.md`](HEAP.md) | HeapHeader format + Heap allocator wrapper |
 | `src/intern.zig` | [`INTERN.md`](INTERN.md) | Symbol + keyword interning + Name split |
 | `src/string.zig` | [`STRING.md`](STRING.md) | String heap kind |
-| `src/bignum.zig` | [`BIGNUM.md`](BIGNUM.md) | Bignum semantics + canonicalization |
+| `src/bignum.zig` | [`BIGNUM.md`](BIGNUM.md) | Bignum canonicalization, arithmetic, ordering, conversion, decimal text |
 | `src/coll/list.zig` | [`LIST.md`](LIST.md) | Immutable cons list |
 | `src/coll/champ.zig` | [`CHAMP.md`](CHAMP.md) | Persistent map + set via CHAMP (Compressed Hash-Array Mapped Prefix-tree) |
 | `src/coll/vector.zig` | [`VECTOR.md`](VECTOR.md) | Persistent vector via RRB tree |

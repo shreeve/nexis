@@ -48,6 +48,7 @@ const string_mod = @import("string");
 const heap_mod = @import("heap");
 const vm_mod = @import("vm");
 const atom_mod = @import("atom");
+const bignum_mod = @import("bignum");
 const db_mod = @import("db");
 const record_mod = @import("record");
 const protocol_mod = @import("protocol");
@@ -155,7 +156,8 @@ pub fn format(
         .error_ => try writer.writeAll("#<error>"),
         .meta_symbol => try writer.writeAll("#<meta-symbol>"),
         .float => try formatFloat(v.asFloat(), writer),
-        .bignum, .byte_vector, .typed_vector => {
+        .bignum => try bignum_mod.formatDecimal(v, writer),
+        .byte_vector, .typed_vector => {
             try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())});
         },
         else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),
@@ -388,6 +390,18 @@ test "display: scalar Values" {
         const got = try formatForTest(c.v, .display, null);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings(c.expect, got);
+    }
+}
+
+test "display and readable: a bignum prints its decimal value with no suffix" {
+    var heap = heap_mod.Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const v = (try bignum_mod.parseDecimal(&heap, "-340282366920938463463374607431768211456")).?;
+    try std.testing.expect(v.kind() == .bignum);
+    for ([_]FormatMode{ .display, .readable }) |mode| {
+        const got = try formatForTest(v, mode, null);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("-340282366920938463463374607431768211456", got);
     }
 }
 

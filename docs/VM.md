@@ -711,14 +711,14 @@ keywords and symbols are `Const.value` entries.
 
 | Var | Name | Operands | Semantics |
 |---|---|---|---|
-| 0 | `math:add` | A=slot, B=any, C=any | `slot[A] := resolve(B) + resolve(C)` over the fixnum/float tower (SEMANTICS.md §2.2 contagion). Errors: `:arithmetic-overflow`, `:kind-mismatch` |
+| 0 | `math:add` | A=slot, B=any, C=any | `slot[A] := resolve(B) + resolve(C)` over the fixnum/bignum/float tower (SEMANTICS.md §2.2 contagion); an integer result outside i48 is a bignum on the VM's heap. Errors: `:kind-mismatch` |
 | 1 | `math:sub` | A=slot, B=any, C=any | subtraction, same tower and errors |
 | 2 | `math:mul` | A=slot, B=any, C=any | multiplication, same tower and errors |
-| 3 | `math:div` | A=slot, B=any, C=any | `/`: exact fixnum quotient stays fixnum, otherwise float. Errors: `:divide-by-zero` (integer), `:arithmetic-overflow`, `:kind-mismatch` |
-| 4 | `math:idiv` | A=slot, B=any, C=any | `quot`: truncated division. Errors: `:divide-by-zero`, `:arithmetic-overflow`, `:kind-mismatch` |
+| 3 | `math:div` | A=slot, B=any, C=any | `/`: an exact integer quotient stays an integer, otherwise float. Errors: `:divide-by-zero` (integer), `:kind-mismatch` |
+| 4 | `math:idiv` | A=slot, B=any, C=any | `quot`: truncated division. Errors: `:divide-by-zero`, `:kind-mismatch` |
 | 5 | `math:mod` | A=slot, B=any, C=any | `mod`: floored remainder, sign of the divisor. Same errors as `math:idiv` |
 | 6 | `math:pow` | A=slot, B=any, C=any | Traps `UnimplementedOpcode` |
-| 7 | `math:neg` | A=slot, B=any, _ | unary negation. Errors: `:arithmetic-overflow`, `:kind-mismatch` |
+| 7 | `math:neg` | A=slot, B=any, _ | unary negation. Errors: `:kind-mismatch` |
 | 8 | `math:abs` | A=slot, B=any, _ | absolute value. Same errors as `math:neg` |
 
 The same tower functions (`numAdd` … `numCompare`) back the
@@ -954,7 +954,7 @@ handler is active):
 | `:arity-mismatch` | `call:call` (or `callValue`) passes an argument count the callee does not accept |
 | `:not-callable` | `call:call` on a value that is not a function, native, protocol fn, keyword, map, set or vector |
 | `:unbound-var` | A `v` operand or `var:load-var` on a Var never bound by `def` |
-| `:arithmetic-overflow` | An integer result of `math:*` (or an arithmetic native) left the i48 fixnum range; there is no bignum arithmetic to promote into |
+| `:arithmetic-overflow` | A count or identifier the runtime produces does not fit in a fixnum. No `math:*` opcode or arithmetic native raises it: an integer result outside i48 promotes to a bignum |
 | `:divide-by-zero` | Integer `/`, `quot`, `rem`, `mod` with a zero divisor (float division by zero is IEEE) |
 | `:index-out-of-bounds` | `nth` and friends past the end |
 | `:db-error`, `:db-closed`, `:invalid-durable-ref`, `:codec-failed`, `:tx-closed` | Storage natives (`docs/DB.md`) |

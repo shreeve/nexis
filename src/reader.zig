@@ -27,9 +27,9 @@
 //! as a structural tag only. Auto-qualification, auto-gensym, and
 //! unquote/splice expansion live in the macroexpander, not here.
 //!
-//! Integers are parsed into `i64`. Values outside the i64 range are rejected
-//! with `:bignum-out-of-phase-0-range`; there is no bignum literal lifting
-//! (bignums arise only from runtime promotion).
+//! An integer literal within i64 is an `int`; one beyond i64, in any radix,
+//! is a `bigint` carrying the value as canonical decimal text, so the
+//! compiler lifts it into a bignum without re-reading the radix.
 
 const std = @import("std");
 /// Re-exported as `pub` so downstream modules
@@ -74,6 +74,10 @@ pub const Datum = union(enum) {
     nil: void,
     bool_: bool,
     int: i64,
+    /// An integer beyond i64, as canonical decimal text: an optional
+    /// `-`, then digits with no leading zero. `int` and `bigint` never
+    /// overlap, so literal equality is text equality.
+    bigint: []const u8,
     real: f64,
     char: u21,
     /// Decoded UTF-8 bytes (escapes processed). Owned by the reader arena.
@@ -125,7 +129,6 @@ pub const ErrorKind = enum {
     invalid_char_literal,
     invalid_string_escape,
     bad_number_literal,
-    bignum_out_of_phase_0_range,
     invalid_symbol,
     invalid_keyword,
     unknown_reader_construct,
@@ -250,9 +253,22 @@ pub const Reader = struct {
 
     fn readInt(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
         const text = expectSrcText(self, args, span) catch |e| return e;
-        const value = parseIntLiteral(text) orelse
+        if (parseIntLiteral(text)) |value| return try self.makeForm(.{ .int = value }, span);
+        const decimal = self.bigIntLiteral(text) orelse
             return self.fail(.bad_number_literal, span, text);
-        return try self.makeForm(.{ .int = value }, span);
+        return try self.makeForm(.{ .bigint = decimal }, span);
+    }
+
+    /// The canonical decimal text of an integer literal beyond i64
+    /// (`-?` then a `0x`/`0b` radix prefix or plain digits), in the
+    /// reader's arena; `null` when the text is not an integer literal.
+    fn bigIntLiteral(self: *Reader, text: []const u8) ?[]const u8 {
+        const lit = splitIntLiteral(text) orelse return null;
+        const alloc = self.allocator();
+        var n = std.math.big.int.Managed.init(alloc) catch return null;
+        n.setString(lit.base, lit.digits) catch return null;
+        if (lit.negative) n.negate();
+        return n.toString(alloc, 10, .lower) catch null;
     }
 
     fn readReal(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
@@ -683,11 +699,11 @@ fn expectSrcText(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError![
     };
 }
 
-/// Parse an integer literal with explicit radix support and strict i64
-/// range enforcement. Returns null for malformed input OR for values that
-/// are syntactically valid but outside i64 range — callers report the
-/// out-of-range case separately from the bad-number-literal path.
-fn parseIntLiteral(text: []const u8) ?i64 {
+const IntLiteral = struct { negative: bool, base: u8, digits: []const u8 };
+
+/// Split an integer literal into sign, radix and digits; `null` unless
+/// every digit is valid for the radix.
+fn splitIntLiteral(text: []const u8) ?IntLiteral {
     if (text.len == 0) return null;
     var negative = false;
     var t = text;
@@ -707,7 +723,20 @@ fn parseIntLiteral(text: []const u8) ?i64 {
         }
     }
     if (t.len == 0) return null;
-    const mag = std.fmt.parseInt(u64, t, base) catch return null;
+    for (t) |c| {
+        const digit = std.fmt.charToDigit(c, base) catch return null;
+        _ = digit;
+    }
+    return .{ .negative = negative, .base = base, .digits = t };
+}
+
+/// Parse an integer literal with explicit radix support into i64.
+/// Returns null for malformed input or for a value outside i64;
+/// `bigIntLiteral` tells the two apart.
+fn parseIntLiteral(text: []const u8) ?i64 {
+    const lit = splitIntLiteral(text) orelse return null;
+    const negative = lit.negative;
+    const mag = std.fmt.parseInt(u64, lit.digits, lit.base) catch return null;
     if (negative) {
         const neg_limit: u64 = @as(u64, @intCast(std.math.maxInt(i64))) + 1;
         if (mag > neg_limit) return null;
@@ -767,7 +796,7 @@ fn splitNamespace(text: []const u8) ?Name {
 /// is compile-time known. Every atom is treated as literal.
 fn isLiteralKey(f: *const Form) bool {
     return switch (f.datum) {
-        .nil, .bool_, .int, .real, .char, .string, .keyword, .symbol => true,
+        .nil, .bool_, .int, .bigint, .real, .char, .string, .keyword, .symbol => true,
         else => false,
     };
 }
@@ -777,6 +806,7 @@ fn formLiteralEq(a: *const Form, b: *const Form) bool {
         .nil => b.datum == .nil,
         .bool_ => |ab| b.datum == .bool_ and b.datum.bool_ == ab,
         .int => |ai| b.datum == .int and b.datum.int == ai,
+        .bigint => |at| b.datum == .bigint and std.mem.eql(u8, at, b.datum.bigint),
         .real => |ar| b.datum == .real and b.datum.real == ar, // naive: NaN never equals itself
         .char => |ac| b.datum == .char and b.datum.char == ac,
         .string => |s| b.datum == .string and std.mem.eql(u8, s, b.datum.string),
@@ -819,6 +849,7 @@ fn writeFormIndent(f: *const Form, w: *std.Io.Writer, indent: u32) std.Io.Writer
         .nil => try w.writeAll("nil"),
         .bool_ => |b| try w.writeAll(if (b) "(bool true)" else "(bool false)"),
         .int => |i| try w.print("(int {d})", .{i}),
+        .bigint => |t| try w.print("(bigint {s})", .{t}),
         .real => |r| try writeReal(r, w),
         .char => |c| try writeCharAtom(c, w),
         .string => |s| try writeStringAtom(s, w),
@@ -961,6 +992,27 @@ fn writeSymbolAtom(s: Name, w: *std.Io.Writer) std.Io.Writer.Error!void {
 // Inline tests — structural sanity checks; golden tests cover the surface.
 // -----------------------------------------------------------------------------
 
+test "bigint literals: beyond i64 in any radix, as canonical decimal text" {
+    const cases = [_]struct { src: []const u8, decimal: []const u8 }{
+        .{ .src = "9223372036854775808", .decimal = "9223372036854775808" },
+        .{ .src = "-9223372036854775809", .decimal = "-9223372036854775809" },
+        .{ .src = "0x10000000000000000", .decimal = "18446744073709551616" },
+        .{ .src = "-0X10000000000000000", .decimal = "-18446744073709551616" },
+        .{ .src = "0b10000000000000000000000000000000000000000000000000000000000000000", .decimal = "18446744073709551616" },
+        .{ .src = "000123456789012345678901234567890", .decimal = "123456789012345678901234567890" },
+    };
+    for (cases) |c| {
+        var rdr = Reader.init(std.testing.allocator, c.src);
+        defer rdr.deinit();
+        try std.testing.expectEqualStrings(c.decimal, rdr.bigIntLiteral(c.src).?);
+    }
+    var rdr = Reader.init(std.testing.allocator, "");
+    defer rdr.deinit();
+    try std.testing.expect(rdr.bigIntLiteral("12345678901234567890x") == null);
+    try std.testing.expect(rdr.bigIntLiteral("0x") == null);
+    try std.testing.expect(rdr.bigIntLiteral("-") == null);
+}
+
 test "integer radix normalization" {
     try std.testing.expectEqual(@as(i64, 42), parseIntLiteral("42").?);
     try std.testing.expectEqual(@as(i64, -1), parseIntLiteral("-1").?);
@@ -973,6 +1025,7 @@ test "integer radix normalization" {
     // Out-of-range is rejected.
     try std.testing.expect(parseIntLiteral("9223372036854775808") == null);
     try std.testing.expect(parseIntLiteral("-9223372036854775809") == null);
+    try std.testing.expect(parseIntLiteral("1_000") == null);
     // Malformed.
     try std.testing.expect(parseIntLiteral("") == null);
     try std.testing.expect(parseIntLiteral("-") == null);

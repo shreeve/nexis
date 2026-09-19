@@ -258,6 +258,8 @@ pub fn build(b: *std.Build) void {
     // VM owns the protocol registry + the
     // dispatchProtocolMethod path used by `call:call`.
     vm_mod.addImport("protocol", protocol_mod);
+    // The numeric tower promotes to bignum and demotes back.
+    vm_mod.addImport("bignum", bignum_mod);
 
     // reader exposed as a proper module so compile.zig
     // can consume `reader.Form` trees. reader.zig uses sibling-
@@ -293,6 +295,8 @@ pub fn build(b: *std.Build) void {
     // Form datums by allocating via `string.fromBytes` against
     // the macro-arg heap.
     expand_mod.addImport("string", string_mod);
+    // Form↔Value conversion of integers beyond the fixnum range.
+    expand_mod.addImport("bignum", bignum_mod);
     // dispatch_mod is declared LATER (it depends on db); the
     // addImport for it is attached after that block. See below.
 
@@ -356,6 +360,8 @@ pub fn build(b: *std.Build) void {
     // through `namespace.registry.heap`.
     compile_mod.addImport("heap", heap_mod);
     compile_mod.addImport("string", string_mod);
+    // integer literals beyond the fixnum range lower to bignums.
+    compile_mod.addImport("bignum", bignum_mod);
 
     // namespace loader (require + file loading).
     const loader_mod = b.createModule(.{
@@ -410,6 +416,7 @@ pub fn build(b: *std.Build) void {
     format_mod.addImport("vm", vm_mod);
     format_mod.addImport("record", record_mod);
     format_mod.addImport("protocol", protocol_mod);
+    format_mod.addImport("bignum", bignum_mod);
 
     // Late-binding addImport for stdlib_mod (declared earlier).
     stdlib_mod.addImport("format", format_mod);
@@ -684,12 +691,12 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db", "atom", "record", "protocol", "nextomic_handle" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "string", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
-        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch", "record", "protocol" } },
+        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch", "record", "protocol", "bignum" } },
         // format test binary. Imports the menagerie of
         // consumer kinds; nothing depends on format itself.
-        .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle" } },
-        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch", "heap", "string" } },
-        .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string" } },
+        .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle", "bignum" } },
+        .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch", "heap", "string", "bignum" } },
+        .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string", "bignum" } },
         .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol", "nextomic" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
     };
@@ -963,6 +970,21 @@ pub fn build(b: *std.Build) void {
     }) |imp| runtime_polish_mod.addImport(imp[0], imp[1]);
     const runtime_polish_tests = b.addTest(.{ .root_module = runtime_polish_mod });
     const run_runtime_polish_tests = b.addRunArtifact(runtime_polish_tests);
+
+    // The numeric tower end to end: promotion, demotion, contagion,
+    // literals, printing, predicates, conversions and the codec.
+    const numbers_mod = b.createModule(.{
+        .root_source_file = b.path("test/integration/numbers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    for ([_]struct { []const u8, *std.Build.Module }{
+        .{ "value", value_mod },   .{ "vm", vm_mod },         .{ "compile", compile_mod },
+        .{ "intern", intern_mod }, .{ "reader", reader_mod }, .{ "expand", expand_mod },
+        .{ "stdlib", stdlib_mod }, .{ "format", format_mod },
+    }) |imp| numbers_mod.addImport(imp[0], imp[1]);
+    const numbers_tests = b.addTest(.{ .root_module = numbers_mod });
+    const run_numbers_tests = b.addRunArtifact(numbers_tests);
 
     // -------------------------------------------------------------------------
     // Benchmark harness (src/bench.zig) + benchmark runner (bench/main.zig).
@@ -1270,6 +1292,7 @@ pub fn build(b: *std.Build) void {
     // Eval-pipeline integration tests.
     quick_step.dependOn(&run_integration_eval_tests.step);
     quick_step.dependOn(&run_runtime_polish_tests.step);
+    quick_step.dependOn(&run_numbers_tests.step);
     // Nextomic unit binaries and the key and transaction property tests.
     quick_step.dependOn(&run_nextomic_handle_tests.step);
     quick_step.dependOn(&run_nextomic_tests.step);
@@ -1298,6 +1321,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_compile_tests.step);
     test_step.dependOn(&run_integration_eval_tests.step);
     test_step.dependOn(&run_runtime_polish_tests.step);
+    test_step.dependOn(&run_numbers_tests.step);
     test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);

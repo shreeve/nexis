@@ -62,11 +62,11 @@ git status                        # clean main
 zig build install                 # bin/nexis and bin/nexis-golden
 ./bin/nexis --help                # usage; lists the namespaces available without a file
 zig build quick                   # the inner loop, ~35-50 s warm
-zig build test --summary all      # the gate: 1307 tests, 138 steps, ~4 min wall
+zig build test --summary all      # the gate: 1338 tests, 140 steps, ~4 min wall
 ```
 
-The gate's last line reads `Build Summary: 138/138 steps succeeded;
-1307/1307 tests passed`, preceded by `golden: ok=10 updated=0
+The gate's last line reads `Build Summary: 140/140 steps succeeded;
+1338/1338 tests passed`, preceded by `golden: ok=10 updated=0
 failed=0 missing=0`. Two integration binaries end with a benchmark
 whose row-count checks always run; the build runner echoes their
 stderr as `failed command:` lines while both succeed, so read the
@@ -76,7 +76,7 @@ The build steps, and what each is for:
 
 | step | runs | time (warm, Debug) |
 |---|---|---|
-| `zig build quick` | the language binaries (`vm`, `compile`, `expand`, `stdlib`, `loader`, `atom`, `record`, `protocol`, `format`), the compile property tests, `test/integration/eval_pipeline.zig`, the Nextomic unit binary and its two property tests | ~35-50 s |
+| `zig build quick` | the language binaries (`vm`, `compile`, `expand`, `stdlib`, `loader`, `atom`, `record`, `protocol`, `format`), the compile property tests, `test/integration/{eval_pipeline,runtime_polish,numbers}.zig`, the Nextomic unit binary and its two property tests | ~35-50 s |
 | `zig build nextomic-test` | `src/nextomic/*` unit tests, `test/prop/nextomic_{key,tx}.zig`, `test/integration/nextomic_{q,pull}.zig` | ~33 s |
 | `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis`, stdout diffed against its `.out` | seconds |
 | `zig build examples` | every `examples/*.nx` through `bin/nexis`; `durable-refs`, `todo-app` and `nextomic-app` twice | seconds |
@@ -155,10 +155,13 @@ arms in `dispatch.zig` (equality, hash, category), `format.zig`,
 `gc.zig` and `codec.zig`; `nextomic_handle` is the pattern for a kind
 whose body lives above `dispatch`.
 
-Numbers: fixnum and f64 with Clojure contagion; `(= 1 1.0)` is
-false, `(== 1 1.0)` true; `/` on two integers yields a float when
-inexact; `:divide-by-zero` and `:arithmetic-overflow` are catchable
-keywords; fixnum overflow raises rather than promoting (§6.2).
+Numbers: fixnum, bignum and f64 with Clojure contagion. An integer
+result outside i48 is a bignum and one that fits is a fixnum again
+(`src/bignum.zig` over `std.math.big.int`, `docs/BIGNUM.md` §9), so
+`=` and `hash` agree for every integer; integer literals of any size
+read and print in decimal; `(= 1 1.0)` is false, `(== 1 1.0)` true;
+`/` on two integers yields a float when inexact; `:divide-by-zero`
+is a catchable keyword; `long` and `double` convert.
 
 Equality and hash (`docs/SEMANTICS.md`): list, vector and seq are one
 sequential category, map and set their own; keyword and symbol hash
@@ -385,8 +388,8 @@ polish; their findings are folded into tests. What they left open is
 ## 6. Known gaps
 
 Each gap: symptom, cause, approach, the test that would prove it,
-size. Nothing here is a data-corruption risk; the first two bound
-process lifetime and the integer range.
+size. Nothing here is a data-corruption risk; the first bounds
+process lifetime.
 
 ### 6.1 The collector is never invoked
 
@@ -423,33 +426,6 @@ collection triggered inside its callback.
 *Size*: `vm.zig`, `gc.zig`, `heap.zig`, `stdlib.zig`, `nextomic/
 query/natives.zig`, `docs/GC.md`; on the order of a thousand lines.
 
-### 6.2 Bignum arithmetic and fixnum promotion
-
-*Symptom*: `(* 100000000 10000000000)` raises `:arithmetic-overflow`;
-the literal `1000000000000000000` is the compile error
-`IntegerOutOfFixnumRange` (through a macro it surfaces as
-`MacroExpansionFailure` over the whole form).
-
-*Cause*: `src/bignum.zig` has construction (`fromI64`, `fromLimbs`),
-canonical form, equality and hash only; `vm.zig` `numAdd`/`numSub`/
-`numMul` return `ArithmeticOverflow` when a result leaves i48;
-`compile.zig` rejects the literal at its one
-`IntegerOutOfFixnumRange` site.
-
-*Approach*: limb arithmetic in `bignum.zig` (`add sub mul quot rem`,
-compare), promotion on overflow in the VM's numeric tower,
-canonicalization of results that fit back to fixnum (`docs/BIGNUM.md`
-§1), literal lifting in the compiler, contagion with f64 unchanged,
-`:db.type/long` refusing bignums (`docs/NEXTOMIC.md` §2.2). Update
-`docs/SEMANTICS.md` §2 and add a PLAN Amendment Log entry.
-
-*Proof*: `test/prop/bignum.zig` sweeps (`(- (+ a b) b) = a` across
-the fixnum boundary, canonical kind after every op), inline VM tests
-at ±2^47, an `eval_pipeline` case for the literal.
-
-*Size*: `bignum.zig`, `vm.zig`, `compile.zig`, `stdlib.zig`
-(`quot`/`rem`/`mod`), two docs; several hundred lines.
-
 ### 6.3 Clojure surface gaps
 
 Each is small and self-contained in `src/expand.zig`,
@@ -467,7 +443,6 @@ through `bin/nexis`:
 | `defn` docstrings and attr-maps | `(defn f "doc" [x] x)` → `MacroExpansionFailure` | `expandDefn` |
 | destructuring extras | `{:strs [a]}`, `{:syms [a]}`, namespaced `:keys`, `& {:keys [a]}` keyword args, `loop` bindings | the destructuring expander (`:keys`/`:or`/`:as` at `expand.zig` ~2261) and `loop`'s binding path |
 | `doseq` and `for` modifiers | `doseq` rejects `:when`/`:let`/`:while`; `for` has `:when`/`:let`, not `:while`, and does not destructure | `core.nx` `doseq`; `expand.zig` `expandFor` |
-| `int`/`long`/`double` | `UnresolvedSymbol`; no way to turn a double into an integer | `stdlib.zig` natives |
 | `meta`/`with-meta`, `ex-info`/`ex-data`, `macroexpand`, `read-string`, `list*`, `reduced`, three-arity `fnil` | `UnresolvedSymbol` (`fnil` → `ArityMismatch`) | `stdlib.zig`; `reduced` needs the reducing natives to check for it; `read-string` needs the reader reachable from a native |
 | symbols not callable | `('a {'a 1})` → `:not-callable` | `vm.zig` lookup arm; PLAN §23 #33 promises keywords only, so state or extend |
 | reader errors carry no location | `nexis: parse error: ParseError` for `(println (1 2` | `src/cli.zig` reports compile errors with `file:line:col` and a caret; the reader path has no span; the golden `.err` files carry kinds like `:map-odd-count` that the CLI does not print |
@@ -682,37 +657,31 @@ regenerated file with the grammar).
 
 ## 8. Recommended order of work
 
-1. **Bignum arithmetic and promotion (§6.2).** The number tower is a
-   frozen decision (PLAN §23 #10) that the tree only half honours;
-   the work is contained in four files, its oracle is a property
-   sweep, and it removes the one compile error a program hits by
-   writing an ordinary integer. Nothing else depends on it, and it
-   does not depend on anything.
-2. **The collector (§6.1).** The largest gap and the one that bounds
+1. **The collector (§6.1).** The largest gap and the one that bounds
    every long-running use, including a Nextomic loader. It touches
    the VM, the natives and the Nextomic caches, so it is best done
    before the natives multiply further; transaction functions (§6.8)
    wait on its rooting rule.
-3. **Clojure surface gaps (§6.3), `case` and syntax-quote first.**
+2. **Clojure surface gaps (§6.3), `case` and syntax-quote first.**
    Each is a morning's work with an obvious test; together they are
    most of what a Clojure programmer trips over in the first hour.
    `defn` docstrings, multi-arity `fn`, finally-only `try` and the
    conversions follow in whatever order the next program needs.
-4. **Runtime source spans and the test runner (§6.4).** Once programs
+3. **Runtime source spans and the test runner (§6.4).** Once programs
    are longer than a screen, an unlocated `DivideByZero` is the
    worst remaining experience; the span table is the substrate for
    `nexis.test` output and for `--disasm`.
-5. **Datalog function-position variables (§6.5)** and the query
+4. **Datalog function-position variables (§6.5)** and the query
    surface items in §6.8, driven by the first real query that needs
    them; each is a parse/plan/exec triple with a corpus case.
-6. **Transaction functions and `:db.fn/cas`, then excision and
+5. **Transaction functions and `:db.fn/cas`, then excision and
    full-text (§6.8).** Transaction functions unlock the next class
    of Nextomic programs; they come after 2 so the callback into the
    VM is safe by construction.
-7. **`^:dynamic`/`binding` (§6.7) and `typed_vector` (§6.6)** when a
+6. **`^:dynamic`/`binding` (§6.7) and `typed_vector` (§6.6)** when a
    user need appears; both are self-contained and neither blocks the
    rest.
-8. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
+7. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
    inline caches, SIMD CHAMP nodes, zero-copy strings from emdb
    pages, hash-join tuning. Measure first with `zig build bench`;
    `docs/BENCH.md` is the honesty gate.

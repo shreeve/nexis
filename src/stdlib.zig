@@ -220,6 +220,8 @@ const core_fns = [_]CoreEntry{
     .{ .name = "not=", .descriptor = &native_not_eq },
     .{ .name = "inc", .descriptor = &native_inc },
     .{ .name = "dec", .descriptor = &native_dec },
+    .{ .name = "long", .descriptor = &native_long },
+    .{ .name = "double", .descriptor = &native_double },
     .{ .name = "max", .descriptor = &native_max },
     .{ .name = "min", .descriptor = &native_min },
     .{ .name = "abs", .descriptor = &native_abs },
@@ -440,6 +442,8 @@ const native_num_eq = NativeFn{ .name = "==", .min_arity = 0, .max_arity = null,
 const native_eq = NativeFn{ .name = "=", .min_arity = 0, .max_arity = null, .call = &fnEq };
 const native_not_eq = NativeFn{ .name = "not=", .min_arity = 1, .max_arity = null, .call = &fnNotEq };
 const native_inc = NativeFn{ .name = "inc", .min_arity = 1, .max_arity = 1, .call = &fnInc };
+const native_long = NativeFn{ .name = "long", .min_arity = 1, .max_arity = 1, .call = &fnLong };
+const native_double = NativeFn{ .name = "double", .min_arity = 1, .max_arity = 1, .call = &fnDouble };
 const native_dec = NativeFn{ .name = "dec", .min_arity = 1, .max_arity = 1, .call = &fnDec };
 const native_max = NativeFn{ .name = "max", .min_arity = 1, .max_arity = null, .call = &fnMax };
 const native_min = NativeFn{ .name = "min", .min_arity = 1, .max_arity = null, .call = &fnMin };
@@ -863,45 +867,47 @@ fn requireFixnum(v: Value) VmError!i64 {
     return v.asFixnum();
 }
 
-const BinaryNum = *const fn (Value, Value) VmError!Value;
+const BinaryNum = *const fn (*heap_mod.Heap, Value, Value) VmError!Value;
 
-/// Left fold of `op` over `args`, which must be non-empty.
-fn foldNumbers(op: BinaryNum, args: []const Value) VmError!Value {
+/// Left fold of `op` over `args`, which must be non-empty. A
+/// promoted result lives on the VM's heap.
+fn foldNumbers(vm: *VM, op: BinaryNum, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
     var acc = try requireNumber(args[0]);
-    for (args[1..]) |x| acc = try op(acc, x);
+    for (args[1..]) |x| acc = try op(heap, acc, x);
     return acc;
 }
 
-fn fnAdd(_: *VM, args: []const Value) VmError!Value {
+fn fnAdd(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 0) return value_mod.fromFixnum(0).?;
-    return foldNumbers(&vm_mod.numAdd, args);
+    return foldNumbers(vm, &vm_mod.numAdd, args);
 }
 
-fn fnSub(_: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return vm_mod.numNeg(args[0]);
-    return foldNumbers(&vm_mod.numSub, args);
+fn fnSub(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return vm_mod.numNeg(vm.ensureHeap(), args[0]);
+    return foldNumbers(vm, &vm_mod.numSub, args);
 }
 
-fn fnMul(_: *VM, args: []const Value) VmError!Value {
+fn fnMul(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 0) return value_mod.fromFixnum(1).?;
-    return foldNumbers(&vm_mod.numMul, args);
+    return foldNumbers(vm, &vm_mod.numMul, args);
 }
 
-fn fnDiv(_: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return vm_mod.numDiv(value_mod.fromFixnum(1).?, args[0]);
-    return foldNumbers(&vm_mod.numDiv, args);
+fn fnDiv(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return vm_mod.numDiv(vm.ensureHeap(), value_mod.fromFixnum(1).?, args[0]);
+    return foldNumbers(vm, &vm_mod.numDiv, args);
 }
 
-fn fnQuot(_: *VM, args: []const Value) VmError!Value {
-    return vm_mod.numQuot(args[0], args[1]);
+fn fnQuot(vm: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numQuot(vm.ensureHeap(), args[0], args[1]);
 }
 
-fn fnRem(_: *VM, args: []const Value) VmError!Value {
-    return vm_mod.numRem(args[0], args[1]);
+fn fnRem(vm: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numRem(vm.ensureHeap(), args[0], args[1]);
 }
 
-fn fnMod(_: *VM, args: []const Value) VmError!Value {
-    return vm_mod.numMod(args[0], args[1]);
+fn fnMod(vm: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numMod(vm.ensureHeap(), args[0], args[1]);
 }
 
 /// Chained comparison: true iff every adjacent pair satisfies
@@ -950,32 +956,42 @@ fn fnNotEq(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(!same.asBool());
 }
 
-fn fnInc(_: *VM, args: []const Value) VmError!Value {
-    return vm_mod.numAdd(args[0], value_mod.fromFixnum(1).?);
+fn fnInc(vm: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numAdd(vm.ensureHeap(), args[0], value_mod.fromFixnum(1).?);
 }
 
-fn fnDec(_: *VM, args: []const Value) VmError!Value {
-    return vm_mod.numSub(args[0], value_mod.fromFixnum(1).?);
+fn fnDec(vm: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numSub(vm.ensureHeap(), args[0], value_mod.fromFixnum(1).?);
 }
 
-fn numMax(a: Value, b: Value) VmError!Value {
+/// `(long x)`: a number as an integer, a float by its integer part.
+fn fnLong(vm: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numLong(vm.ensureHeap(), args[0]);
+}
+
+/// `(double x)`: a number as an f64.
+fn fnDouble(_: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numDouble(args[0]);
+}
+
+fn numMax(_: *heap_mod.Heap, a: Value, b: Value) VmError!Value {
     return vm_mod.numExtremum(true, a, b);
 }
 
-fn numMin(a: Value, b: Value) VmError!Value {
+fn numMin(_: *heap_mod.Heap, a: Value, b: Value) VmError!Value {
     return vm_mod.numExtremum(false, a, b);
 }
 
-fn fnMax(_: *VM, args: []const Value) VmError!Value {
-    return foldNumbers(&numMax, args);
+fn fnMax(vm: *VM, args: []const Value) VmError!Value {
+    return foldNumbers(vm, &numMax, args);
 }
 
-fn fnMin(_: *VM, args: []const Value) VmError!Value {
-    return foldNumbers(&numMin, args);
+fn fnMin(vm: *VM, args: []const Value) VmError!Value {
+    return foldNumbers(vm, &numMin, args);
 }
 
-fn fnAbs(_: *VM, args: []const Value) VmError!Value {
-    return vm_mod.numAbs(args[0]);
+fn fnAbs(vm: *VM, args: []const Value) VmError!Value {
+    return vm_mod.numAbs(vm.ensureHeap(), args[0]);
 }
 
 fn fnNot(_: *VM, args: []const Value) VmError!Value {
@@ -996,13 +1012,11 @@ fn fnNegQ(_: *VM, args: []const Value) VmError!Value {
 
 /// `even?` / `odd?` are integer-only, as in Clojure.
 fn fnOddQ(_: *VM, args: []const Value) VmError!Value {
-    const x = try requireFixnum(args[0]);
-    return value_mod.fromBool(@mod(x, 2) != 0);
+    return value_mod.fromBool(!try vm_mod.numEven(args[0]));
 }
 
 fn fnEvenQ(_: *VM, args: []const Value) VmError!Value {
-    const x = try requireFixnum(args[0]);
-    return value_mod.fromBool(@mod(x, 2) == 0);
+    return value_mod.fromBool(try vm_mod.numEven(args[0]));
 }
 
 fn fnNumberQ(_: *VM, args: []const Value) VmError!Value {
@@ -1010,7 +1024,7 @@ fn fnNumberQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnIntegerQ(_: *VM, args: []const Value) VmError!Value {
-    return value_mod.fromBool(args[0].kind() == .fixnum);
+    return value_mod.fromBool(vm_mod.isInteger(args[0]));
 }
 
 fn fnFloatQ(_: *VM, args: []const Value) VmError!Value {

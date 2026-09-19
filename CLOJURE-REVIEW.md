@@ -222,7 +222,7 @@ the long version lives in PLAN §23 frozen decisions and `docs/FORMS.md` §8.
 | Radix integer | `2r101`, `16rFF`, `36rZZ` | none — `0x`, `0b`, decimal only | simpler grammar |
 | Leading `+` on a number | `+42` → integer `42` | `+42` → symbol | no sign-variant tokenization |
 | Ratio | `22/7` → `Ratio` | unsupported | number tower is int+bignum+f64 only (§23 #10) |
-| BigInt suffix | `42N` | unsupported | no bignum arithmetic or literal (PLAN Amendment Log, doubles) |
+| BigInt suffix | `42N` | unsupported; an integer literal of any size reads as an integer (`18446744073709551616` is a bignum) and prints with no suffix | one integer type: fixnum + bignum in canonical form (§23 #10) |
 | BigDecimal suffix | `3.14M` | unsupported | no decimal tower (§23 #10) |
 | NaN / ±Inf literal | `##NaN`, `##Inf`, `##-Inf` | unsupported | `(/ 1.0 0)` and `(- 0.0 (/ 1.0 0))` produce them; no literal syntax |
 | `##`-dispatch in general | symbolic values | unsupported | as above |
@@ -267,8 +267,10 @@ These are the semantic traps a Clojure programmer will hit.
 |---|---|---|---|
 | `(= 1 1.0)` | `true` | `false`; `(== 1 1.0)` is `true` | PLAN §23 #11; `==` is the cross-type numeric equality (PLAN Amendment Log, number tower) |
 | `(= Double/NaN Double/NaN)` | `false` | `true` (canonical bit pattern) | SEMANTICS §2.2 |
-| Integer overflow | auto-promotes to `BigInteger` | raises the catchable `:arithmetic-overflow`; a literal outside ±2^47 is a compile error (no bignum arithmetic; `HANDOFF.md` §4 item 1) | PLAN §23 #10, Amendment Log (doubles as landed) |
-| `number?` / `integer?` on a bignum | `true` | the value layer has a `bignum` kind (`src/bignum.zig`, SEMANTICS §2.2), but no literal, operation or native produces one at runtime, so the predicates are defined over `fixnum` and `float` only (`vm.isNumber`) | value.zig `Kind.bignum` |
+| Integer overflow | auto-promotes to `BigInteger` (`+'` and friends; the unprimed `+` throws `ArithmeticException`) | every integer operator promotes: `(+ 140737488355327 1)` is the bignum `140737488355328`, and a result that fits i48 is a fixnum again; no `:arithmetic-overflow` from arithmetic | PLAN §23 #10, Amendment Log (bignum arithmetic and literals); SEMANTICS §2.2; BIGNUM.md §9 |
+| `number?` / `integer?` on a bignum | `true` | `true`; `even?`, `odd?`, `zero?`, `pos?`, `neg?`, `compare`, `max`, `min` and `hash` are exact over bignums | `vm.isNumber` / `vm.isInteger` |
+| `(/ big 2)` inexact | `Ratio` | f64 (`(/ (* 4294967296 4294967296) 3)` → `6.148914691236517E18`); exact quotients stay integers | §23 #10 has no rationals |
+| `(long x)`, `(double x)` | `long` throws on a BigInt beyond 64 bits; `(long 3.9)` → `3` | `long` never rejects a size (one integer type); `(long 3.9)` → `3`, `(long 1e30)` is a bignum, NaN/±Inf → `:invalid-argument`; `double` widens a bignum to its nearest f64. `int`, `bigint`, `biginteger`, `short`, `byte`, `float` do not exist | SEMANTICS §2.2 |
 | `(iterate f x)`, `(repeat x)`, `(repeatedly f)`, `(range)` | infinite lazy seqs | sequences are eager, so each takes an explicit count: `(iterate f x n)`, `(repeat n x)`, `(repeatedly n f)`; `(range)` is an arity error. `(take n (iterate f x))` ported from Clojure fails at the `iterate` arity | PLAN §4 (no lazy seqs) |
 | `(empty record)` | throws `UnsupportedOperationException` | `{}`: a record is a map to every collection function | SEMANTICS §4 |
 | Syntax-quote expansion | at read time, auto-qualifies + auto-gensyms | reader emits marker only; macroexpander qualifies | PLAN §14.2 (see §2.6 above) |
@@ -307,7 +309,7 @@ Design decisions the review flagged as worth studying; each is pinned in `docs/S
 2. **Collection equality across concrete types** — is `(list 1 2 3) = (vector 1 2 3)`? Clojure says yes for `sequential?` collections; need explicit decision.
 3. **Empty list / nil / empty seq subtleties** — nexis §6.5 covers the main cases but there are edge cases (e.g., `(= () nil)`, `(seq [])`) worth nailing down.
 4. **Exception / error value design** — stack trace representation, cause chaining, catch matching rules.
-5. **Numbers** — deliberately skipped the 4242-line `Numbers.java`. Need to check NaN/−0 handling, overflow promotion rules, equality across fixnum/bignum/f64 boundaries.
+5. **Numbers** — `Numbers.java` (4242 lines) was read only for its BigInt `quotient`/`remainder` and `ops` contagion rules; NaN/−0 handling, promotion and equality across fixnum/bignum/f64 are pinned in `docs/SEMANTICS.md` §2.2 and `docs/BIGNUM.md` §9.
 
 `docs/SEMANTICS.md` pins all five.
 
