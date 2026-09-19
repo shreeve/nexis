@@ -49,6 +49,7 @@ const heap_mod = @import("heap");
 const vm_mod = @import("vm");
 const atom_mod = @import("atom");
 const bignum_mod = @import("bignum");
+const typed_vector_mod = @import("typed_vector");
 const db_mod = @import("db");
 const record_mod = @import("record");
 const protocol_mod = @import("protocol");
@@ -157,7 +158,10 @@ pub fn format(
         .meta_symbol => try writer.writeAll("#<meta-symbol>"),
         .float => try formatFloat(v.asFloat(), writer),
         .bignum => try bignum_mod.formatDecimal(v, writer),
-        .byte_vector, .typed_vector => {
+        // `#i64[1 2 3]` / `#f64[1.0 2.0]` in both modes; the reader
+        // has no such dispatch, so the text does not read back.
+        .typed_vector => try typed_vector_mod.format(v, writer, formatFloat),
+        .byte_vector => {
             try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())});
         },
         else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),

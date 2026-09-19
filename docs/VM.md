@@ -681,7 +681,7 @@ numbers verbatim.
 | 10 | `tx` | no — `UnimplementedOpcode` | Durable-ref and transaction operations are natives (`docs/DB.md`). |
 | 11 | `ctrl` | yes | `try-enter`, `try-exit`, `finally-exit`, `throw` (`halt` traps). |
 | 12 | `io` | no — `UnimplementedOpcode` | I/O is natives. |
-| 13 | `simd` | no — `UnimplementedOpcode` | No typed-vector kernels exist. |
+| 13 | `simd` | no — `UnimplementedOpcode` | The typed-vector kernels are natives in `nexis.simd` (`docs/TYPED_VECTOR.md` §7.2), not opcodes. |
 
 An unrecognized group byte is `BytecodeCorruption`.
 

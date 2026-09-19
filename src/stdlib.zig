@@ -29,6 +29,7 @@ const value_mod = @import("value");
 const vm_mod = @import("vm");
 const list_mod = @import("list");
 const vector_mod = @import("vector");
+const typed_vector_mod = @import("typed_vector");
 const champ_mod = @import("champ");
 const intern_mod = @import("intern");
 const db_mod = @import("db");
@@ -67,6 +68,18 @@ pub fn installCore(ns: *Namespace) !void {
         v.root = vm_mod.nativeFnValue(entry.descriptor);
         v.bound = true;
         // Native fns are NOT macros (Var.macro stays false).
+    }
+    // The `nexis.simd` kernels (docs/TYPED_VECTOR.md §7.2) install
+    // beside core into the registry that owns `ns`; a Namespace
+    // without a registry (the single-namespace test form) has no
+    // sibling namespaces to install into.
+    if (ns.registry) |registry| {
+        const simd_ns = try registry.getOrCreate("nexis.simd", ns);
+        for (simd_fns) |entry| {
+            const v = try simd_ns.intern(entry.name);
+            v.root = vm_mod.nativeFnValue(entry.descriptor);
+            v.bound = true;
+        }
     }
 }
 
@@ -346,6 +359,11 @@ const core_fns = [_]CoreEntry{
     .{ .name = "keys", .descriptor = &native_keys },
     .{ .name = "vals", .descriptor = &native_vals },
     .{ .name = "conj", .descriptor = &native_conj },
+    // Typed vectors (docs/TYPED_VECTOR.md §7.1).
+    .{ .name = "i64-vector", .descriptor = &native_i64_vector },
+    .{ .name = "f64-vector", .descriptor = &native_f64_vector },
+    .{ .name = "typed-vector?", .descriptor = &native_typed_vector_q },
+    .{ .name = "typed-vector-type", .descriptor = &native_typed_vector_type },
     // Atom primitives.
     // Identity-valued in-memory mutable cells. `deref` is
     // installed above (`&native_db_deref` aliased in
@@ -782,6 +800,7 @@ fn fnCount(_: *VM, args: []const Value) VmError!Value {
         .nil => 0,
         .list => @intCast(list_mod.count(c)),
         .persistent_vector => @intCast(vector_mod.count(c)),
+        .typed_vector => @intCast(typed_vector_mod.count(c)),
         .persistent_map => @intCast(champ_mod.mapCount(c)),
         .record => @intCast(champ_mod.mapCount(record_mod.fieldsOf(c))),
         .persistent_set => @intCast(champ_mod.setCount(c)),
@@ -798,7 +817,7 @@ fn fnCount(_: *VM, args: []const Value) VmError!Value {
 /// if out-of-bounds. nil coll always returns default. Required
 /// by destructuring: `[a b c]` against a 2-element source binds
 /// c to nil, not throw.
-fn fnNth(_: *VM, args: []const Value) VmError!Value {
+fn fnNth(vm: *VM, args: []const Value) VmError!Value {
     const coll = args[0];
     const idx_v = args[1];
     const has_default = args.len > 2;
@@ -812,7 +831,7 @@ fn fnNth(_: *VM, args: []const Value) VmError!Value {
     // non-indexable receivers regardless of index sign or
     // default arity.
     switch (coll.kind()) {
-        .nil, .list, .persistent_vector, .string => {},
+        .nil, .list, .persistent_vector, .typed_vector, .string => {},
         else => return VmError.KindMismatch,
     }
     const idx = idx_v.asFixnum();
@@ -839,6 +858,10 @@ fn fnNth(_: *VM, args: []const Value) VmError!Value {
                 return VmError.IndexOutOfBounds;
             }
             break :blk vector_mod.nth(coll, u_idx);
+        },
+        .typed_vector => typed_vector_mod.nth(vm.ensureHeap(), coll, u_idx) catch |err| switch (err) {
+            error.IndexOutOfBounds => if (has_default) default else VmError.IndexOutOfBounds,
+            error.OutOfMemory => VmError.OutOfMemory,
         },
         // `(nth s i)` returns a
         // Kind.char at codepoint index `i`. Indexing is by
@@ -868,6 +891,7 @@ fn fnEmptyQ(_: *VM, args: []const Value) VmError!Value {
         .nil => true,
         .list => list_mod.isEmpty(c),
         .persistent_vector => vector_mod.isEmpty(c),
+        .typed_vector => typed_vector_mod.count(c) == 0,
         .persistent_map => champ_mod.mapCount(c) == 0,
         .record => champ_mod.mapCount(record_mod.fieldsOf(c)) == 0,
         .persistent_set => champ_mod.setCount(c) == 0,
@@ -1489,10 +1513,22 @@ fn fnDisj(vm: *VM, args: []const Value) VmError!Value {
     return coll;
 }
 
-fn fnGet(_: *VM, args: []const Value) VmError!Value {
+fn fnGet(vm: *VM, args: []const Value) VmError!Value {
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
     if (args[0].kind() == .string) return (try stringIndex(args[0], args[1])) orelse default;
+    if (args[0].kind() == .typed_vector) return (try typedVectorIndex(vm, args[0], args[1])) orelse default;
     return vm_mod.lookup(args[0], args[1], default);
+}
+
+/// The element at fixnum index `k` of typed vector `tv`, or null
+/// when `k` is not a fixnum or not in range (the tolerance `get`
+/// shows a vector).
+fn typedVectorIndex(vm: *VM, tv: Value, k: Value) VmError!?Value {
+    if (k.kind() != .fixnum or k.asFixnum() < 0) return null;
+    return typed_vector_mod.nth(vm.ensureHeap(), tv, @intCast(k.asFixnum())) catch |err| switch (err) {
+        error.IndexOutOfBounds => null,
+        error.OutOfMemory => VmError.OutOfMemory,
+    };
 }
 
 /// The char at fixnum index `k` of string `s`, or null when `k` is
@@ -3990,6 +4026,7 @@ const SeqIter = union(enum) {
     empty,
     list: Value,
     vector: struct { v: Value, idx: usize, count: usize },
+    typed: struct { v: Value, idx: usize, count: usize, heap: *heap_mod.Heap },
     map: struct { it: champ_mod.MapIter, heap: *heap_mod.Heap },
     set: champ_mod.SetIter,
     string: std.unicode.Utf8Iterator,
@@ -4007,6 +4044,12 @@ const SeqIter = union(enum) {
                 if (vec.idx >= vec.count) return null;
                 const e = vector_mod.nth(vec.v, vec.idx);
                 vec.idx += 1;
+                return e;
+            },
+            .typed => |*tv| {
+                if (tv.idx >= tv.count) return null;
+                const e = typed_vector_mod.nth(tv.heap, tv.v, tv.idx) catch return VmError.OutOfMemory;
+                tv.idx += 1;
                 return e;
             },
             .map => |*m| {
@@ -4031,6 +4074,7 @@ fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
         .nil => .empty,
         .list => .{ .list = coll },
         .persistent_vector => .{ .vector = .{ .v = coll, .idx = 0, .count = vector_mod.count(coll) } },
+        .typed_vector => .{ .typed = .{ .v = coll, .idx = 0, .count = typed_vector_mod.count(coll), .heap = vm.ensureHeap() } },
         .persistent_map => .{ .map = .{ .it = champ_mod.mapIter(coll), .heap = vm.ensureHeap() } },
         .record => .{ .map = .{ .it = champ_mod.mapIter(record_mod.fieldsOf(coll)), .heap = vm.ensureHeap() } },
         .persistent_set => .{ .set = champ_mod.setIter(coll) },
@@ -4071,6 +4115,209 @@ fn buildListFromSlice(vm: *VM, items: []const Value) VmError!Value {
         result = list_mod.cons(heap, items[i], result) catch return VmError.OutOfMemory;
     }
     return result;
+}
+
+// =============================================================================
+// Typed vectors (docs/TYPED_VECTOR.md §7)
+//
+// `i64-vector` / `f64-vector` / `typed-vector?` / `typed-vector-type`
+// are `nexis.core` natives; `sum` / `dot` / `scale` / `map` are the
+// `nexis.simd` kernels. A typed vector is a seqable receiver through
+// `makeSeqIter`, so every generic sequence native works on it.
+// =============================================================================
+
+const native_i64_vector = NativeFn{ .name = "i64-vector", .min_arity = 1, .max_arity = 1, .call = &fnI64Vector };
+const native_f64_vector = NativeFn{ .name = "f64-vector", .min_arity = 1, .max_arity = 1, .call = &fnF64Vector };
+const native_typed_vector_q = NativeFn{ .name = "typed-vector?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isTypedVector) };
+const native_typed_vector_type = NativeFn{ .name = "typed-vector-type", .min_arity = 1, .max_arity = 1, .call = &fnTypedVectorType };
+const native_simd_sum = NativeFn{ .name = "nexis.simd/sum", .min_arity = 1, .max_arity = 1, .call = &fnSimdSum };
+const native_simd_dot = NativeFn{ .name = "nexis.simd/dot", .min_arity = 2, .max_arity = 2, .call = &fnSimdDot };
+const native_simd_scale = NativeFn{ .name = "nexis.simd/scale", .min_arity = 2, .max_arity = 2, .call = &fnSimdScale };
+const native_simd_map = NativeFn{ .name = "nexis.simd/map", .min_arity = 2, .max_arity = 2, .call = &fnSimdMap };
+
+const simd_fns = [_]CoreEntry{
+    .{ .name = "sum", .descriptor = &native_simd_sum },
+    .{ .name = "dot", .descriptor = &native_simd_dot },
+    .{ .name = "scale", .descriptor = &native_simd_scale },
+    .{ .name = "map", .descriptor = &native_simd_map },
+};
+
+fn isTypedVector(k: Kind) bool {
+    return k == .typed_vector;
+}
+
+/// An `i64` element from a Value: a fixnum, or a bignum within
+/// `i64`. Anything else is `:kind-mismatch`.
+fn i64Elem(v: Value) VmError!i64 {
+    return typed_vector_mod.i64FromValue(v) orelse VmError.KindMismatch;
+}
+
+/// An `f64` element from a Value: any number, widened.
+fn f64Elem(v: Value) VmError!f64 {
+    return typed_vector_mod.f64FromValue(v) orelse VmError.KindMismatch;
+}
+
+/// `(i64-vector coll)`: an `i64` typed vector of the integers in
+/// `coll`, any seqable.
+fn fnI64Vector(vm: *VM, args: []const Value) VmError!Value {
+    var items = try collectSeq(vm, args[0]);
+    defer items.deinit(vm.allocator);
+    const elems = vm.allocator.alloc(i64, items.items.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(elems);
+    for (elems, items.items) |*slot, v| slot.* = try i64Elem(v);
+    return typed_vector_mod.fromI64Slice(vm.ensureHeap(), elems) catch VmError.OutOfMemory;
+}
+
+/// `(f64-vector coll)`: an `f64` typed vector of the numbers in
+/// `coll`, any seqable; integers widen.
+fn fnF64Vector(vm: *VM, args: []const Value) VmError!Value {
+    var items = try collectSeq(vm, args[0]);
+    defer items.deinit(vm.allocator);
+    const elems = vm.allocator.alloc(f64, items.items.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(elems);
+    for (elems, items.items) |*slot, v| slot.* = try f64Elem(v);
+    return typed_vector_mod.fromF64Slice(vm.ensureHeap(), elems) catch VmError.OutOfMemory;
+}
+
+/// `(typed-vector-type tv)` → `:i64` or `:f64`.
+fn fnTypedVectorType(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .typed_vector) return VmError.KindMismatch;
+    const name = typed_vector_mod.elemType(args[0]).name();
+    return vm.ensureInterner().internKeywordValue(name) catch VmError.OutOfMemory;
+}
+
+fn requireTypedVector(v: Value) VmError!void {
+    if (v.kind() != .typed_vector) return VmError.KindMismatch;
+}
+
+const f64_lanes = 4;
+const F64Lanes = @Vector(f64_lanes, f64);
+
+/// Sum of an `f64` slice: four lanes, folded at the end, then the
+/// tail. The association order differs from a left fold.
+fn sumF64(xs: []const f64) f64 {
+    var acc: F64Lanes = @splat(0.0);
+    var i: usize = 0;
+    while (i + f64_lanes <= xs.len) : (i += f64_lanes) {
+        const lane: F64Lanes = xs[i..][0..f64_lanes].*;
+        acc += lane;
+    }
+    var total = @reduce(.Add, acc);
+    while (i < xs.len) : (i += 1) total += xs[i];
+    return total;
+}
+
+/// Dot product of two `f64` slices of equal length, in lanes.
+fn dotF64(xs: []const f64, ys: []const f64) f64 {
+    var acc: F64Lanes = @splat(0.0);
+    var i: usize = 0;
+    while (i + f64_lanes <= xs.len) : (i += f64_lanes) {
+        const a: F64Lanes = xs[i..][0..f64_lanes].*;
+        const b: F64Lanes = ys[i..][0..f64_lanes].*;
+        acc += a * b;
+    }
+    var total = @reduce(.Add, acc);
+    while (i < xs.len) : (i += 1) total += xs[i] * ys[i];
+    return total;
+}
+
+/// `(tv/sum xs)`: an integer for `i64` (`:arithmetic-overflow` past
+/// `i64`), a float for `f64`.
+fn fnSimdSum(vm: *VM, args: []const Value) VmError!Value {
+    try requireTypedVector(args[0]);
+    switch (typed_vector_mod.elemType(args[0])) {
+        .i64 => {
+            var total: i64 = 0;
+            for (typed_vector_mod.i64Elems(args[0])) |x| {
+                total = std.math.add(i64, total, x) catch return VmError.ArithmeticOverflow;
+            }
+            return typed_vector_mod.i64Value(vm.ensureHeap(), total) catch VmError.OutOfMemory;
+        },
+        .f64 => return value_mod.fromFloat(sumF64(typed_vector_mod.f64Elems(args[0]))),
+    }
+}
+
+/// `(tv/dot xs ys)`: same element type (`:kind-mismatch`) and length
+/// (`:invalid-argument`); result kind as `sum`.
+fn fnSimdDot(vm: *VM, args: []const Value) VmError!Value {
+    try requireTypedVector(args[0]);
+    try requireTypedVector(args[1]);
+    const elem = typed_vector_mod.elemType(args[0]);
+    if (elem != typed_vector_mod.elemType(args[1])) return VmError.KindMismatch;
+    if (typed_vector_mod.count(args[0]) != typed_vector_mod.count(args[1])) return VmError.InvalidArgument;
+    switch (elem) {
+        .i64 => {
+            var total: i64 = 0;
+            for (typed_vector_mod.i64Elems(args[0]), typed_vector_mod.i64Elems(args[1])) |x, y| {
+                const p = std.math.mul(i64, x, y) catch return VmError.ArithmeticOverflow;
+                total = std.math.add(i64, total, p) catch return VmError.ArithmeticOverflow;
+            }
+            return typed_vector_mod.i64Value(vm.ensureHeap(), total) catch VmError.OutOfMemory;
+        },
+        .f64 => return value_mod.fromFloat(dotF64(typed_vector_mod.f64Elems(args[0]), typed_vector_mod.f64Elems(args[1]))),
+    }
+}
+
+/// `(tv/scale xs k)`: every element times `k`, same element type.
+fn fnSimdScale(vm: *VM, args: []const Value) VmError!Value {
+    try requireTypedVector(args[0]);
+    const heap = vm.ensureHeap();
+    switch (typed_vector_mod.elemType(args[0])) {
+        .i64 => {
+            const k = try i64Elem(args[1]);
+            const src = typed_vector_mod.i64Elems(args[0]);
+            const out = vm.allocator.alloc(i64, src.len) catch return VmError.OutOfMemory;
+            defer vm.allocator.free(out);
+            for (out, src) |*slot, x| slot.* = std.math.mul(i64, x, k) catch return VmError.ArithmeticOverflow;
+            return typed_vector_mod.fromI64Slice(heap, out) catch VmError.OutOfMemory;
+        },
+        .f64 => {
+            const k = try f64Elem(args[1]);
+            const src = typed_vector_mod.f64Elems(args[0]);
+            const out = vm.allocator.alloc(f64, src.len) catch return VmError.OutOfMemory;
+            defer vm.allocator.free(out);
+            const ks: F64Lanes = @splat(k);
+            var i: usize = 0;
+            while (i + f64_lanes <= src.len) : (i += f64_lanes) {
+                const lane: F64Lanes = src[i..][0..f64_lanes].*;
+                out[i..][0..f64_lanes].* = lane * ks;
+            }
+            while (i < src.len) : (i += 1) out[i] = src[i] * k;
+            return typed_vector_mod.fromF64Slice(heap, out) catch VmError.OutOfMemory;
+        },
+    }
+}
+
+/// `(tv/map f xs)`: `(f x)` over every element, collected into a
+/// typed vector of the same element type under the constructor rule.
+/// `xs` stays reachable through the caller's argument slot across
+/// every `callValue`; the results live in a Zig slice until the
+/// result vector is allocated.
+fn fnSimdMap(vm: *VM, args: []const Value) VmError!Value {
+    const f = args[0];
+    const xs = args[1];
+    try requireTypedVector(xs);
+    const heap = vm.ensureHeap();
+    const n = typed_vector_mod.count(xs);
+    switch (typed_vector_mod.elemType(xs)) {
+        .i64 => {
+            const out = vm.allocator.alloc(i64, n) catch return VmError.OutOfMemory;
+            defer vm.allocator.free(out);
+            for (out, 0..) |*slot, i| {
+                const x = typed_vector_mod.nth(heap, xs, i) catch return VmError.OutOfMemory;
+                slot.* = try i64Elem(try vm.callValue(f, &.{x}));
+            }
+            return typed_vector_mod.fromI64Slice(heap, out) catch VmError.OutOfMemory;
+        },
+        .f64 => {
+            const out = vm.allocator.alloc(f64, n) catch return VmError.OutOfMemory;
+            defer vm.allocator.free(out);
+            for (out, typed_vector_mod.f64Elems(xs)) |*slot, x| {
+                slot.* = try f64Elem(try vm.callValue(f, &.{value_mod.fromFloat(x)}));
+            }
+            return typed_vector_mod.fromF64Slice(heap, out) catch VmError.OutOfMemory;
+        },
+    }
 }
 
 /// Convert a Value into a list for cons. nil → empty list;

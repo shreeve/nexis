@@ -142,6 +142,19 @@ pub fn build(b: *std.Build) void {
     bignum_mod.addImport("heap", heap_mod);
     bignum_mod.addImport("hash", hash_mod);
 
+    // typed_vector: Kind.typed_vector = 23, unboxed i64 / f64
+    // elements. Leaf kind; bignum only for `nth` promoting an i64
+    // beyond the fixnum range.
+    const typed_vector_mod = b.createModule(.{
+        .root_source_file = b.path("src/coll/typed_vector.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    typed_vector_mod.addImport("value", value_mod);
+    typed_vector_mod.addImport("heap", heap_mod);
+    typed_vector_mod.addImport("hash", hash_mod);
+    typed_vector_mod.addImport("bignum", bignum_mod);
+
     const champ_mod = b.createModule(.{
         .root_source_file = b.path("src/coll/champ.zig"),
         .target = target,
@@ -199,6 +212,7 @@ pub fn build(b: *std.Build) void {
     codec_mod.addImport("list", list_mod);
     codec_mod.addImport("vector", vector_mod);
     codec_mod.addImport("champ", champ_mod);
+    codec_mod.addImport("typed_vector", typed_vector_mod);
     // codec's inline tests import transient to exercise the
     // UnserializableKind error path for transient Values.
     codec_mod.addImport("transient", transient_mod);
@@ -219,6 +233,7 @@ pub fn build(b: *std.Build) void {
     gc_mod.addImport("list", list_mod);
     gc_mod.addImport("vector", vector_mod);
     gc_mod.addImport("champ", champ_mod);
+    gc_mod.addImport("typed_vector", typed_vector_mod);
     gc_mod.addImport("transient", transient_mod);
     gc_mod.addImport("atom", atom_mod);
     gc_mod.addImport("record", record_mod);
@@ -311,6 +326,7 @@ pub fn build(b: *std.Build) void {
     stdlib_mod.addImport("vm", vm_mod);
     stdlib_mod.addImport("list", list_mod);
     stdlib_mod.addImport("vector", vector_mod);
+    stdlib_mod.addImport("typed_vector", typed_vector_mod);
     stdlib_mod.addImport("champ", champ_mod);
     stdlib_mod.addImport("intern", intern_mod);
     stdlib_mod.addImport("heap", heap_mod);
@@ -417,6 +433,7 @@ pub fn build(b: *std.Build) void {
     format_mod.addImport("record", record_mod);
     format_mod.addImport("protocol", protocol_mod);
     format_mod.addImport("bignum", bignum_mod);
+    format_mod.addImport("typed_vector", typed_vector_mod);
 
     // Late-binding addImport for stdlib_mod (declared earlier).
     stdlib_mod.addImport("format", format_mod);
@@ -435,6 +452,7 @@ pub fn build(b: *std.Build) void {
     dispatch_mod.addImport("vector", vector_mod);
     dispatch_mod.addImport("bignum", bignum_mod);
     dispatch_mod.addImport("champ", champ_mod);
+    dispatch_mod.addImport("typed_vector", typed_vector_mod);
     dispatch_mod.addImport("transient", transient_mod);
     dispatch_mod.addImport("db", db_mod);
     dispatch_mod.addImport("atom", atom_mod);
@@ -610,6 +628,7 @@ pub fn build(b: *std.Build) void {
         list: *std.Build.Module,
         vector: *std.Build.Module,
         bignum: *std.Build.Module,
+        typed_vector: *std.Build.Module,
         champ: *std.Build.Module,
         transient: *std.Build.Module,
         atom: *std.Build.Module,
@@ -641,6 +660,7 @@ pub fn build(b: *std.Build) void {
         .list = list_mod,
         .vector = vector_mod,
         .bignum = bignum_mod,
+        .typed_vector = typed_vector_mod,
         .champ = champ_mod,
         .transient = transient_mod,
         .atom = atom_mod,
@@ -686,19 +706,22 @@ pub fn build(b: *std.Build) void {
         .{ .name = "record", .path = "src/record.zig", .imports = &.{ "value", "heap", "hash", "champ" } },
         // protocol test binary (Kind.protocol = 36 + Kind.protocol_fn = 37).
         .{ .name = "protocol", .path = "src/protocol.zig", .imports = &.{ "value", "heap", "hash" } },
-        .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "champ", "transient", "atom", "record", "protocol" } },
-        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "champ", "transient", "db", "atom", "record", "protocol", "nextomic_handle" } },
-        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "transient", "db", "atom", "record", "protocol", "nextomic_handle" } },
+        .{ .name = "codec", .path = "src/codec.zig", .imports = &.{ "value", "heap", "intern", "hash", "string", "bignum", "list", "vector", "champ", "typed_vector", "transient", "atom", "record", "protocol" } },
+        .{ .name = "gc", .path = "src/gc.zig", .imports = &.{ "value", "heap", "string", "bignum", "list", "vector", "champ", "typed_vector", "transient", "db", "atom", "record", "protocol", "nextomic_handle" } },
+        .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "typed_vector", "transient", "db", "atom", "record", "protocol", "nextomic_handle" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "string", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
         .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "list", "intern", "vector", "champ", "dispatch", "record", "protocol", "bignum" } },
         // format test binary. Imports the menagerie of
         // consumer kinds; nothing depends on format itself.
-        .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle", "bignum" } },
+        .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle", "bignum", "typed_vector" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch", "heap", "string", "bignum" } },
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string", "bignum" } },
-        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol", "nextomic" } },
+        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "typed_vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol", "nextomic" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
+        // Appended after `loader` so the `quick` step's index
+        // assertions below hold.
+        .{ .name = "typed_vector", .path = "src/coll/typed_vector.zig", .imports = &.{ "value", "heap", "hash", "bignum" } },
     };
 
     var runtime_test_runs: [runtime_test_files.len]*std.Build.Step.Run = undefined;
@@ -887,6 +910,24 @@ pub fn build(b: *std.Build) void {
 
     const prop_codec_tests = b.addTest(.{ .root_module = prop_codec_mod });
     const run_prop_codec_tests = b.addRunArtifact(prop_codec_tests);
+
+    const prop_typed_vector_mod = b.createModule(.{
+        .root_source_file = b.path("test/prop/typed_vector.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prop_typed_vector_mod.addImport("value", value_mod);
+    prop_typed_vector_mod.addImport("heap", heap_mod);
+    prop_typed_vector_mod.addImport("hash", hash_mod);
+    prop_typed_vector_mod.addImport("intern", intern_mod);
+    prop_typed_vector_mod.addImport("bignum", bignum_mod);
+    prop_typed_vector_mod.addImport("vector", vector_mod);
+    prop_typed_vector_mod.addImport("typed_vector", typed_vector_mod);
+    prop_typed_vector_mod.addImport("codec", codec_mod);
+    prop_typed_vector_mod.addImport("dispatch", dispatch_mod);
+
+    const prop_typed_vector_tests = b.addTest(.{ .root_module = prop_typed_vector_mod });
+    const run_prop_typed_vector_tests = b.addRunArtifact(prop_typed_vector_tests);
 
     const prop_db_mod = b.createModule(.{
         .root_source_file = b.path("test/prop/db.zig"),
@@ -1193,6 +1234,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "require-demo" },
             .{ .name = "shapes" },
             .{ .name = "shapes-app" },
+            .{ .name = "typed-vectors" },
             .{ .name = "durable-refs", .twice = true },
             .{ .name = "todo-app", .twice = true },
             .{ .name = "nextomic-app", .twice = true },
@@ -1312,6 +1354,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_prop_gc_tests.step);
     test_step.dependOn(&run_prop_transient_tests.step);
     test_step.dependOn(&run_prop_codec_tests.step);
+    test_step.dependOn(&run_prop_typed_vector_tests.step);
     test_step.dependOn(&run_prop_db_tests.step);
     test_step.dependOn(&run_nextomic_handle_tests.step);
     test_step.dependOn(&run_nextomic_tests.step);

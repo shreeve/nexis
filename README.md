@@ -28,6 +28,7 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 |---|---|
 | Reader | Grammar-driven parser, canonical Form schema, pretty-printer, golden tests |
 | Runtime core | 16-byte tagged Value, CHAMP map/set, 32-way persistent vector, list, transients, bignum kind, codec, precise mark-sweep collector (`src/gc.zig`; see Known gaps) |
+| Typed vectors | `i64-vector` / `f64-vector`: unboxed contiguous numeric vectors, `#i64[1 2 3]`, serializable, seqable by every core function; `nexis.simd` kernels `sum`/`dot`/`scale`/`map` (`f64` in `@Vector` lanes). Spec: [`docs/TYPED_VECTOR.md`](docs/TYPED_VECTOR.md) |
 | Compiler + VM | Form → Tiny IR → 64-bit bytecode; slot VM with closures, `recur`, `letfn*`, try/catch/finally, catchable VM errors as keywords; a frame restores its entry stack length on return and unwind |
 | Errors | Compile errors carry `file:line:col` and a source caret; a symbol that names nothing is `UnresolvedSymbol` at its own span |
 | Macros | Host macros, user `defmacro` (compile-time sub-VM), syntax-quote with `~`/`~@`/auto-gensym, procedural macros over native fns, qualified macro heads (`alias/name`) |
@@ -35,7 +36,7 @@ See [`PLAN.md`](PLAN.md) §21 for the phase map and
 | Numbers | Integers of any size (48-bit fixnums promote to bignums and demote back) and f64 with Clojure contagion; `(= 1 1.0)` is `false`, `(== 1 1.0)` is `true`; `/` on two integers yields a float when inexact; `:divide-by-zero` is catchable |
 | Invocation | Keywords, maps, sets and vectors are callable: `(:a m)`, `(m :a)`, `(#{1 2} 2)`, `([10 20] 1)` |
 | Destructuring | Sequential, associative, nested, `& rest`, `:as`, `:keys`, `:or` in `let`/`fn`/`defn`; multi-arity `defn`; `#(...)` shorthand |
-| Core library | 162 native functions in `nexis.core` (`src/stdlib.zig`: sequences, HOFs, collections, arithmetic, predicates, strings, I/O) plus 44 macros and functions in `src/stdlib/core.nx` (`when-let`, `doseq`, `cond->`, `some->`, `as->`, `update-in`, `group-by`, `frequencies`, ...); `nexis.string` |
+| Core library | 159 native functions in `nexis.core` (`src/stdlib.zig`: sequences, HOFs, collections, arithmetic, predicates, strings, I/O) plus 44 macros and functions in `src/stdlib/core.nx` (`when-let`, `doseq`, `cond->`, `some->`, `as->`, `update-in`, `group-by`, `frequencies`, ...); `nexis.string` |
 | Clojure breadth | Atoms (`atom`/`swap!`/`reset!`/`compare-and-set!`), `str`/`subs`/`print`/`println`/`slurp`/`spit`, records, protocols, `extend-protocol`/`extend-type`/`satisfies?`, `case`/`condp`/`for` |
 | Durable refs (`db/*`) | Refs backed by emdb named trees: `db/open`/`db/ref`/`db/put-key!`/`db/get-key`, `with-tx`/`with-read-tx` with rollback on throw, `@deref`, `db/alter!`, `db/scan`, `db/reduce-tree`, MVCC snapshots via `with-snapshot`; page size pinned to 16 KiB, tree ids cached per connection, engine failures as named `:db/*` keywords |
 | Nextomic | The `nextomic` namespace: `connect`/`release`/`db`/`basis-t`/`transact!`/`entity`/`entid`/`ident`/`datoms`/`as-of`/`since`/`history`/`tx-range`/`schema`/`sync`/`q`/`explain`/`pull`/`pull-many`/`with`, `with-conn`; every error catchable by `try` (the taxonomy is under Nextomic below). Spec: [`docs/NEXTOMIC.md`](docs/NEXTOMIC.md) |
@@ -233,8 +234,9 @@ Stated so nobody rediscovers them:
   function position of a predicate or function clause takes a
   symbol naming a function, never a `?var` bound to one
   (`docs/NEXTOMIC.md` §5).
-- **`typed_vector`** is a reserved Value kind with no
-  implementation; `nexis.simd` kernels do not exist.
+- **`byte_vector`** is a reserved Value kind with no
+  implementation; `nexis.simd` has no `bench` row and no off-CPU
+  dispatch.
 - **Not serializable**: functions, vars, transients, namespaces,
   tx handles, records, protocols (`:unserializable`).
 - **Nextomic follow-ups** (listed in `docs/NEXTOMIC.md` §6):

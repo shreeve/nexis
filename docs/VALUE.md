@@ -116,7 +116,7 @@ Payload = `u64` pointer to a heap object with a standard `HeapHeader`
 | 20 | `persistent_vector` | 32-way persistent vector | 0 = reserved (future small-vector inline optimization); 1 = root (user-facing); 2 = interior trie node (internal); 3 = leaf trie node (internal, always 32 Values); 4 = tail node (internal, 0..32 Values). Taxonomy pinned in `docs/VECTOR.md` §2. |
 | 21 | `list` | cons list | 0 = normal cons; 1 = empty singleton |
 | 22 | `byte_vector` | packed u8 slice | |
-| 23 | `typed_vector` | homogeneous numeric slice | 0 = i32, 1 = i64, 2 = f32, 3 = f64 |
+| 23 | `typed_vector` | homogeneous numeric slice: 16-byte `{len, elem}` prefix plus unboxed 8-byte elements (`docs/TYPED_VECTOR.md`) | 1 = i64 and 3 = f64 (the element type, also stored in the body); 0 = i32 and 2 = f32 are reserved with no implementation |
 | 24 | `function` | closure (routine + upvalues) | Payload is a raw `*Closure` allocated from the VM's runtime arena, not a `HeapHeader` block (`docs/VM.md` §6) |
 | 25 | `var_` | namespace var cell | |
 | 26 | `durable_ref` | emdb identity triple | |

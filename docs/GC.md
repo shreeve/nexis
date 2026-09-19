@@ -251,8 +251,8 @@ Kind dispatch table (`Collector.mark`):
 | `.record`             | `record.trace`             | the field map; `type_id` is a plain `u32` (PROTOCOLS.md §2.1) |
 | `.protocol`, `.protocol_fn` | `protocol.trace`     | nothing (leaf bodies)                       |
 | `.nextomic_conn`, `.nextomic_db` | inline `{}`     | nothing (a VM-owned pointer plus inline text / numbers) |
+| `.typed_vector`       | `typed_vector.trace`       | nothing (unboxed i64 / f64 elements, `docs/TYPED_VECTOR.md` §5) |
 | `.byte_vector`        | *panic (unallocated)*      | — |
-| `.typed_vector`       | *panic (unallocated)*      | — |
 | `.function`           | *panic (unallocated)*      | — |
 | `.var_`               | *panic (unallocated)*      | — |
 | `.error_`             | *panic (unallocated)*      | — |
@@ -428,6 +428,7 @@ gc.zig
 ├─ @import("list")             — list.trace
 ├─ @import("vector")           — vector.trace
 ├─ @import("champ")            — champ.traceMap + champ.traceSet
+├─ @import("typed_vector")     — typed_vector.trace (leaf)
 ├─ @import("transient")        — transient.trace
 ├─ @import("db")               — db.trace
 ├─ @import("atom")             — atom.trace
