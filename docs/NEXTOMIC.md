@@ -352,8 +352,12 @@ its auto-referred parents) and is called with `vm.callValue`; an
 unbound name throws `:nextomic/query-syntax` naming it. A throw inside
 the function aborts the query, the read transaction closes, and the
 thrown value reaches the caller's `try`; `ControlTransferred` propagates
-unchanged. Function position takes a symbol naming a function, not a
-`:in`-bound variable.
+unchanged. Function position also takes a variable, `[(?pred ?x)]` or
+`[(?f ?x) ?y]`: it is an input of the clause, bound through `:in` or an
+earlier clause (so a rule head may carry it), and the value it holds is
+applied when the clause runs: a function through `callValue`, a keyword
+or collection as the language applies them, anything else is the VM's
+`:not-callable`. A function is identity-valued in a relation.
 
 **Relation** is a Zig-private columnar struct in the query arena
 (`vars`, typed columns for eids and longs, a `Value` column otherwise);

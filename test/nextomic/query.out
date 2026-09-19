@@ -25,6 +25,12 @@ Cy
 ([Ann] [Bob] [Di])
 ([Ann] [Bob] [Cy] [Di] [Edward] [Flo])
 ([Ann])
+([Ann] [Cy] [Di] [Edward] [Flo])
+([Ann 31] [Bob 27] [Cy 42] [Di 31] [Edward 56] [Flo 34])
+([Cy] [Di])
+([Ann 1] [Bob 1] [Cy 1] [Di 1] [Edward 1] [Flo 1])
+([Ann 1] [Bob 2])
+([Cy] [Edward])
 ([Ann is 30] [Bob is 26] [Cy is 41] [Di is 30] [Edward is 55] [Flo is 33])
 ([Ann 31] [Bob 27] [Cy 42] [Di 31] [Edward 56] [Flo 34])
 ([ANN] [BOB] [CY] [DI] [EDWARD] [FLO])
@@ -61,7 +67,8 @@ ok explain returns the plan as text
 {:error :nextomic/query-syntax, :message :find variable is not bound by :in or :where}
 {:error :nextomic/query-syntax, :message wrong number of inputs}
 {:error :nextomic/query-syntax, :message unknown function: nope}
-{:error :nextomic/query-syntax, :message function position takes a function name, not a variable: ?pred}
+:not-callable
+{:error :nextomic/query-syntax, :message a predicate, function or rule argument is never bound}
 :nextomic/unbound-pattern
 {:error :nextomic/unknown-attribute, :attr :nope/attr}
 {:error :nextomic/unknown-attribute, :attr :nope/attr}

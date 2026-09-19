@@ -10,6 +10,8 @@
 //!   - `in` variables are unique; `$` and `%` appear at most once.
 //!   - `or` branches bind the same variables; `not` mentions at least
 //!     one variable.
+//!   - A `?variable` in function position is a `FnRef.variable`; it is
+//!     an input of the clause, never something the clause binds.
 //!   - Rules with one name share one arity and one required count.
 //!
 //! `Cache` memoises parses per query value: by heap identity first
@@ -453,8 +455,9 @@ const Parser = struct {
     fn parseCallClause(self: *Parser, parts: []Value) Error!Clause {
         const call_parts = try self.elems(parts[0]);
         if (call_parts.len == 0) return self.fail("empty function call");
-        const name = self.symName(call_parts[0]) orelse return self.fail("function name must be a symbol");
-        const f: ir.FnRef = if (ir.Builtin.fromName(name)) |b| .{ .builtin = b } else .{ .user = call_parts[0].asSymbolId() };
+        const head = call_parts[0];
+        const name = self.symName(head) orelse return self.fail("function position takes a symbol or a variable");
+        const f: ir.FnRef = if (self.isVarSym(head)) .{ .variable = try self.varOf(head.asSymbolId()) } else if (ir.Builtin.fromName(name)) |b| .{ .builtin = b } else .{ .user = head.asSymbolId() };
         const call: ir.Call = .{ .f = f, .args = try self.parseArgs(call_parts[1..], false) };
         if (f == .builtin) try self.checkBuiltin(f.builtin, call.args, parts.len == 1);
         if (parts.len == 1) return .{ .pred = call };
@@ -693,10 +696,10 @@ test "vector form: find specs, in bindings, where clause kinds" {
     defer interner.deinit();
     const b = Builder{ .heap = &heap, .interner = &interner };
 
-    // [:find ?n (count ?e) :in $ ?age [?tag ...] [[?a ?b]] %
+    // [:find ?n (count ?e) :in $ ?age [?tag ...] [[?a ?b]] % ?pred ?f
     //  :with ?w
     //  :where [?e :user/name ?n] [?e :user/age ?age] [?e :user/tags ?tag]
-    //         [(< ?age 40)] [(str ?n "!") ?w] (not [?e :user/bio _])
+    //         [(< ?age 40)] [(str ?n "!") ?w] [(?pred ?age)] [(?f ?n) ?fn] (not [?e :user/bio _])
     //         (or-join [?e] [?e :user/x 1] (and [?e :user/y ?a] [?e :user/z ?b]))
     //         (friend ?e ?f) [?f :user/name "Q"] [[:user/email "a@x"] :user/age _ ?tx true]]
     const q = b.vec(&.{
@@ -709,6 +712,8 @@ test "vector form: find specs, in bindings, where clause kinds" {
         b.vec(&.{ b.sym("?tag"), b.sym("...") }),
         b.vec(&.{b.vec(&.{ b.sym("?a"), b.sym("?b") })}),
         b.sym("%"),
+        b.sym("?pred"),
+        b.sym("?f"),
         b.kw("with"),
         b.sym("?w"),
         b.kw("where"),
@@ -717,6 +722,8 @@ test "vector form: find specs, in bindings, where clause kinds" {
         b.vec(&.{ b.sym("?e"), b.kw("user/tags"), b.sym("?tag") }),
         b.vec(&.{b.lst(&.{ b.sym("<"), b.sym("?age"), b.int(40) })}),
         b.vec(&.{ b.lst(&.{ b.sym("str"), b.sym("?n"), b.str("!") }), b.sym("?w") }),
+        b.vec(&.{b.lst(&.{ b.sym("?pred"), b.sym("?age") })}),
+        b.vec(&.{ b.lst(&.{ b.sym("?f"), b.sym("?n") }), b.sym("?fn") }),
         b.lst(&.{ b.sym("not"), b.vec(&.{ b.sym("?e"), b.kw("user/bio"), b.sym("_") }) }),
         b.lst(&.{ b.sym("or-join"), b.vec(&.{b.sym("?e")}), b.vec(&.{ b.sym("?e"), b.kw("user/x"), b.int(1) }), b.lst(&.{ b.sym("and"), b.vec(&.{ b.sym("?e"), b.kw("user/y"), b.sym("?a") }), b.vec(&.{ b.sym("?e"), b.kw("user/z"), b.sym("?b") }) }) }),
         b.lst(&.{ b.sym("friend"), b.sym("?e"), b.sym("?f") }),
@@ -729,16 +736,19 @@ test "vector form: find specs, in bindings, where clause kinds" {
     try testing.expectEqual(ir.FindSpec.relation, parsed.find_spec);
     try testing.expectEqual(@as(usize, 2), parsed.find.len);
     try testing.expect(parsed.find[1] == .agg and parsed.find[1].agg.op == .count);
-    try testing.expectEqual(@as(usize, 5), parsed.in.len);
+    try testing.expectEqual(@as(usize, 7), parsed.in.len);
     try testing.expect(parsed.in[0] == .src and parsed.in[1] == .scalar and parsed.in[2] == .collection and parsed.in[3] == .relation and parsed.in[4] == .rules);
+    try testing.expect(parsed.in[5] == .scalar and parsed.in[6] == .scalar);
     try testing.expectEqual(@as(usize, 1), parsed.with.len);
-    try testing.expectEqual(@as(usize, 10), parsed.where.len);
+    try testing.expectEqual(@as(usize, 12), parsed.where.len);
     try testing.expect(parsed.where[3] == .pred and parsed.where[3].pred.f.builtin == .lt);
     try testing.expect(parsed.where[4] == .bind and parsed.where[4].bind.call.f == .user);
-    try testing.expect(parsed.where[5] == .not and parsed.where[5].not.join == null);
-    try testing.expect(parsed.where[6] == .@"or" and parsed.where[6].@"or".branches.len == 2 and parsed.where[6].@"or".branches[1].len == 2);
-    try testing.expect(parsed.where[7] == .rule);
-    const last = parsed.where[9].pattern;
+    try testing.expect(parsed.where[5] == .pred and parsed.where[5].pred.f == .variable and parsed.where[5].pred.f.variable == parsed.in[5].scalar);
+    try testing.expect(parsed.where[6] == .bind and parsed.where[6].bind.call.f == .variable and parsed.where[6].bind.call.f.variable == parsed.in[6].scalar);
+    try testing.expect(parsed.where[7] == .not and parsed.where[7].not.join == null);
+    try testing.expect(parsed.where[8] == .@"or" and parsed.where[8].@"or".branches.len == 2 and parsed.where[8].@"or".branches[1].len == 2);
+    try testing.expect(parsed.where[9] == .rule);
+    const last = parsed.where[11].pattern;
     try testing.expect(last.e == .constant and last.e.constant == .lookup);
     try testing.expect(last.v == .blank and last.tx == .variable and last.added.constant.cell.boolean);
     try testing.expectEqualStrings("?e", interner.symbolName(parsed.vars[1].sym));

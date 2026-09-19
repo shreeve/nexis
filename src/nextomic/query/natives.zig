@@ -20,7 +20,10 @@
 //! compiler resolves a symbol (an alias-qualified `ns/name` to that
 //! namespace's own var; a bare name in the current namespace, then its
 //! auto-referred parents) and is called through `VM.callValue` with
-//! the clause's arguments as values. Whatever that call raises
+//! the clause's arguments as values. A `?variable` in function
+//! position applies the value it holds: a function through
+//! `VM.callValue`, a keyword or collection as the language applies
+//! them, anything else `:not-callable`. Whatever that call raises
 //! propagates untouched: a throw inside a predicate reaches the
 //! caller's `try` as the thrown value after `query.q` has closed its
 //! `Read`, and `ControlTransferred` passes through unchanged.
@@ -117,7 +120,7 @@ const Hook = struct {
     vm: *VM,
 
     fn callHook(self: *Hook) query.CallHook {
-        return .{ .ctx = @ptrCast(self), .call = &call };
+        return .{ .ctx = @ptrCast(self), .call = &call, .apply = &apply };
     }
 
     fn call(ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value {
@@ -126,12 +129,20 @@ const Hook = struct {
         return self.vm.callValue(callee, args);
     }
 
+    /// Apply the value a variable in function position holds: a
+    /// function, or a keyword or collection looked up as the language
+    /// applies them; anything else is the VM's `:not-callable`.
+    fn apply(ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value {
+        const self: *Hook = @ptrCast(@alignCast(ctx));
+        if (vm_mod.isLookupCallable(f.kind())) return vm_mod.callLookup(f, args);
+        return self.vm.callValue(f, args);
+    }
+
     /// The bound value the symbol names, or a thrown
     /// `:nextomic/query-syntax` naming what is missing.
     fn resolve(self: *Hook, sym: u32) anyerror!Value {
         const vm = self.vm;
         const name = vm.ensureInterner().symbolName(sym);
-        if (std.mem.startsWith(u8, name, "?")) return self.unknown("function position takes a function name, not a variable", name);
         const registry = try vm.ensureRegistry();
         const current = registry.current;
         const found: ?*Var = blk: {

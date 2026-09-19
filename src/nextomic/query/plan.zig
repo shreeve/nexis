@@ -12,7 +12,8 @@
 //!     the smallest estimate given the variables bound so far runs next.
 //!   - A data pattern with nothing bound in `e`, `a` or `v` is refused
 //!     with `error.UnboundPattern`; a predicate or function whose inputs
-//!     can never be bound is `error.QuerySyntax`.
+//!     (its arguments, and its function when that is a variable) can
+//!     never be bound is `error.QuerySyntax`.
 //!   - Index choice follows the §5 table from what is bound when the
 //!     pattern runs; estimates come from `Schema` attribute counts.
 //!   - A constant that cannot exist in the store (an unknown ident, a
@@ -313,12 +314,12 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
             if (p.done) continue;
             const placed = switch (p.clause) {
                 .pred => |call| blk: {
-                    if (!argsBound(call.args, bound.items)) break :blk false;
+                    if (!callBound(call, bound.items)) break :blk false;
                     try steps.append(ctx.arena, .{ .pred = .{ .call = call } });
                     break :blk true;
                 },
                 .bind => |b| blk: {
-                    if (!argsBound(b.call.args, bound.items)) break :blk false;
+                    if (!callBound(b.call, bound.items)) break :blk false;
                     const outs = try b.out.vars(ctx.arena);
                     const fresh = try newVars(ctx.arena, outs, bound.items);
                     for (fresh) |v| try bound.append(ctx.arena, v);
@@ -428,6 +429,13 @@ fn placeRule(ctx: *Ctx, r: anytype, bound: *std.ArrayList(Var), steps: *std.Arra
 fn planSource(ctx: *Ctx, s: anytype, bound: []const Var) !Step {
     const fresh = try newVars(ctx.arena, s.vars, bound);
     return .{ .source = .{ .slot = ctx.sources.items[s.id], .vars = s.vars, .fresh = fresh } };
+}
+
+/// A call can run once its function (when a variable) and every
+/// argument variable are bound.
+fn callBound(call: ir.Call, bound: []const Var) bool {
+    if (call.f == .variable and !ir.containsVar(bound, call.f.variable)) return false;
+    return argsBound(call.args, bound);
 }
 
 fn argsBound(args: []const ir.Arg, bound: []const Var) bool {
@@ -883,6 +891,7 @@ fn explainCall(call: ir.Call, ctx: *const Ctx, w: *std.Io.Writer) !void {
     switch (call.f) {
         .builtin => |b| try w.writeAll(b.name()),
         .user => |s| try w.writeAll(ctx.interner.symbolName(s)),
+        .variable => |v| try w.print("{s}!", .{ctx.varName(v)}),
     }
     for (call.args) |a| {
         try w.writeByte(' ');

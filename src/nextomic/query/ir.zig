@@ -105,6 +105,9 @@ pub const FnRef = union(enum) {
     builtin: Builtin,
     /// VM symbol intern id, resolved by the caller's `CallHook`.
     user: u32,
+    /// A variable whose cell is the function value: bound through
+    /// `:in` or an earlier clause, applied by the `CallHook`.
+    variable: Var,
 };
 
 /// A predicate or function argument.
@@ -345,6 +348,7 @@ pub fn allVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(Va
 }
 
 fn callVars(arena: Allocator, call: Call, out: *std.ArrayList(Var)) !void {
+    if (call.f == .variable) try addVar(arena, out, call.f.variable);
     for (call.args) |a| {
         if (a == .variable) try addVar(arena, out, a.variable);
     }

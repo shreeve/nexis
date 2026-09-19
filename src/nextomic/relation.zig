@@ -41,7 +41,9 @@ pub const Var = u32;
 /// every other VM value rides in `vm`. `Cell.fromValue` maps a VM value
 /// onto the first six arms, so `vm` never holds a fixnum, float,
 /// boolean, keyword or string; cross-arm equality is therefore always
-/// false without loss.
+/// false without loss. A function (a variable in function position
+/// holds one) is identity-valued: it hashes and compares by the bits
+/// of its value.
 pub const Cell = union(enum) {
     nil,
     int: i64,
@@ -73,8 +75,19 @@ pub const Cell = union(enum) {
             .boolean => |x| x == b.boolean,
             .keyword => |x| x == b.keyword,
             .str => |x| std.mem.eql(u8, x, b.str),
-            .vm => |x| dispatch.equal(x, b.vm),
+            .vm => |x| if (isFunction(x)) x.tag == b.vm.tag and x.payload == b.vm.payload else dispatch.equal(x, b.vm),
         };
+    }
+
+    fn isFunction(v: Value) bool {
+        return switch (v.kind()) {
+            .function, .native_fn => true,
+            else => false,
+        };
+    }
+
+    fn vmHash(v: Value) u64 {
+        return if (isFunction(v)) hash_mod.hashU64(v.payload) else dispatch.hashValue(v);
     }
 
     pub fn hash(self: Cell) u64 {
@@ -86,7 +99,7 @@ pub const Cell = union(enum) {
             .boolean => |x| @intFromBool(x),
             .keyword => |x| hash_mod.hashU64(x),
             .str => |x| std.hash.Wyhash.hash(0, x),
-            .vm => |x| dispatch.hashValue(x),
+            .vm => |x| vmHash(x),
         };
         return hash_mod.hashU64(base ^ (tag *% 0x9E37_79B9_7F4A_7C15));
     }
@@ -133,7 +146,7 @@ pub const Cell = union(enum) {
             },
             .str => |x| std.mem.order(u8, x, b.str),
             .keyword => |x| std.math.order(x, b.keyword),
-            .vm => |x| std.math.order(dispatch.hashValue(x), dispatch.hashValue(b.vm)),
+            .vm => |x| std.math.order(vmHash(x), vmHash(b.vm)),
         };
     }
 

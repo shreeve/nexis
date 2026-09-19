@@ -674,6 +674,11 @@ const Naive = struct {
                 for (cells, vals) |c, *v| v.* = try self.cellValue(c);
                 return (try Fx.hookCall(@ptrCast(self.fx), sym, vals)).isTruthy();
             },
+            .variable => |f| {
+                const vals = try self.arena.alloc(Value, cells.len);
+                for (cells, vals) |c, *v| v.* = try self.cellValue(c);
+                return (try Fx.hookApply(@ptrCast(self.fx), try self.cellValue(env[f] orelse return error.Unbound), vals)).isTruthy();
+            },
         }
     }
 
@@ -699,6 +704,7 @@ const Naive = struct {
                 else => return error.Unsupported,
             },
             .user => |sym| try Fx.hookCall(@ptrCast(self.fx), sym, vals),
+            .variable => |f| try Fx.hookApply(@ptrCast(self.fx), try self.cellValue(env[f] orelse return error.Unbound), vals),
         };
         return self.arena.dupe(Value, &.{result});
     }
@@ -972,6 +978,31 @@ test "corpus: every :in form" {
     try checkCount(fx, dbv, "[:find ?p :in $ % :where (admin ?p)]", &.{ nil, try fx.read(rules_src) }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ % ?t :where (has-tag ?p ?t) [?p :person/name ?n]]", &.{ nil, try fx.read(rules_src), value.fromKeywordId(try fx.kwId("green")) }, 4);
     try checkCount(fx, dbv, "[:find ?x :in $ ?x]", &.{ nil, value.fromFixnum(5).? }, 1);
+    // A variable in function position applies the value it holds: as
+    // a predicate, as a function binding under every binding form, in
+    // a rule body, and bound by an earlier clause rather than `:in`.
+    const even_fn = try fx.read("even?");
+    const inc_fn = try fx.read("inc");
+    try checkCount(fx, dbv, "[:find ?n :in $ ?pred :where [?e :person/name ?n] [?e :person/age ?a] [(?pred ?a)]]", &.{ nil, even_fn }, 3);
+    try checkCount(fx, dbv, "[:find ?n ?a1 :in $ ?f :where [?e :person/name ?n] [?e :person/age ?a] [(?f ?a) ?a1]]", &.{ nil, inc_fn }, 6);
+    try checkCount(fx, dbv, "[:find ?n ?i :in $ ?f :where [?e :person/name ?n] [(?f 2) [?i ...]]]", &.{ nil, try fx.read("range") }, 12);
+    try checkCount(fx, dbv, "[:find ?n ?x ?y :in $ ?f :where [?e :person/name ?n] [?e :person/age ?a] [(?f ?a ?n) [?x ?y]]]", &.{ nil, try fx.read("pair") }, 6);
+    try checkCount(fx, dbv, "[:find ?n ?h :in $ ?f :where [?e :person/name ?n] [?e :person/age ?a] [(?f ?a) [[_ ?h]]]]", &.{ nil, try fx.read("halves") }, 12);
+    try checkCount(fx, dbv, "[:find ?n :in $ [?f ...] :where [?e :person/name ?n] [?e :person/age ?a] [(?f ?a) ?r] [(> ?r 41)]]", &.{ nil, try fx.read("[inc identity]") }, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?f :where [(ground [1 2]) [?x ...]] [(?f ?x ?x) ?y] [?e :person/age ?a] [(< ?y 3)] [?e :person/name ?n]]", &.{ nil, try fx.read("add") }, 6);
+    // The naive fixpoint runs rule bodies with nothing bound, so a rule
+    // that applies a head-bound function is checked by row count.
+    const via_rule = try runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ % ?pred :where (age-ok ?p ?pred) [?p :person/name ?n]]", &.{ nil, try fx.read("[[(age-ok ?p ?f) [?p :person/age ?a] [(?f ?a)]]]"), even_fn });
+    try testing.expectEqual(@as(usize, 3), via_rule.len);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?g :where [(identity ?g) ?pred] [?e :person/age ?a] [(?pred ?a)] [?e :person/name ?n]]", &.{ nil, even_fn }, 3);
+    // A keyword in function position looks itself up in a map.
+    try checkCount(fx, dbv, "[:find ?n ?v :in $ ?k :where [?e :person/name ?n] [(ground {:x 1}) ?m] [(?k ?m) ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("x")) }, 6);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?k :where [?e :person/name ?n] [(ground {:x 1}) ?m] [(?k ?m) ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("y")) }, 0);
+    // A value that is not callable is an error, and the function
+    // variable must be bound before the call runs.
+    try testing.expectError(error.NotCallable, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?f :where [?e :person/name ?n] [(?f ?n)]]", &.{ nil, value.fromFixnum(7).? }));
+    try testing.expectError(error.NotCallable, Naive.run(fx, fx.arena(), dbv, "[:find ?n :in $ ?f :where [?e :person/name ?n] [(?f ?n)]]", &.{ nil, value.fromFixnum(7).? }));
+    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?n :where [?e :person/name ?n] [(?f ?n)]]", &.{nil}));
     // A bound attribute variable, by id and by ident; an unknown ident matches nothing.
     const name_id = (try dbv.entid(fx.arena(), .{ .ident = try fx.kwId("person/name") })).?;
     try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromFixnum(@intCast(name_id)).? }, 6);

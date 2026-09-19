@@ -1,7 +1,8 @@
 ; test/nextomic/query.nx — q and explain: patterns, joins, every :in
 ; form, constants and lookup refs, predicates and functions (built-in,
-; defn'd, core, qualified), aggregates, every find spec, not/or and
-; their -join forms, rules, time views, errors. Runs from a scratch
+; defn'd, core, qualified, a variable in function position),
+; aggregates, every find spec, not/or and their -join forms, rules,
+; time views, errors. Runs from a scratch
 ; directory; the store is fresh.
 
 (require '[nextomic :as d])
@@ -103,6 +104,15 @@
 (println (rows (d/q '[:find ?n :where [?e :person/name ?n] [(string? ?n)]] db)))
 (println (rows (d/q '[:find ?n :where [?e :person/name ?n] [(s/lower-case ?n) ?l] [(= ?l "ann")]] db)))
 
+; --- a variable in function position: bound to a function, a keyword, a map --
+
+(println (rows (d/q '[:find ?n :in $ ?pred :where [?e :person/age ?a] [(?pred ?a)] [?e :person/name ?n]] db adult?)))
+(println (rows (d/q '[:find ?n ?next :in $ ?f :where [?e :person/age ?a] [(?f ?a) ?next] [?e :person/name ?n]] db inc)))
+(println (rows (d/q '[:find ?n :in $ ?f :where [?e :person/name ?n] [(?f ?n) ?len] [(< ?len 3)]] db count)))
+(println (rows (d/q '[:find ?n ?v :in $ ?k :where [?e :person/name ?n] [(ground {:x 1}) ?m] [(?k ?m) ?v]] db :x)))
+(println (rows (d/q '[:find ?n ?v :in $ ?m :where [?e :person/name ?n] [(?m ?n) ?v]] db {"Ann" 1 "Bob" 2})))
+(println (rows (d/q '[:find ?n :in $ [?f ...] :where [?e :person/age ?a] [(?f ?a) ?r] [(> ?r 41)] [?e :person/name ?n]] db [inc identity])))
+
 ; --- function bindings ----------------------------------------------------
 
 (println (rows (d/q '[:find ?s :where [?e :person/name ?n] [?e :person/age ?a] [(str ?n " is " ?a) ?s]] db)))
@@ -174,7 +184,8 @@
 (println (t/caught (d/q '[:find ?x :where [?e :person/name ?n]] db)))
 (println (t/caught (d/q '[:find ?n :in $ ?a :where [?e :person/name ?n]] db)))
 (println (t/caught (d/q '[:find ?e :where [?e :person/name ?n] [(nope ?n)]] db)))
-(println (t/caught (d/q '[:find ?e :in $ ?pred :where [?e :person/name ?n] [(?pred ?n)]] db adult?)))
+(println (t/caught (d/q '[:find ?e :in $ ?pred :where [?e :person/name ?n] [(?pred ?n)]] db 42)))
+(println (t/caught (d/q '[:find ?e :where [?e :person/name ?n] [(?pred ?n)]] db)))
 (println (t/caught (d/q '[:find ?e ?a ?v :where [?e ?a ?v]] db)))
 (println (t/caught (d/q '[:find ?e :where [?e :nope/attr ?v]] db)))
 (println (t/caught (d/q '[:find ?e :where [?e :person/boss [:nope/attr 1]]] db)))

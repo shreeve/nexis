@@ -14,9 +14,9 @@
 //!     the single constant-prefix scan, else that one scan hash-joined
 //!     on the shared variables.
 //!   - Built-in predicates and functions are Zig over cells; any other
-//!     symbol goes to the `CallHook` with VM values and its errors
-//!     propagate untouched (the caller closes the `Read` on the way
-//!     out).
+//!     symbol goes to the `CallHook` with VM values, as does the value
+//!     of a variable in function position, and its errors propagate
+//!     untouched (the caller closes the `Read` on the way out).
 //!   - A function result of nil drops the row; collection and relation
 //!     bindings fan out one row per element.
 //!   - `finish` forms the basis set (distinct tuples over the find and
@@ -58,11 +58,13 @@ const Plan = plan_mod.Plan;
 const Step = plan_mod.Step;
 const Scan = plan_mod.Scan;
 
-/// Calls a user function by VM symbol. `args` are VM values built in
+/// Calls a user function: `call` by VM symbol, `apply` by the value a
+/// variable in function position holds. `args` are VM values built in
 /// the query's result heap; the result must be a VM value.
 pub const CallHook = struct {
     ctx: *anyopaque,
     call: *const fn (ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value,
+    apply: *const fn (ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value,
 };
 
 pub const Exec = struct {
@@ -272,9 +274,21 @@ pub const Exec = struct {
 
     fn callUser(self: *Exec, sym: u32, cells: []const Cell) anyerror!Value {
         const hook = self.hook orelse return error.NoHook;
+        return hook.call(hook.ctx, sym, try self.argValues(cells));
+    }
+
+    /// Apply the value in `f`'s column of `row`, a function bound
+    /// through `:in` or an earlier clause.
+    fn applyVar(self: *Exec, rel: *const Relation, row: usize, f: Var, cells: []const Cell) anyerror!Value {
+        const hook = self.hook orelse return error.NoHook;
+        const callee = try self.cellValue(rel.get(row, f).?);
+        return hook.apply(hook.ctx, callee, try self.argValues(cells));
+    }
+
+    fn argValues(self: *Exec, cells: []const Cell) ![]Value {
         const args = try self.arena.alloc(Value, cells.len);
         for (cells, args) |c, *a| a.* = try self.cellValue(c);
-        return hook.call(hook.ctx, sym, args);
+        return args;
     }
 
     fn execPred(self: *Exec, p: *const plan_mod.Pred, rel: Relation) anyerror!Relation {
@@ -286,6 +300,7 @@ pub const Exec = struct {
             const keep = switch (p.call.f) {
                 .builtin => |b| try self.builtinPred(b, cells),
                 .user => |sym| (try self.callUser(sym, cells)).isTruthy(),
+                .variable => |f| (try self.applyVar(&rel, i, f, cells)).isTruthy(),
             };
             if (keep) try out.appendFrom(&rel, i, map);
         }
@@ -354,6 +369,7 @@ pub const Exec = struct {
                     .lt, .le, .gt, .ge, .eq, .ne, .missing => unreachable,
                 },
                 .user => |sym| try self.callUser(sym, cells),
+                .variable => |f| try self.applyVar(&rel, i, f, cells),
             };
             rel.rowInto(i, row[0..rel.cols.len]);
             try self.bindValue(b, result, row, rel.cols.len, &out);

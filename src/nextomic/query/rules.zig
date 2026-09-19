@@ -396,7 +396,11 @@ const Renamer = struct {
     }
 
     fn call(self: *Renamer, c: ir.Call) !ir.Call {
-        return .{ .f = c.f, .args = try self.args(c.args) };
+        const f: ir.FnRef = switch (c.f) {
+            .variable => |rv| .{ .variable = try self.v(rv) },
+            else => c.f,
+        };
+        return .{ .f = f, .args = try self.args(c.args) };
     }
 
     fn binding(self: *Renamer, b: ir.Binding) !ir.Binding {

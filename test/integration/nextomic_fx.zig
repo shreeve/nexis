@@ -160,7 +160,24 @@ pub const Fx = struct {
     }
 
     pub fn hook(self: *Fx) query.CallHook {
-        return .{ .ctx = @ptrCast(self), .call = &hookCall };
+        return .{ .ctx = @ptrCast(self), .call = &hookCall, .apply = &hookApply };
+    }
+
+    /// A value in function position: a symbol names one of the
+    /// functions below, a keyword looks itself up in a map argument,
+    /// anything else is not callable.
+    pub fn hookApply(ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value {
+        switch (f.kind()) {
+            .symbol => return hookCall(ctx, f.asSymbolId(), args),
+            .keyword => {
+                if (args.len == 0 or args[0].kind() != .persistent_map) return error.NotCallable;
+                return switch (champ.mapGet(args[0], f, &dispatch.hashValue, &dispatch.equal)) {
+                    .present => |v| v,
+                    .absent => value.nilValue(),
+                };
+            },
+            else => return error.NotCallable,
+        }
     }
 
     /// The test's user functions.
