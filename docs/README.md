@@ -30,7 +30,8 @@ wins and the code is wrong.
 | `src/vm.zig` | [`VM.md`](VM.md) | Phase 2 bytecode VM: ISA + execution contracts |
 | `src/compile.zig` | [`COMPILER.md`](COMPILER.md) | Phase 2 compiler: pipeline + per-special-form lowering |
 | `src/cli.zig` | (no dedicated spec) | Step H1 CLI runner — wires the pipeline into `bin/nexis` |
-| `src/expand.zig` (Phase 2 step #8) | [`MACROEXPAND.md`](MACROEXPAND.md) | Form → Form rewriter (macros, syntax-quote, anon-fn, `#%list`/`#%concat`/`#%vector` dispatch); host-Zig macros for v1 (`defmacro` defers to Phase 3) |
+| `src/expand.zig` | [`MACROEXPAND.md`](MACROEXPAND.md) | Form → Form rewriter (macros, syntax-quote, anon-fn, `#%list`/`#%concat`/`#%vector` dispatch); host-Zig macros and user `defmacro` |
+| `src/nextomic/*` | [`NEXTOMIC.md`](NEXTOMIC.md) | The database: store layout, transactions, db-values and time, query pipeline, pull, Lisp API, errors |
 | `src/parser.zig` | (no dedicated spec) | **Generated** from `nexis.grammar` by the external `nexus` tool. Do not edit by hand. |
 | `src/nexis.zig` | (no dedicated spec) | `@lang` module — Tag enum + Lexer wrapper |
 | `src/golden.zig` | (no dedicated spec) | Build tooling — golden-test runner CLI |
@@ -68,7 +69,7 @@ If you're new to the project, read in this order (per AGENTS.md §"Required read
 3. `docs/FORMS.md` — the Form schema you'll be reading + producing.
 4. `docs/SEMANTICS.md` — equality/hash/numeric edge cases (frozen).
 5. `docs/CODEC.md` — serialization scope (frozen).
-6. `docs/NEXTOMIC.md` — only if Nextomic is being scoped OR a v1 decision might preclude it.
+6. `docs/NEXTOMIC.md` — before touching `src/nextomic/` or the `nextomic` namespace.
 7. `ZIG-0.16.0.md` + `AGENTS.md` before writing any Zig.
 
 For Phase 2 work specifically: `docs/VM.md` and `docs/COMPILER.md` are the authoritative contracts.
