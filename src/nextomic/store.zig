@@ -518,6 +518,15 @@ pub const Store = struct {
         return txn.getFromTree(self.trees.cur(index), k);
     }
 
+    /// The out-of-line payload of the current datom `(e a v)`: the bytes
+    /// after the `t` header of its EAVT value, copied into `arena`.
+    /// Null when there is no such datom.
+    pub fn currentPayload(self: *Store, txn: *Txn, e: u64, a: u32, vbytes: []const u8, arena: Allocator) !?[]const u8 {
+        const raw = (try self.getCurrent(txn, .eavt, e, a, vbytes, arena)) orelse return null;
+        if (raw.len < key.id_len) return error.Corrupted;
+        return try arena.dupe(u8, raw[key.id_len..]);
+    }
+
     /// The history-tree value of `(e a v top)` in `index`, or null.
     pub fn getHistory(self: *Store, txn: *Txn, index: Index, e: u64, a: u32, vbytes: []const u8, top: key.Top, arena: Allocator) !?[]const u8 {
         const k = try key.keyBytes(arena, index, e, a, vbytes, top);
@@ -528,12 +537,14 @@ pub const Store = struct {
 
     pub const KeyValue = emdb.Cursor.KeyValue;
 
-    /// Forward scan of one tree over the keys starting with `prefix`
-    /// (every key when the prefix is empty). Keys and values borrow the
+    /// Forward scan of one tree: the keys starting with a prefix (every
+    /// key when it is empty), or the keys in `[start, end)` (an absent
+    /// `end` runs to the tree's last key). Keys and values borrow the
     /// transaction's snapshot; cursor values are clamped to one page.
     pub const Scan = struct {
         cursor: emdb.Cursor,
-        prefix: []const u8,
+        start: []const u8,
+        stop: union(enum) { prefix: []const u8, end: ?[]const u8 },
         started: bool = false,
         done: bool = false,
 
@@ -541,10 +552,14 @@ pub const Store = struct {
             if (self.done) return null;
             const kv = if (!self.started) blk: {
                 self.started = true;
-                break :blk if (self.prefix.len == 0) self.cursor.first() else self.cursor.setRange(self.prefix);
+                break :blk if (self.start.len == 0) self.cursor.first() else self.cursor.setRange(self.start);
             } else self.cursor.next();
             if (kv) |e| {
-                if (key.hasPrefix(e.key, self.prefix)) return e;
+                const inside = switch (self.stop) {
+                    .prefix => |p| key.hasPrefix(e.key, p),
+                    .end => |end| if (end) |x| std.mem.order(u8, e.key, x) == .lt else true,
+                };
+                if (inside) return e;
             }
             self.done = true;
             return null;
@@ -552,35 +567,11 @@ pub const Store = struct {
     };
 
     pub fn scan(txn: *Txn, tree: TreeId, prefix: []const u8) !Scan {
-        return .{ .cursor = try txn.openCursorForTree(tree), .prefix = prefix };
+        return .{ .cursor = try txn.openCursorForTree(tree), .start = prefix, .stop = .{ .prefix = prefix } };
     }
 
-    /// Forward scan over `[start, end)`; an absent `end` runs to the
-    /// tree's last key.
-    pub const RangeScan = struct {
-        cursor: emdb.Cursor,
-        start: []const u8,
-        end: ?[]const u8,
-        started: bool = false,
-        done: bool = false,
-
-        pub fn next(self: *RangeScan) ?KeyValue {
-            if (self.done) return null;
-            const kv = if (!self.started) blk: {
-                self.started = true;
-                break :blk if (self.start.len == 0) self.cursor.first() else self.cursor.setRange(self.start);
-            } else self.cursor.next();
-            if (kv) |e| {
-                const below_end = if (self.end) |end| std.mem.order(u8, e.key, end) == .lt else true;
-                if (below_end) return e;
-            }
-            self.done = true;
-            return null;
-        }
-    };
-
-    pub fn scanRange(txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8) !RangeScan {
-        return .{ .cursor = try txn.openCursorForTree(tree), .start = start, .end = end };
+    pub fn scanRange(txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8) !Scan {
+        return .{ .cursor = try txn.openCursorForTree(tree), .start = start, .stop = .{ .end = end } };
     }
 
     /// Which history rows a fold sees (NEXTOMIC.md §4).
@@ -616,7 +607,7 @@ pub const Store = struct {
     /// and is emitted iff it is an assertion. `.all` emits every row in
     /// the window unfolded.
     pub const FoldScan = struct {
-        inner: RangeScan,
+        inner: Scan,
         window: Window,
         pending: ?HistoryRow = null,
         exhausted: bool = false,

@@ -441,27 +441,7 @@ pub const Exec = struct {
 
     fn execSource(self: *Exec, src: *const plan_mod.Source, rel: Relation) anyerror!Relation {
         // A fix step fills every slot of its instances before running them.
-        const slot = src.slot.rel.?;
-        var distinct: std.ArrayList(Var) = .empty;
-        for (src.vars) |v| try ir.addVar(self.arena, &distinct, v);
-        var view: Relation = undefined;
-        if (distinct.items.len == src.vars.len) {
-            view = .{ .arena = self.arena, .vars = src.vars, .cols = slot.cols, .rows = slot.rows };
-        } else {
-            view = try Relation.init(self.arena, distinct.items);
-            const cells = try self.arena.alloc(Cell, distinct.items.len);
-            var i: usize = 0;
-            rows: while (i < slot.rows) : (i += 1) {
-                for (src.vars, 0..) |v, pos| {
-                    const d = std.mem.indexOfScalar(Var, distinct.items, v).?;
-                    const c = slot.cell(i, pos);
-                    if (std.mem.indexOfScalar(Var, src.vars, v).? == pos) {
-                        cells[d] = c;
-                    } else if (!cells[d].eql(c)) continue :rows;
-                }
-                try view.append(cells);
-            }
-        }
+        const view = try Relation.viewAs(self.arena, src.vars, src.slot.rel.?);
         return rel.hashJoin(&view);
     }
 

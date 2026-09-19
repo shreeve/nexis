@@ -1070,15 +1070,44 @@ const Ctx = struct {
 
     const Current = struct { val: Val, vbytes: []const u8 };
 
+    /// A committed row of a current tree with this transaction's
+    /// pending fact about it, if any.
+    const LiveRow = struct { parts: key.Parts, kv: Store.KeyValue, pending: ?Pending };
+
+    /// The committed rows of a current tree under a prefix, each with
+    /// the overlay's pending fact about it. Under VAET, `comps.v` must
+    /// be the whole value section, since the rows carry it untagged.
+    const LiveScan = struct {
+        ctx: *Ctx,
+        index: key.Index,
+        vbytes: ?[]const u8,
+        scan: Store.Scan,
+
+        fn next(self: *LiveScan) !?LiveRow {
+            const kv = self.scan.next() orelse return null;
+            const parts = try key.unpackKey(self.index, false, kv.key);
+            const fk = switch (self.index) {
+                .eavt => kv.key,
+                .vaet => try key.keyBytes(self.ctx.arena, .eavt, parts.e, parts.a, self.vbytes.?, null),
+                else => try key.keyBytes(self.ctx.arena, .eavt, parts.e, parts.a, parts.v, null),
+            };
+            const pending: ?Pending = if (self.ctx.facts.get(fk)) |i| self.ctx.overlay.items[i] else null;
+            return .{ .parts = parts, .kv = kv, .pending = pending };
+        }
+    };
+
+    fn liveRows(self: *Ctx, index: key.Index, comps: key.Components) !LiveScan {
+        const prefix = try key.prefixBytes(self.arena, index, comps);
+        return .{ .ctx = self, .index = index, .vbytes = comps.v, .scan = try Store.scan(self.txn, self.conn.store.trees.cur(index), prefix) };
+    }
+
     /// The committed value of a card-one `(e a)` that is not already
     /// retracted in this transaction.
     fn currentOne(self: *Ctx, e: u64, a: u32) !?Current {
-        const prefix = try key.prefixBytes(self.arena, .eavt, .{ .e = e, .a = a });
-        var s = try Store.scan(self.txn, self.conn.store.trees.cur(.eavt), prefix);
-        while (s.next()) |kv| {
-            if (self.facts.get(kv.key)) |i| if (!self.overlay.items[i].added) continue;
-            const parts = try key.unpackKey(.eavt, false, kv.key);
-            return .{ .val = try self.valFromParts(parts), .vbytes = try self.arena.dupe(u8, parts.v) };
+        var rows = try self.liveRows(.eavt, .{ .e = e, .a = a });
+        while (try rows.next()) |r| {
+            if (r.pending) |p| if (!p.added) continue;
+            return .{ .val = try self.valFromParts(r.parts), .vbytes = try self.arena.dupe(u8, r.parts.v) };
         }
         return null;
     }
@@ -1088,9 +1117,7 @@ const Ctx = struct {
     fn valFromParts(self: *Ctx, parts: key.Parts) !Val {
         const kv = try key.decodeVal(self.arena, parts.v);
         if (kv == .val) return kv.val;
-        const raw = (try self.conn.store.getCurrent(self.txn, .eavt, parts.e, parts.a, parts.v, self.arena)) orelse return error.Corrupted;
-        if (raw.len < key.id_len) return error.Corrupted;
-        const payload = try self.arena.dupe(u8, raw[key.id_len..]);
+        const payload = (try self.conn.store.currentPayload(self.txn, parts.e, parts.a, parts.v, self.arena)) orelse return error.Corrupted;
         return switch (kv) {
             .string_long => .{ .string = payload },
             .bytes_long => .{ .bytes = payload },
@@ -1111,12 +1138,10 @@ const Ctx = struct {
 
     fn expandRetractAttr(self: *Ctx, e: u64, attr: Attr) !void {
         if (self.ea_adds.get(.{ .e = e, .a = attr.id })) |_| return self.conflict(e, attr.id);
-        const prefix = try key.prefixBytes(self.arena, .eavt, .{ .e = e, .a = attr.id });
-        var s = try Store.scan(self.txn, self.conn.store.trees.cur(.eavt), prefix);
-        while (s.next()) |kv| {
-            if (self.facts.get(kv.key)) |_| continue;
-            const parts = try key.unpackKey(.eavt, false, kv.key);
-            try self.pushRetract(e, attr, try self.valFromParts(parts), try self.arena.dupe(u8, parts.v));
+        var rows = try self.liveRows(.eavt, .{ .e = e, .a = attr.id });
+        while (try rows.next()) |r| {
+            if (r.pending != null) continue;
+            try self.pushRetract(e, attr, try self.valFromParts(r.parts), try self.arena.dupe(u8, r.parts.v));
         }
     }
 
@@ -1125,34 +1150,29 @@ const Ctx = struct {
         var components: std.ArrayList(u64) = .empty;
         // Its own datoms.
         {
-            const prefix = try key.prefixBytes(self.arena, .eavt, .{ .e = e });
-            var s = try Store.scan(self.txn, self.conn.store.trees.cur(.eavt), prefix);
-            while (s.next()) |kv| {
-                const parts = try key.unpackKey(.eavt, false, kv.key);
-                const attr = try self.attrById(parts.a);
-                const v = try self.valFromParts(parts);
+            var rows = try self.liveRows(.eavt, .{ .e = e });
+            while (try rows.next()) |r| {
+                const attr = try self.attrById(r.parts.a);
+                const v = try self.valFromParts(r.parts);
                 if (attr.component and v == .ref) try components.append(self.arena, v.ref);
-                if (self.facts.get(kv.key)) |i| {
-                    if (self.overlay.items[i].added) return self.conflict(e, attr.id);
+                if (r.pending) |p| {
+                    if (p.added) return self.conflict(e, attr.id);
                     continue;
                 }
-                try self.pushRetract(e, attr, v, try self.arena.dupe(u8, parts.v));
+                try self.pushRetract(e, attr, v, try self.arena.dupe(u8, r.parts.v));
             }
         }
         // Datoms pointing at it.
         {
             const vb = try key.valBytes(self.arena, .{ .ref = e });
-            const prefix = try key.prefixBytes(self.arena, .vaet, .{ .v = vb });
-            var s = try Store.scan(self.txn, self.conn.store.trees.cur(.vaet), prefix);
-            while (s.next()) |kv| {
-                const parts = try key.unpackKey(.vaet, false, kv.key);
-                const attr = try self.attrById(parts.a);
-                const fk = try key.keyBytes(self.arena, .eavt, parts.e, parts.a, vb, null);
-                if (self.facts.get(fk)) |i| {
-                    if (self.overlay.items[i].added) return self.conflict(parts.e, parts.a);
+            var rows = try self.liveRows(.vaet, .{ .v = vb });
+            while (try rows.next()) |r| {
+                const attr = try self.attrById(r.parts.a);
+                if (r.pending) |p| {
+                    if (p.added) return self.conflict(r.parts.e, r.parts.a);
                     continue;
                 }
-                try self.pushRetract(parts.e, attr, .{ .ref = e }, vb);
+                try self.pushRetract(r.parts.e, attr, .{ .ref = e }, vb);
             }
         }
         for (components.items) |c| try self.expandRetractEntity(c, seen);
@@ -1248,16 +1268,12 @@ const Ctx = struct {
     /// An indexed attribute becoming unique: no value may be held by two
     /// entities, in the tree or in this transaction.
     fn checkUniqueAvet(self: *Ctx, attr: Attr) !void {
-        const store = self.conn.store;
-        const prefix = try key.prefixBytes(self.arena, .avet, .{ .a = attr.id });
-        var s = try Store.scan(self.txn, store.trees.cur(.avet), prefix);
+        var rows = try self.liveRows(.avet, .{ .a = attr.id });
         var prev: ?[]const u8 = null;
-        while (s.next()) |kv| {
-            const parts = try key.unpackKey(.avet, false, kv.key);
-            const fk = try key.keyBytes(self.arena, .eavt, parts.e, parts.a, parts.v, null);
-            if (self.facts.get(fk)) |i| if (!self.overlay.items[i].added) continue;
-            if (prev) |pv| if (std.mem.eql(u8, pv, parts.v)) return self.unique(attr, try self.valFromParts(parts));
-            prev = try self.arena.dupe(u8, parts.v);
+        while (try rows.next()) |r| {
+            if (r.pending) |p| if (!p.added) continue;
+            if (prev) |pv| if (std.mem.eql(u8, pv, r.parts.v)) return self.unique(attr, try self.valFromParts(r.parts));
+            prev = try self.arena.dupe(u8, r.parts.v);
         }
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         for (self.overlay.items) |p| {
@@ -1276,20 +1292,17 @@ const Ctx = struct {
             if (p.e == attr.id and p.attr.id == boot.unique and p.added) becomes_unique = true;
         }
         const store = self.conn.store;
-        const prefix = try key.prefixBytes(self.arena, .aevt, .{ .a = attr.id });
         var rows: std.ArrayList(struct { e: u64, vbytes: []const u8, t: u64 }) = .empty;
-        var s = try Store.scan(self.txn, store.trees.cur(.aevt), prefix);
+        var live = try self.liveRows(.aevt, .{ .a = attr.id });
         var seen: std.StringHashMapUnmanaged(void) = .empty;
-        while (s.next()) |kv| {
-            const parts = try key.unpackKey(.aevt, false, kv.key);
-            if (kv.value.len < key.id_len) return error.Corrupted;
-            const fk = try key.keyBytes(self.arena, .eavt, parts.e, parts.a, parts.v, null);
-            if (self.facts.get(fk)) |i| if (!self.overlay.items[i].added) continue;
-            const vb = try self.arena.dupe(u8, parts.v);
+        while (try live.next()) |r| {
+            if (r.kv.value.len < key.id_len) return error.Corrupted;
+            if (r.pending) |p| if (!p.added) continue;
+            const vb = try self.arena.dupe(u8, r.parts.v);
             if (becomes_unique) {
-                if ((try seen.getOrPut(self.arena, vb)).found_existing) return self.unique(attr, try self.valFromParts(parts));
+                if ((try seen.getOrPut(self.arena, vb)).found_existing) return self.unique(attr, try self.valFromParts(r.parts));
             }
-            try rows.append(self.arena, .{ .e = parts.e, .vbytes = vb, .t = key.readId(kv.value[0..key.id_len]) });
+            try rows.append(self.arena, .{ .e = r.parts.e, .vbytes = vb, .t = key.readId(r.kv.value[0..key.id_len]) });
         }
         if (becomes_unique) {
             for (self.overlay.items) |p| {

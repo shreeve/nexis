@@ -489,18 +489,11 @@ pub const DatomScan = struct {
         v: ?[]const u8 = null,
 
         fn after(index: Index, covered: u8, comps: key.Components) Filter {
-            const order: [3]u8 = switch (index) {
-                .eavt => .{ 'e', 'a', 'v' },
-                .aevt => .{ 'a', 'e', 'v' },
-                .avet => .{ 'a', 'v', 'e' },
-                .vaet => .{ 'v', 'a', 'e' },
-            };
             var f: Filter = .{ .v = comps.v };
-            for (order[covered..]) |c| switch (c) {
-                'e' => f.e = comps.e,
-                'a' => f.a = comps.a,
-                'v' => {},
-                else => unreachable,
+            for (index.order()[covered..]) |c| switch (c) {
+                .e => f.e = comps.e,
+                .a => f.a = comps.a,
+                .v => {},
             };
             return f;
         }
@@ -555,9 +548,7 @@ pub const DatomScan = struct {
         const store = self.read.db.conn.store;
         const vbytes = if (self.index == .vaet) unreachable else parts.v;
         if (self.source == .current) {
-            const raw = (try store.getCurrent(self.read.txn, .eavt, parts.e, parts.a, vbytes, self.arena)) orelse return error.Corrupted;
-            if (raw.len < key.id_len) return error.Corrupted;
-            return self.arena.dupe(u8, raw[key.id_len..]);
+            return (try store.currentPayload(self.read.txn, parts.e, parts.a, vbytes, self.arena)) orelse error.Corrupted;
         }
         const raw = (try store.getHistory(self.read.txn, .eavt, parts.e, parts.a, vbytes, .{ .t = t, .added = added }, self.arena)) orelse return error.Corrupted;
         return self.arena.dupe(u8, raw);

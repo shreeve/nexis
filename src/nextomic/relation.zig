@@ -391,6 +391,33 @@ pub const Relation = struct {
         return out;
     }
 
+    /// `src` seen through `vars`, one per column of `src`: the relation
+    /// over the distinct variables whose rows are those of `src` on
+    /// which a repeated variable's columns agree. Without repeats it
+    /// borrows the columns.
+    pub fn viewAs(arena: Allocator, vars: []const Var, src: *const Relation) !Relation {
+        std.debug.assert(vars.len == src.cols.len);
+        var distinct: std.ArrayList(Var) = .empty;
+        for (vars) |v| {
+            if (std.mem.indexOfScalar(Var, distinct.items, v) == null) try distinct.append(arena, v);
+        }
+        if (distinct.items.len == vars.len) return .{ .arena = arena, .vars = vars, .cols = src.cols, .rows = src.rows };
+        var out = try init(arena, distinct.items);
+        const cells = try arena.alloc(Cell, distinct.items.len);
+        var i: usize = 0;
+        rows: while (i < src.rows) : (i += 1) {
+            for (vars, 0..) |v, pos| {
+                const d = std.mem.indexOfScalar(Var, distinct.items, v).?;
+                const c = src.cell(i, pos);
+                if (std.mem.indexOfScalar(Var, vars, v).? == pos) {
+                    cells[d] = c;
+                } else if (!cells[d].eql(c)) continue :rows;
+            }
+            try out.append(cells);
+        }
+        return out;
+    }
+
     /// The variables of `other` that `self` lacks.
     pub fn newVars(self: *const Relation, other: *const Relation) ![]Var {
         var out: std.ArrayList(Var) = .empty;
@@ -607,6 +634,26 @@ test "dedup, project, union, difference, sort" {
     var again = try r.dedup();
     try again.sort();
     try testing.expect(sorted.eqlRows(&again));
+}
+
+test "viewAs collapses repeated variables" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const src = try rel(arena, &.{ 0, 1, 2 }, &.{
+        &.{ .{ .int = 1 }, .{ .int = 1 }, .{ .int = 3 } },
+        &.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 } },
+        &.{ .{ .int = 2 }, .{ .int = 2 }, .{ .int = 2 } },
+    });
+    const same = try Relation.viewAs(arena, &.{ 7, 8, 9 }, &src);
+    try testing.expectEqual(@as(usize, 3), same.rows);
+    try testing.expectEqualSlices(Var, &.{ 7, 8, 9 }, same.vars);
+    const folded = try Relation.viewAs(arena, &.{ 7, 7, 9 }, &src);
+    try testing.expectEqual(@as(usize, 2), folded.rows);
+    try testing.expectEqualSlices(Var, &.{ 7, 9 }, folded.vars);
+    try testing.expect(folded.cell(1, 1).eql(.{ .int = 2 }));
+    const all = try Relation.viewAs(arena, &.{ 7, 7, 7 }, &src);
+    try testing.expectEqual(@as(usize, 1), all.rows);
 }
 
 test "a relation has no column cap" {

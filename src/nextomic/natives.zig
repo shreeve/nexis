@@ -263,9 +263,10 @@ fn detailOf(vm: *VM, conn: *Conn, fault: *const Fault) Detail {
     return d;
 }
 
-/// Surface an error from an operation on `conn_arg` that filled `fault`.
-fn failFault(vm: *VM, conn_arg: Value, err: anyerror, fault: *const Fault) VmError {
-    const c = connOf(conn_arg) catch return fail(vm, err);
+/// Surface an error from an operation on the connection or db-value
+/// `target` that filled `fault`.
+fn failFault(vm: *VM, target: Value, err: anyerror, fault: *const Fault) VmError {
+    const c = connOf(target) catch (dbOf(target) catch return fail(vm, err)).conn;
     return failWith(vm, err, detailOf(vm, c, fault));
 }
 
@@ -387,6 +388,42 @@ fn fixnum(n: u64) !Value {
 // Marshalling: datoms → Lisp
 // =============================================================================
 
+/// One read of the db-value in `arg`, with a scratch arena and a value
+/// builder: the prologue of a native that reads a view.
+const Scope = struct {
+    arena_state: std.heap.ArenaAllocator,
+    db: DbValue,
+    rd: Read,
+    b: Builder,
+
+    fn open(vm: *VM, arg: Value) !Scope {
+        const d = try dbOf(arg);
+        const rd = try d.beginRead();
+        return .{ .arena_state = std.heap.ArenaAllocator.init(vm.allocator), .db = d, .rd = rd, .b = Builder.init(vm, d.conn, rd.txn) };
+    }
+
+    fn close(self: *Scope) void {
+        self.rd.close();
+        self.arena_state.deinit();
+    }
+
+    fn arena(self: *Scope) Allocator {
+        return self.arena_state.allocator();
+    }
+};
+
+/// The `NativeFn.call` of a native that fills a `Fault`: the fault's
+/// detail travels with the error, rendered through the connection of
+/// the handle in `args[0]`.
+fn wrap(comptime native: anytype) fn (*VM, []const Value) VmError!Value {
+    return struct {
+        fn call(vm: *VM, args: []const Value) VmError!Value {
+            var fault: Fault = .{};
+            return native(vm, args, &fault) catch |err| failFault(vm, args[0], err, &fault);
+        }
+    }.call;
+}
+
 const Builder = struct {
     vm: *VM,
     conn: *Conn,
@@ -441,10 +478,7 @@ const Builder = struct {
 // transact!
 // =============================================================================
 
-fn fnTransact(vm: *VM, args: []const Value) VmError!Value {
-    var fault: Fault = .{};
-    return transactNative(vm, args, &fault) catch |err| failFault(vm, args[0], err, &fault);
-}
+const fnTransact = wrap(transactNative);
 
 fn transactNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
     const c = try openConn(args[0]);
@@ -489,10 +523,7 @@ fn reportMap(vm: *VM, conn: *Conn, arena: Allocator, report: transact_mod.Report
 // with
 // =============================================================================
 
-fn fnWith(vm: *VM, args: []const Value) VmError!Value {
-    var fault: Fault = .{};
-    return withNative(vm, args, &fault) catch |err| failFault(vm, args[0], err, &fault);
-}
+const fnWith = wrap(withNative);
 
 /// `(with conn tx-data f)`: apply tx-data in a held write transaction,
 /// call `f` with a db-value over the uncommitted state and the report
@@ -559,25 +590,19 @@ fn failPull(vm: *VM, err: anyerror, diag: *const Diag) VmError {
 // Reads
 // =============================================================================
 
-fn fnEntity(vm: *VM, args: []const Value) VmError!Value {
-    var fault: Fault = .{};
-    return entityNative(vm, args, &fault) catch |err| failWith(vm, err, .{ .attr = fault.attr, .message = fault.message });
-}
+const fnEntity = wrap(entityNative);
 
 /// `{:db/id e :attr v ...}` with card-many values as sets; nil when the
 /// entity has no datoms in this view.
 fn entityNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
-    const d = try dbOf(args[0]);
-    if (d.history) return error.HistoryView;
-    var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var rd = try d.beginRead();
-    defer rd.close();
-    const e = (try marshal.entity(&rd, arena, args[1], fault)) orelse return value.nilValue();
-    var b = Builder.init(vm, d.conn, rd.txn);
+    var sc = try Scope.open(vm, args[0]);
+    defer sc.close();
+    if (sc.db.history) return error.HistoryView;
+    const arena = sc.arena();
+    const e = (try marshal.entity(&sc.rd, arena, args[1], fault)) orelse return value.nilValue();
+    const b = &sc.b;
 
-    var it = try rd.scan(arena, .eavt, .{ .e = e });
+    var it = try sc.rd.scan(arena, .eavt, .{ .e = e });
     var m: ?Value = null;
     var cur_a: u32 = 0;
     var cur_attr: Attr = undefined;
@@ -592,7 +617,7 @@ fn entityNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
         }
         if (many == null or dt.a != cur_a) {
             cur_a = dt.a;
-            cur_attr = (try rd.attr(dt.a)) orelse return error.Corrupted;
+            cur_attr = (try sc.rd.attr(dt.a)) orelse return error.Corrupted;
         }
         const v = try b.val(dt.v);
         if (cur_attr.many()) {
@@ -606,19 +631,13 @@ fn entityNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
     return m orelse value.nilValue();
 }
 
-fn fnEntid(vm: *VM, args: []const Value) VmError!Value {
-    var fault: Fault = .{};
-    return entidNative(vm, args, &fault) catch |err| failWith(vm, err, .{ .attr = fault.attr, .message = fault.message });
-}
+const fnEntid = wrap(entidNative);
 
 fn entidNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
-    const d = try dbOf(args[0]);
-    var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
-    defer arena_state.deinit();
-    var rd = try d.beginRead();
-    defer rd.close();
-    const e = (try marshal.entity(&rd, arena_state.allocator(), args[1], fault)) orelse return value.nilValue();
-    return value.fromFixnum(@intCast(e)) orelse error.ArithmeticOverflow;
+    var sc = try Scope.open(vm, args[0]);
+    defer sc.close();
+    const e = (try marshal.entity(&sc.rd, sc.arena(), args[1], fault)) orelse return value.nilValue();
+    return fixnum(e);
 }
 
 fn fnIdent(vm: *VM, args: []const Value) VmError!Value {
@@ -628,75 +647,59 @@ fn fnIdent(vm: *VM, args: []const Value) VmError!Value {
 /// The ident keyword of an eid; a keyword answers itself when it is an
 /// ident in this view. Nil otherwise.
 fn identNative(vm: *VM, args: []const Value) !Value {
-    const d = try dbOf(args[0]);
-    var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var rd = try d.beginRead();
-    defer rd.close();
+    var sc = try Scope.open(vm, args[0]);
+    defer sc.close();
+    const arena = sc.arena();
     const x = args[1];
     switch (x.kind()) {
         .fixnum => {
             const n = x.asFixnum();
             if (n <= 0 or n > @as(i64, @intCast(key.id_max))) return value.nilValue();
-            const k = (try rd.ident(arena, @intCast(n))) orelse return value.nilValue();
+            const k = (try sc.rd.ident(arena, @intCast(n))) orelse return value.nilValue();
             return value.fromKeywordId(k);
         },
         .keyword => {
-            if ((try rd.entid(arena, .{ .ident = x.asKeywordId() })) == null) return value.nilValue();
+            if ((try sc.rd.entid(arena, .{ .ident = x.asKeywordId() })) == null) return value.nilValue();
             return x;
         },
         else => return error.KindMismatch,
     }
 }
 
-fn fnDatoms(vm: *VM, args: []const Value) VmError!Value {
-    var fault: Fault = .{};
-    return datomsNative(vm, args, &fault) catch |err| failWith(vm, err, .{ .attr = fault.attr, .message = fault.message });
-}
+const fnDatoms = wrap(datomsNative);
 
 /// `(datoms db index & components)`: components follow the index's
 /// order; nil leaves a position unbound and later ones filter.
 fn datomsNative(vm: *VM, args: []const Value, fault: *Fault) !Value {
-    const d = try dbOf(args[0]);
+    var sc = try Scope.open(vm, args[0]);
+    defer sc.close();
     const index = try indexOf(vm, args[1]);
-    var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var rd = try d.beginRead();
-    defer rd.close();
-    var b = Builder.init(vm, d.conn, rd.txn);
+    const arena = sc.arena();
+    const b = &sc.b;
     const empty = try vector_mod.fromSlice(b.heap, &.{});
 
-    const order: [3]u8 = switch (index) {
-        .eavt => .{ 'e', 'a', 'v' },
-        .aevt => .{ 'a', 'e', 'v' },
-        .avet => .{ 'a', 'v', 'e' },
-        .vaet => .{ 'v', 'a', 'e' },
-    };
     var comps: key.Components = .{};
     var attr: ?Attr = null;
-    for (args[2..], 0..) |arg, i| {
+    for (args[2..], index.order()[0 .. args.len - 2]) |arg, c| {
         if (arg.isNil()) continue;
-        switch (order[i]) {
-            'e' => comps.e = (try marshal.entity(&rd, arena, arg, fault)) orelse return empty,
-            'a' => {
-                attr = try marshal.attrOf(&rd, arg, fault);
+        switch (c) {
+            .e => comps.e = (try marshal.entity(&sc.rd, arena, arg, fault)) orelse return empty,
+            .a => {
+                attr = try marshal.attrOf(&sc.rd, arg, fault);
                 comps.a = attr.?.id;
             },
-            'v' => {
+            .v => {
                 const val: Val = if (index == .vaet)
-                    .{ .ref = (try marshal.entity(&rd, arena, arg, fault)) orelse return empty }
+                    .{ .ref = (try marshal.entity(&sc.rd, arena, arg, fault)) orelse return empty }
                 else
-                    (try marshal.valOf(&rd, arena, (attr orelse return error.ValueType).value_type, arg, fault)) orelse return empty;
+                    (try marshal.valOf(&sc.rd, arena, (attr orelse return error.ValueType).value_type, arg, fault)) orelse return empty;
                 comps.v = try key.valBytes(arena, val);
             },
-            else => unreachable,
         }
     }
 
     var out: std.ArrayList(Value) = .empty;
-    var it = try rd.scan(arena, index, comps);
+    var it = try sc.rd.scan(arena, index, comps);
     while (try it.next()) |dt| try out.append(arena, try b.datom(dt));
     return vector_mod.fromSlice(b.heap, out.items);
 }
@@ -782,12 +785,11 @@ fn fnSchema(vm: *VM, args: []const Value) VmError!Value {
 
 /// Ident → attribute map for every attribute this view sees.
 fn schemaNative(vm: *VM, args: []const Value) !Value {
-    const d = try dbOf(args[0]);
-    var rd = try d.beginRead();
-    defer rd.close();
-    var b = Builder.init(vm, d.conn, rd.txn);
-    const schema = try rd.schema();
-    const at = d.upper();
+    var sc = try Scope.open(vm, args[0]);
+    defer sc.close();
+    const b = &sc.b;
+    const schema = try sc.rd.schema();
+    const at = sc.db.upper();
 
     var out = try champ.mapEmpty(b.heap);
     var it = schema.attrs.iterator();

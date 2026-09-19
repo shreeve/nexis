@@ -536,27 +536,7 @@ pub fn execFix(ex: *exec_mod.Exec, fix: *const Fix, rel: Relation) anyerror!Rela
     }
 
     // Rename the target's rows to the call's arguments.
-    const total = &totals[fix.target].rel;
-    var distinct: std.ArrayList(Var) = .empty;
-    for (fix.args) |a| try ir.addVar(arena, &distinct, a);
-    var result: Relation = undefined;
-    if (distinct.items.len == fix.args.len) {
-        result = .{ .arena = arena, .vars = fix.args, .cols = total.cols, .rows = total.rows };
-    } else {
-        result = try Relation.init(arena, distinct.items);
-        const cells = try arena.alloc(relation.Cell, distinct.items.len);
-        var i: usize = 0;
-        rows: while (i < total.rows) : (i += 1) {
-            for (fix.args, 0..) |a, pos| {
-                const c = total.cell(i, pos);
-                const d = std.mem.indexOfScalar(Var, distinct.items, a).?;
-                if (pos == std.mem.indexOfScalar(Var, fix.args, a).?) {
-                    cells[d] = c;
-                } else if (!cells[d].eql(c)) continue :rows;
-            }
-            try result.append(cells);
-        }
-    }
+    const result = try Relation.viewAs(arena, fix.args, &totals[fix.target].rel);
     return rel.hashJoin(&result);
 }
 
