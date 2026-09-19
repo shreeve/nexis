@@ -3706,43 +3706,38 @@ fn typeNameToKind(name: []const u8) ?value_mod.Kind {
 // Helpers
 // =============================================================================
 
-/// Phase 3.3b seq iterator: walks a Value as a sequence.
-/// Supports nil (empty), list, vector. Map/set seq semantics
-/// deferred (Clojure returns entry-pairs/elements but our 3.3
-/// scope doesn't pin that yet).
-const SeqIter = struct {
-    kind: enum { empty, list, vector, map, set, string },
-    node: Value = value_mod.nilValue(),
-    vec: Value = value_mod.nilValue(),
-    vec_idx: usize = 0,
-    vec_count: usize = 0,
-    map_it: champ_mod.MapIter = undefined,
-    set_it: champ_mod.SetIter = undefined,
-    utf8: std.unicode.Utf8Iterator = undefined,
-    heap: *heap_mod.Heap = undefined,
+/// Walks any seqable: nil, list, vector, map or record (as `[k v]`
+/// entries), set, string (as chars).
+const SeqIter = union(enum) {
+    empty,
+    list: Value,
+    vector: struct { v: Value, idx: usize, count: usize },
+    map: struct { it: champ_mod.MapIter, heap: *heap_mod.Heap },
+    set: champ_mod.SetIter,
+    string: std.unicode.Utf8Iterator,
 
     fn next(self: *SeqIter) VmError!?Value {
-        switch (self.kind) {
+        switch (self.*) {
             .empty => return null,
-            .list => {
-                if (list_mod.isEmpty(self.node)) return null;
-                const h = list_mod.head(self.node);
-                self.node = list_mod.tail(self.node);
+            .list => |*node| {
+                if (list_mod.isEmpty(node.*)) return null;
+                const h = list_mod.head(node.*);
+                node.* = list_mod.tail(node.*);
                 return h;
             },
-            .vector => {
-                if (self.vec_idx >= self.vec_count) return null;
-                const e = vector_mod.nth(self.vec, self.vec_idx);
-                self.vec_idx += 1;
+            .vector => |*vec| {
+                if (vec.idx >= vec.count) return null;
+                const e = vector_mod.nth(vec.v, vec.idx);
+                vec.idx += 1;
                 return e;
             },
-            .map => {
-                const e = self.map_it.next() orelse return null;
-                return vector_mod.fromSlice(self.heap, &.{ e.key, e.value }) catch VmError.OutOfMemory;
+            .map => |*m| {
+                const e = m.it.next() orelse return null;
+                return vector_mod.fromSlice(m.heap, &.{ e.key, e.value }) catch VmError.OutOfMemory;
             },
-            .set => return self.set_it.next(),
-            .string => {
-                const scalar = self.utf8.nextCodepoint() orelse return null;
+            .set => |*it| return it.next(),
+            .string => |*utf8| {
+                const scalar = utf8.nextCodepoint() orelse return null;
                 return value_mod.fromChar(scalar) orelse VmError.Utf8Error;
             },
         }
@@ -3750,31 +3745,21 @@ const SeqIter = struct {
 };
 
 /// Every seqable receiver: nil, list, vector, map (as `[k v]`
-/// entries), record (its field map), set and string (as chars).
+/// entries), record (its field map), set and string (as chars). A
+/// string that is not valid UTF-8 is `:utf8-error`, as for every
+/// other string operation.
 fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
     return switch (coll.kind()) {
-        .nil => SeqIter{ .kind = .empty },
-        .list => SeqIter{ .kind = .list, .node = coll },
-        .persistent_vector => SeqIter{
-            .kind = .vector,
-            .vec = coll,
-            .vec_count = vector_mod.count(coll),
-        },
-        .persistent_map => SeqIter{ .kind = .map, .map_it = champ_mod.mapIter(coll), .heap = vm.ensureHeap() },
-        .record => SeqIter{ .kind = .map, .map_it = champ_mod.mapIter(record_mod.fieldsOf(coll)), .heap = vm.ensureHeap() },
-        .persistent_set => SeqIter{ .kind = .set, .set_it = champ_mod.setIter(coll) },
-        .string => SeqIter{
-            .kind = .string,
-            .utf8 = std.unicode.Utf8View.initUnchecked(string_mod.asBytes(coll)).iterator(),
+        .nil => .empty,
+        .list => .{ .list = coll },
+        .persistent_vector => .{ .vector = .{ .v = coll, .idx = 0, .count = vector_mod.count(coll) } },
+        .persistent_map => .{ .map = .{ .it = champ_mod.mapIter(coll), .heap = vm.ensureHeap() } },
+        .record => .{ .map = .{ .it = champ_mod.mapIter(record_mod.fieldsOf(coll)), .heap = vm.ensureHeap() } },
+        .persistent_set => .{ .set = champ_mod.setIter(coll) },
+        .string => .{
+            .string = (std.unicode.Utf8View.init(string_mod.asBytes(coll)) catch return VmError.Utf8Error).iterator(),
         },
         else => VmError.KindMismatch,
-    };
-}
-
-fn isSeqable(v: Value) bool {
-    return switch (v.kind()) {
-        .nil, .list, .persistent_vector, .persistent_map, .record, .persistent_set, .string => true,
-        else => false,
     };
 }
 
@@ -3857,6 +3842,18 @@ test "stdlib: installCore registers all 10 fns" {
         try testing.expectEqual(Kind.native_fn, v.root.kind());
         try testing.expect(!v.macro);
     }
+}
+
+test "stdlib: a string that is not UTF-8 seqs as :utf8-error" {
+    var stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
+    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var vm = try VM.init(testing.allocator, &stub);
+    defer vm.deinit();
+    const bad = try string_mod.fromBytes(vm.ensureHeap(), "a\xffb");
+    try testing.expectError(VmError.Utf8Error, fnFirst(&vm, &.{bad}));
+    try testing.expectError(VmError.Utf8Error, fnSeq(&vm, &.{bad}));
+    const good = try string_mod.fromBytes(vm.ensureHeap(), "é");
+    try testing.expectEqual(@as(u21, 0xE9), (try fnFirst(&vm, &.{good})).asChar());
 }
 
 test "stdlib: nativeFnValue round-trips" {
