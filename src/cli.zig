@@ -240,7 +240,7 @@ const Runtime = struct {
     v: vm.VM,
     host_macros: expand_mod.HostMacroTable,
     loader: loader_mod.Loader,
-    /// What `macroexpand-1` and `read-string` call into.
+    /// What `macroexpand-1`, `read-string` and `eval` call into.
     hooks: compile.RuntimeHooks,
     interner: *intern_mod.Interner,
     registry: *vm.NamespaceRegistry,

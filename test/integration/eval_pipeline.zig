@@ -2115,8 +2115,8 @@ test "nexis.string: join: 2-arity inserts separator between elements" {
 }
 
 test "nexis.string: join: rejects map; rejects non-string sep" {
-    // Turn 79 §D4: maps excluded until CHAMP iteration order is
-    // pinned; non-string sep surfaces :kind-mismatch.
+    // STRING.md §8 item 4: a map is `:kind-mismatch`, as is a
+    // non-string separator.
     try expectOutput("(try (nexis.string/join {:a 1 :b 2}) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (nexis.string/join :sep [1 2]) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (nexis.string/join 42 [1 2]) (catch any e e))", ":kind-mismatch");
@@ -2139,11 +2139,10 @@ test "nexis.string: join: round-trips with split" {
 test "nexis.string: replace: literal, all-non-overlapping" {
     try expectOutput("(nexis.string/replace \"abc\" \"b\" \"X\")", "aXc");
     try expectOutput("(nexis.string/replace \"abababab\" \"ab\" \"X\")", "XXXX");
-    // Turn 79 §D5: after match, cursor jumps by match.len, so
-    // `(replace "aaa" "aa" "x") → "xa"`, not `"xx"`.
+    // STRING.md §8 item 5: after a match the cursor advances by the
+    // match length, so `(replace "aaa" "aa" "x") → "xa"`, not `"xx"`.
     try expectOutput("(nexis.string/replace \"aaa\" \"aa\" \"x\")", "xa");
-    // Turn 80 §"Additional tests" pin: consecutive non-overlapping
-    // matches both fire.
+    // Consecutive non-overlapping matches both fire.
     try expectOutput("(nexis.string/replace \"aaaa\" \"aa\" \"x\")", "xx");
     try expectOutput("(nexis.string/replace \"abc\" \"z\" \"x\")", "abc");
     try expectOutput("(nexis.string/replace \"\" \"x\" \"y\")", "");
