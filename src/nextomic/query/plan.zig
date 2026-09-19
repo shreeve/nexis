@@ -182,8 +182,17 @@ pub const Plan = struct {
     /// The variables this plan starts with (bound by its input relation).
     input: []const Var,
     steps: []const Step,
+    /// Estimated rows of the input relation.
+    rows_in: u64,
+    /// Estimated rows after each step, one per step.
+    rows_after: []const u64,
     /// Estimated rows after the last step.
     rows_estimate: u64,
+
+    /// Estimated rows before step `i`.
+    pub fn rowsBefore(self: *const Plan, i: usize) u64 {
+        return if (i == 0) self.rows_in else self.rows_after[i - 1];
+    }
 };
 
 /// One data source at plan time: its `Read` and what has been
@@ -336,10 +345,17 @@ pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: 
     var bound: std.ArrayList(Var) = .empty;
     try bound.appendSlice(ctx.arena, input);
     var steps: std.ArrayList(Step) = .empty;
+    var rows_after: std.ArrayList(u64) = .empty;
     var rows = rows_in;
-    try planClauses(ctx, clauses, &bound, &steps, &rows);
-    out.* = .{ .input = try ctx.arena.dupe(Var, input), .steps = try steps.toOwnedSlice(ctx.arena), .rows_estimate = rows };
+    try planClauses(ctx, clauses, &bound, &steps, &rows_after, &rows);
+    out.* = .{ .input = try ctx.arena.dupe(Var, input), .steps = try steps.toOwnedSlice(ctx.arena), .rows_in = rows_in, .rows_after = try rows_after.toOwnedSlice(ctx.arena), .rows_estimate = rows };
     return out;
+}
+
+/// Record `rows` as the estimate after every step placed since the
+/// last note.
+fn noteRows(ctx: *Ctx, rows_after: *std.ArrayList(u64), steps: usize, rows: u64) !void {
+    while (rows_after.items.len < steps) try rows_after.append(ctx.arena, rows);
 }
 
 const Pending = struct {
@@ -347,7 +363,7 @@ const Pending = struct {
     done: bool = false,
 };
 
-fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
+fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows_after: *std.ArrayList(u64), rows: *u64) Failure!void {
     const pending = try ctx.arena.alloc(Pending, clauses.len);
     for (clauses, pending) |c, *p| p.* = .{ .clause = c };
 
@@ -407,6 +423,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
                 p.done = true;
                 remaining -= 1;
                 progress = true;
+                try noteRows(ctx, rows_after, steps.items.len, rows.*);
             }
         }
         if (progress) continue;
@@ -465,6 +482,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
             },
             else => unreachable,
         }
+        try noteRows(ctx, rows_after, steps.items.len, rows.*);
         p.done = true;
         remaining -= 1;
     }
@@ -853,26 +871,65 @@ pub fn resolveTyped(ctx: *Ctx, c: ir.Constant, vt: key.ValueType) Failure!?key.V
 // Explain
 // =============================================================================
 
-/// Print the ordered steps with their index and estimate.
+/// Print the plan as a table: one numbered line per step with its
+/// description (index, estimate, tree size, bound variables), the join
+/// the executor will run for a scan (`nested`: one seek per input row;
+/// `hash`: one scan of the constant prefix hash-joined on the shared
+/// variables) and the estimated rows after the step; sub-plans indent
+/// under their step and end with their own `rows~` line.
 pub fn explain(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer) !void {
-    try explainSub(p, ctx, w, 0);
+    var lines: std.ArrayList(Line) = .empty;
+    try explainSub(p, ctx, &lines, 0);
+    var width: usize = 0;
+    for (lines.items) |l| width = @max(width, l.text.len);
+    for (lines.items) |l| {
+        if (l.join == null and l.rows == null) {
+            try w.print("{s}\n", .{l.text});
+            continue;
+        }
+        try w.writeAll(l.text);
+        var pad = width - l.text.len + 2;
+        while (pad > 0) : (pad -= 1) try w.writeByte(' ');
+        try w.print("{s: <7}", .{l.join orelse ""});
+        if (l.rows) |r| try w.print(" rows~{d}", .{r});
+        try w.writeByte('\n');
+    }
 }
+
+/// One line of the table: the description, the join kind of a scan,
+/// the estimated rows after the step.
+const Line = struct {
+    text: []const u8,
+    join: ?[]const u8 = null,
+    rows: ?u64 = null,
+};
 
 fn indent(w: *std.Io.Writer, depth: usize) !void {
     var i: usize = 0;
     while (i < depth) : (i += 1) try w.writeAll("  ");
 }
 
-pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usize) (Failure || std.Io.Writer.Error)!void {
-    for (p.steps, 1..) |step, num| {
+/// The join `execScan` runs for `s` on `rows` input rows.
+fn joinKind(s: *const Scan, rows: u64) []const u8 {
+    if (s.unsatisfiable) return "none";
+    const log_n: u64 = std.math.log2_int_ceil(u64, s.tree_entries + 2);
+    const nested = s.hash_index == null or s.a == .bound or (std.math.mulWide(u64, rows, log_n) < s.hash_estimate);
+    return if (nested) "nested" else "hash";
+}
+
+pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), depth: usize) (Failure || std.Io.Writer.Error)!void {
+    for (p.steps, 0..) |step, i| {
+        var out: std.Io.Writer.Allocating = .init(ctx.arena);
+        const w = &out.writer;
         try indent(w, depth);
-        try w.print("{d}. ", .{num});
+        try w.print("{d}. ", .{i + 1});
+        var line: Line = .{ .text = "", .rows = p.rows_after[i] };
         switch (step) {
             .scan => |s| {
                 try w.writeAll("scan [");
                 if (s.src != 0) try w.print("{s} ", .{ctx.interner.symbolName(ctx.source_names[s.src])});
-                for (s.slots(), 0..) |slot, i| {
-                    if (i > 0) try w.writeByte(' ');
+                for (s.slots(), 0..) |slot, j| {
+                    if (j > 0) try w.writeByte(' ');
                     try explainSlot(slot, ctx, w);
                 }
                 try w.print("] {s}", .{s.index.name()});
@@ -882,46 +939,67 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usi
                     try w.print(" est={d} tree={d}", .{ s.estimate, s.tree_entries });
                     if (s.dedup) try w.writeAll(" dedup");
                 }
-                try w.writeByte('\n');
+                line.join = joinKind(&s, p.rowsBefore(i));
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
             },
             .pred => |pr| {
                 try w.writeAll("pred ");
                 try explainCall(pr.call, ctx, w);
-                try w.writeByte('\n');
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
             },
             .bind => |b| {
                 try w.writeAll("bind ");
                 try explainCall(b.call, ctx, w);
                 try w.writeAll(" -> ");
                 try explainBinding(b, ctx, w);
-                try w.writeByte('\n');
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
             },
             .not => |n| {
                 try w.writeAll("not-join [");
                 try explainVars(n.join, ctx, w);
-                try w.writeAll("]\n");
-                try explainSub(n.sub, ctx, w, depth + 1);
+                try w.writeAll("]");
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
+                try explainSub(n.sub, ctx, lines, depth + 1);
             },
             .@"or" => |o| {
                 try w.writeAll("or-join [");
                 try explainVars(o.join, ctx, w);
-                try w.print("] branches={d}\n", .{o.branches.len});
+                try w.print("] branches={d}", .{o.branches.len});
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
                 for (o.branches) |br| {
-                    try indent(w, depth + 1);
-                    try w.writeAll("branch\n");
-                    try explainSub(br, ctx, w, depth + 2);
+                    var bw: std.Io.Writer.Allocating = .init(ctx.arena);
+                    try indent(&bw.writer, depth + 1);
+                    try bw.writer.writeAll("branch");
+                    try lines.append(ctx.arena, .{ .text = bw.written() });
+                    try explainSub(br, ctx, lines, depth + 2);
                 }
             },
             .source => |s| {
                 try w.writeAll("source [");
                 try explainVars(s.vars, ctx, w);
-                try w.writeAll("]\n");
+                try w.writeAll("]");
+                line.join = "hash";
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
             },
-            .fix => |f| try rules_mod.explainFix(&f, ctx, w, depth),
+            .fix => |f| {
+                try rules_mod.explainFix(&f, ctx, w);
+                line.join = "fixpoint";
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
+                try rules_mod.explainFixBodies(&f, ctx, lines, depth + 1);
+            },
         }
     }
-    try indent(w, depth);
-    try w.print("rows~{d}\n", .{p.rows_estimate});
+    var tail: std.Io.Writer.Allocating = .init(ctx.arena);
+    try indent(&tail.writer, depth);
+    try tail.writer.print("rows~{d}", .{p.rows_estimate});
+    try lines.append(ctx.arena, .{ .text = tail.written() });
 }
 
 /// The binding's variables; one bound before the step (which the

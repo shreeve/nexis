@@ -1535,6 +1535,26 @@ test "results materialise as set, scalar, collection, tuple; caches; explain" {
     out.clearRetainingCapacity();
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?a :where [?e :person/age ?a] [(identity ?e) ?e2] [?e2 :person/email \"ann@x\"]]"), dbv, none, &diag, opts, &out.writer);
     try testing.expect(std.mem.indexOf(u8, out.written(), "3. bind (identity ?e) -> ?e2!") != null);
+    // Every step ends with its join kind (scans) and estimated rows; a
+    // seek per row is `nested`, a constant-prefix scan joined on the
+    // shared variables is `hash`.
+    out.clearRetainingCapacity();
+    try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :where [?e :person/age 30] [?e :person/name ?n]]"), dbv, none, &diag, opts, &out.writer);
+    const table = out.written();
+    try testing.expect(std.mem.indexOf(u8, table, "1. scan [?e :person/age 30 _ _] aevt") != null);
+    try testing.expect(std.mem.indexOf(u8, table, "hash    rows~6") != null);
+    var lines = std.mem.splitScalar(u8, table, '\n');
+    var steps: usize = 0;
+    while (lines.next()) |l| {
+        if (l.len == 0 or std.mem.startsWith(u8, l, "rows~")) continue;
+        steps += 1;
+        try testing.expect(std.mem.indexOf(u8, l, " rows~") != null);
+    }
+    try testing.expectEqual(@as(usize, 2), steps);
+    // A bound attribute variable seeks per row.
+    out.clearRetainingCapacity();
+    try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?v :in $ ?a ?e :where [?e ?a ?v]]"), dbv, &.{ value.nilValue(), try fx.kw("person/name"), value.fromFixnum(1).? }, &diag, opts, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "nested  rows~") != null);
 }
 
 test "transitive closure over a 5k-edge chain" {

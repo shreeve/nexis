@@ -568,19 +568,28 @@ fn absorb(total: *relation.Accumulator, fresh: *Relation, r: *const Relation) !v
 // Explain
 // =============================================================================
 
-pub fn explainFix(f: *const Fix, ctx: *const Ctx, w: *std.Io.Writer, depth: usize) !void {
+/// The fix step's own line: the target rule, its arguments, how many
+/// positions are pushed down and how many rules the component holds.
+pub fn explainFix(f: *const Fix, ctx: *const Ctx, w: *std.Io.Writer) !void {
     try w.print("fix {s} [", .{ctx.interner.symbolName(f.instances[f.target].name)});
     for (f.args, 0..) |v, i| {
         if (i > 0) try w.writeByte(' ');
         try w.writeAll(ctx.varName(v));
     }
-    try w.print("] pushed={d} instances={d}\n", .{ f.pushed.len, f.instances.len });
+    try w.print("] pushed={d} instances={d}", .{ f.pushed.len, f.instances.len });
+}
+
+/// The lines of every body of every rule in the component, under the
+/// fix step.
+pub fn explainFixBodies(f: *const Fix, ctx: *const Ctx, lines: anytype, depth: usize) !void {
     for (f.instances) |inst| {
         for (inst.bodies) |body| {
+            var out: std.Io.Writer.Allocating = .init(ctx.arena);
             var i: usize = 0;
-            while (i < depth + 1) : (i += 1) try w.writeAll("  ");
-            try w.print("{s} body {s}\n", .{ ctx.interner.symbolName(inst.name), if (body.sites.len == 0) "base" else "recursive" });
-            try plan_mod.explainSub(body.plan, ctx, w, depth + 2);
+            while (i < depth) : (i += 1) try out.writer.writeAll("  ");
+            try out.writer.print("{s} body {s}", .{ ctx.interner.symbolName(inst.name), if (body.sites.len == 0) "base" else "recursive" });
+            try lines.append(ctx.arena, .{ .text = out.written() });
+            try plan_mod.explainSub(body.plan, ctx, lines, depth + 1);
         }
     }
 }
