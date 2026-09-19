@@ -9,7 +9,8 @@
 //!   - `vars[i].sym` is unique; every `Var` in the tree is `< vars.len`.
 //!   - Every `find` and `with` variable is bound by some `in` binding
 //!     or by some `where` clause (`parse.zig` checks this).
-//!   - `sources[0]` is `$`; every explicit `Src` in the tree is
+//!   - `sources[0]` is the first `:in` source, which `$` and every
+//!     unprefixed clause read; every explicit `Src` in the tree is
 //!     `< sources.len`.
 //!   - Everything hangs off `arena`; `deinit` frees it all.
 
@@ -284,7 +285,8 @@ pub const Ir = struct {
     keys: ?Keys = null,
     with: []const Var,
     in: []const InBinding,
-    /// VM symbol ids of the sources, by `Src`: `$` first.
+    /// VM symbol ids of the sources, by `Src`; the first is what `$`
+    /// names.
     sources: []const u32,
     where: []const Clause,
 

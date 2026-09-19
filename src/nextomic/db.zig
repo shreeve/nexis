@@ -450,6 +450,30 @@ pub const Read = struct {
         };
     }
 
+    /// Stream the datoms of `index` whose keys lie in `[start, end)`,
+    /// folded for this view; an absent `end` runs to the tree's last
+    /// key. The bounds pin every component they cover, so nothing
+    /// filters.
+    pub fn scanRange(self: *Read, arena: Allocator, index: Index, start: []const u8, end: ?[]const u8) !DatomScan {
+        const store = self.db.conn.store;
+        if (self.fast()) {
+            return .{
+                .read = self,
+                .arena = arena,
+                .index = index,
+                .filter = .{},
+                .source = .{ .current = try Store.scanRange(self.txn, store.trees.cur(index), start, end) },
+            };
+        }
+        return .{
+            .read = self,
+            .arena = arena,
+            .index = index,
+            .filter = .{},
+            .source = .{ .folded = try Store.foldScan(self.txn, store.trees.hist(index), start, end, self.db.window()) },
+        };
+    }
+
     pub fn entid(self: *Read, arena: Allocator, ref: DbValue.EntityRef) !?u64 {
         switch (ref) {
             .eid => |e| return e,
@@ -739,6 +763,37 @@ test "db at bootstrap: datoms, entity, entid, ident, tx-range" {
     try tc.conn.release();
     try testing.expectError(error.Closed, db.datoms(arena, .eavt, .{ .e = 1 }));
     try testing.expectError(error.Closed, tc.conn.db());
+}
+
+test "a bounded scan seeks to its start and stops at its end, on every view" {
+    const tc = try TestConn.init("db_scan_range");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const db = try tc.conn.db();
+
+    // AVET of :db/ident is keyed by ident id: [doc, type_double) holds
+    // doc, txInstant and type_long.
+    var abuf: [key.attr_len]u8 = undefined;
+    key.writeAttr(&abuf, boot.ident);
+    const lo = try std.mem.concat(arena, u8, &.{ &abuf, try key.valBytes(arena, .{ .keyword = boot.doc }) });
+    const hi = try std.mem.concat(arena, u8, &.{ &abuf, try key.valBytes(arena, .{ .keyword = boot.type_double }) });
+    for ([_]DbValue{ db, db.asOf(1) }) |view| {
+        var rd = try view.beginRead();
+        defer rd.close();
+        var it = try rd.scanRange(arena, .avet, lo, hi);
+        var seen: [3]u64 = undefined;
+        var n: usize = 0;
+        while (try it.next()) |d| : (n += 1) seen[n] = d.e;
+        try testing.expectEqual(@as(usize, 3), n);
+        try testing.expectEqualSlices(u64, &.{ boot.doc, boot.tx_instant, boot.type_long }, &seen);
+        // An open end runs to the attribute's last key and past it.
+        var open = try rd.scanRange(arena, .avet, lo, (try key.successor(arena, &abuf)).?);
+        var m: usize = 0;
+        while (try open.next()) |_| m += 1;
+        try testing.expectEqual(@as(usize, boot.idents.len - boot.doc + 1), m);
+    }
 }
 
 test "basis in the future is refused" {

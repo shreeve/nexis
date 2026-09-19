@@ -41,4 +41,9 @@ ok and from history
 ok the untouched entity keeps its rows
 {:error :nextomic/tx-data, :message excision takes a user entity}
 :nextomic/no-entity
+[true nil false]
+[true :db.unique/identity false]
+{:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :doc/code}
+ok the lookup ref resolves from the transaction that made the attribute unique
+[[false nil false] [false nil true]]
 :time-done

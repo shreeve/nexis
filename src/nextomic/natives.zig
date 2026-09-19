@@ -1012,7 +1012,11 @@ const fnIndexRange = wrap(indexRangeNative);
 
 /// `(index-range db attr start end)`: the AVET datoms of an indexed or
 /// unique attribute with `start <= v < end` in value order, either
-/// bound open when nil.
+/// bound open when nil. The cursor seeks to the encoded start and
+/// stops at the encoded end; the range test is on decoded values, so
+/// a long string or byte array is placed by its value even where the
+/// index orders it by hash (§2.2), the seek window widening to the
+/// whole 64-byte prefix class of such a bound (`rangeBound`).
 fn indexRangeNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     var sc = try Scope.open(vm, args[0]);
     defer sc.close();
@@ -1025,18 +1029,56 @@ fn indexRangeNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
         fault = .{ .message = "index-range reads an indexed or unique attribute", .attr = args[1] };
         return error.TxData;
     }
-    const start: ?[]const u8 = if (args[2].isNil()) null else try key.valBytes(arena, (try marshal.valOf(&sc.rd, arena, attr.value_type, args[2], &fault)) orelse return error.ValueType);
-    const end: ?[]const u8 = if (args[3].isNil()) null else try key.valBytes(arena, (try marshal.valOf(&sc.rd, arena, attr.value_type, args[3], &fault)) orelse return error.ValueType);
+    const start: ?Val = if (args[2].isNil()) null else (try marshal.valOf(&sc.rd, arena, attr.value_type, args[2], &fault)) orelse return error.ValueType;
+    const end: ?Val = if (args[3].isNil()) null else (try marshal.valOf(&sc.rd, arena, attr.value_type, args[3], &fault)) orelse return error.ValueType;
 
-    var out: std.ArrayList(Value) = .empty;
-    var it = try sc.rd.scan(arena, .avet, .{ .a = attr.id });
+    var abuf: [key.attr_len]u8 = undefined;
+    key.writeAttr(&abuf, attr.id);
+    const lo: []const u8 = if (start) |v| try std.mem.concat(arena, u8, &.{ &abuf, try rangeBound(arena, v) }) else &abuf;
+    const hi: ?[]const u8 = if (end) |v| blk: {
+        const bound = try rangeBound(arena, v);
+        const class = try std.mem.concat(arena, u8, &.{ &abuf, bound });
+        // A bound widened to its prefix class admits the whole class.
+        break :blk if (bound.len < (try key.valBytes(arena, v)).len) try key.successor(arena, class) else class;
+    } else try key.successor(arena, &abuf);
+
+    var hits: std.ArrayList(Datom) = .empty;
+    var it = try sc.rd.scanRange(arena, .avet, lo, hi);
     while (try it.next()) |dt| {
-        const vb = try key.valBytes(arena, dt.v);
-        if (start) |lo| if (std.mem.order(u8, vb, lo) == .lt) continue;
-        if (end) |hi| if (std.mem.order(u8, vb, hi) != .lt) break;
-        try out.append(arena, try b.datom(dt));
+        if (start) |v| if (dt.v.order(v) == .lt) continue;
+        if (end) |v| if (dt.v.order(v) != .lt) continue;
+        try hits.append(arena, dt);
     }
-    return vector_mod.fromSlice(b.heap, out.items);
+    // Index order is value order except among long values of one
+    // prefix class; the result is in value order, then by entity.
+    std.mem.sort(Datom, hits.items, {}, struct {
+        fn lt(_: void, x: Datom, y: Datom) bool {
+            return switch (x.v.order(y.v)) {
+                .lt => true,
+                .gt => false,
+                .eq => x.e < y.e,
+            };
+        }
+    }.lt);
+    return b.datoms(arena, hits.items);
+}
+
+/// The index bytes a range bound seeks to: the value's encoding, or,
+/// for a string or byte array of `prefix_len` bytes or more, the bytes
+/// every value sharing its first `prefix_len` bytes starts with (the
+/// tag and the escaped prefix). Such values order by hash among
+/// themselves when one is out of line, so an in-range value may sit on
+/// either side of the bound's own key; the class is scanned whole and
+/// the range test on decoded values settles it.
+fn rangeBound(arena: Allocator, v: Val) ![]const u8 {
+    const enc = try key.valBytes(arena, v);
+    const blob: []const u8 = switch (v) {
+        .string => |s| s,
+        .bytes => |x| x,
+        else => return enc,
+    };
+    if (blob.len < key.prefix_len) return enc;
+    return enc[0 .. 1 + key.escapedLen(blob[0..key.prefix_len]) - 1];
 }
 
 fn indexOf(vm: *VM, v: Value) !Index {
@@ -1123,10 +1165,13 @@ fn fnSchema(vm: *VM, args: []const Value) VmError!Value {
     return schemaNative(vm, args) catch |err| fail(vm, err);
 }
 
-/// Ident → attribute map for every attribute this view sees.
+/// Ident → attribute map for every attribute this view sees: the
+/// flags as the view's basis saw them (§4 "Schema as-of"), and the
+/// attribute's `:db/doc` when the view holds one.
 fn schemaNative(vm: *VM, args: []const Value) !Value {
     var sc = try Scope.open(vm, args[0]);
     defer sc.close();
+    const arena = sc.arena();
     const b = &sc.b;
     const schema = try sc.rd.schema();
     const at = sc.db.upper();
@@ -1148,6 +1193,9 @@ fn schemaNative(vm: *VM, args: []const Value) !Value {
         }
         m = try b.putKw(m, "db/index", value.fromBool(attr.indexed));
         m = try b.putKw(m, "db/isComponent", value.fromBool(attr.component));
+        m = try b.putKw(m, "db/fulltext", value.fromBool(attr.fulltext));
+        var docs = try sc.rd.scan(arena, .eavt, .{ .e = attr.id, .a = boot.doc });
+        if (try docs.next()) |d| m = try b.putKw(m, "db/doc", try b.val(d.v));
         out = try b.put(out, ident, m);
     }
     return out;

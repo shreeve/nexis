@@ -180,6 +180,7 @@
                      [$2 ?e :person/age ?then] [(not= ?then ?now)]] db before)))
 (println (rows (d/q '[:find ?n :in $ $2 :where [?e :person/name ?n] (not [$2 ?e :person/name ?n])] db before)))
 (println (rows (d/q '[:find ?n :in $ $2 :where [?e :person/name ?n] [(missing? $2 ?e :person/name)]] db before)))
+(println (rows (d/q '[:find ?n :in $db $2 :where [$db ?e :person/name ?n] [$ ?e :person/age ?now] [$2 ?e :person/age ?then] [(not= ?then ?now)]] db before)))
 (println (rows (d/q '[:find ?n :in $ $hist :where [?e :person/name ?n] [$hist ?e :person/tags :red _ false]] db (d/history db))))
 (def c2 (d/connect "query2.edb"))
 (d/transact! c2 [{:db/ident :city/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one
@@ -261,6 +262,7 @@
 (def before-items (d/db c))
 (d/transact! c [[:db/add :order/items :db/fulltext true]])
 (def ft (d/db c))
+(println [(:db/fulltext (get (d/schema before-items) :order/items)) (:db/fulltext (get (d/schema ft) :order/items))])
 (println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "red") [[?e ?v]]] [?e :person/name ?n]] ft)))
 (println (rows (d/q '[:find ?n ?v :where [(fulltext $ :person/bio "RED team") [[?e ?v]]] [?e :person/name ?n]] ft)))
 (println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "café") [[?e ?v]]] [?e :person/name ?n]] ft)))

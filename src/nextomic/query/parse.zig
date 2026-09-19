@@ -114,8 +114,9 @@ const Parser = struct {
     diag: *Diag,
     vars: std.ArrayList(ir.VarInfo) = .empty,
     by_sym: std.AutoHashMapUnmanaged(u32, Var) = .empty,
-    /// The `:in` sources by symbol id, `$` first; empty while parsing
-    /// a rule set, whose bodies take only `$`.
+    /// The `:in` sources by symbol id, the first being what `$` and
+    /// an unprefixed clause read; empty while parsing a rule set,
+    /// whose bodies take only `$`.
     sources: std.ArrayList(u32) = .empty,
     rule_body: bool = false,
     clause_index: ?usize = null,
@@ -172,9 +173,10 @@ const Parser = struct {
         return s.len > 0 and s[0] == '$';
     }
 
-    /// The source a `$name` symbol names: null for `$` (the default),
-    /// its index for a declared source; an undeclared one, or any
-    /// name but `$` in a rule body, is a syntax error.
+    /// The source a `$name` symbol names: null for `$` (the first
+    /// source, whatever `:in` calls it), its index for a declared
+    /// source; an undeclared one, or any name but `$` in a rule body,
+    /// is a syntax error.
     fn srcOf(self: *Parser, v: Value) Error!?ir.Src {
         if (self.isSym(v, "$")) return null;
         if (self.rule_body) return self.fail("a rule body reads $ only");
@@ -360,7 +362,8 @@ const Parser = struct {
         for (items, 0..) |x, i| {
             if (self.isSrcSym(x)) {
                 const sym = x.asSymbolId();
-                if (self.sources.items.len == 0 and (i != 0 or !self.isSym(x, "$"))) return self.fail(":in starts with $");
+                if (self.sources.items.len == 0 and i != 0) return self.fail(":in starts with a data source");
+                if (i != 0 and self.isSym(x, "$")) return self.fail("$ names the first data source; declare it first");
                 for (self.sources.items) |s| if (s == sym) return self.fail("duplicate data source in :in");
                 try out.append(self.arena, .{ .src = @intCast(self.sources.items.len) });
                 try self.sources.append(self.arena, sym);
@@ -382,7 +385,7 @@ const Parser = struct {
                 }
             } else return self.fail("unknown :in binding form");
         }
-        if (self.sources.items.len == 0) return self.fail(":in starts with $");
+        if (self.sources.items.len == 0) return self.fail(":in starts with a data source");
         return out.toOwnedSlice(self.arena);
     }
 
@@ -903,6 +906,24 @@ test "sources: $ first, $name prefixes on patterns, calls and rule calls" {
     try testing.expectEqual(@as(?ir.Src, 1), p.where[3].pred.args[0].src);
     try testing.expectEqual(@as(?ir.Src, 1), p.where[4].rule.src);
     try testing.expect(p.where[5].rule.src == null);
+
+    // The first source may carry any $name; $ and an unprefixed
+    // clause read it.
+    const named = b.vec(&.{
+        b.kw("find"),                                                b.sym("?n"),
+        b.kw("in"),                                                  b.sym("$db"),
+        b.sym("?e"),                                                 b.kw("where"),
+        b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?n") }),            b.vec(&.{ b.sym("$db"), b.sym("?e"), b.kw("b"), b.sym("_") }),
+        b.vec(&.{ b.sym("$"), b.sym("?e"), b.kw("c"), b.sym("_") }),
+    });
+    const pn = try parse(testing.allocator, &interner, named, &diag);
+    defer pn.deinit();
+    try testing.expectEqual(@as(usize, 1), pn.sources.len);
+    try testing.expectEqualStrings("$db", interner.symbolName(pn.sources[0]));
+    try testing.expect(pn.in[0] == .src and pn.in[0].src == 0);
+    try testing.expect(pn.where[0].pattern.src == null);
+    try testing.expectEqual(@as(?ir.Src, 0), pn.where[1].pattern.src);
+    try testing.expect(pn.where[2].pattern.src == null);
 
     for ([_]Value{
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("in"), b.sym("$2"), b.sym("$"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),

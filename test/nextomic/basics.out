@@ -6,14 +6,17 @@ ok a db-value is not its history view
 ok schema transaction is t=2
 ok attribute entities take ids in the attribute partition
 ok db-before and db-after bracket the transaction
-{:db/id 24, :db/ident :person/email, :db/valueType :db.type/string, :db/cardinality :db.cardinality/one, :db/unique :db.unique/identity, :db/index false, :db/isComponent false}
-{:db/id 31, :db/ident :person/home, :db/valueType :db.type/ref, :db/cardinality :db.cardinality/one, :db/index false, :db/isComponent true}
-{:db/id 32, :db/ident :addr/city, :db/valueType :db.type/string, :db/cardinality :db.cardinality/one, :db/index true, :db/isComponent false}
+{:db/id 24, :db/ident :person/email, :db/valueType :db.type/string, :db/cardinality :db.cardinality/one, :db/unique :db.unique/identity, :db/index false, :db/isComponent false, :db/fulltext false}
+{:db/id 31, :db/ident :person/home, :db/valueType :db.type/ref, :db/cardinality :db.cardinality/one, :db/index false, :db/isComponent true, :db/fulltext false}
+{:db/id 32, :db/ident :addr/city, :db/valueType :db.type/string, :db/cardinality :db.cardinality/one, :db/index true, :db/isComponent false, :db/fulltext false}
 ok ident round trips
 ok ident of an unknown eid is nil
 ok entid of an unknown ident is nil
 {ann 4294967296, bob 4294967298}
-[[4294967296 :person/name Ann 3 true] [4294967296 :person/email ann@example.com 3 true] [4294967296 :person/height 1.7 3 true] [4294967296 :person/born 1000000 3 true] [4294967296 :person/tags :staff 3 true] [4294967296 :person/tags :admin 3 true] [4294967296 :person/photo raw bytes 3 true] [4294967296 :person/uuid 0123abcd-4567-89ef-0123-456789abcdef 3 true] [4294967297 :addr/city Rome 3 true] [4294967296 :person/home 4294967297 3 true] [4294967296 :person/age 41 3 true] [4294967296 :person/active true 3 true] [4294967298 :person/name Bob 3 true] [4294967298 :person/email bob@example.com 3 true] [4294967298 :person/friends 4294967296 3 true] [70368744177667 :db/doc first import 3 true]]
+[[4294967296 :person/name Ann 3 true] [4294967296 :person/email ann@example.com 3 true] [4294967296 :person/height 1.7 3 true] [4294967296 :person/born 1000000 3 true] [4294967296 :person/tags :staff 3 true] [4294967296 :person/tags :admin 3 true] [4294967296 :person/photo raw bytes 3 true] [4294967296 :person/uuid 0123abcd-4567-89ef-0123-456789abcdef 3 true] [4294967297 :addr/city Rome 3 true] [4294967296 :person/home 4294967297 3 true] [4294967296 :person/age 41 3 true] [4294967296 :person/active true 3 true] [4294967298 :person/name Bob 3 true] [4294967298 :person/email bob@example.com 3 true] [4294967298 :person/friends 4294967296 3 true] [70368744177667 :db/doc first import 3 true] [34 :db/doc a portrait 3 true]]
+{:db/id 34, :db/ident :person/photo, :db/valueType :db.type/bytes, :db/cardinality :db.cardinality/one, :db/index false, :db/isComponent false, :db/fulltext false, :db/doc a portrait}
+ok schema and the attribute entity agree on the doc
+ok the doc is absent from the view before it
 #nextomic/entity {:db/id 4294967296}
 {:person/name Ann, :person/email ann@example.com, :person/height 1.7, :person/born 1000000, :person/tags #{:staff :admin}, :person/photo raw bytes, :person/uuid 0123abcd-4567-89ef-0123-456789abcdef, :person/home 4294967297, :person/age 41, :person/active true, :db/id 4294967296}
 {:db/id 4294967298, :person/name Bob, :person/email bob@example.com, :person/friends #{4294967296}}
@@ -64,4 +67,12 @@ Bob
 Robert
 {:error :nextomic/schema, :message a unique attribute is cardinality one, :attr :person/email}
 {:error :nextomic/conflict, :e 25, :a :db/valueType}
+9
+10
+{:error :nextomic/conflict, :e 4294967298, :a :person/age}
+{:error :nextomic/conflict, :e 4294967298, :a :person/age}
+{:error :nextomic/conflict, :e 4294967298, :a :person/age}
+{:error :nextomic/conflict, :e 4294967298, :a :person/age}
+{:db/id 4294967298, :person/age 11}
+{:db/id 4294967298, :person/age 12}
 :basics-done

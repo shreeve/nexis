@@ -55,9 +55,14 @@
                         [:db/add "bob" :person/name "Bob"]
                         [:db/add "bob" :person/email "bob@example.com"]
                         [:db/add "bob" :person/friends "ann"]
-                        [:db/add "datomic.tx" :db/doc "first import"]]))
+                        [:db/add "datomic.tx" :db/doc "first import"]
+                        [:db/add :person/photo :db/doc "a portrait"]]))
 (println (:tempids r1))
 (println (facts r1))
+(println (get (d/schema (d/db c)) :person/photo))
+(t/check "schema and the attribute entity agree on the doc"
+       (= "a portrait" (:db/doc (get (d/schema (d/db c)) :person/photo)) (:db/doc (d/entity (d/db c) :person/photo))))
+(t/check "the doc is absent from the view before it" (nil? (:db/doc (get (d/schema (:db-before r1)) :person/photo))))
 (def ann (get (:tempids r1) "ann"))
 (def bob (get (:tempids r1) "bob"))
 (println (d/entity (d/db c) ann))
@@ -163,6 +168,23 @@
 (println (:person/full-name (d/entity (d/db c) bob)))
 (println (t/caught (d/transact! c [[:db/add :person/email :db/cardinality :db.cardinality/many]])))
 (println (t/caught (d/transact! c [[:db/add :person/age :db/valueType :db.type/string]])))
+
+; tx-data is a set: a bare retract or a retractEntity expands against
+; the committed values, so an add under the same attribute stands in
+; either order; re-asserting a current datom and retracting it in one
+; transaction is a conflict in either order.
+(d/transact! c [[:db/add bob :person/age 9] [:db/retract bob :person/age]])
+(println (:person/age (d/entity (d/db c) bob)))
+(d/transact! c [[:db/retract bob :person/age] [:db/add bob :person/age 10]])
+(println (:person/age (d/entity (d/db c) bob)))
+(println (t/caught (d/transact! c [[:db/add bob :person/age 10] [:db/retract bob :person/age]])))
+(println (t/caught (d/transact! c [[:db/retract bob :person/age] [:db/add bob :person/age 10]])))
+(println (t/caught (d/transact! c [[:db/add bob :person/age 10] [:db/retract bob :person/age 10]])))
+(println (t/caught (d/transact! c [[:db/add bob :person/age 10] [:db/retractEntity bob]])))
+(d/transact! c [[:db/add bob :person/age 11] [:db/retractEntity bob]])
+(println (d/touch (d/entity (d/db c) bob)))
+(d/transact! c [[:db/retractEntity bob] [:db/add bob :person/age 12]])
+(println (d/touch (d/entity (d/db c) bob)))
 
 (d/release c)
 :basics-done

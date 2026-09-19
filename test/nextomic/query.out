@@ -73,6 +73,7 @@ nil
 ([Bob 25 26])
 ([Edward] [Flo])
 ([Flo])
+([Bob])
 ([Ann])
 ([Ann Ann Arbor :size/small] [Cy Cyprus :size/large])
 ([:size/large 1] [:size/small 1])
@@ -106,6 +107,7 @@ ok explain returns the plan as text
 :boom
 ok the store still works after a predicate threw
 ok results are ordinary sets
+[false true]
 ([Ann] [Bob])
 ([Ann Ann runs the red team; loves Café Noir.])
 ([Ann])

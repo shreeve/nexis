@@ -47,5 +47,24 @@
 (println (t/caught (d/index-range db :item/name "A" "Z")))
 (println (t/caught (d/index-range db :item/qty "a" nil)))
 (println (t/caught (d/index-range db :item/nope 1 2)))
+
+; Long strings: the index orders two values that agree on their first
+; 64 bytes by hash when either is over 96 bytes; index-range places
+; them by value.
+(defn a-times [n] (apply str (repeat n "a")))
+(def s60 (a-times 60))
+(def s95 (a-times 95))
+(def s97 (a-times 97))
+(def r3 (d/transact! c [{:db/id "x" :item/sku s60} {:db/id "y" :item/sku s95} {:db/id "z" :item/sku s97}
+                        {:db/id "b" :item/sku (str (a-times 64) "b")}]))
+(def db3 (d/db c))
+(defn lens [ds] (mapv (fn [[e a v tx added]] (count v)) ds))
+(println (lens (d/index-range db3 :item/sku s60 s97)))
+(println (lens (d/index-range db3 :item/sku s95 nil)))
+(println (lens (d/index-range db3 :item/sku nil s95)))
+(println (lens (d/index-range db3 :item/sku s97 nil)))
+(println (lens (d/index-range db3 :item/sku "a" "b")))
+(println (lens (d/index-range (d/as-of db3 (:tx r3)) :item/sku s60 s97)))
+(t/check "the view before the long values has none of them" (empty? (d/index-range db :item/sku s60 nil)))
 (d/release c)
 :datoms-done
