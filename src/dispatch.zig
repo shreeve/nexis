@@ -91,8 +91,8 @@ pub const EqCategory = enum(u8) {
 };
 
 /// Maps a `Kind` to its equality category. Amended whenever a new
-/// cross-kind equality category gains a member. Today `.list` is the
-/// only sequential kind; `.persistent_vector` will join when it ships.
+/// cross-kind equality category gains a member: `.list` and
+/// `.persistent_vector` are the sequential kinds.
 pub fn eqCategory(k: Kind) EqCategory {
     return switch (k) {
         .list, .persistent_vector => .sequential,
@@ -133,7 +133,7 @@ pub fn domainByteForKind(k: Kind) u8 {
 /// `heapHashBase` + the equality-category domain mixer. Result
 /// satisfies the bedrock `(= x y) ⇒ (hash x) = (hash y)` invariant
 /// end-to-end, including across cross-kind equality categories
-/// (sequential collections today; associative / set when those land).
+/// (sequential, associative and set collections).
 pub fn hashValue(v: Value) u64 {
     const k = v.kind();
     if (k.isHeap()) {
@@ -246,10 +246,10 @@ pub fn equal(a: Value, b: Value) bool {
     }
 }
 
-/// Cross-kind associative equality. Today only `persistent_map` lives
-/// in the `.associative` category so this reduces to kind-local
-/// dispatch; the shape parallels `sequentialEqual` so a second
-/// associative member would slot in naturally.
+/// Cross-kind associative equality. `persistent_map` is the only
+/// member of the `.associative` category, so this reduces to
+/// kind-local dispatch; the shape parallels `sequentialEqual` so a
+/// second associative member slots in the same way.
 ///
 /// Semantic strategy is provided by `champ.equalMap` which handles all
 /// four subkind-pair combinations (array-map × array-map, array-map ×
@@ -265,8 +265,8 @@ fn associativeEqual(a: Value, b: Value) bool {
     return champ.equalMap(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &hashValue, &equal);
 }
 
-/// Cross-kind set equality. Parallel to `associativeEqual`. Today only
-/// `persistent_set` lives in the `.set` category. Named
+/// Cross-kind set equality. Parallel to `associativeEqual`;
+/// `persistent_set` is the only member of the `.set` category. Named
 /// `setEqualCategory` (not `setEqual`) because `setEqual` is already
 /// an identifier exported by `champ` for the same-kind entry point.
 fn setEqualCategory(a: Value, b: Value) bool {

@@ -2184,15 +2184,18 @@ fn keyExtremum(vm: *VM, want_max: bool, args: []const Value) VmError!Value {
     const k = args[0];
     var best = args[1];
     var best_key = try vm.callValue(k, &.{best});
+    // The best key so far is the one value kept across the next
+    // call (GC.md §11.5); it goes on the root stack when it changes.
     const scope = vm.rootScope();
     defer scope.release();
+    try scope.push(best_key);
     for (args[2..]) |x| {
-        try scope.push(best_key);
         const key = try vm.callValue(k, &.{x});
         const keep_best = try vm_mod.numCompare(if (want_max) .gt else .lt, best_key, key);
         if (!keep_best) {
             best = x;
             best_key = key;
+            try scope.push(best_key);
         }
     }
     return best;

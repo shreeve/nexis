@@ -56,8 +56,8 @@ const Usage =
     \\transact!, q, pull, as-of/since/history, with), nexis.string,
     \\nexis.test (deftest, is, testing, run-tests), nexis.pprint
     \\(pprint), nexis.math (sqrt, pow, floor, ceil, round, PI, E),
-    \\nexis.internal. See README.md, docs/TOOLING.md and
-    \\docs/NEXTOMIC.md.
+    \\nexis.simd (typed-vector kernels), nexis.internal. See README.md,
+    \\docs/TOOLING.md and docs/NEXTOMIC.md.
     \\
     \\Examples: examples/*.nx (examples/nextomic-app.nx for Nextomic).
     \\

@@ -736,8 +736,6 @@ pub fn build(b: *std.Build) void {
         .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "typed_vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol", "nextomic" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
         .{ .name = "disasm", .path = "src/disasm.zig", .imports = &.{ "vm", "value", "format", "intern" } },
-        // Appended after `loader` so the `quick` step's index
-        // assertions below hold.
         .{ .name = "typed_vector", .path = "src/coll/typed_vector.zig", .imports = &.{ "value", "heap", "hash", "bignum" } },
     };
 
@@ -1406,38 +1404,18 @@ pub fn build(b: *std.Build) void {
     // scripts; run it before committing.
     //
     // A new language module joins by an entry in `runtime_test_files`
-    // and the matching `runtime_test_runs[N]` line below.
+    // and its name in `quick_binaries` below.
     // -------------------------------------------------------------------------
 
     const quick_step = b.step("quick", "The inner loop: language, eval-pipeline and Nextomic unit + property binaries (seconds)");
-    // Indices into runtime_test_files: atom = 11, record = 12,
-    // protocol = 13, vm = 19, format = 20, compile = 21,
-    // expand = 22, stdlib = 23, loader = 24. Asserted at build
-    // time so re-ordering trips this loudly instead of silently
-    // running the wrong tests.
-    comptime {
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[11].name, "atom"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[12].name, "record"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[13].name, "protocol"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[19].name, "vm"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[20].name, "format"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[21].name, "compile"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[22].name, "expand"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[23].name, "stdlib"));
-        std.debug.assert(std.mem.eql(u8, runtime_test_files[24].name, "loader"));
+    // Language binaries, by name in `runtime_test_files`.
+    const quick_binaries = [_][]const u8{ "atom", "record", "protocol", "vm", "format", "compile", "expand", "stdlib", "loader", "disasm" };
+    for (quick_binaries) |name| {
+        const index = for (runtime_test_files, 0..) |f, i| {
+            if (std.mem.eql(u8, f.name, name)) break i;
+        } else @panic("quick: no such runtime test binary");
+        quick_step.dependOn(&runtime_test_runs[index].step);
     }
-    // Language binaries: atom + record + protocol +
-    // vm + format + compile + expand + stdlib + loader.
-    quick_step.dependOn(&runtime_test_runs[11].step);
-    quick_step.dependOn(&runtime_test_runs[12].step);
-    quick_step.dependOn(&runtime_test_runs[13].step);
-    quick_step.dependOn(&runtime_test_runs[19].step);
-    quick_step.dependOn(&runtime_test_runs[20].step);
-    quick_step.dependOn(&runtime_test_runs[21].step);
-    quick_step.dependOn(&runtime_test_runs[22].step);
-    quick_step.dependOn(&runtime_test_runs[23].step);
-    quick_step.dependOn(&runtime_test_runs[24].step);
-    quick_step.dependOn(&runtime_test_runs[25].step);
     // Closure-capture and emitter property tests (COMPILER.md §9.4).
     quick_step.dependOn(&run_prop_compile_tests.step);
     // Eval-pipeline integration tests.

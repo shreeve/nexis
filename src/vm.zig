@@ -2319,8 +2319,9 @@ pub const VM = struct {
     /// reached through the compiler hooks) without retargeting the
     /// frame that is executing. The VM is left as it was found,
     /// idle or mid-execution; a throw the routine does not catch
-    /// propagates as `UncaughtThrow` or, when a handler above the
-    /// call takes it, `ControlTransferred`.
+    /// propagates as `UncaughtThrow` or, when the caller's handler
+    /// (one installed beneath the nested frame) takes it,
+    /// `ControlTransferred`, exactly as `callValue` reports it.
     pub fn runRoutine(self: *VM, routine: *const Routine) VmError!Value {
         if (routine.upvalue_count != 0) return VmError.CaptureCountMismatch;
         const base_slot: usize = self.stack.items.len;
@@ -2601,6 +2602,9 @@ pub const VM = struct {
     /// forms on one VM whose namespaces, interner and runtime
     /// values persist between them.
     pub fn retargetTop(self: *VM, routine: *const Routine) VmError!void {
+        // A failed run leaves its frames for the trace;
+        // `resetAfterError` discards them before the next form.
+        std.debug.assert(self.frames.items.len == 1);
         const top = &self.frames.items[0];
         top.routine = routine;
         top.pc = 0;
@@ -2746,13 +2750,10 @@ pub const VM = struct {
     /// just like a user-level `(throw)`.
     fn handleRuntimeError(self: *VM, err: VmError) VmError!void {
         const kw_name = vmErrorToKeywordName(err) orelse return err;
-        // Only translate to a throwable Value if there's an
-        // active handler that could catch it. Otherwise let
-        // the raw VmError propagate — preserves backward
-        // compat with existing tests that assert specific
-        // VmError variants AND matches the principle of
-        // least surprise: programs that don't opt into
-        // try/catch see the original error taxonomy.
+        // Translate to a throwable Value only when a handler is
+        // in force to take it; otherwise the raw VmError
+        // propagates, so a program that does not opt into
+        // try/catch sees the original error taxonomy.
         if (self.findThrowTarget() == null) return err;
         const interner = self.ensureInterner();
         const id = interner.internKeyword(kw_name) catch return err;
@@ -3022,17 +3023,11 @@ pub const VM = struct {
         // empty list (if argc == fixed_arity) or a cons list
         // of the excess args in their original order.
         //
-        // CRITICAL ORDERING:
-        //   (1) build the rest list FIRST, while excess-arg
-        //       slots still hold the live values;
-        //   (2) install at slot[fixed];
-        //   (3) ONLY THEN reset the local slots to nil.
-        // The earlier draft reset first, which clobbered the
-        // excess-arg slots before construction read them and
-        // produced rest lists of nils. The reset loop below
-        // is now careful to start AT THE EARLIEST after the
-        // rest slot (variadic: fixed+1) or after the args
-        // (non-variadic: argc).
+        // Ordering: build the rest list first, while the
+        // excess-arg slots still hold the live values; install
+        // it at slot[fixed]; only then reset the local slots to
+        // nil, starting after the rest slot (variadic: fixed+1)
+        // or after the args (non-variadic: argc).
         if (callee_routine.variadic) {
             const heap = self.ensureHeap();
             var rest = list_mod.empty(heap) catch return VmError.OutOfMemory;

@@ -1045,7 +1045,7 @@ handler is active):
 | `:not-dynamic` | `binding` (`push-thread-bindings`) or `set!` (`var-set`) on a Var not marked `^:dynamic` (§6.5) |
 | `:no-thread-binding` | `set!` (`var-set`) on a dynamic Var with no `binding` of it in force (§6.5) |
 | `:arithmetic-overflow` | A count or identifier the runtime produces does not fit in a fixnum. No `math:*` opcode or arithmetic native raises it: an integer result outside i48 promotes to a bignum |
-| `:divide-by-zero` | Integer `/`, `quot`, `rem`, `mod` with a zero divisor (float division by zero is IEEE) |
+| `:divide-by-zero` | `/` with an integer zero divisor, and `quot`, `rem`, `mod` with a zero divisor of either kind (`(/ 1 0.0)` is IEEE infinity; `(mod 1 0.0)` raises, as in Clojure) |
 | `:index-out-of-bounds` | `nth` and friends past the end |
 | `:db-error`, `:db-closed`, `:invalid-durable-ref`, `:codec-failed`, `:tx-closed` | Storage natives (`docs/DB.md`) |
 | `:not-derefable` | `deref` of a value that is not a durable ref, Var or atom |
