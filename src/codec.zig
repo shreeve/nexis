@@ -17,10 +17,10 @@
 //! Scope (CODEC.md §1):
 //!   In: nil, bool, char, fixnum, float, keyword, symbol, string,
 //!       bignum, list, persistent_vector, persistent_map,
-//!       persistent_set.
+//!       persistent_set, typed_vector.
 //!   Out: function, var_, transient, error_, meta_symbol,
-//!        byte_vector, typed_vector, durable_ref (non-serializable
-//!        or reserved-unallocated). Public API returns
+//!        byte_vector, durable_ref (non-serializable or
+//!        reserved-unallocated). Public API returns
 //!        `error.UnserializableKind`.
 //!
 //! Module graph (one-way terminal; dispatch / gc / transient /
@@ -35,7 +35,8 @@
 //!     ├── @import("bignum")
 //!     ├── @import("list")
 //!     ├── @import("vector")
-//!     └── @import("champ")
+//!     ├── @import("champ")
+//!     └── @import("typed_vector")
 //!
 //! Nothing imports `codec.zig`.
 
@@ -49,6 +50,7 @@ const bignum = @import("bignum");
 const list = @import("list");
 const vector = @import("vector");
 const champ = @import("champ");
+const typed_vector = @import("typed_vector");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -71,8 +73,8 @@ pub const version_minor: u8 = 0;
 pub const CodecError = error{
     /// Attempt to encode/decode a kind excluded from the
     /// Serializable set — function, var_, transient, error_,
-    /// meta_symbol, byte_vector, typed_vector, durable_ref. Public
-    /// API typed error.
+    /// meta_symbol, byte_vector, durable_ref. Public API typed
+    /// error.
     UnserializableKind,
 
     /// Decode ran out of bytes mid-value.
@@ -100,9 +102,10 @@ pub const CodecError = error{
     InvalidCharScalar,
 
     /// Per-kind payload field is structurally invalid: bignum
-    /// sign byte not in {0, 1}, or similar per-kind field.
-    /// Distinct from InvalidKindByte (which is about the top-level
-    /// kind tag).
+    /// sign byte not in {0, 1}, a typed-vector element tag that
+    /// names no element type, or similar per-kind field. Distinct
+    /// from InvalidKindByte (which is about the top-level kind
+    /// tag).
     MalformedPayload,
 };
 
@@ -383,9 +386,20 @@ fn encodeValue(
                 try encodeValue(buf, allocator, interner, elem);
             }
         },
+        // `[23] [elem tag] [count] [u64 LE × count]`: i64 as two's
+        // complement bits, f64 as canonical IEEE bits (CODEC.md §2).
+        .typed_vector => {
+            try writeByte(buf, allocator, @intFromEnum(Kind.typed_vector));
+            const elem = typed_vector.elemType(v);
+            try writeByte(buf, allocator, @intFromEnum(elem));
+            try writeUleb128(buf, allocator, @as(u64, typed_vector.count(v)));
+            switch (elem) {
+                .i64 => for (typed_vector.i64Elems(v)) |x| try writeU64Le(buf, allocator, @bitCast(x)),
+                .f64 => for (typed_vector.f64Elems(v)) |x| try writeU64Le(buf, allocator, @bitCast(hash_mod.canonicalizeFloat(x))),
+            }
+        },
         // Non-serializable kinds (CODEC.md §3).
         .byte_vector,
-        .typed_vector,
         .function,
         .var_,
         .durable_ref,
@@ -539,11 +553,35 @@ fn decodeValue(
             }
             break :blk s;
         },
+        @intFromEnum(Kind.typed_vector) => blk: {
+            const elem = typed_vector.ElemType.fromTag(try readByte(bytes, cursor)) orelse return CodecError.MalformedPayload;
+            const count_u64 = try readUleb128(bytes, cursor);
+            const n: usize = std.math.cast(usize, count_u64) orelse return CodecError.InvalidLeb128;
+            // The element bytes are fixed-width, so the count says
+            // how much input must remain; check before allocating so
+            // a corrupt count cannot demand a huge scratch buffer.
+            const need = std.math.mul(usize, n, 8) catch return CodecError.TruncatedInput;
+            if (cursor.* + need > bytes.len) return CodecError.TruncatedInput;
+            const raw = try readBytes(bytes, cursor, need);
+            break :blk switch (elem) {
+                .i64 => tv: {
+                    const elems = try heap.backing.alloc(i64, n);
+                    defer heap.backing.free(elems);
+                    for (elems, 0..) |*slot, i| slot.* = @bitCast(std.mem.readInt(u64, raw[i * 8 ..][0..8], .little));
+                    break :tv try typed_vector.fromI64Slice(heap, elems);
+                },
+                .f64 => tv: {
+                    const elems = try heap.backing.alloc(f64, n);
+                    defer heap.backing.free(elems);
+                    for (elems, 0..) |*slot, i| slot.* = @bitCast(std.mem.readInt(u64, raw[i * 8 ..][0..8], .little));
+                    break :tv try typed_vector.fromF64Slice(heap, elems);
+                },
+            };
+        },
         // Recognized-but-non-serializable kinds (CODEC.md §3).
         // These kind bytes ARE valid `Kind` enum values; they're
         // just not in the serializable subset.
         @intFromEnum(Kind.byte_vector),
-        @intFromEnum(Kind.typed_vector),
         @intFromEnum(Kind.function),
         @intFromEnum(Kind.var_),
         @intFromEnum(Kind.durable_ref),
@@ -928,6 +966,64 @@ test "roundtrip: nested structure (map whose values are lists of strings)" {
             try testing.expectEqual(@as(usize, 2), list.count(v));
         },
     }
+}
+
+test "roundtrip: typed vectors of both element types, byte-stable" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+
+    const iv = try typed_vector.fromI64Slice(&ctx.heap, &.{ 1, -2, std.math.maxInt(i64), std.math.minInt(i64) });
+    const fv = try typed_vector.fromF64Slice(&ctx.heap, &.{ 1.5, -0.0, std.math.inf(f64), std.math.nan(f64) });
+    const ev = try typed_vector.fromF64Slice(&ctx.heap, &.{});
+
+    const gi = try ctx.roundtrip(iv);
+    try testing.expect(gi.kind() == .typed_vector);
+    try testing.expectEqual(typed_vector.ElemType.i64, typed_vector.elemType(gi));
+    try testing.expectEqualSlices(i64, typed_vector.i64Elems(iv), typed_vector.i64Elems(gi));
+
+    const gf = try ctx.roundtrip(fv);
+    try testing.expectEqual(typed_vector.ElemType.f64, typed_vector.elemType(gf));
+    const src_bits: []const u64 = @ptrCast(typed_vector.f64Elems(fv));
+    const got_bits: []const u64 = @ptrCast(typed_vector.f64Elems(gf));
+    try testing.expectEqualSlices(u64, src_bits, got_bits);
+
+    const ge = try ctx.roundtrip(ev);
+    try testing.expectEqual(@as(usize, 0), typed_vector.count(ge));
+
+    // Fixed-width elements in a fixed order: the re-encode is the
+    // same bytes.
+    const b1 = try encode(testing.allocator, &ctx.interner, fv);
+    defer testing.allocator.free(b1);
+    const b2 = try encode(testing.allocator, &ctx.interner, gf);
+    defer testing.allocator.free(b2);
+    try testing.expectEqualSlices(u8, b1, b2);
+    // `[1 0] [23] [elem = 3] [count = 4] [4 × 8 bytes]`.
+    try testing.expectEqual(@as(usize, 2 + 1 + 1 + 1 + 32), b1.len);
+    try testing.expectEqual(@as(u8, @intFromEnum(Kind.typed_vector)), b1[2]);
+    try testing.expectEqual(@as(u8, 3), b1[3]);
+    try testing.expectEqual(@as(u8, 4), b1[4]);
+}
+
+test "decode: typed vector with an unknown element tag → MalformedPayload" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const bytes = [_]u8{ 1, 0, @intFromEnum(Kind.typed_vector), 2, 0 };
+    try testing.expectError(
+        CodecError.MalformedPayload,
+        decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
+    );
+}
+
+test "decode: typed vector whose count exceeds the input → TruncatedInput without allocating" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    // Count 2^56 with eight bytes of elements behind it.
+    const bytes = [_]u8{ 1, 0, @intFromEnum(Kind.typed_vector), 1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try testing.expectError(
+        CodecError.TruncatedInput,
+        decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
+    );
+    try testing.expectEqual(@as(usize, 0), ctx.heap.liveCount());
 }
 
 // ---- Error surface ----

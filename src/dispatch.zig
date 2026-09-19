@@ -28,8 +28,9 @@
 //!     ├─ @import("bignum")       (hashHeader + limbsEqual)
 //!     ├─ @import("list")         (hashSeq + equalSeq + Cursor)
 //!     ├─ @import("vector")       (hashSeq + equalSeq + Cursor; cross-kind sequential)
-//!     └─ @import("champ")         (hashMap + equalMap + hashSet + equalSet;
-//!                                  associative + set categories)
+//!     ├─ @import("champ")         (hashMap + equalMap + hashSet + equalSet;
+//!     │                            associative + set categories)
+//!     └─ @import("typed_vector") (hashHeader + equalHeaders; kind-local)
 //!
 //! No heap-kind module imports `dispatch.zig`. Collection kinds whose
 //! hash/equal is recursive over their elements (list, vector, map,
@@ -63,6 +64,7 @@ const vector = @import("vector");
 const nextomic_handle = @import("nextomic_handle");
 const bignum = @import("bignum");
 const champ = @import("champ");
+const typed_vector = @import("typed_vector");
 const transient = @import("transient");
 const db = @import("db");
 const atom = @import("atom");
@@ -159,6 +161,9 @@ pub fn heapHashBase(v: Value) u64 {
         .persistent_vector => vector.hashSeq(h, &hashValue),
         .persistent_map => champ.hashMap(h, &hashValue),
         .persistent_set => champ.hashSet(h, &hashValue),
+        // Typed vectors are kind-local: the element type tag and the
+        // unboxed elements, never comparable with a persistent vector.
+        .typed_vector => typed_vector.hashHeader(h),
         // Durable refs hash on the identity triple only
         // (store_id ++ tree_name ++ key_bytes) per PLAN §15.2 and
         // SEMANTICS.md §3.2. The advisory `conn` pointer is NOT
@@ -192,8 +197,8 @@ pub fn heapHashBase(v: Value) u64 {
                 "Call persistentBang first, or avoid using transients as map keys / set elements.",
             .{},
         ),
-        // Future: .byte_vector, .typed_vector, .function, .var_,
-        // .durable_ref, .error_, .meta_symbol.
+        // No implementation: .byte_vector, .function, .var_,
+        // .error_, .meta_symbol.
         else => std.debug.panic(
             "dispatch.heapHashBase: kind {s} not implemented",
             .{@tagName(k)},
@@ -349,6 +354,8 @@ pub fn heapEqual(a: Value, b: Value) bool {
         .persistent_vector => vector.equalSeq(ah, bh, &equal),
         .persistent_map => champ.equalMap(ah, bh, &hashValue, &equal),
         .persistent_set => champ.equalSet(ah, bh, &hashValue, &equal),
+        // Same element type, same length, element-wise equal.
+        .typed_vector => typed_vector.equalHeaders(ah, bh),
         // Durable refs compare on the identity triple only
         // (store_id ++ tree_name ++ key_bytes) per PLAN §15.2,
         // SEMANTICS.md §2.6, and DB.md §7.1. The advisory `conn`

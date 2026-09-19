@@ -28,7 +28,8 @@
 //!     ├─ @import("bignum")  — bignum.trace
 //!     ├─ @import("list")    — list.trace
 //!     ├─ @import("vector")  — vector.trace
-//!     └─ @import("champ")    — champ.traceMap + champ.traceSet
+//!     ├─ @import("champ")    — champ.traceMap + champ.traceSet
+//!     └─ @import("typed_vector") — typed_vector.trace (leaf)
 //!
 //! Nothing imports gc.zig. Per-kind modules take the visitor as
 //! `anytype`; `gc.Collector` satisfies the duck-typed visitor ABI
@@ -42,6 +43,7 @@ const bignum = @import("bignum");
 const list = @import("list");
 const vector = @import("vector");
 const champ = @import("champ");
+const typed_vector = @import("typed_vector");
 const transient_mod = @import("transient");
 const db_mod = @import("db");
 const atom_mod = @import("atom");
@@ -102,6 +104,8 @@ pub const Collector = struct {
             .persistent_vector => vector.trace(h, self),
             .persistent_map => champ.traceMap(h, self),
             .persistent_set => champ.traceSet(h, self),
+            // Typed vectors are leaves: unboxed numbers, no children.
+            .typed_vector => typed_vector.trace(h, self),
             .transient => transient_mod.trace(h, self),
             // Durable refs have no heap children — store_id,
             // tree_name, key_bytes are all inline body bytes; the
@@ -129,7 +133,6 @@ pub const Collector = struct {
             // on a kind that SHOULD trace would create invisible
             // retention bugs.
             .byte_vector,
-            .typed_vector,
             .function,
             .var_,
             .error_,
