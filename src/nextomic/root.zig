@@ -11,6 +11,7 @@ pub const idents = @import("idents.zig");
 pub const schema = @import("schema.zig");
 pub const db = @import("db.zig");
 pub const transact = @import("transact.zig");
+pub const excise = @import("excise.zig");
 pub const relation = @import("relation.zig");
 pub const query = @import("query.zig");
 pub const pull = @import("pull.zig");
@@ -43,6 +44,7 @@ test {
     _ = schema;
     _ = db;
     _ = transact;
+    _ = excise;
     _ = relation;
     _ = query;
     _ = pull;

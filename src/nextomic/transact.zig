@@ -45,6 +45,7 @@ const idents_mod = @import("idents.zig");
 const schema_mod = @import("schema.zig");
 const db_mod = @import("db.zig");
 const marshal = @import("marshal.zig");
+const excise_mod = @import("excise.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -184,6 +185,31 @@ pub fn transactOps(conn: *Conn, arena: Allocator, ops: []const Op, options: Opti
     try ctx.ops.ensureTotalCapacityPrecise(arena, ops.len);
     for (ops) |op| try ctx.normaliseOp(op);
     return ctx.run();
+}
+
+pub const ExciseReport = struct {
+    report: Report,
+    /// The entity whose datoms went.
+    excised: u64,
+    /// History rows removed.
+    removed: u64,
+};
+
+/// Excise the datoms of entity `e` (a VM entity reference), under the
+/// attribute `a` when given (NEXTOMIC.md §4 "Excision"): one
+/// transaction whose only datom is its `:db/txInstant`, whose txlog
+/// entry carries the marker, and inside whose write transaction the
+/// datoms leave every tree and every txlog entry that held them.
+pub fn excise(conn: *Conn, arena: Allocator, e: Value, a: ?Value, options: Options) !ExciseReport {
+    var ctx = try Ctx.begin(conn, arena, options);
+    errdefer ctx.abort();
+    const ent = try ctx.entityFromVm(e);
+    if (ent == .tempid) return ctx.malformed("excision takes an existing entity");
+    const attr: ?Attr = if (a) |x| try ctx.attrFromVm(x) else null;
+    ctx.excision = .{ .e = ent, .a = attr };
+    try ctx.apply();
+    const report = try ctx.commit();
+    return .{ .report = report, .excised = ctx.excised[0], .removed = ctx.removed };
 }
 
 /// A speculative transaction (NEXTOMIC.md §6, row `with`): tx-data
@@ -381,6 +407,12 @@ const Ctx = struct {
     deltas: std.AutoHashMapUnmanaged(u32, i64) = .empty,
     /// The transaction's datoms in write order, built once by `write`.
     tx_data: []Datom = &.{},
+    /// The excision this transaction records, if it is one.
+    excision: ?struct { e: Ent, a: ?Attr } = null,
+    /// The marker of this transaction's txlog entry: the excised entity.
+    excised: []const u64 = &.{},
+    /// History rows an excision removed.
+    removed: u64 = 0,
 
     fn begin(conn: *Conn, arena: Allocator, options: Options) !Ctx {
         if (!conn.is_open) return error.Closed;
@@ -936,7 +968,46 @@ const Ctx = struct {
         try self.expandAll();
         try self.txInstant();
         try self.applySchema();
+        if (self.excision) |x| {
+            // Resolved before the write, which marks the entry with it.
+            const e = try self.resolveEnt(x.e);
+            if (e < key.user_partition_start or e >= key.user_partition_end) return self.malformed("excision takes a user entity");
+            self.excised = try self.arena.dupe(u64, &.{e});
+        }
         try self.write();
+        if (self.excision) |x| try self.runExcision(self.excised[0], if (x.a) |attr| attr.id else null);
+    }
+
+    /// Remove the datoms of `e` (under `a`) from the trees and the
+    /// txlog entries that held them, and settle the attribute counts.
+    fn runExcision(self: *Ctx, e: u64, a: ?u32) !void {
+        const store = self.conn.store;
+        const out = try excise_mod.removeDatoms(store, self.txn, self.arena, self.schema, e, a);
+        self.removed = out.removed;
+        var it = out.counts.iterator();
+        while (it.next()) |entry| {
+            const cur = try store.attrCount(self.txn, entry.key_ptr.*);
+            if (cur < entry.value_ptr.*) return error.Corrupted;
+            try store.writeAttrCount(self.txn, entry.key_ptr.*, cur - entry.value_ptr.*);
+            const g = try self.deltas.getOrPut(self.arena, entry.key_ptr.*);
+            if (!g.found_existing) g.value_ptr.* = 0;
+            g.value_ptr.* -= @intCast(entry.value_ptr.*);
+        }
+        const ids: datom_mod.IdSource = .{ .ctx = @ptrCast(self), .identId = &identIdOf, .attrType = &attrTypeOf };
+        const names: datom_mod.NameSource = .{ .ctx = @ptrCast(self), .identName = &identName };
+        try excise_mod.rewriteTxlog(store, self.txn, self.arena, out.ts, e, a, ids, names);
+    }
+
+    fn identIdOf(ctx: *anyopaque, name: []const u8) anyerror!?u32 {
+        const self: *Ctx = @ptrCast(@alignCast(ctx));
+        if (try self.minter.lookupName(name)) |id| return id;
+        return self.conn.store.retiredIdentId(self.txn, name);
+    }
+
+    fn attrTypeOf(ctx: *anyopaque, a: u32) anyerror!?key.ValueType {
+        const self: *Ctx = @ptrCast(@alignCast(ctx));
+        const attr = self.schema.attr(a) orelse return null;
+        return attr.value_type;
     }
 
     /// Commit, then publish the mints and update the schema
@@ -1601,7 +1672,7 @@ const Ctx = struct {
         var scratch = std.heap.ArenaAllocator.init(self.conn.gpa);
         defer scratch.deinit();
         const names: datom_mod.NameSource = .{ .ctx = @ptrCast(self), .identName = &identName };
-        const entry = try datom_mod.encodeTxlog(scratch.allocator(), self.now_ms, self.tx_data, names);
+        const entry = try datom_mod.encodeTxlog(scratch.allocator(), self.now_ms, self.tx_data, self.excised, names);
         try store.putTxlog(self.txn, self.t, entry);
 
         try store.writeT(self.txn, self.t);
@@ -3170,6 +3241,91 @@ test "an ident rename retires the old name; cardinality changes under the data's
     try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{
         .{ .retract = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
     }, .{}));
+}
+
+test "excision removes an entity's datoms from every view and rewrites the txlog" {
+    const tc = try TestConn.init("tx_excise");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const email = try attrId(tc, "user/email");
+    const name = try attrId(tc, "user/name");
+    const friend = try attrId(tc, "user/friend");
+    var fault: Fault = .{};
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = email }, .v = .{ .val = .{ .string = "a@x" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Bob" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = friend }, .v = .{ .entity = .{ .tempid = .{ .string = "a" } } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    const b = r1.tempids[1].eid;
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Anne" } } } },
+    }, .{});
+    const before = try tc.conn.db();
+
+    // One attribute: its rows go from every view, the rest stay.
+    const x = try excise(tc.conn, arena, value.fromFixnum(@intCast(a)).?, value.fromFixnum(name).?, .{});
+    try testing.expectEqual(r2.t + 1, x.report.t);
+    try testing.expectEqual(a, x.excised);
+    try testing.expectEqual(@as(u64, 3), x.removed);
+    try testing.expectEqual(@as(usize, 1), x.report.tx_data.len);
+    const db3 = try tc.conn.db();
+    try testing.expectEqual(@as(usize, 1), (try db3.entity(arena, a)).len);
+    try testing.expectEqual(email, (try db3.entity(arena, a))[0].a);
+    try testing.expectEqual(@as(usize, 1), (try before.entity(arena, a)).len);
+    try testing.expectEqual(@as(usize, 0), (try db3.withHistory().datoms(arena, .eavt, .{ .e = a, .a = name })).len);
+    try testing.expectEqual(@as(usize, 0), (try db3.datoms(arena, .aevt, .{ .a = name, .e = a })).len);
+    try testing.expectEqual(@as(usize, 1), (try db3.datoms(arena, .aevt, .{ .a = name })).len);
+    try testing.expectEqual(@as(u64, 1), (try db3.attr(name)).?.count);
+    // The txlog: the entries that held the datoms lost them and carry
+    // the marker; the excising entry carries it too.
+    const log = try db_mod.txRange(tc.conn, arena, r1.t, null);
+    try testing.expectEqual(@as(usize, 3), log.len);
+    try testing.expectEqualSlices(u64, &.{a}, log[0].excised);
+    try testing.expectEqual(@as(usize, 4), log[0].datoms.len);
+    try testing.expectEqualSlices(u64, &.{a}, log[1].excised);
+    try testing.expectEqual(@as(usize, 1), log[1].datoms.len);
+    try testing.expectEqual(boot.tx_instant, log[1].datoms[0].a);
+    try testing.expectEqualSlices(u64, &.{a}, log[2].excised);
+    for (log) |entry| for (entry.datoms) |d| try testing.expect(!(d.e == a and d.a == name));
+
+    // The whole entity: gone everywhere; the ref to it from `b` stays.
+    const y = try excise(tc.conn, arena, value.fromFixnum(@intCast(a)).?, null, .{});
+    try testing.expectEqual(@as(u64, 1), y.removed);
+    const db4 = try tc.conn.db();
+    try testing.expectEqual(@as(usize, 0), (try db4.entity(arena, a)).len);
+    try testing.expectEqual(@as(usize, 0), (try before.entity(arena, a)).len);
+    try testing.expect((try db4.entid(arena, .{ .lookup = .{ .a = email, .v = .{ .string = "a@x" } } })) == null);
+    try testing.expectEqual(@as(usize, 2), (try db4.entity(arena, b)).len);
+    try testing.expectEqual(a, (try db4.entity(arena, b))[1].vals[0].ref);
+    try testing.expectEqual(@as(usize, 1), (try db4.datoms(arena, .vaet, .{ .v = try key.valBytes(arena, .{ .ref = a }) })).len);
+    const log2 = try db_mod.txRange(tc.conn, arena, r1.t, r1.t + 1);
+    try testing.expectEqual(@as(usize, 3), log2[0].datoms.len);
+    for (log2[0].datoms) |d| try testing.expect(d.e == b or d.e == key.txEntity(r1.t));
+    // An excised entity is still addressable: excising it again removes nothing.
+    const z = try excise(tc.conn, arena, value.fromFixnum(@intCast(a)).?, null, .{});
+    try testing.expectEqual(@as(u64, 0), z.removed);
+
+    // Refusals: an attribute or transaction entity, a tempid, an
+    // unallocated id, an unknown attribute; nothing is recorded.
+    const basis = (try tc.conn.db()).basis;
+    try testing.expectError(error.TxData, excise(tc.conn, arena, value.fromFixnum(name).?, null, .{ .fault = &fault }));
+    try testing.expectError(error.TxData, excise(tc.conn, arena, value.fromFixnum(@intCast(key.txEntity(r1.t))).?, null, .{}));
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    try testing.expectError(error.TxData, excise(tc.conn, arena, try string_mod.fromBytes(&heap, "tmp"), null, .{}));
+    try testing.expectError(error.NoEntity, excise(tc.conn, arena, value.fromFixnum(@intCast(key.user_partition_start + 99)).?, null, .{}));
+    try testing.expectError(error.UnknownAttribute, excise(tc.conn, arena, value.fromFixnum(@intCast(b)).?, value.fromFixnum(9999).?, .{ .fault = &fault }));
+    try testing.expectEqual(basis, (try tc.conn.db()).basis);
+    // Inside a held `with`, excision is nested.
+    const w = try withOps(tc.conn, arena, &.{}, .{});
+    defer w.destroy();
+    try testing.expectError(error.Nested, excise(tc.conn, arena, value.fromFixnum(@intCast(b)).?, null, .{}));
 }
 
 /// `[:db.fn/cas e a old new]` as a VM value; `old` may be nil.

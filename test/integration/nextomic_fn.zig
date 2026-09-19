@@ -1,6 +1,6 @@
 //! test/integration/nextomic_fn.zig — transaction functions,
-//! `:db.fn/cas` and schema alteration through the shared fixture
-//! (NEXTOMIC.md §3).
+//! `:db.fn/cas`, schema alteration and excision through the shared
+//! fixture (NEXTOMIC.md §3, §4).
 //!
 //! Tx-data is read from source text, the functions a `:db.fn/call`
 //! names live in `nextomic_fx.zig`, and every case checks the report's
@@ -158,4 +158,42 @@ test "cardinality changes apply from the next transaction and keep their history
     try testing.expectEqualStrings("Annie", @import("string").asBytes((try fx.getName(now, "person/name")).?));
     const then = try fx.pullSrc(many.asOf(many.basis), "[:person/name]", eid);
     try testing.expectEqual(@as(usize, 2), @import("vector").count((try fx.getName(then, "person/name")).?));
+}
+
+test "excision empties the entity for pull and q on every view, and tx-range replays without it" {
+    const fx = try Fx.init("fn_excise");
+    defer fx.deinit();
+    const ann = try loadPeople(fx);
+    const a = fx.arena();
+    const eid = try std.fmt.allocPrint(a, "{d}", .{ann});
+    _ = try fx.transact(try std.fmt.allocPrint(a, "[[:db/add {d} :person/tags :red] [:db/add {d} :person/tags :blue] {{:db/id \"bob\" :person/name \"Bob\" :person/email \"bob@x\"}}]", .{ ann, ann }));
+    const before = try fx.db();
+    const hist = before.withHistory();
+
+    const x = try nextomic.transact.excise(fx.conn(), a, try fx.read(eid), try fx.kw("person/tags"), .{});
+    try testing.expectEqual(@as(u64, 2), x.removed);
+    const mid = try fx.db();
+    const pulled = try fx.pullSrc(mid, "[*]", eid);
+    try testing.expect((try fx.getName(pulled, "person/tags")) == null);
+    try testing.expect((try fx.getName(pulled, "person/name")) != null);
+    const pulled_before = try fx.pullSrc(before, "[*]", eid);
+    try testing.expect((try fx.getName(pulled_before, "person/tags")) == null);
+    try testing.expectEqual(@as(usize, 0), @import("champ").setCount(try fx.q(hist, "[:find ?t :where [?e :person/tags ?t]]")));
+
+    const y = try nextomic.transact.excise(fx.conn(), a, try fx.read("[:person/email \"ann@x\"]"), null, .{});
+    try testing.expectEqual(@as(u64, 3), y.removed);
+    const after = try fx.db();
+    try testing.expect((try fx.pullSrc(after, "[*]", eid)).isNil());
+    try testing.expect((try fx.pullSrc(before, "[*]", eid)).isNil());
+    try testing.expectEqual(@as(usize, 1), @import("champ").setCount(try fx.q(after, "[:find ?n :where [?e :person/name ?n]]")));
+    try testing.expectEqual(@as(usize, 1), @import("champ").setCount(try fx.q(after.withHistory(), "[:find ?n :where [?e :person/name ?n]]")));
+    // The log replays without Ann; the entries that held her are marked.
+    const log = try nextomic.db.txRange(fx.conn(), a, 3, null);
+    var marked: usize = 0;
+    for (log) |entry| {
+        for (entry.datoms) |d| try testing.expect(d.e != ann);
+        if (entry.excised.len > 0) marked += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), marked);
+    try testing.expectEqual(y.report.t, (try fx.db()).basis);
 }

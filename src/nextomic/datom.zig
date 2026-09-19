@@ -1,12 +1,14 @@
 //! datom.zig — the Datom struct, the txlog entry codec and uuid text.
 //!
 //! A txlog entry is the codec-encoded vector
-//! `[instant [e a v added] ...]` (NEXTOMIC.md §2, `nx/txlog`). Inside
-//! it `e` and `a` are fixnums, `added` a boolean and `v` the value in
-//! its natural VM shape: keywords by name (durable across stores),
-//! refs / longs / instants as fixnums, doubles as floats, uuids as
-//! canonical text, byte arrays as strings. The entry is self-describing
-//! given the attribute's value type, which the decoder asks for.
+//! `[instant [e a v added] ...]` (NEXTOMIC.md §2, `nx/txlog`), with a
+//! trailing map `{:excised [e ...]}` on an entry an excision touched
+//! (§4). Inside it `e` and `a` are fixnums, `added` a boolean and `v`
+//! the value in its natural VM shape: keywords by name (durable across
+//! stores), refs / longs / instants as fixnums, doubles as floats,
+//! uuids as canonical text, byte arrays as strings. The entry is
+//! self-describing given the attribute's value type, which the decoder
+//! asks for.
 
 const std = @import("std");
 const value = @import("value");
@@ -16,6 +18,7 @@ const string_mod = @import("string");
 const vector_mod = @import("vector");
 const codec_mod = @import("codec");
 const dispatch = @import("dispatch");
+const champ = @import("champ");
 const key = @import("key.zig");
 
 const Allocator = std.mem.Allocator;
@@ -47,6 +50,9 @@ pub const Datom = struct {
 pub const TxlogEntry = struct {
     instant: i64,
     datoms: []Datom,
+    /// The entities an excision removed datoms of from this entry, or
+    /// that this entry's own transaction excised; empty otherwise.
+    excised: []u64,
 };
 
 // =============================================================================
@@ -75,14 +81,16 @@ pub const IdSource = struct {
 // Encode
 // =============================================================================
 
-/// Encode a txlog entry into `arena`.
-pub fn encodeTxlog(arena: Allocator, instant: i64, datoms: []const Datom, names: NameSource) ![]u8 {
+/// Encode a txlog entry into `arena`; `excised` non-empty appends the
+/// marker map.
+pub fn encodeTxlog(arena: Allocator, instant: i64, datoms: []const Datom, excised: []const u64, names: NameSource) ![]u8 {
     var heap = Heap.init(arena);
     defer heap.deinit();
     var interner = Interner.init(arena);
     defer interner.deinit();
 
-    const elems = try arena.alloc(Value, datoms.len + 1);
+    const marker: usize = if (excised.len > 0) 1 else 0;
+    const elems = try arena.alloc(Value, datoms.len + 1 + marker);
     elems[0] = value.fromFixnum(instant) orelse return error.Corrupted;
     for (datoms, 0..) |d, i| {
         const v = try valToTxlogValue(&heap, &interner, d.v, names);
@@ -93,6 +101,13 @@ pub fn encodeTxlog(arena: Allocator, instant: i64, datoms: []const Datom, names:
             value.fromBool(d.added),
         };
         elems[i + 1] = try vector_mod.fromSlice(&heap, &row);
+    }
+    if (marker == 1) {
+        const ids = try arena.alloc(Value, excised.len);
+        for (ids, excised) |*out, e| out.* = fixnum(e) orelse return error.Corrupted;
+        var m = try champ.mapEmpty(&heap);
+        m = try champ.mapAssoc(&heap, m, try interner.internKeywordValue("excised"), try vector_mod.fromSlice(&heap, ids), &dispatch.hashValue, &dispatch.equal);
+        elems[datoms.len + 1] = m;
     }
     const vec = try vector_mod.fromSlice(&heap, elems);
     return codec_mod.encode(arena, &interner, vec);
@@ -143,7 +158,26 @@ pub fn decodeTxlog(arena: Allocator, bytes: []const u8, t: u64, ids: IdSource) !
     const inst = vector_mod.nth(vec, 0);
     if (inst.kind() != .fixnum) return error.Corrupted;
 
-    const datoms = try arena.alloc(Datom, n - 1);
+    // A trailing map is the excision marker.
+    var excised: []u64 = &.{};
+    var rows = n - 1;
+    const last = vector_mod.nth(vec, n - 1);
+    if (n > 1 and last.kind() == .persistent_map) {
+        rows -= 1;
+        const marked = switch (champ.mapGet(last, try interner.internKeywordValue("excised"), &dispatch.hashValue, &dispatch.equal)) {
+            .present => |v| v,
+            .absent => return error.Corrupted,
+        };
+        if (marked.kind() != .persistent_vector) return error.Corrupted;
+        excised = try arena.alloc(u64, vector_mod.count(marked));
+        var it = vector_mod.Cursor.init(marked);
+        var i: usize = 0;
+        while (it.next()) |x| : (i += 1) {
+            if (x.kind() != .fixnum or x.asFixnum() < 0) return error.Corrupted;
+            excised[i] = @intCast(x.asFixnum());
+        }
+    }
+    const datoms = try arena.alloc(Datom, rows);
     for (datoms, 1..) |*d, i| {
         const row = vector_mod.nth(vec, i);
         if (row.kind() != .persistent_vector or vector_mod.count(row) != 4) return error.Corrupted;
@@ -163,7 +197,7 @@ pub fn decodeTxlog(arena: Allocator, bytes: []const u8, t: u64, ids: IdSource) !
             .added = added.asBool(),
         };
     }
-    return .{ .instant = inst.asFixnum(), .datoms = datoms };
+    return .{ .instant = inst.asFixnum(), .datoms = datoms, .excised = excised };
 }
 
 fn txlogValueToVal(arena: Allocator, interner: *const Interner, v: Value, vt: ?ValueType, ids: IdSource) !Val {
@@ -287,15 +321,36 @@ test "txlog entry round trips every value type" {
         .{ .e = 1 << 33, .a = 8, .v = .{ .boolean = true }, .t = 0, .added = true },
         .{ .e = 1 << 33, .a = 9, .v = .{ .long = -99 }, .t = 0, .added = true },
     };
-    const bytes = try encodeTxlog(arena, 1234, &in, names);
+    const bytes = try encodeTxlog(arena, 1234, &in, &.{}, names);
     const out = try decodeTxlog(arena, bytes, 7, ids);
     try testing.expectEqual(@as(i64, 1234), out.instant);
     try testing.expectEqual(in.len, out.datoms.len);
+    try testing.expectEqual(@as(usize, 0), out.excised.len);
     for (in, out.datoms) |x, y| {
         try testing.expect(x.eqlFact(y));
         try testing.expectEqual(x.added, y.added);
         try testing.expectEqual(@as(u64, 7), y.t);
     }
+}
+
+test "the excision marker rides after the datoms" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dummy: u8 = 0;
+    const names: NameSource = .{ .ctx = @ptrCast(&dummy), .identName = &TestNames.identName };
+    const ids: IdSource = .{ .ctx = @ptrCast(&dummy), .identId = &TestNames.identId, .attrType = &TestNames.attrType };
+    const in = [_]Datom{.{ .e = 1 << 33, .a = 9, .v = .{ .long = 1 }, .t = 0, .added = true }};
+    const bytes = try encodeTxlog(arena, 5, &in, &.{ 1 << 33, 1 << 34 }, names);
+    const out = try decodeTxlog(arena, bytes, 3, ids);
+    try testing.expectEqual(@as(usize, 1), out.datoms.len);
+    try testing.expectEqualSlices(u64, &.{ 1 << 33, 1 << 34 }, out.excised);
+    // An entry emptied by excision keeps its instant and its marker.
+    const empty = try encodeTxlog(arena, 5, &.{}, &.{1 << 33}, names);
+    const out2 = try decodeTxlog(arena, empty, 3, ids);
+    try testing.expectEqual(@as(usize, 0), out2.datoms.len);
+    try testing.expectEqual(@as(i64, 5), out2.instant);
+    try testing.expectEqualSlices(u64, &.{1 << 33}, out2.excised);
 }
 
 test "uuid text round trip" {

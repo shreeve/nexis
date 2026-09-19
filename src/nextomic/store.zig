@@ -759,7 +759,7 @@ pub const Store = struct {
         while (it.next()) |e| try self.writeAttrCount(txn, e.key_ptr.*, e.value_ptr.*);
 
         const names: datom_mod.NameSource = .{ .ctx = @ptrCast(self), .identName = &bootIdentName };
-        const entry = try datom_mod.encodeTxlog(arena, now, datoms.items, names);
+        const entry = try datom_mod.encodeTxlog(arena, now, datoms.items, &.{}, names);
         try self.putTxlog(txn, boot.t, entry);
 
         try self.writeT(txn, boot.t);

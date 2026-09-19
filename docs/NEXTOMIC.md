@@ -56,7 +56,7 @@ not thread-safe; nothing else is).
 | `nx/aevt-h` | `[a:4][e:6][v][top:6]` | empty |
 | `nx/avet-h` | `[a:4][v][e:6][top:6]` | empty (indexed and unique attrs only) |
 | `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
-| `nx/txlog` | `[t:6]` | codec vector `[instant [e a v added] ...]` |
+| `nx/txlog` | `[t:6]` | codec vector `[instant [e a v added] ...]`, with a trailing map `{:excised [e ...]}` on an entry an excision touched |
 | `nx/idents` | `[0x00][utf8 text]` → id, `[0x01][id:4]` → text, `[0x02][utf8 text]` → id for a name a rename retired | |
 | `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"` | see §2.3 |
 
@@ -339,6 +339,31 @@ The txlog is the change feed: `(d/tx-range conn from to)` scans
 `nx/txlog` over `from ≤ t < to`; a bound that is `nil` or not given is
 open.
 
+**Excision.** `(d/excise! conn e)` removes every datom whose entity is
+`e`, current and history, from all eight index trees;
+`(d/excise! conn e attr)` those under one attribute. It is a
+transaction: it takes the next `t`, its only datom is its
+`:db/txInstant`, and everything happens in its one write transaction.
+Inside it, EAVT and EAVT-h lose the datoms by a prefix delete (and
+AEVT and AEVT-h when the attribute is given), the other trees one key
+at a time from a scan of the entity's history rows, which name every
+datom it ever had; the per-attribute counts drop by the current rows
+removed. Every txlog entry that held one of the datoms is rewritten
+without them and marked `{:excised [e ...]}`, the marker accumulating
+across excisions; an entry emptied this way keeps its place, its
+instant and its marker, and the excising transaction's own entry
+carries the marker too, so `tx-range` replays the same transactions
+with the datoms gone and shows `:excised` on the entries an excision
+touched. Every view is affected alike: a db-value taken before the
+excision no longer sees the datoms either, since the trees are the
+only record. Datoms that refer to `e` through a ref attribute are not
+its datoms and stay, as a ref to an entity with no datoms. `e` is a
+user entity given as an eid, ident or lookup ref; an attribute, ident
+or transaction entity, or a tempid, is `:nextomic/tx-data`, an
+unallocated id `:nextomic/no-entity`. An entity excised of everything
+stays addressable, and excising it again removes nothing. Inside a
+`with` or a transaction function, `excise!` is `:nextomic/nested`.
+
 ---
 
 ## 5. Query pipeline
@@ -489,7 +514,8 @@ sub-plans with the same output variables.
 | `(d/q query db & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]`, aggregates (built-in and custom) and `(pull ?e pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] % $2` with inputs positional after the db (a `$name` source takes a db value; `[$2 ?e :a ?v]` and `($2 rule ?x)` read it), `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
 | `(d/explain query db & inputs)` | the plan `q` would run, as an aligned table: one numbered line per step with its description (index, estimate, tree size, source when not `$`, bound variables marked `!`), the join a scan will run (`nested`, one seek per input row; `hash`, one scan of the constant prefix hash-joined on the shared variables; `fixpoint` for a recursive rule) and the estimated rows after the step; sub-plans indent under their step and end with `rows~` |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4); `t` is a transaction number or a transaction's entity id |
-| `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}` for `from ≤ t < to`, oldest first; a bound that is `nil` or not given is open |
+| `(d/excise! conn e)` / `(d/excise! conn e attr)` | §4 "Excision"; returns the recording transaction's report plus `:excised [e]` and `:removed`, the history rows that went |
+| `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}` for `from ≤ t < to`, oldest first, with `:excised [e ...]` on an entry an excision touched; a bound that is `nil` or not given is open |
 | `(d/schema db)` | map ident → attribute map |
 | `(d/pull db pattern e)` | the pattern's map for an eid, lookup ref or ident; nil when the entity has no datoms in the view. `e` follows the entity contract every native shares: an eid below 1, or an ident or lookup ref that names nothing, is `:nextomic/no-entity`; a lookup ref on a non-unique attribute, or a vector that is not `[attr v]`, is `:nextomic/tx-data`; a lookup value of the wrong type is `:nextomic/value-type`; any other kind is the VM's `:kind-mismatch`. A pattern is `[spec+]`: `*`, an attribute, `{attr sub-pattern}`, a reverse `:ns/_attr` (a vector of referrers; through a component, its one owner pulled with `[*]`), `{attr ...}` or `{attr depth}` recursion (a target already on the path, or past the depth, is a plain ref), `(attr :limit n)` / `(attr :limit nil)` / `(attr :default v)` / `(attr :as k)` and the `(limit attr n)` / `(default attr v)` spellings. `:db/id` is always present, a missing attribute omitted unless it has a default, card-many values are vectors in index order cut at 1000 unless `:limit` says otherwise (`*` cuts at 1000 too), a ref is `{:db/id e}` plus `:db/ident` when it has one, and a component target is pulled with `[*]`. Defined on current, as-of and since views; one read per call |
 | `(d/pull-many db pattern es)` | one result per entity of the vector or list `es`, in its order, in the same read |
@@ -507,7 +533,7 @@ Schema install is `transact!` of attribute entities: `{:db/ident
 :db.cardinality/one :db/unique :db.unique/identity :db/index true}`;
 what a later transaction may change is §3 step 5.
 
-Later: excision, lazy entities, full-text, a datom heap kind.
+Later: lazy entities, full-text, a datom heap kind.
 
 ---
 
@@ -565,6 +591,7 @@ src/nextomic/
   idents.zig     durable keyword <-> id, per-connection cache
   schema.zig     Schema from attribute datoms as-of a basis, per-attribute counts
   transact.zig   §3
+  excise.zig     §4 "Excision": the tree deletes and the txlog rewrite
   db.zig         DbValue, fold, datoms, entity, entid/ident, tx-range
   handle.zig     heap bodies of the two value kinds; its own module
                  `nextomic_handle` below dispatch/format/gc, so their

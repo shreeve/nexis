@@ -576,6 +576,8 @@ pub const TxEntry = struct {
     t: u64,
     instant: i64,
     datoms: []Datom,
+    /// The excision marker (§4); empty on an untouched entry.
+    excised: []u64,
 };
 
 /// Txlog entries with `from <= t < to` (an absent `to` runs to the newest).
@@ -603,7 +605,7 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
         const t = key.readId(kv.key[0..key.id_len]);
         const bytes = (try conn.store.getTxlog(txn, t)) orelse return error.Corrupted;
         const entry = try datom_mod.decodeTxlog(arena, bytes, t, ids);
-        try out.append(arena, .{ .t = t, .instant = entry.instant, .datoms = entry.datoms });
+        try out.append(arena, .{ .t = t, .instant = entry.instant, .datoms = entry.datoms, .excised = entry.excised });
     }
     return out.toOwnedSlice(arena);
 }

@@ -65,5 +65,23 @@
 (t/check "history taken earlier stops at its basis" (= 4 (count (rows-of (d/history db7) doc :doc/tags))))
 (t/check "the new db sees the write" (= ["Again"] (vals-of (d/db c) doc :doc/title)))
 
+; Excision removes an entity's datoms, or one attribute's, from every
+; view and from the txlog entries that held them; each such entry keeps
+; its place with an :excised marker, as does the excising transaction.
+(def r2 (d/transact! c [{:db/id "e" :doc/title "Secret" :doc/tags [:red]}]))
+(def secret (get (:tempids r2) "e"))
+(def db9 (d/db c))
+(println (dissoc (d/excise! c secret :doc/tags) :db-before :db-after :tx-data))
+(println (d/entity (d/db c) secret))
+(println (d/entity db9 secret))
+(println (dissoc (d/excise! c secret) :db-before :db-after :tx-data))
+(t/check "the entity is gone from the current view" (nil? (d/entity (d/db c) secret)))
+(t/check "and from the view taken before" (nil? (d/entity db9 secret)))
+(t/check "and from history" (empty? (d/datoms (d/history (d/db c)) :eavt secret)))
+(println (mapv (fn [e] [(:t e) (:excised e) (count (:data e))]) (d/tx-range c 9)))
+(t/check "the untouched entity keeps its rows" (= 4 (count (rows-of (d/history (d/db c)) doc :doc/tags))))
+(println (t/caught (d/excise! c :doc/title)))
+(println (t/caught (d/excise! c (+ t/user-partition 99))))
+
 (d/release c)
 :time-done

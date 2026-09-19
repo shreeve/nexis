@@ -30,4 +30,15 @@ ok tx-range past the end is empty
 ok older db-value unaffected by later writes
 ok history taken earlier stops at its basis
 ok the new db sees the write
+{:tx 10, :tempids {}, :excised [4294967297], :removed 1}
+{:db/id 4294967297, :doc/title Secret}
+{:db/id 4294967297, :doc/title Secret}
+{:tx 11, :tempids {}, :excised [4294967297], :removed 1}
+ok the entity is gone from the current view
+ok and from the view taken before
+ok and from history
+[[9 [4294967297] 1] [10 [4294967297] 1] [11 [4294967297] 1]]
+ok the untouched entity keeps its rows
+{:error :nextomic/tx-data, :message excision takes a user entity}
+:nextomic/no-entity
 :time-done

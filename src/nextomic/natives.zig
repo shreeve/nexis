@@ -82,6 +82,7 @@ const natives = [_]Entry{
     .{ .name = "db", .descriptor = &native_db },
     .{ .name = "basis-t", .descriptor = &native_basis_t },
     .{ .name = "transact!", .descriptor = &native_transact },
+    .{ .name = "excise!", .descriptor = &native_excise },
     .{ .name = "entity", .descriptor = &native_entity },
     .{ .name = "entid", .descriptor = &native_entid },
     .{ .name = "ident", .descriptor = &native_ident },
@@ -114,6 +115,7 @@ const native_release = NativeFn{ .name = "nextomic/release", .min_arity = 1, .ma
 const native_db = NativeFn{ .name = "nextomic/db", .min_arity = 1, .max_arity = 1, .call = &fnDb };
 const native_basis_t = NativeFn{ .name = "nextomic/basis-t", .min_arity = 1, .max_arity = 1, .call = &fnBasisT };
 const native_transact = NativeFn{ .name = "nextomic/transact!", .min_arity = 2, .max_arity = 3, .call = &fnTransact };
+const native_excise = NativeFn{ .name = "nextomic/excise!", .min_arity = 2, .max_arity = 3, .call = &fnExcise };
 const native_entity = NativeFn{ .name = "nextomic/entity", .min_arity = 2, .max_arity = 2, .call = &fnEntity };
 const native_entid = NativeFn{ .name = "nextomic/entid", .min_arity = 2, .max_arity = 2, .call = &fnEntid };
 const native_ident = NativeFn{ .name = "nextomic/ident", .min_arity = 2, .max_arity = 2, .call = &fnIdent };
@@ -565,6 +567,32 @@ fn reportMap(vm: *VM, conn: *Conn, arena: Allocator, report: transact_mod.Report
 }
 
 // =============================================================================
+// excise!
+// =============================================================================
+
+const fnExcise = wrap(exciseNative);
+
+/// `(excise! conn e)` / `(excise! conn e attr)` (NEXTOMIC.md §4
+/// "Excision"): the report of the recording transaction plus
+/// `:excised [e]` and `:removed`, the history rows that went.
+fn exciseNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
+    const c = try openConn(args[0]);
+    var fault: Fault = .{};
+    var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
+    defer arena_state.deinit();
+    errdefer detail.* = detailOf(vm, c, &fault);
+    const arena = arena_state.allocator();
+    const attr: ?Value = if (args.len == 3 and !args[2].isNil()) args[2] else null;
+    const out = try transact_mod.excise(c, arena, args[1], attr, .{ .fault = &fault });
+    var m = try reportMap(vm, c, arena, out.report);
+    const heap = vm.ensureHeap();
+    const it = vm.ensureInterner();
+    m = try champ.mapAssoc(heap, m, try it.internKeywordValue("excised"), try vector_mod.fromSlice(heap, &.{try fixnum(out.excised)}), &dispatch.hashValue, &dispatch.equal);
+    m = try champ.mapAssoc(heap, m, try it.internKeywordValue("removed"), try fixnum(out.removed), &dispatch.hashValue, &dispatch.equal);
+    return m;
+}
+
+// =============================================================================
 // with
 // =============================================================================
 
@@ -872,6 +900,11 @@ fn txRangeNative(vm: *VM, args: []const Value) !Value {
         m = try b.putKw(m, "t", try fixnum(entry.t));
         m = try b.putKw(m, "instant", value.fromFixnum(entry.instant) orelse return error.ArithmeticOverflow);
         m = try b.putKw(m, "data", try b.datoms(arena, entry.datoms));
+        if (entry.excised.len > 0) {
+            const ids = try arena.alloc(Value, entry.excised.len);
+            for (ids, entry.excised) |*out_id, e| out_id.* = try fixnum(e);
+            m = try b.putKw(m, "excised", try vector_mod.fromSlice(b.heap, ids));
+        }
         slot.* = m;
     }
     return vector_mod.fromSlice(b.heap, out);
