@@ -102,17 +102,25 @@ Cross-type operators (PLAN §8.3):
 
 - Arithmetic and ordered comparison follow Clojure contagion: an
   operation with any float operand is carried out in f64 and yields a
-  float; two fixnums stay integral. `(< 1 1.5)` → `true`, `(+ 1 0.5)` →
-  `1.5`, `(max 1 2.0)` → `2.0`.
+  float; integers stay integral and exact. `(< 1 1.5)` → `true`,
+  `(+ 1 0.5)` → `1.5`, `(max 1 2.0)` → `2.0`. A bignum operand widens
+  to the nearest f64 (`(== (* 2 140737488355327) 2.81474976710654E14)`
+  → `true`).
 - `==` is numeric equality under contagion: `(== 1 1.0)` → `true` while
   `(= 1 1.0)` stays `false` (PLAN §23 decision 11). `==` is IEEE on NaN:
   `(== nan nan)` → `false` even though `(= nan nan)` → `true`.
 - `/` on two fixnums yields a fixnum when the division is exact and a
   float otherwise: `(/ 6 3)` → `2`, `(/ 7 2)` → `3.5`. There are no
   rationals (PLAN §23 decision 10).
-- A fixnum result outside the i48 range raises `:arithmetic-overflow`
-  (catchable). Bignum promotion needs bignum arithmetic the runtime does
-  not have; the error keeps precision loss from being silent.
+- An integer result outside the i48 range is a bignum, exact at any
+  size: `(+ 140737488355327 1)` → `140737488355328`, `(* 100000000
+  10000000000)` → `1000000000000000000`. An integer result that fits
+  is a fixnum whatever its operands were, so `(- (+ 140737488355327 1)
+  1)` is the fixnum `140737488355327` again. `quot`, `rem`, `mod`, `abs`
+  and unary `-` promote the same way (`(- -140737488355328)` →
+  `140737488355328`). Ordering, `compare`, `max`, `min`, `zero?`,
+  `pos?`, `neg?`, `even?` and `odd?` are exact over bignums. No
+  arithmetic raises `:arithmetic-overflow`.
 - Integer `/` by zero, and `quot` / `rem` / `mod` by zero of any kind,
   raise `:divide-by-zero`. Float `/` by zero is IEEE: `Infinity`,
   `-Infinity` or `NaN`.

@@ -281,14 +281,15 @@ pub fn mul(heap: *Heap, a: Value, b: Value) !Value {
     return fromMutable(heap, r);
 }
 
-const DivPart = enum { quotient, remainder };
+const DivPart = enum { quotient, remainder, exact_quotient };
 const Rounding = enum { truncated, floored };
 
 /// The division family over a non-zero divisor (the caller raises
 /// on zero): truncated division gives `quot` and `rem` (remainder
 /// with the dividend's sign), floored division gives `mod`
-/// (remainder with the divisor's sign).
-fn divide(heap: *Heap, a: Value, b: Value, rounding: Rounding, part: DivPart) !Value {
+/// (remainder with the divisor's sign). `exact_quotient` is the
+/// quotient when the remainder is zero and `null` otherwise.
+fn divide(heap: *Heap, a: Value, b: Value, rounding: Rounding, part: DivPart) !?Value {
     var sa: [1]Limb = undefined;
     var sb: [1]Limb = undefined;
     const x = view(a, &sa);
@@ -308,25 +309,31 @@ fn divide(heap: *Heap, a: Value, b: Value, rounding: Rounding, part: DivPart) !V
         .truncated => q.divTrunc(&r, x, y, tmp),
         .floored => q.divFloor(&r, x, y, tmp),
     }
-    return fromMutable(heap, switch (part) {
-        .quotient => q,
-        .remainder => r,
-    });
+    return switch (part) {
+        .quotient => try fromMutable(heap, q),
+        .remainder => try fromMutable(heap, r),
+        .exact_quotient => if (r.toConst().eqlZero()) try fromMutable(heap, q) else null,
+    };
 }
 
 /// Truncated quotient.
 pub fn quot(heap: *Heap, a: Value, b: Value) !Value {
-    return divide(heap, a, b, .truncated, .quotient);
+    return (try divide(heap, a, b, .truncated, .quotient)).?;
+}
+
+/// The quotient when `b` divides `a` exactly, `null` otherwise.
+pub fn quotExact(heap: *Heap, a: Value, b: Value) !?Value {
+    return divide(heap, a, b, .truncated, .exact_quotient);
 }
 
 /// Remainder of truncated division: the dividend's sign.
 pub fn rem(heap: *Heap, a: Value, b: Value) !Value {
-    return divide(heap, a, b, .truncated, .remainder);
+    return (try divide(heap, a, b, .truncated, .remainder)).?;
 }
 
 /// Remainder of floored division: the divisor's sign.
 pub fn mod(heap: *Heap, a: Value, b: Value) !Value {
-    return divide(heap, a, b, .floored, .remainder);
+    return (try divide(heap, a, b, .floored, .remainder)).?;
 }
 
 pub fn neg(heap: *Heap, a: Value) !Value {
@@ -946,6 +953,18 @@ test "quot/rem/mod: signs follow Zig's @divTrunc/@rem/@mod on every sign combina
     const r = try rem(&heap, try fromI128(&heap, -big_a), fx(97));
     try testing.expect(r.kind() == .fixnum);
     try testing.expectEqual(@rem(-big_a, 97), @as(i128, r.asFixnum()));
+}
+
+test "quotExact: the quotient only when the remainder is zero" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const a = (try parseDecimal(&heap, "1000000000000000000000000000000000000")).?;
+    const b = (try parseDecimal(&heap, "1000000000000000000")).?;
+    const q = (try quotExact(&heap, a, b)).?;
+    try testing.expect(compare(q, b) == .eq);
+    try testing.expect((try quotExact(&heap, a, fx(7))) == null);
+    try testing.expect((try quotExact(&heap, fx(6), fx(3))).?.asFixnum() == 2);
+    try testing.expect((try quotExact(&heap, fx(6), fx(4))) == null);
 }
 
 test "quot: fixnum_min / -1 is the one fixnum quotient that promotes" {

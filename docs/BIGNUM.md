@@ -155,6 +155,7 @@ pub fn add(heap: *Heap, a: Value, b: Value) !Value;
 pub fn sub(heap: *Heap, a: Value, b: Value) !Value;
 pub fn mul(heap: *Heap, a: Value, b: Value) !Value;
 pub fn quot(heap: *Heap, a: Value, b: Value) !Value;   // truncated quotient
+pub fn quotExact(heap: *Heap, a: Value, b: Value) !?Value; // quotient iff exact
 pub fn rem(heap: *Heap, a: Value, b: Value) !Value;    // dividend's sign
 pub fn mod(heap: *Heap, a: Value, b: Value) !Value;    // divisor's sign
 pub fn neg(heap: *Heap, a: Value) !Value;

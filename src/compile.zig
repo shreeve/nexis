@@ -4207,7 +4207,7 @@ test "compile: integer literal beyond i48 range rejected" {
     try testing.expectError(CompileError.IntegerOutOfFixnumRange, res);
 }
 
-test "compile + run: (+ fixnum_max 1) compiles but VM traps overflow" {
+test "compile + run: (+ fixnum_max 1) compiles and the VM promotes the sum to a bignum" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const compiled = try compileTiny(
@@ -4217,8 +4217,8 @@ test "compile + run: (+ fixnum_max 1) compiles but VM traps overflow" {
     const routine = compiled.toRoutine("(+ fixnum_max 1)");
     var v = try vm.VM.init(testing.allocator, &routine);
     defer v.deinit();
-    const res = v.run();
-    try testing.expectError(vm.VmError.ArithmeticOverflow, res);
+    const res = try v.run();
+    try testing.expect(res.kind() == .bignum);
 }
 
 // ---- cmp:lt tests ----

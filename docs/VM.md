@@ -830,14 +830,14 @@ Phase 2.
 
 | Var | Name | Status | Operands | Semantics |
 |---|---|---|---|---|
-| 0 | `math:add` | wired | A=slot, B=any, C=any | `slot[A] := resolve(B) + resolve(C)` over the fixnum/float tower (SEMANTICS.md §2.2 contagion). Errors: `:arithmetic-overflow`, `:kind-mismatch` |
+| 0 | `math:add` | wired | A=slot, B=any, C=any | `slot[A] := resolve(B) + resolve(C)` over the fixnum/bignum/float tower (SEMANTICS.md §2.2 contagion); an integer result outside i48 is a bignum on the VM's heap. Errors: `:kind-mismatch` |
 | 1 | `math:sub` | wired | A=slot, B=any, C=any | subtraction, same tower and errors |
 | 2 | `math:mul` | wired | A=slot, B=any, C=any | multiplication, same tower and errors |
-| 3 | `math:div` | wired | A=slot, B=any, C=any | `/`: exact fixnum quotient stays fixnum, otherwise float. Errors: `:divide-by-zero` (integer), `:arithmetic-overflow`, `:kind-mismatch` |
-| 4 | `math:idiv` | wired | A=slot, B=any, C=any | `quot`: truncated division. Errors: `:divide-by-zero`, `:arithmetic-overflow`, `:kind-mismatch` |
+| 3 | `math:div` | wired | A=slot, B=any, C=any | `/`: an exact integer quotient stays an integer, otherwise float. Errors: `:divide-by-zero` (integer), `:kind-mismatch` |
+| 4 | `math:idiv` | wired | A=slot, B=any, C=any | `quot`: truncated division. Errors: `:divide-by-zero`, `:kind-mismatch` |
 | 5 | `math:mod` | wired | A=slot, B=any, C=any | `mod`: floored remainder, sign of the divisor. Same errors as `math:idiv` |
 | 6 | `math:pow` | reserved | A=slot, B=any, C=any | exponentiation |
-| 7 | `math:neg` | wired | A=slot, B=any, _ | unary negation. Errors: `:arithmetic-overflow`, `:kind-mismatch` |
+| 7 | `math:neg` | wired | A=slot, B=any, _ | unary negation. Errors: `:kind-mismatch` |
 | 8 | `math:abs` | wired | A=slot, B=any, _ | absolute value. Same errors as `math:neg` |
 
 #### 10.4 `closure` group variants
@@ -1030,7 +1030,7 @@ keyword; renames are breaking changes.
 | `:invalid-cell-state` | `closure:box-local` on an already-boxed slot (double-box), or `closure:init-cell` on an already-initialized cell | Programming error; halts VM |
 | `:uninitialized-cell` | `closure:get-cell` (or U-operand resolve) on a cell with `initialized = false` — placeholder not yet filled | Recoverable in principle but typically a compiler-emitted-out-of-order bug |
 | `:unsupported-write` | `store(u:N, ...)` attempted in v1 (writes to captured upvalues are reserved for Phase 3+ dynamic-binding rebinding) | Recoverable; user code shouldn't see this in v1 unless attempting a future feature |
-| `:arithmetic-overflow` | An integer result of `math:*` (or an arithmetic native) left the i48 fixnum range. Bignum promotion needs bignum arithmetic, which the runtime does not have, so the error is raised instead of losing precision | Recoverable |
+| `:arithmetic-overflow` | A count or identifier the runtime produces does not fit in a fixnum. No `math:*` opcode or arithmetic native raises it: an integer result outside i48 promotes to a bignum | Recoverable |
 
 All errors are structured `Value`s (map with `:kind`, `:msg`,
 `:span` keys minimally) so user code can pattern-match.
