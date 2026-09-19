@@ -1,6 +1,6 @@
-## STRING.md — UTF-8 String Heap Kind (Phase 1)
+## STRING.md — UTF-8 String Heap Kind
 
-**Status**: Phase 1 deliverable. Authoritative body-layout and API contract for
+Authoritative body-layout and API contract for
 the `string` heap kind. Derivative from `PLAN.md` §8.2, `docs/VALUE.md` §2.2,
 `docs/SEMANTICS.md` §2.4 / §3.2, and `docs/HEAP.md`. Those documents win on
 conflict.
@@ -19,14 +19,14 @@ v1 ships **one** string subkind:
 - **Subkind 1 — heap string.** Body is the raw UTF-8 bytes, no length
   prefix. Length is recovered from `Heap.bodyBytes(h).len`.
 
-Reserved for later (no v1 implementation):
+Reserved (no implementation):
 
 - **Subkind 0 — inline short string (SSO).** Up to 15 bytes of content
   live inside the `Value` tag + payload itself, no heap allocation.
-  Performance optimization (PLAN §19.6 Tier 2); deferred. The subkind
-  numbering is kept so SSO slots into subkind 0 without renumbering.
-- **Subkind 2 — zero-copy slice over mmap page.** Needed for the Phase 6
-  T2.2 "direct-from-emdb" path.
+  Performance optimization (PLAN §19.6 Tier 2). The subkind numbering
+  is kept so SSO slots into subkind 0 without renumbering.
+- **Subkind 2 — zero-copy slice over mmap page.** The PLAN §19.6 T2.2
+  "direct-from-emdb" path.
 
 The Value layer's `Kind.string == 16` (VALUE.md §2.2) is unchanged. Two
 string Values with different subkinds compare `=` iff their logical byte
@@ -51,7 +51,7 @@ lands.
    `mixKindDomain`, and returns the result.
 4. **UTF-8 validation is NOT performed at the storage boundary.**
    `fromBytes` trusts its caller — the reader already produces
-   well-formed UTF-8. Untrusted-bytes decoders (Phase 4 codec) are
+   well-formed UTF-8. Untrusted-bytes decoders (the codec) are
    expected to validate before calling. A malformed-bytes `Value`
    remains byte-identical to itself, byte-equal only to another string
    with the same bytes, and hashes deterministically — equality and
@@ -131,8 +131,7 @@ pub fn heapEqual(a: value.Value, b: value.Value) bool;
   `*HeapHeader`s, and dispatches to the per-kind `bytesEqual` /
   `structuralEqual` / etc.
 
-Rationale (peer-review recommendation, conversation `nexis-phase-1`
-turn 6): keeping `value.zig` and `eq.zig` low-level — they describe
+Rationale: keeping `value.zig` and `eq.zig` low-level — they describe
 semantics for immediates and cross-kind rules — while cross-kind
 integration lives in one module where "have we accounted for every
 heap kind?" is a single-file audit.
@@ -159,25 +158,25 @@ depends on `dispatch.zig`. When a new kind lands, exactly one
 - **Hash layer.** `string.hashHeader` calls `hash.hashBytes(bytes)`
   and truncates. No new hash primitives needed.
 - **Intern layer.** No direct interaction — strings are not interned.
-- **Reader.** `src/reader.zig` emits string Forms as byte slices;
-  when the reader→Value lifting pass lands (Phase 2), it will call
-  `string.fromBytes` with the already-validated UTF-8 from the
-  grammar's `STRING` token.
+- **Reader / compiler.** `src/reader.zig` emits string Forms as byte
+  slices; `src/compile.zig` calls `string.fromBytes` with the
+  already-validated UTF-8 from the grammar's `STRING` token when it
+  lifts a string literal into a routine's constant pool.
 
 ---
 
 ### 6. What STRING.md does not cover
 
-- **Inline short-string optimization (SSO).** Subkind 0. Deferred to a
-  future commit; when it lands, it will preserve every invariant in §2
-  except the "body is heap body" physical layout — SSO strings have no
-  heap allocation, but `asBytes`/`hashHeader`/`bytesEqual` will work
+- **Inline short-string optimization (SSO).** Subkind 0, reserved with
+  no implementation. It would preserve every invariant in §2 except
+  the "body is heap body" physical layout — SSO strings would have no
+  heap allocation, with `asBytes`/`hashHeader`/`bytesEqual` working
   transparently.
-- **Zero-copy subkind 2.** Needs mmap / emdb-page plumbing from
-  Phase 6. Same transparency contract as SSO.
+- **Zero-copy subkind 2.** Reserved with no implementation; needs
+  mmap / emdb-page plumbing. Same transparency contract as SSO.
 - **Unicode operations** (grapheme iteration, case folding, normalization,
-  collation). Phase 5.2b will ship case conversion + trim as
-  **ASCII-only** in `nexis.string`. Full Unicode case folding,
+  collation). Case conversion + trim in `nexis.string` are
+  **ASCII-only** (§8). Full Unicode case folding,
   grapheme clustering, normalization, and collation are post-v1 and
   will require a dedicated Unicode tables module.
 - **String interning** (explicit `(intern s)`). PLAN §8.4 defers this
@@ -192,14 +191,14 @@ depends on `dispatch.zig`. When a new kind lands, exactly one
 
 ---
 
-### 7. Language-level operations (Phase 5.2a — peer-AI turn 77)
+### 7. Language-level operations
 
 The storage module ships codepoint-iteration helpers that the
 language-surface stdlib (`src/stdlib.zig`) calls. Frozen invariants
 for the user-facing API:
 
 **Indexing is by Unicode scalar (codepoint), not grapheme cluster
-and not byte.** Picked over byte indexing in turn 77 §D1 because
+and not byte.** Picked over byte indexing because
 `count` / `nth` / `subs` must agree, and surfacing UTF-8 byte
 positions through a user-facing `(count s)` would surprise users
 porting Clojure code where `(.length s)` is character-flavored. v1
@@ -234,14 +233,14 @@ codepoint range to a byte range in a second walk;
 `string.codepointAt(v, i)` returns a `Kind.char` Value via a
 front-to-position walk. None of these store side-cache state on
 the HeapHeader — codepoint count IS NOT cached today (v1; if
-profiling shows hot use, a Phase 6 cache slot or full
+profiling shows hot use, a cache slot or full
 codepoint-counted subkind could land).
 
 **Storage shape unchanged.** Byte layout (§2) is invariant: the body
 is still raw UTF-8 bytes; codepoint indexing is purely a presentation
 view. `subs` allocates a fresh heap string via `fromBytes` — no
 zero-copy slicing in v1 (subkind 2 is reserved for emdb-page
-mmap, not for slicing our own heap; turn 77 §D3 confirmed).
+mmap, not for slicing our own heap).
 
 **v1 invalid-UTF-8 policy.** If a corrupted byte sequence makes
 codepoint iteration fail mid-string, `string.codepointAt` /
@@ -250,12 +249,12 @@ codepoint iteration fail mid-string, `string.codepointAt` /
 to `:utf8-error` (catchable). Construction-time validation of
 strings happens at the reader and the codec; runtime corruption
 that reaches the storage layer is treated as a recoverable
-language error rather than a panic, matching the Phase 1
+language error rather than a panic, matching the storage layer's
 "caller's responsibility" stance.
 
 ---
 
-### 8. `nexis.string` namespace (Phase 5.2b — peer-AI turn 79)
+### 8. `nexis.string` namespace
 
 Separate from `nexis.core`, NOT auto-referred (matches Clojure's
 `clojure.string`). Users call qualified: `(nexis.string/lower-case
@@ -295,7 +294,7 @@ so today.
 
 **Frozen invariants:**
 
-1. **Case conversion is ASCII-only** (turn 77 §D10 + turn 79 §D1).
+1. **Case conversion is ASCII-only**.
    `lower-case` maps bytes `A-Z (0x41..0x5A)` → `a-z (0x61..0x7A)`;
    `upper-case` does the inverse. Bytes ≥ 0x80 (every multi-byte
    UTF-8 continuation or leading byte) are preserved
@@ -304,15 +303,15 @@ so today.
    Future Unicode case folding requires per-codepoint tables;
    tracked in §6's "Unicode operations" deferral.
 
-2. **`trim` whitespace set** (turn 79 §D2): the six ASCII chars
+2. **`trim` whitespace set**: the six ASCII chars
    space (0x20), tab (0x09), LF (0x0A), VT (0x0B), FF (0x0C),
    CR (0x0D). Matches `std.ascii.isWhitespace`. Unicode
    whitespace (e.g., U+00A0, U+2028, U+2029) is NOT recognized.
    `trim` strips from both sides simultaneously (left + right);
-   no separate `triml`/`trimr` shipped in 5.2b.
+   there is no separate `triml`/`trimr`.
 
 3. **`split` is a literal-string splitter** that preserves
-   trailing empties (turn 79 §D3 override). Examples:
+   trailing empties. Examples:
    ```
    (nexis.string/split "a,b,c" ",") → ["a" "b" "c"]
    (nexis.string/split "a,b,"  ",") → ["a" "b" ""]
@@ -321,17 +320,16 @@ so today.
    (nexis.string/split "a"     "foo") → ["a"]
    ```
    `delim` must be a non-empty string. Empty delimiter
-   surfaces `:invalid-argument` (peer-AI turn 80 §"Must-fix"
-   #2: empty delim is the right KIND but an invalid VALUE for
+   surfaces `:invalid-argument` (empty delim is the right KIND but
+   an invalid VALUE for
    the operation, distinct from `:kind-mismatch` which is for
    wrong-kind args). Result is a vector, not a list.
    The "regex split" variant (Clojure's
    `clojure.string/split` 2-arg form trims trailing empties)
-   is deferred to Item 6 alongside regex; our literal split
-   is honest fields. Search is byte-wise (`std.mem.indexOf`).
+   does not exist (no regex); our literal split is honest fields. Search is byte-wise (`std.mem.indexOf`).
 
    **UTF-8 validation**: `nexis.string/*` is a Unicode-string
-   API, not a byte-blob API (peer-AI turn 80 §"Must-fix" #1).
+   API, not a byte-blob API.
    `split` validates both `s` and `delim` as UTF-8 before
    scanning; malformed input → `:utf8-error`. This guarantees
    that valid output strings would not be sliced
@@ -341,7 +339,7 @@ so today.
    for codec compatibility; user-surface validation lives in
    `nexis.string/*`.
 
-4. **`join` accepts nil + sequential + set** (turn 79 §D4):
+4. **`join` accepts nil + sequential + set**:
    - `nil` → `""`
    - `list` / `vector` → walk in declaration order
    - `set` → walk in iteration order (implementation-defined
@@ -355,9 +353,8 @@ so today.
    `join` does NOT auto-stringify the separator.
 
 5. **`replace` is literal, all-non-overlapping, left-to-right**
-   (turn 79 §D5). `match` must be a non-empty string; empty
-   `match` → `:invalid-argument` (turn 80 §"Must-fix" #2:
-   distinct from `:kind-mismatch`). `replacement` must be a
+   `match` must be a non-empty string; empty `match` →
+   `:invalid-argument` (distinct from `:kind-mismatch`). `replacement` must be a
    `Kind.string`; non-string → `:kind-mismatch`. No special
    replacement syntax (`$1`, `\1`, etc.) in literal mode.
    After each match, scanning continues at
@@ -366,7 +363,7 @@ so today.
    non-overlapping matches both fire:
    `(replace "aaaa" "aa" "x") → "xx"`.
 
-   **UTF-8 validation** (turn 80 §"Must-fix" #1): all three
+   **UTF-8 validation**: all three
    args (`s`, `match`, `replacement`) are validated as UTF-8
    before scanning; malformed input → `:utf8-error`. Same
    rationale as `split` — the user-surface API is a Unicode
@@ -377,13 +374,13 @@ so today.
 | Keyword              | Source                                       |
 |----------------------|----------------------------------------------|
 | `:kind-mismatch`     | non-string `s` / non-string sep / non-collection `coll` for join (wrong KIND of arg) |
-| `:invalid-argument`  | empty delim for split, empty match for replace (right kind, wrong value; turn 80 §"Must-fix" #2) |
-| `:utf8-error`        | malformed UTF-8 in any input to `split` / `replace` (turn 80 §"Must-fix" #1) |
+| `:invalid-argument`  | empty delim for split, empty match for replace (right kind, wrong value) |
+| `:utf8-error`        | malformed UTF-8 in any input to `split` / `replace` |
 | `:arity-mismatch`    | wrong argc on any fn                         |
 
 ---
 
-### 9. Printing + I/O (Phase 5.2c — peer-AI turn 81)
+### 9. Printing + I/O
 
 **Module split.** Value→text formatting lives in `src/format.zig`,
 not in `src/stdlib.zig` or `src/cli.zig`. format.zig is the single
@@ -418,19 +415,19 @@ pub fn formatToString(
 
 | Aspect | `.display` | `.readable` |
 |---|---|---|
-| `nil` | `"nil"` (turn 81 §F1) | `"nil"` |
+| `nil` | `"nil"` | `"nil"` |
 | string | unquoted raw bytes | `"…"` with `\ " \n \t \r` + `\u{HEX}` for other 0x00..0x1F + DEL |
 | char | UTF-8 encoded scalar | named tokens (`\space`, `\newline`, `\tab`, `\return`, `\formfeed`, `\backspace`, `\\`), printable ASCII as `\x`, NUL + non-printable as `\u{HEX}` |
 | atom / function / native-fn / var / durable-ref / transient / connection / tx | OPAQUE (`#<atom>`, `#<fn>`, `#<native-fn NAME>`, `#'name`, `#<durable-ref :tree/key>`, ...) | OPAQUE (same; intentionally NOT reader-round-trippable — these are identity-valued/process-local kinds) |
 | collections | recursive in same mode | recursive in same mode |
-| malformed UTF-8 in string | passes through bytes unchanged | `:utf8-error` (turn 81 §F2 — readable mode must not emit invalid source) |
+| malformed UTF-8 in string | passes through bytes unchanged | `:utf8-error` (readable mode must not emit invalid source) |
 
 **`format` is purely presentation, not serialization.** The codec
 (`src/codec.zig`) owns wire-format bytes; `format` owns text-out.
 They don't share an encoding. `#<atom>` / `#<fn>` / durable-ref
 text are NOT reader-round-trippable.
 
-**Nil semantics split** (turn 81 §F1 — load-bearing):
+**Nil semantics split** (load-bearing):
 
 | Call | Result |
 |---|---|
@@ -463,19 +460,18 @@ itself never special-cases nil.
 | `:kind-mismatch`     | non-string path arg                                          |
 | `:utf8-error`        | slurp file content not valid UTF-8                           |
 
-**Frozen invariants (turn 81):**
+**Frozen invariants:**
 
 §9.1. `vm.io` is the authority for filesystem + stdout. Null
 `vm.io` → `:io-error` on print/println/prn/slurp/spit. Tests run
 with null io and exercise the error path; the CLI sets
 `vm.io = init.io` on bootstrap so real programs work.
 
-§9.2. `spit` does NOT auto-create parent directories (turn 81
-§D5). Missing parents → `:file-not-found` / `:io-error`. The
-`db/open` parent-dir auto-create (Phase 5.2a polish) is a DB-
+§9.2. `spit` does NOT auto-create parent directories. Missing parents → `:file-not-found` / `:io-error`. The
+`db/open` parent-dir auto-create is a DB-
 specific convenience; file I/O is not auto-creating.
 
-§9.3. `slurp` size cap is **16 MiB** in v1 (turn 81 §D7). Larger
+§9.3. `slurp` size cap is **16 MiB**. Larger
 files surface `:io-error`. No size-limit-arg overload in v1.
 
 §9.4. `pr-str` does NOT print a trailing newline; `println` and
@@ -484,7 +480,7 @@ files surface `:io-error`. No size-limit-arg overload in v1.
 §9.5. Print args separate with a single space (Clojure parity).
 Empty argc is legal: `(println) → "\n"`, returns `nil`.
 
-**GC-rooting checklist additions (peer-AI turn 79 §D9):** all six
+**GC-rooting checklist (`docs/GC.md` §11.5):** all six
 fns allocate output strings/vectors via `string.fromBytes` /
 `vector.fromSlice` AFTER holding their argument Values in Zig
 locals. Under v1's explicit-only GC this is structurally safe;
