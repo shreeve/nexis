@@ -1,90 +1,39 @@
-//! vm.zig — Phase 2 VM kernel.
+//! vm.zig — the bytecode interpreter.
 //!
-//! Authoritative spec: `docs/VM.md`. Adapted from `../em/src/{bytecode,
-//! runtime}.zig` per the user's latitude to lift + modify em freely.
+//! Spec: `docs/VM.md`. This file holds:
 //!
-//! **Currently implemented** (COMPILER.md §10 steps #1–#2):
-//!
-//!   - 64-bit instruction encoding + operand packing (VM.md §3, §4).
-//!   - `Routine` (compiled code + constants; plain Zig struct,
-//!     not a heap Value yet — heap-kind promotion lands with
-//!     closures per VM.md §5 staged-realization note).
-//!   - `Frame` (base_slot + slot_count + pc + routine pointer)
-//!     windowing into a VM-shared backing `stack: ArrayList(Value)`
-//!     per VM.md §7 (peer-AI turn 40 backing-stack model). Frames
-//!     live in `frames: ArrayList(Frame)`; step 5a0 still has
-//!     exactly one frame at runtime, but the storage model is
-//!     ready for `call:call` / `call:tailcall` (step 5a1) without
-//!     a second restructuring.
-//!   - `VM` with two-level-switch dispatch. Tail-call-threaded
-//!     upgrade is deferred per VM.md §8 staged-realization note.
-//!   - 6 opcodes wired across 3 groups:
-//!       mov: load-const, move, load-nil, load-true, load-false
-//!       call: return, return-nil
-//!       math: add (fixnum/float tower, i48 overflow raises ArithmeticOverflow,
-//!             traps non-fixnum as KindMismatch)
-//!   - Hand-assembled bytecode tests. The `src/compile.zig` tiny
-//!     compiler lowers `(+ 1 2)`-style forms directly to math:add
-//!     bytecode and the `Tiny` form representation.
-//!
-//! What's NOT here yet (deferred per COMPILER.md §10):
-//!
-//!   - `call:call` / `call:tailcall` — step #5 (range-call ABI per
-//!     VM.md §6 amendment). Requires the multi-frame backing-stack
-//!     evolution noted in VM.md §7.
-//!   - `closure:*` group (`make`, `box-local`, `new-cell`,
-//!     `init-cell`, `get-cell`) — step #5.
-//!   - `jump:*` group + `if` lowering — step #3.
-//!   - `cmp:*` group — step #3.
-//!   - `var:*` group + `def` lowering — step #7.
-//!   - `coll:*` / `transient:*` / `hash:*` groups — Phase 2 mid-late.
-//!   - `ctrl:*` (try/catch/throw) — step #9.
-//!   - `tx:*` group — Phase 4.
-//!   - `simd:*` group — Phase 6.
-//!   - GC root enumeration from frames — lands when the multi-frame
-//!     stack does.
-//!
-//! Implementation sequence (COMPILER.md §10):
-//!   1. VM kernel skeleton (mov, call:return)            ✓ done
-//!   2. Tiny compiler for (+ 1 2) + math:add             ✓ done
-//!   3. Conditionals (jump:*, if lowering)               ← next
-//!   4. Locals + let*
-//!   5. Functions + closures (range-call ABI + closure:*)
-//!   6. recur + loop* (with captured-binding fresh cells per VM.md §6)
-//!   7. Vars + def
-//!   8. Macroexpand + syntax-quote + #%anon-fn
-//!   9. try/catch/throw
-//!  10. Error-reporting hardening
-//!  11. Golden + eval tests
+//!   - The 64-bit instruction encoding (`Inst`, `Operand`) and the
+//!     opcode groups the two-level `dispatch` switch understands.
+//!   - `Routine`, a unit of compiled code with its constant pool,
+//!     and `Closure`, a routine plus captured upvalue cells.
+//!   - `Frame`s that window one shared backing `stack`; a call
+//!     grows the stack into the callee's window and a return or an
+//!     unwind restores the length the frame recorded on entry.
+//!   - The handler stack behind `try`/`catch`/`finally`/`throw`,
+//!     shared by bytecode throws and by natives (`throwValue`).
+//!   - The numeric tower (`numAdd` … `numCompare`): the single
+//!     implementation behind the `math:*` and `cmp:*` opcodes and
+//!     the arithmetic natives.
+//!   - `lookup`, the one implementation of `get`, `(:k m)`,
+//!     `(m :k)`, `(s x)` and `(v i)`.
+//!   - Namespaces, Vars and the namespace registry.
 
 const std = @import("std");
 const value_mod = @import("value");
-/// Step 5e (peer-AI turn 49 Option D): the VM owns a `Heap`
-/// backed by `runtime_arena` for constructing rest-arg lists
-/// at variadic call sites. heap + list are pure-allocator
-/// modules; pulling them in does NOT pull GC. The Heap shares
-/// the closure/cell allocator so all VM-side runtime values
-/// are freed together at `VM.deinit`.
+/// The VM owns a `Heap` backed by `runtime_arena` for the values
+/// it constructs itself (rest-arg lists, vectors, maps and sets
+/// built by `coll:*`). heap, list, vector and champ are pure
+/// allocator modules; pulling them in does not pull GC.
 const heap_mod = @import("heap");
 const list_mod = @import("list");
-/// Step #8c.3: persistent vector for `coll:vector` opcode +
-/// runtime vector construction (the `(#%vector ...)` IR).
-/// Like list_mod, vector_mod is a pure-allocator wrapper —
-/// no GC dependency.
 const vector_mod = @import("vector");
-/// Phase 3.1: persistent map/set (CHAMP) for `coll:map` /
-/// `coll:set` opcodes. Map/set construction requires hash +
-/// equality, so we also pull in dispatch_mod (the canonical
-/// hashValue + equal entry points per dispatch.zig docs).
 const champ_mod = @import("champ");
+/// Canonical `hashValue` + `equal` entry points for map and set
+/// construction.
 const dispatch_mod = @import("dispatch");
-/// Step E1 (pre-#8 macroexpander prereq, peer-AI turn 55):
-/// the VM owns an `Interner` used by the Form-lowering layer
-/// to convert quoted symbols/keywords into stable `Value`s. The
-/// macroexpander (step #8) will use the same Interner for
-/// auto-gensym + syntax-quote output. Single shared Interner
-/// means symbol/keyword Value identity is consistent across the
-/// whole VM lifetime.
+/// One shared `Interner` per VM keeps symbol and keyword identity
+/// consistent between the compiler, the macroexpander and runtime
+/// values.
 const intern_mod = @import("intern");
 const protocol_mod = @import("protocol");
 const record_mod = @import("record");
@@ -906,23 +855,19 @@ fn execCallNative(
 // =============================================================================
 // Frame (VM.md §7)
 //
-// Step 5a0: backing-stack model (peer-AI turn 40). Each frame is a
-// window into the VM's shared `stack` ArrayList, denoted by
-// `base_slot..base_slot + slot_count`. This refactor preserves the
-// single-frame runtime semantics — call:call / multi-frame dispatch
-// land in step 5a1 — but evolves the storage so the range-call ABI
-// (VM.md §6) can window the callee's slots over the caller's
-// `[call_base + 1 .. call_base + 1 + argc]` region with zero copy.
+// Each frame is a window into the VM's shared `stack` ArrayList,
+// `base_slot..base_slot + slot_count`. The range-call ABI (VM.md
+// §6) windows the callee's slots over the caller's
+// `[call_base + 1 .. call_base + 1 + argc]` region, so arguments
+// are never copied.
 //
-// **Critical discipline** (peer-AI turn 40):
-//   - Never store a `[]Value` slice into `vm.stack.items` and hold
-//     it across any operation that might grow `stack` — ArrayList
-//     can reallocate and invalidate the slice. Use the slotPtr()
-//     helper for one-shot access; if you need stable references
-//     mid-handler, snapshot the frame's `base_slot` into a local.
-//   - Never hold a `*Frame` across `vm.frames.append()` for the
-//     same reason. Step 5a1 will do `frames.append`, so all helpers
-//     that take a frame pointer must be one-shot.
+// Discipline:
+//   - Never hold a `[]Value` slice into `vm.stack.items` across an
+//     operation that might grow `stack`; ArrayList reallocation
+//     invalidates it. Use `slotPtr()` for one-shot access, or
+//     snapshot the frame's `base_slot` into a local.
+//   - Never hold a `*Frame` across `pushFrame`, for the same
+//     reason. Helpers that take a frame pointer are one-shot.
 // =============================================================================
 
 // Backing-stack extent invariant
@@ -1168,13 +1113,12 @@ pub const VmError = error{
     /// entirely.
     UninitializedCell,
 
-    /// Step #9.1 (peer-AI turn 59): a `ctrl:throw` walked the
-    /// entire frame chain without finding a matching handler.
-    /// Halts the VM; the thrown value is preserved in
-    /// `VM.unhandled_throw` for diagnostics (#10 will surface
-    /// this with source span context).
+    /// A throw, from `ctrl:throw` or from a native through
+    /// `throwValue`, found no handler on the handler stack. The
+    /// VM halts and the thrown value is left in
+    /// `VM.unhandled_throw` for the host to report.
     UncaughtThrow,
-    /// Step #9.1: handler stack is in an invalid state —
+    /// Handler stack is in an invalid state —
     /// `ctrl:try-exit` referenced a handler that doesn't
     /// belong to the current frame, or popping found nothing.
     /// Indicates compiler bug, not user error.
@@ -1288,21 +1232,17 @@ pub const HandlerKind = enum {
     /// A `(try body (catch any x handler))` is active —
     /// catch_pc + binding_slot are valid; throw routes here.
     try_,
-    /// The catch body of a fired try is running — preserves
-    /// per-handler bookkeeping (e.g., per-#9.2 finally_pc)
-    /// for the catch body's `try-exit`. Prevents the catch
-    /// body's own throw from being re-caught by the same
-    /// handler (peer-AI turn 59 §"Missing trap 1" — the
-    /// classic catch-body-rethrow trap).
+    /// The catch body of a fired try is running. Keeps the
+    /// handler's bookkeeping (its `finally_pc`) for the catch
+    /// body's `try-exit` while making sure a throw from inside
+    /// the catch body is not caught by the same handler again.
     cleanup,
 };
 
-/// Per-handler state stored on `VM.handlers`. Per peer-AI
-/// turn 59 §D2: a VM-global stack keyed by `frame_index`
-/// (instead of per-frame ArrayLists). Cheaper to manage, no
-/// per-frame init/deinit, frame indices stable under
-/// `frames.append` reallocations because frames only pop
-/// from the top.
+/// Per-handler state stored on `VM.handlers`: one VM-wide stack
+/// keyed by `frame_index` rather than a list per frame. Frame
+/// indices stay valid across `frames.append` reallocations
+/// because frames only pop from the top.
 pub const Handler = struct {
     kind: HandlerKind,
     /// Index into `VM.frames`. Identifies which frame this
@@ -1316,15 +1256,13 @@ pub const Handler = struct {
     /// Slot into which the thrown value is stored when the
     /// catch fires. Valid only when kind == .try_.
     binding_slot: u12,
-    /// Step #9.2: PC of the finally entry. null when the try
-    /// has no finally clause. Both .try_ and .cleanup handlers
-    /// carry this so unwind through either kind runs the
-    /// finally.
+    /// PC of the finally entry. null when the try has no finally
+    /// clause. Both .try_ and .cleanup handlers carry this so
+    /// unwind through either kind runs the finally.
     finally_pc: ?u32 = null,
 };
 
-/// Step #9.2 (peer-AI turn 59 §D5): tagged continuation for
-/// finally bodies. When a try-exit / catch-exit / throw-unwind
+/// Tagged continuation for finally bodies. When a try-exit / catch-exit / throw-unwind
 /// path needs to run a finally, it pushes a continuation onto
 /// `VM.finally_stack` describing what to do AFTER the finally
 /// finishes.
@@ -1441,20 +1379,14 @@ pub const VM = struct {
     /// throw-unwind (when a finally must run before the throw
     /// continues). Popped by finally-exit.
     finally_stack: std.ArrayList(FinallyContinuation) = .empty,
-    /// Step #9.1: if a `ctrl:throw` walks the entire frame
-    /// chain without finding a matching handler, the VM halts
-    /// with `VmError.UncaughtThrow` AND stores the thrown
-    /// payload here. Step #10 will surface this with source
-    /// span context.
+    /// The payload of the throw that halted the VM with
+    /// `VmError.UncaughtThrow`; the host prints it alongside the
+    /// error.
     unhandled_throw: ?Value = null,
-    /// Step E1 (pre-#8): shared Interner for symbol/keyword
-    /// Value construction. Lazy-initialized on first access.
-    /// Used by the compiler's `lowerQuotePayload` for quoted
-    /// symbols/keywords and (post-#8) by the macroexpander for
-    /// auto-gensym and syntax-quote output. Backed by
-    /// `self.allocator` (NOT runtime_arena) because the
-    /// Interner's internal hash maps need a real allocator
-    /// that supports realloc/free, which arena doesn't.
+    /// Shared Interner for symbol/keyword Value construction,
+    /// initialized on first access. Backed by `self.allocator`
+    /// (not `runtime_arena`) because its hash maps need realloc
+    /// and free.
     interner: ?intern_mod.Interner = null,
     /// Where the top-level `call:return` stores the returned Value on
     /// halt.
@@ -1971,7 +1903,7 @@ pub const VM = struct {
                 // Set up result cell and push the synthetic frame.
                 var result_cell = HostCallResult{};
                 const initial_depth = self.frames.items.len;
-                self.frames.append(self.allocator, .{
+                try self.pushFrame(.{
                     .routine = routine,
                     .base_slot = @intCast(base_slot),
                     .entry_stack_len = @intCast(base_slot),
@@ -1979,13 +1911,7 @@ pub const VM = struct {
                     .pc = 0,
                     .upvalues = closure.upvalues,
                     .host_result = &result_cell,
-                }) catch return VmError.OutOfMemory;
-                if (self.frames.items.len > self.frame_high_water) {
-                    self.frame_high_water = self.frames.items.len;
-                }
-                if (self.stack.items.len > self.stack_high_water) {
-                    self.stack_high_water = self.stack.items.len;
-                }
+                });
 
                 // Run until our frame returns (depth back to initial).
                 try self.runUntilDepth(initial_depth);
@@ -2226,16 +2152,32 @@ pub const VM = struct {
         }
     }
 
+    /// Point the top-level frame at `routine` and clear the halt
+    /// flag so the next `run` executes it from its first
+    /// instruction. The frame keeps its base slot; the backing
+    /// stack is grown when the routine needs more slots than the
+    /// previous one. This is how the REPL, the file runner, the
+    /// loader and the tests run a sequence of compiled top-level
+    /// forms on one VM whose namespaces, interner and runtime
+    /// values persist between them.
+    pub fn retargetTop(self: *VM, routine: *const Routine) VmError!void {
+        const top = &self.frames.items[0];
+        top.routine = routine;
+        top.pc = 0;
+        top.slot_count = routine.slot_count;
+        self.halted = false;
+        if (self.stack.items.len < routine.slot_count) {
+            self.stack.appendNTimes(self.allocator, value_mod.nilValue(), routine.slot_count - self.stack.items.len) catch return VmError.OutOfMemory;
+        }
+    }
+
     /// Run bytecode to completion (halt). Returns the VM's `result`
     /// slot. If bytecode exhausts without a `return`, returns
     /// `BytecodeExhausted`.
     ///
-    /// Peer-AI turn 41: the `frame` pointer is scoped inside a
-    /// nested block so it cannot accidentally be reused after
-    /// `dispatch()` — `dispatch` may grow `frames` in step 5a1
-    /// (call:call) and invalidate the pointer. The block-scoping
-    /// makes the lifetime structurally obvious rather than just
-    /// conventionally true.
+    /// The `frame` pointer is scoped inside a nested block so it
+    /// cannot be reused after `dispatch()`, which may grow `frames`
+    /// and invalidate it.
     pub fn run(self: *VM) VmError!Value {
         while (!self.halted) {
             const inst = blk: {
@@ -2469,21 +2411,8 @@ pub const VM = struct {
             dst_ptr.* = result;
             return;
         }
-        // Keywords and collections are invocable as lookups
-        // (PLAN §8.7): `(:k m)`, `(m :k)`, `(s x)`, `(v i)`.
         if (isLookupCallable(closure_v.kind())) {
-            if (argc > 2) return VmError.ArityMismatch;
-            var args_buf: [2]Value = undefined;
-            var i: u32 = 0;
-            while (i < argc) : (i += 1) {
-                args_buf[i] = (try self.slotPtr(@intCast(call_base + 1 + i))).*;
-            }
-            const result = try callLookup(closure_v, args_buf[0..argc]);
-            if (result_dst >= self.currentFrame().slot_count) {
-                return VmError.OperandOutOfRange;
-            }
-            (try self.slotPtr(result_dst)).* = result;
-            return;
+            return try self.execCallLookup(closure_v, call_base, argc, result_dst);
         }
         if (closure_v.kind() != value_mod.Kind.function) {
             return VmError.NotCallable;
@@ -2561,9 +2490,6 @@ pub const VM = struct {
         if (callee_end > self.stack.items.len) {
             const grow_by: usize = callee_end - self.stack.items.len;
             try self.stack.appendNTimes(self.allocator, value_mod.nilValue(), grow_by);
-            if (self.stack.items.len > self.stack_high_water) {
-                self.stack_high_water = self.stack.items.len;
-            }
         }
 
         // Step 5e: variadic-rest materialization. After this
@@ -2623,9 +2549,9 @@ pub const VM = struct {
         // points to the instruction following call:call.
         const caller_pc_after_call: u32 = self.frames.items[caller_idx].pc;
 
-        // Append callee frame. After this point, `caller_frame`
+        // Push the callee frame. After this point, `caller_frame`
         // pointers are invalidated.
-        try self.frames.append(self.allocator, .{
+        try self.pushFrame(.{
             .routine = callee_routine,
             .base_slot = callee_base,
             .entry_stack_len = entry_stack_len,
@@ -2635,107 +2561,88 @@ pub const VM = struct {
             .return_pc = caller_pc_after_call,
             .upvalues = closure.upvalues,
         });
+    }
+
+    /// Push `frame`. The caller has already grown the stack into
+    /// the frame's window and recorded the length it found before
+    /// doing so in `frame.entry_stack_len`; `popFrame` restores
+    /// exactly that length.
+    fn pushFrame(self: *VM, frame: Frame) VmError!void {
+        self.frames.append(self.allocator, frame) catch return VmError.OutOfMemory;
         if (self.frames.items.len > self.frame_high_water) {
             self.frame_high_water = self.frames.items.len;
         }
+        if (self.stack.items.len > self.stack_high_water) {
+            self.stack_high_water = self.stack.items.len;
+        }
     }
 
-    /// `call:return A=slot _ _` — read return value from
-    /// `slot[A]`, then either halt (if top-level) or pop the
-    /// callee frame and write the return value into the
-    /// caller's `return_dst` slot.
-    fn execCallReturn(self: *VM, inst: Inst) VmError!void {
-        // Read the return value FIRST while the callee frame is
-        // still active (peer-AI turn 42 ordering: shrinking the
-        // stack or popping the frame before this read would
-        // invalidate the slot pointer).
-        const return_value = try self.resolve(inst.a);
+    /// Pop the top frame and restore the stack to the length it
+    /// recorded on entry. The top-level frame is never popped.
+    fn popFrame(self: *VM) Frame {
+        std.debug.assert(self.frames.items.len > 1);
+        const frame = self.frames.pop().?;
+        self.stack.shrinkRetainingCapacity(frame.entry_stack_len);
+        return frame;
+    }
 
-        // Phase 3.3b (peer-AI turn 68): callValue's synthetic
-        // frame path. If this frame's host_result is set, the
-        // caller is HOST CODE (not a regular routine), so the
-        // result must go into the result cell, not into a
-        // caller's slot. Pop the frame, restore the stack to the
-        // frame's entry length, and signal completion. `runUntilDepth`
-        // detects the depth decrease + result_cell.done and
-        // returns.
-        const callee_idx_check = self.frames.items.len - 1;
-        if (self.frames.items[callee_idx_check].host_result) |hr| {
-            const callee = self.frames.items[callee_idx_check];
+    /// `call:call` on a keyword or collection (PLAN §8.7): `(:k m)`,
+    /// `(m :k)`, `(s x)`, `(v i)` are lookups, which take at most a
+    /// receiver and a default and never push a frame.
+    fn execCallLookup(self: *VM, callee: Value, call_base: u32, argc: u32, result_dst: u12) VmError!void {
+        if (argc > 2) return VmError.ArityMismatch;
+        var args_buf: [2]Value = undefined;
+        var i: u32 = 0;
+        while (i < argc) : (i += 1) {
+            args_buf[i] = (try self.slotPtr(@intCast(call_base + 1 + i))).*;
+        }
+        const result = try callLookup(callee, args_buf[0..argc]);
+        if (result_dst >= self.currentFrame().slot_count) {
+            return VmError.OperandOutOfRange;
+        }
+        (try self.slotPtr(result_dst)).* = result;
+    }
+
+    /// `call:return A=slot _ _` — return `slot[A]` from the current
+    /// frame.
+    fn execCallReturn(self: *VM, inst: Inst) VmError!void {
+        // Read the return value while the callee frame is still
+        // active; popping first would invalidate the slot.
+        const return_value = try self.resolve(inst.a);
+        return self.returnValue(return_value);
+    }
+
+    /// `call:return-nil` — return nil from the current frame.
+    fn execCallReturnNil(self: *VM) VmError!void {
+        return self.returnValue(value_mod.nilValue());
+    }
+
+    /// Complete the current frame with `return_value`. A frame
+    /// pushed by `callValue` hands the value to its host result
+    /// cell; the top-level frame halts the VM with it; any other
+    /// frame is popped and the value lands in the caller's
+    /// `return_dst` slot, where the caller resumes at `return_pc`.
+    /// Frame metadata is validated before anything is mutated so
+    /// a corrupt frame surfaces an error, not a half-popped VM.
+    fn returnValue(self: *VM, return_value: Value) VmError!void {
+        const callee = self.frames.items[self.frames.items.len - 1];
+        if (callee.host_result) |hr| {
             hr.value = return_value;
             hr.done = true;
-            _ = self.frames.pop().?;
-            self.stack.shrinkRetainingCapacity(callee.entry_stack_len);
+            _ = self.popFrame();
             return;
         }
-
-        // Top-level return halts the VM and stores result.
         if (self.frames.items.len == 1) {
             self.result = return_value;
             self.halted = true;
             return;
         }
-
-        // Non-top-level return.
-        // Validate frame metadata BEFORE any mutation (peer-AI
-        // turn 43): if `callee.return_dst` is invalid, popping
-        // and shrinking first would partially corrupt VM state
-        // before surfacing the error.
-        const callee_idx = self.frames.items.len - 1;
-        const caller_idx = callee_idx - 1;
-        const callee_meta = self.frames.items[callee_idx];
-        const caller_meta = self.frames.items[caller_idx];
-
-        if (callee_meta.return_dst >= caller_meta.slot_count) {
-            return VmError.OperandOutOfRange;
-        }
-        const caller_end: usize = @as(usize, caller_meta.base_slot) + caller_meta.slot_count;
-        const absolute: usize = @as(usize, caller_meta.base_slot) + callee_meta.return_dst;
-        if (absolute >= caller_end) return VmError.BytecodeCorruption;
-
-        // Mutations from here on out are post-validation.
-        _ = self.frames.pop().?;
-        self.stack.shrinkRetainingCapacity(callee_meta.entry_stack_len);
+        const caller = self.frames.items[self.frames.items.len - 2];
+        if (callee.return_dst >= caller.slot_count) return VmError.OperandOutOfRange;
+        const absolute: usize = @as(usize, caller.base_slot) + callee.return_dst;
+        _ = self.popFrame();
         self.stack.items[absolute] = return_value;
-        self.frames.items[caller_idx].pc = callee_meta.return_pc;
-    }
-
-    /// `call:return-nil` — same as `call:return` with a nil
-    /// return value, no operand resolution. Same validate-before-
-    /// mutate discipline as `execCallReturn` (peer-AI turn 43).
-    fn execCallReturnNil(self: *VM) VmError!void {
-        // Phase 3.3b (peer-AI turn 68): host_result path.
-        const callee_idx_check = self.frames.items.len - 1;
-        if (self.frames.items[callee_idx_check].host_result) |hr| {
-            const callee = self.frames.items[callee_idx_check];
-            hr.value = value_mod.nilValue();
-            hr.done = true;
-            _ = self.frames.pop().?;
-            self.stack.shrinkRetainingCapacity(callee.entry_stack_len);
-            return;
-        }
-
-        if (self.frames.items.len == 1) {
-            self.result = value_mod.nilValue();
-            self.halted = true;
-            return;
-        }
-        const callee_idx = self.frames.items.len - 1;
-        const caller_idx = callee_idx - 1;
-        const callee_meta = self.frames.items[callee_idx];
-        const caller_meta = self.frames.items[caller_idx];
-
-        if (callee_meta.return_dst >= caller_meta.slot_count) {
-            return VmError.OperandOutOfRange;
-        }
-        const caller_end: usize = @as(usize, caller_meta.base_slot) + caller_meta.slot_count;
-        const absolute: usize = @as(usize, caller_meta.base_slot) + callee_meta.return_dst;
-        if (absolute >= caller_end) return VmError.BytecodeCorruption;
-
-        _ = self.frames.pop().?;
-        self.stack.shrinkRetainingCapacity(callee_meta.entry_stack_len);
-        self.stack.items[absolute] = value_mod.nilValue();
-        self.frames.items[caller_idx].pc = callee_meta.return_pc;
+        self.frames.items[self.frames.items.len - 1].pc = callee.return_pc;
     }
 
     // -------------------------------------------------------------------------
@@ -2930,7 +2837,6 @@ pub const VM = struct {
         try self.store(inst.c, closure_v);
     }
 
-
     // -------------------------------------------------------------------------
     // Group `math` (VM.md §10 #3 — PLAN §12.3 group 2)
     //
@@ -3020,18 +2926,10 @@ pub const VM = struct {
     // -------------------------------------------------------------------------
 
     fn execCmp(self: *VM, inst: Inst) VmError!void {
-        const variant: Cmp = @enumFromInt(inst.variant);
         // cmp:<op> a b c   ;  slot[a] = bool(resolve(b) <op> resolve(c))
+        const cmp = std.enums.fromInt(NumCmp, inst.variant) orelse return VmError.BytecodeCorruption;
         const lhs = try self.resolve(inst.b);
         const rhs = try self.resolve(inst.c);
-        const cmp: NumCmp = switch (variant) {
-            .lt => .lt,
-            .lte => .lte,
-            .gt => .gt,
-            .gte => .gte,
-            .eq_num => .eq,
-            _ => return VmError.BytecodeCorruption,
-        };
         try self.store(inst.a, value_mod.fromBool(try numCompare(cmp, lhs, rhs)));
     }
 
@@ -3504,17 +3402,12 @@ pub const VM = struct {
         // unwinding through us).
         self.handlers.shrinkRetainingCapacity(handler_idx);
 
-        // Unwind frames above the matched handler's frame.
-        // Per peer-AI turn 59 §D8: do NOT write to caller
-        // return slots, just pop. (Normal `call:return` writes
-        // to caller's return_dst; throw bypasses that.) The
-        // lowest popped frame recorded the stack length its
-        // caller's frame set requires; restore that.
-        if (self.frames.items.len - 1 > matched.frame_index) {
-            const restore_len = self.frames.items[matched.frame_index + 1].entry_stack_len;
-            self.frames.shrinkRetainingCapacity(matched.frame_index + 1);
-            self.stack.shrinkRetainingCapacity(restore_len);
-        }
+        // Pop every frame above the handler's. A throw bypasses
+        // the callers' return slots: the frames are only popped,
+        // and each pop restores the stack length its frame
+        // recorded on entry, so the lowest pop leaves the extent
+        // the handler's frame set requires.
+        while (self.frames.items.len - 1 > matched.frame_index) _ = self.popFrame();
 
         const frame = self.currentFrame();
 
@@ -3731,28 +3624,88 @@ fn fixnumResult(n: i64) VmError!value_mod.Value {
     return value_mod.fromFixnum(n) orelse VmError.ArithmeticOverflow;
 }
 
-pub fn numAdd(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
-    if (a.isFixnum() and b.isFixnum()) {
-        // Two i48 operands never overflow an i64 sum; only the
-        // fixnum range check can fail.
-        return fixnumResult(a.asFixnum() + b.asFixnum());
+/// One contagious binary operation: two fixnums stay integral
+/// through `int_op` (whose result is range-checked into a fixnum),
+/// any float operand widens both sides through `float_op`.
+fn arith(
+    comptime int_op: fn (i64, i64) VmError!i64,
+    comptime float_op: fn (f64, f64) f64,
+    a: value_mod.Value,
+    b: value_mod.Value,
+) VmError!value_mod.Value {
+    if (a.isFixnum() and b.isFixnum()) return fixnumResult(try int_op(a.asFixnum(), b.asFixnum()));
+    return value_mod.fromFloat(float_op(try toFloat(a), try toFloat(b)));
+}
+
+/// `arith` for the division family: a zero divisor of either kind
+/// raises before the operation is chosen.
+fn divLike(
+    comptime int_op: fn (i64, i64) VmError!i64,
+    comptime float_op: fn (f64, f64) f64,
+    a: value_mod.Value,
+    b: value_mod.Value,
+) VmError!value_mod.Value {
+    if ((b.isFixnum() and b.asFixnum() == 0) or (b.isFloat() and b.asFloat() == 0)) return VmError.DivideByZero;
+    return arith(int_op, float_op, a, b);
+}
+
+const int_ops = struct {
+    // Two i48 operands never overflow an i64 sum or difference;
+    // only the fixnum range check on the result can fail.
+    fn add(x: i64, y: i64) VmError!i64 {
+        return x + y;
     }
-    return value_mod.fromFloat(try toFloat(a) + try toFloat(b));
+    fn sub(x: i64, y: i64) VmError!i64 {
+        return x - y;
+    }
+    fn mul(x: i64, y: i64) VmError!i64 {
+        return std.math.mul(i64, x, y) catch VmError.ArithmeticOverflow;
+    }
+    fn quot(x: i64, y: i64) VmError!i64 {
+        return @divTrunc(x, y);
+    }
+    fn rem(x: i64, y: i64) VmError!i64 {
+        return @rem(x, y);
+    }
+    fn mod(x: i64, y: i64) VmError!i64 {
+        return @mod(x, y);
+    }
+};
+
+const float_ops = struct {
+    fn add(x: f64, y: f64) f64 {
+        return x + y;
+    }
+    fn sub(x: f64, y: f64) f64 {
+        return x - y;
+    }
+    fn mul(x: f64, y: f64) f64 {
+        return x * y;
+    }
+    fn quot(x: f64, y: f64) f64 {
+        return @trunc(x / y);
+    }
+    fn rem(x: f64, y: f64) f64 {
+        return @rem(x, y);
+    }
+    /// Floored: the remainder takes the divisor's sign, as the
+    /// integer `@mod` does.
+    fn mod(x: f64, y: f64) f64 {
+        const r = @rem(x, y);
+        return if (r != 0 and (r < 0) != (y < 0)) r + y else r;
+    }
+};
+
+pub fn numAdd(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
+    return arith(int_ops.add, float_ops.add, a, b);
 }
 
 pub fn numSub(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
-    if (a.isFixnum() and b.isFixnum()) {
-        return fixnumResult(a.asFixnum() - b.asFixnum());
-    }
-    return value_mod.fromFloat(try toFloat(a) - try toFloat(b));
+    return arith(int_ops.sub, float_ops.sub, a, b);
 }
 
 pub fn numMul(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
-    if (a.isFixnum() and b.isFixnum()) {
-        const p = std.math.mul(i64, a.asFixnum(), b.asFixnum()) catch return VmError.ArithmeticOverflow;
-        return fixnumResult(p);
-    }
-    return value_mod.fromFloat(try toFloat(a) * try toFloat(b));
+    return arith(int_ops.mul, float_ops.mul, a, b);
 }
 
 /// `/`: exact fixnum quotient stays a fixnum, anything else is f64.
@@ -3769,41 +3722,17 @@ pub fn numDiv(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
 
 /// `quot`: truncated division. A zero divisor of either kind raises.
 pub fn numQuot(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
-    if (a.isFixnum() and b.isFixnum()) {
-        const y = b.asFixnum();
-        if (y == 0) return VmError.DivideByZero;
-        return fixnumResult(@divTrunc(a.asFixnum(), y));
-    }
-    const x = try toFloat(a);
-    const y = try toFloat(b);
-    if (y == 0) return VmError.DivideByZero;
-    return value_mod.fromFloat(@trunc(x / y));
+    return divLike(int_ops.quot, float_ops.quot, a, b);
 }
 
 /// `rem`: remainder of truncated division, sign of the dividend.
 pub fn numRem(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
-    if (a.isFixnum() and b.isFixnum()) {
-        const y = b.asFixnum();
-        if (y == 0) return VmError.DivideByZero;
-        return fixnumResult(@rem(a.asFixnum(), y));
-    }
-    const x = try toFloat(a);
-    const y = try toFloat(b);
-    if (y == 0) return VmError.DivideByZero;
-    return value_mod.fromFloat(@rem(x, y));
+    return divLike(int_ops.rem, float_ops.rem, a, b);
 }
 
 /// `mod`: remainder of floored division, sign of the divisor.
 pub fn numMod(a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
-    if (a.isFixnum() and b.isFixnum()) {
-        const y = b.asFixnum();
-        if (y == 0) return VmError.DivideByZero;
-        return fixnumResult(@mod(a.asFixnum(), y));
-    }
-    const x = try toFloat(a);
-    const y = try toFloat(b);
-    if (y == 0) return VmError.DivideByZero;
-    return value_mod.fromFloat(@mod(x, y));
+    return divLike(int_ops.mod, float_ops.mod, a, b);
 }
 
 pub fn numNeg(a: value_mod.Value) VmError!value_mod.Value {
@@ -3822,26 +3751,28 @@ pub fn numAbs(a: value_mod.Value) VmError!value_mod.Value {
     };
 }
 
-pub const NumCmp = enum { lt, lte, gt, gte, eq };
+/// The comparison predicates of the tower. The variants share
+/// their values with the `cmp` opcode group so `execCmp` needs no
+/// mapping.
+pub const NumCmp = enum(u6) { lt, lte, gt, gte, eq };
+
+comptime {
+    for (std.meta.tags(NumCmp)) |tag| {
+        const op: Cmp = @enumFromInt(@intFromEnum(tag));
+        std.debug.assert(std.mem.startsWith(u8, @tagName(op), @tagName(tag)));
+    }
+}
 
 /// Ordered comparison across the tower. Two fixnums compare as
 /// integers; any float operand widens both sides to f64, so
 /// `(< 1 1.5)` holds and `(== 1 1.0)` holds. NaN compares false
 /// under every predicate, as IEEE specifies.
 pub fn numCompare(cmp: NumCmp, a: value_mod.Value, b: value_mod.Value) VmError!bool {
-    if (a.isFixnum() and b.isFixnum()) {
-        const x = a.asFixnum();
-        const y = b.asFixnum();
-        return switch (cmp) {
-            .lt => x < y,
-            .lte => x <= y,
-            .gt => x > y,
-            .gte => x >= y,
-            .eq => x == y,
-        };
-    }
-    const x = try toFloat(a);
-    const y = try toFloat(b);
+    if (a.isFixnum() and b.isFixnum()) return ordered(i64, cmp, a.asFixnum(), b.asFixnum());
+    return ordered(f64, cmp, try toFloat(a), try toFloat(b));
+}
+
+fn ordered(comptime T: type, cmp: NumCmp, x: T, y: T) bool {
     return switch (cmp) {
         .lt => x < y,
         .lte => x <= y,
@@ -3866,19 +3797,20 @@ pub fn numSign(a: value_mod.Value) VmError!std.math.Order {
     };
 }
 
-/// `max`/`min` over two operands. A float operand makes the
-/// result a float; NaN wins, as in Clojure.
+/// `max`/`min` over two operands: the winning operand itself, of
+/// its own kind (`(max 2 1.0)` is 2); on a tie the second, as
+/// Clojure's `(if (> x y) x y)`; NaN wins.
 pub fn numExtremum(want_max: bool, a: value_mod.Value, b: value_mod.Value) VmError!value_mod.Value {
     if (a.isFixnum() and b.isFixnum()) {
         const x = a.asFixnum();
         const y = b.asFixnum();
-        return if ((x > y) == want_max) a else b;
+        return if (if (want_max) x > y else x < y) a else b;
     }
     const x = try toFloat(a);
     const y = try toFloat(b);
-    if (std.math.isNan(x)) return value_mod.fromFloat(x);
-    if (std.math.isNan(y)) return value_mod.fromFloat(y);
-    return value_mod.fromFloat(if ((x > y) == want_max) x else y);
+    if (std.math.isNan(x)) return a;
+    if (std.math.isNan(y)) return b;
+    return if (if (want_max) x > y else x < y) a else b;
 }
 
 // =============================================================================
@@ -4933,6 +4865,9 @@ test "numeric tower: contagion, exact division and integer results" {
     try testing.expectEqual(@as(f64, -2.0), (try numQuot(fl(-7.0), fx(3))).asFloat());
     try testing.expectEqual(@as(f64, -1.0), (try numRem(fl(-7.0), fx(3))).asFloat());
     try testing.expectEqual(@as(f64, 2.0), (try numMod(fl(-7.0), fx(3))).asFloat());
+    try testing.expectEqual(@as(f64, -0.5), (try numMod(fl(7.5), fx(-2))).asFloat());
+    try testing.expectEqual(@as(f64, -1.0), (try numMod(fx(5), fl(-1.5))).asFloat());
+    try testing.expectEqual(@as(f64, 0.0), (try numMod(fl(6.0), fx(-2))).asFloat());
     try testing.expectEqual(@as(i64, -3), (try numNeg(fx(3))).asFixnum());
     try testing.expectEqual(@as(i64, 3), (try numAbs(fx(-3))).asFixnum());
     try testing.expectEqual(@as(f64, 3.5), (try numAbs(fl(-3.5))).asFloat());
@@ -4986,7 +4921,9 @@ test "numeric tower: comparison across kinds and NaN" {
     try testing.expectEqual(std.math.Order.gt, try numSign(fx(3)));
     try testing.expectEqual(@as(i64, 4), (try numExtremum(true, fx(3), fx(4))).asFixnum());
     try testing.expectEqual(@as(f64, 4.0), (try numExtremum(true, fx(3), fl(4.0))).asFloat());
-    try testing.expectEqual(@as(f64, 3.0), (try numExtremum(false, fx(3), fl(4.0))).asFloat());
+    try testing.expectEqual(@as(i64, 3), (try numExtremum(false, fx(3), fl(4.0))).asFixnum());
+    try testing.expectEqual(@as(i64, 2), (try numExtremum(true, fx(2), fl(1.0))).asFixnum());
+    try testing.expectEqual(@as(f64, 1.0), (try numExtremum(true, fx(1), fl(1.0))).asFloat());
     try testing.expect(std.math.isNan((try numExtremum(true, nan, fx(4))).asFloat()));
 }
 
@@ -5124,7 +5061,7 @@ test "VM math:add: dst/rhs aliasing (math:add s0, c0, s0)" {
 
 test "VM math:add: mixed slot+constant operand kinds" {
     // Pins resolve() behavior across kind combinations the
-    // codegen will actually emit (peer-AI turn 33).
+    // codegen emits.
     const consts = [_]Const{cval(value_mod.fromFixnum(100).?)};
     var code = [_]Inst{
         asm_.loadConst(0, 0), //                       s0 = 100
@@ -5296,13 +5233,7 @@ test "VM #6a: var:load-var returns var.root for bound var" {
         .slot_count = 1,
         .var_table = &var_table,
     };
-    // Reset the VM's frame to the new routine. (Hacky but
-    // matches what we did before compileTiny existed for the
-    // earlier VM tests.)
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
-    // Stack already has 1 slot from the stub routine.
+    try vm.retargetTop(&routine);
     const result = try vm.run();
     try testing.expect(result.isFixnum());
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
@@ -5329,9 +5260,7 @@ test "VM #6a: var:load-var on unbound Var traps :unbound-var" {
         .slot_count = 1,
         .var_table = &var_table,
     };
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
+    try vm.retargetTop(&routine);
     const res = vm.run();
     try testing.expectError(VmError.UnboundVar, res);
 }
@@ -5354,9 +5283,7 @@ test "VM #6a: var:load-var operand index out of range traps :operand-out-of-rang
         .slot_count = 1,
         // var_table = default empty
     };
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
+    try vm.retargetTop(&routine);
     const res = vm.run();
     try testing.expectError(VmError.OperandOutOfRange, res);
 }
@@ -5385,9 +5312,7 @@ test "VM #6a: var:load-var with non-V B operand traps :invalid-operand-kind" {
         .consts = &.{},
         .slot_count = 1,
     };
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
+    try vm.retargetTop(&routine);
     const res = vm.run();
     try testing.expectError(VmError.InvalidOperandKind, res);
 }
@@ -5417,9 +5342,7 @@ test "VM #6b: var:store-var sets root, marks bound, returns Var object" {
         .slot_count = 1,
         .var_table = &var_table,
     };
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
+    try vm.retargetTop(&routine);
 
     const result = try vm.run();
     // store-var returns the Var object, not the value.
@@ -5458,9 +5381,7 @@ test "VM #6b: var:store-var twice preserves Var identity (rebind in place)" {
         .slot_count = 1,
         .var_table = &var_table,
     };
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
+    try vm.retargetTop(&routine);
 
     const result = try vm.run();
     try testing.expect(result.kind() == .var_);
@@ -5490,9 +5411,7 @@ test "VM #6b: var:var-object returns the Var WITHOUT trapping on unbound" {
         .slot_count = 1,
         .var_table = &var_table,
     };
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
+    try vm.retargetTop(&routine);
 
     const result = try vm.run();
     try testing.expect(result.kind() == .var_);

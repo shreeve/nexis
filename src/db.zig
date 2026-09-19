@@ -307,25 +307,20 @@ fn validateTreeNameAndKey(tree_name: []const u8, key_bytes: []const u8) DbError!
 /// emdb's own behavior for the name.
 pub fn treeId(txn: anytype, tree_name: []const u8, create: bool) !?emdb.TreeId {
     const conn = txn.conn;
-    if (conn.tree_ids.get(tree_name)) |id| {
-        if (!txn.opened.isSet(id)) {
-            const loaded = txn.inner.openTree(tree_name, create) catch |err| switch (err) {
-                error.NotFound => return null,
-                else => return err,
-            };
-            std.debug.assert(loaded == id);
-            txn.opened.set(id);
-        }
-        return id;
-    }
+    const cached = conn.tree_ids.get(tree_name);
+    if (cached) |id| if (txn.opened.isSet(id)) return id;
     const id = txn.inner.openTree(tree_name, create) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
     std.debug.assert(id < TreeSet.bit_length);
-    const owned_name = try conn.allocator.dupe(u8, tree_name);
-    errdefer conn.allocator.free(owned_name);
-    try conn.tree_ids.put(conn.allocator, owned_name, id);
+    if (cached) |known| {
+        std.debug.assert(known == id);
+    } else {
+        const owned_name = try conn.allocator.dupe(u8, tree_name);
+        errdefer conn.allocator.free(owned_name);
+        try conn.tree_ids.put(conn.allocator, owned_name, id);
+    }
     txn.opened.set(id);
     return id;
 }
@@ -413,7 +408,9 @@ pub fn cursorValue(
     page_bytes: u32,
 ) ![]const u8 {
     if (kv.value.len < page_bytes) return kv.value;
-    return (try txn.inner.getFromTree(tree_id, kv.key)) orelse kv.value;
+    // The cursor just returned this key, so the tree must hold it;
+    // a miss means the tree and the cursor disagree.
+    return (try txn.inner.getFromTree(tree_id, kv.key)) orelse error.Corrupted;
 }
 
 pub fn del(
@@ -750,6 +747,21 @@ test "open: a file that is not an emdb store is refused without leaking" {
         close(&opened);
         return error.TestUnexpectedResult;
     } else |_| {}
+}
+
+test "cursorValue: a page-filling entry the tree cannot re-read is Corrupted" {
+    const Inner = struct {
+        fn getFromTree(_: *@This(), _: emdb.TreeId, _: []const u8) !?[]const u8 {
+            return null;
+        }
+    };
+    var inner = Inner{};
+    const txn = struct { inner: *Inner }{ .inner = &inner };
+    const page_bytes: u32 = 16;
+    const short = emdb.Cursor.KeyValue{ .key = "k", .value = "v" };
+    try testing.expectEqualStrings("v", try cursorValue(&txn, 0, short, page_bytes));
+    const full = emdb.Cursor.KeyValue{ .key = "k", .value = "0123456789abcdef" };
+    try testing.expectError(error.Corrupted, cursorValue(&txn, 0, full, page_bytes));
 }
 
 test "put / get / del: single-tree round-trip of a scalar" {

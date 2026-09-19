@@ -1,34 +1,28 @@
 // =============================================================================
-// src/stdlib.zig — Phase 3.3 standard library installation
+// src/stdlib.zig — the native standard library
 // =============================================================================
 //
-// Phase 3.3a (peer-AI turn 67): host-Zig functions exposed as
-// first-class `Value`s of kind `.native_fn`. Each fn has a
-// STATIC `NativeFn` descriptor (no heap allocation, immortal
-// lifetime) and is installed as a Var in the user's namespace
-// at VM startup.
+// Host-Zig functions exposed as first-class `Value`s of kind
+// `.native_fn`. Each has a static `NativeFn` descriptor (no heap
+// allocation, immortal) that the install functions bind as Vars
+// in `nexis.core`, `db`, `nexis.string`, `nexis.internal` and
+// `nextomic` at VM startup. The rest of nexis.core is written in
+// nexis itself (`stdlib/core.nx`, embedded below) on top of these.
 //
-// Phase 3.3a scope (intentionally narrow per peer-AI turn 67
-// §D8 — bound first commit to non-reentrant primitives):
-//   - sequence:   list, cons, first, rest, count, nth, empty?
-//   - utility:    identity, nil?, some?
-//
-// NO higher-order fns (map/reduce/filter/apply) — those require
-// `VM.callValue` reentrancy and ship in Phase 3.3b. NO arithmetic
-// Vars (+, <, =) — also 3.3b. NO collection ops beyond list (no
-// assoc/get/conj/etc.) — 3.3c.
-//
-// `nil`-as-empty-seq semantics (peer-AI turn 67 §D8 + §Sharp
-// warnings §8) match Clojure:
+// Every native declares its arity in its descriptor and the VM
+// enforces it; a native never indexes `args` past its declared
+// minimum. Any seqable receiver goes through `makeSeqIter`, so
+// nil, lists, vectors, maps, records, sets and strings behave the
+// same way in every sequence function. Arithmetic delegates to the
+// VM's numeric tower. nil is the empty sequence, as in Clojure:
 //   (first nil)   => nil
 //   (rest nil)    => ()
 //   (count nil)   => 0
 //   (empty? nil)  => true
 //
-// Native fns are visible to BOTH runtime AND compile-time macro
-// eval, because the persistent-namespace design from Phase 3.2
-// (peer-AI turn 66) means `routine.var_table` resolves to the
-// SAME Var pointer regardless of which VM evaluates it.
+// Natives are visible to runtime and compile-time macro eval
+// alike because `routine.var_table` resolves to the same Var
+// regardless of which VM evaluates it.
 
 const std = @import("std");
 const value_mod = @import("value");
@@ -60,11 +54,8 @@ const VmError = vm_mod.VmError;
 // Installation
 // =============================================================================
 
-/// Phase 3.3a (peer-AI turn 67 §D2): install core native fns
-/// into `ns`. Idempotent: re-installing replaces the root
-/// without disturbing the Var's `.macro` flag. Callers
-/// typically invoke this ONCE at VM startup (REPL, file runner,
-/// test harness).
+/// Install the core natives into `ns`. Idempotent: re-installing
+/// replaces the root without disturbing the Var's `.macro` flag.
 ///
 /// Native fn NAMES are string literals (`.rodata`, immortal),
 /// so the Namespace's existing `intern(name)` overload (which
@@ -97,13 +88,10 @@ pub fn installNextomic(nextomic_ns: *Namespace) !void {
     try nextomic_mod.natives.install(nextomic_ns);
 }
 
-/// Phase 5.2b (peer-AI turn 79): install `nexis.string/*` ops
-/// into the `nexis.string` namespace. NOT auto-referred (matches
-/// Clojure's `clojure.string`); users call qualified
-/// `(nexis.string/lower-case ...)`. CLI ordering must be
-/// installCore → installDb → installString → bootstrap core.nx
-/// (turn 79 §D7) so future composite definitions in core.nx
-/// can reference `nexis.string/*` without a load-order trap.
+/// Install `nexis.string/*` into the `nexis.string` namespace. Not
+/// auto-referred (like Clojure's `clojure.string`): users call
+/// `(nexis.string/lower-case ...)`. Installed before core.nx is
+/// bootstrapped so composite definitions may refer to it.
 pub fn installString(string_ns: *Namespace) !void {
     for (string_fns) |entry| {
         const v = try string_ns.intern(entry.name);
@@ -112,11 +100,10 @@ pub fn installString(string_ns: *Namespace) !void {
     }
 }
 
-/// Phase 5.3a (peer-AI turn 84): install `#%`-prefixed internal
-/// helpers into the `nexis.internal` namespace. NOT auto-
-/// referred; the `defrecord`/`defprotocol` macros emit qualified
-/// calls (`nexis.internal/#%register-record-type` etc.). User
-/// code does not call these directly.
+/// Install the `#%`-prefixed helpers into the `nexis.internal`
+/// namespace. Not auto-referred: the `defrecord`/`defprotocol`
+/// macros emit qualified calls (`nexis.internal/#%register-record-type`
+/// etc.); user code does not call these directly.
 pub fn installInternal(internal_ns: *Namespace) !void {
     for (internal_fns) |entry| {
         const v = try internal_ns.intern(entry.name);
@@ -187,15 +174,10 @@ const internal_fns = [_]CoreEntry{
     .{ .name = "#%extend-default-impl", .descriptor = &native_extend_default_impl },
 };
 
-/// Phase 3.3d (peer-AI turn 67 §D5 + §3.3d): composite stdlib
-/// layer written in nexis itself, embedded at compile time.
-/// CLI / test harnesses compile + evaluate this AFTER calling
-/// `installCore` so the composite definitions can use the
-/// native primitives.
-///
-/// Lives in `src/stdlib/core.nx`. Add new macros/fns there,
-/// not here — keeping the composite layer in nexis source
-/// matches CLOJURE-REVIEW.md §1.1 two-stage bootstrap.
+/// The part of nexis.core written in nexis itself, embedded at
+/// compile time. Evaluated after `installCore` so its definitions
+/// can use the natives. Add composite macros and fns to
+/// `src/stdlib/core.nx`, not here.
 pub const CORE_NX_SOURCE: []const u8 = @embedFile("stdlib/core.nx");
 /// The `nextomic` namespace's sugar (`with-conn`), bootstrapped after
 /// `installNextomic` with that namespace current.
@@ -304,6 +286,7 @@ const core_fns = [_]CoreEntry{
     .{ .name = "sort-by", .descriptor = &native_sort_by },
     .{ .name = "hash", .descriptor = &native_hash },
     .{ .name = "name", .descriptor = &native_name },
+    .{ .name = "namespace", .descriptor = &native_namespace },
     .{ .name = "keyword", .descriptor = &native_keyword },
     .{ .name = "symbol", .descriptor = &native_symbol },
     .{ .name = "boolean", .descriptor = &native_boolean },
@@ -326,6 +309,9 @@ const core_fns = [_]CoreEntry{
     .{ .name = "vec", .descriptor = &native_vec },
     .{ .name = "hash-map", .descriptor = &native_hash_map },
     .{ .name = "hash-set", .descriptor = &native_hash_set },
+    .{ .name = "set", .descriptor = &native_set },
+    .{ .name = "subvec", .descriptor = &native_subvec },
+    .{ .name = "identical?", .descriptor = &native_identical_q },
     .{ .name = "assoc", .descriptor = &native_assoc },
     .{ .name = "dissoc", .descriptor = &native_dissoc },
     .{ .name = "get", .descriptor = &native_get },
@@ -523,8 +509,9 @@ const native_sort = NativeFn{ .name = "sort", .min_arity = 1, .max_arity = 2, .c
 const native_sort_by = NativeFn{ .name = "sort-by", .min_arity = 2, .max_arity = 3, .call = &fnSortBy };
 const native_hash = NativeFn{ .name = "hash", .min_arity = 1, .max_arity = 1, .call = &fnHash };
 const native_name = NativeFn{ .name = "name", .min_arity = 1, .max_arity = 1, .call = &fnName };
-const native_keyword = NativeFn{ .name = "keyword", .min_arity = 1, .max_arity = 1, .call = &fnKeyword };
-const native_symbol = NativeFn{ .name = "symbol", .min_arity = 1, .max_arity = 1, .call = &fnSymbol };
+const native_namespace = NativeFn{ .name = "namespace", .min_arity = 1, .max_arity = 1, .call = &fnNamespace };
+const native_keyword = NativeFn{ .name = "keyword", .min_arity = 1, .max_arity = 2, .call = &fnKeyword };
+const native_symbol = NativeFn{ .name = "symbol", .min_arity = 1, .max_arity = 2, .call = &fnSymbol };
 const native_boolean = NativeFn{ .name = "boolean", .min_arity = 1, .max_arity = 1, .call = &fnBoolean };
 const native_list_q = NativeFn{ .name = "list?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
 const native_seq_q = NativeFn{ .name = "seq?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
@@ -546,6 +533,9 @@ const native_vector = NativeFn{ .name = "vector", .min_arity = 0, .max_arity = n
 const native_vec = NativeFn{ .name = "vec", .min_arity = 1, .max_arity = 1, .call = &fnVec };
 const native_hash_map = NativeFn{ .name = "hash-map", .min_arity = 0, .max_arity = null, .call = &fnHashMap };
 const native_hash_set = NativeFn{ .name = "hash-set", .min_arity = 0, .max_arity = null, .call = &fnHashSet };
+const native_set = NativeFn{ .name = "set", .min_arity = 1, .max_arity = 1, .call = &fnSet };
+const native_subvec = NativeFn{ .name = "subvec", .min_arity = 2, .max_arity = 3, .call = &fnSubvec };
+const native_identical_q = NativeFn{ .name = "identical?", .min_arity = 2, .max_arity = 2, .call = &fnIdenticalQ };
 const native_assoc = NativeFn{ .name = "assoc", .min_arity = 3, .max_arity = null, .call = &fnAssoc };
 const native_dissoc = NativeFn{ .name = "dissoc", .min_arity = 1, .max_arity = null, .call = &fnDissoc };
 const native_get = NativeFn{ .name = "get", .min_arity = 2, .max_arity = 3, .call = &fnGet };
@@ -621,10 +611,10 @@ const native_string_split = NativeFn{ .name = "nexis.string/split", .min_arity =
 const native_string_join = NativeFn{ .name = "nexis.string/join", .min_arity = 1, .max_arity = 2, .call = &fnStringJoin };
 const native_string_replace = NativeFn{ .name = "nexis.string/replace", .min_arity = 3, .max_arity = 3, .call = &fnStringReplace };
 const native_db_alter = NativeFn{ .name = "db/alter!", .min_arity = 3, .max_arity = null, .call = &fnDbAlter };
-// Phase 4.0d — scan + reduce-tree.
+// scan + reduce-tree.
 const native_db_scan = NativeFn{ .name = "db/scan", .min_arity = 2, .max_arity = 4, .call = &fnDbScan };
 const native_db_reduce_tree = NativeFn{ .name = "db/reduce-tree", .min_arity = 4, .max_arity = 4, .call = &fnDbReduceTree };
-// Phase 4.0f — snapshot aliases. emdb read transactions ARE
+// Snapshot aliases. emdb read transactions ARE
 // snapshots (pinned to the commit generation at begin time).
 // These names give users PLAN.md §15.7 vocabulary without
 // duplicating the underlying mechanism.
@@ -728,10 +718,8 @@ fn fnSeq(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(count coll)` → element count. nil → 0. Lists, vectors,
-/// maps, sets, strings supported. For strings: codepoint count
-/// (Phase 5.2a, peer-AI turn 77 §D1 — user-facing count is by
-/// Unicode scalar, not byte; O(n) walk via
-/// `string_mod.codepointCount`).
+/// maps, records, sets and strings; a string counts Unicode
+/// scalars, not bytes.
 fn fnCount(_: *VM, args: []const Value) VmError!Value {
     const c = args[0];
     const n: i64 = switch (c.kind()) {
@@ -739,6 +727,7 @@ fn fnCount(_: *VM, args: []const Value) VmError!Value {
         .list => @intCast(list_mod.count(c)),
         .persistent_vector => @intCast(vector_mod.count(c)),
         .persistent_map => @intCast(champ_mod.mapCount(c)),
+        .record => @intCast(champ_mod.mapCount(record_mod.fieldsOf(c))),
         .persistent_set => @intCast(champ_mod.setCount(c)),
         .string => @intCast(string_mod.codepointCount(c) catch return VmError.Utf8Error),
         else => return VmError.KindMismatch,
@@ -825,6 +814,7 @@ fn fnEmptyQ(_: *VM, args: []const Value) VmError!Value {
         .list => list_mod.isEmpty(c),
         .persistent_vector => vector_mod.isEmpty(c),
         .persistent_map => champ_mod.mapCount(c) == 0,
+        .record => champ_mod.mapCount(record_mod.fieldsOf(c)) == 0,
         .persistent_set => champ_mod.setCount(c) == 0,
         .string => string_mod.byteLen(c) == 0,
         else => return VmError.KindMismatch,
@@ -971,16 +961,20 @@ fn fnDec(_: *VM, args: []const Value) VmError!Value {
     return vm_mod.numSub(args[0], value_mod.fromFixnum(1).?);
 }
 
+fn numMax(a: Value, b: Value) VmError!Value {
+    return vm_mod.numExtremum(true, a, b);
+}
+
+fn numMin(a: Value, b: Value) VmError!Value {
+    return vm_mod.numExtremum(false, a, b);
+}
+
 fn fnMax(_: *VM, args: []const Value) VmError!Value {
-    var acc = try requireNumber(args[0]);
-    for (args[1..]) |x| acc = try vm_mod.numExtremum(true, acc, x);
-    return acc;
+    return foldNumbers(&numMax, args);
 }
 
 fn fnMin(_: *VM, args: []const Value) VmError!Value {
-    var acc = try requireNumber(args[0]);
-    for (args[1..]) |x| acc = try vm_mod.numExtremum(false, acc, x);
-    return acc;
+    return foldNumbers(&numMin, args);
 }
 
 fn fnAbs(_: *VM, args: []const Value) VmError!Value {
@@ -1037,13 +1031,13 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// apply + HOFs (3.3b)
+// apply + HOFs
 // =============================================================================
 //
-// `apply` + `map` / `reduce` / `filter` are the FIRST users of
-// `VM.callValue` (peer-AI turn 68). They MUST propagate
-// `VmError.ControlTransferred` unchanged so throws from inside
-// user fns escape to the outer handler correctly.
+// `apply`, `map`, `reduce`, `filter` and the rest call back into
+// the VM through `VM.callValue`. They propagate
+// `VmError.ControlTransferred` unchanged so a throw from inside a
+// user fn lands at the outer handler.
 
 /// `(apply f x1 x2 ... xs)` calls `f` with the elements of
 /// the last arg seq spliced in after the leading args.
@@ -1069,19 +1063,22 @@ fn fnApply(vm: *VM, args: []const Value) VmError!Value {
 /// stopping at the shortest collection. Throws inside `f`
 /// propagate via `ControlTransferred`.
 fn fnMap(vm: *VM, args: []const Value) VmError!Value {
-    const f = args[0];
-    const colls = args[1..];
-
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
+    try mapInto(vm, args[0], args[1..], &results);
+    return try buildListFromSlice(vm, results.items);
+}
 
+/// Append `(f x1 x2 ...)` for every position of the shortest of
+/// `colls` to `out`.
+fn mapInto(vm: *VM, f: Value, colls: []const Value, out: *std.ArrayList(Value)) VmError!void {
     if (colls.len == 1) {
         var it = try makeSeqIter(vm, colls[0]);
         while (try it.next()) |x| {
             const one = [_]Value{x};
-            results.append(vm.allocator, try vm.callValue(f, &one)) catch return VmError.OutOfMemory;
+            out.append(vm.allocator, try vm.callValue(f, &one)) catch return VmError.OutOfMemory;
         }
-        return try buildListFromSlice(vm, results.items);
+        return;
     }
 
     const iters = vm.allocator.alloc(SeqIter, colls.len) catch return VmError.OutOfMemory;
@@ -1093,9 +1090,8 @@ fn fnMap(vm: *VM, args: []const Value) VmError!Value {
         for (iters, 0..) |*it, i| {
             call_args[i] = (try it.next()) orelse break :outer;
         }
-        results.append(vm.allocator, try vm.callValue(f, call_args)) catch return VmError.OutOfMemory;
+        out.append(vm.allocator, try vm.callValue(f, call_args)) catch return VmError.OutOfMemory;
     }
-    return try buildListFromSlice(vm, results.items);
 }
 
 /// `(reduce f coll)` / `(reduce f init coll)` → left fold. With
@@ -1105,12 +1101,7 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     const f = args[0];
     const coll = args[args.len - 1];
     var it = try makeSeqIter(vm, coll);
-    var acc: Value = undefined;
-    if (args.len == 3) {
-        acc = args[1];
-    } else {
-        acc = (try it.next()) orelse return try vm.callValue(f, &.{});
-    }
+    var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try vm.callValue(f, &.{});
     while (try it.next()) |x| {
         const pair = [_]Value{ acc, x };
         acc = try vm.callValue(f, &pair);
@@ -1150,18 +1141,22 @@ const Sieve = enum { keep_truthy, keep_falsy, keep_result };
 fn sieve(vm: *VM, mode: Sieve, pred: Value, coll: Value) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
+    try sieveInto(vm, mode, pred, coll, &results);
+    return try buildListFromSlice(vm, results.items);
+}
+
+fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, out: *std.ArrayList(Value)) VmError!void {
     var it = try makeSeqIter(vm, coll);
     while (try it.next()) |x| {
         const one = [_]Value{x};
         const r = try vm.callValue(pred, &one);
-        const out: ?Value = switch (mode) {
+        const kept: ?Value = switch (mode) {
             .keep_truthy => if (r.isTruthy()) x else null,
             .keep_falsy => if (r.isTruthy()) null else x,
             .keep_result => if (r.isNil()) null else r,
         };
-        if (out) |v| results.append(vm.allocator, v) catch return VmError.OutOfMemory;
+        if (kept) |v| out.append(vm.allocator, v) catch return VmError.OutOfMemory;
     }
-    return try buildListFromSlice(vm, results.items);
 }
 
 /// `(filter pred coll)` → eager list of x where `(pred x)` is truthy.
@@ -1180,14 +1175,13 @@ fn fnKeep(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Collection utilities (3.3c)
+// Collection utilities
 // =============================================================================
 //
-// Persistent collection construction + access. Per peer-AI
-// turn 67 §D8 Group B:
+// Persistent collection construction + access:
 //
 //   vector       (& xs)     persistent vector from args
-//   vec          (s)        persistent vector from seq
+//   vec          (s)        persistent vector from any seqable
 //   hash-map     (& kvs)    persistent map from k/v pairs
 //   hash-set     (& xs)     persistent set from args
 //   assoc        (m k v)    persistent put (map or vector)
@@ -1200,9 +1194,8 @@ fn fnKeep(vm: *VM, args: []const Value) VmError!Value {
 //   conj         (coll & xs) persistent add (list: cons; vector: push;
 //                            map: assoc with [k v] pair; set: include)
 //
-// HAMT iteration order is unspecified (peer-AI turn 67 §Sharp
-// warning §7). Tests using `keys`/`vals` should compare as
-// sets, not by exact order.
+// Map and set iteration order is unspecified. Tests using
+// `keys`/`vals` should compare as sets, not by exact order.
 
 fn fnVector(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
@@ -1217,19 +1210,11 @@ fn fnVec(vm: *VM, args: []const Value) VmError!Value {
             return vector_mod.empty(heap) catch VmError.OutOfMemory;
         },
         .persistent_vector => s,
-        .list => blk: {
-            const heap = vm.ensureHeap();
-            // Materialize the list into a slice then fromSlice.
-            var items: std.ArrayList(Value) = .empty;
+        else => blk: {
+            var items = try collectSeq(vm, s);
             defer items.deinit(vm.allocator);
-            var node = s;
-            while (!list_mod.isEmpty(node)) {
-                items.append(vm.allocator, list_mod.head(node)) catch return VmError.OutOfMemory;
-                node = list_mod.tail(node);
-            }
-            break :blk vector_mod.fromSlice(heap, items.items) catch VmError.OutOfMemory;
+            break :blk vector_mod.fromSlice(vm.ensureHeap(), items.items) catch VmError.OutOfMemory;
         },
-        else => VmError.KindMismatch,
     };
 }
 
@@ -1264,6 +1249,35 @@ fn fnHashSet(vm: *VM, args: []const Value) VmError!Value {
         ) catch return VmError.OutOfMemory;
     }
     return s;
+}
+
+/// `(set coll)` → the elements of any seqable as a set.
+fn fnSet(vm: *VM, args: []const Value) VmError!Value {
+    var items = try collectSeq(vm, args[0]);
+    defer items.deinit(vm.allocator);
+    return fnHashSet(vm, items.items);
+}
+
+/// `(subvec v start)` / `(subvec v start end)` → the elements
+/// `start..end` of a vector as a new vector; bounds outside
+/// `0..count` are `:index-out-of-bounds`.
+fn fnSubvec(vm: *VM, args: []const Value) VmError!Value {
+    const v = args[0];
+    if (v.kind() != .persistent_vector) return VmError.KindMismatch;
+    const n = vector_mod.count(v);
+    const start = try requireFixnum(args[1]);
+    const end = if (args.len == 3) try requireFixnum(args[2]) else @as(i64, @intCast(n));
+    if (start < 0 or end < start or end > n) return VmError.IndexOutOfBounds;
+    const items = vm.allocator.alloc(Value, @intCast(end - start)) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(items);
+    for (items, @as(usize, @intCast(start))..) |*slot, i| slot.* = vector_mod.nth(v, i);
+    return vector_mod.fromSlice(vm.ensureHeap(), items) catch VmError.OutOfMemory;
+}
+
+/// `(identical? a b)` → whether the two Values are the same bits:
+/// the same immediate, or the same heap object.
+fn fnIdenticalQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(args[0].tag == args[1].tag and args[0].payload == args[1].payload);
 }
 
 /// `(assoc coll k v & kvs)` → persistent put. Maps and records
@@ -1322,12 +1336,7 @@ fn assocOne(vm: *VM, coll: Value, k: Value, v: Value) VmError!Value {
             if (idx < 0 or @as(usize, @intCast(idx)) > n) return VmError.IndexOutOfBounds;
             const u_idx: usize = @intCast(idx);
             if (u_idx == n) break :blk vector_mod.conj(heap, coll, v) catch return VmError.OutOfMemory;
-            const items = vm.allocator.alloc(Value, n) catch return VmError.OutOfMemory;
-            defer vm.allocator.free(items);
-            var i: usize = 0;
-            while (i < n) : (i += 1) items[i] = vector_mod.nth(coll, i);
-            items[u_idx] = v;
-            break :blk vector_mod.fromSlice(heap, items) catch VmError.OutOfMemory;
+            break :blk vector_mod.assoc(heap, coll, u_idx, v) catch VmError.OutOfMemory;
         },
         else => VmError.KindMismatch,
     };
@@ -1386,7 +1395,20 @@ fn fnDisj(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnGet(_: *VM, args: []const Value) VmError!Value {
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
+    if (args[0].kind() == .string) return (try stringIndex(args[0], args[1])) orelse default;
     return vm_mod.lookup(args[0], args[1], default);
+}
+
+/// The char at fixnum index `k` of string `s`, or null when `k` is
+/// not a fixnum or not in range (the same tolerance `get` shows a
+/// vector).
+fn stringIndex(s: Value, k: Value) VmError!?Value {
+    if (k.kind() != .fixnum or k.asFixnum() < 0) return null;
+    const scalar = string_mod.codepointAt(s, @intCast(k.asFixnum())) catch |err| switch (err) {
+        error.OutOfBounds => return null,
+        error.InvalidUtf8 => return VmError.Utf8Error,
+    };
+    return value_mod.fromChar(scalar) orelse VmError.Utf8Error;
 }
 
 fn fnContainsQ(_: *VM, args: []const Value) VmError!Value {
@@ -1416,7 +1438,7 @@ fn fnContainsQ(_: *VM, args: []const Value) VmError!Value {
             const u_idx: usize = @intCast(idx);
             break :blk value_mod.fromBool(u_idx < vector_mod.count(coll));
         },
-        // Phase 5.3a: records are map-like for `contains?`.
+        .string => value_mod.fromBool((try stringIndex(coll, k)) != null),
         .record => value_mod.fromBool(switch (champ_mod.mapGet(
             record_mod.fieldsOf(coll),
             k,
@@ -1431,29 +1453,20 @@ fn fnContainsQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnKeys(vm: *VM, args: []const Value) VmError!Value {
-    const m = args[0];
-    const map_v: Value = switch (m.kind()) {
-        .nil => return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory,
-        .persistent_map => m,
-        // Phase 5.3a: records expose their field-map keys.
-        .record => record_mod.fieldsOf(m),
-        else => return VmError.KindMismatch,
-    };
-    var collected: std.ArrayList(Value) = .empty;
-    defer collected.deinit(vm.allocator);
-    var it = champ_mod.mapIter(map_v);
-    while (it.next()) |e| {
-        collected.append(vm.allocator, e.key) catch return VmError.OutOfMemory;
-    }
-    return try buildListFromSlice(vm, collected.items);
+    return mapPart(vm, args[0], .key);
 }
 
 fn fnVals(vm: *VM, args: []const Value) VmError!Value {
-    const m = args[0];
+    return mapPart(vm, args[0], .value);
+}
+
+/// `(keys m)` / `(vals m)`: the keys or values of a map or record
+/// as a list, nil when there are none (so `(if (keys m) ...)`
+/// reads as in Clojure).
+fn mapPart(vm: *VM, m: Value, part: enum { key, value }) VmError!Value {
     const map_v: Value = switch (m.kind()) {
-        .nil => return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory,
+        .nil => return value_mod.nilValue(),
         .persistent_map => m,
-        // Phase 5.3a: records expose their field-map values.
         .record => record_mod.fieldsOf(m),
         else => return VmError.KindMismatch,
     };
@@ -1461,8 +1474,9 @@ fn fnVals(vm: *VM, args: []const Value) VmError!Value {
     defer collected.deinit(vm.allocator);
     var it = champ_mod.mapIter(map_v);
     while (it.next()) |e| {
-        collected.append(vm.allocator, e.value) catch return VmError.OutOfMemory;
+        collected.append(vm.allocator, if (part == .key) e.key else e.value) catch return VmError.OutOfMemory;
     }
+    if (collected.items.len == 0) return value_mod.nilValue();
     return try buildListFromSlice(vm, collected.items);
 }
 
@@ -1495,52 +1509,24 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
             break :blk result;
         },
         .persistent_vector => blk: {
-            // Materialize, append, rebuild. Vector push API
-            // exists but our limited public surface only has
-            // fromSlice; round-tripping is fine for v1.
-            const n = vector_mod.count(coll);
-            var items: std.ArrayList(Value) = .empty;
-            defer items.deinit(vm.allocator);
-            items.ensureTotalCapacity(vm.allocator, n + xs.len) catch return VmError.OutOfMemory;
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                items.append(vm.allocator, vector_mod.nth(coll, i)) catch return VmError.OutOfMemory;
-            }
-            for (xs) |x| {
-                items.append(vm.allocator, x) catch return VmError.OutOfMemory;
-            }
-            break :blk vector_mod.fromSlice(heap, items.items) catch VmError.OutOfMemory;
+            var result = coll;
+            for (xs) |x| result = vector_mod.conj(heap, result, x) catch return VmError.OutOfMemory;
+            break :blk result;
         },
-        .persistent_map => blk: {
+        .persistent_map, .record => blk: {
             var result = coll;
             for (xs) |x| {
-                // Each x is a `[k v]` entry, a map whose entries
-                // are all added, or nil (skipped).
+                // Each x is a `[k v]` entry, a map or record whose
+                // entries are all added, or nil (skipped).
                 switch (x.kind()) {
                     .nil => {},
                     .persistent_map, .record => {
                         var it = champ_mod.mapIter(if (x.kind() == .record) record_mod.fieldsOf(x) else x);
-                        while (it.next()) |e| {
-                            result = champ_mod.mapAssoc(
-                                heap,
-                                result,
-                                e.key,
-                                e.value,
-                                &dispatch_mod.hashValue,
-                                &dispatch_mod.equal,
-                            ) catch return VmError.OutOfMemory;
-                        }
+                        while (it.next()) |e| result = try assocOne(vm, result, e.key, e.value);
                     },
                     .persistent_vector => {
                         if (vector_mod.count(x) != 2) return VmError.ArityMismatch;
-                        result = champ_mod.mapAssoc(
-                            heap,
-                            result,
-                            vector_mod.nth(x, 0),
-                            vector_mod.nth(x, 1),
-                            &dispatch_mod.hashValue,
-                            &dispatch_mod.equal,
-                        ) catch return VmError.OutOfMemory;
+                        result = try assocOne(vm, result, vector_mod.nth(x, 0), vector_mod.nth(x, 1));
                     },
                     else => return VmError.KindMismatch,
                 }
@@ -1573,31 +1559,14 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
 // with `buildListFromSlice`; vector-producing variants (`mapv`,
 // `filterv`, `vec`) go through `vector_mod.fromSlice`.
 
-fn requireFixnumArg(v: Value) VmError!i64 {
-    if (v.kind() != .fixnum) return VmError.KindMismatch;
-    return v.asFixnum();
-}
-
 /// `(range end)` / `(range start end)` / `(range start end step)`
 /// → list of fixnums. A zero step is `:invalid-argument` (there
 /// is no infinite sequence to return).
 fn fnRange(vm: *VM, args: []const Value) VmError!Value {
-    var start: i64 = 0;
-    var end: i64 = undefined;
-    var step: i64 = 1;
-    switch (args.len) {
-        1 => end = try requireFixnumArg(args[0]),
-        2 => {
-            start = try requireFixnumArg(args[0]);
-            end = try requireFixnumArg(args[1]);
-        },
-        else => {
-            start = try requireFixnumArg(args[0]);
-            end = try requireFixnumArg(args[1]);
-            step = try requireFixnumArg(args[2]);
-            if (step == 0) return VmError.InvalidArgument;
-        },
-    }
+    const start: i64 = if (args.len == 1) 0 else try requireFixnum(args[0]);
+    const end: i64 = try requireFixnum(args[if (args.len == 1) 0 else 1]);
+    const step: i64 = if (args.len == 3) try requireFixnum(args[2]) else 1;
+    if (step == 0) return VmError.InvalidArgument;
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(vm.allocator);
     var i = start;
@@ -1639,11 +1608,17 @@ fn fnInto(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(mapv f & colls)` / `(filterv pred coll)` — vector results.
 fn fnMapv(vm: *VM, args: []const Value) VmError!Value {
-    return fnVec(vm, &.{try fnMap(vm, args)});
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    try mapInto(vm, args[0], args[1..], &results);
+    return vector_mod.fromSlice(vm.ensureHeap(), results.items) catch VmError.OutOfMemory;
 }
 
 fn fnFilterv(vm: *VM, args: []const Value) VmError!Value {
-    return fnVec(vm, &.{try fnFilter(vm, args)});
+    var results: std.ArrayList(Value) = .empty;
+    defer results.deinit(vm.allocator);
+    try sieveInto(vm, .keep_truthy, args[0], args[1], &results);
+    return vector_mod.fromSlice(vm.ensureHeap(), results.items) catch VmError.OutOfMemory;
 }
 
 /// `(map-indexed f coll)` → `(f i x)`; `(keep-indexed f coll)` →
@@ -1670,18 +1645,29 @@ fn fnKeepIndexed(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(distinct coll)` → first occurrences, in order.
 fn fnDistinct(vm: *VM, args: []const Value) VmError!Value {
-    const heap = vm.ensureHeap();
-    var seen = champ_mod.setEmpty(heap) catch return VmError.OutOfMemory;
+    var seen: ValueSet = .empty;
+    defer seen.deinit(vm.allocator);
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
     var it = try makeSeqIter(vm, args[0]);
     while (try it.next()) |x| {
-        if (champ_mod.setContains(seen, x, &dispatch_mod.hashValue, &dispatch_mod.equal)) continue;
-        seen = champ_mod.setConj(heap, seen, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+        const entry = seen.getOrPut(vm.allocator, x) catch return VmError.OutOfMemory;
+        if (entry.found_existing) continue;
         results.append(vm.allocator, x) catch return VmError.OutOfMemory;
     }
     return try buildListFromSlice(vm, results.items);
 }
+
+/// A scratch set of Values under the language's hash and equality,
+/// on the VM allocator; freed when the native returns.
+const ValueSet = std.HashMapUnmanaged(Value, void, struct {
+    pub fn hash(_: @This(), v: Value) u64 {
+        return dispatch_mod.hashValue(v);
+    }
+    pub fn eql(_: @This(), a: Value, b: Value) bool {
+        return dispatch_mod.equal(a, b);
+    }
+}, std.hash_map.default_max_load_percentage);
 
 /// `(partition n coll)` / `(partition n step coll)` /
 /// `(partition n step pad coll)` → list of n-element lists; a
@@ -1689,9 +1675,9 @@ fn fnDistinct(vm: *VM, args: []const Value) VmError!Value {
 /// elements. `(partition-all n coll)` / `(partition-all n step
 /// coll)` keeps the short tail.
 fn partitionImpl(vm: *VM, all: bool, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[0]);
+    const n = try requireFixnum(args[0]);
     if (n <= 0) return VmError.InvalidArgument;
-    const step: i64 = if (args.len >= 3) try requireFixnumArg(args[1]) else n;
+    const step: i64 = if (args.len >= 3) try requireFixnum(args[1]) else n;
     if (step <= 0) return VmError.InvalidArgument;
     const pad: ?Value = if (args.len == 4) args[2] else null;
     var items = try collectSeq(vm, args[args.len - 1]);
@@ -1806,23 +1792,27 @@ fn fnButlast(vm: *VM, args: []const Value) VmError!Value {
     return try buildListFromSlice(vm, items.items[0 .. items.items.len - 1]);
 }
 
+/// A count argument. Negative counts mean zero everywhere Clojure
+/// takes one (`nthrest`, `split-at`, `take-last`, `repeat`, ...).
+fn requireCount(v: Value) VmError!usize {
+    return @intCast(@max(try requireFixnum(v), 0));
+}
+
 /// `(nthrest coll n)` → coll without its first n elements, as a list.
 fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[1]);
-    if (n < 0) return VmError.IndexOutOfBounds;
+    const n = try requireCount(args[1]);
     var items = try collectSeq(vm, args[0]);
     defer items.deinit(vm.allocator);
-    const skip = @min(@as(usize, @intCast(n)), items.items.len);
+    const skip = @min(n, items.items.len);
     return try buildListFromSlice(vm, items.items[skip..]);
 }
 
 /// `(split-at n coll)` → `[(take n coll) (drop n coll)]`.
 fn fnSplitAt(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[0]);
-    if (n < 0) return VmError.IndexOutOfBounds;
+    const n = try requireCount(args[0]);
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
-    const at = @min(@as(usize, @intCast(n)), items.items.len);
+    const at = @min(n, items.items.len);
     const head = try buildListFromSlice(vm, items.items[0..at]);
     const tail = try buildListFromSlice(vm, items.items[at..]);
     return vector_mod.fromSlice(vm.ensureHeap(), &.{ head, tail }) catch VmError.OutOfMemory;
@@ -1830,38 +1820,35 @@ fn fnSplitAt(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(take-last n coll)` / `(drop-last n coll)`.
 fn fnTakeLast(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[0]);
+    const n = try requireCount(args[0]);
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
-    const keep = @min(@as(usize, @intCast(@max(n, 0))), items.items.len);
+    const keep = @min(n, items.items.len);
     return try buildListFromSlice(vm, items.items[items.items.len - keep ..]);
 }
 
 fn fnDropLast(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[0]);
+    const n = try requireCount(args[0]);
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
-    const drop = @min(@as(usize, @intCast(@max(n, 0))), items.items.len);
+    const drop = @min(n, items.items.len);
     return try buildListFromSlice(vm, items.items[0 .. items.items.len - drop]);
 }
 
-/// `(flatten coll)` → every non-sequential leaf, depth first.
+/// `(flatten coll)` → every non-sequential leaf of a list or
+/// vector, depth first; nil leaves are kept. Anything that is not
+/// sequential, nil included, flattens to `()`.
 fn fnFlatten(vm: *VM, args: []const Value) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
-    try flattenInto(vm, args[0], &results);
+    if (isSequential(args[0].kind())) try flattenInto(vm, args[0], &results);
     return try buildListFromSlice(vm, results.items);
 }
 
 fn flattenInto(vm: *VM, v: Value, out: *std.ArrayList(Value)) VmError!void {
-    switch (v.kind()) {
-        .list, .persistent_vector => {
-            var it = try makeSeqIter(vm, v);
-            while (try it.next()) |x| try flattenInto(vm, x, out);
-        },
-        .nil => {},
-        else => out.append(vm.allocator, v) catch return VmError.OutOfMemory,
-    }
+    if (!isSequential(v.kind())) return out.append(vm.allocator, v) catch VmError.OutOfMemory;
+    var it = try makeSeqIter(vm, v);
+    while (try it.next()) |x| try flattenInto(vm, x, out);
 }
 
 /// `(reductions f coll)` / `(reductions f init coll)` → every
@@ -1871,12 +1858,7 @@ fn fnReductions(vm: *VM, args: []const Value) VmError!Value {
     var it = try makeSeqIter(vm, args[args.len - 1]);
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
-    var acc: Value = undefined;
-    if (args.len == 3) {
-        acc = args[1];
-    } else {
-        acc = (try it.next()) orelse return try buildListFromSlice(vm, &.{try vm.callValue(f, &.{})});
-    }
+    var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try buildListFromSlice(vm, &.{try vm.callValue(f, &.{})});
     results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
     while (try it.next()) |x| {
         acc = try vm.callValue(f, &.{ acc, x });
@@ -1889,33 +1871,45 @@ fn fnReductions(vm: *VM, args: []const Value) VmError!Value {
 /// of `(f)`. `(iterate f x n)` → the first n of x, (f x), (f (f x))
 /// … — the count is explicit because sequences are eager.
 fn fnRepeat(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[0]);
-    var results: std.ArrayList(Value) = .empty;
-    defer results.deinit(vm.allocator);
-    var i: i64 = 0;
-    while (i < n) : (i += 1) results.append(vm.allocator, args[1]) catch return VmError.OutOfMemory;
-    return try buildListFromSlice(vm, results.items);
+    var producer = struct {
+        x: Value,
+        fn next(self: *@This(), _: *VM) VmError!Value {
+            return self.x;
+        }
+    }{ .x = args[1] };
+    return repeatInto(vm, try requireCount(args[0]), &producer);
 }
 
 fn fnRepeatedly(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[0]);
-    var results: std.ArrayList(Value) = .empty;
-    defer results.deinit(vm.allocator);
-    var i: i64 = 0;
-    while (i < n) : (i += 1) results.append(vm.allocator, try vm.callValue(args[1], &.{})) catch return VmError.OutOfMemory;
-    return try buildListFromSlice(vm, results.items);
+    var producer = struct {
+        f: Value,
+        fn next(self: *@This(), vm_: *VM) VmError!Value {
+            return vm_.callValue(self.f, &.{});
+        }
+    }{ .f = args[1] };
+    return repeatInto(vm, try requireCount(args[0]), &producer);
 }
 
 fn fnIterate(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[2]);
+    var producer = struct {
+        f: Value,
+        x: Value,
+        started: bool = false,
+        fn next(self: *@This(), vm_: *VM) VmError!Value {
+            if (self.started) self.x = try vm_.callValue(self.f, &.{self.x});
+            self.started = true;
+            return self.x;
+        }
+    }{ .f = args[0], .x = args[1] };
+    return repeatInto(vm, try requireCount(args[2]), &producer);
+}
+
+/// The list of `n` successive `producer.next(vm)` results.
+fn repeatInto(vm: *VM, n: usize, producer: anytype) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
-    var x = args[1];
-    var i: i64 = 0;
-    while (i < n) : (i += 1) {
-        results.append(vm.allocator, x) catch return VmError.OutOfMemory;
-        if (i + 1 < n) x = try vm.callValue(args[0], &.{x});
-    }
+    results.ensureTotalCapacity(vm.allocator, n) catch return VmError.OutOfMemory;
+    for (0..n) |_| results.appendAssumeCapacity(try producer.next(vm));
     return try buildListFromSlice(vm, results.items);
 }
 
@@ -1944,12 +1938,17 @@ fn fnMinKey(vm: *VM, args: []const Value) VmError!Value {
     return keyExtremum(vm, false, args);
 }
 
-/// `(select-keys m ks)` → map of the entries of m whose keys are in ks.
+/// `(select-keys m ks)` → map of the entries of m whose keys are
+/// in ks; a vector's entries are its `[index element]` pairs, as
+/// for `find`.
 fn fnSelectKeys(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     var out = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
     const src = args[0];
-    if (!(src.kind() == .nil or src.kind() == .persistent_map or src.kind() == .record)) return VmError.KindMismatch;
+    switch (src.kind()) {
+        .nil, .persistent_map, .record, .persistent_vector => {},
+        else => return VmError.KindMismatch,
+    }
     var ks = try makeSeqIter(vm, args[1]);
     while (try ks.next()) |k| {
         const entry = try fnFind(vm, &.{ src, k });
@@ -2025,14 +2024,15 @@ fn fnPop(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
-/// `(empty coll)` → an empty collection of the same kind.
+/// `(empty coll)` → an empty collection of the same kind; a
+/// record, being a map, gives `{}`.
 fn fnEmpty(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     return switch (args[0].kind()) {
         .nil => value_mod.nilValue(),
         .list => list_mod.empty(heap) catch VmError.OutOfMemory,
         .persistent_vector => vector_mod.empty(heap) catch VmError.OutOfMemory,
-        .persistent_map => champ_mod.mapEmpty(heap) catch VmError.OutOfMemory,
+        .persistent_map, .record => champ_mod.mapEmpty(heap) catch VmError.OutOfMemory,
         .persistent_set => champ_mod.setEmpty(heap) catch VmError.OutOfMemory,
         .string => string_mod.fromBytes(heap, "") catch VmError.OutOfMemory,
         else => VmError.KindMismatch,
@@ -2052,7 +2052,7 @@ fn fnNotEmpty(vm: *VM, args: []const Value) VmError!Value {
 /// by bytes; chars by scalar; false before true; vectors by count
 /// then elementwise. Comparing different kinds is a
 /// `KindMismatch`.
-pub fn compareValues(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
+fn compareValues(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
     const ka = a.kind();
     const kb = b.kind();
     if (ka == .nil and kb == .nil) return .eq;
@@ -2187,7 +2187,7 @@ fn fnHash(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromFixnum(@intCast(h & @as(u64, @intCast(value_mod.fixnum_max)))).?;
 }
 
-fn interned_name(vm: *VM, v: Value) VmError![]const u8 {
+fn internedName(vm: *VM, v: Value) VmError![]const u8 {
     return switch (v.kind()) {
         .keyword => vm.ensureInterner().keywordName(v.asKeywordId()),
         .symbol => vm.ensureInterner().symbolName(v.asSymbolId()),
@@ -2196,25 +2196,51 @@ fn interned_name(vm: *VM, v: Value) VmError![]const u8 {
     };
 }
 
-/// `(name x)` → the name part of a keyword, symbol or string.
+/// `(name x)` → the name part of a keyword or symbol; a string is
+/// its own name.
 fn fnName(vm: *VM, args: []const Value) VmError!Value {
-    const full = try interned_name(vm, args[0]);
-    const local = if (args[0].kind() == .string) full else if (std.mem.indexOfScalar(u8, full, '/')) |i| full[i + 1 ..] else full;
-    return string_mod.fromBytes(vm.ensureHeap(), local) catch VmError.OutOfMemory;
+    if (args[0].kind() == .string) return args[0];
+    const parts = intern_mod.Interner.splitQualified(try internedName(vm, args[0]));
+    return string_mod.fromBytes(vm.ensureHeap(), parts.name) catch VmError.OutOfMemory;
+}
+
+/// `(namespace x)` → the namespace part of a keyword or symbol, or
+/// nil when it has none.
+fn fnNamespace(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .keyword and args[0].kind() != .symbol) return VmError.KindMismatch;
+    const parts = intern_mod.Interner.splitQualified(try internedName(vm, args[0]));
+    const ns = parts.ns orelse return value_mod.nilValue();
+    return string_mod.fromBytes(vm.ensureHeap(), ns) catch VmError.OutOfMemory;
+}
+
+/// An interner refusal as the program sees it: the empty name is
+/// `:invalid-argument`.
+fn internFailure(err: intern_mod.InternError) VmError {
+    return switch (err) {
+        error.EmptyName => VmError.InvalidArgument,
+        error.OutOfMemory, error.InternTableFull => VmError.OutOfMemory,
+    };
 }
 
 /// `(keyword x)` / `(symbol x)` → interned from a string, keyword
-/// or symbol.
+/// or symbol. `(keyword ns name)` / `(symbol ns name)` → the
+/// qualified name; a nil `ns` leaves it unqualified.
 fn fnKeyword(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 2) {
+        const ns = if (args[0].isNil()) null else try internedName(vm, args[0]);
+        return vm.ensureInterner().internQualifiedKeyword(ns, try internedName(vm, args[1])) catch |err| internFailure(err);
+    }
     if (args[0].kind() == .keyword) return args[0];
-    const text = try interned_name(vm, args[0]);
-    return vm.ensureInterner().internKeywordValue(text) catch VmError.OutOfMemory;
+    return vm.ensureInterner().internKeywordValue(try internedName(vm, args[0])) catch |err| internFailure(err);
 }
 
 fn fnSymbol(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 2) {
+        const ns = if (args[0].isNil()) null else try internedName(vm, args[0]);
+        return vm.ensureInterner().internQualifiedSymbol(ns, try internedName(vm, args[1])) catch |err| internFailure(err);
+    }
     if (args[0].kind() == .symbol) return args[0];
-    const text = try interned_name(vm, args[0]);
-    return vm.ensureInterner().internSymbolValue(text) catch VmError.OutOfMemory;
+    return vm.ensureInterner().internSymbolValue(try internedName(vm, args[0])) catch |err| internFailure(err);
 }
 
 fn fnBoolean(_: *VM, args: []const Value) VmError!Value {
@@ -2276,16 +2302,15 @@ fn isIfn(k: Kind) bool {
 }
 
 // =============================================================================
-// db primitives (Phase 4.0a)
+// db primitives
 // =============================================================================
 //
-// Per peer-AI turn 72: Path B (explicit transaction threading).
 // `(db/open path)` opens a connection; `db/close` closes it.
-// `(db/ref conn tree-keyword key-string)` constructs a durable
-// ref Value. `db/put-key!` / `db/get-key` / `db/delete-key!` /
-// `db/present?` operate via AUTO-EPHEMERAL transactions for
-// v1.alpha (4.0a). Explicit `with-tx` + tx-threaded ops land in
-// 4.0b.
+// `(db/ref conn tree-keyword key)` constructs a durable ref Value.
+// `db/put-key!` / `db/get-key` / `db/delete-key!` / `db/present?`
+// each run inside a transaction of their own; the explicit
+// transaction primitives below thread one through several
+// operations.
 //
 // Errors land as catchable keyword payloads:
 //   :db/<reason>         a named emdb / db-layer failure, see
@@ -2297,35 +2322,20 @@ fn isIfn(k: Kind) bool {
 //   :codec-failed        encode/decode error
 //   :tx-closed           op on a finished transaction
 //
-// Outside any `try`, the raw VmError propagates instead (the same
-// rule the VM applies to every recoverable error).
+// Storage failures are thrown through `VM.throwKeyword`, so outside
+// any `try` they surface as `UncaughtThrow` with the keyword in
+// `vm.unhandled_throw`, exactly like `(throw :db/key-too-large)`.
 //
 // Connection lifetime: each `db/open` allocates a Connection
 // on the VM's main allocator (NOT the runtime arena) + appends
 // it to vm.db_connections. `db/close` removes from the list +
 // frees. VM.deinit closes any remaining as a safety net.
 
-/// Throw the keyword `name` through `VM.throwKeyword`. When a
-/// handler catches it the result is `ControlTransferred`, which the
-/// run loop resumes from. With no handler anywhere the throw is
-/// withdrawn and `raw` is returned instead, so a program that does
-/// not opt into `try` sees the same VmError taxonomy as for every
-/// other recoverable error.
-fn throwKeyword(vm: *VM, name: []const u8, raw: VmError) VmError {
-    const err = vm.throwKeyword(name);
-    if (err == VmError.UncaughtThrow) {
-        vm.unhandled_throw = null;
-        return raw;
-    }
-    return err;
-}
-
-/// Surface a db.zig / emdb / codec error to the program.
+/// Throw a db.zig / emdb / codec error to the program as its
+/// keyword (`db.failureName`).
 fn dbFailure(vm: *VM, err: anyerror) VmError {
     if (err == error.OutOfMemory) return VmError.OutOfMemory;
-    const name = db_mod.failureName(err);
-    const raw: VmError = if (std.mem.eql(u8, name, "codec-failed")) VmError.CodecFailed else VmError.DbError;
-    return throwKeyword(vm, name, raw);
+    return vm.throwKeyword(db_mod.failureName(err));
 }
 
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
@@ -2443,13 +2453,19 @@ fn fnDbRefQ(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(args[0].kind() == .durable_ref);
 }
 
-/// `(db/put-key! ref value)` — auto-ephemeral write tx for v1.alpha.
+/// The open connection a durable ref belongs to.
+fn liveConnOf(vm: *VM, r: Value) VmError!*db_mod.Connection {
+    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
+    const conn = db_mod.refConn(r) orelse return vm.throwKeyword("db/no-connection");
+    if (!conn.open_flag) return VmError.DbClosed;
+    return conn;
+}
+
+/// `(db/put-key! ref value)` — one write transaction around one put.
 fn fnDbPutKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const v = args[1];
-    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
-    if (!conn.open_flag) return VmError.DbClosed;
+    const conn = try liveConnOf(vm, r);
     var txn = db_mod.beginWrite(conn) catch |err| return dbFailure(vm, err);
     db_mod.putRef(&txn, r, v) catch |err| {
         db_mod.abortWrite(&txn);
@@ -2459,13 +2475,12 @@ fn fnDbPutKey(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.nilValue();
 }
 
-/// `(db/get-key ref)` or `(db/get-key ref default)` — auto-ephemeral read tx.
+/// `(db/get-key ref)` or `(db/get-key ref default)` — one read
+/// transaction around one get.
 fn fnDbGetKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const default = if (args.len > 1) args[1] else value_mod.nilValue();
-    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
-    if (!conn.open_flag) return VmError.DbClosed;
+    const conn = try liveConnOf(vm, r);
     var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
     defer db_mod.abortRead(&txn);
     const result = db_mod.getRef(&txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
@@ -2474,9 +2489,7 @@ fn fnDbGetKey(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnDbDeleteKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
-    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
-    if (!conn.open_flag) return VmError.DbClosed;
+    const conn = try liveConnOf(vm, r);
     var txn = db_mod.beginWrite(conn) catch |err| return dbFailure(vm, err);
     const existed = db_mod.delRef(&txn, r) catch |err| {
         db_mod.abortWrite(&txn);
@@ -2488,9 +2501,7 @@ fn fnDbDeleteKey(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
-    if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const conn = db_mod.refConn(r) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
-    if (!conn.open_flag) return VmError.DbClosed;
+    const conn = try liveConnOf(vm, r);
     var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
     defer db_mod.abortRead(&txn);
     const tree = db_mod.refTreeName(r);
@@ -2500,11 +2511,11 @@ fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// db explicit-tx primitives (Phase 4.0b)
+// db explicit-transaction primitives
 // =============================================================================
 //
-// Per peer-AI turn 72: PATH B (explicit tx threading). The
-// `with-tx` / `with-read-tx` macros (in core.nx) generate
+// Transactions are threaded explicitly. The `with-tx` /
+// `with-read-tx` macros (in core.nx) generate
 // `(let [tx (db/begin-write conn)] (try ...body... (catch any e (db/abort-write! tx) (throw e))))`
 // with commit at the end of the body.
 //
@@ -2539,6 +2550,28 @@ fn writeTxnHandle(v: Value) ?*WriteTxnHandle {
 fn readTxnHandle(v: Value) ?*ReadTxnHandle {
     if (v.kind() != .db_read_txn) return null;
     return @ptrFromInt(v.payload);
+}
+
+/// A transaction Value of either kind that is still open.
+const ActiveTxn = union(enum) {
+    write: *WriteTxnHandle,
+    read: *ReadTxnHandle,
+};
+
+fn activeTxn(v: Value) VmError!ActiveTxn {
+    switch (v.kind()) {
+        .db_write_txn => {
+            const h = writeTxnHandle(v).?;
+            if (!h.active) return VmError.TxClosed;
+            return .{ .write = h };
+        },
+        .db_read_txn => {
+            const h = readTxnHandle(v).?;
+            if (!h.active) return VmError.TxClosed;
+            return .{ .read = h };
+        },
+        else => return VmError.KindMismatch,
+    }
 }
 
 fn fnDbBeginWrite(vm: *VM, args: []const Value) VmError!Value {
@@ -2619,18 +2652,8 @@ fn fnDbGet(vm: *VM, args: []const Value) VmError!Value {
     const r = args[1];
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const result: ?Value = switch (tx_v.kind()) {
-        .db_write_txn => blk: {
-            const h = writeTxnHandle(tx_v).?;
-            if (!h.active) return VmError.TxClosed;
-            break :blk db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
-        },
-        .db_read_txn => blk: {
-            const h = readTxnHandle(tx_v).?;
-            if (!h.active) return VmError.TxClosed;
-            break :blk db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
-        },
-        else => return VmError.KindMismatch,
+    const result: ?Value = switch (try activeTxn(tx_v)) {
+        inline else => |h| db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err),
     };
     return result orelse default;
 }
@@ -2658,8 +2681,7 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     return switch (x.kind()) {
         .durable_ref => blk: {
-            const conn = db_mod.refConn(x) orelse return throwKeyword(vm, "db/no-connection", VmError.DbError);
-            if (!conn.open_flag) return VmError.DbClosed;
+            const conn = try liveConnOf(vm, x);
             var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
             defer db_mod.abortRead(&txn);
             const result = db_mod.getRef(&txn, x, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
@@ -2684,28 +2706,20 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
 /// do NOT write. Connection mismatch on `ref` surfaces as
 /// :db/store-mismatch via db.zig's assertRefMatchesConn.
 // =============================================================================
-// scan + reduce-tree (Phase 4.0d)
+// scan + reduce-tree
 // =============================================================================
 //
 // `(db/scan tx tree-keyword)` returns a vector of `[key value]`
-// 2-vectors in key-ordered iteration order.
+// 2-vectors in key order; `(db/scan tx tree-keyword start-key)`
+// starts at `start-key` (inclusive) and
+// `(db/scan tx tree-keyword start-key end-key)` stops before
+// `end-key`. `(db/reduce-tree tx tree-keyword f init)` walks the
+// whole tree applying `(f acc key value)` and returns the final
+// accumulator.
 //
-// `(db/scan tx tree-keyword start-key)` — start-inclusive scan.
-// `(db/scan tx tree-keyword start-key end-key)` — start-inclusive,
-// end-exclusive (peer-AI turn 73 §Q5).
-//
-// `(db/reduce-tree tx tree-keyword f init)` — server-side-ish
-// reduction. Walks the whole tree applying `(f acc key value)`
-// to each entry. Returns final accumulator.
-//
-// v1 LIMITATIONS (peer-AI turn 73 §Q8 traps):
-//   - Keys are returned as keyword Values (interned from key
-//     bytes). Matches the v1.alpha key model where db/ref's key
-//     arg is a keyword/symbol. Arbitrary byte keys await
-//     first-class string support.
-//   - Values are FULLY DECODED + Heap-allocated per entry. The
-//     cursor advances safely because we decode BEFORE moving.
-//   - Eager vector (peer §Q4). Lazy seqs are a future polish.
+// Keys come back as keyword Values interned from the key bytes
+// (the key model of `db/ref`). Each value is fully decoded onto
+// the heap before the cursor advances. Results are eager.
 
 /// A cursor over one named tree inside an active transaction.
 const TreeCursor = struct {
@@ -2720,26 +2734,12 @@ const TreeCursor = struct {
     /// exist, which every caller treats as an empty tree.
     fn open(vm: *VM, tx_v: Value, tree_name: []const u8) VmError!?TreeCursor {
         const Resolved = struct { conn: *db_mod.Connection, inner: *emdb_mod.Txn, tree_id: ?emdb_mod.TreeId };
-        const r: Resolved = switch (tx_v.kind()) {
-            .db_write_txn => blk: {
-                const h = writeTxnHandle(tx_v).?;
-                if (!h.active) return VmError.TxClosed;
-                break :blk .{
-                    .conn = h.txn.conn,
-                    .inner = h.txn.inner,
-                    .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err),
-                };
+        const r: Resolved = switch (try activeTxn(tx_v)) {
+            inline else => |h| .{
+                .conn = h.txn.conn,
+                .inner = h.txn.inner,
+                .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err),
             },
-            .db_read_txn => blk: {
-                const h = readTxnHandle(tx_v).?;
-                if (!h.active) return VmError.TxClosed;
-                break :blk .{
-                    .conn = h.txn.conn,
-                    .inner = h.txn.inner,
-                    .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err),
-                };
-            },
-            else => return VmError.KindMismatch,
         };
         const tree_id = r.tree_id orelse return null;
         const cursor = r.inner.openCursorForTree(tree_id) catch |err| return dbFailure(vm, err);
@@ -3713,43 +3713,38 @@ fn typeNameToKind(name: []const u8) ?value_mod.Kind {
 // Helpers
 // =============================================================================
 
-/// Phase 3.3b seq iterator: walks a Value as a sequence.
-/// Supports nil (empty), list, vector. Map/set seq semantics
-/// deferred (Clojure returns entry-pairs/elements but our 3.3
-/// scope doesn't pin that yet).
-const SeqIter = struct {
-    kind: enum { empty, list, vector, map, set, string },
-    node: Value = value_mod.nilValue(),
-    vec: Value = value_mod.nilValue(),
-    vec_idx: usize = 0,
-    vec_count: usize = 0,
-    map_it: champ_mod.MapIter = undefined,
-    set_it: champ_mod.SetIter = undefined,
-    utf8: std.unicode.Utf8Iterator = undefined,
-    heap: *heap_mod.Heap = undefined,
+/// Walks any seqable: nil, list, vector, map or record (as `[k v]`
+/// entries), set, string (as chars).
+const SeqIter = union(enum) {
+    empty,
+    list: Value,
+    vector: struct { v: Value, idx: usize, count: usize },
+    map: struct { it: champ_mod.MapIter, heap: *heap_mod.Heap },
+    set: champ_mod.SetIter,
+    string: std.unicode.Utf8Iterator,
 
     fn next(self: *SeqIter) VmError!?Value {
-        switch (self.kind) {
+        switch (self.*) {
             .empty => return null,
-            .list => {
-                if (list_mod.isEmpty(self.node)) return null;
-                const h = list_mod.head(self.node);
-                self.node = list_mod.tail(self.node);
+            .list => |*node| {
+                if (list_mod.isEmpty(node.*)) return null;
+                const h = list_mod.head(node.*);
+                node.* = list_mod.tail(node.*);
                 return h;
             },
-            .vector => {
-                if (self.vec_idx >= self.vec_count) return null;
-                const e = vector_mod.nth(self.vec, self.vec_idx);
-                self.vec_idx += 1;
+            .vector => |*vec| {
+                if (vec.idx >= vec.count) return null;
+                const e = vector_mod.nth(vec.v, vec.idx);
+                vec.idx += 1;
                 return e;
             },
-            .map => {
-                const e = self.map_it.next() orelse return null;
-                return vector_mod.fromSlice(self.heap, &.{ e.key, e.value }) catch VmError.OutOfMemory;
+            .map => |*m| {
+                const e = m.it.next() orelse return null;
+                return vector_mod.fromSlice(m.heap, &.{ e.key, e.value }) catch VmError.OutOfMemory;
             },
-            .set => return self.set_it.next(),
-            .string => {
-                const scalar = self.utf8.nextCodepoint() orelse return null;
+            .set => |*it| return it.next(),
+            .string => |*utf8| {
+                const scalar = utf8.nextCodepoint() orelse return null;
                 return value_mod.fromChar(scalar) orelse VmError.Utf8Error;
             },
         }
@@ -3757,31 +3752,21 @@ const SeqIter = struct {
 };
 
 /// Every seqable receiver: nil, list, vector, map (as `[k v]`
-/// entries), record (its field map), set and string (as chars).
+/// entries), record (its field map), set and string (as chars). A
+/// string that is not valid UTF-8 is `:utf8-error`, as for every
+/// other string operation.
 fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
     return switch (coll.kind()) {
-        .nil => SeqIter{ .kind = .empty },
-        .list => SeqIter{ .kind = .list, .node = coll },
-        .persistent_vector => SeqIter{
-            .kind = .vector,
-            .vec = coll,
-            .vec_count = vector_mod.count(coll),
-        },
-        .persistent_map => SeqIter{ .kind = .map, .map_it = champ_mod.mapIter(coll), .heap = vm.ensureHeap() },
-        .record => SeqIter{ .kind = .map, .map_it = champ_mod.mapIter(record_mod.fieldsOf(coll)), .heap = vm.ensureHeap() },
-        .persistent_set => SeqIter{ .kind = .set, .set_it = champ_mod.setIter(coll) },
-        .string => SeqIter{
-            .kind = .string,
-            .utf8 = std.unicode.Utf8View.initUnchecked(string_mod.asBytes(coll)).iterator(),
+        .nil => .empty,
+        .list => .{ .list = coll },
+        .persistent_vector => .{ .vector = .{ .v = coll, .idx = 0, .count = vector_mod.count(coll) } },
+        .persistent_map => .{ .map = .{ .it = champ_mod.mapIter(coll), .heap = vm.ensureHeap() } },
+        .record => .{ .map = .{ .it = champ_mod.mapIter(record_mod.fieldsOf(coll)), .heap = vm.ensureHeap() } },
+        .persistent_set => .{ .set = champ_mod.setIter(coll) },
+        .string => .{
+            .string = (std.unicode.Utf8View.init(string_mod.asBytes(coll)) catch return VmError.Utf8Error).iterator(),
         },
         else => VmError.KindMismatch,
-    };
-}
-
-fn isSeqable(v: Value) bool {
-    return switch (v.kind()) {
-        .nil, .list, .persistent_vector, .persistent_map, .record, .persistent_set, .string => true,
-        else => false,
     };
 }
 
@@ -3864,6 +3849,28 @@ test "stdlib: installCore registers all 10 fns" {
         try testing.expectEqual(Kind.native_fn, v.root.kind());
         try testing.expect(!v.macro);
     }
+}
+
+test "stdlib: a string that is not UTF-8 seqs as :utf8-error" {
+    var stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
+    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var vm = try VM.init(testing.allocator, &stub);
+    defer vm.deinit();
+    const bad = try string_mod.fromBytes(vm.ensureHeap(), "a\xffb");
+    try testing.expectError(VmError.Utf8Error, fnFirst(&vm, &.{bad}));
+    try testing.expectError(VmError.Utf8Error, fnSeq(&vm, &.{bad}));
+    const good = try string_mod.fromBytes(vm.ensureHeap(), "é");
+    try testing.expectEqual(@as(u21, 0xE9), (try fnFirst(&vm, &.{good})).asChar());
+}
+
+test "stdlib: name of a string is the string itself" {
+    var stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
+    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var vm = try VM.init(testing.allocator, &stub);
+    defer vm.deinit();
+    const s = try string_mod.fromBytes(vm.ensureHeap(), "abc");
+    const named = try fnName(&vm, &.{s});
+    try testing.expectEqual(s.payload, named.payload);
 }
 
 test "stdlib: nativeFnValue round-trips" {

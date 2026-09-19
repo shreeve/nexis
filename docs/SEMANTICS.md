@@ -315,8 +315,27 @@ Mirrors PLAN §6.5.
 | `(rest nil)` | `()` (empty list) |
 | `(conj nil x)` | `(list x)` |
 | `(assoc nil k v)` | `{k v}` (a new map) |
+| `(keys nil)`, `(vals nil)` | `nil` (as for `(keys {})`: a map with no entries has no key seq) |
+| `(flatten nil)` | `()` |
+| `(select-keys nil ks)` | `{}` |
 
 These determine the ergonomic feel of idiomatic nexis code and are frozen.
+
+Two further sequence rules follow Clojure exactly and are easy to
+get backwards:
+
+- `flatten` flattens lists and vectors only; nil elements are kept
+  (`(flatten [1 nil [2]])` is `(1 nil 2)`), and a non-sequential
+  argument — a number, a string, a map, nil — flattens to `()`.
+- A negative count means zero in every counting function:
+  `(nthrest xs -1)` is `xs`, `(split-at -1 xs)` is `[() xs]`,
+  `(take-last -1 xs)`, `(repeat -1 x)` and `(repeatedly -1 f)` are
+  `()`.
+
+Records are maps to every collection function: `count`, `empty?`,
+`not-empty`, `seq`, `keys`, `conj` and `into` see the field map,
+`conj`/`into`/`assoc` return a record of the same type, and
+`(empty r)` is `{}`.
 
 ---
 

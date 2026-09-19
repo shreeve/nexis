@@ -144,6 +144,32 @@ pub const Interner = struct {
         return value.fromKeywordId(id);
     }
 
+    /// A keyword's full text is `ns/name` when it is qualified;
+    /// `splitQualified` is the inverse.
+    pub fn internQualifiedKeyword(self: *Interner, ns: ?[]const u8, name: []const u8) InternError!value.Value {
+        const ns_prefix = ns orelse return self.internKeywordValue(name);
+        const full = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ ns_prefix, name });
+        defer self.gpa.free(full);
+        return self.internKeywordValue(full);
+    }
+
+    /// `internQualifiedKeyword` for symbols.
+    pub fn internQualifiedSymbol(self: *Interner, ns: ?[]const u8, name: []const u8) InternError!value.Value {
+        const ns_prefix = ns orelse return self.internSymbolValue(name);
+        const full = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ ns_prefix, name });
+        defer self.gpa.free(full);
+        return self.internSymbolValue(full);
+    }
+
+    /// Split an interned `ns/name` text back into its parts at its
+    /// first slash; `ns` is null for an unqualified name. The bare
+    /// division symbol `/` is an unqualified name, as in `split`.
+    pub fn splitQualified(full: []const u8) struct { ns: ?[]const u8, name: []const u8 } {
+        if (std.mem.eql(u8, full, "/")) return .{ .ns = null, .name = full };
+        const slash = std.mem.indexOfScalar(u8, full, '/') orelse return .{ .ns = null, .name = full };
+        return .{ .ns = full[0..slash], .name = full[slash + 1 ..] };
+    }
+
     pub fn internSymbolValue(self: *Interner, name: []const u8) InternError!value.Value {
         const id = try self.internSymbol(name);
         return value.fromSymbolId(id);

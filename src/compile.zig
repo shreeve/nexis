@@ -1133,30 +1133,34 @@ pub const DeclaredNames = struct {
         try self.names.put(self.allocator, owned, {});
     }
 
-    /// Record every name `form` defines at top level: `def`,
+    /// Record every name `form` defines, at any depth: `def`,
     /// `defn`, `defmacro`, `defrecord` (the type id, `->T`,
-    /// `map->T`, `T?`), `defprotocol` (the protocol and each
-    /// method) and, recursively, the forms of a `do`.
+    /// `map->T`, `T?`) and `defprotocol` (the protocol and each
+    /// method). A definition inside a `let`, a `when` or a call
+    /// interns its Var when it runs, exactly like one at top level,
+    /// so it is declared wherever it appears; quoted data is not
+    /// walked.
     pub fn declareForm(self: *DeclaredNames, form: *const reader_mod.Form) !void {
-        if (form.datum != .list) return;
-        const items = form.datum.list;
+        const items: []const *reader_mod.Form = switch (form.datum) {
+            .list => |items| items,
+            .vector, .map, .set => |items| {
+                for (items) |item| try self.declareForm(item);
+                return;
+            },
+            else => return,
+        };
+        for (items) |item| try self.declareForm(item);
         if (items.len < 2 or items[0].datum != .symbol or items[0].datum.symbol.ns != null) return;
         const head = items[0].datum.symbol.name;
-        if (std.mem.eql(u8, head, "do")) {
-            for (items[1..]) |item| try self.declareForm(item);
-            return;
-        }
         if (items[1].datum != .symbol or items[1].datum.symbol.ns != null) return;
         const name = items[1].datum.symbol.name;
         if (std.mem.eql(u8, head, "def") or std.mem.eql(u8, head, "defn") or std.mem.eql(u8, head, "defmacro")) {
             try self.declare(name);
         } else if (std.mem.eql(u8, head, "defrecord")) {
             try self.declare(name);
-            inline for ([_][]const u8{ "{s}-type-id", "->{s}", "map->{s}", "{s}?" }) |pattern| {
-                const derived = try std.fmt.allocPrint(self.allocator, pattern, .{name});
-                defer self.allocator.free(derived);
-                try self.declare(derived);
-            }
+            var derived = try expand_mod.RecordNames.init(self.allocator, name);
+            defer derived.deinit(self.allocator);
+            for (derived.all()) |derived_name| try self.declare(derived_name);
         } else if (std.mem.eql(u8, head, "defprotocol")) {
             try self.declare(name);
             for (items[2..]) |sig| {
@@ -1250,22 +1254,12 @@ pub fn lowerForm(
     return lowerFormEnv(allocator, form, .{});
 }
 
-/// Intern a keyword Form's full text: `ns/name` when qualified.
-fn internKeywordForm(allocator: std.mem.Allocator, interner: *intern_mod.Interner, name: anytype) !value_mod.Value {
-    if (name.ns) |ns_prefix| {
-        const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ns_prefix, name.name });
-        defer allocator.free(full);
-        return interner.internKeywordValue(full);
-    }
-    return interner.internKeywordValue(name.name);
-}
-
-/// Internal `lowerForm` with LowerEnv threading (step #7b). The
-/// env is consulted ONLY when classifying list-head symbols as
-/// intrinsics vs ordinary calls. Recursion into sub-expressions
-/// passes the env through unchanged; binding forms (let*, fn*,
-/// loop*, letfn*) construct a child env that adds their bindings.
-
+/// `lowerForm` with the lexical environment threaded through
+/// `ctx`. The env is consulted only when classifying list-head
+/// symbols as intrinsics vs ordinary calls. Recursion into
+/// sub-expressions passes the env through unchanged; binding
+/// forms (let*, fn*, loop*, letfn*) construct a child env that
+/// adds their bindings.
 fn lowerFormEnv(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
@@ -1298,7 +1292,7 @@ fn lowerFormEnv(
         // same way qualified symbols do.
         .keyword => |name| blk: {
             const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            const v = internKeywordForm(allocator, interner, name) catch return CompileError.OutOfMemory;
+            const v = interner.internQualifiedKeyword(name.ns, name.name) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
         // Floats and chars are immediates: they lower straight
@@ -1596,7 +1590,7 @@ fn lowerQuotePayload(
         },
         .keyword => |name| blk: {
             const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            const v = internKeywordForm(allocator, interner, name) catch return CompileError.OutOfMemory;
+            const v = interner.internQualifiedKeyword(name.ns, name.name) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
         // Step #8c.1 (peer-AI turn 58 §D6): quoted compound list.
@@ -2351,36 +2345,64 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistry(
     );
 }
 
-/// Phase 3.6: full-featured form-compile entry. Accepts a
-/// `*NamespaceRegistry` for `(ns NAME)` AND a `LoadCallback`
-/// for `(require ...)`, and optionally the file's `DeclaredNames`,
-/// which turns a reference to nothing into `UnresolvedSymbol` at
-/// the symbol's span.
-pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
+/// Everything a full compile may be given beyond the form and its
+/// allocator. Every field is optional; the short-name entry points
+/// (`compileForm`, `compileFormFull`, ...) are spellings of
+/// particular subsets.
+pub const CompileOptions = struct {
+    /// Namespace for `def`, `(var x)` and symbol fall-through.
+    /// Without one, symbols must resolve lexically.
+    namespace: ?*vm.Namespace = null,
+    /// Interner for quoted symbols and keywords, and the
+    /// precondition for macroexpansion. Without one, `'foo`
+    /// raises `UnsupportedFeature` and no macro fires.
+    interner: ?*intern_mod.Interner = null,
+    /// Host macro table consulted before lowering; an absent
+    /// table still expands user `defmacro`s when an interner is
+    /// present.
+    host_macros: ?*const expand_mod.HostMacroTable = null,
+    /// Receives the source span of an error: the symbol's own
+    /// span when lowering can locate it, otherwise the
+    /// macroexpanded form's.
+    out_span: ?*?reader_mod.SrcSpan = null,
+    /// Where `defmacro` closures are stored, so they outlive a
+    /// per-form compile arena. The REPL and file runner pass
+    /// `vm.runtime_arena.allocator()`; null uses `allocator`.
+    persistent_allocator: ?std.mem.Allocator = null,
+    /// Registry that `(ns NAME)` switches; without it `(ns ...)`
+    /// is an error.
+    registry: ?*vm.NamespaceRegistry = null,
+    /// Loader that `(require ...)` dispatches to.
+    load_callback: ?expand_mod.LoadCallback = null,
+    /// The names the enclosing file or REPL line defines; with it,
+    /// a symbol that resolves to nothing is `UnresolvedSymbol` at
+    /// its span.
+    declared: ?*DeclaredNames = null,
+};
+
+/// Full form-compile entry: macroexpand, lower and emit `form`
+/// under `opts`.
+pub fn compileFormWith(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-    host_macros: ?*const expand_mod.HostMacroTable,
-    out_span: ?*?reader_mod.SrcSpan,
-    persistent_allocator: ?std.mem.Allocator,
-    registry: ?*vm.NamespaceRegistry,
-    load_callback: ?expand_mod.LoadCallback,
-    declared: ?*DeclaredNames,
+    opts: CompileOptions,
 ) CompileError!Compiled {
+    const namespace = opts.namespace;
+    const interner = opts.interner;
+    const out_span = opts.out_span;
+    const declared = opts.declared;
     var working_form: *const reader_mod.Form = form;
     if (interner != null) {
         const empty_table: expand_mod.HostMacroTable = .{};
         const table_to_use: *const expand_mod.HostMacroTable =
-            host_macros orelse &empty_table;
-        // Phase 3.2: build a compile-eval callback so the
-        // defmacro handler in expand.zig can compile + run
-        // the synthetic `(def name (fn* ...))` form via a
-        // fresh sub-VM. Persistent allocator (when supplied
-        // by caller) is used for the macro fn's storage so
-        // it outlives the per-form arena.
+            opts.host_macros orelse &empty_table;
+        // The compile-eval callback lets the defmacro handler in
+        // expand.zig compile and run the synthetic
+        // `(def name (fn* ...))` form in a sub-VM; the macro fn
+        // is stored in the persistent allocator so it outlives
+        // the per-form arena.
         var ceval_data = CompileEvalData{
-            .persistent_allocator = persistent_allocator orelse allocator,
+            .persistent_allocator = opts.persistent_allocator orelse allocator,
             .namespace = namespace,
             .interner = interner.?,
         };
@@ -2393,12 +2415,8 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
                 .user_data = @ptrCast(&ceval_data),
                 .eval = compileEvalCallback,
             },
-            // Phase 3.4: registry threaded by the caller (CLI
-            // sets it; ad-hoc tests pass null). Enables
-            // `(ns NAME)` to switch the current namespace.
-            .registry = registry,
-            // Phase 3.6: load callback for `(require ...)`.
-            .load_callback = load_callback,
+            .registry = opts.registry,
+            .load_callback = opts.load_callback,
         };
         working_form = expand_mod.expandForm(&mctx, null, form) catch |err| switch (err) {
             error.ExpansionDepthExceeded => {
@@ -2416,12 +2434,9 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
             error.OutOfMemory => return CompileError.OutOfMemory,
         };
     }
-    // Phase 5.2a (peer-AI turn 77): plumb the heap through
-    // `namespace.registry.heap` so `.string` Form datums lower
-    // to `Tiny.literal` with a stable allocation. Ad-hoc test
-    // entry points that pass a null namespace (or one without a
-    // registry) keep the prior `.string → UnsupportedFeature`
-    // behavior because LowerCtx.heap stays null.
+    // `.string` Form datums lower to `Tiny.literal` on the
+    // registry's heap. Without a namespace or a registry there is
+    // no heap and a string literal is `UnsupportedFeature`.
     const lower_heap: ?*heap_mod.Heap = if (namespace) |n|
         (if (n.registry) |r| r.heap else null)
     else
@@ -2448,6 +2463,31 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
         if (out_span) |s| s.* = working_form.origin;
         return err;
     };
+}
+
+/// `compileFormWith` with every option positional.
+pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
+    allocator: std.mem.Allocator,
+    form: *const reader_mod.Form,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+    host_macros: ?*const expand_mod.HostMacroTable,
+    out_span: ?*?reader_mod.SrcSpan,
+    persistent_allocator: ?std.mem.Allocator,
+    registry: ?*vm.NamespaceRegistry,
+    load_callback: ?expand_mod.LoadCallback,
+    declared: ?*DeclaredNames,
+) CompileError!Compiled {
+    return compileFormWith(allocator, form, .{
+        .namespace = namespace,
+        .interner = interner,
+        .host_macros = host_macros,
+        .out_span = out_span,
+        .persistent_allocator = persistent_allocator,
+        .registry = registry,
+        .load_callback = load_callback,
+        .declared = declared,
+    });
 }
 
 /// End-to-end: parse + read + lower + compile a source string.
@@ -2561,8 +2601,24 @@ pub fn compileSourceFullWithMacrosSpanPersistent(
     );
 }
 
-/// Phase 3.6: variant with both registry AND load callback.
-/// CLI's REPL + runFile pass this so `(require ...)` works.
+/// Parse and read one form from `source`, then `compileFormWith`.
+pub fn compileSourceWith(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    opts: CompileOptions,
+) CompileError!Compiled {
+    var p = reader_mod.parser.parseForm(allocator, source) catch {
+        return CompileError.ReaderFailure;
+    };
+    defer p.parser.deinit();
+    var reader = reader_mod.Reader.init(allocator, source);
+    defer reader.deinit();
+    const form = reader.readOneForm(p.sexp) catch
+        return CompileError.ReaderFailure;
+    return compileFormWith(allocator, form, opts);
+}
+
+/// `compileSourceWith` with every option positional.
 pub fn compileSourceFullWithMacrosSpanPersistentRegistryLoader(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -2575,26 +2631,16 @@ pub fn compileSourceFullWithMacrosSpanPersistentRegistryLoader(
     load_callback: ?expand_mod.LoadCallback,
     declared: ?*DeclaredNames,
 ) CompileError!Compiled {
-    var p = reader_mod.parser.parseForm(allocator, source) catch {
-        return CompileError.ReaderFailure;
-    };
-    defer p.parser.deinit();
-    var reader = reader_mod.Reader.init(allocator, source);
-    defer reader.deinit();
-    const form = reader.readOneForm(p.sexp) catch
-        return CompileError.ReaderFailure;
-    return compileFormFullWithMacrosSpanPersistentRegistryLoader(
-        allocator,
-        form,
-        namespace,
-        interner,
-        host_macros,
-        out_span,
-        persistent_allocator,
-        registry,
-        load_callback,
-        declared,
-    );
+    return compileSourceWith(allocator, source, .{
+        .namespace = namespace,
+        .interner = interner,
+        .host_macros = host_macros,
+        .out_span = out_span,
+        .persistent_allocator = persistent_allocator,
+        .registry = registry,
+        .load_callback = load_callback,
+        .declared = declared,
+    });
 }
 
 /// Phase 3.4: source-string entry with both persistent
@@ -2611,24 +2657,14 @@ pub fn compileSourceFullWithMacrosSpanPersistentRegistry(
     persistent_allocator: ?std.mem.Allocator,
     registry: ?*vm.NamespaceRegistry,
 ) CompileError!Compiled {
-    var p = reader_mod.parser.parseForm(allocator, source) catch {
-        return CompileError.ReaderFailure;
-    };
-    defer p.parser.deinit();
-    var reader = reader_mod.Reader.init(allocator, source);
-    defer reader.deinit();
-    const form = reader.readOneForm(p.sexp) catch
-        return CompileError.ReaderFailure;
-    return compileFormFullWithMacrosSpanPersistentRegistry(
-        allocator,
-        form,
-        namespace,
-        interner,
-        host_macros,
-        out_span,
-        persistent_allocator,
-        registry,
-    );
+    return compileSourceWith(allocator, source, .{
+        .namespace = namespace,
+        .interner = interner,
+        .host_macros = host_macros,
+        .out_span = out_span,
+        .persistent_allocator = persistent_allocator,
+        .registry = registry,
+    });
 }
 
 // =============================================================================
@@ -5045,17 +5081,7 @@ fn runTinyWithNs(
     const ns = v.ensureNamespace();
     const compiled = try compileTinyWithNamespace(arena.allocator(), form, ns);
     const routine = compiled.toRoutine("test-with-ns");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    // Make sure stack is large enough for the new routine.
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(
-            v.allocator,
-            value_mod.nilValue(),
-            routine.slot_count - v.stack.items.len,
-        );
-    }
+    try v.retargetTop(&routine);
     return try v.run();
 }
 
@@ -5076,12 +5102,7 @@ test "compile #6b: (def x 5) returns the Var object" {
     const ns = v.ensureNamespace();
     const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
     const routine = compiled.toRoutine("def-test");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
 
     try testing.expect(result.kind() == .var_);
@@ -5124,12 +5145,7 @@ test "compile #6b: (var x) returns the Var object (unbound OK)" {
     const ns = v.ensureNamespace();
     const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
     const routine = compiled.toRoutine("var-ref-test");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
 
     try testing.expect(result.kind() == .var_);
@@ -5151,9 +5167,7 @@ test "compile #6b: reading an unbound Var traps :unbound-var at runtime" {
     const ns = v.ensureNamespace();
     const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
     const routine = compiled.toRoutine("unbound");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
+    try v.retargetTop(&routine);
     try testing.expectError(vm.VmError.UnboundVar, v.run());
 }
 
@@ -5309,12 +5323,7 @@ test "compile #6c: forward reference + call before bind → UnboundVar trap" {
     const ns = v.ensureNamespace();
     const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
     const routine = compiled.toRoutine("unbound-fwd");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     try testing.expectError(vm.VmError.UnboundVar, v.run());
 }
 
@@ -5696,10 +5705,12 @@ test "compile: scope restored after compile error" {
     // scope from the failed compile.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const failing: Tiny = .{ .let_star = .{
-        .bindings = &.{.{ .name = "x", .value = &.{ .int = 1 } }},
-        .body = &.{ .symbol = "y" }, // y is unbound → error
-    } };
+    const failing: Tiny = .{
+        .let_star = .{
+            .bindings = &.{.{ .name = "x", .value = &.{ .int = 1 } }},
+            .body = &.{ .symbol = "y" }, // y is unbound → error
+        },
+    };
     const res1 = compileTiny(arena.allocator(), &failing);
     try testing.expectError(CompileError.UnresolvedSymbol, res1);
     // The scope should not have leaked `x`. A fresh compile
@@ -5813,10 +5824,12 @@ test "compile 5a1: arity mismatch — call with too few args traps :arity-mismat
         .params = &.{ "x", "y" },
         .body = &.{ .symbol = "x" },
     } };
-    const call_form: Tiny = .{ .call = .{
-        .callee = &fn_form,
-        .args = &.{&.{ .int = 1 }}, // only 1 arg, fn expects 2
-    } };
+    const call_form: Tiny = .{
+        .call = .{
+            .callee = &fn_form,
+            .args = &.{&.{ .int = 1 }}, // only 1 arg, fn expects 2
+        },
+    };
     const compiled = try compileTiny(arena.allocator(), &call_form);
     const routine = compiled.toRoutine("arity-test");
     var v = try vm.VM.init(testing.allocator, &routine);
@@ -6775,12 +6788,7 @@ test "compile #7a: compileSource of symbol resolves via namespace fall-through" 
 
     const compiled = try compileSourceWithNamespace(arena.allocator(), "x", ns);
     const routine = compiled.toRoutine("src-symbol");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(@as(i64, 99), result.asFixnum());
 }
@@ -7171,12 +7179,7 @@ fn expectSourceFixnumWithNs(src: []const u8, expected: i64) !void {
     const ns = v.ensureNamespace();
     const compiled = try compileSourceWithNamespace(arena.allocator(), src, ns);
     const routine = compiled.toRoutine("src-ns");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(expected, result.asFixnum());
 }
@@ -7236,12 +7239,7 @@ test "compile #7d: forward reference + call before bind → UnboundVar at runtim
         ns,
     );
     const routine = compiled.toRoutine("fwd-unbound");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     try testing.expectError(vm.VmError.UnboundVar, v.run());
 }
 
@@ -7255,12 +7253,7 @@ test "compile #7d: (var x) returns the Var object" {
     const ns = v.ensureNamespace();
     const compiled = try compileSourceWithNamespace(arena.allocator(), "(var some-name)", ns);
     const routine = compiled.toRoutine("var-ref");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expect(result.kind() == .var_);
     const var_obj = vm.VM.asVar(result);
@@ -7375,12 +7368,7 @@ fn runSourceFull(src: []const u8) !struct { result: value_mod.Value, vm_owned: v
     const interner = v.ensureInterner();
     const compiled = try compileSourceFull(arena.allocator(), src, ns, interner);
     const routine = compiled.toRoutine("src-full");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     return .{ .result = result, .vm_owned = v };
 }
@@ -7425,21 +7413,13 @@ test "compile E1: 'foo and 'foo intern to the SAME symbol Value (identity stable
     // First program.
     const c1 = try compileSourceFull(arena.allocator(), "'foo", ns, interner);
     const r1 = c1.toRoutine("p1");
-    v.frames.items[0].routine = &r1;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = r1.slot_count;
-    if (v.stack.items.len < r1.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), r1.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&r1);
     const v1 = try v.run();
 
     // Second program — fresh frame, same VM/interner.
     const c2 = try compileSourceFull(arena.allocator(), "'foo", ns, interner);
     const r2 = c2.toRoutine("p2");
-    v.frames.items[0].routine = &r2;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = r2.slot_count;
-    v.halted = false;
+    try v.retargetTop(&r2);
     const v2 = try v.run();
 
     try testing.expect(v1.kind() == .symbol);
@@ -7464,12 +7444,7 @@ test "compile E1: (quote 42) still uses Tiny.int (no const-pool waste)" {
     const interner = v.ensureInterner();
     const compiled = try compileSourceFull(arena.allocator(), "(quote 42)", null, interner);
     const routine = compiled.toRoutine("scalar-quote");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
 }
@@ -7520,12 +7495,7 @@ test "compile #8a: empty macro table passes through (sanity)" {
         &host_macros,
     );
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
 }
@@ -7583,12 +7553,7 @@ fn runSourceWithDefaultMacros(src: []const u8) !struct { result: value_mod.Value
     defer host_macros.deinit(testing.allocator);
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     return .{ .result = result, .vm_owned = v };
 }
@@ -7728,12 +7693,7 @@ test "compile #8b: (and falsy ...) uses gensym (no double-eval on falsy)" {
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("and-gensym-falsy");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     // step was invoked exactly once even though `and` short-
     // circuited on falsy. The bad `(if x y x)` expansion would
@@ -7817,12 +7777,7 @@ test "compile #8b: (or expr ...) uses gensym (no double-eval)" {
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("or-gensym");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     // step was invoked exactly once, so step-count = 1.
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
@@ -8185,12 +8140,7 @@ test "compile #3.1: runtime-computed duplicate key — later wins (Clojure seman
     const src = "(let* [k :a k2 :a] {k 1 k2 2})";
     const compiled = try compileSourceFull(arena.allocator(), src, null, interner);
     const routine = compiled.toRoutine("dup-key-runtime");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expect(result.kind() == .persistent_map);
     const cm = @import("champ");
@@ -8251,12 +8201,7 @@ test "compile #3.1: runtime-computed duplicate elem — set collapses" {
     const src = "(let* [a 1 b 1] #{a b 2})";
     const compiled = try compileSourceFull(arena.allocator(), src, null, interner);
     const routine = compiled.toRoutine("dup-elem-runtime");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expect(result.kind() == .persistent_set);
     const cm = @import("champ");
@@ -8352,12 +8297,7 @@ test "compile #9.1: catch body's own throw NOT re-caught by same handler" {
         &host_macros,
     );
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     try testing.expectError(vm.VmError.UncaughtThrow, v.run());
     // The unhandled value is :b, not :a.
     try testing.expect(v.unhandled_throw != null);
@@ -8382,12 +8322,7 @@ test "compile #9.1: unhandled top-level throw → UncaughtThrow" {
         &host_macros,
     );
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     try testing.expectError(vm.VmError.UncaughtThrow, v.run());
     try testing.expectEqual(@as(i64, 13), v.unhandled_throw.?.asFixnum());
 }
@@ -8462,12 +8397,7 @@ test "compile #9.2: try/catch/finally — finally side effect via def" {
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
@@ -8502,12 +8432,7 @@ test "compile #9.2: uncaught throw — finally runs then throw propagates" {
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     // The outer try received 42 from the inner rethrow.
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
@@ -8541,12 +8466,7 @@ test "compile #9.2: throw inside finally replaces pending value" {
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     // The outer catch sees 99 (the finally's throw), not the
     // body's value 1.
@@ -8576,12 +8496,7 @@ test "compile #9.2: finally body runs on caught-throw exit" {
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
@@ -8638,12 +8553,7 @@ test "compile #9.1: handler stack doesn't leak across normal exits" {
         &host_macros,
     );
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     try testing.expectError(vm.VmError.UncaughtThrow, v.run());
 }
 
@@ -8735,12 +8645,7 @@ test "compile 4.0b: qualified symbol in quote interns full ns/name" {
     const interner = v.ensureInterner();
     const compiled = try compileSourceFull(arena.allocator(), "'foo/bar", null, interner);
     const routine = compiled.toRoutine("test");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(value_mod.Kind.symbol, result.kind());
     const id: u32 = @intCast(result.payload);
