@@ -1123,10 +1123,13 @@ fn fnSchema(vm: *VM, args: []const Value) VmError!Value {
     return schemaNative(vm, args) catch |err| fail(vm, err);
 }
 
-/// Ident → attribute map for every attribute this view sees.
+/// Ident → attribute map for every attribute this view sees: the
+/// flags as the view's basis saw them (§4 "Schema as-of"), and the
+/// attribute's `:db/doc` when the view holds one.
 fn schemaNative(vm: *VM, args: []const Value) !Value {
     var sc = try Scope.open(vm, args[0]);
     defer sc.close();
+    const arena = sc.arena();
     const b = &sc.b;
     const schema = try sc.rd.schema();
     const at = sc.db.upper();
@@ -1148,6 +1151,9 @@ fn schemaNative(vm: *VM, args: []const Value) !Value {
         }
         m = try b.putKw(m, "db/index", value.fromBool(attr.indexed));
         m = try b.putKw(m, "db/isComponent", value.fromBool(attr.component));
+        m = try b.putKw(m, "db/fulltext", value.fromBool(attr.fulltext));
+        var docs = try sc.rd.scan(arena, .eavt, .{ .e = attr.id, .a = boot.doc });
+        if (try docs.next()) |d| m = try b.putKw(m, "db/doc", try b.val(d.v));
         out = try b.put(out, ident, m);
     }
     return out;

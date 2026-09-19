@@ -261,6 +261,7 @@
 (def before-items (d/db c))
 (d/transact! c [[:db/add :order/items :db/fulltext true]])
 (def ft (d/db c))
+(println [(:db/fulltext (get (d/schema before-items) :order/items)) (:db/fulltext (get (d/schema ft) :order/items))])
 (println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "red") [[?e ?v]]] [?e :person/name ?n]] ft)))
 (println (rows (d/q '[:find ?n ?v :where [(fulltext $ :person/bio "RED team") [[?e ?v]]] [?e :person/name ?n]] ft)))
 (println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "café") [[?e ?v]]] [?e :person/name ?n]] ft)))

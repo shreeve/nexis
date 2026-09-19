@@ -106,6 +106,7 @@ ok explain returns the plan as text
 :boom
 ok the store still works after a predicate threw
 ok results are ordinary sets
+[false true]
 ([Ann] [Bob])
 ([Ann Ann runs the red team; loves Café Noir.])
 ([Ann])
