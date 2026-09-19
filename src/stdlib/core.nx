@@ -1,20 +1,10 @@
 ; src/stdlib/core.nx
 ;
-; Phase 3.3d composite stdlib written in nexis itself,
-; embedded via @embedFile and bootstrapped at VM startup
-; AFTER native fns are installed.
-;
-; This is the "stage 2" layer per CLOJURE-REVIEW.md §1.1 —
-; user-facing macros + fns built atop the primitive substrate.
-; Each def/defn/defmacro here lands in the user's namespace and
-; is callable from REPL + source files.
-;
-; Constraints:
-;   - Only uses primitives installed by stdlib.installCore
-;     (sequence/HOF/arithmetic/collection groups from 3.3a/b/c).
-;   - No multi-arity defn yet (Phase 3.5).
-;   - No destructuring yet (Phase 3.5).
-;   - Single-argument macros only for v1 simplicity.
+; The part of nexis.core written in nexis itself: user-facing
+; macros and functions built on the natives that
+; stdlib.installCore provides. Embedded via @embedFile and
+; evaluated into nexis.core at VM startup, after the natives are
+; installed, so everything here is auto-referred by user code.
 
 ; ============================================================
 ; Simple predicates + accessors
@@ -49,13 +39,7 @@
       (reverse acc))))
 
 (defn drop [n s]
-  ; Return s after dropping up to n elements.
-  (loop* [i 0 rem s]
-    (if (< i n)
-      (if (empty? rem)
-        rem
-        (recur (inc i) (rest rem)))
-      rem)))
+  (nthrest s n))
 
 ; ============================================================
 ; Conditional macros
@@ -91,7 +75,7 @@
          nil))))
 
 ; ============================================================
-; Phase 4.0b — durable transaction macros
+; Durable transaction macros
 ; ============================================================
 ;
 ; `(with-tx [tx conn] body...)` opens a write transaction,
@@ -122,7 +106,7 @@
          (db/abort-read! ~(first binding))
          (throw e#)))))
 
-; Phase 4.0f — snapshot vocabulary (PLAN.md §15.7).
+; Snapshot vocabulary (PLAN.md §15.7).
 ;
 ; A snapshot is an emdb read transaction pinned to the commit
 ; generation that was current when it began. As long as the
@@ -154,17 +138,12 @@
          (throw e#)))))
 
 ; ============================================================
-; Phase 5 Item 5 — stdlib breadth (peer-AI turn 74 §10.5)
+; Function combinators and collection helpers
 ; ============================================================
 ;
-; All user-land. Each defn builds on existing primitives —
-; reduce + loop* + cons + assoc + apply. No new runtime
-; surface. These are the Clojure-canonical helpers that
-; real programs reach for first.
-;
-; Where Clojure ships short-circuiting via `reduced`, we use
-; `loop*` instead — nexis v1 doesn't have `reduced` yet, so
-; `every?` / `some` / etc. iterate with explicit termination.
+; Each defn builds on the natives: reduce, loop*, cons, assoc,
+; apply. Where Clojure short-circuits through `reduced`, these
+; iterate with `loop*` and an explicit exit.
 
 ; ---- function composition helpers ----
 
@@ -177,17 +156,9 @@
   (fn* [& args] (not (apply f args))))
 
 ; (partial f & args) → fn taking more args, prepending the
-; closed-over `args`. Single-arity captures matching Clojure
-; behavior; for multi-arity callees the caller supplies the
-; rest.
+; closed-over `args`.
 (defn partial [f & bound]
-  (fn* [& more] (apply f (apply list (concat-lists bound more)))))
-
-; tiny helper for partial (private; not exported by intent).
-(defn concat-lists [a b]
-  ; (a) is a list; (b) is a list. Walk a back-to-front via
-  ; reverse so we can cons each item onto b.
-  (reduce (fn* [acc x] (cons x acc)) b (reverse a)))
+  (fn* [& more] (apply f (concat bound more))))
 
 ; (comp & fns) → fn that applies the rightmost fn to args,
 ; then walks left passing single results. (comp) → identity.
@@ -309,7 +280,7 @@
 ; (juxt f g ...) → fn returning [(f args) (g args) ...].
 (defn juxt [& fs]
   (fn* [& args]
-    (vec (map (fn* [f] (apply f args)) fs))))
+    (mapv (fn* [f] (apply f args)) fs)))
 
 ; (fnil f default) → f, with a nil first argument replaced by
 ; default.
@@ -376,8 +347,8 @@
 ; ============================================================
 
 ; (cond-> x test step ...) → threads x through each step whose
-; test is truthy; tests see the ORIGINAL x, not the threaded
-; value, exactly as in Clojure.
+; test is truthy. The tests are ordinary expressions; they are
+; not threaded, exactly as in Clojure.
 (defmacro cond-> [expr & clauses]
   (if (empty? clauses)
     expr
