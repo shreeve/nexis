@@ -574,6 +574,11 @@ const Parser = struct {
                 if (predicate) return self.fail("get-else needs a binding form");
                 if (args.len != 4 or args[0] != .src) return self.fail("get-else is (get-else $ ?e :attr default)");
             },
+            .get_some => {
+                if (predicate) return self.fail("get-some needs a binding form");
+                if (args.len < 3 or args[0] != .src) return self.fail("get-some is (get-some $ ?e :attr ...)");
+                for (args[2..]) |a| if (a != .constant or a.constant != .keyword) return self.fail("get-some takes attribute keywords");
+            },
             .tuple => {
                 if (predicate) return self.fail("tuple needs a binding form");
             },

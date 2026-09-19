@@ -35,6 +35,8 @@ Cy
 ([Ann 31] [Bob 27] [Cy 42] [Di 31] [Edward 56] [Flo 34])
 ([ANN] [BOB] [CY] [DI] [EDWARD] [FLO])
 ([Ann 30] [Bob 26] [Cy 41] [Di 30] [Edward 55] [Flo 33])
+([Ann :person/height 1.7] [Bob :person/height 1.8] [Cy :person/height 1.65] [Di :person/age 30] [Edward :person/age 55] [Flo :person/age 33])
+([Bob Bob B 3] [Cy Cy C 2] [Di Di D 2] [Edward Edward E 6] [Flo Flo F 3])
 ([Cy :green] [Cy :red] [Edward :green])
 ([[Ann 30]] [[Bob 26]] [[Cy 41]] [[Di 30]] [[Edward 55]] [[Flo 33]])
 ([Ann 3] [Bob 3] [Cy 2] [Di 2] [Edward 6] [Flo 3])

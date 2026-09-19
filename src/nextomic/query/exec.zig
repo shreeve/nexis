@@ -348,7 +348,7 @@ pub const Exec = struct {
                 return false;
             },
             .missing => return (try self.firstValue(call_args[0].src, args[1], args[2])) == null,
-            .ground, .get_else, .tuple, .untuple => unreachable,
+            .ground, .get_else, .get_some, .tuple, .untuple => unreachable,
         }
     }
 
@@ -377,6 +377,14 @@ pub const Exec = struct {
                     .get_else => blk: {
                         const found = try self.firstValue(b.call.args[0].src, cells[1], cells[2]);
                         break :blk try self.cellValue(found orelse cells[3]);
+                    },
+                    // `[attr value]` for the first attribute the entity has, else nil.
+                    .get_some => blk: {
+                        for (cells[2..]) |attr| {
+                            const found = (try self.firstValue(b.call.args[0].src, cells[1], attr)) orelse continue;
+                            break :blk try vector_mod.fromSlice(self.heap, &.{ try self.cellValue(attr), try self.cellValue(found) });
+                        }
+                        break :blk value.nilValue();
                     },
                     .tuple => blk: {
                         const vals = try self.arena.alloc(Value, cells.len);

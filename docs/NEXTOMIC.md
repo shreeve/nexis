@@ -355,9 +355,10 @@ is `:kind-mismatch`.
 **Execute** over one read transaction per source for the whole query
 (one snapshot for every cursor, emdb INV-T02). Scans drive `openCursorForTree` +
 `setRange` with the §4 fold inline; constants in the prefix narrow the
-seek, constants after an unbound position filter. Built-in predicates
-(`< <= > >= = not= missing?`, later `ground tuple untuple get-else`) are
-Zig over `Value`; an int and a double compare numerically, and a
+seek, constants after an unbound position filter. Built-in predicates and functions (`< <= > >= = not= missing?`, `!=` as
+`not=`; `ground`, `tuple`, `untuple`, `get-else`, and `get-some`, which
+binds `[attr value]` for the first of its attributes the entity has and
+drops the row when it has none) are Zig over cells; an int and a double compare numerically, and a
 comparison across other types (a string against a number, a number
 against a keyword) is `:nextomic/value-type`, as is an input or a
 function result whose shape does not fit its binding form. Any other symbol resolves through the namespace

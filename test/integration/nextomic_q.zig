@@ -789,6 +789,13 @@ const Naive = struct {
             .builtin => |b| switch (b) {
                 .ground, .untuple => vals[0],
                 .get_else => try self.cellValue((try self.lookup(cells[1], cells[2], call.args[0].src orelse src)) orelse cells[3]),
+                .get_some => blk: {
+                    for (cells[2..]) |attr| {
+                        const found = (try self.lookup(cells[1], attr, call.args[0].src orelse src)) orelse continue;
+                        break :blk try vector_mod.fromSlice(&self.fx.heap, &.{ try self.cellValue(attr), try self.cellValue(found) });
+                    }
+                    break :blk value.nilValue();
+                },
                 .tuple => try vector_mod.fromSlice(&self.fx.heap, vals),
                 else => return error.Unsupported,
             },
@@ -1014,6 +1021,28 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     try checkCount(fx, dbv, "[:find ?t :where [?e :person/name \"Ann\"] [?e :person/age ?a] [(tuple ?a \"x\") ?t]]", none, 1);
     try checkCount(fx, dbv, "[:find ?a ?b :where [(ground [10 20]) ?t] [(untuple ?t) [?a ?b]]]", none, 1);
     try checkCount(fx, dbv, "[:find ?n ?a2 :where [?e :person/name ?n] [?e :person/age ?a] [(add ?a ?a) ?a2] [(> ?a2 60)]]", none, 3);
+    // get-some binds [attr value] for the first attribute present; != is not=;
+    // identity, str, subs and count are ordinary functions through the hook.
+    try checkCount(fx, dbv, "[:find ?n ?a ?v :where [?e :person/name ?n] [(get-some $ ?e :person/bio :person/height :person/age) [?a ?v]]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(get-some $ ?e :person/bio :person/height) [?a ?v]] [(= ?a :person/bio)]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(get-some $ ?e :person/tags :person/bio) [_ ?v]]]", none, 5);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(get-some $ ?e :person/role :person/bio) [?a ?v]]]", none, 4);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(!= ?n \"Cy\")]]", none, 5);
+    try checkCount(fx, dbv, "[:find ?n ?m :where [?e :person/name ?n] [(identity ?n) ?m]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?s :where [?e :person/name ?n] [(str ?n \"!\") ?s]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?p :where [?e :person/name ?n] [(subs ?n 0 1) ?p]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(count ?n) ?c] [(< ?c 3)]]", none, 2);
+    try checkCount(fx, dbv, "[:find ?x :where [(ground [7 8]) ?t] [(untuple ?t) [?x _]]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?t :where [?e :person/name \"Ann\"] [?e :person/age ?a] [(tuple ?a ?e) ?t] [(untuple ?t) [?a2 ?e2]] [(= ?a ?a2)] [(= ?e ?e2)]]", none, 1);
+    for ([_][]const u8{
+        "[:find ?n :where [?e :person/name ?n] [(get-some $ ?e) [?a ?v]]]",
+        "[:find ?n :where [?e :person/name ?n] [(get-some $ ?e \"bio\") [?a ?v]]]",
+        "[:find ?n :where [?e :person/name ?n] [(get-some $ ?e :person/bio)]]",
+    }) |src| {
+        var d: query.Diag = .{};
+        try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, src, none, &d));
+        try testing.expect(d.message.len > 0);
+    }
     // An output variable bound before the step unifies: the clause
     // keeps the rows whose result equals the bound value, including
     // when the planner runs a cheaper pattern before the function.

@@ -80,6 +80,7 @@ pub const Builtin = enum {
     missing,
     ground,
     get_else,
+    get_some,
     tuple,
     untuple,
 
@@ -94,6 +95,7 @@ pub const Builtin = enum {
             .missing => "missing?",
             .ground => "ground",
             .get_else => "get-else",
+            .get_some => "get-some",
             .tuple => "tuple",
             .untuple => "untuple",
         };

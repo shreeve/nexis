@@ -119,6 +119,8 @@
 (println (rows (d/q '[:find ?n ?next :where [?e :person/name ?n] [?e :person/age ?a] [(+ ?a 1) ?next]] db)))
 (println (rows (d/q '[:find ?u :where [?e :person/name ?n] [(nexis.string/upper-case ?n) ?u]] db)))
 (println (rows (d/q '[:find ?n ?a :where [?e :person/name ?n] [(get-else $ ?e :person/age -1) ?a]] db)))
+(println (rows (d/q '[:find ?n ?a ?v :where [?e :person/name ?n] [(get-some $ ?e :person/height :person/age) [?a ?v]]] db)))
+(println (rows (d/q '[:find ?n ?i ?s ?l :where [?e :person/name ?n] [(!= ?n "Ann")] [(identity ?n) ?i] [(subs ?n 0 1) ?s] [(count ?n) ?l]] db)))
 (println (rows (d/q '[:find ?n ?t :where [(ground [:red :green]) [?t ...]] [?e :person/tags ?t] [?e :person/name ?n]] db)))
 (println (rows (d/q '[:find ?pair :where [?e :person/name ?n] [?e :person/age ?a] [(tuple ?n ?a) ?pair]] db)))
 (defn name-and-length [n] [n (count n)])

@@ -212,6 +212,13 @@ pub const Fx = struct {
             return vector_mod.fromSlice(&self.heap, vals);
         }
         if (std.mem.eql(u8, name, "pair")) return vector_mod.fromSlice(&self.heap, args[0..2]);
+        if (std.mem.eql(u8, name, "count")) return value.fromFixnum(@intCast(string_mod.asBytes(args[0]).len)).?;
+        if (std.mem.eql(u8, name, "subs")) {
+            const s = string_mod.asBytes(args[0]);
+            const from: usize = @intCast(args[1].asFixnum());
+            const to: usize = if (args.len > 2) @intCast(args[2].asFixnum()) else s.len;
+            return string_mod.fromBytes(&self.heap, s[from..to]);
+        }
         if (std.mem.eql(u8, name, "halves")) {
             // [[n 0] [n 1]]
             const rows = try a.alloc(Value, 2);
