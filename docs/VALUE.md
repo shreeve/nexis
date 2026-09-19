@@ -133,9 +133,10 @@ Payload = `u64` pointer to a heap object with a standard `HeapHeader`
 | 37 | `protocol_fn` | protocol method fn | Opaque identity; dispatches on the receiver's kind or record type in `call:call` |
 | 38 | `nextomic_conn` | Nextomic connection handle | VM-owned pointer (`docs/NEXTOMIC.md` §6) |
 | 39 | `nextomic_db` | Nextomic db-value | VM-owned pointer plus inline basis data (`docs/NEXTOMIC.md` §4) |
+| 40 | `nextomic_entity` | Nextomic lazy entity | The `nextomic_db` box it reads through, its eid, the read hook and the VM it runs against, plus the map of its last full read (`docs/NEXTOMIC.md` §6); equal when the db-values are equal and the eids agree |
 
 Values 8–15 are **reserved** for immediate kinds (e.g. a second
-fixnum flavor, or a tagged inline byte burst). Values 40–63 are
+fixnum flavor, or a tagged inline byte burst). Values 41–63 are
 **reserved** for heap kinds. Values 64+ are **reserved** for
 runtime-private use (internal sentinels that must never escape a public
 API).

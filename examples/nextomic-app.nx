@@ -57,10 +57,11 @@
                                    [:db/retract [:patient/mrn "MRN-1001"] :patient/allergies :penicillin]])
         db (d/db c)]
     (println "intake at t =" (:tx intake) ", basis now" (d/basis-t db))
-    (println "Mara today:" (dissoc (patient db "MRN-1001") :db/id :patient/primary))
+    ; An entity reads its attributes on access; `touch` is the whole map.
+    (println "Mara today:" (dissoc (d/touch (patient db "MRN-1001")) :db/id :patient/primary))
     (println "Mara's visits:" (mapv :visit/reason (visits-of db "MRN-1001")))
-    (println "V-1 notes:" (mapv (fn [note] (:note/text (d/entity db note)))
-                                (:visit/notes (d/entity db [:visit/id "V-1"]))))
+    ; A ref reads as another entity, so access navigates the graph.
+    (println "V-1 notes:" (mapv :note/text (:visit/notes (d/entity db [:visit/id "V-1"]))))
 
     ; The same questions as Datalog. A query is data: patterns join on
     ; shared variables, `:in` binds inputs after the db, predicates and

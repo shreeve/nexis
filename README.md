@@ -19,7 +19,7 @@ not a library bolted on top.
 ## Status
 
 Every row below is runnable through `bin/nexis`. `zig build test`
-runs **1451 tests** across 155 build steps (unit, property, golden,
+runs **1451 tests** across 156 build steps (unit, property, golden,
 Nextomic corpora, and the `test/nextomic/*.nx` end-to-end scripts).
 See [`PLAN.md`](PLAN.md) §21 for the phase map and
 [`HANDOFF.md`](HANDOFF.md) for the ranked next-work list.
@@ -222,9 +222,8 @@ Stated so nobody rediscovers them:
   dispatch.
 - **Not serializable**: functions, vars, transients, namespaces,
   tx handles, records, protocols (`:unserializable`).
-- **Nextomic follow-ups** (`HANDOFF.md` §6.2): a lazy entity kind,
-  a datom heap kind, Unicode case folding for full-text, hash-join
-  estimate quality.
+- **Nextomic follow-ups** (`HANDOFF.md` §6.2): a datom heap kind,
+  Unicode case folding for full-text, hash-join estimate quality.
 
 ## Permanent differences from Clojure/JVM
 
@@ -257,7 +256,7 @@ source.
 | Persistent collections | Bagwell HAMT + 32-way vector | CHAMP HAMT + 32-way vector |
 | Concurrency | JVM threads + STM (Refs) | Single isolate; atoms; durable transactions |
 | Java interop | Yes (huge) | None (intentional) |
-| Durable storage | External (Datomic, JDBC, etc.) | In-process: emdb; `durable_ref`, `nextomic_conn`, `nextomic_db` are Value kinds |
+| Durable storage | External (Datomic, JDBC, etc.) | In-process: emdb; `durable_ref`, `nextomic_conn`, `nextomic_db`, `nextomic_entity` are Value kinds |
 | Temporal database | Datomic (separate product, JVM, transactor + storage service) | Nextomic in the same binary, one file, no emdb changes |
 | Deployment | JVM uberjar / native-image | Static binary |
 

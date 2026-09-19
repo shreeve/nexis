@@ -31,7 +31,8 @@
 //!     ├─ @import("list")    — list.trace
 //!     ├─ @import("vector")  — vector.trace
 //!     ├─ @import("champ")    — champ.traceMap + champ.traceSet
-//!     └─ @import("typed_vector") — typed_vector.trace (leaf)
+//!     ├─ @import("typed_vector") — typed_vector.trace (leaf)
+//!     └─ @import("nextomic_handle") — nextomic_handle.traceEntity
 //!
 //! `vm.zig` imports gc.zig and is the collector's host: it
 //! enumerates the runtime's roots and traces the two block kinds
@@ -54,6 +55,7 @@ const db_mod = @import("db");
 const atom_mod = @import("atom");
 const record_mod = @import("record");
 const protocol_mod = @import("protocol");
+const nextomic_handle = @import("nextomic_handle");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -153,10 +155,13 @@ pub const Collector = struct {
             // protocol + protocol_fn are LEAFS
             // (no inner heap values).
             .protocol, .protocol_fn => protocol_mod.trace(h, self),
-            // Nextomic handles are leaves: the connection box holds a
-            // pointer the VM owns plus inline path text, the db box
-            // that pointer and numbers (nextomic_handle).
+            // Nextomic handles: the connection box holds a pointer the
+            // VM owns plus inline path text, the db box that pointer
+            // and numbers, so both are leaves; an entity box holds its
+            // db box and the map of its last full read
+            // (nextomic_handle).
             .nextomic_conn, .nextomic_db => {},
+            .nextomic_entity => nextomic_handle.traceEntity(h, self),
             // Closures and upvalue cells: the host lays them out and
             // walks them (VM.md §6, GC.md §5).
             .function, .cell_internal => {

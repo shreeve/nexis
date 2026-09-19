@@ -2662,3 +2662,14 @@ entry stating the decision and its rationale.
   load is one flag test; §13.4's `push-dynamic` / `pop-dynamic`
   opcodes do not exist, and the §8 sentence "`set!` does not exist"
   is replaced. `docs/VM.md` §6.5 is the authority.
+
+- **2026-09-19 — The lazy entity kind (§8.2, §23 #25).**
+  `nextomic_entity` (40) joins the heap kinds of `docs/VALUE.md`
+  §2.2: `(d/entity db e)` returns a value holding the db-value and
+  the eid that reads its attributes on access, one read per access at
+  the db-value's basis and mode, a ref coming back as another lazy
+  entity; `(d/touch ent)` is the eager map and `(d/entity-db ent)`
+  the db-value. Two entities are equal when their db-values are equal
+  and their eids agree. The kind is not serializable, as the other
+  Nextomic handles are not (§23 #25 unchanged). `docs/NEXTOMIC.md`
+  §6 is the authority.

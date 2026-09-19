@@ -490,10 +490,10 @@ pub fn build(b: *std.Build) void {
     // the same module. Its test binary is `nextomic` below.
     // -------------------------------------------------------------------------
 
-    // nextomic_handle — the heap bodies of the `nextomic_conn` and
-    // `nextomic_db` kinds. Below dispatch, format and gc so their kind
-    // arms can print, compare, hash and trace the handles without
-    // importing the module above them.
+    // nextomic_handle — the heap bodies of the `nextomic_conn`,
+    // `nextomic_db` and `nextomic_entity` kinds. Below dispatch, format,
+    // gc and vm so their kind arms can print, compare, hash, trace and
+    // look up the handles without importing the module above them.
     const nextomic_handle_mod = b.createModule(.{
         .root_source_file = b.path("src/nextomic/handle.zig"),
         .target = target,
@@ -505,6 +505,8 @@ pub fn build(b: *std.Build) void {
     dispatch_mod.addImport("nextomic_handle", nextomic_handle_mod);
     format_mod.addImport("nextomic_handle", nextomic_handle_mod);
     gc_mod.addImport("nextomic_handle", nextomic_handle_mod);
+    // `vm.lookup` reads a lazy entity through the hook its box carries.
+    vm_mod.addImport("nextomic_handle", nextomic_handle_mod);
     const nextomic_handle_tests = b.addTest(.{ .root_module = nextomic_handle_mod });
     const run_nextomic_handle_tests = b.addRunArtifact(nextomic_handle_tests);
 
@@ -725,7 +727,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "typed_vector", "transient", "db", "atom", "record", "protocol", "nextomic_handle" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "string", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
-        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "gc", "list", "intern", "vector", "champ", "dispatch", "record", "protocol", "bignum" } },
+        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "gc", "list", "intern", "vector", "champ", "dispatch", "record", "protocol", "bignum", "nextomic_handle" } },
         // format test binary. Imports the menagerie of
         // consumer kinds; nothing depends on format itself.
         .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle", "bignum", "typed_vector" } },
@@ -1034,6 +1036,23 @@ pub fn build(b: *std.Build) void {
     }) |imp| runtime_polish_mod.addImport(imp[0], imp[1]);
     const runtime_polish_tests = b.addTest(.{ .root_module = runtime_polish_mod });
     const run_runtime_polish_tests = b.addRunArtifact(runtime_polish_tests);
+
+    // The lazy entity through the pipeline (test/integration/
+    // nextomic_entity.zig): every access path as a program sees it,
+    // and an entity kept in a Var under the collector's stress policy.
+    const integration_nextomic_entity_mod = b.createModule(.{
+        .root_source_file = b.path("test/integration/nextomic_entity.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    for ([_]struct { []const u8, *std.Build.Module }{
+        .{ "value", value_mod },   .{ "vm", vm_mod },         .{ "compile", compile_mod },
+        .{ "intern", intern_mod }, .{ "reader", reader_mod }, .{ "expand", expand_mod },
+        .{ "stdlib", stdlib_mod }, .{ "format", format_mod },
+    }) |imp| integration_nextomic_entity_mod.addImport(imp[0], imp[1]);
+    const integration_nextomic_entity_tests = b.addTest(.{ .root_module = integration_nextomic_entity_mod });
+    const run_integration_nextomic_entity_tests = b.addRunArtifact(integration_nextomic_entity_tests);
+    nextomic_test_step.dependOn(&run_integration_nextomic_entity_tests.step);
 
     // The numeric tower end to end: promotion, demotion, contagion,
     // literals, printing, predicates, conversions and the codec.
@@ -1449,6 +1468,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_integration_nextomic_q_tests.step);
     test_step.dependOn(&run_integration_nextomic_pull_tests.step);
     test_step.dependOn(&run_integration_nextomic_fn_tests.step);
+    test_step.dependOn(&run_integration_nextomic_entity_tests.step);
     test_step.dependOn(&run_prop_compile_tests.step);
     test_step.dependOn(&run_integration_eval_tests.step);
     test_step.dependOn(&run_runtime_polish_tests.step);

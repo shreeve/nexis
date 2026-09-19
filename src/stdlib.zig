@@ -836,7 +836,7 @@ fn fnSeq(vm: *VM, args: []const Value) VmError!Value {
 /// `(count coll)` → element count. nil → 0. Lists, vectors,
 /// maps, records, sets and strings; a string counts Unicode
 /// scalars, not bytes.
-fn fnCount(_: *VM, args: []const Value) VmError!Value {
+fn fnCount(vm: *VM, args: []const Value) VmError!Value {
     const c = args[0];
     const n: i64 = switch (c.kind()) {
         .nil => 0,
@@ -845,6 +845,7 @@ fn fnCount(_: *VM, args: []const Value) VmError!Value {
         .typed_vector => @intCast(typed_vector_mod.count(c)),
         .persistent_map => @intCast(champ_mod.mapCount(c)),
         .record => @intCast(champ_mod.mapCount(record_mod.fieldsOf(c))),
+        .nextomic_entity => @intCast(champ_mod.mapCount(try nextomic_mod.natives.entityMap(vm, c))),
         .persistent_set => @intCast(champ_mod.setCount(c)),
         .string => @intCast(string_mod.codepointCount(c) catch return VmError.Utf8Error),
         else => return VmError.KindMismatch,
@@ -936,6 +937,8 @@ fn fnEmptyQ(_: *VM, args: []const Value) VmError!Value {
         .typed_vector => typed_vector_mod.count(c) == 0,
         .persistent_map => champ_mod.mapCount(c) == 0,
         .record => champ_mod.mapCount(record_mod.fieldsOf(c)) == 0,
+        // An entity always has its :db/id.
+        .nextomic_entity => false,
         .persistent_set => champ_mod.setCount(c) == 0,
         .string => string_mod.byteLen(c) == 0,
         else => return VmError.KindMismatch,
@@ -1654,7 +1657,7 @@ fn stringIndex(s: Value, k: Value) VmError!?Value {
     return value_mod.fromChar(scalar) orelse VmError.Utf8Error;
 }
 
-fn fnContainsQ(_: *VM, args: []const Value) VmError!Value {
+fn fnContainsQ(vm: *VM, args: []const Value) VmError!Value {
     const coll = args[0];
     const k = args[1];
     return switch (coll.kind()) {
@@ -1691,6 +1694,7 @@ fn fnContainsQ(_: *VM, args: []const Value) VmError!Value {
             .present => true,
             .absent => false,
         }),
+        .nextomic_entity => value_mod.fromBool(try nextomic_mod.natives.entityHas(vm, coll, k)),
         else => return VmError.KindMismatch,
     };
 }
@@ -1703,14 +1707,15 @@ fn fnVals(vm: *VM, args: []const Value) VmError!Value {
     return mapPart(vm, args[0], .value);
 }
 
-/// `(keys m)` / `(vals m)`: the keys or values of a map or record
-/// as a list, nil when there are none (so `(if (keys m) ...)`
-/// reads as in Clojure).
+/// `(keys m)` / `(vals m)`: the keys or values of a map, record or
+/// lazy entity as a list, nil when there are none (so `(if (keys m)
+/// ...)` reads as in Clojure).
 fn mapPart(vm: *VM, m: Value, part: enum { key, value }) VmError!Value {
     const map_v: Value = switch (m.kind()) {
         .nil => return value_mod.nilValue(),
         .persistent_map => m,
         .record => record_mod.fieldsOf(m),
+        .nextomic_entity => try nextomic_mod.natives.entityMap(vm, m),
         else => return VmError.KindMismatch,
     };
     var collected: std.ArrayList(Value) = .empty;
@@ -4276,9 +4281,10 @@ const SeqIter = union(enum) {
 };
 
 /// Every seqable receiver: nil, list, vector, map (as `[k v]`
-/// entries), record (its field map), set and string (as chars). A
-/// string that is not valid UTF-8 is `:utf8-error`, as for every
-/// other string operation.
+/// entries), record (its field map), lazy entity (its attributes,
+/// read in one pass), set and string (as chars). A string that is
+/// not valid UTF-8 is `:utf8-error`, as for every other string
+/// operation.
 fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
     return switch (coll.kind()) {
         .nil => .empty,
@@ -4287,6 +4293,7 @@ fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
         .typed_vector => .{ .typed = .{ .v = coll, .idx = 0, .count = typed_vector_mod.count(coll), .heap = vm.ensureHeap() } },
         .persistent_map => .{ .map = .{ .it = champ_mod.mapIter(coll), .heap = vm.ensureHeap() } },
         .record => .{ .map = .{ .it = champ_mod.mapIter(record_mod.fieldsOf(coll)), .heap = vm.ensureHeap() } },
+        .nextomic_entity => .{ .map = .{ .it = champ_mod.mapIter(try nextomic_mod.natives.entityMap(vm, coll)), .heap = vm.ensureHeap() } },
         .persistent_set => .{ .set = champ_mod.setIter(coll) },
         .string => .{
             .string = (std.unicode.Utf8View.init(string_mod.asBytes(coll)) catch return VmError.Utf8Error).iterator(),

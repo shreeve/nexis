@@ -13,6 +13,13 @@
 //! thrown through `VM.throwKeyword`, catchable by `try`. Wrong-kind
 //! arguments are `KindMismatch`, as for every other native.
 //!
+//! A lazy entity (`entity`) is a `nextomic_entity` box over the
+//! db-value and the eid; `entityLookup`, `entityHas` and `entityMap`
+//! are its access paths, called from `vm.lookup` through the hook the
+//! box carries and from the `stdlib` arms for `contains?`, `keys`,
+//! `vals`, `seq`, `count` and `into`. Each opens one read at the
+//! entity's basis and mode, as every other native does.
+//!
 //! Connection lifetime: `connect` registers the `Conn` on
 //! `vm.nextomic_connections`; `release` closes it (idempotent, and
 //! `:nextomic/busy` while an operation on it is in flight) and leaves
@@ -84,6 +91,8 @@ const natives = [_]Entry{
     .{ .name = "transact!", .descriptor = &native_transact },
     .{ .name = "excise!", .descriptor = &native_excise },
     .{ .name = "entity", .descriptor = &native_entity },
+    .{ .name = "touch", .descriptor = &native_touch },
+    .{ .name = "entity-db", .descriptor = &native_entity_db },
     .{ .name = "entid", .descriptor = &native_entid },
     .{ .name = "ident", .descriptor = &native_ident },
     .{ .name = "datoms", .descriptor = &native_datoms },
@@ -117,6 +126,8 @@ const native_basis_t = NativeFn{ .name = "nextomic/basis-t", .min_arity = 1, .ma
 const native_transact = NativeFn{ .name = "nextomic/transact!", .min_arity = 2, .max_arity = 3, .call = &fnTransact };
 const native_excise = NativeFn{ .name = "nextomic/excise!", .min_arity = 2, .max_arity = 3, .call = &fnExcise };
 const native_entity = NativeFn{ .name = "nextomic/entity", .min_arity = 2, .max_arity = 2, .call = &fnEntity };
+const native_touch = NativeFn{ .name = "nextomic/touch", .min_arity = 1, .max_arity = 1, .call = &fnTouch };
+const native_entity_db = NativeFn{ .name = "nextomic/entity-db", .min_arity = 1, .max_arity = 1, .call = &fnEntityDb };
 const native_entid = NativeFn{ .name = "nextomic/entid", .min_arity = 2, .max_arity = 2, .call = &fnEntid };
 const native_ident = NativeFn{ .name = "nextomic/ident", .min_arity = 2, .max_arity = 2, .call = &fnIdent };
 const native_datoms = NativeFn{ .name = "nextomic/datoms", .min_arity = 2, .max_arity = 7, .call = &fnDatoms };
@@ -440,13 +451,15 @@ fn fixnum(n: u64) !Value {
 const Scope = struct {
     arena_state: std.heap.ArenaAllocator,
     db: DbValue,
+    /// The db box `db` was read from: what a lazy entity made here holds.
+    box: Value,
     rd: Read,
     b: Builder,
 
     fn open(vm: *VM, arg: Value) !Scope {
         const d = try dbOf(arg);
         const rd = try d.beginRead();
-        return .{ .arena_state = std.heap.ArenaAllocator.init(vm.allocator), .db = d, .rd = rd, .b = Builder.init(vm, d.conn, rd.txn) };
+        return .{ .arena_state = std.heap.ArenaAllocator.init(vm.allocator), .db = d, .box = arg, .rd = rd, .b = Builder.init(vm, d.conn, rd.txn) };
     }
 
     fn close(self: *Scope) void {
@@ -722,8 +735,10 @@ fn failPull(vm: *VM, err: anyerror, diag: *const Diag) VmError {
 
 const fnEntity = wrap(entityNative);
 
-/// `{:db/id e :attr v ...}` with card-many values as sets; nil when the
-/// entity has no datoms in this view.
+/// `(entity db e)`: a lazy entity over this view; nil when the entity
+/// has no datoms in it. One read resolves `e` (an eid, ident or lookup
+/// ref) and confirms a datom exists; the attributes are read on
+/// access. A history view has no entities (`HistoryView`).
 fn entityNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     var sc = try Scope.open(vm, args[0]);
     defer sc.close();
@@ -732,17 +747,56 @@ fn entityNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     if (sc.db.history) return error.HistoryView;
     const arena = sc.arena();
     const e = (try marshal.entity(&sc.rd, arena, args[1], &fault)) orelse return value.nilValue();
-    const b = &sc.b;
-
     var it = try sc.rd.scan(arena, .eavt, .{ .e = e });
+    if ((try it.next()) == null) return value.nilValue();
+    return lazyEntity(vm, args[0], e);
+}
+
+fn lazyEntity(vm: *VM, db: Value, e: u64) !Value {
+    return handle.makeEntity(vm.ensureHeap(), .{ .db = db, .eid = e, .vm = @ptrCast(vm), .read = &entityReadHook });
+}
+
+/// The hook an entity box carries: `vm.lookup`'s path to `entityLookup`.
+fn entityReadHook(vm_ptr: *anyopaque, ent: Value, k: Value, default: Value) anyerror!Value {
+    const vm: *VM = @ptrCast(@alignCast(vm_ptr));
+    return entityLookup(vm, ent, k, default);
+}
+
+/// How a ref value comes back: as a lazy entity of the same view (an
+/// access through the entity) or as its eid (`touch`).
+const RefStyle = enum { entity, id };
+
+/// A datom value as the entity presents it.
+fn entityVal(sc: *Scope, v: Val, refs: RefStyle) !Value {
+    if (refs == .entity and v == .ref) return lazyEntity(sc.b.vm, sc.box, v.ref);
+    return sc.b.val(v);
+}
+
+/// The value of `attr` on `e` in the scope's view: card-many as a
+/// set; null when the entity has no datom under it.
+fn attrValue(sc: *Scope, e: u64, attr: Attr, refs: RefStyle) !?Value {
+    var it = try sc.rd.scan(sc.arena(), .eavt, .{ .e = e, .a = attr.id });
+    var many: ?Value = null;
+    while (try it.next()) |dt| {
+        const v = try entityVal(sc, dt.v, refs);
+        if (!attr.many()) return v;
+        const set = many orelse try champ.setEmpty(sc.b.heap);
+        many = try champ.setConj(sc.b.heap, set, v, &dispatch.hashValue, &dispatch.equal);
+    }
+    return many;
+}
+
+/// `{:db/id e :attr v ...}` for `e` in the scope's view, card-many as
+/// sets, refs by `refs`; null when the view holds no datom of `e`.
+fn entityMapIn(sc: *Scope, e: u64, refs: RefStyle) !?Value {
+    const b = &sc.b;
+    var it = try sc.rd.scan(sc.arena(), .eavt, .{ .e = e });
     var m: ?Value = null;
     var cur_a: u32 = 0;
     var cur_attr: Attr = undefined;
     var many: ?Value = null;
     while (try it.next()) |dt| {
-        if (m == null) {
-            m = try b.putKw(try champ.mapEmpty(b.heap), "db/id", try fixnum(e));
-        }
+        if (m == null) m = try idOnly(b, e);
         if (many != null and dt.a != cur_a) {
             m = try b.put(m.?, try b.attrKeyword(cur_a), many.?);
             many = null;
@@ -751,7 +805,7 @@ fn entityNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
             cur_a = dt.a;
             cur_attr = (try sc.rd.attr(dt.a)) orelse return error.Corrupted;
         }
-        const v = try b.val(dt.v);
+        const v = try entityVal(sc, dt.v, refs);
         if (cur_attr.many()) {
             const set = many orelse try champ.setEmpty(b.heap);
             many = try champ.setConj(b.heap, set, v, &dispatch.hashValue, &dispatch.equal);
@@ -760,7 +814,106 @@ fn entityNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
         }
     }
     if (many) |set| m = try b.put(m.?, try b.attrKeyword(cur_a), set);
-    return m orelse value.nilValue();
+    return m;
+}
+
+/// `{:db/id e}`.
+fn idOnly(b: *Builder, e: u64) !Value {
+    return b.putKw(try champ.mapEmpty(b.heap), "db/id", try fixnum(e));
+}
+
+/// The db box of an entity argument.
+fn entityArg(v: Value) !Value {
+    if (v.kind() != .nextomic_entity) return error.KindMismatch;
+    return handle.entityDb(v);
+}
+
+/// Is `k` the keyword `:db/id`?
+fn isDbId(vm: *VM, k: Value) !bool {
+    return k.kind() == .keyword and k.asKeywordId() == try vm.ensureInterner().internKeyword("db/id");
+}
+
+/// `(get ent k default)` and `(:k ent)`: `:db/id` is the eid and opens
+/// nothing; any other keyword folds that attribute in one read, a ref
+/// coming back as a lazy entity of the same view; an attribute the
+/// entity lacks, an unknown attribute or a non-keyword key is the
+/// default.
+pub fn entityLookup(vm: *VM, ent: Value, k: Value, default: Value) VmError!Value {
+    return entityGet(vm, ent, k, default) catch |err| fail(vm, err);
+}
+
+fn entityGet(vm: *VM, ent: Value, k: Value, default: Value) !Value {
+    const box = try entityArg(ent);
+    if (k.kind() != .keyword) return default;
+    const e = handle.entityEid(ent);
+    if (try isDbId(vm, k)) return fixnum(e);
+    var sc = try Scope.open(vm, box);
+    defer sc.close();
+    var fault: Fault = .{};
+    const attr = marshal.attrOf(&sc.rd, k, &fault) catch |err| switch (err) {
+        error.UnknownAttribute => return default,
+        else => return err,
+    };
+    return (try attrValue(&sc, e, attr, .entity)) orelse default;
+}
+
+/// `(contains? ent k)`: `:db/id` always; another keyword when the
+/// entity has a datom under it in this view.
+pub fn entityHas(vm: *VM, ent: Value, k: Value) VmError!bool {
+    return entityHasNative(vm, ent, k) catch |err| fail(vm, err);
+}
+
+fn entityHasNative(vm: *VM, ent: Value, k: Value) !bool {
+    const box = try entityArg(ent);
+    if (k.kind() != .keyword) return false;
+    if (try isDbId(vm, k)) return true;
+    var sc = try Scope.open(vm, box);
+    defer sc.close();
+    var fault: Fault = .{};
+    const attr = marshal.attrOf(&sc.rd, k, &fault) catch |err| switch (err) {
+        error.UnknownAttribute => return false,
+        else => return err,
+    };
+    var it = try sc.rd.scan(sc.arena(), .eavt, .{ .e = handle.entityEid(ent), .a = attr.id });
+    return (try it.next()) != null;
+}
+
+/// `keys`, `vals`, `seq`, `count` and `into`: every attribute in one
+/// read, refs as lazy entities of the same view; `{:db/id e}` alone
+/// when the view holds no datom of `e`. The map is held on the box so
+/// an iteration over it survives a collection.
+pub fn entityMap(vm: *VM, ent: Value) VmError!Value {
+    return entityMapNative(vm, ent) catch |err| fail(vm, err);
+}
+
+fn entityMapNative(vm: *VM, ent: Value) !Value {
+    const box = try entityArg(ent);
+    var sc = try Scope.open(vm, box);
+    defer sc.close();
+    const e = handle.entityEid(ent);
+    const m = (try entityMapIn(&sc, e, .entity)) orelse try idOnly(&sc.b, e);
+    handle.entityHold(ent, m);
+    return m;
+}
+
+fn fnTouch(vm: *VM, args: []const Value) VmError!Value {
+    return touchNative(vm, args) catch |err| fail(vm, err);
+}
+
+/// `(touch ent)`: the map `{:db/id e :attr v ...}` of every attribute
+/// read in one pass, card-many as sets, refs as eids; `{:db/id e}`
+/// alone when the view holds no datom of `e`.
+fn touchNative(vm: *VM, args: []const Value) !Value {
+    const box = try entityArg(args[0]);
+    var sc = try Scope.open(vm, box);
+    defer sc.close();
+    const e = handle.entityEid(args[0]);
+    return (try entityMapIn(&sc, e, .id)) orelse idOnly(&sc.b, e);
+}
+
+/// `(entity-db ent)`: the db-value the entity reads through.
+fn fnEntityDb(_: *VM, args: []const Value) VmError!Value {
+    return entityArg(args[0]) catch VmError.KindMismatch;
 }
 
 const fnEntid = wrap(entidNative);
