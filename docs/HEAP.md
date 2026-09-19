@@ -1,6 +1,6 @@
-## HEAP.md — Runtime Heap Allocator & Object Storage (Phase 1)
+## HEAP.md — Runtime Heap Allocator & Object Storage
 
-**Status**: Phase 1 deliverable. Authoritative storage-layout contract for
+Authoritative storage-layout contract for
 every non-immediate `Value`. Derivative from `PLAN.md` §10, `docs/VALUE.md`
 §4 and §5. Those documents win on conflict; nothing here may contradict
 the 16-byte `HeapHeader` freeze pinned in VALUE.md.
@@ -72,8 +72,8 @@ or a VALUE.md amendment, not just a HEAP.md edit):
 Every live block is on a single intrusive linked list rooted in
 `Heap.live_head`. Alloc prepends (O(1)); free detaches (O(1) if you hold
 the prev pointer, O(n) otherwise). For v1, `free` does a linear scan to
-find the predecessor — acceptable at Phase 1 scale, and a later slab
-allocator will replace the whole strategy.
+find the predecessor. The size-class pool (`docs/POOL.md`) is the
+backing allocator underneath this list.
 
 The list is the canonical source of truth for "what's live." Sweep walks
 it; tests enumerate it to assert leak counts.
@@ -81,8 +81,7 @@ it; tests enumerate it to assert leak counts.
 **Why not an external registry?** Peer-AI review concluded (and I agreed):
 a prefix block keeps allocation lifetime metadata physically adjacent to
 the object, avoids a dual source of truth (allocator + registry), and
-transitions cleanly to slab-based allocation later. See conversation
-`nexis-phase-1` turn 4 for the full discussion.
+transitions cleanly to slab-based allocation.
 
 ---
 
@@ -193,10 +192,11 @@ flag_hash_cached is reserved and not operationally used yet.
 
 - **Value layer (`src/value.zig`).** Value holds a u64 payload that, for
   heap kinds, is `@intFromPtr(header)`. `valueFromHeader` and
-  `asHeapHeader` round-trip this. The Value layer's `hashValue`
-  currently panics for heap kinds; when heap kinds come online it will
-  load `HeapHeader.hash` (via `cachedHash`), recompute if null, write
-  back via `setCachedHash`, and `mixKindDomain` as always.
+  `asHeapHeader` round-trip this. Hashing of heap kinds is
+  dispatched by `src/dispatch.zig`'s `hashValue` to per-kind hash
+  functions, which load `HeapHeader.hash` (via `cachedHash`),
+  recompute if null, write back via `setCachedHash`, and
+  `mixKindDomain` as always.
 - **Intern layer (`src/intern.zig`).** No direct interaction: interned
   name bytes are NOT heap-allocated (they live in interner-owned buffers,
   not on this heap). The `meta_symbol` heap kind (future) will point at
@@ -224,10 +224,11 @@ flag_hash_cached is reserved and not operationally used yet.
   and `src/gc.zig` own this. HEAP.md only owns the allocator + the
   sweep primitive + the mark-bit layout.
 - **Allocation performance** (slab allocator, size-class bins, large-object
-  direct-mmap). PLAN §10.4 describes the target v3+ shape; Phase 6 is
-  where the optimization work lives (`PLAN §19.6` T2.6 generational,
-  T1.4 slab pools).
+  direct-mmap). PLAN §10.4 describes the target shape (`PLAN §19.6`
+  T2.6 generational, T1.4 slab pools); the size-class pool is what
+  exists (`docs/POOL.md`).
 - **Large-object threshold.** v1 uses a single strategy for every size.
-  PLAN §10.4's >4 KiB direct-from-OS path is a Phase 6 performance item.
+  PLAN §10.4's >4 KiB direct-from-OS path does not exist; the pool
+  delegates large requests to its backing allocator.
 - **Finalization hooks.** Not in v1. Objects that own OS resources (open
   files, durable-ref pins) are tracked separately at the tx/db layer.
