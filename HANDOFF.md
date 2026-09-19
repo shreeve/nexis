@@ -63,11 +63,11 @@ git status                        # clean main
 zig build install                 # bin/nexis and bin/nexis-golden
 ./bin/nexis --help                # usage; lists the namespaces available without a file
 zig build quick                   # the inner loop, ~35-50 s warm
-zig build test --summary all      # the gate: 1439 tests, 154 steps, ~4 min wall
+zig build test --summary all      # the gate: 1451 tests, 156 steps, ~4 min wall
 ```
 
-The gate's last line reads `Build Summary: 154/154 steps succeeded;
-1439/1439 tests passed`, preceded by `golden: ok=10 updated=0
+The gate's last line reads `Build Summary: 156/156 steps succeeded;
+1451/1451 tests passed`, preceded by `golden: ok=10 updated=0
 failed=0 missing=0`. Two integration binaries end with a benchmark
 whose row-count checks always run; the build runner echoes their
 stderr as `failed command:` lines while both succeed, so read the
@@ -217,7 +217,7 @@ imported by `stdlib` only. Files, one sentence each:
 | `schema.zig` | attributes as-of a basis, built from the attribute partition's datoms; per-attribute counts for the planner |
 | `transact.zig` | the transaction protocol: begin, normalise, tempids, expand, schema checks, write, commit; the overlay model that makes implicit retracts and same-transaction unique claims O(1) |
 | `db.zig` | `Conn` and `DbValue`; entity, entid/ident, datoms, tx-range; a speculative `with` is a second `Conn` over the held write transaction |
-| `handle.zig` | heap bodies of `nextomic_conn` and `nextomic_db`; its own build module `nextomic_handle` below `dispatch`/`format`/`gc` |
+| `handle.zig` | heap bodies of `nextomic_conn`, `nextomic_db` and `nextomic_entity`; its own build module `nextomic_handle` below `dispatch`/`format`/`gc`/`vm`, whose `lookup` reads a lazy entity through the hook its box carries |
 | `marshal.zig` | VM values to and from datom values: the entity, value and cell contracts shared by natives, query, pull and transactions |
 | `relation.zig` | the columnar `Relation` of the query pipeline, arena-scoped, never a VM value; hash join, difference, union |
 | `query.zig` | the query pipeline's root: `q` opens one read, runs parse → plan → exec in one arena, closes on every path |
@@ -228,7 +228,7 @@ imported by `stdlib` only. Files, one sentence each:
 | `query/rules.zig` | rule expansion; recursive components run the semi-naive fixpoint |
 | `query/natives.zig` | `q` and `explain`; the per-VM IR and rule-set caches |
 | `pull.zig` | pull patterns over one read: `*`, nesting, reverse refs, recursion, `:limit`/`:default`/`:as` |
-| `natives.zig` | the `nextomic` namespace table, `errorKeyword` (every error variant has a keyword; a test asserts totality), error payload maps, connection lifetime |
+| `natives.zig` | the `nextomic` namespace table, `errorKeyword` (every error variant has a keyword; a test asserts totality), error payload maps, connection lifetime, the lazy entity's access paths (`entityLookup`, `entityHas`, `entityMap`) |
 
 Key invariants (`docs/NEXTOMIC.md` §1): datoms are bytes-only keys
 whose order is the index order; current and history trees are
@@ -256,7 +256,7 @@ context, or the bare keyword when there is nothing more to say.
 | `nexis.test` | `deftest is testing run-tests run-all-tests` and the registry and reporter they share, in `src/stdlib/test.nx` (`docs/TOOLING.md` §3) |
 | `nexis.pprint` | `pprint pprint-str` in `src/stdlib/pprint.nx` (`docs/TOOLING.md` §4) |
 | `nexis.math` | 5 natives `sqrt pow floor ceil round` plus `PI` and `E` from `src/stdlib/math.nx` (`docs/TOOLING.md` §4) |
-| `nextomic` | 22 natives: `connect release db basis-t transact! excise! entity entid ident datoms index-range as-of since history tx-range schema sync q explain pull pull-many with`, plus the macro `with-conn` from `src/stdlib/nextomic.nx` |
+| `nextomic` | 24 natives: `connect release db basis-t transact! excise! entity touch entity-db entid ident datoms index-range as-of since history tx-range schema sync q explain pull pull-many with`, plus the macro `with-conn` from `src/stdlib/nextomic.nx` |
 | `user` | the current namespace at start |
 
 `src/cli.zig` `bootRuntime` installs the tables, bootstraps `core.nx`
@@ -348,7 +348,11 @@ an aborted transaction. `test/prop/nextomic_key.zig` sweeps 100,000
 random pairs per value type for `order(enc a, enc b) == cmp(a, b)`,
 the NUL escape round trip, order across the inline threshold, and the
 256-byte search-clue bound. `test/integration/nextomic_fx.zig` is the
-fixture the corpora share.
+fixture the corpora share. `test/integration/nextomic_entity.zig` runs
+programs against a VM with `nextomic` installed: every access path of
+the lazy entity, refs navigating, `touch`, identity, a released
+connection, and an entity kept in a Var under the collector's stress
+policy.
 
 **Scripts.** `test/nextomic/{basics,indexes,time,errors,query,pull,
 with,with-conn,polish,persist-1,persist-2}.nx` run through
@@ -360,8 +364,8 @@ variable, rule bodies of one name apart in the rule set, a wide
 query, the pull cut at 1000, lookup refs and idents as `:in` inputs,
 transaction entity ids as time arguments, the history view refusing
 `entity` and `pull`, reverse refs and nested maps in map forms, unique
-being card-one, cross-type comparisons, the error payload maps, and
-`connect` making its directories.
+being card-one, cross-type comparisons, the error payload maps, an
+entity reading on access, and `connect` making its directories.
 
 **Language.** `test/integration/eval_pipeline.zig` runs source through
 the whole pipeline for every primitive form, macro and
@@ -432,18 +436,6 @@ through `bin/nexis`:
 In the order they unblock users; each wants its `docs/NEXTOMIC.md`
 row, a corpus or `.nx` case and its `.out`:
 
-- **A lazy entity kind**: `entity` returns an eager map read in one
-  pass (`docs/NEXTOMIC.md` §6). An entity that reads attributes on
-  access is a heap kind of its own, holding the connection, the basis
-  and mode and the eid, with arms in `value.zig`'s `Kind`,
-  `dispatch.zig` (lookup, `get`, `keys`, `seq`, `count`, equality by
-  identity of connection, basis and eid), `format.zig`, `gc.zig` and
-  the codec, and a `nextomic_handle.zig` body beside the two existing
-  boxes. Each access opens a read transaction and folds the view, so
-  `entity` on a history db can stay refused and a ref can return
-  another lazy entity. The `.nx` scripts that print entity maps
-  (`basics`, `polish`, `pull`, `time`) pin the eager shapes and would
-  change.
 - **Hash-join tuning**: the planner's estimates come from `treeStat`
   and per-attribute counts; `exec.zig` chooses nested loop when
   `rows × log n` is below the scan estimate. Measure
@@ -569,9 +561,7 @@ regenerated file with the grammar).
    compiler hooks `macroexpand-1` and `read-string` use are the
    pattern, and the missing piece is a routine compiled and run in
    the calling VM rather than a sub-VM.
-2. **A lazy entity kind (§6.2)** when a program reads a few
-   attributes of many entities; the design is written out there.
-3. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
+2. **Performance pass** (PLAN §21 Phase 6, `docs/PERF.md` §6): Var
    inline caches, SIMD CHAMP nodes, zero-copy strings from emdb
    pages, hash-join estimate quality. Measure first with `zig build
    bench`; `docs/BENCH.md` is the honesty gate.
