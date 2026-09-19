@@ -986,6 +986,19 @@ object mechanics grow with the implementation.
   original exception is lost (v1 behavior; later versions may
   chain).
 
+**Throws from natives** (`VM.throwValue`, `VM.throwKeyword`):
+- A native throws exactly as `ctrl:throw` does: the same handler
+  walk, the same unwinding through every frame above the handler's
+  (including the synthetic frames `callValue` pushes for host
+  callbacks). When a handler catches it the frames and pc are
+  already positioned there and the native returns
+  `ControlTransferred`, which the run loop resumes from.
+- With no handler anywhere the result is `UncaughtThrow` with the
+  thrown value in `vm.unhandled_throw`, for every native alike:
+  a storage failure outside `try` surfaces as an uncaught
+  `:db/key-too-large`, not as a raw `DbError`. The CLI prints the
+  payload with the error.
+
 Richer semantics (stack traces, cause chaining, restart-style
 handlers) are explicitly future work. This spec pins only the
 minimum needed for `(try (throw x) (catch any _ ...))` to be
@@ -1006,7 +1019,7 @@ keyword; renames are breaking changes.
 | `:divide-by-zero` | Fixnum or float `div` / `quot` / `rem` with zero divisor | Deterministic trap |
 | `:kind-mismatch` | `coll:*` opcode on a value of wrong kind (e.g., `map-get` on a vector) | Recoverable via try/catch |
 | `:not-callable` | `call:call` on a value that is neither a function nor invocable as a lookup (keywords, maps, sets and vectors are; PLAN §8.7) | Recoverable |
-| `:uncaught-throw` | `ctrl:throw` with no handler up the frame chain | Halts VM with error report |
+| `:uncaught-throw` | `ctrl:throw`, or a native's `throwValue`, with no handler up the frame chain | Halts VM with error report; the thrown value is in `vm.unhandled_throw` |
 | `:extension-decode-failure` | Primary instruction expects extension but extension bytes malformed | Programming error; halts VM |
 | `:transient-frozen` | `transient_mod.*Bang` op on a finalized transient | Recoverable |
 | `:invalid-operand-kind` | Operand's kind byte is incompatible with opcode context (e.g., `resolve` on an `.unused` operand, `store` to a constant operand) | Handler bug; distinct from index-OOB and from corrupted encoding |

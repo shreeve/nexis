@@ -268,6 +268,9 @@ These are the semantic traps a Clojure programmer will hit.
 | `(= 1 1.0)` | `true` | `false`; `(== 1 1.0)` is `true` | PLAN §23 #11; `==` is the cross-type numeric equality (PLAN Amendment Log, number tower) |
 | `(= Double/NaN Double/NaN)` | `false` | `true` (canonical bit pattern) | SEMANTICS §2.2 |
 | Integer overflow | auto-promotes to `BigInteger` | raises the catchable `:arithmetic-overflow`; a literal outside ±2^47 is a compile error (no bignum arithmetic; `HANDOFF.md` §4 item 1) | PLAN §23 #10, Amendment Log (doubles as landed) |
+| `number?` / `integer?` on a bignum | `true` | the value layer has a `bignum` kind (`src/bignum.zig`, SEMANTICS §2.2), but no literal, operation or native produces one at runtime, so the predicates are defined over `fixnum` and `float` only (`vm.isNumber`); they will widen when bignum arithmetic lands | value.zig `Kind.bignum` |
+| `(iterate f x)`, `(repeat x)`, `(repeatedly f)`, `(range)` | infinite lazy seqs | sequences are eager, so each takes an explicit count: `(iterate f x n)`, `(repeat n x)`, `(repeatedly n f)`; `(range)` is an arity error. `(take n (iterate f x))` ported from Clojure fails at the `iterate` arity | PLAN §4 (no lazy seqs) |
+| `(empty record)` | throws `UnsupportedOperationException` | `{}`: a record is a map to every collection function | SEMANTICS §4 |
 | Syntax-quote expansion | at read time, auto-qualifies + auto-gensyms | reader emits marker only; macroexpander qualifies | PLAN §14.2 (see §2.6 above) |
 
 ### 4.4 Explicit omissions (by PLAN §4 non-goals)
