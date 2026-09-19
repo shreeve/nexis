@@ -827,10 +827,7 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usi
                 try w.writeAll("bind ");
                 try explainCall(b.call, ctx, w);
                 try w.writeAll(" -> ");
-                for (b.fresh, 0..) |v, i| {
-                    if (i > 0) try w.writeByte(' ');
-                    try w.writeAll(ctx.varName(v));
-                }
+                try explainBinding(b, ctx, w);
                 try w.writeByte('\n');
             },
             .not => |n| {
@@ -859,6 +856,23 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usi
     }
     try indent(w, depth);
     try w.print("rows~{d}\n", .{p.rows_estimate});
+}
+
+/// The binding's variables; one bound before the step (which the
+/// step unifies rather than binds) is marked `!` like a scan slot.
+fn explainBinding(b: Bind, ctx: *const Ctx, w: *std.Io.Writer) !void {
+    const outs: []const ?Var = switch (b.out) {
+        .scalar, .collection => |v| &.{v},
+        .tuple, .relation => |ts| ts,
+    };
+    var first = true;
+    for (outs) |t| {
+        const v = t orelse continue;
+        if (!first) try w.writeByte(' ');
+        first = false;
+        try w.writeAll(ctx.varName(v));
+        if (!ir.containsVar(b.fresh, v)) try w.writeByte('!');
+    }
 }
 
 fn explainVars(vars: []const Var, ctx: *const Ctx, w: *std.Io.Writer) !void {

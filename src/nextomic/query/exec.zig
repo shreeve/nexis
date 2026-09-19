@@ -379,45 +379,53 @@ pub const Exec = struct {
     }
 
     /// Append the rows `result` binds under `b.out`; `row[0..base]`
-    /// holds the input row and the rest is filled here.
+    /// holds the input row. An output variable bound before the step
+    /// unifies: the row is kept only when the result equals its value.
     fn bindValue(self: *Exec, b: *const plan_mod.Bind, result: Value, row: []Cell, base: usize, out: *Relation) anyerror!void {
         switch (b.out) {
-            .scalar => {
+            .scalar => |v| {
                 if (result.isNil()) return;
-                row[base] = Cell.fromValue(result);
-                try out.append(row);
+                if (put(out, row, base, v, Cell.fromValue(result))) try out.append(row);
             },
-            .collection => {
+            .collection => |v| {
                 const items = (try self.seqElems(result)) orelse return error.QuerySyntax;
                 for (items) |x| {
-                    row[base] = Cell.fromValue(x);
-                    try out.append(row);
+                    if (put(out, row, base, v, Cell.fromValue(x))) try out.append(row);
                 }
             },
             .tuple => |ts| {
                 if (result.isNil()) return;
-                try self.fillTuple(ts, result, row, base);
-                try out.append(row);
+                if (try self.fillTuple(out, ts, result, row, base)) try out.append(row);
             },
             .relation => |ts| {
                 const items = (try self.seqElems(result)) orelse return error.QuerySyntax;
                 for (items) |x| {
-                    try self.fillTuple(ts, x, row, base);
-                    try out.append(row);
+                    if (try self.fillTuple(out, ts, x, row, base)) try out.append(row);
                 }
             },
         }
     }
 
-    fn fillTuple(self: *Exec, ts: []const ?Var, v: Value, row: []Cell, base: usize) anyerror!void {
+    /// Place `cell` in the row for `v`: written when the step binds
+    /// `v` (its column is past `base`), compared when an earlier step
+    /// did. False when the comparison fails.
+    fn put(out: *const Relation, row: []Cell, base: usize, v: Var, cell: Cell) bool {
+        const col = out.colOf(v).?;
+        if (col < base) return row[col].eql(cell);
+        row[col] = cell;
+        return true;
+    }
+
+    /// Fill the tuple binding `ts` from `v`; false when a bound
+    /// variable disagrees with its element.
+    fn fillTuple(self: *Exec, out: *const Relation, ts: []const ?Var, v: Value, row: []Cell, base: usize) anyerror!bool {
         const items = (try self.seqElems(v)) orelse return error.QuerySyntax;
         if (items.len < ts.len) return error.QuerySyntax;
-        var k: usize = base;
         for (ts, items[0..ts.len]) |t, x| {
-            if (t == null) continue;
-            row[k] = Cell.fromValue(x);
-            k += 1;
+            const tv = t orelse continue;
+            if (!put(out, row, base, tv, Cell.fromValue(x))) return false;
         }
+        return true;
     }
 
     /// The elements of a vector, list or set value, or null.
@@ -510,16 +518,14 @@ pub const Exec = struct {
                 .tuple => |ts| blk: {
                     var r = try Relation.init(self.arena, try tupleVars(self.arena, ts));
                     const row = try self.arena.alloc(Cell, r.vars.len);
-                    try self.fillTuple(ts, a, row, 0);
-                    try r.append(row);
+                    if (try self.fillTuple(&r, ts, a, row, 0)) try r.append(row);
                     break :blk r;
                 },
                 .relation => |ts| blk: {
                     var r = try Relation.init(self.arena, try tupleVars(self.arena, ts));
                     const row = try self.arena.alloc(Cell, r.vars.len);
                     for ((try self.seqElems(a)) orelse return error.QuerySyntax) |x| {
-                        try self.fillTuple(ts, x, row, 0);
-                        try r.append(row);
+                        if (try self.fillTuple(&r, ts, x, row, 0)) try r.append(row);
                     }
                     break :blk try r.dedup();
                 },

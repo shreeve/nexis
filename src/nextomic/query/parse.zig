@@ -511,11 +511,13 @@ const Parser = struct {
     fn bindTuple(self: *Parser, items: []Value) Error![]?Var {
         if (items.len == 0) return self.fail("empty tuple binding");
         const out = try self.arena.alloc(?Var, items.len);
-        for (items, out) |x, *slot| {
+        for (items, out, 0..) |x, *slot, i| {
             if (self.isSym(x, "_")) {
                 slot.* = null;
             } else if (self.isVarSym(x)) {
-                slot.* = try self.varOf(x.asSymbolId());
+                const v = try self.varOf(x.asSymbolId());
+                for (out[0..i]) |prev| if (prev == v) return self.fail("duplicate variable in tuple binding");
+                slot.* = v;
             } else return self.fail("tuple binding takes variables");
         }
         return out;
@@ -765,6 +767,11 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
     // Unknown section.
     const q7 = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("keys"), b.sym("e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
     try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, q7, &diag));
+
+    // A variable twice in one tuple binding.
+    const q8 = b.vec(&.{ b.kw("find"), b.sym("?x"), b.kw("where"), b.vec(&.{ b.lst(&.{ b.sym("f"), b.int(1) }), b.vec(&.{ b.sym("?x"), b.sym("?x") }) }) });
+    try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, q8, &diag));
+    try testing.expectEqualStrings("duplicate variable in tuple binding", diag.message);
 }
 
 test "rules parse with required groups and arity checks; caches hit by identity and structure" {

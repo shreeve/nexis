@@ -152,6 +152,7 @@ const Fx = struct {
         const self: *Fx = @ptrCast(@alignCast(ctx));
         const name = self.interner().symbolName(sym_id);
         const a = self.arena();
+        if (std.mem.eql(u8, name, "identity")) return args[0];
         if (std.mem.eql(u8, name, "inc")) return value.fromFixnum(args[0].asFixnum() + 1).?;
         if (std.mem.eql(u8, name, "add")) return value.fromFixnum(args[0].asFixnum() + args[1].asFixnum()).?;
         if (std.mem.eql(u8, name, "even?")) return value.fromBool(@mod(args[0].asFixnum(), 2) == 0);
@@ -795,32 +796,38 @@ const Naive = struct {
         return self.arena.dupe(Value, &.{result});
     }
 
+    /// Bind `x` to `c` in `e`: a variable bound already unifies, so
+    /// the environment is kept only when the values agree.
+    fn unify(e: Env, x: Var, c: Cell) bool {
+        if (e[x]) |have| return have.eql(c);
+        e[x] = c;
+        return true;
+    }
+
+    fn unifyTuple(self: *Naive, ts: []const ?Var, v: Value, env: Env) !?Env {
+        const e2 = try self.copy(env);
+        for (ts, (try seq(self.arena, v))[0..ts.len]) |t, item| if (t) |x| {
+            if (!unify(e2, x, Cell.fromValue(item))) return null;
+        };
+        return e2;
+    }
+
     fn bind(self: *Naive, b: ir.Binding, v: Value, env: Env) ![]Env {
         var out: std.ArrayList(Env) = .empty;
         switch (b) {
             .scalar => |x| if (!v.isNil()) {
                 const e2 = try self.copy(env);
-                e2[x] = Cell.fromValue(v);
-                try out.append(self.arena, e2);
+                if (unify(e2, x, Cell.fromValue(v))) try out.append(self.arena, e2);
             },
             .collection => |x| for (try seq(self.arena, v)) |item| {
                 const e2 = try self.copy(env);
-                e2[x] = Cell.fromValue(item);
-                try out.append(self.arena, e2);
+                if (unify(e2, x, Cell.fromValue(item))) try out.append(self.arena, e2);
             },
             .tuple => |ts| if (!v.isNil()) {
-                const e2 = try self.copy(env);
-                for (ts, (try seq(self.arena, v))[0..ts.len]) |t, item| if (t) |x| {
-                    e2[x] = Cell.fromValue(item);
-                };
-                try out.append(self.arena, e2);
+                if (try self.unifyTuple(ts, v, env)) |e2| try out.append(self.arena, e2);
             },
             .relation => |ts| for (try seq(self.arena, v)) |row| {
-                const e2 = try self.copy(env);
-                for (ts, (try seq(self.arena, row))[0..ts.len]) |t, item| if (t) |x| {
-                    e2[x] = Cell.fromValue(item);
-                };
-                try out.append(self.arena, e2);
+                if (try self.unifyTuple(ts, row, env)) |e2| try out.append(self.arena, e2);
             },
         }
         return out.toOwnedSlice(self.arena);
@@ -983,6 +990,18 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     try checkCount(fx, dbv, "[:find ?t :where [?e :person/name \"Ann\"] [?e :person/age ?a] [(tuple ?a \"x\") ?t]]", none, 1);
     try checkCount(fx, dbv, "[:find ?a ?b :where [(ground [10 20]) ?t] [(untuple ?t) [?a ?b]]]", none, 1);
     try checkCount(fx, dbv, "[:find ?n ?a2 :where [?e :person/name ?n] [?e :person/age ?a] [(add ?a ?a) ?a2] [(> ?a2 60)]]", none, 3);
+    // An output variable bound before the step unifies: the clause
+    // keeps the rows whose result equals the bound value, including
+    // when the planner runs a cheaper pattern before the function.
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(identity ?e) ?e]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(str ?n \"!\") ?n]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/age ?a] [(inc ?a) ?a] [?e :person/name ?n]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?a :where [?e :person/age ?a] [(identity ?e) ?e2] [?e2 :person/email \"ann@x\"]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(pair ?a ?n) [?a ?x]]]", none, 6);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(pair ?n ?a) [?a ?x]]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(range 31) [?a ...]]]", none, 3);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(halves ?a) [[_ ?a]]]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(halves ?a) [[?a ?h]]]]", none, 6);
 
     // Aggregates and :with.
     try checkCount(fx, dbv, "[:find (count ?e) :where [?e :person/name _]]", none, 1);
@@ -1220,6 +1239,9 @@ test "results materialise as set, scalar, collection, tuple; caches; explain" {
     try testing.expect(std.mem.indexOf(u8, text, "scan [?e! :person/name ?n _ _] eavt est=1") != null);
     try testing.expect(std.mem.indexOf(u8, text, "not-join [?e]") != null);
     try testing.expect(std.mem.indexOf(u8, text, "or-join [?e] branches=1") != null);
+    out.clearRetainingCapacity();
+    try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?a :where [?e :person/age ?a] [(identity ?e) ?e2] [?e2 :person/email \"ann@x\"]]"), dbv, none, &diag, opts, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "3. bind (identity ?e) -> ?e2!") != null);
 }
 
 test "transitive closure over a 5k-edge chain" {
