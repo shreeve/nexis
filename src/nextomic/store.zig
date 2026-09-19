@@ -151,6 +151,10 @@ pub const boot = struct {
     /// The idents through `unique_value`: the bootstrap without
     /// `:db/fulltext`.
     pub const idents_without_fulltext = idents[0 .. idents.len - 1];
+    /// The idents that are entities without a value type: the
+    /// `:db.type/*`, `:db.cardinality/*` and `:db.unique/*`
+    /// enumerations, each bootstrapped by its `:db/ident` datom alone.
+    pub const enum_idents = idents[type_long - 1 .. unique_value];
 
     pub const Attr = struct {
         id: u32,
@@ -172,6 +176,16 @@ pub const boot = struct {
     };
     /// The ident and attribute datoms of `:db/fulltext`.
     pub const fulltext_attr: Attr = attrs[attrs.len - 1];
+    /// The attributes through `:db/txInstant`: the bootstrap without
+    /// `:db/fulltext`.
+    pub const attrs_without_fulltext = attrs[0 .. attrs.len - 1];
+
+    comptime {
+        // `idents[i]` carries id `i + 1`, so the enumerations slice by id.
+        for (idents, 1..) |id, i| std.debug.assert(id.id == i);
+        std.debug.assert(fulltext_attr.id == fulltext);
+        std.debug.assert(enum_idents[0].id == type_long and enum_idents[enum_idents.len - 1].id == unique_value);
+    }
 
     /// Value type named by a `:db.type/*` ident, or null.
     pub fn valueTypeOf(type_ident: u32) ?key.ValueType {
@@ -745,13 +759,13 @@ pub const Store = struct {
         try self.sysPut(txn, "uuid", &self.uuid);
 
         const idents = if (with_fulltext) &boot.idents else boot.idents_without_fulltext;
-        const attrs = if (with_fulltext) &boot.attrs else boot.attrs[0 .. boot.attrs.len - 1];
+        const attrs = if (with_fulltext) &boot.attrs else boot.attrs_without_fulltext;
         for (idents) |id| try self.putIdent(txn, id.name, id.id);
 
         var datoms: std.ArrayList(Datom) = .empty;
         const now = nowMillis();
         for (attrs) |a| try appendAttrDatoms(arena, &datoms, a, boot.t);
-        for (idents[boot.attrs.len - 1 .. idents.len - @intFromBool(with_fulltext)]) |id| {
+        for (boot.enum_idents) |id| {
             try datoms.append(arena, .{ .e = id.id, .a = boot.ident, .v = .{ .keyword = id.id }, .t = boot.t, .added = true });
         }
         try datoms.append(arena, .{ .e = key.txEntity(boot.t), .a = boot.tx_instant, .v = .{ .instant = now }, .t = boot.t, .added = true });
