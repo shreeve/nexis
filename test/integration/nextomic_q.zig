@@ -1003,6 +1003,16 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(halves ?a) [[_ ?a]]]]", none, 0);
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(halves ?a) [[?a ?h]]]]", none, 6);
 
+    // A query is not capped in its number of variables.
+    {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(testing.allocator);
+        try src.appendSlice(testing.allocator, "[:find ?v99 :where [?e :person/age ?v0]");
+        for (1..100) |i| try src.print(testing.allocator, " [(inc ?v{d}) ?v{d}]", .{ i - 1, i });
+        try src.append(testing.allocator, ']');
+        try checkCount(fx, dbv, src.items, none, 5);
+    }
+
     // Aggregates and :with.
     try checkCount(fx, dbv, "[:find (count ?e) :where [?e :person/name _]]", none, 1);
     try checkCount(fx, dbv, "[:find (count ?a) :where [_ :person/age ?a]]", none, 1);

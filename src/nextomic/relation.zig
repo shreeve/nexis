@@ -256,6 +256,14 @@ pub const Relation = struct {
         self.rows += 1;
     }
 
+    /// Append row `row` of `src`, whose columns are this relation's
+    /// columns in the same order.
+    pub fn copyRow(self: *Relation, src: *const Relation, row: usize) !void {
+        std.debug.assert(src.cols.len == self.cols.len);
+        for (self.cols, 0..) |*c, i| try c.append(self.arena, src.cell(row, i));
+        self.rows += 1;
+    }
+
     /// Column indexes in `src` of this relation's variables.
     pub fn mapFrom(self: *const Relation, src: *const Relation) ![]usize {
         const map = try self.arena.alloc(usize, self.vars.len);
@@ -317,8 +325,7 @@ pub const Relation = struct {
         var seen: RowSet = .{ .rel = &out };
         var i: usize = 0;
         while (i < self.rows) : (i += 1) {
-            const map = identityMap(self.cols.len);
-            try out.appendFrom(self, i, map[0..self.cols.len]);
+            try out.copyRow(self, i);
             if (!try seen.insert(self.arena, out.rows - 1)) try out.dropLast();
         }
         return out;
@@ -377,10 +384,9 @@ pub const Relation = struct {
 
         const keyed = try self.project(on, false);
         var out = try init(self.arena, self.vars);
-        const map = identityMap(self.cols.len);
         i = 0;
         while (i < self.rows) : (i += 1) {
-            if (!index.contains(&keyed, i, keyed.rowHash(i))) try out.appendFrom(self, i, map[0..self.cols.len]);
+            if (!index.contains(&keyed, i, keyed.rowHash(i))) try out.copyRow(self, i);
         }
         return out;
     }
@@ -395,10 +401,9 @@ pub const Relation = struct {
 
         const keyed = try self.project(on, false);
         var out = try init(self.arena, self.vars);
-        const map = identityMap(self.cols.len);
         i = 0;
         while (i < self.rows) : (i += 1) {
-            if (index.contains(&keyed, i, keyed.rowHash(i))) try out.appendFrom(self, i, map[0..self.cols.len]);
+            if (index.contains(&keyed, i, keyed.rowHash(i))) try out.copyRow(self, i);
         }
         return out;
     }
@@ -444,14 +449,13 @@ pub const Relation = struct {
         const self_key = try self.project(on, false);
         const extra_map = try self.arena.alloc(usize, extra.len);
         for (extra, extra_map) |v, *m| m.* = other.colOf(v).?;
-        const self_map = identityMap(self.cols.len);
 
         i = 0;
         while (i < self.rows) : (i += 1) {
             const bucket = index.get(self_key.rowHash(i)) orelse continue;
             for (bucket.items) |j| {
                 if (!self_key.rowsEql(i, &other_key, j)) continue;
-                for (out.cols[0..self.cols.len], self_map[0..self.cols.len]) |*c, sc| try c.append(self.arena, self.cell(i, sc));
+                for (out.cols[0..self.cols.len], 0..) |*c, sc| try c.append(self.arena, self.cell(i, sc));
                 for (out.cols[self.cols.len..], extra_map) |*c, oc| try c.append(self.arena, other.cell(j, oc));
                 out.rows += 1;
             }
@@ -533,22 +537,6 @@ pub const Accumulator = struct {
         return self.set.contains(other, row, other.rowHash(row));
     }
 };
-
-const max_identity = 64;
-const identity_table = blk: {
-    var t: [max_identity]usize = undefined;
-    for (&t, 0..) |*x, i| x.* = i;
-    break :blk t;
-};
-
-/// `0..n` as a slice; relations have at most `max_identity` columns.
-fn identityMap(n: usize) []const usize {
-    std.debug.assert(n <= max_identity);
-    return identity_table[0..n];
-}
-
-/// The largest number of variables one relation can carry.
-pub const max_vars = max_identity;
 
 // =============================================================================
 // Tests
@@ -639,6 +627,30 @@ test "dedup, project, union, difference, sort" {
     var again = try r.dedup();
     try again.sort();
     try testing.expect(sorted.eqlRows(&again));
+}
+
+test "a relation has no column cap" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const n = 100;
+    var vars: [n]Var = undefined;
+    for (&vars, 0..) |*v, i| v.* = @intCast(i);
+    var row: [n]Cell = undefined;
+    for (&row, 0..) |*c, i| c.* = .{ .int = @intCast(i) };
+    var r = try Relation.init(arena, &vars);
+    try r.append(&row);
+    try r.append(&row);
+    const d = try r.dedup();
+    try testing.expectEqual(@as(usize, 1), d.rows);
+    const none = try rel(arena, vars[0..1], &.{});
+    const diff = try d.difference(&none, vars[0..1]);
+    try testing.expectEqual(@as(usize, 1), diff.rows);
+    const semi = try d.semiJoin(&d, vars[0..1]);
+    try testing.expectEqual(@as(usize, 1), semi.rows);
+    const j = try d.hashJoin(&d);
+    try testing.expectEqual(@as(usize, 1), j.rows);
+    try testing.expectEqual(@as(usize, n), j.cols.len);
 }
 
 test "hash join on shared vars and cross product" {
