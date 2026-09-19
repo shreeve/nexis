@@ -3532,6 +3532,8 @@ test "core: predicates, names and conversions" {
         .{ .src = "((juxt :a :b) {:a 1 :b 2})", .expected = "[1 2]" },
         .{ .src = "((fnil inc 10) nil)", .expected = "11" },
         .{ .src = "((fnil + 10) 1 2)", .expected = "3" },
+        .{ .src = "((fnil + 10 20) nil nil 1)", .expected = "31" },
+        .{ .src = "((fnil vector 1 2 3) nil 0 nil)", .expected = "[1 0 3]" },
         .{ .src = "((complement odd?) 2)", .expected = "true" },
         .{ .src = "(apply + 1 2 [3 4])", .expected = "10" },
         .{ .src = "(apply max [1 5 2])", .expected = "5" },

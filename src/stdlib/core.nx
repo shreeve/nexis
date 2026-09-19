@@ -295,11 +295,18 @@
 (defn vary-meta [obj f & args]
   (with-meta obj (apply f (meta obj) args)))
 
-; (fnil f default) → f, with a nil first argument replaced by
-; default.
-(defn fnil [f default]
-  (fn* [x & more]
-    (apply f (if (nil? x) default x) more)))
+; (fnil f d1 d2? d3?) → f, with nil leading arguments replaced
+; by the defaults, one per position.
+(defn fnil
+  ([f d1]
+   (fn* [x & more]
+     (apply f (if (nil? x) d1 x) more)))
+  ([f d1 d2]
+   (fn* [x y & more]
+     (apply f (if (nil? x) d1 x) (if (nil? y) d2 y) more)))
+  ([f d1 d2 d3]
+   (fn* [x y z & more]
+     (apply f (if (nil? x) d1 x) (if (nil? y) d2 y) (if (nil? z) d3 z) more))))
 
 ; (merge-with f & maps) → merge where a key present on both
 ; sides keeps (f left right).
