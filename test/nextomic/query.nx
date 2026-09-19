@@ -2,7 +2,7 @@
 ; form, constants and lookup refs, predicates and functions (built-in,
 ; defn'd, core, qualified, a variable in function position),
 ; aggregates, every find spec, pull expressions and :keys, not/or and
-; their -join forms, rules, time views, errors. Runs from a scratch
+; their -join forms, several data sources, rules, time views, errors. Runs from a scratch
 ; directory; the store is fresh.
 
 (require '[nextomic :as d])
@@ -165,6 +165,32 @@
                      (or-join [?e] [?e :person/role :role/admin]
                                    (and [?e :person/boss ?b] [?b :person/role :role/admin]))] db)))
 
+; --- several data sources: $2 is a time view, or another store --------------
+
+(def before (d/as-of db (:tx people)))
+(println (rows (d/q '[:find ?n ?then ?now :in $ $2 :where [?e :person/name ?n] [?e :person/age ?now]
+                     [$2 ?e :person/age ?then] [(not= ?then ?now)]] db before)))
+(println (rows (d/q '[:find ?n :in $ $2 :where [?e :person/name ?n] (not [$2 ?e :person/name ?n])] db before)))
+(println (rows (d/q '[:find ?n :in $ $2 :where [?e :person/name ?n] [(missing? $2 ?e :person/name)]] db before)))
+(println (rows (d/q '[:find ?n :in $ $hist :where [?e :person/name ?n] [$hist ?e :person/tags :red _ false]] db (d/history db))))
+(def c2 (d/connect "query2.edb"))
+(d/transact! c2 [{:db/ident :city/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+                  :db/unique :db.unique/identity}
+                 {:db/ident :city/mayor :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+                 {:db/ident :city/size :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}])
+(d/transact! c2 [{:city/name "Ann Arbor" :city/mayor "Ann" :city/size :size/small}
+                 {:city/name "Cyprus" :city/mayor "Cy" :city/size :size/large}
+                 {:city/name "Nowhere" :city/mayor "Zed" :city/size :size/small}])
+(println (rows (d/q '[:find ?n ?city ?size :in $ $2 :where [?e :person/name ?n] [$2 ?c :city/mayor ?n]
+                     [$2 ?c :city/name ?city] [$2 ?c :city/size ?size]] db (d/db c2))))
+(println (rows (d/q '[:find ?size (count ?e) :in $ $2 :where [$2 ?c :city/mayor ?n] [$2 ?c :city/size ?size]
+                     [?e :person/name ?n]] db (d/db c2))))
+(println (t/caught (d/q '[:find ?n :in $ $2 :where [$3 ?e :person/name ?n]] db before)))
+(println (t/caught (d/q '[:find ?n :in $ $2 :where [$2 ?e :person/name ?n]] db 7)))
+(t/check "explain names a scan's source"
+       (string? (d/explain '[:find ?n :in $ $2 :where [?e :person/name ?n] [$2 ?e :person/age 25]] db before)))
+(d/release c2)
+
 ; --- rules: responsible over the supervision chain ------------------------
 
 (def rules '[[(responsible ?boss ?e) [?e :person/boss ?boss]]
@@ -172,6 +198,7 @@
 (println (sort (d/q '[:find [?n ...] :in $ % :where [?b :person/email "ann@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)))
 (println (sort (d/q '[:find [?n ...] :in $ % :where [?b :person/email "cy@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)))
 (println (rows (d/q '[:find ?b ?n :in $ % :where (responsible ?x ?e) [?x :person/name ?b] [?e :person/name ?n]] db rules)))
+(println (sort (d/q '[:find [?n ...] :in $ $2 % :where [?b :person/email "ann@x"] ($2 responsible ?b ?e) [?e :person/name ?n]] db before rules)))
 (t/check "a repeated query and rule set are served from the caches"
        (= (d/q '[:find [?n ...] :in $ % :where [?b :person/email "ann@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)
           (d/q '[:find [?n ...] :in $ % :where [?b :person/email "ann@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)))

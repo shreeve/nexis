@@ -63,9 +63,19 @@ nil
 ([Ann] [Cy] [Di] [Edward])
 ([Bob] [Di] [Edward] [Flo])
 ([Ann] [Bob] [Cy] [Edward])
+([Bob 25 26])
+([Edward] [Flo])
+([Flo])
+([Ann])
+([Ann Ann Arbor :size/small] [Cy Cyprus :size/large])
+([:size/large 1] [:size/small 1])
+{:error :nextomic/query-syntax, :message unknown data source; declare it in :in, :clause 0}
+:kind-mismatch
+ok explain names a scan's source
 (Bob Cy Di)
 (Di)
 ([Ann Bob] [Ann Cy] [Ann Di] [Cy Di])
+(Bob Cy Di)
 ok a repeated query and rule set are served from the caches
 ([Ann 30] [Bob 25] [Cy 41] [Di 30] [Ed 55])
 ([Flo 33])

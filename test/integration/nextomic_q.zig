@@ -124,14 +124,39 @@ fn runEngineDiag(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args:
             rules = owned_rules.?;
         }
     }
-    var read = try dbv.beginRead();
-    defer read.close();
-    var ctx = try query.plan.Ctx.init(arena, &read, fx.interner(), parsed, rules, diag);
+    const reads = try openReads(arena, dbv, parsed, args);
+    defer for (reads) |r| r.close();
+    var ctx = try query.plan.Ctx.init(arena, reads, fx.interner(), parsed, rules, diag);
     const p = try query.plan.plan(&ctx, parsed);
-    var ex = query.Exec{ .arena = arena, .read = &read, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook(), .diag = diag };
+    var ex = query.Exec{ .arena = arena, .reads = reads, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook(), .diag = diag };
     const input = try ex.inputRelation(parsed, args);
     const rel = try ex.runPlan(p, input);
     return ex.findRows(parsed, rel);
+}
+
+/// The db-values of a query's sources: `dbv` for `$`, the boxed
+/// db-value at each later source's `:in` position.
+fn sourceDbs(arena: Allocator, dbv: DbValue, parsed: *const ir.Ir, args: []const Value) ![]DbValue {
+    const out = try arena.alloc(DbValue, parsed.sources.len);
+    for (parsed.in, args) |b, a| {
+        if (b != .src) continue;
+        out[b.src] = if (b.src == 0) dbv else try nextomic.natives.dbOf(a);
+    }
+    return out;
+}
+
+/// One open `Read` per source.
+fn openReads(arena: Allocator, dbv: DbValue, parsed: *const ir.Ir, args: []const Value) ![]*nextomic.db.Read {
+    const dbs = try sourceDbs(arena, dbv, parsed, args);
+    const out = try arena.alloc(*nextomic.db.Read, dbs.len);
+    var opened: usize = 0;
+    errdefer for (out[0..opened]) |r| r.close();
+    for (dbs, out) |d, *r| {
+        r.* = try arena.create(nextomic.db.Read);
+        r.*.* = try d.beginRead();
+        opened += 1;
+    }
+    return out;
 }
 
 fn sortedRelation(arena: Allocator, rows: []const Row, width: usize) !Relation {
@@ -199,12 +224,25 @@ const Env = []?Cell;
 const Naive = struct {
     fx: *Fx,
     arena: Allocator,
-    dbv: DbValue,
-    datoms: []const [5]Cell,
+    /// Per source: the db-value, its open read, every datom of the
+    /// view as cells.
+    dbvs: []const DbValue,
+    reads: []const *nextomic.db.Read,
+    datoms: []const []const [5]Cell,
     rules: *const ir.RuleSet,
-    read: *nextomic.db.Read,
-    facts: std.AutoHashMapUnmanaged(u32, std.ArrayList(Row)) = .empty,
-    attr_types: std.AutoHashMapUnmanaged(u32, key.ValueType) = .empty,
+    /// Rule facts per (rule name, source): a rule body reads the
+    /// source it is called under.
+    facts: std.AutoHashMapUnmanaged(u64, std.ArrayList(Row)) = .empty,
+    /// Attribute types per source, by attribute id.
+    attr_types: []std.AutoHashMapUnmanaged(u32, key.ValueType),
+
+    fn factKey(name: u32, src: ir.Src) u64 {
+        return (@as(u64, name) << 32) | src;
+    }
+
+    fn connOf(self: *Naive, src: ir.Src) *nextomic.Conn {
+        return self.dbvs[src].conn;
+    }
 
     fn run(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args: []const Value) anyerror![]const Row {
         const qv = try fx.read(src);
@@ -222,9 +260,12 @@ const Naive = struct {
             }
         }
 
-        var read = try dbv.beginRead();
-        defer read.close();
-        var self = Naive{ .fx = fx, .arena = arena, .dbv = dbv, .datoms = &.{}, .rules = rules, .read = &read };
+        const dbvs = try sourceDbs(arena, dbv, parsed, args);
+        const reads = try openReads(arena, dbv, parsed, args);
+        defer for (reads) |r| r.close();
+        const attr_types = try arena.alloc(std.AutoHashMapUnmanaged(u32, key.ValueType), dbvs.len);
+        @memset(attr_types, .empty);
+        var self = Naive{ .fx = fx, .arena = arena, .dbvs = dbvs, .reads = reads, .datoms = &.{}, .rules = rules, .attr_types = attr_types };
         try self.loadDatoms();
         try self.computeFacts();
 
@@ -273,14 +314,14 @@ const Naive = struct {
                 if (!r.entity or r.keyword) continue;
                 const c = e[v] orelse continue;
                 if (c != .keyword and c != .vm) continue;
-                e[v] = .{ .int = @intCast((try self.inputEntity(c)) orelse continue :envs) };
+                e[v] = .{ .int = @intCast((try self.inputEntity(c, r.src)) orelse continue :envs) };
             }
             try resolved.append(arena, e);
         }
         envs = resolved;
 
         var solved: std.ArrayList(Env) = .empty;
-        for (envs.items) |e| try self.solve(parsed.where, e, &solved);
+        for (envs.items) |e| try self.solve(parsed.where, e, &solved, 0);
 
         // Basis: distinct tuples over find ∪ with variables.
         var basis_vars: std.ArrayList(Var) = .empty;
@@ -403,45 +444,50 @@ const Naive = struct {
         return self.arena.dupe(?Cell, e);
     }
 
-    /// Every datom of the view as cells, plus attribute types.
+    /// Every datom of every source's view as cells, plus attribute types.
     fn loadDatoms(self: *Naive) !void {
-        const read = self.read;
-        const ds = try self.dbv.datoms(self.arena, .eavt, .{});
-        const out = try self.arena.alloc([5]Cell, ds.len);
-        for (ds, out) |d, *o| {
-            const v: Cell = switch (d.v) {
-                .boolean => |b| .{ .boolean = b },
-                .long, .instant => |n| .{ .int = n },
-                .double => |x| .{ .double = x },
-                .keyword => |id| .{ .keyword = (try self.fx.conn().idents.internOf(read.txn, id)).? },
-                .ref => |r| .{ .int = @intCast(r) },
-                .string, .bytes => |s| .{ .str = s },
-                .uuid => |u| blk: {
-                    const text = try self.arena.alloc(u8, 36);
-                    nextomic.datom.uuidToText(text[0..36], u);
-                    break :blk .{ .str = text };
-                },
-            };
-            o.* = .{ .{ .int = @intCast(d.e) }, .{ .int = d.a }, v, .{ .int = @intCast(key.txEntity(d.t)) }, .{ .boolean = d.added } };
-            if (!self.attr_types.contains(d.a)) {
-                if (try read.attr(d.a)) |at| try self.attr_types.put(self.arena, d.a, at.value_type);
+        const all = try self.arena.alloc([]const [5]Cell, self.dbvs.len);
+        for (self.dbvs, self.reads, all, 0..) |dbv, read, *slot, src| {
+            const ds = try dbv.datoms(self.arena, .eavt, .{});
+            const out = try self.arena.alloc([5]Cell, ds.len);
+            for (ds, out) |d, *o| {
+                const v: Cell = switch (d.v) {
+                    .boolean => |b| .{ .boolean = b },
+                    .long, .instant => |n| .{ .int = n },
+                    .double => |x| .{ .double = x },
+                    .keyword => |id| .{ .keyword = (try dbv.conn.idents.internOf(read.txn, id)).? },
+                    .ref => |r| .{ .int = @intCast(r) },
+                    .string, .bytes => |s| .{ .str = s },
+                    .uuid => |u| blk: {
+                        const text = try self.arena.alloc(u8, 36);
+                        nextomic.datom.uuidToText(text[0..36], u);
+                        break :blk .{ .str = text };
+                    },
+                };
+                o.* = .{ .{ .int = @intCast(d.e) }, .{ .int = d.a }, v, .{ .int = @intCast(key.txEntity(d.t)) }, .{ .boolean = d.added } };
+                if (!self.attr_types[src].contains(d.a)) {
+                    if (try read.attr(d.a)) |at| try self.attr_types[src].put(self.arena, d.a, at.value_type);
+                }
             }
+            slot.* = out;
         }
-        self.datoms = out;
+        self.datoms = all;
     }
 
-    /// Bottom-up naive fixpoint of every rule over the whole view.
+    /// Bottom-up naive fixpoint of every rule over the whole view of
+    /// every source.
     fn computeFacts(self: *Naive) !void {
-        for (self.rules.rules) |r| {
-            if (!self.facts.contains(r.name)) try self.facts.put(self.arena, r.name, .empty);
-        }
+        for (self.rules.rules) |r| for (0..self.dbvs.len) |src| {
+            const k = factKey(r.name, @intCast(src));
+            if (!self.facts.contains(k)) try self.facts.put(self.arena, k, .empty);
+        };
         var changed = true;
         while (changed) {
             changed = false;
-            for (self.rules.rules) |r| {
+            for (self.rules.rules) |r| for (0..self.dbvs.len) |src| {
                 var solved: std.ArrayList(Env) = .empty;
-                try self.solve(r.body, try self.emptyEnv(self.rules.vars.len), &solved);
-                const list = self.facts.getPtr(r.name).?;
+                try self.solve(r.body, try self.emptyEnv(self.rules.vars.len), &solved, @intCast(src));
+                const list = self.facts.getPtr(factKey(r.name, @intCast(src))).?;
                 for (solved.items) |e| {
                     const tuple = try self.arena.alloc(Cell, r.head.len);
                     var complete = true;
@@ -455,30 +501,31 @@ const Naive = struct {
                         changed = true;
                     }
                 }
-            }
+            };
         }
     }
 
-    fn solve(self: *Naive, clauses: []const ir.Clause, env: Env, out: *std.ArrayList(Env)) anyerror!void {
+    /// `src` is the source an unprefixed clause reads.
+    fn solve(self: *Naive, clauses: []const ir.Clause, env: Env, out: *std.ArrayList(Env), src: ir.Src) anyerror!void {
         if (clauses.len == 0) return out.append(self.arena, env);
         const rest = clauses[1..];
         switch (clauses[0]) {
-            .pattern => |p| for (self.datoms) |d| {
-                const e2 = (try self.matchPattern(p, d, env)) orelse continue;
-                try self.solve(rest, e2, out);
+            .pattern => |p| for (self.datoms[p.src orelse src]) |d| {
+                const e2 = (try self.matchPattern(p, d, env, p.src orelse src)) orelse continue;
+                try self.solve(rest, e2, out, src);
             },
-            .pred => |call| if (try self.evalPred(call, env)) try self.solve(rest, env, out),
+            .pred => |call| if (try self.evalPred(call, env, src)) try self.solve(rest, env, out, src),
             .bind => |b| {
-                const results = try self.evalFn(b.call, env);
+                const results = try self.evalFn(b.call, env, src);
                 for (results) |r| {
                     const bound = try self.bind(b.out, r, env);
-                    for (bound) |e2| try self.solve(rest, e2, out);
+                    for (bound) |e2| try self.solve(rest, e2, out, src);
                 }
             },
             .not => |n| {
                 var sub: std.ArrayList(Env) = .empty;
-                try self.solve(n.body, env, &sub);
-                if (sub.items.len == 0) try self.solve(rest, env, out);
+                try self.solve(n.body, env, &sub, src);
+                if (sub.items.len == 0) try self.solve(rest, env, out, src);
             },
             .@"or" => |o| {
                 var join: std.ArrayList(Var) = .empty;
@@ -488,7 +535,7 @@ const Naive = struct {
                 var seen: std.ArrayList(Env) = .empty;
                 for (o.branches) |br| {
                     var sub: std.ArrayList(Env) = .empty;
-                    try self.solve(br, env, &sub);
+                    try self.solve(br, env, &sub, src);
                     for (sub.items) |s| {
                         const e2 = try self.copy(env);
                         for (join.items) |v| e2[v] = s[v];
@@ -498,15 +545,15 @@ const Naive = struct {
                         };
                         if (dup) continue;
                         try seen.append(self.arena, e2);
-                        try self.solve(rest, e2, out);
+                        try self.solve(rest, e2, out, src);
                     }
                 }
             },
             .rule => |r| {
-                const list = self.facts.get(r.name) orelse return error.UnknownRule;
+                const list = self.facts.get(factKey(r.name, r.src orelse src)) orelse return error.UnknownRule;
                 for (list.items) |tuple| {
                     const e2 = (try self.unifyArgs(r.args, tuple, env)) orelse continue;
-                    try self.solve(rest, e2, out);
+                    try self.solve(rest, e2, out, src);
                 }
             },
             .source => unreachable,
@@ -527,25 +574,31 @@ const Naive = struct {
         return e2;
     }
 
-    /// The attribute id cell of the attribute with ident `kw`, or null.
-    fn attrCell(self: *Naive, kw: u32) !?Cell {
-        const id = (try self.fx.conn().idents.idOf(self.read.txn, kw)) orelse return null;
+    /// The attribute id cell of the attribute with ident `kw` in `src`, or null.
+    fn attrCell(self: *Naive, kw: u32, src: ir.Src) !?Cell {
+        const id = (try self.connOf(src).idents.idOf(self.reads[src].txn, kw)) orelse return null;
         return .{ .int = id };
     }
 
-    const InputRole = struct { entity: bool = false, keyword: bool = false };
+    const InputRole = struct { entity: bool = false, keyword: bool = false, src: ir.Src = 0 };
+
+    fn markEntity(role: *InputRole, src: ir.Src) void {
+        if (!role.entity) role.src = src;
+        role.entity = true;
+    }
 
     /// Mark the variables in an entity position or a ref attribute's
     /// value position, and those in a keyword attribute's value position.
     fn inputRoles(self: *Naive, clauses: []const ir.Clause, roles: []InputRole) !void {
         for (clauses) |c| switch (c) {
             .pattern => |p| {
-                if (p.e.asVar()) |v| roles[v].entity = true;
+                const src = p.src orelse 0;
+                if (p.e.asVar()) |v| markEntity(&roles[v], src);
                 const v = p.v.asVar() orelse continue;
                 if (p.a != .constant or p.a.constant != .cell or p.a.constant.cell != .keyword) continue;
-                const id = (try self.fx.conn().idents.idOf(self.read.txn, p.a.constant.cell.keyword)) orelse continue;
-                const at = (try self.read.attr(id)) orelse continue;
-                if (at.value_type == .ref) roles[v].entity = true;
+                const id = (try self.connOf(src).idents.idOf(self.reads[src].txn, p.a.constant.cell.keyword)) orelse continue;
+                const at = (try self.reads[src].attr(id)) orelse continue;
+                if (at.value_type == .ref) markEntity(&roles[v], src);
                 if (at.value_type == .keyword) roles[v].keyword = true;
             },
             .not => |n| try self.inputRoles(n.body, roles),
@@ -554,29 +607,31 @@ const Naive = struct {
         };
     }
 
-    fn inputEntity(self: *Naive, c: Cell) !?u64 {
+    fn inputEntity(self: *Naive, c: Cell, src: ir.Src) !?u64 {
+        const read = self.reads[src];
         switch (c) {
-            .keyword => |kw| return self.read.entid(self.arena, .{ .ident = kw }),
+            .keyword => |kw| return read.entid(self.arena, .{ .ident = kw }),
             .vm => |v| {
                 if (v.kind() != .persistent_vector or vector_mod.count(v) != 2 or vector_mod.nth(v, 0).kind() != .keyword) return null;
-                const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, vector_mod.nth(v, 0).asKeywordId())) orelse return error.UnknownAttribute;
-                const vt = self.attr_types.get(attr_id) orelse return error.UnknownAttribute;
+                const attr_id = (try self.connOf(src).idents.idOf(read.txn, vector_mod.nth(v, 0).asKeywordId())) orelse return error.UnknownAttribute;
+                const vt = self.attr_types[src].get(attr_id) orelse return error.UnknownAttribute;
                 const val = (try cellToVal(Cell.fromValue(vector_mod.nth(v, 1)), vt)) orelse return error.ValueType;
-                return self.read.entid(self.arena, .{ .lookup = .{ .a = attr_id, .v = val } });
+                return read.entid(self.arena, .{ .lookup = .{ .a = attr_id, .v = val } });
             },
             else => return null,
         }
     }
 
-    /// The cell a pattern constant compares as at position `pos`.
-    fn constCell(self: *Naive, c: ir.Constant, pos: usize, d: [5]Cell) !?Cell {
+    /// The cell a pattern constant compares as at position `pos` in `src`.
+    fn constCell(self: *Naive, c: ir.Constant, pos: usize, d: [5]Cell, src: ir.Src) !?Cell {
         const a = self.arena;
+        const read = self.reads[src];
         switch (c) {
             .lookup => |l| {
-                const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, l.attr)) orelse return null;
-                const vt = self.attr_types.get(attr_id) orelse return null;
+                const attr_id = (try self.connOf(src).idents.idOf(read.txn, l.attr)) orelse return null;
+                const vt = self.attr_types[src].get(attr_id) orelse return null;
                 const val = (try cellToVal(l.v, vt)) orelse return null;
-                const eid = (try self.dbv.entid(a, .{ .lookup = .{ .a = attr_id, .v = val } })) orelse return null;
+                const eid = (try self.dbvs[src].entid(a, .{ .lookup = .{ .a = attr_id, .v = val } })) orelse return null;
                 return .{ .int = @intCast(eid) };
             },
             .cell => |cell| {
@@ -584,13 +639,13 @@ const Naive = struct {
                     const is_ref = switch (pos) {
                         0, 1 => true,
                         2 => blk: {
-                            const vt = self.attr_types.get(@intCast(d[1].int)) orelse break :blk false;
+                            const vt = self.attr_types[src].get(@intCast(d[1].int)) orelse break :blk false;
                             break :blk vt == .ref;
                         },
                         else => false,
                     };
                     if (is_ref) {
-                        const eid = (try self.fx.conn().idents.idOf(self.read.txn, cell.keyword)) orelse return null;
+                        const eid = (try self.connOf(src).idents.idOf(read.txn, cell.keyword)) orelse return null;
                         return .{ .int = @intCast(eid) };
                     }
                 }
@@ -605,7 +660,7 @@ const Naive = struct {
         }
     }
 
-    fn matchPattern(self: *Naive, p: ir.Pattern, d: [5]Cell, env: Env) !?Env {
+    fn matchPattern(self: *Naive, p: ir.Pattern, d: [5]Cell, env: Env, src: ir.Src) !?Env {
         var e2: ?Env = null;
         for (p.terms(), 0..) |t, pos| {
             switch (t) {
@@ -614,7 +669,7 @@ const Naive = struct {
                     const cur = if (e2) |e| e[v] else env[v];
                     if (cur) |have| {
                         // A keyword in the attribute position names the attribute.
-                        const want = if (pos == 1 and have == .keyword) (try self.attrCell(have.keyword)) orelse return null else have;
+                        const want = if (pos == 1 and have == .keyword) (try self.attrCell(have.keyword, src)) orelse return null else have;
                         if (!want.eql(d[pos])) return null;
                     } else {
                         if (e2 == null) e2 = try self.copy(env);
@@ -622,7 +677,7 @@ const Naive = struct {
                     }
                 },
                 .constant => |c| {
-                    const want = (try self.constCell(c, pos, d)) orelse return null;
+                    const want = (try self.constCell(c, pos, d, src)) orelse return null;
                     if (!want.eql(d[pos])) return null;
                 },
             }
@@ -638,7 +693,7 @@ const Naive = struct {
         };
     }
 
-    fn evalPred(self: *Naive, call: ir.Call, env: Env) !bool {
+    fn evalPred(self: *Naive, call: ir.Call, env: Env, src: ir.Src) !bool {
         const cells = try self.arena.alloc(Cell, call.args.len);
         for (call.args, cells) |a, *c| c.* = try argCell(a, env);
         switch (call.f) {
@@ -666,7 +721,7 @@ const Naive = struct {
                     for (cells[1..]) |c| if (!cells[0].eql(c)) return true;
                     return false;
                 },
-                .missing => return (try self.lookup(cells[1], cells[2])) == null,
+                .missing => return (try self.lookup(cells[1], cells[2], call.args[0].src orelse src)) == null,
                 else => return error.Unsupported,
             },
             .user => |sym| {
@@ -682,16 +737,16 @@ const Naive = struct {
         }
     }
 
-    /// First value of attribute `attr` (keyword cell) on `e` in the view.
-    fn lookup(self: *Naive, e: Cell, attr: Cell) !?Cell {
-        const attr_id = (try self.fx.conn().idents.idOf(self.read.txn, attr.keyword)) orelse return null;
-        for (self.datoms) |d| {
+    /// First value of attribute `attr` (keyword cell) on `e` in `src`.
+    fn lookup(self: *Naive, e: Cell, attr: Cell, src: ir.Src) !?Cell {
+        const attr_id = (try self.connOf(src).idents.idOf(self.reads[src].txn, attr.keyword)) orelse return null;
+        for (self.datoms[src]) |d| {
             if (d[0].eql(e) and d[1].int == attr_id) return d[2];
         }
         return null;
     }
 
-    fn evalFn(self: *Naive, call: ir.Call, env: Env) ![]Value {
+    fn evalFn(self: *Naive, call: ir.Call, env: Env, src: ir.Src) ![]Value {
         const cells = try self.arena.alloc(Cell, call.args.len);
         for (call.args, cells) |a, *c| c.* = try argCell(a, env);
         const vals = try self.arena.alloc(Value, cells.len);
@@ -699,7 +754,7 @@ const Naive = struct {
         const result: Value = switch (call.f) {
             .builtin => |b| switch (b) {
                 .ground, .untuple => vals[0],
-                .get_else => try self.cellValue((try self.lookup(cells[1], cells[2])) orelse cells[3]),
+                .get_else => try self.cellValue((try self.lookup(cells[1], cells[2], call.args[0].src orelse src)) orelse cells[3]),
                 .tuple => try vector_mod.fromSlice(&self.fx.heap, vals),
                 else => return error.Unsupported,
             },
@@ -1186,6 +1241,58 @@ test "corpus: as-of, since, history views" {
     try checkCount(fx, hist, "[:find ?n :where [?e :person/name ?n _ true] [?e :person/age 25 _ ?added]]", none, 1);
     try checkCount(fx, hist.asOf(5), "[:find ?v ?added :where [[:person/email \"bob@x\"] :person/age ?v _ ?added]]", none, 1);
     try checkCount(fx, hist, "[:find ?n :where [?e :person/name ?n] (not [?e :person/name _ _ false])]", none, 5);
+}
+
+test "corpus: multiple data sources" {
+    const fx = try Fx.init("q_sources");
+    defer fx.deinit();
+    try loadCorpus(fx);
+    const now = try fx.db();
+    const before = try nextomic.natives.boxDb(&fx.heap, now.asOf(5));
+    const hist = try nextomic.natives.boxDb(&fx.heap, now.withHistory());
+    const nil = value.nilValue();
+    const rules = try fx.read(rules_src);
+
+    // A prefixed pattern reads its source; unprefixed and `$` read the db.
+    try checkCount(fx, now, "[:find ?n ?a ?b :in $ $2 :where [?e :person/name ?n] [?e :person/age ?a] [$2 ?e :person/age ?b] [(not= ?a ?b)]]", &.{ nil, before }, 1);
+    try checkCount(fx, now, "[:find ?n :in $ $2 :where [$ ?e :person/name ?n] (not [$2 ?e :person/name ?n])]", &.{ nil, before }, 2);
+    try checkCount(fx, now, "[:find ?n :in $ $2 :where [?e :person/name ?n] [$2 ?e :person/tags :red _ false]]", &.{ nil, hist }, 1);
+    try checkCount(fx, now, "[:find ?e :in $ $2 :where [$2 ?e :person/name ?n] (not [?e :person/name ?n])]", &.{ nil, before }, 1);
+    try checkCount(fx, now, "[:find ?n :in $ $2 :where [?e :person/name ?n] (or [$2 ?e :person/age 25] [?e :person/age 55])]", &.{ nil, before }, 2);
+    // missing? and get-else read the source they name.
+    try checkCount(fx, now, "[:find ?n :in $ $2 :where [?e :person/name ?n] [(missing? $2 ?e :person/name)]]", &.{ nil, before }, 1);
+    try checkCount(fx, now, "[:find ?n ?a :in $ $2 :where [?e :person/name ?n] [(get-else $2 ?e :person/age 0) ?a]]", &.{ nil, before }, 6);
+    // A rule called under a source reads it, non-recursive and recursive.
+    try checkCount(fx, now, "[:find ?p :in $ $2 % :where ($2 admin ?p)]", &.{ nil, before, rules }, 2);
+    try checkCount(fx, now, "[:find ?n :in $ $2 % :where [?b :person/email \"bob@x\"] ($2 friend ?a ?b) [?a :person/name ?n]]", &.{ nil, before, rules }, 2);
+    try checkCount(fx, now, "[:find ?n :in $ $2 % :where [?b :person/email \"bob@x\"] (friend ?a ?b) [?a :person/name ?n]]", &.{ nil, before, rules }, 2);
+    try checkCount(fx, now, "[:find ?a ?b :in $ $2 % :where ($2 reach ?a ?b)]", &.{ nil, before, rules }, 16);
+    try checkCount(fx, now, "[:find ?l :in $ $2 % :where [?a :node/label \"n1\"] ($2 reach ?a ?b) [?b :node/label ?l]]", &.{ nil, before, rules }, 5);
+    // Aggregates and :with over a join across sources.
+    try checkCount(fx, now, "[:find ?n (count ?o) :in $ $2 :where [$2 ?e :person/name ?n] [?o :order/customer ?e]]", &.{ nil, before }, 3);
+    try checkCount(fx, now, "[:find (sum ?a) :with ?e :in $ $2 :where [?e :person/name _] [$2 ?e :person/age ?a]]", &.{ nil, before }, 1);
+    // An input in an entity role resolves in the source of the pattern that gave it the role.
+    const ann_ref = try fx.read("[:person/email \"ann@x\"]");
+    try checkCount(fx, now, "[:find ?a :in $ $2 ?e :where [$2 ?e :person/age ?a]]", &.{ nil, before, ann_ref }, 1);
+    try checkCount(fx, now, "[:find ?a :in $ $2 ?e :where [$2 ?e :person/age ?a]]", &.{ nil, before, try fx.read("[:person/email \"flo@x\"]") }, 0);
+    // Three sources.
+    try checkCount(fx, now, "[:find ?n :in $ $2 $3 :where [?e :person/name ?n] [$2 ?e :person/age 25] [$3 ?e :person/age 26 _ true]]", &.{ nil, before, hist }, 1);
+    // Errors: an undeclared source, a missing input, an input that is not a db.
+    var d: query.Diag = .{};
+    try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), now, "[:find ?n :in $ $2 :where [$3 ?e :person/name ?n]]", &.{ nil, before }, &d));
+    try testing.expect(d.message.len > 0);
+    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), now, "[:find ?n :in $ $2 :where [$2 ?e :person/name ?n]]", &.{nil}));
+    try testing.expectError(error.KindMismatch, runEngine(fx, fx.arena(), now, "[:find ?n :in $ $2 :where [$2 ?e :person/name ?n]]", &.{ nil, value.fromFixnum(1).? }));
+
+    // explain names the source of a scan; q without a db_of refuses a second source.
+    var diag: query.Diag = .{};
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :in $ $2 :where [?e :person/name ?n] [$2 ?e :person/age 25]]"), now, &.{ nil, before }, &diag, .{ .db_of = &nextomic.natives.dbOf }, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "scan [$2 ?e") != null);
+    try testing.expectError(error.QuerySyntax, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n :in $ $2 :where [$2 ?e :person/name ?n]]"), now, &.{ nil, before }, &diag, .{}));
+    const res = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n . :in $ $2 :where [?e :person/name ?n] [$2 ?e :person/age 25]]"), now, &.{ nil, before }, &diag, .{ .db_of = &nextomic.natives.dbOf });
+    try testing.expectEqualStrings("Bob", string_mod.asBytes(res));
 }
 
 test "results materialise as set, scalar, collection, tuple; caches; explain" {

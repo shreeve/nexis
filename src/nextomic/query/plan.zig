@@ -22,6 +22,9 @@
 //!     is not an error.
 //!   - Sub-plans (`not`, `or`, rule bodies) are planned with their join
 //!     variables bound and start from a relation over those variables.
+//!   - Every source has its own `Read`; a pattern is resolved and
+//!     estimated against the source it names (`$` when it names none),
+//!     and the scan step records that source.
 //!   - Plan variables extend the IR's table; renamed rule variables are
 //!     appended and never alias a query variable.
 //!   - Everything a plan allocates lives in the query arena.
@@ -94,6 +97,8 @@ pub const Slot = union(enum) {
 };
 
 pub const Scan = struct {
+    /// The data source the scan reads.
+    src: ir.Src,
     e: Slot,
     a: Slot,
     v: Slot,
@@ -181,30 +186,63 @@ pub const Plan = struct {
     rows_estimate: u64,
 };
 
-/// Everything planning needs about the query: the `Read`, the variable
-/// table (shared by every sub-plan) and the rule set.
+/// One data source at plan time: its `Read` and what has been
+/// resolved against it.
+pub const DbSource = struct {
+    read: *Read,
+    /// Attributes resolved so far, by VM keyword id.
+    attr_cache: std.AutoHashMapUnmanaged(u32, ?Attr) = .empty,
+    /// Entries of the AEVT tree this view reads, once asked.
+    aevt_entries: ?u64 = null,
+};
+
+/// Everything planning needs about the query: the `Read` of every
+/// source (`read` is the selected one), the variable table (shared by
+/// every sub-plan) and the rule set.
 pub const Ctx = struct {
     arena: Allocator,
+    /// The selected source's `Read`; `select` switches it.
     read: *Read,
     interner: *Interner,
     vars: std.ArrayList(ir.VarInfo),
     rules: *const RuleSet,
     rule_info: ?*rules_mod.Info = null,
-    /// Attributes resolved so far, by VM keyword id.
+    /// The selected source's resolved attributes.
     attr_cache: std.AutoHashMapUnmanaged(u32, ?Attr) = .empty,
     /// The query's `Ir` table size; variables at or past it are renames.
     ir_vars: usize,
     /// Run-time relation slots, by `Clause.source.id`.
     sources: std.ArrayList(*SourceSlot) = .empty,
-    /// Entries of the AEVT tree this view reads, once asked.
+    /// The selected source's AEVT entries, once asked.
     aevt_entries: ?u64 = null,
+    /// The data sources by `Src`; `$` first.
+    dbs: []DbSource,
+    /// VM symbol ids of the sources, for `explain`.
+    source_names: []const u32,
+    selected: ir.Src = 0,
     /// Where a syntax or attribute error leaves its reason.
     diag: *Diag,
 
-    pub fn init(arena: Allocator, read: *Read, interner: *Interner, query: *const Ir, rules: *const RuleSet, diag: *Diag) !Ctx {
+    /// `reads` has one `Read` per query source, `$` first.
+    pub fn init(arena: Allocator, reads: []const *Read, interner: *Interner, query: *const Ir, rules: *const RuleSet, diag: *Diag) !Ctx {
+        std.debug.assert(reads.len == query.sources.len);
         var vars: std.ArrayList(ir.VarInfo) = .empty;
         try vars.appendSlice(arena, query.vars);
-        return .{ .arena = arena, .read = read, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .diag = diag };
+        const dbs = try arena.alloc(DbSource, reads.len);
+        for (reads, dbs) |r, *d| d.* = .{ .read = r };
+        return .{ .arena = arena, .read = reads[0], .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
+    }
+
+    /// Make `src` (null: `$`) the source the resolvers read.
+    pub fn select(self: *Ctx, src: ?ir.Src) void {
+        const next = src orelse 0;
+        if (next == self.selected) return;
+        self.dbs[self.selected].attr_cache = self.attr_cache;
+        self.dbs[self.selected].aevt_entries = self.aevt_entries;
+        self.selected = next;
+        self.read = self.dbs[next].read;
+        self.attr_cache = self.dbs[next].attr_cache;
+        self.aevt_entries = self.dbs[next].aevt_entries;
     }
 
     /// `QuerySyntax` with its reason.
@@ -421,7 +459,7 @@ fn clampRows(n: u128) u64 {
 }
 
 fn placeRule(ctx: *Ctx, r: anytype, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
-    try rules_mod.planCall(ctx, r.name, r.args, bound, steps, rows);
+    try rules_mod.planCall(ctx, r.name, r.args, r.src, bound, steps, rows);
 }
 
 /// Plan a run-time relation source: a join on its already-bound
@@ -611,10 +649,12 @@ fn choose(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !Choice {
 }
 
 fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !u64 {
+    ctx.select(p.src);
     return (try choose(ctx, p, bound)).estimate;
 }
 
 fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) Failure!Scan {
+    ctx.select(p.src);
     const choice = try choose(ctx, p, bound);
     const hash_choice: ?Choice = choose(ctx, p, &.{}) catch |err| switch (err) {
         error.UnboundPattern => null,
@@ -653,6 +693,7 @@ fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) Failure!Scan {
     const entries = try store_mod.Store.treeEntries(ctx.read.txn, tree);
 
     return .{
+        .src = ctx.selected,
         .e = slots[0],
         .a = slots[1],
         .v = slots[2],
@@ -785,6 +826,7 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer, depth: usi
         switch (step) {
             .scan => |s| {
                 try w.writeAll("scan [");
+                if (s.src != 0) try w.print("{s} ", .{ctx.interner.symbolName(ctx.source_names[s.src])});
                 for (s.slots(), 0..) |slot, i| {
                     if (i > 0) try w.writeByte(' ');
                     try explainSlot(slot, ctx, w);
@@ -898,7 +940,7 @@ fn explainCall(call: ir.Call, ctx: *const Ctx, w: *std.Io.Writer) !void {
         switch (a) {
             .variable => |v| try w.writeAll(ctx.varName(v)),
             .constant => |c| try explainCell(c, ctx, w),
-            .src => try w.writeAll("$"),
+            .src => |x| try w.writeAll(ctx.interner.symbolName(ctx.source_names[x orelse 0])),
         }
     }
     try w.writeByte(')');

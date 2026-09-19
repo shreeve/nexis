@@ -294,7 +294,7 @@ pub fn dbOf(v: Value) !DbValue {
     return .{ .conn = c, .basis = s.basis, .as_of = s.as_of, .since = s.since, .history = s.history };
 }
 
-fn boxDb(heap: *Heap, d: DbValue) !Value {
+pub fn boxDb(heap: *Heap, d: DbValue) !Value {
     return handle.makeDb(heap, .{ .conn = @ptrCast(d.conn), .basis = d.basis, .as_of = d.as_of, .since = d.since, .history = d.history });
 }
 

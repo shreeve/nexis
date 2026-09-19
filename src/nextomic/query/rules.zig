@@ -22,7 +22,10 @@
 //!     the result. Pushing elsewhere would lose derivations.
 //!   - Termination: `total` only grows and every row comes from a
 //!     finite set of datoms and inputs, so the fixpoint is reached.
-//!   - Rule bodies see the same `Read` snapshot as the query.
+//!   - Rule bodies see the same `Read` snapshots as the query; a body's
+//!     unprefixed clauses read the source the call names (`$` by
+//!     default), and a recursive component is instantiated under one
+//!     source.
 
 const std = @import("std");
 const ir = @import("ir.zig");
@@ -220,7 +223,7 @@ pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: []const V
 
 /// Append the steps of a rule call: grounding binds for constant
 /// arguments, then an `or` (non-recursive) or a `fix` (recursive).
-pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
+pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
     const defs = try defsOf(ctx, name, args);
     const arg_vars = try ctx.arena.alloc(Var, args.len);
     for (args, arg_vars) |a, *v| {
@@ -244,7 +247,7 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: *std.ArrayLis
     if (!info.isRecursive(name)) {
         const branches = try ctx.arena.alloc(ir.Branch, defs.len);
         for (defs, branches) |def, *br| {
-            var r = try Renamer.init(ctx, arg_vars, def, null);
+            var r = try Renamer.init(ctx, arg_vars, def, null, src);
             br.* = try r.clauses(def.body);
         }
         var join: std.ArrayList(Var) = .empty;
@@ -253,7 +256,7 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: *std.ArrayLis
         for (step.@"or".fresh) |v| try bound.append(ctx.arena, v);
         try steps.append(ctx.arena, step);
     } else {
-        const fix = try planFix(ctx, name, arg_vars, bound.items, rows.*);
+        const fix = try planFix(ctx, name, arg_vars, src, bound.items, rows.*);
         for (fix.fresh) |v| try bound.append(ctx.arena, v);
         try steps.append(ctx.arena, .{ .fix = fix });
     }
@@ -290,7 +293,7 @@ pub const Fix = struct {
     fresh: []const Var,
 };
 
-fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, bound: []const Var, rows: u64) Failure!Fix {
+fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: []const Var, rows: u64) Failure!Fix {
     const info = try ctx.ruleInfo();
     const members = try info.members(ctx.arena, name);
 
@@ -322,7 +325,7 @@ fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, bound: []const Var, rows
             for (pushed.items) |pos| try input.append(ctx.arena, inst.head[pos]);
         }
         for (defs, bodies) |def, *body| {
-            var r = try Renamer.init(ctx, inst.head, def, .{ .names = scc_names, .instances = instances });
+            var r = try Renamer.init(ctx, inst.head, def, .{ .names = scc_names, .instances = instances }, src);
             const clauses = try r.clauses(def.body);
             body.* = .{
                 .plan = try plan_mod.planSub(ctx, clauses, input.items, rows),
@@ -343,11 +346,14 @@ fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, bound: []const Var, rows
 
 /// Copies a rule body into plan variables: head variables map to the
 /// call's arguments, every other rule variable to a fresh plan
-/// variable; calls to component members become `source` clauses.
+/// variable; calls to component members become `source` clauses; a
+/// clause that names no source reads the call's.
 const Renamer = struct {
     ctx: *Ctx,
     map: []?Var,
     scc: ?Scc,
+    /// The call's data source; the body's default.
+    src: ?ir.Src,
     sites: std.ArrayList(CallSite) = .empty,
 
     const Scc = struct {
@@ -355,11 +361,11 @@ const Renamer = struct {
         instances: []const Instance,
     };
 
-    fn init(ctx: *Ctx, call_args: []const Var, def: ir.Rule, scc: ?Scc) !Renamer {
+    fn init(ctx: *Ctx, call_args: []const Var, def: ir.Rule, scc: ?Scc, src: ?ir.Src) !Renamer {
         const map = try ctx.arena.alloc(?Var, ctx.rules.vars.len);
         @memset(map, null);
         for (def.head, call_args) |h, a| map[h] = a;
-        return .{ .ctx = ctx, .map = map, .scc = scc };
+        return .{ .ctx = ctx, .map = map, .scc = scc, .src = src };
     }
 
     fn v(self: *Renamer, rv: Var) !Var {
@@ -390,7 +396,8 @@ const Renamer = struct {
         const out = try self.ctx.arena.alloc(ir.Arg, as.len);
         for (as, out) |a, *o| o.* = switch (a) {
             .variable => |rv| .{ .variable = try self.v(rv) },
-            else => a,
+            .src => |x| .{ .src = x orelse self.src },
+            .constant => a,
         };
         return out;
     }
@@ -428,6 +435,7 @@ const Renamer = struct {
         const arena = self.ctx.arena;
         switch (c) {
             .pattern => |p| try out.append(arena, .{ .pattern = .{
+                .src = p.src orelse self.src,
                 .e = try self.term(p.e),
                 .a = try self.term(p.a),
                 .v = try self.term(p.v),
@@ -471,7 +479,7 @@ const Renamer = struct {
                         return;
                     }
                 }
-                try out.append(arena, .{ .rule = .{ .name = r.name, .args = renamed } });
+                try out.append(arena, .{ .rule = .{ .name = r.name, .args = renamed, .src = r.src orelse self.src } });
             },
             .source => |s| try out.append(arena, .{ .source = .{ .id = s.id, .vars = try self.vars(s.vars) } }),
         }

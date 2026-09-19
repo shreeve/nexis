@@ -8,7 +8,9 @@
 //!   - The IR is pure syntax (see `ir.zig`); nothing here touches a
 //!     store, so a parsed query is reusable across dbs and bases.
 //!   - Every `find` and `with` variable is bound by `in` or `where`.
-//!   - `in` variables are unique; `$` and `%` appear at most once.
+//!   - `in` variables are unique; `$` comes first and every source and
+//!     `%` appear at most once; a `$name` in a clause is declared in
+//!     `in`, and a rule body reads `$` only.
 //!   - `or` branches bind the same variables; `not` mentions at least
 //!     one variable.
 //!   - A `?variable` in function position is a `FnRef.variable`; it is
@@ -68,12 +70,14 @@ pub fn parse(gpa: Allocator, interner: *Interner, query: Value, diag: *Diag) Err
         .find = &.{},
         .with = &.{},
         .in = &.{},
+        .sources = &.{},
         .where = &.{},
     };
     errdefer out.arena_state.deinit();
     var p = Parser{ .arena = out.arena_state.allocator(), .interner = interner, .diag = diag };
     try p.parseQuery(query, out);
     out.vars = try p.vars.toOwnedSlice(p.arena);
+    out.sources = try p.sources.toOwnedSlice(p.arena);
     return out;
 }
 
@@ -99,6 +103,10 @@ const Parser = struct {
     diag: *Diag,
     vars: std.ArrayList(ir.VarInfo) = .empty,
     by_sym: std.AutoHashMapUnmanaged(u32, Var) = .empty,
+    /// The `:in` sources by symbol id, `$` first; empty while parsing
+    /// a rule set, whose bodies take only `$`.
+    sources: std.ArrayList(u32) = .empty,
+    rule_body: bool = false,
     clause_index: ?usize = null,
 
     fn fail(self: *Parser, message: []const u8) Error {
@@ -137,6 +145,22 @@ const Parser = struct {
     fn isVarSym(self: *Parser, v: Value) bool {
         const s = self.symName(v) orelse return false;
         return s.len > 1 and s[0] == '?';
+    }
+
+    fn isSrcSym(self: *Parser, v: Value) bool {
+        const s = self.symName(v) orelse return false;
+        return s.len > 0 and s[0] == '$';
+    }
+
+    /// The source a `$name` symbol names: null for `$` (the default),
+    /// its index for a declared source; an undeclared one, or any
+    /// name but `$` in a rule body, is a syntax error.
+    fn srcOf(self: *Parser, v: Value) Error!?ir.Src {
+        if (self.isSym(v, "$")) return null;
+        if (self.rule_body) return self.fail("a rule body reads $ only");
+        const sym = v.asSymbolId();
+        for (self.sources.items, 0..) |s, i| if (s == sym) return @intCast(i);
+        return self.fail("unknown data source; declare it in :in");
     }
 
     fn isSeq(v: Value) bool {
@@ -202,7 +226,10 @@ const Parser = struct {
         try self.parseFind(find_items, out);
         try self.parseKeys(out, keys, strs, syms);
 
-        out.in = if (in) |items| try self.parseIn(items) else try self.arena.dupe(ir.InBinding, &.{.src});
+        out.in = if (in) |items| try self.parseIn(items) else blk: {
+            try self.sources.append(self.arena, self.interner.internSymbol("$") catch return error.OutOfMemory);
+            break :blk try self.arena.dupe(ir.InBinding, &.{.{ .src = 0 }});
+        };
 
         if (with) |items| {
             const ws = try self.arena.alloc(Var, items.len);
@@ -297,13 +324,14 @@ const Parser = struct {
     fn parseIn(self: *Parser, items: []Value) Error![]ir.InBinding {
         var out: std.ArrayList(ir.InBinding) = .empty;
         var seen: std.ArrayList(Var) = .empty;
-        var has_src = false;
         var has_rules = false;
-        for (items) |x| {
-            if (self.isSym(x, "$")) {
-                if (has_src) return self.fail("more than one $ in :in");
-                has_src = true;
-                try out.append(self.arena, .src);
+        for (items, 0..) |x, i| {
+            if (self.isSrcSym(x)) {
+                const sym = x.asSymbolId();
+                if (self.sources.items.len == 0 and (i != 0 or !self.isSym(x, "$"))) return self.fail(":in starts with $");
+                for (self.sources.items) |s| if (s == sym) return self.fail("duplicate data source in :in");
+                try out.append(self.arena, .{ .src = @intCast(self.sources.items.len) });
+                try self.sources.append(self.arena, sym);
             } else if (self.isSym(x, "%")) {
                 if (has_rules) return self.fail("more than one % in :in");
                 has_rules = true;
@@ -322,7 +350,7 @@ const Parser = struct {
                 }
             } else return self.fail("unknown :in binding form");
         }
-        if (!has_src) return self.fail(":in must include $");
+        if (self.sources.items.len == 0) return self.fail(":in starts with $");
         return out.toOwnedSlice(self.arena);
     }
 
@@ -409,6 +437,10 @@ const Parser = struct {
                     if (parts.len < 3) return self.fail("or-join takes a variable vector and clauses");
                     const join = try self.joinVars(parts[1]);
                     try out.append(self.arena, .{ .@"or" = .{ .join = join, .branches = try self.parseBranches(parts[2..]) } });
+                } else if (parts[0].isSymbol() and self.isSrcSym(parts[0])) {
+                    if (parts.len < 2 or self.symName(parts[1]) == null) return self.fail("a source prefix is followed by a rule name");
+                    const src = try self.srcOf(parts[0]);
+                    try out.append(self.arena, .{ .rule = .{ .name = parts[1].asSymbolId(), .args = try self.parseArgs(parts[2..], true), .src = src } });
                 } else {
                     try out.append(self.arena, .{ .rule = .{ .name = parts[0].asSymbolId(), .args = try self.parseArgs(parts[1..], true) } });
                 }
@@ -466,13 +498,17 @@ const Parser = struct {
 
     fn parsePattern(self: *Parser, parts_in: []Value) Error!ir.Pattern {
         var parts = parts_in;
-        if (parts.len > 0 and self.isSym(parts[0], "$")) parts = parts[1..];
+        var src: ?ir.Src = null;
+        if (parts.len > 0 and parts[0].isSymbol() and self.isSrcSym(parts[0])) {
+            src = try self.srcOf(parts[0]);
+            parts = parts[1..];
+        }
         if (parts.len == 0 or parts.len > 5) return self.fail("data pattern takes 1 to 5 positions");
         var terms: [5]ir.Term = .{ .blank, .blank, .blank, .blank, .blank };
         for (parts, 0..) |x, i| terms[i] = try self.parseTerm(x);
         if (terms[3] == .constant and terms[3].constant == .lookup) return self.fail("tx position takes an entity id or a variable");
         if (terms[4] == .constant and (terms[4].constant != .cell or terms[4].constant.cell != .boolean)) return self.fail("added position takes a boolean or a variable");
-        return .{ .e = terms[0], .a = terms[1], .v = terms[2], .tx = terms[3], .added = terms[4] };
+        return .{ .src = src, .e = terms[0], .a = terms[1], .v = terms[2], .tx = terms[3], .added = terms[4] };
     }
 
     fn parseTerm(self: *Parser, x: Value) Error!ir.Term {
@@ -540,8 +576,8 @@ const Parser = struct {
         const out = try self.arena.alloc(ir.Arg, items.len);
         for (items, out) |x, *a| {
             if (x.isSymbol()) {
-                if (self.isSym(x, "$")) {
-                    a.* = .src;
+                if (self.isSrcSym(x)) {
+                    a.* = .{ .src = try self.srcOf(x) };
                 } else if (self.isVarSym(x)) {
                     a.* = .{ .variable = try self.varOf(x.asSymbolId()) };
                 } else if (rule_call and self.isSym(x, "_")) {
@@ -618,6 +654,7 @@ const Parser = struct {
             for (out.items) |prev| {
                 if (prev.name == name and (prev.head.len != vars.items.len or prev.required != required)) return self.fail("rules with one name must share an arity");
             }
+            self.rule_body = true;
             const body = try self.parseClauses(parts[1..], false);
             try out.append(self.arena, .{ .name = name, .required = required, .head = try vars.toOwnedSlice(self.arena), .body = body });
         }
@@ -793,6 +830,53 @@ test "vector form: find specs, in bindings, where clause kinds" {
     try testing.expect(last.e == .constant and last.e.constant == .lookup);
     try testing.expect(last.v == .blank and last.tx == .variable and last.added.constant.cell.boolean);
     try testing.expectEqualStrings("?e", interner.symbolName(parsed.vars[1].sym));
+}
+
+test "sources: $ first, $name prefixes on patterns, calls and rule calls" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const b = Builder{ .heap = &heap, .interner = &interner };
+    var diag: Diag = .{};
+
+    // [:find ?n :in $ $2 :where [?e :a ?n] [$2 ?e :a ?n] [$ ?e :b _]
+    //  [(missing? $2 ?e :c)] ($2 r ?e) (r ?e)]
+    const q = b.vec(&.{
+        b.kw("find"),                                                b.sym("?n"),
+        b.kw("in"),                                                  b.sym("$"),
+        b.sym("$2"),                                                 b.kw("where"),
+        b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?n") }),            b.vec(&.{ b.sym("$2"), b.sym("?e"), b.kw("a"), b.sym("?n") }),
+        b.vec(&.{ b.sym("$"), b.sym("?e"), b.kw("b"), b.sym("_") }), b.vec(&.{b.lst(&.{ b.sym("missing?"), b.sym("$2"), b.sym("?e"), b.kw("c") })}),
+        b.lst(&.{ b.sym("$2"), b.sym("r"), b.sym("?e") }),           b.lst(&.{ b.sym("r"), b.sym("?e") }),
+    });
+    const p = try parse(testing.allocator, &interner, q, &diag);
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 2), p.sources.len);
+    try testing.expect(p.in[0] == .src and p.in[0].src == 0 and p.in[1] == .src and p.in[1].src == 1);
+    try testing.expect(p.where[0].pattern.src == null);
+    try testing.expectEqual(@as(?ir.Src, 1), p.where[1].pattern.src);
+    try testing.expect(p.where[2].pattern.src == null);
+    try testing.expectEqual(@as(?ir.Src, 1), p.where[3].pred.args[0].src);
+    try testing.expectEqual(@as(?ir.Src, 1), p.where[4].rule.src);
+    try testing.expect(p.where[5].rule.src == null);
+
+    for ([_]Value{
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("in"), b.sym("$2"), b.sym("$"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("in"), b.sym("?x"), b.sym("$"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?x") }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("in"), b.sym("$"), b.sym("$"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("$2"), b.sym("?e"), b.kw("a"), b.int(1) }) }),
+    }) |bad| {
+        try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, bad, &diag));
+        try testing.expect(diag.message.len > 0);
+    }
+    // A rule body reads $ only.
+    const rules_ok = b.vec(&.{b.vec(&.{ b.lst(&.{ b.sym("r"), b.sym("?a") }), b.vec(&.{ b.sym("$"), b.sym("?a"), b.kw("edge"), b.int(1) }) })});
+    const rs = try parseRules(testing.allocator, &interner, rules_ok, &diag);
+    defer rs.deinit();
+    try testing.expect(rs.rules[0].body[0].pattern.src == null);
+    const rules_bad = b.vec(&.{b.vec(&.{ b.lst(&.{ b.sym("r"), b.sym("?a") }), b.vec(&.{ b.sym("$2"), b.sym("?a"), b.kw("edge"), b.int(1) }) })});
+    try testing.expectError(error.QuerySyntax, parseRules(testing.allocator, &interner, rules_bad, &diag));
 }
 
 test "map form, scalar/collection/tuple find, default :in, errors carry clause index" {

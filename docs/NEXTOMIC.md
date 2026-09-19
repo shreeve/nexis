@@ -337,8 +337,23 @@ below the scan estimate, otherwise a hash join on the shared variables.
 Estimates come from `treeStat` and per-attribute counts kept in
 `Schema`.
 
-**Execute** over one read transaction for the whole query (one snapshot
-for every cursor, emdb INV-T02). Scans drive `openCursorForTree` +
+**Sources.** `:in` starts with `$`; further `$name` bindings (`$2`,
+`$hist`) take db values, positional like every input, and may name
+another connection or a time view of the same one. A data pattern, a
+`missing?` or `get-else` call, or a rule call prefixed with a source
+reads it: `[$2 ?e :a ?v]`, `[(missing? $2 ?e :a)]`, `($2 rule ?x)`; an
+unprefixed clause reads `$`. A rule body writes `$` or nothing and reads
+the source its call names, so one rule set serves every source; a
+recursive component runs under one source. Each source is one read
+transaction for the whole query; attributes, idents, lookup refs and
+keyword values resolve per source (an ident is an entity of the store
+that holds it). An input in an entity role resolves in the source of the
+first pattern that gives it that role. A clause naming an undeclared
+source is `:nextomic/query-syntax`; a source input that is not a db value
+is `:kind-mismatch`.
+
+**Execute** over one read transaction per source for the whole query
+(one snapshot for every cursor, emdb INV-T02). Scans drive `openCursorForTree` +
 `setRange` with the §4 fold inline; constants in the prefix narrow the
 seek, constants after an unbound position filter. Built-in predicates
 (`< <= > >= = not= missing?`, later `ground tuple untuple get-else`) are
@@ -394,8 +409,8 @@ sub-plans with the same output variables.
 | `(d/entity db e)` | eager map `{:db/id e :attr v ...}`, card-many as sets, refs as eids; nil when the entity has no datoms in this view; `:nextomic/history-view` on a history db |
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
 | `(d/datoms db :eavt e a v)` (index and optional components in index order; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
-| `(d/q query db & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]`, aggregates and `(pull ?e pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] %` with inputs positional after the db, `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
-| `(d/explain query db & inputs)` | the plan `q` would run, as a string: one numbered line per step with index, estimate and bound variables |
+| `(d/q query db & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]`, aggregates and `(pull ?e pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] % $2` with inputs positional after the db (a `$name` source takes a db value; `[$2 ?e :a ?v]` and `($2 rule ?x)` read it), `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
+| `(d/explain query db & inputs)` | the plan `q` would run, as a string: one numbered line per step with index, estimate, source (when not `$`) and bound variables |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4); `t` is a transaction number or a transaction's entity id |
 | `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}` for `from ≤ t < to`, oldest first; a bound that is `nil` or not given is open |
 | `(d/schema db)` | map ident → attribute map |

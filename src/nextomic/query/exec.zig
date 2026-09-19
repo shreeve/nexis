@@ -2,9 +2,13 @@
 //! "Execute").
 //!
 //! Invariants:
-//!   - One `Read` (one emdb snapshot) serves every scan of a query; the
-//!     caller opens it before planning and closes it after the result
-//!     is materialised, on success or error.
+//!   - One `Read` (one emdb snapshot) per data source serves every scan
+//!     of a query; the caller opens them before planning and closes
+//!     them after the result is materialised, on success or error. A
+//!     scan, `missing?` and `get-else` read the source their clause
+//!     names; an input resolves its idents and lookup refs in the
+//!     source of the first pattern that gives it an entity role; a pull
+//!     expression reads `$`.
 //!   - A scan seeks by the constants and bound variables that lead its
 //!     index and post-filters everything else; `tx` binds the
 //!     transaction entity id and `added` the datom's flag. The mode of
@@ -71,7 +75,8 @@ pub const CallHook = struct {
 
 pub const Exec = struct {
     arena: Allocator,
-    read: *Read,
+    /// One `Read` per data source, `$` first.
+    reads: []const *Read,
     heap: *Heap,
     interner: *Interner,
     hook: ?CallHook,
@@ -99,17 +104,22 @@ pub const Exec = struct {
 
     // ── datoms to cells ───────────────────────────────────────────
 
-    /// The cell of a datom value: ids as `int`, keywords as VM keyword
-    /// ids, uuids as text.
-    pub fn valCell(self: *Exec, v: key.Val) !Cell {
-        return marshal.cellOf(self.read, self.arena, v);
+    /// The `Read` of a source (null: `$`).
+    fn readOf(self: *Exec, src: ?ir.Src) *Read {
+        return self.reads[src orelse 0];
     }
 
-    fn datomCells(self: *Exec, d: datom_mod.Datom) ![5]Cell {
+    /// The cell of a datom value read from `read`: ids as `int`,
+    /// keywords as VM keyword ids, uuids as text.
+    pub fn valCell(self: *Exec, read: *Read, v: key.Val) !Cell {
+        return marshal.cellOf(read, self.arena, v);
+    }
+
+    fn datomCells(self: *Exec, read: *Read, d: datom_mod.Datom) ![5]Cell {
         return .{
             .{ .int = @intCast(d.e) },
             .{ .int = d.a },
-            try self.valCell(d.v),
+            try self.valCell(read, d.v),
             .{ .int = @intCast(key.txEntity(d.t)) },
             .{ .boolean = d.added },
         };
@@ -197,6 +207,7 @@ pub const Exec = struct {
     /// VAET scan whose value cell is not an entity id becomes a scan
     /// of every datom in AEVT, filtered on the value.
     fn scanInto(self: *Exec, s: *const Scan, planned: key.Index, rel: ?*const Relation, row: []const Cell, srcs: []const Src, out: *Relation) anyerror!void {
+        const read = self.reads[s.src];
         const slots = s.slots();
         var comps: key.Components = .{};
         var index = planned;
@@ -210,20 +221,20 @@ pub const Exec = struct {
         var attr = s.attr;
         if (wants[1]) |c| {
             const n: i64 = switch (c) {
-                .keyword => |kw| (try self.read.db.conn.idents.idOf(self.read.txn, kw)) orelse return,
+                .keyword => |kw| (try read.db.conn.idents.idOf(read.txn, kw)) orelse return,
                 else => c.asInt() orelse return,
             };
             if (n <= 0 or n >= key.attr_partition_end) return;
             comps.a = @intCast(n);
             wants[1] = .{ .int = n };
-            if (attr == null) attr = (try self.read.attr(comps.a.?)) orelse return;
+            if (attr == null) attr = (try read.attr(comps.a.?)) orelse return;
         }
 
         if (wants[2]) |c| {
             if (slots[2] == .constant and slots[2].constant.bytes != null) {
                 comps.v = slots[2].constant.bytes;
             } else if (attr) |at| {
-                const val = (try marshal.encodeCell(self.read, c, at.value_type)) orelse return;
+                const val = (try marshal.encodeCell(read, c, at.value_type)) orelse return;
                 comps.v = key.valBytes(self.arena, val) catch |err| switch (err) {
                     error.ValueType => return,
                     else => return err,
@@ -237,10 +248,10 @@ pub const Exec = struct {
             }
         }
 
-        var it = try self.read.scan(self.arena, index, comps);
+        var it = try read.scan(self.arena, index, comps);
         const cells = try self.arena.alloc(Cell, out.cols.len);
         datoms: while (try it.next()) |d| {
-            const dc = try self.datomCells(d);
+            const dc = try self.datomCells(read, d);
             for (slots, 0..) |slot, pos| {
                 switch (slot) {
                     .blank, .fresh => {},
@@ -300,7 +311,7 @@ pub const Exec = struct {
         while (i < rel.rows) : (i += 1) {
             const cells = try self.argCells(&rel, i, p.call.args);
             const keep = switch (p.call.f) {
-                .builtin => |b| try self.builtinPred(b, cells),
+                .builtin => |b| try self.builtinPred(b, p.call.args, cells),
                 .user => |sym| (try self.callUser(sym, cells)).isTruthy(),
                 .variable => |f| (try self.applyVar(&rel, i, f, cells)).isTruthy(),
             };
@@ -309,7 +320,8 @@ pub const Exec = struct {
         return out;
     }
 
-    fn builtinPred(self: *Exec, b: ir.Builtin, args: []const Cell) anyerror!bool {
+    /// `call_args` carry what a cell cannot: the source of `missing?`.
+    fn builtinPred(self: *Exec, b: ir.Builtin, call_args: []const ir.Arg, args: []const Cell) anyerror!bool {
         switch (b) {
             .lt, .le, .gt, .ge => {
                 for (args[0 .. args.len - 1], args[1..]) |x, y| {
@@ -333,20 +345,21 @@ pub const Exec = struct {
                 for (args[1..]) |y| if (!args[0].eql(y)) return true;
                 return false;
             },
-            .missing => return (try self.firstValue(args[1], args[2])) == null,
+            .missing => return (try self.firstValue(call_args[0].src, args[1], args[2])) == null,
             .ground, .get_else, .tuple, .untuple => unreachable,
         }
     }
 
-    /// The first current value of attribute `attr` (a keyword cell) on
-    /// entity `e`, or null.
-    fn firstValue(self: *Exec, e: Cell, attr: Cell) anyerror!?Cell {
+    /// The first value of attribute `attr` (a keyword cell) on entity
+    /// `e` in source `src`, or null.
+    fn firstValue(self: *Exec, src: ?ir.Src, e: Cell, attr: Cell) anyerror!?Cell {
+        const read = self.readOf(src);
         const eid = e.asEid() orelse return null;
         if (attr != .keyword) return error.ValueType;
-        const a = (try self.read.db.conn.idents.idOf(self.read.txn, attr.keyword)) orelse return null;
-        var it = try self.read.scan(self.arena, .eavt, .{ .e = eid, .a = a });
+        const a = (try read.db.conn.idents.idOf(read.txn, attr.keyword)) orelse return null;
+        var it = try read.scan(self.arena, .eavt, .{ .e = eid, .a = a });
         const d = (try it.next()) orelse return null;
-        return try self.valCell(d.v);
+        return try self.valCell(read, d.v);
     }
 
     fn execBind(self: *Exec, b: *const plan_mod.Bind, rel: Relation) anyerror!Relation {
@@ -360,7 +373,7 @@ pub const Exec = struct {
                 .builtin => |bi| switch (bi) {
                     .ground, .untuple => try self.cellValue(cells[0]),
                     .get_else => blk: {
-                        const found = try self.firstValue(cells[1], cells[2]);
+                        const found = try self.firstValue(b.call.args[0].src, cells[1], cells[2]);
                         break :blk try self.cellValue(found orelse cells[3]);
                     },
                     .tuple => blk: {
@@ -514,7 +527,9 @@ pub const Exec = struct {
         return self.resolveInputs(q, rel);
     }
 
-    const InputRole = struct { entity: bool = false, keyword: bool = false };
+    /// `src` is the source of the first pattern that put the variable
+    /// in an entity role; its idents and lookups resolve there.
+    const InputRole = struct { entity: bool = false, keyword: bool = false, src: ir.Src = 0 };
 
     /// `rel` with the entity-role columns resolved (see `inputRelation`).
     fn resolveInputs(self: *Exec, q: *const Ir, rel: Relation) anyerror!Relation {
@@ -532,7 +547,7 @@ pub const Exec = struct {
             rel.rowInto(i, row);
             for (cols.items) |c| {
                 if (row[c] != .keyword and row[c] != .vm) continue;
-                const e = (try self.inputEntity(row[c])) orelse continue :rows;
+                const e = (try self.inputEntity(self.reads[roles[rel.vars[c]].src], row[c])) orelse continue :rows;
                 row[c] = .{ .int = @intCast(e) };
             }
             try out.append(row);
@@ -545,12 +560,13 @@ pub const Exec = struct {
     fn inputRoles(self: *Exec, clauses: []const ir.Clause, roles: []InputRole) anyerror!void {
         for (clauses) |c| switch (c) {
             .pattern => |p| {
-                if (p.e.asVar()) |v| roles[v].entity = true;
+                const read = self.readOf(p.src);
+                if (p.e.asVar()) |v| markEntity(&roles[v], p.src orelse 0);
                 const v = p.v.asVar() orelse continue;
                 if (p.a != .constant or p.a.constant != .cell or p.a.constant.cell != .keyword) continue;
-                const id = (try self.read.db.conn.idents.idOf(self.read.txn, p.a.constant.cell.keyword)) orelse continue;
-                const at = (try self.read.attr(@intCast(id))) orelse continue;
-                if (at.value_type == .ref) roles[v].entity = true;
+                const id = (try read.db.conn.idents.idOf(read.txn, p.a.constant.cell.keyword)) orelse continue;
+                const at = (try read.attr(@intCast(id))) orelse continue;
+                if (at.value_type == .ref) markEntity(&roles[v], p.src orelse 0);
                 if (at.value_type == .keyword) roles[v].keyword = true;
             },
             .not => |n| try self.inputRoles(n.body, roles),
@@ -559,17 +575,22 @@ pub const Exec = struct {
         };
     }
 
-    /// The entity an ident or lookup-ref input names (the `marshal`
-    /// contract), or null when there is none; the diagnostic carries
-    /// what a failing lookup ref named.
-    fn inputEntity(self: *Exec, c: Cell) anyerror!?u64 {
+    fn markEntity(role: *InputRole, src: ir.Src) void {
+        if (!role.entity) role.src = src;
+        role.entity = true;
+    }
+
+    /// The entity an ident or lookup-ref input names in `read` (the
+    /// `marshal` contract), or null when there is none; the diagnostic
+    /// carries what a failing lookup ref named.
+    fn inputEntity(self: *Exec, read: *Read, c: Cell) anyerror!?u64 {
         const v: Value = switch (c) {
             .keyword => |kw| value.fromKeywordId(kw),
             .vm => |v| v,
             else => return null,
         };
         var fault: db_mod.Fault = .{};
-        return marshal.entity(self.read, self.arena, v, &fault) catch |err| {
+        return marshal.entity(read, self.arena, v, &fault) catch |err| {
             if (self.diag) |d| d.* = .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr };
             return err;
         };
@@ -742,7 +763,7 @@ pub const Exec = struct {
         var scratch: Diag = .{};
         const diag = self.diag orelse &scratch;
         const prepared = try self.arena.alloc(?pull_mod.Prepared, query.find.len);
-        for (query.find, prepared) |f, *p| p.* = if (f == .pull) try pull_mod.Prepared.prepare(self.arena, self.read, self.heap, self.interner, f.pull.pattern, diag) else null;
+        for (query.find, prepared) |f, *p| p.* = if (f == .pull) try pull_mod.Prepared.prepare(self.arena, self.reads[0], self.heap, self.interner, f.pull.pattern, diag) else null;
         const out = try self.arena.alloc([]const Cell, rows.len);
         for (rows, out) |row, *o| {
             const cells = try self.arena.dupe(Cell, row);
