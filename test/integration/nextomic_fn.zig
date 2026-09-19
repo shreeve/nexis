@@ -1,5 +1,6 @@
-//! test/integration/nextomic_fn.zig — transaction functions and
-//! `:db.fn/cas` through the shared fixture (NEXTOMIC.md §3).
+//! test/integration/nextomic_fn.zig — transaction functions,
+//! `:db.fn/cas` and schema alteration through the shared fixture
+//! (NEXTOMIC.md §3).
 //!
 //! Tx-data is read from source text, the functions a `:db.fn/call`
 //! names live in `nextomic_fx.zig`, and every case checks the report's
@@ -93,4 +94,68 @@ test "cas swaps on a match and names the mismatch" {
     try testing.expectError(error.Cas, fx.transactFn(try std.fmt.allocPrint(a, "[[:db.fn/cas {d} :person/age 31 33] [:db.fn/cas {d} :person/age 31 34]]", .{ ann, ann }), &fault));
     try testing.expectEqual(@as(u64, r2.t), (try fx.db()).basis);
     _ = boot;
+}
+
+test "a renamed attribute answers to its new ident in every view and query" {
+    const fx = try Fx.init("fn_rename");
+    defer fx.deinit();
+    const ann = try loadPeople(fx);
+    const a = fx.arena();
+    const before = try fx.db();
+
+    const r = try fx.transact("[[:db/add :person/name :db/ident :person/full-name]]");
+    try testing.expectEqual(@as(usize, 0), facts(r).len);
+    const after = try fx.db();
+    const eid = try std.fmt.allocPrint(a, "{d}", .{ann});
+    // pull and q spell the new name; the old one is unknown.
+    const pulled = try fx.pullSrc(after, "[:person/full-name]", eid);
+    try testing.expectEqualStrings("Ann", @import("string").asBytes((try fx.getName(pulled, "person/full-name")).?));
+    const old_view = try fx.pullSrc(before, "[*]", eid);
+    try testing.expect((try fx.getName(old_view, "person/full-name")) != null);
+    try testing.expect((try fx.getName(old_view, "person/name")) == null);
+    const rows = try fx.q(after, "[:find ?n :where [?e :person/full-name ?n]]");
+    try testing.expectEqual(@as(usize, 1), @import("champ").setCount(rows));
+    try testing.expectError(error.UnknownAttribute, fx.q(after, "[:find ?n :where [?e :person/name ?n]]"));
+    try testing.expectError(error.UnknownAttribute, fx.transact("[[:db/add \"x\" :person/name \"X\"]]"));
+    // The txlog entry written under the old name decodes.
+    const entries = try nextomic.db.txRange(fx.conn(), a, 2, 3);
+    try testing.expect(entries[0].datoms.len > 0);
+}
+
+test "cardinality changes apply from the next transaction and keep their history" {
+    const fx = try Fx.init("fn_card");
+    defer fx.deinit();
+    const ann = try loadPeople(fx);
+    const a = fx.arena();
+    const eid = try std.fmt.allocPrint(a, "{d}", .{ann});
+    var fault: Fault = .{};
+
+    const one = try fx.db();
+    _ = try fx.transact("[[:db/add :person/name :db/cardinality :db.cardinality/many]]");
+    _ = try fx.transact(try std.fmt.allocPrint(a, "[[:db/add {d} :person/name \"Annie\"]]", .{ann}));
+    const many = try fx.db();
+    const both = try fx.pullSrc(many, "[:person/name]", eid);
+    try testing.expectEqual(@as(usize, 2), @import("vector").count((try fx.getName(both, "person/name")).?));
+    // The basis before the change still reads a scalar.
+    const single = try fx.pullSrc(one, "[:person/name]", eid);
+    try testing.expectEqualStrings("Ann", @import("string").asBytes((try fx.getName(single, "person/name")).?));
+    const single_as_of = try fx.pullSrc(many.asOf(one.basis), "[:person/name]", eid);
+    try testing.expectEqualStrings("Ann", @import("string").asBytes((try fx.getName(single_as_of, "person/name")).?));
+
+    // Back to one: refused while two values stand, then allowed.
+    try testing.expectError(error.Schema, fx.transactFn("[[:db/add :person/name :db/cardinality :db.cardinality/one]]", &fault));
+    try testing.expectEqual(@as(?u64, ann), fault.e);
+    _ = try fx.transact(try std.fmt.allocPrint(a, "[[:db/retract {d} :person/name \"Ann\"] [:db/add :person/name :db/cardinality :db.cardinality/one]]", .{ann}));
+    const back = try fx.db();
+    const name = blk: {
+        const txn = try fx.conn().store.beginRead();
+        defer txn.abort();
+        break :blk (try fx.conn().idents.idOfName(txn, "person/name")).?;
+    };
+    try testing.expect(!(try back.attr(name)).?.many());
+    try testing.expect((try many.attr(name)).?.many());
+    const now = try fx.pullSrc(back, "[:person/name]", eid);
+    try testing.expectEqualStrings("Annie", @import("string").asBytes((try fx.getName(now, "person/name")).?));
+    const then = try fx.pullSrc(many.asOf(many.basis), "[:person/name]", eid);
+    try testing.expectEqual(@as(usize, 2), @import("vector").count((try fx.getName(then, "person/name")).?));
 }

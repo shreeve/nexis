@@ -47,4 +47,19 @@ ok a call inside with is speculative
 {:error :nextomic/conflict, :e 4294967298, :a :person/height}
 ok cas against an absent attribute
 {:error :nextomic/cas, :attr :person/height, :expected nil, :actual 1.8}
+[]
+[nil 22 :person/full-name]
+Bob
+ok the old name is gone from every view
+ok tx-range decodes the entries written under the old name
+{:error :nextomic/unknown-attribute, :attr :person/name}
+{:error :nextomic/tx-data, :message a retired ident name is never reused}
+{:error :nextomic/conflict, :e 22, :a :db/ident}
+#{Bob Robert}
+Bob
+{:error :nextomic/schema, :message an entity holds two values; cardinality stays many, :e 4294967298, :attr :person/full-name}
+:db.cardinality/one
+Robert
+{:error :nextomic/schema, :message a unique attribute is cardinality one, :attr :person/email}
+{:error :nextomic/conflict, :e 24, :a :db/valueType}
 :basics-done

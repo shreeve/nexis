@@ -375,8 +375,20 @@ pub const Store = struct {
     // ── idents ────────────────────────────────────────────────────
 
     pub fn identIdByName(self: *Store, txn: *Txn, name: []const u8) !?u32 {
+        return self.identIdUnder(txn, ident_live, name);
+    }
+
+    /// The id a retired name (`[0x02][text]`) once named, or null. Read
+    /// by the txlog decoder, whose entries spell keywords by the name
+    /// they had when written, and by the minter, which never reuses a
+    /// retired name.
+    pub fn retiredIdentId(self: *Store, txn: *Txn, name: []const u8) !?u32 {
+        return self.identIdUnder(txn, ident_retired, name);
+    }
+
+    fn identIdUnder(self: *Store, txn: *Txn, prefix: u8, name: []const u8) !?u32 {
         var buf: [256]u8 = undefined;
-        const k = try identNameKey(&buf, self.allocator, name);
+        const k = try identNameKey(&buf, self.allocator, prefix, name);
         defer if (k.len > buf.len) self.allocator.free(k);
         const raw = (try txn.getFromTree(self.trees.idents, k)) orelse return null;
         if (raw.len != key.attr_len) return error.Corrupted;
@@ -393,22 +405,64 @@ pub const Store = struct {
     /// Write both directions of an ident mapping.
     pub fn putIdent(self: *Store, txn: *Txn, name: []const u8, id: u32) !void {
         var buf: [256]u8 = undefined;
-        const k = try identNameKey(&buf, self.allocator, name);
+        const k = try identNameKey(&buf, self.allocator, ident_live, name);
         defer if (k.len > buf.len) self.allocator.free(k);
         var idb: [key.attr_len]u8 = undefined;
         key.writeAttr(&idb, id);
         try txn.putInTree(self.trees.idents, k, &idb);
         var rk: [1 + key.attr_len]u8 = undefined;
-        rk[0] = 0x01;
+        rk[0] = ident_by_id;
         key.writeAttr(rk[1..], id);
         try txn.putInTree(self.trees.idents, &rk, name);
     }
 
-    fn identNameKey(buf: []u8, gpa: Allocator, name: []const u8) ![]u8 {
+    /// Give ident `id` the name `new`: its old name moves from the live
+    /// names to the retired ones, where it stays reserved, and `new`
+    /// maps both ways. Bumps the ident generation so every cache
+    /// reloads.
+    pub fn renameIdent(self: *Store, txn: *Txn, id: u32, new: []const u8) !void {
+        const old = (try self.identNameById(txn, id)) orelse return error.Corrupted;
+        const old_copy = try self.allocator.dupe(u8, old);
+        defer self.allocator.free(old_copy);
+        var buf: [256]u8 = undefined;
+        const live = try identNameKey(&buf, self.allocator, ident_live, old_copy);
+        defer if (live.len > buf.len) self.allocator.free(live);
+        _ = try txn.delFromTree(self.trees.idents, live);
+        var rbuf: [256]u8 = undefined;
+        const retired = try identNameKey(&rbuf, self.allocator, ident_retired, old_copy);
+        defer if (retired.len > rbuf.len) self.allocator.free(retired);
+        var idb: [key.attr_len]u8 = undefined;
+        key.writeAttr(&idb, id);
+        try txn.putInTree(self.trees.idents, retired, &idb);
+        try self.putIdent(txn, new, id);
+        try self.writeIdentGen(txn, (try self.readIdentGen(txn)) + 1);
+    }
+
+    /// Key prefixes of `nx/idents`: live name → id, id → name, retired
+    /// name → id.
+    const ident_live: u8 = 0x00;
+    const ident_by_id: u8 = 0x01;
+    const ident_retired: u8 = 0x02;
+
+    fn identNameKey(buf: []u8, gpa: Allocator, prefix: u8, name: []const u8) ![]u8 {
         const k = if (name.len + 1 <= buf.len) buf[0 .. name.len + 1] else try gpa.alloc(u8, name.len + 1);
-        k[0] = 0x00;
+        k[0] = prefix;
         @memcpy(k[1..], name);
         return k;
+    }
+
+    /// The ident generation: bumped by every rename, so a cache that
+    /// remembers the generation it loaded at knows when a name it holds
+    /// may have moved. Absent in a store with no renames, which reads
+    /// as 0.
+    pub fn readIdentGen(self: *Store, txn: *Txn) !u64 {
+        const raw = (try self.sysGet(txn, "ig")) orelse return 0;
+        if (raw.len != 8) return error.Corrupted;
+        return std.mem.readInt(u64, raw[0..8], .big);
+    }
+
+    fn writeIdentGen(self: *Store, txn: *Txn, gen: u64) !void {
+        try self.sysPutInt(txn, "ig", 8, gen);
     }
 
     // ── txlog ─────────────────────────────────────────────────────
@@ -924,6 +978,28 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     const only = cur.next().?;
     try testing.expectEqual(@as(u32, 101), (try key.unpackKey(.eavt, false, only.key)).a);
     try testing.expect(cur.next() == null);
+}
+
+test "renaming an ident retires the old name and bumps the generation" {
+    var td = try TestDir.init("store_rename");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    {
+        const txn = try store.beginWrite(.none);
+        try testing.expectEqual(@as(u64, 0), try store.readIdentGen(txn));
+        try store.putIdent(txn, "user/email", 22);
+        try store.renameIdent(txn, 22, "user/mail");
+        try txn.commit();
+    }
+    const txn = try store.beginRead();
+    defer txn.abort();
+    try testing.expect((try store.identIdByName(txn, "user/email")) == null);
+    try testing.expectEqual(@as(?u32, 22), try store.retiredIdentId(txn, "user/email"));
+    try testing.expectEqual(@as(?u32, 22), try store.identIdByName(txn, "user/mail"));
+    try testing.expect((try store.retiredIdentId(txn, "user/mail")) == null);
+    try testing.expectEqualStrings("user/mail", (try store.identNameById(txn, 22)).?);
+    try testing.expectEqual(@as(u64, 1), try store.readIdentGen(txn));
 }
 
 test "long ident names use the heap path" {

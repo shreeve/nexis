@@ -4,11 +4,13 @@
 //! Invariants:
 //!   - An entity in the attribute partition is an attribute iff it has a
 //!     `:db/valueType`; its entity id is its attribute id.
-//!   - Schema is additive: value type and cardinality never change once
-//!     written; `:db/index` and `:db/unique` can only be added. So a
-//!     Schema built at basis B is a superset of every earlier basis, and
-//!     `attrAt(a, b)` for `b < B` masks the AVET flags that arrived after
-//!     `b` and hides attributes created after `b`.
+//!   - Value type never changes once written; `:db/index` and
+//!     `:db/unique` can only be added; `:db/cardinality` may change, and
+//!     an attribute whose cardinality ever changed carries the whole
+//!     timeline of its assertions. So a Schema built at basis B answers
+//!     every earlier basis: `attrAt(a, b)` for `b < B` hides attributes
+//!     created after `b`, masks the AVET flags that arrived after `b`,
+//!     and reads the cardinality in force at `b` off the timeline.
 //!   - `count` is the number of current AEVT entries of the attribute at
 //!     the transaction the schema was built in; it is a planner estimate.
 
@@ -26,6 +28,9 @@ const boot = store_mod.boot;
 pub const Cardinality = enum { one, many };
 pub const Unique = enum { none, identity, value };
 
+/// One `:db/cardinality` assertion: the cardinality from `t` on.
+pub const CardAt = struct { t: u64, cardinality: Cardinality };
+
 pub const Attr = struct {
     id: u32,
     value_type: ValueType,
@@ -38,6 +43,12 @@ pub const Attr = struct {
     /// `t` from which AVET carries the attribute (the first assertion of
     /// `:db/index true` or `:db/unique`); 0 when it never did.
     avet_since: u64 = 0,
+    /// `t` of the `:db/cardinality` assertion in force.
+    card_t: u64 = 0,
+    /// Every `:db/cardinality` assertion up to the schema's basis, in
+    /// `t` order, for an attribute whose cardinality has changed; empty
+    /// when it never did.
+    card_changes: []const CardAt = &.{},
     /// Current AEVT entries when the schema was built.
     count: u64 = 0,
 
@@ -89,8 +100,39 @@ pub const Schema = struct {
         try acc.flush(self, arena);
 
         var it = self.attrs.valueIterator();
-        while (it.next()) |a| a.count = try store.attrCount(txn, a.id);
+        while (it.next()) |a| {
+            a.count = try store.attrCount(txn, a.id);
+            if (a.card_t != a.since) a.card_changes = try cardTimeline(arena, store, txn, a.id, basis);
+        }
         return self;
+    }
+
+    /// The `:db/cardinality` assertions of attribute `a` with `t <=
+    /// basis`, from the history tree, in `t` order.
+    fn cardTimeline(arena: Allocator, store: *Store, txn: *Txn, a: u32, basis: u64) ![]const CardAt {
+        var out: std.ArrayList(CardAt) = .empty;
+        const prefix = try key.prefixBytes(arena, .eavt, .{ .e = a, .a = boot.cardinality });
+        var s = try Store.scan(txn, store.trees.hist(.eavt), prefix);
+        while (s.next()) |kv| {
+            const parts = try key.unpackKey(.eavt, true, kv.key);
+            const top = parts.top.?;
+            if (!top.added or top.t > basis) continue;
+            const kv2 = try key.decodeVal(arena, parts.v);
+            if (kv2 != .val or kv2.val != .keyword) return error.Corrupted;
+            const c: Cardinality = switch (kv2.val.keyword) {
+                boot.card_one => .one,
+                boot.card_many => .many,
+                else => return error.Corrupted,
+            };
+            try out.append(arena, .{ .t = top.t, .cardinality = c });
+        }
+        // The tree orders by value before `top`; the timeline is by `t`.
+        std.mem.sort(CardAt, out.items, {}, struct {
+            fn lt(_: void, x: CardAt, y: CardAt) bool {
+                return x.t < y.t;
+            }
+        }.lt);
+        return out.toOwnedSlice(arena);
     }
 
     pub fn deinit(self: *Schema) void {
@@ -107,7 +149,7 @@ pub const Schema = struct {
 
     /// The attribute as it was at basis `at <= self.basis`: absent when
     /// it did not exist yet, with AVET flags cleared when they arrived
-    /// after `at`.
+    /// after `at`, and the cardinality in force at `at`.
     pub fn attrAt(self: *const Schema, a: u32, at: u64) ?Attr {
         const p = self.attrs.getPtr(a) orelse return null;
         if (p.since > at) return null;
@@ -116,6 +158,11 @@ pub const Schema = struct {
             copy.indexed = false;
             copy.unique = .none;
             copy.avet_since = 0;
+        }
+        for (copy.card_changes) |c| {
+            if (c.t > at) break;
+            copy.cardinality = c.cardinality;
+            copy.card_t = c.t;
         }
         return copy;
     }
@@ -131,6 +178,7 @@ pub const Schema = struct {
         value_type: ?ValueType = null,
         type_t: u64 = 0,
         cardinality: Cardinality = .one,
+        card_t: u64 = 0,
         unique: Unique = .none,
         unique_t: u64 = 0,
         indexed: bool = false,
@@ -157,6 +205,7 @@ pub const Schema = struct {
                         boot.card_many => .many,
                         else => return error.Corrupted,
                     };
+                    self.card_t = t;
                 },
                 boot.unique => {
                     if (kv != .val or kv.val != .keyword) return error.Corrupted;
@@ -195,6 +244,7 @@ pub const Schema = struct {
                 .component = self.component,
                 .since = self.type_t,
                 .avet_since = avet_since,
+                .card_t = self.card_t,
             });
         }
     };
@@ -237,6 +287,58 @@ test "bootstrap schema has the eight attributes with their shapes" {
         try testing.expect(schema.attrAt(boot.ident, 0) == null);
         try testing.expect(schema.attrAt(boot.ident, 1) != null);
     }
+}
+
+test "a cardinality change carries its timeline for every basis" {
+    var td = try store_mod.TestDir.init("schema_card");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Attribute 22: string, card-one at t=2; many at t=3; one again at t=5.
+    const a: u32 = 22;
+    {
+        const txn = try store.beginWrite(.none);
+        const vt = try key.valBytes(arena, .{ .keyword = boot.type_string });
+        const c1 = try key.valBytes(arena, .{ .keyword = boot.card_one });
+        const cm = try key.valBytes(arena, .{ .keyword = boot.card_many });
+        try store.writeBatch(txn, 2, &.{
+            .{ .e = a, .a = boot.value_type, .vbytes = vt, .added = true, .avet = false, .vaet = false },
+            .{ .e = a, .a = boot.cardinality, .vbytes = c1, .added = true, .avet = false, .vaet = false },
+        }, arena);
+        try store.writeBatch(txn, 3, &.{
+            .{ .e = a, .a = boot.cardinality, .vbytes = c1, .added = false, .avet = false, .vaet = false },
+            .{ .e = a, .a = boot.cardinality, .vbytes = cm, .added = true, .avet = false, .vaet = false },
+        }, arena);
+        try store.writeBatch(txn, 5, &.{
+            .{ .e = a, .a = boot.cardinality, .vbytes = cm, .added = false, .avet = false, .vaet = false },
+            .{ .e = a, .a = boot.cardinality, .vbytes = c1, .added = true, .avet = false, .vaet = false },
+        }, arena);
+        try store.writeT(txn, 5);
+        try txn.commit();
+    }
+    const txn = try store.beginRead();
+    defer txn.abort();
+    const schema = try Schema.build(testing.allocator, store, txn, 5, 5);
+    defer schema.deinit();
+    const full = schema.attr(a).?;
+    try testing.expectEqual(Cardinality.one, full.cardinality);
+    try testing.expectEqual(@as(u64, 5), full.card_t);
+    try testing.expectEqual(@as(usize, 3), full.card_changes.len);
+    try testing.expectEqual(Cardinality.one, schema.attrAt(a, 2).?.cardinality);
+    try testing.expectEqual(Cardinality.many, schema.attrAt(a, 3).?.cardinality);
+    try testing.expectEqual(Cardinality.many, schema.attrAt(a, 4).?.cardinality);
+    try testing.expectEqual(Cardinality.one, schema.attrAt(a, 5).?.cardinality);
+    // A history build at basis 4 stops its timeline there.
+    const at4 = try Schema.build(testing.allocator, store, txn, 4, 5);
+    defer at4.deinit();
+    try testing.expectEqual(Cardinality.many, at4.attr(a).?.cardinality);
+    try testing.expectEqual(@as(usize, 2), at4.attr(a).?.card_changes.len);
+    // An attribute whose cardinality never changed carries no timeline.
+    try testing.expectEqual(@as(usize, 0), schema.attr(boot.ident).?.card_changes.len);
 }
 
 test "attrAt masks flags that arrived after the asked basis" {

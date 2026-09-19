@@ -57,8 +57,8 @@ not thread-safe; nothing else is).
 | `nx/avet-h` | `[a:4][v][e:6][top:6]` | empty (indexed and unique attrs only) |
 | `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
 | `nx/txlog` | `[t:6]` | codec vector `[instant [e a v added] ...]` |
-| `nx/idents` | `[0x00][utf8 text]` → id, `[0x01][id:4]` → text | |
-| `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"` | see §2.3 |
+| `nx/idents` | `[0x00][utf8 text]` → id, `[0x01][id:4]` → text, `[0x02][utf8 text]` → id for a name a rename retired | |
+| `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"` | see §2.3 |
 
 `top` = `(t << 1) | added`. `v` is always followed only by fixed-width
 fields, so it is `key[prefix .. len - suffix]` with no length byte.
@@ -80,7 +80,12 @@ or an engine-level rollback can never leave `t` ahead of the data.
 
 Keyword *values* (enums) are interned in `nx/idents` exactly like
 attributes and stored as 4-byte ids, so `:db/ident` refs and enum values
-are the same mechanism. They sort by id, not by text.
+are the same mechanism. They sort by id, not by text. An ident's text
+is a property of its id, not a datom value: renaming an ident (§3 step
+5) changes what every view, past or present, prints for that id, and
+leaves no datom behind. The old text moves to the retired names, which
+only the txlog decoder reads (an entry spells keywords by the names
+they had when it was written) and which are never minted again.
 
 ### 2.2 Sortable value encoding
 
@@ -133,6 +138,7 @@ bytes, inside emdb's 256-byte search-clue buffer.
 | `"t"` | u48 last committed logical transaction number |
 | `"eid"` | u48 next user entity id |
 | `"aid"` | u32 next attribute / ident id |
+| `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once |
 
 ### 2.4 Bootstrap
 
@@ -203,14 +209,36 @@ so there is no queue; emdb's write lock is the transactor.
    `"datomic.tx"` itself: that instant stands, in the datom and in the
    txlog entry.
 5. **Schema**: schema changes are ordinary assertions on attribute
-   entities, checked here. A new attribute needs `:db/valueType` and
-   `:db/cardinality`, and neither changes once written
-   (`:nextomic/conflict`); `:db/index` and `:db/unique` may be added,
-   and the transaction that adds them backfills AVET from AEVT (an
-   attribute becoming unique while two entities hold one value is
-   `:nextomic/unique`). A unique attribute identifies one entity by one
-   value, so it is cardinality one: `:db/unique` on a card-many
-   attribute is `:nextomic/tx-data`.
+   entities, checked here, and take effect for the transactions after
+   the one that makes them (the data of the same transaction is
+   expanded under the schema it began with). A new attribute needs
+   `:db/valueType` and `:db/cardinality`. What may change afterwards:
+   - `:db/valueType` never (`:nextomic/conflict`).
+   - `:db/cardinality`: one → many always; many → one while no entity
+     holds two values, in the tree or in the transaction, otherwise
+     `:nextomic/schema` naming the attribute and an entity. The
+     cardinality in force at each basis is kept (§4), so an as-of view
+     reads sets or scalars as its time saw them.
+   - `:db/index` and `:db/unique` may be added, never retracted
+     (`:nextomic/conflict`), and the transaction that adds them
+     backfills AVET from AEVT (an attribute becoming unique while two
+     entities hold one value is `:nextomic/unique`). A unique attribute
+     identifies one entity by one value, so it is cardinality one:
+     `:db/unique` on a card-many attribute is `:nextomic/tx-data`, and
+     a unique attribute becoming card-many `:nextomic/schema`.
+   - `:db/ident` on an attribute or ident entity renames it, provided
+     the new keyword names nothing (`:nextomic/conflict` when it names
+     another entity; asserting the entity's own ident is a no-op). The
+     new ident wins everywhere and the old one is retired: the entity
+     resolves by the new keyword alone, `ident`, `schema`, `entity`,
+     `pull` and query results spell it the new way in every view, and
+     the old keyword is `:nextomic/unknown-attribute` as an attribute,
+     nil as an ident, and never minted again (`:nextomic/tx-data` when
+     tx-data tries). The ident's id, its datoms and its keyword values
+     are untouched, so the rename writes no datom; the transaction's
+     entry holds only its `:db/txInstant`. An ident on a user-partition
+     entity is `:nextomic/conflict`.
+   - `:db/doc` and `:db/isComponent` are ordinary card-one attributes.
 6. **Write**: for each assertion, put into the current trees (value
    `[t]`, plus the payload in `nx/eavt` for out-of-line values) and
    append `[.. top]` with `added = 1` to the history trees; for each
@@ -299,9 +327,13 @@ prefix; consecutive keys with equal `(e a v)` form a group in ascending
 emit the group's newest kept datom iff its `added` is 1.
 
 **Schema as-of.** `Schema` is built from the attribute partition's
-datoms with `t ≤ basis`, cached per `(store, basis)`; since schema is
-additive, a cache built at a later basis is a superset and may serve an
-earlier one for attributes that existed then.
+datoms with `t ≤ basis`, cached per `(store, basis)`; a cache built at
+a later basis serves an earlier one: attributes created after it are
+hidden, `:db/index` and `:db/unique` that arrived after it are masked,
+and an attribute whose cardinality has changed carries the timeline of
+its `:db/cardinality` assertions, read from the history tree, so the
+cardinality in force at the earlier basis is what `entity`, `pull` and
+the planner see.
 
 The txlog is the change feed: `(d/tx-range conn from to)` scans
 `nx/txlog` over `from ≤ t < to`; a bound that is `nil` or not given is
@@ -472,7 +504,8 @@ are values, equal when they name the same connection, basis and mode.
 
 Schema install is `transact!` of attribute entities: `{:db/ident
 :user/email :db/valueType :db.type/string :db/cardinality
-:db.cardinality/one :db/unique :db.unique/identity :db/index true}`.
+:db.cardinality/one :db/unique :db.unique/identity :db/index true}`;
+what a later transaction may change is §3 step 5.
 
 Later: excision, lazy entities, full-text, a datom heap kind.
 
@@ -488,7 +521,8 @@ All errors are keywords in the `nextomic` namespace and are catchable:
 the connection is in flight), `:nextomic/tx-data` for malformed
 tx-data, a lookup ref on a non-unique attribute, a nested map nothing
 could reach, or a unique card-many attribute, `:nextomic/history-view`
-(`entity` or `pull` on a history db), `:nextomic/nested`
+(`entity` or `pull` on a history db), `:nextomic/schema` (a schema
+change the attribute's data refuses), `:nextomic/nested`
 (`transact!` or `with` while a `with` holds the write transaction, or
 inside a transaction function), `:nextomic/tx-fn` (a transaction
 function that cannot run) and `:nextomic/cas` (a `:db.fn/cas` whose
@@ -507,6 +541,7 @@ keyword. The shapes:
 | `:nextomic/no-entity` | bare |
 | `:nextomic/tx-data` | `:message`; `:attr` when an attribute is at fault |
 | `:nextomic/tx-fn` | `:message`: the unbound symbol, or the depth limit |
+| `:nextomic/schema` | `:message` and `:attr`; `:e`, the entity holding two values, when one refuses many → one |
 | `:nextomic/cas` | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
 | `:nextomic/query-syntax` | `:message`; `:clause`, the index into `:where`, when the parser or planner was inside a clause (an unbound function name is reported the same way at run time). A scoping refusal names what is wrong: the variable an `or` branch mentions and another does not, the join variable an `or-join` branch leaves unbound, the variable a `not` body has that nothing outside binds, the argument or function-position variable no clause ever binds |
 | `:nextomic/pull-syntax` | `:message`; `:clause`, the index of the spec in the pattern (from `pull`, `pull-many` or a `(pull ?e pattern)` find element) |

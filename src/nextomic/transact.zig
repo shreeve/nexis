@@ -75,6 +75,8 @@ pub const Error = error{
     /// A `:db.fn/cas` found a value other than the one it expected:
     /// `:nextomic/cas`.
     Cas,
+    /// A schema change the attribute's data refuses: `:nextomic/schema`.
+    Schema,
 };
 
 /// How deep `:db.fn/call` results may nest further calls.
@@ -301,6 +303,11 @@ const PVal = union(enum) {
     val: Val,
     tempid: u32,
     lookup: *const Lookup,
+    /// A `:db/ident` value by VM keyword id, settled by `bindIdents`:
+    /// the keyword may name the entity already, be fresh (minted for a
+    /// new entity, or renaming an attribute entity), or belong to
+    /// another entity (a conflict).
+    ident: u32,
 };
 
 /// `[:db.fn/cas e a old new]`: assert `new` when the current value of
@@ -445,6 +452,22 @@ const Ctx = struct {
     fn cas(self: *Ctx, attr: Attr, expected: ?Val, actual: ?Val) error{Cas} {
         if (self.fault) |f| f.* = .{ .attr = self.attrValue(attr.id), .cas = .{ .expected = expected, .actual = actual } };
         return error.Cas;
+    }
+
+    /// `Schema`: the change to attribute `a` is refused for `message`,
+    /// by entity `e` when one is at fault.
+    fn schemaRefused(self: *Ctx, a: u32, e: ?u64, message: []const u8) error{Schema} {
+        if (self.fault) |f| f.* = .{ .attr = self.attrValue(a), .e = e, .message = message };
+        return error.Schema;
+    }
+
+    /// The ident id of keyword `k`, minted when new; a name retired by
+    /// a rename is malformed tx-data.
+    fn mintKeyword(self: *Ctx, k: u32) !u32 {
+        return self.minter.resolve(k) catch |err| switch (err) {
+            error.RetiredIdent => self.malformed("a retired ident name is never reused"),
+            else => err,
+        };
     }
 
     /// The attribute as a program names it: its ident, else its id.
@@ -595,7 +618,8 @@ const Ctx = struct {
             },
             .keyword => |k| {
                 if (attr.value_type != .keyword) return error.ValueType;
-                return .{ .val = .{ .keyword = try self.minter.resolve(k) } };
+                if (attr.id == boot.ident) return .{ .ident = k };
+                return .{ .val = .{ .keyword = try self.mintKeyword(k) } };
             },
             .vm => |x| return self.valueFromVm(attr, x),
         }
@@ -867,7 +891,8 @@ const Ctx = struct {
             },
             .keyword => {
                 if (v.kind() != .keyword) return error.ValueType;
-                return .{ .val = .{ .keyword = try self.minter.resolve(v.asKeywordId()) } };
+                if (attr.id == boot.ident) return .{ .ident = v.asKeywordId() };
+                return .{ .val = .{ .keyword = try self.mintKeyword(v.asKeywordId()) } };
             },
             .ref => {
                 const e = self.entityFromVm(v) catch |err| switch (err) {
@@ -906,6 +931,7 @@ const Ctx = struct {
     /// the write transaction open with the datoms, txlog and counters
     /// written.
     fn apply(self: *Ctx) !void {
+        try self.bindIdents();
         try self.bindTempids();
         try self.expandAll();
         try self.txInstant();
@@ -945,6 +971,61 @@ const Ctx = struct {
             .tempids = tempids,
             .tx_data = self.tx_data,
         };
+    }
+
+    // ── idents ────────────────────────────────────────────────────
+
+    /// Settle every `:db/ident` value (NEXTOMIC.md §3 step 5). An
+    /// assertion on a tempid mints the keyword when it is new, and the
+    /// tempid takes the ident's id. On an entity that exists: a keyword
+    /// naming it already is a no-op, one naming another entity a
+    /// conflict, and a fresh keyword on an attribute-partition entity
+    /// renames it, retiring the old name. A retraction resolves the
+    /// keyword as any value.
+    fn bindIdents(self: *Ctx) !void {
+        for (self.ops.items) |*op| {
+            const slot: *PVal = switch (op.*) {
+                .add => |*o| if (o.attr.id == boot.ident) &o.v else continue,
+                .retract => |*o| if (o.attr.id == boot.ident) &o.v else continue,
+                .cas => |c| blk: {
+                    const mutable: *CasOp = @constCast(c);
+                    if (mutable.old) |*old| if (old.* == .ident) {
+                        old.* = .{ .val = .{ .keyword = try self.mintKeyword(old.ident) } };
+                    };
+                    break :blk &mutable.new;
+                },
+                else => continue,
+            };
+            if (slot.* != .ident) continue;
+            const k = slot.ident;
+            if (op.* != .add) {
+                slot.* = .{ .val = .{ .keyword = try self.mintKeyword(k) } };
+                continue;
+            }
+            const existing = try self.minter.lookup(k);
+            const e: ?u64 = switch (op.add.e) {
+                .eid => |id| id,
+                .tempid => null,
+                .lookup => |l| blk: {
+                    const vb = try key.valBytes(self.arena, l.v);
+                    break :blk (try self.probeAvet(l.attr.id, vb)) orelse return error.NoEntity;
+                },
+            };
+            const id: u32 = blk: {
+                const eid = e orelse break :blk existing orelse try self.mintKeyword(k);
+                if (existing) |x| {
+                    if (x != eid) return self.conflict(eid, boot.ident);
+                    break :blk x;
+                }
+                if (!key.isAttrPartition(eid)) return self.conflict(eid, boot.ident);
+                self.minter.rename(@intCast(eid), k) catch |err| switch (err) {
+                    error.RetiredIdent => return self.malformed("a retired ident name is never reused"),
+                    else => return err,
+                };
+                break :blk @intCast(eid);
+            };
+            slot.* = .{ .val = .{ .keyword = id } };
+        }
     }
 
     // ── tempids ───────────────────────────────────────────────────
@@ -990,7 +1071,7 @@ const Ctx = struct {
                         // tempid, wherever the identity is asserted.
                         if (target) |t| self.ops.items[d.op].add.v = .{ .tempid = t };
                     },
-                    .val => unreachable,
+                    .val, .ident => unreachable,
                 }
                 if (eid == null) if (target) |t| {
                     eid = self.bindings.items[self.root(t)].eid;
@@ -1092,6 +1173,7 @@ const Ctx = struct {
                 const vb = try key.valBytes(self.arena, l.v);
                 break :blk .{ .ref = (try self.findByAv(l.attr.id, vb)) orelse return error.NoEntity };
             },
+            .ident => unreachable,
         };
     }
 
@@ -1319,26 +1401,50 @@ const Ctx = struct {
 
     // ── schema ────────────────────────────────────────────────────
 
-    /// Attribute entities: a new attribute needs `:db/valueType` and
-    /// `:db/cardinality`; an existing one keeps both; adding
-    /// `:db/index` or `:db/unique` backfills AVET from AEVT.
+    /// Attribute entities (NEXTOMIC.md §3 step 5): a new attribute needs
+    /// `:db/valueType` and `:db/cardinality`; `:db/valueType` never
+    /// changes; `:db/cardinality` may go one → many, and many → one
+    /// while no entity holds two values; adding `:db/index` or
+    /// `:db/unique` backfills AVET from AEVT; none of them is retracted.
     fn applySchema(self: *Ctx) !void {
         if (!self.schema_touched) return;
         var new_attrs: std.AutoHashMapUnmanaged(u32, struct { has_type: bool = false, has_card: bool = false, many: bool = false }) = .empty;
         var backfill: std.AutoHashMapUnmanaged(u32, Attr) = .empty;
         var unique_added: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        // The card-one overwrite of `:db/cardinality` retracts the old
+        // value beside the new one; that retraction is the change, not
+        // a removal.
+        var card_changed: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        for (self.overlay.items) |p| {
+            if (key.isAttrPartition(p.e) and p.attr.id == boot.cardinality and p.added) try card_changed.put(self.arena, @intCast(p.e), {});
+        }
         for (self.overlay.items) |p| {
             if (!key.isAttrPartition(p.e)) continue;
             const a: u32 = @intCast(p.e);
             const existing = self.schema.attr(a);
             switch (p.attr.id) {
-                boot.value_type, boot.cardinality => {
-                    if (!p.added) return self.conflict(p.e, p.attr.id);
-                    if (existing != null) return self.conflict(p.e, p.attr.id);
+                boot.value_type => {
+                    if (!p.added or existing != null) return self.conflict(p.e, p.attr.id);
                     const g = try new_attrs.getOrPut(self.arena, a);
                     if (!g.found_existing) g.value_ptr.* = .{};
-                    if (p.attr.id == boot.value_type) g.value_ptr.has_type = true else g.value_ptr.has_card = true;
-                    if (p.attr.id == boot.cardinality and p.v.keyword == boot.card_many) g.value_ptr.many = true;
+                    g.value_ptr.has_type = true;
+                },
+                boot.cardinality => {
+                    const many = p.v.keyword == boot.card_many;
+                    if (!p.added) {
+                        if (card_changed.get(a) == null) return self.conflict(p.e, p.attr.id);
+                        continue;
+                    }
+                    if (existing) |ex| {
+                        if (many == ex.many()) continue;
+                        if (many and ex.unique != .none) return self.schemaRefused(a, null, "a unique attribute is cardinality one");
+                        if (!many) try self.checkSingleValued(ex.*);
+                        continue;
+                    }
+                    const g = try new_attrs.getOrPut(self.arena, a);
+                    if (!g.found_existing) g.value_ptr.* = .{};
+                    g.value_ptr.has_card = true;
+                    if (many) g.value_ptr.many = true;
                 },
                 boot.unique, boot.index => {
                     if (!p.added) return self.conflict(p.e, p.attr.id);
@@ -1363,11 +1469,34 @@ const Ctx = struct {
         // is card-one.
         var uit = unique_added.keyIterator();
         while (uit.next()) |a| {
-            const many = if (self.schema.attr(a.*)) |ex| ex.many() else new_attrs.get(a.*).?.many;
+            const many = if (self.schema.attr(a.*)) |ex| (if (card_changed.get(a.*) != null) !ex.many() else ex.many()) else new_attrs.get(a.*).?.many;
             if (many) return self.malformed("a unique attribute is cardinality one");
         }
         var bit = backfill.iterator();
         while (bit.next()) |e| try self.backfillAvet(e.value_ptr.*);
+    }
+
+    /// An attribute becoming cardinality one: no entity may hold two
+    /// values, in the tree less this transaction's retractions, or
+    /// counting its assertions.
+    fn checkSingleValued(self: *Ctx, attr: Attr) !void {
+        var rows = try self.liveRows(.aevt, .{ .a = attr.id });
+        var prev: ?u64 = null;
+        while (try rows.next()) |r| {
+            if (r.pending) |p| if (!p.added) continue;
+            if (prev) |e| if (e == r.parts.e) return self.schemaRefused(attr.id, e, "an entity holds two values; cardinality stays many");
+            prev = r.parts.e;
+        }
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (self.overlay.items) |p| {
+            if (p.attr.id != attr.id or !p.added) continue;
+            if ((try seen.getOrPut(self.arena, p.e)).found_existing) return self.schemaRefused(attr.id, p.e, "an entity holds two values; cardinality stays many");
+            var live = try self.liveRows(.eavt, .{ .e = p.e, .a = attr.id });
+            while (try live.next()) |r| {
+                if (r.pending != null) continue;
+                return self.schemaRefused(attr.id, p.e, "an entity holds two values; cardinality stays many");
+            }
+        }
     }
 
     /// An indexed attribute becoming unique: no value may be held by two
@@ -1790,7 +1919,7 @@ test "schema changes: index backfill, unique backfill refusal, immutable type" {
     try testing.expectError(error.Unique, transactOps(tc.conn, arena, &.{
         .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_value } } } },
     }, .{}));
-    // Value type and cardinality never change.
+    // Value type never changes.
     try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{
         .{ .add = .{ .e = .{ .eid = age }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_string } } } },
     }, .{}));
@@ -2919,6 +3048,128 @@ test "a held with keeps the store open until finish; a closed connection refuses
     try testing.expectError(error.Closed, w.db().entity(arena, a));
     try testing.expectError(error.Closed, transactOps(tc.conn, arena, &.{}, .{}));
     try testing.expectError(error.Closed, withOps(tc.conn, arena, &.{}, .{}));
+}
+
+test "an ident rename retires the old name; cardinality changes under the data's rule" {
+    const tc = try TestConn.init("tx_alter");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const email = try attrId(tc, "user/email");
+    const tags = try attrId(tc, "user/tags");
+    var fault: Fault = .{};
+
+    const r1 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = tags }, .v = .{ .keyword = try kw(tc, "tag/x") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = tags }, .v = .{ .keyword = try kw(tc, "tag/y") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Bob" } } } },
+    }, .{});
+    const a = r1.tempids[0].eid;
+    const b = r1.tempids[1].eid;
+
+    // Rename: no datom, the new keyword resolves, the old is retired.
+    const k_full = try kw(tc, "user/full-name");
+    const r2 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.ident }, .v = .{ .keyword = k_full } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 1), r2.tx_data.len);
+    const db2 = try tc.conn.db();
+    try testing.expectEqual(@as(?u64, name), try db2.entid(arena, .{ .ident = k_full }));
+    try testing.expect((try db2.entid(arena, .{ .ident = try kw(tc, "user/name") })) == null);
+    try testing.expectEqual(@as(?u32, k_full), try db2.ident(arena, name));
+    try testing.expectEqual(@as(?u32, k_full), try db2.asOf(r1.t).ident(arena, name));
+    try testing.expectError(error.UnknownAttribute, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .ident = try kw(tc, "user/name") }, .v = .{ .val = .{ .string = "x" } } } },
+    }, .{}));
+    // The retired name is never minted again, as an attribute or a value.
+    try testing.expectError(error.TxData, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = boot.ident }, .v = .{ .keyword = try kw(tc, "user/name") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_string } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+    }, .{}));
+    try testing.expectError(error.TxData, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = tags }, .v = .{ .keyword = try kw(tc, "user/name") } } },
+    }, .{}));
+    // A keyword naming another entity conflicts; the entity's own ident is a no-op.
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.ident }, .v = .{ .keyword = try kw(tc, "user/email") } } },
+    }, .{}));
+    const r3 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.ident }, .v = .{ .keyword = k_full } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 1), r3.tx_data.len);
+    // The txlog still decodes the entry written under the old name.
+    const entries = try db_mod.txRange(tc.conn, arena, 2, 3);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    var saw_name = false;
+    for (entries[0].datoms) |d| {
+        if (d.a == boot.ident and d.v.keyword == name) saw_name = true;
+    }
+    try testing.expect(saw_name);
+    // A second connection sees the rename through the generation.
+    {
+        const other = try Conn.open(testing.allocator, &tc.interner, tc.td.path.ptr, .{ .sync = .none });
+        defer other.destroy();
+        const odb = try other.db();
+        try testing.expectEqual(@as(?u64, name), try odb.entid(arena, .{ .ident = k_full }));
+        try testing.expect((try odb.entid(arena, .{ .ident = try kw(tc, "user/name") })) == null);
+        try testing.expectEqual(@as(?u32, k_full), try odb.ident(arena, name));
+    }
+
+    // Cardinality one → many: the attribute takes a second value; an
+    // earlier basis still reads it as card-one.
+    const r4 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_many } } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 3), r4.tx_data.len);
+    const r5 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Annie" } } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 2), r5.tx_data.len);
+    const db5 = try tc.conn.db();
+    try testing.expect((try db5.attr(name)).?.many());
+    try testing.expect(!(try db5.asOf(r1.t).attr(name)).?.many());
+    try testing.expectEqual(@as(usize, 2), (try db5.entity(arena, a))[0].vals.len);
+    try testing.expectEqual(@as(usize, 1), (try db5.asOf(r1.t).entity(arena, a))[0].vals.len);
+
+    // Many → one is refused while `a` holds two values, naming it.
+    try testing.expectError(error.Schema, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+    }, .{ .fault = &fault }));
+    try testing.expectEqual(@as(?u64, a), fault.e);
+    try testing.expectEqual(k_full, fault.attr.?.asKeywordId());
+    // Retracting in the same transaction makes room; a second value asserted in it does not.
+    try testing.expectError(error.Schema, transactOps(tc.conn, arena, &.{
+        .{ .retract = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+        .{ .add = .{ .e = .{ .eid = b }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Bobby" } } } },
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+    }, .{ .fault = &fault }));
+    try testing.expectEqual(@as(?u64, b), fault.e);
+    const r6 = try transactOps(tc.conn, arena, &.{
+        .{ .retract = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+    }, .{});
+    const db6 = try tc.conn.db();
+    try testing.expect(!(try db6.attr(name)).?.many());
+    try testing.expect((try db6.asOf(r5.t).attr(name)).?.many());
+    try testing.expectEqual(@as(usize, 3), (try db6.attr(name)).?.card_changes.len);
+    // The card-one rule applies from the next transaction on.
+    const r7 = try transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Anne" } } } },
+    }, .{});
+    try testing.expectEqual(@as(usize, 3), r7.tx_data.len);
+    _ = r6;
+    // A unique attribute stays card-one; a bare retraction of the cardinality is a conflict.
+    try testing.expectError(error.Schema, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = email }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_many } } } },
+    }, .{}));
+    try testing.expectError(error.Conflict, transactOps(tc.conn, arena, &.{
+        .{ .retract = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
+    }, .{}));
 }
 
 /// `[:db.fn/cas e a old new]` as a VM value; `old` may be nil.

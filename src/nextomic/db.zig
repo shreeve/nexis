@@ -185,6 +185,8 @@ pub const Conn = struct {
     pub fn beginReadTxn(self: *Conn) !*Txn {
         if (!self.is_open) return error.Closed;
         const txn = if (self.overlay) |w| try self.store.beginReadChild(w) else try self.store.beginRead();
+        errdefer txn.abort();
+        try self.idents.refresh(txn);
         self.busy += 1;
         return txn;
     }
@@ -199,6 +201,8 @@ pub const Conn = struct {
     pub fn beginWriteTxn(self: *Conn, sync_mode: SyncMode) !*Txn {
         if (!self.is_open) return error.Closed;
         const txn = try self.store.beginWrite(sync_mode);
+        errdefer txn.abort();
+        try self.idents.refresh(txn);
         self.busy += 1;
         return txn;
     }
@@ -609,9 +613,12 @@ const TxCtx = struct {
     txn: *Txn,
     schema: *Schema,
 
+    /// An entry spells a keyword by the name it had when written; a
+    /// name retired by a rename still decodes to its id.
     fn identId(ctx: *anyopaque, name: []const u8) anyerror!?u32 {
         const self: *TxCtx = @ptrCast(@alignCast(ctx));
-        return self.conn.idents.idOfName(self.txn, name);
+        if (try self.conn.idents.idOfName(self.txn, name)) |id| return id;
+        return self.conn.store.retiredIdentId(self.txn, name);
     }
 
     fn attrType(ctx: *anyopaque, a: u32) anyerror!?key.ValueType {
