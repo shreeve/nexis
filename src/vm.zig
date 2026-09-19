@@ -42,6 +42,7 @@ const dispatch_mod = @import("dispatch");
 const intern_mod = @import("intern");
 const protocol_mod = @import("protocol");
 const record_mod = @import("record");
+const nextomic_handle = @import("nextomic_handle");
 const Value = value_mod.Value;
 
 // =============================================================================
@@ -3957,13 +3958,17 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
 
 /// `(get coll key default)`. Maps and records look the key up,
 /// sets return the element itself when present, vectors index by
-/// fixnum, nil yields the default. Any other receiver is a
-/// `KindMismatch`.
+/// fixnum, a lazy entity reads the attribute from its view, nil
+/// yields the default. Any other receiver is a `KindMismatch`.
 pub fn lookup(coll: Value, key: Value, default: Value) VmError!Value {
     return switch (coll.kind()) {
         .nil => default,
         .persistent_map => mapLookup(coll, key, default),
         .record => mapLookup(record_mod.fieldsOf(coll), key, default),
+        // A lazy entity reads the attribute through the hook its box
+        // carries (docs/NEXTOMIC.md §6); the hook returns only errors
+        // of this set.
+        .nextomic_entity => nextomic_handle.entityLookup(coll, key, default) catch |err| return @as(VmError, @errorCast(err)),
         .persistent_set => if (champ_mod.setContains(
             coll,
             key,
@@ -4010,7 +4015,7 @@ pub fn callLookup(callee: Value, args: []const Value) VmError!Value {
     const default = if (args.len == 2) args[1] else value_mod.nilValue();
     return switch (callee.kind()) {
         .keyword => switch (args[0].kind()) {
-            .nil, .persistent_map, .record, .persistent_set, .persistent_vector => lookup(args[0], callee, default),
+            .nil, .persistent_map, .record, .persistent_set, .persistent_vector, .nextomic_entity => lookup(args[0], callee, default),
             else => default,
         },
         .persistent_map => lookup(callee, args[0], default),

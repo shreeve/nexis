@@ -490,10 +490,10 @@ pub fn build(b: *std.Build) void {
     // the same module. Its test binary is `nextomic` below.
     // -------------------------------------------------------------------------
 
-    // nextomic_handle — the heap bodies of the `nextomic_conn` and
-    // `nextomic_db` kinds. Below dispatch, format and gc so their kind
-    // arms can print, compare, hash and trace the handles without
-    // importing the module above them.
+    // nextomic_handle — the heap bodies of the `nextomic_conn`,
+    // `nextomic_db` and `nextomic_entity` kinds. Below dispatch, format,
+    // gc and vm so their kind arms can print, compare, hash, trace and
+    // look up the handles without importing the module above them.
     const nextomic_handle_mod = b.createModule(.{
         .root_source_file = b.path("src/nextomic/handle.zig"),
         .target = target,
@@ -505,6 +505,8 @@ pub fn build(b: *std.Build) void {
     dispatch_mod.addImport("nextomic_handle", nextomic_handle_mod);
     format_mod.addImport("nextomic_handle", nextomic_handle_mod);
     gc_mod.addImport("nextomic_handle", nextomic_handle_mod);
+    // `vm.lookup` reads a lazy entity through the hook its box carries.
+    vm_mod.addImport("nextomic_handle", nextomic_handle_mod);
     const nextomic_handle_tests = b.addTest(.{ .root_module = nextomic_handle_mod });
     const run_nextomic_handle_tests = b.addRunArtifact(nextomic_handle_tests);
 
@@ -725,7 +727,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dispatch", .path = "src/dispatch.zig", .imports = &.{ "value", "eq", "heap", "hash", "string", "list", "vector", "bignum", "champ", "typed_vector", "transient", "db", "atom", "record", "protocol", "nextomic_handle" } },
         .{ .name = "db", .path = "src/db.zig", .imports = &.{ "value", "heap", "intern", "hash", "codec", "string", "list", "champ", "emdb" } },
         .{ .name = "pool", .path = "src/pool.zig", .imports = &.{} },
-        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "gc", "list", "intern", "vector", "champ", "dispatch", "record", "protocol", "bignum" } },
+        .{ .name = "vm", .path = "src/vm.zig", .imports = &.{ "value", "heap", "gc", "list", "intern", "vector", "champ", "dispatch", "record", "protocol", "bignum", "nextomic_handle" } },
         // format test binary. Imports the menagerie of
         // consumer kinds; nothing depends on format itself.
         .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle", "bignum", "typed_vector" } },
