@@ -2,23 +2,21 @@
 ; wrote is there, including history and the ident cache.
 
 (require '[nextomic :as d])
-
-(defn check [label ok]
-  (println (if ok "ok" "FAIL") label)
-  (when-not ok (throw :check-failed)))
+(require '[prelude :as t])
 
 (d/with-conn [c "persist.edb"]
   (let [db (d/db c)]
-  (check "basis persisted" (= 4 (d/basis-t db)))
+  (t/check "basis persisted" (= 4 (d/basis-t db)))
   (println (dissoc (d/entity db [:city/name "Turin"]) :db/id))
   (println (dissoc (d/entity db [:city/name "Genoa"]) :db/id))
-  (check "keyword values survive a reopen" (= :calm (:city/mood (d/entity db [:city/name "Turin"]))))
-  (check "history survives a reopen"
+  (t/check "keyword values survive a reopen" (= :calm (:city/mood (d/entity db [:city/name "Turin"]))))
+  (t/check "history survives a reopen"
          (= [[850000 3 true] [850000 4 false] [870000 4 true]]
             (mapv #(vector (nth % 2) (nth % 3) (nth % 4))
                   (d/datoms (d/history db) :eavt [:city/name "Turin"] :city/population))))
-  (check "the schema survives a reopen" (= :db.unique/identity (:db/unique (get (d/schema db) :city/name))))
+  (t/check "the schema survives a reopen" (= :db.unique/identity (:db/unique (get (d/schema db) :city/name))))
   (println (mapv :t (d/tx-range c)))
   (d/transact! c [{:city/name "Bari" :city/population 320000}])
-  (check "writing continues from the persisted t" (= 5 (d/basis-t (d/db c))))
+  (t/check "writing continues from the persisted t" (= 5 (d/basis-t (d/db c))))
   (println (count (d/datoms (d/db c) :aevt :city/name)))))
+:persist-2-done

@@ -228,6 +228,51 @@ fn expectProgramError(src: []const u8, expected: anyerror) !void {
     try testing.expectError(expected, program.run(src));
 }
 
+/// A store file for one test under `.zig-cache/tmp/<unique>/`, the
+/// way `store.TestDir` scopes its files: concurrent runs never share
+/// it and `deinit` removes the directory with the store inside.
+const SeamStore = struct {
+    tmp: std.testing.TmpDir,
+    path: []u8,
+
+    fn init(name: []const u8) !SeamStore {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/{s}.edb", .{ tmp.sub_path, name });
+        return .{ .tmp = tmp, .path = path };
+    }
+
+    fn deinit(self: *SeamStore) void {
+        testing.allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+
+    /// `template` with every `@STORE@` replaced by this store's path.
+    fn source(self: *const SeamStore, template: []const u8) ![]u8 {
+        return std.mem.replaceOwned(u8, testing.allocator, template, "@STORE@", self.path);
+    }
+};
+
+/// `expectOutputProgram` for a program that opens the store named
+/// `@STORE@` in `template`; the store is private to the call and
+/// deleted afterwards.
+fn expectOutputProgramWithStore(name: []const u8, template: []const u8, expected: []const u8) !void {
+    var store = try SeamStore.init(name);
+    defer store.deinit();
+    const src = try store.source(template);
+    defer testing.allocator.free(src);
+    try expectOutputProgram(src, expected);
+}
+
+/// `expectProgramError` with the same store substitution.
+fn expectProgramErrorWithStore(name: []const u8, template: []const u8, expected: anyerror) !void {
+    var store = try SeamStore.init(name);
+    defer store.deinit();
+    const src = try store.source(template);
+    defer testing.allocator.free(src);
+    try expectProgramError(src, expected);
+}
+
 /// Run `src` end-to-end and assert the printed output equals
 /// `expected`. Wraps multiple top-level forms in an implicit do
 /// so callers can write multi-form programs naturally.
@@ -1685,13 +1730,10 @@ test "phase5.2a end-to-end DB persistence of a string value (peer-AI turn 78 §R
     // Direct test that string literals survive the entire
     // compile → durable codec → emdb → decode → user path. The
     // todo-app demo uses keyword values; this test pins the
-    // string Value codec round-trip explicitly. The /tmp file
-    // is overwritten by the with-tx put on every run, so no
-    // explicit cleanup is needed (and Zig 0.16's std.Io.Dir
-    // file ops would add unnecessary boilerplate here).
-    try expectOutputProgram(
+    // string Value codec round-trip explicitly.
+    try expectOutputProgramWithStore("strings",
         \\(do
-        \\  (def conn (db/open "/tmp/nexis-phase5-2a-strings.edb"))
+        \\  (def conn (db/open "@STORE@"))
         \\  (def r   (db/ref conn :strings "k"))
         \\  (with-tx [tx conn] (db/put! tx r "hello-utf8-é-🦀"))
         \\  (with-read-tx [tx conn] (db/get tx r)))
@@ -1699,9 +1741,9 @@ test "phase5.2a end-to-end DB persistence of a string value (peer-AI turn 78 §R
 }
 
 test "db/scan seeks to the start bound and stops before the end bound" {
-    try expectOutputProgram(
+    try expectOutputProgramWithStore("seam-scan-range",
         \\(do
-        \\  (def conn (db/open "/tmp/nexis-seam-scan-range.edb"))
+        \\  (def conn (db/open "@STORE@"))
         \\  (with-tx [tx conn]
         \\    (db/put! tx (db/ref conn :range :a) 1)
         \\    (db/put! tx (db/ref conn :range :b) 2)
@@ -1718,9 +1760,9 @@ test "db/scan seeks to the start bound and stops before the end bound" {
 
 test "storage failures surface as :db/<reason> keywords inside try" {
     // 8192-byte key: past the key bound of a 16 KiB page.
-    try expectOutputProgram(
+    try expectOutputProgramWithStore("seam-errors",
         \\(do
-        \\  (def conn (db/open "/tmp/nexis-seam-errors.edb"))
+        \\  (def conn (db/open "@STORE@"))
         \\  (def long-key (loop [s "k" n 0] (if (< n 13) (recur (str s s) (inc n)) s)))
         \\  [(try (with-tx [tx conn] (db/put! tx (db/ref conn :t long-key) 1))
         \\        (catch any e e))
@@ -1732,9 +1774,9 @@ test "storage failures surface as :db/<reason> keywords inside try" {
 }
 
 test "the VM keeps running after a caught storage failure" {
-    try expectOutputProgram(
+    try expectOutputProgramWithStore("seam-errors-resume",
         \\(do
-        \\  (def conn (db/open "/tmp/nexis-seam-errors-resume.edb"))
+        \\  (def conn (db/open "@STORE@"))
         \\  (def long-key (loop [s "k" n 0] (if (< n 13) (recur (str s s) (inc n)) s)))
         \\  (with-tx [tx conn] (db/put! tx (db/ref conn :t :k) 41))
         \\  (def caught (try (with-tx [tx conn] (db/put! tx (db/ref conn :t long-key) 1))
@@ -1744,9 +1786,9 @@ test "the VM keeps running after a caught storage failure" {
 }
 
 test "outside try a storage failure is the raw DbError" {
-    try expectProgramError(
+    try expectProgramErrorWithStore("seam-errors-raw",
         \\(do
-        \\  (def conn (db/open "/tmp/nexis-seam-errors-raw.edb"))
+        \\  (def conn (db/open "@STORE@"))
         \\  (def long-key (loop [s "k" n 0] (if (< n 13) (recur (str s s) (inc n)) s)))
         \\  (db/put-key! (db/ref conn :t long-key) 1))
     , vm.VmError.DbError);
@@ -1756,9 +1798,9 @@ test "db/scan and db/reduce-tree read a value that spans several overflow pages"
     // 5 * 2^13 = 40960 bytes: three 16 KiB pages once encoded. A
     // cursor alone shows the first page; the natives must return
     // the whole value.
-    try expectOutputProgram(
+    try expectOutputProgramWithStore("seam-overflow",
         \\(do
-        \\  (def conn (db/open "/tmp/nexis-seam-overflow.edb"))
+        \\  (def conn (db/open "@STORE@"))
         \\  (def big (loop [s "abcde" n 0] (if (< n 13) (recur (str s s) (inc n)) s)))
         \\  (with-tx [tx conn]
         \\    (db/put! tx (db/ref conn :blobs :big) big)
@@ -2599,7 +2641,6 @@ test "phase5.2b end-to-end: case + trim + split + join chain" {
         \\  joined)
     , "hello/world/from/nexis");
 }
-
 
 // =============================================================================
 // Backing-stack extent across nested frames

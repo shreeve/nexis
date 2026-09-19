@@ -5,7 +5,13 @@
 ```bash
 zig build install                       # bin/nexis
 ./bin/nexis run examples/hello.nx
+zig build examples                      # every example through bin/nexis
 ```
+
+`zig build examples` (part of `zig build test`) runs every file below
+from a generated working directory; `durable-refs`, `todo-app` and
+`nextomic-app` run a second time in the same directory, which proves
+their second-run behavior.
 
 | File | What it shows |
 |---|---|

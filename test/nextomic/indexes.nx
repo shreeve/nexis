@@ -2,10 +2,7 @@
 ; component shape: bound, nil gap, lookup ref, keyword and ref values.
 
 (require '[nextomic :as d])
-
-(defn check [label ok]
-  (println (if ok "ok" "FAIL") label)
-  (when-not ok (throw :check-failed)))
+(require '[prelude :as t])
 
 (def c (d/connect "indexes.edb"))
 (d/transact! c [{:db/ident :item/sku :db/valueType :db.type/string :db/cardinality :db.cardinality/one
@@ -26,37 +23,37 @@
 (println (d/datoms db :eavt bolt))
 (println (d/datoms db :eavt bolt :item/qty))
 (println (d/datoms db :eavt bolt :item/qty 500))
-(check "exact datom with the wrong value is empty" (empty? (d/datoms db :eavt bolt :item/qty 501)))
-(check "lookup ref as the entity component" (= 1 (count (d/datoms db :eavt [:item/sku "N-1"] :item/name))))
-(check "a gap filters: every :item/name datom holding Bolt" (= 1 (count (d/datoms db :eavt nil :item/name "Bolt"))))
+(t/check "exact datom with the wrong value is empty" (empty? (d/datoms db :eavt bolt :item/qty 501)))
+(t/check "lookup ref as the entity component" (= 1 (count (d/datoms db :eavt [:item/sku "N-1"] :item/name))))
+(t/check "a gap filters: every :item/name datom holding Bolt" (= 1 (count (d/datoms db :eavt nil :item/name "Bolt"))))
 
 ; AEVT: an attribute across entities, then narrowed by entity.
 (println (mapv first (d/datoms db :aevt :item/name)))
 (println (d/datoms db :aevt :item/name nut))
-(check "aevt with a value after a gap" (= [nut] (mapv first (d/datoms db :aevt :item/name nil "Nut"))))
+(t/check "aevt with a value after a gap" (= [nut] (mapv first (d/datoms db :aevt :item/name nil "Nut"))))
 
 ; AVET: indexed and unique attributes, by value; a gap then entity.
 (println (mapv first (d/datoms db :avet :item/qty 500)))
 (println (d/datoms db :avet :item/sku "B-1"))
-(check "avet with entity after a gap" (= 1 (count (d/datoms db :avet :item/qty nil nut))))
-(check "avet on an unindexed attribute reads nothing" (empty? (d/datoms db :avet :item/name)))
-(check "a value nobody holds matches nothing" (empty? (d/datoms db :avet :item/qty 7)))
+(t/check "avet with entity after a gap" (= 1 (count (d/datoms db :avet :item/qty nil nut))))
+(t/check "avet on an unindexed attribute reads nothing" (empty? (d/datoms db :avet :item/name)))
+(t/check "a value nobody holds matches nothing" (empty? (d/datoms db :avet :item/qty 7)))
 
 ; VAET: who points at the kit.
 (println (mapv first (d/datoms db :vaet kit)))
 (println (d/datoms db :vaet kit :item/part-of bolt))
-(check "vaet by lookup ref" (= 2 (count (d/datoms db :vaet [:item/sku "K-1"]))))
-(check "vaet of an entity nobody references is empty" (empty? (d/datoms db :vaet bolt)))
+(t/check "vaet by lookup ref" (= 2 (count (d/datoms db :vaet [:item/sku "K-1"]))))
+(t/check "vaet of an entity nobody references is empty" (empty? (d/datoms db :vaet bolt)))
 
 ; Keyword values are keywords on the way out and match on the way in.
-(check "keyword value round trip" (= :brass (nth (first (d/datoms db :eavt nut :item/color)) 2)))
-(check "keyword the store never saw matches nothing" (empty? (d/datoms db :eavt nut :item/color :gold)))
-(check "unknown ident as entity matches nothing" (empty? (d/datoms db :eavt :item/nope)))
+(t/check "keyword value round trip" (= :brass (nth (first (d/datoms db :eavt nut :item/color)) 2)))
+(t/check "keyword the store never saw matches nothing" (empty? (d/datoms db :eavt nut :item/color :gold)))
+(t/check "unknown ident as entity matches nothing" (empty? (d/datoms db :eavt :item/nope)))
 
 ; The bootstrap schema is visible through the same indexes.
 (println (d/datoms db :eavt :db/ident))
-(check "datoms carry their transaction" (= 3 (nth (first (d/datoms db :eavt nut :item/name)) 3)))
-(check "current datoms are assertions" (every? #(nth % 4) (d/datoms db :aevt :item/qty)))
+(t/check "datoms carry their transaction" (= 3 (nth (first (d/datoms db :eavt nut :item/name)) 3)))
+(t/check "current datoms are assertions" (every? #(nth % 4) (d/datoms db :aevt :item/qty)))
 
 (d/release c)
 :indexes-done

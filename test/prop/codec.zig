@@ -102,7 +102,10 @@ const Gen = struct {
     }
 
     fn container(self: *Gen, depth: u8) (std.mem.Allocator.Error || error{
-        InternTableFull, EmptyName, InvalidListTail, Overflow,
+        InternTableFull,
+        EmptyName,
+        InvalidListTail,
+        Overflow,
     })!Value {
         if (depth == 0) return try self.scalar();
 

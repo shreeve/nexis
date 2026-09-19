@@ -2,8 +2,14 @@
 //!
 //! Usage:
 //!   zig build parser                    regenerate src/parser.zig from nexis.grammar
-//!   zig build test                      run Zig-native unit + property tests (full suite, ~3min)
-//!   zig build phase2-test               run only vm + compile tests (~3s, for Phase 2 iteration)
+//!   zig build test                      everything: unit, property, golden, Nextomic corpora,
+//!                                       test/nextomic scripts, examples (minutes)
+//!   zig build quick                     the inner loop: language, eval-pipeline and Nextomic
+//!                                       unit + property binaries (seconds); phase2-test is
+//!                                       the same step under its older name
+//!   zig build nextomic-test             Nextomic unit, property and corpus binaries
+//!   zig build nextomic-nx               test/nextomic/*.nx through bin/nexis
+//!   zig build examples                  every examples/*.nx through bin/nexis
 //!   zig build golden                    verify golden reader outputs (byte-exact)
 //!   zig build golden -Dupdate=true      regenerate golden expected files
 //!
@@ -506,13 +512,8 @@ pub fn build(b: *std.Build) void {
     for (nextomic_imports) |imp| nextomic_mod.addImport(imp.name, imp.mod);
     stdlib_mod.addImport("nextomic", nextomic_mod);
 
-    const nextomic_tests_mod = b.createModule(.{
-        .root_source_file = b.path("src/nextomic/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    for (nextomic_imports) |imp| nextomic_tests_mod.addImport(imp.name, imp.mod);
-    const nextomic_tests = b.addTest(.{ .root_module = nextomic_tests_mod });
+    // The module is its own test root, as nextomic_handle is above.
+    const nextomic_tests = b.addTest(.{ .root_module = nextomic_mod });
     const run_nextomic_tests = b.addRunArtifact(nextomic_tests);
 
     const prop_nextomic_key_mod = b.createModule(.{
@@ -530,7 +531,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     prop_nextomic_tx_mod.addImport("nextomic", nextomic_mod);
-    for (nextomic_imports) |imp| prop_nextomic_tx_mod.addImport(imp.name, imp.mod);
     const prop_nextomic_tx_tests = b.addTest(.{ .root_module = prop_nextomic_tx_mod });
     const run_prop_nextomic_tx_tests = b.addRunArtifact(prop_nextomic_tx_tests);
 
@@ -562,7 +562,7 @@ pub fn build(b: *std.Build) void {
     const integration_nextomic_pull_tests = b.addTest(.{ .root_module = integration_nextomic_pull_mod });
     const run_integration_nextomic_pull_tests = b.addRunArtifact(integration_nextomic_pull_tests);
 
-    const nextomic_test_step = b.step("nextomic-test", "Run only the nextomic unit + property tests");
+    const nextomic_test_step = b.step("nextomic-test", "Nextomic unit tests, key and transaction property tests, and the query and pull corpora");
     nextomic_test_step.dependOn(&run_nextomic_handle_tests.step);
     nextomic_test_step.dependOn(&run_nextomic_tests.step);
     nextomic_test_step.dependOn(&run_prop_nextomic_key_tests.step);
@@ -1079,11 +1079,12 @@ pub fn build(b: *std.Build) void {
 
     // -------------------------------------------------------------------------
     // test/nextomic/*.nx — end-to-end Nextomic scripts run through the
-    // nexis binary (NEXTOMIC.md §8). Every script and its expected
-    // stdout are copied into one generated directory that is also the
-    // scripts' working directory, so the store files they create are
-    // fresh whenever the binary or a script changes and the persistence
-    // pair shares one file. Scripts run in the listed order.
+    // nexis binary (NEXTOMIC.md §8). The scripts and their shared
+    // prelude are copied into one generated directory that is also
+    // their working directory, so the store files they create are
+    // fresh whenever the binary or a script changes and the
+    // persistence pair shares one file. Each script's stdout is
+    // compared with its test/nextomic/<name>.out.
     // -------------------------------------------------------------------------
 
     const nextomic_nx_step = b.step("nextomic-nx", "Run the test/nextomic end-to-end scripts through bin/nexis");
@@ -1101,12 +1102,14 @@ pub fn build(b: *std.Build) void {
             "persist-2",
         };
         const scratch = b.addWriteFiles();
+        // The binary is copied only so the directory's hash, and with
+        // it the store files inside, changes when the binary does.
         _ = scratch.addCopyFile(nexis_exe.getEmittedBin(), "nexis");
+        _ = scratch.addCopyFile(b.path("test/nextomic/prelude.nx"), "prelude.nx");
         for (scripts) |name| {
             _ = scratch.addCopyFile(b.path(b.fmt("test/nextomic/{s}.nx", .{name})), b.fmt("{s}.nx", .{name}));
-            _ = scratch.addCopyFile(b.path(b.fmt("test/nextomic/{s}.out", .{name})), b.fmt("{s}.out", .{name}));
         }
-        var previous: ?*std.Build.Step = null;
+        var persist_1: ?*std.Build.Step = null;
         for (scripts) |name| {
             const expected = b.build_root.handle.readFileAlloc(
                 b.graph.io,
@@ -1120,10 +1123,62 @@ pub fn build(b: *std.Build) void {
             run.setCwd(scratch.getDirectory());
             run.expectExitCode(0);
             run.expectStdOutEqual(expected);
-            if (previous) |p| run.step.dependOn(p);
-            previous = &run.step;
+            // persist-2 reads what persist-1 wrote; every other script
+            // owns its store.
+            if (std.mem.eql(u8, name, "persist-1")) persist_1 = &run.step;
+            if (std.mem.eql(u8, name, "persist-2")) run.step.dependOn(persist_1.?);
+            nextomic_nx_step.dependOn(&run.step);
         }
-        nextomic_nx_step.dependOn(previous.?);
+    }
+
+    // -------------------------------------------------------------------------
+    // examples/*.nx — every example runs through the nexis binary from
+    // a generated working directory (the store-backed ones write under
+    // tmp/ relative to it). The three that keep a store run a second
+    // time in the same directory to prove they are idempotent.
+    // -------------------------------------------------------------------------
+
+    const examples_step = b.step("examples", "Run every examples/*.nx through bin/nexis");
+    {
+        const examples = [_]struct { name: []const u8, twice: bool = false }{
+            .{ .name = "hello" },
+            .{ .name = "sum10" },
+            .{ .name = "forward-ref" },
+            .{ .name = "cond" },
+            .{ .name = "threading" },
+            .{ .name = "macros" },
+            .{ .name = "quoted-list" },
+            .{ .name = "syntax-quote" },
+            .{ .name = "macro-author" },
+            .{ .name = "try-catch" },
+            .{ .name = "maps-sets" },
+            .{ .name = "defmacro" },
+            .{ .name = "stdlib-primitives" },
+            .{ .name = "require-demo" },
+            .{ .name = "shapes" },
+            .{ .name = "shapes-app" },
+            .{ .name = "durable-refs", .twice = true },
+            .{ .name = "todo-app", .twice = true },
+            .{ .name = "nextomic-app", .twice = true },
+        };
+        const scratch = b.addWriteFiles();
+        _ = scratch.addCopyFile(nexis_exe.getEmittedBin(), "nexis");
+        for (examples) |ex| {
+            var first: ?*std.Build.Step = null;
+            const passes: usize = if (ex.twice) 2 else 1;
+            for (0..passes) |pass| {
+                const run = b.addRunArtifact(nexis_exe);
+                run.addArg("run");
+                run.addFileArg(b.path(b.fmt("examples/{s}.nx", .{ex.name})));
+                run.setCwd(scratch.getDirectory());
+                // Distinguishes the second pass's cache entry from the first's.
+                run.setEnvironmentVariable("NEXIS_EXAMPLE_PASS", b.fmt("{d}", .{pass + 1}));
+                run.expectExitCode(0);
+                if (first) |f| run.step.dependOn(f);
+                first = &run.step;
+                examples_step.dependOn(&run.step);
+            }
+        }
     }
 
     const golden_mod = b.createModule(.{
@@ -1150,33 +1205,35 @@ pub fn build(b: *std.Build) void {
     golden_step.dependOn(&run_golden.step);
 
     // -------------------------------------------------------------------------
-    // Aggregate `zig build test` — unit + property + golden
+    // Aggregate `zig build test` — everything
     // -------------------------------------------------------------------------
 
-    const test_step = b.step("test", "Run all Phase 0/1 tests (unit + property + golden)");
+    const test_step = b.step("test", "Run everything: unit, property, golden, Nextomic corpora, test/nextomic scripts, examples");
     for (runtime_test_runs) |r| test_step.dependOn(&r.step);
 
     // -------------------------------------------------------------------------
-    // `zig build phase2-test` — fast iteration target for Phase 2 work
+    // `zig build quick` — the inner loop
     //
-    // Runs ONLY the vm + compile module tests (currently ~187 tests in ~3s).
-    // The full `zig build test` re-runs Phase 1's randomized HAMT correctness
-    // gate, 10k+ collection ops, etc. — ~3min and unrelated to Phase 2
-    // compiler/VM iteration. Use this step during the Phase 2 edit/test loop;
-    // run the full suite before committing significant changes.
+    // The language binaries (vm, compile, expand, stdlib, loader, atom,
+    // record, protocol, format), the compile property tests, the
+    // eval-pipeline integration tests and the Nextomic unit and
+    // property binaries: seconds. The full `zig build test` adds the
+    // randomized collection gates (minutes) and the end-to-end
+    // scripts; run it before committing. `phase2-test` names the same
+    // step.
     //
-    // When a new Phase 2 module lands (e.g., expand.zig, resolve.zig),
-    // add its entry to `runtime_test_files` AND append the corresponding
-    // `runtime_test_runs[N]` to this step.
+    // A new language module joins by an entry in `runtime_test_files`
+    // and the matching `runtime_test_runs[N]` line below.
     // -------------------------------------------------------------------------
 
-    const phase2_test_step = b.step("phase2-test", "Run only vm + compile tests (fast Phase 2 iteration)");
+    const quick_step = b.step("quick", "The inner loop: language, eval-pipeline and Nextomic unit + property binaries (seconds)");
+    const phase2_test_step = b.step("phase2-test", "Same as quick");
+    phase2_test_step.dependOn(quick_step);
     // Indices into runtime_test_files: atom = 11, record = 12,
     // protocol = 13, vm = 19, format = 20, compile = 21,
-    // expand = 22, stdlib = 23, loader = 24. (Phase 5.3b
-    // shifted everything past `record` by +1 by inserting
-    // `protocol`.) Asserted at build time so re-ordering trips
-    // this loudly instead of silently running the wrong tests.
+    // expand = 22, stdlib = 23, loader = 24. Asserted at build
+    // time so re-ordering trips this loudly instead of silently
+    // running the wrong tests.
     comptime {
         std.debug.assert(std.mem.eql(u8, runtime_test_files[11].name, "atom"));
         std.debug.assert(std.mem.eql(u8, runtime_test_files[12].name, "record"));
@@ -1188,26 +1245,26 @@ pub fn build(b: *std.Build) void {
         std.debug.assert(std.mem.eql(u8, runtime_test_files[23].name, "stdlib"));
         std.debug.assert(std.mem.eql(u8, runtime_test_files[24].name, "loader"));
     }
-    // Inner-loop binaries: atom + record + protocol +
+    // Language binaries: atom + record + protocol +
     // vm + format + compile + expand + stdlib + loader.
-    phase2_test_step.dependOn(&runtime_test_runs[11].step);
-    phase2_test_step.dependOn(&runtime_test_runs[12].step);
-    phase2_test_step.dependOn(&runtime_test_runs[13].step);
-    phase2_test_step.dependOn(&runtime_test_runs[19].step);
-    phase2_test_step.dependOn(&runtime_test_runs[20].step);
-    phase2_test_step.dependOn(&runtime_test_runs[21].step);
-    phase2_test_step.dependOn(&runtime_test_runs[22].step);
-    phase2_test_step.dependOn(&runtime_test_runs[23].step);
-    phase2_test_step.dependOn(&runtime_test_runs[24].step);
-    // Phase 2 gate items 3 + 4.
-    phase2_test_step.dependOn(&run_prop_compile_tests.step);
-    // Phase 2 step #11 — eval-pipeline integration tests.
-    phase2_test_step.dependOn(&run_integration_eval_tests.step);
-    // nextomic storage layer: unit + property binaries.
-    phase2_test_step.dependOn(&run_nextomic_handle_tests.step);
-    phase2_test_step.dependOn(&run_nextomic_tests.step);
-    phase2_test_step.dependOn(&run_prop_nextomic_key_tests.step);
-    phase2_test_step.dependOn(&run_prop_nextomic_tx_tests.step);
+    quick_step.dependOn(&runtime_test_runs[11].step);
+    quick_step.dependOn(&runtime_test_runs[12].step);
+    quick_step.dependOn(&runtime_test_runs[13].step);
+    quick_step.dependOn(&runtime_test_runs[19].step);
+    quick_step.dependOn(&runtime_test_runs[20].step);
+    quick_step.dependOn(&runtime_test_runs[21].step);
+    quick_step.dependOn(&runtime_test_runs[22].step);
+    quick_step.dependOn(&runtime_test_runs[23].step);
+    quick_step.dependOn(&runtime_test_runs[24].step);
+    // Closure-capture and emitter property tests (COMPILER.md §9.4).
+    quick_step.dependOn(&run_prop_compile_tests.step);
+    // Eval-pipeline integration tests.
+    quick_step.dependOn(&run_integration_eval_tests.step);
+    // Nextomic unit binaries and the key and transaction property tests.
+    quick_step.dependOn(&run_nextomic_handle_tests.step);
+    quick_step.dependOn(&run_nextomic_tests.step);
+    quick_step.dependOn(&run_prop_nextomic_key_tests.step);
+    quick_step.dependOn(&run_prop_nextomic_tx_tests.step);
 
     test_step.dependOn(&run_prop_primitive_tests.step);
     test_step.dependOn(&run_prop_intern_tests.step);
@@ -1233,6 +1290,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_bench_tests.step);
     test_step.dependOn(&run_reader_tests.step);
     test_step.dependOn(&run_golden.step);
+    test_step.dependOn(examples_step);
 
     b.getInstallStep().dependOn(&install_golden.step);
     b.getInstallStep().dependOn(&install_nexis.step);

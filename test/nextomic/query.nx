@@ -5,14 +5,8 @@
 ; directory; the store is fresh.
 
 (require '[nextomic :as d])
+(require '[prelude :as t])
 (require '[nexis.string :as s])
-
-(defn check [label ok]
-  (println (if ok "ok" "FAIL") label)
-  (when-not ok (throw :check-failed)))
-
-(defmacro caught [& body]
-  `(try (do ~@body :no-error) (catch any e# e#)))
 
 ; Results are persistent sets; sorting makes the output stable.
 (defn rows [res] (sort res))
@@ -79,11 +73,11 @@
 (println (rows (d/q '[:find ?n :where [?e :person/age _] [?e :person/tags _] [?e :person/name ?n]] db)))
 (println (rows (d/q '[:find ?n ?f :where [?e :person/friend ?x] [?e :person/name ?n] [?x :person/name ?f]] db)))
 (println (rows (d/q '[:find ?n ?item :where [?o :order/customer ?e] [?o :order/items ?item] [?e :person/name ?n]] db)))
-(check "a constant that names nothing matches nothing"
+(t/check "a constant that names nothing matches nothing"
        (= #{} (d/q '[:find ?n :where [?e :person/tags :nope/tag] [?e :person/name ?n]] db)))
-(check "a lookup ref that names nothing matches nothing"
+(t/check "a lookup ref that names nothing matches nothing"
        (= #{} (d/q '[:find ?n :where [?e :person/boss [:person/email "nobody@x"]] [?e :person/name ?n]] db)))
-(check "the tx position binds the transaction entity"
+(t/check "the tx position binds the transaction entity"
        (= 1 (count (d/q '[:find ?tx :where [?e :person/name "Flo" ?tx]] db))))
 
 ; --- every :in form -------------------------------------------------------
@@ -122,7 +116,7 @@
 (defn twice [n] [[n 1] [n 2]])
 (println (rows (d/q '[:find ?n ?k :where [?e :person/name "Ann"] [?e :person/name ?x] [(twice ?x) [[?n ?k]]]] db)))
 (defn maybe-name [n] (when (= n "Cy") n))
-(check "a nil function result drops the row"
+(t/check "a nil function result drops the row"
        (= #{["Cy"]} (d/q '[:find ?m :where [?e :person/name ?n] [(maybe-name ?n) ?m]] db)))
 
 ; --- aggregates, :with, every find spec -----------------------------------
@@ -155,7 +149,7 @@
 (println (sort (d/q '[:find [?n ...] :in $ % :where [?b :person/email "ann@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)))
 (println (sort (d/q '[:find [?n ...] :in $ % :where [?b :person/email "cy@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)))
 (println (rows (d/q '[:find ?b ?n :in $ % :where (responsible ?x ?e) [?x :person/name ?b] [?e :person/name ?n]] db rules)))
-(check "a repeated query and rule set are served from the caches"
+(t/check "a repeated query and rule set are served from the caches"
        (= (d/q '[:find [?n ...] :in $ % :where [?b :person/email "ann@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)
           (d/q '[:find [?n ...] :in $ % :where [?b :person/email "ann@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)))
 
@@ -172,27 +166,27 @@
 
 (def plan (d/explain '[:find ?n :in $ % :where [?e :person/age 30] [?e :person/name ?n] (not [?e :person/tags :red])
                       (responsible ?e ?x) [(< 1 2)]] db rules))
-(check "explain returns the plan as text" (and (string? plan) (> (count plan) 0)))
+(t/check "explain returns the plan as text" (and (string? plan) (> (count plan) 0)))
 
 ; --- errors ---------------------------------------------------------------
 
-(println (caught (d/q '[:find ?e :where [?e bogus]] db)))
-(println (caught (d/q '[:find ?x :where [?e :person/name ?n]] db)))
-(println (caught (d/q '[:find ?n :in $ ?a :where [?e :person/name ?n]] db)))
-(println (caught (d/q '[:find ?e :where [?e :person/name ?n] [(nope ?n)]] db)))
-(println (caught (d/q '[:find ?e :in $ ?pred :where [?e :person/name ?n] [(?pred ?n)]] db adult?)))
-(println (caught (d/q '[:find ?e ?a ?v :where [?e ?a ?v]] db)))
-(println (caught (d/q '[:find ?e :where [?e :nope/attr ?v]] db)))
-(println (caught (d/q '[:find ?e :where [?e :person/boss [:nope/attr 1]]] db)))
-(println (caught (d/q '[:find (sum ?n) :where [?e :person/name ?n]] db)))
-(println (caught (d/explain '[:find ?e :where [?e bogus]] db)))
-(println (caught (d/q '[:find ?e :where [?e :person/name ?n] [(boom ?n)]] db)))
-(check "the store still works after a predicate threw"
+(println (t/caught (d/q '[:find ?e :where [?e bogus]] db)))
+(println (t/caught (d/q '[:find ?x :where [?e :person/name ?n]] db)))
+(println (t/caught (d/q '[:find ?n :in $ ?a :where [?e :person/name ?n]] db)))
+(println (t/caught (d/q '[:find ?e :where [?e :person/name ?n] [(nope ?n)]] db)))
+(println (t/caught (d/q '[:find ?e :in $ ?pred :where [?e :person/name ?n] [(?pred ?n)]] db adult?)))
+(println (t/caught (d/q '[:find ?e ?a ?v :where [?e ?a ?v]] db)))
+(println (t/caught (d/q '[:find ?e :where [?e :nope/attr ?v]] db)))
+(println (t/caught (d/q '[:find ?e :where [?e :person/boss [:nope/attr 1]]] db)))
+(println (t/caught (d/q '[:find (sum ?n) :where [?e :person/name ?n]] db)))
+(println (t/caught (d/explain '[:find ?e :where [?e bogus]] db)))
+(println (t/caught (d/q '[:find ?e :where [?e :person/name ?n] [(boom ?n)]] db)))
+(t/check "the store still works after a predicate threw"
        (= (inc (d/basis-t db)) (:tx (d/transact! c [{:person/email "gil@x" :person/name "Gil"}]))))
-(check "results are ordinary sets"
+(t/check "results are ordinary sets"
        (let [res (d/q '[:find ?n ?a :where [?e :person/name ?n] [?e :person/age ?a]] (d/db c))]
          (and (set? res) (= 6 (count res)) (= ["Ann" "Bob" "Cy" "Di" "Edward" "Flo"] (sort (map first res)))
               (contains? res ["Bob" 26]))))
 (d/release c)
-(println (caught (d/q ages db)))
+(println (t/caught (d/q ages db)))
 :query-done
