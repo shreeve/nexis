@@ -1557,11 +1557,6 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
 // with `buildListFromSlice`; vector-producing variants (`mapv`,
 // `filterv`, `vec`) go through `vector_mod.fromSlice`.
 
-fn requireFixnumArg(v: Value) VmError!i64 {
-    if (v.kind() != .fixnum) return VmError.KindMismatch;
-    return v.asFixnum();
-}
-
 /// `(range end)` / `(range start end)` / `(range start end step)`
 /// → list of fixnums. A zero step is `:invalid-argument` (there
 /// is no infinite sequence to return).
@@ -1570,15 +1565,15 @@ fn fnRange(vm: *VM, args: []const Value) VmError!Value {
     var end: i64 = undefined;
     var step: i64 = 1;
     switch (args.len) {
-        1 => end = try requireFixnumArg(args[0]),
+        1 => end = try requireFixnum(args[0]),
         2 => {
-            start = try requireFixnumArg(args[0]);
-            end = try requireFixnumArg(args[1]);
+            start = try requireFixnum(args[0]);
+            end = try requireFixnum(args[1]);
         },
         else => {
-            start = try requireFixnumArg(args[0]);
-            end = try requireFixnumArg(args[1]);
-            step = try requireFixnumArg(args[2]);
+            start = try requireFixnum(args[0]);
+            end = try requireFixnum(args[1]);
+            step = try requireFixnum(args[2]);
             if (step == 0) return VmError.InvalidArgument;
         },
     }
@@ -1673,9 +1668,9 @@ fn fnDistinct(vm: *VM, args: []const Value) VmError!Value {
 /// elements. `(partition-all n coll)` / `(partition-all n step
 /// coll)` keeps the short tail.
 fn partitionImpl(vm: *VM, all: bool, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[0]);
+    const n = try requireFixnum(args[0]);
     if (n <= 0) return VmError.InvalidArgument;
-    const step: i64 = if (args.len >= 3) try requireFixnumArg(args[1]) else n;
+    const step: i64 = if (args.len >= 3) try requireFixnum(args[1]) else n;
     if (step <= 0) return VmError.InvalidArgument;
     const pad: ?Value = if (args.len == 4) args[2] else null;
     var items = try collectSeq(vm, args[args.len - 1]);
@@ -1790,23 +1785,27 @@ fn fnButlast(vm: *VM, args: []const Value) VmError!Value {
     return try buildListFromSlice(vm, items.items[0 .. items.items.len - 1]);
 }
 
+/// A count argument. Negative counts mean zero everywhere Clojure
+/// takes one (`nthrest`, `split-at`, `take-last`, `repeat`, ...).
+fn requireCount(v: Value) VmError!usize {
+    return @intCast(@max(try requireFixnum(v), 0));
+}
+
 /// `(nthrest coll n)` → coll without its first n elements, as a list.
 fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[1]);
-    if (n < 0) return VmError.IndexOutOfBounds;
+    const n = try requireCount(args[1]);
     var items = try collectSeq(vm, args[0]);
     defer items.deinit(vm.allocator);
-    const skip = @min(@as(usize, @intCast(n)), items.items.len);
+    const skip = @min(n, items.items.len);
     return try buildListFromSlice(vm, items.items[skip..]);
 }
 
 /// `(split-at n coll)` → `[(take n coll) (drop n coll)]`.
 fn fnSplitAt(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[0]);
-    if (n < 0) return VmError.IndexOutOfBounds;
+    const n = try requireCount(args[0]);
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
-    const at = @min(@as(usize, @intCast(n)), items.items.len);
+    const at = @min(n, items.items.len);
     const head = try buildListFromSlice(vm, items.items[0..at]);
     const tail = try buildListFromSlice(vm, items.items[at..]);
     return vector_mod.fromSlice(vm.ensureHeap(), &.{ head, tail }) catch VmError.OutOfMemory;
@@ -1814,18 +1813,18 @@ fn fnSplitAt(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(take-last n coll)` / `(drop-last n coll)`.
 fn fnTakeLast(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[0]);
+    const n = try requireCount(args[0]);
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
-    const keep = @min(@as(usize, @intCast(@max(n, 0))), items.items.len);
+    const keep = @min(n, items.items.len);
     return try buildListFromSlice(vm, items.items[items.items.len - keep ..]);
 }
 
 fn fnDropLast(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[0]);
+    const n = try requireCount(args[0]);
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
-    const drop = @min(@as(usize, @intCast(@max(n, 0))), items.items.len);
+    const drop = @min(n, items.items.len);
     return try buildListFromSlice(vm, items.items[0 .. items.items.len - drop]);
 }
 
@@ -1870,33 +1869,45 @@ fn fnReductions(vm: *VM, args: []const Value) VmError!Value {
 /// of `(f)`. `(iterate f x n)` → the first n of x, (f x), (f (f x))
 /// … — the count is explicit because sequences are eager.
 fn fnRepeat(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[0]);
-    var results: std.ArrayList(Value) = .empty;
-    defer results.deinit(vm.allocator);
-    var i: i64 = 0;
-    while (i < n) : (i += 1) results.append(vm.allocator, args[1]) catch return VmError.OutOfMemory;
-    return try buildListFromSlice(vm, results.items);
+    var producer = struct {
+        x: Value,
+        fn next(self: *@This(), _: *VM) VmError!Value {
+            return self.x;
+        }
+    }{ .x = args[1] };
+    return repeatInto(vm, try requireCount(args[0]), &producer);
 }
 
 fn fnRepeatedly(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[0]);
-    var results: std.ArrayList(Value) = .empty;
-    defer results.deinit(vm.allocator);
-    var i: i64 = 0;
-    while (i < n) : (i += 1) results.append(vm.allocator, try vm.callValue(args[1], &.{})) catch return VmError.OutOfMemory;
-    return try buildListFromSlice(vm, results.items);
+    var producer = struct {
+        f: Value,
+        fn next(self: *@This(), vm_: *VM) VmError!Value {
+            return vm_.callValue(self.f, &.{});
+        }
+    }{ .f = args[1] };
+    return repeatInto(vm, try requireCount(args[0]), &producer);
 }
 
 fn fnIterate(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnumArg(args[2]);
+    var producer = struct {
+        f: Value,
+        x: Value,
+        started: bool = false,
+        fn next(self: *@This(), vm_: *VM) VmError!Value {
+            if (self.started) self.x = try vm_.callValue(self.f, &.{self.x});
+            self.started = true;
+            return self.x;
+        }
+    }{ .f = args[0], .x = args[1] };
+    return repeatInto(vm, try requireCount(args[2]), &producer);
+}
+
+/// The list of `n` successive `producer.next(vm)` results.
+fn repeatInto(vm: *VM, n: usize, producer: anytype) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
-    var x = args[1];
-    var i: i64 = 0;
-    while (i < n) : (i += 1) {
-        results.append(vm.allocator, x) catch return VmError.OutOfMemory;
-        if (i + 1 < n) x = try vm.callValue(args[0], &.{x});
-    }
+    results.ensureTotalCapacity(vm.allocator, n) catch return VmError.OutOfMemory;
+    for (0..n) |_| results.appendAssumeCapacity(try producer.next(vm));
     return try buildListFromSlice(vm, results.items);
 }
 
