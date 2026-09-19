@@ -142,7 +142,10 @@ const Gen = struct {
     }
 
     fn container(self: *Gen, depth: u8) (std.mem.Allocator.Error || error{
-        InternTableFull, EmptyName, InvalidListTail, Overflow,
+        InternTableFull,
+        EmptyName,
+        InvalidListTail,
+        Overflow,
     })!Value {
         if (depth == 0) return try self.scalar();
 
@@ -284,7 +287,7 @@ fn runD1Partition(suffix: []const u8, seed_offset: u64, trials: usize) !void {
         const got = got_opt.?;
         if (!dispatch.equal(rec.v, got)) {
             std.debug.print("D1 trial {d}: tree={s} key={s} kinds: written={s} got={s}\n", .{
-                i, tree_names[rec.tree_idx], rec.key[0..rec.key_len],
+                i,                      tree_names[rec.tree_idx], rec.key[0..rec.key_len],
                 @tagName(rec.v.kind()), @tagName(got.kind()),
             });
             return error.UnequalAfterRoundTrip;

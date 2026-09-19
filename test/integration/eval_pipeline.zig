@@ -2642,7 +2642,6 @@ test "phase5.2b end-to-end: case + trim + split + join chain" {
     , "hello/world/from/nexis");
 }
 
-
 // =============================================================================
 // Backing-stack extent across nested frames
 //
