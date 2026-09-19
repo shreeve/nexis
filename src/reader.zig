@@ -257,10 +257,16 @@ pub const Reader = struct {
     // Atom readers
     // -------------------------------------------------------------------------
 
+    /// An integer token's text is the whole run the lexer took, so a
+    /// malformed literal (`1abc`, `1-2`, `1/2`, `0x`) fails here with
+    /// the text as detail. Clojure's `N` suffix names an arbitrary-
+    /// precision integer; nexis has one integer domain (SEMANTICS.md
+    /// §2), so `42N` reads exactly as `42` does.
     fn readInt(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
         const text = expectSrcText(self, args, span) catch |e| return e;
-        if (parseIntLiteral(text)) |value| return try self.makeForm(.{ .int = value }, span);
-        const decimal = self.bigIntLiteral(text) orelse
+        const digits = if (text.len > 1 and text[text.len - 1] == 'N') text[0 .. text.len - 1] else text;
+        if (parseIntLiteral(digits)) |value| return try self.makeForm(.{ .int = value }, span);
+        const decimal = self.bigIntLiteral(digits) orelse
             return self.fail(.bad_number_literal, span, text);
         return try self.makeForm(.{ .bigint = decimal }, span);
     }
@@ -1011,6 +1017,82 @@ fn writeSymbolAtom(s: Name, w: *std.Io.Writer) std.Io.Writer.Error!void {
 // -----------------------------------------------------------------------------
 // Inline tests — structural sanity checks; golden tests cover the surface.
 // -----------------------------------------------------------------------------
+
+test "number token boundary: a digit-led run is one token the reader rejects" {
+    const allocator = std.testing.allocator;
+    // Each source holds one malformed number; the error spans exactly
+    // that token and carries its text (FORMS.md §3, "Number token
+    // boundary").
+    const cases = [_]struct { src: []const u8, pos: u32, text: []const u8 }{
+        .{ .src = "1abc", .pos = 0, .text = "1abc" },
+        .{ .src = "(println 1-2)", .pos = 9, .text = "1-2" },
+        .{ .src = "[1.5x]", .pos = 1, .text = "1.5x" },
+        .{ .src = "-1abc", .pos = 0, .text = "-1abc" },
+        .{ .src = "1/2", .pos = 0, .text = "1/2" },
+        .{ .src = "0x", .pos = 0, .text = "0x" },
+        .{ .src = "0b12", .pos = 0, .text = "0b12" },
+        .{ .src = "1.", .pos = 0, .text = "1." },
+        .{ .src = "1e", .pos = 0, .text = "1e" },
+        .{ .src = "1:a", .pos = 0, .text = "1:a" },
+        .{ .src = "1'", .pos = 0, .text = "1'" },
+        .{ .src = "3.14M", .pos = 0, .text = "3.14M" },
+        .{ .src = "1.5N", .pos = 0, .text = "1.5N" },
+        .{ .src = "1_000", .pos = 0, .text = "1_000" },
+    };
+    for (cases) |c| {
+        var p = parser.Parser.init(allocator, c.src);
+        defer p.deinit();
+        const tree = try p.parseProgram();
+        var rd = Reader.init(allocator, c.src);
+        defer rd.deinit();
+        try std.testing.expectError(error.ReaderFailure, rd.readProgram(tree));
+        const e = rd.err orelse return error.TestUnexpectedResult;
+        try std.testing.expect(e.kind == .bad_number_literal);
+        try std.testing.expectEqualStrings(c.text, e.detail.?);
+        try std.testing.expectEqual(c.pos, e.span.pos);
+        try std.testing.expectEqual(@as(u32, @intCast(c.text.len)), e.span.len);
+    }
+
+    // A reader macro character or a delimiter ends the number, as it
+    // would end a symbol: `1@x` is `1` then `(deref x)`.
+    const two = "(1@x)";
+    var p = parser.Parser.init(allocator, two);
+    defer p.deinit();
+    var rd = Reader.init(allocator, two);
+    defer rd.deinit();
+    const forms = try rd.readProgram(try p.parseProgram());
+    try std.testing.expectEqual(@as(usize, 1), forms.len);
+    const items = forms[0].datum.list;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqual(@as(i64, 1), items[0].datum.int);
+    try std.testing.expect(items[1].datum == .deref);
+}
+
+test "N suffix: an integer literal of any radix or size reads as the integer" {
+    const allocator = std.testing.allocator;
+    const ints = [_]struct { src: []const u8, value: i64 }{
+        .{ .src = "1N", .value = 1 },
+        .{ .src = "-7N", .value = -7 },
+        .{ .src = "0xFFN", .value = 255 },
+        .{ .src = "0b101N", .value = 5 },
+    };
+    for (ints) |c| {
+        var p = parser.Parser.init(allocator, c.src);
+        defer p.deinit();
+        var rd = Reader.init(allocator, c.src);
+        defer rd.deinit();
+        const forms = try rd.readProgram(try p.parseProgram());
+        try std.testing.expectEqual(@as(usize, 1), forms.len);
+        try std.testing.expectEqual(c.value, forms[0].datum.int);
+    }
+    const wide = "18446744073709551616N";
+    var p = parser.Parser.init(allocator, wide);
+    defer p.deinit();
+    var rd = Reader.init(allocator, wide);
+    defer rd.deinit();
+    const forms = try rd.readProgram(try p.parseProgram());
+    try std.testing.expectEqualStrings("18446744073709551616", forms[0].datum.bigint);
+}
 
 test "bigint literals: beyond i64 in any radix, as canonical decimal text" {
     const cases = [_]struct { src: []const u8, decimal: []const u8 }{

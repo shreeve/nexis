@@ -221,9 +221,12 @@ the long version lives in PLAN §23 frozen decisions and `docs/FORMS.md` §8.
 | **Numeric literals** | | | |
 | Radix integer | `2r101`, `16rFF`, `36rZZ` | none — `0x`, `0b`, decimal only | simpler grammar |
 | Leading `+` on a number | `+42` → integer `42` | `+42` → symbol | no sign-variant tokenization |
-| Ratio | `22/7` → `Ratio` | unsupported | number tower is int+bignum+f64 only (§23 #10) |
-| BigInt suffix | `42N` | unsupported; an integer literal of any size reads as an integer (`18446744073709551616` is a bignum) and prints with no suffix | one integer type: fixnum + bignum in canonical form (§23 #10) |
-| BigDecimal suffix | `3.14M` | unsupported | no decimal tower (§23 #10) |
+| Ratio | `22/7` → `Ratio` | `:bad-number-literal` | number tower is int+bignum+f64 only (§23 #10) |
+| BigInt suffix | `42N` → `BigInt` | `42N` reads as `42`; an integer literal of any size reads as an integer (`18446744073709551616` is a bignum) and prints with no suffix | one integer type: fixnum + bignum in canonical form (§23 #10) |
+| BigDecimal suffix | `3.14M` | `:bad-number-literal` | no decimal tower (§23 #10) |
+| Leading-zero integer | `017` → octal `15` | `017` → decimal `17` | one decimal spelling; `0x` and `0b` are the radix prefixes |
+| Trailing dot | `1.` → `1.0` | `:bad-number-literal` | a real has digits on both sides of the dot (§7.2) |
+| Malformed number | `1abc`, `1-2` → "Invalid number" | `:bad-number-literal` at the token | same rule: a number token ends where a symbol would (`docs/FORMS.md` §3) |
 | NaN / ±Inf literal | `##NaN`, `##Inf`, `##-Inf` | unsupported | `(/ 1.0 0)` and `(- 0.0 (/ 1.0 0))` produce them; no literal syntax |
 | `##`-dispatch in general | symbolic values | unsupported | as above |
 | **Chars and strings** | | | |

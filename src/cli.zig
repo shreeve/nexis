@@ -171,9 +171,9 @@ fn emitParseError(io: std.Io, path: []const u8, source: []const u8, p: *const re
 
 /// Report a reader failure at the form it rejected, with the kind
 /// the golden `.err` files name (`:map-odd-count`) and the reader's
-/// detail when it has one:
+/// detail when it has one, verbatim:
 ///
-///   nexis: <path>:<line>:<col>: reader error: :duplicate-literal-key :a
+///   nexis: <path>:<line>:<col>: reader error: :duplicate-literal-key (keyword :a_b)
 ///
 /// A failure the reader did not record (out of memory, invalid
 /// UTF-8) is reported bare.
@@ -185,14 +185,17 @@ fn emitReaderError(io: std.Io, path: []const u8, source: []const u8, rdr: *const
         try stderr.writeStreamingAll(io, "\n");
         return;
     };
+    // Kinds are spelled with underscores in Zig and dashes in nexis;
+    // the detail is the user's own text and stays as written.
+    var kind_buf: [64]u8 = undefined;
+    const kind = kind_buf[0..@tagName(e.kind).len];
+    @memcpy(kind, @tagName(e.kind));
+    std.mem.replaceScalar(u8, kind, '_', '-');
     var buf: [256]u8 = undefined;
-    const kind = @tagName(e.kind);
     const label = if (e.detail) |detail|
         try std.fmt.bufPrint(&buf, "reader error: :{s} {s}", .{ kind, detail })
     else
         try std.fmt.bufPrint(&buf, "reader error: :{s}", .{kind});
-    // Kinds are spelled with underscores in Zig and dashes in nexis.
-    std.mem.replaceScalar(u8, buf[0..label.len], '_', '-');
     try emitSourceError(io, path, source, label, e.span);
 }
 
@@ -247,7 +250,7 @@ const Runtime = struct {
     v: vm.VM,
     host_macros: expand_mod.HostMacroTable,
     loader: loader_mod.Loader,
-    /// What `macroexpand-1` and `read-string` call into.
+    /// What `macroexpand-1`, `read-string` and `eval` call into.
     hooks: compile.RuntimeHooks,
     interner: *intern_mod.Interner,
     registry: *vm.NamespaceRegistry,

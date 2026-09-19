@@ -449,7 +449,7 @@ Defined in `nexis.grammar`, run through `nexus` to produce `src/parser.zig`.
 | Syntax | Reads as |
 |---|---|
 | `nil`, `true`, `false` | Immediates |
-| `42`, `-1`, `0x2A`, `0b101` | Integer literal |
+| `42`, `-1`, `0x2A`, `0b101`, `42N` | Integer literal; the `N` suffix is accepted and changes nothing. A number token runs to the next delimiter, so `1abc` and `1-2` are read-time errors (`docs/FORMS.md` §3) |
 | `3.14`, `1e9`, `1.5e-3` | f64 literal |
 | `\a`, `\space`, `\newline`, `\u{2603}` | Character (Unicode scalar). Named set: `\newline \space \tab \return \formfeed \backspace`. Any char via `\u{HEX}`. |
 | `"..."` | String with `\n \t \r \\ \" \u{HEX}` escapes (same `\u{HEX}` form as char literals — unified escape language); no multi-line |
@@ -2674,3 +2674,14 @@ entry stating the decision and its rationale.
   and their eids agree. The kind is not serializable, as the other
   Nextomic handles are not (§23 #25 unchanged). `docs/NEXTOMIC.md`
   §6 is the authority.
+
+- **2026-09-19 — Number token boundary and the `N` suffix (§7.2).** A
+  token that begins with a digit, or `-` and a digit, ends where a
+  symbol would; the symbol constituents that follow the digits belong
+  to the token, so `1abc`, `1-2`, `1.5x` and `22/7` reach the reader
+  whole and fail as `:bad-number-literal` at the token instead of
+  reading as a number followed by a symbol. `42N` reads as `42`, in any
+  radix and at any size: one integer domain (§23 #10) leaves the
+  suffix nothing to mark. `docs/FORMS.md` §3 is the authority;
+  `CLOJURE-REVIEW.md` §4.2 lists the spellings that differ from
+  Clojure.

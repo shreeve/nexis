@@ -1346,8 +1346,8 @@ pub fn build(b: *std.Build) void {
 
     // test/golden/cli — what bin/nexis prints for a script, pinned
     // byte for byte: a runtime error's stderr (`<name>.nx` +
-    // `<name>.err`, exit 5), a disassembly's stdout (`.disasm`) and
-    // a script's stdout (`.out`).
+    // `<name>.err`, exit 5), a reader error's stderr (exit 3), a
+    // disassembly's stdout (`.disasm`) and a script's stdout (`.out`).
     // Each runs from the build root so the paths in the output are
     // the relative ones committed. To refresh an expected file, run
     // the command from the build root and redirect the stream it
@@ -1364,6 +1364,8 @@ pub fn build(b: *std.Build) void {
             .{ .file = "test/golden/cli/divide-by-zero.nx", .expected = "divide-by-zero.err", .stream = .stderr, .exit_code = 5 },
             .{ .file = "test/golden/cli/uncaught-throw.nx", .expected = "uncaught-throw.err", .stream = .stderr, .exit_code = 5 },
             .{ .file = "test/golden/cli/require-runtime-error.nx", .expected = "require-runtime-error.err", .stream = .stderr, .exit_code = 5 },
+            .{ .file = "test/golden/cli/bad-number.nx", .expected = "bad-number.err", .stream = .stderr, .exit_code = 3 },
+            .{ .file = "test/golden/cli/duplicate-key.nx", .expected = "duplicate-key.err", .stream = .stderr, .exit_code = 3 },
             .{ .verb = "disasm", .file = "examples/sum10.nx", .expected = "sum10.disasm" },
             .{ .file = "test/golden/cli/pprint.nx", .expected = "pprint.out" },
         };

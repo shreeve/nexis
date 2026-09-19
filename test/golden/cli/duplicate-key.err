@@ -1,0 +1,3 @@
+nexis: test/golden/cli/duplicate-key.nx:4:10: reader error: :duplicate-literal-key (keyword :a_b)
+    (println {:a_b 1 :a_b 2})
+             ^^^^^^^^^^^^^^^

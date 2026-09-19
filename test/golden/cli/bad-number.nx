@@ -1,0 +1,5 @@
+; A malformed number: the lexer keeps the whole run as one token and
+; the reader rejects it, so `1-2` is one error at the token and never
+; the two values 1 and -2.
+
+(println 1-2)

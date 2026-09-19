@@ -261,8 +261,8 @@ fn formatChar(scalar: u21, mode: FormatMode, writer: *std.Io.Writer) Error!void 
         return;
     }
     // Readable: named tokens for common whitespace + backslash;
-    // printable ASCII as `\x`; everything else hex-escape. Turn 81
-    // §D3 pinned the exact set.
+    // printable ASCII as `\x`; everything else hex-escape. STRING.md
+    // §9 pins the exact set.
     switch (scalar) {
         ' ' => try writer.writeAll("\\space"),
         '\n' => try writer.writeAll("\\newline"),
