@@ -3973,3 +3973,57 @@ test "nexis.pprint: a short collection prints flat, a long one breaks from its c
         \\ [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19]]]
     );
 }
+
+// =============================================================================
+// A definition binds the current namespace's own Var
+// =============================================================================
+
+test "def in a user namespace shadows the referred core Var without rebinding it" {
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(defn inc [x] (+ x 100))
+        \\[(inc 1) (nexis.core/inc 1) (my.app/inc 1)]
+    , "[101 2 101]");
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(def inc 7)
+        \\(ns user)
+        \\[(inc 1) my.app/inc]
+    , "[2 7]");
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(declare later)
+        \\(defn f [] (later 1))
+        \\(defn later [x] (* x 3))
+        \\[(f) (nexis.core/inc 1)]
+    , "[3 2]");
+}
+
+test "syntax-quote qualifies a symbol to the namespace whose own Var it names" {
+    try expectOutputProgram("`(inc 1)", "(nexis.core/inc 1)");
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(defn inc [x] (+ x 100))
+        \\`(inc 1)
+    , "(my.app/inc 1)");
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(defn inc [x] (+ x 100))
+        \\(defmacro m [] `(inc 1))
+        \\[(m) (nexis.core/inc 1)]
+    , "[101 2]");
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(defmacro m [] `(helper 2))
+        \\(defn helper [x] (* x 5))
+        \\(m)
+    , "10");
+}
+
+test "a user macro named like a core macro is the namespace's own" {
+    try expectOutputProgram(
+        \\(ns my.app)
+        \\(defmacro when-let [b & body] :mine)
+        \\[(when-let [x 1] x) (nexis.core/when-let [x 1] x)]
+    , "[:mine 1]");
+}

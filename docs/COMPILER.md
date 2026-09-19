@@ -322,8 +322,14 @@ compiler relies on:
 - **Output**: routines whose `var_table` holds `*Var` pointers.
 
 - **Responsibilities**:
-  - `def` / `defn` intern the Var in the current namespace at
-    compile time (possibly unbound until the form runs).
+  - `def` / `defn` intern the Var in the current namespace itself
+    at compile time (possibly unbound until the form runs), never
+    in a referred one: `(ns my.app) (defn inc ...)` binds
+    `my.app/inc`, leaves `nexis.core/inc` as it was, and from then
+    on a bare `inc` in `my.app` resolves to the local Var (rule 6
+    finds it before the parent chain), as in Clojure. A symbol
+    qualified with the current namespace's own name is its own
+    Var, interned unbound when the definition is still to come.
   - Every Var reference is resolved to a `*Var` at compile time
     and stored in the routine's var table; the VM reads the Var's
     root at execution time, so forward references between

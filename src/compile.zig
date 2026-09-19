@@ -905,8 +905,24 @@ const Emitter = struct {
             existing_v
         else
             ns.intern(name) catch return CompileError.OutOfMemory;
-        // Dedup: linear scan (var_table length stays small;
-        // rarely > a few dozen).
+        return self.addVarTableEntry(v);
+    }
+
+    /// The V operand index of the current namespace's OWN Var
+    /// named `name`, created unbound when absent and never a
+    /// referred one: what `def` binds, and what a symbol qualified
+    /// with the current namespace's name means. A definition
+    /// therefore shadows a referred Var of the same name for this
+    /// namespace and leaves the referred Var as it was.
+    fn addVarLocal(self: *Emitter, name: []const u8) CompileError!u12 {
+        const ns = self.namespace orelse return CompileError.InternalCompilerBug;
+        const v = ns.intern(name) catch return CompileError.OutOfMemory;
+        return self.addVarTableEntry(v);
+    }
+
+    /// Dedup-append `v` to the routine's var table: a routine that
+    /// references one Var twice carries one entry.
+    fn addVarTableEntry(self: *Emitter, v: *vm.Var) CompileError!u12 {
         for (self.var_table.items, 0..) |existing, i| {
             if (existing == v) return @intCast(i);
         }
@@ -3428,28 +3444,17 @@ fn compileQualifiedSymbol(
     // via `(require '[real.name :as ns_prefix])` names its target;
     // any other prefix is a namespace name.
     const target_ns = qualifiedTarget(current_ns, ns_prefix) orelse return CompileError.UnresolvedSymbol;
-    // The current namespace's own name interns like a bare
-    // symbol, so a forward reference qualified by syntax-quote
-    // works as the bare one does.
+    // A symbol qualified with the current namespace's own name is
+    // its own Var, interned unbound when the definition is still
+    // to come (a forward reference syntax-quote qualified).
     if (target_ns == current_ns) {
-        const idx = try e.addVarRef(name);
+        const idx = try e.addVarLocal(name);
         try e.emit(vm.asm_.varLoadVar(dst, idx));
         return;
     }
     const v = target_ns.lookupLocal(name) orelse return CompileError.UnresolvedSymbol;
-    // Reuse the var_table machinery (dedup + table append). We
-    // bypass `addVarRef`'s lookup-then-intern path because we
-    // already have the Var pointer.
-    for (e.var_table.items, 0..) |existing, i| {
-        if (existing == v) {
-            try e.emit(vm.asm_.varLoadVar(dst, @intCast(i)));
-            return;
-        }
-    }
-    const idx = e.var_table.items.len;
-    if (idx >= 4096) return CompileError.SlotOverflow;
-    try e.var_table.append(e.allocator, v);
-    try e.emit(vm.asm_.varLoadVar(dst, @intCast(idx)));
+    const idx = try e.addVarTableEntry(v);
+    try e.emit(vm.asm_.varLoadVar(dst, idx));
 }
 
 fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
@@ -3510,8 +3515,9 @@ fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
     }
 }
 
-/// Lower `(def name value?)`. Interns the Var in the
-/// namespace (creating an unbound Var if absent), compiles
+/// Lower `(def name value?)`. Interns the Var in the current
+/// namespace itself (creating an unbound Var if absent; a referred
+/// Var of the same name is shadowed, never rebound), compiles
 /// `value` into a temp slot, emits `var:store-var` to update
 /// the Var's root and write the Var object into `dst`.
 ///
@@ -3529,7 +3535,7 @@ fn compileDef(
     dst: u12,
 ) CompileError!void {
     if (e.namespace == null) return CompileError.UnresolvedSymbol;
-    const idx = try e.addVarRef(name);
+    const idx = try e.addVarLocal(name);
     if (value) |val| {
         const t = try e.allocSlot();
         try compileExpr(e, val, t, null); // RHS is non-tail
