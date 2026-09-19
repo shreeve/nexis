@@ -35,7 +35,6 @@ const intern_mod = @import("intern");
 const expand_mod = @import("expand");
 const compile_mod = @import("compile");
 const vm_mod = @import("vm");
-const value_mod = @import("value");
 
 pub const LoadError = error{
     /// The requested namespace name could not be mapped to a
@@ -213,13 +212,7 @@ pub const Loader = struct {
                 &declared,
             ) catch return LoadError.LoadCompileFailed;
             const routine = compiled.toRoutine("loader");
-            self.vm.frames.items[0].routine = &routine;
-            self.vm.frames.items[0].pc = 0;
-            self.vm.frames.items[0].slot_count = routine.slot_count;
-            self.vm.halted = false;
-            if (self.vm.stack.items.len < routine.slot_count) {
-                self.vm.stack.appendNTimes(self.vm.allocator, value_mod.nilValue(), routine.slot_count - self.vm.stack.items.len) catch return LoadError.OutOfMemory;
-            }
+            self.vm.retargetTop(&routine) catch return LoadError.OutOfMemory;
             _ = self.vm.run() catch return LoadError.LoadCompileFailed;
         }
     }

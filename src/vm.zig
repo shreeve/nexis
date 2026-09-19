@@ -1971,7 +1971,7 @@ pub const VM = struct {
                 // Set up result cell and push the synthetic frame.
                 var result_cell = HostCallResult{};
                 const initial_depth = self.frames.items.len;
-                self.frames.append(self.allocator, .{
+                try self.pushFrame(.{
                     .routine = routine,
                     .base_slot = @intCast(base_slot),
                     .entry_stack_len = @intCast(base_slot),
@@ -1979,13 +1979,7 @@ pub const VM = struct {
                     .pc = 0,
                     .upvalues = closure.upvalues,
                     .host_result = &result_cell,
-                }) catch return VmError.OutOfMemory;
-                if (self.frames.items.len > self.frame_high_water) {
-                    self.frame_high_water = self.frames.items.len;
-                }
-                if (self.stack.items.len > self.stack_high_water) {
-                    self.stack_high_water = self.stack.items.len;
-                }
+                });
 
                 // Run until our frame returns (depth back to initial).
                 try self.runUntilDepth(initial_depth);
@@ -2226,16 +2220,32 @@ pub const VM = struct {
         }
     }
 
+    /// Point the top-level frame at `routine` and clear the halt
+    /// flag so the next `run` executes it from its first
+    /// instruction. The frame keeps its base slot; the backing
+    /// stack is grown when the routine needs more slots than the
+    /// previous one. This is how the REPL, the file runner, the
+    /// loader and the tests run a sequence of compiled top-level
+    /// forms on one VM whose namespaces, interner and runtime
+    /// values persist between them.
+    pub fn retargetTop(self: *VM, routine: *const Routine) VmError!void {
+        const top = &self.frames.items[0];
+        top.routine = routine;
+        top.pc = 0;
+        top.slot_count = routine.slot_count;
+        self.halted = false;
+        if (self.stack.items.len < routine.slot_count) {
+            self.stack.appendNTimes(self.allocator, value_mod.nilValue(), routine.slot_count - self.stack.items.len) catch return VmError.OutOfMemory;
+        }
+    }
+
     /// Run bytecode to completion (halt). Returns the VM's `result`
     /// slot. If bytecode exhausts without a `return`, returns
     /// `BytecodeExhausted`.
     ///
-    /// Peer-AI turn 41: the `frame` pointer is scoped inside a
-    /// nested block so it cannot accidentally be reused after
-    /// `dispatch()` — `dispatch` may grow `frames` in step 5a1
-    /// (call:call) and invalidate the pointer. The block-scoping
-    /// makes the lifetime structurally obvious rather than just
-    /// conventionally true.
+    /// The `frame` pointer is scoped inside a nested block so it
+    /// cannot be reused after `dispatch()`, which may grow `frames`
+    /// and invalidate it.
     pub fn run(self: *VM) VmError!Value {
         while (!self.halted) {
             const inst = blk: {
@@ -2561,9 +2571,6 @@ pub const VM = struct {
         if (callee_end > self.stack.items.len) {
             const grow_by: usize = callee_end - self.stack.items.len;
             try self.stack.appendNTimes(self.allocator, value_mod.nilValue(), grow_by);
-            if (self.stack.items.len > self.stack_high_water) {
-                self.stack_high_water = self.stack.items.len;
-            }
         }
 
         // Step 5e: variadic-rest materialization. After this
@@ -2623,9 +2630,9 @@ pub const VM = struct {
         // points to the instruction following call:call.
         const caller_pc_after_call: u32 = self.frames.items[caller_idx].pc;
 
-        // Append callee frame. After this point, `caller_frame`
+        // Push the callee frame. After this point, `caller_frame`
         // pointers are invalidated.
-        try self.frames.append(self.allocator, .{
+        try self.pushFrame(.{
             .routine = callee_routine,
             .base_slot = callee_base,
             .entry_stack_len = entry_stack_len,
@@ -2929,7 +2936,6 @@ pub const VM = struct {
 
         try self.store(inst.c, closure_v);
     }
-
 
     // -------------------------------------------------------------------------
     // Group `math` (VM.md §10 #3 — PLAN §12.3 group 2)
@@ -3504,17 +3510,12 @@ pub const VM = struct {
         // unwinding through us).
         self.handlers.shrinkRetainingCapacity(handler_idx);
 
-        // Unwind frames above the matched handler's frame.
-        // Per peer-AI turn 59 §D8: do NOT write to caller
-        // return slots, just pop. (Normal `call:return` writes
-        // to caller's return_dst; throw bypasses that.) The
-        // lowest popped frame recorded the stack length its
-        // caller's frame set requires; restore that.
-        if (self.frames.items.len - 1 > matched.frame_index) {
-            const restore_len = self.frames.items[matched.frame_index + 1].entry_stack_len;
-            self.frames.shrinkRetainingCapacity(matched.frame_index + 1);
-            self.stack.shrinkRetainingCapacity(restore_len);
-        }
+        // Pop every frame above the handler's. A throw bypasses
+        // the callers' return slots: the frames are only popped,
+        // and each pop restores the stack length its frame
+        // recorded on entry, so the lowest pop leaves the extent
+        // the handler's frame set requires.
+        while (self.frames.items.len - 1 > matched.frame_index) _ = self.popFrame();
 
         const frame = self.currentFrame();
 
@@ -5296,13 +5297,7 @@ test "VM #6a: var:load-var returns var.root for bound var" {
         .slot_count = 1,
         .var_table = &var_table,
     };
-    // Reset the VM's frame to the new routine. (Hacky but
-    // matches what we did before compileTiny existed for the
-    // earlier VM tests.)
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
-    // Stack already has 1 slot from the stub routine.
+    try vm.retargetTop(&routine);
     const result = try vm.run();
     try testing.expect(result.isFixnum());
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
@@ -5329,9 +5324,7 @@ test "VM #6a: var:load-var on unbound Var traps :unbound-var" {
         .slot_count = 1,
         .var_table = &var_table,
     };
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
+    try vm.retargetTop(&routine);
     const res = vm.run();
     try testing.expectError(VmError.UnboundVar, res);
 }
@@ -5354,9 +5347,7 @@ test "VM #6a: var:load-var operand index out of range traps :operand-out-of-rang
         .slot_count = 1,
         // var_table = default empty
     };
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
+    try vm.retargetTop(&routine);
     const res = vm.run();
     try testing.expectError(VmError.OperandOutOfRange, res);
 }
@@ -5385,9 +5376,7 @@ test "VM #6a: var:load-var with non-V B operand traps :invalid-operand-kind" {
         .consts = &.{},
         .slot_count = 1,
     };
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
+    try vm.retargetTop(&routine);
     const res = vm.run();
     try testing.expectError(VmError.InvalidOperandKind, res);
 }
@@ -5417,9 +5406,7 @@ test "VM #6b: var:store-var sets root, marks bound, returns Var object" {
         .slot_count = 1,
         .var_table = &var_table,
     };
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
+    try vm.retargetTop(&routine);
 
     const result = try vm.run();
     // store-var returns the Var object, not the value.
@@ -5458,9 +5445,7 @@ test "VM #6b: var:store-var twice preserves Var identity (rebind in place)" {
         .slot_count = 1,
         .var_table = &var_table,
     };
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
+    try vm.retargetTop(&routine);
 
     const result = try vm.run();
     try testing.expect(result.kind() == .var_);
@@ -5490,9 +5475,7 @@ test "VM #6b: var:var-object returns the Var WITHOUT trapping on unbound" {
         .slot_count = 1,
         .var_table = &var_table,
     };
-    vm.frames.items[0].routine = &routine;
-    vm.frames.items[0].pc = 0;
-    vm.frames.items[0].slot_count = routine.slot_count;
+    try vm.retargetTop(&routine);
 
     const result = try vm.run();
     try testing.expect(result.kind() == .var_);

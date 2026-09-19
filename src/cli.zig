@@ -288,13 +288,7 @@ fn bootstrapEmbedded(
             std.debug.panic("nexis: {s} compile error: {s} (form span: {?})\n", .{ label, @errorName(err), error_span });
         };
         const routine = compiled.toRoutine(label);
-        v.frames.items[0].routine = &routine;
-        v.frames.items[0].pc = 0;
-        v.frames.items[0].slot_count = routine.slot_count;
-        v.halted = false;
-        if (v.stack.items.len < routine.slot_count) {
-            try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-        }
+        try v.retargetTop(&routine);
         _ = v.run() catch |err| {
             std.debug.panic("nexis: {s} runtime error: {s}\n", .{ label, @errorName(err) });
         };
@@ -466,17 +460,7 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         // Bind the new routine onto frame 0 + reset the VM
         // state for a fresh run.
         const routine = compiled.toRoutine("repl");
-        v.frames.items[0].routine = &routine;
-        v.frames.items[0].pc = 0;
-        v.frames.items[0].slot_count = routine.slot_count;
-        v.halted = false;
-        if (v.stack.items.len < routine.slot_count) {
-            try v.stack.appendNTimes(
-                v.allocator,
-                value_mod.nilValue(),
-                routine.slot_count - v.stack.items.len,
-            );
-        }
+        try v.retargetTop(&routine);
 
         const result = v.run() catch |err| {
             try stderr.writeStreamingAll(io, "nexis: runtime error: ");
@@ -652,18 +636,7 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
             std.process.exit(4);
         };
         const routine = compiled.toRoutine("file-form");
-        v.frames.items[0].routine = &routine;
-        v.frames.items[0].pc = 0;
-        v.frames.items[0].slot_count = routine.slot_count;
-        v.halted = false;
-        // Grow stack if needed.
-        if (v.stack.items.len < routine.slot_count) {
-            try v.stack.appendNTimes(
-                v.allocator,
-                value_mod.nilValue(),
-                routine.slot_count - v.stack.items.len,
-            );
-        }
+        try v.retargetTop(&routine);
         last_result = v.run() catch |err| {
             try std.Io.File.stderr().writeStreamingAll(io, "nexis: runtime error: ");
             try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));

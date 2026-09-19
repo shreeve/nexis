@@ -1265,7 +1265,6 @@ fn internKeywordForm(allocator: std.mem.Allocator, interner: *intern_mod.Interne
 /// intrinsics vs ordinary calls. Recursion into sub-expressions
 /// passes the env through unchanged; binding forms (let*, fn*,
 /// loop*, letfn*) construct a child env that adds their bindings.
-
 fn lowerFormEnv(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
@@ -5045,17 +5044,7 @@ fn runTinyWithNs(
     const ns = v.ensureNamespace();
     const compiled = try compileTinyWithNamespace(arena.allocator(), form, ns);
     const routine = compiled.toRoutine("test-with-ns");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    // Make sure stack is large enough for the new routine.
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(
-            v.allocator,
-            value_mod.nilValue(),
-            routine.slot_count - v.stack.items.len,
-        );
-    }
+    try v.retargetTop(&routine);
     return try v.run();
 }
 
@@ -5076,12 +5065,7 @@ test "compile #6b: (def x 5) returns the Var object" {
     const ns = v.ensureNamespace();
     const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
     const routine = compiled.toRoutine("def-test");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
 
     try testing.expect(result.kind() == .var_);
@@ -5124,12 +5108,7 @@ test "compile #6b: (var x) returns the Var object (unbound OK)" {
     const ns = v.ensureNamespace();
     const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
     const routine = compiled.toRoutine("var-ref-test");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
 
     try testing.expect(result.kind() == .var_);
@@ -5151,9 +5130,7 @@ test "compile #6b: reading an unbound Var traps :unbound-var at runtime" {
     const ns = v.ensureNamespace();
     const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
     const routine = compiled.toRoutine("unbound");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
+    try v.retargetTop(&routine);
     try testing.expectError(vm.VmError.UnboundVar, v.run());
 }
 
@@ -5309,12 +5286,7 @@ test "compile #6c: forward reference + call before bind → UnboundVar trap" {
     const ns = v.ensureNamespace();
     const compiled = try compileTinyWithNamespace(arena.allocator(), &form, ns);
     const routine = compiled.toRoutine("unbound-fwd");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     try testing.expectError(vm.VmError.UnboundVar, v.run());
 }
 
@@ -5696,10 +5668,12 @@ test "compile: scope restored after compile error" {
     // scope from the failed compile.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const failing: Tiny = .{ .let_star = .{
-        .bindings = &.{.{ .name = "x", .value = &.{ .int = 1 } }},
-        .body = &.{ .symbol = "y" }, // y is unbound → error
-    } };
+    const failing: Tiny = .{
+        .let_star = .{
+            .bindings = &.{.{ .name = "x", .value = &.{ .int = 1 } }},
+            .body = &.{ .symbol = "y" }, // y is unbound → error
+        },
+    };
     const res1 = compileTiny(arena.allocator(), &failing);
     try testing.expectError(CompileError.UnresolvedSymbol, res1);
     // The scope should not have leaked `x`. A fresh compile
@@ -5813,10 +5787,12 @@ test "compile 5a1: arity mismatch — call with too few args traps :arity-mismat
         .params = &.{ "x", "y" },
         .body = &.{ .symbol = "x" },
     } };
-    const call_form: Tiny = .{ .call = .{
-        .callee = &fn_form,
-        .args = &.{&.{ .int = 1 }}, // only 1 arg, fn expects 2
-    } };
+    const call_form: Tiny = .{
+        .call = .{
+            .callee = &fn_form,
+            .args = &.{&.{ .int = 1 }}, // only 1 arg, fn expects 2
+        },
+    };
     const compiled = try compileTiny(arena.allocator(), &call_form);
     const routine = compiled.toRoutine("arity-test");
     var v = try vm.VM.init(testing.allocator, &routine);
@@ -6775,12 +6751,7 @@ test "compile #7a: compileSource of symbol resolves via namespace fall-through" 
 
     const compiled = try compileSourceWithNamespace(arena.allocator(), "x", ns);
     const routine = compiled.toRoutine("src-symbol");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(@as(i64, 99), result.asFixnum());
 }
@@ -7171,12 +7142,7 @@ fn expectSourceFixnumWithNs(src: []const u8, expected: i64) !void {
     const ns = v.ensureNamespace();
     const compiled = try compileSourceWithNamespace(arena.allocator(), src, ns);
     const routine = compiled.toRoutine("src-ns");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(expected, result.asFixnum());
 }
@@ -7236,12 +7202,7 @@ test "compile #7d: forward reference + call before bind → UnboundVar at runtim
         ns,
     );
     const routine = compiled.toRoutine("fwd-unbound");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     try testing.expectError(vm.VmError.UnboundVar, v.run());
 }
 
@@ -7255,12 +7216,7 @@ test "compile #7d: (var x) returns the Var object" {
     const ns = v.ensureNamespace();
     const compiled = try compileSourceWithNamespace(arena.allocator(), "(var some-name)", ns);
     const routine = compiled.toRoutine("var-ref");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expect(result.kind() == .var_);
     const var_obj = vm.VM.asVar(result);
@@ -7375,12 +7331,7 @@ fn runSourceFull(src: []const u8) !struct { result: value_mod.Value, vm_owned: v
     const interner = v.ensureInterner();
     const compiled = try compileSourceFull(arena.allocator(), src, ns, interner);
     const routine = compiled.toRoutine("src-full");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     return .{ .result = result, .vm_owned = v };
 }
@@ -7425,21 +7376,13 @@ test "compile E1: 'foo and 'foo intern to the SAME symbol Value (identity stable
     // First program.
     const c1 = try compileSourceFull(arena.allocator(), "'foo", ns, interner);
     const r1 = c1.toRoutine("p1");
-    v.frames.items[0].routine = &r1;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = r1.slot_count;
-    if (v.stack.items.len < r1.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), r1.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&r1);
     const v1 = try v.run();
 
     // Second program — fresh frame, same VM/interner.
     const c2 = try compileSourceFull(arena.allocator(), "'foo", ns, interner);
     const r2 = c2.toRoutine("p2");
-    v.frames.items[0].routine = &r2;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = r2.slot_count;
-    v.halted = false;
+    try v.retargetTop(&r2);
     const v2 = try v.run();
 
     try testing.expect(v1.kind() == .symbol);
@@ -7464,12 +7407,7 @@ test "compile E1: (quote 42) still uses Tiny.int (no const-pool waste)" {
     const interner = v.ensureInterner();
     const compiled = try compileSourceFull(arena.allocator(), "(quote 42)", null, interner);
     const routine = compiled.toRoutine("scalar-quote");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
 }
@@ -7520,12 +7458,7 @@ test "compile #8a: empty macro table passes through (sanity)" {
         &host_macros,
     );
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
 }
@@ -7583,12 +7516,7 @@ fn runSourceWithDefaultMacros(src: []const u8) !struct { result: value_mod.Value
     defer host_macros.deinit(testing.allocator);
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     return .{ .result = result, .vm_owned = v };
 }
@@ -7728,12 +7656,7 @@ test "compile #8b: (and falsy ...) uses gensym (no double-eval on falsy)" {
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("and-gensym-falsy");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     // step was invoked exactly once even though `and` short-
     // circuited on falsy. The bad `(if x y x)` expansion would
@@ -7817,12 +7740,7 @@ test "compile #8b: (or expr ...) uses gensym (no double-eval)" {
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("or-gensym");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     // step was invoked exactly once, so step-count = 1.
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
@@ -8185,12 +8103,7 @@ test "compile #3.1: runtime-computed duplicate key — later wins (Clojure seman
     const src = "(let* [k :a k2 :a] {k 1 k2 2})";
     const compiled = try compileSourceFull(arena.allocator(), src, null, interner);
     const routine = compiled.toRoutine("dup-key-runtime");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expect(result.kind() == .persistent_map);
     const cm = @import("champ");
@@ -8251,12 +8164,7 @@ test "compile #3.1: runtime-computed duplicate elem — set collapses" {
     const src = "(let* [a 1 b 1] #{a b 2})";
     const compiled = try compileSourceFull(arena.allocator(), src, null, interner);
     const routine = compiled.toRoutine("dup-elem-runtime");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expect(result.kind() == .persistent_set);
     const cm = @import("champ");
@@ -8352,12 +8260,7 @@ test "compile #9.1: catch body's own throw NOT re-caught by same handler" {
         &host_macros,
     );
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     try testing.expectError(vm.VmError.UncaughtThrow, v.run());
     // The unhandled value is :b, not :a.
     try testing.expect(v.unhandled_throw != null);
@@ -8382,12 +8285,7 @@ test "compile #9.1: unhandled top-level throw → UncaughtThrow" {
         &host_macros,
     );
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     try testing.expectError(vm.VmError.UncaughtThrow, v.run());
     try testing.expectEqual(@as(i64, 13), v.unhandled_throw.?.asFixnum());
 }
@@ -8462,12 +8360,7 @@ test "compile #9.2: try/catch/finally — finally side effect via def" {
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
@@ -8502,12 +8395,7 @@ test "compile #9.2: uncaught throw — finally runs then throw propagates" {
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     // The outer try received 42 from the inner rethrow.
     try testing.expectEqual(@as(i64, 42), result.asFixnum());
@@ -8541,12 +8429,7 @@ test "compile #9.2: throw inside finally replaces pending value" {
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     // The outer catch sees 99 (the finally's throw), not the
     // body's value 1.
@@ -8576,12 +8459,7 @@ test "compile #9.2: finally body runs on caught-throw exit" {
     ;
     const compiled = try compileSourceFullWithMacros(arena.allocator(), src, ns, interner, &host_macros);
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(@as(i64, 1), result.asFixnum());
 }
@@ -8638,12 +8516,7 @@ test "compile #9.1: handler stack doesn't leak across normal exits" {
         &host_macros,
     );
     const routine = compiled.toRoutine("p");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     try testing.expectError(vm.VmError.UncaughtThrow, v.run());
 }
 
@@ -8735,12 +8608,7 @@ test "compile 4.0b: qualified symbol in quote interns full ns/name" {
     const interner = v.ensureInterner();
     const compiled = try compileSourceFull(arena.allocator(), "'foo/bar", null, interner);
     const routine = compiled.toRoutine("test");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expectEqual(value_mod.Kind.symbol, result.kind());
     const id: u32 = @intCast(result.payload);
