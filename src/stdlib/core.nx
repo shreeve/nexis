@@ -313,13 +313,17 @@
 
 ; (doc name) → prints the Var's :arglists and :doc, the way a
 ; REPL shows them; nil. A defn carries them once it is given a
-; docstring or attribute map.
+; docstring or attribute map. The keys are built when doc runs:
+; a keyword literal here would be interned at boot and shift the
+; intern order every script's map layout depends on.
 (defmacro doc [name]
-  `(let* [m# (meta (var ~name))]
+  `(let* [m# (meta (var ~name))
+          arglists# (get m# (keyword "arglists"))
+          docstring# (get m# (keyword "doc"))]
      (println "-------------------------")
      (println '~name)
-     (when (:arglists m#) (println (:arglists m#)))
-     (when (:doc m#) (println " " (:doc m#)))
+     (when arglists# (println arglists#))
+     (when docstring# (println " " docstring#))
      nil))
 
 ; (declare a b ...) → interns each name as an unbound Var so a

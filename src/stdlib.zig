@@ -179,7 +179,11 @@ const internal_fns = [_]CoreEntry{
 /// The part of nexis.core written in nexis itself, embedded at
 /// compile time. Evaluated after `installCore` so its definitions
 /// can use the natives. Add composite macros and fns to
-/// `src/stdlib/core.nx`, not here.
+/// `src/stdlib/core.nx`, not here. A keyword literal in that file
+/// is interned at boot, ahead of every keyword a script reads, and
+/// a map's iteration order is a function of intern order, so the
+/// file builds any keyword it needs at run time (`(keyword "x")`)
+/// and `test/nextomic/*.out` stay as they are.
 pub const CORE_NX_SOURCE: []const u8 = @embedFile("stdlib/core.nx");
 /// The `nextomic` namespace's sugar (`with-conn`), bootstrapped after
 /// `installNextomic` with that namespace current.
