@@ -503,6 +503,9 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         var error_span: ?reader_mod.SrcSpan = null;
         const compiled = compile.compileFormWith(rt.persistent(), form, rt.compileOptions(&error_span, &declared, line_source)) catch |err| {
             try emitCompileError(io, "<repl>", src, err, error_span);
+            // A `require` inside the form may have run a file whose
+            // form failed; that run's frames must not leak either.
+            rt.v.resetAfterError();
             continue;
         };
 

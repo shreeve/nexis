@@ -211,9 +211,13 @@ pub const Loader = struct {
                 &declared,
             ) catch return LoadError.LoadCompileFailed;
             // A nested call, never a retarget of the top frame: the
-            // VM may be executing the program that required us.
-            const routine = compiled.toRoutine("loader");
-            _ = self.vm.runRoutine(&routine) catch return LoadError.LoadCompileFailed;
+            // VM may be executing the program that required us. The
+            // routine lives in the persistent allocator because a run
+            // that fails leaves its frame in place for the error
+            // trace, and that frame must not point at a dead local.
+            const routine = ra.create(vm_mod.Routine) catch return LoadError.OutOfMemory;
+            routine.* = compiled.toRoutine("loader");
+            _ = self.vm.runRoutine(routine) catch return LoadError.LoadCompileFailed;
         }
     }
 
