@@ -334,6 +334,43 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
     return valueFromRoot(new_root_h);
 }
 
+/// `v` with element `i` replaced by `elem`, sharing every node not
+/// on the path to `i`. O(1) when `i` is in the tail, O(log₃₂ n)
+/// through the trie. `i` must be in bounds.
+pub fn assoc(heap: *Heap, v: Value, i: usize, elem: Value) !Value {
+    const src_h = rootHeader(v);
+    const src = rootBodyConst(src_h);
+    std.debug.assert(i < src.count);
+    const new_root_h = try allocRoot(heap);
+    const new_root = rootBody(new_root_h);
+    new_root.* = src.*;
+    const tail_offset: usize = src.count - src.tail_len;
+    if (i >= tail_offset) {
+        const new_tail = try allocTail(heap, src.tail_len);
+        @memcpy(tailValues(new_tail), tailValuesConst(src.tail_node.?));
+        tailValues(new_tail)[i - tail_offset] = elem;
+        new_root.tail_node = new_tail;
+    } else {
+        new_root.root_node = try assocPath(heap, src.root_node.?, src.shift, i, elem);
+    }
+    return valueFromRoot(new_root_h);
+}
+
+/// Copy the path from `node` (at `level_shift`) down to the leaf
+/// holding `i`, with `elem` stored there.
+fn assocPath(heap: *Heap, node: *HeapHeader, level_shift: u32, i: usize, elem: Value) !*HeapHeader {
+    if (level_shift == 0) {
+        const leaf = try allocLeaf(heap);
+        @memcpy(leafValues(leaf), leafValues(node));
+        leafValues(leaf)[i & branch_mask] = elem;
+        return leaf;
+    }
+    const clone = try cloneInterior(heap, node);
+    const child_idx: usize = (i >> @intCast(level_shift)) & branch_mask;
+    interiorChildren(clone)[child_idx] = try assocPath(heap, interiorChildren(node)[child_idx].?, level_shift - branch_bits, i, elem);
+    return clone;
+}
+
 /// Build a vector from a slice, in natural order. Implemented as
 /// a left-fold of `conj` for simplicity and to exercise the append
 /// paths during construction.
@@ -660,6 +697,26 @@ test "fromSlice + nth: round-trip across trie depth boundaries (1024, 1025)" {
         for (probe) |i| if (i < n) {
             try testing.expectEqual(@as(i64, @intCast(i)), nth(v, i).asFixnum());
         };
+    }
+}
+
+test "assoc: replaces one element in the tail or the trie and leaves the source intact" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const n: usize = 1025;
+    const elems = try testing.allocator.alloc(Value, n);
+    defer testing.allocator.free(elems);
+    for (elems, 0..) |*slot, i| slot.* = value.fromFixnum(@intCast(i)).?;
+    const v = try fromSlice(&heap, elems);
+    const probe = [_]usize{ 0, 31, 32, 500, 1023, 1024 };
+    for (probe) |i| {
+        const w = try assoc(&heap, v, i, value.fromFixnum(-1).?);
+        try testing.expectEqual(n, count(w));
+        for (0..n) |j| {
+            const expected: i64 = if (j == i) -1 else @intCast(j);
+            try testing.expectEqual(expected, nth(w, j).asFixnum());
+            try testing.expectEqual(@as(i64, @intCast(j)), nth(v, j).asFixnum());
+        }
     }
 }
 

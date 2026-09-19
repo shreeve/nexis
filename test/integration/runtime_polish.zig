@@ -282,3 +282,25 @@ test "keyword and symbol refuse an empty name catchably and take a namespace" {
         \\ (namespace (keyword "a" "b")) (name (symbol "a" "b"))]
     , "[:invalid-argument :invalid-argument :a/b a/b :b a b]");
 }
+
+// ---- vectors grow and update by path copy ----
+
+test "conj and assoc on a vector share structure and stay fast" {
+    try expectOutput(
+        \\(def v (loop [i 0 v []] (if (< i 20000) (recur (inc i) (conj v i)) v)))
+        \\(def w (assoc v 5 :a 1000 :b 19999 :c))
+        \\[(count v) (nth v 19999) (count w) (nth w 5) (nth w 1000) (nth w 19999) (nth v 5) (nth v 1000)
+        \\ (assoc [1 2] 2 3) (conj [1] 2 3)]
+    , "[20000 19999 20000 :a :b :c 5 1000 [1 2 3] [1 2 3]]");
+}
+
+// ---- merge ----
+
+test "merge of empty maps is a map, merge of nothing is nil" {
+    try expectOutput(
+        \\(defrecord R [a])
+        \\(def m (merge {:a 1} nil {:a 2 :b 3}))
+        \\[(merge {}) (merge {} {}) (merge) (merge nil) (merge nil {:a 1}) (count m) (:a m) (:b m)
+        \\ (R? (merge (->R 1) {:b 2})) (:b (merge (->R 1) {:b 2}))]
+    , "[{} {} nil nil {:a 1} 2 2 3 true 2]");
+}

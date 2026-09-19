@@ -235,16 +235,11 @@
 ; ---- collection extras ----
 
 ; (merge & maps) → left-to-right map merge. Later keys win.
-; (merge) → nil. (merge m) → m. Nil maps treated as empty.
+; (merge) → nil, and so does a merge of nils only; the first
+; non-nil map decides the result's kind, so a record stays one.
 (defn merge [& maps]
-  (reduce (fn* [acc m]
-            (if (nil? m)
-              acc
-              (reduce (fn* [a k] (assoc a k (get m k)))
-                      acc
-                      (keys m))))
-          nil
-          maps))
+  (when (some some? maps)
+    (reduce conj (remove nil? maps))))
 
 ; (update m k f & args) → assoc m with k → (apply f (get m k) args).
 (defn update [m k f & args]

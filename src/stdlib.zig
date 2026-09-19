@@ -1319,12 +1319,7 @@ fn assocOne(vm: *VM, coll: Value, k: Value, v: Value) VmError!Value {
             if (idx < 0 or @as(usize, @intCast(idx)) > n) return VmError.IndexOutOfBounds;
             const u_idx: usize = @intCast(idx);
             if (u_idx == n) break :blk vector_mod.conj(heap, coll, v) catch return VmError.OutOfMemory;
-            const items = vm.allocator.alloc(Value, n) catch return VmError.OutOfMemory;
-            defer vm.allocator.free(items);
-            var i: usize = 0;
-            while (i < n) : (i += 1) items[i] = vector_mod.nth(coll, i);
-            items[u_idx] = v;
-            break :blk vector_mod.fromSlice(heap, items) catch VmError.OutOfMemory;
+            break :blk vector_mod.assoc(heap, coll, u_idx, v) catch VmError.OutOfMemory;
         },
         else => VmError.KindMismatch,
     };
@@ -1492,21 +1487,9 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
             break :blk result;
         },
         .persistent_vector => blk: {
-            // Materialize, append, rebuild. Vector push API
-            // exists but our limited public surface only has
-            // fromSlice; round-tripping is fine for v1.
-            const n = vector_mod.count(coll);
-            var items: std.ArrayList(Value) = .empty;
-            defer items.deinit(vm.allocator);
-            items.ensureTotalCapacity(vm.allocator, n + xs.len) catch return VmError.OutOfMemory;
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                items.append(vm.allocator, vector_mod.nth(coll, i)) catch return VmError.OutOfMemory;
-            }
-            for (xs) |x| {
-                items.append(vm.allocator, x) catch return VmError.OutOfMemory;
-            }
-            break :blk vector_mod.fromSlice(heap, items.items) catch VmError.OutOfMemory;
+            var result = coll;
+            for (xs) |x| result = vector_mod.conj(heap, result, x) catch return VmError.OutOfMemory;
+            break :blk result;
         },
         .persistent_map, .record => blk: {
             var result = coll;
