@@ -199,9 +199,9 @@ a file, like `db` and `nextomic`). Every example and test writes
 
 | native | result | errors |
 |---|---|---|
-| `(tv/sum xs)` | the sum of the elements: an integer (fixnum or bignum) for `i64`, a float for `f64`; `0` / `0.0` when empty | an `i64` sum that leaves `i64` is `:arithmetic-overflow` |
-| `(tv/dot xs ys)` | the dot product, of the same result kind as `sum` | element types differ: `:kind-mismatch`; lengths differ: `:invalid-argument`; `i64` overflow of a product or the running sum: `:arithmetic-overflow` |
-| `(tv/scale xs k)` | a typed vector of the same element type with every element multiplied by `k` | for `i64`, `k` must be an integer within `i64` (`:kind-mismatch`) and each product must fit (`:arithmetic-overflow`); for `f64`, `k` is any number, widened |
+| `(tv/sum xs)` | the sum of the elements: the exact integer for `i64` (a fixnum, or a bignum beyond the fixnum range, the value `(reduce + xs)` yields), a float for `f64`; `0` / `0.0` when empty | — |
+| `(tv/dot xs ys)` | the dot product, of the same result kind as `sum` and exact at any size for `i64` | element types differ: `:kind-mismatch`; lengths differ: `:invalid-argument` |
+| `(tv/scale xs k)` | a typed vector of the same element type with every element multiplied by `k` | for `i64`, `k` must be an integer within `i64` (`:kind-mismatch`) and each product must fit `i64` (`:arithmetic-overflow`: the result is an `i64` vector, so a product outside `i64` has no representation); for `f64`, `k` is any number, widened |
 | `(tv/map f xs)` | a typed vector of the same element type whose elements are `(f x)` for each element `x` (passed as the Value `nth` returns) | each result must fit the element type under the constructor rule of §7.1: an integer within `i64` for an `i64` vector, any number for an `f64` vector; otherwise `:kind-mismatch` |
 
 `tv/map` always returns a typed vector of the input's element type;
@@ -211,9 +211,15 @@ instead, which work on a typed vector as on any seqable.
 The `f64` kernels run four lanes of `@Vector(4, f64)` and fold the
 lanes at the end, so the association order differs from a left fold
 and the low bits of a sum can differ from `(reduce + xs)`. The `i64`
-kernels are scalar with overflow checks on every operation; an `i64`
-vector holds full `i64` elements, not fixnums, so a sum can overflow
-where fixnum arithmetic would have promoted. `tv/map` calls the
+kernels are scalar and exact: `sum` accumulates in `i128`, which the
+elements of any vector that fits in memory cannot overflow; `dot`
+forms each product in `i128` and, when the running total leaves
+`i128`, spills it into a bignum and continues; each hands its total
+to `bignum.fromI128`, so the result is a fixnum or a bignum by value
+alone, as `(reduce + xs)` promotes (SEMANTICS.md §2.2). `scale` is
+the one kernel, and the one arithmetic in the language, that raises
+`:arithmetic-overflow`: its result is an element-typed `i64` vector
+with no wider element to promote to. `tv/map` calls the
 function once per element through `vm.callValue`; the only heap Value
 it holds across those calls is `xs`, which the caller's argument slot
 keeps reachable (GC.md §11.5), and the results are collected into a
@@ -228,7 +234,7 @@ Zig-owned slice before the result vector is allocated.
 | `:kind-mismatch` | a constructor element of the wrong kind; a non-typed-vector to `typed-vector-type`; an update native (`conj`, `assoc`, ...); mismatched element types in `tv/dot`; a `tv/scale` or `tv/map` value that does not fit the element type |
 | `:index-out-of-bounds` | `nth` without a default, index outside `0..count` |
 | `:invalid-argument` | `tv/dot` over different lengths |
-| `:arithmetic-overflow` | an `i64` kernel result outside `i64` |
+| `:arithmetic-overflow` | a `tv/scale` product outside `i64` on an `i64` vector |
 | `:not-callable` | a typed vector in function position |
 | `:no-metadata-on-immediate` | `with-meta` |
 

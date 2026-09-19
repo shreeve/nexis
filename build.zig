@@ -331,6 +331,7 @@ pub fn build(b: *std.Build) void {
     stdlib_mod.addImport("list", list_mod);
     stdlib_mod.addImport("vector", vector_mod);
     stdlib_mod.addImport("typed_vector", typed_vector_mod);
+    stdlib_mod.addImport("bignum", bignum_mod);
     stdlib_mod.addImport("champ", champ_mod);
     stdlib_mod.addImport("intern", intern_mod);
     stdlib_mod.addImport("heap", heap_mod);
@@ -737,7 +738,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "format", .path = "src/format.zig", .imports = &.{ "value", "intern", "list", "vector", "champ", "string", "heap", "atom", "db", "vm", "record", "protocol", "nextomic_handle", "bignum", "typed_vector" } },
         .{ .name = "compile", .path = "src/compile.zig", .imports = &.{ "vm", "value", "list", "reader", "intern", "expand", "vector", "champ", "dispatch", "heap", "string", "bignum" } },
         .{ .name = "expand", .path = "src/expand.zig", .imports = &.{ "reader", "intern", "vm", "value", "list", "vector", "champ", "heap", "dispatch", "string", "bignum" } },
-        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "typed_vector", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol", "nextomic" } },
+        .{ .name = "stdlib", .path = "src/stdlib.zig", .imports = &.{ "value", "vm", "list", "vector", "typed_vector", "bignum", "champ", "intern", "dispatch", "db", "codec", "heap", "emdb", "atom", "string", "format", "record", "protocol", "nextomic" } },
         .{ .name = "loader", .path = "src/loader.zig", .imports = &.{ "reader", "intern", "expand", "compile", "vm", "value" } },
         .{ .name = "disasm", .path = "src/disasm.zig", .imports = &.{ "vm", "value", "format", "intern" } },
         // Appended after `loader` so the `quick` step's index
