@@ -111,7 +111,14 @@ pub const Kind = enum(u8) {
     /// src/nextomic/handle.zig; a plain value with no open transaction,
     /// compared and hashed structurally.
     nextomic_db = 39,
-    // 40..63 reserved for heap kinds.
+    /// Nextomic lazy entity (docs/NEXTOMIC.md §6). The heap body is
+    /// the `EntityBox` of src/nextomic/handle.zig: the db box the
+    /// entity reads through, its eid, and the read hook the natives
+    /// install; every attribute access opens one read at the
+    /// db-value's basis and mode. Equal when the db-values are equal
+    /// and the eids agree.
+    nextomic_entity = 40,
+    // 41..63 reserved for heap kinds.
 
     // ---- Runtime-private sentinels (never escape public API) ----
     unbound = 64,

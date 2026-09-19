@@ -212,6 +212,7 @@ From PLAN §15.10 / §23 #25 (frozen):
 | `meta_symbol` | Reserved; not yet allocated; non-serializable per metadata discipline. |
 | `byte_vector` | Reserved kind with no implementation. |
 | `durable_ref` | An identity into a store; the value half of a durable pair is codec bytes, but a ref inside a value is `:unserializable` (`docs/DB.md` §9). |
+| `nextomic_conn`, `nextomic_db`, `nextomic_entity` | Process-local: a Nextomic connection, the db-values taken from it and the entities read through them name a `Conn` the VM owns (`docs/NEXTOMIC.md` §6, §8). |
 
 Attempting to encode any of these returns
 `error.UnserializableKind` at the public API. No silent stubs, no

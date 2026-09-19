@@ -420,10 +420,12 @@ fn encodeValue(
         // identity-valued. NOT in §23 #25.
         .protocol,
         .protocol_fn,
-        // Nextomic handles are process-local: a connection and the
-        // db-values taken from it mean nothing in another process.
+        // Nextomic handles are process-local: a connection, the
+        // db-values taken from it and the entities read through them
+        // mean nothing in another process.
         .nextomic_conn,
         .nextomic_db,
+        .nextomic_entity,
         => return CodecError.UnserializableKind,
         // Sentinels (unbound, undef) and any other non-heap,
         // non-immediate kind reaching here is a runtime bug. Treat
@@ -590,6 +592,7 @@ fn decodeValue(
         @intFromEnum(Kind.meta_symbol),
         @intFromEnum(Kind.nextomic_conn),
         @intFromEnum(Kind.nextomic_db),
+        @intFromEnum(Kind.nextomic_entity),
         => CodecError.UnserializableKind,
         // Any other byte — including values in the reserved range
         // (8..15 immediates, 30..63 heap, 64..255 sentinels/unused)

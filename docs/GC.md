@@ -118,8 +118,8 @@ order it marks them:
 The interner holds no heap values (symbols and keywords are
 immediates), so `Interner.trace` is a no-op seam. Open `db` and
 `nextomic` connections hold no heap values; a `durable_ref`,
-`db_read_txn` or `nextomic_db` handle is reachable from wherever the
-program keeps it. The Nextomic query caches hold query values by
+`db_read_txn`, `nextomic_db` or `nextomic_entity` handle is reachable
+from wherever the program keeps it. The Nextomic query caches hold query values by
 heap identity and are emptied after every cycle instead of being
 rooted (`vm.nextomic_query_clear`; `docs/NEXTOMIC.md` §5); with a
 query in flight the clearing waits for it to return, because the
@@ -320,6 +320,7 @@ Kind dispatch table (`Collector.mark`):
 | `.record`             | `record.trace`             | the field map; `type_id` is a plain `u32` (PROTOCOLS.md §2.1) |
 | `.protocol`, `.protocol_fn` | `protocol.trace`     | nothing (leaf bodies)                       |
 | `.nextomic_conn`, `.nextomic_db` | inline `{}`     | nothing (a VM-owned pointer plus inline text / numbers) |
+| `.nextomic_entity`    | `nextomic_handle.traceEntity` | the db box and the map of the entity's last full read (NEXTOMIC.md §6) |
 | `.function`           | `Host.trace` (`VM.gcTrace`) | every upvalue cell (`markInternal`-free: cells are blocks of their own kind, marked through `mark`), then the routine's heap constants recursively through nested routines (VM.md §6) |
 | `.cell_internal`      | `Host.trace` (`VM.gcTrace`) | the cell's value (VM.md §6) |
 | `.typed_vector`       | `typed_vector.trace`       | nothing (unboxed i64 / f64 elements, `docs/TYPED_VECTOR.md` §5) |
@@ -554,7 +555,7 @@ gc.zig
 ├─ @import("atom")             — atom.trace
 ├─ @import("record")           — record.trace
 ├─ @import("protocol")         — protocol.trace
-└─ @import("nextomic_handle")  — kind constants (leaf handles)
+└─ @import("nextomic_handle")  — nextomic_handle.traceEntity (the conn and db boxes are leaves)
 ```
 
 No heap-kind module imports `gc.zig`; `vm.zig` does, as the host

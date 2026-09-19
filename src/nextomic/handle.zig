@@ -1,21 +1,30 @@
-//! handle.zig — heap bodies of the `nextomic_conn` and `nextomic_db`
-//! value kinds (NEXTOMIC.md §8).
+//! handle.zig — heap bodies of the `nextomic_conn`, `nextomic_db` and
+//! `nextomic_entity` value kinds (NEXTOMIC.md §8).
 //!
 //! This file is its own build module (`nextomic_handle`), below
-//! `dispatch`, `format` and `gc`, so those layers can print, compare,
-//! hash and trace the two kinds without importing the `nextomic`
-//! module that sits above them. The `nextomic.Conn` behind a
-//! connection handle is opaque here; `natives.zig` owns the cast.
+//! `dispatch`, `format`, `gc` and `vm`, so those layers can print,
+//! compare, hash, trace and look up the three kinds without importing
+//! the `nextomic` module that sits above them. The `nextomic.Conn`
+//! behind a connection handle is opaque here; `natives.zig` owns the
+//! cast.
 //!
-//! Both kinds are leaves for the collector: a connection box holds a
-//! pointer the VM owns and its path text inline; a db box holds that
-//! same pointer and numbers. Neither references another heap object.
+//! The connection and db boxes are leaves for the collector: a
+//! connection box holds a pointer the VM owns and its path text
+//! inline; a db box holds that same pointer and numbers. An entity box
+//! holds a db box and the map of its last full read, and the collector
+//! marks both.
 //!
 //!   - A connection handle is identity-valued: equal to itself only.
 //!   - A db-value is a plain value: two db boxes are equal when they
 //!     name the same connection, basis and mode (as-of, since,
 //!     history); `(= (d/db c) (d/db c))` holds while nothing was
 //!     transacted in between.
+//!   - A lazy entity is a value: two entity boxes are equal when their
+//!     db-values are equal and their eids agree, and hash accordingly.
+//!     Its attributes are read on access through the hook the box
+//!     carries (`entityLookup`), which `vm.lookup` calls for
+//!     `(:attr ent)` and `(get ent :attr)`; the hook is a function of
+//!     `natives.zig`, and the VM it runs against rides in the box too.
 
 const std = @import("std");
 const value = @import("value");
@@ -182,10 +191,157 @@ pub fn formatDb(v: Value, writer: *std.Io.Writer) !void {
 }
 
 // =============================================================================
+// Lazy entity
+// =============================================================================
+
+/// The read hook of an entity box: `(vm, entity, key, default)` → the
+/// attribute's value in the entity's view, or `default`. It returns
+/// only errors of the VM's set, so `vm.lookup` can cast them back.
+pub const EntityRead = *const fn (vm: *anyopaque, ent: Value, key: Value, default: Value) anyerror!Value;
+
+/// The fields of a lazy entity (NEXTOMIC.md §6).
+pub const EntityShape = struct {
+    /// The `nextomic_db` box the entity reads through.
+    db: Value,
+    eid: u64,
+    /// The VM the hook runs against.
+    vm: *anyopaque,
+    read: EntityRead,
+};
+
+const EntityBox = struct {
+    db: Value,
+    /// The map of the last full read (`keys`, `seq`, `count`, ...),
+    /// nil before one: kept reachable from the entity so an iteration
+    /// over it survives a collection inside a callback. Never read
+    /// back; every access folds the view again.
+    held: Value,
+    eid: u64,
+    vm: *anyopaque,
+    read: EntityRead,
+};
+
+comptime {
+    std.debug.assert(@alignOf(EntityBox) <= 16);
+}
+
+pub fn makeEntity(heap: *Heap, shape: EntityShape) !Value {
+    std.debug.assert(shape.db.kind() == .nextomic_db);
+    const h = try heap.alloc(.nextomic_entity, @sizeOf(EntityBox));
+    const body = Heap.bodyOf(EntityBox, h);
+    body.* = .{
+        .db = shape.db,
+        .held = value.nilValue(),
+        .eid = shape.eid,
+        .vm = shape.vm,
+        .read = shape.read,
+    };
+    return Heap.valueFromHeader(.nextomic_entity, h);
+}
+
+fn entityBody(v: Value) *EntityBox {
+    std.debug.assert(v.kind() == .nextomic_entity);
+    return Heap.bodyOf(EntityBox, Heap.asHeapHeader(v));
+}
+
+/// The db-value the entity reads through.
+pub fn entityDb(v: Value) Value {
+    return entityBody(v).db;
+}
+
+pub fn entityEid(v: Value) u64 {
+    return entityBody(v).eid;
+}
+
+/// Keep `m`, the map of a full read, reachable from the entity.
+pub fn entityHold(v: Value, m: Value) void {
+    entityBody(v).held = m;
+}
+
+/// `(get ent key default)` through the box's hook.
+pub fn entityLookup(ent: Value, key: Value, default: Value) anyerror!Value {
+    const body = entityBody(ent);
+    return body.read(body.vm, ent, key, default);
+}
+
+pub fn entityEqual(a: *HeapHeader, b: *HeapHeader) bool {
+    const x = Heap.bodyOf(EntityBox, a);
+    const y = Heap.bodyOf(EntityBox, b);
+    return x.eid == y.eid and dbEqual(Heap.asHeapHeader(x.db), Heap.asHeapHeader(y.db));
+}
+
+/// Structural hash over the same fields equality reads.
+pub fn entityHash(h: *HeapHeader) u32 {
+    if (h.cachedHash()) |cached| return cached;
+    const body = Heap.bodyOf(EntityBox, h);
+    const acc = hash_mod.combineOrdered(dbHash(Heap.asHeapHeader(body.db)), hash_mod.hashU64(body.eid));
+    const truncated: u32 = @truncate(acc);
+    if (truncated != 0) h.setCachedHash(truncated);
+    return truncated;
+}
+
+/// The collector marks the db box and the held map.
+pub fn traceEntity(h: *HeapHeader, visitor: anytype) void {
+    const body = Heap.bodyOf(EntityBox, h);
+    visitor.markValue(body.db);
+    visitor.markValue(body.held);
+}
+
+/// `#nextomic/entity {:db/id 4294967296}`: the eid alone, since the
+/// attributes are read on access and the db-value is `entity-db`'s.
+pub fn formatEntity(v: Value, writer: *std.Io.Writer) !void {
+    try writer.print("#nextomic/entity {{:db/id {d}}}", .{entityEid(v)});
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
 const testing = std.testing;
+
+fn echoKey(_: *anyopaque, _: Value, key: Value, _: Value) anyerror!Value {
+    return key;
+}
+
+test "entity box is a value over its db-value and eid, and reads through its hook" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var target: u32 = 0;
+    const conn: *anyopaque = @ptrCast(&target);
+    var other: u32 = 0;
+    const cur = try makeDb(&heap, .{ .conn = conn, .basis = 7 });
+    const cur2 = try makeDb(&heap, .{ .conn = conn, .basis = 7 });
+    const older = try makeDb(&heap, .{ .conn = conn, .basis = 7, .as_of = 3 });
+    const elsewhere = try makeDb(&heap, .{ .conn = @ptrCast(&other), .basis = 7 });
+    const vm: *anyopaque = @ptrCast(&target);
+
+    const a = try makeEntity(&heap, .{ .db = cur, .eid = 4294967296, .vm = vm, .read = &echoKey });
+    const a2 = try makeEntity(&heap, .{ .db = cur2, .eid = 4294967296, .vm = vm, .read = &echoKey });
+    const b = try makeEntity(&heap, .{ .db = cur, .eid = 4294967297, .vm = vm, .read = &echoKey });
+    const a_older = try makeEntity(&heap, .{ .db = older, .eid = 4294967296, .vm = vm, .read = &echoKey });
+    const a_elsewhere = try makeEntity(&heap, .{ .db = elsewhere, .eid = 4294967296, .vm = vm, .read = &echoKey });
+
+    const H = Heap.asHeapHeader;
+    try testing.expect(entityEqual(H(a), H(a)));
+    try testing.expect(entityEqual(H(a), H(a2)));
+    try testing.expectEqual(entityHash(H(a)), entityHash(H(a2)));
+    try testing.expect(!entityEqual(H(a), H(b)));
+    try testing.expect(entityHash(H(a)) != entityHash(H(b)));
+    try testing.expect(!entityEqual(H(a), H(a_older)));
+    try testing.expect(entityHash(H(a)) != entityHash(H(a_older)));
+    try testing.expect(!entityEqual(H(a), H(a_elsewhere)));
+
+    try testing.expectEqual(@as(u64, 4294967296), entityEid(a));
+    try testing.expect(dbEqual(H(entityDb(a)), H(cur)));
+    const key = Value{ .tag = 6, .payload = 42 };
+    const got = try entityLookup(a, key, value.nilValue());
+    try testing.expectEqual(key.payload, got.payload);
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try formatEntity(b, &w);
+    try testing.expectEqualStrings("#nextomic/entity {:db/id 4294967297}", w.buffered());
+}
 
 test "conn box keeps its path and is identity-valued" {
     var heap = Heap.init(testing.allocator);

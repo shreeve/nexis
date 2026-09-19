@@ -151,6 +151,7 @@ pub fn format(
         .db_connection => try writer.writeAll("#<db-connection>"),
         .nextomic_conn => try nextomic_handle.formatConn(v, writer),
         .nextomic_db => try nextomic_handle.formatDb(v, writer),
+        .nextomic_entity => try nextomic_handle.formatEntity(v, writer),
         .db_write_txn => try writer.writeAll("#<db-write-txn>"),
         .db_read_txn => try writer.writeAll("#<db-read-txn>"),
         .transient => try writer.writeAll("#<transient>"),

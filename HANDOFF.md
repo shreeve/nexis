@@ -158,10 +158,10 @@ interned ids). Heap kinds, by number: `string 16`, `bignum 17`,
 `transient 27`, `error_ 28`, `meta_symbol 29`, `native_fn 30`,
 `db_connection 31`, `db_write_txn 32`, `db_read_txn 33`, `atom 34`,
 `record 35`, `protocol 36`, `protocol_fn 37`, `nextomic_conn 38`,
-`nextomic_db 39`; 40-63 are free. A new kind adds an enum value and
-arms in `dispatch.zig` (equality, hash, category), `format.zig`,
-`gc.zig` and `codec.zig`; `nextomic_handle` is the pattern for a kind
-whose body lives above `dispatch`.
+`nextomic_db 39`, `nextomic_entity 40`; 41-63 are free. A new kind
+adds an enum value and arms in `dispatch.zig` (equality, hash,
+category), `format.zig`, `gc.zig` and `codec.zig`; `nextomic_handle`
+is the pattern for a kind whose body lives above `dispatch`.
 
 Numbers: fixnum, bignum and f64 with Clojure contagion. An integer
 result outside i48 is a bignum and one that fits is a fixnum again
