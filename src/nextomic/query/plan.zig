@@ -35,6 +35,7 @@ const db_mod = @import("../db.zig");
 const relation = @import("../relation.zig");
 const ir = @import("ir.zig");
 const rules_mod = @import("rules.zig");
+const parse_mod = @import("parse.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -47,6 +48,7 @@ const Clause = ir.Clause;
 const Ir = ir.Ir;
 const RuleSet = ir.RuleSet;
 const Relation = relation.Relation;
+pub const Diag = parse_mod.Diag;
 
 pub const Error = error{
     QuerySyntax,
@@ -193,11 +195,25 @@ pub const Ctx = struct {
     sources: std.ArrayList(*SourceSlot) = .empty,
     /// Entries of the AEVT tree this view reads, once asked.
     aevt_entries: ?u64 = null,
+    /// Where a syntax or attribute error leaves its reason.
+    diag: *Diag,
 
-    pub fn init(arena: Allocator, read: *Read, interner: *Interner, query: *const Ir, rules: *const RuleSet) !Ctx {
+    pub fn init(arena: Allocator, read: *Read, interner: *Interner, query: *const Ir, rules: *const RuleSet, diag: *Diag) !Ctx {
         var vars: std.ArrayList(ir.VarInfo) = .empty;
         try vars.appendSlice(arena, query.vars);
-        return .{ .arena = arena, .read = read, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len };
+        return .{ .arena = arena, .read = read, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .diag = diag };
+    }
+
+    /// `QuerySyntax` with its reason.
+    pub fn syntax(self: *Ctx, message: []const u8) error{QuerySyntax} {
+        self.diag.* = .{ .message = message };
+        return error.QuerySyntax;
+    }
+
+    /// `UnknownAttribute` for the attribute the query wrote as `attr`.
+    pub fn unknownAttr(self: *Ctx, attr: Value) error{UnknownAttribute} {
+        self.diag.* = .{ .message = "unknown attribute", .attr = attr };
+        return error.UnknownAttribute;
     }
 
     pub fn freshVar(self: *Ctx, sym: u32) !Var {
@@ -368,7 +384,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
         }
         const p = best orelse {
             if (unbound_pattern) return error.UnboundPattern;
-            return error.QuerySyntax;
+            return ctx.syntax("a predicate, function or rule argument is never bound");
         };
         switch (p.clause) {
             .pattern => |pat| {
@@ -442,7 +458,7 @@ fn notJoin(ctx: *Ctx, n: anytype, scope: []const Var) ![]const Var {
     for (body_vars.items) |v| {
         if (ir.containsVar(scope, v)) try join.append(ctx.arena, v);
     }
-    if (join.items.len == 0) return error.QuerySyntax;
+    if (join.items.len == 0) return ctx.syntax("not needs a variable bound outside it");
     return join.toOwnedSlice(ctx.arena);
 }
 
@@ -468,7 +484,7 @@ pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: 
         var ends: std.ArrayList(Var) = .empty;
         try ends.appendSlice(ctx.arena, bound_join.items);
         try ir.boundVars(ctx.arena, br, &ends);
-        for (join) |v| if (!ir.containsVar(ends.items, v)) return error.QuerySyntax;
+        for (join) |v| if (!ir.containsVar(ends.items, v)) return ctx.syntax("an or branch leaves a join variable unbound");
     }
     return .{ .@"or" = .{ .join = join, .bound = try bound_join.toOwnedSlice(ctx.arena), .fresh = fresh, .branches = plans } };
 }
@@ -529,14 +545,15 @@ fn patternAttr(ctx: *Ctx, a: ir.Term) !?Attr {
     if (a != .constant) return null;
     switch (a.constant) {
         .cell => |c| switch (c) {
-            .keyword => |kw| return (try ctx.attrByKeyword(kw)) orelse error.UnknownAttribute,
+            .keyword => |kw| return (try ctx.attrByKeyword(kw)) orelse ctx.unknownAttr(value.fromKeywordId(kw)),
             .int => |n| {
-                if (n <= 0 or n >= key.attr_partition_end) return error.UnknownAttribute;
-                return (try ctx.read.attr(@intCast(n))) orelse error.UnknownAttribute;
+                const id = value.fromFixnum(n) orelse unreachable;
+                if (n <= 0 or n >= key.attr_partition_end) return ctx.unknownAttr(id);
+                return (try ctx.read.attr(@intCast(n))) orelse ctx.unknownAttr(id);
             },
-            else => return error.QuerySyntax,
+            else => return ctx.syntax("an attribute is a keyword or an id"),
         },
-        .lookup => return error.QuerySyntax,
+        .lookup => return ctx.syntax("an attribute cannot be a lookup ref"),
     }
 }
 
@@ -652,7 +669,7 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) anyerror!?Co
             return .{ .cell = .{ .int = @intCast(eid) }, .name = if (c == .cell and c.cell == .keyword) c.cell.keyword else null };
         },
         1 => {
-            const at = attr orelse return error.QuerySyntax;
+            const at = attr orelse return ctx.syntax("an attribute is a keyword or an id");
             return .{ .cell = .{ .int = at.id }, .name = if (c == .cell and c.cell == .keyword) c.cell.keyword else null };
         },
         2 => {
@@ -673,7 +690,7 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) anyerror!?Co
             };
         },
         3 => {
-            if (c != .cell or c.cell != .int) return error.QuerySyntax;
+            if (c != .cell or c.cell != .int) return ctx.syntax("the tx position takes a t or a transaction id");
             const n = c.cell.int;
             if (n < 0) return null;
             const t = key.txOfEntity(@intCast(n)) orelse @as(u64, @intCast(n));
@@ -681,7 +698,7 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) anyerror!?Co
             return .{ .cell = .{ .int = @intCast(key.txEntity(t)) } };
         },
         4 => {
-            if (c != .cell or c.cell != .boolean) return error.QuerySyntax;
+            if (c != .cell or c.cell != .boolean) return ctx.syntax("the added position takes a boolean");
             return .{ .cell = c.cell };
         },
         else => unreachable,
@@ -704,11 +721,11 @@ pub fn resolveEntity(ctx: *Ctx, c: ir.Constant) anyerror!?u64 {
                 const id = (try ctx.read.db.conn.idents.idOf(ctx.read.txn, kw)) orelse return null;
                 return id;
             },
-            else => return error.QuerySyntax,
+            else => return ctx.syntax("an entity is an id, an ident or a lookup ref"),
         },
         .lookup => |l| {
-            const at = (try ctx.attrByKeyword(l.attr)) orelse return error.UnknownAttribute;
-            if (at.unique == .none) return error.QuerySyntax;
+            const at = (try ctx.attrByKeyword(l.attr)) orelse return ctx.unknownAttr(value.fromKeywordId(l.attr));
+            if (at.unique == .none) return ctx.syntax("a lookup ref needs a unique attribute");
             const val = (try resolveTyped(ctx, .{ .cell = l.v }, at.value_type)) orelse return null;
             return ctx.read.entid(ctx.arena, .{ .lookup = .{ .a = at.id, .v = val } }) catch |err| switch (err) {
                 error.ValueType, error.TxData => null,

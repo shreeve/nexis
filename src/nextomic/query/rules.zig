@@ -200,8 +200,8 @@ fn collectRuleCalls(arena: Allocator, clauses: []const Clause, name: u32, out: *
 // =============================================================================
 
 fn defsOf(ctx: *Ctx, name: u32, args: []const ir.Arg) ![]const ir.Rule {
-    const defs = ctx.rules.byName(name) orelse return error.QuerySyntax;
-    if (defs[0].head.len != args.len) return error.QuerySyntax;
+    const defs = ctx.rules.byName(name) orelse return ctx.syntax("unknown rule");
+    if (defs[0].head.len != args.len) return ctx.syntax("a rule is called with the wrong number of arguments");
     return defs;
 }
 
@@ -232,11 +232,11 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: *std.ArrayLis
                 try bound.append(ctx.arena, fresh);
                 break :blk fresh;
             },
-            .src => return error.QuerySyntax,
+            .src => return ctx.syntax("$ cannot be a rule argument"),
         };
     }
     for (arg_vars[0..defs[0].required]) |v| {
-        if (!ir.containsVar(bound.items, v)) return error.QuerySyntax;
+        if (!ir.containsVar(bound.items, v)) return ctx.syntax("a required rule argument is unbound");
     }
 
     const info = try ctx.ruleInfo();
@@ -455,7 +455,7 @@ const Renamer = struct {
                                 try out.append(arena, .{ .bind = .{ .call = g, .out = .{ .scalar = fresh } } });
                                 break :blk fresh;
                             },
-                            .src => return error.QuerySyntax,
+                            .src => return self.ctx.syntax("$ cannot be a rule argument"),
                         };
                         const slot = try arena.create(plan_mod.SourceSlot);
                         slot.* = .{};

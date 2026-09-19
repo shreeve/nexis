@@ -97,9 +97,9 @@ pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: DbV
     var read = try db.beginRead();
     defer read.close();
 
-    var ctx = try plan.Ctx.init(arena, &read, interner, parsed.query, parsed.rules);
+    var ctx = try plan.Ctx.init(arena, &read, interner, parsed.query, parsed.rules, diag);
     const p = try plan.plan(&ctx, parsed.query);
-    var ex = exec.Exec{ .arena = arena, .read = &read, .heap = heap, .interner = interner, .hook = options.hook };
+    var ex = exec.Exec{ .arena = arena, .read = &read, .heap = heap, .interner = interner, .hook = options.hook, .diag = diag };
     const input = try ex.inputRelation(parsed.query, args);
     const rel = try ex.runPlan(p, input);
     const rows = try ex.findRows(parsed.query, rel);
@@ -118,7 +118,7 @@ pub fn explain(gpa: Allocator, interner: *Interner, query: Value, db: DbValue, a
     var read = try db.beginRead();
     defer read.close();
 
-    var ctx = try plan.Ctx.init(arena, &read, interner, parsed.query, parsed.rules);
+    var ctx = try plan.Ctx.init(arena, &read, interner, parsed.query, parsed.rules, diag);
     const p = try plan.plan(&ctx, parsed.query);
     try plan.explain(p, &ctx, w);
 }

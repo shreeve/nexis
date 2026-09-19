@@ -49,6 +49,7 @@ const Var = ir.Var;
 const Cell = ir.Cell;
 const Relation = relation.Relation;
 const Ir = ir.Ir;
+const Diag = plan_mod.Diag;
 const Plan = plan_mod.Plan;
 const Step = plan_mod.Step;
 const Scan = plan_mod.Scan;
@@ -66,6 +67,8 @@ pub const Exec = struct {
     heap: *Heap,
     interner: *Interner,
     hook: ?CallHook,
+    /// Where an `UnknownAttribute` in an input leaves its name.
+    diag: ?*Diag = null,
 
     /// Run `p` from `input`, which binds at least `p.input`.
     pub fn runPlan(self: *Exec, p: *const Plan, input: Relation) anyerror!Relation {
@@ -276,7 +279,7 @@ pub const Exec = struct {
     }
 
     fn callUser(self: *Exec, sym: u32, cells: []const Cell) anyerror!Value {
-        const hook = self.hook orelse return error.QuerySyntax;
+        const hook = self.hook orelse return error.NoHook;
         const args = try self.arena.alloc(Value, cells.len);
         for (cells, args) |c, *a| a.* = try self.cellValue(c);
         return hook.call(hook.ctx, sym, args);
@@ -300,7 +303,6 @@ pub const Exec = struct {
     fn builtinPred(self: *Exec, b: ir.Builtin, args: []const Cell) anyerror!bool {
         switch (b) {
             .lt, .le, .gt, .ge => {
-                if (args.len < 2) return error.QuerySyntax;
                 for (args[0 .. args.len - 1], args[1..]) |x, y| {
                     const o = x.compare(y) orelse return error.ValueType;
                     const ok = switch (b) {
@@ -315,20 +317,15 @@ pub const Exec = struct {
                 return true;
             },
             .eq => {
-                if (args.len < 2) return error.QuerySyntax;
                 for (args[1..]) |y| if (!args[0].eql(y)) return false;
                 return true;
             },
             .ne => {
-                if (args.len < 2) return error.QuerySyntax;
                 for (args[1..]) |y| if (!args[0].eql(y)) return true;
                 return false;
             },
-            .missing => {
-                if (args.len != 3) return error.QuerySyntax;
-                return (try self.firstValue(args[1], args[2])) == null;
-            },
-            .ground, .get_else, .tuple, .untuple => return error.QuerySyntax,
+            .missing => return (try self.firstValue(args[1], args[2])) == null,
+            .ground, .get_else, .tuple, .untuple => unreachable,
         }
     }
 
@@ -336,7 +333,7 @@ pub const Exec = struct {
     /// entity `e`, or null.
     fn firstValue(self: *Exec, e: Cell, attr: Cell) anyerror!?Cell {
         const eid = e.asEid() orelse return null;
-        if (attr != .keyword) return error.QuerySyntax;
+        if (attr != .keyword) return error.ValueType;
         const a = (try self.read.db.conn.idents.idOf(self.read.txn, attr.keyword)) orelse return null;
         var it = try self.read.scan(self.arena, .eavt, .{ .e = eid, .a = a });
         const d = (try it.next()) orelse return null;
@@ -352,12 +349,8 @@ pub const Exec = struct {
             const cells = try self.argCells(&rel, i, b.call.args);
             const result: Value = switch (b.call.f) {
                 .builtin => |bi| switch (bi) {
-                    .ground, .untuple => blk: {
-                        if (cells.len != 1) return error.QuerySyntax;
-                        break :blk try self.cellValue(cells[0]);
-                    },
+                    .ground, .untuple => try self.cellValue(cells[0]),
                     .get_else => blk: {
-                        if (cells.len != 4) return error.QuerySyntax;
                         const found = try self.firstValue(cells[1], cells[2]);
                         break :blk try self.cellValue(found orelse cells[3]);
                     },
@@ -366,7 +359,7 @@ pub const Exec = struct {
                         for (cells, vals) |c, *v| v.* = try self.cellValue(c);
                         break :blk try vector_mod.fromSlice(self.heap, vals);
                     },
-                    else => return error.QuerySyntax,
+                    .lt, .le, .gt, .ge, .eq, .ne, .missing => unreachable,
                 },
                 .user => |sym| try self.callUser(sym, cells),
             };
@@ -382,6 +375,8 @@ pub const Exec = struct {
     /// Append the rows `result` binds under `b.out`; `row[0..base]`
     /// holds the input row. An output variable bound before the step
     /// unifies: the row is kept only when the result equals its value.
+    /// A result that is not the collection its binding form needs is
+    /// `ValueType`.
     fn bindValue(self: *Exec, b: *const plan_mod.Bind, result: Value, row: []Cell, base: usize, out: *Relation) anyerror!void {
         switch (b.out) {
             .scalar => |v| {
@@ -389,7 +384,7 @@ pub const Exec = struct {
                 if (put(out, row, base, v, Cell.fromValue(result))) try out.append(row);
             },
             .collection => |v| {
-                const items = (try self.seqElems(result)) orelse return error.QuerySyntax;
+                const items = (try self.seqElems(result)) orelse return error.ValueType;
                 for (items) |x| {
                     if (put(out, row, base, v, Cell.fromValue(x))) try out.append(row);
                 }
@@ -399,7 +394,7 @@ pub const Exec = struct {
                 if (try self.fillTuple(out, ts, result, row, base)) try out.append(row);
             },
             .relation => |ts| {
-                const items = (try self.seqElems(result)) orelse return error.QuerySyntax;
+                const items = (try self.seqElems(result)) orelse return error.ValueType;
                 for (items) |x| {
                     if (try self.fillTuple(out, ts, x, row, base)) try out.append(row);
                 }
@@ -420,8 +415,8 @@ pub const Exec = struct {
     /// Fill the tuple binding `ts` from `v`; false when a bound
     /// variable disagrees with its element.
     fn fillTuple(self: *Exec, out: *const Relation, ts: []const ?Var, v: Value, row: []Cell, base: usize) anyerror!bool {
-        const items = (try self.seqElems(v)) orelse return error.QuerySyntax;
-        if (items.len < ts.len) return error.QuerySyntax;
+        const items = (try self.seqElems(v)) orelse return error.ValueType;
+        if (items.len < ts.len) return error.ValueType;
         for (ts, items[0..ts.len]) |t, x| {
             const tv = t orelse continue;
             if (!put(out, row, base, tv, Cell.fromValue(x))) return false;
@@ -472,7 +467,8 @@ pub const Exec = struct {
     }
 
     fn execSource(self: *Exec, src: *const plan_mod.Source, rel: Relation) anyerror!Relation {
-        const slot = src.slot.rel orelse return error.QuerySyntax;
+        // A fix step fills every slot of its instances before running them.
+        const slot = src.slot.rel.?;
         var distinct: std.ArrayList(Var) = .empty;
         for (src.vars) |v| try ir.addVar(self.arena, &distinct, v);
         var view: Relation = undefined;
@@ -500,15 +496,16 @@ pub const Exec = struct {
 
     /// The relation the `:in` bindings describe over `args`, which are
     /// positional with `in` (the `$` and `%` positions are ignored).
-    /// The relation the `:in` bindings of `q` make of `args`. A lookup
-    /// ref or an ident bound to a variable in an entity position, or in
-    /// the value position of a ref attribute, becomes the entity id, and
-    /// a row whose reference resolves to nothing is dropped; a keyword
-    /// bound to a variable that is also a keyword attribute's value
-    /// stays a keyword.
+    /// The relation the `:in` bindings of `q` make of `args`, one per
+    /// binding. A lookup ref or an ident bound to a variable in an
+    /// entity position, or in the value position of a ref attribute,
+    /// becomes the entity id, and a row whose reference resolves to
+    /// nothing is dropped; a keyword bound to a variable that is also a
+    /// keyword attribute's value stays a keyword. An input that is not
+    /// the collection its binding form needs is `ValueType`.
     pub fn inputRelation(self: *Exec, q: *const Ir, args: []const Value) anyerror!Relation {
         const in = q.in;
-        if (args.len != in.len) return error.QuerySyntax;
+        std.debug.assert(args.len == in.len);
         var rel = try Relation.unit(self.arena);
         for (in, args) |b, a| {
             const part: Relation = switch (b) {
@@ -520,7 +517,7 @@ pub const Exec = struct {
                 },
                 .collection => |v| blk: {
                     var r = try Relation.init(self.arena, &.{v});
-                    for ((try self.seqElems(a)) orelse return error.QuerySyntax) |x| try r.append(&.{Cell.fromValue(x)});
+                    for ((try self.seqElems(a)) orelse return error.ValueType) |x| try r.append(&.{Cell.fromValue(x)});
                     break :blk try r.dedup();
                 },
                 .tuple => |ts| blk: {
@@ -532,7 +529,7 @@ pub const Exec = struct {
                 .relation => |ts| blk: {
                     var r = try Relation.init(self.arena, try tupleVars(self.arena, ts));
                     const row = try self.arena.alloc(Cell, r.vars.len);
-                    for ((try self.seqElems(a)) orelse return error.QuerySyntax) |x| {
+                    for ((try self.seqElems(a)) orelse return error.ValueType) |x| {
                         if (try self.fillTuple(&r, ts, x, row, 0)) try r.append(row);
                     }
                     break :blk try r.dedup();
@@ -596,8 +593,15 @@ pub const Exec = struct {
             .keyword => |kw| return self.read.entid(self.arena, .{ .ident = kw }),
             .vm => |v| {
                 if (v.kind() != .persistent_vector or vector_mod.count(v) != 2 or vector_mod.nth(v, 0).kind() != .keyword) return null;
-                const id = (try self.read.db.conn.idents.idOf(self.read.txn, vector_mod.nth(v, 0).asKeywordId())) orelse return error.UnknownAttribute;
-                const at = (try self.read.attr(@intCast(id))) orelse return error.UnknownAttribute;
+                const name = vector_mod.nth(v, 0);
+                const at = blk: {
+                    if (try self.read.db.conn.idents.idOf(self.read.txn, name.asKeywordId())) |id| {
+                        if (try self.read.attr(@intCast(id))) |at| break :blk at;
+                    }
+                    if (self.diag) |d| d.* = .{ .message = "unknown attribute", .attr = name };
+                    return error.UnknownAttribute;
+                };
+                const id = at.id;
                 const val = (try plan_mod.encodeCell(self.read, Cell.fromValue(vector_mod.nth(v, 1)), at.value_type)) orelse return null;
                 return self.read.entid(self.arena, .{ .lookup = .{ .a = @intCast(id), .v = val } });
             },

@@ -348,8 +348,13 @@ const Parser = struct {
             const forward = try std.mem.concat(self.arena, u8, &.{ name[0..local_start], name[local_start + 1 ..] });
             break :blk try self.interner.internKeyword(forward);
         } else k;
-        const id = (try self.read.db.conn.idents.idOf(self.read.txn, attr_k)) orelse return error.UnknownAttribute;
-        const attr = (try self.read.attr(id)) orelse return error.UnknownAttribute;
+        const attr = blk: {
+            if (try self.read.db.conn.idents.idOf(self.read.txn, attr_k)) |id| {
+                if (try self.read.attr(id)) |attr| break :blk attr;
+            }
+            self.diag.* = .{ .clause = self.index, .message = "unknown attribute", .attr = value.fromKeywordId(k) };
+            return error.UnknownAttribute;
+        };
         if (reverse and attr.value_type != .ref) return self.fail("reverse reference on a non-ref attribute");
         const spec: Spec = .{
             .attr = attr,
@@ -407,8 +412,14 @@ const Puller = struct {
             .persistent_vector => {
                 if (vector_mod.count(e) != 2 or vector_mod.nth(e, 0).kind() != .keyword) return self.fail("lookup ref must be [attr value]");
                 const k = vector_mod.nth(e, 0).asKeywordId();
-                const id = (try self.read.db.conn.idents.idOf(self.read.txn, k)) orelse return error.UnknownAttribute;
-                const attr = (try self.read.attr(id)) orelse return error.UnknownAttribute;
+                const attr = blk: {
+                    if (try self.read.db.conn.idents.idOf(self.read.txn, k)) |id| {
+                        if (try self.read.attr(id)) |attr| break :blk attr;
+                    }
+                    self.diag.* = .{ .message = "unknown attribute", .attr = vector_mod.nth(e, 0) };
+                    return error.UnknownAttribute;
+                };
+                const id = attr.id;
                 const v = (try plan_mod.encodeCell(self.read, Cell.fromValue(vector_mod.nth(e, 1)), attr.value_type)) orelse return error.ValueType;
                 return (try self.read.entid(self.arena, .{ .lookup = .{ .a = id, .v = v } })) orelse error.NoEntity;
             },

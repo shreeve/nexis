@@ -45,6 +45,8 @@ pub const Error = error{ QuerySyntax, OutOfMemory };
 pub const Diag = struct {
     clause: ?usize = null,
     message: []const u8 = "",
+    /// The attribute an `UnknownAttribute` names, as the query wrote it.
+    attr: ?Value = null,
 };
 
 // =============================================================================
@@ -465,15 +467,40 @@ const Parser = struct {
         const name = self.symName(call_parts[0]) orelse return self.fail("function name must be a symbol");
         const f: ir.FnRef = if (ir.Builtin.fromName(name)) |b| .{ .builtin = b } else .{ .user = call_parts[0].asSymbolId() };
         const call: ir.Call = .{ .f = f, .args = try self.parseArgs(call_parts[1..], false) };
-        if (parts.len == 1) {
-            if (f == .builtin) switch (f.builtin) {
-                .ground, .get_else, .tuple, .untuple => return self.fail("function needs a binding form"),
-                else => {},
-            };
-            return .{ .pred = call };
-        }
+        if (f == .builtin) try self.checkBuiltin(f.builtin, call.args, parts.len == 1);
+        if (parts.len == 1) return .{ .pred = call };
         if (parts.len != 2) return self.fail("function clause is [(f args) binding]");
         return .{ .bind = .{ .call = call, .out = try self.parseBinding(parts[1]) } };
+    }
+
+    /// A built-in's arity and role: predicates stand alone, functions
+    /// need a binding form.
+    fn checkBuiltin(self: *Parser, b: ir.Builtin, args: []const ir.Arg, predicate: bool) Error!void {
+        switch (b) {
+            .lt, .le, .gt, .ge, .eq, .ne => {
+                if (!predicate) return self.fail("a comparison is a predicate; it binds nothing");
+                if (args.len < 2) return self.fail("a comparison needs at least two arguments");
+            },
+            .missing => {
+                if (!predicate) return self.fail("missing? is a predicate; it binds nothing");
+                if (args.len != 3 or args[0] != .src) return self.fail("missing? is (missing? $ ?e :attr)");
+            },
+            .ground => {
+                if (predicate) return self.fail("ground needs a binding form");
+                if (args.len != 1) return self.fail("ground takes one value");
+            },
+            .get_else => {
+                if (predicate) return self.fail("get-else needs a binding form");
+                if (args.len != 4 or args[0] != .src) return self.fail("get-else is (get-else $ ?e :attr default)");
+            },
+            .tuple => {
+                if (predicate) return self.fail("tuple needs a binding form");
+            },
+            .untuple => {
+                if (predicate) return self.fail("untuple needs a binding form");
+                if (args.len != 1) return self.fail("untuple takes one tuple");
+            },
+        }
     }
 
     fn parseArgs(self: *Parser, items: []Value, rule_call: bool) Error![]ir.Arg {
@@ -774,6 +801,21 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
     // Unknown section.
     const q7 = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("keys"), b.sym("e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
     try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, q7, &diag));
+
+    // Built-in arity and role are checked here, with a reason.
+    for ([_]Value{
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.lst(&.{ b.sym("<"), b.sym("?v") })}) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("<"), b.sym("?v"), b.int(3) }), b.sym("?x") }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.lst(&.{ b.sym("missing?"), b.sym("?e"), b.kw("a") })}) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("ground"), b.int(1), b.int(2) }), b.sym("?x") }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("get-else"), b.sym("?e"), b.kw("a"), b.int(0) }), b.sym("?x") }) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.lst(&.{ b.sym("tuple"), b.sym("?v") })}) }),
+        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("untuple"), b.sym("?v"), b.sym("?v") }), b.vec(&.{ b.sym("?x"), b.sym("?y") }) }) }),
+    }) |bad_call| {
+        try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, bad_call, &diag));
+        try testing.expect(diag.message.len > 0);
+        try testing.expectEqual(@as(?usize, 1), diag.clause);
+    }
 
     // A variable twice in one tuple binding.
     const q8 = b.vec(&.{ b.kw("find"), b.sym("?x"), b.kw("where"), b.vec(&.{ b.lst(&.{ b.sym("f"), b.int(1) }), b.vec(&.{ b.sym("?x"), b.sym("?x") }) }) });

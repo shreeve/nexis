@@ -51,6 +51,18 @@ pub const SyncMode = store_mod.SyncMode;
 // =============================================================================
 
 /// The Nextomic error set; each maps to a `:nextomic/*` keyword.
+/// What an operation was looking at when it failed, for the error
+/// payload the program sees (NEXTOMIC.md §7). A caller that wants the
+/// detail passes one in; every field is set only when the failing
+/// step has it at hand.
+pub const Fault = struct {
+    /// The attribute, as a keyword when it has an ident, else its id.
+    attr: ?Value = null,
+    e: ?u64 = null,
+    value: ?Val = null,
+    message: ?[]const u8 = null,
+};
+
 pub const Error = error{
     HistoryView,
     UnknownAttribute,

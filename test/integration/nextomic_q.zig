@@ -254,25 +254,32 @@ const Row = []const Cell;
 
 /// Rows through the pipeline, in `arena`.
 fn runEngine(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args: []const Value) anyerror![]const Row {
-    const qv = try fx.read(src);
     var diag: query.Diag = .{};
-    const parsed = try query.parse.parse(testing.allocator, fx.interner(), qv, &diag);
+    return runEngineDiag(fx, arena, dbv, src, args, &diag);
+}
+
+fn runEngineDiag(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args: []const Value, diag: *query.Diag) anyerror![]const Row {
+    const qv = try fx.read(src);
+    const parsed = try query.parse.parse(testing.allocator, fx.interner(), qv, diag);
     defer parsed.deinit();
-    if (args.len != parsed.in.len) return error.QuerySyntax;
+    if (args.len != parsed.in.len) {
+        diag.* = .{ .message = "wrong number of inputs" };
+        return error.QuerySyntax;
+    }
     var rules: *const ir.RuleSet = &ir.no_rules;
     var owned_rules: ?*ir.RuleSet = null;
     defer if (owned_rules) |r| r.deinit();
     for (parsed.in, args) |b, a| {
         if (b == .rules) {
-            owned_rules = try query.parse.parseRules(testing.allocator, fx.interner(), a, &diag);
+            owned_rules = try query.parse.parseRules(testing.allocator, fx.interner(), a, diag);
             rules = owned_rules.?;
         }
     }
     var read = try dbv.beginRead();
     defer read.close();
-    var ctx = try query.plan.Ctx.init(arena, &read, fx.interner(), parsed, rules);
+    var ctx = try query.plan.Ctx.init(arena, &read, fx.interner(), parsed, rules, diag);
     const p = try query.plan.plan(&ctx, parsed);
-    var ex = query.Exec{ .arena = arena, .read = &read, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook() };
+    var ex = query.Exec{ .arena = arena, .read = &read, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook(), .diag = diag };
     const input = try ex.inputRelation(parsed, args);
     const rel = try ex.runPlan(p, input);
     return ex.findRows(parsed, rel);
@@ -1153,7 +1160,12 @@ test "corpus: every :in form" {
     try testing.expectError(error.UnknownAttribute, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:nope/attr \"Ann\"]") }));
     // Wrong input count and shape.
     try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?e :in $ ?n :where [?e :person/name ?n]]", &.{nil}));
-    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?e :in $ [?n ...] :where [?e :person/name ?n]]", &.{ nil, value.fromFixnum(1).? }));
+    try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, "[:find ?e :in $ [?n ...] :where [?e :person/name ?n]]", &.{ nil, value.fromFixnum(1).? }));
+    try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, "[:find ?e :in $ [[?n ?a]] :where [?e :person/name ?n]]", &.{ nil, try fx.read("[[\"Ann\"]]") }));
+    // An unknown attribute in a lookup-ref input is named in the diagnostic.
+    var in_diag: query.Diag = .{};
+    try testing.expectError(error.UnknownAttribute, runEngineDiag(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:nope/attr \"Ann\"]") }, &in_diag));
+    try testing.expectEqual(try fx.kw("nope/attr"), in_diag.attr.?.asKeywordId());
 }
 
 test "corpus: not, not-join, or, or-join, and" {
@@ -1181,8 +1193,28 @@ test "corpus: not, not-join, or, or-join, and" {
     try checkCount(fx, dbv, "[:find ?n :where (and [?e :person/name ?n] [?e :person/active true])]", none, 3);
     try checkCount(fx, dbv, "[:find ?o :where (or-join [?o] (and [?o :order/total ?t] [(> ?t 50.0)]) [?o :order/items \"pear\"])]", none, 2);
     // Errors: not with nothing bound outside, or branches with different vars, unbound pattern.
-    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?n :where [?e :person/name ?n] (not [?x :person/tags :blue])]", none));
-    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?n :where [?e :person/name ?n] (or [?e :person/tags :blue] [?x :person/tags :green])]", none));
+    // Every planner refusal carries a reason.
+    for ([_][]const u8{
+        "[:find ?n :where [?e :person/name ?n] (not [?x :person/tags :blue])]",
+        "[:find ?n :where [?e :person/name ?n] (or [?e :person/tags :blue] [?x :person/tags :green])]",
+        "[:find ?e :where [?e :person/name ?n] [(< ?zz 3)]]",
+        "[:find ?e :where [?e [:person/email \"ann@x\"] ?v]]",
+        "[:find ?e :where [?e \"name\" ?v]]",
+        "[:find ?e :where [?e :person/name ?v \"tx\"]]",
+        "[:find ?e :where [?e :person/name ?v _ 1]]",
+        "[:find ?e :where [\"ann\" :person/name ?v]]",
+        "[:find ?e :where [[:person/name \"Ann\"] :person/age ?e]]",
+    }) |src| {
+        var d: query.Diag = .{};
+        try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, src, none, &d));
+        try testing.expect(d.message.len > 0);
+    }
+    var d_attr: query.Diag = .{};
+    try testing.expectError(error.UnknownAttribute, runEngineDiag(fx, fx.arena(), dbv, "[:find ?e :where [?e :nope/attr ?v]]", none, &d_attr));
+    try testing.expectEqual(try fx.kw("nope/attr"), d_attr.attr.?.asKeywordId());
+    d_attr = .{};
+    try testing.expectError(error.UnknownAttribute, runEngineDiag(fx, fx.arena(), dbv, "[:find ?e :where [?e 4000 ?v]]", none, &d_attr));
+    try testing.expectEqual(@as(i64, 4000), d_attr.attr.?.asFixnum());
     try testing.expectError(error.UnboundPattern, runEngine(fx, fx.arena(), dbv, "[:find ?e :where [?e ?a ?v]]", none));
     try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?e :where [?e :person/name ?n] [(< ?zz 3)]]", none));
 }
@@ -1220,9 +1252,16 @@ test "corpus: rules" {
     try checkCount(fx, dbv, "[:find ?l :in $ % :where [?n :node/label ?l] (reach ?n ?n)]", args, 3);
     try checkCount(fx, dbv, "[:find (count ?b) :in $ % :where [?a :node/label \"n3\"] (reach ?a ?b)]", args, 1);
     // Errors: unknown rule, arity, required argument unbound.
-    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?a :in $ % :where (nope ?a)]", args));
-    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?a :in $ % :where (admin ?a ?b)]", args));
-    try testing.expectError(error.QuerySyntax, runEngine(fx, fx.arena(), dbv, "[:find ?a ?l :in $ % :where (reach-label ?a ?l)]", args));
+    for ([_][]const u8{
+        "[:find ?a :in $ % :where (nope ?a)]",
+        "[:find ?a :in $ % :where (admin ?a ?b)]",
+        "[:find ?a ?l :in $ % :where (reach-label ?a ?l)]",
+        "[:find ?a :in $ % :where (admin $)]",
+    }) |src| {
+        var d: query.Diag = .{};
+        try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, src, args, &d));
+        try testing.expect(d.message.len > 0);
+    }
 }
 
 test "corpus: as-of, since, history views" {
