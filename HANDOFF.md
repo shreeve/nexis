@@ -68,7 +68,7 @@ zig build test --summary all      # the gate: 1472 tests, 157 steps, ~4 min wall
 ```
 
 The gate's last line reads `Build Summary: 157/157 steps succeeded;
-1462/1472 tests passed`, preceded by `golden: ok=11 updated=0
+1472/1472 tests passed`, preceded by `golden: ok=11 updated=0
 failed=0 missing=0`. Two integration binaries end with a benchmark
 whose row-count checks always run; the build runner echoes their
 stderr as `failed command:` lines while both succeed, so read the
