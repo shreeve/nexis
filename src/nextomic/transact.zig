@@ -574,15 +574,15 @@ const Ctx = struct {
                     try self.ops.append(self.arena, .{ .retract_entity = try self.entityFromVm(vector_mod.nth(form, 1)) });
                 } else return error.TxData;
             },
-            .persistent_map => _ = try self.normaliseMap(form, null),
+            .persistent_map => _ = try self.normaliseMap(form),
             else => return error.TxData,
         }
     }
 
-    /// Expand a map form into adds; returns the entity. `parent` is the
-    /// attribute under which a nested map appeared.
-    fn normaliseMap(self: *Ctx, m: Value, parent: ?Attr) anyerror!Ent {
-        _ = parent;
+    /// Expand a map form into adds; returns the entity. A key
+    /// `:ns/_attr` is a reverse ref: its value names the entities that
+    /// refer to this one through `:ns/attr`.
+    fn normaliseMap(self: *Ctx, m: Value) anyerror!Ent {
         var ent: ?Ent = null;
         var it = champ.mapIter(m);
         while (it.next()) |entry| {
@@ -596,17 +596,65 @@ const Ctx = struct {
         var it2 = champ.mapIter(m);
         while (it2.next()) |entry| {
             if (self.kwIs(entry.key, "db/id")) continue;
-            const attr = try self.attrFromVm(entry.key);
             const v = entry.value;
+            if (try self.reverseAttr(entry.key)) |attr| {
+                if (isCollection(v) and !try self.isLookupRef(v)) {
+                    for (try collectionElements(self.arena, v)) |el| try self.addReverse(e, attr, el);
+                } else {
+                    try self.addReverse(e, attr, v);
+                }
+                continue;
+            }
+            const attr = try self.attrFromVm(entry.key);
             if (attr.many() and isCollection(v) and !(attr.value_type == .ref and try self.isLookupRef(v))) {
-                var elems = try collectionElements(self.arena, v);
-                for (elems[0..]) |el| try self.addFromVm(e, attr, el);
-                elems = &.{};
+                for (try collectionElements(self.arena, v)) |el| try self.addFromVm(e, attr, el);
             } else {
                 try self.addFromVm(e, attr, v);
             }
         }
         return e;
+    }
+
+    /// The ref attribute a `:ns/_attr` key reverses, or null for any
+    /// other key.
+    fn reverseAttr(self: *Ctx, k: Value) !?Attr {
+        if (k.kind() != .keyword) return null;
+        const name = self.conn.interner.keywordName(k.asKeywordId());
+        const slash = std.mem.indexOfScalar(u8, name, '/') orelse return null;
+        if (slash + 1 >= name.len or name[slash + 1] != '_') return null;
+        const forward = try std.mem.concat(self.arena, u8, &.{ name[0 .. slash + 1], name[slash + 2 ..] });
+        const id = (try self.minter.lookupName(forward)) orelse return error.UnknownAttribute;
+        const attr = try self.attrById(id);
+        if (attr.value_type != .ref) return error.TxData;
+        return attr;
+    }
+
+    /// `[referrer attr e]` for one value under a reverse ref: an entity,
+    /// or a map form of one.
+    fn addReverse(self: *Ctx, e: Ent, attr: Attr, referrer: Value) anyerror!void {
+        const from = if (referrer.kind() == .persistent_map) try self.normaliseMap(referrer) else try self.entityFromVm(referrer);
+        try self.ops.append(self.arena, .{ .add = .{ .e = from, .attr = attr, .v = pvalOf(e) } });
+    }
+
+    fn pvalOf(e: Ent) PVal {
+        return switch (e) {
+            .eid => |id| .{ .val = .{ .ref = id } },
+            .tempid => |i| .{ .tempid = i },
+            .lookup => |l| .{ .lookup = l },
+        };
+    }
+
+    /// Does a map form name its entity: a `:db/id`, or a unique
+    /// attribute?
+    fn carriesIdentity(self: *Ctx, m: Value) !bool {
+        var it = champ.mapIter(m);
+        while (it.next()) |entry| {
+            if (self.kwIs(entry.key, "db/id")) return true;
+            if (entry.key.kind() != .keyword) continue;
+            const attr = self.attrFromVm(entry.key) catch continue;
+            if (attr.unique != .none) return true;
+        }
+        return false;
     }
 
     /// Under a ref attribute a two-element vector whose first element is
@@ -620,15 +668,14 @@ const Ctx = struct {
         return self.schema.attr(id) != null;
     }
 
+    /// One value under `attr`. A nested map under a ref attribute is an
+    /// entity; unless the attribute is a component it must carry an
+    /// identity, or nothing could ever reach it.
     fn addFromVm(self: *Ctx, e: Ent, attr: Attr, v: Value) anyerror!void {
         if (v.kind() == .persistent_map and attr.value_type == .ref) {
-            const nested = try self.normaliseMap(v, attr);
-            const pv: PVal = switch (nested) {
-                .eid => |id| .{ .val = .{ .ref = id } },
-                .tempid => |i| .{ .tempid = i },
-                .lookup => |l| .{ .lookup = l },
-            };
-            try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = pv } });
+            if (!attr.component and !try self.carriesIdentity(v)) return error.TxData;
+            const nested = try self.normaliseMap(v);
+            try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = pvalOf(nested) } });
             return;
         }
         try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, v) } });
@@ -1116,8 +1163,9 @@ const Ctx = struct {
     /// `:db/index` or `:db/unique` backfills AVET from AEVT.
     fn applySchema(self: *Ctx) !void {
         if (!self.schema_touched) return;
-        var new_attrs: std.AutoHashMapUnmanaged(u32, struct { has_type: bool = false, has_card: bool = false }) = .empty;
+        var new_attrs: std.AutoHashMapUnmanaged(u32, struct { has_type: bool = false, has_card: bool = false, many: bool = false }) = .empty;
         var backfill: std.AutoHashMapUnmanaged(u32, Attr) = .empty;
+        var unique_added: std.AutoHashMapUnmanaged(u32, void) = .empty;
         for (self.overlay.items) |p| {
             if (!key.isAttrPartition(p.e)) continue;
             const a: u32 = @intCast(p.e);
@@ -1129,10 +1177,12 @@ const Ctx = struct {
                     const g = try new_attrs.getOrPut(self.arena, a);
                     if (!g.found_existing) g.value_ptr.* = .{};
                     if (p.attr.id == boot.value_type) g.value_ptr.has_type = true else g.value_ptr.has_card = true;
+                    if (p.attr.id == boot.cardinality and p.v.keyword == boot.card_many) g.value_ptr.many = true;
                 },
                 boot.unique, boot.index => {
                     if (!p.added) return error.Conflict;
                     if (p.attr.id == boot.index and !p.v.boolean) continue;
+                    if (p.attr.id == boot.unique) try unique_added.put(self.arena, a, {});
                     if (existing) |ex| {
                         if (!ex.inAvet()) {
                             try backfill.put(self.arena, a, ex.*);
@@ -1147,6 +1197,13 @@ const Ctx = struct {
         var it = new_attrs.iterator();
         while (it.next()) |e| {
             if (!e.value_ptr.has_type or !e.value_ptr.has_card) return error.TxData;
+        }
+        // A unique attribute identifies one entity by one value, so it
+        // is card-one.
+        var uit = unique_added.keyIterator();
+        while (uit.next()) |a| {
+            const many = if (self.schema.attr(a.*)) |ex| ex.many() else new_attrs.get(a.*).?.many;
+            if (many) return error.TxData;
         }
         var bit = backfill.iterator();
         while (bit.next()) |e| try self.backfillAvet(e.value_ptr.*);
@@ -1694,6 +1751,145 @@ test "Lisp tx-data: vector forms, map forms, nested maps, card-many vectors, dat
     const bad = try vector_mod.fromSlice(&heap, &.{try K.k(tc, "db/add")});
     try testing.expectError(error.TxData, transact(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{bad}), .{}));
     try testing.expectError(error.TxData, transact(tc.conn, arena, try s.s(&heap, "nope"), .{}));
+}
+
+/// Lisp values for tx-data tests.
+const Lisp = struct {
+    tc: *TestConn,
+    heap: *@import("heap").Heap,
+
+    const dispatch = @import("dispatch");
+    const KV = struct { []const u8, Value };
+
+    fn kw(self: Lisp, name: []const u8) !Value {
+        return self.tc.interner.internKeywordValue(name);
+    }
+    fn str(self: Lisp, text: []const u8) !Value {
+        return string_mod.fromBytes(self.heap, text);
+    }
+    fn vec(self: Lisp, items: []const Value) !Value {
+        return vector_mod.fromSlice(self.heap, items);
+    }
+    fn map(self: Lisp, entries: []const KV) !Value {
+        var m = try champ.mapEmpty(self.heap);
+        for (entries) |e| m = try champ.mapAssoc(self.heap, m, try self.kw(e[0]), e[1], &dispatch.hashValue, &dispatch.equal);
+        return m;
+    }
+};
+
+test "a reverse ref in a map form asserts the forward datom" {
+    const tc = try TestConn.init("tx_reverse");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    const l = Lisp{ .tc = tc, .heap = &heap };
+    try installSchema(tc, arena);
+    const friend = try attrId(tc, "user/friend");
+    const home = try attrId(tc, "user/home");
+
+    // Ann and Bob befriend Cy through Cy's map; Cy's home names its
+    // owner through a reverse component ref, from a nested map.
+    const r = try transact(tc.conn, arena, try l.vec(&.{
+        try l.map(&.{ .{ "db/id", try l.str("ann") }, .{ "user/email", try l.str("ann@x") } }),
+        try l.map(&.{ .{ "db/id", try l.str("bob") }, .{ "user/email", try l.str("bob@x") } }),
+        try l.map(&.{
+            .{ "db/id", try l.str("cy") },
+            .{ "user/email", try l.str("cy@x") },
+            .{ "user/_friend", try l.vec(&.{ try l.str("ann"), try l.vec(&.{ try l.kw("user/email"), try l.str("bob@x") }) }) },
+        }),
+        try l.map(&.{ .{ "addr/city", try l.str("Rome") }, .{ "user/_home", try l.str("cy") } }),
+        try l.map(&.{ .{ "db/id", try l.str("di") }, .{ "user/email", try l.str("di@x") }, .{ "user/_friend", try l.map(&.{.{ "user/email", try l.str("ed@x") }}) } }),
+    }), .{});
+    var ann: u64 = 0;
+    var bob: u64 = 0;
+    var cy: u64 = 0;
+    var di: u64 = 0;
+    for (r.tempids) |b| {
+        if (std.mem.eql(u8, b.key.string, "ann")) ann = b.eid;
+        if (std.mem.eql(u8, b.key.string, "bob")) bob = b.eid;
+        if (std.mem.eql(u8, b.key.string, "cy")) cy = b.eid;
+        if (std.mem.eql(u8, b.key.string, "di")) di = b.eid;
+    }
+    const db = try tc.conn.db();
+    const ann_friends = try db.datoms(arena, .eavt, .{ .e = ann, .a = friend });
+    try testing.expectEqual(@as(usize, 1), ann_friends.len);
+    try testing.expectEqual(cy, ann_friends[0].v.ref);
+    const bob_friends = try db.datoms(arena, .eavt, .{ .e = bob, .a = friend });
+    try testing.expectEqual(cy, bob_friends[0].v.ref);
+    try testing.expectEqual(@as(usize, 0), (try db.datoms(arena, .eavt, .{ .e = cy, .a = friend })).len);
+    const cy_home = try db.datoms(arena, .eavt, .{ .e = cy, .a = home });
+    try testing.expectEqual(@as(usize, 1), cy_home.len);
+    const ed_friends = try db.datoms(arena, .vaet, .{ .a = friend, .v = try key.valBytes(arena, .{ .ref = di }) });
+    try testing.expectEqual(@as(usize, 1), ed_friends.len);
+
+    // A reverse ref needs a ref attribute and an entity value.
+    try testing.expectError(error.TxData, transact(tc.conn, arena, try l.vec(&.{
+        try l.map(&.{ .{ "db/id", try l.str("x") }, .{ "user/_email", try l.str("ann@x") } }),
+    }), .{}));
+    try testing.expectError(error.UnknownAttribute, transact(tc.conn, arena, try l.vec(&.{
+        try l.map(&.{ .{ "db/id", try l.str("x") }, .{ "user/_nope", try l.str("ann") } }),
+    }), .{}));
+    try testing.expectError(error.TxData, transact(tc.conn, arena, try l.vec(&.{
+        try l.map(&.{ .{ "db/id", try l.str("x") }, .{ "user/_friend", value.fromBool(true) } }),
+    }), .{}));
+}
+
+test "a nested map under a plain ref must carry an identity" {
+    const tc = try TestConn.init("tx_nested_identity");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("heap").Heap.init(arena);
+    defer heap.deinit();
+    const l = Lisp{ .tc = tc, .heap = &heap };
+    try installSchema(tc, arena);
+
+    // Under a component, or with a unique attribute or a :db/id, a
+    // nested map is an entity; otherwise it would be an orphan.
+    const ok = try transact(tc.conn, arena, try l.vec(&.{
+        try l.map(&.{
+            .{ "user/email", try l.str("ann@x") },
+            .{ "user/home", try l.map(&.{.{ "addr/city", try l.str("Rome") }}) },
+            .{ "user/friend", try l.vec(&.{
+                try l.map(&.{.{ "user/email", try l.str("bob@x") }}),
+                try l.map(&.{ .{ "db/id", try l.str("cy") }, .{ "user/name", try l.str("Cy") } }),
+            }) },
+        }),
+    }), .{});
+    try testing.expectEqual(@as(usize, 1), ok.tempids.len);
+    const ann = (try (try tc.conn.db()).entid(arena, .{ .lookup = .{ .a = try attrId(tc, "user/email"), .v = .{ .string = "ann@x" } } })).?;
+    try testing.expectEqual(@as(usize, 2), (try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = ann, .a = try attrId(tc, "user/friend") })).len);
+    try testing.expectError(error.TxData, transact(tc.conn, arena, try l.vec(&.{
+        try l.map(&.{
+            .{ "user/email", try l.str("ann@x") },
+            .{ "user/friend", try l.map(&.{.{ "user/name", try l.str("Orphan") }}) },
+        }),
+    }), .{}));
+}
+
+test "a card-many attribute cannot be unique" {
+    const tc = try TestConn.init("tx_unique_many");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const tags = try attrId(tc, "user/tags");
+
+    try testing.expectError(error.TxData, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = tags }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_value } } } },
+    }, .{}));
+    try testing.expectError(error.TxData, transactOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.ident }, .v = .{ .keyword = try kw(tc, "user/nick") } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_string } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_many } } } },
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_identity } } } },
+    }, .{}));
+    try testing.expect((try (try tc.conn.db()).attr(arena, tags)).?.unique == .none);
 }
 
 test "long strings round trip through the payload in every view" {
