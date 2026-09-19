@@ -10,6 +10,6 @@ embedded into the binary and bootstrapped at startup:
 - `src/stdlib/nextomic.nx`: sugar for the Nextomic natives (`with-conn`).
 
 Compiler primitives (`let*`, `fn*`, `letfn*`, `loop*`, `recur`, `def`,
-`if`, `do`, `quote`, `var`, `set!`, `try`, `throw`) live in
+`if`, `do`, `quote`, `var`, `try`, `throw`) live in
 `src/compile.zig`. Native functions live in `src/stdlib.zig` and
 `src/nextomic/natives.zig`.

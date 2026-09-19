@@ -333,7 +333,8 @@ The compiler recognizes a **small primitive core**. User-facing ergonomics (`let
 | `(throw e)` | Raise `e` as an exception value. |
 | `(try body... (catch bind pat handler) (finally cleanup))` | Exception handling. Frames with pending `finally` / unwind obligations are not tailcall-replaceable. |
 | `(var sym)` | Yield the `Var` object (not its root value). |
-| `(set! target expr)` | Narrowly scoped: only rebinds the current dynamic binding of a `^:dynamic` Var. Errors on ordinary locals, collections, or non-dynamic vars. Var root rebinding is via `def` / `alter-var-root!`, not `set!`. |
+
+`set!` does not exist: there are no dynamic bindings, and `def` is the only Var write.
 
 #### User-facing forms provided as macros
 
@@ -801,7 +802,7 @@ Stage boundaries are **strict**. A fresh implementation session must not let wor
 
 1. **Parser** (generated from `nexis.grammar`): source → raw `Sexp` tree with `.src` spans. Pure lexer + LALR(1). No semantic logic.
 2. **Reader / normalizer** (`src/reader.zig`): raw `Sexp` → canonical `Form` tree (Appendix C §28.2). Attaches origin + user metadata. Normalizes metadata sugar (`^:kw` → `{:kw true}`, merges multiple metas). Lowers `#(...)` to `(#%anon-fn body)`. Emits `(syntax-quote f)` markers *without* expansion. Discards `#_` forms. Rejects duplicate statically-detectable literal map/set keys, odd map arity, nested anon-fn, bare unquote outside syntax-quote.
-3. **Macroexpander** (`src/expand.zig`): canonical `Form` → expanded `Form`. Looks up macros in the current namespace's Var table. **Expands `syntax-quote` forms** (auto-qualification, auto-gensym, unquote/splice handling) as an early sub-pass. **Resolves `(#%anon-fn body)`** to `(fn* [%1 %2 ...] body)` by scanning for positional-arg symbols. Expands user macros outermost-first, to fixpoint, with `&form` and `&env` injected. Recursion limit enforced.
+3. **Macroexpander** (`src/expand.zig`): canonical `Form` → expanded `Form`. Looks up macros in the current namespace's Var table. **Expands `syntax-quote` forms** (auto-qualification, auto-gensym, unquote/splice handling) as an early sub-pass. **Resolves `(#%anon-fn body)`** to `(fn* [%1 %2 ...] body)` by scanning for positional-arg symbols. Expands user macros outermost-first, to fixpoint, passing the user arguments only. Recursion limit enforced.
 4. **Resolver** (`src/resolve.zig`): expanded `Form` → `Resolved` AST. Binds each symbol reference to one of: local slot, upvalue, Var handle, special form, or error (unbound). Detects shadowing. Resolution order: **special form → lexical local (let/fn/loop binding) → namespace-qualified → alias-qualified → current-namespace mapping**.
 5. **Analyzer** (`src/analyze.zig`): `Resolved` → `IR`. Assigns slots, identifies closures/upvalues, marks tail positions, folds constants, lifts literals to the pool.
 6. **Codegen** (`src/compile.zig`): `IR` → bytecode. Emits 64-bit instructions, per-function literal/var tables, source maps.
@@ -827,7 +828,7 @@ Stage boundaries are **strict**. A fresh implementation session must not let wor
 
 - Every error carries a `SrcSpan` resolved from the Form. For errors inside macro-expanded code, the error reports both the *expansion site* and the *macro's origin*.
 - Resolver errors: unbound symbol, wrong arity, duplicate binding, invalid destructuring.
-- Analyzer errors: `recur` outside tail position, `set!` on non-settable, `catch` without `try`.
+- Analyzer errors: `recur` outside tail position, `catch` without `try`.
 - All compiler errors use a stable error-kind taxonomy (`:unresolved-symbol`, `:arity-mismatch`, etc.) for tooling integration.
 
 ---
@@ -1107,11 +1108,11 @@ Adapted directly from em:
 
 ### 14.1 Macros
 
-- A `Var` with `macro: true` is a macro. Its value must be a function that conceptually receives **`(&form, &env, user-args...)`** and returns a `Form`. This matches Clojure's macro calling convention and is the minimum power needed for scope-aware expansion.
-- `&form` is the full invocation form being expanded (with source-span metadata intact). `&env` is the lexical environment at the expansion site, exposed in v1 as a deliberately shallow map of `symbol → LocalBinding`.
-- `(defmacro name [args] body)` is sugar for defining a macro-valued `Var`; the compiler injects `&form` and `&env` as invisible leading arguments at expansion time.
-- During macroexpansion, the compiler resolves head-position symbols to macro Vars and invokes them **at compile time** with the invocation form, lexical environment, and user arguments.
-- Macros run in a controlled compile-time environment: they may call functions from already-loaded namespaces, inspect `&form`, and consult the minimal `&env` view. v1 deliberately keeps `&env` small; it may be extended later without changing the core model.
+- A `Var` with `macro: true` is a macro. Its value is a function that receives the user arguments of the invocation form and returns a `Form`.
+- `&form` and `&env` are not injected: a macro sees its arguments only, not the invocation form or the lexical environment at the expansion site.
+- `(defmacro name [args] body)` is sugar for defining a macro-valued `Var`.
+- During macroexpansion, the expander resolves head-position symbols to macro Vars and invokes them **at compile time** with the user arguments.
+- Macros run in a controlled compile-time environment: they may call functions from already-loaded namespaces.
 - **Macros do not run at runtime.** After macroexpansion, no reference to the macro Var survives in the compiled bytecode.
 
 ### 14.2 Syntax-quote
@@ -2106,10 +2107,10 @@ The following are architectural decisions committed to, to prevent drift. Each r
 28. **`#(...)` anonymous fn** is lowered post-read to an internal form (e.g. `#%anon-fn`), not resolved by the reader. Nested `#(...)` is an error.
 29. **Backtick reads as `syntax-quote`**, not `quasiquote`. Full Clojure-style qualification + auto-gensym semantics implemented at the macro-expansion layer.
 30. **Persistent vector is plain 32-way trie with tail buffer in v1** (§9.2). No RRB relaxation. This matches Clojure's own vector.
-31. **Compiler knows only `*`-suffixed primitives** (§6.1): `let*`, `fn*`, `loop*`, `letfn*` plus the un-starred `def`, `if`, `do`, `quote`, `var`, `set!`, `recur`, `try`, `throw`. All user-facing `let`, `fn`, `loop`, `letfn`, `defn` are macros (`docs/MACROEXPAND.md` §10; `letfn` in `src/stdlib/core.nx`). Two-stage bootstrap.
+31. **Compiler knows only `*`-suffixed primitives** (§6.1): `let*`, `fn*`, `loop*`, `letfn*` plus the un-starred `def`, `if`, `do`, `quote`, `var`, `recur`, `try`, `throw`. All user-facing `let`, `fn`, `loop`, `letfn`, `defn` are macros (`docs/MACROEXPAND.md` §10; `letfn` in `src/stdlib/core.nx`). Two-stage bootstrap.
 32. **Keyword / symbol asymmetry** (§8.4): keywords interned, metadata-less, callable; symbols interned in common case, heap-wrapped when metadata-bearing. Hash domains are separated to avoid HAMT collision.
 33. **Keyword-as-function is a v1 language feature** (§8.7): `(:k m)` = `(get m :k)`, `(:k m default)` = `(get m :k default)`. Not a late specialization.
-34. **Macros receive `(&form, &env, user-args...)`** (§14.1), not just `Form → Form`. `&env` is a deliberately shallow `symbol → LocalBinding` map in v1.
+34. **Macros receive their user arguments only** (§14.1): `Form → Form` over the arguments, with no `&form` or `&env` injection.
 35. **`seq` is a core v1 abstraction** (§6.6) — confirmed by reading Clojure source. Direct fast paths on maps/vectors/typed-vectors bypass seq when that's clearer.
 36. **Cross-type sequential equality** (§6.7): list, vector, lazy-seq, and cons are mutually equal if element-wise equal. Map and set are their own equality categories. Hashes are constructed so the invariant holds by design.
 37. **CHAMP is the committed persistent-map target** (§9.1), not a stretch goal. Separate data/node bitmaps, canonical layout. Classic HAMT is a fallback only if CHAMP implementation hits a specific blocker.
@@ -2395,7 +2396,7 @@ A fresh implementation session **must** respect these stage boundaries:
 |---|---|---|---|
 | **Parser** (nexus-generated, `src/parser.zig`) | source text | raw `Sexp` tree with `.src` spans | Tokenization + LALR(1) parse. No semantic validation beyond grammar. No normalization. |
 | **Reader / normalizer** (`src/reader.zig`) | raw `Sexp` | canonical `Form` tree | Wraps each Sexp into a Form. Attaches source spans. Normalizes metadata sugar → map form. Lowers `#(...)` → `(#%anon-fn ...)`. Emits `(syntax-quote f)` markers. Discards `#_` forms. Rejects duplicate literal keys / odd map arity / nested anon-fn / bare unquote. |
-| **Macroexpander** (`src/expand.zig`) | canonical `Form` | expanded `Form` | Expands macros to fixpoint. Expands `syntax-quote` forms (auto-qualifies symbols, auto-gensym `x#`, handles unquote/splice). Resolves `#%anon-fn` to `(fn* [%1 %2 ...] body)`. Passes `&form` and `&env` to user macros. |
+| **Macroexpander** (`src/expand.zig`) | canonical `Form` | expanded `Form` | Expands macros to fixpoint. Expands `syntax-quote` forms (auto-qualifies symbols, auto-gensym `x#`, handles unquote/splice). Resolves `#%anon-fn` to `(fn* [%1 %2 ...] body)`. Passes the user arguments to user macros; `&form` and `&env` are not injected. |
 | **Resolver** (`src/resolve.zig`) | expanded `Form` | `Resolved` AST | Symbols → slot / upvalue / var handle / special form. Errors on unbound. |
 
 **Important**: `syntax-quote` expansion happens in the **macroexpander**, not the reader. The reader only marks syntax-quoted forms with the `(syntax-quote f)` tag. This lets tooling inspect raw reader output without losing the backtick-form structure.
