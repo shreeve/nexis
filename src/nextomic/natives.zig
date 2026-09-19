@@ -535,6 +535,18 @@ const fnTransact = wrap(transactNative);
 /// throws propagates through the transaction, which aborts.
 const TxHook = struct {
     vm: *VM,
+    /// Roots the db-value each call receives and every tx-data a
+    /// function returns for the transaction's life, so a nested call
+    /// cannot collect them (docs/GC.md).
+    scope: vm_mod.RootScope,
+
+    fn init(vm: *VM) TxHook {
+        return .{ .vm = vm, .scope = vm.rootScope() };
+    }
+
+    fn deinit(self: *TxHook) void {
+        self.scope.release();
+    }
 
     fn hook(self: *TxHook) transact_mod.CallHook {
         return .{ .ctx = @ptrCast(self), .call = &call };
@@ -543,7 +555,7 @@ const TxHook = struct {
     fn call(ctx: *anyopaque, f: Value, db_before: DbValue, args: []const Value) anyerror!Value {
         const self: *TxHook = @ptrCast(@alignCast(ctx));
         const vm = self.vm;
-        var resolver = query_natives.Hook{ .vm = vm };
+        var resolver = query_natives.Hook{ .vm = vm, .scope = self.scope };
         const callee = if (f.kind() == .symbol) (try resolver.lookup(f.asSymbolId())) orelse {
             const name = vm.ensureInterner().symbolName(f.asSymbolId());
             const message = try std.fmt.allocPrint(vm.allocator, "unknown function: {s}", .{name});
@@ -553,15 +565,19 @@ const TxHook = struct {
         const all = try vm.allocator.alloc(Value, args.len + 1);
         defer vm.allocator.free(all);
         all[0] = try boxDb(vm.ensureHeap(), db_before);
+        try self.scope.push(all[0]);
         @memcpy(all[1..], args);
-        return vm.callValue(callee, all);
+        const result = try vm.callValue(callee, all);
+        try self.scope.push(result);
+        return result;
     }
 };
 
 fn transactNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     const c = try openConn(args[0]);
     var fault: Fault = .{};
-    var tx_hook = TxHook{ .vm = vm };
+    var tx_hook = TxHook.init(vm);
+    defer tx_hook.deinit();
     var options: transact_mod.Options = .{ .fault = &fault, .hook = tx_hook.hook() };
     if (args.len == 3) options.sync = try syncOption(vm, args[2]);
     var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
@@ -650,7 +666,8 @@ fn withNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     // The fault's value lives in the arena: rendered before the arena goes.
     errdefer detail.* = detailOf(vm, c, &fault);
     const arena = arena_state.allocator();
-    var tx_hook = TxHook{ .vm = vm };
+    var tx_hook = TxHook.init(vm);
+    defer tx_hook.deinit();
     const w = try transact_mod.with(c, arena, args[1], .{ .fault = &fault, .hook = tx_hook.hook() });
     st.views.appendAssumeCapacity(w.view);
     defer w.finish();
