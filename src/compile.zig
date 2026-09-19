@@ -1169,6 +1169,16 @@ fn symbolResolves(ctx: LowerCtx, declared: *const DeclaredNames, name: []const u
     return declared.contains(name);
 }
 
+/// The namespace a qualified symbol's prefix names from `ns`: an
+/// alias registered there resolves to its target, any other
+/// prefix is a namespace name. Null when nothing is registered
+/// under it.
+fn qualifiedTarget(ns: *const vm.Namespace, ns_prefix: []const u8) ?*vm.Namespace {
+    const registry = ns.registry orelse return null;
+    const effective = if (ns.aliases_initialized) (ns.lookupAlias(ns_prefix) orelse ns_prefix) else ns_prefix;
+    return registry.lookupNs(effective);
+}
+
 /// Helper used by `lowerList` to test whether a head symbol is a
 /// shadowable intrinsic. Special forms are NOT shadowable; they
 /// have their own switch arm.
@@ -1211,8 +1221,19 @@ fn lowerFormEnv(
         .symbol => |name| blk: {
             // Qualified symbols `ns/name` lower to
             // `Tiny.qualified_symbol`; compileSymbol handles
-            // dispatch through the namespace registry.
+            // dispatch through the namespace registry. One that
+            // names the current namespace is checked like a bare
+            // symbol, so a forward reference a macro qualified
+            // still resolves through the file's declarations.
             if (name.ns) |ns_prefix| {
+                if (ctx.declared) |declared| {
+                    if (ctx.namespace) |ns| {
+                        if (qualifiedTarget(ns, ns_prefix) == ns and ns.lookupLocal(name.name) == null and !declared.contains(name.name)) {
+                            if (ctx.diag) |d| d.span = form.origin;
+                            return CompileError.UnresolvedSymbol;
+                        }
+                    }
+                }
                 break :blk try allocTiny(allocator, .{ .qualified_symbol = .{ .ns = ns_prefix, .name = name.name } });
             }
             if (ctx.declared) |declared| {
@@ -3199,17 +3220,18 @@ fn compileQualifiedSymbol(
     dst: u12,
 ) CompileError!void {
     const current_ns = e.namespace orelse return CompileError.UnresolvedSymbol;
-    const registry = current_ns.registry orelse return CompileError.UnresolvedSymbol;
-    // Alias resolution. If the current namespace
-    // has registered `ns_prefix` as an alias (via
-    // `(require '[real.name :as ns_prefix])`), swap it for the
-    // canonical name before the registry lookup. Otherwise the
-    // prefix is treated as a literal namespace name.
-    const effective_prefix = if (current_ns.aliases_initialized)
-        (current_ns.lookupAlias(ns_prefix) orelse ns_prefix)
-    else
-        ns_prefix;
-    const target_ns = registry.lookupNs(effective_prefix) orelse return CompileError.UnresolvedSymbol;
+    // Alias resolution: a prefix the current namespace registered
+    // via `(require '[real.name :as ns_prefix])` names its target;
+    // any other prefix is a namespace name.
+    const target_ns = qualifiedTarget(current_ns, ns_prefix) orelse return CompileError.UnresolvedSymbol;
+    // The current namespace's own name interns like a bare
+    // symbol, so a forward reference qualified by syntax-quote
+    // works as the bare one does.
+    if (target_ns == current_ns) {
+        const idx = try e.addVarRef(name);
+        try e.emit(vm.asm_.varLoadVar(dst, idx));
+        return;
+    }
     const v = target_ns.lookupLocal(name) orelse return CompileError.UnresolvedSymbol;
     // Reuse the var_table machinery (dedup + table append). We
     // bypass `addVarRef`'s lookup-then-intern path because we
@@ -7961,24 +7983,6 @@ test "compile quote vector: `[~x ~y] syntax-quote with unquote" {
     try testing.expectEqual(@as(usize, 2), vec_mod.count(r.result));
     try testing.expectEqual(@as(i64, 10), vec_mod.nth(r.result, 0).asFixnum());
     try testing.expectEqual(@as(i64, 20), vec_mod.nth(r.result, 1).asFixnum());
-}
-
-test "compile quote vector: syntax-quoted vector + splice → MacroExpansionFailure" {
-    // Vectors don't support splice (binding vectors are built
-    // positionally).
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    const interner = v.ensureInterner();
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    try testing.expectError(
-        CompileError.MacroExpansionFailure,
-        compileSourceFullWithMacros(arena.allocator(), "(let [xs '(1 2)] `[~@xs])", null, interner, &host_macros),
-    );
 }
 
 test "compile quote vector: nested vector in quoted list" {

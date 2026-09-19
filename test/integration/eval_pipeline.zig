@@ -513,17 +513,19 @@ test "integration: quote vector" {
 
 test "integration: syntax-quote no unquote" {
     try expectOutput("`(1 2 3)", "(1 2 3)");
-    try expectOutput("`(a b c)", "(a b c)");
+    // An unqualified symbol with no Var resolves to the current
+    // namespace, as in Clojure.
+    try expectOutput("`(a b c)", "(user/a user/b user/c)");
 }
 
 test "integration: syntax-quote with unquote" {
-    try expectOutput("(let* [x 5] `(value ~x))", "(value 5)");
+    try expectOutput("(let* [x 5] `(value ~x))", "(user/value 5)");
 }
 
 test "integration: syntax-quote with splicing" {
     try expectOutput(
         "(let* [xs (quote (b c d))] `(a ~@xs e))",
-        "(a b c d e)",
+        "(user/a b c d user/e)",
     );
 }
 
@@ -536,6 +538,67 @@ test "integration: synthesize let* form (the macro author's pattern)" {
         "(let* [name (quote x) val 42] `(let* [~name ~val] ~name))",
         "(let* [x 42] x)",
     );
+}
+
+test "syntax-quote: ~@ splices any seqable, in lists and vectors" {
+    try expectOutput("(let [x 1] `(~x ~@[2 3]))", "(1 2 3)");
+    try expectOutput("(let [x 1] `(~x ~@nil))", "(1)");
+    try expectOutput("(let [x 1] `(~x ~@(list 2) ~@(seq [3]) ~@(map inc [3])))", "(1 2 3 4)");
+    try expectOutput("(let [xs [2 3]] `[1 ~@xs 4])", "[1 2 3 4]");
+    try expectOutput("(let [xs [2 3]] `[~@xs])", "[2 3]");
+    try expectOutput("(let [xs '(1 2)] `(~@xs))", "(1 2)");
+    try expectOutput("`(~@#{1})", "(1)");
+    try expectOutput("(let [kvs [:a 1] more '(:b 2)] `{~@kvs ~@more})", "{:a 1, :b 2}");
+    try expectOutput("(let [xs [1 2 1]] `#{~@xs})", "#{1 2}");
+    try expectOutput("(let [xs [2 3]] `(1 ~@xs (4 ~@xs)))", "(1 2 3 (4 2 3))");
+    // A vector built by splicing is a vector, not a seq.
+    try expectOutput("(let [xs [2 3]] (vector? `[1 ~@xs]))", "true");
+    try expectOutput("(let [xs [2 3]] (list? `(1 ~@xs)))", "true");
+}
+
+test "syntax-quote: maps, sets, quote, #() and @ are payloads" {
+    try expectOutput("`{:a 1}", "{:a 1}");
+    try expectOutput("(let [x 2] `{:a ~x})", "{:a 2}");
+    try expectOutput("(let [x 2] `{~x :a})", "{2 :a}");
+    try expectOutput("`#{1}", "#{1}");
+    try expectOutput("(let [x 1] `#{~x})", "#{1}");
+    try expectOutput("`'a", "(quote user/a)");
+    try expectOutput("(let [x 1] `'~x)", "(quote 1)");
+    try expectOutput("`(#(inc %) 1)", "((fn* [%1] (nexis.core/inc %1)) 1)");
+    try expectOutput("`@a", "(nexis.core/deref user/a)");
+    try expectOutput("(let [m `{:f (fn* [x#] x#)}] (= (first (nth (:f m) 1)) (nth (:f m) 2)))", "true");
+}
+
+test "syntax-quote: symbols qualify to the namespace that defines them" {
+    try expectOutput("`(+ 1 2)", "(nexis.core/+ 1 2)");
+    try expectOutput("`(if a b)", "(if user/a user/b)");
+    try expectOutputProgram("(defn helper [] 1) `(helper)", "(user/helper)");
+    try expectOutput("(= `a 'a)", "false");
+    try expectOutput("(= `a 'user/a)", "true");
+    try expectOutput("(= `+ 'nexis.core/+)", "true");
+    try expectOutput("`nexis.core/+", "nexis.core/+");
+    try expectOutput("`db/open", "db/open");
+    try expectOutputProgram("(ns other) `(foo)", "(other/foo)");
+    // Special forms, `&`, catch matchers and `#()` parameters stay bare.
+    try expectOutput("`(do (let* [a 1] (fn* [& r] (try a (catch any e e) (finally 1)))))", "(do (let* [user/a 1] (fn* [& user/r] (try user/a (catch any user/e user/e) (finally 1)))))");
+    try expectOutput("`(quote a)", "(quote user/a)");
+    try expectOutput("`(def x (var y))", "(def user/x (var user/y))");
+    try expectOutput("`(recur (throw 1))", "(recur (throw 1))");
+    // Host macros qualify to nexis.core and still expand from there.
+    try expectOutput("(first `(let [x 1] x))", "nexis.core/let");
+    try expectOutput("(nexis.core/let [x 1] (nexis.core/when true x))", "1");
+    try expectOutputProgram("(defmacro m [x] `(let [y# ~x] (inc y#))) (m 1)", "2");
+    try expectOutputProgram("(defmacro m [x] `(when ~x (-> ~x inc))) (m 1)", "2");
+    // A forward reference through a macro resolves like a bare one.
+    try expectOutputProgram("(defmacro m [] `(later)) (defn f [] (m)) (defn later [] :late) (f)", ":late");
+    // Auto-gensym never qualifies; `~'x` keeps a bare symbol.
+    try expectOutput("(let [f (fn [] `(x# ~'x))] [(namespace (first (f))) (subs (name (first (f))) 0 3)])", "[nil x__]");
+    try expectOutput("(second `(a ~'b))", "b");
+}
+
+test "syntax-quote: a bare binding name inside syntax-quote is the Clojure mistake" {
+    // `(let [x ~a] x)` qualifies `x`; a qualified name cannot be bound.
+    try expectProgramError("(defmacro bad [a] `(let [x ~a] x)) (bad 1)", compile.CompileError.MacroExpansionFailure);
 }
 
 // =============================================================================
@@ -1338,7 +1401,7 @@ test "integration: composite — syntax-quote inside defn" {
         \\  (defn build [a b]
         \\    `(pair ~a ~b))
         \\  (build 1 2))
-    , "(pair 1 2)");
+    , "(user/pair 1 2)");
 }
 
 // =============================================================================

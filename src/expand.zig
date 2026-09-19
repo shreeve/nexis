@@ -20,8 +20,9 @@
 //!     `for`, `->`, `->>`, `defrecord`, `defprotocol`,
 //!     `extend-type`, `extend-protocol`) via `defaultMacros`.
 //!   - Transforms syntax_quote / unquote / unquote_splicing into
-//!     `#%list` / `#%concat` / `#%vector` construction forms
-//!     with per-form auto-gensym scopes.
+//!     `#%list` / `#%concat` / `#%vector` / `#%map` / `#%set`
+//!     construction forms with per-form auto-gensym scopes and
+//!     Clojure-style symbol qualification.
 //!   - Handles user `defmacro` through a compile-time eval
 //!     callback and dispatches user-macro calls through a
 //!     sub-VM.
@@ -367,6 +368,9 @@ fn expandList(
         if (qualifiedMacro(ctx, ns_prefix, head_sym.name)) |user_var| {
             return try invokeUserMacro(ctx, env, user_var, list_form, items, depth);
         }
+        if (qualifiedHostMacro(ctx, ns_prefix, head_sym.name)) |macro_fn| {
+            return try invokeMacro(ctx, env, macro_fn, list_form, items, depth);
+        }
         return try expandOrdinaryCall(ctx, env, list_form, items, depth);
     }
     const name = head_sym.name;
@@ -434,10 +438,25 @@ fn expandList(
 /// the namespace is unknown or the Var is not a macro.
 fn qualifiedMacro(ctx: *ExpandContext, ns_prefix: []const u8, name: []const u8) ?*vm_mod.Var {
     const reg = ctx.registry orelse return null;
-    const target_name = if (ctx.namespace) |cur| (cur.lookupAlias(ns_prefix) orelse ns_prefix) else ns_prefix;
-    const target = reg.lookupNs(target_name) orelse return null;
+    const target = reg.lookupNs(aliasTarget(ctx, ns_prefix)) orelse return null;
     const user_var = target.lookupLocal(name) orelse return null;
     return if (user_var.macro and user_var.bound) user_var else null;
+}
+
+/// The host macro a qualified head `nexis.core/name` names (the
+/// prefix may be an alias of it); syntax-quote qualifies host
+/// macros this way. Null for any other prefix or name.
+fn qualifiedHostMacro(ctx: *ExpandContext, ns_prefix: []const u8, name: []const u8) ?MacroFn {
+    if (!std.mem.eql(u8, aliasTarget(ctx, ns_prefix), "nexis.core")) return null;
+    return ctx.host_macros.get(name);
+}
+
+/// The namespace name `ns_prefix` stands for: the target of an
+/// alias registered in the current namespace, else itself.
+fn aliasTarget(ctx: *ExpandContext, ns_prefix: []const u8) []const u8 {
+    const cur = ctx.namespace orelse return ns_prefix;
+    if (!cur.aliases_initialized) return ns_prefix;
+    return cur.lookupAlias(ns_prefix) orelse ns_prefix;
 }
 
 /// Macro fires: call the host fn, then recursively expand the
@@ -3777,6 +3796,16 @@ pub const GensymScope = struct {
 
 /// Walk a syntax-quoted form. Returns a Form that, when
 /// compiled and run, produces the quoted shape.
+///
+/// Symbols qualify as in Clojure (PLAN §23 #29): an unqualified
+/// symbol becomes `ns/name` for the namespace that holds its Var
+/// (the current namespace, one it refers to, or `nexis.core` for
+/// a host macro), or `<current-ns>/name` when nothing holds it.
+/// `name#` is an auto-gensym and stays bare; so do the special
+/// forms, `&`, the catch matcher `any`, `#%` internals and the
+/// `%` parameters of `#()`. A qualified symbol keeps its prefix,
+/// with an alias resolved to the namespace it names. Without a
+/// named namespace (a bare `Namespace` in tests) nothing qualifies.
 fn expandSyntaxQuotePayload(
     ctx: *ExpandContext,
     scope: *GensymScope,
@@ -3787,24 +3816,20 @@ fn expandSyntaxQuotePayload(
         // Self-evaluating leaves: pass through. Lowered as
         // existing Tiny variants — no quote wrap needed.
         .nil, .bool_, .int, .real, .char, .string, .keyword => mutCast(payload),
-        // Symbol → (quote sym) — unless ends with `#`, then
-        // gensym lookup. Qualified symbols (`ns/name`) preserve
-        // their prefix; auto-gensym applies only to unqualified
-        // symbols (required so `\`(db/begin-write ...)` works in
-        // macros emitted by user code).
         .symbol => |name| blk: {
-            // Build the synthesized symbol form. Qualified
-            // symbols pass through unchanged. Unqualified
-            // symbols ending in `#` are gensym'd.
-            const sym_form = if (name.ns != null)
-                mutCast(payload)
-            else lbl: {
-                const sym_name: []const u8 = if (name.name.len > 1 and name.name[name.name.len - 1] == '#')
-                    try scope.lookupOrAllocate(ctx, name.name)
-                else
-                    name.name;
-                break :lbl try makeSymbol(ctx, sym_name, payload.origin);
-            };
+            const sym_form = if (name.ns) |ns_prefix| lbl: {
+                // An alias of the current namespace resolves to
+                // the namespace it names, as `(require '[x :as
+                // a])` intends; anything else passes through.
+                const target = aliasTarget(ctx, ns_prefix);
+                if (target.ptr == ns_prefix.ptr) break :lbl mutCast(payload);
+                break :lbl try makeQualifiedSymbol(ctx, target, name.name, payload.origin);
+            } else if (name.name.len > 1 and name.name[name.name.len - 1] == '#')
+                try makeSymbol(ctx, try scope.lookupOrAllocate(ctx, name.name), payload.origin)
+            else if (syntaxQuoteNamespace(ctx, name.name)) |ns_name|
+                try makeQualifiedSymbol(ctx, ns_name, name.name, payload.origin)
+            else
+                mutCast(payload);
             // Emit (quote <sym>).
             const items = try ctx.allocator.alloc(*Form, 2);
             items[0] = try makeSymbol(ctx, "quote", call_form.origin);
@@ -3814,106 +3839,151 @@ fn expandSyntaxQuotePayload(
         // Unquote: return the payload directly; it goes through
         // normal expansion + evaluation on the outer walk.
         .unquote => |inner| mutCast(inner),
-        // Splice in non-list context is illegal.
+        // Splice outside a collection is illegal.
         .unquote_splicing => return ExpandError.MalformedMacroCall,
-        // List: build the segment-and-concat structure.
-        .list => |items| try expandSyntaxQuoteList(ctx, scope, call_form, items, payload.origin),
-        // Vector — same pattern as list. The result wraps in
-        // `(#%vector ...)` instead of `(#%list ...)`. Splices
-        // inside a syntax-quoted vector are unsupported and
-        // raise MalformedMacroCall (binding vectors are built
-        // positionally, so vector-valued macros rarely splice).
-        .vector => |items| try expandSyntaxQuoteVector(ctx, scope, call_form, items, payload.origin),
-        // Map/set/nested-syntax-quote and other reader macros
-        // are unsupported: MalformedMacroCall, which the compile
-        // layer buckets as MacroExpansionFailure.
+        .list => |items| try expandSyntaxQuoteColl(ctx, scope, call_form, items, payload.origin, .list_),
+        .vector => |items| try expandSyntaxQuoteColl(ctx, scope, call_form, items, payload.origin, .vector_),
+        .map => |items| try expandSyntaxQuoteColl(ctx, scope, call_form, items, payload.origin, .map_),
+        .set => |items| try expandSyntaxQuoteColl(ctx, scope, call_form, items, payload.origin, .set_),
+        // `'x` inside syntax-quote is the list `(quote x)` with
+        // `x` walked like any payload, so `` `'a `` is
+        // `(quote ns/a)` and `` `'~x `` is `(quote <x>)`.
+        .quote => |inner| blk: {
+            const quote_items = try ctx.allocator.alloc(*Form, 2);
+            quote_items[0] = try makeSymbol(ctx, "quote", call_form.origin);
+            quote_items[1] = try makeSymbol(ctx, "quote", call_form.origin);
+            const seg_items = try ctx.allocator.alloc(*Form, 3);
+            seg_items[0] = try makeSymbol(ctx, "#%list", payload.origin);
+            seg_items[1] = try makeList(ctx, quote_items, call_form.origin);
+            seg_items[2] = try expandSyntaxQuotePayload(ctx, scope, call_form, inner);
+            break :blk try makeList(ctx, seg_items, payload.origin);
+        },
+        // `@x` inside syntax-quote is `(nexis.core/deref x)`.
+        .deref => |inner| blk: {
+            const quote_items = try ctx.allocator.alloc(*Form, 2);
+            quote_items[0] = try makeSymbol(ctx, "quote", call_form.origin);
+            quote_items[1] = try makeQualifiedSymbol(ctx, "nexis.core", "deref", call_form.origin);
+            const seg_items = try ctx.allocator.alloc(*Form, 3);
+            seg_items[0] = try makeSymbol(ctx, "#%list", payload.origin);
+            seg_items[1] = try makeList(ctx, quote_items, call_form.origin);
+            seg_items[2] = try expandSyntaxQuotePayload(ctx, scope, call_form, inner);
+            break :blk try makeList(ctx, seg_items, payload.origin);
+        },
+        // `#(...)` inside syntax-quote is the `fn*` form it stands
+        // for; its `%` parameters stay bare (see the symbol arm).
+        .anon_fn => |items| try expandSyntaxQuotePayload(ctx, scope, call_form, try anonFnForm(ctx, payload, items)),
+        // Nested syntax-quote and metadata are unsupported:
+        // MalformedMacroCall, which the compile layer buckets as
+        // MacroExpansionFailure.
         else => return ExpandError.MalformedMacroCall,
     };
 }
 
-/// Walk a syntax-quoted vector. Simpler than the list walker —
-/// no splice support (binding vectors are built positionally;
-/// splicing into vectors is rare and would require
-/// concat-of-vectors machinery).
-fn expandSyntaxQuoteVector(
+/// Symbols syntax-quote leaves unqualified besides auto-gensyms:
+/// the special forms the expander and compiler recognise by
+/// name, `&` in a parameter vector, the catch matcher `any`, the
+/// `#%` internals and the `%` parameters of `#()`.
+fn isSyntaxQuoteBare(name: []const u8) bool {
+    const bare = [_][]const u8{
+        "quote", "if", "do", "let*", "loop*", "recur", "fn*", "letfn*", "def", "var", "set!", "try", "catch", "finally", "throw", "defmacro", "ns", "require", "&", "any",
+    };
+    for (bare) |b| if (std.mem.eql(u8, name, b)) return true;
+    return std.mem.startsWith(u8, name, "#%") or std.mem.startsWith(u8, name, "%");
+}
+
+/// The namespace an unqualified symbol qualifies to inside
+/// syntax-quote, or null to leave it bare: the namespace in the
+/// current namespace's refer chain whose own Var it names,
+/// `nexis.core` for a host macro, otherwise the current namespace.
+/// Null without a named namespace.
+fn syntaxQuoteNamespace(ctx: *ExpandContext, name: []const u8) ?[]const u8 {
+    if (isSyntaxQuoteBare(name)) return null;
+    const ns = ctx.namespace orelse return null;
+    if (ns.name.len == 0) return null;
+    var cur: ?*const vm_mod.Namespace = ns;
+    while (cur) |n| : (cur = n.parent) {
+        if (n.lookupLocal(name) != null) return n.name;
+    }
+    if (ctx.host_macros.get(name) != null) return "nexis.core";
+    return ns.name;
+}
+
+const SyntaxQuoteColl = enum { list_, vector_, map_, set_ };
+
+/// Walk the items of a syntax-quoted collection. Runs of ordinary
+/// elements become `(#%list ...)` segments and each `~@x` is its
+/// own segment; with no splice the items build the collection
+/// directly (`#%list` / `#%vector` / `#%map` / `#%set`), with a
+/// splice they are concatenated at run time and a vector, map or
+/// set is rebuilt from the resulting list through `nexis.core/vec`,
+/// `nexis.core/hash-map` and `nexis.core/hash-set`.
+fn expandSyntaxQuoteColl(
     ctx: *ExpandContext,
     scope: *GensymScope,
     call_form: *const Form,
     items: []const *Form,
     origin: reader_mod.SrcSpan,
-) ExpandError!*Form {
-    // Reject splices inside vectors.
-    for (items) |it| {
-        if (it.datum == .unquote_splicing) return ExpandError.MalformedMacroCall;
-    }
-    const seg_items = try ctx.allocator.alloc(*Form, items.len + 1);
-    seg_items[0] = try makeSymbol(ctx, "#%vector", origin);
-    for (items, 0..) |item, i| {
-        seg_items[1 + i] = try expandSyntaxQuotePayload(ctx, scope, call_form, item);
-    }
-    return try makeList(ctx, seg_items, origin);
-}
-
-/// Walk the items of a syntax-quoted list. Groups runs of
-/// non-splice elements into `(#%list ...)` segments; splices
-/// interleave as separate concat arguments. Returns either
-/// a bare `(#%list ...)` (no splices found) or a
-/// `(#%concat ...)` wrapping multiple segments.
-fn expandSyntaxQuoteList(
-    ctx: *ExpandContext,
-    scope: *GensymScope,
-    call_form: *const Form,
-    items: []const *Form,
-    list_origin: reader_mod.SrcSpan,
+    kind: SyntaxQuoteColl,
 ) ExpandError!*Form {
     var segments: std.ArrayList(*Form) = .empty;
     defer segments.deinit(ctx.allocator);
     var current: std.ArrayList(*Form) = .empty;
     defer current.deinit(ctx.allocator);
-
-    const flushCurrent = struct {
-        fn call(c: *std.ArrayList(*Form), cx: *ExpandContext, segs: *std.ArrayList(*Form), origin: reader_mod.SrcSpan) ExpandError!void {
-            if (c.items.len == 0) return;
-            // Build (#%list ...) from the current segment.
-            const seg_items = try cx.allocator.alloc(*Form, c.items.len + 1);
-            seg_items[0] = try makeSymbol(cx, "#%list", origin);
-            for (c.items, 0..) |it, i| seg_items[1 + i] = it;
-            const seg_form = try makeList(cx, seg_items, origin);
-            try segs.append(cx.allocator, seg_form);
-            c.clearRetainingCapacity();
-        }
-    }.call;
+    var has_splice = false;
 
     for (items) |item| {
         if (item.datum == .unquote_splicing) {
-            // Flush the current segment, then add the spliced
-            // payload as its own concat segment.
-            try flushCurrent(&current, ctx, &segments, list_origin);
+            has_splice = true;
+            try flushSyntaxQuoteSegment(ctx, &current, &segments, origin);
             try segments.append(ctx.allocator, mutCast(item.datum.unquote_splicing));
         } else {
             try current.append(ctx.allocator, try expandSyntaxQuotePayload(ctx, scope, call_form, item));
         }
     }
-    try flushCurrent(&current, ctx, &segments, list_origin);
 
-    // 0 segments → empty list: `(#%list)`.
-    if (segments.items.len == 0) {
-        const empty_items = try ctx.allocator.alloc(*Form, 1);
-        empty_items[0] = try makeSymbol(ctx, "#%list", list_origin);
-        return try makeList(ctx, empty_items, list_origin);
+    if (!has_splice) {
+        const head: []const u8 = switch (kind) {
+            .list_ => "#%list",
+            .vector_ => "#%vector",
+            .map_ => "#%map",
+            .set_ => "#%set",
+        };
+        const seg_items = try ctx.allocator.alloc(*Form, current.items.len + 1);
+        seg_items[0] = try makeSymbol(ctx, head, origin);
+        for (current.items, 0..) |it, i| seg_items[1 + i] = it;
+        return try makeList(ctx, seg_items, origin);
     }
-    // 1 segment → return it directly. If it's a single
-    // segment, no concat needed. The segment is already
-    // either a `(#%list ...)` (if it came from a flush)
-    // or a spliced expression (which evaluates to a list
-    // at runtime — return it as-is and trust the caller).
-    if (segments.items.len == 1) return segments.items[0];
 
-    // 2+ segments → wrap in (#%concat seg1 seg2 ...).
+    try flushSyntaxQuoteSegment(ctx, &current, &segments, origin);
     const concat_items = try ctx.allocator.alloc(*Form, segments.items.len + 1);
-    concat_items[0] = try makeSymbol(ctx, "#%concat", list_origin);
+    concat_items[0] = try makeSymbol(ctx, "#%concat", origin);
     for (segments.items, 0..) |seg, i| concat_items[1 + i] = seg;
-    return try makeList(ctx, concat_items, list_origin);
+    const concat = try makeList(ctx, concat_items, origin);
+    return switch (kind) {
+        .list_ => concat,
+        .vector_ => try makeListInline(ctx, origin, &.{ try makeQualifiedSymbol(ctx, "nexis.core", "vec", origin), concat }),
+        .map_ => try makeListInline(ctx, origin, &.{
+            try makeQualifiedSymbol(ctx, "nexis.core", "apply", origin),
+            try makeQualifiedSymbol(ctx, "nexis.core", "hash-map", origin),
+            concat,
+        }),
+        .set_ => try makeListInline(ctx, origin, &.{
+            try makeQualifiedSymbol(ctx, "nexis.core", "apply", origin),
+            try makeQualifiedSymbol(ctx, "nexis.core", "hash-set", origin),
+            concat,
+        }),
+    };
+}
+
+/// Move the pending ordinary elements into one `(#%list ...)`
+/// segment; nothing pending, nothing emitted.
+fn flushSyntaxQuoteSegment(ctx: *ExpandContext, current: *std.ArrayList(*Form), segments: *std.ArrayList(*Form), origin: reader_mod.SrcSpan) ExpandError!void {
+    if (current.items.len == 0) return;
+    const seg_items = try ctx.allocator.alloc(*Form, current.items.len + 1);
+    seg_items[0] = try makeSymbol(ctx, "#%list", origin);
+    for (current.items, 0..) |it, i| seg_items[1 + i] = it;
+    try segments.append(ctx.allocator, try makeList(ctx, seg_items, origin));
+    current.clearRetainingCapacity();
 }
 
 // ---- Default macro table -------------------------------------

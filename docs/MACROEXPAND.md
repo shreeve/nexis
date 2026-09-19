@@ -403,42 +403,61 @@ The expander rewrites them recursively.
 
 ```text
 sq(literal)          → literal
-sq(symbol)           → (quote <interned-symbol>)
+sq(symbol)           → (quote <qualified-symbol>)     ; see qualification
 sq(symbol-with-#)    → (quote <fresh-gensym>)         ; auto-gensym scope
 sq(unquote-X)        → X                              ; passthrough
-sq(unquote-splice-X) → ILLEGAL outside list context
-sq(list [...])       → (list sq(e1) sq(e2) ...)       ; with splice handling
-sq(vector [...])     → (vector sq(e1) ...)            ; same
+sq(unquote-splice-X) → ILLEGAL outside a collection
+sq(list [...])       → (#%list sq(e1) sq(e2) ...)     ; with splice handling
+sq(vector [...])     → (#%vector sq(e1) ...)          ; same
+sq(map {...})        → (#%map sq(k1) sq(v1) ...)      ; same
+sq(set #{...})       → (#%set sq(e1) ...)             ; same
+sq('x)               → (#%list 'quote sq(x))          ; `'a → (quote ns/a)
+sq(@x)               → (#%list 'nexis.core/deref sq(x))
+sq(#(...))           → sq of the fn* form it stands for
 ```
 
-For `unquote-splicing` inside a list: the surrounding `(list ...)`
-construction becomes a `(concat (list e1) X (list e2) ...)`
-where `X` is the spliced expression.
+For `unquote-splicing` inside a collection: the element runs
+become `(#%concat (#%list e1 ...) X (#%list e2 ...) ...)` where
+`X` is the spliced expression, and a vector, map or set is
+rebuilt from the resulting list with `nexis.core/vec`,
+`(nexis.core/apply nexis.core/hash-map ...)` or
+`(nexis.core/apply nexis.core/hash-set ...)`. `coll:concat`
+accepts every seqable (nil, list, vector, map as `[k v]`
+entries, set), so `~@` splices whatever a seq function returns.
+A nested syntax-quote and `^meta` inside syntax-quote are
+`MacroExpansionFailure`.
 
-**This requires runtime `list`, `vector`, `concat` functions.**
-For v1 step #8c: ship `list` and `concat` as host-Zig builtins
-registered as core Vars. `vector` defer if compound vector
-literals aren't needed by stage-1 macros (probably not — when/
-cond/and/or all produce list output only).
+**Qualification** (PLAN §23 #29, Clojure's rule): an unqualified
+symbol becomes `ns/name` where `ns` is the namespace whose own
+Var it names, searched from the current namespace along its
+refer chain (`nexis.core` last), or `nexis.core` when it names
+a host macro; a symbol nothing holds qualifies to the current
+namespace, so `` `(helper) `` written before `(defn helper ...)`
+still meets it. Left bare: auto-gensyms, the special forms
+(`quote if do let* loop* recur fn* letfn* def var set! try catch
+finally throw defmacro ns require`), `&`, the catch matcher `any`,
+`#%` internals and the `%` parameters of `#()`. A qualified
+symbol keeps its prefix, an alias resolving to the namespace it
+names. Without a named namespace (a bare `Namespace` in tests)
+nothing qualifies. A head qualified to `nexis.core` reaches the
+host macro table, so `` `(let [x# 1] x#) `` expands through
+`nexis.core/let` exactly as `let` does; a qualified symbol
+naming the current namespace resolves like a bare one, including
+forward references the file declares.
+
+The consequence a macro author meets first: a binding name
+written bare inside syntax-quote, `` `(let [x ~a] x) ``, becomes
+`user/x`, which cannot be bound. Write `x#` (fresh per
+expansion) or `~'x` (deliberate capture), as in Clojure.
 
 **Shadowing safety** (peer-AI turn 56 §5.Trap 4): syntax-quote
-generated calls to `list` / `concat` MUST NOT be capturable by
-user lexical/Var bindings. If a user writes
-`(let* [list 99] `(~x))`, we can NOT have the syntax-quote
-emission of `(list x)` resolve to the user's `list` binding.
-Three options:
-
-1. Emit qualified core symbols (`nexis.core/list`). Cleanest
-   long-term; requires multi-ns support which is post-v1.
-2. Emit an internal special form (`#%list`, `#%concat`)
-   recognized by the compiler. Hides the implementation; ugly.
-3. Pre-resolve to native-fn Values at expansion time and emit
-   `Tiny.literal`-bearing constructor calls.
-
-For v1 step #8c: option (2) — `#%list` / `#%concat` recognized
-in the special-form dispatcher, never user-shadowable.
-Post-#8 (when multi-ns lands): migrate to (1) for proper
-Clojure semantics.
+generated construction MUST NOT be capturable by user lexical/Var
+bindings. If a user writes `(let* [list 99] `(~x))`, the emitted
+construction cannot resolve to the user's `list`. The internal
+special forms `#%list` / `#%concat` / `#%vector` / `#%map` /
+`#%set` are recognized in the special-form dispatcher and are
+never user-shadowable; the rebuild calls are qualified
+`nexis.core/...` symbols for the same reason.
 
 ---
 

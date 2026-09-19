@@ -223,9 +223,10 @@ pub const CollOp = enum(u6) {
     /// is the canonical empty value per `list_mod.empty(heap)`.
     list = 0,
     /// `coll:concat A=arg_base B=argc C=dst` — each arg slot
-    /// must hold a list Value; result is the left-to-right
-    /// concatenation. Empty concat (argc=0) returns the empty
-    /// list. Non-list arg traps `KindMismatch`.
+    /// holds a seqable (nil, list, vector, map or set); result is
+    /// the list of their elements left to right, a map
+    /// contributing `[k v]` entries. Empty concat (argc=0) returns
+    /// the empty list. Any other kind traps `KindMismatch`.
     concat = 1,
     /// `coll:vector A=arg_base B=argc C=dst` —
     /// build a persistent vector from argc consecutive slots.
@@ -2981,11 +2982,13 @@ pub const VM = struct {
         try self.store(.{ .kind = .slot, .index = dst }, result);
     }
 
-    /// `coll:concat A=arg_base B=argc C=dst` — each arg must
-    /// be a list Value; result is the left-to-right concat.
-    /// Strategy: traverse each input list, collect elements
-    /// into a temp slice, then build the result right-to-left
-    /// via cons. Avoids recursive append on singly-linked lists.
+    /// `coll:concat A=arg_base B=argc C=dst` — each arg is a
+    /// seqable (nil, list, vector, map, set); result is the list
+    /// of every element left to right, so `~@` in syntax-quote
+    /// splices whatever a seq function returns.
+    /// Strategy: traverse each input, collect elements into a
+    /// temp slice, then build the result right-to-left via cons.
+    /// Avoids recursive append on singly-linked lists.
     fn execCollConcat(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
@@ -3011,14 +3014,34 @@ pub const VM = struct {
         while (i < argc) : (i += 1) {
             const arg_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
             const arg_val = (try self.slotPtr(arg_idx)).*;
-            // Validate: each arg must be a list.
-            if (arg_val.kind() != .list) return VmError.KindMismatch;
-            // Walk the list, collecting elements.
-            var node = arg_val;
-            while (node.kind() == .list and !list_mod.isEmpty(node)) {
-                const head = list_mod.head(node);
-                try elements.append(self.runtime_arena.allocator(), head);
-                node = list_mod.tail(node);
+            const scratch = self.runtime_arena.allocator();
+            switch (arg_val.kind()) {
+                .nil => {},
+                .list => {
+                    var node = arg_val;
+                    while (node.kind() == .list and !list_mod.isEmpty(node)) {
+                        try elements.append(scratch, list_mod.head(node));
+                        node = list_mod.tail(node);
+                    }
+                },
+                .persistent_vector => {
+                    const n = vector_mod.count(arg_val);
+                    var j: usize = 0;
+                    while (j < n) : (j += 1) try elements.append(scratch, vector_mod.nth(arg_val, j));
+                },
+                .persistent_map => {
+                    var it = champ_mod.mapIter(arg_val);
+                    while (it.next()) |e| {
+                        const pair = [_]Value{ e.key, e.value };
+                        const entry = vector_mod.fromSlice(heap, &pair) catch return VmError.OutOfMemory;
+                        try elements.append(scratch, entry);
+                    }
+                },
+                .persistent_set => {
+                    var it = champ_mod.setIter(arg_val);
+                    while (it.next()) |e| try elements.append(scratch, e);
+                },
+                else => return VmError.KindMismatch,
             }
         }
 
@@ -4411,7 +4434,7 @@ test "VM coll: coll:concat ([1 2] [3]) → [1 2 3]" {
     try testing.expect(list_mod.isEmpty(list_mod.tail(list_mod.tail(list_mod.tail(r)))));
 }
 
-test "VM coll: coll:concat on non-list arg traps KindMismatch" {
+test "VM coll: coll:concat on a non-seqable arg traps KindMismatch" {
     const c1 = Const{ .value = value_mod.fromFixnum(99).? };
     var code = [_]Inst{
         asm_.loadConst(0, 0), // slot[0] := 99 (fixnum, NOT list)

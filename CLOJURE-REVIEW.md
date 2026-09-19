@@ -271,7 +271,7 @@ These are the semantic traps a Clojure programmer will hit.
 | `number?` / `integer?` on a bignum | `true` | the value layer has a `bignum` kind (`src/bignum.zig`, SEMANTICS §2.2), but no literal, operation or native produces one at runtime, so the predicates are defined over `fixnum` and `float` only (`vm.isNumber`); they will widen when bignum arithmetic lands | value.zig `Kind.bignum` |
 | `(iterate f x)`, `(repeat x)`, `(repeatedly f)`, `(range)` | infinite lazy seqs | sequences are eager, so each takes an explicit count: `(iterate f x n)`, `(repeat n x)`, `(repeatedly n f)`; `(range)` is an arity error. `(take n (iterate f x))` ported from Clojure fails at the `iterate` arity | PLAN §4 (no lazy seqs) |
 | `(empty record)` | throws `UnsupportedOperationException` | `{}`: a record is a map to every collection function | SEMANTICS §4 |
-| Syntax-quote expansion | at read time, auto-qualifies + auto-gensyms | reader emits marker only; macroexpander qualifies | PLAN §14.2 (see §2.6 above) |
+| Syntax-quote expansion | at read time, auto-qualifies + auto-gensyms | reader emits marker only; the macroexpander qualifies by the same rule (a Var's namespace, else the current one; special forms, `&`, `any` and `#()` parameters stay bare) and auto-gensyms; `~@` splices any seqable into lists, vectors, maps and sets | PLAN §14.2, MACROEXPAND.md §5 |
 | `(case x ...)` with no matching clause | throws `IllegalArgumentException` "No matching clause: x" | throws the map `{:error :no-matching-clause :message "No matching clause: x" :value x}`; `condp` throws the same. Keys are constants exactly as in Clojure: `(1 2)` groups, `sym` is the symbol | MACROEXPAND.md §8b |
 
 ### 4.4 Explicit omissions (by PLAN §4 non-goals)
