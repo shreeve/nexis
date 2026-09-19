@@ -1464,18 +1464,7 @@ fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
             const id = ctx.interner.internSymbol(name.name) catch return ExpandError.OutOfMemory;
             break :blk value_mod.fromSymbolId(id);
         },
-        .keyword => |name| blk: {
-            // Qualified keywords intern their full `ns/name` text,
-            // like qualified symbols; valueToForm splits it back.
-            if (name.ns) |ns_prefix| {
-                const full = std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ns_prefix, name.name }) catch return ExpandError.OutOfMemory;
-                defer ctx.allocator.free(full);
-                const id = ctx.interner.internKeyword(full) catch return ExpandError.OutOfMemory;
-                break :blk value_mod.fromKeywordId(id);
-            }
-            const id = ctx.interner.internKeyword(name.name) catch return ExpandError.OutOfMemory;
-            break :blk value_mod.fromKeywordId(id);
-        },
+        .keyword => |name| ctx.interner.internQualifiedKeyword(name.ns, name.name) catch return ExpandError.OutOfMemory,
         .list => |items| try formItemsToList(ctx, items),
         .vector => |items| blk: {
             // Construct vector via fromSlice. We need a heap; the
@@ -1616,22 +1605,12 @@ fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSp
         },
         .keyword => blk: {
             const id: u32 = @intCast(v.payload);
-            const full_name = ctx.interner.keywordName(id);
+            const parts = intern_mod.Interner.splitQualified(ctx.interner.keywordName(id));
             const form = try ctx.allocator.create(Form);
-            if (std.mem.indexOfScalar(u8, full_name, '/')) |slash_idx| {
-                form.* = .{
-                    .datum = .{ .keyword = .{
-                        .ns = full_name[0..slash_idx],
-                        .name = full_name[slash_idx + 1 ..],
-                    } },
-                    .origin = origin,
-                };
-            } else {
-                form.* = .{
-                    .datum = .{ .keyword = .{ .ns = null, .name = full_name } },
-                    .origin = origin,
-                };
-            }
+            form.* = .{
+                .datum = .{ .keyword = .{ .ns = parts.ns, .name = parts.name } },
+                .origin = origin,
+            };
             break :blk form;
         },
         .list => blk: {
@@ -3028,6 +3007,39 @@ fn expandFor(
 //     extend-record-impl call against the current protocol.
 // Same shape Clojure uses.
 
+/// The Vars `(defrecord T [...])` defines besides `T` itself. The
+/// compiler's `DeclaredNames` reads the same table, so a form may
+/// refer to `->T` before the `defrecord` that produces it.
+pub const RecordNames = struct {
+    type_id: []u8,
+    ctor: []u8,
+    map_ctor: []u8,
+    pred: []u8,
+
+    pub fn typeId(allocator: std.mem.Allocator, rec_name: []const u8) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{s}-type-id", .{rec_name});
+    }
+
+    pub fn init(allocator: std.mem.Allocator, rec_name: []const u8) !RecordNames {
+        const type_id = try typeId(allocator, rec_name);
+        errdefer allocator.free(type_id);
+        const ctor = try std.fmt.allocPrint(allocator, "->{s}", .{rec_name});
+        errdefer allocator.free(ctor);
+        const map_ctor = try std.fmt.allocPrint(allocator, "map->{s}", .{rec_name});
+        errdefer allocator.free(map_ctor);
+        const pred = try std.fmt.allocPrint(allocator, "{s}?", .{rec_name});
+        return .{ .type_id = type_id, .ctor = ctor, .map_ctor = map_ctor, .pred = pred };
+    }
+
+    pub fn deinit(self: *RecordNames, allocator: std.mem.Allocator) void {
+        for (self.all()) |name| allocator.free(name);
+    }
+
+    pub fn all(self: *const RecordNames) [4][]const u8 {
+        return .{ self.type_id, self.ctor, self.map_ctor, self.pred };
+    }
+};
+
 fn expandDefrecord(
     ctx: *ExpandContext,
     call_form: *const Form,
@@ -3069,11 +3081,12 @@ fn expandDefrecord(
     }
     const fields_kw_vec = try makeVector(ctx, keyword_items, origin);
 
-    // Names we synthesize.
-    const type_id_name = try std.fmt.allocPrint(ctx.allocator, "{s}-type-id", .{rec_name});
-    const ctor_name = try std.fmt.allocPrint(ctx.allocator, "->{s}", .{rec_name});
-    const map_ctor_name = try std.fmt.allocPrint(ctx.allocator, "map->{s}", .{rec_name});
-    const pred_name = try std.fmt.allocPrint(ctx.allocator, "{s}?", .{rec_name});
+    // Names we synthesize (the arena keeps them).
+    const names = try RecordNames.init(ctx.allocator, rec_name);
+    const type_id_name = names.type_id;
+    const ctor_name = names.ctor;
+    const map_ctor_name = names.map_ctor;
+    const pred_name = names.pred;
 
     // Qualified internal-helper Forms.
     const register_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%register-record-type", origin);
@@ -3442,7 +3455,7 @@ fn emitExtendCall(
         // emits the symbol; the user is responsible for
         // ensuring it's defined (defrecord generates it).
         const rec_name = type_form.datum.symbol.name;
-        const type_id_name = try std.fmt.allocPrint(ctx.allocator, "{s}-type-id", .{rec_name});
+        const type_id_name = try RecordNames.typeId(ctx.allocator, rec_name);
         const ext_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%extend-record-impl", origin);
         return try makeListInline(ctx, origin, &.{
             ext_sym,
@@ -3649,25 +3662,23 @@ fn threadStep(
     }
     // List step (f a b) → thread-first: (f acc a b)
     //                      thread-last:  (f a b acc)
-    {
-        const step_items = step.datum.list;
-        if (step_items.len == 0) return ExpandError.MalformedMacroCall;
-        const new_items = try ctx.allocator.alloc(*Form, step_items.len + 1);
-        switch (pos) {
-            .first => {
-                // (head acc rest...)
-                new_items[0] = @constCast(step_items[0]);
-                new_items[1] = acc;
-                for (step_items[1..], 0..) |it, i| new_items[2 + i] = @constCast(it);
-            },
-            .last => {
-                // (head rest... acc)
-                for (step_items, 0..) |it, i| new_items[i] = @constCast(it);
-                new_items[step_items.len] = acc;
-            },
-        }
-        return try makeList(ctx, new_items, call_form.origin);
+    const step_items = step.datum.list;
+    if (step_items.len == 0) return ExpandError.MalformedMacroCall;
+    const new_items = try ctx.allocator.alloc(*Form, step_items.len + 1);
+    switch (pos) {
+        .first => {
+            // (head acc rest...)
+            new_items[0] = @constCast(step_items[0]);
+            new_items[1] = acc;
+            for (step_items[1..], 0..) |it, i| new_items[2 + i] = @constCast(it);
+        },
+        .last => {
+            // (head rest... acc)
+            for (step_items, 0..) |it, i| new_items[i] = @constCast(it);
+            new_items[step_items.len] = acc;
+        },
     }
+    return try makeList(ctx, new_items, call_form.origin);
 }
 
 // =============================================================================

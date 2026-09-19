@@ -1152,11 +1152,9 @@ pub const DeclaredNames = struct {
             try self.declare(name);
         } else if (std.mem.eql(u8, head, "defrecord")) {
             try self.declare(name);
-            inline for ([_][]const u8{ "{s}-type-id", "->{s}", "map->{s}", "{s}?" }) |pattern| {
-                const derived = try std.fmt.allocPrint(self.allocator, pattern, .{name});
-                defer self.allocator.free(derived);
-                try self.declare(derived);
-            }
+            var derived = try expand_mod.RecordNames.init(self.allocator, name);
+            defer derived.deinit(self.allocator);
+            for (derived.all()) |derived_name| try self.declare(derived_name);
         } else if (std.mem.eql(u8, head, "defprotocol")) {
             try self.declare(name);
             for (items[2..]) |sig| {
@@ -1250,21 +1248,12 @@ pub fn lowerForm(
     return lowerFormEnv(allocator, form, .{});
 }
 
-/// Intern a keyword Form's full text: `ns/name` when qualified.
-fn internKeywordForm(allocator: std.mem.Allocator, interner: *intern_mod.Interner, name: anytype) !value_mod.Value {
-    if (name.ns) |ns_prefix| {
-        const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ns_prefix, name.name });
-        defer allocator.free(full);
-        return interner.internKeywordValue(full);
-    }
-    return interner.internKeywordValue(name.name);
-}
-
-/// Internal `lowerForm` with LowerEnv threading (step #7b). The
-/// env is consulted ONLY when classifying list-head symbols as
-/// intrinsics vs ordinary calls. Recursion into sub-expressions
-/// passes the env through unchanged; binding forms (let*, fn*,
-/// loop*, letfn*) construct a child env that adds their bindings.
+/// `lowerForm` with the lexical environment threaded through
+/// `ctx`. The env is consulted only when classifying list-head
+/// symbols as intrinsics vs ordinary calls. Recursion into
+/// sub-expressions passes the env through unchanged; binding
+/// forms (let*, fn*, loop*, letfn*) construct a child env that
+/// adds their bindings.
 fn lowerFormEnv(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
@@ -1297,7 +1286,7 @@ fn lowerFormEnv(
         // same way qualified symbols do.
         .keyword => |name| blk: {
             const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            const v = internKeywordForm(allocator, interner, name) catch return CompileError.OutOfMemory;
+            const v = interner.internQualifiedKeyword(name.ns, name.name) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
         // Floats and chars are immediates: they lower straight
@@ -1595,7 +1584,7 @@ fn lowerQuotePayload(
         },
         .keyword => |name| blk: {
             const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            const v = internKeywordForm(allocator, interner, name) catch return CompileError.OutOfMemory;
+            const v = interner.internQualifiedKeyword(name.ns, name.name) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
         // Step #8c.1 (peer-AI turn 58 §D6): quoted compound list.
@@ -2350,36 +2339,64 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistry(
     );
 }
 
-/// Phase 3.6: full-featured form-compile entry. Accepts a
-/// `*NamespaceRegistry` for `(ns NAME)` AND a `LoadCallback`
-/// for `(require ...)`, and optionally the file's `DeclaredNames`,
-/// which turns a reference to nothing into `UnresolvedSymbol` at
-/// the symbol's span.
-pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
+/// Everything a full compile may be given beyond the form and its
+/// allocator. Every field is optional; the short-name entry points
+/// (`compileForm`, `compileFormFull`, ...) are spellings of
+/// particular subsets.
+pub const CompileOptions = struct {
+    /// Namespace for `def`, `(var x)` and symbol fall-through.
+    /// Without one, symbols must resolve lexically.
+    namespace: ?*vm.Namespace = null,
+    /// Interner for quoted symbols and keywords, and the
+    /// precondition for macroexpansion. Without one, `'foo`
+    /// raises `UnsupportedFeature` and no macro fires.
+    interner: ?*intern_mod.Interner = null,
+    /// Host macro table consulted before lowering; an absent
+    /// table still expands user `defmacro`s when an interner is
+    /// present.
+    host_macros: ?*const expand_mod.HostMacroTable = null,
+    /// Receives the source span of an error: the symbol's own
+    /// span when lowering can locate it, otherwise the
+    /// macroexpanded form's.
+    out_span: ?*?reader_mod.SrcSpan = null,
+    /// Where `defmacro` closures are stored, so they outlive a
+    /// per-form compile arena. The REPL and file runner pass
+    /// `vm.runtime_arena.allocator()`; null uses `allocator`.
+    persistent_allocator: ?std.mem.Allocator = null,
+    /// Registry that `(ns NAME)` switches; without it `(ns ...)`
+    /// is an error.
+    registry: ?*vm.NamespaceRegistry = null,
+    /// Loader that `(require ...)` dispatches to.
+    load_callback: ?expand_mod.LoadCallback = null,
+    /// The names the enclosing file or REPL line defines; with it,
+    /// a symbol that resolves to nothing is `UnresolvedSymbol` at
+    /// its span.
+    declared: ?*DeclaredNames = null,
+};
+
+/// Full form-compile entry: macroexpand, lower and emit `form`
+/// under `opts`.
+pub fn compileFormWith(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-    host_macros: ?*const expand_mod.HostMacroTable,
-    out_span: ?*?reader_mod.SrcSpan,
-    persistent_allocator: ?std.mem.Allocator,
-    registry: ?*vm.NamespaceRegistry,
-    load_callback: ?expand_mod.LoadCallback,
-    declared: ?*DeclaredNames,
+    opts: CompileOptions,
 ) CompileError!Compiled {
+    const namespace = opts.namespace;
+    const interner = opts.interner;
+    const out_span = opts.out_span;
+    const declared = opts.declared;
     var working_form: *const reader_mod.Form = form;
     if (interner != null) {
         const empty_table: expand_mod.HostMacroTable = .{};
         const table_to_use: *const expand_mod.HostMacroTable =
-            host_macros orelse &empty_table;
-        // Phase 3.2: build a compile-eval callback so the
-        // defmacro handler in expand.zig can compile + run
-        // the synthetic `(def name (fn* ...))` form via a
-        // fresh sub-VM. Persistent allocator (when supplied
-        // by caller) is used for the macro fn's storage so
-        // it outlives the per-form arena.
+            opts.host_macros orelse &empty_table;
+        // The compile-eval callback lets the defmacro handler in
+        // expand.zig compile and run the synthetic
+        // `(def name (fn* ...))` form in a sub-VM; the macro fn
+        // is stored in the persistent allocator so it outlives
+        // the per-form arena.
         var ceval_data = CompileEvalData{
-            .persistent_allocator = persistent_allocator orelse allocator,
+            .persistent_allocator = opts.persistent_allocator orelse allocator,
             .namespace = namespace,
             .interner = interner.?,
         };
@@ -2392,12 +2409,8 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
                 .user_data = @ptrCast(&ceval_data),
                 .eval = compileEvalCallback,
             },
-            // Phase 3.4: registry threaded by the caller (CLI
-            // sets it; ad-hoc tests pass null). Enables
-            // `(ns NAME)` to switch the current namespace.
-            .registry = registry,
-            // Phase 3.6: load callback for `(require ...)`.
-            .load_callback = load_callback,
+            .registry = opts.registry,
+            .load_callback = opts.load_callback,
         };
         working_form = expand_mod.expandForm(&mctx, null, form) catch |err| switch (err) {
             error.ExpansionDepthExceeded => {
@@ -2415,12 +2428,9 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
             error.OutOfMemory => return CompileError.OutOfMemory,
         };
     }
-    // Phase 5.2a (peer-AI turn 77): plumb the heap through
-    // `namespace.registry.heap` so `.string` Form datums lower
-    // to `Tiny.literal` with a stable allocation. Ad-hoc test
-    // entry points that pass a null namespace (or one without a
-    // registry) keep the prior `.string → UnsupportedFeature`
-    // behavior because LowerCtx.heap stays null.
+    // `.string` Form datums lower to `Tiny.literal` on the
+    // registry's heap. Without a namespace or a registry there is
+    // no heap and a string literal is `UnsupportedFeature`.
     const lower_heap: ?*heap_mod.Heap = if (namespace) |n|
         (if (n.registry) |r| r.heap else null)
     else
@@ -2447,6 +2457,31 @@ pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
         if (out_span) |s| s.* = working_form.origin;
         return err;
     };
+}
+
+/// `compileFormWith` with every option positional.
+pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
+    allocator: std.mem.Allocator,
+    form: *const reader_mod.Form,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+    host_macros: ?*const expand_mod.HostMacroTable,
+    out_span: ?*?reader_mod.SrcSpan,
+    persistent_allocator: ?std.mem.Allocator,
+    registry: ?*vm.NamespaceRegistry,
+    load_callback: ?expand_mod.LoadCallback,
+    declared: ?*DeclaredNames,
+) CompileError!Compiled {
+    return compileFormWith(allocator, form, .{
+        .namespace = namespace,
+        .interner = interner,
+        .host_macros = host_macros,
+        .out_span = out_span,
+        .persistent_allocator = persistent_allocator,
+        .registry = registry,
+        .load_callback = load_callback,
+        .declared = declared,
+    });
 }
 
 /// End-to-end: parse + read + lower + compile a source string.
@@ -2560,8 +2595,24 @@ pub fn compileSourceFullWithMacrosSpanPersistent(
     );
 }
 
-/// Phase 3.6: variant with both registry AND load callback.
-/// CLI's REPL + runFile pass this so `(require ...)` works.
+/// Parse and read one form from `source`, then `compileFormWith`.
+pub fn compileSourceWith(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    opts: CompileOptions,
+) CompileError!Compiled {
+    var p = reader_mod.parser.parseForm(allocator, source) catch {
+        return CompileError.ReaderFailure;
+    };
+    defer p.parser.deinit();
+    var reader = reader_mod.Reader.init(allocator, source);
+    defer reader.deinit();
+    const form = reader.readOneForm(p.sexp) catch
+        return CompileError.ReaderFailure;
+    return compileFormWith(allocator, form, opts);
+}
+
+/// `compileSourceWith` with every option positional.
 pub fn compileSourceFullWithMacrosSpanPersistentRegistryLoader(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -2574,26 +2625,16 @@ pub fn compileSourceFullWithMacrosSpanPersistentRegistryLoader(
     load_callback: ?expand_mod.LoadCallback,
     declared: ?*DeclaredNames,
 ) CompileError!Compiled {
-    var p = reader_mod.parser.parseForm(allocator, source) catch {
-        return CompileError.ReaderFailure;
-    };
-    defer p.parser.deinit();
-    var reader = reader_mod.Reader.init(allocator, source);
-    defer reader.deinit();
-    const form = reader.readOneForm(p.sexp) catch
-        return CompileError.ReaderFailure;
-    return compileFormFullWithMacrosSpanPersistentRegistryLoader(
-        allocator,
-        form,
-        namespace,
-        interner,
-        host_macros,
-        out_span,
-        persistent_allocator,
-        registry,
-        load_callback,
-        declared,
-    );
+    return compileSourceWith(allocator, source, .{
+        .namespace = namespace,
+        .interner = interner,
+        .host_macros = host_macros,
+        .out_span = out_span,
+        .persistent_allocator = persistent_allocator,
+        .registry = registry,
+        .load_callback = load_callback,
+        .declared = declared,
+    });
 }
 
 /// Phase 3.4: source-string entry with both persistent
@@ -2610,24 +2651,14 @@ pub fn compileSourceFullWithMacrosSpanPersistentRegistry(
     persistent_allocator: ?std.mem.Allocator,
     registry: ?*vm.NamespaceRegistry,
 ) CompileError!Compiled {
-    var p = reader_mod.parser.parseForm(allocator, source) catch {
-        return CompileError.ReaderFailure;
-    };
-    defer p.parser.deinit();
-    var reader = reader_mod.Reader.init(allocator, source);
-    defer reader.deinit();
-    const form = reader.readOneForm(p.sexp) catch
-        return CompileError.ReaderFailure;
-    return compileFormFullWithMacrosSpanPersistentRegistry(
-        allocator,
-        form,
-        namespace,
-        interner,
-        host_macros,
-        out_span,
-        persistent_allocator,
-        registry,
-    );
+    return compileSourceWith(allocator, source, .{
+        .namespace = namespace,
+        .interner = interner,
+        .host_macros = host_macros,
+        .out_span = out_span,
+        .persistent_allocator = persistent_allocator,
+        .registry = registry,
+    });
 }
 
 // =============================================================================
