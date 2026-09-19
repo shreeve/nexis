@@ -349,6 +349,11 @@ inline fn keyEquivalent(a: Value, b: Value, elementEq: *const fn (Value, Value) 
 // =============================================================================
 
 inline fn indexHashOf(k: Value, elementHash: *const fn (Value) u64) u32 {
+    // An immediate hashes kind-locally through `Value.hashImmediate`,
+    // which is what `dispatch.hashValue` computes for it; taking that
+    // path here skips the callback for keyword, fixnum and the other
+    // immediate keys. Heap keys go through the callback.
+    if (!k.kind().isHeap()) return @truncate(k.hashImmediate());
     return @truncate(elementHash(k));
 }
 
