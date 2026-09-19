@@ -263,3 +263,11 @@ test "a quoted def declares nothing" {
     defer program.deinit();
     try testing.expectError(compile.CompileError.UnresolvedSymbol, program.runChecked("(do '(def hidden 1) hidden)"));
 }
+
+// ---- floored mod for floats ----
+
+test "mod on floats takes the sign of the divisor" {
+    try expectOutput(
+        \\[(mod 7.5 -2) (mod 5.5 -2) (mod 5 -1.5) (mod -7.5 2) (mod 7.5 2) (mod -7 3) (mod 7 -3) (mod 6.0 -2)]
+    , "[-0.5 -0.5 -1.0 0.5 1.5 2 -2 0.0]");
+}

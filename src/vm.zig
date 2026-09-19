@@ -3688,8 +3688,11 @@ const float_ops = struct {
     fn rem(x: f64, y: f64) f64 {
         return @rem(x, y);
     }
+    /// Floored: the remainder takes the divisor's sign, as the
+    /// integer `@mod` does.
     fn mod(x: f64, y: f64) f64 {
-        return @mod(x, y);
+        const r = @rem(x, y);
+        return if (r != 0 and (r < 0) != (y < 0)) r + y else r;
     }
 };
 
@@ -4861,6 +4864,9 @@ test "numeric tower: contagion, exact division and integer results" {
     try testing.expectEqual(@as(f64, -2.0), (try numQuot(fl(-7.0), fx(3))).asFloat());
     try testing.expectEqual(@as(f64, -1.0), (try numRem(fl(-7.0), fx(3))).asFloat());
     try testing.expectEqual(@as(f64, 2.0), (try numMod(fl(-7.0), fx(3))).asFloat());
+    try testing.expectEqual(@as(f64, -0.5), (try numMod(fl(7.5), fx(-2))).asFloat());
+    try testing.expectEqual(@as(f64, -1.0), (try numMod(fx(5), fl(-1.5))).asFloat());
+    try testing.expectEqual(@as(f64, 0.0), (try numMod(fl(6.0), fx(-2))).asFloat());
     try testing.expectEqual(@as(i64, -3), (try numNeg(fx(3))).asFixnum());
     try testing.expectEqual(@as(i64, 3), (try numAbs(fx(-3))).asFixnum());
     try testing.expectEqual(@as(f64, 3.5), (try numAbs(fl(-3.5))).asFloat());
