@@ -27,10 +27,15 @@ wins and the code is wrong.
 | `src/pool.zig` | [`POOL.md`](POOL.md) | Small-object pool allocator |
 | `src/bench.zig` | [`BENCH.md`](BENCH.md) | Benchmark harness |
 | `src/reader.zig` | [`FORMS.md`](FORMS.md) | Sexp → Form normalizer + pretty-printer + canonical Form schema |
-| `src/vm.zig` | [`VM.md`](VM.md) | Phase 2 bytecode VM: ISA + execution contracts |
-| `src/compile.zig` | [`COMPILER.md`](COMPILER.md) | Phase 2 compiler: pipeline + per-special-form lowering |
-| `src/cli.zig` | (no dedicated spec) | Step H1 CLI runner — wires the pipeline into `bin/nexis` |
+| `src/vm.zig` | [`VM.md`](VM.md) | Bytecode VM: ISA + execution contracts, frames, handlers, natives, namespaces |
+| `src/compile.zig` | [`COMPILER.md`](COMPILER.md) | Compiler: Form → Tiny → bytecode, per-special-form lowering, capture analysis |
+| `src/cli.zig` | (no dedicated spec) | CLI runner — `nexis run FILE.nx` / `nexis repl`; wires the pipeline into `bin/nexis` |
 | `src/expand.zig` | [`MACROEXPAND.md`](MACROEXPAND.md) | Form → Form rewriter (macros, syntax-quote, anon-fn, `#%list`/`#%concat`/`#%vector` dispatch); host-Zig macros and user `defmacro` |
+| `src/atom.zig` | [`ATOM.md`](ATOM.md) | In-memory mutable cells: `atom` / `swap!` / `reset!` / `compare-and-set!` |
+| `src/protocol.zig`, `src/record.zig` | [`PROTOCOLS.md`](PROTOCOLS.md) | Records + protocols: per-VM registries, `defrecord` / `defprotocol` / `extend-*` dispatch |
+| `src/loader.zig` | (in [`MACROEXPAND.md`](MACROEXPAND.md) §2b) | `(require ...)` file loading: ns-to-path mapping, load path, cycle detection |
+| `src/stdlib.zig`, `src/stdlib/*.nx` | (no dedicated spec) | Native functions + the embedded `nexis.core` / `nextomic` sources; `stdlib/README.md` |
+| `src/format.zig` | (in [`STRING.md`](STRING.md) §9) | Value printing (`pr-str` / `str` modes) |
 | `src/nextomic/*` | [`NEXTOMIC.md`](NEXTOMIC.md) | The database: store layout, transactions, db-values and time, query pipeline, pull, Lisp API, errors |
 | `src/parser.zig` | (no dedicated spec) | **Generated** from `nexis.grammar` by the external `nexus` tool. Do not edit by hand. |
 | `src/nexis.zig` | (no dedicated spec) | `@lang` module — Tag enum + Lexer wrapper |
@@ -72,7 +77,7 @@ If you're new to the project, read in this order (per AGENTS.md §"Required read
 6. `docs/NEXTOMIC.md` — before touching `src/nextomic/` or the `nextomic` namespace.
 7. `ZIG-0.16.0.md` + `AGENTS.md` before writing any Zig.
 
-For Phase 2 work specifically: `docs/VM.md` and `docs/COMPILER.md` are the authoritative contracts.
+For compiler or VM work: `docs/MACROEXPAND.md`, `docs/COMPILER.md` and `docs/VM.md` are the authoritative contracts.
 
 ## Spec discipline (per AGENTS.md "Authority order")
 
@@ -83,4 +88,4 @@ When sources disagree:
 3. `docs/*.md` — derivative; must track `PLAN.md`.
 4. Code comments — lowest. If code says one thing and `PLAN.md` says another, `PLAN.md` wins and the code is wrong.
 
-Amendment log entries at the bottom of `VM.md` and `COMPILER.md` track every spec evolution with the peer-AI conversation turn that prompted it.
+Every doc describes the module as it is. Where a doc states an absence ("the collector is never invoked at runtime"), that absence is a fact about the tree, not a schedule; `PLAN.md` §21 and `HANDOFF.md` §4 hold the roadmap.
