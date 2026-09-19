@@ -136,7 +136,9 @@ value
 The three representations — Form, Value, Encoded — fuse only through
 the codec (PLAN §5). Compile errors carry `file:line:col` and a source
 caret; a symbol that names nothing is `UnresolvedSymbol` at its own
-span. Runtime errors and reader errors carry no location (§6).
+span; a parse or reader failure is reported the same way, at the
+token or form the reader rejected. Runtime errors carry no location
+(§6).
 
 ### 3.2 The value model
 
@@ -470,7 +472,6 @@ through `bin/nexis`:
 | `int`/`long`/`double` | `UnresolvedSymbol`; no way to turn a double into an integer | `stdlib.zig` natives |
 | `meta`/`with-meta`, `ex-info`/`ex-data`, `macroexpand`, `read-string`, `list*`, `reduced`, three-arity `fnil` | `UnresolvedSymbol` (`fnil` → `ArityMismatch`) | `stdlib.zig`; `reduced` needs the reducing natives to check for it; `read-string` needs the reader reachable from a native |
 | symbols not callable | `('a {'a 1})` → `:not-callable` | `vm.zig` lookup arm; PLAN §23 #33 promises keywords only, so state or extend |
-| reader errors carry no location | `nexis: parse error: ParseError` for `(println (1 2` | `src/cli.zig` reports compile errors with `file:line:col` and a caret; the reader path has no span; the golden `.err` files carry kinds like `:map-odd-count` that the CLI does not print |
 
 ### 6.4 Phase 5 as PLAN §21 defines it
 
