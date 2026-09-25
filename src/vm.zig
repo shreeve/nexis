@@ -2174,8 +2174,8 @@ pub const VM = struct {
         switch (callee.kind()) {
             .native_fn => {
                 const native = asNativeFn(callee);
-                if (args.len < native.min_arity or args.len > native.max_arity orelse args.len) {
-                    const max: ?usize = if (native.max_arity) |m| m else null;
+                const max: ?usize = if (native.max_arity) |m| m else null;
+                if (args.len < native.min_arity or args.len > (max orelse args.len)) {
                     return self.arityError(native.name, native.min_arity, max, args.len);
                 }
                 return native.call(self, args);
