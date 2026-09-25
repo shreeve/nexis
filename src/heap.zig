@@ -24,7 +24,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const value = @import("value");
+const value = @import("value.zig");
 
 const Allocator = std.mem.Allocator;
 

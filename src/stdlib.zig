@@ -25,25 +25,25 @@
 // regardless of which VM evaluates it.
 
 const std = @import("std");
-const value_mod = @import("value");
-const vm_mod = @import("vm");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const typed_vector_mod = @import("typed_vector");
-const bignum_mod = @import("bignum");
-const champ_mod = @import("champ");
-const intern_mod = @import("intern");
-const db_mod = @import("db");
-const codec_mod = @import("codec");
-const heap_mod = @import("heap");
-const dispatch_mod_alias = @import("dispatch");
+const value_mod = @import("value.zig");
+const vm_mod = @import("vm.zig");
+const list_mod = @import("coll/list.zig");
+const vector_mod = @import("coll/vector.zig");
+const typed_vector_mod = @import("coll/typed_vector.zig");
+const bignum_mod = @import("bignum.zig");
+const champ_mod = @import("coll/champ.zig");
+const intern_mod = @import("intern.zig");
+const db_mod = @import("db.zig");
+const codec_mod = @import("codec.zig");
+const heap_mod = @import("heap.zig");
+const dispatch_mod_alias = @import("dispatch.zig");
 const emdb_mod = @import("emdb");
-const atom_mod = @import("atom");
-const string_mod = @import("string");
-const format_mod = @import("format");
-const record_mod = @import("record");
-const protocol_mod = @import("protocol");
-const nextomic_mod = @import("nextomic");
+const atom_mod = @import("atom.zig");
+const string_mod = @import("string.zig");
+const format_mod = @import("format.zig");
+const record_mod = @import("record.zig");
+const protocol_mod = @import("protocol.zig");
+const nextomic_mod = @import("nextomic/root.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -979,7 +979,7 @@ fn fnSomeQ(_: *VM, args: []const Value) VmError!Value {
 // `=` is value equality (dispatch.equal, cross-type false);
 // `==` is numeric equality with contagion (`(== 1 1.0)` is true).
 
-const dispatch_mod = @import("dispatch");
+const dispatch_mod = @import("dispatch.zig");
 
 fn requireNumber(v: Value) VmError!Value {
     if (!vm_mod.isNumber(v)) return VmError.KindMismatch;

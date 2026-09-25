@@ -1,0 +1,6 @@
+nexis repl
+Type `:quit` or hit Ctrl-D to exit.
+
+user=> #'x
+user=> 42
+user=> user=> 

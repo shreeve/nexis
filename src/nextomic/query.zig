@@ -10,9 +10,9 @@
 //! prints the plan instead.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const intern_mod = @import("intern");
+const value = @import("../value.zig");
+const heap_mod = @import("../heap.zig");
+const intern_mod = @import("../intern.zig");
 const db_mod = @import("db.zig");
 
 pub const ir = @import("query/ir.zig");

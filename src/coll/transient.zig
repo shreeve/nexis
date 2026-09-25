@@ -22,19 +22,19 @@
 //! Module graph (one-way terminal):
 //!
 //!     src/coll/transient.zig
-//!     ├─ @import("value")
-//!     ├─ @import("heap")
-//!     ├─ @import("champ")    — mapAssoc/Dissoc/Get/Count, setConj/Disj/Contains/Count, valueFromMapHeader, valueFromSetHeader
-//!     └─ @import("vector")  — conj/nth/count, valueFromVectorHeader
+//!     ├─ @import("../value.zig")
+//!     ├─ @import("../heap.zig")
+//!     ├─ @import("champ.zig")    — mapAssoc/Dissoc/Get/Count, setConj/Disj/Contains/Count, valueFromMapHeader, valueFromSetHeader
+//!     └─ @import("vector.zig")  — conj/nth/count, valueFromVectorHeader
 //!
 //! Importers: the `.transient` arms of `src/dispatch.zig` (operations),
 //! `src/gc.zig` (this module's `trace`) and `src/codec.zig`.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const champ = @import("champ");
-const vector = @import("vector");
+const value = @import("../value.zig");
+const heap_mod = @import("../heap.zig");
+const champ = @import("champ.zig");
+const vector = @import("vector.zig");
 
 const Value = value.Value;
 const Kind = value.Kind;

@@ -10,21 +10,22 @@
 //!
 //! Gate item 4 (syntax-quote structural equality):
 //!   Generate random list-valued Forms; compare the runtime list
-//!   produced by syntax-quoting them against the runtime list
-//!   produced by directly quoting the same forms. Exercises the
-//!   syntax-quote walker's segment-and-concat logic against the
-//!   simpler `(quote ...)` lowering.
+//!   produced by syntax-quoting them in the `user` namespace against
+//!   the runtime list produced by quoting the same forms with every
+//!   symbol written `user/...`. Exercises the syntax-quote walker's
+//!   segment-and-concat logic and its symbol qualification against
+//!   the simpler `(quote ...)` lowering.
 //!
 //! Deterministic PRNG seeds so failures reproduce.
 
 const std = @import("std");
-const value_mod = @import("value");
-const vm = @import("vm");
-const compile = @import("compile");
-const intern_mod = @import("intern");
-const reader_mod = @import("reader");
-const expand_mod = @import("expand");
-const list_mod = @import("list");
+const nx = @import("nexis");
+const value_mod = nx.value;
+const vm = nx.vm;
+const compile = nx.compile;
+const expand_mod = nx.expand;
+const list_mod = nx.list;
+const harness = @import("harness");
 
 const testing = std.testing;
 const Value = value_mod.Value;
@@ -57,12 +58,7 @@ fn runSource(src: []const u8) !struct { result: Value, vm_owned: vm.VM } {
         &host_macros,
     );
     const routine = compiled.toRoutine("prop");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
+    try v.retargetTop(&routine);
     const result = try v.run();
     return .{ .result = result, .vm_owned = v };
 }
@@ -141,10 +137,7 @@ test "prop capture depth: independent captures don't interfere" {
 
         var r = try runSource(src.items);
         defer r.vm_owned.deinit();
-        const expected: i64 = a + b;
-        // Sum might overflow i48 for extreme i16 pairs; skip if so.
-        if (value_mod.fromFixnum(expected) == null) continue;
-        try testing.expectEqual(expected, r.result.asFixnum());
+        try testing.expectEqual(a + b, r.result.asFixnum());
     }
 }
 
@@ -152,9 +145,10 @@ test "prop capture depth: independent captures don't interfere" {
 // Gate item 4: syntax-quote structural equality
 // =============================================================================
 //
-// For each random Form shape, evaluate it as `(quote SHAPE)` and as
-// `` `SHAPE `` (syntax-quote with NO unquotes). Both must produce
-// structurally-equal runtime list values.
+// For each random Form shape, evaluate `` `SHAPE `` (syntax-quote
+// with no unquotes) and `(quote SHAPE)` with its symbols qualified the
+// way syntax-quote qualifies them. Both must produce structurally
+// equal runtime list values.
 
 fn listEq(a: Value, b: Value) bool {
     if (a.kind() != b.kind()) return false;
@@ -203,9 +197,15 @@ fn writeRandomShape(buf: *std.array_list.Managed(u8), rand: std.Random, depth: u
     try buf.append(')');
 }
 
-test "prop syntax-quote: syntax-quote ≡ quote for splice-free shapes" {
+test "prop syntax-quote: syntax-quote ≡ quote of the namespace-qualified shape" {
     var prng = std.Random.DefaultPrng.init(sq_prng_seed);
     const rand = prng.random();
+
+    // One program for every trial, so interned symbols compare by
+    // identity; syntax-quote qualifies in its namespace, `user`.
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
 
     var trial: u32 = 0;
     while (trial < 100) : (trial += 1) {
@@ -213,66 +213,21 @@ test "prop syntax-quote: syntax-quote ≡ quote for splice-free shapes" {
         defer shape.deinit();
         try writeRandomShape(&shape, rand, 3);
 
-        // Construct two parallel source programs:
-        //   q:  (quote SHAPE)
+        //   q:  (quote SHAPE) with every symbol leaf written user/symN
         //   sq: `SHAPE
-        var q_src: std.array_list.Managed(u8) = .init(testing.allocator);
-        defer q_src.deinit();
-        try q_src.appendSlice("(quote ");
-        try q_src.appendSlice(shape.items);
-        try q_src.appendSlice(")");
+        const qualified = try std.mem.replaceOwned(u8, testing.allocator, shape.items, "sym", "user/sym");
+        defer testing.allocator.free(qualified);
+        const q_src = try std.fmt.allocPrint(testing.allocator, "(quote {s})", .{qualified});
+        defer testing.allocator.free(q_src);
+        const sq_src = try std.fmt.allocPrint(testing.allocator, "`{s}", .{shape.items});
+        defer testing.allocator.free(sq_src);
 
-        var sq_src: std.array_list.Managed(u8) = .init(testing.allocator);
-        defer sq_src.deinit();
-        try sq_src.append('`');
-        try sq_src.appendSlice(shape.items);
-
-        // Run both in the SAME VM so interned symbol identity matches.
-        var arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer arena.deinit();
-        var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-        const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-        var v = try vm.VM.init(testing.allocator, &stub);
-        defer v.deinit();
-        const ns = v.ensureNamespace();
-        const interner = v.ensureInterner();
-        var host_macros = try expand_mod.defaultMacros(testing.allocator);
-        defer host_macros.deinit(testing.allocator);
-
-        const q_compiled = try compile.compileSourceFullWithMacros(
-            arena.allocator(),
-            q_src.items,
-            ns,
-            interner,
-            &host_macros,
-        );
-        const q_routine = q_compiled.toRoutine("q");
-        v.frames.items[0].routine = &q_routine;
-        v.frames.items[0].pc = 0;
-        v.frames.items[0].slot_count = q_routine.slot_count;
-        if (v.stack.items.len < q_routine.slot_count) {
-            try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), q_routine.slot_count - v.stack.items.len);
-        }
-        const q_result = try v.run();
-
-        const sq_compiled = try compile.compileSourceFullWithMacros(
-            arena.allocator(),
-            sq_src.items,
-            ns,
-            interner,
-            &host_macros,
-        );
-        const sq_routine = sq_compiled.toRoutine("sq");
-        v.frames.items[0].routine = &sq_routine;
-        v.frames.items[0].pc = 0;
-        v.frames.items[0].slot_count = sq_routine.slot_count;
-        v.halted = false;
-        if (v.stack.items.len < sq_routine.slot_count) {
-            try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), sq_routine.slot_count - v.stack.items.len);
-        }
-        const sq_result = try v.run();
-
-        try testing.expect(listEq(q_result, sq_result));
+        const q_result = try program.run(q_src);
+        const sq_result = try program.run(sq_src);
+        testing.expect(listEq(q_result, sq_result)) catch |err| {
+            std.debug.print("\n  shape: {s}\n", .{shape.items});
+            return err;
+        };
     }
 }
 

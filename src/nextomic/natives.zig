@@ -35,17 +35,17 @@
 //! scratch is freed when the native returns.
 
 const std = @import("std");
-const value = @import("value");
-const vm_mod = @import("vm");
-const heap_mod = @import("heap");
-const string_mod = @import("string");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ = @import("champ");
-const dispatch = @import("dispatch");
-const dblayer = @import("db");
+const value = @import("../value.zig");
+const vm_mod = @import("../vm.zig");
+const heap_mod = @import("../heap.zig");
+const string_mod = @import("../string.zig");
+const list_mod = @import("../coll/list.zig");
+const vector_mod = @import("../coll/vector.zig");
+const champ = @import("../coll/champ.zig");
+const dispatch = @import("../dispatch.zig");
+const dblayer = @import("../db.zig");
 const emdb = @import("emdb");
-const handle = @import("nextomic_handle");
+const handle = @import("handle.zig");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
 const store_mod = @import("store.zig");

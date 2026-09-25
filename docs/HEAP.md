@@ -72,8 +72,9 @@ or a VALUE.md amendment, not just a HEAP.md edit):
 Every live block is on a single intrusive linked list rooted in
 `Heap.live_head`. Alloc prepends (O(1)); free detaches (O(1) if you hold
 the prev pointer, O(n) otherwise). `free` does a linear scan to
-find the predecessor. The size-class pool (`docs/POOL.md`) is the
-backing allocator underneath this list.
+find the predecessor. Blocks come from the allocator the heap is
+created with: the VM's, which in `bin/nexis` is the process allocator
+(`std.heap.smp_allocator` in release builds).
 
 The list is the canonical source of truth for "what's live." Sweep walks
 it; tests enumerate it to assert leak counts.
@@ -245,10 +246,9 @@ flag_hash_cached is reserved and unused.
   sweep primitive + the mark-bit layout.
 - **Allocation performance** (slab allocator, size-class bins, large-object
   direct-mmap). PLAN §10.4 describes the target shape (`PLAN §19.6`
-  T2.6 generational, T1.4 slab pools); the size-class pool is what
-  exists (`docs/POOL.md`).
+  T2.6 generational, T1.4 slab pools); none of it exists. Every block
+  comes from the backing allocator.
 - **Large-object threshold.** One strategy serves every size.
-  PLAN §10.4's >4 KiB direct-from-OS path does not exist; the pool
-  delegates large requests to its backing allocator.
+  PLAN §10.4's >4 KiB direct-from-OS path does not exist.
 - **Finalization hooks.** None. Objects that own OS resources (open
   files, durable-ref pins) are tracked separately at the tx/db layer.

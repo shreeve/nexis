@@ -20,17 +20,17 @@
 //! Dependency shape (one-way; no cycles):
 //!
 //!     dispatch.zig
-//!     ├─ @import("value")        (Value + Kind + v.hashImmediate path)
-//!     ├─ @import("eq")           (cross-kind rule + immediate equality)
-//!     ├─ @import("heap")         (*HeapHeader + Heap.asHeapHeader)
-//!     ├─ @import("hash")         (combineOrdered + mixKindDomain)
-//!     ├─ @import("string")       (hashHeader + bytesEqual)
-//!     ├─ @import("bignum")       (hashHeader + limbsEqual)
-//!     ├─ @import("list")         (hashSeq + equalSeq + Cursor)
-//!     ├─ @import("vector")       (hashSeq + equalSeq + Cursor; cross-kind sequential)
-//!     ├─ @import("champ")         (hashMap + equalMap + hashSet + equalSet;
+//!     ├─ @import("value.zig")        (Value + Kind + v.hashImmediate path)
+//!     ├─ @import("eq.zig")           (cross-kind rule + immediate equality)
+//!     ├─ @import("heap.zig")         (*HeapHeader + Heap.asHeapHeader)
+//!     ├─ @import("hash.zig")         (combineOrdered + mixKindDomain)
+//!     ├─ @import("string.zig")       (hashHeader + bytesEqual)
+//!     ├─ @import("bignum.zig")       (hashHeader + limbsEqual)
+//!     ├─ @import("coll/list.zig")         (hashSeq + equalSeq + Cursor)
+//!     ├─ @import("coll/vector.zig")       (hashSeq + equalSeq + Cursor; cross-kind sequential)
+//!     ├─ @import("coll/champ.zig")         (hashMap + equalMap + hashSet + equalSet;
 //!     │                            associative + set categories)
-//!     └─ @import("typed_vector") (hashHeader + equalHeaders; kind-local)
+//!     └─ @import("coll/typed_vector.zig") (hashHeader + equalHeaders; kind-local)
 //!
 //! No heap-kind module imports `dispatch.zig`. Collection kinds whose
 //! hash/equal is recursive over their elements (list, vector, map,
@@ -54,22 +54,22 @@
 //!     Drives both the hash domain byte and the equality dispatch.
 
 const std = @import("std");
-const value = @import("value");
-const eq = @import("eq");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const string = @import("string");
-const list = @import("list");
-const vector = @import("vector");
-const nextomic_handle = @import("nextomic_handle");
-const bignum = @import("bignum");
-const champ = @import("champ");
-const typed_vector = @import("typed_vector");
-const transient = @import("transient");
-const db = @import("db");
-const atom = @import("atom");
-const record = @import("record");
-const protocol = @import("protocol");
+const value = @import("value.zig");
+const eq = @import("eq.zig");
+const heap_mod = @import("heap.zig");
+const hash_mod = @import("hash.zig");
+const string = @import("string.zig");
+const list = @import("coll/list.zig");
+const vector = @import("coll/vector.zig");
+const nextomic_handle = @import("nextomic/handle.zig");
+const bignum = @import("bignum.zig");
+const champ = @import("coll/champ.zig");
+const typed_vector = @import("coll/typed_vector.zig");
+const transient = @import("coll/transient.zig");
+const db = @import("db.zig");
+const atom = @import("atom.zig");
+const record = @import("record.zig");
+const protocol = @import("protocol.zig");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -526,7 +526,7 @@ test "equal ⇒ hashValue equal: bedrock invariant end-to-end (string)" {
 
 // ---- Bignum kind end-to-end dispatch ----
 
-const bignum_mod = @import("bignum");
+const bignum_mod = @import("bignum.zig");
 
 test "hashValue / equal: bignum round-trip across distinct allocations" {
     var heap = Heap.init(testing.allocator);
@@ -600,7 +600,7 @@ test "canonicalization invariant: fromLimbs with trailing zeros + fixnum-range t
 
 // ---- List kind end-to-end dispatch ----
 
-const list_mod = @import("list");
+const list_mod = @import("coll/list.zig");
 
 test "hashValue / equal: empty list round-trip" {
     var heap = Heap.init(testing.allocator);
@@ -733,7 +733,7 @@ test "eqCategory + domainByteForKind: exhaustive table matches SEMANTICS §2.6/�
 
 // ---- Vector kind end-to-end dispatch + cross-kind list↔vector ----
 
-const vector_mod = @import("vector");
+const vector_mod = @import("coll/vector.zig");
 
 test "hashValue / equal: empty vector round-trip" {
     var heap = Heap.init(testing.allocator);
@@ -920,7 +920,7 @@ test "equal rejects cross-kind heap Values before payload interpretation" {
 
 // ---- Persistent map (CHAMP) kind end-to-end dispatch ----
 
-const champ_mod = @import("champ");
+const champ_mod = @import("coll/champ.zig");
 
 test "hashValue / equal: empty map round-trip (two separate allocations)" {
     var heap = Heap.init(testing.allocator);

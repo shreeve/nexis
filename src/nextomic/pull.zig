@@ -33,14 +33,14 @@
 //!   - Not defined on a history view: `error.HistoryView`.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const intern_mod = @import("intern");
-const string_mod = @import("string");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ = @import("champ");
-const dispatch = @import("dispatch");
+const value = @import("../value.zig");
+const heap_mod = @import("../heap.zig");
+const intern_mod = @import("../intern.zig");
+const string_mod = @import("../string.zig");
+const list_mod = @import("../coll/list.zig");
+const vector_mod = @import("../coll/vector.zig");
+const champ = @import("../coll/champ.zig");
+const dispatch = @import("../dispatch.zig");
 const key = @import("key.zig");
 const db_mod = @import("db.zig");
 const schema_mod = @import("schema.zig");

@@ -63,34 +63,32 @@ open the file and see each other's writes.
 git status                        # clean main
 zig build install                 # bin/nexis and bin/nexis-golden
 ./bin/nexis --help                # usage; lists the namespaces available without a file
-zig build quick                   # the inner loop, ~35-50 s warm
-zig build test --summary all      # the gate: 1476 tests, 157 steps, ~4 min wall
+zig build quick                   # the inner loop, ~30 s from a cold cache
+zig build test --summary all      # the gate: 1457 tests, 143 steps, ~1 min from a cold cache
 ```
 
-The gate's last line reads `Build Summary: 157/157 steps succeeded;
-1472/1476 tests passed`, preceded by `golden: ok=11 updated=0
-failed=0 missing=0`. Two integration binaries end with a benchmark
-whose row-count checks always run; the build runner echoes their
-stderr as `failed command:` lines while both succeed, so read the
-summary line, not the noise.
+The gate prints nothing but its last line, `Build Summary: 143/143
+steps succeeded; 1457/1457 tests passed`; any other output is a
+failure.
 
 The build steps, and what each is for:
 
 | step | runs | time (warm, Debug) |
 |---|---|---|
-| `zig build quick` | the language binaries (`vm`, `compile`, `expand`, `stdlib`, `loader`, `disasm`, `atom`, `record`, `protocol`, `format`), the compile property tests, `test/integration/{eval_pipeline,runtime_polish,numbers}.zig`, the Nextomic unit binary and its two property tests | ~35-50 s |
-| `zig build nextomic-test` | `src/nextomic/*` unit tests, `test/prop/nextomic_{key,tx}.zig`, `test/integration/nextomic_{q,pull}.zig` | ~33 s |
-| `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis`, stdout diffed against its `.out` | seconds |
-| `zig build examples` | every `examples/*.nx` through `bin/nexis`; `durable-refs`, `todo-app` and `nextomic-app` twice | seconds |
-| `zig build golden` | reader goldens (`-Dupdate=true` rewrites them) and the CLI goldens under `test/golden/cli` (a runtime error's stderr, a disassembly, a `pprint` script's stdout, pinned byte for byte) | seconds |
-| `zig build test --summary all` | all of the above plus every module's inline tests and the randomized collection gates | ~4 min |
+| `zig build quick` | the `unit` binary (every inline test in `src/`), the compile and Nextomic property tests, `test/integration/{eval_pipeline,runtime_polish,numbers}.zig` | ~30 s |
+| `zig build nextomic-test` | the `src/nextomic/*` unit tests, `test/prop/nextomic_{key,tx}.zig`, `test/integration/nextomic_{q,pull,fn,entity}.zig` | ~20 s |
+| `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis` from a fresh directory, stdout diffed against its `.out` | seconds |
+| `zig build examples` | every `examples/*.nx` through `bin/nexis` from a fresh directory, stdout diffed against `test/examples/<name>.out`; those with a `.2.out` twice | seconds |
+| `zig build golden` | reader goldens and the CLI goldens under `test/golden/cli` (runtime and reader error reports, a disassembly, script output, a REPL session, the usage errors, each stream and exit code pinned) | seconds |
+| `zig build test --summary all` | all of the above plus every property test and the layering check (`build.zig` `checkLayering`) | ~1 min |
 | `zig build bench` | the ReleaseFast benchmark harness (`docs/BENCH.md`) | minutes |
 | `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` via `../nexus/bin/nexus` | seconds |
 
-Two environment variables. `NEXTOMIC_BENCH`: when set, the two
-Nextomic corpora print `[bench]` timing lines to stderr
-(`NEXTOMIC_BENCH=1 zig build nextomic-test --summary all`).
-`NEXIS_GC_STRESS`: when set, every VM collects every 4 KiB of
+`-Dupdate=true` on `test`, `golden`, `examples` or `nextomic-nx`
+rewrites every expected-output file those steps compare, from the
+current binary; read the diff before committing it.
+
+One environment variable, `NEXIS_GC_STRESS`: when set, every VM collects every 4 KiB of
 allocation instead of every 16 MiB (`NEXIS_GC_STRESS=1 zig build test
 --summary all` proves the natives' rooting; `docs/GC.md` §7). Debug
 numbers under the testing allocator are not performance
@@ -539,8 +537,8 @@ tests passed`. The binaries are Debug builds under
 **ReleaseFast.** `zig build -Doptimize=ReleaseFast install` builds
 `bin/nexis` optimized in about 12 s warm; `-Doptimize=ReleaseFast`
 applies to every step, so `zig build -Doptimize=ReleaseFast test`
-runs the gate optimized and `NEXTOMIC_BENCH=1 zig build nextomic-test
--Doptimize=ReleaseFast --summary all` reproduces `docs/PERF.md` §3.7.
+runs the gate optimized and `zig build bench -Doptimize=ReleaseFast
+-- --filter nextomic` reproduces `docs/PERF.md` §3.7.
 A Debug binary under the testing allocator is not a performance
 measurement.
 

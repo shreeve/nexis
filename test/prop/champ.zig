@@ -1,12 +1,9 @@
 //! test/prop/champ.zig — randomized properties for the persistent map
-//! heap kind (CHAMP). Ships alongside commit 1; commit 2 extends this
-//! file with parallel set properties (S1–S9) when `persistent_set`
-//! lands.
+//! and set heap kinds (CHAMP): M1–M10 for maps, S1–S9 for sets.
 //!
-//! Primary purpose: retire the associative equality category's hidden
-//! fault line — until these properties pass, the `(= a b) ⇒ hash(a) =
-//! hash(b)` invariant is hypothetical for the entire associative
-//! category. M6 is the retirement receipt parallel to
+//! Primary purpose: pin the associative equality category's invariant
+//! `(= a b) ⇒ hash(a) = hash(b)` across both subkinds. M6 is the
+//! map property parallel to
 //! `test/prop/vector.zig` V3 (sequential category) and V9 (cross-kind
 //! at structural boundaries).
 //!
@@ -21,9 +18,10 @@
 //!   M5. Equality laws over random maps: reflexive, symmetric,
 //!       transitive (pairwise).
 //!   M6. **Cross-subkind hash equivalence** (RETIREMENT RECEIPT for
-//!       `.associative` category): 500 random maps built via two
-//!       different paths — one that stays array-map, one that
-//!       promote-then-dissocs — hash and equal identically.
+//!       `.associative` category): 2000 random maps of 1..8 entries
+//!       built two ways — one stays array-map, one promotes to CHAMP
+//!       and dissocs back to the same entries — hash and equal
+//!       identically.
 //!   M7. Cross-category never-equal: a map is never `=` to any non-
 //!       associative Value; `dispatch.hashValue` outputs distinct.
 //!   M8. Persistent immutability: `mapAssoc(m, k, v)` does not mutate
@@ -36,14 +34,14 @@
 //!        + equality all hold.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const champ = @import("champ");
-const string_mod = @import("string");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const dispatch = @import("dispatch");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const champ = nx.champ;
+const string_mod = nx.string;
+const list_mod = nx.list;
+const vector_mod = nx.vector;
+const dispatch = nx.dispatch;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;
@@ -325,17 +323,20 @@ test "M6: cross-subkind (array-map vs CHAMP) same entries hash AND equal (2000 t
         }
         try std.testing.expect(am.subkind() == 0);
 
-        // Path B: grow to n+1 then dissoc the extra key → CHAMP.
+        // Path B: grow past the array-map limit to 9 keys, which
+        // promotes to CHAMP, then dissoc the extra keys: the same
+        // entries in the other subkind.
         var ch = am;
-        const extra_key = value.fromFixnum(@intCast(1_000_000 + trial)).?;
-        ch = try champ.mapAssoc(&heap, ch, extra_key, value.fromFixnum(99).?, &dispatch.hashValue, &dispatch.equal);
-        if (n >= 8) {
-            try std.testing.expect(ch.subkind() == 1);
+        for (n..9) |extra| {
+            const extra_key = value.fromFixnum(@intCast(1_000_000 + trial * 16 + extra)).?;
+            ch = try champ.mapAssoc(&heap, ch, extra_key, value.fromFixnum(99).?, &dispatch.hashValue, &dispatch.equal);
         }
-        ch = try champ.mapDissoc(&heap, ch, extra_key, &dispatch.hashValue, &dispatch.equal);
-
-        // Equality and hash must agree regardless of whether ch is
-        // actually CHAMP (it is, when n == 8) or stayed array-map.
+        try std.testing.expect(ch.subkind() == 1);
+        for (n..9) |extra| {
+            const extra_key = value.fromFixnum(@intCast(1_000_000 + trial * 16 + extra)).?;
+            ch = try champ.mapDissoc(&heap, ch, extra_key, &dispatch.hashValue, &dispatch.equal);
+        }
+        try std.testing.expect(ch.subkind() == 1);
         try std.testing.expect(dispatch.equal(am, ch));
         try std.testing.expect(dispatch.equal(ch, am));
         try std.testing.expectEqual(dispatch.hashValue(am), dispatch.hashValue(ch));
@@ -588,7 +589,7 @@ test "M11: equal ⇒ hashValue equal over 2000 random map pairs" {
 }
 
 // =============================================================================
-// Persistent set property tests (commit 2)
+// Persistent set property tests
 //
 // Properties (CHAMP.md §12.2 / §12.4 parallel):
 //   S1. setFromElements + setContains round-trip; absent returns false.
@@ -755,12 +756,13 @@ test "S5: cross-subkind (array-set vs CHAMP) equal + hash-equal (2000 trials)" {
         var as = try champ.setEmpty(&heap);
         for (elems) |e| as = try champ.setConj(&heap, as, e, &dispatch.hashValue, &dispatch.equal);
         try std.testing.expect(as.subkind() == 0);
-        // Path B: grow to n+1 then disj the extra → CHAMP.
+        // Path B: grow past the array-set limit to 9 elements, which
+        // promotes to CHAMP, then disj the extras.
         var ch = as;
-        const extra = value.fromFixnum(@intCast(1_000_000 + trial)).?;
-        ch = try champ.setConj(&heap, ch, extra, &dispatch.hashValue, &dispatch.equal);
-        if (n >= 8) try std.testing.expect(ch.subkind() == 1);
-        ch = try champ.setDisj(&heap, ch, extra, &dispatch.hashValue, &dispatch.equal);
+        for (n..9) |extra| ch = try champ.setConj(&heap, ch, value.fromFixnum(@intCast(1_000_000 + trial * 16 + extra)).?, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expect(ch.subkind() == 1);
+        for (n..9) |extra| ch = try champ.setDisj(&heap, ch, value.fromFixnum(@intCast(1_000_000 + trial * 16 + extra)).?, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expect(ch.subkind() == 1);
         try std.testing.expect(dispatch.equal(as, ch));
         try std.testing.expect(dispatch.equal(ch, as));
         try std.testing.expectEqual(dispatch.hashValue(as), dispatch.hashValue(ch));

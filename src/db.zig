@@ -28,22 +28,22 @@
 //!
 //!     src/db.zig
 //!     ├── @import("std")
-//!     ├── @import("value")
-//!     ├── @import("heap")
-//!     ├── @import("intern")
-//!     ├── @import("hash")
-//!     ├── @import("codec")
+//!     ├── @import("value.zig")
+//!     ├── @import("heap.zig")
+//!     ├── @import("intern.zig")
+//!     ├── @import("hash.zig")
+//!     ├── @import("codec.zig")
 //!     └── @import("emdb")
 //!
 //! Nothing imports `db.zig` except `dispatch.zig` / `gc.zig` at
 //! their `.durable_ref` arms.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const intern_mod = @import("intern");
-const hash_mod = @import("hash");
-const codec_mod = @import("codec");
+const value = @import("value.zig");
+const heap_mod = @import("heap.zig");
+const intern_mod = @import("intern.zig");
+const hash_mod = @import("hash.zig");
+const codec_mod = @import("codec.zig");
 const emdb = @import("emdb");
 
 const Value = value.Value;
@@ -601,18 +601,19 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
 // Inline tests
 // =============================================================================
 
+/// A store path in a fresh directory under `.zig-cache/tmp/`, so
+/// concurrent runs never share a file; `cleanupDb` removes the
+/// directory with the store in it.
 fn tmpDbPath(allocator: std.mem.Allocator, suffix: []const u8) ![:0]u8 {
-    const base = "test_nexis_db_";
-    const path = try std.fmt.allocPrintSentinel(allocator, "{s}{s}.emdb", .{ base, suffix }, 0);
-    cleanupDb(path);
-    return path;
+    var tmp = std.testing.tmpDir(.{});
+    tmp.dir.close(std.testing.io);
+    tmp.parent_dir.close(std.testing.io);
+    return std.fmt.allocPrintSentinel(allocator, ".zig-cache/tmp/{s}/{s}.emdb", .{ tmp.sub_path, suffix }, 0);
 }
 
 fn cleanupDb(path: [:0]const u8) void {
-    _ = std.c.unlink(path.ptr);
-    var buf: [256]u8 = undefined;
-    const lock_path = std.fmt.bufPrintSentinel(&buf, "{s}-lock", .{path}, 0) catch return;
-    _ = std.c.unlink(lock_path.ptr);
+    const dir = std.fs.path.dirname(path) orelse return;
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
 }
 
 fn synthHash(v: Value) u64 {
@@ -878,8 +879,8 @@ test "treeId: a tree created by an aborted transaction reads as empty afterwards
 }
 
 test "put / get: container values (list, map, set) codec round-trip" {
-    const list_mod = @import("list");
-    const champ = @import("champ");
+    const list_mod = @import("coll/list.zig");
+    const champ = @import("coll/champ.zig");
 
     const path = try tmpDbPath(testing.allocator, "containers");
     defer testing.allocator.free(path);

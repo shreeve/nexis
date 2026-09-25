@@ -33,7 +33,7 @@
 //! mutation.
 
 const std = @import("std");
-const value = @import("value");
+const value = @import("value.zig");
 const Value = value.Value;
 const Kind = value.Kind;
 

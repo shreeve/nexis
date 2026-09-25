@@ -43,11 +43,12 @@
 //!   A6. Decimal text round-trips; toF64/fromF64 round-trips below 2^53.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const bignum = @import("bignum");
-const dispatch = @import("dispatch");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const hash_mod = nx.hash;
+const bignum = nx.bignum;
+const dispatch = nx.dispatch;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;
@@ -533,8 +534,9 @@ test "A6: decimal text and doubles round-trip" {
         try std.testing.expect(text[0] == '-' or (text[0] >= '1' and text[0] <= '9'));
         const back = (try bignum.parseDecimal(&heap, text)).?;
         try std.testing.expect(dispatch.equal(back, a));
-        // Doubles: exact below 2^53, and the nearest double otherwise
-        // reads back as an integer within one ulp of the original.
+        // Doubles: exact below 2^53; beyond, the double reads back as
+        // an integer with the same double, within one ulp of the
+        // original: |rounded - a| * 2^52 <= |a|.
         const n: i64 = r.intRangeAtMost(i64, -(1 << 53), 1 << 53);
         const nv = try bignum.fromI64(&heap, n);
         try std.testing.expectEqual(@as(f64, @floatFromInt(n)), bignum.toF64(nv));
@@ -542,6 +544,9 @@ test "A6: decimal text and doubles round-trip" {
         const f = bignum.toF64(a);
         try std.testing.expectEqual(bignum.isNegative(a), f < 0);
         const rounded = (try bignum.fromF64(&heap, f)).?;
-        try std.testing.expect(bignum.compare(try bignum.abs(&heap, try bignum.sub(&heap, rounded, a)), try bignum.abs(&heap, a)) == .lt);
+        try std.testing.expectEqual(f, bignum.toF64(rounded));
+        const off = try bignum.abs(&heap, try bignum.sub(&heap, rounded, a));
+        const scaled = try bignum.mul(&heap, off, try bignum.fromI64(&heap, 1 << 52));
+        try std.testing.expect(bignum.compare(scaled, try bignum.abs(&heap, a)) != .gt);
     }
 }

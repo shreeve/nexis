@@ -30,8 +30,8 @@
 //!   - Everything a plan allocates lives in the query arena.
 
 const std = @import("std");
-const value = @import("value");
-const intern_mod = @import("intern");
+const value = @import("../../value.zig");
+const intern_mod = @import("../../intern.zig");
 const key = @import("../key.zig");
 const datom_mod = @import("../datom.zig");
 const schema_mod = @import("../schema.zig");

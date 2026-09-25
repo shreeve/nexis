@@ -20,8 +20,9 @@
 //!   I10. by_name/names counts stay in lockstep across a mixed workload.
 
 const std = @import("std");
-const value = @import("value");
-const intern = @import("intern");
+const nx = @import("nexis");
+const value = nx.value;
+const intern = nx.intern;
 
 const Interner = intern.Interner;
 const prng_seed: u64 = 0x696E_7465_726E_5F50; // "intern_P" ASCII LE
@@ -255,18 +256,26 @@ test "I10: by_name/names counts stay in lockstep under mixed workload" {
     const alphabet = "xyzw";
     var buf: [4]u8 = undefined;
 
+    // The distinct names interned so far, per table: each count must
+    // equal its table's, whatever the mix of new and repeated names.
+    var keywords: std.StringHashMapUnmanaged(void) = .empty;
+    defer keywords.deinit(std.testing.allocator);
+    var symbols: std.StringHashMapUnmanaged(void) = .empty;
+    defer symbols.deinit(std.testing.allocator);
+    const keywords_before = it.keywordCount();
+    const symbols_before = it.symbolCount();
+
     var i: usize = 0;
     while (i < 2000) : (i += 1) {
         const name = randName(r, &buf, alphabet, 4);
         if (r.boolean()) {
-            _ = try it.internKeyword(name);
+            const id = try it.internKeyword(name);
+            try keywords.put(std.testing.allocator, it.keywordName(id), {});
         } else {
-            _ = try it.internSymbol(name);
+            const id = try it.internSymbol(name);
+            try symbols.put(std.testing.allocator, it.symbolName(id), {});
         }
-        // Internal count invariant — accessor-based sanity check.
-        const kn = it.keywordCount();
-        const sn = it.symbolCount();
-        try std.testing.expect(kn <= @as(u32, @intCast(i + 1)));
-        try std.testing.expect(sn <= @as(u32, @intCast(i + 1)));
+        try std.testing.expectEqual(keywords_before + keywords.count(), it.keywordCount());
+        try std.testing.expectEqual(symbols_before + symbols.count(), it.symbolCount());
     }
 }

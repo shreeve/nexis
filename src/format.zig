@@ -39,21 +39,21 @@
 //!        reference cycle formats opaquely.
 
 const std = @import("std");
-const value_mod = @import("value");
-const intern_mod = @import("intern");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ_mod = @import("champ");
-const string_mod = @import("string");
-const heap_mod = @import("heap");
-const vm_mod = @import("vm");
-const atom_mod = @import("atom");
-const bignum_mod = @import("bignum");
-const typed_vector_mod = @import("typed_vector");
-const db_mod = @import("db");
-const record_mod = @import("record");
-const protocol_mod = @import("protocol");
-const nextomic_handle = @import("nextomic_handle");
+const value_mod = @import("value.zig");
+const intern_mod = @import("intern.zig");
+const list_mod = @import("coll/list.zig");
+const vector_mod = @import("coll/vector.zig");
+const champ_mod = @import("coll/champ.zig");
+const string_mod = @import("string.zig");
+const heap_mod = @import("heap.zig");
+const vm_mod = @import("vm.zig");
+const atom_mod = @import("atom.zig");
+const bignum_mod = @import("bignum.zig");
+const typed_vector_mod = @import("coll/typed_vector.zig");
+const db_mod = @import("db.zig");
+const record_mod = @import("record.zig");
+const protocol_mod = @import("protocol.zig");
+const nextomic_handle = @import("nextomic/handle.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;

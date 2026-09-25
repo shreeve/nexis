@@ -24,13 +24,13 @@
 //! collector that frees values must `clear` the cache.
 
 const std = @import("std");
-const value = @import("value");
-const intern_mod = @import("intern");
-const string_mod = @import("string");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ = @import("champ");
-const dispatch = @import("dispatch");
+const value = @import("../../value.zig");
+const intern_mod = @import("../../intern.zig");
+const string_mod = @import("../../string.zig");
+const list_mod = @import("../../coll/list.zig");
+const vector_mod = @import("../../coll/vector.zig");
+const champ = @import("../../coll/champ.zig");
+const dispatch = @import("../../dispatch.zig");
 const marshal = @import("../marshal.zig");
 const ir = @import("ir.zig");
 
@@ -786,7 +786,7 @@ pub const RulesCache = CacheOf(RuleSet, parseRules);
 // =============================================================================
 
 const testing = std.testing;
-const heap_mod = @import("heap");
+const heap_mod = @import("../../heap.zig");
 
 /// Builds query values in tests: `v.sym("?e")`, `v.vec(&.{...})`.
 const Builder = struct {

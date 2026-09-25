@@ -22,9 +22,9 @@
 //!
 //!     src/atom.zig
 //!     ├── @import("std")
-//!     ├── @import("value")
-//!     ├── @import("heap")
-//!     └── @import("hash")
+//!     ├── @import("value.zig")
+//!     ├── @import("heap.zig")
+//!     └── @import("hash.zig")
 //!
 //! Nothing imports atom.zig except `dispatch.zig` (heapHashBase +
 //! heapEqual arms), `gc.zig` (trace arm), `stdlib.zig` (native fns),
@@ -41,9 +41,9 @@
 //! (`docs/GC.md` §7, §11.5).
 
 const std = @import("std");
-const value_mod = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
+const value_mod = @import("value.zig");
+const heap_mod = @import("heap.zig");
+const hash_mod = @import("hash.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;

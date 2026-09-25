@@ -23,16 +23,16 @@
 //!   V7. Length discrimination: differing lengths break equality.
 //!   V8. Nested collections round-trip through recursive dispatch.
 //!   V9. Cross-kind at shift-boundary sizes (33, 1024, 1025, 1057,
-//!       32768, 32769) — stresses the trie descent in the cursor
-//!       walker.
+//!       32768, 32769, 32801) — stresses the trie descent in the
+//!       cursor walker through a three-level trie.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const dispatch = @import("dispatch");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const list_mod = nx.list;
+const vector_mod = nx.vector;
+const dispatch = nx.dispatch;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;
@@ -280,12 +280,18 @@ test "V8: nested vectors — recursive dispatch reaches inner sequences" {
 // V9. Cross-kind at trie shift-boundary sizes — stresses cursor walker
 // -----------------------------------------------------------------------------
 
-test "V9: cross-kind equality + hash at shift-boundary sizes (33, 1024, 1025, 1057)" {
-    const gpa = std.testing.allocator;
+test "V9: cross-kind equality + hash at shift-boundary sizes up to a three-level trie" {
+    // No stack trace per allocation: a list of 32801 cells would spend
+    // the test capturing them. A leak still logs an error.
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    const gpa = debug.allocator();
     var heap = Heap.init(gpa);
     defer heap.deinit();
 
-    const sizes = [_]usize{ 33, 1024, 1025, 1057 };
+    // 1056 = 32 + 1024 fills the root's two-level trie and the tail;
+    // 32800 = 32 + 32768 fills a three-level trie.
+    const sizes = [_]usize{ 33, 1024, 1025, 1057, 32768, 32769, 32801 };
     for (sizes) |n| {
         const elems = try gpa.alloc(Value, n);
         defer gpa.free(elems);

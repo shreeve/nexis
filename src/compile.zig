@@ -66,33 +66,33 @@
 //!     only lexical shadowing does.
 
 const std = @import("std");
-const vm = @import("vm");
-const value_mod = @import("value");
+const vm = @import("vm.zig");
+const value_mod = @import("value.zig");
 /// Tests only: inspect rest-list results in variadic fn tests.
 /// The compiler itself doesn't depend on list — the VM
 /// constructs rest lists at call time per VM.md §6.
-const list_mod = @import("list");
+const list_mod = @import("coll/list.zig");
 /// Compiler input. `lowerForm` translates a reader.Form tree
 /// into `Tiny`; the backend compiles `Tiny` only (there is no
 /// parallel Form → bytecode path).
-const reader_mod = @import("reader");
+const reader_mod = @import("reader.zig");
 /// Interner for quoted symbols/keywords during Form lowering.
 /// `lowerQuotePayload` interns symbols/keywords through the
 /// VM's shared Interner so identity is stable across compile,
 /// runtime and macroexpand.
-const intern_mod = @import("intern");
+const intern_mod = @import("intern.zig");
 /// Form → Form expander: macros, syntax-quote, anon-fn, and the
 /// #%list/#%concat/#%vector dispatch all live there. Expansion
 /// runs BEFORE lowering whenever `compileFormWith` is given an
 /// Interner; without one, no expansion fires.
-const expand_mod = @import("expand");
+const expand_mod = @import("expand.zig");
 /// Form lowering allocates string-literal Values into a stable
 /// Heap so `Tiny.literal` can carry them across compile → run.
 /// `LowerCtx.heap` is the optional heap; when null, `.string`
 /// Forms raise `UnsupportedFeature`.
-const heap_mod = @import("heap");
-const string_mod = @import("string");
-const bignum_mod = @import("bignum");
+const heap_mod = @import("heap.zig");
+const string_mod = @import("string.zig");
+const bignum_mod = @import("bignum.zig");
 
 pub const Inst = vm.Inst;
 pub const Routine = vm.Routine;
@@ -2437,8 +2437,8 @@ pub const RuntimeHooks = struct {
     /// form}`, where `name` is the `CompileError` variant.
     fn compileFailure(v: *vm.VM, err: anyerror, name: []const u8, form: value_mod.Value) vm.VmError {
         if (err == error.OutOfMemory) return vm.VmError.OutOfMemory;
-        const champ = @import("champ");
-        const dispatch = @import("dispatch");
+        const champ = @import("coll/champ.zig");
+        const dispatch = @import("dispatch.zig");
         const heap = v.ensureHeap();
         const interner = v.ensureInterner();
         const message = string_mod.fromBytes(heap, name) catch return vm.VmError.OutOfMemory;
@@ -8334,7 +8334,7 @@ test "compile quote vector: (quote [1 2 3]) builds a persistent vector" {
     var r = try runSourceFull("(quote [1 2 3])");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_vector);
-    const vec_mod = @import("vector");
+    const vec_mod = @import("coll/vector.zig");
     try testing.expectEqual(@as(usize, 3), vec_mod.count(r.result));
     try testing.expectEqual(@as(i64, 1), vec_mod.nth(r.result, 0).asFixnum());
     try testing.expectEqual(@as(i64, 2), vec_mod.nth(r.result, 1).asFixnum());
@@ -8345,7 +8345,7 @@ test "compile quote vector: (quote []) builds empty vector" {
     var r = try runSourceFull("(quote [])");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_vector);
-    const vec_mod = @import("vector");
+    const vec_mod = @import("coll/vector.zig");
     try testing.expectEqual(@as(usize, 0), vec_mod.count(r.result));
 }
 
@@ -8355,7 +8355,7 @@ test "compile quote vector: `[~x ~y] syntax-quote with unquote" {
     );
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_vector);
-    const vec_mod = @import("vector");
+    const vec_mod = @import("coll/vector.zig");
     try testing.expectEqual(@as(usize, 2), vec_mod.count(r.result));
     try testing.expectEqual(@as(i64, 10), vec_mod.nth(r.result, 0).asFixnum());
     try testing.expectEqual(@as(i64, 20), vec_mod.nth(r.result, 1).asFixnum());
@@ -8370,7 +8370,7 @@ test "compile quote vector: nested vector in quoted list" {
     // Second element: vector [1 2]
     const second = list_mod.head(list_mod.tail(r.result));
     try testing.expect(second.kind() == .persistent_vector);
-    const vec_mod = @import("vector");
+    const vec_mod = @import("coll/vector.zig");
     try testing.expectEqual(@as(usize, 2), vec_mod.count(second));
 }
 
@@ -8380,7 +8380,7 @@ test "compile map/set literals: (quote {}) builds the empty persistent map" {
     var r = try runSourceFull("(quote {})");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_map);
-    const cm = @import("champ");
+    const cm = @import("coll/champ.zig");
     try testing.expectEqual(@as(usize, 0), cm.mapCount(r.result));
 }
 
@@ -8388,7 +8388,7 @@ test "compile map/set literals: (quote {:a 1 :b 2}) builds 2-entry map" {
     var r = try runSourceFull("(quote {:a 1 :b 2})");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_map);
-    const cm = @import("champ");
+    const cm = @import("coll/champ.zig");
     try testing.expectEqual(@as(usize, 2), cm.mapCount(r.result));
 }
 
@@ -8410,9 +8410,9 @@ test "compile map/set literals: runtime-computed duplicate key — later wins (C
     try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expect(result.kind() == .persistent_map);
-    const cm = @import("champ");
+    const cm = @import("coll/champ.zig");
     try testing.expectEqual(@as(usize, 1), cm.mapCount(result));
-    const dispatch = @import("dispatch");
+    const dispatch = @import("dispatch.zig");
     const kw_id = try interner.internKeyword("a");
     const kw_val = value_mod.fromKeywordId(kw_id);
     const looked_up = cm.mapGet(result, kw_val, &dispatch.hashValue, &dispatch.equal);
@@ -8442,7 +8442,7 @@ test "compile map/set literals: (quote #{}) builds the empty persistent set" {
     var r = try runSourceFull("(quote #{})");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_set);
-    const cm = @import("champ");
+    const cm = @import("coll/champ.zig");
     try testing.expectEqual(@as(usize, 0), cm.setCount(r.result));
 }
 
@@ -8450,7 +8450,7 @@ test "compile map/set literals: (quote #{1 2 3}) builds 3-element set" {
     var r = try runSourceFull("(quote #{1 2 3})");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_set);
-    const cm = @import("champ");
+    const cm = @import("coll/champ.zig");
     try testing.expectEqual(@as(usize, 3), cm.setCount(r.result));
 }
 
@@ -8471,7 +8471,7 @@ test "compile map/set literals: runtime-computed duplicate elem — set collapse
     try v.retargetTop(&routine);
     const result = try v.run();
     try testing.expect(result.kind() == .persistent_set);
-    const cm = @import("champ");
+    const cm = @import("coll/champ.zig");
     try testing.expectEqual(@as(usize, 2), cm.setCount(result));
 }
 
@@ -8495,9 +8495,9 @@ test "compile map/set literals: runtime map literal {k1 v1} — value expression
     var r = try runSourceFull("(let* [n 42] {:answer n})");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_map);
-    const cm = @import("champ");
+    const cm = @import("coll/champ.zig");
     try testing.expectEqual(@as(usize, 1), cm.mapCount(r.result));
-    const dispatch = @import("dispatch");
+    const dispatch = @import("dispatch.zig");
     const kw_id = try r.vm_owned.ensureInterner().internKeyword("answer");
     const kw_val = value_mod.fromKeywordId(kw_id);
     const got = cm.mapGet(r.result, kw_val, &dispatch.hashValue, &dispatch.equal);
@@ -8509,8 +8509,8 @@ test "compile map/set literals: (quote {k {:nested :map}}) — nested quoted map
     var r = try runSourceFull("(quote {:outer {:inner 1}})");
     defer r.vm_owned.deinit();
     try testing.expect(r.result.kind() == .persistent_map);
-    const cm = @import("champ");
-    const dispatch = @import("dispatch");
+    const cm = @import("coll/champ.zig");
+    const dispatch = @import("dispatch.zig");
     const interner = r.vm_owned.ensureInterner();
     const outer_id = try interner.internKeyword("outer");
     const inner_map = cm.mapGet(r.result, value_mod.fromKeywordId(outer_id), &dispatch.hashValue, &dispatch.equal);

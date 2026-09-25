@@ -15,10 +15,10 @@
 //! while instructions execute.
 
 const std = @import("std");
-const vm = @import("vm");
-const value_mod = @import("value");
-const format_mod = @import("format");
-const intern_mod = @import("intern");
+const vm = @import("vm.zig");
+const value_mod = @import("value.zig");
+const format_mod = @import("format.zig");
+const intern_mod = @import("intern.zig");
 
 const Writer = std.Io.Writer;
 

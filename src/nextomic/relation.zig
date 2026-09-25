@@ -17,10 +17,10 @@
 //!     equal row by row after sorting.
 
 const std = @import("std");
-const value = @import("value");
-const string_mod = @import("string");
-const dispatch = @import("dispatch");
-const hash_mod = @import("hash");
+const value = @import("../value.zig");
+const string_mod = @import("../string.zig");
+const dispatch = @import("../dispatch.zig");
+const hash_mod = @import("../hash.zig");
 const key = @import("key.zig");
 
 const Allocator = std.mem.Allocator;

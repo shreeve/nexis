@@ -7,8 +7,9 @@
 //! datoms and the state the next db-value sees.
 
 const std = @import("std");
-const nextomic = @import("nextomic");
-const value = @import("value");
+const nx = @import("nexis");
+const nextomic = nx.nextomic;
+const value = nx.value;
 
 const testing = std.testing;
 const Value = value.Value;
@@ -109,12 +110,12 @@ test "a renamed attribute answers to its new ident in every view and query" {
     const eid = try std.fmt.allocPrint(a, "{d}", .{ann});
     // pull and q spell the new name; the old one is unknown.
     const pulled = try fx.pullSrc(after, "[:person/full-name]", eid);
-    try testing.expectEqualStrings("Ann", @import("string").asBytes((try fx.getName(pulled, "person/full-name")).?));
+    try testing.expectEqualStrings("Ann", nx.string.asBytes((try fx.getName(pulled, "person/full-name")).?));
     const old_view = try fx.pullSrc(before, "[*]", eid);
     try testing.expect((try fx.getName(old_view, "person/full-name")) != null);
     try testing.expect((try fx.getName(old_view, "person/name")) == null);
     const rows = try fx.q(after, "[:find ?n :where [?e :person/full-name ?n]]");
-    try testing.expectEqual(@as(usize, 1), @import("champ").setCount(rows));
+    try testing.expectEqual(@as(usize, 1), nx.champ.setCount(rows));
     try testing.expectError(error.UnknownAttribute, fx.q(after, "[:find ?n :where [?e :person/name ?n]]"));
     try testing.expectError(error.UnknownAttribute, fx.transact("[[:db/add \"x\" :person/name \"X\"]]"));
     // The txlog entry written under the old name decodes.
@@ -135,12 +136,12 @@ test "cardinality changes apply from the next transaction and keep their history
     _ = try fx.transact(try std.fmt.allocPrint(a, "[[:db/add {d} :person/name \"Annie\"]]", .{ann}));
     const many = try fx.db();
     const both = try fx.pullSrc(many, "[:person/name]", eid);
-    try testing.expectEqual(@as(usize, 2), @import("vector").count((try fx.getName(both, "person/name")).?));
+    try testing.expectEqual(@as(usize, 2), nx.vector.count((try fx.getName(both, "person/name")).?));
     // The basis before the change still reads a scalar.
     const single = try fx.pullSrc(one, "[:person/name]", eid);
-    try testing.expectEqualStrings("Ann", @import("string").asBytes((try fx.getName(single, "person/name")).?));
+    try testing.expectEqualStrings("Ann", nx.string.asBytes((try fx.getName(single, "person/name")).?));
     const single_as_of = try fx.pullSrc(many.asOf(one.basis), "[:person/name]", eid);
-    try testing.expectEqualStrings("Ann", @import("string").asBytes((try fx.getName(single_as_of, "person/name")).?));
+    try testing.expectEqualStrings("Ann", nx.string.asBytes((try fx.getName(single_as_of, "person/name")).?));
 
     // Back to one: refused while two values stand, then allowed.
     try testing.expectError(error.Schema, fx.transactFn("[[:db/add :person/name :db/cardinality :db.cardinality/one]]", &fault));
@@ -155,9 +156,9 @@ test "cardinality changes apply from the next transaction and keep their history
     try testing.expect(!(try back.attr(name)).?.many());
     try testing.expect((try many.attr(name)).?.many());
     const now = try fx.pullSrc(back, "[:person/name]", eid);
-    try testing.expectEqualStrings("Annie", @import("string").asBytes((try fx.getName(now, "person/name")).?));
+    try testing.expectEqualStrings("Annie", nx.string.asBytes((try fx.getName(now, "person/name")).?));
     const then = try fx.pullSrc(many.asOf(many.basis), "[:person/name]", eid);
-    try testing.expectEqual(@as(usize, 2), @import("vector").count((try fx.getName(then, "person/name")).?));
+    try testing.expectEqual(@as(usize, 2), nx.vector.count((try fx.getName(then, "person/name")).?));
 }
 
 test "excision empties the entity for pull and q on every view, and tx-range replays without it" {
@@ -178,15 +179,15 @@ test "excision empties the entity for pull and q on every view, and tx-range rep
     try testing.expect((try fx.getName(pulled, "person/name")) != null);
     const pulled_before = try fx.pullSrc(before, "[*]", eid);
     try testing.expect((try fx.getName(pulled_before, "person/tags")) == null);
-    try testing.expectEqual(@as(usize, 0), @import("champ").setCount(try fx.q(hist, "[:find ?t :where [?e :person/tags ?t]]")));
+    try testing.expectEqual(@as(usize, 0), nx.champ.setCount(try fx.q(hist, "[:find ?t :where [?e :person/tags ?t]]")));
 
     const y = try nextomic.transact.excise(fx.conn(), a, try fx.read("[:person/email \"ann@x\"]"), null, .{});
     try testing.expectEqual(@as(u64, 3), y.removed);
     const after = try fx.db();
     try testing.expect((try fx.pullSrc(after, "[*]", eid)).isNil());
     try testing.expect((try fx.pullSrc(before, "[*]", eid)).isNil());
-    try testing.expectEqual(@as(usize, 1), @import("champ").setCount(try fx.q(after, "[:find ?n :where [?e :person/name ?n]]")));
-    try testing.expectEqual(@as(usize, 1), @import("champ").setCount(try fx.q(after.withHistory(), "[:find ?n :where [?e :person/name ?n]]")));
+    try testing.expectEqual(@as(usize, 1), nx.champ.setCount(try fx.q(after, "[:find ?n :where [?e :person/name ?n]]")));
+    try testing.expectEqual(@as(usize, 1), nx.champ.setCount(try fx.q(after.withHistory(), "[:find ?n :where [?e :person/name ?n]]")));
     // The log replays without Ann; the entries that held her are marked.
     const log = try nextomic.db.txRange(fx.conn(), a, 3, null);
     var marked: usize = 0;
@@ -210,7 +211,7 @@ fn tokenRows(fx: *Fx) !usize {
 }
 
 fn count(v: Value) usize {
-    return @import("champ").setCount(v);
+    return nx.champ.setCount(v);
 }
 
 test "full-text stays in step under assert, retract, backfill and excision, on a store that gained :db/fulltext at open" {

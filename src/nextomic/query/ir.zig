@@ -15,7 +15,7 @@
 //!   - Everything hangs off `arena`; `deinit` frees it all.
 
 const std = @import("std");
-const value = @import("value");
+const value = @import("../../value.zig");
 const relation = @import("../relation.zig");
 
 const Allocator = std.mem.Allocator;

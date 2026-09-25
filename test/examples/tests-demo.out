@@ -1,0 +1,5 @@
+FAIL in user/failing-test (a wrong expectation): (= 5 (area 2 2)) expected: 5 actual: 4 ; areas multiply
+ERROR in user/erroring-test: :divide-by-zero
+FAIL in user/bare-test: (empty? [1]) expected: true actual: false ; a bare assertion that fails
+Ran 5 tests containing 9 assertions.
+2 failures, 1 errors.

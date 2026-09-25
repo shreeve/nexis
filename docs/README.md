@@ -9,6 +9,8 @@ wins and the code is wrong.
 
 | Source module | Spec | Notes |
 |---|---|---|
+| `src/root.zig` | (in `build.zig` `checkLayering`) | The `nexis` module: re-exports every runtime file, declared bottom-up in layering order |
+| `src/stack.zig` | [`VM.md`](VM.md) §13.1 | Native stack guard: `check` on every recursion over input depth |
 | `src/value.zig` | [`VALUE.md`](VALUE.md) | 16-byte tagged Value layout + Kind discriminator |
 | `src/heap.zig` | [`HEAP.md`](HEAP.md) | HeapHeader format + Heap allocator wrapper |
 | `src/intern.zig` | [`INTERN.md`](INTERN.md) | Symbol + keyword interning + Name split |
@@ -25,7 +27,6 @@ wins and the code is wrong.
 | `src/gc.zig` | [`GC.md`](GC.md) | Precise mark-sweep tracing GC |
 | `src/codec.zig` | [`CODEC.md`](CODEC.md) | Wire-format serialization |
 | `src/db.zig` | [`DB.md`](DB.md) | emdb-backed durable storage integration |
-| `src/pool.zig` | [`POOL.md`](POOL.md) | Small-object pool allocator |
 | `src/bench.zig` | [`BENCH.md`](BENCH.md) | Benchmark harness |
 | `src/reader.zig` | [`FORMS.md`](FORMS.md) | Sexp → Form normalizer + pretty-printer + canonical Form schema |
 | `src/vm.zig` | [`VM.md`](VM.md) | Bytecode VM: ISA + execution contracts, frames, handlers, natives, namespaces |

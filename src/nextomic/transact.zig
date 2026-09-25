@@ -31,12 +31,12 @@
 //! so `transact` and `with` are `error.Nested` while one is held.
 
 const std = @import("std");
-const value = @import("value");
-const intern_mod = @import("intern");
-const string_mod = @import("string");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ = @import("champ");
+const value = @import("../value.zig");
+const intern_mod = @import("../intern.zig");
+const string_mod = @import("../string.zig");
+const list_mod = @import("../coll/list.zig");
+const vector_mod = @import("../coll/vector.zig");
+const champ = @import("../coll/champ.zig");
 const emdb = @import("emdb");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
@@ -2072,9 +2072,9 @@ test "Lisp tx-data: vector forms, map forms, nested maps, card-many vectors, dat
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var heap = @import("heap").Heap.init(arena);
+    var heap = @import("../heap.zig").Heap.init(arena);
     defer heap.deinit();
-    const dispatch = @import("dispatch");
+    const dispatch = @import("../dispatch.zig");
     try installSchema(tc, arena);
     const email = try attrId(tc, "user/email");
     const home = try attrId(tc, "user/home");
@@ -2088,7 +2088,7 @@ test "Lisp tx-data: vector forms, map forms, nested maps, card-many vectors, dat
         }
     };
     const s = struct {
-        fn s(h: *@import("heap").Heap, t: []const u8) !Value {
+        fn s(h: *@import("../heap.zig").Heap, t: []const u8) !Value {
             return string_mod.fromBytes(h, t);
         }
     };
@@ -2147,9 +2147,9 @@ test "Lisp tx-data: vector forms, map forms, nested maps, card-many vectors, dat
 /// Lisp values for tx-data tests.
 const Lisp = struct {
     tc: *TestConn,
-    heap: *@import("heap").Heap,
+    heap: *@import("../heap.zig").Heap,
 
-    const dispatch = @import("dispatch");
+    const dispatch = @import("../dispatch.zig");
     const KV = struct { []const u8, Value };
 
     fn kw(self: Lisp, name: []const u8) !Value {
@@ -2174,7 +2174,7 @@ test "a reverse ref in a map form asserts the forward datom" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var heap = @import("heap").Heap.init(arena);
+    var heap = @import("../heap.zig").Heap.init(arena);
     defer heap.deinit();
     const l = Lisp{ .tc = tc, .heap = &heap };
     try installSchema(tc, arena);
@@ -2234,7 +2234,7 @@ test "a nested map under a plain ref must carry an identity" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var heap = @import("heap").Heap.init(arena);
+    var heap = @import("../heap.zig").Heap.init(arena);
     defer heap.deinit();
     const l = Lisp{ .tc = tc, .heap = &heap };
     try installSchema(tc, arena);
@@ -2268,7 +2268,7 @@ test "a failing transaction reports what it was looking at" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var heap = @import("heap").Heap.init(arena);
+    var heap = @import("../heap.zig").Heap.init(arena);
     defer heap.deinit();
     const l = Lisp{ .tc = tc, .heap = &heap };
     try installSchema(tc, arena);
@@ -2533,7 +2533,7 @@ test "with: Lisp tx-data" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var heap = @import("heap").Heap.init(arena);
+    var heap = @import("../heap.zig").Heap.init(arena);
     defer heap.deinit();
     try installSchema(tc, arena);
     const name = try attrId(tc, "user/name");
@@ -2810,9 +2810,9 @@ test "a lookup ref under a card-many ref attribute is one ref; a vector of them 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var heap = @import("heap").Heap.init(arena);
+    var heap = @import("../heap.zig").Heap.init(arena);
     defer heap.deinit();
-    const dispatch = @import("dispatch");
+    const dispatch = @import("../dispatch.zig");
     try installSchema(tc, arena);
     const email = try attrId(tc, "user/email");
     const friend = try attrId(tc, "user/friend");
@@ -3461,7 +3461,7 @@ test "excision removes an entity's datoms from every view and rewrites the txlog
     const basis = (try tc.conn.db()).basis;
     try testing.expectError(error.TxData, excise(tc.conn, arena, value.fromFixnum(name).?, null, .{ .fault = &fault }));
     try testing.expectError(error.TxData, excise(tc.conn, arena, value.fromFixnum(@intCast(key.txEntity(r1.t))).?, null, .{}));
-    var heap = @import("heap").Heap.init(arena);
+    var heap = @import("../heap.zig").Heap.init(arena);
     defer heap.deinit();
     try testing.expectError(error.TxData, excise(tc.conn, arena, try string_mod.fromBytes(&heap, "tmp"), null, .{}));
     try testing.expectError(error.NoEntity, excise(tc.conn, arena, value.fromFixnum(@intCast(key.user_partition_start + 99)).?, null, .{}));
@@ -3474,7 +3474,7 @@ test "excision removes an entity's datoms from every view and rewrites the txlog
 }
 
 /// `[:db.fn/cas e a old new]` as a VM value; `old` may be nil.
-fn casForm(heap: *@import("heap").Heap, tc: *TestConn, e: Value, attr: []const u8, old: Value, new: Value) !Value {
+fn casForm(heap: *@import("../heap.zig").Heap, tc: *TestConn, e: Value, attr: []const u8, old: Value, new: Value) !Value {
     const it = &tc.interner;
     const form = try vector_mod.fromSlice(heap, &.{ try it.internKeywordValue("db.fn/cas"), e, try it.internKeywordValue(attr), old, new });
     return vector_mod.fromSlice(heap, &.{form});
@@ -3486,7 +3486,7 @@ test "cas asserts against the committed value and reports what it found" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var heap = @import("heap").Heap.init(arena);
+    var heap = @import("../heap.zig").Heap.init(arena);
     defer heap.deinit();
     try installSchema(tc, arena);
     const age = try attrId(tc, "user/age");
@@ -3536,7 +3536,7 @@ test "cas asserts against the committed value and reports what it found" {
 /// a behaviour, and the hook builds the tx-data the behaviour returns.
 const TestTxHook = struct {
     tc: *TestConn,
-    heap: *@import("heap").Heap,
+    heap: *@import("../heap.zig").Heap,
     calls: usize = 0,
     /// The basis the last call saw.
     basis: u64 = 0,
@@ -3581,7 +3581,7 @@ test "transaction functions splice their tx-data in place, nest to a bound, and 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var heap = @import("heap").Heap.init(arena);
+    var heap = @import("../heap.zig").Heap.init(arena);
     defer heap.deinit();
     try installSchema(tc, arena);
     const age = try attrId(tc, "user/age");

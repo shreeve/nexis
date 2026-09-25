@@ -10,16 +10,17 @@
 //! VM through `VM.retargetTop`.
 
 const std = @import("std");
-const value_mod = @import("value");
-const vm = @import("vm");
-const compile = @import("compile");
-const reader_mod = @import("reader");
-const intern_mod = @import("intern");
-const expand_mod = @import("expand");
-const stdlib = @import("stdlib");
-const loader_mod = @import("loader");
-const format_mod = @import("format");
-const disasm_mod = @import("disasm");
+const value_mod = @import("value.zig");
+const vm = @import("vm.zig");
+const compile = @import("compile.zig");
+const reader_mod = @import("reader.zig");
+const intern_mod = @import("intern.zig");
+const expand_mod = @import("expand.zig");
+const stdlib = @import("stdlib.zig");
+const loader_mod = @import("loader.zig");
+const format_mod = @import("format.zig");
+const disasm_mod = @import("disasm.zig");
+const stack_guard = @import("stack.zig");
 
 const Value = value_mod.Value;
 
@@ -62,7 +63,27 @@ const Usage =
     \\
 ;
 
+/// The runtime's thread stack. Reading, printing, hashing and comparing
+/// nested data recurse on the native stack, guarded by `stack.check`
+/// (docs/VM.md §13.1), so the runtime runs on a thread whose stack is a
+/// large virtual reservation: pages are committed only when touched.
+const runtime_stack_size = 1 << 30;
+/// Headroom below the guard's limit for unguarded leaf calls.
+const runtime_stack_margin = 16 << 20;
+
 pub fn main(init: std.process.Init) !void {
+    var result: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{ .stack_size = runtime_stack_size }, runtimeThread, .{ init, &result });
+    thread.join();
+    return result;
+}
+
+fn runtimeThread(init: std.process.Init, result: *anyerror!void) void {
+    stack_guard.arm(runtime_stack_size - runtime_stack_margin);
+    result.* = runCommand(init);
+}
+
+fn runCommand(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 

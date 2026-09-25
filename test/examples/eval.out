@@ -1,0 +1,7 @@
+square 12 = 144
+each form: (3 4 ab)
+answer = 42
+closure from eval: 84
+macro from eval: :ran
+compile error: [UnresolvedSymbol (no-such-fn 1)]
+caught :boom

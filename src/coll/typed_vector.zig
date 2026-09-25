@@ -28,10 +28,10 @@
 //! `=` and `hash` fold it into `+0.0` as they do for a float Value.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const bignum = @import("bignum");
+const value = @import("../value.zig");
+const heap_mod = @import("../heap.zig");
+const hash_mod = @import("../hash.zig");
+const bignum = @import("../bignum.zig");
 
 const Value = value.Value;
 const Kind = value.Kind;

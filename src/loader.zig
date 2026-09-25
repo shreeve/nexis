@@ -30,11 +30,11 @@
 // it just calls through an opaque user_data pointer.
 
 const std = @import("std");
-const reader_mod = @import("reader");
-const intern_mod = @import("intern");
-const expand_mod = @import("expand");
-const compile_mod = @import("compile");
-const vm_mod = @import("vm");
+const reader_mod = @import("reader.zig");
+const intern_mod = @import("intern.zig");
+const expand_mod = @import("expand.zig");
+const compile_mod = @import("compile.zig");
+const vm_mod = @import("vm.zig");
 
 pub const LoadError = error{
     /// The requested namespace name could not be mapped to a
