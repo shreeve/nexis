@@ -1,238 +1,174 @@
-## FORMS.md — Canonical Form Schema for nexis
+## FORMS.md — the reader's Form tree
 
-Authoritative contract between the `nexis.grammar`
-parser output and the `src/reader.zig` normalizer. **This document is strictly
-derivative from `PLAN.md` Appendix C (§28) and the frozen decisions in §23.** No
-shape or rule in this file invents anything not already committed to in the plan.
-
-When FORMS.md and PLAN.md appear to disagree, PLAN.md wins and this document is
-corrected in the same commit. When you think you need a new Form kind, stop —
-amend PLAN.md §23 first.
+The contract between the `nexis.grammar` parser output and the
+`src/reader.zig` normalizer: the Form tree macros and the compiler
+consume, the normalization rules, the reader errors, the pretty-printer
+the goldens pin, and the reader's limits. The frozen schema is `PLAN.md`
+Appendix C (§28); where the two disagree, PLAN wins and this document
+is corrected in the same commit. A new datum variant is a PLAN §23
+amendment first.
 
 ---
 
 ### 1. Form shape
 
-A `Form` is a recursive heap-resident wrapper (PLAN §28.1):
+A `Form` is two fields (PLAN §28.1):
 
-```zig
-pub const Form = struct {
-    datum: Datum,                // see §2
-    origin: ?SrcSpan,            // { file_id: u32, pos: u32, len: u16 }
-    user_meta: ?*PersistentMap,  // normalized map, never `^:kw` sugar
-    ann: ?*Annotation,           // compiler-injected; invisible to user code
-};
-```
+- `datum` — the content, one `Datum` variant (§2).
+- `origin` — a `SrcSpan {pos: u32, len: u32}`, byte offset and length
+  in the source. It is never absent: the reader derives it from the
+  parser's token spans (§6), and a Form the macroexpander builds takes
+  the span of the form it expands.
 
-- `datum` is the form's actual content — atom or compound.
-- `origin` is derived from the parser's `Sexp.src`. See §6 for span policy.
-- `user_meta` is **always a normalized map** (keys are normal Form atoms).
-  The reader converts `^:kw` → `{:kw true}` and `^sym` → `{:tag sym}` before
-  attaching. Multiple metadata annotations on the same target are merged; on
-  duplicate keys, **rightmost wins** (matches Clojure, PLAN §28.5 example 2).
-- `ann` is never read or written by user code. `(meta x)` returns `user_meta`
-  only. This preserves the discipline that compiler provenance cannot be
-  stripped by `with-meta` and similar surface operations.
+A Form has no metadata field and no compiler annotation. Metadata is a
+datum of its own, `with_meta {target, meta}` (§2). The reader's arena
+owns every Form and every name and string they hold.
 
 ---
 
-### 2. Canonical datum shapes
+### 2. Datums
 
-Straight from PLAN §28.2. Every Form's `datum` is exactly one of these. Anything
-else is a bug.
+Every Form's `datum` is exactly one of these (`reader.zig` `Datum`):
 
 ```
-;; Atoms (leaves; Form's datum is an Atom variant)
+;; Atoms
 nil                                  ;; nil
 true, false                          ;; bool
-42, 0x2A, 0b101                      ;; int  (normalized from any radix; within i64)
-18446744073709551616                 ;; bigint (an integer beyond i64, as decimal text)
-3.14, 1e9, 1.5e-3                    ;; real (f64)
-"hello"                              ;; string
-\a, \newline, \u{2603}               ;; char (Unicode scalar)
-:foo, :ns/foo                        ;; keyword (interned, no metadata)
+42, 0x2A, 0b101                      ;; int     (any radix, within i64)
+18446744073709551616                 ;; bigint  (beyond i64, canonical decimal text)
+3.14, 1e9, 1.5e-3                    ;; real    (f64)
+"hello"                              ;; string  (escapes decoded, UTF-8)
+\a, \newline, \u{2603}               ;; char    (Unicode scalar)
+:foo, :ns/foo                        ;; keyword
 foo, ns/foo, set!, ->>               ;; symbol
 
-;; Compounds (Form's datum is a Compound variant with a tag + children)
-(list   f1 f2 f3)                    ;; (...)
-(vector f1 f2 f3)                    ;; [...]
-(map    k1 v1 k2 v2)                 ;; {...}   — flat key/value alternation
-(set    f1 f2 f3)                    ;; #{...}
-
-;; Reader macros (user-visible conventional tags)
-(quote             f)                ;; 'f
-(syntax-quote      f)                ;; `f    — marker only; expanded by macroexpander
-(unquote           f)                ;; ~f
-(unquote-splicing  f)                ;; ~@f
-(deref             f)                ;; @f
-
-;; Metadata — TARGET is first child, META-MAP is second
-(with-meta TARGET META-MAP)          ;; ^meta x  →  (with-meta x {:meta true})
-
-;; Internal-only (reader-normalizer output; not user-addressable)
-(#%anon-fn BODY)                     ;; #(BODY) — lowered post-parse, pre-macroexpand
+;; Compounds
+(f1 f2)   [f1 f2]   {k1 v1 k2 v2}   #{f1 f2}   ;; list, vector, map (flat k/v), set
+'f  `f  ~f  ~@f  @f                  ;; quote, syntax_quote, unquote, unquote_splicing, deref
+^meta x                              ;; with_meta {target: x, meta: a map Form}
+#(body)                              ;; anon_fn  (the body forms)
 ```
 
-Notes:
-
-- `(map k1 v1 k2 v2)` is a **flat** alternation. The reader rejects odd arity.
-- `#(...)` reads as the `anon_fn` datum holding the body forms; the
-  pretty-printer renders it with the reserved head `#%anon-fn`, a name user
-  code cannot spell (§8). The macroexpander rewrites it to
-  `(fn* [%1 %2 ...] body)`.
-- `syntax-quote` is a **structural marker**. Expansion (auto-qualification,
-  auto-gensym `x#`, unquote/splice handling) is the macroexpander's job (PLAN
-  §14.2). The reader only tags the form.
+- A map's children alternate key and value.
+- `nil`, `true` and `false` lex as symbols and become their own datums.
+- `syntax_quote` is a marker. Auto-qualification, auto-gensym `x#` and
+  unquote handling belong to the macroexpander (`MACROEXPAND.md` §5).
+- `anon_fn` holds the body forms only; `%`, `%1`, `%&` inside stay
+  ordinary symbols. The macroexpander rewrites it to `(fn* [%1 ...]
+  (body))` (`MACROEXPAND.md` §9). The pretty-printer renders it with the
+  head `#%anon-fn`, a name user code cannot spell (§8).
 
 ---
 
-### 3. Reader-normalization rules (authoritative)
+### 3. Normalization rules and reader errors
 
-Transformations between the raw `Sexp` parser output and the `Form` tree macros
-see. Mirrors PLAN §28.3 exactly.
-
-| Source | Canonical Form |
+| Source | Form, or reader error |
 |---|---|
 | `^:kw x` | `(with-meta x {:kw true})` |
 | `^{:a 1} x` | `(with-meta x {:a 1})` |
 | `^sym x` | `(with-meta x {:tag sym})` |
-| `^:a ^:b x` | `(with-meta x {:a true, :b true})` — right-to-left merge; duplicate keys: rightmost wins |
-| `#_ x y` | the `x` form is discarded; only `y` appears in output |
-| `'#_ x y`, `^:m #_ x y` | a prefix reads the form after the discarded one: `(quote y)`, `(with-meta y {:m true})` |
-| `#_ #_ x y z` | each `#_` consumes one form, which may itself begin with `#_`: only `z` remains |
-| `#(body)` | `(#%anon-fn body)` — `%`/`%1`/`%2`/`%&` left as ordinary symbols; resolved by macroexpander |
-| `` `x `` | `(syntax-quote x)` — **no expansion here**; the macroexpander does the Clojure-style rewrite |
-| `{:a 1 :a 2}` | **reader error**: `:duplicate-literal-key` |
-| `{:a}` | **reader error**: `:map-odd-count` |
-| `#{1 1 2}` | **reader error**: `:duplicate-literal-element` |
-| `#(#(inc %))` | **reader error**: `:nested-anon-fn` |
-| `~x` outside `` `...` `` | **reader error**: `:unquote-outside-syntax-quote` |
-| `~@x` outside `` `...` `` | **reader error**: `:unquote-splice-outside-syntax-quote` |
-| `42N`, `0xFFN`, `18446744073709551616N` | the integer, as without the suffix: `(int 42)`, `(int 255)`, `(bigint 18446744073709551616)` |
-| `1abc`, `1-2`, `1.5x`, `1/2`, `1.`, `0x`, `3.14M` | **reader error**: `:bad-number-literal`, detail the token's text |
-| `"one⏎two"` (a newline in the source) | a string may span lines; the newline is part of it: `(string "one\ntwo")` |
-| `"a\qb"`, `"\u{D800}"`, `"\u0041"` | **reader error**: `:invalid-string-escape`, detail the escape (`\q`, `\u{D800}`, `\u`) |
+| `^:a ^:b x` | one `with-meta`, the chain's maps merged; on a duplicate literal key the outer (leftmost) `^` wins, and keys sit in the order of their last occurrence |
+| `^42 x` | `:unknown-reader-construct` "metadata must be a keyword, map, or symbol" |
+| `#_ x y` | `x` is dropped by the parser; only `y` remains |
+| `'#_ x y`, `^:m #_ x y` | the prefix takes the form after the dropped one: `(quote y)`, `(with-meta y {:m true})` |
+| `#_ #_ x y z` | each `#_` drops one form: only `z` remains |
+| `#(body)` | `anon_fn` of the body forms |
+| `#(#(inc %))` | `:nested-anon-fn` |
+| `` `x `` | `(syntax-quote x)`, unexpanded |
+| `~x`, `~@x` outside `` `...` `` | `:unquote-outside-syntax-quote`, `:unquote-splice-outside-syntax-quote` |
+| `{:a 1 :a 2}` | `:duplicate-literal-key`, detail the key |
+| `#{1 1 2}` | `:duplicate-literal-element`, detail the element |
+| `{:a}` | `:map-odd-count` |
+| `42N`, `0xFFN`, `18446744073709551616N` | the integer, as without the suffix |
+| `1abc`, `1-2`, `1.5x`, `1/2`, `1.`, `0x`, `3.14M` | `:bad-number-literal`, detail the token |
+| `"one⏎two"` | a string may span lines; the newline is part of it |
+| `"a\qb"`, `"\u{D800}"`, `"A"` | `:invalid-string-escape`, detail the escape |
 | `λ`, `ns.é/π`, `:ключ` | a symbol or keyword may hold any non-ASCII UTF-8 character |
-| a string, symbol or keyword whose bytes are not UTF-8 | **reader error**: `:invalid-utf8` |
-| `\é`, `\☃`, `\(` | one character, any UTF-8 sequence or delimiter: `(char \u{E9})`, `(char \u{2603})`, `(char \()` |
-| `\u0041`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | **reader error**: `:invalid-char-literal`, detail the token's text (`\u{HEX}` is the one escape, PLAN §23 decision 26) |
-| `#'x`, `#"re"`, `##Inf`, `#?(...)`, `#!`, `::k` | **parse error** naming the construct (`unexpected \`#'x\``): none of these is in the reader (PLAN §7.2) |
-| a form nested past the native stack's budget | **reader error**: `:nesting-too-deep` (`src/stack.zig`) |
+| a string, symbol or keyword that is not UTF-8 | `:invalid-utf8` |
+| `\é`, `\☃`, `\(` | one character, any UTF-8 sequence or delimiter |
+| `A`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | `:invalid-char-literal`, detail the token (`\u{HEX}` is the one escape, PLAN §23 #26) |
+| `foo/bar/baz`, `:foo/bar/baz` | `:invalid-symbol`, `:invalid-keyword`, detail the token |
+| `#'x`, `#"re"`, `##Inf`, `#?(...)`, `#!`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `#'x` ``): none is in the reader (PLAN §7.2) |
+| a form nested past the native stack's budget | `:nesting-too-deep` (`src/stack.zig`) |
+
+`ErrorKind` in `reader.zig` is the complete list. The reader fails fast
+on the first error and produces no partial tree.
 
 **Number token boundary.** A token that begins with a digit, or with
 `-` and a digit, ends where a symbol would: at whitespace, a comma,
 a delimiter (`( ) [ ] { }`), `"`, `;`, a reader macro character
-(`' ` ~ @ ^ \`) or the end of input. Every symbol constituent that
-follows the digits belongs to the token, so the lexer never splits
-`1abc` into `1` and `abc` or `1-2` into `1` and `-2`; the reader
-receives the whole run, reads it as a number when the text is one of
-the §2 spellings (with an optional `N` suffix on an integer) and
-fails with `:bad-number-literal` otherwise, its span the whole token.
-The CLI reports the failure as `reader error: :bad-number-literal
-1abc` with the caret under the token (`TOOLING.md` §1). Consequences
-that differ from Clojure are listed in `CLOJURE-REVIEW.md` §4.2: `1.`
-and `22/7` are errors, `017` is decimal 17, `3.14M` is an error.
+(`' ` ~ @ ^ \`) or the end of input. The lexer never splits `1abc`
+into `1` and `abc` or `1-2` into `1` and `-2`; the reader reads the
+whole run as a number when it is one of the §2 spellings (with an
+optional `N` on an integer) and fails with `:bad-number-literal`
+otherwise, its span the whole token. The differences from Clojure
+(`1.` and `22/7` are errors, `017` is decimal 17, `3.14M` is an error)
+are in `CLOJURE-REVIEW.md` §4.2.
 
 **Char token boundary.** A char token is `\`, one character (a whole
 UTF-8 sequence, or any other byte, a delimiter included), then every
-symbol constituent that follows, as a number token runs; `\u{HEX}` runs
-to its `}` first. The reader accepts the text only when it is one
-character, `u{HEX}` naming a Unicode scalar, or a name of the named set,
-so `\a1` and `\u0041` fail whole instead of reading as a char followed
-by another form.
+symbol constituent that follows; `\u{HEX}` runs to its `}` first. The
+reader accepts the text only when it is one character, `u{HEX}` naming
+a Unicode scalar, or a name of the named set (§5), so `\a1` and
+`A` fail whole.
 
-**Duplicate detection rule.** Only *statically-detectable literal* keys or
-elements count. `{:a 1 (keyword "a") 2}` is **not** a reader error — the second
-key is a runtime value. This matches the PLAN §7.2 wording "duplicate
-statically-detectable literal keys".
+**Duplicate detection.** Only literal keys and elements count:
+`{:a 1 (keyword "a") 2}` reads, since the second key is a runtime value.
+Literal equality compares integers by value, `bigint` by text, strings
+byte for byte, keywords and symbols by name. `1` and `1.0` differ
+(`(= 1 1.0)` is false, PLAN §23 #11), `:a` and `a` differ, and reals
+compare with `==`, so `{0.0 x -0.0 y}` is a duplicate. Detection
+hashes, so it is linear in the literal's size.
 
-Comparison for duplicate detection uses the reader's own literal equality:
-integers by value, strings byte-for-byte, keywords/symbols by name, nil/true/
-false structurally. `1` and `1.0` are **different** keys at the reader (matches
-PLAN §23 decision 11: `(= 1 1.0)` is false). `:a` and `a` are different
-(keyword vs symbol hash domains per §8.4).
-
-**Metadata-target validation.** The reader allows `with-meta` to wrap any Form
-that Appendix C admits; runtime validity is enforced at eval time against the
-PLAN §8.5 attachability matrix. The reader does **not** enforce the matrix
-because the target may be a symbol whose resolution depends on the namespace.
-
-**Span preservation.** Normalized Forms inherit the source span of the
-**outermost source construct that produced them**. `^:kw x` produces a
-`with-meta` Form whose span covers both the metadata prefix and `x`. Merged
-metadata maps span from the first metadata prefix to the last.
+**Metadata targets.** The reader wraps any Form in `with-meta`; which
+values accept metadata is a runtime rule (`SEMANTICS.md` §7).
 
 ---
 
 ### 4. Stage ownership
 
-Mirrors PLAN §28.4. A fresh implementation session **must** respect these
-boundaries.
+The pipeline and its one-way stage boundaries (PLAN §5, §28.4;
+`src/root.zig` and `build.zig` check the import layering):
 
-| Stage | Input | Output | Responsibilities |
-|---|---|---|---|
-| **Parser** (`src/parser.zig`, generated; scanner `src/nexis.zig`) | source text | raw `Sexp` tree with `.src` spans | Tokenization + LALR(1) parse. Drops `#_` and the form it discards. No semantic validation beyond grammar. No normalization. |
-| **Reader / normalizer** (`src/reader.zig`) | raw `Sexp` | canonical `Form` tree | §3 rules. Attaches spans. Normalizes metadata. Lowers `#(...)`. Emits `(syntax-quote f)` marker. Rejects duplicate literal keys / odd map / nested anon-fn / bare unquote. |
-| **Macroexpander** (`src/expand.zig`) | canonical `Form` | expanded `Form` | Macros to fixpoint. **Expands `syntax-quote` forms.** Resolves `#%anon-fn` to `(fn* ...)`. A macro receives its arguments only (PLAN §23 decision 34). |
-| **Compiler** (`src/compile.zig`) | expanded `Form` | bytecode | Symbols → slot / upvalue / var / special form. Errors on unbound (`docs/COMPILER.md`). |
+| Stage | Input → output | Responsibilities |
+|---|---|---|
+| Parser (`src/parser.zig`, generated from `nexis.grammar`; scanner `src/nexis.zig`) | source → `Sexp` with token spans | Tokenizing and the LALR(1) parse; drops `#_` and its form. No normalization. |
+| Reader (`src/reader.zig`) | `Sexp` → `Form` | §3: typed atoms, spans, metadata merge, `anon_fn`, the `syntax-quote` marker, every reader error. |
+| Macroexpander (`src/expand.zig`) | `Form` → expanded `Form` | Macros to a fixpoint, `syntax-quote`, `anon_fn` → `fn*`, destructuring. A macro receives its arguments only; there is no `&form` or `&env` (PLAN §23 #34). `MACROEXPAND.md`. |
+| Compiler (`src/compile.zig`) | expanded `Form` → Tiny tree → bytecode | Resolves each symbol to a slot, capture, Var or special form in `lowerForm`; there is no separate resolver. `COMPILER.md`. |
 
-**Important**: `syntax-quote` expansion happens in the macroexpander, not the
-reader. The reader only tags. This keeps the reader stateless wrt namespaces
-and lets tooling inspect raw reader output without losing backtick structure.
+Syntax-quote expansion lives in the macroexpander so the reader holds no
+namespace state and tooling sees the backtick structure.
 
 ---
 
-### 5. Pretty-printer (canonical Form serialization)
+### 5. Pretty-printer
 
-Used by the `test/golden/*.sexp` expected files (`src/golden.zig`). The pretty-
-printer must be **deterministic, stable, and diff-friendly** — goldens cannot
-tolerate whitespace churn.
+`reader.writeForm` and `writeProgram` render a Form tree for the
+`test/golden/*.sexp` files (`src/golden.zig`). The output is
+deterministic:
 
-**Format.**
+- `(tag child ...)`. A compound whose children are all atoms prints on
+  one line; otherwise each child goes on its own line, indented two
+  spaces past the parent. There is no width-aware wrapping.
+- Atoms carry their datum tag, so a symbol and a keyword are never
+  confused: `nil`, `(bool true)`, `(int N)`, `(bigint N)`, `(real R)`,
+  `(string "S")`, `(char C)`, `(keyword :K)`, `(symbol S)`.
+- Integers print in decimal whatever the source radix. Reals use Zig's
+  `{d}` format (`1e9` prints `1000000000`); NaN and the infinities print
+  `+nan`, `+inf`, `-inf`.
+- Chars: the named set `\newline \space \tab \return \formfeed
+  \backspace`, printable ASCII as itself (`\a`, `\(`), anything else as
+  `\u{HEX}` in uppercase hex.
+- Strings escape `\" \\ \n \t \r`; every other byte outside printable
+  ASCII prints as `\u{HEX}` of that byte, so `"☃"` prints
+  `\u{E2}\u{98}\u{83}`. The output is stable; it is not source that
+  reads back as the same string.
+- Compound tags: `list vector map set quote syntax-quote unquote
+  unquote-splicing deref with-meta #%anon-fn`. Map and set children
+  print in source order. Metadata prints as the `with-meta` compound.
 
-- Lisp-style parens: `(tag child1 child2 ...)`.
-- One child per line when any child is a compound; otherwise inline on a
-  single line. (Width-aware wrapping is a future tooling pass — the
-  current printer does not measure columns.)
-- Children are indented 2 spaces beyond the opening `(`.
-- Atom notation:
-  - `nil` bare; booleans as `(bool true)`, `(bool false)`.
-  - Integers: decimal, with a leading `-` for negatives. Hex and binary source
-    literals are normalized to decimal in the Form's `datum` — the pretty-
-    printer does not preserve the source radix. An integer beyond i64 is a
-    `bigint` whose datum is that decimal text; `(bigint N)` prints it.
-  - Floats: Zig's default `{d}` formatting, except special values:
-    `+inf`, `-inf`, `+nan` (canonical NaN; the Form stores NaN as a single
-    canonical bit pattern — see SEMANTICS §3.2).
-  - Chars: `\newline`, `\space`, `\tab`, `\return`, `\formfeed`,
-    `\backspace` for the named set; printable ASCII as itself (`\a`, `\(`);
-    all others as `\u{HEX}` with uppercase hex digits and no leading zeros.
-  - Strings: double-quoted with `\n \t \r \\ \" \u{HEX}` escapes — same
-    escape language as source (PLAN §23 decision 26).
-  - Keywords: `:name` or `:ns/name`.
-  - Symbols: `name` or `ns/name`. Auto-gensym markers (`x#`) do **not** appear
-    in reader output; they are a macroexpander concern.
-- Compound tags: bare identifier (`list`, `vector`, `map`, `set`, `quote`,
-  `syntax-quote`, `unquote`, `unquote-splicing`, `deref`, `with-meta`,
-  `#%anon-fn`).
-- Map children render in **source order**. The reader preserves the input
-  order of `(map k1 v1 k2 v2 ...)` as a flat list. Forms have no sorted
-  canonical order; runtime persistent maps are unordered.
-- Set children render in **source order** for the same reason. Duplicate
-  detection already fired at the reader.
-- Metadata is the `with-meta` compound, printed like any other:
-  `(with-meta TARGET META-MAP)`.
-- `ann` is **never** emitted — it is invisible to user code and tooling.
-
-**Example.**
-
-Source:
-
-```
-^:private (defn foo [x] x)
-```
-
-Pretty-printed Form:
+Source `^:private (defn foo [x] x)` prints:
 
 ```
 (with-meta
@@ -241,113 +177,59 @@ Pretty-printed Form:
     (symbol foo)
     (vector (symbol x))
     (symbol x))
-  (map (keyword :private) true))
+  (map (keyword :private) (bool true)))
 ```
-
-The exact atomic tags in the pretty-printer — `(int N)`, `(bigint N)`, `(real R)`, `(string
-S)`, `(char C)`, `(keyword K)`, `(symbol S)`, `(bool B)`, `nil` — make atom
-types unambiguous in goldens. Bare source text like `defn` never appears as a
-standalone leaf; it is always wrapped in its datum tag. This costs a few bytes
-per golden but eliminates a whole class of "is this a symbol or a keyword?"
-review questions.
 
 ---
 
 ### 6. Span policy
 
-Every Form carries an `origin: ?SrcSpan` whose `Some` case records the source
-range that produced it. Policy:
+- An atom's span is its token's.
+- A compound's span runs from its opening punctuation (`(`, `[`, `{`,
+  `#{`, `'`, `` ` ``, `~`, `~@`, `@`, `^`, `#(`) to its closing
+  delimiter, or to the end of its target for a prefix form.
+- A `with-meta` Form covers the first `^` through the target; the merged
+  metadata map carries that same span.
+- A reader error carries the span of the token or form it rejects. The
+  CLI reports it as `path:line:col: reader error: :kind detail` with a
+  caret under the span (`TOOLING.md` §1); `read-string` throws
+  `:reader-error`.
 
-- **Atoms** carry the span of the token that produced them.
-- **Compounds** carry the span from the opening punctuation (`(`, `[`, `{`,
-  `#{`, `'`, `` ` ``, `~`, `~@`, `@`, `^`, `#(`) to the matching close.
-- **Reader-introduced constructs** (`with-meta`, `syntax-quote`, `quote`,
-  `#%anon-fn`) cover the full source extent of their origin sugar.
-- `None` appears only for Forms synthesized by macros; the reader never
-  produces `None`.
-
-Spans are **not** printed in the `.sexp` goldens: including them would
-churn goldens on unrelated edits. The CLI goldens under `test/golden/cli`
-pin them where they are visible, in error carets and `nexis disasm`
-annotations.
-
-A reader **error** carries the span of the form or token it rejects; the
-CLI reports it as `path:line:col: reader error: :kind detail` with a caret
-under the span (`TOOLING.md` §1), and `read-string` throws `:reader-error`.
+The `.sexp` goldens omit spans. The CLI goldens in `test/golden/cli/`
+pin them where they show: error carets and `nexis disasm` annotations.
 
 ---
 
-### 7. Golden-test contract
+### 7. Golden tests
 
-- `test/golden/basic.nx` exercises the happy-path reader surface from PLAN
-  §7.2. Its sibling `basic.sexp` is the expected pretty-printer output of the
-  Form tree, line-for-line.
-- `test/golden/reader-literals.nx` exhaustively covers every reader construct
-  (numbers in every radix, strings with every escape, chars named and
-  hex-escaped, keywords/symbols with and without namespace, all collection
-  literals, all reader macros, `#_`, `#(...)`, metadata in every shape).
-- `test/golden/errors/*.nx` each pair with `<name>.err`, one line: the
-  error kind, then ` :detail "..."` when the reader gives one, or
-  `:parser-error ParseError` for input the grammar rejects. Example:
+- `test/golden/basic.nx` and `reader-literals.nx` cover the reader
+  surface (every radix, escape, named and hex char, qualified name,
+  collection literal, reader macro, `#_`, `#()` and metadata shape);
+  each `.sexp` sibling is the expected `writeProgram` output.
+- Each `test/golden/errors/<name>.nx` pairs with `<name>.err`: one line,
+  the error keyword, then ` :detail "..."` when the reader gives one,
+  or `:parser-error ParseError` for input the grammar rejects, e.g.
   `:duplicate-literal-key :detail "(keyword :a)"`.
 
-A golden diff is a **reader regression**. `zig build golden -Dupdate=true`
-overwrites the expected files; use it only
-when intentionally changing the schema, and commit the diff alongside the code
-change so reviewers see both.
+A golden diff is a reader regression. `zig build golden -Dupdate=true`
+rewrites the expected files; use it only for an intended change and
+commit the diff with the code.
 
 ---
 
-### 8. Reader limits (non-binding)
+### 8. Reader limits
 
-These are **not** language-level commitments — they document the
-reader as it is. Readers should treat them as implementation
-quirks, not contract.
+These describe the reader as it is; they are not language commitments.
 
-- **Integer range.** `src/reader.zig` stores an `int` in `i64`; a literal
-  whose magnitude exceeds i64 reads as `bigint`, its canonical decimal
-  text. The compiler lifts an `int` outside the i48 fixnum range and
-  every `bigint` into a bignum constant.
-- **NaN / ±Inf literal syntax.** The reader accepts no source spelling for
-  NaN or infinity (Clojure uses `##NaN` / `##Inf`). `SEMANTICS.md` §3.2
-  pins the runtime semantics; float division by zero produces infinity.
-- **String escape re-encoding.** The pretty-printer escapes non-ASCII
-  bytes individually rather than re-encoding codepoints, so `"☃"` round-
-  trips as `\u{E2}\u{98}\u{83}` in goldens. This is stable and correct for
-  byte-level equality.
-- **`#%anon-fn` reservation.** The lexer rejects a bare `#` followed by
-  anything other than `{`, `(`, or `_` as `err`, so user code cannot write
-  a symbol whose text begins with `#%`. The reader exploits this to claim
-  `#%anon-fn` (and every other `#%*` name) as internal. If the lexer is
-  ever broadened to admit `#%` prefixes, the reader must add an explicit
-  collision check.
-- **Anon-fn placeholder status.** `#(body)` lowers to `(#%anon-fn body)`
-  with no transformation of `%`, `%1`, `%2`, `%&` inside the body — those
-  remain ordinary symbols at the reader. The macroexpander
-  (`docs/MACROEXPAND.md` §9) owns positional-arg scanning and
-  `(fn* [...] body)` synthesis. Nested `#(...)` is rejected by the reader
-  because nesting would ambiguate placeholder scoping.
-- **Duplicate-literal detection cost.** Literal keys and elements are
-  hashed, so the check and the merge of a `^` chain are linear in the
-  literal's size.
-- **Duplicate-literal detection for numeric keys.** The reader's
-  `formLiteralEq` compares `real`s with naive `==`, meaning `{0.0 x -0.0
-  y}` is flagged as a duplicate. The runtime's canonical-NaN equality
-  (SEMANTICS §2.2) is a Value-layer rule; the reader has no NaN literal
-  to compare.
-
-### 9. What FORMS.md does not cover (and why)
-
-- **Macroexpansion rules** — lives in PLAN §14 and `docs/MACROEXPAND.md`.
-- **Resolver / compiler lowering** — lives in PLAN §11 and `docs/COMPILER.md`.
-- **Serializable kinds** — lives in PLAN §15.10 and `docs/CODEC.md`. Forms
-  themselves are **not** serializable values; only the Value-layer outputs of
-  quote/compile are.
-- **Persistent-map ordering** — Form maps use source order; runtime
-  persistent maps are unordered. The two representations are distinct and
-  kept so.
-
-If you are about to add a rule to this document, check first whether it
-actually belongs in PLAN.md (frozen), SEMANTICS.md (value-layer semantics), or
-CODEC.md (serialization). FORMS.md is strictly about the parser-to-reader
-boundary.
+- **Integers.** An `int` is an i64; a literal beyond it, in any radix,
+  is a `bigint` of canonical decimal text. The compiler lifts an `int`
+  outside the i48 fixnum range, and every `bigint`, into a bignum
+  constant (`COMPILER.md` §4.3).
+- **No NaN or infinity literals.** There is no source spelling
+  (Clojure's `##NaN`, `##Inf`); `SEMANTICS.md` §2.2 gives the runtime
+  rules.
+- **`#%` names are unreachable.** The lexer accepts `#` only before
+  `{`, `(` and `_`, so no user symbol begins with `#%` and the
+  printer's `#%anon-fn` head cannot collide with one.
+- **Nested `#()`** is rejected because nesting would make the `%`
+  placeholders ambiguous.
