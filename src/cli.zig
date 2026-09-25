@@ -137,8 +137,8 @@ fn usageExit(io: std.Io) noreturn {
 }
 
 /// `nexis: <path>:<line>:<col>: <label>`, then the source line
-/// and a caret under the span. Nothing is cut: a long path, label or
-/// line goes out whole.
+/// and a caret under the span's part on that line. Nothing is cut: a
+/// long path, label or line goes out whole.
 fn emitSourceError(io: std.Io, info: *const vm.SourceInfo, label: []const u8, span: reader_mod.SrcSpan) !void {
     var buf: [1024]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(io, &buf);
@@ -149,8 +149,10 @@ fn emitSourceError(io: std.Io, info: *const vm.SourceInfo, label: []const u8, sp
     if (line_text.len > 0) {
         try w.print("    {s}\n    ", .{line_text});
         try w.splatByteAll(' ', loc.col -| 1);
-        // One caret per byte of the span, at least one.
-        try w.splatByteAll('^', @max(span.len, 1));
+        // One caret per byte of the span up to the line's end, at
+        // least one.
+        const rest = line_text.len -| (loc.col -| 1);
+        try w.splatByteAll('^', @max(@min(span.len, rest), 1));
         try w.writeAll("\n");
     }
     try w.flush();

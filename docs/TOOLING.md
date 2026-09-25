@@ -57,8 +57,9 @@ session.
 
 **A parse, reader or compile error** is `nexis: PATH:LINE:COL:
 LABEL`, the source line and a caret under the span the error is
-about, one `^` per byte (exit 3 for a parse or reader error, 4 for a
-compile error):
+about, one `^` per byte up to the end of that line, so a form that
+spans lines is underlined on its first (exit 3 for a parse or reader
+error, 4 for a compile error):
 
 ```
 nexis: test/golden/cli/bad-number.nx:5:10: reader error: :bad-number-literal 1-2
@@ -105,7 +106,8 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   follows after `: ` (`runtime error: ArityMismatch: f takes 1
   argument, got 0`). An uncaught throw is `UncaughtThrow` followed by
   the thrown value as `pr-str` prints it (`runtime error:
-  UncaughtThrow {:error :negative, :value -3}`, `uncaught-throw.err`).
+  UncaughtThrow {:error :negative, :value -3}`, `uncaught-throw.err`,
+  whose `throw` spans two lines and is underlined on its first).
 
 - One `at NAME (PATH:LINE:COL)` line per frame of `vm.error_trace`,
   innermost first: `defn` and named `fn*` routines carry their name,
