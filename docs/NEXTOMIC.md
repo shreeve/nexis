@@ -691,15 +691,20 @@ src/nextomic/
   excise.zig     §4 "Excision": the tree deletes and the txlog rewrite
   fulltext.zig   the tokenizer and the nx/fulltext rows: put, delete, search
   db.zig         DbValue, fold, datoms, entity, entid/ident, tx-range
-  handle.zig     heap bodies of the three value kinds; its own module
-                 `nextomic_handle` below dispatch/format/gc/vm, so their
-                 kind arms need nothing from the module above them
+  handle.zig     heap bodies of the three value kinds, the one file
+                 dispatch/format/gc/vm import, so their kind arms need
+                 nothing from the layers above them
   marshal.zig    VM values to and from datom values: the entity, value and cell contracts
-  relation.zig   columnar Relation
-  query/ir.zig  query/parse.zig  query/plan.zig  query/exec.zig  query/rules.zig
+  relation.zig   columnar Relation and its Cell
+  query.zig      q and explain over parse, plan and exec; the data sources
+  query/ir.zig   the parsed query and rule set
+  query/parse.zig  query value to IR; the rooted, bounded parse caches
+  query/plan.zig   greedy ordering, index choice, explain
+  query/exec.zig   scans, matches over collections, built-ins, aggregates, materialising
+  query/rules.zig  rule expansion, the stratification check, the semi-naive fixpoint
   pull.zig
-  natives.zig    nextomic/* NativeFn table, error mapping, installNextomic
-  query/natives.zig  q and explain
+  natives.zig    nextomic/* NativeFn table, error mapping, per-VM state, install
+  query/natives.zig  q and explain (and their arg-map form), the call hook
 stdlib/nextomic.nx   sugar only (with-conn)
 test/prop/nextomic_key.zig     order(enc a, enc b) == cmp(a, b) per type
 test/prop/nextomic_tx.zig      random transactions vs an in-memory model, every basis
@@ -711,8 +716,8 @@ test/integration/nextomic_entity.zig the lazy entity through the pipeline, and u
 test/nextomic/*.nx             end-to-end scripts
 ```
 
-`nextomic` is one build module above `dispatch` and `vm`, imported by
-`stdlib` only; `cli` installs it through `stdlib.installNextomic` and
+`nextomic` sits above `dispatch` and `vm` and is imported by `stdlib`
+only; `cli` installs it through `stdlib.installNextomic` and
 bootstraps `stdlib/nextomic.nx` with the `nextomic` namespace current.
 Value kinds: `nextomic_conn`, `nextomic_db`, `nextomic_entity` (heap
 boxes from `handle.zig`; the connection box holds the `Conn` the VM
