@@ -1239,6 +1239,9 @@ test "integration: transients: transient, conj!, assoc!, dissoc!, disj!, pop!, p
     try expectOutput("(let [t (transient [])] (persistent! t) (try (conj! t 1) (catch any e e)))", ":transient-used-after-persistent");
     try expectOutput("(try (transient '(1)) (catch any e e))", ":kind-mismatch");
     try expectOutput("(persistent! (conj! (transient {}) [:k 1]))", "{:k 1}");
+    try expectOutput("(let [t (transient [1 2 3])] (identical? t (assoc! t 3 4)))", "true");
+    try expectOutput("[(try (assoc! (transient [1]) 5 :x) (catch any e e)) (try (pop! (transient [])) (catch any e e))]", "[:index-out-of-bounds :index-out-of-bounds]");
+    try expectOutput("[(pop [1 2 3]) (pop [1]) (count (reduce (fn [v _] (pop v)) (vec (range 2000)) (range 1990)))]", "[[1 2] [] 10]");
 }
 
 test "integration: a transient hashes by identity, so it can be a set member or map key (SEMANTICS §2.6)" {
