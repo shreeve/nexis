@@ -548,8 +548,9 @@ do not fit) and enables a one-instruction call fast path.
 - For a variadic routine, the call machinery (NOT the caller's
   bytecode) builds a list from the excess arguments right-to-left
   and installs it at callee `slot[fixed_arity]`; when
-  `argc == fixed_arity` the rest slot holds the empty list. Slots
-  above it up to the callee's window end are reset to nil.
+  `argc == fixed_arity` the rest slot holds nil, as in Clojure, so
+  `(if more ...)` tests for extra arguments. Slots above it up to
+  the callee's window end are reset to nil.
 - Point `callee.upvalues` at the closure's upvalue array.
 - Dispatch into the callee's entry point (pc 0).
 - On callee `return v`: pop the frame, restore the stack length
@@ -586,10 +587,15 @@ halts the VM with that value as `vm.result`.
 native built on `VM.callValue`.
 
 **Native entry points**: `VM.callValue(callee, args)` invokes any
-callable from Zig (used by `map`, `reduce`, `swap!`, protocol
-dispatch, ...) by pushing a synthetic frame and running the VM to
-its return; `VM.evalClosure` runs a closure in a fresh sub-VM (the
-macroexpander uses it for `defmacro` bodies).
+callable from Zig (used by `map`, `reduce`, `swap!`, `apply`, ...):
+a closure by copying the arguments to the top of the stack, entering
+it exactly as `call:call` does and running the VM to its return; a
+native, a protocol fn or a lookup by calling it directly with its
+arguments rooted. `call:call`, `callValue` and `VM.evalClosure`
+(which runs a closure in a fresh sub-VM; the macroexpander uses it
+for `defmacro` bodies) share one closure entry and one direct call,
+so a protocol fn passed to `map` or `apply` behaves as it does in
+call position.
 
 ---
 

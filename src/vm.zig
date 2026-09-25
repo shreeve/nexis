@@ -854,70 +854,6 @@ pub fn nativeFnValue(descriptor: *const NativeFn) Value {
     return value_mod.fromNativeFnPtr(@ptrCast(descriptor));
 }
 
-/// Dispatch a `call:call` whose callee resolves to
-/// a `.native_fn` Value. Copies args off the stack (so the
-/// args slice outlives any stack growth), validates arity,
-/// invokes the host fn, stores the result.
-fn execCallNative(
-    self: *VM,
-    callee_v: Value,
-    call_base: u32,
-    argc: u32,
-    result_dst: u12,
-) VmError!void {
-    const native = asNativeFn(callee_v);
-
-    // Arity check.
-    if (argc < native.min_arity) return VmError.ArityMismatch;
-    if (native.max_arity) |max| {
-        if (argc > max) return VmError.ArityMismatch;
-    }
-
-    // Validate caller's frame can fit the result_dst (mirrors
-    // the closure-call validation path; both must trap symmetric
-    // bytecode corruption).
-    {
-        const caller_frame = self.currentFrame();
-        if (result_dst >= caller_frame.slot_count) {
-            return VmError.OperandOutOfRange;
-        }
-    }
-
-    // Copy args off the stack into a heap-allocated slice so
-    // the native fn can re-enter the VM, grow the stack, or
-    // allocate freely without aliasing dead slots. We use a
-    // small bounded stack buffer for the common case (argc <= 8)
-    // to avoid the allocator round-trip; longer arg lists fall
-    // back to allocator.alloc.
-    var stack_buf: [8]Value = undefined;
-    var args_slice: []Value = undefined;
-    var heap_args: ?[]Value = null;
-    defer if (heap_args) |h| self.allocator.free(h);
-    if (argc <= stack_buf.len) {
-        args_slice = stack_buf[0..argc];
-    } else {
-        const h = self.allocator.alloc(Value, argc) catch return VmError.OutOfMemory;
-        heap_args = h;
-        args_slice = h;
-    }
-    var i: u32 = 0;
-    while (i < argc) : (i += 1) {
-        const src = try self.slotPtr(@intCast(call_base + 1 + i));
-        args_slice[i] = src.*;
-    }
-
-    // Invoke. Native fns return a Value or propagate VmError;
-    // throws are propagated upward via the standard handler
-    // mechanism. A native that re-enters the VM through
-    // `callValue` gets its own synthetic frame and the
-    // `ControlTransferred` signal handles unwinding through it.
-    const result = try native.call(self, args_slice);
-
-    // Store result at the caller's result_dst slot.
-    const dst_ptr = try self.slotPtr(result_dst);
-    dst_ptr.* = result;
-}
-
 // =============================================================================
 // Frame (VM.md §7)
 //
@@ -2071,11 +2007,9 @@ pub const VM = struct {
         return error.NoProtocolMethod;
     }
 
-    /// Dispatch a protocol-method
-    /// invocation. Called from `execCallCall` when the callee
-    /// has `Kind.protocol_fn`. Walks the protocol registry to
-    /// find an impl for the receiver's dispatch key, returns
-    /// `NoProtocolImpl` if none and no default exists.
+    /// Call the protocol fn `callee` with `args`: find the impl for
+    /// the receiver's (`args[0]`) dispatch key, or the protocol's
+    /// default, and call it. `NoProtocolImpl` when there is neither.
     pub fn dispatchProtocolMethod(
         self: *VM,
         callee: Value,
@@ -2139,35 +2073,26 @@ pub const VM = struct {
         return @constCast(body.upvalues);
     }
 
-    /// Invoke `closure` with `args`
-    /// in a FRESH sub-VM, returning the result Value. Used by
-    /// the expander for compile-time macro evaluation.
+    /// Invoke `closure_v` with `args` in a fresh sub-VM, `out_vm`,
+    /// returning the result. The expander evaluates a macro this
+    /// way: a sub-VM needs no save and restore of the calling VM's
+    /// frames, handlers and finally stack. The closure's routine
+    /// carries its `var_table` (pointers into the caller's
+    /// namespaces) and its literal pool, so the sub-VM needs no
+    /// namespace of its own; `interner`, when given, is shared so the
+    /// ids in the arguments resolve.
     ///
-    /// **Why fresh-VM-per-call**: avoids save/restore of the
-    /// caller's VM state (handlers, finally stack, halted flag,
-    /// frame stack). Each invocation gets isolated heap +
-    /// frame state. The closure's routine carries its `var_table`
-    /// (pointers into the caller's namespace) and constant pool
-    /// (literals interned by the caller's interner) directly,
-    /// so the sub-VM doesn't need a namespace/interner of its
-    /// own for the macro body to read or mutate the caller's
-    /// Vars. Symbols/keywords emitted by the macro come from
-    /// the caller's interner via the routine's literal pool.
+    /// **Heap**: with `shared_heap` given, the sub-VM allocates on it
+    /// (the calling VM's heap), so whatever the macro stores into a
+    /// Var stays valid after the sub-VM is gone; without one the
+    /// sub-VM's own heap holds its values until `deinit`. A sub-VM
+    /// never collects: the values it reads through Vars and
+    /// arguments live on heaps whose roots it cannot enumerate.
     ///
-    /// **Heap**: with `heap` given, the sub-VM allocates on it (the
-    /// calling VM's heap, reached through the namespace registry),
-    /// so whatever the macro stores into a Var stays valid after
-    /// the sub-VM is gone; without one the sub-VM's own heap holds
-    /// its values until `deinit`. A sub-VM never collects: the
-    /// values it reads through Vars and arguments live on heaps
-    /// whose roots it cannot enumerate.
-    ///
-    /// **Lifetime**: the returned Value may reference the
-    /// sub-VM's own heap when no heap was shared. The caller MUST
-    /// convert the result to a caller-arena-owned form (typically
-    /// by walking it into a Form tree on the compile arena) BEFORE
-    /// calling `deinit` on the sub-VM. `out_vm` is written so the
-    /// caller controls the deinit timing.
+    /// **Lifetime**: on success the caller owns `out_vm` and must
+    /// convert the result out of the sub-VM's heap (when none was
+    /// shared) before calling its `deinit`. On failure `out_vm` is
+    /// already released.
     pub fn evalClosure(
         allocator: std.mem.Allocator,
         closure_v: Value,
@@ -2177,171 +2102,147 @@ pub const VM = struct {
         shared_heap: ?*heap_mod.Heap,
     ) !Value {
         if (closure_v.kind() != .function) return error.NotCallable;
-        const closure = VM.asClosure(closure_v);
-        const routine = closure.routine;
-
-        // Arity check.
-        if (routine.variadic) {
-            if (args.len < routine.fixed_arity) return error.ArityMismatch;
-        } else {
-            if (args.len != routine.fixed_arity) return error.ArityMismatch;
-        }
-
-        out_vm.* = try VM.init(allocator, routine);
+        out_vm.* = try VM.init(allocator, &idle_routine);
+        errdefer out_vm.deinit();
         out_vm.borrowed_interner = interner;
         out_vm.borrowed_heap = shared_heap;
         out_vm.gc_enabled = false;
-
-        // Wire the frame's upvalues to the closure's captures.
-        out_vm.frames.items[0].upvalues = closure.upvalues;
-        out_vm.frames.items[0].closure = closure_v;
-
-        // Populate the fixed-arity args into slots.
-        const fixed: usize = routine.fixed_arity;
-        var i: usize = 0;
-        while (i < fixed) : (i += 1) {
-            out_vm.stack.items[i] = args[i];
-        }
-
-        // For variadic, build the rest list from the excess args.
-        if (routine.variadic) {
-            const heap = out_vm.ensureHeap();
-            var rest = list_mod.empty(heap) catch return error.OutOfMemory;
-            var j: usize = args.len;
-            while (j > fixed) {
-                j -= 1;
-                rest = list_mod.cons(heap, args[j], rest) catch return error.OutOfMemory;
-            }
-            if (fixed < out_vm.stack.items.len) {
-                out_vm.stack.items[fixed] = rest;
-            }
-        }
-
-        return try out_vm.run();
+        return out_vm.callValue(closure_v, args);
     }
 
-    /// Invoke `callee` (Closure
-    /// or native_fn) from inside an already-running VM. Used by
-    /// native HOFs (`map`/`reduce`/`filter`/`apply`) to call
-    /// user-supplied fns at runtime without the per-call
-    /// fresh-VM overhead of `evalClosure`.
+    /// Call `callee` with `args` from host code running inside the
+    /// VM: how natives (`map`, `reduce`, `apply`, `swap!`, ...) call
+    /// the functions they are given. Any callable works: a closure,
+    /// a native, a protocol fn, a keyword, symbol or collection used
+    /// as a lookup.
     ///
-    /// **Args lifetime**: `args` is borrowed for the duration
-    /// of the call. Callees (native fns + closures) must not
-    /// retain the slice past their own return.
+    /// **Args lifetime**: `args` is borrowed for the duration of the
+    /// call and must not point into `vm.stack`.
     ///
-    /// **Throw propagation**: if the callee throws and no
-    /// handler INSIDE the callee catches it, control transfers
-    /// to a handler installed BELOW the `callValue` entry
-    /// point. In that case `callValue` returns
-    /// `VmError.ControlTransferred` — an INTERNAL signal that
-    /// callers (native fns + HOFs) must propagate unchanged.
-    /// The main run loop catches `ControlTransferred` and
-    /// continues dispatch (frame + PC already adjusted by
-    /// `unwindThrow`).
+    /// **Throw propagation**: if the callee throws and no handler
+    /// inside the callee catches it, control transfers to a handler
+    /// installed below the `callValue` entry point, and `callValue`
+    /// returns `VmError.ControlTransferred`, an internal signal the
+    /// calling native must propagate unchanged. The run loop beneath
+    /// catches it and continues dispatch (frames and pc already
+    /// adjusted by `unwindThrow`).
     ///
-    /// **Rooting**: a native callee's `args` are pushed on the
-    /// root stack for the call, so a native reached this way holds
-    /// rooted arguments exactly as one reached by `call:call`
-    /// holds them in the caller's slots; a closure callee receives
-    /// them in its own slots. Values a native derives and keeps
-    /// across a nested `callValue` are its own to root
-    /// (`RootScope`; GC.md §3).
+    /// **Rooting**: a closure receives `args` in its own slots; any
+    /// other callee's `args` are pushed on the root stack for the
+    /// call, so a native reached this way holds rooted arguments
+    /// exactly as one reached by `call:call` holds them in the
+    /// caller's slots. Values a native derives and keeps across a
+    /// nested `callValue` are its own to root (`RootScope`; GC.md §3).
     pub fn callValue(self: *VM, callee: Value, args: []const Value) VmError!Value {
         // Every re-entry nests a native call and a run loop on the
         // native stack (§13.1).
         stack_guard.check() catch return VmError.StackOverflow;
+        if (callee.kind() != .function) {
+            const scope = self.rootScope();
+            defer scope.release();
+            try scope.pushAll(args);
+            return self.callDirect(callee, args);
+        }
+        const base = self.stack.items.len;
+        self.stack.appendSlice(self.allocator, args) catch return VmError.OutOfMemory;
+        var result_cell = HostCallResult{};
+        const depth = self.frames.items.len;
+        self.enterClosure(callee, base, args.len, base, .{ .host_result = &result_cell }) catch |err| {
+            self.stack.shrinkRetainingCapacity(base);
+            return err;
+        };
+        try self.runUntilDepth(depth);
+        // Back at `depth` without a return: a throw went past us.
+        if (!result_cell.done) return VmError.ControlTransferred;
+        return result_cell.value;
+    }
+
+    /// Call `callee`, anything but a closure, with `args`, to
+    /// completion on the native stack: a native (after its arity
+    /// check), a protocol fn (dispatched on `args[0]`), or a lookup
+    /// (`callLookup`). Anything else is `NotCallable`.
+    fn callDirect(self: *VM, callee: Value, args: []const Value) VmError!Value {
         switch (callee.kind()) {
-            value_mod.Kind.native_fn => {
+            .native_fn => {
                 const native = asNativeFn(callee);
                 if (args.len < native.min_arity) return VmError.ArityMismatch;
-                if (native.max_arity) |max| {
-                    if (args.len > max) return VmError.ArityMismatch;
-                }
-                const scope = self.rootScope();
-                defer scope.release();
-                try scope.pushAll(args);
+                if (native.max_arity) |max| if (args.len > max) return VmError.ArityMismatch;
                 return native.call(self, args);
             },
-            value_mod.Kind.function => {
-                const closure = asClosure(callee);
-                const routine = closure.routine;
-                // Arity check (same shape as execCallCall).
-                if (routine.variadic) {
-                    if (args.len < routine.fixed_arity) return VmError.ArityMismatch;
-                } else {
-                    if (routine.fixed_arity != args.len) return VmError.ArityMismatch;
-                }
-                if (closure.upvalues.len != routine.upvalue_count) {
-                    return VmError.CaptureCountMismatch;
-                }
-                // Allocate stack space. Variadic gotcha: must
-                // accommodate args.len even when
-                // > routine.slot_count, otherwise the arg-copy
-                // loop below writes out of bounds. After rest
-                // construction we shrink back to slot_count.
-                const required_slots = @max(@as(usize, routine.slot_count), args.len);
-                const base_slot: usize = self.stack.items.len;
-                self.stack.appendNTimes(self.allocator, value_mod.nilValue(), required_slots) catch return VmError.OutOfMemory;
-                // Copy fixed args.
-                const fixed: usize = routine.fixed_arity;
-                var i: usize = 0;
-                while (i < fixed) : (i += 1) {
-                    self.stack.items[base_slot + i] = args[i];
-                }
-                // Variadic rest construction.
-                if (routine.variadic) {
-                    // Build the rest list from excess args in
-                    // reverse so cons threads correctly.
-                    const heap = self.ensureHeap();
-                    var rest = list_mod.empty(heap) catch return VmError.OutOfMemory;
-                    var j: usize = args.len;
-                    while (j > fixed) {
-                        j -= 1;
-                        rest = list_mod.cons(heap, args[j], rest) catch return VmError.OutOfMemory;
-                    }
-                    self.stack.items[base_slot + fixed] = rest;
-                    // Nil any slots between fixed+1 .. required_slots
-                    // (these are the dead args).
-                    var k: usize = fixed + 1;
-                    while (k < required_slots) : (k += 1) {
-                        self.stack.items[base_slot + k] = value_mod.nilValue();
-                    }
-                }
-                // Now shrink to the routine's logical slot_count.
-                // (Variadic routines' slot_count already accounts
-                // for the rest slot.)
-                if (required_slots > routine.slot_count) {
-                    self.stack.shrinkRetainingCapacity(base_slot + routine.slot_count);
-                }
-
-                // Set up result cell and push the synthetic frame.
-                var result_cell = HostCallResult{};
-                const initial_depth = self.frames.items.len;
-                try self.pushFrame(.{
-                    .routine = routine,
-                    .base_slot = @intCast(base_slot),
-                    .entry_stack_len = @intCast(base_slot),
-                    .slot_count = routine.slot_count,
-                    .pc = 0,
-                    .upvalues = closure.upvalues,
-                    .closure = callee,
-                    .host_result = &result_cell,
-                });
-
-                // Run until our frame returns (depth back to initial).
-                try self.runUntilDepth(initial_depth);
-
-                // If the depth dropped without `done = true`, a
-                // throw propagated past us → ControlTransferred.
-                if (!result_cell.done) return VmError.ControlTransferred;
-                return result_cell.value;
-            },
+            .protocol_fn => return self.dispatchProtocolMethod(callee, args),
             else => {
-                if (isLookupCallable(callee.kind())) return callLookup(callee, args);
-                return VmError.NotCallable;
+                if (!isLookupCallable(callee.kind())) return VmError.NotCallable;
+                return callLookup(callee, args);
             },
         }
+    }
+
+    /// Where a closure frame's value goes when it returns.
+    const Link = struct {
+        return_dst: u12 = 0,
+        return_pc: u32 = 0,
+        host_result: ?*HostCallResult = null,
+    };
+
+    /// Enter `callee`, a closure whose `argc` arguments sit in
+    /// `stack[base..base + argc]`, the one entry path for `call:call`,
+    /// `callValue` and `evalClosure`: check the arity and the
+    /// routine's shape, grow the stack over the callee's window, pack
+    /// the arguments past the fixed ones into the rest list (nil when
+    /// there are none, as in Clojure), nil every other slot the window
+    /// and the arguments cover, and push the frame.
+    /// `entry_stack_len` is the stack length its pop restores.
+    fn enterClosure(self: *VM, callee: Value, base: usize, argc: usize, entry_stack_len: usize, link: Link) VmError!void {
+        const closure = asClosure(callee);
+        const routine = closure.routine;
+        const fixed: usize = routine.fixed_arity;
+        if (if (routine.variadic) argc < fixed else argc != fixed) return VmError.ArityMismatch;
+        if (closure.upvalues.len != routine.upvalue_count) return VmError.CaptureCountMismatch;
+        // A variadic routine needs a slot for its rest parameter.
+        if (routine.slot_count < fixed + @intFromBool(routine.variadic)) return VmError.BytecodeCorruption;
+
+        const window_end = base + routine.slot_count;
+        const args_end = base + argc;
+        if (window_end > self.stack.items.len) {
+            self.stack.appendNTimes(self.allocator, value_mod.nilValue(), window_end - self.stack.items.len) catch return VmError.OutOfMemory;
+        }
+        errdefer self.stack.shrinkRetainingCapacity(entry_stack_len);
+        // The rest list is built while the excess arguments still
+        // hold their values.
+        var live_end = args_end;
+        if (routine.variadic) {
+            var rest = value_mod.nilValue();
+            if (argc > fixed) {
+                const heap = self.ensureHeap();
+                rest = list_mod.empty(heap) catch return VmError.OutOfMemory;
+                var j = args_end;
+                while (j > base + fixed) {
+                    j -= 1;
+                    rest = list_mod.cons(heap, self.stack.items[j], rest) catch return VmError.OutOfMemory;
+                }
+            }
+            self.stack.items[base + fixed] = rest;
+            live_end = base + fixed + 1;
+        }
+        // Locals start nil, and so do excess argument slots past the
+        // window: whatever they held is dead.
+        @memset(self.stack.items[live_end..@max(args_end, window_end)], value_mod.nilValue());
+        // An argument list longer than the window was appended by
+        // `callValue` and ends at the window.
+        const extent = @max(entry_stack_len, window_end);
+        if (self.stack.items.len > extent) self.stack.shrinkRetainingCapacity(extent);
+
+        try self.pushFrame(.{
+            .routine = routine,
+            .base_slot = @intCast(base),
+            .entry_stack_len = @intCast(entry_stack_len),
+            .slot_count = routine.slot_count,
+            .return_dst = link.return_dst,
+            .return_pc = link.return_pc,
+            .upvalues = closure.upvalues,
+            .closure = callee,
+            .host_result = link.host_result,
+        });
     }
 
     /// Run a compiled top-level `routine` to its `return` as a
@@ -2912,219 +2813,45 @@ pub const VM = struct {
     }
 
     /// `call:call A=call_base B=argc C=result_slot` — range-call
-    /// ABI per VM.md §6. Caller has staged
-    /// `slot[A] = closure` and `slot[A+1 .. A+1+argc] = args`.
-    /// On return, the call's result lands in `slot[C]` and the
-    /// caller resumes at the instruction following this one.
+    /// ABI per VM.md §6. Caller has staged `slot[A] = callee` and
+    /// `slot[A+1 .. A+1+argc] = args`. A closure callee gets a frame
+    /// windowed over the arguments; its return lands in `slot[C]` and
+    /// the caller resumes at the instruction following this one. Any
+    /// other callee runs to completion here and its value lands in
+    /// `slot[C]` at once.
     fn execCallCall(self: *VM, inst: Inst) VmError!void {
-        // Operand kind validation per VM.md §13. A and C are
-        // slot operands; B is a raw-index immediate (kind ignored
-        // per §4.5 raw-index convention).
-        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
-
+        // A and C are slot operands; B is a raw-index immediate
+        // (§4.5).
+        if (inst.a.kind != .slot or inst.c.kind != .slot) return VmError.InvalidOperandKind;
         const call_base: u32 = inst.a.index;
         const argc: u32 = inst.b.index;
         const result_dst: u12 = inst.c.index;
 
-        // Validate the call block fits within the caller's frame
-        // (u32 math avoids u12 overflow).
-        // The closure occupies slot[A], args are at A+1..A+argc.
-        // Compiler invariant: caller's slot_count >= A + 1 + argc.
-        const caller_idx = self.currentFrameIdx();
-        {
-            const caller_frame = self.currentFrame();
-            const required: u32 = call_base + 1 + argc;
-            if (required > caller_frame.slot_count) {
-                return VmError.CallBlockOutOfRange;
-            }
-        }
+        const caller = self.currentFrame();
+        if (call_base + 1 + argc > caller.slot_count) return VmError.CallBlockOutOfRange;
+        if (result_dst >= caller.slot_count) return VmError.OperandOutOfRange;
+        const callee = (try self.slotPtrIn(caller, @intCast(call_base))).*;
+        const args_base: usize = @as(usize, caller.base_slot) + call_base + 1;
+        if (args_base + argc > self.stack.items.len) return VmError.BytecodeCorruption;
 
-        // Read callee value from slot[call_base]. Copy the Value
-        // by value (16 bytes) so we don't hold a *Value across
-        // stack growth.
-        const closure_v = (try self.slotPtr(@intCast(call_base))).*;
-
-        // Native-fn dispatch branch. Native fns don't push a new
-        // frame — they run host-Zig code directly with the arg
-        // slice and write their result back to the caller's
-        // result_dst. Args are COPIED off the stack first so
-        // native fns can safely allocate / re-enter / grow the
-        // stack without aliasing dead slots.
-        if (closure_v.kind() == value_mod.Kind.native_fn) {
-            return try execCallNative(self, closure_v, call_base, argc, result_dst);
+        if (callee.kind() == .function) {
+            // `caller.pc` is already past this instruction.
+            return self.enterClosure(callee, args_base, argc, self.stack.items.len, .{
+                .return_dst = result_dst,
+                .return_pc = caller.pc,
+            });
         }
-        // Protocol-fn dispatch.
-        // Same shape as native — args COPIED off the stack (so
-        // the dispatcher's invoked impl can safely grow the
-        // stack), result written to result_dst. The receiver
-        // (args[0]) determines which impl wins. PROTOCOLS.md
-        // §3.2 + §5 hand-trace.
-        if (closure_v.kind() == value_mod.Kind.protocol_fn) {
-            // Copy args.
-            const args_buf = try self.allocator.alloc(value_mod.Value, argc);
-            defer self.allocator.free(args_buf);
-            var i: u32 = 0;
-            while (i < argc) : (i += 1) {
-                const arg_ptr = try self.slotPtr(@intCast(call_base + 1 + i));
-                args_buf[i] = arg_ptr.*;
-            }
-            const result = try self.dispatchProtocolMethod(closure_v, args_buf);
-            // Write result back. Caller frame's result_dst slot
-            // is valid (validated below for closures; here we
-            // re-check the same window).
-            const caller_frame = self.currentFrame();
-            if (result_dst >= caller_frame.slot_count) {
-                return VmError.OperandOutOfRange;
-            }
-            const dst_ptr = try self.slotPtr(result_dst);
-            dst_ptr.* = result;
-            return;
-        }
-        if (isLookupCallable(closure_v.kind())) {
-            return try self.execCallLookup(closure_v, call_base, argc, result_dst);
-        }
-        if (closure_v.kind() != value_mod.Kind.function) {
-            return VmError.NotCallable;
-        }
-        const closure = asClosure(closure_v);
-        const callee_routine = closure.routine;
-
-        // Arity check:
-        //   non-variadic: argc must equal fixed_arity
-        //   variadic:     argc must be >= fixed_arity (excess
-        //                 args get packed into a rest list by
-        //                 the VM at call/prologue time below)
-        if (callee_routine.variadic) {
-            if (argc < callee_routine.fixed_arity) {
-                return VmError.ArityMismatch;
-            }
-        } else {
-            if (callee_routine.fixed_arity != argc) {
-                return VmError.ArityMismatch;
-            }
-        }
-        // Upvalue count consistency check: the closure's upvalue
-        // array length must match what the routine expects.
-        // Indicates `closure:make` was emitted with a wrong-size
-        // descriptor, OR the closure was constructed by a
-        // different routine. Trap as CaptureCountMismatch.
-        if (closure.upvalues.len != callee_routine.upvalue_count) {
-            return VmError.CaptureCountMismatch;
-        }
-        // Validate result slot fits within caller's frame:
-        // rejecting at call time is cheaper
-        // than running the callee and failing on return.
-        {
-            const caller_frame = self.currentFrame();
-            if (result_dst >= caller_frame.slot_count) {
-                return VmError.OperandOutOfRange;
-            }
-        }
-        // Validate the routine's metadata is internally
-        // consistent: a
-        // routine with `slot_count < fixed_arity` would underrun
-        // on fixed param storage; a variadic routine additionally
-        // needs `slot_count > fixed_arity` (room for the rest
-        // slot). Indicates compiler bug or corrupt routine.
-        // Use u32 for the addition to avoid overflow on
-        // malformed routines with fixed_arity == maxInt(u16) and
-        // variadic = true. Such routines are
-        // bytecode corruption regardless; we want to surface
-        // BytecodeCorruption, not an integer-overflow panic.
-        const min_slots: u32 = @as(u32, callee_routine.fixed_arity) +
-            @as(u32, if (callee_routine.variadic) 1 else 0);
-        if (@as(u32, callee_routine.slot_count) < min_slots) {
-            return VmError.BytecodeCorruption;
-        }
-
-        // Compute callee window per range-call ABI:
-        //   callee.base_slot = caller.base_slot + call_base + 1
-        // Read caller's base_slot before any stack/frames mutation.
-        const caller_base: u32 = self.frames.items[caller_idx].base_slot;
-        const callee_base: u32 = caller_base + call_base + 1;
-        const callee_end: u32 = callee_base + callee_routine.slot_count;
-
-        // The stack length before the callee's window is grown
-        // into it is what the callee's return must restore.
-        const entry_stack_len: u32 = @intCast(self.stack.items.len);
-
-        // Grow stack to fit the callee's full slot range. Args
-        // are already at callee_base..callee_base+argc (windowed
-        // from the caller). Locals/temps beyond args MUST be
-        // initialized to nil even though that memory may already
-        // exist as caller's high slots (GC roots /
-        // next-iteration reads need a valid Value
-        // there, not stale caller data).
-        if (callee_end > self.stack.items.len) {
-            const grow_by: usize = callee_end - self.stack.items.len;
-            try self.stack.appendNTimes(self.allocator, value_mod.nilValue(), grow_by);
-        }
-
-        // Variadic-rest materialization. After this
-        // block, slot[callee_base + fixed_arity] holds an
-        // empty list (if argc == fixed_arity) or a cons list
-        // of the excess args in their original order.
-        //
-        // Ordering: build the rest list first, while the
-        // excess-arg slots still hold the live values; install
-        // it at slot[fixed]; only then reset the local slots to
-        // nil, starting after the rest slot (variadic: fixed+1)
-        // or after the args (non-variadic: argc).
-        if (callee_routine.variadic) {
-            const heap = self.ensureHeap();
-            var rest = list_mod.empty(heap) catch return VmError.OutOfMemory;
-            const fixed: usize = callee_routine.fixed_arity;
-            var j: usize = argc;
-            while (j > fixed) {
-                j -= 1;
-                const arg = self.stack.items[@as(usize, callee_base) + j];
-                rest = list_mod.cons(heap, arg, rest) catch return VmError.OutOfMemory;
-            }
-            self.stack.items[@as(usize, callee_base) + fixed] = rest;
-        }
-
-        // Reset dead slots to nil. Coverage:
-        //   - Variadic: start at fixed_arity+1 (skip the rest
-        //     slot, which was just written); end at
-        //     max(callee_base + argc, callee_end). When
-        //     argc > slot_count (common for variadic), excess-
-        //     arg slots sit ABOVE the callee's logical frame
-        //     but still inside the caller's backing stack —
-        //     they hold dead post-cons values and must be
-        //     nil'd for GC-root hygiene (once roots scan).
-        //   - Non-variadic: start at argc (skip the live args).
-        //     end at callee_end (slot_count).
-        const reset_start: usize = if (callee_routine.variadic)
-            @as(usize, callee_base) + callee_routine.fixed_arity + 1
+        // The arguments are copied off the stack: the callee may
+        // re-enter the VM and grow it. The slots keep them rooted.
+        var buf: [8]Value = undefined;
+        const args: []Value = if (argc <= buf.len)
+            buf[0..argc]
         else
-            @as(usize, callee_base) + argc;
-        const args_end: usize = @as(usize, callee_base) + argc;
-        const reset_end: usize = @max(args_end, callee_end);
-        var i: usize = reset_start;
-        while (i < reset_end) : (i += 1) {
-            self.stack.items[i] = value_mod.nilValue();
-        }
-
-        // Snapshot the caller's already-incremented PC for the
-        // callee's return_pc. The dispatch loop pre-increments
-        // PC before invoking handlers, so caller_frame.pc here
-        // points to the instruction following call:call.
-        const caller_pc_after_call: u32 = self.frames.items[caller_idx].pc;
-
-        // Push the callee frame. After this point, `caller_frame`
-        // pointers are invalidated.
-        try self.pushFrame(.{
-            .routine = callee_routine,
-            .base_slot = callee_base,
-            .entry_stack_len = entry_stack_len,
-            .slot_count = callee_routine.slot_count,
-            .pc = 0,
-            .return_dst = result_dst,
-            .return_pc = caller_pc_after_call,
-            .upvalues = closure.upvalues,
-            .closure = closure_v,
-        });
+            self.allocator.alloc(Value, argc) catch return VmError.OutOfMemory;
+        defer if (argc > buf.len) self.allocator.free(args);
+        @memcpy(args, self.stack.items[args_base..][0..argc]);
+        const result = try self.callDirect(callee, args);
+        (try self.slotPtr(result_dst)).* = result;
     }
 
     /// Push `frame`. The caller has already grown the stack into

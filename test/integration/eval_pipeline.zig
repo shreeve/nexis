@@ -190,6 +190,28 @@ test "integration: variadic & rest" {
     try expectOutput("((fn* [x & xs] x) 1 2 3)", "1");
 }
 
+test "integration: a variadic fn called with no extra arguments binds its rest parameter to nil" {
+    // As in Clojure, on every entry path: call:call, apply, a native
+    // calling back.
+    try expectOutput("(defn f [& args] (if args :some :none)) [(f) (apply f []) (first (map f [1])) (f 1)]", "[:none :none :some :some]");
+    try expectOutput("[((fn [& r] r)) ((fn [x & r] r) 1) ((fn [x & r] r) 1 2)]", "[nil nil (2)]");
+    try expectOutput("(defn my-max [x & more] (if more (recur (max x (first more)) (next more)) x)) [(my-max 5) (my-max 1 9 3)]", "[5 9]");
+}
+
+test "integration: a protocol fn is a first-class function" {
+    // map, apply, comp and update reach it through callValue.
+    try expectOutput(
+        \\(defprotocol Shape (area [s]))
+        \\(defrecord Rect [w h] Shape (area [this] (* (:w this) (:h this))))
+        \\(def r (->Rect 2 3))
+        \\[(map area [r]) (apply area [r]) ((comp inc area) r) (update {:s r} :s area) (reduce + (map area [r r]))]
+    , "[(6) 6 7 {:s 6} 12]");
+    try expectOutput(
+        \\(defprotocol Shape (area [s]))
+        \\(try (mapv area [1]) (catch any e e))
+    , ":no-protocol-impl");
+}
+
 test "integration: recur into a variadic fn passes the rest param one seq" {
     // COMPILER.md §5.6: the rest slot is the last binding of the
     // target; `(next r)` lands in `r` as it is.
@@ -813,13 +835,14 @@ test "integration: sequential destructuring (let)" {
 test "integration: sequential destructuring with rest" {
     // MACROEXPAND.md §10 `let`: a vector pattern's rest is `next`,
     // nil once the source is exhausted; a fn rest parameter is the
-    // list the VM packs, `()` when empty (VM.md §6).
+    // list the VM packs, nil when empty (VM.md §6), as in Clojure; a
+    // multi-arity fn's variadic arity binds `(rest args)`.
     try expectOutput("(let [[a & rest] [1 2 3 4]] rest)", "(2 3 4)");
     try expectOutput("(let [[a b & rest] [1 2 3 4 5]] rest)", "(3 4 5)");
     try expectOutput("(let [[a & r] [1 2 3]] r)", "(2 3)");
     try expectOutput("(nil? (let [[a & r] [1]] r))", "true");
     try expectOutput("(nil? (let [[a b & r] [1]] r))", "true");
-    try expectOutput("((fn [& r] r))", "()");
+    try expectOutput("((fn [& r] r))", "nil");
     try expectOutput("((fn ([x & r] r)) 1)", "()");
 }
 
