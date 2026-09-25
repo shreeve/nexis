@@ -22,6 +22,7 @@ const string_mod = @import("../string.zig");
 const dispatch = @import("../dispatch.zig");
 const hash_mod = @import("../hash.zig");
 const key = @import("key.zig");
+const Interner = @import("../intern.zig").Interner;
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -116,17 +117,25 @@ pub const Cell = union(enum) {
         };
     }
 
-    /// The order of two values of one type (numbers are one type), or
-    /// null when they are not comparable.
-    pub fn compare(a: Cell, b: Cell) ?std.math.Order {
-        if (a.rank() != b.rank()) return null;
+    /// The order `compare` gives two values of one type (numbers are
+    /// one type; keywords by their text), or null when they are not
+    /// comparable here: different types, or VM values.
+    pub fn compare(a: Cell, b: Cell, names: *const Interner) ?std.math.Order {
+        if (a.rank() != b.rank() or a == .vm) return null;
+        return a.orderBy(b, names);
+    }
+
+    /// `order` with keywords by their text, as `compare` orders them.
+    pub fn orderBy(a: Cell, b: Cell, names: *const Interner) std.math.Order {
+        if (a == .keyword and b == .keyword) return std.mem.order(u8, names.keywordName(a.keyword), names.keywordName(b.keyword));
         return a.order(b);
     }
 
     /// A total order: nil < booleans < numbers < strings < keywords <
     /// other VM values. Numbers compare numerically across int and
     /// double; strings by bytes; keywords by intern id; VM values by
-    /// hash (a stable tie-break, not a semantic order).
+    /// hash. Keywords and VM values are in a stable order, not a
+    /// semantic one; `orderBy` orders keywords as the language does.
     pub fn order(a: Cell, b: Cell) std.math.Order {
         const ra = a.rank();
         const rb = b.rank();
@@ -621,12 +630,6 @@ pub const Accumulator = struct {
         if (try self.set.insert(self.rel.arena, self.rel.rows - 1)) return true;
         try self.rel.dropLast();
         return false;
-    }
-
-    /// Does the set hold an equal row to row `row` of `other` (over
-    /// the same variables in the same order)?
-    pub fn contains(self: *Accumulator, other: *const Relation, row: usize) bool {
-        return self.set.contains(other, row, other.rowHash(row));
     }
 };
 
