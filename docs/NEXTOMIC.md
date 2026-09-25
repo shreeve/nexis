@@ -177,7 +177,10 @@ so there is no queue; emdb's write lock is the transactor.
    were all retracted stays addressable. Attributes resolve through the
    ident cache (unknown → `:nextomic/unknown-attribute`); each `v` is
    converted by the attribute's `:db/valueType` (`:nextomic/value-type`
-   when it cannot be). Map forms `{:db/id e :attr v ...}` expand, a map
+   when it cannot be). A keyword value an assertion names is minted
+   when new (step 3); one a retraction or a lookup ref names is only
+   matched, so a keyword the store has never seen retracts nothing,
+   resolves no lookup ref and mints no id. Map forms `{:db/id e :attr v ...}` expand, a map
    without `:db/id` being a fresh tempid. A nested map under a component
    attribute becomes an entity with a fresh tempid; under any other ref
    attribute it must name its entity with `:db/id` or a unique
@@ -200,7 +203,12 @@ so there is no queue; emdb's write lock is the transactor.
    bound by its own identity, a lookup ref found in the tree or naming
    an identity asserted anywhere in the same transaction; claims on an
    entity the transaction creates unify their tempids. Remaining tempids
-   take eids from `sys/"eid"`, read once and bumped once. A lookup ref
+   take eids from `sys/"eid"`, read once and bumped once; each must be
+   the entity of some form, since a tempid only in value positions (or
+   a map form holding nothing but `:db/id`) would name an entity with
+   no datoms (`:nextomic/tx-data`). Two identities that bind one tempid
+   to two entities are `:nextomic/conflict` on the first entity's
+   attribute. A lookup ref
    names the committed holder of its `(a v)`, else the entity a unique
    assertion of the same tx-data puts `(a v)` on, wherever that
    assertion stands; otherwise it is `:nextomic/no-entity`.
@@ -231,7 +239,11 @@ so there is no queue; emdb's write lock is the transactor.
    `[tx-entity :db/txInstant now]` is appended as a datom of this
    transaction, unless the tx-data asserted `:db/txInstant` on
    `"datomic.tx"` itself: that instant stands, in the datom and in the
-   txlog entry.
+   txlog entry. Instants never go back: an asserted instant earlier
+   than the previous transaction's is `:nextomic/tx-data`, and a clock
+   behind it takes the previous instant. `:db/txInstant` on any other
+   entity, or a retraction of one, is `:nextomic/tx-data`, since the
+   txlog entry keeps each transaction's instant.
 5. **Schema**: schema changes are ordinary assertions on attribute
    entities, checked here, and take effect for the transactions after
    the one that makes them (the data of the same transaction is

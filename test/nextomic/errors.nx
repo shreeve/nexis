@@ -35,6 +35,9 @@
 (defn loops [db] [[:db.fn/call loops]])
 (println (t/caught (d/transact! c [[:db.fn/call loops]])))
 (println (t/caught (d/connect "/")))
+(println (t/caught (d/transact! c [{:db/id "a" :user/boss "ghost"}])))
+(println (t/caught (d/transact! c [[:db/add (+ t/tx-partition 2) :db/txInstant 0]])))
+(println (t/caught (d/transact! c [[:db/add "datomic.tx" :db/txInstant 5]])))
 (t/check "a failed transaction leaves the basis alone" (= (d/basis-t db) (d/basis-t (d/db c))))
 (t/check "the store still works after every failure" (= 1 (:user/age (d/entity (d/db c) a))))
 
