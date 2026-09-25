@@ -447,6 +447,8 @@ all before macroexpansion.
 | `1abc`, `1-2`, `1/2`, `1.`, `3.14M` | reader error `:bad-number-literal` |
 | `"a\qb"`, `"\u{D800}"` | reader error `:invalid-string-escape` |
 | `A`, `\ab`, `\u{110000}` | reader error `:invalid-char-literal` |
+| `foo/bar/baz`, `:foo/bar/baz` | reader error `:invalid-symbol`, `:invalid-keyword` |
+| `^1 x` | reader error `:unknown-reader-construct` (metadata is a keyword, map or symbol) |
 | bytes that are not UTF-8 in a string, symbol or keyword | reader error `:invalid-utf8` |
 | a form nested past the native stack's budget | reader error `:nesting-too-deep` |
 | `#'x`, `#"re"`, `##Inf`, `#?(...)`, `::k` | parse error naming the construct |
