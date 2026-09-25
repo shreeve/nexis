@@ -791,3 +791,11 @@ transaction's next such read, so Nextomic copies what it keeps.
   before the rename included, and `:person/name` names nothing
   anywhere and is never minted again. Datomic keeps the old ident
   resolving to the entity beside the new one.
+- **A lookup ref may name an identity the same transaction asserts.**
+  It resolves against the committed state first, and otherwise to the
+  entity a unique assertion of the same tx-data puts its `(a v)` on,
+  wherever that assertion stands (§3 step 3). Datomic resolves lookup
+  refs against the database before the transaction only.
+- **`:db/index true` and `:db/unique` are never retracted** (§3 step
+  5), and `:db/unique` does not switch between identity and value.
+  Datomic can drop an index or a uniqueness constraint.
