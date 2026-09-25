@@ -39,10 +39,6 @@ test.
   dominated by the randomized CHAMP correctness gate. Run before
   commits.
 
-The two Nextomic corpora end with a benchmark whose row-count checks
-always run; its `[bench]` timing lines print only when the
-`NEXTOMIC_BENCH` environment variable is set (`docs/PERF.md` §3.7).
-
 ## Counts
 
 `zig build test --summary all` prints the authoritative count

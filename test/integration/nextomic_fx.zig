@@ -32,20 +32,15 @@ pub const Fx = struct {
     arena_state: std.heap.ArenaAllocator,
     diag: pull.Diag = .{},
     /// The allocator behind the heap, the arena and each pull's
-    /// scratch: the testing allocator, or a plain one for a benchmark.
-    gpa: Allocator,
+    /// scratch.
+    gpa: Allocator = testing.allocator,
 
     pub fn init(name: []const u8) !*Fx {
-        return initWith(name, testing.allocator);
-    }
-
-    pub fn initWith(name: []const u8, gpa: Allocator) !*Fx {
         const self = try testing.allocator.create(Fx);
         self.* = .{
             .tc = try TestConn.init(name),
-            .heap = Heap.init(gpa),
-            .arena_state = std.heap.ArenaAllocator.init(gpa),
-            .gpa = gpa,
+            .heap = Heap.init(testing.allocator),
+            .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
         };
         return self;
     }
@@ -69,7 +64,6 @@ pub const Fx = struct {
             .tc = tc,
             .heap = Heap.init(testing.allocator),
             .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
-            .gpa = testing.allocator,
         };
         return self;
     }

@@ -87,10 +87,7 @@ The build steps, and what each is for:
 | `zig build bench` | the ReleaseFast benchmark harness (`docs/BENCH.md`) | minutes |
 | `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` via `../nexus/bin/nexus` | seconds |
 
-Two environment variables. `NEXTOMIC_BENCH`: when set, the two
-Nextomic corpora print `[bench]` timing lines to stderr
-(`NEXTOMIC_BENCH=1 zig build nextomic-test --summary all`).
-`NEXIS_GC_STRESS`: when set, every VM collects every 4 KiB of
+One environment variable, `NEXIS_GC_STRESS`: when set, every VM collects every 4 KiB of
 allocation instead of every 16 MiB (`NEXIS_GC_STRESS=1 zig build test
 --summary all` proves the natives' rooting; `docs/GC.md` §7). Debug
 numbers under the testing allocator are not performance
@@ -539,8 +536,8 @@ tests passed`. The binaries are Debug builds under
 **ReleaseFast.** `zig build -Doptimize=ReleaseFast install` builds
 `bin/nexis` optimized in about 12 s warm; `-Doptimize=ReleaseFast`
 applies to every step, so `zig build -Doptimize=ReleaseFast test`
-runs the gate optimized and `NEXTOMIC_BENCH=1 zig build nextomic-test
--Doptimize=ReleaseFast --summary all` reproduces `docs/PERF.md` §3.7.
+runs the gate optimized and `zig build bench -Doptimize=ReleaseFast
+-- --filter nextomic` reproduces `docs/PERF.md` §3.7.
 A Debug binary under the testing allocator is not a performance
 measurement.
 

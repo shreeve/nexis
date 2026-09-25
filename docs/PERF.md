@@ -342,21 +342,20 @@ random-access variant is a follow-up.
 
 ### 3.7 Nextomic — query and pull over 200k datoms
 
-The two integration corpora end with a benchmark test
-(`test/integration/nextomic_q.zig` "benchmark: 200k datoms,
-three-way join"; `test/integration/nextomic_pull.zig` "benchmark:
-pull-many [*] and a nested pattern over 20k entities"). The row-count
-checks run under every `zig build test`; the `[bench]` timing lines
-print to stderr only when the `NEXTOMIC_BENCH` environment variable
-is set. Reproduce with
-`NEXTOMIC_BENCH=1 zig build nextomic-test -Doptimize=ReleaseFast --summary all`.
+The `nextomic` category of the bench harness
+(`bench/nextomic.zig`) builds both stores and measures every row
+through the engine's Zig API. Reproduce with
+`zig build bench -Doptimize=ReleaseFast -- --filter nextomic`. The
+tests carry 10k-datom twins of both corpora that check the row
+counts (`test/integration/nextomic_{q,pull}.zig`).
 The store is emdb with 16 KiB pages; the datom set is 40,000
 employees in 20 departments, five attributes each (~200k datoms).
 
-Each query row is the best of five runs inside the test; the table
-is the best of five invocations of the step, with the spread across
-them in brackets (Apple M5, 32 GiB, macOS 26.6, Zig 0.16.0,
-ReleaseFast, idle machine).
+The table was measured as the best of five timed runs per row, the
+best of five invocations with the spread across them in brackets
+(Apple M5, 32 GiB, macOS 26.6, Zig 0.16.0, ReleaseFast, idle
+machine); the harness reports the 30-sample median of each row
+instead.
 
 | Op | ReleaseFast, Apple M5 | Notes |
 |---|---:|---|
@@ -372,13 +371,9 @@ ReleaseFast, idle machine).
 
 **Caveats:**
 
-- Both corpora build their fixture with `c_allocator` for the
-  benchmark (`Fx.initWith`), so the result-set columns measure the
-  VM heap's allocator, not a testing allocator's bookkeeping.
-- The pull rows are one sample per run of the step; the query rows
-  are the best of five inside the test. Neither is the 30-sample
-  median the §3.1–§3.6 harness reports, so these rows enter the §2
-  scorecard as corpus measurements, not harness ones.
+- The result sets are built on a heap over the process allocator,
+  so the rows measure the VM heap's allocator, not a testing
+  allocator's bookkeeping.
 - A profile of the query rows (`sample` on the ReleaseFast test
   binary with the repetitions raised) puts about 30 % of the time in
   the engine's page search (`page.searchPage`, `simd.compare`), 10 %
@@ -1026,12 +1021,9 @@ iterations**.
   `.gitignore`d; the curated numbers live inline here.
 - §3.2 / §3.3 / §3.5 A/B rows compare `--allocator std` against the
   default pool under the per-invocation heap methodology (§3).
-- §3.7 Nextomic numbers come from the corpus benchmarks in
-  `test/integration/nextomic_{q,pull}.zig` under
-  `NEXTOMIC_BENCH=1 zig build nextomic-test -Doptimize=ReleaseFast
-  --summary all` on an Apple M5, the best of five invocations of the
-  step. They are not harness numbers; scorecard row 21 is `measured`
-  in the §2 sense only once `src/bench.zig` carries the scenarios.
+- §3.7 Nextomic numbers come from the scenarios in
+  `bench/nextomic.zig` (`zig build bench -Doptimize=ReleaseFast --
+  --filter nextomic`) on an Apple M5.
 - §3.8 numbers come from `zig build bench -Doptimize=ReleaseFast --
   --filter vm,compiler,collection-lookup-update,collection-construction`
   on the same Apple M5, five invocations per state of the tree, the

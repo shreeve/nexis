@@ -684,8 +684,10 @@ test "with: q, entity and pull see the speculative datoms; nothing is written" {
 // Benchmark
 // =============================================================================
 
-test "benchmark: pull-many [*] and a nested pattern over 20k entities" {
-    const fx = try Fx.initWith("pull_bench", std.heap.c_allocator);
+test "pull-many [*], a nested pattern and a reverse ref over 2k entities" {
+    // The same data shape as `zig build bench`'s 20k-entity pull
+    // corpus (bench/nextomic.zig), at a size a test can afford.
+    const fx = try Fx.init("pull_many");
     defer fx.deinit();
     _ = try fx.transact(
         \\[{:db/ident :emp/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -714,8 +716,8 @@ test "benchmark: pull-many [*] and a nested pattern over 20k entities" {
     const dept_eids = try fx.arena().alloc(u64, depts);
     for (dept_report.tempids) |b| dept_eids[@intCast(-b.key.fixnum - 1)] = b.eid;
 
-    const emps: usize = 20_000;
-    const batch: usize = 5_000;
+    const emps: usize = 2_000;
+    const batch: usize = 500;
     var eids: std.ArrayList(Value) = .empty;
     var start: usize = 0;
     while (start < emps) : (start += batch) {
@@ -741,31 +743,10 @@ test "benchmark: pull-many [*] and a nested pattern over 20k entities" {
     const reverse = try fx.read("[:dept/name (:emp/_dept :limit nil)]");
     const dept = value.fromFixnum(@intCast(dept_eids[3])).?;
 
-    _ = try pull.pullMany(fx.gpa, fx.interner(), &fx.heap, dbv, star, eids.items[0..100], &fx.diag);
-    const t0 = nowNs();
     const all = try pull.pullMany(fx.gpa, fx.interner(), &fx.heap, dbv, star, eids.items, &fx.diag);
-    const t1 = nowNs();
     const some = try pull.pullMany(fx.gpa, fx.interner(), &fx.heap, dbv, nested, eids.items, &fx.diag);
-    const t2 = nowNs();
     const rev = try pull.pull(fx.gpa, fx.interner(), &fx.heap, dbv, reverse, dept, &fx.diag);
-    const t3 = nowNs();
     try testing.expectEqual(emps, vector_mod.count(all));
     try testing.expectEqual(emps, vector_mod.count(some));
     try testing.expectEqual(emps / depts, vector_mod.count((try fx.getName(rev, "emp/_dept")).?));
-    if (!benchOutput()) return;
-    std.debug.print("\n[bench] pull-many [*] over {d} entities ({d} datoms each): {d} us\n", .{ emps, 5, (t1 - t0) / 1000 });
-    std.debug.print("[bench] pull-many nested ref + limit over {d} entities: {d} us\n", .{ emps, (t2 - t1) / 1000 });
-    std.debug.print("[bench] reverse ref pull of {d} employees of one department: {d} us\n", .{ emps / depts, (t3 - t2) / 1000 });
-}
-
-/// Timings print only when `NEXTOMIC_BENCH` is set; the checks run
-/// regardless.
-fn benchOutput() bool {
-    return std.c.getenv("NEXTOMIC_BENCH") != null;
-}
-
-fn nowNs() u64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }

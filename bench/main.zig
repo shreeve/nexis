@@ -19,6 +19,8 @@
 //!     "database-integrated" category).
 //!   - vm: the dispatch loop on a routine compiled once (a counting
 //!     loop, the same loop calling a global fn, a keyword lookup).
+//!   - nextomic: `q` over a 200k-datom store and `pull` over 20k
+//!     entities (bench/nextomic.zig).
 //!
 //! Every benchmark function here is a tiny wrapper over a
 //! `Runner.bench` call; the heavy lifting lives in `src/bench.zig`.
@@ -38,6 +40,7 @@
 const std = @import("std");
 const nx = @import("nexis");
 const bench = nx.bench;
+const nextomic_bench = @import("nextomic.zig");
 const value_mod = nx.value;
 const heap_mod = nx.heap;
 const intern_mod = nx.intern;
@@ -531,6 +534,31 @@ fn benchRun(ctx: *RunCtx) anyerror!void {
     ctx.sink +%= @as(u64, @bitCast(result.payload));
 }
 
+/// A fresh store file under $TMPDIR (or /tmp), named for this
+/// process so concurrent runs never share it; `deinit` removes it.
+const TmpStore = struct {
+    path: [:0]u8,
+
+    fn init(alloc: std.mem.Allocator, name: []const u8) !TmpStore {
+        const dir = if (std.c.getenv("TMPDIR")) |d| std.mem.span(d) else "/tmp";
+        const path = try std.fmt.allocPrintSentinel(alloc, "{s}/nexis-bench-{d}-{s}.emdb", .{ std.mem.trimEnd(u8, dir, "/"), std.c.getpid(), name }, 0);
+        remove(path);
+        return .{ .path = path };
+    }
+
+    fn deinit(self: *TmpStore, alloc: std.mem.Allocator) void {
+        remove(self.path);
+        alloc.free(self.path);
+    }
+
+    fn remove(path: [:0]const u8) void {
+        _ = std.c.unlink(path.ptr);
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const lock_path = std.fmt.bufPrintSentinel(&buf, "{s}-lock", .{path}, 0) catch return;
+        _ = std.c.unlink(lock_path.ptr);
+    }
+};
+
 pub fn main(init: std.process.Init) !u8 {
     const alloc = init.gpa;
     const io = init.io;
@@ -764,19 +792,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     // ---- DB-integrated ----
     if (include(filter, "db-integrated")) {
-        // Fresh temp DB per benchmark run.
-        const path: [:0]const u8 = "bench_tmp.emdb";
-        _ = std.c.unlink(path.ptr);
-        var lockbuf: [64]u8 = undefined;
-        const lock_path = try std.fmt.bufPrintSentinel(&lockbuf, "{s}-lock", .{path}, 0);
-        _ = std.c.unlink(lock_path.ptr);
-
-        var conn = try db.open(alloc, &heap, &interner, path.ptr, .{ .allocator = alloc });
-        defer {
-            db.close(&conn);
-            _ = std.c.unlink(path.ptr);
-            _ = std.c.unlink(lock_path.ptr);
-        }
+        var store = try TmpStore.init(alloc, "db");
+        defer store.deinit(alloc);
+        var conn = try db.open(alloc, &heap, &interner, store.path.ptr, .{ .allocator = alloc });
+        defer db.close(&conn);
 
         // Seed the key we'll be overwriting.
         {
@@ -788,6 +807,20 @@ pub fn main(init: std.process.Init) !u8 {
         var dctx = DbCtx{ .conn = &conn, .key = "k", .value = value_mod.fromFixnum(42).? };
         try runner.bench("db_put_commit_scalar", "db-integrated", null, &dctx, benchDbPut);
         try runner.bench("db_get_hit_scalar", "db-integrated", null, &dctx, benchDbGetHit);
+    }
+
+    // ---- Nextomic (docs/PERF.md §3.7) ----
+    if (include(filter, "nextomic")) {
+        {
+            var store = try TmpStore.init(alloc, "q");
+            defer store.deinit(alloc);
+            try nextomic_bench.runQuery(&runner, alloc, store.path);
+        }
+        {
+            var store = try TmpStore.init(alloc, "pull");
+            defer store.deinit(alloc);
+            try nextomic_bench.runPull(&runner, alloc, store.path);
+        }
     }
 
     // ---- Output ----

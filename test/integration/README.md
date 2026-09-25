@@ -30,10 +30,9 @@ and frame depth are restored.
   navigating, `touch`, identity, a released connection, and an entity
   kept in a Var under the collector's stress policy.
 
-Both Nextomic corpora end with a benchmark over ~200k datoms whose
-row-count checks always run; the `[bench]` timing lines print to
-stderr only when the `NEXTOMIC_BENCH` environment variable is set
-(`docs/PERF.md` §3.7 has the ReleaseFast numbers).
+The q and pull corpora each end with a 10k-datom twin of a
+`zig build bench` scenario (`bench/nextomic.zig`) that checks its row
+counts.
 
 Run with `zig build test`; `eval_pipeline`, `runtime_polish` and
 `numbers` also run under `zig build quick` and the Nextomic suites under
