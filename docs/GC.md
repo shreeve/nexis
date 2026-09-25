@@ -12,7 +12,7 @@ two kinds whose layout the VM owns (closures, upvalue cells) trace
 through the host hook.
 
 **The collector is precise, non-moving, stop-the-world mark-sweep,
-non-reentrant, run by the VM at its safe points.** The VM is the
+iterative, run by the VM at its safe points.** The VM is the
 host: `src/vm.zig` imports `gc.zig`, enumerates the runtime's roots
 (§3), traces closures and cells, and runs a cycle between two
 instructions once the heap has allocated a threshold of bytes since
@@ -80,7 +80,7 @@ heap.
 ### 3. Root model (what counts as a root)
 
 A **root** is a block or Value the collector starts marking from.
-The collector marks each root and recursively traces children.
+The collector marks each root and, through the worklist (§4), everything reachable from it.
 Anything unreachable from the root set, not `isPinned`, is freed.
 
 Two sources: the explicit `roots` slice `collect` takes (the tests'
@@ -164,9 +164,12 @@ module pins a block, and only tests call `setPinned`.
 ```zig
 pub const Collector = struct {
     heap: *Heap,
-    collecting: bool = false,
     /// The runtime behind the heap, when there is one.
     host: ?Host = null,
+    /// Headers marked but not yet traced.
+    gray: std.ArrayList(*HeapHeader) = .empty,
+    /// True while a drain runs (all of `collect`): `mark` only pushes.
+    draining: bool = false,
 
     pub const Host = struct {
         ctx: *anyopaque,
@@ -183,15 +186,14 @@ pub const Collector = struct {
     /// Start a reachability walk from a `Value`. Immediates and the
     /// pointer kinds with no block (`native_fn`, `var_`, the db
     /// handles; `Heap.isBlockKind`) are ignored. Any other Value
-    /// marks the underlying *HeapHeader (and recursively its
-    /// children). Safe entry point for callers holding Values.
+    /// marks the underlying *HeapHeader. Safe entry point for
+    /// callers holding Values.
     pub fn markValue(self: *Collector, v: Value) void;
 
-    /// Mark a full heap object and recursively walk its children.
-    /// Idempotent via mark-bit. Handles:
-    ///   - mark bit transition (once-only walk)
-    ///   - meta chain: if `h.meta != null`, recursively marks `h.meta`
-    ///   - kind dispatch: invokes the per-kind trace function
+    /// Mark a full heap object: set the mark bit (once only) and
+    /// push the header on `gray`. Outside a drain it drains before
+    /// returning, so a direct call still marks the transitive
+    /// closure.
     pub fn mark(self: *Collector, h: *HeapHeader) void;
 
     /// Mark an INTERNAL heap node (collection-internal subkind, never
@@ -209,14 +211,10 @@ pub const Collector = struct {
     /// is centralized on the collector even for internal nodes.
     pub fn markInternal(self: *Collector, h: *HeapHeader) bool;
 
-    /// Run a full collection cycle: mark every root, then the
-    /// host's roots, then sweep unmarked and start a new
-    /// allocation-counting window on the heap. Returns the number
-    /// of blocks freed.
-    ///
-    /// Not reentrant. Calling `collect` from inside a trace
-    /// function or a `mark` callback panics via the
-    /// `self.collecting` guard.
+    /// Run a full collection cycle: push every root, then the
+    /// host's roots, drain the worklist, then sweep unmarked and
+    /// start a new allocation-counting window on the heap. Returns
+    /// the number of blocks freed.
     pub fn collect(self: *Collector, roots: []const *HeapHeader) usize;
 };
 ```
@@ -239,11 +237,21 @@ owner for the mark-bit state machine.
 at the allocator layer (`backing.free` cannot fail). `mark` and
 `markInternal` are `void` / `bool` respectively; neither can fail.
 
-**Non-reentrancy.** `collect` asserts `self.collecting == false` at
-entry and sets it to `true` for the duration. Any nested `collect`
-call panics. Any `mark` / `markInternal` call outside an active
-`collect` is legal (tests exercise them directly to verify
-individual primitives); those do not set the flag.
+**Iterative marking.** The mark phase is a loop, never a recursion
+on the data: `mark` sets the bit and pushes the header on `gray`;
+the drain pops a header, marks its meta map and runs its kind's
+trace (§5), whose `mark` / `markValue` calls push in turn. A live
+structure nested a million levels deep (a linked list of maps, an
+accumulator of nested vectors, a chain of atoms or of meta maps)
+costs a million entries of `gray`, not a million native frames.
+The per-kind traces keep walking their own interior nodes in place
+(`markInternal`), which is bounded: a vector trie is at most seven
+levels deep and a CHAMP tree thirteen. If `gray` cannot grow, `mark`
+traces the header on the spot instead, so a cycle never fails; only
+under memory exhaustion does it recurse. `gray` is freed at the end
+of every cycle. A `mark` / `markInternal` call outside `collect` is
+legal (tests exercise the primitives directly) and drains before it
+returns.
 
 ---
 
@@ -352,12 +360,12 @@ metadata-bearing persistent-map root. Per SEMANTICS.md §7 and PLAN
 GC's perspective, however, it's a live reference — if an object is
 reachable, its metadata map must also survive.
 
-The collector walks the meta chain centrally in `mark`:
+The collector walks the meta chain centrally, when the drain
+traces a header:
 
 ```zig
-pub fn mark(self: *Collector, h: *HeapHeader) void {
-    if (!self.markHeaderOnce(h)) return;
-    if (h.meta) |m| self.mark(m);  // recurses; handles cycles by mark-bit
+fn trace(self: *Collector, h: *HeapHeader) void {
+    if (h.meta) |m| self.mark(m);  // pushes; cycles stop at the mark bit
     dispatch_by_kind(h, self);
 }
 ```
@@ -373,13 +381,13 @@ skips the meta walk.
 
 ```
 collect(roots):
-    assert !self.collecting
-    self.collecting = true
-    defer self.collecting = false
-
+    self.draining = true
     for each r in roots:
-        self.mark(r)             // marks reachable transitive closure
+        self.mark(r)             // sets the bit, pushes on gray
     if host: host.roots(host.ctx, self)
+    while gray.pop() |h|: trace(h)   // the transitive closure
+    self.draining = false
+    free gray
 
     freed = self.heap.sweepUnmarked()  // clears marked bit on survivors;
                                         // frees unmarked, non-pinned blocks
@@ -503,8 +511,6 @@ Inline tests in `src/gc.zig` cover structural correctness:
 - `markInternal` return value: true on first call, false on second;
   `mark` idempotent across direct calls; `markValue` no-op on
   immediates.
-- Non-reentrancy: calling `collect` from inside a visitor callback
-  panics.
 - Metadata chain: reachable through `h.meta`; a meta-only
   unreachable block is swept.
 
@@ -517,6 +523,9 @@ Property tests in `test/prop/gc.zig` exercise randomized graphs:
 - G3b: a list of half a million cells survives a cycle intact and
   is freed by the next; the walk is a loop, so length never
   becomes recursion depth.
+- G3c: a chain of 300,000 levels alternating vector elements, map
+  values, atom values and meta maps survives a cycle intact: the
+  worklist keeps nesting depth off the native stack.
 - G4: pinned block survives without roots; unpinning releases it.
 - G5: repeated allocate-and-collect cycles do not leak.
 - G6: a program that allocates a vector, a string and a map on
