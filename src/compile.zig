@@ -1615,13 +1615,15 @@ fn lowerQuotePayload(
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
         // `'(a 'b)` is `(a (quote b))`: the inner quote is data, the
-        // 2-list `formToValue` renders it as.
+        // 2-list `formToValue` renders it as, a constant like any
+        // other quoted list.
         .quote => |inner| blk: {
             const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
             const quote_sym = interner.internSymbolValue("quote") catch return CompileError.OutOfMemory;
             const tiny_items = try allocator.alloc(*const Tiny, 2);
             tiny_items[0] = try allocTiny(allocator, .{ .literal = quote_sym });
             tiny_items[1] = try lowerQuotePayload(allocator, inner, ctx);
+            if (try constantColl(allocator, .list, tiny_items, ctx)) |v| break :blk try allocTiny(allocator, .{ .literal = v });
             break :blk try allocTiny(allocator, .{ .coll = .{ .op = .list, .items = tiny_items } });
         },
         else => return CompileError.UnsupportedFeature,

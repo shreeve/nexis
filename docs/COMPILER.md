@@ -238,9 +238,9 @@ constant pool, Var table, capture descriptors, span table,
   lowering, on the lowering heap, the way the VM would build it, and
   is one constant: its size costs no slots and no instructions, and
   evaluating it twice yields the same object, as in Clojure.
-  `#%concat`, a collection with a computed item, and a quoted payload
-  holding a nested quote (`'(a 'b)`) compile to `coll:*` over a slot
-  block.
+  A quote nested in quoted data (`'(a 'b)`) is the constant 2-list
+  `(quote b)`. `#%concat` and a collection with a computed item compile
+  to `coll:*` over a slot block.
 - **Deduplication.** The constant pool holds each Value once
   (identical bits: the same immediate or the same heap object), and
   the Var table each Var once; a routine that captures one name from

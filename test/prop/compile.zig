@@ -639,6 +639,8 @@ test "literals: constant data of any size is one constant built at compile time"
     }
     try testing.expectEqual(@as(i64, 5000), (try program.run("(let [big (vec (range 5000))] (count (eval (list 'quote big))))")).asFixnum());
     try harness.expectResult(&program, "", try program.run("[(= '[1 [2 3] {:a #{4}} (5)] [1 [2 3] {:a #{4}} '(5)]) (let* [f (fn* [] [1 2])] (identical? (f) (f)))]"), "[true true]");
+    // A quote nested in quoted data is constant data too.
+    try harness.expectResult(&program, "", try program.run("(let* [f (fn* [] '(a 'b ['c]))] [(identical? (f) (f)) (f)])"), "[true (a (quote b) [(quote c)])]");
     // The literal is the constant itself; equal constants share an entry.
     const compiled = try compileIn(&program, "(fn* [x] [x [1 2] {:a [1 2]} #{1 2} '(1 2) 1 2 1 2])");
     for (compiled.consts) |k| if (k == .routine) {
