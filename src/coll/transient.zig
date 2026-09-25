@@ -110,10 +110,6 @@ fn transientBody(h: *HeapHeader) *TransientBody {
     return Heap.bodyOf(TransientBody, h);
 }
 
-fn transientBodyConst(h: *HeapHeader) *const TransientBody {
-    return Heap.bodyOf(TransientBody, h);
-}
-
 // =============================================================================
 // Internal validation helpers
 // =============================================================================
@@ -129,13 +125,13 @@ fn assertTransientSubkind(t: Value, expected_subkind: u16) TransientError!void {
 
 fn assertActive(t: Value) TransientError!void {
     try assertTransient(t);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     if (body.owner_token == 0) return TransientError.TransientFrozen;
 }
 
 fn assertActiveSubkind(t: Value, expected_subkind: u16) TransientError!void {
     try assertTransientSubkind(t, expected_subkind);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     if (body.owner_token == 0) return TransientError.TransientFrozen;
 }
 
@@ -238,14 +234,14 @@ pub fn mapGetBang(
     elementEq: *const fn (Value, Value) bool,
 ) TransientError!champ.MapLookup {
     try assertActiveSubkind(t, subkind_transient_map);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     const v = champ.valueFromMapHeader(body.inner_header);
     return champ.mapGet(v, key, elementHash, elementEq);
 }
 
 pub fn mapCountBang(t: Value) TransientError!usize {
     try assertActiveSubkind(t, subkind_transient_map);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     const v = champ.valueFromMapHeader(body.inner_header);
     return champ.mapCount(v);
 }
@@ -293,14 +289,14 @@ pub fn setContainsBang(
     elementEq: *const fn (Value, Value) bool,
 ) TransientError!bool {
     try assertActiveSubkind(t, subkind_transient_set);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     const v = champ.valueFromSetHeader(body.inner_header);
     return champ.setContains(v, elem, elementHash, elementEq);
 }
 
 pub fn setCountBang(t: Value) TransientError!usize {
     try assertActiveSubkind(t, subkind_transient_set);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     const v = champ.valueFromSetHeader(body.inner_header);
     return champ.setCount(v);
 }
@@ -358,14 +354,14 @@ pub fn vectorPopBang(
 
 pub fn vectorNthBang(t: Value, idx: usize) TransientError!Value {
     try assertActiveSubkind(t, subkind_transient_vector);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     const v = vector.valueFromVectorHeader(body.inner_header);
     return vector.nth(v, idx);
 }
 
 pub fn vectorCountBang(t: Value) TransientError!usize {
     try assertActiveSubkind(t, subkind_transient_vector);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     const v = vector.valueFromVectorHeader(body.inner_header);
     return vector.count(v);
 }
@@ -380,7 +376,7 @@ pub fn vectorCountBang(t: Value) TransientError!usize {
 // =============================================================================
 
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    const body = transientBodyConst(h);
+    const body = transientBody(h);
     visitor.mark(body.inner_header);
 }
 
@@ -421,7 +417,7 @@ test "transientFrom: wraps persistent map; subkind 0; owner_token nonzero" {
     const t = try transientFrom(&heap, m);
     try testing.expectEqual(Kind.transient, t.kind());
     try testing.expectEqual(subkind_transient_map, t.subkind());
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     try testing.expect(body.owner_token != 0);
     try testing.expect(body.inner_header == Heap.asHeapHeader(m));
 }
@@ -463,8 +459,8 @@ test "transientFrom: two calls yield distinct owner tokens" {
     const m = try champ.mapEmpty(&heap);
     const t1 = try transientFrom(&heap, m);
     const t2 = try transientFrom(&heap, m);
-    const b1 = transientBodyConst(Heap.asHeapHeader(t1));
-    const b2 = transientBodyConst(Heap.asHeapHeader(t2));
+    const b1 = transientBody(Heap.asHeapHeader(t1));
+    const b2 = transientBody(Heap.asHeapHeader(t2));
     try testing.expect(b1.owner_token != b2.owner_token);
 }
 
@@ -595,7 +591,7 @@ test "persistentBang: freezes wrapper and returns inner persistent Value" {
     try testing.expectEqual(Kind.persistent_map, frozen.kind());
     try testing.expectEqual(@as(usize, 1), champ.mapCount(frozen));
     // Wrapper's owner_token is now zero.
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     try testing.expectEqual(@as(u64, 0), body.owner_token);
 }
 
@@ -631,9 +627,9 @@ test "persistentBang: inner_header survives post-freeze (for GC reachability)" {
     defer heap.deinit();
     const m = try champ.mapEmpty(&heap);
     const t = try transientFrom(&heap, m);
-    const inner_before = transientBodyConst(Heap.asHeapHeader(t)).inner_header;
+    const inner_before = transientBody(Heap.asHeapHeader(t)).inner_header;
     _ = try persistentBang(t);
-    const inner_after = transientBodyConst(Heap.asHeapHeader(t)).inner_header;
+    const inner_after = transientBody(Heap.asHeapHeader(t)).inner_header;
     try testing.expect(inner_before == inner_after);
 }
 
