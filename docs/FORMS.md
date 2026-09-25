@@ -109,6 +109,8 @@ see. Mirrors PLAN §28.3 exactly.
 | `~@x` outside `` `...` `` | **reader error**: `:unquote-splice-outside-syntax-quote` |
 | `42N`, `0xFFN`, `18446744073709551616N` | the integer, as without the suffix: `(int 42)`, `(int 255)`, `(bigint 18446744073709551616)` |
 | `1abc`, `1-2`, `1.5x`, `1/2`, `1.`, `0x`, `3.14M` | **reader error**: `:bad-number-literal`, detail the token's text |
+| `\é`, `\☃`, `\(` | one character, any UTF-8 sequence or delimiter: `(char \u{E9})`, `(char \u{2603})`, `(char \()` |
+| `\u0041`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | **reader error**: `:invalid-char-literal`, detail the token's text (`\u{HEX}` is the one escape, PLAN §23 decision 26) |
 | a form nested past the native stack's budget | **reader error**: `:nesting-too-deep` (`src/stack.zig`) |
 
 **Number token boundary.** A token that begins with a digit, or with
@@ -124,6 +126,14 @@ The CLI reports the failure as `reader error: :bad-number-literal
 1abc` with the caret under the token (`TOOLING.md` §1). Consequences
 that differ from Clojure are listed in `CLOJURE-REVIEW.md` §4.2: `1.`
 and `22/7` are errors, `017` is decimal 17, `3.14M` is an error.
+
+**Char token boundary.** A char token is `\`, one character (a whole
+UTF-8 sequence, or any other byte, a delimiter included), then every
+symbol constituent that follows, as a number token runs; `\u{HEX}` runs
+to its `}` first. The reader accepts the text only when it is one
+character, `u{HEX}` naming a Unicode scalar, or a name of the named set,
+so `\a1` and `\u0041` fail whole instead of reading as a char followed
+by another form.
 
 **Duplicate detection rule.** Only *statically-detectable literal* keys or
 elements count. `{:a 1 (keyword "a") 2}` is **not** a reader error — the second

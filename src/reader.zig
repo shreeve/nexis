@@ -631,29 +631,26 @@ fn parseIntLiteral(text: []const u8) ?i64 {
     return @intCast(mag);
 }
 
+/// The scalar a char token's text after `\` names: `u{HEX}`, one
+/// character (a valid UTF-8 sequence), or a name of PLAN §7.2's named
+/// set. `null` for anything else, surrogates and scalars past U+10FFFF
+/// included. Clojure's `uXXXX` and `oNNN` spellings are not accepted:
+/// `\u{HEX}` is the one escape (PLAN §23 decision 26).
 fn parseCharLiteral(body: []const u8) ?u21 {
     if (body.len == 0) return null;
-    // `u{HEX}` form.
-    if (body.len >= 4 and body[0] == 'u' and body[1] == '{' and body[body.len - 1] == '}') {
-        const hex = body[2 .. body.len - 1];
-        if (hex.len == 0) return null;
-        const v = std.fmt.parseInt(u32, hex, 16) catch return null;
-        if (v > 0x10FFFF) return null;
-        return @intCast(v);
+    if (body.len >= 3 and body[0] == 'u' and body[1] == '{' and body[body.len - 1] == '}') {
+        const v = std.fmt.parseInt(u21, body[2 .. body.len - 1], 16) catch return null;
+        if (v > 0x10FFFF or (v >= 0xD800 and v <= 0xDFFF)) return null;
+        return v;
     }
-    // Named character set (PLAN §7.2).
-    if (body.len > 1) {
-        if (std.mem.eql(u8, body, "newline")) return '\n';
-        if (std.mem.eql(u8, body, "space")) return ' ';
-        if (std.mem.eql(u8, body, "tab")) return '\t';
-        if (std.mem.eql(u8, body, "return")) return '\r';
-        if (std.mem.eql(u8, body, "formfeed")) return 0x0C;
-        if (std.mem.eql(u8, body, "backspace")) return 0x08;
-        return null;
-    }
-    // Single-byte literal (ASCII). Multi-byte UTF-8 chars need broader
-    // handling; the reader accepts ASCII directly and `\u{HEX}` for the rest.
-    return body[0];
+    const n = std.unicode.utf8ByteSequenceLength(body[0]) catch return null;
+    if (n == body.len) return std.unicode.utf8Decode(body) catch null;
+    const names = [_]struct { []const u8, u21 }{
+        .{ "newline", '\n' }, .{ "space", ' ' },     .{ "tab", '\t' },
+        .{ "return", '\r' },  .{ "formfeed", 0x0C }, .{ "backspace", 0x08 },
+    };
+    for (names) |entry| if (std.mem.eql(u8, body, entry[0])) return entry[1];
+    return null;
 }
 
 fn splitNamespace(text: []const u8) ?Name {
@@ -1119,6 +1116,26 @@ test "char literal parsing" {
     try std.testing.expectEqual(@as(u21, 0x2603), parseCharLiteral("u{2603}").?);
     try std.testing.expect(parseCharLiteral("") == null);
     try std.testing.expect(parseCharLiteral("u{}") == null);
+}
+
+test "char literals: one token to the next delimiter, judged whole" {
+    try expectReads("[\\u{41} \\newline \\a \\é \\☃ \\( \\\\ \\u \\o]", "(vector (char \\A) (char \\newline) (char \\a) (char \\u{E9}) (char \\u{2603}) (char \\() (char \\\\) (char \\u) (char \\o))\n");
+    // A delimiter or reader macro character ends the token.
+    try expectReads("(\\a)[\\b@c]", "(list (char \\a))\n(vector\n  (char \\b)\n  (deref (symbol c)))\n");
+    // Clojure's `\uXXXX` and `\oNNN` spellings, a letter or digit run
+    // after a char, a surrogate and a scalar past U+10FFFF are errors
+    // over the whole token, never a char followed by more forms.
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "\\u0041", "\\o101", "\\a1", "\\ab", "\\é1", "\\u{D800}", "\\u{110000}", "\\u{41}x" }) |src| {
+        var p = parser.Parser.init(allocator, src);
+        defer p.deinit();
+        var rd = Reader.init(allocator, src);
+        defer rd.deinit();
+        try std.testing.expectError(error.ReaderFailure, rd.readProgram(try p.parseProgram()));
+        try std.testing.expect(rd.err.?.kind == .invalid_char_literal);
+        try std.testing.expectEqualStrings(src, rd.err.?.detail.?);
+        try std.testing.expectEqual(@as(u32, @intCast(src.len)), rd.err.?.span.len);
+    }
 }
 
 test "discard applies uniformly across aggregator contexts" {

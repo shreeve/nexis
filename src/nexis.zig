@@ -220,44 +220,31 @@ pub const Lexer = struct {
         return self.finish(.err, start, pre);
     }
 
+    /// A char token: `\`, one character (a whole UTF-8 sequence, or
+    /// any byte, a delimiter included), then every symbol constituent
+    /// that follows, as a number token runs (FORMS.md §3). `\u{HEX}`
+    /// runs to its `}` first. The reader judges the text, so `\a1` and
+    /// `\u0041` are each one token it rejects, never a char followed by
+    /// another form.
     fn scanChar(self: *Lexer, start: u32, pre: u8) Token {
         const src = self.base.source;
-        // start points at '\\'. A char literal needs at least one char after.
-        self.base.pos = start + 1;
-        if (self.base.pos >= src.len) {
-            return .{ .cat = .err, .pre = pre, .pos = start, .len = 1 };
-        }
-
-        // `\u{HEX}` — unicode scalar.
-        if (src[self.base.pos] == 'u' and self.base.pos + 1 < src.len and src[self.base.pos + 1] == '{') {
-            self.base.pos += 2;
-            while (self.base.pos < src.len and isHexDigit(src[self.base.pos])) : (self.base.pos += 1) {}
-            if (self.base.pos < src.len and src[self.base.pos] == '}') {
-                self.base.pos += 1;
-                return self.finish(.char, start, pre);
+        var pos = start + 1;
+        if (pos >= src.len) return self.single(.err, start, pre);
+        if (src[pos] == 'u' and pos + 1 < src.len and src[pos + 1] == '{') {
+            pos += 2;
+            while (pos < src.len and isHexDigit(src[pos])) pos += 1;
+            if (pos >= src.len or src[pos] != '}') {
+                self.base.pos = pos;
+                return self.finish(.err, start, pre);
             }
-            return self.finish(.err, start, pre);
+            pos += 1;
+        } else {
+            const n = std.unicode.utf8ByteSequenceLength(src[pos]) catch 1;
+            pos = @min(pos + n, @as(u32, @intCast(src.len)));
         }
-
-        // `\name` — named character (alpha run). `\a` and friends fall out of
-        // this path because a single alpha run of length 1 is still valid.
-        if (isNamedCharStart(src[self.base.pos])) {
-            self.base.pos += 1;
-            while (self.base.pos < src.len and isAlpha(src[self.base.pos])) : (self.base.pos += 1) {}
-            return self.finish(.char, start, pre);
-        }
-
-        // `\<any>` — any single literal character (incl. punctuation).
-        self.base.pos += 1;
+        while (pos < src.len and isIdentCont(src[pos])) pos += 1;
+        self.base.pos = pos;
         return self.finish(.char, start, pre);
-    }
-
-    inline fn isNamedCharStart(c: u8) bool {
-        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
-    }
-
-    inline fn isAlpha(c: u8) bool {
-        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
     }
 
     fn scanKeyword(self: *Lexer, start: u32, pre: u8) Token {
