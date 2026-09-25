@@ -15,7 +15,9 @@
 //!     one variable.
 //!   - A `?variable` in function position is a `FnRef.variable`; it is
 //!     an input of the clause, never something the clause binds.
-//!   - Rules with one name share one arity and one required count.
+//!   - Rules with one name share one arity and one required count, and
+//!     every call to a rule inside a rule body passes that many
+//!     arguments.
 //!
 //! `Cache` memoises parses per query value: by identity first (the
 //! query literal's pointer), then by structural hash and an equality
@@ -332,6 +334,7 @@ const Parser = struct {
         if (self.isVarSym(v)) return .{ .variable = try self.varOf(v.asSymbolId()) };
         if (v.kind() == .list) {
             const parts = try self.elems(v);
+            if (parts.len == 0) return self.fail("empty :find element");
             const name = self.symName(parts[0]) orelse return self.fail("aggregate head must be a symbol");
             if (std.mem.eql(u8, name, "pull")) {
                 if (parts.len != 3 or !self.isVarSym(parts[1])) return self.fail("pull is (pull ?e pattern)");
@@ -443,6 +446,7 @@ const Parser = struct {
     }
 
     fn parseClauseInto(self: *Parser, x: Value, out: *std.ArrayList(Clause)) Error!void {
+        try stack.check();
         switch (x.kind()) {
             .persistent_vector => {
                 const parts = try self.elems(x);
@@ -706,10 +710,29 @@ const Parser = struct {
             const body = try self.parseClauses(parts[1..], false);
             try out.append(self.arena, .{ .name = name, .required = required, .head = try vars.toOwnedSlice(self.arena), .body = body });
         }
+        for (out.items, 0..) |r, i| {
+            self.clause_index = i;
+            try self.checkCalls(out.items, r.body);
+        }
         // Group the bodies of one rule: `RuleSet.byName` is one slice.
         // The sort is stable, so bodies keep their source order.
         std.mem.sort(ir.Rule, out.items, {}, ruleNameLess);
         return out.toOwnedSlice(self.arena);
+    }
+
+    /// Every call in `body` to a rule of the set passes as many
+    /// arguments as its head has.
+    fn checkCalls(self: *Parser, rules: []const ir.Rule, body: []const Clause) Error!void {
+        for (body) |c| switch (c) {
+            .rule => |call| for (rules) |def| {
+                if (def.name != call.name) continue;
+                if (def.head.len != call.args.len) return self.fail("a rule is called with the wrong number of arguments");
+                break;
+            },
+            .not => |n| try self.checkCalls(rules, n.body),
+            .@"or" => |o| for (o.branches) |br| try self.checkCalls(rules, br),
+            else => {},
+        };
     }
 
     fn ruleNameLess(_: void, a: ir.Rule, b: ir.Rule) bool {
@@ -1210,6 +1233,21 @@ test "rules parse with required groups and arity checks; caches hit by identity 
     try testing.expect(pv.where[0].pattern.v.constant == .lookup);
     cache.release(pl);
     cache.release(pv);
+}
+
+test "clauses nested past the stack guard are StackOverflow" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const b = Builder{ .heap = &heap, .interner = &interner };
+    var clause = b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) });
+    for (0..5000) |_| clause = b.lst(&.{ b.sym("not"), clause });
+    const q = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), clause });
+    stack.arm(64 * 1024);
+    defer stack.arm(stack.main_thread_budget);
+    var diag: Diag = .{};
+    try testing.expectError(error.StackOverflow, parse(testing.allocator, &interner, q, &diag));
 }
 
 test "a full cache replaces its least recently used unpinned parse and roots what it holds" {

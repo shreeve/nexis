@@ -104,6 +104,9 @@ ok explain returns the plan as text
 {:error :nextomic/unknown-attribute, :attr :nope/attr}
 {:error :nextomic/unknown-attribute, :attr :nope/attr}
 :nextomic/value-type
+{:error :nextomic/query-syntax, :message empty :find element}
+{:error :nextomic/query-syntax, :message a rule is called with the wrong number of arguments, :clause 1}
+{:error :nextomic/query-syntax, :message a rule is called with the wrong number of arguments, :clause 1}
 {:error :nextomic/query-syntax, :message unknown symbol in data pattern, :clause 0}
 :boom
 ok the store still works after a predicate threw

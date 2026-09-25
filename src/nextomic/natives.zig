@@ -239,6 +239,7 @@ pub fn errorKeyword(err: anyerror) []const u8 {
         error.PullSyntax => "nextomic/pull-syntax",
         error.HistoryView => "nextomic/history-view",
         error.Format, error.UnknownIdent => "db/corrupted",
+        error.StackOverflow => "stack-overflow",
         else => dblayer.failureName(err),
     };
 }

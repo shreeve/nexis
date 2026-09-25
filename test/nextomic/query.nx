@@ -245,6 +245,10 @@
 (println (t/caught (d/q '[:find ?e :where [?e :nope/attr ?v]] db)))
 (println (t/caught (d/q '[:find ?e :where [?e :person/boss [:nope/attr 1]]] db)))
 (println (t/caught (d/q '[:find (sum ?n) :where [?e :person/name ?n]] db)))
+(println (t/caught (d/q '[:find () :where [?e :person/name ?n]] db)))
+(def bad-arity '[[(linked ?a ?b) [?a :person/friend ?b]] [(linked ?a ?b) [?a :person/friend ?m] (linked ?m)]])
+(println (t/caught (d/q '[:find ?y :in $ % ?x ?y :where (linked ?x ?y)] db bad-arity 1 2)))
+(println (t/caught (d/q '[:find ?x ?y :in $ % :where (linked ?x ?y)] db bad-arity)))
 (println (t/caught (d/explain '[:find ?e :where [?e bogus]] db)))
 (println (t/caught (d/q '[:find ?e :where [?e :person/name ?n] [(boom ?n)]] db)))
 (t/check "the store still works after a predicate threw"

@@ -27,7 +27,9 @@
 //!     a component: a component target is pulled with `[*]`.
 //!   - Recursion (`...` or a depth) re-applies the enclosing pattern to
 //!     the target; a target already on the recursion path, or past the
-//!     depth, renders as a plain ref, so cycles terminate.
+//!     depth, renders as a plain ref, so cycles terminate. The walk and
+//!     the pattern parser recurse on the native stack under the stack
+//!     guard: nesting past it is `error.StackOverflow`, never a fault.
 //!   - Explicit specs win over `*` for the attributes they name.
 //!   - An entity with no datoms in the view pulls as nil.
 //!   - Not defined on a history view: `error.HistoryView`.
@@ -50,6 +52,7 @@ const relation = @import("relation.zig");
 const parse_mod = @import("query/parse.zig");
 const plan_mod = @import("query/plan.zig");
 const marshal = @import("marshal.zig");
+const stack = @import("../stack.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -73,7 +76,7 @@ pub const Error = error{
 
 /// Everything a pull can fail with: its own errors, the entity
 /// contract's and the store's.
-pub const Failure = Error || marshal.Error || db_mod.Error || db_mod.ErrorsOf(DbValue.beginRead) || db_mod.ErrorsOf(Read.scan) || db_mod.ErrorsOf(db_mod.DatomScan.next) || db_mod.ErrorsOf(Read.ident) || db_mod.ErrorsOf(db_mod.Conn.valToValue) || db_mod.ErrorsOf(champ.mapEmpty) || db_mod.ErrorsOf(champ.mapAssoc) || db_mod.ErrorsOf(vector_mod.fromSlice) || db_mod.ErrorsOf(string_mod.fromBytes) || db_mod.ErrorsOf(idents_mod.Idents.internOf);
+pub const Failure = Error || stack.Error || marshal.Error || db_mod.Error || db_mod.ErrorsOf(DbValue.beginRead) || db_mod.ErrorsOf(Read.scan) || db_mod.ErrorsOf(db_mod.DatomScan.next) || db_mod.ErrorsOf(Read.ident) || db_mod.ErrorsOf(db_mod.Conn.valToValue) || db_mod.ErrorsOf(champ.mapEmpty) || db_mod.ErrorsOf(champ.mapAssoc) || db_mod.ErrorsOf(vector_mod.fromSlice) || db_mod.ErrorsOf(string_mod.fromBytes) || db_mod.ErrorsOf(idents_mod.Idents.internOf);
 
 /// Card-many values are cut here unless the spec says otherwise.
 pub const default_limit: u32 = 1000;
@@ -250,6 +253,7 @@ const Parser = struct {
     }
 
     fn parsePattern(self: *Parser, v: Value) Failure!*Pattern {
+        try stack.check();
         const items = try self.elems(v);
         if (items.len == 0) return self.fail("empty pattern");
         const top = self.index == null;
@@ -406,8 +410,8 @@ const Puller = struct {
     diag: *Diag,
     k_db_id: Value,
     k_db_ident: Value,
-    /// Entities on the current recursion path, root first.
-    path: std.ArrayList(u64) = .empty,
+    /// Entities on the current recursion path.
+    path: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     fn init(arena: Allocator, read: *Read, heap: *Heap, interner: *Interner, diag: *Diag) !Puller {
         return .{
@@ -440,12 +444,8 @@ const Puller = struct {
 
     fn root(self: *Puller, pat: *const Pattern, e: u64) Failure!?Value {
         self.path.clearRetainingCapacity();
-        try self.path.append(self.arena, e);
+        try self.path.put(self.arena, e, {});
         return self.entity(pat, e, pat.budget);
-    }
-
-    fn onPath(self: *const Puller, e: u64) bool {
-        return std.mem.indexOfScalar(u64, self.path.items, e) != null;
     }
 
     fn assoc(self: *Puller, m: Value, k: Value, v: Value) !Value {
@@ -470,6 +470,7 @@ const Puller = struct {
     /// The pattern applied to `e`: null when the entity has no datoms
     /// in this view. `budget` is the remaining depth per spec.
     fn entity(self: *Puller, pat: *const Pattern, e: u64, budget: []const ?u32) Failure!?Value {
+        try stack.check();
         var m = try champ.mapEmpty(self.heap);
         m = try self.assoc(m, self.k_db_id, try eidValue(e));
         var any = false;
@@ -578,9 +579,9 @@ const Puller = struct {
     }
 
     fn nested(self: *Puller, pat: *const Pattern, target: u64, budget: []const ?u32) Failure!Value {
-        if (self.onPath(target)) return self.refMap(target);
-        try self.path.append(self.arena, target);
-        defer _ = self.path.pop();
+        if (self.path.contains(target)) return self.refMap(target);
+        try self.path.put(self.arena, target, {});
+        defer _ = self.path.remove(target);
         return (try self.entity(pat, target, budget)) orelse self.refMap(target);
     }
 };
@@ -853,6 +854,41 @@ test "nested patterns, reverse refs, recursion with cycles, depth" {
     const mixed = try fx.pullOne(dbv, try fx.vec(&.{ try fx.sym("*"), try fx.map(&.{ try fx.kw("p/friend"), try fx.vec(&.{try fx.kw("p/name")}) }) }), Fx.int(@intCast(p.ann)));
     try testing.expectEqual(@as(usize, 6), champ.mapCount(mixed));
     try testing.expectEqualStrings("Bob", string_mod.asBytes((try fx.getName(vector_mod.nth((try fx.getName(mixed, "p/friend")).?, 0), "p/name")).?));
+}
+
+test "a recursion past the stack guard is StackOverflow, and the path set stops long cycles" {
+    const fx = try Fx.init("pull_deep");
+    defer fx.deinit();
+    try installSchema(fx);
+    const a = fx.arena();
+    const boss = try fx.attrId("p/boss");
+    // A ring of 100: each entity's boss is the next, the last's the first.
+    const n = 100;
+    var ops: std.ArrayList(Op) = .empty;
+    for (0..n) |i| {
+        const me: transact_mod.Entity = .{ .tempid = .{ .string = try std.fmt.allocPrint(a, "n{d}", .{i}) } };
+        const next: transact_mod.Entity = .{ .tempid = .{ .string = try std.fmt.allocPrint(a, "n{d}", .{(i + 1) % n}) } };
+        try ops.append(a, .{ .add = .{ .e = me, .a = .{ .id = boss }, .v = .{ .entity = next } } });
+    }
+    const r = try transact_mod.transactOps(fx.tc.conn, a, ops.items, .{});
+    const first = Fx.int(@intCast(r.tempids[0].eid));
+    const dbv = try fx.db();
+    const pattern = try fx.vec(&.{try fx.map(&.{ try fx.kw("p/boss"), try fx.sym("...") })});
+
+    // The whole ring pulls, ending in a plain ref back to the start.
+    var m = try fx.pullOne(dbv, pattern, first);
+    var depth: usize = 0;
+    while (try fx.getName(m, "p/boss")) |next| : (depth += 1) m = next;
+    try testing.expectEqual(@as(usize, n), depth);
+    try testing.expectEqual(first.asFixnum(), (try fx.getName(m, "db/id")).?.asFixnum());
+
+    // A small guard: the same walk, and a deeply nested pattern, fail cleanly.
+    stack.arm(64 * 1024);
+    defer stack.arm(stack.main_thread_budget);
+    try testing.expectError(error.StackOverflow, fx.pullOne(dbv, pattern, first));
+    var deep = try fx.vec(&.{try fx.kw("p/boss")});
+    for (0..5000) |_| deep = try fx.vec(&.{try fx.map(&.{ try fx.kw("p/boss"), deep })});
+    try testing.expectError(error.StackOverflow, fx.pullOne(dbv, deep, first));
 }
 
 test "limit, default, as, expression forms, pull-many, syntax diagnostics" {

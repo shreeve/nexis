@@ -400,7 +400,8 @@ db and inputs.
 
 **Parse** → IR `{find, in, where, rules}` with a symbol table; a syntax
 error throws `{:error :nextomic/query-syntax :message "..." :clause i}`
-with the clause index when the error is inside `:where`. The IR is pure
+with the clause index when the error is inside `:where`; clauses nested
+past the native stack guard are the catchable `:stack-overflow`. The IR is pure
 syntax over the VM's symbol table, so it is cached per VM by query value
 and reused across every db and basis; the rule set bound to `%` is
 cached the same way. A lookup hits on the same value, or on one `=` to
@@ -538,8 +539,12 @@ history db. `:keys`, `:strs` or `:syms` name every find element (one
 symbol each, relation find spec only) and the result is a vector of
 maps under those names as keywords, strings or symbols.
 
-**Rules.** `:in $ %` binds a rule set. Non-recursive rules inline as
-sub-plans (cached per binding signature). Recursive rules run
+**Rules.** `:in $ %` binds a rule set. Rules of one name share one
+arity and one required count, and every call to a rule, in the query or
+inside a rule body, passes that many arguments
+(`:nextomic/query-syntax` otherwise). A call to a non-recursive rule
+inlines the rule's bodies, renamed afresh for that call, as the
+branches of an `or-join` over its arguments. Recursive rules run
 semi-naive: `total = base bodies; delta = total; repeat { new = ∪ bodies
 with one recursive call bound to delta, others to total, minus total;
 total ∪= new; delta = new } until delta is empty`. `not`/`not-join` are
@@ -569,7 +574,7 @@ sub-plans with the same output variables.
 | `(d/excise! conn e)` / `(d/excise! conn e attr)` | §4 "Excision"; returns the recording transaction's report plus `:excised [e]` and `:removed`, the history rows that went |
 | `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}` for `from ≤ t < to`, oldest first, with `:excised [e ...]` on an entry an excision touched; a bound that is `nil` or not given is open |
 | `(d/schema db)` | map ident → `{:db/id :db/ident :db/valueType :db/cardinality :db/index :db/isComponent :db/fulltext}`, plus `:db/unique` and `:db/doc` when the attribute has them in this view; every flag as the view's basis saw it (§4 "Schema as-of") |
-| `(d/pull db pattern e)` | the pattern's map for an eid, lookup ref or ident; nil when the entity has no datoms in the view. `e` follows the entity contract every native shares: an eid below 1, or an ident or lookup ref that names nothing, is `:nextomic/no-entity`; a lookup ref on a non-unique attribute, or a vector that is not `[attr v]`, is `:nextomic/tx-data`; a lookup value of the wrong type is `:nextomic/value-type`; any other kind is the VM's `:kind-mismatch`. A pattern is `[spec+]`: `*`, an attribute, `{attr sub-pattern}`, a reverse `:ns/_attr` (a vector of referrers; through a component, its one owner pulled with `[*]`), `{attr ...}` or `{attr depth}` recursion (a target already on the path, or past the depth, is a plain ref), `(attr :limit n)` / `(attr :limit nil)` / `(attr :default v)` / `(attr :as k)` and the `(limit attr n)` / `(default attr v)` spellings. `:db/id` is always present, a missing attribute omitted unless it has a default, card-many values are vectors in index order cut at 1000 unless `:limit` says otherwise (`*` cuts at 1000 too), a ref is `{:db/id e}` plus `:db/ident` when it has one, and a component target is pulled with `[*]`. Defined on current, as-of and since views; one read per call |
+| `(d/pull db pattern e)` | the pattern's map for an eid, lookup ref or ident; nil when the entity has no datoms in the view. `e` follows the entity contract every native shares: an eid below 1, or an ident or lookup ref that names nothing, is `:nextomic/no-entity`; a lookup ref on a non-unique attribute, or a vector that is not `[attr v]`, is `:nextomic/tx-data`; a lookup value of the wrong type is `:nextomic/value-type`; any other kind is the VM's `:kind-mismatch`. A pattern is `[spec+]`: `*`, an attribute, `{attr sub-pattern}`, a reverse `:ns/_attr` (a vector of referrers; through a component, its one owner pulled with `[*]`), `{attr ...}` or `{attr depth}` recursion (a target already on the path, or past the depth, is a plain ref; a walk or a pattern nested past the native stack guard is the catchable `:stack-overflow`, never a crash), `(attr :limit n)` / `(attr :limit nil)` / `(attr :default v)` / `(attr :as k)` and the `(limit attr n)` / `(default attr v)` spellings. `:db/id` is always present, a missing attribute omitted unless it has a default, card-many values are vectors in index order cut at 1000 unless `:limit` says otherwise (`*` cuts at 1000 too), a ref is `{:db/id e}` plus `:db/ident` when it has one, and a component target is pulled with `[*]`. Defined on current, as-of and since views; one read per call |
 | `(d/pull-many db pattern es)` | one result per entity of the vector or list `es`, in its order, in the same read |
 | `(d/with conn tx-data f)` | speculative transaction: tx-data applied in a held write transaction, `f` called with `db-after` (a db-value over the uncommitted state: `q`, `entity`, `pull`, `datoms`, `schema` and the time views read it) and the report `transact!` would have returned, then aborted. Returns `f`'s value; a throw inside `f` propagates after the abort; the committed basis is unchanged and the next `transact!` takes the same `t`. `transact!` and `with` inside the scope are `:nextomic/nested`; `db-after` after the scope is `:nextomic/closed` |
 | `(d/sync conn)` | `Env.sync()` after `:none` loads |
