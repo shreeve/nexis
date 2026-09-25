@@ -22,6 +22,9 @@
 //!     the result. Pushing elsewhere would lose derivations.
 //!   - Termination: `total` only grows and every row comes from a
 //!     finite set of datoms and inputs, so the fixpoint is reached.
+//!   - Soundness: a growing fixpoint answers stratified programs only,
+//!     so a component whose rules call one another inside `not` is
+//!     refused before it runs.
 //!   - Rule bodies see the same `Read` snapshots as the query; a body's
 //!     unprefixed clauses read the source the call names (`$` by
 //!     default), and a recursive component is instantiated under one
@@ -60,6 +63,9 @@ pub const Info = struct {
     scc_of: []const usize,
     /// Per component: does it contain a cycle?
     recursive: []const bool,
+    /// Per component: does one of its rules call another of its rules
+    /// inside a `not`? Such a program is not stratified.
+    negated: []const bool,
 
     pub fn nameIndex(self: *const Info, name: u32) ?usize {
         for (self.names, 0..) |n, i| if (n == name) return i;
@@ -92,14 +98,20 @@ pub fn analyze(arena: Allocator, set: *const RuleSet) !Info {
     }
     const n = names.items.len;
     const edges = try arena.alloc([]usize, n);
+    const negative = try arena.alloc([]usize, n);
     for (names.items, 0..) |name, i| {
-        var calls: std.ArrayList(u32) = .empty;
-        for (set.byName(name).?) |r| try collectCalls(arena, r.body, &calls);
+        var calls: std.ArrayList(Call) = .empty;
+        for (set.byName(name).?) |r| try collectCalls(arena, r.body, false, &calls);
         var out: std.ArrayList(usize) = .empty;
+        var neg: std.ArrayList(usize) = .empty;
         for (calls.items) |c| {
-            for (names.items, 0..) |m, j| if (m == c) try out.append(arena, j);
+            for (names.items, 0..) |m, j| if (m == c.name) {
+                try out.append(arena, j);
+                if (c.negated) try neg.append(arena, j);
+            };
         }
         edges[i] = try out.toOwnedSlice(arena);
+        negative[i] = try neg.toOwnedSlice(arena);
     }
 
     var t = Tarjan{
@@ -126,7 +138,12 @@ pub fn analyze(arena: Allocator, set: *const RuleSet) !Info {
             recursive[t.scc_of[i]] = true;
         };
     }
-    return .{ .names = try names.toOwnedSlice(arena), .scc_of = t.scc_of, .recursive = recursive };
+    const negated = try arena.alloc(bool, t.scc_count);
+    @memset(negated, false);
+    for (negative, 0..) |js, i| for (js) |j| {
+        if (t.scc_of[i] == t.scc_of[j]) negated[t.scc_of[i]] = true;
+    };
+    return .{ .names = try names.toOwnedSlice(arena), .scc_of = t.scc_of, .recursive = recursive, .negated = negated };
 }
 
 const Tarjan = struct {
@@ -166,12 +183,15 @@ const Tarjan = struct {
     }
 };
 
-/// Rule names called anywhere in `clauses`.
-fn collectCalls(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(u32)) !void {
+const Call = struct { name: u32, negated: bool };
+
+/// Rule names called anywhere in `clauses`, each marked when it is
+/// inside a `not`.
+fn collectCalls(arena: Allocator, clauses: []const Clause, negated: bool, out: *std.ArrayList(Call)) !void {
     for (clauses) |c| switch (c) {
-        .rule => |r| try out.append(arena, r.name),
-        .not => |n| try collectCalls(arena, n.body, out),
-        .@"or" => |o| for (o.branches) |br| try collectCalls(arena, br, out),
+        .rule => |r| try out.append(arena, .{ .name = r.name, .negated = negated }),
+        .not => |n| try collectCalls(arena, n.body, true, out),
+        .@"or" => |o| for (o.branches) |br| try collectCalls(arena, br, negated, out),
         else => {},
     };
 }
@@ -295,6 +315,10 @@ pub const Fix = struct {
 
 fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: []const Var, rows: u64) Failure!Fix {
     const info = try ctx.ruleInfo();
+    // The fixpoint only adds rows, which is sound for stratified rules
+    // alone: a rule that depends on its own negation has no answer it
+    // could reach.
+    if (info.negated[info.scc_of[info.nameIndex(name).?]]) return ctx.syntaxFmt("{s} recurses through not; a rule cannot depend on the negation of itself", .{ctx.interner.symbolName(name)});
     const members = try info.members(ctx.arena, name);
 
     var pushed: std.ArrayList(usize) = .empty;
@@ -624,6 +648,10 @@ test "call graph: self loop, mutual recursion, acyclic" {
     try testing.expect(!info.isRecursive(4));
     try testing.expect(!info.isRecursive(5));
     try testing.expectEqual(@as(usize, 2), (try info.members(arena, 2)).len);
+    // 3 calls 2 under `not` and 2 calls 3: not stratified; 1 is.
+    try testing.expect(info.negated[info.scc_of[info.nameIndex(2).?]]);
+    try testing.expect(!info.negated[info.scc_of[info.nameIndex(1).?]]);
+    try testing.expect(!info.negated[info.scc_of[info.nameIndex(4).?]]);
 }
 
 test "pass-through positions" {

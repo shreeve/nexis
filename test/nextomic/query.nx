@@ -217,6 +217,10 @@
 (println (sort (d/q '[:find [?n ...] :in $ % :where [?b :person/email "cy@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)))
 (println (rows (d/q '[:find ?b ?n :in $ % :where (responsible ?x ?e) [?x :person/name ?b] [?e :person/name ?n]] db rules)))
 (println (sort (d/q '[:find [?n ...] :in $ $2 % :where [?b :person/email "ann@x"] ($2 responsible ?b ?e) [?e :person/name ?n]] db before rules)))
+(println (t/caught (d/q '[:find ?n :in $ % :where [?x :person/name ?n] (outranks ?x)] db
+                        '[[(outranks ?x) [?x :person/friend ?y] (not (outranks ?y))]])))
+(println (t/caught (d/q '[:find ?n :in $ % :where [?x :person/name ?n] (ra ?x)] db
+                        '[[(ra ?x) [?x :person/friend ?y] (not (rb ?y))] [(rb ?x) [?x :person/friend ?y] (ra ?y)]])))
 (t/check "a repeated query and rule set are served from the caches"
        (= (d/q '[:find [?n ...] :in $ % :where [?b :person/email "ann@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)
           (d/q '[:find [?n ...] :in $ % :where [?b :person/email "ann@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)))

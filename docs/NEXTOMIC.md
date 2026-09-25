@@ -550,7 +550,10 @@ inlines the rule's bodies, renamed afresh for that call, as the
 branches of an `or-join` over its arguments. Recursive rules run
 semi-naive: `total = base bodies; delta = total; repeat { new = ∪ bodies
 with one recursive call bound to delta, others to total, minus total;
-total ∪= new; delta = new } until delta is empty`. `not`/`not-join` are
+total ∪= new; delta = new } until delta is empty`. The fixpoint only
+adds rows, so it answers stratified rules only: a recursive component
+whose rules call one another inside a `not` is `:nextomic/query-syntax`
+naming the rule. `not`/`not-join` are
 anti-joins on the shared variables; `or`/`or-join` are unions of
 sub-plans with the same output variables.
 
