@@ -153,6 +153,7 @@ const cases = [_]Case{
     .{ .src = "(do (def x 5) (def x 10) x)", .out = "10" },
     .{ .src = "(let* [v (def x 5)] (identical? v (def x 10)))", .out = "true" },
     .{ .src = "(= (var some-name) (var some-name))", .out = "true" },
+    .{ .src = "[(= (var nexis.core/map) (var map)) (do (def x 1) (= (var user/x) (var x)))]", .out = "[true true]" },
     .{ .src = "(do (def x 100) (let* [x 5] x))", .out = "5" },
     .{ .src = "(do (def x 5) (let* [x 99] x))", .out = "99" },
     .{ .src = "(do (defn add1 [n] (+ n 1)) (add1 5))", .out = "6" },
@@ -280,6 +281,8 @@ const failures = [_]Failure{
     // Run-time failures of compiled code.
     .{ .src = "((fn* [x y] x) 1)", .err = error.ArityMismatch },
     .{ .src = "((fn* [a b & r] a) 1)", .err = error.ArityMismatch },
+    .{ .src = "(var nope/x)", .err = error.UnresolvedSymbol },
+    .{ .src = "(var nexis.core/no-such-var)", .err = error.UnresolvedSymbol },
     .{ .src = "never-bound", .err = error.UnboundVar },
     .{ .src = "(do (defn f [] (g)) (f))", .err = error.UnboundVar },
     .{ .src = "(throw 13)", .err = error.UncaughtThrow },

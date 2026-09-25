@@ -642,9 +642,11 @@ the Var. Forward references between definitions work because each
 `def` interns its Var at compile time and call-time resolution
 through the var table picks up whatever is bound by then.
 
-#### 5.9 `(var name)`
+#### 5.9 `(var name)`, `(var ns/name)`
 
-- Emit `var:var-object V#(name)` into a result slot.
+- Emit `var:var-object V#(name)` into a result slot. A bare
+  name resolves as a symbol does (§4.3 rules 6-7); a qualified
+  one exactly, as rule 5 resolves a qualified symbol.
 - Returns the Var object itself (not its root value); used by
   macros and tooling. Does not trap on an unbound Var.
 

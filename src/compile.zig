@@ -260,11 +260,12 @@ pub const Tiny = union(enum) {
         name: []const u8,
         value: ?*const Tiny = null,
     },
-    /// `(var name)` per PLAN §6.1. Loads the Var
-    /// object itself (not its value) — Clojure's `#'name`
+    /// `(var name)` or `(var ns/name)` per PLAN §6.1. Loads the
+    /// Var object itself (not its value) — Clojure's `#'name`
     /// reader form. Does NOT trap on unbound; taking a
     /// reference to a declared-but-unbound Var is legal.
     var_ref: struct {
+        ns: ?[]const u8 = null,
         name: []const u8,
     },
     /// `(letfn* [(name1 params1 body1) (name2 params2 body2) ...] body)`
@@ -2013,8 +2014,9 @@ fn lowerVarRef(
     args: []const *reader_mod.Form,
 ) CompileError!*Tiny {
     if (args.len != 1) return CompileError.MalformedForm;
-    const name = try expectUnqualifiedSymbol(args[0]);
-    return try allocTiny(allocator, .{ .var_ref = .{ .name = name } });
+    if (args[0].datum != .symbol) return CompileError.ExpectedSymbol;
+    const sym = args[0].datum.symbol;
+    return try allocTiny(allocator, .{ .var_ref = .{ .ns = sym.ns, .name = sym.name } });
 }
 
 /// Lower `(try body+ (catch any binding handler+) (finally ...)?)`.
@@ -2671,7 +2673,7 @@ fn compileExpr(
         .loop_star => |l| try compileLoopStar(e, l.bindings, l.body, dst),
         .recur => |r| try compileRecur(e, r.args, recur_target),
         .def => |d| try compileDef(e, d.name, d.value, dst),
-        .var_ref => |v| try compileVarRef(e, v.name, dst),
+        .var_ref => |v| try compileVarRef(e, v.ns, v.name, dst),
     }
 }
 
@@ -2742,6 +2744,10 @@ fn directOperand(e: *Emitter, t: *const Tiny, allow_var: bool) CompileError!?Ope
             return Operand.constant(try e.addValueConst(v));
         },
         .literal => |v| return Operand.constant(try e.addValueConst(v)),
+        .qualified_symbol => |q| {
+            if (!allow_var) return null;
+            return Operand.varRef(try qualifiedVarIndex(e, q.ns, q.name));
+        },
         .symbol => |name| {
             const ref = e.resolveOrCapture(name) catch |err| switch (err) {
                 CompileError.UnresolvedSymbol => {
@@ -2760,40 +2766,25 @@ fn directOperand(e: *Emitter, t: *const Tiny, allow_var: bool) CompileError!?Ope
     }
 }
 
-/// Resolve `prefix/name` through the namespace
-/// registry attached to the current namespace's parent chain.
-/// Lexical bindings are NOT consulted (qualified symbols
-/// always go through namespaces).
-///
-/// Resolution shape:
-///   1. Locate the prefix namespace via the registry.
-///   2. Look up `name` in that namespace's LOCAL vars only
-///      (no auto-refer fallback — qualified means exact).
-///   3. Emit `var:load-var`.
-///
-/// Missing ns or missing var surface as UnresolvedSymbol.
-fn compileQualifiedSymbol(
-    e: *Emitter,
-    ns_prefix: []const u8,
-    name: []const u8,
-    dst: u12,
-) CompileError!void {
+/// `ns/name`: its Var's root, never a lexical binding
+/// (`qualifiedVarIndex`).
+fn compileQualifiedSymbol(e: *Emitter, ns_prefix: []const u8, name: []const u8, dst: u12) CompileError!void {
+    try e.emit(vm.asm_.varLoadVar(dst, try qualifiedVarIndex(e, ns_prefix, name)));
+}
+
+/// The V operand index of `ns_prefix/name`: an alias the current
+/// namespace registered (`(require '[real.name :as ns_prefix])`)
+/// names its target, any other prefix a namespace, whose own Var
+/// `name` must be (no parent chain: qualified means exact). The
+/// current namespace's own name is its own Var, interned unbound
+/// when the definition is still to come (a forward reference
+/// syntax-quote qualified).
+fn qualifiedVarIndex(e: *Emitter, ns_prefix: []const u8, name: []const u8) CompileError!u12 {
     const current_ns = e.namespace orelse return CompileError.UnresolvedSymbol;
-    // Alias resolution: a prefix the current namespace registered
-    // via `(require '[real.name :as ns_prefix])` names its target;
-    // any other prefix is a namespace name.
     const target_ns = qualifiedTarget(current_ns, ns_prefix) orelse return CompileError.UnresolvedSymbol;
-    // A symbol qualified with the current namespace's own name is
-    // its own Var, interned unbound when the definition is still
-    // to come (a forward reference syntax-quote qualified).
-    if (target_ns == current_ns) {
-        const idx = try e.addVarLocal(name);
-        try e.emit(vm.asm_.varLoadVar(dst, idx));
-        return;
-    }
+    if (target_ns == current_ns) return e.addVarLocal(name);
     const v = target_ns.lookupLocal(name) orelse return CompileError.UnresolvedSymbol;
-    const idx = try e.addVarTableEntry(v);
-    try e.emit(vm.asm_.varLoadVar(dst, idx));
+    return e.addVarTableEntry(v);
 }
 
 fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
@@ -2887,9 +2878,9 @@ fn compileDef(
 /// emits `var:var-object` to load the Var object itself (NOT
 /// its value). Does not trap on unbound; users can take a
 /// reference to a forward-declared Var.
-fn compileVarRef(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
+fn compileVarRef(e: *Emitter, ns: ?[]const u8, name: []const u8, dst: u12) CompileError!void {
     if (e.namespace == null) return CompileError.UnresolvedSymbol;
-    const idx = try e.addVarRef(name);
+    const idx = if (ns) |prefix| try qualifiedVarIndex(e, prefix, name) else try e.addVarRef(name);
     try e.emit(vm.asm_.varVarObject(dst, idx));
 }
 
