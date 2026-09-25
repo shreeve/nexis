@@ -554,6 +554,12 @@ test "fn: a :pre/:post condition map checks arguments and the result" {
     try expectOutput("((fn [] {:pre [false]}))", "{:pre [false]}");
 }
 
+test "condp: :>> passes the predicate's result to a function" {
+    try expectOutput("(condp some [1 2 3] #{0 6} :>> inc #{4 5 3} :>> dec #{7} 99 :none)", "2");
+    try expectOutput("(condp some [9] #{0} :>> inc :none)", ":none");
+    try expectOutput("(condp = 2 1 :one 2 :two)", ":two");
+}
+
 test "empty bodies are nil and () is the empty list" {
     try expectOutput("((fn []))", "nil");
     try expectOutput("(do (defn e0 []) (e0))", "nil");

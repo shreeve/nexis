@@ -1930,6 +1930,7 @@ fn expandCond(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
 //     => (let* [g e] (if (= g 'k1) v1 (if (= g 'k2) v2 ... terminal)))
 //   (condp pred e c1 v1 ... default?)
 //     => (let* [p pred g e] (if (p c1 g) v1 ... terminal))
+//   a clause `c :>> f` calls `f` on the predicate's truthy result.
 //
 // A `case` key is a constant, never evaluated: a symbol key is that
 // symbol, a vector or map key that literal, and a list key `(k1 k2)`
@@ -1980,12 +1981,25 @@ fn expandCondp(ctx: *ExpandContext, call_form: *const Form, args: []const *Form)
     const b = Builder{ .ctx = ctx, .origin = call_form.origin };
     const p = try b.gensym("condp-pred");
     const g = try b.gensym("condp-expr");
-    const clauses = args[2..];
-    var chain = if (clauses.len % 2 == 1) mutCast(clauses[clauses.len - 1]) else try noMatchThrow(b, g);
-    var i = clauses.len / 2;
+    // Clauses `test result` or `test :>> f`, then an optional default.
+    const Clause = struct { test_form: *const Form, result: *const Form, thread: bool };
+    var clauses: std.ArrayList(Clause) = .empty;
+    var rest = args[2..];
+    while (rest.len >= 2) {
+        const threads = rest.len >= 3 and rest[1].datum == .keyword and rest[1].datum.keyword.ns == null and std.mem.eql(u8, rest[1].datum.keyword.name, ">>");
+        try clauses.append(ctx.allocator, .{ .test_form = rest[0], .result = rest[if (threads) 2 else 1], .thread = threads });
+        rest = rest[if (threads) 3 else 2..];
+    }
+    var chain = if (rest.len == 1) mutCast(rest[0]) else try noMatchThrow(b, g);
+    var i = clauses.items.len;
     while (i > 0) {
         i -= 1;
-        chain = try b.list(.{ "if", try b.list(.{ p, clauses[2 * i], g }), clauses[2 * i + 1], chain });
+        const c = clauses.items[i];
+        const test_call = try b.list(.{ p, c.test_form, g });
+        chain = if (c.thread) blk: {
+            const r = try b.gensym("condp-result");
+            break :blk try b.list(.{ "let*", try b.vec(.{ r, test_call }), try b.list(.{ "if", r, try b.list(.{ c.result, r }), chain }) });
+        } else try b.list(.{ "if", test_call, c.result, chain });
     }
     return b.list(.{ "let*", try b.vec(.{ p, args[0], g, args[1] }), chain });
 }
