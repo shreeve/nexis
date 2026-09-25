@@ -277,6 +277,7 @@ Interior and collision nodes cache nothing.
 | `mapAssoc(heap, m, k, v, eh, ee)` | `setConj(heap, s, e, eh, ee)` | §8.1 |
 | `mapDissoc(heap, m, k, eh, ee)` | `setDisj(heap, s, e, eh, ee)` | §8.1 |
 | `mapGet(m, k, eh, ee) MapLookup` | `setContains(s, e, eh, ee) bool` | §6.6 |
+| `mapFind(m, k, eh, ee) ?Entry` | | The stored entry, its key as the map holds it (`find`) |
 | `mapCount(m)`, `mapIter(m)` → `MapIter` | `setCount(s)`, `setIter(s)` → `SetIter` | `next()` gives `?Entry` / `?Value` in iteration order (§8.1) |
 | `hashMap(h, eh)` | `hashSet(h, eh)` | §7 |
 | `equalMap(a, b, eh, ee)` | `equalSet(a, b, eh, ee)` | §6.3; header arguments |
