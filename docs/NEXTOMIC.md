@@ -547,9 +547,10 @@ nothing is empty (nil for `.` and `[...]`), not zero.
 (`vars`, typed columns for eids and longs, a `Value` column otherwise);
 never a VM value. Results are copied into the VM heap as a persistent
 set of vectors (or the `.`, `[...]`, `[[...]]` find specs). A find
-element `(pull ?e pattern)` (a pattern vector, §6) groups and dedups as
-`?e` and is applied when the result is copied, in the query's own
-snapshot: the pattern's map, nil for an entity with no datoms,
+element `(pull ?e pattern)` or `(pull $src ?e pattern)` (a pattern
+vector, §6, or a variable a scalar `:in` input binds to one) groups and
+dedups as `?e` and is applied when the result is copied, in the query's
+own snapshot of the source it names (`$` by default): the pattern's map, nil for an entity with no datoms,
 `:nextomic/value-type` when `?e` is not an entity id,
 `:nextomic/pull-syntax` for a bad pattern, `:nextomic/history-view` on a
 history db. `:keys`, `:strs` or `:syms` name every find element (one
@@ -588,7 +589,7 @@ sub-plans with the same output variables.
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
 | `(d/datoms db :eavt e a v tx added)` (index, its components in index order, then `tx` as a t or a transaction entity id and `added` as a boolean; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
 | `(d/index-range db attr start end)` | the AVET datoms of an indexed or unique attribute with `start <= v < end` in value order; a nil bound is open; another attribute is `:nextomic/tx-data` naming it, a bound of the wrong type `:nextomic/value-type`. The cursor seeks to `start` and stops at `end`; the range test compares decoded values, so long strings and byte arrays (§2.2) are placed by value: a bound of 64 bytes or more seeks at its 64-byte prefix class, whose members the index may order by hash, and the class is scanned whole |
-| `(d/q query & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]`, aggregates (built-in and custom) and `(pull ?e pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] % $2` with inputs positional to `:in` (a source takes a db value, and a query may have none; `[$2 ?e :a ?v]` and `($2 rule ?x)` read it), `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
+| `(d/q query & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]`, aggregates (built-in and custom) and `(pull ?e pattern)` or `(pull $src ?e ?pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] % $2` with inputs positional to `:in` (a source takes a db value, and a query may have none; `[$2 ?e :a ?v]` and `($2 rule ?x)` read it), `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
 | `(d/explain query & inputs)` | the plan `q` would run, as an aligned table: one numbered line per step with its description (index, estimate, tree size, source when not `$`, bound variables marked `!`), the join a scan will run (`nested`, one seek per input row; `hash`, one scan of the constant prefix hash-joined on the shared variables; `fixpoint` for a recursive rule) and the estimated rows after the step; sub-plans indent under their step and end with `rows~` |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4); `t` is a transaction number or a transaction's entity id |
 | `(d/excise! conn e)` / `(d/excise! conn e attr)` | §4 "Excision"; returns the recording transaction's report plus `:excised [e]` and `:removed`, the history rows that went |

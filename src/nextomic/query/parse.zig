@@ -126,6 +126,11 @@ const Parser = struct {
     sources: std.ArrayList(u32) = .empty,
     rule_body: bool = false,
     clause_index: ?usize = null,
+    /// The `:find` element being parsed, and the source each
+    /// `(pull $src ...)` names, resolved once `:in` is known.
+    find_index: usize = 0,
+    find_elems: []ir.FindElem = &.{},
+    pull_srcs: std.ArrayList(struct { find: usize, sym: Value }) = .empty,
 
     fn fail(self: *Parser, message: []const u8) Error {
         self.diag.* = .{ .clause = self.clause_index, .message = message };
@@ -307,29 +312,29 @@ const Parser = struct {
 
     fn parseFind(self: *Parser, items: []Value, out: *Ir) Error!void {
         // `[?a .]`, `[[?a ...]]`, `[[?a ?b]]`, else relation.
+        var elems_in = items;
+        out.find_spec = .relation;
         if (items.len == 2 and self.isSym(items[1], ".")) {
             out.find_spec = .scalar;
-            out.find = try self.arena.dupe(ir.FindElem, &.{try self.parseFindElem(items[0])});
-            return;
-        }
-        if (items.len == 1 and items[0].kind() == .persistent_vector) {
+            elems_in = items[0..1];
+        } else if (items.len == 1 and items[0].kind() == .persistent_vector) {
             const inner = try self.elems(items[0]);
             if (inner.len == 2 and self.isSym(inner[1], "...")) {
                 out.find_spec = .collection;
-                out.find = try self.arena.dupe(ir.FindElem, &.{try self.parseFindElem(inner[0])});
-                return;
+                elems_in = inner[0..1];
+            } else {
+                if (inner.len == 0) return self.fail("empty :find tuple");
+                out.find_spec = .tuple;
+                elems_in = inner;
             }
-            if (inner.len == 0) return self.fail("empty :find tuple");
-            out.find_spec = .tuple;
-            const fs = try self.arena.alloc(ir.FindElem, inner.len);
-            for (inner, fs) |x, *f| f.* = try self.parseFindElem(x);
-            out.find = fs;
-            return;
         }
-        out.find_spec = .relation;
-        const fs = try self.arena.alloc(ir.FindElem, items.len);
-        for (items, fs) |x, *f| f.* = try self.parseFindElem(x);
+        const fs = try self.arena.alloc(ir.FindElem, elems_in.len);
+        for (elems_in, fs, 0..) |x, *f, i| {
+            self.find_index = i;
+            f.* = try self.parseFindElem(x);
+        }
         out.find = fs;
+        self.find_elems = fs;
     }
 
     fn parseFindElem(self: *Parser, v: Value) Error!ir.FindElem {
@@ -339,9 +344,17 @@ const Parser = struct {
             if (parts.len == 0) return self.fail("empty :find element");
             const name = self.symName(parts[0]) orelse return self.fail("aggregate head must be a symbol");
             if (std.mem.eql(u8, name, "pull")) {
-                if (parts.len != 3 or !self.isVarSym(parts[1])) return self.fail("pull is (pull ?e pattern)");
-                if (parts[2].kind() != .persistent_vector) return self.fail("pull takes a pattern vector");
-                return .{ .pull = .{ .e = try self.varOf(parts[1].asSymbolId()), .pattern = parts[2] } };
+                // The source is resolved once `:in` is parsed (`checkBound`).
+                const with_src = parts.len == 4 and self.isSrcSym(parts[1]);
+                const rest = if (with_src) parts[2..] else parts[1..];
+                if (rest.len != 2 or !self.isVarSym(rest[0])) return self.fail("pull is (pull ?e pattern) or (pull $src ?e pattern)");
+                const pattern = rest[1];
+                var out: ir.Pull = .{ .e = try self.varOf(rest[0].asSymbolId()), .pattern = .{ .value = pattern } };
+                if (self.isVarSym(pattern)) {
+                    out.pattern = .{ .input = try self.varOf(pattern.asSymbolId()) };
+                } else if (pattern.kind() != .persistent_vector) return self.fail("pull takes a pattern vector or a variable bound by :in");
+                if (with_src) try self.pull_srcs.append(self.arena, .{ .find = self.find_index, .sym = parts[1] });
+                return .{ .pull = out };
             }
             if (self.isVarSym(parts[0])) return self.fail("an aggregate is named by a symbol");
             const op = ir.AggOp.fromName(name) orelse .custom;
@@ -426,13 +439,24 @@ const Parser = struct {
         };
         try ir.boundVars(self.arena, out.where, &bound);
         self.clause_index = null;
+        for (self.pull_srcs.items) |ps| self.find_elems[ps.find].pull.src = try self.srcOf(ps.sym);
         for (out.find) |f| {
             if (!ir.containsVar(bound.items, f.variable_of())) return self.fail(":find variable is not bound by :in or :where");
-            if (f == .pull and self.sources.items.len == 0) return self.fail("pull reads a data source, and :in names none");
+            if (f != .pull) continue;
+            if (self.sources.items.len == 0) return self.fail("pull reads a data source, and :in names none");
+            switch (f.pull.pattern) {
+                .value => {},
+                .input => |v| if (!scalarInput(out.in, v)) return self.fail("a pull pattern variable is bound by a scalar :in input"),
+            }
         }
         for (out.with) |w| {
             if (!ir.containsVar(bound.items, w)) return self.fail(":with variable is not bound by :in or :where");
         }
+    }
+
+    fn scalarInput(in: []const ir.InBinding, v: Var) bool {
+        for (in) |b| if (b == .scalar and b.scalar == v) return true;
+        return false;
     }
 
     // ── clauses ───────────────────────────────────────────────────

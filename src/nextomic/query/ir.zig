@@ -243,10 +243,10 @@ pub const Agg = struct {
 pub const FindElem = union(enum) {
     variable: Var,
     agg: Agg,
-    /// `(pull ?e pattern)`: the pattern value is resolved against the
-    /// db when the result is materialised; the element groups and
-    /// dedups as its variable.
-    pull: struct { e: Var, pattern: Value },
+    /// `(pull ?e pattern)` or `(pull $src ?e pattern)`: the pattern is
+    /// resolved against the source (null: `$`) when the result is
+    /// materialised; the element groups and dedups as its variable.
+    pull: Pull,
 
     pub fn variable_of(self: FindElem) Var {
         return switch (self) {
@@ -255,6 +255,17 @@ pub const FindElem = union(enum) {
             .pull => |p| p.e,
         };
     }
+};
+
+pub const Pull = struct {
+    e: Var,
+    src: ?Src = null,
+    pattern: union(enum) {
+        value: Value,
+        /// A variable bound by a scalar `:in` input: the pattern is
+        /// that input's value.
+        input: Var,
+    },
 };
 
 pub const FindSpec = enum { relation, scalar, collection, tuple };

@@ -84,6 +84,10 @@ nil
 {:error :nextomic/query-syntax, :message :keys, :strs and :syms take one name per :find element}
 {:error :nextomic/unknown-attribute, :attr :nope/attr}
 :nextomic/history-view
+{:db/id 4294967298, :person/name Cy, :person/age 41}
+[{:db/id 4294967300, :person/name Ed} {:db/id 4294967300, :person/name Edward}]
+{:error :nextomic/query-syntax, :message a pull pattern variable is bound by a scalar :in input}
+{:error :nextomic/query-syntax, :message unknown data source; declare it in :in}
 ([Di] [Flo])
 ([Ann] [Cy] [Di] [Edward])
 ([Bob] [Di] [Edward] [Flo])

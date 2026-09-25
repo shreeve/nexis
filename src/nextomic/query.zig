@@ -128,7 +128,7 @@ pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: ?Db
 
     var ctx = try plan.Ctx.init(arena, reads.items, interner, parsed.query, parsed.rules, diag);
     const p = try plan.plan(&ctx, parsed.query);
-    var ex = exec.Exec{ .arena = arena, .reads = reads.items, .heap = heap, .interner = interner, .hook = options.hook, .diag = diag };
+    var ex = exec.Exec{ .arena = arena, .reads = reads.items, .heap = heap, .interner = interner, .hook = options.hook, .diag = diag, .args = args };
     const input = try ex.inputRelation(parsed.query, args);
     const rel = try ex.runPlan(p, input);
     const rows = try ex.findRows(parsed.query, rel);

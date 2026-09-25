@@ -191,6 +191,11 @@
 (println (t/caught (d/q '[:find ?n ?a :keys name :where [?e :person/name ?n] [?e :person/age ?a]] db)))
 (println (t/caught (d/q '[:find (pull ?e [:nope/attr]) :where [?e :person/age 30]] db)))
 (println (t/caught (d/q '[:find (pull ?e [:person/name]) :where [?e :person/age 30]] (d/history db))))
+(println (d/q '[:find (pull ?e ?p) . :in $ ?p :where [?e :person/email "cy@x"]] db [:person/name :person/age]))
+(println (d/q '[:find [(pull $then ?e [:person/name]) (pull ?e [:person/name])] :in $ $then :where [?e :person/email "ed@x"]]
+              db (d/as-of db (:tx people))))
+(println (t/caught (d/q '[:find (pull ?e ?p) :where [?e :person/age 30] [(ground [:person/name]) ?p]] db)))
+(println (t/caught (d/q '[:find (pull $2 ?e [:person/name]) :where [?e :person/age 30]] db)))
 
 ; --- not, or, not-join, or-join ------------------------------------------
 

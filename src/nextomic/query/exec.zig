@@ -8,7 +8,7 @@
 //!     scan, `missing?` and `get-else` read the source their clause
 //!     names; an input resolves its idents and lookup refs in the
 //!     source of the first pattern that gives it an entity role; a pull
-//!     expression reads `$`.
+//!     expression reads the source it names, `$` by default.
 //!   - A scan seeks by the constants and bound variables that lead its
 //!     index and post-filters everything else; `tx` binds the
 //!     transaction entity id and `added` the datom's flag. The mode of
@@ -89,6 +89,9 @@ pub const Exec = struct {
     hook: ?CallHook,
     /// Where an `UnknownAttribute` in an input leaves its name.
     diag: ?*Diag = null,
+    /// The inputs, positional to `:in`: where a pull pattern bound by
+    /// `:in` is found.
+    args: []const Value = &.{},
     /// The random source of `sample` and `rand`, made on first use.
     prng: ?std.Random.DefaultPrng = null,
 
@@ -1034,7 +1037,17 @@ pub const Exec = struct {
         var scratch: Diag = .{};
         const diag = self.diag orelse &scratch;
         const prepared = try self.arena.alloc(?pull_mod.Prepared, query.find.len);
-        for (query.find, prepared) |f, *p| p.* = if (f == .pull) try pull_mod.Prepared.prepare(self.arena, self.reads[0], self.heap, self.interner, f.pull.pattern, diag) else null;
+        for (query.find, prepared) |f, *p| {
+            if (f != .pull) {
+                p.* = null;
+                continue;
+            }
+            const pattern = switch (f.pull.pattern) {
+                .value => |v| v,
+                .input => |v| inputOf(query, self.args, v),
+            };
+            p.* = try pull_mod.Prepared.prepare(self.arena, self.readOf(f.pull.src), self.heap, self.interner, pattern, diag);
+        }
         const out = try self.arena.alloc([]const Cell, rows.len);
         for (rows, out) |row, *o| {
             const cells = try self.arena.dupe(Cell, row);
@@ -1046,6 +1059,12 @@ pub const Exec = struct {
             o.* = cells;
         }
         return out;
+    }
+
+    /// The value of the scalar `:in` input that binds `v`.
+    fn inputOf(query: *const Ir, args: []const Value, v: Var) Value {
+        for (query.in, args) |b, a| if (b == .scalar and b.scalar == v) return a;
+        unreachable;
     }
 
     /// The rows as a vector of maps, one key per find element.
