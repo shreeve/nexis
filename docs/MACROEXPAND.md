@@ -116,16 +116,20 @@ is an ordinary call. User macros shadow host macros.
    replacement is `(var name)`, so the REPL prints `#'name`.
    Without a `compile_eval` callback `defmacro` is
    `MalformedMacroCall`.
-3. **Invocation**: convert each argument Form → Value
-   (`formToValue`), call `VM.evalClosure(var.root, args, &sub_vm)`,
-   convert the result Value → Form (`valueToForm`, in the compile
-   arena), deinit the sub-VM, recursively re-expand the result.
+3. **Invocation**: the argument count is checked against the macro
+   fn's arity, each argument Form becomes a Value (`formToValue`),
+   and a fresh sub-VM (idle routine, the compile-time interner and
+   the calling VM's heap borrowed, collection off) calls the macro
+   fn through `callValue`; the result becomes a Form (`valueToForm`,
+   in the compile arena), or an uncaught throw or VM error becomes
+   the failure message (§8), before the sub-VM is released, and the
+   result is expanded again in the call's place.
 4. **Fresh sub-VM per call** (never persistent): no handler /
    finally / halted state to save and restore. The macro routine's
    `var_table` holds pointers into the caller's namespace
    (resolved at compile time) and its constant pool holds
-   caller-interned literals, so the sub-VM needs no namespace or
-   interner of its own.
+   caller-interned literals, so the sub-VM needs no namespace of
+   its own. It has no `io`, so a macro body cannot print.
 5. **Persistent allocator**: the compile-eval callback allocates
    the macro fn's storage from a persistent allocator (the VM's
    `runtime_arena`) so the closure outlives the per-form compile
@@ -572,7 +576,7 @@ and a message naming the problem, for the caller to report.
 | Failure | Span | Message |
 |---|---|---|
 | A macro call's user macro throws | the call | `macro m threw <message>`: an `ex-info` or error map's `:message`, a string, `:keyword` |
-| … fails in the VM | the call | `macro m failed: KindMismatch` |
+| … fails in the VM | the call | `macro m failed: ArityMismatch: g takes 1 argument, got 0` (the VM's detail when it has one) |
 | … gets the wrong number of arguments | the call | `macro m takes 1 argument, got 0` |
 | … returns a non-form | the call | `a macro returned a function, which is not a form` |
 | An argument a macro cannot take | the argument | `a syntax-quote is not data a macro can take` |
