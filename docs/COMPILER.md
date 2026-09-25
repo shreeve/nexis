@@ -55,8 +55,8 @@ here.
   `.nx.o`. Every run compiles from source.
 - No separate resolver or analyzer module; classification and
   capture analysis happen inside `lowerForm` and the `Emitter`.
-- No slot liveness analysis: slots are bump-allocated per routine
-  (§4.4).
+- No register allocation beyond a stack of slots: a slot is
+  freed when the form that allocated it is compiled (§4.4).
 - No profile-guided optimization, inline caches or
   operand-specialized opcodes; no ahead-of-time linker.
 
@@ -272,17 +272,23 @@ compiler relies on:
     operands) has none.
   - `recur` into a variadic `fn*` takes the fixed params plus one
     argument for the rest binding.
-  - Frame-slot assignment: each local and each compiler-generated
-    temporary gets a slot number from a per-routine bump
-    counter. Slots are not reused across disjoint lifetimes.
-    More than 4096 slots is `SlotOverflow`.
+  - Frame-slot assignment: slots are a stack. Each local and each
+    compiler-generated temporary takes the next free slot, and
+    every slot a form allocated is free again once the form is
+    compiled: a binding's slot lives to the end of its scope, a
+    temporary until the instruction that consumes it, a call
+    block until the call. A routine's `slot_count` is the most
+    slots live at once, and more than 4096 live at once is
+    `SlotOverflow`.
   - **Capture-cell slot liveness**: a slot holding an
     `UpvalCell*` (boxed local, or a placeholder cell for
     `letfn*` / named `fn*` self-reference) is an ordinary live
     value. If the cell is needed after a call (per the range-call
     ABI's call-clobbered region in `VM.md §6`) or by a later
     `closure:make` descriptor's `local_cell_slot` source, its
-    slot is never placed at or above any `call_base`. Concrete
+    slot is never placed at or above any `call_base`. The slot
+    stack gives this for free: a call block is allocated on top
+    of every slot live when its form is compiled. Concrete
     hazard: `(let* [x 1, f (g), h (fn [] x)] h)` — if `x`'s cell
     slot were allocated inside the call block for `(g)`, the
     subsequent `closure:make` for `h` would read garbage.

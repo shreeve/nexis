@@ -579,3 +579,23 @@ test "inlining: core arithmetic and comparison run as one instruction each" {
     const call = try compileIn(&program, "(fn* [a b c] (+ a b c))");
     for (call.consts) |k| if (k == .routine) try testing.expectEqual(@as(usize, 1), k.routine.var_table.len);
 }
+
+test "slots: a routine's frame holds what is live at once, not every temporary it ever used" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    // 1500 bindings, each computed by a call, all in scope at once.
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "(let [a0 0");
+    for (1..1500) |i| try src.print(testing.allocator, " a{d} (identity (inc a{d}))", .{ i, i - 1 });
+    try src.appendSlice(testing.allocator, "] a1499)");
+    try testing.expectEqual(@as(i64, 1499), (try program.run(src.items)).asFixnum());
+    // 2000 calls in sequence reuse one call block.
+    src.clearRetainingCapacity();
+    try src.appendSlice(testing.allocator, "(fn* [x] ");
+    for (0..2000) |_| try src.appendSlice(testing.allocator, "(identity x) ");
+    try src.appendSlice(testing.allocator, "x)");
+    const compiled = try compileIn(&program, src.items);
+    for (compiled.consts) |k| if (k == .routine) try testing.expect(k.routine.slot_count <= 8);
+}

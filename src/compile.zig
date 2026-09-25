@@ -56,9 +56,6 @@
 //! shared dst.
 //!
 //! **Limits**:
-//!   - The slot allocator is monotonic: each fresh result slot bumps
-//!     `slot_count`; branch-local temps are not reclaimed across the
-//!     merge point. Constants are not deduplicated.
 //!   - The primitive `try` takes one `(catch any binding ...)`; the
 //!     expander lowers several catch clauses and keyword matchers
 //!     onto it (MACROEXPAND.md §8b). A catch binding captured by an
@@ -688,9 +685,8 @@ fn toSourceSpan(span: reader_mod.SrcSpan) vm.SourceSpan {
 /// calls runs. It's allocator-owned and turned into a `Compiled`
 /// at the end via `finish()`.
 ///
-/// **Slot allocation**: monotonic — each `allocSlot()` call returns
-/// `slot_count` and bumps it. No reuse across branches; there is
-/// no liveness analysis.
+/// **Slot allocation**: a stack (`slot_top`); `compileExpr` frees
+/// what a node allocated once the node is compiled.
 ///
 /// **Constant pool**: simple append; constants are not
 /// deduplicated (COMPILER.md §4.5).
@@ -710,6 +706,14 @@ const Emitter = struct {
     consts: std.ArrayList(vm.Const) = .empty,
     capture_descs: std.ArrayList(vm.CaptureDescriptor) = .empty,
     scope: std.ArrayList(LocalBinding) = .empty,
+    /// The next free slot. Slots are a stack: `compileExpr` frees
+    /// every slot a node allocated once the node is compiled, so a
+    /// slot lives as long as the value in it is needed (bindings to
+    /// the end of their scope, temporaries until their consumer is
+    /// emitted), and a call block always lies above every live slot
+    /// (§4.4's capture-cell rule).
+    slot_top: u16 = 0,
+    /// The most slots live at once: the routine's frame size.
     slot_count: u16 = 0,
     /// Pointer to the enclosing routine's Emitter, or null for the
     /// top-level routine. Capture discovery walks the parent
@@ -892,13 +896,9 @@ const Emitter = struct {
         return .{ .upvalue = u_idx };
     }
 
-    /// Allocate a fresh result slot. Slots are monotonic; there
-    /// is no reclamation.
+    /// Allocate a fresh slot on top of the live ones.
     fn allocSlot(self: *Emitter) CompileError!u12 {
-        if (self.slot_count >= 4096) return CompileError.SlotOverflow;
-        const s = self.slot_count;
-        self.slot_count += 1;
-        return @intCast(s);
+        return self.allocSlotBlock(1);
     }
 
     /// Allocate a contiguous run of `count` fresh slots, return the
@@ -909,10 +909,11 @@ const Emitter = struct {
     /// the next "arg slot" would not be adjacent to the previous,
     /// breaking the range-call ABI invariant.
     fn allocSlotBlock(self: *Emitter, count: u32) CompileError!u12 {
-        const base: u32 = self.slot_count;
+        const base: u32 = self.slot_top;
         const end: u32 = base + count;
         if (end > 4096) return CompileError.SlotOverflow;
-        self.slot_count = @intCast(end);
+        self.slot_top = @intCast(end);
+        self.slot_count = @max(self.slot_count, self.slot_top);
         return @intCast(base);
     }
 
@@ -3388,6 +3389,9 @@ fn compileExpr(
         if (d.span == null) d.span = e.current_span;
     };
     try stack.check();
+    // What this node allocates is dead once it is compiled.
+    const slot_mark = e.slot_top;
+    defer e.slot_top = slot_mark;
     switch (form.*) {
         .nil => try e.emit(vm.asm_.loadNil(dst)),
         .bool => |b| try e.emit(if (b) vm.asm_.loadTrue(dst) else vm.asm_.loadFalse(dst)),
@@ -4550,9 +4554,12 @@ fn compileIf(
     dst: u12,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    // The test is non-tail and read in place where it can be.
+    // The test is non-tail and read in place where it can be; a
+    // slot it needed is free again once the jump has read it.
+    const slot_mark = e.slot_top;
     const test_op = try compileOperand(e, test_form, true);
     const if_false_pc = try e.emitJumpIfFalsePlaceholder(test_op);
+    e.slot_top = slot_mark;
     // Both arms inherit tail position.
     try compileExpr(e, then_form, dst, recur_target);
     // An arm that always jumps away (recur, throw) needs no jump
@@ -4813,6 +4820,26 @@ test "routine limits: a jump past the 12-bit range is JumpTargetOutOfRange at th
         var span: ?reader_mod.SrcSpan = null;
         try testing.expectError(CompileError.JumpTargetOutOfRange, compileSourceWith(a, src, .{ .out_span = &span }));
         try testing.expectEqual(src.len - 1 - tail.len, span.?.pos);
+    }
+}
+
+test "routine limits: at most 4096 slots are live at once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]struct { n: usize, ok: bool }{ .{ .n = 4000, .ok = true }, .{ .n = 4100, .ok = false } }) |c| {
+        var src: std.ArrayList(u8) = .empty;
+        try src.appendSlice(a, "(let* [");
+        for (0..c.n) |i| try src.print(a, "a{d} {d} ", .{ i, i });
+        try src.appendSlice(a, "] a0)");
+        if (c.ok) {
+            _ = try compileSourceWith(a, src.items, .{});
+        } else {
+            var span: ?reader_mod.SrcSpan = null;
+            try testing.expectError(CompileError.SlotOverflow, compileSourceWith(a, src.items, .{ .out_span = &span }));
+            // Reported at the form whose binding did not fit.
+            try testing.expectEqual(@as(usize, 0), span.?.pos);
+        }
     }
 }
 
