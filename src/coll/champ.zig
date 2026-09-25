@@ -1719,7 +1719,7 @@ test "dissoc from a collision node passes the survivor up to the root" {
 // Unit-level invariants for the set kind. Mirrors the map test layout
 // but exercises set-specific shapes (no value column, no replace-
 // value case, contains bool instead of get union). Property tests
-// live in test/prop/champ.zig (S1..S6).
+// live in test/prop/champ.zig (S1..S9).
 // =============================================================================
 
 test "setEmpty: subkind 0, count 0, isEmpty true" {
