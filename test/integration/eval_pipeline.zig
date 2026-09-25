@@ -1241,6 +1241,14 @@ test "integration: transients: transient, conj!, assoc!, dissoc!, disj!, pop!, p
     try expectOutput("(persistent! (conj! (transient {}) [:k 1]))", "{:k 1}");
 }
 
+test "integration: a transient hashes by identity, so it can be a set member or map key (SEMANTICS §2.6)" {
+    try expectOutput(
+        \\(let [t (transient [])]
+        \\  [(= (hash t) (hash t)) (count (conj #{t} t (transient []))) (get {t 1} t)
+        \\   (= t (transient [])) (= t [])])
+    , "[true 2 1 false false]");
+}
+
 test "integration: in-ns switches the namespace the next forms compile in" {
     try expectOutputProgram("(in-ns 'other) (def x 1) (in-ns 'user) [other/x (try (in-ns \"s\") (catch any e e))]", "[1 :kind-mismatch]");
 }
