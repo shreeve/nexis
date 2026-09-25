@@ -142,6 +142,13 @@ anything deeper as `UnserializableKind` (at the language level
 reads back. Each nesting level costs two small frames of the
 recursion, so the bound fits the native stack in every build mode.
 
+Decode memory is bounded by what the input holds, whatever its counts
+claim. A count larger than the bytes left could encode is
+`TruncatedInput` before anything is read for it. The elements of every
+list and vector being decoded share one scratch stack, which grows by
+one per element actually decoded: nested headers that each claim the
+rest of the input cost nothing until the input runs out.
+
 ---
 
 ### 3. Serializability by kind

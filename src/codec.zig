@@ -254,6 +254,7 @@ pub fn decode(
         .elementHash = elementHash,
         .elementEq = elementEq,
     };
+    defer d.scratch.deinit(heap.backing);
     const v = try d.item(0);
     if (d.cursor != bytes.len) return CodecError.TrailingBytes;
     return v;
@@ -389,6 +390,11 @@ const Decoder = struct {
     cursor: usize,
     elementHash: *const fn (Value) u64,
     elementEq: *const fn (Value, Value) bool,
+    /// The elements of every list and vector being decoded, innermost
+    /// last. It grows one element per element decoded, so a count
+    /// that claims more than the input holds costs nothing until the
+    /// input runs out (CODEC.md §2.7).
+    scratch: std.ArrayList(Value) = .empty,
 
     fn item(d: *Decoder, depth: u32) DecodeError!Value {
         if (depth > max_depth) return CodecError.MalformedPayload;
@@ -402,19 +408,28 @@ const Decoder = struct {
         };
     }
 
-    /// Reads the elements into scratch, then conses from the tail.
     noinline fn list(d: *Decoder, depth: u32) DecodeError!Value {
-        const elems = try d.heap.backing.alloc(Value, try d.count(1));
-        defer d.heap.backing.free(elems);
-        for (elems) |*slot| slot.* = try d.item(depth);
-        return list_mod.fromSlice(d.heap, elems);
+        const start = try d.elements(depth);
+        defer d.scratch.shrinkRetainingCapacity(start);
+        return list_mod.fromSlice(d.heap, d.scratch.items[start..]);
     }
 
     noinline fn vector(d: *Decoder, depth: u32) DecodeError!Value {
+        const start = try d.elements(depth);
+        defer d.scratch.shrinkRetainingCapacity(start);
+        return vector_mod.fromSlice(d.heap, d.scratch.items[start..]);
+    }
+
+    /// Read a count and that many elements onto `scratch`; returns
+    /// where they start.
+    fn elements(d: *Decoder, depth: u32) DecodeError!usize {
         const n = try d.count(1);
-        var v = try vector_mod.empty(d.heap);
-        for (0..n) |_| v = try vector_mod.conj(d.heap, v, try d.item(depth));
-        return v;
+        const start = d.scratch.items.len;
+        for (0..n) |_| {
+            const v = try d.item(depth);
+            try d.scratch.append(d.heap.backing, v);
+        }
+        return start;
     }
 
     // Encode never writes a duplicate key or element, so a count
@@ -1040,6 +1055,29 @@ test "decode: nesting past max_depth is MalformedPayload, never a stack fault" {
         }
         try writeByte(&buf, testing.allocator, 0);
         try testing.expectError(CodecError.MalformedPayload, decode(&ctx.heap, &ctx.interner, buf.items, &synthHash, &synthEq));
+    }
+}
+
+test "decode: nested counts that each claim the rest of the input allocate by what is decoded" {
+    for ([_]Kind{ .list, .persistent_vector }) |kind| {
+        var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var heap = Heap.init(counting.allocator());
+        defer heap.deinit();
+        var interner = Interner.init(testing.allocator);
+        defer interner.deinit();
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        try writeByte(&buf, testing.allocator, version_major);
+        try writeByte(&buf, testing.allocator, version_minor);
+        // 1000 levels each claiming 3000 elements, then 2000 nils:
+        // every level but the deepest few passes the count check.
+        for (0..1000) |_| {
+            try writeByte(&buf, testing.allocator, @intFromEnum(kind));
+            try writeUleb128(&buf, testing.allocator, 3000);
+        }
+        try buf.appendNTimes(testing.allocator, @intFromEnum(Kind.nil), 2000);
+        try testing.expectError(CodecError.TruncatedInput, decode(&heap, &interner, buf.items, &synthHash, &synthEq));
+        try testing.expect(counting.allocated_bytes <= 16 * buf.items.len);
     }
 }
 
