@@ -194,15 +194,16 @@ so there is no queue; emdb's write lock is the transactor.
    [:user/email "a@x"]}` is one friend; `[[:user/email "a@x"] "tmp"]` is
    two).
 3. **Tempids**: mint ident ids for new keyword values inside `wtxn`.
-   Resolve lookup refs and unique-identity tempids by an AVET probe
-   **through `wtxn`** so datoms earlier in the same transaction are
-   visible. A unique-identity claim whose value is a tempid or a lookup
-   ref upserts once the value is known: a tempid bound by its own
-   identity, a lookup ref found in the tree or naming an identity
-   asserted anywhere in the same transaction; claims on an entity the
-   transaction creates unify their tempids. A unique-value collision
-   with a different entity is `:nextomic/unique`. Remaining tempids take
-   eids from `sys/"eid"`, read once and bumped once.
+   A unique-identity tempid upserts to the entity holding its value in
+   the committed AVET tree. A unique-identity claim whose value is a
+   tempid or a lookup ref upserts once the value is known: a tempid
+   bound by its own identity, a lookup ref found in the tree or naming
+   an identity asserted anywhere in the same transaction; claims on an
+   entity the transaction creates unify their tempids. Remaining tempids
+   take eids from `sys/"eid"`, read once and bumped once. A lookup ref
+   names the committed holder of its `(a v)`, else the entity a unique
+   assertion of the same tx-data puts `(a v)` on, wherever that
+   assertion stands; otherwise it is `:nextomic/no-entity`.
 4. **Expand**: a card-one assertion whose current value differs writes
    the retraction of the old value and the assertion of the new one in
    this `t`; asserting an already-current datom writes nothing; two
@@ -221,7 +222,12 @@ so there is no queue; emdb's write lock is the transactor.
    same conflict as the explicit pair: re-asserting a current datom is
    a claim on it even though it writes nothing, so it and a retraction
    of that datom in one transaction, by any form and in either order,
-   are `:nextomic/conflict`. Then
+   are `:nextomic/conflict`. Unique attributes are checked over the
+   whole expansion, so a value moves between entities whichever form
+   comes first: two entities asserting one unique `(a v)`, or an
+   assertion of a `(a v)` another entity holds and the transaction
+   does not retract (explicitly or by a card-one overwrite), is
+   `:nextomic/unique`. Then
    `[tx-entity :db/txInstant now]` is appended as a datom of this
    transaction, unless the tx-data asserted `:db/txInstant` on
    `"datomic.tx"` itself: that instant stands, in the datom and in the

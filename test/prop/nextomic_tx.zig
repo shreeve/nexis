@@ -784,3 +784,110 @@ test "T2 a failed transaction leaves the ident and schema caches as a fresh conn
     try testing.expect(committed > 10);
     try testing.expect(failed > 10);
 }
+
+// =============================================================================
+// tx-data is a set: any order of the same forms gives the same outcome.
+// =============================================================================
+
+/// The outcome of one speculative run: the error, or the datoms as
+/// `e|a|v|added` with every tempid's eid spelled by its name, since
+/// tempids take eids in first-seen order.
+fn outcome(arena: Allocator, tc: *db_mod.TestConn, ops: []const Op) ![]const u8 {
+    const w = transact.withOps(tc.conn, arena, ops, .{ .now_ms = 1 }) catch |err| return @errorName(err);
+    defer w.destroy();
+    const r = w.report;
+    var rows: std.ArrayList([]const u8) = .empty;
+    for (r.tx_data) |d| {
+        if (d.a == boot.tx_instant) continue;
+        const e = try spell(arena, r, d.e);
+        const v = if (d.v == .ref) try spell(arena, r, d.v.ref) else try std.fmt.allocPrint(arena, "{x}", .{try key.valBytes(arena, d.v)});
+        try rows.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{s}|{}", .{ e, d.a, v, d.added }));
+    }
+    std.mem.sort([]const u8, rows.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return std.mem.join(arena, "\n", rows.items);
+}
+
+fn spell(arena: Allocator, r: transact.Report, e: u64) ![]const u8 {
+    for (r.tempids) |b| if (b.eid == e) return std.fmt.allocPrint(arena, "tmp:{s}", .{b.key.string});
+    return std.fmt.allocPrint(arena, "{d}", .{e});
+}
+
+test "T3 a permutation of tx-data gives the same report or fails alike" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(prng_seed ^ 0x5e7);
+    const rand = prng.random();
+
+    const tc = try db_mod.TestConn.init("prop_tx_perm");
+    defer tc.deinit();
+    var schema_ops: std.ArrayList(Op) = .empty;
+    try schema_ops.appendSlice(arena, try attrOps(arena, tc, "k", "u/k", boot.type_string, false, true, false));
+    try schema_ops.appendSlice(arena, try attrOps(arena, tc, "v", "u/v", boot.type_string, false, false, false));
+    try schema_ops.appendSlice(arena, try attrOps(arena, tc, "n", "u/n", boot.type_long, false, false, false));
+    // `:u/v` is unique by value.
+    try schema_ops.append(arena, .{ .add = .{ .e = .{ .tempid = .{ .string = "v" } }, .a = .{ .id = boot.unique }, .v = .{ .val = .{ .keyword = boot.unique_value } } } });
+    const rs = try transact.transactOps(tc.conn, arena, schema_ops.items, .{});
+    var ids: [3]u32 = undefined;
+    for (rs.tempids, 0..) |b, i| ids[i] = @intCast(b.eid);
+    const k_attr, const v_attr, const n_attr = ids;
+
+    const pool = [_][]const u8{ "p", "q", "r", "s" };
+    var ents: [3]u64 = undefined;
+    {
+        var ops: std.ArrayList(Op) = .empty;
+        for (0..3) |i| {
+            const t: transact.Entity = .{ .tempid = .{ .string = pool[i] } };
+            try ops.append(arena, .{ .add = .{ .e = t, .a = .{ .id = k_attr }, .v = .{ .val = .{ .string = pool[i] } } } });
+            try ops.append(arena, .{ .add = .{ .e = t, .a = .{ .id = v_attr }, .v = .{ .val = .{ .string = pool[i] } } } });
+        }
+        const r = try transact.transactOps(tc.conn, arena, ops.items, .{});
+        for (r.tempids, 0..) |b, i| ents[i] = b.eid;
+    }
+
+    var succeeded: usize = 0;
+    var failed: usize = 0;
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        var ops: std.ArrayList(Op) = .empty;
+        const n = 2 + rand.uintLessThan(usize, 4);
+        for (0..n) |_| {
+            const val: Val = .{ .string = pool[rand.uintLessThan(usize, pool.len)] };
+            const e: transact.Entity = switch (rand.uintLessThan(u8, 6)) {
+                0, 1, 2 => .{ .eid = ents[rand.uintLessThan(usize, 3)] },
+                3, 4 => .{ .lookup = .{ .a = .{ .id = k_attr }, .v = .{ .string = pool[rand.uintLessThan(usize, pool.len)] } } },
+                else => .{ .tempid = .{ .string = if (rand.boolean()) "t1" else "t2" } },
+            };
+            const a = if (rand.boolean()) k_attr else v_attr;
+            switch (rand.uintLessThan(u8, 6)) {
+                0, 1 => try ops.append(arena, .{ .add = .{ .e = e, .a = .{ .id = a }, .v = .{ .val = val } } }),
+                2 => if (e != .tempid) try ops.append(arena, .{ .retract = .{ .e = e, .a = .{ .id = a }, .v = .{ .val = val } } }),
+                3 => if (e != .tempid) try ops.append(arena, .{ .retract_attr = .{ .e = e, .a = .{ .id = a } } }),
+                else => try ops.append(arena, .{ .add = .{ .e = e, .a = .{ .id = n_attr }, .v = .{ .val = .{ .long = rand.intRangeAtMost(i64, 1, 3) } } } }),
+            }
+        }
+        if (ops.items.len < 2) continue;
+        const want = try outcome(arena, tc, ops.items);
+        for (0..3) |_| {
+            const shuffled = try arena.dupe(Op, ops.items);
+            rand.shuffle(Op, shuffled);
+            const got = try outcome(arena, tc, shuffled);
+            const failure = std.mem.indexOfScalar(u8, want, '|') == null and want.len > 0 and std.ascii.isUpper(want[0]);
+            const got_failure = std.mem.indexOfScalar(u8, got, '|') == null and got.len > 0 and std.ascii.isUpper(got[0]);
+            // Two independent faults may surface in either order; the
+            // outcome is still a failure both ways.
+            if (failure and got_failure) continue;
+            if (!std.mem.eql(u8, want, got)) {
+                std.debug.print("transaction {d} (seed 0x{x}): in order\n{s}\nshuffled\n{s}\n", .{ i, prng_seed, want, got });
+                return error.TestUnexpectedResult;
+            }
+        }
+        if (transact.transactOps(tc.conn, arena, ops.items, .{})) |_| succeeded += 1 else |_| failed += 1;
+    }
+    try testing.expect(succeeded > 30);
+    try testing.expect(failed > 30);
+}

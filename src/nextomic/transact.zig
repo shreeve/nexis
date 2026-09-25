@@ -11,12 +11,14 @@
 //!     unique-identity assertions upsert through an AVET probe (a
 //!     tempid- or lookup-ref-valued claim once its value is known),
 //!     two tempids naming one identity unify, the rest take fresh eids;
-//!   - expand: ops in order against the committed trees plus the
-//!     transaction's own overlay: card-one implicit retracts, no-op
-//!     re-assertions, conflicts, unique-value collisions, lookup refs,
-//!     retract-attribute, retract-entity with VAET cleanup and component
-//!     cascade, then the `:db/txInstant` datom unless the tx-data
-//!     asserted one on the transaction entity;
+//!     then every unique assertion is claimed, so a lookup ref resolves
+//!     alike wherever it stands;
+//!   - expand: ops against the committed trees plus the transaction's
+//!     own overlay: card-one implicit retracts, no-op re-assertions,
+//!     conflicts, retract-attribute, retract-entity with VAET cleanup
+//!     and component cascade, then the `:db/txInstant` datom unless the
+//!     tx-data asserted one on the transaction entity, then the unique
+//!     check over the whole expansion;
 //!   - schema: validate schema changes and backfill AVET for attributes
 //!     that become indexed or unique;
 //!   - write: the eight index trees, the txlog, the counts and `sys`;
@@ -402,6 +404,10 @@ const Ctx = struct {
     kept: std.StringHashMapUnmanaged(void) = .empty,
     /// `[a][v]` of a pending assertion -> e.
     av_adds: std.StringHashMapUnmanaged(u64) = .empty,
+    /// `[a][v]` -> e for every unique assertion of the tx-data, whatever
+    /// its place: what a lookup ref names when the committed state holds
+    /// nothing under `(a v)`.
+    av_claims: std.StringHashMapUnmanaged(u64) = .empty,
 
     next_eid: u64,
     eid_bumped: bool = false,
@@ -984,8 +990,10 @@ const Ctx = struct {
     fn apply(self: *Ctx) !void {
         try self.bindIdents();
         try self.bindTempids();
+        try self.claimAll();
         try self.expandAll();
         try self.txInstant();
+        try self.checkUnique();
         try self.applySchema();
         if (self.excision) |x| {
             // Resolved before the write, which marks the entry with it.
@@ -1233,25 +1241,28 @@ const Ctx = struct {
         return null;
     }
 
-    /// The entity holding `(a v)` in the tree or the overlay, or null.
+    /// The entity holding `(a v)` once the transaction's datoms are
+    /// written, or null.
     fn findByAv(self: *Ctx, a: u32, vbytes: []const u8) !?u64 {
-        const av = try self.avKey(a, vbytes);
-        if (self.av_adds.get(av)) |e| return e;
+        if (self.av_adds.get(try self.avKey(a, vbytes))) |e| return e;
         const e = (try self.probeAvet(a, vbytes)) orelse return null;
-        // A pending retraction of that datom hides it.
-        const fk = try key.keyBytes(self.arena, .eavt, e, a, vbytes, null);
-        if (self.facts.get(fk)) |i| if (!self.overlay.items[i].added) return null;
-        return e;
+        return if (try self.retracts(e, a, vbytes)) null else e;
+    }
+
+    /// The entity a lookup ref names: the committed holder of `(a v)`,
+    /// else the entity the tx-data asserts it on, wherever that
+    /// assertion stands; null when neither exists.
+    fn lookupEid(self: *Ctx, l: *const Lookup) !?u64 {
+        const vb = try key.valBytes(self.arena, l.v);
+        if (try self.probeAvet(l.attr.id, vb)) |e| return e;
+        return self.av_claims.get(try self.avKey(l.attr.id, vb));
     }
 
     fn resolveEnt(self: *Ctx, e: Ent) !u64 {
         return switch (e) {
             .eid => |id| id,
             .tempid => |i| self.eidOfTempid(i),
-            .lookup => |l| blk: {
-                const vb = try key.valBytes(self.arena, l.v);
-                break :blk (try self.findByAv(l.attr.id, vb)) orelse return error.NoEntity;
-            },
+            .lookup => |l| (try self.lookupEid(l)) orelse error.NoEntity,
         };
     }
 
@@ -1259,12 +1270,71 @@ const Ctx = struct {
         return switch (v) {
             .val => |x| x,
             .tempid => |i| .{ .ref = self.eidOfTempid(i) },
-            .lookup => |l| blk: {
-                const vb = try key.valBytes(self.arena, l.v);
-                break :blk .{ .ref = (try self.findByAv(l.attr.id, vb)) orelse return error.NoEntity };
-            },
+            .lookup => |l| .{ .ref = (try self.lookupEid(l)) orelse return error.NoEntity },
             .ident => unreachable,
         };
+    }
+
+    /// Record every unique assertion's `(a v) -> e` before expansion,
+    /// so a lookup ref resolves the same wherever it stands. An
+    /// assertion whose entity or value is itself a lookup ref waits for
+    /// the claims it names.
+    fn claimAll(self: *Ctx) !void {
+        var waiting: std.ArrayList(usize) = .empty;
+        for (self.ops.items, 0..) |op, i| {
+            if (op != .add or op.add.attr.unique == .none) continue;
+            if (!try self.claim(op.add.e, op.add.attr, op.add.v)) try waiting.append(self.arena, i);
+        }
+        var progress = true;
+        while (progress) {
+            progress = false;
+            var i: usize = 0;
+            while (i < waiting.items.len) {
+                const op = self.ops.items[waiting.items[i]].add;
+                if (try self.claim(op.e, op.attr, op.v)) {
+                    _ = waiting.swapRemove(i);
+                    progress = true;
+                } else i += 1;
+            }
+        }
+    }
+
+    /// Claim `(a v) -> e` when both sides resolve; false when a lookup
+    /// ref among them names nothing yet.
+    fn claim(self: *Ctx, e: Ent, attr: *const Attr, v: PVal) !bool {
+        const eid = switch (e) {
+            .lookup => |l| (try self.lookupEid(l)) orelse return false,
+            else => try self.resolveEnt(e),
+        };
+        const val: Val = switch (v) {
+            .lookup => |l| .{ .ref = (try self.lookupEid(l)) orelse return false },
+            else => try self.resolveVal(v),
+        };
+        const av = try self.avKey(attr.id, try key.valBytes(self.arena, val));
+        const g = try self.av_claims.getOrPut(self.arena, av);
+        if (!g.found_existing) g.value_ptr.* = eid;
+        return true;
+    }
+
+    /// Unique attributes (NEXTOMIC.md §3 step 4) over the whole
+    /// expansion, so the order of the forms never matters: no two
+    /// entities assert one `(a v)`, and an entity other than the
+    /// asserting one holds it in the committed state only when the
+    /// transaction retracts it there.
+    fn checkUnique(self: *Ctx) !void {
+        for (self.overlay.items) |p| {
+            if (!p.added or p.attr.unique == .none) continue;
+            if (self.av_adds.get(try self.avKey(p.attr.id, p.vbytes))) |e| if (e != p.e) return self.unique(p.attr, p.v);
+            const other = (try self.probeAvet(p.attr.id, p.vbytes)) orelse continue;
+            if (other != p.e and !try self.retracts(other, p.attr.id, p.vbytes)) return self.unique(p.attr, p.v);
+        }
+    }
+
+    /// Does the transaction retract the committed datom `(e a v)`?
+    fn retracts(self: *Ctx, e: u64, a: u32, vbytes: []const u8) !bool {
+        const fk = try key.keyBytes(self.arena, .eavt, e, a, vbytes, null);
+        const i = self.facts.get(fk) orelse return false;
+        return !self.overlay.items[i].added;
     }
 
     // ── expand ────────────────────────────────────────────────────
@@ -1319,9 +1389,6 @@ const Ctx = struct {
         if (self.facts.get(fk)) |i| {
             if (!self.overlay.items[i].added) return self.conflict(e, attr.id);
             return;
-        }
-        if (attr.unique != .none) {
-            if (try self.findByAv(attr.id, vb)) |other| if (other != e) return self.unique(attr, v);
         }
         const already = (try self.txn.getFromTree(self.conn.store.trees.cur(.eavt), fk)) != null;
         if (!attr.many()) {
@@ -1680,10 +1747,7 @@ const Ctx = struct {
             try self.txn.putInTree(store.trees.hist(.avet), hk, &.{});
         }
         // Pending datoms of this attribute belong in AVET too.
-        if (self.attrs.get(attr.id)) |c| {
-            c.indexed = true;
-            if (becomes_unique) c.unique = .identity;
-        }
+        if (self.attrs.get(attr.id)) |c| c.indexed = true;
     }
 
     // ── write ─────────────────────────────────────────────────────
