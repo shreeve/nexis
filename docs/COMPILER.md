@@ -80,9 +80,10 @@ Form tree
 Expanded Form tree
    │
    ▼  lowerForm (src/compile.zig)
-Tiny IR (symbols classified, special forms recognized)
+Tiny IR (symbols classified, special forms recognized, captured
+         bindings marked)
    │
-   ▼  Emitter (src/compile.zig) — capture pre-analysis + codegen
+   ▼  Emitter (src/compile.zig) — codegen
 Bytecode routines (code + consts + var_table + capture_descs)
    │
    ▼  VM (src/vm.zig)
@@ -236,20 +237,24 @@ compiler relies on:
     raise `DuplicateBinding` (mutual visibility makes duplicates
     ambiguous; matches Clojure).
   - `(fn* [a b & r] body)` lowers with `rest_param = "r"`; `&`
-    is never a parameter name. `letfn*` bindings do not accept a
-    rest parameter (`UnsupportedFeature`).
+    is never a parameter name. A `letfn*` binding takes a rest
+    parameter the same way.
+  - Every binding a closure captures is marked in its Tiny node
+    as the symbol reaching it is lowered (§6.1).
   - `recur` is a marker at lowering; tail-position validation
     happens in the `Emitter` against the active `RecurTarget`.
-  - `catch` takes the matcher `any` only; any other matcher
-    symbol is `MalformedForm`.
+  - `catch` takes the matcher `any` only; any other matcher is
+    `UnsupportedFeature` (the expander lowers every surface
+    matcher onto `any`, MACROEXPAND.md §10).
 
 - **Errors**: `UnresolvedSymbol`, `DuplicateParam`,
   `DuplicateBinding`, `MalformedForm`, `ExpectedSymbol`,
   `ExpectedVector`, `UnsupportedFeature`,
-  `IntegerOutOfFixnumRange` (an integer literal outside the i48
-  fixnum range; there is no bignum literal lifting).
+  `StackOverflow`. An integer literal outside the i48 fixnum
+  range is a bignum constant; `IntegerOutOfFixnumRange` is only
+  for a hand-built `Tiny.int` outside it.
 
-#### 4.4 Emitter — capture analysis, slots, codegen
+#### 4.4 Emitter — slots, captures, codegen
 
 - **Input**: `Tiny` tree.
 - **Output**: bytecode routine per `docs/VM.md` — code + typed
@@ -257,10 +262,9 @@ compiler relies on:
   `slot_count` / `fixed_arity` / `variadic` / `upvalue_count`.
 
 - **Guarantees**:
-  - Every local binding is tagged **captured** or **not
-    captured** before its code is emitted (§6.1). A local is
-    captured iff at least one `fn*` within its scope references
-    it.
+  - Every local binding arrives tagged **captured** or **not
+    captured** by lowering (§6.1). A local is captured iff at
+    least one `fn*` within its scope references it.
   - Non-captured locals are plain frame slots at runtime.
   - Captured locals are **heap cells** (`docs/VM.md` §6): the
     `Emitter` boxes the slot at binding time (`closure:box-local`)
@@ -438,8 +442,8 @@ variants are codegen details.
   The routine is registered in the **current** routine's
   constant pool as a `Const.routine` entry; its constant-pool
   index becomes operand A of the eventual `closure:make`.
-- Capture analysis on the body identifies which enclosing-frame
-  locals the body references. For each, build a capture
+- Compiling the body resolves each enclosing-frame local it
+  references as a capture. For each, build a capture
   descriptor entry: `local_cell_slot(s)` if the captured
   binding is a local of the immediate enclosing frame,
   `inherited_upvalue(u)` if it is a capture inherited from an
@@ -447,7 +451,7 @@ variants are codegen details.
   capture-descriptor table; its index becomes operand B.
 - Emit `closure:make A=proto_const B=cap_desc C=result_slot`
   per `VM.md §6`. The result is a closure value (VALUE.md
-  kind 22).
+  kind 24, `function`).
 - The routine records `fixed_arity = params.len` and
   `variadic = rest != null`; the rest parameter is bound at slot
   `params.len` and the VM materializes the rest list at call
@@ -604,8 +608,7 @@ liveness rule) AND across the `closure:init-cell` calls.
 corresponding `init-cell` runs would surface
 `:uninitialized-cell` at runtime. The lowering sequence above
 (allocate-all → make-all → init-all) rules this out for
-ordinary `letfn*` use. A `letfn*` binding with a rest parameter
-is `UnsupportedFeature`.
+ordinary `letfn*` use.
 
 #### 5.7 `(loop* [b1 v1 b2 v2 ...] body...)`
 
@@ -674,12 +677,12 @@ matcher, or a `finally` alone, onto it (MACROEXPAND.md §10).
 ### 6. Closure and upvalue contract
 
 Captured-only boxing, descriptor-based construction, cell access
-opcodes; §6.1 gives the pre-analysis discipline that makes the
-boxing decision sound.
+opcodes; §6.1 gives the discipline that makes the boxing decision
+sound.
 
 - A local is **captured** iff any nested `fn*` body references
-  it. The classification is computed before the binding's code
-  is emitted — see §6.1.
+  it. Lowering classifies it before the binding's code is
+  emitted — see §6.1.
 - **Non-captured locals**: plain frame slots. Read / write via
   SCVU slot operands. Zero per-op overhead.
 - **Captured locals**: the bound value is wrapped in an
@@ -718,49 +721,41 @@ boxing decision sound.
   an upvalue pointer array copied from the closure; U#
   operands resolve via the callee frame's upvalue array.
 
-#### 6.1 Pre-analysis capture, binding-time boxing
+#### 6.1 Capture marking, binding-time boxing
 
-The `Emitter` does **capture pre-analysis per `let*`, `loop*`
-and `fn*`**, then emits `closure:box-local` at **binding time**
-(or function entry for captured params), making the runtime
-cell-vs-direct status of each slot **provably stable across all
-control-flow paths**.
+Lowering marks every captured binding; the `Emitter` emits
+`closure:box-local` at **binding time** (or function entry for
+captured params), making the runtime cell-vs-direct status of
+each slot **provably stable across all control-flow paths**.
 
 Boxing lazily — at the moment an inner closure first captures a
 binding — is unsound under control flow: if the inner closure is
 created in a branch (e.g., `(if false (fn* [] x) 0)`), the
 `box-local` lives in the unreachable branch, while subsequent
 same-frame reads emit `closure:get-cell` against an unboxed slot
-— an `:expected-cell` trap on a valid program. The pre-analysis
-model below rules this out.
+— an `:expected-cell` trap on a valid program. Deciding before
+the binding's code is emitted rules this out.
 
-**The pre-analysis algorithm** (per `let*` / `loop*` / `fn*`):
+1. **Marking** (in lowering): `LowerEnv` mirrors every lexical
+   scope the Emitter will have — `let*` / `loop*` bindings in
+   order, `fn*` parameters (and the rest parameter), the `fn*`
+   self-name (in the scope enclosing the body), `letfn*` names
+   and the `catch` binding — each entry recording the `fn*`
+   depth it was made at and pointing at its Tiny node's
+   `captured` flag. Lowering a symbol finds its innermost
+   binding; one made at a smaller depth than the symbol's is
+   captured, and its flag is set. One pass, O(scope depth) per
+   symbol.
 
-1. **Capture-set computation** — `freeVarsAcrossFn(body,
-   locally_bound)` walks the Tiny tree under `body`,
-   accumulating the set of names that are referenced by ANY
-   enclosed `fn*` body and that are NOT bound locally to that
-   `fn*`. The walk recurses into `fn*` bodies with that fn's
-   params (and rest param and self-name) as the inner-bound
-   set; the result percolates up to the enclosing scope. This
-   is "free vars across function boundaries" — exactly the set
-   of names the enclosing scope's bindings might have to box.
+2. **Binding-time boxing**: a `let*` / `loop*` binding, a
+   parameter or a `catch` binding that is marked is boxed with
+   `closure:box-local` as it is bound and pushed as
+   `.cell_slot(s)`; every other binding is `.direct_slot(s)`.
+   The instruction sits in straight-line code that every path
+   reaching the binding's scope runs. A marked self-name gets a
+   placeholder cell (§5.5).
 
-2. **`let*` binding-time decision**: when binding `name` at
-   slot `s`, check whether `name ∈ freeVarsAcrossFn(remaining
-   bindings + body)`. If yes, immediately emit
-   `closure:box-local s` and push the binding as `.cell_slot(s)`.
-   If no, push as `.direct_slot(s)`. The `closure:box-local`
-   instruction sits in the routine's straight-line prelude, so
-   it executes on every code path that reaches the let body.
-
-3. **`fn*` param decision**: when entering a `fn*` body, check
-   each param (and the rest param) against
-   `freeVarsAcrossFn(body)`. Box captured params at function
-   entry (immediately after argument reception); push as
-   `.cell_slot`.
-
-4. **Same-frame read dispatch** (in `compileSymbol`):
+3. **Same-frame read dispatch** (in `compileSymbol`):
 
    ```
    .direct_slot(s) → mov:move dst, slot(s)
@@ -768,44 +763,30 @@ model below rules this out.
    .upvalue(u)     → mov:move dst, u:u   (resolve(u) deref's the cell)
    ```
 
-5. **Capture from parent scope** (in `resolveOrCapture`): when
+4. **Capture from parent scope** (in `resolveOrCapture`): when
    a child Emitter resolves a name to a parent-scope binding,
-   the parent's binding is **already** `.cell_slot` if the name
-   appears in any `fn*` body within the parent's scope (which
-   includes the child being compiled). A `.direct_slot` result
-   here is a compiler bug (pre-analysis missed a capture) and is
-   reported as `InternalCompilerBug`. Repeat references to the
-   same captured name reuse one upvalue index.
+   the parent's binding is **already** `.cell_slot` (or an
+   `.upvalue` further out), because lowering marked it. A
+   `.direct_slot` result here is a compiler bug and is reported
+   as `InternalCompilerBug`. Repeat references to the same
+   captured name reuse one upvalue index.
 
-6. **`BindingRef`** is **immutable from binding time onward**.
-   There is no mid-codegen mutation of a binding's kind.
-
-   ```zig
-   pub const BindingRef = union(enum) {
-       direct_slot: u12,
-       cell_slot: u12,
-       upvalue: u12,
-   };
-   ```
+5. **`BindingRef`** (`direct_slot`, `cell_slot`, `upvalue`) is
+   **immutable from binding time onward**. There is no
+   mid-codegen mutation of a binding's kind.
 
 **Soundness invariant**:
 > A binding is `.cell_slot` iff `closure:box-local` is emitted
-> for its slot in the routine's prelude (or function entry for
-> params), which guarantees the slot holds an `UpvalCell*` on
-> every reachable runtime path. `closure:get-cell` and
-> `closure:make`'s `local_cell_slot` source can therefore use
-> strict cell-only semantics with no runtime "ensure cell"
-> dynamic check.
-
-This invariant holds because the `closure:box-local` for a
-captured binding sits in straight-line code (let-binding
-prelude or fn-entry prelude) that EVERY reachable code path
-traverses before any inner `fn*` could possibly construct a
-closure that references the binding.
+> for its slot where it is bound (or at function entry for
+> params, or at handler entry for a `catch` binding), which
+> guarantees the slot holds an `UpvalCell*` on every reachable
+> runtime path. `closure:get-cell` and `closure:make`'s
+> `local_cell_slot` source can therefore use strict cell-only
+> semantics with no runtime "ensure cell" dynamic check.
 
 **Invariants** (continuation):
-- `UpvalCell` and `Closure` are allocated from the VM's runtime
-  arena and live for the VM's lifetime (`VM.md §6`).
+- `UpvalCell` and `Closure` are allocated on the VM's heap and
+  collected like any other value (`VM.md §6`, `GC.md`).
 - Closures carry references to cells, NOT copies of cell
   contents.
 - A closure's captured-cell array is immutable after creation;
@@ -1037,7 +1018,7 @@ the VM's namespace, interner and macro table.
 - `docs/FORMS.md` — Form schema.
 - `docs/SEMANTICS.md` — equality, hash, numeric edges
   (runtime-side; compiler must respect).
-- `docs/VALUE.md` — heap kinds; `function` is kind 22.
+- `docs/VALUE.md` — heap kinds; `function` is kind 24.
 - `docs/TOOLING.md` — what the §8 span table serves: located
   runtime errors and `nexis disasm`.
 - `../em/docs/architecture/PIPELINE.md` — em compiler pipeline
