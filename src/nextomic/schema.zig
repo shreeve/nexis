@@ -109,6 +109,9 @@ pub const Attr = struct {
 pub const Schema = struct {
     arena: std.heap.ArenaAllocator,
     basis: u64,
+    /// The store's schema generation (`sys["sg"]`) the schema was built
+    /// under.
+    gen: u64 = 0,
     attrs: std.AutoHashMapUnmanaged(u32, Attr) = .empty,
 
     /// Build the schema at `basis`, the `sys["t"]` of `txn`, from the
@@ -116,7 +119,7 @@ pub const Schema = struct {
     pub fn build(gpa: Allocator, store: *Store, txn: *Txn, basis: u64) !*Schema {
         const self = try gpa.create(Schema);
         errdefer gpa.destroy(self);
-        self.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .basis = basis };
+        self.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .basis = basis, .gen = try store.readSchemaGen(txn) };
         errdefer self.arena.deinit();
         const arena = self.arena.allocator();
 

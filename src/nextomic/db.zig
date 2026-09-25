@@ -235,10 +235,16 @@ pub const Conn = struct {
 
     /// The schema serving `basis` inside `txn` (whose `sys["t"]` is
     /// `now`). A cached schema built at a basis `>= basis` serves it
-    /// through `attrAt`; otherwise the cache is rebuilt at `now`.
+    /// through `attrAt`; one whose schema generation is still the
+    /// store's serves `now` too, since only data was committed since;
+    /// otherwise the cache is rebuilt at `now`.
     pub fn schemaAt(self: *Conn, txn: *Txn, basis: u64, now: u64) !*Schema {
         if (self.schema_cache) |s| {
             if (s.basis >= basis) return s;
+            if (s.gen == try self.store.readSchemaGen(txn)) {
+                s.basis = now;
+                return s;
+            }
             s.deinit();
             self.schema_cache = null;
         }

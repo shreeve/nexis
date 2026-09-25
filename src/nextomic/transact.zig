@@ -1843,6 +1843,7 @@ const Ctx = struct {
         try store.putTxlog(self.txn, self.t, entry);
 
         try store.writeT(self.txn, self.t);
+        if (self.schema_touched) try store.bumpSchemaGen(self.txn);
         if (self.eid_bumped) try store.writeNextEid(self.txn, self.next_eid);
         try self.minter.finish();
     }
@@ -3463,6 +3464,33 @@ test "two identities naming two entities for one tempid conflict, naming the dat
     }, .{ .fault = &fault }));
     try testing.expect(fault.e != null);
     try testing.expectEqual(try kw(tc, "user/email"), fault.attr.?.asKeywordId());
+}
+
+test "another connection's data commits keep the schema cache; its schema changes rebuild it" {
+    const tc = try TestConn.init("tx_schema_gen");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const other = try Conn.open(testing.allocator, &tc.interner, tc.td.path.ptr, .{ .sync = .none });
+    defer other.destroy();
+
+    _ = try (try tc.conn.db()).attr(name);
+    const cached = tc.conn.schema_cache.?;
+    _ = try transactOps(other, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "A" } } } },
+    }, .{});
+    const db = try tc.conn.db();
+    try testing.expect((try db.attr(name)) != null);
+    try testing.expectEqual(cached, tc.conn.schema_cache.?);
+    try testing.expectEqual(db.basis, cached.basis);
+
+    _ = try transactOps(other, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_many } } } },
+    }, .{});
+    try testing.expect((try (try tc.conn.db()).attr(name)).?.many());
 }
 
 test "the view outlives the scratch arena until destroy" {

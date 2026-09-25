@@ -70,7 +70,7 @@ one while another holds the file's write transaction is
 | `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
 | `nx/txlog` | `[t:6]` | codec vector `[instant [e a v added] ...]`, with a trailing map `{:excised [e ...]}` on an entry an excision touched |
 | `nx/idents` | `[0x00][utf8 text]` → id, `[0x01][id:4]` → text, `[0x02][utf8 text]` → id for a name a rename retired | |
-| `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"`, `"n"[a:4]` | see §2.3 |
+| `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"`, `"sg"`, `"n"[a:4]` | see §2.3 |
 | `nx/fulltext` | `[a:4][token][0x00][e:6][hash128(v):16]` | empty; one row per token of each current string value of a `:db/fulltext` attribute (§5 "fulltext") |
 
 `top` = `(t << 1) | added`. `v` is always followed only by fixed-width
@@ -156,6 +156,7 @@ bytes, inside emdb's 256-byte search-clue buffer.
 | `"eid"` | u48 next user entity id |
 | `"aid"` | u32 next attribute / ident id |
 | `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once |
+| `"sg"` | u64 schema generation, bumped by every transaction that writes a datom on an attribute-partition entity; absent reads as 0. A connection's schema cache serves a newer basis while the generation is the one it was built under, since only data was committed since |
 | `"n"` `[a:4]` | u64 count of the current datoms of attribute `a`, kept by every transaction and excision; the planner's estimate (§5) |
 
 ### 2.4 Bootstrap
@@ -393,7 +394,9 @@ emit the group's newest kept datom iff its `added` is 1.
 history of the attribute partition: every assertion and retraction of
 `:db/valueType`, `:db/cardinality`, `:db/unique`, `:db/index`,
 `:db/isComponent` and `:db/fulltext` on an attribute is one event of its
-timeline. The cache serves every earlier basis by replaying each
+timeline. The cache serves a later basis while `sys["sg"]` is unchanged
+(§2.3), and is rebuilt when another connection changed the schema. It
+serves every earlier basis by replaying each
 attribute's timeline up to it: attributes created after it are hidden,
 and every flag and the cardinality read as that basis saw them, so an
 attribute indexed at one `t` and made unique at a later one is indexed

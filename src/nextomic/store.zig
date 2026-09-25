@@ -600,6 +600,18 @@ pub const Store = struct {
         try self.sysPutInt(txn, "ig", 8, gen);
     }
 
+    /// Schema generation: bumped by every transaction that writes a
+    /// datom on an attribute-partition entity; absent reads as 0.
+    pub fn readSchemaGen(self: *Store, txn: *Txn) !u64 {
+        const raw = (try self.sysGet(txn, "sg")) orelse return 0;
+        if (raw.len != 8) return error.Corrupted;
+        return std.mem.readInt(u64, raw[0..8], .big);
+    }
+
+    pub fn bumpSchemaGen(self: *Store, txn: *Txn) !void {
+        try self.sysPutInt(txn, "sg", 8, (try self.readSchemaGen(txn)) +% 1);
+    }
+
     // ── txlog ─────────────────────────────────────────────────────
 
     fn txlogKey(t: u64) [key.id_len]u8 {
@@ -913,6 +925,7 @@ pub const Store = struct {
         const entry = try datom_mod.encodeTxlog(arena, now, datoms, &.{}, .{ .ctx = @ptrCast(&names), .identName = &IdentNames.identName });
         try self.putTxlog(txn, t, entry);
         try self.writeT(txn, t);
+        try self.bumpSchemaGen(txn);
     }
 
     /// Ident names for the txlog encoder, from `nx/idents` through the
