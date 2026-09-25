@@ -237,6 +237,8 @@ pub fn errorKeyword(err: anyerror) []const u8 {
         error.Cas => "nextomic/cas",
         error.Schema => "nextomic/schema",
         error.PullSyntax => "nextomic/pull-syntax",
+        error.QuerySyntax => "nextomic/query-syntax",
+        error.UnboundPattern => "nextomic/unbound-pattern",
         error.HistoryView => "nextomic/history-view",
         error.Format, error.UnknownIdent => "db/corrupted",
         error.StackOverflow => "stack-overflow",
@@ -697,7 +699,7 @@ fn withNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
 
 fn fnPull(vm: *VM, args: []const Value) VmError!Value {
     var diag: Diag = .{};
-    return pullNative(vm, args, &diag) catch |err| failPull(vm, err, &diag);
+    return pullNative(vm, args, &diag) catch |err| failDiag(vm, err, &diag);
 }
 
 /// `(pull db pattern e)`: the pattern's map for `e`; nil when the
@@ -709,7 +711,7 @@ fn pullNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
 
 fn fnPullMany(vm: *VM, args: []const Value) VmError!Value {
     var diag: Diag = .{};
-    return pullManyNative(vm, args, &diag) catch |err| failPull(vm, err, &diag);
+    return pullManyNative(vm, args, &diag) catch |err| failDiag(vm, err, &diag);
 }
 
 /// `(pull-many db pattern es)`: one result per entity of the vector
@@ -723,11 +725,16 @@ fn pullManyNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
 }
 
 /// A pattern or entity syntax error travels with its reason.
-fn failPull(vm: *VM, err: anyerror, diag: *const Diag) VmError {
-    if (err == error.PullSyntax) return throwSyntax(vm, "nextomic/pull-syntax", diag.message, diag.clause);
-    if (err == error.UnknownAttribute) return failWith(vm, err, .{ .attr = diag.attr });
-    if (err == error.TxData) return failWith(vm, err, .{ .message = if (diag.message.len == 0) null else diag.message, .attr = diag.attr });
-    return fail(vm, err);
+/// Surface an error of the query or pull pipeline with what `diag`
+/// knows: the reason and clause of a syntax error, the attribute of an
+/// unknown one, the reason and attribute of malformed input.
+pub fn failDiag(vm: *VM, err: anyerror, diag: *const Diag) VmError {
+    return switch (err) {
+        error.QuerySyntax, error.PullSyntax => throwSyntax(vm, errorKeyword(err), diag.message, diag.clause),
+        error.UnknownAttribute => failWith(vm, err, .{ .attr = diag.attr }),
+        error.TxData => failWith(vm, err, .{ .message = if (diag.message.len == 0) null else diag.message, .attr = diag.attr }),
+        else => fail(vm, err),
+    };
 }
 
 // =============================================================================
@@ -1229,6 +1236,8 @@ test "every nextomic error maps to its §7 keyword; engine errors to the db set"
         .{ .err = error.Cas, .name = "nextomic/cas" },
         .{ .err = error.Schema, .name = "nextomic/schema" },
         .{ .err = error.PullSyntax, .name = "nextomic/pull-syntax" },
+        .{ .err = error.QuerySyntax, .name = "nextomic/query-syntax" },
+        .{ .err = error.UnboundPattern, .name = "nextomic/unbound-pattern" },
         .{ .err = error.HistoryView, .name = "nextomic/history-view" },
         .{ .err = error.Format, .name = "db/corrupted" },
         .{ .err = error.Corrupted, .name = "db/corrupted" },

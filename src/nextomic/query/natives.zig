@@ -35,13 +35,12 @@
 //! caller's `try` as the thrown value after `query.q` has closed its
 //! `Read`, and `ControlTransferred` passes through unchanged.
 //!
-//! Errors: `QuerySyntax` throws `{:error :nextomic/query-syntax
-//! :message "..." :clause i}` (`:clause` only when the parser was
-//! inside a `:where` clause), so the reason travels with the throw;
-//! `PullSyntax` from a `(pull ?e pattern)` find element throws the
-//! `:nextomic/pull-syntax` map the same way;
-//! `UnboundPattern` throws `:nextomic/unbound-pattern`; every other
-//! error takes the `natives.zig` mapping. VM errors pass through.
+//! Errors go through `natives.failDiag`, shared with pull: `QuerySyntax`
+//! throws `{:error :nextomic/query-syntax :message "..." :clause i}`
+//! (`:clause` only when the parser was inside a `:where` clause), so the
+//! reason travels with the throw, and `PullSyntax` from a pull find
+//! element the `:nextomic/pull-syntax` map the same way; every other
+//! error takes the `natives.zig` keyword. VM errors pass through.
 
 const std = @import("std");
 const value = @import("../../value.zig");
@@ -82,48 +81,6 @@ pub fn install(ns: *Namespace) !void {
 
 const native_q = NativeFn{ .name = "nextomic/q", .min_arity = 1, .max_arity = null, .call = &fnQ };
 const native_explain = NativeFn{ .name = "nextomic/explain", .min_arity = 1, .max_arity = null, .call = &fnExplain };
-
-// =============================================================================
-// Errors
-// =============================================================================
-
-/// The keyword a pipeline error throws as, or null for a VM error,
-/// which passes through unchanged.
-fn keywordFor(err: anyerror) ?[]const u8 {
-    switch (err) {
-        error.QuerySyntax => return "nextomic/query-syntax",
-        error.UnboundPattern => return "nextomic/unbound-pattern",
-        else => {},
-    }
-    inline for (@typeInfo(VmError).error_set.?) |e| {
-        if (err == @field(anyerror, e.name)) return null;
-    }
-    return natives.errorKeyword(err);
-}
-
-/// Surface `err` to the program with what `diag` knows: the reason of
-/// a syntax error or of malformed input, the attribute of an unknown one.
-fn fail(vm: *VM, err: anyerror, diag: *const Diag) VmError {
-    if (err == error.QuerySyntax) return throwSyntax(vm, diag.message, diag.clause);
-    if (err == error.PullSyntax) return natives.throwSyntax(vm, "nextomic/pull-syntax", diag.message, diag.clause);
-    if (err == error.UnknownAttribute) return natives.failWith(vm, err, .{ .attr = diag.attr });
-    if (err == error.TxData) return natives.failWith(vm, err, .{ .message = messageOf(diag), .attr = diag.attr });
-    if (keywordFor(err)) |name| return vm.throwKeyword(name);
-    inline for (@typeInfo(VmError).error_set.?) |e| {
-        if (err == @field(anyerror, e.name)) return @field(VmError, e.name);
-    }
-    unreachable;
-}
-
-/// The message `diag` carries, when it carries one.
-fn messageOf(diag: *const Diag) ?[]const u8 {
-    return if (diag.message.len == 0) null else diag.message;
-}
-
-/// Throw the `:nextomic/query-syntax` map.
-fn throwSyntax(vm: *VM, message: []const u8, clause: ?usize) VmError {
-    return natives.throwSyntax(vm, "nextomic/query-syntax", message, clause);
-}
 
 // =============================================================================
 // The call hook
@@ -177,7 +134,7 @@ const Hook = struct {
         if (try lookup(vm, sym)) |v| return v;
         const message = try std.fmt.allocPrint(vm.allocator, "unknown function: {s}", .{vm.ensureInterner().symbolName(sym)});
         defer vm.allocator.free(message);
-        return throwSyntax(vm, message, null);
+        return natives.throwSyntax(vm, "nextomic/query-syntax", message, null);
     }
 };
 
@@ -217,7 +174,7 @@ fn splitQualified(name: []const u8) ?Qualified {
 
 fn fnQ(vm: *VM, args: []const Value) VmError!Value {
     var diag: Diag = .{};
-    return qNative(vm, args, &diag) catch |err| fail(vm, err, &diag);
+    return qNative(vm, args, &diag) catch |err| natives.failDiag(vm, err, &diag);
 }
 
 fn qNative(vm: *VM, call_args: []const Value, diag: *Diag) !Value {
@@ -265,7 +222,7 @@ fn argMap(vm: *VM, arena: std.mem.Allocator, args: []const Value, diag: *Diag) !
 
 fn fnExplain(vm: *VM, args: []const Value) VmError!Value {
     var diag: Diag = .{};
-    return explainNative(vm, args, &diag) catch |err| fail(vm, err, &diag);
+    return explainNative(vm, args, &diag) catch |err| natives.failDiag(vm, err, &diag);
 }
 
 fn explainNative(vm: *VM, call_args: []const Value, diag: *Diag) !Value {
@@ -287,22 +244,6 @@ fn explainNative(vm: *VM, call_args: []const Value, diag: *Diag) !Value {
 // =============================================================================
 
 const testing = std.testing;
-
-test "pipeline errors map to keywords; VM errors pass through" {
-    try testing.expectEqualStrings("nextomic/unbound-pattern", keywordFor(error.UnboundPattern).?);
-    try testing.expectEqualStrings("nextomic/unknown-attribute", keywordFor(error.UnknownAttribute).?);
-    try testing.expectEqualStrings("nextomic/value-type", keywordFor(error.ValueType).?);
-    try testing.expectEqualStrings("nextomic/closed", keywordFor(error.Closed).?);
-    try testing.expectEqualStrings("nextomic/nested", keywordFor(error.Nested).?);
-    try testing.expectEqualStrings("nextomic/pull-syntax", keywordFor(error.PullSyntax).?);
-    try testing.expectEqualStrings("nextomic/history-view", keywordFor(error.HistoryView).?);
-    try testing.expectEqualStrings("db/corrupted", keywordFor(error.Corrupted).?);
-    try testing.expect(keywordFor(error.ControlTransferred) == null);
-    try testing.expect(keywordFor(error.UncaughtThrow) == null);
-    try testing.expect(keywordFor(error.ArityMismatch) == null);
-    try testing.expect(keywordFor(error.OutOfMemory) == null);
-    try testing.expect(keywordFor(error.KindMismatch) == null);
-}
 
 test "qualified names split at the first slash" {
     try testing.expect(splitQualified("str") == null);
