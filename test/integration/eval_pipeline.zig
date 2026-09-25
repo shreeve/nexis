@@ -536,6 +536,15 @@ test "try: a class-name matcher or :default catches anything, as Exception would
     try expectOutput("(try (throw :a) (catch :a e 1) (catch Exception e 2))", "1");
 }
 
+test "fn: a :pre/:post condition map checks arguments and the result" {
+    try expectOutput("((fn [x] {:pre [(pos? x)]} (* 2 x)) 3)", "6");
+    try expectOutput("(try ((fn [x] {:pre [(pos? x) (< x 10)]} x) -1) (catch :assertion-failed e (:message e)))", "Assert failed: (pos? x)");
+    try expectOutput("(try ((fn [x] {:post [(> % 10)]} (* 2 x)) 3) (catch :assertion-failed e (:message e)))", "Assert failed: (> % 10)");
+    try expectOutputProgram("(defn f ([x] {:pre [(odd? x)]} x) ([x y] {:post [(= % 3)]} (+ x y))) [(f 1) (f 1 2) (try (f 2) (catch any e :pre))]", "[1 3 :pre]");
+    // A lone map is the body, not a condition map.
+    try expectOutput("((fn [] {:pre [false]}))", "{:pre [false]}");
+}
+
 test "empty bodies are nil and () is the empty list" {
     try expectOutput("((fn []))", "nil");
     try expectOutput("(do (defn e0 []) (e0))", "nil");

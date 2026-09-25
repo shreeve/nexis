@@ -1512,8 +1512,51 @@ fn expandFnRename(ctx: *ExpandContext, call_form: *const Form, args: []const *Fo
         }
     }
     const new_params = try makeVector(ctx, params, params_form.origin);
-    if (patterns.items.len == 0) return b.list(.{ "fn*", name, new_params, tail[1..] });
-    return b.list(.{ "fn*", name, new_params, try b.list(.{ "let", try b.vec(.{patterns.items}), tail[1..] }) });
+    const body = try conditionedBody(b, tail[1..]);
+    if (patterns.items.len == 0) return b.list(.{ "fn*", name, new_params, body });
+    return b.list(.{ "fn*", name, new_params, try b.list(.{ "let", try b.vec(.{patterns.items}), body }) });
+}
+
+/// A fn body whose first form is a condition map `{:pre [c...]
+/// :post [c...]}` followed by more forms, as the checks around the
+/// rest: each `:pre` condition before it, each `:post` condition
+/// after it with `%` bound to its value. A failed check throws
+/// `{:error :assertion-failed :message "Assert failed: <c>"}`. Any
+/// other body is itself.
+fn conditionedBody(b: Builder, body: []const *Form) ExpandError![]const *Form {
+    if (body.len < 2 or body[0].datum != .map) return body;
+    const pre = conditions(body[0], "pre");
+    const post = conditions(body[0], "post");
+    if (pre == null and post == null) return body;
+    var out: std.ArrayList(*Form) = .empty;
+    for (pre orelse &.{}) |c| try out.append(b.ctx.allocator, try assertion(b, c));
+    const rest = body[1..];
+    if (post) |checks| {
+        var after: std.ArrayList(*Form) = .empty;
+        for (checks) |c| try after.append(b.ctx.allocator, try assertion(b, c));
+        try out.append(b.ctx.allocator, try b.list(.{ "let*", try b.vec(.{ "%", try b.list(.{ "do", rest }) }), after.items, "%" }));
+    } else {
+        try out.appendSlice(b.ctx.allocator, rest);
+    }
+    return out.items;
+}
+
+/// The conditions under `:key` in a condition map, if it has them.
+fn conditions(map: *const Form, key: []const u8) ?[]const *Form {
+    const entries = map.datum.map;
+    var i: usize = 0;
+    while (i + 1 < entries.len) : (i += 2) {
+        const k = entries[i];
+        if (k.datum == .keyword and k.datum.keyword.ns == null and std.mem.eql(u8, k.datum.keyword.name, key) and entries[i + 1].datum == .vector) return entries[i + 1].datum.vector;
+    }
+    return null;
+}
+
+/// `(if c nil (throw {:error :assertion-failed :message ...}))`.
+fn assertion(b: Builder, c: *const Form) ExpandError!*Form {
+    const prefix = try makeForm(b.ctx, .{ .string = "Assert failed: " }, b.origin);
+    const message = try b.list(.{ "nexis.core/str", prefix, try b.list(.{ "quote", c }) });
+    return b.list(.{ "if", c, null, try b.list(.{ "throw", try b.map(.{ ":error", ":assertion-failed", ":message", message }) }) });
 }
 
 fn isAmpersand(form: *const Form) bool {
@@ -1615,7 +1658,7 @@ fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandE
             try b.list(.{ "nexis.core/=", n, a.fixed });
         // `loop`, not `loop*`, so a pattern parameter destructures
         // on entry and after every `recur`.
-        chain = try b.list(.{ "if", test_form, try b.list(.{ "loop", try b.vec(.{bindings.items}), a.body }), chain });
+        chain = try b.list(.{ "if", test_form, try b.list(.{ "loop", try b.vec(.{bindings.items}), try conditionedBody(b, a.body) }), chain });
     }
     return b.list(.{ "fn", name, try b.vec(.{ "&", args }), try b.list(.{ "let*", try b.vec(.{ n, try b.list(.{ "nexis.core/count", args }) }), chain }) });
 }
