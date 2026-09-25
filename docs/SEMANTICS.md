@@ -351,7 +351,8 @@ How each kind prints in the `pr-str` and `str` modes is
 Functions, native fns, vars, transients, atoms, protocols, protocol
 fns and the db and Nextomic handles print as markers for debugging
 (`#<fn>`, `#<native-fn inc>`, `#<atom>`, `#<transient>`, a var as
-`#'name`) that do not read back. None is serializable either
+`#'ns/name`, a Nextomic handle as `#nextomic/conn "path"` and the
+like) that do not read back. None is serializable either
 (`docs/CODEC.md` §3).
 
 #### 6.3 Numeric print rules
@@ -373,9 +374,10 @@ fns and the db and Nextomic handles print as markers for debugging
 #### 6.4 Character print rules
 
 Named: `\newline`, `\space`, `\tab`, `\return`, `\formfeed`,
-`\backspace`. Printable ASCII prints as `\a` (backslash as `\\`);
-everything else as `\u{HEX}`, uppercase, no leading zeros (`\u{E9}`,
-`\u{0}`). The reader accepts the same set (PLAN §23 #26).
+`\backspace`, and `\\` for the backslash. Other printable ASCII
+prints as `\a`; everything else as `\u{HEX}`, uppercase, no leading
+zeros (`\u{E9}`, `\u{0}`). The reader accepts the same set (PLAN §23
+#26).
 
 #### 6.5 String print rules
 
