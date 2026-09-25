@@ -2150,6 +2150,24 @@ test "nexis.string: join: round-trips with split" {
     , "[a,b,, a,b]");
 }
 
+test "nexis.string: predicates and searches" {
+    try expectOutput("(let [s \"hello world\"] [(nexis.string/starts-with? s \"hell\") (nexis.string/ends-with? s \"world\") (nexis.string/includes? s \"o w\") (nexis.string/includes? s \"x\") (nexis.string/starts-with? s \"\")])", "[true true true false true]");
+    try expectOutput("[(nexis.string/index-of \"héllo\" \"l\") (nexis.string/index-of \"héllo\" \\l 3) (nexis.string/index-of \"abc\" \"z\") (nexis.string/last-index-of \"héllo\" \"l\") (nexis.string/last-index-of \"abcabc\" \"b\" 3)]", "[2 3 nil 3 1]");
+    try expectOutput("[(nexis.string/blank? nil) (nexis.string/blank? \" \\t\\n\") (nexis.string/blank? \" x \")]", "[true true false]");
+    try expectOutput("(try (nexis.string/starts-with? 1 \"a\") (catch any e e))", ":kind-mismatch");
+}
+
+test "nexis.string: capitalize, reverse, triml, trimr, trim-newline, split-lines" {
+    try expectOutput("(pr-str [(nexis.string/capitalize \"hELLO\") (nexis.string/capitalize \"\") (nexis.string/reverse \"héllo\") (nexis.string/triml \"  a \") (nexis.string/trimr \"  a \") (nexis.string/trim-newline \"a\\r\\n\\n\") (nexis.string/trim-newline \"a \")])", "[\"Hello\" \"\" \"olléh\" \"a \" \"  a\" \"a\" \"a \"]");
+    try expectOutput("(pr-str (nexis.string/split-lines \"a\\nb\\r\\nc\\n\\n\"))", "[\"a\" \"b\" \"c\"]");
+}
+
+test "nexis.set: union, intersection, difference, subset?, superset?, select, map-invert, rename-keys" {
+    try expectOutput("[(nexis.set/union #{1 2} #{2 3}) (nexis.set/union) (nexis.set/intersection #{1 2 3} #{2 3 4} #{3 2}) (nexis.set/difference #{1 2 3} #{2} #{3})]", "[#{1 2 3} #{} #{2 3} #{1}]");
+    try expectOutput("[(nexis.set/subset? #{1} #{1 2}) (nexis.set/subset? #{3} #{1 2}) (nexis.set/superset? #{1 2} #{2}) (nexis.set/select odd? #{1 2 3})]", "[true false true #{1 3}]");
+    try expectOutput("[(nexis.set/map-invert {:a 1}) (= {:z 1 :b 2} (nexis.set/rename-keys {:a 1 :b 2} {:a :z}))]", "[{1 :a} true]");
+}
+
 test "nexis.string: replace: literal, all-non-overlapping" {
     try expectOutput("(nexis.string/replace \"abc\" \"b\" \"X\")", "aXc");
     try expectOutput("(nexis.string/replace \"abababab\" \"ab\" \"X\")", "XXXX");

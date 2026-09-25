@@ -139,6 +139,10 @@ const embedded = [_]Embedded{
     .{ .ns = "nexis.pprint", .info = .{ .path = "pprint.nx", .text = @embedFile("stdlib/pprint.nx") } },
     // The constants of nexis.math.
     .{ .ns = "nexis.math", .info = .{ .path = "math.nx", .text = @embedFile("stdlib/math.nx") } },
+    // The nexis.string functions written over its natives.
+    .{ .ns = "nexis.string", .info = .{ .path = "string.nx", .text = @embedFile("stdlib/string.nx") } },
+    // Set algebra (Clojure's clojure.set).
+    .{ .ns = "nexis.set", .info = .{ .path = "set.nx", .text = @embedFile("stdlib/set.nx") } },
 };
 
 const core_natives = table("", .{
@@ -407,6 +411,15 @@ const string_natives = table("nexis.string", .{
     .{ "upper-case", 1, 1, &fnStringUpperCase },
     .{ "trim", 1, 1, &fnStringTrim },
     .{ "split", 2, 3, &fnStringSplit },
+    .{ "triml", 1, 1, &fnStringTriml },
+    .{ "trimr", 1, 1, &fnStringTrimr },
+    .{ "trim-newline", 1, 1, &fnStringTrimNewline },
+    .{ "blank?", 1, 1, &fnStringBlankQ },
+    .{ "starts-with?", 2, 2, &fnStringStartsWithQ },
+    .{ "ends-with?", 2, 2, &fnStringEndsWithQ },
+    .{ "includes?", 2, 2, &fnStringIncludesQ },
+    .{ "index-of", 2, 3, &fnStringIndexOf },
+    .{ "last-index-of", 2, 3, &fnStringLastIndexOf },
     .{ "join", 1, 2, &fnStringJoin },
     .{ "replace", 3, 3, &fnStringReplace },
 });
@@ -3745,23 +3758,106 @@ fn fnStringUpperCase(vm: *VM, args: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), buf) catch return VmError.OutOfMemory;
 }
 
-/// `std.ascii.isWhitespace` recognizes the six ASCII whitespace
-/// characters: space, tab, LF, VT, FF, CR. Inlined
-/// rather than calling so the fn is testable without Zig stdlib
-/// internals.
-inline fn isAsciiSpace(b: u8) bool {
+/// The six ASCII whitespace characters: space, tab, LF, VT, FF, CR.
+fn isAsciiSpace(b: u8) bool {
     return b == ' ' or b == '\t' or b == '\n' or b == 0x0B or b == 0x0C or b == '\r';
 }
 
-fn fnStringTrim(vm: *VM, args: []const Value) VmError!Value {
-    const s = args[0];
-    if (s.kind() != .string) return VmError.KindMismatch;
-    const src = string_mod.asBytes(s);
+/// `trim`, `triml`, `trimr`: `s` without ASCII whitespace at both
+/// ends, the start or the end; `trim-newline` without every `\n`
+/// and `\r` at the end.
+fn trimString(vm: *VM, s: Value, left: bool, right: bool, comptime isTrimmed: fn (u8) bool) VmError!Value {
+    const src = try stringArg(s);
     var lo: usize = 0;
     var hi: usize = src.len;
-    while (lo < hi and isAsciiSpace(src[lo])) lo += 1;
-    while (hi > lo and isAsciiSpace(src[hi - 1])) hi -= 1;
+    if (left) while (lo < hi and isTrimmed(src[lo])) {
+        lo += 1;
+    };
+    if (right) while (hi > lo and isTrimmed(src[hi - 1])) {
+        hi -= 1;
+    };
     return string_mod.fromBytes(vm.ensureHeap(), src[lo..hi]) catch return VmError.OutOfMemory;
+}
+
+fn isNewline(b: u8) bool {
+    return b == '\n' or b == '\r';
+}
+
+fn fnStringTrim(vm: *VM, args: []const Value) VmError!Value {
+    return trimString(vm, args[0], true, true, isAsciiSpace);
+}
+
+fn fnStringTriml(vm: *VM, args: []const Value) VmError!Value {
+    return trimString(vm, args[0], true, false, isAsciiSpace);
+}
+
+fn fnStringTrimr(vm: *VM, args: []const Value) VmError!Value {
+    return trimString(vm, args[0], false, true, isAsciiSpace);
+}
+
+fn fnStringTrimNewline(vm: *VM, args: []const Value) VmError!Value {
+    return trimString(vm, args[0], false, true, isNewline);
+}
+
+fn stringArg(v: Value) VmError![]const u8 {
+    if (v.kind() != .string) return VmError.KindMismatch;
+    return string_mod.asBytes(v);
+}
+
+/// `(blank? s)` → whether `s` is nil, empty or only whitespace.
+fn fnStringBlankQ(_: *VM, args: []const Value) VmError!Value {
+    if (args[0].isNil()) return value_mod.fromBool(true);
+    for (try stringArg(args[0])) |b| if (!isAsciiSpace(b)) return value_mod.fromBool(false);
+    return value_mod.fromBool(true);
+}
+
+fn fnStringStartsWithQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(std.mem.startsWith(u8, try stringArg(args[0]), try stringArg(args[1])));
+}
+
+fn fnStringEndsWithQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(std.mem.endsWith(u8, try stringArg(args[0]), try stringArg(args[1])));
+}
+
+fn fnStringIncludesQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(std.mem.indexOf(u8, try stringArg(args[0]), try stringArg(args[1])) != null);
+}
+
+/// The bytes a search looks for: a string's, or a char's UTF-8.
+fn needleBytes(v: Value, buf: *[4]u8) VmError![]const u8 {
+    if (v.kind() == .char) {
+        const n = std.unicode.utf8Encode(v.asChar(), buf) catch return VmError.Utf8Error;
+        return buf[0..n];
+    }
+    return stringArg(v);
+}
+
+/// `(index-of s value)` / `(index-of s value from)` → the code-point
+/// index of the first occurrence of `value` (a string or char) at or
+/// after `from`, nil when there is none; `last-index-of` the last at
+/// or before `from`. Indexes count code points, as `count` and `subs`
+/// do (STRING.md §7).
+fn fnStringIndexOf(vm: *VM, args: []const Value) VmError!Value {
+    return stringSearch(vm, args, false);
+}
+
+fn fnStringLastIndexOf(vm: *VM, args: []const Value) VmError!Value {
+    return stringSearch(vm, args, true);
+}
+
+fn stringSearch(vm: *VM, args: []const Value, last: bool) VmError!Value {
+    _ = vm;
+    const src = try stringArg(args[0]);
+    var buf: [4]u8 = undefined;
+    const needle = try needleBytes(args[1], &buf);
+    const n = string_mod.codepointCount(args[0]) catch return VmError.Utf8Error;
+    const from: usize = if (args.len == 3) @intCast(std.math.clamp(try requireFixnum(args[2]), 0, @as(i64, @intCast(n)))) else if (last) n else 0;
+    const at = string_mod.byteRangeForCodepoints(args[0], from, from) catch return VmError.Utf8Error;
+    const byte_at: ?usize = if (last)
+        std.mem.lastIndexOf(u8, src[0..@min(src.len, at.start + needle.len)], needle)
+    else if (std.mem.indexOf(u8, src[at.start..], needle)) |i| at.start + i else null;
+    const b = byte_at orelse return value_mod.nilValue();
+    return value_mod.fromFixnum(@intCast(std.unicode.utf8CountCodepoints(src[0..b]) catch return VmError.Utf8Error)).?;
 }
 
 /// `(nexis.string/split s sep)` / `(nexis.string/split s sep limit)`

@@ -1,0 +1,20 @@
+; src/stdlib/string.nx — the part of the `nexis.string` namespace
+; written in nexis over its natives (src/stdlib.zig string_natives).
+; Embedded via @embedFile and bootstrapped with nexis.string as the
+; current namespace.
+
+; (capitalize s) → s with its first character upper-case and the
+; rest lower-case (ASCII, as upper-case and lower-case are).
+(defn capitalize [s]
+  (if (< (count s) 2)
+    (upper-case s)
+    (str (upper-case (subs s 0 1)) (lower-case (subs s 1)))))
+
+; (reverse s) → s with its characters in reverse order.
+(defn reverse [s]
+  (apply str (nexis.core/reverse s)))
+
+; (split-lines s) → the lines of s, split at \n or \r\n; trailing
+; empty lines dropped, as split drops them.
+(defn split-lines [s]
+  (split (replace s "\r\n" "\n") "\n"))
