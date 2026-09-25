@@ -95,34 +95,22 @@ pub const Operand = vm.Operand;
 pub const Value = value_mod.Value;
 
 // =============================================================================
-// Tiny — the compiler's IR.
-//
-// Recursive shape: sub-expressions are pointers (the compile-time
-// arena owns them). Hand-construction in tests uses `&Tiny{ ... }`
-// literals.
+// Tiny — the compiler's IR: the special forms, with every symbol
+// reference still a name. Sub-expressions are pointers into the
+// compile allocator (tests build small trees as `&Tiny{ ... }`).
 // =============================================================================
 
 pub const Tiny = union(enum) {
-    /// nil literal.
     nil,
-    /// boolean literal (true / false).
     bool: bool,
-    /// Integer literal in the i48 fixnum range. Form lowering puts a
-    /// wider integer literal into `literal` as a bignum.
+    /// An integer in the i48 fixnum range; lowering makes a wider
+    /// literal a bignum `literal`.
     int: i64,
-    /// Reference to a lexically-bound local, a captured upvalue,
-    /// or a namespace Var. Resolution walks the Emitter's scope
-    /// stack innermost-first, then the parent chain (capture),
-    /// then the namespace, per the COMPILER.md §4.3 priority
-    /// list; unresolved names raise `CompileError.UnresolvedSymbol`.
+    /// A lexical local, a captured upvalue or a namespace Var, tried
+    /// in that order (COMPILER.md §4.3).
     symbol: []const u8,
-    /// Namespace-qualified symbol `prefix/name`. Resolves DIRECTLY through the namespace
-    /// registry — lexical scope is NOT consulted. The compiler
-    /// looks up `prefix` as a registered namespace name, then
-    /// fetches `name` from that namespace's local vars (NOT
-    /// walking the parent chain — qualified lookup is exact).
-    /// Missing ns / missing var both surface as UnresolvedSymbol
-    /// at compile time.
+    /// `prefix/name`: a Var of the namespace `prefix` names, never a
+    /// lexical binding; exact, with no parent-chain walk.
     qualified_symbol: struct { ns: []const u8, name: []const u8 },
     /// A constant Value: a keyword, string, float, char, bignum, quoted
     /// symbol, or a collection of constants built at lowering. It
@@ -140,26 +128,17 @@ pub const Tiny = union(enum) {
         op: vm.CollOp,
         items: []const *const Tiny,
     },
-    /// `try` / `catch` / `finally`. The only catch matcher is
-    /// `any` and the catch clause is mandatory; `finally` is
-    /// optional. body, handler and finally are each implicit-do;
-    /// binding is the catch's name.
+    /// `(try body (catch any binding handler) (finally ...)?)`.
     try_: struct {
         body: *const Tiny,
-        /// catch binding name. Always present since catch is
-        /// mandatory.
         binding: []const u8,
         handler: *const Tiny,
-        /// Optional finally body; sees the OUTER lexical scope,
-        /// not the catch binding.
+        /// Sees the enclosing scope, not the catch binding.
         finally_: ?*const Tiny = null,
         /// Whether a closure in the handler captures `binding`.
         binding_captured: bool = false,
     },
-    /// `(throw value)`. Compiles the value to a
-    /// slot then emits `ctrl:throw <slot>`. Backend never
-    /// returns from this opcode (it either jumps to a catch
-    /// PC or raises VmError.UncaughtThrow).
+    /// `(throw value)`.
     throw_: *const Tiny,
     /// A call of a core arithmetic or comparison fn that the VM
     /// runs as one `math` or `cmp` instruction (COMPILER.md §4.3
@@ -169,45 +148,22 @@ pub const Tiny = union(enum) {
         lhs: *const Tiny,
         rhs: ?*const Tiny = null,
     },
-    /// `(if test then else?)`. else_ is optional; absent else
-    /// synthesizes nil per PLAN §6.1.
-    /// Field name `test_` (with trailing underscore) avoids
-    /// collision with Zig's `test` keyword. Same trick as `else_`.
+    /// `(if test then else?)`; a missing else is nil.
     if_: struct {
         test_: *const Tiny,
         then: *const Tiny,
         else_: ?*const Tiny,
     },
-    /// `(let* [n1 v1, n2 v2, ...] body)` per PLAN §6.1.
-    /// Strict left-of-self visibility per COMPILER.md §4.3:
-    /// each binding's RHS sees previous bindings only, NOT
-    /// itself. Body sees all bindings. Bindings exit scope at
-    /// the end of `body`.
     let_star: Scope,
-    /// `(do e1 e2 ... eN)` per PLAN §6.1.
-    /// Sequential evaluation; yields the value of `eN`. Empty
-    /// `(do)` yields nil. Each let_star / fn_star / loop_star
-    /// body that needs multiple expressions wraps them in `do_`.
+    /// `(do e...)`: the value of the last, nil when empty.
     do_: []const *const Tiny,
-    /// `(fn* name? [params...] body)` per PLAN §6.1.
-    /// `name` is the optional self-name; when present,
-    /// the body can reference itself recursively (e.g.,
-    /// `(fn* fact [n] ... (fact ...))`). Implementation uses
-    /// the placeholder-cell pattern: parent emits
-    /// `closure:new-cell` + `closure:make` (capturing the
-    /// placeholder) + `closure:init-cell` (filling the cell
-    /// with the constructed closure). The body's references
-    /// to `name` resolve to the captured upvalue.
+    /// `(fn* name? [params... & rest?] body)`.
     fn_star: struct {
+        /// The self-name the body may refer to (COMPILER.md §5.5).
         name: ?[]const u8 = null,
         params: []const []const u8,
-        /// `(fn* [a b & r] body)` has `params = ["a","b"]` and
-        /// `rest_param = "r"`. `rest_param` is bound at slot
-        /// `params.len`. At call time, the VM packs excess args
-        /// into a list and installs it in that slot. `null` means
-        /// fixed-arity. Tiny avoids encoding `&` as a fake symbol;
-        /// `parseParams` parses `[a b & r]` into this explicit
-        /// shape.
+        /// Bound at slot `params.len`, to the list of the arguments
+        /// past the fixed ones (VM.md §6).
         rest_param: ?[]const u8 = null,
         body: *const Tiny,
         /// Per parameter (the rest parameter last): whether a
@@ -217,65 +173,32 @@ pub const Tiny = union(enum) {
         /// placeholder cell (COMPILER.md §5.5).
         self_referenced: bool = false,
     },
-    /// `(callee args...)` — function invocation. Lowers to the
-    /// range-call ABI per VM.md §6: stage callee + args in a
-    /// contiguous call block, emit `call:call`. The callee may be
-    /// any expression evaluating to a closure.
+    /// `(callee args...)` through the range-call ABI (VM.md §6).
     call: struct {
         callee: *const Tiny,
         args: []const *const Tiny,
     },
-    /// `(loop* [name1 v1 name2 v2 ...] body)` per PLAN §6.1 +
-    /// COMPILER.md §5.7.
-    /// Same as `let*` for binding setup (sequential RHS
-    /// visibility, captured-binding cells); the loop body
-    /// installs a `RecurTarget` so `(recur args...)` inside the
-    /// body rebinds and jumps to the entry label.
+    /// Bound like `let*`; `recur` in the body re-enters it.
     loop_star: Scope,
-    /// `(recur arg1 arg2 ...)` per PLAN §6.1 + COMPILER.md §5.6.
-    /// Re-enters the nearest enclosing `loop*` or `fn*` with the
-    /// given arguments. Must be in tail
-    /// position; arity must match the target's binding count.
-    /// Lowers to a parallel-assignment move (via temp slots)
-    /// into the target's binding slots + `jump:jmp` to the
-    /// target's entry label. NO call opcode is emitted (per
-    /// VM.md §11 — recur is not a call).
+    /// `(recur args...)`: rebind the nearest `loop*` or `fn*`'s
+    /// bindings and jump to its entry; valid only in tail position
+    /// (COMPILER.md §5.6).
     recur: struct {
         args: []const *const Tiny,
     },
-    /// `(def name value?)` per PLAN §6.1.
-    /// Interns a Var in the namespace (or finds the existing
-    /// one), sets its root + bound, returns the Var object
-    /// (Clojure semantics: `(def x 5)` evaluates to `#'x`, not
-    /// to 5). If `value` is null, the Var is "declared" — root
-    /// unchanged; only the intern happens (matches Clojure's
-    /// arity-1 `def`, used for forward declarations).
-    ///
-    /// Compile-time requirement: a Namespace must be passed to
-    /// `compileTiny` for `def` to compile. Without one, this
-    /// raises `UnresolvedSymbol` (no namespace to put the Var
-    /// in). Tests that exercise `def` build a Namespace and
-    /// pass it explicitly.
+    /// `(def name value?)`: intern `name` in the current namespace
+    /// and, with a value, bind it; either way the result is the Var.
     def: struct {
         name: []const u8,
         value: ?*const Tiny = null,
     },
-    /// `(var name)` or `(var ns/name)` per PLAN §6.1. Loads the
-    /// Var object itself (not its value) — Clojure's `#'name`
-    /// reader form. Does NOT trap on unbound; taking a
-    /// reference to a declared-but-unbound Var is legal.
+    /// `(var name)` or `(var ns/name)`: the Var itself, bound or not.
     var_ref: struct {
         ns: ?[]const u8 = null,
         name: []const u8,
     },
-    /// `(letfn* [(name1 params1 body1) (name2 params2 body2) ...] body)`
-    /// per PLAN §6.1 + COMPILER.md §5.6b.
-    /// Mutually-recursive function bindings: each fn body can
-    /// reference any other letfn* binding, including itself.
-    /// Implementation uses placeholder cells (one per binding),
-    /// constructed BEFORE any closure is built so each closure
-    /// can capture the others' cells; the cells are then
-    /// initialized with the constructed closure values.
+    /// `(letfn* [(name [params] body...) ...] body)`: every name is
+    /// visible to every function and the body (COMPILER.md §5.6b).
     letfn_star: struct {
         bindings: []const FnBinding,
         body: *const Tiny,
@@ -323,7 +246,8 @@ pub const PrimOp = enum {
 /// The core fns inlined as a `Tiny.prim`, at the one arity each
 /// inlines at; `inc` and `dec` are `+` and `-` with a constant 1.
 /// Every other arity is an ordinary call.
-const inlined_ops = [_]struct { name: []const u8, argc: usize, op: PrimOp, one: bool = false }{
+const Inlined = struct { name: []const u8, argc: usize, op: PrimOp, one: bool = false };
+const inlined_ops = [_]Inlined{
     .{ .name = "+", .argc = 2, .op = .add },
     .{ .name = "-", .argc = 2, .op = .sub },
     .{ .name = "*", .argc = 2, .op = .mul },
@@ -443,9 +367,9 @@ pub const RecurTarget = struct {
 // =============================================================================
 
 pub const CompileError = error{
-    /// Compiler encountered a `Tiny` variant it doesn't know how to
-    /// lower. No `Tiny` variant raises it; `compileExpr` handles
-    /// every variant.
+    /// `eval` was given a value that is not a form, such as a list
+    /// holding a function (MACROEXPAND.md §1.2); the compiler itself
+    /// never raises it.
     UnsupportedForm,
 
     /// A hand-built `Tiny.int` outside the i48 fixnum range. Form
@@ -581,12 +505,9 @@ pub const CompileError = error{
 /// `vm.Routine` ready for `vm.VM.init`. `capture_descs` supports
 /// `closure:make` lowering and `fixed_arity` call-site validation.
 ///
-/// **Ownership**: `code` and `consts` are slices allocated through
-/// the allocator passed to `compileTiny()` and remain valid until
-/// that allocator is reset or destroyed. There is no `deinit`
-/// method — the model is "compile-time arena, drop wholesale after
-/// execution." Callers using a non-arena allocator must free
-/// `code` and `consts` individually.
+/// **Ownership**: the slices live on the routine allocator
+/// (`CompileOptions.routine_allocator`, else the compile allocator)
+/// until it is reset or destroyed; there is no `deinit`.
 pub const Compiled = struct {
     code: []const Inst,
     consts: []const vm.Const,
@@ -602,8 +523,8 @@ pub const Compiled = struct {
     /// True for `(fn* [a b & r] ...)`. The VM packs
     /// excess args into a list at call time.
     variadic: bool = false,
-    /// PC → source span table (VM.md §5); empty when the form was
-    /// lowered without a `SpanMap`.
+    /// PC → source span table (VM.md §5); empty for a hand-built
+    /// tree.
     spans: []const vm.SpanEntry = &.{},
     /// The span of the form this routine was lowered from.
     origin: ?vm.SourceSpan = null,
@@ -656,8 +577,8 @@ fn toSourceSpan(span: reader_mod.SrcSpan) vm.SourceSpan {
 /// **Slot allocation**: a stack (`slot_top`); `compileExpr` frees
 /// what a node allocated once the node is compiled.
 ///
-/// **Constant pool**: simple append; constants are not
-/// deduplicated (COMPILER.md §4.5).
+/// **Constant pool**: one entry per identical Value (COMPILER.md
+/// §4.5).
 ///
 /// **Lexical scope**: a stack of `LocalBinding{name, ref}` pairs.
 /// Resolution walks innermost-first (newest entries shadow older).
@@ -1338,13 +1259,9 @@ fn namesCore(ctx: LowerCtx, name: []const u8) bool {
 }
 
 /// Translate a `reader.Form` into a `Tiny` node on `allocator`,
-/// with the lexical environment threaded through `ctx`. Symbol
-/// names are borrowed from the reader's source, which must outlive
-/// the compiled routine. The env is consulted only when classifying list-head
-/// symbols as intrinsics vs ordinary calls. Recursion into
-/// sub-expressions passes the env through unchanged; binding
-/// forms (let*, fn*, loop*, letfn*) construct a child env that
-/// adds their bindings.
+/// with the lexical environment threaded through `ctx`; binding
+/// forms extend it for their bodies. Symbol names are borrowed from
+/// the reader's source, which must outlive the compiled routine.
 fn lowerForm(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
@@ -1492,14 +1409,14 @@ fn lowerList(
         if (std.mem.eql(u8, name, "try")) return try lowerTry(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "throw")) return try lowerThrow(allocator, items[1..], ctx);
         // -- Inlineable core fns (shadowable) --
-        if (try lowerPrim(allocator, name, items[1..], ctx)) |t| {
-            if (namesCore(ctx, name)) return t;
+        if (inlinedOp(name, items.len - 1)) |in| {
+            if (namesCore(ctx, name)) return try lowerPrim(allocator, in, items[1..], ctx);
         }
     } else if (items[0].datum == .symbol and std.mem.eql(u8, items[0].datum.symbol.ns.?, "nexis.core")) {
         // A qualified head is never a lexical local, so `nexis.core/+`
         // inlines unconditionally. Host macros emit these
         // (MACROEXPAND.md §5).
-        if (try lowerPrim(allocator, items[0].datum.symbol.name, items[1..], ctx)) |t| return t;
+        if (inlinedOp(items[0].datum.symbol.name, items.len - 1)) |in| return try lowerPrim(allocator, in, items[1..], ctx);
     }
     // Ordinary call: lower head as callee, rest as args.
     return try lowerCall(allocator, items, ctx);
@@ -1716,19 +1633,21 @@ fn lowerBigInt(allocator: std.mem.Allocator, text: []const u8, ctx: LowerCtx) Co
     return allocTiny(allocator, .{ .literal = v });
 }
 
-/// `(name args...)` as a `Tiny.prim` when `name` is an inlined core
-/// fn at this arity, else null. The caller decides whether the name
-/// means the core fn; lowering the operands first is harmless, as
-/// an ordinary call lowers them the same way.
+/// The inlined core fn `name` is at `argc` arguments, if any.
+fn inlinedOp(name: []const u8, argc: usize) ?Inlined {
+    for (inlined_ops) |in| {
+        if (in.argc == argc and std.mem.eql(u8, in.name, name)) return in;
+    }
+    return null;
+}
+
+/// A call of the inlined core fn `in` as a `Tiny.prim`.
 fn lowerPrim(
     allocator: std.mem.Allocator,
-    name: []const u8,
+    in: Inlined,
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
-) CompileError!?*Tiny {
-    const in = for (inlined_ops) |in| {
-        if (in.argc == args.len and std.mem.eql(u8, in.name, name)) break in;
-    } else return null;
+) CompileError!*Tiny {
     const lhs = try lowerForm(allocator, args[0], ctx);
     const rhs: ?*const Tiny = if (in.one)
         try allocTiny(allocator, .{ .int = 1 })

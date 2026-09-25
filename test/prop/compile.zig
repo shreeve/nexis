@@ -536,6 +536,15 @@ test "inlining: an operator inlines only when it names nexis.core's Var" {
     , "[:mine :mine]");
     // A definition in the same form counts from its own definition on.
     try harness.expectCheckedOutput("(do (def + (fn* [a b] 42)) (+ 1 2))", "42");
+    // A call that does not inline lowers its operands once: nesting
+    // 40 deep would take 2^40 lowerings otherwise.
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "(ns foo) (defn + [a b] (nexis.core/+ a b)) ");
+    for (0..40) |_| try src.appendSlice(testing.allocator, "(+ 1 ");
+    try src.appendSlice(testing.allocator, "0");
+    for (0..40) |_| try src.appendSlice(testing.allocator, ")");
+    try harness.expectOutput(src.items, "40");
     // Every other namespace still gets core's.
     try harness.expectOutput(
         \\(ns foo)
