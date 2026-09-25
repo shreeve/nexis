@@ -53,6 +53,11 @@ pub const LoadError = error{
 /// describes the failure, the rest as for `LoadError`.
 pub const EvalError = error{ Diagnosed, RunFailed, ControlTransferred, OutOfMemory };
 
+/// A UTF-8 byte-order mark. A source file that opens with one is read
+/// without it, so its positions count from the character after it
+/// (TOOLING.md §1).
+pub const byte_order_mark = "\xEF\xBB\xBF";
+
 /// A failure to read or compile, and where it happened.
 pub const Diagnostic = struct {
     /// The source and the span in it the failure is at; null when
@@ -183,6 +188,8 @@ pub const Loader = struct {
             const pos: u32 = @intCast(@min(parser.current.pos, text.len));
             if (pos >= text.len) {
                 try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unexpected end of input", .{});
+            } else if (unterminatedString(text[pos..])) {
+                try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unterminated string", .{});
             } else {
                 const len: u32 = @max(parser.current.len, 1);
                 try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = len }, .label = "", .reading = true }, "parse error: unexpected `{s}`", .{text[pos..@min(text.len, pos + len)]});
@@ -254,6 +261,20 @@ pub const Loader = struct {
         return last;
     }
 
+    /// Whether `rest` opens a string literal that no unescaped `"`
+    /// closes: the parser stops at the opening quote, and more input
+    /// may complete it.
+    fn unterminatedString(rest: []const u8) bool {
+        if (rest.len == 0 or rest[0] != '"') return false;
+        var i: usize = 1;
+        while (i < rest.len) : (i += 1) switch (rest[i]) {
+            '\\' => i += 1,
+            '"' => return false,
+            else => {},
+        };
+        return true;
+    }
+
     fn mapCallbackError(err: anyerror) EvalError {
         return if (err == error.OutOfMemory) error.OutOfMemory else error.RunFailed;
     }
@@ -313,10 +334,11 @@ pub const Loader = struct {
         // The text and the path outlive the load: every routine
         // compiled from the file points at them for its error
         // reports (TOOLING.md §1).
-        const source = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.persistent_allocator, .unlimited) catch |err| {
+        const file = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.persistent_allocator, .unlimited) catch |err| {
             try self.diagnose(.{ .label = "" }, "require: cannot read {s}: {s}", .{ path, @errorName(err) });
             return LoadError.LoadFailed;
         };
+        const source = if (std.mem.startsWith(u8, file, byte_order_mark)) file[byte_order_mark.len..] else file;
         const info = try self.persistent_allocator.create(vm_mod.SourceInfo);
         info.* = .{ .path = try self.persistent_allocator.dupe(u8, path), .text = source };
 
@@ -390,9 +412,10 @@ fn searchLoadPaths(allocator: std.mem.Allocator, io: std.Io, load_paths: []const
 }
 
 /// Whether `source`'s first form is `(ns NAME ...)` with NAME the
-/// requested namespace: a file that declares another name, or none,
-/// is refused before any of it runs. Only the head and the name are
-/// looked at; the rest of the form is the expander's.
+/// requested namespace, `^meta` before it allowed: a file that
+/// declares another name, or none, is refused before any of it runs.
+/// Only the head and the name are looked at; the rest of the form is
+/// the expander's.
 fn startsWithNs(source: []const u8, ns_name: []const u8) bool {
     var i: usize = 0;
     while (i < source.len) {
@@ -406,14 +429,44 @@ fn startsWithNs(source: []const u8, ns_name: []const u8) bool {
     }
     const rest = source[i..];
     if (!std.mem.startsWith(u8, rest, "(ns")) return false;
-    const after = std.mem.trimStart(u8, rest[3..], " \t\r\n,");
+    var after = std.mem.trimStart(u8, rest[3..], " \t\r\n,");
     if (after.len == rest.len - 3) return false;
+    while (after.len > 0 and after[0] == '^') {
+        after = std.mem.trimStart(u8, after[metaLen(after)..], " \t\r\n,");
+    }
     if (!std.mem.startsWith(u8, after, ns_name)) return false;
     if (after.len == ns_name.len) return false;
     return switch (after[ns_name.len]) {
         ' ', '\t', '\r', '\n', ',', ')', '"', '(', '^', '{' => true,
         else => false,
     };
+}
+
+/// The length of the `^meta` that opens `text`: a map to its closing
+/// brace (braces in strings and char literals aside), else a keyword
+/// or symbol token; all of `text` when the map is not closed.
+fn metaLen(text: []const u8) usize {
+    var i: usize = 1;
+    if (i < text.len and text[i] == '{') {
+        var depth: usize = 0;
+        var in_string = false;
+        while (i < text.len) : (i += 1) switch (text[i]) {
+            '\\' => i += 1,
+            '"' => in_string = !in_string,
+            '{' => depth += @intFromBool(!in_string),
+            '}' => if (!in_string) {
+                depth -= 1;
+                if (depth == 0) return i + 1;
+            },
+            else => {},
+        };
+        return text.len;
+    }
+    while (i < text.len) : (i += 1) switch (text[i]) {
+        ' ', '\t', '\r', '\n', ',', ')', '(', '"' => break,
+        else => {},
+    };
+    return i;
 }
 
 // =============================================================================
@@ -444,4 +497,9 @@ test "loader: a file must open with (ns NAME ...)" {
     try testing.expect(!startsWithNs("(nsx app.a)", "app.a"));
     try testing.expect(!startsWithNs("(def x 1)", "app.a"));
     try testing.expect(!startsWithNs("", "app.a"));
+    // Metadata on the name, as Clojure allows it.
+    try testing.expect(startsWithNs("(ns ^:no-doc app.a)", "app.a"));
+    try testing.expect(startsWithNs("(ns ^:no-doc ^{:doc \"a {b} \\\" }\" :k \\}}\n  app.a (:require [b]))", "app.a"));
+    try testing.expect(!startsWithNs("(ns ^:no-doc app.ab)", "app.a"));
+    try testing.expect(!startsWithNs("(ns ^{:doc \"x\"", "app.a"));
 }

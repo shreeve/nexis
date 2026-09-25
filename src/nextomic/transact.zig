@@ -437,9 +437,10 @@ const Ctx = struct {
         if (!conn.is_open) return error.Closed;
         if (conn.speculative != null or conn.overlay != null) return error.Nested;
         const sync_mode = options.sync orelse conn.sync_mode;
-        // The engine has one writer: a transaction function that
+        // The file has one writer: a transaction function that
         // transacts on its own connection, or on another connection to
-        // the same file, meets the write transaction it runs inside.
+        // the same file, and a `transact!` inside a `db/*` write to the
+        // file, meet the write transaction already open.
         const txn = conn.beginWriteTxn(sync_mode) catch |err| switch (err) {
             error.WriterActive => return error.Nested,
             else => return err,

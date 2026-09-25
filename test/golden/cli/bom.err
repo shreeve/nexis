@@ -1,0 +1,3 @@
+nexis: test/golden/cli/bom.nx:1:2: UnresolvedSymbol
+    (nope)
+     ^^^^

@@ -84,6 +84,7 @@ foo, ns/foo, set!, ->>               ;; symbol
 | `"one⏎two"` | a string may span lines; the newline is part of it |
 | `"a\qb"`, `"\u{D800}"`, `"\u0041"` | `:invalid-string-escape`, detail the escape |
 | `λ`, `ns.é/π`, `:ключ` | a symbol or keyword may hold any non-ASCII UTF-8 character |
+| a UTF-8 byte-order mark (U+FEFF) | skipped when it starts the source, as whitespace; anywhere else a symbol constituent, as in Clojure |
 | a string, symbol or keyword that is not UTF-8 | `:invalid-utf8` |
 | `\é`, `\☃`, `\(` | one character, any UTF-8 sequence or delimiter |
 | `\u0041`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | `:invalid-char-literal`, detail the token (`\u{HEX}` is the one escape, PLAN §23 #26) |

@@ -1,5 +1,5 @@
-nexis: test/golden/cli/uncaught-throw.nx:6:5: runtime error: UncaughtThrow {:error :negative, :value -3}
-        (throw {:error :negative :value x})))
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  at check (test/golden/cli/uncaught-throw.nx:6:5)
-  at <top> (test/golden/cli/uncaught-throw.nx:8:1)
+nexis: test/golden/cli/uncaught-throw.nx:7:5: runtime error: UncaughtThrow {:error :negative, :value -3}
+        (throw {:error :negative
+        ^^^^^^^^^^^^^^^^^^^^^^^^
+  at check (test/golden/cli/uncaught-throw.nx:7:5)
+  at <top> (test/golden/cli/uncaught-throw.nx:10:1)

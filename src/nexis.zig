@@ -75,8 +75,11 @@ pub const Lexer = struct {
     pub fn next(self: *Lexer) Token {
         const src = self.base.source;
 
-        // Skip whitespace (spaces, tabs, CR, LF, commas) and line comments.
+        // Skip whitespace (spaces, tabs, CR, LF, commas) and line
+        // comments, and a UTF-8 byte-order mark that starts the source,
+        // which some editors write.
         const ws_start: u32 = self.base.pos;
+        if (self.base.pos == 0 and std.mem.startsWith(u8, src, "\xEF\xBB\xBF")) self.base.pos = 3;
         while (true) {
             while (self.base.pos < src.len) : (self.base.pos += 1) {
                 switch (src[self.base.pos]) {

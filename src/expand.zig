@@ -277,6 +277,10 @@ fn findMacro(ctx: *ExpandContext, env: ?*const ExpandEnv, items: []const *Form) 
     if (env) |e| if (e.contains(head.name)) return null;
     if (ctx.namespace) |ns| if (ns.lookup(head.name)) |v| {
         if (v.macro and v.bound) return .{ .user = v };
+        // A Var of the name other than `nexis.core`'s (the
+        // namespace's own, excluded or defined, or a referred one)
+        // hides the host macro, as it hides a core function.
+        if (ctx.registry) |reg| if (reg.core.lookupLocal(head.name) != v) return null;
     };
     if (ctx.host_macros.get(head.name)) |f| return .{ .host = f };
     return null;
@@ -869,10 +873,13 @@ const Walk = struct {
 /// current namespace to NAME at expansion time, creating it (with
 /// `nexis.core` referred) if needed, then runs each
 /// `(:require spec*)` clause as `require` runs its specs, in the new
-/// namespace. `(:refer-clojure ...)` and `(:gen-class ...)` are
-/// accepted and do nothing (nexis.core is always referred; there is
-/// no class to generate). The docstring and attribute map are
-/// accepted and not kept. The form is replaced by nil.
+/// namespace. `(:refer-clojure :exclude [names])` interns each name
+/// that `nexis.core` or the host macro table holds as an unbound Var
+/// of the namespace, so the name is the namespace's own from then
+/// on; `:only` and `:rename` are refused. `(:gen-class ...)` is
+/// accepted and does nothing (there is no class to generate). The
+/// docstring and attribute map are accepted and not kept. The form
+/// is replaced by nil.
 fn expandNs(ctx: *ExpandContext, _: ?*const ExpandEnv, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     const origin = list_form.origin;
     if (items.len < 2) return ctx.fail(origin, "ns: expected a namespace name", .{});
@@ -889,11 +896,36 @@ fn expandNs(ctx: *ExpandContext, _: ?*const ExpandEnv, list_form: *const Form, i
         const kind = clause_items[0].datum.keyword.name;
         if (std.mem.eql(u8, kind, "require")) {
             for (clause_items[1..]) |spec| try requireSpec(ctx, spec);
-        } else if (!std.mem.eql(u8, kind, "refer-clojure") and !std.mem.eql(u8, kind, "gen-class")) {
+        } else if (std.mem.eql(u8, kind, "refer-clojure")) {
+            try referClojure(ctx, reg, clause_items[1..]);
+        } else if (!std.mem.eql(u8, kind, "gen-class")) {
             return ctx.fail(clause.origin, "ns: (:{s} ...) is not supported", .{kind});
         }
     }
     return try makeNil(ctx, origin);
+}
+
+/// The options of `(:refer-clojure ...)`: `:exclude [names]` makes
+/// each name the current namespace's own (an unbound Var until the
+/// namespace defines it), so it neither resolves to nor inlines nor
+/// expands as `nexis.core`'s; `nexis.core/name` still reaches it.
+fn referClojure(ctx: *ExpandContext, reg: *vm_mod.NamespaceRegistry, opts: []const *Form) ExpandError!void {
+    if (opts.len % 2 != 0) return ctx.fail(opts[opts.len - 1].origin, "ns: :refer-clojure options come in pairs", .{});
+    var i: usize = 0;
+    while (i < opts.len) : (i += 2) {
+        const key = opts[i];
+        const k = if (key.datum == .keyword and key.datum.keyword.ns == null) key.datum.keyword.name else "";
+        if (k.len == 0) return ctx.fail(key.origin, "ns: expected a :refer-clojure option, not {s}", .{describeForm(key)});
+        if (!std.mem.eql(u8, k, "exclude")) return ctx.fail(key.origin, "ns: (:refer-clojure :{s} ...) is not supported; :exclude is", .{k});
+        const names = opts[i + 1];
+        if (names.datum != .vector) return ctx.fail(names.origin, "ns: :exclude takes a vector of symbols, not {s}", .{describeForm(names)});
+        for (names.datum.vector) |name_form| {
+            const name = try plainName(ctx, name_form, "ns: an excluded name");
+            if (reg.core.lookupLocal(name) == null and ctx.host_macros.get(name) == null) continue;
+            if (reg.current.lookupLocal(name) != null) continue;
+            _ = reg.current.intern(name) catch return ExpandError.OutOfMemory;
+        }
+    }
 }
 
 /// `(require spec*)` loads and refers at expansion time, through
@@ -1070,7 +1102,7 @@ fn expandDefmacro(
     items: []const *Form,
 ) ExpandError!*Form {
     const origin = list_form.origin;
-    const parts = try defnParts(ctx, list_form, items[1..]);
+    const parts = try defnParts(ctx, list_form, items[1..], false);
     const name = parts.name.datum.symbol.name;
     const ceval = ctx.compile_eval orelse return ctx.fail(origin, "defmacro {s}: macros cannot be defined here", .{name});
     const b = Builder{ .ctx = ctx, .origin = origin };
@@ -1192,7 +1224,7 @@ pub fn formToValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod
             } catch return oom;
         },
         .quote => |inner| try callForm(ctx, "quote", inner),
-        .deref => |inner| try callForm(ctx, "deref", inner),
+        .deref => |inner| try callForm(ctx, "nexis.core/deref", inner),
         .anon_fn => |items| try formToValue(ctx, try anonFnForm(ctx, form, items)),
         .with_meta => |wm| try formToValue(ctx, wm.target),
         .syntax_quote, .unquote, .unquote_splicing => ctx.fail(form.origin, "{s} is not data a macro can take", .{describeForm(form)}),
@@ -1226,7 +1258,8 @@ fn mapOf(heap: *heap_mod.Heap, kvs: []const value_mod.Value) !value_mod.Value {
 /// A macro's result as a form, every form at `origin` (the call's
 /// span) in `ctx.allocator`: the inverse of `formToValue`, a bignum
 /// within i64 an `int` and beyond it a `bigint`. The list
-/// `(nexis.internal/#%meta x m)` becomes `^m x` (§5). A function, a
+/// `(nexis.internal/#%meta x m)` becomes `^m x`, and so does a list,
+/// vector, map or set carrying the metadata `m` (§5). A function, a
 /// Var or any other kind is not a form.
 pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) ExpandError!*Form {
     try checkStack();
@@ -1272,7 +1305,16 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) Exp
         },
         else => return ctx.fail(origin, "a macro returned a {s}, which is not a form", .{@tagName(v.kind())}),
     };
-    return makeForm(ctx, datum, origin);
+    const form = try makeForm(ctx, datum, origin);
+    const carries_meta = switch (v.kind()) {
+        .list, .persistent_vector, .persistent_map, .persistent_set => datum != .with_meta,
+        else => false,
+    };
+    if (carries_meta) if (heap_mod.Heap.asHeapHeader(v).getMeta()) |m| {
+        const meta = try valueToForm(ctx, champ_mod.valueFromMapHeader(m), origin);
+        return makeForm(ctx, .{ .with_meta = .{ .target = form, .meta = meta } }, origin);
+    };
+    return form;
 }
 
 /// An interned `ns/name` text as a qualified name.
@@ -1480,7 +1522,7 @@ fn expandFnRename(ctx: *ExpandContext, call_form: *const Form, args: []const *Fo
     const new_params = try makeVector(ctx, params, params_form.origin);
     const body = try conditionedBody(b, tail[1..]);
     if (patterns.items.len == 0) return b.list(.{ "fn*", name, new_params, body });
-    return b.list(.{ "fn*", name, new_params, try b.list(.{ "let", try b.vec(.{patterns.items}), body }) });
+    return b.list(.{ "fn*", name, new_params, try b.list(.{ "nexis.core/let", try b.vec(.{patterns.items}), body }) });
 }
 
 /// A fn body whose first form is a condition map `{:pre [c...]
@@ -1547,7 +1589,7 @@ fn expandLoopRename(ctx: *ExpandContext, call_form: *const Form, args: []const *
     }
     // `loop*` drops the hints of hinted names.
     if (patterns.items.len == 0) return renameHead(ctx, call_form, args, "loop*");
-    return b.list(.{ "loop*", try b.vec(.{loop_bindings}), try b.list(.{ "let", try b.vec(.{patterns.items}), args[1..] }) });
+    return b.list(.{ "loop*", try b.vec(.{loop_bindings}), try b.list(.{ "nexis.core/let", try b.vec(.{patterns.items}), args[1..] }) });
 }
 
 /// `(NEW_HEAD args...)`, the args expanded later by the walker for
@@ -1625,9 +1667,9 @@ fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandE
             try b.list(.{ "nexis.core/=", n, a.fixed });
         // `loop`, not `loop*`, so a pattern parameter destructures
         // on entry and after every `recur`.
-        chain = try b.list(.{ "if", test_form, try b.list(.{ "loop", try b.vec(.{bindings.items}), try conditionedBody(b, a.body) }), chain });
+        chain = try b.list(.{ "if", test_form, try b.list(.{ "nexis.core/loop", try b.vec(.{bindings.items}), try conditionedBody(b, a.body) }), chain });
     }
-    return b.list(.{ "fn", name, try b.vec(.{ "&", args }), try b.list(.{ "let*", try b.vec(.{ n, try b.list(.{ "nexis.core/count", args }) }), chain }) });
+    return b.list(.{ "nexis.core/fn", name, try b.vec(.{ "&", args }), try b.list(.{ "let*", try b.vec(.{ n, try b.list(.{ "nexis.core/count", args }) }), chain }) });
 }
 
 /// Append the plain bindings that destructure `pattern` over `expr`
@@ -1782,35 +1824,42 @@ fn lookupDefault(defaults: []const *Form, name: []const u8) ?*const Form {
 /// `(defn name ...)` → `(def name (fn name ...))`, so params
 /// destructure and overload clauses work as for `fn`, wrapped by
 /// `withVarMeta` when the definition carries metadata.
-fn expandDefnMacro(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    const parts = try defnParts(ctx, call_form, args);
+fn expandDefnMacro(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    return defnForm(ctx, call_form, args, false);
+}
+
+/// `(defn- name ...)`: `defn` with `:private true` on the Var.
+fn expandDefnPrivate(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    return defnForm(ctx, call_form, args, true);
+}
+
+fn defnForm(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, private: bool) ExpandError!*Form {
+    const parts = try defnParts(ctx, call_form, args, private);
     const origin = call_form.origin;
     const b = Builder{ .ctx = ctx, .origin = origin };
-    const def_form = try b.list(.{ "def", parts.name, try b.list(.{ "fn", parts.name, parts.fn_tail }) });
+    const def_form = try b.list(.{ "def", parts.name, try b.list(.{ "nexis.core/fn", parts.name, parts.fn_tail }) });
     return try withVarMeta(ctx, def_form, parts.meta, origin);
 }
 
 /// The parts of `(defn NAME "doc"? {attrs}? tail)` and of `defmacro`
 /// spelled the same way: the name, the fn tail (a parameter vector
 /// and body, or overload clauses) and the Var metadata, from `^meta`
-/// on the name, the docstring and the attribute map, with
-/// `:arglists` (quoted) added when there is any.
+/// on the name, `:private true` when `private` (`defn-`), the
+/// docstring and the attribute map, with `:arglists` (quoted) added
+/// when there is any.
 const DefnParts = struct {
     name: *const Form,
     fn_tail: []const *Form,
     meta: []const *Form,
 };
 
-fn defnParts(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!DefnParts {
+fn defnParts(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, private: bool) ExpandError!DefnParts {
     const what = call_form.datum.list[0].datum.symbol.name;
     const origin = call_form.origin;
     if (args.len < 2) return ctx.fail(origin, "{s}: expected a name and a parameter vector", .{what});
     const named = try splitMetaName(ctx, args[0]);
     var meta: std.ArrayList(*Form) = .empty;
+    if (private) try meta.appendSlice(ctx.allocator, &.{ try makeKeyword(ctx, "private", origin), try makeBool(ctx, true, origin) });
     if (named.meta) |m| try meta.appendSlice(ctx.allocator, m);
     var rest: usize = 1;
     if (rest < args.len and args[rest].datum == .string) {
@@ -1912,6 +1961,16 @@ fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
     const b = Builder{ .ctx = ctx, .origin = call_form.origin };
     const g = try b.gensym("case");
     const clauses = args[1..];
+    var keys: std.ArrayList(*const Form) = .empty;
+    var k: usize = 0;
+    while (k + 1 < clauses.len) : (k += 2) {
+        const key = clauses[k];
+        const alternatives: []const *Form = if (key.datum == .list) key.datum.list else &.{key};
+        for (alternatives) |alt| {
+            for (keys.items) |seen| if (try sameConstant(seen, alt)) return ctx.fail(alt.origin, "case: duplicate test constant", .{});
+            try keys.append(ctx.allocator, alt);
+        }
+    }
     var chain = if (clauses.len % 2 == 1) mutCast(clauses[clauses.len - 1]) else try noMatchThrow(b, g);
     var i = clauses.len / 2;
     while (i > 0) {
@@ -1919,6 +1978,25 @@ fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
         chain = try b.list(.{ "if", try caseTest(b, g, clauses[2 * i]), clauses[2 * i + 1], chain });
     }
     return b.list(.{ "let*", try b.vec(.{ g, args[0] }), chain });
+}
+
+/// Whether the `case` constants `a` and `b` are one datum: the same
+/// literal atom, or collections of one kind whose items are, in order.
+fn sameConstant(a: *const Form, b: *const Form) ExpandError!bool {
+    try checkStack();
+    switch (a.datum) {
+        .list, .vector, .map, .set => |items| {
+            if (std.meta.activeTag(a.datum) != std.meta.activeTag(b.datum)) return false;
+            const other = switch (b.datum) {
+                .list, .vector, .map, .set => |x| x,
+                else => unreachable,
+            };
+            if (items.len != other.len) return false;
+            for (items, other) |x, y| if (!try sameConstant(x, y)) return false;
+            return true;
+        },
+        else => return reader_mod.formLiteralEq(a, b),
+    }
 }
 
 /// The test for one `case` key: `(= g 'k)`, or for a group of
@@ -2033,7 +2111,7 @@ fn forLevel(b: Builder, bindings: []const *Form, outer_acc: *Form, body: *const 
         const value = bindings[m + 1];
         if (key.ns != null) return b.ctx.fail(bindings[m].origin, "for: unknown modifier :{s}/{s}", .{ key.ns.?, key.name });
         inner = if (std.mem.eql(u8, key.name, "let"))
-            try b.list(.{ "let", value, inner })
+            try b.list(.{ "nexis.core/let", value, inner })
         else if (std.mem.eql(u8, key.name, "when"))
             try b.list(.{ "if", value, inner, try b.list(.{ "recur", next_s, acc }) })
         else if (std.mem.eql(u8, key.name, "while"))
@@ -2041,7 +2119,7 @@ fn forLevel(b: Builder, bindings: []const *Form, outer_acc: *Form, body: *const 
         else
             return b.ctx.fail(bindings[m].origin, "for: unknown modifier :{s}", .{key.name});
     }
-    const with_elem = try b.list(.{ "let", try b.vec(.{ bindings[0], try b.list(.{ "nexis.core/first", s }) }), inner });
+    const with_elem = try b.list(.{ "nexis.core/let", try b.vec(.{ bindings[0], try b.list(.{ "nexis.core/first", s }) }), inner });
     return b.list(.{
         "loop*",
         try b.vec(.{ s, try b.list(.{ "nexis.core/seq", bindings[1] }), acc, outer_acc }),
@@ -2133,10 +2211,10 @@ fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *F
     try out.appendSlice(ctx.allocator, &.{
         try b.item("do"),
         try b.list(.{ "def", type_id, try b.list(.{ "nexis.internal/#%register-record-type", try qualifiedNameString(b, rec_name), try b.vec(.{keys}) }) }),
-        try b.list(.{ "defn", names.ctor, try b.vec(.{fields}), try b.list(.{ "nexis.internal/#%make-record", type_id, field_map }) }),
-        try b.list(.{ "defn", names.map_ctor, try b.vec(.{"m"}), try b.list(.{ "nexis.internal/#%make-record", type_id, "m" }) }),
-        try b.list(.{ "defn", names.pred, try b.vec(.{"x"}), try b.list(.{
-            "and",
+        try b.list(.{ "nexis.core/defn", names.ctor, try b.vec(.{fields}), try b.list(.{ "nexis.internal/#%make-record", type_id, field_map }) }),
+        try b.list(.{ "nexis.core/defn", names.map_ctor, try b.vec(.{"m"}), try b.list(.{ "nexis.internal/#%make-record", type_id, "m" }) }),
+        try b.list(.{ "nexis.core/defn", names.pred, try b.vec(.{"x"}), try b.list(.{
+            "nexis.core/and",
             try b.list(.{ "nexis.internal/#%record?", "x" }),
             try b.list(.{ "nexis.core/=", type_id, try b.list(.{ "nexis.internal/#%record-type-id", "x" }) }),
         }) }),
@@ -2145,23 +2223,24 @@ fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *F
     return makeList(ctx, out.items, b.origin);
 }
 
-/// An inline `defrecord` method `(fn [this p...] body...)` with the
-/// record's fields in scope, as in Clojure: `(fn [g p...] (let* [f
-/// (nexis.core/get g :f) ...] (let [this g] body...)))`. A field
-/// named anywhere in the parameters is left out, so a parameter
-/// shadows it; a field assoc'd onto the record is what the method
-/// sees.
-fn recordMethod(b: Builder, fields: []const *Form, method: []const *Form) ExpandError!*Form {
-    const params = (try stripParams(b.ctx, method[1])).datum.vector;
-    if (params.len == 0) return b.ctx.fail(method[1].origin, "a record method takes the record as its first parameter", .{});
+/// One arity `([this p...] body...)` of an inline `defrecord` method
+/// with the record's fields in scope, as in Clojure: `([g p...]
+/// (let* [f (nexis.core/get g :f) ...] (let [this g] body...)))`. A
+/// field named anywhere in the parameters is left out, so a
+/// parameter shadows it; a field assoc'd onto the record is what the
+/// method sees.
+fn recordArity(b: Builder, fields: []const *Form, arity: *const Form) ExpandError!*Form {
+    const items = arity.datum.list;
+    const params = (try stripParams(b.ctx, items[0])).datum.vector;
+    if (params.len == 0) return b.ctx.fail(items[0].origin, "a record method takes the record as its first parameter", .{});
     const g = try b.gensym("this");
     var bindings: std.ArrayList(*Form) = .empty;
     for (fields) |field| {
-        if (try namesSymbol(method[1], field.datum.symbol.name)) continue;
+        if (try namesSymbol(items[0], field.datum.symbol.name)) continue;
         try bindings.appendSlice(b.ctx.allocator, &.{ field, try b.list(.{ "nexis.core/get", g, try b.kw(field.datum.symbol.name) }) });
     }
-    const body = try b.list(.{ "let", try b.vec(.{ params[0], g }), method[2..] });
-    return b.list(.{ "fn", try b.vec(.{ g, params[1..] }), try b.list(.{ "let*", try b.vec(.{bindings.items}), body }) });
+    const body = try b.list(.{ "nexis.core/let", try b.vec(.{ params[0], g }), items[1..] });
+    return b.list(.{ try b.vec(.{ g, params[1..] }), try b.list(.{ "let*", try b.vec(.{bindings.items}), body }) });
 }
 
 /// Whether the symbol `name` appears anywhere in `form`.
@@ -2230,28 +2309,79 @@ fn extendForm(ctx: *ExpandContext, call_form: *const Form, clauses: []const *For
     return makeList(ctx, out.items, b.origin);
 }
 
-/// One extend call per method clause in `clauses` onto `out`; a
-/// symbol or keyword clause switches the protocol (or, for
-/// `extend-protocol`, the type) the following methods belong to.
+/// One extend call per method in `clauses` onto `out`; a symbol or
+/// keyword clause switches the protocol (or, for `extend-protocol`,
+/// the type) the following methods belong to. A method's arities are
+/// every clause of its name under that header, each `(name [params]
+/// body...)` or `(name ([params] body...) ...)`, and its impl one
+/// `fn` over them all, so the call's argument count picks the arity.
 fn extendClauses(b: Builder, clauses: []const *Form, anchor: ExtendAnchor, out: *std.ArrayList(*Form)) ExpandError!void {
     var current: ?*const Form = null;
-    for (clauses) |clause| {
-        if (clause.datum == .symbol or (clause.datum == .keyword and anchor == .protocol)) {
+    var start: usize = 0;
+    while (start < clauses.len) {
+        const clause = clauses[start];
+        if (isExtendHeader(clause, anchor)) {
             current = clause;
+            start += 1;
             continue;
         }
-        if (clause.datum != .list or clause.datum.list.len < 2) return b.ctx.fail(clause.origin, "expected a protocol name or a method (name [params] body...), not {s}", .{describeForm(clause)});
         const other = current orelse return b.ctx.fail(clause.origin, "a method needs a protocol name before it", .{});
-        const method = clause.datum.list;
-        const method_key = try b.kw(try plainName(b.ctx, method[0], "a method name"));
-        if (stripMeta(method[1]).datum != .vector) return b.ctx.fail(method[1].origin, "expected the method's parameter vector, not {s}", .{describeForm(method[1])});
-        const impl = if (anchor == .record) try recordMethod(b, anchor.record.fields, method) else try b.list(.{ "fn", method[1..] });
-        const protocol, const type_form = switch (anchor) {
-            .type_ => |t| .{ other, t },
-            .protocol => |p| .{ p, other },
-            .record => |r| .{ other, r.name },
-        };
-        try out.append(b.ctx.allocator, try extendCall(b, protocol, type_form, method_key, impl));
+        var end = start;
+        while (end < clauses.len and !isExtendHeader(clauses[end], anchor)) : (end += 1) {
+            const c = clauses[end];
+            if (c.datum != .list or c.datum.list.len < 2) return b.ctx.fail(c.origin, "expected a protocol name or a method (name [params] body...), not {s}", .{describeForm(c)});
+            _ = try plainName(b.ctx, c.datum.list[0], "a method name");
+        }
+        const run = clauses[start..end];
+        for (run, 0..) |method, i| {
+            const name = method.datum.list[0].datum.symbol.name;
+            if (methodIndex(run[0..i], name) != null) continue;
+            var arities: std.ArrayList(*Form) = .empty;
+            for (run[i..]) |same| {
+                if (!std.mem.eql(u8, same.datum.list[0].datum.symbol.name, name)) continue;
+                try methodArities(b.ctx, same, &arities);
+            }
+            var clauses_out: std.ArrayList(*Form) = .empty;
+            for (arities.items) |arity| {
+                try clauses_out.append(b.ctx.allocator, if (anchor == .record) try recordArity(.{ .ctx = b.ctx, .origin = arity.origin }, anchor.record.fields, arity) else arity);
+            }
+            const impl = if (clauses_out.items.len == 1)
+                try b.list(.{ "nexis.core/fn", clauses_out.items[0].datum.list })
+            else
+                try b.list(.{ "nexis.core/fn", clauses_out.items });
+            const protocol, const type_form = switch (anchor) {
+                .type_ => |t| .{ other, t },
+                .protocol => |p| .{ p, other },
+                .record => |r| .{ other, r.name },
+            };
+            try out.append(b.ctx.allocator, try extendCall(b, protocol, type_form, try b.kw(name), impl));
+        }
+        start = end;
+    }
+}
+
+/// Whether `clause` names the protocol (or, for `extend-protocol`,
+/// the type) the methods after it belong to.
+fn isExtendHeader(clause: *const Form, anchor: ExtendAnchor) bool {
+    return clause.datum == .symbol or (clause.datum == .keyword and anchor == .protocol);
+}
+
+/// The position in `methods` of the first clause named `name`.
+fn methodIndex(methods: []const *Form, name: []const u8) ?usize {
+    for (methods, 0..) |m, i| if (std.mem.eql(u8, m.datum.list[0].datum.symbol.name, name)) return i;
+    return null;
+}
+
+/// The arities `([params] body...)` of one method clause onto `out`:
+/// `(name [params] body...)` has one, at the clause's span, and
+/// `(name ([params] body...) ...)` lists its own.
+fn methodArities(ctx: *ExpandContext, method: *const Form, out: *std.ArrayList(*Form)) ExpandError!void {
+    const items = method.datum.list;
+    if (stripMeta(items[1]).datum == .vector) return out.append(ctx.allocator, try makeList(ctx, items[1..], method.origin));
+    for (items[1..]) |arity| {
+        if (arity.datum != .list or arity.datum.list.len == 0 or stripMeta(arity.datum.list[0]).datum != .vector)
+            return ctx.fail(arity.origin, "expected the method's parameter vector or its arities ([params] body...), not {s}", .{describeForm(arity)});
+        try out.append(ctx.allocator, mutCast(arity));
     }
 }
 
@@ -2377,15 +2507,20 @@ fn syntaxQuote(ctx: *ExpandContext, scope: *GensymScope, payload: *const Form) E
         // The `fn*` form a `#()` stands for; its `%` parameters stay
         // bare (see the symbol arm).
         .anon_fn => |items| try syntaxQuote(ctx, scope, try anonFnForm(ctx, payload, items)),
-        // `^m x` builds the list `(nexis.internal/#%meta x m)`, which
-        // a macro's result turns back into `^m x`: a symbol value
-        // cannot carry the metadata itself (`(def ^:private ~name ...)`).
-        .with_meta => |wm| b.list(.{
-            "#%list",
-            try b.list(.{ "quote", "nexis.internal/#%meta" }),
-            try syntaxQuote(ctx, scope, wm.target),
-            try syntaxQuote(ctx, scope, wm.meta),
-        }),
+        // `^m coll` is the collection carrying `m`, as in Clojure.
+        // Any other `^m x` builds the list `(nexis.internal/#%meta x
+        // m)`, which a macro's result turns back into `^m x`: a symbol
+        // value cannot carry the metadata itself (`(def ^:private
+        // ~name ...)`).
+        .with_meta => |wm| switch (wm.target.datum) {
+            .list, .vector, .map, .set => b.list(.{ "nexis.core/with-meta", try syntaxQuote(ctx, scope, wm.target), try syntaxQuote(ctx, scope, wm.meta) }),
+            else => b.list(.{
+                "#%list",
+                try b.list(.{ "quote", "nexis.internal/#%meta" }),
+                try syntaxQuote(ctx, scope, wm.target),
+                try syntaxQuote(ctx, scope, wm.meta),
+            }),
+        },
         // Clojure's rule: the inner syntax-quote becomes its
         // construction form first, in its own gensym scope, and the
         // outer one quotes that, so `~~x` is unquoted by the outer.
@@ -2482,6 +2617,7 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     try table.put(allocator, "let", expandLetRename);
     try table.put(allocator, "fn", expandFnRename);
     try table.put(allocator, "defn", expandDefnMacro);
+    try table.put(allocator, "defn-", expandDefnPrivate);
     try table.put(allocator, "loop", expandLoopRename);
     try table.put(allocator, "when", expandWhen);
     try table.put(allocator, "when-not", expandWhenNot);

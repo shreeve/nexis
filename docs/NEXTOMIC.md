@@ -58,10 +58,13 @@ writer, and succeeds on a file the process may only read, where every
 `transact!` is `:db/read-only`.
 
 emdb's writer lock is per file and makes a second writer wait for the
-first to end. Every connection to one file in the process sees the
-others (the stores are told apart by their `uuid`), so a write through
-one while another holds the file's write transaction is
-`:nextomic/nested` rather than a wait on itself.
+first to end. Every connection to one file in the process, and every
+`db/*` connection to it, shares the file's one environment
+(`db.StoreFile`, `docs/DB.md` §3.1; files are told apart by device and
+inode, so a symlink is the same file and a copy is another). A write
+through one while another holds the file's write transaction is
+`:nextomic/nested` from Nextomic and `:db/busy` from `db/*`, never a
+wait on itself.
 
 | tree | key | value |
 |---|---|---|
@@ -341,7 +344,8 @@ trees and the txlog hold only the datoms it returned. Its reads of
 `db-before`, or of `(d/db conn)`, open ordinary read transactions
 beside the held write; a `transact!`, `with` or `excise!` inside it, on
 this connection or on another to the same file, is `:nextomic/nested`,
-since the engine has one writer. A throw inside it unwinds through the
+and a `db/*` write to the same file `:db/busy`, since the engine has one
+writer. A throw inside it unwinds through the
 native, aborts the transaction and reaches the caller's `try`. The
 built-in `[:db.fn/cas e a old new]` asserts `new` on the
 cardinality-one attribute `a` when the value the transaction sees (the

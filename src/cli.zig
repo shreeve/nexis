@@ -57,9 +57,10 @@ const Usage =
     \\Namespaces available without a file: nexis.core (auto-referred),
     \\db (key-value storage on emdb), nextomic (Datomic-class datoms:
     \\transact!, q, pull, as-of/since/history, with), nexis.string,
-    \\nexis.test (deftest, is, testing, run-tests), nexis.pprint
-    \\(pprint), nexis.math (sqrt, pow, floor, ceil, round, PI, E),
-    \\nexis.simd (typed-vector kernels), nexis.internal. See README.md,
+    \\nexis.set (union, intersection, difference, ...), nexis.test
+    \\(deftest, is, testing, run-tests), nexis.pprint (pprint),
+    \\nexis.math (sqrt, pow, floor, ceil, round, PI, E), nexis.simd
+    \\(typed-vector kernels), nexis.internal. See README.md,
     \\docs/TOOLING.md and docs/NEXTOMIC.md.
     \\
     \\Examples: examples/*.nx (examples/nextomic-app.nx for Nextomic).
@@ -137,8 +138,8 @@ fn usageExit(io: std.Io) noreturn {
 }
 
 /// `nexis: <path>:<line>:<col>: <label>`, then the source line
-/// and a caret under the span. Nothing is cut: a long path, label or
-/// line goes out whole.
+/// and a caret under the span's part on that line. Nothing is cut: a
+/// long path, label or line goes out whole.
 fn emitSourceError(io: std.Io, info: *const vm.SourceInfo, label: []const u8, span: reader_mod.SrcSpan) !void {
     var buf: [1024]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(io, &buf);
@@ -149,8 +150,10 @@ fn emitSourceError(io: std.Io, info: *const vm.SourceInfo, label: []const u8, sp
     if (line_text.len > 0) {
         try w.print("    {s}\n    ", .{line_text});
         try w.splatByteAll(' ', loc.col -| 1);
-        // One caret per byte of the span, at least one.
-        try w.splatByteAll('^', @max(span.len, 1));
+        // One caret per byte of the span up to the line's end, at
+        // least one.
+        const rest = line_text.len -| (loc.col -| 1);
+        try w.splatByteAll('^', @max(@min(span.len, rest), 1));
         try w.writeAll("\n");
     }
     try w.flush();
@@ -303,14 +306,20 @@ const Runtime = struct {
 };
 
 /// The text of FILE, or of stdin for `-`; exit 2 when it cannot be
-/// read. A `#!` first line is a comment, so a script can be
-/// executable.
+/// read. A leading UTF-8 byte-order mark is dropped, so positions and
+/// carets count from the first character after it. A `#!` first line
+/// is a comment, so a script can be executable.
 fn readProgram(io: std.Io, allocator: std.mem.Allocator, path: []const u8) []u8 {
-    const text = if (eql(path, "-")) blk: {
+    var text = if (eql(path, "-")) blk: {
         var buf: [4096]u8 = undefined;
         var r = std.Io.File.stdin().readerStreaming(io, &buf);
         break :blk r.interface.allocRemaining(allocator, .unlimited) catch |err| failRead(io, path, err);
     } else std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch |err| failRead(io, path, err);
+    const bom = loader_mod.byte_order_mark;
+    if (std.mem.startsWith(u8, text, bom)) {
+        std.mem.copyForwards(u8, text, text[bom.len..]);
+        text = allocator.realloc(text, text.len - bom.len) catch |err| failRead(io, path, err);
+    }
     if (std.mem.startsWith(u8, text, "#!")) @memcpy(text[0..2], ";;");
     return text;
 }

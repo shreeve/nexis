@@ -31,8 +31,10 @@
   ; reduce + cons builds the list in reverse order naturally.
   (reduce (fn* [acc x] (cons x acc)) (list) s))
 
+; (drop n coll) → a seq of coll without its first n elements, () when
+; none are left.
 (defn drop [n s]
-  (nthrest s n))
+  (or (seq (nthrest s n)) (list)))
 
 ; (nthnext coll n) → the elements after the first n, nil when none.
 (defn nthnext [coll n]
@@ -43,8 +45,11 @@
 ; ============================================================
 
 ; (if-let [binding test] then else?) → then with binding bound to
-; test's value when it is truthy, else. The binding may destructure.
+; test's value when it is truthy, else. The binding may destructure;
+; any other shape fails to expand, as in Clojure.
 (defmacro if-let [binding then & else]
+  (when (or (not (vector? binding)) (not= 2 (count binding)) (next else))
+    (throw (ex-info "if-let takes [binding test], then and an optional else" {})))
   `(let [temp# ~(second binding)]
      (if temp#
        (let [~(first binding) temp#] ~then)
@@ -59,6 +64,8 @@
 ; (if-some [binding test] then else?) / (when-some [binding test]
 ; body...) → as if-let / when-let, but only nil fails: false binds.
 (defmacro if-some [binding then & else]
+  (when (or (not (vector? binding)) (not= 2 (count binding)) (next else))
+    (throw (ex-info "if-some takes [binding test], then and an optional else" {})))
   `(let [temp# ~(second binding)]
      (if (nil? temp#)
        ~(first else)
@@ -516,11 +523,28 @@
 ; More sequence and function helpers
 ; ============================================================
 
-; (some-fn p & ps) → a fn true of its arguments when any predicate
-; is truthy of any of them; (every-pred p & ps) when every one is of
-; every argument.
-(defn some-fn [& ps]
-  (fn [& xs] (boolean (some (fn [p] (some p xs)) ps))))
+; (some-fn p & ps) → a fn returning the first truthy result of a
+; predicate on an argument, in Clojure's order: each predicate over the
+; first three arguments, then each further argument against every
+; predicate (every predicate against those arguments past three
+; predicates). A miss is the last result for up to three predicates
+; and three arguments, else nil. (every-pred p & ps) → a fn true when
+; every predicate is truthy of every argument.
+(defn some-fn [p & ps]
+  (let [ps (cons p ps)
+        many (> (count ps) 3)
+        hit (fn [f coll]
+              (loop [s (seq coll) r nil]
+                (if s (let [v (f (first s))] (if v v (recur (next s) v))) r)))]
+    (fn [& xs]
+      (let [more (drop 3 xs)
+            r (hit (fn [p] (hit p (take 3 xs))) ps)]
+        (cond r r
+              (seq more) (if many
+                           (some (fn [p] (some p more)) ps)
+                           (some (fn [x] (hit (fn [p] (p x)) ps)) more))
+              many nil
+              true r)))))
 
 (defn every-pred [& ps]
   (fn [& xs] (every? (fn [p] (every? p xs)) ps)))
@@ -563,11 +587,11 @@
         (if (or (empty? run) (= fx k))
           (recur (next s) acc (conj run x) fx)
           (recur (next s) (conj acc (seq run)) [x] fx)))
-      (seq (if (empty? run) acc (conj acc (seq run)))))))
+      (or (seq (if (empty? run) acc (conj acc (seq run)))) (list)))))
 
 ; (dedupe coll) → coll without consecutive duplicates.
 (defn dedupe [coll]
-  (seq (reduce (fn [acc x] (if (and (seq acc) (= x (peek acc))) acc (conj acc x))) [] coll)))
+  (or (seq (reduce (fn [acc x] (if (and (seq acc) (= x (peek acc))) acc (conj acc x))) [] coll)) (list)))
 
 ; (take-nth n coll) → every nth element, starting with the first.
 (defn take-nth [n coll]
@@ -597,13 +621,13 @@
         (recur (assoc v i (nth v j) j vi) (dec i)))
       v)))
 
-; (update-vals m f) / (update-keys m f) → m with f applied to every
-; value / key.
+; (update-vals m f) / (update-keys m f) → a map of m's entries with f
+; applied to every value / key, keeping m's metadata.
 (defn update-vals [m f]
-  (reduce-kv (fn [acc k v] (assoc acc k (f v))) {} m))
+  (with-meta (persistent! (reduce-kv (fn [acc k v] (assoc! acc k (f v))) (transient {}) m)) (meta m)))
 
 (defn update-keys [m f]
-  (reduce-kv (fn [acc k v] (assoc acc (f k) v)) {} m))
+  (with-meta (persistent! (reduce-kv (fn [acc k v] (assoc! acc (f k) v)) (transient {}) m)) (meta m)))
 
 ; (reset-vals! a v) → [old new] after setting a to v.
 (defn reset-vals! [a v]
@@ -623,10 +647,12 @@
 (defn simple-keyword? [x] (and (keyword? x) (nil? (namespace x))))
 (defn qualified-symbol? [x] (boolean (and (symbol? x) (namespace x))))
 (defn simple-symbol? [x] (and (symbol? x) (nil? (namespace x))))
-(defn int? [x] (integer? x))
-(defn pos-int? [x] (and (integer? x) (pos? x)))
-(defn nat-int? [x] (and (integer? x) (not (neg? x))))
-(defn neg-int? [x] (and (integer? x) (neg? x)))
+; int? and its kin: an integer in Java's long range, as Clojure's are
+; true of a Long and not a BigInt.
+(defn int? [x] (and (integer? x) (<= -9223372036854775808 x 9223372036854775807)))
+(defn pos-int? [x] (and (int? x) (pos? x)))
+(defn nat-int? [x] (and (int? x) (not (neg? x))))
+(defn neg-int? [x] (and (int? x) (neg? x)))
 (defn double? [x] (float? x))
 (defn seqable? [x] (or (nil? x) (coll? x) (string? x) (typed-vector? x)))
 (defn counted? [x] (or (coll? x) (typed-vector? x)))

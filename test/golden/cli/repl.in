@@ -7,6 +7,11 @@
 (defn twice [n]
   (* 2 n))
 (twice 21)
+(def s "one
+two \" three
+
+four \\")
+(count s)
 ["a" \b "c d"]
 (count (pr-str (range 2000)))
 (ns other)

@@ -1,0 +1,3 @@
+﻿(nope)
+; A file that opens with a UTF-8 byte-order mark reads as if the mark
+; were absent: the column and the caret do not count it.

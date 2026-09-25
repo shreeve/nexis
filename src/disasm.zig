@@ -19,6 +19,10 @@ const vm = @import("vm.zig");
 const value_mod = @import("value.zig");
 const format_mod = @import("format.zig");
 const intern_mod = @import("intern.zig");
+const heap_mod = @import("heap.zig");
+const vector_mod = @import("coll/vector.zig");
+const list_mod = @import("coll/list.zig");
+const champ_mod = @import("coll/champ.zig");
 
 const Writer = std.Io.Writer;
 
@@ -209,10 +213,7 @@ fn writeOperand(op: vm.Operand, routine: *const vm.Routine, interner: ?*const in
                 switch (routine.consts[op.index]) {
                     .value => |v| {
                         try writer.writeAll("=");
-                        format_mod.format(v, .readable, writer, interner) catch |err| switch (err) {
-                            error.Utf8Error => try writer.writeAll("#<invalid utf-8>"),
-                            else => |e| return e,
-                        };
+                        try writeConstant(v, interner, writer);
                     },
                     .routine => |r| try writer.print("=<routine {s}>", .{r.name}),
                 }
@@ -229,6 +230,35 @@ fn writeOperand(op: vm.Operand, routine: *const vm.Routine, interner: ?*const in
         .unused => try writer.writeAll("-"),
         _ => try writer.print("?{d}", .{op.index}),
     }
+}
+
+/// The most bytes of a constant's printed form a listing shows.
+const max_constant_width = 60;
+
+/// `v` as `pr-str` prints it, cut at a space within
+/// `max_constant_width` bytes when longer, then ` ...` and, for a
+/// collection, its item count: a large literal is one constant
+/// (COMPILER.md §4.4) and stays one readable line.
+fn writeConstant(v: value_mod.Value, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
+    var buf: [max_constant_width + 1]u8 = undefined;
+    var fixed = Writer.fixed(&buf);
+    format_mod.format(v, .readable, &fixed, interner) catch |err| switch (err) {
+        error.WriteFailed => {},
+        error.Utf8Error => return writer.writeAll("#<invalid utf-8>"),
+    };
+    const text = fixed.buffered();
+    if (text.len <= max_constant_width) return writer.writeAll(text);
+    var cut = std.mem.lastIndexOfScalar(u8, text[0..max_constant_width], ' ') orelse max_constant_width;
+    while (cut > 0 and text[cut] & 0xC0 == 0x80) cut -= 1;
+    try writer.print("{s} ...", .{text[0..cut]});
+    const items: ?usize = switch (v.kind()) {
+        .list => list_mod.count(v),
+        .persistent_vector => vector_mod.count(v),
+        .persistent_map => champ_mod.mapCount(v),
+        .persistent_set => champ_mod.setCount(v),
+        else => null,
+    };
+    if (items) |n| try writer.print("({d} items)", .{n});
 }
 
 // =============================================================================
@@ -338,6 +368,25 @@ test "a span table annotates the line and column where it changes" {
         \\  0000  mov:load-nil        s0  -  -  ; 1:2
         \\  0001  mov:load-nil        s0  -  -
         \\  0002  call:return         s0  -  -  ; 2:4
+        \\
+    , out.written());
+}
+
+test "a large constant prints as its first 60 bytes and its item count" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var items: [5000]value_mod.Value = undefined;
+    for (&items, 0..) |*item, i| item.* = value_mod.fromFixnum(@intCast(i)).?;
+    const consts = [_]vm.Const{ vm.cval(try vector_mod.fromSlice(&heap, &items)), vm.cval(try vector_mod.fromSlice(&heap, items[0..3])) };
+    const code = [_]vm.Inst{ vm.asm_.loadConst(0, 0), vm.asm_.loadConst(0, 1) };
+    const routine = vm.Routine{ .code = &code, .consts = &consts, .slot_count = 1, .name = "t" };
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try disassemble(&routine, null, &out.writer);
+    try testing.expectEqualStrings(
+        \\routine t slots=1 arity=0 upvalues=0
+        \\  0000  mov:load-const      s0  c0=[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 ...(5000 items)  -
+        \\  0001  mov:load-const      s0  c1=[0 1 2]  -
         \\
     , out.written());
 }
