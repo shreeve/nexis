@@ -1,7 +1,7 @@
 ; examples/tests-demo.nx — nexis.test: deftest, is, testing and
 ; run-tests, with one failing test and one that throws, so the
-; report shows every outcome. The last form's value, the summary
-; map, is what `nexis run` prints at the end.
+; report shows every outcome. `nexis test examples/tests-demo.nx`
+; would also exit 1 for the failures.
 
 (require '[nexis.test :as t])
 

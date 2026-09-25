@@ -1,0 +1,6 @@
+; `nexis test FILE`: the file's deftests run after it, and a failure
+; makes the exit status 1.
+(ns tests)
+(require '[nexis.test :as t])
+(t/deftest passes (t/is (= 2 (+ 1 1))))
+(t/deftest fails (t/is (= 3 (+ 1 1))))

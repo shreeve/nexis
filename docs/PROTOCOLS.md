@@ -51,9 +51,12 @@ Facts about the boundary:
 - A protocol method has exactly one arity: the impl fn's own. The
   registry stores no per-method arity, and `defprotocol` ignores the
   parameter vectors in its method specs (§4.1).
-- Every `Kind` tag name is a valid dispatch keyword, so `:fixnum`,
-  `:bignum`, and `:float` are three distinct dispatch targets; there
-  is no umbrella `Number` target.
+- Every `Kind` tag name is a valid dispatch keyword. The integer
+  tower is one type (SEMANTICS §2.2), so `:fixnum` and `:bignum`
+  name one dispatch target: an impl for either covers every integer,
+  whatever its representation, and the later extension replaces the
+  earlier. `:float` is a separate target; there is no umbrella
+  `Number` target.
 
 ---
 
@@ -162,10 +165,14 @@ ProtocolFnBody extern struct {
 - **Unserializable.**
 - **Format**: `#<protocol-fn proto=P method=M>` (numeric ids).
 - **GC trace**: leaf.
-- **Call dispatch**: `call:call` on a `protocol_fn` routes to the
-  VM helper `dispatchProtocolMethod(vm, callee, args)` which walks
+- **Call dispatch**: `call:call` or `VM.callValue` on a
+  `protocol_fn` (so a protocol fn passed to `map`, `apply` or `comp`
+  dispatches as it does in call position) routes to the VM helper
+  `dispatchProtocolMethod(vm, callee, args)` which walks
   `VM.protocol_registry[protocol_id].methods[method_name_id].impls[DispatchKey.ofValue(args[0])]`
-  and invokes the resulting closure / native_fn / fn.
+  and invokes the resulting closure / native_fn / fn. `ofValue`
+  keys a bignum on the fixnum's kind, and `extendProtocol` stores a
+  `:bignum` key the same way (`DispatchKey.canonical`).
 
 `NativeFn` is a static descriptor with `{name, min_arity,
 max_arity, call}` — no per-instance state. Protocol dispatchers
@@ -361,7 +368,7 @@ Type forms:
 
 | Type form | Emits | Dispatch key |
 |---|---|---|
-| keyword naming a `Kind` tag (`:nil`, `:false_`, `:true_`, `:char`, `:fixnum`, `:float`, `:keyword`, `:symbol`, `:string`, `:bignum`, `:persistent_map`, `:persistent_set`, `:persistent_vector`, `:list`, `:function`, `:native_fn`, `:atom`, `:record`, ...) | `#%extend-builtin-impl` | `{ .builtin, kind }` |
+| keyword naming a `Kind` tag (`:nil`, `:false_`, `:true_`, `:char`, `:fixnum`, `:float`, `:keyword`, `:symbol`, `:string`, `:bignum`, `:persistent_map`, `:persistent_set`, `:persistent_vector`, `:list`, `:function`, `:native_fn`, `:atom`, `:record`, ...) | `#%extend-builtin-impl` | `{ .builtin, kind }`; `:fixnum` and `:bignum` both `{ .builtin, fixnum }` |
 | `:vector` / `:map` / `:set` | `#%extend-builtin-impl` | aliases for `:persistent_vector` / `:persistent_map` / `:persistent_set` |
 | `:any` | `#%extend-default-impl` | sets the method's `default_impl` |
 | symbol `Counter` | `#%extend-record-impl` with `Counter-type-id` | `{ .record, type_id }` |
@@ -630,6 +637,6 @@ first dispatch that selects it, pointing at the user's impl form.
   parameter vector is ignored); defaults are installed with
   `extend-protocol ... :any`.
 - No multi-arity protocol methods and no arity declared per method.
-- No umbrella numeric dispatch target; `:fixnum`, `:bignum`, `:float`
-  are separate keys.
+- No umbrella numeric dispatch target: integers (`:fixnum` /
+  `:bignum`, one key) and `:float` are separate keys.
 - No inline caching of protocol dispatch.

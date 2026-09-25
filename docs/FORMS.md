@@ -76,8 +76,9 @@ foo, ns/foo, set!, ->>               ;; symbol
 Notes:
 
 - `(map k1 v1 k2 v2)` is a **flat** alternation. The reader rejects odd arity.
-- `#%anon-fn` is a **reserved symbol name** (with the literal `%` characters),
-  not a dedicated Datum variant. The macroexpander later rewrites it to
+- `#(...)` reads as the `anon_fn` datum holding the body forms; the
+  pretty-printer renders it with the reserved head `#%anon-fn`, a name user
+  code cannot spell (§8). The macroexpander rewrites it to
   `(fn* [%1 %2 ...] body)`.
 - `syntax-quote` is a **structural marker**. Expansion (auto-qualification,
   auto-gensym `x#`, unquote/splice handling) is the macroexpander's job (PLAN
@@ -97,6 +98,8 @@ see. Mirrors PLAN §28.3 exactly.
 | `^sym x` | `(with-meta x {:tag sym})` |
 | `^:a ^:b x` | `(with-meta x {:a true, :b true})` — right-to-left merge; duplicate keys: rightmost wins |
 | `#_ x y` | the `x` form is discarded; only `y` appears in output |
+| `'#_ x y`, `^:m #_ x y` | a prefix reads the form after the discarded one: `(quote y)`, `(with-meta y {:m true})` |
+| `#_ #_ x y z` | each `#_` consumes one form, which may itself begin with `#_`: only `z` remains |
 | `#(body)` | `(#%anon-fn body)` — `%`/`%1`/`%2`/`%&` left as ordinary symbols; resolved by macroexpander |
 | `` `x `` | `(syntax-quote x)` — **no expansion here**; the macroexpander does the Clojure-style rewrite |
 | `{:a 1 :a 2}` | **reader error**: `:duplicate-literal-key` |
@@ -107,6 +110,14 @@ see. Mirrors PLAN §28.3 exactly.
 | `~@x` outside `` `...` `` | **reader error**: `:unquote-splice-outside-syntax-quote` |
 | `42N`, `0xFFN`, `18446744073709551616N` | the integer, as without the suffix: `(int 42)`, `(int 255)`, `(bigint 18446744073709551616)` |
 | `1abc`, `1-2`, `1.5x`, `1/2`, `1.`, `0x`, `3.14M` | **reader error**: `:bad-number-literal`, detail the token's text |
+| `"one⏎two"` (a newline in the source) | a string may span lines; the newline is part of it: `(string "one\ntwo")` |
+| `"a\qb"`, `"\u{D800}"`, `"\u0041"` | **reader error**: `:invalid-string-escape`, detail the escape (`\q`, `\u{D800}`, `\u`) |
+| `λ`, `ns.é/π`, `:ключ` | a symbol or keyword may hold any non-ASCII UTF-8 character |
+| a string, symbol or keyword whose bytes are not UTF-8 | **reader error**: `:invalid-utf8` |
+| `\é`, `\☃`, `\(` | one character, any UTF-8 sequence or delimiter: `(char \u{E9})`, `(char \u{2603})`, `(char \()` |
+| `\u0041`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | **reader error**: `:invalid-char-literal`, detail the token's text (`\u{HEX}` is the one escape, PLAN §23 decision 26) |
+| `#'x`, `#"re"`, `##Inf`, `#?(...)`, `#!`, `::k` | **parse error** naming the construct (`unexpected \`#'x\``): none of these is in the reader (PLAN §7.2) |
+| a form nested past the native stack's budget | **reader error**: `:nesting-too-deep` (`src/stack.zig`) |
 
 **Number token boundary.** A token that begins with a digit, or with
 `-` and a digit, ends where a symbol would: at whitespace, a comma,
@@ -121,6 +132,14 @@ The CLI reports the failure as `reader error: :bad-number-literal
 1abc` with the caret under the token (`TOOLING.md` §1). Consequences
 that differ from Clojure are listed in `CLOJURE-REVIEW.md` §4.2: `1.`
 and `22/7` are errors, `017` is decimal 17, `3.14M` is an error.
+
+**Char token boundary.** A char token is `\`, one character (a whole
+UTF-8 sequence, or any other byte, a delimiter included), then every
+symbol constituent that follows, as a number token runs; `\u{HEX}` runs
+to its `}` first. The reader accepts the text only when it is one
+character, `u{HEX}` naming a Unicode scalar, or a name of the named set,
+so `\a1` and `\u0041` fail whole instead of reading as a char followed
+by another form.
 
 **Duplicate detection rule.** Only *statically-detectable literal* keys or
 elements count. `{:a 1 (keyword "a") 2}` is **not** a reader error — the second
@@ -152,10 +171,10 @@ boundaries.
 
 | Stage | Input | Output | Responsibilities |
 |---|---|---|---|
-| **Parser** (`src/parser.zig`, generated) | source text | raw `Sexp` tree with `.src` spans | Tokenization + LALR(1) parse. No semantic validation beyond grammar. No normalization. |
-| **Reader / normalizer** (`src/reader.zig`) | raw `Sexp` | canonical `Form` tree | §3 rules. Attaches spans. Normalizes metadata. Lowers `#(...)`. Emits `(syntax-quote f)` marker. Discards `#_`. Rejects duplicate literal keys / odd map / nested anon-fn / bare unquote. |
-| **Macroexpander** (`src/expand.zig`) | canonical `Form` | expanded `Form` | Macros to fixpoint. **Expands `syntax-quote` forms.** Resolves `#%anon-fn` to `(fn* ...)`. Passes `&form` and `&env`. |
-| **Resolver** (`src/resolve.zig`) | expanded `Form` | `Resolved` AST | Symbols → slot / upvalue / var / special form. Errors on unbound. |
+| **Parser** (`src/parser.zig`, generated; scanner `src/nexis.zig`) | source text | raw `Sexp` tree with `.src` spans | Tokenization + LALR(1) parse. Drops `#_` and the form it discards. No semantic validation beyond grammar. No normalization. |
+| **Reader / normalizer** (`src/reader.zig`) | raw `Sexp` | canonical `Form` tree | §3 rules. Attaches spans. Normalizes metadata. Lowers `#(...)`. Emits `(syntax-quote f)` marker. Rejects duplicate literal keys / odd map / nested anon-fn / bare unquote. |
+| **Macroexpander** (`src/expand.zig`) | canonical `Form` | expanded `Form` | Macros to fixpoint. **Expands `syntax-quote` forms.** Resolves `#%anon-fn` to `(fn* ...)`. A macro receives its arguments only (PLAN §23 decision 34). |
+| **Compiler** (`src/compile.zig`) | expanded `Form` | bytecode | Symbols → slot / upvalue / var / special form. Errors on unbound (`docs/COMPILER.md`). |
 
 **Important**: `syntax-quote` expansion happens in the macroexpander, not the
 reader. The reader only tags. This keeps the reader stateless wrt namespaces
@@ -165,7 +184,7 @@ and lets tooling inspect raw reader output without losing backtick structure.
 
 ### 5. Pretty-printer (canonical Form serialization)
 
-Used by `test/golden/*.sexp` expected files and by `nexis -s`. The pretty-
+Used by the `test/golden/*.sexp` expected files (`src/golden.zig`). The pretty-
 printer must be **deterministic, stable, and diff-friendly** — goldens cannot
 tolerate whitespace churn.
 
@@ -177,7 +196,7 @@ tolerate whitespace churn.
   current printer does not measure columns.)
 - Children are indented 2 spaces beyond the opening `(`.
 - Atom notation:
-  - `nil`, `true`, `false` — bare.
+  - `nil` bare; booleans as `(bool true)`, `(bool false)`.
   - Integers: decimal, with a leading `-` for negatives. Hex and binary source
     literals are normalized to decimal in the Form's `datum` — the pretty-
     printer does not preserve the source radix. An integer beyond i64 is a
@@ -185,9 +204,9 @@ tolerate whitespace churn.
   - Floats: Zig's default `{d}` formatting, except special values:
     `+inf`, `-inf`, `+nan` (canonical NaN; the Form stores NaN as a single
     canonical bit pattern — see SEMANTICS §3.2).
-  - Chars: `\a`, `\newline`, `\space`, `\tab`, `\return`, `\formfeed`,
-    `\backspace` for the named set; all others as `\u{HEX}` with uppercase hex
-    digits and no leading zeros.
+  - Chars: `\newline`, `\space`, `\tab`, `\return`, `\formfeed`,
+    `\backspace` for the named set; printable ASCII as itself (`\a`, `\(`);
+    all others as `\u{HEX}` with uppercase hex digits and no leading zeros.
   - Strings: double-quoted with `\n \t \r \\ \" \u{HEX}` escapes — same
     escape language as source (PLAN §23 decision 26).
   - Keywords: `:name` or `:ns/name`.
@@ -201,9 +220,8 @@ tolerate whitespace churn.
   canonical order; runtime persistent maps are unordered.
 - Set children render in **source order** for the same reason. Duplicate
   detection already fired at the reader.
-- `user_meta`, when present, is emitted as a second line after the target
-  form, prefixed with `^meta `, and its map uses the same pretty-printer
-  recursively. When `user_meta` is absent, nothing is emitted for it.
+- Metadata is the `with-meta` compound, printed like any other:
+  `(with-meta TARGET META-MAP)`.
 - `ann` is **never** emitted — it is invisible to user code and tooling.
 
 **Example.**
@@ -242,7 +260,7 @@ range that produced it. Policy:
 
 - **Atoms** carry the span of the token that produced them.
 - **Compounds** carry the span from the opening punctuation (`(`, `[`, `{`,
-  `#{`, `'`, `` ` ``, `~`, `~@`, `@`, `^`, `#_`, `#(`) to the matching close.
+  `#{`, `'`, `` ` ``, `~`, `~@`, `@`, `^`, `#(`) to the matching close.
 - **Reader-introduced constructs** (`with-meta`, `syntax-quote`, `quote`,
   `#%anon-fn`) cover the full source extent of their origin sugar.
 - `None` appears only for Forms synthesized by macros; the reader never
@@ -253,10 +271,9 @@ churn goldens on unrelated edits. The CLI goldens under `test/golden/cli`
 pin them where they are visible, in error carets and `nexis disasm`
 annotations.
 
-For reader **errors**, spans are formatted as `{:line L :col C :end-line L
-:end-col C}` in the error map, where `L`/`C` are 1-based and `end-col` is the
-first column *after* the offending region. This minimal form is stable across
-editor conventions.
+A reader **error** carries the span of the form or token it rejects; the
+CLI reports it as `path:line:col: reader error: :kind detail` with a caret
+under the span (`TOOLING.md` §1), and `read-string` throws `:reader-error`.
 
 ---
 
@@ -269,13 +286,13 @@ editor conventions.
   (numbers in every radix, strings with every escape, chars named and
   hex-escaped, keywords/symbols with and without namespace, all collection
   literals, all reader macros, `#_`, `#(...)`, metadata in every shape).
-- `test/golden/errors/*.nx` each pair with `<name>.err` — a single-map EDN-ish
-  value of the form `{:kind :K, ...slots...}` where `...slots...` are stable
-  diagnostic fields (no raw spans unless the test explicitly exercises span
-  reporting). Example: `{:kind :duplicate-literal-key :key :a}`.
+- `test/golden/errors/*.nx` each pair with `<name>.err`, one line: the
+  error kind, then ` :detail "..."` when the reader gives one, or
+  `:parser-error ParseError` for input the grammar rejects. Example:
+  `:duplicate-literal-key :detail "(keyword :a)"`.
 
-A golden diff is a **reader regression**. The test runner supports a
-`-Dupdate-golden=true` option that overwrites the expected files; use it only
+A golden diff is a **reader regression**. `zig build golden -Dupdate=true`
+overwrites the expected files; use it only
 when intentionally changing the schema, and commit the diff alongside the code
 change so reviewers see both.
 
@@ -310,6 +327,9 @@ quirks, not contract.
   (`docs/MACROEXPAND.md` §9) owns positional-arg scanning and
   `(fn* [...] body)` synthesis. Nested `#(...)` is rejected by the reader
   because nesting would ambiguate placeholder scoping.
+- **Duplicate-literal detection cost.** Literal keys and elements are
+  hashed, so the check and the merge of a `^` chain are linear in the
+  literal's size.
 - **Duplicate-literal detection for numeric keys.** The reader's
   `formLiteralEq` compares `real`s with naive `==`, meaning `{0.0 x -0.0
   y}` is flagged as a duplicate. The runtime's canonical-NaN equality
@@ -318,9 +338,8 @@ quirks, not contract.
 
 ### 9. What FORMS.md does not cover (and why)
 
-- **Macroexpansion rules** — lives in PLAN §14 and future `docs/MACROS.md`.
-- **Resolver / compiler lowering** — lives in PLAN §11 and future
-  `docs/PIPELINE.md`.
+- **Macroexpansion rules** — lives in PLAN §14 and `docs/MACROEXPAND.md`.
+- **Resolver / compiler lowering** — lives in PLAN §11 and `docs/COMPILER.md`.
 - **Serializable kinds** — lives in PLAN §15.10 and `docs/CODEC.md`. Forms
   themselves are **not** serializable values; only the Value-layer outputs of
   quote/compile are.
