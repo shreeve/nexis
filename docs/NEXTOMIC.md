@@ -428,7 +428,7 @@ runs:
 |---|---|---|
 | `e` | EAVT `[e][a?]` | attributes per entity |
 | `a` + `v`, unique | AVET `[a][v]` | 1 |
-| `a` + `v`, indexed | AVET `[a][v]` | entries / distinct values |
+| `a` + `v`, indexed | AVET `[a][v]` | entries of `a` / 16 |
 | `a` + `v`, not indexed | AEVT `[a]` + filter | entries of `a` |
 | `v` ref, `a` optional | VAET `[v][a?]` | small |
 | `a` only | AEVT `[a]` | entries of `a` |
@@ -446,6 +446,11 @@ without an attribute; give the attribute when it is known.
 
 Clauses are ordered greedily by estimate given the variables bound so
 far; predicates run at the first point all their variables are bound.
+An `or` costs the sum over its branches of each branch's cheapest
+pattern; a call to a non-recursive rule the same over the rule's
+bodies, with the head variables bound where the call's arguments are
+(16 for a body with no pattern that can run); a call into a recursive
+rule runs after every pattern that could bind its arguments.
 Join per step: index nested loop (seek per row) when `rows × log n` is
 below four times the scan estimate, otherwise one scan of the constant
 prefix hash-joined on the shared variables (`plan.nestedLoop`; `explain`

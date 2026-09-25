@@ -246,6 +246,16 @@
 (def plan (d/explain '[:find ?n :in $ % :where [?e :person/age 30] [?e :person/name ?n] (not [?e :person/tags :red])
                       (responsible ?e ?x) [(< 1 2)]] db rules))
 (t/check "explain returns the plan as text" (and (string? plan) (> (count plan) 0)))
+(def pc (d/connect "plan.edb"))
+(d/transact! pc [{:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+                 {:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
+(d/transact! pc (mapv (fn [i] (merge {:p/name (str "n" i)} (when (< i 40) {:p/age (mod i 2)}))) (range 60)))
+(t/check "a rule call is costed by its bodies: the smaller scan runs first, then the call"
+       (let [lines (s/split (d/explain '[:find ?n :in $ % :where [?e :p/age 1] (named ?e ?n)] (d/db pc)
+                                       '[[(named ?e ?n) [?e :p/name ?n]]])
+                            "\n")]
+         (and (= "1. scan" (subs (first lines) 0 7))
+              (= "2. or-join" (subs (second lines) 0 10)))))
 
 ; --- errors ---------------------------------------------------------------
 

@@ -601,14 +601,14 @@ pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: 
 
 fn orEstimate(ctx: *Ctx, o: anytype, bound: []const Var) Failure!u64 {
     var total: u64 = 0;
-    for (o.branches) |br| total +|= try clausesEstimate(ctx, br, bound);
+    for (o.branches) |br| total +|= (try clausesEstimate(ctx, br, bound)) orelse 1;
     return total;
 }
 
-/// The smallest pattern estimate among `clauses` given `bound`; 1 for a
-/// branch without runnable patterns.
-pub fn clausesEstimate(ctx: *Ctx, clauses: []const Clause, bound: []const Var) Failure!u64 {
-    var best: u64 = std.math.maxInt(u64);
+/// The smallest pattern estimate among `clauses` given `bound`; null
+/// when none of them is a pattern or `or` that can run.
+pub fn clausesEstimate(ctx: *Ctx, clauses: []const Clause, bound: []const Var) Failure!?u64 {
+    var best: ?u64 = null;
     for (clauses) |c| {
         const est: u64 = switch (c) {
             .pattern => |p| patternEstimate(ctx, p, bound) catch |err| switch (err) {
@@ -618,9 +618,9 @@ pub fn clausesEstimate(ctx: *Ctx, clauses: []const Clause, bound: []const Var) F
             .@"or" => |o| try orEstimate(ctx, o, bound),
             else => continue,
         };
-        best = @min(best, est);
+        best = @min(best orelse est, est);
     }
-    return if (best == std.math.maxInt(u64)) 1 else best;
+    return best;
 }
 
 // =============================================================================

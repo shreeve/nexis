@@ -1544,10 +1544,12 @@ test "results materialise as set, scalar, collection, tuple; caches; explain" {
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :in $ % :where [?e :person/age 30] [?e :person/name ?n] (not [?e :person/tags :red]) (admin ?e) [(< 1 2)]]"), dbv, &.{ value.nilValue(), rules_v }, &diag, opts, &out.writer);
     const text = out.written();
     try testing.expect(std.mem.indexOf(u8, text, "1. pred (< 1 2)") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "2. scan [?e :person/age 30 _ _] aevt") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "scan [?e! :person/name ?n _ _] eavt est=1") != null);
+    // The admin rule's body (3 entities) is cheaper than the age scan.
+    try testing.expect(std.mem.indexOf(u8, text, "2. or-join [?e] branches=1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "scan [?e :person/role :role/admin _ _] aevt est=3") != null);
     try testing.expect(std.mem.indexOf(u8, text, "not-join [?e]") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "or-join [?e] branches=1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "scan [?e! :person/age 30 _ _] eavt est=1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "scan [?e! :person/name ?n _ _] eavt est=1") != null);
     out.clearRetainingCapacity();
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?a :where [?e :person/age ?a] [(identity ?e) ?e2] [?e2 :person/email \"ann@x\"]]"), dbv, none, &diag, opts, &out.writer);
     try testing.expect(std.mem.indexOf(u8, out.written(), "3. bind (identity ?e) -> ?e2!") != null);

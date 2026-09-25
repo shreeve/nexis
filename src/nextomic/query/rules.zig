@@ -49,7 +49,8 @@ const Relation = relation.Relation;
 /// Planner cost of a recursive rule call: after every pattern that
 /// could bind its arguments.
 const recursive_cost: u64 = 1 << 20;
-/// Planner cost of one inlined rule body.
+/// Planner cost of an inlined rule body with no pattern that can run,
+/// and the row growth assumed per rule call.
 const body_cost: u64 = 16;
 
 // =============================================================================
@@ -238,7 +239,17 @@ pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: []const V
     }
     const info = try ctx.ruleInfo();
     if (info.isRecursive(name)) return recursive_cost;
-    return body_cost * defs.len;
+    // Each body costs its cheapest pattern, with the head variables
+    // bound where the call's arguments are.
+    var total: u64 = 0;
+    for (defs) |def| {
+        var head_bound: std.ArrayList(Var) = .empty;
+        for (def.head, args) |h, a| {
+            if (a != .variable or ir.containsVar(bound, a.variable)) try head_bound.append(ctx.arena, h);
+        }
+        total +|= (try plan_mod.clausesEstimate(ctx, def.body, head_bound.items)) orelse body_cost;
+    }
+    return total;
 }
 
 /// Append the steps of a rule call: grounding binds for constant
