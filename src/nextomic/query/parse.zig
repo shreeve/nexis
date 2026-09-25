@@ -24,7 +24,7 @@
 //! `Cache` memoises parses per query value: by identity first (the
 //! query literal's pointer), then by structural hash and an equality
 //! that tells lists from vectors. It keeps at most `cache_capacity`
-//! parses that no query is running on, and its `Roots` keep every query
+//! parses that no query is running on, and `mark` keeps every query
 //! value it holds reachable, so no address it compares by is reused
 //! while it is there.
 
@@ -37,6 +37,7 @@ const vector_mod = @import("../../coll/vector.zig");
 const champ = @import("../../coll/champ.zig");
 const dispatch = @import("../../dispatch.zig");
 const stack = @import("../../stack.zig");
+const gc = @import("../../gc.zig");
 const marshal = @import("../marshal.zig");
 const ir = @import("ir.zig");
 
@@ -782,17 +783,6 @@ const Parser = struct {
 // Cache
 // =============================================================================
 
-/// How a cache keeps the query values it holds alive: `set` makes `v`
-/// the value of `slot`, where a slot one past the last appends. A parse
-/// borrows from its query value (string constants' bytes, opaque and
-/// lookup-ref constants, pull patterns and their defaults), so the
-/// collector must see every value a cache holds for as long as it holds
-/// it.
-pub const Roots = struct {
-    ctx: *anyopaque,
-    set: *const fn (ctx: *anyopaque, slot: usize, v: Value) error{OutOfMemory}!void,
-};
-
 /// The parses a cache keeps before a miss replaces the least recently
 /// used one that no query is running on.
 pub const cache_capacity = 128;
@@ -811,8 +801,6 @@ fn CacheOf(comptime T: type, comptime parseFn: anytype) type {
         };
 
         gpa: Allocator,
-        /// Null only where nothing collects (unit tests without a VM).
-        roots: ?Roots = null,
         entries: std.ArrayList(Entry) = .empty,
         clock: u64 = 0,
 
@@ -827,6 +815,15 @@ fn CacheOf(comptime T: type, comptime parseFn: anytype) type {
 
         pub fn count(self: *const Self) usize {
             return self.entries.items.len;
+        }
+
+        /// Mark every query value the cache holds, from the VM's root
+        /// walk (GC.md §3). A parse borrows from its query value
+        /// (string constants' bytes, opaque and lookup-ref constants,
+        /// pull patterns and their defaults), so the collector must see
+        /// each one for as long as the cache holds it.
+        pub fn mark(self: *const Self, c: *gc.Collector) void {
+            for (self.entries.items) |e| c.markValue(e.query);
         }
 
         /// The parse of `query`, parsing on a miss, pinned until
@@ -856,7 +853,6 @@ fn CacheOf(comptime T: type, comptime parseFn: anytype) type {
             const parsed = try parseFn(self.gpa, interner, query, diag);
             errdefer parsed.deinit();
             const slot = self.victim() orelse self.entries.items.len;
-            if (self.roots) |r| try r.set(r.ctx, slot, query);
             const entry: Entry = .{ .query = query, .hash = h, .parsed = parsed, .used = self.clock };
             if (slot == self.entries.items.len) {
                 try self.entries.append(self.gpa, entry);
@@ -1299,25 +1295,14 @@ test "clauses nested past the stack guard are StackOverflow" {
     try testing.expectError(error.StackOverflow, parse(testing.allocator, &interner, q, &diag));
 }
 
-test "a full cache replaces its least recently used unpinned parse and roots what it holds" {
+test "a full cache replaces its least recently used unpinned parse and marks what it holds" {
     var heap = heap_mod.Heap.init(testing.allocator);
     defer heap.deinit();
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
     const b = Builder{ .heap = &heap, .interner = &interner };
-    const Held = struct {
-        vals: [cache_capacity + 2]Value = undefined,
-        len: usize = 0,
-        fn set(ctx: *anyopaque, slot: usize, v: Value) error{OutOfMemory}!void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (slot == self.len) self.len += 1;
-            self.vals[slot] = v;
-        }
-    };
-    var held: Held = .{};
     var cache = Cache.init(testing.allocator);
     defer cache.deinit();
-    cache.roots = .{ .ctx = &held, .set = &Held.set };
     var diag: Diag = .{};
     const queryOf = struct {
         fn f(bb: Builder, n: i64) Value {
@@ -1325,18 +1310,34 @@ test "a full cache replaces its least recently used unpinned parse and roots wha
         }
     }.f;
     // The first query stays pinned; the second is the oldest unpinned.
-    const pinned_q = queryOf(b, 0);
-    const pinned = try cache.acquire(&interner, pinned_q, &diag);
+    const pinned = try cache.acquire(&interner, queryOf(b, 0), &diag);
     var i: i64 = 1;
     while (i < cache_capacity) : (i += 1) cache.release(try cache.acquire(&interner, queryOf(b, i), &diag));
     try testing.expectEqual(@as(usize, cache_capacity), cache.count());
-    try testing.expectEqual(@as(usize, cache_capacity), held.len);
-    const newest = queryOf(b, 1000);
-    cache.release(try cache.acquire(&interner, newest, &diag));
+    const newest = try cache.acquire(&interner, queryOf(b, 1000), &diag);
+    cache.release(newest);
     try testing.expectEqual(@as(usize, cache_capacity), cache.count());
-    try testing.expect(held.vals[1].payload == newest.payload);
-    try testing.expect(held.vals[0].payload == pinned_q.payload);
-    try testing.expect(pinned == try cache.acquire(&interner, pinned_q, &diag));
+
+    // A collection rooted only by the cache frees the replaced query
+    // and keeps the rest: an equal query built afresh finds each.
+    const Walk = struct {
+        fn roots(ctx: *anyopaque, c: *gc.Collector) void {
+            const self: *const Cache = @ptrCast(@alignCast(ctx));
+            self.mark(c);
+        }
+        fn trace(_: *anyopaque, _: *heap_mod.HeapHeader, _: *gc.Collector) void {
+            unreachable;
+        }
+    };
+    var collector = gc.Collector.init(&heap);
+    collector.host = .{ .ctx = @ptrCast(&cache), .roots = &Walk.roots, .trace = &Walk.trace };
+    try testing.expect(collector.collect(&.{}) > 0);
+    try testing.expect(pinned == try cache.acquire(&interner, queryOf(b, 0), &diag));
+    try testing.expect(newest == try cache.acquire(&interner, queryOf(b, 1000), &diag));
+    i = 2;
+    while (i < cache_capacity) : (i += 1) cache.release(try cache.acquire(&interner, queryOf(b, i), &diag));
+    try testing.expectEqual(@as(usize, cache_capacity), cache.count());
+    cache.release(newest);
     cache.release(pinned);
     cache.release(pinned);
 }

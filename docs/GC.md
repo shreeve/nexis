@@ -116,15 +116,16 @@ order it marks them:
    (`vm.result`).
 7. **The protocol registry**: every method implementation and
    default implementation.
+8. **The Nextomic query caches**: the query value of every entry in
+   the per-VM parse and rule caches, through the hook the nextomic
+   natives install (`vm.nextomic_query_mark`), since a parse borrows
+   from its query value (`docs/NEXTOMIC.md` §5).
 
 The interner holds no heap values (symbols and keywords are
 immediates), so `Interner.trace` is a no-op seam. Open `db` and
 `nextomic` connections hold no heap values; a `durable_ref`,
 `db_read_txn`, `nextomic_db` or `nextomic_entity` handle is reachable
-from wherever the program keeps it. The Nextomic query caches keep
-their query values reachable through the Vars
-`nexis.internal/#%query-cache` and `#%rules-cache`, which are roots
-like any Var (`docs/NEXTOMIC.md` §5).
+from wherever the program keeps it.
 
 **The root stack.** A cycle can run inside any `VM.callValue`, so a
 native that holds a heap Value only in a Zig local across a call

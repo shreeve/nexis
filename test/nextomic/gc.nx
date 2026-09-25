@@ -81,5 +81,25 @@
   (and (= 40 (count (d/q '[:find ?e :where [?e :item/n ?n] [(mod ?n 10) ?k] [(inner-agrees? ?k)]] db)))
        (empty? @wrong)))
 
+; The collector finds the caches' query values through the VM itself, so
+; a program that defines names in nexis.internal cannot unroot them.
+(def long-name (apply str (repeat 200 "x")))
+(def held-query (vector :find '?e :where (vector '?e :item/name long-name)))
+(def held-rules (vector (vector (list 'named '?e) (vector '?e :item/name long-name))))
+(d/q held-query db)
+(d/q '[:find ?e :in $ % :where (named ?e)] db held-rules)
+(in-ns 'nexis.internal)
+(nexis.core/eval (nexis.core/list 'def (nexis.core/symbol "#%query-cache") []))
+(nexis.core/eval (nexis.core/list 'def (nexis.core/symbol "#%rules-cache") 42))
+(nexis.core/in-ns 'user)
+(def held-query nil)
+(def held-rules nil)
+(churn 1)
+(t/check "the query caches survive a program redefining names in nexis.internal"
+  (and (empty? (d/q (vector :find '?e :where (vector '?e :item/name (apply str (repeat 200 "x")))) db))
+       (empty? (d/q '[:find ?e :in $ % :where (named ?e)] db
+                    (vector (vector (list 'named '?e) (vector '?e :item/name (apply str (repeat 200 "x")))))))
+       (= 40 (count (d/q '[:find ?e :in $ % :where (numbered ?e)] db '[[(numbered ?e) [?e :item/n _]]])))))
+
 (d/release c)
 (println "done")

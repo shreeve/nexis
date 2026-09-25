@@ -34,7 +34,6 @@ pub const RuleSet = ir.RuleSet;
 pub const Diag = parse.Diag;
 pub const Cache = parse.Cache;
 pub const RulesCache = parse.RulesCache;
-pub const Roots = parse.Roots;
 pub const Plan = plan.Plan;
 pub const CallHook = exec.CallHook;
 pub const Exec = exec.Exec;

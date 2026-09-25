@@ -449,9 +449,9 @@ syntax over the VM's symbol table, so it is cached per VM by query value
 and reused across every db and basis; the rule set bound to `%` is
 cached the same way. A lookup hits on the same value, or on one `=` to
 it with lists and vectors told apart at every depth, since the parser
-reads them differently. Each cache keeps its query values reachable
-through a var in `nexis.internal`, because a parse borrows from its
-query (string constants, pull patterns), and holds at most 128 parses:
+reads them differently. The VM's root walk marks every query value a
+cache holds (`docs/GC.md` §3), because a parse borrows from its query
+(string constants, pull patterns); each cache holds at most 128 parses:
 a miss replaces the least recently used one that no running query is
 using, so a nested `q` inside a callback never frees the outer query's
 parse (`natives.State`). Constants in data patterns are
@@ -787,8 +787,8 @@ byte keys over it.
 - **Memory**: every operation allocates in its own arena and copies
   only results into the VM heap (§1 commitment 8); the arena dies with
   the operation on every path out of it, a throw included.
-- **The collector**: the query caches (§5) keep the query values they
-  hold reachable through vars in `nexis.internal`; the `q` hook
+- **The collector**: the VM's root walk marks the query values the
+  query caches (§5) hold, so no program can unroot them; the `q` hook
   roots every user-function result for the query's life, and every
   heap value the pipeline builds before the result (a `tuple` or
   `fulltext` result bound as one value, an aggregate's vector or set);
