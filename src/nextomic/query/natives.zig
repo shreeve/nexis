@@ -5,7 +5,8 @@
 //! result; `(explain query & inputs)` returns the plan as a string.
 //! The inputs follow `:in` positionally (`[$]` when the query has no
 //! `:in`): a db value for each source, the rules for `%`, and values
-//! for `?x`, `[?x ...]`, `[?a ?b]` and `[[?a ?b]]`.
+//! for `?x`, `[?x ...]`, `[?a ?b]` and `[[?a ?b]]`. The arg-map form
+//! `(q {:query query :args [inputs...]})` is the same call.
 //!
 //! Caches: one IR cache and one rules cache per VM, on the natives'
 //! per-VM state (`natives.state`). A parsed query is pure syntax over
@@ -46,7 +47,10 @@ const std = @import("std");
 const value = @import("../../value.zig");
 const vm_mod = @import("../../vm.zig");
 const string_mod = @import("../../string.zig");
+const champ = @import("../../coll/champ.zig");
+const dispatch = @import("../../dispatch.zig");
 const natives = @import("../natives.zig");
+const marshal = @import("../marshal.zig");
 const query = @import("../query.zig");
 
 const Value = value.Value;
@@ -220,7 +224,10 @@ fn fnQ(vm: *VM, args: []const Value) VmError!Value {
     return qNative(vm, args, &diag) catch |err| fail(vm, err, &diag);
 }
 
-fn qNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
+fn qNative(vm: *VM, call_args: []const Value, diag: *Diag) !Value {
+    var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
+    defer arena_state.deinit();
+    const args = try argMap(vm, arena_state.allocator(), call_args, diag) orelse call_args;
     const st = try natives.state(vm);
     var hook = Hook.init(vm);
     defer hook.deinit();
@@ -228,12 +235,47 @@ fn qNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     return query.q(vm.allocator, vm.ensureInterner(), vm.ensureHeap(), args[0], null, args[1..], diag, options);
 }
 
+/// The arguments an arg-map call `(q {:query q :args [...]})` stands
+/// for, `[q ...]`; null when the call is not one. A map is an arg-map
+/// when it has `:query`; its other key is `:args`, and anything else is
+/// `:nextomic/query-syntax`.
+fn argMap(vm: *VM, arena: std.mem.Allocator, args: []const Value, diag: *Diag) !?[]const Value {
+    if (args.len != 1 or args[0].kind() != .persistent_map) return null;
+    const it = vm.ensureInterner();
+    const k_query = try it.internKeywordValue("query");
+    const k_args = try it.internKeywordValue("args");
+    const query_v = switch (champ.mapGet(args[0], k_query, &dispatch.hashValue, &dispatch.equal)) {
+        .present => |v| v,
+        .absent => return null,
+    };
+    var inputs: []const Value = &.{};
+    var keys = champ.mapIter(args[0]);
+    while (keys.next()) |e| {
+        if (dispatch.equal(e.key, k_query)) continue;
+        if (!dispatch.equal(e.key, k_args)) {
+            diag.* = .{ .message = "an arg-map takes :query and :args" };
+            return error.QuerySyntax;
+        }
+        inputs = (try marshal.sequence(arena, e.value)) orelse {
+            diag.* = .{ .message = ":args is a vector of the query's inputs" };
+            return error.QuerySyntax;
+        };
+    }
+    const out = try arena.alloc(Value, inputs.len + 1);
+    out[0] = query_v;
+    @memcpy(out[1..], inputs);
+    return out;
+}
+
 fn fnExplain(vm: *VM, args: []const Value) VmError!Value {
     var diag: Diag = .{};
     return explainNative(vm, args, &diag) catch |err| fail(vm, err, &diag);
 }
 
-fn explainNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
+fn explainNative(vm: *VM, call_args: []const Value, diag: *Diag) !Value {
+    var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
+    defer arena_state.deinit();
+    const args = try argMap(vm, arena_state.allocator(), call_args, diag) orelse call_args;
     const st = try natives.state(vm);
     var hook = Hook.init(vm);
     defer hook.deinit();

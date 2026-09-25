@@ -94,6 +94,13 @@
 (println (rows (d/q '[:find ?n ?total :in $ ?status ?min :where [?o :order/status ?status] [?o :order/total ?total]
                      [(> ?total ?min)] [?o :order/customer ?e] [?e :person/name ?n]] db :status/open 20.0)))
 
+; --- the arg-map form ----------------------------------------------------
+
+(println (rows (d/q {:query '[:find ?n :in $ ?a :where [?e :person/age ?a] [?e :person/name ?n]] :args [db 30]})))
+(println (d/q {:query '{:find [?x] :in [[?x ...]]} :args [[1 2]]}))
+(println (t/caught (d/q {:query '[:find ?x :in ?x] :args [1] :timeout 10})))
+(println (t/caught (d/q {:query '[:find ?x :in ?x] :args 1})))
+
 ; --- queries over their inputs alone ---------------------------------------
 
 (println (d/q '[:find ?x :in [?x ...]] [1 2 3]))

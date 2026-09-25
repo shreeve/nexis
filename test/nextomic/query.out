@@ -19,6 +19,10 @@ Cy
 ([Ann 30 4294967296] [Bob 26 4294967297])
 ([Ann])
 ([Cy 42.0])
+([Ann] [Di])
+#{[1] [2]}
+{:error :nextomic/query-syntax, :message an arg-map takes :query and :args}
+{:error :nextomic/query-syntax, :message :args is a vector of the query's inputs}
 #{[1] [2] [3]}
 ([1 3] [2 3])
 6
