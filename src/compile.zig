@@ -1194,7 +1194,7 @@ pub const DeclaredNames = struct {
     }
 
     /// Record every name `form` defines, at any depth: `def`,
-    /// `defn`, `defmacro`, `defrecord` (the type id, `->T`,
+    /// `defn`, `defonce`, `defmacro`, `defrecord` (the type id, `->T`,
     /// `map->T`, `T?`) and `defprotocol` (the protocol and each
     /// method). A definition inside a `let`, a `when` or a call
     /// interns its Var when it runs, exactly like one at top level,
@@ -1219,7 +1219,10 @@ pub const DeclaredNames = struct {
         const name_form = if (items[1].datum == .with_meta) items[1].datum.with_meta.target else items[1];
         if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return;
         const name = name_form.datum.symbol.name;
-        if (std.mem.eql(u8, head, "def") or std.mem.eql(u8, head, "defn") or std.mem.eql(u8, head, "defmacro")) {
+        const plain = [_][]const u8{ "def", "defn", "defonce", "defmacro" };
+        if (for (plain) |h| {
+            if (std.mem.eql(u8, head, h)) break true;
+        } else false) {
             try self.declare(name);
         } else if (std.mem.eql(u8, head, "defrecord")) {
             try self.declare(name);
@@ -3870,10 +3873,10 @@ test "declared names: lexical bindings, quoted data and same-form definitions re
     }
 }
 
-test "declared names: declareForm collects def/defn/defmacro/defrecord/defprotocol through do" {
+test "declared names: declareForm collects def/defn/defonce/defmacro/defrecord/defprotocol through do" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const src = "(do (def a 1) (defn b [] 2) (defmacro c [] 3) (defrecord R [x]) (defprotocol P (m [s]) (n [s])) (println z))";
+    const src = "(do (def a 1) (defn b [] 2) (defmacro c [] 3) (defonce d 4) (defrecord R [x]) (defprotocol P (m [s]) (n [s])) (println z))";
     var p = try reader_mod.parser.parseForm(arena.allocator(), src);
     defer p.parser.deinit();
     var reader = reader_mod.Reader.init(arena.allocator(), src);
@@ -3883,7 +3886,7 @@ test "declared names: declareForm collects def/defn/defmacro/defrecord/defprotoc
     var declared = DeclaredNames.init(testing.allocator);
     defer declared.deinit();
     try declared.declareForm(form);
-    for ([_][]const u8{ "a", "b", "c", "R", "R-type-id", "->R", "map->R", "R?", "P", "m", "n" }) |name| {
+    for ([_][]const u8{ "a", "b", "c", "d", "R", "R-type-id", "->R", "map->R", "R?", "P", "m", "n" }) |name| {
         try testing.expect(declared.contains(name));
     }
     try testing.expect(!declared.contains("z"));

@@ -213,10 +213,11 @@ compiler relies on:
   6. **Current-namespace Var**: bare symbol looked up in the
      current namespace, then up its parent chain (`user`'s
      parent is `nexis.core`, so core names resolve unqualified).
-  7. **Declared-later name**: a top-level `def`/`defn` name of
-     the same file or REPL line (`DeclaredNames`, collected
-     before any form compiles) — so a form may refer to a Var a
-     later form defines.
+  7. **Declared-later name**: a name the same file or REPL line
+     defines anywhere (`def`, `defn`, `defonce`, `defmacro`,
+     `defrecord`'s names, `defprotocol` and its methods;
+     `DeclaredNames`, collected before any form compiles) — so a
+     form may refer to a Var a later form defines.
   8. **Error**: `UnresolvedSymbol` with the symbol's span.
 
 - **Additional guarantees**:
