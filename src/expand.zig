@@ -1192,7 +1192,7 @@ pub fn formToValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod
             } catch return oom;
         },
         .quote => |inner| try callForm(ctx, "quote", inner),
-        .deref => |inner| try callForm(ctx, "deref", inner),
+        .deref => |inner| try callForm(ctx, "nexis.core/deref", inner),
         .anon_fn => |items| try formToValue(ctx, try anonFnForm(ctx, form, items)),
         .with_meta => |wm| try formToValue(ctx, wm.target),
         .syntax_quote, .unquote, .unquote_splicing => ctx.fail(form.origin, "{s} is not data a macro can take", .{describeForm(form)}),
@@ -1480,7 +1480,7 @@ fn expandFnRename(ctx: *ExpandContext, call_form: *const Form, args: []const *Fo
     const new_params = try makeVector(ctx, params, params_form.origin);
     const body = try conditionedBody(b, tail[1..]);
     if (patterns.items.len == 0) return b.list(.{ "fn*", name, new_params, body });
-    return b.list(.{ "fn*", name, new_params, try b.list(.{ "let", try b.vec(.{patterns.items}), body }) });
+    return b.list(.{ "fn*", name, new_params, try b.list(.{ "nexis.core/let", try b.vec(.{patterns.items}), body }) });
 }
 
 /// A fn body whose first form is a condition map `{:pre [c...]
@@ -1547,7 +1547,7 @@ fn expandLoopRename(ctx: *ExpandContext, call_form: *const Form, args: []const *
     }
     // `loop*` drops the hints of hinted names.
     if (patterns.items.len == 0) return renameHead(ctx, call_form, args, "loop*");
-    return b.list(.{ "loop*", try b.vec(.{loop_bindings}), try b.list(.{ "let", try b.vec(.{patterns.items}), args[1..] }) });
+    return b.list(.{ "loop*", try b.vec(.{loop_bindings}), try b.list(.{ "nexis.core/let", try b.vec(.{patterns.items}), args[1..] }) });
 }
 
 /// `(NEW_HEAD args...)`, the args expanded later by the walker for
@@ -1625,9 +1625,9 @@ fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandE
             try b.list(.{ "nexis.core/=", n, a.fixed });
         // `loop`, not `loop*`, so a pattern parameter destructures
         // on entry and after every `recur`.
-        chain = try b.list(.{ "if", test_form, try b.list(.{ "loop", try b.vec(.{bindings.items}), try conditionedBody(b, a.body) }), chain });
+        chain = try b.list(.{ "if", test_form, try b.list(.{ "nexis.core/loop", try b.vec(.{bindings.items}), try conditionedBody(b, a.body) }), chain });
     }
-    return b.list(.{ "fn", name, try b.vec(.{ "&", args }), try b.list(.{ "let*", try b.vec(.{ n, try b.list(.{ "nexis.core/count", args }) }), chain }) });
+    return b.list(.{ "nexis.core/fn", name, try b.vec(.{ "&", args }), try b.list(.{ "let*", try b.vec(.{ n, try b.list(.{ "nexis.core/count", args }) }), chain }) });
 }
 
 /// Append the plain bindings that destructure `pattern` over `expr`
@@ -1790,7 +1790,7 @@ fn expandDefnMacro(
     const parts = try defnParts(ctx, call_form, args);
     const origin = call_form.origin;
     const b = Builder{ .ctx = ctx, .origin = origin };
-    const def_form = try b.list(.{ "def", parts.name, try b.list(.{ "fn", parts.name, parts.fn_tail }) });
+    const def_form = try b.list(.{ "def", parts.name, try b.list(.{ "nexis.core/fn", parts.name, parts.fn_tail }) });
     return try withVarMeta(ctx, def_form, parts.meta, origin);
 }
 
@@ -2033,7 +2033,7 @@ fn forLevel(b: Builder, bindings: []const *Form, outer_acc: *Form, body: *const 
         const value = bindings[m + 1];
         if (key.ns != null) return b.ctx.fail(bindings[m].origin, "for: unknown modifier :{s}/{s}", .{ key.ns.?, key.name });
         inner = if (std.mem.eql(u8, key.name, "let"))
-            try b.list(.{ "let", value, inner })
+            try b.list(.{ "nexis.core/let", value, inner })
         else if (std.mem.eql(u8, key.name, "when"))
             try b.list(.{ "if", value, inner, try b.list(.{ "recur", next_s, acc }) })
         else if (std.mem.eql(u8, key.name, "while"))
@@ -2041,7 +2041,7 @@ fn forLevel(b: Builder, bindings: []const *Form, outer_acc: *Form, body: *const 
         else
             return b.ctx.fail(bindings[m].origin, "for: unknown modifier :{s}", .{key.name});
     }
-    const with_elem = try b.list(.{ "let", try b.vec(.{ bindings[0], try b.list(.{ "nexis.core/first", s }) }), inner });
+    const with_elem = try b.list(.{ "nexis.core/let", try b.vec(.{ bindings[0], try b.list(.{ "nexis.core/first", s }) }), inner });
     return b.list(.{
         "loop*",
         try b.vec(.{ s, try b.list(.{ "nexis.core/seq", bindings[1] }), acc, outer_acc }),
@@ -2133,10 +2133,10 @@ fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *F
     try out.appendSlice(ctx.allocator, &.{
         try b.item("do"),
         try b.list(.{ "def", type_id, try b.list(.{ "nexis.internal/#%register-record-type", try qualifiedNameString(b, rec_name), try b.vec(.{keys}) }) }),
-        try b.list(.{ "defn", names.ctor, try b.vec(.{fields}), try b.list(.{ "nexis.internal/#%make-record", type_id, field_map }) }),
-        try b.list(.{ "defn", names.map_ctor, try b.vec(.{"m"}), try b.list(.{ "nexis.internal/#%make-record", type_id, "m" }) }),
-        try b.list(.{ "defn", names.pred, try b.vec(.{"x"}), try b.list(.{
-            "and",
+        try b.list(.{ "nexis.core/defn", names.ctor, try b.vec(.{fields}), try b.list(.{ "nexis.internal/#%make-record", type_id, field_map }) }),
+        try b.list(.{ "nexis.core/defn", names.map_ctor, try b.vec(.{"m"}), try b.list(.{ "nexis.internal/#%make-record", type_id, "m" }) }),
+        try b.list(.{ "nexis.core/defn", names.pred, try b.vec(.{"x"}), try b.list(.{
+            "nexis.core/and",
             try b.list(.{ "nexis.internal/#%record?", "x" }),
             try b.list(.{ "nexis.core/=", type_id, try b.list(.{ "nexis.internal/#%record-type-id", "x" }) }),
         }) }),
@@ -2160,8 +2160,8 @@ fn recordMethod(b: Builder, fields: []const *Form, method: []const *Form) Expand
         if (try namesSymbol(method[1], field.datum.symbol.name)) continue;
         try bindings.appendSlice(b.ctx.allocator, &.{ field, try b.list(.{ "nexis.core/get", g, try b.kw(field.datum.symbol.name) }) });
     }
-    const body = try b.list(.{ "let", try b.vec(.{ params[0], g }), method[2..] });
-    return b.list(.{ "fn", try b.vec(.{ g, params[1..] }), try b.list(.{ "let*", try b.vec(.{bindings.items}), body }) });
+    const body = try b.list(.{ "nexis.core/let", try b.vec(.{ params[0], g }), method[2..] });
+    return b.list(.{ "nexis.core/fn", try b.vec(.{ g, params[1..] }), try b.list(.{ "let*", try b.vec(.{bindings.items}), body }) });
 }
 
 /// Whether the symbol `name` appears anywhere in `form`.
@@ -2245,7 +2245,7 @@ fn extendClauses(b: Builder, clauses: []const *Form, anchor: ExtendAnchor, out: 
         const method = clause.datum.list;
         const method_key = try b.kw(try plainName(b.ctx, method[0], "a method name"));
         if (stripMeta(method[1]).datum != .vector) return b.ctx.fail(method[1].origin, "expected the method's parameter vector, not {s}", .{describeForm(method[1])});
-        const impl = if (anchor == .record) try recordMethod(b, anchor.record.fields, method) else try b.list(.{ "fn", method[1..] });
+        const impl = if (anchor == .record) try recordMethod(b, anchor.record.fields, method) else try b.list(.{ "nexis.core/fn", method[1..] });
         const protocol, const type_form = switch (anchor) {
             .type_ => |t| .{ other, t },
             .protocol => |p| .{ p, other },

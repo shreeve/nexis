@@ -354,14 +354,22 @@ macro's output calls is the qualified `nexis.core/name` (§10b):
 destructuring uses `nexis.core/nth`, `next` and `get`; overload
 dispatch `count`, `=`, `<`, `not` and `next`; `case` `=`; `for`
 `seq`, `first`, `next` and `conj`; `defrecord` `get` and `=`;
-`case` and `condp` report through `str`; `@x` is `deref`. So
+`case` and `condp` report through `str`; `@x` is `deref`, in a
+macro's arguments too. So
 `(let [nth (fn [& _] :captured)] (let [[a b] [1 2]] [a b]))` is
 `[1 2]`, and a `(defn nth ...)` in the user's namespace changes
 nothing. A qualified `nexis.core/+` is still inlined (`COMPILER.md`
-§4.3), so the qualification costs nothing. Only special-form and
-host-macro heads (`let`, `let*`, `fn`, `fn*`, `loop*`, `if`, `and`,
-`or`, `recur`, `throw`, `quote`, `var`, `defn`, `catch`) stay bare,
-since they are recognised regardless of bindings.
+§4.3), so the qualification costs nothing. The macros a host macro's
+output invokes are qualified the same way, since a local or an
+ns-local macro or Var of the name would otherwise capture the head
+(§3): `nexis.core/let` (destructuring in `fn`, `loop`, `for` and
+record methods), `nexis.core/fn` (`defn`, overloads, method impls),
+`nexis.core/loop` (overload clauses), `nexis.core/defn` and
+`nexis.core/and` (`defrecord`), so `(defn f [let] (for [[a b] xs]
+[let a b]))` and `(defmacro and ...)` before a `defrecord` work as in
+Clojure. Only special-form heads (`let*`, `fn*`, `loop*`, `if`, `do`,
+`def`, `recur`, `throw`, `quote`, `var`) and the clause words
+`catch` and `any` stay bare: no binding can shadow them.
 
 ---
 

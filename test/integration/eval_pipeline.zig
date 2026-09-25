@@ -1060,6 +1060,21 @@ test "hygiene: a local or Var named after a core function cannot capture host-ma
     try expectOutput("(let [rest (fn [& _] :r)] (let [[a & r] [1 2 3]] r))", "(2 3)");
 }
 
+test "hygiene: a local, Var or macro named let, fn, loop, defn or and cannot capture host-macro output" {
+    // MACROEXPAND.md §5: host macros emit `nexis.core/let` and the like.
+    try expectOutputProgram("(defmacro and [& xs] :my-and) (defrecord R9 [a]) (R9? (->R9 1))", "true");
+    try expectOutputProgram("(defn four [let] (for [[a b] [[1 2]]] [let a b])) (four 9)", "([9 1 2])");
+    try expectOutput("(let [loop 5] ((fn ([x] (+ x loop)) ([x y] y)) 1))", "6");
+    try expectOutput("(let [let 5] ((fn [[a b]] (+ a b let)) [1 2]))", "8");
+    try expectOutput("(let [let 5] (loop [[a b] [1 2]] (+ a b let)))", "8");
+    try expectOutput("(let [fn 5] (defn g [x] (+ x fn)) (g 1))", "6");
+    try expectOutput("(let [defn 5] (defrecord RR [a]) (:a (->RR 1)))", "1");
+    try expectOutputProgram("(defprotocol P (m [s])) (let [fn 7 let 8] (defrecord R2 [a] P (m [s] [a fn let])) (m (->R2 1)))", "[1 7 8]");
+    try expectOutputProgram("(defprotocol P (m [s])) (defrecord R3 [a]) (let [fn 7] (extend-type R3 P (m [s] fn)) (m (->R3 1)))", "7");
+    // `@x` in a macro's arguments is `(nexis.core/deref x)`.
+    try expectOutputProgram("(defmacro q [x] (list 'quote x)) (q @a)", "(nexis.core/deref a)");
+}
+
 test "integration: fn with destructured params" {
     try expectOutput(
         \\(do (defn point-sum [[x y]] (+ x y))
