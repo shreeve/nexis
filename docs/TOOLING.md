@@ -24,7 +24,11 @@ every top-level form, then compile and run each before compiling the
 next, on one VM (MACROEXPAND.md §2b, the loader). `require` searches
 the working directory, then the directory of the file being run.
 `*command-line-args*` holds the ARGs (`run` and `-e`); a first line
-that begins `#!` is a comment, so a script can be made executable.
+that begins `#!` is a comment, so a script can be made executable. A
+file (run, tested, disassembled or required) that opens with a UTF-8
+byte-order mark is read without it, so its line-1 columns and carets
+count from the character after the mark (`test/golden/cli/bom.nx`;
+`lib/failing.nx` is required through one).
 `exit`, `read-line` and `*command-line-args*` are STDLIB.md §6.
 
 | Exit status | Meaning |
@@ -40,8 +44,8 @@ that begins `#!` is a comment, so a script can be made executable.
 **The REPL** prints a banner (`nexis repl`, then ``Type `:quit` or hit
 Ctrl-D to exit.``) and prompts with the current namespace (`user=> `,
 `other=> ` after `(ns other)`). It reads lines until they hold
-complete forms, so a form may span lines (with no second prompt) and
-a line may hold several; blank lines are skipped. It evaluates every
+complete forms, so a form or a string literal may span lines (with no
+second prompt) and a line may hold several; blank lines are skipped. It evaluates every
 form and prints each value on stdout as `prn` does, nil included,
 whatever its size. `*1`, `*2` and `*3` hold the last three values. A
 runtime error is reported on stderr, the frames, handlers and
@@ -57,8 +61,9 @@ session.
 
 **A parse, reader or compile error** is `nexis: PATH:LINE:COL:
 LABEL`, the source line and a caret under the span the error is
-about, one `^` per byte (exit 3 for a parse or reader error, 4 for a
-compile error):
+about, one `^` per byte up to the end of that line, so a form that
+spans lines is underlined on its first (exit 3 for a parse or reader
+error, 4 for a compile error):
 
 ```
 nexis: test/golden/cli/bad-number.nx:5:10: reader error: :bad-number-literal 1-2
@@ -67,7 +72,9 @@ nexis: test/golden/cli/bad-number.nx:5:10: reader error: :bad-number-literal 1-2
 ```
 
 The label is ``parse error: unexpected `)` `` or `parse error: unexpected
-end of input` at the token the parser stopped on; `reader error:
+end of input` at the token the parser stopped on, or `parse error:
+unterminated string` at the `"` of a string literal no quote closes;
+`reader error:
 :KIND DETAIL` at the form the reader rejected (`:duplicate-literal-key
 (keyword :a_b)`, FORMS.md §3); a `CompileError` name at the span
 COMPILER.md §7 gives. A macro expansion that failed adds the
@@ -83,7 +90,8 @@ nexis: test/golden/cli/macro-failure.nx:4:1: MacroExpansionFailure: macro m thre
 A file `require` could not load is reported in that file at its
 place (a parse, reader or compile error there), or at the requiring
 form: `require: no file my/app.nx on the load path`, `require: cyclic
-require of my.app`, `require: PATH does not begin with (ns my.app)`.
+require of my.app`, `require: PATH does not begin with (ns my.app)`
+(metadata on the name, `(ns ^:no-doc my.app)`, is allowed).
 
 **A runtime error** that no `try` catches ends the program with exit
 5 and this report on stderr:
@@ -103,7 +111,8 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   follows after `: ` (`runtime error: ArityMismatch: f takes 1
   argument, got 0`). An uncaught throw is `UncaughtThrow` followed by
   the thrown value as `pr-str` prints it (`runtime error:
-  UncaughtThrow {:error :negative, :value -3}`, `uncaught-throw.err`).
+  UncaughtThrow {:error :negative, :value -3}`, `uncaught-throw.err`,
+  whose `throw` spans two lines and is underlined on its first).
 
 - One `at NAME (PATH:LINE:COL)` line per frame of `vm.error_trace`,
   innermost first: `defn` and named `fn*` routines carry their name,

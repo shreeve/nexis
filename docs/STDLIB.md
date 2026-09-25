@@ -104,13 +104,13 @@ any of them throw `:utf8-error` (STRING.md §2, invariant 4).
 | `seq` and the sequence library | — | A string is a seq of its chars (`(seq "hé")` is `(\h \u{E9})`, `(seq "")` nil), so `first`, `map`, `into`, `reverse`, `frequencies` and the rest take one. `(empty "abc")` is nil. A string is not callable (`:not-callable`) | — |
 | `char` | 1 | The char with a code point; a char is itself | `:kind-mismatch` (non-integer), `:invalid-argument` (not a Unicode scalar: negative, past `0x10FFFF`, a surrogate) |
 | `char?` | 1 | Whether the argument is a char | — |
-| `int`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part | `:kind-mismatch` |
+| `int`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part (SEMANTICS.md §2.2). `long` takes any size (`(long 1e30)` is a bignum); `int` only Java's 32-bit `int` range, as Clojure's cast checks | `:kind-mismatch`, `:invalid-argument` (NaN, an infinity; for `int`, out of range) |
 | `name` | 1 | The name part of a keyword or symbol; a string is itself | `:kind-mismatch` |
 | `namespace` | 1 | The namespace part of a keyword or symbol, nil when unqualified | `:kind-mismatch` (a string included) |
 | `keyword` | 1–2 | `(keyword x)`: interned from a string, symbol or keyword (`"a/b"` makes the qualified `:a/b`); nil is nil. `(keyword ns name)`: qualified, a nil `ns` leaving it unqualified. The name is not checked against the reader's grammar: `(keyword "a b")` prints `:a b` | `:kind-mismatch`, `:invalid-argument` (empty name) |
 | `symbol` | 1–2 | As `keyword`, making a symbol; `(symbol nil)` is `:kind-mismatch` | `:kind-mismatch`, `:invalid-argument` (empty name) |
-| `parse-long` | 1 | The integer a whole string spells in decimal, with one optional leading `+` or `-`, within the 64-bit range (a fixnum or bignum); anything else nil (`" 42"`, `"4.2"`, `"99999999999999999999"`) | `:kind-mismatch` (non-string) |
-| `parse-double` | 1 | The float a whole string spells, as Zig's `parseFloat` reads it (`"1e3"`, `"0x1p3"`, `"nan"`, `"Infinity"`); leading or trailing whitespace or any other text nil | `:kind-mismatch` |
+| `parse-long` | 1 | The integer a whole string spells as Java's `Long/valueOf` reads it: ASCII decimal digits after one optional `+` or `-`, within the 64-bit range (a fixnum or bignum); anything else nil (`" 42"`, `"4.2"`, `"1_000"`, `"0x10"`, `"99999999999999999999"`) | `:kind-mismatch` (non-string) |
+| `parse-double` | 1 | The float a string spells in the grammar Clojure's `parse-double` admits (Java's `Double/valueOf`): control or space bytes around an optional sign and `NaN`, `Infinity`, a decimal with an optional exponent (`"1e3"`, `".5"`, `"5."`) or a hex significand with its binary exponent (`"0x1p3"`), the last two with an optional `f`, `F`, `d` or `D` suffix; anything else nil (`"inf"`, `"nan"`, `"1_000"`, `"0x10"`) | `:kind-mismatch` |
 | `parse-boolean` | 1 | `"true"` and `"false"` to booleans, any other string nil (`core.nx`) | `:kind-mismatch` |
 | `format` | 1+ | Below | Below |
 | `read-string` | 1 | The first form of the string as data (the reader of `docs/FORMS.md`); text after it is ignored | `:kind-mismatch`, `:reader-error` (no form, or text that does not read) |
@@ -123,9 +123,9 @@ argument:
 
 | Conversion | Argument | Text |
 |---|---|---|
-| `%s` | any | As `str` makes it, except nil is `nil` (Java prints `null`); the precision is ignored |
+| `%s` | any | As `str` makes it, except nil is `nil` (Java prints `null`); a precision keeps that many characters: `(format "%.2s" "héllo")` is `"hé"` |
 | `%d` | integer (fixnum or bignum) | Decimal |
-| `%f` | any number | Fixed-point with `precision` decimals, 6 by default: `(format "%.2f" 3.14159)` is `"3.14"` |
+| `%f` | any number | Fixed-point with `precision` decimals, 6 by default: `(format "%.2f" 3.14159)` is `"3.14"`. As Java's, the digits are the double's shortest round-trip ones, rounded half up and padded with zeros (`(format "%.2f" 0.125)` is `"0.13"`, `(format "%.20f" 0.1)` `"0.10000000000000000000"`); NaN and the infinities are `NaN`, `Infinity`, `-Infinity` |
 | `%x`, `%X` | integer within 64 bits | Hex of the 64-bit two's complement: `(format "%x" -1)` is `"ffffffffffffffff"`; a larger bignum is `:arithmetic-overflow` |
 | `%c` | char | The char (a number is `:kind-mismatch`) |
 | `%n` | none | `"\n"` |
@@ -133,9 +133,10 @@ argument:
 
 The flags are `-` (pad on the right) and `0` (pad with zeros after
 any sign, for `%d`, `%f`, `%x`, `%X` only). `width` pads on the left
-with spaces and counts bytes, so a multibyte character pads less
-than Java would (`(format "[%3s]" "é")` is `"[ é]"`). A missing
-argument, an unknown conversion or flag (`%e`, `%b`, `%+d`,
+with spaces to that many characters (code points: `(format "[%3s]"
+"é")` is `"[  é]"`). A width or precision above 1048576, a precision
+on a conversion other than `%s` and `%f` (as Java refuses `%.2d`), a
+missing argument, an unknown conversion or flag (`%e`, `%b`, `%+d`,
 `%1$s`) and a trailing `%` are `:invalid-argument`; an argument of
 the wrong kind is `:kind-mismatch`, as is a non-string `fmt`;
 surplus arguments are ignored. `printf` (§6) prints the result.
@@ -148,7 +149,8 @@ The natives are in `string_natives`; `capitalize`, `reverse` and
 `split-lines` are in `src/stdlib/string.nx`. Every function takes
 strings, not chars or nil, except where the table says so; any
 other kind is `:kind-mismatch`. There are no regular expressions:
-`split` and `replace` take a literal string. Searches compare bytes,
+`split` and `replace` take a literal string (`replace` also a char).
+Searches compare bytes,
 which on valid UTF-8 match only at code-point boundaries.
 
 | Name | Arity | Semantics |
@@ -156,20 +158,19 @@ which on valid UTF-8 match only at code-point boundaries.
 | `lower-case`, `upper-case` | 1 | ASCII letters mapped; every other byte, every byte of a multibyte scalar included, unchanged: `(upper-case "héllo")` is `"HéLLO"` |
 | `capitalize` | 1 | The first character upper-case and the rest lower-case, by the same ASCII rule |
 | `reverse` | 1 | The code points in reverse order (not grapheme clusters) |
-| `trim`, `triml`, `trimr` | 1 | Without the six ASCII whitespace bytes (space, tab, LF, VT, FF, CR) at both ends, the start, the end; Unicode whitespace such as U+00A0 stays |
+| `trim`, `triml`, `trimr` | 1 | Without whitespace at both ends, the start, the end. Whitespace is Java's `Character/isWhitespace`, as Clojure's: tab through CR, FS through US, space, and the Unicode space, line and paragraph separators except the no-break ones (U+2003 and U+3000 are trimmed, U+00A0 stays) |
 | `trim-newline` | 1 | Without every `\n` and `\r` at the end |
-| `blank?` | 1 | Whether the argument is nil, empty, or only the six whitespace bytes |
+| `blank?` | 1 | Whether the argument is nil, empty, or only whitespace as `trim` reads it |
 | `starts-with?`, `ends-with?`, `includes?` | 2 | Whether the second string is a prefix, suffix, substring of the first |
 | `index-of` | 2–3 | `(index-of s x)`, `(index-of s x from)`: the code-point index of the first occurrence of `x` (a string or a char) at or after `from`, nil when there is none; `from` is clamped to `[0, (count s)]`; `(index-of "héllo" "l")` is 2 |
-| `last-index-of` | 2–3 | The code-point index of the last occurrence starting at or before `from` (default the count), nil when there is none; the empty string is found at `from` |
-| `split` | 2–3 | `(split s sep)`, `(split s sep limit)`: a vector of the pieces between occurrences of `sep`, as Clojure's `split` with a pattern that matches only `sep`. With no limit (or 0) trailing empty pieces are dropped (`(split "a,b,," ",")` is `["a" "b"]`, `(split ",," ",")` is `[]`, `(split "" ",")` is `[""]`); a positive limit splits at most `limit − 1` times and keeps the rest whole; a negative one keeps every trailing empty piece |
+| `last-index-of` | 2–3 | The code-point index of the last occurrence starting at or before `from` (default the count; clamped to it, and nil when negative, as Java's `lastIndexOf`), nil when there is none; the empty string is found at `from` |
+| `split` | 2–3 | `(split s sep)`, `(split s sep limit)`: a vector of the pieces between occurrences of `sep`, as Clojure's `split` with a pattern that matches only `sep`. With no limit (or 0) trailing empty pieces are dropped (`(split "a,b,," ",")` is `["a" "b"]`, `(split ",," ",")` is `[]`, `(split "" ",")` is `[""]`); a positive limit splits at most `limit − 1` times and keeps the rest whole; a negative one keeps every trailing empty piece. An empty `sep` splits between code points, as Clojure's `#""` does (`(split "abc" "")` is `["a" "b" "c"]`) |
 | `split-lines` | 1 | The lines of `s`, split at `\n` or `\r\n`, trailing empty lines dropped |
 | `join` | 1–2 | `(join coll)`, `(join sep coll)`: the elements of any seqable, each as `str` makes it (nil empty), separated by `sep`: `(join ", " ["a" nil 1])` is `"a, , 1"`; a map joins its entries (`"[:a 1]"`), a string its chars; nil is `""`. A set joins in its iteration order |
-| `replace` | 3 | `(replace s match replacement)`: every non-overlapping occurrence of `match`, left to right, replaced; the scan resumes after each match, so `(replace "aaa" "aa" "x")` is `"xa"`. The replacement is literal (`$1` is two characters) |
+| `replace` | 3 | `(replace s match replacement)`: every non-overlapping occurrence of `match`, left to right, replaced; the scan resumes after each match, so `(replace "aaa" "aa" "x")` is `"xa"`. `match` and `replacement` are both strings or both chars (`(replace "a.b" \. \/)`); an empty `match` is found before every code point and at the end (`(replace "ab" "" "-")` is `"-a-b-"`), as Java's `String.replace`. The replacement is literal (`$1` is two characters) |
 
-Errors beyond `:kind-mismatch`: an empty `sep` or `match` is
-`:invalid-argument`; `split` and `replace` validate every string
-argument as UTF-8 before scanning and throw `:utf8-error` on a
+Errors beyond `:kind-mismatch`: `split` and `replace` validate every
+string argument as UTF-8 before scanning and throw `:utf8-error` on a
 malformed one, so a separator can never cut a scalar in two; the
 code-point functions throw `:utf8-error` as §2 says.
 
@@ -255,9 +256,6 @@ readable mode refuses them with `:utf8-error` rather than emit text
 that is not source. The REPL and `-e` print such a value as
 `#<invalid utf-8>`.
 
-`format.formatToString` builds a heap string from one value; only
-its own test calls it.
-
 ---
 
 ### 6. I/O natives
@@ -279,9 +277,9 @@ buffered, so nothing is lost at `exit`). A VM with no `io` throws
 | `with-out-str` | macro | The body's printed output as a string; nothing reaches stdout. Captures nest; a throw discards the buffer and propagates | — |
 | `slurp` | 1 | The whole file at a path (relative to the working directory) as a string; no size cap; the text must be UTF-8 | `:kind-mismatch` (non-string path), `:invalid-path` (empty, or holding a NUL byte), `:file-not-found`, `:utf8-error`, `:io-error` (a directory, a permission, any other failure) |
 | `spit` | 2+ | `(spit path x)` writes `(str x)` (nil: an empty file), replacing the file; `(spit path x :append true)` writes after its end. Parent directories are not created (`db/open` is the one call that creates them). nil | as `slurp`, and `:file-not-found` for a missing parent; `:arity-mismatch` (an odd option list), `:invalid-argument` (an option other than `:append`) |
-| `read-line` | 0 | The next line of stdin without its `\n` or a trailing `\r`; nil at end of input. It shares one 64 KiB buffer with the REPL, so neither loses what the other read | `:io-error` (a line longer than 64 KiB, a read failure) |
+| `read-line` | 0 | The next line of stdin, of any length, without its `\n` or a trailing `\r`; nil at end of input. It shares one buffer with the REPL, so neither loses what the other read | `:io-error` (a read failure) |
 | `nano-time` | 0 | A monotonic clock in nanoseconds, reduced modulo the fixnum maximum, for intervals; the `time` macro prints `"Elapsed time: X msecs"` with `prn` | — |
-| `exit` | 0–1 | Closes every store `db/open` opened, then ends the process with the status (0 by default; the integer's low eight bits, so `(exit 257)` exits 1 and `(exit -1)` 255). Nothing after it runs, `finally` blocks included, as with Java's `System/exit` (`test/golden/cli/exit-status.nx`). Nextomic connections are not closed | `:kind-mismatch` (non-integer) |
+| `exit` | 0–1 | Closes every store `db/open` or `nextomic/connect` opened, then ends the process with the status (0 by default; the integer's low eight bits, so `(exit 257)` exits 1 and `(exit -1)` 255). Nothing after it runs, `finally` blocks included, as with Java's `System/exit` (`test/golden/cli/exit-status.nx`) | `:kind-mismatch` (non-integer) |
 | `*command-line-args*` | Var | The arguments after the program as a vector of strings, nil when there are none; `nexis run` binds it (TOOLING.md §1) | — |
 
 The `with-out-str` buffer stack is process-wide (one isolate, one

@@ -185,7 +185,7 @@ const core_natives = table("", .{
     .{ "inc", 1, 1, &fnInc },
     .{ "dec", 1, 1, &fnDec },
     .{ "long", 1, 1, &fnLong },
-    .{ "int", 1, 1, &fnLong },
+    .{ "int", 1, 1, &fnInt },
     .{ "char", 1, 1, &fnChar },
     .{ "parse-long", 1, 1, &fnParseLong },
     .{ "parse-double", 1, 1, &fnParseDouble },
@@ -712,8 +712,9 @@ fn fnNth(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(empty? coll)` → true if coll has zero elements. nil →
 /// true (matches Clojure). Strings: byte-length test (O(1)) —
-/// empty UTF-8 ↔ zero codepoints, so no codepoint walk needed.
-fn fnEmptyQ(_: *VM, args: []const Value) VmError!Value {
+/// empty UTF-8 ↔ zero codepoints, so no codepoint walk needed. A
+/// transient is counted, as Clojure 1.12's `empty?` counts one.
+fn fnEmptyQ(vm: *VM, args: []const Value) VmError!Value {
     const c = args[0];
     const is_empty = switch (c.kind()) {
         .nil => true,
@@ -726,6 +727,7 @@ fn fnEmptyQ(_: *VM, args: []const Value) VmError!Value {
         .nextomic_entity => false,
         .persistent_set => champ_mod.setCount(c) == 0,
         .string => string_mod.byteLen(c) == 0,
+        .transient => try transientCount(vm, c) == 0,
         else => return VmError.KindMismatch,
     };
     return value_mod.fromBool(is_empty);
@@ -872,11 +874,22 @@ fn fnDec(vm: *VM, args: []const Value) VmError!Value {
     return vm_mod.numSub(vm.ensureHeap(), args[0], value_mod.fromFixnum(1).?);
 }
 
-/// `(long x)` / `(int x)`: a number as an integer, a float by its
-/// integer part, a char as its code point.
+/// `(long x)`: a number as an integer of any size, a float by its
+/// integer part, a char as its code point (SEMANTICS.md §2.2).
 fn fnLong(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .char) return value_mod.fromFixnum(args[0].asChar()).?;
     return vm_mod.numLong(vm.ensureHeap(), args[0]);
+}
+
+/// `(int x)`: as `long`, within Java's 32-bit `int` range, else
+/// `:invalid-argument`, as Clojure's cast checks.
+fn fnInt(vm: *VM, args: []const Value) VmError!Value {
+    const x = args[0];
+    const min = std.math.minInt(i32);
+    const max = std.math.maxInt(i32);
+    if (x.isFloat() and !(x.asFloat() >= min and x.asFloat() <= max)) return VmError.InvalidArgument;
+    const r = try fnLong(vm, args);
+    return if (r.kind() == .fixnum and r.asFixnum() >= min and r.asFixnum() <= max) r else VmError.InvalidArgument;
 }
 
 /// `(char n)`: the char with code point `n`; a char is itself. A
@@ -889,21 +902,59 @@ fn fnChar(_: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(parse-long s)` / `(parse-double s)`: the number `s` spells in
-/// full, else nil; a non-string is `:kind-mismatch`, as in Clojure.
+/// full as Java's `Long/valueOf` / `Double/valueOf` read it, else nil;
+/// a non-string is `:kind-mismatch`, as in Clojure (STDLIB.md §2).
 fn fnParseLong(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
     const text = string_mod.asBytes(args[0]);
-    const digits = if (text.len > 0 and text[0] == '+') text[1..] else text;
-    if (digits.len > 0 and digits[0] == '+') return value_mod.nilValue();
-    const n = std.fmt.parseInt(i64, digits, 10) catch return value_mod.nilValue();
+    const digits = if (text.len > 0 and (text[0] == '+' or text[0] == '-')) text[1..] else text;
+    if (digits.len == 0) return value_mod.nilValue();
+    for (digits) |c| if (!std.ascii.isDigit(c)) return value_mod.nilValue();
+    const n = std.fmt.parseInt(i64, text, 10) catch return value_mod.nilValue();
     return integerValue(vm, n);
 }
 
 fn fnParseDouble(_: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
-    const text = string_mod.asBytes(args[0]);
-    if (text.len == 0 or std.ascii.isWhitespace(text[0]) or std.ascii.isWhitespace(text[text.len - 1])) return value_mod.nilValue();
+    const text = javaDouble(string_mod.asBytes(args[0])) orelse return value_mod.nilValue();
     return value_mod.fromFloat(std.fmt.parseFloat(f64, text) catch return value_mod.nilValue());
+}
+
+/// The part of `s` for `parseFloat` when `s` is in the grammar
+/// Clojure's `parse-double` admits (Java's `Double/valueOf`): control
+/// and space bytes around an optional sign and `NaN`, `Infinity`, a
+/// decimal with an optional exponent, or a hex significand with a
+/// binary exponent, the last two with an optional `[fFdD]` suffix.
+/// Null otherwise.
+fn javaDouble(s: []const u8) ?[]const u8 {
+    var lo: usize = 0;
+    var hi = s.len;
+    while (lo < hi and s[lo] <= ' ') lo += 1;
+    while (hi > lo and s[hi - 1] <= ' ') hi -= 1;
+    const t = s[lo..hi];
+    const sign = @intFromBool(t.len > 0 and (t[0] == '+' or t[0] == '-'));
+    const body = t[sign..];
+    if (std.mem.eql(u8, body, "NaN") or std.mem.eql(u8, body, "Infinity")) return t;
+    const suffix = body.len > 0 and std.mem.indexOfScalar(u8, "fFdD", body[body.len - 1]) != null;
+    const number = t[0 .. t.len - @intFromBool(suffix)];
+    const hex = body.len > 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X');
+    const isDigit: *const fn (u8) bool = if (hex) &std.ascii.isHex else &std.ascii.isDigit;
+    var i: usize = sign + @as(usize, if (hex) 2 else 0);
+    var mantissa: usize = 0;
+    while (i < number.len and isDigit(number[i])) : (i += 1) mantissa += 1;
+    if (i < number.len and number[i] == '.') {
+        i += 1;
+        while (i < number.len and isDigit(number[i])) : (i += 1) mantissa += 1;
+    }
+    if (mantissa == 0) return null;
+    if (i < number.len and std.mem.indexOfScalar(u8, if (hex) "pP" else "eE", number[i]) != null) {
+        i += 1;
+        if (i < number.len and (number[i] == '+' or number[i] == '-')) i += 1;
+        const digits = i;
+        while (i < number.len and std.ascii.isDigit(number[i])) i += 1;
+        if (i == digits) return null;
+    } else if (hex) return null;
+    return if (i == number.len) number else null;
 }
 
 /// An integer argument as an `i64`: a fixnum, or a bignum that fits.
@@ -2015,21 +2066,25 @@ fn requireCount(v: Value) VmError!usize {
 }
 
 /// `(nthrest coll n)` → coll without its first n elements, as a
-/// list; O(1) past a vector's elements (a view, LIST.md §1).
+/// list; O(1) past a vector's elements (a view, LIST.md §1). As
+/// Clojure's, coll itself when n is not positive or coll is empty.
 fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireCount(args[1]);
+    const n = try requireFixnum(args[1]);
+    if (n <= 0 or args[0].isNil()) return args[0];
+    const count: usize = @intCast(n);
     switch (args[0].kind()) {
-        .list => return list_mod.drop(args[0], n),
+        .list => return list_mod.drop(args[0], count),
         .persistent_vector => {
             const v = args[0];
-            return list_mod.ofVector(vm.ensureHeap(), v, @min(n, vector_mod.count(v))) catch VmError.OutOfMemory;
+            if (vector_mod.count(v) == 0) return v;
+            return list_mod.ofVector(vm.ensureHeap(), v, @min(count, vector_mod.count(v))) catch VmError.OutOfMemory;
         },
         else => {},
     }
     var items = try collectSeq(vm, args[0]);
     defer items.deinit(vm.allocator);
-    const skip = @min(n, items.items.len);
-    return try buildListFromSlice(vm, items.items[skip..]);
+    if (items.items.len == 0) return args[0];
+    return try buildListFromSlice(vm, items.items[@min(count, items.items.len)..]);
 }
 
 /// `(split-at n coll)` → `[(take n coll) (drop n coll)]`.
@@ -2043,12 +2098,14 @@ fn fnSplitAt(vm: *VM, args: []const Value) VmError!Value {
     return vector_mod.fromSlice(vm.ensureHeap(), &.{ head, tail }) catch VmError.OutOfMemory;
 }
 
-/// `(take-last n coll)` / `(drop-last n coll)`.
+/// `(take-last n coll)` / `(drop-last n coll)`; `take-last` of
+/// nothing is nil, as Clojure's.
 fn fnTakeLast(vm: *VM, args: []const Value) VmError!Value {
     const n = try requireCount(args[0]);
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
     const keep = @min(n, items.items.len);
+    if (keep == 0) return value_mod.nilValue();
     return try buildListFromSlice(vm, items.items[items.items.len - keep ..]);
 }
 
@@ -2136,17 +2193,19 @@ fn fnIterate(vm: *VM, args: []const Value) VmError!Value {
     return repeatInto(vm, try requireCount(args[2]), &producer);
 }
 
-/// The list of `n` successive `producer.next(vm)` results.
+/// The list of `n` successive `producer.next(vm)` results. The list
+/// grows as they come rather than reserving `n` slots, so a huge count
+/// fails only when memory does, and a producer that throws first
+/// throws.
 fn repeatInto(vm: *VM, n: usize, producer: anytype) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
-    results.ensureTotalCapacity(vm.allocator, n) catch return VmError.OutOfMemory;
     const scope = vm.rootScope();
     defer scope.release();
     for (0..n) |_| {
         const r = try producer.next(vm);
         try scope.push(r);
-        results.appendAssumeCapacity(r);
+        results.append(vm.allocator, r) catch return VmError.OutOfMemory;
     }
     return try buildListFromSlice(vm, results.items);
 }
@@ -3389,14 +3448,31 @@ fn fnConjBang(vm: *VM, args: []const Value) VmError!Value {
     var t = args[0];
     const sub = try requireTransient(t);
     for (args[1..]) |x| t = switch (sub) {
-        transient_mod.subkind_transient_map => blk: {
-            if (x.kind() != .persistent_vector or vector_mod.count(x) != 2) return VmError.KindMismatch;
-            break :blk transient_mod.mapAssocBang(heap, t, vector_mod.nth(x, 0), vector_mod.nth(x, 1), &dispatch_mod.hashValue, &dispatch_mod.equal);
-        },
+        transient_mod.subkind_transient_map => try conjBangMap(vm, t, x),
         transient_mod.subkind_transient_set => transient_mod.setConjBang(heap, t, x, &dispatch_mod.hashValue, &dispatch_mod.equal),
         else => transient_mod.vectorConjBang(heap, t, x),
     } catch |err| return transientFailure(vm, err);
     return t;
+}
+
+/// A transient map with `x` added as `conj` adds it to a map: a
+/// `[k v]` entry, every entry of a map or record, or nothing for nil.
+fn conjBangMap(vm: *VM, t: Value, x: Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    switch (x.kind()) {
+        .nil => return t,
+        .persistent_map, .record => {
+            var result = t;
+            var it = champ_mod.mapIter(if (x.kind() == .record) record_mod.fieldsOf(x) else x);
+            while (it.next()) |e| result = transient_mod.mapAssocBang(heap, result, e.key, e.value, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
+            return result;
+        },
+        .persistent_vector => {
+            if (vector_mod.count(x) != 2) return VmError.ArityMismatch;
+            return transient_mod.mapAssocBang(heap, t, vector_mod.nth(x, 0), vector_mod.nth(x, 1), &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| transientFailure(vm, err);
+        },
+        else => return VmError.KindMismatch,
+    }
 }
 
 /// `(assoc! t k v & kvs)` on a transient map or vector.
@@ -3454,10 +3530,11 @@ fn fnPopBang(vm: *VM, args: []const Value) VmError!Value {
 /// the next argument: `%s` (as `str` makes it text, nil as `nil`),
 /// `%d` (an integer), `%f` (any number; 6 decimals unless `.N`),
 /// `%x` / `%X` (an integer in hex, two's complement when negative),
-/// `%c` (a char), `%n` and `%%`. A width pads on the left, or the
-/// right with `-`; `0` pads a number with zeros. A missing argument
-/// or unknown conversion is `:invalid-argument`, an argument of the
-/// wrong kind `:kind-mismatch`.
+/// `%c` (a char), `%n` and `%%`. A width pads to that many code
+/// points on the left, or the right with `-`; `0` pads a number with
+/// zeros; `.N` keeps N characters of a `%s`. A missing argument or
+/// unknown conversion is `:invalid-argument`, an argument of the
+/// wrong kind `:kind-mismatch` (STDLIB.md §2).
 fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
     const fmt = string_mod.asBytes(args[0]);
@@ -3479,17 +3556,15 @@ fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
         while (i < fmt.len and (fmt[i] == '-' or fmt[i] == '0')) : (i += 1) {
             if (fmt[i] == '-') left = true else zero = true;
         }
-        var width: usize = 0;
-        while (i < fmt.len and std.ascii.isDigit(fmt[i])) : (i += 1) width = width * 10 + (fmt[i] - '0');
+        const width = try formatField(fmt, &i);
         var precision: ?usize = null;
         if (i < fmt.len and fmt[i] == '.') {
             i += 1;
-            var p: usize = 0;
-            while (i < fmt.len and std.ascii.isDigit(fmt[i])) : (i += 1) p = p * 10 + (fmt[i] - '0');
-            precision = p;
+            precision = try formatField(fmt, &i);
         }
         if (i >= fmt.len) return VmError.InvalidArgument;
         const conv = fmt[i];
+        if (precision != null and conv != 's' and conv != 'f') return VmError.InvalidArgument;
         piece.clearRetainingCapacity();
         const w = &piece.writer;
         switch (conv) {
@@ -3500,12 +3575,15 @@ fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
                 const a = args[next];
                 next += 1;
                 switch (conv) {
-                    's' => if (a.isNil()) w.writeAll("nil") catch return VmError.OutOfMemory else try appendStrValue(&piece, a, interner),
+                    's' => {
+                        if (a.isNil()) w.writeAll("nil") catch return VmError.OutOfMemory else try appendStrValue(&piece, a, interner);
+                        if (precision) |p| piece.shrinkRetainingCapacity(codepointPrefix(piece.written(), p));
+                    },
                     'd' => {
                         if (!vm_mod.isInteger(a)) return VmError.KindMismatch;
                         format_mod.format(a, .readable, w, interner) catch return VmError.OutOfMemory;
                     },
-                    'f' => w.printFloat((try vm_mod.numDouble(a)).asFloat(), .{ .mode = .decimal, .precision = precision orelse 6 }) catch return VmError.OutOfMemory,
+                    'f' => try formatFixed(vm, w, (try vm_mod.numDouble(a)).asFloat(), precision orelse 6),
                     'x', 'X' => {
                         const n: u64 = @bitCast(try intArg(a));
                         w.printInt(n, 16, if (conv == 'x') .lower else .upper, .{}) catch return VmError.OutOfMemory;
@@ -3519,7 +3597,8 @@ fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
             },
         }
         const text = piece.written();
-        const pad = if (width > text.len) width - text.len else 0;
+        const chars = std.unicode.utf8CountCodepoints(text) catch text.len;
+        const pad = if (width > chars) width - chars else 0;
         const numeric = conv == 'd' or conv == 'f' or conv == 'x' or conv == 'X';
         if (left) {
             out.writer.writeAll(text) catch return VmError.OutOfMemory;
@@ -3536,6 +3615,41 @@ fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
         }
     }
     return string_mod.fromBytes(vm.ensureHeap(), out.written()) catch VmError.OutOfMemory;
+}
+
+/// The largest width or precision `format` accepts; a larger one would
+/// only allocate padding.
+const format_field_max = 1 << 20;
+
+/// The decimal number at `fmt[i.*..]`, advancing `i` past it; 0 when
+/// there is none, `:invalid-argument` above `format_field_max`.
+fn formatField(fmt: []const u8, i: *usize) VmError!usize {
+    var n: usize = 0;
+    while (i.* < fmt.len and std.ascii.isDigit(fmt[i.*])) : (i.* += 1) {
+        n = n * 10 + (fmt[i.*] - '0');
+        if (n > format_field_max) return VmError.InvalidArgument;
+    }
+    return n;
+}
+
+/// The byte length of the first `n` code points of `text`.
+fn codepointPrefix(text: []const u8, n: usize) usize {
+    var it = std.unicode.Utf8View.initUnchecked(text).iterator();
+    for (0..n) |_| _ = it.nextCodepointSlice() orelse break;
+    return it.i;
+}
+
+/// `%f`: `x` with `precision` decimals from its shortest round-trip
+/// digits, as Java's `Formatter` rounds them; NaN and the infinities
+/// as Java spells them.
+fn formatFixed(vm: *VM, w: *std.Io.Writer, x: f64, precision: usize) VmError!void {
+    if (std.math.isNan(x)) return w.writeAll("NaN") catch VmError.OutOfMemory;
+    if (std.math.isInf(x)) return w.writeAll(if (x < 0) "-Infinity" else "Infinity") catch VmError.OutOfMemory;
+    // Every f64's integer digits and sign, plus the decimals.
+    const buf = vm.allocator.alloc(u8, std.fmt.float.bufferSize(.decimal, f64) + 1 + precision) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(buf);
+    const text = std.fmt.float.render(buf, x, .{ .mode = .decimal, .precision = precision }) catch return VmError.InvalidArgument;
+    w.writeAll(text) catch return VmError.OutOfMemory;
 }
 
 // =============================================================================
@@ -3746,40 +3860,54 @@ fn fnStringUpperCase(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// The six ASCII whitespace characters: space, tab, LF, VT, FF, CR.
-fn isAsciiSpace(b: u8) bool {
-    return b == ' ' or b == '\t' or b == '\n' or b == 0x0B or b == 0x0C or b == '\r';
+/// Java's `Character.isWhitespace`, which Clojure's `blank?` and `trim`
+/// use: the Unicode space, line and paragraph separators except the
+/// no-break ones, and the controls tab through CR and FS through US.
+fn isJavaWhitespace(c: u21) bool {
+    return switch (c) {
+        0x09...0x0D, 0x1C...0x20, 0x1680, 0x2000...0x2006, 0x2008...0x200A, 0x2028, 0x2029, 0x205F, 0x3000 => true,
+        else => false,
+    };
 }
 
-/// `trim`, `triml`, `trimr`: `s` without ASCII whitespace at both
-/// ends, the start or the end; `trim-newline` without every `\n`
-/// and `\r` at the end.
-fn trimString(vm: *VM, s: Value, left: bool, right: bool, comptime isTrimmed: fn (u8) bool) VmError!Value {
+/// `trim`, `triml`, `trimr`: `s` without whitespace at both ends, the
+/// start or the end; `trim-newline` without every `\n` and `\r` at the
+/// end. Bytes that are not UTF-8 are never trimmed.
+fn trimString(vm: *VM, s: Value, left: bool, right: bool, comptime isTrimmed: fn (u21) bool) VmError!Value {
     const src = try stringArg(s);
     var lo: usize = 0;
     var hi: usize = src.len;
-    if (left) while (lo < hi and isTrimmed(src[lo])) {
-        lo += 1;
+    if (left) while (lo < hi) {
+        const len = std.unicode.utf8ByteSequenceLength(src[lo]) catch break;
+        if (len > hi - lo) break;
+        const c = std.unicode.utf8Decode(src[lo..][0..len]) catch break;
+        if (!isTrimmed(c)) break;
+        lo += len;
     };
-    if (right) while (hi > lo and isTrimmed(src[hi - 1])) {
-        hi -= 1;
+    if (right) while (hi > lo) {
+        var start = hi - 1;
+        while (start > lo and src[start] & 0xC0 == 0x80) start -= 1;
+        const c = std.unicode.utf8Decode(src[start..hi]) catch break;
+        if (!isTrimmed(c)) break;
+        hi = start;
     };
     return string_mod.fromBytes(vm.ensureHeap(), src[lo..hi]) catch return VmError.OutOfMemory;
 }
 
-fn isNewline(b: u8) bool {
-    return b == '\n' or b == '\r';
+fn isNewline(c: u21) bool {
+    return c == '\n' or c == '\r';
 }
 
 fn fnStringTrim(vm: *VM, args: []const Value) VmError!Value {
-    return trimString(vm, args[0], true, true, isAsciiSpace);
+    return trimString(vm, args[0], true, true, isJavaWhitespace);
 }
 
 fn fnStringTriml(vm: *VM, args: []const Value) VmError!Value {
-    return trimString(vm, args[0], true, false, isAsciiSpace);
+    return trimString(vm, args[0], true, false, isJavaWhitespace);
 }
 
 fn fnStringTrimr(vm: *VM, args: []const Value) VmError!Value {
-    return trimString(vm, args[0], false, true, isAsciiSpace);
+    return trimString(vm, args[0], false, true, isJavaWhitespace);
 }
 
 fn fnStringTrimNewline(vm: *VM, args: []const Value) VmError!Value {
@@ -3791,10 +3919,19 @@ fn stringArg(v: Value) VmError![]const u8 {
     return string_mod.asBytes(v);
 }
 
-/// `(blank? s)` → whether `s` is nil, empty or only whitespace.
+/// `(blank? s)` → whether `s` is nil, empty or only whitespace (Java's,
+/// as `trim` reads it).
 fn fnStringBlankQ(_: *VM, args: []const Value) VmError!Value {
     if (args[0].isNil()) return value_mod.fromBool(true);
-    for (try stringArg(args[0])) |b| if (!isAsciiSpace(b)) return value_mod.fromBool(false);
+    const src = try stringArg(args[0]);
+    var i: usize = 0;
+    while (i < src.len) {
+        const len = std.unicode.utf8ByteSequenceLength(src[i]) catch return value_mod.fromBool(false);
+        if (len > src.len - i) return value_mod.fromBool(false);
+        const c = std.unicode.utf8Decode(src[i..][0..len]) catch return value_mod.fromBool(false);
+        if (!isJavaWhitespace(c)) return value_mod.fromBool(false);
+        i += len;
+    }
     return value_mod.fromBool(true);
 }
 
@@ -3838,7 +3975,10 @@ fn stringSearch(vm: *VM, args: []const Value, last: bool) VmError!Value {
     var buf: [4]u8 = undefined;
     const needle = try needleBytes(args[1], &buf);
     const n = string_mod.codepointCount(args[0]) catch return VmError.Utf8Error;
-    const from: usize = if (args.len == 3) @intCast(std.math.clamp(try requireFixnum(args[2]), 0, @as(i64, @intCast(n)))) else if (last) n else 0;
+    const from_arg: ?i64 = if (args.len == 3) try requireFixnum(args[2]) else null;
+    // Java's lastIndexOf finds nothing before a negative index.
+    if (last and from_arg != null and from_arg.? < 0) return value_mod.nilValue();
+    const from: usize = if (from_arg) |f| @intCast(std.math.clamp(f, 0, @as(i64, @intCast(n)))) else if (last) n else 0;
     const at = string_mod.byteRangeForCodepoints(args[0], from, from) catch return VmError.Utf8Error;
     const byte_at: ?usize = if (last)
         std.mem.lastIndexOf(u8, src[0..@min(src.len, at.start + needle.len)], needle)
@@ -3852,15 +3992,14 @@ fn stringSearch(vm: *VM, args: []const Value, last: bool) VmError!Value {
 /// `sep`, as Clojure's `split` with a regex that matches only `sep`:
 /// trailing empty pieces are dropped; a positive `limit` splits at
 /// most `limit - 1` times and keeps the rest whole; a negative one
-/// keeps trailing empties.
-///   - Empty separator → :invalid-argument
+/// keeps trailing empties. An empty `sep` splits between code points,
+/// as `#""` does.
 ///   - Invalid UTF-8 in either string → :utf8-error
 fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string or args[1].kind() != .string) return VmError.KindMismatch;
     const src = string_mod.asBytes(args[0]);
     const sep = string_mod.asBytes(args[1]);
     const limit: i64 = if (args.len == 3) try requireFixnum(args[2]) else 0;
-    if (sep.len == 0) return VmError.InvalidArgument;
     // A separator that is not UTF-8 could match the first byte of a
     // multibyte scalar and split inside it (STRING.md §2).
     if (!std.unicode.utf8ValidateSlice(src)) return VmError.Utf8Error;
@@ -3870,7 +4009,14 @@ fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
     defer pieces.deinit(vm.allocator);
     var rest = src;
     while (limit <= 0 or pieces.items.len + 1 < limit) {
-        const at = std.mem.indexOf(u8, rest, sep) orelse break;
+        // An empty separator matches after each code point but the
+        // last, whose match ends the text.
+        const at = if (sep.len > 0)
+            std.mem.indexOf(u8, rest, sep) orelse break
+        else if (rest.len > 0)
+            std.unicode.utf8ByteSequenceLength(rest[0]) catch unreachable
+        else
+            break;
         pieces.append(vm.allocator, rest[0..at]) catch return VmError.OutOfMemory;
         rest = rest[at + sep.len ..];
     }
@@ -3906,8 +4052,9 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(nexis.string/replace s match replacement)` — literal,
-/// all-non-overlapping, left-to-right.
-///   - Empty `match` → :invalid-argument
+/// all-non-overlapping, left-to-right; `match` and `replacement` are
+/// both strings or both chars. An empty `match` matches before every
+/// code point and at the end, as Java's `String.replace`.
 ///   - Invalid UTF-8 in any arg → :utf8-error
 /// After each match, cursor advances by `match.len` so
 /// `(replace "aaa" "aa" "x") → "xa"`.
@@ -3915,13 +4062,13 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
     const match = args[1];
     const replacement = args[2];
-    if (s.kind() != .string or match.kind() != .string or replacement.kind() != .string) {
-        return VmError.KindMismatch;
-    }
+    const pair: Kind = if (match.kind() == .char) .char else .string;
+    if (s.kind() != .string or match.kind() != pair or replacement.kind() != pair) return VmError.KindMismatch;
     const src = string_mod.asBytes(s);
-    const m = string_mod.asBytes(match);
-    const r = string_mod.asBytes(replacement);
-    if (m.len == 0) return VmError.InvalidArgument;
+    var match_buf: [4]u8 = undefined;
+    var replacement_buf: [4]u8 = undefined;
+    const m = try needleBytes(match, &match_buf);
+    const r = try needleBytes(replacement, &replacement_buf);
     // Validate all three byte slices as UTF-8 before scanning.
     // Same rationale
     // as fnStringSplit — keep `nexis.string/*` semantically a
@@ -3933,7 +4080,15 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(vm.allocator);
 
-    var cursor: usize = 0;
+    if (m.len == 0) {
+        var it = std.unicode.Utf8View.initUnchecked(src).iterator();
+        while (it.nextCodepointSlice()) |c| {
+            buf.appendSlice(vm.allocator, r) catch return VmError.OutOfMemory;
+            buf.appendSlice(vm.allocator, c) catch return VmError.OutOfMemory;
+        }
+        buf.appendSlice(vm.allocator, r) catch return VmError.OutOfMemory;
+    }
+    var cursor: usize = if (m.len == 0) src.len else 0;
     while (cursor < src.len) {
         const rel = std.mem.indexOf(u8, src[cursor..], m);
         if (rel) |off| {
@@ -4103,33 +4258,60 @@ fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
 
 /// The process's stdin, read through one buffer: the REPL's input
 /// and `read-line` share it, so neither loses what the other
-/// buffered. One isolate, one thread.
+/// buffered. A line longer than the buffer is gathered in
+/// `stdin_long_line`. One isolate, one thread.
 var stdin_buf: [64 * 1024]u8 = undefined;
 var stdin_reader: ?std.Io.File.Reader = null;
+var stdin_long_line: std.ArrayList(u8) = .empty;
 
 /// The next line of stdin without its newline, null at end of input;
-/// valid until the next read. A line longer than the buffer is
-/// `error.StreamTooLong`.
-pub fn readStdinLine(io: std.Io) error{ ReadFailed, StreamTooLong }!?[]const u8 {
+/// valid until the next read.
+pub fn readStdinLine(io: std.Io) error{ ReadFailed, OutOfMemory }!?[]const u8 {
     if (stdin_reader == null) stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buf);
-    const line = (try stdin_reader.?.interface.takeDelimiter('\n')) orelse return null;
+    return readLine(&stdin_reader.?.interface, &stdin_long_line, std.heap.page_allocator);
+}
+
+/// The next line of `r` without its newline or a trailing `\r`, null
+/// at end of input; valid until the next read. A line longer than
+/// `r`'s buffer is gathered in `overflow`, allocated from `gpa`.
+fn readLine(r: *std.Io.Reader, overflow: *std.ArrayList(u8), gpa: std.mem.Allocator) error{ ReadFailed, OutOfMemory }!?[]const u8 {
+    const line = r.takeDelimiter('\n') catch |err| switch (err) {
+        error.ReadFailed => return error.ReadFailed,
+        error.StreamTooLong => long: {
+            overflow.clearRetainingCapacity();
+            var w: std.Io.Writer.Allocating = .fromArrayList(gpa, overflow);
+            const streamed = r.streamDelimiterEnding(&w.writer, '\n');
+            overflow.* = w.toArrayList();
+            _ = streamed catch |e| return switch (e) {
+                error.ReadFailed => error.ReadFailed,
+                error.WriteFailed => error.OutOfMemory,
+            };
+            // The newline, unless the input ended first.
+            if (r.bufferedLen() > 0) r.toss(1);
+            break :long overflow.items;
+        },
+    } orelse return null;
     return std.mem.trimEnd(u8, line, "\r");
 }
 
 /// `(read-line)` → the next line of stdin as a string, nil at end
 /// of input.
 fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
-    const line = (readStdinLine(vm.io orelse return VmError.IoError) catch return VmError.IoError) orelse return value_mod.nilValue();
+    const line = (readStdinLine(vm.io orelse return VmError.IoError) catch |err| return switch (err) {
+        error.OutOfMemory => VmError.OutOfMemory,
+        error.ReadFailed => VmError.IoError,
+    }) orelse return value_mod.nilValue();
     return string_mod.fromBytes(vm.ensureHeap(), line) catch VmError.OutOfMemory;
 }
 
 /// `(exit)` / `(exit status)` → ends the process with `status` (0 by
-/// default) after closing every store the program opened; nothing
-/// after it runs, `finally` blocks included, as with Java's
-/// `System/exit`.
+/// default) after closing every store the program opened, through
+/// `db/open` or `nextomic/connect`; nothing after it runs, `finally`
+/// blocks included, as with Java's `System/exit`.
 fn fnExit(vm: *VM, args: []const Value) VmError!Value {
     const status: u8 = if (args.len == 0) 0 else @truncate(@as(u64, @bitCast(try requireFixnum(args[0]))));
     for (vm.db_connections.items) |conn| db_mod.shutdown(@ptrCast(@alignCast(conn)));
+    if (vm.nextomic_close_callback) |close| for (vm.nextomic_connections.items) |conn| close(conn);
     std.process.exit(status);
 }
 
@@ -4803,6 +4985,17 @@ test "stdlib: name of a string is the string itself" {
     const s = try string_mod.fromBytes(vm.ensureHeap(), "abc");
     const named = try fnName(&vm, &.{s});
     try testing.expectEqual(s.payload, named.payload);
+}
+
+test "stdlib: readLine returns a line longer than the reader's buffer whole" {
+    var buf: [8]u8 = undefined;
+    var r: std.testing.Reader = .init(&buf, &.{ .{ .buffer = "short\r\n0123456789abcdef" }, .{ .buffer = "ghij\nthe-last-line" } });
+    var overflow: std.ArrayList(u8) = .empty;
+    defer overflow.deinit(testing.allocator);
+    try testing.expectEqualStrings("short", (try readLine(&r.interface, &overflow, testing.allocator)).?);
+    try testing.expectEqualStrings("0123456789abcdefghij", (try readLine(&r.interface, &overflow, testing.allocator)).?);
+    try testing.expectEqualStrings("the-last-line", (try readLine(&r.interface, &overflow, testing.allocator)).?);
+    try testing.expect(try readLine(&r.interface, &overflow, testing.allocator) == null);
 }
 
 test "stdlib: nativeFnValue round-trips" {
