@@ -44,14 +44,14 @@ const ctrl_names = [_]?[]const u8{ "try-enter", "try-exit", "finally-exit", "thr
 
 /// The name of group number `group`, or null for a number outside
 /// VM.md §10.
-pub fn groupName(group: u6) ?[]const u8 {
+fn groupName(group: u6) ?[]const u8 {
     if (group >= group_names.len) return null;
     return group_names[group];
 }
 
 /// The name of `variant` within `group`, or null when the group
 /// defines no such variant.
-pub fn variantName(group: vm.Group, variant: u6) ?[]const u8 {
+fn variantName(group: vm.Group, variant: u6) ?[]const u8 {
     const table: []const ?[]const u8 = switch (group) {
         .jump => &jump_names,
         .cmp => &cmp_names,
@@ -89,7 +89,7 @@ fn immediateB(group: vm.Group, variant: u6) bool {
 /// its constant pool, depth first. `interner` names keywords,
 /// symbols and Vars; a null interner prints them by id.
 pub fn disassemble(routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
-    try disassembleOne(routine, interner, writer);
+    try disassembleRoutine(routine, interner, writer);
     for (routine.consts) |c| switch (c) {
         .routine => |child| {
             try writer.writeAll("\n");
@@ -103,7 +103,7 @@ pub fn disassemble(routine: *const vm.Routine, interner: ?*const intern_mod.Inte
 ///
 ///   routine NAME (PATH:LINE:COL) slots=N arity=A upvalues=U
 ///     0000  mov:load-const  s1  c0=42  -   ; 4:9
-pub fn disassembleOne(routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
+fn disassembleRoutine(routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
     try writer.print("routine {s}", .{routine.name});
     if (routine.source) |src| {
         if (routine.origin) |origin| {
@@ -128,7 +128,11 @@ pub fn disassembleOne(routine: *const vm.Routine, interner: ?*const intern_mod.I
             const group: vm.Group = @enumFromInt(inst.group);
             try writeOperand(inst.a, routine, interner, false, writer);
             try writer.writeAll("  ");
-            try writeOperand(inst.b, routine, interner, immediateB(group, inst.variant), writer);
+            if (group == .closure and inst.variant == @intFromEnum(vm.Closure_.make)) {
+                try writeCaptures(inst.b.index, routine, writer);
+            } else {
+                try writeOperand(inst.b, routine, interner, immediateB(group, inst.variant), writer);
+            }
             try writer.writeAll("  ");
             try writeOperand(inst.c, routine, interner, false, writer);
         }
@@ -169,6 +173,23 @@ fn writeOpcode(inst: vm.Inst, writer: *Writer) Writer.Error!void {
     try writer.writeAll(text);
     var pad: usize = text.len;
     while (pad < 18) : (pad += 1) try writer.writeAll(" ");
+}
+
+/// A `closure:make` descriptor: its index, then where each captured
+/// cell comes from, `sN` for a cell in this frame's slot N and `uN`
+/// for this closure's upvalue N (VM.md §6).
+fn writeCaptures(index: u12, routine: *const vm.Routine, writer: *Writer) Writer.Error!void {
+    try writer.print("#{d}", .{index});
+    if (index >= routine.capture_descs.len) return;
+    try writer.writeAll("[");
+    for (routine.capture_descs[index].sources, 0..) |source, i| {
+        if (i > 0) try writer.writeAll(" ");
+        switch (source) {
+            .local_cell_slot => |slot| try writer.print("s{d}", .{slot}),
+            .inherited_upvalue => |u| try writer.print("u{d}", .{u}),
+        }
+    }
+    try writer.writeAll("]");
 }
 
 /// One operand: its kind letter and index, then what the index
@@ -281,6 +302,24 @@ test "a listing shows every operand kind, immediates, constants and jump targets
         \\  0003  call:call           s0  #2  s3
         \\  0004  mov:move            s2  u0  -
         \\  0005  call:return         s1  -  -
+        \\
+    , out.written());
+}
+
+test "closure:make lists where each captured cell comes from" {
+    const inner = vm.Routine{ .code = &.{vm.asm_.returnSlot(0)}, .consts = &.{}, .slot_count = 1, .name = "f", .upvalue_count = 2 };
+    const consts = [_]vm.Const{.{ .routine = &inner }};
+    const sources = [_]vm.CaptureSource{ .{ .local_cell_slot = 3 }, .{ .inherited_upvalue = 1 } };
+    const descs = [_]vm.CaptureDescriptor{ .{ .sources = &.{} }, .{ .sources = &sources } };
+    const code = [_]vm.Inst{ vm.asm_.closureMake(0, 0, 1), vm.asm_.closureMake(0, 1, 2) };
+    const routine = vm.Routine{ .code = &code, .consts = &consts, .capture_descs = &descs, .slot_count = 4, .name = "t" };
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try disassembleRoutine(&routine, null, &out.writer);
+    try testing.expectEqualStrings(
+        \\routine t slots=4 arity=0 upvalues=0
+        \\  0000  closure:make        c0=<routine f>  #0[]  s1
+        \\  0001  closure:make        c0=<routine f>  #1[s3 u1]  s2
         \\
     , out.written());
 }
