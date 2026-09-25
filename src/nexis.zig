@@ -198,26 +198,23 @@ pub const Lexer = struct {
         };
     }
 
+    /// A string token runs to the closing `"`, across lines; the reader
+    /// decodes the escapes. An unterminated string is an `err` token of
+    /// its opening quote alone, so the parse error points there.
     fn scanString(self: *Lexer, start: u32, pre: u8) Token {
         const src = self.base.source;
-        // start points at the opening '"'.
-        self.base.pos = start + 1;
-        while (self.base.pos < src.len) {
-            const ch = src[self.base.pos];
-            if (ch == '"') {
-                self.base.pos += 1;
-                return self.finish(.string, start, pre);
+        var pos = start + 1;
+        while (pos < src.len) : (pos += 1) {
+            switch (src[pos]) {
+                '"' => {
+                    self.base.pos = pos + 1;
+                    return self.finish(.string, start, pre);
+                },
+                '\\' => pos += 1,
+                else => {},
             }
-            if (ch == '\\') {
-                // Accept any next byte; detailed escape validation is the
-                // reader's job.
-                self.base.pos += @min(2, src.len - self.base.pos);
-                continue;
-            }
-            if (ch == '\n') break; // no multi-line strings (PLAN §7.2).
-            self.base.pos += 1;
         }
-        return self.finish(.err, start, pre);
+        return self.single(.err, start, pre);
     }
 
     /// A char token: `\`, one character (a whole UTF-8 sequence, or

@@ -116,7 +116,6 @@ pub const Form = struct {
 pub const ReaderError = error{
     ReaderFailure,
     OutOfMemory,
-    InvalidUtf8,
 };
 
 pub const ErrorKind = enum {
@@ -132,6 +131,8 @@ pub const ErrorKind = enum {
     invalid_symbol,
     invalid_keyword,
     unknown_reader_construct,
+    /// A string literal's bytes are not UTF-8.
+    invalid_utf8,
     /// Nesting deeper than the native stack's budget (`src/stack.zig`).
     nesting_too_deep,
 };
@@ -472,67 +473,43 @@ pub const Reader = struct {
     // String / character / number decoding helpers
     // -------------------------------------------------------------------------
 
+    /// A string body with its escapes decoded (PLAN §7.2). The bytes
+    /// must be UTF-8; an escape that fails is the error's detail.
     fn decodeStringEscapes(self: *Reader, body: []const u8, span: SrcSpan) ReaderError![]const u8 {
-        var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(self.allocator());
+        if (!std.unicode.utf8ValidateSlice(body)) return self.fail(.invalid_utf8, span, null);
+        // Every escape is at least as long as the bytes it stands for.
+        var out = try std.ArrayList(u8).initCapacity(self.allocator(), body.len);
         var i: usize = 0;
-        while (i < body.len) {
-            const ch = body[i];
-            if (ch != '\\') {
-                try out.append(self.allocator(), ch);
-                i += 1;
+        while (std.mem.indexOfScalarPos(u8, body, i, '\\')) |at| {
+            out.appendSliceAssumeCapacity(body[i..at]);
+            i = @min(at + 2, body.len);
+            const simple: ?u8 = if (at + 1 == body.len) null else switch (body[at + 1]) {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                '\\' => '\\',
+                '"' => '"',
+                else => null,
+            };
+            if (simple) |b| {
+                out.appendAssumeCapacity(b);
                 continue;
             }
-            if (i + 1 >= body.len) {
-                return self.fail(.invalid_string_escape, span, body);
-            }
-            const esc = body[i + 1];
-            switch (esc) {
-                'n' => {
-                    try out.append(self.allocator(), '\n');
-                    i += 2;
-                },
-                't' => {
-                    try out.append(self.allocator(), '\t');
-                    i += 2;
-                },
-                'r' => {
-                    try out.append(self.allocator(), '\r');
-                    i += 2;
-                },
-                '\\' => {
-                    try out.append(self.allocator(), '\\');
-                    i += 2;
-                },
-                '"' => {
-                    try out.append(self.allocator(), '"');
-                    i += 2;
-                },
-                'u' => {
-                    if (i + 2 >= body.len or body[i + 2] != '{') {
-                        return self.fail(.invalid_string_escape, span, body);
-                    }
-                    const hex_start = i + 3;
-                    var hex_end = hex_start;
-                    while (hex_end < body.len and body[hex_end] != '}') : (hex_end += 1) {}
-                    if (hex_end == body.len or hex_end == hex_start) {
-                        return self.fail(.invalid_string_escape, span, body);
-                    }
-                    const codepoint = std.fmt.parseInt(u32, body[hex_start..hex_end], 16) catch
-                        return self.fail(.invalid_string_escape, span, body);
-                    if (codepoint > 0x10FFFF) {
-                        return self.fail(.invalid_string_escape, span, body);
-                    }
-                    var utf8_buf: [4]u8 = undefined;
-                    const n = std.unicode.utf8Encode(@intCast(codepoint), &utf8_buf) catch
-                        return self.fail(.invalid_string_escape, span, body);
-                    try out.appendSlice(self.allocator(), utf8_buf[0..n]);
-                    i = hex_end + 1;
-                },
-                else => return self.fail(.invalid_string_escape, span, body),
-            }
+            if (body[i - 1] != 'u' or i == body.len or body[i] != '{')
+                return self.fail(.invalid_string_escape, span, body[at..i]);
+            const close = std.mem.indexOfScalarPos(u8, body, i, '}') orelse
+                return self.fail(.invalid_string_escape, span, body[at..@min(body.len, at + 16)]);
+            const escape = body[at .. close + 1];
+            i = close + 1;
+            const scalar = std.fmt.parseInt(u21, body[at + 3 .. close], 16) catch
+                return self.fail(.invalid_string_escape, span, escape);
+            var utf8: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(scalar, &utf8) catch
+                return self.fail(.invalid_string_escape, span, escape);
+            out.appendSliceAssumeCapacity(utf8[0..n]);
         }
-        return try out.toOwnedSlice(self.allocator());
+        out.appendSliceAssumeCapacity(body[i..]);
+        return out.items;
     }
 
     fn fail(self: *Reader, kind: ErrorKind, span: SrcSpan, detail: ?[]const u8) ReaderError {
@@ -1116,6 +1093,38 @@ test "char literal parsing" {
     try std.testing.expectEqual(@as(u21, 0x2603), parseCharLiteral("u{2603}").?);
     try std.testing.expect(parseCharLiteral("") == null);
     try std.testing.expect(parseCharLiteral("u{}") == null);
+}
+
+/// `src` fails to read with `kind`, its detail `detail`.
+fn expectReaderError(src: []const u8, kind: ErrorKind, detail: ?[]const u8) !void {
+    const allocator = std.testing.allocator;
+    var p = parser.Parser.init(allocator, src);
+    defer p.deinit();
+    var rd = Reader.init(allocator, src);
+    defer rd.deinit();
+    try std.testing.expectError(error.ReaderFailure, rd.readProgram(try p.parseProgram()));
+    try std.testing.expectEqual(kind, rd.err.?.kind);
+    if (detail) |d| try std.testing.expectEqualStrings(d, rd.err.?.detail.?);
+}
+
+test "strings: may span lines, must be UTF-8, fail at their bad escape" {
+    try expectReads("\"Line one.\n  Line two.\"", "(string \"Line one.\\n  Line two.\")\n");
+    try expectReads("\"é\\u{2603}\"", "(string \"\\u{C3}\\u{A9}\\u{E2}\\u{98}\\u{83}\")\n");
+    try expectReaderError("\"a\xffb\"", .invalid_utf8, null);
+    try expectReaderError("\"\xc3\"", .invalid_utf8, null);
+    // The detail is the escape that fails, not the whole string.
+    try expectReaderError("\"abc \\q def\"", .invalid_string_escape, "\\q");
+    try expectReaderError("\"abc \\u{110000} def\"", .invalid_string_escape, "\\u{110000}");
+    try expectReaderError("\"abc \\u{D800}\"", .invalid_string_escape, "\\u{D800}");
+    try expectReaderError("\"abc \\u0041\"", .invalid_string_escape, "\\u");
+    // An unterminated string is a parse error at its opening quote.
+    const allocator = std.testing.allocator;
+    const src = "(println \"never closed\n(+ 1 2)";
+    var p = parser.Parser.init(allocator, src);
+    defer p.deinit();
+    try std.testing.expectError(error.ParseError, p.parseProgram());
+    try std.testing.expectEqual(@as(u32, 9), p.current.pos);
+    try std.testing.expectEqual(@as(u16, 1), p.current.len);
 }
 
 test "char literals: one token to the next delimiter, judged whole" {
