@@ -494,6 +494,31 @@ test "integration: a throw out of a running finally body leaves no pending conti
     try testing.expectEqual(@as(usize, 0), program.v.handlers.items.len);
 }
 
+test "integration: every exit path leaves the VM's stacks as it found them" {
+    // Normal return, a caught throw, a throw across callValue, a VM
+    // error translated inside a native's callback, a binding unwound
+    // by a throw, a finally that runs on the way out: afterwards no
+    // handler, continuation, binding frame or root is left.
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try harness.expectResult(&program, "", try program.run(
+        \\(def ^:dynamic *d* 0)
+        \\(def log (atom []))
+        \\(defn thrower [x] (binding [*d* x] (throw [:t *d*])))
+        \\[(try (mapv thrower [1 2]) (catch any e e))
+        \\ (try (reduce (fn [a x] (+ a (/ 1 x))) 0 [1 0]) (catch any e e))
+        \\ (try (binding [*d* 5] (try (mapv (fn [x] (throw x)) [:in]) (finally (swap! log conj *d*)))) (catch any e e))
+        \\ (binding [*d* 7] (mapv (fn [x] (try (inc x) (finally (swap! log conj *d*)))) [1 2]))
+        \\ *d* @log]
+    ), "[[:t 1] :divide-by-zero :in [2 3] 0 [5 7 7]]");
+    try testing.expectEqual(@as(usize, 0), program.v.handlers.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.finally_stack.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.dyn_frames.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.dyn_saves.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.roots.items.len);
+}
+
 test "integration: nested try — outer catches what inner rethrows" {
     try expectOutput(
         "(try (try (throw 100) (catch any e (throw e))) (catch any e e))",
