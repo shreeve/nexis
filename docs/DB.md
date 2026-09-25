@@ -1,579 +1,308 @@
 ## DB.md — Durable identities & emdb integration
 
-Authoritative contract for `src/db.zig`. Derivative from `PLAN.md` §15 (durable identities,
-connection model, transactions, codec boundary) + §20.2 gate test
-#6 (emdb round-trip) + `docs/CODEC.md` (value-bytes serialization)
-+ `docs/VALUE.md` §2.2 (kind 26 reserved for `durable_ref`). Those
-documents win on conflict.
-
-Codec bytes are the value half of every durable-ref round-trip;
-this module is the emdb bridge + the
-`durable_ref` heap Value kind to complete the picture.
-
-The language surface (`with-tx` macros, snapshots, `db/scan`, the
-`db/...` namespace) is built on these Zig-level primitives; §12
-lists what exists above them.
+Authoritative contract for `src/db.zig` and the `db/*` language surface
+built on it (the db natives in `src/stdlib.zig`, the `with-tx` family
+in `src/stdlib/core.nx`). Derivative from `PLAN.md` §15 (durable
+identities, connection model, transactions) and §20.2 gate test #6
+(emdb round-trip); values cross the store as `docs/CODEC.md` bytes;
+`durable_ref` is kind 26 (`docs/VALUE.md` §2.2). Nextomic, the datom
+database on the same engine, is `docs/NEXTOMIC.md`.
 
 ---
 
 ### 1. Scope
 
-**In:**
-- `Connection` — wrapper around `emdb.Env` with a stable
-  `store_id: u128` and an `*Interner` pointer for codec
-  integration.
-- `Connection.open(allocator, heap, interner, path, options)`,
-  `Connection.close()`.
-- `WriteTxn` / `ReadTxn` — thin wrappers around `emdb.Txn` with
-  nexis-typed errors and codec integration.
-- `beginWrite()` / `beginRead()` / `commit()` / `abort()`.
-- `put(txn, tree_name, key_bytes, value)` — opaque `key_bytes`,
-  Value `value` encoded via `src/codec.zig`.
-- `get(txn, tree_name, key_bytes) !?Value` — decode via codec.
-- `del(txn, tree_name, key_bytes) !bool`.
-- `ref(heap, conn, tree_name, key_bytes) !Value` — construct a
-  `durable_ref` heap Value.
-- `putRef` / `getRef` / `delRef` convenience wrappers that resolve
-  `tree_name` + `key_bytes` from the ref body.
-- Per-kind dispatch integration: hash = xxHash3-32 over identity
-  triple; equality = byte-for-byte on the triple; GC trace = no-op
-  (per §7).
-- Gate #6 property test: 10k values × multiple named trees ×
-  reopen-connection readback.
+`db.zig` is the key-value bridge to emdb: a `Connection` over one
+store file, write and read transactions, `put` / `get` / `del` of
+codec-encoded values under opaque byte keys in named trees, and the
+`durable_ref` heap kind that names one `(store, tree, key)` slot. The
+language surface (§12) adds auto-transaction ref operations,
+`with-tx` / `with-read-tx` / `with-snapshot`, `db/alter!` and the eager
+tree walks `db/scan` and `db/reduce-tree`.
 
-**Out of this module** (built above it, §12): `db/alter!`,
-snapshots, `db/scan` / `db/reduce-tree`, `(with-tx ...)`.
-
-**Absent:** emdb file-UUID identity (§2), multi-isolate /
-multi-process durability semantics.
+Multi-process concurrent writes are emdb's single-writer discipline;
+the nexis surface is single-isolate (PLAN §16.1).
 
 ---
 
 ### 2. `store_id` derivation
 
-PLAN §15.1: "A connection has a stable `store-id: u128` derived
-from the file UUID written in emdb's meta page."
+emdb's meta page carries no file id, so `store_id: u128` comes from
+the file's path. `open` resolves the canonical path
+(`realPathFileAlloc`) after emdb has opened, and so created, the file;
+a platform that cannot resolve one keeps the path as given. The low
+64 bits are `hash.hashBytes(path)`; the high 64 bits are xxHash3,
+seeded with `hash.seed`, over `"store-id"` followed by the path.
 
-**emdb's v0.8 MetaPage does NOT carry a file UUID** (fields:
-magic, version, mapAddr, mapSize, freeTree, mainTree, txnId,
-lastPgno, canary, pageSize — no UUID slot). Adding one is an emdb
-spec change; this commit defers that to a later coordinated
-emdb+nexis amendment.
+So `x.edb`, `./x.edb` and the absolute spelling name one store (the
+inline test "store_id comes from the canonical path" pins it). The id
+is stable for an unmoved file and changes when the file is renamed or
+moved; two files with equal contents at different paths are different
+stores. `storeId()` is the accessor; nothing else depends on the
+derivation.
 
-`store_id` is derived as:
-
-```
-store_id = xxHash3-128(realpath(file))
-```
-
-where `realpath` is the canonicalized absolute path bytes. This
-is:
-- **stable within a process / session for an unmoved file**;
-- **NOT stable across rename / move** of the file;
-- **NOT a true store UUID** — two files with identical content
-  but different paths have different store_ids;
-- **sufficient for gate #6** (within-process round-trip).
-
-emdb has no file UUID. Should one exist, the envelope version in
-CODEC.md §2 would bump and `store_id` derivation would switch to
-reading it from the meta page on `Connection.open`. `Connection`
-exposes `storeId() u128` as a read-only accessor so downstream
-code doesn't hardwire the derivation.
-
-`open` takes a `std.Io` and resolves the path after emdb has
-opened (and so created) the file, so `x.edb`, `./x.edb` and its
-absolute spelling name one store. `store_id` is two xxHash3-64
-halves over the canonical path, the second salted with
-`"store-id"`. A platform that cannot resolve a canonical path keeps
-the path as given.
-
-**Parent directories.** emdb's `open()` requires the path's parent
-directory to exist. The language-surface `(db/open path)`
-(`src/stdlib.zig fnDbOpen`) and `nextomic/connect` call
-`std.Io.Dir.cwd().createDirPath(io, dirname(path))` first, so
-`(db/open "data/v1/state.edb")` works from a fresh working
-directory. `db/open` uses the VM's `std.Io`, or the process-wide
-single-threaded one when the host gave the VM none. A
-`createDirPath` failure is ignored: if the directory is still
-unusable, emdb's own open surfaces `:db/open-failed`. The path is a
-string; any other argument is `:kind-mismatch`.
+**Parent directories.** emdb creates only the file. `(db/open path)`
+creates the missing parent directories first, with the VM's `std.Io`
+(or the process-wide single-threaded one when the host gave the VM
+none); a failure there is ignored, and emdb's own open then reports
+`:db/open-failed`.
 
 ---
 
-### 3. `Connection` shape
+### 3. `Connection`
 
-```zig
-pub const Connection = struct {
-    // Non-owning: caller supplies these and guarantees their
-    // lifetimes meet or exceed the Connection's.
-    allocator: std.mem.Allocator,
-    heap: *Heap,
-    interner: *Interner,
+A plain Zig struct, not a Value: it holds the `emdb.Env`, the
+non-owning allocator, heap and interner the codec needs, the two
+`store_id` halves, the owned canonical path, an open flag, a count of
+open transactions and the tree-handle cache. The stdlib allocates each
+one on the VM's allocator, records it in `vm.db_connections`, and
+frees it only at VM teardown, so no address a Value holds is reused
+while the VM lives. A `db_connection` Value (kind 31) is a pointer to
+it; `db_write_txn` (32) and `db_read_txn` (33) point at a
+per-transaction handle.
 
-    // Owning (closed by Connection.close).
-    env: emdb.Env,
-    store_id_lo: u64,
-    store_id_hi: u64,
-    // Canonicalized absolute path, owned. Freed in close().
-    path_owned: [:0]u8,
-    // Named-tree handles resolved so far, keyed by owned copies
-    // of the tree names. Freed in close().
-    tree_ids: std.StringHashMapUnmanaged(emdb.TreeId),
-    open_flag: bool,
-    // Transactions begun and not yet committed or aborted.
-    open_txns: u32,
-};
-```
+**Pinned geometry.** `open` overrides the caller's `pageSize` with
+`db.page_size` (16 KiB) and `maxNamedTrees` with `db.max_named_trees`
+(128). emdb's default page size is the OS page size, and the page
+size fixes the key bound and overflow threshold for the life of the
+file, so every store carries the same geometry wherever it is
+created. An existing file keeps the page size it was created with.
 
-**Tree handles are resolved once per connection.** `treeId(txn,
-name, create)` looks the name up in `tree_ids` before asking emdb;
-a `TreeId` is fixed for the life of the environment (emdb
-INV-SUB03), so the handle is remembered across transactions. emdb
-keeps per-transaction tree state, so each `WriteTxn` / `ReadTxn`
-carries an `opened` bit set and loads the tree behind a handle the
-first time it touches it; every later operation on that tree in the
-same transaction is a bit test. `put` / `get` / `del` and the
-stdlib cursor natives all go through `treeId`.
+**Tree handles resolve once per connection.** `treeId(txn, name,
+create)` looks the name up in the connection's cache before asking
+emdb; a `TreeId` is fixed for the life of the environment. emdb keeps
+per-transaction tree state, so each transaction carries a bit set and
+loads a tree the first time it touches it; later operations on that
+tree in the same transaction are a bit test. A tree registered by an
+aborted transaction stays registered and reads as empty.
 
-**Cursor values are whole.** An emdb cursor returns a multi-page
-overflow value assembled in the transaction's buffer, valid until
-the next multi-page read on that transaction; `db/scan` and
-`db/reduce-tree` decode each entry before advancing. `db/scan`
-positions its cursor with `setRange` for the start bound.
+**Cursor values are whole.** An emdb cursor returns a multi-page value
+assembled in the transaction's buffer, valid until the next multi-page
+read on that transaction; `db/scan` and `db/reduce-tree` decode each
+entry before advancing.
 
-**`Connection` is NOT a runtime heap-managed Value.** It's a plain
-Zig struct allocated on the caller's allocator. Multiple
-durable-refs may point to the same Connection; the Connection
-itself is not reference-counted.
-
-**Closing.** `close()` closes the env and leaves the struct in place
-with `open_flag` false, so a ref, transaction handle or connection
-Value that still names it reads the flag and reports the connection
-closed; a second `close()` does nothing. `close()` of a connection
-with a transaction still open returns `error.TransactionsOpen`: no
-emdb transaction outlives its env. `shutdown()` closes whatever is
-open, for teardown. The stdlib frees a `Connection` only at
-`VM.deinit`, so no address a Value holds is ever reused by a later
-`db/open` while the VM lives.
+**Closing.** `close` closes the env and leaves the struct in place
+with the open flag false: a ref, transaction handle or connection
+Value that still names it reports the connection closed. A second
+`close` does nothing. `close` while a transaction of the connection is
+open is refused (`TransactionsOpen`), so no emdb transaction outlives
+its env. `shutdown` closes whatever is open, for VM teardown.
 
 **A failed commit aborts.** emdb leaves a transaction whose commit
-failed open, holding the write lock; `commit()` aborts it before
+failed open, holding the write lock; `commit` aborts it before
 returning the error, so the transaction is over either way.
-
-**Metadata attachability**: not applicable. Connections are not
-Values.
-
-**File geometry is pinned.** `open` overrides the caller's
-`pageSize` with `db.page_size` (16 KiB) and `maxNamedTrees` with
-`db.max_named_trees` (128) before handing the options to
-`emdb.Env.open`. emdb's own default page size is the OS page size,
-which differs between platforms, and the page size fixes the key
-bound and overflow threshold for the life of the file; pinning it
-here means a store carries the same geometry wherever it is
-created. An existing file keeps the page size it was created with.
 
 ---
 
 ### 4. `durable_ref` heap kind (VALUE.md §2.2 kind 26)
 
-Per PLAN §15.2 and SEMANTICS.md §2.6 (kind-local equality,
-identity-triple hash).
+The body is a 32-byte header — an advisory `conn: ?*Connection`, the
+two `store_id` halves, and the tree-name and key lengths as `u32` —
+followed inline by the tree-name bytes and then the key bytes. The
+subkind is always 0.
 
-#### 4.1 Body layout
-
-```zig
-const DurableRefBody = extern struct {
-    /// Operational pointer to the Connection that produced this
-    /// ref. NON-IDENTITY — not hashed, not compared in equality,
-    /// not GC-traced. May be stale (closed connection) or
-    /// cross-store if the ref was reconstructed from bytes (codec
-    /// decode) without a matching connection available.
-    conn: ?*Connection,
-
-    /// First 64 bits of the u128 store_id.
-    store_id_lo: u64,
-    /// Upper 64 bits of the u128 store_id.
-    store_id_hi: u64,
-
-    /// Length of the tree name (UTF-8 bytes) that follows the
-    /// header. The tree name is the emdb named-subtree identifier.
-    tree_name_len: u32,
-    /// Length of the key bytes that follow the tree name.
-    key_bytes_len: u32,
-
-    // Body total = 32 bytes header + tree_name_len + key_bytes_len.
-    // Inline byte storage (not a pointer elsewhere) so the ref is
-    // self-contained and codec-portable without ancillary heap
-    // walks.
-};
-```
-
-**`conn: ?*Connection` is advisory**:
-- NOT part of identity — equality and hash ignore it.
-- NOT GC-traced — `*Connection` is not a heap Value.
-- MAY be `null` for refs reconstructed from bytes without a live
-  connection context (codec decode does not resolve a Connection
-  pointer; see §8).
-- MAY be stale if the Connection was closed after ref construction.
-- Set by `ref(heap, conn, ...)` constructors; left `null` by codec
-  decode.
-
-#### 4.2 Subkind
-
-Subkind byte is unused (single canonical durable-ref shape) and
-always `0`.
+The identity is the triple `(store_id, tree_name, key_bytes)`. `conn`
+is operational only: not hashed, not compared, not traced. `ref` sets
+it to the connection the ref was made on; `refFromBytes` leaves it
+null, and I/O through a null-`conn` ref is `ConnectionUnavailable`. A
+ref may outlive its connection: its own I/O then reports the
+connection closed, but inside a transaction of another connection to
+the same store it reads and writes normally (§8).
 
 ---
 
-### 5. API surface
+### 5. Zig API
 
-```zig
-pub const DbError = error{
-    /// Connection operation attempted on a closed or null conn.
-    ConnectionUnavailable,
-    /// Ref's store_id doesn't match the Connection passed in.
-    StoreMismatch,
-    /// Tree name is empty or under `nx/` (§6).
-    InvalidTreeName,
-    /// Key is empty.
-    InvalidKey,
-    /// `close` while a transaction of the connection is open.
-    TransactionsOpen,
-    // plus propagated: emdb.Error, Allocator.Error, CodecError,
-    // InternError, etc.
-};
+`DbError` is `ConnectionUnavailable`, `StoreMismatch`,
+`InvalidTreeName`, `InvalidKey`, `TransactionsOpen`; emdb, codec,
+intern and allocator errors propagate unchanged.
 
-pub const Connection = struct { ... };
+| Function | Contract |
+|---|---|
+| `open(allocator, io, heap, interner, path, options) !Connection` | §2, §3. |
+| `close(*Connection) DbError!void` / `shutdown(*Connection) void` | §3. |
+| `storeId(*const Connection) u128` | §2. |
+| `beginWrite(*Connection) !WriteTxn` / `beginRead(*Connection) !ReadTxn` | `ConnectionUnavailable` on a closed connection. |
+| `commit(*WriteTxn) !void` / `abortWrite(*WriteTxn)` / `abortRead(*ReadTxn)` | End the transaction; a failed commit aborts (§3). |
+| `treeId(txn, name, create) !?TreeId` | §3; null for an absent tree when `create` is false. |
+| `validateTreeName(name) DbError!void` | §6. |
+| `put(*WriteTxn, tree, key, value) !void` | Encodes `value` (CODEC.md) under the opaque `key` bytes; creates the tree. |
+| `get(txn, tree, key, elementHash, elementEq) !?Value` | Either transaction kind; null when the key or the tree is absent. |
+| `del(*WriteTxn, tree, key) !bool` | Whether the key existed. |
+| `ref(heap, conn, tree, key) !Value` / `refFromBytes(heap, store_id, tree, key) !Value` | §4. |
+| `putRef` / `getRef` / `delRef` | The same through a ref's tree and key, after checking the ref belongs to the transaction's store (§8). |
+| `refStoreId` / `refTreeName` / `refKeyBytes` / `refConn` | The ref's fields. |
+| `hashHeader` / `refsEqual` / `trace` | §7. |
+| `failureName(anyerror) []const u8` | The keyword a failure surfaces as (§8). |
 
-pub fn open(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    heap: *Heap,
-    interner: *Interner,
-    path: [*:0]const u8,
-    options: emdb.EnvOptions,
-) !Connection;
+Keys are opaque byte slices, never codec-encoded; values are
+codec-encoded on `put` and decoded on `get`.
 
-pub fn close(self: *Connection) DbError!void;
-pub fn shutdown(self: *Connection) void;
-pub fn storeId(self: *const Connection) u128;
-
-// ---- Transaction wrappers ----
-
-pub const WriteTxn = struct { conn: *Connection, inner: *emdb.Txn };
-pub const ReadTxn = struct { conn: *Connection, inner: *emdb.Txn };
-
-pub fn beginWrite(conn: *Connection) !WriteTxn;
-pub fn beginRead(conn: *Connection) !ReadTxn;
-
-pub fn commit(txn: *WriteTxn) !void;
-pub fn abortWrite(txn: *WriteTxn) void;
-pub fn abortRead(txn: *ReadTxn) void;
-
-// ---- Tree-name + key-bytes API (opaque keys) ----
-//
-// Keys are OPAQUE BYTE SLICES at the Zig runtime layer. They are
-// NOT codec-encoded. Callers supply a byte
-// sequence that becomes the emdb key directly. Values are
-// codec-encoded on put and codec-decoded on get.
-
-pub fn put(
-    txn: *WriteTxn,
-    tree_name: []const u8,
-    key_bytes: []const u8,
-    value: Value,
-) !void;
-
-/// `elementHash` / `elementEq` MUST be the authoritative runtime
-/// hash and equality for all codec-serializable kinds (production
-/// callers pass `&dispatch.hashValue, &dispatch.equal`). See §6.1.
-pub fn get(
-    txn_read_or_write: anytype,
-    tree_name: []const u8,
-    key_bytes: []const u8,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !?Value;
-
-pub fn del(
-    txn: *WriteTxn,
-    tree_name: []const u8,
-    key_bytes: []const u8,
-) !bool;
-
-// ---- Durable-ref Value construction + ref-based ops ----
-
-pub fn ref(
-    heap: *Heap,
-    conn: *Connection,
-    tree_name: []const u8,
-    key_bytes: []const u8,
-) !Value;
-
-pub fn refFromBytes(
-    heap: *Heap,
-    store_id: u128,
-    tree_name: []const u8,
-    key_bytes: []const u8,
-) !Value;
-
-pub fn putRef(txn: *WriteTxn, r: Value, value: Value) !void;
-pub fn getRef(
-    txn_read_or_write: anytype,
-    r: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !?Value;
-pub fn delRef(txn: *WriteTxn, r: Value) !bool;
-
-// ---- Identity accessors (for codec + equality) ----
-
-pub fn refStoreId(r: Value) u128;
-pub fn refTreeName(r: Value) []const u8;
-pub fn refKeyBytes(r: Value) []const u8;
-pub fn refConn(r: Value) ?*Connection;
-```
+**`get` takes the hash and equality the codec rebuilds maps and sets
+with.** `dispatch.zig` imports `db.zig` for the `.durable_ref` arms,
+so `db.zig` cannot import `dispatch.zig`; the caller passes
+`&dispatch.hashValue, &dispatch.equal`. Any other pair must agree with
+them on every kind that can be a decoded key or element: a mismatched
+hash misplaces entries in a CHAMP-shaped map or set (9 or more
+entries), and later lookups miss present keys. The inline tests use
+narrow stand-ins with scalar values and array-map-sized collections;
+`test/prop/db.zig` uses the dispatch pair.
 
 ---
-
-### 5.1 Why `get` takes hash/eq callbacks
-
-Callers of `get` / `getRef` pass the runtime hash + equality
-functions that the codec uses to rebuild decoded collections
-(maps, sets, vectors). Production callers pass
-`&dispatch.hashValue, &dispatch.equal`. Test code with a
-restricted Value alphabet may pass narrower stand-ins.
-
-The callbacks are parameterized (rather than `db.zig` importing
-`dispatch.zig` directly) because `dispatch.zig` already imports
-`db.zig` to route `.durable_ref` hash / equality arms. Passing
-them in keeps the module graph one-way terminal.
-
-**Soundness requirement**: the callbacks MUST
-produce the SAME hash / equality relation as `dispatch.hashValue`
-/ `dispatch.equal` for every kind that may appear as a map key or
-set element in decoded bytes. A mismatched hash callback silently
-mis-places entries in CHAMP-shaped maps (≥9 entries), causing
-subsequent dispatch-based lookups to miss present keys. Small
-array-maps (≤8 entries) tolerate mismatched callbacks because
-they probe purely via equality.
-
-`src/db.zig`'s inline tests use narrow stand-ins (only scalar
-values, always array-map-sized collections) precisely because the
-soundness requirement above is satisfied trivially when CHAMP
-trees never form. `test/prop/db.zig` uses the authoritative
-dispatch callbacks and stresses full CHAMP depth through randomized
-generation.
 
 ### 6. Named trees
 
-`treeId` (§3) resolves a name to emdb's `TreeId` once per connection
-and loads the tree once per transaction.
-
-Empty tree names and empty keys return `error.InvalidTreeName` /
-`error.InvalidKey`. So does a tree name beginning `nx/`: Nextomic
+A tree name is refused when it is empty or begins `nx/`: Nextomic
 keeps its indexes and transaction log in `nx/*` trees
-(`docs/NEXTOMIC.md` §3), and a `db/*` write there would bypass every
-Nextomic invariant. `validateTreeName` is public so `db/scan` and
-`db/reduce-tree` refuse the same names; at the language level all of
-these are `:db/invalid-key`.
+(`docs/NEXTOMIC.md` §2), and a `db/*` write there would bypass every
+Nextomic invariant. An empty key is refused too. `validateTreeName` is
+public so `db/scan` and `db/reduce-tree` refuse the same names. All of
+these are `:db/invalid-key` at the language level.
 
 ---
 
 ### 7. Equality, hash, GC integration
 
-#### 7.1 Equality (SEMANTICS.md §2.6, PLAN §15.2)
+Equality category and hash domain: SEMANTICS.md §3.3.
 
-Two `durable_ref` Values are `=` iff their **identity triples
-match byte-for-byte**:
+#### 7.1 Equality
 
-- `store_id_lo == store_id_lo' AND store_id_hi == store_id_hi'`
-- `tree_name_len == tree_name_len' AND tree_name_bytes byteeq`
-- `key_bytes_len == key_bytes_len' AND key_bytes byteeq`
+Two refs are `=` when their triples match byte for byte; `conn` is not
+consulted, so refs made on different connections to one store are
+equal.
 
-The `conn` field is NOT consulted. Two refs reconstructed from
-different processes / connections / codec byte sources with
-matching identity triples compare equal.
+#### 7.2 Hash
 
-#### 7.2 Hash (SEMANTICS.md §3.2)
+64-bit xxHash3, seeded with `hash.seed`, over the `store_id` low and
+high halves as little-endian bytes, then the tree-name bytes, then the
+key bytes; truncated to `u32` and cached in the header when nonzero.
+`dispatch.hashValue` applies the kind's domain on the way out.
 
-```
-base = xxHash3-32(
-  store_id_lo_bytes_LE ++ store_id_hi_bytes_LE ++
-  tree_name_bytes ++
-  key_bytes)
-```
+#### 7.3 GC trace
 
-`dispatch.hashValue` applies the kind-local domain mix
-(`mixKindDomain(u64(base), 26)`) on the way out. Same `durable_ref`
-identity produces the same hash regardless of `conn` state.
-
-Cached in the HeapHeader's `hash: u32` slot per the standard
-cache-if-nonzero pattern.
-
-#### 7.3 GC trace (GC.md §5)
-
-```zig
-pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    _ = h;
-    _ = visitor;
-}
-```
-
-No heap children. `conn` is a plain pointer to a non-heap-managed
-`Connection` struct; GC must not follow it. Tree-name and
-key-bytes are inline body bytes, not references. `meta` handled
-centrally by the collector.
+None: a ref has no heap children. `conn` points at a non-heap
+`Connection`, and the tree name and key are inline bytes (GC.md §5).
 
 ---
 
 ### 8. Failure semantics
 
-Pinned explicitly:
+| Condition | Zig error | Keyword |
+|---|---|---|
+| I/O through a ref whose `conn` is null | `ConnectionUnavailable` | `:db/no-connection` |
+| A ref used in a transaction of a different store | `StoreMismatch` | `:db/store-mismatch` |
+| A transaction begun on a closed connection | `ConnectionUnavailable` | `:db-closed` (the natives check first) |
+| Empty or `nx/` tree name, empty key | `InvalidTreeName` / `InvalidKey` | `:db/invalid-key` |
+| `close` with a transaction open | `TransactionsOpen` | `:db/busy` |
+| A second `close` | none | none (nil) |
+| Encode of a kind with no serialized form (CODEC.md §3) | `UnserializableKind` | `:unserializable` |
+| Stored bytes that do not decode | any other `CodecError` | `:codec-failed` |
 
-| Condition | Behavior |
-|---|---|
-| `putRef` / `getRef` / `delRef` on ref with `conn == null` | `error.ConnectionUnavailable` |
-| `putRef` / `getRef` / `delRef` on ref with `conn.storeId() != r.store_id` | `error.StoreMismatch` |
-| `beginWrite` / `beginRead` on a closed connection | `error.ConnectionUnavailable` |
-| `close` while a transaction is open | `error.TransactionsOpen` |
-| A second `close` | nothing |
-| Codec encode / decode error during put / get | propagated `CodecError` |
-| emdb-level errors (`KeyTooLarge`, `DatabaseFull`, `TxnAborted`, etc.) | propagated `emdb.Error` |
+emdb errors map by `failureName`: `:db/key-too-large`,
+`:db/value-too-large`, `:db/max-trees`, `:db/not-found`,
+`:db/corrupted` (also a file that is not a store, and a format-version
+mismatch), `:db/map-full`, `:db/mmap-failed`, `:db/open-failed`,
+`:db/page-size-mismatch`, `:db/busy` (a writer already active, the
+environment busy), `:db/txn-aborted`, `:db/read-only`,
+`:db/sync-failed`; anything else is `:db-error`. Nextomic shares these
+`:db/*` names through the same function.
 
-**Equality and hash are unaffected** by any of the above — the
-identity triple is fully defined by the stored bytes, independent
-of operational state.
+The natives throw them with `vm.throwKeyword`, so `(catch any e …)`
+binds the keyword and, outside any `try`, the throw is uncaught like
+every recoverable error. Equality and hash are unaffected by any
+failure: the triple is fixed at construction.
 
-**At the language level** every one of these reaches the program
-as a keyword payload (stdlib `dbFailure`). Distinct emdb error sets
-get distinct names — `:db/key-too-large`, `:db/value-too-large`,
-`:db/max-trees`, `:db/not-found`, `:db/corrupted`, `:db/map-full`,
-`:db/mmap-failed`, `:db/open-failed`, `:db/page-size-mismatch`,
-`:db/busy`, `:db/txn-aborted`, `:db/read-only`, `:db/sync-failed` —
-as do the db.zig errors `:db/store-mismatch`, `:db/no-connection`,
-`:db/invalid-key` and `:db/busy` (`TransactionsOpen`); anything else
-is `:db-error`. A value of a kind with no serialized form (a
-function, atom, record, transient, ...) is `:unserializable`; stored
-bytes that do not decode are `:codec-failed`. A ref or transaction
-of a closed connection is `:db-closed`. Outside any `try` the throw
-is uncaught, the rule the VM applies to every recoverable error.
-
-**Re-hydrating a ref** (constructing from bytes without an
-available Connection): `refFromBytes(heap, store_id, tree_name,
-key_bytes)` returns a ref with `conn = null`. I/O operations
-(`putRef`, `getRef`, `delRef`) will return
-`error.ConnectionUnavailable` until the ref is "bound" to a live
-Connection. The low-level API does not bind refs; callers that
-need binding do it at a higher layer (the stdlib natives).
+**Two connections to one file.** A ref made on one connection is
+accepted in a transaction of another connection to the same store.
+emdb's writer lock is per file, so a write through the second
+connection while the first holds a write transaction waits on a
+writer the same single-threaded process holds: it never returns.
+Nextomic refuses that case itself (`docs/NEXTOMIC.md` §3); `db/*` does
+not.
 
 ---
 
 ### 9. Codec integration
 
-`durable_ref` serialization is pinned in PLAN §23 #25 and
-CODEC.md §2. The wire form is the identity triple:
-
-```
-[26] [unsigned LEB128 tree_name_len] [tree_name_bytes]
-     [unsigned LEB128 key_bytes_len] [key_bytes]
-     [u64 LE store_id_lo] [u64 LE store_id_hi]
-```
-
-`src/codec.zig` has no `.durable_ref` encode/decode arm: a ref
-inside a value (e.g., a map whose values are refs) is
-`:unserializable`. Codec bytes for a durable ref would only ever
-serve **ref-containing values**; the round-trip property tests
-direct-ref identity via the `durable_ref` body layout, not
-codec-encoded refs inside other Values.
+Values are CODEC.md bytes. A durable ref inside a stored value is
+`:unserializable`: the kind is not in the serializable set
+(CODEC.md §3).
 
 ---
 
-### 10. Round-trip property test (PLAN §20.2 #6)
+### 10. Tests
 
-`test/prop/db.zig` D1:
-
-```
-Write 10,000 random Values across 5 named trees. Each tree gets
-2,000 entries with deterministic keys. Keys are derived from
-trial index + tree index so overlapping-key cases occur across
-trees (key "k0" in tree A != key "k0" in tree B unless they were
-explicitly put with the same value).
-
-Assertions:
-  - Every write succeeds.
-  - Every read back yields `dispatch.equal` AND
-    `dispatch.hashValue`-equal recovery.
-  - Cross-tree independence: key "k0" in tree A vs key "k0" in
-    tree B have distinct values when the writer set them distinct.
-```
-
-D2: **Reopen-connection readback**. After all writes commit and the Connection is
-closed, reopen the same file and read every key back; assert
-values match what was written.
-
-D3: `durable_ref` identity triple round-trip via equality + hash
-(simpler property — no DB I/O, just ref construction and
-comparison).
-
-D4: `ConnectionUnavailable` / `StoreMismatch` error paths.
-
-Together D1 + D2 deliver PLAN §20.2 gate test #6 receipt:
-"writing 10k values across N named trees, then reading them back,
-yields structural equality for all; named trees are independent."
+`test/prop/db.zig` is PLAN §20.2 gate test #6: D1 writes 10 000 random
+values across 5 named trees and reads each back equal with an equal
+hash; D2 closes, reopens the file with a fresh heap and interner, and
+reads 2 000 values back; D3 checks that the identity triple alone
+decides ref equality and hash; D4 writes the same key to every tree
+with different values and reads each tree's own back. The inline tests
+in `src/db.zig` pin the canonical store id, the pinned geometry, close
+refused while a transaction is open, the tree-handle cache,
+`ConnectionUnavailable`, `StoreMismatch` and the invalid names. The
+language surface runs in `test/integration/eval_pipeline.zig`,
+`test/integration/runtime_polish.zig` and `examples/durable-refs.nx`.
 
 ---
 
 ### 11. Module graph
 
-```
-src/db.zig
-├── @import("std")
-├── @import("value")
-├── @import("heap")
-├── @import("intern")
-├── @import("hash")
-├── @import("codec")
-└── @import("emdb")     // external path dependency per build.zig.zon
-```
-
-One-way terminal. `src/dispatch.zig` and `src/gc.zig` gain
-`.durable_ref` arms that call back into `db.zig`'s hash / equal /
-trace helpers.
+`db.zig` imports `value`, `heap`, `intern`, `hash`, `codec` and
+`emdb`. `dispatch.zig` and `gc.zig` call its hash, equality and trace
+helpers at their `.durable_ref` arms; `stdlib.zig` holds the natives;
+Nextomic imports it only for `failureName` and the geometry
+constants `page_size` and `max_named_trees`: it opens its own
+`emdb.Env` with them, keeps raw byte keys and never goes through
+`db.zig`'s connections, trees, codec calls or refs.
 
 ---
 
-### 11.1 The datom API
+### 12. Language surface
 
-`db/*` is the key-value layer: named trees, codec-encoded values,
-explicit transactions and durable refs. The Datomic-class database
-built on the same engine — datoms, schema-as-data, `transact!` with
-tempids and upserts, `as-of`/`since`/`history` db-values and the
-query pipeline — is the `nextomic` namespace, specified end to end
-in `docs/NEXTOMIC.md` (§6 Lisp API, §7 errors, §8 module layout). The
-two layers share the engine and the `:db/*` engine-error keywords
-(`failureName` above) and nothing else: Nextomic holds raw byte keys
-and never goes through the codec or per-operation tree opens.
+Every native is in the `db` namespace. A ref's tree is a keyword whose
+name is the tree name (`:a/b` names tree `a/b`); its key is a keyword,
+symbol or string whose name or bytes are the key, so `(db/ref c :t :k)`,
+`(db/ref c :t 'k)` and `(db/ref c :t "k")` are equal. Wrong argument
+kinds are `:kind-mismatch`, a non-ref where a ref belongs is
+`:invalid-durable-ref`, a wrong argument count is `:arity-mismatch`,
+and any operation on a closed connection or through a ref of one is
+`:db-closed`. Storage and codec failures are §8.
 
----
+| Form | Arity | Result |
+|---|---|---|
+| `(db/open path)` | 1 | A connection; creates the file and its parent directories. |
+| `(db/close conn)` | 1 | nil; closing twice is nil; with a transaction open, `:db/busy`. |
+| `(db/ref conn tree key)` | 3 | A durable ref (§4); prints `#<durable-ref :tree hex:…>`. |
+| `(db/ref? x)` | 1 | Whether `x` is a durable ref. |
+| `(db/put-key! ref v)` | 2 | nil; one write transaction around one put. |
+| `(db/get-key ref)` / `(db/get-key ref default)` | 1–2 | The stored value, or `default` (nil); one read transaction. |
+| `(db/delete-key! ref)` | 1 | Whether the key existed; one write transaction. |
+| `(db/present? ref)` | 1 | Whether the key exists. |
+| `(deref ref)`, `@ref`, `(db/deref ref)` | 1 | The stored value or nil; one read transaction. `db/deref` is the universal `deref` (vars, atoms, reduced too); another kind is `:not-derefable`. |
+| `(db/begin-write conn)` | 1 | A write transaction; a second one on the same connection while one is open is `:db/busy`. |
+| `(db/begin-read conn)` | 1 | A read transaction. |
+| `(db/commit! tx)` | 1 | nil; the transaction is over even when the commit fails. Any use of a finished transaction is `:tx-closed`. |
+| `(db/abort-write! tx)` / `(db/abort-read! tx)` | 1 | nil; aborting a finished transaction is nil. |
+| `(db/put! tx ref v)` | 3 | nil. A read transaction here is `:kind-mismatch`. |
+| `(db/get tx ref)` / `(db/get tx ref default)` | 2–3 | The value through either transaction kind, the transaction's own writes included, or `default`. |
+| `(db/delete! tx ref)` | 2 | Whether the key existed. |
+| `(db/alter! tx ref f & args)` | 3+ | Writes and returns `(apply f current args)`, `current` nil when absent; when `f` throws, nothing is written. |
+| `(db/scan tx tree)` / `(… start)` / `(… start end)` | 2–4 | An eager vector of `[key value]` in key-byte order, keys as keywords; `start` inclusive, `end` exclusive, each a keyword or symbol. An absent tree is `[]`. |
+| `(db/reduce-tree tx tree f init)` | 4 | `(f acc key value)` over the whole tree in key order; `init` for an absent tree. |
+| `(db/snapshot conn)` / `(db/release-snapshot! snap)` | 1 | `db/begin-read` and `db/abort-read!` under the snapshot names. |
+| `(db/snapshot? x)` | 1 | Whether `x` is a read transaction not yet released. |
+| `(with-tx [tx conn] body…)` | macro | Begins a write, commits after body and returns its value; when body throws, aborts and rethrows. |
+| `(with-read-tx [tx conn] body…)` | macro | Begins a read and aborts it after body, whether or not body throws. |
+| `(with-snapshot [snap conn] body…)` | macro | `with-read-tx` under the snapshot names. |
 
-### 12. Surface above this module, and absences
+A read transaction sees the store as of when it began and nothing
+committed after. A held snapshot keeps emdb from reclaiming the pages
+it sees, so release what you pin. A transaction handle lives until VM
+teardown; one never finished keeps its connection from closing.
 
-Built above these primitives (PLAN §21 Phase 4): `(with-tx ...)` /
-`(with-read-tx ...)`, `db/snapshot` / `db/release-snapshot!` /
-`with-snapshot`, `db/scan` / `db/reduce-tree`, `db/alter!`, and the
-per-connection `TreeId` cache. Datomic-style `as-of` db-values are
-Nextomic's (`docs/NEXTOMIC.md` §4). Absent:
-
-- Cursors as raw Values — PLAN §15.8; `db/scan` and `db/reduce-tree`
-  are the eager surface.
-- `db/snapshot-stats` (PLAN §15.7: pinned snapshots and their page
-  cost) — does not exist.
-- emdb file-UUID identity (§2).
-- Multi-process concurrent writes — emdb handles single-writer
-  discipline; nexis surface stays single-isolate per PLAN §16.1.
-- `.durable_ref` codec encode/decode arms — the codec raises
-  `:unserializable` for the kind (§9).
-
----
-
+**Absent.** Cursors as Values (PLAN §15.8; `db/scan` and
+`db/reduce-tree` are the eager surface), a lazy `db/scan`,
+`db/cursor`, `with-read-tx-at`, `db/as-of`, `db/pin-snapshot`,
+`with-db`, `(deref r :using db)` and `db/snapshot-stats` (PLAN §15.7).
+Point-in-time database values are Nextomic's (`docs/NEXTOMIC.md` §4).

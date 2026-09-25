@@ -1,596 +1,185 @@
 ## TRANSIENT.md — Transient Wrappers
 
-Authoritative contract for the `.transient` heap kind and the
-`...Bang` mutation operations (`src/coll/transient.zig`).
-Derivative from `PLAN.md` §9.4, `docs/VALUE.md` §2.2,
-`docs/SEMANTICS.md` §2.6 (identity-based equality + serialization
-disallowed), `docs/GC.md` (trace integration), and
-`CLOJURE-REVIEW.md` §1.2 + §2.7 (owner-token epoch vs. thread
-identity). Those documents win on conflict.
-
-This module satisfies the transient-equivalence and
-transient-ownership properties of PLAN §20.2.
-
-**Transients are "shallow" wrappers** — they hold an owner-token and a mutable
-pointer to a persistent inner root. Mutating ops call the
-persistent backing operations underneath, reassigning the wrapper's
-`inner_header` field in place. Token discipline enforced at every
-boundary. Node-level in-place mutation (Clojure's real perf
-advantage) does not exist (PLAN §19.6 Tier 2): **a transient op costs
-exactly what the persistent op costs, plus a wrapper check.**
-Transients give nexis Clojure's `transient` / `persistent!` / `conj!`
-API, not its speed-up; code that builds a collection with
-transients is no faster than the same code built persistently.
+The contract for the `.transient` heap kind (`src/coll/transient.zig`)
+and its language surface (`transient`, `persistent!` and the `!`
+operations in `src/stdlib.zig`). Kind number: `docs/VALUE.md` §2.2.
+Governing decision: PLAN §9.4. Ownership compared with Clojure's:
+`CLOJURE-REVIEW.md` §1.2, §3.5.
 
 ---
 
-### 1. The two-option fork, and why nexis picks "shallow"
+### 1. Model: shallow wrappers
 
-**Option A — full Clojure-style transients** with per-node owner
-tags: every CHAMP interior / collision / vector interior / leaf /
-tail node grows an `owner_token: ?u64` field. Mutating ops walk the
-tree and mutate owner-matched nodes in place, clone + stamp
-owner-mismatched ones. Real O(1) amortized `conjBang` etc. Cost:
-~8 bytes/node, the trie edit primitives in `champ.zig` and
-`vector.zig` grow transient-aware variants, structural invariants
-loosen in transient-mode.
+A transient is a thin wrapper `{owner_token, inner_header}` around a
+persistent map, set or vector. Each `!` operation calls the persistent
+operation (`champ.mapAssoc`, `champ.setConj`, `vector.conj`,
+`vector.pop`, …) on the inner collection and stores the new root in the
+wrapper's `inner_header`, in place. **A transient operation costs what
+the persistent one costs, plus a wrapper check**: transients give
+nexis Clojure's `transient`/`persistent!` API and its ownership
+discipline, not its speed-up. Node-level in-place editing (per-node
+owner tags) is absent; the wrapper layout and the ownership rules do
+not depend on it.
 
-**Option B — shallow wrappers** (what nexis has): `.transient` is a thin heap
-kind with `{owner_token, inner_header}`. Mutation ops call
-`mapAssoc` / `setConj` / `vector.conj` on the inner, receive a new
-persistent root, atomically update the wrapper's `inner_header`
-field. No persistent collection code changes. Gate-test discipline
-(#3 equivalence, #4 ownership) satisfied by construction.
-
-**nexis picks B.** Reasons:
-  - Gate tests measure semantics, not performance. B delivers
-    semantics in a small module with zero changes to the persistent
-    paths.
-  - CHAMP nodes carry no reserved transient fields.
-  - B → A is achievable without changing the user-facing
-    transient API: wrapper layout stays identical, owner-token
-    discipline stays identical, only the internal mutation paths
-    and node bodies change.
-
-Option B is the implementation; the user-facing wrapper API and
-ownership model are forward-compatible with a revision that
-replaces the underlying mutation paths with in-place editing.
+**Absent.** Transient lists (a `cons` is already O(1)), transient typed
+vectors (a typed vector takes no updates, `docs/TYPED_VECTOR.md` §1),
+and an owner-mismatch check between isolates (there is one isolate).
 
 ---
 
-### 2. Subkind taxonomy (local enum)
+### 2. Subkinds
 
-Subkinds classify within a kind; they do not mirror the global
-kind bytes (18/19/20) of the inner collection. The taxonomy is a
-**local enum** (VALUE.md §2.2 row 27):
+A local enum; it does not mirror the inner collection's kind number.
 
-| Subkind | Meaning                          | Wraps       |
-|---------|----------------------------------|-------------|
-| 0       | transient map                    | `.persistent_map`    |
-| 1       | transient set                    | `.persistent_set`    |
-| 2       | transient vector                 | `.persistent_vector` |
-| 3..15   | reserved                         | —           |
+| Subkind | Wraps |
+|---|---|
+| 0 | `.persistent_map` |
+| 1 | `.persistent_set` |
+| 2 | `.persistent_vector` |
 
-No other kind is transient-wrappable. Attempting to wrap a
-list, string, bignum, byte-vector, typed-vector, function, var,
-durable-ref, or error Value in `transientFrom` returns
-`error.InvalidTransientInner`. (Typed vectors and the rest have no
-transient form.)
-
-Kind 27 + subkind 0/1/2 together give enough information to
-dispatch any operation without inspecting the inner header's kind.
-The inner header's kind is implicitly guaranteed by construction:
-
-  - subkind 0 wrapper's `inner_header.kind` is always `persistent_map`,
-  - subkind 1 wrapper's is always `persistent_set`,
-  - subkind 2 wrapper's is always `persistent_vector`.
-
-Safe-build code asserts this at every entry point.
+No other kind can be wrapped. The wrapper's subkind fixes the inner
+root's kind, so no operation inspects the inner header's kind.
 
 ---
 
 ### 3. Wrapper layout
 
-```zig
-const TransientBody = extern struct {
-    /// Owner-token epoch. `0` means frozen/invalidated (after
-    /// `persistentBang`, or allocator-zero-init pre-stamp).
-    /// Nonzero is an active owner. Tokens are monotonically
-    /// assigned by a private `issueOwnerToken()` counter in
-    /// `src/coll/transient.zig`; they are opaque to user code.
-    owner_token: u64,
-
-    /// Pointer to the current persistent inner root (one of:
-    /// `.persistent_map` subkind 0/1, `.persistent_set` subkind
-    /// 0/1, `.persistent_vector` subkind 1). Mutated in place by
-    /// every successful `...Bang` op. Never null: cleared only
-    /// when the wrapper itself is freed.
-    inner_header: *HeapHeader,
-
-    comptime {
-        std.debug.assert(@sizeOf(TransientBody) == 16);
-    }
-};
-```
-
-Body size is 16 bytes; wrapper allocation total is
-`@sizeOf(Block) + 16` = 48 bytes. `_pad` is not needed because the
-two u64-sized fields consume the whole body.
-
-Invariants (checked at every entry point in safe builds):
-
-  - `owner_token != 0` on active wrappers; `== 0` on frozen.
-  - `inner_header != 0` always.
-  - `inner_header.kind` matches the wrapper's subkind:
-    - subkind 0 → `.persistent_map`
-    - subkind 1 → `.persistent_set`
-    - subkind 2 → `.persistent_vector`
-  - No metadata on transient wrappers (`h.meta == null`). Per
-    VALUE.md §7 / SEMANTICS §7: transients are not
-    metadata-attachable.
+Body 16 bytes: `owner_token: u64` at offset 0 (0 = frozen, nonzero =
+active) and `inner_header: *HeapHeader` at offset 8, the current
+persistent root, never null. A wrapper never carries metadata.
 
 ---
 
-### 4. Owner-token model
+### 4. Owner token
 
-Tokens are u64 counters issued by a **private module-level source**
-in `src/coll/transient.zig`:
-
-```zig
-var next_token: u64 = 1; // 0 is reserved for "frozen"
-
-fn issueOwnerToken() u64 {
-    const t = next_token;
-    next_token += 1;
-    // Overflow-safe on u64 for every practical workload. Wraparound
-    // after 2^64 - 1 tokens is theoretically reachable in a long-
-    // running multi-isolate system; a single isolate cannot.
-    // A multi-isolate runtime would have to revisit this.
-    return t;
-}
-```
-
-**No public API exposes token issuance.** Tokens are opaque; the
-transient wrapper owns token state; user code never constructs or
-inspects tokens directly.
-
-**Token semantics** (PLAN §9.4 frozen):
-  - `0` = frozen/invalidated. Reached after `persistentBang` OR
-    initial allocator-zero state BEFORE `transientFrom` stamps.
-    Any op on a wrapper whose `owner_token == 0` returns
-    `error.TransientFrozen`.
-  - Nonzero = active owner. The runtime is single-threaded, so the
-    token is effectively an aliveness signal. A multi-isolate runtime would
-    additionally check that the **current isolate's epoch** matches
-    the token's issuing epoch; that check is absent because there
-    is no second isolate to mismatch against.
-
-**Token exhaustion.** Owner tokens are issued from a monotonically
-increasing `u64` counter. Exhaustion is not handled;
-wraparound is practically unreachable for single-isolate
-workloads. No saturation / error path is provided.
-
-**`TransientWrongOwner`.** The error variant exists in the
-`TransientError` set, but no runtime code path produces it —
-single-isolate, single-threaded execution has no legitimate way
-for a transient to encounter a mismatched-but-nonzero owner. Gate test #4 is satisfied by the
-frozen-rejection path alone: "using a transient after
-`persistentBang`" IS the operational manifestation of "using a
-transient from the wrong owner" (the owner has become the
-nobody-token `0`). The `TransientWrongOwner` code path is wired in
-`transient.zig` so a multi-isolate runtime can light it up by adding
-an isolate-epoch comparison without introducing a new error kind.
+Tokens come from a private process-wide `u64` counter that starts at 1
+(`issueOwnerToken`); 0 is reserved for "frozen". No API issues or reads
+a token. The runtime is single-threaded per VM, so a nonzero token is
+an aliveness signal: `persistent!` is the only way a transient loses
+its owner. Exhaustion of the counter is not handled (2⁶⁴ issues).
+`TransientWrongOwner` is in the error set for an isolate-epoch check;
+no code path returns it.
 
 ---
 
-### 5. State machine
+### 5. States
 
-Every `.transient` wrapper is in exactly one of three states:
+| State | Token | Behaviour |
+|---|---|---|
+| active | nonzero | every operation allowed; made by `transient` |
+| frozen | 0 | every operation, reads included, is rejected; made by `persistent!` |
+| dead | — | unreachable; the sweep frees the wrapper |
 
-```
-            transientFrom(persistent_v)
-                │
-                ▼
-        ┌───────────────┐
-        │     ACTIVE    │  owner_token != 0
-        │               │  mutating ops allowed
-        │               │  reads allowed
-        └───────┬───────┘
-                │  persistentBang(t)
-                ▼
-        ┌───────────────┐
-        │     FROZEN    │  owner_token == 0
-        │  (invalidated)│  any op returns .TransientFrozen
-        │               │  wrapper still GC-reachable via
-        │               │  inner_header, but discarded for user use
-        └───────┬───────┘
-                │  wrapper unreachable from roots
-                ▼
-        ┌───────────────┐
-        │      DEAD     │  sweep frees the wrapper header
-        │               │  inner_header still traceable from
-        │               │  other roots if any hold it
-        └───────────────┘
-```
-
-**All** transient ops — `...Bang` mutations AND queries (`mapGet`,
-`setContains`, `mapCount`, etc.) — reject frozen wrappers.
-Keeping reads also rejecting frozen makes the
-ownership discipline crisp. The user-visible rule is simple:
-"after `persistentBang`, the transient is dead; use the returned
-persistent value instead."
-
-**`persistentBang` does NOT null `inner_header`.** Only zeros
-`owner_token`. Rationale: the wrapper may still be GC-reachable
-from other roots; leaving `inner_header` intact lets GC continue
-to trace through it without special-casing frozen wrappers.
+`persistent!` zeroes the token and returns the inner collection as a
+persistent Value, safe to share. It leaves `inner_header` in place, so
+a frozen wrapper still traces its inner root (§10).
 
 ---
 
-### 6. Error surface
+### 6. Errors
 
-Public transient ops return typed errors at the user boundary:
+| Zig error | Raised when | The language sees |
+|---|---|---|
+| `TransientFrozen` | any operation on a frozen wrapper | `:transient-used-after-persistent` |
+| `TransientKindMismatch` | a non-transient Value, or the wrong family (`dissoc!` on a vector transient) | `:kind-mismatch` |
+| `InvalidTransientInner` | `transient` of anything but a map, set or vector | `:kind-mismatch` |
+| `IndexOutOfBounds` | `pop!` of an empty vector; `assoc!` past the count | `:index-out-of-bounds` |
+| `TransientWrongOwner` | never (§4) | — |
 
-```zig
-pub const TransientError = error{
-    TransientFrozen,            // owner_token == 0
-    TransientWrongOwner,        // owner mismatch (never produced; single isolate)
-    InvalidTransientInner,      // transientFrom on a non-wrappable kind
-    TransientKindMismatch,      // e.g., mapAssocBang called with a set wrapper
-};
-```
-
-Each public entry point:
-  - asserts in safe builds that the Value's kind is `.transient`,
-  - returns `error.TransientKindMismatch` if the Value's subkind
-    doesn't match the op family (mapAssocBang on a set, etc.),
-  - returns `error.TransientFrozen` if `owner_token == 0`,
-  - would return `error.TransientWrongOwner` on token mismatch
-    (no path produces it),
-  - proceeds to the underlying persistent op.
-
-The kind, subkind and frozen checks are ordinary branches, not
-safe-build assertions: a `...Bang` op on a non-transient Value
-returns `error.TransientKindMismatch` in every build mode.
+These are ordinary branches, checked in every build mode. The stdlib
+also checks the family before calling in (`transientFailure` in
+`src/stdlib.zig` maps the Zig errors).
 
 ---
 
-### 7. Public API
+### 7. API
 
-Lives in `src/coll/transient.zig`. All ops take callbacks for
-hash/eq the same way their persistent counterparts do.
+**Language surface** (`src/stdlib.zig`). Every `!` returns the same
+wrapper it was given; the source collection is never changed.
 
-```zig
-// ---- Wrapping / unwrapping ----
+| Form | Meaning |
+|---|---|
+| `(transient coll)` | an active transient of a map, set or vector |
+| `(persistent! t)` | the collection; `t` is frozen |
+| `(conj! t x & xs)` | vector: append; set: add; map: `x` is a `[k v]` vector. `(conj!)` is a new transient vector, `(conj! t)` is `t` |
+| `(assoc! t k v & kvs)` | map: put; vector: replace index `k`, or append when `k` is the count |
+| `(dissoc! t k & ks)` | map only |
+| `(disj! t x & xs)` | set only |
+| `(pop! t)` | vector only: without its last element |
+| `count`, `get`, `contains?` | on any transient; `get` of a vector transient takes an index |
+| `nth` | on a vector transient |
 
-/// Wrap a persistent map/set/vector Value as an active transient.
-/// `error.InvalidTransientInner` on any other kind.
-pub fn transientFrom(heap: *Heap, persistent_v: Value) !Value;
+A transient is not callable and not seqable (`seq` of one is
+`:kind-mismatch`).
 
-/// Freeze the wrapper and return the current inner persistent
-/// Value. The wrapper's `owner_token` is zeroed; subsequent ops
-/// on the wrapper return `error.TransientFrozen`. The returned
-/// persistent Value is safe to share.
-pub fn persistentBang(t: Value) !Value;
-
-// ---- Transient map ops (inner subkind 0) ----
-
-pub fn mapAssocBang(
-    heap: *Heap, t: Value, key: Value, val: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value;    // returns the same transient wrapper (pointer-stable)
-
-pub fn mapDissocBang(
-    heap: *Heap, t: Value, key: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value;
-
-pub fn mapGetBang(
-    t: Value, key: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !MapLookup;     // same union as persistent side
-
-pub fn mapCountBang(t: Value) !usize;
-
-// ---- Transient set ops (inner subkind 1) ----
-
-pub fn setConjBang(
-    heap: *Heap, t: Value, elem: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value;
-
-pub fn setDisjBang(
-    heap: *Heap, t: Value, elem: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value;
-
-pub fn setContainsBang(
-    t: Value, elem: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !bool;
-
-pub fn setCountBang(t: Value) !usize;
-
-// ---- Transient vector ops (inner subkind 2) ----
-
-pub fn vectorConjBang(heap: *Heap, t: Value, elem: Value) !Value;
-/// `assoc!`: replaces element `idx`, or appends when `idx == count`;
-/// `error.IndexOutOfBounds` beyond.
-pub fn vectorAssocBang(heap: *Heap, t: Value, idx: usize, elem: Value) !Value;
-/// `pop!`: `error.IndexOutOfBounds` on an empty vector.
-pub fn vectorPopBang(heap: *Heap, t: Value) !Value;
-pub fn vectorNthBang(t: Value, idx: usize) !Value;
-pub fn vectorCountBang(t: Value) !usize;
+```clojure
+(persistent! (reduce conj! (transient []) (range 5)))   ;=> [0 1 2 3 4]
+(let [t (transient {:a 1})]
+  (persistent! (dissoc! (assoc! t :b 2 :c 3) :a)))      ;=> {:b 2, :c 3}
+(let [t (transient [])]
+  (persistent! t)
+  (try (conj! t 1) (catch any e e)))                    ;=> :transient-used-after-persistent
 ```
 
-**`isEmptyBang` is deliberately not exported.** `countBang == 0`
-suffices; a dedicated `isEmptyBang` per kind is trivial wrapper
-surface area that would bloat the public API. Users who want the check call
-`(try mapCountBang(t)) == 0`.
+**Zig API** (`src/coll/transient.zig`). Map and set operations take the
+`elementHash`/`elementEq` callbacks their persistent counterparts take;
+mutating operations take the heap and return the same wrapper Value.
 
-**`...Bang` ops return the same transient wrapper Value they were
-given.** The wrapper's `inner_header` field is mutated in place.
-Pointer-stability means callers can hold a `Value` for the
-lifetime of the transient session; they don't need to rebind it on
-each op.
+| Family | Functions |
+|---|---|
+| wrap | `transientFrom(heap, v)`, `persistentBang(t)` |
+| map (0) | `mapAssocBang`, `mapDissocBang`, `mapGetBang` (a `champ.MapLookup`), `mapCountBang` |
+| set (1) | `setConjBang`, `setDisjBang`, `setContainsBang`, `setCountBang` |
+| vector (2) | `vectorConjBang`, `vectorAssocBang` (appends at `idx == count`), `vectorPopBang`, `vectorNthBang`, `vectorCountBang` |
+| GC | `trace(h, visitor)` |
+
+The module imports `champ.zig` and `vector.zig`, never `dispatch`;
+`dispatch.zig`, `gc.zig`, `codec.zig` and `stdlib.zig` import it.
 
 ---
 
-### 8. Implementation sketch
+### 8. The reconstruction seam
 
-**Per-kind root reconstruction helpers.** The transient
-module needs to reconstruct a persistent Value from a raw
-`*HeapHeader` — e.g. to call `champ.mapAssoc(heap, v, …)` where `v`
-is a persistent-map Value built from the transient's
-`inner_header`. This is kind-specific
-knowledge (CHAMP/array-map subkind discovery via body-size
-inspection; vector root is always subkind 1) and shouldn't live in
-transient code. Each collection module exports a small helper:
-
-```zig
-// src/coll/champ.zig
-pub fn valueFromMapHeader(h: *HeapHeader) Value;
-pub fn valueFromSetHeader(h: *HeapHeader) Value;
-
-// src/coll/vector.zig
-pub fn valueFromVectorHeader(h: *HeapHeader) Value;
-```
-
-These wrap champ's body-size subkind inference behind a single
-per-kind entry point. The transient module
-calls them; it never inspects kind-specific body layouts.
-
-```zig
-// Wrapping
-pub fn transientFrom(heap: *Heap, v: Value) !Value {
-    const inner_kind = v.kind();
-    const subkind: u16 = switch (inner_kind) {
-        .persistent_map => subkind_transient_map,      // 0
-        .persistent_set => subkind_transient_set,      // 1
-        .persistent_vector => subkind_transient_vector, // 2
-        else => return error.InvalidTransientInner,
-    };
-    const h = try heap.alloc(.transient, @sizeOf(TransientBody));
-    const body = Heap.bodyOf(TransientBody, h);
-    body.owner_token = issueOwnerToken();
-    body.inner_header = Heap.asHeapHeader(v);
-    return .{
-        .tag = @as(u64, @intFromEnum(Kind.transient)) | (@as(u64, subkind) << 16),
-        .payload = @intFromPtr(h),
-    };
-}
-
-// Freezing
-pub fn persistentBang(t: Value) !Value {
-    try assertTransientActive(t);
-    const h = Heap.asHeapHeader(t);
-    const body = Heap.bodyOf(TransientBody, h);
-    const inner = body.inner_header;
-    body.owner_token = 0; // freeze
-    return innerValueForSubkind(t.subkind(), inner);
-}
-
-// Mutation (map example)
-pub fn mapAssocBang(heap, t, key, val, hash, eq) !Value {
-    try assertTransientActive(t);
-    try assertSubkind(t, subkind_transient_map);
-    const h = Heap.asHeapHeader(t);
-    const body = Heap.bodyOf(TransientBody, h);
-    const old_v = champ.valueFromMapHeader(body.inner_header);
-    const new_v = try champ.mapAssoc(heap, old_v, key, val, hash, eq);
-    body.inner_header = Heap.asHeapHeader(new_v);
-    return t; // same pointer
-}
-
-// Subkind → persistent Value dispatch (single place transient
-// crosses into kind-specific reconstruction; calls only the public
-// per-kind `valueFromXxxHeader` helpers).
-fn innerValueForSubkind(subkind: u16, h: *HeapHeader) Value {
-    return switch (subkind) {
-        subkind_transient_map => champ.valueFromMapHeader(h),
-        subkind_transient_set => champ.valueFromSetHeader(h),
-        subkind_transient_vector => vector.valueFromVectorHeader(h),
-        else => unreachable,
-    };
-}
-
-// Validation helpers
-fn assertTransientActive(t: Value) !void {
-    if (t.kind() != .transient) return error.TransientKindMismatch;
-    const body = Heap.bodyOf(TransientBody, Heap.asHeapHeader(t));
-    if (body.owner_token == 0) return error.TransientFrozen;
-}
-```
+To call a persistent operation the wrapper needs a Value for its raw
+`inner_header`. Each collection module owns that step:
+`champ.valueFromMapHeader`, `champ.valueFromSetHeader` (which infer the
+array-map or CHAMP subkind from the body) and
+`vector.valueFromVectorHeader`. The transient module calls only these
+and never reads a collection's body.
 
 ---
 
-### 9. Equality, hash, print, codec
+### 9. Equality, hash, print, codec, metadata
 
-Per SEMANTICS §2.6 / PLAN §15.10:
-
-- **Equality**: transients compare by `identical?` only — two
-  transient Values are equal iff they are the same wrapper header
-  pointer. Two structurally-identical transients built
-  independently are NOT equal.
-- **Hash**: transients are not hashable. `dispatch.hashValue` on a
-  transient panics with `:no-hash-on-transient`. This matches
-  Clojure's semantics and guards against accidentally using a
-  transient as a map key.
-- **Print**: `#object[transient 0x...]`-style diagnostic print for
-  REPL debugging. Does NOT round-trip (`read` does not produce
-  transients; `pr-str` output is not codec-compatible).
-- **Codec**: transients are non-serializable per PLAN §23 #25.
-  Codec encode on a transient throws `:unserializable`.
-- **Metadata**: not attachable per PLAN §8.5 / SEMANTICS §7.
-
-These are enforced in `dispatch.zig`:
-
-```zig
-// In heapHashBase:
-.transient => std.debug.panic(
-    "dispatch.hashValue: transients are not hashable (SEMANTICS §3.2). " ++
-    "Call persistentBang first or avoid using transients as map keys / set elements.",
-    .{},
-),
-
-// In heapEqual:
-.transient => a == b,  // bit-identity on headers (same wrapper pointer)
-```
-
-The `dispatch.equal` top-level bit-identity fast path (`a.tag ==
-b.tag and a.payload == b.payload`) already catches same-wrapper
-comparisons before reaching `heapEqual`. The explicit transient
-arm in `heapEqual` is defensive routing:
-makes transient identity semantics visible in the dispatch table
-rather than an accidental fast-path consequence.
-
-Two distinct transient wrappers never compare equal even if
-their `inner_header`s happen to point at the same persistent
-structure. (Unusual but possible construction: `let t1 =
-transientFrom(v); let t2 = transientFrom(v);` — `t1 != t2` by
-identity.)
+- **Equality and hash** (SEMANTICS §3.3): identity. A transient is `=`
+  only to itself, never to another wrapper of the same collection nor
+  to a persistent collection, and hashes by address, so it can be a
+  map key.
+- **Print**: `#<transient>`; it does not read back.
+- **Codec**: not serializable (`docs/CODEC.md` §3); a transient inside
+  a durable value is `:unserializable`.
+- **Metadata**: `with-meta` is `:no-metadata-on-immediate`; `meta` is
+  nil (SEMANTICS §7).
 
 ---
 
-### 10. GC interaction
+### 10. GC
 
-The `.transient` kind ships with a `trace` function in
-`src/coll/transient.zig` that the Collector (`src/gc.zig`) imports
-at its `.transient` arm:
-
-```zig
-pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    const body = Heap.bodyOf(TransientBody, h);
-    // The wrapper has one outgoing heap reference: inner_header.
-    // Even on frozen wrappers (owner_token == 0), the inner_header
-    // is still a valid *HeapHeader that the GC must walk so the
-    // inner persistent structure survives while the wrapper does.
-    // Other roots holding the persistent Value independently would
-    // keep it alive regardless; this trace covers the case where
-    // only the wrapper holds the reference.
-    visitor.mark(body.inner_header);
-}
-```
-
-After `persistentBang`: the wrapper still traces its
-`inner_header` until the wrapper itself becomes unreachable.
-Freezing does NOT sever the GC edge — clearing `owner_token` is
-the only state change. This simplifies GC reasoning: frozen
-wrappers behave identically to active wrappers at the trace
-level.
-
-The collector's `mark` dispatch in `src/gc.zig` routes the
-`.transient` arm to `transient_mod.trace`.
-
----
-
-### 11. Dispatch wiring
-
-`src/dispatch.zig` has a `.transient` arm in `heapHashBase` (panic
-per §9) and in `heapEqual` (explicit bit-identity per §9). The
-`equal` switch's `.kind_local` arm handles transients through the
-standard kind-local dispatch (`eqCategory(.transient) ==
-.kind_local`). `src/gc.zig`'s `mark` routes `.transient` to this
-module's `trace`.
-
-The transient module imports `heap`, `value`, `coll/champ.zig` and
-`coll/vector.zig`, never `dispatch.zig`: hash and equality arrive as
-callbacks, as they do for the persistent ops. Its importers are
-`dispatch.zig`, `gc.zig` and `codec.zig`; the runtime is one module
-(`src/root.zig`), and the one-way rule is a layering rule inside it.
+`trace` marks `inner_header`, the wrapper's only outgoing reference,
+whether the wrapper is active or frozen (`docs/GC.md` §5). A wrapper
+that is the sole holder of its collection keeps it alive.
 
 ---
 
 ### 12. Testing
 
-Inline tests in `src/coll/transient.zig`:
-
-- `transientFrom` wraps map/set/vector; errors on list/string/bignum/nil.
-- Basic lifecycle: `transientFrom → mapAssocBang × N → persistentBang`.
-- Freeze semantics: `persistentBang` then any op errors `TransientFrozen`.
-- Owner-token uniqueness: two `transientFrom` calls produce two
-  distinct tokens.
-- Subkind mismatch: `mapAssocBang` on a set transient errors
-  `TransientKindMismatch`.
-- Pointer-stability: `mapAssocBang` returns the same wrapper Value.
-- Mutation visibility: after `mapAssocBang`, `mapGetBang` reflects
-  the update.
-- Nil-key/nil-value legal (inherited from persistent ops).
-- GC trace exercised: wrap a map, disconnect the persistent root,
-  collect with only the transient as root — inner structure survives.
-
-Property tests in `test/prop/transient.zig` (new):
-
-- **T1. Equivalence (gate test #3)**: for random edit sequences
-  of length 0..40 applied to identical starting maps/sets/vectors,
-  the (transient → N × ...Bang → persistentBang) path and the
-  direct (persistent × N × assoc/conj) path produce
-  `dispatch.equal` and `dispatch.hashValue`-equal results. 1000
-  trials per kind; T1d drives random `conj!` / `assoc!` / `pop!` on
-  vectors of up to 1100 elements.
-- **T2. Ownership (gate test #4)**: frozen transients reject
-  every subsequent op with `error.TransientFrozen`. There is no
-  operational `TransientWrongOwner` path (single-isolate); the
-  error kind is retained in the API.
-- **T3. No mutation escapes the wrapper**: after a session of
-  `...Bang` ops on transient `t`, the original persistent value
-  the transient was wrapped from is still structurally intact
-  (persistent semantics preserved end-to-end).
-- **T4. GC survival**: random graphs of transients holding
-  persistent inner structures; collect with random root subsets;
-  every reachable inner structure survives intact.
-
-Together T1 and T2 pin the PLAN §20.2 transient properties. There
-is no test-only `_testReplaceOwnerToken` helper — the ownership
-discipline is tested entirely through the frozen path, which is the
-operationally reachable ownership failure in a single isolate.
-
----
-
-### 13. Scope
-
-**In:**
-  - `.transient` kind, three subkinds (0/1/2).
-  - `transientFrom` / `persistentBang`.
-  - Map, set, vector mutation ops per §7.
-  - Wrapper layout, owner-token source, state machine.
-  - GC trace integration.
-  - Dispatch hash-panic + equality-identity arms.
-  - Inline + property tests for T1–T4.
-
-**Absent:**
-  - **Node-level in-place mutation** (Option A, real Clojure-
-    style).
-  - **Transient byte-vector / typed-vector**: a typed vector has no
-    update operation to make transient (`docs/TYPED_VECTOR.md` §1);
-    the byte-vector kind has no implementation.
-  - **Multi-isolate token mismatch path**: there is one isolate.
-  - **A dedicated transient promotion path** for array-map/set
-    growing beyond 8 entries: the persistent `mapAssoc` handles
-    promotion internally and the transient inherits it.
+`test/prop/transient.zig`: T1a-T1d equivalence (random edit sequences
+through a transient and through the persistent operations give `=` and
+hash-equal results, for maps, sets and vectors, T1d with random
+`conj!`/`assoc!`/`pop!`); T2a-T2d ownership (a frozen wrapper rejects
+every operation; the wrong family gives `TransientKindMismatch`);
+T3a-T3b the source collection is unchanged; T4, T4b the inner root
+survives collection through an active or a frozen wrapper. These are
+the transient properties of PLAN §20.2. Inline tests in
+`transient.zig` cover the wrapper; `test/integration/eval_pipeline.zig`
+("transients") covers the language surface.

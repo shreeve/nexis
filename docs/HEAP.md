@@ -1,250 +1,135 @@
 ## HEAP.md — Runtime Heap Allocator & Object Storage
 
-Authoritative storage-layout contract for
-every non-immediate `Value`. Derivative from `PLAN.md` §10, `docs/VALUE.md`
-§4 and §5. Those documents win on conflict; nothing here may contradict
-the 16-byte `HeapHeader` freeze pinned in VALUE.md.
-
-This is the module that makes every heap kind possible. It is deliberately
-tiny: allocation, free, object enumeration, and a minimal `sweepUnmarked`
-that implements the sweep half of mark-sweep. Full GC (root enumeration,
-precise tracing, the `collect(roots)` driver) ships in `src/gc.zig`
-and is specified in `docs/GC.md`. This file is the allocator + sweep
-bedrock the collector builds on; the kind dispatch + mark phase live
-in `gc.zig`.
-
-Risk-register entries #1 (three-reps boundary), #2 (GC bugs), and #3
-(eq/hash inconsistency) are the three this module is most responsible for
-keeping in check.
+The storage contract for every heap-kind `Value` (`docs/VALUE.md`
+§2.2): the block layout, the `HeapHeader` and its bits, and the `Heap`
+API in `src/heap.zig`. The module allocates, frees, enumerates and
+sweeps; the collector that decides what to sweep is `src/gc.zig`
+(`docs/GC.md`).
 
 ---
 
 ### 1. Physical layout
 
 ```
- ┌──────────────────────────────┐  ← returned Block*, 16-byte aligned
- │ Block prefix (16 bytes)       │
- │   next: ?*Block               │    (8 bytes)
- │   total_size: usize           │    (8 bytes — whole allocation)
- ├──────────────────────────────┤  ← *HeapHeader = &block.header
- │ HeapHeader (16 bytes)         │    matches VALUE.md §4 exactly:
- │   kind: u16                    │
- │   mark: u8                     │
- │   flags: u8                    │
- │   hash: u32                    │
- │   meta: ?*HeapHeader           │
- ├──────────────────────────────┤  ← body = header + 16, `body_size` bytes
- │ Body (body_size bytes)        │
- └──────────────────────────────┘
+ ┌───────────────────────────────┐  ← Block, 16-byte aligned (private)
+ │ next: ?*Block        8 bytes   │
+ │ total_size: usize    8 bytes   │  header + body + 16
+ ├───────────────────────────────┤  ← *HeapHeader = &block.header
+ │ HeapHeader          16 bytes   │
+ ├───────────────────────────────┤  ← body = header + 16
+ │ body           body_size bytes │
+ └───────────────────────────────┘
 ```
 
-The `Block` struct is **private** to `src/heap.zig`. Users never see it;
-they only ever hold `*HeapHeader`. The 16-byte prefix carries the
-singly-linked list cursor and the allocation's total size (needed to
-reconstruct the backing slice for `allocator.free`).
+`Block` is private to `src/heap.zig`; every other module holds only a
+`*HeapHeader`. The prefix links the live list and records the size
+`free` needs to hand the slice back to the allocator.
 
-Pointer arithmetic:
+**HeapHeader** (`extern struct`, 16 bytes, 16-byte aligned):
 
-- `block → header`: `&block.header`.
-- `header → block`: `@fieldParentPtr("header", header_ptr)`.
-- `header → body`: `@as([*]u8, @ptrCast(header)) + @sizeOf(HeapHeader)`.
-- `block → allocation slice`: `@as([*]align(16) u8, @ptrCast(block))[0..block.total_size]`.
+| Offset | Field | Type | Contents |
+|---|---|---|---|
+| 0 | `kind` | `u16` | The block's `Kind` (VALUE.md §2), set by `alloc` |
+| 2 | `mark` | `u8` | Collector bits (§4) |
+| 3 | `flags` | `u8` | Object flags (§4) |
+| 4 | `hash` | `u32` | Cached hash; 0 means not computed |
+| 8 | `meta` | `?*HeapHeader` | The metadata map (a `persistent_map` block) or null |
 
-**Frozen invariants** (changing any of these requires a PLAN amendment
-or a VALUE.md amendment, not just a HEAP.md edit):
+Frozen invariants (a change is a PLAN amendment):
 
-1. Returned `*HeapHeader` is 16-byte aligned.
-2. `HeapHeader` layout and field order match VALUE.md §4 exactly.
-   `@sizeOf(HeapHeader) == 16`, `@alignOf(HeapHeader) == 16`.
-3. `HeapHeader.hash == 0` means "not computed". Genuine computed-zero
-   hashes recompute on next access (VALUE.md §4). The heap module provides
-   `cachedHash` / `setCachedHash` helpers that encode this sentinel.
-4. Fresh allocations are **zero-initialized** — both header (except `kind`
-   which is set explicitly) and body. Downstream code can rely on
-   `mark == 0`, `flags == 0`, `hash == 0` (uncomputed), `meta == null`,
-   and all body bytes `0`. This is what makes "freshly-allocated memory
-   is `nil`-valued" (VALUE.md §1.2) work for heap-stored `Value` arrays.
+1. A returned `*HeapHeader` is 16-byte aligned and nonzero;
+   `Heap.asHeapHeader` asserts both.
+2. `@sizeOf(HeapHeader) == 16`, `@alignOf(HeapHeader) == 16`, with the
+   field offsets above (asserted at compile time).
+3. `hash == 0` means "not computed". A kind's hasher caches its `u32`
+   hash only when it is nonzero (`cachedHash` / `setCachedHash`); a
+   genuine zero is recomputed on each use, which is cheaper than a
+   validity bit per object.
+4. A fresh block is zero-filled except `kind`: `mark`, `flags`, `hash`
+   are 0, `meta` is null and every body byte is 0, so a body of
+   Values starts as `nil`s (VALUE.md §1.2).
+
+Only a user-visible root carries metadata; the internal nodes of a map,
+set or vector never do.
 
 ---
 
 ### 2. Allocation list
 
-Every live block is on a single intrusive linked list rooted in
-`Heap.live_head`. Alloc prepends (O(1)); free detaches (O(1) if you hold
-the prev pointer, O(n) otherwise). `free` does a linear scan to
-find the predecessor. Blocks come from the allocator the heap is
-created with: the VM's, which in `bin/nexis` is the process allocator
-(`std.heap.smp_allocator` in release builds).
+Every live block is on one intrusive singly linked list at
+`Heap.live_head`. `alloc` prepends in O(1); `free` unlinks by a linear
+scan for the predecessor; `sweepUnmarked` unlinks as it walks. The list
+is the one record of what is live: the sweep walks it and tests count
+it.
 
-The list is the canonical source of truth for "what's live." Sweep walks
-it; tests enumerate it to assert leak counts.
-
-**Why not an external registry?** A prefix block keeps allocation lifetime metadata physically adjacent to
-the object, avoids a dual source of truth (allocator + registry), and
-transitions cleanly to slab-based allocation.
+Blocks come from the allocator the `Heap` is created with, the VM's
+(`VM.ensureHeap`). In `bin/nexis` that is a `DebugAllocator` (leak
+check, no per-allocation stack trace) in a Debug build and the
+process allocator otherwise (`src/cli.zig`). There are no size
+classes, slabs or large-object path, and no finalizers: an object that
+owns an OS resource is closed at the db layer.
 
 ---
 
 ### 3. Public API
 
-```zig
-pub const Heap = struct {
-    pub fn init(gpa: std.mem.Allocator) Heap;
-    pub fn deinit(self: *Heap) void;             // frees every remaining live block
+| `Heap` member | Contract |
+|---|---|
+| `init(backing: Allocator) Heap` | O(1); nothing is allocated until the first block |
+| `deinit()` | Frees every block still live |
+| `alloc(kind, body_size) !*HeapHeader` | A zero-filled block (§1 invariant 4) with `kind` set. `kind` is a heap kind or `cell_internal` (an upvalue cell, `docs/VM.md` §6). Errors: `error.OutOfMemory` from the backing allocator, `error.Overflow` when `body_size + 32` overflows `usize`. A zero `body_size` is legal. Never collects |
+| `free(h)` | Unlinks and releases one block. Debug builds poison the kind (`0xDEAD`) and panic on a second free |
+| `sweepUnmarked() usize` | Frees every block that is neither marked nor pinned, clears the mark on survivors, returns the count freed. The sweep half of `gc.Collector.collect`; it enumerates no roots |
+| `live_bytes`, `peak_live_bytes`, `allocated_since_collect` | Bytes held by live blocks (prefix included), the largest that has been, and bytes allocated since `resetAllocationCounter()`, which the collector's trigger reads (`docs/GC.md` §7) |
+| `isBlockKind(kind) bool` | Whether a Value of `kind` carries a `*HeapHeader`: every heap kind except `native_fn`, `var_` and the three db handles, plus `cell_internal`. The collector marks only these |
+| `bodyOf(Body, h) *Body`, `bodyBytes(h) []u8` | The body, typed (alignment ≤ 16, checked at compile time) or as bytes (`total_size - 32` long) |
+| `valueFromHeader(kind, h) Value`, `asHeapHeader(v) *HeapHeader` | Pack a header into a Value with subkind 0, and back. A kind that sets a subkind or view offset packs its own tag (VALUE.md §3) |
+| `liveCount() usize`, `forEachLive(visitor)` | O(n) enumeration for tests and diagnostics; the visitor must not allocate or free |
 
-    // Bytes held by every live block (header and body), the largest that
-    // figure has been, and the bytes allocated since the last
-    // `resetAllocationCounter`; the collector's trigger reads the last
-    // (docs/GC.md §7), a bounded-memory test the second.
-    live_bytes: usize,
-    peak_live_bytes: usize,
-    allocated_since_collect: usize,
-
-    // Allocate a new heap object of the given kind with `body_size` body bytes.
-    // `kind` is a heap kind or the `cell_internal` sentinel (an upvalue cell
-    // block, docs/VM.md §6). Returns a 16-byte-aligned `*HeapHeader`. Header
-    // and body are zero-initialized except `HeapHeader.kind` which is set to
-    // `kind`.
-    pub fn alloc(self: *Heap, kind: value.Kind, body_size: usize) !*HeapHeader;
-
-    pub fn resetAllocationCounter(self: *Heap) void;
-
-    // Which kinds carry a `*HeapHeader` in `Value.payload`: every heap kind
-    // except the pointer kinds (`native_fn`, `var_`, the three db handles),
-    // plus `cell_internal`. The collector marks only these.
-    pub fn isBlockKind(kind: value.Kind) bool;
-
-    // Free a single heap object. Removes it from the live list and releases
-    // the backing allocation. Debug builds panic on double-free (the block's
-    // kind field is poisoned at free time and checked on entry).
-    pub fn free(self: *Heap, h: *HeapHeader) void;
-
-    // Body accessors. Compile-time size/alignment check via `bodyOf`.
-    pub fn bodyOf(comptime Body: type, h: *HeapHeader) *Body;
-    pub fn bodyBytes(h: *HeapHeader) []u8;       // len = block.total_size - 32
-
-    // Value ↔ *HeapHeader conversion. `valueFromHeader` sets Kind in the
-    // tag word and packs the pointer into the payload. Per-kind constructors
-    // (in string.zig, bignum.zig, etc.) wrap this to set subkind/aux/flags
-    // appropriately for their kind.
-    pub fn valueFromHeader(kind: value.Kind, h: *HeapHeader) value.Value;
-    pub fn asHeapHeader(v: value.Value) *HeapHeader;
-
-    // Enumeration. `liveCount` is O(n) over the live list (not cached);
-    // it exists for tests and occasional diagnostics, not hot paths.
-    pub fn liveCount(self: *const Heap) usize;
-    pub fn forEachLive(self: *const Heap, visitor: anytype) void;
-
-    // Minimal sweep — free every block whose `mark` bit is clear; on
-    // survivors, clear the `mark` bit so the next cycle starts fresh.
-    // Returns the number of blocks freed. Does NOT enumerate roots or
-    // trace reachability (that's `src/gc.zig`'s job; see `docs/GC.md`).
-    // Callers that want a full collection should use
-    // `gc.Collector.collect(roots)` instead of driving this primitive
-    // directly; `sweepUnmarked` is exposed only as the sweep half of
-    // the mark-sweep pair.
-    pub fn sweepUnmarked(self: *Heap) usize;
-};
-
-// HeapHeader instance helpers — the canonical way to mutate the bits.
-// Raw field writes should be avoided outside of heap.zig itself.
-pub fn HeapHeader.isMarked(self: *const HeapHeader) bool;
-pub fn HeapHeader.setMarked(self: *HeapHeader) void;
-pub fn HeapHeader.clearMarked(self: *HeapHeader) void;
-pub fn HeapHeader.isPinned(self: *const HeapHeader) bool;
-pub fn HeapHeader.setPinned(self: *HeapHeader) void;
-pub fn HeapHeader.clearPinned(self: *HeapHeader) void;
-
-pub fn HeapHeader.meta(self: *const HeapHeader) ?*HeapHeader;
-pub fn HeapHeader.setMeta(self: *HeapHeader, m: ?*HeapHeader) void;
-
-pub fn HeapHeader.cachedHash(self: *const HeapHeader) ?u32;  // null if == 0
-pub fn HeapHeader.setCachedHash(self: *HeapHeader, h: u32) void;
-```
-
-**Error set.** `alloc` returns `error.OutOfMemory` from the backing
-allocator. There is no other error case.
-
-**Zero-body-size alloc** is legal. The returned `*HeapHeader` is valid;
-`bodyBytes` returns a length-0 slice; `bodyOf(T, h)` for `@sizeOf(T) == 0`
-is valid. (Rare, but pins the edge case.)
+| `HeapHeader` method | Contract |
+|---|---|
+| `isMarked`, `setMarked`, `clearMarked` | The `marked` bit |
+| `isPinned`, `setPinned`, `clearPinned` | The `pinned` bit |
+| `hasMeta`, `getMeta`, `setMeta` | `setMeta` keeps `flags.has_meta` equal to `meta != null`; `getMeta` asserts it in safe builds. Raw writes to `meta` are not made |
+| `cachedHash() ?u32`, `setCachedHash(u32)` | Null when `hash == 0` (§1 invariant 3) |
 
 ---
 
-### 4. Bit-level conventions
+### 4. Header bits
 
-`HeapHeader.mark` bit layout (VALUE.md §5):
+`mark`:
 
-| Bit | Name      | Meaning                                        |
-|-----|-----------|------------------------------------------------|
-| 0   | `marked`  | Visited in the current mark phase              |
-| 1   | `pinned`  | Do not free; survives every sweep. No runtime module pins a block; tests use it |
-| 2–7 | reserved  | Future tri-color / generational / remembered   |
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 | `marked` | Reached in the current mark phase; cleared by the sweep |
+| 1 | `pinned` | Survives every sweep, marked or not. No runtime module pins a block; tests do |
+| 2–7 | reserved | 0 |
 
-`HeapHeader.flags` bit layout:
+`flags`:
 
-| Bit | Name         | Meaning                                              |
-|-----|--------------|------------------------------------------------------|
-| 0   | `has_meta`   | `meta` field is non-null                             |
-| 1–7 | reserved     | zero; no constant names them                         |
-
-**`Value.tag.flags` is NOT `HeapHeader.flags`.** These are two different
-flag bytes on two different data structures:
-
-- `Value.tag.flags` describes the Value *reference* (hint bits used by the
-  runtime's dispatcher — e.g. `hash_cached` can become a fast-path bit
-  saying "don't dereference the header for the hash, it's the cached one
-  embedded in `Value.aux`" if that optimization ever lands).
-- `HeapHeader.flags` describes the heap object itself.
-
-The authoritative hash cache is `HeapHeader.hash`. `Value.tag`
-flag_hash_cached is reserved and unused.
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 | `has_meta` | `meta` is non-null |
+| 1–7 | reserved | 0 |
 
 ---
 
 ### 5. Interaction with other modules
 
-- **Value layer (`src/value.zig`).** Value holds a u64 payload that, for
-  heap kinds, is `@intFromPtr(header)`. `valueFromHeader` and
-  `asHeapHeader` round-trip this. Hashing of heap kinds is
-  dispatched by `src/dispatch.zig`'s `hashValue` to per-kind hash
-  functions, which load `HeapHeader.hash` (via `cachedHash`),
-  recompute if null, write back via `setCachedHash`, and
-  `mixKindDomain` as always.
-- **Intern layer (`src/intern.zig`).** No direct interaction: interned
-  name bytes are NOT heap-allocated (they live in interner-owned buffers,
-  not on this heap). The `meta_symbol` heap kind is reserved and has
-  no implementation.
-- **GC (`src/gc.zig`, see `docs/GC.md`).** Collector.collect(roots)
-  drives a full cycle: mark each root via per-kind `trace` functions
-  (each heap kind exports `pub fn trace(h, visitor)`; closures and
-  cells trace through the VM, the collector's host), then call
-  `sweepUnmarked` and reset the allocation counter. The VM runs a
-  cycle at its instruction-fetch safe point once
-  `allocated_since_collect` reaches its threshold; the mark phase is
-  a worklist loop. `forEachLive` is available for diagnostics. The
-  trace seam on `Interner` is a no-op (intern-owned storage is not
-  heap-managed).
-- **Codec (`src/codec.zig`).** Does not allocate directly on this
-  heap; it uses per-kind constructors that do. The heap module
+- **Value layer.** A heap Value's payload is `@intFromPtr(header)`;
+  its tag carries kind, subkind and (for a list view) an offset
+  (VALUE.md §1.1).
+- **Hashing.** `dispatch.hashValue` routes each heap kind to its
+  module's hasher, which reads and fills the header cache (§1
+  invariant 3) and returns the base the dispatcher domain-mixes
+  (SEMANTICS §3.3).
+- **Collector.** `gc.Collector.collect` marks from the roots through
+  each kind's `trace`, then calls `sweepUnmarked` and
+  `resetAllocationCounter` (`docs/GC.md`). The VM runs a cycle only at
+  its instruction-fetch safe point, never inside `alloc`.
+- **Interner.** Keyword and symbol names are interner allocations, not
+  heap blocks (`docs/INTERN.md`).
+- **Codec.** Builds values through the per-kind constructors; the heap
   is codec-unaware.
 
----
-
-### 6. What HEAP.md does not cover
-
-- **Per-kind body layouts** (string body, CHAMP node, RRB trie node,
-  bignum limbs). Those are each their own module's concern, documented
-  alongside the module (`docs/STRING.md`, `docs/CHAMP.md`, `docs/VECTOR.md`,
-  etc.).
-- **Root enumeration and the real mark-sweep driver.** `docs/GC.md`
-  and `src/gc.zig` own this. HEAP.md only owns the allocator + the
-  sweep primitive + the mark-bit layout.
-- **Allocation performance** (slab allocator, size-class bins, large-object
-  direct-mmap). PLAN §10.4 describes the target shape (`PLAN §19.6`
-  T2.6 generational, T1.4 slab pools); none of it exists. Every block
-  comes from the backing allocator.
-- **Large-object threshold.** One strategy serves every size.
-  PLAN §10.4's >4 KiB direct-from-OS path does not exist.
-- **Finalization hooks.** None. Objects that own OS resources (open
-  files, durable-ref pins) are tracked separately at the tx/db layer.
+Per-kind body layouts are in each kind's doc.
