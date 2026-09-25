@@ -271,6 +271,7 @@ const core_natives = table("", .{
     .{ "keyword", 1, 2, &fnKeyword },
     .{ "symbol", 1, 2, &fnSymbol },
     .{ "gensym", 0, 1, &fnGensym },
+    .{ "in-ns", 1, 1, &fnInNs },
     // Exceptions as maps (PLAN Amendment Log, exceptions are values).
     .{ "ex-info", 2, 3, &fnExInfo },
     .{ "ex-data", 1, 1, &fnExData },
@@ -4210,6 +4211,16 @@ fn fnMakeRecord(vm: *VM, args: []const Value) VmError!Value {
 /// what `deftest` registers under and `run-tests` runs by default.
 fn fnCurrentNs(vm: *VM, _: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), vm.ensureNamespace().name) catch VmError.OutOfMemory;
+}
+
+/// `(in-ns 'name)` → makes `name` the current namespace, creating
+/// it (with nexis.core referred) when absent, so the forms after it
+/// compile there; nil.
+fn fnInNs(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .symbol) return VmError.KindMismatch;
+    const registry = vm.ensureRegistry() catch return VmError.OutOfMemory;
+    registry.switchTo(vm.ensureInterner().symbolName(args[0].asSymbolId())) catch return VmError.OutOfMemory;
+    return value_mod.nilValue();
 }
 
 /// `(#%record? x)` → bool.

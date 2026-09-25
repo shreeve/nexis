@@ -208,6 +208,9 @@ every outcome.
   2 failures, 1 errors.
   ```
 
+- `nexis test FILE...` (§1) runs the files, then `run-all-tests`, and
+  exits 1 when an assertion failed or a test threw, so CI can gate on
+  a test run.
 - `nexis.internal/#%current-ns` is the native `deftest` and
   `run-tests` read the current namespace's name from at run time,
   since a macro body runs in a compile-time VM that has no
@@ -233,13 +236,14 @@ bracket; one holding a collection one element per line, each laid
 out from its own column. Records and empty collections print flat.
 `test/golden/cli/pprint.out` pins the layout.
 
-**`nexis.math`** (`src/stdlib.zig` `math_fns` + `src/stdlib/math.nx`):
+**`nexis.math`** (`src/stdlib.zig` `math_natives` + `src/stdlib/math.nx`):
 `sqrt` and `pow` are over doubles and return a float for any
 number in the tower (`(sqrt 16)` is `4.0`, `(pow 2 10)` is
 `1024.0`); `floor` and `ceil` return an integer unchanged and a
 float's floor or ceiling as a float; `round` returns an integer
 unchanged and a float's nearest integer, halves up, as a fixnum or
-bignum (`(round 2.5)` is `3`, `(round -2.5)` is `-2`; NaN and the
-infinities are `:invalid-argument`). `PI` and `E` are the doubles.
+bignum, exactly as Java's `Math/round` (`(round 2.5)` is `3`,
+`(round -2.5)` is `-2`, `(round 0.49999999999999994)` is `0`; NaN and
+the infinities are `:invalid-argument`). `PI` and `E` are the doubles.
 `abs` is `nexis.core/abs` and is not duplicated here.
 `test/integration/numbers.zig` pins each.
