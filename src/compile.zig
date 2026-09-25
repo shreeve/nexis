@@ -8612,7 +8612,7 @@ test "compile try: the primitive accepts only the any matcher" {
     try testing.expectError(CompileError.UnsupportedFeature, compileSource(arena.allocator(), "(try 1 (catch :my-error e e))"));
 }
 
-test "compile try: a symbol matcher other than any is a macro error" {
+test "compile try: a string matcher is a macro error" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
@@ -8624,7 +8624,7 @@ test "compile try: a symbol matcher other than any is a macro error" {
     defer host_macros.deinit(testing.allocator);
     try testing.expectError(
         CompileError.MacroExpansionFailure,
-        compileSourceFullWithMacros(arena.allocator(), "(try 1 (catch Exception e e))", null, interner, &host_macros),
+        compileSourceFullWithMacros(arena.allocator(), "(try 1 (catch \"Exception\" e e))", null, interner, &host_macros),
     );
 }
 
