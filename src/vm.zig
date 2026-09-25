@@ -3850,7 +3850,7 @@ fn mapLookup(m: Value, key: Value, default: Value) Value {
 /// Kinds a `call:call` treats as a lookup rather than a function.
 pub fn isLookupCallable(k: value_mod.Kind) bool {
     return switch (k) {
-        .keyword, .persistent_map, .persistent_set, .persistent_vector => true,
+        .keyword, .symbol, .persistent_map, .persistent_set, .persistent_vector => true,
         else => false,
     };
 }
@@ -3858,7 +3858,7 @@ pub fn isLookupCallable(k: value_mod.Kind) bool {
 /// Invoke a keyword or collection as a function.
 ///
 ///   (:k x)      → (get x :k)       nil when `x` is not a lookup target
-///   (:k x d)    → (get x :k d)
+///   (:k x d)    → (get x :k d)     a symbol, `('s x)`, alike
 ///   (m k), (m k d) → (get m k d)
 ///   (s x)       → (get s x)       sets take exactly one argument
 ///   (v i)       → (nth v i)       vectors take exactly one fixnum;
@@ -3869,7 +3869,7 @@ pub fn callLookup(callee: Value, args: []const Value) VmError!Value {
     if (args.len < 1 or args.len > 2) return VmError.ArityMismatch;
     const default = if (args.len == 2) args[1] else value_mod.nilValue();
     return switch (callee.kind()) {
-        .keyword => switch (args[0].kind()) {
+        .keyword, .symbol => switch (args[0].kind()) {
             .nil, .persistent_map, .record, .persistent_set, .persistent_vector, .nextomic_entity => lookup(args[0], callee, default),
             else => default,
         },

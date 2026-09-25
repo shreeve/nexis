@@ -3150,6 +3150,15 @@ test "keyword-as-function: keywords passed to higher-order functions" {
     try expectOutput("((partial :a) {:a 5})", "5");
 }
 
+test "symbol-as-function: a symbol looks itself up as a keyword does" {
+    try expectOutput("('a {'a 1 'b 2})", "1");
+    try expectOutput("('c {'a 1} :none)", ":none");
+    try expectOutput("('a #{'a})", "a");
+    try expectOutput("('a 5)", "nil");
+    try expectOutput("(map 'x [{'x 1} {'x 2} {}])", "(1 2 nil)");
+    try expectOutput("(try ('a) (catch any e e))", ":arity-mismatch");
+}
+
 test "collection-as-function: maps, sets and vectors" {
     try expectOutput("({:a 1} :a)", "1");
     try expectOutput("({:a 1} :b)", "nil");

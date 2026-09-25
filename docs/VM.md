@@ -529,10 +529,10 @@ do not fit) and enables a one-instruction call fast path.
 - `protocol_fn`: dispatch on the first argument's kind (or record
   type) through the VM's protocol registry (`docs/PROTOCOLS.md`);
   `:no-protocol-impl` / `:no-protocol-method` on a miss.
-- `keyword`, `persistent_map`, `persistent_set`,
-  `persistent_vector`: invoked as a lookup — `(:k m)`, `(m :k)`,
-  `(s x)`, `(v i)` with an optional default (PLAN §8.7,
-  `VM.lookup`).
+- `keyword`, `symbol`, `persistent_map`, `persistent_set`,
+  `persistent_vector`: invoked as a lookup — `(:k m)`, `('s m)`,
+  `(m :k)`, `(s x)`, `(v i)` with an optional default (PLAN §8.7,
+  `VM.lookup`); a symbol looks itself up exactly as a keyword does.
 - `function` (a closure): the frame transfer below.
 - Anything else: `:not-callable`.
 
@@ -1054,7 +1054,7 @@ handler is active):
 |---|---|
 | `:kind-mismatch` | An operand of the wrong kind: non-numeric to `math:*` / `cmp:*`, non-list to `coll:concat`, wrong kind to a native |
 | `:arity-mismatch` | `call:call` (or `callValue`) passes an argument count the callee does not accept |
-| `:not-callable` | `call:call` on a value that is not a function, native, protocol fn, keyword, map, set or vector |
+| `:not-callable` | `call:call` on a value that is not a function, native, protocol fn, keyword, symbol, map, set or vector |
 | `:unbound-var` | A `v` operand or `var:load-var` on a Var never bound by `def` |
 | `:not-dynamic` | `binding` (`push-thread-bindings`) or `set!` (`var-set`) on a Var not marked `^:dynamic` (§6.5) |
 | `:no-thread-binding` | `set!` (`var-set`) on a dynamic Var with no `binding` of it in force (§6.5) |
