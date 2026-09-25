@@ -1,24 +1,25 @@
-//! bench/main.zig — nexis baseline benchmark suite.
+//! bench/main.zig — the nexis benchmark suite.
 //!
-//! Driver `main()` that runs every benchmark in this file,
-//! prints a human-readable table to stdout, and writes JSON to
-//! `--out <path>` (default `bench/baseline.json` under the repo
-//! root).
+//! `main()` runs every benchmark of the selected categories and
+//! prints a table to stdout; with `--out <path>` it also writes the
+//! JSON report there.
 //!
-//! Categories (BENCH.md §2):
-//!   - scalar: fixnum / float arithmetic, keyword identity hash,
-//!     raw xxHash3 over bytes.
+//! Categories, in the order they run (docs/BENCH.md §10):
+//!   - scalar: fixnum / float arithmetic, fixnum, keyword and string
+//!     hashes, raw xxHash3 over bytes.
 //!   - collection-construction: list / vector / map / set built
 //!     by N-fold conj/assoc from empty.
-//!   - collection-lookup-update: random lookup on a pre-built
-//!     collection of size N.
-//!   - transient-construction: same as collection-construction,
-//!     but using transient wrappers + `persistent!`.
-//!   - codec: encode / decode for representative Values.
-//!   - db-integrated: emdb put / get round-trip cost (PLAN §19
-//!     "database-integrated" category).
+//!   - transient-construction: the same through transients and
+//!     `persistent!`.
+//!   - collection-lookup-update: lookups on a pre-built collection
+//!     of size N.
+//!   - compiler: compiling `(+ 1 2)`, and the whole pipeline for a
+//!     loop, a closure and nested arithmetic.
 //!   - vm: the dispatch loop on a routine compiled once (a counting
 //!     loop, the same loop calling a global fn, a keyword lookup).
+//!   - codec: encode / decode for representative Values.
+//!   - db-integrated: emdb put / get round-trip cost (the
+//!     Database-integrated category of docs/BENCH.md §2).
 //!   - nextomic: `q` over a 200k-datom store and `pull` over 20k
 //!     entities (bench/nextomic.zig).
 //!
@@ -364,7 +365,7 @@ fn populateKeysAndVals(
 }
 
 // =============================================================================
-// Compiler benchmarks (COMPILER.md §9.4 gate item 7)
+// Compiler benchmarks (COMPILER.md §9.4 item 6)
 // =============================================================================
 
 const CompileBenchCtx = struct {
@@ -632,7 +633,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
-    // ---- Compiler (COMPILER.md §9.4 gate item 7) ----
+    // ---- Compiler (COMPILER.md §9.4 item 6) ----
     //
     //   compile_simple — read, expand and compile `(+ 1 2)`
     //   eval_simple_loop, closure_create, eval_arith — the whole
@@ -714,7 +715,7 @@ pub fn main(init: std.process.Init) !u8 {
         var store = try TmpStore.init(alloc, "db");
         defer store.deinit(alloc);
         var conn = try db.open(alloc, &heap, &interner, store.path.ptr, .{ .allocator = alloc });
-        defer db.close(&conn);
+        defer db.close(&conn) catch {};
 
         // Seed the key we'll be overwriting.
         {

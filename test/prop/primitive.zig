@@ -22,6 +22,10 @@
 //!   P7. NaN canonicalization: any f64 input — including arbitrary NaN
 //!       bit patterns — produces a Value whose hash and equality
 //!       behaviour are identical to the canonical NaN.
+//!   P8. Within a kind, `=` follows the value: distinct chars,
+//!       keywords, symbols and fixnums are never `=`.
+//!   K1. Every kind's equality category (identity or not) and hash
+//!       domain byte match the table of SEMANTICS §3.3.
 //!
 //! There's no adversarial key generator here; the sample space is
 //! dense enough (every kind, broad value ranges) that a fixed-seed
@@ -193,5 +197,47 @@ test "P7: NaN canonicalization — arbitrary NaN bits behave identically" {
         try std.testing.expectEqual(v.hashImmediate(), canonical.hashImmediate());
         // And bit-level: all NaN inputs collapse to the canonical bit pattern.
         try std.testing.expectEqual(hash.canonical_nan_bits, v.payload);
+    }
+}
+
+test "P8: within a kind, = follows the value: distinct chars, keywords, symbols and fixnums are never =" {
+    try std.testing.expect(!value.fromChar('a').?.equalImmediate(value.fromChar('b').?));
+    try std.testing.expect(!value.fromKeywordId(7).equalImmediate(value.fromKeywordId(8)));
+    try std.testing.expect(!value.fromSymbolId(7).equalImmediate(value.fromSymbolId(8)));
+    try std.testing.expect(!value.fromFixnum(1).?.equalImmediate(value.fromFixnum(2).?));
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 7);
+    const r = prng.random();
+    var i: usize = 0;
+    while (i < iterations_per_property) : (i += 1) {
+        const a = randValue(r);
+        const b = randValue(r);
+        if (a.kind() != b.kind()) continue;
+        const same = if (a.kind() == .float)
+            a.asFloat() == b.asFloat() or (std.math.isNan(a.asFloat()) and std.math.isNan(b.asFloat()))
+        else
+            a.payload == b.payload;
+        try std.testing.expectEqual(same, a.equalImmediate(b));
+    }
+}
+
+test "K1: every kind's equality category and hash domain are SEMANTICS §3.3's" {
+    const dispatch = nx.dispatch;
+    for (std.enums.values(value.Kind)) |k| {
+        const identity = switch (k) {
+            .function, .var_, .transient, .native_fn, .db_connection, .db_write_txn, .db_read_txn, .atom, .protocol, .protocol_fn, .nextomic_conn => true,
+            else => false,
+        };
+        const domain: u8 = switch (k) {
+            .list, .persistent_vector => 0xF0,
+            else => @intFromEnum(k),
+        };
+        std.testing.expectEqual(identity, dispatch.isIdentityKind(k)) catch |err| {
+            std.debug.print("\n  kind {t}: identity\n", .{k});
+            return err;
+        };
+        std.testing.expectEqual(domain, dispatch.domainByte(k)) catch |err| {
+            std.debug.print("\n  kind {t}: domain\n", .{k});
+            return err;
+        };
     }
 }

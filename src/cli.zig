@@ -117,7 +117,7 @@ fn runCommand(init: std.process.Init) !void {
         if (args.len < 3) usageExit(io);
         try evalExpr(io, allocator, args[2], args[3..]);
     } else if (eql(cmd, "--help") or eql(cmd, "-h")) {
-        try std.Io.File.stderr().writeStreamingAll(io, Usage);
+        try std.Io.File.stdout().writeStreamingAll(io, Usage);
     } else if (std.mem.endsWith(u8, cmd, ".nx") or eql(cmd, "-")) {
         try runFile(io, allocator, cmd, args[2..]);
     } else {

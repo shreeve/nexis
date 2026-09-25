@@ -17,7 +17,7 @@ samples are the committed goldens under `test/golden/cli/`, which
 | `nexis repl` | The read-eval-print loop below. |
 | `nexis test FILE...` | Runs each file (restoring the current namespace after each), then `(nexis.test/run-all-tests)` (§3); exit 1 when an assertion failed or a test threw. |
 | `nexis disasm FILE`, `nexis --disasm FILE` | §2. |
-| `nexis --help`, `nexis -h` | The usage text, on stderr, exit 0. With no arguments, or a command missing its FILE, the same text and exit 1; an unknown command is ``nexis: unknown command 'X' (try `nexis --help`)``, exit 1. |
+| `nexis --help`, `nexis -h` | The usage text, on stdout, exit 0. With no arguments, or a command missing its FILE, the same text on stderr and exit 1; an unknown command is ``nexis: unknown command 'X' (try `nexis --help`)``, exit 1. |
 
 Every command evaluates through `Loader.evalSource`: parse and read
 every top-level form, then compile and run each before compiling the

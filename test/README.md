@@ -31,6 +31,15 @@ Every expected-output file the gate compares (`.sexp`, `.err`,
 `nextomic-nx` steps); read the diff before committing it. A missing
 expected file fails its step and names the flag.
 
+A program run is cached on the contents of everything it reads: the
+binary, the script, its expected output, the files it loads
+(`prelude.nx`, every file under `examples/lib/`, `test/golden/cli/lib/`)
+and its environment, which is empty but for `NEXIS_GC_STRESS` (always
+set for `test/nextomic/`, passed through from the build's environment
+elsewhere). A change to any of them re-runs it, in a directory emptied
+that build. The two runs that share a store (`persist-1`/`persist-2`,
+an example with a `.2.out`) both run on every build.
+
 ## Running
 
 `AGENTS.md` lists the build steps: `zig build quick` is the inner

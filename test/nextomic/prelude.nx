@@ -1,6 +1,6 @@
 ; test/nextomic/prelude.nx — shared by every script in this directory
-; through `(require '[prelude :as t])`; the build copies it into the
-; scripts' scratch directory next to them.
+; through `(require '[prelude :as t])`, which finds it beside the
+; script.
 
 (ns prelude)
 

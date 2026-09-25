@@ -155,9 +155,9 @@ pub const Runner = struct {
     /// Run `run_fn(ctx)` under criterion-style measurement.
     ///
     /// `name`: stable identifier for this benchmark (appears in JSON).
-    /// `category`: one of BENCH.md §2 taxonomy strings
-    ///   ("warm-microbench", "collection-construction",
-    ///   "collection-lookup-update", "memory-footprint", etc.).
+    /// `category`: the suite category the row belongs to, the name
+    ///   `--filter` selects it by ("scalar", "collection-construction",
+    ///   "db-integrated", ...; bench/main.zig lists them).
     /// `param`: optional scaling parameter (e.g., N for size-N
     ///   collection benchmarks).
     /// `ctx`: arbitrary state passed to `run_fn`.

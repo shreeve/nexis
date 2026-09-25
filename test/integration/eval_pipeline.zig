@@ -1405,6 +1405,27 @@ test "integration: a transient hashes by identity, so it can be a set member or 
     , "[true 2 1 false false]");
 }
 
+test "integration: identity kinds are = only to themselves, and two of them hash apart (SEMANTICS §3.3)" {
+    try expectOutputProgram(
+        \\(defprotocol P (area [s]))
+        \\(def old-p P)
+        \\(def old-area area)
+        \\(defprotocol P (area [s]))
+        \\(def x 1)
+        \\(def y 1)
+        \\(defn same [a b] [(= a a) (= (hash a) (hash a)) (= a b) (= (hash a) (hash b))])
+        \\[(same (atom 1) (atom 1)) (same (fn [] 1) (fn [] 1)) (same + -) (same (var x) (var y)) (same old-p P) (same old-area area)]
+    , "[[true true false false] [true true false false] [true true false false] [true true false false] [true true false false] [true true false false]]");
+    try expectOutputProgramWithStore("identity-conns",
+        \\(def c (db/open "@STORE@"))
+        \\(def n (nextomic/connect "@STORE@.nextomic"))
+        \\(def seen [(= c c) (= (hash c) (hash c)) (= n n) (= (hash n) (hash n)) (= c n) (contains? #{c} c) (contains? #{n} n)])
+        \\(db/close c)
+        \\(nextomic/release n)
+        \\seen
+    , "[true true true true false true true]");
+}
+
 test "integration: in-ns switches the namespace the next forms compile in" {
     try expectOutputProgram("(in-ns 'other) (def x 1) (in-ns 'user) [other/x (try (in-ns \"s\") (catch any e e))]", "[1 :kind-mismatch]");
 }
@@ -1413,16 +1434,29 @@ test "integration: *command-line-args* is nil without arguments; read-line needs
     try expectOutput("[*command-line-args* (try (read-line) (catch any e e))]", "[nil :io-error]");
 }
 
-test "integration: =, hash, set membership and printing of data nested past the stack are :stack-overflow" {
-    try expectOutput("(let [deep (fn [] (reduce (fn [acc _] [acc]) [] (range 200000)))] [(try (= (deep) (deep)) (catch :stack-overflow e :deep)) (try (hash (deep)) (catch :stack-overflow e :deep)) (try #{(deep) (deep)} (catch :stack-overflow e :deep)) (try (pr-str (deep)) (catch :stack-overflow e :deep))])", "[:deep :deep :deep :deep]");
+test "integration: =, compare, flatten, hash, set membership and printing of data nested past the stack are :stack-overflow" {
+    // One chain of vectors 100k deep, built once: the test's 6 MiB
+    // guard (stack.main_thread_budget) stops every walk of it well
+    // before the bottom, in Debug and ReleaseFast alike (a ReleaseFast
+    // hash or print uses about 160 bytes a level, so about 40k levels
+    // reach the guard). `b` is `a` one level down, so `=` and
+    // `compare` walk both to the bottom with nothing else to build,
+    // and a collection under NEXIS_GC_STRESS marks one chain, not
+    // several.
+    try expectOutput(
+        \\(let [a (loop [acc [] i 0] (if (< i 100000) (recur [acc] (inc i)) acc))
+        \\      b (nth a 0)]
+        \\  [(try (= a b) (catch :stack-overflow e :deep))
+        \\   (try (compare a b) (catch :stack-overflow e :deep))
+        \\   (try (flatten a) (catch :stack-overflow e :deep))
+        \\   (try (hash a) (catch :stack-overflow e :deep))
+        \\   (try #{a b} (catch :stack-overflow e :deep))
+        \\   (try (pr-str a) (catch :stack-overflow e :deep))])
+    , "[:deep :deep :deep :deep :deep :deep]");
 }
 
 test "integration: a record prints as #ns.Type{...}; defrecord and defprotocol may be redefined" {
     try expectOutput("(defrecord P [x y]) (def old (->P 1 \"a\")) (defrecord P [x y z]) (defprotocol A (area [s])) (defprotocol A (area [s])) [(pr-str old) (pr-str (->P 1 2 3)) (= old (map->P {:x 1 :y \"a\"}))]", "[#user.P{:x 1, :y \"a\"} #user.P{:x 1, :y 2, :z 3} false]");
-}
-
-test "integration: flatten and compare of data nested past the stack are :stack-overflow" {
-    try expectOutput("(let [deep (fn [] (reduce (fn [acc _] [acc]) [] (range 200000)))] [(try (flatten (deep)) (catch :stack-overflow e :deep)) (try (compare (deep) (deep)) (catch :stack-overflow e :deep))])", "[:deep :deep]");
 }
 
 test "integration: core.nx composite + HOFs" {

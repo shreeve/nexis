@@ -5,9 +5,10 @@
 //! Zig API, not through the language: a 200k-datom employee store for
 //! `q` (joins by department and by age, an aggregate over a hash join,
 //! and one join from 1, 3 and 7 ages, either side of the nested-loop /
-//! hash-join crossover) and a 20k-entity store for `pull`. The tests
-//! carry 10k-datom twins of both that check the rows
-//! (test/integration/nextomic_{q,pull}.zig).
+//! hash-join crossover) and a 20k-entity store for `pull`. Each row
+//! runs once and checks how many rows it returns before it is timed,
+//! so a timing never measures a wrong answer; the tests carry 10k-datom
+//! twins of both (test/integration/nextomic_{q,pull}.zig).
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -135,10 +136,13 @@ const QCtx = struct {
     q: Value,
     inputs: []const Value,
 
-    fn run(self: *QCtx) anyerror!void {
+    fn answer(self: *QCtx) !Value {
         var diag: query.Diag = .{};
-        const result = try query.q(self.fx.gpa, &self.fx.interner, &self.fx.heap, self.q, self.dbv, self.inputs, &diag, .{});
-        std.mem.doNotOptimizeAway(result);
+        return query.q(self.fx.gpa, &self.fx.interner, &self.fx.heap, self.q, self.dbv, self.inputs, &diag, .{});
+    }
+
+    fn run(self: *QCtx) anyerror!void {
+        std.mem.doNotOptimizeAway(try self.answer());
     }
 };
 
@@ -150,15 +154,38 @@ const PullCtx = struct {
     eids: []const Value = &.{},
     one: ?Value = null,
 
-    fn run(self: *PullCtx) anyerror!void {
+    fn answer(self: *PullCtx) !Value {
         var diag: pull.Diag = .{};
-        const result = if (self.one) |eid|
-            try pull.pull(self.fx.gpa, &self.fx.interner, &self.fx.heap, self.dbv, self.pattern, eid, &diag)
+        return if (self.one) |eid|
+            pull.pull(self.fx.gpa, &self.fx.interner, &self.fx.heap, self.dbv, self.pattern, eid, &diag)
         else
-            try pull.pullMany(self.fx.gpa, &self.fx.interner, &self.fx.heap, self.dbv, self.pattern, self.eids, &diag);
-        std.mem.doNotOptimizeAway(result);
+            pull.pullMany(self.fx.gpa, &self.fx.interner, &self.fx.heap, self.dbv, self.pattern, self.eids, &diag);
+    }
+
+    fn run(self: *PullCtx) anyerror!void {
+        std.mem.doNotOptimizeAway(try self.answer());
     }
 };
+
+/// Fail unless `result` holds `rows` rows: a scalar count, or the
+/// count of a set or vector.
+fn expectRows(name: []const u8, result: Value, rows: usize) !void {
+    const got: usize = switch (result.kind()) {
+        .fixnum => @intCast(result.asFixnum()),
+        .persistent_set => champ.setCount(result),
+        .persistent_vector => vector_mod.count(result),
+        else => return error.UnexpectedResult,
+    };
+    if (got == rows) return;
+    std.debug.print("nexis-bench: {s} returned {d} rows, not {d}\n", .{ name, got, rows });
+    return error.WrongRowCount;
+}
+
+/// Check the answer of `ctx`'s query, then time it.
+fn benchQuery(runner: *bench.Runner, comptime name: []const u8, ctx: *QCtx, rows: usize) !void {
+    try expectRows(name, try ctx.answer(), rows);
+    try runner.bench(name, "nextomic", 200_000, ctx, QCtx.run);
+}
 
 /// The 200k-datom `q` corpus: 40,000 employees with five attributes
 /// each over 20 departments.
@@ -185,6 +212,8 @@ pub fn runQuery(runner: *bench.Runner, gpa: Allocator, path: [:0]const u8) !void
     const batch: usize = 5_000;
     var prng = std.Random.DefaultPrng.init(7);
     const rnd = prng.random();
+    // Employees per age, for the rows each query must return.
+    var of_age = [_]usize{0} ** 65;
     var start: usize = 0;
     while (start < emps) : (start += batch) {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -195,7 +224,9 @@ pub fn runQuery(runner: *bench.Runner, gpa: Allocator, path: [:0]const u8) !void
             const me = tempid(i);
             const name = try std.fmt.allocPrint(arena, "emp-{d}", .{i});
             try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_name }, .v = .{ .val = .{ .string = name } } } });
-            try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_age }, .v = .{ .val = .{ .long = 20 + @as(i64, @intCast(rnd.uintLessThan(u32, 45))) } } } });
+            const age = 20 + rnd.uintLessThan(u32, 45);
+            of_age[age] += 1;
+            try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_age }, .v = .{ .val = .{ .long = age } } } });
             try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_dept }, .v = .{ .val = .{ .ref = depts[i % depts.len] } } } });
             try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_salary }, .v = .{ .val = .{ .long = 1000 + @as(i64, @intCast(rnd.uintLessThan(u32, 9000))) } } } });
             try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_active }, .v = .{ .val = .{ .boolean = i % 3 == 0 } } } });
@@ -207,17 +238,21 @@ pub fn runQuery(runner: *bench.Runner, gpa: Allocator, path: [:0]const u8) !void
     const join = try fx.read("[:find (count ?n) . :in $ [?a ...] :where [?e :emp/age ?a] [?e :emp/name ?n] [?e :emp/salary ?s]]");
 
     var by_dept = QCtx{ .fx = &fx, .dbv = dbv, .inputs = none, .q = try fx.read("[:find ?n ?dn :where [?d :dept/name \"d7\"] [?e :emp/dept ?d] [?e :emp/name ?n] [?d :dept/name ?dn]]") };
-    try runner.bench("q_join3_by_dept_2k_rows", "nextomic", 200_000, &by_dept, QCtx.run);
+    try benchQuery(runner, "q_join3_by_dept_2k_rows", &by_dept, emps / depts.len);
     var by_age = QCtx{ .fx = &fx, .dbv = dbv, .inputs = none, .q = try fx.read("[:find ?n ?dn :where [?e :emp/age 33] [?e :emp/dept ?d] [?d :dept/name ?dn] [?e :emp/name ?n]]") };
-    try runner.bench("q_join3_by_age", "nextomic", 200_000, &by_age, QCtx.run);
+    try benchQuery(runner, "q_join3_by_age", &by_age, of_age[33]);
+    // Active is every third employee, d3 every twentieth from the
+    // fourth: the employees 3, 63, 123, ...
     var active = QCtx{ .fx = &fx, .dbv = dbv, .inputs = none, .q = try fx.read("[:find (count ?e) . :where [?e :emp/active true] [?e :emp/dept ?d] [?d :dept/name \"d3\"]]") };
-    try runner.bench("q_count_hash_join", "nextomic", 200_000, &active, QCtx.run);
+    try benchQuery(runner, "q_count_hash_join", &active, (emps - 3 + 59) / 60);
     var ages_1 = QCtx{ .fx = &fx, .dbv = dbv, .q = join, .inputs = &.{ value.nilValue(), try fx.read("[33]") } };
-    try runner.bench("q_join3_from_1_age", "nextomic", 200_000, &ages_1, QCtx.run);
+    try benchQuery(runner, "q_join3_from_1_age", &ages_1, of_age[33]);
     var ages_3 = QCtx{ .fx = &fx, .dbv = dbv, .q = join, .inputs = &.{ value.nilValue(), try fx.read("[33 34 35]") } };
-    try runner.bench("q_join3_from_3_ages", "nextomic", 200_000, &ages_3, QCtx.run);
+    try benchQuery(runner, "q_join3_from_3_ages", &ages_3, of_age[33] + of_age[34] + of_age[35]);
     var ages_7 = QCtx{ .fx = &fx, .dbv = dbv, .q = join, .inputs = &.{ value.nilValue(), try fx.read("[20 21 22 23 24 25 26]") } };
-    try runner.bench("q_join3_from_7_ages", "nextomic", 200_000, &ages_7, QCtx.run);
+    var young: usize = 0;
+    for (of_age[20..27]) |n| young += n;
+    try benchQuery(runner, "q_join3_from_7_ages", &ages_7, young);
 }
 
 /// The 20k-entity `pull` corpus: employees with a name, an age, a
@@ -265,9 +300,17 @@ pub fn runPull(runner: *bench.Runner, gpa: Allocator, path: [:0]const u8) !void 
     const dbv = try fx.conn.db();
 
     var star = PullCtx{ .fx = &fx, .dbv = dbv, .eids = eids.items, .pattern = try fx.read("[*]") };
+    try expectRows("pull_many_star", try star.answer(), emps);
     try runner.bench("pull_many_star", "nextomic", 20_000, &star, PullCtx.run);
     var nested = PullCtx{ .fx = &fx, .dbv = dbv, .eids = eids.items, .pattern = try fx.read("[:emp/name {:emp/dept [:dept/name]} (:emp/skills :limit 1)]") };
+    try expectRows("pull_many_nested_ref_limit", try nested.answer(), emps);
     try runner.bench("pull_many_nested_ref_limit", "nextomic", 20_000, &nested, PullCtx.run);
     var reverse = PullCtx{ .fx = &fx, .dbv = dbv, .one = value.fromFixnum(@intCast(depts[3])).?, .pattern = try fx.read("[:dept/name (:emp/_dept :limit nil)]") };
+    const reverse_key = try fx.interner.internKeywordValue("emp/_dept");
+    const reverse_refs = switch (champ.mapGet(try reverse.answer(), reverse_key, &dispatch.hashValue, &dispatch.equal)) {
+        .present => |refs| refs,
+        .absent => return error.UnexpectedResult,
+    };
+    try expectRows("pull_reverse_ref_2k", reverse_refs, emps / depts.len);
     try runner.bench("pull_reverse_ref_2k", "nextomic", 2_000, &reverse, PullCtx.run);
 }
