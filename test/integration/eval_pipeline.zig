@@ -4930,6 +4930,19 @@ fn expectOutputWithFiles(files: []const [2][]const u8, src: []const u8, expected
 
 const utilns = [2][]const u8{ "util.nx", "(ns util)\n(defn twice [x] (* 2 x))\n(def ^:private secret 1)\n(defn half [x] (quot x 2))\n" };
 
+test "ns: (:refer-clojure :exclude [names]) leaves those names to the namespace" {
+    // A form compiled before the namespace's own + calls it, not core's inlined +.
+    try expectOutputProgram("(ns ex (:refer-clojure :exclude [+ when])) (defn f [] (+ 1 2)) (defn + [a b] (str a b)) (f)", "12");
+    try expectOutputProgram("(ns ex (:refer-clojure :exclude [when])) (defn when [x] [:mine x]) (when 1)", "[:mine 1]");
+    try expectOutputProgram("(ns ex (:refer-clojure :exclude [inc])) [(nexis.core/inc 1) (try (inc 1) (catch any e e))]", "[2 :unbound-var]");
+    try expectOutputProgram("(ns ex (:refer-clojure :exclude [inc])) `(inc 1)", "(ex/inc 1)");
+    try expectOutputProgram("(ns ex (:refer-clojure)) (inc 1)", "2");
+    // Without :exclude, a Var the namespace defines hides a host macro too.
+    try expectOutputProgram("(defn when [x] [:mine x]) (when 1)", "[:mine 1]");
+    try expectMacroFailure("", "(ns ex (:refer-clojure :only [inc]))", "ns: (:refer-clojure :only ...) is not supported; :exclude is", ":only");
+    try expectMacroFailure("", "(ns ex (:refer-clojure :exclude inc))", "ns: :exclude takes a vector of symbols, not a symbol", "inc");
+}
+
 test "ns and require: :require clauses, :as, :refer, :refer :all, :rename, flags" {
     try expectOutputWithFiles(&.{utilns},
         \\(ns my.app "An app." {:author "me"}

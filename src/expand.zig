@@ -277,6 +277,10 @@ fn findMacro(ctx: *ExpandContext, env: ?*const ExpandEnv, items: []const *Form) 
     if (env) |e| if (e.contains(head.name)) return null;
     if (ctx.namespace) |ns| if (ns.lookup(head.name)) |v| {
         if (v.macro and v.bound) return .{ .user = v };
+        // A Var of the name other than `nexis.core`'s (the
+        // namespace's own, excluded or defined, or a referred one)
+        // hides the host macro, as it hides a core function.
+        if (ctx.registry) |reg| if (reg.core.lookupLocal(head.name) != v) return null;
     };
     if (ctx.host_macros.get(head.name)) |f| return .{ .host = f };
     return null;
@@ -869,10 +873,13 @@ const Walk = struct {
 /// current namespace to NAME at expansion time, creating it (with
 /// `nexis.core` referred) if needed, then runs each
 /// `(:require spec*)` clause as `require` runs its specs, in the new
-/// namespace. `(:refer-clojure ...)` and `(:gen-class ...)` are
-/// accepted and do nothing (nexis.core is always referred; there is
-/// no class to generate). The docstring and attribute map are
-/// accepted and not kept. The form is replaced by nil.
+/// namespace. `(:refer-clojure :exclude [names])` interns each name
+/// that `nexis.core` or the host macro table holds as an unbound Var
+/// of the namespace, so the name is the namespace's own from then
+/// on; `:only` and `:rename` are refused. `(:gen-class ...)` is
+/// accepted and does nothing (there is no class to generate). The
+/// docstring and attribute map are accepted and not kept. The form
+/// is replaced by nil.
 fn expandNs(ctx: *ExpandContext, _: ?*const ExpandEnv, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     const origin = list_form.origin;
     if (items.len < 2) return ctx.fail(origin, "ns: expected a namespace name", .{});
@@ -889,11 +896,36 @@ fn expandNs(ctx: *ExpandContext, _: ?*const ExpandEnv, list_form: *const Form, i
         const kind = clause_items[0].datum.keyword.name;
         if (std.mem.eql(u8, kind, "require")) {
             for (clause_items[1..]) |spec| try requireSpec(ctx, spec);
-        } else if (!std.mem.eql(u8, kind, "refer-clojure") and !std.mem.eql(u8, kind, "gen-class")) {
+        } else if (std.mem.eql(u8, kind, "refer-clojure")) {
+            try referClojure(ctx, reg, clause_items[1..]);
+        } else if (!std.mem.eql(u8, kind, "gen-class")) {
             return ctx.fail(clause.origin, "ns: (:{s} ...) is not supported", .{kind});
         }
     }
     return try makeNil(ctx, origin);
+}
+
+/// The options of `(:refer-clojure ...)`: `:exclude [names]` makes
+/// each name the current namespace's own (an unbound Var until the
+/// namespace defines it), so it neither resolves to nor inlines nor
+/// expands as `nexis.core`'s; `nexis.core/name` still reaches it.
+fn referClojure(ctx: *ExpandContext, reg: *vm_mod.NamespaceRegistry, opts: []const *Form) ExpandError!void {
+    if (opts.len % 2 != 0) return ctx.fail(opts[opts.len - 1].origin, "ns: :refer-clojure options come in pairs", .{});
+    var i: usize = 0;
+    while (i < opts.len) : (i += 2) {
+        const key = opts[i];
+        const k = if (key.datum == .keyword and key.datum.keyword.ns == null) key.datum.keyword.name else "";
+        if (k.len == 0) return ctx.fail(key.origin, "ns: expected a :refer-clojure option, not {s}", .{describeForm(key)});
+        if (!std.mem.eql(u8, k, "exclude")) return ctx.fail(key.origin, "ns: (:refer-clojure :{s} ...) is not supported; :exclude is", .{k});
+        const names = opts[i + 1];
+        if (names.datum != .vector) return ctx.fail(names.origin, "ns: :exclude takes a vector of symbols, not {s}", .{describeForm(names)});
+        for (names.datum.vector) |name_form| {
+            const name = try plainName(ctx, name_form, "ns: an excluded name");
+            if (reg.core.lookupLocal(name) == null and ctx.host_macros.get(name) == null) continue;
+            if (reg.current.lookupLocal(name) != null) continue;
+            _ = reg.current.intern(name) catch return ExpandError.OutOfMemory;
+        }
+    }
 }
 
 /// `(require spec*)` loads and refers at expansion time, through

@@ -62,7 +62,8 @@ namespace's Vars (the same Var objects), so `(require
 '[clojure.string :as str])` and, after it, `clojure.string/join`
 both reach `nexis.string/join`. Before a `require` a
 `clojure.string/...` symbol does not resolve. No other `clojure.*`
-namespace exists; `(:refer-clojure ...)` in `ns` is ignored.
+namespace exists; `(:refer-clojure :exclude [...])` in `ns` makes
+the names the namespace's own (`MACROEXPAND.md` §2b).
 
 **Rules for the embedded sources.**
 
