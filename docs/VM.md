@@ -1201,8 +1201,12 @@ Three layers, paralleling `COMPILER.md` §9:
 #### 15.1 Per-opcode unit tests
 
 - `src/vm.zig` inline tests for every dispatched opcode:
-  hand-assembled bytecode, pre-state + post-state assertion,
-  error-path coverage for every trap the opcode can raise.
+  hand-assembled bytecode and error-path coverage for every trap the
+  opcode can raise. The single-routine cases are tables of
+  `RunCase{code, consts, slots, want}` run by `expectRuns`, which
+  also asserts that a run that returns leaves no handler, pending
+  finally or frame behind; the closure, cell, var and ctrl tests
+  that inspect VM state stay individual.
 
 #### 15.2 Per-group integration tests
 

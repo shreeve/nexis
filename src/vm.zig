@@ -4493,205 +4493,143 @@ test "VM frames: slotPtr out-of-range surfaces OperandOutOfRange" {
     try testing.expectError(VmError.OperandOutOfRange, vm.slotPtr(4095));
 }
 
-test "VM: load-nil into slot 0, return slot 0 -> nil" {
-    var code = [_]Inst{
-        asm_.loadNil(0),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "load-nil");
+/// One hand-assembled routine and what running it on a fresh VM
+/// yields.
+const RunCase = struct {
+    name: []const u8,
+    code: []const Inst,
+    consts: []const Const = &.{},
+    slots: u16 = 1,
+    want: union(enum) {
+        /// The result, by `dispatch.equal`.
+        value: Value,
+        /// An integer result in decimal (the bignum promotions).
+        decimal: []const u8,
+        /// A list of these fixnums.
+        list: []const i64,
+        err: VmError,
+    },
+};
 
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .nil);
+fn expectRuns(cases: []const RunCase) !void {
+    for (cases) |case| {
+        errdefer std.debug.print("run case \"{s}\" failed\n", .{case.name});
+        const routine = makeRoutine(case.code, case.consts, case.slots, case.name);
+        var vm = try VM.init(testing.allocator, &routine);
+        defer vm.deinit();
+        switch (case.want) {
+            .err => |e| {
+                try testing.expectError(e, vm.run());
+                continue;
+            },
+            .value => |v| try testing.expect(dispatch_mod.equal(v, try vm.run())),
+            .decimal => |d| try expectDecimal(d, try vm.run()),
+            .list => |xs| {
+                var cur = try vm.run();
+                for (xs) |x| {
+                    try testing.expect(cur.kind() == .list and !list_mod.isEmpty(cur));
+                    try testing.expectEqual(x, list_mod.head(cur).asFixnum());
+                    cur = list_mod.tail(cur);
+                }
+                try testing.expect(list_mod.isEmpty(cur));
+            },
+        }
+        // A run that returns leaves no handler, continuation or
+        // frame behind.
+        try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.finally_stack.items.len);
+        try testing.expectEqual(@as(usize, 1), vm.frames.items.len);
+    }
 }
 
-test "VM: load-true into slot 0, return -> true" {
-    var code = [_]Inst{
-        asm_.loadTrue(0),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "load-true");
+const nil_v = value_mod.nilValue();
+const true_v = value_mod.fromBool(true);
+const false_v = value_mod.fromBool(false);
+const sl = Operand.slot;
+const kn = Operand.constant;
 
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .true_);
+fn raw(g: Group, variant: u6, a: Operand, b: Operand, c: Operand) Inst {
+    return .{ .kind = .primary, .group = @intFromEnum(g), .variant = variant, .a = a, .b = b, .c = c };
 }
 
-test "VM: load-false into slot 0, return -> false" {
-    var code = [_]Inst{
-        asm_.loadFalse(0),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "load-false");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .false_);
+test "VM opcodes: mov, return and operand resolution" {
+    const dummy = comptime makeRoutine(&.{asm_.returnNil()}, &.{}, 1, "dummy");
+    try expectRuns(comptime &[_]RunCase{
+        .{ .name = "load-nil", .code = &.{ asm_.loadNil(0), asm_.returnSlot(0) }, .want = .{ .value = nil_v } },
+        .{ .name = "load-true", .code = &.{ asm_.loadTrue(0), asm_.returnSlot(0) }, .want = .{ .value = true_v } },
+        .{ .name = "load-false", .code = &.{ asm_.loadFalse(0), asm_.returnSlot(0) }, .want = .{ .value = false_v } },
+        .{ .name = "load-const", .code = &.{ asm_.loadConst(0, 0), asm_.returnSlot(0) }, .consts = &.{cval(fx(12345))}, .want = .{ .value = fx(12345) } },
+        .{ .name = "move copies a slot", .code = &.{ asm_.loadConst(0, 0), asm_.move(1, 0), asm_.returnSlot(1) }, .consts = &.{cval(fx(77))}, .slots = 2, .want = .{ .value = fx(77) } },
+        .{ .name = "multi-step round trip through slots", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.move(3, 1), asm_.returnSlot(3) }, .consts = &.{ cval(fx(10)), cval(fx(20)), cval(fx(30)) }, .slots = 4, .want = .{ .value = fx(20) } },
+        .{ .name = "return-nil reads no slot", .code = &.{asm_.returnNil()}, .slots = 0, .want = .{ .value = nil_v } },
+        .{ .name = "slot out of range", .code = &.{asm_.returnSlot(5)}, .want = .{ .err = VmError.OperandOutOfRange } },
+        .{ .name = "constant out of range", .code = &.{ asm_.loadConst(0, 9), asm_.returnSlot(0) }, .want = .{ .err = VmError.OperandOutOfRange } },
+        .{ .name = "resolve of an unused operand", .code = &.{ raw(.mov, @intFromEnum(Mov.move), sl(0), Operand.none, Operand.none), asm_.returnNil() }, .want = .{ .err = VmError.InvalidOperandKind } },
+        .{ .name = "no return: bytecode exhausted", .code = &.{asm_.loadNil(0)}, .want = .{ .err = VmError.BytecodeExhausted } },
+        .{ .name = "known group with no variants", .code = &.{ raw(.transient, 0, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "unrecognized group 60", .code = &.{ .{ .kind = .primary, .group = 60, .variant = 0, .a = Operand.none, .b = Operand.none, .c = Operand.none }, asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
+        .{ .name = "call:call on a fixnum", .code = &.{ asm_.loadConst(0, 0), asm_.callCall(0, 0, 1), asm_.returnSlot(1) }, .consts = &.{cval(fx(42))}, .slots = 2, .want = .{ .err = VmError.NotCallable } },
+        .{ .name = "load-const of a routine constant", .code = &.{ asm_.loadConst(0, 0), asm_.returnSlot(0) }, .consts = &.{croutine(&dummy)}, .want = .{ .err = VmError.InvalidOperandKind } },
+    });
 }
 
-test "VM: load-const pulls a fixnum from the pool" {
-    const consts = [_]Const{cval(value_mod.fromFixnum(12345).?)};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "load-const");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .fixnum);
-    try testing.expectEqual(@as(i64, 12345), result.asFixnum());
+test "VM opcodes: coll" {
+    try expectRuns(comptime &[_]RunCase{
+        .{ .name = "empty list", .code = &.{ asm_.collList(0, 0, 0), asm_.returnSlot(0) }, .want = .{ .list = &.{} } },
+        .{ .name = "list of three", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.collList(0, 3, 3), asm_.returnSlot(3) }, .consts = &.{ cval(fx(1)), cval(fx(2)), cval(fx(3)) }, .slots = 4, .want = .{ .list = &.{ 1, 2, 3 } } },
+        .{ .name = "empty concat", .code = &.{ asm_.collConcat(0, 0, 0), asm_.returnSlot(0) }, .want = .{ .list = &.{} } },
+        .{ .name = "concat (1 2) (3)", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.collList(0, 2, 3), asm_.collList(2, 1, 4), asm_.collConcat(3, 2, 5), asm_.returnSlot(5) }, .consts = &.{ cval(fx(1)), cval(fx(2)), cval(fx(3)) }, .slots = 6, .want = .{ .list = &.{ 1, 2, 3 } } },
+        .{ .name = "concat (1 2) [3] nil", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.collList(0, 2, 3), asm_.collVector(2, 1, 4), asm_.loadNil(5), asm_.collConcat(3, 3, 6), asm_.returnSlot(6) }, .consts = &.{ cval(fx(1)), cval(fx(2)), cval(fx(3)) }, .slots = 7, .want = .{ .list = &.{ 1, 2, 3 } } },
+        .{ .name = "concat of a non-seqable", .code = &.{ asm_.loadConst(0, 0), asm_.collConcat(0, 1, 1), asm_.returnSlot(1) }, .consts = &.{cval(fx(99))}, .slots = 2, .want = .{ .err = VmError.KindMismatch } },
+        .{ .name = "odd map argc", .code = &.{ asm_.collMap(0, 1, 0), asm_.returnSlot(0) }, .want = .{ .err = VmError.BytecodeCorruption } },
+        .{ .name = "args past the frame", .code = &.{ asm_.collVector(0, 2, 0), asm_.returnSlot(0) }, .want = .{ .err = VmError.OperandOutOfRange } },
+    });
 }
 
-test "VM: move copies one slot into another" {
-    const consts = [_]Const{cval(value_mod.fromFixnum(77).?)};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), // slot[0] = 77
-        asm_.move(1, 0), //      slot[1] = slot[0]
-        asm_.returnSlot(1), //   return slot[1]
-    };
-    const routine = makeRoutine(&code, &consts, 2, "move");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 77), result.asFixnum());
+test "VM opcodes: math and cmp" {
+    const add = asm_.mathAdd;
+    try expectRuns(comptime &[_]RunCase{
+        .{ .name = "(+ 1 2) from constants", .code = &.{ add(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ cval(fx(1)), cval(fx(2)) }, .want = .{ .value = fx(3) } },
+        .{ .name = "(+ 10 32) from slots", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), add(2, sl(0), sl(1)), asm_.returnSlot(2) }, .consts = &.{ cval(fx(10)), cval(fx(32)) }, .slots = 3, .want = .{ .value = fx(42) } },
+        .{ .name = "(+ -7 -5)", .code = &.{ add(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ cval(fx(-7)), cval(fx(-5)) }, .want = .{ .value = fx(-12) } },
+        .{ .name = "a sum past i48 promotes", .code = &.{ add(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ cval(fx(value_mod.fixnum_max)), cval(fx(1)) }, .want = .{ .decimal = "140737488355328" } },
+        .{ .name = "a sum below i48 promotes", .code = &.{ add(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ cval(fx(value_mod.fixnum_min)), cval(fx(-1)) }, .want = .{ .decimal = "-140737488355329" } },
+        .{ .name = "a float operand is contagious", .code = &.{ add(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ cval(fl(1.5)), cval(fx(2)) }, .want = .{ .value = fl(3.5) } },
+        .{ .name = "a non-numeric operand", .code = &.{ add(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ cval(true_v), cval(fx(2)) }, .want = .{ .err = VmError.KindMismatch } },
+        // Both sources are read before the destination is written.
+        .{ .name = "dst aliases lhs", .code = &.{ asm_.loadConst(0, 0), add(0, sl(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ cval(fx(1)), cval(fx(40)) }, .want = .{ .value = fx(41) } },
+        .{ .name = "dst aliases rhs", .code = &.{ asm_.loadConst(0, 1), add(0, kn(0), sl(0)), asm_.returnSlot(0) }, .consts = &.{ cval(fx(40)), cval(fx(1)) }, .want = .{ .value = fx(41) } },
+        .{ .name = "slot+const and const+slot", .code = &.{ asm_.loadConst(0, 0), add(1, sl(0), kn(0)), add(2, kn(0), sl(1)), asm_.returnSlot(2) }, .consts = &.{cval(fx(100))}, .slots = 3, .want = .{ .value = fx(300) } },
+        .{ .name = "a constant destination", .code = &.{ raw(.math, @intFromEnum(Math.add), kn(0), kn(0), kn(1)), asm_.returnNil() }, .consts = &.{ cval(fx(1)), cval(fx(2)) }, .want = .{ .err = VmError.InvalidOperandKind } },
+        .{ .name = "math:pow is reserved", .code = &.{ raw(.math, @intFromEnum(Math.pow), sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "1 < 2", .code = &.{ asm_.cmpLt(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ cval(fx(1)), cval(fx(2)) }, .want = .{ .value = true_v } },
+        .{ .name = "2 < 1", .code = &.{ asm_.cmpLt(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ cval(fx(2)), cval(fx(1)) }, .want = .{ .value = false_v } },
+        .{ .name = "2 < 2 is strict", .code = &.{ asm_.cmpLt(0, kn(0), kn(0)), asm_.returnSlot(0) }, .consts = &.{cval(fx(2))}, .want = .{ .value = false_v } },
+        .{ .name = "-5 < 3", .code = &.{ asm_.cmpLt(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ cval(fx(-5)), cval(fx(3)) }, .want = .{ .value = true_v } },
+        .{ .name = "true < 1", .code = &.{ asm_.loadTrue(0), asm_.loadConst(1, 0), asm_.cmpLt(2, sl(0), sl(1)), asm_.returnSlot(2) }, .consts = &.{cval(fx(1))}, .slots = 3, .want = .{ .err = VmError.KindMismatch } },
+        .{ .name = "cmp into a constant", .code = &.{ raw(.cmp, @intFromEnum(Cmp.lt), kn(0), kn(0), kn(0)), asm_.returnNil() }, .consts = &.{cval(fx(1))}, .want = .{ .err = VmError.InvalidOperandKind } },
+        .{ .name = "cmp variant 9", .code = &.{ raw(.cmp, 9, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
+    });
 }
 
-test "VM: return_nil halts without reading a slot" {
-    var code = [_]Inst{
-        asm_.returnNil(),
-    };
-    const routine = makeRoutine(&code, &.{}, 0, "return-nil");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .nil);
-}
-
-test "VM: reading a slot out of range returns OperandOutOfRange" {
-    var code = [_]Inst{
-        asm_.returnSlot(5), // frame has 1 slot; slot 5 is out of range
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "oob");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.OperandOutOfRange, res);
-}
-
-test "VM: reading a constant out of range returns OperandOutOfRange" {
-    var code = [_]Inst{
-        asm_.loadConst(0, 9), // pool is empty; const 9 is OOB
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "const-oob");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.OperandOutOfRange, res);
-}
-
-// ---- coll group tests ---------------------------
-
-test "VM coll: coll:list with argc=0 builds the empty list" {
-    var code = [_]Inst{
-        asm_.collList(0, 0, 0), // slot[0] := empty list
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "coll-list-empty");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const r = try vm.run();
-    try testing.expect(r.kind() == .list);
-    try testing.expect(list_mod.isEmpty(r));
-}
-
-test "VM coll: coll:list with 3 fixnums builds [1 2 3]" {
-    // slot[0] := 1, slot[1] := 2, slot[2] := 3
-    // slot[3] := list from slots 0..2
-    // return slot[3]
-    const c1 = Const{ .value = value_mod.fromFixnum(1).? };
-    const c2 = Const{ .value = value_mod.fromFixnum(2).? };
-    const c3 = Const{ .value = value_mod.fromFixnum(3).? };
-    var code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.loadConst(1, 1),
-        asm_.loadConst(2, 2),
-        asm_.collList(0, 3, 3),
-        asm_.returnSlot(3),
-    };
-    const routine = makeRoutine(&code, &.{ c1, c2, c3 }, 4, "coll-list-3");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const r = try vm.run();
-    try testing.expect(r.kind() == .list);
-    try testing.expectEqual(@as(i64, 1), list_mod.head(r).asFixnum());
-    try testing.expectEqual(@as(i64, 2), list_mod.head(list_mod.tail(r)).asFixnum());
-    try testing.expectEqual(@as(i64, 3), list_mod.head(list_mod.tail(list_mod.tail(r))).asFixnum());
-    try testing.expect(list_mod.isEmpty(list_mod.tail(list_mod.tail(list_mod.tail(r)))));
-}
-
-test "VM coll: coll:concat with argc=0 builds the empty list" {
-    var code = [_]Inst{
-        asm_.collConcat(0, 0, 0),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "coll-concat-empty");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const r = try vm.run();
-    try testing.expect(r.kind() == .list);
-    try testing.expect(list_mod.isEmpty(r));
-}
-
-test "VM coll: coll:concat ([1 2] [3]) → [1 2 3]" {
-    // slot[0] := 1, slot[1] := 2, slot[2] := 3
-    // slot[3] := list from slots 0..1   ; [1 2]
-    // slot[4] := list from slots 2..2   ; [3]
-    // slot[5] := concat from slots 3..4
-    // return slot[5]
-    const c1 = Const{ .value = value_mod.fromFixnum(1).? };
-    const c2 = Const{ .value = value_mod.fromFixnum(2).? };
-    const c3 = Const{ .value = value_mod.fromFixnum(3).? };
-    var code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.loadConst(1, 1),
-        asm_.loadConst(2, 2),
-        asm_.collList(0, 2, 3), // [1 2]
-        asm_.collList(2, 1, 4), // [3]
-        asm_.collConcat(3, 2, 5),
-        asm_.returnSlot(5),
-    };
-    const routine = makeRoutine(&code, &.{ c1, c2, c3 }, 6, "coll-concat");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const r = try vm.run();
-    try testing.expect(r.kind() == .list);
-    try testing.expectEqual(@as(i64, 1), list_mod.head(r).asFixnum());
-    try testing.expectEqual(@as(i64, 2), list_mod.head(list_mod.tail(r)).asFixnum());
-    try testing.expectEqual(@as(i64, 3), list_mod.head(list_mod.tail(list_mod.tail(r))).asFixnum());
-    try testing.expect(list_mod.isEmpty(list_mod.tail(list_mod.tail(list_mod.tail(r)))));
-}
-
-test "VM coll: coll:concat on a non-seqable arg traps KindMismatch" {
-    const c1 = Const{ .value = value_mod.fromFixnum(99).? };
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), // slot[0] := 99 (fixnum, NOT list)
-        asm_.collConcat(0, 1, 1),
-        asm_.returnSlot(1),
-    };
-    const routine = makeRoutine(&code, &.{c1}, 2, "coll-concat-kind");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    try testing.expectError(VmError.KindMismatch, vm.run());
+test "VM opcodes: jump" {
+    try expectRuns(comptime &[_]RunCase{
+        .{ .name = "jmp skips an instruction", .code = &.{ asm_.loadConst(0, 0), asm_.jumpJmp(3), asm_.loadConst(0, 1), asm_.returnSlot(0) }, .consts = &.{ cval(fx(1)), cval(fx(99)) }, .want = .{ .value = fx(1) } },
+        .{ .name = "if-false branches on nil", .code = &.{ asm_.loadNil(0), asm_.jumpIfFalse(3, sl(0)), asm_.returnNil(), asm_.loadTrue(0), asm_.returnSlot(0) }, .want = .{ .value = true_v } },
+        .{ .name = "if-false branches on false", .code = &.{ asm_.loadFalse(0), asm_.jumpIfFalse(3, sl(0)), asm_.returnNil(), asm_.loadTrue(0), asm_.returnSlot(0) }, .want = .{ .value = true_v } },
+        .{ .name = "if-false falls through on true", .code = &.{ asm_.loadTrue(0), asm_.jumpIfFalse(3, sl(0)), asm_.returnSlot(0), asm_.loadNil(0), asm_.returnSlot(0) }, .want = .{ .value = true_v } },
+        // 0 is truthy (PLAN §6.2).
+        .{ .name = "if-false falls through on 0", .code = &.{ asm_.loadConst(0, 0), asm_.jumpIfFalse(3, sl(0)), asm_.returnSlot(0), asm_.loadNil(0), asm_.returnSlot(0) }, .consts = &.{cval(fx(0))}, .want = .{ .value = fx(0) } },
+        .{ .name = "if-false on a constant test", .code = &.{ asm_.jumpIfFalse(3, kn(0)), asm_.returnNil(), asm_.returnNil(), asm_.loadTrue(0), asm_.returnSlot(0) }, .consts = &.{cval(false_v)}, .want = .{ .value = true_v } },
+        .{ .name = "if-true branches on true", .code = &.{ asm_.loadTrue(0), asm_.jumpIfTrue(3, sl(0)), asm_.returnNil(), asm_.loadFalse(0), asm_.returnSlot(0) }, .want = .{ .value = false_v } },
+        .{ .name = "if-true falls through on nil", .code = &.{ asm_.loadNil(0), asm_.jumpIfTrue(3, sl(0)), asm_.returnSlot(0), asm_.loadTrue(0), asm_.returnSlot(0) }, .want = .{ .value = nil_v } },
+        // pc is past the jump before it runs, so a jump not taken
+        // falls through instead of looping on itself.
+        .{ .name = "a jump to itself not taken", .code = &.{ asm_.loadFalse(0), asm_.jumpIfTrue(1, sl(0)), asm_.returnSlot(0) }, .want = .{ .value = false_v } },
+        .{ .name = "target past the code", .code = &.{ asm_.jumpJmp(5), asm_.returnNil() }, .want = .{ .err = VmError.OperandOutOfRange } },
+        .{ .name = "target at the code's end", .code = &.{ asm_.jumpJmp(2), asm_.returnNil() }, .want = .{ .err = VmError.OperandOutOfRange } },
+        .{ .name = "target not a jump operand", .code = &.{ raw(.jump, @intFromEnum(Jump.jmp), sl(0), Operand.none, Operand.none), asm_.returnNil() }, .want = .{ .err = VmError.InvalidOperandKind } },
+    });
 }
 
 // ---- ctrl group tests ---------------------------
@@ -4805,200 +4743,6 @@ test "VM ctrl: throw inside catch body NOT re-caught by same handler" {
     try testing.expectError(VmError.UncaughtThrow, vm.run());
     // Should be the SECOND throw (value 2), not the first.
     try testing.expectEqual(@as(i64, 2), vm.unhandled_throw.?.asFixnum());
-}
-
-test "VM: exhausting bytecode without return surfaces BytecodeExhausted" {
-    var code = [_]Inst{
-        asm_.loadNil(0),
-        // no return — fall off the end
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "fallthrough");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.BytecodeExhausted, res);
-}
-
-test "VM: known-but-not-implemented group returns UnimplementedOpcode" {
-    // transient group (8) with variant 0 — a known group with no
-    // implemented variants. Invariant: this test must name a
-    // group the dispatcher does not implement (transient, hash,
-    // tx, io or simd).
-    const var_op = Inst.primary(
-        .transient,
-        @as(Mov, @enumFromInt(0)), // variant 0 — placeholder; only the group matters
-        Operand.slot(0),
-        Operand.slot(0),
-        Operand.slot(0),
-    );
-    var code = [_]Inst{
-        var_op,
-        asm_.returnNil(),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "unimpl");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.UnimplementedOpcode, res);
-}
-
-test "VM: unrecognized group (bit-pattern 60) returns BytecodeCorruption" {
-    // Build a raw Inst with a group number outside the allocated
-    // space (60, well above the 14 groups). The non-exhaustive
-    // `Group` enum lets us emit this without aborting; dispatch
-    // should detect and surface BytecodeCorruption.
-    const raw: Inst = .{
-        .kind = .primary,
-        .group = 60,
-        .variant = 0,
-        .a = Operand.none,
-        .b = Operand.none,
-        .c = Operand.none,
-    };
-    var code = [_]Inst{ raw, asm_.returnNil() };
-    const routine = makeRoutine(&code, &.{}, 1, "corrupt");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.BytecodeCorruption, res);
-}
-
-test "VM: resolve on .unused operand returns InvalidOperandKind" {
-    // mov:move with source operand B = unused. Handler calls
-    // resolve(inst.b), which should surface InvalidOperandKind
-    // rather than the ambiguous OperandOutOfRange.
-    const bad_move: Inst = .{
-        .kind = .primary,
-        .group = @intFromEnum(Group.mov),
-        .variant = @intFromEnum(Mov.move),
-        .a = Operand.slot(0),
-        .b = Operand.none, // .unused
-        .c = Operand.none,
-    };
-    var code = [_]Inst{ bad_move, asm_.returnNil() };
-    const routine = makeRoutine(&code, &.{}, 1, "unused-operand");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
-}
-
-test "VM math:add: constant + constant = fixnum sum" {
-    // The exact bytecode the compiler emits for `(+ 1 2)`:
-    //   math:add  s0, c0, c1     ; s0 = 1 + 2
-    //   call:return s0
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(1).?),
-        cval(value_mod.fromFixnum(2).?),
-    };
-    var code = [_]Inst{
-        asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "(+ 1 2)");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .fixnum);
-    try testing.expectEqual(@as(i64, 3), result.asFixnum());
-}
-
-test "VM math:add: slot + slot through prelude staging" {
-    // Demonstrates the path the eventual real compiler takes
-    // when args have non-trivial sub-expressions: load each into
-    // a slot first, then add.
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(10).?),
-        cval(value_mod.fromFixnum(32).?),
-    };
-    var code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.loadConst(1, 1),
-        asm_.mathAdd(2, Operand.slot(0), Operand.slot(1)),
-        asm_.returnSlot(2),
-    };
-    const routine = makeRoutine(&code, &consts, 3, "(+ 10 32)");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 42), result.asFixnum());
-}
-
-test "VM math:add: negative + negative" {
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(-7).?),
-        cval(value_mod.fromFixnum(-5).?),
-    };
-    var code = [_]Inst{
-        asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "(+ -7 -5)");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, -12), result.asFixnum());
-}
-
-test "VM math:add: a sum that leaves i48 promotes to a bignum" {
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(value_mod.fixnum_max).?),
-        cval(value_mod.fromFixnum(1).?),
-    };
-    var code = [_]Inst{
-        asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "(+ fixnum_max 1)");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = try vm.run();
-    try testing.expect(res.kind() == .bignum);
-    try testing.expect(!bignum_mod.isNegative(res));
-    try testing.expectEqual(@as(u64, 1) << 47, bignum_mod.limbs(res)[0]);
-}
-
-test "VM math:add: a float operand makes the result a float" {
-    const consts = [_]Const{
-        cval(value_mod.fromFloat(1.5)),
-        cval(value_mod.fromFixnum(2).?),
-    };
-    var code = [_]Inst{
-        asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "(+ 1.5 2)");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.isFloat());
-    try testing.expectEqual(@as(f64, 3.5), result.asFloat());
-}
-
-test "VM math:add: a non-numeric operand surfaces KindMismatch" {
-    const consts = [_]Const{
-        cval(value_mod.fromBool(true)),
-        cval(value_mod.fromFixnum(2).?),
-    };
-    var code = [_]Inst{
-        asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "(+ true 2)");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.KindMismatch, res);
 }
 
 // ---- numeric tower ----
@@ -5254,195 +4998,6 @@ test "VM math/cmp opcodes cover every wired variant" {
     try testing.expect(!vm.stack.items[9].asBool());
 }
 
-test "VM math:add: a sum below i48 promotes to a negative bignum" {
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(value_mod.fixnum_min).?),
-        cval(value_mod.fromFixnum(-1).?),
-    };
-    var code = [_]Inst{
-        asm_.mathAdd(0, Operand.constant(0), Operand.constant(1)),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "(+ fixnum_min -1)");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = try vm.run();
-    try testing.expect(res.kind() == .bignum);
-    try testing.expect(bignum_mod.isNegative(res));
-    try testing.expectEqual((@as(u64, 1) << 47) + 1, bignum_mod.limbs(res)[0]);
-}
-
-test "VM math:add: dst/src aliasing is well-defined (math:add s0, s0, c0)" {
-    // The handler must resolve BOTH source operands BEFORE
-    // writing the destination. Otherwise an aliased dst+lhs
-    // (or dst+rhs) would silently produce wrong results when
-    // codegen reuses slots.
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(1).?),
-        cval(value_mod.fromFixnum(40).?),
-    };
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), //                      s0 = 1
-        asm_.mathAdd(0, Operand.slot(0), Operand.constant(1)), // s0 = s0 + 40
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "alias-lhs");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 41), result.asFixnum());
-}
-
-test "VM math:add: dst/rhs aliasing (math:add s0, c0, s0)" {
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(40).?),
-        cval(value_mod.fromFixnum(1).?),
-    };
-    var code = [_]Inst{
-        asm_.loadConst(0, 1), //                      s0 = 1
-        asm_.mathAdd(0, Operand.constant(0), Operand.slot(0)), // s0 = 40 + s0
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "alias-rhs");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 41), result.asFixnum());
-}
-
-test "VM math:add: mixed slot+constant operand kinds" {
-    // Pins resolve() behavior across kind combinations the
-    // codegen emits.
-    const consts = [_]Const{cval(value_mod.fromFixnum(100).?)};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), //                       s0 = 100
-        asm_.mathAdd(1, Operand.slot(0), Operand.constant(0)), // slot+const
-        asm_.mathAdd(2, Operand.constant(0), Operand.slot(1)), // const+slot
-        asm_.returnSlot(2),
-    };
-    const routine = makeRoutine(&code, &consts, 3, "mixed");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 300), result.asFixnum());
-}
-
-// ---- cmp:lt tests ----
-
-test "VM cmp:lt: true case (1 < 2)" {
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(1).?),
-        cval(value_mod.fromFixnum(2).?),
-    };
-    var code = [_]Inst{
-        asm_.cmpLt(0, Operand.constant(0), Operand.constant(1)),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "lt-true");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.isBool());
-    try testing.expectEqual(true, result.asBool());
-}
-
-test "VM cmp:lt: false case (2 < 1)" {
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(2).?),
-        cval(value_mod.fromFixnum(1).?),
-    };
-    var code = [_]Inst{
-        asm_.cmpLt(0, Operand.constant(0), Operand.constant(1)),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "lt-false");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.isBool());
-    try testing.expectEqual(false, result.asBool());
-}
-
-test "VM cmp:lt: equal case (2 < 2) — strict less-than yields false" {
-    const consts = [_]Const{cval(value_mod.fromFixnum(2).?)};
-    var code = [_]Inst{
-        asm_.cmpLt(0, Operand.constant(0), Operand.constant(0)),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "lt-eq");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(false, result.asBool());
-}
-
-test "VM cmp:lt: negative + positive (-5 < 3)" {
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(-5).?),
-        cval(value_mod.fromFixnum(3).?),
-    };
-    var code = [_]Inst{
-        asm_.cmpLt(0, Operand.constant(0), Operand.constant(1)),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "lt-neg");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(true, result.asBool());
-}
-
-test "VM cmp:lt: non-fixnum operand traps :kind-mismatch" {
-    // True (bool, kind=.bool_) is not a fixnum.
-    var code = [_]Inst{
-        asm_.loadTrue(0),
-        asm_.loadConst(1, 0),
-        asm_.cmpLt(2, Operand.slot(0), Operand.slot(1)),
-        asm_.returnSlot(2),
-    };
-    const consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
-    const routine = makeRoutine(&code, &consts, 3, "lt-kind");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.KindMismatch, res);
-}
-
-test "VM cmp:lt: writing to a constant operand surfaces InvalidOperandKind" {
-    const consts = [_]Const{cval(value_mod.fromFixnum(1).?)};
-    var code = [_]Inst{
-        Inst.primary(
-            .cmp,
-            Cmp.lt,
-            Operand.constant(0), // dst can't be a constant
-            Operand.constant(0),
-            Operand.constant(0),
-        ),
-        asm_.returnNil(),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "lt-bad-dst");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
-}
-
-test "VM cmp: unrecognized variant returns BytecodeCorruption" {
-    var code = [_]Inst{
-        Inst.primary(.cmp, @as(Cmp, @enumFromInt(9)), Operand.slot(0), Operand.slot(0), Operand.slot(0)),
-        asm_.returnNil(),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "cmp-bad-variant");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.BytecodeCorruption, res);
-}
-
 // ---- Var + Namespace + var:load-var tests ----
 
 test "VM var: Namespace.intern creates an unbound Var, lookup returns it" {
@@ -5673,144 +5228,6 @@ test "VM var store: var:var-object returns the Var WITHOUT trapping on unbound" 
     try testing.expect(!x.bound); // var-object did NOT bind it
 }
 
-test "VM jump:jmp skips past an instruction" {
-    // mov:load-const s0, c0          ; s0 = 1
-    // jump:jmp 3                     ; skip past the next instruction
-    // mov:load-const s0, c1          ; (skipped) would set s0 = 99
-    // call:return s0                 ; return s0 = 1
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(1).?),
-        cval(value_mod.fromFixnum(99).?),
-    };
-    var code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.jumpJmp(3),
-        asm_.loadConst(0, 1),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "jmp");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 1), result.asFixnum());
-}
-
-test "VM jump:if-false branches when test is nil" {
-    // s0 = 99
-    // jump:if-false 3, s0   ; s0 is fixnum (truthy) → don't branch (FAILS the test)
-    // ... this isn't right. Need to load nil into s0 first.
-    var code = [_]Inst{
-        asm_.loadNil(0),
-        asm_.jumpIfFalse(3, Operand.slot(0)), // s0 is nil (falsy) → branch to pc=3
-        asm_.returnNil(), //                    (skipped)
-        asm_.loadTrue(0), //                    (jumped here)
-        asm_.returnSlot(0), //                  return true
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "if-false-nil");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .true_);
-}
-
-test "VM jump:if-false branches when test is false" {
-    var code = [_]Inst{
-        asm_.loadFalse(0),
-        asm_.jumpIfFalse(3, Operand.slot(0)),
-        asm_.returnNil(),
-        asm_.loadTrue(0),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "if-false-bool");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .true_);
-}
-
-test "VM jump:if-false does NOT branch when test is true" {
-    var code = [_]Inst{
-        asm_.loadTrue(0),
-        asm_.jumpIfFalse(3, Operand.slot(0)),
-        asm_.returnSlot(0), //                  fall through; return true
-        asm_.loadNil(0), //                     (not reached)
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "if-false-truthy");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .true_);
-}
-
-test "VM jump:if-false does NOT branch when test is fixnum 0 (truthy)" {
-    // PLAN §6.2 surprise: 0 is TRUTHY in nexis.
-    const consts = [_]Const{cval(value_mod.fromFixnum(0).?)};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), //                s0 = 0
-        asm_.jumpIfFalse(3, Operand.slot(0)), // 0 is truthy → don't branch
-        asm_.returnSlot(0), //                  fall through; return 0
-        asm_.loadNil(0),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "if-false-zero");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 0), result.asFixnum());
-}
-
-test "VM jump:if-true branches when test is true" {
-    var code = [_]Inst{
-        asm_.loadTrue(0),
-        asm_.jumpIfTrue(3, Operand.slot(0)),
-        asm_.returnNil(), //                    (skipped)
-        asm_.loadFalse(0), //                   (jumped here)
-        asm_.returnSlot(0), //                  return false
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "if-true-true");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .false_);
-}
-
-test "VM jump:if-true does NOT branch when test is nil" {
-    var code = [_]Inst{
-        asm_.loadNil(0),
-        asm_.jumpIfTrue(3, Operand.slot(0)),
-        asm_.returnSlot(0), //                  fall through; return nil
-        asm_.loadTrue(0),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "if-true-nil");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .nil);
-}
-
-test "VM jump: target out of routine code range surfaces OperandOutOfRange" {
-    // Routine has 2 instructions (indices 0-1); jumping to 5 is invalid.
-    var code = [_]Inst{
-        asm_.jumpJmp(5),
-        asm_.returnNil(),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "bad-jump");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.OperandOutOfRange, res);
-}
-
 test "VM jump: patchJumpTarget rewrites operand A in place" {
     // Verify the asm_ helper used by the compiler back-patches
     // correctly: emit a placeholder jump, then patch it.
@@ -5818,111 +5235,6 @@ test "VM jump: patchJumpTarget rewrites operand A in place" {
     asm_.patchJumpTarget(&inst, 7);
     try testing.expectEqual(OpKind.jump, inst.a.kind);
     try testing.expectEqual(@as(u12, 7), inst.a.index);
-}
-
-test "VM jump: target with wrong operand kind surfaces InvalidOperandKind" {
-    // Hand-build jump:jmp with target encoded as slot(0) instead
-    // of jump(0). Without the kind check this would loop forever.
-    // With the kind check it surfaces a clean error.
-    const bad_jump: Inst = .{
-        .kind = .primary,
-        .group = @intFromEnum(Group.jump),
-        .variant = @intFromEnum(Jump.jmp),
-        .a = Operand.slot(0), // wrong kind for jump target
-        .b = Operand.none,
-        .c = Operand.none,
-    };
-    var code = [_]Inst{ bad_jump, asm_.returnNil() };
-    const routine = makeRoutine(&code, &.{}, 1, "bad-jump-kind");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    // Bounded execution as a defense-in-depth measure: even if the
-    // kind check were removed, this can't hang the suite.
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
-}
-
-test "VM jump: target == code.len traps OperandOutOfRange" {
-    // Code has 2 instructions (indices 0-1); jumping to index 2
-    // would surface BytecodeExhausted on the next dispatch.
-    // applyJump catches this eagerly as OperandOutOfRange so
-    // the error kind matches the cause.
-    var code = [_]Inst{
-        asm_.jumpJmp(2), // target == code.len → invalid
-        asm_.returnNil(),
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "jump-at-end");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.OperandOutOfRange, res);
-}
-
-test "VM jump:if-false: constant operand as test resolves correctly" {
-    // Conditional test operand can be any kind resolve() handles.
-    // Constant pool entry → branch / fall through per its truthiness.
-    const consts = [_]Const{cval(value_mod.fromBool(false))};
-    var code = [_]Inst{
-        asm_.jumpIfFalse(3, Operand.constant(0)), // c0=false → branch
-        asm_.returnNil(), // (skipped)
-        asm_.returnNil(), // (skipped)
-        asm_.loadTrue(0),
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "if-false-const");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .true_);
-}
-
-test "VM jump:if-true: non-taken branch falls through with pc pre-increment" {
-    // Pins the dispatch invariant: pc is incremented BEFORE
-    // handler execution, so non-taken conditionals "fall through"
-    // by leaving frame.pc alone. If pc were post-incremented,
-    // this test would loop on the jump instruction.
-    var code = [_]Inst{
-        asm_.loadFalse(0),
-        asm_.jumpIfTrue(0, Operand.slot(0)), // false → don't branch; pc=2 next
-        asm_.returnSlot(0), // halt with false
-    };
-    const routine = makeRoutine(&code, &.{}, 1, "fallthrough");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .false_);
-}
-
-test "VM math:add: writing to a constant operand surfaces InvalidOperandKind" {
-    // Hand-build an instruction with destination kind = constant.
-    // Sources are valid (resolve to fixnums from the pool), so
-    // the addition succeeds and the failure surfaces at the
-    // destination store. Per VM.md §13's `:invalid-operand-kind`
-    // row, write-to-constant is an invalid operand kind in the
-    // store context, NOT "known but not wired".
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(1).?),
-        cval(value_mod.fromFixnum(2).?),
-    };
-    const bad: Inst = .{
-        .kind = .primary,
-        .group = @intFromEnum(Group.math),
-        .variant = @intFromEnum(Math.add),
-        .a = Operand.constant(0), // illegal destination kind
-        .b = Operand.constant(0),
-        .c = Operand.constant(1),
-    };
-    var code = [_]Inst{ bad, asm_.returnNil() };
-    const routine = makeRoutine(&code, &consts, 1, "bad-dst");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
 }
 
 // ---- closure + call tests ----
@@ -6143,43 +5455,6 @@ test "VM closure call: arity mismatch — too many args traps :arity-mismatch" {
     defer vm.deinit();
     const res = vm.run();
     try testing.expectError(VmError.ArityMismatch, res);
-}
-
-test "VM closure call: not-callable — call:call on a fixnum traps :not-callable" {
-    const consts = [_]Const{cval(value_mod.fromFixnum(42).?)};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), // s0 = 42 (not a closure)
-        asm_.callCall(0, 0, 1),
-        asm_.returnSlot(1),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &consts,
-        .slot_count = 2,
-    };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.NotCallable, res);
-}
-
-test "VM closure call: mov:load-const with routine-typed Const traps :invalid-operand-kind" {
-    // Pins the typed-Const-pool enforcement: mov:load-const cannot
-    // load a Const.routine into a slot.
-    var dummy_code = [_]Inst{asm_.returnNil()};
-    const dummy_routine = Routine{ .code = &dummy_code, .consts = &.{}, .slot_count = 1 };
-    const consts = [_]Const{croutine(&dummy_routine)};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), // tries to load a routine into a slot
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
 }
 
 test "VM closure call: closure:make with value-typed Const traps :invalid-operand-kind" {
@@ -6765,48 +6040,4 @@ test "VM closure call: same closure called twice — both invocations succeed" {
     defer vm.deinit();
     const result = try vm.run();
     try testing.expectEqual(@as(i64, 17), result.asFixnum());
-}
-
-test "VM math: unimplemented variant (pow) returns UnimplementedOpcode" {
-    // math:pow is reserved per PLAN §12.3 but not wired. Dispatch
-    // must surface UnimplementedOpcode, not BytecodeCorruption.
-    const math_pow: Inst = .{
-        .kind = .primary,
-        .group = @intFromEnum(Group.math),
-        .variant = @intFromEnum(Math.pow),
-        .a = Operand.slot(0),
-        .b = Operand.slot(0),
-        .c = Operand.slot(0),
-    };
-    var code = [_]Inst{ math_pow, asm_.returnNil() };
-    const routine = makeRoutine(&code, &.{}, 1, "math-pow-unimpl");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.UnimplementedOpcode, res);
-}
-
-test "VM: a multi-step routine round-trips values through slots" {
-    // Load three fixnum constants into three slots, then pick the
-    // middle one as the return value. Exercises the instruction loop
-    // across multiple dispatches.
-    const consts = [_]Const{
-        cval(value_mod.fromFixnum(10).?),
-        cval(value_mod.fromFixnum(20).?),
-        cval(value_mod.fromFixnum(30).?),
-    };
-    var code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.loadConst(1, 1),
-        asm_.loadConst(2, 2),
-        asm_.move(3, 1),
-        asm_.returnSlot(3),
-    };
-    const routine = makeRoutine(&code, &consts, 4, "multi-step");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 20), result.asFixnum());
 }
