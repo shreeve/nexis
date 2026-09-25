@@ -622,3 +622,25 @@ test "literals: constant data of any size is one constant built at compile time"
         try testing.expectEqual(@as(usize, 0), k.routine.var_table.len);
     };
 }
+
+test "eval: a form's lowering is freed once its routine is compiled" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(eval '(+ 1 2))");
+    const before = program.v.runtime_arena.queryCapacity();
+    const result = try program.run(
+        \\(loop [i 0 acc 0]
+        \\  (if (< i 2000)
+        \\    (recur (inc i) (+ acc (eval (list 'let '[x [1 2 3] y {:a 1}] (list '+ '(count x) '(count y) i)))))
+        \\    acc))
+    );
+    try testing.expectEqual(@as(i64, 2000 * 4 + 1999 * 2000 / 2), result.asFixnum());
+    // What stays is the routine each eval ran: a few hundred bytes,
+    // not the Form and Tiny trees it was compiled from.
+    const per_eval = (program.v.runtime_arena.queryCapacity() - before) / 2000;
+    testing.expect(per_eval < 1024) catch |err| {
+        std.debug.print("\n  {d} bytes kept per eval\n", .{per_eval});
+        return err;
+    };
+}

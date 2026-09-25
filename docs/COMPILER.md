@@ -109,6 +109,14 @@ compile entry points.
   sub-routine pointers that must outlive the line, and a line's
   definitions are called from later lines. The source bytes go
   there too (`Tiny.symbol` slices borrow from them).
+- **Lifetime, `eval`**: the Form and Tiny trees and the Emitter's
+  working storage live in a scratch arena freed when `eval`
+  returns; the routine, its constants, span table and closure
+  prototypes are compiled onto the runtime's persistent arena
+  (`CompileOptions.routine_allocator`), since a closure the form
+  returns, a Var it defines and the frame an escaping throw
+  leaves in place outlive the call. What each `eval` keeps is its
+  routine: a few hundred bytes, not the trees it came from.
 - **Runtime-heap cross-over**: literal Values that must reach
   runtime (strings, bignums, collections of constants, interned
   symbols and keywords) are built through the heap and interner

@@ -666,7 +666,11 @@ fn toSourceSpan(span: reader_mod.SrcSpan) vm.SourceSpan {
 /// compilation resolves free names through the `parent` chain
 /// (capture analysis at function boundaries).
 const Emitter = struct {
+    /// Scratch: what compiling needs and nothing after it.
     allocator: std.mem.Allocator,
+    /// Where the routines go: their code, pools, span tables, names
+    /// and nested routines, which live as long as the caller needs.
+    out: std.mem.Allocator,
     code: std.ArrayList(Inst) = .empty,
     consts: std.ArrayList(vm.Const) = .empty,
     /// Where each Value constant sits in `consts`.
@@ -742,8 +746,8 @@ const Emitter = struct {
     /// an error is raised; nested routines share their parent's.
     diag: ?*LowerDiag = null,
 
-    fn init(allocator: std.mem.Allocator) Emitter {
-        return .{ .allocator = allocator };
+    fn init(allocator: std.mem.Allocator, out: std.mem.Allocator) Emitter {
+        return .{ .allocator = allocator, .out = out };
     }
 
     fn deinit(self: *Emitter) void {
@@ -1005,23 +1009,23 @@ const Emitter = struct {
         return pc;
     }
 
-    /// Convert the accumulated state into an owned `Compiled`.
+    /// The routine's code, pools and span table, copied onto `out`.
     ///
     /// Ownership transfer is errdefer-safe: if
     /// any `toOwnedSlice` fails after a previous one succeeded,
     /// the earlier slice would leak under a non-arena allocator.
     /// The chained errdefers guard against that.
     fn finish(self: *Emitter) CompileError!Compiled {
-        const code = try self.code.toOwnedSlice(self.allocator);
-        errdefer self.allocator.free(code);
-        const consts = try self.consts.toOwnedSlice(self.allocator);
-        errdefer self.allocator.free(consts);
-        const caps = try self.capture_descs.toOwnedSlice(self.allocator);
-        errdefer self.allocator.free(caps);
-        const vt = try self.var_table.toOwnedSlice(self.allocator);
-        errdefer self.allocator.free(vt);
-        const spans = try self.span_table.toOwnedSlice(self.allocator);
-        errdefer self.allocator.free(spans);
+        const code = try self.out.dupe(Inst, self.code.items);
+        errdefer self.out.free(code);
+        const consts = try self.out.dupe(vm.Const, self.consts.items);
+        errdefer self.out.free(consts);
+        const caps = try self.out.dupe(vm.CaptureDescriptor, self.capture_descs.items);
+        errdefer self.out.free(caps);
+        const vt = try self.out.dupe(*vm.Var, self.var_table.items);
+        errdefer self.out.free(vt);
+        const spans = try self.out.dupe(vm.SpanEntry, self.span_table.items);
+        errdefer self.out.free(spans);
         return .{
             .code = code,
             .consts = consts,
@@ -1049,6 +1053,8 @@ pub fn compileTiny(allocator: std.mem.Allocator, form: *const Tiny) CompileError
 
 /// What `emitRoutine` compiles a top-level `Tiny` tree with.
 const EmitOptions = struct {
+    /// Where the routines go; the scratch allocator when null.
+    out: ?std.mem.Allocator = null,
     namespace: ?*vm.Namespace = null,
     /// Whether every node is a `TinyNode` (a tree `lowerForm`
     /// built), so the routines carry span tables.
@@ -1063,13 +1069,13 @@ const EmitOptions = struct {
 /// There is no enclosing `recur` target, so a top-level `(recur)`
 /// is `RecurOutsideTail`.
 fn emitRoutine(allocator: std.mem.Allocator, form: *const Tiny, opts: EmitOptions) CompileError!Compiled {
-    var emitter = Emitter.init(allocator);
+    var emitter = Emitter.init(allocator, opts.out orelse allocator);
+    defer emitter.deinit();
     emitter.namespace = opts.namespace;
     emitter.spanned = opts.spanned;
     emitter.current_span = opts.origin;
     emitter.source = opts.source;
     emitter.diag = opts.diag;
-    errdefer emitter.deinit();
     const dst = try emitter.allocSlot();
     try compileExpr(&emitter, form, dst, null);
     try emitter.emit(vm.asm_.returnSlot(dst));
@@ -2242,8 +2248,9 @@ pub const RuntimeHooks = struct {
     /// REPL compiles a line (the current namespace, this registry,
     /// interner, host macro table and loader, a fresh set of
     /// declared names) and run on `v` as a nested call. The Form
-    /// tree, the routine, its constants and every closure prototype
-    /// live in the VM's runtime arena: a closure the form returns, a
+    /// and Tiny trees live in a scratch arena freed on return; the
+    /// routine, its constants and every closure prototype live in
+    /// the VM's runtime arena, because a closure the form returns, a
     /// Var it defines and the frame an escaping throw leaves in
     /// place all outlive the call. During the run the routine is a
     /// frame, so its constants are roots. A value that is not a
@@ -2252,17 +2259,22 @@ pub const RuntimeHooks = struct {
     fn evalHook(user_data: *anyopaque, v: *vm.VM, form_value: value_mod.Value) vm.VmError!value_mod.Value {
         const self: *RuntimeHooks = @ptrCast(@alignCast(user_data));
         const persistent = v.runtime_arena.allocator();
-        var ctx = self.context(persistent, v);
+        // The Form and Tiny trees are garbage once the routine is
+        // compiled; only the routine outlives the call.
+        var scratch = std.heap.ArenaAllocator.init(v.allocator);
+        defer scratch.deinit();
+        var ctx = self.context(scratch.allocator(), v);
         const origin = reader_mod.SrcSpan{ .pos = 0, .len = 0 };
         const form = expand_mod.valueToForm(&ctx, form_value, origin) catch |err|
             return compileFailure(v, err, "UnsupportedForm", form_value);
         var declared = DeclaredNames.init(v.allocator);
         defer declared.deinit();
-        const compiled = compileFormWith(persistent, form, .{
+        const compiled = compileFormWith(scratch.allocator(), form, .{
             .namespace = self.registry.current,
             .interner = self.interner,
             .host_macros = self.host_macros,
             .persistent_allocator = persistent,
+            .routine_allocator = persistent,
             .registry = self.registry,
             .load_callback = self.load_callback,
             .declared = &declared,
@@ -2335,6 +2347,12 @@ pub const CompileOptions = struct {
     /// per-form compile arena. The REPL and file runner pass
     /// `vm.runtime_arena.allocator()`; null uses `allocator`.
     persistent_allocator: ?std.mem.Allocator = null,
+    /// Where the compiled routines go (their code, constant pools,
+    /// span tables and nested routines); null uses `allocator`.
+    /// With it, `allocator` is scratch the caller may free as soon
+    /// as the call returns: the Form and Tiny trees and the
+    /// Emitter's working storage.
+    routine_allocator: ?std.mem.Allocator = null,
     /// Registry that `(ns NAME)` switches; without it `(ns ...)`
     /// is an error.
     registry: ?*vm.NamespaceRegistry = null,
@@ -2440,6 +2458,7 @@ pub fn compileFormWith(
     };
     diag.span = null;
     return emitRoutine(allocator, tiny, .{
+        .out = opts.routine_allocator,
         .namespace = namespace,
         .spanned = true,
         .origin = working_form.origin,
@@ -3147,7 +3166,7 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
 
     // `defer`, not `errdefer`: `finish` hands the code and pools
     // over, but the scope and capture lists keep their capacity.
-    var child = Emitter.init(parent.allocator);
+    var child = Emitter.init(parent.allocator, parent.out);
     child.parent = parent;
     child.namespace = parent.namespace;
     child.spanned = parent.spanned;
@@ -3188,13 +3207,13 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
     try compileExpr(&child, f.body, result_slot, &fn_target);
     try child.emit(vm.asm_.returnSlot(result_slot));
 
-    const sources = try parent.allocator.dupe(vm.CaptureSource, child.captures.items);
+    const sources = try parent.out.dupe(vm.CaptureSource, child.captures.items);
     const upvalue_count: u16 = @intCast(child.captures.items.len);
     const child_compiled = try child.finish();
     // The routine lives on the compile allocator with the tree it
     // belongs to; its name is copied because it borrows from source
     // text that need not outlive the routine.
-    const child_routine = try parent.allocator.create(vm.Routine);
+    const child_routine = try parent.out.create(vm.Routine);
     child_routine.* = .{
         .code = child_compiled.code,
         .consts = child_compiled.consts,
@@ -3204,7 +3223,7 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
         .fixed_arity = @intCast(f.params.len),
         .variadic = f.rest_param != null,
         .upvalue_count = upvalue_count,
-        .name = if (f.display_name) |n| try parent.allocator.dupe(u8, n) else "fn",
+        .name = if (f.display_name) |n| try parent.out.dupe(u8, n) else "fn",
         .spans = child_compiled.spans,
         .origin = if (parent.current_span) |sp| toSourceSpan(sp) else null,
         .source = parent.source,
