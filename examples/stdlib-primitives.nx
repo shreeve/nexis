@@ -42,7 +42,7 @@
        ~(first (rest clauses))
        (my-cond ~@(rest (rest clauses))))))
 
-(my-cond
+(println (my-cond
   (empty? (list))          :got-empty
   (empty? (list :anything)) :unreached
-  true                      :default)
+  true                      :default))

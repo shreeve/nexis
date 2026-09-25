@@ -14,9 +14,9 @@
 ; The expansion below is the same mechanism without the
 ; (defmacro ...) wrapper:
 
-(let [name (quote my-binding) value 99]
+(println (let [name (quote my-binding) value 99]
   ; Construct (let* [my-binding 99] my-binding) — a fully
   ; valid nexis form ready to feed back into the compiler.
-  `(let* [~name ~value] ~name))
+  `(let* [~name ~value] ~name)))
 
 ; -> (let* [my-binding 99] my-binding)

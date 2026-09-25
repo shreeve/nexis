@@ -294,4 +294,4 @@
 
 (d/release c)
 (println (t/caught (d/q ages db)))
-:query-done
+(println :query-done)

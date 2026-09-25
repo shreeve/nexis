@@ -16,4 +16,4 @@
 (require '[lib.geom :as g])
 
 ; Qualified call via alias.
-(g/area-of-square 5)
+(println (g/area-of-square 5))

@@ -25,4 +25,4 @@
 (defn first-truthy [a b c]
   (or a b c))
 
-(sum-up-to 10)  ; -> 55
+(println (sum-up-to 10))  ; -> 55

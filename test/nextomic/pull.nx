@@ -131,4 +131,4 @@
 
 (d/release c)
 (println (t/caught (d/pull now '[*] ann)))
-:pull-done
+(println :pull-done)

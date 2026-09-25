@@ -13,4 +13,4 @@
 
 ; Result: the data list (point x y) — NOT a call. quote
 ; preserves the structural form as a runtime list value.
-(point 3 4)
+(println (point 3 4))

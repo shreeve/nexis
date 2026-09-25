@@ -3,4 +3,4 @@
 
 (defn f [] (g))
 (defn g [] 42)
-(f)
+(println (f))

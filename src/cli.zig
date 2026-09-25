@@ -36,8 +36,7 @@ const Usage =
     \\
     \\usage:
     \\  nexis run FILE.nx    Reads FILE.nx, compiles and runs each
-    \\                       top-level form in order, prints the
-    \\                       final result.
+    \\                       top-level form in order.
     \\  nexis repl           Interactive read-eval-print loop.
     \\                       :quit or EOF to exit.
     \\  nexis disasm FILE.nx Compiles FILE.nx without running it and
@@ -541,8 +540,9 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     }
 }
 
-/// Read FILE.nx, parse, compile and run each top-level form, and
-/// print the final result to stdout.
+/// Read FILE.nx, parse, compile and run each top-level form. Like
+/// Clojure's script runner, `run` writes only what the program
+/// prints; the REPL is where results are echoed.
 fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     const stderr = std.Io.File.stderr();
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| {
@@ -571,7 +571,6 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
         std.process.exit(3);
     };
 
-    // An empty file prints nothing.
     if (forms.len == 0) return;
 
     // `require` searches the working directory and the file's own.
@@ -594,26 +593,16 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
     for (forms) |form| try declared.declareForm(form);
 
     const file_source = vm.SourceInfo{ .path = path, .text = source };
-    var last_result: Value = value_mod.nilValue();
     for (forms) |form| {
         var error_span: ?reader_mod.SrcSpan = null;
         const compiled = compile.compileFormWith(compile_arena.allocator(), form, rt.compileOptions(&error_span, &declared, &file_source)) catch |err| {
             std.process.exit(try reportCompileFailure(&rt, io, path, source, err, error_span));
         };
-        last_result = rt.runCompiled(compiled) catch |err| {
+        _ = rt.runCompiled(compiled) catch |err| {
             try rt.reportRuntimeError(io, err);
             std.process.exit(5);
         };
     }
-
-    var buf: [4096]u8 = undefined;
-    var stream = std.Io.Writer.fixed(&buf);
-    formatValue(last_result, rt.interner, &stream) catch {
-        try std.Io.File.stdout().writeStreamingAll(io, "#<value too large to print>\n");
-        return;
-    };
-    try std.Io.File.stdout().writeStreamingAll(io, stream.buffered());
-    try std.Io.File.stdout().writeStreamingAll(io, "\n");
 }
 
 /// Read FILE.nx, parse and compile each top-level form the way

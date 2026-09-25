@@ -10,10 +10,10 @@
 ; with structural sharing. Hash + equality come from the
 ; dispatch layer (same machinery used everywhere else).
 
-(let [project-id :nexis
+(println (let [project-id :nexis
       version    :v0-2-alpha
       tags       #{:phase-3 :collections :ready}]
   {:project project-id
    :version version
    :tags    tags
-   :status  :shipped})
+   :status  :shipped}))

@@ -107,9 +107,9 @@
 
 (db/close conn)
 
-[:initial-stats     initial-stats
+(println [:initial-stats     initial-stats
  :initial-count     (count initial-list)
  :rollback-caught   rollback-result
  :rollback-present? rolled-back-present?
  :buy-milk-after    buy-milk-after
- :final-stats       final-stats]
+ :final-stats       final-stats])

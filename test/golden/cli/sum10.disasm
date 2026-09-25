@@ -1,19 +1,21 @@
-routine <top> (examples/sum10.nx:4:1) slots=12 arity=0 upvalues=0
-  0000  mov:load-const      s1  c0=0  -  ; 4:11
-  0001  mov:load-const      s2  c1=0  -  ; 4:17
-  0002  mov:move            s4  s1  -  ; 5:10
-  0003  mov:load-const      s5  c2=10  -  ; 5:12
-  0004  cmp:lt              s3  s4  s5  ; 5:7
-  0005  jump:if-false       j0016  s3  -  ; 5:3
-  0006  mov:move            s7  s1  -  ; 6:15
-  0007  mov:load-const      s8  c3=1  -  ; 6:17
-  0008  math:add            s6  s7  s8  ; 6:12
-  0009  mov:move            s10  s2  -  ; 6:23
-  0010  mov:move            s11  s1  -  ; 6:27
-  0011  math:add            s9  s10  s11  ; 6:20
-  0012  mov:move            s1  s6  -  ; 6:5
-  0013  mov:move            s2  s9  -
-  0014  jump:jmp            j0002  -  -
-  0015  jump:jmp            j0017  -  -  ; 5:3
-  0016  mov:move            s0  s2  -  ; 7:5
-  0017  call:return         s0  -  -  ; 4:1
+routine <top> (examples/sum10.nx:4:1) slots=14 arity=0 upvalues=0
+  0000  var:load-var        s1  v0=println  -  ; 4:2
+  0001  mov:load-const      s3  c0=0  -  ; 5:13
+  0002  mov:load-const      s4  c1=0  -  ; 5:19
+  0003  mov:move            s6  s3  -  ; 6:12
+  0004  mov:load-const      s7  c2=10  -  ; 6:14
+  0005  cmp:lt              s5  s6  s7  ; 6:9
+  0006  jump:if-false       j0017  s5  -  ; 6:5
+  0007  mov:move            s9  s3  -  ; 7:17
+  0008  mov:load-const      s10  c3=1  -  ; 7:19
+  0009  math:add            s8  s9  s10  ; 7:14
+  0010  mov:move            s12  s4  -  ; 7:25
+  0011  mov:move            s13  s3  -  ; 7:29
+  0012  math:add            s11  s12  s13  ; 7:22
+  0013  mov:move            s3  s8  -  ; 7:7
+  0014  mov:move            s4  s11  -
+  0015  jump:jmp            j0003  -  -
+  0016  jump:jmp            j0018  -  -  ; 6:5
+  0017  mov:move            s2  s4  -  ; 8:7
+  0018  call:call           s1  #1  s0  ; 4:1
+  0019  call:return         s0  -  -

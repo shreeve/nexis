@@ -54,4 +54,4 @@
 ; The store reopens cleanly after all of that.
 (d/with-conn [c2 "errors.edb"]
   (t/check "reopened store is at the last committed basis" (= 3 (d/basis-t (d/db c2)))))
-:errors-done
+(println :errors-done)

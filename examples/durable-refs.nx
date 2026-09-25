@@ -69,4 +69,4 @@
 (db/delete-key! bob)
 (db/close conn)
 
-[:rolled-back rolled-back :after-rollback after-rollback]
+(println [:rolled-back rolled-back :after-rollback after-rollback])

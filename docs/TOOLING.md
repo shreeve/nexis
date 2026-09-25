@@ -64,13 +64,13 @@ each top-level form's routine, then the prototype of every closure
 nested in it, depth first.
 
 ```
-routine <top> (examples/sum10.nx:4:2) slots=12 arity=0 upvalues=0
-  0000  mov:load-const      s1  c0=0  -  ; 4:11
-  0001  mov:load-const      s2  c1=0  -  ; 4:17
-  0002  mov:move            s4  s1  -  ; 5:10
-  0003  mov:load-const      s5  c2=10  -  ; 5:12
-  0004  cmp:lt              s3  s4  s5  ; 5:8
-  0005  jump:if-false       j0016  s3  -  ; 5:4
+routine <top> (examples/sum10.nx:4:1) slots=14 arity=0 upvalues=0
+  0000  var:load-var        s1  v0=println  -  ; 4:2
+  0001  mov:load-const      s3  c0=0  -  ; 5:13
+  0002  mov:load-const      s4  c1=0  -  ; 5:19
+  0003  mov:move            s6  s3  -  ; 6:12
+  0004  mov:load-const      s7  c2=10  -  ; 6:14
+  0005  cmp:lt              s5  s6  s7  ; 6:9
 ```
 
 - The header: the routine's name, the path and position of the
@@ -82,7 +82,7 @@ routine <top> (examples/sum10.nx:4:2) slots=12 arity=0 upvalues=0
   var, `u` upvalue, `i` intern, `j` jump, `e` durable), `-` when
   unused. A constant shows its value as `pr-str` prints it
   (`c0=:x`) or the routine it holds (`c0=<routine greet>`); a var
-  its name (`v0=greet`); a jump target its pc (`j0016`). Operand
+  its name (`v0=println`); a jump target its pc (`j0017`). Operand
   B of `call:call`, `call:tailcall`, `closure:make` and every
   `coll:*` is a raw immediate (`VM.md` §4.5) and prints as `#n`.
   An unnamed group or variant prints its number after `?`; an

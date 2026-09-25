@@ -149,4 +149,4 @@
 (check "as-of by t and by entity id agree" (= (d/as-of db3 tx2) (d/as-of db3 (:tx r2))))
 
 (d/release c)
-:polish-done
+(println :polish-done)

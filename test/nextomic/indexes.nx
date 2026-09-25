@@ -56,4 +56,4 @@
 (t/check "current datoms are assertions" (every? #(nth % 4) (d/datoms db :aevt :item/qty)))
 
 (d/release c)
-:indexes-done
+(println :indexes-done)
