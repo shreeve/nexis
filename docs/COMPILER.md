@@ -171,10 +171,14 @@ compiler relies on:
      are reserved: they are recognized regardless of lexical
      bindings.
   2. **Inlined intrinsic** — `+` and `<` with exactly two
-     operands lower to `math:add` / `cmp:lt` directly, unless
-     the name is lexically shadowed (`LowerEnv`). A Var named
-     `+` does not disable the inlining: `(do (def + f) (+ 1 2))`
-     still inlines. The qualified `nexis.core/+` and
+     operands lower to `math:add` / `cmp:lt` directly when the
+     operator means `nexis.core`'s Var: it is not lexically bound
+     (`LowerEnv`), the namespace resolves it to `nexis.core`'s Var
+     rather than one it defines or refers to, and (outside
+     `nexis.core`) the file or REPL line being compiled does not
+     define it (`DeclaredNames`), so `(do (def + f) (+ 1 2))` calls
+     `f`, as Clojure does. Otherwise the call goes through the Var
+     like any other. The qualified `nexis.core/+` and
      `nexis.core/<` with two operands inline unconditionally: a
      qualified head is never a local, and host macros emit them
      (`MACROEXPAND.md` §5).

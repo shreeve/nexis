@@ -15,11 +15,10 @@
 //!                               →  `Tiny.literal` (a const-pool Value;
 //!                                  keywords and symbols need an
 //!                                  Interner, strings a Heap)
-//!   - `(+ a b)` / `(< a b)`     →  `math:add` / `cmp:lt`; a literal-
-//!                                  pair peephole emits constant
-//!                                  operands directly. These are the
-//!                                  only inlined intrinsics, and only
-//!                                  when not lexically shadowed
+//!   - `(+ a b)` / `(< a b)`     →  `math:add` / `cmp:lt` when the
+//!                                  operator names `nexis.core`'s Var;
+//!                                  a literal-pair peephole emits
+//!                                  constant operands directly
 //!   - `(if <test> <then> <else?>)` → `jump:if-false` over then,
 //!                                  unconditional `jump:jmp` past else,
 //!                                  with PC back-patching; an absent
@@ -62,8 +61,6 @@
 //!     expander lowers several catch clauses and keyword matchers
 //!     onto it (MACROEXPAND.md §8b). A catch binding captured by an
 //!     inner fn raises `UnsupportedFeature`.
-//!   - Var-level shadowing of `+` / `<` does not defeat inlining;
-//!     only lexical shadowing does.
 
 const std = @import("std");
 const vm = @import("vm.zig");
@@ -1239,12 +1236,8 @@ pub const DeclaredNames = struct {
 /// Special forms (`if`, `do`, `let*`, `fn*`, `letfn*`, `loop*`,
 /// `recur`, `quote`, `def`, `defn`, `var`) are RESERVED in operator
 /// position — they're recognized regardless of lexical bindings.
-/// Only the inlineable core fns (`+`, `<`) check the env.
-///
-/// Limit: the shadowing check is lexical-only. Namespace-level
-/// Var shadowing — `(do (def + f) (+ 1 2))` — inlines `+` to
-/// `Tiny.add` because the lowerer doesn't track Vars (see
-/// CLOJURE-REVIEW.md §1.7's "core inlining" discussion).
+/// Only the inlineable core fns (`+`, `<`) check the env
+/// (`namesCore`).
 pub const LowerEnv = struct {
     /// Names bound at THIS scope level. The full visibility set
     /// is the union of this set with the parent's set,
@@ -1288,12 +1281,24 @@ fn qualifiedTarget(ns: *const vm.Namespace, ns_prefix: []const u8) ?*vm.Namespac
     return registry.lookupNs(effective);
 }
 
-/// Helper used by `lowerList` to test whether a head symbol is a
-/// shadowable intrinsic. Special forms are NOT shadowable; they
-/// have their own switch arm.
-fn isIntrinsicShadowed(env: ?*const LowerEnv, name: []const u8) bool {
-    const e = env orelse return false;
-    return e.contains(name);
+/// Whether a bare operator `name` means `nexis.core`'s Var of that
+/// name, so its call may be inlined (COMPILER.md §4.3 rule 2): not a
+/// lexical binding, not a Var the namespace defines or refers to
+/// instead, and not a name this file or line defines outside
+/// `nexis.core` (a definition earlier in the same form interns its
+/// Var only when the form is emitted). Without a namespace registry
+/// there is nothing to shadow it.
+fn namesCore(ctx: LowerCtx, name: []const u8) bool {
+    if (ctx.env) |env| {
+        if (env.contains(name)) return false;
+    }
+    const ns = ctx.namespace orelse return true;
+    const registry = ns.registry orelse return true;
+    const core_var = registry.core.lookupLocal(name) orelse return false;
+    if (ns.lookup(name) != core_var) return false;
+    if (ns == registry.core) return true;
+    const declared = ctx.declared orelse return true;
+    return !declared.contains(name);
 }
 
 /// Translate a `reader.Form` tree into a `Tiny` IR tree on the
@@ -1495,10 +1500,10 @@ fn lowerList(
         if (std.mem.eql(u8, name, "try")) return try lowerTry(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "throw")) return try lowerThrow(allocator, items[1..], ctx);
         // -- Inlineable intrinsics (shadowable) --
-        if (std.mem.eql(u8, name, "+") and items.len == 3 and !isIntrinsicShadowed(ctx.env, name)) {
+        if (std.mem.eql(u8, name, "+") and items.len == 3 and namesCore(ctx, name)) {
             return try lowerAdd(allocator, items[1], items[2], ctx);
         }
-        if (std.mem.eql(u8, name, "<") and items.len == 3 and !isIntrinsicShadowed(ctx.env, name)) {
+        if (std.mem.eql(u8, name, "<") and items.len == 3 and namesCore(ctx, name)) {
             return try lowerLt(allocator, items[1], items[2], ctx);
         }
     } else if (items[0].datum == .symbol and items.len == 3 and std.mem.eql(u8, items[0].datum.symbol.ns.?, "nexis.core")) {
@@ -2075,9 +2080,8 @@ fn lowerLetFnStar(
 // rebind, and the named-fn placeholder pattern. This layer is
 // purely Form-side dispatch + structural validation.
 //
-// LowerEnv does NOT add def/defn names — Vars don't shadow
-// intrinsic inlining. `(do (def + f) (+ 1 2))` inlines to 3.
-// See the LowerEnv doc comment.
+// LowerEnv does NOT add def/defn names: a Var is not lexical.
+// `namesCore` consults the namespace and the declared names instead.
 
 /// `(def name)` or `(def name value)`. Per Tiny.def shape, the
 /// value is optional (declare-only).
@@ -7605,13 +7609,6 @@ test "compile shadowing: ((fn* [+] (+ 1 2)) (fn* [a b] 42)) → 42 — fn param 
 
 test "compile shadowing: (letfn* [(+ [a b] 42)] (+ 1 2)) → 42 — letfn name shadows intrinsic" {
     try expectSourceFixnum("(letfn* [(+ [a b] 42)] (+ 1 2))", 42);
-}
-
-test "compile shadowing: (do (def + (fn* [a b] 42)) (+ 1 2)) → 3 — Vars do not defeat inlining" {
-    // Pins the documented limitation: Var-level shadowing
-    // does NOT defeat intrinsic inlining (LowerEnv only tracks
-    // lexical names, not namespace Vars).
-    try expectSourceFixnumWithNs("(do (def + (fn* [a b] 42)) (+ 1 2))", 3);
 }
 
 test "compile shadowing: nexis.core/+ and nexis.core/< inline under a lexical + or <" {

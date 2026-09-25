@@ -259,3 +259,30 @@ test "prop syntax-quote: syntax-quote with unquoted integer matches hand-built l
         try testing.expectEqual(v, second.asFixnum());
     }
 }
+
+// =============================================================================
+// Inlined core arithmetic (COMPILER.md §4.3 rule 2)
+// =============================================================================
+
+test "inlining: an operator inlines only when it names nexis.core's Var" {
+    // A namespace's own definition wins in every call shape.
+    try harness.expectOutput(
+        \\(ns foo)
+        \\(defn + [a b] 42)
+        \\[(+ 1 2) (apply + [1 2]) (let [p +] (p 1 2))]
+    , "[42 42 42]");
+    try harness.expectOutput(
+        \\(ns foo)
+        \\(defn < [a b] :mine)
+        \\[(< 1 2) (apply < [1 2])]
+    , "[:mine :mine]");
+    // A definition in the same form counts from its own definition on.
+    try harness.expectCheckedOutput("(do (def + (fn* [a b] 42)) (+ 1 2))", "42");
+    // Every other namespace still gets core's.
+    try harness.expectOutput(
+        \\(ns foo)
+        \\(defn + [a b] 42)
+        \\(ns bar)
+        \\(+ 1 2)
+    , "3");
+}
