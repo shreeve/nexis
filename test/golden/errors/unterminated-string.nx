@@ -1,0 +1,2 @@
+; An unterminated string is a parse error at its opening quote.
+(println "never closed)

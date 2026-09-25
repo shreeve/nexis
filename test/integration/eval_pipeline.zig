@@ -147,6 +147,8 @@ test "integration: let*" {
 
 test "integration: let (rename macro)" {
     try expectOutput("(let [x 10 y 20] (+ x y))", "30");
+    // A name may be any UTF-8 text, as in Clojure.
+    try expectOutput("(let [λ 2 café :crème] [(* λ λ) café 'π/τ])", "[4 :crème π/τ]");
 }
 
 test "integration: loop*/recur" {
@@ -222,6 +224,8 @@ test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
     try expectOutputProgram("(defn ^:private p [x] x) [(p 2) (:private (meta (var p)))]", "[2 true]");
     try expectOutputProgram("(defn ^{:doc \"d\"} q [x] x) (:doc (meta (var q)))", "d");
     try expectOutputProgram("(defn m \"two\" ([x] x) ([x y] y)) [(m 1 2) (:arglists (meta (var m)))]", "[2 ([x] [x y])]");
+    // A docstring may span lines, as in Clojure.
+    try expectOutputProgram("(defn ml\n  \"Line one.\n  Line two.\"\n  [] 1)\n[(ml) (:doc (meta (var ml)))]", "[1 Line one.\n  Line two.]");
     // Without metadata a defn's Var carries none.
     try expectOutputProgram("(defn plain [x] x) (meta (var plain))", "nil");
     // def and defmacro take the same spellings.
@@ -3613,6 +3617,11 @@ test "read-string: forms as data, the first form only, errors thrown" {
     try expectOutput("(try (read-string \"(\") (catch :reader-error e :bad))", ":bad");
     try expectOutput("(try (read-string \"\") (catch :reader-error e :empty))", ":empty");
     try expectOutput("(macroexpand-1 (read-string \"(when a b)\"))", "(if a (do b) nil)");
+    // A token has no 64 KiB limit: a long string and symbol round-trip.
+    try expectOutput("(count (read-string (pr-str (apply str (repeat 70000 \"a\")))))", "70000");
+    try expectOutput("(count (name (read-string (apply str (repeat 70000 \"b\")))))", "70000");
+    // Nesting past the stack budget is a reader error, not a fault.
+    try expectOutput("(try (read-string (str (apply str (repeat 200000 \"(\")) (apply str (repeat 200000 \")\")))) (catch :reader-error e :deep))", ":deep");
 }
 
 // =============================================================================

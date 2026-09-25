@@ -1,0 +1,3 @@
+; Clojure's \uXXXX spelling is one token the reader rejects whole,
+; never the char \u followed by the number 41.
+(println [\u0041])
