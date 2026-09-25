@@ -406,9 +406,10 @@ fn searchLoadPaths(allocator: std.mem.Allocator, io: std.Io, load_paths: []const
 }
 
 /// Whether `source`'s first form is `(ns NAME ...)` with NAME the
-/// requested namespace: a file that declares another name, or none,
-/// is refused before any of it runs. Only the head and the name are
-/// looked at; the rest of the form is the expander's.
+/// requested namespace, `^meta` before it allowed: a file that
+/// declares another name, or none, is refused before any of it runs.
+/// Only the head and the name are looked at; the rest of the form is
+/// the expander's.
 fn startsWithNs(source: []const u8, ns_name: []const u8) bool {
     var i: usize = 0;
     while (i < source.len) {
@@ -422,14 +423,44 @@ fn startsWithNs(source: []const u8, ns_name: []const u8) bool {
     }
     const rest = source[i..];
     if (!std.mem.startsWith(u8, rest, "(ns")) return false;
-    const after = std.mem.trimStart(u8, rest[3..], " \t\r\n,");
+    var after = std.mem.trimStart(u8, rest[3..], " \t\r\n,");
     if (after.len == rest.len - 3) return false;
+    while (after.len > 0 and after[0] == '^') {
+        after = std.mem.trimStart(u8, after[metaLen(after)..], " \t\r\n,");
+    }
     if (!std.mem.startsWith(u8, after, ns_name)) return false;
     if (after.len == ns_name.len) return false;
     return switch (after[ns_name.len]) {
         ' ', '\t', '\r', '\n', ',', ')', '"', '(', '^', '{' => true,
         else => false,
     };
+}
+
+/// The length of the `^meta` that opens `text`: a map to its closing
+/// brace (braces in strings and char literals aside), else a keyword
+/// or symbol token; all of `text` when the map is not closed.
+fn metaLen(text: []const u8) usize {
+    var i: usize = 1;
+    if (i < text.len and text[i] == '{') {
+        var depth: usize = 0;
+        var in_string = false;
+        while (i < text.len) : (i += 1) switch (text[i]) {
+            '\\' => i += 1,
+            '"' => in_string = !in_string,
+            '{' => depth += @intFromBool(!in_string),
+            '}' => if (!in_string) {
+                depth -= 1;
+                if (depth == 0) return i + 1;
+            },
+            else => {},
+        };
+        return text.len;
+    }
+    while (i < text.len) : (i += 1) switch (text[i]) {
+        ' ', '\t', '\r', '\n', ',', ')', '(', '"' => break,
+        else => {},
+    };
+    return i;
 }
 
 // =============================================================================
@@ -460,4 +491,9 @@ test "loader: a file must open with (ns NAME ...)" {
     try testing.expect(!startsWithNs("(nsx app.a)", "app.a"));
     try testing.expect(!startsWithNs("(def x 1)", "app.a"));
     try testing.expect(!startsWithNs("", "app.a"));
+    // Metadata on the name, as Clojure allows it.
+    try testing.expect(startsWithNs("(ns ^:no-doc app.a)", "app.a"));
+    try testing.expect(startsWithNs("(ns ^:no-doc ^{:doc \"a {b} \\\" }\" :k \\}}\n  app.a (:require [b]))", "app.a"));
+    try testing.expect(!startsWithNs("(ns ^:no-doc app.ab)", "app.a"));
+    try testing.expect(!startsWithNs("(ns ^{:doc \"x\"", "app.a"));
 }

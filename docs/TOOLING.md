@@ -86,7 +86,8 @@ nexis: test/golden/cli/macro-failure.nx:4:1: MacroExpansionFailure: macro m thre
 A file `require` could not load is reported in that file at its
 place (a parse, reader or compile error there), or at the requiring
 form: `require: no file my/app.nx on the load path`, `require: cyclic
-require of my.app`, `require: PATH does not begin with (ns my.app)`.
+require of my.app`, `require: PATH does not begin with (ns my.app)`
+(metadata on the name, `(ns ^:no-doc my.app)`, is allowed).
 
 **A runtime error** that no `try` catches ends the program with exit
 5 and this report on stderr:
