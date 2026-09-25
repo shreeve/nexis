@@ -516,11 +516,28 @@
 ; More sequence and function helpers
 ; ============================================================
 
-; (some-fn p & ps) → a fn true of its arguments when any predicate
-; is truthy of any of them; (every-pred p & ps) when every one is of
-; every argument.
-(defn some-fn [& ps]
-  (fn [& xs] (boolean (some (fn [p] (some p xs)) ps))))
+; (some-fn p & ps) → a fn returning the first truthy result of a
+; predicate on an argument, in Clojure's order: each predicate over the
+; first three arguments, then each further argument against every
+; predicate (every predicate against those arguments past three
+; predicates). A miss is the last result for up to three predicates
+; and three arguments, else nil. (every-pred p & ps) → a fn true when
+; every predicate is truthy of every argument.
+(defn some-fn [p & ps]
+  (let [ps (cons p ps)
+        many (> (count ps) 3)
+        hit (fn [f coll]
+              (loop [s (seq coll) r nil]
+                (if s (let [v (f (first s))] (if v v (recur (next s) v))) r)))]
+    (fn [& xs]
+      (let [more (drop 3 xs)
+            r (hit (fn [p] (hit p (take 3 xs))) ps)]
+        (cond r r
+              (seq more) (if many
+                           (some (fn [p] (some p more)) ps)
+                           (some (fn [x] (hit (fn [p] (p x)) ps)) more))
+              many nil
+              true r)))))
 
 (defn every-pred [& ps]
   (fn [& xs] (every? (fn [p] (every? p xs)) ps)))

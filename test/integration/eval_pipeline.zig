@@ -1265,6 +1265,13 @@ test "integration: with-out-str captures what the print functions write, nested 
 
 test "integration: core.nx higher-order functions: some-fn, every-pred, memoize, trampoline, comparator, run!" {
     try expectOutput("[((some-fn even? neg?) 3 -1) ((some-fn even?) 1 3) ((every-pred odd? pos?) 1 3) ((every-pred odd? pos?) 1 -3)]", "[true false true false]");
+    // some-fn returns the first truthy result, not a boolean; a miss is
+    // the last result for up to three predicates and three arguments,
+    // else nil, and arguments past the third go element by element,
+    // as Clojure's arities do.
+    try expectOutput("[((some-fn :a :b) {:b 5}) ((some-fn :a) {} {}) ((some-fn even? neg? zero?) 1) ((some-fn even? neg? zero? #{9}) 1) ((some-fn even?) 1 3 5 7) ((some-fn even?))]", "[5 nil false nil nil nil]");
+    try expectOutput("[((some-fn :a :b) {} {} {} {:b 4} {:a 5}) ((some-fn #{4} #{5} #{6} #{7}) 1 2 3 7 6)]", "[4 6]");
+    try expectOutput("(try (some-fn) (catch any e e))", ":arity-mismatch");
     try expectOutputProgram("(def calls (atom 0)) (def f (memoize (fn [x] (swap! calls inc) (* x x)))) [(f 3) (f 3) (f 4) @calls]", "[9 9 16 2]");
     try expectOutputProgram("(defn down [n] (if (zero? n) :done #(down (dec n)))) (trampoline down 100000)", ":done");
     try expectOutput("(sort (comparator >) [1 3 2])", "(3 2 1)");
