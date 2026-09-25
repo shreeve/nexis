@@ -469,3 +469,11 @@
     expr
     `(let* [~name ~expr]
        (as-> ~(first forms) ~name ~@(rest forms)))))
+
+; ============================================================
+; The command line
+; ============================================================
+
+; The arguments after the program on the command line, as a vector
+; of strings; nil when there are none. `nexis run` binds it.
+(def *command-line-args* nil)

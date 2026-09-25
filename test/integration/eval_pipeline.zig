@@ -4337,6 +4337,53 @@ test "require: a required file's runtime error reached through eval leaves with 
     try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
 }
 
+test "require: a file that cannot be loaded is diagnosed where it failed, in the file that failed" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var files: RequireDir = undefined;
+    try files.init(&program, &.{
+        .{ "broken.nx", "(ns broken)\n(defn f [x]\n" },
+        .{ "notns.nx", "(def x 1)\n" },
+        .{ "unresolved.nx", "(ns unresolved)\n(defn f [] (nope 1))\n" },
+        .{ "cyca.nx", "(ns cyca)\n(require 'cycb)\n" },
+        .{ "cycb.nx", "(ns cycb)\n(require 'cyca)\n" },
+    });
+    defer files.deinit();
+    const Case = struct { src: []const u8, label: []const u8, file: ?[]const u8 = null, line: u32 = 0 };
+    const cases = [_]Case{
+        .{ .src = "(require 'broken)", .label = "parse error: unexpected end of input", .file = "broken.nx", .line = 3 },
+        .{ .src = "(require 'unresolved)", .label = "UnresolvedSymbol", .file = "unresolved.nx", .line = 2 },
+        .{ .src = "(require 'cyca)", .label = "require: cyclic require of cyca", .file = "cycb.nx", .line = 2 },
+        .{ .src = "(require 'nope)", .label = "require: no file nope.nx on the load path" },
+    };
+    for (cases) |c| {
+        if (files.compileOne(&program, c.src)) |_| return error.TestUnexpectedResult else |_| {}
+        const d = files.loader.diagnostic orelse return error.TestFailed;
+        try testing.expectEqualStrings(c.label, d.label);
+        if (c.file) |name| {
+            const src = d.source orelse return error.TestFailed;
+            try testing.expect(std.mem.endsWith(u8, src.path, name));
+            try testing.expectEqual(c.line, src.lineCol(d.span.?.pos).line);
+        } else try testing.expect(d.source == null);
+    }
+    if (files.compileOne(&program, "(require 'notns)")) |_| return error.TestUnexpectedResult else |_| {}
+    try testing.expect(std.mem.endsWith(u8, files.loader.diagnostic.?.label, "notns.nx does not begin with (ns notns)"));
+    // Nothing a failed load did leaks into the requiring namespace.
+    try testing.expectEqualStrings("user", program.registry.current.name);
+}
+
+test "require: clojure.string, clojure.set, clojure.test and clojure.pprint name the nexis namespaces" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var files: RequireDir = undefined;
+    try files.init(&program, &.{});
+    defer files.deinit();
+    const r = try program.run("(eval '(require '[clojure.string :as s] 'clojure.test)) [(eval '(s/join \",\" (clojure.string/split \"a-b\" \"-\"))) (eval '(fn? clojure.test/run-tests))]");
+    try harness.expectResult(&program, "clojure.string", r, "[a,b true]");
+}
+
 test "require: a required file that fails while a form is compiled is a runtime failure with its trace, not a compile error" {
     var program: Program = undefined;
     try program.init();

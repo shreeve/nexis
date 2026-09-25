@@ -1,34 +1,29 @@
-//! nexis CLI: `nexis run FILE.nx`, `nexis repl` and `nexis disasm
-//! FILE.nx`.
+//! nexis CLI: `run`, `repl`, `test`, `disasm` and `-e` over one
+//! `Runtime` (docs/TOOLING.md §1).
 //!
-//! The first two boot one `Runtime` (a VM with every namespace
-//! installed, the embedded core.nx and nextomic.nx bootstrapped,
-//! and a namespace loader for `require`), then compile and run
-//! top-level forms on it one at a time. Vars, the interner and
-//! runtime values persist across the forms of a file and across
-//! the lines of a REPL session because every form runs on the same
-//! VM through `VM.retargetTop`.
+//! A Runtime is a VM with the standard library booted
+//! (`stdlib.boot`) and a `Loader` for `require`. Every command
+//! evaluates its text through `Loader.evalSource`, one top-level
+//! form at a time on the same VM, so Vars, the interner and runtime
+//! values persist across the forms of a file and the inputs of a
+//! REPL session.
 
 const std = @import("std");
 const value_mod = @import("value.zig");
 const vm = @import("vm.zig");
 const compile = @import("compile.zig");
-const reader_mod = @import("reader.zig");
 const intern_mod = @import("intern.zig");
 const expand_mod = @import("expand.zig");
 const stdlib = @import("stdlib.zig");
 const loader_mod = @import("loader.zig");
 const format_mod = @import("format.zig");
 const disasm_mod = @import("disasm.zig");
+const string_mod = @import("string.zig");
+const vector_mod = @import("coll/vector.zig");
+const reader_mod = @import("reader.zig");
 const stack_guard = @import("stack.zig");
 
 const Value = value_mod.Value;
-
-/// Print a Value the way `(print ...)` does, through the one
-/// formatter in `src/format.zig`.
-fn formatValue(v: Value, interner: *const intern_mod.Interner, writer: *std.Io.Writer) !void {
-    try format_mod.format(v, .display, writer, interner);
-}
 
 const Usage =
     \\nexis — A Lisp where immutable values, transactional durable
@@ -36,20 +31,27 @@ const Usage =
     \\        programming model.
     \\
     \\usage:
-    \\  nexis run FILE.nx    Reads FILE.nx, compiles and runs each
-    \\                       top-level form in order.
-    \\  nexis repl           Interactive read-eval-print loop.
-    \\                       :quit or EOF to exit.
-    \\  nexis disasm FILE.nx Compiles FILE.nx without running it and
-    \\                       prints every routine's bytecode: pc,
-    \\                       opcode, operands, constants and the
-    \\                       source line:col each run of
-    \\                       instructions comes from.
-    \\                       `--disasm FILE.nx` is the same.
+    \\  nexis run FILE [ARG...]  Runs FILE's top-level forms in order;
+    \\                           `-` reads the program from stdin.
+    \\                           *command-line-args* holds the ARGs.
+    \\  nexis FILE.nx [ARG...]   The same as `run`.
+    \\  nexis -e EXPR [ARG...]   Evaluates EXPR's forms and prints each
+    \\                           value that is not nil.
+    \\  nexis repl               Interactive read-eval-print loop;
+    \\                           :quit or EOF to exit.
+    \\  nexis test FILE...       Runs each file, then every deftest
+    \\                           they defined; exits 1 on a failure
+    \\                           or an error.
+    \\  nexis disasm FILE        Compiles FILE without running it and
+    \\                           prints every routine's bytecode: pc,
+    \\                           opcode, operands, constants and the
+    \\                           source line:col each run of
+    \\                           instructions comes from.
+    \\                           `--disasm FILE` is the same.
     \\
-    \\For `run`, Vars and the interner persist across forms within
-    \\the file; for `repl`, across the whole session. A runtime error
-    \\is reported at its source position with the frame chain.
+    \\Exit status: 0 success, 1 usage or test failure, 2 unreadable
+    \\file, 3 parse or reader error, 4 compile error, 5 runtime
+    \\error; `(exit n)` exits with n.
     \\
     \\Namespaces available without a file: nexis.core (auto-referred),
     \\db (key-value storage on emdb), nextomic (Datomic-class datoms:
@@ -84,46 +86,34 @@ fn runtimeThread(init: std.process.Init, result: *anyerror!void) void {
 }
 
 fn runCommand(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    // Every heap block the VM allocates goes through this allocator;
+    // Zig's leak-checking DebugAllocator costs a Debug build most of
+    // its speed, so it is opt-in (`NEXIS_DEBUG_ALLOC`). The unit and
+    // integration tests check leaks under `std.testing.allocator`.
+    const allocator = if (init.environ_map.get("NEXIS_DEBUG_ALLOC") != null) init.gpa else std.heap.smp_allocator;
     const io = init.io;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    // Iterate the argv stream into a small owned slice. Zig 0.16
-    // moved argv from `process.argsAlloc` to `init.minimal.args`
-    // (an iterator). We collect to a slice for simple indexing.
-    var arg_iter = std.process.Args.Iterator.init(init.minimal.args);
-    defer arg_iter.deinit();
-    var arg_list: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (arg_list.items) |a| allocator.free(a);
-        arg_list.deinit(allocator);
-    }
-    while (arg_iter.next()) |a| {
-        try arg_list.append(allocator, try allocator.dupe(u8, a));
-    }
-    const args = arg_list.items;
-
-    if (args.len < 2) {
-        try printUsage(io);
-        std.process.exit(1);
-    }
-
+    if (args.len < 2) usageExit(io);
     const cmd = args[1];
-    if (std.mem.eql(u8, cmd, "run")) {
-        if (args.len < 3) {
-            try printUsage(io);
-            std.process.exit(1);
-        }
-        try runFile(io, allocator, args[2]);
-    } else if (std.mem.eql(u8, cmd, "repl")) {
+    if (eql(cmd, "run")) {
+        if (args.len < 3) usageExit(io);
+        try runFile(io, allocator, args[2], args[3..]);
+    } else if (eql(cmd, "repl")) {
         try runRepl(io, allocator);
-    } else if (std.mem.eql(u8, cmd, "disasm") or std.mem.eql(u8, cmd, "--disasm")) {
-        if (args.len < 3) {
-            try printUsage(io);
-            std.process.exit(1);
-        }
+    } else if (eql(cmd, "test")) {
+        if (args.len < 3) usageExit(io);
+        try runTests(io, allocator, args[2..]);
+    } else if (eql(cmd, "disasm") or eql(cmd, "--disasm")) {
+        if (args.len < 3) usageExit(io);
         try disasmFile(io, allocator, args[2]);
-    } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
-        try printUsage(io);
+    } else if (eql(cmd, "-e")) {
+        if (args.len < 3) usageExit(io);
+        try evalExpr(io, allocator, args[2], args[3..]);
+    } else if (eql(cmd, "--help") or eql(cmd, "-h")) {
+        try std.Io.File.stderr().writeStreamingAll(io, Usage);
+    } else if (std.mem.endsWith(u8, cmd, ".nx") or eql(cmd, "-")) {
+        try runFile(io, allocator, cmd, args[2..]);
     } else {
         try std.Io.File.stderr().writeStreamingAll(io, "nexis: unknown command '");
         try std.Io.File.stderr().writeStreamingAll(io, cmd);
@@ -132,108 +122,25 @@ fn runCommand(init: std.process.Init) !void {
     }
 }
 
-fn printUsage(io: std.Io) !void {
-    try std.Io.File.stderr().writeStreamingAll(io, Usage);
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
 }
 
-/// Report a compile error with file:line:col and a source-line
-/// caret:
-///
-///   nexis: <path>:<line>:<col>: <ErrorKind>
-///       <source line>
-///       <spaces><caret>
-fn emitCompileError(
-    io: std.Io,
-    path: []const u8,
-    source: []const u8,
-    err: anyerror,
-    maybe_span: ?reader_mod.SrcSpan,
-) !void {
-    if (maybe_span) |span| {
-        try emitSourceError(io, path, source, @errorName(err), span);
-    } else {
-        // An error without a span is reported bare.
-        const stderr = std.Io.File.stderr();
-        try stderr.writeStreamingAll(io, "nexis: compile error: ");
-        try stderr.writeStreamingAll(io, @errorName(err));
-        try stderr.writeStreamingAll(io, "\n");
-    }
-}
-
-/// Report a compile failure and return the exit code it carries:
-/// 4 at its span, or 5 when a `require` inside the form ran a
-/// file whose form failed at run time, which is reported as the
-/// runtime error it is, with the trace the failed run left.
-fn reportCompileFailure(rt: *Runtime, io: std.Io, path: []const u8, source: []const u8, err: anyerror, maybe_span: ?reader_mod.SrcSpan) !u8 {
-    if (err == compile.CompileError.RequiredFileFailed) {
-        try rt.reportRuntimeError(io, rt.v.traced_error orelse err);
-        return 5;
-    }
-    try emitCompileError(io, path, source, err, maybe_span);
-    return 4;
-}
-
-/// Report a parse failure at the token the parser stopped on:
-///
-///   nexis: <path>:<line>:<col>: parse error: unexpected `)`
-///
-/// or `unexpected end of input` past the last token.
-fn emitParseError(io: std.Io, path: []const u8, source: []const u8, p: *const reader_mod.parser.Parser) !void {
-    const pos: u32 = @intCast(@min(p.current.pos, source.len));
-    var buf: [128]u8 = undefined;
-    const label = if (pos >= source.len)
-        "parse error: unexpected end of input"
-    else
-        try std.fmt.bufPrint(&buf, "parse error: unexpected `{s}`", .{source[pos..@min(source.len, pos + @as(usize, @max(p.current.len, 1)))]});
-    const len: u32 = if (pos >= source.len) 1 else @max(p.current.len, 1);
-    try emitSourceError(io, path, source, label, .{ .pos = pos, .len = len });
-}
-
-/// Report a reader failure at the form it rejected, with the kind
-/// the golden `.err` files name (`:map-odd-count`) and the reader's
-/// detail when it has one, verbatim:
-///
-///   nexis: <path>:<line>:<col>: reader error: :duplicate-literal-key (keyword :a_b)
-///
-/// A failure the reader did not record (out of memory, invalid
-/// UTF-8) is reported bare.
-fn emitReaderError(io: std.Io, path: []const u8, source: []const u8, rdr: *const reader_mod.Reader, err: anyerror) !void {
-    const e = rdr.err orelse {
-        const stderr = std.Io.File.stderr();
-        try stderr.writeStreamingAll(io, "nexis: reader error: ");
-        try stderr.writeStreamingAll(io, @errorName(err));
-        try stderr.writeStreamingAll(io, "\n");
-        return;
-    };
-    // Kinds are spelled with underscores in Zig and dashes in nexis;
-    // the detail is the user's own text and stays as written.
-    var kind_buf: [64]u8 = undefined;
-    const kind = kind_buf[0..@tagName(e.kind).len];
-    @memcpy(kind, @tagName(e.kind));
-    std.mem.replaceScalar(u8, kind, '_', '-');
-    var buf: [256]u8 = undefined;
-    const label = if (e.detail) |detail|
-        try std.fmt.bufPrint(&buf, "reader error: :{s} {s}", .{ kind, detail })
-    else
-        try std.fmt.bufPrint(&buf, "reader error: :{s}", .{kind});
-    try emitSourceError(io, path, source, label, e.span);
+fn usageExit(io: std.Io) noreturn {
+    std.Io.File.stderr().writeStreamingAll(io, Usage) catch {};
+    std.process.exit(1);
 }
 
 /// `nexis: <path>:<line>:<col>: <label>`, then the source line
 /// and a caret under the span.
-fn emitSourceError(
-    io: std.Io,
-    path: []const u8,
-    source: []const u8,
-    label: []const u8,
-    span: reader_mod.SrcSpan,
-) !void {
+fn emitSourceError(io: std.Io, info: *const vm.SourceInfo, label: []const u8, span: reader_mod.SrcSpan) !void {
     const stderr = std.Io.File.stderr();
-    const info = vm.SourceInfo{ .path = path, .text = source };
     const loc = info.lineCol(span.pos);
     var buf: [512]u8 = undefined;
-    const header = try std.fmt.bufPrint(&buf, "nexis: {s}:{d}:{d}: {s}\n", .{ path, loc.line, loc.col, label });
+    const header = std.fmt.bufPrint(&buf, "nexis: {s}:{d}:{d}: ", .{ info.path, loc.line, loc.col }) catch "nexis: ";
     try stderr.writeStreamingAll(io, header);
+    try stderr.writeStreamingAll(io, label);
+    try stderr.writeStreamingAll(io, "\n");
     const line_text = info.lineText(loc.line);
     if (line_text.len > 0) {
         try stderr.writeStreamingAll(io, "    ");
@@ -242,73 +149,96 @@ fn emitSourceError(
         var i: usize = 1;
         while (i < loc.col) : (i += 1) try stderr.writeStreamingAll(io, " ");
         // One caret per byte of the span, at least one.
-        const span_len: usize = if (span.len < 1) 1 else span.len;
+        const span_len: usize = @max(span.len, 1);
         var j: usize = 0;
         while (j < span_len) : (j += 1) try stderr.writeStreamingAll(io, "^");
         try stderr.writeStreamingAll(io, "\n");
     }
 }
 
-/// The embedded sources, as the routines compiled from them name
-/// them in a stack trace.
-const core_source = vm.SourceInfo{ .path = "core.nx", .text = stdlib.CORE_NX_SOURCE };
-const nextomic_source = vm.SourceInfo{ .path = "nextomic.nx", .text = stdlib.NEXTOMIC_NX_SOURCE };
-const test_source = vm.SourceInfo{ .path = "test.nx", .text = stdlib.TEST_NX_SOURCE };
-const pprint_source = vm.SourceInfo{ .path = "pprint.nx", .text = stdlib.PPRINT_NX_SOURCE };
-const math_source = vm.SourceInfo{ .path = "math.nx", .text = stdlib.MATH_NX_SOURCE };
-
-/// The routine the VM is created around; `retargetTop` replaces it
-/// before anything runs.
-/// A VM with `nexis.core`, `db`, `nexis.string`, `nexis.internal`,
-/// `nexis.math` and `nextomic` installed, the embedded core.nx,
-/// nextomic.nx, test.nx, pprint.nx and math.nx bootstrapped into
-/// their namespaces, and a namespace loader
-/// that searches `load_paths` when `(require ...)` fires. The
-/// current namespace is `user`.
 const Runtime = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     v: vm.VM,
     host_macros: expand_mod.HostMacroTable,
     loader: loader_mod.Loader,
+    registry: *vm.NamespaceRegistry,
     /// What `macroexpand-1`, `read-string` and `eval` call into.
     hooks: compile.RuntimeHooks,
-    interner: *intern_mod.Interner,
-    registry: *vm.NamespaceRegistry,
 
-    fn deinit(self: *Runtime) void {
-        self.loader.deinit();
-        self.host_macros.deinit(self.allocator);
-        self.v.deinit();
-    }
-
-    /// Where `defmacro` closures and bootstrap routines live: the
-    /// VM's runtime arena, so they outlive any per-form arena.
-    fn persistent(self: *Runtime) std.mem.Allocator {
-        return self.v.runtime_arena.allocator();
-    }
-
-    /// Everything the compiler needs from the runtime; `declared`,
-    /// `out_span` and `source` are per call.
-    fn compileOptions(self: *Runtime, out_span: ?*?reader_mod.SrcSpan, declared: ?*compile.DeclaredNames, source: *const vm.SourceInfo) compile.CompileOptions {
-        return .{
-            .namespace = self.registry.current,
-            .interner = self.interner,
-            .host_macros = &self.host_macros,
-            .out_span = out_span,
-            .persistent_allocator = self.persistent(),
-            .registry = self.registry,
-            .load_callback = .{ .user_data = @ptrCast(&self.loader), .load = &loader_mod.Loader.loadCallback },
-            .declared = declared,
-            .source = source,
+    /// Boot in place: the runtime keeps pointers into itself.
+    /// `load_paths` must outlive it.
+    fn init(rt: *Runtime, io: std.Io, allocator: std.mem.Allocator, load_paths: []const []const u8) !void {
+        rt.allocator = allocator;
+        rt.io = io;
+        rt.v = try vm.VM.init(allocator, &vm.VM.idle_routine);
+        errdefer rt.v.deinit();
+        rt.v.io = io;
+        const interner = rt.v.ensureInterner();
+        const registry = try rt.v.ensureRegistry();
+        rt.registry = registry;
+        rt.host_macros = try expand_mod.defaultMacros(allocator);
+        errdefer rt.host_macros.deinit(allocator);
+        rt.loader = loader_mod.Loader.init(allocator, rt.v.runtime_arena.allocator(), io, load_paths, &rt.v, interner, registry, &rt.host_macros);
+        errdefer rt.loader.deinit();
+        // A failure here is a bug in an embedded source, not in the
+        // user's program: no half-booted runtime is worth running.
+        stdlib.boot(&rt.loader) catch |err| {
+            const d = rt.loader.diagnostic;
+            std.debug.panic("nexis: stdlib bootstrap failed: {s} {s}", .{ @errorName(err), if (d) |x| x.label else "" });
         };
+        rt.hooks = .{ .host_macros = &rt.host_macros, .registry = registry, .interner = interner, .load_callback = rt.loader.callback() };
+        rt.hooks.install(&rt.v);
     }
 
-    /// Run one compiled top-level form on the VM; `<top>` is how a
-    /// stack trace names its frame.
-    fn runCompiled(self: *Runtime, compiled: compile.Compiled) vm.VmError!Value {
-        const routine = compiled.toRoutine("<top>");
-        try self.v.retargetTop(&routine);
-        return self.v.run();
+    fn deinit(rt: *Runtime) void {
+        rt.loader.deinit();
+        rt.host_macros.deinit(rt.allocator);
+        rt.v.deinit();
+    }
+
+    fn persistent(rt: *Runtime) std.mem.Allocator {
+        return rt.v.runtime_arena.allocator();
+    }
+
+    /// Bind `nexis.core/<name>` to `value`.
+    fn setCoreVar(rt: *Runtime, name: []const u8, value: Value) !void {
+        const v = try rt.registry.core.intern(name);
+        v.root = value;
+        v.bound = true;
+    }
+
+    /// `*command-line-args*`: the arguments after the program as a
+    /// vector of strings, nil when there are none (as in Clojure).
+    fn setArgs(rt: *Runtime, args: []const []const u8) !void {
+        if (args.len == 0) return;
+        const heap = rt.v.ensureHeap();
+        var vec = try vector_mod.empty(heap);
+        for (args) |a| vec = try vector_mod.conj(heap, vec, try string_mod.fromBytes(heap, a));
+        try rt.setCoreVar("*command-line-args*", vec);
+    }
+
+    /// Report what `evalSource` failed with; the exit status it
+    /// carries.
+    fn report(rt: *Runtime, err: loader_mod.EvalError) !u8 {
+        switch (err) {
+            error.Diagnosed => {
+                const d = rt.loader.diagnostic.?;
+                if (d.source) |info| {
+                    try emitSourceError(rt.io, info, d.label, d.span orelse .{ .pos = 0, .len = 1 });
+                } else {
+                    try std.Io.File.stderr().writeStreamingAll(rt.io, "nexis: ");
+                    try std.Io.File.stderr().writeStreamingAll(rt.io, d.label);
+                    try std.Io.File.stderr().writeStreamingAll(rt.io, "\n");
+                }
+                return if (d.reading) 3 else 4;
+            },
+            error.RunFailed, error.ControlTransferred => {
+                try rt.reportRuntimeError(rt.v.traced_error orelse vm.VmError.UncaughtThrow);
+                return 5;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        }
     }
 
     /// Report a runtime error at the instruction that raised it and
@@ -323,157 +253,181 @@ const Runtime = struct {
     /// An uncaught throw names the thrown value after the error, as
     /// `pr-str` prints it. A frame whose routine carries no span
     /// table is listed by name alone.
-    fn reportRuntimeError(self: *Runtime, io: std.Io, err: anyerror) !void {
+    fn reportRuntimeError(rt: *Runtime, err: anyerror) !void {
         const stderr = std.Io.File.stderr();
-        var label_buf: [4096]u8 = undefined;
-        var label_stream = std.Io.Writer.fixed(&label_buf);
-        try label_stream.print("runtime error: {s}", .{@errorName(err)});
-        if (err == vm.VmError.UncaughtThrow) {
-            if (self.v.unhandled_throw) |payload| {
-                try label_stream.writeAll(" ");
-                format_mod.format(payload, .readable, &label_stream, self.interner) catch {
-                    try label_stream.writeAll("#<value too large to print>");
-                };
-            }
-        }
-        const label = label_stream.buffered();
+        var label: std.Io.Writer.Allocating = .init(rt.allocator);
+        defer label.deinit();
+        try label.writer.print("runtime error: {s}", .{@errorName(err)});
+        if (err == vm.VmError.UncaughtThrow) if (rt.v.unhandled_throw) |payload| {
+            try label.writer.writeAll(" ");
+            format_mod.format(payload, .readable, &label.writer, rt.v.ensureInterner()) catch try label.writer.writeAll("#<unprintable>");
+        };
 
-        const trace = self.v.error_trace.items;
-        const located = trace.len > 0 and trace[0].span != null and trace[0].source != null;
-        if (located) {
-            const src = trace[0].source.?;
-            try emitSourceError(io, src.path, src.text, label, .{ .pos = trace[0].span.?.pos, .len = trace[0].span.?.len });
+        const trace = rt.v.error_trace.items;
+        if (trace.len > 0 and trace[0].span != null and trace[0].source != null) {
+            try emitSourceError(rt.io, trace[0].source.?, label.written(), .{ .pos = trace[0].span.?.pos, .len = trace[0].span.?.len });
         } else {
-            try stderr.writeStreamingAll(io, "nexis: ");
-            try stderr.writeStreamingAll(io, label);
-            try stderr.writeStreamingAll(io, "\n");
+            try stderr.writeStreamingAll(rt.io, "nexis: ");
+            try stderr.writeStreamingAll(rt.io, label.written());
+            try stderr.writeStreamingAll(rt.io, "\n");
         }
         for (trace) |frame| {
             var buf: [1024]u8 = undefined;
             const line = if (frame.source) |src| blk: {
                 if (frame.span) |span| {
                     const loc = src.lineCol(span.pos);
-                    break :blk try std.fmt.bufPrint(&buf, "  at {s} ({s}:{d}:{d})\n", .{ frame.name, src.path, loc.line, loc.col });
+                    break :blk std.fmt.bufPrint(&buf, "  at {s} ({s}:{d}:{d})\n", .{ frame.name, src.path, loc.line, loc.col }) catch continue;
                 }
-                break :blk try std.fmt.bufPrint(&buf, "  at {s} ({s})\n", .{ frame.name, src.path });
-            } else try std.fmt.bufPrint(&buf, "  at {s}\n", .{frame.name});
-            try stderr.writeStreamingAll(io, line);
+                break :blk std.fmt.bufPrint(&buf, "  at {s} ({s})\n", .{ frame.name, src.path }) catch continue;
+            } else std.fmt.bufPrint(&buf, "  at {s}\n", .{frame.name}) catch continue;
+            try stderr.writeStreamingAll(rt.io, line);
         }
+    }
+
+    /// `v` as `pr` prints it, then a newline, on stdout.
+    fn printReadably(rt: *Runtime, v: Value) !void {
+        var out: std.Io.Writer.Allocating = .init(rt.allocator);
+        defer out.deinit();
+        format_mod.format(v, .readable, &out.writer, rt.v.ensureInterner()) catch |err| switch (err) {
+            error.Utf8Error => try out.writer.writeAll("#<invalid utf-8>"),
+            error.WriteFailed => return error.OutOfMemory,
+        };
+        try out.writer.writeAll("\n");
+        try std.Io.File.stdout().writeStreamingAll(rt.io, out.written());
     }
 };
 
-/// Build a `Runtime` in place. `load_paths` must outlive it.
-fn bootRuntime(rt: *Runtime, io: std.Io, allocator: std.mem.Allocator, load_paths: []const []const u8) !void {
-    rt.allocator = allocator;
-    rt.v = try vm.VM.init(allocator, &vm.VM.idle_routine);
-    errdefer rt.v.deinit();
-    // `(db/open path)` creates the path's parent directories through
-    // the CLI's std.Io; emdb itself does not.
-    rt.v.io = io;
-    rt.interner = rt.v.ensureInterner();
-    rt.registry = try rt.v.ensureRegistry();
-    // Natives live in nexis.core (auto-referred by user) and in the
-    // qualified-only namespaces; each qualified namespace has
-    // nexis.core as its parent.
-    try stdlib.installCore(rt.registry.core);
-    const db_ns = try rt.registry.getOrCreate("db", rt.registry.core);
-    try stdlib.installDb(db_ns);
-    const string_ns = try rt.registry.getOrCreate("nexis.string", rt.registry.core);
-    try stdlib.installString(string_ns);
-    const internal_ns = try rt.registry.getOrCreate("nexis.internal", rt.registry.core);
-    try stdlib.installInternal(internal_ns);
-    const nextomic_ns = try rt.registry.getOrCreate("nextomic", rt.registry.core);
-    try stdlib.installNextomic(nextomic_ns);
-    const test_ns = try rt.registry.getOrCreate("nexis.test", rt.registry.core);
-    const pprint_ns = try rt.registry.getOrCreate("nexis.pprint", rt.registry.core);
-    const math_ns = try rt.registry.getOrCreate("nexis.math", rt.registry.core);
-    try stdlib.installMath(math_ns);
-    rt.host_macros = try expand_mod.defaultMacros(allocator);
-    errdefer rt.host_macros.deinit(allocator);
-    // The embedded sources define into their own namespaces; core.nx
-    // first so nextomic.nx can use it.
-    try bootstrapEmbedded(rt, rt.registry.core, &core_source);
-    try bootstrapEmbedded(rt, nextomic_ns, &nextomic_source);
-    try bootstrapEmbedded(rt, test_ns, &test_source);
-    try bootstrapEmbedded(rt, pprint_ns, &pprint_source);
-    try bootstrapEmbedded(rt, math_ns, &math_source);
-    rt.loader = loader_mod.Loader.init(
-        allocator,
-        rt.persistent(),
-        io,
-        load_paths,
-        &rt.v,
-        rt.interner,
-        rt.registry,
-        &rt.host_macros,
-    );
-    rt.hooks = .{
-        .host_macros = &rt.host_macros,
-        .registry = rt.registry,
-        .interner = rt.interner,
-        .load_callback = .{ .user_data = @ptrCast(&rt.loader), .load = &loader_mod.Loader.loadCallback },
-    };
-    rt.hooks.install(&rt.v);
+/// The text of FILE, or of stdin for `-`; exit 2 when it cannot be
+/// read. A `#!` first line is a comment, so a script can be
+/// executable.
+fn readProgram(io: std.Io, allocator: std.mem.Allocator, path: []const u8) []u8 {
+    const text = if (eql(path, "-")) blk: {
+        var buf: [4096]u8 = undefined;
+        var r = std.Io.File.stdin().readerStreaming(io, &buf);
+        break :blk r.interface.allocRemaining(allocator, .unlimited) catch |err| failRead(io, path, err);
+    } else std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch |err| failRead(io, path, err);
+    if (std.mem.startsWith(u8, text, "#!")) @memcpy(text[0..2], ";;");
+    return text;
 }
 
-/// Compile and evaluate one embedded source into `ns`, one
-/// top-level form at a time, so each definition is visible to
-/// the forms after it. Errors here are bugs in the embedded
-/// source, not in user code: the process panics rather than come
-/// up with half a stdlib.
-fn bootstrapEmbedded(rt: *Runtime, ns: *vm.Namespace, info: *const vm.SourceInfo) !void {
-    const allocator = rt.allocator;
-    const source = info.text;
-    const label = info.path;
-    var parse_result = reader_mod.parser.parseProgram(allocator, source) catch |err| {
-        std.debug.panic("nexis: {s} parse error: {s}\n", .{ label, @errorName(err) });
-    };
-    defer parse_result.parser.deinit();
-
-    var rdr = reader_mod.Reader.init(allocator, source);
-    defer rdr.deinit();
-    const forms = rdr.readProgram(parse_result.sexp) catch |err| {
-        std.debug.panic("nexis: {s} reader error: {s}\n", .{ label, @errorName(err) });
-    };
-
-    const saved_current = rt.registry.current;
-    rt.registry.current = ns;
-    defer rt.registry.current = saved_current;
-
-    // The routines of ordinary defns are referenced by closures in
-    // Var roots that outlive bootstrap, so they are compiled into
-    // the persistent allocator, not a temporary arena.
-    for (forms) |form| {
-        var error_span: ?reader_mod.SrcSpan = null;
-        const compiled = compile.compileFormWith(rt.persistent(), form, .{
-            .namespace = ns,
-            .interner = rt.interner,
-            .host_macros = &rt.host_macros,
-            .out_span = &error_span,
-            .persistent_allocator = rt.persistent(),
-            .registry = rt.registry,
-            .source = info,
-        }) catch |err| {
-            std.debug.panic("nexis: {s} compile error: {s} (form span: {?})\n", .{ label, @errorName(err), error_span });
-        };
-        _ = rt.runCompiled(compiled) catch |err| {
-            std.debug.panic("nexis: {s} runtime error: {s}\n", .{ label, @errorName(err) });
-        };
-    }
-}
-
-/// Interactive read-eval-print loop: one form per input line,
-/// evaluated on a runtime that persists for the session; errors
-/// are printed and the loop continues. `:quit`, `:q` or EOF exits.
-fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
-    const stdin = std.Io.File.stdin();
-    const stdout = std.Io.File.stdout();
+fn failRead(io: std.Io, path: []const u8, err: anyerror) noreturn {
     const stderr = std.Io.File.stderr();
+    stderr.writeStreamingAll(io, "nexis: failed to read '") catch {};
+    stderr.writeStreamingAll(io, path) catch {};
+    stderr.writeStreamingAll(io, "': ") catch {};
+    stderr.writeStreamingAll(io, @errorName(err)) catch {};
+    stderr.writeStreamingAll(io, "\n") catch {};
+    std.process.exit(2);
+}
 
+/// `require` searches the working directory and the file's own.
+fn loadPathsFor(path: []const u8) [2][]const u8 {
+    return .{ ".", if (eql(path, "-")) "." else std.fs.path.dirname(path) orelse "." };
+}
+
+/// Run FILE's forms. Like Clojure's script runner, `run` writes only
+/// what the program prints.
+fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, args: []const []const u8) !void {
+    const text = readProgram(io, allocator, path);
+    defer allocator.free(text);
+    const load_paths = loadPathsFor(path);
+    var rt: Runtime = undefined;
+    try rt.init(io, allocator, &load_paths);
+    defer rt.deinit();
+    try rt.setArgs(args);
+    // One arena for the file's Form trees and routines, released
+    // together at the end.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const info = vm.SourceInfo{ .path = if (eql(path, "-")) "<stdin>" else path, .text = text };
+    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator() }) catch |err| std.process.exit(try rt.report(err));
+}
+
+/// `nexis -e EXPR`: EXPR's forms, each non-nil value printed.
+fn evalExpr(io: std.Io, allocator: std.mem.Allocator, expr: []const u8, args: []const []const u8) !void {
     const load_paths = [_][]const u8{"."};
     var rt: Runtime = undefined;
-    try bootRuntime(&rt, io, allocator, &load_paths);
+    try rt.init(io, allocator, &load_paths);
     defer rt.deinit();
+    try rt.setArgs(args);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const info = vm.SourceInfo{ .path = "<-e>", .text = expr };
+    const Print = struct {
+        fn call(ctx: *anyopaque, v: Value) anyerror!void {
+            if (!v.isNil()) try @as(*Runtime, @ptrCast(@alignCast(ctx))).printReadably(v);
+        }
+    };
+    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_value = .{ .ctx = &rt, .call = &Print.call } }) catch |err| std.process.exit(try rt.report(err));
+}
+
+/// `nexis test FILE...`: run each file, then `run-all-tests`; exit 1
+/// when an assertion failed or a test threw.
+fn runTests(io: std.Io, allocator: std.mem.Allocator, paths: []const []const u8) !void {
+    const load_paths = loadPathsFor(paths[0]);
+    var rt: Runtime = undefined;
+    try rt.init(io, allocator, &load_paths);
+    defer rt.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    for (paths) |path| {
+        const text = readProgram(io, arena.allocator(), path);
+        const info = try arena.allocator().create(vm.SourceInfo);
+        info.* = .{ .path = path, .text = text };
+        const saved = rt.registry.current;
+        _ = rt.loader.evalSource(info, .{ .allocator = arena.allocator() }) catch |err| std.process.exit(try rt.report(err));
+        rt.registry.current = saved;
+    }
+    const info = vm.SourceInfo{ .path = "<test>", .text = "(let [r (nexis.test/run-all-tests)] (+ (get r :fail) (get r :error)))" };
+    const bad = rt.loader.evalSource(&info, .{ .allocator = arena.allocator() }) catch |err| std.process.exit(try rt.report(err));
+    if (!bad.isFixnum() or bad.asFixnum() != 0) std.process.exit(1);
+}
+
+/// Compile FILE the way `run` does and print every routine's
+/// disassembly to stdout instead of running it. Macro expansion,
+/// `(ns ...)` and `(require ...)` still take effect at compile time;
+/// a `def` does not run, so a macro that calls a function the same
+/// file defines cannot expand here.
+fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
+    const text = readProgram(io, allocator, path);
+    defer allocator.free(text);
+    const load_paths = loadPathsFor(path);
+    var rt: Runtime = undefined;
+    try rt.init(io, allocator, &load_paths);
+    defer rt.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const Disasm = struct {
+        rt: *Runtime,
+        out: *std.Io.Writer,
+        first: bool = true,
+        fn call(ctx: *anyopaque, routine: *const vm.Routine) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.first) try self.out.writeAll("\n");
+            self.first = false;
+            try disasm_mod.disassemble(routine, self.rt.v.ensureInterner(), self.out);
+        }
+    };
+    var each = Disasm{ .rt = &rt, .out = &out.writer };
+    const info = vm.SourceInfo{ .path = path, .text = text };
+    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_routine = .{ .ctx = &each, .call = &Disasm.call } }) catch |err| std.process.exit(try rt.report(err));
+    try std.Io.File.stdout().writeStreamingAll(io, out.written());
+}
+
+/// The interactive loop: read lines until they hold complete forms,
+/// evaluate every form, print each value as `pr` does and bind it to
+/// `*1` (the previous ones to `*2` and `*3`); an error is printed,
+/// bound to `*e`, and the loop continues. `:quit`, `:q` or EOF exits.
+fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
+    const stdout = std.Io.File.stdout();
+    const load_paths = [_][]const u8{"."};
+    var rt: Runtime = undefined;
+    try rt.init(io, allocator, &load_paths);
+    defer rt.deinit();
+    const nil = value_mod.nilValue();
+    for ([_][]const u8{ "*1", "*2", "*3", "*e" }) |name| try rt.setCoreVar(name, nil);
 
     try stdout.writeStreamingAll(io,
         \\nexis repl
@@ -482,205 +436,78 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         \\
     );
 
-    var stdin_buf: [4096]u8 = undefined;
-    var reader = stdin.readerStreaming(io, &stdin_buf);
+    const Results = struct {
+        rt: *Runtime,
+        fn call(ctx: *anyopaque, v: Value) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const core = self.rt.registry.core;
+            core.lookupLocal("*3").?.root = core.lookupLocal("*2").?.root;
+            core.lookupLocal("*2").?.root = core.lookupLocal("*1").?.root;
+            core.lookupLocal("*1").?.root = v;
+            try self.rt.printReadably(v);
+        }
+    };
+    var results = Results{ .rt = &rt };
 
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(allocator);
     while (true) {
-        try stdout.writeStreamingAll(io, "user=> ");
-        // takeDelimiter returns null at EOF. The returned slice
-        // excludes the delimiter and the reader advances past it
-        // (takeDelimiterExclusive leaves it in the buffer and
-        // loops forever on empty lines).
-        const maybe_line = (reader.interface.takeDelimiter('\n')) catch |err| {
-            try stderr.writeStreamingAll(io, "nexis: stdin read error: ");
-            try stderr.writeStreamingAll(io, @errorName(err));
-            try stderr.writeStreamingAll(io, "\n");
+        if (pending.items.len == 0) {
+            const ns = rt.registry.current.name;
+            try stdout.writeStreamingAll(io, ns);
+            try stdout.writeStreamingAll(io, "=> ");
+        }
+        const line = stdlib.readStdinLine(io) catch |err| {
+            try std.Io.File.stderr().writeStreamingAll(io, "nexis: stdin read error: ");
+            try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));
+            try std.Io.File.stderr().writeStreamingAll(io, "\n");
             return;
-        };
-        const line = maybe_line orelse {
+        } orelse {
             try stdout.writeStreamingAll(io, "\n");
             return;
         };
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (trimmed.len == 0) continue;
-        if (std.mem.eql(u8, trimmed, ":quit") or std.mem.eql(u8, trimmed, ":q")) return;
+        if (pending.items.len == 0) {
+            if (trimmed.len == 0) continue;
+            if (eql(trimmed, ":quit") or eql(trimmed, ":q")) return;
+        }
+        try pending.appendSlice(allocator, line);
+        try pending.append(allocator, '\n');
 
-        // Closures and their routines reference sub-routine pointers
-        // that live in the compile arena, and a line's definitions
-        // are called from later lines, so every line compiles into
-        // the persistent arena. The source bytes go there too:
-        // Tiny.symbol slices borrow from them.
-        const src = try rt.persistent().dupe(u8, trimmed);
-        // Routines defined on this line name it in later traces.
-        const line_source = try rt.persistent().create(vm.SourceInfo);
-        line_source.* = .{ .path = "<repl>", .text = src };
-
-        // A REPL line may only refer to what exists or what the
-        // line itself defines; the compiler reports anything else
-        // at the symbol.
-        var declared = compile.DeclaredNames.init(allocator);
-        defer declared.deinit();
-        // One form per line, located like a file's.
-        var parser = reader_mod.parser.Parser.init(allocator, src);
-        defer parser.deinit();
-        const sexp = parser.parseForm() catch {
-            try emitParseError(io, "<repl>", src, &parser);
-            continue;
-        };
-        var line_reader = reader_mod.Reader.init(allocator, src);
-        defer line_reader.deinit();
-        const form = line_reader.readOneForm(sexp) catch |err| {
-            try emitReaderError(io, "<repl>", src, &line_reader, err);
-            continue;
-        };
-        var error_span: ?reader_mod.SrcSpan = null;
-        const compiled = compile.compileFormWith(rt.persistent(), form, rt.compileOptions(&error_span, &declared, line_source)) catch |err| {
-            _ = try reportCompileFailure(&rt, io, "<repl>", src, err, error_span);
-            // A `require` inside the form may have run a file whose
-            // form failed; that run's frames must not leak either.
+        // Closures made here are called from later inputs, so the
+        // text, its SourceInfo and its routines live as long as the
+        // session.
+        const info = try rt.persistent().create(vm.SourceInfo);
+        info.* = .{ .path = "<repl>", .text = try rt.persistent().dupe(u8, std.mem.trimEnd(u8, pending.items, "\n")) };
+        _ = rt.loader.evalSource(info, .{ .allocator = rt.persistent(), .on_value = .{ .ctx = &results, .call = &Results.call } }) catch |err| {
+            if (err == error.Diagnosed and rt.loader.diagnostic.?.incomplete) continue;
+            const e = if (err == error.RunFailed) rt.v.unhandled_throw orelse errorKeyword(&rt) else nil;
+            _ = try rt.report(err);
+            // The frames, handlers and bindings an aborted run left
+            // must not leak into the next input.
             rt.v.resetAfterError();
-            continue;
+            if (err == error.RunFailed) rt.registry.core.lookupLocal("*e").?.root = e;
         };
-
-        const result = rt.runCompiled(compiled) catch |err| {
-            try rt.reportRuntimeError(io, err);
-            // The frames and handlers an aborted run left must
-            // not leak into the next line.
-            rt.v.resetAfterError();
-            continue;
-        };
-
-        var out_buf: [4096]u8 = undefined;
-        var out_stream = std.Io.Writer.fixed(&out_buf);
-        formatValue(result, rt.interner, &out_stream) catch {
-            try stdout.writeStreamingAll(io, "#<value too large to print>\n");
-            continue;
-        };
-        try stdout.writeStreamingAll(io, out_stream.buffered());
-        try stdout.writeStreamingAll(io, "\n");
+        pending.clearRetainingCapacity();
     }
 }
 
-/// Read FILE.nx, parse, compile and run each top-level form. Like
-/// Clojure's script runner, `run` writes only what the program
-/// prints; the REPL is where results are echoed.
-fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
-    const stderr = std.Io.File.stderr();
-    const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| {
-        try stderr.writeStreamingAll(io, "nexis: failed to read '");
-        try stderr.writeStreamingAll(io, path);
-        try stderr.writeStreamingAll(io, "': ");
-        try stderr.writeStreamingAll(io, @errorName(err));
-        try stderr.writeStreamingAll(io, "\n");
-        std.process.exit(2);
-    };
-    defer allocator.free(source);
-
-    // The parser owns the Sexp tree, the reader the Form tree.
-    var parser = reader_mod.parser.Parser.init(allocator, source);
-    defer parser.deinit();
-    const sexp = parser.parseProgram() catch {
-        try emitParseError(io, path, source, &parser);
-        std.process.exit(3);
-    };
-
-    var reader = reader_mod.Reader.init(allocator, source);
-    defer reader.deinit();
-
-    const forms = reader.readProgram(sexp) catch |err| {
-        try emitReaderError(io, path, source, &reader, err);
-        std.process.exit(3);
-    };
-
-    if (forms.len == 0) return;
-
-    // `require` searches the working directory and the file's own.
-    const file_dir = std.fs.path.dirname(path) orelse ".";
-    const load_paths = [_][]const u8{ ".", file_dir };
-    var rt: Runtime = undefined;
-    try bootRuntime(&rt, io, allocator, &load_paths);
-    defer rt.deinit();
-
-    // One compile arena for the whole file: Form trees, Tiny IR and
-    // Compiled routines, released together at the end.
-    var compile_arena = std.heap.ArenaAllocator.init(allocator);
-    defer compile_arena.deinit();
-
-    // Every name the file defines may be referred to from any form
-    // in it (forward references); a symbol that resolves to nothing
-    // else is a compile error at its span.
-    var declared = compile.DeclaredNames.init(allocator);
-    defer declared.deinit();
-    for (forms) |form| try declared.declareForm(form);
-
-    const file_source = vm.SourceInfo{ .path = path, .text = source };
-    for (forms) |form| {
-        var error_span: ?reader_mod.SrcSpan = null;
-        const compiled = compile.compileFormWith(compile_arena.allocator(), form, rt.compileOptions(&error_span, &declared, &file_source)) catch |err| {
-            std.process.exit(try reportCompileFailure(&rt, io, path, source, err, error_span));
-        };
-        _ = rt.runCompiled(compiled) catch |err| {
-            try rt.reportRuntimeError(io, err);
-            std.process.exit(5);
-        };
+/// The keyword a caught runtime error would be (`DivideByZero` is
+/// `:divide-by-zero`), for `*e`.
+fn errorKeyword(rt: *Runtime) Value {
+    const err = rt.v.traced_error orelse return value_mod.nilValue();
+    var buf: [64]u8 = undefined;
+    var n: usize = 0;
+    for (@errorName(err), 0..) |c, i| {
+        if (n + 2 > buf.len) break;
+        if (std.ascii.isUpper(c)) {
+            if (i > 0) {
+                buf[n] = '-';
+                n += 1;
+            }
+            buf[n] = std.ascii.toLower(c);
+        } else buf[n] = c;
+        n += 1;
     }
-}
-
-/// Read FILE.nx, parse and compile each top-level form the way
-/// `run` does, and print every routine's disassembly to stdout
-/// instead of running it. Macro expansion, `(ns ...)` and
-/// `(require ...)` still take effect at compile time; a `def` does
-/// not run, so a macro that calls a function the same file defines
-/// cannot expand here.
-fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
-    const stderr = std.Io.File.stderr();
-    const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| {
-        try stderr.writeStreamingAll(io, "nexis: failed to read '");
-        try stderr.writeStreamingAll(io, path);
-        try stderr.writeStreamingAll(io, "': ");
-        try stderr.writeStreamingAll(io, @errorName(err));
-        try stderr.writeStreamingAll(io, "\n");
-        std.process.exit(2);
-    };
-    defer allocator.free(source);
-
-    var parser = reader_mod.parser.Parser.init(allocator, source);
-    defer parser.deinit();
-    const sexp = parser.parseProgram() catch {
-        try emitParseError(io, path, source, &parser);
-        std.process.exit(3);
-    };
-    var reader = reader_mod.Reader.init(allocator, source);
-    defer reader.deinit();
-    const forms = reader.readProgram(sexp) catch |err| {
-        try emitReaderError(io, path, source, &reader, err);
-        std.process.exit(3);
-    };
-    if (forms.len == 0) return;
-
-    const file_dir = std.fs.path.dirname(path) orelse ".";
-    const load_paths = [_][]const u8{ ".", file_dir };
-    var rt: Runtime = undefined;
-    try bootRuntime(&rt, io, allocator, &load_paths);
-    defer rt.deinit();
-
-    var compile_arena = std.heap.ArenaAllocator.init(allocator);
-    defer compile_arena.deinit();
-    var declared = compile.DeclaredNames.init(allocator);
-    defer declared.deinit();
-    for (forms) |form| try declared.declareForm(form);
-
-    const file_source = vm.SourceInfo{ .path = path, .text = source };
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    for (forms, 0..) |form, i| {
-        var error_span: ?reader_mod.SrcSpan = null;
-        const compiled = compile.compileFormWith(compile_arena.allocator(), form, rt.compileOptions(&error_span, &declared, &file_source)) catch |err| {
-            std.process.exit(try reportCompileFailure(&rt, io, path, source, err, error_span));
-        };
-        const routine = compiled.toRoutine("<top>");
-        if (i > 0) try out.writer.writeAll("\n");
-        try disasm_mod.disassemble(&routine, rt.interner, &out.writer);
-    }
-    try std.Io.File.stdout().writeStreamingAll(io, out.written());
+    return rt.v.ensureInterner().internKeywordValue(buf[0..n]) catch value_mod.nilValue();
 }

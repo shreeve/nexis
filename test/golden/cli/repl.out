@@ -3,4 +3,15 @@ Type `:quit` or hit Ctrl-D to exit.
 
 user=> #'x
 user=> 42
-user=> user=> 
+user=> user=> :divide-by-zero
+user=> #'a
+#'b
+3
+user=> 30
+user=> #'twice
+user=> 42
+user=> ["a" \b "c d"]
+user=> 8891
+user=> nil
+other=> "in other"
+other=> other=> 

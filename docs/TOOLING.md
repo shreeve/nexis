@@ -6,10 +6,64 @@ compiler made of a file, a test runner, a pretty-printer and the
 `nexis.math` functions. Each section names the module that
 implements it and the section of the layer contract it rests on.
 
-### 1. Runtime error output (`src/cli.zig`, `src/vm.zig` §13)
+### 1. Commands and error output (`src/cli.zig`, `src/loader.zig`, `src/vm.zig` §13)
 
-A runtime error that no `try` catches ends `nexis run` with exit 5
-and this report on stderr:
+| Command | What it does |
+|---|---|
+| `nexis run FILE [ARG...]` | Runs FILE's top-level forms in order and prints only what the program prints. FILE `-` reads the program from stdin. |
+| `nexis FILE.nx [ARG...]` | The same as `run`. |
+| `nexis -e EXPR [ARG...]` | Evaluates EXPR's forms and prints each value that is not nil, as `pr` does. |
+| `nexis repl` | The read-eval-print loop below. |
+| `nexis test FILE...` | Runs each file, then `(nexis.test/run-all-tests)`; exit 1 when an assertion failed or a test threw. |
+| `nexis disasm FILE` | §2. `--disasm FILE` is the same. |
+| `nexis --help` | The usage, on stderr. |
+
+`*command-line-args*` (in `nexis.core`) is the ARGs as a vector of
+strings, nil when there are none, as in Clojure. A first line that
+begins `#!` is a comment, so a script can be made executable.
+`(exit)` / `(exit n)` ends the process with status n (0 by default)
+after closing every store the program opened; no `finally` runs.
+`(read-line)` returns the next line of stdin without its newline,
+nil at end of input.
+
+| Exit status | Meaning |
+|---|---|
+| 0 | success |
+| 1 | usage error; `nexis test` with a failure or an error |
+| 2 | the file could not be read |
+| 3 | parse or reader error |
+| 4 | compile error |
+| 5 | runtime error that no `try` caught |
+| n | `(exit n)` |
+
+**The REPL** prompts with the current namespace (`user=> `, `foo=> `
+after `(ns foo)`). It reads lines until they hold complete forms, so
+a form may span lines and a line may hold several; it evaluates every
+form and prints each value as `pr` does (`"hello"`, `\a`), whatever
+its size. `*1`, `*2` and `*3` hold the last three values, `*e` the
+last error (the thrown value, or the error's keyword). An error is
+reported and the loop goes on; `:quit`, `:q` or end of input exits.
+Every input's text is kept for the session, so a function defined in
+one input and failing in a later one points into the input that
+defined it.
+
+**Loading.** `(require 'my.app)` reads `my/app.nx` (dots to slashes,
+dashes to underscores) from the working directory or the running
+file's directory. The file's first form must be `(ns my.app ...)`.
+`clojure.string`, `clojure.set`, `clojure.test` and `clojure.pprint`
+name the Vars of `nexis.string`, `nexis.set`, `nexis.test` and
+`nexis.pprint`; the namespaces the runtime installs load from no
+file. A file that cannot be loaded is reported in the file that
+failed: a parse, reader or compile error at its place in the
+required file, `require: no file my/app.nx on the load path`,
+`require: cyclic require of my.app` or `require: PATH does not
+begin with (ns my.app)` at the form that required it.
+
+A compile error is `nexis: PATH:LINE:COL: ErrorName` with the source
+line and a caret under the form (exit 4); a parse or reader error
+the same with `parse error: ...` or `reader error: :kind detail`
+(exit 3). A runtime error that no `try` catches ends the program
+with exit 5 and this report on stderr:
 
 ```
 nexis: test/golden/cli/divide-by-zero.nx:5:4: runtime error: DivideByZero

@@ -44,6 +44,7 @@ const format_mod = @import("format.zig");
 const record_mod = @import("record.zig");
 const protocol_mod = @import("protocol.zig");
 const nextomic_mod = @import("nextomic/root.zig");
+const loader_mod = @import("loader.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -96,35 +97,48 @@ pub fn installCore(ns: *Namespace) !void {
     if (ns.registry) |registry| try installTable(try registry.getOrCreate("nexis.simd", ns), &simd_natives);
 }
 
-/// `db/*`: durable refs and explicit transactions (docs/DB.md).
-pub fn installDb(db_ns: *Namespace) !void {
-    try installTable(db_ns, &db_natives);
+/// Install every namespace of the standard library into the
+/// loader's registry, bootstrap the embedded sources into theirs,
+/// and mark each namespace there loaded, so a `require` of one only
+/// aliases it. The CLI and the test harness boot through here. A
+/// failure is a bug in an embedded source; `loader.diagnostic` says
+/// where.
+pub fn boot(loader: *loader_mod.Loader) !void {
+    const registry = loader.registry;
+    const core = registry.core;
+    try installCore(core);
+    try installTable(try registry.getOrCreate("db", core), &db_natives);
+    try installTable(try registry.getOrCreate("nexis.string", core), &string_natives);
+    try installTable(try registry.getOrCreate("nexis.math", core), &math_natives);
+    try installTable(try registry.getOrCreate("nexis.internal", core), &internal_natives);
+    try nextomic_mod.natives.install(try registry.getOrCreate("nextomic", core));
+    const saved = registry.current;
+    defer registry.current = saved;
+    for (&embedded) |*e| {
+        registry.current = try registry.getOrCreate(e.ns, core);
+        _ = try loader.evalSource(&e.info, .{ .allocator = loader.persistent_allocator, .declare = false });
+    }
+    var names = registry.map.keyIterator();
+    while (names.next()) |name| try loader.markLoaded(name.*);
 }
 
-/// Install the `nextomic/*` natives (docs/NEXTOMIC.md §6) into the
-/// `nextomic` namespace; `NEXTOMIC_NX_SOURCE` adds the sugar on top.
-pub fn installNextomic(nextomic_ns: *Namespace) !void {
-    try nextomic_mod.natives.install(nextomic_ns);
-}
-
-/// `nexis.string/*`: not auto-referred, like Clojure's
-/// `clojure.string`. Installed before core.nx is bootstrapped so
-/// composite definitions may refer to it.
-pub fn installString(string_ns: *Namespace) !void {
-    try installTable(string_ns, &string_natives);
-}
-
-/// `nexis.math/*` (docs/TOOLING.md §4); `MATH_NX_SOURCE` adds the
-/// constants.
-pub fn installMath(math_ns: *Namespace) !void {
-    try installTable(math_ns, &math_natives);
-}
-
-/// The `#%` helpers the `defrecord`, `defprotocol`, `try` and
-/// destructuring expansions call qualified; not for user code.
-pub fn installInternal(internal_ns: *Namespace) !void {
-    try installTable(internal_ns, &internal_natives);
-}
+/// The parts of the library written in nexis, embedded at compile
+/// time and bootstrapped in this order, each with its namespace
+/// current, after the natives are installed: each file may use the
+/// natives and the files before it.
+const Embedded = struct { ns: []const u8, info: vm_mod.SourceInfo };
+const embedded = [_]Embedded{
+    // nexis.core's macros and functions over the natives.
+    .{ .ns = "nexis.core", .info = .{ .path = "core.nx", .text = @embedFile("stdlib/core.nx") } },
+    // Sugar over the Nextomic natives (`with-conn`).
+    .{ .ns = "nextomic", .info = .{ .path = "nextomic.nx", .text = @embedFile("stdlib/nextomic.nx") } },
+    // deftest, is, testing, run-tests (docs/TOOLING.md §3).
+    .{ .ns = "nexis.test", .info = .{ .path = "test.nx", .text = @embedFile("stdlib/test.nx") } },
+    // pprint, pprint-str (docs/TOOLING.md §4).
+    .{ .ns = "nexis.pprint", .info = .{ .path = "pprint.nx", .text = @embedFile("stdlib/pprint.nx") } },
+    // The constants of nexis.math.
+    .{ .ns = "nexis.math", .info = .{ .path = "math.nx", .text = @embedFile("stdlib/math.nx") } },
+};
 
 const core_natives = table("", .{
     // Sequence primitives.
@@ -315,6 +329,8 @@ const core_natives = table("", .{
     .{ "pr-str", 0, null, &fnPrStr },
     .{ "slurp", 1, 1, &fnSlurp },
     .{ "spit", 2, 2, &fnSpit },
+    .{ "read-line", 0, 0, &fnReadLine },
+    .{ "exit", 0, 1, &fnExit },
     // db primitives live in the `db` namespace
     // (installed separately via `installDb`) so they appear as
     // qualified `(db/open ...)` calls.
@@ -396,26 +412,6 @@ const simd_natives = table("nexis.simd", .{
     .{ "scale", 2, 2, &fnSimdScale },
     .{ "map", 2, 2, &fnSimdMap },
 });
-
-/// The part of nexis.core written in nexis itself, embedded at
-/// compile time. Evaluated after `installCore` so its definitions
-/// can use the natives. Add composite macros and fns to
-/// `src/stdlib/core.nx`, not here. A keyword literal in that file
-/// is interned at boot, ahead of every keyword a script reads, and
-/// a map's iteration order is a function of intern order, so the
-/// file builds any keyword it needs at run time (`(keyword "x")`)
-/// and `test/nextomic/*.out` stay as they are.
-pub const CORE_NX_SOURCE: []const u8 = @embedFile("stdlib/core.nx");
-/// The `nextomic` namespace's sugar (`with-conn`), bootstrapped after
-/// `installNextomic` with that namespace current.
-pub const NEXTOMIC_NX_SOURCE: []const u8 = @embedFile("stdlib/nextomic.nx");
-/// `nexis.test` (deftest, is, testing, run-tests), bootstrapped with
-/// that namespace current after core.nx; docs/TOOLING.md §3.
-pub const TEST_NX_SOURCE: []const u8 = @embedFile("stdlib/test.nx");
-/// `nexis.pprint` (pprint, pprint-str); docs/TOOLING.md §4.
-pub const PPRINT_NX_SOURCE: []const u8 = @embedFile("stdlib/pprint.nx");
-/// The constants of `nexis.math`, bootstrapped after `installMath`.
-pub const MATH_NX_SOURCE: []const u8 = @embedFile("stdlib/math.nx");
 
 // =============================================================================
 // Implementations
@@ -3582,6 +3578,38 @@ fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
         else => return VmError.IoError,
     };
     return value_mod.nilValue();
+}
+
+/// The process's stdin, read through one buffer: the REPL's input
+/// and `read-line` share it, so neither loses what the other
+/// buffered. One isolate, one thread.
+var stdin_buf: [64 * 1024]u8 = undefined;
+var stdin_reader: ?std.Io.File.Reader = null;
+
+/// The next line of stdin without its newline, null at end of input;
+/// valid until the next read. A line longer than the buffer is
+/// `error.StreamTooLong`.
+pub fn readStdinLine(io: std.Io) error{ ReadFailed, StreamTooLong }!?[]const u8 {
+    if (stdin_reader == null) stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buf);
+    const line = (try stdin_reader.?.interface.takeDelimiter('\n')) orelse return null;
+    return std.mem.trimEnd(u8, line, "\r");
+}
+
+/// `(read-line)` → the next line of stdin as a string, nil at end
+/// of input.
+fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
+    const line = (readStdinLine(vm.io orelse return VmError.IoError) catch return VmError.IoError) orelse return value_mod.nilValue();
+    return string_mod.fromBytes(vm.ensureHeap(), line) catch VmError.OutOfMemory;
+}
+
+/// `(exit)` / `(exit status)` → ends the process with `status` (0 by
+/// default) after closing every store the program opened; nothing
+/// after it runs, `finally` blocks included, as with Java's
+/// `System/exit`.
+fn fnExit(vm: *VM, args: []const Value) VmError!Value {
+    const status: u8 = if (args.len == 0) 0 else @truncate(@as(u64, @bitCast(try requireFixnum(args[0]))));
+    for (vm.db_connections.items) |conn| db_mod.shutdown(@ptrCast(@alignCast(conn)));
+    std.process.exit(status);
 }
 
 // =============================================================================
