@@ -30,7 +30,6 @@ const std = @import("std");
 const nx = @import("nexis");
 const value = nx.value;
 const heap_mod = nx.heap;
-const hash_mod = nx.hash;
 const list_mod = nx.list;
 const vector_mod = nx.vector;
 const dispatch = nx.dispatch;

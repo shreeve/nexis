@@ -18,6 +18,14 @@ convention; there is no `test/unit/`.
 
 Property and integration files import the runtime as one module:
 `const nx = @import("nexis");` then `nx.vm`, `nx.nextomic` and so on.
+`test/harness.zig` (module `harness`) is the pipeline harness they
+share: `Program` boots a VM the way `bin/nexis` does (every namespace,
+every embedded source), `expectOutput` / `expectCheckedOutput` /
+`expectError` run one program per assertion, and `Store` names a
+store under the test's own temporary directory. Each program's
+allocator is leak-checked without per-allocation stack traces, so a
+fresh VM per assertion costs milliseconds and a leak still fails the
+test.
 
 ## Two build steps for two loops
 

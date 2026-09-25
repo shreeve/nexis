@@ -12,13 +12,11 @@ notes.txt
 # `zig build bench -- --out bench/baseline.json`.
 bench/*.json
 
-# Phase 4: emdb data files (created during testing).
-# Examples that use relative paths now write to `tmp/` (see
-# `examples/todo-app.nx`, `examples/durable-refs.nx`). `db/open`
-# auto-creates the path's parent directories (Phase 5.2a polish),
-# so `tmp/` doesn't need to exist at clone time — the CLI creates
-# it on first run. The bare patterns below catch stragglers from
-# REPL sessions or ad-hoc commands run from the repo root.
+# Store files left by a REPL session or an ad-hoc run from the repo
+# root. Examples write under tmp/ (`db/open` creates the parent
+# directories); tests and benches write under .zig-cache/tmp/.
 *.edb
 *.edb-lock
+*.emdb
+*.emdb-lock
 tmp/

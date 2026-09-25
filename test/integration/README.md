@@ -4,9 +4,13 @@ End-to-end suites that run source through the whole pipeline
 (`.nx` text → reader → Form → macroexpansion → bytecode → VM → result)
 and Nextomic through its public Zig API:
 
+The language suites run programs through `test/harness.zig`: one VM
+per assertion, booted as `bin/nexis` boots one, each top-level form
+compiled and run in order; every run asserts the VM's stack length
+and frame depth are restored.
+
 - `eval_pipeline.zig`: every primitive core form, every macro, every
-  try/catch/finally path, VM stack discipline across nested calls
-  (each run asserts the stack length and frame depth are restored),
+  try/catch/finally path, VM stack discipline across nested calls,
   and the `db/*` seam; each store-backed test opens its own store
   under `.zig-cache/tmp/` and deletes it.
 - `runtime_polish.zig`: the Clojure-fidelity rules of the sequence

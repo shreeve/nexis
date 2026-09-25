@@ -54,7 +54,6 @@ const emdb = nx.emdb;
 const pool_mod = nx.pool;
 const vm_mod = nx.vm;
 const compile_mod = nx.compile;
-const expand_mod = nx.expand;
 
 const Value = value_mod.Value;
 const Heap = heap_mod.Heap;

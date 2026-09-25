@@ -20,7 +20,6 @@ const std = @import("std");
 const nx = @import("nexis");
 const value = nx.value;
 const heap_mod = nx.heap;
-const hash_mod = nx.hash;
 const intern_mod = nx.intern;
 const bignum = nx.bignum;
 const vector_mod = nx.vector;

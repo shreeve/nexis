@@ -30,13 +30,11 @@ const compile = nx.compile;
 const intern_mod = nx.intern;
 const reader_mod = nx.reader;
 const expand_mod = nx.expand;
-const list_mod = nx.list;
-const vector_mod = nx.vector;
-const champ_mod = nx.champ;
 const stdlib = nx.stdlib;
 const string_mod = nx.string;
 const format_mod = nx.format;
 const loader_mod = nx.loader;
+const harness = @import("harness");
 
 const testing = std.testing;
 
@@ -51,204 +49,25 @@ fn formatValue(buf: *std.array_list.Managed(u8), v: value_mod.Value, interner: *
     try buf.appendSlice(w.written());
 }
 
-/// Compile + run one embedded source (core.nx, test.nx, pprint.nx)
-/// into `ns` against `v` so test programs can use its definitions.
-/// Uses the VM's runtime arena as the compile arena so closures +
-/// routines outlive bootstrap.
-fn bootstrapEmbeddedForTest(
-    v: *vm.VM,
-    ns: *vm.Namespace,
-    source: []const u8,
-    interner: *intern_mod.Interner,
-    host_macros: *const expand_mod.HostMacroTable,
-) !void {
-    var parse_result = try reader_mod.parser.parseProgram(testing.allocator, source);
-    defer parse_result.parser.deinit();
-    var rdr = reader_mod.Reader.init(testing.allocator, source);
-    defer rdr.deinit();
-    const forms = try rdr.readProgram(parse_result.sexp);
-    const ra = v.runtime_arena.allocator();
-    for (forms) |form| {
-        const compiled = try compile.compileFormFullWithMacrosSpanPersistent(
-            ra,
-            form,
-            ns,
-            interner,
-            host_macros,
-            null,
-            ra,
-        );
-        const routine = compiled.toRoutine("core-nx-test");
-        try v.retargetTop(&routine);
-        _ = try v.run();
-    }
-}
+/// A VM booted as `bin/nexis` boots one, ready to run one program of
+/// top-level forms (test/harness.zig).
+const Program = harness.Program;
 
-/// Every frame the VM pushes during a run is popped by return or
-/// unwind before the top-level form halts, and each pop restores
-/// the backing stack to the length recorded at that frame's entry,
-/// so a completed run leaves both the stack length and the frame
-/// depth exactly where they started.
-fn expectStackRestored(v: *vm.VM, stack_len_before: usize, frame_depth_before: usize) !void {
-    try testing.expectEqual(stack_len_before, v.stack.items.len);
-    try testing.expectEqual(frame_depth_before, v.frames.items.len);
-}
+/// Run `src` form by form, as `nexis run` does, and assert the last
+/// form's printed value equals `expected`.
+const expectOutput = harness.expectOutput;
 
-/// A VM with core, `db`, `nexis.string` and `nexis.internal`
-/// installed and core.nx, test.nx and pprint.nx bootstrapped, ready
-/// to run one program of top-level forms. Integration tests leave
-/// `v.io` null (see `expectOutput`).
-const Program = struct {
-    arena: std.heap.ArenaAllocator,
-    v: vm.VM,
-    host_macros: expand_mod.HostMacroTable,
-    hooks: compile.RuntimeHooks,
-    registry: *vm.NamespaceRegistry,
-    interner: *intern_mod.Interner,
-
-    const stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-
-    fn init(self: *Program) !void {
-        self.arena = std.heap.ArenaAllocator.init(testing.allocator);
-        errdefer self.arena.deinit();
-        self.v = try vm.VM.init(testing.allocator, &stub);
-        errdefer self.v.deinit();
-        self.interner = self.v.ensureInterner();
-        self.registry = try self.v.ensureRegistry();
-        try stdlib.installCore(self.registry.core);
-        const db_ns = try self.registry.getOrCreate("db", self.registry.core);
-        try stdlib.installDb(db_ns);
-        const string_ns = try self.registry.getOrCreate("nexis.string", self.registry.core);
-        try stdlib.installString(string_ns);
-        const internal_ns = try self.registry.getOrCreate("nexis.internal", self.registry.core);
-        try stdlib.installInternal(internal_ns);
-        self.host_macros = try expand_mod.defaultMacros(testing.allocator);
-        errdefer self.host_macros.deinit(testing.allocator);
-        const test_ns = try self.registry.getOrCreate("nexis.test", self.registry.core);
-        const pprint_ns = try self.registry.getOrCreate("nexis.pprint", self.registry.core);
-        const saved_current = self.registry.current;
-        self.registry.current = self.registry.core;
-        try bootstrapEmbeddedForTest(&self.v, self.registry.core, stdlib.CORE_NX_SOURCE, self.interner, &self.host_macros);
-        self.registry.current = test_ns;
-        try bootstrapEmbeddedForTest(&self.v, test_ns, stdlib.TEST_NX_SOURCE, self.interner, &self.host_macros);
-        self.registry.current = pprint_ns;
-        try bootstrapEmbeddedForTest(&self.v, pprint_ns, stdlib.PPRINT_NX_SOURCE, self.interner, &self.host_macros);
-        self.registry.current = saved_current;
-        self.hooks = .{ .host_macros = &self.host_macros, .registry = self.registry, .interner = self.interner };
-        self.hooks.install(&self.v);
-    }
-
-    fn deinit(self: *Program) void {
-        self.host_macros.deinit(testing.allocator);
-        self.v.deinit();
-        self.arena.deinit();
-    }
-
-    /// Run every top-level form of `src` in order (matching
-    /// runFile semantics); the last form's value is the result.
-    fn run(self: *Program, src: []const u8) !value_mod.Value {
-        return self.runWith(src, false, null);
-    }
-
-    /// `run` the way the CLI runs a file: every name the program
-    /// defines is declared up front and any other unresolved
-    /// symbol is a compile error whose span lands in `out_span`.
-    fn runChecked(self: *Program, src: []const u8, out_span: ?*?reader_mod.SrcSpan) !value_mod.Value {
-        return self.runWith(src, true, out_span);
-    }
-
-    fn runWith(self: *Program, src: []const u8, checked: bool, out_span: ?*?reader_mod.SrcSpan) !value_mod.Value {
-        var parse_result = try reader_mod.parser.parseProgram(testing.allocator, src);
-        defer parse_result.parser.deinit();
-        var rdr = reader_mod.Reader.init(testing.allocator, src);
-        defer rdr.deinit();
-        const forms = try rdr.readProgram(parse_result.sexp);
-
-        var declared = compile.DeclaredNames.init(testing.allocator);
-        defer declared.deinit();
-        if (checked) for (forms) |form| try declared.declareForm(form);
-
-        var last_result: value_mod.Value = value_mod.nilValue();
-        for (forms) |form| {
-            // Re-read current per form so (ns NAME) takes effect.
-            const current_ns = self.registry.current;
-            const compiled = try compile.compileFormFullWithMacrosSpanPersistentRegistryLoader(
-                self.arena.allocator(),
-                form,
-                current_ns,
-                self.interner,
-                &self.host_macros,
-                out_span,
-                self.v.runtime_arena.allocator(),
-                self.registry,
-                null,
-                if (checked) &declared else null,
-            );
-            const routine = compiled.toRoutine("test-form");
-            try self.v.retargetTop(&routine);
-            const stack_len_before = self.v.stack.items.len;
-            const frame_depth_before = self.v.frames.items.len;
-            last_result = try self.v.run();
-            try expectStackRestored(&self.v, stack_len_before, frame_depth_before);
-        }
-        return last_result;
-    }
-};
-
-/// Multi-form test helper that processes top-level
-/// forms sequentially (matching runFile semantics). Use this
-/// when `(ns NAME)` switching needs to affect subsequent
-/// forms within the same test. The final form's value is the
-/// "result".
-fn expectOutputProgram(src: []const u8, expected: []const u8) !void {
-    var program: Program = undefined;
-    try program.init();
-    defer program.deinit();
-    const last_result = try program.run(src);
-
-    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
-    defer buf.deinit();
-    try formatValue(&buf, last_result, program.interner);
-    testing.expectEqualStrings(expected, buf.items) catch |err| {
-        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
-        return err;
-    };
-}
+/// `expectOutput` for a program whose `(ns NAME)` switches affect
+/// the forms after it; the same helper.
+const expectOutputProgram = harness.expectOutput;
 
 /// Run `src` as a program and assert it fails with `expected`
 /// instead of producing a value.
-fn expectProgramError(src: []const u8, expected: anyerror) !void {
-    var program: Program = undefined;
-    try program.init();
-    defer program.deinit();
-    try testing.expectError(expected, program.run(src));
-}
+const expectProgramError = harness.expectError;
 
-/// A store file for one test under `.zig-cache/tmp/<unique>/`, the
-/// way `store.TestDir` scopes its files: concurrent runs never share
-/// it and `deinit` removes the directory with the store inside.
-const SeamStore = struct {
-    tmp: std.testing.TmpDir,
-    path: []u8,
-
-    fn init(name: []const u8) !SeamStore {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/{s}.edb", .{ tmp.sub_path, name });
-        return .{ .tmp = tmp, .path = path };
-    }
-
-    fn deinit(self: *SeamStore) void {
-        testing.allocator.free(self.path);
-        self.tmp.cleanup();
-    }
-
-    /// `template` with every `@STORE@` replaced by this store's path.
-    fn source(self: *const SeamStore, template: []const u8) ![]u8 {
-        return std.mem.replaceOwned(u8, testing.allocator, template, "@STORE@", self.path);
-    }
-};
+/// A store file for one test under `.zig-cache/tmp/<unique>/`:
+/// concurrent runs never share it and `deinit` removes it.
+const SeamStore = harness.Store;
 
 /// `expectOutputProgram` for a program that opens the store named
 /// `@STORE@` in `template`; the store is private to the call and
@@ -268,75 +87,6 @@ fn expectProgramErrorWithStore(name: []const u8, template: []const u8, expected:
     const src = try store.source(template);
     defer testing.allocator.free(src);
     try expectProgramError(src, expected);
-}
-
-/// Run `src` end-to-end and assert the printed output equals
-/// `expected`. Wraps multiple top-level forms in an implicit do
-/// so callers can write multi-form programs naturally.
-fn expectOutput(src: []const u8, expected: []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var stub_code = [_]vm.Inst{vm.asm_.returnNil()};
-    const stub = vm.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm.VM.init(testing.allocator, &stub);
-    defer v.deinit();
-    // Tests leave `v.io` null; see the I/O error-path tests for
-    // the contract.
-    const interner = v.ensureInterner();
-    // Set up the namespace registry so tests can
-    // exercise `(ns NAME)` + qualified symbol resolution.
-    const registry = try v.ensureRegistry();
-    // Install core native fns into nexis.core (auto-
-    // referred by user via parent).
-    try stdlib.installCore(registry.core);
-    // Install the db namespace so qualified `db/...`
-    // calls and the `db/deref` alias resolve in tests.
-    const db_ns_single = try registry.getOrCreate("db", registry.core);
-    try stdlib.installDb(db_ns_single);
-    // nexis.string namespace (qualified-only).
-    const string_ns_single = try registry.getOrCreate("nexis.string", registry.core);
-    try stdlib.installString(string_ns_single);
-    // nexis.internal (qualified-only macro scaffolding).
-    const internal_ns_single = try registry.getOrCreate("nexis.internal", registry.core);
-    try stdlib.installInternal(internal_ns_single);
-    var host_macros = try expand_mod.defaultMacros(testing.allocator);
-    defer host_macros.deinit(testing.allocator);
-    // Bootstrap the composite core.nx layer into core.
-    const saved_current = registry.current;
-    registry.current = registry.core;
-    try bootstrapEmbeddedForTest(&v, registry.core, stdlib.CORE_NX_SOURCE, interner, &host_macros);
-    registry.current = saved_current;
-    var hooks = compile.RuntimeHooks{ .host_macros = &host_macros, .registry = registry, .interner = interner };
-    hooks.install(&v);
-
-    // Each test compiles in the CURRENT namespace
-    // (initially user). `(ns NAME)` in src can switch mid-test.
-    const current_ns = registry.current;
-    const compiled = try compile.compileSourceFullWithMacrosSpanPersistentRegistry(
-        arena.allocator(),
-        src,
-        current_ns,
-        interner,
-        &host_macros,
-        null,
-        v.runtime_arena.allocator(),
-        registry,
-    );
-    const routine = compiled.toRoutine("integration");
-    try v.retargetTop(&routine);
-    const stack_len_before = v.stack.items.len;
-    const frame_depth_before = v.frames.items.len;
-    const result = try v.run();
-    try expectStackRestored(&v, stack_len_before, frame_depth_before);
-
-    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
-    defer buf.deinit();
-    try formatValue(&buf, result, interner);
-
-    testing.expectEqualStrings(expected, buf.items) catch |err| {
-        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
-        return err;
-    };
 }
 
 // =============================================================================

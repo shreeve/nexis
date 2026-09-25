@@ -34,7 +34,6 @@ const std = @import("std");
 const nx = @import("nexis");
 const value = nx.value;
 const heap_mod = nx.heap;
-const hash_mod = nx.hash;
 const intern_mod = nx.intern;
 const string = nx.string;
 const bignum = nx.bignum;
@@ -63,17 +62,19 @@ const tree_names = [_][]const u8{
 // Temp DB path helpers
 // =============================================================================
 
+/// A store path in a fresh directory under `.zig-cache/tmp/`, so
+/// concurrent runs never share a file; `cleanupDb` removes the
+/// directory with the store in it.
 fn tmpDbPath(allocator: std.mem.Allocator, suffix: []const u8) ![:0]u8 {
-    const path = try std.fmt.allocPrintSentinel(allocator, "test_nexis_dbprop_{s}.emdb", .{suffix}, 0);
-    cleanupDb(path);
-    return path;
+    var tmp = std.testing.tmpDir(.{});
+    tmp.dir.close(std.testing.io);
+    tmp.parent_dir.close(std.testing.io);
+    return std.fmt.allocPrintSentinel(allocator, ".zig-cache/tmp/{s}/{s}.emdb", .{ tmp.sub_path, suffix }, 0);
 }
 
 fn cleanupDb(path: [:0]const u8) void {
-    _ = std.c.unlink(path.ptr);
-    var buf: [256]u8 = undefined;
-    const lock_path = std.fmt.bufPrintSentinel(&buf, "{s}-lock", .{path}, 0) catch return;
-    _ = std.c.unlink(lock_path.ptr);
+    const dir = std.fs.path.dirname(path) orelse return;
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
 }
 
 // =============================================================================
@@ -207,15 +208,11 @@ const Gen = struct {
 
 // =============================================================================
 // D1. 10k Values across 5 named trees (PLAN §20.2 test #6)
-//
-// Partitioned into 5 × 2000-trial sub-tests so that a single sub-
-// test's runtime stays reasonable (matches the codec C1 shape).
-// Each sub-test is independent — fresh DB file, fresh Connection,
-// fresh heap, fresh interner, fresh PRNG seed offset.
 // =============================================================================
 
-fn runD1Partition(suffix: []const u8, seed_offset: u64, trials: usize) !void {
-    const path = try tmpDbPath(std.testing.allocator, suffix);
+test "D1: 10000 random Values across 5 trees read back equal after commit" {
+    const trials: usize = 10_000;
+    const path = try tmpDbPath(std.testing.allocator, "d1");
     defer std.testing.allocator.free(path);
     defer cleanupDb(path);
 
@@ -231,7 +228,7 @@ fn runD1Partition(suffix: []const u8, seed_offset: u64, trials: usize) !void {
     );
     defer db.close(&conn);
 
-    var prng = std.Random.DefaultPrng.init(prng_seed +% seed_offset);
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 1);
     var gen = Gen{ .ctx = &ctx, .r = prng.random() };
 
     // Pre-generate the values and their (tree_idx, key_bytes) slots
@@ -294,22 +291,6 @@ fn runD1Partition(suffix: []const u8, seed_offset: u64, trials: usize) !void {
         }
         try std.testing.expectEqual(rec.hash_val, dispatch.hashValue(got));
     }
-}
-
-test "D1a: 2000 random Values across 5 trees (partition 1/5)" {
-    try runD1Partition("d1a", 1, 2000);
-}
-test "D1b: 2000 random Values across 5 trees (partition 2/5)" {
-    try runD1Partition("d1b", 2, 2000);
-}
-test "D1c: 2000 random Values across 5 trees (partition 3/5)" {
-    try runD1Partition("d1c", 3, 2000);
-}
-test "D1d: 2000 random Values across 5 trees (partition 4/5)" {
-    try runD1Partition("d1d", 4, 2000);
-}
-test "D1e: 2000 random Values across 5 trees (partition 5/5, 10k in total)" {
-    try runD1Partition("d1e", 5, 2000);
 }
 
 // =============================================================================

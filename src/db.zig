@@ -601,18 +601,19 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
 // Inline tests
 // =============================================================================
 
+/// A store path in a fresh directory under `.zig-cache/tmp/`, so
+/// concurrent runs never share a file; `cleanupDb` removes the
+/// directory with the store in it.
 fn tmpDbPath(allocator: std.mem.Allocator, suffix: []const u8) ![:0]u8 {
-    const base = "test_nexis_db_";
-    const path = try std.fmt.allocPrintSentinel(allocator, "{s}{s}.emdb", .{ base, suffix }, 0);
-    cleanupDb(path);
-    return path;
+    var tmp = std.testing.tmpDir(.{});
+    tmp.dir.close(std.testing.io);
+    tmp.parent_dir.close(std.testing.io);
+    return std.fmt.allocPrintSentinel(allocator, ".zig-cache/tmp/{s}/{s}.emdb", .{ tmp.sub_path, suffix }, 0);
 }
 
 fn cleanupDb(path: [:0]const u8) void {
-    _ = std.c.unlink(path.ptr);
-    var buf: [256]u8 = undefined;
-    const lock_path = std.fmt.bufPrintSentinel(&buf, "{s}-lock", .{path}, 0) catch return;
-    _ = std.c.unlink(lock_path.ptr);
+    const dir = std.fs.path.dirname(path) orelse return;
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
 }
 
 fn synthHash(v: Value) u64 {

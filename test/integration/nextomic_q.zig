@@ -20,7 +20,6 @@ const list_mod = nx.list;
 const vector_mod = nx.vector;
 const champ = nx.champ;
 const dispatch = nx.dispatch;
-const reader_mod = nx.reader;
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;

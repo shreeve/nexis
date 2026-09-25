@@ -83,6 +83,12 @@ pub fn build(b: *std.Build) void {
         .{ .path = "test/integration/nextomic_fn.zig", .nextomic = true },
         .{ .path = "test/integration/nextomic_entity.zig", .nextomic = true },
     };
+    const harness = b.createModule(.{
+        .root_source_file = b.path("test/harness.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    harness.addImport("nexis", nexis);
     for (suites) |suite| {
         const module = b.createModule(.{
             .root_source_file = b.path(suite.path),
@@ -90,6 +96,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         module.addImport("nexis", nexis);
+        module.addImport("harness", harness);
         const name = std.fs.path.stem(suite.path);
         const run = b.addRunArtifact(b.addTest(.{ .name = name, .root_module = module }));
         test_step.dependOn(&run.step);
