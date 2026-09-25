@@ -1562,13 +1562,15 @@ const Ctx = struct {
     /// `:db/unique` backfills AVET from AEVT; none of them is retracted.
     fn applySchema(self: *Ctx) !void {
         if (!self.schema_touched) return;
-        var new_attrs: std.AutoHashMapUnmanaged(u32, struct { has_type: bool = false, has_card: bool = false, many: bool = false, string: bool = false }) = .empty;
+        var new_attrs: std.AutoHashMapUnmanaged(u32, struct { value_type: ?key.ValueType = null, has_card: bool = false, many: bool = false }) = .empty;
         var backfill: std.AutoHashMapUnmanaged(u32, *const Attr) = .empty;
         var unique_added: std.AutoHashMapUnmanaged(u32, void) = .empty;
         // Attributes gaining `:db/fulltext true`: existing ones backfill
         // the tokens tree, new ones must be strings.
         var fulltext_backfill: std.AutoHashMapUnmanaged(u32, *const Attr) = .empty;
         var fulltext_new: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        // Attributes gaining `:db/isComponent true`, which must be refs.
+        var components: std.AutoHashMapUnmanaged(u32, void) = .empty;
         const fulltext_aid = self.conn.store.fulltext_aid;
         // The card-one overwrite of `:db/cardinality` retracts the old
         // value beside the new one; that retraction is the change, not
@@ -1582,8 +1584,9 @@ const Ctx = struct {
             const a: u32 = @intCast(p.e);
             const existing = self.schema.attr(a);
             if (p.attr.id == fulltext_aid) {
-                if (!p.added) return self.conflict(p.e, p.attr.id);
-                if (!p.v.boolean) continue;
+                // A `false` flag gives way to `true`; `true` stays.
+                if (!p.added and p.v.boolean) return self.conflict(p.e, p.attr.id);
+                if (!p.added or !p.v.boolean) continue;
                 if (existing) |ex| {
                     if (ex.value_type != .string) return self.schemaRefused(a, null, ":db/fulltext takes a string attribute");
                     if (!ex.fulltext) try fulltext_backfill.put(self.arena, a, ex);
@@ -1595,8 +1598,7 @@ const Ctx = struct {
                     if (!p.added or existing != null) return self.conflict(p.e, p.attr.id);
                     const g = try new_attrs.getOrPut(self.arena, a);
                     if (!g.found_existing) g.value_ptr.* = .{};
-                    g.value_ptr.has_type = true;
-                    g.value_ptr.string = p.v.keyword == boot.type_string;
+                    g.value_ptr.value_type = boot.valueTypeOf(p.v.keyword);
                 },
                 boot.cardinality => {
                     const many = p.v.keyword == boot.card_many;
@@ -1615,9 +1617,10 @@ const Ctx = struct {
                     g.value_ptr.has_card = true;
                     if (many) g.value_ptr.many = true;
                 },
+                boot.is_component => if (p.added and p.v.boolean) try components.put(self.arena, a, {}),
                 boot.unique, boot.index => {
-                    if (!p.added) return self.conflict(p.e, p.attr.id);
-                    if (p.attr.id == boot.index and !p.v.boolean) continue;
+                    if (!p.added and (p.attr.id == boot.unique or p.v.boolean)) return self.conflict(p.e, p.attr.id);
+                    if (!p.added or (p.attr.id == boot.index and !p.v.boolean)) continue;
                     if (p.attr.id == boot.unique) try unique_added.put(self.arena, a, {});
                     if (existing) |ex| {
                         if (!ex.inAvet()) {
@@ -1632,7 +1635,7 @@ const Ctx = struct {
         }
         var it = new_attrs.iterator();
         while (it.next()) |e| {
-            if (!e.value_ptr.has_type or !e.value_ptr.has_card) return self.malformed("a new attribute needs :db/valueType and :db/cardinality");
+            if (e.value_ptr.value_type == null or !e.value_ptr.has_card) return self.malformed("a new attribute needs :db/valueType and :db/cardinality");
         }
         // A unique attribute identifies one entity by one value, so it
         // is card-one.
@@ -1644,7 +1647,12 @@ const Ctx = struct {
         var fit = fulltext_new.keyIterator();
         while (fit.next()) |a| {
             const n = new_attrs.get(a.*) orelse return self.schemaRefused(a.*, null, ":db/fulltext takes a string attribute");
-            if (!n.string) return self.schemaRefused(a.*, null, ":db/fulltext takes a string attribute");
+            if (n.value_type != .string) return self.schemaRefused(a.*, null, ":db/fulltext takes a string attribute");
+        }
+        var cit = components.keyIterator();
+        while (cit.next()) |a| {
+            const vt = if (self.schema.attr(a.*)) |ex| ex.value_type else if (new_attrs.get(a.*)) |n| n.value_type else null;
+            if (vt != .ref) return self.schemaRefused(a.*, null, ":db/isComponent takes a ref attribute");
         }
         var bit = backfill.iterator();
         while (bit.next()) |e| try self.backfillAvet(e.value_ptr.*);
@@ -3488,7 +3496,6 @@ test "an ident rename retires the old name; cardinality changes under the data's
     const db6 = try tc.conn.db();
     try testing.expect(!(try db6.attr(name)).?.many());
     try testing.expect((try db6.asOf(r5.t).attr(name)).?.many());
-    try testing.expectEqual(@as(usize, 3), (try db6.attr(name)).?.card_changes.len);
     // The card-one rule applies from the next transaction on.
     const r7 = try transactOps(tc.conn, arena, &.{
         .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Anne" } } } },

@@ -243,16 +243,17 @@ so there is no queue; emdb's write lock is the transactor.
      `:nextomic/schema` naming the attribute and an entity. The
      cardinality in force at each basis is kept (§4), so an as-of view
      reads sets or scalars as its time saw them.
-   - `:db/index` and `:db/unique` may be added, never retracted
-     (`:nextomic/conflict`), and the transaction that adds them
+   - `:db/index true` and `:db/unique` may be added, never retracted
+     (`:nextomic/conflict`; an explicit `:db/index false` gives way to
+     `true`), and the transaction that adds them
      backfills AVET from AEVT (an attribute becoming unique while two
      entities hold one value is `:nextomic/unique`). A unique attribute
      identifies one entity by one value, so it is cardinality one:
      `:db/unique` on a card-many attribute is `:nextomic/tx-data`, and
      a unique attribute becoming card-many `:nextomic/schema`.
    - `:db/fulltext true` may be added to a string attribute, never
-     retracted (`:nextomic/conflict`); on any other value type it is
-     `:nextomic/schema`. The transaction that adds it backfills
+     retracted (`:nextomic/conflict`; an explicit `false` gives way to
+     `true`); on any other value type it is `:nextomic/schema`. The transaction that adds it backfills
      `nx/fulltext` from the attribute's current values, and from then
      on every assertion and retraction of one of its string values
      puts or deletes that value's token rows in the same write.
@@ -268,7 +269,9 @@ so there is no queue; emdb's write lock is the transactor.
      are untouched, so the rename writes no datom; the transaction's
      entry holds only its `:db/txInstant`. An ident on a user-partition
      entity is `:nextomic/conflict`.
-   - `:db/doc` and `:db/isComponent` are ordinary card-one attributes.
+   - `:db/isComponent true` takes a ref attribute (`:nextomic/schema`
+     otherwise) and may be set false again; `:db/doc` is an ordinary
+     card-one attribute.
 6. **Write**: for each assertion, put into the current trees (value
    `[t]`, plus the payload in `nx/eavt` for out-of-line values) and
    append `[.. top]` with `added = 1` to the history trees; for each
@@ -358,20 +361,18 @@ prefix; consecutive keys with equal `(e a v)` form a group in ascending
 `t`; keep the last `added` among datoms inside the window; on group end
 emit the group's newest kept datom iff its `added` is 1.
 
-**Schema as-of.** `Schema` is built from the attribute partition's
-datoms with `t ≤ basis`, cached per `(store, basis)`; a cache built at
-a later basis serves an earlier one: attributes created after it are
-hidden; `:db/index`, `:db/unique`, `:db/isComponent` and `:db/fulltext`
-are each masked by the `t` of its own assertion, so an attribute
-indexed at one `t` and made unique at a later one is indexed and not
-unique in a view between them (`schema` shows it so, and a lookup ref
-on it is refused there); and an attribute whose cardinality has changed
-carries the timeline of its `:db/cardinality` assertions, read from the
-history tree, so the cardinality in force at the earlier basis is what
-`entity`, `pull` and the planner see. A flag reads its assertion in
-force alone: `:db/isComponent`, the one of the four that may be set
-false again, reads as false in every view before the assertion in
-force, even one that saw an earlier `true`.
+**Schema as-of.** `Schema` is built at the newest basis from the
+history of the attribute partition: every assertion and retraction of
+`:db/valueType`, `:db/cardinality`, `:db/unique`, `:db/index`,
+`:db/isComponent` and `:db/fulltext` on an attribute is one event of its
+timeline. The cache serves every earlier basis by replaying each
+attribute's timeline up to it: attributes created after it are hidden,
+and every flag and the cardinality read as that basis saw them, so an
+attribute indexed at one `t` and made unique at a later one is indexed
+and not unique in a view between them (`schema` shows it so, and a
+lookup ref on it is refused there), and a component flag set false
+later still reads true, and pulls the component whole, in a view
+before that.
 
 The txlog is the change feed: `(d/tx-range conn from to)` scans
 `nx/txlog` over `from ≤ t < to`; a bound that is `nil` or not given is
@@ -633,7 +634,7 @@ keyword. The shapes:
 | `:nextomic/no-entity` | bare |
 | `:nextomic/tx-data` | `:message`; `:attr` when an attribute is at fault |
 | `:nextomic/tx-fn` | `:message`: the unbound symbol, or the depth limit |
-| `:nextomic/schema` | `:message` and `:attr`; `:e`, the entity holding two values, when one refuses many → one; `:db/fulltext` on a non-string attribute names the attribute |
+| `:nextomic/schema` | `:message` and `:attr`; `:e`, the entity holding two values, when one refuses many → one; `:db/fulltext` on a non-string attribute and `:db/isComponent true` on a non-ref attribute name the attribute |
 | `:nextomic/cas` | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
 | `:nextomic/query-syntax` | `:message`; `:clause`, the index into `:where`, when the parser or planner was inside a clause (an unbound function name is reported the same way at run time). A scoping refusal names what is wrong: the variable an `or` branch mentions and another does not, the join variable an `or-join` branch leaves unbound, the variable a `not` body has that nothing outside binds, the argument or function-position variable no clause ever binds |
 | `:nextomic/pull-syntax` | `:message`; `:clause`, the index of the spec in the pattern (from `pull`, `pull-many` or a `(pull ?e pattern)` find element) |

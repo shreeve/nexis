@@ -242,7 +242,7 @@ pub const Conn = struct {
             s.deinit();
             self.schema_cache = null;
         }
-        const s = try Schema.build(self.gpa, self.store, txn, now, now);
+        const s = try Schema.build(self.gpa, self.store, txn, now);
         self.schema_cache = s;
         return s;
     }
