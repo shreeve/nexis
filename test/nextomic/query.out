@@ -36,6 +36,8 @@ Cy
 ([Ann] [Di] [Flo])
 ([Bob] [Edward])
 ([Di] [Flo])
+([Ann false] [Bob false] [Cy true] [Di false] [Edward true] [Flo true])
+([Ann false] [Bob false] [Cy false] [Di true] [Edward false] [Flo true])
 ([Ann] [Cy] [Di] [Edward] [Flo])
 ([Ann] [Bob] [Di])
 ([Ann] [Bob] [Cy] [Di] [Edward] [Flo])

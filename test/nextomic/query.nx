@@ -122,6 +122,8 @@
 (println (rows (d/q '[:find ?n :where [?e :person/age ?a] [(< 26 ?a 41)] [?e :person/name ?n]] db)))
 (println (rows (d/q '[:find ?n :where [?e :person/name ?n] [(not= ?n "Ann")] [?e :person/role _]] db)))
 (println (rows (d/q '[:find ?n :where [?e :person/name ?n] [(missing? $ ?e :person/tags)]] db)))
+(println (rows (d/q '[:find ?n ?old :where [?e :person/name ?n] [?e :person/age ?a] [(>= ?a 33) ?old]] db)))
+(println (rows (d/q '[:find ?n ?untagged :where [?e :person/name ?n] [(missing? $ ?e :person/tags) ?untagged]] db)))
 (println (rows (d/q '[:find ?n :where [?e :person/age ?a] [(adult? ?a)] [?e :person/name ?n]] db)))
 (println (rows (d/q '[:find ?n :where [?e :person/age ?a] [(even? ?a)] [?e :person/name ?n]] db)))
 (println (rows (d/q '[:find ?n :where [?e :person/name ?n] [(string? ?n)]] db)))

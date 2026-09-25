@@ -496,7 +496,7 @@ pub const Exec = struct {
                     },
                     .tuple => .{ .tuple = cells },
                     .fulltext => .{ .tuples = try self.fulltextHits(b.call.args[0].src, cells[1], cells[2]) },
-                    .lt, .le, .gt, .ge, .eq, .ne, .missing => unreachable,
+                    .lt, .le, .gt, .ge, .eq, .ne, .missing => .{ .cell = .{ .boolean = try self.builtinPred(bi, b.call.args, cells) } },
                 },
                 .user => |sym| .{ .value = try self.callUser(sym, cells) },
                 .variable => |f| .{ .value = try self.applyVar(&rel, i, f, cells) },

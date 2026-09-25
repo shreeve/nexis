@@ -610,16 +610,15 @@ const Parser = struct {
         return .{ .bind = .{ .call = call, .out = try self.parseBinding(parts[1]) } };
     }
 
-    /// A built-in's arity and role: predicates stand alone, functions
-    /// need a binding form.
+    /// A built-in's arity and role: a comparison or `missing?` stands
+    /// alone as a predicate or binds its boolean; a function needs a
+    /// binding form.
     fn checkBuiltin(self: *Parser, b: ir.Builtin, args: []const ir.Arg, predicate: bool) Error!void {
         switch (b) {
             .lt, .le, .gt, .ge, .eq, .ne => {
-                if (!predicate) return self.fail("a comparison is a predicate; it binds nothing");
                 if (args.len < 2) return self.fail("a comparison needs at least two arguments");
             },
             .missing => {
-                if (!predicate) return self.fail("missing? is a predicate; it binds nothing");
                 if (args.len != 3 or args[0] != .src) return self.fail("missing? is (missing? $ ?e :attr)");
             },
             .ground => {
@@ -1171,7 +1170,6 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
     // Built-in arity and role are checked here, with a reason.
     for ([_]Value{
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.lst(&.{ b.sym("<"), b.sym("?v") })}) }),
-        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("<"), b.sym("?v"), b.int(3) }), b.sym("?x") }) }),
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.lst(&.{ b.sym("missing?"), b.sym("?e"), b.kw("a") })}) }),
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("ground"), b.int(1), b.int(2) }), b.sym("?x") }) }),
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("get-else"), b.sym("?e"), b.kw("a"), b.int(0) }), b.sym("?x") }) }),
@@ -1184,6 +1182,11 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
         try testing.expect(diag.message.len > 0);
         try testing.expectEqual(@as(?usize, 1), diag.clause);
     }
+
+    // A comparison with a binding form binds its boolean.
+    const lt_bind = try parse(testing.allocator, &interner, b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("<"), b.sym("?v"), b.int(3) }), b.sym("?x") }) }), &diag);
+    defer lt_bind.deinit();
+    try testing.expect(lt_bind.where[1] == .bind and lt_bind.where[1].bind.call.f.builtin == .lt);
 
     // A variable twice in one tuple binding.
     const q8 = b.vec(&.{ b.kw("find"), b.sym("?x"), b.kw("where"), b.vec(&.{ b.lst(&.{ b.sym("f"), b.int(1) }), b.vec(&.{ b.sym("?x"), b.sym("?x") }) }) });

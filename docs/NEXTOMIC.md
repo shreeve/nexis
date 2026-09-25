@@ -489,7 +489,9 @@ seek, constants after an unbound position filter. Built-in predicates and functi
 cardinality-one attribute and a default that is not nil
 (`:nextomic/query-syntax` otherwise), `get-some`, which binds `[attr
 value]` for the first of its attributes the entity has and drops the
-row when it has none, and `fulltext`) are Zig over cells; an attribute
+row when it has none, and `fulltext`) are Zig over cells; a comparison
+or `missing?` with a binding form, `[(< ?a ?b) ?lt]`, binds its boolean
+instead of filtering; an attribute
 `missing?`, `get-else` or `get-some` names that does not exist is
 `:nextomic/unknown-attribute`; an int and a double compare numerically,
 strings by their bytes and keywords by their text, as `compare` orders
