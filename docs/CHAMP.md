@@ -61,103 +61,65 @@ key/value entries, a set bare keys (§11).
 
 ---
 
-### 2. The three-layer canonicality model (central)
+### 2. Canonical layout and semantic equality (central)
 
-**Overclaiming canonical representation is the single most likely
-spec mistake here.** The rule set below is deliberately narrower
-than a naive "CHAMP guarantees a unique layout for any logical entry
-set" reading of PLAN §9.1.
-
-nexis claims canonical representation at **three distinct levels**,
-each with its own scope:
+Two separate things are easy to conflate here: the **layout** a map
+has, and how two maps are **compared**. nexis makes a narrow
+canonical-layout claim and never builds equality on it.
 
 #### 2.1 Array-map layer (subkind 0)
 
 - Array-maps store up to 8 entries **in association order** as a
   representation detail.
-- **Two array-maps with the same key-value set compare `=` regardless
-  of entry order.** Equality is O(n²) membership comparison (n ≤ 8);
-  hash uses the order-independent `hash.combineUnordered`.
 - There is **no** structural / bytewise uniqueness guarantee at this
-  layer. Build order leaks into representation but NOT into equality
-  or hash.
+  layer. Build order leaks into representation (iteration order,
+  printing, codec bytes) but NOT into equality or hash.
 
-#### 2.2 CHAMP node layer (subkind 1 root, subkind 2 interior)
+#### 2.2 CHAMP node layer (subkind 1 root and its interiors)
 
-- Within a single CHAMP node, entries and child pointers occupy
-  physical array positions determined by **bitmap rank (popcount)** of
-  a deterministic slot assignment. Slot assignment is derived from
-  5-bit hash fragments at the node's depth. This is the CHAMP paper's
-  canonicality guarantee.
-- Two **CHAMP-backed maps** with the same entry set produce
-  structurally-identical node trees (bitmap-equal, entry-array-equal,
-  recursively). This enables bitmap-level early-exit equality on
-  CHAMP-vs-CHAMP comparison.
-- Promotion and splitting are deterministic — independent of insertion
-  order — for every case that does NOT involve a collision node.
+- Within a node, entries and child pointers occupy physical positions
+  given by **bitmap rank (popcount)** of a deterministic slot
+  assignment: 5-bit hash fragments at the node's depth.
+- Every key sits at the shallowest node where no other key shares its
+  hash path, and no node below the root holds fewer than two keys in
+  its subtree (§4.3, §5.5). The trie is therefore a function of the
+  key set: two CHAMP-backed maps with the same keys have
+  structurally identical trees and iterate, print and encode in the
+  same order, whatever their build history. The one exception is
+  entry order inside a collision node (§2.3).
+- `canonicalTrie` checks this layout and the property tests assert it
+  (§4.3, §12.4).
 
-#### 2.3 Collision-node layer (subkind 3)
+#### 2.3 Collision-node layer
 
-- Collision nodes hold entries whose keys share a **full 32-bit hash**
-  (indexable bits exhausted). The bucket is small in expectation —
-  xxHash3 collision probability is ~1-in-2³².
-- **Collision nodes do NOT have canonical raw-layout equality.**
-  Defining one would require a total comparator over arbitrary Values
-  (sorting keys by some byte encoding), which is a huge semantic
-  commitment — it entangles equality-internals with a canonical-order
-  contract that would propagate into serialization, stable iteration,
-  and potentially language-level ordering primitives. nexis does not
-  accept that commitment.
-- Collision-node equality is **semantic membership comparison**:
-  same count, then every entry in `a` has an equal-keyed entry in
-  `b`. O(k²) in the collision-bucket size k, which is tiny.
-- Bitmap early-exit does NOT apply to collision-node payloads beyond
-  trivial checks (same count, same shared 32-bit hash).
+- Collision nodes hold entries whose keys share a **full 32-bit
+  indexing hash**. The bucket is small in expectation — xxHash3
+  collision probability is ~1-in-2³².
+- **Collision nodes have no canonical order.** Defining one would
+  require a total comparator over arbitrary Values (sorting keys by
+  some byte encoding), which would entangle equality internals with
+  a canonical-order contract propagating into serialization, stable
+  iteration, and potentially language-level ordering primitives.
+  nexis does not accept that commitment. Entries stay in association
+  order.
 
-#### 2.4 Cross-subkind equality
+#### 2.4 Equality and hash are semantic
 
-- Two maps with the same entry set but different subkinds (e.g. an
-  array-map built to 8 entries vs. a CHAMP-backed map built to 9
-  entries and then reduced by one `dissoc`) compare `=` and hash
-  equal.
-- Equality across subkinds **cannot** use bitmap early-exit. It falls
-  back to **semantic associative comparison** — count equality, then
-  `∀ (k,v) ∈ a: get(b, k) == Some(v)`. Same pattern for sets via
-  `contains`.
-- Hash is structure-independent by construction: both paths iterate
-  every entry and fold via `hash.combineUnordered` + `finalizeUnordered`
-  with the same entry-hash function.
+Equality never compares layouts. For every pair of maps, whatever
+their subkinds (array-map vs array-map, CHAMP vs CHAMP, array-map vs
+CHAMP): counts must match, then every entry `(k, v)` of `a` must be
+found in `b` by `get` with a `=` value (`contains` for sets). This
+is O(n) lookups, each O(log₃₂ n).
 
-#### 2.5 Summary
+Hash is structure-independent by construction: every representation
+iterates every entry and folds it with `hash.combineUnordered` +
+`finalizeUnordered` and the same entry-hash function (§7).
 
-| Comparison kind | Equality strategy | Hash strategy |
-|---|---|---|
-| array-map vs array-map | O(n²) membership | unordered combine |
-| CHAMP vs CHAMP, no collision | bitmap + recursive structural | unordered combine |
-| CHAMP vs CHAMP with collision | bitmap + structural above, semantic at collision node | unordered combine |
-| array-map vs CHAMP (cross-subkind) | semantic associative via `get` | unordered combine |
-
-Equal entry-sets always hash equal, regardless of which cell of the
-table the pair lands in. Equality is correct in every cell; bitmap
-early-exit is an **optimization** confined to the cells where
-canonicality provably holds.
-
-#### 2.6 Explicit exclusions
-
-**Canonicality in this document refers only to CHAMP node
-partitioning and bitmap-derived slot placement for non-collision
-paths.** It does not imply:
-
-- unique bytewise representation across subkinds (array-map and CHAMP
-  can both represent the same logical map — they do NOT share byte
-  layout),
-- canonical ordering of entries inside collision nodes (no total
-  comparator over arbitrary keys),
-- assoc-history-independent raw shape for array-map (insertion order
-  leaks into representation but not into equality or hash).
-
-Any implementation or review claim that requires one of the above
-must be read as a bug in the claim, not a property of the spec.
+A bitmap-level structural early exit would be sound only between two
+CHAMP tries and only outside collision nodes; nexis does not
+implement one. The canonical layout (§2.2) is a representation
+property — stable iteration order for equal maps — not an equality
+mechanism.
 
 ---
 
@@ -424,7 +386,7 @@ threshold.
 
 Consequence: two logically-equal maps may have different subkinds
 depending on their construction history. Equality and hash handle
-this via §2.4's semantic fallback; no user-visible behavior changes.
+this via §2.4's semantic comparison; no user-visible behavior changes.
 
 #### 5.5 Single-entry-subtree promotion on dissoc
 
@@ -438,11 +400,11 @@ same climb from the bottom of the trie. This preserves canonicality
 of CHAMP node shape: an interior node with one entry and no children
 cannot exist anywhere but at the root.
 
-Skipping this promotion would be simpler but would break bitmap
-canonicality — two equal maps built by different paths could
-differ by a "lonely interior node" in one and a "direct data entry"
-in the other. The bitmap early-exit equality fast path would then
-produce false negatives.
+Skipping this promotion would be simpler but would break canonical
+layout — two equal maps built by different paths could differ by a
+"lonely interior node" in one and a "direct data entry" in the
+other, and then iterate, print and encode in different orders (and
+any structural equality shortcut would give false negatives).
 
 #### 5.6 Dissoc at the root
 
@@ -482,45 +444,27 @@ the category), but the shape is the seam for any cross-kind
 associative member. Same shape for `setEqualCategory` in the set
 category.
 
-#### 6.3 Same-kind, same-subkind equality
+#### 6.3 Same-kind equality
 
-| Subkind pair | Strategy |
-|---|---|
-| (0, 0) array-map ↔ array-map | O(n²) membership: count match, then every (k,v) in `a` is found in `b` |
-| (1, 1) CHAMP ↔ CHAMP | Count match, then recursive node structural compare starting at roots; bitmap early-exit enabled |
-| (3, 3) collision ↔ collision | Count match, shared-hash match, then O(k²) semantic membership |
+`equalMap` / `equalSet` use one strategy for every subkind pair
+(§2.4):
 
-Recursive node structural compare:
-- Bitmaps equal? If not, return false.
-- For each data slot: recursive `dispatch.equal` on key and on value.
-- For each node slot: recursive structural compare on children. If
-  the child pair is (interior, interior), recurse. If either is a
-  collision node, fall through to semantic membership compare at
-  that subtree.
+- Same header → true.
+- Count mismatch → false.
+- Iterate `a`. For each entry (k, v), `mapGet(b, k)`:
+  - `.absent` → false.
+  - `.present = v'` → `dispatch.equal(v, v')`; unequal → false.
+  For a set, `setContains(b, e)` for each element `e`.
+- The iteration completes → true.
 
-#### 6.4 Same-kind, cross-subkind equality
-
-Subkind pairs (0, 1) and (1, 0) — array-map vs. CHAMP root:
-
-- Count match first.
-- Then iterate the side with the cheaper iteration / smaller bound
-  (always the array-map side, since it is capped at 8 entries).
-  For each entry (k, v), call `mapGet(otherMap, k)`:
-  - `.absent` → return false.
-  - `.present = v'` → compare `v == v'` via `dispatch.equal`; unequal
-    → return false.
-- If the iteration completes, return true.
-
-Subkind pair (3, anything-other-than-3) cannot occur as a
-**top-level** comparison — subkind 3 is internal and never escapes
-as a user-facing Value. Collision nodes only appear nested inside
-CHAMP tree walks, where §6.3 handles them.
+Collision nodes need no special case: `mapGet` walks into them like
+any other node.
 
 **Nil-value correctness.** Nil is a legal map value. The `?Value`
 return shape would conflate "absent" with "present with nil value",
 which would break this equality strategy on maps containing nil
 values. The `MapLookup` union in §6.6 / §8 fixes this at the API
-level; this §6.4 strategy depends on that fix.
+level; this §6.3 strategy depends on that fix.
 
 #### 6.5 Keyword-keyed fast path
 
@@ -947,8 +891,9 @@ Map:
   yields `mapGet(m, k) == v2` with unchanged count.
 - M4. `assoc` same-value short-circuit returns the same map pointer.
 - M5. Equality laws over random maps: reflexive, symmetric, transitive.
-- M6. Cross-subkind hash equivalence (A2's setup across 500 random
-  maps).
+- M6. Cross-subkind hash equivalence: 2000 random entry sets built
+  once as an array-map and once as a CHAMP (promote to 9, dissoc
+  back) compare `=` and hash equal.
 - M7. Cross-category never-equal: a map is never `=` to any
   non-associative Value; hashes distinct.
 - M8. Persistent immutability: `mapAssoc(m1, k, v)` does not mutate
@@ -963,7 +908,7 @@ Map:
   insertion orders.
 
 Set: S1–S9, parallel over set operations (S5 is the cross-subkind
-array-set vs. CHAMP receipt).
+array-set vs. CHAMP property).
 
 ---
 

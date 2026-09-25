@@ -1,5 +1,5 @@
 //! test/prop/champ.zig — randomized properties for the persistent map
-//! and set heap kinds (CHAMP): M1–M10 for maps, S1–S9 for sets.
+//! and set heap kinds (CHAMP): M1–M11 for maps, S1–S9 for sets.
 //!
 //! Primary purpose: pin the associative equality category's invariant
 //! `(= a b) ⇒ hash(a) = hash(b)` across both subkinds. M6 is the
@@ -20,8 +20,8 @@
 //!   M4. `assoc` same-value short-circuit returns the same map pointer.
 //!   M5. Equality laws over random maps: reflexive, symmetric,
 //!       transitive (pairwise).
-//!   M6. **Cross-subkind hash equivalence** (RETIREMENT RECEIPT for
-//!       `.associative` category): 2000 random maps of 1..8 entries
+//!   M6. **Cross-subkind hash equivalence** for the `.associative`
+//!       category: 2000 random maps of 1..8 entries
 //!       built two ways — one stays array-map, one promotes to CHAMP
 //!       and dissocs back to the same entries — hash and equal
 //!       identically.
@@ -351,7 +351,7 @@ test "M5: equality laws (reflexive, symmetric, pairwise transitive)" {
 }
 
 // -----------------------------------------------------------------------------
-// M6. Cross-subkind hash equivalence — THE RETIREMENT RECEIPT
+// M6. Cross-subkind hash equivalence
 // -----------------------------------------------------------------------------
 
 test "M6: cross-subkind (array-map vs CHAMP) same entries hash AND equal (2000 trials)" {
@@ -665,8 +665,8 @@ test "M11: equal ⇒ hashValue equal over 2000 random map pairs" {
 //   S3. setConj of existing element returns the same pointer.
 //   S4. Equality laws over random sets (reflexive / symmetric /
 //       pairwise transitive).
-//   S5. **Cross-subkind hash equivalence** (RETIREMENT RECEIPT for
-//       `.set` equality category): 500 random sets built via two
+//   S5. **Cross-subkind hash equivalence** for the `.set` equality
+//       category: 2000 random sets built via two
 //       different paths — pure array-set vs. promote-then-disj — hash
 //       and equal identically. Parallel to M6.
 //   S6. Cross-category never-equal: a set is never `=` to any non-set
