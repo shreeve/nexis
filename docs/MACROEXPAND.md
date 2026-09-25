@@ -129,7 +129,8 @@ is an ordinary call. User macros shadow host macros.
    `var_table` holds pointers into the caller's namespace
    (resolved at compile time) and its constant pool holds
    caller-interned literals, so the sub-VM needs no namespace of
-   its own. It has no `io`, so a macro body cannot print.
+   its own. It has `ExpandContext.io` as its `io`, so a macro body
+can print when the compiler passes the calling VM's.
 5. **Persistent allocator**: the compile-eval callback allocates
    the macro fn's storage from a persistent allocator (the VM's
    `runtime_arena`) so the closure outlives the per-form compile

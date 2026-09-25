@@ -132,6 +132,9 @@ pub const ExpandContext = struct {
     /// arguments, the macro sub-VM's allocations and the values
     /// it returns then live where the VM's Vars can hold them.
     value_heap: ?*heap_mod.Heap = null,
+    /// The calling VM's `io`, given to a user macro's sub-VM so the
+    /// macro body can print; null leaves the sub-VM without one.
+    io: ?std.Io = null,
     /// Set by the first (innermost) failure of an expansion that
     /// returns an error; the message lives in `allocator`.
     failure: ?Failure = null,
@@ -1127,6 +1130,7 @@ fn callUserMacro(
     sub_vm.borrowed_interner = ctx.interner;
     sub_vm.borrowed_heap = ctx.value_heap;
     sub_vm.gc_enabled = false;
+    sub_vm.io = ctx.io;
     const result_value = sub_vm.callValue(macro_var.root, arg_values) catch |err| {
         if (err == error.OutOfMemory) return ExpandError.OutOfMemory;
         if (err == error.UncaughtThrow) if (sub_vm.unhandled_throw) |thrown| {
