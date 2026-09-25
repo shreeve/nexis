@@ -53,6 +53,11 @@ pub const LoadError = error{
 /// describes the failure, the rest as for `LoadError`.
 pub const EvalError = error{ Diagnosed, RunFailed, ControlTransferred, OutOfMemory };
 
+/// A UTF-8 byte-order mark. A source file that opens with one is read
+/// without it, so its positions count from the character after it
+/// (TOOLING.md §1).
+pub const byte_order_mark = "\xEF\xBB\xBF";
+
 /// A failure to read or compile, and where it happened.
 pub const Diagnostic = struct {
     /// The source and the span in it the failure is at; null when
@@ -329,10 +334,11 @@ pub const Loader = struct {
         // The text and the path outlive the load: every routine
         // compiled from the file points at them for its error
         // reports (TOOLING.md §1).
-        const source = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.persistent_allocator, .unlimited) catch |err| {
+        const file = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.persistent_allocator, .unlimited) catch |err| {
             try self.diagnose(.{ .label = "" }, "require: cannot read {s}: {s}", .{ path, @errorName(err) });
             return LoadError.LoadFailed;
         };
+        const source = if (std.mem.startsWith(u8, file, byte_order_mark)) file[byte_order_mark.len..] else file;
         const info = try self.persistent_allocator.create(vm_mod.SourceInfo);
         info.* = .{ .path = try self.persistent_allocator.dupe(u8, path), .text = source };
 

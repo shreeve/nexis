@@ -306,14 +306,20 @@ const Runtime = struct {
 };
 
 /// The text of FILE, or of stdin for `-`; exit 2 when it cannot be
-/// read. A `#!` first line is a comment, so a script can be
-/// executable.
+/// read. A leading UTF-8 byte-order mark is dropped, so positions and
+/// carets count from the first character after it. A `#!` first line
+/// is a comment, so a script can be executable.
 fn readProgram(io: std.Io, allocator: std.mem.Allocator, path: []const u8) []u8 {
-    const text = if (eql(path, "-")) blk: {
+    var text = if (eql(path, "-")) blk: {
         var buf: [4096]u8 = undefined;
         var r = std.Io.File.stdin().readerStreaming(io, &buf);
         break :blk r.interface.allocRemaining(allocator, .unlimited) catch |err| failRead(io, path, err);
     } else std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch |err| failRead(io, path, err);
+    const bom = loader_mod.byte_order_mark;
+    if (std.mem.startsWith(u8, text, bom)) {
+        std.mem.copyForwards(u8, text, text[bom.len..]);
+        text = allocator.realloc(text, text.len - bom.len) catch |err| failRead(io, path, err);
+    }
     if (std.mem.startsWith(u8, text, "#!")) @memcpy(text[0..2], ";;");
     return text;
 }
