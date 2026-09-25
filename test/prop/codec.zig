@@ -19,6 +19,10 @@
 //!       fed to decode either succeed (producing some Value) or
 //!       return a `CodecError`; no panic, no crash, no memory
 //!       corruption.
+//!   C5. **Hostile structure**: lengths and counts near 2^64, counts
+//!       past the input, and nesting past `codec.max_depth` end in a
+//!       typed error without overflow, stack exhaustion or an
+//!       allocation sized by the count.
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -261,5 +265,58 @@ test "C4: 1000 random byte slices fed to decode never panic" {
             // Any error is acceptable; the point is no panic / crash /
             // memory corruption.
         }
+    }
+}
+
+// =============================================================================
+// C5. Hostile structure: huge lengths and counts, deep nesting
+// =============================================================================
+
+test "C5: 500 hostile headers (huge lengths and counts, deep nesting) decode to a typed error or a value" {
+    // The deep trials build thousands of blocks each; an arena keeps
+    // them cheap to allocate and to drop.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var ctx = TestCtx.initWith(arena.allocator());
+    defer ctx.deinit();
+    _ = try ctx.interner.internKeywordValue("k");
+
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 5);
+    const r = prng.random();
+    const kinds = [_]u8{ 6, 7, 16, 17, 18, 19, 20, 21, 23 };
+    const lengths = [_]u64{ std.math.maxInt(u64), std.math.maxInt(u64) - 7, 1 << 35, 1 << 20, 3 };
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var trial: usize = 0;
+    while (trial < 500) : (trial += 1) {
+        buf.clearRetainingCapacity();
+        try buf.appendSlice(std.testing.allocator, &.{ 1, 0 });
+        // A run of one-element containers, sometimes past max_depth.
+        const depth = if (r.uintLessThan(u8, 8) != 0) r.uintLessThan(usize, 8) else codec.max_depth + r.uintLessThan(usize, 64);
+        for (0..depth) |_| try buf.appendSlice(std.testing.allocator, &.{ kinds[4 + r.uintLessThan(usize, 4)], 1 });
+        // Then a header whose length or count is hostile.
+        const kind = kinds[r.uintLessThan(usize, kinds.len)];
+        try buf.append(std.testing.allocator, kind);
+        if (kind == 17) try buf.append(std.testing.allocator, 0);
+        if (kind == 23) try buf.append(std.testing.allocator, 1);
+        var n = lengths[r.uintLessThan(usize, lengths.len)];
+        while (true) {
+            const byte: u8 = @intCast(n & 0x7F);
+            n >>= 7;
+            try buf.append(std.testing.allocator, if (n == 0) byte else byte | 0x80);
+            if (n == 0) break;
+        }
+        for (0..r.uintLessThan(usize, 16)) |_| try buf.append(std.testing.allocator, r.int(u8));
+
+        const live_before = ctx.heap.liveCount();
+        if (codec.decode(&ctx.heap, &ctx.interner, buf.items, &dispatch.hashValue, &dispatch.equal)) |_| {} else |err| switch (err) {
+            error.OutOfMemory => return error.TestUnexpectedResult,
+            else => {},
+        }
+        // A failed decode may leave partial values behind; a count
+        // past the input never gets as far as allocating for it.
+        try std.testing.expect(ctx.heap.liveCount() - live_before < 4 * depth + 64);
+        ctx.resetHeap();
     }
 }

@@ -1782,6 +1782,19 @@ test "storage failures surface as :db/<reason> keywords inside try" {
     , "[:db/key-too-large :db/key-too-large :db/open-failed]");
 }
 
+test "a value nested past the codec's max depth is refused with a catchable error; max depth round-trips" {
+    // CODEC.md §2.7: max_depth is 4096.
+    try expectOutputProgramWithStore("seam-deep",
+        \\(do
+        \\  (def conn (db/open "@STORE@"))
+        \\  (defn nest [n] (loop [i 0 acc nil] (if (< i n) (recur (inc i) [acc]) acc)))
+        \\  [(try (do (db/put-key! (db/ref conn :t :deep) (nest 4097)) :stored)
+        \\        (catch any e (keyword? e)))
+        \\   (do (db/put-key! (db/ref conn :t :ok) (nest 4096))
+        \\       (= (nest 4096) (db/get-key (db/ref conn :t :ok))))])
+    , "[true true]");
+}
+
 test "the VM keeps running after a caught storage failure" {
     try expectOutputProgramWithStore("seam-errors-resume",
         \\(do
