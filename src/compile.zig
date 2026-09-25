@@ -1536,23 +1536,13 @@ fn buildColl(heap: *heap_mod.Heap, op: vm.CollOp, values: []const Value) !Value 
     }
 }
 
-/// Shared implementation for `(quote x)` and the reader-macro
-/// `'x` (which the reader emits as `Datum.quote`).
-///
-/// Quoted symbols/keywords use the Interner from
-/// `ctx.interner` to produce stable symbol/keyword Values
-/// emitted via `Tiny.literal`. Without an Interner
-/// (`ctx.interner == null`), quoted symbols/keywords raise
-/// `UnsupportedFeature` — the caller is expected to use
-/// `compileSourceWith` / `compileFormWith` to pass an Interner.
-/// Quoted nil/bool/int never need the Interner.
-///
-/// Quoted compound collections (lists/vectors/maps/sets) lower
-/// to the matching `*_construct` node whose elements are
-/// themselves quote-lowered; quoted strings need `ctx.heap`. A
-/// quote inside the payload is the 2-list `(quote x)`, as
-/// `formToValue` renders it. Quoted reader macros (`'@x`,
-/// `'#(...)`, `'^{...}`, syntax-quote) raise `UnsupportedFeature`.
+/// `(quote x)` and `'x`: `x` as data. Symbols and keywords are
+/// interned (`UnsupportedFeature` without an interner), strings and
+/// bignums built on the heap; a compound collection quotes each
+/// element and so becomes one constant (`lowerColl`). A quote inside
+/// the payload is the 2-list `(quote x)`, as `formToValue` renders
+/// it. Quoted reader macros (`'@x`, `'#(...)`, `'^{...}`,
+/// syntax-quote) are `UnsupportedFeature`.
 fn lowerQuotePayload(
     allocator: std.mem.Allocator,
     payload: *const reader_mod.Form,
@@ -1678,14 +1668,9 @@ fn lowerCall(
 // Form binding-form lowering
 // =============================================================================
 //
-// `let*`, `fn*`, `letfn*`, `loop*`, `recur`. All share the same
-// structural-validation primitives + the implicit-do helper
-// (multi-form bodies synthesize Tiny.do_).
-//
-// LowerEnv must mirror lexical visibility for intrinsic
-// shadowing. Each binding
-// form constructs a child env that adds its bound names, then
-// passes it through body lowering.
+// `let*`, `fn*`, `letfn*`, `loop*`, `recur`. Each binding form
+// lowers its body in a child `LowerEnv` holding its names, which
+// mirrors the Emitter's scope (see `LowerEnv`).
 
 /// Lower a sequence of body forms into a single Tiny expression.
 /// Multi-form bodies wrap in `Tiny.do_`; single-form bodies pass
@@ -2050,16 +2035,11 @@ fn lowerThrow(
     return try allocTiny(allocator, .{ .throw_ = value });
 }
 
-/// user_data for the
-/// CompileEvalContext callback. The `persistent_allocator` is
-/// CRITICAL — defmacro Closures must outlive the per-form
-/// compile arena (REPL uses a fresh arena per input line; the
-/// macro Closure has to survive into the next form's
-/// invocation). Typically wired to `vm.runtime_arena.allocator()`.
+/// What `compileEvalCallback` compiles a `defmacro`'s function with.
 const CompileEvalData = struct {
-    /// Used by the callback for synthetic Routine + Compiled
-    /// artifact storage. Must outlive ALL subsequent forms
-    /// that might invoke the macro.
+    /// Where the macro's routines go: they must outlive every later
+    /// form that expands the macro (typically the VM's runtime
+    /// arena).
     persistent_allocator: std.mem.Allocator,
     namespace: ?*vm.Namespace,
     interner: *intern_mod.Interner,
@@ -2068,27 +2048,19 @@ const CompileEvalData = struct {
     registry_heap: ?*heap_mod.Heap,
 };
 
-/// Compile-time eval callback. Compiles `form`
-/// WITHOUT a macro table (the body has already been expanded by
-/// the expander before this is called) and runs it via a fresh
-/// sub-VM written through `out_vm`.
-///
-/// **Lifetime contract** (per expand.CompileEvalContext): the
-/// returned Value may reference `out_vm.runtime_arena`. The
-/// caller MUST extract whatever it needs from the result + call
-/// `out_vm.deinit()` to release the arena. The synthetic
-/// Routine itself lives in `data.allocator` (the compile
-/// arena), so it outlives the sub-VM.
+/// The expander's compile-eval callback (`defmacro`): compile `form`,
+/// the already-expanded `(def name (fn* ...))`, with no macro table,
+/// and run it on a fresh sub-VM written through `out_vm`. It compiles
+/// on the persistent allocator, so the macro's closure outlives the
+/// per-form compile arena. The result may reference
+/// `out_vm.runtime_arena`: the caller takes what it needs and deinits
+/// `out_vm` (`expand.CompileEvalContext`).
 fn compileEvalCallback(
     user_data: *anyopaque,
     form: *const reader_mod.Form,
     out_vm: *vm.VM,
 ) anyerror!value_mod.Value {
     const data: *CompileEvalData = @ptrCast(@alignCast(user_data));
-    // Compile into the PERSISTENT allocator (typically the
-    // user VM's runtime_arena). The macro fn's Closure +
-    // Routine + capture_descs all live there and outlive
-    // any per-form compile arena.
     const compiled = try compileFormWith(data.persistent_allocator, form, .{
         .namespace = data.namespace,
         .interner = data.interner,
