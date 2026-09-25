@@ -1317,6 +1317,11 @@ pub const VmError = error{
     /// exists (same `(ns, name)`). Mapped to
     /// `:protocol-redefinition`.
     ProtocolRedefinition,
+    /// Recursion ran out of room: a call would push frame number
+    /// `VM.max_frames`, or a native re-entering the VM found the
+    /// native stack below the guard's limit (§13.1). Mapped to
+    /// `:stack-overflow`.
+    StackOverflow,
 };
 
 // =============================================================================
@@ -1356,6 +1361,10 @@ pub const Handler = struct {
     /// clause. Both .try_ and .cleanup handlers carry this so
     /// unwind through either kind runs the finally.
     finally_pc: ?u32 = null,
+    /// `finally_stack.items.len` when the try was entered. Every
+    /// continuation above it belongs to a finally body running inside
+    /// this try, which a throw this handler takes abandons.
+    finally_depth: usize,
 };
 
 /// Tagged continuation for finally bodies. When a try-exit / catch-exit / throw-unwind
@@ -1604,6 +1613,21 @@ pub const VM = struct {
     /// equal but high-water inflated).
     stack_high_water: usize = 0,
     frame_high_water: usize = 0,
+    /// The deepest frame chain a program may build. A call that
+    /// would push past it raises `StackOverflow`, so runaway
+    /// recursion is a catchable `:stack-overflow` instead of memory
+    /// growing until the process dies (§13).
+    max_frames: usize = default_max_frames,
+    /// The text of the marker `recordErrorTrace` puts where it
+    /// leaves frames out.
+    trace_gap: [48]u8 = undefined,
+
+    pub const default_max_frames = 1 << 20;
+    /// A trace keeps this many innermost frames and
+    /// `trace_outermost` outermost ones; a marker frame counts the
+    /// rest.
+    const trace_innermost = 32;
+    const trace_outermost = 8;
 
     /// Build a VM around `routine`, allocating a single top-level
     /// frame with `routine.slot_count` slots zero-initialized to nil.
@@ -2224,6 +2248,9 @@ pub const VM = struct {
     /// across a nested `callValue` are its own to root
     /// (`RootScope`; GC.md §3).
     pub fn callValue(self: *VM, callee: Value, args: []const Value) VmError!Value {
+        // Every re-entry nests a native call and a run loop on the
+        // native stack (§13.1).
+        stack_guard.check() catch return VmError.StackOverflow;
         switch (callee.kind()) {
             value_mod.Kind.native_fn => {
                 const native = asNativeFn(callee);
@@ -2328,6 +2355,7 @@ pub const VM = struct {
     /// (one installed beneath the nested frame) takes it,
     /// `ControlTransferred`, exactly as `callValue` reports it.
     pub fn runRoutine(self: *VM, routine: *const Routine) VmError!Value {
+        stack_guard.check() catch return VmError.StackOverflow;
         if (routine.upvalue_count != 0) return VmError.CaptureCountMismatch;
         const base_slot: usize = self.stack.items.len;
         self.stack.appendNTimes(self.allocator, value_mod.nilValue(), routine.slot_count) catch return VmError.OutOfMemory;
@@ -2640,15 +2668,25 @@ pub const VM = struct {
     /// intact here: an uncaught throw and an untranslated `VmError`
     /// both leave the chain as it was. A parked top frame (one
     /// resting on `idle_routine`) is not part of any run and is
-    /// left out.
+    /// left out. A chain deeper than `trace_innermost +
+    /// trace_outermost` keeps both ends and one marker frame, named
+    /// for the number of frames between them.
     fn recordErrorTrace(self: *VM, err: VmError) void {
         self.error_trace.clearRetainingCapacity();
         self.traced_error = err;
-        var i = self.frames.items.len;
-        while (i > 0) {
+        const frames = self.frames.items;
+        const lowest: usize = if (frames[0].routine == &idle_routine) 1 else 0;
+        const elided = (frames.len - lowest) -| (trace_innermost + trace_outermost);
+        var i = frames.len;
+        while (i > lowest) {
             i -= 1;
-            const f = self.frames.items[i];
-            if (f.routine == &idle_routine) continue;
+            if (elided > 0 and i == frames.len - 1 - trace_innermost) {
+                const name = std.fmt.bufPrint(&self.trace_gap, "<{d} frames elided>", .{elided}) catch unreachable;
+                self.error_trace.append(self.allocator, .{ .name = name, .pc = 0, .span = null, .source = null }) catch return;
+                i -= elided - 1;
+                continue;
+            }
+            const f = frames[i];
             const pc: u32 = if (f.pc > 0) f.pc - 1 else 0;
             self.error_trace.append(self.allocator, .{
                 .name = f.routine.name,
@@ -3093,7 +3131,11 @@ pub const VM = struct {
     /// the frame's window and recorded the length it found before
     /// doing so in `frame.entry_stack_len`; `popFrame` restores
     /// exactly that length.
+    /// On failure the stack is restored to that length, as if the
+    /// call had never started.
     fn pushFrame(self: *VM, frame: Frame) VmError!void {
+        errdefer self.stack.shrinkRetainingCapacity(frame.entry_stack_len);
+        if (self.frames.items.len >= self.max_frames) return VmError.StackOverflow;
         self.frames.append(self.allocator, frame) catch return VmError.OutOfMemory;
         if (self.frames.items.len > self.frame_high_water) {
             self.frame_high_water = self.frames.items.len;
@@ -3791,6 +3833,7 @@ pub const VM = struct {
             .catch_pc = inst.a.index,
             .binding_slot = inst.b.index,
             .finally_pc = finally_pc,
+            .finally_depth = self.finally_stack.items.len,
         });
     }
 
@@ -3919,6 +3962,9 @@ pub const VM = struct {
         // they're unreachable since their try is
         // unwinding through us).
         self.handlers.shrinkRetainingCapacity(handler_idx);
+        // Likewise the continuations of finally bodies the throw
+        // leaves mid-run, the one it was thrown from included.
+        self.finally_stack.shrinkRetainingCapacity(matched.finally_depth);
 
         // Pop every frame above the handler's. A throw bypasses
         // the callers' return slots: the frames are only popped,
@@ -3944,6 +3990,7 @@ pub const VM = struct {
                     .catch_pc = 0,
                     .binding_slot = 0,
                     .finally_pc = matched.finally_pc,
+                    .finally_depth = matched.finally_depth,
                 });
 
                 // Store thrown value into the handler's binding_slot.
@@ -4007,6 +4054,7 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.NoProtocolImpl => "no-protocol-impl",
         VmError.NoProtocolMethod => "no-protocol-method",
         VmError.ProtocolRedefinition => "protocol-redefinition",
+        VmError.StackOverflow => "stack-overflow",
         // Unrecoverable: bytecode corruption / VM-internal /
         // OOM / already-a-user-throw / unimplemented.
         VmError.UncaughtThrow,

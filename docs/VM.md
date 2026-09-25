@@ -54,8 +54,9 @@ DOES and what invariants the VM upholds are frozen here.
   tiered compilation.
 - No per-PC liveness maps and no root enumeration: the VM never
   runs the collector (§9).
-- No frame-depth limit: non-tail recursion grows `VM.frames`
-  until allocation fails (`OutOfMemory`).
+- No unbounded recursion: the frame chain stops at `VM.max_frames`
+  and native re-entry at the stack guard, both with a catchable
+  `:stack-overflow` (§13).
 
 ---
 
@@ -963,8 +964,10 @@ loop leaving both unchanged (`COMPILER.md` §9.4).
 ### 12. try / catch / finally / throw
 
 **Handler stack**: one VM-wide stack (`vm.handlers`) of
-`Handler { kind, frame_index, catch_pc, binding_slot, finally_pc? }`
-keyed by frame index rather than a list per frame. Two kinds:
+`Handler { kind, frame_index, catch_pc, binding_slot, finally_pc?,
+finally_depth }` keyed by frame index rather than a list per frame;
+`finally_depth` is the length of `vm.finally_stack` when the `try` was
+entered. Two kinds:
 
 - `try_` — a `(try body (catch any x handler))` is active:
   a throw routes to `catch_pc` with the value in `binding_slot`.
@@ -1002,8 +1005,11 @@ walk the handler stack top-down:
 **`ctrl:finally-exit`**: pop the top `FinallyContinuation`
 (`InvalidHandlerState` if none, or if it belongs to another
 frame). `.normal(pc)` resumes at `pc`; `.throwing(v)` re-throws
-`v` from this point. A throw inside the finally body itself
-replaces the pending continuation's throw.
+`v` from this point. A throw out of a finally body abandons that
+body's continuation: the handler that takes any throw first
+truncates `vm.finally_stack` to its `finally_depth`, dropping the
+continuations of every finally body the throw leaves mid-run, so the
+stack is back to where it stood when the catching `try` was entered.
 
 **Matching**: the only matcher is `any`; every throw is caught by
 the innermost active `try`. Thrown values are ordinary Values.
@@ -1054,6 +1060,7 @@ handler is active):
 | `:atom-re-entry` | `swap!` re-entered on the atom it is swapping (`docs/ATOM.md`) |
 | `:utf8-error`, `:invalid-argument`, `:io-error`, `:file-not-found`, `:invalid-path` | String and I/O natives |
 | `:record-redefinition`, `:not-a-record`, `:no-protocol-impl`, `:no-protocol-method`, `:protocol-redefinition` | Records and protocols (`docs/PROTOCOLS.md`) |
+| `:stack-overflow` | A call would push frame number `VM.max_frames` (default 2^20, about a million; an embedder may set it), or a native re-entering the VM (`callValue`, `runRoutine`) finds the native stack past the guard's limit (§13.1). Runaway recursion ends in well under a second instead of growing memory until the process dies; legitimate recursion a hundred thousand calls deep runs |
 
 **Not catchable** (compiler bugs or corrupt bytecode; propagate
 out of `run`):
@@ -1072,15 +1079,16 @@ out of `run`):
 | `InvalidCellState` | `box-local` on an already-boxed slot, `init-cell` on an initialized cell |
 | `UninitializedCell` | `get-cell` (or U resolve) on a placeholder not yet filled |
 | `InvalidHandlerState` | `try-exit` / `finally-exit` with no matching handler or continuation |
-| `OutOfMemory` | Allocation failure (including unbounded frame growth) |
+| `OutOfMemory` | Allocation failure |
 
 **Control signals** (not errors in the user sense): `Halt` (the
 outermost `return`), `ControlTransferred` (a native's throw has been
 caught and the run loop resumes at the handler), `UncaughtThrow`
 (no handler; value in `vm.unhandled_throw`).
 
-VM frame depth is unbounded: frames live on the heap. The native
-stack is bounded and guarded (§13.1).
+Frames live on the heap, so bytecode recursion costs no native
+stack; its depth is bounded by `VM.max_frames`. The native stack is
+bounded and guarded (§13.1).
 
 **What the VM records when an error leaves `run`**: the frame
 chain as it stood, in `VM.error_trace`, innermost first, one
@@ -1098,7 +1106,10 @@ and is left out. `VM.traced_error` names the error the trace was
 recorded for. `runRoutine` records the same way when a nested run
 fails, so a host that learns of the failure indirectly (the loader
 ran a required file while a form was being compiled) reports it
-with its chain. The trace is rebuilt by the next failing run. `resetAfterError` discards
+with its chain. A chain longer than 40 frames keeps its innermost 32
+and outermost 8 around one marker frame named `<N frames elided>`
+(no span, no source), so a runaway recursion reports in 41 lines.
+The trace is rebuilt by the next failing run. `resetAfterError` discards
 what the failed run left (the frames above the top-level one,
 handlers, pending finallys, the unhandled throw) so `retargetTop`
 can run the next form; the CLI's REPL calls it after reporting.
@@ -1126,8 +1137,11 @@ guarded function may run at:
   arms the guard at that thread's entry with the stack less a 16 MiB
   margin for unguarded leaf calls.
 
-Each layer maps the error to its own report: the VM raises
-`StackOverflow`, the reader a reader error, the compiler a compile
+The VM checks on entry to `callValue` and `runRoutine`, the two ways
+a native re-enters it, so recursion through `apply`, `map`, `reduce`,
+a protocol impl or `eval` ends in the same catchable `:stack-overflow`
+as runaway bytecode recursion. Each layer maps the error to its own
+report: the VM raises `StackOverflow`, the reader a reader error, the compiler a compile
 error, and a codec decode of bytes nested too deep treats them as
 corrupt input.
 
@@ -1214,7 +1228,6 @@ Three layers, paralleling `COMPILER.md` §9:
 - Exact dispatch-loop code (§8).
 - Per-opcode handler signature. Contract is "handler reads the
   current instruction from the VM and executes its semantics."
-- How an `OutOfMemory` on frame growth is surfaced to user code.
 
 ---
 

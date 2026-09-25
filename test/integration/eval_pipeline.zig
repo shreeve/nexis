@@ -455,6 +455,23 @@ test "integration: throw inside finally overrides" {
     );
 }
 
+test "integration: a throw out of a running finally body leaves no pending continuation" {
+    // The inner finally's continuation is abandoned by its own
+    // throw; the handler that catches it discards it (VM.md §12).
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try harness.expectResult(&program, "", try program.run(
+        \\(defn once [] (try (try 1 (finally (throw :x))) (catch any e e)))
+        \\(defn twice [] (try (try (try 1 (finally (throw :x))) (finally (throw :y))) (catch any e e)))
+        \\(defn across [] (try (mapv (fn [_] (try 1 (finally (throw :z)))) [1]) (catch any e e)))
+        \\(dotimes [_ 100] (once) (twice) (across))
+        \\[(once) (twice) (across)]
+    ), "[:x :y :z]");
+    try testing.expectEqual(@as(usize, 0), program.v.finally_stack.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.handlers.items.len);
+}
+
 test "integration: nested try — outer catches what inner rethrows" {
     try expectOutput(
         "(try (try (throw 100) (catch any e (throw e))) (catch any e e))",
@@ -652,6 +669,35 @@ test "integration: a macro body reads names of its keyword and symbol arguments"
 test "integration: native fn — arity mismatch is catchable" {
     try expectOutput("(try (first) (catch any e e))", ":arity-mismatch");
     try expectOutput("(try (cons 1) (catch any e e))", ":arity-mismatch");
+}
+
+test "integration: recursion through a native re-entry ends in a catchable :stack-overflow" {
+    // Every level nests `apply` / `mapv` / a protocol impl and a run
+    // loop on the native stack; the guard stops it before the stack
+    // does (VM.md §13.1).
+    try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (g 300)", "300");
+    try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (try (g 100000000) (catch any e e))", ":stack-overflow");
+    try expectOutput("(defn h [n] (if (= n 0) 0 (+ 1 (first (mapv h [(- n 1)]))))) (try (h 100000000) (catch any e e))", ":stack-overflow");
+    // The VM is whole afterwards: the next call runs normally.
+    try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (try (g 100000000) (catch any e e)) (g 10)", "10");
+}
+
+test "integration: runaway recursion is a catchable :stack-overflow; deep legitimate recursion runs" {
+    try expectOutput("(defn d [n] (if (= n 0) 0 (inc (d (dec n))))) (d 100000)", "100000");
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.max_frames = 20_000;
+    try harness.expectResult(&program, "", try program.run("(defn f [n] (inc (f n))) (try (f 1) (catch any e [:caught e]))"), "[:caught :stack-overflow]");
+    try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+    try testing.expectError(vm.VmError.StackOverflow, program.run("(f 1)"));
+    // The trace keeps the innermost 32 frames and the outermost 8
+    // around one marker for the rest.
+    const trace = program.v.error_trace.items;
+    try testing.expectEqual(@as(usize, 41), trace.len);
+    try testing.expectEqualStrings("f", trace[0].name);
+    try testing.expectEqualStrings("<19960 frames elided>", trace[32].name);
+    try testing.expectEqualStrings("test-form", trace[40].name);
 }
 
 // =============================================================================
