@@ -7,7 +7,9 @@ commitments here are strongest when they cannot be post-rationalized
 against favorable measurements.
 
 Derivative from `PLAN.md` §19.6 / §19.7 / §19.8 (performance Tier 1/2
-targets and perf-gate text). PLAN.md wins on conflict.
+targets and perf-gate text). PLAN.md wins on conflict. §1–§9 and §11
+are the contract for a published comparison; §10 is the harness that
+produces nexis's own numbers (`zig build bench`).
 
 ---
 
@@ -149,8 +151,12 @@ The symmetric rules, enforced on our own side:
   any exist, are published as their own rows labeled as
   optimization-tier measurements, not folded into the baseline.
 - **Idiomatic nexis code**, not hand-unrolled core-primitives
-  invocation. Stdlib forms like `defn`, `->>`, `reduce` are used
-  in benchmark code the same way a nexis user would use them.
+  invocation, in any benchmark compared with another system. Stdlib
+  forms like `defn`, `->>`, `reduce` are used in benchmark code the
+  same way a nexis user would use them. The harness rows (§10) call
+  runtime primitives directly; they are nexis-only measurements of
+  those primitives and are never set against another system's
+  idiomatic code.
 - **No disabled safety paths for benchmark runs.** Everything runs
   with the same runtime safety settings a user would run. If a
   "release-unsafe" variant is published, it's its own row and
@@ -234,19 +240,50 @@ Before any comparative benchmark report is published:
 
 ---
 
-### 10. What this doc does not cover
+### 10. The harness: `zig build bench`
 
-- **Specific benchmark content.** The suite is `src/bench.zig` +
-  `bench/main.zig` (`docs/PERF.md` §3); each published report gets
-  its own `README.md` per §7. This doc is methodology, not suite
-  design.
-- **Benchmark-driven performance tuning.** PLAN §19 defines the
-  Tier 1/2/3 wins with projected magnitudes; `docs/PERF.md` is
-  where measurements are published. This doc is the publication contract,
-  not the implementation plan.
-- **Marketing copy.** Headline positioning (PLAN §19.7) is allowed
-  to be aspirational; the comparative benchmark report is where
-  aspirations meet measurement and must survive that collision.
+The harness is `src/bench.zig` (Runner, Stats, table, JSON); the
+suite is `bench/main.zig` and `bench/nextomic.zig`. The numbers of
+record, each with its host, live in `docs/PERF.md` §3.
+
+```bash
+zig build bench                                  # the whole suite, table to stdout
+zig build bench -- --filter vm,codec             # named categories only
+zig build bench -- --out run.json --note "idle"  # also the JSON, with a note
+```
+
+The runner and the whole runtime it drives are compiled ReleaseFast
+(`-Doptimize=ReleaseSafe` or `ReleaseSmall` select those instead); a
+Debug build is never a measurement. An unknown flag or category is an
+error. JSON files are run artifacts and are not committed.
+
+| Harness category | §2 category | Measures |
+|---|---|---|
+| `scalar` | Warm microbenchmark | fixnum and float arithmetic; hashing a fixnum, keyword, string and raw bytes |
+| `collection-construction` | Collection construction | list, vector, map and set built by N `conj`/`assoc` from empty (N = 16, 256, 4096) |
+| `transient-construction` | Collection construction | the same through transients and `persistent!` |
+| `collection-lookup-update` | Collection lookup/update | `nth`, `get` and `contains?` over prebuilt collections (N = 256, 4096) |
+| `compiler` | Warm microbenchmark | `compile_simple` reads, expands and compiles `(+ 1 2)`; the other rows run the whole pipeline per sample (VM construction, compile, run) for a one-form program |
+| `vm` | Warm microbenchmark | the dispatch loop alone: a routine compiled once, rerun on one VM |
+| `codec` | Warm microbenchmark | encode and decode of a fixnum and a 64-entry map |
+| `db-integrated` | Database-integrated | an emdb put-and-commit and a get, on a store under `$TMPDIR` |
+| `nextomic` | Database-integrated | `q` over a 200k-datom store and `pull` over 20k entities (PERF §3.7) |
+
+Method (§3): a pilot doubles its repetitions until one timing spans a
+millisecond and picks `inner_reps` so a sample lasts at least 50 ms;
+10 warm-up samples are discarded and 30 kept. A sample is its elapsed
+`CLOCK_MONOTONIC` time over `inner_reps`, kept as a fraction of a
+nanosecond. The table and the JSON report min, p5, median, p95, p99,
+max (nearest rank, never interpolated), mean and stddev; ops/sec is
+derived from the median. Setup stays outside the timed body unless a
+row says it measures it (the `compiler` pipeline rows), and a body
+that allocates keeps its memory bounded (the decode rows drop their
+scratch heap every 16 MiB).
+
+This document does not cover benchmark-driven tuning (PLAN §19 names
+the Tier 1/2/3 wins; `docs/PERF.md` records what was measured) or
+marketing copy (PLAN §19.7 may be aspirational; a comparative report
+is where it meets measurement).
 
 ---
 
