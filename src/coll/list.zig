@@ -13,7 +13,9 @@
 //!         tag bits 32..63 hold the offset of its first element. The
 //!         elements of a vector from an offset on, so `seq`, `rest`
 //!         and `next` of a vector are O(1): `tail` of a view is the
-//!         same block at the next offset and allocates nothing.
+//!         same block at the next offset and allocates nothing. A
+//!         view carrying metadata holds, instead of the vector, a
+//!         view Value of the metadata-free block its rests share.
 //!
 //! Every reader goes through `isEmpty` / `head` / `tail` / `count` /
 //! `drop` / `Cursor`; only this file knows the bodies.
@@ -95,6 +97,15 @@ pub fn cons(heap: *Heap, head_v: Value, tail_v: Value) !Value {
     return valueFrom(h, subkind_cons);
 }
 
+/// `(conj l x)`: `x` prepended in a cell that carries `l`'s metadata,
+/// as Clojure's `conj` on a list does (SEMANTICS §7); `cons` carries
+/// none.
+pub fn conj(heap: *Heap, l: Value, x: Value) !Value {
+    const c = try cons(heap, x, l);
+    Heap.asHeapHeader(c).setMeta(Heap.asHeapHeader(l).getMeta());
+    return c;
+}
+
 /// Build a list from `elems` in natural order: `fromSlice(&.{a,b,c})`
 /// produces `(a b c)`. Right-folds `cons` from the end of the slice;
 /// O(n) allocations.
@@ -116,6 +127,21 @@ pub fn ofVector(heap: *Heap, vec: Value, start: usize) !Value {
     const h = try heap.alloc(.list, view_body_size);
     Heap.bodyOf(Value, h).* = vec;
     return viewAt(h, start);
+}
+
+/// The view `v` carrying `meta`, in O(1). The metadata goes on a new
+/// view block whose body is the metadata-free block `v` reads, and
+/// `tail` and `drop` step onto that block, so the metadata stays on
+/// the view `with-meta` returned and never reaches a rest (LIST.md
+/// §1). Null metadata gives the metadata-free view.
+pub fn viewWithMeta(heap: *Heap, v: Value, meta: ?*HeapHeader) !Value {
+    std.debug.assert(v.kind() == .list and v.subkind() == subkind_view);
+    const plain = restBlock(v);
+    const m = meta orelse return viewAt(plain, viewOffset(v));
+    const h = try heap.alloc(.list, view_body_size);
+    Heap.bodyOf(Value, h).* = valueFrom(plain, subkind_view);
+    h.setMeta(m);
+    return viewAt(h, viewOffset(v));
 }
 
 // =============================================================================
@@ -142,7 +168,7 @@ pub fn head(v: Value) Value {
 /// safe builds if the list is empty.
 pub fn tail(v: Value) Value {
     if (std.debug.runtime_safety and isEmpty(v)) std.debug.panic("list.tail: called on empty list", .{});
-    if (v.subkind() == subkind_view) return viewAt(Heap.asHeapHeader(v), viewOffset(v) + 1);
+    if (v.subkind() == subkind_view) return viewAt(restBlock(v), viewOffset(v) + 1);
     return consBody(v).tail;
 }
 
@@ -172,7 +198,7 @@ pub fn drop(v: Value, n: usize) Value {
         subkind_view => {
             const at = viewOffset(cur);
             const remaining = vector.count(viewVector(cur)) - at;
-            return viewAt(Heap.asHeapHeader(cur), at + @min(left, remaining));
+            return viewAt(restBlock(cur), at + @min(left, remaining));
         },
         else => return cur,
     };
@@ -314,8 +340,16 @@ fn viewOffset(v: Value) usize {
     return @intCast(v.tag >> 32);
 }
 
+/// The metadata-free block a view's rests share: the view's own, or
+/// the one a view carrying metadata wraps (`viewWithMeta`).
+fn restBlock(v: Value) *HeapHeader {
+    const h = Heap.asHeapHeader(v);
+    const body = Heap.bodyOf(Value, h).*;
+    return if (body.kind() == .list) Heap.asHeapHeader(body) else h;
+}
+
 fn viewVector(v: Value) Value {
-    return Heap.bodyOf(Value, Heap.asHeapHeader(v)).*;
+    return Heap.bodyOf(Value, restBlock(v)).*;
 }
 
 fn consBody(v: Value) *ConsBody {

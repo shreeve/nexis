@@ -26,7 +26,8 @@
 //! and `hash` are too many to thread an error through, so the VM reads
 //! `overflowCount` around each native call and opcode that compares or
 //! hashes and turns a change into the catchable `:stack-overflow`
-//! (SEMANTICS §2.7). A map, set or record whose hash was computed past
+//! (SEMANTICS §2.7), rewinding the count as it does so that one
+//! overflow is reported once, by the innermost call that saw it. A map, set or record whose hash was computed past
 //! an overflow keeps no cached hash.
 
 const std = @import("std");
@@ -99,6 +100,14 @@ pub fn overflowCount() u64 {
 /// Record that a recursion on data depth stopped at the stack guard.
 pub fn noteOverflow() void {
     overflow_count +%= 1;
+}
+
+/// Consume the overflows counted since `before`: the caller has turned
+/// them into a throw (or abandoned the answer they spoiled), so a
+/// caller further out that took its snapshot earlier must not see them
+/// again.
+pub fn rewindOverflows(before: u64) void {
+    overflow_count = before;
 }
 
 // =============================================================================

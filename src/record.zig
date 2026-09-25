@@ -85,10 +85,14 @@ pub inline fn fieldsOf(v: Value) Value {
     return Heap.bodyOf(RecordBody, Heap.asHeapHeader(v)).fields;
 }
 
-/// Return a NEW record Value with the same type_id but `new_fields`
-/// substituted. Used by `assoc` / `dissoc` to preserve record type.
+/// Return a NEW record Value with the same type_id and metadata but
+/// `new_fields` substituted. Used by `assoc` / `dissoc` to preserve
+/// record type; the metadata stays as on every Clojure record update
+/// (SEMANTICS §7).
 pub fn withFields(heap: *Heap, v: Value, new_fields: Value) !Value {
-    return try make(heap, typeId(v), new_fields);
+    const r = try make(heap, typeId(v), new_fields);
+    Heap.asHeapHeader(r).setMeta(Heap.asHeapHeader(v).getMeta());
+    return r;
 }
 
 // =============================================================================

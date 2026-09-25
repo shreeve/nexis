@@ -146,7 +146,10 @@ Past the stack guard (`src/stack.zig`) they do not fault: the step that
 ran out answers `false`, `0` or a `#<too deep>` marker and counts an
 overflow (`dispatch.overflowCount`), and the VM turns a count that
 changed across a native call or opcode into the catchable
-`:stack-overflow` (`docs/VM.md` §13.1). A map, set or record whose hash
+`:stack-overflow` (`docs/VM.md` §13.1). The raise consumes the
+overflows it reports, as does a native call that fails, so one overflow
+raises once: a callback that catches it returns normally to the native
+that called it. A map, set or record whose hash
 was computed past an overflow keeps no cached hash, so the wrong answer
 never outlives the throw. The codec bounds nesting at 4096 levels
 instead (`docs/CODEC.md` §2.7).
@@ -397,9 +400,10 @@ map or `nil`; it never throws.
 
 | Kind | `with-meta` / `vary-meta` | `meta` |
 |---|---|---|
-| `list`, `vector`, `map`, `set` | a copy of the root block carrying the map; every node below the root is shared. A vector view is first rebuilt as cons cells, so the metadata does not follow `rest` into the shared vector | the map or `nil` |
-| `var` | `:no-metadata-on-immediate`. A Var's metadata changes in place with `reset-meta!` / `alter-meta!`; `def`, `defn` and `defmacro` set it from `^meta` on the name, a docstring (`:doc`) and an attribute map, `defn` and `defmacro` adding `:arglists`; `:dynamic true` makes the Var dynamic | the map or `nil` |
-| every other kind: `nil`, booleans, `char`, numbers, `string`, `keyword`, `symbol`, `typed-vector`, `record`, `function`, `native-fn`, `atom`, `transient`, `durable-ref`, protocols, the db and Nextomic handles | `:no-metadata-on-immediate` | `nil` |
+| `list`, `vector`, `map`, `set`, `record` | a copy of the root block carrying the map; every node below the root is shared. A vector view gets one new view block that carries the map and wraps the metadata-free one, so its `rest` carries none (`docs/LIST.md` §2) | the map or `nil` |
+| `var` | `:kind-mismatch`. A Var's metadata changes in place with `reset-meta!` / `alter-meta!`; `def`, `defn` and `defmacro` set it from `^meta` on the name, a docstring (`:doc`) and an attribute map, `defn` and `defmacro` adding `:arglists`; `:dynamic true` makes the Var dynamic | the map or `nil` |
+| the scalars: `nil`, booleans, `char`, numbers, `string`, `keyword`, `symbol` | `:no-metadata-on-immediate` | `nil` |
+| every other kind: `typed-vector`, `function`, `native-fn`, `atom`, `transient`, `durable-ref`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |
 
 - The metadata argument is a map or `nil` (which clears it); anything
   else is `:kind-mismatch`, checked before the target's kind.
@@ -407,12 +411,19 @@ map or `nil`; it never throws.
   `:kind-mismatch`.
 - Reader metadata on a collection literal attaches: `(meta ^:foo [1])`
   is `{:foo true}`.
-- **Known divergence from Clojure.** Metadata stays on the value
-  `with-meta` returned: `conj`, `assoc`, `dissoc`, `disj`, `pop`,
-  `into`, `rest` and every other operation that builds a new
-  collection return one without metadata, where Clojure carries it
-  over. An update that changes nothing (`(assoc m :a 1)` when `:a` is
-  already `1`) returns its argument, metadata included.
+- **Updates keep it**, as in Clojure. `conj`, `assoc`, `dissoc`,
+  `disj`, a vector's `pop` and `empty` return a collection carrying
+  their argument's metadata, and so do `into` (its target's),
+  `merge`, `update`, `assoc-in` and the rest built on them; a
+  record's `assoc` and `dissoc` keep the record's. The collection
+  modules carry it from the old root to the new one (`champ`,
+  `vector`, `list.conj`, `record.withFields`).
+- **Parts do not.** `rest`, `next`, `seq` of a vector, a list's `pop`
+  and `cons` return a sequence with no metadata of its own; the rest
+  of a list is its tail cell, which carries whatever it was built
+  with. `transient` drops it, so `persistent!` returns a collection
+  without metadata, as in Clojure. Functions that build a fresh
+  collection (`mapv`, `vec` of a seq, `set`, `zipmap`) carry none.
 - Metadata never takes part in `=`, `hash`, printing or the codec:
   `(= v (with-meta v m))` is true and the two hash alike.
 

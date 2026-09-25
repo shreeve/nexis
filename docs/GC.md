@@ -104,15 +104,16 @@ block, only tests do.
 | `gc.Collector` member | Contract |
 |---|---|
 | `init(heap)` | A collector over `heap` with no host |
+| `deinit()` | Frees the gray worklist, whose capacity `collect` keeps |
 | `host: ?Host` | `Host.roots(ctx, collector)` marks every root the runtime holds, once per cycle after the explicit roots; `Host.trace(ctx, h, collector)` walks an already-marked `function` or `cell_internal` block |
 | `markValue(v)` | Ignores immediates and the pointer kinds with no block (`native_fn`, `var_`, the db handles); marks any other Value's header |
-| `mark(h)` | Sets the mark bit once and pushes `h` on the gray worklist; outside `collect` it drains before returning, so a direct call marks the transitive closure |
+| `mark(h)` | Sets the mark bit once and pushes `h` on the gray worklist, unless `h` is a leaf (string, bignum, typed vector, durable ref, protocol, protocol fn, Nextomic connection or db) with no metadata, which has nothing to trace; outside `collect` it drains before returning, so a direct call marks the transitive closure |
 | `markInternal(h) bool` | Sets the mark bit of a collection-internal node and returns whether this call set it; walks neither the node's `meta` nor its kind: the caller walks the payload |
 | `collect(roots) usize` | Marks the roots and the host's roots, drains the worklist, sweeps (`Heap.sweepUnmarked`), resets the heap's allocation counter, and returns the number of blocks freed |
 
 `mark` and `markInternal` share one primitive (`markHeaderOnce`), so
 the mark bit has one owner. Nothing in the API can fail: sweeping only
-frees.
+frees, and a cycle that runs out of memory frees nothing.
 
 **Iterative marking.** The mark phase is a loop, never a recursion on
 the data: `mark` pushes the header on `gray`; the drain pops a header,
@@ -121,10 +122,12 @@ marks its meta map and runs its kind's trace (§5), whose own `mark` and
 deep costs a million entries of `gray`, not a million native frames. A
 kind's trace walks its own interior nodes in place with `markInternal`,
 which is bounded: a vector trie is at most seven levels deep, a CHAMP
-tree thirteen, and a list's tail chain is walked in a loop. If `gray`
-cannot grow, `mark` traces the header on the spot instead, so a cycle
-never fails; only under memory exhaustion does marking recurse. `gray`
-is freed at the end of every cycle.
+tree thirteen, and a list's tail chain is walked in a loop. Marking
+never recurses. If `gray` cannot grow, the header stays marked but
+untraced and the cycle is abandoned: `collect` clears every mark bit
+and frees nothing, and the allocation that next fails ends the program
+with the VM's `OutOfMemory`. The VM keeps `gray` between cycles
+(`VM.gc_gray`), so a cycle reuses the capacity the last one grew.
 
 ---
 
@@ -194,15 +197,17 @@ collect(roots):
     draining = true
     mark each root; host.roots(...)     // push on gray
     while gray.pop() |h|: trace(h)      // the transitive closure
-    draining = false; free gray
+    draining = false; empty gray, keeping its capacity
     freed = heap.sweepUnmarked()        // frees unmarked, unpinned blocks;
                                         // clears the mark on survivors
+                                        // (or, if gray could not grow:
+                                        // clear every mark, free nothing)
     heap.resetAllocationCounter()
     return freed
 ```
 
-The collector keeps no state between cycles: each starts and ends with
-every mark bit clear.
+No marks carry between cycles: each starts and ends with every mark
+bit clear. Only the worklist's capacity carries over.
 
 **Trigger.** `Heap.alloc` counts the bytes it hands out in
 `allocated_since_collect`, and `collect` resets the counter. The VM

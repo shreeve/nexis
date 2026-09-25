@@ -397,6 +397,7 @@ test "T4: transient wrapper as sole root keeps inner structure alive" {
     }
 
     var collector = gc.Collector.init(&heap);
+    defer collector.deinit();
     const live_before = heap.liveCount();
     _ = collector.collect(&.{Heap.asHeapHeader(t)});
     const live_after = heap.liveCount();
@@ -429,6 +430,7 @@ test "T4b: frozen transient still traces inner_header (inner survives via wrappe
     // persistent Value (which points at the same *HeapHeader)
     // remains usable.
     var collector = gc.Collector.init(&heap);
+    defer collector.deinit();
     _ = collector.collect(&.{
         Heap.asHeapHeader(t),
         Heap.asHeapHeader(frozen_persistent),

@@ -1410,6 +1410,9 @@ pub const VM = struct {
     /// Cycles run so far; tests read it to prove a collection
     /// happened.
     gc_cycles: usize = 0,
+    /// The collector's gray worklist, kept between cycles so each
+    /// cycle reuses the capacity the last one grew (GC.md §4).
+    gc_gray: std.ArrayList(*heap_mod.HeapHeader) = .empty,
     /// The root stack (GC.md §3): values a native holds in Zig
     /// locals across a call back into the VM. `callValue` pushes a
     /// native callee's arguments for the call's duration; a native
@@ -1605,6 +1608,7 @@ pub const VM = struct {
         self.dyn_saves.deinit(self.allocator);
         self.dyn_frames.deinit(self.allocator);
         self.roots.deinit(self.allocator);
+        self.gc_gray.deinit(self.allocator);
         // Free handler + finally stack backing storage. Both
         // contain POD entries.
         self.handlers.deinit(self.allocator);
@@ -1768,7 +1772,9 @@ pub const VM = struct {
         const heap = self.ensureHeap();
         var collector = gc_mod.Collector.init(heap);
         collector.host = .{ .ctx = @ptrCast(self), .roots = &gcRoots, .trace = &gcTrace };
+        collector.gray = self.gc_gray;
         _ = collector.collect(&.{});
+        self.gc_gray = collector.gray;
         self.gc_cycles += 1;
         const by_growth = heap.live_bytes / 100 * self.gc_growth_percent;
         self.gc_next_at = @max(self.gc_threshold, by_growth);
@@ -2110,6 +2116,9 @@ pub const VM = struct {
     /// (`callLookup`). Anything else is `NotCallable`.
     fn callDirect(self: *VM, callee: Value, args: []const Value) VmError!Value {
         const overflows = dispatch_mod.overflowCount();
+        // A call that fails spoils nothing its caller sees, so the
+        // overflows under it are consumed with it.
+        errdefer dispatch_mod.rewindOverflows(overflows);
         const result = switch (callee.kind()) {
             .native_fn => blk: {
                 const native = asNativeFn(callee);
@@ -2135,9 +2144,12 @@ pub const VM = struct {
     /// past the stack guard and count an overflow (dispatch.zig);
     /// a call or opcode that compared or hashed across one raises the
     /// catchable `:stack-overflow` instead of returning that answer
-    /// (SEMANTICS §2.7).
+    /// (SEMANTICS §2.7). The raise consumes the overflows it reports,
+    /// so an enclosing native whose callback caught the throw does not
+    /// raise it again.
     fn checkDeepData(self: *VM, overflows_before: u64) VmError!void {
         if (dispatch_mod.overflowCount() != overflows_before) {
+            dispatch_mod.rewindOverflows(overflows_before);
             return self.fail(VmError.StackOverflow, "a value nests too deeply to compare, hash or print", .{});
         }
     }

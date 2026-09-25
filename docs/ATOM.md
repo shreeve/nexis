@@ -180,7 +180,7 @@ first.
 | `:not-callable` | an `f` to `swap!` or `swap-vals!` that cannot be called |
 | `:not-derefable` | `deref` of a value that is not an atom, Var, durable ref or `reduced` |
 | `:unserializable` | the codec meets an atom (§6) |
-| `:no-metadata-on-immediate` | `with-meta` on an atom (SEMANTICS.md §7) |
+| `:kind-mismatch` | `with-meta` on an atom (SEMANTICS.md §7) |
 
 Every one is catchable by keyword, `(catch :atom-re-entry e …)`, or
 with `(catch any e …)` (`docs/VM.md` §12).

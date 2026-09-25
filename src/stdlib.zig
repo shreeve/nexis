@@ -1741,7 +1741,7 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
         .list => blk: {
             var result = coll;
             for (xs) |x| {
-                result = list_mod.cons(heap, x, result) catch return VmError.OutOfMemory;
+                result = list_mod.conj(heap, result, x) catch return VmError.OutOfMemory;
             }
             break :blk result;
         },
@@ -2319,21 +2319,25 @@ fn fnPop(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
-/// `(empty coll)` → an empty collection of the same kind; a
-/// record, being a map, gives `{}`; anything that is not a
-/// collection (a string included) gives nil, as in Clojure.
+/// `(empty coll)` → an empty collection of the same kind carrying
+/// `coll`'s metadata; a record, being a map, gives `{}`; anything
+/// that is not a collection (a string included) gives nil, as in
+/// Clojure.
 fn fnEmpty(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
-    return switch (args[0].kind()) {
-        .nil => value_mod.nilValue(),
-        .list => list_mod.empty(heap) catch VmError.OutOfMemory,
-        .persistent_vector => vector_mod.empty(heap) catch VmError.OutOfMemory,
-        .persistent_map, .record => champ_mod.mapEmpty(heap) catch VmError.OutOfMemory,
-        .persistent_set => champ_mod.setEmpty(heap) catch VmError.OutOfMemory,
+    const e = switch (args[0].kind()) {
+        .nil => return value_mod.nilValue(),
+        .list => list_mod.empty(heap),
+        .persistent_vector => vector_mod.empty(heap),
+        .record => return champ_mod.mapEmpty(heap) catch VmError.OutOfMemory,
+        .persistent_map => champ_mod.mapEmpty(heap),
+        .persistent_set => champ_mod.setEmpty(heap),
         // A typed vector takes no updates (TYPED_VECTOR.md §6).
-        .typed_vector => VmError.KindMismatch,
-        else => value_mod.nilValue(),
-    };
+        .typed_vector => return VmError.KindMismatch,
+        else => return value_mod.nilValue(),
+    } catch return VmError.OutOfMemory;
+    heap_mod.Heap.asHeapHeader(e).setMeta(heap_mod.Heap.asHeapHeader(args[0]).getMeta());
+    return e;
 }
 
 /// `(not-empty coll)` → coll, or nil when it has no elements.
@@ -2617,16 +2621,19 @@ fn fnEval(vm: *VM, args: []const Value) VmError!Value {
 // Metadata (PLAN §8.5, SEMANTICS.md §7)
 // =============================================================================
 //
-// A list, vector, map or set carries its metadata map in the heap
-// header's `meta` slot; a Var carries it in `Var.meta`. Metadata
+// A list, vector, map, set or record carries its metadata map in the
+// heap header's `meta` slot; a Var carries it in `Var.meta`. Metadata
 // never takes part in equality, hashing, printing or the codec.
 
 fn carriesHeaderMeta(k: Kind) bool {
-    return k == .list or k == .persistent_vector or k == .persistent_map or k == .persistent_set;
+    return switch (k) {
+        .list, .persistent_vector, .persistent_map, .persistent_set, .record => true,
+        else => false,
+    };
 }
 
-/// `(meta x)` → the metadata map of a list, vector, map, set or Var;
-/// nil for anything else or when none is attached.
+/// `(meta x)` → the metadata map of a list, vector, map, set, record
+/// or Var; nil for anything else or when none is attached.
 fn fnMeta(_: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     if (x.kind() == .var_) return VM.asVar(x).meta;
@@ -2637,27 +2644,29 @@ fn fnMeta(_: *VM, args: []const Value) VmError!Value {
 
 /// `(with-meta x m)` → a value equal to `x` carrying `m` (a map or
 /// nil) as its metadata. The root object is copied, so `x` keeps its
-/// own; the copy shares every node below the root. A kind that
-/// cannot carry metadata is `:no-metadata-on-immediate`; a Var's
-/// metadata changes in place through `reset-meta!` / `alter-meta!`.
+/// own; the copy shares every node below the root. A scalar (nil, a
+/// boolean, char, number, string, keyword or symbol) is
+/// `:no-metadata-on-immediate`; any other kind that cannot carry
+/// metadata is `:kind-mismatch`, a Var included: its metadata changes
+/// in place through `reset-meta!` / `alter-meta!` (SEMANTICS §7).
 fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
     const m = args[1];
     if (!m.isNil() and m.kind() != .persistent_map) return VmError.KindMismatch;
-    if (!carriesHeaderMeta(args[0].kind())) return vm.throwKeyword("no-metadata-on-immediate");
-    // Every rest of a vector view shares its block (LIST.md §1), so
-    // metadata on it would follow `rest`; the copy gets cells of its own.
-    const x = if (args[0].kind() == .list and args[0].subkind() == list_mod.subkind_view) blk: {
-        var items = try collectSeq(vm, args[0]);
-        defer items.deinit(vm.allocator);
-        break :blk try buildListFromSlice(vm, items.items);
-    } else args[0];
+    const x = args[0];
+    if (!carriesHeaderMeta(x.kind())) return switch (x.kind()) {
+        .nil, .true_, .false_, .char, .fixnum, .float, .bignum, .string, .keyword, .symbol => vm.throwKeyword("no-metadata-on-immediate"),
+        else => VmError.KindMismatch,
+    };
+    const meta_h: ?*heap_mod.HeapHeader = if (m.isNil()) null else heap_mod.Heap.asHeapHeader(m);
+    // Every rest of a vector view shares its block (LIST.md §2).
+    if (x.kind() == .list and x.subkind() == list_mod.subkind_view) return list_mod.viewWithMeta(vm.ensureHeap(), x, meta_h) catch VmError.OutOfMemory;
     const h = heap_mod.Heap.asHeapHeader(x);
     const body = heap_mod.Heap.bodyBytes(h);
     const copy = vm.ensureHeap().alloc(x.kind(), body.len) catch return VmError.OutOfMemory;
     @memcpy(heap_mod.Heap.bodyBytes(copy), body);
     copy.kind = h.kind;
     copy.flags = h.flags & ~heap_mod.flag_has_meta;
-    copy.setMeta(if (m.isNil()) null else heap_mod.Heap.asHeapHeader(m));
+    copy.setMeta(meta_h);
     return .{ .tag = x.tag, .payload = @intFromPtr(copy) };
 }
 
@@ -3401,6 +3410,30 @@ fn transientFailure(vm: *VM, err: anyerror) VmError {
     };
 }
 
+/// Leaves a transient as a raising `!` call found it (TRANSIENT.md §6):
+/// on an error, and when an op hashed or compared past the stack guard,
+/// which `callDirect` raises as `:stack-overflow` once the native
+/// returns (SEMANTICS §2.7). The ops run before a collection can happen,
+/// so the saved collection needs no root.
+const TransientUndo = struct {
+    t: Value,
+    inner: *heap_mod.HeapHeader,
+    overflows: u64,
+
+    fn begin(t: Value) TransientUndo {
+        return .{ .t = t, .inner = transient_mod.savedInner(t), .overflows = dispatch_mod.overflowCount() };
+    }
+
+    fn undo(self: TransientUndo) void {
+        transient_mod.restoreInner(self.t, self.inner);
+    }
+
+    fn keepUnlessOverflowed(self: TransientUndo) Value {
+        if (dispatch_mod.overflowCount() != self.overflows) self.undo();
+        return self.t;
+    }
+};
+
 fn requireTransient(v: Value) VmError!u16 {
     if (v.kind() != .transient) return VmError.KindMismatch;
     return v.subkind();
@@ -3445,14 +3478,16 @@ fn fnPersistentBang(vm: *VM, args: []const Value) VmError!Value {
 fn fnConjBang(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     if (args.len == 0) return fnTransient(vm, &.{vector_mod.empty(heap) catch return VmError.OutOfMemory});
-    var t = args[0];
+    const t = args[0];
     const sub = try requireTransient(t);
-    for (args[1..]) |x| t = switch (sub) {
+    const undo = TransientUndo.begin(t);
+    errdefer undo.undo();
+    for (args[1..]) |x| _ = switch (sub) {
         transient_mod.subkind_transient_map => try conjBangMap(vm, t, x),
         transient_mod.subkind_transient_set => transient_mod.setConjBang(heap, t, x, &dispatch_mod.hashValue, &dispatch_mod.equal),
         else => transient_mod.vectorConjBang(heap, t, x),
     } catch |err| return transientFailure(vm, err);
-    return t;
+    return undo.keepUnlessOverflowed();
 }
 
 /// A transient map with `x` added as `conj` adds it to a map: a
@@ -3479,41 +3514,41 @@ fn conjBangMap(vm: *VM, t: Value, x: Value) VmError!Value {
 fn fnAssocBang(vm: *VM, args: []const Value) VmError!Value {
     if (args.len % 2 != 1) return VmError.ArityMismatch;
     const heap = vm.ensureHeap();
-    var t = args[0];
-    switch (try requireTransient(t)) {
-        transient_mod.subkind_transient_map => {
-            var i: usize = 1;
-            while (i < args.len) : (i += 2) t = transient_mod.mapAssocBang(heap, t, args[i], args[i + 1], &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
-            return t;
-        },
-        transient_mod.subkind_transient_vector => {
-            var i: usize = 1;
-            while (i < args.len) : (i += 2) {
-                const k = args[i];
-                if (k.kind() != .fixnum) return VmError.KindMismatch;
-                if (k.asFixnum() < 0) return VmError.IndexOutOfBounds;
-                t = transient_mod.vectorAssocBang(heap, t, @intCast(k.asFixnum()), args[i + 1]) catch |err| return transientFailure(vm, err);
-            }
-            return t;
-        },
-        else => return VmError.KindMismatch,
+    const t = args[0];
+    const sub = try requireTransient(t);
+    if (sub == transient_mod.subkind_transient_set) return VmError.KindMismatch;
+    const undo = TransientUndo.begin(t);
+    errdefer undo.undo();
+    var i: usize = 1;
+    while (i < args.len) : (i += 2) {
+        const k = args[i];
+        _ = if (sub == transient_mod.subkind_transient_map)
+            transient_mod.mapAssocBang(heap, t, k, args[i + 1], &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err)
+        else blk: {
+            if (k.kind() != .fixnum) return VmError.KindMismatch;
+            if (k.asFixnum() < 0) return VmError.IndexOutOfBounds;
+            break :blk transient_mod.vectorAssocBang(heap, t, @intCast(k.asFixnum()), args[i + 1]) catch |err| return transientFailure(vm, err);
+        };
     }
+    return undo.keepUnlessOverflowed();
 }
 
 /// `(dissoc! t k & ks)` on a transient map.
 fn fnDissocBang(vm: *VM, args: []const Value) VmError!Value {
     if (try requireTransient(args[0]) != transient_mod.subkind_transient_map) return VmError.KindMismatch;
-    var t = args[0];
-    for (args[1..]) |k| t = transient_mod.mapDissocBang(vm.ensureHeap(), t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
-    return t;
+    const undo = TransientUndo.begin(args[0]);
+    errdefer undo.undo();
+    for (args[1..]) |k| _ = transient_mod.mapDissocBang(vm.ensureHeap(), args[0], k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
+    return undo.keepUnlessOverflowed();
 }
 
 /// `(disj! t x & xs)` on a transient set.
 fn fnDisjBang(vm: *VM, args: []const Value) VmError!Value {
     if (try requireTransient(args[0]) != transient_mod.subkind_transient_set) return VmError.KindMismatch;
-    var t = args[0];
-    for (args[1..]) |x| t = transient_mod.setDisjBang(vm.ensureHeap(), t, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
-    return t;
+    const undo = TransientUndo.begin(args[0]);
+    errdefer undo.undo();
+    for (args[1..]) |x| _ = transient_mod.setDisjBang(vm.ensureHeap(), args[0], x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
+    return undo.keepUnlessOverflowed();
 }
 
 /// `(pop! t)` on a transient vector: without its last element.

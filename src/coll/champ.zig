@@ -359,9 +359,23 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             return null;
         }
 
+        /// A root built from `from` by an update carries `from`'s
+        /// metadata, as every Clojure collection update does
+        /// (SEMANTICS §7). `to` is `from` itself or a fresh root.
+        fn keepMeta(from: Value, to: Value) Value {
+            if (to.payload == from.payload) return to;
+            const m = Heap.asHeapHeader(from).getMeta() orelse return to;
+            Heap.asHeapHeader(to).setMeta(m);
+            return to;
+        }
+
         /// `v` with `p` stored under its key (CHAMP.md §8.1): `v`
         /// itself when that changes nothing.
         fn insert(heap: *Heap, v: Value, p: P, elementHash: ElementHash, elementEq: ElementEq) !Value {
+            return keepMeta(v, try insertBare(heap, v, p, elementHash, elementEq));
+        }
+
+        fn insertBare(heap: *Heap, v: Value, p: P, elementHash: ElementHash, elementEq: ElementEq) !Value {
             const h = rootHeader(v);
             if (v.subkind() == subkind_array_map) {
                 const ps = arrayPayloads(h);
@@ -471,6 +485,10 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
         /// array (CHAMP.md §5.6); there is no demotion otherwise
         /// (§5.4).
         fn remove(heap: *Heap, v: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) !Value {
+            return keepMeta(v, try removeBare(heap, v, key, elementHash, elementEq));
+        }
+
+        fn removeBare(heap: *Heap, v: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) !Value {
             const h = rootHeader(v);
             if (v.subkind() == subkind_array_map) {
                 const ps = arrayPayloads(h);

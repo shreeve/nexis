@@ -17,7 +17,7 @@ apart (0, 16, 32 bytes), which is what the collector sees.
 |---|---|---|---|
 | 0 | cons | `{ head: Value, tail: Value }`, 32 B | `tail` is always a `.list` Value |
 | 1 | empty | 0 B | the empty list |
-| 2 | vector view | one vector Value, 16 B | the vector's elements from an offset on |
+| 2 | vector view | one vector Value, 16 B; with metadata, one view Value, 16 B | the vector's elements from an offset on |
 
 **Vector view.** The offset is a `u32` (as a vector's count is) held in
 the Value's tag bits 32..63, never in the block, and is at most the
@@ -57,14 +57,20 @@ reader and macro material; large sequences are vectors.
    computes the same value for the same elements. The caller mixes in
    the sequential domain byte. A cons cell caches a nonzero result in
    its header (SEMANTICS §3.1); a view caches nothing, because every
-   offset of it shares one header.
+   offset of it shares one header. A view used over and over as a map
+   key (memoizing on `(rest args)`) is rehashed in O(n) at each lookup;
+   `vec` of it gives a key that caches its hash.
 3. **Equality.** `equalSeq` walks both lists in lock step through their
    cursors: same length and every pair `=`.
 4. **Metadata** (SEMANTICS §7). Lists carry metadata in the header's
-   `meta` slot. `with-meta` of a view first copies its elements into
-   cons cells, since metadata on the shared view block would follow
-   `rest`; a view block never carries metadata, so `(meta (seq v))` is
-   nil whatever `v`'s metadata.
+   `meta` slot, and `conj` keeps the list's in the new cell; `cons`
+   adds none. A view block that `seq`, `rest` or `drop` returns never
+   carries metadata, so `(meta (seq v))` is nil whatever `v`'s.
+   `with-meta` of a view (`viewWithMeta`) is O(1): one new view block
+   carrying the metadata, whose body is the metadata-free view block
+   it wraps instead of the vector. `tail` and `drop` of it step onto
+   the wrapped block, so its rests carry no metadata, as in Clojure;
+   every other reader reaches the vector through the wrapped block.
 5. **Depth.** `hashSeq`, `equalSeq`, `count`, `drop` and `trace` walk
    the top-level chain iteratively, so a long flat list costs constant
    stack. Elements recurse through `dispatch.hashValue` and
@@ -81,8 +87,10 @@ reader and macro material; large sequences are vectors.
 |---|---|
 | `empty(heap) !Value` | fresh empty list (subkind 1) |
 | `cons(heap, head, tail) !Value` | one cons cell; `error.InvalidListTail` for a non-list tail |
+| `conj(heap, l, x) !Value` | `cons` whose cell carries `l`'s metadata |
 | `fromSlice(heap, elems) !Value` | `(a b c)` from `&.{a, b, c}`, right-folded `cons` |
 | `ofVector(heap, vec, start) !Value` | one view block; `start` ≤ the vector's count |
+| `viewWithMeta(heap, view, meta) !Value` | the view carrying `meta` (§2 invariant 4); null gives the metadata-free view |
 | `isEmpty(v) bool` | the empty list, or a view at its vector's end |
 | `head(v) Value` | first element; panics in safe builds on an empty list |
 | `tail(v) Value` | the rest, always a list; never allocates; panics on empty |
@@ -105,8 +113,9 @@ nil-returning `first`, `rest` and `next` are stdlib natives on top.
 - **GC** (`docs/GC.md` §5). `trace` marks every head and marks each
   following cons cell directly, in a loop, so the collector's recursion
   follows nesting, never length. It stops at the empty list, at an
-  already-marked cell, or at a view, which marks its whole vector (the
-  block does not know the offset).
+  already-marked cell, or at a view, which marks its body: the whole
+  vector (the block does not know the offset), or for a view carrying
+  metadata the view block it wraps.
 - **Compiler and VM.** Quoted lists reach runtime through the
   `coll:list` opcode, which builds them with `cons` (`docs/VM.md`
   §10.8).
