@@ -3839,40 +3839,54 @@ fn fnStringUpperCase(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// The six ASCII whitespace characters: space, tab, LF, VT, FF, CR.
-fn isAsciiSpace(b: u8) bool {
-    return b == ' ' or b == '\t' or b == '\n' or b == 0x0B or b == 0x0C or b == '\r';
+/// Java's `Character.isWhitespace`, which Clojure's `blank?` and `trim`
+/// use: the Unicode space, line and paragraph separators except the
+/// no-break ones, and the controls tab through CR and FS through US.
+fn isJavaWhitespace(c: u21) bool {
+    return switch (c) {
+        0x09...0x0D, 0x1C...0x20, 0x1680, 0x2000...0x2006, 0x2008...0x200A, 0x2028, 0x2029, 0x205F, 0x3000 => true,
+        else => false,
+    };
 }
 
-/// `trim`, `triml`, `trimr`: `s` without ASCII whitespace at both
-/// ends, the start or the end; `trim-newline` without every `\n`
-/// and `\r` at the end.
-fn trimString(vm: *VM, s: Value, left: bool, right: bool, comptime isTrimmed: fn (u8) bool) VmError!Value {
+/// `trim`, `triml`, `trimr`: `s` without whitespace at both ends, the
+/// start or the end; `trim-newline` without every `\n` and `\r` at the
+/// end. Bytes that are not UTF-8 are never trimmed.
+fn trimString(vm: *VM, s: Value, left: bool, right: bool, comptime isTrimmed: fn (u21) bool) VmError!Value {
     const src = try stringArg(s);
     var lo: usize = 0;
     var hi: usize = src.len;
-    if (left) while (lo < hi and isTrimmed(src[lo])) {
-        lo += 1;
+    if (left) while (lo < hi) {
+        const len = std.unicode.utf8ByteSequenceLength(src[lo]) catch break;
+        if (len > hi - lo) break;
+        const c = std.unicode.utf8Decode(src[lo..][0..len]) catch break;
+        if (!isTrimmed(c)) break;
+        lo += len;
     };
-    if (right) while (hi > lo and isTrimmed(src[hi - 1])) {
-        hi -= 1;
+    if (right) while (hi > lo) {
+        var start = hi - 1;
+        while (start > lo and src[start] & 0xC0 == 0x80) start -= 1;
+        const c = std.unicode.utf8Decode(src[start..hi]) catch break;
+        if (!isTrimmed(c)) break;
+        hi = start;
     };
     return string_mod.fromBytes(vm.ensureHeap(), src[lo..hi]) catch return VmError.OutOfMemory;
 }
 
-fn isNewline(b: u8) bool {
-    return b == '\n' or b == '\r';
+fn isNewline(c: u21) bool {
+    return c == '\n' or c == '\r';
 }
 
 fn fnStringTrim(vm: *VM, args: []const Value) VmError!Value {
-    return trimString(vm, args[0], true, true, isAsciiSpace);
+    return trimString(vm, args[0], true, true, isJavaWhitespace);
 }
 
 fn fnStringTriml(vm: *VM, args: []const Value) VmError!Value {
-    return trimString(vm, args[0], true, false, isAsciiSpace);
+    return trimString(vm, args[0], true, false, isJavaWhitespace);
 }
 
 fn fnStringTrimr(vm: *VM, args: []const Value) VmError!Value {
-    return trimString(vm, args[0], false, true, isAsciiSpace);
+    return trimString(vm, args[0], false, true, isJavaWhitespace);
 }
 
 fn fnStringTrimNewline(vm: *VM, args: []const Value) VmError!Value {
@@ -3884,10 +3898,19 @@ fn stringArg(v: Value) VmError![]const u8 {
     return string_mod.asBytes(v);
 }
 
-/// `(blank? s)` → whether `s` is nil, empty or only whitespace.
+/// `(blank? s)` → whether `s` is nil, empty or only whitespace (Java's,
+/// as `trim` reads it).
 fn fnStringBlankQ(_: *VM, args: []const Value) VmError!Value {
     if (args[0].isNil()) return value_mod.fromBool(true);
-    for (try stringArg(args[0])) |b| if (!isAsciiSpace(b)) return value_mod.fromBool(false);
+    const src = try stringArg(args[0]);
+    var i: usize = 0;
+    while (i < src.len) {
+        const len = std.unicode.utf8ByteSequenceLength(src[i]) catch return value_mod.fromBool(false);
+        if (len > src.len - i) return value_mod.fromBool(false);
+        const c = std.unicode.utf8Decode(src[i..][0..len]) catch return value_mod.fromBool(false);
+        if (!isJavaWhitespace(c)) return value_mod.fromBool(false);
+        i += len;
+    }
     return value_mod.fromBool(true);
 }
 
@@ -3931,7 +3954,10 @@ fn stringSearch(vm: *VM, args: []const Value, last: bool) VmError!Value {
     var buf: [4]u8 = undefined;
     const needle = try needleBytes(args[1], &buf);
     const n = string_mod.codepointCount(args[0]) catch return VmError.Utf8Error;
-    const from: usize = if (args.len == 3) @intCast(std.math.clamp(try requireFixnum(args[2]), 0, @as(i64, @intCast(n)))) else if (last) n else 0;
+    const from_arg: ?i64 = if (args.len == 3) try requireFixnum(args[2]) else null;
+    // Java's lastIndexOf finds nothing before a negative index.
+    if (last and from_arg != null and from_arg.? < 0) return value_mod.nilValue();
+    const from: usize = if (from_arg) |f| @intCast(std.math.clamp(f, 0, @as(i64, @intCast(n)))) else if (last) n else 0;
     const at = string_mod.byteRangeForCodepoints(args[0], from, from) catch return VmError.Utf8Error;
     const byte_at: ?usize = if (last)
         std.mem.lastIndexOf(u8, src[0..@min(src.len, at.start + needle.len)], needle)
@@ -3945,15 +3971,14 @@ fn stringSearch(vm: *VM, args: []const Value, last: bool) VmError!Value {
 /// `sep`, as Clojure's `split` with a regex that matches only `sep`:
 /// trailing empty pieces are dropped; a positive `limit` splits at
 /// most `limit - 1` times and keeps the rest whole; a negative one
-/// keeps trailing empties.
-///   - Empty separator → :invalid-argument
+/// keeps trailing empties. An empty `sep` splits between code points,
+/// as `#""` does.
 ///   - Invalid UTF-8 in either string → :utf8-error
 fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string or args[1].kind() != .string) return VmError.KindMismatch;
     const src = string_mod.asBytes(args[0]);
     const sep = string_mod.asBytes(args[1]);
     const limit: i64 = if (args.len == 3) try requireFixnum(args[2]) else 0;
-    if (sep.len == 0) return VmError.InvalidArgument;
     // A separator that is not UTF-8 could match the first byte of a
     // multibyte scalar and split inside it (STRING.md §2).
     if (!std.unicode.utf8ValidateSlice(src)) return VmError.Utf8Error;
@@ -3963,7 +3988,14 @@ fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
     defer pieces.deinit(vm.allocator);
     var rest = src;
     while (limit <= 0 or pieces.items.len + 1 < limit) {
-        const at = std.mem.indexOf(u8, rest, sep) orelse break;
+        // An empty separator matches after each code point but the
+        // last, whose match ends the text.
+        const at = if (sep.len > 0)
+            std.mem.indexOf(u8, rest, sep) orelse break
+        else if (rest.len > 0)
+            std.unicode.utf8ByteSequenceLength(rest[0]) catch unreachable
+        else
+            break;
         pieces.append(vm.allocator, rest[0..at]) catch return VmError.OutOfMemory;
         rest = rest[at + sep.len ..];
     }
@@ -3999,8 +4031,9 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(nexis.string/replace s match replacement)` — literal,
-/// all-non-overlapping, left-to-right.
-///   - Empty `match` → :invalid-argument
+/// all-non-overlapping, left-to-right; `match` and `replacement` are
+/// both strings or both chars. An empty `match` matches before every
+/// code point and at the end, as Java's `String.replace`.
 ///   - Invalid UTF-8 in any arg → :utf8-error
 /// After each match, cursor advances by `match.len` so
 /// `(replace "aaa" "aa" "x") → "xa"`.
@@ -4008,13 +4041,13 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
     const match = args[1];
     const replacement = args[2];
-    if (s.kind() != .string or match.kind() != .string or replacement.kind() != .string) {
-        return VmError.KindMismatch;
-    }
+    const pair: Kind = if (match.kind() == .char) .char else .string;
+    if (s.kind() != .string or match.kind() != pair or replacement.kind() != pair) return VmError.KindMismatch;
     const src = string_mod.asBytes(s);
-    const m = string_mod.asBytes(match);
-    const r = string_mod.asBytes(replacement);
-    if (m.len == 0) return VmError.InvalidArgument;
+    var match_buf: [4]u8 = undefined;
+    var replacement_buf: [4]u8 = undefined;
+    const m = try needleBytes(match, &match_buf);
+    const r = try needleBytes(replacement, &replacement_buf);
     // Validate all three byte slices as UTF-8 before scanning.
     // Same rationale
     // as fnStringSplit — keep `nexis.string/*` semantically a
@@ -4026,7 +4059,15 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(vm.allocator);
 
-    var cursor: usize = 0;
+    if (m.len == 0) {
+        var it = std.unicode.Utf8View.initUnchecked(src).iterator();
+        while (it.nextCodepointSlice()) |c| {
+            buf.appendSlice(vm.allocator, r) catch return VmError.OutOfMemory;
+            buf.appendSlice(vm.allocator, c) catch return VmError.OutOfMemory;
+        }
+        buf.appendSlice(vm.allocator, r) catch return VmError.OutOfMemory;
+    }
+    var cursor: usize = if (m.len == 0) src.len else 0;
     while (cursor < src.len) {
         const rel = std.mem.indexOf(u8, src[cursor..], m);
         if (rel) |off| {

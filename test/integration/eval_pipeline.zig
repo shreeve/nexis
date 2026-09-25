@@ -2474,11 +2474,9 @@ test "nexis.string: split: literal delimiter; trailing empties dropped unless th
 }
 
 test "nexis.string: split: empty delim and non-string args" {
-    // Empty delimiter is a string of the wrong VALUE (not the
-    // wrong KIND), so it surfaces `:invalid-argument` per turn
-    // 80's taxonomy improvement; non-string args remain
-    // `:kind-mismatch`.
-    try expectOutput("(try (nexis.string/split \"abc\" \"\") (catch any e e))", ":invalid-argument");
+    // An empty separator splits between code points, as Clojure's
+    // split on #"" does; non-string args are `:kind-mismatch`.
+    try expectOutput("(pr-str [(nexis.string/split \"abc\" \"\") (nexis.string/split \"héb\" \"\" -1) (nexis.string/split \"abc\" \"\" 2) (nexis.string/split \"\" \"\")])", "[[\"a\" \"b\" \"c\"] [\"h\" \"é\" \"b\" \"\"] [\"a\" \"bc\"] [\"\"]]");
     try expectOutput("(try (nexis.string/split \"abc\" 42) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (nexis.string/split 1 \",\") (catch any e e))", ":kind-mismatch");
 }
@@ -2532,6 +2530,11 @@ test "nexis.string: predicates and searches" {
     try expectOutput("[(nexis.string/index-of \"héllo\" \"l\") (nexis.string/index-of \"héllo\" \\l 3) (nexis.string/index-of \"abc\" \"z\") (nexis.string/last-index-of \"héllo\" \"l\") (nexis.string/last-index-of \"abcabc\" \"b\" 3)]", "[2 3 nil 3 1]");
     try expectOutput("[(nexis.string/blank? nil) (nexis.string/blank? \" \\t\\n\") (nexis.string/blank? \" x \")]", "[true true false]");
     try expectOutput("(try (nexis.string/starts-with? 1 \"a\") (catch any e e))", ":kind-mismatch");
+    // Java's lastIndexOf finds nothing before a negative index.
+    try expectOutput("[(nexis.string/last-index-of \"abc\" \"a\" -1) (nexis.string/last-index-of \"abc\" \"a\" 0) (nexis.string/index-of \"abc\" \"a\" -5)]", "[nil 0 0]");
+    // Whitespace is Java's Character/isWhitespace, as Clojure's blank?
+    // and trim use it: U+2003 and U+3000 are, U+00A0 is not.
+    try expectOutput("(pr-str [(nexis.string/blank? \"\u{2003}\u{3000}\") (nexis.string/blank? \"\u{00A0}\") (nexis.string/blank? (str (char 28) (char 31))) (nexis.string/trim \"\u{2003}x\u{2028} \") (nexis.string/triml \"\u{3000}a\") (nexis.string/trimr \"a\u{205F}\")])", "[true false true \"x\" \"a\" \"a\"]");
 }
 
 test "nexis.string: capitalize, reverse, triml, trimr, trim-newline, split-lines" {
@@ -2546,6 +2549,10 @@ test "nexis.set: union, intersection, difference, subset?, superset?, select, ma
 }
 
 test "nexis.string: replace: literal, all-non-overlapping" {
+    // A char for a char, and an empty match between code points, as
+    // Clojure's replace (Java's String.replace) does.
+    try expectOutput("(pr-str [(nexis.string/replace \"aXbX\" \\X \\-) (nexis.string/replace \"héé\" \\é \\e) (nexis.string/replace \"abc\" \"\" \"-\") (nexis.string/replace \"\" \"\" \"-\")])", "[\"a-b-\" \"hee\" \"-a-b-c-\" \"-\"]");
+    try expectOutput("[(try (nexis.string/replace \"abc\" \\a \"x\") (catch any e e)) (try (nexis.string/replace \"abc\" \"a\" \\x) (catch any e e))]", "[:kind-mismatch :kind-mismatch]");
     try expectOutput("(nexis.string/replace \"abc\" \"b\" \"X\")", "aXc");
     try expectOutput("(nexis.string/replace \"abababab\" \"ab\" \"X\")", "XXXX");
     // STRING.md §8 item 5: after a match the cursor advances by the
@@ -2560,10 +2567,7 @@ test "nexis.string: replace: literal, all-non-overlapping" {
     try expectOutput("(nexis.string/replace \"foobar\" \"foo\" \"\")", "bar");
 }
 
-test "nexis.string: replace: empty match / non-string args" {
-    // Empty match → :invalid-argument (right kind, wrong value);
-    // non-string args → :kind-mismatch.
-    try expectOutput("(try (nexis.string/replace \"abc\" \"\" \"x\") (catch any e e))", ":invalid-argument");
+test "nexis.string: replace: non-string args" {
     try expectOutput("(try (nexis.string/replace \"abc\" :nope \"x\") (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (nexis.string/replace \"abc\" \"b\" 42) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (nexis.string/replace 42 \"b\" \"x\") (catch any e e))", ":kind-mismatch");
