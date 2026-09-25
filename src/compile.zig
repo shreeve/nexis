@@ -86,6 +86,10 @@ const heap_mod = @import("heap.zig");
 const string_mod = @import("string.zig");
 const bignum_mod = @import("bignum.zig");
 const stack = @import("stack.zig");
+const list_mod = @import("coll/list.zig");
+const vector_mod = @import("coll/vector.zig");
+const champ_mod = @import("coll/champ.zig");
+const dispatch_mod = @import("dispatch.zig");
 
 pub const Inst = vm.Inst;
 pub const Routine = vm.Routine;
@@ -122,19 +126,10 @@ pub const Tiny = union(enum) {
     /// Missing ns / missing var both surface as UnresolvedSymbol
     /// at compile time.
     qualified_symbol: struct { ns: []const u8, name: []const u8 },
-    /// Generic literal Value constant. Used by `lowerQuotePayload`
-    /// for quoted symbols/keywords (which become symbol/keyword
-    /// Values via the VM's Interner) and by Form lowering for
-    /// keywords, strings, floats and chars.
-    ///
-    /// Quoted nil/bool/int go through the plain Tiny variants —
-    /// they're cheaper than const-pool entries.
-    ///
-    /// **Lifetime constraint**: the Value must be stable for the
-    /// lifetime of the Compiled artifact. Interned symbols/
-    /// keywords satisfy this (the Interner outlives compile +
-    /// VM run). Heap-backed Values from arbitrary sources do NOT
-    /// — only use `Tiny.literal` for Values with stable identity.
+    /// A constant Value: a keyword, string, float, char, bignum, quoted
+    /// symbol, or a collection of constants built at lowering. It
+    /// lives in the routine's constant pool, which keeps a heap
+    /// Value alive for as long as the routine can run.
     literal: value_mod.Value,
     /// A collection built from its evaluated items: the internal
     /// `#%list`, `#%concat`, `#%vector`, `#%map` and `#%set` forms
@@ -686,6 +681,8 @@ const Emitter = struct {
     allocator: std.mem.Allocator,
     code: std.ArrayList(Inst) = .empty,
     consts: std.ArrayList(vm.Const) = .empty,
+    /// Where each Value constant sits in `consts`.
+    value_consts: std.AutoHashMapUnmanaged([2]u64, u12) = .empty,
     capture_descs: std.ArrayList(vm.CaptureDescriptor) = .empty,
     scope: std.ArrayList(LocalBinding) = .empty,
     /// The next free slot. Slots are a stack: `compileExpr` frees
@@ -765,6 +762,7 @@ const Emitter = struct {
         self.span_table.deinit(self.allocator);
         self.code.deinit(self.allocator);
         self.consts.deinit(self.allocator);
+        self.value_consts.deinit(self.allocator);
         self.capture_descs.deinit(self.allocator);
         self.scope.deinit(self.allocator);
         self.captures.deinit(self.allocator);
@@ -899,10 +897,9 @@ const Emitter = struct {
         return @intCast(base);
     }
 
-    /// Add a constant to the pool, return its index. Constants are
-    /// not deduplicated. Most callers want `addValueConst(v)` for
-    /// an ordinary `Value` or `addRoutineConst(*const Routine)`
-    /// for `closure:make` lowering.
+    /// Add a constant to the pool, return its index. Most callers
+    /// want `addValueConst(v)` for an ordinary `Value` or
+    /// `addRoutineConst(*const Routine)` for `closure:make` lowering.
     fn addConst(self: *Emitter, c: vm.Const) CompileError!u12 {
         const idx = self.consts.items.len;
         if (idx >= 4096) return CompileError.ConstantPoolOverflow;
@@ -910,9 +907,14 @@ const Emitter = struct {
         return @intCast(idx);
     }
 
-    /// Convenience: add a `Value` constant (the common case).
+    /// The pool index of `v`, one entry per identical Value (same
+    /// bits: the same immediate, or the same heap object).
     fn addValueConst(self: *Emitter, v: Value) CompileError!u12 {
-        return self.addConst(.{ .value = v });
+        const key = [2]u64{ v.tag, v.payload };
+        if (self.value_consts.get(key)) |idx| return idx;
+        const idx = try self.addConst(.{ .value = v });
+        try self.value_consts.put(self.allocator, key, idx);
+        return idx;
     }
 
     /// Convenience: add a `*const Routine` constant. Used by
@@ -1584,7 +1586,53 @@ fn lowerColl(
     for (forms, items) |form, *item| {
         item.* = if (quoted) try lowerQuotePayload(allocator, form, ctx) else try lowerFormEnv(allocator, form, ctx);
     }
+    if (try constantColl(allocator, op, items, ctx)) |v| return try allocTiny(allocator, .{ .literal = v });
     return try allocTiny(allocator, .{ .coll = .{ .op = op, .items = items } });
+}
+
+/// The collection `items` build, made now when every item is a
+/// constant (PLAN §11.4): the literal is then one constant, however
+/// large, instead of a slot and an instruction per item. It is built
+/// on the lowering heap, as the VM builds it at run time, and lives
+/// as long as a routine holding it can run, which marks it
+/// (`markRoutineConsts`). Null without a heap, for `concat`, or when
+/// an item is computed.
+fn constantColl(allocator: std.mem.Allocator, op: vm.CollOp, items: []const *const Tiny, ctx: LowerCtx) CompileError!?Value {
+    const heap = ctx.heap orelse return null;
+    if (op == .concat) return null;
+    const values = try allocator.alloc(Value, items.len);
+    defer allocator.free(values);
+    for (items, values) |item, *v| {
+        v.* = switch (item.*) {
+            .nil => value_mod.nilValue(),
+            .bool => |b| value_mod.fromBool(b),
+            .int => |n| value_mod.fromFixnum(n) orelse return null,
+            .literal => |l| l,
+            else => return null,
+        };
+    }
+    return buildColl(heap, op, values) catch CompileError.OutOfMemory;
+}
+
+fn buildColl(heap: *heap_mod.Heap, op: vm.CollOp, values: []const Value) !Value {
+    switch (op) {
+        .list => return list_mod.fromSlice(heap, values),
+        .vector => return if (values.len == 0) vector_mod.empty(heap) else vector_mod.fromSlice(heap, values),
+        .map => {
+            var m = try champ_mod.mapEmpty(heap);
+            var i: usize = 0;
+            while (i < values.len) : (i += 2) {
+                m = try champ_mod.mapAssoc(heap, m, values[i], values[i + 1], &dispatch_mod.hashValue, &dispatch_mod.equal);
+            }
+            return m;
+        },
+        .set => {
+            var set = try champ_mod.setEmpty(heap);
+            for (values) |v| set = try champ_mod.setConj(heap, set, v, &dispatch_mod.hashValue, &dispatch_mod.equal);
+            return set;
+        },
+        else => unreachable,
+    }
 }
 
 /// Shared implementation for `(quote x)` and the reader-macro

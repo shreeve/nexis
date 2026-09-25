@@ -49,8 +49,9 @@ here.
   end-to-end eval pipeline (`test/integration/eval_pipeline.zig`).
 
 **Absent (stated as facts):**
-- No constant folding of any kind. `(+ 1 2)` compiles to
-  `math:add`.
+- No folding of computations: `(+ 1 2)` compiles to `math:add`.
+  Only collections of constants are built at compile time
+  (§4.4).
 - No bytecode cache and no object file: nothing writes or reads
   `.nx.o`. Every run compiles from source.
 - No separate resolver or analyzer module; classification and
@@ -108,11 +109,14 @@ compile entry points.
   definitions are called from later lines. The source bytes go
   there too (`Tiny.symbol` slices borrow from them).
 - **Runtime-heap cross-over**: literal Values that must reach
-  runtime (quoted compound collections, interned symbols and
-  keywords) are built through the heap and interner plumbed into
-  the lowering context (`LowerCtx.heap`, `LowerCtx.interner`) and
-  placed in the routine's constant pool. Without an interner,
-  quoted symbols and keywords are `UnsupportedFeature`.
+  runtime (strings, bignums, collections of constants, interned
+  symbols and keywords) are built through the heap and interner
+  plumbed into the lowering context (`LowerCtx.heap`,
+  `LowerCtx.interner`) and placed in the routine's constant pool,
+  which the collector marks for as long as a frame or a closure
+  can run the routine (VM.md §9). Nothing collects between
+  lowering a form and running it. Without an interner, quoted
+  symbols and keywords are `UnsupportedFeature`.
 - **No GC**: the compile arena is a plain bump allocator, not
   tracked by `src/gc.zig`. Freeing is the arena drop.
 
@@ -301,11 +305,17 @@ compiler relies on:
     the right one is a literal or a symbol, which run no code.
   - Literal lifting: nil, booleans and fixnums have dedicated
     `mov:*` loads or inline `Tiny` variants; every other literal
-    (symbols, keywords, quoted compound collections) is a
-    `Const.value` in the routine's constant pool.
-  - Collection literals with non-literal sub-expressions compile
-    to `coll:list` / `coll:concat` / `coll:vector` / `coll:map` /
-    `coll:set` construction code.
+    (strings, bignums, symbols, keywords) is a `Const.value` in
+    the routine's constant pool.
+  - A list, vector, map or set whose items are all constants —
+    quoted data, `[1 2 3]`, `{:a 1}`, and the `#%` constructors
+    syntax-quote emits over constants — is built once, at
+    lowering, the way the VM would build it, and is one constant
+    (PLAN §11.4): its size costs no slots and no instructions,
+    and evaluating it twice yields the same object, as in
+    Clojure. A collection with a computed item compiles to
+    `coll:list` / `coll:concat` / `coll:vector` / `coll:map` /
+    `coll:set` over a slot block.
 
 - **Errors**: `RecurOutsideTail`, `RecurArityMismatch`,
   `SlotOverflow`, `ConstantPoolOverflow` (more than 4096
@@ -321,9 +331,10 @@ compiler relies on:
   top-level routine for any top-level form).
 - Instructions are 64 bits. Operand indexes are 12 bits; the
   extension-instruction form is not emitted.
-- The constant pool is append-only: repeated constants within a
-  routine are not deduplicated. The var table IS deduplicated: a
-  routine that references `x` twice carries one `V#` entry.
+- The constant pool holds each Value once: identical Values (the
+  same immediate, or the same heap object) share an entry. The
+  var table is deduplicated the same way: a routine that
+  references `x` twice carries one `V#` entry.
 - Var references compile to `V#` operands bound to `*Var`
   pointers at compile time (§4.7).
 - Upvalue slots in a closure are numbered 0..N; the closure
@@ -382,14 +393,14 @@ variants are codegen details.
   (saves constant-pool entries).
 - Symbols and keywords are interned to Values and placed in the
   constant pool.
-- Compound collections lower through `#%list` / `#%vector` /
-  `#%map` / `#%set` construction (`lowerQuotePayload`) with each
-  element quoted recursively.
+- Compound collections are quoted element by element
+  (`lowerQuotePayload`), so every element is a constant and the
+  collection is one constant built at lowering (§4.4).
 - A quote inside the payload is data: `'(a 'b)` is `(a (quote b))`,
   the 2-list `formToValue` renders a quote as. Syntax-quote,
   unquote, `@x`, `#(...)` and `^meta` inside a quoted form are
   `UnsupportedFeature`.
-- Runtime: `mov:load-const` (scalars) or `coll:*` construction.
+- Runtime: `mov:load-const`.
 
 #### 5.2 `(if test then else?)`
 

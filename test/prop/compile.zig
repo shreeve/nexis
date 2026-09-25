@@ -599,3 +599,26 @@ test "slots: a routine's frame holds what is live at once, not every temporary i
     const compiled = try compileIn(&program, src.items);
     for (compiled.consts) |k| if (k == .routine) try testing.expect(k.routine.slot_count <= 8);
 }
+
+test "literals: constant data of any size is one constant built at compile time" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    for ([_][]const u8{ "[", "'[", "'(", "#{", "{" }) |open| {
+        src.clearRetainingCapacity();
+        try src.print(testing.allocator, "(count {s}", .{open});
+        for (0..5000) |i| try src.print(testing.allocator, " {d}", .{i});
+        try src.appendSlice(testing.allocator, if (open[open.len - 1] == '(') "))" else if (open[open.len - 1] == '[') "])" else "})");
+        try testing.expectEqual(@as(i64, if (std.mem.eql(u8, open, "{")) 2500 else 5000), (try program.run(src.items)).asFixnum());
+    }
+    try testing.expectEqual(@as(i64, 5000), (try program.run("(let [big (vec (range 5000))] (count (eval (list 'quote big))))")).asFixnum());
+    try harness.expectResult(&program, "", try program.run("[(= '[1 [2 3] {:a #{4}} (5)] [1 [2 3] {:a #{4}} '(5)]) (let* [f (fn* [] [1 2])] (identical? (f) (f)))]"), "[true true]");
+    // The literal is the constant itself; equal constants share an entry.
+    const compiled = try compileIn(&program, "(fn* [x] [x [1 2] {:a [1 2]} #{1 2} '(1 2) 1 2 1 2])");
+    for (compiled.consts) |k| if (k == .routine) {
+        try testing.expectEqual(@as(usize, 6), k.routine.consts.len);
+        try testing.expectEqual(@as(usize, 0), k.routine.var_table.len);
+    };
+}

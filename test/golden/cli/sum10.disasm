@@ -1,10 +1,10 @@
 routine <top> (examples/sum10.nx:4:1) slots=6 arity=0 upvalues=0
   0000  var:load-var        s1  v0=println  -  ; 4:2
   0001  mov:load-const      s3  c0=0  -  ; 5:13
-  0002  mov:load-const      s4  c1=0  -  ; 5:19
-  0003  cmp:lt              s5  s3  c2=10  ; 6:9
+  0002  mov:load-const      s4  c0=0  -  ; 5:19
+  0003  cmp:lt              s5  s3  c1=10  ; 6:9
   0004  jump:if-false       j0009  s5  -  ; 6:5
-  0005  math:add            s5  s3  c3=1  ; 7:14
+  0005  math:add            s5  s3  c2=1  ; 7:14
   0006  math:add            s4  s4  s3  ; 7:22
   0007  mov:move            s3  s5  -  ; 7:7
   0008  jump:jmp            j0003  -  -
