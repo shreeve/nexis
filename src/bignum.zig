@@ -393,15 +393,77 @@ pub fn formatDecimal(v: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void 
     if (v.isFixnum()) return writer.print("{d}", .{v.asFixnum()});
     var s: [1]Limb = undefined;
     const x = view(v, &s);
-    // Everything up to `scratch_limbs` limbs renders through stack
-    // buffers; a larger value borrows pages for the digit string.
+    if (!x.positive) try writer.writeByte('-');
+    const magnitude: bigint.Const = .{ .limbs = x.limbs, .positive = true };
+    if (x.limbs.len <= split_limbs) return writeSmallDecimal(magnitude, 0, writer);
+    // The quotients, remainders and powers of ten of the split all
+    // live until the digits are written; they total O(n log n) limbs.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    writeSplitDecimal(arena.allocator(), magnitude, writer) catch |err| switch (err) {
+        error.OutOfMemory => return error.WriteFailed,
+        error.WriteFailed => return error.WriteFailed,
+    };
+}
+
+/// At or under this many limbs, `std`'s conversion (one division by
+/// 10^9 per nine digits, each a pass over the whole number) is the
+/// faster one.
+const split_limbs = 32;
+
+/// Divide and conquer (BIGNUM.md §9): split `x` at a power of ten
+/// 10^(9·2^i) into a high and a low half and write each, the low half
+/// zero-padded to its full width. Each level's divisions cost about
+/// half the level above's, so the whole conversion costs about one
+/// Knuth division of `x` by its square root, where `std`'s costs a
+/// pass over `x` per nine digits: a 130 000-digit value converts in a
+/// fraction of the time, and a million-digit one in seconds instead of
+/// a minute.
+fn writeSplitDecimal(arena: std.mem.Allocator, x: bigint.Const, writer: *std.Io.Writer) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+    // powers[i] = 10^(9·2^i), up to the first whose square exceeds x.
+    var powers: std.ArrayList(bigint.Const) = .empty;
+    var p: bigint.Const = .{ .limbs = try arena.dupe(Limb, &.{1_000_000_000}), .positive = true };
+    while (true) {
+        try powers.append(arena, p);
+        if (p.limbs.len * 2 > x.limbs.len + 1) break;
+        var sq: bigint.Mutable = .{ .limbs = try arena.alloc(Limb, 2 * p.limbs.len + 1), .len = 1, .positive = true };
+        sq.sqrNoAlias(p, null);
+        p = sq.toConst();
+    }
+    try writePart(arena, x, powers.items, powers.items.len, 0, writer);
+}
+
+/// `x`, which is below `powers[level - 1]` squared, written with at
+/// least `width` digits.
+fn writePart(
+    arena: std.mem.Allocator,
+    x: bigint.Const,
+    powers: []const bigint.Const,
+    level: usize,
+    width: usize,
+    writer: *std.Io.Writer,
+) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+    if (level == 0 or x.limbs.len <= split_limbs) return writeSmallDecimal(x, width, writer);
+    const pow = powers[level - 1];
+    if (x.order(pow) == .lt) return writePart(arena, x, powers, level - 1, width, writer);
+    const half = @as(usize, 9) << @intCast(level - 1);
+    var q: bigint.Mutable = .{ .limbs = try arena.alloc(Limb, x.limbs.len + 1), .len = 1, .positive = true };
+    var r: bigint.Mutable = .{ .limbs = try arena.alloc(Limb, pow.limbs.len + 1), .len = 1, .positive = true };
+    q.divTrunc(&r, x, pow, try arena.alloc(Limb, bigint.calcDivLimbsBufferLen(x.limbs.len, pow.limbs.len)));
+    try writePart(arena, q.toConst(), powers, level - 1, width -| half, writer);
+    try writePart(arena, r.toConst(), powers, level - 1, half, writer);
+}
+
+/// `x` through `std`'s conversion, left-padded with zeros to `width`.
+fn writeSmallDecimal(x: bigint.Const, width: usize, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     var sfa = std.heap.stackFallback(scratch_bytes * 8, std.heap.page_allocator);
     const alloc = sfa.get();
-    const digits = alloc.alloc(u8, x.sizeInBaseUpperBound(10)) catch return error.WriteFailed;
+    const digits = alloc.alloc(u8, @max(1, x.sizeInBaseUpperBound(10))) catch return error.WriteFailed;
     defer alloc.free(digits);
-    const tmp = alloc.alloc(Limb, bigint.calcToStringLimbsBufferLen(x.limbs.len, 10)) catch return error.WriteFailed;
+    const tmp = alloc.alloc(Limb, bigint.calcToStringLimbsBufferLen(@max(1, x.limbs.len), 10)) catch return error.WriteFailed;
     defer alloc.free(tmp);
     const n = x.toString(digits, 10, .lower, tmp);
+    if (n < width) try writer.splatByteAll('0', width - n);
     try writer.writeAll(digits[0..n]);
 }
 
@@ -1045,6 +1107,40 @@ test "formatDecimal/parseDecimal: round trip at every size, canonical on the way
     try testing.expect((try parseDecimal(&heap, "-")) == null);
     try testing.expect((try parseDecimal(&heap, "12x")) == null);
     try testing.expect((try parseDecimal(&heap, "1_000")) == null);
+}
+
+test "formatDecimal: the divide-and-conquer split writes std's digits, zero runs included" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(0xDEC1);
+    const r = prng.random();
+    const ten = try fromI64(&heap, 10);
+    var cases: std.ArrayList(Value) = .empty;
+    defer cases.deinit(testing.allocator);
+    // 10^k - 1, 10^k and 10^k + 1 around the split sizes: all-nines,
+    // and a one followed by zero runs that every low half must pad.
+    for ([_]u32{ 600, 1000, 4000, 9000 }) |k| {
+        var p = try fromI64(&heap, 1);
+        for (0..k) |_| p = try mul(&heap, p, ten);
+        try cases.append(testing.allocator, try sub(&heap, p, try fromI64(&heap, 1)));
+        try cases.append(testing.allocator, p);
+        try cases.append(testing.allocator, try add(&heap, p, try fromI64(&heap, 1)));
+    }
+    for ([_]usize{ 33, 64, 100, 257, 700 }) |n| {
+        const ls = try testing.allocator.alloc(u64, n);
+        defer testing.allocator.free(ls);
+        for (ls) |*l| l.* = r.int(u64);
+        try cases.append(testing.allocator, try fromLimbs(&heap, r.boolean(), ls));
+    }
+    for (cases.items) |v| {
+        var s1: [1]Limb = undefined;
+        const want = try view(v, &s1).toStringAlloc(testing.allocator, 10, .lower);
+        defer testing.allocator.free(want);
+        var w = std.Io.Writer.Allocating.init(testing.allocator);
+        defer w.deinit();
+        try formatDecimal(v, &w.writer);
+        try testing.expectEqualStrings(want, w.written());
+    }
 }
 
 test "fromI128: both limbs, both signs, and the i64 edge" {

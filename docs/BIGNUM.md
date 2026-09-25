@@ -278,7 +278,15 @@ Semantics, matching Clojure's `Numbers` for BigInt:
 - `toI64`: the value when it fits, `null` otherwise.
 - `formatDecimal` / `parseDecimal`: decimal text with a leading `-`
   for a negative value and no suffix; the parser accepts exactly
-  `-?[0-9]+` and returns `null` for anything else.
+  `-?[0-9]+` and returns `null` for anything else. Printing is
+  implicit everywhere (`str`, `pr-str`, REPL results, error reports),
+  so `formatDecimal` divides and conquers past 32 limbs: it splits the
+  value at 10^(9·2^i), the power whose square first exceeds it, and
+  writes the quotient and the zero-padded remainder the same way. Each
+  level costs about half the one above, so the whole conversion is
+  about one Knuth division of the value by its square root, not one
+  pass over the value per nine digits: a million digits print in about
+  a second (ReleaseFast) where `std`'s conversion takes minutes.
 
 The VM's tower (`src/vm.zig` `numAdd` … `numCompare`) keeps the
 fixnum × fixnum fast path in `i64` and reaches this module only when
