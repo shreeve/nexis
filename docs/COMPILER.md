@@ -915,18 +915,24 @@ Three layers:
 - `src/expand.zig`: inline tests for recursive expansion,
   fixed-point termination, syntax-quote handling, `#(...)`
   lowering, host macros, `defmacro`, error cases.
-- `src/compile.zig`: inline tests for every lowering rule,
-  capture pre-analysis (including closures in dead branches),
-  `recur` targets and their propagation, variadic parameters,
-  `letfn*`, named `fn*`, forward references, shadowing, and every
-  `CompileError` variant. A set of tests drives the `Emitter`
-  directly from hand-built `Tiny` trees and pins bytecode shape.
+- `src/compile.zig`: inline tests for what only the compiler
+  sees: the error taxonomy (a table of malformed programs, each
+  with its variant, and the span an error is reported at), the
+  shape of the bytecode (one Var-table entry per Var, one upvalue
+  per captured name, boxing of exactly the captured bindings on
+  every path, `recur` in constant stack), routine limits, the span
+  table, declared names and the stack guard.
 - `src/vm.zig`: per-opcode tests on hand-assembled bytecode.
 
 #### 9.2 Property tests
 
-- `test/prop/compile.zig`: randomized programs through the full
-  pipeline — closure capture at nesting depth up to 10,
+- `test/prop/compile.zig`: what programs evaluate to, as tables
+  run through a program booted as `bin/nexis` boots one — source
+  and printed value for every primitive-core form, binding and
+  capture shape, `recur` target, quoted literal and the host
+  macros the compiler relies on; source and error for compile and
+  run failures — and randomized programs through the full
+  pipeline: closure capture at nesting depth up to 10,
   syntax-quote output structurally equal to hand-built Forms.
 
 #### 9.3 Integration tests
