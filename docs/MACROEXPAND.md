@@ -104,10 +104,12 @@ is an ordinary call. User macros shadow host macros.
 
 1. **`Var.macro: bool`** is a field on every Var (`src/vm.zig`).
 2. **`defmacro` is an expander-time special form**, not a Tiny
-   node. The expander recognizes `(defmacro name [params] body)`,
-   pre-expands the body in an env that includes the self-name +
-   params, builds the synthetic form
-   `(def name (fn* name [params] body))` and calls
+   node, spelled exactly like `defn`: a docstring, an attribute
+   map and `^meta` on the name become the Var's metadata, the
+   parameters destructure and overload clauses dispatch on the
+   argument count, as for `fn`. The expander builds
+   `(def name (fn name ...))` (wrapped to set the metadata as
+   `defn` does), expands it fully in the enclosing env, and calls
    `ctx.compile_eval.eval` to compile + run it in a fresh sub-VM.
    The resulting Var's `macro` flag is set. The `defmacro` form's
    replacement is `(var name)`, so the REPL prints `#'name`.
@@ -298,7 +300,7 @@ that should be expanded.
 | `try` | Expand the body forms; `catch MATCHER BINDING handler...` passes the matcher and binding symbols through and expands the handler with the binding in env; expand the `finally` body. |
 | `set!` | `(set! target v)` → `(nexis.core/var-set (var target) v)` with `v` expanded; `target` must be a symbol, and one bound in the lexical env is refused (`MalformedMacroCall`): a local has no thread binding to rebind. The Var's own checks (`:not-dynamic`, `:no-thread-binding`) happen at run time. |
 | `throw`, `do`, `if`, ordinary call, `#%*` constructors | Expand all sub-forms with current env. |
-| `defmacro` | §1.2 — evaluated at expansion time; replaced by `(var name)`. |
+| `defmacro` | §1.2 — spelled like `defn`, evaluated at expansion time; replaced by `(var name)`. |
 | `ns` | `(ns NAME)` switches `ctx.registry.current` to the named namespace at expansion time, creating it (parent `nexis.core`) if unregistered; replaced by `nil`. |
 | `require` | `(require 'my.ns)` / `(require '[my.ns :as a])`, several specs per call: the file load, registry update and alias entry happen at expansion time through `ctx.load_callback`; replaced by `nil`. Only `:as` is accepted — `:refer` / `:rename` / `:exclude` are `MalformedMacroCall`. |
 | Non-symbol head | Treat as ordinary call: expand head + all args. |

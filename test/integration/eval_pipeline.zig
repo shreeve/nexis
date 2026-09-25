@@ -1357,6 +1357,17 @@ test "defmacro: a failing macro call names the macro and the cause, at the call"
     try expectMacroFailure("(defmacro m [a] a)", "(m (+ 1 `x))", "a syntax-quote is not data a macro can take", "`x");
 }
 
+test "defmacro: parameters destructure and overload clauses dispatch, as for defn" {
+    try expectOutputProgram("(defmacro m [[a b] & body] `(+ ~a ~b ~@body)) (m [1 2] 3)", "6");
+    try expectOutputProgram("(defmacro m ([x] x) ([x y] `(+ ~x ~y))) [(m 1) (m 1 2)]", "[1 3]");
+    try expectOutputProgram("(defmacro m [{:keys [k] :or {k 9}}] k) [(m {:k 5}) (m {})]", "[5 9]");
+    try expectOutputProgram(
+        \\(defmacro with-x [[sym init] & body] `(let [~sym ~init] ~@body))
+        \\(with-x [y 4] (* y y))
+    , "16");
+    try expectOutputProgram("(defmacro m \"doc\" {:added \"1\"} [x] x) [(m 1) (select-keys (meta (var m)) [:doc :added :arglists])]", "[1 {:doc doc, :added 1, :arglists ([x])}]");
+}
+
 test "integration: defmacro — macro can use already-defined macros in body" {
     // twice's body uses unless (a macro defined above it);
     // when outer is invoked, the macro fn body is already

@@ -859,18 +859,22 @@ fn expandLetFnStar(
 }
 
 /// A `letfn*` entry `(name params-or-clauses body...)` as `(name
-/// [params] body...)`: `expandFnRename` on `(fn name ...)` lowers
-/// overload clauses and destructuring, and the entry keeps its
-/// name with the resulting param vector and body.
+/// [params] body...)`: the name with the param vector and body of
+/// the `fn*` form `fnStar` makes of it.
 fn normalizeLetFnEntry(ctx: *ExpandContext, entry: *const Form) ExpandError![]const *Form {
-    const entry_items = entry.datum.list;
-    var fn_form = try expandFnRename(ctx, entry, entry_items);
-    // Overload clauses come back as `(fn name [& args] body)`;
-    // one more pass renames that to `fn*`.
+    return (try fnStar(ctx, entry, entry.datum.list)).datum.list[1..];
+}
+
+/// `(fn args...)` lowered to its `(fn* ...)` form, destructuring and
+/// overload clauses included, without expanding the body.
+fn fnStar(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    var fn_form = try expandFnRename(ctx, call_form, args);
+    // Overload clauses come back as `(fn name? [& args] body)`; one
+    // more pass renames that to `fn*`.
     if (std.mem.eql(u8, fn_form.datum.list[0].datum.symbol.name, "fn")) {
-        fn_form = try expandFnRename(ctx, entry, fn_form.datum.list[1..]);
+        fn_form = try expandFnRename(ctx, call_form, fn_form.datum.list[1..]);
     }
-    return fn_form.datum.list[1..];
+    return fn_form;
 }
 
 // ---- def / defn -----------------------------------------------------------
@@ -1369,122 +1373,36 @@ fn expandSetBang(
     return try makeList(ctx, out_items, origin);
 }
 
-/// Expand `(defmacro name [params] body)`.
+/// `(defmacro NAME ...)`, spelled like `defn` (docstring, attribute
+/// map, destructuring, overload clauses), runs at expansion time:
+/// `(def NAME (fn NAME ...))`, fully expanded, is compiled and run
+/// through `ctx.compile_eval`, and the Var it yields is marked a
+/// macro. The form is replaced by `(var NAME)`.
 fn expandDefmacro(
     ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
 ) ExpandError!*Form {
-    // (defmacro NAME "doc"? [PARAMS] BODY...); `^meta` on NAME and
-    // the docstring land on the Var like defn's.
-    if (items.len < 3) return ExpandError.MalformedMacroCall;
-    const named = try splitMetaName(ctx, items[1]);
-    const name_form = named.name;
-    var meta_items: std.ArrayList(*Form) = .empty;
-    defer meta_items.deinit(ctx.allocator);
-    if (named.meta) |m| try meta_items.appendSlice(ctx.allocator, m);
-    var params_idx: usize = 2;
-    if (items[2].datum == .string) {
-        try meta_items.append(ctx.allocator, try makeKeyword(ctx, "doc", items[2].origin));
-        try meta_items.append(ctx.allocator, mutCast(items[2]));
-        params_idx = 3;
-    }
-    if (params_idx >= items.len) return ExpandError.MalformedMacroCall;
-    const params_form = items[params_idx];
-    if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
-    const body_forms = items[params_idx + 1 ..];
+    const origin = list_form.origin;
+    const parts = try defnParts(ctx, list_form, items[1..]);
+    const name = parts.name.datum.symbol.name;
+    const ceval = ctx.compile_eval orelse return ctx.fail(origin, "defmacro {s}: macros cannot be defined here", .{name});
+    const fn_form = try fnStar(ctx, list_form, (try prependList(ctx, origin, &.{mutCast(parts.name)}, parts.fn_tail)).datum.list);
+    const def_form = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "def", origin), mutCast(parts.name), fn_form });
+    const expanded = try expandForm(ctx, env, try withVarMeta(ctx, def_form, parts.meta, origin));
 
-    // Need both a namespace (to mark the Var) and a compile-
-    // eval callback (to compile+run the synthetic def form).
-    const ns = ctx.namespace orelse return ExpandError.MalformedMacroCall;
-    const ceval = ctx.compile_eval orelse return ExpandError.MalformedMacroCall;
-
-    // First: macroexpand the body BEFORE compiling it. Body
-    // env includes the self-name + params.
-    var local: ExpandEnv = .{ .parent = env };
-    defer local.deinit(ctx.allocator);
-    _ = try local.lexical_names.getOrPut(ctx.allocator, name_form.datum.symbol.name);
-    for (params_form.datum.vector) |p| {
-        if (p.datum != .symbol or p.datum.symbol.ns != null) continue;
-        if (std.mem.eql(u8, p.datum.symbol.name, "&")) continue;
-        _ = try local.lexical_names.getOrPut(ctx.allocator, p.datum.symbol.name);
-    }
-    const expanded_body = try ctx.allocator.alloc(*Form, body_forms.len);
-    for (body_forms, 0..) |b, i| {
-        expanded_body[i] = try expandForm(ctx, &local, b);
-    }
-
-    // Build the synthetic form: (def NAME (fn* NAME [PARAMS] body...))
-    const fn_items = try ctx.allocator.alloc(*Form, 3 + expanded_body.len);
-    fn_items[0] = try makeSymbol(ctx, "fn*", list_form.origin);
-    fn_items[1] = mutCast(name_form);
-    fn_items[2] = mutCast(params_form);
-    for (expanded_body, 0..) |b, i| fn_items[3 + i] = b;
-    const fn_form = try makeList(ctx, fn_items, list_form.origin);
-
-    const def_items = try ctx.allocator.alloc(*Form, 3);
-    def_items[0] = try makeSymbol(ctx, "def", list_form.origin);
-    def_items[1] = mutCast(name_form);
-    def_items[2] = fn_form;
-    const def_form = try makeList(ctx, def_items, list_form.origin);
-
-    // Compile-time-eval the def form. Returns the Var Value.
-    //
-    // CRITICAL: we INTENTIONALLY LEAK the sub-VM here. The
-    // macro fn's Closure is allocated in the sub-VM's
-    // `runtime_arena`, which is backed by the caller's
-    // persistent allocator. `ArenaAllocator.free` RECLAIMS the
-    // most-recent allocation, so `sub_vm.deinit()` would
-    // invalidate the Closure pointer stored in `Var.root`
-    // \u2014 and the next defmacro's allocations would land on the
-    // exact bytes. Leaking the sub-VM here is safe: every
-    // allocation it made was from the persistent allocator
-    // (typically `vm.runtime_arena`), which is freed wholesale
-    // at VM teardown. The sub-VM struct itself is on the Zig
-    // stack and dies normally.
+    // The sub-VM is not released: the macro's closure lives in its
+    // allocator (the persistent one the compiler gives), which the
+    // calling VM frees at teardown.
     var sub_vm: vm_mod.VM = undefined;
-    const result_value = ceval.eval(ceval.user_data, def_form, &sub_vm) catch |err| {
+    const result = ceval.eval(ceval.user_data, expanded, &sub_vm) catch |err| {
         if (err == error.OutOfMemory) return ExpandError.OutOfMemory;
-        return ctx.fail(list_form.origin, "defmacro {s}: the macro function did not compile: {s}", .{ name_form.datum.symbol.name, @errorName(err) });
+        return ctx.fail(origin, "defmacro {s}: the macro function did not compile: {s}", .{ name, @errorName(err) });
     };
-
-    // Sanity: result should be a Var value. Mark it as macro.
-    if (result_value.kind() != .var_) return ExpandError.MalformedMacroCall;
-    const target_var = vm_mod.VM.asVar(result_value);
-    target_var.macro = true;
-    if (meta_items.items.len > 0) {
-        target_var.meta = formToValue(ctx, blk: {
-            const map_form = try ctx.allocator.create(Form);
-            const map_items = try ctx.allocator.alloc(*Form, meta_items.items.len);
-            for (meta_items.items, 0..) |it, i| map_items[i] = it;
-            map_form.* = .{ .datum = .{ .map = @as([]const *Form, map_items) }, .origin = list_form.origin };
-            break :blk map_form;
-        }) catch return ExpandError.MalformedMacroCall;
-    }
-
-    // Replacement form: (var name) — evaluates to the same Var
-    // at runtime so the REPL prints `#'name`.
-    const var_items = try ctx.allocator.alloc(*Form, 2);
-    var_items[0] = try makeSymbol(ctx, "var", list_form.origin);
-    var_items[1] = mutCast(name_form);
-
-    // Also intern the Var in the caller's namespace explicitly,
-    // to be safe (the compile-eval should have done this, but
-    // the macro flag is on a pointer — make sure the namespace
-    // sees the SAME pointer). The compile-eval already created
-    // the Var via def; our `lookup` and `intern` ought to return
-    // it. Double-check:
-    if (ns.lookup(name_form.datum.symbol.name)) |looked| {
-        if (looked != target_var) {
-            // Should not happen — compile-eval used the same
-            // namespace. If pointer identity mismatches, the
-            // macro flag is on the wrong Var.
-            return ExpandError.MalformedMacroCall;
-        }
-    }
-
-    return try makeList(ctx, var_items, list_form.origin);
+    if (result.kind() != .var_) return ctx.fail(origin, "defmacro {s}: the definition yielded no Var", .{name});
+    vm_mod.VM.asVar(result).macro = true;
+    return try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "var", origin), mutCast(parts.name) });
 }
 
 /// Invoke a user-defined macro.
@@ -2076,100 +1994,72 @@ fn expandFnRename(
     return renameHead(ctx, call_form, fn_args, "fn*");
 }
 
-/// `(defn name [params] body...)` → `(def name
-/// (fn name [params] body...))`. Routing defn through `fn`
-/// gives us destructured params for free. The overload form
-/// `(defn name ([p1] b1) ([p1 p2] b2))` is `(def name <fn>)` with
-/// the dispatcher `buildMultiArityFn` builds.
+/// `(defn name ...)` → `(def name (fn name ...))`, so params
+/// destructure and overload clauses work as for `fn`, wrapped by
+/// `withVarMeta` when the definition carries metadata.
 fn expandDefnMacro(
     ctx: *ExpandContext,
     call_form: *const Form,
     args: []const *Form,
 ) ExpandError!*Form {
-    if (args.len < 2) return ctx.fail(call_form.origin, "defn: expected a name and a parameter vector", .{});
-    const named = try splitMetaName(ctx, args[0]);
-    const name_form = named.name;
+    const parts = try defnParts(ctx, call_form, args);
     const origin = call_form.origin;
+    const fn_form = try prependList(ctx, origin, &.{ try makeSymbol(ctx, "fn", origin), mutCast(parts.name) }, parts.fn_tail);
+    const def_form = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "def", origin), mutCast(parts.name), fn_form });
+    return try withVarMeta(ctx, def_form, parts.meta, origin);
+}
 
-    // Optional docstring, then optional attribute map, before the
-    // params or clauses. Together with `^meta` on the name they
-    // become the Var's metadata, with `:arglists` added.
-    var meta_items: std.ArrayList(*Form) = .empty;
-    defer meta_items.deinit(ctx.allocator);
-    if (named.meta) |m| try meta_items.appendSlice(ctx.allocator, m);
+/// The parts of `(defn NAME "doc"? {attrs}? tail)` and of `defmacro`
+/// spelled the same way: the name, the fn tail (a parameter vector
+/// and body, or overload clauses) and the Var metadata, from `^meta`
+/// on the name, the docstring and the attribute map, with
+/// `:arglists` (quoted) added when there is any.
+const DefnParts = struct {
+    name: *const Form,
+    fn_tail: []const *Form,
+    meta: []const *Form,
+};
+
+fn defnParts(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!DefnParts {
+    const what = call_form.datum.list[0].datum.symbol.name;
+    const origin = call_form.origin;
+    if (args.len < 2) return ctx.fail(origin, "{s}: expected a name and a parameter vector", .{what});
+    const named = try splitMetaName(ctx, args[0]);
+    var meta: std.ArrayList(*Form) = .empty;
+    if (named.meta) |m| try meta.appendSlice(ctx.allocator, m);
     var rest: usize = 1;
     if (rest < args.len and args[rest].datum == .string) {
-        try meta_items.append(ctx.allocator, try makeKeyword(ctx, "doc", args[rest].origin));
-        try meta_items.append(ctx.allocator, mutCast(args[rest]));
+        try meta.appendSlice(ctx.allocator, &.{ try makeKeyword(ctx, "doc", args[rest].origin), mutCast(args[rest]) });
         rest += 1;
     }
     if (rest < args.len and args[rest].datum == .map) {
-        try meta_items.appendSlice(ctx.allocator, args[rest].datum.map);
+        try meta.appendSlice(ctx.allocator, args[rest].datum.map);
         rest += 1;
     }
-    if (rest >= args.len) return ctx.fail(call_form.origin, "defn: expected a parameter vector", .{});
-    const fn_args = args[rest..];
-
-    // Detect single-arity vs multi-arity:
-    //   single: fn_args[0] is vector (params)
-    //   multi:  fn_args are lists each shaped (params body...)
-    const single = stripMeta(fn_args[0]).datum == .vector;
-    const def_form = if (single)
-        try buildDefSingleFn(ctx, call_form, name_form, fn_args)
-    else
-        try buildDefMultiFn(ctx, call_form, name_form, fn_args);
-    if (meta_items.items.len == 0) return def_form;
-
-    // :arglists (quote ([params] ...))
-    var lists: std.ArrayList(*Form) = .empty;
-    defer lists.deinit(ctx.allocator);
-    if (single) {
-        try lists.append(ctx.allocator, try stripParams(ctx, fn_args[0]));
-    } else for (fn_args) |clause| {
-        if (clause.datum != .list or clause.datum.list.len == 0) return ExpandError.MalformedMacroCall;
-        try lists.append(ctx.allocator, try stripParams(ctx, clause.datum.list[0]));
+    if (rest >= args.len) return ctx.fail(origin, "{s}: expected a parameter vector", .{what});
+    const tail = args[rest..];
+    if (meta.items.len > 0) {
+        var lists: std.ArrayList(*Form) = .empty;
+        if (stripMeta(tail[0]).datum == .vector) {
+            try lists.append(ctx.allocator, try stripParams(ctx, tail[0]));
+        } else for (tail) |clause| {
+            if (clause.datum != .list or clause.datum.list.len == 0) return ctx.fail(clause.origin, "{s}: expected ([params] body...), not {s}", .{ what, describeForm(clause) });
+            try lists.append(ctx.allocator, try stripParams(ctx, clause.datum.list[0]));
+        }
+        try meta.appendSlice(ctx.allocator, &.{
+            try makeKeyword(ctx, "arglists", origin),
+            try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "quote", origin), try makeList(ctx, lists.items, origin) }),
+        });
     }
-    try meta_items.append(ctx.allocator, try makeKeyword(ctx, "arglists", origin));
-    try meta_items.append(ctx.allocator, try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "quote", origin), try makeListInline(ctx, origin, lists.items) }));
-    return try withVarMeta(ctx, def_form, meta_items.items, origin);
+    return .{ .name = named.name, .fn_tail = tail, .meta = meta.items };
 }
 
-fn buildDefSingleFn(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    name_form: *const Form,
-    fn_args: []const *Form,
-) ExpandError!*Form {
-    // Build (fn name params body...).
-    const fn_items = try ctx.allocator.alloc(*Form, 2 + fn_args.len);
-    fn_items[0] = try makeSymbol(ctx, "fn", call_form.origin);
-    fn_items[1] = @constCast(name_form);
-    for (fn_args, 0..) |a, i| fn_items[2 + i] = @constCast(a);
-    const fn_form = try makeList(ctx, fn_items, call_form.origin);
-    return try buildDefForm(ctx, call_form, name_form, fn_form);
-}
-
-fn buildDefForm(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    name_form: *const Form,
-    fn_form: *Form,
-) ExpandError!*Form {
-    const def_items = try ctx.allocator.alloc(*Form, 3);
-    def_items[0] = try makeSymbol(ctx, "def", call_form.origin);
-    def_items[1] = @constCast(name_form);
-    def_items[2] = fn_form;
-    return try makeList(ctx, def_items, call_form.origin);
-}
-
-fn buildDefMultiFn(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    name_form: *const Form,
-    arity_forms: []const *Form,
-) ExpandError!*Form {
-    const fn_form = try buildMultiArityFn(ctx, call_form, name_form, arity_forms);
-    return try buildDefForm(ctx, call_form, name_form, fn_form);
+/// The list `(head... tail...)`.
+fn prependList(ctx: *ExpandContext, origin: SrcSpan, head: []const *Form, tail: []const *Form) ExpandError!*Form {
+    const items = try ctx.allocator.alloc(*Form, head.len + tail.len);
+    @memcpy(items[0..head.len], head);
+    @memcpy(items[head.len..], tail);
+    return try makeList(ctx, items, origin);
 }
 
 /// Overload clauses `([params] body...)+` of `fn`, `defn` or a
