@@ -594,7 +594,9 @@ rewrites it:
 
 1. Scan the body recursively for placeholder symbols: `%`
    records positional 1, `%N` records positional N (N ≥ 1),
-   `%&` marks the rest parameter as used.
+   `%&` marks the rest parameter as used. Every sub-form is
+   scanned (lists, vectors, maps, sets, `@x`, `^meta` and the
+   unquotes of a syntax-quote) except a quoted one.
 2. Param count = max positional N found (0 if none).
 3. Generate params `[%1 %2 ... %N]` plus `[& %&]` if rest.
 4. Rewrite `%` occurrences in the body to `%1`.

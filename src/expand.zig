@@ -351,9 +351,7 @@ fn expandFormDepth(
         // by their dedicated walkers (which do their own
         // per-form traversal); this arm catches top-level
         // collection-literal expressions.
-        .vector => |items| try expandCollKind(ctx, env, form, items, .vector_),
-        .map => |items| try expandCollKind(ctx, env, form, items, .map_),
-        .set => |items| try expandCollKind(ctx, env, form, items, .set_),
+        .vector, .map, .set => try mapChildren(ctx, form, Walk{ .env = env }),
         // ---- Quote — OPAQUE per MACROEXPAND.md §2b. ----------
         // The expander does NOT recurse into the payload of a
         // quote form. `(quote (when x y))` MUST NOT expand
@@ -464,7 +462,7 @@ fn dispatchList(
     // Non-symbol head → ordinary call; expand head + all args.
     const head_form = items[0];
     if (head_form.datum != .symbol) {
-        return try expandOrdinaryCall(ctx, env, list_form, items);
+        return try mapChildren(ctx, list_form, Walk{ .env = env });
     }
     const head_sym = head_form.datum.symbol;
 
@@ -478,17 +476,17 @@ fn dispatchList(
         if (qualifiedHostMacro(ctx, ns_prefix, head_sym.name)) |macro_fn| {
             return try invokeMacro(ctx, env, macro_fn, list_form, items, depth);
         }
-        return try expandOrdinaryCall(ctx, env, list_form, items);
+        return try mapChildren(ctx, list_form, Walk{ .env = env });
     }
     const name = head_sym.name;
 
     // ---- Special forms (NOT shadowable, NOT macro-replaceable). --
     if (std.mem.eql(u8, name, "quote")) return mutCast(list_form);
     if (std.mem.eql(u8, name, "if")) return try expandIf(ctx, env, list_form, items);
-    if (std.mem.eql(u8, name, "do")) return try expandDo(ctx, env, list_form, items);
+    if (std.mem.eql(u8, name, "do")) return try mapChildren(ctx, list_form, Walk{ .env = env });
     if (std.mem.eql(u8, name, "let*")) return try expandLetStar(ctx, env, list_form, items);
     if (std.mem.eql(u8, name, "loop*")) return try expandLetStar(ctx, env, list_form, items); // same shape as let*
-    if (std.mem.eql(u8, name, "recur")) return try expandRecur(ctx, env, list_form, items);
+    if (std.mem.eql(u8, name, "recur")) return try mapChildren(ctx, list_form, Walk{ .env = env });
     if (std.mem.eql(u8, name, "fn*")) return try expandFnStar(ctx, env, list_form, items);
     if (std.mem.eql(u8, name, "letfn*")) return try expandLetFnStar(ctx, env, list_form, items);
     if (std.mem.eql(u8, name, "def")) return try expandDef(ctx, env, list_form, items);
@@ -499,7 +497,7 @@ fn dispatchList(
     if (std.mem.eql(u8, name, "var")) return mutCast(list_form); // (var X) — X is just a name, don't expand
     if (std.mem.eql(u8, name, "set!")) return try expandSetBang(ctx, env, list_form, items);
     if (std.mem.eql(u8, name, "try")) return try expandTry(ctx, env, list_form, items);
-    if (std.mem.eql(u8, name, "throw")) return try expandOrdinaryCall(ctx, env, list_form, items);
+    if (std.mem.eql(u8, name, "throw")) return try mapChildren(ctx, list_form, Walk{ .env = env });
     if (std.mem.eql(u8, name, "defmacro")) return try expandDefmacro(ctx, env, list_form, items);
     if (std.mem.eql(u8, name, "ns")) return try expandNs(ctx, list_form, items);
     if (std.mem.eql(u8, name, "require")) return try expandRequire(ctx, list_form, items);
@@ -513,7 +511,7 @@ fn dispatchList(
         std.mem.eql(u8, name, "#%map") or
         std.mem.eql(u8, name, "#%set"))
     {
-        return try expandOrdinaryCall(ctx, env, list_form, items);
+        return try mapChildren(ctx, list_form, Walk{ .env = env });
     }
 
     // ---- Macro dispatch (shadowable by lexical bindings). -----
@@ -538,7 +536,7 @@ fn dispatchList(
     }
 
     // ---- Ordinary call. ---------------------------------------
-    return try expandOrdinaryCall(ctx, env, list_form, items);
+    return try mapChildren(ctx, list_form, Walk{ .env = env });
 }
 
 /// The macro Var a qualified head `ns/name` names, with `ns` an
@@ -596,60 +594,8 @@ fn expandIf(
     items: []const *Form,
 ) ExpandError!*Form {
     // (if test then) | (if test then else)
-    if (items.len < 3 or items.len > 4) return ExpandError.MalformedMacroCall;
-    return try rebuildListIfChanged(ctx, list_form, items, env);
-}
-
-fn expandDo(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    list_form: *const Form,
-    items: []const *Form,
-) ExpandError!*Form {
-    return try rebuildListIfChanged(ctx, list_form, items, env);
-}
-
-fn expandRecur(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    list_form: *const Form,
-    items: []const *Form,
-) ExpandError!*Form {
-    return try rebuildListIfChanged(ctx, list_form, items, env);
-}
-
-fn expandOrdinaryCall(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    list_form: *const Form,
-    items: []const *Form,
-) ExpandError!*Form {
-    return try rebuildListIfChanged(ctx, list_form, items, env);
-}
-
-/// Expand every list item with the same env, each exactly once
-/// (a user macro may have side effects); the list is rebuilt only
-/// when some item changed.
-fn rebuildListIfChanged(
-    ctx: *ExpandContext,
-    list_form: *const Form,
-    items: []const *Form,
-    env: ?*const ExpandEnv,
-) ExpandError!*Form {
-    var new_items: ?[]*Form = null;
-    for (items, 0..) |item, i| {
-        const expanded = try expandForm(ctx, env, item);
-        if (new_items) |out| {
-            out[i] = expanded;
-        } else if (expanded != item) {
-            const out = try ctx.allocator.alloc(*Form, items.len);
-            for (items[0..i], 0..) |earlier, j| out[j] = mutCast(earlier);
-            out[i] = expanded;
-            new_items = out;
-        }
-    }
-    const out = new_items orelse return mutCast(list_form);
-    return try makeList(ctx, out, list_form.origin);
+    if (items.len < 3 or items.len > 4) return ctx.fail(list_form.origin, "if: expected a test, a then and an optional else", .{});
+    return try mapChildren(ctx, list_form, Walk{ .env = env });
 }
 
 // ---- let* / loop* — sequential binding scope ------------------------------
@@ -1098,189 +1044,100 @@ fn anonFnForm(
     call_form: *const Form,
     items: []const *Form,
 ) ExpandError!*Form {
-    // First pass: scan to determine arity. Also rejects nested
-    // #() during the walk.
-    var max_positional: u32 = 0;
-    var uses_rest: bool = false;
-    for (items) |it| {
-        try anonScanForm(it, &max_positional, &uses_rest);
-    }
+    const origin = call_form.origin;
+    var anon: AnonParams = .{};
+    const body = try ctx.allocator.alloc(*Form, items.len);
+    for (items, body) |it, *b| b.* = try anon.visit(ctx, it);
 
-    // Second pass: rewrite `%` → `%1`. The other patterns
-    // (`%1`, `%2`, ..., `%&`) are already valid symbols and
-    // need no rewriting.
-    var rewritten_body: std.ArrayList(*Form) = .empty;
-    defer rewritten_body.deinit(ctx.allocator);
-    try rewritten_body.ensureTotalCapacity(ctx.allocator, items.len);
-    for (items) |it| {
-        try rewritten_body.append(ctx.allocator, try anonRewriteForm(ctx, it));
+    const params = try ctx.allocator.alloc(*Form, anon.max_positional + @as(usize, if (anon.uses_rest) 2 else 0));
+    for (params[0..anon.max_positional], 1..) |*p, n| p.* = try makeSymbol(ctx, try std.fmt.allocPrint(ctx.allocator, "%{d}", .{n}), origin);
+    if (anon.uses_rest) {
+        params[anon.max_positional] = try makeSymbol(ctx, "&", origin);
+        params[anon.max_positional + 1] = try makeSymbol(ctx, "%&", origin);
     }
-
-    // Build param vector.
-    // Layout: [%1 %2 ... %N] OR [%1 ... %N & %&] when rest.
-    const param_count: usize = max_positional + (if (uses_rest) @as(usize, 2) else 0);
-    var param_items: std.ArrayList(*Form) = .empty;
-    defer param_items.deinit(ctx.allocator);
-    try param_items.ensureTotalCapacity(ctx.allocator, param_count);
-    var i: u32 = 1;
-    while (i <= max_positional) : (i += 1) {
-        // Allocate the name string in the arena so it lives
-        // alongside the synthesized Form.
-        const name = try std.fmt.allocPrint(ctx.allocator, "%{d}", .{i});
-        try param_items.append(ctx.allocator, try makeSymbol(ctx, name, call_form.origin));
-    }
-    if (uses_rest) {
-        try param_items.append(ctx.allocator, try makeSymbol(ctx, "&", call_form.origin));
-        try param_items.append(ctx.allocator, try makeSymbol(ctx, "%&", call_form.origin));
-    }
-    const params_slice = try ctx.allocator.alloc(*Form, param_items.items.len);
-    for (param_items.items, 0..) |p, j| params_slice[j] = p;
-    const params_vec = try makeVector(ctx, params_slice, call_form.origin);
-
-    // Build the body call: `#(+ 1 2)` means the body IS the
-    // single call `(+ 1 2)`. The reader emits the body items
-    // ([+, 1, 2]) as the items of that synthetic call form,
-    // so we wrap them in a list here.
-    const body_call_items = try ctx.allocator.alloc(*Form, rewritten_body.items.len);
-    for (rewritten_body.items, 0..) |b, j| body_call_items[j] = b;
-    const body_call = try makeList(ctx, body_call_items, call_form.origin);
-
-    // Build (fn* params body_call).
-    const out_items = try ctx.allocator.alloc(*Form, 3);
-    out_items[0] = try makeSymbol(ctx, "fn*", call_form.origin);
-    out_items[1] = params_vec;
-    out_items[2] = body_call;
-    return try makeList(ctx, out_items, call_form.origin);
+    return try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "fn*", origin), try makeVector(ctx, params, origin), try makeList(ctx, body, origin) });
 }
 
-/// Recursively walk a Form looking for anon-fn placeholders.
-/// Errors:
-///   - nested #(...) is rejected (MalformedMacroCall)
-///   - `%N` where N parses as 0 is rejected
-fn anonScanForm(form: *const Form, max_pos: *u32, uses_rest: *bool) ExpandError!void {
+/// The `%` parameters a `#()` body uses, found in every sub-form
+/// but a quoted one: `%` is rewritten to `%1`, `%N` counts toward
+/// the arity and `%&` makes the fn variadic. A nested `#()` is
+/// malformed (Clojure's rule; the reader refuses it first).
+const AnonParams = struct {
+    max_positional: u32 = 0,
+    uses_rest: bool = false,
+
+    fn visit(self: *AnonParams, ctx: *ExpandContext, form: *const Form) ExpandError!*Form {
+        switch (form.datum) {
+            .symbol => |sym| if (sym.ns == null and sym.name.len > 0 and sym.name[0] == '%') {
+                const name = sym.name;
+                if (name.len == 1) {
+                    self.max_positional = @max(self.max_positional, 1);
+                    return try makeSymbol(ctx, "%1", form.origin);
+                }
+                if (std.mem.eql(u8, name, "%&")) {
+                    self.uses_rest = true;
+                } else if (std.fmt.parseUnsigned(u32, name[1..], 10)) |n| {
+                    if (n == 0 or n > 1000) return ctx.fail(form.origin, "#(): no parameter {s}", .{name});
+                    self.max_positional = @max(self.max_positional, n);
+                } else |_| {}
+            },
+            .anon_fn => return ctx.fail(form.origin, "#() cannot nest", .{}),
+            .quote => {},
+            else => return try mapChildren(ctx, form, self),
+        }
+        return mutCast(form);
+    }
+};
+
+/// `form` with `visitor.visit(ctx, child)` in place of each child
+/// (the items of a list, vector, map or set; the target and map of
+/// `^meta`; the payload of `@`, syntax-quote and the unquotes),
+/// sharing `form` when no child changed. A leaf, `quote` and `#()`
+/// come back as they are.
+fn mapChildren(ctx: *ExpandContext, form: *const Form, visitor: anytype) ExpandError!*Form {
     try checkStack();
     switch (form.datum) {
-        .symbol => |name| {
-            if (name.ns != null) return;
-            try anonClassifySymbol(name.name, max_pos, uses_rest);
-        },
-        .list => |items| for (items) |it| try anonScanForm(it, max_pos, uses_rest),
-        .vector => |items| for (items) |it| try anonScanForm(it, max_pos, uses_rest),
-        // Nested #() rejection.
-        .anon_fn => return ExpandError.MalformedMacroCall,
-        // Quote payload is OPAQUE — placeholders inside (quote ...)
-        // are literal data, not body references.
-        .quote, .syntax_quote, .unquote, .unquote_splicing => {},
-        else => {},
-    }
-}
-
-/// Inspect a symbol name for `%`, `%N`, or `%&` patterns and
-/// update the scan state. Anything else (including `%foo`)
-/// is left as an ordinary symbol — Clojure semantics.
-fn anonClassifySymbol(name: []const u8, max_pos: *u32, uses_rest: *bool) ExpandError!void {
-    if (name.len == 0 or name[0] != '%') return;
-    if (name.len == 1) {
-        // bare `%` → positional 1
-        if (max_pos.* < 1) max_pos.* = 1;
-        return;
-    }
-    if (name.len == 2 and name[1] == '&') {
-        uses_rest.* = true;
-        return;
-    }
-    // %N where N is a positive integer.
-    var n: u32 = 0;
-    for (name[1..]) |c| {
-        if (c < '0' or c > '9') return; // ordinary symbol like %foo
-        const d: u32 = c - '0';
-        n = n * 10 + d;
-        if (n > 1000) return ExpandError.MalformedMacroCall; // sanity bound
-    }
-    if (n == 0) return ExpandError.MalformedMacroCall;
-    if (max_pos.* < n) max_pos.* = n;
-}
-
-/// Recursively rewrite `%` symbols to `%1`. Other forms pass
-/// through unchanged. For lists/vectors, we only allocate a
-/// new node when at least one element changed (best-effort
-/// pointer-equality fast path).
-fn anonRewriteForm(ctx: *ExpandContext, form: *const Form) ExpandError!*Form {
-    try checkStack();
-    return switch (form.datum) {
-        .symbol => |name| blk: {
-            if (name.ns == null and name.name.len == 1 and name.name[0] == '%') {
-                break :blk try makeSymbol(ctx, "%1", form.origin);
+        inline .list, .vector, .map, .set => |items, tag| {
+            var out: ?[]*Form = null;
+            for (items, 0..) |item, i| {
+                const new = try visitor.visit(ctx, item);
+                if (out) |o| {
+                    o[i] = new;
+                } else if (new != item) {
+                    const o = try ctx.allocator.alloc(*Form, items.len);
+                    for (items[0..i], 0..) |earlier, j| o[j] = mutCast(earlier);
+                    o[i] = new;
+                    out = o;
+                }
             }
-            break :blk mutCast(form);
+            const o = out orelse return mutCast(form);
+            return try makeForm(ctx, @unionInit(Datum, @tagName(tag), o), form.origin);
         },
-        .list => |items| try anonRewriteList(ctx, form, items, false),
-        .vector => |items| try anonRewriteList(ctx, form, items, true),
-        // Quote payload preserved literally.
-        .quote, .syntax_quote, .unquote, .unquote_splicing => mutCast(form),
-        else => mutCast(form),
-    };
-}
-
-fn anonRewriteList(
-    ctx: *ExpandContext,
-    list_form: *const Form,
-    items: []const *Form,
-    is_vector: bool,
-) ExpandError!*Form {
-    var changed = false;
-    var rewritten: std.ArrayList(*Form) = .empty;
-    defer rewritten.deinit(ctx.allocator);
-    try rewritten.ensureTotalCapacity(ctx.allocator, items.len);
-    for (items) |it| {
-        const new_it = try anonRewriteForm(ctx, it);
-        if (new_it != it) changed = true;
-        try rewritten.append(ctx.allocator, new_it);
+        inline .deref, .syntax_quote, .unquote, .unquote_splicing => |inner, tag| {
+            const new = try visitor.visit(ctx, inner);
+            if (new == inner) return mutCast(form);
+            return try makeForm(ctx, @unionInit(Datum, @tagName(tag), new), form.origin);
+        },
+        .with_meta => |wm| {
+            const target = try visitor.visit(ctx, wm.target);
+            const meta = try visitor.visit(ctx, wm.meta);
+            if (target == wm.target and meta == wm.meta) return mutCast(form);
+            return try makeForm(ctx, .{ .with_meta = .{ .target = target, .meta = meta } }, form.origin);
+        },
+        else => return mutCast(form),
     }
-    if (!changed) return mutCast(list_form);
-    const slice = try ctx.allocator.alloc(*Form, rewritten.items.len);
-    for (rewritten.items, 0..) |it, i| slice[i] = it;
-    if (is_vector) return try makeVector(ctx, slice, list_form.origin);
-    return try makeList(ctx, slice, list_form.origin);
 }
 
-/// Discriminator for `expandCollKind`.
-const CollKind = enum { vector_, map_, set_ };
-
-/// Walk a vector/map/set literal's items + rebuild
-/// the collection Form. Each item is expanded with the current
-/// env (collection literals don't introduce bindings). Re-uses
-/// the input form if no item changed (cheap fast path).
-fn expandCollKind(
-    ctx: *ExpandContext,
+/// The visitor `mapChildren` expands each child with: the sub-forms
+/// of calls, `do`, `if`, `recur` and collection literals, all under
+/// one env.
+const Walk = struct {
     env: ?*const ExpandEnv,
-    coll_form: *const Form,
-    items: []const *Form,
-    kind: CollKind,
-) ExpandError!*Form {
-    var changed = false;
-    var rewritten: std.ArrayList(*Form) = .empty;
-    defer rewritten.deinit(ctx.allocator);
-    try rewritten.ensureTotalCapacity(ctx.allocator, items.len);
-    for (items) |it| {
-        const new_it = try expandForm(ctx, env, it);
-        if (new_it != it) changed = true;
-        try rewritten.append(ctx.allocator, new_it);
+
+    fn visit(self: Walk, ctx: *ExpandContext, form: *const Form) ExpandError!*Form {
+        return expandForm(ctx, self.env, form);
     }
-    if (!changed) return mutCast(coll_form);
-    const slice = try ctx.allocator.alloc(*Form, rewritten.items.len);
-    for (rewritten.items, 0..) |it, i| slice[i] = it;
-    const new_form = try ctx.allocator.create(Form);
-    new_form.* = .{
-        .datum = switch (kind) {
-            .vector_ => .{ .vector = @as([]const *Form, slice) },
-            .map_ => .{ .map = @as([]const *Form, slice) },
-            .set_ => .{ .set = @as([]const *Form, slice) },
-        },
-        .origin = coll_form.origin,
-    };
-    return new_form;
-}
+};
 
 // =============================================================================
 // User-defined defmacro
@@ -1952,6 +1809,12 @@ fn isClauseHead(form: *const Form, name: []const u8) bool {
 // Lifetime: every constructed Form lives in `ctx.allocator`
 // (the macroexpand arena, same as the compile arena). The
 // caller does NOT free.
+
+fn makeForm(ctx: *ExpandContext, datum: Datum, origin: SrcSpan) ExpandError!*Form {
+    const form = try ctx.allocator.create(Form);
+    form.* = .{ .datum = datum, .origin = origin };
+    return form;
+}
 
 pub fn makeList(ctx: *ExpandContext, items: []*Form, origin: SrcSpan) ExpandError!*Form {
     const form = try ctx.allocator.create(Form);

@@ -1440,6 +1440,14 @@ test "integration: anon-fn — closure captures outer binding" {
     try expectOutput("((fn* [x] (#(+ % x) 3)) 10)", "13");
 }
 
+test "anon-fn: % is found inside maps, sets, nested vectors and @" {
+    try expectOutput("(#(do {:a %}) 1)", "{:a 1}");
+    try expectOutput("(#(do #{%}) 1)", "#{1}");
+    try expectOutput("(#(vector [%1 {:k %2}]) 1 2)", "[[1 {:k 2}]]");
+    try expectOutput("(#(inc @%) (atom 1))", "2");
+    try expectOutput("(#(do {% %2}) :k :v)", "{:k :v}");
+}
+
 test "integration: anon-fn — macro inside body re-expands" {
     try expectOutput("(#(when % :yes) :anything)", ":yes");
 }
