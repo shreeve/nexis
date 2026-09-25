@@ -854,42 +854,14 @@ const Walk = struct {
 };
 
 // =============================================================================
-// User-defined defmacro
+// Namespaces, require, set!, defmacro and user-macro calls
 // =============================================================================
 //
-//   1. `(defmacro name [params] body)` is recognized by the
-//      EXPANDER (not Tiny/backend). Must execute at expansion
-//      time so subsequent forms in the SAME compile unit see
-//      the macro.
-//   2. Defmacro lowers internally to:
-//        (def name (fn* name [params] body))
-//      compile-time-evaluated via `ctx.compile_eval`. The
-//      callback compiles + runs the form in a fresh sub-VM
-//      and returns the resulting Var Value.
-//   3. The expander sets `Var.macro = true` on the returned
-//      Var pointer (the namespace owns the Var; mutating the
-//      flag here is correct).
-//   4. The defmacro form's REPLACEMENT (what the rest of the
-//      pipeline sees) is `(var name)` — that lowers to a
-//      Var-object load, so REPL/eval print the Var like
-//      `#'name`.
-//
-// User-macro INVOCATION:
-//   1. Convert each arg Form → Value via `formToValue`.
-//   2. Call `VM.evalClosure(var.root, arg_values, &sub_vm, interner,
-//      heap)`; the sub-VM borrows the compile-time interner so names
-//      in its arguments resolve, and the calling VM's heap when the
-//      context has one.
-//   3. Convert returned Value → Form via `valueToForm` in
-//      `ctx.allocator` (the compile arena).
-//   4. Deinit the sub-VM.
-//   5. Recursively re-expand the resulting Form (so macros
-//      in the macro output expand).
-//
-// Macro args are UNEVALUATED Forms-as-Values; the macro body
-// inspects them as data (lists, symbols, etc.) with natives
-// such as `first`/`rest`/`cons` and builds output via
-// syntax-quote.
+// `ns`, `require` and `defmacro` take effect at expansion time, so
+// the forms after them in the same file see the namespace, the
+// loaded code and the macro. A user macro runs in a sub-VM on its
+// arguments as data (`formToValue`), and its result becomes a form
+// again (`valueToForm`) that is expanded in its place.
 
 /// `(ns NAME docstring? attr-map? clause*)` switches the registry's
 /// current namespace to NAME at expansion time, creating it (with
@@ -1160,6 +1132,7 @@ fn callUserMacro(
         if (err == error.UncaughtThrow) if (sub_vm.unhandled_throw) |thrown| {
             return ctx.fail(span, "macro {s} threw {s}", .{ name, try describeThrown(ctx, thrown) });
         };
+        if (sub_vm.error_detail.len > 0) return ctx.fail(span, "macro {s} failed: {s}: {s}", .{ name, @errorName(err), sub_vm.error_detail });
         return ctx.fail(span, "macro {s} failed: {s}", .{ name, @errorName(err) });
     };
     return try valueToForm(ctx, result_value, span);
