@@ -188,7 +188,7 @@ out of scope and documented).
 (subs s start)        ; [start, codepoint-count) byte-slice → fresh string
 (subs s start end)    ; [start, end)
 
-(count s)         ; extends to strings: number of codepoints (O(n) walk).
+(count s)         ; extends to strings: number of codepoints (O(n) scan).
 (nth s i)         ; codepoint at index → Kind.char
 (nth s i default) ; default on out-of-bounds (matches existing nth)
 (empty? s)        ; (= 0 (count s))
@@ -200,15 +200,18 @@ out of scope and documented).
 - `:index-out-of-bounds` — negative start, end > count, start > end,
   index outside `[0, count)`.
 
-**Algorithm**: `string.codepointCount(v)` walks the byte body once
-using `std.unicode.utf8ByteSequenceLength`-style decoding;
-`string.byteRangeForCodepoints(v, start, end)` converts a
-codepoint range to a byte range in a second walk;
-`string.codepointAt(v, i)` returns a `Kind.char` Value via a
-front-to-position walk. None of these store side-cache state on
-the HeapHeader — the codepoint count is not cached (a cache slot
-or a codepoint-counted subkind is the lever if profiling shows hot
-use).
+**Algorithm**: `string.codepointCount(v)` counts with
+`std.unicode.utf8CountCodepoints`, which skips ASCII a word at a time
+and validates the rest. `string.codepointAt(v, i)` and
+`string.byteRangeForCodepoints(v, start, end)` first find the ASCII run
+at the start of the body, sixteen bytes at a time; an index inside it
+is its own byte offset, and only the bytes past it are decoded one
+scalar at a time. On an ASCII string `nth` and `subs` therefore cost a
+vector scan to the index, not a decode per character (40 000 `nth`
+calls over a 40 000-character string: 3.1 s → under 0.1 s,
+ReleaseFast). None of these store side-cache state on the HeapHeader —
+the codepoint count is not cached (a cache slot or a
+codepoint-counted subkind is the lever if profiling shows hot use).
 
 **Storage shape unchanged.** Byte layout (§2) is invariant: the body
 is still raw UTF-8 bytes; codepoint indexing is purely a presentation

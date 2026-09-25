@@ -121,35 +121,45 @@ pub fn bytesEqual(a: *HeapHeader, b: *HeapHeader) bool {
 // The language-level surface (`(count s)`, `(nth s i)`, `(subs s
 // start end)`) indexes by Unicode SCALAR / codepoint, NOT by byte
 // and NOT by grapheme cluster. The storage body remains raw UTF-8
-// bytes; these helpers walk it once per call to convert codepoint
-// indices into byte offsets.
+// bytes; these helpers convert codepoint indices into byte offsets.
+// A leading ASCII run is found sixteen bytes at a time and indexed
+// directly, so an ASCII string costs a vector scan instead of a
+// decode per character, and only the bytes past the run are walked.
 //
 // Frozen contract (STRING.md §7):
-//   - All four ops return `error.InvalidUtf8` on a malformed body
-//     mid-walk. The runtime caller (`stdlib.zig`) maps that to
-//     `:utf8-error` (catchable). The storage layer does not
-//     pre-validate bytes; the user's source had to be well-formed
-//     to reach a string Value, but a fuzzer / corrupt-codec path
-//     could produce one.
+//   - All three return `error.InvalidUtf8` on a malformed body up to
+//     the position asked for. The runtime caller (`stdlib.zig`) maps
+//     that to `:utf8-error` (catchable). The storage layer does not
+//     pre-validate bytes (a codec round trip keeps them byte-exact).
 //   - Codepoint count is NOT cached on the HeapHeader.
+
+/// Length of the ASCII run at the start of `bytes`.
+fn asciiPrefixLen(bytes: []const u8) usize {
+    const V = @Vector(16, u8);
+    var i: usize = 0;
+    while (i + 16 <= bytes.len) : (i += 16) {
+        const chunk: V = bytes[i..][0..16].*;
+        if (@reduce(.Or, chunk) & 0x80 != 0) break;
+    }
+    while (i < bytes.len and bytes[i] < 0x80) i += 1;
+    return i;
+}
+
+/// One validated scalar at `bytes[pos..]`, and its byte length.
+fn decodeAt(bytes: []const u8, pos: usize) error{InvalidUtf8}!struct { scalar: u21, len: u3 } {
+    const len = std.unicode.utf8ByteSequenceLength(bytes[pos]) catch return error.InvalidUtf8;
+    if (len > bytes.len - pos) return error.InvalidUtf8;
+    // utf8Decode rejects lone continuation bytes, overlong forms and
+    // surrogates.
+    const scalar = std.unicode.utf8Decode(bytes[pos..][0..len]) catch return error.InvalidUtf8;
+    return .{ .scalar = scalar, .len = len };
+}
 
 /// Total number of Unicode codepoints in `v`. O(byteLen). Returns
 /// `error.InvalidUtf8` if the body contains an invalid byte
 /// sequence.
 pub fn codepointCount(v: Value) error{InvalidUtf8}!usize {
-    const bytes = asBytes(v);
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < bytes.len) {
-        const seq_len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch return error.InvalidUtf8;
-        if (i + seq_len > bytes.len) return error.InvalidUtf8;
-        // Validate the sequence (catches lone continuation bytes
-        // and over-long encodings).
-        _ = std.unicode.utf8Decode(bytes[i..][0..seq_len]) catch return error.InvalidUtf8;
-        i += seq_len;
-        count += 1;
-    }
-    return count;
+    return std.unicode.utf8CountCodepoints(asBytes(v)) catch error.InvalidUtf8;
 }
 
 /// Unicode scalar at codepoint index `i`. Returns `error.OutOfBounds`
@@ -157,23 +167,22 @@ pub fn codepointCount(v: Value) error{InvalidUtf8}!usize {
 /// byte sequence anywhere up to position `i`.
 pub fn codepointAt(v: Value, i: usize) error{ OutOfBounds, InvalidUtf8 }!u21 {
     const bytes = asBytes(v);
-    var byte_pos: usize = 0;
-    var cp_pos: usize = 0;
-    while (byte_pos < bytes.len) {
-        const seq_len = std.unicode.utf8ByteSequenceLength(bytes[byte_pos]) catch return error.InvalidUtf8;
-        if (byte_pos + seq_len > bytes.len) return error.InvalidUtf8;
-        const scalar = std.unicode.utf8Decode(bytes[byte_pos..][0..seq_len]) catch return error.InvalidUtf8;
-        if (cp_pos == i) return scalar;
-        byte_pos += seq_len;
-        cp_pos += 1;
+    const ascii = asciiPrefixLen(bytes[0..@min(bytes.len, i +| 1)]);
+    if (i < ascii) return bytes[i];
+    var byte_pos = ascii;
+    var cp_pos = ascii;
+    while (byte_pos < bytes.len) : (cp_pos += 1) {
+        const d = try decodeAt(bytes, byte_pos);
+        if (cp_pos == i) return d.scalar;
+        byte_pos += d.len;
     }
     return error.OutOfBounds;
 }
 
 /// Convert a codepoint range `[start, end)` to a byte range. Both
 /// endpoints are codepoint-indexed. Returns `error.OutOfBounds` if
-/// `start > end`, `start > codepointCount(v)`, or `end >
-/// codepointCount(v)`; `error.InvalidUtf8` on malformed bytes.
+/// `start > end` or `end > codepointCount(v)`; `error.InvalidUtf8` on
+/// malformed bytes before `end`.
 ///
 /// Caller responsibility: `start` and `end` must already be
 /// non-negative — the public API rejects negatives as
@@ -186,29 +195,17 @@ pub fn byteRangeForCodepoints(
 ) error{ OutOfBounds, InvalidUtf8 }!struct { start: usize, end: usize } {
     if (start > end) return error.OutOfBounds;
     const bytes = asBytes(v);
-    var byte_pos: usize = 0;
-    var cp_pos: usize = 0;
-    var byte_start: ?usize = if (start == 0) 0 else null;
-    while (byte_pos < bytes.len) {
-        if (cp_pos == start) byte_start = byte_pos;
-        if (cp_pos == end) {
-            return .{ .start = byte_start.?, .end = byte_pos };
-        }
-        const seq_len = std.unicode.utf8ByteSequenceLength(bytes[byte_pos]) catch return error.InvalidUtf8;
-        if (byte_pos + seq_len > bytes.len) return error.InvalidUtf8;
-        _ = std.unicode.utf8Decode(bytes[byte_pos..][0..seq_len]) catch return error.InvalidUtf8;
-        byte_pos += seq_len;
-        cp_pos += 1;
+    const ascii = asciiPrefixLen(bytes[0..@min(bytes.len, end)]);
+    if (end <= ascii) return .{ .start = start, .end = end };
+    var byte_start: ?usize = if (start <= ascii) start else null;
+    var byte_pos = ascii;
+    var cp_pos = ascii;
+    while (cp_pos < end) : (cp_pos += 1) {
+        if (byte_pos == bytes.len) return error.OutOfBounds;
+        byte_pos += (try decodeAt(bytes, byte_pos)).len;
+        if (cp_pos + 1 == start) byte_start = byte_pos;
     }
-    // Reached end of bytes. Final positions land iff cp_pos
-    // matches the requested boundary.
-    if (cp_pos == end) {
-        if (byte_start == null) {
-            if (cp_pos == start) byte_start = byte_pos else return error.OutOfBounds;
-        }
-        return .{ .start = byte_start.?, .end = byte_pos };
-    }
-    return error.OutOfBounds;
+    return .{ .start = byte_start.?, .end = byte_pos };
 }
 
 // =============================================================================
