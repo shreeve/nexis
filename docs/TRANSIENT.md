@@ -115,8 +115,10 @@ wrapper it was given; the source collection is never changed.
 | `count`, `empty?`, `get`, `contains?` | on any transient; `get` of a vector transient takes an index |
 | `nth` | on a vector transient |
 
-A transient is not callable and not seqable (`seq` of one is
-`:kind-mismatch`).
+A transient map, set or vector is called, and looked up by a keyword,
+as its persistent kind is (`((transient {:a 1}) :a)` and `(:a
+(transient {:a 1}))` are 1; `((transient [5 6]) 1)` is 6). It is not
+seqable (`seq` of one is `:kind-mismatch`).
 
 ```clojure
 (persistent! (reduce conj! (transient []) (range 5)))   ;=> [0 1 2 3 4]

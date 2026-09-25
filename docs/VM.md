@@ -206,9 +206,10 @@ and `slot[A + 1 + i]` argument `i`. A and C must be slot operands
   type through the VM's protocol registry (`docs/PROTOCOLS.md`);
   `:no-protocol-impl` on a miss.
 - `keyword`, `symbol`, `persistent_map`, `persistent_set`,
-  `persistent_vector`: a lookup with an optional default, `(:k m)`,
-  `('s m)`, `(m :k)`, `(s x)`, `(v i)` (`VM.lookup`); a symbol looks
-  itself up exactly as a keyword does.
+  `persistent_vector`, `transient`: a lookup with an optional default,
+  `(:k m)`, `('s m)`, `(m :k)`, `(s x)`, `(v i)` (`VM.lookup`); a
+  symbol looks itself up exactly as a keyword does, and a transient
+  map, set or vector as its persistent kind.
 - `function` (a closure): the frame transfer below.
 - Anything else: `:not-callable`.
 
@@ -635,7 +636,7 @@ keyword form of the catchable subset (`vmErrorToKeywordName`).
 |---|---|---|
 | `KindMismatch` | `:kind-mismatch` | An operand of the wrong kind: a non-number to `math:*` / `cmp:*`, a non-seqable to `coll:concat`, a wrong kind to a native |
 | `ArityMismatch` | `:arity-mismatch` | A call passes an argument count the callee does not accept |
-| `NotCallable` | `:not-callable` | A call on a value that is not a closure, native, protocol fn, keyword, symbol, map, set or vector |
+| `NotCallable` | `:not-callable` | A call on a value that is not a closure, native, protocol fn, keyword, symbol, map, set, vector or transient |
 | `UnboundVar` | `:unbound-var` | A `v` operand or `var:load-var` on a Var never bound |
 | `NotDynamic` | `:not-dynamic` | `binding` or `set!` on a Var not marked `^:dynamic` (§6.5) |
 | `NoThreadBinding` | `:no-thread-binding` | `set!` on a dynamic Var with no binding in force |
@@ -645,6 +646,7 @@ keyword form of the catchable subset (`vmErrorToKeywordName`).
 | `DbError`, `DbClosed`, `InvalidDurableRef`, `CodecFailed`, `TxClosed` | `:db-error`, `:db-closed`, `:invalid-durable-ref`, `:codec-failed`, `:tx-closed` | Storage natives (`docs/DB.md`) |
 | `NotDerefable` | `:not-derefable` | `deref` of a value that is not a durable ref, Var or atom |
 | `AtomReEntry` | `:atom-re-entry` | A mutating atom op re-entered on the atom it is mutating (`docs/ATOM.md`) |
+| `TransientUsedAfterPersistent` | `:transient-used-after-persistent` | A transient called or looked up after `persistent!` froze it (`docs/TRANSIENT.md` §6) |
 | `Utf8Error`, `InvalidArgument`, `IoError`, `FileNotFound`, `InvalidPath` | `:utf8-error`, `:invalid-argument`, `:io-error`, `:file-not-found`, `:invalid-path` | String, math and I/O natives |
 | `NotARecord`, `NoProtocolImpl`, `NoProtocolMethod` | `:not-a-record`, `:no-protocol-impl`, `:no-protocol-method` | Records and protocols (`docs/PROTOCOLS.md`) |
 | `StackOverflow` | `:stack-overflow` | A call would push frame number `VM.max_frames` (default 2^20; an embedder may set it); a native re-entering the VM finds the native stack past the guard (§13.1); or `=`, `hash` or printing inside a call or opcode met data nested past the guard (SEMANTICS.md §2.7). Runaway recursion ends in well under a second; legitimate recursion a hundred thousand calls deep runs |

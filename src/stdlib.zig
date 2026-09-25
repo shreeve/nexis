@@ -1605,7 +1605,6 @@ fn fnGet(vm: *VM, args: []const Value) VmError!Value {
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
     if (args[0].kind() == .string) return (try stringIndex(args[0], args[1])) orelse default;
     if (args[0].kind() == .typed_vector) return (try typedVectorIndex(vm, args[0], args[1])) orelse default;
-    if (args[0].kind() == .transient) return (try transientLookup(vm, args[0], args[1])) orelse default;
     return vm_mod.lookup(args[0], args[1], default) catch |err| if (err == VmError.KindMismatch) default else err;
 }
 
@@ -1680,7 +1679,7 @@ fn fnContainsQ(vm: *VM, args: []const Value) VmError!Value {
         .transient => value_mod.fromBool(if (coll.subkind() == transient_mod.subkind_transient_set)
             transient_mod.setContainsBang(coll, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err)
         else
-            (try transientLookup(vm, coll, k)) != null),
+            (try vm_mod.transientLookup(coll, k)) != null),
         else => return VmError.KindMismatch,
     };
 }
@@ -3445,22 +3444,6 @@ fn transientCount(vm: *VM, t: Value) VmError!usize {
         transient_mod.subkind_transient_set => transient_mod.setCountBang(t),
         else => transient_mod.vectorCountBang(t),
     } catch |err| transientFailure(vm, err);
-}
-
-/// The value at `k` in a transient map, the element `k` of a set or
-/// the element at index `k` of a vector; null when absent.
-fn transientLookup(vm: *VM, t: Value, k: Value) VmError!?Value {
-    switch (try requireTransient(t)) {
-        transient_mod.subkind_transient_map => return switch (transient_mod.mapGetBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err)) {
-            .present => |v| v,
-            .absent => null,
-        },
-        transient_mod.subkind_transient_set => return if (transient_mod.setContainsBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err)) k else null,
-        else => {
-            if (k.kind() != .fixnum or k.asFixnum() < 0 or @as(usize, @intCast(k.asFixnum())) >= try transientCount(vm, t)) return null;
-            return transient_mod.vectorNthBang(t, @intCast(k.asFixnum())) catch |err| transientFailure(vm, err);
-        },
-    }
 }
 
 /// `(transient coll)` → a transient of a vector, map or set.

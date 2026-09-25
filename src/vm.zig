@@ -33,6 +33,7 @@ const bignum_mod = @import("bignum.zig");
 const list_mod = @import("coll/list.zig");
 const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
+const transient_mod = @import("coll/transient.zig");
 /// Canonical `hashValue` + `equal` entry points for map and set
 /// construction.
 const dispatch_mod = @import("dispatch.zig");
@@ -1208,6 +1209,9 @@ pub const VmError = error{
     /// catchable error instead of being silently allowed.
     /// Mapped to `:atom-re-entry`. See ATOM.md §4.4.
     AtomReEntry,
+    /// A transient was used after `persistent!` froze it
+    /// (TRANSIENT.md §6).
+    TransientUsedAfterPersistent,
     /// Malformed UTF-8
     /// byte sequence encountered during codepoint iteration of
     /// a `.string` Value. Storage is byte-blob; the reader and
@@ -3512,6 +3516,7 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.TxClosed => "tx-closed",
         VmError.NotDerefable => "not-derefable",
         VmError.AtomReEntry => "atom-re-entry",
+        VmError.TransientUsedAfterPersistent => "transient-used-after-persistent",
         VmError.Utf8Error => "utf8-error",
         VmError.InvalidArgument => "invalid-argument",
         VmError.IoError => "io-error",
@@ -3574,8 +3579,33 @@ pub fn lookup(coll: Value, key: Value, default: Value) VmError!Value {
             if (idx < 0 or @as(usize, @intCast(idx)) >= vector_mod.count(coll)) break :blk default;
             break :blk vector_mod.nth(coll, @intCast(idx));
         },
+        .transient => (try transientLookup(coll, key)) orelse default,
         else => VmError.KindMismatch,
     };
+}
+
+/// The value at `k` in transient map `t`, the element `k` of a
+/// transient set or the element at index `k` of a transient vector;
+/// null when absent (TRANSIENT.md §7).
+pub fn transientLookup(t: Value, k: Value) VmError!?Value {
+    return transientFind(t, k) catch |err| switch (err) {
+        error.TransientFrozen => VmError.TransientUsedAfterPersistent,
+        else => VmError.KindMismatch,
+    };
+}
+
+fn transientFind(t: Value, k: Value) transient_mod.TransientError!?Value {
+    switch (t.subkind()) {
+        transient_mod.subkind_transient_map => return switch (try transient_mod.mapGetBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
+            .present => |v| v,
+            .absent => null,
+        },
+        transient_mod.subkind_transient_set => return if (try transient_mod.setContainsBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal)) k else null,
+        else => {
+            if (k.kind() != .fixnum or k.asFixnum() < 0 or @as(usize, @intCast(k.asFixnum())) >= try transient_mod.vectorCountBang(t)) return null;
+            return try transient_mod.vectorNthBang(t, @intCast(k.asFixnum()));
+        },
+    }
 }
 
 fn mapLookup(m: Value, key: Value, default: Value) Value {
@@ -3611,7 +3641,7 @@ pub fn kindPhrase(k: value_mod.Kind) []const u8 {
 /// Kinds a `call:call` treats as a lookup rather than a function.
 pub fn isLookupCallable(k: value_mod.Kind) bool {
     return switch (k) {
-        .keyword, .symbol, .persistent_map, .persistent_set, .persistent_vector => true,
+        .keyword, .symbol, .persistent_map, .persistent_set, .persistent_vector, .transient => true,
         else => false,
     };
 }
@@ -3625,17 +3655,28 @@ pub fn isLookupCallable(k: value_mod.Kind) bool {
 ///   (v i)       → (nth v i)       vectors take exactly one fixnum;
 ///                                 out of range is an error
 ///
-/// Any other arity is `ArityMismatch` (PLAN §8.7).
+/// A transient map, set or vector is called, and looked up by a
+/// keyword, as its persistent kind is (TRANSIENT.md §7). Any other
+/// arity is `ArityMismatch` (PLAN §8.7).
 pub fn callLookup(callee: Value, args: []const Value) VmError!Value {
     if (args.len < 1 or args.len > 2) return VmError.ArityMismatch;
     const default = if (args.len == 2) args[1] else value_mod.nilValue();
     return switch (callee.kind()) {
         .keyword, .symbol => switch (args[0].kind()) {
-            .nil, .persistent_map, .record, .persistent_set, .persistent_vector, .nextomic_entity => lookup(args[0], callee, default),
+            .nil, .persistent_map, .record, .persistent_set, .persistent_vector, .nextomic_entity, .transient => lookup(args[0], callee, default),
             else => default,
         },
         .persistent_map => lookup(callee, args[0], default),
         .persistent_set => if (args.len == 1) lookup(callee, args[0], default) else VmError.ArityMismatch,
+        .transient => switch (callee.subkind()) {
+            transient_mod.subkind_transient_map => lookup(callee, args[0], default),
+            transient_mod.subkind_transient_set => if (args.len == 1) lookup(callee, args[0], default) else VmError.ArityMismatch,
+            else => blk: {
+                if (args.len != 1) return VmError.ArityMismatch;
+                if (args[0].kind() != .fixnum) return VmError.KindMismatch;
+                break :blk (try transientLookup(callee, args[0])) orelse VmError.IndexOutOfBounds;
+            },
+        },
         .persistent_vector => blk: {
             if (args.len != 1) return VmError.ArityMismatch;
             if (args[0].kind() != .fixnum) return VmError.KindMismatch;

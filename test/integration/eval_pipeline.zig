@@ -1420,6 +1420,11 @@ test "integration: transients: transient, conj!, assoc!, dissoc!, disj!, pop!, p
     // empty? counts a transient, as Clojure 1.12's does (CLJ-1872).
     try expectOutput("[(empty? (transient [])) (empty? (transient [1])) (empty? (transient {:a 1})) (empty? (transient #{}))]", "[true false false true]");
     try expectOutput("(let [t (transient [])] (persistent! t) (try (empty? t) (catch any e e)))", ":transient-used-after-persistent");
+    // A transient is called, and looked up by a keyword, as its
+    // persistent kind is.
+    try expectOutput("[(:a (transient {:a 1})) (:b (transient {:a 1}) 7) ((transient {:a 1}) :a) ((transient {:a 1}) :b 9) ((transient [5 6]) 1) ((transient #{3}) 3) ((transient #{3}) 4) (:a (transient [1])) (map (transient {:a 1}) [:a :c])]", "[1 7 1 9 6 3 nil nil (1 nil)]");
+    try expectOutput("[(try ((transient [1 2]) 5) (catch any e e)) (try ((transient [1 2]) :a) (catch any e e)) (try ((transient #{1}) 1 2) (catch any e e))]", "[:index-out-of-bounds :kind-mismatch :arity-mismatch]");
+    try expectOutput("(let [t (transient {:a 1})] (persistent! t) [(try (:a t) (catch any e e)) (try (t :a) (catch any e e)) (try (get t :a) (catch any e e))])", "[:transient-used-after-persistent :transient-used-after-persistent :transient-used-after-persistent]");
     try expectOutput("(let [t (transient [1 2 3])] (identical? t (assoc! t 3 4)))", "true");
     try expectOutput("[(try (assoc! (transient [1]) 5 :x) (catch any e e)) (try (pop! (transient [])) (catch any e e))]", "[:index-out-of-bounds :index-out-of-bounds]");
     try expectOutput("[(pop [1 2 3]) (pop [1]) (count (reduce (fn [v _] (pop v)) (vec (range 2000)) (range 1990)))]", "[[1 2] [] 10]");
