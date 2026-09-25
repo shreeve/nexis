@@ -415,6 +415,18 @@ test "syntax-quote: symbols qualify to the namespace that defines them" {
     try expectOutput("(second `(a ~'b))", "b");
 }
 
+test "syntax-quote: auto-gensyms stay unique across top-level forms" {
+    try expectOutputProgram("(def p `a#) (def q `a#) (= p q)", "false");
+    // A macro's syntax-quote is expanded once, when the macro is
+    // defined, so every call of it yields the same name (Clojure's
+    // read-time rule); `gensym` gives a fresh one per call.
+    try expectOutputProgram(
+        \\(defmacro same [] `'g#)
+        \\(defmacro fresh [] (list 'quote (gensym "g")))
+        \\[(= (same) (same)) (= (fresh) (fresh))]
+    , "[true false]");
+}
+
 test "syntax-quote: a bare binding name inside syntax-quote is the Clojure mistake" {
     // `(let [x ~a] x)` qualifies `x`; a qualified name cannot be bound.
     try expectProgramError("(defmacro bad [a] `(let [x ~a] x)) (bad 1)", compile.CompileError.MacroExpansionFailure);

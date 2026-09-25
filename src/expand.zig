@@ -119,10 +119,6 @@ pub const LoadCallback = struct {
 pub const ExpandContext = struct {
     allocator: Allocator,
     interner: *intern_mod.Interner,
-    /// Monotonic auto-gensym counter (MACROEXPAND.md §5: lives
-    /// on the context, NOT the VM). Used by host macros that
-    /// need to avoid double-evaluation (e.g. `or`).
-    gensym_next: u64 = 0,
     /// Macro registry. May be empty (no host expansion fires).
     host_macros: *const HostMacroTable,
     /// Namespace for user-defmacro lookup. When
@@ -173,19 +169,18 @@ pub const ExpandContext = struct {
         return &self._arg_heap.?;
     }
 
-    /// Allocate a fresh gensym name in the context's arena.
-    /// Format: `<base>__<counter>__auto__` per MACROEXPAND.md §4.
-    /// The `__auto__` suffix marks auto-gensym.
-    ///
-    /// Lifetime: the returned slice lives in `ctx.allocator`,
-    /// which is the macroexpand arena (typically the same as
-    /// the compile arena). The caller does NOT free.
+    /// A fresh name `<base>__<N>__auto__` (MACROEXPAND.md §4) in
+    /// `ctx.allocator`.
     pub fn gensym(self: *ExpandContext, base: []const u8) ExpandError![]const u8 {
-        const counter = self.gensym_next;
-        self.gensym_next += 1;
-        return std.fmt.allocPrint(self.allocator, "{s}__{d}__auto__", .{ base, counter });
+        gensym_counter += 1;
+        return std.fmt.allocPrint(self.allocator, "{s}__{d}__auto__", .{ base, gensym_counter });
     }
 };
+
+/// The auto-gensym counter. A context lives for one top-level form,
+/// but a name it generates may be defined as a Var that later forms
+/// see, so the counter is process-wide (one isolate, one thread).
+var gensym_counter: u64 = 0;
 
 /// Host-Zig macro callback. Takes the call form (head + args)
 /// and produces a rewritten form. The result is then re-fed to
@@ -2641,11 +2636,9 @@ fn lookupDefault(defaults: ?[]const *Form, name: []const u8) ?*Form {
     return null;
 }
 
-/// Generate a fresh auto-gensym symbol like `nx__N__auto__`.
+/// A fresh symbol `nx__N__auto__`.
 fn genTempSym(ctx: *ExpandContext, origin: reader_mod.SrcSpan) ExpandError!*Form {
-    ctx.gensym_next += 1;
-    const name = try std.fmt.allocPrint(ctx.allocator, "nx__{d}__auto__", .{ctx.gensym_next});
-    return try makeSymbol(ctx, name, origin);
+    return try makeSymbol(ctx, try ctx.gensym("nx"), origin);
 }
 
 /// Build `(nth src idx nil)` as a Form.
@@ -4040,8 +4033,7 @@ fn threadStep(
 //     entry: ONE scope per syntax-quote form. A nested
 //     syntax-quote raises MalformedMacroCall before any inner
 //     scope would open.
-//   - Counter is on ExpandContext.gensym_next (monotonic
-//     across the entire compilation unit), so two separate
+//   - The counter is process-wide, so two separate
 //     syntax-quotes never collide even though their scopes
 //     are independent.
 

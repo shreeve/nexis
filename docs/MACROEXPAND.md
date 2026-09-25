@@ -56,10 +56,6 @@ Macros come in two kinds, dispatched from one lookup:
 pub const ExpandContext = struct {
     allocator: std.mem.Allocator,
     interner: *intern_mod.Interner,
-    /// Monotonic counter for auto-gensym. Lives on the
-    /// context, not the VM: macroexpand runs before VM
-    /// execution and may run without a VM at all.
-    gensym_next: u64 = 0,
     host_macros: *const HostMacroTable,
     namespace: ?*vm_mod.Namespace = null,          // user-macro lookup
     compile_eval: ?CompileEvalContext = null,      // defmacro evaluation
@@ -76,9 +72,7 @@ pub const MacroFn = *const fn (
 pub const HostMacroTable = std.StringHashMapUnmanaged(MacroFn);
 ```
 
-The context bundle lives for one compilation unit (one CLI
-invocation, one REPL session, one test); reusing it across forms
-is how auto-gensym stays monotonic within a unit.
+The compiler builds a context for each top-level form.
 
 ### 1.1 Lookup order in `expandList`
 
@@ -366,9 +360,9 @@ same `x#` gets a DIFFERENT gensym: the scope is per syntax-quote
 form.
 
 Gensym name format: `<base>__<counter>__auto__`. The counter is
-`ExpandContext.gensym_next`, monotonic across the whole
-compilation unit, so two separate syntax-quotes never collide
-even though their scopes are independent. Host macros that need
+process-wide, not per context: a generated name may become a Var
+that later top-level forms see, so two expansions never share a
+name, whichever forms or files they come from. Host macros that need
 a fresh name (`and`, `or`, `case`, `condp`, `for`, `defn`
 multi-arity, destructuring) call `ctx.gensym(base)` directly.
 The `__auto__` suffix is the Clojure convention — it
