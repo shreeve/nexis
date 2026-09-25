@@ -19,8 +19,15 @@
 {:error :nextomic/tx-fn, :message unknown function: no-such-fn}
 {:error :nextomic/tx-fn, :message transaction functions nest past the depth limit}
 :db/open-failed
+{:error :nextomic/tx-data, :message a tempid used only as a value, or not at all, names no entity}
+{:error :nextomic/tx-data, :message :db/txInstant is asserted on the transaction's own entity only, and never retracted}
+{:error :nextomic/tx-data, :message a transaction's :db/txInstant is never earlier than the one before}
 ok a failed transaction leaves the basis alone
 ok the store still works after every failure
+{:error :nextomic/conflict, :e 27, :a :db/ident}
+ok an aborted rename is not cached
+ok the attribute keeps its old name
+:nextomic/value-type
 :nextomic/closed
 :nextomic/closed
 :nextomic/closed

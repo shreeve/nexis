@@ -1,0 +1,3 @@
+; `nexis run FILE ARG...`: the arguments after the program, as a
+; vector of strings.
+(prn *command-line-args*)

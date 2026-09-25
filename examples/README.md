@@ -9,9 +9,11 @@ zig build examples                      # every example through bin/nexis
 ```
 
 `zig build examples` (part of `zig build test`) runs every file below
-from a generated working directory; `durable-refs`, `todo-app` and
-`nextomic-app` run a second time in the same directory, which proves
-their second-run behavior.
+from a generated working directory and compares what it prints with
+`test/examples/<name>.out`; `durable-refs`, `todo-app` and
+`nextomic-app` run a second time in the same directory, compared with
+`test/examples/<name>.2.out`, which proves their second-run behavior.
+`zig build examples -Dupdate=true` rewrites the expected files.
 
 | File | What it shows |
 |---|---|

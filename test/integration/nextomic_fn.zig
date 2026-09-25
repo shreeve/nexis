@@ -161,6 +161,52 @@ test "cardinality changes apply from the next transaction and keep their history
     try testing.expectEqual(@as(usize, 2), nx.vector.count((try fx.getName(then, "person/name")).?));
 }
 
+test "a flag declared false turns true later; a component flag reads as each view saw it" {
+    const fx = try Fx.init("fn_flags");
+    defer fx.deinit();
+    const a = fx.arena();
+    var fault: Fault = .{};
+    _ = try fx.transact(
+        \\[{:db/ident :t/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/index false :db/fulltext false}
+        \\ {:db/ident :t/home :db/valueType :db.type/ref :db/cardinality :db.cardinality/one :db/isComponent true}
+        \\ {:db/ident :t/city :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
+    );
+    const r = try fx.transact("[{:db/id \"p\" :t/name \"Red Plum\" :t/home {:t/city \"Oslo\"}}]");
+    const p = try std.fmt.allocPrint(a, "{d}", .{r.tempids[0].eid});
+    const before = try fx.db();
+    const name = blk: {
+        const txn = try fx.conn().store.beginRead();
+        defer txn.abort();
+        break :blk (try fx.conn().idents.idOfName(txn, "t/name")).?;
+    };
+
+    // `false` to `true` is the flag's arrival: AVET and the tokens tree
+    // are backfilled. Retracting `true` stays refused.
+    _ = try fx.transact("[[:db/add :t/name :db/index true] [:db/add :t/name :db/fulltext true]]");
+    const flagged = try fx.db();
+    try testing.expect((try flagged.attr(name)).?.indexed);
+    try testing.expect((try flagged.attr(name)).?.fulltext);
+    try testing.expect(!(try flagged.asOf(before.basis).attr(name)).?.indexed);
+    try testing.expectEqual(@as(usize, 1), (try flagged.datoms(a, .avet, .{ .a = name })).len);
+    try testing.expectEqual(@as(usize, 1), count(try fx.q(flagged, "[:find ?e :where [(fulltext $ :t/name \"plum\") [[?e ?v]]]]")));
+    try testing.expectError(error.Conflict, fx.transact("[[:db/retract :t/name :db/index true]]"));
+    try testing.expectError(error.Conflict, fx.transact("[[:db/add :t/name :db/fulltext false]]"));
+
+    // `:db/isComponent true` takes a ref attribute only.
+    try testing.expectError(error.Schema, fx.transactFn("[[:db/add :t/city :db/isComponent true]]", &fault));
+    try testing.expect(fault.attr != null);
+    try testing.expectError(error.Schema, fx.transact("[{:db/ident :t/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/isComponent true}]"));
+
+    // A component flag cleared later: a view before the change still
+    // pulls the component whole, the current view pulls a ref.
+    _ = try fx.transact("[[:db/add :t/home :db/isComponent false]]");
+    const later = try fx.db();
+    const then = (try fx.getName(try fx.pullSrc(later.asOf(before.basis), "[:t/home]", p), "t/home")).?;
+    try testing.expect((try fx.getName(then, "t/city")) != null);
+    const now = (try fx.getName(try fx.pullSrc(later, "[:t/home]", p), "t/home")).?;
+    try testing.expect((try fx.getName(now, "t/city")) == null);
+}
+
 test "excision empties the entity for pull and q on every view, and tx-range replays without it" {
     const fx = try Fx.init("fn_excise");
     defer fx.deinit();

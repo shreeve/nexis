@@ -182,7 +182,7 @@ test "removeDatoms empties every tree of the entity and reports its transactions
     }
     const txn = try store.beginWrite(.none);
     defer txn.abort();
-    const schema = try Schema.build(testing.allocator, store, txn, 3, 3);
+    const schema = try Schema.build(testing.allocator, store, txn, 3);
     defer schema.deinit();
 
     const out = try removeDatoms(store, txn, arena, schema, e, null);
