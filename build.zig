@@ -164,7 +164,12 @@ pub fn build(b: *std.Build) void {
     // `-Dupdate=true` rewrites every expected file instead of comparing.
     // -------------------------------------------------------------------------
 
-    const scripts: Scripts = .{ .b = b, .exe = nexis_exe, .update = update };
+    const scripts: Scripts = .{
+        .b = b,
+        .exe = nexis_exe,
+        .update = update,
+        .stress = b.graph.environ_map.get("NEXIS_GC_STRESS") != null,
+    };
 
     // test/nextomic/*.nx: each script's stdout against its `.out`
     // (NEXTOMIC.md §8), run from a fresh directory that holds the
@@ -176,47 +181,33 @@ pub fn build(b: *std.Build) void {
     const nextomic_nx_step = b.step("nextomic-nx", "Run the test/nextomic end-to-end scripts through bin/nexis");
     for (listStems(b, "test/nextomic", ".nx")) |name| {
         if (std.mem.eql(u8, name, "prelude") or std.mem.endsWith(u8, name, "-2")) continue;
-        const pair: []const []const u8 = if (std.mem.endsWith(u8, name, "-1"))
-            &.{ name, b.fmt("{s}-2", .{name[0 .. name.len - 2]}) }
-        else
-            &.{name};
-        var inputs: std.ArrayList(std.Build.LazyPath) = .empty;
-        inputs.append(b.allocator, b.path("test/nextomic/prelude.nx")) catch @panic("OOM");
-        for (pair) |n| {
-            inputs.append(b.allocator, b.path(b.fmt("test/nextomic/{s}.nx", .{n}))) catch @panic("OOM");
-            inputs.append(b.allocator, b.path(b.fmt("test/nextomic/{s}.out", .{n}))) catch @panic("OOM");
-        }
-        const cwd = scripts.freshDir(inputs.items);
-        var previous: ?*std.Build.Step = null;
-        for (pair) |n| {
-            const run = scripts.run(nextomic_nx_step, b.fmt("test/nextomic/{s}.nx", .{n}), cwd, b.fmt("test/nextomic/{s}.out", .{n}));
-            run.setEnvironmentVariable("NEXIS_GC_STRESS", "1");
-            if (previous) |p| run.step.dependOn(p);
-            previous = &run.step;
-        }
+        const pair = std.mem.endsWith(u8, name, "-1");
+        var programs: std.ArrayList(Program) = .empty;
+        for (if (pair) &[_][]const u8{ name, b.fmt("{s}-2", .{name[0 .. name.len - 2]}) } else &[_][]const u8{name}) |n|
+            programs.append(b.allocator, .{
+                .script = b.fmt("test/nextomic/{s}.nx", .{n}),
+                .expected = b.fmt("test/nextomic/{s}.out", .{n}),
+            }) catch @panic("OOM");
+        scripts.unit(nextomic_nx_step, b.fmt("nextomic-nx-{s}", .{name}), programs.items, &.{"test/nextomic/prelude.nx"}, true);
     }
     test_step.dependOn(nextomic_nx_step);
 
     // examples/*.nx: each example's stdout against
     // test/examples/<name>.out, from a fresh directory (the
     // store-backed ones write under tmp/ in it). An example with a
-    // `<name>.2.out` runs again in the same directory, proving it
-    // idempotent over the store it left.
+    // `<name>.2.out` runs again in the same directory, over the
+    // store the first run left.
     const examples_step = b.step("examples", "Run every examples/*.nx through bin/nexis");
-    const example_libs = listFiles(b, "examples/lib");
+    const example_libs = listFiles(b, "examples/lib", true);
     for (listStems(b, "examples", ".nx")) |name| {
         const script = b.fmt("examples/{s}.nx", .{name});
-        const first = b.fmt("test/examples/{s}.out", .{name});
         const second = b.fmt("test/examples/{s}.2.out", .{name});
-        const twice = exists(b, second);
-        var inputs: std.ArrayList(std.Build.LazyPath) = .empty;
-        inputs.append(b.allocator, b.path(script)) catch @panic("OOM");
-        inputs.append(b.allocator, b.path(first)) catch @panic("OOM");
-        if (twice) inputs.append(b.allocator, b.path(second)) catch @panic("OOM");
-        for (example_libs) |lib| inputs.append(b.allocator, b.path(lib)) catch @panic("OOM");
-        const cwd = scripts.freshDir(inputs.items);
-        const run = scripts.run(examples_step, script, cwd, first);
-        if (twice) scripts.run(examples_step, script, cwd, second).step.dependOn(&run.step);
+        const programs = [_]Program{
+            .{ .script = script, .expected = b.fmt("test/examples/{s}.out", .{name}) },
+            .{ .script = script, .expected = second },
+        };
+        const count: usize = if (exists(b, second)) 2 else 1;
+        scripts.unit(examples_step, b.fmt("examples-{s}", .{name}), programs[0..count], example_libs, scripts.stress);
     }
     test_step.dependOn(examples_step);
 
@@ -242,8 +233,8 @@ pub fn build(b: *std.Build) void {
     run_golden.addArg("test/golden");
     run_golden.setCwd(b.path("."));
     if (update) run_golden.has_side_effects = true else run_golden.expectExitCode(0);
-    for (listFiles(b, "test/golden")) |path| run_golden.addFileInput(b.path(path));
-    for (listFiles(b, "test/golden/errors")) |path| run_golden.addFileInput(b.path(path));
+    for (listFiles(b, "test/golden", false)) |path| run_golden.addFileInput(b.path(path));
+    for (listFiles(b, "test/golden/errors", false)) |path| run_golden.addFileInput(b.path(path));
     golden_step.dependOn(&run_golden.step);
 
     // test/golden/cli: what bin/nexis prints, pinned byte for byte: a
@@ -282,7 +273,7 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{"frobnicate"}, .stderr = "unknown-command.err", .exit_code = 1 },
         };
         for (cases) |case| {
-            const run = b.addRunArtifact(nexis_exe);
+            const run = scripts.program(scripts.stress);
             run.setCwd(b.path("."));
             run.addArgs(case.args);
             for (case.args) |arg| {
@@ -297,40 +288,66 @@ pub fn build(b: *std.Build) void {
     }
 }
 
+/// One program of a unit: the script `nexis run` runs and the file its
+/// stdout is pinned to.
+const Program = struct { script: []const u8, expected: []const u8 };
+
 /// Programs run through bin/nexis with their output compared to, or
 /// under `-Dupdate=true` written to, a file in the tree.
 const Scripts = struct {
     b: *std.Build,
     exe: *std.Build.Step.Compile,
     update: bool,
+    /// `NEXIS_GC_STRESS` is set in the build's environment.
+    stress: bool,
 
-    /// A directory emptied on every build, for a program to use as its
-    /// working directory: the stores a run leaves, including a failed
-    /// run's, never reach the next run. Its path follows `inputs` and
-    /// the binary.
-    fn freshDir(self: Scripts, inputs: []const std.Build.LazyPath) std.Build.LazyPath {
-        const mk = self.b.addSystemCommand(&.{ "sh", "-c", "rm -rf \"$1\" && mkdir -p \"$1\"", "fresh-dir" });
-        mk.has_side_effects = true;
-        const dir = mk.addOutputDirectoryArg("cwd");
-        mk.addFileInput(self.exe.getEmittedBin());
-        for (inputs) |input| {
-            // An expected file not written yet is no input.
-            if (input == .src_path and !exists(self.b, input.src_path.sub_path)) continue;
-            mk.addFileInput(input);
-        }
-        mk.expectExitCode(0);
-        return dir;
+    /// A run of bin/nexis with an environment of its own: empty, or
+    /// only `NEXIS_GC_STRESS` when `stress`. The step's cache key
+    /// hashes that environment, so a stress build never reuses a
+    /// result a normal build left, and nothing else in the caller's
+    /// environment reaches the program or its key.
+    fn program(self: Scripts, stress: bool) *std.Build.Step.Run {
+        const r = self.b.addRunArtifact(self.exe);
+        r.clearEnvironment();
+        if (stress) r.setEnvironmentVariable("NEXIS_GC_STRESS", "1");
+        return r;
     }
 
-    /// `nexis run script` from `cwd`, its stdout pinned to `expected`.
-    fn run(self: Scripts, step: *std.Build.Step, script: []const u8, cwd: std.Build.LazyPath, expected: []const u8) *std.Build.Step.Run {
-        const r = self.b.addRunArtifact(self.exe);
-        r.addArg("run");
-        r.addFileArg(self.b.path(script));
-        r.setCwd(cwd);
-        r.expectExitCode(0);
-        self.pin(step, r, expected, .stdout);
-        return r;
+    /// Run `programs` in order from one fresh directory named after
+    /// `name`, each one's stdout pinned to its expected file. Every
+    /// run hashes the contents of its script, its expected output,
+    /// the binary and each of `inputs` (the files the scripts load),
+    /// so a change to any of them re-runs it. A unit of two programs
+    /// shares a store, so both run on every build: a second program
+    /// never reads a directory its first did not write in the same
+    /// build.
+    fn unit(self: Scripts, step: *std.Build.Step, name: []const u8, programs: []const Program, inputs: []const []const u8, stress: bool) void {
+        const cwd = self.freshDir(name);
+        var previous: ?*std.Build.Step = null;
+        for (programs) |p| {
+            const r = self.program(stress);
+            r.addArg("run");
+            r.addFileArg(self.b.path(p.script));
+            r.setCwd(cwd);
+            for (inputs) |input| r.addFileInput(self.b.path(input));
+            r.has_side_effects = programs.len > 1;
+            r.expectExitCode(0);
+            self.pin(step, r, p.expected, .stdout);
+            if (previous) |prev| r.step.dependOn(prev);
+            previous = &r.step;
+        }
+    }
+
+    /// A directory emptied on every build, for a unit's programs to
+    /// use as their working directory: the stores a run leaves, a
+    /// failed run's included, never reach a later build. Its path
+    /// follows `name` only; what a program reads is hashed on its run.
+    fn freshDir(self: Scripts, name: []const u8) std.Build.LazyPath {
+        const mk = self.b.addSystemCommand(&.{ "sh", "-c", "rm -rf \"$1\" && mkdir -p \"$1\"", name });
+        mk.has_side_effects = true;
+        const dir = mk.addOutputDirectoryArg("cwd");
+        mk.expectExitCode(0);
+        return dir;
     }
 
     /// Make `step` compare `r`'s `stream` with the file at `path`, or
@@ -364,7 +381,7 @@ const Scripts = struct {
 /// without it, sorted.
 fn listStems(b: *std.Build, dir: []const u8, ext: []const u8) []const []const u8 {
     var stems: std.ArrayList([]const u8) = .empty;
-    for (listFiles(b, dir)) |path| {
+    for (listFiles(b, dir, false)) |path| {
         const base = std.fs.path.basename(path);
         if (std.mem.endsWith(u8, base, ext))
             stems.append(b.allocator, base[0 .. base.len - ext.len]) catch @panic("OOM");
@@ -372,18 +389,21 @@ fn listStems(b: *std.Build, dir: []const u8, ext: []const u8) []const []const u8
     return stems.items;
 }
 
-/// The paths of the files directly under `dir`, sorted.
-fn listFiles(b: *std.Build, dir: []const u8) []const []const u8 {
+/// The paths of the files under `dir`, and under its subdirectories
+/// when `recursive`, sorted.
+fn listFiles(b: *std.Build, dir: []const u8, recursive: bool) []const []const u8 {
     const io = b.graph.io;
     var handle = b.build_root.handle.openDir(io, dir, .{ .iterate = true }) catch |err|
         std.debug.panic("cannot open {s}: {t}", .{ dir, err });
     defer handle.close(io);
     var paths: std.ArrayList([]const u8) = .empty;
-    var it = handle.iterate();
-    while (it.next(io) catch |err| std.debug.panic("cannot list {s}: {t}", .{ dir, err })) |entry| {
-        if (entry.kind != .file) continue;
-        paths.append(b.allocator, b.pathJoin(&.{ dir, entry.name })) catch @panic("OOM");
-    }
+    var walker = handle.walkSelectively(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    while (walker.next(io) catch |err| std.debug.panic("cannot list {s}: {t}", .{ dir, err })) |entry| switch (entry.kind) {
+        .file => paths.append(b.allocator, b.pathJoin(&.{ dir, entry.path })) catch @panic("OOM"),
+        .directory => if (recursive) walker.enter(io, entry) catch |err| std.debug.panic("cannot list {s}: {t}", .{ entry.path, err }),
+        else => {},
+    };
     std.mem.sort([]const u8, paths.items, {}, struct {
         fn lessThan(_: void, x: []const u8, y: []const u8) bool {
             return std.mem.lessThan(u8, x, y);

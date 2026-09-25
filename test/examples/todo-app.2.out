@@ -1,1 +1,1 @@
-[:initial-stats {:total 3, :completed 0} :initial-count 3 :rollback-caught [:caught :simulated-failure] :rollback-present? false :buy-milk-after {:title :buy-milk, :done true} :final-stats {:total 3, :completed 1}]
+[:initial-stats {:total 3, :completed 1} :initial-count 3 :rollback-caught [:caught :simulated-failure] :rollback-present? false :buy-milk-after {:title :buy-milk, :done true} :final-stats {:total 3, :completed 1}]
