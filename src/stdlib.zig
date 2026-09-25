@@ -3433,10 +3433,11 @@ fn fnPopBang(vm: *VM, args: []const Value) VmError!Value {
 /// the next argument: `%s` (as `str` makes it text, nil as `nil`),
 /// `%d` (an integer), `%f` (any number; 6 decimals unless `.N`),
 /// `%x` / `%X` (an integer in hex, two's complement when negative),
-/// `%c` (a char), `%n` and `%%`. A width pads on the left, or the
-/// right with `-`; `0` pads a number with zeros. A missing argument
-/// or unknown conversion is `:invalid-argument`, an argument of the
-/// wrong kind `:kind-mismatch`.
+/// `%c` (a char), `%n` and `%%`. A width pads to that many code
+/// points on the left, or the right with `-`; `0` pads a number with
+/// zeros; `.N` keeps N characters of a `%s`. A missing argument or
+/// unknown conversion is `:invalid-argument`, an argument of the
+/// wrong kind `:kind-mismatch` (STDLIB.md §2).
 fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
     const fmt = string_mod.asBytes(args[0]);
@@ -3458,17 +3459,15 @@ fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
         while (i < fmt.len and (fmt[i] == '-' or fmt[i] == '0')) : (i += 1) {
             if (fmt[i] == '-') left = true else zero = true;
         }
-        var width: usize = 0;
-        while (i < fmt.len and std.ascii.isDigit(fmt[i])) : (i += 1) width = width * 10 + (fmt[i] - '0');
+        const width = try formatField(fmt, &i);
         var precision: ?usize = null;
         if (i < fmt.len and fmt[i] == '.') {
             i += 1;
-            var p: usize = 0;
-            while (i < fmt.len and std.ascii.isDigit(fmt[i])) : (i += 1) p = p * 10 + (fmt[i] - '0');
-            precision = p;
+            precision = try formatField(fmt, &i);
         }
         if (i >= fmt.len) return VmError.InvalidArgument;
         const conv = fmt[i];
+        if (precision != null and conv != 's' and conv != 'f') return VmError.InvalidArgument;
         piece.clearRetainingCapacity();
         const w = &piece.writer;
         switch (conv) {
@@ -3479,12 +3478,15 @@ fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
                 const a = args[next];
                 next += 1;
                 switch (conv) {
-                    's' => if (a.isNil()) w.writeAll("nil") catch return VmError.OutOfMemory else try appendStrValue(&piece, a, interner),
+                    's' => {
+                        if (a.isNil()) w.writeAll("nil") catch return VmError.OutOfMemory else try appendStrValue(&piece, a, interner);
+                        if (precision) |p| piece.shrinkRetainingCapacity(codepointPrefix(piece.written(), p));
+                    },
                     'd' => {
                         if (!vm_mod.isInteger(a)) return VmError.KindMismatch;
                         format_mod.format(a, .readable, w, interner) catch return VmError.OutOfMemory;
                     },
-                    'f' => w.printFloat((try vm_mod.numDouble(a)).asFloat(), .{ .mode = .decimal, .precision = precision orelse 6 }) catch return VmError.OutOfMemory,
+                    'f' => try formatFixed(vm, w, (try vm_mod.numDouble(a)).asFloat(), precision orelse 6),
                     'x', 'X' => {
                         const n: u64 = @bitCast(try intArg(a));
                         w.printInt(n, 16, if (conv == 'x') .lower else .upper, .{}) catch return VmError.OutOfMemory;
@@ -3498,7 +3500,8 @@ fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
             },
         }
         const text = piece.written();
-        const pad = if (width > text.len) width - text.len else 0;
+        const chars = std.unicode.utf8CountCodepoints(text) catch text.len;
+        const pad = if (width > chars) width - chars else 0;
         const numeric = conv == 'd' or conv == 'f' or conv == 'x' or conv == 'X';
         if (left) {
             out.writer.writeAll(text) catch return VmError.OutOfMemory;
@@ -3515,6 +3518,41 @@ fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
         }
     }
     return string_mod.fromBytes(vm.ensureHeap(), out.written()) catch VmError.OutOfMemory;
+}
+
+/// The largest width or precision `format` accepts; a larger one would
+/// only allocate padding.
+const format_field_max = 1 << 20;
+
+/// The decimal number at `fmt[i.*..]`, advancing `i` past it; 0 when
+/// there is none, `:invalid-argument` above `format_field_max`.
+fn formatField(fmt: []const u8, i: *usize) VmError!usize {
+    var n: usize = 0;
+    while (i.* < fmt.len and std.ascii.isDigit(fmt[i.*])) : (i.* += 1) {
+        n = n * 10 + (fmt[i.*] - '0');
+        if (n > format_field_max) return VmError.InvalidArgument;
+    }
+    return n;
+}
+
+/// The byte length of the first `n` code points of `text`.
+fn codepointPrefix(text: []const u8, n: usize) usize {
+    var it = std.unicode.Utf8View.initUnchecked(text).iterator();
+    for (0..n) |_| _ = it.nextCodepointSlice() orelse break;
+    return it.i;
+}
+
+/// `%f`: `x` with `precision` decimals from its shortest round-trip
+/// digits, as Java's `Formatter` rounds them; NaN and the infinities
+/// as Java spells them.
+fn formatFixed(vm: *VM, w: *std.Io.Writer, x: f64, precision: usize) VmError!void {
+    if (std.math.isNan(x)) return w.writeAll("NaN") catch VmError.OutOfMemory;
+    if (std.math.isInf(x)) return w.writeAll(if (x < 0) "-Infinity" else "Infinity") catch VmError.OutOfMemory;
+    // Every f64's integer digits and sign, plus the decimals.
+    const buf = vm.allocator.alloc(u8, std.fmt.float.bufferSize(.decimal, f64) + 1 + precision) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(buf);
+    const text = std.fmt.float.render(buf, x, .{ .mode = .decimal, .precision = precision }) catch return VmError.InvalidArgument;
+    w.writeAll(text) catch return VmError.OutOfMemory;
 }
 
 // =============================================================================

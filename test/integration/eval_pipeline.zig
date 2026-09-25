@@ -1320,6 +1320,16 @@ test "integration: format with %s %d %f %x %% and widths" {
     try expectOutput("(with-out-str (printf \"%d+%d\" 1 2))", "1+2");
 }
 
+test "integration: format widths count characters, %.Ns truncates, fields are bounded, %f prints every double" {
+    try expectOutput("(format \"[%3s|%-3s|%2s]\" \"é\" \"é\" \"日本\")", "[  é|é  |日本]");
+    try expectOutput("(format \"%.2s|%.0s|%.9s|%5.1s|%.1s\" \"héllo\" \"x\" \"ab\" \"éa\" nil)", "hé||ab|    é|n");
+    try expectOutput("(let [s (format \"%.400f\" 1e300)] [(count s) (subs s 0 3) (subs s 299 304)])", "[702 100 00.00]");
+    try expectOutput("(format \"%f %.2f %f %5.1f\" (/ 0.0 0.0) (/ 1.0 0.0) (/ -1.0 0.0) 1e-300)", "NaN Infinity -Infinity   0.0");
+    try expectOutput("[(try (format \"%99999999999999999999d\" 1) (catch any e e)) (try (format \"%.99999999999999999999f\" 1.0) (catch any e e)) (try (format \"%2000000s\" \"\") (catch any e e))]", "[:invalid-argument :invalid-argument :invalid-argument]");
+    try expectOutput("[(try (format \"%.2d\" 1) (catch any e e)) (try (format \"%.1x\" 1) (catch any e e)) (try (format \"%.1c\" \\a) (catch any e e))]", "[:invalid-argument :invalid-argument :invalid-argument]");
+    try expectOutput("(count (format \"%1048576s\" \"\"))", "1048576");
+}
+
 test "integration: transients: transient, conj!, assoc!, dissoc!, disj!, pop!, persistent!" {
     try expectOutput("(persistent! (reduce conj! (transient []) (range 5)))", "[0 1 2 3 4]");
     try expectOutput("(let [t (transient {:a 1})] (persistent! (dissoc! (assoc! t :b 2 :c 3) :a)))", "{:b 2, :c 3}");

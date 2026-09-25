@@ -122,9 +122,9 @@ argument:
 
 | Conversion | Argument | Text |
 |---|---|---|
-| `%s` | any | As `str` makes it, except nil is `nil` (Java prints `null`); the precision is ignored |
+| `%s` | any | As `str` makes it, except nil is `nil` (Java prints `null`); a precision keeps that many characters: `(format "%.2s" "héllo")` is `"hé"` |
 | `%d` | integer (fixnum or bignum) | Decimal |
-| `%f` | any number | Fixed-point with `precision` decimals, 6 by default: `(format "%.2f" 3.14159)` is `"3.14"` |
+| `%f` | any number | Fixed-point with `precision` decimals, 6 by default: `(format "%.2f" 3.14159)` is `"3.14"`. As Java's, the digits are the double's shortest round-trip ones, rounded half up and padded with zeros (`(format "%.2f" 0.125)` is `"0.13"`, `(format "%.20f" 0.1)` `"0.10000000000000000000"`); NaN and the infinities are `NaN`, `Infinity`, `-Infinity` |
 | `%x`, `%X` | integer within 64 bits | Hex of the 64-bit two's complement: `(format "%x" -1)` is `"ffffffffffffffff"`; a larger bignum is `:arithmetic-overflow` |
 | `%c` | char | The char (a number is `:kind-mismatch`) |
 | `%n` | none | `"\n"` |
@@ -132,9 +132,10 @@ argument:
 
 The flags are `-` (pad on the right) and `0` (pad with zeros after
 any sign, for `%d`, `%f`, `%x`, `%X` only). `width` pads on the left
-with spaces and counts bytes, so a multibyte character pads less
-than Java would (`(format "[%3s]" "é")` is `"[ é]"`). A missing
-argument, an unknown conversion or flag (`%e`, `%b`, `%+d`,
+with spaces to that many characters (code points: `(format "[%3s]"
+"é")` is `"[  é]"`). A width or precision above 1048576, a precision
+on a conversion other than `%s` and `%f` (as Java refuses `%.2d`), a
+missing argument, an unknown conversion or flag (`%e`, `%b`, `%+d`,
 `%1$s`) and a trailing `%` are `:invalid-argument`; an argument of
 the wrong kind is `:kind-mismatch`, as is a non-string `fmt`;
 surplus arguments are ignored. `printf` (§6) prints the result.
