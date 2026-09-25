@@ -9,7 +9,7 @@ introduction to Datomic and Nextomic is §1 of that file.
 
 Nextomic requires **zero changes to emdb**. Every engine capability used
 below is a public function or a committed invariant of emdb as it stands
-(§11 lists the two engine capabilities Nextomic works around).
+(§11).
 
 ---
 
@@ -775,9 +775,10 @@ one writer.
 
 The engine's public `Txn.txnId` field is not used: Nextomic's own `t`
 is read from `sys` inside the same snapshot. Index trees carry only
-`[t]` in current trees and nothing in history trees; out-of-line
-payloads and txlog entries are read with `Txn.getFromTree` on the
-exact key.
+`[t]` in current trees and nothing in history trees; an out-of-line
+payload is read with `Txn.getFromTree` on its exact EAVT key. A value
+spanning several pages, from a cursor or a get, is valid until the
+transaction's next such read, so Nextomic copies what it keeps.
 
 ---
 
