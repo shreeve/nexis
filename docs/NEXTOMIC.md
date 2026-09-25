@@ -546,8 +546,9 @@ or `missing?` with a binding form, `[(< ?a ?b) ?lt]`, binds its boolean
 instead of filtering; an attribute
 `missing?`, `get-else` or `get-some` names that does not exist is
 `:nextomic/unknown-attribute`; an int and a double compare numerically,
-strings by their bytes and keywords by their text, as `compare` orders
-them, and a comparison across other types (a string against a number, a
+strings by their bytes and keywords by name (an unqualified keyword
+before any qualified one, then by namespace, then by name), as `compare`
+orders them, and a comparison across other types (a string against a number, a
 number against a keyword) or of any other value (a vector, a bignum) is
 `:nextomic/value-type`, as is an input or a
 function result whose shape does not fit its binding form. Any other symbol resolves through the namespace
@@ -586,7 +587,7 @@ and `:with` variables) by the plain find elements: `count`, `sum`,
 largest, a vector), `(sample n ?x)` (up to n distinct values, a vector)
 and `(rand n ?x)` (n values with repetition, a vector). `min` and `max`
 take any type, in the cell order: nil, booleans, numbers, strings,
-keywords by their text, then other values in a stable order; `sum`, `avg`, `variance` and `stddev`
+keywords by name as `compare` orders them, then other values in a stable order; `sum`, `avg`, `variance` and `stddev`
 take numbers (`:nextomic/value-type` otherwise), and a `sum` of
 integers past the fixnum range is a bignum, as `+` gives; `median` of an odd
 count is the middle value of any type, of an even count the mean of the

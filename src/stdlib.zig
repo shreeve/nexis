@@ -2306,7 +2306,7 @@ fn compareValues(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
     if (ka != kb) return VmError.KindMismatch;
     return switch (ka) {
         .string => std.mem.order(u8, string_mod.asBytes(a), string_mod.asBytes(b)),
-        .keyword, .symbol => compareNames(try internedName(vm, a), try internedName(vm, b)),
+        .keyword, .symbol => intern_mod.Interner.compareNames(try internedName(vm, a), try internedName(vm, b)),
         .char => std.math.order(a.asChar(), b.asChar()),
         .persistent_vector => blk: {
             const na = vector_mod.count(a);
@@ -2321,20 +2321,6 @@ fn compareValues(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
         },
         else => VmError.KindMismatch,
     };
-}
-
-/// Clojure's order of symbols and keywords: an unqualified name
-/// before any qualified one, then by namespace, then by name.
-fn compareNames(a: []const u8, b: []const u8) std.math.Order {
-    const pa = intern_mod.Interner.splitQualified(a);
-    const pb = intern_mod.Interner.splitQualified(b);
-    if (pa.ns == null and pb.ns != null) return .lt;
-    if (pa.ns != null and pb.ns == null) return .gt;
-    if (pa.ns) |na| {
-        const o = std.mem.order(u8, na, pb.ns.?);
-        if (o != .eq) return o;
-    }
-    return std.mem.order(u8, pa.name, pb.name);
 }
 
 fn fnCompare(vm: *VM, args: []const Value) VmError!Value {

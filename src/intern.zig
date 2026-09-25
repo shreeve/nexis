@@ -190,6 +190,21 @@ pub const Interner = struct {
         return .{ .ns = full[0..slash], .name = full[slash + 1 ..] };
     }
 
+    /// Clojure's order of symbol or keyword texts, which `compare` and
+    /// Nextomic's queries share: an unqualified name before any
+    /// qualified one, then by namespace, then by name.
+    pub fn compareNames(a: []const u8, b: []const u8) std.math.Order {
+        const pa = splitQualified(a);
+        const pb = splitQualified(b);
+        if (pa.ns == null and pb.ns != null) return .lt;
+        if (pa.ns != null and pb.ns == null) return .gt;
+        if (pa.ns) |na| {
+            const o = std.mem.order(u8, na, pb.ns.?);
+            if (o != .eq) return o;
+        }
+        return std.mem.order(u8, pa.name, pb.name);
+    }
+
     pub fn internSymbolValue(self: *Interner, name: []const u8) InternError!value.Value {
         const id = try self.internSymbol(name);
         return value.fromSymbolId(id);
@@ -322,6 +337,13 @@ test "splitQualified: first slash; bare / is unqualified" {
         if (c.ns) |ns| try testing.expectEqualStrings(ns, got.ns.?) else try testing.expect(got.ns == null);
         try testing.expectEqualStrings(c.name, got.name);
     }
+}
+
+test "compareNames: unqualified first, then namespace, then name" {
+    const sorted = [_][]const u8{ "/", "ab", "b", "c", "a/b", "a/z", "b/a", "nexis.core//" };
+    for (sorted, 0..) |a, i| for (sorted, 0..) |b, j| {
+        try testing.expectEqual(std.math.order(i, j), Interner.compareNames(a, b));
+    };
 }
 
 test "record type names: named ids print as ns.Type, others are null" {

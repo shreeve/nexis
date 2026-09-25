@@ -118,16 +118,16 @@ pub const Cell = union(enum) {
     }
 
     /// The order `compare` gives two values of one type (numbers are
-    /// one type; keywords by their text), or null when they are not
-    /// comparable here: different types, or VM values.
+    /// one type), or null when they are not comparable here: different
+    /// types, or VM values.
     pub fn compare(a: Cell, b: Cell, names: *const Interner) ?std.math.Order {
         if (a.rank() != b.rank() or a == .vm) return null;
         return a.orderBy(b, names);
     }
 
-    /// `order` with keywords by their text, as `compare` orders them.
+    /// `order` with keywords by name, as `compare` orders them.
     pub fn orderBy(a: Cell, b: Cell, names: *const Interner) std.math.Order {
-        if (a == .keyword and b == .keyword) return std.mem.order(u8, names.keywordName(a.keyword), names.keywordName(b.keyword));
+        if (a == .keyword and b == .keyword) return Interner.compareNames(names.keywordName(a.keyword), names.keywordName(b.keyword));
         return a.order(b);
     }
 
