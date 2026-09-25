@@ -2,12 +2,16 @@
 //! and the raw datom write / scan primitives (NEXTOMIC.md §2).
 //!
 //! Invariants:
-//!   - The environment is opened with `pageSize = 16384` and
-//!     `maxNamedTrees = 128`; the page size is fixed for the file's life.
-//!   - All twelve trees are opened in one write transaction at open and
-//!     their `TreeId`s are cached for the store's life (tree registration
-//!     is the only non-thread-safe engine call); a tree absent from the
-//!     file is created then, so a store written without one gains it.
+//!   - The environment is opened with the geometry every nexis store
+//!     shares (`db.page_size`, `db.max_named_trees`); the page size is
+//!     fixed for the file's life.
+//!   - All twelve trees are opened at open and their `TreeId`s are
+//!     cached for the store's life (tree registration is the only
+//!     non-thread-safe engine call). A complete store opens in a read
+//!     transaction; a write transaction creates a tree absent from the
+//!     file, so a store written without one gains it.
+//!   - Two stores of one file in this process never wait on each other's
+//!     writer lock: `beginWrite` refuses while another holds it.
 //!   - `sys["t"]` is the last committed logical transaction number and
 //!     commits atomically with the datoms it counts.
 //!   - Bootstrap ids are fixed (`boot`): a store created by any build has
@@ -19,13 +23,15 @@
 //!   - Current-tree values are `[t:6]`, plus the payload in `nx/eavt`
 //!     for out-of-line values; history-tree values are empty, plus the
 //!     payload in `nx/eavt-h`.
-//!   - Values read off a cursor are clamped to one page; a payload is
-//!     always read with `getFromTree` on its exact key.
+//!   - A value spanning several pages, from a cursor or `getFromTree`,
+//!     is assembled in the transaction's buffer and valid until the
+//!     next such read; callers copy what they keep.
 
 const std = @import("std");
 const emdb = @import("emdb");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
+const db_layer = @import("../db.zig");
 
 const Allocator = std.mem.Allocator;
 const Txn = emdb.Txn;
@@ -33,7 +39,6 @@ const TreeId = emdb.TreeId;
 const Index = key.Index;
 const Datom = datom_mod.Datom;
 
-pub const page_size: u32 = 16384;
 pub const format_version: u16 = 1;
 
 // =============================================================================
@@ -208,17 +213,32 @@ pub const boot = struct {
 // Store
 // =============================================================================
 
+/// Every store open in this process, linked through `Store.next_open`:
+/// the stores of one file, told apart from others by their uuid, share
+/// the engine's writer lock (`Store.beginWrite`). The runtime is
+/// single-threaded, so the list is a plain global.
+var open_stores: ?*Store = null;
+
 pub const Store = struct {
     allocator: Allocator,
     env: emdb.Env,
     trees: Trees,
     uuid: [16]u8,
     is_open: bool,
+    /// The file could only be opened for reading: every write
+    /// transaction is `error.TxnReadOnly`.
+    read_only: bool = false,
     /// The id of the `:db/fulltext` attribute in this store.
     fulltext_aid: u32,
+    /// The next store open in this process (`open_stores`).
+    next_open: ?*Store = null,
 
     /// Open or create the store at `path`. The store is heap-allocated
     /// so the environment never moves while transactions reference it.
+    /// A store that has every tree, its header and `:db/fulltext` opens
+    /// in a read transaction alone; a write transaction runs only to
+    /// create, bootstrap or complete one. A file this process may not
+    /// write opens read-only.
     pub fn open(allocator: Allocator, path: [*:0]const u8, options: Options) !*Store {
         const self = try allocator.create(Store);
         errdefer allocator.destroy(self);
@@ -226,29 +246,44 @@ pub const Store = struct {
             .allocator = allocator,
             .env = undefined,
             .trees = undefined,
-            .uuid = undefined,
+            .uuid = @splat(0),
             .is_open = false,
             .fulltext_aid = boot.fulltext,
         };
-        self.env = try emdb.Env.open(path, .{
-            .pageSize = page_size,
-            .maxNamedTrees = 128,
+        var env_options: emdb.EnvOptions = .{
+            .pageSize = db_layer.page_size,
+            .maxNamedTrees = db_layer.max_named_trees,
             .mapSize = options.map_size,
             .allocator = allocator,
-        });
+        };
+        self.env = emdb.Env.open(path, env_options) catch |err| switch (err) {
+            error.OpenFailed => blk: {
+                if (!readOnlyFile(path)) return err;
+                env_options.readOnly = true;
+                self.read_only = true;
+                break :blk emdb.Env.open(path, env_options) catch return err;
+            },
+            else => return err,
+        };
         errdefer self.env.close();
 
-        const txn = try self.env.beginWrite();
-        errdefer txn.abort();
-        try self.openTrees(txn);
-        if (try self.sysGet(txn, "format")) |_| {
-            try self.readHeader(txn);
-            try self.ensureFulltextAttr(txn);
-        } else {
-            try self.bootstrap(txn, options.fulltext_attr);
+        if (!try self.openComplete()) {
+            if (self.read_only) return error.TxnReadOnly;
+            if (self.sameFileWriter()) return error.WriterActive;
+            const txn = try self.env.beginWrite();
+            errdefer txn.abort();
+            try self.openTrees(txn);
+            if (try self.sysGet(txn, "format")) |_| {
+                try self.readHeader(txn);
+                try self.ensureFulltextAttr(txn);
+            } else {
+                try self.bootstrap(txn, options.fulltext_attr);
+            }
+            try txn.commit();
         }
-        try txn.commit();
         self.is_open = true;
+        self.next_open = open_stores;
+        open_stores = self;
         return self;
     }
 
@@ -259,7 +294,56 @@ pub const Store = struct {
             self.env.close();
             self.is_open = false;
         }
+        var link = &open_stores;
+        while (link.*) |s| : (link = &s.next_open) {
+            if (s == self) {
+                link.* = self.next_open;
+                break;
+            }
+        }
         self.allocator.destroy(self);
+    }
+
+    /// A regular file this process may read but not write: the one
+    /// `OpenFailed` that opens again read-only.
+    fn readOnlyFile(path: [*:0]const u8) bool {
+        if (std.c.access(path, std.c.R_OK) != 0 or std.c.access(path, std.c.W_OK) == 0) return false;
+        // A directory reads too, and is never a store.
+        const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true });
+        if (fd >= 0) {
+            _ = std.c.close(fd);
+            return false;
+        }
+        return true;
+    }
+
+    /// Does another store of this file hold its write transaction? A
+    /// store not yet bootstrapped has no uuid and shares no file.
+    fn sameFileWriter(self: *const Store) bool {
+        var it = open_stores;
+        while (it) |s| : (it = s.next_open) {
+            if (s != self and std.mem.eql(u8, &s.uuid, &self.uuid) and s.env.inner.currentWriter != null) return true;
+        }
+        return false;
+    }
+
+    /// Open the trees, header and `:db/fulltext` id of a complete store
+    /// in a read transaction; false when anything is missing.
+    fn openComplete(self: *Store) !bool {
+        const txn = try self.env.beginRead();
+        defer txn.abort();
+        var ids: [tree_names.len]TreeId = undefined;
+        for (tree_names, 0..) |name, i| {
+            ids[i] = txn.openTree(name, false) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+        }
+        self.setTrees(ids);
+        if ((try self.sysGet(txn, "format")) == null) return false;
+        try self.readHeader(txn);
+        self.fulltext_aid = (try self.identIdByName(txn, "db/fulltext")) orelse return false;
+        return true;
     }
 
     fn openTrees(self: *Store, txn: *Txn) !void {
@@ -267,6 +351,10 @@ pub const Store = struct {
         for (tree_names, 0..) |name, i| {
             ids[i] = try txn.openTree(name, true);
         }
+        self.setTrees(ids);
+    }
+
+    fn setTrees(self: *Store, ids: [tree_names.len]TreeId) void {
         self.trees = .{
             .current = ids[0..4].*,
             .history = ids[4..8].*,
@@ -308,8 +396,14 @@ pub const Store = struct {
     }
 
     /// Begin the write transaction with all twelve trees loaded.
+    /// emdb's writer lock is per file and makes a second writer wait for
+    /// the first to end; a second store on the same file in this
+    /// single-threaded process would wait on itself forever, so a write
+    /// held through any store of the same file is `error.WriterActive`.
     pub fn beginWrite(self: *Store, sync_mode: SyncMode) !*Txn {
         if (!self.is_open) return error.Closed;
+        if (self.read_only) return error.TxnReadOnly;
+        if (self.sameFileWriter()) return error.WriterActive;
         const txn = try self.env.beginWriteWith(.{ .sync = sync_mode.override() });
         errdefer txn.abort();
         try self.loadTrees(txn);
@@ -364,7 +458,8 @@ pub const Store = struct {
 
     /// Last committed logical transaction number.
     pub fn readT(self: *Store, txn: *Txn) !u64 {
-        return self.sysGetInt(txn, "t", 6);
+        const t = try self.sysGetInt(txn, "t", 6);
+        return if (t >= key.tx_partition_bit) error.Corrupted else t;
     }
 
     pub fn writeT(self: *Store, txn: *Txn, t: u64) !void {
@@ -373,7 +468,8 @@ pub const Store = struct {
 
     /// Next user entity id.
     pub fn readNextEid(self: *Store, txn: *Txn) !u64 {
-        return self.sysGetInt(txn, "eid", 6);
+        const eid = try self.sysGetInt(txn, "eid", 6);
+        return if (eid < key.user_partition_start or eid > key.user_partition_end) error.Corrupted else eid;
     }
 
     pub fn writeNextEid(self: *Store, txn: *Txn, eid: u64) !void {
@@ -382,7 +478,8 @@ pub const Store = struct {
 
     /// Next attribute / ident id.
     pub fn readNextAid(self: *Store, txn: *Txn) !u32 {
-        return @intCast(try self.sysGetInt(txn, "aid", 4));
+        const aid = try self.sysGetInt(txn, "aid", 4);
+        return if (aid == 0) error.Corrupted else @intCast(aid);
     }
 
     pub fn writeNextAid(self: *Store, txn: *Txn, aid: u32) !void {
@@ -502,6 +599,18 @@ pub const Store = struct {
 
     fn writeIdentGen(self: *Store, txn: *Txn, gen: u64) !void {
         try self.sysPutInt(txn, "ig", 8, gen);
+    }
+
+    /// Schema generation: bumped by every transaction that writes a
+    /// datom on an attribute-partition entity; absent reads as 0.
+    pub fn readSchemaGen(self: *Store, txn: *Txn) !u64 {
+        const raw = (try self.sysGet(txn, "sg")) orelse return 0;
+        if (raw.len != 8) return error.Corrupted;
+        return std.mem.readInt(u64, raw[0..8], .big);
+    }
+
+    pub fn bumpSchemaGen(self: *Store, txn: *Txn) !void {
+        try self.sysPutInt(txn, "sg", 8, (try self.readSchemaGen(txn)) +% 1);
     }
 
     // ── txlog ─────────────────────────────────────────────────────
@@ -633,7 +742,8 @@ pub const Store = struct {
     /// Forward scan of one tree: the keys starting with a prefix (every
     /// key when it is empty), or the keys in `[start, end)` (an absent
     /// `end` runs to the tree's last key). Keys and values borrow the
-    /// transaction's snapshot; cursor values are clamped to one page.
+    /// transaction's snapshot, a multi-page value only until the next
+    /// multi-page read.
     pub const Scan = struct {
         cursor: emdb.Cursor,
         start: []const u8,
@@ -685,7 +795,7 @@ pub const Store = struct {
         }
     };
 
-    /// A history row: the key without `top`, its clamped value, `t` and
+    /// A history row: the key without `top`, its value, `t` and
     /// `added`. Slices borrow the transaction's snapshot.
     pub const HistoryRow = struct {
         fact: []const u8,
@@ -705,7 +815,7 @@ pub const Store = struct {
         pending: ?HistoryRow = null,
         exhausted: bool = false,
 
-        pub fn next(self: *FoldScan) ?HistoryRow {
+        pub fn next(self: *FoldScan) key.DecodeError!?HistoryRow {
             while (!self.exhausted) {
                 const row = self.inner.next() orelse {
                     self.exhausted = true;
@@ -713,7 +823,7 @@ pub const Store = struct {
                 };
                 if (row.key.len < key.top_len) continue;
                 const fact_len = row.key.len - key.top_len;
-                const top = key.readTop(row.key[fact_len..][0..key.top_len]);
+                const top = try key.readTop(row.key[fact_len..][0..key.top_len]);
                 if (!self.window.contains(top.t)) continue;
                 const r: HistoryRow = .{ .fact = row.key[0..fact_len], .value = row.value, .t = top.t, .added = top.added };
                 if (self.window == .all) return r;
@@ -817,6 +927,7 @@ pub const Store = struct {
         const entry = try datom_mod.encodeTxlog(arena, now, datoms, &.{}, .{ .ctx = @ptrCast(&names), .identName = &IdentNames.identName });
         try self.putTxlog(txn, t, entry);
         try self.writeT(txn, t);
+        try self.bumpSchemaGen(txn);
     }
 
     /// Ident names for the txlog encoder, from `nx/idents` through the
@@ -1004,7 +1115,7 @@ test "bootstrap datoms are in every index they belong to" {
     var n: usize = 0;
     while (s.next()) |kv| : (n += 1) {
         try testing.expectEqual(@as(usize, key.id_len), kv.value.len);
-        try testing.expectEqual(@as(u64, 1), key.readId(kv.value[0..key.id_len]));
+        try testing.expectEqual(@as(u64, 1), try key.readId(kv.value[0..key.id_len]));
     }
     try testing.expectEqual(@as(usize, 5), n);
 
@@ -1100,7 +1211,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     for (cases) |c| {
         var fs = try Store.foldScan(txn, tree, prefix, end, c.window);
         var got: std.ArrayList(u64) = .empty;
-        while (fs.next()) |r| {
+        while (try fs.next()) |r| {
             try testing.expect(r.added);
             const parts = try key.unpackKey(.eavt, false, r.fact);
             const kv = try key.decodeVal(arena, parts.v);
@@ -1112,7 +1223,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     var all = try Store.foldScan(txn, tree, prefix, end, .{ .all = .{ .after = 0, .upto = 5 } });
     var n: usize = 0;
     var adds: usize = 0;
-    while (all.next()) |r| {
+    while (try all.next()) |r| {
         n += 1;
         if (r.added) adds += 1;
     }
@@ -1162,4 +1273,65 @@ test "long ident names use the heap path" {
     defer txn.abort();
     try testing.expectEqual(@as(?u32, 5000), try store.identIdByName(txn, long_name));
     try testing.expectEqualStrings(long_name, (try store.identNameById(txn, 5000)).?);
+}
+
+test "sys counters outside their partitions are corrupt" {
+    var td = try TestDir.init("store_sys_range");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    const txn = try store.beginWrite(.none);
+    defer txn.abort();
+    try store.sysPutInt(txn, "t", 6, key.tx_partition_bit);
+    try testing.expectError(error.Corrupted, store.readT(txn));
+    try store.sysPutInt(txn, "eid", 6, key.user_partition_end + 1);
+    try testing.expectError(error.Corrupted, store.readNextEid(txn));
+    try store.sysPutInt(txn, "eid", 6, 5);
+    try testing.expectError(error.Corrupted, store.readNextEid(txn));
+    try store.sysPutInt(txn, "aid", 4, 0);
+    try testing.expectError(error.Corrupted, store.readNextAid(txn));
+}
+
+test "reopening a complete store writes nothing, so a read-only file opens" {
+    var td = try TestDir.init("store_open_read");
+    defer td.deinit();
+    const committed = blk: {
+        const store = try Store.open(testing.allocator, td.path.ptr, .{});
+        defer store.close();
+        const txn = try store.beginRead();
+        defer txn.abort();
+        break :blk txn.txnId;
+    };
+    {
+        const store = try Store.open(testing.allocator, td.path.ptr, .{});
+        defer store.close();
+        const txn = try store.beginRead();
+        defer txn.abort();
+        try testing.expectEqual(committed, txn.txnId);
+    }
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(td.path.ptr, 0o444));
+    defer _ = std.c.chmod(td.path.ptr, 0o644);
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    {
+        const txn = try store.beginRead();
+        defer txn.abort();
+        try testing.expectEqual(@as(u64, 1), try store.readT(txn));
+    }
+    try testing.expectError(error.TxnReadOnly, store.beginWrite(.none));
+}
+
+test "a second store on the same file refuses to write while the first does" {
+    var td = try TestDir.init("store_same_file");
+    defer td.deinit();
+    const a = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer a.close();
+    const b = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer b.close();
+    const txn = try a.beginWrite(.none);
+    // emdb's writer lock would wait for `a`, which this thread holds.
+    try testing.expectError(error.WriterActive, b.beginWrite(.none));
+    txn.abort();
+    const again = try b.beginWrite(.none);
+    again.abort();
 }

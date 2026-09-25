@@ -186,5 +186,19 @@
 (d/transact! c [[:db/retractEntity bob] [:db/add bob :person/age 12]])
 (println (d/touch (d/entity (d/db c) bob)))
 
+; Unique values and lookup refs read tx-data as a set too: a unique
+; value moves to another entity whichever form comes first, and a
+; lookup ref names an identity the transaction asserts wherever that
+; assertion stands.
+(def xy (d/transact! c [{:db/id "x" :person/email "x@example.com"} {:db/id "y" :person/email "y@example.com"}]))
+(def x (get (:tempids xy) "x"))
+(def y (get (:tempids xy) "y"))
+(d/transact! c [[:db/add y :person/email "x@example.com"] [:db/add x :person/email "x2@example.com"]])
+(t/check "a unique value moves before its old holder lets go" (= y (d/entid (d/db c) [:person/email "x@example.com"])))
+(d/transact! c [[:db/add [:person/email "new@example.com"] :person/age 7] [:db/add "n" :person/email "new@example.com"]])
+(t/check "a lookup ref names an identity asserted after it" (= 7 (:person/age (d/entity (d/db c) [:person/email "new@example.com"]))))
+(println (t/caught (d/transact! c [[:db/add x :person/email "y2@example.com"] [:db/add y :person/email "x2@example.com"]])))
+(println (t/caught (d/transact! c [[:db/add x :person/email "x2@example.com"] [:db/add x :person/age 1]])))
+
 (d/release c)
 (println :basics-done)
