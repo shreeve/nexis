@@ -44,9 +44,9 @@
 //! error takes the `natives.zig` mapping. VM errors pass through.
 
 const std = @import("std");
-const value = @import("value");
-const vm_mod = @import("vm");
-const string_mod = @import("string");
+const value = @import("../../value.zig");
+const vm_mod = @import("../../vm.zig");
+const string_mod = @import("../../string.zig");
 const natives = @import("../natives.zig");
 const query = @import("../query.zig");
 

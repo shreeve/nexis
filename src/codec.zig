@@ -27,30 +27,30 @@
 //! codec all share this shape):
 //!
 //!     src/codec.zig
-//!     ├── @import("value")
-//!     ├── @import("heap")
-//!     ├── @import("intern")
-//!     ├── @import("hash")
-//!     ├── @import("string")
-//!     ├── @import("bignum")
-//!     ├── @import("list")
-//!     ├── @import("vector")
-//!     ├── @import("champ")
-//!     └── @import("typed_vector")
+//!     ├── @import("value.zig")
+//!     ├── @import("heap.zig")
+//!     ├── @import("intern.zig")
+//!     ├── @import("hash.zig")
+//!     ├── @import("string.zig")
+//!     ├── @import("bignum.zig")
+//!     ├── @import("coll/list.zig")
+//!     ├── @import("coll/vector.zig")
+//!     ├── @import("coll/champ.zig")
+//!     └── @import("coll/typed_vector.zig")
 //!
 //! Nothing imports `codec.zig`.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const intern_mod = @import("intern");
-const hash_mod = @import("hash");
-const string = @import("string");
-const bignum = @import("bignum");
-const list = @import("list");
-const vector = @import("vector");
-const champ = @import("champ");
-const typed_vector = @import("typed_vector");
+const value = @import("value.zig");
+const heap_mod = @import("heap.zig");
+const intern_mod = @import("intern.zig");
+const hash_mod = @import("hash.zig");
+const string = @import("string.zig");
+const bignum = @import("bignum.zig");
+const list = @import("coll/list.zig");
+const vector = @import("coll/vector.zig");
+const champ = @import("coll/champ.zig");
+const typed_vector = @import("coll/typed_vector.zig");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -1049,7 +1049,7 @@ test "decode: typed vector whose count exceeds the input → TruncatedInput with
 // ---- Error surface ----
 
 test "encode: transient is unserializable" {
-    const transient = @import("transient");
+    const transient = @import("coll/transient.zig");
     var ctx = TestCtx.init();
     defer ctx.deinit();
 

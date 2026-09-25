@@ -22,9 +22,9 @@
 //! transients wrap this module from `src/coll/transient.zig`.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
+const value = @import("../value.zig");
+const heap_mod = @import("../heap.zig");
+const hash_mod = @import("../hash.zig");
 
 const Value = value.Value;
 const Kind = value.Kind;

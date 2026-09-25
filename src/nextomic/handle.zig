@@ -27,9 +27,9 @@
 //!     `natives.zig`, and the VM it runs against rides in the box too.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
+const value = @import("../value.zig");
+const heap_mod = @import("../heap.zig");
+const hash_mod = @import("../hash.zig");
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;

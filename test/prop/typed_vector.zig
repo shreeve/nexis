@@ -17,15 +17,16 @@
 //!       `IndexOutOfBounds` at `count` and beyond.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const intern_mod = @import("intern");
-const bignum = @import("bignum");
-const vector_mod = @import("vector");
-const typed_vector = @import("typed_vector");
-const codec = @import("codec");
-const dispatch = @import("dispatch");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const hash_mod = nx.hash;
+const intern_mod = nx.intern;
+const bignum = nx.bignum;
+const vector_mod = nx.vector;
+const typed_vector = nx.typed_vector;
+const codec = nx.codec;
+const dispatch = nx.dispatch;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;

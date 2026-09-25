@@ -31,9 +31,9 @@
 //! stdlib.zig (native helpers + dispatcher).
 
 const std = @import("std");
-const value_mod = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
+const value_mod = @import("value.zig");
+const heap_mod = @import("heap.zig");
+const hash_mod = @import("hash.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;

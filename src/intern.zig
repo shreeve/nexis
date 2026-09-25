@@ -23,7 +23,7 @@
 //! leaves no duped bytes leaked and no half-committed map entries.
 
 const std = @import("std");
-const value = @import("value");
+const value = @import("value.zig");
 
 const Allocator = std.mem.Allocator;
 

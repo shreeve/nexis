@@ -32,21 +32,21 @@
 //!     `MacroExpansionFailure`.
 
 const std = @import("std");
-const reader_mod = @import("reader");
-const intern_mod = @import("intern");
+const reader_mod = @import("reader.zig");
+const intern_mod = @import("intern.zig");
 /// Needed for Namespace + Var lookup (user-defmacro dispatch),
 /// Value construction (Form→Value conversion for macro args),
 /// and the VM type referenced by the compile-eval callback type
 /// signature. Importing vm pulls in champ + dispatch + vector +
 /// heap + list transitively. No cycle: compile.zig imports
 /// expand AND vm; vm doesn't import expand.
-const vm_mod = @import("vm");
-const value_mod = @import("value");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ_mod = @import("champ");
-const heap_mod = @import("heap");
-const bignum_mod = @import("bignum");
+const vm_mod = @import("vm.zig");
+const value_mod = @import("value.zig");
+const list_mod = @import("coll/list.zig");
+const vector_mod = @import("coll/vector.zig");
+const champ_mod = @import("coll/champ.zig");
+const heap_mod = @import("heap.zig");
+const bignum_mod = @import("bignum.zig");
 
 const Form = reader_mod.Form;
 const Datum = reader_mod.Datum;
@@ -1669,7 +1669,7 @@ pub fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
             if (items.len % 2 != 0) return ExpandError.MalformedMacroCall;
             const heap = try ctx.heapForArgs();
             var m = champ_mod.mapEmpty(heap) catch return ExpandError.OutOfMemory;
-            const dispatch = @import("dispatch");
+            const dispatch = @import("dispatch.zig");
             var i: usize = 0;
             while (i < items.len) : (i += 2) {
                 const k = try formToValue(ctx, items[i]);
@@ -1681,7 +1681,7 @@ pub fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
         .set => |items| blk: {
             const heap = try ctx.heapForArgs();
             var s = champ_mod.setEmpty(heap) catch return ExpandError.OutOfMemory;
-            const dispatch = @import("dispatch");
+            const dispatch = @import("dispatch.zig");
             for (items) |it| {
                 const v = try formToValue(ctx, it);
                 s = champ_mod.setConj(heap, s, v, &dispatch.hashValue, &dispatch.equal) catch return ExpandError.OutOfMemory;
@@ -1707,7 +1707,7 @@ pub fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
         // (`ctx.heapForArgs()`) the rest of formToValue uses for
         // collections.
         .string => |bytes| blk: {
-            const string_mod_local = @import("string");
+            const string_mod_local = @import("string.zig");
             const heap = try ctx.heapForArgs();
             break :blk string_mod_local.fromBytes(heap, bytes) catch return ExpandError.OutOfMemory;
         },
@@ -1860,7 +1860,7 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.S
         // shape. The byte slice is copied into the macro arena
         // (`ctx.allocator`) so it outlives the source Value.
         .string => blk: {
-            const string_mod_local = @import("string");
+            const string_mod_local = @import("string.zig");
             const src_bytes = string_mod_local.asBytes(v);
             const owned = try ctx.allocator.dupe(u8, src_bytes);
             const form = try ctx.allocator.create(Form);

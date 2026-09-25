@@ -23,7 +23,7 @@
 //!     callers that need larger integers must go via the bignum path.
 
 const std = @import("std");
-const hash = @import("hash");
+const hash = @import("hash.zig");
 
 // =============================================================================
 // Kind discriminator

@@ -19,30 +19,30 @@
 //!   - Namespaces, Vars and the namespace registry.
 
 const std = @import("std");
-const value_mod = @import("value");
+const value_mod = @import("value.zig");
 /// The VM owns the `Heap` every runtime value lives on: rest-arg
 /// lists, the collections `coll:*` builds, closures and upvalue
 /// cells, and everything the natives and the compiler allocate
 /// through `ensureHeap` / `registry.heap`.
-const heap_mod = @import("heap");
+const heap_mod = @import("heap.zig");
 /// The collector. The VM is its host (VM.md §9, GC.md §3): it
 /// enumerates the roots, traces closures and cells, and decides
 /// when a cycle is due.
-const gc_mod = @import("gc");
-const bignum_mod = @import("bignum");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ_mod = @import("champ");
+const gc_mod = @import("gc.zig");
+const bignum_mod = @import("bignum.zig");
+const list_mod = @import("coll/list.zig");
+const vector_mod = @import("coll/vector.zig");
+const champ_mod = @import("coll/champ.zig");
 /// Canonical `hashValue` + `equal` entry points for map and set
 /// construction.
-const dispatch_mod = @import("dispatch");
+const dispatch_mod = @import("dispatch.zig");
 /// One shared `Interner` per VM keeps symbol and keyword identity
 /// consistent between the compiler, the macroexpander and runtime
 /// values.
-const intern_mod = @import("intern");
-const protocol_mod = @import("protocol");
-const record_mod = @import("record");
-const nextomic_handle = @import("nextomic_handle");
+const intern_mod = @import("intern.zig");
+const protocol_mod = @import("protocol.zig");
+const record_mod = @import("record.zig");
+const nextomic_handle = @import("nextomic/handle.zig");
 const Value = value_mod.Value;
 
 // =============================================================================
@@ -1101,7 +1101,7 @@ pub const DispatchKey = struct {
         if (v.kind() == .record) {
             return .{
                 .tag = .record,
-                .id = @import("record").typeId(v),
+                .id = @import("record.zig").typeId(v),
             };
         }
         return .{

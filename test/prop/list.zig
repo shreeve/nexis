@@ -23,11 +23,12 @@
 //!       reasonable time and equals another identical list.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const list = @import("list");
-const dispatch = @import("dispatch");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const hash_mod = nx.hash;
+const list = nx.list;
+const dispatch = nx.dispatch;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;

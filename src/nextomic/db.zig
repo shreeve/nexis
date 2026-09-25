@@ -19,10 +19,10 @@
 //!     allocator holds only the store, the ident cache and the schema.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const intern_mod = @import("intern");
-const string_mod = @import("string");
+const value = @import("../value.zig");
+const heap_mod = @import("../heap.zig");
+const intern_mod = @import("../intern.zig");
+const string_mod = @import("../string.zig");
 const emdb = @import("emdb");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");

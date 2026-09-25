@@ -21,20 +21,20 @@
 //!
 //!     src/record.zig
 //!     ├── @import("std")
-//!     ├── @import("value")
-//!     ├── @import("heap")
-//!     ├── @import("hash")
-//!     └── @import("champ")     // for hash composition of field map
+//!     ├── @import("value.zig")
+//!     ├── @import("heap.zig")
+//!     ├── @import("hash.zig")
+//!     └── @import("coll/champ.zig")     // for hash composition of field map
 //!
 //! Nothing imports record.zig except `dispatch.zig` (heapHashBase +
 //! heapEqual arms), `gc.zig` (trace arm), `stdlib.zig` (native fns),
 //! `format.zig` (printer arm), `codec.zig` (unserializable arm).
 
 const std = @import("std");
-const value_mod = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const champ_mod = @import("champ");
+const value_mod = @import("value.zig");
+const heap_mod = @import("heap.zig");
+const hash_mod = @import("hash.zig");
+const champ_mod = @import("coll/champ.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;

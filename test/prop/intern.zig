@@ -20,8 +20,9 @@
 //!   I10. by_name/names counts stay in lockstep across a mixed workload.
 
 const std = @import("std");
-const value = @import("value");
-const intern = @import("intern");
+const nx = @import("nexis");
+const value = nx.value;
+const intern = nx.intern;
 
 const Interner = intern.Interner;
 const prng_seed: u64 = 0x696E_7465_726E_5F50; // "intern_P" ASCII LE

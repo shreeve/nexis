@@ -13,7 +13,8 @@
 //! and a reopened store must continue from the same `t`.
 
 const std = @import("std");
-const nextomic = @import("nextomic");
+const nx = @import("nexis");
+const nextomic = nx.nextomic;
 
 const key = nextomic.key;
 const boot = nextomic.boot;

@@ -43,11 +43,12 @@
 //!   A6. Decimal text round-trips; toF64/fromF64 round-trips below 2^53.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const bignum = @import("bignum");
-const dispatch = @import("dispatch");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const hash_mod = nx.hash;
+const bignum = nx.bignum;
+const dispatch = nx.dispatch;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;

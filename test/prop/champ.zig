@@ -36,14 +36,15 @@
 //!        + equality all hold.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const champ = @import("champ");
-const string_mod = @import("string");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const dispatch = @import("dispatch");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const hash_mod = nx.hash;
+const champ = nx.champ;
+const string_mod = nx.string;
+const list_mod = nx.list;
+const vector_mod = nx.vector;
+const dispatch = nx.dispatch;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;

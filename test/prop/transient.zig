@@ -19,14 +19,15 @@
 //!       original persistent Value is dropped.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const champ = @import("champ");
-const vector = @import("vector");
-const transient = @import("transient");
-const dispatch = @import("dispatch");
-const gc = @import("gc");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const hash_mod = nx.hash;
+const champ = nx.champ;
+const vector = nx.vector;
+const transient = nx.transient;
+const dispatch = nx.dispatch;
+const gc = nx.gc;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;

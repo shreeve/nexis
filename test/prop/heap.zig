@@ -29,8 +29,9 @@
 //! test under the same Zig build.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
 
 const Heap = heap_mod.Heap;
 const HeapHeader = heap_mod.HeapHeader;

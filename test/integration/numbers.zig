@@ -4,14 +4,15 @@
 //! f64, and the errors a program can catch.
 
 const std = @import("std");
-const value_mod = @import("value");
-const vm = @import("vm");
-const compile = @import("compile");
-const intern_mod = @import("intern");
-const reader_mod = @import("reader");
-const expand_mod = @import("expand");
-const stdlib = @import("stdlib");
-const format_mod = @import("format");
+const nx = @import("nexis");
+const value_mod = nx.value;
+const vm = nx.vm;
+const compile = nx.compile;
+const intern_mod = nx.intern;
+const reader_mod = nx.reader;
+const expand_mod = nx.expand;
+const stdlib = nx.stdlib;
+const format_mod = nx.format;
 
 const testing = std.testing;
 

@@ -5,7 +5,8 @@
 //! inline value stays under emdb's 256-byte search-clue buffer.
 
 const std = @import("std");
-const nextomic = @import("nextomic");
+const nx = @import("nexis");
+const nextomic = nx.nextomic;
 
 const key = nextomic.key;
 const Val = key.Val;

@@ -20,7 +20,7 @@
 //!     attribute's ident id is its entity id.
 
 const std = @import("std");
-const intern_mod = @import("intern");
+const intern_mod = @import("../intern.zig");
 const emdb = @import("emdb");
 const store_mod = @import("store.zig");
 

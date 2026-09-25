@@ -19,15 +19,16 @@
 //!       it freeable.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const string = @import("string");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ = @import("champ");
-const dispatch = @import("dispatch");
-const gc = @import("gc");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const hash_mod = nx.hash;
+const string = nx.string;
+const list_mod = nx.list;
+const vector_mod = nx.vector;
+const champ = nx.champ;
+const dispatch = nx.dispatch;
+const gc = nx.gc;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;
@@ -363,12 +364,12 @@ test "G5: repeated allocate-and-collect cycles do not leak" {
 // G6. A program's heap stays bounded under a forced-frequent trigger
 // -----------------------------------------------------------------------------
 
-const vm_mod = @import("vm");
-const compile = @import("compile");
-const intern_mod = @import("intern");
-const reader_mod = @import("reader");
-const expand_mod = @import("expand");
-const stdlib = @import("stdlib");
+const vm_mod = nx.vm;
+const compile = nx.compile;
+const intern_mod = nx.intern;
+const reader_mod = nx.reader;
+const expand_mod = nx.expand;
+const stdlib = nx.stdlib;
 
 /// A VM with the core natives and core.nx, whose collector is due
 /// every few kilobytes (`GcPolicy.stress`), running one program of

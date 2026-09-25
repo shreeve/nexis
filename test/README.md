@@ -8,7 +8,7 @@ convention; there is no `test/unit/`.
 
 | Path | What | Run via |
 |---|---|---|
-| `src/*.zig` (inline `test` blocks) | Per-module unit tests + integration smoke tests | `zig build test` |
+| `src/**/*.zig` (inline `test` blocks) | Per-module unit tests, compiled into one `unit` binary rooted at `src/root.zig` (a file's tests run once `src/root.zig` declares it; the build's layering check rejects an undeclared file) | `zig build test`, `zig build quick` |
 | `test/prop/` | Cross-module property tests (16 files: primitive, intern, heap, string, list, bignum, vector, champ, transient, typed_vector, gc, codec, db, compile, nextomic_key, nextomic_tx) | `zig build test` (`compile`, `nextomic_key` and `nextomic_tx` also via `zig build quick`) |
 | `test/golden/` | Reader golden tests (`.nx` source ↔ `.sexp` / `.err` expected) | `zig build golden` (or `zig build test`) |
 | `test/nextomic/` | Nextomic end-to-end scripts (`.nx` run through `bin/nexis` ↔ `.out` expected stdout) from a scratch directory that also holds `prelude.nx` (shared `check`/`caught` and the partition constants); `persist-1`/`persist-2` share one store across two processes | `zig build nextomic-nx` (or `zig build test`) |
@@ -16,16 +16,17 @@ convention; there is no `test/unit/`.
 | `examples/` | Every example runs through `bin/nexis`; the store-backed ones twice | `zig build examples` (or `zig build test`) |
 | `test/fuzz/` | Empty: the targets its README names have no harness | — |
 
+Property and integration files import the runtime as one module:
+`const nx = @import("nexis");` then `nx.vm`, `nx.nextomic` and so on.
+
 ## Two build steps for two loops
 
-- **`zig build quick`** (seconds) — the language binaries (`vm`,
-  `compile`, `expand`, `stdlib`, `loader`, `disasm`, `atom`, `record`,
-  `protocol`, `format`), the compile property tests, the
-  `eval_pipeline`, `runtime_polish` and `numbers` integration tests
-  and the Nextomic unit and property binaries. The inner edit/test
-  loop.
-- **`zig build test`** (minutes) — the full suite: every module's
-  inline tests, property tests, golden verification, the Nextomic
+- **`zig build quick`** — the `unit` binary (every inline test), the
+  compile and Nextomic property tests and the `eval_pipeline`,
+  `runtime_polish` and `numbers` integration tests. The inner
+  edit/test loop.
+- **`zig build test`** (minutes) — the full suite: the `unit` binary,
+  every property test, golden verification, the Nextomic
   corpora, the `.nx` scripts and the examples. The runtime is
   dominated by the randomized CHAMP correctness gate. Run before
   commits.

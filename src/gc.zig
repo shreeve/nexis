@@ -24,15 +24,15 @@
 //! Module graph (one-way terminal, like dispatch.zig):
 //!
 //!     gc.zig
-//!     ├─ @import("heap")
-//!     ├─ @import("value")
-//!     ├─ @import("string")  — string.trace
-//!     ├─ @import("bignum")  — bignum.trace
-//!     ├─ @import("list")    — list.trace
-//!     ├─ @import("vector")  — vector.trace
-//!     ├─ @import("champ")    — champ.traceMap + champ.traceSet
-//!     ├─ @import("typed_vector") — typed_vector.trace (leaf)
-//!     └─ @import("nextomic_handle") — nextomic_handle.traceEntity
+//!     ├─ @import("heap.zig")
+//!     ├─ @import("value.zig")
+//!     ├─ @import("string.zig")  — string.trace
+//!     ├─ @import("bignum.zig")  — bignum.trace
+//!     ├─ @import("coll/list.zig")    — list.trace
+//!     ├─ @import("coll/vector.zig")  — vector.trace
+//!     ├─ @import("coll/champ.zig")    — champ.traceMap + champ.traceSet
+//!     ├─ @import("coll/typed_vector.zig") — typed_vector.trace (leaf)
+//!     └─ @import("nextomic/handle.zig") — nextomic_handle.traceEntity
 //!
 //! `vm.zig` imports gc.zig and is the collector's host: it
 //! enumerates the runtime's roots and traces the two block kinds
@@ -42,20 +42,20 @@
 //! `{ markValue, mark, markInternal }`.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const string = @import("string");
-const bignum = @import("bignum");
-const list = @import("list");
-const vector = @import("vector");
-const champ = @import("champ");
-const typed_vector = @import("typed_vector");
-const transient_mod = @import("transient");
-const db_mod = @import("db");
-const atom_mod = @import("atom");
-const record_mod = @import("record");
-const protocol_mod = @import("protocol");
-const nextomic_handle = @import("nextomic_handle");
+const value = @import("value.zig");
+const heap_mod = @import("heap.zig");
+const string = @import("string.zig");
+const bignum = @import("bignum.zig");
+const list = @import("coll/list.zig");
+const vector = @import("coll/vector.zig");
+const champ = @import("coll/champ.zig");
+const typed_vector = @import("coll/typed_vector.zig");
+const transient_mod = @import("coll/transient.zig");
+const db_mod = @import("db.zig");
+const atom_mod = @import("atom.zig");
+const record_mod = @import("record.zig");
+const protocol_mod = @import("protocol.zig");
+const nextomic_handle = @import("nextomic/handle.zig");
 
 const Value = value.Value;
 const Kind = value.Kind;

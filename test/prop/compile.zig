@@ -18,13 +18,14 @@
 //! Deterministic PRNG seeds so failures reproduce.
 
 const std = @import("std");
-const value_mod = @import("value");
-const vm = @import("vm");
-const compile = @import("compile");
-const intern_mod = @import("intern");
-const reader_mod = @import("reader");
-const expand_mod = @import("expand");
-const list_mod = @import("list");
+const nx = @import("nexis");
+const value_mod = nx.value;
+const vm = nx.vm;
+const compile = nx.compile;
+const intern_mod = nx.intern;
+const reader_mod = nx.reader;
+const expand_mod = nx.expand;
+const list_mod = nx.list;
 
 const testing = std.testing;
 const Value = value_mod.Value;

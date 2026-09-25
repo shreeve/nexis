@@ -31,18 +31,19 @@
 //!       tree must return its own value.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const intern_mod = @import("intern");
-const string = @import("string");
-const bignum = @import("bignum");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ = @import("champ");
-const codec_mod = @import("codec");
-const db = @import("db");
-const dispatch = @import("dispatch");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const hash_mod = nx.hash;
+const intern_mod = nx.intern;
+const string = nx.string;
+const bignum = nx.bignum;
+const list_mod = nx.list;
+const vector_mod = nx.vector;
+const champ = nx.champ;
+const codec_mod = nx.codec;
+const db = nx.db;
+const dispatch = nx.dispatch;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;

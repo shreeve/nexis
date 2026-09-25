@@ -13,17 +13,18 @@
 //! write, and that the committed basis is unchanged afterwards.
 
 const std = @import("std");
-const nextomic = @import("nextomic");
-const value = @import("value");
-const heap_mod = @import("heap");
-const intern_mod = @import("intern");
-const string_mod = @import("string");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ = @import("champ");
-const dispatch = @import("dispatch");
-const emdb = @import("emdb");
-const reader_mod = @import("reader");
+const nx = @import("nexis");
+const nextomic = nx.nextomic;
+const value = nx.value;
+const heap_mod = nx.heap;
+const intern_mod = nx.intern;
+const string_mod = nx.string;
+const list_mod = nx.list;
+const vector_mod = nx.vector;
+const champ = nx.champ;
+const dispatch = nx.dispatch;
+const emdb = nx.emdb;
+const reader_mod = nx.reader;
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;

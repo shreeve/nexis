@@ -10,16 +10,16 @@
 //! VM through `VM.retargetTop`.
 
 const std = @import("std");
-const value_mod = @import("value");
-const vm = @import("vm");
-const compile = @import("compile");
-const reader_mod = @import("reader");
-const intern_mod = @import("intern");
-const expand_mod = @import("expand");
-const stdlib = @import("stdlib");
-const loader_mod = @import("loader");
-const format_mod = @import("format");
-const disasm_mod = @import("disasm");
+const value_mod = @import("value.zig");
+const vm = @import("vm.zig");
+const compile = @import("compile.zig");
+const reader_mod = @import("reader.zig");
+const intern_mod = @import("intern.zig");
+const expand_mod = @import("expand.zig");
+const stdlib = @import("stdlib.zig");
+const loader_mod = @import("loader.zig");
+const format_mod = @import("format.zig");
+const disasm_mod = @import("disasm.zig");
 
 const Value = value_mod.Value;
 

@@ -23,19 +23,20 @@
 //! exit path of try/catch/finally has at least one golden.
 
 const std = @import("std");
-const value_mod = @import("value");
-const vm = @import("vm");
-const compile = @import("compile");
-const intern_mod = @import("intern");
-const reader_mod = @import("reader");
-const expand_mod = @import("expand");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ_mod = @import("champ");
-const stdlib = @import("stdlib");
-const string_mod = @import("string");
-const format_mod = @import("format");
-const loader_mod = @import("loader");
+const nx = @import("nexis");
+const value_mod = nx.value;
+const vm = nx.vm;
+const compile = nx.compile;
+const intern_mod = nx.intern;
+const reader_mod = nx.reader;
+const expand_mod = nx.expand;
+const list_mod = nx.list;
+const vector_mod = nx.vector;
+const champ_mod = nx.champ;
+const stdlib = nx.stdlib;
+const string_mod = nx.string;
+const format_mod = nx.format;
+const loader_mod = nx.loader;
 
 const testing = std.testing;
 

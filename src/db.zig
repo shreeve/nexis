@@ -28,22 +28,22 @@
 //!
 //!     src/db.zig
 //!     ├── @import("std")
-//!     ├── @import("value")
-//!     ├── @import("heap")
-//!     ├── @import("intern")
-//!     ├── @import("hash")
-//!     ├── @import("codec")
+//!     ├── @import("value.zig")
+//!     ├── @import("heap.zig")
+//!     ├── @import("intern.zig")
+//!     ├── @import("hash.zig")
+//!     ├── @import("codec.zig")
 //!     └── @import("emdb")
 //!
 //! Nothing imports `db.zig` except `dispatch.zig` / `gc.zig` at
 //! their `.durable_ref` arms.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const intern_mod = @import("intern");
-const hash_mod = @import("hash");
-const codec_mod = @import("codec");
+const value = @import("value.zig");
+const heap_mod = @import("heap.zig");
+const intern_mod = @import("intern.zig");
+const hash_mod = @import("hash.zig");
+const codec_mod = @import("codec.zig");
 const emdb = @import("emdb");
 
 const Value = value.Value;
@@ -878,8 +878,8 @@ test "treeId: a tree created by an aborted transaction reads as empty afterwards
 }
 
 test "put / get: container values (list, map, set) codec round-trip" {
-    const list_mod = @import("list");
-    const champ = @import("champ");
+    const list_mod = @import("coll/list.zig");
+    const champ = @import("coll/champ.zig");
 
     const path = try tmpDbPath(testing.allocator, "containers");
     defer testing.allocator.free(path);

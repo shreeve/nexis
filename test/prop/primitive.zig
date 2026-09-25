@@ -28,9 +28,10 @@
 //! uniform sampler catches the interesting cases.
 
 const std = @import("std");
-const value = @import("value");
-const eq = @import("eq");
-const hash = @import("hash");
+const nx = @import("nexis");
+const value = nx.value;
+const eq = nx.eq;
+const hash = nx.hash;
 
 const Value = value.Value;
 
