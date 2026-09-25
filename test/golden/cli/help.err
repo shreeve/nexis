@@ -3,20 +3,27 @@ nexis — A Lisp where immutable values, transactional durable
         programming model.
 
 usage:
-  nexis run FILE.nx    Reads FILE.nx, compiles and runs each
-                       top-level form in order.
-  nexis repl           Interactive read-eval-print loop.
-                       :quit or EOF to exit.
-  nexis disasm FILE.nx Compiles FILE.nx without running it and
-                       prints every routine's bytecode: pc,
-                       opcode, operands, constants and the
-                       source line:col each run of
-                       instructions comes from.
-                       `--disasm FILE.nx` is the same.
+  nexis run FILE [ARG...]  Runs FILE's top-level forms in order;
+                           `-` reads the program from stdin.
+                           *command-line-args* holds the ARGs.
+  nexis FILE.nx [ARG...]   The same as `run`.
+  nexis -e EXPR [ARG...]   Evaluates EXPR's forms and prints each
+                           value that is not nil.
+  nexis repl               Interactive read-eval-print loop;
+                           :quit or EOF to exit.
+  nexis test FILE...       Runs each file, then every deftest
+                           they defined; exits 1 on a failure
+                           or an error.
+  nexis disasm FILE        Compiles FILE without running it and
+                           prints every routine's bytecode: pc,
+                           opcode, operands, constants and the
+                           source line:col each run of
+                           instructions comes from.
+                           `--disasm FILE` is the same.
 
-For `run`, Vars and the interner persist across forms within
-the file; for `repl`, across the whole session. A runtime error
-is reported at its source position with the frame chain.
+Exit status: 0 success, 1 usage or test failure, 2 unreadable
+file, 3 parse or reader error, 4 compile error, 5 runtime
+error; `(exit n)` exits with n.
 
 Namespaces available without a file: nexis.core (auto-referred),
 db (key-value storage on emdb), nextomic (Datomic-class datoms:

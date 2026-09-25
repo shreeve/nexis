@@ -1,0 +1,2 @@
+; `nexis run -` reads the whole program from stdin.
+(println (+ 1 2) *command-line-args*)

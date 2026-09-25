@@ -155,7 +155,7 @@ fn hitOf(k: []const u8) !Hit {
     const tail = key.id_len + key.hash_len;
     if (k.len < key.attr_len + 1 + tail) return error.Corrupted;
     return .{
-        .e = key.readId(k[k.len - tail ..][0..key.id_len]),
+        .e = try key.readId(k[k.len - tail ..][0..key.id_len]),
         .hash = std.mem.readInt(u128, k[k.len - key.hash_len ..][0..key.hash_len], .big),
     };
 }

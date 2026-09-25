@@ -178,7 +178,7 @@ is valid. (Rare, but pins the edge case.)
 | Bit | Name      | Meaning                                        |
 |-----|-----------|------------------------------------------------|
 | 0   | `marked`  | Visited in the current mark phase              |
-| 1   | `pinned`  | Do not free; live root (open tx, durable ref…) |
+| 1   | `pinned`  | Do not free; survives every sweep. No runtime module pins a block; tests use it |
 | 2–7 | reserved  | Future tri-color / generational / remembered   |
 
 `HeapHeader.flags` bit layout:
@@ -186,10 +186,7 @@ is valid. (Rare, but pins the edge case.)
 | Bit | Name         | Meaning                                              |
 |-----|--------------|------------------------------------------------------|
 | 0   | `has_meta`   | `meta` field is non-null                             |
-| 1   | `interned`   | Object is content-deduplicated (for strings etc.)    |
-| 2   | `immutable`  | Structural-share safe; collection invariant holder   |
-| 3   | `zero_copy`  | Body points into mmap page / external buffer         |
-| 4–7 | reserved     | —                                                    |
+| 1–7 | reserved     | zero; no constant names them                         |
 
 **`Value.tag.flags` is NOT `HeapHeader.flags`.** These are two different
 flag bytes on two different data structures:
@@ -216,21 +213,20 @@ flag_hash_cached is reserved and unused.
   `mixKindDomain` as always.
 - **Intern layer (`src/intern.zig`).** No direct interaction: interned
   name bytes are NOT heap-allocated (they live in interner-owned buffers,
-  not on this heap). The `meta_symbol` heap kind (future) will point at
-  a base symbol id from the interner plus a `*HeapHeader` metadata map
-  allocated on this heap.
+  not on this heap). The `meta_symbol` heap kind is reserved and has
+  no implementation.
 - **GC (`src/gc.zig`, see `docs/GC.md`).** Collector.collect(roots)
   drives a full cycle: mark each root via per-kind `trace` functions
   (each heap kind exports `pub fn trace(h, visitor)`; closures and
   cells trace through the VM, the collector's host), then call
   `sweepUnmarked` and reset the allocation counter. The VM runs a
   cycle at its instruction-fetch safe point once
-  `allocated_since_collect` reaches its threshold; the collector is
-  non-reentrant. `forEachLive` remains available for diagnostics. The
+  `allocated_since_collect` reaches its threshold; the mark phase is
+  a worklist loop. `forEachLive` is available for diagnostics. The
   trace seam on `Interner` is a no-op (intern-owned storage is not
   heap-managed).
-- **Codec (future `src/codec.zig`).** Does not allocate directly on this
-  heap; instead uses per-kind `decode` helpers that do. The heap module
+- **Codec (`src/codec.zig`).** Does not allocate directly on this
+  heap; it uses per-kind constructors that do. The heap module
   is codec-unaware.
 
 ---

@@ -142,9 +142,9 @@ const cases = [_]Case{
     // Variadic fns and recur into them.
     .{ .src = "((fn* [a & r] a) 1 2 3)", .out = "1" },
     .{ .src = "((fn* [a & r] r) 1 2 3)", .out = "(2 3)" },
-    .{ .src = "(seq ((fn* [a & r] r) 1))", .out = "nil" },
+    .{ .src = "((fn* [a & r] r) 1)", .out = "nil" },
     .{ .src = "((fn* [& r] r) 1 2 3 4)", .out = "(1 2 3 4)" },
-    .{ .src = "[(seq ((fn* [& r] r))) ((fn* [& r] 42))]", .out = "[nil 42]" },
+    .{ .src = "[((fn* [& r] r)) ((fn* [& r] 42))]", .out = "[nil 42]" },
     .{ .src = "(((fn* [a & r] (fn* [] r)) 1 2 3))", .out = "(2 3)" },
     .{ .src = "((fn* [a & r] (if (< a 1) (recur (+ a 1) 42) r)) 0 7)", .out = "42" },
     // def, var and Var resolution.

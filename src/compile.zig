@@ -1199,9 +1199,11 @@ pub const DeclaredNames = struct {
     /// method). A definition inside a `let`, a `when` or a call
     /// interns its Var when it runs, exactly like one at top level,
     /// so it is declared wherever it appears; quoted data is not
-    /// walked.
-    pub fn declareForm(self: *DeclaredNames, form: *const reader_mod.Form) error{ OutOfMemory, StackOverflow }!void {
-        try stack.check();
+    /// walked. A form nested past the stack budget is walked as deep
+    /// as the budget allows: compiling it fails with StackOverflow
+    /// anyway.
+    pub fn declareForm(self: *DeclaredNames, form: *const reader_mod.Form) error{OutOfMemory}!void {
+        stack.check() catch return;
         const items: []const *reader_mod.Form = switch (form.datum) {
             .list => |items| items,
             .vector, .map, .set => |items| {
@@ -2258,12 +2260,17 @@ pub const RuntimeHooks = struct {
         return error.ReaderFailure;
     }
 
+    /// The forms `text` reads as. The reader's arena, which holds
+    /// them, and the parser's live on `a` and go when `a` does.
     fn readForms(a: std.mem.Allocator, text: []const u8) ![]const *reader_mod.Form {
         var p = try reader_mod.parser.parseProgram(a, text);
-        defer p.parser.deinit();
         var reader = reader_mod.Reader.init(a, text);
-        defer reader.deinit();
-        return reader.readProgram(p.sexp);
+        const forms = reader.readProgram(p.sexp) catch |err| {
+            reader.deinit();
+            p.parser.deinit();
+            return err;
+        };
+        return forms;
     }
 
     /// Where a top-level form could end in `text`: after an atom or

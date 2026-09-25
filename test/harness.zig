@@ -32,6 +32,9 @@ pub const Program = struct {
     hooks: compile.RuntimeHooks,
     registry: *vm.NamespaceRegistry,
     interner: *intern_mod.Interner,
+    /// What boots the library; no load path, so a `require` reaches
+    /// only the namespaces the library installs.
+    loader: nx.loader.Loader,
 
     pub const Options = struct {
         /// Run the collector every few kilobytes (`vm.GcPolicy.stress`)
@@ -56,22 +59,11 @@ pub const Program = struct {
         // system through the CLI's std.Io.
         self.interner = self.v.ensureInterner();
         self.registry = try self.v.ensureRegistry();
-        const core = self.registry.core;
-        try stdlib.installCore(core);
-        try stdlib.installDb(try self.registry.getOrCreate("db", core));
-        try stdlib.installString(try self.registry.getOrCreate("nexis.string", core));
-        try stdlib.installInternal(try self.registry.getOrCreate("nexis.internal", core));
-        const nextomic_ns = try self.registry.getOrCreate("nextomic", core);
-        try stdlib.installNextomic(nextomic_ns);
-        const math_ns = try self.registry.getOrCreate("nexis.math", core);
-        try stdlib.installMath(math_ns);
         self.host_macros = try expand_mod.defaultMacros(gpa);
         errdefer self.host_macros.deinit(gpa);
-        try self.bootstrap(core, stdlib.CORE_NX_SOURCE);
-        try self.bootstrap(nextomic_ns, stdlib.NEXTOMIC_NX_SOURCE);
-        try self.bootstrap(try self.registry.getOrCreate("nexis.test", core), stdlib.TEST_NX_SOURCE);
-        try self.bootstrap(try self.registry.getOrCreate("nexis.pprint", core), stdlib.PPRINT_NX_SOURCE);
-        try self.bootstrap(math_ns, stdlib.MATH_NX_SOURCE);
+        self.loader = nx.loader.Loader.init(gpa, self.v.runtime_arena.allocator(), testing.io, &.{}, &self.v, self.interner, self.registry, &self.host_macros);
+        errdefer self.loader.deinit();
+        try stdlib.boot(&self.loader);
         self.hooks = .{ .host_macros = &self.host_macros, .registry = self.registry, .interner = self.interner };
         self.hooks.install(&self.v);
         if (options.gc_stress) {
@@ -83,6 +75,7 @@ pub const Program = struct {
 
     /// Release the program; a leak logs an error, which fails the test.
     pub fn deinit(self: *Program) void {
+        self.loader.deinit();
         self.host_macros.deinit(self.gpa.allocator());
         self.v.deinit();
         self.arena.deinit();
@@ -148,33 +141,6 @@ pub const Program = struct {
             try testing.expectEqual(frame_depth, self.v.frames.items.len);
         }
         return last;
-    }
-
-    /// Compile and run an embedded source into `ns` one form at a
-    /// time, the routines kept in the VM's runtime arena.
-    fn bootstrap(self: *Program, ns: *vm.Namespace, src: []const u8) !void {
-        const saved = self.registry.current;
-        self.registry.current = ns;
-        defer self.registry.current = saved;
-        const gpa = self.allocator();
-        var parsed = try reader_mod.parser.parseProgram(gpa, src);
-        defer parsed.parser.deinit();
-        var rdr = reader_mod.Reader.init(gpa, src);
-        defer rdr.deinit();
-        const forms = try rdr.readProgram(parsed.sexp);
-        const persistent = self.v.runtime_arena.allocator();
-        for (forms) |form| {
-            const compiled = try compile.compileFormWith(persistent, form, .{
-                .namespace = ns,
-                .interner = self.interner,
-                .host_macros = &self.host_macros,
-                .persistent_allocator = persistent,
-                .registry = self.registry,
-            });
-            const routine = compiled.toRoutine("bootstrap");
-            try self.v.retargetTop(&routine);
-            _ = try self.v.run();
-        }
     }
 };
 

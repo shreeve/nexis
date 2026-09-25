@@ -50,7 +50,6 @@ pub const SyncMode = store_mod.SyncMode;
 // Errors (§7)
 // =============================================================================
 
-/// The Nextomic error set; each maps to a `:nextomic/*` keyword.
 /// The error set of `f`, for naming a module's failures by the
 /// operations it performs.
 pub fn ErrorsOf(comptime f: anytype) type {
@@ -72,6 +71,7 @@ pub const Fault = struct {
     cas: ?struct { expected: ?Val, actual: ?Val } = null,
 };
 
+/// The Nextomic error set; each maps to a `:nextomic/*` keyword.
 pub const Error = error{
     HistoryView,
     UnknownAttribute,
@@ -235,14 +235,20 @@ pub const Conn = struct {
 
     /// The schema serving `basis` inside `txn` (whose `sys["t"]` is
     /// `now`). A cached schema built at a basis `>= basis` serves it
-    /// through `attrAt`; otherwise the cache is rebuilt at `now`.
+    /// through `attrAt`; one whose schema generation is still the
+    /// store's serves `now` too, since only data was committed since;
+    /// otherwise the cache is rebuilt at `now`.
     pub fn schemaAt(self: *Conn, txn: *Txn, basis: u64, now: u64) !*Schema {
         if (self.schema_cache) |s| {
             if (s.basis >= basis) return s;
+            if (s.gen == try self.store.readSchemaGen(txn)) {
+                s.basis = now;
+                return s;
+            }
             s.deinit();
             self.schema_cache = null;
         }
-        const s = try Schema.build(self.gpa, self.store, txn, now, now);
+        const s = try Schema.build(self.gpa, self.store, txn, now);
         self.schema_cache = s;
         return s;
     }
@@ -554,11 +560,11 @@ pub const DatomScan = struct {
                     const parts = try key.unpackKey(self.index, false, kv.key);
                     if (!self.filter.passes(self.index, parts)) continue;
                     if (kv.value.len < key.id_len) return error.Corrupted;
-                    const t = key.readId(kv.value[0..key.id_len]);
+                    const t = try key.readId(kv.value[0..key.id_len]);
                     return try self.materialise(parts, t, true);
                 },
                 .folded => |*s| {
-                    const r = s.next() orelse return null;
+                    const r = (try s.next()) orelse return null;
                     const parts = try key.unpackKey(self.index, false, r.fact);
                     if (!self.filter.passes(self.index, parts)) continue;
                     return try self.materialise(parts, r.t, r.added);
@@ -626,9 +632,8 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
     var s = try Store.scanRange(txn, conn.store.trees.txlog, &start, end);
     while (s.next()) |kv| {
         if (kv.key.len != key.id_len) return error.Corrupted;
-        const t = key.readId(kv.key[0..key.id_len]);
-        const bytes = (try conn.store.getTxlog(txn, t)) orelse return error.Corrupted;
-        const entry = try datom_mod.decodeTxlog(arena, bytes, t, ids);
+        const t = try key.readId(kv.key[0..key.id_len]);
+        const entry = try datom_mod.decodeTxlog(arena, kv.value, t, ids);
         try out.append(arena, .{ .t = t, .instant = entry.instant, .datoms = entry.datoms, .excised = entry.excised });
     }
     return out.toOwnedSlice(arena);
@@ -794,6 +799,20 @@ test "a bounded scan seeks to its start and stops at its end, on every view" {
         while (try open.next()) |_| m += 1;
         try testing.expectEqual(@as(usize, boot.idents.len - boot.doc + 1), m);
     }
+}
+
+test "a txlog key past the id range is corrupt, not a crash" {
+    const tc = try TestConn.init("db_txlog_corrupt");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    {
+        const txn = try tc.conn.store.beginWrite(.none);
+        errdefer txn.abort();
+        try txn.putInTree(tc.conn.store.trees.txlog, &([_]u8{0xFF} ** key.id_len), &.{});
+        try txn.commit();
+    }
+    try testing.expectError(error.Corrupted, txRange(tc.conn, arena_state.allocator(), 1, null));
 }
 
 test "basis in the future is refused" {

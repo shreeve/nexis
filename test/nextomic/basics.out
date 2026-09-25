@@ -75,4 +75,8 @@ Robert
 {:error :nextomic/conflict, :e 4294967298, :a :person/age}
 {:db/id 4294967298, :person/age 11}
 {:db/id 4294967298, :person/age 12}
+ok a unique value moves before its old holder lets go
+ok a lookup ref names an identity asserted after it
+:no-error
+{:error :nextomic/unique, :attr :person/email, :value x2@example.com}
 :basics-done
