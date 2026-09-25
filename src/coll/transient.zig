@@ -9,9 +9,10 @@
 //!
 //! Transients are "shallow" (TRANSIENT.md §1 Option B): mutation ops
 //! call the persistent backing operations (`champ.mapAssoc`,
-//! `champ.setConj`, `vector.conj`) underneath, updating the wrapper's
-//! `inner_header` field in place. There is no in-place node editing
-//! (TRANSIENT.md §1 Option A, Clojure's performance advantage).
+//! `champ.setConj`, `vector.conj`, …) underneath, updating the
+//! wrapper's `inner_header` field in place. There is no in-place node
+//! editing (TRANSIENT.md §1 Option A), so a transient op costs what
+//! the persistent op costs, plus the wrapper check.
 //!
 //! Token discipline enforced at every public entry point:
 //!   - `owner_token == 0` → frozen; all ops return `error.TransientFrozen`.
@@ -19,16 +20,10 @@
 //!   - Wrong subkind (mapAssocBang on a set wrapper) →
 //!     `error.TransientKindMismatch`.
 //!
-//! Module graph (one-way terminal):
-//!
-//!     src/coll/transient.zig
-//!     ├─ @import("../value.zig")
-//!     ├─ @import("../heap.zig")
-//!     ├─ @import("champ.zig")    — mapAssoc/Dissoc/Get/Count, setConj/Disj/Contains/Count, valueFromMapHeader, valueFromSetHeader
-//!     └─ @import("vector.zig")  — conj/nth/count, valueFromVectorHeader
-//!
-//! Importers: the `.transient` arms of `src/dispatch.zig` (operations),
-//! `src/gc.zig` (this module's `trace`) and `src/codec.zig`.
+//! Imports: value, heap, `champ.zig` and `vector.zig` (never
+//! dispatch; hash and equality arrive as callbacks). Importers: the
+//! `.transient` arms of `src/dispatch.zig`, `src/gc.zig` (this
+//! module's `trace`) and `src/codec.zig`.
 
 const std = @import("std");
 const value = @import("../value.zig");
@@ -328,6 +323,39 @@ pub fn vectorConjBang(
     return t;
 }
 
+/// `(assoc! t idx elem)`: replaces element `idx`, or appends when
+/// `idx` is the count (as Clojure's `assoc!` on a transient vector).
+/// `error.IndexOutOfBounds` beyond that.
+pub fn vectorAssocBang(
+    heap: *Heap,
+    t: Value,
+    idx: usize,
+    elem: Value,
+) (TransientError || std.mem.Allocator.Error || error{ Overflow, IndexOutOfBounds })!Value {
+    try assertActiveSubkind(t, subkind_transient_vector);
+    const body = transientBody(Heap.asHeapHeader(t));
+    const old_v = vector.valueFromVectorHeader(body.inner_header);
+    const n = vector.count(old_v);
+    if (idx > n) return error.IndexOutOfBounds;
+    const new_v = if (idx == n) try vector.conj(heap, old_v, elem) else try vector.assoc(heap, old_v, idx, elem);
+    body.inner_header = Heap.asHeapHeader(new_v);
+    return t;
+}
+
+/// `(pop! t)`: drops the last element. `error.IndexOutOfBounds` on an
+/// empty vector.
+pub fn vectorPopBang(
+    heap: *Heap,
+    t: Value,
+) (TransientError || std.mem.Allocator.Error || error{ Overflow, IndexOutOfBounds })!Value {
+    try assertActiveSubkind(t, subkind_transient_vector);
+    const body = transientBody(Heap.asHeapHeader(t));
+    const old_v = vector.valueFromVectorHeader(body.inner_header);
+    if (vector.isEmpty(old_v)) return error.IndexOutOfBounds;
+    body.inner_header = Heap.asHeapHeader(try vector.pop(heap, old_v));
+    return t;
+}
+
 pub fn vectorNthBang(t: Value, idx: usize) TransientError!Value {
     try assertActiveSubkind(t, subkind_transient_vector);
     const body = transientBodyConst(Heap.asHeapHeader(t));
@@ -533,6 +561,26 @@ test "vectorConjBang + vectorNthBang: round-trip" {
         const got = try vectorNthBang(t, i);
         try testing.expectEqual(@as(i64, @intCast(i)), got.asFixnum());
     }
+}
+
+test "vectorAssocBang + vectorPopBang: replace, append at count, pop to empty" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const t = try transientFrom(&heap, try vector.empty(&heap));
+    for (0..40) |i| _ = try vectorAssocBang(&heap, t, i, value.fromFixnum(@intCast(i)).?);
+    try testing.expectEqual(@as(usize, 40), try vectorCountBang(t));
+    _ = try vectorAssocBang(&heap, t, 3, value.fromFixnum(-3).?);
+    try testing.expectEqual(@as(i64, -3), (try vectorNthBang(t, 3)).asFixnum());
+    try testing.expectError(error.IndexOutOfBounds, vectorAssocBang(&heap, t, 41, value.nilValue()));
+    var n: usize = 40;
+    while (n > 0) : (n -= 1) {
+        try testing.expectEqual(@as(i64, if (n == 4) -3 else @intCast(n - 1)), (try vectorNthBang(t, n - 1)).asFixnum());
+        _ = try vectorPopBang(&heap, t);
+    }
+    try testing.expectError(error.IndexOutOfBounds, vectorPopBang(&heap, t));
+    _ = try persistentBang(t);
+    try testing.expectError(TransientError.TransientFrozen, vectorPopBang(&heap, t));
+    try testing.expectError(TransientError.TransientFrozen, vectorAssocBang(&heap, t, 0, value.nilValue()));
 }
 
 // ---- Freeze semantics ----
