@@ -2260,7 +2260,8 @@ fn fnSelectKeys(vm: *VM, args: []const Value) VmError!Value {
     return out;
 }
 
-/// `(find m k)` → the `[k v]` entry or nil.
+/// `(find m k)` → the `[k v]` entry or nil; `k` is the key as the map
+/// holds it, which may be another `=` value than the argument.
 fn fnFind(vm: *VM, args: []const Value) VmError!Value {
     const m = args[0];
     const map_v: Value = switch (m.kind()) {
@@ -2276,10 +2277,8 @@ fn fnFind(vm: *VM, args: []const Value) VmError!Value {
         },
         else => return VmError.KindMismatch,
     };
-    return switch (champ_mod.mapGet(map_v, args[1], &dispatch_mod.hashValue, &dispatch_mod.equal)) {
-        .present => |v| vector_mod.fromSlice(vm.ensureHeap(), &.{ args[1], v }) catch VmError.OutOfMemory,
-        .absent => value_mod.nilValue(),
-    };
+    const e = champ_mod.mapFind(map_v, args[1], &dispatch_mod.hashValue, &dispatch_mod.equal) orelse return value_mod.nilValue();
+    return vector_mod.fromSlice(vm.ensureHeap(), &.{ e.key, e.value }) catch VmError.OutOfMemory;
 }
 
 /// `(key e)` / `(val e)` on a `[k v]` entry.

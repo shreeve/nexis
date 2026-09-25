@@ -884,6 +884,12 @@ pub fn mapGet(m: Value, key: Value, elementHash: ElementHash, elementEq: Element
     return .{ .present = e.value };
 }
 
+/// The entry whose key equals `key`, with the key as `m` holds it
+/// (Clojure's `find`), or null.
+pub fn mapFind(m: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) ?Entry {
+    return MapTrie.find(m, key, elementHash, elementEq);
+}
+
 /// `m` with `key → val` (CHAMP.md §8.1). Returns `m` itself when the
 /// key already maps to a bit-identical value; a replaced value keeps
 /// the original key object.

@@ -4103,6 +4103,8 @@ test "core: maps" {
         .{ .src = "(zipmap [:a :b :c] [1 2])", .expected = "{:a 1, :b 2}" },
         .{ .src = "(find {:a 1} :a)", .expected = "[:a 1]" },
         .{ .src = "(find {:a 1} :b)", .expected = "nil" },
+        // The key as the map holds it: a vector key found by a list.
+        .{ .src = "(let [e (find {[1 2] :x} '(1 2))] [(vector? (key e)) (meta (key (find {(with-meta [1] {:m 1}) 2} [1])))])", .expected = "[true {:m 1}]" },
         .{ .src = "(find [5 6] 1)", .expected = "[1 6]" },
         .{ .src = "(key (find {:a 1} :a))", .expected = ":a" },
         .{ .src = "(val (find {:a 1} :a))", .expected = "1" },
