@@ -26,7 +26,8 @@
 //!       and dissocs back to the same entries — hash and equal
 //!       identically.
 //!   M7. Cross-category never-equal: a map is never `=` to any non-
-//!       associative Value; `dispatch.hashValue` outputs distinct.
+//!       associative Value (an immediate, a list or vector, a string,
+//!       a set, a record), and the hashes differ.
 //!   M8. Persistent immutability: `mapAssoc(m, k, v)` does not mutate
 //!       `m`; `mapGet(m, k)` still returns the pre-assoc result.
 //!   M9. Keyword-keyed fast-path correctness: maps keyed entirely by
@@ -44,6 +45,7 @@ const champ = nx.champ;
 const string_mod = nx.string;
 const list_mod = nx.list;
 const vector_mod = nx.vector;
+const record = nx.record;
 const dispatch = nx.dispatch;
 
 const Value = value.Value;
@@ -435,15 +437,22 @@ test "M7: map never equal to non-associative Values" {
         value.fromChar('a').?,
         try list_mod.empty(&heap),
         try vector_mod.empty(&heap),
+        try string_mod.fromBytes(&heap, ""),
+        try string_mod.fromBytes(&heap, "a"),
+        try champ.setEmpty(&heap),
+        // A record is never its field map (SEMANTICS §2.6).
+        try record.make(&heap, 1, m),
     };
+    // Empty-map vs all of the above: never equal, and the hashes
+    // land in different domains.
+    const em = try champ.mapEmpty(&heap);
     for (non_assoc) |other| {
         try std.testing.expect(!dispatch.equal(m, other));
         try std.testing.expect(!dispatch.equal(other, m));
-    }
-    // Empty-map vs all of the above: never equal.
-    const em = try champ.mapEmpty(&heap);
-    for (non_assoc) |other| {
+        try std.testing.expect(dispatch.hashValue(m) != dispatch.hashValue(other));
         try std.testing.expect(!dispatch.equal(em, other));
+        try std.testing.expect(!dispatch.equal(other, em));
+        try std.testing.expect(dispatch.hashValue(em) != dispatch.hashValue(other));
     }
 }
 
@@ -878,6 +887,42 @@ test "S5: cross-subkind (array-set vs CHAMP) equal + hash-equal (2000 trials)" {
     }
 }
 
+test "S5b: a set of sets is equal and hash-equal in either insertion order" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const H = struct {
+        fn set(h: *Heap, elems: []const Value) !Value {
+            var s = try champ.setEmpty(h);
+            for (elems) |e| s = try champ.setConj(h, s, e, &dispatch.hashValue, &dispatch.equal);
+            return s;
+        }
+    };
+    const fx = struct {
+        fn f(n: i64) Value {
+            return value.fromFixnum(n).?;
+        }
+    }.f;
+    // #{#{1 2} #{3 4}}, inner and outer sets built in both orders, and
+    // a map keyed by one (the codec's C1 covers a set inside a map).
+    const a12 = try H.set(&heap, &.{ fx(1), fx(2) });
+    const b12 = try H.set(&heap, &.{ fx(2), fx(1) });
+    const a34 = try H.set(&heap, &.{ fx(3), fx(4) });
+    const b34 = try H.set(&heap, &.{ fx(4), fx(3) });
+    const outer_a = try H.set(&heap, &.{ a12, a34 });
+    const outer_b = try H.set(&heap, &.{ b34, b12 });
+    try std.testing.expect(dispatch.equal(outer_a, outer_b));
+    try std.testing.expect(dispatch.equal(outer_b, outer_a));
+    try std.testing.expectEqual(dispatch.hashValue(outer_a), dispatch.hashValue(outer_b));
+    try std.testing.expect(champ.setContains(outer_a, b12, &dispatch.hashValue, &dispatch.equal));
+    // One element apart: #{#{1 2} #{3 5}} is a different set.
+    const other = try H.set(&heap, &.{ a12, try H.set(&heap, &.{ fx(3), fx(5) }) });
+    try std.testing.expect(!dispatch.equal(outer_a, other));
+    const m_a = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), outer_a, fx(1), &dispatch.hashValue, &dispatch.equal);
+    const m_b = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), outer_b, fx(1), &dispatch.hashValue, &dispatch.equal);
+    try std.testing.expect(dispatch.equal(m_a, m_b));
+    try std.testing.expectEqual(dispatch.hashValue(m_a), dispatch.hashValue(m_b));
+}
+
 test "S6: set never equal to non-set Values" {
     var heap = Heap.init(std.testing.allocator);
     defer heap.deinit();
@@ -897,14 +942,18 @@ test "S6: set never equal to non-set Values" {
         try list_mod.empty(&heap),
         try vector_mod.empty(&heap),
         try champ.mapEmpty(&heap),
+        try string_mod.fromBytes(&heap, ""),
+        try string_mod.fromBytes(&heap, "a"),
+        try record.make(&heap, 1, try champ.mapEmpty(&heap)),
     };
+    const es = try champ.setEmpty(&heap);
     for (non_set) |other| {
         try std.testing.expect(!dispatch.equal(s, other));
         try std.testing.expect(!dispatch.equal(other, s));
-    }
-    const es = try champ.setEmpty(&heap);
-    for (non_set) |other| {
+        try std.testing.expect(dispatch.hashValue(s) != dispatch.hashValue(other));
         try std.testing.expect(!dispatch.equal(es, other));
+        try std.testing.expect(!dispatch.equal(other, es));
+        try std.testing.expect(dispatch.hashValue(es) != dispatch.hashValue(other));
     }
 }
 

@@ -315,6 +315,19 @@ test "failures: each source fails with its error" {
     try testing.expect(!failed);
 }
 
+test "failures: a form that fails to compile leaves none of its locals in scope" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(error.UnresolvedSymbol, program.runChecked("(let* [x 1] y)", null));
+    try testing.expectError(error.UnresolvedSymbol, program.runChecked("x", null));
+    // A global of the same name, defined after a failure inside a
+    // local's scope, is not shadowed by it.
+    _ = try program.run("(def x 5)");
+    try testing.expectError(error.RecurOutsideTail, program.run("(let* [x 1] (do (recur) x))"));
+    try harness.expectResult(&program, "x", try program.run("x"), "5");
+}
+
 // =============================================================================
 // Properties
 // =============================================================================

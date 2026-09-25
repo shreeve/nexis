@@ -11,6 +11,10 @@
 //!   S3. Cross-kind: a string Value is never `equal` to a keyword /
 //!       symbol / fixnum / char / float / nil / bool with any of
 //!       their values; hashes differ as well (via `mixKindDomain`).
+//!   S3b. Nor to a list, vector, map, set or record: the empty
+//!       string and the empty collections are pairwise unequal and
+//!       hash apart, except list and vector, which share the
+//!       sequential domain.
 //!   S4. `fromBytes(bytes)` + `asBytes(v)` round-trip byte-exact
 //!       across 1000 random byte sequences (including empty and
 //!       non-ASCII).
@@ -140,6 +144,33 @@ test "S3: string Value is never equal to any non-string Value; hashes differ" {
         // regions of u64 space.
         try std.testing.expect(s_hash != dispatch.hashValue(o));
     }
+}
+
+test "S3b: strings and the empty collections: never equal across categories, hashes apart" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const empty_map = try nx.champ.mapEmpty(&heap);
+    // One per category; the empty list and vector are one category.
+    const reps = [_]Value{
+        try string.fromBytes(&heap, ""),
+        try string.fromBytes(&heap, "[]"),
+        try nx.list.empty(&heap),
+        empty_map,
+        try nx.champ.setEmpty(&heap),
+        try nx.record.make(&heap, 1, empty_map),
+    };
+    for (reps, 0..) |a, i| for (reps, 0..) |b, j| {
+        if (i == j) continue;
+        try std.testing.expect(!dispatch.equal(a, b));
+        try std.testing.expect(dispatch.hashValue(a) != dispatch.hashValue(b));
+    };
+    const empty_vector = try nx.vector.empty(&heap);
+    try std.testing.expect(dispatch.equal(reps[2], empty_vector));
+    try std.testing.expectEqual(dispatch.hashValue(reps[2]), dispatch.hashValue(empty_vector));
+    for (reps, 0..) |other, i| if (i != 2) {
+        try std.testing.expect(!dispatch.equal(empty_vector, other));
+        try std.testing.expect(dispatch.hashValue(empty_vector) != dispatch.hashValue(other));
+    };
 }
 
 // -----------------------------------------------------------------------------
