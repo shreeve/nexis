@@ -38,6 +38,11 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&fail.step);
         quick_step.dependOn(&fail.step);
     }
+    // The tests of this file: the import scanner `checkLayering` uses.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        .name = "build",
+        .root_module = b.createModule(.{ .root_source_file = b.path("build.zig"), .target = target, .optimize = optimize }),
+    })).step);
 
     // Parser generation, through the external nexus tool at ../nexus/bin/nexus.
     const nexus_bin = b.pathJoin(&.{ b.pathFromRoot(".."), "nexus", "bin", "nexus" });
@@ -458,10 +463,7 @@ fn checkLayering(b: *std.Build) ?[]const u8 {
     const root_text = src.readFileAlloc(io, "root.zig", gpa, .limited(1 << 20)) catch |err|
         return b.fmt("layering: cannot read src/root.zig: {t}", .{err});
     var rank: std.StringHashMapUnmanaged(usize) = .empty;
-    var lines = std.mem.splitScalar(u8, root_text, '\n');
-    while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, "pub const ")) continue;
-        const path = importPath(line) orelse continue;
+    for (importPaths(gpa, root_text)) |path| {
         if (std.mem.endsWith(u8, path, ".zig")) rank.put(gpa, path, rank.count()) catch @panic("OOM");
     }
 
@@ -479,10 +481,7 @@ fn checkLayering(b: *std.Build) ?[]const u8 {
 
         const text = src.readFileAlloc(io, file, gpa, .limited(1 << 24)) catch |err|
             return b.fmt("layering: cannot read src/{s}: {t}", .{ file, err });
-        var it = std.mem.splitScalar(u8, text, '\n');
-        while (it.next()) |line| {
-            if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "//")) continue;
-            const rel = importPath(line) orelse continue;
+        for (importPaths(gpa, text)) |rel| {
             if (!std.mem.endsWith(u8, rel, ".zig")) continue;
             const dir = std.fs.path.dirnamePosix(file) orelse "";
             const target = std.fs.path.resolvePosix(gpa, &.{ dir, rel }) catch @panic("OOM");
@@ -499,12 +498,42 @@ fn checkLayering(b: *std.Build) ?[]const u8 {
     return null;
 }
 
-/// The path inside the first `@import("...")` on a line.
-fn importPath(line: []const u8) ?[]const u8 {
-    const open = "@import(\"";
-    const start = (std.mem.indexOf(u8, line, open) orelse return null) + open.len;
-    const len = std.mem.indexOfScalar(u8, line[start..], '"') orelse return null;
-    return line[start..][0..len];
+/// The path of every `@import("...")` in the Zig source `text`, in
+/// order, whatever whitespace or line breaks sit around the paren;
+/// comments and string and character literals are skipped.
+fn importPaths(gpa: std.mem.Allocator, text: []const u8) []const []const u8 {
+    var paths: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) switch (text[i]) {
+        // A comment, or a line of a multiline string literal.
+        '/', '\\' => if (i + 1 < text.len and text[i + 1] == text[i]) {
+            i = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse text.len;
+        },
+        '"', '\'' => {
+            const quote = text[i];
+            i += 1;
+            while (i < text.len and text[i] != quote and text[i] != '\n') : (i += 1) {
+                if (text[i] == '\\') i += 1;
+            }
+        },
+        '@' => if (std.mem.startsWith(u8, text[i..], "@import")) {
+            var j = skipSpace(text, i + "@import".len);
+            if (j == text.len or text[j] != '(') continue;
+            j = skipSpace(text, j + 1);
+            if (j == text.len or text[j] != '"') continue;
+            const end = std.mem.indexOfScalarPos(u8, text, j + 1, '"') orelse text.len;
+            paths.append(gpa, text[j + 1 .. end]) catch @panic("OOM");
+            i = end;
+        },
+        else => {},
+    };
+    return paths.items;
+}
+
+fn skipSpace(text: []const u8, from: usize) usize {
+    var i = from;
+    while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+    return i;
 }
 
 fn layerUnit(file: []const u8) []const u8 {
@@ -516,4 +545,27 @@ fn layerUnit(file: []const u8) []const u8 {
 
 fn isExecutableRoot(file: []const u8) bool {
     return std.mem.eql(u8, file, "cli.zig") or std.mem.eql(u8, file, "golden.zig");
+}
+
+test "importPaths: every @import in order, in any spacing, never one inside a comment or string" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const src =
+        \\const a = @import("a.zig"); const b = @import("b.zig");
+        \\const c = @import (
+        \\    "c.zig",
+        \\);
+        \\const d = @import("d.zig"); // was @import("x.zig")
+        \\    // @import("y.zig")
+        \\const s = "@import(\"z.zig\")";
+        \\const q = '"'; const e = @import("e.zig");
+        \\const m =
+        \\    \\@import("w.zig")
+        \\;
+    ;
+    const paths = importPaths(arena.allocator(), src);
+    try std.testing.expectEqual(5, paths.len);
+    for (paths, [_][]const u8{ "a.zig", "b.zig", "c.zig", "d.zig", "e.zig" }) |got, want|
+        try std.testing.expectEqualStrings(want, got);
 }
