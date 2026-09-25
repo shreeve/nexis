@@ -107,7 +107,7 @@ Every snippet runs via `bin/nexis`:
 (swap! counter inc)                         ;; => 1
 
 ;; durable refs — values persist across processes (examples/todo-app.nx)
-(def conn (db/open :app.edb))
+(def conn (db/open "app.edb"))
 (def alice (db/ref conn :users :alice))
 (with-tx [tx conn] (db/put! tx alice {:age 31}))
 @alice                                      ;; => {:age 31}

@@ -236,7 +236,8 @@ pub fn build(b: *std.Build) void {
 
     // test/golden/cli: what bin/nexis prints, pinned byte for byte: a
     // runtime error's stderr (exit 5), a reader error's stderr (exit
-    // 3), a disassembly, a script's stdout, a REPL session and the
+    // 3), a disassembly, scripts' stdout (with arguments, from stdin,
+    // an explicit exit status), `nexis test`, a REPL session and the
     // usage errors. Each runs from the build root, so the paths in
     // the output are the relative ones committed.
     {
@@ -258,6 +259,10 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "disasm", "examples/sum10.nx" }, .stdout = "sum10.disasm" },
             .{ .args = &.{ "run", cli ++ "pprint.nx" }, .stdout = "pprint.out" },
             .{ .args = &.{ "run", cli ++ "deep-recursion.nx" }, .stdout = "deep-recursion.out" },
+            .{ .args = &.{ "run", cli ++ "args.nx", "a", "b c" }, .stdout = "args.out" },
+            .{ .args = &.{ "run", cli ++ "exit-status.nx" }, .stdout = "exit-status.out", .exit_code = 3 },
+            .{ .args = &.{ "run", "-", "x" }, .stdin = "stdin.in", .stdout = "stdin.out" },
+            .{ .args = &.{ "test", cli ++ "tests.nx" }, .stdout = "tests.out", .exit_code = 1 },
             .{ .args = &.{"repl"}, .stdin = "repl.in", .stdout = "repl.out", .stderr = "repl.err" },
             .{ .args = &.{"--help"}, .stderr = "help.err" },
             .{ .args = &.{}, .stderr = "help.err", .exit_code = 1 },
