@@ -1,14 +1,22 @@
-//! coll/list.zig — immutable cons list heap kind.
+//! coll/list.zig — immutable list heap kind: cons cells and vector views.
 //!
 //! Authoritative spec: `docs/LIST.md`. Physical storage: `src/heap.zig`.
 //! Semantics: `docs/SEMANTICS.md` §2.6 (sequential equality category)
 //! and §3.2 (sequential-domain hash mixing; the domain mixer is chosen
 //! by equality category).
 //!
-//! Subkinds (VALUE.md §2.2):
+//! Subkinds (LIST.md §1):
 //!   - 0 = cons  — body is `{ head: Value, tail: Value }` = 32 bytes;
 //!         tail is always kind .list (proper lists only).
 //!   - 1 = empty — body size 0; the Value alone encodes emptiness.
+//!   - 2 = view  — body is one vector Value = 16 bytes; the Value's
+//!         tag bits 32..63 hold the offset of its first element. The
+//!         elements of a vector from an offset on, so `seq`, `rest`
+//!         and `next` of a vector are O(1): `tail` of a view is the
+//!         same block at the next offset and allocates nothing.
+//!
+//! Every reader goes through `isEmpty` / `head` / `tail` / `count` /
+//! `drop` / `Cursor`; only this file knows the bodies.
 //!
 //! Dispatch plumbing: `hashSeq` and `equalSeq` take function-pointer
 //! callbacks (`elementHash`, `elementEq`) for the inner operations so
@@ -19,6 +27,7 @@ const std = @import("std");
 const value = @import("../value.zig");
 const heap_mod = @import("../heap.zig");
 const hash_mod = @import("../hash.zig");
+const vector = @import("vector.zig");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -33,6 +42,7 @@ const testing = std.testing;
 
 pub const subkind_cons: u16 = 0;
 pub const subkind_empty: u16 = 1;
+pub const subkind_view: u16 = 2;
 
 // =============================================================================
 // Cons body — private, always accessed via bodyOf
@@ -51,6 +61,11 @@ const ConsBody = extern struct {
         std.debug.assert(@offsetOf(ConsBody, "tail") == 16);
     }
 };
+
+/// A view's body is the vector it reads; its size tells a view block
+/// from a cons cell (32) and an empty list (0) where only the header
+/// is at hand (`trace`).
+const view_body_size: usize = @sizeOf(Value);
 
 pub const ListError = error{
     InvalidListTail,
@@ -93,52 +108,75 @@ pub fn fromSlice(heap: *Heap, elems: []const Value) !Value {
     return result;
 }
 
+/// The elements of the vector `vec` from index `start` on, as a
+/// list: one 16-byte block whatever the vector's length. `start ==
+/// count(vec)` gives an empty list.
+pub fn ofVector(heap: *Heap, vec: Value, start: usize) !Value {
+    std.debug.assert(start <= vector.count(vec));
+    const h = try heap.alloc(.list, view_body_size);
+    Heap.bodyOf(Value, h).* = vec;
+    return viewAt(h, start);
+}
+
 // =============================================================================
 // Public API — accessors
 // =============================================================================
 
-pub inline fn isEmpty(v: Value) bool {
+pub fn isEmpty(v: Value) bool {
     std.debug.assert(v.kind() == .list);
-    return v.subkind() == subkind_empty;
+    return switch (v.subkind()) {
+        subkind_cons => false,
+        subkind_view => viewOffset(v) >= vector.count(viewVector(v)),
+        else => true,
+    };
 }
 
 /// First element. Panics in safe builds if the list is empty.
 pub fn head(v: Value) Value {
-    std.debug.assert(v.kind() == .list);
-    if (std.debug.runtime_safety) {
-        if (v.subkind() == subkind_empty) {
-            std.debug.panic("list.head: called on empty list", .{});
-        }
-    }
-    const h = Heap.asHeapHeader(v);
-    return Heap.bodyOf(ConsBody, h).head;
+    if (std.debug.runtime_safety and isEmpty(v)) std.debug.panic("list.head: called on empty list", .{});
+    if (v.subkind() == subkind_view) return vector.nth(viewVector(v), viewOffset(v));
+    return consBody(v).head;
 }
 
-/// Rest of the list. Always a list Value. Panics in safe builds if
-/// the list is empty.
+/// Rest of the list. Always a list Value; never allocates. Panics in
+/// safe builds if the list is empty.
 pub fn tail(v: Value) Value {
-    std.debug.assert(v.kind() == .list);
-    if (std.debug.runtime_safety) {
-        if (v.subkind() == subkind_empty) {
-            std.debug.panic("list.tail: called on empty list", .{});
-        }
-    }
-    const h = Heap.asHeapHeader(v);
-    return Heap.bodyOf(ConsBody, h).tail;
+    if (std.debug.runtime_safety and isEmpty(v)) std.debug.panic("list.tail: called on empty list", .{});
+    if (v.subkind() == subkind_view) return viewAt(Heap.asHeapHeader(v), viewOffset(v) + 1);
+    return consBody(v).tail;
 }
 
-/// O(n) length; the length is not cached.
+/// Length: O(1) for a view, O(n) over cons cells; nothing caches it.
 pub fn count(v: Value) usize {
     std.debug.assert(v.kind() == .list);
     var cur = v;
     var n: usize = 0;
-    while (cur.subkind() == subkind_cons) : (n += 1) {
-        const h = Heap.asHeapHeader(cur);
-        cur = Heap.bodyOf(ConsBody, h).tail;
-        // Safe-build invariant: tail must stay on the list rail.
-        std.debug.assert(cur.kind() == .list);
-    }
-    return n;
+    while (true) switch (cur.subkind()) {
+        subkind_cons => {
+            n += 1;
+            cur = consBody(cur).tail;
+        },
+        subkind_view => return n + vector.count(viewVector(cur)) - viewOffset(cur),
+        else => return n,
+    };
+}
+
+/// The list without its first `n` elements; empty when it is
+/// shorter. Never allocates: a view moves its offset in one step.
+pub fn drop(v: Value, n: usize) Value {
+    std.debug.assert(v.kind() == .list);
+    var cur = v;
+    var left = n;
+    while (left > 0) : (left -= 1) switch (cur.subkind()) {
+        subkind_cons => cur = consBody(cur).tail,
+        subkind_view => {
+            const at = viewOffset(cur);
+            const remaining = vector.count(viewVector(cur)) - at;
+            return viewAt(Heap.asHeapHeader(cur), at + @min(left, remaining));
+        },
+        else => return cur,
+    };
+    return cur;
 }
 
 // =============================================================================
@@ -149,67 +187,37 @@ pub fn count(v: Value) usize {
 /// `elementHash` on each. Top-level walk is iterative; the element
 /// callback may itself recurse (nested lists hash through
 /// `dispatch.hashValue → list.hashSeq → elementHash → …`). Returns
-/// the pre-domain base at u32 precision, cached in `h`'s header
-/// (SEMANTICS.md §3.1); `dispatch.hashValue` applies the
-/// sequential-category domain byte on the way out. `vector.hashSeq`
-/// computes the same value for the same elements.
-pub fn hashSeq(h: *HeapHeader, elementHash: *const fn (Value) u64) u64 {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(h.kind == @intFromEnum(Kind.list));
-    }
-    if (h.cachedHash()) |cached| return cached;
+/// the pre-domain base at u32 precision (SEMANTICS.md §3.1);
+/// `dispatch.hashValue` applies the sequential-category domain byte
+/// on the way out. `vector.hashSeq` computes the same value for the
+/// same elements. A cons cell caches the result in its header; a
+/// view does not, because every offset of it shares one header.
+pub fn hashSeq(v: Value, elementHash: *const fn (Value) u64) u64 {
+    std.debug.assert(v.kind() == .list);
+    const h = Heap.asHeapHeader(v);
+    const cacheable = v.subkind() != subkind_view;
+    if (cacheable) if (h.cachedHash()) |cached| return cached;
     var acc: u64 = hash_mod.ordered_init;
     var n: usize = 0;
-    var cur_header: *HeapHeader = h;
-    while (cur_header.kind == @intFromEnum(Kind.list)) {
-        // Reconstruct the subkind from the allocation size: body == 0
-        // ⇒ empty; body == 32 ⇒ cons. We avoid round-tripping through
-        // a Value to preserve the pure *HeapHeader input shape.
-        const body = Heap.bodyBytes(cur_header);
-        if (body.len == 0) break; // empty list terminator
-        std.debug.assert(body.len == @sizeOf(ConsBody));
-        const cons_body: *ConsBody = @ptrCast(@alignCast(body.ptr));
-        acc = hash_mod.combineOrdered(acc, elementHash(cons_body.head));
-        n += 1;
-        std.debug.assert(cons_body.tail.kind() == .list);
-        cur_header = Heap.asHeapHeader(cons_body.tail);
-    }
+    var c = Cursor.init(v);
+    while (c.next()) |x| : (n += 1) acc = hash_mod.combineOrdered(acc, elementHash(x));
     const truncated: u32 = @truncate(hash_mod.finalizeOrdered(acc, n));
-    if (truncated != 0) h.setCachedHash(truncated);
+    if (cacheable and truncated != 0) h.setCachedHash(truncated);
     return truncated;
 }
 
-/// Pairwise structural equality. Walks both cons chains in lock-step,
+/// Pairwise structural equality. Walks both lists in lock-step,
 /// comparing each paired element via `elementEq`. Returns true iff
 /// the lists have identical length and every pair is equal.
-pub fn equalSeq(
-    a: *HeapHeader,
-    b: *HeapHeader,
-    elementEq: *const fn (Value, Value) bool,
-) bool {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(a.kind == @intFromEnum(Kind.list));
-        std.debug.assert(b.kind == @intFromEnum(Kind.list));
-    }
-    if (a == b) return true;
-    var ca: *HeapHeader = a;
-    var cb: *HeapHeader = b;
+pub fn equalSeq(a: Value, b: Value, elementEq: *const fn (Value, Value) bool) bool {
+    std.debug.assert(a.kind() == .list and b.kind() == .list);
+    if (a.identicalTo(b)) return true;
+    var ca = Cursor.init(a);
+    var cb = Cursor.init(b);
     while (true) {
-        const a_body = Heap.bodyBytes(ca);
-        const b_body = Heap.bodyBytes(cb);
-        const a_empty = a_body.len == 0;
-        const b_empty = b_body.len == 0;
-        if (a_empty and b_empty) return true;
-        if (a_empty or b_empty) return false;
-        std.debug.assert(a_body.len == @sizeOf(ConsBody));
-        std.debug.assert(b_body.len == @sizeOf(ConsBody));
-        const abody: *ConsBody = @ptrCast(@alignCast(a_body.ptr));
-        const bbody: *ConsBody = @ptrCast(@alignCast(b_body.ptr));
-        if (!elementEq(abody.head, bbody.head)) return false;
-        std.debug.assert(abody.tail.kind() == .list);
-        std.debug.assert(bbody.tail.kind() == .list);
-        ca = Heap.asHeapHeader(abody.tail);
-        cb = Heap.asHeapHeader(bbody.tail);
+        const x = ca.next() orelse return cb.next() == null;
+        const y = cb.next() orelse return false;
+        if (!elementEq(x, y)) return false;
     }
 }
 
@@ -223,15 +231,19 @@ pub fn equalSeq(
 /// `visitor.mark`) instead of handing the tail back to the
 /// collector, so a list of any length is walked in a loop and the
 /// collector's recursion depth follows nesting, never length. The
-/// walk stops at the empty list or at the first cell that is
-/// already marked, which is also what ends a cyclic chain.
-///
-/// Empty-list subkind traces as no-op (body_size == 0).
+/// walk stops at the empty list, at a view (which marks its whole
+/// vector: the offset lives in the Value, not the block), or at the
+/// first cell that is already marked, which is also what ends a
+/// cyclic chain.
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
     var cell = h;
     while (true) {
         const body = Heap.bodyBytes(cell);
-        if (body.len == 0) return; // empty list; no children
+        switch (body.len) {
+            0 => return,
+            view_body_size => return visitor.markValue(Heap.bodyOf(Value, cell).*),
+            else => {},
+        }
         std.debug.assert(body.len == @sizeOf(ConsBody));
         const cons_body: *ConsBody = @ptrCast(@alignCast(body.ptr));
         visitor.markValue(cons_body.head);
@@ -244,18 +256,19 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
 }
 
 // =============================================================================
-// Cursor — streaming ordered iteration for cross-kind sequential equality
+// Cursor — streaming ordered iteration
 // =============================================================================
 //
 // The cross-kind walker pattern is streaming ordered traversal rather
-// than random-access-by-index. This cursor is consumed by
-// `dispatch.sequentialEqual` when walking a list against another
-// sequential kind. Not part of the language-surface API.
+// than random-access-by-index. `dispatch.sequentialEqual`, `hashSeq`,
+// `equalSeq` and the stdlib's sequence iterator walk lists with it;
+// once it reaches a view it walks the vector's leaves directly.
 
 pub const Cursor = struct {
-    /// The tail of the list still to be yielded. Always `.list` kind.
-    /// Empty list → `next()` returns null.
+    /// The part of the list still to be yielded, until a view is
+    /// reached; from then on `view` yields the rest.
     current: Value,
+    view: ?vector.Cursor = null,
 
     pub fn init(v: Value) Cursor {
         std.debug.assert(v.kind() == .list);
@@ -263,11 +276,19 @@ pub const Cursor = struct {
     }
 
     pub fn next(self: *Cursor) ?Value {
-        if (isEmpty(self.current)) return null;
-        const h = Heap.asHeapHeader(self.current);
-        const body: *const ConsBody = @ptrCast(@alignCast(Heap.bodyBytes(h).ptr));
-        self.current = body.tail;
-        return body.head;
+        if (self.view) |*vc| return vc.next();
+        switch (self.current.subkind()) {
+            subkind_cons => {
+                const body = consBody(self.current);
+                self.current = body.tail;
+                return body.head;
+            },
+            subkind_view => {
+                self.view = vector.Cursor.initAt(viewVector(self.current), viewOffset(self.current));
+                return self.view.?.next();
+            },
+            else => return null,
+        }
     }
 };
 
@@ -280,6 +301,26 @@ fn valueFrom(h: *HeapHeader, sk: u16) Value {
         .tag = @as(u64, @intFromEnum(Kind.list)) | (@as(u64, sk) << 16),
         .payload = @intFromPtr(h),
     };
+}
+
+/// The view Value over the block `h` at `offset`. A vector's count is
+/// a u32, so the offset fits the tag's upper half.
+fn viewAt(h: *HeapHeader, offset: usize) Value {
+    const v = valueFrom(h, subkind_view);
+    return .{ .tag = v.tag | (@as(u64, @as(u32, @intCast(offset))) << 32), .payload = v.payload };
+}
+
+fn viewOffset(v: Value) usize {
+    return @intCast(v.tag >> 32);
+}
+
+fn viewVector(v: Value) Value {
+    return Heap.bodyOf(Value, Heap.asHeapHeader(v)).*;
+}
+
+fn consBody(v: Value) *ConsBody {
+    std.debug.assert(v.subkind() == subkind_cons);
+    return Heap.bodyOf(ConsBody, Heap.asHeapHeader(v));
 }
 
 // =============================================================================
@@ -423,7 +464,7 @@ test "hashSeq: empty list returns finalizeOrdered(init, 0) at u32 precision" {
     defer heap.deinit();
     const e = try empty(&heap);
     const expected: u64 = @as(u32, @truncate(hash_mod.finalizeOrdered(hash_mod.ordered_init, 0)));
-    try testing.expectEqual(expected, hashSeq(Heap.asHeapHeader(e), &callbackHashImmediateOnly));
+    try testing.expectEqual(expected, hashSeq(e, &callbackHashImmediateOnly));
 }
 
 test "hashSeq: (list 1 2 3) matches manual ordered combine" {
@@ -441,17 +482,33 @@ test "hashSeq: (list 1 2 3) matches manual ordered combine" {
     expected = hash_mod.combineOrdered(expected, value.fromFixnum(3).?.hashImmediate());
     expected = @as(u32, @truncate(hash_mod.finalizeOrdered(expected, 3)));
 
-    try testing.expectEqual(expected, hashSeq(Heap.asHeapHeader(lst), &callbackHashImmediateOnly));
+    try testing.expectEqual(expected, hashSeq(lst, &callbackHashImmediateOnly));
 }
 
 test "hashSeq caches its result in the head cell's header" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const h = Heap.asHeapHeader(try fromSlice(&heap, &.{ value.fromFixnum(1).?, value.fromFixnum(2).? }));
+    const l = try fromSlice(&heap, &.{ value.fromFixnum(1).?, value.fromFixnum(2).? });
+    const h = Heap.asHeapHeader(l);
     try testing.expect(h.cachedHash() == null);
-    const first = hashSeq(h, &callbackHashImmediateOnly);
+    const first = hashSeq(l, &callbackHashImmediateOnly);
     try testing.expectEqual(@as(?u32, @intCast(first)), h.cachedHash());
-    try testing.expectEqual(first, hashSeq(h, &callbackHashImmediateOnly));
+    try testing.expectEqual(first, hashSeq(l, &callbackHashImmediateOnly));
+}
+
+test "hashSeq: a view hashes as the list of its elements and caches nothing" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var elems: [40]Value = undefined;
+    for (&elems, 0..) |*slot, i| slot.* = value.fromFixnum(@intCast(i)).?;
+    const vec = try vector.fromSlice(&heap, &elems);
+    const view = try ofVector(&heap, vec, 0);
+    for (0..elems.len + 1) |k| {
+        const at = drop(view, k);
+        const expected = hashSeq(try fromSlice(&heap, elems[k..]), &callbackHashImmediateOnly);
+        try testing.expectEqual(expected, hashSeq(at, &callbackHashImmediateOnly));
+    }
+    try testing.expect(Heap.asHeapHeader(view).cachedHash() == null);
 }
 
 test "hashSeq: equal lists produce equal base hashes (different allocations)" {
@@ -465,8 +522,8 @@ test "hashSeq: equal lists produce equal base hashes (different allocations)" {
         value.fromFixnum(7).?,
         value.fromKeywordId(3),
     });
-    const ha = hashSeq(Heap.asHeapHeader(a), &callbackHashImmediateOnly);
-    const hb = hashSeq(Heap.asHeapHeader(b), &callbackHashImmediateOnly);
+    const ha = hashSeq(a, &callbackHashImmediateOnly);
+    const hb = hashSeq(b, &callbackHashImmediateOnly);
     try testing.expectEqual(ha, hb);
 }
 
@@ -476,8 +533,8 @@ test "hashSeq: different-length lists produce different hashes" {
     const one = value.fromFixnum(1).?;
     const lst1 = try fromSlice(&heap, &.{one});
     const lst2 = try fromSlice(&heap, &.{ one, one });
-    const h1 = hashSeq(Heap.asHeapHeader(lst1), &callbackHashImmediateOnly);
-    const h2 = hashSeq(Heap.asHeapHeader(lst2), &callbackHashImmediateOnly);
+    const h1 = hashSeq(lst1, &callbackHashImmediateOnly);
+    const h2 = hashSeq(lst2, &callbackHashImmediateOnly);
     try testing.expect(h1 != h2);
 }
 
@@ -494,7 +551,7 @@ test "equalSeq: structural equality across distinct allocations" {
         value.fromFixnum(2).?,
         value.fromFixnum(3).?,
     });
-    try testing.expect(equalSeq(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &callbackEqImmediateOnly));
+    try testing.expect(equalSeq(a, b, &callbackEqImmediateOnly));
 }
 
 test "equalSeq: length mismatch returns false" {
@@ -502,8 +559,8 @@ test "equalSeq: length mismatch returns false" {
     defer heap.deinit();
     const a = try fromSlice(&heap, &.{ value.fromFixnum(1).?, value.fromFixnum(2).? });
     const b = try fromSlice(&heap, &.{value.fromFixnum(1).?});
-    try testing.expect(!equalSeq(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &callbackEqImmediateOnly));
-    try testing.expect(!equalSeq(Heap.asHeapHeader(b), Heap.asHeapHeader(a), &callbackEqImmediateOnly));
+    try testing.expect(!equalSeq(a, b, &callbackEqImmediateOnly));
+    try testing.expect(!equalSeq(b, a, &callbackEqImmediateOnly));
 }
 
 test "equalSeq: element-level inequality propagates up" {
@@ -511,7 +568,7 @@ test "equalSeq: element-level inequality propagates up" {
     defer heap.deinit();
     const a = try fromSlice(&heap, &.{ value.fromFixnum(1).?, value.fromFixnum(2).? });
     const b = try fromSlice(&heap, &.{ value.fromFixnum(1).?, value.fromFixnum(99).? });
-    try testing.expect(!equalSeq(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &callbackEqImmediateOnly));
+    try testing.expect(!equalSeq(a, b, &callbackEqImmediateOnly));
 }
 
 test "equalSeq: two empty lists compare equal" {
@@ -519,14 +576,14 @@ test "equalSeq: two empty lists compare equal" {
     defer heap.deinit();
     const a = try empty(&heap);
     const b = try empty(&heap);
-    try testing.expect(equalSeq(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &callbackEqImmediateOnly));
+    try testing.expect(equalSeq(a, b, &callbackEqImmediateOnly));
 }
 
 test "equalSeq: identity short-circuit on same *HeapHeader" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     const a = try fromSlice(&heap, &.{value.fromFixnum(42).?});
-    try testing.expect(equalSeq(Heap.asHeapHeader(a), Heap.asHeapHeader(a), &callbackEqImmediateOnly));
+    try testing.expect(equalSeq(a, a, &callbackEqImmediateOnly));
 }
 
 test "Cursor: streaming iteration yields head-to-tail, null on empty" {
@@ -550,6 +607,51 @@ test "Cursor: streaming iteration yields head-to-tail, null on empty" {
     try testing.expectEqual(@as(i64, 3), c.next().?.asFixnum());
     try testing.expectEqual(@as(?Value, null), c.next());
     try testing.expectEqual(@as(?Value, null), c.next()); // still null
+}
+
+test "view: head, tail, count, drop and Cursor read the vector from the offset" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    // 1100 elements: a tail, full leaves and a two-level trie.
+    var elems: [1100]Value = undefined;
+    for (&elems, 0..) |*slot, i| slot.* = value.fromFixnum(@intCast(i)).?;
+    const vec = try vector.fromSlice(&heap, &elems);
+    const live = heap.liveCount();
+    const view = try ofVector(&heap, vec, 0);
+    try testing.expectEqual(subkind_view, view.subkind());
+
+    var cur = view;
+    for (elems, 0..) |x, i| {
+        try testing.expect(!isEmpty(cur));
+        try testing.expectEqual(elems.len - i, count(cur));
+        try testing.expect(head(cur).identicalTo(x));
+        try testing.expect(drop(view, i).identicalTo(cur));
+        cur = tail(cur);
+    }
+    try testing.expect(isEmpty(cur));
+    try testing.expectEqual(@as(usize, 0), count(cur));
+    try testing.expect(drop(view, elems.len + 5).identicalTo(cur));
+    // One block for the view; tail and drop allocate nothing.
+    try testing.expectEqual(live + 1, heap.liveCount());
+
+    for ([_]usize{ 0, 1, 31, 32, 33, 1055, 1056, 1057, 1099, 1100 }) |k| {
+        var c = Cursor.init(drop(view, k));
+        for (elems[k..]) |x| try testing.expect(c.next().?.identicalTo(x));
+        try testing.expectEqual(@as(?Value, null), c.next());
+    }
+}
+
+test "view: a cons in front of a view walks into it" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const one = value.fromFixnum(1).?;
+    const vec = try vector.fromSlice(&heap, &.{ one, value.fromFixnum(2).?, value.fromFixnum(3).? });
+    const l = try cons(&heap, value.fromFixnum(0).?, try ofVector(&heap, vec, 1));
+    try testing.expectEqual(@as(usize, 3), count(l));
+    try testing.expectEqual(@as(i64, 3), head(drop(l, 2)).asFixnum());
+    try testing.expect(equalSeq(l, try fromSlice(&heap, &.{ value.fromFixnum(0).?, value.fromFixnum(2).?, value.fromFixnum(3).? }), &callbackEqImmediateOnly));
+    try testing.expect(!equalSeq(l, try ofVector(&heap, vec, 0), &callbackEqImmediateOnly));
+    try testing.expect(equalSeq(try ofVector(&heap, vec, 3), try empty(&heap), &callbackEqImmediateOnly));
 }
 
 test "count: flat list with 100 elements" {

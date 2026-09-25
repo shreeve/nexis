@@ -566,6 +566,15 @@ pub const Cursor = struct {
         return fromHeader(rootHeader(v));
     }
 
+    /// A cursor whose first element is the one at `start` (≤ count);
+    /// the walk of a list view (LIST.md §1).
+    pub fn initAt(v: Value, start: usize) Cursor {
+        var c = init(v);
+        std.debug.assert(start <= c.count);
+        c.index = start;
+        return c;
+    }
+
     fn fromHeader(h: *HeapHeader) Cursor {
         return .{ .root = h, .count = rootBody(h).count };
     }

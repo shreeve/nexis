@@ -513,7 +513,8 @@ fn fnFirst(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(rest s)` → seq of everything after the first element.
-/// Always returns a list (empty if input is empty/nil).
+/// Always returns a list (empty if input is empty/nil); of a vector,
+/// an O(1) view (LIST.md §1).
 fn fnRest(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
     const heap = vm.ensureHeap();
@@ -523,6 +524,7 @@ fn fnRest(vm: *VM, args: []const Value) VmError!Value {
             list_mod.empty(heap) catch VmError.OutOfMemory
         else
             list_mod.tail(s),
+        .persistent_vector => list_mod.ofVector(heap, s, @min(1, vector_mod.count(s))) catch VmError.OutOfMemory,
         else => blk: {
             var items = try collectSeq(vm, s);
             defer items.deinit(vm.allocator);
@@ -590,10 +592,18 @@ fn fnNext(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(seq coll)` → nil for nil or an empty collection, otherwise a
 /// list of the collection's elements (a non-empty list is
-/// returned as is). Maps yield `[k v]` entries, strings chars.
+/// returned as is; a vector gives an O(1) view, LIST.md §1). Maps
+/// yield `[k v]` entries, strings chars.
 fn fnSeq(vm: *VM, args: []const Value) VmError!Value {
     const c = args[0];
-    if (c.kind() == .list) return if (list_mod.isEmpty(c)) value_mod.nilValue() else c;
+    switch (c.kind()) {
+        .list => return if (list_mod.isEmpty(c)) value_mod.nilValue() else c,
+        .persistent_vector => return if (vector_mod.isEmpty(c))
+            value_mod.nilValue()
+        else
+            list_mod.ofVector(vm.ensureHeap(), c, 0) catch VmError.OutOfMemory,
+        else => {},
+    }
     var items = try collectSeq(vm, c);
     defer items.deinit(vm.allocator);
     if (items.items.len == 0) return value_mod.nilValue();
@@ -656,14 +666,12 @@ fn fnNth(vm: *VM, args: []const Value) VmError!Value {
     return switch (coll.kind()) {
         .nil => default,
         .list => blk: {
-            if (u_idx >= list_mod.count(coll)) {
+            const at = list_mod.drop(coll, u_idx);
+            if (list_mod.isEmpty(at)) {
                 if (has_default) break :blk default;
                 return VmError.IndexOutOfBounds;
             }
-            var node = coll;
-            var i: usize = 0;
-            while (i < u_idx) : (i += 1) node = list_mod.tail(node);
-            break :blk list_mod.head(node);
+            break :blk list_mod.head(at);
         },
         .persistent_vector => blk: {
             if (u_idx >= vector_mod.count(coll)) {
@@ -2006,9 +2014,18 @@ fn requireCount(v: Value) VmError!usize {
     return @intCast(@max(try requireFixnum(v), 0));
 }
 
-/// `(nthrest coll n)` → coll without its first n elements, as a list.
+/// `(nthrest coll n)` → coll without its first n elements, as a
+/// list; O(1) past a vector's elements (a view, LIST.md §1).
 fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
     const n = try requireCount(args[1]);
+    switch (args[0].kind()) {
+        .list => return list_mod.drop(args[0], n),
+        .persistent_vector => {
+            const v = args[0];
+            return list_mod.ofVector(vm.ensureHeap(), v, @min(n, vector_mod.count(v))) catch VmError.OutOfMemory;
+        },
+        else => {},
+    }
     var items = try collectSeq(vm, args[0]);
     defer items.deinit(vm.allocator);
     const skip = @min(n, items.items.len);
@@ -2579,10 +2596,16 @@ fn fnMeta(_: *VM, args: []const Value) VmError!Value {
 /// cannot carry metadata is `:no-metadata-on-immediate`; a Var's
 /// metadata changes in place through `reset-meta!` / `alter-meta!`.
 fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
-    const x = args[0];
     const m = args[1];
     if (!m.isNil() and m.kind() != .persistent_map) return VmError.KindMismatch;
-    if (!carriesHeaderMeta(x.kind())) return vm.throwKeyword("no-metadata-on-immediate");
+    if (!carriesHeaderMeta(args[0].kind())) return vm.throwKeyword("no-metadata-on-immediate");
+    // Every rest of a vector view shares its block (LIST.md §1), so
+    // metadata on it would follow `rest`; the copy gets cells of its own.
+    const x = if (args[0].kind() == .list and args[0].subkind() == list_mod.subkind_view) blk: {
+        var items = try collectSeq(vm, args[0]);
+        defer items.deinit(vm.allocator);
+        break :blk try buildListFromSlice(vm, items.items);
+    } else args[0];
     const h = heap_mod.Heap.asHeapHeader(x);
     const body = heap_mod.Heap.bodyBytes(h);
     const copy = vm.ensureHeap().alloc(x.kind(), body.len) catch return VmError.OutOfMemory;
@@ -4408,7 +4431,7 @@ fn typeNameToKind(name: []const u8) ?value_mod.Kind {
 const SeqIter = struct {
     state: union(enum) {
         empty,
-        list: Value,
+        list: list_mod.Cursor,
         vector: struct { v: Value, idx: usize, count: usize },
         typed: struct { v: Value, idx: usize, count: usize, heap: *heap_mod.Heap },
         map: struct { it: champ_mod.MapIter, heap: *heap_mod.Heap },
@@ -4420,12 +4443,7 @@ const SeqIter = struct {
     fn next(self: *SeqIter) VmError!?Value {
         switch (self.state) {
             .empty => return null,
-            .list => |*node| {
-                if (list_mod.isEmpty(node.*)) return null;
-                const h = list_mod.head(node.*);
-                node.* = list_mod.tail(node.*);
-                return h;
-            },
+            .list => |*c| return c.next(),
             .vector => |*vec| {
                 if (vec.idx >= vec.count) return null;
                 const e = vector_mod.nth(vec.v, vec.idx);
@@ -4464,7 +4482,7 @@ const SeqIter = struct {
 fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
     return .{ .state = switch (coll.kind()) {
         .nil => .empty,
-        .list => .{ .list = coll },
+        .list => .{ .list = list_mod.Cursor.init(coll) },
         .persistent_vector => .{ .vector = .{ .v = coll, .idx = 0, .count = vector_mod.count(coll) } },
         .typed_vector => .{ .typed = .{ .v = coll, .idx = 0, .count = typed_vector_mod.count(coll), .heap = vm.ensureHeap() } },
         .persistent_map => .{ .map = .{ .it = champ_mod.mapIter(coll), .heap = vm.ensureHeap() } },

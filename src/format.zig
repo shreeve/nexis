@@ -288,13 +288,12 @@ fn formatList(
     interner: ?*const intern_mod.Interner,
 ) Error!void {
     try writer.writeByte('(');
-    var node = v;
+    var it = list_mod.Cursor.init(v);
     var first = true;
-    while (node.kind() == .list and !list_mod.isEmpty(node)) {
+    while (it.next()) |x| {
         if (!first) try writer.writeByte(' ');
         first = false;
-        try format(list_mod.head(node), mode, writer, interner);
-        node = list_mod.tail(node);
+        try format(x, mode, writer, interner);
     }
     try writer.writeByte(')');
 }

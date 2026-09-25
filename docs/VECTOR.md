@@ -132,6 +132,7 @@ and whose `next()` returns the next element in logical order or
 pub const Cursor = struct {
     // root header, count, next index, and the current leaf or tail
     pub fn init(v: Value) Cursor;
+    pub fn initAt(v: Value, start: usize) Cursor; // first element: the one at `start`
     pub fn next(self: *Cursor) ?Value;
 };
 ```
@@ -141,47 +142,30 @@ lies in, and descends the trie again only when it crosses into the
 next 32-element chunk: O(n) for a whole walk. `hashSeq` and
 `equalSeq` walk with it too.
 
-The corresponding list cursor (`src/coll/list.zig`):
+The corresponding list cursor (`src/coll/list.zig`) yields cons heads
+one step at a time and, on reaching a vector view (`docs/LIST.md` §1),
+continues with a vector cursor started at the view's offset
+(`Cursor.initAt`).
 
-```zig
-// list.zig
-pub const Cursor = struct {
-    current: Value, // always .list kind; empty => next() returns null
-
-    pub fn init(v: Value) Cursor { return .{ .current = v }; }
-    pub fn next(self: *Cursor) ?Value;  // O(1) per step
-};
-```
-
-`dispatch.sequentialEqual` unions the two cursor types and walks
-pairwise:
+`dispatch.sequentialEqual` walks a list against a vector with the two
+cursors in lock-step:
 
 ```zig
 fn sequentialEqual(a: Value, b: Value) bool {
-    // Same-kind fast paths (existing list-list; new vector-vector).
-    if (a.kind() == .list and b.kind() == .list)
-        return list.equalSeq(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &equal);
-    if (a.kind() == .persistent_vector and b.kind() == .persistent_vector)
-        return vector.equalSeq(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &equal);
-
-    // Cross-kind: cursor walk.
-    var ca = seqCursorInit(a);
-    var cb = seqCursorInit(b);
+    const l, const v = if (a.kind() == .list) .{ a, b } else .{ b, a };
+    var cl = list.Cursor.init(l);
+    var cv = vector.Cursor.init(v);
     while (true) {
-        const na = seqCursorNext(&ca);
-        const nb = seqCursorNext(&cb);
-        if (na == null and nb == null) return true;
-        if (na == null or nb == null) return false;
-        if (!equal(na.?, nb.?)) return false;
+        const x = cl.next() orelse return cv.next() == null;
+        const y = cv.next() orelse return false;
+        if (!equal(x, y)) return false;
     }
 }
 ```
 
-Where `seqCursorInit(v)` returns a union-of-cursors dispatching on
-`v.kind()`. The cursor pattern is **not** exposed as a public
-language-level API — it is an internal composition tool for
-dispatch. The user-facing `seq` natives in `src/stdlib.zig` are
-built on it (PLAN §6.7).
+The cursor pattern is **not** exposed as a public language-level API —
+it is an internal composition tool for dispatch and the stdlib's
+sequence iterator (PLAN §6.7).
 
 ---
 
@@ -209,8 +193,8 @@ pub fn nth(v: value.Value, i: usize) value.Value;
 pub fn hashSeq(h: *HeapHeader, elementHash: *const fn (value.Value) u64) u64;
 pub fn equalSeq(a: *HeapHeader, b: *HeapHeader, elementEq: *const fn (value.Value, value.Value) bool) bool;
 
-/// Streaming cursor for cross-kind walking. dispatch.sequentialEqual
-/// composes list.Cursor and vector.Cursor into a union.
+/// Streaming cursor: `init(v)` from the first element, `initAt(v,
+/// start)` from element `start` (a list view's walk); `next()`.
 pub const Cursor = struct { ... };
 ```
 
@@ -294,9 +278,9 @@ The heap-kind switch in `heapHashBase` gains
 `heapEqual` switch never routes to vector because vector is
 sequential-category; `dispatch.sequentialEqual` handles it.
 
-`dispatch.sequentialEqual` has the cursor-walk shape above. The list-list fast-path (O(n) via
-`list.equalSeq`); the new vector-vector fast-path uses
-`vector.equalSeq`. Cross-kind pairs fall through to cursor-walk.
+Two lists compare through `list.equalSeq`, two vectors through
+`vector.equalSeq`; a list against a vector goes to
+`dispatch.sequentialEqual`, the cursor walk above.
 
 `dispatch.zig` imports `coll/vector.zig`; the vector module never
 imports dispatch, so hashing and comparing elements arrive as

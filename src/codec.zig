@@ -291,8 +291,8 @@ const Encoder = struct {
     noinline fn list(e: *Encoder, v: Value, depth: u32) Error!void {
         try e.byte(@intFromEnum(Kind.list));
         try e.uleb(list_mod.count(v));
-        var cur = v;
-        while (!list_mod.isEmpty(cur)) : (cur = list_mod.tail(cur)) try e.item(list_mod.head(cur), depth);
+        var it = list_mod.Cursor.init(v);
+        while (it.next()) |x| try e.item(x, depth);
     }
 
     noinline fn vector(e: *Encoder, v: Value, depth: u32) Error!void {
