@@ -363,6 +363,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
         /// metadata, as every Clojure collection update does
         /// (SEMANTICS §7). `to` is `from` itself or a fresh root.
         fn keepMeta(from: Value, to: Value) Value {
+            if (to.payload == from.payload) return to;
             const m = Heap.asHeapHeader(from).getMeta() orelse return to;
             Heap.asHeapHeader(to).setMeta(m);
             return to;
