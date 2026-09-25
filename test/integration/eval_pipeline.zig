@@ -1238,6 +1238,11 @@ test "integration: core.nx if-let / when-let destructure, and if-let's else is o
     try expectOutput("(when-let [[a b] [1 2]] b)", "2");
     try expectOutput("(if-let [{:keys [a]} {:a 1}] a 0)", "1");
     try expectOutput("(when-let [[a & more] (seq [])] a)", "nil");
+    // As Clojure's: one binding and test, then and at most one else.
+    try expectProgramError("(if-let [x 1] x 2 3)", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(if-let [x 1 y 2] x)", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(if-some [x 1] x 2 3)", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(if-some (x 1) x)", compile.CompileError.MacroExpansionFailure);
 }
 
 test "integration: core.nx if-some / when-some bind false; when-first binds the first element" {

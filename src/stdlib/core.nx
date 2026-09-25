@@ -45,8 +45,11 @@
 ; ============================================================
 
 ; (if-let [binding test] then else?) → then with binding bound to
-; test's value when it is truthy, else. The binding may destructure.
+; test's value when it is truthy, else. The binding may destructure;
+; any other shape fails to expand, as in Clojure.
 (defmacro if-let [binding then & else]
+  (when (or (not (vector? binding)) (not= 2 (count binding)) (next else))
+    (throw (ex-info "if-let takes [binding test], then and an optional else" {})))
   `(let [temp# ~(second binding)]
      (if temp#
        (let [~(first binding) temp#] ~then)
@@ -61,6 +64,8 @@
 ; (if-some [binding test] then else?) / (when-some [binding test]
 ; body...) → as if-let / when-let, but only nil fails: false binds.
 (defmacro if-some [binding then & else]
+  (when (or (not (vector? binding)) (not= 2 (count binding)) (next else))
+    (throw (ex-info "if-some takes [binding test], then and an optional else" {})))
   `(let [temp# ~(second binding)]
      (if (nil? temp#)
        ~(first else)
