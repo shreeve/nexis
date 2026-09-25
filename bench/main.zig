@@ -380,12 +380,7 @@ fn benchCompileSimple(ctx: *CompileBenchCtx) !void {
     defer arena.deinit();
     var interner = intern_mod.Interner.init(arena.allocator());
     defer interner.deinit();
-    const compiled = try compile_mod.compileSourceFull(
-        arena.allocator(),
-        "(+ 1 2)",
-        null,
-        &interner,
-    );
+    const compiled = try compile_mod.compileSourceWith(arena.allocator(), "(+ 1 2)", .{ .interner = &interner });
     std.mem.doNotOptimizeAway(compiled);
 }
 
@@ -403,7 +398,7 @@ fn benchPipeline(ctx: *PipelineCtx) !void {
     defer arena.deinit();
     var v = try vm_mod.VM.init(ctx.alloc, &vm_mod.VM.idle_routine);
     defer v.deinit();
-    const compiled = try compile_mod.compileSourceFull(arena.allocator(), ctx.source, null, v.ensureInterner());
+    const compiled = try compile_mod.compileSourceWith(arena.allocator(), ctx.source, .{ .interner = v.ensureInterner() });
     const routine = compiled.toRoutine("bench");
     try v.retargetTop(&routine);
     std.mem.doNotOptimizeAway(try v.run());
@@ -431,12 +426,12 @@ const RunCtx = struct {
         const interner = ctx.v.ensureInterner();
         const ns = ctx.v.ensureNamespace();
         if (setup) |s| {
-            const compiled = try compile_mod.compileSourceFull(ctx.arena.allocator(), s, ns, interner);
+            const compiled = try compile_mod.compileSourceWith(ctx.arena.allocator(), s, .{ .namespace = ns, .interner = interner });
             const routine = compiled.toRoutine("bench-setup");
             try ctx.v.retargetTop(&routine);
             _ = try ctx.v.run();
         }
-        const compiled = try compile_mod.compileSourceFull(ctx.arena.allocator(), source, ns, interner);
+        const compiled = try compile_mod.compileSourceWith(ctx.arena.allocator(), source, .{ .namespace = ns, .interner = interner });
         ctx.routine = compiled.toRoutine("bench");
         ctx.sink = 0;
         return ctx;

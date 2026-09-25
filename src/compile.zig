@@ -2492,51 +2492,6 @@ pub fn compileSourceWith(
     return compileFormWith(allocator, form, opts);
 }
 
-/// `compileSourceWith` with a namespace and an interner; bench/main.zig
-/// compiles its programs this way.
-pub fn compileSourceFull(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-) CompileError!Compiled {
-    return compileSourceWith(allocator, source, .{ .namespace = namespace, .interner = interner });
-}
-
-/// `compileSourceWith` with a macro table; the eval pipeline tests
-/// compile a source string this way.
-pub fn compileSourceFullWithMacros(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-    host_macros: ?*const expand_mod.HostMacroTable,
-) CompileError!Compiled {
-    return compileSourceWith(allocator, source, .{ .namespace = namespace, .interner = interner, .host_macros = host_macros });
-}
-
-/// `compileSourceWith` with every option the eval pipeline tests
-/// pass positionally.
-pub fn compileSourceFullWithMacrosSpanPersistentRegistry(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-    host_macros: ?*const expand_mod.HostMacroTable,
-    out_span: ?*?reader_mod.SrcSpan,
-    persistent_allocator: ?std.mem.Allocator,
-    registry: ?*vm.NamespaceRegistry,
-) CompileError!Compiled {
-    return compileSourceWith(allocator, source, .{
-        .namespace = namespace,
-        .interner = interner,
-        .host_macros = host_macros,
-        .out_span = out_span,
-        .persistent_allocator = persistent_allocator,
-        .registry = registry,
-    });
-}
-
 // =============================================================================
 // Internal lowering — destination-driven
 // =============================================================================

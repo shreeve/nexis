@@ -2474,10 +2474,9 @@ fn syntaxQuoteColl(b: Builder, scope: *GensymScope, items: []const *Form, compti
 
 // ---- Default macro table -------------------------------------
 
-/// Build the standard host-macro table for `nexis run`. Pass
-/// the result via `compileSourceFullWithMacros` (the CLI does
-/// this automatically). Caller owns the returned table and is
-/// responsible for `table.deinit(allocator)`.
+/// Build the standard host-macro table the runtime compiles with
+/// (`CompileOptions.host_macros`). The caller owns the table and
+/// calls `table.deinit(allocator)`.
 pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     var table: HostMacroTable = .{};
     errdefer table.deinit(allocator);

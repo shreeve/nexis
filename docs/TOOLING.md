@@ -60,7 +60,11 @@ required file, `require: no file my/app.nx on the load path`,
 begin with (ns my.app)` at the form that required it.
 
 A compile error is `nexis: PATH:LINE:COL: ErrorName` with the source
-line and a caret under the form (exit 4); a parse or reader error
+line and a caret under the form (exit 4); a macro expansion that
+failed adds what went wrong, at the innermost form that failed
+(`MacroExpansionFailure: macro m threw bad macro input`,
+`MacroExpansionFailure: let: the binding vector needs an even number
+of forms`); a parse or reader error
 the same with `parse error: ...` or `reader error: :kind detail`
 (exit 3). A runtime error that no `try` catches ends the program
 with exit 5 and this report on stderr:

@@ -1150,16 +1150,13 @@ test "integration: missing qualified ns is UnresolvedSymbol" {
     defer host_macros.deinit(testing.allocator);
     try testing.expectError(
         compile.CompileError.UnresolvedSymbol,
-        compile.compileSourceFullWithMacrosSpanPersistentRegistry(
-            arena.allocator(),
-            "missing.ns/foo",
-            registry.current,
-            interner,
-            &host_macros,
-            null,
-            v.runtime_arena.allocator(),
-            registry,
-        ),
+        compile.compileSourceWith(arena.allocator(), "missing.ns/foo", .{
+            .namespace = registry.current,
+            .interner = interner,
+            .host_macros = &host_macros,
+            .persistent_allocator = v.runtime_arena.allocator(),
+            .registry = registry,
+        }),
     );
 }
 
@@ -1743,13 +1740,7 @@ test "integration: catchable — KindMismatch BYPASSES translation when no handl
     const interner = v.ensureInterner();
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
-    const compiled = try compile.compileSourceFullWithMacros(
-        arena.allocator(),
-        "(+ 1 :hello)",
-        ns,
-        interner,
-        &host_macros,
-    );
+    const compiled = try compile.compileSourceWith(arena.allocator(), "(+ 1 :hello)", .{ .namespace = ns, .interner = interner, .host_macros = &host_macros });
     const routine = compiled.toRoutine("catchable-no-handler");
     v.frames.items[0].routine = &routine;
     v.frames.items[0].pc = 0;

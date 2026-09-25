@@ -1,0 +1,4 @@
+; A macro that throws: the report names the macro and what it threw,
+; at the call.
+(defmacro m [x] (throw (ex-info "bad macro input" {})))
+(m 1)

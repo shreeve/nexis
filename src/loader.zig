@@ -217,18 +217,21 @@ pub const Loader = struct {
         var last: Value = @import("value.zig").nilValue();
         for (forms) |form| {
             var span: ?reader_mod.SrcSpan = null;
+            var detail: ?[]const u8 = null;
             self.load_failed = false;
             const compiled = compile_mod.compileFormWith(options.allocator, form, .{
                 .namespace = self.registry.current,
                 .interner = self.interner,
                 .host_macros = self.host_macros,
                 .out_span = &span,
+                .out_detail = &detail,
+                .io = self.io,
                 .persistent_allocator = self.persistent_allocator,
                 .registry = self.registry,
                 .load_callback = self.callback(),
                 .declared = if (options.declare) &declared else null,
                 .source = info,
-            }) catch |err| return self.compileFailure(info, err, span);
+            }) catch |err| return self.compileFailure(info, err, span, detail);
             // A run that fails leaves its frame for the trace, and
             // the frame points at the routine.
             const routine = try options.allocator.create(vm_mod.Routine);
@@ -255,7 +258,7 @@ pub const Loader = struct {
         return if (err == error.OutOfMemory) error.OutOfMemory else error.RunFailed;
     }
 
-    fn compileFailure(self: *Loader, info: *const vm_mod.SourceInfo, err: anyerror, span: ?reader_mod.SrcSpan) EvalError {
+    fn compileFailure(self: *Loader, info: *const vm_mod.SourceInfo, err: anyerror, span: ?reader_mod.SrcSpan, detail: ?[]const u8) EvalError {
         switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ControlTransferred => return error.ControlTransferred,
@@ -272,7 +275,11 @@ pub const Loader = struct {
             };
             return error.Diagnosed;
         }
-        self.diagnose(.{ .source = info, .span = span, .label = "" }, "{s}", .{@errorName(err)}) catch return error.OutOfMemory;
+        const base: Diagnostic = .{ .source = info, .span = span, .label = "" };
+        if (detail) |d|
+            self.diagnose(base, "{s}: {s}", .{ @errorName(err), d }) catch return error.OutOfMemory
+        else
+            self.diagnose(base, "{s}", .{@errorName(err)}) catch return error.OutOfMemory;
         return error.Diagnosed;
     }
 
