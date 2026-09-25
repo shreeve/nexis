@@ -95,7 +95,7 @@ projected nexis direction vs Clojure. "Measured" column cites the
 | 9 | Keyword identity | Intern + identity | Intern + identity | **parity** | hash 2 ns (§3.1) | measured |
 | 10 | Transients | Mutation token | Owner-token (Option B wrapper) | **parity**; node-owner in-place edit is the open lever | ~parity with persistent (§3.3) | measured |
 | 11 | GC | Generational tracing (G1/ZGC) | Precise non-moving mark-sweep | **worse** short-term; addressable | — | implemented, acknowledged weakness |
-| 12 | Allocator | TLAB bump pointer | size-class pool (POOL.md) | **parity-to-edge vs TLAB** on hot paths | list cons **3.94×**, map assoc **1.80×** vs pre-pool (§3.2) | measured |
+| 12 | Allocator | TLAB bump pointer | the process allocator under the collected heap (`smp_allocator` in release builds) | **worse** on allocation-heavy paths; a size-class pool is the open lever (§5.12) | a size-class pool the bench carried built lists **3.94×** and maps **1.80×** faster than the general-purpose allocator (§3.2); the runtime never used it | measured (bench only) |
 | 13 | Dispatch / polymorphism | Inline-cached via JIT | 26-way switch per op | **worse** at warm steady state; inline caches absent | hashValue ~1–2 ns (§3.1); 2.9 ns per bytecode instruction, 20 ns per global fn call on M5 (§3.8) | measured (partial) |
 | 14 | Durable state | No stdlib primitive | emdb mmap, zero-copy | **orders of magnitude faster** | get-hot 1.04 μs (§3.6) | measured (partial) |
 | 15 | Codec / serialization | `.edn` / Nippy | Binary LEB128/ZigZag | **2–5× size, 5–20× speed** vs `.edn` | encode 18 ns/entry, decode 124 ns/entry (§3.5) | measured (partial) |
@@ -123,11 +123,11 @@ cold-cache measurement is a follow-up. See §3.4 footnote.
 | OS | macOS |
 | Optimize | ReleaseFast |
 | Zig | 0.16.0 |
-| Allocator | `PoolAllocator` (size-class pool, `docs/POOL.md`) — default |
+| Allocator | a size-class pool under the benchmark heaps (the runtime itself runs on the process allocator; the pool is not in the tree) |
 | Harness | `src/bench.zig` (criterion-style, 30 samples × ≥50 ms per measurement) |
 | Baseline run date | 2026-04-19 |
 | Baseline numbers | Inline in §3.1–§3.6 below |
-| Local artifacts (`.gitignore`d) | `bench/baseline.json` (pool default), `bench/baseline-std.json` (A/B), `bench/baseline-pool.json` (A/B) |
+| Local artifacts (`.gitignore`d) | `bench/*.json` |
 
 **On the JSON files.** `bench/*.json` are **local run artifacts,
 not committed**. The numbers of record live inline in §3.1–§3.7.
@@ -147,12 +147,7 @@ effect; the §3.2 / §3.3 tables are per-invocation numbers.
 
 Reproducing:
 
-    # default (pool)
-    zig build bench -- --out bench/baseline.json --note "your-hw"
-
-    # A/B vs pre-pool allocator
-    zig build bench -- --allocator std \
-        --out bench/baseline-std.json --note "std-ab"
+    zig build bench -Doptimize=ReleaseFast -- --out bench/run.json --note "your-hw"
 
 **Clojure-side same-machine comparison is NOT in this baseline.**
 That's a follow-up commit using `criterium` per BENCH.md §5. The
@@ -194,11 +189,13 @@ zero-cost claim.
 
 ---
 
-### 3.2 Persistent collection construction — **A/B vs pool allocator**
+### 3.2 Persistent collection construction — general-purpose allocator vs a size-class pool
 
 N-fold conj/assoc from empty; keyword keys throughout. **Two
-columns**: `std` = Zig debug allocator (pre-lift reference);
-`pool` = size-class pool (current default, POOL.md).
+columns**: `std` = the general-purpose allocator; `pool` = a
+size-class pool the bench carried (16 classes from 16 B to 4 KiB,
+LIFO free lists, slab bump pointer). The runtime's heap never used
+the pool, and it is not in the tree (§5.12).
 
 | Op | N | std median | pool median | **Speedup** | pool per-op |
 |---|---:|---:|---:|---:|---:|
@@ -467,8 +464,8 @@ post-JIT. Another ~3–5 ns to squeeze via monomorphized dispatch.
 
 ### 4.3 Allocator A/B (std vs pool)
 
-The realized wins live here. `zig build bench -- --allocator std`
-against the default pool gives the following A/B (§3.2):
+The general-purpose allocator against the size-class pool of §3.2,
+which the runtime's heap never used and which is not in the tree:
 
 | Measurement | Before | After (pool) | Lift |
 |---|---:|---:|---:|
@@ -685,31 +682,27 @@ steady-state allocation-heavy workloads.
 safe point once the heap has allocated its threshold (`docs/GC.md`
 §1, §7); acknowledged weakness.
 
-### 5.12 Allocator — **measured win**
+### 5.12 Allocator — the open lever
 
 **Clojure (JVM)**: TLAB bump pointer. Young-gen allocation is
 2–5 ns.
 
-**nexis**: `PoolAllocator` (size-class pool, `docs/POOL.md`).
-16 size classes from 16 B to 4 KB, free-list LIFO per class,
-slab-backed bump pointer, large + high-alignment requests
-delegated to backing. Single-threaded by design (PLAN §16.1),
-no locking.
-
-**Measured lift** (§3.2, §3.3, §3.5, §4.3):
+**nexis**: the collected heap allocates every block from the
+process allocator (`std.heap.smp_allocator` in release builds). A
+size-class pool (16 size classes from 16 B to 4 KB, free-list LIFO
+per class, slab-backed bump pointer, single-threaded) that the bench
+carried, and that was never wired under the VM's heap, measured
+against the general-purpose allocator (§3.2, §3.3, §3.5, §4.3):
 - list cons @ N=4096: 17.6 ns → 4.5 ns (**3.94×**)
 - vector conj @ N=4096: 51.9 ns → 20.1 ns (**2.59×**)
 - map assoc @ N=4096: 151 ns → 84 ns (**1.80×**)
 - set conj @ N=4096: 143 ns → 78 ns (**1.84×**)
 - codec decode map entry: ~103 ns → ~85 ns (**1.14×**)
 
-**Retained capacity**: slabs are held until `pool.deinit()` (no
-empty-slab reclamation). Documented at POOL.md §8 as a
-deliberate tradeoff, not a leak. Per-slab refcounting + empty-slab release would serve long-lived REPL sessions.
-
-**Status**: default for `zig build bench` and for any code that
-constructs a `Heap` from `pool.allocator()`; `--allocator std`
-selects the general-purpose allocator for A/B.
+**Status**: not in the tree. An allocator of that shape under
+`VM.heap`, with empty-slab reclamation so a long REPL session gives
+memory back, is the lever; it lands with a before/after from
+`zig build bench` on the runtime's own heap.
 
 ### 5.13 Dispatch / polymorphism — medium-term leverage
 
@@ -956,9 +949,10 @@ numbers, not same-machine head-to-head runs.
    Node-owner in-place-edit transient is the path to
    Clojure-class transient speedups; absent.
 5. **Allocator is the single largest leverage point** for
-   construction-heavy workloads: the size-class pool lifts list
-   cons 3.94× and map assoc 1.80× over the general-purpose
-   allocator (§4.3); map assoc is ~45% allocator-bound.
+   construction-heavy workloads: a size-class pool built lists
+   3.94× and maps 1.80× faster than the general-purpose allocator
+   in the bench (§4.3); the runtime does not have one yet. Map
+   assoc is ~45% allocator-bound.
 6. **emdb durable `get` at ~1 μs end-to-end** is dramatically
    faster than any Clojure-ecosystem durable-state alternative
    the author is aware of (Datomic deref, Redis round-trip, SQL
@@ -1016,11 +1010,11 @@ iterations**.
 ## 11. Measurement provenance
 
 - §3.1–§3.6 numbers come from `src/bench.zig` + `bench/main.zig`
-  (`zig build bench`, ReleaseFast, Apple M1, pool allocator
-  default, 30 samples × ≥50 ms). `bench/*.json` run artifacts are
+  (`zig build bench`, ReleaseFast, Apple M1, a size-class pool
+  under the benchmark heaps, 30 samples × ≥50 ms). `bench/*.json` run artifacts are
   `.gitignore`d; the curated numbers live inline here.
-- §3.2 / §3.3 / §3.5 A/B rows compare `--allocator std` against the
-  default pool under the per-invocation heap methodology (§3).
+- §3.2 / §3.3 / §3.5 A/B rows compare the general-purpose allocator
+  with that pool under the per-invocation heap methodology (§3).
 - §3.7 Nextomic numbers come from the scenarios in
   `bench/nextomic.zig` (`zig build bench -Doptimize=ReleaseFast --
   --filter nextomic`) on an Apple M5.

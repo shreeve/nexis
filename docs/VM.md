@@ -1154,7 +1154,6 @@ corrupt input.
 - **`src/codec.zig`, `src/db.zig`, `src/nextomic/*`**: reached
   only through natives; the VM tracks open connections so
   `VM.deinit` can close them.
-- **`src/pool.zig`**: not used by the VM.
 
 ---
 

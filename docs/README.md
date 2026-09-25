@@ -27,7 +27,6 @@ wins and the code is wrong.
 | `src/gc.zig` | [`GC.md`](GC.md) | Precise mark-sweep tracing GC |
 | `src/codec.zig` | [`CODEC.md`](CODEC.md) | Wire-format serialization |
 | `src/db.zig` | [`DB.md`](DB.md) | emdb-backed durable storage integration |
-| `src/pool.zig` | [`POOL.md`](POOL.md) | Small-object pool allocator |
 | `src/bench.zig` | [`BENCH.md`](BENCH.md) | Benchmark harness |
 | `src/reader.zig` | [`FORMS.md`](FORMS.md) | Sexp → Form normalizer + pretty-printer + canonical Form schema |
 | `src/vm.zig` | [`VM.md`](VM.md) | Bytecode VM: ISA + execution contracts, frames, handlers, natives, namespaces |

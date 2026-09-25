@@ -52,7 +52,6 @@ const codec_mod = nx.codec;
 const dispatch = nx.dispatch;
 const db = nx.db;
 const emdb = nx.emdb;
-const pool_mod = nx.pool;
 const vm_mod = nx.vm;
 const compile_mod = nx.compile;
 
@@ -503,7 +502,6 @@ pub fn main(init: std.process.Init) !u8 {
     var out_path: ?[]const u8 = null;
     var note: []const u8 = "";
     var filter: ?[]const u8 = null;
-    var allocator_choice: []const u8 = "pool"; // POOL.md §9 default
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const a = args[ai];
@@ -516,11 +514,8 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, a, "--filter") and ai + 1 < args.len) {
             ai += 1;
             filter = args[ai];
-        } else if (std.mem.eql(u8, a, "--allocator") and ai + 1 < args.len) {
-            ai += 1;
-            allocator_choice = args[ai];
         } else {
-            std.debug.print("nexis-bench: unknown argument '{s}'\nusage: nexis-bench [--out FILE] [--note TEXT] [--filter CATEGORY,...] [--allocator pool|std]\n", .{a});
+            std.debug.print("nexis-bench: unknown argument '{s}'\nusage: nexis-bench [--out FILE] [--note TEXT] [--filter CATEGORY,...]\n", .{a});
             return 2;
         }
     }
@@ -537,30 +532,9 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
     }
-    if (!std.mem.eql(u8, allocator_choice, "pool") and !std.mem.eql(u8, allocator_choice, "std")) {
-        std.debug.print("nexis-bench: --allocator is pool or std, not '{s}'\n", .{allocator_choice});
-        return 2;
-    }
-
-    // Backing allocator for the size-class pool itself. Must be
-    // a real general-purpose allocator — `page_allocator` is NOT
-    // suitable here because it rounds every allocation up to a
-    // page, which under the bench workload OOMs quickly.
-    const backing = init.gpa;
-
-    // Heap-backing allocator under measurement. POOL.md §9:
-    // pool is the default; --allocator std selects the process
-    // GPA directly (matches commit 7e5bb1a's baseline).
-    var pool: pool_mod.PoolAllocator = undefined;
-    var heap_backing: std.mem.Allocator = undefined;
-    const use_pool = std.mem.eql(u8, allocator_choice, "pool");
-    if (use_pool) {
-        pool = pool_mod.PoolAllocator.init(backing);
-        heap_backing = pool.allocator();
-    } else {
-        heap_backing = init.gpa;
-    }
-    defer if (use_pool) pool.deinit();
+    // The runtime's heap allocates from the process allocator, so the
+    // benchmark heaps do too.
+    const heap_backing = init.gpa;
 
     // ---- Runner ----
     var runner = try Runner.init(alloc, .{});
@@ -569,9 +543,6 @@ pub fn main(init: std.process.Init) !u8 {
     // ---- Shared interner + heap for non-DB benches ----
     var interner = Interner.init(alloc);
     defer interner.deinit();
-    // Heap is what the pool allocator actually backs for the A/B:
-    // the vast majority of allocations under measurement come from
-    // `heap.alloc()`.
     var heap = Heap.init(heap_backing);
     defer heap.deinit();
 
@@ -780,7 +751,6 @@ pub fn main(init: std.process.Init) !u8 {
     {
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
-        try aw.writer.print("\n(allocator: {s})\n", .{allocator_choice});
         try runner.writeTable(&aw.writer);
         try std.Io.File.stdout().writeStreamingAll(io, aw.written());
     }
@@ -788,15 +758,13 @@ pub fn main(init: std.process.Init) !u8 {
     if (out_path) |p| {
         var jw: std.Io.Writer.Allocating = .init(alloc);
         defer jw.deinit();
-        var note_buf: [256]u8 = undefined;
-        const decorated_note = try std.fmt.bufPrint(&note_buf, "{s} | allocator={s}", .{ note, allocator_choice });
         try runner.writeJson(&jw.writer, .{
             .cpu = builtin_cpu_model_str,
             .os = @tagName(@import("builtin").os.tag),
             .ram = "",
             .zig_version = @import("builtin").zig_version_string,
             .optimize_mode = @tagName(@import("builtin").mode),
-            .note = decorated_note,
+            .note = note,
         });
         var file = try std.Io.Dir.cwd().createFile(io, p, .{});
         defer file.close(io);
