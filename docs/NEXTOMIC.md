@@ -461,8 +461,15 @@ Estimates come from `treeStat` and per-attribute counts kept in
 
 **Sources.** A query without `:in` reads `[$]`. `:in` binds data
 sources, `$` or any `$name` (`:in $db ?x`), positional like every
-input: each takes a db value and may name another connection or a time
-view of the same one. `:in` may name no source at all, `(d/q '[:find
+input: each takes a db value, which may name another connection or a
+time view of the same one, or a vector, list or set of tuples. A
+pattern over a collection matches its tuples by position (`[e a v tx
+added]`, a tuple shorter than a position the pattern uses matching
+nothing), compares constants as written (no idents, no lookup refs,
+which are `:nextomic/query-syntax` there) and joins like any pattern,
+rule bodies included; a `missing?`, `get-else`, `get-some`, `fulltext`
+or pull expression on a collection is `:nextomic/query-syntax`, and an
+element that is not a tuple `:nextomic/value-type`. `:in` may name no source at all, `(d/q '[:find
 ?x :in [?x ...] :where [(odd? ?x)]] [1 2 3])`: the query then runs over
 its inputs alone, and a pattern, a `missing?`, `get-else`, `get-some`
 or `fulltext` call, or a pull expression in it is
@@ -478,8 +485,8 @@ transaction for the whole query; attributes, idents, lookup refs and
 keyword values resolve per source (an ident is an entity of the store
 that holds it). An input in an entity role resolves in the source of the
 first pattern that gives it that role. A clause naming an undeclared
-source is `:nextomic/query-syntax`; a source input that is not a db value
-is `:kind-mismatch`.
+source is `:nextomic/query-syntax`; a source input that is neither a db
+value nor a collection is `:kind-mismatch`.
 
 **Execute** over one read transaction per source for the whole query
 (one snapshot for every cursor, emdb INV-T02). Scans drive `openCursorForTree` +
@@ -591,7 +598,7 @@ sub-plans with the same output variables.
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
 | `(d/datoms db :eavt e a v tx added)` (index, its components in index order, then `tx` as a t or a transaction entity id and `added` as a boolean; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
 | `(d/index-range db attr start end)` | the AVET datoms of an indexed or unique attribute with `start <= v < end` in value order; a nil bound is open; another attribute is `:nextomic/tx-data` naming it, a bound of the wrong type `:nextomic/value-type`. The cursor seeks to `start` and stops at `end`; the range test compares decoded values, so long strings and byte arrays (§2.2) are placed by value: a bound of 64 bytes or more seeks at its 64-byte prefix class, whose members the index may order by hash, and the class is scanned whole |
-| `(d/q query & inputs)` / `(d/q {:query query :args [inputs...]})` | §5; the arg-map is the same call, and a key other than `:query` and `:args` is `:nextomic/query-syntax`; `:find` with `.`, `[...]`, `[[...]]`, aggregates (built-in and custom) and `(pull ?e pattern)` or `(pull $src ?e ?pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] % $2` with inputs positional to `:in` (a source takes a db value, and a query may have none; `[$2 ?e :a ?v]` and `($2 rule ?x)` read it), `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
+| `(d/q query & inputs)` / `(d/q {:query query :args [inputs...]})` | §5; the arg-map is the same call, and a key other than `:query` and `:args` is `:nextomic/query-syntax`; `:find` with `.`, `[...]`, `[[...]]`, aggregates (built-in and custom) and `(pull ?e pattern)` or `(pull $src ?e ?pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] % $2` with inputs positional to `:in` (a source takes a db value or a collection of tuples, and a query may have none; `[$2 ?e :a ?v]` and `($2 rule ?x)` read it), `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
 | `(d/explain query & inputs)` / `(d/explain {:query query :args [...]})` | the plan `q` would run, as an aligned table: one numbered line per step with its description (index, estimate, tree size, source when not `$`, bound variables marked `!`), the join a scan will run (`nested`, one seek per input row; `hash`, one scan of the constant prefix hash-joined on the shared variables; `fixpoint` for a recursive rule) and the estimated rows after the step; sub-plans indent under their step and end with `rows~` |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4); `t` is a transaction number or a transaction's entity id |
 | `(d/excise! conn e)` / `(d/excise! conn e attr)` | §4 "Excision"; returns the recording transaction's report plus `:excised [e]` and `:removed`, the history rows that went |

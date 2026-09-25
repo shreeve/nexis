@@ -80,10 +80,17 @@ pub const CallHook = struct {
     root: ?*const fn (ctx: *anyopaque, v: Value) anyerror!void = null,
 };
 
+/// A data source: a db value's read, or a collection of tuples whose
+/// elements a pattern matches by position (`[e a v tx added]`).
+pub const Source = union(enum) {
+    db: *Read,
+    coll: []const []const Cell,
+};
+
 pub const Exec = struct {
     arena: Allocator,
-    /// One `Read` per data source, `$` first.
-    reads: []const *Read,
+    /// The data sources, `$` first.
+    sources: []const Source,
     heap: *Heap,
     interner: *Interner,
     hook: ?CallHook,
@@ -105,6 +112,7 @@ pub const Exec = struct {
     fn step(self: *Exec, s: *const Step, rel: Relation) anyerror!Relation {
         return switch (s.*) {
             .scan => |*sc| self.execScan(sc, rel),
+            .match => |*m| self.execMatch(m, rel),
             .pred => |*p| self.execPred(p, rel),
             .bind => |*b| self.execBind(b, rel),
             .not => |*n| self.execNot(n, rel),
@@ -116,9 +124,12 @@ pub const Exec = struct {
 
     // ── datoms to cells ───────────────────────────────────────────
 
-    /// The `Read` of a source (null: `$`).
-    fn readOf(self: *Exec, src: ?ir.Src) *Read {
-        return self.reads[src orelse 0];
+    /// The `Read` of a source (null: `$`); a collection has none.
+    fn readOf(self: *Exec, src: ?ir.Src) error{QuerySyntax}!*Read {
+        return switch (self.sources[src orelse 0]) {
+            .db => |r| r,
+            .coll => self.syntax("this clause reads a db value, and its source is a collection"),
+        };
     }
 
     /// The cell of a datom value read from `read`: ids as `int`,
@@ -203,6 +214,39 @@ pub const Exec = struct {
         return if (s.dedup) out.dedup() else out;
     }
 
+    /// A pattern over a collection: the tuples whose elements equal the
+    /// constants and agree on a repeated variable, joined with `rel` on
+    /// the bound variables. A tuple shorter than a position the pattern
+    /// uses matches nothing.
+    fn execMatch(self: *Exec, m: *const plan_mod.Match, rel: Relation) anyerror!Relation {
+        var pvars: std.ArrayList(Var) = .empty;
+        for (m.slots) |slot| switch (slot) {
+            .bound, .fresh => |v| try ir.addVar(self.arena, &pvars, v),
+            else => {},
+        };
+        var matched = try Relation.init(self.arena, pvars.items);
+        const cells = try self.arena.alloc(Cell, pvars.items.len);
+        tuples: for (m.rows) |t| {
+            for (m.slots, 0..) |slot, pos| {
+                if (slot == .blank) continue;
+                if (pos >= t.len) continue :tuples;
+                switch (slot) {
+                    .blank => {},
+                    .constant => |c| if (!t[pos].eql(c.cell)) continue :tuples,
+                    .same => |v| if (!t[pos].eql(t[slotPos(m.slots, v)])) continue :tuples,
+                    .bound, .fresh => |v| {
+                        const first = slotPos(m.slots, v);
+                        if (first != pos) {
+                            if (!t[pos].eql(t[first])) continue :tuples;
+                        } else cells[std.mem.indexOfScalar(Var, pvars.items, v).?] = t[pos];
+                    },
+                }
+            }
+            try matched.append(cells);
+        }
+        return rel.hashJoin(&(try matched.dedup()));
+    }
+
     /// The first position whose slot names `v`.
     fn slotPos(slots: [5]plan_mod.Slot, v: Var) usize {
         for (slots, 0..) |slot, i| switch (slot) {
@@ -228,7 +272,7 @@ pub const Exec = struct {
     /// VAET scan whose value cell is not an entity id becomes a scan
     /// of every datom in AEVT, filtered on the value.
     fn scanInto(self: *Exec, s: *const Scan, planned: key.Index, rel: ?*const Relation, row: []const Cell, srcs: []const Src, out: *Relation) anyerror!void {
-        const read = self.reads[s.src];
+        const read = self.sources[s.src].db;
         const slots = s.slots();
         var comps: key.Components = .{};
         var index = planned;
@@ -377,7 +421,7 @@ pub const Exec = struct {
     /// re-tokenises the attribute's values in that view. The attribute
     /// must carry `:db/fulltext` at the view's basis.
     fn fulltextHits(self: *Exec, src: ?ir.Src, attr: Cell, needle: Cell) anyerror![]const []const Cell {
-        const read = self.readOf(src);
+        const read = try self.readOf(src);
         if (needle != .str) return error.ValueType;
         const at = try self.attrNamed(read, attr);
         const a = at.id;
@@ -435,7 +479,7 @@ pub const Exec = struct {
     /// The first value of attribute `attr` (a keyword cell) on entity
     /// `e` in source `src`, or null.
     fn firstValue(self: *Exec, src: ?ir.Src, e: Cell, attr: Cell) anyerror!?Cell {
-        const read = self.readOf(src);
+        const read = try self.readOf(src);
         const at = try self.attrNamed(read, attr);
         const eid = e.asEid() orelse return null;
         var it = try read.scan(self.arena, .eavt, .{ .e = eid, .a = at.id });
@@ -448,7 +492,7 @@ pub const Exec = struct {
     /// default binds nothing, so both are refused.
     fn getElse(self: *Exec, src: ?ir.Src, e: Cell, attr: Cell, default: Cell) anyerror!Cell {
         if (default == .nil) return self.syntax("get-else takes a default that is not nil");
-        if ((try self.attrNamed(self.readOf(src), attr)).many()) return self.syntax("get-else takes a cardinality-one attribute");
+        if ((try self.attrNamed(try self.readOf(src), attr)).many()) return self.syntax("get-else takes a cardinality-one attribute");
         return (try self.firstValue(src, e, attr)) orelse default;
     }
 
@@ -730,7 +774,7 @@ pub const Exec = struct {
             rel.rowInto(i, row);
             for (cols.items) |c| {
                 if (row[c] != .keyword and row[c] != .vm) continue;
-                const e = (try self.inputEntity(self.reads[roles[rel.vars[c]].src], row[c])) orelse continue :rows;
+                const e = (try self.inputEntity(self.sources[roles[rel.vars[c]].src].db, row[c])) orelse continue :rows;
                 row[c] = .{ .int = @intCast(e) };
             }
             try out.append(row);
@@ -743,7 +787,11 @@ pub const Exec = struct {
     fn inputRoles(self: *Exec, clauses: []const ir.Clause, roles: []InputRole) anyerror!void {
         for (clauses) |c| switch (c) {
             .pattern => |p| {
-                const read = self.readOf(p.src);
+                // A collection's tuples are taken as they are.
+                const read = switch (self.sources[p.src orelse 0]) {
+                    .db => |r| r,
+                    .coll => continue,
+                };
                 if (p.e.asVar()) |v| markEntity(&roles[v], p.src orelse 0);
                 const v = p.v.asVar() orelse continue;
                 if (p.a != .constant or p.a.constant != .cell or p.a.constant.cell != .keyword) continue;
@@ -1046,7 +1094,7 @@ pub const Exec = struct {
                 .value => |v| v,
                 .input => |v| inputOf(query, self.args, v),
             };
-            p.* = try pull_mod.Prepared.prepare(self.arena, self.readOf(f.pull.src), self.heap, self.interner, pattern, diag);
+            p.* = try pull_mod.Prepared.prepare(self.arena, try self.readOf(f.pull.src), self.heap, self.interner, pattern, diag);
         }
         const out = try self.arena.alloc([]const Cell, rows.len);
         for (rows, out) |row, *o| {

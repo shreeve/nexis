@@ -114,6 +114,21 @@
 (println (t/caught (d/q '[:find ?e :in $2 $ :where [?e :person/age 1]] db db)))
 (println (t/caught (d/q '[:find ?e :where [?e :person/age 1]])))
 
+; --- collections of tuples as data sources ---------------------------------
+
+(def edges [[1 :to 2] [2 :to 3] [3 :to 1] [3 :to 4]])
+(println (rows (d/q '[:find ?a ?b :in $ :where [?a :to ?b]] edges)))
+(println (d/q '[:find ?c :in $ :where [?a :to ?b] [?b :to ?c] [(= ?a 1)]] edges))
+(println (rows (d/q '[:find ?n ?w :in $ $words :where [?x :person/age ?a] [?x :person/name ?n] [$words ?a ?w]]
+                    db [[30 "thirty"] [25 "twenty-five"] [26 "twenty-six"]])))
+(println (rows (d/q '[:find ?x :in $ :where [?x ?x]] [[1 1] [1 2] [3 3] [4]])))
+(println (count (d/q '[:find ?a ?b :in $ % :where (reach ?a ?b)] edges
+                     '[[(reach ?a ?b) [?a :to ?b]] [(reach ?a ?b) [?a :to ?m] (reach ?m ?b)]])))
+(println (t/caught (d/q '[:find ?x :in $ :where [?x :to [:person/email "a@x"]]] edges)))
+(println (t/caught (d/q '[:find ?x :in $ :where [?x :to _] [(missing? $ ?x :to)]] edges)))
+(println (t/caught (d/q '[:find (pull ?x [*]) :in $ :where [?x :to _]] edges)))
+(println (t/caught (d/q '[:find ?x :in $ :where [?x :to _]] [1 2])))
+
 ; --- predicates: built-in, defn'd, core, alias-qualified ------------------
 
 (defn adult? [age] (>= age 30))

@@ -4,9 +4,10 @@
 //! (`query/plan.zig`) resolves it against one `Read` and orders the
 //! steps; exec (`query/exec.zig`) runs the plan and materialises the
 //! result into the VM heap; rules (`query/rules.zig`) expand rule
-//! calls. `q` is the one-call entry point: it opens one `Read` per
-//! data source, runs the whole pipeline in one arena, closes the
-//! `Read`s on every path and returns the result value. `explain`
+//! calls. `q` is the one-call entry point: it opens one `Read` per db
+//! source (a collection source is its tuples), runs the whole pipeline
+//! in one arena, closes the `Read`s on every path and returns the
+//! result value. `explain`
 //! prints the plan instead.
 
 const std = @import("std");
@@ -14,6 +15,7 @@ const value = @import("../value.zig");
 const heap_mod = @import("../heap.zig");
 const intern_mod = @import("../intern.zig");
 const db_mod = @import("db.zig");
+const marshal = @import("marshal.zig");
 
 pub const ir = @import("query/ir.zig");
 pub const parse = @import("query/parse.zig");
@@ -36,6 +38,7 @@ pub const Roots = parse.Roots;
 pub const Plan = plan.Plan;
 pub const CallHook = exec.CallHook;
 pub const Exec = exec.Exec;
+pub const Source = exec.Source;
 
 pub const Options = struct {
     hook: ?CallHook = null,
@@ -79,36 +82,58 @@ fn parseAll(gpa: Allocator, interner: *Interner, query: Value, args: []const Val
     return out;
 }
 
-/// One `Read` per data source, `$` first, open together and closed
-/// together.
-const Reads = struct {
-    items: []*db_mod.Read,
+/// The data sources, `$` first: a `Read` per db value, open together
+/// and closed together, and the tuples of each collection.
+const Sources = struct {
+    items: []exec.Source,
 
     /// `db`, when given, is `$`; every other source comes from its
-    /// input through `options.db_of`.
-    fn open(arena: Allocator, db: ?DbValue, query: *const Ir, args: []const Value, options: Options, diag: *Diag) !Reads {
-        const items = try arena.alloc(*db_mod.Read, query.sources.len);
-        var opened: usize = 0;
-        errdefer for (items[0..opened]) |r| r.close();
+    /// input: a vector, list or set of tuples is a collection, anything
+    /// else a db value through `options.db_of`.
+    fn open(arena: Allocator, db: ?DbValue, query: *const Ir, args: []const Value, options: Options, diag: *Diag) !Sources {
+        const items = try arena.alloc(exec.Source, query.sources.len);
+        var out: Sources = .{ .items = items[0..0] };
+        errdefer out.close();
         for (query.in, args) |b, a| {
             if (b != .src) continue;
-            const d: DbValue = if (b.src == 0 and db != null) db.? else blk: {
+            items[b.src] = if (b.src == 0 and db != null) .{ .db = try openRead(arena, db.?) } else if (try tuples(arena, a)) |rows| .{ .coll = rows } else blk: {
                 const db_of = options.db_of orelse {
-                    diag.* = .{ .message = "a data source after $ takes a db value" };
+                    diag.* = .{ .message = "a data source takes a db value or a collection of tuples" };
                     return error.QuerySyntax;
                 };
-                break :blk try db_of(a);
+                break :blk .{ .db = try openRead(arena, try db_of(a)) };
             };
-            const r = try arena.create(db_mod.Read);
-            r.* = try d.beginRead();
-            items[b.src] = r;
-            opened += 1;
+            out.items = items[0 .. out.items.len + 1];
         }
-        return .{ .items = items };
+        return out;
     }
 
-    fn close(self: Reads) void {
-        for (self.items) |r| r.close();
+    fn openRead(arena: Allocator, d: DbValue) !*db_mod.Read {
+        const r = try arena.create(db_mod.Read);
+        r.* = try d.beginRead();
+        return r;
+    }
+
+    /// The tuples of a collection source as cells; null when `v` is not
+    /// a vector, list or set, `ValueType` when an element is not a
+    /// tuple.
+    fn tuples(arena: Allocator, v: Value) !?[]const []const ir.Cell {
+        const items = (try marshal.collection(arena, v)) orelse return null;
+        const rows = try arena.alloc([]const ir.Cell, items.len);
+        for (items, rows) |t, *row| {
+            const elems = (try marshal.sequence(arena, t)) orelse return error.ValueType;
+            const cells = try arena.alloc(ir.Cell, elems.len);
+            for (elems, cells) |x, *c| c.* = ir.Cell.fromValue(x);
+            row.* = cells;
+        }
+        return rows;
+    }
+
+    fn close(self: Sources) void {
+        for (self.items) |src| switch (src) {
+            .db => |r| r.close(),
+            .coll => {},
+        };
     }
 };
 
@@ -123,12 +148,12 @@ pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: ?Db
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const reads = try Reads.open(arena, db, parsed.query, args, options, diag);
-    defer reads.close();
+    const sources = try Sources.open(arena, db, parsed.query, args, options, diag);
+    defer sources.close();
 
-    var ctx = try plan.Ctx.init(arena, reads.items, interner, parsed.query, parsed.rules, diag);
+    var ctx = try plan.Ctx.init(arena, sources.items, interner, parsed.query, parsed.rules, diag);
     const p = try plan.plan(&ctx, parsed.query);
-    var ex = exec.Exec{ .arena = arena, .reads = reads.items, .heap = heap, .interner = interner, .hook = options.hook, .diag = diag, .args = args };
+    var ex = exec.Exec{ .arena = arena, .sources = sources.items, .heap = heap, .interner = interner, .hook = options.hook, .diag = diag, .args = args };
     const input = try ex.inputRelation(parsed.query, args);
     const rel = try ex.runPlan(p, input);
     const rows = try ex.findRows(parsed.query, rel);
@@ -144,10 +169,10 @@ pub fn explain(gpa: Allocator, interner: *Interner, query: Value, db: ?DbValue, 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const reads = try Reads.open(arena, db, parsed.query, args, options, diag);
-    defer reads.close();
+    const sources = try Sources.open(arena, db, parsed.query, args, options, diag);
+    defer sources.close();
 
-    var ctx = try plan.Ctx.init(arena, reads.items, interner, parsed.query, parsed.rules, diag);
+    var ctx = try plan.Ctx.init(arena, sources.items, interner, parsed.query, parsed.rules, diag);
     const p = try plan.plan(&ctx, parsed.query);
     try plan.explain(p, &ctx, w);
 }

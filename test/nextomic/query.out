@@ -33,6 +33,15 @@ Cy
 {:error :nextomic/query-syntax, :message pull reads a data source, and :in names none}
 {:error :nextomic/query-syntax, :message $ names the first data source; declare it first}
 {:error :nextomic/query-syntax, :message wrong number of inputs}
+([1 2] [2 3] [3 1] [3 4])
+#{[3]}
+([Ann thirty] [Bob twenty-six] [Di thirty])
+([1] [3])
+12
+{:error :nextomic/query-syntax, :message a lookup ref needs a db source; this source is a collection, :clause 0}
+{:error :nextomic/query-syntax, :message this clause reads a db value, and its source is a collection, :clause 1}
+{:error :nextomic/query-syntax, :message this clause reads a db value, and its source is a collection}
+:nextomic/value-type
 ([Ann] [Di] [Flo])
 ([Bob] [Edward])
 ([Di] [Flo])

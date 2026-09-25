@@ -126,9 +126,11 @@ fn runEngineDiag(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args:
     }
     const reads = try openReads(arena, dbv, parsed, args);
     defer for (reads) |r| r.close();
-    var ctx = try query.plan.Ctx.init(arena, reads, fx.interner(), parsed, rules, diag);
+    const sources = try arena.alloc(query.Source, reads.len);
+    for (reads, sources) |r, *s| s.* = .{ .db = r };
+    var ctx = try query.plan.Ctx.init(arena, sources, fx.interner(), parsed, rules, diag);
     const p = try query.plan.plan(&ctx, parsed);
-    var ex = query.Exec{ .arena = arena, .reads = reads, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook(), .diag = diag };
+    var ex = query.Exec{ .arena = arena, .sources = sources, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook(), .diag = diag };
     const input = try ex.inputRelation(parsed, args);
     const rel = try ex.runPlan(p, input);
     return ex.findRows(parsed, rel);

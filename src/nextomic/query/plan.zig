@@ -42,6 +42,7 @@ const relation = @import("../relation.zig");
 const ir = @import("ir.zig");
 const rules_mod = @import("rules.zig");
 const parse_mod = @import("parse.zig");
+const exec_mod = @import("exec.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -127,6 +128,16 @@ pub const Scan = struct {
     }
 };
 
+/// A data pattern over a collection source: its tuples filtered and
+/// joined by position, with no index and no resolution (constants are
+/// compared as written).
+pub const Match = struct {
+    src: ir.Src,
+    slots: [5]Slot,
+    fresh: []const Var,
+    rows: []const []const Cell,
+};
+
 pub const Pred = struct {
     call: ir.Call,
 };
@@ -166,6 +177,7 @@ pub const SourceSlot = struct {
 
 pub const Step = union(enum) {
     scan: Scan,
+    match: Match,
     pred: Pred,
     bind: Bind,
     not: Not,
@@ -196,9 +208,10 @@ pub const Plan = struct {
 };
 
 /// One data source at plan time: its `Read` and what has been
-/// resolved against it.
+/// resolved against it, or the tuples of a collection.
 pub const DbSource = struct {
-    read: *Read,
+    read: ?*Read,
+    coll: ?[]const []const Cell = null,
     /// Attributes resolved so far, by VM keyword id.
     attr_cache: std.AutoHashMapUnmanaged(u32, ?Attr) = .empty,
     /// Entries of the AEVT tree this view reads, once asked.
@@ -210,8 +223,11 @@ pub const DbSource = struct {
 /// every sub-plan) and the rule set.
 pub const Ctx = struct {
     arena: Allocator,
-    /// The selected source's `Read`; `select` switches it.
+    /// The selected source's `Read`; `select` switches it. Undefined
+    /// while a collection is selected (`coll`).
     read: *Read,
+    /// The selected source's tuples when it is a collection.
+    coll: ?[]const []const Cell = null,
     interner: *Interner,
     vars: std.ArrayList(ir.VarInfo),
     rules: *const RuleSet,
@@ -236,14 +252,19 @@ pub const Ctx = struct {
     /// Where a syntax or attribute error leaves its reason.
     diag: *Diag,
 
-    /// `reads` has one `Read` per query source, `$` first.
-    pub fn init(arena: Allocator, reads: []const *Read, interner: *Interner, query: *const Ir, rules: *const RuleSet, diag: *Diag) !Ctx {
-        std.debug.assert(reads.len == query.sources.len);
+    /// `sources` has one entry per query source, `$` first.
+    pub fn init(arena: Allocator, sources: []const exec_mod.Source, interner: *Interner, query: *const Ir, rules: *const RuleSet, diag: *Diag) !Ctx {
+        std.debug.assert(sources.len == query.sources.len);
         var vars: std.ArrayList(ir.VarInfo) = .empty;
         try vars.appendSlice(arena, query.vars);
-        const dbs = try arena.alloc(DbSource, reads.len);
-        for (reads, dbs) |r, *d| d.* = .{ .read = r };
-        return .{ .arena = arena, .read = if (reads.len > 0) reads[0] else undefined, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
+        const dbs = try arena.alloc(DbSource, sources.len);
+        for (sources, dbs) |src, *d| d.* = switch (src) {
+            .db => |r| .{ .read = r },
+            .coll => |rows| .{ .read = null, .coll = rows },
+        };
+        var ctx: Ctx = .{ .arena = arena, .read = undefined, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
+        if (dbs.len > 0) ctx.enter(0);
+        return ctx;
     }
 
     /// Make `src` (null: `$`) the source the resolvers read; a query
@@ -254,10 +275,22 @@ pub const Ctx = struct {
         if (next == self.selected) return;
         self.dbs[self.selected].attr_cache = self.attr_cache;
         self.dbs[self.selected].aevt_entries = self.aevt_entries;
+        self.enter(next);
+    }
+
+    fn enter(self: *Ctx, next: ir.Src) void {
         self.selected = next;
-        self.read = self.dbs[next].read;
+        self.read = self.dbs[next].read orelse undefined;
+        self.coll = self.dbs[next].coll;
         self.attr_cache = self.dbs[next].attr_cache;
         self.aevt_entries = self.dbs[next].aevt_entries;
+    }
+
+    /// `select` for a clause that reads a db value: `missing?`,
+    /// `get-else`, `get-some`, `fulltext`.
+    pub fn selectDb(self: *Ctx, src: ?ir.Src) error{QuerySyntax}!void {
+        try self.select(src);
+        if (self.coll != null) return self.syntax("this clause reads a db value, and its source is a collection");
     }
 
     /// `QuerySyntax` with its reason and the top-level clause it was
@@ -466,10 +499,19 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
         if (ctx.depth == 1) ctx.clause_index = (@intFromPtr(p) - @intFromPtr(pending.ptr)) / @sizeOf(Pending);
         switch (p.clause) {
             .pattern => |pat| {
-                const scan = try planScan(ctx, pat, bound.items);
-                for (scan.fresh) |v| try bound.append(ctx.arena, v);
-                rows.* = if (scan.unsatisfiable) 0 else clampRows(std.math.mulWide(u64, rows.*, scan.estimate));
-                try steps.append(ctx.arena, .{ .scan = scan });
+                const step = try planPattern(ctx, pat, bound.items);
+                switch (step) {
+                    .scan => |scan| {
+                        for (scan.fresh) |v| try bound.append(ctx.arena, v);
+                        rows.* = if (scan.unsatisfiable) 0 else clampRows(std.math.mulWide(u64, rows.*, scan.estimate));
+                    },
+                    .match => |m| {
+                        for (m.fresh) |v| try bound.append(ctx.arena, v);
+                        rows.* = clampRows(std.math.mulWide(u64, rows.*, best_cost));
+                    },
+                    else => unreachable,
+                }
+                try steps.append(ctx.arena, step);
             },
             .@"or" => |o| {
                 const join = try orJoin(ctx, o);
@@ -534,7 +576,7 @@ fn planSource(ctx: *Ctx, s: anytype, bound: []const Var) !Step {
 
 /// Every source a call's arguments name exists.
 fn callSources(ctx: *Ctx, call: ir.Call) error{QuerySyntax}!void {
-    for (call.args) |a| if (a == .src) try ctx.select(a.src);
+    for (call.args) |a| if (a == .src) try ctx.selectDb(a.src);
 }
 
 /// A call can run once its function (when a variable) and every
@@ -721,7 +763,31 @@ fn choose(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !Choice {
 
 fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !u64 {
     try ctx.select(p.src);
+    if (ctx.coll) |rows| return @max(1, rows.len);
     return (try choose(ctx, p, bound)).estimate;
+}
+
+/// The step of a data pattern: a scan of a db source, or a match over
+/// a collection.
+fn planPattern(ctx: *Ctx, p: ir.Pattern, bound: []const Var) Failure!Step {
+    try ctx.select(p.src);
+    const rows = ctx.coll orelse return .{ .scan = try planScan(ctx, p, bound) };
+    var fresh: std.ArrayList(Var) = .empty;
+    var slots: [5]Slot = undefined;
+    for (p.terms(), &slots) |t, *slot| slot.* = switch (t) {
+        .blank => .blank,
+        .variable => |v| blk: {
+            if (ir.containsVar(bound, v)) break :blk .{ .bound = v };
+            if (ir.containsVar(fresh.items, v)) break :blk .{ .same = v };
+            try fresh.append(ctx.arena, v);
+            break :blk .{ .fresh = v };
+        },
+        .constant => |c| switch (c) {
+            .cell => |cell| .{ .constant = .{ .cell = cell } },
+            .lookup => return ctx.syntax("a lookup ref needs a db source; this source is a collection"),
+        },
+    };
+    return .{ .match = .{ .src = ctx.selected, .slots = slots, .fresh = try fresh.toOwnedSlice(ctx.arena), .rows = rows } };
 }
 
 fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) Failure!Scan {
@@ -1008,6 +1074,17 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), 
                 try w.writeAll("source [");
                 try explainVars(s.vars, ctx, w);
                 try w.writeAll("]");
+                line.join = "hash";
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
+            },
+            .match => |m| {
+                try w.print("match [{s}", .{ctx.interner.symbolName(ctx.source_names[m.src])});
+                for (m.slots) |slot| {
+                    try w.writeByte(' ');
+                    try explainSlot(slot, ctx, w);
+                }
+                try w.print("] tuples={d}", .{m.rows.len});
                 line.join = "hash";
                 line.text = out.written();
                 try lines.append(ctx.arena, line);
