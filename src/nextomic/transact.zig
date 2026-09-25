@@ -1778,7 +1778,7 @@ const Ctx = struct {
             if (becomes_unique) {
                 if ((try seen.getOrPut(self.arena, vb)).found_existing) return self.unique(attr, try self.valFromParts(r.parts));
             }
-            try rows.append(self.arena, .{ .e = r.parts.e, .vbytes = vb, .t = key.readId(r.kv.value[0..key.id_len]) });
+            try rows.append(self.arena, .{ .e = r.parts.e, .vbytes = vb, .t = try key.readId(r.kv.value[0..key.id_len]) });
         }
         if (becomes_unique) {
             for (self.overlay.items) |p| {

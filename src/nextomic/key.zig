@@ -202,8 +202,11 @@ pub fn writeId(out: *[id_len]u8, id: u64) void {
     std.mem.writeInt(u48, out, @intCast(id), .big);
 }
 
-pub fn readId(in: *const [id_len]u8) u64 {
-    return std.mem.readInt(u48, in, .big);
+/// An id read from file bytes: one past `id_max` is corrupt, since no
+/// allocator hands it out and `writeId` refuses it.
+pub fn readId(in: *const [id_len]u8) DecodeError!u64 {
+    const id = std.mem.readInt(u48, in, .big);
+    return if (id > id_max) error.Corrupted else id;
 }
 
 pub fn writeAttr(out: *[attr_len]u8, a: u32) void {
@@ -225,8 +228,9 @@ pub fn writeTop(out: *[top_len]u8, t: u64, added: bool) void {
     std.mem.writeInt(u48, out, @intCast(packTop(t, added)), .big);
 }
 
-pub fn readTop(in: *const [top_len]u8) Top {
+pub fn readTop(in: *const [top_len]u8) DecodeError!Top {
     const raw = std.mem.readInt(u48, in, .big);
+    if (raw >> 1 >= tx_partition_bit) return error.Corrupted;
     return .{ .t = raw >> 1, .added = (raw & 1) == 1 };
 }
 
@@ -461,7 +465,7 @@ pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
         },
         .ref => {
             if (body.len != id_len) return error.Corrupted;
-            return .{ .val = .{ .ref = readId(body[0..id_len]) } };
+            return .{ .val = .{ .ref = try readId(body[0..id_len]) } };
         },
         .string, .bytes => {
             const r = try unescapeFrom(gpa, body);
@@ -595,30 +599,30 @@ pub fn unpackKey(index: Index, history: bool, key: []const u8) DecodeError!Parts
     const fixed: usize = id_len + attr_len + suffix_top;
     if (key.len < fixed + v_min) return error.Corrupted;
     const body = key[0 .. key.len - suffix_top];
-    const top: ?Top = if (history) readTop(key[key.len - top_len ..][0..top_len]) else null;
+    const top: ?Top = if (history) try readTop(key[key.len - top_len ..][0..top_len]) else null;
     return switch (index) {
         .eavt => .{
-            .e = readId(body[0..id_len]),
+            .e = try readId(body[0..id_len]),
             .a = readAttr(body[id_len..][0..attr_len]),
             .v = body[id_len + attr_len ..],
             .top = top,
         },
         .aevt => .{
             .a = readAttr(body[0..attr_len]),
-            .e = readId(body[attr_len..][0..id_len]),
+            .e = try readId(body[attr_len..][0..id_len]),
             .v = body[attr_len + id_len ..],
             .top = top,
         },
         .avet => .{
             .a = readAttr(body[0..attr_len]),
             .v = body[attr_len .. body.len - id_len],
-            .e = readId(body[body.len - id_len ..][0..id_len]),
+            .e = try readId(body[body.len - id_len ..][0..id_len]),
             .top = top,
         },
         .vaet => .{
             .v = body[0..id_len],
             .a = readAttr(body[id_len..][0..attr_len]),
-            .e = readId(body[id_len + attr_len ..][0..id_len]),
+            .e = try readId(body[id_len + attr_len ..][0..id_len]),
             .top = top,
         },
     };
@@ -628,7 +632,7 @@ pub fn unpackKey(index: Index, history: bool, key: []const u8) DecodeError!Parts
 pub fn partsVal(gpa: Allocator, index: Index, parts: Parts) DecodeError!KeyVal {
     if (index == .vaet) {
         if (parts.v.len != id_len) return error.Corrupted;
-        return .{ .val = .{ .ref = readId(parts.v[0..id_len]) } };
+        return .{ .val = .{ .ref = try readId(parts.v[0..id_len]) } };
     }
     return decodeVal(gpa, parts.v);
 }
@@ -839,7 +843,22 @@ test "successor increments with carry" {
 test "top packs t and added" {
     var buf: [top_len]u8 = undefined;
     writeTop(&buf, 77, true);
-    const tp = readTop(&buf);
+    const tp = try readTop(&buf);
     try testing.expectEqual(@as(u64, 77), tp.t);
     try testing.expect(tp.added);
+}
+
+test "ids and tops read from bytes are range-checked" {
+    const high = [_]u8{0xFF} ** id_len;
+    try testing.expectError(error.Corrupted, readId(&high));
+    try testing.expectError(error.Corrupted, readTop(&high));
+    var buf: [id_len]u8 = undefined;
+    writeId(&buf, id_max);
+    try testing.expectEqual(id_max, try readId(&buf));
+    // An index key naming an id past the range is corrupt, not a crash.
+    var k: [id_len + attr_len + 1]u8 = undefined;
+    @memcpy(k[0..id_len], &high);
+    writeAttr(k[id_len..][0..attr_len], 1);
+    k[id_len + attr_len] = @intFromEnum(Tag.bool_true);
+    try testing.expectError(error.Corrupted, unpackKey(.eavt, false, &k));
 }

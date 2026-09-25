@@ -364,7 +364,8 @@ pub const Store = struct {
 
     /// Last committed logical transaction number.
     pub fn readT(self: *Store, txn: *Txn) !u64 {
-        return self.sysGetInt(txn, "t", 6);
+        const t = try self.sysGetInt(txn, "t", 6);
+        return if (t >= key.tx_partition_bit) error.Corrupted else t;
     }
 
     pub fn writeT(self: *Store, txn: *Txn, t: u64) !void {
@@ -373,7 +374,8 @@ pub const Store = struct {
 
     /// Next user entity id.
     pub fn readNextEid(self: *Store, txn: *Txn) !u64 {
-        return self.sysGetInt(txn, "eid", 6);
+        const eid = try self.sysGetInt(txn, "eid", 6);
+        return if (eid < key.user_partition_start or eid > key.user_partition_end) error.Corrupted else eid;
     }
 
     pub fn writeNextEid(self: *Store, txn: *Txn, eid: u64) !void {
@@ -382,7 +384,8 @@ pub const Store = struct {
 
     /// Next attribute / ident id.
     pub fn readNextAid(self: *Store, txn: *Txn) !u32 {
-        return @intCast(try self.sysGetInt(txn, "aid", 4));
+        const aid = try self.sysGetInt(txn, "aid", 4);
+        return if (aid == 0) error.Corrupted else @intCast(aid);
     }
 
     pub fn writeNextAid(self: *Store, txn: *Txn, aid: u32) !void {
@@ -705,7 +708,7 @@ pub const Store = struct {
         pending: ?HistoryRow = null,
         exhausted: bool = false,
 
-        pub fn next(self: *FoldScan) ?HistoryRow {
+        pub fn next(self: *FoldScan) key.DecodeError!?HistoryRow {
             while (!self.exhausted) {
                 const row = self.inner.next() orelse {
                     self.exhausted = true;
@@ -713,7 +716,7 @@ pub const Store = struct {
                 };
                 if (row.key.len < key.top_len) continue;
                 const fact_len = row.key.len - key.top_len;
-                const top = key.readTop(row.key[fact_len..][0..key.top_len]);
+                const top = try key.readTop(row.key[fact_len..][0..key.top_len]);
                 if (!self.window.contains(top.t)) continue;
                 const r: HistoryRow = .{ .fact = row.key[0..fact_len], .value = row.value, .t = top.t, .added = top.added };
                 if (self.window == .all) return r;
@@ -1004,7 +1007,7 @@ test "bootstrap datoms are in every index they belong to" {
     var n: usize = 0;
     while (s.next()) |kv| : (n += 1) {
         try testing.expectEqual(@as(usize, key.id_len), kv.value.len);
-        try testing.expectEqual(@as(u64, 1), key.readId(kv.value[0..key.id_len]));
+        try testing.expectEqual(@as(u64, 1), try key.readId(kv.value[0..key.id_len]));
     }
     try testing.expectEqual(@as(usize, 5), n);
 
@@ -1100,7 +1103,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     for (cases) |c| {
         var fs = try Store.foldScan(txn, tree, prefix, end, c.window);
         var got: std.ArrayList(u64) = .empty;
-        while (fs.next()) |r| {
+        while (try fs.next()) |r| {
             try testing.expect(r.added);
             const parts = try key.unpackKey(.eavt, false, r.fact);
             const kv = try key.decodeVal(arena, parts.v);
@@ -1112,7 +1115,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     var all = try Store.foldScan(txn, tree, prefix, end, .{ .all = .{ .after = 0, .upto = 5 } });
     var n: usize = 0;
     var adds: usize = 0;
-    while (all.next()) |r| {
+    while (try all.next()) |r| {
         n += 1;
         if (r.added) adds += 1;
     }
@@ -1162,4 +1165,21 @@ test "long ident names use the heap path" {
     defer txn.abort();
     try testing.expectEqual(@as(?u32, 5000), try store.identIdByName(txn, long_name));
     try testing.expectEqualStrings(long_name, (try store.identNameById(txn, 5000)).?);
+}
+
+test "sys counters outside their partitions are corrupt" {
+    var td = try TestDir.init("store_sys_range");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    const txn = try store.beginWrite(.none);
+    defer txn.abort();
+    try store.sysPutInt(txn, "t", 6, key.tx_partition_bit);
+    try testing.expectError(error.Corrupted, store.readT(txn));
+    try store.sysPutInt(txn, "eid", 6, key.user_partition_end + 1);
+    try testing.expectError(error.Corrupted, store.readNextEid(txn));
+    try store.sysPutInt(txn, "eid", 6, 5);
+    try testing.expectError(error.Corrupted, store.readNextEid(txn));
+    try store.sysPutInt(txn, "aid", 4, 0);
+    try testing.expectError(error.Corrupted, store.readNextAid(txn));
 }

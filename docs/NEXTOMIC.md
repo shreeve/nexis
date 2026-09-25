@@ -68,7 +68,9 @@ fields, so it is `key[prefix .. len - suffix]` with no length byte.
 ### 2.1 Identifiers
 
 All ids are stored big-endian in 6 bytes and fit the VM's `fixnum`
-(i48), so the usable range is `0 .. 2^47-1`.
+(i48), so the usable range is `0 .. 2^47-1`. An id, a `t` or a `sys`
+counter read back from the file outside its range is `:db/corrupted`,
+never trusted.
 
 | partition | range | source |
 |---|---|---|

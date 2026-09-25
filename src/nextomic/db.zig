@@ -554,11 +554,11 @@ pub const DatomScan = struct {
                     const parts = try key.unpackKey(self.index, false, kv.key);
                     if (!self.filter.passes(self.index, parts)) continue;
                     if (kv.value.len < key.id_len) return error.Corrupted;
-                    const t = key.readId(kv.value[0..key.id_len]);
+                    const t = try key.readId(kv.value[0..key.id_len]);
                     return try self.materialise(parts, t, true);
                 },
                 .folded => |*s| {
-                    const r = s.next() orelse return null;
+                    const r = (try s.next()) orelse return null;
                     const parts = try key.unpackKey(self.index, false, r.fact);
                     if (!self.filter.passes(self.index, parts)) continue;
                     return try self.materialise(parts, r.t, r.added);
@@ -626,7 +626,7 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
     var s = try Store.scanRange(txn, conn.store.trees.txlog, &start, end);
     while (s.next()) |kv| {
         if (kv.key.len != key.id_len) return error.Corrupted;
-        const t = key.readId(kv.key[0..key.id_len]);
+        const t = try key.readId(kv.key[0..key.id_len]);
         const bytes = (try conn.store.getTxlog(txn, t)) orelse return error.Corrupted;
         const entry = try datom_mod.decodeTxlog(arena, bytes, t, ids);
         try out.append(arena, .{ .t = t, .instant = entry.instant, .datoms = entry.datoms, .excised = entry.excised });
@@ -794,6 +794,20 @@ test "a bounded scan seeks to its start and stops at its end, on every view" {
         while (try open.next()) |_| m += 1;
         try testing.expectEqual(@as(usize, boot.idents.len - boot.doc + 1), m);
     }
+}
+
+test "a txlog key past the id range is corrupt, not a crash" {
+    const tc = try TestConn.init("db_txlog_corrupt");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    {
+        const txn = try tc.conn.store.beginWrite(.none);
+        errdefer txn.abort();
+        try txn.putInTree(tc.conn.store.trees.txlog, &([_]u8{0xFF} ** key.id_len), &.{});
+        try txn.commit();
+    }
+    try testing.expectError(error.Corrupted, txRange(tc.conn, arena_state.allocator(), 1, null));
 }
 
 test "basis in the future is refused" {
