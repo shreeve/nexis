@@ -891,6 +891,9 @@ fn expandDef(
     const head = items[0];
     const named = try splitMetaName(ctx, items[1]);
     const name_form = named.name;
+    if (ctx.namespace) |ns| if (ns.vars.getEntry(name_form.datum.symbol.name)) |entry| if (!isOwnVar(entry)) {
+        return ctx.fail(name_form.origin, "def: {s} already refers to a Var of another namespace", .{name_form.datum.symbol.name});
+    };
     var meta_items: std.ArrayList(*Form) = .empty;
     defer meta_items.deinit(ctx.allocator);
     if (named.meta) |m| try meta_items.appendSlice(ctx.allocator, m);
@@ -1229,109 +1232,178 @@ const Walk = struct {
 // such as `first`/`rest`/`cons` and builds output via
 // syntax-quote.
 
-/// Expand `(ns NAME)`. Switches
-/// `ctx.registry.current` to the named namespace, creating it
-/// (with `nexis.core` as auto-referred parent) if not already
-/// registered. Returns nil; the runtime effect already happened
-/// at expansion time, so subsequent forms see the new current
-/// namespace.
-fn expandNs(
-    ctx: *ExpandContext,
-    list_form: *const Form,
-    items: []const *Form,
-) ExpandError!*Form {
-    if (items.len != 2) return ExpandError.MalformedMacroCall;
-    const name_form = items[1];
-    if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) {
-        return ExpandError.MalformedMacroCall;
-    }
-    const reg = ctx.registry orelse return ExpandError.MalformedMacroCall;
+/// `(ns NAME docstring? attr-map? clause*)` switches the registry's
+/// current namespace to NAME at expansion time, creating it (with
+/// `nexis.core` referred) if needed, then runs each
+/// `(:require spec*)` clause as `require` runs its specs, in the new
+/// namespace. `(:refer-clojure ...)` and `(:gen-class ...)` are
+/// accepted and do nothing (nexis.core is always referred; there is
+/// no class to generate). The docstring and attribute map are
+/// accepted and not kept. The form is replaced by nil.
+fn expandNs(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
+    const origin = list_form.origin;
+    if (items.len < 2) return ctx.fail(origin, "ns: expected a namespace name", .{});
+    const name_form = stripMeta(items[1]);
+    if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return ctx.fail(name_form.origin, "ns: the name must be an unqualified symbol, not {s}", .{describeForm(name_form)});
+    const reg = ctx.registry orelse return ctx.fail(origin, "ns: namespaces cannot be switched here", .{});
     reg.switchTo(name_form.datum.symbol.name) catch return ExpandError.OutOfMemory;
-    // Replace `(ns NAME)` with `nil` in the form tree — the
-    // side effect already happened; nothing else to do at
-    // runtime.
-    return try makeNil(ctx, list_form.origin);
-}
-
-/// Expand `(require ...)`. Supported forms:
-///
-///   (require 'my.ns)              ; load my.ns; no alias
-///   (require '[my.ns :as alias])  ; load my.ns + alias `alias` → my.ns
-///
-/// The side effect (file load + registry update + alias entry)
-/// happens at EXPANSION TIME via `ctx.load_callback`. The
-/// replacement form is `nil` (there is no runtime work left).
-/// Both forms accept `:as` only — `:refer` / `:rename` /
-/// `:exclude` are unsupported and raise MalformedMacroCall.
-///
-/// Multiple specs in one require call (Clojure-style
-/// `(require '[a] '[b])`) supported.
-fn expandRequire(
-    ctx: *ExpandContext,
-    list_form: *const Form,
-    items: []const *Form,
-) ExpandError!*Form {
-    if (items.len < 2) return ExpandError.MalformedMacroCall;
-    const cb = ctx.load_callback orelse return ExpandError.MalformedMacroCall;
-    const reg = ctx.registry orelse return ExpandError.MalformedMacroCall;
-
-    // Each item after the head is a require spec. The reader
-    // sees `'X` as a `Datum.quote{X}` form; we unwrap one level.
-    for (items[1..]) |spec_form| {
-        const spec = unwrapQuote(spec_form);
-        switch (spec.datum) {
-            .symbol => |sym| {
-                if (sym.ns != null) return ExpandError.MalformedMacroCall;
-                cb.load(cb.user_data, sym.name) catch |err| return loadFailure(err);
-            },
-            .vector => |elems| {
-                if (elems.len < 1) return ExpandError.MalformedMacroCall;
-                const ns_form = elems[0];
-                if (ns_form.datum != .symbol or ns_form.datum.symbol.ns != null) {
-                    return ExpandError.MalformedMacroCall;
-                }
-                const ns_name = ns_form.datum.symbol.name;
-                // Optional `:as alias` clause.
-                var alias_name: ?[]const u8 = null;
-                var i: usize = 1;
-                while (i < elems.len) : (i += 2) {
-                    const k = elems[i];
-                    if (k.datum != .keyword or k.datum.keyword.ns != null) {
-                        return ExpandError.MalformedMacroCall;
-                    }
-                    if (std.mem.eql(u8, k.datum.keyword.name, "as")) {
-                        if (i + 1 >= elems.len) return ExpandError.MalformedMacroCall;
-                        const alias_form = elems[i + 1];
-                        if (alias_form.datum != .symbol or alias_form.datum.symbol.ns != null) {
-                            return ExpandError.MalformedMacroCall;
-                        }
-                        alias_name = alias_form.datum.symbol.name;
-                    } else {
-                        // :refer / :rename / :exclude are unsupported.
-                        return ExpandError.MalformedMacroCall;
-                    }
-                }
-                cb.load(cb.user_data, ns_name) catch |err| return loadFailure(err);
-                if (alias_name) |an| {
-                    reg.current.putAlias(an, ns_name) catch return ExpandError.OutOfMemory;
-                }
-            },
-            else => return ExpandError.MalformedMacroCall,
+    var clauses = items[2..];
+    if (clauses.len > 0 and clauses[0].datum == .string) clauses = clauses[1..];
+    if (clauses.len > 0 and clauses[0].datum == .map) clauses = clauses[1..];
+    for (clauses) |clause| {
+        const clause_items: []const *Form = if (clause.datum == .list) clause.datum.list else &.{};
+        if (clause_items.len == 0 or clause_items[0].datum != .keyword) return ctx.fail(clause.origin, "ns: expected a clause like (:require ...), not {s}", .{describeForm(clause)});
+        const kind = clause_items[0].datum.keyword.name;
+        if (std.mem.eql(u8, kind, "require")) {
+            for (clause_items[1..]) |spec| try requireSpec(ctx, spec);
+        } else if (!std.mem.eql(u8, kind, "refer-clojure") and !std.mem.eql(u8, kind, "gen-class")) {
+            return ctx.fail(clause.origin, "ns: (:{s} ...) is not supported", .{kind});
         }
     }
+    return try makeNil(ctx, origin);
+}
+
+/// `(require spec*)` loads and refers at expansion time, through
+/// `ctx.load_callback`, and is replaced by nil. Each spec, quoted or
+/// not, is a namespace symbol or `[ns-name option*]`:
+///
+///   :as alias          `alias/x` names `ns-name/x`
+///   :as-alias alias    the alias alone; nothing is loaded
+///   :refer [x y]       `x` and `y` name those Vars here
+///   :refer :all        so does every public Var of the namespace
+///   :rename {x z}      a referred `x` is named `z` here
+///
+/// A keyword spec (`:reload`, `:reload-all`, `:verbose`) is a flag
+/// and changes nothing. `clojure.string`, `clojure.set`,
+/// `clojure.test`, `clojure.pprint`, `clojure.math` and
+/// `clojure.core` name their nexis namespaces, and the Clojure name
+/// becomes an alias of the nexis one.
+fn expandRequire(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
+    if (items.len < 2) return ctx.fail(list_form.origin, "require: expected a namespace", .{});
+    for (items[1..]) |spec| try requireSpec(ctx, spec);
     return try makeNil(ctx, list_form.origin);
 }
 
-/// What a load callback's failure means to the expander: the two
-/// signals of a file that ran and failed pass through under their
-/// own names; a file that could not be found, read or compiled is
-/// a malformed `require`.
-fn loadFailure(err: anyerror) ExpandError {
-    return switch (err) {
-        error.OutOfMemory => ExpandError.OutOfMemory,
-        error.RunFailed => ExpandError.RequiredFileFailed,
-        error.ControlTransferred => ExpandError.ControlTransferred,
-        else => ExpandError.MalformedMacroCall,
+/// The nexis namespace a Clojure library namespace stands for.
+const clojure_namespaces = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "clojure.core", "nexis.core" },
+    .{ "clojure.string", "nexis.string" },
+    .{ "clojure.set", "nexis.set" },
+    .{ "clojure.test", "nexis.test" },
+    .{ "clojure.pprint", "nexis.pprint" },
+    .{ "clojure.math", "nexis.math" },
+});
+
+/// Load and refer one `require` spec (see `expandRequire`).
+fn requireSpec(ctx: *ExpandContext, quoted: *const Form) ExpandError!void {
+    const spec = unwrapQuote(quoted);
+    const opts: []const *Form = switch (spec.datum) {
+        .keyword => return,
+        .symbol => &.{},
+        .vector => |v| if (v.len > 0) v[1..] else return ctx.fail(spec.origin, "require: an empty spec", .{}),
+        else => return ctx.fail(spec.origin, "require: expected a namespace symbol or [name options...], not {s}", .{describeForm(spec)}),
+    };
+    const name_form = if (spec.datum == .vector) spec.datum.vector[0] else spec;
+    if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return ctx.fail(name_form.origin, "require: the namespace must be an unqualified symbol, not {s}", .{describeForm(name_form)});
+    const written = name_form.datum.symbol.name;
+    const ns_name = clojure_namespaces.get(written) orelse written;
+    if (opts.len % 2 != 0) return ctx.fail(spec.origin, "require: options come in pairs", .{});
+    var as_alias: ?[]const u8 = null;
+    var load = true;
+    var refer: ?*const Form = null;
+    var rename: []const *Form = &.{};
+    var i: usize = 0;
+    while (i < opts.len) : (i += 2) {
+        const key = opts[i];
+        const val = opts[i + 1];
+        const k = if (key.datum == .keyword and key.datum.keyword.ns == null) key.datum.keyword.name else "";
+        if (std.mem.eql(u8, k, "as") or std.mem.eql(u8, k, "as-alias")) {
+            if (val.datum != .symbol or val.datum.symbol.ns != null) return ctx.fail(val.origin, "require: :{s} takes a symbol, not {s}", .{ k, describeForm(val) });
+            as_alias = val.datum.symbol.name;
+            if (std.mem.eql(u8, k, "as-alias")) load = false;
+        } else if (std.mem.eql(u8, k, "refer")) {
+            const all = val.datum == .keyword and std.mem.eql(u8, val.datum.keyword.name, "all");
+            if (val.datum != .vector and !all) return ctx.fail(val.origin, "require: :refer takes a vector of names or :all, not {s}", .{describeForm(val)});
+            refer = val;
+        } else if (std.mem.eql(u8, k, "rename")) {
+            if (val.datum != .map) return ctx.fail(val.origin, "require: :rename takes a map, not {s}", .{describeForm(val)});
+            rename = val.datum.map;
+        } else {
+            return ctx.fail(key.origin, "require: unknown option {s}", .{if (k.len > 0) k else describeForm(key)});
+        }
+    }
+
+    const reg = ctx.registry orelse return ctx.fail(spec.origin, "require: namespaces cannot be loaded here", .{});
+    if (load) {
+        const cb = ctx.load_callback orelse return ctx.fail(spec.origin, "require: namespaces cannot be loaded here", .{});
+        cb.load(cb.user_data, ns_name) catch |err| return switch (err) {
+            error.OutOfMemory => ExpandError.OutOfMemory,
+            // A file that ran and failed: the VM carries the failure.
+            error.RunFailed => ExpandError.RequiredFileFailed,
+            error.ControlTransferred => ExpandError.ControlTransferred,
+            error.FileNotFound => ctx.fail(name_form.origin, "require: no namespace {s} on the load path", .{ns_name}),
+            else => ctx.fail(name_form.origin, "require: {s} could not be loaded: {s}", .{ ns_name, @errorName(err) }),
+        };
+    }
+    const cur = reg.current;
+    if (!std.mem.eql(u8, written, ns_name)) cur.putAlias(written, ns_name) catch return ExpandError.OutOfMemory;
+    if (as_alias) |a| cur.putAlias(a, ns_name) catch return ExpandError.OutOfMemory;
+    const r = refer orelse return;
+    const target = reg.lookupNs(ns_name) orelse return ctx.fail(name_form.origin, "require: no namespace {s} to refer from", .{ns_name});
+    if (r.datum == .keyword) {
+        var it = target.vars.iterator();
+        while (it.next()) |entry| {
+            const v = entry.value_ptr.*;
+            if (isOwnVar(entry) and !isPrivate(ctx, v)) try referVar(ctx, cur, v, renamed(rename, v.name), r.origin);
+        }
+        return;
+    }
+    for (r.datum.vector) |sym| {
+        if (sym.datum != .symbol or sym.datum.symbol.ns != null) return ctx.fail(sym.origin, "require: :refer names symbols, not {s}", .{describeForm(sym)});
+        const name = sym.datum.symbol.name;
+        const v = target.lookupLocal(name) orelse return ctx.fail(sym.origin, "require: {s}/{s} does not exist", .{ ns_name, name });
+        try referVar(ctx, cur, v, renamed(rename, name), sym.origin);
+    }
+}
+
+/// The name `:rename {from to ...}` gives `name`, else `name`.
+fn renamed(rename: []const *Form, name: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i + 1 < rename.len) : (i += 2) {
+        const from = rename[i];
+        const to = rename[i + 1];
+        if (from.datum == .symbol and to.datum == .symbol and std.mem.eql(u8, from.datum.symbol.name, name)) return to.datum.symbol.name;
+    }
+    return name;
+}
+
+/// Map `name` in `ns` to the Var `v` of another namespace. A name
+/// that already maps to a Var of `ns` itself is a conflict, as in
+/// Clojure; one that already refers to `v` stays.
+fn referVar(ctx: *ExpandContext, ns: *vm_mod.Namespace, v: *vm_mod.Var, name: []const u8, span: SrcSpan) ExpandError!void {
+    if (ns.vars.getEntry(name)) |existing| {
+        if (existing.value_ptr.* == v) return;
+        if (isOwnVar(existing)) return ctx.fail(span, "require: {s} is already defined in {s}", .{ name, ns.name });
+    }
+    const owned = try ns.var_allocator.dupe(u8, name);
+    try ns.vars.put(ns.map_allocator, owned, v);
+}
+
+/// Whether a namespace's entry is its own Var rather than one it
+/// refers to: `Namespace.intern` keys the map with the Var's own
+/// name storage, and a referral is keyed with a copy.
+fn isOwnVar(entry: anytype) bool {
+    return entry.key_ptr.*.ptr == entry.value_ptr.*.name.ptr;
+}
+
+/// Whether `v`'s metadata marks it `:private`.
+fn isPrivate(ctx: *ExpandContext, v: *const vm_mod.Var) bool {
+    if (v.meta.kind() != .persistent_map) return false;
+    const dispatch = @import("dispatch.zig");
+    const key = ctx.interner.internKeywordValue("private") catch return false;
+    return switch (champ_mod.mapGet(v.meta, key, &dispatch.hashValue, &dispatch.equal)) {
+        .present => |flag| flag.isTruthy(),
+        .absent => false,
     };
 }
 

@@ -1961,8 +1961,8 @@ test "db/scan and db/reduce-tree read a value that spans several overflow pages"
 test "nexis.string: qualified-only (not auto-referred)" {
     // Bare `(lower-case ...)` from user namespace must NOT
     // resolve to nexis.string/lower-case. Short names reach it
-    // only through `(require ... :as ...)`; `:refer` is unsupported,
-    // so qualified calls are the only other path.
+    // only through `(require ...)` with `:refer` or `:as`, or a
+    // qualified call.
     try expectOutput("(try (lower-case \"HI\") (catch any e e))", ":unbound-var");
     try expectOutput("(nexis.string/lower-case \"HI\")", "hi");
 }
@@ -4326,6 +4326,111 @@ const RequireDir = struct {
         });
     }
 };
+
+/// Run every top-level form of `src`, as `nexis run` does, with a
+/// loader over `files` as each form's load callback, and compare the
+/// last form's printed value with `expected`.
+fn expectOutputWithFiles(files: []const [2][]const u8, src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var dir: RequireDir = undefined;
+    try dir.init(&program, files);
+    defer dir.deinit();
+    var parsed = try reader_mod.parser.parseProgram(testing.allocator, src);
+    defer parsed.parser.deinit();
+    var rdr = reader_mod.Reader.init(testing.allocator, src);
+    defer rdr.deinit();
+    var last = value_mod.nilValue();
+    for (try rdr.readProgram(parsed.sexp)) |form| {
+        const compiled = try compile.compileFormWith(program.arena.allocator(), form, .{
+            .namespace = program.registry.current,
+            .interner = program.interner,
+            .host_macros = &program.host_macros,
+            .persistent_allocator = program.v.runtime_arena.allocator(),
+            .registry = program.registry,
+            .load_callback = dir.callback(),
+        });
+        const routine = compiled.toRoutine("test-form");
+        try program.v.retargetTop(&routine);
+        last = try program.v.run();
+    }
+    try harness.expectResult(&program, src, last, expected);
+}
+
+const utilns = [2][]const u8{ "util.nx", "(ns util)\n(defn twice [x] (* 2 x))\n(def ^:private secret 1)\n(defn half [x] (quot x 2))\n" };
+
+test "ns and require: :require clauses, :as, :refer, :refer :all, :rename, flags" {
+    try expectOutputWithFiles(&.{utilns},
+        \\(ns my.app "An app." {:author "me"}
+        \\  (:refer-clojure :exclude [replace])
+        \\  (:require [util :as u :refer [twice]]
+        \\            [nexis.string :refer [upper-case join] :rename {join j}])
+        \\  (:gen-class))
+        \\(def here 1)
+        \\[(u/half 8) (twice 2) (upper-case "a") (j "-" [1 2]) my.app/here]
+    , "[4 4 A 1-2 1]");
+    try expectOutputWithFiles(&.{utilns}, "(require '[util :refer :all] :reload) [(twice 1) (half 4)]", "[2 2]");
+    // :refer :all skips private Vars.
+    try expectOutputWithFiles(&.{utilns}, "(require '[util :refer :all]) (try (eval 'secret) (catch any e :unresolved))", ":unresolved");
+    try expectOutputWithFiles(&.{utilns}, "(require '[util :as-alias ua]) (require 'util) (ua/twice 3)", "6");
+}
+
+test "require: Clojure's library namespaces name nexis's" {
+    try expectOutputWithFiles(&.{},
+        \\(ns t (:require [clojure.string :as str :refer [trim]] clojure.test))
+        \\[(str/upper-case "a") (trim " x ") (clojure.string/lower-case "B") (fn? clojure.test/is)]
+    , "[A x b true]");
+}
+
+/// Run `setup`, then expand `src` with the loader over `files` and
+/// expect a failure recorded with `message` against the source text
+/// `at`.
+fn expectRequireFailure(files: []const [2][]const u8, setup: []const u8, src: []const u8, message: []const u8, at: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run(setup);
+    var dir: RequireDir = undefined;
+    try dir.init(&program, files);
+    defer dir.deinit();
+    var arena = std.heap.ArenaAllocator.init(program.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parsed = try reader_mod.parser.parseProgram(a, src);
+    defer parsed.parser.deinit();
+    var rdr = reader_mod.Reader.init(a, src);
+    defer rdr.deinit();
+    const forms = try rdr.readProgram(parsed.sexp);
+    var failure: ?expand_mod.Failure = null;
+    for (forms) |form| {
+        var ctx = expand_mod.ExpandContext{
+            .allocator = a,
+            .interner = program.interner,
+            .host_macros = &program.host_macros,
+            .namespace = program.registry.current,
+            .registry = program.registry,
+            .load_callback = dir.callback(),
+            .value_heap = program.v.ensureHeap(),
+        };
+        _ = expand_mod.expandForm(&ctx, null, form) catch {
+            failure = ctx.failure;
+            break;
+        };
+    }
+    const f = failure orelse return error.TestExpectedFailure;
+    try testing.expectEqualStrings(message, f.message);
+    try testing.expectEqualStrings(at, src[f.span.pos..][0..f.span.len]);
+}
+
+test "ns and require: a bad spec or a missing namespace or Var is reported by name" {
+    try expectRequireFailure(&.{}, "", "(require '[nope.ns :as n])", "require: no namespace nope.ns on the load path", "nope.ns");
+    try expectRequireFailure(&.{utilns}, "", "(require '[util :refer [nope]])", "require: util/nope does not exist", "nope");
+    try expectRequireFailure(&.{utilns}, "", "(require '[util :only [twice]])", "require: unknown option only", ":only");
+    try expectRequireFailure(&.{}, "", "(ns x (:import java.util.Date))", "ns: (:import ...) is not supported", "(:import java.util.Date)");
+    try expectRequireFailure(&.{utilns}, "(defn twice [] 0)", "(require '[util :refer [twice]])", "require: twice is already defined in user", "twice");
+    try expectRequireFailure(&.{utilns}, "", "(require '[util :refer [twice]]) (def twice 0)", "def: twice already refers to a Var of another namespace", "twice");
+}
 
 const throwsns = [2][]const u8{ "throwsns.nx", "(ns throwsns)\n(throw :boom)\n" };
 const badns = [2][]const u8{ "badns.nx", "(ns badns)\n(defn f [] (/ 1 0))\n(f)\n" };
