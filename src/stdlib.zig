@@ -2819,7 +2819,7 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     defer vm.allocator.free(path_z);
     const conn = vm.allocator.create(db_mod.Connection) catch return VmError.OutOfMemory;
     errdefer vm.allocator.destroy(conn);
-    conn.* = db_mod.open(vm.allocator, io, vm.ensureHeap(), vm.ensureInterner(), path_z.ptr, .{}) catch |err| return dbFailure(vm, err);
+    conn.* = db_mod.open(vm.allocator, vm.ensureHeap(), vm.ensureInterner(), path_z.ptr, .{}) catch |err| return dbFailure(vm, err);
     vm.db_close_callback = &dbCloseCallback;
     vm.db_connections.append(vm.allocator, @ptrCast(conn)) catch {
         db_mod.shutdown(conn);
@@ -2949,6 +2949,12 @@ fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
 // detect this and raise `:tx-closed`. Prevents double-commit and
 // use-after-finalize.
 //
+// Held transactions: a native that calls back into the program
+// while it uses a transaction (`db/alter!`, `db/reduce-tree`) holds
+// the handle for the call, and commit or abort of a held handle is
+// `:db/busy`, so no callback finishes a transaction under the native
+// using it (DB.md §12).
+//
 // Lifetime: TxnHandle structs live on `vm.runtime_arena` (small
 // allocations, short-lived; arena reclaims at VM teardown). The
 // underlying emdb txn handle is freed by commit/abort.
@@ -2960,11 +2966,16 @@ fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
 pub const WriteTxnHandle = struct {
     txn: db_mod.WriteTxn,
     active: bool,
+    /// Natives running a callback over the transaction; commit and
+    /// abort refuse while any does.
+    held: u32 = 0,
 };
 
 pub const ReadTxnHandle = struct {
     txn: db_mod.ReadTxn,
     active: bool,
+    /// As `WriteTxnHandle.held`.
+    held: u32 = 0,
 };
 
 fn writeTxnHandle(v: Value) ?*WriteTxnHandle {
@@ -2981,6 +2992,20 @@ fn readTxnHandle(v: Value) ?*ReadTxnHandle {
 const ActiveTxn = union(enum) {
     write: *WriteTxnHandle,
     read: *ReadTxnHandle,
+
+    /// Keep the transaction open across a callback; `release` ends
+    /// the hold.
+    fn hold(self: ActiveTxn) void {
+        switch (self) {
+            inline else => |h| h.held += 1,
+        }
+    }
+
+    fn release(self: ActiveTxn) void {
+        switch (self) {
+            inline else => |h| h.held -= 1,
+        }
+    }
 };
 
 fn activeTxn(v: Value) VmError!ActiveTxn {
@@ -3034,6 +3059,7 @@ fn fnDbBeginRead(vm: *VM, args: []const Value) VmError!Value {
 fn fnDbCommit(vm: *VM, args: []const Value) VmError!Value {
     const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
     if (!h.active) return VmError.TxClosed;
+    if (h.held != 0) return vm.throwKeyword("db/busy");
     db_mod.commit(&h.txn) catch |err| {
         h.active = false;
         return dbFailure(vm, err);
@@ -3042,17 +3068,19 @@ fn fnDbCommit(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.nilValue();
 }
 
-fn fnDbAbortWrite(_: *VM, args: []const Value) VmError!Value {
+fn fnDbAbortWrite(vm: *VM, args: []const Value) VmError!Value {
     const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
     if (!h.active) return value_mod.nilValue(); // idempotent abort
+    if (h.held != 0) return vm.throwKeyword("db/busy");
     db_mod.abortWrite(&h.txn);
     h.active = false;
     return value_mod.nilValue();
 }
 
-fn fnDbAbortRead(_: *VM, args: []const Value) VmError!Value {
+fn fnDbAbortRead(vm: *VM, args: []const Value) VmError!Value {
     const h = readTxnHandle(args[0]) orelse return VmError.KindMismatch;
     if (!h.active) return value_mod.nilValue();
+    if (h.held != 0) return vm.throwKeyword("db/busy");
     db_mod.abortRead(&h.txn);
     h.active = false;
     return value_mod.nilValue();
@@ -3143,9 +3171,9 @@ const TreeCursor = struct {
 
     /// Open a cursor on `tree_name`. Null when the tree does not
     /// exist, which every caller treats as an empty tree.
-    fn open(vm: *VM, tx_v: Value, tree_name: []const u8) VmError!?TreeCursor {
+    fn open(vm: *VM, txn: ActiveTxn, tree_name: []const u8) VmError!?TreeCursor {
         db_mod.validateTreeName(tree_name) catch |err| return dbFailure(vm, err);
-        switch (try activeTxn(tx_v)) {
+        switch (txn) {
             inline else => |h| {
                 const tree_id = (db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err)) orelse return null;
                 const cursor = h.txn.inner.openCursorForTree(tree_id) catch |err| return dbFailure(vm, err);
@@ -3181,7 +3209,7 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     const start_bytes: ?[]const u8 = if (args.len >= 3) try boundBytes(vm, args[2]) else null;
     const end_bytes: ?[]const u8 = if (args.len >= 4) try boundBytes(vm, args[3]) else null;
 
-    var tc = (try TreeCursor.open(vm, tx_v, tree_name)) orelse {
+    var tc = (try TreeCursor.open(vm, try activeTxn(tx_v), tree_name)) orelse {
         return vector_mod.fromSlice(vm.ensureHeap(), &.{}) catch VmError.OutOfMemory;
     };
 
@@ -3237,7 +3265,10 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     const tree_name = interner.keywordName(tree_id);
 
     // No such tree: the init value, unchanged.
-    var tc = (try TreeCursor.open(vm, tx_v, tree_name)) orelse return acc;
+    const txn = try activeTxn(tx_v);
+    var tc = (try TreeCursor.open(vm, txn, tree_name)) orelse return acc;
+    txn.hold();
+    defer txn.release();
 
     var maybe_kv: ?emdb_mod.Cursor.KeyValue = tc.cursor.first();
     while (maybe_kv) |kv| {
@@ -3281,9 +3312,13 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     call_args[0] = current;
     for (extra, 0..) |a, i| call_args[1 + i] = a;
 
-    // 3. Invoke. Throws / control transfers propagate UNCHANGED
-    //    so the with-tx's catch can abort. NO write on error.
-    const new_value = try vm.callValue(f, call_args);
+    // 3. Invoke, the transaction held. Throws / control transfers
+    //    propagate UNCHANGED so the with-tx's catch can abort. NO
+    //    write on error.
+    h.held += 1;
+    const called = vm.callValue(f, call_args);
+    h.held -= 1;
+    const new_value = try called;
 
     // 4. Write.
     db_mod.putRef(&h.txn, r, new_value) catch |err| return dbFailure(vm, err);

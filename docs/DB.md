@@ -28,13 +28,18 @@ the nexis surface is single-isolate (PLAN §23 #5).
 ### 2. `store_id` derivation
 
 emdb's meta page carries no file id, so `store_id: u128` comes from
-the file's path. `open` resolves the canonical path
-(`realPathFileAlloc`) after emdb has opened, and so created, the file;
-a platform that cannot resolve one keeps the path as given. The low
+the file's path. `open` resolves the canonical path before emdb opens
+the file: the `realpath` of an existing file, and for a new file the
+`realpath` of its directory joined with its name (a directory that
+does not resolve is `:db/open-failed`). emdb opens the file at that
+path, so every spelling of it takes the same lock file. The id is
+computed over the canonical path of the file's `StoreFile` (§3.1), so
+every connection sharing the file shares it. The low
 64 bits are `hash.hashBytes(path)`; the high 64 bits are xxHash3,
 seeded with `hash.seed`, over `"store-id"` followed by the path.
 
-So `x.edb`, `./x.edb` and the absolute spelling name one store (the
+So `x.edb`, `./x.edb`, the absolute spelling and a symlink to it name
+one store (the
 inline test "store_id comes from the canonical path" pins it). The id
 is stable for an unmoved file and changes when the file is renamed or
 moved; two files with equal contents at different paths are different
@@ -51,9 +56,9 @@ none); a failure there is ignored, and emdb's own open then reports
 
 ### 3. `Connection`
 
-A plain Zig struct, not a Value: it holds the `emdb.Env`, the
-non-owning allocator, heap and interner the codec needs, the two
-`store_id` halves, the owned canonical path, an open flag, a count of
+A plain Zig struct, not a Value: it holds its file's `StoreFile`
+(§3.1), the non-owning allocator, heap and interner the codec needs,
+the two `store_id` halves, an open flag, a count of
 open transactions and the tree-handle cache. The stdlib allocates each
 one on the VM's allocator, records it in `vm.db_connections`, and
 frees it only at VM teardown, so no address a Value holds is reused
@@ -81,16 +86,38 @@ assembled in the transaction's buffer, valid until the next multi-page
 read on that transaction; `db/scan` and `db/reduce-tree` decode each
 entry before advancing.
 
-**Closing.** `close` closes the env and leaves the struct in place
+**Closing.** `close` releases the `StoreFile` and leaves the struct in place
 with the open flag false: a ref, transaction handle or connection
 Value that still names it reports the connection closed. A second
 `close` does nothing. `close` while a transaction of the connection is
 open is refused (`TransactionsOpen`), so no emdb transaction outlives
-its env. `shutdown` closes whatever is open, for VM teardown.
+its environment. `shutdown` closes whatever is open, for VM teardown.
 
 **A failed commit aborts.** emdb leaves a transaction whose commit
 failed open, holding the write lock; `commit` aborts it before
 returning the error, so the transaction is over either way.
+
+#### 3.1 One environment per file
+
+emdb's writer lock is per file and process and waits for its holder,
+so two environments on one file in one process would deadlock (the
+second writer waits on the first, which the same thread holds), and
+one opened through another spelling of the path would take a lock
+file of its own and write beside the first. A process therefore opens
+each store file once: `StoreFile.acquire` keeps the open files in one
+process-wide list keyed by `(st_dev, st_ino)`, and every `open` of the
+file, through any spelling, symlink or hard link, and every Nextomic
+`connect` to it (`docs/NEXTOMIC.md` §2) share its one `emdb.Env`,
+reference-counted; the last `release` closes it. A copy of a store
+file is another file.
+
+The environment has one write transaction. `StoreFile.beginWrite`
+while any holder of the file has one open is `WriterActive`
+(`:db/busy`; Nextomic reports it as `:nextomic/nested`), never a wait.
+Read transactions run beside it. The first open sets the environment's
+options and allocator, which outlive every connection to the file; a
+file the process may read but not write opens read-only, and every
+write on it is `:db/read-only`.
 
 ---
 
@@ -119,7 +146,8 @@ intern and allocator errors propagate unchanged.
 
 | Function | Contract |
 |---|---|
-| `open(allocator, io, heap, interner, path, options) !Connection` | §2, §3. |
+| `open(allocator, heap, interner, path, options) !Connection` | §2, §3. |
+| `StoreFile.acquire(path, options) !*StoreFile` / `release(*StoreFile)` / `beginWrite(*StoreFile, options) !*emdb.Txn` | §3.1. |
 | `close(*Connection) DbError!void` / `shutdown(*Connection) void` | §3. |
 | `storeId(*const Connection) u128` | §2. |
 | `beginWrite(*Connection) !WriteTxn` / `beginRead(*Connection) !ReadTxn` | `ConnectionUnavailable` on a closed connection. |
@@ -194,6 +222,8 @@ None: a ref has no heap children. `conn` points at a non-heap
 | A transaction begun on a closed connection | `ConnectionUnavailable` | `:db-closed` (the natives check first) |
 | Empty or `nx/` tree name, empty key | `InvalidTreeName` / `InvalidKey` | `:db/invalid-key` |
 | `close` with a transaction open | `TransactionsOpen` | `:db/busy` |
+| A write while any connection or Nextomic store of the file holds its writer | `WriterActive` | `:db/busy` (§3.1) |
+| A write on a file opened read-only | `TxnReadOnly` | `:db/read-only` |
 | A second `close` | none | none (nil) |
 | Encode of a kind with no serialized form (CODEC.md §3) | `UnserializableKind` | `:unserializable` |
 | Stored bytes that do not decode | any other `CodecError` | `:codec-failed` |
@@ -214,11 +244,8 @@ failure: the triple is fixed at construction.
 
 **Two connections to one file.** A ref made on one connection is
 accepted in a transaction of another connection to the same store.
-emdb's writer lock is per file, so a write through the second
-connection while the first holds a write transaction waits on a
-writer the same single-threaded process holds: it never returns.
-Nextomic refuses that case itself (`docs/NEXTOMIC.md` §3); `db/*` does
-not.
+Both share the file's environment (§3.1), so a write through the
+second while the first holds the writer is `:db/busy`.
 
 ---
 
@@ -251,9 +278,10 @@ language surface runs in `test/integration/eval_pipeline.zig`,
 `db.zig` imports `value`, `heap`, `intern`, `hash`, `codec` and
 `emdb`. `dispatch.zig` and `gc.zig` call its hash, equality and trace
 helpers at their `.durable_ref` arms; `stdlib.zig` holds the natives;
-Nextomic imports it only for `failureName` and the geometry
-constants `page_size` and `max_named_trees`: it opens its own
-`emdb.Env` with them, keeps raw byte keys and never goes through
+Nextomic imports it only for `failureName`, the geometry constants
+`page_size` and `max_named_trees`, and `StoreFile`, through which it
+shares the file's environment (§3.1); it keeps raw byte keys and never
+goes through
 `db.zig`'s connections, trees, codec calls or refs.
 
 ---
@@ -271,7 +299,7 @@ and any operation on a closed connection or through a ref of one is
 
 | Form | Arity | Result |
 |---|---|---|
-| `(db/open path)` | 1 | A connection; creates the file and its parent directories. |
+| `(db/open path)` | 1 | A connection; creates the file and its parent directories. A file the process may only read opens read-only. |
 | `(db/close conn)` | 1 | nil; closing twice is nil; with a transaction open, `:db/busy`. |
 | `(db/ref conn tree key)` | 3 | A durable ref (§4); prints `#<durable-ref :tree hex:…>`. |
 | `(db/ref? x)` | 1 | Whether `x` is a durable ref. |
@@ -280,7 +308,7 @@ and any operation on a closed connection or through a ref of one is
 | `(db/delete-key! ref)` | 1 | Whether the key existed; one write transaction. |
 | `(db/present? ref)` | 1 | Whether the key exists. |
 | `(deref ref)`, `@ref`, `(db/deref ref)` | 1 | The stored value or nil; one read transaction. `db/deref` is the universal `deref` (vars, atoms, reduced too); another kind is `:not-derefable`. |
-| `(db/begin-write conn)` | 1 | A write transaction; a second one on the same connection while one is open is `:db/busy`. |
+| `(db/begin-write conn)` | 1 | A write transaction; while any connection or Nextomic store of the same file holds one, `:db/busy`. |
 | `(db/begin-read conn)` | 1 | A read transaction. |
 | `(db/commit! tx)` | 1 | nil; the transaction is over even when the commit fails. Any use of a finished transaction is `:tx-closed`. |
 | `(db/abort-write! tx)` / `(db/abort-read! tx)` | 1 | nil; aborting a finished transaction is nil. |
@@ -295,6 +323,15 @@ and any operation on a closed connection or through a ref of one is
 | `(with-tx [tx conn] body…)` | macro | Begins a write, commits after body and returns its value; when body throws, aborts and rethrows. |
 | `(with-read-tx [tx conn] body…)` | macro | Begins a read and aborts it after body, whether or not body throws. |
 | `(with-snapshot [snap conn] body…)` | macro | `with-read-tx` under the snapshot names. |
+
+**A callback holds its transaction.** `db/alter!` holds its
+transaction handle while it calls `f`, and `db/reduce-tree` while it
+walks: `db/commit!`, `db/abort-write!`, `db/abort-read!` and
+`db/release-snapshot!` of a held handle are `:db/busy`, so no callback
+finishes a transaction a native is still using. A throw from the
+callback ends the hold before it propagates, so `with-tx` aborts as
+usual; reads and writes through the handle, a nested `db/alter!`
+included, are allowed.
 
 A read transaction sees the store as of when it began and nothing
 committed after. A held snapshot keeps emdb from reclaiming the pages

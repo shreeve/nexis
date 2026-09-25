@@ -116,7 +116,6 @@ test "D1: 10000 random Values across 5 trees read back equal after commit" {
 
     var conn = try db.open(
         std.testing.allocator,
-        std.testing.io,
         &ctx.heap,
         &ctx.interner,
         path.ptr,
@@ -222,7 +221,6 @@ test "D2: reopen-connection readback (2000 Values, close+reopen between)" {
 
         var conn = try db.open(
             std.testing.allocator,
-            std.testing.io,
             &ctx.heap,
             &ctx.interner,
             path.ptr,
@@ -277,7 +275,6 @@ test "D2: reopen-connection readback (2000 Values, close+reopen between)" {
 
         var conn = try db.open(
             std.testing.allocator,
-            std.testing.io,
             &ctx.heap,
             &ctx.interner,
             path.ptr,
@@ -378,7 +375,6 @@ test "D4: same key in every tree returns its own value (no cross-contamination)"
 
     var conn = try db.open(
         std.testing.allocator,
-        std.testing.io,
         &ctx.heap,
         &ctx.interner,
         path.ptr,
