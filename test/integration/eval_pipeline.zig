@@ -1364,16 +1364,29 @@ test "integration: *command-line-args* is nil without arguments; read-line needs
     try expectOutput("[*command-line-args* (try (read-line) (catch any e e))]", "[nil :io-error]");
 }
 
-test "integration: =, hash, set membership and printing of data nested past the stack are :stack-overflow" {
-    try expectOutput("(let [deep (fn [] (reduce (fn [acc _] [acc]) [] (range 200000)))] [(try (= (deep) (deep)) (catch :stack-overflow e :deep)) (try (hash (deep)) (catch :stack-overflow e :deep)) (try #{(deep) (deep)} (catch :stack-overflow e :deep)) (try (pr-str (deep)) (catch :stack-overflow e :deep))])", "[:deep :deep :deep :deep]");
+test "integration: =, compare, flatten, hash, set membership and printing of data nested past the stack are :stack-overflow" {
+    // One chain of vectors 100k deep, built once: the test's 6 MiB
+    // guard (stack.main_thread_budget) stops every walk of it well
+    // before the bottom, in Debug and ReleaseFast alike (a ReleaseFast
+    // hash or print uses about 160 bytes a level, so about 40k levels
+    // reach the guard). `b` is `a` one level down, so `=` and
+    // `compare` walk both to the bottom with nothing else to build,
+    // and a collection under NEXIS_GC_STRESS marks one chain, not
+    // several.
+    try expectOutput(
+        \\(let [a (loop [acc [] i 0] (if (< i 100000) (recur [acc] (inc i)) acc))
+        \\      b (nth a 0)]
+        \\  [(try (= a b) (catch :stack-overflow e :deep))
+        \\   (try (compare a b) (catch :stack-overflow e :deep))
+        \\   (try (flatten a) (catch :stack-overflow e :deep))
+        \\   (try (hash a) (catch :stack-overflow e :deep))
+        \\   (try #{a b} (catch :stack-overflow e :deep))
+        \\   (try (pr-str a) (catch :stack-overflow e :deep))])
+    , "[:deep :deep :deep :deep :deep :deep]");
 }
 
 test "integration: a record prints as #ns.Type{...}; defrecord and defprotocol may be redefined" {
     try expectOutput("(defrecord P [x y]) (def old (->P 1 \"a\")) (defrecord P [x y z]) (defprotocol A (area [s])) (defprotocol A (area [s])) [(pr-str old) (pr-str (->P 1 2 3)) (= old (map->P {:x 1 :y \"a\"}))]", "[#user.P{:x 1, :y \"a\"} #user.P{:x 1, :y 2, :z 3} false]");
-}
-
-test "integration: flatten and compare of data nested past the stack are :stack-overflow" {
-    try expectOutput("(let [deep (fn [] (reduce (fn [acc _] [acc]) [] (range 200000)))] [(try (flatten (deep)) (catch :stack-overflow e :deep)) (try (compare (deep) (deep)) (catch :stack-overflow e :deep))])", "[:deep :deep]");
 }
 
 test "integration: core.nx composite + HOFs" {
