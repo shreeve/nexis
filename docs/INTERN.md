@@ -1,216 +1,122 @@
 ## INTERN.md — Keyword & Symbol Intern Tables
 
-Authoritative contract for the process-local
-keyword and symbol intern tables that back `Value.fromKeywordId` /
-`Value.fromSymbolId`. Derivative from `PLAN.md` §8.4, §10.5, §15.10 and
-`docs/SEMANTICS.md` §5. PLAN.md wins on conflict.
+The contract of `src/intern.zig`: the process-local tables that map
+keyword and symbol names to the ids `Value.fromKeywordId` and
+`Value.fromSymbolId` carry, and the record-type names the printer
+reads. PLAN §23 #32 freezes the keyword/symbol asymmetry; equality and
+hashing of the two kinds are `docs/SEMANTICS.md` §2.5 and §3.3.
 
-This is the smallest piece of the runtime that persists identity across
-read/eval cycles inside a process. Every bit of state it carries — id,
-ordering, byte ownership, table disjointness — is frozen before first use.
-Changing any of §1, §2, §3, or §5 below requires a PLAN amendment.
+A VM owns one `Interner` (`VM.ensureInterner`); a sub-VM the expander
+runs macros on shares its owner's (`borrowed_interner`), so ids agree
+across the two. §1–§3 are the contract; §4 is private.
 
 ---
 
-### 1. Scope and invariants
+### 1. Invariants
 
-The interner maps **textual names** to **dense process-local `u32` ids** for
-two independent namespaces:
+The interner maps **names** to **dense `u32` ids** in two independent
+tables, one for keywords and one for symbols.
 
-- keyword ids (consumed by `Value.fromKeywordId`)
-- symbol ids (consumed by `Value.fromSymbolId`)
+1. **Dense from 0, per table.** The first name interned in a table gets
+   `0`, the Nth distinct name `N-1`. Ids are never reused and tables
+   never shrink. No id is reserved: `nil` is the all-zero Value because
+   its kind is 0 (`docs/VALUE.md` §1.2), so a keyword with id 0 is an
+   ordinary keyword.
+2. **Idempotent.** Interning the same bytes again returns the original
+   id. There is no normalization (no NFC/NFD, SEMANTICS §2.4).
+3. **Independent id spaces.** The keyword and symbol tables share
+   nothing; the same text may have different ids in each. The Value
+   layer keeps `:foo` and `'foo` apart by kind and hash domain
+   (SEMANTICS §3.3), not the interner.
+4. **Byte-exact round trip.** `keywordName(internKeyword(s))` is `s`
+   byte for byte, and likewise for symbols.
+5. **The interner owns the name bytes.** Each name is copied on its
+   first intern and freed by `deinit`, so a caller may pass a
+   transient buffer (a slice of source text); a returned name lives as
+   long as the interner.
+6. **No unintern, no weak entries.** The tables grow monotonically
+   for the process's life: every distinct name read, decoded from a
+   store or built with `(keyword s)` / `(symbol s)` stays (PLAN §25
+   risk #16). A process that reads untrusted stores or input keeps
+   every name it has seen.
+7. **Empty names are rejected** (`error.EmptyName`). The reader never
+   produces one, but codec decode and `(keyword "")` reach the
+   interner directly; the language raises `:invalid-argument`.
+8. **Bounded id space.** An intern that would take a table past
+   `maxInt(u32)` entries returns `error.InternTableFull`, so the id
+   cast cannot truncate.
 
-Non-negotiable invariants:
-
-1. **Dense-from-0 ids, per table.** First intern in a table returns `0`,
-   the Nth distinct name returns `N-1`. Ids are never reused; tables never
-   shrink. There is **no reserved sentinel id**. The `nil == all-zero Value`
-   rule (VALUE.md §2.1) is a per-kind invariant at kind `0`, not a
-   cross-kind invariant on payload zero, so a keyword with id `0` is a
-   fully legitimate value.
-2. **Idempotence.** Second intern of the same byte sequence returns the
-   original id. No rehash, no canonicalization (no NFC/NFD — consistent
-   with SEMANTICS §2.4).
-3. **Independent id spaces.** The keyword table and the symbol table share
-   no ids. The same text may intern to different ids in each; Value-layer
-   hash-domain separation (`mixKindDomain` over the `Kind` byte, see
-   `docs/SEMANTICS.md` §3.2) keeps `(= :foo 'foo) ⇒ false` and
-   `(hash :foo) ≠ (hash 'foo)`.
-4. **Byte-exact round-trip.** For every successfully-interned name `s`,
-   `keywordName(internKeyword(s)) == s` byte-for-byte, and the same for
-   symbols. No trimming, no normalization, no folding.
-5. **Name bytes owned by the interner.** Each name is duplicated into
-   interner-owned storage on first intern and freed in `deinit`. Callers
-   may pass transient buffers (e.g. slices into a parser buffer); the
-   returned name slice from `keywordName`/`symbolName` lives as long as
-   the interner.
-6. **No unintern, no weak semantics, no rehash-to-different-ids.** A
-   long-lived REPL session grows the tables monotonically (risk #16 in
-   PLAN §25), and so does every distinct keyword or symbol name decoded
-   from a store or built with `(keyword s)` / `(symbol s)`: a process
-   that reads untrusted stores or input keeps each name it has seen.
-7. **Empty names are rejected** at the intern layer. The reader already
-   won't produce them, but the intern API is also reachable from codec
-   decode and direct runtime construction, so the
-   rejection is pinned here rather than delegated upstream.
-8. **ID-space bound.** An intern call that would make the table exceed
-   `maxInt(u32)` entries returns `error.InternTableFull`. In practice
-   unreachable; pinned for correctness of the `usize → u32` cast.
+`test/prop/intern.zig` I1–I10 check invariants 1–5, the qualified
+split (§3) and the map/list lockstep (§4) over random names.
 
 ---
 
 ### 2. Public API
 
-```zig
-pub const Interner = struct {
-    pub fn init(gpa: std.mem.Allocator) Interner;
-    pub fn deinit(self: *Interner) void;
+| `Interner` member | Contract |
+|---|---|
+| `init(gpa)`, `deinit()` | Empty tables; `deinit` frees every name |
+| `internKeyword(name) !u32`, `internSymbol(name) !u32` | The dense id (§1) |
+| `internKeywordValue(name) !Value`, `internSymbolValue(name) !Value` | The same, wrapped as a Value |
+| `internQualifiedKeyword(ns, name) !Value`, `internQualifiedSymbol(ns, name) !Value` | Interns `ns/name`, or `name` when `ns` is null (§3) |
+| `splitQualified(full)` | `{ ns: ?[]const u8, name: []const u8 }`, without allocating (§3) |
+| `keywordName(id)`, `symbolName(id)` | The name. An out-of-range id panics in every build mode: every id comes from the table, so a bad one is a runtime bug, not a user error |
+| `keywordCount()`, `symbolCount()` | The table sizes |
+| `nameRecordType(type_id, ns, name) !void` | Names a record type `ns.name`, the printer's source for `#ns.Type{...}` (`docs/PROTOCOLS.md` §2.1); naming an id again renames it |
+| `recordTypeName(type_id) ?[]const u8` | That name, or null for a type never named |
 
-    // Raw intern — returns the dense id. Error on OOM, empty name, or
-    // table-full.
-    pub fn internKeyword(self: *Interner, name: []const u8) !u32;
-    pub fn internSymbol (self: *Interner, name: []const u8) !u32;
-
-    // Convenience: return a fully-constructed Value. Preferred at call
-    // sites that don't need the raw id.
-    pub fn internKeywordValue(self: *Interner, name: []const u8) !value.Value;
-    pub fn internSymbolValue (self: *Interner, name: []const u8) !value.Value;
-
-    // `ns/name` in one step, and its inverse (§3).
-    pub fn internQualifiedKeyword(self: *Interner, ns: ?[]const u8, name: []const u8) !value.Value;
-    pub fn internQualifiedSymbol (self: *Interner, ns: ?[]const u8, name: []const u8) !value.Value;
-    pub fn splitQualified(full: []const u8) struct { ns: ?[]const u8, name: []const u8 };
-
-    // Name accessors. Panic **unconditionally** (every build mode) if
-    // `id` is out of range for the table — every id comes from the
-    // table, so an out-of-range one is a runtime bug upstream, not a
-    // user error to surface.
-    pub fn keywordName(self: *const Interner, id: u32) []const u8;
-    pub fn symbolName (self: *const Interner, id: u32) []const u8;
-
-    pub fn keywordCount(self: *const Interner) u32;
-    pub fn symbolCount (self: *const Interner) u32;
-
-    // Record type names, by dense per-VM type id: the printer's source
-    // for `#ns.Type{...}` (PROTOCOLS.md §2.1). The VM names each type
-    // as it registers it; an id never named reads back null.
-    pub fn nameRecordType(self: *Interner, type_id: u32, ns: []const u8, name: []const u8) !void;
-    pub fn recordTypeName(self: *const Interner, type_id: u32) ?[]const u8;
-};
-```
-
-Interned names are plain allocations, not heap objects: the collector
-never visits the interner.
-```
-
-**Error set.** `internKeyword` / `internSymbol` / their `*Value`
-variants return a union of:
-
-- `error.OutOfMemory` — allocator rejected the name dup or map growth
-- `error.EmptyName` — the input is a zero-length slice
-- `error.InternTableFull` — would exceed `maxInt(u32)` entries
-
-These errors are surfaced; callers decide whether to map them to
-`:name-error` / `:oom` etc.
+The intern calls fail with `error.OutOfMemory`, `error.EmptyName` or
+`error.InternTableFull` (`InternError`); the stdlib maps `EmptyName`
+to `:invalid-argument` and the other two to the VM's uncatchable
+`OutOfMemory` (`docs/VM.md` §13). A failed intern leaves both tables
+unchanged.
 
 ---
 
 ### 3. Qualified names
 
 A qualified keyword or symbol is interned under its full text
-`ns/name`. `internQualifiedKeyword` / `internQualifiedSymbol` build that
-text; `splitQualified` takes it apart again at the **first** slash, as
-Clojure's `namespace` and `name` do:
+`ns/name`. `internQualifiedKeyword` / `internQualifiedSymbol` build
+that text; `splitQualified` takes it apart again at the **first**
+slash, as Clojure's `namespace` and `name` do:
 
-| Full text        | `ns`           | `name`  |
-|------------------|----------------|---------|
-| `"foo"`          | null           | `"foo"` |
-| `"/"`            | null           | `"/"`   |
-| `"ns/foo"`       | `"ns"`         | `"foo"` |
-| `"a/b/c"`        | `"a"`          | `"b/c"` |
-| `"nexis.core//"` | `"nexis.core"` | `"/"`   |
+| Full text | `ns` | `name` |
+|---|---|---|
+| `"foo"` | null | `"foo"` |
+| `"/"` | null | `"/"` |
+| `"ns/foo"` | `"ns"` | `"foo"` |
+| `"a/b/c"` | `"a"` | `"b/c"` |
+| `"nexis.core//"` | `"nexis.core"` | `"/"` |
 
-The bare `/` is the unqualified division symbol (`clojure.core//` in
-Clojure, `nexis.core//` here), not a qualification. `splitQualified`
-does not allocate; the slices point into its input.
+The bare `/` is the unqualified division symbol, not a qualification;
+qualified, it is `nexis.core//` (Clojure's `clojure.core//`). The
+returned slices point into the argument.
 
 ---
 
 ### 4. Internal shape
 
-Private; subject to change without amendment so long as §1–§3 hold.
-
-```zig
-const Table = struct {
-    by_name: std.StringHashMapUnmanaged(u32),    // name -> id
-    names:   std.ArrayListUnmanaged([]const u8), // id -> duped name
-};
-```
-
-Insertion sequence in `internInto` (lookup-then-insert, with errdefer
-cleanup on allocator failure):
-
-1. Reject empty name: `if (name.len == 0) return error.EmptyName`.
-2. Existing-id fast path: `if (by_name.get(name)) |id| return id`.
-   `StringHashMap` hashes by byte content, so the caller's transient
-   slice finds the entry even when the stored key points at duped bytes.
-3. Bound check: `if (names.items.len >= maxInt(u32)) return
-   error.InternTableFull`, so the subsequent `@intCast` to `u32`
-   cannot truncate.
-4. `dup := gpa.dupe(u8, name)` with `errdefer gpa.free(dup)`.
-5. `names.append(gpa, dup)` with `errdefer _ = names.pop()`.
-6. `by_name.put(gpa, dup, id)` — on failure, the two `errdefer`s
-   above unwind in reverse order: pop the `names` entry, then free
-   the dup. No state change escapes.
-7. Debug assert `by_name.count() == names.items.len` before returning.
-
-The map's key `dup` points at the interner-owned byte buffer (NOT into
-`names.items`'s backing array, which may relocate on growth), so the
-key stays valid for the interner's lifetime. This is exercised by the
-`"by_name lookups survive names reallocation"` inline test.
-
-Two hash-map probes occur on the insert path (one `get`, one `put`);
-on the hit path only one. A single-probe `getOrPut` refactor that
-also carries the caller's transient slice into the new-entry branch
-and then overwrites the key pointer with `dup` is not done — the
-intern table is cold outside startup, and the simpler
-code is easier to audit for errdefer correctness.
-
-`deinit` frees every duped name, then clears both containers, after
-asserting the lockstep invariant one more time so a corrupted
-mutation path (if one ever slipped in) fails at teardown rather than
-silently leaking.
+Each table is a `StringHashMapUnmanaged(u32)` from name to id and an
+`ArrayListUnmanaged([]const u8)` from id to the owned copy of the
+name; the map's key is that copy, never a slice of the list's backing
+array, which moves when the list grows. `internInto`, shared by both
+tables, rejects an empty name, returns an existing id on a hit, checks
+the bound, then copies the name, appends it and inserts it, each step
+undone by an `errdefer` if a following step fails. Both `internInto` and
+`deinit` assert that the map and the list have the same length.
 
 ---
 
 ### 5. Interaction with other layers
 
-- **Value layer.** Ids produced here feed directly into
-  `Value.fromKeywordId` / `Value.fromSymbolId`. Those constructors do
-  not validate the id — validity is an interner-level invariant.
-- **Hash/Eq.** The Value layer's `hashValue` and `equal` already handle
-  keyword/symbol disjointness via `Kind` byte and `mixKindDomain`. The
-  interner is not consulted by `hashValue` or `equal` — hashing an id
-  is independent of whether the id is in the table.
-- **Codec.** Serialization always emits textual form
-  (PLAN §15.10 / SEMANTICS §5). Deserialization calls `internKeyword` /
-  `internSymbol` on the receiving end. Ids are **never** serialized;
-  they are process-local.
-- **GC.** Names are not heap objects; the collector never visits the
-  interner.
+- **Value layer.** `Value.fromKeywordId` / `fromSymbolId` do not
+  validate an id; validity is this module's invariant. Equality and
+  hashing read the id and never consult the interner.
+- **Codec.** A keyword or symbol is written as its name and re-interned
+  when decoded; ids never leave the process (`docs/CODEC.md`).
+- **Collector.** Names are plain allocations, not heap blocks; the
+  collector never visits the interner (`docs/GC.md` §2).
+- **Namespaces.** Vars and namespaces live in `src/vm.zig`; the
+  interner holds only the text of a qualified name.
 
----
-
-### 6. What INTERN.md does not cover
-
-- **Metadata on symbols** — symbols carry none (SEMANTICS §7).
-- **String interning.** Strings are not interned by default (PLAN §8.4).
-  There is no `(intern s)` operation on strings; one would live in
-  the string module, not here.
-- **Namespace objects** (the Clojure-style `Namespace` bearing Vars).
-  Those live in `src/vm.zig` (`Namespace`, `NamespaceRegistry`). The
-  interner stores
-  the *textual* `"ns/local"` form only.
-- **Multi-isolate sharing.** The runtime is single-isolate; each
-  isolate has its own `Interner`. Cross-isolate intern sharing is an
-  open research direction (PLAN §16.4).
+Symbols carry no metadata (SEMANTICS §7), and strings are not interned.
