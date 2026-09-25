@@ -3048,6 +3048,40 @@ test "defrecord impls: multiple methods" {
     , "[5 12]");
 }
 
+test "protocol methods: several arities, in either Clojure spelling, dispatch by argument count" {
+    // Separate clauses per arity, Clojure's defrecord spelling.
+    try expectOutputProgram(
+        \\(defprotocol P (m [s] [s x]))
+        \\(defrecord R [a]
+        \\  P
+        \\  (m [this] [:one a])
+        \\  (m [this x] [:two a x]))
+        \\[(m (->R 1)) (m (->R 1) 2)]
+    , "[[:one 1] [:two 1 2]]");
+    // One clause listing its arities, Clojure's extend spelling.
+    try expectOutputProgram(
+        \\(defprotocol P (m [s] [s x]))
+        \\(defrecord R [a] P (m ([this] [:one a]) ([this x] [:two a x])))
+        \\(extend-type :string P (m ([s] [:s1 s]) ([s x] [:s2 s x])))
+        \\(extend-protocol P :fixnum (m ([n] [:n1 n]) ([n x] [:n2 n x])) :keyword (m [k] :k1) (m [k x] :k2))
+        \\[(m (->R 1)) (m (->R 1) 2) (m "a") (m "a" 2) (m 5) (m 5 6) (m :z) (m :z 1)]
+    , "[[:one 1] [:two 1 2] [:s1 a] [:s2 a 2] [:n1 5] [:n2 5 6] :k1 :k2]");
+    // A variadic arity, and an arity no impl has.
+    try expectOutputProgram(
+        \\(defprotocol P (m [s] [s x] [s x y]))
+        \\(extend-type :fixnum P (m ([n] n) ([n & xs] (apply + n xs))))
+        \\[(m 1) (m 1 2 3) (try (m "x") (catch any e e))]
+    , "[1 6 :no-protocol-impl]");
+    try expectOutputProgram(
+        \\(defprotocol P (m [s] [s x]))
+        \\(defrecord R [a] P (m [this] 1))
+        \\(try (m (->R 1) 2) (catch any e e))
+    , ":arity-mismatch");
+    // The same arity twice is the fn overload error.
+    try expectMacroFailure("(defprotocol P (m [s]))", "(defrecord R [a] P (m [this] 1) (m [that] 2))", "fn: two overload clauses take 1 arguments", "(m [that] 2)");
+    try expectMacroFailure("(defprotocol P (m [s]))", "(extend-type :string P (m ([s] 1) [s]))", "expected the method's parameter vector or its arities ([params] body...), not a vector", "[s]");
+}
+
 test "defrecord impls: multiple protocols on one record" {
     try expectOutputProgram(
         \\(do

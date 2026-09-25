@@ -2145,23 +2145,24 @@ fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *F
     return makeList(ctx, out.items, b.origin);
 }
 
-/// An inline `defrecord` method `(fn [this p...] body...)` with the
-/// record's fields in scope, as in Clojure: `(fn [g p...] (let* [f
-/// (nexis.core/get g :f) ...] (let [this g] body...)))`. A field
-/// named anywhere in the parameters is left out, so a parameter
-/// shadows it; a field assoc'd onto the record is what the method
-/// sees.
-fn recordMethod(b: Builder, fields: []const *Form, method: []const *Form) ExpandError!*Form {
-    const params = (try stripParams(b.ctx, method[1])).datum.vector;
-    if (params.len == 0) return b.ctx.fail(method[1].origin, "a record method takes the record as its first parameter", .{});
+/// One arity `([this p...] body...)` of an inline `defrecord` method
+/// with the record's fields in scope, as in Clojure: `([g p...]
+/// (let* [f (nexis.core/get g :f) ...] (let [this g] body...)))`. A
+/// field named anywhere in the parameters is left out, so a
+/// parameter shadows it; a field assoc'd onto the record is what the
+/// method sees.
+fn recordArity(b: Builder, fields: []const *Form, arity: *const Form) ExpandError!*Form {
+    const items = arity.datum.list;
+    const params = (try stripParams(b.ctx, items[0])).datum.vector;
+    if (params.len == 0) return b.ctx.fail(items[0].origin, "a record method takes the record as its first parameter", .{});
     const g = try b.gensym("this");
     var bindings: std.ArrayList(*Form) = .empty;
     for (fields) |field| {
-        if (try namesSymbol(method[1], field.datum.symbol.name)) continue;
+        if (try namesSymbol(items[0], field.datum.symbol.name)) continue;
         try bindings.appendSlice(b.ctx.allocator, &.{ field, try b.list(.{ "nexis.core/get", g, try b.kw(field.datum.symbol.name) }) });
     }
-    const body = try b.list(.{ "nexis.core/let", try b.vec(.{ params[0], g }), method[2..] });
-    return b.list(.{ "nexis.core/fn", try b.vec(.{ g, params[1..] }), try b.list(.{ "let*", try b.vec(.{bindings.items}), body }) });
+    const body = try b.list(.{ "nexis.core/let", try b.vec(.{ params[0], g }), items[1..] });
+    return b.list(.{ try b.vec(.{ g, params[1..] }), try b.list(.{ "let*", try b.vec(.{bindings.items}), body }) });
 }
 
 /// Whether the symbol `name` appears anywhere in `form`.
@@ -2230,28 +2231,79 @@ fn extendForm(ctx: *ExpandContext, call_form: *const Form, clauses: []const *For
     return makeList(ctx, out.items, b.origin);
 }
 
-/// One extend call per method clause in `clauses` onto `out`; a
-/// symbol or keyword clause switches the protocol (or, for
-/// `extend-protocol`, the type) the following methods belong to.
+/// One extend call per method in `clauses` onto `out`; a symbol or
+/// keyword clause switches the protocol (or, for `extend-protocol`,
+/// the type) the following methods belong to. A method's arities are
+/// every clause of its name under that header, each `(name [params]
+/// body...)` or `(name ([params] body...) ...)`, and its impl one
+/// `fn` over them all, so the call's argument count picks the arity.
 fn extendClauses(b: Builder, clauses: []const *Form, anchor: ExtendAnchor, out: *std.ArrayList(*Form)) ExpandError!void {
     var current: ?*const Form = null;
-    for (clauses) |clause| {
-        if (clause.datum == .symbol or (clause.datum == .keyword and anchor == .protocol)) {
+    var start: usize = 0;
+    while (start < clauses.len) {
+        const clause = clauses[start];
+        if (isExtendHeader(clause, anchor)) {
             current = clause;
+            start += 1;
             continue;
         }
-        if (clause.datum != .list or clause.datum.list.len < 2) return b.ctx.fail(clause.origin, "expected a protocol name or a method (name [params] body...), not {s}", .{describeForm(clause)});
         const other = current orelse return b.ctx.fail(clause.origin, "a method needs a protocol name before it", .{});
-        const method = clause.datum.list;
-        const method_key = try b.kw(try plainName(b.ctx, method[0], "a method name"));
-        if (stripMeta(method[1]).datum != .vector) return b.ctx.fail(method[1].origin, "expected the method's parameter vector, not {s}", .{describeForm(method[1])});
-        const impl = if (anchor == .record) try recordMethod(b, anchor.record.fields, method) else try b.list(.{ "nexis.core/fn", method[1..] });
-        const protocol, const type_form = switch (anchor) {
-            .type_ => |t| .{ other, t },
-            .protocol => |p| .{ p, other },
-            .record => |r| .{ other, r.name },
-        };
-        try out.append(b.ctx.allocator, try extendCall(b, protocol, type_form, method_key, impl));
+        var end = start;
+        while (end < clauses.len and !isExtendHeader(clauses[end], anchor)) : (end += 1) {
+            const c = clauses[end];
+            if (c.datum != .list or c.datum.list.len < 2) return b.ctx.fail(c.origin, "expected a protocol name or a method (name [params] body...), not {s}", .{describeForm(c)});
+            _ = try plainName(b.ctx, c.datum.list[0], "a method name");
+        }
+        const run = clauses[start..end];
+        for (run, 0..) |method, i| {
+            const name = method.datum.list[0].datum.symbol.name;
+            if (methodIndex(run[0..i], name) != null) continue;
+            var arities: std.ArrayList(*Form) = .empty;
+            for (run[i..]) |same| {
+                if (!std.mem.eql(u8, same.datum.list[0].datum.symbol.name, name)) continue;
+                try methodArities(b.ctx, same, &arities);
+            }
+            var clauses_out: std.ArrayList(*Form) = .empty;
+            for (arities.items) |arity| {
+                try clauses_out.append(b.ctx.allocator, if (anchor == .record) try recordArity(.{ .ctx = b.ctx, .origin = arity.origin }, anchor.record.fields, arity) else arity);
+            }
+            const impl = if (clauses_out.items.len == 1)
+                try b.list(.{ "nexis.core/fn", clauses_out.items[0].datum.list })
+            else
+                try b.list(.{ "nexis.core/fn", clauses_out.items });
+            const protocol, const type_form = switch (anchor) {
+                .type_ => |t| .{ other, t },
+                .protocol => |p| .{ p, other },
+                .record => |r| .{ other, r.name },
+            };
+            try out.append(b.ctx.allocator, try extendCall(b, protocol, type_form, try b.kw(name), impl));
+        }
+        start = end;
+    }
+}
+
+/// Whether `clause` names the protocol (or, for `extend-protocol`,
+/// the type) the methods after it belong to.
+fn isExtendHeader(clause: *const Form, anchor: ExtendAnchor) bool {
+    return clause.datum == .symbol or (clause.datum == .keyword and anchor == .protocol);
+}
+
+/// The position in `methods` of the first clause named `name`.
+fn methodIndex(methods: []const *Form, name: []const u8) ?usize {
+    for (methods, 0..) |m, i| if (std.mem.eql(u8, m.datum.list[0].datum.symbol.name, name)) return i;
+    return null;
+}
+
+/// The arities `([params] body...)` of one method clause onto `out`:
+/// `(name [params] body...)` has one, at the clause's span, and
+/// `(name ([params] body...) ...)` lists its own.
+fn methodArities(ctx: *ExpandContext, method: *const Form, out: *std.ArrayList(*Form)) ExpandError!void {
+    const items = method.datum.list;
+    if (stripMeta(items[1]).datum == .vector) return out.append(ctx.allocator, try makeList(ctx, items[1..], method.origin));
+    for (items[1..]) |arity| {
+        if (arity.datum != .list or arity.datum.list.len == 0 or stripMeta(arity.datum.list[0]).datum != .vector)
+            return ctx.fail(arity.origin, "expected the method's parameter vector or its arities ([params] body...), not {s}", .{describeForm(arity)});
+        try out.append(ctx.allocator, mutCast(arity));
     }
 }
 
