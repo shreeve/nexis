@@ -46,7 +46,9 @@ Non-negotiable invariants:
    the interner.
 6. **No unintern, no weak semantics, no rehash-to-different-ids.** A
    long-lived REPL session grows the tables monotonically (risk #16 in
-   PLAN §25).
+   PLAN §25), and so does every distinct keyword or symbol name decoded
+   from a store or built with `(keyword s)` / `(symbol s)`: a process
+   that reads untrusted stores or input keeps each name it has seen.
 7. **Empty names are rejected** at the intern layer. The reader already
    won't produce them, but the intern API is also reachable from codec
    decode and direct runtime construction, so the
