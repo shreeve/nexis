@@ -21,8 +21,8 @@ consists of:
    `(hash (list 1 2 3)) == (hash [1 2 3])` hold.
 
 **The module provides construction, the canonical trie/tail
-representation, `conj`, `assoc`, `nth`, `count`, the cursor and
-cross-kind integration.** `pop`, `subvec`, `concat` and the
+representation, `conj`, `assoc`, `pop`, `nth`, `count`, the cursor and
+cross-kind integration.** `subvec`, `concat` and the
 small-vector-inline (subkind 0) space optimization do not exist;
 transients wrap the persistent ops (`docs/TRANSIENT.md`).
 
@@ -37,6 +37,9 @@ transients wrap the persistent ops (`docs/TRANSIENT.md`).
 - Construction: `empty(heap)`, `fromSlice(heap, elems)`, `conj(heap,
   v, elem)` (O(1) amortized append with automatic tail promotion and
   root-shift growth).
+- Update: `assoc(heap, v, i, elem)` (O(log₃₂ n) path copy; O(1) in
+  the tail) and `pop(heap, v)` (§6: O(1) while the tail holds more
+  than one element, O(log₃₂ n) when the last leaf becomes the tail).
 - Accessors: `count(v)`, `nth(v, i) Value` (O(log₃₂ n)),
   `isEmpty(v)`.
 - Per-kind dispatch: `hashSeq(h, elementHash) u64` + `equalSeq(a, b,
@@ -50,8 +53,6 @@ transients wrap the persistent ops (`docs/TRANSIENT.md`).
 - `assoc n v` — O(log₃₂ n) path-copy update. Significant additional
   code; independent of the architectural composition story this
   commit is retiring.
-- `pop` — has a non-trivial tail-promotion case when tail becomes
-  empty and must be pulled up from the trie.
 - `subvec`, `concat` — O(n) regardless of implementation
   choice (PLAN §9.2); not architecturally interesting.
 - **Transients** — `docs/TRANSIENT.md`, alongside map/set transient
@@ -204,6 +205,10 @@ Lives in `src/coll/vector.zig` (a plain trie, not RRB, per PLAN §23
 pub fn empty(heap: *Heap) !value.Value;
 pub fn fromSlice(heap: *Heap, elems: []const value.Value) !value.Value;
 pub fn conj(heap: *Heap, v: value.Value, elem: value.Value) !value.Value;
+/// `i < count(v)`.
+pub fn assoc(heap: *Heap, v: value.Value, i: usize, elem: value.Value) !value.Value;
+/// `v` must not be empty.
+pub fn pop(heap: *Heap, v: value.Value) !value.Value;
 
 pub fn count(v: value.Value) usize;
 pub fn isEmpty(v: value.Value) bool;
@@ -246,6 +251,14 @@ misstep; the impl + tests must cover all of them explicitly.
 - **Structural invariants on leaf vs tail.** Leaves (subkind 3) are
   always exactly 32 Values; tail (subkind 4) is the ONLY partial
   node. Mixing these breaks the trie path arithmetic.
+- **`pop` when the tail empties.** A tail of one element pops to the
+  trie's last leaf as the new 32-element tail (a leaf and a full tail
+  share one layout, so the node is reused as it stands). The leaf's
+  path is removed from the trie: an interior left with no children is
+  dropped, and a root at shift ≥ 10 left with only child 0 is replaced
+  by that child, so the shift drops by 5. The result has exactly the
+  shape `fromSlice` builds for the remaining elements. `pop` of a
+  one-element vector is the empty vector.
 - **`tail_len` is the authority.** Do not derive tail length from
   `count % 32` — it's wrong for the boundary case `count == 32` (tail
   is full, not empty).
@@ -354,7 +367,7 @@ list/vector cross-kind equality:
 
 ### 10. What VECTOR.md does not cover
 
-- **`pop`, `subvec`, `concat`** — do not exist (`assoc n v` does, §5).
+- **`subvec`, `concat`** — do not exist in this module.
 - **Transients** — `docs/TRANSIENT.md`.
 - **RRB relaxation** — absent per PLAN §23 #30.
 - **Small-vector inline (subkind 0)** — reserved, no implementation.
