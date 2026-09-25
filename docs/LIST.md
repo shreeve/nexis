@@ -57,7 +57,9 @@ reader and macro material; large sequences are vectors.
    computes the same value for the same elements. The caller mixes in
    the sequential domain byte. A cons cell caches a nonzero result in
    its header (SEMANTICS §3.1); a view caches nothing, because every
-   offset of it shares one header.
+   offset of it shares one header. A view used over and over as a map
+   key (memoizing on `(rest args)`) is rehashed in O(n) at each lookup;
+   `vec` of it gives a key that caches its hash.
 3. **Equality.** `equalSeq` walks both lists in lock step through their
    cursors: same length and every pair `=`.
 4. **Metadata** (SEMANTICS §7). Lists carry metadata in the header's
