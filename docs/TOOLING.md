@@ -166,8 +166,10 @@ into a temporary because `(+ acc i)` still reads `i` (COMPILER.md
   names them, then operands A, B and C. An operand prints its kind
   letter and index (VM.md §4: `s` slot, `c` constant, `v` var, `u`
   upvalue, `i` intern, `j` jump, `e` durable), `-` when unused. A
-  constant shows its value as `pr-str` prints it (`c2=1`) or the
-  routine it holds (`c0=<routine adder>`); a var its name
+  constant shows its value as `pr-str` prints it (`c2=1`), cut at a
+  space within 60 bytes and followed by ` ...` and, for a collection,
+  its item count when longer (`c0=[0 1 2 ... 22 ...(5000 items)`), or
+  the routine it holds (`c0=<routine adder>`); a var its name
   (`v0=println`); a jump its target pc (`j0009`). Operand B of
   `call:call`, `call:tailcall` and every `coll:*` is a raw immediate
   (VM.md §4.5) and prints as `#n`; `closure:make`'s B prints its
