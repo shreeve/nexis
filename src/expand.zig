@@ -47,6 +47,7 @@ const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
 const heap_mod = @import("heap.zig");
 const bignum_mod = @import("bignum.zig");
+const stack = @import("stack.zig");
 
 const Form = reader_mod.Form;
 const Datum = reader_mod.Datum;
@@ -216,10 +217,10 @@ pub const ExpandEnv = struct {
     }
 };
 
-/// MACROEXPAND.md §6 — matches Clojure's default. The expander
-/// increments depth on EACH macro expansion (not on tree-walk
-/// recursion). Catches infinite macro loops without limiting
-/// legitimate deep source.
+/// MACROEXPAND.md §6: how many times in a row the form at one
+/// position may be a macro call whose expansion is again a macro
+/// call. Nesting in the source never counts; the native stack guard
+/// bounds that.
 pub const MAX_EXPANSION_DEPTH: u32 = 256;
 
 // =============================================================================
@@ -304,6 +305,8 @@ pub fn expandProgram(
 // Internal walker
 // =============================================================================
 
+/// `form` expanded, `depth` being how many macro expansions in a row
+/// produced it at this position; its sub-forms start again at 0.
 fn expandFormDepth(
     ctx: *ExpandContext,
     env: ?*const ExpandEnv,
@@ -311,6 +314,7 @@ fn expandFormDepth(
     depth: u32,
 ) ExpandError!*Form {
     if (depth > MAX_EXPANSION_DEPTH) return ExpandError.ExpansionDepthExceeded;
+    try checkStack();
 
     return switch (form.datum) {
         // ---- Leaves — pass through unchanged. -----------------
@@ -325,9 +329,9 @@ fn expandFormDepth(
         // by their dedicated walkers (which do their own
         // per-form traversal); this arm catches top-level
         // collection-literal expressions.
-        .vector => |items| try expandCollKind(ctx, env, form, items, depth, .vector_),
-        .map => |items| try expandCollKind(ctx, env, form, items, depth, .map_),
-        .set => |items| try expandCollKind(ctx, env, form, items, depth, .set_),
+        .vector => |items| try expandCollKind(ctx, env, form, items, .vector_),
+        .map => |items| try expandCollKind(ctx, env, form, items, .map_),
+        .set => |items| try expandCollKind(ctx, env, form, items, .set_),
         // ---- Quote — OPAQUE per MACROEXPAND.md §2b. ----------
         // The expander does NOT recurse into the payload of a
         // quote form. `(quote (when x y))` MUST NOT expand
@@ -356,7 +360,7 @@ fn expandFormDepth(
         // equivalent `(fn* [params] body...)` form. The
         // result is recursively re-expanded so macros nested
         // in the body still fire.
-        .anon_fn => |items| try expandAnonFn(ctx, env, form, items, depth),
+        .anon_fn => |items| try expandFormDepth(ctx, env, try anonFnForm(ctx, form, items), depth),
         // with_meta is metadata attached to a target form; it
         // passes through and the expander does not descend into
         // the target.
@@ -380,7 +384,7 @@ fn expandFormDepth(
                 .origin = form.origin,
             };
             items[0] = deref_sym;
-            items[1] = try expandFormDepth(ctx, env, inner, depth);
+            items[1] = try expandForm(ctx, env, inner);
             const call = try makeList(ctx, items, form.origin);
             break :blk call;
         },
@@ -394,6 +398,13 @@ fn expandFormDepth(
 /// reads the form; nothing in the pipeline writes back to it.
 inline fn mutCast(form: *const Form) *Form {
     return @constCast(form);
+}
+
+/// The native stack guard (`stack.zig`) for every recursion of the
+/// expander over a form: a form nested past the stack's budget is
+/// `ExpansionDepthExceeded`, never a fault.
+inline fn checkStack() ExpandError!void {
+    stack.check() catch return ExpandError.ExpansionDepthExceeded;
 }
 
 /// Dispatch a list form: check for special form / macro / call.
@@ -411,7 +422,7 @@ fn expandList(
     // Non-symbol head → ordinary call; expand head + all args.
     const head_form = items[0];
     if (head_form.datum != .symbol) {
-        return try expandOrdinaryCall(ctx, env, list_form, items, depth);
+        return try expandOrdinaryCall(ctx, env, list_form, items);
     }
     const head_sym = head_form.datum.symbol;
 
@@ -425,29 +436,29 @@ fn expandList(
         if (qualifiedHostMacro(ctx, ns_prefix, head_sym.name)) |macro_fn| {
             return try invokeMacro(ctx, env, macro_fn, list_form, items, depth);
         }
-        return try expandOrdinaryCall(ctx, env, list_form, items, depth);
+        return try expandOrdinaryCall(ctx, env, list_form, items);
     }
     const name = head_sym.name;
 
     // ---- Special forms (NOT shadowable, NOT macro-replaceable). --
     if (std.mem.eql(u8, name, "quote")) return mutCast(list_form);
-    if (std.mem.eql(u8, name, "if")) return try expandIf(ctx, env, list_form, items, depth);
-    if (std.mem.eql(u8, name, "do")) return try expandDo(ctx, env, list_form, items, depth);
-    if (std.mem.eql(u8, name, "let*")) return try expandLetStar(ctx, env, list_form, items, depth);
-    if (std.mem.eql(u8, name, "loop*")) return try expandLetStar(ctx, env, list_form, items, depth); // same shape as let*
-    if (std.mem.eql(u8, name, "recur")) return try expandRecur(ctx, env, list_form, items, depth);
-    if (std.mem.eql(u8, name, "fn*")) return try expandFnStar(ctx, env, list_form, items, depth);
-    if (std.mem.eql(u8, name, "letfn*")) return try expandLetFnStar(ctx, env, list_form, items, depth);
-    if (std.mem.eql(u8, name, "def")) return try expandDef(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "if")) return try expandIf(ctx, env, list_form, items);
+    if (std.mem.eql(u8, name, "do")) return try expandDo(ctx, env, list_form, items);
+    if (std.mem.eql(u8, name, "let*")) return try expandLetStar(ctx, env, list_form, items);
+    if (std.mem.eql(u8, name, "loop*")) return try expandLetStar(ctx, env, list_form, items); // same shape as let*
+    if (std.mem.eql(u8, name, "recur")) return try expandRecur(ctx, env, list_form, items);
+    if (std.mem.eql(u8, name, "fn*")) return try expandFnStar(ctx, env, list_form, items);
+    if (std.mem.eql(u8, name, "letfn*")) return try expandLetFnStar(ctx, env, list_form, items);
+    if (std.mem.eql(u8, name, "def")) return try expandDef(ctx, env, list_form, items);
     // `defn` is a HOST MACRO (expandDefnMacro) that rewrites to
     // `(def name (fn name ...))`. The host macro lives in the
     // macros table; dispatching here would bypass the macro
     // path.
     if (std.mem.eql(u8, name, "var")) return mutCast(list_form); // (var X) — X is just a name, don't expand
-    if (std.mem.eql(u8, name, "set!")) return try expandSetBang(ctx, env, list_form, items, depth);
-    if (std.mem.eql(u8, name, "try")) return try expandTry(ctx, env, list_form, items, depth);
-    if (std.mem.eql(u8, name, "throw")) return try expandOrdinaryCall(ctx, env, list_form, items, depth);
-    if (std.mem.eql(u8, name, "defmacro")) return try expandDefmacro(ctx, env, list_form, items, depth);
+    if (std.mem.eql(u8, name, "set!")) return try expandSetBang(ctx, env, list_form, items);
+    if (std.mem.eql(u8, name, "try")) return try expandTry(ctx, env, list_form, items);
+    if (std.mem.eql(u8, name, "throw")) return try expandOrdinaryCall(ctx, env, list_form, items);
+    if (std.mem.eql(u8, name, "defmacro")) return try expandDefmacro(ctx, env, list_form, items);
     if (std.mem.eql(u8, name, "ns")) return try expandNs(ctx, list_form, items);
     if (std.mem.eql(u8, name, "require")) return try expandRequire(ctx, list_form, items);
     // Internal compiler primitives (#%list / #%concat / ...).
@@ -460,7 +471,7 @@ fn expandList(
         std.mem.eql(u8, name, "#%map") or
         std.mem.eql(u8, name, "#%set"))
     {
-        return try expandOrdinaryCall(ctx, env, list_form, items, depth);
+        return try expandOrdinaryCall(ctx, env, list_form, items);
     }
 
     // ---- Macro dispatch (shadowable by lexical bindings). -----
@@ -485,7 +496,7 @@ fn expandList(
     }
 
     // ---- Ordinary call. ---------------------------------------
-    return try expandOrdinaryCall(ctx, env, list_form, items, depth);
+    return try expandOrdinaryCall(ctx, env, list_form, items);
 }
 
 /// The macro Var a qualified head `ns/name` names, with `ns` an
@@ -541,11 +552,10 @@ fn expandIf(
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
-    depth: u32,
 ) ExpandError!*Form {
     // (if test then) | (if test then else)
     if (items.len < 3 or items.len > 4) return ExpandError.MalformedMacroCall;
-    return try rebuildListIfChanged(ctx, list_form, items, env, depth);
+    return try rebuildListIfChanged(ctx, list_form, items, env);
 }
 
 fn expandDo(
@@ -553,9 +563,8 @@ fn expandDo(
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
-    depth: u32,
 ) ExpandError!*Form {
-    return try rebuildListIfChanged(ctx, list_form, items, env, depth);
+    return try rebuildListIfChanged(ctx, list_form, items, env);
 }
 
 fn expandRecur(
@@ -563,9 +572,8 @@ fn expandRecur(
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
-    depth: u32,
 ) ExpandError!*Form {
-    return try rebuildListIfChanged(ctx, list_form, items, env, depth);
+    return try rebuildListIfChanged(ctx, list_form, items, env);
 }
 
 fn expandOrdinaryCall(
@@ -573,9 +581,8 @@ fn expandOrdinaryCall(
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
-    depth: u32,
 ) ExpandError!*Form {
-    return try rebuildListIfChanged(ctx, list_form, items, env, depth);
+    return try rebuildListIfChanged(ctx, list_form, items, env);
 }
 
 /// Expand every list item with the same env, each exactly once
@@ -586,11 +593,10 @@ fn rebuildListIfChanged(
     list_form: *const Form,
     items: []const *Form,
     env: ?*const ExpandEnv,
-    depth: u32,
 ) ExpandError!*Form {
     var new_items: ?[]*Form = null;
     for (items, 0..) |item, i| {
-        const expanded = try expandFormDepth(ctx, env, item, depth);
+        const expanded = try expandForm(ctx, env, item);
         if (new_items) |out| {
             out[i] = expanded;
         } else if (expanded != item) {
@@ -611,7 +617,6 @@ fn expandLetStar(
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
-    depth: u32,
 ) ExpandError!*Form {
     // (let* [n1 v1 n2 v2 ...] body...)
     if (items.len < 2) return ExpandError.MalformedMacroCall;
@@ -637,7 +642,7 @@ fn expandLetStar(
         }
         // RHS expanded under env-so-far (BEFORE name added).
         new_bindings[i] = mutCast(name_form);
-        new_bindings[i + 1] = try expandFormDepth(ctx, &local, bindings[i + 1], depth);
+        new_bindings[i + 1] = try expandForm(ctx, &local, bindings[i + 1]);
         // NOW add the binding name to the local env (sequential).
         _ = try local.lexical_names.getOrPut(ctx.allocator, name_form.datum.symbol.name);
     }
@@ -647,7 +652,7 @@ fn expandLetStar(
     const body = items[2..];
     const new_body = try ctx.allocator.alloc(*Form, body.len);
     for (body, 0..) |b, j| {
-        new_body[j] = try expandFormDepth(ctx, &local, b, depth);
+        new_body[j] = try expandForm(ctx, &local, b);
     }
 
     // Reassemble: [let*/loop*, bindings, body...]
@@ -666,7 +671,6 @@ fn expandFnStar(
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
-    depth: u32,
 ) ExpandError!*Form {
     // (fn* [params] body...) | (fn* name [params] body...)
     if (items.len < 2) return ExpandError.MalformedMacroCall;
@@ -712,7 +716,7 @@ fn expandFnStar(
     // Expand body.
     const new_body = try ctx.allocator.alloc(*Form, body.len);
     for (body, 0..) |b, j| {
-        new_body[j] = try expandFormDepth(ctx, &local, b, depth);
+        new_body[j] = try expandForm(ctx, &local, b);
     }
 
     // Reassemble.
@@ -732,7 +736,6 @@ fn expandLetFnStar(
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
-    depth: u32,
 ) ExpandError!*Form {
     // (letfn* [(name [params] body...) ...] body...)
     if (items.len < 2) return ExpandError.MalformedMacroCall;
@@ -777,7 +780,7 @@ fn expandLetFnStar(
         }
         const new_fn_body = try ctx.allocator.alloc(*Form, fn_body.len);
         for (fn_body, 0..) |b, j| {
-            new_fn_body[j] = try expandFormDepth(ctx, &fn_env, b, depth);
+            new_fn_body[j] = try expandForm(ctx, &fn_env, b);
         }
         const new_entry_items = try ctx.allocator.alloc(*Form, 2 + fn_body.len);
         new_entry_items[0] = mutCast(entry_items[0]);
@@ -791,7 +794,7 @@ fn expandLetFnStar(
     const body = items[2..];
     const new_body = try ctx.allocator.alloc(*Form, body.len);
     for (body, 0..) |b, j| {
-        new_body[j] = try expandFormDepth(ctx, &local, b, depth);
+        new_body[j] = try expandForm(ctx, &local, b);
     }
 
     const total = 2 + body.len;
@@ -824,7 +827,6 @@ fn expandDef(
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
-    depth: u32,
 ) ExpandError!*Form {
     // (def name) | (def name value) | (def name "doc" value); the
     // name may carry `^meta`, which lands on the Var.
@@ -845,7 +847,7 @@ fn expandDef(
     if (meta_items.items.len == 0 and named.meta == null and items.len < 4) {
         if (items.len == 2) return mutCast(list_form);
         // Expand value only.
-        const new_value = try expandFormDepth(ctx, env, items[2], depth);
+        const new_value = try expandForm(ctx, env, items[2]);
         if (new_value == items[2]) return mutCast(list_form);
         const out_items = try ctx.allocator.alloc(*Form, 3);
         out_items[0] = mutCast(head);
@@ -857,7 +859,7 @@ fn expandDef(
     defer def_items.deinit(ctx.allocator);
     try def_items.append(ctx.allocator, mutCast(head));
     try def_items.append(ctx.allocator, mutCast(name_form));
-    if (value_idx < items.len) try def_items.append(ctx.allocator, try expandFormDepth(ctx, env, items[value_idx], depth));
+    if (value_idx < items.len) try def_items.append(ctx.allocator, try expandForm(ctx, env, items[value_idx]));
     const def_form = try makeListInline(ctx, list_form.origin, def_items.items);
     return try withVarMeta(ctx, def_form, meta_items.items, list_form.origin);
 }
@@ -929,7 +931,6 @@ fn expandTry(
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
-    depth: u32,
 ) ExpandError!*Form {
     const head = items[0];
     const origin = list_form.origin;
@@ -953,12 +954,12 @@ fn expandTry(
 
     if (catches.len == 0 and finally_form == null) {
         try out_items.append(ctx.allocator, try makeSymbol(ctx, "do", origin));
-        for (body) |b| try out_items.append(ctx.allocator, try expandFormDepth(ctx, env, b, depth));
+        for (body) |b| try out_items.append(ctx.allocator, try expandForm(ctx, env, b));
         return try makeListInline(ctx, origin, out_items.items);
     }
 
     try out_items.append(ctx.allocator, mutCast(head));
-    for (body) |b| try out_items.append(ctx.allocator, try expandFormDepth(ctx, env, b, depth));
+    for (body) |b| try out_items.append(ctx.allocator, try expandForm(ctx, env, b));
 
     // The single primitive catch binds g; its handler is the
     // clause chain ending in a rethrow.
@@ -984,7 +985,7 @@ fn expandTry(
         bind_items[0] = mutCast(binding);
         bind_items[1] = try makeSymbol(ctx, g_name, origin);
         try let_items.append(ctx.allocator, try makeVector(ctx, bind_items, origin));
-        for (ci[3..]) |h| try let_items.append(ctx.allocator, try expandFormDepth(ctx, &handler_env, h, depth));
+        for (ci[3..]) |h| try let_items.append(ctx.allocator, try expandForm(ctx, &handler_env, h));
         const clause_body = try makeListInline(ctx, origin, let_items.items);
 
         const is_any = matcher.datum == .symbol and matcher.datum.symbol.ns == null and std.mem.eql(u8, matcher.datum.symbol.name, "any");
@@ -1012,46 +1013,17 @@ fn expandTry(
         var new_finally_items: std.ArrayList(*Form) = .empty;
         defer new_finally_items.deinit(ctx.allocator);
         try new_finally_items.append(ctx.allocator, mutCast(fi[0]));
-        for (fi[1..]) |f| try new_finally_items.append(ctx.allocator, try expandFormDepth(ctx, env, f, depth));
+        for (fi[1..]) |f| try new_finally_items.append(ctx.allocator, try expandForm(ctx, env, f));
         try out_items.append(ctx.allocator, try makeListInline(ctx, ff.origin, new_finally_items.items));
     }
     return try makeListInline(ctx, origin, out_items.items);
 }
 
-/// Expand `#(body...)` shorthand.
-///
-/// Examples:
-///   #(+ % %2)   → (fn* [%1 %2] (+ %1 %2))
-///   #(+ %1 %2)  → same
-///   #(inc %)    → (fn* [%1] (inc %1))
-///   #(apply f %&) → (fn* [& %&] (apply f %&))
-///
-/// Algorithm:
-///   1. Scan body recursively for placeholder symbols:
-///        `%`  → records positional 1
-///        `%N` → records positional N (N >= 1)
-///        `%&` → marks rest used
-///   2. Param count = max positional N found (0 if none).
-///   3. Generate params `[%1 %2 ... %N]` plus `[& %&]` if rest.
-///   4. Rewrite `%` occurrences in body to `%1`.
-///   5. Build `(fn* params body...)`.
-///   6. Reject nested `#()` (Clojure compatibility).
-fn expandAnonFn(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    call_form: *const Form,
-    items: []const *Form,
-    depth: u32,
-) ExpandError!*Form {
-    const fn_form = try anonFnForm(ctx, call_form, items);
-    // Recursively re-expand so any macros nested in body fire.
-    return try expandFormDepth(ctx, env, fn_form, depth);
-}
-
 /// The `(fn* [%1 ...] (body...))` form a `#(body...)` literal
-/// stands for, built syntactically and not yet expanded. Shared by
-/// the expander and by macro-argument conversion, so a `#()` inside
-/// a user macro's body reaches the macro as an ordinary `fn*` form.
+/// stands for (MACROEXPAND.md §9), built syntactically and not yet
+/// expanded. Shared by the expander and by macro-argument
+/// conversion, so a `#()` inside a user macro's body reaches the
+/// macro as an ordinary `fn*` form.
 fn anonFnForm(
     ctx: *ExpandContext,
     call_form: *const Form,
@@ -1117,6 +1089,7 @@ fn anonFnForm(
 ///   - nested #(...) is rejected (MalformedMacroCall)
 ///   - `%N` where N parses as 0 is rejected
 fn anonScanForm(form: *const Form, max_pos: *u32, uses_rest: *bool) ExpandError!void {
+    try checkStack();
     switch (form.datum) {
         .symbol => |name| {
             if (name.ns != null) return;
@@ -1164,6 +1137,7 @@ fn anonClassifySymbol(name: []const u8, max_pos: *u32, uses_rest: *bool) ExpandE
 /// new node when at least one element changed (best-effort
 /// pointer-equality fast path).
 fn anonRewriteForm(ctx: *ExpandContext, form: *const Form) ExpandError!*Form {
+    try checkStack();
     return switch (form.datum) {
         .symbol => |name| blk: {
             if (name.ns == null and name.name.len == 1 and name.name[0] == '%') {
@@ -1213,7 +1187,6 @@ fn expandCollKind(
     env: ?*const ExpandEnv,
     coll_form: *const Form,
     items: []const *Form,
-    depth: u32,
     kind: CollKind,
 ) ExpandError!*Form {
     var changed = false;
@@ -1221,7 +1194,7 @@ fn expandCollKind(
     defer rewritten.deinit(ctx.allocator);
     try rewritten.ensureTotalCapacity(ctx.allocator, items.len);
     for (items) |it| {
-        const new_it = try expandFormDepth(ctx, env, it, depth);
+        const new_it = try expandForm(ctx, env, it);
         if (new_it != it) changed = true;
         try rewritten.append(ctx.allocator, new_it);
     }
@@ -1404,7 +1377,6 @@ fn expandSetBang(
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
-    depth: u32,
 ) ExpandError!*Form {
     if (items.len != 3) return ExpandError.MalformedMacroCall;
     const target = items[1];
@@ -1419,7 +1391,7 @@ fn expandSetBang(
     const out_items = try ctx.allocator.alloc(*Form, 3);
     out_items[0] = try makeQualifiedSymbol(ctx, "nexis.core", "var-set", origin);
     out_items[1] = try makeList(ctx, var_items, origin);
-    out_items[2] = try expandFormDepth(ctx, env, items[2], depth + 1);
+    out_items[2] = try expandForm(ctx, env, items[2]);
     return try makeList(ctx, out_items, origin);
 }
 
@@ -1429,7 +1401,6 @@ fn expandDefmacro(
     env: ?*const ExpandEnv,
     list_form: *const Form,
     items: []const *Form,
-    depth: u32,
 ) ExpandError!*Form {
     // (defmacro NAME "doc"? [PARAMS] BODY...); `^meta` on NAME and
     // the docstring land on the Var like defn's.
@@ -1467,7 +1438,7 @@ fn expandDefmacro(
     }
     const expanded_body = try ctx.allocator.alloc(*Form, body_forms.len);
     for (body_forms, 0..) |b, i| {
-        expanded_body[i] = try expandFormDepth(ctx, &local, b, depth);
+        expanded_body[i] = try expandForm(ctx, &local, b);
     }
 
     // Build the synthetic form: (def NAME (fn* NAME [PARAMS] body...))
@@ -1615,7 +1586,8 @@ fn callUserMacro(
 ///   anon_fn        → the `fn*` form it stands for
 /// syntax_quote, unquote, unquote_splicing and with_meta raise
 /// `MalformedMacroCall`.
-pub fn formToValue(ctx: *ExpandContext, form: *const Form) !value_mod.Value {
+pub fn formToValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod.Value {
+    try checkStack();
     return switch (form.datum) {
         .nil => value_mod.nilValue(),
         .bool_ => |b| value_mod.fromBool(b),
@@ -1737,7 +1709,8 @@ fn formItemsToList(ctx: *ExpandContext, items: []const *Form) ExpandError!value_
 /// sub-VM. Each constructed Form gets `origin` as its source
 /// span — typically the macro call site (generated forms use
 /// the macro call origin).
-pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSpan) !*Form {
+pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.SrcSpan) ExpandError!*Form {
+    try checkStack();
     return switch (v.kind()) {
         .nil => try makeNil(ctx, origin),
         .true_ => try makeBool(ctx, true, origin),
@@ -2432,6 +2405,7 @@ fn destructurePair(
     out: *std.ArrayList(*Form),
     origin: reader_mod.SrcSpan,
 ) ExpandError!void {
+    try checkStack();
     switch (pattern.datum) {
         .symbol => |sym| {
             if (sym.ns != null) return ExpandError.MalformedMacroCall;
@@ -4085,6 +4059,7 @@ fn expandSyntaxQuotePayload(
     call_form: *const Form,
     payload: *const Form,
 ) ExpandError!*Form {
+    try checkStack();
     return switch (payload.datum) {
         // Self-evaluating leaves: pass through. Lowered as
         // existing Tiny variants — no quote wrap needed.
@@ -4458,6 +4433,32 @@ test "macroexpand: depth limit caught for infinite macro loop" {
         .interner = &interner,
         .host_macros = &table,
     };
+    try testing.expectError(ExpandError.ExpansionDepthExceeded, expandForm(&ctx, null, form));
+}
+
+test "macroexpand: nesting past the stack budget is ExpansionDepthExceeded, not a fault" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    stack.arm(64 * 1024);
+    defer stack.arm(stack.main_thread_budget);
+    // (do (do ... (do 1) ...)) nested far deeper than 64 KiB of frames.
+    var form = try arena.create(Form);
+    form.* = .{ .datum = .{ .int = 1 }, .origin = .{ .pos = 0, .len = 0 } };
+    const do_sym = try arena.create(Form);
+    do_sym.* = .{ .datum = .{ .symbol = .{ .ns = null, .name = "do" } }, .origin = .{ .pos = 0, .len = 0 } };
+    for (0..20_000) |_| {
+        const items = try arena.alloc(*Form, 2);
+        items[0] = do_sym;
+        items[1] = form;
+        const outer = try arena.create(Form);
+        outer.* = .{ .datum = .{ .list = items }, .origin = .{ .pos = 0, .len = 0 } };
+        form = outer;
+    }
+    var interner = intern_mod.Interner.init(arena);
+    defer interner.deinit();
+    const empty: HostMacroTable = .{};
+    var ctx = ExpandContext{ .allocator = arena, .interner = &interner, .host_macros = &empty };
     try testing.expectError(ExpandError.ExpansionDepthExceeded, expandForm(&ctx, null, form));
 }
 

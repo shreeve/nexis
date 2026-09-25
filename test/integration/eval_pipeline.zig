@@ -1275,6 +1275,18 @@ test "defmacro: a macro call nested in calls and host macros expands exactly onc
     , "3");
 }
 
+test "macroexpand: the depth limit counts expansions in a row, not nesting" {
+    // 300 nested `let`s: each is one expansion at its own position.
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    for (0..300) |_| try src.appendSlice(testing.allocator, "(let [a 1] ");
+    try src.appendSlice(testing.allocator, "a");
+    for (0..300) |_| try src.append(testing.allocator, ')');
+    try expectOutput(src.items, "1");
+    // A macro whose expansion is itself, forever, still trips it.
+    try expectProgramError("(defmacro forever [] `(forever)) (forever)", compile.CompileError.MacroDepthExceeded);
+}
+
 test "integration: defmacro — macro can use already-defined macros in body" {
     // twice's body uses unless (a macro defined above it);
     // when outer is invoked, the macro fn body is already

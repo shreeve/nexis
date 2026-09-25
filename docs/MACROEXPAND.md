@@ -482,17 +482,25 @@ and the macro table recognize them regardless of bindings (§3).
 pub const MAX_EXPANSION_DEPTH: u32 = 256; // matches Clojure
 ```
 
-The depth counter increments on EACH macro expansion (not on
-tree-walk recursion), so legitimate deep source is not limited.
-If depth exceeds the limit, the expander raises
-`ExpandError.ExpansionDepthExceeded`, which the compiler reports
-as `CompileError.MacroDepthExceeded`. This catches infinite macro
-loops:
+The depth counts the expansions in a row at one position: a macro
+call whose expansion is again a macro call, and so on. The
+sub-forms of an expansion start again at 0, so nesting in the
+source (300 nested `let`s) never counts. Past the limit the
+expander raises `ExpandError.ExpansionDepthExceeded`, which the
+compiler reports as `CompileError.MacroDepthExceeded`. This catches
+infinite macro loops:
 
 ```clojure
 (defmacro broken [x] `(broken ~x))
 (broken 1)                            ; MacroDepthExceeded
 ```
+
+Nesting is bounded by the native stack guard (`src/stack.zig`,
+`VM.md` §13.1) instead: every recursion of the expander over a form
+(the walk, syntax-quote, `#()` scanning, destructuring, and the
+Form ↔ Value conversions of macro arguments and results) checks it,
+and a form nested past the stack's budget is
+`ExpansionDepthExceeded` too, never a fault.
 
 ---
 
