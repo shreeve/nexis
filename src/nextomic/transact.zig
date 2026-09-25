@@ -47,6 +47,7 @@ const db_mod = @import("db.zig");
 const marshal = @import("marshal.zig");
 const excise_mod = @import("excise.zig");
 const fulltext = @import("fulltext.zig");
+const stack = @import("../stack.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -96,7 +97,7 @@ pub const CallHook = struct {
 
 /// Everything a transaction can fail with: its own errors, the
 /// db-value's, the value contract's and the store's.
-pub const Failure = Error || db_mod.Error || marshal.Error || db_mod.ErrorsOf(Minter.lookup) || db_mod.ErrorsOf(Minter.resolve) || db_mod.ErrorsOf(Minter.lookupName) || db_mod.ErrorsOf(Store.scan) || db_mod.ErrorsOf(Txn.getFromTree) || db_mod.ErrorsOf(Store.currentPayload) || db_mod.ErrorsOf(champ.mapEmpty);
+pub const Failure = Error || stack.Error || db_mod.Error || marshal.Error || db_mod.ErrorsOf(Minter.lookup) || db_mod.ErrorsOf(Minter.resolve) || db_mod.ErrorsOf(Minter.lookupName) || db_mod.ErrorsOf(Store.scan) || db_mod.ErrorsOf(Txn.getFromTree) || db_mod.ErrorsOf(Store.currentPayload) || db_mod.ErrorsOf(champ.mapEmpty);
 
 pub const Options = struct {
     /// Overrides the connection's sync mode for this commit.
@@ -781,6 +782,8 @@ const Ctx = struct {
     /// `:ns/_attr` is a reverse ref: its value names the entities that
     /// refer to this one through `:ns/attr`.
     fn normaliseMap(self: *Ctx, m: Value) Failure!Ent {
+        // Nested map forms recurse here, one frame per level.
+        try stack.check();
         var ent: ?Ent = null;
         var it = champ.mapIter(m);
         while (it.next()) |entry| {
@@ -1277,10 +1280,7 @@ const Ctx = struct {
                 .add => |o| try self.expandAdd(try self.resolveEnt(o.e), o.attr, try self.resolveVal(o.v)),
                 .retract => |o| try self.expandRetract(try self.resolveEnt(o.e), o.attr, try self.resolveVal(o.v)),
                 .retract_attr => |o| try self.expandRetractAttr(try self.resolveEnt(o.e), o.attr),
-                .retract_entity => |e| {
-                    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-                    try self.expandRetractEntity(try self.resolveEnt(e), &seen);
-                },
+                .retract_entity => |e| try self.expandRetractEntity(try self.resolveEnt(e)),
                 .cas => |o| {
                     const old: ?Val = if (o.old) |v| try self.resolveVal(v) else null;
                     try self.expandCas(try self.resolveEnt(o.e), o.attr, old, try self.resolveVal(o.new));
@@ -1426,23 +1426,26 @@ const Ctx = struct {
         }
     }
 
-    fn expandRetractEntity(self: *Ctx, e: u64, seen: *std.AutoHashMapUnmanaged(u64, void)) Failure!void {
-        if ((try seen.getOrPut(self.arena, e)).found_existing) return;
-        var components: std.ArrayList(u64) = .empty;
-        // Its own datoms.
-        {
-            var rows = try self.liveRows(.eavt, .{ .e = e });
-            while (try rows.next()) |r| {
-                const attr = try self.attrById(r.parts.a);
-                const v = try self.valFromParts(r.parts);
-                if (attr.component and v == .ref) try components.append(self.arena, v.ref);
-                if (r.kept) return self.conflict(e, attr.id);
-                if (r.pending != null) continue;
-                try self.pushRetract(e, attr, v, try self.arena.dupe(u8, r.parts.v));
+    /// `[:db/retractEntity e]`: the entity's own datoms and the datoms
+    /// pointing at it, then the same for every component it holds, from
+    /// a worklist, so a component chain of any length retracts whole.
+    fn expandRetractEntity(self: *Ctx, root_e: u64) Failure!void {
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        var work: std.ArrayList(u64) = .empty;
+        try work.append(self.arena, root_e);
+        while (work.pop()) |e| {
+            if ((try seen.getOrPut(self.arena, e)).found_existing) continue;
+            {
+                var rows = try self.liveRows(.eavt, .{ .e = e });
+                while (try rows.next()) |r| {
+                    const attr = try self.attrById(r.parts.a);
+                    const v = try self.valFromParts(r.parts);
+                    if (attr.component and v == .ref) try work.append(self.arena, v.ref);
+                    if (r.kept) return self.conflict(e, attr.id);
+                    if (r.pending != null) continue;
+                    try self.pushRetract(e, attr, v, try self.arena.dupe(u8, r.parts.v));
+                }
             }
-        }
-        // Datoms pointing at it.
-        {
             const vb = try key.valBytes(self.arena, .{ .ref = e });
             var rows = try self.liveRows(.vaet, .{ .v = vb });
             while (try rows.next()) |r| {
@@ -1452,7 +1455,6 @@ const Ctx = struct {
                 try self.pushRetract(r.parts.e, attr, .{ .ref = e }, vb);
             }
         }
-        for (components.items) |c| try self.expandRetractEntity(c, seen);
     }
 
     /// Queue a datom; `fact_key` is its EAVT key when the caller has it.
@@ -2262,6 +2264,30 @@ test "a nested map under a plain ref must carry an identity" {
     }), .{}));
 }
 
+test "nested map forms past the stack budget fail with StackOverflow and abort" {
+    const tc = try TestConn.init("tx_nested_deep");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var heap = @import("../heap.zig").Heap.init(arena);
+    defer heap.deinit();
+    const l = Lisp{ .tc = tc, .heap = &heap };
+    try installSchema(tc, arena);
+
+    var m = try l.map(&.{.{ "addr/city", try l.str("Rome") }});
+    for (0..100_000) |_| m = try l.map(&.{.{ "user/home", m }});
+    stack.arm(1 << 20);
+    defer stack.arm(stack.main_thread_budget);
+    try testing.expectError(error.StackOverflow, transact(tc.conn, arena, try l.vec(&.{m}), .{}));
+    // The write transaction is gone: the next one takes the next t.
+    var shallow = try l.map(&.{.{ "addr/city", try l.str("Oslo") }});
+    for (0..50) |_| shallow = try l.map(&.{.{ "user/home", shallow }});
+    const r = try transact(tc.conn, arena, try l.vec(&.{shallow}), .{});
+    try testing.expectEqual(@as(u64, 3), r.t);
+    try testing.expectEqual(@as(usize, 52), r.tx_data.len);
+}
+
 test "a failing transaction reports what it was looking at" {
     const tc = try TestConn.init("tx_fault");
     defer tc.deinit();
@@ -2802,6 +2828,35 @@ test "retractEntity expands against the committed state; the transaction's own d
     const bn = try (try tc.conn.db()).entity(arena, b);
     try testing.expectEqual(@as(usize, 1), bn.len);
     try testing.expectEqual(age, bn[0].a);
+}
+
+test "retractEntity follows a component chain of any length" {
+    const tc = try TestConn.init("tx_retract_chain");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const home = try attrId(tc, "user/home");
+    const city = try attrId(tc, "addr/city");
+
+    // c0 -> c1 -> ... -> cn through the component `:user/home`; a
+    // native frame per level would exhaust the stack long before n.
+    const n = 20_000;
+    var ops: std.ArrayList(Op) = .empty;
+    var names: [n + 1][]const u8 = undefined;
+    for (&names, 0..) |*nm, i| nm.* = try std.fmt.allocPrint(arena, "c{d}", .{i});
+    for (0..n) |i| try ops.append(arena, .{ .add = .{ .e = .{ .tempid = .{ .string = names[i] } }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .string = names[i + 1] } } } } });
+    try ops.append(arena, .{ .add = .{ .e = .{ .tempid = .{ .string = names[n] } }, .a = .{ .id = city }, .v = .{ .val = .{ .string = "end" } } } });
+    const r = try transactOps(tc.conn, arena, ops.items, .{});
+    const head = r.tempids[0].eid;
+    const tail = r.tempids[n].eid;
+    const gone = try transactOps(tc.conn, arena, &.{.{ .retract_entity = .{ .eid = head } }}, .{});
+    // Every home link and the tail's city, then the instant.
+    try testing.expectEqual(@as(usize, n + 2), gone.tx_data.len);
+    const db = try tc.conn.db();
+    try testing.expectEqual(@as(usize, 0), (try db.entity(arena, tail)).len);
+    try testing.expectEqual(@as(usize, 0), (try db.datoms(arena, .aevt, .{ .a = home })).len);
 }
 
 test "a lookup ref under a card-many ref attribute is one ref; a vector of them is a collection" {

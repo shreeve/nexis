@@ -182,7 +182,9 @@ so there is no queue; emdb's write lock is the transactor.
    attribute becomes an entity with a fresh tempid; under any other ref
    attribute it must name its entity with `:db/id` or a unique
    attribute, since nothing could reach it otherwise
-   (`:nextomic/tx-data`). A reverse key `:ns/_attr` in a map form
+   (`:nextomic/tx-data`). Map forms nest as deep as the native stack
+   allows (`stack.check`); past it the transaction aborts with the
+   VM's `:stack-overflow`. A reverse key `:ns/_attr` in a map form
    asserts `[x :ns/attr e]` for each `x` under it: `{:db/id e
    :user/_friends x}` makes `x`, an entity or a map form of one, point
    at `e`, and a vector of them is one referrer each; the attribute must
@@ -209,7 +211,8 @@ so there is no queue; emdb's write lock is the transactor.
    `:nextomic/conflict`. `[:db/retract e a]` retracts every current value
    of `a`. `[:db/retractEntity e]` retracts every current `(e a v)` from
    an EAVT `[e]` scan plus every current `(e' a' e)` from a VAET `[e]`
-   scan, recursively through component attributes. tx-data is a set:
+   scan, and the same for every component entity it holds, through
+   component chains of any length. tx-data is a set:
    the two bare forms expand against the values current before the
    transaction, never against what the transaction asserts, so an
    assertion under the same `(e a)` stands whichever form comes first
