@@ -78,6 +78,9 @@
        (= #{} (d/q '[:find ?n :where [?e :person/tags :nope/tag] [?e :person/name ?n]] db)))
 (t/check "a lookup ref that names nothing matches nothing"
        (= #{} (d/q '[:find ?n :where [?e :person/boss [:person/email "nobody@x"]] [?e :person/name ?n]] db)))
+(t/check "a list constant is a value, not a lookup ref, though = to one"
+       (and (= #{} (d/q '[:find ?n :where [?e :person/boss (:person/email "ann@x")] [?e :person/name ?n]] db))
+            (= #{["Bob"] ["Cy"]} (d/q '[:find ?n :where [?e :person/boss [:person/email "ann@x"]] [?e :person/name ?n]] db))))
 (t/check "the tx position binds the transaction entity"
        (= 1 (count (d/q '[:find ?tx :where [?e :person/name "Flo" ?tx]] db))))
 

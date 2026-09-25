@@ -1,5 +1,6 @@
 ok predicate survives collections
 ok function binding results survive collections
 ok custom aggregate survives collections
-ok the same query parses again after the caches emptied
+ok the same query parses again after collections
+ok nested queries built afresh answer their own query across collections
 done

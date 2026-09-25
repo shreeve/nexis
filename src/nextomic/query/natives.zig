@@ -10,12 +10,9 @@
 //! Caches: one IR cache and one rules cache per VM, on the natives'
 //! per-VM state (`natives.state`). A parsed query is pure syntax over
 //! the VM's symbol table, so one cache serves every connection the VM
-//! opens. The caches hold the query values themselves (by heap identity
-//! first, then by structure); the collector empties both after every
-//! cycle (`natives.clearState`), since a freed value's address may be
-//! reused. A query borrows its IR from the cache for its duration, so
-//! `q` and `explain` bracket their run with `State.enter` / `leave`
-//! and a cycle inside a callback defers the clearing to `leave`.
+//! opens. The caches hold the query values themselves, rooted, and pin
+//! the parse a running query uses, so a nested `q` in a callback can
+//! neither free nor replace it (NEXTOMIC.md §5 "Parse").
 //!
 //! Rooting: a value a user function returns to the pipeline may end up
 //! in a relation cell that the next call back into the VM must not see
@@ -219,8 +216,6 @@ fn fnQ(vm: *VM, args: []const Value) VmError!Value {
 fn qNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     const d = try natives.dbOf(args[1]);
     const st = try natives.state(vm);
-    st.enter();
-    defer st.leave();
     var hook = Hook.init(vm);
     defer hook.deinit();
     const options: query.Options = .{ .hook = hook.callHook(), .db_of = &natives.dbOf, .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };
@@ -235,8 +230,6 @@ fn fnExplain(vm: *VM, args: []const Value) VmError!Value {
 fn explainNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
     const d = try natives.dbOf(args[1]);
     const st = try natives.state(vm);
-    st.enter();
-    defer st.leave();
     var hook = Hook.init(vm);
     defer hook.deinit();
     const options: query.Options = .{ .hook = hook.callHook(), .db_of = &natives.dbOf, .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };

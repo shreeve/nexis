@@ -32,6 +32,7 @@ pub const RuleSet = ir.RuleSet;
 pub const Diag = parse.Diag;
 pub const Cache = parse.Cache;
 pub const RulesCache = parse.RulesCache;
+pub const Roots = parse.Roots;
 pub const Plan = plan.Plan;
 pub const CallHook = exec.CallHook;
 pub const Exec = exec.Exec;
@@ -47,42 +48,33 @@ pub const Options = struct {
     rules_cache: ?*RulesCache = null,
 };
 
-/// The parsed query and, when `:in` has `%`, its rule set; owned by
-/// the caches when given, else by this struct.
+/// The parsed query and, when `:in` has `%`, its rule set: pinned in
+/// the caches when given (released by `deinit`), else owned here.
 const Parsed = struct {
-    gpa: Allocator,
     query: *Ir,
-    rules: *const RuleSet,
-    owns_query: bool,
-    owns_rules: bool,
+    rules: *const RuleSet = &ir.no_rules,
+    options: Options,
 
     fn deinit(self: *Parsed) void {
-        if (self.owns_query) self.query.deinit();
-        if (self.owns_rules) @constCast(self.rules).deinit();
+        if (self.options.ir_cache) |c| c.release(self.query) else self.query.deinit();
+        if (self.rules == &ir.no_rules) return;
+        if (self.options.rules_cache) |c| c.release(self.rules) else @constCast(self.rules).deinit();
     }
 };
 
 fn parseAll(gpa: Allocator, interner: *Interner, query: Value, args: []const Value, diag: *Diag, options: Options) !Parsed {
-    var out: Parsed = .{ .gpa = gpa, .query = undefined, .rules = &ir.no_rules, .owns_query = false, .owns_rules = false };
-    if (options.ir_cache) |c| {
-        out.query = try c.get(interner, query, diag);
-    } else {
-        out.query = try parse.parse(gpa, interner, query, diag);
-        out.owns_query = true;
-    }
-    errdefer if (out.owns_query) out.query.deinit();
+    var out: Parsed = .{
+        .query = if (options.ir_cache) |c| try c.acquire(interner, query, diag) else try parse.parse(gpa, interner, query, diag),
+        .options = options,
+    };
+    errdefer out.deinit();
     if (args.len != out.query.in.len) {
         diag.* = .{ .message = "wrong number of inputs" };
         return error.QuerySyntax;
     }
     for (out.query.in, args) |b, a| {
         if (b != .rules) continue;
-        if (options.rules_cache) |c| {
-            out.rules = try c.get(interner, a, diag);
-        } else {
-            out.rules = try parse.parseRules(gpa, interner, a, diag);
-            out.owns_rules = true;
-        }
+        out.rules = if (options.rules_cache) |c| try c.acquire(interner, a, diag) else try parse.parseRules(gpa, interner, a, diag);
     }
     return out;
 }

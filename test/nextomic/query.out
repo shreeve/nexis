@@ -11,6 +11,7 @@
 ([Ann apple] [Ann pear] [Bob fig] [Cy apple])
 ok a constant that names nothing matches nothing
 ok a lookup ref that names nothing matches nothing
+ok a list constant is a value, not a lookup ref, though = to one
 ok the tx position binds the transaction entity
 Cy
 ([Ann 30] [Di 30])

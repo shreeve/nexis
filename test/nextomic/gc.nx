@@ -34,9 +34,24 @@
   (= (d/q '[:find (total ?n) . :where [?e :item/n ?n]] db)
      (reduce + 0 (range 40))))
 
-(t/check "the same query parses again after the caches emptied"
+(t/check "the same query parses again after collections"
   (= (rows (d/q '[:find ?n :where [?e :item/n ?n] [(big-even? ?n)]] db))
      (rows (map vector (filter even? (range 40))))))
+
+; A query run from inside another query's predicate, its value built
+; afresh on every call and each one asked four times: the cache keeps
+; every value it holds alive, so a later equal query never compares
+; against freed memory and a freed address is never mistaken for a new
+; query.
+(def wrong (atom []))
+(defn inner-agrees? [n]
+  (churn n)
+  (let [m (d/q [:find '?m '. :where ['?e :item/n n] ['?e :item/n '?m]] db)]
+    (when (not= m n) (swap! wrong conj [n m]))
+    true))
+(t/check "nested queries built afresh answer their own query across collections"
+  (and (= 40 (count (d/q '[:find ?e :where [?e :item/n ?n] [(mod ?n 10) ?k] [(inner-agrees? ?k)]] db)))
+       (empty? @wrong)))
 
 (d/release c)
 (println "done")

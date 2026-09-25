@@ -17,11 +17,12 @@
 //!     an input of the clause, never something the clause binds.
 //!   - Rules with one name share one arity and one required count.
 //!
-//! `Cache` memoises parses per query value: by heap identity first
-//! (the query literal's pointer), then by structural hash and
-//! equality. Heap pointers are stable for the process's life because
-//! nothing moves or frees a value while a cache references it; a
-//! collector that frees values must `clear` the cache.
+//! `Cache` memoises parses per query value: by identity first (the
+//! query literal's pointer), then by structural hash and an equality
+//! that tells lists from vectors. It keeps at most `cache_capacity`
+//! parses that no query is running on, and its `Roots` keep every query
+//! value it holds reachable, so no address it compares by is reused
+//! while it is there.
 
 const std = @import("std");
 const value = @import("../../value.zig");
@@ -31,6 +32,7 @@ const list_mod = @import("../../coll/list.zig");
 const vector_mod = @import("../../coll/vector.zig");
 const champ = @import("../../coll/champ.zig");
 const dispatch = @import("../../dispatch.zig");
+const stack = @import("../../stack.zig");
 const marshal = @import("../marshal.zig");
 const ir = @import("ir.zig");
 
@@ -43,7 +45,7 @@ const Clause = ir.Clause;
 const Ir = ir.Ir;
 const RuleSet = ir.RuleSet;
 
-pub const Error = error{ QuerySyntax, OutOfMemory };
+pub const Error = error{ QuerySyntax, OutOfMemory, StackOverflow };
 
 /// Where a syntax error was found. `clause` is the index into `:where`
 /// (or into the rule vector for rule parsing) when the error is inside
@@ -719,63 +721,140 @@ const Parser = struct {
 // Cache
 // =============================================================================
 
+/// How a cache keeps the query values it holds alive: `set` makes `v`
+/// the value of `slot`, where a slot one past the last appends. A parse
+/// borrows from its query value (string constants' bytes, opaque and
+/// lookup-ref constants, pull patterns and their defaults), so the
+/// collector must see every value a cache holds for as long as it holds
+/// it.
+pub const Roots = struct {
+    ctx: *anyopaque,
+    set: *const fn (ctx: *anyopaque, slot: usize, v: Value) error{OutOfMemory}!void,
+};
+
+/// The parses a cache keeps before a miss replaces the least recently
+/// used one that no query is running on.
+pub const cache_capacity = 128;
+
 fn CacheOf(comptime T: type, comptime parseFn: anytype) type {
     return struct {
         const Self = @This();
-        const Entry = struct { query: Value, parsed: *T };
+        const Entry = struct {
+            query: Value,
+            hash: u64,
+            parsed: *T,
+            /// The cache's clock at the entry's last use.
+            used: u64,
+            /// Queries running on the parse; a pinned entry stays.
+            pins: u32 = 0,
+        };
 
         gpa: Allocator,
-        by_ptr: std.AutoHashMapUnmanaged(u64, *T) = .empty,
-        by_hash: std.AutoHashMapUnmanaged(u64, std.ArrayList(Entry)) = .empty,
+        /// Null only where nothing collects (unit tests without a VM).
+        roots: ?Roots = null,
+        entries: std.ArrayList(Entry) = .empty,
+        clock: u64 = 0,
 
         pub fn init(gpa: Allocator) Self {
             return .{ .gpa = gpa };
         }
 
         pub fn deinit(self: *Self) void {
-            self.clear();
-            self.by_ptr.deinit(self.gpa);
-            self.by_hash.deinit(self.gpa);
-        }
-
-        /// Drop every entry.
-        pub fn clear(self: *Self) void {
-            var it = self.by_hash.valueIterator();
-            while (it.next()) |bucket| {
-                for (bucket.items) |e| e.parsed.deinit();
-                bucket.deinit(self.gpa);
-            }
-            self.by_hash.clearRetainingCapacity();
-            self.by_ptr.clearRetainingCapacity();
+            for (self.entries.items) |e| e.parsed.deinit();
+            self.entries.deinit(self.gpa);
         }
 
         pub fn count(self: *const Self) usize {
-            return self.by_ptr.count();
+            return self.entries.items.len;
         }
 
-        /// The parse of `query`, parsing on a miss. The result is owned
-        /// by the cache.
-        pub fn get(self: *Self, interner: *Interner, query: Value, diag: *Diag) Error!*T {
-            const is_heap = query.kind().isHeap();
-            if (is_heap) {
-                if (self.by_ptr.get(query.payload)) |p| return p;
-            }
+        /// The parse of `query`, parsing on a miss, pinned until
+        /// `release`. A hit is the same value, or one equal to it with
+        /// lists and vectors told apart (`sameShape`), since the parser
+        /// reads them differently.
+        pub fn acquire(self: *Self, interner: *Interner, query: Value, diag: *Diag) Error!*T {
+            self.clock += 1;
+            const e = try self.find(interner, query, diag);
+            e.used = self.clock;
+            e.pins += 1;
+            return e.parsed;
+        }
+
+        pub fn release(self: *Self, parsed: *const T) void {
+            for (self.entries.items) |*e| if (e.parsed == parsed) {
+                e.pins -= 1;
+                return;
+            };
+            unreachable;
+        }
+
+        fn find(self: *Self, interner: *Interner, query: Value, diag: *Diag) Error!*Entry {
+            for (self.entries.items) |*e| if (e.query.tag == query.tag and e.query.payload == query.payload) return e;
             const h = dispatch.hashValue(query);
-            const gop = try self.by_hash.getOrPut(self.gpa, h);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            for (gop.value_ptr.items) |e| {
-                if (dispatch.equal(e.query, query)) {
-                    if (is_heap) try self.by_ptr.put(self.gpa, query.payload, e.parsed);
-                    return e.parsed;
-                }
-            }
+            for (self.entries.items) |*e| if (e.hash == h and try sameShape(e.query, query)) return e;
             const parsed = try parseFn(self.gpa, interner, query, diag);
             errdefer parsed.deinit();
-            try gop.value_ptr.append(self.gpa, .{ .query = query, .parsed = parsed });
-            if (is_heap) try self.by_ptr.put(self.gpa, query.payload, parsed);
-            return parsed;
+            const slot = self.victim() orelse self.entries.items.len;
+            if (self.roots) |r| try r.set(r.ctx, slot, query);
+            const entry: Entry = .{ .query = query, .hash = h, .parsed = parsed, .used = self.clock };
+            if (slot == self.entries.items.len) {
+                try self.entries.append(self.gpa, entry);
+            } else {
+                self.entries.items[slot].parsed.deinit();
+                self.entries.items[slot] = entry;
+            }
+            return &self.entries.items[slot];
+        }
+
+        /// The entry a miss replaces: the least recently used unpinned
+        /// one once the cache is full, else null (append).
+        fn victim(self: *const Self) ?usize {
+            if (self.entries.items.len < cache_capacity) return null;
+            var best: ?usize = null;
+            for (self.entries.items, 0..) |e, i| {
+                if (e.pins > 0) continue;
+                if (best == null or e.used < self.entries.items[best.?].used) best = i;
+            }
+            return best;
         }
     };
+}
+
+/// `=` over query values with lists and vectors told apart at every
+/// depth: `[?e :a (:b 1)]` and `[?e :a [:b 1]]` are equal as data but
+/// parse to different clauses. Anything that is not a list, vector or
+/// map compares by `=`.
+fn sameShape(a: Value, b: Value) error{StackOverflow}!bool {
+    try stack.check();
+    if (a.kind() != b.kind()) return false;
+    switch (a.kind()) {
+        .persistent_vector => {
+            const n = vector_mod.count(a);
+            if (n != vector_mod.count(b)) return false;
+            for (0..n) |i| if (!try sameShape(vector_mod.nth(a, i), vector_mod.nth(b, i))) return false;
+            return true;
+        },
+        .list => {
+            var x = list_mod.Cursor.init(a);
+            var y = list_mod.Cursor.init(b);
+            while (true) {
+                const p = x.next();
+                const q = y.next();
+                if (p == null or q == null) return p == null and q == null;
+                if (!try sameShape(p.?, q.?)) return false;
+            }
+        },
+        .persistent_map => {
+            if (champ.mapCount(a) != champ.mapCount(b)) return false;
+            var it = champ.mapIter(a);
+            while (it.next()) |e| switch (champ.mapGet(b, e.key, &dispatch.hashValue, &dispatch.equal)) {
+                .absent => return false,
+                .present => |v| if (!try sameShape(e.value, v)) return false,
+            };
+            return true;
+        },
+        else => return dispatch.equal(a, b),
+    }
 }
 
 pub const Cache = CacheOf(Ir, parse);
@@ -1109,14 +1188,68 @@ test "rules parse with required groups and arity checks; caches hit by identity 
     var cache = Cache.init(testing.allocator);
     defer cache.deinit();
     const q = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
-    const p1 = try cache.get(&interner, q, &diag);
-    const p2 = try cache.get(&interner, q, &diag);
+    const p1 = try cache.acquire(&interner, q, &diag);
+    const p2 = try cache.acquire(&interner, q, &diag);
     try testing.expect(p1 == p2);
     const q_again = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
-    const p3 = try cache.get(&interner, q_again, &diag);
+    const p3 = try cache.acquire(&interner, q_again, &diag);
     try testing.expect(p1 == p3);
-    try testing.expectEqual(@as(usize, 2), cache.count());
+    try testing.expectEqual(@as(usize, 1), cache.count());
     const q_other = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(2) }) });
-    const p4 = try cache.get(&interner, q_other, &diag);
+    const p4 = try cache.acquire(&interner, q_other, &diag);
     try testing.expect(p1 != p4);
+    for ([_]*Ir{ p1, p2, p3, p4 }) |p| cache.release(p);
+
+    // A list constant and a lookup-ref vector are `=` but parse apart.
+    const as_list = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.lst(&.{ b.kw("b"), b.int(1) }) }) });
+    const as_vec = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.vec(&.{ b.kw("b"), b.int(1) }) }) });
+    try testing.expect(dispatch.equal(as_list, as_vec));
+    const pl = try cache.acquire(&interner, as_list, &diag);
+    const pv = try cache.acquire(&interner, as_vec, &diag);
+    try testing.expect(pl.where[0].pattern.v.constant == .cell);
+    try testing.expect(pv.where[0].pattern.v.constant == .lookup);
+    cache.release(pl);
+    cache.release(pv);
+}
+
+test "a full cache replaces its least recently used unpinned parse and roots what it holds" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const b = Builder{ .heap = &heap, .interner = &interner };
+    const Held = struct {
+        vals: [cache_capacity + 2]Value = undefined,
+        len: usize = 0,
+        fn set(ctx: *anyopaque, slot: usize, v: Value) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (slot == self.len) self.len += 1;
+            self.vals[slot] = v;
+        }
+    };
+    var held: Held = .{};
+    var cache = Cache.init(testing.allocator);
+    defer cache.deinit();
+    cache.roots = .{ .ctx = &held, .set = &Held.set };
+    var diag: Diag = .{};
+    const queryOf = struct {
+        fn f(bb: Builder, n: i64) Value {
+            return bb.vec(&.{ bb.kw("find"), bb.sym("?e"), bb.kw("where"), bb.vec(&.{ bb.sym("?e"), bb.kw("a"), bb.int(n) }) });
+        }
+    }.f;
+    // The first query stays pinned; the second is the oldest unpinned.
+    const pinned_q = queryOf(b, 0);
+    const pinned = try cache.acquire(&interner, pinned_q, &diag);
+    var i: i64 = 1;
+    while (i < cache_capacity) : (i += 1) cache.release(try cache.acquire(&interner, queryOf(b, i), &diag));
+    try testing.expectEqual(@as(usize, cache_capacity), cache.count());
+    try testing.expectEqual(@as(usize, cache_capacity), held.len);
+    const newest = queryOf(b, 1000);
+    cache.release(try cache.acquire(&interner, newest, &diag));
+    try testing.expectEqual(@as(usize, cache_capacity), cache.count());
+    try testing.expect(held.vals[1].payload == newest.payload);
+    try testing.expect(held.vals[0].payload == pinned_q.payload);
+    try testing.expect(pinned == try cache.acquire(&interner, pinned_q, &diag));
+    cache.release(pinned);
+    cache.release(pinned);
 }

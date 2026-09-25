@@ -402,12 +402,15 @@ db and inputs.
 error throws `{:error :nextomic/query-syntax :message "..." :clause i}`
 with the clause index when the error is inside `:where`. The IR is pure
 syntax over the VM's symbol table, so it is cached per VM by query value
-(heap identity first, structural hash second) and reused across every
-db and basis; the rule set bound to `%` is cached the same way. The
-collector empties both caches after every cycle, since a freed value's
-address may be reused; a query in flight borrows its IR from the cache,
-so a cycle inside one of its callbacks defers the clearing to the
-query's return (`natives.State`). Constants in data patterns are
+and reused across every db and basis; the rule set bound to `%` is
+cached the same way. A lookup hits on the same value, or on one `=` to
+it with lists and vectors told apart at every depth, since the parser
+reads them differently. Each cache keeps its query values reachable
+through a var in `nexis.internal`, because a parse borrows from its
+query (string constants, pull patterns), and holds at most 128 parses:
+a miss replaces the least recently used one that no running query is
+using, so a nested `q` inside a callback never frees the outer query's
+parse (`natives.State`). Constants in data patterns are
 encoded to their sortable bytes, and lookup refs and idents in constant
 positions resolve against the db, at plan time. `:in` inputs resolve
 by the role their variable plays in `:where`: one bound in an entity
@@ -698,9 +701,8 @@ the `Env`.
 - **Memory**: every operation allocates in its own arena and copies
   only results into the VM heap (§1 commitment 8); the arena dies with
   the operation on every path out of it, a throw included.
-- **The collector**: the query caches (§5) hold query values by
-  address, so a cycle empties them through `vm.nextomic_query_clear`,
-  deferred to the query's return while one is in flight; the `q` hook
+- **The collector**: the query caches (§5) keep the query values they
+  hold reachable through vars in `nexis.internal`; the `q` hook
   roots every user-function result for the query's life; the entity
   box keeps its db box and the map of its last full read reachable
   (`docs/GC.md` §3, §11.5).

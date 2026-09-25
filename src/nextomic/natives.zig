@@ -27,9 +27,10 @@
 //! `:nextomic/closed`; VM teardown destroys every connection through
 //! `closeCallback`.
 //!
-//! Per-VM state (`State`): the parsed-query caches and the view of
-//! every finished `with` scope, created on first use and destroyed at
-//! VM teardown through `vm.nextomic_query_close`. A view outlives its
+//! Per-VM state (`State`): the parsed-query caches, whose query values
+//! a var in `nexis.internal` keeps reachable, and the view of every
+//! finished `with` scope, created on first use and destroyed at VM
+//! teardown through `vm.nextomic_query_close`. A view outlives its
 //! scope the way a released connection's struct does, so a db-value
 //! that escaped the scope answers `:nextomic/closed`; the scope's
 //! scratch is freed when the native returns.
@@ -150,30 +151,38 @@ pub const State = struct {
     gpa: Allocator,
     ir_cache: query.Cache,
     rules_cache: query.RulesCache,
+    ir_roots: CacheRoots,
+    rules_roots: CacheRoots,
     /// The views of finished `with` scopes: closed, kept allocated for
     /// the db-values that name them, destroyed at VM teardown.
     views: std.ArrayList(*Conn) = .empty,
-    /// Queries in flight: each borrows its parsed IR from the caches
-    /// for its duration, so a collection that happens inside one of
-    /// its callbacks defers the clearing (`clear_pending`) to the
-    /// moment the outermost query returns.
-    active: usize = 0,
-    clear_pending: bool = false,
+};
 
-    /// Enter a query; `leave` is its pair.
-    pub fn enter(self: *State) void {
-        self.active += 1;
+/// Keeps a cache's query values reachable: a var in `nexis.internal`
+/// whose root is the vector of them, slot for slot. Every var's root is
+/// a collector root (GC.md §3).
+const CacheRoots = struct {
+    holder: *vm_mod.Var,
+    heap: *Heap,
+
+    fn init(vm: *VM, name: []const u8) !CacheRoots {
+        const registry = try vm.ensureRegistry();
+        const ns = try registry.getOrCreate("nexis.internal", registry.core);
+        const heap = vm.ensureHeap();
+        const holder = try ns.intern(name);
+        holder.root = try vector_mod.empty(heap);
+        return .{ .holder = holder, .heap = heap };
     }
 
-    pub fn leave(self: *State) void {
-        self.active -= 1;
-        if (self.active == 0 and self.clear_pending) self.clearCaches();
+    fn roots(self: *CacheRoots) query.Roots {
+        return .{ .ctx = @ptrCast(self), .set = &set };
     }
 
-    fn clearCaches(self: *State) void {
-        self.clear_pending = false;
-        self.ir_cache.clear();
-        self.rules_cache.clear();
+    fn set(ctx: *anyopaque, slot: usize, v: Value) error{OutOfMemory}!void {
+        const self: *CacheRoots = @ptrCast(@alignCast(ctx));
+        const held = self.holder.root;
+        const next = if (slot < vector_mod.count(held)) vector_mod.assoc(self.heap, held, slot, v) else vector_mod.conj(self.heap, held, v);
+        self.holder.root = next catch return error.OutOfMemory;
     }
 };
 
@@ -181,27 +190,19 @@ pub const State = struct {
 pub fn state(vm: *VM) !*State {
     if (vm.nextomic_query_state) |p| return @ptrCast(@alignCast(p));
     const s = try vm.allocator.create(State);
+    errdefer vm.allocator.destroy(s);
     s.* = .{
         .gpa = vm.allocator,
         .ir_cache = query.Cache.init(vm.allocator),
         .rules_cache = query.RulesCache.init(vm.allocator),
+        .ir_roots = try CacheRoots.init(vm, "#%query-cache"),
+        .rules_roots = try CacheRoots.init(vm, "#%rules-cache"),
     };
+    s.ir_cache.roots = s.ir_roots.roots();
+    s.rules_cache.roots = s.rules_roots.roots();
     vm.nextomic_query_state = @ptrCast(s);
     vm.nextomic_query_close = &closeState;
-    vm.nextomic_query_clear = &clearState;
     return s;
-}
-
-/// Empty both query caches: the collector calls this after every
-/// cycle because the caches key on heap identity (§5). With a query
-/// in flight the clearing waits until it returns.
-fn clearState(ptr: *anyopaque) void {
-    const s: *State = @ptrCast(@alignCast(ptr));
-    if (s.active > 0) {
-        s.clear_pending = true;
-        return;
-    }
-    s.clearCaches();
 }
 
 fn closeState(ptr: *anyopaque) void {
