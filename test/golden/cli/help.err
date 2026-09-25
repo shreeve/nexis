@@ -1,0 +1,29 @@
+nexis — A Lisp where immutable values, transactional durable
+        identity, and historical snapshots are one coherent
+        programming model.
+
+usage:
+  nexis run FILE.nx    Reads FILE.nx, compiles and runs each
+                       top-level form in order.
+  nexis repl           Interactive read-eval-print loop.
+                       :quit or EOF to exit.
+  nexis disasm FILE.nx Compiles FILE.nx without running it and
+                       prints every routine's bytecode: pc,
+                       opcode, operands, constants and the
+                       source line:col each run of
+                       instructions comes from.
+                       `--disasm FILE.nx` is the same.
+
+For `run`, Vars and the interner persist across forms within
+the file; for `repl`, across the whole session. A runtime error
+is reported at its source position with the frame chain.
+
+Namespaces available without a file: nexis.core (auto-referred),
+db (key-value storage on emdb), nextomic (Datomic-class datoms:
+transact!, q, pull, as-of/since/history, with), nexis.string,
+nexis.test (deftest, is, testing, run-tests), nexis.pprint
+(pprint), nexis.math (sqrt, pow, floor, ceil, round, PI, E),
+nexis.simd (typed-vector kernels), nexis.internal. See README.md,
+docs/TOOLING.md and docs/NEXTOMIC.md.
+
+Examples: examples/*.nx (examples/nextomic-app.nx for Nextomic).

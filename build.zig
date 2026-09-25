@@ -25,7 +25,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const update_golden = b.option(bool, "update", "rewrite golden expected files in-place") orelse false;
+    const update = b.option(bool, "update", "rewrite the expected-output files the gate compares, instead of comparing") orelse false;
 
     const nexis = runtime(b, target, optimize);
 
@@ -143,126 +143,65 @@ pub fn build(b: *std.Build) void {
     b.step("bench", "Run the benchmark suite (ReleaseFast)").dependOn(&run_bench.step);
 
     // -------------------------------------------------------------------------
-    // test/nextomic/*.nx — end-to-end Nextomic scripts run through the
-    // nexis binary (NEXTOMIC.md §8). The scripts and their shared
-    // prelude are copied into one generated directory that is also
-    // their working directory, so the store files they create are
-    // fresh whenever the binary or a script changes and the
-    // persistence pair shares one file. Each script's stdout is
-    // compared with its test/nextomic/<name>.out.
+    // Programs through bin/nexis, their output pinned byte for byte.
+    // `-Dupdate=true` rewrites every expected file instead of comparing.
     // -------------------------------------------------------------------------
 
+    const scripts: Scripts = .{ .b = b, .exe = nexis_exe, .update = update };
+
+    // test/nextomic/*.nx: each script's stdout against its `.out`
+    // (NEXTOMIC.md §8), run from a fresh directory that holds the
+    // stores it creates; `prelude.nx` is found beside the script.
+    // `<name>-2.nx` reads what `<name>-1.nx` wrote, from the same
+    // directory. gc.nx runs with a collection every few kilobytes.
     const nextomic_nx_step = b.step("nextomic-nx", "Run the test/nextomic end-to-end scripts through bin/nexis");
-    {
-        const scripts = [_][]const u8{
-            "basics",
-            "indexes",
-            "time",
-            "errors",
-            "query",
-            "pull",
-            "with",
-            "with-conn",
-            "polish",
-            "datoms",
-            "persist-1",
-            "persist-2",
-            "gc",
-        };
-        const scratch = b.addWriteFiles();
-        // The binary is copied only so the directory's hash, and with
-        // it the store files inside, changes when the binary does.
-        _ = scratch.addCopyFile(nexis_exe.getEmittedBin(), "nexis");
-        _ = scratch.addCopyFile(b.path("test/nextomic/prelude.nx"), "prelude.nx");
-        for (scripts) |name| {
-            _ = scratch.addCopyFile(b.path(b.fmt("test/nextomic/{s}.nx", .{name})), b.fmt("{s}.nx", .{name}));
+    for (listStems(b, "test/nextomic", ".nx")) |name| {
+        if (std.mem.eql(u8, name, "prelude") or std.mem.endsWith(u8, name, "-2")) continue;
+        const pair: []const []const u8 = if (std.mem.endsWith(u8, name, "-1"))
+            &.{ name, b.fmt("{s}-2", .{name[0 .. name.len - 2]}) }
+        else
+            &.{name};
+        var inputs: std.ArrayList(std.Build.LazyPath) = .empty;
+        inputs.append(b.allocator, b.path("test/nextomic/prelude.nx")) catch @panic("OOM");
+        for (pair) |n| {
+            inputs.append(b.allocator, b.path(b.fmt("test/nextomic/{s}.nx", .{n}))) catch @panic("OOM");
+            inputs.append(b.allocator, b.path(b.fmt("test/nextomic/{s}.out", .{n}))) catch @panic("OOM");
         }
-        var persist_1: ?*std.Build.Step = null;
-        for (scripts) |name| {
-            const expected = b.build_root.handle.readFileAlloc(
-                b.graph.io,
-                b.fmt("test/nextomic/{s}.out", .{name}),
-                b.allocator,
-                .limited(1 << 20),
-            ) catch @panic("test/nextomic: missing expected-output file");
-            const run = b.addRunArtifact(nexis_exe);
-            run.addArg("run");
-            run.addArg(b.fmt("{s}.nx", .{name}));
-            run.setCwd(scratch.getDirectory());
-            run.expectExitCode(0);
-            run.expectStdOutEqual(expected);
-            // gc.nx proves the collector inside query callbacks: it
-            // runs with a cycle due every few kilobytes.
-            if (std.mem.eql(u8, name, "gc")) run.setEnvironmentVariable("NEXIS_GC_STRESS", "1");
-            // persist-2 reads what persist-1 wrote; every other script
-            // owns its store.
-            if (std.mem.eql(u8, name, "persist-1")) persist_1 = &run.step;
-            if (std.mem.eql(u8, name, "persist-2")) run.step.dependOn(persist_1.?);
-            nextomic_nx_step.dependOn(&run.step);
+        const cwd = scripts.freshDir(inputs.items);
+        var previous: ?*std.Build.Step = null;
+        for (pair) |n| {
+            const run = scripts.run(nextomic_nx_step, b.fmt("test/nextomic/{s}.nx", .{n}), cwd, b.fmt("test/nextomic/{s}.out", .{n}));
+            if (std.mem.eql(u8, n, "gc")) run.setEnvironmentVariable("NEXIS_GC_STRESS", "1");
+            if (previous) |p| run.step.dependOn(p);
+            previous = &run.step;
         }
     }
     test_step.dependOn(nextomic_nx_step);
 
-    // -------------------------------------------------------------------------
-    // examples/*.nx — every example runs through the nexis binary from
-    // a generated working directory (the store-backed ones write under
-    // tmp/ relative to it). The three that keep a store run a second
-    // time in the same directory to prove they are idempotent.
-    // -------------------------------------------------------------------------
-
+    // examples/*.nx: each example's stdout against
+    // test/examples/<name>.out, from a fresh directory (the
+    // store-backed ones write under tmp/ in it). An example with a
+    // `<name>.2.out` runs again in the same directory, proving it
+    // idempotent over the store it left.
     const examples_step = b.step("examples", "Run every examples/*.nx through bin/nexis");
-    {
-        const examples = [_]struct { name: []const u8, twice: bool = false }{
-            .{ .name = "hello" },
-            .{ .name = "sum10" },
-            .{ .name = "forward-ref" },
-            .{ .name = "cond" },
-            .{ .name = "threading" },
-            .{ .name = "macros" },
-            .{ .name = "quoted-list" },
-            .{ .name = "syntax-quote" },
-            .{ .name = "macro-author" },
-            .{ .name = "try-catch" },
-            .{ .name = "metadata" },
-            .{ .name = "binding" },
-            .{ .name = "maps-sets" },
-            .{ .name = "defmacro" },
-            .{ .name = "eval" },
-            .{ .name = "stdlib-primitives" },
-            .{ .name = "require-demo" },
-            .{ .name = "shapes" },
-            .{ .name = "shapes-app" },
-            .{ .name = "typed-vectors" },
-            .{ .name = "tests-demo" },
-            .{ .name = "durable-refs", .twice = true },
-            .{ .name = "todo-app", .twice = true },
-            .{ .name = "nextomic-app", .twice = true },
-        };
-        const scratch = b.addWriteFiles();
-        _ = scratch.addCopyFile(nexis_exe.getEmittedBin(), "nexis");
-        for (examples) |ex| {
-            var first: ?*std.Build.Step = null;
-            const passes: usize = if (ex.twice) 2 else 1;
-            for (0..passes) |pass| {
-                const run = b.addRunArtifact(nexis_exe);
-                run.addArg("run");
-                run.addFileArg(b.path(b.fmt("examples/{s}.nx", .{ex.name})));
-                run.setCwd(scratch.getDirectory());
-                // Distinguishes the second pass's cache entry from the first's.
-                run.setEnvironmentVariable("NEXIS_EXAMPLE_PASS", b.fmt("{d}", .{pass + 1}));
-                run.expectExitCode(0);
-                if (first) |f| run.step.dependOn(f);
-                first = &run.step;
-                examples_step.dependOn(&run.step);
-            }
-        }
+    const example_libs = listFiles(b, "examples/lib");
+    for (listStems(b, "examples", ".nx")) |name| {
+        const script = b.fmt("examples/{s}.nx", .{name});
+        const first = b.fmt("test/examples/{s}.out", .{name});
+        const second = b.fmt("test/examples/{s}.2.out", .{name});
+        const twice = exists(b, second);
+        var inputs: std.ArrayList(std.Build.LazyPath) = .empty;
+        inputs.append(b.allocator, b.path(script)) catch @panic("OOM");
+        inputs.append(b.allocator, b.path(first)) catch @panic("OOM");
+        if (twice) inputs.append(b.allocator, b.path(second)) catch @panic("OOM");
+        for (example_libs) |lib| inputs.append(b.allocator, b.path(lib)) catch @panic("OOM");
+        const cwd = scripts.freshDir(inputs.items);
+        const run = scripts.run(examples_step, script, cwd, first);
+        if (twice) scripts.run(examples_step, script, cwd, second).step.dependOn(&run.step);
     }
     test_step.dependOn(examples_step);
 
-    // -------------------------------------------------------------------------
     // Goldens: the reader's Form output (src/golden.zig) and the CLI.
-    // -------------------------------------------------------------------------
-
     const golden_exe = b.addExecutable(.{
         .name = "nexis-golden",
         .root_module = b.createModule(.{
@@ -277,59 +216,158 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&install_golden.step);
 
+    const golden_step = b.step("golden", "Run the reader and CLI goldens");
+    test_step.dependOn(golden_step);
     const run_golden = b.addRunArtifact(golden_exe);
-    run_golden.addArg(if (update_golden) "--update" else "--verify");
+    run_golden.addArg(if (update) "--update" else "--verify");
     run_golden.addArg("test/golden");
-    run_golden.step.dependOn(&install_golden.step);
-
-    const golden_step = b.step("golden", "Run reader golden tests");
+    run_golden.setCwd(b.path("."));
+    if (update) run_golden.has_side_effects = true else run_golden.expectExitCode(0);
+    for (listFiles(b, "test/golden")) |path| run_golden.addFileInput(b.path(path));
+    for (listFiles(b, "test/golden/errors")) |path| run_golden.addFileInput(b.path(path));
     golden_step.dependOn(&run_golden.step);
-    test_step.dependOn(&run_golden.step);
 
-    // test/golden/cli — what bin/nexis prints for a script, pinned
-    // byte for byte: a runtime error's stderr (`<name>.nx` +
-    // `<name>.err`, exit 5), a reader error's stderr (exit 3), a
-    // disassembly's stdout (`.disasm`) and a script's stdout (`.out`).
-    // Each runs from the build root so the paths in the output are
-    // the relative ones committed. To refresh an expected file, run
-    // the command from the build root and redirect the stream it
-    // pins.
+    // test/golden/cli: what bin/nexis prints, pinned byte for byte: a
+    // runtime error's stderr (exit 5), a reader error's stderr (exit
+    // 3), a disassembly, a script's stdout, a REPL session and the
+    // usage errors. Each runs from the build root, so the paths in
+    // the output are the relative ones committed.
     {
         const CliGolden = struct {
-            verb: []const u8 = "run",
-            file: []const u8,
-            expected: []const u8,
-            stream: enum { stdout, stderr } = .stdout,
+            args: []const []const u8,
+            /// The expected-output files each stream is pinned to.
+            stdout: ?[]const u8 = null,
+            stderr: ?[]const u8 = null,
             exit_code: u8 = 0,
+            stdin: ?[]const u8 = null,
         };
+        const cli = "test/golden/cli/";
         const cases = [_]CliGolden{
-            .{ .file = "test/golden/cli/divide-by-zero.nx", .expected = "divide-by-zero.err", .stream = .stderr, .exit_code = 5 },
-            .{ .file = "test/golden/cli/uncaught-throw.nx", .expected = "uncaught-throw.err", .stream = .stderr, .exit_code = 5 },
-            .{ .file = "test/golden/cli/require-runtime-error.nx", .expected = "require-runtime-error.err", .stream = .stderr, .exit_code = 5 },
-            .{ .file = "test/golden/cli/bad-number.nx", .expected = "bad-number.err", .stream = .stderr, .exit_code = 3 },
-            .{ .file = "test/golden/cli/duplicate-key.nx", .expected = "duplicate-key.err", .stream = .stderr, .exit_code = 3 },
-            .{ .verb = "disasm", .file = "examples/sum10.nx", .expected = "sum10.disasm" },
-            .{ .file = "test/golden/cli/pprint.nx", .expected = "pprint.out" },
-            .{ .file = "test/golden/cli/deep-recursion.nx", .expected = "deep-recursion.out" },
+            .{ .args = &.{ "run", cli ++ "divide-by-zero.nx" }, .stderr = "divide-by-zero.err", .exit_code = 5 },
+            .{ .args = &.{ "run", cli ++ "uncaught-throw.nx" }, .stderr = "uncaught-throw.err", .exit_code = 5 },
+            .{ .args = &.{ "run", cli ++ "require-runtime-error.nx" }, .stderr = "require-runtime-error.err", .exit_code = 5 },
+            .{ .args = &.{ "run", cli ++ "bad-number.nx" }, .stderr = "bad-number.err", .exit_code = 3 },
+            .{ .args = &.{ "run", cli ++ "duplicate-key.nx" }, .stderr = "duplicate-key.err", .exit_code = 3 },
+            .{ .args = &.{ "disasm", "examples/sum10.nx" }, .stdout = "sum10.disasm" },
+            .{ .args = &.{ "run", cli ++ "pprint.nx" }, .stdout = "pprint.out" },
+            .{ .args = &.{ "run", cli ++ "deep-recursion.nx" }, .stdout = "deep-recursion.out" },
+            .{ .args = &.{"repl"}, .stdin = "repl.in", .stdout = "repl.out", .stderr = "repl.err" },
+            .{ .args = &.{"--help"}, .stderr = "help.err" },
+            .{ .args = &.{}, .stderr = "help.err", .exit_code = 1 },
+            .{ .args = &.{"frobnicate"}, .stderr = "unknown-command.err", .exit_code = 1 },
         };
         for (cases) |case| {
-            const expected = b.build_root.handle.readFileAlloc(
-                b.graph.io,
-                b.fmt("test/golden/cli/{s}", .{case.expected}),
-                b.allocator,
-                .limited(1 << 20),
-            ) catch @panic("test/golden/cli: missing expected-output file");
             const run = b.addRunArtifact(nexis_exe);
-            run.addArg(case.verb);
-            run.addArg(case.file);
-            run.expectExitCode(case.exit_code);
-            switch (case.stream) {
-                .stdout => run.expectStdOutEqual(expected),
-                .stderr => run.expectStdErrEqual(expected),
+            run.setCwd(b.path("."));
+            run.addArgs(case.args);
+            for (case.args) |arg| {
+                if (std.mem.endsWith(u8, arg, ".nx")) run.addFileInput(b.path(arg));
             }
-            golden_step.dependOn(&run.step);
+            run.addFileInput(b.path(cli ++ "lib/failing.nx"));
+            if (case.stdin) |stdin| run.setStdIn(.{ .lazy_path = b.path(b.fmt(cli ++ "{s}", .{stdin})) });
+            run.expectExitCode(case.exit_code);
+            if (case.stdout) |file| scripts.pin(golden_step, run, b.fmt(cli ++ "{s}", .{file}), .stdout);
+            if (case.stderr) |file| scripts.pin(golden_step, run, b.fmt(cli ++ "{s}", .{file}), .stderr);
         }
     }
+}
+
+/// Programs run through bin/nexis with their output compared to, or
+/// under `-Dupdate=true` written to, a file in the tree.
+const Scripts = struct {
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    update: bool,
+
+    /// A directory that is empty whenever any of `inputs` or the
+    /// binary changes, for a program to use as its working directory:
+    /// the stores a run leaves never reach a run of changed inputs.
+    fn freshDir(self: Scripts, inputs: []const std.Build.LazyPath) std.Build.LazyPath {
+        const mk = self.b.addSystemCommand(&.{ "sh", "-c", "rm -rf \"$1\" && mkdir -p \"$1\"", "fresh-dir" });
+        const dir = mk.addOutputDirectoryArg("cwd");
+        mk.addFileInput(self.exe.getEmittedBin());
+        for (inputs) |input| {
+            // An expected file not written yet is no input.
+            if (input == .src_path and !exists(self.b, input.src_path.sub_path)) continue;
+            mk.addFileInput(input);
+        }
+        mk.expectExitCode(0);
+        return dir;
+    }
+
+    /// `nexis run script` from `cwd`, its stdout pinned to `expected`.
+    fn run(self: Scripts, step: *std.Build.Step, script: []const u8, cwd: std.Build.LazyPath, expected: []const u8) *std.Build.Step.Run {
+        const r = self.b.addRunArtifact(self.exe);
+        r.addArg("run");
+        r.addFileArg(self.b.path(script));
+        r.setCwd(cwd);
+        r.expectExitCode(0);
+        self.pin(step, r, expected, .stdout);
+        return r;
+    }
+
+    /// Make `step` compare `r`'s `stream` with the file at `path`, or
+    /// rewrite the file. A missing file fails the step, not the
+    /// configure.
+    fn pin(self: Scripts, step: *std.Build.Step, r: *std.Build.Step.Run, path: []const u8, stream: enum { stdout, stderr }) void {
+        const b = self.b;
+        if (self.update) {
+            const captured = switch (stream) {
+                .stdout => r.captureStdOut(.{}),
+                .stderr => r.captureStdErr(.{}),
+            };
+            const usf = b.addUpdateSourceFiles();
+            usf.addCopyFileToSource(captured, path);
+            step.dependOn(&usf.step);
+            return;
+        }
+        step.dependOn(&r.step);
+        const expected = b.build_root.handle.readFileAlloc(b.graph.io, path, b.allocator, .limited(1 << 20)) catch |err| {
+            r.step.dependOn(&b.addFail(b.fmt("{s}: {t} (write it with -Dupdate=true)", .{ path, err })).step);
+            return;
+        };
+        switch (stream) {
+            .stdout => r.expectStdOutEqual(expected),
+            .stderr => r.expectStdErrEqual(expected),
+        }
+    }
+};
+
+/// The names under `dir` (relative to the build root) ending in `ext`,
+/// without it, sorted.
+fn listStems(b: *std.Build, dir: []const u8, ext: []const u8) []const []const u8 {
+    var stems: std.ArrayList([]const u8) = .empty;
+    for (listFiles(b, dir)) |path| {
+        const base = std.fs.path.basename(path);
+        if (std.mem.endsWith(u8, base, ext))
+            stems.append(b.allocator, base[0 .. base.len - ext.len]) catch @panic("OOM");
+    }
+    return stems.items;
+}
+
+/// The paths of the files directly under `dir`, sorted.
+fn listFiles(b: *std.Build, dir: []const u8) []const []const u8 {
+    const io = b.graph.io;
+    var handle = b.build_root.handle.openDir(io, dir, .{ .iterate = true }) catch |err|
+        std.debug.panic("cannot open {s}: {t}", .{ dir, err });
+    defer handle.close(io);
+    var paths: std.ArrayList([]const u8) = .empty;
+    var it = handle.iterate();
+    while (it.next(io) catch |err| std.debug.panic("cannot list {s}: {t}", .{ dir, err })) |entry| {
+        if (entry.kind != .file) continue;
+        paths.append(b.allocator, b.pathJoin(&.{ dir, entry.name })) catch @panic("OOM");
+    }
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lessThan);
+    return paths.items;
+}
+
+fn exists(b: *std.Build, path: []const u8) bool {
+    b.build_root.handle.access(b.graph.io, path, .{}) catch return false;
+    return true;
 }
 
 /// The `nexis` module: the whole runtime, rooted at src/root.zig.

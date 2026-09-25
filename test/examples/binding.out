@@ -1,0 +1,11 @@
+> outer
+>   one
+>   inner
+>     two
+!     three
+>     four
+>   five
+> root again
+[0 :restored]
+5
+:not-dynamic
