@@ -256,10 +256,13 @@ misstep; the impl + tests must cover all of them explicitly.
 
 ### 7. Hash and equality contract
 
-**Hash.** `vector.hashSeq` produces the same pre-mix `u64` base as
+**Hash.** `vector.hashSeq` produces the same pre-mix base as
 `list.hashSeq` for equal element sequences, because both use
 identical `hash.ordered_init`, `hash.combineOrdered`, and
-`hash.finalizeOrdered(h, count)` arithmetic. `dispatch.hashValue`
+`hash.finalizeOrdered(h, count)` arithmetic truncated to `u32`. The
+first call caches the base in the root header (a computed zero is not
+cached; SEMANTICS §3.1), so a vector used as a map key or set element
+is hashed once, not on every lookup. `dispatch.hashValue`
 then applies `mixKindDomain(base, sequential_domain_byte)` =
 `mixKindDomain(base, 0xF0)`, which is the shared sequential-category
 byte. Result: `(hash (list 1 2 3)) == (hash [1 2 3])` by

@@ -60,10 +60,12 @@ is the remedy.
 5. **Hash** (SEMANTICS §3.2). `list.hashSeq(h, hasher)` returns the
    sequential ordered combine: `acc = ordered_init; for each x:
    acc = combineOrdered(acc, hasher(x)); return finalizeOrdered(acc,
-   count)`. The `hasher` parameter is the dispatcher's
-   `&dispatch.hashValue` — already fully mixed per-kind. The returned
-   `u64` is the pre-domain base; `dispatch.hashValue` applies the
-   **sequential-category** domain byte on the way out.
+   count)` truncated to `u32`. The `hasher` parameter is the
+   dispatcher's `&dispatch.hashValue` — already fully mixed per-kind.
+   The result is the pre-domain base; `dispatch.hashValue` applies the
+   **sequential-category** domain byte on the way out. The first call
+   caches it in the head cell's header (a computed zero is not cached;
+   SEMANTICS §3.1), so a list used as a map key is hashed once.
 6. **Metadata** (SEMANTICS §7). Lists carry metadata through
    `with-meta`; the `HeapHeader.meta` slot is the storage.
 

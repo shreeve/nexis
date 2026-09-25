@@ -466,15 +466,19 @@ pub fn nth(v: Value, i: usize) Value {
 // Per-kind hash + equality (called by dispatch)
 // =============================================================================
 
-/// Ordered-combine hash over the logical element sequence. Matches
-/// `list.hashSeq` arithmetic exactly so equal element sequences
-/// produce equal pre-mix u64 bases across list and vector.
+/// Ordered-combine hash over the logical element sequence, at u32
+/// precision and cached in the root header (SEMANTICS.md §3.1).
+/// Matches `list.hashSeq` exactly, so equal element sequences produce
+/// equal pre-mix bases across list and vector.
 pub fn hashSeq(h: *HeapHeader, elementHash: *const fn (Value) u64) u64 {
     std.debug.assert(h.kind == @intFromEnum(Kind.persistent_vector));
+    if (h.cachedHash()) |cached| return cached;
     var acc: u64 = hash_mod.ordered_init;
     var c = Cursor.fromHeader(h);
     while (c.next()) |elem| acc = hash_mod.combineOrdered(acc, elementHash(elem));
-    return hash_mod.finalizeOrdered(acc, c.count);
+    const truncated: u32 = @truncate(hash_mod.finalizeOrdered(acc, c.count));
+    if (truncated != 0) h.setCachedHash(truncated);
+    return truncated;
 }
 
 /// Pairwise structural equality. Called by dispatch when both sides
@@ -931,7 +935,7 @@ test "hashSeq: matches manual ordered-combine for small vector" {
     expected = hash_mod.combineOrdered(expected, elems[0].hashImmediate());
     expected = hash_mod.combineOrdered(expected, elems[1].hashImmediate());
     expected = hash_mod.combineOrdered(expected, elems[2].hashImmediate());
-    expected = hash_mod.finalizeOrdered(expected, 3);
+    expected = @as(u32, @truncate(hash_mod.finalizeOrdered(expected, 3)));
 
     const SynthHash = struct {
         fn f(x: Value) u64 {
@@ -963,13 +967,28 @@ test "hashSeq: empty vector matches empty ordered-combine with count 0" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     const v = try empty(&heap);
-    const expected = hash_mod.finalizeOrdered(hash_mod.ordered_init, 0);
+    const expected: u64 = @as(u32, @truncate(hash_mod.finalizeOrdered(hash_mod.ordered_init, 0)));
     const SynthHash = struct {
         fn f(x: Value) u64 {
             return x.hashImmediate();
         }
     };
     try testing.expectEqual(expected, hashSeq(rootHeader(v), &SynthHash.f));
+}
+
+test "hashSeq caches its result in the root header" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const h = rootHeader(try rangeVector(&heap, 40));
+    const SynthHash = struct {
+        fn f(x: Value) u64 {
+            return x.hashImmediate();
+        }
+    };
+    try testing.expect(h.cachedHash() == null);
+    const first = hashSeq(h, &SynthHash.f);
+    try testing.expectEqual(@as(?u32, @intCast(first)), h.cachedHash());
+    try testing.expectEqual(first, hashSeq(h, &SynthHash.f));
 }
 
 test "Cursor: streams head-to-tail, null on exhaustion" {
