@@ -95,10 +95,12 @@ order it marks them:
    retains garbage for a while and is sound. A slot holding a
    `.cell_internal` Value marks the cell block like any other.
 2. **Every frame**: the closure it runs (`Frame.closure`, which
-   keeps the `upvalues` array in the closure block's tail alive),
-   each cell of `Frame.upvalues`, and the heap constants of its
-   routine, recursively through the routines in the constant pool
-   (string and bignum literals).
+   keeps the `upvalues` array in the closure block's tail alive;
+   its trace reaches the cells and the routine's constants, once
+   however many frames run it), or, for a frame with no closure
+   (the top-level form, a loader routine), the heap constants of
+   its routine, recursively through the routines in the constant
+   pool (string and bignum literals).
 3. **Every Var of every namespace** in the registry, and of the
    single ad-hoc namespace: `root`, `meta` and `thread_value`. Vars
    are immortal arena objects, so a `var_` Value is never marked

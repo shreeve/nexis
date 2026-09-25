@@ -50,10 +50,10 @@ DOES and what invariants the VM upholds are frozen here.
   the group numbers exist; an instruction in one of those groups
   traps `UnimplementedOpcode`. Durable-ref, I/O, hashing and
   transient operations are natives.
-- No bytecode verifier, no object files, no disassembler, no
-  tiered compilation.
-- No per-PC liveness maps and no root enumeration: the VM never
-  runs the collector (§9).
+- No bytecode verifier, no object files, no tiered compilation.
+  `bin/nexis disasm` reads routines; nothing checks them before
+  they run.
+- No per-PC liveness maps: the whole backing stack is a root (§9).
 - No unbounded recursion: the frame chain stops at `VM.max_frames`
   and native re-entry at the stack guard, both with a catchable
   `:stack-overflow` (§13).
@@ -332,7 +332,7 @@ const CaptureDescriptor = struct {
 ```
 
 **Execution**:
-- Allocate a closure (kind `function`, VALUE.md kind 22) with an
+- Allocate a closure (kind `function`, VALUE.md kind 24) with an
   `[N]*UpvalCell` array, where `N = descriptor.sources.len`. `N`
   must equal the child routine's `upvalue_count`, otherwise
   `CaptureCountMismatch`.
@@ -723,8 +723,9 @@ block and the arena wholesale.
 `vm.zig` imports `gc.zig`; `VM.gcRoots` enumerates the roots, in
 this order: the whole backing stack (every slot, the conservative
 overapproximation that needs no per-PC liveness map), every frame's
-closure, cells and routine constants (recursively through nested
-routines), every Var of every namespace (`root`, `meta`,
+closure (whose trace reaches its cells and routine constants, once
+however many frames run it) or, for a frame with none, its routine
+constants (recursively through nested routines), every Var of every namespace (`root`, `meta`,
 `thread_value`), the dynamic-binding stack's saved values, the root
 stack (`vm.roots`), pending `finally` throws, `vm.unhandled_throw`,
 `vm.result`, and the protocol registry's implementations.
@@ -1019,8 +1020,9 @@ stack is back to where it stood when the catching `try` was entered.
 
 **Matching**: the only matcher is `any`; every throw is caught by
 the innermost active `try`. Thrown values are ordinary Values.
-There are no stack traces, no cause chains and no source spans on
-runtime errors.
+A thrown value carries no stack trace and no cause chain; an error
+that leaves `run` records the frame chain, with source spans, in
+`VM.error_trace` (§13).
 
 **Throws from natives** (`VM.throwValue`, `VM.throwKeyword`):
 - A native throws exactly as `ctrl:throw` does: the same handler
@@ -1173,9 +1175,10 @@ corrupt input.
   All slot/constant/upvalue reads produce `Value`s; all stores
   write `Value`s.
 - **`src/heap.zig`**: the VM's own `Heap` is backed by
-  `runtime_arena` and used for the values it constructs itself
-  (rest-arg lists, `coll:*` results).
-- **`src/gc.zig`**: not imported (§9).
+  `VM.allocator`, so a sweep returns memory; it holds every runtime
+  value, the ones the VM constructs itself (rest-arg lists, `coll:*`
+  results, closures, cells) included.
+- **`src/gc.zig`**: the VM is the collector's host (§9).
 - **`src/intern.zig`**: one shared `Interner` per VM keeps symbol
   and keyword identity consistent between the compiler, the
   macroexpander and runtime values.
@@ -1258,7 +1261,7 @@ Three layers, paralleling `COMPILER.md` §9:
 - `PLAN.md` §12 — ISA physical format + operand kinds + opcode
   groups (higher-level).
 - `PLAN.md` §8 — Value model (what the VM manipulates).
-- `docs/VALUE.md` — heap kinds; `function` (kind 22) is the
+- `docs/VALUE.md` — heap kinds; `function` (kind 24) is the
   closure carrier.
 - `docs/SEMANTICS.md` — equality / hash / numeric invariants the
   VM must respect.

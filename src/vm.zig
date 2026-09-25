@@ -142,7 +142,7 @@ pub const Group = enum(u6) {
     _,
 };
 
-/// Variants for the `mov` group. Extends as the compiler grows.
+/// Variants for the `mov` group.
 pub const Mov = enum(u6) {
     move = 0,
     load_const = 1,
@@ -960,8 +960,6 @@ pub const TraceFrame = struct {
 // Errors
 // =============================================================================
 
-/// One entry per `defrecord`.
-/// Names are owned by the registry (duped on registration).
 /// What a native needs from the compiler at run time. `user_data`
 /// belongs to the installer (the CLI runtime, a test harness); the
 /// functions run on the calling VM and build their results on its
@@ -980,6 +978,8 @@ pub const CompilerHooks = struct {
     eval: *const fn (*anyopaque, *VM, Value) VmError!Value,
 };
 
+/// One entry per `defrecord`.
+/// Names are owned by the registry (duped on registration).
 pub const RecordTypeEntry = struct {
     id: u32,
     ns_name: []const u8,
@@ -1791,7 +1791,7 @@ pub const VM = struct {
     /// Every root this VM holds (GC.md §3): the backing stack in
     /// full (a stale slot above a popped frame retains its value
     /// until the slot is reused, which is sound), every frame's
-    /// closure, cells and routine constants, every Var of every
+    /// closure or, without one, routine constants, every Var of every
     /// namespace (root, metadata, thread binding), the saved
     /// bindings of every open `binding` frame, the root stack,
     /// pending `finally` throws, the unhandled throw, the halt
@@ -1799,10 +1799,11 @@ pub const VM = struct {
     fn gcRoots(ctx: *anyopaque, c: *gc_mod.Collector) void {
         const self: *VM = @ptrCast(@alignCast(ctx));
         for (self.stack.items) |v| c.markValue(v);
+        // A frame running a closure reaches its cells and routine
+        // through the closure block (`gcTrace`), marked once however
+        // many frames run it; any other frame has no cells.
         for (self.frames.items) |*f| {
-            c.markValue(f.closure);
-            for (f.upvalues) |cell| c.mark(cellHeader(cell));
-            markRoutineConsts(c, f.routine);
+            if (f.closure.isNil()) markRoutineConsts(c, f.routine) else c.markValue(f.closure);
         }
         if (self.registry) |*reg| {
             var it = reg.map.valueIterator();
@@ -2467,7 +2468,7 @@ pub const VM = struct {
                 if (!v.bound) return VmError.UnboundVar;
                 break :blk v.root;
             },
-            // Remaining kinds land with their respective opcode groups.
+            // Kinds no opcode reads through `resolve`.
             .intern, .jump, .durable => VmError.UnimplementedOpcode,
             // `unused` is a sentinel emitted by the assembler for
             // operand slots the opcode doesn't consume; calling
@@ -4165,7 +4166,7 @@ pub const asm_ = struct {
             .coll,
             CollOp.list,
             Operand.slot(arg_base),
-            .{ .kind = .unused, .index = argc }, // B = raw argc immediate
+            Operand.slot(argc), // raw-index immediate per §4.5
             Operand.slot(dst),
         );
     }
@@ -4177,7 +4178,7 @@ pub const asm_ = struct {
             .coll,
             CollOp.concat,
             Operand.slot(arg_base),
-            .{ .kind = .unused, .index = argc },
+            Operand.slot(argc), // raw-index immediate per §4.5
             Operand.slot(dst),
         );
     }
@@ -4250,7 +4251,7 @@ pub const asm_ = struct {
             .coll,
             CollOp.vector,
             Operand.slot(arg_base),
-            .{ .kind = .unused, .index = argc },
+            Operand.slot(argc), // raw-index immediate per §4.5
             Operand.slot(dst),
         );
     }
@@ -4262,7 +4263,7 @@ pub const asm_ = struct {
             .coll,
             CollOp.map,
             Operand.slot(arg_base),
-            .{ .kind = .unused, .index = argc },
+            Operand.slot(argc), // raw-index immediate per §4.5
             Operand.slot(dst),
         );
     }
@@ -4274,7 +4275,7 @@ pub const asm_ = struct {
             .coll,
             CollOp.set,
             Operand.slot(arg_base),
-            .{ .kind = .unused, .index = argc },
+            Operand.slot(argc), // raw-index immediate per §4.5
             Operand.slot(dst),
         );
     }
@@ -4352,8 +4353,8 @@ pub const asm_ = struct {
     /// kind that `resolve` accepts (slot / constant / upvalue).
     /// Used by `compileSymbol` for upvalue reads:
     /// `moveFrom(dst, Operand.upvalue(u))` lowers a captured-
-    /// binding read. The pre-existing `move(dst, slot_src)`
-    /// helper remains for the slot-to-slot common case.
+    /// binding read; `move(dst, slot_src)` is the slot-to-slot
+    /// case.
     pub fn moveFrom(slot_dst: u12, src: Operand) Inst {
         return Inst.primary(
             .mov,
