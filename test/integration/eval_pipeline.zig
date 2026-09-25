@@ -1287,6 +1287,46 @@ test "macroexpand: the depth limit counts expansions in a row, not nesting" {
     try expectProgramError("(defmacro forever [] `(forever)) (forever)", compile.CompileError.MacroDepthExceeded);
 }
 
+/// Run `setup`, then expand `src` as the compiler would and expect
+/// the expansion to fail with `message` recorded against the source
+/// text `at` (MACROEXPAND.md §8).
+fn expectMacroFailure(setup: []const u8, src: []const u8, message: []const u8, at: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run(setup);
+    var arena = std.heap.ArenaAllocator.init(program.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parsed = try reader_mod.parser.parseForm(a, src);
+    defer parsed.parser.deinit();
+    var rdr = reader_mod.Reader.init(a, src);
+    defer rdr.deinit();
+    const form = try rdr.readOneForm(parsed.sexp);
+    var ctx = expand_mod.ExpandContext{
+        .allocator = a,
+        .interner = program.interner,
+        .host_macros = &program.host_macros,
+        .namespace = program.registry.current,
+        .registry = program.registry,
+        .value_heap = program.v.ensureHeap(),
+    };
+    try testing.expectError(error.MalformedMacroCall, expand_mod.expandForm(&ctx, null, form));
+    const failure = ctx.failure orelse return error.TestExpectedFailure;
+    try testing.expectEqualStrings(message, failure.message);
+    try testing.expectEqualStrings(at, src[failure.span.pos..][0..failure.span.len]);
+}
+
+test "defmacro: a failing macro call names the macro and the cause, at the call" {
+    try expectMacroFailure("(defmacro m [] (throw (ex-info \"bad macro input\" {:x 1})))", "(do 1 (m))", "macro m threw bad macro input", "(m)");
+    try expectMacroFailure("(defmacro m [] (throw :nope))", "(when true (m))", "macro m threw :nope", "(m)");
+    try expectMacroFailure("(defmacro m [a] a)", "(do (m))", "macro m takes 1 argument, got 0", "(m)");
+    try expectMacroFailure("(defmacro m [a b & c] a)", "(m 1)", "macro m takes 2 or more arguments, got 1", "(m 1)");
+    try expectMacroFailure("(defmacro m [] (first 1))", "(m)", "macro m failed: KindMismatch", "(m)");
+    try expectMacroFailure("(defmacro m [] (fn [] 1))", "(m)", "a macro returned a function, which is not a form", "(m)");
+    try expectMacroFailure("(defmacro m [a] a)", "(m (+ 1 `x))", "a syntax-quote is not data a macro can take", "`x");
+}
+
 test "integration: defmacro — macro can use already-defined macros in body" {
     // twice's body uses unless (a macro defined above it);
     // when outer is invoked, the macro fn body is already

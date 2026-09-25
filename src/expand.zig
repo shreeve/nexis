@@ -112,11 +112,15 @@ pub const LoadCallback = struct {
     load: *const fn (user_data: *anyopaque, ns_name: []const u8) anyerror!void,
 };
 
-/// Per-spec MACROEXPAND.md §1: bundles every cross-cutting
-/// resource a host MacroFn might need. Lives FOR THE LIFETIME
-/// of a single compilation unit (typically one CLI invocation
-/// or one test). Reusing across forms is how auto-gensym stays
-/// monotonic within a unit.
+/// Why an expansion failed and where (MACROEXPAND.md §8): the
+/// innermost form that failed, and a message naming the problem.
+pub const Failure = struct {
+    span: SrcSpan,
+    message: []const u8,
+};
+
+/// Every resource a host MacroFn might need (MACROEXPAND.md §1). The
+/// compiler builds one per top-level form.
 pub const ExpandContext = struct {
     allocator: Allocator,
     interner: *intern_mod.Interner,
@@ -158,6 +162,24 @@ pub const ExpandContext = struct {
     /// arguments, the macro sub-VM's allocations and the values
     /// it returns then live where the VM's Vars can hold them.
     value_heap: ?*heap_mod.Heap = null,
+    /// Set by the first (innermost) failure of an expansion that
+    /// returns an error; the message lives in `allocator`.
+    failure: ?Failure = null,
+
+    /// Record why expanding the form at `span` failed, unless an
+    /// inner form already did, and return `err`.
+    pub fn failWith(self: *ExpandContext, err: ExpandError, span: SrcSpan, comptime fmt: []const u8, args: anytype) ExpandError {
+        if (self.failure == null) {
+            const message = std.fmt.allocPrint(self.allocator, fmt, args) catch return ExpandError.OutOfMemory;
+            self.failure = .{ .span = span, .message = message };
+        }
+        return err;
+    }
+
+    /// `failWith` for a malformed form.
+    pub fn fail(self: *ExpandContext, span: SrcSpan, comptime fmt: []const u8, args: anytype) ExpandError {
+        return self.failWith(ExpandError.MalformedMacroCall, span, fmt, args);
+    }
 
     /// The heap for arg Value construction: `value_heap` when set,
     /// else the lazily created `_arg_heap`, good for the lifetime
@@ -313,7 +335,7 @@ fn expandFormDepth(
     form: *const Form,
     depth: u32,
 ) ExpandError!*Form {
-    if (depth > MAX_EXPANSION_DEPTH) return ExpandError.ExpansionDepthExceeded;
+    if (depth > MAX_EXPANSION_DEPTH) return ctx.failWith(ExpandError.ExpansionDepthExceeded, form.origin, "macro expansion did not finish after {d} expansions in a row", .{MAX_EXPANSION_DEPTH});
     try checkStack();
 
     return switch (form.datum) {
@@ -407,8 +429,28 @@ inline fn checkStack() ExpandError!void {
     stack.check() catch return ExpandError.ExpansionDepthExceeded;
 }
 
-/// Dispatch a list form: check for special form / macro / call.
+/// Expand a list form; a failure no inner form explained is
+/// recorded against this one.
 fn expandList(
+    ctx: *ExpandContext,
+    env: ?*const ExpandEnv,
+    list_form: *const Form,
+    items: []const *Form,
+    depth: u32,
+) ExpandError!*Form {
+    return dispatchList(ctx, env, list_form, items, depth) catch |err| {
+        if (ctx.failure != null) return err;
+        const head = if (items.len > 0 and items[0].datum == .symbol) items[0].datum.symbol.name else "";
+        return switch (err) {
+            error.MalformedMacroCall => ctx.fail(list_form.origin, "malformed ({s} ...)", .{head}),
+            error.ExpansionDepthExceeded => ctx.failWith(err, list_form.origin, "form nested too deeply", .{}),
+            else => err,
+        };
+    };
+}
+
+/// Dispatch a list form: check for special form / macro / call.
+fn dispatchList(
     ctx: *ExpandContext,
     env: ?*const ExpandEnv,
     list_form: *const Form,
@@ -619,12 +661,9 @@ fn expandLetStar(
     items: []const *Form,
 ) ExpandError!*Form {
     // (let* [n1 v1 n2 v2 ...] body...)
-    if (items.len < 2) return ExpandError.MalformedMacroCall;
     const head = items[0]; // the `let*` symbol form
+    const bindings = try bindingVector(ctx, list_form, items);
     const binding_form = items[1];
-    if (binding_form.datum != .vector) return ExpandError.MalformedMacroCall;
-    const bindings = binding_form.datum.vector;
-    if (bindings.len % 2 != 0) return ExpandError.MalformedMacroCall;
 
     // Walk bindings with a sequential env. Each binding's RHS
     // sees prior names (and ONLY prior, per COMPILER.md §4.3
@@ -638,7 +677,7 @@ fn expandLetStar(
     while (i < bindings.len) : (i += 2) {
         const name_form = bindings[i];
         if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) {
-            return ExpandError.MalformedMacroCall;
+            return ctx.fail(name_form.origin, "{s}: cannot bind {s}", .{ head.datum.symbol.name, describeForm(name_form) });
         }
         // RHS expanded under env-so-far (BEFORE name added).
         new_bindings[i] = mutCast(name_form);
@@ -662,6 +701,42 @@ fn expandLetStar(
     out_items[1] = new_binding_vec;
     for (new_body, 0..) |b, k| out_items[2 + k] = b;
     return try makeList(ctx, out_items, list_form.origin);
+}
+
+/// The binding vector of a `(let [n v ...] ...)`-shaped form: a
+/// vector of name/value pairs.
+fn bindingVector(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError![]const *Form {
+    const head = if (items[0].datum == .symbol) items[0].datum.symbol.name else "";
+    if (items.len < 2 or items[1].datum != .vector) return ctx.fail(list_form.origin, "{s}: expected a binding vector", .{head});
+    const bindings = items[1].datum.vector;
+    if (bindings.len % 2 != 0) return ctx.fail(items[1].origin, "{s}: the binding vector needs an even number of forms", .{head});
+    return bindings;
+}
+
+/// What kind of form `form` is, with its article, for a failure
+/// message.
+fn describeForm(form: *const Form) []const u8 {
+    return switch (form.datum) {
+        .nil => "nil",
+        .bool_ => "a boolean",
+        .int, .bigint => "an integer",
+        .real => "a real",
+        .char => "a char",
+        .string => "a string",
+        .keyword => "a keyword",
+        .symbol => |sym| if (sym.ns != null) "a qualified symbol" else "a symbol",
+        .list => "a list",
+        .vector => "a vector",
+        .map => "a map",
+        .set => "a set",
+        .with_meta => "a form with metadata",
+        .anon_fn => "a #() literal",
+        .quote => "a quote",
+        .syntax_quote => "a syntax-quote",
+        .unquote => "an unquote",
+        .unquote_splicing => "an unquote-splicing",
+        .deref => "a deref",
+    };
 }
 
 // ---- fn* — optional self-name + param vector + body -----------------------
@@ -832,7 +907,7 @@ fn expandDef(
     // name may carry `^meta`, which lands on the Var.
     if (items.len < 2 or items.len > 4) return ExpandError.MalformedMacroCall;
     const head = items[0];
-    const named = try splitMetaName(items[1]);
+    const named = try splitMetaName(ctx, items[1]);
     const name_form = named.name;
     var meta_items: std.ArrayList(*Form) = .empty;
     defer meta_items.deinit(ctx.allocator);
@@ -867,19 +942,13 @@ fn expandDef(
 /// A definition's name form split into the symbol and the entries
 /// of any `^meta` it carries (`^:private f` reads as `{:private
 /// true}`); a name that is neither is malformed.
-fn splitMetaName(form: *const Form) ExpandError!struct { name: *const Form, meta: ?[]const *Form } {
-    switch (form.datum) {
-        .symbol => |sym| {
-            if (sym.ns != null) return ExpandError.MalformedMacroCall;
-            return .{ .name = form, .meta = null };
-        },
-        .with_meta => |wm| {
-            if (wm.target.datum != .symbol or wm.target.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
-            if (wm.meta.datum != .map) return ExpandError.MalformedMacroCall;
-            return .{ .name = wm.target, .meta = wm.meta.datum.map };
-        },
-        else => return ExpandError.MalformedMacroCall,
-    }
+fn splitMetaName(ctx: *ExpandContext, form: *const Form) ExpandError!struct { name: *const Form, meta: ?[]const *Form } {
+    const target, const meta: ?[]const *Form = switch (form.datum) {
+        .with_meta => |wm| .{ wm.target, if (wm.meta.datum == .map) wm.meta.datum.map else null },
+        else => .{ form, null },
+    };
+    if (target.datum != .symbol or target.datum.symbol.ns != null) return ctx.fail(form.origin, "the name defined must be an unqualified symbol, not {s}", .{describeForm(target)});
+    return .{ .name = target, .meta = meta };
 }
 
 /// `def_form` (a `def`, which yields its Var) wrapped so the Var
@@ -1405,7 +1474,7 @@ fn expandDefmacro(
     // (defmacro NAME "doc"? [PARAMS] BODY...); `^meta` on NAME and
     // the docstring land on the Var like defn's.
     if (items.len < 3) return ExpandError.MalformedMacroCall;
-    const named = try splitMetaName(items[1]);
+    const named = try splitMetaName(ctx, items[1]);
     const name_form = named.name;
     var meta_items: std.ArrayList(*Form) = .empty;
     defer meta_items.deinit(ctx.allocator);
@@ -1470,8 +1539,9 @@ fn expandDefmacro(
     // at VM teardown. The sub-VM struct itself is on the Zig
     // stack and dies normally.
     var sub_vm: vm_mod.VM = undefined;
-    const result_value = ceval.eval(ceval.user_data, def_form, &sub_vm) catch {
-        return ExpandError.MalformedMacroCall;
+    const result_value = ceval.eval(ceval.user_data, def_form, &sub_vm) catch |err| {
+        if (err == error.OutOfMemory) return ExpandError.OutOfMemory;
+        return ctx.fail(list_form.origin, "defmacro {s}: the macro function did not compile: {s}", .{ name_form.datum.symbol.name, @errorName(err) });
     };
 
     // Sanity: result should be a Var value. Mark it as macro.
@@ -1536,37 +1606,62 @@ fn callUserMacro(
     items: []const *Form,
 ) ExpandError!*Form {
     const args = items[1..];
-
-    // Convert each arg Form → Value (unevaluated, as data).
-    const arg_values = ctx.allocator.alloc(value_mod.Value, args.len) catch return ExpandError.OutOfMemory;
-    defer ctx.allocator.free(arg_values);
-    for (args, 0..) |a, i| {
-        arg_values[i] = formToValue(ctx, a) catch return ExpandError.MalformedMacroCall;
+    const name = macro_var.name;
+    const span = call_form.origin;
+    if (macro_var.root.kind() != .function) return ctx.fail(span, "macro {s} is not a function", .{name});
+    const routine = vm_mod.VM.asClosure(macro_var.root).routine;
+    if (if (routine.variadic) args.len < routine.fixed_arity else args.len != routine.fixed_arity) {
+        return ctx.fail(span, "macro {s} takes {d}{s} argument{s}, got {d}", .{
+            name,
+            routine.fixed_arity,
+            if (routine.variadic) " or more" else "",
+            if (routine.fixed_arity == 1 and !routine.variadic) "" else "s",
+            args.len,
+        });
     }
 
-    // Invoke in a fresh sub-VM that allocates on the calling VM's
-    // heap when the context knows it (`heapForArgs`), so a value
-    // the macro stores into a Var outlives the call; otherwise the
-    // sub-VM's own heap holds the macro fn's runtime state and the
-    // result is converted to a Form (in ctx.allocator) BEFORE
-    // deinit.
-    var sub_vm: vm_mod.VM = undefined;
-    var sub_vm_ready = false;
-    defer if (sub_vm_ready) sub_vm.deinit();
-    const result_value = vm_mod.VM.evalClosure(
-        ctx.allocator,
-        macro_var.root,
-        arg_values,
-        &sub_vm,
-        ctx.interner,
-        ctx.value_heap,
-    ) catch {
-        return ExpandError.MalformedMacroCall;
-    };
-    sub_vm_ready = true;
+    // Each argument as data, unevaluated.
+    const arg_values = try ctx.allocator.alloc(value_mod.Value, args.len);
+    defer ctx.allocator.free(arg_values);
+    for (args, 0..) |a, i| arg_values[i] = try formToValue(ctx, a);
 
-    // Convert result Value → Form.
-    return valueToForm(ctx, result_value, call_form.origin) catch return ExpandError.MalformedMacroCall;
+    // A fresh sub-VM on the calling VM's heap when the context has
+    // it, so a value the macro stores into a Var outlives the call;
+    // the result becomes a Form in `ctx.allocator` before the
+    // sub-VM goes. Past the checks above, only out-of-memory can
+    // fail before the sub-VM exists.
+    var sub_vm: vm_mod.VM = undefined;
+    const result_value = vm_mod.VM.evalClosure(ctx.allocator, macro_var.root, arg_values, &sub_vm, ctx.interner, ctx.value_heap) catch |err| {
+        if (err == error.OutOfMemory) return ExpandError.OutOfMemory;
+        defer sub_vm.deinit();
+        if (err == error.UncaughtThrow) if (sub_vm.unhandled_throw) |thrown| {
+            return ctx.fail(span, "macro {s} threw {s}", .{ name, try describeThrown(ctx, thrown) });
+        };
+        return ctx.fail(span, "macro {s} failed: {s}", .{ name, @errorName(err) });
+    };
+    defer sub_vm.deinit();
+    return try valueToForm(ctx, result_value, span);
+}
+
+/// A thrown value in a failure message: a string as itself, a
+/// keyword as `:name`, a map by its `:message` string or `:error`
+/// keyword, anything else by its kind.
+fn describeThrown(ctx: *ExpandContext, thrown: value_mod.Value) ExpandError![]const u8 {
+    const string_mod = @import("string.zig");
+    const dispatch = @import("dispatch.zig");
+    switch (thrown.kind()) {
+        .string => return string_mod.asBytes(thrown),
+        .keyword => return std.fmt.allocPrint(ctx.allocator, ":{s}", .{ctx.interner.keywordName(@intCast(thrown.payload))}),
+        .persistent_map => for ([_][]const u8{ "message", "error" }) |key_name| {
+            const key = ctx.interner.internKeywordValue(key_name) catch return ExpandError.OutOfMemory;
+            switch (champ_mod.mapGet(thrown, key, &dispatch.hashValue, &dispatch.equal)) {
+                .present => |v| if (v.kind() == .string or v.kind() == .keyword) return describeThrown(ctx, v),
+                .absent => {},
+            }
+        },
+        else => {},
+    }
+    return std.fmt.allocPrint(ctx.allocator, "a {s}", .{@tagName(thrown.kind())});
 }
 
 /// Convert a `Form` to its runtime Value representation. Used
@@ -1685,9 +1780,7 @@ pub fn formToValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod
         },
         // `#(...)` reaches a macro as the `fn*` form it stands for.
         .anon_fn => |items| try formToValue(ctx, try anonFnForm(ctx, form, items)),
-        // syntax_quote, unquote, unquote_splicing, with_meta →
-        // MalformedMacroCall.
-        else => return ExpandError.MalformedMacroCall,
+        .syntax_quote, .unquote, .unquote_splicing, .with_meta => ctx.fail(form.origin, "{s} is not data a macro can take", .{describeForm(form)}),
     };
 }
 
@@ -1828,10 +1921,7 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.S
             form.* = .{ .datum = .{ .string = owned }, .origin = origin };
             break :blk form;
         },
-        // Macro returned a kind we don't know how to surface
-        // as a Form (function, var, etc.). Most macros return
-        // shapes built via syntax-quote, so this is rare.
-        else => return ExpandError.MalformedMacroCall,
+        else => ctx.fail(origin, "a macro returned a {s}, which is not a form", .{@tagName(v.kind())}),
     };
 }
 
@@ -1946,11 +2036,8 @@ fn expandLetRename(
     call_form: *const Form,
     args: []const *Form,
 ) ExpandError!*Form {
-    if (args.len < 1) return ExpandError.MalformedMacroCall;
+    const src_pairs = try bindingVector(ctx, call_form, call_form.datum.list);
     const bindings_form = args[0];
-    if (bindings_form.datum != .vector) return ExpandError.MalformedMacroCall;
-    const src_pairs = bindings_form.datum.vector;
-    if (src_pairs.len % 2 != 0) return ExpandError.MalformedMacroCall;
 
     // Expand into a flat list of [pattern expr] pairs.
     var expanded: std.ArrayList(*Form) = .empty;
@@ -1990,12 +2077,12 @@ fn expandFnRename(
         name_form = @constCast(args[0]);
         params_idx = 1;
     }
-    if (params_idx >= args.len) return ExpandError.MalformedMacroCall;
+    if (params_idx >= args.len) return ctx.fail(call_form.origin, "fn: expected a parameter vector", .{});
     const params_form = args[params_idx];
     if (params_form.datum == .list) {
         return try buildMultiArityFn(ctx, call_form, if (name_form) |n| n else null, args[params_idx..]);
     }
-    if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
+    if (params_form.datum != .vector) return ctx.fail(params_form.origin, "fn: expected a parameter vector, got {s}", .{describeForm(params_form)});
     const params = params_form.datum.vector;
     const body = args[params_idx + 1 ..];
 
@@ -2085,8 +2172,8 @@ fn expandDefnMacro(
     call_form: *const Form,
     args: []const *Form,
 ) ExpandError!*Form {
-    if (args.len < 2) return ExpandError.MalformedMacroCall;
-    const named = try splitMetaName(args[0]);
+    if (args.len < 2) return ctx.fail(call_form.origin, "defn: expected a name and a parameter vector", .{});
+    const named = try splitMetaName(ctx, args[0]);
     const name_form = named.name;
     const origin = call_form.origin;
 
@@ -2106,7 +2193,7 @@ fn expandDefnMacro(
         try meta_items.appendSlice(ctx.allocator, args[rest].datum.map);
         rest += 1;
     }
-    if (rest >= args.len) return ExpandError.MalformedMacroCall;
+    if (rest >= args.len) return ctx.fail(call_form.origin, "defn: expected a parameter vector", .{});
     const fn_args = args[rest..];
 
     // Detect single-arity vs multi-arity:
@@ -2408,7 +2495,7 @@ fn destructurePair(
     try checkStack();
     switch (pattern.datum) {
         .symbol => |sym| {
-            if (sym.ns != null) return ExpandError.MalformedMacroCall;
+            if (sym.ns != null) return ctx.fail(pattern.origin, "cannot bind the qualified symbol {s}/{s}", .{ sym.ns.?, sym.name });
             try out.append(ctx.allocator, @constCast(pattern));
             try out.append(ctx.allocator, @constCast(expr));
         },
@@ -2426,7 +2513,7 @@ fn destructurePair(
             try out.append(ctx.allocator, @constCast(expr));
             try destructureMap(ctx, items, tmp, out, origin);
         },
-        else => return ExpandError.MalformedMacroCall,
+        else => return ctx.fail(pattern.origin, "cannot bind {s}", .{describeForm(pattern)}),
     }
 }
 
@@ -2501,10 +2588,10 @@ fn destructureMap(
         const v = entries[i + 1];
         if (k.datum == .keyword and k.datum.keyword.ns == null) {
             if (std.mem.eql(u8, k.datum.keyword.name, "or")) {
-                if (v.datum != .map) return ExpandError.MalformedMacroCall;
+                if (v.datum != .map) return ctx.fail(v.origin, "destructuring: :or takes a map, not {s}", .{describeForm(v)});
                 defaults = v.datum.map;
             } else if (std.mem.eql(u8, k.datum.keyword.name, "as")) {
-                if (v.datum != .symbol) return ExpandError.MalformedMacroCall;
+                if (v.datum != .symbol) return ctx.fail(v.origin, "destructuring: :as takes a symbol, not {s}", .{describeForm(v)});
                 as_name = @constCast(v);
             }
         }
@@ -2526,7 +2613,7 @@ fn destructureMap(
             else
                 null;
             if (group) |g| {
-                if (v.datum != .vector) return ExpandError.MalformedMacroCall;
+                if (v.datum != .vector) return ctx.fail(v.origin, ":{s} takes a vector of names, not {s}", .{ kw.name, describeForm(v) });
                 for (v.datum.vector) |entry| try destructureKeyEntry(ctx, g, kw.ns, entry, src, defaults, out, origin);
                 continue;
             }
@@ -2674,9 +2761,7 @@ fn expandLoopRename(
     call_form: *const Form,
     args: []const *Form,
 ) ExpandError!*Form {
-    if (args.len < 1 or args[0].datum != .vector) return ExpandError.MalformedMacroCall;
-    const pairs = args[0].datum.vector;
-    if (pairs.len % 2 != 0) return ExpandError.MalformedMacroCall;
+    const pairs = try bindingVector(ctx, call_form, call_form.datum.list);
     var has_pattern = false;
     for (pairs, 0..) |p, i| {
         if (i % 2 == 0 and p.datum != .symbol) has_pattern = true;
@@ -2908,7 +2993,7 @@ fn expandCond(
     args: []const *Form,
 ) ExpandError!*Form {
     if (args.len == 0) return try makeNil(ctx, call_form.origin);
-    if (args.len % 2 != 0) return ExpandError.MalformedMacroCall;
+    if (args.len % 2 != 0) return ctx.fail(call_form.origin, "cond: needs an even number of forms", .{});
 
     // Build right-to-left: start from nil, wrap each pair.
     var current: *Form = try makeNil(ctx, call_form.origin);
@@ -4296,6 +4381,41 @@ fn expandSourceForTest(
         .host_macros = host_macros,
     };
     return try expandForm(&ctx, null, form);
+}
+
+/// Expand `src` with the default host macros and expect `expected`,
+/// with `message` recorded against the source text `at`.
+fn expectFailure(src: []const u8, expected: ExpandError, message: []const u8, at: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const table = try defaultMacros(arena);
+    var p = try reader_mod.parser.parseForm(arena, src);
+    defer p.parser.deinit();
+    var rdr = reader_mod.Reader.init(arena, src);
+    defer rdr.deinit();
+    const form = try rdr.readOneForm(p.sexp);
+    var interner = intern_mod.Interner.init(arena);
+    defer interner.deinit();
+    var ctx = ExpandContext{ .allocator = arena, .interner = &interner, .host_macros = &table };
+    try testing.expectError(expected, expandForm(&ctx, null, form));
+    const failure = ctx.failure orelse return error.TestExpectedFailure;
+    try testing.expectEqualStrings(message, failure.message);
+    try testing.expectEqualStrings(at, src[failure.span.pos..][0..failure.span.len]);
+}
+
+test "failure: a malformed form records a message at the innermost form" {
+    const M = ExpandError.MalformedMacroCall;
+    try expectFailure("(let [a] a)", M, "let: the binding vector needs an even number of forms", "[a]");
+    try expectFailure("(let* [a 1] (loop [b] b))", M, "loop: the binding vector needs an even number of forms", "[b]");
+    try expectFailure("(let [1 2] 3)", M, "cannot bind an integer", "1");
+    try expectFailure("(let [{:keys k} {}] k)", M, ":keys takes a vector of names, not a symbol", "k");
+    try expectFailure("(defn f)", M, "defn: expected a name and a parameter vector", "(defn f)");
+    try expectFailure("(defn \"f\" [] 1)", M, "the name defined must be an unqualified symbol, not a string", "\"f\"");
+    try expectFailure("(fn x)", M, "fn: expected a parameter vector", "(fn x)");
+    try expectFailure("(do 1 (+ 2 (cond 1)))", M, "cond: needs an even number of forms", "(cond 1)");
+    // Without a specific message, the innermost failing list is named.
+    try expectFailure("(do 1 (+ 2 (when)))", M, "malformed (when ...)", "(when)");
 }
 
 test "unwrapQuote: the reader's quote datum and a written-out (quote x) both unwrap" {

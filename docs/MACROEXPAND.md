@@ -61,6 +61,8 @@ pub const ExpandContext = struct {
     compile_eval: ?CompileEvalContext = null,      // defmacro evaluation
     registry: ?*vm_mod.NamespaceRegistry = null,   // ns / qualified macros
     load_callback: ?LoadCallback = null,           // (require ...)
+    value_heap: ?*heap_mod.Heap = null,            // where macro args live
+    failure: ?Failure = null,                      // why and where it failed (§8)
 };
 
 pub const MacroFn = *const fn (
@@ -126,13 +128,14 @@ is an ordinary call. User macros shadow host macros.
    `runtime_arena`) so the closure outlives the per-form compile
    arena. Both the CLI file runner and the REPL pass one.
 6. **Form ↔ Value conversion**. Form → Value: nil, bool, int
-   (must fit the fixnum range), symbol, keyword, list, vector,
-   map (flat pairs, even count), set, `quote` (normalized to a
-   2-list). Any other datum as a macro argument (real, char,
-   string, syntax-quote, unquote, splicing, anon-fn, with-meta,
-   deref) is `MalformedMacroCall`. Value → Form: nil, booleans,
-   fixnum, float, char, symbol, keyword, list, vector, map, set,
-   string; any other kind is `MacroReturnedNull`.
+   and bigint, real, char, string, symbol, keyword, list, vector,
+   map, set, `'x` as `(quote x)`, `@x` as `(deref x)` and `#()` as
+   the `fn*` form it stands for. A syntax-quote, unquote or
+   unquote-splicing as a macro argument is `MalformedMacroCall`.
+   Value → Form: nil, booleans, integers, reals, chars, strings,
+   symbols, keywords, lists, vectors, maps and sets; a macro that
+   returns any other kind (a function, a Var) is
+   `MalformedMacroCall`.
 7. **Variadic macros** (`& body`) work; `recur` inside a variadic
    macro body is rejected exactly as at runtime.
 8. Macro arguments are **unevaluated Forms-as-Values**; a macro
@@ -545,6 +548,24 @@ not be found, read or compiled is a malformed `require`.
 `MacroDepthExceeded` is distinct because infinite expansion is a
 common enough failure mode to warrant its own test category. Every
 other expansion error buckets into `MacroExpansionFailure`.
+(`MacroReturnedNull` is never raised.)
+
+Every expansion error but out-of-memory also records
+`ExpandContext.failure`: the span of the innermost form that failed
+and a message naming the problem, for the caller to report.
+
+| Failure | Span | Message |
+|---|---|---|
+| A macro call's user macro throws | the call | `macro m threw <message>`: an `ex-info` or error map's `:message`, a string, `:keyword` |
+| … fails in the VM | the call | `macro m failed: KindMismatch` |
+| … gets the wrong number of arguments | the call | `macro m takes 1 argument, got 0` |
+| … returns a non-form | the call | `a macro returned a function, which is not a form` |
+| An argument a macro cannot take | the argument | `a syntax-quote is not data a macro can take` |
+| A binding form's vector | the vector | `let: the binding vector needs an even number of forms` |
+| A pattern that cannot bind | the pattern | `cannot bind an integer` |
+| Too many expansions in a row (§6) | the form | `macro expansion did not finish after 256 expansions in a row` |
+| Nesting past the stack guard (§6) | the innermost list | `form nested too deeply` |
+| Any other malformed list | the list | `malformed (when ...)` |
 
 This means the lowering errors `MalformedForm` / `ExpectedSymbol`
 / `ExpectedVector` are NOT raised from inside macro expansion. A
