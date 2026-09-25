@@ -3002,8 +3002,12 @@ fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *F
     const names = try RecordNames.init(ctx.allocator, rec_name);
     const type_id = try b.item(names.type_id);
 
-    var field_map = try b.map(.{});
-    for (fields, keys) |field, key| field_map = try b.list(.{ "nexis.core/assoc", field_map, key, field });
+    const entries = try ctx.allocator.alloc(*Form, 2 * fields.len);
+    for (fields, keys, 0..) |field, key, i| {
+        entries[2 * i] = key;
+        entries[2 * i + 1] = field;
+    }
+    const field_map = try b.map(.{entries});
 
     var out: std.ArrayList(*Form) = .empty;
     try out.appendSlice(ctx.allocator, &.{
@@ -3017,15 +3021,51 @@ fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *F
             try b.list(.{ "nexis.core/=", type_id, try b.list(.{ "nexis.internal/#%record-type-id", "x" }) }),
         }) }),
     });
-    try extendClauses(b, args[2..], .{ .record = args[0] }, &out);
+    try extendClauses(b, args[2..], .{ .record = .{ .name = args[0], .fields = fields } }, &out);
     return makeList(ctx, out.items, b.origin);
+}
+
+/// An inline `defrecord` method `(fn [this p...] body...)` with the
+/// record's fields in scope, as in Clojure: `(fn [g p...] (let* [f
+/// (nexis.core/get g :f) ...] (let [this g] body...)))`. A field
+/// named anywhere in the parameters is left out, so a parameter
+/// shadows it; a field assoc'd onto the record is what the method
+/// sees.
+fn recordMethod(b: Builder, fields: []const *Form, method: []const *Form) ExpandError!*Form {
+    const params = (try stripParams(b.ctx, method[1])).datum.vector;
+    if (params.len == 0) return b.ctx.fail(method[1].origin, "a record method takes the record as its first parameter", .{});
+    const g = try b.gensym("this");
+    var bindings: std.ArrayList(*Form) = .empty;
+    for (fields) |field| {
+        if (try namesSymbol(method[1], field.datum.symbol.name)) continue;
+        try bindings.appendSlice(b.ctx.allocator, &.{ field, try b.list(.{ "nexis.core/get", g, try b.kw(field.datum.symbol.name) }) });
+    }
+    const body = try b.list(.{ "let", try b.vec(.{ params[0], g }), method[2..] });
+    return b.list(.{ "fn", try b.vec(.{ g, params[1..] }), try b.list(.{ "let*", try b.vec(.{bindings.items}), body }) });
+}
+
+/// Whether the symbol `name` appears anywhere in `form`.
+fn namesSymbol(form: *const Form, name: []const u8) ExpandError!bool {
+    try checkStack();
+    switch (form.datum) {
+        .symbol => |sym| return sym.ns == null and std.mem.eql(u8, sym.name, name),
+        .list, .vector, .map, .set => |items| {
+            for (items) |item| if (try namesSymbol(item, name)) return true;
+            return false;
+        },
+        .with_meta => |wm| return namesSymbol(wm.target, name),
+        else => return false,
+    }
 }
 
 fn expandDefprotocol(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
     if (args.len < 1) return ctx.fail(call_form.origin, "defprotocol: expected a name", .{});
     const b = Builder{ .ctx = ctx, .origin = call_form.origin };
     const proto_name = try plainName(ctx, args[0], "defprotocol: the name");
-    const specs = args[1..];
+    // A docstring and `:option value` pairs may precede the methods.
+    var specs = args[1..];
+    if (specs.len > 0 and specs[0].datum == .string) specs = specs[1..];
+    while (specs.len >= 2 and specs[0].datum == .keyword) specs = specs[2..];
     const method_keys = try ctx.allocator.alloc(*Form, specs.len);
     const defs = try ctx.allocator.alloc(*Form, specs.len);
     for (specs, method_keys, defs) |spec, *key, *def| {
@@ -3049,7 +3089,7 @@ fn expandDefprotocol(ctx: *ExpandContext, call_form: *const Form, args: []const 
 const ExtendAnchor = union(enum) {
     type_: *const Form,
     protocol: *const Form,
-    record: *const Form,
+    record: struct { name: *const Form, fields: []const *Form },
 };
 
 fn expandExtendType(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
@@ -3085,11 +3125,11 @@ fn extendClauses(b: Builder, clauses: []const *Form, anchor: ExtendAnchor, out: 
         const method = clause.datum.list;
         const method_key = try b.kw(try plainName(b.ctx, method[0], "a method name"));
         if (stripMeta(method[1]).datum != .vector) return b.ctx.fail(method[1].origin, "expected the method's parameter vector, not {s}", .{describeForm(method[1])});
-        const impl = try b.list(.{ "fn", method[1..] });
+        const impl = if (anchor == .record) try recordMethod(b, anchor.record.fields, method) else try b.list(.{ "fn", method[1..] });
         const protocol, const type_form = switch (anchor) {
             .type_ => |t| .{ other, t },
             .protocol => |p| .{ p, other },
-            .record => |r| .{ other, r },
+            .record => |r| .{ other, r.name },
         };
         try out.append(b.ctx.allocator, try extendCall(b, protocol, type_form, method_key, impl));
     }

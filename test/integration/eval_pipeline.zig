@@ -2467,6 +2467,33 @@ test "defrecord: keys + vals walk the field map" {
     , "1");
 }
 
+test "defrecord: inline methods see the fields as locals; parameters shadow them" {
+    try expectOutputProgram(
+        \\(defprotocol Shape (area [s]) (scaled [s k]))
+        \\(defrecord Rect [w h] Shape (area [_] (* w h)) (scaled [this w] (* w h)))
+        \\[(area (->Rect 2 3)) (scaled (->Rect 2 3) 10)]
+    , "[6 30]");
+    // A field assoc'd onto the record is what the method sees.
+    try expectOutputProgram(
+        \\(defprotocol P (x-of [p]))
+        \\(defrecord Pt [x] P (x-of [p] x))
+        \\(x-of (assoc (->Pt 1) :x 5))
+    , "5");
+    try expectOutputProgram(
+        \\(defprotocol P (sum [p]))
+        \\(defrecord Pair [a b] P (sum [{:keys [a]}] (+ a b)))
+        \\(sum (->Pair 1 2))
+    , "3");
+}
+
+test "defprotocol: a docstring and options before the methods" {
+    try expectOutputProgram(
+        \\(defprotocol Named "Things with names." :extend-via-metadata true (nm [x] "The name."))
+        \\(extend-type :string Named (nm [s] (str "s:" s)))
+        \\(nm "a")
+    , "s:a");
+}
+
 // =============================================================================
 // Protocols substrate
 // =============================================================================

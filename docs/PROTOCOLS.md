@@ -287,7 +287,7 @@ Expansion:
        (nexis.internal/#%register-record-type "my.ns/Counter" [:n]))
   ;; Positional constructor.
   (defn ->Counter [n]
-    (nexis.internal/#%make-record Counter-type-id (assoc {} :n n)))
+    (nexis.internal/#%make-record Counter-type-id {:n n}))
   ;; Map constructor.
   (defn map->Counter [m]
     (nexis.internal/#%make-record Counter-type-id m))
@@ -296,11 +296,17 @@ Expansion:
     (and (nexis.internal/#%record? x)
          (= Counter-type-id (nexis.internal/#%record-type-id x))))
   ;; Per-protocol impls registered into the protocol's method table.
+  ;; A method sees the fields as locals (below).
   (nexis.internal/#%extend-record-impl IFoo :bar Counter-type-id
-    (fn [this x] (assoc this :n (+ x (:n this)))))
+    (fn [this x] (assoc this :n (+ x n))))
   (nexis.internal/#%extend-record-impl IFoo :baz Counter-type-id
     (fn [this x y] [:counter (+ x y)])))
 ```
+
+Inside an inline method each field is a local bound to the record's
+value for it, `(nexis.core/get this :n)`, as in Clojure, unless a
+parameter of the method has the same name, which shadows it. So a
+field assoc'd onto the record is what a method sees.
 
 Clauses after the field vector are parsed in order: a bare symbol
 switches the current protocol; a list `(method [params] body...)`
@@ -445,7 +451,7 @@ After execution:
   (def Counter-type-id
        (nexis.internal/#%register-record-type "user/Counter" [:n]))
   (defn ->Counter [n]
-    (nexis.internal/#%make-record Counter-type-id (assoc {} :n n)))
+    (nexis.internal/#%make-record Counter-type-id {:n n}))
   (defn map->Counter [m]
     (nexis.internal/#%make-record Counter-type-id m))
   (defn Counter? [x]
