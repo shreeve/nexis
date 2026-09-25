@@ -1,344 +1,195 @@
 ## BIGNUM.md — Arbitrary-Precision Integer Heap Kind
 
-Authoritative body-layout and semantic contract for the `bignum` heap kind. Derivative from `PLAN.md` §8.3,
-`docs/VALUE.md` §2.2, `docs/SEMANTICS.md` §2.2 / §3.2, and `docs/HEAP.md`.
-Those documents win on conflict. This doc pins the rules that are specific
-to bignums — most importantly the **canonicalization invariant** that
-makes the integer tower's equality and hash consistent without any
-cross-kind comparison — and the arithmetic contract (§9) that the VM's
-numeric tower (`docs/VM.md` §10.3, `src/vm.zig`) builds on.
+The contract for the `bignum` heap kind (`src/bignum.zig`): the
+canonical form that keeps the integer tower's equality and hash
+consistent without a cross-kind rule, the layout, and the arithmetic
+the VM's numeric tower builds on (PLAN §8.3; SEMANTICS §2.2). Kind
+number: `docs/VALUE.md` §2.2. Header bits: `docs/HEAP.md`. Equality
+category and hash domain: `docs/SEMANTICS.md` §3.3. Serializable:
+`docs/CODEC.md` §3.
 
-The module ships construction, canonical form, equality, hash, the
-arithmetic `add sub mul quot rem mod neg abs`, ordering, conversion
-to and from f64 and i64, and decimal parsing and printing. GCD,
-bitwise operations and modular exponentiation are absent (PLAN §8.3).
+The module provides construction, canonical form, equality, hash, the
+arithmetic `add sub mul quot rem mod neg abs`, ordering, conversion to
+and from `f64` and `i64`, and decimal parsing and printing.
+
+**Absent.** GCD, bitwise operations beyond 64 bits (the `bit-*`
+natives work on 64-bit two's complement), modular exponentiation,
+rationals, multi-precision floats and decimals (PLAN §8.3); interned
+small bignums (§1 forbids them); metadata (`with-meta` is
+`:no-metadata-on-immediate`, SEMANTICS §7). Integer literals are the
+reader's and compiler's (`docs/FORMS.md` §3); this module parses the
+decimal text they hand it.
 
 ---
 
-### 1. The canonicalization invariant (central)
+### 1. The canonical form
 
-**For integers, the runtime guarantees that two mathematically-equal
-integers are always represented by exactly one runtime kind/value
-form.** Everything else in this document is in service of that rule.
+**Two mathematically equal integers always have one runtime form.**
+Concretely:
 
-Consequences that the implementation must enforce without exception:
+1. No bignum's value fits the fixnum range, `[-2⁴⁷, 2⁴⁷ - 1]` (i48,
+   asymmetric as two's complement is; `value.fixnum_min` /
+   `fixnum_max`).
+2. No bignum has magnitude zero: every zero, whatever the sign of the
+   input, is `fixnum(0)`.
+3. No bignum has a trailing zero limb: the highest limb is nonzero.
 
-1. **No bignum whose magnitude fits in i48 may exist.** Fixnum range
-   (per `src/value.zig`) is `[-(2⁴⁷), 2⁴⁷ - 1]` inclusive — asymmetric
-   bounds as in standard two's-complement i48.
-2. **No bignum with magnitude zero may exist.** Any zero magnitude —
-   regardless of sign input — collapses to `fixnum(0)`.
-3. **No bignum with trailing zero limbs may exist.** Canonical magnitude
-   has the highest-index limb non-zero.
-
-Every code path that could construct a bignum goes through exactly
-one canonicalization function (§3). Arithmetic results, codec decode
-and direct API constructors all funnel there. If any path
-bypasses it, integer equality silently breaks.
+Every path that produces an integer from limbs (the constructors, the
+arithmetic, the codec's decode) goes through the one canonicalizer
+(§3). A path that bypassed it would silently break `=` and `hash`
+across the fixnum/bignum boundary.
 
 ---
 
 ### 2. Body layout (subkind 0)
 
-```zig
-// Private body prefix. 8 bytes, followed by a variable number of
-// u64 limbs. Total body size = 8 + limb_count * 8.
-const BignumBody = extern struct {
-    negative: u8,     // 0 = non-negative, 1 = negative. Never any other value.
-    _pad: [7]u8,      // align limbs to 8; NEVER hashed, NEVER compared
-    // limbs: [limb_count]u64 follow immediately; limb[0] is LSW
-};
-```
+The body is an 8-byte prefix, `negative: u8` (0 or 1, never anything
+else) and 7 bytes of `_pad`, followed by the magnitude as `u64` limbs,
+least significant first. The limb count is `(body.len - 8) / 8`; there
+is no count field. `_pad` is never hashed or compared.
 
-- **Little-endian limb order** — `limb[0]` is least-significant.
-- **u64 limbs** — natural on the 64-bit-only target.
-- **`negative` is a byte holding 0 or 1 only**; `isNegative(v)` reads this byte and safe-asserts the value is in `{0, 1}`.
-- **Limb count is inferred** from body length: `limb_count = (body.len - 8) / 8`. No redundant count field in the body.
-- **`_pad` is semantically invisible** — hashing and equality explicitly ignore it (hashing raw body bytes would bake layout detail into the hash output).
-
-**Canonical constraints** (every bignum on the heap satisfies all of these):
-
-- `body.len >= 8`
-- `(body.len - 8) % 8 == 0`
-- `body.len >= 16` (at least one limb, because zero magnitudes don't exist)
-- `limbs[limb_count - 1] != 0` (no trailing zero limbs)
-- Magnitude computed from the limbs is **strictly outside** the fixnum range.
-
-Structural validity of a heap-loaded bignum is safe-asserted at traversal entry; canonicality is asserted at construction time, not re-checked on every read.
+Every bignum on the heap satisfies: `body.len ≥ 16` and `(body.len - 8)
+% 8 == 0` (at least one limb), a nonzero top limb, and a value outside
+the fixnum range. The canonicalizer asserts the shape at construction
+in safe builds, and `headerLimbs` re-asserts it on every read.
 
 ---
 
-### 3. Canonicalization — the only construction path
+### 3. Canonicalization
 
-```zig
-/// Private. Takes possibly-non-canonical input; returns either a
-/// fixnum Value or a bignum Value. This is the ONLY place that
-/// decides which kind to produce.
-fn canonicalizeToValue(
-    heap: *Heap,
-    negative: bool,
-    limbs: []const u64, // may have trailing zeros; may be empty
-) !Value;
-```
+`canonicalizeToValue(heap, negative, limbs)` (private) takes a sign and
+a possibly non-canonical little-endian magnitude and is the only place
+that decides the kind of the result. Its steps, each short-circuiting:
 
-Steps, in order (each step short-circuits):
+1. Trim trailing zero limbs.
+2. An empty magnitude is `fixnum(0)`, whatever `negative` says (no
+   signed zero in the integer tower, SEMANTICS §2.2).
+3. A one-limb magnitude in range is a fixnum: `limb ≤ 2⁴⁷ - 1` when
+   non-negative, `limb ≤ 2⁴⁷` when negative (the magnitude 2⁴⁷ is
+   `fixnum(-2⁴⁷)` and no positive fixnum).
+4. Otherwise one allocation of `8 + n·8` bytes, sign and trimmed limbs
+   copied in.
 
-1. **Trim trailing zero limbs.** Scan `limbs` high-to-low; drop zeros.
-2. **Zero magnitude → `fixnum(0)`**. If all limbs were zero (including empty input slice), return `Value.fromFixnum(0).?` regardless of the input `negative` flag. This is the enforcement point for "no signed zero in the integer tower" (SEMANTICS §2.2).
-3. **Fixnum-range magnitude → fixnum.** If trimmed length is 1 and the single limb fits in i48 with the given sign, return a fixnum. Sign-aware range check:
-   - `negative == false`: representable iff `limb[0] <= fixnum_max` = `2⁴⁷ - 1`.
-   - `negative == true`:  representable iff `limb[0] <= |fixnum_min|` = `2⁴⁷`.
-   Note the asymmetry: the magnitude `2⁴⁷` (exactly) is representable as `fixnum(-2⁴⁷)` but not as any positive fixnum.
-4. **Otherwise — allocate a bignum**. One allocation of exactly `8 + trimmed_limb_count * 8` bytes. Copy the trimmed limbs into the body. Set `negative` byte. Return the heap-backed Value.
-
-The first three steps are pure (no allocation). Step 4 is the only path that touches the heap. This makes OOM handling clean: the first three branches are infallible; only step 4 returns an error.
-
-**Debug assertion after step 4**: the freshly-constructed bignum satisfies every constraint in §2. If this fails, the canonicalizer itself has a bug.
+Steps 1 to 3 never allocate; only step 4 can fail, with
+`error.OutOfMemory` or `error.Overflow` (the size computation and
+`heap.alloc`). There is no bignum-specific error.
 
 ---
 
-### 4. Public API
+### 4. Public API (`src/bignum.zig`)
 
-Lives in `src/bignum.zig`.
+Every integer operand may be a fixnum or a bignum; every integer result
+is canonical (§1).
 
-```zig
-/// Integer-tower-aware constructor. Returns either a fixnum or a
-/// bignum Value depending on magnitude; callers never see the
-/// distinction at this layer. Handles i64.min (|i64.min| = 2⁶³,
-/// which fits in a single u64 limb) via two's-complement negation.
-pub fn fromI64(heap: *Heap, n: i64) !value.Value;
+| Function | Contract |
+|---|---|
+| `fromI64(heap, n)`, `fromI128(heap, n)` | the canonical integer; `i64.min` per §7 |
+| `fromLimbs(heap, negative, limbs)` | sign and magnitude, trailing zeros allowed, empty is `fixnum(0)` |
+| `isNegative(v)`, `limbs(v)`, `limbCount(v)` | bignum only (asserted); `limbs` borrows the heap body |
+| `isInteger(v)` | fixnum or bignum |
+| `view(v, scratch)` | the integer as a `std.math.big.int.Const` in place; `scratch` backs a fixnum's one limb |
+| `add`, `sub`, `mul` | exact |
+| `quot`, `rem`, `mod` | §9 |
+| `quotExact(heap, a, b)` | the quotient when the division is exact, null otherwise |
+| `neg`, `abs` | exact |
+| `compare(a, b)`, `isEven(v)` | `std.math.Order`; parity |
+| `toF64(v)` | the nearest double, ties to even; an infinity beyond `f64`'s range |
+| `fromF64(heap, f)` | the integer part (toward zero) of a finite double; null for NaN and the infinities |
+| `toI64(v)` | the value when it fits `i64`, null otherwise |
+| `formatDecimal(v, writer)`, `parseDecimal(heap, text)` | §9 |
+| `hashHeader(h) u32`, `limbsEqual(a, b)` | §5, §6 |
+| `trace(h, visitor)` | a no-op: the body holds no Values (GC.md §5) |
 
-/// Construct from a sign + little-endian u64-limb magnitude. Input
-/// may have trailing zero limbs, may be empty. Canonicalizes
-/// (§3) before returning. An empty `limbs` slice returns `fixnum(0)`
-/// regardless of `negative`.
-pub fn fromLimbs(
-    heap: *Heap,
-    negative: bool,
-    limbs: []const u64,
-) !value.Value;
-
-/// Bignum-only accessors. All safe-assert `v.kind() == .bignum`.
-pub fn isNegative(v: value.Value) bool;
-pub fn limbs(v: value.Value) []const u64;
-pub fn limbCount(v: value.Value) usize;
-
-/// Per-kind hash entry point. Called by `dispatch.heapHashBase` via
-/// the kind switch. Cached in `HeapHeader.hash` with the cache-if-
-/// nonzero pattern (VALUE.md §4).
-pub fn hashHeader(h: *HeapHeader) u32;
-
-/// Per-kind equality entry point. Called by `dispatch.equal` after
-/// the cross-kind rule and bit-identity fast path have been ruled
-/// out.
-pub fn limbsEqual(a: *HeapHeader, b: *HeapHeader) bool;
-
-/// GC trace entry point (GC.md §4). A bignum body holds limbs and
-/// no Values, so the visitor is never called.
-pub fn trace(h: *HeapHeader, visitor: anytype) void;
-```
-
-**Error set.** Whatever `heap.alloc` returns (`error.OutOfMemory`,
-`error.Overflow` from `std.math.add` when computing total size). No
-bignum-specific error conditions.
+`Limb` (`std.math.big.Limb`, `u64` on the 64-bit target) and
+`subkind_limbs` (0) are public.
 
 ---
 
+### 5. Hash
 
-**Arithmetic, ordering and conversion** (§9). Every integer operand
-may be a fixnum or a bignum; every result is canonical.
-
-```zig
-pub const Limb = std.math.big.Limb;        // u64 on the 64-bit target
-pub fn view(v: Value, scratch: *[1]Limb) std.math.big.int.Const;
-pub fn isInteger(v: Value) bool;
-pub fn fromI128(heap: *Heap, n: i128) !Value;
-pub fn add(heap: *Heap, a: Value, b: Value) !Value;
-pub fn sub(heap: *Heap, a: Value, b: Value) !Value;
-pub fn mul(heap: *Heap, a: Value, b: Value) !Value;
-pub fn quot(heap: *Heap, a: Value, b: Value) !Value;   // truncated quotient
-pub fn quotExact(heap: *Heap, a: Value, b: Value) !?Value; // quotient iff exact
-pub fn rem(heap: *Heap, a: Value, b: Value) !Value;    // dividend's sign
-pub fn mod(heap: *Heap, a: Value, b: Value) !Value;    // divisor's sign
-pub fn neg(heap: *Heap, a: Value) !Value;
-pub fn abs(heap: *Heap, a: Value) !Value;
-pub fn compare(a: Value, b: Value) std.math.Order;
-pub fn isEven(v: Value) bool;
-pub fn toF64(v: Value) f64;
-pub fn fromF64(heap: *Heap, f: f64) !?Value;           // null for NaN / ±Inf
-pub fn toI64(v: Value) ?i64;
-pub fn formatDecimal(v: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void;
-pub fn parseDecimal(heap: *Heap, text: []const u8) !?Value;
-```
-
-### 5. Hash — semantic bytes only
-
-SEMANTICS.md §3.2: xxHash3 over the sign byte and the canonical
-magnitude, truncated to 32 bits and cached. Concretely:
-
-```
-hash_input := [negative_byte] ++ limbs_as_little_endian_bytes
-```
-
-Where `limbs_as_little_endian_bytes` is `std.mem.sliceAsBytes(limbs)` on
-our LE-only target. The `_pad` bytes from the body are **not** fed into
-the hash: hashing raw body memory would
-leak the 7 pad bytes into the hash output and couple hash stability to
-layout detail.
-
-Implementation:
-
-```zig
-var hasher = XxHash3.init(seed);
-hasher.update(&[_]u8{ if (isNegative(h)) 1 else 0 });
-hasher.update(std.mem.sliceAsBytes(bignumLimbs(h)));
-const raw: u32 = @truncate(hasher.final());
-if (raw != 0) h.setCachedHash(raw); // cache-if-nonzero (VALUE.md §4)
-return raw;
-```
+`hashHeader` is xxHash3 (the runtime seed) over the sign byte followed
+by the limb bytes, never the padding; truncated to `u32` and cached in
+the header when nonzero (the HEAP.md cache rule).
+`dispatch.hashValue` mixes the kind's domain in on top (SEMANTICS
+§3.3).
 
 ---
 
-### 6. Equality — semantic bytes only
+### 6. Equality
 
-Two canonical bignums are equal iff:
-
-1. Their `negative` bytes match.
-2. Their limb counts match.
-3. Their limb byte streams match.
-
-`limbsEqual(a, b)` returns the conjunction. Because canonical form has no
-trailing zero limbs, step 2 implies equal magnitude ranges; `std.mem.eql`
-on the limb byte slice covers the actual value comparison.
-
-**Padding bytes are not compared.** Same rationale as hashing — they're
-layout detail, not semantics.
-
-### 6.1 What does NOT need to be true
-
-- Two Values with `kind == .bignum` may have distinct `*HeapHeader`s but
-  be structurally equal. `identical?` is pointer-based; `=` is
-  structural.
-- Bignums are not content-deduplicated. Constructing the same large
-  value twice produces two distinct heap allocations that compare `=`.
+`limbsEqual` is true for the same header, or the same sign, the same
+limb count and equal limbs; the padding is not compared. Canonical form
+makes that exactly equality of value. Bignums are not deduplicated:
+the same value built twice is two allocations, `=` but not
+`identical?`.
 
 ---
 
-### 7. `i64.min` magnitude conversion
+### 7. `i64.min`
 
-Classic footgun: `-i64.min` overflows because `|i64.min| = 2⁶³ > i64.max`.
-
-In `fromI64`:
-- If `n >= 0`: `magnitude = @intCast(u64, n)`.
-- If `n < 0`: `magnitude = (~@as(u64, @bitCast(n))) +% 1` — two's-complement
-  negation in u64 space. For `n == i64.min`, this yields `2⁶³` correctly
-  (fits in one u64 limb without overflow).
-
-After magnitude is computed, the result flows through `canonicalizeToValue`
-which handles the fixnum-range check (`-2⁴⁷` is representable as
-`fixnum(-2⁴⁷)`; `-2⁶³` is not, so it allocates a bignum).
-
----
-
-### 8. Dispatch integration
-
-`src/dispatch.zig` routes `.bignum` to `bignum.hashHeader` in
-`heapHashBase` and to `bignum.limbsEqual` in `equal`.
-
-Bignum is kind-local (SEMANTICS §2.6): its hash domain byte is its kind
-byte, like string.
+`-i64.min` overflows `i64`, since `|i64.min| = 2⁶³`. `fromI64` negates
+in `u64` space instead (`~@as(u64, @bitCast(n)) +% 1`), which gives 2⁶³
+in one limb, and hands the sign and magnitude to the canonicalizer:
+`-2⁴⁷` becomes a fixnum, `-2⁶³` a one-limb bignum.
+`(- -9223372036854775808)` is `9223372036854775808`.
 
 ---
 
 ### 9. Arithmetic
 
-The limb arithmetic is `std.math.big.int`. A heap bignum's body —
-sign byte, padding, little-endian `u64` limbs — is read in place as a
-`big.int.Const` (`view`); a fixnum is viewed through a one-limb
-scratch cell. Results are computed into a scratch buffer (on the
-stack up to 64 limbs, from the heap's backing allocator beyond) and
-copied onto the heap once through `canonicalizeToValue`, so every
-result obeys §1 by construction: `(- (+ a b) b)` is a fixnum again
-whenever `a` was, and a zero result is `fixnum(0)` whatever the signs
-of the operands.
+The limb arithmetic is `std.math.big.int`. A heap bignum's body, sign
+byte and little-endian `u64` limbs, is read in place as a
+`big.int.Const` (`view`); a fixnum is viewed through a one-limb scratch
+cell. A result is computed into a scratch buffer (on the stack up to 64
+limbs, from the heap's backing allocator beyond) and copied onto the
+heap once through the canonicalizer, so `(- (+ a b) b)` is a fixnum
+again whenever `a` was, and a zero result is `fixnum(0)` whatever the
+operands' signs.
 
-Semantics, matching Clojure's `Numbers` for BigInt:
+The semantics match Clojure's `Numbers` for BigInt:
 
-- `add`, `sub`, `mul`: exact.
-- `quot`: truncated quotient; `rem`: remainder of truncated division,
-  the dividend's sign; `mod`: remainder of floored division, the
-  divisor's sign. A zero divisor is the caller's error to raise
+- `quot` truncates; `rem` is the remainder of truncated division, with
+  the dividend's sign; `mod` is the remainder of floored division, with
+  the divisor's sign. A zero divisor is the caller's to raise
   (`:divide-by-zero`); the functions assert it away.
-- `neg`, `abs`: `(neg fixnum_min)` and `(abs fixnum_min)` are the
-  fixnum inputs whose results promote (2⁴⁷).
-- `compare`: exact ordering of any two integers.
-- `toF64`: the nearest double, ties to even; an infinity beyond
-  f64's range. `fromF64`: the integer part of a finite double
-  (toward zero), `null` for NaN and the infinities.
-- `toI64`: the value when it fits, `null` otherwise.
-- `formatDecimal` / `parseDecimal`: decimal text with a leading `-`
-  for a negative value and no suffix; the parser accepts exactly
-  `-?[0-9]+` and returns `null` for anything else. Printing is
-  implicit everywhere (`str`, `pr-str`, REPL results, error reports),
-  so `formatDecimal` divides and conquers past 32 limbs: it splits the
-  value at 10^(9·2^i), the power whose square first exceeds it, and
-  writes the quotient and the zero-padded remainder the same way. Each
-  level costs about half the one above, so the whole conversion is
-  about one Knuth division of the value by its square root, not one
-  pass over the value per nine digits: a million digits print in about
-  a second (ReleaseFast) where `std`'s conversion takes minutes.
+- `neg` and `abs` of `fixnum_min` promote: 2⁴⁷ is a bignum.
+- `parseDecimal` accepts exactly `-?[0-9]+` and returns null for
+  anything else. `formatDecimal` writes decimal digits with a leading
+  `-` for a negative value and no suffix. Past 32 limbs it divides and
+  conquers: it splits the value at 10^(9·2^i), the power whose square
+  first exceeds it, and writes the quotient and the zero-padded
+  remainder the same way, so the whole conversion costs about one
+  division of the value by its square root instead of one pass per
+  nine digits; a million digits print in about a second
+  (ReleaseFast).
 
-The VM's tower (`src/vm.zig` `numAdd` … `numCompare`) keeps the
-fixnum × fixnum fast path in `i64` and reaches this module only when
-a result leaves the fixnum range or an operand is already a bignum;
-any float operand takes the f64 path instead (SEMANTICS §2.2
-contagion), with `toF64` widening a bignum operand.
-
-### 10. Property test coverage
-
-Alongside the module:
-
-- `test/prop/bignum.zig` with 16 properties:
-  - N1. `fromI64(n)` for random i64 is a fixnum in the fixnum range
-    (no allocation) and a bignum outside it whose reconstructed
-    magnitude equals `|n|`.
-  - N2. `fromI64(i64.min)` produces a bignum with magnitude 2⁶³: its
-    limb representation is `{ negative = true, limbs = [2⁶³] }`.
-  - N3. `fromLimbs` with a fixnum-range magnitude canonicalizes to a
-    fixnum without allocating.
-  - N4. `fromLimbs` with zero magnitude, any sign and any length, is
-    `fixnum(0)`.
-  - N5. No bignum escaping `fromLimbs` has trailing zero limbs.
-  - N6. Equality is reflexive, symmetric and pairwise transitive over
-    random bignums.
-  - N7. `equal ⇒ hash equal` (bedrock): equal bignums across
-    allocations share `hashValue`.
-  - N8. Cross-kind: a bignum is never `=` to any non-bignum Value;
-    hashes differ.
-  - N9. `fromLimbs` and the accessors round-trip limbs and sign
-    byte-exact.
-  - N10. `hashValue(bignum)` matches xxHash3 over `{sign, limbs}`
-    under `mixKindDomain`.
-  - A1. `add`, `sub` and `compare` agree with `i128` over random
-    pairs; results are canonical.
-  - A2. `mul` agrees with `i128` over random i64 pairs.
-  - A3. `quot`, `rem` and `mod` agree with `@divTrunc`, `@rem` and
-    `@mod` on every sign combination.
-  - A4. The fixnum boundary is crossed both ways and the kind follows
-    the value alone.
-  - A5. Algebraic identities hold on multi-limb values.
-  - A6. Decimal text and doubles round-trip.
+The VM's tower (`src/vm.zig` `numAdd` through `numCompare`) keeps the
+fixnum-by-fixnum fast path in `i64` and calls this module only when a
+result leaves the fixnum range or an operand is already a bignum: `(+
+140737488355327 1)` is the bignum `140737488355328`. A float operand
+takes the `f64` path instead, `toF64` widening a bignum operand
+(SEMANTICS §2.2 contagion). `/` of two integers is `quotExact`'s
+integer when the division is exact and a float otherwise. `long` of a
+float goes through `fromF64` (`:invalid-argument` for NaN and the
+infinities). The arithmetic operators promote and never raise
+`:arithmetic-overflow`; a native that needs an `i64` argument (the
+`bit-*` operations among them) raises it for a bignum beyond `i64`.
 
 ---
 
-### 11. What BIGNUM.md does not cover
+### 10. Tests
 
-- **Multi-precision floats, rationals, decimals.** Absent, per
-  PLAN §8.3.
-- **Interned small bignums.** Not applicable — canonicalization
-  prevents small-magnitude bignums from existing at all.
-- **Metadata.** Bignums are not metadata-attachable per PLAN §8.5 /
-  SEMANTICS §7.
-- **Literals.** The reader and compiler own the literal path
-  (`docs/FORMS.md` §3, `docs/SEMANTICS.md` §6); this module only
-  parses the decimal text they hand it.
+`test/prop/bignum.zig`: N1 `fromI64` gives a fixnum in range (no
+allocation) and a bignum outside it; N2 `fromI64(i64.min)`; N3 and N4
+`fromLimbs` canonicalizes a fixnum-range magnitude and any zero; N5 no
+trailing zero limbs; N6 equality laws; N7 equal bignums share
+`hashValue`; N8 never `=` to a non-bignum; N9 limbs and sign round-trip
+byte-exact; N10 the hash is xxHash3 over sign and limbs under the kind
+domain; A1 and A2 `add`, `sub`, `compare` and `mul` agree with `i128`;
+A3 `quot`, `rem` and `mod` agree with `@divTrunc`, `@rem` and `@mod`
+on every sign combination; A4 the fixnum boundary crossed both ways;
+A5 algebraic identities on multi-limb values; A6 decimal text and
+doubles round-trip. `src/bignum.zig` carries unit tests for the
+canonicalizer, the accessors, conversion and printing;
+`test/integration/numbers.zig` runs the tower end to end through
+every operator and predicate.
