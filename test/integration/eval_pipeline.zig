@@ -1335,6 +1335,27 @@ test "integration: a transient hashes by identity, so it can be a set member or 
     , "[true 2 1 false false]");
 }
 
+test "integration: identity kinds are = only to themselves, and two of them hash apart (SEMANTICS §3.3)" {
+    try expectOutputProgram(
+        \\(defprotocol P (area [s]))
+        \\(def old-p P)
+        \\(def old-area area)
+        \\(defprotocol P (area [s]))
+        \\(def x 1)
+        \\(def y 1)
+        \\(defn same [a b] [(= a a) (= (hash a) (hash a)) (= a b) (= (hash a) (hash b))])
+        \\[(same (atom 1) (atom 1)) (same (fn [] 1) (fn [] 1)) (same + -) (same (var x) (var y)) (same old-p P) (same old-area area)]
+    , "[[true true false false] [true true false false] [true true false false] [true true false false] [true true false false] [true true false false]]");
+    try expectOutputProgramWithStore("identity-conns",
+        \\(def c (db/open "@STORE@"))
+        \\(def n (nextomic/connect "@STORE@.nextomic"))
+        \\(def seen [(= c c) (= (hash c) (hash c)) (= n n) (= (hash n) (hash n)) (= c n) (contains? #{c} c) (contains? #{n} n)])
+        \\(db/close c)
+        \\(nextomic/release n)
+        \\seen
+    , "[true true true true false true true]");
+}
+
 test "integration: in-ns switches the namespace the next forms compile in" {
     try expectOutputProgram("(in-ns 'other) (def x 1) (in-ns 'user) [other/x (try (in-ns \"s\") (catch any e e))]", "[1 :kind-mismatch]");
 }
