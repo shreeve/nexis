@@ -1,0 +1,2 @@
+; An escape outside the language is an error naming that escape.
+(println "tab\tthen \q here")

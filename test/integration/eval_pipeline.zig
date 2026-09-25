@@ -147,6 +147,8 @@ test "integration: let*" {
 
 test "integration: let (rename macro)" {
     try expectOutput("(let [x 10 y 20] (+ x y))", "30");
+    // A name may be any UTF-8 text, as in Clojure.
+    try expectOutput("(let [λ 2 café :crème] [(* λ λ) café 'π/τ])", "[4 :crème π/τ]");
 }
 
 test "integration: loop*/recur" {
@@ -190,6 +192,28 @@ test "integration: variadic & rest" {
     try expectOutput("((fn* [x & xs] x) 1 2 3)", "1");
 }
 
+test "integration: a variadic fn called with no extra arguments binds its rest parameter to nil" {
+    // As in Clojure, on every entry path: call:call, apply, a native
+    // calling back.
+    try expectOutput("(defn f [& args] (if args :some :none)) [(f) (apply f []) (first (map f [1])) (f 1)]", "[:none :none :some :some]");
+    try expectOutput("[((fn [& r] r)) ((fn [x & r] r) 1) ((fn [x & r] r) 1 2)]", "[nil nil (2)]");
+    try expectOutput("(defn my-max [x & more] (if more (recur (max x (first more)) (next more)) x)) [(my-max 5) (my-max 1 9 3)]", "[5 9]");
+}
+
+test "integration: a protocol fn is a first-class function" {
+    // map, apply, comp and update reach it through callValue.
+    try expectOutput(
+        \\(defprotocol Shape (area [s]))
+        \\(defrecord Rect [w h] Shape (area [this] (* (:w this) (:h this))))
+        \\(def r (->Rect 2 3))
+        \\[(map area [r]) (apply area [r]) ((comp inc area) r) (update {:s r} :s area) (reduce + (map area [r r]))]
+    , "[(6) 6 7 {:s 6} 12]");
+    try expectOutput(
+        \\(defprotocol Shape (area [s]))
+        \\(try (mapv area [1]) (catch any e e))
+    , ":no-protocol-impl");
+}
+
 test "integration: recur into a variadic fn passes the rest param one seq" {
     // COMPILER.md §5.6: the rest slot is the last binding of the
     // target; `(next r)` lands in `r` as it is.
@@ -222,6 +246,8 @@ test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
     try expectOutputProgram("(defn ^:private p [x] x) [(p 2) (:private (meta (var p)))]", "[2 true]");
     try expectOutputProgram("(defn ^{:doc \"d\"} q [x] x) (:doc (meta (var q)))", "d");
     try expectOutputProgram("(defn m \"two\" ([x] x) ([x y] y)) [(m 1 2) (:arglists (meta (var m)))]", "[2 ([x] [x y])]");
+    // A docstring may span lines, as in Clojure.
+    try expectOutputProgram("(defn ml\n  \"Line one.\n  Line two.\"\n  [] 1)\n[(ml) (:doc (meta (var ml)))]", "[1 Line one.\n  Line two.]");
     // Without metadata a defn's Var carries none.
     try expectOutputProgram("(defn plain [x] x) (meta (var plain))", "nil");
     // def and defmacro take the same spellings.
@@ -496,6 +522,48 @@ test "integration: throw inside finally overrides" {
     );
 }
 
+test "integration: a throw out of a running finally body leaves no pending continuation" {
+    // The inner finally's continuation is abandoned by its own
+    // throw; the handler that catches it discards it (VM.md §12).
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try harness.expectResult(&program, "", try program.run(
+        \\(defn once [] (try (try 1 (finally (throw :x))) (catch any e e)))
+        \\(defn twice [] (try (try (try 1 (finally (throw :x))) (finally (throw :y))) (catch any e e)))
+        \\(defn across [] (try (mapv (fn [_] (try 1 (finally (throw :z)))) [1]) (catch any e e)))
+        \\(dotimes [_ 100] (once) (twice) (across))
+        \\[(once) (twice) (across)]
+    ), "[:x :y :z]");
+    try testing.expectEqual(@as(usize, 0), program.v.finally_stack.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.handlers.items.len);
+}
+
+test "integration: every exit path leaves the VM's stacks as it found them" {
+    // Normal return, a caught throw, a throw across callValue, a VM
+    // error translated inside a native's callback, a binding unwound
+    // by a throw, a finally that runs on the way out: afterwards no
+    // handler, continuation, binding frame or root is left.
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try harness.expectResult(&program, "", try program.run(
+        \\(def ^:dynamic *d* 0)
+        \\(def log (atom []))
+        \\(defn thrower [x] (binding [*d* x] (throw [:t *d*])))
+        \\[(try (mapv thrower [1 2]) (catch any e e))
+        \\ (try (reduce (fn [a x] (+ a (/ 1 x))) 0 [1 0]) (catch any e e))
+        \\ (try (binding [*d* 5] (try (mapv (fn [x] (throw x)) [:in]) (finally (swap! log conj *d*)))) (catch any e e))
+        \\ (binding [*d* 7] (mapv (fn [x] (try (inc x) (finally (swap! log conj *d*)))) [1 2]))
+        \\ *d* @log]
+    ), "[[:t 1] :divide-by-zero :in [2 3] 0 [5 7 7]]");
+    try testing.expectEqual(@as(usize, 0), program.v.handlers.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.finally_stack.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.dyn_frames.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.dyn_saves.items.len);
+    try testing.expectEqual(@as(usize, 0), program.v.roots.items.len);
+}
+
 test "integration: nested try — outer catches what inner rethrows" {
     try expectOutput(
         "(try (try (throw 100) (catch any e (throw e))) (catch any e e))",
@@ -720,6 +788,65 @@ test "integration: native fn — arity mismatch is catchable" {
     try expectOutput("(try (cons 1) (catch any e e))", ":arity-mismatch");
 }
 
+test "integration: recursion through a native re-entry ends in a catchable :stack-overflow" {
+    // Every level nests `apply` / `mapv` / a protocol impl and a run
+    // loop on the native stack; the guard stops it before the stack
+    // does (VM.md §13.1).
+    try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (g 300)", "300");
+    try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (try (g 100000000) (catch any e e))", ":stack-overflow");
+    try expectOutput("(defn h [n] (if (= n 0) 0 (+ 1 (first (mapv h [(- n 1)]))))) (try (h 100000000) (catch any e e))", ":stack-overflow");
+    // The VM is whole afterwards: the next call runs normally.
+    try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (try (g 100000000) (catch any e e)) (g 10)", "10");
+}
+
+test "integration: runaway recursion is a catchable :stack-overflow; deep legitimate recursion runs" {
+    try expectOutput("(defn d [n] (if (= n 0) 0 (inc (d (dec n))))) (d 100000)", "100000");
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.max_frames = 20_000;
+    try harness.expectResult(&program, "", try program.run("(defn f [n] (inc (f n))) (try (f 1) (catch any e [:caught e]))"), "[:caught :stack-overflow]");
+    try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+    try testing.expectError(vm.VmError.StackOverflow, program.run("(f 1)"));
+    // The trace keeps the innermost 32 frames and the outermost 8
+    // around one marker for the rest.
+    const trace = program.v.error_trace.items;
+    try testing.expectEqual(@as(usize, 41), trace.len);
+    try testing.expectEqualStrings("f", trace[0].name);
+    try testing.expectEqualStrings("<19960 frames elided>", trace[32].name);
+    try testing.expectEqualStrings("test-form", trace[40].name);
+}
+
+test "integration: an uncaught runtime error names what went wrong in VM.error_detail" {
+    const Case = struct { src: []const u8, err: anyerror, detail: []const u8 };
+    const cases = [_]Case{
+        .{ .src = "(defn f [x] x) (f)", .err = vm.VmError.ArityMismatch, .detail = "f takes 1 argument, got 0" },
+        .{ .src = "(defn g [a b & r] a) (g 1)", .err = vm.VmError.ArityMismatch, .detail = "g takes at least 2 arguments, got 1" },
+        .{ .src = "(first 1 2)", .err = vm.VmError.ArityMismatch, .detail = "first takes 1 argument, got 2" },
+        .{ .src = "(mapv (fn [a b] a) [1])", .err = vm.VmError.ArityMismatch, .detail = "fn takes 2 arguments, got 1" },
+        .{ .src = "(5 1)", .err = vm.VmError.NotCallable, .detail = "an integer is not callable" },
+        .{ .src = "(map \"s\" [1])", .err = vm.VmError.NotCallable, .detail = "a string is not callable" },
+        .{ .src = "(+ 1 \"a\")", .err = vm.VmError.KindMismatch, .detail = "+ expects numbers, got a string" },
+        .{ .src = "(< nil 1)", .err = vm.VmError.KindMismatch, .detail = "< expects numbers, got nil" },
+        .{ .src = "(defprotocol P (m [x])) (m 1)", .err = vm.VmError.NoProtocolImpl, .detail = "no impl of m for an integer" },
+    };
+    for (cases) |case| {
+        var program: Program = undefined;
+        try program.init();
+        defer program.deinit();
+        // A caught error's detail does not linger into the next one.
+        _ = try program.run("(try (first) (catch any e e))");
+        try testing.expectError(case.err, program.run(case.src));
+        try testing.expectEqualStrings(case.detail, program.v.error_detail);
+    }
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(try (first) (catch any e e))");
+    try testing.expectError(vm.VmError.UncaughtThrow, program.run("(throw :x)"));
+    try testing.expectEqualStrings("", program.v.error_detail);
+}
+
 // =============================================================================
 // Multi-arity defn
 // =============================================================================
@@ -833,13 +960,14 @@ test "integration: sequential destructuring (let)" {
 test "integration: sequential destructuring with rest" {
     // MACROEXPAND.md §10 `let`: a vector pattern's rest is `next`,
     // nil once the source is exhausted; a fn rest parameter is the
-    // list the VM packs, `()` when empty (VM.md §6).
+    // list the VM packs, nil when empty (VM.md §6), as in Clojure; a
+    // multi-arity fn's variadic arity binds `(rest args)`.
     try expectOutput("(let [[a & rest] [1 2 3 4]] rest)", "(2 3 4)");
     try expectOutput("(let [[a b & rest] [1 2 3 4 5]] rest)", "(3 4 5)");
     try expectOutput("(let [[a & r] [1 2 3]] r)", "(2 3)");
     try expectOutput("(nil? (let [[a & r] [1]] r))", "true");
     try expectOutput("(nil? (let [[a b & r] [1]] r))", "true");
-    try expectOutput("((fn [& r] r))", "()");
+    try expectOutput("((fn [& r] r))", "nil");
     try expectOutput("((fn ([x & r] r)) 1)", "()");
 }
 
@@ -2556,6 +2684,21 @@ test "protocol dispatch with NO impl raises :no-protocol-impl" {
     , ":no-protocol-impl");
 }
 
+test "protocol dispatch: the integer tower is one target, fixnum or bignum" {
+    // SEMANTICS §2.2: an integer's representation is invisible, so an
+    // impl for either integer kind covers both (PROTOCOLS.md §4.3).
+    try expectOutput(
+        \\(defprotocol Twice (twice [x]))
+        \\(extend-protocol Twice :fixnum (twice [x] (* 2 x)))
+        \\[(twice 140737488355327) (twice (inc 140737488355327)) (satisfies? Twice (* 1000000000 1000000000)) (satisfies? Twice 1.5)]
+    , "[281474976710654 281474976710656 true false]");
+    try expectOutput(
+        \\(defprotocol Kind (kind-of [x]))
+        \\(extend-protocol Kind :bignum (kind-of [x] :integer) :float (kind-of [x] :float))
+        \\[(kind-of 1) (kind-of (* 1000000000 1000000000)) (kind-of 1.0)]
+    , "[:integer :integer :float]");
+}
+
 test "protocol dispatch with zero args raises :arity-mismatch" {
     // `(bar)` has no receiver to dispatch on; dispatchProtocolMethod
     // raises ArityMismatch which surfaces as the catchable
@@ -3257,6 +3400,15 @@ test "keyword-as-function: keywords passed to higher-order functions" {
     try expectOutput("((partial :a) {:a 5})", "5");
 }
 
+test "symbol-as-function: a symbol looks itself up as a keyword does" {
+    try expectOutput("('a {'a 1 'b 2})", "1");
+    try expectOutput("('c {'a 1} :none)", ":none");
+    try expectOutput("('a #{'a})", "a");
+    try expectOutput("('a 5)", "nil");
+    try expectOutput("(map 'x [{'x 1} {'x 2} {}])", "(1 2 nil)");
+    try expectOutput("(try ('a) (catch any e e))", ":arity-mismatch");
+}
+
 test "collection-as-function: maps, sets and vectors" {
     try expectOutput("({:a 1} :a)", "1");
     try expectOutput("({:a 1} :b)", "nil");
@@ -3789,6 +3941,11 @@ test "read-string: forms as data, the first form only, errors thrown" {
     try expectOutput("(try (read-string \"(\") (catch :reader-error e :bad))", ":bad");
     try expectOutput("(try (read-string \"\") (catch :reader-error e :empty))", ":empty");
     try expectOutput("(macroexpand-1 (read-string \"(when a b)\"))", "(if a (do b) nil)");
+    // A token has no 64 KiB limit: a long string and symbol round-trip.
+    try expectOutput("(count (read-string (pr-str (apply str (repeat 70000 \"a\")))))", "70000");
+    try expectOutput("(count (name (read-string (apply str (repeat 70000 \"b\")))))", "70000");
+    // Nesting past the stack budget is a reader error, not a fault.
+    try expectOutput("(try (read-string (str (apply str (repeat 200000 \"(\")) (apply str (repeat 200000 \")\")))) (catch :reader-error e :deep))", ":deep");
 }
 
 // =============================================================================

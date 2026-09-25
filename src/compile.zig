@@ -5180,7 +5180,7 @@ test "compile variadic: ((fn* [a & r] r) 1 2 3) returns list (2 3)" {
     try testing.expectEqual(@as(i64, 3), list_mod.head(tail).asFixnum());
 }
 
-test "compile variadic: ((fn* [a & r] r) 1) returns empty list — argc == fixed_arity" {
+test "compile variadic: ((fn* [a & r] r) 1) returns nil — argc == fixed_arity" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const fn_form: Tiny = .{ .fn_star = .{
@@ -5193,9 +5193,7 @@ test "compile variadic: ((fn* [a & r] r) 1) returns empty list — argc == fixed
         .args = &.{&.{ .int = 1 }},
     } };
     const result = try runTiny(&arena, &call_form);
-    try testing.expect(result.kind() == .list);
-    try testing.expect(list_mod.isEmpty(result));
-    try testing.expectEqual(@as(usize, 0), list_mod.count(result));
+    try testing.expect(result.isNil());
 }
 
 test "compile variadic: ((fn* [& r] r) 1 2 3 4) — fixed_arity 0 variadic, all args to rest" {
@@ -5233,7 +5231,7 @@ test "compile variadic: ((fn* [& r] r)) — fixed_arity 0 variadic, no args" {
     } };
     const call_form: Tiny = .{ .call = .{ .callee = &fn_form, .args = &.{} } };
     const result = try runTiny(&arena, &call_form);
-    try testing.expect(list_mod.isEmpty(result));
+    try testing.expect(result.isNil());
 }
 
 test "compile variadic: variadic with too few args traps :arity-mismatch at runtime" {
