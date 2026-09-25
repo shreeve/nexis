@@ -280,6 +280,62 @@ test "G3b: a list of half a million cells survives a cycle intact and is freed b
     try std.testing.expectEqual(@as(usize, 0), heap.liveCount());
 }
 
+test "G3c: a chain of 300,000 nested vectors, maps, atoms and meta maps survives a cycle" {
+    // Every level is a different edge the mark phase follows: a
+    // vector element, a map value, an atom's value, a header's meta.
+    // The walk is a worklist, so the chain's depth never becomes
+    // native recursion depth; a recursive mark faults here long
+    // before the end.
+    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = gpa.deinit();
+    var heap = Heap.init(gpa.allocator());
+    defer heap.deinit();
+
+    const depth: usize = 300_000;
+    var node = value.fromFixnum(0).?;
+    var i: usize = 0;
+    while (i < depth) : (i += 1) {
+        node = switch (i % 4) {
+            0 => try vector_mod.fromSlice(&heap, &.{node}),
+            1 => try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), value.fromKeywordId(1), node, &dispatch.hashValue, &dispatch.equal),
+            2 => try nx.atom.make(&heap, node),
+            // A fresh string whose metadata map holds the level below.
+            else => blk: {
+                const m = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), value.fromKeywordId(2), node, &dispatch.hashValue, &dispatch.equal);
+                const s = try string.fromBytes(&heap, "m");
+                Heap.asHeapHeader(s).setMeta(Heap.asHeapHeader(m));
+                break :blk s;
+            },
+        };
+    }
+    _ = try string.fromBytes(&heap, "orphan");
+
+    var collector = Collector.init(&heap);
+    try std.testing.expect(collector.collect(&.{Heap.asHeapHeader(node)}) >= 1);
+    // Walk the chain back down to the fixnum at its bottom; a swept
+    // level would read freed memory.
+    var cur = node;
+    var steps: usize = 0;
+    while (cur.kind() != .fixnum) : (steps += 1) {
+        cur = switch (cur.kind()) {
+            .persistent_vector => vector_mod.nth(cur, 0),
+            .persistent_map => for ([_]u32{ 1, 2 }) |k| {
+                switch (champ.mapGet(cur, value.fromKeywordId(k), &dispatch.hashValue, &dispatch.equal)) {
+                    .present => |v| break v,
+                    .absent => {},
+                }
+            } else return error.TestUnexpectedResult,
+            .atom => nx.atom.getValue(cur),
+            .string => Heap.valueFromHeader(.persistent_map, Heap.asHeapHeader(cur).meta.?),
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    // A string level takes two steps: to its meta map, then through it.
+    try std.testing.expectEqual(depth + depth / 4, steps);
+    _ = collector.collect(&.{});
+    try std.testing.expectEqual(@as(usize, 0), heap.liveCount());
+}
+
 // -----------------------------------------------------------------------------
 // G4. Pinning
 // -----------------------------------------------------------------------------

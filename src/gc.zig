@@ -14,8 +14,9 @@
 //!     host's (`Host.roots`), then the sweep. The VM decides when a
 //!     cycle is due (GC.md §7); the collector has no policy of its
 //!     own.
-//!   - Non-reentrant — `collect` panics if called from inside a
-//!     visitor callback. Flag-guarded via `self.collecting`.
+//!   - Iterative — `mark` sets the bit and pushes the header on a
+//!     gray worklist; `collect` drains it. Data nesting depth never
+//!     becomes native recursion depth (GC.md §4).
 //!   - Precise — the roots are complete; the collector does NOT
 //!     scan stacks or registers.
 //!   - No write barriers (STW, single-threaded).
@@ -70,16 +71,19 @@ const testing = std.testing;
 
 pub const Collector = struct {
     heap: *Heap,
-    /// Re-entrancy guard. `collect` sets this to true for the duration
-    /// of a cycle; nested `collect` panics. Direct `mark` /
-    /// `markInternal` / `markValue` calls outside an active collect
-    /// are legal (tests exercise them to verify individual primitives);
-    /// they do not touch this flag.
-    collecting: bool = false,
     /// The runtime behind this heap, when there is one. A collector
     /// over a bare heap (the property tests) has none: its roots are
     /// all explicit and a closure or cell block cannot appear.
     host: ?Host = null,
+    /// Headers marked but not yet traced. `mark` pushes; the drain
+    /// pops and runs the kind's trace, whose own `mark` calls push
+    /// again, so the walk is a loop whatever the data's depth.
+    gray: std.ArrayList(*HeapHeader) = .empty,
+    /// True while a drain is running (for the whole of `collect`):
+    /// `mark` only pushes. Outside one, a direct `mark` drains before
+    /// it returns, so a caller marking by hand still gets the
+    /// transitive closure.
+    draining: bool = false,
 
     /// What the collector needs from the runtime that owns the heap
     /// (GC.md §3, §5): its roots, and the tracing of the two block
@@ -108,24 +112,38 @@ pub const Collector = struct {
     /// ignored. A Var's root, metadata and thread value are marked by
     /// the host's namespace walk, so skipping the `var_` Value loses
     /// nothing. Every other Value is dereferenced to its
-    /// `*HeapHeader` and marked + traced. This is the safe entry
-    /// point for callers holding Values (e.g. from a VM frame slot)
-    /// rather than raw heap headers.
+    /// `*HeapHeader` and marked.
     pub fn markValue(self: *Collector, v: Value) void {
         if (!Heap.isBlockKind(v.kind())) return;
         std.debug.assert(v.payload != 0 and (v.payload & 0xF) == 0);
         self.mark(@ptrFromInt(v.payload));
     }
 
-    /// Mark a full heap object and recursively walk its children.
-    /// Idempotent via mark-bit short-circuit (a second call on an
-    /// already-marked header returns immediately). Handles:
-    ///   - mark-bit transition via `markHeaderOnce`.
-    ///   - meta chain: if `h.meta != null`, recursively marks `h.meta`
-    ///     (which is itself a persistent-map root per SEMANTICS §7).
-    ///   - kind dispatch: invokes the per-kind trace function.
+    /// Mark a full heap object; its metadata and children are marked
+    /// when the drain traces it. Idempotent via the mark bit. When
+    /// the worklist cannot grow, the header is traced right here
+    /// instead: recursion is the fallback under memory exhaustion,
+    /// never the rule.
     pub fn mark(self: *Collector, h: *HeapHeader) void {
         if (!self.markHeaderOnce(h)) return;
+        self.gray.append(self.heap.backing, h) catch return self.trace(h);
+        if (!self.draining) {
+            self.drain();
+            self.gray.clearAndFree(self.heap.backing);
+        }
+    }
+
+    /// Trace every gray header until none is left.
+    fn drain(self: *Collector) void {
+        const was_draining = self.draining;
+        self.draining = true;
+        defer self.draining = was_draining;
+        while (self.gray.pop()) |h| self.trace(h);
+    }
+
+    /// Mark `h`'s metadata map and dispatch to the kind's trace.
+    /// `h` is already marked.
+    fn trace(self: *Collector, h: *HeapHeader) void {
         if (h.meta) |m| self.mark(m);
         const k: Kind = @enumFromInt(h.kind);
         switch (k) {
@@ -222,26 +240,20 @@ pub const Collector = struct {
     }
 
     /// Run a full collection cycle:
-    ///   1. Mark each root (transitive closure via `mark`), then the
-    ///      host's roots when there is a host.
+    ///   1. Push each root, then the host's roots when there is a
+    ///      host, and drain the worklist: the transitive closure.
     ///   2. Sweep: free every unmarked, non-pinned heap block.
     ///   3. Clear mark bits on survivors (handled inside sweepUnmarked).
     ///   4. Start a new allocation-counting window on the heap.
     /// Returns the number of blocks freed.
-    ///
-    /// **Not reentrant.** Panics if called while already collecting.
     pub fn collect(self: *Collector, roots: []const *HeapHeader) usize {
-        if (self.collecting) {
-            std.debug.panic(
-                "gc.collect: reentrant invocation (already inside a collect cycle)",
-                .{},
-            );
-        }
-        self.collecting = true;
-        defer self.collecting = false;
-
+        std.debug.assert(!self.draining);
+        self.draining = true;
         for (roots) |r| self.mark(r);
         if (self.host) |host| host.roots(host.ctx, self);
+        self.drain();
+        self.draining = false;
+        self.gray.clearAndFree(self.heap.backing);
         const freed = self.heap.sweepUnmarked();
         self.heap.resetAllocationCounter();
         return freed;
@@ -609,27 +621,6 @@ test "markValue: no-op on immediate Values" {
     gc.markValue(value.fromKeywordId(1));
     // No panic, no allocation, no state change.
     try testing.expectEqual(@as(usize, 0), heap.liveCount());
-}
-
-test "non-reentrant: collect from inside a visitor panics" {
-    // This is a structural property we verify by construction; a
-    // runtime panic test would require a custom visitor that
-    // re-entered the collector. We instead validate the flag guard
-    // directly.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    var gc = Collector.init(&heap);
-    gc.collecting = true; // simulate mid-cycle
-    // Calling collect while `collecting` is true would panic — we
-    // can't easily trigger that without expectPanic infrastructure.
-    // The guard is documented and asserted; the inverse assertion
-    // is covered by every other test that calls collect successfully
-    // (which requires `collecting == false` on entry).
-    try testing.expect(gc.collecting);
-    gc.collecting = false;
-    _ = gc.collect(&.{});
-    try testing.expect(!gc.collecting);
 }
 
 test "metadata chain: reachable through h.meta" {

@@ -1,19 +1,12 @@
-//! nexis language module — the `@lang = "nexis"` companion for
+//! nexis language module: the `@lang = "nexis"` companion of
 //! `nexis.grammar`.
 //!
-//! Responsibilities:
-//!   - `Tag` enum whose variants match every tagged S-expression emitted by
-//!     the grammar's parser actions.
-//!   - `Lexer` wrapper that fully replaces nexus's generated `BaseLexer`
-//!     tokenization. The generated scanner is tailored to imperative-language
-//!     conventions (hardcoded integer/keyword/ident shapes, no support for
-//!     Clojure-style `-?[0-9]+` numbers, no char literals, no multi-char
-//!     sharp-dispatch tokens beyond the ones listed in the operator switch).
-//!     Overriding `Lexer` here is the clean fix: the parser continues to
-//!     drive `self.lexer.next()` but our scanner produces exactly the token
-//!     shapes §7.2 of PLAN.md and FORMS.md §2 demand.
-//!   - `keyword_as`: promotion hook — unused (nexis has no
-//!     context-sensitive keywords at the reader level).
+//!   - `Tag`: every tag the grammar's actions put at the head of a list;
+//!     `src/reader.zig` consumes exactly this set.
+//!   - `Lexer`: the scanner, which replaces the generated one entirely.
+//!     Clojure's token boundaries (a number, char or symbol token runs to
+//!     the next delimiter) are written here once, and the generated parser
+//!     drives `next()` as it would its own lexer.
 
 const std = @import("std");
 const parser = @import("parser.zig");
@@ -48,14 +41,13 @@ pub const Tag = enum(u8) {
 
     // Internal reader-stage tags consumed and rewritten by src/reader.zig
     @"anon-fn",
-    discard,
     @"with-meta-raw",
 };
 
-/// Keyword-promotion hook required by the generated parser. nexis does not
-/// use the `@as` promotion machinery.
-pub fn keyword_as(_: []const u8, _: u16) ?u16 {
-    return null;
+/// The byte length of a leaf the parser built from a `Lexer` token (see
+/// `Lexer.finish`).
+pub fn srcLen(s: parser.Src) u32 {
+    return @as(u32, s.id) << 16 | s.len;
 }
 
 // =============================================================================
@@ -140,7 +132,15 @@ pub const Lexer = struct {
                             self.base.pos += 2;
                             return .{ .cat = .hash_discard, .pre = pre, .pos = start, .len = 2 };
                         },
-                        else => {},
+                        ' ', '\t', '\r', '\n', ',' => {},
+                        // An unsupported dispatch (`#'x`, `#"`, `##Inf`,
+                        // `#?`) is one err token, so the parse error
+                        // names the construct.
+                        else => |after| {
+                            self.base.pos = start + 2;
+                            if (isIdentCont(after)) self.skipConstituents();
+                            return self.finish(.err, start, pre);
+                        },
                     }
                 }
                 return self.single(.err, start, pre);
@@ -163,6 +163,15 @@ pub const Lexer = struct {
         }
     }
 
+    /// The token from `start` to the scan position. Token and Src carry a
+    /// u16 length; the high half goes through `aux`, which the parser
+    /// copies into the leaf's `src.id` (`srcLen` puts the halves together).
+    fn finish(self: *Lexer, cat: TokenCat, start: u32, pre: u8) Token {
+        const len = self.base.pos - start;
+        self.base.aux = @intCast(len >> 16);
+        return .{ .cat = cat, .pre = pre, .pos = start, .len = @truncate(len) };
+    }
+
     inline fn single(self: *Lexer, cat: TokenCat, start: u32, pre: u8) Token {
         self.base.pos = start + 1;
         return .{ .cat = cat, .pre = pre, .pos = start, .len = 1 };
@@ -180,83 +189,68 @@ pub const Lexer = struct {
         return c == '0' or c == '1';
     }
 
-    /// Clojure-style symbol start: letters, underscore, and the accepted
-    /// symbolic chars. `-` is handled at the dispatch level so we can
-    /// disambiguate negative numbers.
+    /// Clojure-style symbol start: letters, underscore, the accepted
+    /// symbolic chars, and every byte of a non-ASCII UTF-8 character
+    /// (the reader validates the sequence). `-` is handled at the
+    /// dispatch level so we can disambiguate negative numbers.
     inline fn isIdentStart(c: u8) bool {
         return switch (c) {
-            'a'...'z', 'A'...'Z', '_', '!', '$', '%', '&', '*', '+', '.', '/', '<', '=', '>', '?' => true,
+            'a'...'z', 'A'...'Z', '_', '!', '$', '%', '&', '*', '+', '.', '/', '<', '=', '>', '?', 0x80...0xFF => true,
             else => false,
         };
     }
 
     inline fn isIdentCont(c: u8) bool {
         return switch (c) {
-            'a'...'z', 'A'...'Z', '0'...'9', '_', '!', '$', '%', '&', '*', '+', '-', '.', '/', ':', '<', '=', '>', '?', '\'', '#' => true,
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '!', '$', '%', '&', '*', '+', '-', '.', '/', ':', '<', '=', '>', '?', '\'', '#', 0x80...0xFF => true,
             else => false,
         };
     }
 
+    /// A string token runs to the closing `"`, across lines; the reader
+    /// decodes the escapes. An unterminated string is an `err` token of
+    /// its opening quote alone, so the parse error points there.
     fn scanString(self: *Lexer, start: u32, pre: u8) Token {
         const src = self.base.source;
-        // start points at the opening '"'.
-        self.base.pos = start + 1;
-        while (self.base.pos < src.len) {
-            const ch = src[self.base.pos];
-            if (ch == '"') {
-                self.base.pos += 1;
-                return .{ .cat = .string, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+        var pos = start + 1;
+        while (pos < src.len) : (pos += 1) {
+            switch (src[pos]) {
+                '"' => {
+                    self.base.pos = pos + 1;
+                    return self.finish(.string, start, pre);
+                },
+                '\\' => pos += 1,
+                else => {},
             }
-            if (ch == '\\') {
-                // Accept any next byte; detailed escape validation is the
-                // reader's job.
-                self.base.pos += @min(2, src.len - self.base.pos);
-                continue;
-            }
-            if (ch == '\n') break; // no multi-line strings (PLAN §7.2).
-            self.base.pos += 1;
         }
-        return .{ .cat = .err, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+        return self.single(.err, start, pre);
     }
 
+    /// A char token: `\`, one character (a whole UTF-8 sequence, or
+    /// any byte, a delimiter included), then every symbol constituent
+    /// that follows, as a number token runs (FORMS.md §3). `\u{HEX}`
+    /// runs to its `}` first. The reader judges the text, so `\a1` and
+    /// `\u0041` are each one token it rejects, never a char followed by
+    /// another form.
     fn scanChar(self: *Lexer, start: u32, pre: u8) Token {
         const src = self.base.source;
-        // start points at '\\'. A char literal needs at least one char after.
-        self.base.pos = start + 1;
-        if (self.base.pos >= src.len) {
-            return .{ .cat = .err, .pre = pre, .pos = start, .len = 1 };
-        }
-
-        // `\u{HEX}` — unicode scalar.
-        if (src[self.base.pos] == 'u' and self.base.pos + 1 < src.len and src[self.base.pos + 1] == '{') {
-            self.base.pos += 2;
-            while (self.base.pos < src.len and isHexDigit(src[self.base.pos])) : (self.base.pos += 1) {}
-            if (self.base.pos < src.len and src[self.base.pos] == '}') {
-                self.base.pos += 1;
-                return .{ .cat = .char, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+        var pos = start + 1;
+        if (pos >= src.len) return self.single(.err, start, pre);
+        if (src[pos] == 'u' and pos + 1 < src.len and src[pos + 1] == '{') {
+            pos += 2;
+            while (pos < src.len and isHexDigit(src[pos])) pos += 1;
+            if (pos >= src.len or src[pos] != '}') {
+                self.base.pos = pos;
+                return self.finish(.err, start, pre);
             }
-            return .{ .cat = .err, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+            pos += 1;
+        } else {
+            const n = std.unicode.utf8ByteSequenceLength(src[pos]) catch 1;
+            pos = @min(pos + n, @as(u32, @intCast(src.len)));
         }
-
-        // `\name` — named character (alpha run). `\a` and friends fall out of
-        // this path because a single alpha run of length 1 is still valid.
-        if (isNamedCharStart(src[self.base.pos])) {
-            self.base.pos += 1;
-            while (self.base.pos < src.len and isAlpha(src[self.base.pos])) : (self.base.pos += 1) {}
-            return .{ .cat = .char, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
-        }
-
-        // `\<any>` — any single literal character (incl. punctuation).
-        self.base.pos += 1;
-        return .{ .cat = .char, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
-    }
-
-    inline fn isNamedCharStart(c: u8) bool {
-        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
-    }
-
-    inline fn isAlpha(c: u8) bool {
-        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
+        while (pos < src.len and isIdentCont(src[pos])) pos += 1;
+        self.base.pos = pos;
+        return self.finish(.char, start, pre);
     }
 
     fn scanKeyword(self: *Lexer, start: u32, pre: u8) Token {
@@ -271,18 +265,27 @@ pub const Lexer = struct {
             return .{ .cat = .err, .pre = pre, .pos = start, .len = 1 };
         }
         const first = src[self.base.pos];
-        if (!isIdentStart(first) and first != '-') {
-            return .{ .cat = .err, .pre = pre, .pos = start, .len = 1 };
+        if (first == ':') {
+            // `::k`, an auto-resolved keyword, is not supported: one err
+            // token over it names it in the parse error.
+            self.skipConstituents();
+            return self.finish(.err, start, pre);
         }
+        if (!isIdentStart(first) and first != '-') return self.single(.err, start, pre);
+        self.skipConstituents();
+        return self.finish(.keyword, start, pre);
+    }
+
+    fn skipConstituents(self: *Lexer) void {
+        const src = self.base.source;
         while (self.base.pos < src.len and isIdentCont(src[self.base.pos])) : (self.base.pos += 1) {}
-        return .{ .cat = .keyword, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
     }
 
     fn scanIdent(self: *Lexer, start: u32, pre: u8) Token {
         const src = self.base.source;
         self.base.pos = start + 1;
         while (self.base.pos < src.len and isIdentCont(src[self.base.pos])) : (self.base.pos += 1) {}
-        return .{ .cat = .ident, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+        return self.finish(.ident, start, pre);
     }
 
     /// A number token: `-?`, then `0x`/`0b` and radix digits, or decimal
@@ -337,6 +340,6 @@ pub const Lexer = struct {
 
         // Whatever symbol constituents follow stay in the token.
         while (self.base.pos < src.len and isIdentCont(src[self.base.pos])) : (self.base.pos += 1) {}
-        return .{ .cat = if (is_real) .real else .integer, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+        return self.finish(if (is_real) .real else .integer, start, pre);
     }
 };

@@ -50,12 +50,13 @@ DOES and what invariants the VM upholds are frozen here.
   the group numbers exist; an instruction in one of those groups
   traps `UnimplementedOpcode`. Durable-ref, I/O, hashing and
   transient operations are natives.
-- No bytecode verifier, no object files, no disassembler, no
-  tiered compilation.
-- No per-PC liveness maps and no root enumeration: the VM never
-  runs the collector (§9).
-- No frame-depth limit: non-tail recursion grows `VM.frames`
-  until allocation fails (`OutOfMemory`).
+- No bytecode verifier, no object files, no tiered compilation.
+  `bin/nexis disasm` reads routines; nothing checks them before
+  they run.
+- No per-PC liveness maps: the whole backing stack is a root (§9).
+- No unbounded recursion: the frame chain stops at `VM.max_frames`
+  and native re-entry at the stack guard, both with a catchable
+  `:stack-overflow` (§13).
 
 ---
 
@@ -331,7 +332,7 @@ const CaptureDescriptor = struct {
 ```
 
 **Execution**:
-- Allocate a closure (kind `function`, VALUE.md kind 22) with an
+- Allocate a closure (kind `function`, VALUE.md kind 24) with an
   `[N]*UpvalCell` array, where `N = descriptor.sources.len`. `N`
   must equal the child routine's `upvalue_count`, otherwise
   `CaptureCountMismatch`.
@@ -528,10 +529,10 @@ do not fit) and enables a one-instruction call fast path.
 - `protocol_fn`: dispatch on the first argument's kind (or record
   type) through the VM's protocol registry (`docs/PROTOCOLS.md`);
   `:no-protocol-impl` / `:no-protocol-method` on a miss.
-- `keyword`, `persistent_map`, `persistent_set`,
-  `persistent_vector`: invoked as a lookup — `(:k m)`, `(m :k)`,
-  `(s x)`, `(v i)` with an optional default (PLAN §8.7,
-  `VM.lookup`).
+- `keyword`, `symbol`, `persistent_map`, `persistent_set`,
+  `persistent_vector`: invoked as a lookup — `(:k m)`, `('s m)`,
+  `(m :k)`, `(s x)`, `(v i)` with an optional default (PLAN §8.7,
+  `VM.lookup`); a symbol looks itself up exactly as a keyword does.
 - `function` (a closure): the frame transfer below.
 - Anything else: `:not-callable`.
 
@@ -547,8 +548,9 @@ do not fit) and enables a one-instruction call fast path.
 - For a variadic routine, the call machinery (NOT the caller's
   bytecode) builds a list from the excess arguments right-to-left
   and installs it at callee `slot[fixed_arity]`; when
-  `argc == fixed_arity` the rest slot holds the empty list. Slots
-  above it up to the callee's window end are reset to nil.
+  `argc == fixed_arity` the rest slot holds nil, as in Clojure, so
+  `(if more ...)` tests for extra arguments. Slots above it up to
+  the callee's window end are reset to nil.
 - Point `callee.upvalues` at the closure's upvalue array.
 - Dispatch into the callee's entry point (pc 0).
 - On callee `return v`: pop the frame, restore the stack length
@@ -585,10 +587,15 @@ halts the VM with that value as `vm.result`.
 native built on `VM.callValue`.
 
 **Native entry points**: `VM.callValue(callee, args)` invokes any
-callable from Zig (used by `map`, `reduce`, `swap!`, protocol
-dispatch, ...) by pushing a synthetic frame and running the VM to
-its return; `VM.evalClosure` runs a closure in a fresh sub-VM (the
-macroexpander uses it for `defmacro` bodies).
+callable from Zig (used by `map`, `reduce`, `swap!`, `apply`, ...):
+a closure by copying the arguments to the top of the stack, entering
+it exactly as `call:call` does and running the VM to its return; a
+native, a protocol fn or a lookup by calling it directly with its
+arguments rooted. `call:call`, `callValue` and `VM.evalClosure`
+(which runs a closure in a fresh sub-VM; the macroexpander uses it
+for `defmacro` bodies) share one closure entry and one direct call,
+so a protocol fn passed to `map` or `apply` behaves as it does in
+call position.
 
 ---
 
@@ -675,19 +682,19 @@ loop:
   inst = frame.routine.code[frame.pc]; frame.pc += 1
   switch inst.group:                       -- step
     .mov, .cmp, .jump, .var, .math => exec<Group>(frame, inst) -> switch variant
-    other => dispatch(inst):
-      .call    => execCall(inst)
-      ...
-      .transient, .hash, .tx, .io, .simd => UnimplementedOpcode
-      other    => BytecodeCorruption
+    .call, .closure, .coll, .ctrl  => exec<Group>(inst)        -> switch variant
+    .transient, .hash, .tx, .io, .simd => UnimplementedOpcode
+    other    => BytecodeCorruption
 ```
 
 The groups that never push or pop a frame (`mov`, `cmp`, `jump`,
 `var`, `math`) resolve their operands through the frame pointer the
-fetch took (`resolveIn`, `storeIn`, `slotPtrIn`); the others go
-through `dispatch`, whose handlers re-derive the current frame
-because a call or a native may have grown `frames`. The bounds
-checks are the same on both paths.
+fetch took (`resolveIn`, `storeIn`, `slotPtrIn`); the others
+re-derive the current frame because a call or a native may have
+grown `frames`. The bounds checks are the same on both paths.
+`run` drives the loop until the VM halts; `callValue` and
+`runRoutine` drive the same loop until the frame they pushed
+returns.
 
 **Contract**:
 - PC increment happens before handler entry: handlers see the
@@ -716,8 +723,9 @@ block and the arena wholesale.
 `vm.zig` imports `gc.zig`; `VM.gcRoots` enumerates the roots, in
 this order: the whole backing stack (every slot, the conservative
 overapproximation that needs no per-PC liveness map), every frame's
-closure, cells and routine constants (recursively through nested
-routines), every Var of every namespace (`root`, `meta`,
+closure (whose trace reaches its cells and routine constants, once
+however many frames run it) or, for a frame with none, its routine
+constants (recursively through nested routines), every Var of every namespace (`root`, `meta`,
 `thread_value`), the dynamic-binding stack's saved values, the root
 stack (`vm.roots`), pending `finally` throws, `vm.unhandled_throw`,
 `vm.result`, and the protocol registry's implementations.
@@ -725,8 +733,8 @@ stack (`vm.roots`), pending `finally` throws, `vm.unhandled_throw`,
 constants) and a cell (its value).
 
 **Trigger and safe point.** `VM.gcDue` is checked at the
-instruction fetch in `run`, `runWithFuel` and `runUntilDepth`, and
-nowhere else: at a loop's first fetch and at every fetch that
+instruction fetch of `VM.loop`, the one run loop (`run`,
+`callValue` and `runRoutine` drive it), and nowhere else: at a loop's first fetch and at every fetch that
 follows an instruction of a group that can allocate (`math`,
 `call`, `closure`, `coll`, `ctrl`); the fetch after a `mov`, `cmp`,
 `jump` or `var` instruction skips the test because the heap's
@@ -886,7 +894,7 @@ from `slot[arg_base ..]`:
 | Var | Name | Semantics |
 |---|---|---|
 | 0 | `coll:list` | Build a list right-to-left via `cons` |
-| 1 | `coll:concat` | Each arg must be a list (`:kind-mismatch` otherwise); result is the left-to-right concatenation, built by collecting every element then consing right-to-left (no recursive append) |
+| 1 | `coll:concat` | Each arg is a seqable: nil, a list, a vector, a map (its `[k v]` entries) or a set (`:kind-mismatch` otherwise); result is the list of every element left to right, built by collecting the elements then consing right-to-left (no recursive append) |
 | 2 | `coll:vector` | `vector.fromSlice` over the range |
 | 3 | `coll:map` | Flat `k v k v ...` pairs (`argc` even); later duplicate keys overwrite earlier (Clojure semantics) |
 | 4 | `coll:set` | Set from the range; duplicates collapse |
@@ -963,8 +971,10 @@ loop leaving both unchanged (`COMPILER.md` §9.4).
 ### 12. try / catch / finally / throw
 
 **Handler stack**: one VM-wide stack (`vm.handlers`) of
-`Handler { kind, frame_index, catch_pc, binding_slot, finally_pc? }`
-keyed by frame index rather than a list per frame. Two kinds:
+`Handler { kind, frame_index, catch_pc, binding_slot, finally_pc?,
+finally_depth }` keyed by frame index rather than a list per frame;
+`finally_depth` is the length of `vm.finally_stack` when the `try` was
+entered. Two kinds:
 
 - `try_` — a `(try body (catch any x handler))` is active:
   a throw routes to `catch_pc` with the value in `binding_slot`.
@@ -1002,13 +1012,17 @@ walk the handler stack top-down:
 **`ctrl:finally-exit`**: pop the top `FinallyContinuation`
 (`InvalidHandlerState` if none, or if it belongs to another
 frame). `.normal(pc)` resumes at `pc`; `.throwing(v)` re-throws
-`v` from this point. A throw inside the finally body itself
-replaces the pending continuation's throw.
+`v` from this point. A throw out of a finally body abandons that
+body's continuation: the handler that takes any throw first
+truncates `vm.finally_stack` to its `finally_depth`, dropping the
+continuations of every finally body the throw leaves mid-run, so the
+stack is back to where it stood when the catching `try` was entered.
 
 **Matching**: the only matcher is `any`; every throw is caught by
 the innermost active `try`. Thrown values are ordinary Values.
-There are no stack traces, no cause chains and no source spans on
-runtime errors.
+A thrown value carries no stack trace and no cause chain; an error
+that leaves `run` records the frame chain, with source spans, in
+`VM.error_trace` (§13).
 
 **Throws from natives** (`VM.throwValue`, `VM.throwKeyword`):
 - A native throws exactly as `ctrl:throw` does: the same handler
@@ -1040,9 +1054,9 @@ handler is active):
 
 | Keyword | When |
 |---|---|
-| `:kind-mismatch` | An operand of the wrong kind: non-numeric to `math:*` / `cmp:*`, non-list to `coll:concat`, wrong kind to a native |
+| `:kind-mismatch` | An operand of the wrong kind: non-numeric to `math:*` / `cmp:*`, non-seqable to `coll:concat`, wrong kind to a native |
 | `:arity-mismatch` | `call:call` (or `callValue`) passes an argument count the callee does not accept |
-| `:not-callable` | `call:call` on a value that is not a function, native, protocol fn, keyword, map, set or vector |
+| `:not-callable` | `call:call` on a value that is not a function, native, protocol fn, keyword, symbol, map, set or vector |
 | `:unbound-var` | A `v` operand or `var:load-var` on a Var never bound by `def` |
 | `:not-dynamic` | `binding` (`push-thread-bindings`) or `set!` (`var-set`) on a Var not marked `^:dynamic` (§6.5) |
 | `:no-thread-binding` | `set!` (`var-set`) on a dynamic Var with no `binding` of it in force (§6.5) |
@@ -1054,6 +1068,7 @@ handler is active):
 | `:atom-re-entry` | `swap!` re-entered on the atom it is swapping (`docs/ATOM.md`) |
 | `:utf8-error`, `:invalid-argument`, `:io-error`, `:file-not-found`, `:invalid-path` | String and I/O natives |
 | `:record-redefinition`, `:not-a-record`, `:no-protocol-impl`, `:no-protocol-method`, `:protocol-redefinition` | Records and protocols (`docs/PROTOCOLS.md`) |
+| `:stack-overflow` | A call would push frame number `VM.max_frames` (default 2^20, about a million; an embedder may set it), or a native re-entering the VM (`callValue`, `runRoutine`) finds the native stack past the guard's limit (§13.1). Runaway recursion ends in well under a second instead of growing memory until the process dies; legitimate recursion a hundred thousand calls deep runs |
 
 **Not catchable** (compiler bugs or corrupt bytecode; propagate
 out of `run`):
@@ -1072,15 +1087,30 @@ out of `run`):
 | `InvalidCellState` | `box-local` on an already-boxed slot, `init-cell` on an initialized cell |
 | `UninitializedCell` | `get-cell` (or U resolve) on a placeholder not yet filled |
 | `InvalidHandlerState` | `try-exit` / `finally-exit` with no matching handler or continuation |
-| `OutOfMemory` | Allocation failure (including unbounded frame growth) |
+| `OutOfMemory` | Allocation failure |
 
-**Control signals** (not errors in the user sense): `Halt` (the
-outermost `return`), `ControlTransferred` (a native's throw has been
-caught and the run loop resumes at the handler), `UncaughtThrow`
-(no handler; value in `vm.unhandled_throw`).
+**Control signals** (not errors in the user sense):
+`ControlTransferred` (a native's throw has been caught and the run
+loop resumes at the handler), `UncaughtThrow` (no handler; value in
+`vm.unhandled_throw`). The outermost `return` is no error: it sets
+`vm.halted` and `run` returns `vm.result`.
 
-VM frame depth is unbounded: frames live on the heap. The native
-stack is bounded and guarded (§13.1).
+Frames live on the heap, so bytecode recursion costs no native
+stack; its depth is bounded by `VM.max_frames`. The native stack is
+bounded and guarded (§13.1).
+
+**What the error was about**: where the VM raises an error it can
+describe, it writes one sentence to `VM.error_detail` for the host's
+report: `f takes 1 argument, got 0`, `first takes 1 argument, got
+2`, `g takes at least 2 arguments, got 1` (closures, natives and
+protocol methods alike), `an integer is not callable`, `+ expects
+numbers, got a string` (the `math:*` and `cmp:*` opcodes), `no impl
+of area for a vector`. A value's kind is named as the language
+presents it (`kindPhrase`: `nil`, `a boolean`, `an integer`, `a
+map`, ...). The detail is empty when the raise site has nothing to
+add, as for errors natives raise; `run` clears it on entry and a
+handler clears it when it takes the error as a keyword, so it never
+describes an earlier error.
 
 **What the VM records when an error leaves `run`**: the frame
 chain as it stood, in `VM.error_trace`, innermost first, one
@@ -1098,7 +1128,10 @@ and is left out. `VM.traced_error` names the error the trace was
 recorded for. `runRoutine` records the same way when a nested run
 fails, so a host that learns of the failure indirectly (the loader
 ran a required file while a form was being compiled) reports it
-with its chain. The trace is rebuilt by the next failing run. `resetAfterError` discards
+with its chain. A chain longer than 40 frames keeps its innermost 32
+and outermost 8 around one marker frame named `<N frames elided>`
+(no span, no source), so a runaway recursion reports in 41 lines.
+The trace is rebuilt by the next failing run. `resetAfterError` discards
 what the failed run left (the frames above the top-level one,
 handlers, pending finallys, the unhandled throw) so `retargetTop`
 can run the next form; the CLI's REPL calls it after reporting.
@@ -1126,8 +1159,11 @@ guarded function may run at:
   arms the guard at that thread's entry with the stack less a 16 MiB
   margin for unguarded leaf calls.
 
-Each layer maps the error to its own report: the VM raises
-`StackOverflow`, the reader a reader error, the compiler a compile
+The VM checks on entry to `callValue` and `runRoutine`, the two ways
+a native re-enters it, so recursion through `apply`, `map`, `reduce`,
+a protocol impl or `eval` ends in the same catchable `:stack-overflow`
+as runaway bytecode recursion. Each layer maps the error to its own
+report: the VM raises `StackOverflow`, the reader a reader error, the compiler a compile
 error, and a codec decode of bytes nested too deep treats them as
 corrupt input.
 
@@ -1139,9 +1175,10 @@ corrupt input.
   All slot/constant/upvalue reads produce `Value`s; all stores
   write `Value`s.
 - **`src/heap.zig`**: the VM's own `Heap` is backed by
-  `runtime_arena` and used for the values it constructs itself
-  (rest-arg lists, `coll:*` results).
-- **`src/gc.zig`**: not imported (§9).
+  `VM.allocator`, so a sweep returns memory; it holds every runtime
+  value, the ones the VM constructs itself (rest-arg lists, `coll:*`
+  results, closures, cells) included.
+- **`src/gc.zig`**: the VM is the collector's host (§9).
 - **`src/intern.zig`**: one shared `Interner` per VM keeps symbol
   and keyword identity consistent between the compiler, the
   macroexpander and runtime values.
@@ -1164,8 +1201,12 @@ Three layers, paralleling `COMPILER.md` §9:
 #### 15.1 Per-opcode unit tests
 
 - `src/vm.zig` inline tests for every dispatched opcode:
-  hand-assembled bytecode, pre-state + post-state assertion,
-  error-path coverage for every trap the opcode can raise.
+  hand-assembled bytecode and error-path coverage for every trap the
+  opcode can raise. The single-routine cases are tables of
+  `RunCase{code, consts, slots, want}` run by `expectRuns`, which
+  also asserts that a run that returns leaves no handler, pending
+  finally or frame behind; the closure, cell, var and ctrl tests
+  that inspect VM state stay individual.
 
 #### 15.2 Per-group integration tests
 
@@ -1214,7 +1255,6 @@ Three layers, paralleling `COMPILER.md` §9:
 - Exact dispatch-loop code (§8).
 - Per-opcode handler signature. Contract is "handler reads the
   current instruction from the VM and executes its semantics."
-- How an `OutOfMemory` on frame growth is surfaced to user code.
 
 ---
 
@@ -1225,7 +1265,7 @@ Three layers, paralleling `COMPILER.md` §9:
 - `PLAN.md` §12 — ISA physical format + operand kinds + opcode
   groups (higher-level).
 - `PLAN.md` §8 — Value model (what the VM manipulates).
-- `docs/VALUE.md` — heap kinds; `function` (kind 22) is the
+- `docs/VALUE.md` — heap kinds; `function` (kind 24) is the
   closure carrier.
 - `docs/SEMANTICS.md` — equality / hash / numeric invariants the
   VM must respect.
