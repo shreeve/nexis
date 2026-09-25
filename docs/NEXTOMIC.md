@@ -478,9 +478,11 @@ is `:kind-mismatch`.
 seek, constants after an unbound position filter. Built-in predicates and functions (`< <= > >= = not= missing?`, `!=` as
 `not=`; `ground`, `tuple`, `untuple`, `get-else`, `get-some`, which
 binds `[attr value]` for the first of its attributes the entity has and
-drops the row when it has none, and `fulltext`) are Zig over cells; an int and a double compare numerically, and a
-comparison across other types (a string against a number, a number
-against a keyword) is `:nextomic/value-type`, as is an input or a
+drops the row when it has none, and `fulltext`) are Zig over cells; an int and a double compare numerically,
+strings by their bytes and keywords by their text, as `compare` orders
+them, and a comparison across other types (a string against a number, a
+number against a keyword) or of any other value (a vector, a bignum) is
+`:nextomic/value-type`, as is an input or a
 function result whose shape does not fit its binding form. Any other symbol resolves through the namespace
 registry as the compiler resolves it (an alias-qualified `ns/name` to
 that namespace's own var, a bare name in the current namespace and then
@@ -516,7 +518,8 @@ and `:with` variables) by the plain find elements: `count`, `sum`,
 `distinct` (a set), `(min n ?x)` and `(max n ?x)` (the n smallest or
 largest, a vector), `(sample n ?x)` (up to n distinct values, a vector)
 and `(rand n ?x)` (n values with repetition, a vector). `min` and `max`
-compare any type in the cell order; `sum`, `avg`, `variance` and `stddev`
+take any type, in the cell order: nil, booleans, numbers, strings,
+keywords by their text, then other values in a stable order; `sum`, `avg`, `variance` and `stddev`
 take numbers (`:nextomic/value-type` otherwise); `median` of an odd
 count is the middle value of any type, of an even count the mean of the
 two middle numbers as a double; `variance` divides by the count

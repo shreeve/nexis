@@ -53,6 +53,7 @@ ok a nil function result drops the row
 (3 8 5)
 :nextomic/value-type
 (:blue :green :red)
+ok keywords compare and aggregate by name, as compare orders them
 Edward
 nil
 (Bob Cy Di)

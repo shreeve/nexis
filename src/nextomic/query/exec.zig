@@ -341,7 +341,7 @@ pub const Exec = struct {
         switch (b) {
             .lt, .le, .gt, .ge => {
                 for (args[0 .. args.len - 1], args[1..]) |x, y| {
-                    const o = x.compare(y) orelse return error.ValueType;
+                    const o = x.compare(y, self.interner) orelse return error.ValueType;
                     const ok = switch (b) {
                         .lt => o == .lt,
                         .le => o != .gt,
@@ -860,7 +860,7 @@ pub const Exec = struct {
                 if (agg.n) |n| {
                     const cells = try self.arena.alloc(Cell, members.len);
                     for (members, cells) |m, *c| c.* = basis.cell(m, col);
-                    std.mem.sort(Cell, cells, op == .max, cellLess);
+                    std.mem.sort(Cell, cells, CellOrder{ .names = self.interner, .descending = op == .max }, CellOrder.less);
                     return self.cellVector(cells[0..@min(cells.len, n)]);
                 }
                 var best: ?Cell = null;
@@ -870,7 +870,7 @@ pub const Exec = struct {
                         best = c;
                         continue;
                     }
-                    const o = c.order(best.?);
+                    const o = c.orderBy(best.?, self.interner);
                     if ((op == .min and o == .lt) or (op == .max and o == .gt)) best = c;
                 }
                 return best orelse .nil;
@@ -878,7 +878,7 @@ pub const Exec = struct {
             .median => {
                 const cells = try self.arena.alloc(Cell, members.len);
                 for (members, cells) |m, *c| c.* = basis.cell(m, col);
-                std.mem.sort(Cell, cells, false, cellLess);
+                std.mem.sort(Cell, cells, CellOrder{ .names = self.interner, .descending = false }, CellOrder.less);
                 if (cells.len == 0) return .nil;
                 if (cells.len % 2 == 1) return cells[cells.len / 2];
                 const lo = try numberOf(cells[cells.len / 2 - 1]);
@@ -927,10 +927,15 @@ pub const Exec = struct {
         }
     }
 
-    fn cellLess(descending: bool, a: Cell, b: Cell) bool {
-        const o = a.order(b);
-        return if (descending) o == .gt else o == .lt;
-    }
+    const CellOrder = struct {
+        names: *const Interner,
+        descending: bool,
+
+        fn less(self: CellOrder, a: Cell, b: Cell) bool {
+            const o = a.orderBy(b, self.names);
+            return if (self.descending) o == .gt else o == .lt;
+        }
+    };
 
     /// A numeric cell as a double; anything else is `ValueType`.
     fn numberOf(c: Cell) error{ValueType}!f64 {

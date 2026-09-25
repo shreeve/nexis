@@ -383,7 +383,7 @@ const Naive = struct {
         const op = ag.op;
         const sorted = try self.arena.alloc(Cell, members.len);
         for (members, sorted) |m, *c| c.* = m[col];
-        std.mem.sort(Cell, sorted, {}, cellAsc);
+        std.mem.sort(Cell, sorted, self.fx.interner(), cellAsc);
         switch (op) {
             .count => return .{ .int = @intCast(members.len) },
             .median => {
@@ -430,7 +430,7 @@ const Naive = struct {
                 }
                 var best = members[0][col];
                 for (members[1..]) |m| {
-                    const o = m[col].order(best);
+                    const o = naiveOrder(self.fx.interner(), m[col], best);
                     if ((op == .min and o == .lt) or (op == .max and o == .gt)) best = m[col];
                 }
                 return best;
@@ -735,7 +735,7 @@ const Naive = struct {
                 .lt, .le, .gt, .ge => {
                     var i: usize = 0;
                     while (i + 1 < cells.len) : (i += 1) {
-                        const o = cells[i].compare(cells[i + 1]) orelse return error.ValueType;
+                        const o = naiveCompare(self.fx.interner(), cells[i], cells[i + 1]) orelse return error.ValueType;
                         const ok = switch (b) {
                             .lt => o == .lt,
                             .le => o != .gt,
@@ -843,8 +843,24 @@ const Naive = struct {
     }
 };
 
-fn cellAsc(_: void, a: Cell, b: Cell) bool {
-    return a.order(b) == .lt;
+fn cellAsc(names: *Interner, a: Cell, b: Cell) bool {
+    return naiveOrder(names, a, b) == .lt;
+}
+
+/// The oracle's order: keywords by their text, as `compare` orders
+/// them; everything else in the cell order.
+fn naiveOrder(names: *Interner, a: Cell, b: Cell) std.math.Order {
+    if (a == .keyword and b == .keyword) return std.mem.order(u8, names.keywordName(a.keyword), names.keywordName(b.keyword));
+    return a.order(b);
+}
+
+/// The oracle's comparison: values of one type (int and double are
+/// one), never VM values.
+fn naiveCompare(names: *Interner, a: Cell, b: Cell) ?std.math.Order {
+    const numeric = (a == .int or a == .double) and (b == .int or b == .double);
+    if (!numeric and std.meta.activeTag(a) != std.meta.activeTag(b)) return null;
+    if (a == .vm) return null;
+    return naiveOrder(names, a, b);
 }
 
 fn num(c: Cell) !f64 {

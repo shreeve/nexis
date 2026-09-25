@@ -147,6 +147,12 @@
 (println (map count (d/q '[:find [(sample 3 ?a) (rand 8 ?a) (sample 100 ?a)] :where [?e :person/age ?a]] db)))
 (println (t/caught (d/q '[:find (variance ?n) :where [_ :person/name ?n]] db)))
 (println (sort (d/q '[:find (distinct ?t) . :where [_ :person/tags ?t]] db)))
+(t/check "keywords compare and aggregate by name, as compare orders them"
+       (and (= :red (d/q '[:find (max ?t) . :where [_ :person/tags ?t]] db))
+            (= :blue (d/q '[:find (min ?t) . :where [_ :person/tags ?t]] db))
+            (= [:red :green] (d/q '[:find (max 2 ?t) . :where [_ :person/tags ?t]] db))
+            (= #{[:blue]} (d/q '[:find ?t :where [_ :person/tags ?t] [(< ?t :c)]] db))
+            (= #{[:green] [:red]} (d/q '[:find ?t :where [_ :person/tags ?t] [(>= ?t :green)]] db))))
 (println (d/q '[:find ?n . :where [?e :person/age 55] [?e :person/name ?n]] db))
 (println (d/q '[:find ?n . :where [?e :person/age 99] [?e :person/name ?n]] db))
 (println (sort (d/q '[:find [?n ...] :where [?e :person/boss _] [?e :person/name ?n]] db)))
