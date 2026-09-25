@@ -286,11 +286,13 @@ const Scripts = struct {
     exe: *std.Build.Step.Compile,
     update: bool,
 
-    /// A directory that is empty whenever any of `inputs` or the
-    /// binary changes, for a program to use as its working directory:
-    /// the stores a run leaves never reach a run of changed inputs.
+    /// A directory emptied on every build, for a program to use as its
+    /// working directory: the stores a run leaves, including a failed
+    /// run's, never reach the next run. Its path follows `inputs` and
+    /// the binary.
     fn freshDir(self: Scripts, inputs: []const std.Build.LazyPath) std.Build.LazyPath {
         const mk = self.b.addSystemCommand(&.{ "sh", "-c", "rm -rf \"$1\" && mkdir -p \"$1\"", "fresh-dir" });
+        mk.has_side_effects = true;
         const dir = mk.addOutputDirectoryArg("cwd");
         mk.addFileInput(self.exe.getEmittedBin());
         for (inputs) |input| {
