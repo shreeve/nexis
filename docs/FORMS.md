@@ -88,7 +88,7 @@ foo, ns/foo, set!, ->>               ;; symbol
 | `\é`, `\☃`, `\(` | one character, any UTF-8 sequence or delimiter |
 | `\u0041`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | `:invalid-char-literal`, detail the token (`\u{HEX}` is the one escape, PLAN §23 #26) |
 | `foo/bar/baz`, `:foo/bar/baz` | `:invalid-symbol`, `:invalid-keyword`, detail the token |
-| `#'x`, `#"re"`, `##Inf`, `#?(...)`, `#!`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `#'x` ``): none is in the reader (PLAN §7.2) |
+| `#'x`, `#"re"`, `##Inf`, `#?(...)`, `#!`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `#'x` ``): none is in the reader (`CLOJURE-REVIEW.md` §4) |
 | a form nested past the native stack's budget | `:nesting-too-deep` (`src/stack.zig`) |
 
 `ErrorKind` in `reader.zig` is the complete list. The reader fails fast
