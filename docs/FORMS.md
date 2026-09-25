@@ -111,7 +111,8 @@ see. Mirrors PLAN §28.3 exactly.
 | `1abc`, `1-2`, `1.5x`, `1/2`, `1.`, `0x`, `3.14M` | **reader error**: `:bad-number-literal`, detail the token's text |
 | `"one⏎two"` (a newline in the source) | a string may span lines; the newline is part of it: `(string "one\ntwo")` |
 | `"a\qb"`, `"\u{D800}"`, `"\u0041"` | **reader error**: `:invalid-string-escape`, detail the escape (`\q`, `\u{D800}`, `\u`) |
-| a string literal whose bytes are not UTF-8 | **reader error**: `:invalid-utf8` |
+| `λ`, `ns.é/π`, `:ключ` | a symbol or keyword may hold any non-ASCII UTF-8 character |
+| a string, symbol or keyword whose bytes are not UTF-8 | **reader error**: `:invalid-utf8` |
 | `\é`, `\☃`, `\(` | one character, any UTF-8 sequence or delimiter: `(char \u{E9})`, `(char \u{2603})`, `(char \()` |
 | `\u0041`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | **reader error**: `:invalid-char-literal`, detail the token's text (`\u{HEX}` is the one escape, PLAN §23 decision 26) |
 | a form nested past the native stack's budget | **reader error**: `:nesting-too-deep` (`src/stack.zig`) |

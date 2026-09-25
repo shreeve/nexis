@@ -147,6 +147,8 @@ test "integration: let*" {
 
 test "integration: let (rename macro)" {
     try expectOutput("(let [x 10 y 20] (+ x y))", "30");
+    // A name may be any UTF-8 text, as in Clojure.
+    try expectOutput("(let [λ 2 café :crème] [(* λ λ) café 'π/τ])", "[4 :crème π/τ]");
 }
 
 test "integration: loop*/recur" {

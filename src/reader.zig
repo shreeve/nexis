@@ -131,7 +131,7 @@ pub const ErrorKind = enum {
     invalid_symbol,
     invalid_keyword,
     unknown_reader_construct,
-    /// A string literal's bytes are not UTF-8.
+    /// A string, symbol or keyword's bytes are not UTF-8.
     invalid_utf8,
     /// Nesting deeper than the native stack's budget (`src/stack.zig`).
     nesting_too_deep,
@@ -298,6 +298,7 @@ pub const Reader = struct {
         if (raw.len < 2 or raw[0] != ':') {
             return self.fail(.invalid_keyword, span, raw);
         }
+        if (!std.unicode.utf8ValidateSlice(raw)) return self.fail(.invalid_utf8, span, null);
         const body = raw[1..];
         const name = splitNamespace(body) orelse
             return self.fail(.invalid_keyword, span, raw);
@@ -311,6 +312,7 @@ pub const Reader = struct {
         if (std.mem.eql(u8, raw, "nil")) return try self.makeForm(.nil, span);
         if (std.mem.eql(u8, raw, "true")) return try self.makeForm(.{ .bool_ = true }, span);
         if (std.mem.eql(u8, raw, "false")) return try self.makeForm(.{ .bool_ = false }, span);
+        if (!std.unicode.utf8ValidateSlice(raw)) return self.fail(.invalid_utf8, span, null);
         const name = splitNamespace(raw) orelse
             return self.fail(.invalid_symbol, span, raw);
         return try self.makeForm(.{ .symbol = name }, span);
@@ -1328,6 +1330,13 @@ test "duplicate literal detection is linear in the literal's size" {
             try std.testing.expectEqualStrings("(keyword :k7)", rd.err.?.detail.?);
         }
     }
+}
+
+test "symbols and keywords take any UTF-8 character" {
+    try expectReads("(λ ns.é/π :ключ :a/ß)", "(list (symbol λ) (symbol ns.é/π) (keyword :ключ) (keyword :a/ß))\n");
+    try expectReaderError("1é", .bad_number_literal, "1é");
+    try expectReaderError("(a\xff)", .invalid_utf8, null);
+    try expectReaderError(":k\xc3", .invalid_utf8, null);
 }
 
 test "keyword starting with `-` is accepted" {

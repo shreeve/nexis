@@ -181,19 +181,20 @@ pub const Lexer = struct {
         return c == '0' or c == '1';
     }
 
-    /// Clojure-style symbol start: letters, underscore, and the accepted
-    /// symbolic chars. `-` is handled at the dispatch level so we can
-    /// disambiguate negative numbers.
+    /// Clojure-style symbol start: letters, underscore, the accepted
+    /// symbolic chars, and every byte of a non-ASCII UTF-8 character
+    /// (the reader validates the sequence). `-` is handled at the
+    /// dispatch level so we can disambiguate negative numbers.
     inline fn isIdentStart(c: u8) bool {
         return switch (c) {
-            'a'...'z', 'A'...'Z', '_', '!', '$', '%', '&', '*', '+', '.', '/', '<', '=', '>', '?' => true,
+            'a'...'z', 'A'...'Z', '_', '!', '$', '%', '&', '*', '+', '.', '/', '<', '=', '>', '?', 0x80...0xFF => true,
             else => false,
         };
     }
 
     inline fn isIdentCont(c: u8) bool {
         return switch (c) {
-            'a'...'z', 'A'...'Z', '0'...'9', '_', '!', '$', '%', '&', '*', '+', '-', '.', '/', ':', '<', '=', '>', '?', '\'', '#' => true,
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '!', '$', '%', '&', '*', '+', '-', '.', '/', ':', '<', '=', '>', '?', '\'', '#', 0x80...0xFF => true,
             else => false,
         };
     }
