@@ -1226,7 +1226,8 @@ fn mapOf(heap: *heap_mod.Heap, kvs: []const value_mod.Value) !value_mod.Value {
 /// A macro's result as a form, every form at `origin` (the call's
 /// span) in `ctx.allocator`: the inverse of `formToValue`, a bignum
 /// within i64 an `int` and beyond it a `bigint`. The list
-/// `(nexis.internal/#%meta x m)` becomes `^m x` (§5). A function, a
+/// `(nexis.internal/#%meta x m)` becomes `^m x`, and so does a list,
+/// vector, map or set carrying the metadata `m` (§5). A function, a
 /// Var or any other kind is not a form.
 pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) ExpandError!*Form {
     try checkStack();
@@ -1272,7 +1273,16 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) Exp
         },
         else => return ctx.fail(origin, "a macro returned a {s}, which is not a form", .{@tagName(v.kind())}),
     };
-    return makeForm(ctx, datum, origin);
+    const form = try makeForm(ctx, datum, origin);
+    const carries_meta = switch (v.kind()) {
+        .list, .persistent_vector, .persistent_map, .persistent_set => datum != .with_meta,
+        else => false,
+    };
+    if (carries_meta) if (heap_mod.Heap.asHeapHeader(v).getMeta()) |m| {
+        const meta = try valueToForm(ctx, champ_mod.valueFromMapHeader(m), origin);
+        return makeForm(ctx, .{ .with_meta = .{ .target = form, .meta = meta } }, origin);
+    };
+    return form;
 }
 
 /// An interned `ns/name` text as a qualified name.
@@ -2429,15 +2439,20 @@ fn syntaxQuote(ctx: *ExpandContext, scope: *GensymScope, payload: *const Form) E
         // The `fn*` form a `#()` stands for; its `%` parameters stay
         // bare (see the symbol arm).
         .anon_fn => |items| try syntaxQuote(ctx, scope, try anonFnForm(ctx, payload, items)),
-        // `^m x` builds the list `(nexis.internal/#%meta x m)`, which
-        // a macro's result turns back into `^m x`: a symbol value
-        // cannot carry the metadata itself (`(def ^:private ~name ...)`).
-        .with_meta => |wm| b.list(.{
-            "#%list",
-            try b.list(.{ "quote", "nexis.internal/#%meta" }),
-            try syntaxQuote(ctx, scope, wm.target),
-            try syntaxQuote(ctx, scope, wm.meta),
-        }),
+        // `^m coll` is the collection carrying `m`, as in Clojure.
+        // Any other `^m x` builds the list `(nexis.internal/#%meta x
+        // m)`, which a macro's result turns back into `^m x`: a symbol
+        // value cannot carry the metadata itself (`(def ^:private
+        // ~name ...)`).
+        .with_meta => |wm| switch (wm.target.datum) {
+            .list, .vector, .map, .set => b.list(.{ "nexis.core/with-meta", try syntaxQuote(ctx, scope, wm.target), try syntaxQuote(ctx, scope, wm.meta) }),
+            else => b.list(.{
+                "#%list",
+                try b.list(.{ "quote", "nexis.internal/#%meta" }),
+                try syntaxQuote(ctx, scope, wm.target),
+                try syntaxQuote(ctx, scope, wm.meta),
+            }),
+        },
         // Clojure's rule: the inner syntax-quote becomes its
         // construction form first, in its own gensym scope, and the
         // outer one quotes that, so `~~x` is unquoted by the outer.

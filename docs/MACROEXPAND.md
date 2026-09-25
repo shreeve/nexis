@@ -305,6 +305,7 @@ sq(#{a})             → (#%set sq(a))
 sq('x)               → (#%list 'quote sq(x))            ; `'a → (quote user/a)
 sq(@x)               → (#%list 'nexis.core/deref sq(x))
 sq(#(...))           → sq of the fn* form it stands for
+sq(^m coll)          → (nexis.core/with-meta sq(coll) sq(m))  ; a list, vector, map or set
 sq(^m x)             → (#%list 'nexis.internal/#%meta sq(x) sq(m))
 sq(`x)               → sq(sq'(x))   ; the inner in a gensym scope of its own
 ```
@@ -317,7 +318,11 @@ macro can write a macro:
 
 The list a syntax-quoted `^m x` builds turns back into `^m x` when a
 macro's result becomes a form, so `` `(def ^:private ~name 1) ``
-defines a private Var although a symbol value carries no metadata.
+defines a private Var although a symbol value carries no metadata. A
+collection carries its metadata itself, as in Clojure:
+`` (meta `^:foo [1 2]) `` is `{:foo true}`, and a list, vector, map
+or set a macro returns with metadata becomes `^m coll` again, so the
+metadata survives into the code the macro writes.
 
 **Splicing.** Inside a collection with a `~@`, runs of ordinary
 elements become `(#%list ...)` segments, each `~@x` a segment of its

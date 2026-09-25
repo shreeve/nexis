@@ -299,6 +299,10 @@ test "metadata: hints in binding positions are dropped, ^meta on a collection li
     // ^meta inside syntax-quote reaches the definition the macro writes.
     try expectOutputProgram("(defmacro defp [n] `(def ^:private ~n 1)) (defp hidden) [hidden (:private (meta (var hidden)))]", "[1 true]");
     try expectOutputProgram("(defmacro lethint [v] `(let [^String x# ~v] x#)) (lethint 5)", "5");
+    // A syntax-quoted collection with ^meta is that collection carrying it.
+    try expectOutput("[`^:foo [1 2] (meta `^:foo [1 2]) (meta `^{:k 1} {:a 1}) (meta `^:s #{1}) (meta `^:l (a b))]", "[[1 2] {:foo true} {:k 1} {:s true} {:l true}]");
+    try expectOutputProgram("(defmacro mv [] `(meta ^:foo [1 2])) (mv)", "{:foo true}");
+    try expectOutputProgram("(defmacro wm [] (with-meta [1 2] {:w 1})) [(wm) (meta (wm))]", "[[1 2] {:w 1}]");
 }
 
 test "integration: defn forward reference (Var late-binding)" {
