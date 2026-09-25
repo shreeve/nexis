@@ -608,6 +608,17 @@ Built above these primitives (PLAN §21 Phase 4): `(with-tx ...)` /
 per-connection `TreeId` cache. Datomic-style `as-of` db-values are
 Nextomic's (`docs/NEXTOMIC.md` §4).
 
+**A callback holds its transaction.** `db/alter!` calls `f` and
+`db/reduce-tree` calls its reducing function while they use the
+transaction (a read before the write, a cursor between entries).
+Each holds the transaction handle for the call: `db/commit!`,
+`db/abort-write!`, `db/abort-read!` and `db/release-snapshot!` of a
+held handle are `:db/busy`, so no callback finishes a transaction a
+native is still using. A throw from the callback ends the hold before
+it propagates, so `with-tx` aborts as usual. Reads and writes through
+the handle inside the callback, including a nested `db/alter!`, are
+allowed.
+
 Absent:
 
 - Cursors as raw Values — PLAN §15.8; `db/scan` and `db/reduce-tree`

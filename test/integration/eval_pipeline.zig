@@ -2282,6 +2282,28 @@ test "db/close: refused while a transaction of the connection is open" {
     , "[:db/busy nil :db/busy nil nil :tx-closed]");
 }
 
+test "db: a callback cannot finish the transaction db/alter! or db/reduce-tree is running it in" {
+    try expectOutputProgramWithStore("held-tx",
+        \\(do
+        \\  (def c (db/open "@STORE@"))
+        \\  (def r (db/ref c :t "k0"))
+        \\  (with-tx [tx c] (dotimes [i 300] (db/put! tx (db/ref c :t (str "k" i)) i)))
+        \\  [(try (with-tx [tx c] (db/alter! tx r (fn [v] (db/abort-write! tx) (inc v)))) (catch any e e))
+        \\   (try (with-tx [tx c] (db/alter! tx r (fn [v] (db/commit! tx) (inc v)))) (catch any e e))
+        \\   (with-tx [tx c] (db/alter! tx r (fn [v] (db/alter! tx (db/ref c :t "k1") inc) (inc v))))
+        \\   [(db/get-key r) (db/get-key (db/ref c :t "k1"))]
+        \\   (let [wt (db/begin-write c)]
+        \\     [(try (db/reduce-tree wt :t (fn [a k v] (when (= a 0) (db/abort-write! wt)) (inc a)) 0) (catch any e e))
+        \\      (db/reduce-tree wt :t (fn [a k v] (inc a)) 0)
+        \\      (db/commit! wt)])
+        \\   (let [rt (db/begin-read c)]
+        \\     [(try (db/reduce-tree rt :t (fn [a k v] (when (= a 0) (db/abort-read! rt)) (inc a)) 0) (catch any e e))
+        \\      (db/snapshot? rt)
+        \\      (db/abort-read! rt)
+        \\      (db/snapshot? rt)])])
+    , "[:db/busy :db/busy 1 [1 2] [:db/busy 300 nil] [:db/busy true nil false]]");
+}
+
 test "db/close: a stale ref never reaches a store opened after the close" {
     var a = try SeamStore.init("stale-a");
     defer a.deinit();
