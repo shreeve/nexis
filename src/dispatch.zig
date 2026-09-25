@@ -127,7 +127,7 @@ pub fn heapHashBase(v: Value) u64 {
     const base: u64 = switch (k) {
         .string => string.hashHeader(h),
         .bignum => bignum.hashHeader(h),
-        .list => list.hashSeq(h, &hashValue),
+        .list => list.hashSeq(v, &hashValue),
         .persistent_vector => vector.hashSeq(h, &hashValue),
         .persistent_map => champ.hashMap(h, &hashValue),
         .persistent_set => champ.hashSet(h, &hashValue),
@@ -166,7 +166,7 @@ pub fn equal(a: Value, b: Value) bool {
     return switch (ka) {
         .string => string.bytesEqual(ah, bh),
         .bignum => bignum.limbsEqual(ah, bh),
-        .list => list.equalSeq(ah, bh, &equal),
+        .list => list.equalSeq(a, b, &equal),
         .persistent_vector => vector.equalSeq(ah, bh, &equal),
         .persistent_map => champ.equalMap(ah, bh, &hashValue, &equal),
         .persistent_set => champ.equalSet(ah, bh, &hashValue, &equal),

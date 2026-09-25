@@ -302,6 +302,13 @@ Mirrors PLAN §6.5.
 
 These determine the ergonomic feel of idiomatic nexis code and are frozen.
 
+The seq of a vector is a view, not a copy: `seq`, `rest`, `next`,
+`nthrest`, `nthnext` and `drop` of a vector take O(1) time and space
+whatever its length (`docs/LIST.md` §1), so `(loop [v v] (when (seq v)
+... (recur (pop v))))` is linear. The view is a list to everything
+else: `seq?` is true, it prints as `(...)`, it is `=` to and hashes as
+the list of the same elements, and the codec encodes it as a list.
+
 Two further sequence rules follow Clojure exactly and are easy to
 get backwards:
 

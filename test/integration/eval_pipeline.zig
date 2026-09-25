@@ -713,6 +713,24 @@ test "integration: native rest — nil/list/vector" {
     try expectOutput("(rest [10 20 30])", "(20 30)");
 }
 
+test "integration: seq, rest, next, nthrest and nth over a vector view" {
+    // LIST.md §1: the seq of a vector is an O(1) view; it is a list
+    // to every consumer.
+    try expectOutput("(seq [])", "nil");
+    try expectOutput("(rest [])", "()");
+    try expectOutput("(rest [1])", "()");
+    try expectOutput("(next [1])", "nil");
+    try expectOutput("(let [s (seq [1 2 3])] [s (seq? s) (count s) (rest s) (next (next s)) (next (next (next s)))])", "[(1 2 3) true 3 (2 3) (3) nil]");
+    try expectOutput("(let [v (vec (range 40))] [(nthnext v 38) (drop 38 v) (nthrest v 99) (nthnext v 40) (nth (rest v) 34) (nth (rest v) 39 :none)])", "[(38 39) (38 39) () nil 35 :none]");
+    try expectOutput("(let [v (vec (range 1100))] [(= (rest v) (range 1 1100)) (= (hash (drop 1056 v)) (hash (range 1056 1100))) (= (seq v) v)])", "[true true true]");
+    try expectOutput("(let [s (rest [1 2 3])] [(cons 0 s) (conj s 0) (apply + s) (into [] s) (reduce + s) (pr-str s) {s :k}])", "[(0 2 3) (0 2 3) 5 [2 3] 5 (2 3) {(2 3) :k}]");
+    try expectOutput("(let [[a & more] (rest [1 2 3 4])] [a more])", "[2 (3 4)]");
+    try expectOutput("(let [s (rest [1 2 3])] [(meta (with-meta s {:a 1})) (meta (rest (with-meta s {:a 1}))) (meta (seq (with-meta [1] {:b 2}))) (with-meta s {:a 1})])", "[{:a 1} nil nil (2 3)]");
+    // Emptying a vector with a seq test each step is linear.
+    try expectOutput("(loop [v (vec (range 3000))] (if (seq v) (recur (pop v)) (count v)))", "0");
+    try expectOutput("(loop [s (seq (vec (range 3000))) n 0] (if s (recur (next s) (+ n (first s))) n))", "4498500");
+}
+
 test "integration: native count — nil/list/vector/map/set" {
     try expectOutput("(count nil)", "0");
     try expectOutput("(count (list))", "0");
@@ -4505,6 +4523,13 @@ test "gc: reduce, reductions, sort-by, max-key, repeatedly and iterate survive c
     try expectOutputUnderGc(churn ++ "(apply max-key (fn [x] (churn x) (count (str x))) (range 30))", "29");
     try expectOutputUnderGc(churn ++ "(count (repeatedly 30 (fn [] (churn 1) (str \"r\"))))", "30");
     try expectOutputUnderGc(churn ++ "(last (iterate (fn [s] (churn s) (str s \"x\")) \"\" 20))", "xxxxxxxxxxxxxxxxxxx");
+}
+
+test "gc: a vector view alone keeps its vector alive across cycles" {
+    // LIST.md §1: nothing but the view block reaches the vector here.
+    try expectOutputUnderGc(churn ++ "(reduce (fn [acc x] (churn x) (str acc x)) \"\" (rest (mapv str (range 30))))", "1234567891011121314151617181920212223242526272829");
+    try expectOutputUnderGc(churn ++ "(loop [s (seq (mapv str (range 60))) acc 0] (if s (do (churn 1) (recur (next s) (+ acc (count (first s))))) acc))", "110");
+    try expectOutputUnderGc(churn ++ "(let [s (drop 1050 (mapv str (range 1100)))] (churn 1) [(count s) (first s) (last s)])", "[50 1050 1099]");
 }
 
 /// A map receiver: every element a native sees is a `[k v]` entry
