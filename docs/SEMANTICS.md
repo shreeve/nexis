@@ -209,9 +209,9 @@ collection.
 
 #### 2.7 Values nested deeper than the native stack
 
-`=` and `hash` recurse on nesting depth on the native stack. Past the
-stack guard (`src/stack.zig`) they do not fault: the step that ran out
-answers `false` or `0` and counts an overflow (`dispatch.overflowCount`), and the VM turns a
+`=`, `hash` and printing recurse on nesting depth on the native stack.
+Past the stack guard (`src/stack.zig`) they do not fault: the step that
+ran out answers `false`, `0` or a `#<too deep>` marker and counts an overflow (`dispatch.overflowCount`), and the VM turns a
 count that changed across a native call or opcode into the catchable
 `:stack-overflow` (`docs/VM.md` §13.1). A map, set or record whose hash
 was computed past an overflow keeps no cached hash, so the wrong answer
@@ -346,13 +346,15 @@ For every value kind, a **pr-style** textual representation exists such that:
 - `list`, `vector`, `map`, `set` — yes, recursively.
 - `typed-vector` — no. It prints as `#i64[1 2 3]` / `#f64[1.0 2.0]`,
   which the reader rejects at the `#`; the codec is its round trip.
+- `record` — no. It prints as `#ns.Type{:field value, ...}` in both
+  modes, as Clojure does; the reader has no tagged literals.
 - `durable-ref` — no. It prints as the opaque token
   `#<durable-ref :<tree> hex:<key-bytes>>`, which does not read back.
 
 #### 6.2 Which kinds do **not** round-trip
 
-- `function`/`closure`, `var`, `transient`, `atom`, record, protocols,
-  the db and Nextomic handles. These print as `#<...>` markers (a var as
+- `function`/`closure`, `var`, `transient`, `atom`, protocols, the db
+  and Nextomic handles. These print as `#<...>` markers (a var as
   `#'ns/name`) for debugging but do not parse back. Matches PLAN §15.10
   "not serializable".
 

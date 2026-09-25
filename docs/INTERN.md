@@ -88,6 +88,12 @@ pub const Interner = struct {
 
     pub fn keywordCount(self: *const Interner) u32;
     pub fn symbolCount (self: *const Interner) u32;
+
+    // Record type names, by dense per-VM type id: the printer's source
+    // for `#ns.Type{...}` (PROTOCOLS.md §2.1). The VM names each type
+    // as it registers it; an id never named reads back null.
+    pub fn nameRecordType(self: *Interner, type_id: u32, ns: []const u8, name: []const u8) !void;
+    pub fn recordTypeName(self: *const Interner, type_id: u32) ?[]const u8;
 };
 ```
 

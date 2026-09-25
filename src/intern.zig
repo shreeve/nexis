@@ -109,6 +109,10 @@ pub const Interner = struct {
     gpa: Allocator,
     keyword: Table = .{},
     symbol: Table = .{},
+    /// `ns.Type` of each record type, by its dense per-VM type id; an
+    /// empty slice for an id not yet named. The printer's source for
+    /// `#ns.Type{...}` (INTERN.md §2).
+    record_types: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub fn init(gpa: Allocator) Interner {
         return .{ .gpa = gpa };
@@ -117,7 +121,29 @@ pub const Interner = struct {
     pub fn deinit(self: *Interner) void {
         self.keyword.deinit(self.gpa);
         self.symbol.deinit(self.gpa);
+        for (self.record_types.items) |name| self.gpa.free(name);
+        self.record_types.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    // ---- Record type names ----
+
+    /// Name record type `type_id` as `ns.name`, the way Clojure
+    /// prints a record's class.
+    pub fn nameRecordType(self: *Interner, type_id: u32, ns: []const u8, name: []const u8) Allocator.Error!void {
+        const full = try std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ ns, name });
+        errdefer self.gpa.free(full);
+        while (self.record_types.items.len <= type_id) try self.record_types.append(self.gpa, &.{});
+        self.gpa.free(self.record_types.items[type_id]);
+        self.record_types.items[type_id] = full;
+    }
+
+    /// The `ns.Type` name of record type `type_id`, or null when the
+    /// type was never named.
+    pub fn recordTypeName(self: *const Interner, type_id: u32) ?[]const u8 {
+        if (type_id >= self.record_types.items.len) return null;
+        const name = self.record_types.items[type_id];
+        return if (name.len == 0) null else name;
     }
 
     // ---- Raw intern: name -> id ----
@@ -296,6 +322,18 @@ test "splitQualified: first slash; bare / is unqualified" {
         if (c.ns) |ns| try testing.expectEqualStrings(ns, got.ns.?) else try testing.expect(got.ns == null);
         try testing.expectEqualStrings(c.name, got.name);
     }
+}
+
+test "record type names: named ids print as ns.Type, others are null" {
+    var it = Interner.init(testing.allocator);
+    defer it.deinit();
+    try testing.expect(it.recordTypeName(0) == null);
+    try it.nameRecordType(2, "my.app", "Point");
+    try testing.expectEqualStrings("my.app.Point", it.recordTypeName(2).?);
+    try testing.expect(it.recordTypeName(0) == null);
+    try testing.expect(it.recordTypeName(3) == null);
+    try it.nameRecordType(2, "user", "P");
+    try testing.expectEqualStrings("user.P", it.recordTypeName(2).?);
 }
 
 test "by_name lookups survive names reallocation" {

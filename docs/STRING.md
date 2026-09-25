@@ -391,6 +391,8 @@ pub fn formatToString(
 | char | UTF-8 encoded scalar | named tokens (`\space`, `\newline`, `\tab`, `\return`, `\formfeed`, `\backspace`, `\\`), printable ASCII as `\x`, NUL + non-printable as `\u{HEX}` |
 | atom / function / native-fn / var / durable-ref / transient / connection / tx | OPAQUE (`#<atom>`, `#<fn>`, `#<native-fn NAME>`, `#'name`, `#<durable-ref :tree/key>`, ...) | OPAQUE (same; intentionally NOT reader-round-trippable — these are identity-valued/process-local kinds) |
 | collections | recursive in same mode | recursive in same mode |
+| record | `#ns.Type{:k v, ...}`, fields in display mode (`docs/PROTOCOLS.md` §2.1) | `#ns.Type{:k v, ...}`, fields readable; does not read back |
+| a collection nested past the native stack guard | `#<too deep>`, and the VM raises `:stack-overflow` (SEMANTICS §2.7) | same |
 | malformed UTF-8 in string | passes through bytes unchanged | `:utf8-error` (readable mode must not emit invalid source) |
 
 **`format` is purely presentation, not serialization.** The codec
