@@ -109,6 +109,7 @@ see. Mirrors PLAN §28.3 exactly.
 | `~@x` outside `` `...` `` | **reader error**: `:unquote-splice-outside-syntax-quote` |
 | `42N`, `0xFFN`, `18446744073709551616N` | the integer, as without the suffix: `(int 42)`, `(int 255)`, `(bigint 18446744073709551616)` |
 | `1abc`, `1-2`, `1.5x`, `1/2`, `1.`, `0x`, `3.14M` | **reader error**: `:bad-number-literal`, detail the token's text |
+| a form nested past the native stack's budget | **reader error**: `:nesting-too-deep` (`src/stack.zig`) |
 
 **Number token boundary.** A token that begins with a digit, or with
 `-` and a digit, ends where a symbol would: at whitespace, a comma,
@@ -312,6 +313,9 @@ quirks, not contract.
   (`docs/MACROEXPAND.md` §9) owns positional-arg scanning and
   `(fn* [...] body)` synthesis. Nested `#(...)` is rejected by the reader
   because nesting would ambiguate placeholder scoping.
+- **Duplicate-literal detection cost.** Literal keys and elements are
+  hashed, so the check and the merge of a `^` chain are linear in the
+  literal's size.
 - **Duplicate-literal detection for numeric keys.** The reader's
   `formLiteralEq` compares `real`s with naive `==`, meaning `{0.0 x -0.0
   y}` is flagged as a duplicate. The runtime's canonical-NaN equality

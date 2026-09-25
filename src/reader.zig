@@ -40,6 +40,7 @@ const std = @import("std");
 /// see `src/parser.zig`.
 pub const parser = @import("parser.zig");
 const nexis = @import("nexis.zig");
+const stack = @import("stack.zig");
 
 pub const Tag = nexis.Tag;
 pub const Sexp = parser.Sexp;
@@ -131,6 +132,8 @@ pub const ErrorKind = enum {
     invalid_symbol,
     invalid_keyword,
     unknown_reader_construct,
+    /// Nesting deeper than the native stack's budget (`src/stack.zig`).
+    nesting_too_deep,
 };
 
 pub const Error = struct {
@@ -172,8 +175,8 @@ pub const Reader = struct {
     /// Normalize a top-level `(program forms...)` sexp into a slice of
     /// Forms.
     pub fn readProgram(self: *Reader, tree: Sexp) ReaderError![]const *Form {
-        const items = try self.requireCompound(tree, .program);
-        return try self.readFormsList(items);
+        if (!tree.isKind(.program)) return self.fail(.unknown_reader_construct, sexpSpan(tree), null);
+        return try self.readFormsList(tree.items()[1..]);
     }
 
     /// Normalize a single `form` sexp into one `*Form`.
@@ -185,42 +188,46 @@ pub const Reader = struct {
     // Core dispatch
     // -------------------------------------------------------------------------
 
+    /// Every list the grammar builds is a tag followed by its tokens and
+    /// forms: an atom holds its one token, a compound its children
+    /// between its delimiter tokens, a prefix form its token and its
+    /// target (`nexis.grammar`).
     fn readForm(self: *Reader, s: Sexp) ReaderError!*Form {
-        const items = switch (s) {
-            .list => |l| l.items(),
-            else => return self.fail(.unknown_reader_construct, srcSpan(s), null),
-        };
-        if (items.len == 0 or items[0] != .tag) {
-            return self.fail(.unknown_reader_construct, srcSpan(s), null);
-        }
+        stack.check() catch return self.fail(.nesting_too_deep, sexpSpan(s), null);
+        const items = s.items();
+        if (items.len < 2 or items[0] != .tag or items[1] != .src)
+            return self.fail(.unknown_reader_construct, sexpSpan(s), null);
         const tag: Tag = items[0].tag;
-        // An atom's one child is its token; a compound's leading and
-        // trailing token children are its delimiters, kept by the
-        // grammar so the compound's span covers them (§ srcSpan).
-        const args = switch (tag) {
-            .int, .real, .string, .char, .keyword, .symbol => items[1..],
-            else => withoutDelimiters(items[1..]),
-        };
-        return switch (tag) {
-            .int => try self.readInt(args, srcSpan(s)),
-            .real => try self.readReal(args, srcSpan(s)),
-            .string => try self.readString(args, srcSpan(s)),
-            .char => try self.readChar(args, srcSpan(s)),
-            .keyword => try self.readKeyword(args, srcSpan(s)),
-            .symbol => try self.readSymbol(args, srcSpan(s)),
-            .list => try self.readCollection(.list, args, srcSpan(s)),
-            .vector => try self.readCollection(.vector, args, srcSpan(s)),
-            .map => try self.readMap(args, srcSpan(s)),
-            .set => try self.readSet(args, srcSpan(s)),
-            .quote => try self.readReaderMacro(.quote, args, srcSpan(s)),
-            .@"syntax-quote" => try self.readSyntaxQuote(args, srcSpan(s)),
-            .unquote => try self.readUnquote(.unquote, args, srcSpan(s)),
-            .@"unquote-splicing" => try self.readUnquote(.@"unquote-splicing", args, srcSpan(s)),
-            .deref => try self.readReaderMacro(.deref, args, srcSpan(s)),
-            .@"anon-fn" => try self.readAnonFn(args, srcSpan(s)),
-            .@"with-meta-raw" => try self.readWithMetaRaw(args, srcSpan(s)),
-            .program => self.fail(.unknown_reader_construct, srcSpan(s), "nested (program ...) not allowed"),
-        };
+        switch (tag) {
+            .int, .real, .string, .char, .keyword, .symbol => {
+                const span = tokenSpan(items[1].src);
+                const text = self.source[span.pos..][0..span.len];
+                return switch (tag) {
+                    .int => self.readInt(text, span),
+                    .real => self.readReal(text, span),
+                    .string => self.readString(text, span),
+                    .char => self.readChar(text, span),
+                    .keyword => self.readKeyword(text, span),
+                    .symbol => self.readSymbol(text, span),
+                    else => unreachable,
+                };
+            },
+            .list, .vector, .map, .set, .@"anon-fn" => {
+                const span = sexpSpan(s);
+                const children = items[2 .. items.len - 1];
+                return switch (tag) {
+                    .list => self.makeForm(.{ .list = try self.readFormsList(children) }, span),
+                    .vector => self.makeForm(.{ .vector = try self.readFormsList(children) }, span),
+                    .map => self.readMap(children, span),
+                    .set => self.readSet(children, span),
+                    .@"anon-fn" => self.readAnonFn(children, span),
+                    else => unreachable,
+                };
+            },
+            .quote, .deref, .@"syntax-quote", .unquote, .@"unquote-splicing" => return self.readPrefix(tag, s),
+            .@"with-meta-raw" => return self.readWithMetaRaw(s),
+            .program => return self.fail(.unknown_reader_construct, sexpSpan(s), "nested (program ...) not allowed"),
+        }
     }
 
     fn readFormsList(self: *Reader, items: []const Sexp) ReaderError![]const *Form {
@@ -238,8 +245,7 @@ pub const Reader = struct {
     /// the text as detail. Clojure's `N` suffix names an arbitrary-
     /// precision integer; nexis has one integer domain (SEMANTICS.md
     /// §2), so `42N` reads exactly as `42` does.
-    fn readInt(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        const text = expectSrcText(self, args, span) catch |e| return e;
+    fn readInt(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
         const digits = if (text.len > 1 and text[text.len - 1] == 'N') text[0 .. text.len - 1] else text;
         if (parseIntLiteral(digits)) |value| return try self.makeForm(.{ .int = value }, span);
         const decimal = self.bigIntLiteral(digits) orelse
@@ -259,15 +265,14 @@ pub const Reader = struct {
         return n.toString(alloc, 10, .lower) catch null;
     }
 
-    fn readReal(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        const text = try expectSrcText(self, args, span);
+    fn readReal(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
         const value = std.fmt.parseFloat(f64, text) catch
             return self.fail(.bad_number_literal, span, text);
         return try self.makeForm(.{ .real = value }, span);
     }
 
-    fn readString(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        const raw = try expectSrcText(self, args, span);
+    fn readString(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
+        const raw = text;
         if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') {
             return self.fail(.invalid_string_escape, span, raw);
         }
@@ -276,8 +281,8 @@ pub const Reader = struct {
         return try self.makeForm(.{ .string = decoded }, span);
     }
 
-    fn readChar(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        const raw = try expectSrcText(self, args, span);
+    fn readChar(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
+        const raw = text;
         if (raw.len < 2 or raw[0] != '\\') {
             return self.fail(.invalid_char_literal, span, raw);
         }
@@ -287,8 +292,8 @@ pub const Reader = struct {
         return try self.makeForm(.{ .char = scalar }, span);
     }
 
-    fn readKeyword(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        const raw = try expectSrcText(self, args, span);
+    fn readKeyword(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
+        const raw = text;
         if (raw.len < 2 or raw[0] != ':') {
             return self.fail(.invalid_keyword, span, raw);
         }
@@ -298,8 +303,8 @@ pub const Reader = struct {
         return try self.makeForm(.{ .keyword = name }, span);
     }
 
-    fn readSymbol(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        const raw = try expectSrcText(self, args, span);
+    fn readSymbol(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
+        const raw = text;
         // nil / true / false are lexed as symbols and normalized here
         // (FORMS.md §3 — also PLAN §28.2).
         if (std.mem.eql(u8, raw, "nil")) return try self.makeForm(.nil, span);
@@ -314,196 +319,131 @@ pub const Reader = struct {
     // Compound readers
     // -------------------------------------------------------------------------
 
-    fn readCollection(self: *Reader, comptime kind: @TypeOf(.list), args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        const children = try self.readFormsList(args);
-        const datum: Datum = switch (kind) {
-            .list => .{ .list = children },
-            .vector => .{ .vector = children },
-            else => unreachable,
-        };
-        return try self.makeForm(datum, span);
-    }
-
-    fn readMap(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        const children = try self.readFormsList(args);
+    fn readMap(self: *Reader, items: []const Sexp, span: SrcSpan) ReaderError!*Form {
+        const children = try self.readFormsList(items);
         if (children.len % 2 != 0) {
             return self.fail(.map_odd_count, span, null);
         }
-        // Duplicate-literal-key check: look at every even-index key form; if
-        // it's a compile-time literal, ensure no earlier key equals it
-        // under the reader's literal-equality rules.
-        var i: usize = 0;
-        while (i < children.len) : (i += 2) {
-            const k = children[i];
-            if (!isLiteralKey(k)) continue;
-            var j: usize = 0;
-            while (j < i) : (j += 2) {
-                const prior = children[j];
-                if (!isLiteralKey(prior)) continue;
-                if (formLiteralEq(prior, k)) {
-                    const detail = try self.formatLiteralKey(k);
-                    return self.fail(.duplicate_literal_key, span, detail);
-                }
-            }
-        }
+        if (try self.firstDuplicate(children, 2)) |k|
+            return self.fail(.duplicate_literal_key, span, try self.formatLiteralKey(k));
         return try self.makeForm(.{ .map = children }, span);
     }
 
-    fn readSet(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        const children = try self.readFormsList(args);
-        // Duplicate-literal-element check (same rules as map keys).
-        for (children, 0..) |c, i| {
-            if (!isLiteralKey(c)) continue;
-            for (children[0..i]) |p| {
-                if (!isLiteralKey(p)) continue;
-                if (formLiteralEq(p, c)) {
-                    const detail = try self.formatLiteralKey(c);
-                    return self.fail(.duplicate_literal_element, span, detail);
-                }
-            }
-        }
+    fn readSet(self: *Reader, items: []const Sexp, span: SrcSpan) ReaderError!*Form {
+        const children = try self.readFormsList(items);
+        if (try self.firstDuplicate(children, 1)) |e|
+            return self.fail(.duplicate_literal_element, span, try self.formatLiteralKey(e));
         return try self.makeForm(.{ .set = children }, span);
+    }
+
+    /// The first literal among `forms[0]`, `forms[stride]`, ... equal
+    /// to an earlier one (FORMS.md §3, "Duplicate detection rule").
+    fn firstDuplicate(self: *Reader, forms: []const *Form, stride: usize) ReaderError!?*const Form {
+        var seen: LiteralSet = .empty;
+        defer seen.deinit(self.allocator());
+        var i: usize = 0;
+        while (i < forms.len) : (i += stride) {
+            if (!isLiteralKey(forms[i])) continue;
+            if ((try seen.getOrPut(self.allocator(), forms[i])).found_existing) return forms[i];
+        }
+        return null;
     }
 
     // -------------------------------------------------------------------------
     // Reader macros
     // -------------------------------------------------------------------------
 
-    fn readReaderMacro(self: *Reader, comptime kind: @TypeOf(.quote), args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        if (args.len != 1) {
-            return self.fail(.unknown_reader_construct, span, "reader-macro arity");
+    /// `'x`, `@x`, `` `x ``, `~x`, `~@x`: the span runs from the prefix
+    /// token to the end of the target, known once the target is read.
+    fn readPrefix(self: *Reader, tag: Tag, s: Sexp) ReaderError!*Form {
+        const items = s.items();
+        switch (tag) {
+            .@"syntax-quote" => self.syntax_quote_depth += 1,
+            .unquote, .@"unquote-splicing" => {
+                if (self.syntax_quote_depth == 0) {
+                    const kind: ErrorKind = if (tag == .unquote) .unquote_outside_syntax_quote else .unquote_splice_outside_syntax_quote;
+                    return self.fail(kind, sexpSpan(s), null);
+                }
+                // The target of `~`/`~@` leaves syntax-quote scope, as in
+                // Clojure's reader.
+                self.syntax_quote_depth -= 1;
+            },
+            else => {},
         }
-        const inner = try self.readForm(args[0]);
-        const datum: Datum = switch (kind) {
+        defer switch (tag) {
+            .@"syntax-quote" => self.syntax_quote_depth -= 1,
+            .unquote, .@"unquote-splicing" => self.syntax_quote_depth += 1,
+            else => {},
+        };
+        const inner = try self.readForm(items[2]);
+        const datum: Datum = switch (tag) {
             .quote => .{ .quote = inner },
             .deref => .{ .deref = inner },
-            else => unreachable,
-        };
-        return try self.makeForm(datum, span);
-    }
-
-    fn readSyntaxQuote(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        if (args.len != 1) {
-            return self.fail(.unknown_reader_construct, span, "syntax-quote arity");
-        }
-        self.syntax_quote_depth += 1;
-        defer self.syntax_quote_depth -= 1;
-        const inner = try self.readForm(args[0]);
-        return try self.makeForm(.{ .syntax_quote = inner }, span);
-    }
-
-    fn readUnquote(self: *Reader, comptime kind: @TypeOf(.unquote), args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        if (args.len != 1) {
-            return self.fail(.unknown_reader_construct, span, "unquote arity");
-        }
-        if (self.syntax_quote_depth == 0) {
-            const error_kind: ErrorKind = switch (kind) {
-                .unquote => .unquote_outside_syntax_quote,
-                .@"unquote-splicing" => .unquote_splice_outside_syntax_quote,
-                else => unreachable,
-            };
-            return self.fail(error_kind, span, null);
-        }
-        // Inside `~`/`~@` the form "leaves" syntax-quote scope for its child
-        // (matching Clojure's reader).
-        self.syntax_quote_depth -= 1;
-        defer self.syntax_quote_depth += 1;
-        const inner = try self.readForm(args[0]);
-        const datum: Datum = switch (kind) {
+            .@"syntax-quote" => .{ .syntax_quote = inner },
             .unquote => .{ .unquote = inner },
             .@"unquote-splicing" => .{ .unquote_splicing = inner },
             else => unreachable,
         };
-        return try self.makeForm(datum, span);
+        return try self.makeForm(datum, spanTo(items[1].src.pos, inner.origin));
     }
 
-    fn readAnonFn(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
+    fn readAnonFn(self: *Reader, items: []const Sexp, span: SrcSpan) ReaderError!*Form {
         if (self.anon_fn_depth > 0) {
             return self.fail(.nested_anon_fn, span, null);
         }
         self.anon_fn_depth += 1;
         defer self.anon_fn_depth -= 1;
-        const body = try self.readFormsList(args);
+        const body = try self.readFormsList(items);
         return try self.makeForm(.{ .anon_fn = body }, span);
     }
 
-    fn readWithMetaRaw(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        if (args.len != 2) {
-            return self.fail(.unknown_reader_construct, span, "with-meta-raw arity");
-        }
-        const target_raw = args[0];
-        const meta_raw = args[1];
-
-        // Walk through stacked (with-meta-raw) forms left-to-right in source
-        // order, accumulating metadata maps; the innermost target is the
-        // final target. FORMS.md §3 specifies rightmost-wins on duplicate
-        // keys, which matches the order we encounter them because nested
-        // metadata grammar wraps outside-in.
+    /// `^M1 ^M2 x` arrives as `(with-meta-raw ^ (with-meta-raw ^ x M2) M1)`:
+    /// the chain is unwound to its innermost target, and the with-meta
+    /// Form spans from the first `^` to the end of that target.
+    fn readWithMetaRaw(self: *Reader, s: Sexp) ReaderError!*Form {
         var metas: std.ArrayList(Sexp) = .empty;
         defer metas.deinit(self.allocator());
-        try metas.append(self.allocator(), meta_raw);
-
-        var current = target_raw;
-        while (self.isCompoundWithTag(current, .@"with-meta-raw")) {
-            const inner_items = try self.requireCompound(current, .@"with-meta-raw");
-            if (inner_items.len != 2) {
-                return self.fail(.unknown_reader_construct, srcSpan(current), "nested with-meta-raw arity");
-            }
-            try metas.append(self.allocator(), inner_items[1]);
-            current = inner_items[0];
+        var current = s;
+        while (current.isKind(.@"with-meta-raw")) {
+            const items = current.items();
+            try metas.append(self.allocator(), items[3]);
+            current = items[2];
         }
         const target = try self.readForm(current);
+        const span = spanTo(s.items()[1].src.pos, target.origin);
         const merged = try self.mergeMetaChain(metas.items, span);
         return try self.makeForm(.{ .with_meta = .{ .target = target, .meta = merged } }, span);
     }
 
+    /// Merge a `^` chain's metadata into one map. `raw_metas` is outer
+    /// (source-leftmost) first. As Clojure's reader assoc's each outer
+    /// `^` onto the metadata of the form it wraps, the entries are
+    /// gathered innermost first and a literal key keeps its value from
+    /// its last occurrence, at that occurrence's place.
     fn mergeMetaChain(self: *Reader, raw_metas: []const Sexp, span: SrcSpan) ReaderError!*Form {
-        // raw_metas is in grammar nesting order (outer-first). For `^A ^B x`
-        // the grammar gives (with-meta-raw (with-meta-raw x B) A), which
-        // unwound above yields raw_metas = [A, B]. Source order is B-then-A
-        // textually, but per FORMS.md §3 rightmost (= latest source) wins,
-        // and the pretty-printer example in PLAN §28.5 (^:dynamic ^{:doc
-        // "hi"} *out* → {:dynamic true, :doc "hi"}) tells us the source-
-        // leftmost metadata goes first, rightmost overrides. Applying raw_
-        // metas in REVERSE gives source-left-first, source-right-last —
-        // exactly the "rightmost wins" semantics.
+        const alloc = self.allocator();
         var entries: std.ArrayList(*Form) = .empty;
-        errdefer entries.deinit(self.allocator());
         var i = raw_metas.len;
         while (i > 0) {
             i -= 1;
             const m = try self.readForm(raw_metas[i]);
             try self.appendMetaEntries(&entries, m, span);
         }
-        // Deduplicate by key — later entries (rightmost) win.
-        var deduped: std.ArrayList(*Form) = .empty;
-        errdefer deduped.deinit(self.allocator());
-        var idx: usize = 0;
-        while (idx < entries.items.len) : (idx += 2) {
-            const k = entries.items[idx];
-            const v = entries.items[idx + 1];
-            var last_v = v;
-            var j = idx + 2;
-            while (j < entries.items.len) : (j += 2) {
-                if (formLiteralEq(entries.items[j], k)) {
-                    last_v = entries.items[j + 1];
-                }
-            }
-            // Skip if this key appears later — it'll be emitted at its last
-            // occurrence.
-            var found_later = false;
-            j = idx + 2;
-            while (j < entries.items.len) : (j += 2) {
-                if (formLiteralEq(entries.items[j], k)) {
-                    found_later = true;
-                    break;
-                }
-            }
-            if (found_later) continue;
-            try deduped.append(self.allocator(), k);
-            try deduped.append(self.allocator(), last_v);
+        // Walk the pairs from the end, keeping each literal key's last
+        // occurrence, then restore source order.
+        var seen: LiteralSet = .empty;
+        defer seen.deinit(alloc);
+        const merged = try alloc.alloc(*Form, entries.items.len);
+        var n: usize = merged.len;
+        var j = entries.items.len;
+        while (j > 0) : (j -= 2) {
+            const k = entries.items[j - 2];
+            if (isLiteralKey(k) and (try seen.getOrPut(alloc, k)).found_existing) continue;
+            n -= 2;
+            merged[n] = k;
+            merged[n + 1] = entries.items[j - 1];
         }
-        return try self.makeForm(.{ .map = try deduped.toOwnedSlice(self.allocator()) }, span);
+        return try self.makeForm(.{ .map = merged[n..] }, span);
     }
 
     /// Accept `^:kw`, `^{...}`, or `^sym` and append the resulting
@@ -607,24 +547,6 @@ pub const Reader = struct {
         return f;
     }
 
-    fn requireCompound(self: *Reader, s: Sexp, expected: Tag) ReaderError![]const Sexp {
-        const items = switch (s) {
-            .list => |l| l.items(),
-            else => return self.fail(.unknown_reader_construct, srcSpan(s), null),
-        };
-        if (items.len == 0 or items[0] != .tag or items[0].tag != expected) {
-            return self.fail(.unknown_reader_construct, srcSpan(s), null);
-        }
-        return withoutDelimiters(items[1..]);
-    }
-
-    fn isCompoundWithTag(_: *const Reader, s: Sexp, expected: Tag) bool {
-        return switch (s) {
-            .list => |l| l.len > 0 and l.ptr[0] == .tag and l.ptr[0].tag == expected,
-            else => false,
-        };
-    }
-
     fn formatLiteralKey(self: *Reader, f: *const Form) ReaderError![]const u8 {
         var al: std.Io.Writer.Allocating = .init(self.allocator());
         writeForm(f, &al.writer) catch return error.OutOfMemory;
@@ -636,51 +558,29 @@ pub const Reader = struct {
 // Pure helpers (no Reader state)
 // -----------------------------------------------------------------------------
 
-/// A compound's children without the delimiter tokens the grammar
-/// keeps at either end (`(` `)`, `[` `]`, `'`, `^`, ...): every real
-/// child is itself a compound, so a bare token child is a delimiter.
-fn withoutDelimiters(items: []const Sexp) []const Sexp {
-    var lo: usize = 0;
-    var hi: usize = items.len;
-    while (lo < hi and items[lo] == .src) lo += 1;
-    while (hi > lo and items[hi - 1] == .src) hi -= 1;
-    return items[lo..hi];
+fn tokenSpan(r: parser.Src) SrcSpan {
+    return .{ .pos = r.pos, .len = nexis.srcLen(r) };
 }
 
-fn srcSpan(s: Sexp) SrcSpan {
-    return switch (s) {
-        .src => |r| .{ .pos = r.pos, .len = nexis.srcLen(r) },
-        .list => |l| blk: {
-            // Actions like (with-meta-raw 1 3 2) reorder positional
-            // children relative to source order; the compound's span is
-            // the min/max envelope over all descendant source positions,
-            // delimiter tokens included.
-            var lo: u32 = std.math.maxInt(u32);
-            var hi: u32 = 0;
-            var any = false;
-            for (l.items()) |c| {
-                if (c == .tag) continue;
-                const s2 = srcSpan(c);
-                if (s2.len == 0 and s2.pos == 0) continue;
-                if (s2.pos < lo) lo = s2.pos;
-                const end = s2.pos + s2.len;
-                if (end > hi) hi = end;
-                any = true;
-            }
-            if (!any) break :blk .{ .pos = 0, .len = 0 };
-            break :blk .{ .pos = lo, .len = hi - lo };
-        },
-        else => .{ .pos = 0, .len = 0 },
-    };
+/// From `pos` to the end of `last`.
+fn spanTo(pos: u32, last: SrcSpan) SrcSpan {
+    return .{ .pos = pos, .len = last.pos + last.len - pos };
 }
 
-fn expectSrcText(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError![]const u8 {
-    if (args.len != 1) return self.fail(.unknown_reader_construct, span, "atom must wrap exactly one src");
-    const a = args[0];
-    return switch (a) {
-        .src => |r| self.source[r.pos..][0..nexis.srcLen(r)],
-        else => self.fail(.unknown_reader_construct, span, "atom expected .src child"),
-    };
+/// The span of a raw form, from its first token to its last: an atom's
+/// token, a compound's delimiters, a prefix token to the end of its
+/// target. Only a chain of prefixes walks, one step per prefix.
+fn sexpSpan(s: Sexp) SrcSpan {
+    if (s == .src) return tokenSpan(s.src);
+    const items = s.items();
+    if (items.len < 2 or items[1] != .src) return .{ .pos = 0, .len = 0 };
+    var last = s;
+    while (true) {
+        const it = last.items();
+        if (it[it.len - 1] == .src) return spanTo(items[1].src.pos, tokenSpan(it[it.len - 1].src));
+        // A prefix form's target, or with-meta-raw's (the meta is last).
+        last = it[2];
+    }
 }
 
 const IntLiteral = struct { negative: bool, base: u8, digits: []const u8 };
@@ -784,6 +684,32 @@ fn isLiteralKey(f: *const Form) bool {
         else => false,
     };
 }
+
+/// Literal forms under the reader's literal equality (`formLiteralEq`).
+const LiteralSet = std.HashMapUnmanaged(*const Form, void, struct {
+    pub fn hash(_: @This(), f: *const Form) u64 {
+        var h = std.hash.Wyhash.init(@intFromEnum(f.datum));
+        switch (f.datum) {
+            .nil => {},
+            .bool_ => |b| h.update(&.{@intFromBool(b)}),
+            .int => |v| h.update(std.mem.asBytes(&v)),
+            .bigint, .string => |t| h.update(t),
+            // 0.0 and -0.0 are equal under `==`, so they hash alike.
+            .real => |r| h.update(std.mem.asBytes(&(if (r == 0) @as(f64, 0) else r))),
+            .char => |c| h.update(std.mem.asBytes(&@as(u32, c))),
+            .keyword, .symbol => |n| {
+                h.update(n.ns orelse "");
+                h.update("/");
+                h.update(n.name);
+            },
+            else => unreachable,
+        }
+        return h.final();
+    }
+    pub fn eql(_: @This(), a: *const Form, b: *const Form) bool {
+        return formLiteralEq(a, b);
+    }
+}, std.hash_map.default_max_load_percentage);
 
 fn formLiteralEq(a: *const Form, b: *const Form) bool {
     return switch (a.datum) {
@@ -1302,6 +1228,79 @@ test "discard: #_ drops the next form wherever a form may stand" {
         defer rd.deinit();
         const f = try rd.readOneForm(try p.parseForm());
         try std.testing.expectEqualStrings("x", f.datum.symbol.name);
+    }
+}
+
+test "nesting past the stack budget is a reader error, not a fault" {
+    const allocator = std.testing.allocator;
+    stack.armIfUnarmed(stack.main_thread_budget);
+    const depth = 200_000;
+    inline for (.{ "(", "[", "'", "@", "^(" }, .{ ")", "]", "", "", ") y" }) |open, close| {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(allocator);
+        for (0..depth) |_| try src.appendSlice(allocator, open);
+        try src.append(allocator, 'x');
+        for (0..depth) |_| try src.appendSlice(allocator, close);
+        var p = parser.Parser.init(allocator, src.items);
+        defer p.deinit();
+        var rd = Reader.init(allocator, src.items);
+        defer rd.deinit();
+        try std.testing.expectError(error.ReaderFailure, rd.readProgram(try p.parseProgram()));
+        try std.testing.expect(rd.err.?.kind == .nesting_too_deep);
+    }
+}
+
+test "spans: a form covers its first token to its last" {
+    const allocator = std.testing.allocator;
+    const src = " ( a [b] '#_ x @c ^:m #_ q {d 1} #(e) `~f ) ";
+    var p = parser.Parser.init(allocator, src);
+    defer p.deinit();
+    var rd = Reader.init(allocator, src);
+    defer rd.deinit();
+    const forms = try rd.readProgram(try p.parseProgram());
+    const text = struct {
+        fn of(f: *const Form) []const u8 {
+            return src[f.origin.pos..][0..f.origin.len];
+        }
+    }.of;
+    try std.testing.expectEqualStrings("( a [b] '#_ x @c ^:m #_ q {d 1} #(e) `~f )", text(forms[0]));
+    const items = forms[0].datum.list;
+    const expected = [_][]const u8{ "a", "[b]", "'#_ x @c", "^:m #_ q {d 1}", "#(e)", "`~f" };
+    try std.testing.expectEqual(expected.len, items.len);
+    for (expected, items) |e, f| try std.testing.expectEqualStrings(e, text(f));
+    try std.testing.expectEqualStrings("@c", text(items[2].datum.quote));
+    try std.testing.expectEqualStrings("{d 1}", text(items[3].datum.with_meta.target));
+    try std.testing.expectEqualStrings("~f", text(items[5].datum.syntax_quote));
+}
+
+test "stacked metadata: an outer ^ overrides an inner one, key order by last occurrence" {
+    try expectReads("^{:x 1 :z 0} ^{:x 2 :y 3} v", "(with-meta\n  (symbol v)\n  (map (keyword :y) (int 3) (keyword :x) (int 1) (keyword :z) (int 0)))\n");
+    try expectReads("^:a ^{[1] 1} ^{[1] 2} ^:a v", "(with-meta\n  (symbol v)\n  (map\n    (vector (int 1))\n    (int 2)\n    (vector (int 1))\n    (int 1)\n    (keyword :a)\n    (bool true)))\n");
+}
+
+test "duplicate literal detection is linear in the literal's size" {
+    const allocator = std.testing.allocator;
+    const n = 40_000;
+    // A set, a map and a metadata chain of n distinct literals, each
+    // with one duplicate at the end that must be found.
+    inline for (.{ "#{", "{", "" }, .{ "}", "}", "v" }, .{ "", " 0", "" }, .{ "", "", "^" }) |open, close, value, prefix| {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(allocator);
+        try src.appendSlice(allocator, open);
+        for (0..n) |i| try src.print(allocator, prefix ++ ":k{d}" ++ value ++ " ", .{i});
+        try src.appendSlice(allocator, prefix ++ ":k7" ++ value ++ " " ++ close);
+        var p = parser.Parser.init(allocator, src.items);
+        defer p.deinit();
+        var rd = Reader.init(allocator, src.items);
+        defer rd.deinit();
+        const result = rd.readProgram(try p.parseProgram());
+        if (prefix.len > 0) {
+            // Metadata merges its duplicates instead of rejecting them.
+            try std.testing.expectEqual(@as(usize, 2 * n), (try result)[0].datum.with_meta.meta.datum.map.len);
+        } else {
+            try std.testing.expectError(error.ReaderFailure, result);
+            try std.testing.expectEqualStrings("(keyword :k7)", rd.err.?.detail.?);
+        }
     }
 }
 

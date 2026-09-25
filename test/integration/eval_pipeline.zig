@@ -3616,6 +3616,8 @@ test "read-string: forms as data, the first form only, errors thrown" {
     // A token has no 64 KiB limit: a long string and symbol round-trip.
     try expectOutput("(count (read-string (pr-str (apply str (repeat 70000 \"a\")))))", "70000");
     try expectOutput("(count (name (read-string (apply str (repeat 70000 \"b\")))))", "70000");
+    // Nesting past the stack budget is a reader error, not a fault.
+    try expectOutput("(try (read-string (str (apply str (repeat 200000 \"(\")) (apply str (repeat 200000 \")\")))) (catch :reader-error e :deep))", ":deep");
 }
 
 // =============================================================================
