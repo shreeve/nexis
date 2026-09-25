@@ -76,19 +76,6 @@ pub fn connPath(v: Value) []const u8 {
     return connPathBytes(Heap.asHeapHeader(v));
 }
 
-/// Identity hash on the header pointer.
-pub fn connHash(h: *HeapHeader) u32 {
-    if (h.cachedHash()) |cached| return cached;
-    const full = hash_mod.hashU64(@intFromPtr(h));
-    const truncated: u32 = @truncate(full);
-    if (truncated != 0) h.setCachedHash(truncated);
-    return truncated;
-}
-
-pub fn connEqual(a: *HeapHeader, b: *HeapHeader) bool {
-    return a == b;
-}
-
 pub fn formatConn(v: Value, writer: *std.Io.Writer) !void {
     try writer.writeAll("#nextomic/conn \"");
     try writer.writeAll(connPath(v));
@@ -343,7 +330,7 @@ test "entity box is a value over its db-value and eid, and reads through its hoo
     try testing.expectEqualStrings("#nextomic/entity {:db/id 4294967297}", w.buffered());
 }
 
-test "conn box keeps its path and is identity-valued" {
+test "conn box keeps its path; two boxes are two identities" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     var target: u32 = 0;
@@ -351,8 +338,7 @@ test "conn box keeps its path and is identity-valued" {
     const b = try makeConn(&heap, @ptrCast(&target), "/tmp/a.edb");
     try testing.expectEqualStrings("/tmp/a.edb", connPath(a));
     try testing.expectEqual(@as(*anyopaque, @ptrCast(&target)), connPtr(a));
-    try testing.expect(connEqual(Heap.asHeapHeader(a), Heap.asHeapHeader(a)));
-    try testing.expect(!connEqual(Heap.asHeapHeader(a), Heap.asHeapHeader(b)));
+    try testing.expect(Heap.asHeapHeader(a) != Heap.asHeapHeader(b));
     var buf: [64]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try formatConn(a, &w);

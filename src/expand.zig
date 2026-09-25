@@ -36,7 +36,6 @@ const Allocator = std.mem.Allocator;
 pub const ExpandError = error{
     ExpansionDepthExceeded,
     MalformedMacroCall,
-    MacroReturnedNull,
     /// A `require` ran a file whose form failed at run time with no
     /// handler in force; the VM's `traced_error` and `error_trace`
     /// carry the failure.
