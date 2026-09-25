@@ -1218,6 +1218,13 @@ fn expectReads(src: []const u8, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, al.written());
 }
 
+test "a UTF-8 byte-order mark is skipped at the start of the source only" {
+    try expectReads("\xEF\xBB\xBF(a)", "(list (symbol a))\n");
+    try expectReads("\xEF\xBB\xBF", "");
+    // Anywhere else it is a symbol constituent, as in Clojure.
+    try expectReads("a\xEF\xBB\xBF", "(symbol a\xEF\xBB\xBF)\n");
+}
+
 test "discard: #_ drops the next form wherever a form may stand" {
     // A prefix reads the form after the discarded one, as Clojure's
     // reader does.
