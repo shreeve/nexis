@@ -469,18 +469,9 @@ const simd_natives = table("nexis.simd", .{
 // Implementations
 // =============================================================================
 
-/// `(list & xs)` → fresh cons list of the args (left-to-right).
-/// `(list)` is the empty list. The partial result is not
-/// rooted; `Heap.alloc` never collects (GC.md §9).
+/// `(list & xs)` → a fresh list of the args; `(list)` is `()`.
 fn fnList(vm: *VM, args: []const Value) VmError!Value {
-    const heap = vm.ensureHeap();
-    var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
-    var i: usize = args.len;
-    while (i > 0) {
-        i -= 1;
-        result = list_mod.cons(heap, args[i], result) catch return VmError.OutOfMemory;
-    }
-    return result;
+    return buildListFromSlice(vm, args);
 }
 
 /// `(list* a b ... seq)` → list of the leading args followed by
@@ -531,21 +522,6 @@ fn fnRest(vm: *VM, args: []const Value) VmError!Value {
             list_mod.empty(heap) catch VmError.OutOfMemory
         else
             list_mod.tail(s),
-        .persistent_vector => blk: {
-            const n = vector_mod.count(s);
-            if (n <= 1) {
-                break :blk list_mod.empty(heap) catch VmError.OutOfMemory;
-            }
-            // Build a list from elements [1..n-1] in reverse so
-            // cons threads correctly.
-            var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
-            var i: usize = n;
-            while (i > 1) {
-                i -= 1;
-                result = list_mod.cons(heap, vector_mod.nth(s, i), result) catch return VmError.OutOfMemory;
-            }
-            break :blk result;
-        },
         else => blk: {
             var items = try collectSeq(vm, s);
             defer items.deinit(vm.allocator);
@@ -3141,14 +3117,6 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
-/// `(db/alter! tx ref f & args)` — read-modify-write inside an
-/// active write tx. Reads current via getRef, computes
-/// `(apply f current args)` via vm.callValue, writes via putRef.
-/// Returns the new value.
-///
-/// If `f` throws or control transfers, do NOT write.
-/// Connection mismatch on `ref` surfaces as
-/// :db/store-mismatch via db.zig's assertRefMatchesConn.
 // =============================================================================
 // scan + reduce-tree
 // =============================================================================
@@ -3204,20 +3172,10 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     const tree_id: u32 = @intCast(tree_v.payload);
     const tree_name = interner.keywordName(tree_id);
 
-    // Optional range bounds. Keys are keyword Values; extract
-    // their interned names as byte slices.
-    const start_bytes: ?[]const u8 = if (args.len >= 3) blk: {
-        const sv = args[2];
-        if (sv.kind() != .keyword and sv.kind() != .symbol) return VmError.KindMismatch;
-        const id: u32 = @intCast(sv.payload);
-        break :blk if (sv.kind() == .keyword) interner.keywordName(id) else interner.symbolName(id);
-    } else null;
-    const end_bytes: ?[]const u8 = if (args.len >= 4) blk: {
-        const ev = args[3];
-        if (ev.kind() != .keyword and ev.kind() != .symbol) return VmError.KindMismatch;
-        const id: u32 = @intCast(ev.payload);
-        break :blk if (ev.kind() == .keyword) interner.keywordName(id) else interner.symbolName(id);
-    } else null;
+    // Optional range bounds: a keyword or symbol, whose name is the
+    // key's bytes.
+    const start_bytes: ?[]const u8 = if (args.len >= 3) try boundBytes(vm, args[2]) else null;
+    const end_bytes: ?[]const u8 = if (args.len >= 4) try boundBytes(vm, args[3]) else null;
 
     var tc = (try TreeCursor.open(vm, tx_v, tree_name)) orelse {
         return vector_mod.fromSlice(vm.ensureHeap(), &.{}) catch VmError.OutOfMemory;
@@ -3247,6 +3205,11 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     }
 
     return vector_mod.fromSlice(vm.ensureHeap(), entries.items) catch VmError.OutOfMemory;
+}
+
+fn boundBytes(vm: *VM, v: Value) VmError![]const u8 {
+    if (v.kind() != .keyword and v.kind() != .symbol) return VmError.KindMismatch;
+    return internedName(vm, v);
 }
 
 /// Predicate for snapshot Values. True if `x` is a
@@ -3285,6 +3248,14 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     return acc;
 }
 
+/// `(db/alter! tx ref f & args)` — read-modify-write inside an
+/// active write tx. Reads current via getRef, computes
+/// `(apply f current args)` via vm.callValue, writes via putRef.
+/// Returns the new value.
+///
+/// If `f` throws or control transfers, do NOT write.
+/// Connection mismatch on `ref` surfaces as
+/// :db/store-mismatch via db.zig's assertRefMatchesConn.
 fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     const tx_v = args[0];
     const r = args[1];
@@ -3559,57 +3530,35 @@ fn fnResetBang(_: *VM, args: []const Value) VmError!Value {
     return new_val;
 }
 
-fn fnSwapBang(vm: *VM, args: []const Value) VmError!Value {
+/// `(swap! a f & args)` → sets `a` to `(apply f @a args)` and
+/// returns it; `swap-vals!` returns `[old new]`. Nothing is written
+/// when `f` throws or control transfers.
+fn swapImpl(vm: *VM, args: []const Value, pair: bool) VmError!Value {
     const a = args[0];
-    const f = args[1];
-    const extra = args[2..];
-
     if (a.kind() != .atom) return VmError.KindMismatch;
     if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
     defer atom_mod.exitCritical(a);
-
-    // 1. Read current.
     const old = atom_mod.getValue(a);
-
-    // 2. Build call_args = [old, ...extra].
-    const call_args = vm.allocator.alloc(Value, 1 + extra.len) catch return VmError.OutOfMemory;
+    const call_args = vm.allocator.alloc(Value, args.len - 1) catch return VmError.OutOfMemory;
     defer vm.allocator.free(call_args);
     call_args[0] = old;
-    for (extra, 0..) |x, i| call_args[1 + i] = x;
-
-    // 3. Invoke. NO write on throw / control transfer.
-    const new_val = try vm.callValue(f, call_args);
-
-    // 4. Write.
-    atom_mod.setValue(a, new_val);
-    return new_val;
-}
-
-fn fnSwapValsBang(vm: *VM, args: []const Value) VmError!Value {
-    const a = args[0];
-    const f = args[1];
-    const extra = args[2..];
-
-    if (a.kind() != .atom) return VmError.KindMismatch;
-    if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
-    defer atom_mod.exitCritical(a);
-
-    const old = atom_mod.getValue(a);
-
-    const call_args = vm.allocator.alloc(Value, 1 + extra.len) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(call_args);
-    call_args[0] = old;
-    for (extra, 0..) |x, i| call_args[1 + i] = x;
-
-    const new_val = try vm.callValue(f, call_args);
-
+    @memcpy(call_args[1..], args[2..]);
+    const new_val = try vm.callValue(args[1], call_args);
     // `old` is the atom's value, hence rooted, throughout the
     // callback; the [old new] vector is built after `setValue` with
     // no safe point in between (a cycle runs only between
     // instructions, VM.md §9).
     atom_mod.setValue(a, new_val);
-    const pair_elems = [_]Value{ old, new_val };
-    return vector_mod.fromSlice(vm.ensureHeap(), &pair_elems) catch return VmError.OutOfMemory;
+    if (!pair) return new_val;
+    return vector_mod.fromSlice(vm.ensureHeap(), &.{ old, new_val }) catch VmError.OutOfMemory;
+}
+
+fn fnSwapBang(vm: *VM, args: []const Value) VmError!Value {
+    return swapImpl(vm, args, false);
+}
+
+fn fnSwapValsBang(vm: *VM, args: []const Value) VmError!Value {
+    return swapImpl(vm, args, true);
 }
 
 fn fnCompareAndSetBang(_: *VM, args: []const Value) VmError!Value {
@@ -3735,28 +3684,22 @@ fn fnSubs(vm: *VM, args: []const Value) VmError!Value {
 // rooted for the call, and never calls back into the VM
 // (docs/GC.md §11.5, class 1).
 
-fn fnStringLowerCase(vm: *VM, args: []const Value) VmError!Value {
-    const s = args[0];
-    if (s.kind() != .string) return VmError.KindMismatch;
-    const src = string_mod.asBytes(s);
+/// `s` with its ASCII letters in one case; other bytes, every byte
+/// of a multibyte scalar included, pass through.
+fn mapAsciiCase(vm: *VM, s: Value, upper: bool) VmError!Value {
+    const src = try stringArg(s);
     const buf = vm.allocator.alloc(u8, src.len) catch return VmError.OutOfMemory;
     defer vm.allocator.free(buf);
-    for (src, 0..) |b, i| {
-        buf[i] = if (b >= 'A' and b <= 'Z') b + ('a' - 'A') else b;
-    }
+    for (src, buf) |b, *out| out.* = if (upper) std.ascii.toUpper(b) else std.ascii.toLower(b);
     return string_mod.fromBytes(vm.ensureHeap(), buf) catch return VmError.OutOfMemory;
 }
 
+fn fnStringLowerCase(vm: *VM, args: []const Value) VmError!Value {
+    return mapAsciiCase(vm, args[0], false);
+}
+
 fn fnStringUpperCase(vm: *VM, args: []const Value) VmError!Value {
-    const s = args[0];
-    if (s.kind() != .string) return VmError.KindMismatch;
-    const src = string_mod.asBytes(s);
-    const buf = vm.allocator.alloc(u8, src.len) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(buf);
-    for (src, 0..) |b, i| {
-        buf[i] = if (b >= 'a' and b <= 'z') b - ('a' - 'A') else b;
-    }
-    return string_mod.fromBytes(vm.ensureHeap(), buf) catch return VmError.OutOfMemory;
+    return mapAsciiCase(vm, args[0], true);
 }
 
 /// The six ASCII whitespace characters: space, tab, LF, VT, FF, CR.
@@ -4569,18 +4512,10 @@ fn appendSeqValues(vm: *VM, seq: Value, out: *std.ArrayList(Value)) VmError!void
     }
 }
 
-/// Build a fresh cons list from a slice of Values (left-to-
-/// right). Uses `vm.ensureHeap()`. The partial list needs no
-/// root: `Heap.alloc` never collects (VM.md §9).
+/// A fresh list of `items`, in order. The partial list needs no root:
+/// `Heap.alloc` never collects (VM.md §9).
 fn buildListFromSlice(vm: *VM, items: []const Value) VmError!Value {
-    const heap = vm.ensureHeap();
-    var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
-    var i: usize = items.len;
-    while (i > 0) {
-        i -= 1;
-        result = list_mod.cons(heap, items[i], result) catch return VmError.OutOfMemory;
-    }
-    return result;
+    return list_mod.fromSlice(vm.ensureHeap(), items) catch VmError.OutOfMemory;
 }
 
 // =============================================================================
