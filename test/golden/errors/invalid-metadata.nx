@@ -1,0 +1,2 @@
+; Metadata is a keyword, a map or a symbol.
+(def ^1 x 2)

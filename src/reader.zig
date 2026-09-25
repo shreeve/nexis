@@ -1332,6 +1332,21 @@ test "duplicate literal detection is linear in the literal's size" {
     }
 }
 
+test "an unsupported construct is one err token, so the parse error names it" {
+    const allocator = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "(f #'x)", "#'x" }, .{ "#\"a.*\"", "#\"" },                        .{ "::k", "::k" },
+        .{ "##Inf", "##Inf" }, .{ "#!/usr/bin/env nexis", "#!/usr/bin/env" }, .{ "#?(:clj 1)", "#?" },
+        .{ "# x", "#" },
+    };
+    for (cases) |c| {
+        var p = parser.Parser.init(allocator, c[0]);
+        defer p.deinit();
+        try std.testing.expectError(error.ParseError, p.parseProgram());
+        try std.testing.expectEqualStrings(c[1], c[0][p.current.pos..][0..p.current.len]);
+    }
+}
+
 test "symbols and keywords take any UTF-8 character" {
     try expectReads("(λ ns.é/π :ключ :a/ß)", "(list (symbol λ) (symbol ns.é/π) (keyword :ключ) (keyword :a/ß))\n");
     try expectReaderError("1é", .bad_number_literal, "1é");

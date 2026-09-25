@@ -132,7 +132,15 @@ pub const Lexer = struct {
                             self.base.pos += 2;
                             return .{ .cat = .hash_discard, .pre = pre, .pos = start, .len = 2 };
                         },
-                        else => {},
+                        ' ', '\t', '\r', '\n', ',' => {},
+                        // An unsupported dispatch (`#'x`, `#"`, `##Inf`,
+                        // `#?`) is one err token, so the parse error
+                        // names the construct.
+                        else => |after| {
+                            self.base.pos = start + 2;
+                            if (isIdentCont(after)) self.skipConstituents();
+                            return self.finish(.err, start, pre);
+                        },
                     }
                 }
                 return self.single(.err, start, pre);
@@ -257,11 +265,20 @@ pub const Lexer = struct {
             return .{ .cat = .err, .pre = pre, .pos = start, .len = 1 };
         }
         const first = src[self.base.pos];
-        if (!isIdentStart(first) and first != '-') {
-            return .{ .cat = .err, .pre = pre, .pos = start, .len = 1 };
+        if (first == ':') {
+            // `::k`, an auto-resolved keyword, is not supported: one err
+            // token over it names it in the parse error.
+            self.skipConstituents();
+            return self.finish(.err, start, pre);
         }
-        while (self.base.pos < src.len and isIdentCont(src[self.base.pos])) : (self.base.pos += 1) {}
+        if (!isIdentStart(first) and first != '-') return self.single(.err, start, pre);
+        self.skipConstituents();
         return self.finish(.keyword, start, pre);
+    }
+
+    fn skipConstituents(self: *Lexer) void {
+        const src = self.base.source;
+        while (self.base.pos < src.len and isIdentCont(src[self.base.pos])) : (self.base.pos += 1) {}
     }
 
     fn scanIdent(self: *Lexer, start: u32, pre: u8) Token {

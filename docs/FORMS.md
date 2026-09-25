@@ -115,6 +115,7 @@ see. Mirrors PLAN §28.3 exactly.
 | a string, symbol or keyword whose bytes are not UTF-8 | **reader error**: `:invalid-utf8` |
 | `\é`, `\☃`, `\(` | one character, any UTF-8 sequence or delimiter: `(char \u{E9})`, `(char \u{2603})`, `(char \()` |
 | `\u0041`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | **reader error**: `:invalid-char-literal`, detail the token's text (`\u{HEX}` is the one escape, PLAN §23 decision 26) |
+| `#'x`, `#"re"`, `##Inf`, `#?(...)`, `#!`, `::k` | **parse error** naming the construct (`unexpected \`#'x\``): none of these is in the reader (PLAN §7.2) |
 | a form nested past the native stack's budget | **reader error**: `:nesting-too-deep` (`src/stack.zig`) |
 
 **Number token boundary.** A token that begins with a digit, or with
