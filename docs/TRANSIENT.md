@@ -16,7 +16,11 @@ pointer to a persistent inner root. Mutating ops call the
 persistent backing operations underneath, reassigning the wrapper's
 `inner_header` field in place. Token discipline enforced at every
 boundary. Node-level in-place mutation (Clojure's real perf
-advantage) does not exist (PLAN §19.6 Tier 2).
+advantage) does not exist (PLAN §19.6 Tier 2): **a transient op costs
+exactly what the persistent op costs, plus a wrapper check.**
+Transients give nexis Clojure's `transient` / `persistent!` / `conj!`
+API, not its speed-up; code that builds a collection with
+transients is no faster than the same code built persistently.
 
 ---
 
@@ -27,21 +31,21 @@ tags: every CHAMP interior / collision / vector interior / leaf /
 tail node grows an `owner_token: ?u64` field. Mutating ops walk the
 tree and mutate owner-matched nodes in place, clone + stamp
 owner-mismatched ones. Real O(1) amortized `conjBang` etc. Cost:
-~8 bytes/node, every clone helper in hamt and rrb grows a
-transient-aware variant, structural invariants loosen in
-transient-mode.
+~8 bytes/node, the trie edit primitives in `champ.zig` and
+`vector.zig` grow transient-aware variants, structural invariants
+loosen in transient-mode.
 
 **Option B — shallow wrappers** (what nexis has): `.transient` is a thin heap
 kind with `{owner_token, inner_header}`. Mutation ops call
 `mapAssoc` / `setConj` / `vector.conj` on the inner, receive a new
 persistent root, atomically update the wrapper's `inner_header`
-field. No existing hamt/rrb code changes. Gate-test discipline
+field. No persistent collection code changes. Gate-test discipline
 (#3 equivalence, #4 ownership) satisfied by construction.
 
 **nexis picks B.** Reasons:
   - Gate tests measure semantics, not performance. B delivers
-    semantics with ~800 LOC of new code + zero changes to stable
-    persistent paths.
+    semantics in a small module with zero changes to the persistent
+    paths.
   - CHAMP nodes carry no reserved transient fields.
   - B → A is achievable without changing the user-facing
     transient API: wrapper layout stays identical, owner-token
@@ -245,11 +249,9 @@ Each public entry point:
     (no path produces it),
   - proceeds to the underlying persistent op.
 
-Non-safe-build safety: in Release builds, kind/subkind
-assertions are compiled out. The token + frozen checks remain.
-Users calling `...Bang` on a non-transient Value in a release
-build get undefined behavior — same discipline as calling
-`mapAssoc` on a list value.
+The kind, subkind and frozen checks are ordinary branches, not
+safe-build assertions: a `...Bang` op on a non-transient Value
+returns `error.TransientKindMismatch` in every build mode.
 
 ---
 
@@ -318,6 +320,11 @@ pub fn setCountBang(t: Value) !usize;
 // ---- Transient vector ops (inner subkind 2) ----
 
 pub fn vectorConjBang(heap: *Heap, t: Value, elem: Value) !Value;
+/// `assoc!`: replaces element `idx`, or appends when `idx == count`;
+/// `error.IndexOutOfBounds` beyond.
+pub fn vectorAssocBang(heap: *Heap, t: Value, idx: usize, elem: Value) !Value;
+/// `pop!`: `error.IndexOutOfBounds` on an empty vector.
+pub fn vectorPopBang(heap: *Heap, t: Value) !Value;
 pub fn vectorNthBang(t: Value, idx: usize) !Value;
 pub fn vectorCountBang(t: Value) !usize;
 ```
@@ -327,16 +334,11 @@ suffices; a dedicated `isEmptyBang` per kind is trivial wrapper
 surface area that would bloat the public API. Users who want the check call
 `(try mapCountBang(t)) == 0`.
 
-**There is no vector `assocBang`.** The persistent path has
-`vector.assoc` (random index update via path-copy); the transient
-API has no counterpart.
-
 **`...Bang` ops return the same transient wrapper Value they were
 given.** The wrapper's `inner_header` field is mutated in place.
 Pointer-stability means callers can hold a `Value` for the
 lifetime of the transient session; they don't need to rebind it on
-each op. (Internal implementation may optimize this differently
-in the future; the user-facing contract is pointer-stable.)
+each op.
 
 ---
 
@@ -344,7 +346,7 @@ in the future; the user-facing contract is pointer-stable.)
 
 **Per-kind root reconstruction helpers.** The transient
 module needs to reconstruct a persistent Value from a raw
-`*HeapHeader` — e.g. to call `hamt.mapAssoc(heap, v, …)` where `v`
+`*HeapHeader` — e.g. to call `champ.mapAssoc(heap, v, …)` where `v`
 is a persistent-map Value built from the transient's
 `inner_header`. This is kind-specific
 knowledge (CHAMP/array-map subkind discovery via body-size
@@ -360,8 +362,8 @@ pub fn valueFromSetHeader(h: *HeapHeader) Value;
 pub fn valueFromVectorHeader(h: *HeapHeader) Value;
 ```
 
-These wrap the existing `inferRootSubkind` / `inferSetRootSubkind`
-logic behind a single per-kind entry point. The transient module
+These wrap champ's body-size subkind inference behind a single
+per-kind entry point. The transient module
 calls them; it never inspects kind-specific body layouts.
 
 ```zig
@@ -400,8 +402,8 @@ pub fn mapAssocBang(heap, t, key, val, hash, eq) !Value {
     try assertSubkind(t, subkind_transient_map);
     const h = Heap.asHeapHeader(t);
     const body = Heap.bodyOf(TransientBody, h);
-    const old_v = hamt.valueFromMapHeader(body.inner_header);
-    const new_v = try hamt.mapAssoc(heap, old_v, key, val, hash, eq);
+    const old_v = champ.valueFromMapHeader(body.inner_header);
+    const new_v = try champ.mapAssoc(heap, old_v, key, val, hash, eq);
     body.inner_header = Heap.asHeapHeader(new_v);
     return t; // same pointer
 }
@@ -411,8 +413,8 @@ pub fn mapAssocBang(heap, t, key, val, hash, eq) !Value {
 // per-kind `valueFromXxxHeader` helpers).
 fn innerValueForSubkind(subkind: u16, h: *HeapHeader) Value {
     return switch (subkind) {
-        subkind_transient_map => hamt.valueFromMapHeader(h),
-        subkind_transient_set => hamt.valueFromSetHeader(h),
+        subkind_transient_map => champ.valueFromMapHeader(h),
+        subkind_transient_set => champ.valueFromSetHeader(h),
         subkind_transient_vector => vector.valueFromVectorHeader(h),
         else => unreachable,
     };
@@ -503,27 +505,25 @@ the only state change. This simplifies GC reasoning: frozen
 wrappers behave identically to active wrappers at the trace
 level.
 
-The collector's `mark` dispatch in `src/gc.zig` replaces the
-current `.transient => panic` arm with
-`.transient => transient_mod.trace(h, self)`.
+The collector's `mark` dispatch in `src/gc.zig` routes the
+`.transient` arm to `transient_mod.trace`.
 
 ---
 
-### 11. Dispatch wiring (one-way terminal, same discipline as `gc.zig`)
+### 11. Dispatch wiring
 
-`src/dispatch.zig` gains a `.transient` arm in `heapHashBase`
-(panic per §9) and `heapEqual` (explicit bit-identity per §9).
-The `equal` switch's `.kind_local` arm continues to handle
-transients via the standard kind-local dispatch — no category
-changes needed since `eqCategory(.transient) == .kind_local`
-already in the exhaustive table test.
+`src/dispatch.zig` has a `.transient` arm in `heapHashBase` (panic
+per §9) and in `heapEqual` (explicit bit-identity per §9). The
+`equal` switch's `.kind_local` arm handles transients through the
+standard kind-local dispatch (`eqCategory(.transient) ==
+.kind_local`). `src/gc.zig`'s `mark` routes `.transient` to this
+module's `trace`.
 
-`src/gc.zig` gains a real `.transient => transient_mod.trace(h,
-self)` arm in `mark`.
-
-The transient module itself imports `heap`, `value`, `hamt`, and
-`vector` (plus whatever the set ops need, which is the same hamt
-module). No other module depends on `transient.zig`.
+The transient module imports `heap`, `value`, `coll/champ.zig` and
+`coll/vector.zig`, never `dispatch.zig`: hash and equality arrive as
+callbacks, as they do for the persistent ops. Its importers are
+`dispatch.zig`, `gc.zig` and `codec.zig`; the runtime is one module
+(`src/root.zig`), and the one-way rule is a layering rule inside it.
 
 ---
 
@@ -551,8 +551,9 @@ Property tests in `test/prop/transient.zig` (new):
   of length 0..40 applied to identical starting maps/sets/vectors,
   the (transient → N × ...Bang → persistentBang) path and the
   direct (persistent × N × assoc/conj) path produce
-  `dispatch.equal` and `dispatch.hashValue`-equal results. 300
-  trials per kind.
+  `dispatch.equal` and `dispatch.hashValue`-equal results. 1000
+  trials per kind; T1d drives random `conj!` / `assoc!` / `pop!` on
+  vectors of up to 1100 elements.
 - **T2. Ownership (gate test #4)**: frozen transients reject
   every subsequent op with `error.TransientFrozen`. There is no
   operational `TransientWrongOwner` path (single-isolate); the
@@ -586,7 +587,6 @@ operationally reachable ownership failure in a single isolate.
 **Absent:**
   - **Node-level in-place mutation** (Option A, real Clojure-
     style).
-  - **Transient vector `assocBang`** (§7).
   - **Transient byte-vector / typed-vector**: a typed vector has no
     update operation to make transient (`docs/TYPED_VECTOR.md` §1);
     the byte-vector kind has no implementation.

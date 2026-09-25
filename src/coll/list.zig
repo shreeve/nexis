@@ -149,12 +149,15 @@ pub fn count(v: Value) usize {
 /// `elementHash` on each. Top-level walk is iterative; the element
 /// callback may itself recurse (nested lists hash through
 /// `dispatch.hashValue → list.hashSeq → elementHash → …`). Returns
-/// the pre-domain `u64` base; `dispatch.hashValue` applies the
-/// sequential-category domain byte on the way out.
+/// the pre-domain base at u32 precision, cached in `h`'s header
+/// (SEMANTICS.md §3.1); `dispatch.hashValue` applies the
+/// sequential-category domain byte on the way out. `vector.hashSeq`
+/// computes the same value for the same elements.
 pub fn hashSeq(h: *HeapHeader, elementHash: *const fn (Value) u64) u64 {
     if (std.debug.runtime_safety) {
         std.debug.assert(h.kind == @intFromEnum(Kind.list));
     }
+    if (h.cachedHash()) |cached| return cached;
     var acc: u64 = hash_mod.ordered_init;
     var n: usize = 0;
     var cur_header: *HeapHeader = h;
@@ -171,7 +174,9 @@ pub fn hashSeq(h: *HeapHeader, elementHash: *const fn (Value) u64) u64 {
         std.debug.assert(cons_body.tail.kind() == .list);
         cur_header = Heap.asHeapHeader(cons_body.tail);
     }
-    return hash_mod.finalizeOrdered(acc, n);
+    const truncated: u32 = @truncate(hash_mod.finalizeOrdered(acc, n));
+    if (truncated != 0) h.setCachedHash(truncated);
+    return truncated;
 }
 
 /// Pairwise structural equality. Walks both cons chains in lock-step,
@@ -413,11 +418,11 @@ fn callbackEqImmediateOnly(a: Value, b: Value) bool {
     };
 }
 
-test "hashSeq: empty list returns finalizeOrdered(init, 0)" {
+test "hashSeq: empty list returns finalizeOrdered(init, 0) at u32 precision" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     const e = try empty(&heap);
-    const expected = hash_mod.finalizeOrdered(hash_mod.ordered_init, 0);
+    const expected: u64 = @as(u32, @truncate(hash_mod.finalizeOrdered(hash_mod.ordered_init, 0)));
     try testing.expectEqual(expected, hashSeq(Heap.asHeapHeader(e), &callbackHashImmediateOnly));
 }
 
@@ -434,9 +439,19 @@ test "hashSeq: (list 1 2 3) matches manual ordered combine" {
     expected = hash_mod.combineOrdered(expected, value.fromFixnum(1).?.hashImmediate());
     expected = hash_mod.combineOrdered(expected, value.fromFixnum(2).?.hashImmediate());
     expected = hash_mod.combineOrdered(expected, value.fromFixnum(3).?.hashImmediate());
-    expected = hash_mod.finalizeOrdered(expected, 3);
+    expected = @as(u32, @truncate(hash_mod.finalizeOrdered(expected, 3)));
 
     try testing.expectEqual(expected, hashSeq(Heap.asHeapHeader(lst), &callbackHashImmediateOnly));
+}
+
+test "hashSeq caches its result in the head cell's header" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const h = Heap.asHeapHeader(try fromSlice(&heap, &.{ value.fromFixnum(1).?, value.fromFixnum(2).? }));
+    try testing.expect(h.cachedHash() == null);
+    const first = hashSeq(h, &callbackHashImmediateOnly);
+    try testing.expectEqual(@as(?u32, @intCast(first)), h.cachedHash());
+    try testing.expectEqual(first, hashSeq(h, &callbackHashImmediateOnly));
 }
 
 test "hashSeq: equal lists produce equal base hashes (different allocations)" {

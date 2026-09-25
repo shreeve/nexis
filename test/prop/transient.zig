@@ -8,7 +8,9 @@
 //!   T1. Equivalence (test #3): random edit sequences applied via
 //!       (transient → N × ...Bang → persistentBang) produce the same
 //!       persistent Value (by `dispatch.equal` AND `dispatch.hashValue`)
-//!       as the direct persistent path. 300 trials per kind.
+//!       as the direct persistent path. 1000 trials per kind; T1d
+//!       drives random conj!/assoc!/pop! on vectors of up to 1100
+//!       elements, across the first trie boundary.
 //!   T2. Ownership (test #4): frozen transients reject every op with
 //!       `error.TransientFrozen`.
 //!   T3. Source immutability: a `...Bang` session on transient
@@ -143,6 +145,49 @@ test "T1c: vector equivalence — transient × N conj ≡ persistent × N conj (
             dispatch.hashValue(persistent_path),
             dispatch.hashValue(persistent_from_transient),
         );
+    }
+}
+
+test "T1d: vector equivalence — random conj!/assoc!/pop! ≡ conj/assoc/pop (300 trials)" {
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    var heap = Heap.init(debug.allocator());
+    defer heap.deinit();
+
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x34);
+    const r = prng.random();
+
+    var trial: usize = 0;
+    while (trial < 300) : (trial += 1) {
+        // Start anywhere up to past the first trie boundary (1056).
+        const start = r.uintLessThan(usize, 1100);
+        const elems = try debug.allocator().alloc(Value, start);
+        defer debug.allocator().free(elems);
+        for (elems, 0..) |*e, i| e.* = value.fromFixnum(@intCast(i)).?;
+        var persistent_path = try vector.fromSlice(&heap, elems);
+        const t = try transient.transientFrom(&heap, persistent_path);
+        for (0..60) |_| {
+            const n = vector.count(persistent_path);
+            const elem = value.fromFixnum(r.intRangeAtMost(i64, -99, 99)).?;
+            switch (r.uintLessThan(u8, 3)) {
+                0 => {
+                    persistent_path = try vector.conj(&heap, persistent_path, elem);
+                    _ = try transient.vectorConjBang(&heap, t, elem);
+                },
+                1 => if (n > 0) {
+                    const i = r.uintLessThan(usize, n);
+                    persistent_path = try vector.assoc(&heap, persistent_path, i, elem);
+                    _ = try transient.vectorAssocBang(&heap, t, i, elem);
+                },
+                else => if (n > 0) {
+                    persistent_path = try vector.pop(&heap, persistent_path);
+                    _ = try transient.vectorPopBang(&heap, t);
+                },
+            }
+        }
+        const persistent_from_transient = try transient.persistentBang(t);
+        try std.testing.expect(dispatch.equal(persistent_path, persistent_from_transient));
+        try std.testing.expectEqual(dispatch.hashValue(persistent_path), dispatch.hashValue(persistent_from_transient));
     }
 }
 
