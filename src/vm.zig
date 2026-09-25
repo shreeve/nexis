@@ -2106,6 +2106,9 @@ pub const VM = struct {
     /// (`callLookup`). Anything else is `NotCallable`.
     fn callDirect(self: *VM, callee: Value, args: []const Value) VmError!Value {
         const overflows = dispatch_mod.overflowCount();
+        // A call that fails spoils nothing its caller sees, so the
+        // overflows under it are consumed with it.
+        errdefer dispatch_mod.rewindOverflows(overflows);
         const result = switch (callee.kind()) {
             .native_fn => blk: {
                 const native = asNativeFn(callee);
@@ -2131,9 +2134,12 @@ pub const VM = struct {
     /// past the stack guard and count an overflow (dispatch.zig);
     /// a call or opcode that compared or hashed across one raises the
     /// catchable `:stack-overflow` instead of returning that answer
-    /// (SEMANTICS §2.7).
+    /// (SEMANTICS §2.7). The raise consumes the overflows it reports,
+    /// so an enclosing native whose callback caught the throw does not
+    /// raise it again.
     fn checkDeepData(self: *VM, overflows_before: u64) VmError!void {
         if (dispatch_mod.overflowCount() != overflows_before) {
+            dispatch_mod.rewindOverflows(overflows_before);
             return self.fail(VmError.StackOverflow, "a value nests too deeply to compare, hash or print", .{});
         }
     }

@@ -1355,6 +1355,38 @@ test "integration: flatten and compare of data nested past the stack are :stack-
     try expectOutput("(let [deep (fn [] (reduce (fn [acc _] [acc]) [] (range 200000)))] [(try (flatten (deep)) (catch :stack-overflow e :deep)) (try (compare (deep) (deep)) (catch :stack-overflow e :deep))])", "[:deep :deep]");
 }
 
+/// `expectOutput` with `deep-a` and `deep-b` defined as vectors nested
+/// 200,000 deep, past the stack guard. They are built with the
+/// collector off: under `NEXIS_GC_STRESS` every cycle re-marks the
+/// growing chain, which makes building one quadratic. `src` itself
+/// runs under the policy the environment chose.
+fn expectOutputOverDeepData(src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.gc_enabled = false;
+    _ = try program.run("(defn nest [n] (loop [i 0 v []] (if (< i n) (recur (inc i) [v]) v))) (def deep-a (nest 200000)) (def deep-b (nest 200000))");
+    program.v.gc_enabled = true;
+    try harness.expectResult(&program, src, try program.run(src), expected);
+}
+
+test "integration: a :stack-overflow caught inside a callback does not resurface from the native that called it" {
+    try expectOutputOverDeepData(
+        \\(let [safe= (fn [x y] (try (= x y) (catch :stack-overflow e :deep)))
+        \\      safe-str (fn [x] (try (pr-str x) (catch :stack-overflow e :deep)))
+        \\      a deep-a b deep-b]
+        \\  [(safe= a b)
+        \\   (mapv (fn [x] (safe= x b)) [a 1])
+        \\   (reduce (fn [acc x] (conj acc (safe= x b))) [] [a])
+        \\   (vec (map (fn [x] (safe= x b)) [a]))
+        \\   (count (filterv (fn [x] (= :deep (safe= x b))) [a 1]))
+        \\   (swap! (atom 0) (fn [_] (safe= a b)))
+        \\   (apply safe= [a b])
+        \\   (mapv safe-str [a])
+        \\   (try (mapv (fn [x] (= x b)) [a]) (catch :stack-overflow e :outer))])
+    , "[:deep [:deep false] [:deep] [:deep] 1 :deep :deep [:deep] :outer]");
+}
+
 test "integration: core.nx composite + HOFs" {
     try expectOutput("(reduce + 0 (range 10))", "45");
     try expectOutput("(count (filter odd? (range 10)))", "5");

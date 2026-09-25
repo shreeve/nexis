@@ -750,6 +750,16 @@ report: the VM raises `StackOverflow`, the reader a reader error, the
 compiler a compile error, and a codec decode of bytes nested too deep
 treats them as corrupt input.
 
+`=`, `hash` and printing cannot return an error to their many callers,
+so past the guard they answer `false`, `0` or `#<too deep>` and count
+an overflow (`dispatch.overflowCount`). `callDirect` snapshots the
+count around every native call, and `coll:*` around its construction;
+a count that moved raises `:stack-overflow` and rewinds the count to
+the snapshot, and a native call that fails rewinds it too. An overflow
+is therefore reported once, by the innermost call that saw it: a
+callback that catches it returns normally through `mapv`, `reduce`,
+`swap!` or any other native that called it (SEMANTICS §2.7).
+
 ---
 
 ### 14. Interaction with other subsystems

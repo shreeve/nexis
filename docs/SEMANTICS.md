@@ -146,7 +146,10 @@ Past the stack guard (`src/stack.zig`) they do not fault: the step that
 ran out answers `false`, `0` or a `#<too deep>` marker and counts an
 overflow (`dispatch.overflowCount`), and the VM turns a count that
 changed across a native call or opcode into the catchable
-`:stack-overflow` (`docs/VM.md` §13.1). A map, set or record whose hash
+`:stack-overflow` (`docs/VM.md` §13.1). The raise consumes the
+overflows it reports, as does a native call that fails, so one overflow
+raises once: a callback that catches it returns normally to the native
+that called it. A map, set or record whose hash
 was computed past an overflow keeps no cached hash, so the wrong answer
 never outlives the throw. The codec bounds nesting at 4096 levels
 instead (`docs/CODEC.md` §2.7).
