@@ -1794,6 +1794,79 @@ test "the VM keeps running after a caught storage failure" {
     , "[:db/key-too-large 42]");
 }
 
+test "db/close: a ref, a connection and a second close after it are :db-closed or nil" {
+    try expectOutputProgramWithStore("close-after",
+        \\(do
+        \\  (def c (db/open "@STORE@"))
+        \\  (def r (db/ref c :t "k"))
+        \\  (db/put-key! r 42)
+        \\  (db/close c)
+        \\  [(try @r (catch any e e))
+        \\   (try (db/put-key! r 1) (catch any e e))
+        \\   (db/close c)
+        \\   (try (db/ref c :t "k") (catch any e e))
+        \\   (try (db/begin-read c) (catch any e e))])
+    , "[:db-closed :db-closed nil :db-closed :db-closed]");
+}
+
+test "db/close: refused while a transaction of the connection is open" {
+    try expectOutputProgramWithStore("close-busy",
+        \\(do
+        \\  (def c (db/open "@STORE@"))
+        \\  (def r (db/ref c :t "k"))
+        \\  (def tx (db/begin-read c))
+        \\  (def wx (db/begin-write c))
+        \\  [(try (db/close c) (catch any e e))
+        \\   (db/abort-read! tx)
+        \\   (try (db/close c) (catch any e e))
+        \\   (db/abort-write! wx)
+        \\   (db/close c)
+        \\   (try (db/get tx r) (catch any e e))])
+    , "[:db/busy nil :db/busy nil nil :tx-closed]");
+}
+
+test "db/close: a stale ref never reaches a store opened after the close" {
+    var a = try SeamStore.init("stale-a");
+    defer a.deinit();
+    var b = try SeamStore.init("stale-b");
+    defer b.deinit();
+    const tmpl = try a.source(
+        \\(do
+        \\  (def c1 (db/open "@STORE@"))
+        \\  (def r (db/ref c1 :t :k))
+        \\  (db/put-key! r :from-a)
+        \\  (db/close c1)
+        \\  (def c2 (db/open "@OTHER@"))
+        \\  (db/put-key! (db/ref c2 :t :k) :from-b)
+        \\  [(try (db/put-key! r :stale) (catch any e e))
+        \\   (db/get-key (db/ref c2 :t :k))])
+    );
+    defer testing.allocator.free(tmpl);
+    const src = try std.mem.replaceOwned(u8, testing.allocator, tmpl, "@OTHER@", b.path);
+    defer testing.allocator.free(src);
+    try expectOutputProgram(src, "[:db-closed :from-b]");
+}
+
+test "db: Nextomic's nx/ trees are not reachable through db/*" {
+    try expectOutputProgramWithStore("nx-trees",
+        \\(do
+        \\  (def c (db/open "@STORE@"))
+        \\  [(try (db/ref c :nx/eavt "k") (catch any e e))
+        \\   (try (with-read-tx [t c] (db/scan t :nx/sys)) (catch any e e))
+        \\   (try (with-read-tx [t c] (db/reduce-tree t :nx/txlog conj [])) (catch any e e))
+        \\   (db/ref? (db/ref c :nxt "k"))])
+    , "[:db/invalid-key :db/invalid-key :db/invalid-key true]");
+}
+
+test "db: a value with no serialized form is :unserializable" {
+    try expectOutputProgramWithStore("unserializable",
+        \\(do
+        \\  (def c (db/open "@STORE@"))
+        \\  [(try (db/put-key! (db/ref c :t "f") inc) (catch :unserializable e e))
+        \\   (try (with-tx [tx c] (db/put! tx (db/ref c :t "a") [1 (atom 2)])) (catch any e e))])
+    , "[:unserializable :unserializable]");
+}
+
 test "outside try a storage failure is the raw DbError" {
     try expectProgramErrorWithStore("seam-errors-raw",
         \\(do

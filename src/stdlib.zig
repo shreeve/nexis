@@ -2828,17 +2828,18 @@ fn isIfn(k: Kind) bool {
 //   :db-error            any other storage failure
 //   :db-closed           op on already-closed connection
 //   :invalid-durable-ref arg was not a durable_ref Value
-//   :codec-failed        encode/decode error
+//   :unserializable      a value of a kind with no serialized form
+//   :codec-failed        stored bytes that do not decode
 //   :tx-closed           op on a finished transaction
 //
 // Storage failures are thrown through `VM.throwKeyword`, so outside
 // any `try` they surface as `UncaughtThrow` with the keyword in
 // `vm.unhandled_throw`, exactly like `(throw :db/key-too-large)`.
 //
-// Connection lifetime: each `db/open` allocates a Connection
-// on the VM's main allocator (NOT the runtime arena) + appends
-// it to vm.db_connections. `db/close` removes from the list +
-// frees. VM.deinit closes any remaining as a safety net.
+// Connection lifetime: each `db/open` allocates a Connection on the
+// VM's allocator and appends it to `vm.db_connections`. `db/close`
+// closes its env and leaves the struct in place; VM.deinit closes
+// whatever is still open and frees every Connection.
 
 /// Throw a db.zig / emdb / codec error to the program as its
 /// keyword (`db.failureName`).
@@ -2847,85 +2848,50 @@ fn dbFailure(vm: *VM, err: anyerror) VmError {
     return vm.throwKeyword(db_mod.failureName(err));
 }
 
+/// The VM's I/O, or the process-wide single-threaded one for a VM
+/// the host gave none (a test harness): opening a store touches the
+/// file system either way.
+fn ioOf(vm: *VM) std.Io {
+    return vm.io orelse std.Io.Threaded.global_single_threaded.io();
+}
+
+/// `(db/open path)`: the store at `path`, created with its parent
+/// directories when absent (emdb creates only the file).
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
-    // `(db/open "/tmp/x.edb")` is the canonical form; a keyword
-    // or symbol argument is accepted as well (its interned name
-    // is the path).
-    const path_v = args[0];
-    const path_slice: []const u8 = blk: {
-        if (path_v.kind() == .string) break :blk string_mod.asBytes(path_v);
-        if (path_v.kind() == .keyword) {
-            const id: u32 = @intCast(path_v.payload);
-            break :blk vm.ensureInterner().keywordName(id);
-        }
-        if (path_v.kind() == .symbol) {
-            const id: u32 = @intCast(path_v.payload);
-            break :blk vm.ensureInterner().symbolName(id);
-        }
-        return VmError.KindMismatch;
-    };
-    // Heap-alloc the Connection on VM.allocator (NOT the arena).
+    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const path = string_mod.asBytes(args[0]);
+    const io = ioOf(vm);
+    if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    const path_z = vm.allocator.dupeZ(u8, path) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(path_z);
     const conn = vm.allocator.create(db_mod.Connection) catch return VmError.OutOfMemory;
     errdefer vm.allocator.destroy(conn);
-    const path_z = vm.allocator.dupeZ(u8, path_slice) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(path_z);
-
-    // Auto-create the path's parent directories so
-    // `(db/open "tmp/x.edb")` / `(db/open
-    // "data/v1/state.edb")` Just Work. emdb does NOT create
-    // parents; without this, the open fails with `:db/open-failed`
-    // unless the user pre-created the directory.
-    //
-    // The auto-create branch only fires when the VM was given
-    // a `std.Io` handle (the CLI sets one; ad-hoc test harnesses
-    // don't, and tests use absolute `/tmp/...` paths or
-    // pre-create their dirs explicitly). Best-effort: any error
-    // here is swallowed — emdb's open will surface
-    // `:db/open-failed` if the directory still isn't usable.
-    if (vm.io) |io_handle| {
-        if (std.fs.path.dirname(path_slice)) |dir| {
-            if (dir.len > 0) {
-                std.Io.Dir.cwd().createDirPath(io_handle, dir) catch {};
-            }
-        }
-    }
-
-    const heap = vm.ensureHeap();
-    const interner = vm.ensureInterner();
-    conn.* = db_mod.open(vm.allocator, heap, interner, path_z.ptr, .{}) catch |err| return dbFailure(vm, err);
-    // Register on VM safety-net list.
+    conn.* = db_mod.open(vm.allocator, io, vm.ensureHeap(), vm.ensureInterner(), path_z.ptr, .{}) catch |err| return dbFailure(vm, err);
     vm.db_close_callback = &dbCloseCallback;
-    vm.db_connections.append(vm.allocator, @ptrCast(conn)) catch return VmError.OutOfMemory;
-    return value_mod.Value{
-        .tag = @intFromEnum(value_mod.Kind.db_connection),
-        .payload = @intFromPtr(conn),
+    vm.db_connections.append(vm.allocator, @ptrCast(conn)) catch {
+        db_mod.shutdown(conn);
+        return VmError.OutOfMemory;
     };
+    return .{ .tag = @intFromEnum(Kind.db_connection), .payload = @intFromPtr(conn) };
 }
 
-/// Stand-alone closer used by VM.deinit safety net.
-/// Closes the emdb env AND destroys the Connection struct. The
-/// struct's own `allocator` field tells us how it was allocated.
+/// Teardown of the VM: close whatever is still open and free the
+/// struct. Only here is a Connection freed, so every ref, handle
+/// and connection Value that names one stays valid while the VM
+/// lives.
 fn dbCloseCallback(opaque_ptr: *anyopaque) void {
     const conn: *db_mod.Connection = @ptrCast(@alignCast(opaque_ptr));
-    if (conn.open_flag) db_mod.close(conn);
-    const allocator = conn.allocator;
-    allocator.destroy(conn);
+    db_mod.shutdown(conn);
+    conn.allocator.destroy(conn);
 }
 
+/// `(db/close conn)` → nil. Refs and handles of a closed connection
+/// report `:db-closed`; closing twice is nil; closing while one of
+/// its transactions is open is `:db/busy`.
 fn fnDbClose(vm: *VM, args: []const Value) VmError!Value {
-    const v = args[0];
-    if (v.kind() != .db_connection) return VmError.KindMismatch;
-    const conn: *db_mod.Connection = @ptrFromInt(v.payload);
-    // Remove from VM safety-net list.
-    var i: usize = 0;
-    while (i < vm.db_connections.items.len) : (i += 1) {
-        if (vm.db_connections.items[i] == @as(*anyopaque, @ptrCast(conn))) {
-            _ = vm.db_connections.swapRemove(i);
-            break;
-        }
-    }
-    db_mod.close(conn);
-    vm.allocator.destroy(conn);
+    if (args[0].kind() != .db_connection) return VmError.KindMismatch;
+    const conn: *db_mod.Connection = @ptrFromInt(args[0].payload);
+    db_mod.close(conn) catch |err| return dbFailure(vm, err);
     return value_mod.nilValue();
 }
 
@@ -3233,6 +3199,7 @@ const TreeCursor = struct {
     /// Open a cursor on `tree_name`. Null when the tree does not
     /// exist, which every caller treats as an empty tree.
     fn open(vm: *VM, tx_v: Value, tree_name: []const u8) VmError!?TreeCursor {
+        db_mod.validateTreeName(tree_name) catch |err| return dbFailure(vm, err);
         switch (try activeTxn(tx_v)) {
             inline else => |h| {
                 const tree_id = (db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err)) orelse return null;
