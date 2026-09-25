@@ -84,15 +84,15 @@ fn parseAll(gpa: Allocator, interner: *Interner, query: Value, args: []const Val
 const Reads = struct {
     items: []*db_mod.Read,
 
-    /// `db` is `$`; every later source comes from its input through
-    /// `options.db_of`.
-    fn open(arena: Allocator, db: DbValue, query: *const Ir, args: []const Value, options: Options, diag: *Diag) !Reads {
+    /// `db`, when given, is `$`; every other source comes from its
+    /// input through `options.db_of`.
+    fn open(arena: Allocator, db: ?DbValue, query: *const Ir, args: []const Value, options: Options, diag: *Diag) !Reads {
         const items = try arena.alloc(*db_mod.Read, query.sources.len);
         var opened: usize = 0;
         errdefer for (items[0..opened]) |r| r.close();
         for (query.in, args) |b, a| {
             if (b != .src) continue;
-            const d: DbValue = if (b.src == 0) db else blk: {
+            const d: DbValue = if (b.src == 0 and db != null) db.? else blk: {
                 const db_of = options.db_of orelse {
                     diag.* = .{ .message = "a data source after $ takes a db value" };
                     return error.QuerySyntax;
@@ -112,10 +112,10 @@ const Reads = struct {
     }
 };
 
-/// Run `query` against `db` with `args` positional to its `:in` (the
-/// `$` and `%` positions carry the db and the rules; a source after
-/// `$` is a db value). The result lives in `heap`.
-pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: DbValue, args: []const Value, diag: *Diag, options: Options) anyerror!Value {
+/// Run `query` with `args` positional to its `:in`: a source position
+/// carries a db value, the `%` position the rules. `db`, when given,
+/// is `$` in place of its input. The result lives in `heap`.
+pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: ?DbValue, args: []const Value, diag: *Diag, options: Options) anyerror!Value {
     var parsed = try parseAll(gpa, interner, query, args, diag, options);
     defer parsed.deinit();
 
@@ -136,7 +136,7 @@ pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: DbV
 }
 
 /// Print the plan of `query` against `db` to `w`.
-pub fn explain(gpa: Allocator, interner: *Interner, query: Value, db: DbValue, args: []const Value, diag: *Diag, options: Options, w: *std.Io.Writer) anyerror!void {
+pub fn explain(gpa: Allocator, interner: *Interner, query: Value, db: ?DbValue, args: []const Value, diag: *Diag, options: Options, w: *std.Io.Writer) anyerror!void {
     var parsed = try parseAll(gpa, interner, query, args, diag, options);
     defer parsed.deinit();
 

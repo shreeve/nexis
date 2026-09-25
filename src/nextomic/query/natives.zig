@@ -1,11 +1,11 @@
 //! query/natives.zig — `nextomic/q` and `nextomic/explain` (NEXTOMIC.md
 //! §5, §6).
 //!
-//! `(q query db & inputs)` runs `query.q` and returns the materialised
-//! result; `(explain query db & inputs)` returns the plan as a string.
-//! The inputs follow `:in` positionally after `$`, so the db is the
-//! `$` argument and the rest bind `?x`, `[?x ...]`, `[?a ?b]`,
-//! `[[?a ?b]]`, `%` and further db values for `$name` sources.
+//! `(q query & inputs)` runs `query.q` and returns the materialised
+//! result; `(explain query & inputs)` returns the plan as a string.
+//! The inputs follow `:in` positionally (`[$]` when the query has no
+//! `:in`): a db value for each source, the rules for `%`, and values
+//! for `?x`, `[?x ...]`, `[?a ?b]` and `[[?a ?b]]`.
 //!
 //! Caches: one IR cache and one rules cache per VM, on the natives'
 //! per-VM state (`natives.state`). A parsed query is pure syntax over
@@ -76,8 +76,8 @@ pub fn install(ns: *Namespace) !void {
     }
 }
 
-const native_q = NativeFn{ .name = "nextomic/q", .min_arity = 2, .max_arity = null, .call = &fnQ };
-const native_explain = NativeFn{ .name = "nextomic/explain", .min_arity = 2, .max_arity = null, .call = &fnExplain };
+const native_q = NativeFn{ .name = "nextomic/q", .min_arity = 1, .max_arity = null, .call = &fnQ };
+const native_explain = NativeFn{ .name = "nextomic/explain", .min_arity = 1, .max_arity = null, .call = &fnExplain };
 
 // =============================================================================
 // Errors
@@ -221,12 +221,11 @@ fn fnQ(vm: *VM, args: []const Value) VmError!Value {
 }
 
 fn qNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
-    const d = try natives.dbOf(args[1]);
     const st = try natives.state(vm);
     var hook = Hook.init(vm);
     defer hook.deinit();
     const options: query.Options = .{ .hook = hook.callHook(), .db_of = &natives.dbOf, .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };
-    return query.q(vm.allocator, vm.ensureInterner(), vm.ensureHeap(), args[0], d, args[1..], diag, options);
+    return query.q(vm.allocator, vm.ensureInterner(), vm.ensureHeap(), args[0], null, args[1..], diag, options);
 }
 
 fn fnExplain(vm: *VM, args: []const Value) VmError!Value {
@@ -235,14 +234,13 @@ fn fnExplain(vm: *VM, args: []const Value) VmError!Value {
 }
 
 fn explainNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
-    const d = try natives.dbOf(args[1]);
     const st = try natives.state(vm);
     var hook = Hook.init(vm);
     defer hook.deinit();
     const options: query.Options = .{ .hook = hook.callHook(), .db_of = &natives.dbOf, .ir_cache = &st.ir_cache, .rules_cache = &st.rules_cache };
     var out: std.Io.Writer.Allocating = .init(vm.allocator);
     defer out.deinit();
-    try query.explain(vm.allocator, vm.ensureInterner(), args[0], d, args[1..], diag, options, &out.writer);
+    try query.explain(vm.allocator, vm.ensureInterner(), args[0], null, args[1..], diag, options, &out.writer);
     return string_mod.fromBytes(vm.ensureHeap(), out.written());
 }
 

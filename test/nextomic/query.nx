@@ -94,6 +94,19 @@
 (println (rows (d/q '[:find ?n ?total :in $ ?status ?min :where [?o :order/status ?status] [?o :order/total ?total]
                      [(> ?total ?min)] [?o :order/customer ?e] [?e :person/name ?n]] db :status/open 20.0)))
 
+; --- queries over their inputs alone ---------------------------------------
+
+(println (d/q '[:find ?x :in [?x ...]] [1 2 3]))
+(println (rows (d/q '[:find ?x ?y :in [?x ...] ?y :where [(< ?x ?y)]] [1 2 3] 3)))
+(println (d/q '[:find (sum ?x) . :in [?x ...]] [1 2 3]))
+(println (rows (d/q '[:find ?x ?n :in ?x [[?n]] :where [(* ?x ?n) ?z] [(> ?z 5)]] 3 [[1] [2] [3]])))
+(println (d/q '[:find ?n . :in ?x $ :where [?e :person/age ?x] [?e :person/name ?n]] 41 db))
+(println (t/caught (d/q '[:find ?e :in ?x :where [?e :person/age ?x]] 1)))
+(println (t/caught (d/q '[:find ?e :in ?x :where [(missing? $ ?x :person/age)] [(identity ?x) ?e]] 1)))
+(println (t/caught (d/q '[:find (pull ?x [*]) :in ?x] 1)))
+(println (t/caught (d/q '[:find ?e :in $2 $ :where [?e :person/age 1]] db db)))
+(println (t/caught (d/q '[:find ?e :where [?e :person/age 1]])))
+
 ; --- predicates: built-in, defn'd, core, alias-qualified ------------------
 
 (defn adult? [age] (>= age 30))

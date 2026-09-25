@@ -459,15 +459,19 @@ row hash, sized up front.
 Estimates come from `treeStat` and per-attribute counts kept in
 `Schema`.
 
-**Sources.** `:in` starts with a data source, `$` or any `$name`
-(`:in $db ?x`); further `$name` bindings (`$2`, `$hist`) take db
-values, positional like every input, and may name another connection
-or a time view of the same one. A data pattern, a `missing?` or
+**Sources.** A query without `:in` reads `[$]`. `:in` binds data
+sources, `$` or any `$name` (`:in $db ?x`), positional like every
+input: each takes a db value and may name another connection or a time
+view of the same one. `:in` may name no source at all, `(d/q '[:find
+?x :in [?x ...] :where [(odd? ?x)]] [1 2 3])`: the query then runs over
+its inputs alone, and a pattern, a `missing?`, `get-else`, `get-some`
+or `fulltext` call, or a pull expression in it is
+`:nextomic/query-syntax`. A data pattern, a `missing?` or
 `get-else` call, or a rule call prefixed with a source reads it: `[$2
 ?e :a ?v]`, `[(missing? $2 ?e :a)]`, `($2 rule ?x)`; an unprefixed
 clause reads the first source, and so does `$`, whatever `:in` calls
-it, so `$` is declared first or not at all (`:nextomic/query-syntax`
-elsewhere). A rule body writes `$` or nothing and reads
+it, so `$` is the first source declared or none (`:nextomic/query-syntax`
+otherwise). A rule body writes `$` or nothing and reads
 the source its call names, so one rule set serves every source; a
 recursive component runs under one source. Each source is one read
 transaction for the whole query; attributes, idents, lookup refs and
@@ -584,8 +588,8 @@ sub-plans with the same output variables.
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
 | `(d/datoms db :eavt e a v tx added)` (index, its components in index order, then `tx` as a t or a transaction entity id and `added` as a boolean; nil leaves one unbound, later ones filter) | vector of `[e a v t added]` after the fold |
 | `(d/index-range db attr start end)` | the AVET datoms of an indexed or unique attribute with `start <= v < end` in value order; a nil bound is open; another attribute is `:nextomic/tx-data` naming it, a bound of the wrong type `:nextomic/value-type`. The cursor seeks to `start` and stops at `end`; the range test compares decoded values, so long strings and byte arrays (§2.2) are placed by value: a bound of 64 bytes or more seeks at its 64-byte prefix class, whose members the index may order by hash, and the class is scanned whole |
-| `(d/q query db & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]`, aggregates (built-in and custom) and `(pull ?e pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] % $2` with inputs positional after the db (a `$name` source takes a db value; `[$2 ?e :a ?v]` and `($2 rule ?x)` read it), `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
-| `(d/explain query db & inputs)` | the plan `q` would run, as an aligned table: one numbered line per step with its description (index, estimate, tree size, source when not `$`, bound variables marked `!`), the join a scan will run (`nested`, one seek per input row; `hash`, one scan of the constant prefix hash-joined on the shared variables; `fixpoint` for a recursive rule) and the estimated rows after the step; sub-plans indent under their step and end with `rows~` |
+| `(d/q query & inputs)` | §5; `:find` with `.`, `[...]`, `[[...]]`, aggregates (built-in and custom) and `(pull ?e pattern)`, `:keys`/`:strs`/`:syms`, `:with`, `:in $ ?x [?x ...] [?x ?y] [[?x ?y]] % $2` with inputs positional to `:in` (a source takes a db value, and a query may have none; `[$2 ?e :a ?v]` and `($2 rule ?x)` read it), `:where` with patterns, predicates, function bindings (a symbol or a bound variable in function position), `not`/`not-join`/`or`/`or-join`/`and`, rule calls; a relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
+| `(d/explain query & inputs)` | the plan `q` would run, as an aligned table: one numbered line per step with its description (index, estimate, tree size, source when not `$`, bound variables marked `!`), the join a scan will run (`nested`, one seek per input row; `hash`, one scan of the constant prefix hash-joined on the shared variables; `fixpoint` for a recursive rule) and the estimated rows after the step; sub-plans indent under their step and end with `rows~` |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4); `t` is a transaction number or a transaction's entity id |
 | `(d/excise! conn e)` / `(d/excise! conn e attr)` | §4 "Excision"; returns the recording transaction's report plus `:excised [e]` and `:removed`, the history rows that went |
 | `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}` for `from ≤ t < to`, oldest first, with `:excised [e ...]` on an entry an excision touched; a bound that is `nil` or not given is open |

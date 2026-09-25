@@ -8,9 +8,11 @@
 //!   - The IR is pure syntax (see `ir.zig`); nothing here touches a
 //!     store, so a parsed query is reusable across dbs and bases.
 //!   - Every `find` and `with` variable is bound by `in` or `where`.
-//!   - `in` variables are unique; `$` comes first and every source and
-//!     `%` appear at most once; a `$name` in a clause is declared in
-//!     `in`, and a rule body reads `$` only.
+//!   - `in` variables are unique; `$` is the first source when declared,
+//!     and every source and `%` appear at most once; a `$name` in a
+//!     clause is declared in `in`, and a rule body reads `$` only. `in`
+//!     may declare no source at all: the query then runs over its
+//!     inputs alone.
 //!   - `or` branches bind the same variables; `not` mentions at least
 //!     one variable.
 //!   - A `?variable` in function position is a `FnRef.variable`; it is
@@ -364,11 +366,10 @@ const Parser = struct {
         var out: std.ArrayList(ir.InBinding) = .empty;
         var seen: std.ArrayList(Var) = .empty;
         var has_rules = false;
-        for (items, 0..) |x, i| {
+        for (items) |x| {
             if (self.isSrcSym(x)) {
                 const sym = x.asSymbolId();
-                if (self.sources.items.len == 0 and i != 0) return self.fail(":in starts with a data source");
-                if (i != 0 and self.isSym(x, "$")) return self.fail("$ names the first data source; declare it first");
+                if (self.sources.items.len > 0 and self.isSym(x, "$")) return self.fail("$ names the first data source; declare it first");
                 for (self.sources.items) |s| if (s == sym) return self.fail("duplicate data source in :in");
                 try out.append(self.arena, .{ .src = @intCast(self.sources.items.len) });
                 try self.sources.append(self.arena, sym);
@@ -390,7 +391,6 @@ const Parser = struct {
                 }
             } else return self.fail("unknown :in binding form");
         }
-        if (self.sources.items.len == 0) return self.fail(":in starts with a data source");
         return out.toOwnedSlice(self.arena);
     }
 
@@ -428,6 +428,7 @@ const Parser = struct {
         self.clause_index = null;
         for (out.find) |f| {
             if (!ir.containsVar(bound.items, f.variable_of())) return self.fail(":find variable is not bound by :in or :where");
+            if (f == .pull and self.sources.items.len == 0) return self.fail("pull reads a data source, and :in names none");
         }
         for (out.with) |w| {
             if (!ir.containsVar(bound.items, w)) return self.fail(":with variable is not bound by :in or :where");
@@ -1028,9 +1029,16 @@ test "sources: $ first, $name prefixes on patterns, calls and rule calls" {
     try testing.expectEqual(@as(?ir.Src, 0), pn.where[1].pattern.src);
     try testing.expect(pn.where[2].pattern.src == null);
 
+    // A source may follow other inputs, and a query may have none.
+    const late = try parse(testing.allocator, &interner, b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("in"), b.sym("?x"), b.sym("$"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?x") }) }), &diag);
+    defer late.deinit();
+    try testing.expect(late.in[1] == .src and late.in[1].src == 0);
+    const none = try parse(testing.allocator, &interner, b.vec(&.{ b.kw("find"), b.sym("?x"), b.kw("in"), b.sym("?x") }), &diag);
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.sources.len);
+
     for ([_]Value{
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("in"), b.sym("$2"), b.sym("$"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),
-        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("in"), b.sym("?x"), b.sym("$"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?x") }) }),
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("in"), b.sym("$"), b.sym("$"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("$2"), b.sym("?e"), b.kw("a"), b.int(1) }) }),
     }) |bad| {

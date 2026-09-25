@@ -243,11 +243,13 @@ pub const Ctx = struct {
         try vars.appendSlice(arena, query.vars);
         const dbs = try arena.alloc(DbSource, reads.len);
         for (reads, dbs) |r, *d| d.* = .{ .read = r };
-        return .{ .arena = arena, .read = reads[0], .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
+        return .{ .arena = arena, .read = if (reads.len > 0) reads[0] else undefined, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
     }
 
-    /// Make `src` (null: `$`) the source the resolvers read.
-    pub fn select(self: *Ctx, src: ?ir.Src) void {
+    /// Make `src` (null: `$`) the source the resolvers read; a query
+    /// whose `:in` names no source has none to read.
+    pub fn select(self: *Ctx, src: ?ir.Src) error{QuerySyntax}!void {
+        if (self.dbs.len == 0) return self.syntax("this clause reads a data source, and :in names none");
         const next = src orelse 0;
         if (next == self.selected) return;
         self.dbs[self.selected].attr_cache = self.attr_cache;
@@ -383,11 +385,13 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
             const placed = switch (p.clause) {
                 .pred => |call| blk: {
                     if (!callBound(call, bound.items)) break :blk false;
+                    try callSources(ctx, call);
                     try steps.append(ctx.arena, .{ .pred = .{ .call = call } });
                     break :blk true;
                 },
                 .bind => |b| blk: {
                     if (!callBound(b.call, bound.items)) break :blk false;
+                    try callSources(ctx, b.call);
                     const outs = try b.out.vars(ctx.arena);
                     const fresh = try newVars(ctx.arena, outs, bound.items);
                     for (fresh) |v| try bound.append(ctx.arena, v);
@@ -526,6 +530,11 @@ fn placeRule(ctx: *Ctx, r: anytype, bound: *std.ArrayList(Var), steps: *std.Arra
 fn planSource(ctx: *Ctx, s: anytype, bound: []const Var) !Step {
     const fresh = try newVars(ctx.arena, s.vars, bound);
     return .{ .source = .{ .slot = ctx.sources.items[s.id], .vars = s.vars, .fresh = fresh } };
+}
+
+/// Every source a call's arguments name exists.
+fn callSources(ctx: *Ctx, call: ir.Call) error{QuerySyntax}!void {
+    for (call.args) |a| if (a == .src) try ctx.select(a.src);
 }
 
 /// A call can run once its function (when a variable) and every
@@ -711,12 +720,12 @@ fn choose(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !Choice {
 }
 
 fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !u64 {
-    ctx.select(p.src);
+    try ctx.select(p.src);
     return (try choose(ctx, p, bound)).estimate;
 }
 
 fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) Failure!Scan {
-    ctx.select(p.src);
+    try ctx.select(p.src);
     const choice = try choose(ctx, p, bound);
     const hash_choice: ?Choice = choose(ctx, p, &.{}) catch |err| switch (err) {
         error.UnboundPattern => null,

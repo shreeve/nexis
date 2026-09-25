@@ -19,6 +19,16 @@ Cy
 ([Ann 30 4294967296] [Bob 26 4294967297])
 ([Ann])
 ([Cy 42.0])
+#{[1] [2] [3]}
+([1 3] [2 3])
+6
+([3 2] [3 3])
+Cy
+{:error :nextomic/query-syntax, :message this clause reads a data source, and :in names none, :clause 0}
+{:error :nextomic/query-syntax, :message this clause reads a data source, and :in names none, :clause 0}
+{:error :nextomic/query-syntax, :message pull reads a data source, and :in names none}
+{:error :nextomic/query-syntax, :message $ names the first data source; declare it first}
+{:error :nextomic/query-syntax, :message wrong number of inputs}
 ([Ann] [Di] [Flo])
 ([Bob] [Edward])
 ([Di] [Flo])
