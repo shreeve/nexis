@@ -40,8 +40,8 @@ that begins `#!` is a comment, so a script can be made executable.
 **The REPL** prints a banner (`nexis repl`, then ``Type `:quit` or hit
 Ctrl-D to exit.``) and prompts with the current namespace (`user=> `,
 `other=> ` after `(ns other)`). It reads lines until they hold
-complete forms, so a form may span lines (with no second prompt) and
-a line may hold several; blank lines are skipped. It evaluates every
+complete forms, so a form or a string literal may span lines (with no
+second prompt) and a line may hold several; blank lines are skipped. It evaluates every
 form and prints each value on stdout as `prn` does, nil included,
 whatever its size. `*1`, `*2` and `*3` hold the last three values. A
 runtime error is reported on stderr, the frames, handlers and
@@ -67,7 +67,9 @@ nexis: test/golden/cli/bad-number.nx:5:10: reader error: :bad-number-literal 1-2
 ```
 
 The label is ``parse error: unexpected `)` `` or `parse error: unexpected
-end of input` at the token the parser stopped on; `reader error:
+end of input` at the token the parser stopped on, or `parse error:
+unterminated string` at the `"` of a string literal no quote closes;
+`reader error:
 :KIND DETAIL` at the form the reader rejected (`:duplicate-literal-key
 (keyword :a_b)`, FORMS.md §3); a `CompileError` name at the span
 COMPILER.md §7 gives. A macro expansion that failed adds the

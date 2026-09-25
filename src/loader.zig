@@ -183,6 +183,8 @@ pub const Loader = struct {
             const pos: u32 = @intCast(@min(parser.current.pos, text.len));
             if (pos >= text.len) {
                 try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unexpected end of input", .{});
+            } else if (unterminatedString(text[pos..])) {
+                try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unterminated string", .{});
             } else {
                 const len: u32 = @max(parser.current.len, 1);
                 try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = len }, .label = "", .reading = true }, "parse error: unexpected `{s}`", .{text[pos..@min(text.len, pos + len)]});
@@ -252,6 +254,20 @@ pub const Loader = struct {
             if (options.on_value) |each| each.call(each.ctx, last) catch |err| return mapCallbackError(err);
         }
         return last;
+    }
+
+    /// Whether `rest` opens a string literal that no unescaped `"`
+    /// closes: the parser stops at the opening quote, and more input
+    /// may complete it.
+    fn unterminatedString(rest: []const u8) bool {
+        if (rest.len == 0 or rest[0] != '"') return false;
+        var i: usize = 1;
+        while (i < rest.len) : (i += 1) switch (rest[i]) {
+            '\\' => i += 1,
+            '"' => return false,
+            else => {},
+        };
+        return true;
     }
 
     fn mapCallbackError(err: anyerror) EvalError {
