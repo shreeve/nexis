@@ -39,6 +39,7 @@ const std = @import("std");
 const value = @import("../value.zig");
 const vm_mod = @import("../vm.zig");
 const heap_mod = @import("../heap.zig");
+const gc = @import("../gc.zig");
 const string_mod = @import("../string.zig");
 const list_mod = @import("../coll/list.zig");
 const vector_mod = @import("../coll/vector.zig");
@@ -151,58 +152,32 @@ pub const State = struct {
     gpa: Allocator,
     ir_cache: query.Cache,
     rules_cache: query.RulesCache,
-    ir_roots: CacheRoots,
-    rules_roots: CacheRoots,
     /// The views of finished `with` scopes: closed, kept allocated for
     /// the db-values that name them, destroyed at VM teardown.
     views: std.ArrayList(*Conn) = .empty,
-};
-
-/// Keeps a cache's query values reachable: a var in `nexis.internal`
-/// whose root is the vector of them, slot for slot. Every var's root is
-/// a collector root (GC.md §3).
-const CacheRoots = struct {
-    holder: *vm_mod.Var,
-    heap: *Heap,
-
-    fn init(vm: *VM, name: []const u8) !CacheRoots {
-        const registry = try vm.ensureRegistry();
-        const ns = try registry.getOrCreate("nexis.internal", registry.core);
-        const heap = vm.ensureHeap();
-        const holder = try ns.intern(name);
-        holder.root = try vector_mod.empty(heap);
-        return .{ .holder = holder, .heap = heap };
-    }
-
-    fn roots(self: *CacheRoots) query.Roots {
-        return .{ .ctx = @ptrCast(self), .set = &set };
-    }
-
-    fn set(ctx: *anyopaque, slot: usize, v: Value) error{OutOfMemory}!void {
-        const self: *CacheRoots = @ptrCast(@alignCast(ctx));
-        const held = self.holder.root;
-        const next = if (slot < vector_mod.count(held)) vector_mod.assoc(self.heap, held, slot, v) else vector_mod.conj(self.heap, held, v);
-        self.holder.root = next catch return error.OutOfMemory;
-    }
 };
 
 /// The VM's state, created on first use.
 pub fn state(vm: *VM) !*State {
     if (vm.nextomic_query_state) |p| return @ptrCast(@alignCast(p));
     const s = try vm.allocator.create(State);
-    errdefer vm.allocator.destroy(s);
     s.* = .{
         .gpa = vm.allocator,
         .ir_cache = query.Cache.init(vm.allocator),
         .rules_cache = query.RulesCache.init(vm.allocator),
-        .ir_roots = try CacheRoots.init(vm, "#%query-cache"),
-        .rules_roots = try CacheRoots.init(vm, "#%rules-cache"),
     };
-    s.ir_cache.roots = s.ir_roots.roots();
-    s.rules_cache.roots = s.rules_roots.roots();
     vm.nextomic_query_state = @ptrCast(s);
     vm.nextomic_query_close = &closeState;
+    vm.nextomic_query_mark = &markState;
     return s;
+}
+
+/// The caches' query values are roots of the VM's own walk (GC.md §3),
+/// out of reach of anything a program can rebind.
+fn markState(ptr: *anyopaque, c: *gc.Collector) void {
+    const s: *State = @ptrCast(@alignCast(ptr));
+    s.ir_cache.mark(c);
+    s.rules_cache.mark(c);
 }
 
 fn closeState(ptr: *anyopaque) void {

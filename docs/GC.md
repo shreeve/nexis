@@ -82,14 +82,15 @@ VM's roots, in the order it marks them:
 6. **Pending `finally` throws** (`vm.finally_stack`), **the unhandled
    throw** and **the halt result** (`vm.result`).
 7. **The protocol registry**: every method implementation and default.
+8. **The Nextomic query caches**: the query value of every entry in the
+   per-VM parse and rule caches, through the hook the Nextomic natives
+   install (`vm.nextomic_query_mark`), since a parse borrows from its
+   query value (`docs/NEXTOMIC.md` §5).
 
 The interner holds no heap values (keywords and symbols are
 immediates). Open db and Nextomic connections hold none either; a
 durable ref, a transaction handle or a Nextomic db-value or entity is
-reachable from wherever the program keeps it. The Nextomic query caches
-keep their query values alive through the Vars
-`nexis.internal/#%query-cache` and `#%rules-cache`, which are roots
-like any Var.
+reachable from wherever the program keeps it.
 
 **Pinned is not a root.** A pinned block (`HeapHeader.isPinned`)
 survives every sweep whether or not it is reachable. The heap provides

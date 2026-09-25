@@ -197,6 +197,13 @@
             (= [:red :green] (d/q '[:find (max 2 ?t) . :where [_ :person/tags ?t]] db))
             (= #{[:blue]} (d/q '[:find ?t :where [_ :person/tags ?t] [(< ?t :c)]] db))
             (= #{[:green] [:red]} (d/q '[:find ?t :where [_ :person/tags ?t] [(>= ?t :green)]] db))))
+(t/check "an unqualified keyword orders before a qualified one, as compare orders them"
+  (let [ks [:b :a/b :c :b/a :ab]]
+    (and (= #{[:ab]} (d/q '[:find ?x :in [?x ...] :where [(< ?x :b)]] ks))
+         (= #{[:a/b] [:b/a]} (d/q '[:find ?x :in [?x ...] :where [(> ?x :c)]] ks))
+         (= [(first (sort ks)) (last (sort ks))] (d/q '[:find [(min ?x) (max ?x)] :in [?x ...]] ks))
+         (= (take 2 (sort ks)) (d/q '[:find (min 2 ?x) . :in [?x ...]] ks))
+         (= (take 2 (reverse (sort ks))) (d/q '[:find (max 2 ?x) . :in [?x ...]] ks)))))
 (println (d/q '[:find ?n . :where [?e :person/age 55] [?e :person/name ?n]] db))
 (println (d/q '[:find ?n . :where [?e :person/age 99] [?e :person/name ?n]] db))
 (println (sort (d/q '[:find [?n ...] :where [?e :person/boss _] [?e :person/name ?n]] db)))

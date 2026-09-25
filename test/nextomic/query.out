@@ -85,6 +85,7 @@ ok a sum past the fixnum range is a bignum, as + gives
 :nextomic/value-type
 (:blue :green :red)
 ok keywords compare and aggregate by name, as compare orders them
+ok an unqualified keyword orders before a qualified one, as compare orders them
 Edward
 nil
 (Bob Cy Di)

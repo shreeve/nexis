@@ -1453,10 +1453,12 @@ pub const VM = struct {
     nextomic_connections: std.ArrayList(*anyopaque) = .empty,
     nextomic_close_callback: ?*const fn (*anyopaque) void = null,
     /// The nextomic natives' per-VM state (parsed-query caches and
-    /// finished `with` scopes), created on first use and destroyed at
+    /// finished `with` scopes), created on first use, marked by every
+    /// collection through `nextomic_query_mark` and destroyed at
     /// teardown through `nextomic_query_close`. The natives own the cast.
     nextomic_query_state: ?*anyopaque = null,
     nextomic_query_close: ?*const fn (*anyopaque) void = null,
+    nextomic_query_mark: ?*const fn (*anyopaque, *gc_mod.Collector) void = null,
     /// Zig 0.16 `std.Io` handle for filesystem ops that live
     /// below the language surface —
     /// only `(db/open path)` uses it to auto-create the
@@ -1779,7 +1781,8 @@ pub const VM = struct {
     /// namespace (root, metadata, thread binding), the saved
     /// bindings of every open `binding` frame, the root stack,
     /// pending `finally` throws, the unhandled throw, the halt
-    /// result, and the protocol registry's implementations.
+    /// result, the protocol registry's implementations, and the query
+    /// values the Nextomic caches hold.
     fn gcRoots(ctx: *anyopaque, c: *gc_mod.Collector) void {
         const self: *VM = @ptrCast(@alignCast(ctx));
         for (self.stack.items) |v| c.markValue(v);
@@ -1809,6 +1812,7 @@ pub const VM = struct {
                 if (method.default_impl) |d| c.markValue(d);
             }
         }
+        if (self.nextomic_query_state) |state| self.nextomic_query_mark.?(state, c);
     }
 
     fn markNamespaceVars(c: *gc_mod.Collector, ns: *const Namespace) void {

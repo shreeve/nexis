@@ -459,9 +459,9 @@ past the native stack guard are the catchable `:stack-overflow`. The IR
 is pure syntax, so it is cached per VM by query value (a hit is the
 same value, or one `=` to it with lists and vectors told apart at every
 depth) and reused across every db and basis; the rule set bound to `%`
-is cached the same way. A parse borrows from its query, so each cache
-roots its query values through a var in `nexis.internal`, holds at most
-128 parses, and on a miss replaces the least recently used one no
+is cached the same way. A parse borrows from its query, so the VM's
+root walk marks every query value a cache holds (`docs/GC.md` §3); each
+cache holds at most 128 parses, and on a miss replaces the least recently used one no
 running query is using (`natives.State`). Constants in data patterns
 are encoded to their sortable bytes, and lookup refs and idents in
 constant positions resolve against the db, at plan time. `:in` inputs resolve
@@ -563,8 +563,9 @@ The built-ins are Zig over cells:
 
 An attribute `missing?`, `get-else` or `get-some` names that does not
 exist is `:nextomic/unknown-attribute`. An int and a double compare
-numerically, strings by their bytes and keywords by their text, as
-`compare` orders them; a comparison across other types (a string
+numerically, strings by their bytes and keywords as `compare`
+orders them (an unqualified keyword before any qualified one, then by
+namespace, then by name); a comparison across other types (a string
 against a number, a number against a keyword) or of any other value (a
 vector, a bignum) is `:nextomic/value-type`, as is an input or a
 function result whose shape does not fit its binding form. Any other
@@ -608,7 +609,7 @@ and `:with` variables) by the plain find elements: `count`, `sum`,
 largest, a vector), `(sample n ?x)` (up to n distinct values, a vector)
 and `(rand n ?x)` (n values with repetition, a vector). `min` and `max`
 take any type, in the cell order: nil, booleans, numbers, strings,
-keywords by their text, then other values in a stable order; `sum`,
+keywords as `compare` orders them, then other values in a stable order; `sum`,
 `avg`, `variance` and `stddev` take numbers (`:nextomic/value-type`
 otherwise), and a `sum` of integers past the fixnum range is a bignum,
 as `+` gives; `median` of an odd count is the middle value of any type,
