@@ -81,12 +81,13 @@ The compiler builds a context for each top-level form.
 For a list form `(head ...)` whose head is an unqualified symbol:
 
 1. **Special forms** (§2b) are recognized first and are never
-   shadowable or macro-overridable: `quote`, `syntax_quote`
-   (a datum), `let*`, `loop*`, `fn*`, `letfn*`, `def`, `defn`,
-   `var`, `recur`, `do`, `if`, `try`, `throw`, `defmacro`, `ns`,
-   `require`, and the internal constructors `#%list` / `#%concat`
-   / `#%vector` / `#%map` / `#%set` (whose arguments ARE
-   expanded).
+   shadowable or macro-overridable: the names of
+   `expand.special_forms` (`quote`, `var`, `if`, `do`, `recur`,
+   `throw`, `let*`, `loop*`, `fn*`, `letfn*`, `def`, `set!`,
+   `try`, `defmacro`, `ns`, `require`), each with its own walker,
+   and the internal `#%` primitives such as `#%list` / `#%concat` /
+   `#%vector` / `#%map` / `#%set`, whose arguments expand as a
+   call's do. `defn`, `let`, `fn` and `loop` are host macros.
 2. If the name is bound in the lexical `ExpandEnv` → ordinary
    call (§3).
 3. **User macro**: `ctx.namespace.lookup(name)` yields a Var with
@@ -294,7 +295,6 @@ that should be expanded.
 | `fn*` | Do NOT expand param vector or self-name symbol. Expand body with params + rest + self-name added to env. |
 | `letfn*` | Do NOT expand binding names or param vectors. Add all binding names to env FIRST. Expand each fn body with that env + the fn's params. Expand letfn body with the env. |
 | `def` | Do NOT expand def name. Expand value if present. Do NOT add def name to lexical env (Vars don't enter the env). |
-| `defn` | `(def name (fn name ...))`, so params destructure and overload clauses work as for `fn`. `^meta` on the name (`^:private f` reads as `{:private true}`), a docstring after the name (`:doc`) and an attribute map after that land on the Var: `(defn f "doc" {:k 1} [x] ...)` → `(let* [v# (def f (fn f [x] ...))] (nexis.core/reset-meta! v# {:doc "doc" :k 1 :arglists (quote ([x]))}) v#)`; a definition with none of them leaves the Var's metadata nil. `def` and `defmacro` take `^meta` and a docstring the same way. `(doc f)` prints the `:arglists` and `:doc` of `f`'s Var. |
 | `var` | Do NOT expand name. |
 | `recur` | Expand each arg (no env change). |
 | `try` | Expand the body forms; `catch MATCHER BINDING handler...` passes the matcher and binding symbols through and expands the handler with the binding in env; expand the `finally` body. |
@@ -634,7 +634,7 @@ rewrites it:
 | `condp` | `pred` and `expr` each evaluated once; clauses become `(if (p c_i e) v_i ...)` with the same default policy as `case`; no match throws the same `:no-matching-clause` map. No `:>>` syntax. |
 | `try` | `(try body* (catch M b h*)* (finally f*)?)` → the primitive `(try body* (catch any g <chain>) (finally f*)?)`, where the chain tries the clauses in order, `(if (nexis.internal/#%catch-matches? g M) (let* [b g] h*) ...)`, an `any` matcher needing no test, and ends in `(throw g)` so a value no clause takes unwinds through the `finally` to the enclosing `try`. A matcher is `any`, a keyword `:tag`, which takes a thrown value equal to `:tag`, a map whose `:error` entry is `:tag` (the shape of Nextomic's error maps and of the `case` no-match map), or an `ex-info` map (`{:message m :data d}`, `:cause` when given) whose data's `:error` is `:tag`, or, so code written for Clojure runs, a class-name symbol (`Exception`, `Throwable`, `clojure.lang.ExceptionInfo`, any symbol) or `:default`, which take every value as `any` does (nexis has no classes); anything else is `MacroExpansionFailure`. No clause at all is a finally-only `try`; neither catch nor finally makes the form `(do body*)`. |
 | `for` | Eager: one loop per binding pair (`(loop* [s# (seq src) acc# outer] (if s# (let [pat (first s#)] ... (recur (next s#) (conj acc# body))) acc#))`), each pair followed by any number of `:let [b]`, `:when t` and `:while t` in any order; a pattern destructures through `let`. `:when` skips the element, `:while` ends the loop it modifies (outer loops carry on), and both see the pattern and earlier `:let` names. The result is always a vector; no laziness. |
-| `->` | `(-> x)` → `x`; `(-> x f)` → `(f x)`; `(-> x (f a b))` → `(f x a b)`; steps chain left to right. A bare-symbol step is `(f)`; any other non-list step is `MacroExpansionFailure`. |
+| `->` | `(-> x)` → `x`; `(-> x f)` → `(f x)`; `(-> x (f a b))` → `(f x a b)`; steps chain left to right. A step that is not a list (a symbol, a keyword) is called with the threaded value alone; an empty-list step is `MacroExpansionFailure`. |
 | `->>` | Same, inserting the threaded value as the LAST argument. |
 | `defrecord` | Registers the record type and defines `T-type-id`, `->T` (the field map built as one map literal), `map->T`, `T?` and one impl per `(method [params] body)` clause under the protocol named by the preceding bare symbol (`docs/PROTOCOLS.md` §4); `T` itself is not bound. An inline method sees the record's fields as locals, read from the record it is called on, unless a parameter of the same name shadows one: `(defrecord Rect [w h] Shape (area [_] (* w h)))`. The Vars it defines are visible to `DeclaredNames`, so a form may refer to `->T` before the `defrecord`. |
 | `defprotocol` | `(do (def IFoo (nexis.internal/#%register-protocol "<ns>/IFoo" [:bar ...])) (def bar (nexis.internal/#%protocol-fn IFoo :bar)) ...)`; a docstring and `:option value` pairs before the methods are accepted and ignored, and method signatures beyond the name are ignored (`docs/PROTOCOLS.md` §4.1). |
