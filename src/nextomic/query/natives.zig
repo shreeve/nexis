@@ -17,7 +17,9 @@
 //! Rooting: a value a user function returns to the pipeline may end up
 //! in a relation cell that the next call back into the VM must not see
 //! collected, so the hook pushes every result on a root scope that
-//! lives as long as the `q` call (GC.md §3).
+//! lives as long as the `q` call (GC.md §3); `root` pushes the heap
+//! values the pipeline builds itself (a `tuple` bound as one value, an
+//! aggregate's vector or set) the same way.
 //!
 //! Functions: a predicate or function-binding symbol that is not a
 //! built-in resolves through the namespace registry the way the
@@ -137,7 +139,7 @@ pub const Hook = struct {
     }
 
     fn callHook(self: *Hook) query.CallHook {
-        return .{ .ctx = @ptrCast(self), .call = &call, .apply = &apply };
+        return .{ .ctx = @ptrCast(self), .call = &call, .apply = &apply, .root = &root };
     }
 
     fn call(ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value {
@@ -146,6 +148,11 @@ pub const Hook = struct {
         const result = try self.vm.callValue(callee, args);
         try self.scope.push(result);
         return result;
+    }
+
+    fn root(ctx: *anyopaque, v: Value) anyerror!void {
+        const self: *Hook = @ptrCast(@alignCast(ctx));
+        try self.scope.push(v);
     }
 
     /// Apply the value a variable in function position holds: a

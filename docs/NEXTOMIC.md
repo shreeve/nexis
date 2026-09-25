@@ -703,7 +703,10 @@ the `Env`.
   the operation on every path out of it, a throw included.
 - **The collector**: the query caches (§5) keep the query values they
   hold reachable through vars in `nexis.internal`; the `q` hook
-  roots every user-function result for the query's life; the entity
+  roots every user-function result for the query's life, and every
+  heap value the pipeline builds before the result (a `tuple` or
+  `fulltext` result bound as one value, an aggregate's vector or set);
+  the other built-ins bind in cell space and build nothing; the entity
   box keeps its db box and the map of its last full read reachable
   (`docs/GC.md` §3, §11.5).
 - **Nested calls**: user-function predicates, custom aggregates and
