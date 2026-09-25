@@ -45,23 +45,83 @@
 ; Conditional macros
 ; ============================================================
 
-; (when-let [name val-expr] body...)
-;   evaluates val-expr; if truthy, binds it to name and runs
-;   body, returning its last value. Else nil.
-(defmacro when-let [binding & body]
-  `(let* [bound# ~(first (rest binding))]
-     (if bound#
-       (let* [~(first binding) bound#]
-         (do ~@body))
-       nil)))
+; (if-let [binding test] then else?) → then with binding bound to
+; test's value when it is truthy, else. The binding may destructure.
+(defmacro if-let [binding then & else]
+  `(let [temp# ~(second binding)]
+     (if temp#
+       (let [~(first binding) temp#] ~then)
+       ~(first else))))
 
-; (if-let [name val-expr] then else)
-;   like when-let but with explicit else branch.
-(defmacro if-let [binding then else]
-  `(let* [bound# ~(first (rest binding))]
-     (if bound#
-       (let* [~(first binding) bound#] ~then)
-       ~else)))
+; (when-let [binding test] body...) → body when test is truthy.
+(defmacro when-let [binding & body]
+  `(let [temp# ~(second binding)]
+     (when temp#
+       (let [~(first binding) temp#] ~@body))))
+
+; (if-some [binding test] then else?) / (when-some [binding test]
+; body...) → as if-let / when-let, but only nil fails: false binds.
+(defmacro if-some [binding then & else]
+  `(let [temp# ~(second binding)]
+     (if (nil? temp#)
+       ~(first else)
+       (let [~(first binding) temp#] ~then))))
+
+(defmacro when-some [binding & body]
+  `(let [temp# ~(second binding)]
+     (if (nil? temp#)
+       nil
+       (let [~(first binding) temp#] ~@body))))
+
+; (when-first [x coll] body...) → body with x bound to the first
+; element, when coll has one.
+(defmacro when-first [binding & body]
+  `(let [s# (seq ~(second binding))]
+     (when s#
+       (let [~(first binding) (first s#)] ~@body))))
+
+; (comment ...) → nil; the body is never evaluated or compiled, so
+; it may hold anything that reads (PLAN §23 #27).
+(defmacro comment [& _] nil)
+
+; (doto x (f a) g ...) → x, after (f x a), (g x), ... in order.
+(defmacro doto [x & forms]
+  (let [g (gensym "doto")]
+    `(let [~g ~x]
+       ~@(map (fn [f] (if (seq? f) `(~(first f) ~g ~@(rest f)) `(~f ~g))) forms)
+       ~g)))
+
+; (defonce name expr) → defines name as expr's value unless it
+; already has one; expr is not evaluated then.
+(defmacro defonce [name expr]
+  `(let [v# (def ~name)]
+     (when-not (bound? v#) (def ~name ~expr))
+     v#))
+
+; (assert x) / (assert x message) → nil when x is truthy, else throws
+; ex-info "Assert failed: <message or the form>" whose data's :error
+; is :assertion-failed.
+(defmacro assert [x & message]
+  `(when-not ~x
+     (throw (ex-info (str "Assert failed: "
+                          ~(if (seq message) `(str ~(first message) "\n" (pr-str '~x)) `(pr-str '~x)))
+                     (hash-map (keyword "error") (keyword "assertion-failed"))))))
+
+; (time expr) → expr's value, after printing how long it took, as
+; Clojure's does.
+(defmacro time [expr]
+  `(let [start# (nano-time)
+         ret# ~expr]
+     (prn (str "Elapsed time: " (/ (double (- (nano-time) start#)) 1000000.0) " msecs"))
+     ret#))
+
+; (with-out-str body...) → what body printed, as a string; nothing
+; reaches stdout. Captures nest.
+(defmacro with-out-str [& body]
+  `(do (nexis.internal/#%push-out)
+       (try (do ~@body)
+            (catch any e# (nexis.internal/#%pop-out) (throw e#)))
+       (nexis.internal/#%pop-out)))
 
 ; (dotimes [name n-expr] body...)
 ;   runs body n times with name bound to 0..n-1.
@@ -469,6 +529,15 @@
     expr
     `(let* [~name ~expr]
        (as-> ~(first forms) ~name ~@(rest forms)))))
+
+; ============================================================
+; Printing to a string
+; ============================================================
+
+(defn newline [] (print "\n"))
+(defn print-str [& xs] (with-out-str (apply print xs)))
+(defn println-str [& xs] (with-out-str (apply println xs)))
+(defn prn-str [& xs] (with-out-str (apply prn xs)))
 
 ; ============================================================
 ; The command line

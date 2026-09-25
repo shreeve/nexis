@@ -325,8 +325,11 @@ const core_natives = table("", .{
     // Printing + I/O.
     .{ "print", 0, null, &fnPrint },
     .{ "println", 0, null, &fnPrintln },
+    .{ "pr", 0, null, &fnPr },
     .{ "prn", 0, null, &fnPrn },
     .{ "pr-str", 0, null, &fnPrStr },
+    .{ "bound?", 1, null, &fnBoundQ },
+    .{ "nano-time", 0, 0, &fnNanoTime },
     .{ "slurp", 1, 1, &fnSlurp },
     .{ "spit", 2, 2, &fnSpit },
     .{ "read-line", 0, 0, &fnReadLine },
@@ -404,6 +407,9 @@ const internal_natives = table("nexis.internal", .{
     .{ "#%kwargs", 1, 1, &fnKwargs },
     // deftest and run-tests: the name of the current namespace.
     .{ "#%current-ns", 0, 0, &fnCurrentNs },
+    // with-out-str: capture what the print functions write.
+    .{ "#%push-out", 0, 0, &fnPushOut },
+    .{ "#%pop-out", 0, 0, &fnPopOut },
 });
 
 const simd_natives = table("nexis.simd", .{
@@ -3438,94 +3444,101 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
 // Printing + I/O
 // =============================================================================
 //
-// `print` / `println` / `prn` write to the VM's stdout (via
-// `vm.io`); `pr-str` returns a String; `slurp` / `spit` read or
-// write UTF-8 files via `vm.io`. All six fns require `vm.io != null`;
-// ad-hoc test harnesses (which don't run user-source I/O paths)
-// leave `vm.io` null and these fns surface `:io-error` cleanly.
-// CLI bootstrap (`runFile` / `runRepl`) sets `vm.io = init.io`.
-//
-// Nil semantics:
-//   - `print` / `println` / `prn`  treat `nil` arg as the literal
-//     `"nil"` because they use `format(.display, ...)` directly.
-//   - `pr-str` similarly. (Readable mode also writes `"nil"`.)
-//   - `spit` uses str-semantics so `(spit path nil) → ""`.
-//
-// Each fn writes through format_mod, which lives in `src/format.zig`.
-// Print fns separate args with a single space (Clojure parity);
-// `println` and `prn` append a trailing newline.
+// `print` / `println` / `pr` / `prn` write to the innermost
+// `with-out-str` buffer, or to stdout through `vm.io` (`:io-error`
+// when the host gave the VM none); `pr-str` returns a string. The
+// arguments are separated by one space, as in Clojure; `println` and
+// `prn` end with a newline. `print`/`println` write display form
+// (`nil`, strings without quotes), `pr`/`prn`/`pr-str` readable form.
 
-/// Append a single Value to an Allocating buffer with optional
-/// leading separator. The writer is an Allocating buffer;
-/// WriteFailed from it means the backing
-/// allocator failed → OutOfMemory (not IoError). Print fns that
-/// drain to stdout later map THAT failure to IoError separately.
-fn writeOneAndSep(
-    w: *std.Io.Writer.Allocating,
-    v: Value,
-    mode: format_mod.FormatMode,
-    first: *bool,
-    interner: *const intern_mod.Interner,
-) VmError!void {
-    if (!first.*) {
-        w.writer.writeAll(" ") catch return VmError.OutOfMemory;
+/// The `with-out-str` buffers in force, innermost last. One isolate,
+/// one thread; each buffer is on the allocator of the VM that pushed
+/// it.
+var out_stack: std.ArrayList(std.ArrayList(u8)) = .empty;
+
+fn writeOut(vm: *VM, bytes: []const u8) VmError!void {
+    if (out_stack.items.len > 0) {
+        out_stack.items[out_stack.items.len - 1].appendSlice(vm.allocator, bytes) catch return VmError.OutOfMemory;
+        return;
     }
-    first.* = false;
-    format_mod.format(v, mode, &w.writer, interner) catch |err| switch (err) {
-        error.Utf8Error => return VmError.Utf8Error,
-        // Allocating-writer drain → allocator failure.
-        error.WriteFailed => return VmError.OutOfMemory,
-    };
-}
-
-fn writeBufferedToStdout(vm: *VM, bytes: []const u8) VmError!void {
     const io_handle = vm.io orelse return VmError.IoError;
     std.Io.File.stdout().writeStreamingAll(io_handle, bytes) catch return VmError.IoError;
 }
 
-fn fnPrint(vm: *VM, args: []const Value) VmError!Value {
+/// `args` formatted in `mode`, separated by spaces, into `w`. The
+/// writer is an Allocating buffer, so a failed write is an allocation
+/// failure.
+fn formatArgs(vm: *VM, w: *std.Io.Writer.Allocating, args: []const Value, mode: format_mod.FormatMode) VmError!void {
+    const interner = vm.ensureInterner();
+    for (args, 0..) |x, i| {
+        if (i > 0) w.writer.writeAll(" ") catch return VmError.OutOfMemory;
+        format_mod.format(x, mode, &w.writer, interner) catch |err| switch (err) {
+            error.Utf8Error => return VmError.Utf8Error,
+            error.WriteFailed => return VmError.OutOfMemory,
+        };
+    }
+}
+
+fn printArgs(vm: *VM, args: []const Value, mode: format_mod.FormatMode, newline: bool) VmError!Value {
     var w = std.Io.Writer.Allocating.init(vm.allocator);
     defer w.deinit();
-    const interner = vm.ensureInterner();
-    var first = true;
-    for (args) |x| try writeOneAndSep(&w, x, .display, &first, interner);
-    try writeBufferedToStdout(vm, w.written());
+    try formatArgs(vm, &w, args, mode);
+    if (newline) w.writer.writeAll("\n") catch return VmError.OutOfMemory;
+    try writeOut(vm, w.written());
     return value_mod.nilValue();
+}
+
+fn fnPrint(vm: *VM, args: []const Value) VmError!Value {
+    return printArgs(vm, args, .display, false);
 }
 
 fn fnPrintln(vm: *VM, args: []const Value) VmError!Value {
-    var w = std.Io.Writer.Allocating.init(vm.allocator);
-    defer w.deinit();
-    const interner = vm.ensureInterner();
-    var first = true;
-    for (args) |x| try writeOneAndSep(&w, x, .display, &first, interner);
-    // The trailing newline goes into the SAME Allocating buffer,
-    // so a WriteFailed here is allocator-fail, not I/O. Map to
-    // OOM. Real stdout-write failure surfaces from
-    // writeBufferedToStdout below as :io-error.
-    w.writer.writeAll("\n") catch return VmError.OutOfMemory;
-    try writeBufferedToStdout(vm, w.written());
-    return value_mod.nilValue();
+    return printArgs(vm, args, .display, true);
+}
+
+fn fnPr(vm: *VM, args: []const Value) VmError!Value {
+    return printArgs(vm, args, .readable, false);
 }
 
 fn fnPrn(vm: *VM, args: []const Value) VmError!Value {
-    var w = std.Io.Writer.Allocating.init(vm.allocator);
-    defer w.deinit();
-    const interner = vm.ensureInterner();
-    var first = true;
-    for (args) |x| try writeOneAndSep(&w, x, .readable, &first, interner);
-    w.writer.writeAll("\n") catch return VmError.OutOfMemory;
-    try writeBufferedToStdout(vm, w.written());
-    return value_mod.nilValue();
+    return printArgs(vm, args, .readable, true);
 }
 
 fn fnPrStr(vm: *VM, args: []const Value) VmError!Value {
     var w = std.Io.Writer.Allocating.init(vm.allocator);
     defer w.deinit();
-    const interner = vm.ensureInterner();
-    var first = true;
-    for (args) |x| try writeOneAndSep(&w, x, .readable, &first, interner);
+    try formatArgs(vm, &w, args, .readable);
     return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch return VmError.OutOfMemory;
+}
+
+/// `(#%push-out)` opens a `with-out-str` buffer; `(#%pop-out)` closes
+/// the innermost one and returns what was printed into it.
+fn fnPushOut(vm: *VM, _: []const Value) VmError!Value {
+    out_stack.append(vm.allocator, .empty) catch return VmError.OutOfMemory;
+    return value_mod.nilValue();
+}
+
+fn fnPopOut(vm: *VM, _: []const Value) VmError!Value {
+    var buf = out_stack.pop() orelse return VmError.InvalidArgument;
+    defer buf.deinit(vm.allocator);
+    if (out_stack.items.len == 0) out_stack.clearAndFree(vm.allocator);
+    return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch VmError.OutOfMemory;
+}
+
+/// `(bound? v & vs)` → whether every Var has a root value.
+fn fnBoundQ(_: *VM, args: []const Value) VmError!Value {
+    for (args) |v| {
+        if (v.kind() != .var_) return VmError.KindMismatch;
+        if (!VM.asVar(v).bound) return value_mod.fromBool(false);
+    }
+    return value_mod.fromBool(true);
+}
+
+/// `(nano-time)` → a monotonic clock in nanoseconds, for measuring
+/// intervals (Java's `System/nanoTime`).
+fn fnNanoTime(vm: *VM, _: []const Value) VmError!Value {
+    const now = std.Io.Clock.awake.now(ioOf(vm));
+    return value_mod.fromFixnum(@intCast(@mod(now.nanoseconds, value_mod.fixnum_max))) orelse VmError.ArithmeticOverflow;
 }
 
 /// `(slurp path)` — read a UTF-8 text file into a String.

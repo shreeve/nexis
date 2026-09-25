@@ -1021,6 +1021,37 @@ test "integration: core.nx if-let" {
     try expectOutput("(if-let [x (get {:a 1} :missing)] x :default)", ":default");
 }
 
+test "integration: core.nx if-let / when-let destructure, and if-let's else is optional" {
+    try expectOutput("(if-let [x 1] x)", "1");
+    try expectOutput("(if-let [x nil] x)", "nil");
+    try expectOutput("(when-let [[a b] [1 2]] b)", "2");
+    try expectOutput("(if-let [{:keys [a]} {:a 1}] a 0)", "1");
+    try expectOutput("(when-let [[a & more] (seq [])] a)", "nil");
+}
+
+test "integration: core.nx if-some / when-some bind false; when-first binds the first element" {
+    try expectOutput("[(if-some [x false] [:some x] :none) (if-some [x nil] :some :none) (if-some [x nil] :some)]", "[[:some false] :none nil]");
+    try expectOutput("[(when-some [x false] (str x)) (when-some [x nil] :unreached)]", "[false nil]");
+    try expectOutput("[(when-first [x [7 8]] (* x 2)) (when-first [x []] :unreached) (when-first [x nil] :unreached)]", "[14 nil nil]");
+}
+
+test "integration: core.nx comment, doto, defonce, assert and time" {
+    try expectOutputProgram("(comment (undefined-fn 1) (more)) 1", "1");
+    try expectOutput("(comment)", "nil");
+    try expectOutput("(let [a (atom [])] (deref (doto a (swap! conj 1) (swap! conj 2))))", "[1 2]");
+    try expectOutputProgram("(defonce x (atom 1)) (defonce x (atom 2)) @x", "1");
+    try expectOutputProgram("(def y 5) (defonce y 6) y", "5");
+    try expectOutput("[(assert (= 1 1)) (try (assert (= 1 2)) (catch :assertion-failed e (ex-message e)))]", "[nil Assert failed: (= 1 2)]");
+    try expectOutput("(try (assert false \"nope\") (catch any e (ex-message e)))", "Assert failed: nope\nfalse");
+    try expectOutput("(let [r (atom nil) s (with-out-str (reset! r (time (+ 1 2))))] [@r (subs s 0 15) (subs s (- (count s) 8))])", "[3 \"Elapsed time:   msecs\"\n]");
+}
+
+test "integration: with-out-str captures what the print functions write, nested and across a throw" {
+    try expectOutput("(pr-str (with-out-str (print \"a\" 1) (prn \"b\") (println :c) (pr 'd) (newline)))", "\"a 1\\\"b\\\"\\n:c\\nd\\n\"");
+    try expectOutput("(with-out-str (print \"x\") (print (count (with-out-str (print \"inner\")))))", "x5");
+    try expectOutput("[(try (with-out-str (print \"lost\") (throw :boom)) (catch :boom e e)) (with-out-str (print \"after\"))]", "[:boom after]");
+}
+
 test "integration: core.nx composite + HOFs" {
     try expectOutput("(reduce + 0 (range 10))", "45");
     try expectOutput("(count (filter odd? (range 10)))", "5");
