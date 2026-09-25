@@ -2541,8 +2541,8 @@ fn compileExpr(
     switch (form.*) {
         .nil => try e.emit(vm.asm_.loadNil(dst)),
         .bool => |b| try e.emit(if (b) vm.asm_.loadTrue(dst) else vm.asm_.loadFalse(dst)),
-        .int => |n| try compileIntLiteral(e, n, dst),
-        .literal => |v| try compileLiteral(e, v, dst),
+        .int => |n| try e.emit(vm.asm_.loadConst(dst, try e.addValueConst(value_mod.fromFixnum(n) orelse return CompileError.IntegerOutOfFixnumRange))),
+        .literal => |v| try e.emit(vm.asm_.loadConst(dst, try e.addValueConst(v))),
         .symbol => |name| try compileSymbol(e, name, dst),
         .qualified_symbol => |qs| try compileQualifiedSymbol(e, qs.ns, qs.name, dst),
         .coll => |c| try compileColl(e, c.op, c.items, dst),
@@ -2568,22 +2568,6 @@ fn compileExpr(
         .def => |d| try compileDef(e, d.name, d.value, dst),
         .var_ref => |v| try compileVarRef(e, v.ns, v.name, dst),
     }
-}
-
-fn compileIntLiteral(e: *Emitter, n: i64, dst: u12) CompileError!void {
-    const v = value_mod.fromFixnum(n) orelse
-        return CompileError.IntegerOutOfFixnumRange;
-    const c = try e.addValueConst(v);
-    try e.emit(vm.asm_.loadConst(dst, c));
-}
-
-/// Emit a generic Value constant. The Value must have
-/// stable identity (interned symbols/keywords, immediates,
-/// strings owned by the Interner). See `Tiny.literal` doc for
-/// the lifetime contract.
-fn compileLiteral(e: *Emitter, v: value_mod.Value, dst: u12) CompileError!void {
-    const c = try e.addValueConst(v);
-    try e.emit(vm.asm_.loadConst(dst, c));
 }
 
 /// `coll:<op>` over the items, each compiled into its slot of one
@@ -3072,13 +3056,8 @@ fn compileDo(
         try compileExpr(e, exprs[0], dst, recur_target);
         return;
     }
-    // Multi-expression: ALL non-last go to a SHARED discard
-    // slot (avoids the 999-slot blowup that
-    // `(do e1 e2 ... e1000)` would cause with fresh-per-expr
-    // allocation). Reusing one discard slot for all ignored
-    // results is the natural meaning of "compile this for its
-    // effect only" — not asymmetric liveness analysis.
-    // Non-last expressions are NOT in tail position.
+    // The forms before the last run for effect, into one discard
+    // slot, and are not in tail position.
     const discard = try e.allocSlot();
     for (exprs[0 .. exprs.len - 1]) |expr| {
         try compileExpr(e, expr, discard, null);
@@ -3286,54 +3265,23 @@ fn compileLetFnStar(
     try compileExpr(e, body, dst, recur_target);
 }
 
-/// Lower a function-call form: stage callee + args in a
-/// contiguous call block per VM.md §6 range-call ABI, emit
-/// `call:call`. The result lands in `dst`.
-///
-/// **Critical**: the entire `1 + args.len`
-/// contiguous call block MUST be reserved BEFORE compiling
-/// any sub-expression. A per-arg allocSlot pattern breaks
-/// silently when the callee or any arg's compilation
-/// allocates its own temp slots — the next arg's allocated
-/// slot is then not adjacent to the previous one,
-/// violating the range-call ABI invariant. Reserve up front;
-/// each sub-expression then targets its predetermined slot.
-///
-/// Slot-allocation correctness for "live across the call":
-/// `dst` was allocated by the caller before we entered, and
-/// the call block is allocated after `dst` (so `dst < call_base`).
-/// Per VM.md §6 the call-clobbered region is `[call_base ..
-/// call_base + slot_count)` — `dst` sits below this region
-/// and survives the call.
+/// A call through the range-call ABI (VM.md §6): the callee and
+/// the arguments in one contiguous block, then `call:call` writes the
+/// result to `dst`. The block is reserved before any sub-expression
+/// is compiled, so their temporaries land above it instead of
+/// breaking its contiguity; `dst`, allocated earlier, lies below the
+/// block and the callee's frame, so the call cannot clobber it.
 fn compileCall(
     e: *Emitter,
     callee: *const Tiny,
     args: []const *const Tiny,
     dst: u12,
 ) CompileError!void {
-    // 12-bit operand encoding: argc + 1 (closure slot) + 1 (room
-    // for the result slot peeking at most one beyond) must fit;
-    // 4095 max args is more than nexis will ever exercise.
-    if (args.len > 4095) return CompileError.SlotOverflow;
-
-    // Reserve the entire contiguous call block up front:
-    //   slot[call_base]                = closure
-    //   slot[call_base + 1 + i]        = arg i
-    const block_count: u32 = 1 + @as(u32, @intCast(args.len));
-    const call_base = try e.allocSlotBlock(block_count);
-
-    // Compile callee into call_base. Sub-expression may itself
-    // allocate temps; those land above the reserved block, which
-    // is correct (they're free-to-use by the time the call fires).
-    // Callee + args are non-tail (recur invalid inside call sites).
+    if (args.len >= std.math.maxInt(u12)) return CompileError.SlotOverflow;
+    const call_base = try e.allocSlotBlock(1 + @as(u32, @intCast(args.len)));
+    // The callee and the arguments are not in tail position.
     try compileExpr(e, callee, call_base, null);
-    // Compile each arg into its predetermined slot in the block.
-    for (args, 0..) |arg, i| {
-        const arg_slot: u12 = @intCast(@as(u32, call_base) + 1 + @as(u32, @intCast(i)));
-        try compileExpr(e, arg, arg_slot, null);
-    }
-
-    // Emit the call.
+    for (args, 1..) |arg, i| try compileExpr(e, arg, call_base + @as(u12, @intCast(i)), null);
     try e.emit(vm.asm_.callCall(call_base, @intCast(args.len), dst));
 }
 
