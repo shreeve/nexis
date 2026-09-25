@@ -1600,7 +1600,7 @@ fn renameHead(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, 
 ///     (let* [n# (count args#)]
 ///       (if (= n# 1) (loop [p1 (nth args# 0 nil)] b1)
 ///       (if (= n# 2) (loop [p1 (nth args# 0 nil) p2 (nth args# 1 nil)] b2)
-///       (if (not (< n# k)) (loop [... r (rest ... args#)] bv)
+///       (if (not (< n# k)) (loop [... r (next ... args#)] bv)
 ///       (throw :arity-mismatch))))))
 ///
 /// Fixed arities are tested in source order and the variadic clause
@@ -1648,9 +1648,10 @@ fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandE
         var bindings: std.ArrayList(*Form) = .empty;
         for (a.params[0..a.fixed], 0..) |p, k| try bindings.appendSlice(ctx.allocator, &.{ p, try b.list(.{ "nexis.core/nth", args, k, null }) });
         if (a.variadic) {
-            // `rest`, not `next`: an empty rest is `()` (VM.md §6).
+            // `next`, as `nthnext`: an empty rest is nil, as the VM
+            // binds a single-arity fn's (VM.md §6).
             var rest = args;
-            for (0..a.fixed) |_| rest = try b.list(.{ "nexis.core/rest", rest });
+            for (0..a.fixed) |_| rest = try b.list(.{ "nexis.core/next", rest });
             const pattern = a.params[a.fixed + 1];
             try bindings.appendSlice(ctx.allocator, &.{ pattern, try restSource(b, pattern, rest) });
         }

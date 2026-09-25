@@ -960,15 +960,17 @@ test "integration: sequential destructuring (let)" {
 test "integration: sequential destructuring with rest" {
     // MACROEXPAND.md §10 `let`: a vector pattern's rest is `next`,
     // nil once the source is exhausted; a fn rest parameter is the
-    // list the VM packs, nil when empty (VM.md §6), as in Clojure; a
-    // multi-arity fn's variadic arity binds `(rest args)`.
+    // list the VM packs, nil when empty (VM.md §6), as in Clojure,
+    // and so is a multi-arity fn's variadic rest, `(nthnext args n)`.
     try expectOutput("(let [[a & rest] [1 2 3 4]] rest)", "(2 3 4)");
     try expectOutput("(let [[a b & rest] [1 2 3 4 5]] rest)", "(3 4 5)");
     try expectOutput("(let [[a & r] [1 2 3]] r)", "(2 3)");
     try expectOutput("(nil? (let [[a & r] [1]] r))", "true");
     try expectOutput("(nil? (let [[a b & r] [1]] r))", "true");
     try expectOutput("((fn [& r] r))", "nil");
-    try expectOutput("((fn ([x & r] r)) 1)", "()");
+    try expectOutput("((fn ([x & r] r)) 1)", "nil");
+    try expectOutput("((fn ([x & r] r) ([] 0)) 1 2 3)", "(2 3)");
+    try expectOutput("((fn ([] 0) ([x & r] r)) 1)", "nil");
 }
 
 test "integration: sequential destructuring with :as" {
