@@ -5,18 +5,17 @@ the `list` heap kind (singly-linked immutable cons list). Derivative from
 `PLAN.md` §9.3, `docs/VALUE.md` §2.2, `docs/SEMANTICS.md` §2.6 / §3.2, and
 `docs/HEAP.md`.
 
-This is the second heap kind to land, and the first **collection** kind. It
-therefore exercises two new pieces of runtime machinery for the first time:
+The list is the simplest collection kind and carries two pieces of runtime
+machinery every collection shares:
 
 1. **Function-pointer plumbing** for per-kind operations that recursively
    hash or compare arbitrary elements. `list.zig` stays out of the dispatch
    import graph; the dispatcher passes `&dispatch.hashValue` and
    `&dispatch.equal` into `hashSeq` / `equalSeq` at the kind-switch.
-2. **Equality-category hashing.** Sequential collections (list, future
-   persistent-vector / lazy-seq / cons) share one hash domain byte so cross-
-   type equality `(= (list 1 2 3) [1 2 3])` survives the final
-   `mixKindDomain` step. Pinned in `docs/SEMANTICS.md` §3.2 (amended this
-   commit).
+2. **Equality-category hashing.** Sequential collections (list and
+   persistent vector) share one hash domain byte so cross-type equality
+   `(= (list 1 2 3) [1 2 3])` survives the final `mixKindDomain` step.
+   Pinned in `docs/SEMANTICS.md` §3.2.
 
 ---
 
@@ -129,22 +128,21 @@ plus whatever `heap.alloc` returns (OOM, Overflow). `empty` and
 
 **Panic contracts.** `head(empty)` and `tail(empty)` panic in safe
 builds — they represent a caller bug (should have checked `isEmpty`
-first). The language surface will expose nil-returning variants
-(`first`, `rest`) as stdlib functions layered on top.
+first). The language surface's nil-returning `first` and `rest` are
+stdlib functions layered on top.
 
 ---
 
 ### 4. Dispatch integration
 
-`dispatch.zig` gains two pieces of machinery this commit:
+`dispatch.zig` carries two pieces of machinery for it:
 
-1. **Sequential hash domain.** The existing `mixKindDomain(base,
-   kind_byte)` call at the tail of `dispatch.hashValue` is replaced
-   with `mixKindDomain(base, domainByteForKind(kind))`, where
+1. **Sequential hash domain.** `dispatch.hashValue` ends with
+   `mixKindDomain(base, domainByteForKind(kind))`, where
    `domainByteForKind` returns `0xF0` for every sequential kind
-   (today just `.list`) and the kind byte otherwise.
-2. **Category-aware equality.** `dispatch.equal` grows an equality-
-   category check: two Values whose categories match can still
+   (`.list`, `.persistent_vector`) and the kind byte otherwise.
+2. **Category-aware equality.** `dispatch.equal` checks the equality
+   category first: two Values whose categories match can still
    be `=` even when their kinds differ (list and vector are both
    sequential), while two Values whose categories differ are always
    `!=` without further dispatch.

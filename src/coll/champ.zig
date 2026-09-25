@@ -1,50 +1,34 @@
-//! coll/champ.zig — persistent map + set heap kind.
+//! coll/champ.zig — persistent map + set heap kinds.
 //!
 //! Authoritative spec: `docs/CHAMP.md`. Semantic framing:
-//! `docs/SEMANTICS.md` §2.6 (associative equality category) and §3.2
-//! (associative-domain hash byte `0xF1`, map entry-hash formula).
-//! Physical storage: `docs/HEAP.md`. Representation choices:
-//! `docs/VALUE.md` §2.2 (extended subkind taxonomy for
-//! `persistent_map` — four subkinds 0..3).
+//! `docs/SEMANTICS.md` §2.6 (associative and set equality categories)
+//! and §3.2 (hash-domain bytes `0xF1` / `0xF2`, map entry-hash
+//! formula). Physical storage: `docs/HEAP.md`. Representation
+//! choices: `docs/VALUE.md` §2.2.
 //!
-//! The file has two parts: the persistent map, then `persistent_set`
-//! as a parallel subkind family sharing the map's machinery.
+//! One trie implementation, `Trie(P)`, serves both kinds: a map's
+//! payload is an `Entry` (key + value, 32 bytes), a set's a bare key
+//! `Value` (16 bytes). The public `map*` / `set*` functions are thin
+//! wrappers over `MapTrie` and `SetTrie`.
 //!
-//! ## Subkind taxonomy
+//! ## Representation (CHAMP.md §3-§4)
 //!
-//!   - 0 = array-map (inline ≤ 8 entries; user-facing)
-//!   - 1 = CHAMP root (count + pointer to root node; user-facing)
-//!   - 2 = CHAMP interior node (two 32-bit bitmaps + compact payload;
-//!     internal, never escapes as a user-visible Value)
-//!   - 3 = collision node (shared 32-bit indexing hash + entries;
-//!     internal)
+//!   - subkind 0 = array-map / array-set: up to 8 payloads inline,
+//!     in association order.
+//!   - subkind 1 = CHAMP root: count + pointer to the root interior.
 //!
-//! Top-level `persistent_map` Values are ONLY subkinds 0 or 1. Subkinds
-//! 2/3 are heap-internal and asserted against at every dispatch entry
-//! point.
+//! Interior and collision nodes are internal: no Value ever points at
+//! one, and no header records which one a node is. Every walk derives
+//! it from the shift it reached the node at (a node reached past
+//! `MAX_TRIE_SHIFT` is a collision node).
 //!
 //! ## Dispatch plumbing (one-way terminal)
 //!
-//! This module does NOT import `dispatch.zig` (the established
-//! one-way-terminal rule — see `docs/CHAMP.md` §9 + `src/dispatch.zig`'s
-//! module-level comment). Every operation that needs to hash or
-//! compare an arbitrary Value takes a fn-pointer callback
-//! (`elementHash: *const fn (Value) u64`,
-//!  `elementEq: *const fn (Value, Value) bool`). The dispatcher wires
-//! `&dispatch.hashValue` and `&dispatch.equal` into each call at the
-//! `persistent_map` kind switch.
-//!
-//! ## Map surface
-//!
-//!   - construction: `mapEmpty`, `mapFromEntries`
-//!   - mutation (persistent): `mapAssoc`, `mapDissoc`
-//!   - query: `mapGet` (returns `MapLookup` union, nil-safe),
-//!     `mapCount`, `mapIsEmpty`
-//!   - dispatch entry points: `hashMap`, `equalMap`
-//!   - iterator: `MapIter` for hash accumulation and entry walks
-//!   - promotion: array-map → CHAMP at count=9; no demotion
-//!   - single-entry-subtree promotion on dissoc (preserves canonicality)
-//!   - keyword-keyed identity fast path in every equality call site
+//! This module does not import `dispatch.zig` (CHAMP.md §9). Every
+//! operation that hashes or compares arbitrary Values takes callbacks
+//! (`elementHash: *const fn (Value) u64`, `elementEq: *const fn
+//! (Value, Value) bool`); the dispatcher passes `&dispatch.hashValue`
+//! and `&dispatch.equal`.
 //!
 //! Transients are the separate `src/coll/transient.zig` module.
 
@@ -61,6 +45,9 @@ const HeapHeader = heap_mod.HeapHeader;
 
 const testing = std.testing;
 
+const ElementHash = *const fn (Value) u64;
+const ElementEq = *const fn (Value, Value) bool;
+
 // =============================================================================
 // Constants (CHAMP.md §5)
 // =============================================================================
@@ -71,29 +58,16 @@ pub const branch_mask: u32 = @as(u32, branch_factor) - 1; // 0x1F
 
 /// Shift at the deepest interior level. Levels 0..5 consume 5 bits each
 /// (30 total); level 6 consumes the remaining 2 bits (`shift == 30`).
-/// Any attempt to descend further triggers collision-node creation.
-///
-/// Typed `u8` (not `u5`) so recursive helpers can carry transient
-/// values up to `MAX_TRIE_SHIFT + branch_bits = 35` as "past-the-trie"
-/// sentinels without overflowing. Narrowed to u5 only at the `>> shift`
-/// site where the actual 5-bit shift amount is required.
+/// A node reached past it is a collision node. Typed `u8` so a walk
+/// can carry `MAX_TRIE_SHIFT + branch_bits` as the collision level.
 pub const MAX_TRIE_SHIFT: u8 = 30;
 
-/// Total trie levels before collision (levels 0..6 inclusive).
-pub const COLLISION_DEPTH: u8 = 7;
-
-/// Promotion threshold: array-map supports 0..array_map_max entries;
-/// the (array_map_max + 1)-th `assoc` with a new key promotes to CHAMP.
+/// An array-map or array-set holds up to this many payloads; the next
+/// distinct key promotes it to a CHAMP root.
 pub const array_map_max: u32 = 8;
-
-// =============================================================================
-// Subkind discriminators (VALUE.md §2.2; CHAMP.md §3)
-// =============================================================================
 
 pub const subkind_array_map: u16 = 0;
 pub const subkind_champ_root: u16 = 1;
-pub const subkind_champ_interior: u16 = 2;
-pub const subkind_champ_collision: u16 = 3;
 
 // =============================================================================
 // Public types (CHAMP.md §8)
@@ -111,232 +85,71 @@ pub const Entry = extern struct {
 };
 
 /// Nil-safe lookup result. `?Value` would conflate "absent" with
-/// "present with nil value" (CHAMP.md §6.6); this union makes the
-/// distinction explicit.
+/// "present with nil value" (CHAMP.md §6.6).
 pub const MapLookup = union(enum) {
     absent,
     present: Value,
 };
 
 // =============================================================================
-// Body layouts (CHAMP.md §4)
+// Body layouts (CHAMP.md §4). Each header is followed by its payloads
+// (and, for an interior, its child pointers).
 // =============================================================================
 
-/// Header of an array-map body. Followed immediately by `count`
-/// `Entry` structs — no padding, no length prefix beyond `count`.
-const ArrayMapBody = extern struct {
+/// Array-map / array-set: `count` payloads follow.
+const ArrayHeader = extern struct {
     count: u32,
     _pad: u32,
-
-    comptime {
-        std.debug.assert(@sizeOf(ArrayMapBody) == 8);
-        std.debug.assert(@alignOf(ArrayMapBody) == 4);
-    }
 };
 
-/// CHAMP-backed root. Always points at a subkind-2 (interior) or
-/// subkind-3 (collision) node; `root_node` is NEVER null at this
-/// subkind.
-const ChampRootBody = extern struct {
+/// CHAMP root. `root_node` is always an interior node.
+const RootBody = extern struct {
     count: u32,
     _pad: u32,
     root_node: *HeapHeader,
 
     comptime {
-        std.debug.assert(@sizeOf(ChampRootBody) == 16);
-        std.debug.assert(@offsetOf(ChampRootBody, "root_node") == 8);
+        std.debug.assert(@sizeOf(RootBody) == 16);
+        std.debug.assert(@offsetOf(RootBody, "root_node") == 8);
     }
 };
 
-/// Header of a CHAMP interior node body. Followed by
-/// `popCount(data_bitmap)` entries, then `popCount(node_bitmap)` child
-/// pointers. Invariant: `data_bitmap & node_bitmap == 0`.
-const ChampInteriorHeader = extern struct {
+/// Interior node: `popCount(data_bitmap)` payloads in ascending slot
+/// order, then `popCount(node_bitmap)` child pointers in descending
+/// slot order. `data_bitmap & node_bitmap == 0`.
+const InteriorHeader = extern struct {
     data_bitmap: u32,
     node_bitmap: u32,
-
-    comptime {
-        std.debug.assert(@sizeOf(ChampInteriorHeader) == 8);
-    }
 };
 
-/// Header of a collision-node body. Followed by `count` entries, all of
-/// which share the same 32-bit `shared_hash`. `count >= 2`.
-const ChampCollisionHeader = extern struct {
+/// Collision node: `count ≥ 2` payloads whose keys share the 32-bit
+/// indexing hash `shared_hash`, in association order.
+const CollisionHeader = extern struct {
     shared_hash: u32,
     count: u32,
-
-    comptime {
-        std.debug.assert(@sizeOf(ChampCollisionHeader) == 8);
-    }
 };
 
-// =============================================================================
-// Allocation helpers — one per subkind.
-//
-// Every path goes through `heap.alloc(.persistent_map, body_size)`, so
-// GC will see these blocks on the live list.
-// =============================================================================
-
-fn allocArrayMap(heap: *Heap, n: u32) !*HeapHeader {
-    std.debug.assert(n <= array_map_max);
-    const body_size = @sizeOf(ArrayMapBody) + @as(usize, n) * @sizeOf(Entry);
-    return heap.alloc(.persistent_map, body_size);
+comptime {
+    for (.{ ArrayHeader, InteriorHeader, CollisionHeader }) |H| std.debug.assert(@sizeOf(H) == 8);
 }
 
-fn allocChampRoot(heap: *Heap) !*HeapHeader {
-    return heap.alloc(.persistent_map, @sizeOf(ChampRootBody));
+inline fn headerOf(comptime H: type, h: *HeapHeader) *H {
+    return Heap.bodyOf(H, h);
 }
 
-fn allocChampInterior(heap: *Heap, entry_count: u32, child_count: u32) !*HeapHeader {
-    const entry_bytes = @as(usize, entry_count) * @sizeOf(Entry);
-    const child_bytes = @as(usize, child_count) * @sizeOf(*HeapHeader);
-    const body_size = @sizeOf(ChampInteriorHeader) + entry_bytes + child_bytes;
-    return heap.alloc(.persistent_map, body_size);
-}
-
-fn allocCollision(heap: *Heap, n: u32) !*HeapHeader {
-    std.debug.assert(n >= 2);
-    const body_size = @sizeOf(ChampCollisionHeader) + @as(usize, n) * @sizeOf(Entry);
-    return heap.alloc(.persistent_map, body_size);
+/// The first byte after a node's 8-byte header: where its payloads
+/// start.
+inline fn afterHeader(h: *HeapHeader) [*]u8 {
+    return @as([*]u8, @ptrCast(Heap.bodyOf(InteriorHeader, h))) + 8;
 }
 
 // =============================================================================
-// Body accessors — typed views over the zero-prefixed bytes.
+// Key equivalence and indexing hash
 // =============================================================================
 
-fn arrayMapBody(h: *HeapHeader) *ArrayMapBody {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len >= @sizeOf(ArrayMapBody));
-    return @ptrCast(@alignCast(body.ptr));
-}
-
-fn arrayMapBodyConst(h: *HeapHeader) *const ArrayMapBody {
-    return arrayMapBody(h);
-}
-
-fn arrayMapEntries(h: *HeapHeader) []Entry {
-    const body = Heap.bodyBytes(h);
-    const n = arrayMapBodyConst(h).count;
-    std.debug.assert(body.len == @sizeOf(ArrayMapBody) + @as(usize, n) * @sizeOf(Entry));
-    const entries_ptr: [*]Entry = @ptrCast(@alignCast(body.ptr + @sizeOf(ArrayMapBody)));
-    return entries_ptr[0..n];
-}
-
-fn champRootBody(h: *HeapHeader) *ChampRootBody {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len == @sizeOf(ChampRootBody));
-    return @ptrCast(@alignCast(body.ptr));
-}
-
-fn champRootBodyConst(h: *HeapHeader) *const ChampRootBody {
-    return champRootBody(h);
-}
-
-fn champInteriorHeader(h: *HeapHeader) *ChampInteriorHeader {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len >= @sizeOf(ChampInteriorHeader));
-    return @ptrCast(@alignCast(body.ptr));
-}
-
-fn champInteriorHeaderConst(h: *HeapHeader) *const ChampInteriorHeader {
-    return champInteriorHeader(h);
-}
-
-fn champInteriorEntries(h: *HeapHeader) []Entry {
-    const hdr = champInteriorHeaderConst(h);
-    const n = @popCount(hdr.data_bitmap);
-    const body = Heap.bodyBytes(h);
-    const entries_ptr: [*]Entry = @ptrCast(@alignCast(body.ptr + @sizeOf(ChampInteriorHeader)));
-    return entries_ptr[0..n];
-}
-
-fn champInteriorChildren(h: *HeapHeader) []*HeapHeader {
-    const hdr = champInteriorHeaderConst(h);
-    const n_entries = @popCount(hdr.data_bitmap);
-    const n_children = @popCount(hdr.node_bitmap);
-    const body = Heap.bodyBytes(h);
-    const entries_bytes = @as(usize, n_entries) * @sizeOf(Entry);
-    const children_ptr: [*]*HeapHeader = @ptrCast(@alignCast(body.ptr + @sizeOf(ChampInteriorHeader) + entries_bytes));
-    return children_ptr[0..n_children];
-}
-
-fn collisionHeader(h: *HeapHeader) *ChampCollisionHeader {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len >= @sizeOf(ChampCollisionHeader));
-    return @ptrCast(@alignCast(body.ptr));
-}
-
-fn collisionHeaderConst(h: *HeapHeader) *const ChampCollisionHeader {
-    return collisionHeader(h);
-}
-
-fn collisionEntries(h: *HeapHeader) []Entry {
-    const hdr = collisionHeaderConst(h);
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len == @sizeOf(ChampCollisionHeader) + @as(usize, hdr.count) * @sizeOf(Entry));
-    const entries_ptr: [*]Entry = @ptrCast(@alignCast(body.ptr + @sizeOf(ChampCollisionHeader)));
-    return entries_ptr[0..hdr.count];
-}
-
-// =============================================================================
-// Value packing — builds user-facing Values from internal headers.
-// =============================================================================
-
-fn valueFromArrayMap(h: *HeapHeader) Value {
-    return .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_map)) | (@as(u64, subkind_array_map) << 16),
-        .payload = @intFromPtr(h),
-    };
-}
-
-fn valueFromChampRoot(h: *HeapHeader) Value {
-    return .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_map)) | (@as(u64, subkind_champ_root) << 16),
-        .payload = @intFromPtr(h),
-    };
-}
-
-/// Resolve a user-facing map Value to its backing header. Asserts the
-/// top-level subkind discipline (CHAMP.md §3): user-facing maps are
-/// subkind 0 or 1 — subkinds 2/3 are internal and never appear in a
-/// user Value.
-fn mapHeader(v: Value) *HeapHeader {
-    std.debug.assert(v.kind() == .persistent_map);
-    const sk = v.subkind();
-    std.debug.assert(sk == subkind_array_map or sk == subkind_champ_root);
-    return Heap.asHeapHeader(v);
-}
-
-/// Public reconstruction helper for the transient module (TRANSIENT.md
-/// §8). Given a raw `*HeapHeader` of kind `.persistent_map`, builds a
-/// user-facing Value with the correct subkind inferred from the body
-/// size. Used by transient.zig to round-trip between mutable wrapper
-/// state and persistent ops.
-pub fn valueFromMapHeader(h: *HeapHeader) Value {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(h.kind == @intFromEnum(Kind.persistent_map));
-    }
-    const sk = inferRootSubkind(h);
-    return .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_map)) | (@as(u64, sk) << 16),
-        .payload = @intFromPtr(h),
-    };
-}
-
-// =============================================================================
-// Key equivalence — keyword-keyed fast path (CHAMP.md §6.5).
-//
-// Two-tier:
-//   (a) Bit-identity: same tag + same payload ⇒ definitely equal.
-//   (b) Keyword shortcut: both `.keyword` ⇒ interned-id compare; this
-//       is equivalent to `dispatch.equal` for this kind-pair by intern-
-//       table invariants, but skips the callback indirection.
-//   (c) Fall-through: delegate to `elementEq` (the general-purpose
-//       `dispatch.equal` callback).
-// =============================================================================
-
-inline fn keyEquivalent(a: Value, b: Value, elementEq: *const fn (Value, Value) bool) bool {
+/// Key equality with two shortcuts ahead of `elementEq` (CHAMP.md
+/// §6.5): bit identity, and interned-id identity for two keywords.
+inline fn keyEquivalent(a: Value, b: Value, elementEq: ElementEq) bool {
     if (a.tag == b.tag and a.payload == b.payload) return true;
     if (a.kind() == .keyword and b.kind() == .keyword) {
         return a.asKeywordId() == b.asKeywordId();
@@ -344,70 +157,828 @@ inline fn keyEquivalent(a: Value, b: Value, elementEq: *const fn (Value, Value) 
     return elementEq(a, b);
 }
 
-// =============================================================================
-// Indexing hash — low 32 bits of `dispatch.hashValue(key)`. Passed in
-// as a callback so this module stays one-way-terminal w.r.t. dispatch.
-// =============================================================================
-
-inline fn indexHashOf(k: Value, elementHash: *const fn (Value) u64) u32 {
-    // An immediate hashes kind-locally through `Value.hashImmediate`,
-    // which is what `dispatch.hashValue` computes for it; taking that
-    // path here skips the callback for keyword, fixnum and the other
-    // immediate keys. Only a heap key reaches the callback, so a
-    // fixture that shapes the indexing hash through `elementHash`
-    // must key by heap values (CHAMP.md §5.1).
+/// The low 32 bits of `dispatch.hashValue(k)` (CHAMP.md §5.1). An
+/// immediate hashes through `Value.hashImmediate`, which is what
+/// `dispatch.hashValue` computes for it, so only a heap key reaches
+/// the callback; a fixture that shapes the indexing hash through
+/// `elementHash` must key by heap values.
+inline fn indexHashOf(k: Value, elementHash: ElementHash) u32 {
     if (!k.kind().isHeap()) return @truncate(k.hashImmediate());
     return @truncate(elementHash(k));
 }
 
+inline fn slotOf(hash32: u32, shift: u8) u32 {
+    return (hash32 >> @intCast(shift)) & branch_mask;
+}
+
+inline fn bitOf(slot: u32) u32 {
+    return @as(u32, 1) << @intCast(slot);
+}
+
+/// Physical index of `slot` in the child segment, stored in
+/// descending slot order: the set bits of `node_bitmap` above `slot`.
+inline fn childIndex(node_bitmap: u32, slot: u32) usize {
+    const at_or_below: u32 = (bitOf(slot) - 1) | bitOf(slot);
+    return @popCount(node_bitmap & ~at_or_below);
+}
+
+/// Physical index of `slot` in the payload segment, stored in
+/// ascending slot order: the set bits of `data_bitmap` below `slot`.
+inline fn dataIndex(data_bitmap: u32, slot: u32) usize {
+    return @popCount(data_bitmap & (bitOf(slot) - 1));
+}
+
+/// `dst` = `src` with the element at `at` dropped when `had`, and
+/// `put` inserted there.
+/// Each path-copied node costs as few libc copies as the edit allows.
+inline fn splice(comptime T: type, dst: []T, src: []const T, at: usize, had: bool, put: ?T) void {
+    if (had == (put != null)) {
+        if (src.len > 0) @memcpy(dst, src);
+        if (put) |x| dst[at] = x;
+        return;
+    }
+    if (at > 0) @memcpy(dst[0..at], src[0..at]);
+    var w = at;
+    if (put) |x| {
+        dst[w] = x;
+        w += 1;
+    }
+    const rest = src[at + @intFromBool(had) ..];
+    if (rest.len > 0) @memcpy(dst[w..], rest);
+}
+
 // =============================================================================
-// Trie introspection for tests (CHAMP.md §12.3)
+// The trie, generic over its payload
 // =============================================================================
 
-/// The node reached by descending `root` along `hash32` through every
-/// trie level, i.e. the collision node its keys share, or `null` when
-/// the descent leaves the trie earlier: a slot with no child, at any
-/// level, means the keys hashing to `hash32` did not collide all the
-/// way down.
-fn collisionNodeFor(
-    root: *HeapHeader,
-    hash32: u32,
-    children: *const fn (*HeapHeader) []*HeapHeader,
-) ?*HeapHeader {
-    var node = root;
-    var shift: u8 = 0;
-    while (shift <= MAX_TRIE_SHIFT) : (shift += branch_bits) {
-        const hdr = champInteriorHeaderConst(node);
-        const slot: u32 = (hash32 >> @intCast(shift)) & branch_mask;
-        const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-        if ((hdr.node_bitmap & slot_bit) == 0) return null;
-        node = children(node)[childIndex(hdr.node_bitmap, slot)];
-    }
-    return node;
+fn Trie(comptime P: type, comptime kind: Kind) type {
+    return struct {
+        const is_map = P == Entry;
+
+        inline fn keyOf(p: P) Value {
+            return if (is_map) p.key else p;
+        }
+
+        /// Whether storing `new` over `old` (equal keys) changes
+        /// nothing: a set's payload is its key; a map's value must be
+        /// bit-identical (CHAMP.md §8.1).
+        inline fn sameValue(old: P, new: P) bool {
+            if (!is_map) return true;
+            return old.value.tag == new.value.tag and old.value.payload == new.value.payload;
+        }
+
+        /// `new` stored over `old` (equal keys): the original key
+        /// object stays, as in Clojure.
+        fn replaced(old: P, new: P) P {
+            return if (is_map) .{ .key = old.key, .value = new.value } else old;
+        }
+
+        // ---- allocation and accessors ----
+
+        inline fn arrayPayloads(h: *HeapHeader) []P {
+            const n = headerOf(ArrayHeader, h).count;
+            if (std.debug.runtime_safety) std.debug.assert(Heap.bodyBytes(h).len == 8 + @as(usize, n) * @sizeOf(P));
+            const ptr: [*]P = @ptrCast(@alignCast(afterHeader(h)));
+            return ptr[0..n];
+        }
+
+        inline fn payloads(h: *HeapHeader) []P {
+            const ptr: [*]P = @ptrCast(@alignCast(afterHeader(h)));
+            return ptr[0..@popCount(headerOf(InteriorHeader, h).data_bitmap)];
+        }
+
+        inline fn children(h: *HeapHeader) []*HeapHeader {
+            const hdr = headerOf(InteriorHeader, h);
+            const ptr: [*]*HeapHeader = @ptrCast(@alignCast(afterHeader(h) + @as(usize, @popCount(hdr.data_bitmap)) * @sizeOf(P)));
+            return ptr[0..@popCount(hdr.node_bitmap)];
+        }
+
+        inline fn collisionPayloads(h: *HeapHeader) []P {
+            const n = headerOf(CollisionHeader, h).count;
+            if (std.debug.runtime_safety) std.debug.assert(Heap.bodyBytes(h).len == 8 + @as(usize, n) * @sizeOf(P));
+            const ptr: [*]P = @ptrCast(@alignCast(afterHeader(h)));
+            return ptr[0..n];
+        }
+
+        fn allocArray(heap: *Heap, n: usize) !*HeapHeader {
+            std.debug.assert(n <= array_map_max);
+            const h = try heap.alloc(kind, @sizeOf(ArrayHeader) + n * @sizeOf(P));
+            headerOf(ArrayHeader, h).count = @intCast(n);
+            return h;
+        }
+
+        fn allocInterior(heap: *Heap, data_bitmap: u32, node_bitmap: u32) !*HeapHeader {
+            std.debug.assert(data_bitmap & node_bitmap == 0);
+            const size = @sizeOf(InteriorHeader) +
+                @as(usize, @popCount(data_bitmap)) * @sizeOf(P) +
+                @as(usize, @popCount(node_bitmap)) * @sizeOf(*HeapHeader);
+            const h = try heap.alloc(kind, size);
+            headerOf(InteriorHeader, h).* = .{ .data_bitmap = data_bitmap, .node_bitmap = node_bitmap };
+            return h;
+        }
+
+        fn allocCollision(heap: *Heap, shared_hash: u32, n: usize) !*HeapHeader {
+            std.debug.assert(n >= 2);
+            const h = try heap.alloc(kind, @sizeOf(CollisionHeader) + n * @sizeOf(P));
+            headerOf(CollisionHeader, h).* = .{ .shared_hash = shared_hash, .count = @intCast(n) };
+            return h;
+        }
+
+        fn valueOf(h: *HeapHeader, subkind: u16) Value {
+            return .{
+                .tag = @as(u64, @intFromEnum(kind)) | (@as(u64, subkind) << 16),
+                .payload = @intFromPtr(h),
+            };
+        }
+
+        fn newRoot(heap: *Heap, n: usize, node: *HeapHeader) !Value {
+            const h = try heap.alloc(kind, @sizeOf(RootBody));
+            headerOf(RootBody, h).* = .{ .count = @intCast(n), ._pad = 0, .root_node = node };
+            return valueOf(h, subkind_champ_root);
+        }
+
+        /// The subkind of a map or set root header, from its body size:
+        /// a CHAMP root is 16 bytes, which no array body (8 + n·32 or
+        /// 8 + n·16 bytes) can be.
+        fn inferSubkind(h: *HeapHeader) u16 {
+            std.debug.assert(h.kind == @intFromEnum(kind));
+            const size = Heap.bodyBytes(h).len;
+            if (size == @sizeOf(RootBody)) return subkind_champ_root;
+            if (std.debug.runtime_safety) {
+                const n = (size -| @sizeOf(ArrayHeader)) / @sizeOf(P);
+                if (size != @sizeOf(ArrayHeader) + n * @sizeOf(P) or n > array_map_max) {
+                    std.debug.panic("champ: body size {d} is no {s} root", .{ size, @tagName(kind) });
+                }
+            }
+            return subkind_array_map;
+        }
+
+        fn fromHeader(h: *HeapHeader) Value {
+            return valueOf(h, inferSubkind(h));
+        }
+
+        fn rootHeader(v: Value) *HeapHeader {
+            std.debug.assert(v.kind() == kind);
+            std.debug.assert(v.subkind() == subkind_array_map or v.subkind() == subkind_champ_root);
+            return Heap.asHeapHeader(v);
+        }
+
+        // ---- public operations ----
+
+        fn empty(heap: *Heap) !Value {
+            return valueOf(try allocArray(heap, 0), subkind_array_map);
+        }
+
+        fn count(v: Value) usize {
+            const h = rootHeader(v);
+            return if (v.subkind() == subkind_array_map) headerOf(ArrayHeader, h).count else headerOf(RootBody, h).count;
+        }
+
+        /// The payload whose key equals `key`, or null.
+        inline fn find(v: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) ?P {
+            const h = rootHeader(v);
+            if (v.subkind() == subkind_array_map) {
+                for (arrayPayloads(h)) |p| if (keyEquivalent(keyOf(p), key, elementEq)) return p;
+                return null;
+            }
+            const hash32 = indexHashOf(key, elementHash);
+            var node = headerOf(RootBody, h).root_node;
+            var shift: u8 = 0;
+            while (shift <= MAX_TRIE_SHIFT) : (shift += branch_bits) {
+                const hdr = headerOf(InteriorHeader, node);
+                const slot = slotOf(hash32, shift);
+                if (hdr.data_bitmap & bitOf(slot) != 0) {
+                    const p = payloads(node)[dataIndex(hdr.data_bitmap, slot)];
+                    return if (keyEquivalent(keyOf(p), key, elementEq)) p else null;
+                }
+                if (hdr.node_bitmap & bitOf(slot) == 0) return null;
+                node = children(node)[childIndex(hdr.node_bitmap, slot)];
+            }
+            if (headerOf(CollisionHeader, node).shared_hash != hash32) return null;
+            for (collisionPayloads(node)) |p| if (keyEquivalent(keyOf(p), key, elementEq)) return p;
+            return null;
+        }
+
+        /// `v` with `p` stored under its key (CHAMP.md §8.1): `v`
+        /// itself when that changes nothing.
+        fn insert(heap: *Heap, v: Value, p: P, elementHash: ElementHash, elementEq: ElementEq) !Value {
+            const h = rootHeader(v);
+            if (v.subkind() == subkind_array_map) {
+                const ps = arrayPayloads(h);
+                for (ps, 0..) |old, i| {
+                    if (!keyEquivalent(keyOf(old), keyOf(p), elementEq)) continue;
+                    if (sameValue(old, p)) return v;
+                    const nh = try allocArray(heap, ps.len);
+                    @memcpy(arrayPayloads(nh), ps);
+                    arrayPayloads(nh)[i] = replaced(old, p);
+                    return valueOf(nh, subkind_array_map);
+                }
+                if (ps.len < array_map_max) {
+                    const nh = try allocArray(heap, ps.len + 1);
+                    splice(P, arrayPayloads(nh), ps, ps.len, false, p);
+                    return valueOf(nh, subkind_array_map);
+                }
+                // Promotion (CHAMP.md §5.3): build the trie of the nine.
+                var items: [array_map_max + 1]Item = undefined;
+                for (ps, 0..) |old, i| items[i] = .{ .p = old, .hash = indexHashOf(keyOf(old), elementHash), .order = @intCast(i) };
+                items[array_map_max] = .{ .p = p, .hash = indexHashOf(keyOf(p), elementHash), .order = array_map_max };
+                std.mem.sortUnstable(Item, &items, {}, Item.lessThan);
+                return newRoot(heap, items.len, try build(heap, &items, 0));
+            }
+            const root = headerOf(RootBody, h);
+            var added = false;
+            const node = try insertIn(heap, root.root_node, p, indexHashOf(keyOf(p), elementHash), 0, elementHash, elementEq, &added);
+            if (node == root.root_node) return v;
+            return newRoot(heap, root.count + @intFromBool(added), node);
+        }
+
+        /// `node` (reached at `shift`) with `p` stored; `node` itself
+        /// when that changes nothing. Sets `added` for a new key.
+        fn insertIn(
+            heap: *Heap,
+            node: *HeapHeader,
+            p: P,
+            hash32: u32,
+            shift: u8,
+            elementHash: ElementHash,
+            elementEq: ElementEq,
+            added: *bool,
+        ) !*HeapHeader {
+            if (shift > MAX_TRIE_SHIFT) {
+                const ps = collisionPayloads(node);
+                for (ps, 0..) |old, i| {
+                    if (!keyEquivalent(keyOf(old), keyOf(p), elementEq)) continue;
+                    if (sameValue(old, p)) return node;
+                    const nh = try allocCollision(heap, hash32, ps.len);
+                    @memcpy(collisionPayloads(nh), ps);
+                    collisionPayloads(nh)[i] = replaced(old, p);
+                    return nh;
+                }
+                added.* = true;
+                const nh = try allocCollision(heap, hash32, ps.len + 1);
+                splice(P, collisionPayloads(nh), ps, ps.len, false, p);
+                return nh;
+            }
+            const hdr = headerOf(InteriorHeader, node).*;
+            const slot = slotOf(hash32, shift);
+            if (hdr.data_bitmap & bitOf(slot) != 0) {
+                const old = payloads(node)[dataIndex(hdr.data_bitmap, slot)];
+                if (keyEquivalent(keyOf(old), keyOf(p), elementEq)) {
+                    if (sameValue(old, p)) return node;
+                    return withSlot(heap, node, slot, .{ .data = replaced(old, p) });
+                }
+                // Two keys on one slot: they move into a subtree.
+                added.* = true;
+                const sub = try pair(heap, old, indexHashOf(keyOf(old), elementHash), p, hash32, shift + branch_bits);
+                return withSlot(heap, node, slot, .{ .child = sub });
+            }
+            if (hdr.node_bitmap & bitOf(slot) != 0) {
+                const child = children(node)[childIndex(hdr.node_bitmap, slot)];
+                const new_child = try insertIn(heap, child, p, hash32, shift + branch_bits, elementHash, elementEq, added);
+                if (new_child == child) return node;
+                return withSlot(heap, node, slot, .{ .child = new_child });
+            }
+            added.* = true;
+            return withSlot(heap, node, slot, .{ .data = p });
+        }
+
+        /// The subtree at `shift` holding `a` and `b`, distinct keys
+        /// whose hashes share the bits below `shift`: a collision node
+        /// past the last level, else an interior with both inline or,
+        /// when they share this level's slot too, one child.
+        fn pair(heap: *Heap, a: P, ha: u32, b: P, hb: u32, shift: u8) !*HeapHeader {
+            if (shift > MAX_TRIE_SHIFT) {
+                const h = try allocCollision(heap, ha, 2);
+                collisionPayloads(h)[0] = a;
+                collisionPayloads(h)[1] = b;
+                return h;
+            }
+            const sa = slotOf(ha, shift);
+            const sb = slotOf(hb, shift);
+            if (sa == sb) {
+                const h = try allocInterior(heap, 0, bitOf(sa));
+                children(h)[0] = try pair(heap, a, ha, b, hb, shift + branch_bits);
+                return h;
+            }
+            const h = try allocInterior(heap, bitOf(sa) | bitOf(sb), 0);
+            payloads(h)[@intFromBool(sa > sb)] = a;
+            payloads(h)[@intFromBool(sb > sa)] = b;
+            return h;
+        }
+
+        /// `v` without the payload keyed `key`; `v` itself when there
+        /// is none. A CHAMP root emptied by it becomes a fresh empty
+        /// array (CHAMP.md §5.6); there is no demotion otherwise
+        /// (§5.4).
+        fn remove(heap: *Heap, v: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) !Value {
+            const h = rootHeader(v);
+            if (v.subkind() == subkind_array_map) {
+                const ps = arrayPayloads(h);
+                for (ps, 0..) |old, i| {
+                    if (!keyEquivalent(keyOf(old), key, elementEq)) continue;
+                    const nh = try allocArray(heap, ps.len - 1);
+                    splice(P, arrayPayloads(nh), ps, i, true, null);
+                    return valueOf(nh, subkind_array_map);
+                }
+                return v;
+            }
+            const root = headerOf(RootBody, h);
+            const removed = (try removeIn(heap, root.root_node, key, indexHashOf(key, elementHash), 0, elementEq)) orelse return v;
+            if (root.count == 1) return empty(heap);
+            return newRoot(heap, root.count - 1, removed.node);
+        }
+
+        const Removed = union(enum) {
+            node: *HeapHeader,
+            /// The subtree is left holding this one payload, which
+            /// belongs inline in an ancestor (CHAMP.md §5.5). The root
+            /// (shift 0) never returns it.
+            single: P,
+        };
+
+        /// `node` (reached at `shift`) without `key`, or null when the
+        /// key is absent.
+        fn removeIn(heap: *Heap, node: *HeapHeader, key: Value, hash32: u32, shift: u8, elementEq: ElementEq) !?Removed {
+            if (shift > MAX_TRIE_SHIFT) {
+                const ps = collisionPayloads(node);
+                for (ps, 0..) |old, i| {
+                    if (!keyEquivalent(keyOf(old), key, elementEq)) continue;
+                    if (ps.len == 2) return .{ .single = ps[1 - i] };
+                    const nh = try allocCollision(heap, hash32, ps.len - 1);
+                    splice(P, collisionPayloads(nh), ps, i, true, null);
+                    return .{ .node = nh };
+                }
+                return null;
+            }
+            const hdr = headerOf(InteriorHeader, node).*;
+            const slot = slotOf(hash32, shift);
+            if (hdr.data_bitmap & bitOf(slot) != 0) {
+                const i = dataIndex(hdr.data_bitmap, slot);
+                if (!keyEquivalent(keyOf(payloads(node)[i]), key, elementEq)) return null;
+                if (shift > 0 and hdr.node_bitmap == 0 and @popCount(hdr.data_bitmap) == 2) {
+                    return .{ .single = payloads(node)[1 - i] };
+                }
+                return .{ .node = try withSlot(heap, node, slot, .empty) };
+            }
+            if (hdr.node_bitmap & bitOf(slot) == 0) return null;
+            const child = children(node)[childIndex(hdr.node_bitmap, slot)];
+            return switch ((try removeIn(heap, child, key, hash32, shift + branch_bits, elementEq)) orelse return null) {
+                .node => |c| .{ .node = try withSlot(heap, node, slot, .{ .child = c }) },
+                // A node whose only content was that child would hold
+                // the lone payload itself: it passes further up.
+                .single => |p| if (shift > 0 and hdr.data_bitmap == 0 and @popCount(hdr.node_bitmap) == 1)
+                    .{ .single = p }
+                else
+                    .{ .node = try withSlot(heap, node, slot, .{ .data = p }) },
+            };
+        }
+
+        const Slot = union(enum) { empty, data: P, child: *HeapHeader };
+
+        /// A copy of interior `src` with `slot` holding `new`: the one
+        /// path-copy primitive every insert and remove goes through.
+        inline fn withSlot(heap: *Heap, src: *HeapHeader, slot: u32, new: Slot) !*HeapHeader {
+            const hdr = headerOf(InteriorHeader, src).*;
+            const bit = bitOf(slot);
+            var data = hdr.data_bitmap & ~bit;
+            var nodes = hdr.node_bitmap & ~bit;
+            switch (new) {
+                .empty => {},
+                .data => data |= bit,
+                .child => nodes |= bit,
+            }
+            const h = try allocInterior(heap, data, nodes);
+            const put_data: ?P = switch (new) {
+                .data => |p| p,
+                else => null,
+            };
+            const put_child: ?*HeapHeader = switch (new) {
+                .child => |c| c,
+                else => null,
+            };
+            splice(P, payloads(h), payloads(src), dataIndex(hdr.data_bitmap, slot), hdr.data_bitmap & bit != 0, put_data);
+            splice(*HeapHeader, children(h), children(src), childIndex(hdr.node_bitmap, slot), hdr.node_bitmap & bit != 0, put_child);
+            return h;
+        }
+
+        // ---- bulk construction ----
+
+        const Item = struct {
+            p: P,
+            hash: u32,
+            /// Input position: equal hashes keep it (a collision node
+            /// is in association order).
+            order: u32,
+
+            /// Orders by the hash's slot on level 0, then level 1, and
+            /// so on, so every subtree's keys are contiguous; equal
+            /// hashes keep input order.
+            fn lessThan(_: void, a: Item, b: Item) bool {
+                const ra = @bitReverse(a.hash);
+                const rb = @bitReverse(b.hash);
+                return ra < rb or (ra == rb and a.order < b.order);
+            }
+        };
+
+        /// The canonical node at `shift` holding `items`, which are
+        /// sorted by `Item.lessThan`, have distinct keys, and share
+        /// the hash bits below `shift`; at least two below the root.
+        /// One allocation per node.
+        fn build(heap: *Heap, items: []const Item, shift: u8) !*HeapHeader {
+            if (shift > MAX_TRIE_SHIFT) {
+                const h = try allocCollision(heap, items[0].hash, items.len);
+                for (collisionPayloads(h), items) |*dst, item| dst.* = item.p;
+                return h;
+            }
+            var data: u32 = 0;
+            var nodes: u32 = 0;
+            var i: usize = 0;
+            while (i < items.len) {
+                const slot = slotOf(items[i].hash, shift);
+                const j = runEnd(items, i, shift);
+                if (j - i == 1) data |= bitOf(slot) else nodes |= bitOf(slot);
+                i = j;
+            }
+            const h = try allocInterior(heap, data, nodes);
+            i = 0;
+            while (i < items.len) {
+                const slot = slotOf(items[i].hash, shift);
+                const j = runEnd(items, i, shift);
+                if (j - i == 1) {
+                    payloads(h)[dataIndex(data, slot)] = items[i].p;
+                } else {
+                    children(h)[childIndex(nodes, slot)] = try build(heap, items[i..j], shift + branch_bits);
+                }
+                i = j;
+            }
+            return h;
+        }
+
+        fn runEnd(items: []const Item, start: usize, shift: u8) usize {
+            const slot = slotOf(items[start].hash, shift);
+            var j = start + 1;
+            while (j < items.len and slotOf(items[j].hash, shift) == slot) j += 1;
+            return j;
+        }
+
+        /// The map or set of `ps`, as a left fold of `insert` from empty
+        /// would build it (a later payload with an equal key replaces
+        /// the value, keeping the first key), built bottom-up with one
+        /// allocation per node.
+        fn fromSlice(heap: *Heap, ps: []const P, elementHash: ElementHash, elementEq: ElementEq) !Value {
+            const items = try heap.backing.alloc(Item, ps.len);
+            defer heap.backing.free(items);
+            for (ps, items, 0..) |p, *item, i| item.* = .{ .p = p, .hash = indexHashOf(keyOf(p), elementHash), .order = @intCast(i) };
+            std.mem.sortUnstable(Item, items, {}, Item.lessThan);
+            // Merge equal keys; they share a hash, so they are adjacent.
+            var n: usize = 0;
+            var i: usize = 0;
+            while (i < items.len) {
+                const run = n;
+                var j = i;
+                while (j < items.len and items[j].hash == items[i].hash) : (j += 1) {
+                    const item = items[j];
+                    for (items[run..n]) |*kept| {
+                        if (keyEquivalent(keyOf(kept.p), keyOf(item.p), elementEq)) {
+                            kept.p = replaced(kept.p, item.p);
+                            break;
+                        }
+                    } else {
+                        items[n] = item;
+                        n += 1;
+                    }
+                }
+                i = j;
+            }
+            if (n <= array_map_max) {
+                std.mem.sortUnstable(Item, items[0..n], {}, struct {
+                    fn byOrder(_: void, a: Item, b: Item) bool {
+                        return a.order < b.order;
+                    }
+                }.byOrder);
+                const h = try allocArray(heap, n);
+                for (arrayPayloads(h), items[0..n]) |*dst, item| dst.* = item.p;
+                return valueOf(h, subkind_array_map);
+            }
+            return newRoot(heap, n, try build(heap, items[0..n], 0));
+        }
+
+        // ---- dispatch entry points ----
+
+        /// The pre-domain-mix hash (CHAMP.md §7): an unordered combine
+        /// of payload hashes, cached in the root header at u32
+        /// precision (§7.5).
+        fn hashOf(h: *HeapHeader, elementHash: ElementHash) u64 {
+            if (h.cachedHash()) |cached| return cached;
+            var acc: u64 = hash_mod.unordered_init;
+            var n: usize = 0;
+            var it = Iter.init(fromHeader(h));
+            while (it.next()) |p| : (n += 1) {
+                acc = hash_mod.combineUnordered(acc, if (is_map) entryHash(p, elementHash) else elementHash(p));
+            }
+            const truncated: u32 = @truncate(hash_mod.finalizeUnordered(acc, n));
+            if (truncated != 0) h.setCachedHash(truncated);
+            return truncated;
+        }
+
+        /// Semantic equality (CHAMP.md §6.3): equal counts, and every
+        /// payload of `a` found in `b` (for a map, with an equal value).
+        fn equal(a: *HeapHeader, b: *HeapHeader, elementHash: ElementHash, elementEq: ElementEq) bool {
+            if (a == b) return true;
+            const va = fromHeader(a);
+            const vb = fromHeader(b);
+            if (count(va) != count(vb)) return false;
+            var it = Iter.init(va);
+            while (it.next()) |p| {
+                const q = find(vb, keyOf(p), elementHash, elementEq) orelse return false;
+                if (is_map and !elementEq(p.value, q.value)) return false;
+            }
+            return true;
+        }
+
+        /// Every payload of a map or set: array order for an array
+        /// root; otherwise depth first, each node's payloads before its
+        /// children. Equal CHAMP-backed maps iterate alike (CHAMP.md
+        /// §4.3) except inside collision nodes.
+        const Iter = struct {
+            /// The array root's payloads not yet returned.
+            flat: []const P = &.{},
+            /// Root interior first; at most seven interior levels and a
+            /// collision node below them.
+            stack: [8]Frame = undefined,
+            depth: u8 = 0,
+
+            const Frame = struct { node: *HeapHeader, shift: u8, data: u32 = 0, child: u8 = 0 };
+
+            pub fn init(v: Value) Iter {
+                const h = rootHeader(v);
+                if (v.subkind() == subkind_array_map) return .{ .flat = arrayPayloads(h) };
+                var it: Iter = .{ .depth = 1 };
+                it.stack[0] = .{ .node = headerOf(RootBody, h).root_node, .shift = 0 };
+                return it;
+            }
+
+            pub fn next(self: *Iter) ?P {
+                if (self.flat.len > 0) {
+                    defer self.flat = self.flat[1..];
+                    return self.flat[0];
+                }
+                while (self.depth > 0) {
+                    const top = &self.stack[self.depth - 1];
+                    const collision = top.shift > MAX_TRIE_SHIFT;
+                    const ps = if (collision) collisionPayloads(top.node) else payloads(top.node);
+                    if (top.data < ps.len) {
+                        top.data += 1;
+                        return ps[top.data - 1];
+                    }
+                    const cs = if (collision) &[_]*HeapHeader{} else children(top.node);
+                    if (top.child < cs.len) {
+                        top.child += 1;
+                        self.stack[self.depth] = .{ .node = cs[top.child - 1], .shift = top.shift + branch_bits };
+                        self.depth += 1;
+                    } else {
+                        self.depth -= 1;
+                    }
+                }
+                return null;
+            }
+        };
+
+        /// GC trace (GC.md §5): every key and value, and every internal
+        /// node through `markInternal`.
+        fn trace(h: *HeapHeader, visitor: anytype) void {
+            if (inferSubkind(h) == subkind_array_map) {
+                for (arrayPayloads(h)) |p| markPayload(p, visitor);
+            } else {
+                traceNode(headerOf(RootBody, h).root_node, 0, visitor);
+            }
+        }
+
+        fn traceNode(node: *HeapHeader, shift: u8, visitor: anytype) void {
+            if (!visitor.markInternal(node)) return;
+            if (shift > MAX_TRIE_SHIFT) {
+                for (collisionPayloads(node)) |p| markPayload(p, visitor);
+                return;
+            }
+            for (payloads(node)) |p| markPayload(p, visitor);
+            for (children(node)) |child| traceNode(child, shift + branch_bits, visitor);
+        }
+
+        fn markPayload(p: P, visitor: anytype) void {
+            if (is_map) {
+                visitor.markValue(p.key);
+                visitor.markValue(p.value);
+            } else visitor.markValue(p);
+        }
+
+        // ---- introspection for tests (CHAMP.md §4.3, §12.3) ----
+
+        fn collisionCount(v: Value, hash32: u32) ?u32 {
+            if (v.subkind() != subkind_champ_root) return null;
+            var node = headerOf(RootBody, rootHeader(v)).root_node;
+            var shift: u8 = 0;
+            while (shift <= MAX_TRIE_SHIFT) : (shift += branch_bits) {
+                const hdr = headerOf(InteriorHeader, node);
+                const slot = slotOf(hash32, shift);
+                if (hdr.node_bitmap & bitOf(slot) == 0) return null;
+                node = children(node)[childIndex(hdr.node_bitmap, slot)];
+            }
+            const hdr = headerOf(CollisionHeader, node);
+            std.debug.assert(hdr.shared_hash == hash32);
+            return hdr.count;
+        }
+
+        fn canonical(v: Value, elementHash: ElementHash) bool {
+            if (v.subkind() != subkind_champ_root) return true;
+            const root = headerOf(RootBody, rootHeader(v));
+            return canonicalNode(root.root_node, 0, 0, elementHash) == root.count;
+        }
+
+        /// The key count of the canonical subtree `node` at `shift`,
+        /// whose keys' indexing hashes all have `path` in their low
+        /// `shift` bits; null when the subtree is not canonical.
+        fn canonicalNode(node: *HeapHeader, shift: u8, path: u32, elementHash: ElementHash) ?usize {
+            const low: u32 = @truncate((@as(u64, 1) << @intCast(shift)) - 1);
+            if (shift > MAX_TRIE_SHIFT) {
+                const hdr = headerOf(CollisionHeader, node);
+                if (hdr.count < 2 or hdr.shared_hash != path) return null;
+                for (collisionPayloads(node)) |p| {
+                    if (indexHashOf(keyOf(p), elementHash) != hdr.shared_hash) return null;
+                }
+                return hdr.count;
+            }
+            const hdr = headerOf(InteriorHeader, node);
+            if (hdr.data_bitmap & hdr.node_bitmap != 0) return null;
+            var total: usize = 0;
+            var bits = hdr.data_bitmap;
+            for (payloads(node)) |p| {
+                const slot: u32 = @ctz(bits);
+                bits &= bits - 1;
+                const h = indexHashOf(keyOf(p), elementHash);
+                if (h & low != path or slotOf(h, shift) != slot) return null;
+                total += 1;
+            }
+            bits = hdr.node_bitmap;
+            for (children(node)) |child| {
+                const slot: u32 = 31 - @clz(bits);
+                bits &= ~bitOf(slot);
+                total += canonicalNode(child, shift + branch_bits, path | (slot << @intCast(shift)), elementHash) orelse return null;
+            }
+            if (shift > 0 and total < 2) return null;
+            return total;
+        }
+    };
 }
+
+const MapTrie = Trie(Entry, .persistent_map);
+const SetTrie = Trie(Value, .persistent_set);
+
+/// Per-entry hash (CHAMP.md §7.1): two ordered combines, no finalize,
+/// no inner domain mix. SEMANTICS.md §3.2 pins this formula.
+inline fn entryHash(e: Entry, elementHash: ElementHash) u64 {
+    var acc: u64 = hash_mod.ordered_init;
+    acc = hash_mod.combineOrdered(acc, elementHash(e.key));
+    acc = hash_mod.combineOrdered(acc, elementHash(e.value));
+    return acc;
+}
+
+// =============================================================================
+// Public API — map (CHAMP.md §8)
+// =============================================================================
+
+/// A fresh empty map: a zero-entry array-map, not a shared singleton.
+pub fn mapEmpty(heap: *Heap) !Value {
+    return MapTrie.empty(heap);
+}
+
+/// The map of `entries`; a later entry with an equal key wins
+/// (CHAMP.md §8.1). Built bottom-up: one allocation per node.
+pub fn mapFromEntries(heap: *Heap, entries: []const Entry, elementHash: ElementHash, elementEq: ElementEq) !Value {
+    return MapTrie.fromSlice(heap, entries, elementHash, elementEq);
+}
+
+pub fn mapCount(m: Value) usize {
+    return MapTrie.count(m);
+}
+
+pub fn mapGet(m: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) MapLookup {
+    const e = MapTrie.find(m, key, elementHash, elementEq) orelse return .absent;
+    return .{ .present = e.value };
+}
+
+/// `m` with `key → val` (CHAMP.md §8.1). Returns `m` itself when the
+/// key already maps to a bit-identical value; a replaced value keeps
+/// the original key object.
+pub fn mapAssoc(heap: *Heap, m: Value, key: Value, val: Value, elementHash: ElementHash, elementEq: ElementEq) !Value {
+    return MapTrie.insert(heap, m, .{ .key = key, .value = val }, elementHash, elementEq);
+}
+
+/// `m` without `key`; `m` itself when the key is absent (CHAMP.md
+/// §5.4-§5.6, §8.1).
+pub fn mapDissoc(heap: *Heap, m: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) !Value {
+    return MapTrie.remove(heap, m, key, elementHash, elementEq);
+}
+
+pub const MapIter = MapTrie.Iter;
+
+pub fn mapIter(m: Value) MapIter {
+    return MapIter.init(m);
+}
+
+/// A user-facing map Value for a root header (TRANSIENT.md §8), its
+/// subkind read off the body size.
+pub fn valueFromMapHeader(h: *HeapHeader) Value {
+    return MapTrie.fromHeader(h);
+}
+
+// =============================================================================
+// Public API — set
+// =============================================================================
+
+/// A fresh empty set: a zero-element array-set.
+pub fn setEmpty(heap: *Heap) !Value {
+    return SetTrie.empty(heap);
+}
+
+/// The set of `elems`, duplicates merged. Built bottom-up.
+pub fn setFromElements(heap: *Heap, elems: []const Value, elementHash: ElementHash, elementEq: ElementEq) !Value {
+    return SetTrie.fromSlice(heap, elems, elementHash, elementEq);
+}
+
+pub fn setCount(s: Value) usize {
+    return SetTrie.count(s);
+}
+
+pub fn setContains(s: Value, elem: Value, elementHash: ElementHash, elementEq: ElementEq) bool {
+    return SetTrie.find(s, elem, elementHash, elementEq) != null;
+}
+
+/// `s` with `elem`; `s` itself when `elem` is already present.
+pub fn setConj(heap: *Heap, s: Value, elem: Value, elementHash: ElementHash, elementEq: ElementEq) !Value {
+    return SetTrie.insert(heap, s, elem, elementHash, elementEq);
+}
+
+/// `s` without `elem`; `s` itself when `elem` is absent.
+pub fn setDisj(heap: *Heap, s: Value, elem: Value, elementHash: ElementHash, elementEq: ElementEq) !Value {
+    return SetTrie.remove(heap, s, elem, elementHash, elementEq);
+}
+
+pub const SetIter = SetTrie.Iter;
+
+pub fn setIter(s: Value) SetIter {
+    return SetIter.init(s);
+}
+
+pub fn valueFromSetHeader(h: *HeapHeader) Value {
+    return SetTrie.fromHeader(h);
+}
+
+// =============================================================================
+// Dispatch and GC entry points (CHAMP.md §9, GC.md §5)
+// =============================================================================
+
+/// Pre-domain-mix hash of a map root; `dispatch.hashValue` applies the
+/// `0xF1` domain mix.
+pub fn hashMap(h: *HeapHeader, elementHash: ElementHash) u64 {
+    return MapTrie.hashOf(h, elementHash);
+}
+
+/// Pre-domain-mix hash of a set root (domain byte `0xF2`).
+pub fn hashSet(h: *HeapHeader, elementHash: ElementHash) u64 {
+    return SetTrie.hashOf(h, elementHash);
+}
+
+pub fn equalMap(a: *HeapHeader, b: *HeapHeader, elementHash: ElementHash, elementEq: ElementEq) bool {
+    return MapTrie.equal(a, b, elementHash, elementEq);
+}
+
+pub fn equalSet(a: *HeapHeader, b: *HeapHeader, elementHash: ElementHash, elementEq: ElementEq) bool {
+    return SetTrie.equal(a, b, elementHash, elementEq);
+}
+
+pub fn traceMap(h: *HeapHeader, visitor: anytype) void {
+    MapTrie.trace(h, visitor);
+}
+
+pub fn traceSet(h: *HeapHeader, visitor: anytype) void {
+    SetTrie.trace(h, visitor);
+}
+
+// =============================================================================
+// Trie introspection for tests (CHAMP.md §4.3, §12.3)
+// =============================================================================
 
 /// The entry count of the collision node holding every key of `m`
-/// whose indexing hash is `hash32`, or `null` when no such node
-/// exists (an array-map, or a descent that ends above the collision
-/// layer). A collision fixture asserts through this that its keys
-/// reached the collision node at `MAX_TRIE_SHIFT`.
+/// whose indexing hash is `hash32`, or `null` when no such node exists
+/// (an array-map, or a descent that ends above the collision layer).
+/// A collision fixture asserts through this that its keys reached the
+/// collision node.
 pub fn mapCollisionCount(m: Value, hash32: u32) ?u32 {
-    if (m.subkind() != subkind_champ_root) return null;
-    const root = champRootBodyConst(Heap.asHeapHeader(m)).root_node;
-    const node = collisionNodeFor(root, hash32, &champInteriorChildren) orelse return null;
-    const hdr = collisionHeaderConst(node);
-    std.debug.assert(hdr.shared_hash == hash32);
-    return hdr.count;
+    return MapTrie.collisionCount(m, hash32);
 }
 
-/// Set counterpart of `mapCollisionCount`.
 pub fn setCollisionCount(s: Value, hash32: u32) ?u32 {
-    if (s.subkind() != subkind_champ_root) return null;
-    const root = champSetRootBodyConst(Heap.asHeapHeader(s)).root_node;
-    const node = collisionNodeFor(root, hash32, &setInteriorChildren) orelse return null;
-    const hdr = setCollisionHeaderConst(node);
-    std.debug.assert(hdr.shared_hash == hash32);
-    return hdr.count;
+    return SetTrie.collisionCount(s, hash32);
 }
 
 /// Whether the trie of map or set `v` has the canonical layout
@@ -417,2690 +988,11 @@ pub fn setCollisionCount(s: Value, hash32: u32) ?u32 {
 /// every node below the root holding at least two keys in its subtree
 /// (a subtree with one key is that key, inline in its parent). An
 /// array-map or array-set is trivially canonical.
-pub fn canonicalTrie(v: Value, elementHash: *const fn (Value) u64) bool {
-    if (v.subkind() != subkind_champ_root) return true;
-    const root = champRootBodyConst(Heap.asHeapHeader(v));
-    const total = switch (v.kind()) {
-        .persistent_map => canonicalNode(true, root.root_node, 0, 0, elementHash),
-        else => canonicalNode(false, root.root_node, 0, 0, elementHash),
+pub fn canonicalTrie(v: Value, elementHash: ElementHash) bool {
+    return switch (v.kind()) {
+        .persistent_map => MapTrie.canonical(v, elementHash),
+        else => SetTrie.canonical(v, elementHash),
     };
-    return total == root.count;
-}
-
-/// The key count of the canonical subtree `node` at `shift`, whose
-/// keys' indexing hashes all have `path` in their low `shift` bits;
-/// null when the subtree is not canonical.
-fn canonicalNode(comptime is_map: bool, node: *HeapHeader, shift: u8, path: u32, elementHash: *const fn (Value) u64) ?usize {
-    const low: u32 = @truncate((@as(u64, 1) << @intCast(shift)) - 1);
-    if (shift > MAX_TRIE_SHIFT) {
-        const hdr = collisionHeaderConst(node);
-        if (hdr.count < 2 or hdr.shared_hash != path) return null;
-        for (0..hdr.count) |i| {
-            const key = if (is_map) collisionEntries(node)[i].key else setCollisionElements(node)[i];
-            if (indexHashOf(key, elementHash) != hdr.shared_hash) return null;
-        }
-        return hdr.count;
-    }
-    const hdr = champInteriorHeaderConst(node);
-    if (hdr.data_bitmap & hdr.node_bitmap != 0) return null;
-    var total: usize = 0;
-    var bits = hdr.data_bitmap;
-    while (bits != 0) : (bits &= bits - 1) {
-        const slot: u32 = @ctz(bits);
-        const key = if (is_map) champInteriorEntries(node)[total].key else setInteriorElements(node)[total];
-        const h = indexHashOf(key, elementHash);
-        if (h & low != path or (h >> @intCast(shift)) & branch_mask != slot) return null;
-        total += 1;
-    }
-    const children = if (is_map) champInteriorChildren(node) else setInteriorChildren(node);
-    bits = hdr.node_bitmap;
-    for (children) |child| {
-        const slot: u32 = 31 - @clz(bits);
-        bits &= ~(@as(u32, 1) << @intCast(slot));
-        total += canonicalNode(is_map, child, shift + branch_bits, path | (slot << @intCast(shift)), elementHash) orelse return null;
-    }
-    if (shift > 0 and total < 2) return null;
-    return total;
-}
-
-// =============================================================================
-// Public API — construction & query (CHAMP.md §8)
-// =============================================================================
-
-/// Fresh empty map. Subkind 0 (array-map) with count 0. Not a shared
-/// singleton — every call allocates a new header (matches list / vector
-/// precedent).
-pub fn mapEmpty(heap: *Heap) !Value {
-    const h = try allocArrayMap(heap, 0);
-    const body = arrayMapBody(h);
-    body.count = 0;
-    body._pad = 0;
-    return valueFromArrayMap(h);
-}
-
-/// Build a map from an entry slice. Duplicate keys: later wins
-/// (CHAMP.md §8.1). Implementation is a left-fold of
-/// `mapAssoc`, which handles duplicate-key overwrite and promotion
-/// threshold automatically.
-pub fn mapFromEntries(
-    heap: *Heap,
-    entries: []const Entry,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    var result = try mapEmpty(heap);
-    for (entries) |e| {
-        result = try mapAssoc(heap, result, e.key, e.value, elementHash, elementEq);
-    }
-    return result;
-}
-
-pub fn mapCount(m: Value) usize {
-    const h = mapHeader(m);
-    return switch (m.subkind()) {
-        subkind_array_map => arrayMapBodyConst(h).count,
-        subkind_champ_root => champRootBodyConst(h).count,
-        else => unreachable,
-    };
-}
-
-pub fn mapIsEmpty(m: Value) bool {
-    return mapCount(m) == 0;
-}
-
-/// Looks up `key` in `m`. Returns `.absent` if the key is not present,
-/// or `.present = v` if it is (where `v` may itself be nil — nil is a
-/// legal map value, and the union makes the distinction explicit).
-pub fn mapGet(
-    m: Value,
-    key: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) MapLookup {
-    const h = mapHeader(m);
-    return switch (m.subkind()) {
-        subkind_array_map => arrayMapGet(h, key, elementEq),
-        subkind_champ_root => champGet(champRootBodyConst(h).root_node, key, indexHashOf(key, elementHash), 0, elementEq),
-        else => unreachable,
-    };
-}
-
-/// Associate `key → val` in `m`, returning a new persistent map.
-/// Semantics (CHAMP.md §8.1):
-///   - key already present with `=`-equal value → return `m` unchanged
-///     (pointer identity preserved; no allocation).
-///   - key already present with different value → replace value; count
-///     unchanged.
-///   - key absent, count < 8 at array-map → extend array-map.
-///   - key absent, count == 8 at array-map → promote to CHAMP.
-///   - CHAMP path → recursive path-copy.
-pub fn mapAssoc(
-    heap: *Heap,
-    m: Value,
-    key: Value,
-    val: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    const h = mapHeader(m);
-    return switch (m.subkind()) {
-        subkind_array_map => arrayMapAssoc(heap, m, h, key, val, elementHash, elementEq),
-        subkind_champ_root => champRootAssoc(heap, m, h, key, val, elementHash, elementEq),
-        else => unreachable,
-    };
-}
-
-/// Dissociate `key` from `m`, returning a new persistent map.
-/// Semantics (CHAMP.md §8.1):
-///   - key absent → return `m` unchanged (pointer identity preserved).
-///   - key present → return a new map with one fewer entry.
-///   - dissoc that leaves the CHAMP root with a single interior
-///     subtree whose subtree in turn holds a single entry triggers
-///     single-entry-subtree promotion (CHAMP.md §5.5).
-///   - dissoc that leaves an empty CHAMP root returns a fresh
-///     subkind-0 empty array-map (CHAMP.md §5.6).
-///   - no demotion to array-map when count drops back below 9
-///     (CHAMP.md §5.4).
-pub fn mapDissoc(
-    heap: *Heap,
-    m: Value,
-    key: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    const h = mapHeader(m);
-    return switch (m.subkind()) {
-        subkind_array_map => arrayMapDissoc(heap, m, h, key, elementEq),
-        subkind_champ_root => champRootDissoc(heap, m, h, key, elementHash, elementEq),
-        else => unreachable,
-    };
-}
-
-// =============================================================================
-// Array-map operations (subkind 0)
-// =============================================================================
-
-/// Linear scan lookup. O(n) for n ≤ 8 (worst case 8 compares).
-fn arrayMapGet(
-    h: *HeapHeader,
-    key: Value,
-    elementEq: *const fn (Value, Value) bool,
-) MapLookup {
-    const entries = arrayMapEntries(h);
-    for (entries) |e| {
-        // Synthetic elementHash is irrelevant here; array-map lookup
-        // is by structural key equality, not by indexing hash.
-        if (keyEquivalent(e.key, key, elementEq)) {
-            return .{ .present = e.value };
-        }
-    }
-    return .absent;
-}
-
-/// Find the index of `key` in the array-map, or null if absent.
-fn arrayMapFindKeyIndex(
-    h: *HeapHeader,
-    key: Value,
-    elementEq: *const fn (Value, Value) bool,
-) ?usize {
-    const entries = arrayMapEntries(h);
-    for (entries, 0..) |e, i| {
-        if (keyEquivalent(e.key, key, elementEq)) return i;
-    }
-    return null;
-}
-
-/// Array-map assoc. Three cases:
-///   (a) key already present, value equal → return `m` unchanged.
-///   (b) key already present, value different → replace value.
-///   (c) key absent:
-///       - count < 8 → grow by one.
-///       - count == 8 → promote to CHAMP.
-fn arrayMapAssoc(
-    heap: *Heap,
-    src_v: Value,
-    src_h: *HeapHeader,
-    key: Value,
-    val: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    const src_entries = arrayMapEntries(src_h);
-    // Case (a) / (b): key already present.
-    if (arrayMapFindKeyIndex(src_h, key, elementEq)) |idx| {
-        const existing = src_entries[idx];
-        if (existing.value.tag == val.tag and existing.value.payload == val.payload) {
-            return src_v; // same pointer, no allocation
-        }
-        // Replace-in-new-copy. Count unchanged.
-        const new_h = try allocArrayMap(heap, @intCast(src_entries.len));
-        const new_body = arrayMapBody(new_h);
-        new_body.count = @intCast(src_entries.len);
-        new_body._pad = 0;
-        const new_entries = arrayMapEntries(new_h);
-        @memcpy(new_entries, src_entries);
-        new_entries[idx].value = val;
-        return valueFromArrayMap(new_h);
-    }
-
-    // Case (c): key absent.
-    if (src_entries.len < array_map_max) {
-        // Grow array-map by 1.
-        const new_count: u32 = @as(u32, @intCast(src_entries.len)) + 1;
-        const new_h = try allocArrayMap(heap, new_count);
-        const new_body = arrayMapBody(new_h);
-        new_body.count = new_count;
-        new_body._pad = 0;
-        const new_entries = arrayMapEntries(new_h);
-        @memcpy(new_entries[0..src_entries.len], src_entries);
-        new_entries[src_entries.len] = .{ .key = key, .value = val };
-        return valueFromArrayMap(new_h);
-    }
-
-    // Promotion: count == 8, new key → CHAMP.
-    std.debug.assert(src_entries.len == array_map_max);
-    return arrayMapPromoteAndAssoc(heap, src_entries, key, val, elementHash, elementEq);
-}
-
-/// Array-map dissoc. Two cases:
-///   (a) key absent → return unchanged.
-///   (b) key present → return a new array-map with count - 1.
-fn arrayMapDissoc(
-    heap: *Heap,
-    src_v: Value,
-    src_h: *HeapHeader,
-    key: Value,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    const idx_opt = arrayMapFindKeyIndex(src_h, key, elementEq);
-    if (idx_opt == null) return src_v;
-
-    const idx = idx_opt.?;
-    const src_entries = arrayMapEntries(src_h);
-    const new_count: u32 = @as(u32, @intCast(src_entries.len)) - 1;
-    const new_h = try allocArrayMap(heap, new_count);
-    const new_body = arrayMapBody(new_h);
-    new_body.count = new_count;
-    new_body._pad = 0;
-    const new_entries = arrayMapEntries(new_h);
-    // Copy prefix [0..idx] and suffix [idx+1..].
-    if (idx > 0) @memcpy(new_entries[0..idx], src_entries[0..idx]);
-    if (idx < src_entries.len - 1) {
-        @memcpy(new_entries[idx..], src_entries[idx + 1 ..]);
-    }
-    return valueFromArrayMap(new_h);
-}
-
-/// Array-map → CHAMP promotion. Entry count is at array_map_max (8),
-/// and we're about to add a 9th distinct key. Rehash all 9 entries
-/// into a single CHAMP interior node (recursively splitting as their
-/// hash prefixes demand), wrap in a CHAMP root, return.
-fn arrayMapPromoteAndAssoc(
-    heap: *Heap,
-    existing: []const Entry,
-    new_key: Value,
-    new_val: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    // Start with a single-entry CHAMP interior holding the first entry,
-    // then assoc each subsequent entry into the growing structure.
-    // This is simpler than bulk-loading and guaranteed correct.
-    std.debug.assert(existing.len == array_map_max);
-    const first = existing[0];
-    var root_node = try champSingleEntryInterior(heap, first.key, first.value, indexHashOf(first.key, elementHash), 0);
-    var count: u32 = 1;
-    for (existing[1..]) |e| {
-        const res = try champAssocInNode(heap, root_node, e.key, e.value, indexHashOf(e.key, elementHash), 0, elementHash, elementEq);
-        root_node = res.node;
-        if (res.added) count += 1;
-    }
-    const res = try champAssocInNode(heap, root_node, new_key, new_val, indexHashOf(new_key, elementHash), 0, elementHash, elementEq);
-    root_node = res.node;
-    if (res.added) count += 1;
-    const root_h = try allocChampRoot(heap);
-    const root_body = champRootBody(root_h);
-    root_body.count = count;
-    root_body._pad = 0;
-    root_body.root_node = root_node;
-    return valueFromChampRoot(root_h);
-}
-
-// =============================================================================
-// CHAMP root operations (subkind 1)
-// =============================================================================
-
-/// Root-level assoc. Delegates to the subtree's assoc; wraps the
-/// result in a new root with updated count.
-fn champRootAssoc(
-    heap: *Heap,
-    src_v: Value,
-    src_h: *HeapHeader,
-    key: Value,
-    val: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    const src_body = champRootBodyConst(src_h);
-    const hash32 = indexHashOf(key, elementHash);
-    const res = try champAssocInNode(heap, src_body.root_node, key, val, hash32, 0, elementHash, elementEq);
-    if (res.node == src_body.root_node and !res.added and !res.replaced) {
-        // Pointer-identity short-circuit (same-value assoc on an
-        // existing key propagated up to the root unchanged).
-        return src_v;
-    }
-    const new_h = try allocChampRoot(heap);
-    const new_body = champRootBody(new_h);
-    new_body.count = if (res.added) src_body.count + 1 else src_body.count;
-    new_body._pad = 0;
-    new_body.root_node = res.node;
-    return valueFromChampRoot(new_h);
-}
-
-/// Root-level dissoc. On-absent returns unchanged. On-present recurses
-/// down the trie; the result may collapse to subkind-0 empty array-map
-/// when count drops to 0.
-fn champRootDissoc(
-    heap: *Heap,
-    src_v: Value,
-    src_h: *HeapHeader,
-    key: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    const src_body = champRootBodyConst(src_h);
-    const hash32 = indexHashOf(key, elementHash);
-    const res = try champDissocFromNode(heap, src_body.root_node, key, hash32, 0, elementEq);
-    if (!res.removed) return src_v;
-    const new_count = src_body.count - 1;
-    if (new_count == 0) {
-        // CHAMP.md §5.6: empty result collapses to subkind-0 empty
-        // array-map, NOT a subkind-1 root with null child.
-        return mapEmpty(heap);
-    }
-    // Build the new root_node. Three possibilities coming back from
-    // `champDissocFromNode`:
-    //   (i)  `res.node != null, res.promoted_single == null` —
-    //        the subtree was mutated but did not collapse; use it.
-    //   (ii) `res.node == null, res.promoted_single != null` —
-    //        single-entry-subtree promotion at the root. There is no
-    //        parent interior to migrate into, so we wrap the sole
-    //        entry in a fresh subkind-2 interior at shift 0 and make
-    //        THAT the new root_node (CHAMP.md §5.6: stay in CHAMP,
-    //        do not demote even at count 1).
-    //   (iii) `res.node == null, res.promoted_single == null` —
-    //         subtree completely emptied. Only possible when
-    //         `new_count == 0`, already handled above.
-    const new_root_node: *HeapHeader = if (res.promoted_single) |pulled| blk: {
-        break :blk try champSingleEntryInterior(
-            heap,
-            pulled.key,
-            pulled.value,
-            indexHashOf(pulled.key, elementHash),
-            0,
-        );
-    } else blk: {
-        std.debug.assert(res.node != null);
-        break :blk res.node.?;
-    };
-    const new_h = try allocChampRoot(heap);
-    const new_body = champRootBody(new_h);
-    new_body.count = new_count;
-    new_body._pad = 0;
-    new_body.root_node = new_root_node;
-    return valueFromChampRoot(new_h);
-}
-
-// =============================================================================
-// CHAMP internal ops — the trie walk
-// =============================================================================
-
-/// Result of a recursive assoc call.
-const AssocResult = struct {
-    node: *HeapHeader,
-    /// True when the node was structurally different (count increased
-    /// or a value changed) from the input. False when the caller is
-    /// looking at the same pointer with no change.
-    added: bool, // new key inserted
-    replaced: bool, // existing key, different value
-};
-
-/// Build a single-entry CHAMP interior at `shift`. Used during
-/// array-map → CHAMP promotion and when splitting a two-entry
-/// collision at the deepest level.
-fn champSingleEntryInterior(
-    heap: *Heap,
-    key: Value,
-    val: Value,
-    hash32: u32,
-    shift: u8,
-) !*HeapHeader {
-    std.debug.assert(shift <= MAX_TRIE_SHIFT);
-    const slot: u32 = (hash32 >> @intCast(shift)) & branch_mask;
-    const h = try allocChampInterior(heap, 1, 0);
-    const hdr = champInteriorHeader(h);
-    hdr.data_bitmap = @as(u32, 1) << @intCast(slot);
-    hdr.node_bitmap = 0;
-    const entries = champInteriorEntries(h);
-    entries[0] = .{ .key = key, .value = val };
-    return h;
-}
-
-/// Build a CHAMP interior node containing two inline entries at
-/// distinct slots `s1` and `s2` (s1 != s2). Entries sorted by slot
-/// index (ascending) per CHAMP.md §4.3.
-fn champTwoEntryInterior(
-    heap: *Heap,
-    k1: Value,
-    v1: Value,
-    slot1: u32,
-    k2: Value,
-    v2: Value,
-    slot2: u32,
-) !*HeapHeader {
-    std.debug.assert(slot1 != slot2);
-    const h = try allocChampInterior(heap, 2, 0);
-    const hdr = champInteriorHeader(h);
-    hdr.data_bitmap = (@as(u32, 1) << @intCast(slot1)) | (@as(u32, 1) << @intCast(slot2));
-    hdr.node_bitmap = 0;
-    const entries = champInteriorEntries(h);
-    // Slot-ascending order:
-    if (slot1 < slot2) {
-        entries[0] = .{ .key = k1, .value = v1 };
-        entries[1] = .{ .key = k2, .value = v2 };
-    } else {
-        entries[0] = .{ .key = k2, .value = v2 };
-        entries[1] = .{ .key = k1, .value = v1 };
-    }
-    return h;
-}
-
-/// Build a CHAMP interior node whose only content is a single child
-/// pointer at `slot`. Used during two-entry split when both entries
-/// hash to the same slot at this level.
-fn champSingleChildInterior(
-    heap: *Heap,
-    slot: u32,
-    child: *HeapHeader,
-) !*HeapHeader {
-    const h = try allocChampInterior(heap, 0, 1);
-    const hdr = champInteriorHeader(h);
-    hdr.data_bitmap = 0;
-    hdr.node_bitmap = @as(u32, 1) << @intCast(slot);
-    const children = champInteriorChildren(h);
-    children[0] = child;
-    return h;
-}
-
-/// Build a collision node with two entries sharing the same 32-bit
-/// indexing hash. Entries in association order (k1 first, then k2).
-fn champCollisionOfTwo(
-    heap: *Heap,
-    k1: Value,
-    v1: Value,
-    k2: Value,
-    v2: Value,
-    shared_hash: u32,
-) !*HeapHeader {
-    const h = try allocCollision(heap, 2);
-    const hdr = collisionHeader(h);
-    hdr.shared_hash = shared_hash;
-    hdr.count = 2;
-    const entries = collisionEntries(h);
-    entries[0] = .{ .key = k1, .value = v1 };
-    entries[1] = .{ .key = k2, .value = v2 };
-    return h;
-}
-
-/// Build a two-entry substructure at `shift` that holds both `k1 → v1`
-/// (hash1) and `k2 → v2` (hash2). Recurses if the slots collide until
-/// reaching MAX_TRIE_SHIFT; on collision at the deepest level, emits
-/// a collision node.
-fn champBuildTwoEntrySubtree(
-    heap: *Heap,
-    k1: Value,
-    v1: Value,
-    hash1: u32,
-    k2: Value,
-    v2: Value,
-    hash2: u32,
-    shift: u8,
-) !*HeapHeader {
-    if (shift > MAX_TRIE_SHIFT) {
-        // All 32 bits consumed and still the same — must be equal
-        // hashes. This entry point is only called after the caller
-        // has confirmed the keys are different; equal-key case is
-        // handled above (replace value).
-        std.debug.assert(hash1 == hash2);
-        return champCollisionOfTwo(heap, k1, v1, k2, v2, hash1);
-    }
-    const s1: u32 = (hash1 >> @intCast(shift)) & branch_mask;
-    const s2: u32 = (hash2 >> @intCast(shift)) & branch_mask;
-    if (s1 != s2) {
-        return champTwoEntryInterior(heap, k1, v1, s1, k2, v2, s2);
-    }
-    // Same slot at this level — recurse one level deeper. At shift
-    // == MAX_TRIE_SHIFT the recursive call goes past the trie
-    // (shift + branch_bits > MAX_TRIE_SHIFT) and hits the collision
-    // branch above on re-entry.
-    const next_shift: u8 = shift + branch_bits;
-    const child = try champBuildTwoEntrySubtree(heap, k1, v1, hash1, k2, v2, hash2, next_shift);
-    return champSingleChildInterior(heap, s1, child);
-}
-
-// ---- CHAMP node dispatch ----
-
-/// Look up `key` in any subtree node (interior or collision). Hash
-/// is only used at interior levels; collision nodes ignore it beyond
-/// the pre-check of `shared_hash`.
-/// Look up `key` in any subtree node (interior or collision). When
-/// `shift > MAX_TRIE_SHIFT`, the node IS a collision node (the caller
-/// just descended into a child at the deepest level); otherwise it's
-/// an interior node. Dispatch is shift-driven — no body-inspection
-/// heuristic.
-fn champGet(
-    node: *HeapHeader,
-    key: Value,
-    hash32: u32,
-    shift: u8,
-    elementEq: *const fn (Value, Value) bool,
-) MapLookup {
-    if (shift > MAX_TRIE_SHIFT) {
-        return collisionGet(node, key, hash32, elementEq);
-    }
-    return champInteriorGet(node, key, hash32, shift, elementEq);
-}
-
-/// Look up `key` in a CHAMP interior node. Descends into child nodes
-/// by hash fragment; returns on inline-entry match or miss.
-fn champInteriorGet(
-    node: *HeapHeader,
-    key: Value,
-    hash32: u32,
-    shift: u8,
-    elementEq: *const fn (Value, Value) bool,
-) MapLookup {
-    std.debug.assert(shift <= MAX_TRIE_SHIFT);
-    const hdr = champInteriorHeaderConst(node);
-    const slot: u32 = (hash32 >> @intCast(shift)) & branch_mask;
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-    if ((hdr.data_bitmap & slot_bit) != 0) {
-        // Inline entry at this slot — compare keys.
-        const idx_in_entries = @popCount(hdr.data_bitmap & (slot_bit - 1));
-        const e = champInteriorEntries(node)[idx_in_entries];
-        if (keyEquivalent(e.key, key, elementEq)) {
-            return .{ .present = e.value };
-        }
-        return .absent;
-    }
-    if ((hdr.node_bitmap & slot_bit) != 0) {
-        // Child pointer at this slot — recurse one level deeper.
-        // At shift == MAX_TRIE_SHIFT the child is a collision node;
-        // `champGet` detects this via `shift > MAX_TRIE_SHIFT`.
-        const idx_in_children = childIndex(hdr.node_bitmap, slot);
-        const child = champInteriorChildren(node)[idx_in_children];
-        const next_shift: u8 = shift + branch_bits;
-        return champGet(child, key, hash32, next_shift, elementEq);
-    }
-    return .absent;
-}
-
-/// Look up `key` in a collision node. First gate the shared hash; if
-/// it mismatches, the key cannot possibly be in this bucket.
-fn collisionGet(
-    node: *HeapHeader,
-    key: Value,
-    hash32: u32,
-    elementEq: *const fn (Value, Value) bool,
-) MapLookup {
-    const hdr = collisionHeaderConst(node);
-    if (hdr.shared_hash != hash32) return .absent;
-    const entries = collisionEntries(node);
-    for (entries) |e| {
-        if (keyEquivalent(e.key, key, elementEq)) {
-            return .{ .present = e.value };
-        }
-    }
-    return .absent;
-}
-
-/// Child-array physical index for a given slot. Child segment is
-/// stored in descending slot-index order (CHAMP.md §4.3) so the
-/// physical index from the start of the child segment for slot `i` is
-/// the number of set bits in `node_bitmap` at slots GREATER than `i`.
-/// Constructed as `popCount(mask_greater)` where `mask_greater` is the
-/// complement of `mask_at_or_below` — the latter avoids the
-/// "shift by 32" undefined-behavior edge when `slot == 31`.
-inline fn childIndex(node_bitmap: u32, slot: u32) usize {
-    const slot_u5: u5 = @intCast(slot);
-    const slot_bit: u32 = @as(u32, 1) << slot_u5;
-    const mask_at_or_below: u32 = (slot_bit - 1) | slot_bit;
-    const mask_greater: u32 = ~mask_at_or_below;
-    return @popCount(node_bitmap & mask_greater);
-}
-
-/// Data-array physical index for a given slot. Data segment is stored
-/// in ascending slot-index order.
-inline fn dataIndex(data_bitmap: u32, slot: u32) usize {
-    const mask_lower: u32 = (@as(u32, 1) << @intCast(slot)) - 1;
-    return @popCount(data_bitmap & mask_lower);
-}
-
-// =============================================================================
-// CHAMP assoc — recursive path-copy with bitmap updates.
-// =============================================================================
-
-/// Assoc `key → val` into `node` at `shift`. `node` is either a CHAMP
-/// interior node (when `shift <= MAX_TRIE_SHIFT`) OR a collision node
-/// (when the caller reached `shift > MAX_TRIE_SHIFT` and descended into
-/// its child at the deepest level).
-fn champAssocInNode(
-    heap: *Heap,
-    node: *HeapHeader,
-    key: Value,
-    val: Value,
-    hash32: u32,
-    shift: u8,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !AssocResult {
-    if (shift > MAX_TRIE_SHIFT) {
-        return collisionAssoc(heap, node, key, val, hash32, elementEq);
-    }
-    const hdr = champInteriorHeaderConst(node);
-    const slot: u32 = (hash32 >> @intCast(shift)) & branch_mask;
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-
-    // Case (a): inline entry at slot → compare keys.
-    if ((hdr.data_bitmap & slot_bit) != 0) {
-        const data_idx = dataIndex(hdr.data_bitmap, slot);
-        const existing = champInteriorEntries(node)[data_idx];
-        if (keyEquivalent(existing.key, key, elementEq)) {
-            // Same key. Value equal? short-circuit. Else replace.
-            if (existing.value.tag == val.tag and existing.value.payload == val.payload) {
-                return .{ .node = node, .added = false, .replaced = false };
-            }
-            const new_node = try cloneInteriorReplaceEntry(heap, node, data_idx, .{ .key = key, .value = val });
-            return .{ .node = new_node, .added = false, .replaced = true };
-        }
-        // Different key, same slot. Must split into a subtree.
-        const existing_hash = indexHashOf(existing.key, elementHash);
-        const next_shift: u8 = shift + branch_bits;
-        const subtree = try champBuildTwoEntrySubtree(heap, existing.key, existing.value, existing_hash, key, val, hash32, next_shift);
-        // Remove the inline entry; add a child pointer at the same slot.
-        const new_node = try cloneInteriorMigrateDataToChild(heap, node, slot, data_idx, subtree);
-        return .{ .node = new_node, .added = true, .replaced = false };
-    }
-
-    // Case (b): child pointer at slot → recurse.
-    if ((hdr.node_bitmap & slot_bit) != 0) {
-        const child_idx = childIndex(hdr.node_bitmap, slot);
-        const child = champInteriorChildren(node)[child_idx];
-        const next_shift: u8 = shift + branch_bits;
-        const sub = try champAssocInNode(heap, child, key, val, hash32, next_shift, elementHash, elementEq);
-        if (sub.node == child) {
-            // Child unchanged → caller is unchanged.
-            return .{ .node = node, .added = sub.added, .replaced = sub.replaced };
-        }
-        const new_node = try cloneInteriorReplaceChild(heap, node, child_idx, sub.node);
-        return .{ .node = new_node, .added = sub.added, .replaced = sub.replaced };
-    }
-
-    // Case (c): empty slot → insert inline.
-    const new_node = try cloneInteriorInsertEntry(heap, node, slot, .{ .key = key, .value = val });
-    return .{ .node = new_node, .added = true, .replaced = false };
-}
-
-/// Assoc into a collision node. Either replaces an existing key's
-/// value or appends a new entry.
-fn collisionAssoc(
-    heap: *Heap,
-    node: *HeapHeader,
-    key: Value,
-    val: Value,
-    hash32: u32,
-    elementEq: *const fn (Value, Value) bool,
-) !AssocResult {
-    const hdr = collisionHeaderConst(node);
-    std.debug.assert(hdr.shared_hash == hash32); // caller asserted this by reaching here
-
-    const entries = collisionEntries(node);
-    for (entries, 0..) |e, i| {
-        if (keyEquivalent(e.key, key, elementEq)) {
-            if (e.value.tag == val.tag and e.value.payload == val.payload) {
-                return .{ .node = node, .added = false, .replaced = false };
-            }
-            // Replace in new copy.
-            const new_h = try allocCollision(heap, hdr.count);
-            const new_hdr = collisionHeader(new_h);
-            new_hdr.shared_hash = hash32;
-            new_hdr.count = hdr.count;
-            const new_entries = collisionEntries(new_h);
-            @memcpy(new_entries, entries);
-            new_entries[i].value = val;
-            return .{ .node = new_h, .added = false, .replaced = true };
-        }
-    }
-    // Append.
-    const new_h = try allocCollision(heap, hdr.count + 1);
-    const new_hdr = collisionHeader(new_h);
-    new_hdr.shared_hash = hash32;
-    new_hdr.count = hdr.count + 1;
-    const new_entries = collisionEntries(new_h);
-    @memcpy(new_entries[0..entries.len], entries);
-    new_entries[entries.len] = .{ .key = key, .value = val };
-    return .{ .node = new_h, .added = true, .replaced = false };
-}
-
-// =============================================================================
-// CHAMP node clone helpers (path-copy primitives)
-// =============================================================================
-
-/// Clone an interior node, replacing the inline entry at `data_idx`
-/// with `new_entry`. Bitmaps unchanged.
-fn cloneInteriorReplaceEntry(
-    heap: *Heap,
-    src: *HeapHeader,
-    data_idx: usize,
-    new_entry: Entry,
-) !*HeapHeader {
-    const src_hdr = champInteriorHeaderConst(src);
-    const src_entries = champInteriorEntries(src);
-    const src_children = champInteriorChildren(src);
-    const new_h = try allocChampInterior(
-        heap,
-        @intCast(src_entries.len),
-        @intCast(src_children.len),
-    );
-    const new_hdr = champInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap;
-    new_hdr.node_bitmap = src_hdr.node_bitmap;
-    const new_entries = champInteriorEntries(new_h);
-    @memcpy(new_entries, src_entries);
-    new_entries[data_idx] = new_entry;
-    const new_children = champInteriorChildren(new_h);
-    @memcpy(new_children, src_children);
-    return new_h;
-}
-
-/// Clone an interior node, replacing the child pointer at `child_idx`
-/// with `new_child`. Bitmaps unchanged.
-fn cloneInteriorReplaceChild(
-    heap: *Heap,
-    src: *HeapHeader,
-    child_idx: usize,
-    new_child: *HeapHeader,
-) !*HeapHeader {
-    const src_hdr = champInteriorHeaderConst(src);
-    const src_entries = champInteriorEntries(src);
-    const src_children = champInteriorChildren(src);
-    const new_h = try allocChampInterior(
-        heap,
-        @intCast(src_entries.len),
-        @intCast(src_children.len),
-    );
-    const new_hdr = champInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap;
-    new_hdr.node_bitmap = src_hdr.node_bitmap;
-    const new_entries = champInteriorEntries(new_h);
-    @memcpy(new_entries, src_entries);
-    const new_children = champInteriorChildren(new_h);
-    @memcpy(new_children, src_children);
-    new_children[child_idx] = new_child;
-    return new_h;
-}
-
-/// Clone an interior node, inserting a new inline entry at `slot`.
-/// `slot` must not already have a data or node bit set. Grows data
-/// segment by 1; children unchanged.
-fn cloneInteriorInsertEntry(
-    heap: *Heap,
-    src: *HeapHeader,
-    slot: u32,
-    new_entry: Entry,
-) !*HeapHeader {
-    const src_hdr = champInteriorHeaderConst(src);
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-    std.debug.assert((src_hdr.data_bitmap & slot_bit) == 0);
-    std.debug.assert((src_hdr.node_bitmap & slot_bit) == 0);
-    const src_entries = champInteriorEntries(src);
-    const src_children = champInteriorChildren(src);
-    const insert_at = dataIndex(src_hdr.data_bitmap, slot);
-    const new_h = try allocChampInterior(
-        heap,
-        @intCast(src_entries.len + 1),
-        @intCast(src_children.len),
-    );
-    const new_hdr = champInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap | slot_bit;
-    new_hdr.node_bitmap = src_hdr.node_bitmap;
-    const new_entries = champInteriorEntries(new_h);
-    if (insert_at > 0) @memcpy(new_entries[0..insert_at], src_entries[0..insert_at]);
-    new_entries[insert_at] = new_entry;
-    if (insert_at < src_entries.len) {
-        @memcpy(new_entries[insert_at + 1 ..], src_entries[insert_at..]);
-    }
-    const new_children = champInteriorChildren(new_h);
-    @memcpy(new_children, src_children);
-    return new_h;
-}
-
-/// Clone an interior node, migrating the inline entry at `slot` /
-/// `data_idx` into a child pointer at the same slot. Used when two
-/// different keys hash to the same slot and must be pushed into a
-/// subtree. Data segment shrinks by 1; child segment grows by 1.
-fn cloneInteriorMigrateDataToChild(
-    heap: *Heap,
-    src: *HeapHeader,
-    slot: u32,
-    data_idx: usize,
-    new_child: *HeapHeader,
-) !*HeapHeader {
-    const src_hdr = champInteriorHeaderConst(src);
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-    std.debug.assert((src_hdr.data_bitmap & slot_bit) != 0);
-    std.debug.assert((src_hdr.node_bitmap & slot_bit) == 0);
-    const src_entries = champInteriorEntries(src);
-    const src_children = champInteriorChildren(src);
-    const new_h = try allocChampInterior(
-        heap,
-        @intCast(src_entries.len - 1),
-        @intCast(src_children.len + 1),
-    );
-    const new_hdr = champInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap & ~slot_bit;
-    new_hdr.node_bitmap = src_hdr.node_bitmap | slot_bit;
-    // Copy entries except the migrated one.
-    const new_entries = champInteriorEntries(new_h);
-    if (data_idx > 0) @memcpy(new_entries[0..data_idx], src_entries[0..data_idx]);
-    if (data_idx < src_entries.len - 1) {
-        @memcpy(new_entries[data_idx..], src_entries[data_idx + 1 ..]);
-    }
-    // Insert new child at the correct position (descending slot order).
-    const child_insert_at = childIndex(new_hdr.node_bitmap, slot);
-    const new_children = champInteriorChildren(new_h);
-    if (child_insert_at > 0) @memcpy(new_children[0..child_insert_at], src_children[0..child_insert_at]);
-    new_children[child_insert_at] = new_child;
-    if (child_insert_at < src_children.len) {
-        @memcpy(new_children[child_insert_at + 1 ..], src_children[child_insert_at..]);
-    }
-    return new_h;
-}
-
-/// Clone an interior node, removing the inline entry at `slot` /
-/// `data_idx`. Data segment shrinks by 1; children unchanged.
-fn cloneInteriorRemoveEntry(
-    heap: *Heap,
-    src: *HeapHeader,
-    slot: u32,
-    data_idx: usize,
-) !*HeapHeader {
-    const src_hdr = champInteriorHeaderConst(src);
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-    std.debug.assert((src_hdr.data_bitmap & slot_bit) != 0);
-    const src_entries = champInteriorEntries(src);
-    const src_children = champInteriorChildren(src);
-    const new_h = try allocChampInterior(
-        heap,
-        @intCast(src_entries.len - 1),
-        @intCast(src_children.len),
-    );
-    const new_hdr = champInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap & ~slot_bit;
-    new_hdr.node_bitmap = src_hdr.node_bitmap;
-    const new_entries = champInteriorEntries(new_h);
-    if (data_idx > 0) @memcpy(new_entries[0..data_idx], src_entries[0..data_idx]);
-    if (data_idx < src_entries.len - 1) {
-        @memcpy(new_entries[data_idx..], src_entries[data_idx + 1 ..]);
-    }
-    const new_children = champInteriorChildren(new_h);
-    @memcpy(new_children, src_children);
-    return new_h;
-}
-
-/// Clone an interior node, replacing the child pointer at `slot` /
-/// `child_idx` with an inline entry at the same slot. This is the
-/// single-entry-subtree promotion step (CHAMP.md §5.5) — when dissoc
-/// collapses a subtree to one entry, we pull it back up.
-fn cloneInteriorMigrateChildToData(
-    heap: *Heap,
-    src: *HeapHeader,
-    slot: u32,
-    child_idx: usize,
-    pulled_entry: Entry,
-) !*HeapHeader {
-    const src_hdr = champInteriorHeaderConst(src);
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-    std.debug.assert((src_hdr.node_bitmap & slot_bit) != 0);
-    std.debug.assert((src_hdr.data_bitmap & slot_bit) == 0);
-    const src_entries = champInteriorEntries(src);
-    const src_children = champInteriorChildren(src);
-    const new_h = try allocChampInterior(
-        heap,
-        @intCast(src_entries.len + 1),
-        @intCast(src_children.len - 1),
-    );
-    const new_hdr = champInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap | slot_bit;
-    new_hdr.node_bitmap = src_hdr.node_bitmap & ~slot_bit;
-    // Insert new entry at the appropriate data position.
-    const entry_insert_at = dataIndex(new_hdr.data_bitmap, slot);
-    const new_entries = champInteriorEntries(new_h);
-    if (entry_insert_at > 0) @memcpy(new_entries[0..entry_insert_at], src_entries[0..entry_insert_at]);
-    new_entries[entry_insert_at] = pulled_entry;
-    if (entry_insert_at < src_entries.len) {
-        @memcpy(new_entries[entry_insert_at + 1 ..], src_entries[entry_insert_at..]);
-    }
-    // Remove old child pointer.
-    const new_children = champInteriorChildren(new_h);
-    if (child_idx > 0) @memcpy(new_children[0..child_idx], src_children[0..child_idx]);
-    if (child_idx < src_children.len - 1) {
-        @memcpy(new_children[child_idx..], src_children[child_idx + 1 ..]);
-    }
-    return new_h;
-}
-
-// =============================================================================
-// CHAMP dissoc — recursive path-copy with subtree collapse.
-// =============================================================================
-
-const DissocResult = struct {
-    /// New node pointer, or null if the subtree collapsed to empty.
-    node: ?*HeapHeader,
-    /// If the subtree collapsed to a single inline entry, return it
-    /// here so the parent can pull it up (single-entry-subtree
-    /// promotion). When this is non-null, `node` is null — the parent
-    /// should NOT clone the subtree; it should instead migrate the
-    /// entry into its own data segment.
-    promoted_single: ?Entry = null,
-    removed: bool,
-};
-
-fn champDissocFromNode(
-    heap: *Heap,
-    node: *HeapHeader,
-    key: Value,
-    hash32: u32,
-    shift: u8,
-    elementEq: *const fn (Value, Value) bool,
-) !DissocResult {
-    if (shift > MAX_TRIE_SHIFT) {
-        return collisionDissoc(heap, node, key, hash32, elementEq);
-    }
-    const hdr = champInteriorHeaderConst(node);
-    const slot: u32 = (hash32 >> @intCast(shift)) & branch_mask;
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-
-    if ((hdr.data_bitmap & slot_bit) != 0) {
-        const data_idx = dataIndex(hdr.data_bitmap, slot);
-        const existing = champInteriorEntries(node)[data_idx];
-        if (!keyEquivalent(existing.key, key, elementEq)) {
-            // Key not in this slot; absent.
-            return .{ .node = node, .removed = false };
-        }
-        // Remove this entry. After removal, does this node collapse?
-        const new_entry_count = @popCount(hdr.data_bitmap) - 1;
-        const new_child_count = @popCount(hdr.node_bitmap);
-        if (new_entry_count == 0 and new_child_count == 0) {
-            // Completely empty; parent should collapse the slot.
-            return .{ .node = null, .removed = true };
-        }
-        if (new_entry_count == 1 and new_child_count == 0) {
-            // Single-entry node. Return the lone entry for the parent
-            // to pull up (unless this is the root — handled by the
-            // root-level caller).
-            const entries = champInteriorEntries(node);
-            const sole = if (data_idx == 0) entries[1] else entries[0];
-            return .{ .node = null, .promoted_single = sole, .removed = true };
-        }
-        const new_node = try cloneInteriorRemoveEntry(heap, node, slot, data_idx);
-        return .{ .node = new_node, .removed = true };
-    }
-
-    if ((hdr.node_bitmap & slot_bit) != 0) {
-        const child_idx = childIndex(hdr.node_bitmap, slot);
-        const child = champInteriorChildren(node)[child_idx];
-        const next_shift: u8 = shift + branch_bits;
-        const sub = try champDissocFromNode(heap, child, key, hash32, next_shift, elementEq);
-        if (!sub.removed) {
-            return .{ .node = node, .removed = false };
-        }
-        if (sub.promoted_single) |pulled| {
-            // Single-entry-subtree promotion (CHAMP.md §5.5). A node
-            // whose only content was that child would itself hold the
-            // lone entry: pass it further up.
-            if (hdr.data_bitmap == 0 and @popCount(hdr.node_bitmap) == 1) {
-                return .{ .node = null, .promoted_single = pulled, .removed = true };
-            }
-            // Otherwise pull it into THIS node's data area.
-            const new_node = try cloneInteriorMigrateChildToData(heap, node, slot, child_idx, pulled);
-            return .{ .node = new_node, .removed = true };
-        }
-        if (sub.node == null) {
-            // Empty subtree → drop the child pointer at this slot.
-            return try champInteriorDropChildAt(heap, node, slot, child_idx);
-        }
-        // Subtree changed but not collapsed.
-        const new_node = try cloneInteriorReplaceChild(heap, node, child_idx, sub.node.?);
-        return .{ .node = new_node, .removed = true };
-    }
-
-    // No entry at this slot; absent.
-    return .{ .node = node, .removed = false };
-}
-
-/// Drop the child pointer at `slot` / `child_idx` from an interior
-/// node. If the result would leave exactly one entry and no children,
-/// surface a `promoted_single` so the parent can pull it up.
-fn champInteriorDropChildAt(
-    heap: *Heap,
-    src: *HeapHeader,
-    slot: u32,
-    child_idx: usize,
-) !DissocResult {
-    const src_hdr = champInteriorHeaderConst(src);
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-    const src_entries = champInteriorEntries(src);
-    const src_children = champInteriorChildren(src);
-    const new_entry_count = src_entries.len;
-    const new_child_count = src_children.len - 1;
-    if (new_entry_count == 0 and new_child_count == 0) {
-        return .{ .node = null, .removed = true };
-    }
-    if (new_entry_count == 1 and new_child_count == 0) {
-        return .{ .node = null, .promoted_single = src_entries[0], .removed = true };
-    }
-    const new_h = try allocChampInterior(
-        heap,
-        @intCast(new_entry_count),
-        @intCast(new_child_count),
-    );
-    const new_hdr = champInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap;
-    new_hdr.node_bitmap = src_hdr.node_bitmap & ~slot_bit;
-    const new_entries = champInteriorEntries(new_h);
-    @memcpy(new_entries, src_entries);
-    const new_children = champInteriorChildren(new_h);
-    if (child_idx > 0) @memcpy(new_children[0..child_idx], src_children[0..child_idx]);
-    if (child_idx < src_children.len - 1) {
-        @memcpy(new_children[child_idx..], src_children[child_idx + 1 ..]);
-    }
-    return .{ .node = new_h, .removed = true };
-}
-
-/// Dissoc from a collision node. Three cases:
-///   (a) hash mismatches shared_hash → absent.
-///   (b) key not in bucket → absent.
-///   (c) key in bucket → new collision with count-1, OR if that would
-///       leave a single entry, return `promoted_single` so the parent
-///       pulls it up as an inline entry.
-fn collisionDissoc(
-    heap: *Heap,
-    node: *HeapHeader,
-    key: Value,
-    hash32: u32,
-    elementEq: *const fn (Value, Value) bool,
-) !DissocResult {
-    const hdr = collisionHeaderConst(node);
-    if (hdr.shared_hash != hash32) {
-        return .{ .node = node, .removed = false };
-    }
-    const entries = collisionEntries(node);
-    for (entries, 0..) |e, i| {
-        if (keyEquivalent(e.key, key, elementEq)) {
-            if (hdr.count == 2) {
-                const sole = if (i == 0) entries[1] else entries[0];
-                return .{ .node = null, .promoted_single = sole, .removed = true };
-            }
-            const new_h = try allocCollision(heap, hdr.count - 1);
-            const new_hdr = collisionHeader(new_h);
-            new_hdr.shared_hash = hash32;
-            new_hdr.count = hdr.count - 1;
-            const new_entries = collisionEntries(new_h);
-            if (i > 0) @memcpy(new_entries[0..i], entries[0..i]);
-            if (i < entries.len - 1) @memcpy(new_entries[i..], entries[i + 1 ..]);
-            return .{ .node = new_h, .removed = true };
-        }
-    }
-    return .{ .node = node, .removed = false };
-}
-
-// =============================================================================
-// Dispatch entry points (CHAMP.md §9)
-// =============================================================================
-
-/// Per-kind hash for a map Value. Routed here by
-/// `dispatch.heapHashBase` at the `.persistent_map` arm. The result is
-/// the pre-domain-mix hash, widened to `u64`; `dispatch.hashValue`
-/// applies `mixKindDomain(base, 0xF1)` on the way out.
-///
-/// Caching contract (CHAMP.md §7.5): the root header's `hash: u32`
-/// field caches the truncated low-32 bits of the finalized hash on
-/// the first call. Every subsequent call returns the cached u32 value
-/// widened to u64 — so the high 32 bits of the returned u64 are
-/// always zero. This loses some precision vs. the full u64 unordered
-/// combine, but `mixKindDomain` still produces a well-distributed
-/// final u64 because the domain_byte × golden-ratio constant
-/// occupies the high 32 bits. Matches the `string.hashHeader` / `bignum.hashHeader`
-/// discipline (both return u32 and cache at u32 precision).
-pub fn hashMap(h: *HeapHeader, elementHash: *const fn (Value) u64) u64 {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(h.kind == @intFromEnum(Kind.persistent_map));
-    }
-    if (h.cachedHash()) |cached| {
-        return @as(u64, cached);
-    }
-    var acc: u64 = hash_mod.unordered_init;
-    var count_seen: usize = 0;
-    const root_v: Value = .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_map)) | (@as(u64, inferRootSubkind(h)) << 16),
-        .payload = @intFromPtr(h),
-    };
-    var iter = mapIter(root_v);
-    while (iter.next()) |e| {
-        acc = hash_mod.combineUnordered(acc, entryHash(e.key, e.value, elementHash));
-        count_seen += 1;
-    }
-    const finalized = hash_mod.finalizeUnordered(acc, count_seen);
-    const truncated: u32 = @truncate(finalized);
-    if (truncated != 0) h.setCachedHash(truncated);
-    return @as(u64, truncated);
-}
-
-/// Infer subkind of a user-facing map root header. For `hashMap` and
-/// `equalMap` which receive the raw `*HeapHeader` (not a Value), we
-/// reconstruct the Value subkind byte from the body size.
-///
-/// This is sound because the two user-facing body-size sets are
-/// **disjoint by construction**:
-///   - subkind-0 (array-map) body size: `8 + n * 32` for `n ∈ [0, 8]`
-///     = {8, 40, 72, 104, 136, 168, 200, 232, 264}
-///   - subkind-1 (CHAMP root)  body size: exactly 16
-///
-/// 16 ∉ {8, 40, 72, …, 264}, so the discriminator is unambiguous.
-/// Safe builds assert the body size matches one of the known values
-/// to catch corrupted headers before they're interpreted with the
-/// wrong layout.
-///
-/// Subkinds 2 (interior) and 3 (collision) are internal-only and
-/// never flow through this function — user-facing maps are only
-/// subkind 0 or 1 per the CHAMP.md §3 discipline.
-fn inferRootSubkind(h: *HeapHeader) u16 {
-    const body_size = Heap.bodyBytes(h).len;
-    if (body_size == @sizeOf(ChampRootBody)) return subkind_champ_root;
-    if (std.debug.runtime_safety) {
-        // Array-map body must be 8 + n*32 for n ∈ [0, 8]. Reject
-        // anything else loudly — it indicates a corrupted header or
-        // an internal subkind-2/3 node leaked into user territory.
-        const header_bytes = @sizeOf(ArrayMapBody);
-        const valid = body_size >= header_bytes and
-            (body_size - header_bytes) % @sizeOf(Entry) == 0 and
-            (body_size - header_bytes) / @sizeOf(Entry) <= array_map_max;
-        if (!valid) {
-            std.debug.panic(
-                "hamt.inferRootSubkind: body size {d} does not match any valid user-facing map subkind (array-map 8..264 step 32, or CHAMP root 16). Possible internal-node leak or memory corruption.",
-                .{body_size},
-            );
-        }
-    }
-    return subkind_array_map;
-}
-
-/// Per-entry hash (CHAMP.md §7.1): two ordered combines, no finalize,
-/// no inner domain mix. SEMANTICS.md §3.2 pins this formula.
-inline fn entryHash(k: Value, v: Value, elementHash: *const fn (Value) u64) u64 {
-    var acc: u64 = hash_mod.ordered_init;
-    acc = hash_mod.combineOrdered(acc, elementHash(k));
-    acc = hash_mod.combineOrdered(acc, elementHash(v));
-    return acc;
-}
-
-/// Same-kind structural equality. Handles all four subkind-pair
-/// combinations (0,0) / (0,1) / (1,0) / (1,1). See CHAMP.md §6.3 /
-/// §6.4 for strategy.
-pub fn equalMap(
-    a: *HeapHeader,
-    b: *HeapHeader,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) bool {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(a.kind == @intFromEnum(Kind.persistent_map));
-        std.debug.assert(b.kind == @intFromEnum(Kind.persistent_map));
-    }
-    if (a == b) return true;
-
-    const sk_a = inferRootSubkind(a);
-    const sk_b = inferRootSubkind(b);
-
-    const count_a = if (sk_a == subkind_array_map) arrayMapBodyConst(a).count else champRootBodyConst(a).count;
-    const count_b = if (sk_b == subkind_array_map) arrayMapBodyConst(b).count else champRootBodyConst(b).count;
-    if (count_a != count_b) return false;
-
-    // Semantic-associative strategy (CHAMP.md §6.4): iterate one side,
-    // get-into the other, require every entry matches. This works
-    // uniformly for all four subkind-pair combinations.
-    const a_val: Value = .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_map)) | (@as(u64, sk_a) << 16),
-        .payload = @intFromPtr(a),
-    };
-    const b_val: Value = .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_map)) | (@as(u64, sk_b) << 16),
-        .payload = @intFromPtr(b),
-    };
-    var iter = mapIter(a_val);
-    while (iter.next()) |e| {
-        switch (mapGet(b_val, e.key, elementHash, elementEq)) {
-            .absent => return false,
-            .present => |bv| {
-                if (!elementEq(e.value, bv)) return false;
-            },
-        }
-    }
-    return true;
-}
-
-// =============================================================================
-// Iterator — walks every entry of a user-facing map Value.
-//
-// Used by `hashMap`, `equalMap`, and every external walk of a map's
-// entries. Iteration order is insertion order for array-maps and
-// trie-walk order for CHAMP-backed maps — the language does not
-// guarantee either specifically (maps are unordered at the semantic
-// level); the iterator's order is an implementation detail.
-//
-// Internal-node discrimination: interior-vs-collision
-// is tracked by **recorded shift depth per frame**, NOT by inspecting
-// body bytes. The assoc/dissoc paths only construct collision nodes
-// at `shift > MAX_TRIE_SHIFT`, so a frame whose child was reached via
-// descent at shift `s` knows deterministically:
-//   - if `s <= MAX_TRIE_SHIFT`: child is another interior.
-//   - if `s > MAX_TRIE_SHIFT`: child is a collision node.
-// This matches the read/write path's shift-driven dispatch; no
-// body-inspection heuristic is involved.
-// =============================================================================
-
-pub const MapIter = struct {
-    /// Stack of frames: one per nesting level of CHAMP traversal,
-    /// plus one for the top-level array-map or root iteration.
-    /// Max depth is bounded: root + up to COLLISION_DEPTH interior
-    /// frames + possibly one collision frame = 9. 16 gives headroom.
-    frames: [16]Frame = undefined,
-    depth: u8 = 0,
-
-    const Frame = struct {
-        kind: FrameKind,
-        node: *HeapHeader,
-        /// Position within the frame: for array-map and collision,
-        /// the current entry index; for interior, the current slot
-        /// index 0..31 (we advance through the bitmaps).
-        cursor: u32,
-        /// Shift at which this frame's node was reached. Unused for
-        /// `.array_map` frames; for `.champ_interior_*` frames it's
-        /// the node's own shift (0 for the root's immediate child,
-        /// branch_bits for its first sub-interior, etc.). Used to
-        /// derive the kind of a child when descending (see
-        /// `next()`'s `champ_interior_children` arm).
-        shift: u8 = 0,
-    };
-
-    const FrameKind = enum { array_map, champ_interior_data, champ_interior_children, collision };
-
-    pub fn init(m: Value) MapIter {
-        std.debug.assert(m.kind() == .persistent_map);
-        var iter = MapIter{};
-        const h = Heap.asHeapHeader(m);
-        const sk = m.subkind();
-        switch (sk) {
-            subkind_array_map => iter.push(.array_map, h, 0),
-            subkind_champ_root => {
-                // The CHAMP root's `root_node` is ALWAYS an interior
-                // node (never a bare collision): collision nodes only
-                // appear as children of an interior at shift ==
-                // MAX_TRIE_SHIFT. Single-entry-post-dissoc roots are
-                // also wrapped in a single-entry interior at shift 0
-                // (champ_root_dissoc single-entry-promotion path).
-                const root_body = champRootBodyConst(h);
-                iter.push(.champ_interior_data, root_body.root_node, 0);
-            },
-            else => unreachable,
-        }
-        return iter;
-    }
-
-    fn push(self: *MapIter, kind: FrameKind, node: *HeapHeader, shift: u8) void {
-        self.frames[self.depth] = .{ .kind = kind, .node = node, .cursor = 0, .shift = shift };
-        self.depth += 1;
-    }
-
-    /// Advance; return the next Entry or null when exhausted.
-    pub fn next(self: *MapIter) ?Entry {
-        while (self.depth > 0) {
-            const top = &self.frames[self.depth - 1];
-            switch (top.kind) {
-                .array_map => {
-                    const entries = arrayMapEntries(top.node);
-                    if (top.cursor >= entries.len) {
-                        self.depth -= 1;
-                        continue;
-                    }
-                    const e = entries[top.cursor];
-                    top.cursor += 1;
-                    return e;
-                },
-                .collision => {
-                    const entries = collisionEntries(top.node);
-                    if (top.cursor >= entries.len) {
-                        self.depth -= 1;
-                        continue;
-                    }
-                    const e = entries[top.cursor];
-                    top.cursor += 1;
-                    return e;
-                },
-                .champ_interior_data => {
-                    const hdr = champInteriorHeaderConst(top.node);
-                    const n_data = @as(u32, @popCount(hdr.data_bitmap));
-                    if (top.cursor < n_data) {
-                        const e = champInteriorEntries(top.node)[top.cursor];
-                        top.cursor += 1;
-                        return e;
-                    }
-                    // Switch to children phase.
-                    top.kind = .champ_interior_children;
-                    top.cursor = 0;
-                    continue;
-                },
-                .champ_interior_children => {
-                    const hdr = champInteriorHeaderConst(top.node);
-                    const n_children = @as(u32, @popCount(hdr.node_bitmap));
-                    if (top.cursor >= n_children) {
-                        self.depth -= 1;
-                        continue;
-                    }
-                    const child = champInteriorChildren(top.node)[top.cursor];
-                    top.cursor += 1;
-                    // Shift-driven child dispatch:
-                    // the current frame's `shift` tells us what this
-                    // child IS. If `shift == MAX_TRIE_SHIFT`, child
-                    // is a collision node (we've consumed all 32
-                    // indexing bits). Otherwise it's another interior
-                    // and we descend with `shift + branch_bits`.
-                    const parent_shift = top.shift;
-                    if (parent_shift >= MAX_TRIE_SHIFT) {
-                        self.push(.collision, child, 0); // shift unused for collision frame
-                    } else {
-                        self.push(.champ_interior_data, child, parent_shift + branch_bits);
-                    }
-                    continue;
-                },
-            }
-        }
-        return null;
-    }
-};
-
-/// Construct a MapIter (alias — matches the doc's §8 signature for the
-/// dispatch-internal iterator).
-pub fn mapIter(m: Value) MapIter {
-    return MapIter.init(m);
-}
-
-// =============================================================================
-// GC trace — map (GC.md §5)
-//
-// Walks the map rooted at `h` (subkind 0 or 1). Subkind 0 holds
-// entries inline in the root body; subkind 1 delegates to a
-// subkind-2/3 tree which is walked via `visitor.markInternal` for
-// every node visited. External Value references (keys, values) route
-// through `visitor.markValue`. Internal nodes have no metadata
-// (CHAMP.md §8.2 invariant).
-// =============================================================================
-
-/// Walk a user-facing map Value's heap-referencing children.
-pub fn traceMap(h: *HeapHeader, visitor: anytype) void {
-    const sk = inferRootSubkind(h);
-    switch (sk) {
-        subkind_array_map => {
-            // Entries stored inline in the array-map body.
-            for (arrayMapEntries(h)) |e| {
-                visitor.markValue(e.key);
-                visitor.markValue(e.value);
-            }
-        },
-        subkind_champ_root => {
-            // Root holds a pointer to the CHAMP tree. At shift 0 the
-            // node is an interior; collision nodes only appear at
-            // shift > MAX_TRIE_SHIFT.
-            const root_body = champRootBodyConst(h);
-            traceMapNode(root_body.root_node, 0, visitor);
-        },
-        else => unreachable,
-    }
-}
-
-fn traceMapNode(node: *HeapHeader, shift: u8, visitor: anytype) void {
-    if (!visitor.markInternal(node)) return;
-    if (shift > MAX_TRIE_SHIFT) {
-        // Collision node: sequence of entries sharing the same hash.
-        for (collisionEntries(node)) |e| {
-            visitor.markValue(e.key);
-            visitor.markValue(e.value);
-        }
-        return;
-    }
-    // Interior node.
-    for (champInteriorEntries(node)) |e| {
-        visitor.markValue(e.key);
-        visitor.markValue(e.value);
-    }
-    const next_shift: u8 = shift + branch_bits;
-    for (champInteriorChildren(node)) |child| {
-        traceMapNode(child, next_shift, visitor);
-    }
-}
-
-// =============================================================================
-// =============================================================================
-// PART 2 — Persistent set (parallel to persistent_map)
-//
-// Same subkind taxonomy (0 array-set / 1 CHAMP set root / 2 set
-// interior / 3 set collision), same algorithms, same bitmap
-// arithmetic, same shift-tracked iterator. Body layouts differ only
-// in entry size: 16 bytes per element (a single Value) vs. 32 bytes
-// per map entry (key+value Value pair).
-//
-// The distinction between map and set at the HeapHeader level is
-// `h.kind` (Kind.persistent_map vs Kind.persistent_set). User Values
-// also carry the kind byte so dispatch is unambiguous. CHAMP.md §3's
-// parallel-subkind-numbering discipline means the same subkind byte
-// (0..3) means different things under different kind bytes, but the
-// meaning is regular across both kinds.
-//
-// Property tests: test/prop/champ.zig S1..S9 (the set-category
-// parallel of the map category's M1..M11), so all three equality
-// categories (.sequential / .associative / .set) have concrete
-// runtime members and property-test coverage.
-// =============================================================================
-// =============================================================================
-
-// -----------------------------------------------------------------------------
-// Set body layouts (structurally parallel to map; layout structs
-// reused where the header bytes match).
-// -----------------------------------------------------------------------------
-
-/// Header of an array-set body. Followed by `count` `Value` elements
-/// (16 bytes each). Total body size = 8 + count * 16.
-const ArraySetBody = extern struct {
-    count: u32,
-    _pad: u32,
-
-    comptime {
-        std.debug.assert(@sizeOf(ArraySetBody) == 8);
-    }
-};
-
-// CHAMP set root body: `{ count, _pad, root_node: *HeapHeader }` —
-// structurally identical to ChampRootBody; we alias for clarity.
-const ChampSetRootBody = ChampRootBody;
-
-// CHAMP set interior header: two u32 bitmaps, identical to
-// ChampInteriorHeader.
-const SetInteriorHeader = ChampInteriorHeader;
-
-// CHAMP set collision header: shared_hash + count, identical to
-// ChampCollisionHeader.
-const SetCollisionHeader = ChampCollisionHeader;
-
-// -----------------------------------------------------------------------------
-// Set allocation helpers
-// -----------------------------------------------------------------------------
-
-fn allocArraySet(heap: *Heap, n: u32) !*HeapHeader {
-    std.debug.assert(n <= array_map_max); // same threshold for set
-    const body_size = @sizeOf(ArraySetBody) + @as(usize, n) * @sizeOf(Value);
-    return heap.alloc(.persistent_set, body_size);
-}
-
-fn allocChampSetRoot(heap: *Heap) !*HeapHeader {
-    return heap.alloc(.persistent_set, @sizeOf(ChampSetRootBody));
-}
-
-fn allocSetInterior(heap: *Heap, elem_count: u32, child_count: u32) !*HeapHeader {
-    const elem_bytes = @as(usize, elem_count) * @sizeOf(Value);
-    const child_bytes = @as(usize, child_count) * @sizeOf(*HeapHeader);
-    const body_size = @sizeOf(SetInteriorHeader) + elem_bytes + child_bytes;
-    return heap.alloc(.persistent_set, body_size);
-}
-
-fn allocSetCollision(heap: *Heap, n: u32) !*HeapHeader {
-    std.debug.assert(n >= 2);
-    const body_size = @sizeOf(SetCollisionHeader) + @as(usize, n) * @sizeOf(Value);
-    return heap.alloc(.persistent_set, body_size);
-}
-
-// -----------------------------------------------------------------------------
-// Set body accessors
-// -----------------------------------------------------------------------------
-
-fn arraySetBody(h: *HeapHeader) *ArraySetBody {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len >= @sizeOf(ArraySetBody));
-    return @ptrCast(@alignCast(body.ptr));
-}
-
-fn arraySetBodyConst(h: *HeapHeader) *const ArraySetBody {
-    return arraySetBody(h);
-}
-
-fn arraySetElements(h: *HeapHeader) []Value {
-    const body = Heap.bodyBytes(h);
-    const n = arraySetBodyConst(h).count;
-    std.debug.assert(body.len == @sizeOf(ArraySetBody) + @as(usize, n) * @sizeOf(Value));
-    const elems_ptr: [*]Value = @ptrCast(@alignCast(body.ptr + @sizeOf(ArraySetBody)));
-    return elems_ptr[0..n];
-}
-
-fn champSetRootBody(h: *HeapHeader) *ChampSetRootBody {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len == @sizeOf(ChampSetRootBody));
-    return @ptrCast(@alignCast(body.ptr));
-}
-
-fn champSetRootBodyConst(h: *HeapHeader) *const ChampSetRootBody {
-    return champSetRootBody(h);
-}
-
-fn setInteriorHeader(h: *HeapHeader) *SetInteriorHeader {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len >= @sizeOf(SetInteriorHeader));
-    return @ptrCast(@alignCast(body.ptr));
-}
-
-fn setInteriorHeaderConst(h: *HeapHeader) *const SetInteriorHeader {
-    return setInteriorHeader(h);
-}
-
-fn setInteriorElements(h: *HeapHeader) []Value {
-    const hdr = setInteriorHeaderConst(h);
-    const n = @popCount(hdr.data_bitmap);
-    const body = Heap.bodyBytes(h);
-    const elems_ptr: [*]Value = @ptrCast(@alignCast(body.ptr + @sizeOf(SetInteriorHeader)));
-    return elems_ptr[0..n];
-}
-
-fn setInteriorChildren(h: *HeapHeader) []*HeapHeader {
-    const hdr = setInteriorHeaderConst(h);
-    const n_elems = @popCount(hdr.data_bitmap);
-    const n_children = @popCount(hdr.node_bitmap);
-    const body = Heap.bodyBytes(h);
-    const elems_bytes = @as(usize, n_elems) * @sizeOf(Value);
-    const children_ptr: [*]*HeapHeader = @ptrCast(@alignCast(body.ptr + @sizeOf(SetInteriorHeader) + elems_bytes));
-    return children_ptr[0..n_children];
-}
-
-fn setCollisionHeader(h: *HeapHeader) *SetCollisionHeader {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len >= @sizeOf(SetCollisionHeader));
-    return @ptrCast(@alignCast(body.ptr));
-}
-
-fn setCollisionHeaderConst(h: *HeapHeader) *const SetCollisionHeader {
-    return setCollisionHeader(h);
-}
-
-fn setCollisionElements(h: *HeapHeader) []Value {
-    const hdr = setCollisionHeaderConst(h);
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len == @sizeOf(SetCollisionHeader) + @as(usize, hdr.count) * @sizeOf(Value));
-    const elems_ptr: [*]Value = @ptrCast(@alignCast(body.ptr + @sizeOf(SetCollisionHeader)));
-    return elems_ptr[0..hdr.count];
-}
-
-// -----------------------------------------------------------------------------
-// Set Value packing
-// -----------------------------------------------------------------------------
-
-fn valueFromArraySet(h: *HeapHeader) Value {
-    return .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_set)) | (@as(u64, subkind_array_map) << 16),
-        .payload = @intFromPtr(h),
-    };
-}
-
-fn valueFromChampSetRoot(h: *HeapHeader) Value {
-    return .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_set)) | (@as(u64, subkind_champ_root) << 16),
-        .payload = @intFromPtr(h),
-    };
-}
-
-/// Resolve a user-facing set Value to its backing header. Asserts the
-/// top-level subkind discipline: user-facing sets are subkind 0 or 1;
-/// subkinds 2/3 are internal and never appear in a user Value.
-fn setHeader(v: Value) *HeapHeader {
-    std.debug.assert(v.kind() == .persistent_set);
-    const sk = v.subkind();
-    std.debug.assert(sk == subkind_array_map or sk == subkind_champ_root);
-    return Heap.asHeapHeader(v);
-}
-
-/// Public reconstruction helper for the transient module (parallel
-/// to `valueFromMapHeader`). Used by transient.zig to round-trip
-/// between mutable wrapper state and persistent set ops.
-pub fn valueFromSetHeader(h: *HeapHeader) Value {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(h.kind == @intFromEnum(Kind.persistent_set));
-    }
-    const sk = inferSetRootSubkind(h);
-    return .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_set)) | (@as(u64, sk) << 16),
-        .payload = @intFromPtr(h),
-    };
-}
-
-// -----------------------------------------------------------------------------
-// Public API — construction and query (set)
-// -----------------------------------------------------------------------------
-
-/// Fresh empty set. Subkind 0 with count 0. Not a shared singleton.
-pub fn setEmpty(heap: *Heap) !Value {
-    const h = try allocArraySet(heap, 0);
-    const body = arraySetBody(h);
-    body.count = 0;
-    body._pad = 0;
-    return valueFromArraySet(h);
-}
-
-/// Build a set from an element slice. Duplicate elements are
-/// deduplicated naturally via `setConj`'s same-element short-circuit
-/// (pointer-identity preserved on duplicate) and membership check.
-pub fn setFromElements(
-    heap: *Heap,
-    elems: []const Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    var result = try setEmpty(heap);
-    for (elems) |e| {
-        result = try setConj(heap, result, e, elementHash, elementEq);
-    }
-    return result;
-}
-
-pub fn setCount(s: Value) usize {
-    const h = setHeader(s);
-    return switch (s.subkind()) {
-        subkind_array_map => arraySetBodyConst(h).count,
-        subkind_champ_root => champSetRootBodyConst(h).count,
-        else => unreachable,
-    };
-}
-
-pub fn setIsEmpty(s: Value) bool {
-    return setCount(s) == 0;
-}
-
-/// Membership check. Returns true iff `elem` is present in `s`.
-/// Nil-safe: setContains(#{}, nil) returns false, setContains(#{nil}, nil)
-/// returns true. Unlike map's `get`, no union wrapper is needed — the
-/// return is a plain bool because presence is the ONLY information a
-/// set carries about an element.
-pub fn setContains(
-    s: Value,
-    elem: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) bool {
-    const h = setHeader(s);
-    return switch (s.subkind()) {
-        subkind_array_map => arraySetContains(h, elem, elementEq),
-        subkind_champ_root => champSetContains(
-            champSetRootBodyConst(h).root_node,
-            elem,
-            indexHashOf(elem, elementHash),
-            0,
-            elementEq,
-        ),
-        else => unreachable,
-    };
-}
-
-/// Add `elem` to `s`, returning a new persistent set. Semantics:
-///   - elem already present → return `s` unchanged (pointer identity).
-///   - elem absent, count < 8 at array-set → extend array-set.
-///   - elem absent, count == 8 at array-set → promote to CHAMP.
-///   - CHAMP path → recursive path-copy.
-pub fn setConj(
-    heap: *Heap,
-    s: Value,
-    elem: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    const h = setHeader(s);
-    return switch (s.subkind()) {
-        subkind_array_map => arraySetConj(heap, s, h, elem, elementHash, elementEq),
-        subkind_champ_root => champSetRootConj(heap, s, h, elem, elementHash, elementEq),
-        else => unreachable,
-    };
-}
-
-/// Remove `elem` from `s`, returning a new persistent set. Semantics
-/// parallel to `mapDissoc`: absent → return unchanged; present →
-/// return a new set with one fewer element. Single-entry-subtree
-/// promotion + no-demotion + empty-collapse rules all apply (CHAMP.md
-/// §5.4–§5.6).
-pub fn setDisj(
-    heap: *Heap,
-    s: Value,
-    elem: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    const h = setHeader(s);
-    return switch (s.subkind()) {
-        subkind_array_map => arraySetDisj(heap, s, h, elem, elementEq),
-        subkind_champ_root => champSetRootDisj(heap, s, h, elem, elementHash, elementEq),
-        else => unreachable,
-    };
-}
-
-// -----------------------------------------------------------------------------
-// Array-set operations (subkind 0)
-// -----------------------------------------------------------------------------
-
-fn arraySetContains(
-    h: *HeapHeader,
-    elem: Value,
-    elementEq: *const fn (Value, Value) bool,
-) bool {
-    const elems = arraySetElements(h);
-    for (elems) |e| {
-        if (keyEquivalent(e, elem, elementEq)) return true;
-    }
-    return false;
-}
-
-fn arraySetFindElemIndex(
-    h: *HeapHeader,
-    elem: Value,
-    elementEq: *const fn (Value, Value) bool,
-) ?usize {
-    const elems = arraySetElements(h);
-    for (elems, 0..) |e, i| {
-        if (keyEquivalent(e, elem, elementEq)) return i;
-    }
-    return null;
-}
-
-fn arraySetConj(
-    heap: *Heap,
-    src_v: Value,
-    src_h: *HeapHeader,
-    elem: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    const src_elems = arraySetElements(src_h);
-    // Already present → same pointer.
-    if (arraySetFindElemIndex(src_h, elem, elementEq) != null) {
-        return src_v;
-    }
-    // Absent: grow or promote.
-    if (src_elems.len < array_map_max) {
-        const new_count: u32 = @as(u32, @intCast(src_elems.len)) + 1;
-        const new_h = try allocArraySet(heap, new_count);
-        const new_body = arraySetBody(new_h);
-        new_body.count = new_count;
-        new_body._pad = 0;
-        const new_elems = arraySetElements(new_h);
-        @memcpy(new_elems[0..src_elems.len], src_elems);
-        new_elems[src_elems.len] = elem;
-        return valueFromArraySet(new_h);
-    }
-    // Promotion: count == 8, new element → CHAMP.
-    std.debug.assert(src_elems.len == array_map_max);
-    return arraySetPromoteAndConj(heap, src_elems, elem, elementHash, elementEq);
-}
-
-fn arraySetDisj(
-    heap: *Heap,
-    src_v: Value,
-    src_h: *HeapHeader,
-    elem: Value,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    const idx_opt = arraySetFindElemIndex(src_h, elem, elementEq);
-    if (idx_opt == null) return src_v;
-
-    const idx = idx_opt.?;
-    const src_elems = arraySetElements(src_h);
-    const new_count: u32 = @as(u32, @intCast(src_elems.len)) - 1;
-    const new_h = try allocArraySet(heap, new_count);
-    const new_body = arraySetBody(new_h);
-    new_body.count = new_count;
-    new_body._pad = 0;
-    const new_elems = arraySetElements(new_h);
-    if (idx > 0) @memcpy(new_elems[0..idx], src_elems[0..idx]);
-    if (idx < src_elems.len - 1) {
-        @memcpy(new_elems[idx..], src_elems[idx + 1 ..]);
-    }
-    return valueFromArraySet(new_h);
-}
-
-/// Array-set → CHAMP promotion. Entry count is 8, adding 9th distinct
-/// element. Rehash all 9 into a single CHAMP interior (recursively
-/// splitting as hash prefixes demand), wrap in CHAMP root.
-fn arraySetPromoteAndConj(
-    heap: *Heap,
-    existing: []const Value,
-    new_elem: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    std.debug.assert(existing.len == array_map_max);
-    const first = existing[0];
-    var root_node = try champSetSingleEntryInterior(heap, first, indexHashOf(first, elementHash), 0);
-    var count: u32 = 1;
-    for (existing[1..]) |e| {
-        const res = try champSetConjInNode(heap, root_node, e, indexHashOf(e, elementHash), 0, elementHash, elementEq);
-        root_node = res.node;
-        if (res.added) count += 1;
-    }
-    const res = try champSetConjInNode(heap, root_node, new_elem, indexHashOf(new_elem, elementHash), 0, elementHash, elementEq);
-    root_node = res.node;
-    if (res.added) count += 1;
-    const root_h = try allocChampSetRoot(heap);
-    const root_body = champSetRootBody(root_h);
-    root_body.count = count;
-    root_body._pad = 0;
-    root_body.root_node = root_node;
-    return valueFromChampSetRoot(root_h);
-}
-
-// -----------------------------------------------------------------------------
-// CHAMP set root operations (subkind 1)
-// -----------------------------------------------------------------------------
-
-fn champSetRootConj(
-    heap: *Heap,
-    src_v: Value,
-    src_h: *HeapHeader,
-    elem: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    const src_body = champSetRootBodyConst(src_h);
-    const hash32 = indexHashOf(elem, elementHash);
-    const res = try champSetConjInNode(heap, src_body.root_node, elem, hash32, 0, elementHash, elementEq);
-    if (res.node == src_body.root_node and !res.added) {
-        // Same-pointer short-circuit (elem already present).
-        return src_v;
-    }
-    const new_h = try allocChampSetRoot(heap);
-    const new_body = champSetRootBody(new_h);
-    new_body.count = if (res.added) src_body.count + 1 else src_body.count;
-    new_body._pad = 0;
-    new_body.root_node = res.node;
-    return valueFromChampSetRoot(new_h);
-}
-
-fn champSetRootDisj(
-    heap: *Heap,
-    src_v: Value,
-    src_h: *HeapHeader,
-    elem: Value,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !Value {
-    const src_body = champSetRootBodyConst(src_h);
-    const hash32 = indexHashOf(elem, elementHash);
-    const res = try champSetDisjFromNode(heap, src_body.root_node, elem, hash32, 0, elementEq);
-    if (!res.removed) return src_v;
-    const new_count = src_body.count - 1;
-    if (new_count == 0) {
-        // §5.6 parallel: empty result collapses to subkind-0 empty array-set.
-        return setEmpty(heap);
-    }
-    const new_root_node: *HeapHeader = if (res.promoted_single) |pulled| blk: {
-        break :blk try champSetSingleEntryInterior(heap, pulled, indexHashOf(pulled, elementHash), 0);
-    } else blk: {
-        std.debug.assert(res.node != null);
-        break :blk res.node.?;
-    };
-    const new_h = try allocChampSetRoot(heap);
-    const new_body = champSetRootBody(new_h);
-    new_body.count = new_count;
-    new_body._pad = 0;
-    new_body.root_node = new_root_node;
-    return valueFromChampSetRoot(new_h);
-}
-
-// -----------------------------------------------------------------------------
-// CHAMP set internal ops (recursive)
-// -----------------------------------------------------------------------------
-
-const SetConjResult = struct {
-    node: *HeapHeader,
-    added: bool, // new element inserted
-};
-
-const SetDisjResult = struct {
-    node: ?*HeapHeader,
-    promoted_single: ?Value = null,
-    removed: bool,
-};
-
-fn champSetSingleEntryInterior(
-    heap: *Heap,
-    elem: Value,
-    hash32: u32,
-    shift: u8,
-) !*HeapHeader {
-    std.debug.assert(shift <= MAX_TRIE_SHIFT);
-    const slot: u32 = (hash32 >> @intCast(shift)) & branch_mask;
-    const h = try allocSetInterior(heap, 1, 0);
-    const hdr = setInteriorHeader(h);
-    hdr.data_bitmap = @as(u32, 1) << @intCast(slot);
-    hdr.node_bitmap = 0;
-    const elems = setInteriorElements(h);
-    elems[0] = elem;
-    return h;
-}
-
-fn champSetTwoEntryInterior(
-    heap: *Heap,
-    e1: Value,
-    slot1: u32,
-    e2: Value,
-    slot2: u32,
-) !*HeapHeader {
-    std.debug.assert(slot1 != slot2);
-    const h = try allocSetInterior(heap, 2, 0);
-    const hdr = setInteriorHeader(h);
-    hdr.data_bitmap = (@as(u32, 1) << @intCast(slot1)) | (@as(u32, 1) << @intCast(slot2));
-    hdr.node_bitmap = 0;
-    const elems = setInteriorElements(h);
-    if (slot1 < slot2) {
-        elems[0] = e1;
-        elems[1] = e2;
-    } else {
-        elems[0] = e2;
-        elems[1] = e1;
-    }
-    return h;
-}
-
-fn champSetSingleChildInterior(
-    heap: *Heap,
-    slot: u32,
-    child: *HeapHeader,
-) !*HeapHeader {
-    const h = try allocSetInterior(heap, 0, 1);
-    const hdr = setInteriorHeader(h);
-    hdr.data_bitmap = 0;
-    hdr.node_bitmap = @as(u32, 1) << @intCast(slot);
-    const children = setInteriorChildren(h);
-    children[0] = child;
-    return h;
-}
-
-fn setCollisionOfTwo(
-    heap: *Heap,
-    e1: Value,
-    e2: Value,
-    shared_hash: u32,
-) !*HeapHeader {
-    const h = try allocSetCollision(heap, 2);
-    const hdr = setCollisionHeader(h);
-    hdr.shared_hash = shared_hash;
-    hdr.count = 2;
-    const elems = setCollisionElements(h);
-    elems[0] = e1;
-    elems[1] = e2;
-    return h;
-}
-
-fn champSetBuildTwoEntrySubtree(
-    heap: *Heap,
-    e1: Value,
-    hash1: u32,
-    e2: Value,
-    hash2: u32,
-    shift: u8,
-) !*HeapHeader {
-    if (shift > MAX_TRIE_SHIFT) {
-        std.debug.assert(hash1 == hash2);
-        return setCollisionOfTwo(heap, e1, e2, hash1);
-    }
-    const s1: u32 = (hash1 >> @intCast(shift)) & branch_mask;
-    const s2: u32 = (hash2 >> @intCast(shift)) & branch_mask;
-    if (s1 != s2) {
-        return champSetTwoEntryInterior(heap, e1, s1, e2, s2);
-    }
-    const next_shift: u8 = shift + branch_bits;
-    const child = try champSetBuildTwoEntrySubtree(heap, e1, hash1, e2, hash2, next_shift);
-    return champSetSingleChildInterior(heap, s1, child);
-}
-
-// ---- Contains ----
-
-fn champSetContains(
-    node: *HeapHeader,
-    elem: Value,
-    hash32: u32,
-    shift: u8,
-    elementEq: *const fn (Value, Value) bool,
-) bool {
-    if (shift > MAX_TRIE_SHIFT) {
-        return setCollisionContains(node, elem, hash32, elementEq);
-    }
-    return champSetInteriorContains(node, elem, hash32, shift, elementEq);
-}
-
-fn champSetInteriorContains(
-    node: *HeapHeader,
-    elem: Value,
-    hash32: u32,
-    shift: u8,
-    elementEq: *const fn (Value, Value) bool,
-) bool {
-    std.debug.assert(shift <= MAX_TRIE_SHIFT);
-    const hdr = setInteriorHeaderConst(node);
-    const slot: u32 = (hash32 >> @intCast(shift)) & branch_mask;
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-    if ((hdr.data_bitmap & slot_bit) != 0) {
-        const idx = dataIndex(hdr.data_bitmap, slot);
-        return keyEquivalent(setInteriorElements(node)[idx], elem, elementEq);
-    }
-    if ((hdr.node_bitmap & slot_bit) != 0) {
-        const child_idx = childIndex(hdr.node_bitmap, slot);
-        const child = setInteriorChildren(node)[child_idx];
-        const next_shift: u8 = shift + branch_bits;
-        return champSetContains(child, elem, hash32, next_shift, elementEq);
-    }
-    return false;
-}
-
-fn setCollisionContains(
-    node: *HeapHeader,
-    elem: Value,
-    hash32: u32,
-    elementEq: *const fn (Value, Value) bool,
-) bool {
-    const hdr = setCollisionHeaderConst(node);
-    if (hdr.shared_hash != hash32) return false;
-    const elems = setCollisionElements(node);
-    for (elems) |e| {
-        if (keyEquivalent(e, elem, elementEq)) return true;
-    }
-    return false;
-}
-
-// ---- Conj (add) ----
-
-fn champSetConjInNode(
-    heap: *Heap,
-    node: *HeapHeader,
-    elem: Value,
-    hash32: u32,
-    shift: u8,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) !SetConjResult {
-    if (shift > MAX_TRIE_SHIFT) {
-        return setCollisionConj(heap, node, elem, hash32, elementEq);
-    }
-    const hdr = setInteriorHeaderConst(node);
-    const slot: u32 = (hash32 >> @intCast(shift)) & branch_mask;
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-
-    if ((hdr.data_bitmap & slot_bit) != 0) {
-        const data_idx = dataIndex(hdr.data_bitmap, slot);
-        const existing = setInteriorElements(node)[data_idx];
-        if (keyEquivalent(existing, elem, elementEq)) {
-            // Already present — same pointer.
-            return .{ .node = node, .added = false };
-        }
-        // Different element, same slot — split into subtree.
-        const existing_hash = indexHashOf(existing, elementHash);
-        const next_shift: u8 = shift + branch_bits;
-        const subtree = try champSetBuildTwoEntrySubtree(heap, existing, existing_hash, elem, hash32, next_shift);
-        const new_node = try cloneSetInteriorMigrateDataToChild(heap, node, slot, data_idx, subtree);
-        return .{ .node = new_node, .added = true };
-    }
-
-    if ((hdr.node_bitmap & slot_bit) != 0) {
-        const child_idx = childIndex(hdr.node_bitmap, slot);
-        const child = setInteriorChildren(node)[child_idx];
-        const next_shift: u8 = shift + branch_bits;
-        const sub = try champSetConjInNode(heap, child, elem, hash32, next_shift, elementHash, elementEq);
-        if (sub.node == child) {
-            return .{ .node = node, .added = sub.added };
-        }
-        const new_node = try cloneSetInteriorReplaceChild(heap, node, child_idx, sub.node);
-        return .{ .node = new_node, .added = sub.added };
-    }
-
-    // Empty slot — insert inline.
-    const new_node = try cloneSetInteriorInsertElement(heap, node, slot, elem);
-    return .{ .node = new_node, .added = true };
-}
-
-fn setCollisionConj(
-    heap: *Heap,
-    node: *HeapHeader,
-    elem: Value,
-    hash32: u32,
-    elementEq: *const fn (Value, Value) bool,
-) !SetConjResult {
-    const hdr = setCollisionHeaderConst(node);
-    std.debug.assert(hdr.shared_hash == hash32);
-    const elems = setCollisionElements(node);
-    for (elems) |e| {
-        if (keyEquivalent(e, elem, elementEq)) {
-            return .{ .node = node, .added = false };
-        }
-    }
-    const new_h = try allocSetCollision(heap, hdr.count + 1);
-    const new_hdr = setCollisionHeader(new_h);
-    new_hdr.shared_hash = hash32;
-    new_hdr.count = hdr.count + 1;
-    const new_elems = setCollisionElements(new_h);
-    @memcpy(new_elems[0..elems.len], elems);
-    new_elems[elems.len] = elem;
-    return .{ .node = new_h, .added = true };
-}
-
-// ---- Disj (remove) ----
-
-fn champSetDisjFromNode(
-    heap: *Heap,
-    node: *HeapHeader,
-    elem: Value,
-    hash32: u32,
-    shift: u8,
-    elementEq: *const fn (Value, Value) bool,
-) !SetDisjResult {
-    if (shift > MAX_TRIE_SHIFT) {
-        return setCollisionDisj(heap, node, elem, hash32, elementEq);
-    }
-    const hdr = setInteriorHeaderConst(node);
-    const slot: u32 = (hash32 >> @intCast(shift)) & branch_mask;
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-
-    if ((hdr.data_bitmap & slot_bit) != 0) {
-        const data_idx = dataIndex(hdr.data_bitmap, slot);
-        const existing = setInteriorElements(node)[data_idx];
-        if (!keyEquivalent(existing, elem, elementEq)) {
-            return .{ .node = node, .removed = false };
-        }
-        // Remove this element. Does node collapse?
-        const new_entry_count = @popCount(hdr.data_bitmap) - 1;
-        const new_child_count = @popCount(hdr.node_bitmap);
-        if (new_entry_count == 0 and new_child_count == 0) {
-            return .{ .node = null, .removed = true };
-        }
-        if (new_entry_count == 1 and new_child_count == 0) {
-            const elems = setInteriorElements(node);
-            const sole = if (data_idx == 0) elems[1] else elems[0];
-            return .{ .node = null, .promoted_single = sole, .removed = true };
-        }
-        const new_node = try cloneSetInteriorRemoveElement(heap, node, slot, data_idx);
-        return .{ .node = new_node, .removed = true };
-    }
-
-    if ((hdr.node_bitmap & slot_bit) != 0) {
-        const child_idx = childIndex(hdr.node_bitmap, slot);
-        const child = setInteriorChildren(node)[child_idx];
-        const next_shift: u8 = shift + branch_bits;
-        const sub = try champSetDisjFromNode(heap, child, elem, hash32, next_shift, elementEq);
-        if (!sub.removed) {
-            return .{ .node = node, .removed = false };
-        }
-        if (sub.promoted_single) |pulled| {
-            if (hdr.data_bitmap == 0 and @popCount(hdr.node_bitmap) == 1) {
-                return .{ .node = null, .promoted_single = pulled, .removed = true };
-            }
-            const new_node = try cloneSetInteriorMigrateChildToData(heap, node, slot, child_idx, pulled);
-            return .{ .node = new_node, .removed = true };
-        }
-        if (sub.node == null) {
-            return try champSetInteriorDropChildAt(heap, node, slot, child_idx);
-        }
-        const new_node = try cloneSetInteriorReplaceChild(heap, node, child_idx, sub.node.?);
-        return .{ .node = new_node, .removed = true };
-    }
-
-    return .{ .node = node, .removed = false };
-}
-
-fn champSetInteriorDropChildAt(
-    heap: *Heap,
-    src: *HeapHeader,
-    slot: u32,
-    child_idx: usize,
-) !SetDisjResult {
-    const src_hdr = setInteriorHeaderConst(src);
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-    const src_elems = setInteriorElements(src);
-    const src_children = setInteriorChildren(src);
-    const new_entry_count = src_elems.len;
-    const new_child_count = src_children.len - 1;
-    if (new_entry_count == 0 and new_child_count == 0) {
-        return .{ .node = null, .removed = true };
-    }
-    if (new_entry_count == 1 and new_child_count == 0) {
-        return .{ .node = null, .promoted_single = src_elems[0], .removed = true };
-    }
-    const new_h = try allocSetInterior(
-        heap,
-        @intCast(new_entry_count),
-        @intCast(new_child_count),
-    );
-    const new_hdr = setInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap;
-    new_hdr.node_bitmap = src_hdr.node_bitmap & ~slot_bit;
-    const new_elems = setInteriorElements(new_h);
-    @memcpy(new_elems, src_elems);
-    const new_children = setInteriorChildren(new_h);
-    if (child_idx > 0) @memcpy(new_children[0..child_idx], src_children[0..child_idx]);
-    if (child_idx < src_children.len - 1) {
-        @memcpy(new_children[child_idx..], src_children[child_idx + 1 ..]);
-    }
-    return .{ .node = new_h, .removed = true };
-}
-
-fn setCollisionDisj(
-    heap: *Heap,
-    node: *HeapHeader,
-    elem: Value,
-    hash32: u32,
-    elementEq: *const fn (Value, Value) bool,
-) !SetDisjResult {
-    const hdr = setCollisionHeaderConst(node);
-    if (hdr.shared_hash != hash32) {
-        return .{ .node = node, .removed = false };
-    }
-    const elems = setCollisionElements(node);
-    for (elems, 0..) |e, i| {
-        if (keyEquivalent(e, elem, elementEq)) {
-            if (hdr.count == 2) {
-                const sole = if (i == 0) elems[1] else elems[0];
-                return .{ .node = null, .promoted_single = sole, .removed = true };
-            }
-            const new_h = try allocSetCollision(heap, hdr.count - 1);
-            const new_hdr = setCollisionHeader(new_h);
-            new_hdr.shared_hash = hash32;
-            new_hdr.count = hdr.count - 1;
-            const new_elems = setCollisionElements(new_h);
-            if (i > 0) @memcpy(new_elems[0..i], elems[0..i]);
-            if (i < elems.len - 1) @memcpy(new_elems[i..], elems[i + 1 ..]);
-            return .{ .node = new_h, .removed = true };
-        }
-    }
-    return .{ .node = node, .removed = false };
-}
-
-// -----------------------------------------------------------------------------
-// CHAMP set clone helpers (path-copy primitives, parallel to map)
-// -----------------------------------------------------------------------------
-
-fn cloneSetInteriorReplaceChild(
-    heap: *Heap,
-    src: *HeapHeader,
-    child_idx: usize,
-    new_child: *HeapHeader,
-) !*HeapHeader {
-    const src_hdr = setInteriorHeaderConst(src);
-    const src_elems = setInteriorElements(src);
-    const src_children = setInteriorChildren(src);
-    const new_h = try allocSetInterior(
-        heap,
-        @intCast(src_elems.len),
-        @intCast(src_children.len),
-    );
-    const new_hdr = setInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap;
-    new_hdr.node_bitmap = src_hdr.node_bitmap;
-    const new_elems = setInteriorElements(new_h);
-    @memcpy(new_elems, src_elems);
-    const new_children = setInteriorChildren(new_h);
-    @memcpy(new_children, src_children);
-    new_children[child_idx] = new_child;
-    return new_h;
-}
-
-fn cloneSetInteriorInsertElement(
-    heap: *Heap,
-    src: *HeapHeader,
-    slot: u32,
-    new_elem: Value,
-) !*HeapHeader {
-    const src_hdr = setInteriorHeaderConst(src);
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-    std.debug.assert((src_hdr.data_bitmap & slot_bit) == 0);
-    std.debug.assert((src_hdr.node_bitmap & slot_bit) == 0);
-    const src_elems = setInteriorElements(src);
-    const src_children = setInteriorChildren(src);
-    const insert_at = dataIndex(src_hdr.data_bitmap, slot);
-    const new_h = try allocSetInterior(
-        heap,
-        @intCast(src_elems.len + 1),
-        @intCast(src_children.len),
-    );
-    const new_hdr = setInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap | slot_bit;
-    new_hdr.node_bitmap = src_hdr.node_bitmap;
-    const new_elems = setInteriorElements(new_h);
-    if (insert_at > 0) @memcpy(new_elems[0..insert_at], src_elems[0..insert_at]);
-    new_elems[insert_at] = new_elem;
-    if (insert_at < src_elems.len) {
-        @memcpy(new_elems[insert_at + 1 ..], src_elems[insert_at..]);
-    }
-    const new_children = setInteriorChildren(new_h);
-    @memcpy(new_children, src_children);
-    return new_h;
-}
-
-fn cloneSetInteriorMigrateDataToChild(
-    heap: *Heap,
-    src: *HeapHeader,
-    slot: u32,
-    data_idx: usize,
-    new_child: *HeapHeader,
-) !*HeapHeader {
-    const src_hdr = setInteriorHeaderConst(src);
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-    std.debug.assert((src_hdr.data_bitmap & slot_bit) != 0);
-    std.debug.assert((src_hdr.node_bitmap & slot_bit) == 0);
-    const src_elems = setInteriorElements(src);
-    const src_children = setInteriorChildren(src);
-    const new_h = try allocSetInterior(
-        heap,
-        @intCast(src_elems.len - 1),
-        @intCast(src_children.len + 1),
-    );
-    const new_hdr = setInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap & ~slot_bit;
-    new_hdr.node_bitmap = src_hdr.node_bitmap | slot_bit;
-    const new_elems = setInteriorElements(new_h);
-    if (data_idx > 0) @memcpy(new_elems[0..data_idx], src_elems[0..data_idx]);
-    if (data_idx < src_elems.len - 1) {
-        @memcpy(new_elems[data_idx..], src_elems[data_idx + 1 ..]);
-    }
-    const child_insert_at = childIndex(new_hdr.node_bitmap, slot);
-    const new_children = setInteriorChildren(new_h);
-    if (child_insert_at > 0) @memcpy(new_children[0..child_insert_at], src_children[0..child_insert_at]);
-    new_children[child_insert_at] = new_child;
-    if (child_insert_at < src_children.len) {
-        @memcpy(new_children[child_insert_at + 1 ..], src_children[child_insert_at..]);
-    }
-    return new_h;
-}
-
-fn cloneSetInteriorRemoveElement(
-    heap: *Heap,
-    src: *HeapHeader,
-    slot: u32,
-    data_idx: usize,
-) !*HeapHeader {
-    const src_hdr = setInteriorHeaderConst(src);
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-    std.debug.assert((src_hdr.data_bitmap & slot_bit) != 0);
-    const src_elems = setInteriorElements(src);
-    const src_children = setInteriorChildren(src);
-    const new_h = try allocSetInterior(
-        heap,
-        @intCast(src_elems.len - 1),
-        @intCast(src_children.len),
-    );
-    const new_hdr = setInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap & ~slot_bit;
-    new_hdr.node_bitmap = src_hdr.node_bitmap;
-    const new_elems = setInteriorElements(new_h);
-    if (data_idx > 0) @memcpy(new_elems[0..data_idx], src_elems[0..data_idx]);
-    if (data_idx < src_elems.len - 1) {
-        @memcpy(new_elems[data_idx..], src_elems[data_idx + 1 ..]);
-    }
-    const new_children = setInteriorChildren(new_h);
-    @memcpy(new_children, src_children);
-    return new_h;
-}
-
-fn cloneSetInteriorMigrateChildToData(
-    heap: *Heap,
-    src: *HeapHeader,
-    slot: u32,
-    child_idx: usize,
-    pulled_elem: Value,
-) !*HeapHeader {
-    const src_hdr = setInteriorHeaderConst(src);
-    const slot_bit: u32 = @as(u32, 1) << @intCast(slot);
-    std.debug.assert((src_hdr.node_bitmap & slot_bit) != 0);
-    std.debug.assert((src_hdr.data_bitmap & slot_bit) == 0);
-    const src_elems = setInteriorElements(src);
-    const src_children = setInteriorChildren(src);
-    const new_h = try allocSetInterior(
-        heap,
-        @intCast(src_elems.len + 1),
-        @intCast(src_children.len - 1),
-    );
-    const new_hdr = setInteriorHeader(new_h);
-    new_hdr.data_bitmap = src_hdr.data_bitmap | slot_bit;
-    new_hdr.node_bitmap = src_hdr.node_bitmap & ~slot_bit;
-    const entry_insert_at = dataIndex(new_hdr.data_bitmap, slot);
-    const new_elems = setInteriorElements(new_h);
-    if (entry_insert_at > 0) @memcpy(new_elems[0..entry_insert_at], src_elems[0..entry_insert_at]);
-    new_elems[entry_insert_at] = pulled_elem;
-    if (entry_insert_at < src_elems.len) {
-        @memcpy(new_elems[entry_insert_at + 1 ..], src_elems[entry_insert_at..]);
-    }
-    const new_children = setInteriorChildren(new_h);
-    if (child_idx > 0) @memcpy(new_children[0..child_idx], src_children[0..child_idx]);
-    if (child_idx < src_children.len - 1) {
-        @memcpy(new_children[child_idx..], src_children[child_idx + 1 ..]);
-    }
-    return new_h;
-}
-
-// -----------------------------------------------------------------------------
-// Set dispatch entry points (parallel to hashMap / equalMap)
-// -----------------------------------------------------------------------------
-
-pub fn hashSet(h: *HeapHeader, elementHash: *const fn (Value) u64) u64 {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(h.kind == @intFromEnum(Kind.persistent_set));
-    }
-    if (h.cachedHash()) |cached| {
-        return @as(u64, cached);
-    }
-    var acc: u64 = hash_mod.unordered_init;
-    var count_seen: usize = 0;
-    const root_v: Value = .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_set)) | (@as(u64, inferSetRootSubkind(h)) << 16),
-        .payload = @intFromPtr(h),
-    };
-    var iter = setIter(root_v);
-    while (iter.next()) |e| {
-        // Set aggregate hash: SEMANTICS §3.2 — unordered combine of
-        // each element's full `dispatch.hashValue` (which is what
-        // elementHash delivers). No inner wrap, no finalize per
-        // element; only the outer unordered combine + finalize.
-        acc = hash_mod.combineUnordered(acc, elementHash(e));
-        count_seen += 1;
-    }
-    const finalized = hash_mod.finalizeUnordered(acc, count_seen);
-    const truncated: u32 = @truncate(finalized);
-    if (truncated != 0) h.setCachedHash(truncated);
-    return @as(u64, truncated);
-}
-
-/// Infer subkind of a user-facing set root header. Disjoint-set
-/// discipline parallel to `inferRootSubkind` for maps:
-///   - subkind-0 (array-set) body size: 8 + n*16 for n ∈ [0, 8]
-///     = {8, 24, 40, 56, 72, 88, 104, 120, 136}
-///   - subkind-1 (CHAMP set root) body size: exactly 16
-/// 16 ∉ {8, 24, 40, …, 136}, unambiguous. Safe-build asserts the
-/// body size matches a known shape.
-fn inferSetRootSubkind(h: *HeapHeader) u16 {
-    const body_size = Heap.bodyBytes(h).len;
-    if (body_size == @sizeOf(ChampSetRootBody)) return subkind_champ_root;
-    if (std.debug.runtime_safety) {
-        const header_bytes = @sizeOf(ArraySetBody);
-        const valid = body_size >= header_bytes and
-            (body_size - header_bytes) % @sizeOf(Value) == 0 and
-            (body_size - header_bytes) / @sizeOf(Value) <= array_map_max;
-        if (!valid) {
-            std.debug.panic(
-                "hamt.inferSetRootSubkind: body size {d} does not match any valid user-facing set subkind (array-set 8..136 step 16, or CHAMP set root 16). Possible internal-node leak or memory corruption.",
-                .{body_size},
-            );
-        }
-    }
-    return subkind_array_map;
-}
-
-/// Same-kind structural equality for sets. Handles all four subkind-
-/// pair combinations via the semantic-set strategy: count match, then
-/// iterate the side with the smaller/cheaper iteration, `setContains`-
-/// check each element into the other. Works uniformly regardless of
-/// whether either or both sides are array-set or CHAMP.
-pub fn equalSet(
-    a: *HeapHeader,
-    b: *HeapHeader,
-    elementHash: *const fn (Value) u64,
-    elementEq: *const fn (Value, Value) bool,
-) bool {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(a.kind == @intFromEnum(Kind.persistent_set));
-        std.debug.assert(b.kind == @intFromEnum(Kind.persistent_set));
-    }
-    if (a == b) return true;
-
-    const sk_a = inferSetRootSubkind(a);
-    const sk_b = inferSetRootSubkind(b);
-
-    const count_a = if (sk_a == subkind_array_map) arraySetBodyConst(a).count else champSetRootBodyConst(a).count;
-    const count_b = if (sk_b == subkind_array_map) arraySetBodyConst(b).count else champSetRootBodyConst(b).count;
-    if (count_a != count_b) return false;
-
-    const a_val: Value = .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_set)) | (@as(u64, sk_a) << 16),
-        .payload = @intFromPtr(a),
-    };
-    const b_val: Value = .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_set)) | (@as(u64, sk_b) << 16),
-        .payload = @intFromPtr(b),
-    };
-    var iter = setIter(a_val);
-    while (iter.next()) |e| {
-        if (!setContains(b_val, e, elementHash, elementEq)) return false;
-    }
-    return true;
-}
-
-// -----------------------------------------------------------------------------
-// SetIter — walks every element of a user-facing set Value.
-//
-// Structurally parallel to MapIter, returning Value per element
-// rather than Entry per (k, v) pair. Shift-tracked frames for
-// deterministic interior/collision dispatch (same discipline).
-// -----------------------------------------------------------------------------
-
-pub const SetIter = struct {
-    frames: [16]Frame = undefined,
-    depth: u8 = 0,
-
-    const Frame = struct {
-        kind: FrameKind,
-        node: *HeapHeader,
-        cursor: u32,
-        shift: u8 = 0,
-    };
-
-    const FrameKind = enum { array_set, set_interior_data, set_interior_children, set_collision };
-
-    pub fn init(s: Value) SetIter {
-        std.debug.assert(s.kind() == .persistent_set);
-        var iter = SetIter{};
-        const h = Heap.asHeapHeader(s);
-        const sk = s.subkind();
-        switch (sk) {
-            subkind_array_map => iter.push(.array_set, h, 0),
-            subkind_champ_root => {
-                const root_body = champSetRootBodyConst(h);
-                iter.push(.set_interior_data, root_body.root_node, 0);
-            },
-            else => unreachable,
-        }
-        return iter;
-    }
-
-    fn push(self: *SetIter, kind: FrameKind, node: *HeapHeader, shift: u8) void {
-        self.frames[self.depth] = .{ .kind = kind, .node = node, .cursor = 0, .shift = shift };
-        self.depth += 1;
-    }
-
-    pub fn next(self: *SetIter) ?Value {
-        while (self.depth > 0) {
-            const top = &self.frames[self.depth - 1];
-            switch (top.kind) {
-                .array_set => {
-                    const elems = arraySetElements(top.node);
-                    if (top.cursor >= elems.len) {
-                        self.depth -= 1;
-                        continue;
-                    }
-                    const e = elems[top.cursor];
-                    top.cursor += 1;
-                    return e;
-                },
-                .set_collision => {
-                    const elems = setCollisionElements(top.node);
-                    if (top.cursor >= elems.len) {
-                        self.depth -= 1;
-                        continue;
-                    }
-                    const e = elems[top.cursor];
-                    top.cursor += 1;
-                    return e;
-                },
-                .set_interior_data => {
-                    const hdr = setInteriorHeaderConst(top.node);
-                    const n_data = @as(u32, @popCount(hdr.data_bitmap));
-                    if (top.cursor < n_data) {
-                        const e = setInteriorElements(top.node)[top.cursor];
-                        top.cursor += 1;
-                        return e;
-                    }
-                    top.kind = .set_interior_children;
-                    top.cursor = 0;
-                    continue;
-                },
-                .set_interior_children => {
-                    const hdr = setInteriorHeaderConst(top.node);
-                    const n_children = @as(u32, @popCount(hdr.node_bitmap));
-                    if (top.cursor >= n_children) {
-                        self.depth -= 1;
-                        continue;
-                    }
-                    const child = setInteriorChildren(top.node)[top.cursor];
-                    top.cursor += 1;
-                    const parent_shift = top.shift;
-                    if (parent_shift >= MAX_TRIE_SHIFT) {
-                        self.push(.set_collision, child, 0);
-                    } else {
-                        self.push(.set_interior_data, child, parent_shift + branch_bits);
-                    }
-                    continue;
-                },
-            }
-        }
-        return null;
-    }
-};
-
-pub fn setIter(s: Value) SetIter {
-    return SetIter.init(s);
-}
-
-// =============================================================================
-// GC trace — set (GC.md §5)
-//
-// Parallel to traceMap. Walks the set rooted at `h` (subkind 0 or 1).
-// External Value references (elements) route through
-// `visitor.markValue`; internal CHAMP nodes via `visitor.markInternal`.
-// =============================================================================
-
-pub fn traceSet(h: *HeapHeader, visitor: anytype) void {
-    const sk = inferSetRootSubkind(h);
-    switch (sk) {
-        subkind_array_map => {
-            for (arraySetElements(h)) |e| visitor.markValue(e);
-        },
-        subkind_champ_root => {
-            const root_body = champSetRootBodyConst(h);
-            traceSetNode(root_body.root_node, 0, visitor);
-        },
-        else => unreachable,
-    }
-}
-
-fn traceSetNode(node: *HeapHeader, shift: u8, visitor: anytype) void {
-    if (!visitor.markInternal(node)) return;
-    if (shift > MAX_TRIE_SHIFT) {
-        // Collision node: sequence of elements sharing the same hash.
-        for (setCollisionElements(node)) |e| visitor.markValue(e);
-        return;
-    }
-    // Interior node.
-    for (setInteriorElements(node)) |e| visitor.markValue(e);
-    const next_shift: u8 = shift + branch_bits;
-    for (setInteriorChildren(node)) |child| {
-        traceSetNode(child, next_shift, visitor);
-    }
 }
 
 // =============================================================================
@@ -3168,13 +1060,13 @@ test "Entry layout: 32 bytes, key at 0, value at 16" {
     try testing.expectEqual(@as(usize, 16), @offsetOf(Entry, "value"));
 }
 
-test "ChampRootBody layout: 16 bytes total" {
-    try testing.expectEqual(@as(usize, 16), @sizeOf(ChampRootBody));
-    try testing.expectEqual(@as(usize, 0), @offsetOf(ChampRootBody, "count"));
-    try testing.expectEqual(@as(usize, 8), @offsetOf(ChampRootBody, "root_node"));
+test "RootBody layout: 16 bytes total" {
+    try testing.expectEqual(@as(usize, 16), @sizeOf(RootBody));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(RootBody, "count"));
+    try testing.expectEqual(@as(usize, 8), @offsetOf(RootBody, "root_node"));
 }
 
-// ---- mapEmpty / mapCount / mapIsEmpty ----
+// ---- mapEmpty / mapCount ----
 
 test "mapEmpty: subkind 0, count 0, isEmpty true" {
     var heap = Heap.init(testing.allocator);
@@ -3183,7 +1075,7 @@ test "mapEmpty: subkind 0, count 0, isEmpty true" {
     try testing.expectEqual(Kind.persistent_map, m.kind());
     try testing.expectEqual(subkind_array_map, m.subkind());
     try testing.expectEqual(@as(usize, 0), mapCount(m));
-    try testing.expect(mapIsEmpty(m));
+    try testing.expectEqual(@as(usize, 0), mapCount(m));
 }
 
 test "mapEmpty: each call allocates a fresh header (not a shared singleton)" {
@@ -3390,7 +1282,7 @@ test "dissoc: last CHAMP entry removed returns fresh subkind-0 empty map" {
     while (i < 9) : (i += 1) {
         m = try mapDissoc(&heap, m, value.fromKeywordId(i), &synthHash, &synthEq);
     }
-    try testing.expect(mapIsEmpty(m));
+    try testing.expectEqual(@as(usize, 0), mapCount(m));
     try testing.expectEqual(subkind_array_map, m.subkind());
 }
 
@@ -3438,6 +1330,79 @@ test "mapFromEntries: later wins on duplicate keys; count reflects unique" {
     switch (mapGet(m, k, &synthHash, &synthEq)) {
         .present => |v| try testing.expectEqual(@as(i64, 3), v.asFixnum()),
         .absent => try testing.expect(false),
+    }
+}
+
+test "assoc over an equal key keeps the original key object, array-map and CHAMP alike" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    for ([_]u32{ 1, 20 }) |n| {
+        var m = try mapEmpty(&heap);
+        for (0..n) |i| m = try mapAssoc(&heap, m, try collidingKey(&heap, @intCast(i)), value.fromFixnum(0).?, &synthHash2, &synthEq);
+        const first = mapIterKey(m, try collidingKey(&heap, 0));
+        m = try mapAssoc(&heap, m, try collidingKey(&heap, 0), value.fromFixnum(1).?, &synthHash2, &synthEq);
+        try testing.expectEqual(first.payload, mapIterKey(m, try collidingKey(&heap, 0)).payload);
+        switch (mapGet(m, first, &synthHash2, &synthEq)) {
+            .present => |v| try testing.expectEqual(@as(i64, 1), v.asFixnum()),
+            .absent => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+/// Content hash for string keys, so equal strings in distinct
+/// allocations collide on purpose and nothing else does.
+fn synthHash2(x: Value) u64 {
+    return if (x.kind() == .string) string_mod.hashHeader(Heap.asHeapHeader(x)) else x.hashImmediate();
+}
+
+/// The key object `m` stores for a key equal to `key`.
+fn mapIterKey(m: Value, key: Value) Value {
+    var it = mapIter(m);
+    while (it.next()) |e| if (synthEq(e.key, key)) return e.key;
+    unreachable;
+}
+
+test "mapFromEntries and setFromElements build what a fold of assoc and conj builds" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    // Sizes across the array/CHAMP boundary, keys drawn with
+    // repeats, under a real hash and under one that forces collision
+    // nodes (string keys through `collidingHash`).
+    var prng = std.Random.DefaultPrng.init(0x6368616d70);
+    const r = prng.random();
+    for ([_]usize{ 0, 1, 8, 9, 10, 40, 300 }) |n| {
+        for ([_]ElementHash{ &synthHash2, &collidingHash }) |h| {
+            const entries = try testing.allocator.alloc(Entry, n);
+            defer testing.allocator.free(entries);
+            for (entries, 0..) |*e, i| e.* = .{ .key = try collidingKey(&heap, r.uintLessThan(u32, @intCast(n / 2 + 1))), .value = value.fromFixnum(@intCast(i)).? };
+            var fold = try mapEmpty(&heap);
+            var set_fold = try setEmpty(&heap);
+            for (entries) |e| {
+                fold = try mapAssoc(&heap, fold, e.key, e.value, h, &synthEq);
+                set_fold = try setConj(&heap, set_fold, e.key, h, &synthEq);
+            }
+            const built = try mapFromEntries(&heap, entries, h, &synthEq);
+            try testing.expectEqual(fold.subkind(), built.subkind());
+            try testing.expect(canonicalTrie(built, h));
+            var a = mapIter(fold);
+            var b = mapIter(built);
+            while (a.next()) |x| {
+                const y = b.next().?;
+                try testing.expectEqual(x.key.payload, y.key.payload);
+                try testing.expectEqual(x.value.payload, y.value.payload);
+            }
+            try testing.expect(b.next() == null);
+
+            const keys = try testing.allocator.alloc(Value, n);
+            defer testing.allocator.free(keys);
+            for (entries, keys) |e, *k| k.* = e.key;
+            const set_built = try setFromElements(&heap, keys, h, &synthEq);
+            try testing.expectEqual(set_fold.subkind(), set_built.subkind());
+            var sa = setIter(set_fold);
+            var sb = setIter(set_built);
+            while (sa.next()) |x| try testing.expectEqual(x.payload, sb.next().?.payload);
+            try testing.expect(sb.next() == null);
+        }
     }
 }
 
@@ -3764,7 +1729,7 @@ test "setEmpty: subkind 0, count 0, isEmpty true" {
     try testing.expectEqual(Kind.persistent_set, s.kind());
     try testing.expectEqual(subkind_array_map, s.subkind());
     try testing.expectEqual(@as(usize, 0), setCount(s));
-    try testing.expect(setIsEmpty(s));
+    try testing.expectEqual(@as(usize, 0), setCount(s));
 }
 
 test "set: conj + contains single element round-trip" {
@@ -3846,7 +1811,7 @@ test "set: disj all elements from CHAMP returns fresh subkind-0 empty set" {
     while (i < 9) : (i += 1) {
         s = try setDisj(&heap, s, value.fromKeywordId(i), &synthHash, &synthEq);
     }
-    try testing.expect(setIsEmpty(s));
+    try testing.expectEqual(@as(usize, 0), setCount(s));
     try testing.expectEqual(subkind_array_map, s.subkind());
 }
 

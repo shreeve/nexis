@@ -611,7 +611,7 @@ test "M10: collision node stress — ≥5 distinct keys sharing an indexing hash
     for (remaining) |r| {
         m = try champ.mapDissoc(&heap, m, try collidingKey(&heap, r), &collidingHash, &dispatch.equal);
     }
-    try std.testing.expect(champ.mapIsEmpty(m));
+    try std.testing.expectEqual(@as(usize, 0), champ.mapCount(m));
 }
 
 // -----------------------------------------------------------------------------
@@ -993,5 +993,5 @@ test "S9: collision-node stress for set (≥5 elements sharing indexing hash)" {
     for (remaining) |x| {
         s = try champ.setDisj(&heap, s, try collidingKey(&heap, x), &collidingHash, &dispatch.equal);
     }
-    try std.testing.expect(champ.setIsEmpty(s));
+    try std.testing.expectEqual(@as(usize, 0), champ.setCount(s));
 }
