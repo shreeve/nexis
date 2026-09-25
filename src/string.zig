@@ -76,7 +76,7 @@ pub fn byteLen(v: Value) usize {
     return asBytes(v).len;
 }
 
-/// Per-kind hash entry point — called by `dispatch.heapHashValue`
+/// Per-kind hash entry point — called by `dispatch.heapHashBase`
 /// once the kind switch lands on `.string`. Reads
 /// `HeapHeader.cachedHash`; if uncomputed (zero), computes
 /// `xxHash3(seed, bodyBytes(h))` truncated to u32, stores it in the
@@ -93,18 +93,16 @@ pub fn hashHeader(h: *HeapHeader) u32 {
     return raw;
 }
 
-/// Per-kind equality entry point. Byte-for-byte comparison over two
-/// string headers' bodies. The dispatcher has already verified both
-/// are `.string`; we assert as defense-in-depth in safe builds.
 /// GC trace function (GC.md §5). Strings are leaf heap kinds — their
-/// bodies are raw UTF-8 bytes with no heap references. The collector
-/// has already marked `h` before dispatching here; there's nothing
-/// more for us to do. Metadata is handled by the collector centrally.
+/// bodies are raw UTF-8 bytes with no heap references.
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
     _ = h;
     _ = visitor;
 }
 
+/// Per-kind equality entry point. Byte-for-byte comparison over two
+/// string headers' bodies. The dispatcher has already verified both
+/// are `.string`; we assert as defense-in-depth in safe builds.
 pub fn bytesEqual(a: *HeapHeader, b: *HeapHeader) bool {
     if (std.debug.runtime_safety) {
         std.debug.assert(a.kind == @intFromEnum(Kind.string));

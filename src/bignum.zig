@@ -146,19 +146,18 @@ pub fn hashHeader(h: *HeapHeader) u32 {
     return raw;
 }
 
-/// Semantic equality: same sign, same limb count, same limb bytes.
-/// Padding is not compared. Canonical form (no trailing zeros) is
-/// maintained by the canonicalizer, so equal limb-byte-streams iff
-/// equal magnitudes.
 /// GC trace function (GC.md §5). Bignums are leaf heap kinds — their
 /// bodies are `{negative: u8, _pad, limbs: [N]u64}` with no heap
-/// references. Metadata is handled by the collector centrally. The
-/// collector has already marked `h` before dispatching here.
+/// references.
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
     _ = h;
     _ = visitor;
 }
 
+/// Semantic equality: same sign, same limb count, same limb bytes.
+/// Padding is not compared. Canonical form (no trailing zeros) is
+/// maintained by the canonicalizer, so equal limb-byte-streams iff
+/// equal magnitudes.
 pub fn limbsEqual(a: *HeapHeader, b: *HeapHeader) bool {
     if (std.debug.runtime_safety) {
         std.debug.assert(a.kind == @intFromEnum(Kind.bignum));

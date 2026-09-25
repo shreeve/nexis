@@ -3,7 +3,7 @@
 //! This module is intentionally **Value-unaware**. It exports hashers over
 //! raw bytes and primitive machine types, plus the two structural combine
 //! functions that every aggregate kind must use. `src/value.zig` and
-//! `src/eq.zig` import these; no dependency goes the other way.
+//! `src/dispatch.zig` import these; no dependency goes the other way.
 //!
 //! Scope-of-authority: SEMANTICS.md §3 pins the hash invariants. VALUE.md
 //! §6 pins the contract (`(= x y) ⇒ (hash x) = (hash y)`). This file is
@@ -20,27 +20,19 @@
 
 const std = @import("std");
 
-/// Fixed xxHash3 seed. Chosen once, frozen forever — changing it would
-/// invalidate every previously-serialized hash value and break the
-/// cross-process stability guarantee for codec-serialized values
-/// (SEMANTICS §3.1). Derived from the literal "nexis/1" (ASCII) zero-
-/// padded to 8 bytes and read as little-endian u64.
+/// Fixed xxHash3 seed: the ASCII bytes "nexis1/1" read as a
+/// little-endian u64. Hashes are stable within a process only
+/// (SEMANTICS §3.1): none is persisted, so the seed may change freely.
 pub const seed: u64 = 0x0000_0000_3173_6978_656E | (@as(u64, '/') << 48) | (@as(u64, '1') << 56);
 
-// Keyword/symbol domain separation is handled by the generic
-// `mixKindDomain` below (each Kind byte lands in a distinct region of
-// u64 space). This subsumes Clojure's `keyword.hash ^= 0x9E3779B9`
-// pattern (PLAN §8.4, §23 #32) since every Kind participates in
-// the same mechanism rather than keyword alone getting a special offset.
-// The `mixKeywordDomain` helper is kept below as a thin alias for
-// clarity at call sites that want to express "deliberately shifting a
-// keyword into its own space," but it layers on top of the generic
-// mixer rather than duplicating the separation story.
+// Keyword/symbol domain separation is the generic `mixKindDomain`
+// below: each Kind byte lands in a distinct region of u64 space. That
+// subsumes Clojure's `keyword.hash ^= 0x9E3779B9` (PLAN §8.4, §23 #32).
 
 /// Multiplier used by `combineOrdered`. Matches Clojure's `31 * h +
-/// hasheq(x)` (Util.java:hashCombine). Frozen so that
-/// `(list 1 2 3)` and `[1 2 3]` always share a hash — the cross-category
-/// sequential equality rule in PLAN §6.6 requires it by construction.
+/// hasheq(x)` (Util.java:hashCombine). List and vector both combine
+/// with it, so `(list 1 2 3)` and `[1 2 3]` share a hash, as the
+/// sequential equality rule (PLAN §6.6) requires.
 pub const ordered_mul: u64 = 31;
 
 /// Per-kind domain mixer used by `mixKindDomain`. A 64-bit golden-ratio
@@ -132,9 +124,9 @@ pub fn canonicalizeFloat(f: f64) f64 {
 /// Mix a per-kind offset into a base hash so values of different kinds
 /// with coincidentally-equal raw-payload hashes (`fixnum(65)` vs
 /// `symbol(65)` vs `char(65)`) still land in disjoint regions of the
-/// 64-bit hash space. Cheap — a multiply and an add. Applied by the
-/// runtime's `Value.hashValue()` after the per-kind primitive hash so
-/// every kind automatically carries its own domain, including any
+/// 64-bit hash space. Cheap — a multiply and an add. Applied by
+/// `Value.hashImmediate` and `dispatch.hashValue` after the per-kind
+/// primitive hash, so every kind carries its own domain, including any
 /// kind added later. Includes keyword-vs-symbol separation as a
 /// special case (their kind bytes differ).
 pub inline fn mixKindDomain(base: u64, kind_tag: u8) u64 {

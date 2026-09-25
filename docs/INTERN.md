@@ -74,22 +74,25 @@ pub const Interner = struct {
     pub fn internKeywordValue(self: *Interner, name: []const u8) !value.Value;
     pub fn internSymbolValue (self: *Interner, name: []const u8) !value.Value;
 
+    // `ns/name` in one step, and its inverse (§3).
+    pub fn internQualifiedKeyword(self: *Interner, ns: ?[]const u8, name: []const u8) !value.Value;
+    pub fn internQualifiedSymbol (self: *Interner, ns: ?[]const u8, name: []const u8) !value.Value;
+    pub fn splitQualified(full: []const u8) struct { ns: ?[]const u8, name: []const u8 };
+
     // Name accessors. Panic **unconditionally** (every build mode) if
-    // `id` is out of range for the table — an out-of-range id is a
-    // runtime-bug leak upstream, not a user error to surface. This
-    // matches the fail-fast discipline in `eq.zig` for sentinel escape.
+    // `id` is out of range for the table — every id comes from the
+    // table, so an out-of-range one is a runtime bug upstream, not a
+    // user error to surface.
     pub fn keywordName(self: *const Interner, id: u32) []const u8;
     pub fn symbolName (self: *const Interner, id: u32) []const u8;
 
     pub fn keywordCount(self: *const Interner) u32;
     pub fn symbolCount (self: *const Interner) u32;
-
-    // GC-root tracing seam. A no-op — name bytes
-    // are not heap objects in the `HeapHeader` sense. Exists so the
-    // a root enumeration can list the interner without a struct
-    // refactor (PLAN §10.5).
-    pub fn trace(self: *Interner, visitor: anytype) void;
 };
+```
+
+Interned names are plain allocations, not heap objects: the collector
+never visits the interner.
 ```
 
 **Error set.** `internKeyword` / `internSymbol` / their `*Value`
@@ -104,58 +107,24 @@ These errors are surfaced; callers decide whether to map them to
 
 ---
 
-### 3. Namespace splitting (`split`)
+### 3. Qualified names
 
-The grammar (`nexis.grammar`) already restricts multi-slash forms and
-treats the bare symbol `/` as the legal division symbol, so the reader
-only ever hands the intern table one of:
+A qualified keyword or symbol is interned under its full text
+`ns/name`. `internQualifiedKeyword` / `internQualifiedSymbol` build that
+text; `splitQualified` takes it apart again at the **first** slash, as
+Clojure's `namespace` and `name` do:
 
-- unqualified name: `"foo"`, `"+"`, `"/"`
-- qualified name: `"ns/foo"` (exactly one `/`, both halves non-empty)
+| Full text        | `ns`           | `name`  |
+|------------------|----------------|---------|
+| `"foo"`          | null           | `"foo"` |
+| `"/"`            | null           | `"/"`   |
+| `"ns/foo"`       | `"ns"`         | `"foo"` |
+| `"a/b/c"`        | `"a"`          | `"b/c"` |
+| `"nexis.core//"` | `"nexis.core"` | `"/"`   |
 
-Nevertheless, the `split` helper is **robust against malformed raw
-inputs** — it is a pure function over a `[]const u8` and therefore
-reachable independently of the reader.
-
-```zig
-pub const Qualified = struct {
-    ns: ?[]const u8,
-    local: []const u8,
-};
-
-pub fn split(name: []const u8) SplitError!Qualified;
-
-pub const SplitError = error{
-    EmptyName,             // input is "" — not a valid symbol/keyword name
-    EmptyNamespace,        // input is "/foo" — namespace half is empty
-    EmptyLocalName,        // input is "foo/" — local half is empty (bare
-                           // "/" is handled separately as the division symbol)
-    MultipleSlashes,       // input has more than one '/'
-};
-```
-
-Canonical table:
-
-| Input    | Result                                |
-|----------|---------------------------------------|
-| `"foo"`  | `{ ns = null, local = "foo" }`        |
-| `"+"`    | `{ ns = null, local = "+" }`          |
-| `"/"`    | `{ ns = null, local = "/" }`          |
-| `"a/b"`  | `{ ns = "a",  local = "b" }`          |
-| `""`     | `error.EmptyName`                     |
-| `"/foo"` | `error.EmptyNamespace`                |
-| `"foo/"` | `error.EmptyLocalName`                |
-| `"a//b"` | `error.MultipleSlashes`               |
-| `"a/b/c"`| `error.MultipleSlashes`               |
-
-Note: `"/"` is NOT `EmptyLocalName` — it is the unqualified division
-symbol (`clojure.core//` in Clojure, `nexis.core//` here). The rule is:
-a single `/` with no characters on either side is the bare symbol, not
-a qualification.
-
-`split` does **not** allocate and is a pure function of its input
-slice. It performs one linear pass for the slash count + one for the
-final split.
+The bare `/` is the unqualified division symbol (`clojure.core//` in
+Clojure, `nexis.core//` here), not a qualification. `splitQualified`
+does not allocate; the slices point into its input.
 
 ---
 
@@ -219,20 +188,14 @@ silently leaking.
   (PLAN §15.10 / SEMANTICS §5). Deserialization calls `internKeyword` /
   `internSymbol` on the receiving end. Ids are **never** serialized;
   they are process-local.
-- **Heap (future).** `meta_symbol` heap objects wrap a base symbol id
-  (from this table) plus a metadata map pointer. The interner never
-  sees metadata; that concern belongs to the future `heap.zig` /
-  `meta_symbol` module.
-- **GC (future).** The interner is a root (PLAN §10.5). `trace` exists
-  today as a no-op; the GC will call it to visit any heap-owned state
-  reachable through interned names once heap-owned names are allowed.
+- **GC.** Names are not heap objects; the collector never visits the
+  interner.
 
 ---
 
 ### 6. What INTERN.md does not cover
 
-- **Metadata-bearing symbols** — the heap `meta_symbol` kind. Future
-  `heap.zig` / `docs/META-SYMBOL.md`.
+- **Metadata on symbols** — symbols carry none (SEMANTICS §7).
 - **String interning.** Strings are not interned by default (PLAN §8.4).
   There is no `(intern s)` operation on strings; one would live in
   the string module, not here.

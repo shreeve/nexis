@@ -113,50 +113,12 @@ matches the runtime invariant that mutable identity values must NOT
 participate in structural equality (otherwise a value being a key in a
 map could become unequal to itself after a mutation — disaster).
 
-```zig
-// src/atom.zig:
-pub fn atomsEqual(a: *HeapHeader, b: *HeapHeader) bool {
-    return a == b;
-}
-```
-
-`dispatch.equal` adds an arm for `.atom` that delegates to
-`atom.atomsEqual`.
-
-**Hash is pointer-identity, kind-domain-mixed.** The hash domain byte
-is `@intFromEnum(Kind.atom) = 34`, placed via
-`hash.mixKindDomain(..., 34)` exactly as `durable_ref` (domain 26),
-`native_fn`, etc. do. This keeps atoms in their own hash domain
-distinct from the sequential/associative/set shared domains
-(SEMANTICS.md §3.2), so an atom and a `durable_ref` whose body bytes
-happened to hash-collide remain hash-distinct.
-
-```zig
-pub fn hashHeader(h: *HeapHeader) u32 {
-    if (h.cachedHash()) |cached| return cached;
-    var hasher = std.hash.XxHash3.init(hash_mod.seed);
-    const ptr_bytes = std.mem.toBytes(@intFromPtr(h));
-    hasher.update(&ptr_bytes);
-    const truncated: u32 = @truncate(hasher.final());
-    if (truncated != 0) h.setCachedHash(truncated);
-    return truncated;
-}
-```
-
-Caching the pointer-hash is safe BECAUSE the pointer itself never
-changes for the lifetime of the atom. Only the contained `value` can
-change; pointer-hash is invariant under value mutation. (A moving
-collector would require the atom hash to migrate to a stable
-object-identity instead of raw `@intFromPtr`; the collector is
-non-moving, `docs/GC.md`.)
-
-**`dispatch.eqCategory` mapping:**
-
-```zig
-.{ .kind = .atom, .cat = .kind_local, .domain = 34 },
-```
-
-Same shape as `durable_ref` and the other identity-valued kinds.
+An atom is an **identity kind** (`dispatch.isIdentityKind`,
+SEMANTICS.md §2.6): `dispatch.equal` answers true only for the same
+atom, and `dispatch.hashValue` hashes the pointer, mixed with the atom
+kind byte (34). The pointer never changes for the atom's lifetime (the
+collector is non-moving, `docs/GC.md`), so the hash is invariant under
+value mutation and needs no cache.
 
 ---
 

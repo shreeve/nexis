@@ -128,9 +128,9 @@ pub fn limbCount(v: value.Value) usize;
 /// nonzero pattern (VALUE.md §4).
 pub fn hashHeader(h: *HeapHeader) u32;
 
-/// Per-kind equality entry point. Called by `dispatch.heapEqual`
-/// after the cross-kind rule and bit-identity fast path have been
-/// ruled out.
+/// Per-kind equality entry point. Called by `dispatch.equal` after
+/// the cross-kind rule and bit-identity fast path have been ruled
+/// out.
 pub fn limbsEqual(a: *HeapHeader, b: *HeapHeader) bool;
 
 /// GC trace entry point (GC.md §4). A bignum body holds limbs and
@@ -173,8 +173,8 @@ pub fn parseDecimal(heap: *Heap, text: []const u8) !?Value;
 
 ### 5. Hash — semantic bytes only
 
-SEMANTICS.md §3.2: "xxHash3-32 over the canonical magnitude byte stream
-plus sign byte." Concretely:
+SEMANTICS.md §3.2: xxHash3 over the sign byte and the canonical
+magnitude, truncated to 32 bits and cached. Concretely:
 
 ```
 hash_input := [negative_byte] ++ limbs_as_little_endian_bytes
@@ -242,13 +242,11 @@ which handles the fixnum-range check (`-2⁴⁷` is representable as
 
 ### 8. Dispatch integration
 
-Two one-line additions to `src/dispatch.zig`:
+`src/dispatch.zig` routes `.bignum` to `bignum.hashHeader` in
+`heapHashBase` and to `bignum.limbsEqual` in `equal`.
 
-- `heapHashBase` kind switch gains `.bignum => @as(u64, bignum.hashHeader(h)),`.
-- `heapEqual` kind switch gains `.bignum => bignum.limbsEqual(ah, bh),`.
-
-No changes to `eqCategory` (bignum is kind-local per SEMANTICS §2.6)
-and no new domain byte — bignum uses the kind-byte domain like string.
+Bignum is kind-local (SEMANTICS §2.6): its hash domain byte is its kind
+byte, like string.
 
 ---
 

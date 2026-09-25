@@ -16,7 +16,7 @@
 //!       is consistent with an oracle map.
 //!   I7. UTF-8 — non-ASCII names round-trip byte-exact.
 //!   I8. Long names — a 64 KiB name round-trips byte-exact.
-//!   I9. split — full edge-case table matches INTERN.md §3.
+//!   I9. splitQualified inverts the qualified intern at the first slash.
 //!   I10. by_name/names counts stay in lockstep across a mixed workload.
 
 const std = @import("std");
@@ -212,39 +212,29 @@ test "I8: very-long names round-trip (64 KiB)" {
     try std.testing.expectEqual(@as(u32, 1), it.keywordCount());
 }
 
-test "I9: split — edge-case table matches INTERN.md §3" {
-    // Canonical passes.
-    {
-        const q = try intern.split("foo");
-        try std.testing.expect(q.ns == null);
-        try std.testing.expectEqualStrings("foo", q.local);
+test "I9: splitQualified inverts internQualified* at the first slash" {
+    var it = intern.Interner.init(std.testing.allocator);
+    defer it.deinit();
+    var prng = std.Random.DefaultPrng.init(0x1239);
+    const r = prng.random();
+    const alphabet = "abc.-/";
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        var ns_buf: [6]u8 = undefined;
+        var name_buf: [6]u8 = undefined;
+        // A namespace never holds a slash; a name may.
+        const ns_len = 1 + r.uintLessThan(usize, ns_buf.len);
+        for (ns_buf[0..ns_len]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len - 1)];
+        const name_len = 1 + r.uintLessThan(usize, name_buf.len);
+        for (name_buf[0..name_len]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+        const ns: ?[]const u8 = if (r.boolean()) ns_buf[0..ns_len] else null;
+        const name = name_buf[0..name_len];
+        if (ns == null and std.mem.indexOfScalar(u8, name, '/') != null and !std.mem.eql(u8, name, "/")) continue;
+        const kw = try it.internQualifiedKeyword(ns, name);
+        const parts = intern.Interner.splitQualified(it.keywordName(kw.asKeywordId()));
+        if (ns) |want| try std.testing.expectEqualStrings(want, parts.ns.?) else try std.testing.expect(parts.ns == null);
+        try std.testing.expectEqualStrings(name, parts.name);
     }
-    {
-        const q = try intern.split("+");
-        try std.testing.expect(q.ns == null);
-        try std.testing.expectEqualStrings("+", q.local);
-    }
-    {
-        const q = try intern.split("/");
-        try std.testing.expect(q.ns == null);
-        try std.testing.expectEqualStrings("/", q.local);
-    }
-    {
-        const q = try intern.split("a/b");
-        try std.testing.expectEqualStrings("a", q.ns.?);
-        try std.testing.expectEqualStrings("b", q.local);
-    }
-    {
-        const q = try intern.split("nexis.core/map");
-        try std.testing.expectEqualStrings("nexis.core", q.ns.?);
-        try std.testing.expectEqualStrings("map", q.local);
-    }
-    // Errors.
-    try std.testing.expectError(error.EmptyName, intern.split(""));
-    try std.testing.expectError(error.EmptyNamespace, intern.split("/foo"));
-    try std.testing.expectError(error.EmptyLocalName, intern.split("foo/"));
-    try std.testing.expectError(error.MultipleSlashes, intern.split("a//b"));
-    try std.testing.expectError(error.MultipleSlashes, intern.split("a/b/c"));
 }
 
 test "I10: by_name/names counts stay in lockstep under mixed workload" {
