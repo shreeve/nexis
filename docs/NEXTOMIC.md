@@ -579,7 +579,9 @@ adds rows, so it answers stratified rules only: a recursive component
 whose rules call one another inside a `not` is `:nextomic/query-syntax`
 naming the rule. `not`/`not-join` are
 anti-joins on the shared variables; `or`/`or-join` are unions of
-sub-plans with the same output variables.
+sub-plans with the same output variables, and an `or-join` whose join
+vector leads with a group, `(or-join [[?a] ?b] ...)`, runs only once
+the group's variables are bound.
 
 ---
 
@@ -662,7 +664,7 @@ keyword. The shapes:
 | `:nextomic/tx-fn` | `:message`: the unbound symbol, or the depth limit |
 | `:nextomic/schema` | `:message` and `:attr`; `:e`, the entity holding two values, when one refuses many → one; `:db/fulltext` on a non-string attribute names the attribute |
 | `:nextomic/cas` | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
-| `:nextomic/query-syntax` | `:message`; `:clause`, the index into `:where`, when the parser or planner was inside a clause (an unbound function name is reported the same way at run time). A scoping refusal names what is wrong: the variable an `or` branch mentions and another does not, the join variable an `or-join` branch leaves unbound, the variable a `not` body has that nothing outside binds, the argument or function-position variable no clause ever binds |
+| `:nextomic/query-syntax` | `:message`; `:clause`, the index into `:where`, when the parser or planner was inside a clause (an unbound function name is reported the same way at run time). A scoping refusal names what is wrong: the variable an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the variable a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
 | `:nextomic/pull-syntax` | `:message`; `:clause`, the index of the spec in the pattern (from `pull`, `pull-many` or a `(pull ?e pattern)` find element) |
 
 The map is what `catch` receives; `(:error m)` is the keyword. A key is

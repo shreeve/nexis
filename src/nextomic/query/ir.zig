@@ -167,8 +167,9 @@ pub const Clause = union(enum) {
     /// (join on `join`).
     not: struct { join: ?[]const Var, body: []const Clause },
     /// `or` (every branch binds the same variables, all of which join)
-    /// or `or-join` (join on `join`; other variables are branch-local).
-    @"or": struct { join: ?[]const Var, branches: []const Branch },
+    /// or `or-join` (join on `join`; other variables are branch-local;
+    /// `required`, the `[[?a] ?b]` group, must be bound before it runs).
+    @"or": struct { join: ?[]const Var, branches: []const Branch, required: []const Var = &.{} },
     /// `(rule-name arg ...)` or `($src rule-name arg ...)`; the body's
     /// unprefixed clauses read `src` (null: the default source).
     rule: struct { name: u32, args: []const Arg, src: ?Src = null },

@@ -282,7 +282,7 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound:
         }
         var join: std.ArrayList(Var) = .empty;
         for (arg_vars) |v| try ir.addVar(ctx.arena, &join, v);
-        const step = try plan_mod.planOr(ctx, branches, join.items, bound.items, rows.*);
+        const step = try plan_mod.planOr(ctx, branches, join.items, bound.items, rows.*, name);
         for (step.@"or".fresh) |v| try bound.append(ctx.arena, v);
         try steps.append(ctx.arena, step);
     } else {
@@ -493,7 +493,7 @@ const Renamer = struct {
             .@"or" => |o| {
                 const branches = try arena.alloc(ir.Branch, o.branches.len);
                 for (o.branches, branches) |br, *nb| nb.* = try self.clauses(br);
-                try out.append(arena, .{ .@"or" = .{ .join = if (o.join) |js| try self.vars(js) else null, .branches = branches } });
+                try out.append(arena, .{ .@"or" = .{ .join = if (o.join) |js| try self.vars(js) else null, .branches = branches, .required = try self.vars(o.required) } });
             },
             .rule => |r| {
                 const renamed = try self.args(r.args);

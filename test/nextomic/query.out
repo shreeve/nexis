@@ -144,6 +144,10 @@ ok a rule call is costed by its bodies: the smaller scan runs first, then the ca
 {:error :nextomic/unknown-attribute, :attr :nope/attr}
 :nextomic/value-type
 {:error :nextomic/query-syntax, :message empty :find element}
+{:error :nextomic/query-syntax, :message rule half body 1 leaves ?y unbound; every body binds every head variable, :clause 1}
+{:error :nextomic/query-syntax, :message ?zz is never bound; not-join joins on variables the clauses around it bind, :clause 1}
+{:error :nextomic/query-syntax, :message ?zz is never bound; or-join needs its required variables bound before it runs, :clause 1}
+([Ann] [Di])
 {:error :nextomic/query-syntax, :message a rule is called with the wrong number of arguments, :clause 1}
 {:error :nextomic/query-syntax, :message a rule is called with the wrong number of arguments, :clause 1}
 {:error :nextomic/query-syntax, :message unknown symbol in data pattern, :clause 0}

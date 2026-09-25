@@ -433,7 +433,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
                 .@"or" => |o| blk: {
                     const join = try orJoin(ctx, o);
                     if (!allBound(join, bound.items)) break :blk false;
-                    try steps.append(ctx.arena, try planOr(ctx, o.branches, join, bound.items, rows.*));
+                    try steps.append(ctx.arena, try planOr(ctx, o.branches, join, bound.items, rows.*, null));
                     break :blk true;
                 },
                 .rule => |r| blk: {
@@ -473,7 +473,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
                     },
                     else => return err,
                 },
-                .@"or" => |o| try orEstimate(ctx, o, bound.items),
+                .@"or" => |o| if (allBound(o.required, bound.items)) try orEstimate(ctx, o, bound.items) else null,
                 .rule => |r| try rules_mod.callEstimate(ctx, r.name, r.args, bound.items),
                 .source => 0,
                 else => null,
@@ -507,7 +507,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
             },
             .@"or" => |o| {
                 const join = try orJoin(ctx, o);
-                const step = try planOr(ctx, o.branches, join, bound.items, rows.*);
+                const step = try planOr(ctx, o.branches, join, bound.items, rows.*, null);
                 for (step.@"or".fresh) |v| try bound.append(ctx.arena, v);
                 rows.* = clampRows(std.math.mulWide(u64, rows.*, best_cost));
                 try steps.append(ctx.arena, step);
@@ -536,6 +536,15 @@ fn neverBound(ctx: *Ctx, pending: []const Pending, bound: []const Var) error{Que
             .pred => |call| call.args,
             .bind => |b| b.call.args,
             .rule => |r| r.args,
+            .not => |n| {
+                const join = n.join orelse continue;
+                for (join) |v| if (!ir.containsVar(bound, v)) return ctx.syntaxFmt("{s} is never bound; not-join joins on variables the clauses around it bind", .{ctx.varName(v)});
+                continue;
+            },
+            .@"or" => |o| {
+                for (o.required) |v| if (!ir.containsVar(bound, v)) return ctx.syntaxFmt("{s} is never bound; or-join needs its required variables bound before it runs", .{ctx.varName(v)});
+                continue;
+            },
             else => continue,
         };
         const f: ?ir.FnRef = switch (p.clause) {
@@ -625,7 +634,7 @@ fn orJoin(ctx: *Ctx, o: anytype) ![]const Var {
 
 /// Plan an `or`: every branch starts from the join variables already
 /// bound and must end with every join variable bound.
-pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: []const Var, rows: u64) Failure!Step {
+pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: []const Var, rows: u64, rule: ?u32) Failure!Step {
     var bound_join: std.ArrayList(Var) = .empty;
     for (join) |v| {
         if (ir.containsVar(bound, v)) try bound_join.append(ctx.arena, v);
@@ -637,7 +646,10 @@ pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: 
         var ends: std.ArrayList(Var) = .empty;
         try ends.appendSlice(ctx.arena, bound_join.items);
         try ir.boundVars(ctx.arena, br, &ends);
-        for (join) |v| if (!ir.containsVar(ends.items, v)) return ctx.syntaxFmt("or-join branch {d} leaves {s} unbound; every branch binds every join variable", .{ n, ctx.varName(v) });
+        for (join) |v| if (!ir.containsVar(ends.items, v)) {
+            if (rule) |name| return ctx.syntaxFmt("rule {s} body {d} leaves {s} unbound; every body binds every head variable", .{ ctx.interner.symbolName(name), n, ctx.varName(v) });
+            return ctx.syntaxFmt("or-join branch {d} leaves {s} unbound; every branch binds every join variable", .{ n, ctx.varName(v) });
+        };
     }
     return .{ .@"or" = .{ .join = join, .bound = try bound_join.toOwnedSlice(ctx.arena), .fresh = fresh, .branches = plans } };
 }

@@ -1253,6 +1253,7 @@ test "corpus: not, not-join, or, or-join, and" {
         .{ .src = "[:find ?e :where [?e :person/name ?n] [(< ?zz 3)]]", .message = "?zz is never bound; a predicate, function or rule argument needs a pattern, an input or an earlier clause to bind it", .clause = 1 },
         .{ .src = "[:find ?e :where [?e :person/name ?n] [(?f ?n)] [?e :person/age 30]]", .message = "?f in function position is never bound", .clause = 1 },
         .{ .src = "[:find ?e :where [?e :person/name ?n] (not-join [?e] (not [?q :person/tags :blue]))]", .message = "not shares no variable with the clauses around it: ?q is bound nowhere outside; not joins on a variable bound outside it", .clause = 1 },
+        .{ .src = "[:find ?e :where [?e :person/name ?n] (not-join [?zz] [?zz :person/tags :blue])]", .message = "?zz is never bound; not-join joins on variables the clauses around it bind", .clause = 1 },
     }) |case| {
         var d: query.Diag = .{};
         try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, case.src, none, &d));

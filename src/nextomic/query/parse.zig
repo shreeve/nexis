@@ -503,7 +503,7 @@ const Parser = struct {
                 } else if (std.mem.eql(u8, head, "or-join")) {
                     if (parts.len < 3) return self.fail("or-join takes a variable vector and clauses");
                     const join = try self.joinVars(parts[1]);
-                    try out.append(self.arena, .{ .@"or" = .{ .join = join, .branches = try self.parseBranches(parts[2..]) } });
+                    try out.append(self.arena, .{ .@"or" = .{ .join = join, .branches = try self.parseBranches(parts[2..]), .required = try self.requiredVars(parts[1]) } });
                 } else if (parts[0].isSymbol() and self.isSrcSym(parts[0])) {
                     if (parts.len < 2 or self.symName(parts[1]) == null) return self.fail("a source prefix is followed by a rule name");
                     const src = try self.srcOf(parts[0]);
@@ -544,6 +544,17 @@ const Parser = struct {
             for (first.items) |v| if (!ir.containsVar(vs.items, v)) return self.failFmt("or branch {d} does not mention {s}, which branch 1 does; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
             for (vs.items) |v| if (!ir.containsVar(first.items, v)) return self.failFmt("or branch {d} mentions {s}, which branch 1 does not; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
         }
+    }
+
+    /// The variables of the leading `[?a ...]` group of a join vector:
+    /// the ones an `or-join` needs bound before it runs.
+    fn requiredVars(self: *Parser, v: Value) Error![]const Var {
+        const items = try self.elems(v);
+        if (items.len == 0 or items[0].kind() != .persistent_vector) return &.{};
+        const group = try self.elems(items[0]);
+        const out = try self.arena.alloc(Var, group.len);
+        for (group, out) |x, *o| o.* = try self.varOf(x.asSymbolId());
+        return out;
     }
 
     /// `[?a ?b]` or `[[?a] ?b]` (a required-bound group, flattened).
