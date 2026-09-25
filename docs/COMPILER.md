@@ -795,7 +795,8 @@ closure that references the binding.
   `RecurArityMismatch`, `UnsupportedFeature`, `ReaderFailure`,
   `MalformedForm`, `MacroDepthExceeded`, `MacroExpansionFailure`,
   `RequiredFileFailed`, `ControlTransferred`, `ExpectedSymbol`,
-  `ExpectedVector`, `InternalCompilerBug`, `OutOfMemory`.
+  `ExpectedVector`, `InternalCompilerBug`, `StackOverflow`,
+  `OutOfMemory`.
 - A **primary SrcSpan** in `CompileOptions.out_span`: the span
   of the innermost form being lowered or emitted when the error
   was raised, or the symbol's own span for `UnresolvedSymbol`
@@ -809,7 +810,11 @@ Errors raised inside macro expansion are bucketed:
 everything else (a malformed macro call, a macro returning a
 non-Form, an integer literal out of range inside a macro
 argument). `MalformedForm` / `ExpectedSymbol` / `ExpectedVector`
-are lowering errors about special-form shape. Two variants are
+are lowering errors about special-form shape. `StackOverflow` is
+a form nested deeper than the native stack's budget allows
+lowering or emitting it: every recursive step of lowering, the
+Emitter and `DeclaredNames` calls `stack.check` (VM.md §13.1), so
+depth fails cleanly instead of faulting. Two variants are
 not compile errors at all but the loader's run signals passed
 through under their own names (MACROEXPAND.md §8):
 `RequiredFileFailed`, a required file's form failed at run time

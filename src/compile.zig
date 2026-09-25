@@ -93,6 +93,7 @@ const expand_mod = @import("expand.zig");
 const heap_mod = @import("heap.zig");
 const string_mod = @import("string.zig");
 const bignum_mod = @import("bignum.zig");
+const stack = @import("stack.zig");
 
 pub const Inst = vm.Inst;
 pub const Routine = vm.Routine;
@@ -548,6 +549,10 @@ pub const CompileError = error{
     /// release builds as a clean error rather than panicking;
     /// debug builds also assert.
     InternalCompilerBug,
+
+    /// The form nests deeper than the native stack's budget allows
+    /// lowering or emitting it (`stack.check`, VM.md §13.1).
+    StackOverflow,
 
     OutOfMemory,
 };
@@ -1185,7 +1190,8 @@ pub const DeclaredNames = struct {
     /// interns its Var when it runs, exactly like one at top level,
     /// so it is declared wherever it appears; quoted data is not
     /// walked.
-    pub fn declareForm(self: *DeclaredNames, form: *const reader_mod.Form) !void {
+    pub fn declareForm(self: *DeclaredNames, form: *const reader_mod.Form) error{ OutOfMemory, StackOverflow }!void {
+        try stack.check();
         const items: []const *reader_mod.Form = switch (form.datum) {
             .list => |items| items,
             .vector, .map, .set => |items| {
@@ -1322,6 +1328,7 @@ fn lowerFormEnv(
     errdefer if (ctx.diag) |d| {
         if (d.span == null) d.span = form.origin;
     };
+    try stack.check();
     const tiny = try lowerDatum(allocator, form, ctx);
     // A node lowering passes through unchanged (`(do x)` is `x`)
     // keeps the innermost form's span, the one set first.
@@ -1647,6 +1654,7 @@ fn lowerQuotePayload(
     payload: *const reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
+    try stack.check();
     return switch (payload.datum) {
         .nil => try allocTiny(allocator, .nil),
         .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
@@ -2705,7 +2713,7 @@ pub fn compileFormWith(
         null;
     // Whatever this form defines (including definitions a macro
     // expanded into it) may be referred to anywhere inside it.
-    if (declared) |d| d.declareForm(working_form) catch return CompileError.OutOfMemory;
+    if (declared) |d| try d.declareForm(working_form);
     var diag = LowerDiag{};
     const ctx = LowerCtx{
         .env = null,
@@ -2996,6 +3004,7 @@ const NameSet = struct {
 /// `form` as we descend). Used internally by
 /// `capturedByDescendantFns` for `fn_star` boundaries.
 fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet, out: *NameSet) CompileError!void {
+    try stack.check();
     switch (form.*) {
         .nil, .bool, .int => {},
         .symbol => |name| if (!env.contains(name)) try out.put(allocator, name),
@@ -3149,6 +3158,7 @@ fn capturedByDescendantFns(
     env: *const NameSet,
     out: *NameSet,
 ) CompileError!void {
+    try stack.check();
     switch (form.*) {
         .nil, .bool, .int, .symbol, .qualified_symbol => {},
         .add => |a| {
@@ -3334,6 +3344,7 @@ fn compileExpr(
     errdefer if (e.diag) |d| {
         if (d.span == null) d.span = e.current_span;
     };
+    try stack.check();
     switch (form.*) {
         .nil => try e.emit(vm.asm_.loadNil(dst)),
         .bool => |b| try e.emit(if (b) vm.asm_.loadTrue(dst) else vm.asm_.loadFalse(dst)),
@@ -8751,6 +8762,50 @@ test "compile span: an error is reported at the innermost form that raised it" {
         try testing.expectEqual(std.mem.indexOf(u8, c.src, c.at).?, span.?.pos);
         try testing.expectEqual(c.at.len, span.?.len);
     }
+}
+
+/// `depth` vectors nested around `1`, built without the reader,
+/// quoted when `quoted`.
+fn nestedVectorForm(allocator: std.mem.Allocator, depth: usize, quoted: bool) !*reader_mod.Form {
+    const origin: reader_mod.SrcSpan = .{ .pos = 0, .len = 1 };
+    var form = try allocator.create(reader_mod.Form);
+    form.* = .{ .datum = .{ .int = 1 }, .origin = origin };
+    for (0..depth) |_| {
+        const items = try allocator.alloc(*reader_mod.Form, 1);
+        items[0] = form;
+        form = try allocator.create(reader_mod.Form);
+        form.* = .{ .datum = .{ .vector = items }, .origin = origin };
+    }
+    if (!quoted) return form;
+    const q = try allocator.create(reader_mod.Form);
+    q.* = .{ .datum = .{ .quote = form }, .origin = origin };
+    return q;
+}
+
+test "stack guard: a form nested past the stack budget is StackOverflow, not a crash" {
+    stack.armIfUnarmed(stack.main_thread_budget);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |quoted| {
+        const deep = try nestedVectorForm(a, 1_000_000, quoted);
+        var declared = DeclaredNames.init(testing.allocator);
+        defer declared.deinit();
+        try testing.expectError(CompileError.StackOverflow, compileFormWith(a, deep, .{ .declared = &declared }));
+        const shallow = try nestedVectorForm(a, 100, quoted);
+        _ = try compileFormWith(a, shallow, .{ .declared = &declared });
+    }
+    // A hand-built Tiny tree reaches the Emitter without lowering;
+    // a one-form `do` allocates no slot, so only depth can fail it.
+    var tiny: *const Tiny = &.{ .int = 1 };
+    for (0..1_000_000) |_| {
+        const node = try a.create(Tiny);
+        const items = try a.alloc(*const Tiny, 1);
+        items[0] = tiny;
+        node.* = .{ .do_ = items };
+        tiny = node;
+    }
+    try testing.expectError(CompileError.StackOverflow, compileTiny(a, tiny));
 }
 
 test "compile span: compileSourceFullWithMacros compiles a source string" {
