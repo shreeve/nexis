@@ -1837,19 +1837,11 @@ fn isClauseHead(form: *const Form, name: []const u8) bool {
 }
 
 // =============================================================================
-// Form construction helpers (MACROEXPAND.md §10b — the
-// FormBuilder pattern, with origin carried through per §4b)
+// Form construction (MACROEXPAND.md §10b)
 // =============================================================================
 //
-// Every helper takes an `origin: SrcSpan` parameter. Per §4b,
-// synthetic forms get the macro CALL site's origin so that
-// error messages can say "in macro expansion of WHEN at line
-// 5". Macros typically pass
-// `call_form.origin` to every helper.
-//
-// Lifetime: every constructed Form lives in `ctx.allocator`
-// (the macroexpand arena, same as the compile arena). The
-// caller does NOT free.
+// Every synthetic form carries the span of the macro call it came
+// from (§4b) and lives in `ctx.allocator`.
 
 fn makeForm(ctx: *ExpandContext, datum: Datum, origin: SrcSpan) ExpandError!*Form {
     const form = try ctx.allocator.create(Form);
@@ -1857,49 +1849,116 @@ fn makeForm(ctx: *ExpandContext, datum: Datum, origin: SrcSpan) ExpandError!*For
     return form;
 }
 
-pub fn makeList(ctx: *ExpandContext, items: []*Form, origin: SrcSpan) ExpandError!*Form {
-    const form = try ctx.allocator.create(Form);
-    form.* = .{
-        .datum = .{ .list = @as([]const *Form, items) },
-        .origin = origin,
-    };
-    return form;
+fn makeList(ctx: *ExpandContext, items: []const *Form, origin: SrcSpan) ExpandError!*Form {
+    return makeForm(ctx, .{ .list = items }, origin);
 }
 
-pub fn makeVector(ctx: *ExpandContext, items: []*Form, origin: SrcSpan) ExpandError!*Form {
-    const form = try ctx.allocator.create(Form);
-    form.* = .{
-        .datum = .{ .vector = @as([]const *Form, items) },
-        .origin = origin,
-    };
-    return form;
+fn makeVector(ctx: *ExpandContext, items: []const *Form, origin: SrcSpan) ExpandError!*Form {
+    return makeForm(ctx, .{ .vector = items }, origin);
 }
 
-/// Construct a symbol form. `name` is borrowed (typically a
-/// string literal from the macro fn or a gensym output —
-/// either way the lifetime is at least as long as the
-/// resulting Form's). Always unqualified; `makeQualifiedSymbol`
-/// builds `ns/name` forms.
-pub fn makeSymbol(ctx: *ExpandContext, name: []const u8, origin: SrcSpan) ExpandError!*Form {
-    const form = try ctx.allocator.create(Form);
-    form.* = .{
-        .datum = .{ .symbol = .{ .ns = null, .name = name } },
-        .origin = origin,
-    };
-    return form;
+fn makeSymbol(ctx: *ExpandContext, name: []const u8, origin: SrcSpan) ExpandError!*Form {
+    return makeForm(ctx, .{ .symbol = .{ .ns = null, .name = name } }, origin);
 }
 
-pub fn makeNil(ctx: *ExpandContext, origin: SrcSpan) ExpandError!*Form {
-    const form = try ctx.allocator.create(Form);
-    form.* = .{ .datum = .nil, .origin = origin };
-    return form;
+fn makeQualifiedSymbol(ctx: *ExpandContext, ns_name: []const u8, sym_name: []const u8, origin: SrcSpan) ExpandError!*Form {
+    return makeForm(ctx, .{ .symbol = .{ .ns = ns_name, .name = sym_name } }, origin);
 }
 
-pub fn makeBool(ctx: *ExpandContext, value: bool, origin: SrcSpan) ExpandError!*Form {
-    const form = try ctx.allocator.create(Form);
-    form.* = .{ .datum = .{ .bool_ = value }, .origin = origin };
-    return form;
+fn makeKeyword(ctx: *ExpandContext, name: []const u8, origin: SrcSpan) ExpandError!*Form {
+    return makeForm(ctx, .{ .keyword = .{ .ns = null, .name = name } }, origin);
 }
+
+fn makeNil(ctx: *ExpandContext, origin: SrcSpan) ExpandError!*Form {
+    return makeForm(ctx, .nil, origin);
+}
+
+fn makeBool(ctx: *ExpandContext, value: bool, origin: SrcSpan) ExpandError!*Form {
+    return makeForm(ctx, .{ .bool_ = value }, origin);
+}
+
+/// A list of `items`, copied.
+fn makeListInline(ctx: *ExpandContext, origin: SrcSpan, items: []const *Form) ExpandError!*Form {
+    return makeList(ctx, try ctx.allocator.dupe(*Form, items), origin);
+}
+
+/// Builds a host macro's output at one call's span. `list`, `vec`
+/// and `map` take a tuple whose elements may be forms, slices of
+/// forms (spliced in place), integers, booleans, `null` (nil) or
+/// strings: `":k"` is a keyword, `"ns/name"` a qualified symbol and
+/// any other string a symbol.
+const Builder = struct {
+    ctx: *ExpandContext,
+    origin: SrcSpan,
+
+    fn list(b: Builder, parts: anytype) ExpandError!*Form {
+        return makeList(b.ctx, try b.items(parts), b.origin);
+    }
+
+    fn vec(b: Builder, parts: anytype) ExpandError!*Form {
+        return makeVector(b.ctx, try b.items(parts), b.origin);
+    }
+
+    fn map(b: Builder, parts: anytype) ExpandError!*Form {
+        return makeForm(b.ctx, .{ .map = try b.items(parts) }, b.origin);
+    }
+
+    /// `name` as a keyword.
+    fn kw(b: Builder, name: []const u8) ExpandError!*Form {
+        return makeKeyword(b.ctx, name, b.origin);
+    }
+
+    /// A fresh symbol `<base>__N__auto__`.
+    fn gensym(b: Builder, base: []const u8) ExpandError!*Form {
+        return makeSymbol(b.ctx, try b.ctx.gensym(base), b.origin);
+    }
+
+    fn items(b: Builder, parts: anytype) ExpandError![]*Form {
+        var n: usize = 0;
+        inline for (parts) |part| n += if (comptime isFormSlice(@TypeOf(part))) part.len else 1;
+        const out = try b.ctx.allocator.alloc(*Form, n);
+        var i: usize = 0;
+        inline for (parts) |part| {
+            if (comptime isFormSlice(@TypeOf(part))) {
+                for (part) |f| {
+                    out[i] = mutCast(f);
+                    i += 1;
+                }
+            } else {
+                out[i] = try b.item(part);
+                i += 1;
+            }
+        }
+        return out;
+    }
+
+    fn item(b: Builder, x: anytype) ExpandError!*Form {
+        const T = @TypeOf(x);
+        if (T == *Form or T == *const Form) return mutCast(x);
+        if (T == @TypeOf(null)) return makeNil(b.ctx, b.origin);
+        if (T == bool) return makeBool(b.ctx, x, b.origin);
+        if (comptime isString(T)) return b.named(x);
+        return makeForm(b.ctx, .{ .int = @intCast(x) }, b.origin);
+    }
+
+    fn named(b: Builder, text: []const u8) ExpandError!*Form {
+        const is_kw = text.len > 1 and text[0] == ':';
+        const body = if (is_kw) text[1..] else text;
+        const slash = if (body.len > 1) std.mem.indexOfScalar(u8, body, '/') else null;
+        const name: reader_mod.Name = if (slash) |at| .{ .ns = body[0..at], .name = body[at + 1 ..] } else .{ .ns = null, .name = body };
+        return makeForm(b.ctx, if (is_kw) .{ .keyword = name } else .{ .symbol = name }, b.origin);
+    }
+
+    fn isFormSlice(comptime T: type) bool {
+        return T == []*Form or T == []const *Form;
+    }
+
+    fn isString(comptime T: type) bool {
+        if (T == []const u8 or T == []u8) return true;
+        const info = @typeInfo(T);
+        return info == .pointer and info.pointer.size == .one and @typeInfo(info.pointer.child) == .array and @typeInfo(info.pointer.child).array.child == u8;
+    }
+};
 
 // =============================================================================
 // Host core macros (MACROEXPAND.md §10)
@@ -2623,12 +2682,6 @@ fn buildGetCall(ctx: *ExpandContext, src: *Form, key: *Form, default: ?*Form, or
     return try makeList(ctx, items, origin);
 }
 
-fn makeKeyword(ctx: *ExpandContext, name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
-    const form = try ctx.allocator.create(Form);
-    form.* = .{ .datum = .{ .keyword = .{ .ns = null, .name = name } }, .origin = origin };
-    return form;
-}
-
 /// `(loop [pattern init ...] body...)` → `(loop* [g init ...] (let
 /// [pattern g ...] body...))`: each non-symbol pattern binds a
 /// gensym in the loop and destructures it again on every
@@ -2679,396 +2732,133 @@ fn expandLoopRename(
 /// passed through unchanged — the expander will descend into
 /// them on the next walk via the special-form traversal for
 /// the new head.
-fn renameHead(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-    new_head: []const u8,
-) ExpandError!*Form {
-    const items = try ctx.allocator.alloc(*Form, args.len + 1);
-    items[0] = try makeSymbol(ctx, new_head, call_form.origin);
-    for (args, 0..) |a, i| items[1 + i] = @constCast(a);
-    return try makeList(ctx, items, call_form.origin);
+fn renameHead(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, new_head: []const u8) ExpandError!*Form {
+    return (Builder{ .ctx = ctx, .origin = call_form.origin }).list(.{ new_head, args });
 }
 
-// ---- when / when-not -----------------------------------------
+// ---- when / when-not / and / or / cond ------------------------
 //
-//   (when test body...)     => (if test (do body...) nil)
-//   (when-not test body...) => (if test nil (do body...))
+//   (when t body...)      => (if t (do body...) nil)
+//   (when-not t body...)  => (if t nil (do body...))
+//   (and) => true   (and x) => x   (and x y ...) => (let* [g x] (if g (and y ...) g))
+//   (or)  => nil    (or x)  => x   (or x y ...)  => (let* [g x] (if g g (or y ...)))
+//   (cond t1 e1 t2 e2 ...) => (if t1 e1 (if t2 e2 ... nil))
+//
+// `and` and `or` return the deciding value itself and bind the
+// first operand to a gensym so it is evaluated once. `cond` has no
+// `:else` case: a keyword test is truthy.
 
-fn expandWhen(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    if (args.len < 1) return ExpandError.MalformedMacroCall;
-    return try buildWhen(ctx, call_form, args, .when_true);
+fn expandWhen(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    if (args.len < 1) return ctx.fail(call_form.origin, "when: expected a test", .{});
+    const b = Builder{ .ctx = ctx, .origin = call_form.origin };
+    return b.list(.{ "if", args[0], try b.list(.{ "do", args[1..] }), null });
 }
 
-fn expandWhenNot(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    if (args.len < 1) return ExpandError.MalformedMacroCall;
-    return try buildWhen(ctx, call_form, args, .when_false);
+fn expandWhenNot(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    if (args.len < 1) return ctx.fail(call_form.origin, "when-not: expected a test", .{});
+    const b = Builder{ .ctx = ctx, .origin = call_form.origin };
+    return b.list(.{ "if", args[0], null, try b.list(.{ "do", args[1..] }) });
 }
 
-const WhenArm = enum { when_true, when_false };
-
-fn buildWhen(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-    arm: WhenArm,
-) ExpandError!*Form {
-    const test_form = args[0];
-    const body = args[1..];
-    // Build (do body...) — empty body yields just (do).
-    const do_items = try ctx.allocator.alloc(*Form, 1 + body.len);
-    do_items[0] = try makeSymbol(ctx, "do", call_form.origin);
-    for (body, 0..) |b, i| do_items[1 + i] = @constCast(b);
-    const do_form = try makeList(ctx, do_items, call_form.origin);
-
-    const nil_form = try makeNil(ctx, call_form.origin);
-    const if_items = try ctx.allocator.alloc(*Form, 4);
-    if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
-    if_items[1] = @constCast(test_form);
-    switch (arm) {
-        .when_true => {
-            if_items[2] = do_form;
-            if_items[3] = nil_form;
-        },
-        .when_false => {
-            if_items[2] = nil_form;
-            if_items[3] = do_form;
-        },
-    }
-    return try makeList(ctx, if_items, call_form.origin);
+fn expandAnd(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    return andOr(ctx, call_form, args, .and_);
 }
 
-// ---- and / or ------------------------------------------------
-//
-// Clojure semantics: `and` returns the FIRST FALSY value or
-// the last value if all truthy; `or` returns the FIRST TRUTHY
-// value or the last value if all falsy. Crucially, both
-// return the actual value (not literal true/false).
-//
-//   (and)        => true
-//   (and x)      => x
-//   (and x y)    => (let* [g x] (if g y g))
-//   (and x y z)  => (let* [g x] (if g (and y z) g))
-//
-//   (or)         => nil
-//   (or x)       => x
-//   (or x y)     => (let* [g x] (if g g y))
-//   (or x y z)   => (let* [g x] (if g g (or y z)))
-//
-// BOTH `and` and `or` MUST gensym to avoid double-evaluating
-// the first operand (per MACROEXPAND.md §10.G/H).
-
-fn expandAnd(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    if (args.len == 0) return try makeBool(ctx, true, call_form.origin);
-    if (args.len == 1) return @constCast(args[0]);
-
-    // Build the "rest" — either args[1] alone (2-arg case)
-    // or a recursive (and ...) call.
-    const rest_form: *Form = if (args.len == 2)
-        @constCast(args[1])
-    else blk: {
-        const rest_items = try ctx.allocator.alloc(*Form, args.len);
-        rest_items[0] = try makeSymbol(ctx, "and", call_form.origin);
-        for (args[1..], 0..) |a, i| rest_items[1 + i] = @constCast(a);
-        break :blk try makeList(ctx, rest_items, call_form.origin);
-    };
-
-    // (let* [g args[0]] (if g rest g))
-    const g_name = try ctx.gensym("and");
-    const g_sym1 = try makeSymbol(ctx, g_name, call_form.origin);
-    const g_sym2 = try makeSymbol(ctx, g_name, call_form.origin);
-    const g_sym3 = try makeSymbol(ctx, g_name, call_form.origin);
-
-    const binding_items = try ctx.allocator.alloc(*Form, 2);
-    binding_items[0] = g_sym1;
-    binding_items[1] = @constCast(args[0]);
-    const binding_vec = try makeVector(ctx, binding_items, call_form.origin);
-
-    const if_items = try ctx.allocator.alloc(*Form, 4);
-    if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
-    if_items[1] = g_sym2;
-    if_items[2] = rest_form;
-    if_items[3] = g_sym3;
-    const if_form = try makeList(ctx, if_items, call_form.origin);
-
-    const let_items = try ctx.allocator.alloc(*Form, 3);
-    let_items[0] = try makeSymbol(ctx, "let*", call_form.origin);
-    let_items[1] = binding_vec;
-    let_items[2] = if_form;
-    return try makeList(ctx, let_items, call_form.origin);
+fn expandOr(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    return andOr(ctx, call_form, args, .or_);
 }
 
-fn expandOr(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    if (args.len == 0) return try makeNil(ctx, call_form.origin);
-    if (args.len == 1) return @constCast(args[0]);
-
-    // Build the "rest" — either the single second arg or
-    // a recursive (or ...) call.
-    const rest_form: *Form = if (args.len == 2)
-        @constCast(args[1])
-    else blk: {
-        const rest_items = try ctx.allocator.alloc(*Form, args.len);
-        rest_items[0] = try makeSymbol(ctx, "or", call_form.origin);
-        for (args[1..], 0..) |a, i| rest_items[1 + i] = @constCast(a);
-        break :blk try makeList(ctx, rest_items, call_form.origin);
-    };
-
-    // (let* [g args[0]] (if g g rest_form))
-    const g_name = try ctx.gensym("or");
-    const g_sym1 = try makeSymbol(ctx, g_name, call_form.origin);
-    const g_sym2 = try makeSymbol(ctx, g_name, call_form.origin);
-    const g_sym3 = try makeSymbol(ctx, g_name, call_form.origin);
-
-    const binding_items = try ctx.allocator.alloc(*Form, 2);
-    binding_items[0] = g_sym1;
-    binding_items[1] = @constCast(args[0]);
-    const binding_vec = try makeVector(ctx, binding_items, call_form.origin);
-
-    const if_items = try ctx.allocator.alloc(*Form, 4);
-    if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
-    if_items[1] = g_sym2;
-    if_items[2] = g_sym3;
-    if_items[3] = rest_form;
-    const if_form = try makeList(ctx, if_items, call_form.origin);
-
-    const let_items = try ctx.allocator.alloc(*Form, 3);
-    let_items[0] = try makeSymbol(ctx, "let*", call_form.origin);
-    let_items[1] = binding_vec;
-    let_items[2] = if_form;
-    return try makeList(ctx, let_items, call_form.origin);
+fn andOr(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, comptime op: enum { and_, or_ }) ExpandError!*Form {
+    const b = Builder{ .ctx = ctx, .origin = call_form.origin };
+    const name = if (op == .and_) "and" else "or";
+    if (args.len == 0) return if (op == .and_) b.item(true) else b.item(null);
+    if (args.len == 1) return mutCast(args[0]);
+    const rest = if (args.len == 2) mutCast(args[1]) else try b.list(.{ name, args[1..] });
+    const g = try b.gensym(name);
+    const test_form = if (op == .and_) try b.list(.{ "if", g, rest, g }) else try b.list(.{ "if", g, g, rest });
+    return b.list(.{ "let*", try b.vec(.{ g, args[0] }), test_form });
 }
 
-// ---- cond ----------------------------------------------------
-//
-//   (cond)              => nil
-//   (cond t1 e1)        => (if t1 e1 nil)
-//   (cond t1 e1 t2 e2)  => (if t1 e1 (if t2 e2 nil))
-//
-// Odd-count args raise MalformedMacroCall. There is no special
-// case for `:else` — any truthy test works as a default; users
-// can write `(cond ... :else default)` and the keyword's
-// truthiness makes it pass.
-
-fn expandCond(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    if (args.len == 0) return try makeNil(ctx, call_form.origin);
+fn expandCond(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
     if (args.len % 2 != 0) return ctx.fail(call_form.origin, "cond: needs an even number of forms", .{});
-
-    // Build right-to-left: start from nil, wrap each pair.
-    var current: *Form = try makeNil(ctx, call_form.origin);
-    var i: usize = args.len;
-    while (i >= 2) : (i -= 2) {
-        const test_form = args[i - 2];
-        const expr_form = args[i - 1];
-        const if_items = try ctx.allocator.alloc(*Form, 4);
-        if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
-        if_items[1] = @constCast(test_form);
-        if_items[2] = @constCast(expr_form);
-        if_items[3] = current;
-        current = try makeList(ctx, if_items, call_form.origin);
-    }
-    return current;
+    const b = Builder{ .ctx = ctx, .origin = call_form.origin };
+    var chain = try b.item(null);
+    var i = args.len;
+    while (i >= 2) : (i -= 2) chain = try b.list(.{ "if", args[i - 2], args[i - 1], chain });
+    return chain;
 }
 
-// ---- case ----------------------------------------------------
+// ---- case / condp ------------------------------------------------
 //
-//   (case expr)                  => (throw {:error :no-matching-clause ...})
-//   (case expr default)          => (let* [g# expr] default)
-//   (case expr k1 v1 k2 v2 ...)  => chained `(if (= g# 'k_i) v_i ...)`
-//                                   with the no-match throw as the
-//                                   terminal branch when the clause
-//                                   count is even (no default).
-//   (case expr k1 v1 ... default) => same, with `default` as the
-//                                    terminal else branch when the
-//                                    clause count is odd.
+//   (case e k1 v1 k2 v2 ... default?)
+//     => (let* [g e] (if (= g 'k1) v1 (if (= g 'k2) v2 ... terminal)))
+//   (condp pred e c1 v1 ... default?)
+//     => (let* [p pred g e] (if (p c1 g) v1 ... terminal))
 //
-// Each key is a constant, never evaluated: a symbol key is the
-// symbol itself, a vector or map key is that literal, and a list
-// key `(k1 k2 ...)` groups alternatives, any of which matches. The
-// test for a key is `(= g# (quote k))`; a group nests the tests as
-// `(if (= g# 'k1) true (= g# 'k2))`.
-//
-// No-match with no default THROWS `{:error :no-matching-clause
-// :message "No matching clause: <expr>" :value expr}`, not
-// returns nil (Clojure's IllegalArgumentException carries the same
-// message). Forces users to be explicit about exhaustion.
-// Mirrors Clojure semantics modulo the perf shape (Clojure uses
-// hash dispatch; we chain `if`).
-//
-// `expr` is evaluated EXACTLY ONCE via gensym.
+// A `case` key is a constant, never evaluated: a symbol key is that
+// symbol, a vector or map key that literal, and a list key `(k1 k2)`
+// groups alternatives. The terminal is the trailing odd form when
+// there is one, else the throw of `{:error :no-matching-clause
+// :message "No matching clause: <e>" :value e}` (Clojure's
+// IllegalArgumentException carries the same message). The dispatch
+// value, and condp's predicate, are evaluated once.
 
-fn expandCase(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    if (args.len == 0) return ExpandError.MalformedMacroCall;
-    const expr_form = args[0];
+fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    if (args.len == 0) return ctx.fail(call_form.origin, "case: expected an expression", .{});
+    const b = Builder{ .ctx = ctx, .origin = call_form.origin };
+    const g = try b.gensym("case");
     const clauses = args[1..];
-
-    // gensym the test expression so it's evaluated exactly once.
-    const g_name = try ctx.gensym("case");
-
-    // Terminal default branch: the no-match throw OR the
-    // odd-arity terminal form.
-    const has_default = (clauses.len % 2 == 1);
-    var terminal: *Form = if (has_default)
-        @constCast(clauses[clauses.len - 1])
-    else
-        try makeNoMatchThrow(ctx, g_name, call_form.origin);
-
-    // Walk pairs right-to-left, wrapping in `(if <test> v rest)`.
-    const pair_count = clauses.len / 2;
-    var i: usize = pair_count;
+    var chain = if (clauses.len % 2 == 1) mutCast(clauses[clauses.len - 1]) else try noMatchThrow(b, g);
+    var i = clauses.len / 2;
     while (i > 0) {
         i -= 1;
-        const key = clauses[i * 2];
-        const value = clauses[i * 2 + 1];
-
-        const test_form = try buildCaseTest(ctx, g_name, key, call_form.origin);
-
-        const if_items = try ctx.allocator.alloc(*Form, 4);
-        if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
-        if_items[1] = test_form;
-        if_items[2] = @constCast(value);
-        if_items[3] = terminal;
-        terminal = try makeList(ctx, if_items, call_form.origin);
+        chain = try b.list(.{ "if", try caseTest(b, g, clauses[2 * i]), clauses[2 * i + 1], chain });
     }
-
-    // Wrap in (let* [g# expr] <chained-if>).
-    const binding_items = try ctx.allocator.alloc(*Form, 2);
-    binding_items[0] = try makeSymbol(ctx, g_name, call_form.origin);
-    binding_items[1] = @constCast(expr_form);
-    const binding_vec = try makeVector(ctx, binding_items, call_form.origin);
-
-    const let_items = try ctx.allocator.alloc(*Form, 3);
-    let_items[0] = try makeSymbol(ctx, "let*", call_form.origin);
-    let_items[1] = binding_vec;
-    let_items[2] = terminal;
-    return try makeList(ctx, let_items, call_form.origin);
+    return b.list(.{ "let*", try b.vec(.{ g, args[0] }), chain });
 }
 
-/// The test for one `case` key: `(= g 'k)` for a single constant;
-/// for a list of alternatives, `(if (= g 'k1) true <rest>)` nested
-/// over the group so any alternative matches. An empty group never
-/// matches.
-fn buildCaseTest(ctx: *ExpandContext, g_name: []const u8, key: *const Form, origin: reader_mod.SrcSpan) ExpandError!*Form {
-    const alternatives: []const *Form = if (key.datum == .list) key.datum.list else &.{@constCast(key)};
-    if (alternatives.len == 0) return try makeBool(ctx, false, origin);
-    var test_form: *Form = try buildCaseEq(ctx, g_name, alternatives[alternatives.len - 1], origin);
-    var i: usize = alternatives.len - 1;
+/// The test for one `case` key: `(= g 'k)`, or for a group of
+/// alternatives `(if (= g 'k1) true (if (= g 'k2) true ... false))`.
+fn caseTest(b: Builder, g: *Form, key: *const Form) ExpandError!*Form {
+    const quoted = struct {
+        fn eq(bb: Builder, gg: *Form, k: *const Form) ExpandError!*Form {
+            return bb.list(.{ "nexis.core/=", gg, try bb.list(.{ "quote", k }) });
+        }
+    };
+    if (key.datum != .list) return quoted.eq(b, g, key);
+    const alternatives = key.datum.list;
+    var test_form = try b.item(false);
+    var i = alternatives.len;
     while (i > 0) {
         i -= 1;
-        const if_items = try ctx.allocator.alloc(*Form, 4);
-        if_items[0] = try makeSymbol(ctx, "if", origin);
-        if_items[1] = try buildCaseEq(ctx, g_name, alternatives[i], origin);
-        if_items[2] = try makeBool(ctx, true, origin);
-        if_items[3] = test_form;
-        test_form = try makeList(ctx, if_items, origin);
+        test_form = if (i == alternatives.len - 1)
+            try quoted.eq(b, g, alternatives[i])
+        else
+            try b.list(.{ "if", try quoted.eq(b, g, alternatives[i]), true, test_form });
     }
     return test_form;
 }
 
-/// `(= g (quote k))`: the key is data, so a symbol compares as a
-/// symbol and a compound literal as that literal.
-fn buildCaseEq(ctx: *ExpandContext, g_name: []const u8, key: *const Form, origin: reader_mod.SrcSpan) ExpandError!*Form {
-    const quote_items = try ctx.allocator.alloc(*Form, 2);
-    quote_items[0] = try makeSymbol(ctx, "quote", origin);
-    quote_items[1] = @constCast(key);
-    const eq_items = try ctx.allocator.alloc(*Form, 3);
-    eq_items[0] = try coreSym(ctx, "=", origin);
-    eq_items[1] = try makeSymbol(ctx, g_name, origin);
-    eq_items[2] = try makeList(ctx, quote_items, origin);
-    return try makeList(ctx, eq_items, origin);
-}
-
-// ---- condp ---------------------------------------------------
-//
-//   (condp pred expr)                       => (throw {:error :no-matching-clause ...})
-//   (condp pred expr default)               => default
-//   (condp pred expr c1 v1 c2 v2 ...)       => chained `(if (p# c_i e#) v_i ...)`
-//                                              with the no-match throw
-//                                              when the clause count is even.
-//   (condp pred expr c1 v1 ... default)     => terminal default.
-//
-// Same throw-on-no-match policy as case. `pred` and `expr` each
-// evaluated exactly ONCE via gensyms. Predicate call order:
-// `(p# clause expr)` (matches Clojure). There is no `:>>`
-// thread-result-through-fn syntax.
-
-fn expandCondp(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    if (args.len < 2) return ExpandError.MalformedMacroCall;
-    const pred_form = args[0];
-    const expr_form = args[1];
+fn expandCondp(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    if (args.len < 2) return ctx.fail(call_form.origin, "condp: expected a predicate and an expression", .{});
+    const b = Builder{ .ctx = ctx, .origin = call_form.origin };
+    const p = try b.gensym("condp-pred");
+    const g = try b.gensym("condp-expr");
     const clauses = args[2..];
-
-    const p_name = try ctx.gensym("condp-pred");
-    const e_name = try ctx.gensym("condp-expr");
-
-    const has_default = (clauses.len % 2 == 1);
-    var terminal: *Form = if (has_default)
-        @constCast(clauses[clauses.len - 1])
-    else
-        try makeNoMatchThrow(ctx, e_name, call_form.origin);
-
-    const pair_count = clauses.len / 2;
-    var i: usize = pair_count;
+    var chain = if (clauses.len % 2 == 1) mutCast(clauses[clauses.len - 1]) else try noMatchThrow(b, g);
+    var i = clauses.len / 2;
     while (i > 0) {
         i -= 1;
-        const clause = clauses[i * 2];
-        const value = clauses[i * 2 + 1];
-
-        const call_items = try ctx.allocator.alloc(*Form, 3);
-        call_items[0] = try makeSymbol(ctx, p_name, call_form.origin);
-        call_items[1] = @constCast(clause);
-        call_items[2] = try makeSymbol(ctx, e_name, call_form.origin);
-        const call = try makeList(ctx, call_items, call_form.origin);
-
-        const if_items = try ctx.allocator.alloc(*Form, 4);
-        if_items[0] = try makeSymbol(ctx, "if", call_form.origin);
-        if_items[1] = call;
-        if_items[2] = @constCast(value);
-        if_items[3] = terminal;
-        terminal = try makeList(ctx, if_items, call_form.origin);
+        chain = try b.list(.{ "if", try b.list(.{ p, clauses[2 * i], g }), clauses[2 * i + 1], chain });
     }
+    return b.list(.{ "let*", try b.vec(.{ p, args[0], g, args[1] }), chain });
+}
 
-    // Wrap in (let* [p# pred e# expr] <chained-if>).
-    const binding_items = try ctx.allocator.alloc(*Form, 4);
-    binding_items[0] = try makeSymbol(ctx, p_name, call_form.origin);
-    binding_items[1] = @constCast(pred_form);
-    binding_items[2] = try makeSymbol(ctx, e_name, call_form.origin);
-    binding_items[3] = @constCast(expr_form);
-    const binding_vec = try makeVector(ctx, binding_items, call_form.origin);
-
-    const let_items = try ctx.allocator.alloc(*Form, 3);
-    let_items[0] = try makeSymbol(ctx, "let*", call_form.origin);
-    let_items[1] = binding_vec;
-    let_items[2] = terminal;
-    return try makeList(ctx, let_items, call_form.origin);
+/// The no-match fallthrough of `case` and `condp` for the dispatch
+/// value bound to `g`.
+fn noMatchThrow(b: Builder, g: *Form) ExpandError!*Form {
+    const message = try makeForm(b.ctx, .{ .string = "No matching clause: " }, b.origin);
+    return b.list(.{ "throw", try b.map(.{ ":error", ":no-matching-clause", ":message", try b.list(.{ "nexis.core/str", message, g }), ":value", g }) });
 }
 
 // ---- for ----------------------------------------------------
@@ -3092,149 +2882,69 @@ fn expandCondp(
 //
 // `:while` ends the loop it modifies (its accumulator is returned
 // as is), `:when` skips the element, and both see the pattern and
-// any earlier `:let`. Modifiers before the first pair, an odd
-// vector or a body count other than one are MalformedMacroCall.
+// any earlier `:let`.
 
-const ForModifier = union(enum) {
-    let_bindings: *Form,
-    when_test: *Form,
-    while_test: *Form,
-};
-
-const ForLevel = struct {
-    pattern: *Form,
-    src: *Form,
-    modifiers: std.ArrayList(ForModifier) = .empty,
-};
-
-fn expandFor(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    if (args.len != 2) return ExpandError.MalformedMacroCall;
-    const bindings_form = args[0];
-    if (bindings_form.datum != .vector) return ExpandError.MalformedMacroCall;
-    const bindings = bindings_form.datum.vector;
-    const body = args[1];
-    if (bindings.len == 0) return ExpandError.MalformedMacroCall;
-
-    var levels: std.ArrayList(ForLevel) = .empty;
-    defer {
-        for (levels.items) |*l| l.modifiers.deinit(ctx.allocator);
-        levels.deinit(ctx.allocator);
-    }
-    var i: usize = 0;
-    while (i + 1 < bindings.len) : (i += 2) {
-        const item = bindings[i];
-        const value = @constCast(bindings[i + 1]);
-        if (item.datum == .keyword) {
-            const kw = item.datum.keyword;
-            if (kw.ns != null or levels.items.len == 0) return ExpandError.MalformedMacroCall;
-            const level = &levels.items[levels.items.len - 1];
-            const modifier: ForModifier = if (std.mem.eql(u8, kw.name, "let")) blk: {
-                if (value.datum != .vector) return ExpandError.MalformedMacroCall;
-                break :blk .{ .let_bindings = value };
-            } else if (std.mem.eql(u8, kw.name, "when"))
-                .{ .when_test = value }
-            else if (std.mem.eql(u8, kw.name, "while"))
-                .{ .while_test = value }
-            else
-                return ExpandError.MalformedMacroCall;
-            try level.modifiers.append(ctx.allocator, modifier);
-        } else {
-            try levels.append(ctx.allocator, .{ .pattern = @constCast(item), .src = value });
-        }
-    }
-    if (i != bindings.len) return ExpandError.MalformedMacroCall;
-
-    const empty_items = try ctx.allocator.alloc(*Form, 0);
-    return try buildForLevel(ctx, levels.items, 0, try makeVector(ctx, empty_items, call_form.origin), body, call_form.origin);
+fn expandFor(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    if (args.len != 2 or args[0].datum != .vector) return ctx.fail(call_form.origin, "for: expected a binding vector and one body form", .{});
+    const bindings = args[0].datum.vector;
+    if (bindings.len == 0 or bindings.len % 2 != 0) return ctx.fail(args[0].origin, "for: the binding vector needs pairs", .{});
+    if (bindings[0].datum == .keyword) return ctx.fail(bindings[0].origin, "for: a modifier needs a binding before it", .{});
+    const b = Builder{ .ctx = ctx, .origin = call_form.origin };
+    return forLevel(b, bindings, try b.vec(.{}), args[1]);
 }
 
-/// The loop for `levels[idx]` accumulating onto `outer_acc`.
-fn buildForLevel(
-    ctx: *ExpandContext,
-    levels: []const ForLevel,
-    idx: usize,
-    outer_acc: *Form,
-    body: *const Form,
-    origin: reader_mod.SrcSpan,
-) ExpandError!*Form {
-    const level = levels[idx];
-    const s_sym = try genTempSym(ctx, origin);
-    const acc_sym = try genTempSym(ctx, origin);
-    const next_s = try makeListInline(ctx, origin, &.{ try coreSym(ctx, "next", origin), s_sym });
+/// The loop for the binding pair at the head of `bindings` (with
+/// the modifiers after it), accumulating onto `outer_acc`.
+fn forLevel(b: Builder, bindings: []const *Form, outer_acc: *Form, body: *const Form) ExpandError!*Form {
+    var end: usize = 2;
+    while (end < bindings.len and bindings[end].datum == .keyword) end += 2;
+    const s = try b.gensym("nx");
+    const acc = try b.gensym("nx");
+    const next_s = try b.list(.{ "nexis.core/next", s });
 
-    // What the element contributes: the nested loop or the body.
-    const contribution: *Form = if (idx + 1 < levels.len)
-        try buildForLevel(ctx, levels, idx + 1, acc_sym, body, origin)
+    var inner = try b.list(.{ "recur", next_s, if (end < bindings.len)
+        try forLevel(b, bindings[end..], acc, body)
     else
-        try makeListInline(ctx, origin, &.{ try coreSym(ctx, "conj", origin), acc_sym, @constCast(body) });
-    var inner: *Form = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "recur", origin), next_s, contribution });
-
-    var m: usize = level.modifiers.items.len;
-    while (m > 0) {
-        m -= 1;
-        inner = switch (level.modifiers.items[m]) {
-            .let_bindings => |lb| try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "let", origin), lb, inner }),
-            .when_test => |t| try makeListInline(ctx, origin, &.{
-                try makeSymbol(ctx, "if", origin),
-                t,
-                inner,
-                try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "recur", origin), next_s, acc_sym }),
-            }),
-            .while_test => |t| try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "if", origin), t, inner, acc_sym }),
-        };
+        try b.list(.{ "nexis.core/conj", acc, body }) });
+    var m = end;
+    while (m > 2) {
+        m -= 2;
+        const key = bindings[m].datum.keyword;
+        const value = bindings[m + 1];
+        if (key.ns != null) return b.ctx.fail(bindings[m].origin, "for: unknown modifier :{s}/{s}", .{ key.ns.?, key.name });
+        inner = if (std.mem.eql(u8, key.name, "let"))
+            try b.list(.{ "let", value, inner })
+        else if (std.mem.eql(u8, key.name, "when"))
+            try b.list(.{ "if", value, inner, try b.list(.{ "recur", next_s, acc }) })
+        else if (std.mem.eql(u8, key.name, "while"))
+            try b.list(.{ "if", value, inner, acc })
+        else
+            return b.ctx.fail(bindings[m].origin, "for: unknown modifier :{s}", .{key.name});
     }
-
-    const first_s = try makeListInline(ctx, origin, &.{ try coreSym(ctx, "first", origin), s_sym });
-    const elem_bindings = try ctx.allocator.alloc(*Form, 2);
-    elem_bindings[0] = level.pattern;
-    elem_bindings[1] = first_s;
-    const with_elem = try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "let", origin), try makeVector(ctx, elem_bindings, origin), inner });
-
-    const loop_bindings = try ctx.allocator.alloc(*Form, 4);
-    loop_bindings[0] = s_sym;
-    loop_bindings[1] = try makeListInline(ctx, origin, &.{ try coreSym(ctx, "seq", origin), level.src });
-    loop_bindings[2] = acc_sym;
-    loop_bindings[3] = outer_acc;
-    return try makeListInline(ctx, origin, &.{
-        try makeSymbol(ctx, "loop*", origin),
-        try makeVector(ctx, loop_bindings, origin),
-        try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "if", origin), s_sym, with_elem, acc_sym }),
+    const with_elem = try b.list(.{ "let", try b.vec(.{ bindings[0], try b.list(.{ "nexis.core/first", s }) }), inner });
+    return b.list(.{
+        "loop*",
+        try b.vec(.{ s, try b.list(.{ "nexis.core/seq", bindings[1] }), acc, outer_acc }),
+        try b.list(.{ "if", s, with_elem, acc }),
     });
 }
 
-// ---- defrecord (records + inline protocol impls) ----
+// ---- defrecord / defprotocol / extend-type / extend-protocol ----
 //
-// Spec: PROTOCOLS.md §4.2.
+// PROTOCOLS.md §4.
 //
-//   (defrecord Counter [n]
-//     IFoo
-//     (bar [this y] (+ (:n this) y))
-//     IBar
-//     (baz [this] (:n this)))
-//   →
-//   (do
-//     (def Counter-type-id (nexis.internal/#%register-record-type
-//                            "<ns>/Counter" [:n]))
-//     (defn ->Counter [n] ...)
-//     (defn map->Counter [m] ...)
-//     (defn Counter? [x] ...)
-//     ;; one extend call per method impl:
-//     (nexis.internal/#%extend-record-impl
-//       IFoo :bar Counter-type-id
-//       (fn [this y] (+ (:n this) y)))
-//     (nexis.internal/#%extend-record-impl
-//       IBar :baz Counter-type-id
-//       (fn [this] (:n this))))
+//   (defrecord Counter [n] IFoo (bar [this y] ...) IBar (baz [this] ...))
+//   → (do
+//       (def Counter-type-id (nexis.internal/#%register-record-type "<ns>/Counter" [:n]))
+//       (defn ->Counter [n] (nexis.internal/#%make-record Counter-type-id (assoc {} :n n)))
+//       (defn map->Counter [m] (nexis.internal/#%make-record Counter-type-id m))
+//       (defn Counter? [x] (and (nexis.internal/#%record? x)
+//                               (= Counter-type-id (nexis.internal/#%record-type-id x))))
+//       (nexis.internal/#%extend-record-impl IFoo :bar Counter-type-id (fn [this y] ...))
+//       (nexis.internal/#%extend-record-impl IBar :baz Counter-type-id (fn [this] ...)))
 //
-// Clauses after the field-vector are parsed in order:
-//   - A bare symbol → switch "current protocol" to that symbol.
-//   - A list `(method-name [params] body...)` → emit one
-//     extend-record-impl call against the current protocol.
-// Same shape Clojure uses.
+// After the field vector, a bare symbol names the protocol the method
+// clauses `(name [params] body...)` that follow implement.
 
 /// The Vars `(defrecord T [...])` defines besides `T` itself. The
 /// compiler's `DeclaredNames` reads the same table, so a form may
@@ -3269,518 +2979,137 @@ pub const RecordNames = struct {
     }
 };
 
-fn expandDefrecord(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    // Minimum: (defrecord Name [fields])
-    if (args.len < 2) return ExpandError.MalformedMacroCall;
-    const name_form = args[0];
-    if (name_form.datum != .symbol) return ExpandError.MalformedMacroCall;
-    if (name_form.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
-    const fields_form = args[1];
-    if (fields_form.datum != .vector) return ExpandError.MalformedMacroCall;
+/// An unqualified symbol's name, or a failure naming `what`.
+fn plainName(ctx: *ExpandContext, form: *const Form, comptime what: []const u8) ExpandError![]const u8 {
+    if (form.datum != .symbol or form.datum.symbol.ns != null) return ctx.fail(form.origin, what ++ " must be an unqualified symbol, not {s}", .{describeForm(form)});
+    return form.datum.symbol.name;
+}
 
-    const rec_name = name_form.datum.symbol.name;
-    const origin = call_form.origin;
+/// The name `name` qualified by the current namespace, as a string
+/// form: the registry key of a record type or protocol.
+fn qualifiedNameString(b: Builder, name: []const u8) ExpandError!*Form {
+    const ns_name: []const u8 = if (b.ctx.namespace) |ns| ns.name else "";
+    return makeForm(b.ctx, .{ .string = try std.fmt.allocPrint(b.ctx.allocator, "{s}/{s}", .{ ns_name, name }) }, b.origin);
+}
 
-    // Build the fully-qualified record-type name string. Use
-    // the macroexpand context's current namespace if available;
-    // otherwise emit just the bare name (the registry treats
-    // empty ns as "no qualifier", and re-registration safety
-    // is per-name).
-    const ns_name: []const u8 = if (ctx.namespace) |ns| ns.name else "";
-    const full_name = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ns_name, rec_name });
-
-    // Helper: build the keyword-vector of field names (verifies
-    // each field is an unqualified symbol; emits `:fieldname`
-    // keywords).
-    const fields = try stripParams(ctx, fields_form);
-    const field_count = fields.datum.vector.len;
-    var keyword_items = try ctx.allocator.alloc(*Form, field_count);
-    for (fields.datum.vector, 0..) |fld, i| {
-        if (fld.datum != .symbol) return ExpandError.MalformedMacroCall;
-        if (fld.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
-        const kw = try ctx.allocator.create(Form);
-        kw.* = .{
-            .datum = .{ .keyword = .{ .ns = null, .name = fld.datum.symbol.name } },
-            .origin = origin,
-        };
-        keyword_items[i] = kw;
-    }
-    const fields_kw_vec = try makeVector(ctx, keyword_items, origin);
-
-    // Names we synthesize (the arena keeps them).
+fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    if (args.len < 2 or stripMeta(args[1]).datum != .vector) return ctx.fail(call_form.origin, "defrecord: expected a name and a field vector", .{});
+    const b = Builder{ .ctx = ctx, .origin = call_form.origin };
+    const rec_name = try plainName(ctx, args[0], "defrecord: the name");
+    const fields = (try stripParams(ctx, args[1])).datum.vector;
+    const keys = try ctx.allocator.alloc(*Form, fields.len);
+    for (fields, keys) |field, *key| key.* = try b.kw(try plainName(ctx, field, "defrecord: a field"));
     const names = try RecordNames.init(ctx.allocator, rec_name);
-    const type_id_name = names.type_id;
-    const ctor_name = names.ctor;
-    const map_ctor_name = names.map_ctor;
-    const pred_name = names.pred;
+    const type_id = try b.item(names.type_id);
 
-    // Qualified internal-helper Forms.
-    const register_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%register-record-type", origin);
-    const make_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%make-record", origin);
-    const record_q_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%record?", origin);
-    const record_type_id_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%record-type-id", origin);
+    var field_map = try b.map(.{});
+    for (fields, keys) |field, key| field_map = try b.list(.{ "nexis.core/assoc", field_map, key, field });
 
-    // String literal for the full record-type name.
-    const full_name_str = try ctx.allocator.create(Form);
-    full_name_str.* = .{
-        .datum = .{ .string = full_name },
-        .origin = origin,
-    };
-
-    // ---- Form 1: (def Counter-type-id
-    //                 (nexis.internal/#%register-record-type
-    //                   "ns/Counter" [:n]))
-    const reg_call = try makeListInline(ctx, origin, &.{
-        register_sym,
-        full_name_str,
-        fields_kw_vec,
+    var out: std.ArrayList(*Form) = .empty;
+    try out.appendSlice(ctx.allocator, &.{
+        try b.item("do"),
+        try b.list(.{ "def", type_id, try b.list(.{ "nexis.internal/#%register-record-type", try qualifiedNameString(b, rec_name), try b.vec(.{keys}) }) }),
+        try b.list(.{ "defn", names.ctor, try b.vec(.{fields}), try b.list(.{ "nexis.internal/#%make-record", type_id, field_map }) }),
+        try b.list(.{ "defn", names.map_ctor, try b.vec(.{"m"}), try b.list(.{ "nexis.internal/#%make-record", type_id, "m" }) }),
+        try b.list(.{ "defn", names.pred, try b.vec(.{"x"}), try b.list(.{
+            "and",
+            try b.list(.{ "nexis.internal/#%record?", "x" }),
+            try b.list(.{ "nexis.core/=", type_id, try b.list(.{ "nexis.internal/#%record-type-id", "x" }) }),
+        }) }),
     });
-    const def_type_id = try makeListInline(ctx, origin, &.{
-        try makeSymbol(ctx, "def", origin),
-        try makeSymbol(ctx, type_id_name, origin),
-        reg_call,
-    });
-
-    // ---- Form 2: (defn ->Counter [n] (#%make-record id (assoc {} :n n)))
-    // Build the field-map construction: (assoc (assoc ... {} :f0 f0) :f1 f1 ...)
-    // Easier: start from `{}` literal map, then `assoc` each field.
-    const ctor_body_inner: *Form = blk: {
-        const empty_map = try makeEmptyMap(ctx, origin);
-        var acc = empty_map;
-        for (fields.datum.vector) |fld| {
-            const sym_name = fld.datum.symbol.name;
-            const kw = try ctx.allocator.create(Form);
-            kw.* = .{
-                .datum = .{ .keyword = .{ .ns = null, .name = sym_name } },
-                .origin = origin,
-            };
-            const sym_form = try makeSymbol(ctx, sym_name, origin);
-            acc = try makeListInline(ctx, origin, &.{
-                try coreSym(ctx, "assoc", origin),
-                acc,
-                kw,
-                sym_form,
-            });
-        }
-        break :blk acc;
-    };
-    const ctor_make_call = try makeListInline(ctx, origin, &.{
-        make_sym,
-        try makeSymbol(ctx, type_id_name, origin),
-        ctor_body_inner,
-    });
-    // Build parameter vector [n m ...] for the constructor.
-    const ctor_params = try ctx.allocator.alloc(*Form, field_count);
-    for (fields.datum.vector, 0..) |fld, i| {
-        ctor_params[i] = try makeSymbol(ctx, fld.datum.symbol.name, origin);
-    }
-    const ctor_param_vec = try makeVector(ctx, ctor_params, origin);
-    const defn_ctor = try makeListInline(ctx, origin, &.{
-        try makeSymbol(ctx, "defn", origin),
-        try makeSymbol(ctx, ctor_name, origin),
-        ctor_param_vec,
-        ctor_make_call,
-    });
-
-    // ---- Form 3: (defn map->Counter [m] (#%make-record id m))
-    const map_ctor_call = try makeListInline(ctx, origin, &.{
-        make_sym,
-        try makeSymbol(ctx, type_id_name, origin),
-        try makeSymbol(ctx, "m", origin),
-    });
-    const map_ctor_params = try ctx.allocator.alloc(*Form, 1);
-    map_ctor_params[0] = try makeSymbol(ctx, "m", origin);
-    const defn_map_ctor = try makeListInline(ctx, origin, &.{
-        try makeSymbol(ctx, "defn", origin),
-        try makeSymbol(ctx, map_ctor_name, origin),
-        try makeVector(ctx, map_ctor_params, origin),
-        map_ctor_call,
-    });
-
-    // ---- Form 4: (defn Counter? [x]
-    //                (and (#%record? x)
-    //                     (= Counter-type-id (#%record-type-id x))))
-    const pred_body = try makeListInline(ctx, origin, &.{
-        try makeSymbol(ctx, "and", origin),
-        try makeListInline(ctx, origin, &.{
-            record_q_sym,
-            try makeSymbol(ctx, "x", origin),
-        }),
-        try makeListInline(ctx, origin, &.{
-            try coreSym(ctx, "=", origin),
-            try makeSymbol(ctx, type_id_name, origin),
-            try makeListInline(ctx, origin, &.{
-                record_type_id_sym,
-                try makeSymbol(ctx, "x", origin),
-            }),
-        }),
-    });
-    const pred_params = try ctx.allocator.alloc(*Form, 1);
-    pred_params[0] = try makeSymbol(ctx, "x", origin);
-    const defn_pred = try makeListInline(ctx, origin, &.{
-        try makeSymbol(ctx, "defn", origin),
-        try makeSymbol(ctx, pred_name, origin),
-        try makeVector(ctx, pred_params, origin),
-        pred_body,
-    });
-
-    // ---- Parse inline protocol clauses (args[2..]).
-    // Walk clauses tracking a "current protocol symbol". Bare
-    // symbol → switch; list → emit one #%extend-record-impl call.
-    const extend_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%extend-record-impl", origin);
-    var extend_calls: std.ArrayList(*Form) = .empty;
-    defer extend_calls.deinit(ctx.allocator);
-
-    if (args.len > 2) {
-        var current_protocol: ?*const Form = null;
-        for (args[2..]) |clause| {
-            if (clause.datum == .symbol) {
-                // Protocol-name switch.
-                current_protocol = clause;
-                continue;
-            }
-            if (clause.datum != .list) return ExpandError.MalformedMacroCall;
-            if (clause.datum.list.len < 2) return ExpandError.MalformedMacroCall;
-            const proto = current_protocol orelse return ExpandError.MalformedMacroCall;
-            const method_head = clause.datum.list[0];
-            if (method_head.datum != .symbol) return ExpandError.MalformedMacroCall;
-            if (method_head.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
-            const method_name = method_head.datum.symbol.name;
-            const params_form = clause.datum.list[1];
-            if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
-            const body_slice = clause.datum.list[2..];
-
-            // Build `(fn params body...)`.
-            var fn_items = try ctx.allocator.alloc(*Form, 2 + body_slice.len);
-            fn_items[0] = try makeSymbol(ctx, "fn", origin);
-            fn_items[1] = params_form;
-            for (body_slice, 0..) |b, i| fn_items[2 + i] = b;
-            const fn_form = try makeList(ctx, fn_items, origin);
-
-            // Method-name keyword.
-            const method_kw = try ctx.allocator.create(Form);
-            method_kw.* = .{
-                .datum = .{ .keyword = .{ .ns = null, .name = method_name } },
-                .origin = origin,
-            };
-
-            // Build the qualified protocol symbol reference (just
-            // pass the user-typed symbol verbatim — runtime resolves
-            // it via the namespace binding from defprotocol).
-            const proto_ref = try ctx.allocator.create(Form);
-            proto_ref.* = proto.*;
-
-            const call_form_x = try makeListInline(ctx, origin, &.{
-                extend_sym,
-                proto_ref,
-                method_kw,
-                try makeSymbol(ctx, type_id_name, origin),
-                fn_form,
-            });
-            try extend_calls.append(ctx.allocator, call_form_x);
-        }
-    }
-
-    // ---- Wrap everything in (do ...).
-    var top_items = try ctx.allocator.alloc(*Form, 5 + extend_calls.items.len);
-    top_items[0] = try makeSymbol(ctx, "do", origin);
-    top_items[1] = def_type_id;
-    top_items[2] = defn_ctor;
-    top_items[3] = defn_map_ctor;
-    top_items[4] = defn_pred;
-    for (extend_calls.items, 0..) |c, i| top_items[5 + i] = c;
-    return try makeList(ctx, top_items, origin);
+    try extendClauses(b, args[2..], .{ .record = args[0] }, &out);
+    return makeList(ctx, out.items, b.origin);
 }
 
-// ---- defprotocol ----
-//
-// Spec: PROTOCOLS.md §4.1.
-//
-//   (defprotocol IFoo
-//     (bar [this y])
-//     (baz [this]))
-//   →
-//   (do
-//     (def IFoo (nexis.internal/#%register-protocol
-//                  "<ns>/IFoo" [:bar :baz]))
-//     (def bar (nexis.internal/#%protocol-fn IFoo :bar))
-//     (def baz (nexis.internal/#%protocol-fn IFoo :baz)))
-//
-// Method signatures (arity, doc strings) are not verified.
-// The dispatch path raises `:no-protocol-impl` at call time
-// when no impl matches the receiver.
-
-fn expandDefprotocol(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    // Minimum: (defprotocol Name <method-spec>+)
-    if (args.len < 1) return ExpandError.MalformedMacroCall;
-    const name_form = args[0];
-    if (name_form.datum != .symbol) return ExpandError.MalformedMacroCall;
-    if (name_form.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
-    const proto_name = name_form.datum.symbol.name;
-    const origin = call_form.origin;
-
-    // Parse method specs: each must be a list whose head is a
-    // symbol (the method name). The arg-vector after the name
-    // is ignored.
-    var method_kw_items = try ctx.allocator.alloc(*Form, args.len - 1);
-    var method_names = try ctx.allocator.alloc([]const u8, args.len - 1);
-    for (args[1..], 0..) |spec, i| {
-        if (spec.datum != .list) return ExpandError.MalformedMacroCall;
-        if (spec.datum.list.len == 0) return ExpandError.MalformedMacroCall;
-        const head = spec.datum.list[0];
-        if (head.datum != .symbol) return ExpandError.MalformedMacroCall;
-        if (head.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
-        method_names[i] = head.datum.symbol.name;
-        const kw = try ctx.allocator.create(Form);
-        kw.* = .{
-            .datum = .{ .keyword = .{ .ns = null, .name = head.datum.symbol.name } },
-            .origin = origin,
-        };
-        method_kw_items[i] = kw;
+fn expandDefprotocol(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    if (args.len < 1) return ctx.fail(call_form.origin, "defprotocol: expected a name", .{});
+    const b = Builder{ .ctx = ctx, .origin = call_form.origin };
+    const proto_name = try plainName(ctx, args[0], "defprotocol: the name");
+    const specs = args[1..];
+    const method_keys = try ctx.allocator.alloc(*Form, specs.len);
+    const defs = try ctx.allocator.alloc(*Form, specs.len);
+    for (specs, method_keys, defs) |spec, *key, *def| {
+        if (spec.datum != .list or spec.datum.list.len == 0) return ctx.fail(spec.origin, "defprotocol: expected a method signature (name [params]...), not {s}", .{describeForm(spec)});
+        const method = try plainName(ctx, spec.datum.list[0], "defprotocol: a method name");
+        key.* = try b.kw(method);
+        def.* = try b.list(.{ "def", method, try b.list(.{ "nexis.internal/#%protocol-fn", proto_name, key.* }) });
     }
-    const methods_kw_vec = try makeVector(ctx, method_kw_items, origin);
-
-    // Build the protocol full-name string.
-    const ns_name: []const u8 = if (ctx.namespace) |ns| ns.name else "";
-    const full_name = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ns_name, proto_name });
-    const full_name_str = try ctx.allocator.create(Form);
-    full_name_str.* = .{
-        .datum = .{ .string = full_name },
-        .origin = origin,
-    };
-
-    // Qualified helpers.
-    const register_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%register-protocol", origin);
-    const protocol_fn_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%protocol-fn", origin);
-
-    // (def IFoo (#%register-protocol "ns/IFoo" [:bar :baz]))
-    const reg_call = try makeListInline(ctx, origin, &.{
-        register_sym,
-        full_name_str,
-        methods_kw_vec,
+    return b.list(.{
+        "do",
+        try b.list(.{ "def", proto_name, try b.list(.{ "nexis.internal/#%register-protocol", try qualifiedNameString(b, proto_name), try b.vec(.{method_keys}) }) }),
+        defs,
     });
-    const def_proto = try makeListInline(ctx, origin, &.{
-        try makeSymbol(ctx, "def", origin),
-        try makeSymbol(ctx, proto_name, origin),
-        reg_call,
-    });
-
-    // Build the (def method-name (#%protocol-fn IFoo :method-name))
-    // for every method.
-    var top_items = try ctx.allocator.alloc(*Form, args.len + 1);
-    top_items[0] = try makeSymbol(ctx, "do", origin);
-    top_items[1] = def_proto;
-    for (method_names, 0..) |mname, i| {
-        const kw = try ctx.allocator.create(Form);
-        kw.* = .{
-            .datum = .{ .keyword = .{ .ns = null, .name = mname } },
-            .origin = origin,
-        };
-        const pf_call = try makeListInline(ctx, origin, &.{
-            protocol_fn_sym,
-            try makeSymbol(ctx, proto_name, origin),
-            kw,
-        });
-        top_items[2 + i] = try makeListInline(ctx, origin, &.{
-            try makeSymbol(ctx, "def", origin),
-            try makeSymbol(ctx, mname, origin),
-            pf_call,
-        });
-    }
-    return try makeList(ctx, top_items, origin);
 }
 
-// ---- extend-type / extend-protocol ----
-//
-// Spec: PROTOCOLS.md §4.3.
-//
-// `extend-type` shape:
-//   (extend-type Type
-//     Protocol1
-//     (method1 [params] body)
-//     (method2 [params] body)
-//     Protocol2
-//     (method3 [params] body))
-//
-// `extend-protocol` shape:
-//   (extend-protocol Protocol
-//     Type1
-//     (method1 [params] body)
-//     Type2
-//     (method2 [params] body))
-//
-// Type forms:
-//   - Keyword `:string` / `:vector` / `:map` / `:nil` / etc. →
-//     dispatches via the built-in Kind enum.
-//   - Keyword `:any` → installs as the default-impl fallback.
-//   - Symbol `Counter` → dispatches via the record's type_id
-//     (must be a defrecord-defined name; the macro emits a
-//     reference to `Counter-type-id`).
+/// What the method clauses of `extend-type`, `extend-protocol` and
+/// `defrecord` extend: a fixed type (a record symbol or a kind
+/// keyword such as `:string`, `:any` for the default impl) whose
+/// clauses name protocols, a fixed protocol whose clauses name
+/// types, or the record `defrecord` defines.
+const ExtendAnchor = union(enum) {
+    type_: *const Form,
+    protocol: *const Form,
+    record: *const Form,
+};
 
-fn emitExtendCall(
-    ctx: *ExpandContext,
-    type_form: *const Form,
-    protocol_form: *const Form,
-    method_name: []const u8,
-    params: *Form,
-    body_slice: []const *Form,
-    origin: reader_mod.SrcSpan,
-) ExpandError!*Form {
-    // Build (fn params body...).
-    var fn_items = try ctx.allocator.alloc(*Form, 2 + body_slice.len);
-    fn_items[0] = try makeSymbol(ctx, "fn", origin);
-    fn_items[1] = params;
-    for (body_slice, 0..) |b, i| fn_items[2 + i] = b;
-    const fn_form = try makeList(ctx, fn_items, origin);
-
-    // Method-name keyword.
-    const method_kw = try ctx.allocator.create(Form);
-    method_kw.* = .{
-        .datum = .{ .keyword = .{ .ns = null, .name = method_name } },
-        .origin = origin,
-    };
-
-    // Pass the protocol form verbatim (resolved at runtime).
-    const proto_ref = try ctx.allocator.create(Form);
-    proto_ref.* = protocol_form.*;
-
-    if (type_form.datum == .keyword) {
-        const tag = type_form.datum.keyword.name;
-        if (std.mem.eql(u8, tag, "any")) {
-            // #%extend-default-impl
-            const ext_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%extend-default-impl", origin);
-            return try makeListInline(ctx, origin, &.{
-                ext_sym,
-                proto_ref,
-                method_kw,
-                fn_form,
-            });
-        }
-        // #%extend-builtin-impl
-        const ext_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%extend-builtin-impl", origin);
-        const type_kw = try ctx.allocator.create(Form);
-        type_kw.* = .{
-            .datum = .{ .keyword = .{ .ns = null, .name = tag } },
-            .origin = origin,
-        };
-        return try makeListInline(ctx, origin, &.{
-            ext_sym,
-            proto_ref,
-            method_kw,
-            type_kw,
-            fn_form,
-        });
-    }
-    if (type_form.datum == .symbol) {
-        // Record type: refer to `<RecName>-type-id`. The macro
-        // emits the symbol; the user is responsible for
-        // ensuring it's defined (defrecord generates it).
-        const rec_name = type_form.datum.symbol.name;
-        const type_id_name = try RecordNames.typeId(ctx.allocator, rec_name);
-        const ext_sym = try makeQualifiedSymbol(ctx, "nexis.internal", "#%extend-record-impl", origin);
-        return try makeListInline(ctx, origin, &.{
-            ext_sym,
-            proto_ref,
-            method_kw,
-            try makeSymbol(ctx, type_id_name, origin),
-            fn_form,
-        });
-    }
-    return ExpandError.MalformedMacroCall;
+fn expandExtendType(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    if (args.len < 1 or (args[0].datum != .symbol and args[0].datum != .keyword)) return ctx.fail(call_form.origin, "extend-type: expected a type", .{});
+    return extendForm(ctx, call_form, args[1..], .{ .type_ = args[0] });
 }
 
-/// Walk `clauses` looking for protocol-name / type / method-list
-/// sequences and emit one extend call per method. The walk
-/// alternates between "expect protocol or type" and "expect
-/// method impls until next protocol/type", letting it support
-/// both `extend-type` (one type, many (protocol-symbol, methods)
-/// groups) and `extend-protocol` (one protocol, many (type,
-/// methods) groups) with the same parser by swapping which
-/// position is iterated.
-fn walkExtendClauses(
-    ctx: *ExpandContext,
-    fixed_anchor_is_protocol: bool,
-    anchor_form: *const Form,
-    clauses: []const *Form,
-    origin: reader_mod.SrcSpan,
-    out_calls: *std.ArrayList(*Form),
-) ExpandError!void {
-    var current_other: ?*const Form = null;
+fn expandExtendProtocol(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    if (args.len < 1 or args[0].datum != .symbol) return ctx.fail(call_form.origin, "extend-protocol: expected a protocol", .{});
+    return extendForm(ctx, call_form, args[1..], .{ .protocol = args[0] });
+}
+
+fn extendForm(ctx: *ExpandContext, call_form: *const Form, clauses: []const *Form, anchor: ExtendAnchor) ExpandError!*Form {
+    const b = Builder{ .ctx = ctx, .origin = call_form.origin };
+    var out: std.ArrayList(*Form) = .empty;
+    try out.append(ctx.allocator, try b.item("do"));
+    try extendClauses(b, clauses, anchor, &out);
+    return makeList(ctx, out.items, b.origin);
+}
+
+/// One extend call per method clause in `clauses` onto `out`; a
+/// symbol or keyword clause switches the protocol (or, for
+/// `extend-protocol`, the type) the following methods belong to.
+fn extendClauses(b: Builder, clauses: []const *Form, anchor: ExtendAnchor, out: *std.ArrayList(*Form)) ExpandError!void {
+    var current: ?*const Form = null;
     for (clauses) |clause| {
-        if (clause.datum == .symbol or clause.datum == .keyword) {
-            current_other = clause;
+        if (clause.datum == .symbol or (clause.datum == .keyword and anchor == .protocol)) {
+            current = clause;
             continue;
         }
-        if (clause.datum != .list) return ExpandError.MalformedMacroCall;
-        if (clause.datum.list.len < 2) return ExpandError.MalformedMacroCall;
-        const other = current_other orelse return ExpandError.MalformedMacroCall;
-        const method_head = clause.datum.list[0];
-        if (method_head.datum != .symbol) return ExpandError.MalformedMacroCall;
-        if (method_head.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
-        const method_name = method_head.datum.symbol.name;
-        const params = clause.datum.list[1];
-        if (params.datum != .vector) return ExpandError.MalformedMacroCall;
-        const body_slice = clause.datum.list[2..];
-
-        const protocol_form: *const Form = if (fixed_anchor_is_protocol) anchor_form else other;
-        const type_form: *const Form = if (fixed_anchor_is_protocol) other else anchor_form;
-        const call_form = try emitExtendCall(
-            ctx,
-            type_form,
-            protocol_form,
-            method_name,
-            params,
-            body_slice,
-            origin,
-        );
-        try out_calls.append(ctx.allocator, call_form);
+        if (clause.datum != .list or clause.datum.list.len < 2) return b.ctx.fail(clause.origin, "expected a protocol name or a method (name [params] body...), not {s}", .{describeForm(clause)});
+        const other = current orelse return b.ctx.fail(clause.origin, "a method needs a protocol name before it", .{});
+        const method = clause.datum.list;
+        const method_key = try b.kw(try plainName(b.ctx, method[0], "a method name"));
+        if (stripMeta(method[1]).datum != .vector) return b.ctx.fail(method[1].origin, "expected the method's parameter vector, not {s}", .{describeForm(method[1])});
+        const impl = try b.list(.{ "fn", method[1..] });
+        const protocol, const type_form = switch (anchor) {
+            .type_ => |t| .{ other, t },
+            .protocol => |p| .{ p, other },
+            .record => |r| .{ other, r },
+        };
+        try out.append(b.ctx.allocator, try extendCall(b, protocol, type_form, method_key, impl));
     }
 }
 
-fn expandExtendType(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    if (args.len < 1) return ExpandError.MalformedMacroCall;
-    const type_form = args[0];
-    if (type_form.datum != .symbol and type_form.datum != .keyword) {
-        return ExpandError.MalformedMacroCall;
+/// The call installing `impl` as `protocol`'s method for a type: a
+/// kind keyword (`:string`), `:any` (the default impl) or a record
+/// symbol (through its `<Name>-type-id`).
+fn extendCall(b: Builder, protocol: *const Form, type_form: *const Form, method_key: *Form, impl: *Form) ExpandError!*Form {
+    switch (type_form.datum) {
+        .keyword => |kw| {
+            if (std.mem.eql(u8, kw.name, "any")) return b.list(.{ "nexis.internal/#%extend-default-impl", protocol, method_key, impl });
+            return b.list(.{ "nexis.internal/#%extend-builtin-impl", protocol, method_key, try b.kw(kw.name), impl });
+        },
+        .symbol => |sym| {
+            const type_id = try RecordNames.typeId(b.ctx.allocator, sym.name);
+            return b.list(.{ "nexis.internal/#%extend-record-impl", protocol, method_key, type_id, impl });
+        },
+        else => return b.ctx.fail(type_form.origin, "expected a record name or a kind keyword, not {s}", .{describeForm(type_form)}),
     }
-    const origin = call_form.origin;
-    var calls: std.ArrayList(*Form) = .empty;
-    defer calls.deinit(ctx.allocator);
-    try walkExtendClauses(ctx, false, type_form, args[1..], origin, &calls);
-    var top_items = try ctx.allocator.alloc(*Form, 1 + calls.items.len);
-    top_items[0] = try makeSymbol(ctx, "do", origin);
-    for (calls.items, 0..) |c, i| top_items[1 + i] = c;
-    return try makeList(ctx, top_items, origin);
-}
-
-fn expandExtendProtocol(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    if (args.len < 1) return ExpandError.MalformedMacroCall;
-    const proto_form = args[0];
-    if (proto_form.datum != .symbol) return ExpandError.MalformedMacroCall;
-    const origin = call_form.origin;
-    var calls: std.ArrayList(*Form) = .empty;
-    defer calls.deinit(ctx.allocator);
-    try walkExtendClauses(ctx, true, proto_form, args[1..], origin, &calls);
-    var top_items = try ctx.allocator.alloc(*Form, 1 + calls.items.len);
-    top_items[0] = try makeSymbol(ctx, "do", origin);
-    for (calls.items, 0..) |c, i| top_items[1 + i] = c;
-    return try makeList(ctx, top_items, origin);
 }
 
 /// The `nexis.core` function `name` as a qualified symbol: what a
@@ -3792,146 +3121,37 @@ fn coreSym(ctx: *ExpandContext, name: []const u8, origin: reader_mod.SrcSpan) Ex
     return try makeQualifiedSymbol(ctx, "nexis.core", name, origin);
 }
 
-/// Helper: make a qualified symbol form (`ns/name`).
-fn makeQualifiedSymbol(ctx: *ExpandContext, ns_name: []const u8, sym_name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
-    const f = try ctx.allocator.create(Form);
-    f.* = .{
-        .datum = .{ .symbol = .{ .ns = ns_name, .name = sym_name } },
-        .origin = origin,
-    };
-    return f;
-}
-
-/// Helper: make an empty map literal `{}` Form.
-fn makeEmptyMap(ctx: *ExpandContext, origin: reader_mod.SrcSpan) ExpandError!*Form {
-    const f = try ctx.allocator.create(Form);
-    const items = try ctx.allocator.alloc(*Form, 0);
-    f.* = .{
-        .datum = .{ .map = items },
-        .origin = origin,
-    };
-    return f;
-}
-
-/// Helper: make a list from inline slice (allocates the items
-/// array, copies the inputs, returns the list Form). Convenience
-/// for the long sequence of `try ctx.allocator.alloc(*Form, N); items[0] = ...`
-/// patterns this file would otherwise need.
-fn makeListInline(ctx: *ExpandContext, origin: reader_mod.SrcSpan, items: []const *Form) ExpandError!*Form {
-    const buf = try ctx.allocator.alloc(*Form, items.len);
-    for (items, 0..) |it, i| buf[i] = it;
-    return try makeList(ctx, buf, origin);
-}
-
-/// The no-match fallthrough of `case` and `condp`:
-/// `(throw {:error :no-matching-clause :message (nexis.core/str
-/// "No matching clause: " g) :value g})`, `g` being the symbol the
-/// dispatch value is bound to. `str` is qualified so a lexical
-/// `str` cannot capture it.
-fn makeNoMatchThrow(ctx: *ExpandContext, g_name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
-    const str_items = try ctx.allocator.alloc(*Form, 3);
-    str_items[0] = try makeQualifiedSymbol(ctx, "nexis.core", "str", origin);
-    const prefix = try ctx.allocator.create(Form);
-    prefix.* = .{ .datum = .{ .string = "No matching clause: " }, .origin = origin };
-    str_items[1] = prefix;
-    str_items[2] = try makeSymbol(ctx, g_name, origin);
-
-    const map_items = try ctx.allocator.alloc(*Form, 6);
-    map_items[0] = try makeKeyword(ctx, "error", origin);
-    map_items[1] = try makeKeyword(ctx, "no-matching-clause", origin);
-    map_items[2] = try makeKeyword(ctx, "message", origin);
-    map_items[3] = try makeList(ctx, str_items, origin);
-    map_items[4] = try makeKeyword(ctx, "value", origin);
-    map_items[5] = try makeSymbol(ctx, g_name, origin);
-    const map_form = try ctx.allocator.create(Form);
-    map_form.* = .{ .datum = .{ .map = @as([]const *Form, map_items) }, .origin = origin };
-
-    const items = try ctx.allocator.alloc(*Form, 2);
-    items[0] = try makeSymbol(ctx, "throw", origin);
-    items[1] = map_form;
-    return try makeList(ctx, items, origin);
-}
-
-// ---- ->  /  ->>  (threading macros) --------------------------
+// ---- -> / ->> ------------------------------------------------
 //
-//   (-> x)             => x
-//   (-> x f)           => (f x)
-//   (-> x (f a b))     => (f x a b)            ; thread-first
-//   (-> x f (g a))     => (g (f x) a)          ; chained
+//   (-> x (f a) g)   => (g (f x a))       thread-first
+//   (->> x (f a) g)  => (g (f a x))       thread-last
 //
-//   (->> x f)          => (f x)
-//   (->> x (f a b))    => (f a b x)            ; thread-last
-//
-// Symbol step `f` is treated as `(f)` — equivalent to inserting
-// the threaded value as the sole arg. Non-symbol non-list steps
-// raise MalformedMacroCall.
+// A step that is not a list (a symbol, a keyword) is called with the
+// threaded value alone.
 
-const ThreadPosition = enum { first, last };
-
-fn expandThreadFirst(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    return try expandThread(ctx, call_form, args, .first);
+fn expandThreadFirst(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    return thread(ctx, call_form, args, .first);
 }
 
-fn expandThreadLast(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    return try expandThread(ctx, call_form, args, .last);
+fn expandThreadLast(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    return thread(ctx, call_form, args, .last);
 }
 
-fn expandThread(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-    pos: ThreadPosition,
-) ExpandError!*Form {
-    if (args.len == 0) return ExpandError.MalformedMacroCall;
-    var acc: *Form = @constCast(args[0]);
+fn thread(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, comptime pos: enum { first, last }) ExpandError!*Form {
+    const name = if (pos == .first) "->" else "->>";
+    if (args.len == 0) return ctx.fail(call_form.origin, name ++ ": expected a value to thread", .{});
+    const b = Builder{ .ctx = ctx, .origin = call_form.origin };
+    var acc = mutCast(args[0]);
     for (args[1..]) |step| {
-        acc = try threadStep(ctx, call_form, acc, step, pos);
+        if (step.datum != .list) {
+            acc = try b.list(.{ step, acc });
+            continue;
+        }
+        const items = step.datum.list;
+        if (items.len == 0) return ctx.fail(step.origin, name ++ ": a step cannot be ()", .{});
+        acc = if (pos == .first) try b.list(.{ items[0], acc, items[1..] }) else try b.list(.{ items, acc });
     }
     return acc;
-}
-
-fn threadStep(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    acc: *Form,
-    step: *const Form,
-    pos: ThreadPosition,
-) ExpandError!*Form {
-    // A non-list step `f` → (f acc): a symbol, or a keyword /
-    // other invocable value (`(-> m :a :b)`).
-    if (step.datum != .list) {
-        const items = try ctx.allocator.alloc(*Form, 2);
-        items[0] = @constCast(step);
-        items[1] = acc;
-        return try makeList(ctx, items, call_form.origin);
-    }
-    // List step (f a b) → thread-first: (f acc a b)
-    //                      thread-last:  (f a b acc)
-    const step_items = step.datum.list;
-    if (step_items.len == 0) return ExpandError.MalformedMacroCall;
-    const new_items = try ctx.allocator.alloc(*Form, step_items.len + 1);
-    switch (pos) {
-        .first => {
-            // (head acc rest...)
-            new_items[0] = @constCast(step_items[0]);
-            new_items[1] = acc;
-            for (step_items[1..], 0..) |it, i| new_items[2 + i] = @constCast(it);
-        },
-        .last => {
-            // (head rest... acc)
-            for (step_items, 0..) |it, i| new_items[i] = @constCast(it);
-            new_items[step_items.len] = acc;
-        },
-    }
-    return try makeList(ctx, new_items, call_form.origin);
 }
 
 // =============================================================================
@@ -4311,8 +3531,9 @@ test "failure: a malformed form records a message at the innermost form" {
     try expectFailure("(defn \"f\" [] 1)", M, "the name defined must be an unqualified symbol, not a string", "\"f\"");
     try expectFailure("(fn x)", M, "fn: expected a parameter vector", "(fn x)");
     try expectFailure("(do 1 (+ 2 (cond 1)))", M, "cond: needs an even number of forms", "(cond 1)");
+    try expectFailure("(do 1 (+ 2 (when)))", M, "when: expected a test", "(when)");
     // Without a specific message, the innermost failing list is named.
-    try expectFailure("(do 1 (+ 2 (when)))", M, "malformed (when ...)", "(when)");
+    try expectFailure("(do 1 (+ 2 (fn* x)))", M, "malformed (fn* ...)", "(fn* x)");
 }
 
 test "unwrapQuote: the reader's quote datum and a written-out (quote x) both unwrap" {

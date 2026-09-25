@@ -654,21 +654,24 @@ build time, define further macros in nexis itself through
 (finally (pop-thread-bindings))))` and `set!` to `(var-set (var a) v)`
 (`docs/VM.md` §6.5).
 
-## 10b. Form construction helpers
+## 10b. Form construction
+
+A host macro builds its output with a `Builder`: the context and
+the call's span, which every synthetic form carries (§4b).
 
 ```zig
-pub fn makeList(ctx, items: []*Form, origin: SrcSpan) ExpandError!*Form;
-pub fn makeVector(ctx, items: []*Form, origin: SrcSpan) ExpandError!*Form;
-pub fn makeSymbol(ctx, name: []const u8, origin: SrcSpan) ExpandError!*Form;
-pub fn makeNil(ctx, origin: SrcSpan) ExpandError!*Form;
-pub fn makeBool(ctx, value: bool, origin: SrcSpan) ExpandError!*Form;
+const b = Builder{ .ctx = ctx, .origin = call_form.origin };
+// (when t body...) → (if t (do body...) nil)
+return b.list(.{ "if", args[0], try b.list(.{ "do", args[1..] }), null });
 ```
 
-Every helper takes `origin` per §4b. Host macros build all of
-their output through them. `makeQualifiedSymbol(ctx, ns, name,
-origin)` builds `ns/name`, and `coreSym(ctx, name, origin)` is
-`nexis.core/name`: the form of every core function a host macro's
-output calls (§5).
+`list`, `vec` and `map` take a tuple whose elements are forms,
+slices of forms (spliced in place), integers, booleans, `null`
+(nil) or strings: `":k"` is a keyword, `"ns/name"` a qualified
+symbol and any other string a symbol. `b.kw(name)` makes a keyword
+from a runtime name and `b.gensym(base)` a fresh symbol (§4). Every
+core function a host macro's output calls is written qualified,
+`"nexis.core/nth"` (§5).
 
 ---
 
