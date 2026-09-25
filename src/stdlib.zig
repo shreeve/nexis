@@ -4198,12 +4198,13 @@ fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
 }
 
 /// `(exit)` / `(exit status)` → ends the process with `status` (0 by
-/// default) after closing every store the program opened; nothing
-/// after it runs, `finally` blocks included, as with Java's
-/// `System/exit`.
+/// default) after closing every store the program opened, through
+/// `db/open` or `nextomic/connect`; nothing after it runs, `finally`
+/// blocks included, as with Java's `System/exit`.
 fn fnExit(vm: *VM, args: []const Value) VmError!Value {
     const status: u8 = if (args.len == 0) 0 else @truncate(@as(u64, @bitCast(try requireFixnum(args[0]))));
     for (vm.db_connections.items) |conn| db_mod.shutdown(@ptrCast(@alignCast(conn)));
+    if (vm.nextomic_close_callback) |close| for (vm.nextomic_connections.items) |conn| close(conn);
     std.process.exit(status);
 }
 
