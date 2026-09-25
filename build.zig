@@ -4,7 +4,7 @@
 //!   zig build install                 bin/nexis and bin/nexis-golden
 //!   zig build test                    the gate: unit, property, integration and
 //!                                     Nextomic corpora, goldens, test/nextomic
-//!                                     scripts, examples
+//!                                     scripts, examples; analyzes the bench
 //!   zig build quick                   the inner loop: unit tests, the compile and
 //!                                     Nextomic property tests, the eval corpora
 //!   zig build nextomic-test           Nextomic unit, property and corpus tests
@@ -148,6 +148,16 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bench.addArgs(args);
     run_bench.step.dependOn(&install_bench.step);
     b.step("bench", "Run the benchmark suite (ReleaseFast)").dependOn(&run_bench.step);
+    // The gate analyzes the suite against the Debug runtime without
+    // generating code or running it, so an API change cannot leave the
+    // bench broken.
+    const bench_check_mod = b.createModule(.{
+        .root_source_file = b.path("bench/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_check_mod.addImport("nexis", nexis);
+    test_step.dependOn(&b.addExecutable(.{ .name = "nexis-bench", .root_module = bench_check_mod }).step);
 
     // -------------------------------------------------------------------------
     // Programs through bin/nexis, their output pinned byte for byte.

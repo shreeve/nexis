@@ -151,6 +151,10 @@ An unknown flag or category prints the usage (or the list of
 categories) and exits 2. JSON is written only with `--out`; run files
 are artifacts and are not committed.
 
+`zig build test` analyzes the suite against the Debug runtime, with no
+code generation and no run, so an API change that breaks it fails the
+gate.
+
 | Category | §2 category | Rows |
 |---|---|---|
 | `scalar` | Warm microbenchmark | `fixnum_add`, `float_add`, `hash_fixnum`, `hash_keyword`, `hash_string_43b`, `xxhash3_raw_172b` |
