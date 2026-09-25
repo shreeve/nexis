@@ -258,6 +258,11 @@ test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
     try expectOutputProgram("(defmacro ^:private pm [x] x) [(pm 1) (:private (meta (var pm)))]", "[1 true]");
     // A ^meta name is still declared for forward references.
     try expectOutputProgram("(defn a [] (b)) (defn ^:private b [] :b) (a)", ":b");
+    // defn- is defn with :private true, which :refer :all skips.
+    try expectOutputProgram("(defn- dp \"doc\" [x] x) [(dp 1) (select-keys (meta (var dp)) [:private :doc :arglists])]", "[1 {:private true, :doc doc, :arglists ([x])}]");
+    try expectOutputProgram("(defn- ^{:k 1} dq ([] 0) ([x] x)) [(dq) (dq 2) (select-keys (meta (var dq)) [:private :k])]", "[0 2 {:private true, :k 1}]");
+    try expectOutputProgram("(defn e [] (dr)) (defn- dr [] :dr) (e)", ":dr");
+    try expectOutputWithFiles(&.{.{ "privy.nx", "(ns privy) (defn- hidden [] 1) (defn shown [] 2)" }}, "(require '[privy :refer :all]) [(shown) (try (eval 'hidden) (catch any e :unresolved))]", "[2 :unresolved]");
     // reset-meta! / alter-meta! change a Var in place.
     try expectOutputProgram("(defn f [x] x) (reset-meta! (var f) {:z 1}) (alter-meta! (var f) assoc :y 2) (meta (var f))", "{:z 1, :y 2}");
 }

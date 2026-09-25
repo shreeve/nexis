@@ -152,7 +152,7 @@ and a reused subform its own (MACROEXPAND.md §4b).
 6. **Current-namespace Var**: a bare symbol looked up in the current
    namespace, then its parent chain (`user`'s parent is `nexis.core`).
 7. **Declared-later name**: a name the file or REPL line defines
-   anywhere, at any depth (`def`, `defn`, `defonce`, `defmacro`,
+   anywhere, at any depth (`def`, `defn`, `defn-`, `defonce`, `defmacro`,
    `defrecord` and its derived names, `defprotocol` and its methods;
    `DeclaredNames`, collected before any form compiles), so a form
    may refer to a Var a later form defines.

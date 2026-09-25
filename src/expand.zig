@@ -1070,7 +1070,7 @@ fn expandDefmacro(
     items: []const *Form,
 ) ExpandError!*Form {
     const origin = list_form.origin;
-    const parts = try defnParts(ctx, list_form, items[1..]);
+    const parts = try defnParts(ctx, list_form, items[1..], false);
     const name = parts.name.datum.symbol.name;
     const ceval = ctx.compile_eval orelse return ctx.fail(origin, "defmacro {s}: macros cannot be defined here", .{name});
     const b = Builder{ .ctx = ctx, .origin = origin };
@@ -1792,12 +1792,17 @@ fn lookupDefault(defaults: []const *Form, name: []const u8) ?*const Form {
 /// `(defn name ...)` → `(def name (fn name ...))`, so params
 /// destructure and overload clauses work as for `fn`, wrapped by
 /// `withVarMeta` when the definition carries metadata.
-fn expandDefnMacro(
-    ctx: *ExpandContext,
-    call_form: *const Form,
-    args: []const *Form,
-) ExpandError!*Form {
-    const parts = try defnParts(ctx, call_form, args);
+fn expandDefnMacro(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    return defnForm(ctx, call_form, args, false);
+}
+
+/// `(defn- name ...)`: `defn` with `:private true` on the Var.
+fn expandDefnPrivate(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
+    return defnForm(ctx, call_form, args, true);
+}
+
+fn defnForm(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, private: bool) ExpandError!*Form {
+    const parts = try defnParts(ctx, call_form, args, private);
     const origin = call_form.origin;
     const b = Builder{ .ctx = ctx, .origin = origin };
     const def_form = try b.list(.{ "def", parts.name, try b.list(.{ "nexis.core/fn", parts.name, parts.fn_tail }) });
@@ -1807,20 +1812,22 @@ fn expandDefnMacro(
 /// The parts of `(defn NAME "doc"? {attrs}? tail)` and of `defmacro`
 /// spelled the same way: the name, the fn tail (a parameter vector
 /// and body, or overload clauses) and the Var metadata, from `^meta`
-/// on the name, the docstring and the attribute map, with
-/// `:arglists` (quoted) added when there is any.
+/// on the name, `:private true` when `private` (`defn-`), the
+/// docstring and the attribute map, with `:arglists` (quoted) added
+/// when there is any.
 const DefnParts = struct {
     name: *const Form,
     fn_tail: []const *Form,
     meta: []const *Form,
 };
 
-fn defnParts(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!DefnParts {
+fn defnParts(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, private: bool) ExpandError!DefnParts {
     const what = call_form.datum.list[0].datum.symbol.name;
     const origin = call_form.origin;
     if (args.len < 2) return ctx.fail(origin, "{s}: expected a name and a parameter vector", .{what});
     const named = try splitMetaName(ctx, args[0]);
     var meta: std.ArrayList(*Form) = .empty;
+    if (private) try meta.appendSlice(ctx.allocator, &.{ try makeKeyword(ctx, "private", origin), try makeBool(ctx, true, origin) });
     if (named.meta) |m| try meta.appendSlice(ctx.allocator, m);
     var rest: usize = 1;
     if (rest < args.len and args[rest].datum == .string) {
@@ -2549,6 +2556,7 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     try table.put(allocator, "let", expandLetRename);
     try table.put(allocator, "fn", expandFnRename);
     try table.put(allocator, "defn", expandDefnMacro);
+    try table.put(allocator, "defn-", expandDefnPrivate);
     try table.put(allocator, "loop", expandLoopRename);
     try table.put(allocator, "when", expandWhen);
     try table.put(allocator, "when-not", expandWhenNot);

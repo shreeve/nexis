@@ -1118,7 +1118,7 @@ pub const DeclaredNames = struct {
     }
 
     /// Record every name `form` defines, at any depth: `def`,
-    /// `defn`, `defonce`, `defmacro`, `defrecord` (the type id, `->T`,
+    /// `defn`, `defn-`, `defonce`, `defmacro`, `defrecord` (the type id, `->T`,
     /// `map->T`, `T?`) and `defprotocol` (the protocol and each
     /// method). A definition inside a `let`, a `when` or a call
     /// interns its Var when it runs, exactly like one at top level,
@@ -1143,7 +1143,7 @@ pub const DeclaredNames = struct {
         const name_form = if (items[1].datum == .with_meta) items[1].datum.with_meta.target else items[1];
         if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return;
         const name = name_form.datum.symbol.name;
-        const plain = [_][]const u8{ "def", "defn", "defonce", "defmacro" };
+        const plain = [_][]const u8{ "def", "defn", "defn-", "defonce", "defmacro" };
         if (for (plain) |h| {
             if (std.mem.eql(u8, head, h)) break true;
         } else false) {
