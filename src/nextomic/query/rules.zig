@@ -35,6 +35,7 @@ const ir = @import("ir.zig");
 const plan_mod = @import("plan.zig");
 const exec_mod = @import("exec.zig");
 const relation = @import("../relation.zig");
+const stack = @import("../../stack.zig");
 
 const Allocator = std.mem.Allocator;
 const Var = ir.Var;
@@ -159,6 +160,7 @@ const Tarjan = struct {
     scc_count: usize = 0,
 
     fn visit(self: *Tarjan, v: usize) !void {
+        try stack.check();
         self.index[v] = self.next;
         self.low[v] = self.next;
         self.next += 1;
@@ -189,6 +191,7 @@ const Call = struct { name: u32, negated: bool };
 /// Rule names called anywhere in `clauses`, each marked when it is
 /// inside a `not`.
 fn collectCalls(arena: Allocator, clauses: []const Clause, negated: bool, out: *std.ArrayList(Call)) !void {
+    try stack.check();
     for (clauses) |c| switch (c) {
         .rule => |r| try out.append(arena, .{ .name = r.name, .negated = negated }),
         .not => |n| try collectCalls(arena, n.body, true, out),
@@ -212,6 +215,7 @@ fn passThrough(arena: Allocator, set: *const RuleSet, name: u32, pos: usize) !bo
 }
 
 fn collectRuleCalls(arena: Allocator, clauses: []const Clause, name: u32, out: *std.ArrayList(Clause)) !void {
+    try stack.check();
     for (clauses) |c| switch (c) {
         .rule => |r| if (r.name == name) try out.append(arena, c),
         .not => |n| try collectRuleCalls(arena, n.body, name, out),
@@ -474,6 +478,7 @@ const Renamer = struct {
     }
 
     fn clause(self: *Renamer, c: Clause, out: *std.ArrayList(Clause)) Failure!void {
+        try stack.check();
         const arena = self.ctx.arena;
         switch (c) {
             .pattern => |p| try out.append(arena, .{ .pattern = .{
@@ -669,6 +674,23 @@ test "call graph: self loop, mutual recursion, acyclic" {
     try testing.expect(info.negated[info.scc_of[info.nameIndex(2).?]]);
     try testing.expect(!info.negated[info.scc_of[info.nameIndex(1).?]]);
     try testing.expect(!info.negated[info.scc_of[info.nameIndex(4).?]]);
+}
+
+test "a call chain past the stack guard is StackOverflow" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // r0 calls r1 calls r2 ... : one frame per rule in the analysis.
+    const n = 5000;
+    const rules = try arena.alloc(ir.Rule, n);
+    for (rules, 0..) |*r, i| {
+        const body: []const Clause = if (i + 1 < n) try arena.dupe(Clause, &.{.{ .rule = .{ .name = @intCast(i + 1), .args = &.{} } }}) else &.{};
+        r.* = .{ .name = @intCast(i), .required = 0, .head = &.{}, .body = body };
+    }
+    const set: RuleSet = .{ .arena_state = null, .vars = &.{}, .rules = rules };
+    stack.arm(64 * 1024);
+    defer stack.arm(stack.main_thread_budget);
+    try testing.expectError(error.StackOverflow, analyze(arena, &set));
 }
 
 test "pass-through positions" {

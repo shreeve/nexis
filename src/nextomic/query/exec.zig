@@ -51,6 +51,7 @@ const rules_mod = @import("rules.zig");
 const marshal = @import("../marshal.zig");
 const pull_mod = @import("../pull.zig");
 const fulltext = @import("../fulltext.zig");
+const stack = @import("../../stack.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -104,6 +105,7 @@ pub const Exec = struct {
 
     /// Run `p` from `input`, which binds at least `p.input`.
     pub fn runPlan(self: *Exec, p: *const Plan, input: Relation) anyerror!Relation {
+        try stack.check();
         var rel = input;
         for (p.steps) |*s| rel = try self.step(s, rel);
         return rel;

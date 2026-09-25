@@ -760,6 +760,7 @@ const Parser = struct {
     /// Every call in `body` to a rule of the set passes as many
     /// arguments as its head has.
     fn checkCalls(self: *Parser, rules: []const ir.Rule, body: []const Clause) Error!void {
+        try stack.check();
         for (body) |c| switch (c) {
             .rule => |call| for (rules) |def| {
                 if (def.name != call.name) continue;

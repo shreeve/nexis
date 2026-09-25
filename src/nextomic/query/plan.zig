@@ -39,6 +39,7 @@ const db_mod = @import("../db.zig");
 const store_mod = @import("../store.zig");
 const marshal = @import("../marshal.zig");
 const relation = @import("../relation.zig");
+const stack = @import("../../stack.zig");
 const ir = @import("ir.zig");
 const rules_mod = @import("rules.zig");
 const parse_mod = @import("parse.zig");
@@ -66,7 +67,7 @@ pub const Error = error{
 
 /// Everything planning can fail with: the planner's own errors and
 /// the store's, through the attribute and constant lookups.
-pub const Failure = Error || marshal.Error || db_mod.ErrorsOf(marshal.cellOf) || db_mod.ErrorsOf(Interner.internSymbol) || db_mod.ErrorsOf(store_mod.Store.treeEntries);
+pub const Failure = Error || stack.Error || marshal.Error || db_mod.ErrorsOf(marshal.cellOf) || db_mod.ErrorsOf(Interner.internSymbol) || db_mod.ErrorsOf(store_mod.Store.treeEntries);
 
 // =============================================================================
 // Steps
@@ -366,6 +367,7 @@ pub fn plan(ctx: *Ctx, query: *const Ir) Failure!*Plan {
 
 /// Plan `clauses` starting from a relation over `input`.
 pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: u64) Failure!*Plan {
+    try stack.check();
     ctx.depth += 1;
     defer ctx.depth -= 1;
     const out = try ctx.arena.create(Plan);
@@ -1013,6 +1015,7 @@ fn joinKind(s: *const Scan, rows: u64) []const u8 {
 }
 
 pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), depth: usize) (Failure || std.Io.Writer.Error)!void {
+    try stack.check();
     for (p.steps, 0..) |step, i| {
         var out: std.Io.Writer.Allocating = .init(ctx.arena);
         const w = &out.writer;

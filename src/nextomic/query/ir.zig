@@ -17,6 +17,7 @@
 const std = @import("std");
 const value = @import("../../value.zig");
 const relation = @import("../relation.zig");
+const stack = @import("../../stack.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -379,6 +380,7 @@ pub const no_rules: RuleSet = .{
 /// Variables bound by evaluating `clauses` (patterns, function outputs,
 /// `or` join variables, rule arguments); not `not` bodies.
 pub fn boundVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(Var)) !void {
+    try stack.check();
     for (clauses) |c| switch (c) {
         .pattern => |p| for (p.terms()) |t| {
             if (t.asVar()) |v| try addVar(arena, out, v);
@@ -401,6 +403,7 @@ pub fn boundVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(
 /// Every variable mentioned anywhere in `clauses`, including predicate
 /// arguments and `not` bodies.
 pub fn allVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(Var)) !void {
+    try stack.check();
     for (clauses) |c| switch (c) {
         .pattern => |p| for (p.terms()) |t| {
             if (t.asVar()) |v| try addVar(arena, out, v);
