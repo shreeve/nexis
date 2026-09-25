@@ -45,6 +45,12 @@ pub const Tag = enum(u8) {
     @"with-meta-raw",
 };
 
+/// The byte length of a leaf the parser built from a `Lexer` token (see
+/// `Lexer.finish`).
+pub fn srcLen(s: parser.Src) u32 {
+    return @as(u32, s.id) << 16 | s.len;
+}
+
 // =============================================================================
 // Lexer — full hand-written replacement
 // =============================================================================
@@ -150,6 +156,15 @@ pub const Lexer = struct {
         }
     }
 
+    /// The token from `start` to the scan position. Token and Src carry a
+    /// u16 length; the high half goes through `aux`, which the parser
+    /// copies into the leaf's `src.id` (`srcLen` puts the halves together).
+    fn finish(self: *Lexer, cat: TokenCat, start: u32, pre: u8) Token {
+        const len = self.base.pos - start;
+        self.base.aux = @intCast(len >> 16);
+        return .{ .cat = cat, .pre = pre, .pos = start, .len = @truncate(len) };
+    }
+
     inline fn single(self: *Lexer, cat: TokenCat, start: u32, pre: u8) Token {
         self.base.pos = start + 1;
         return .{ .cat = cat, .pre = pre, .pos = start, .len = 1 };
@@ -192,7 +207,7 @@ pub const Lexer = struct {
             const ch = src[self.base.pos];
             if (ch == '"') {
                 self.base.pos += 1;
-                return .{ .cat = .string, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+                return self.finish(.string, start, pre);
             }
             if (ch == '\\') {
                 // Accept any next byte; detailed escape validation is the
@@ -203,7 +218,7 @@ pub const Lexer = struct {
             if (ch == '\n') break; // no multi-line strings (PLAN §7.2).
             self.base.pos += 1;
         }
-        return .{ .cat = .err, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+        return self.finish(.err, start, pre);
     }
 
     fn scanChar(self: *Lexer, start: u32, pre: u8) Token {
@@ -220,9 +235,9 @@ pub const Lexer = struct {
             while (self.base.pos < src.len and isHexDigit(src[self.base.pos])) : (self.base.pos += 1) {}
             if (self.base.pos < src.len and src[self.base.pos] == '}') {
                 self.base.pos += 1;
-                return .{ .cat = .char, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+                return self.finish(.char, start, pre);
             }
-            return .{ .cat = .err, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+            return self.finish(.err, start, pre);
         }
 
         // `\name` — named character (alpha run). `\a` and friends fall out of
@@ -230,12 +245,12 @@ pub const Lexer = struct {
         if (isNamedCharStart(src[self.base.pos])) {
             self.base.pos += 1;
             while (self.base.pos < src.len and isAlpha(src[self.base.pos])) : (self.base.pos += 1) {}
-            return .{ .cat = .char, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+            return self.finish(.char, start, pre);
         }
 
         // `\<any>` — any single literal character (incl. punctuation).
         self.base.pos += 1;
-        return .{ .cat = .char, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+        return self.finish(.char, start, pre);
     }
 
     inline fn isNamedCharStart(c: u8) bool {
@@ -262,14 +277,14 @@ pub const Lexer = struct {
             return .{ .cat = .err, .pre = pre, .pos = start, .len = 1 };
         }
         while (self.base.pos < src.len and isIdentCont(src[self.base.pos])) : (self.base.pos += 1) {}
-        return .{ .cat = .keyword, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+        return self.finish(.keyword, start, pre);
     }
 
     fn scanIdent(self: *Lexer, start: u32, pre: u8) Token {
         const src = self.base.source;
         self.base.pos = start + 1;
         while (self.base.pos < src.len and isIdentCont(src[self.base.pos])) : (self.base.pos += 1) {}
-        return .{ .cat = .ident, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+        return self.finish(.ident, start, pre);
     }
 
     /// A number token: `-?`, then `0x`/`0b` and radix digits, or decimal
@@ -324,6 +339,6 @@ pub const Lexer = struct {
 
         // Whatever symbol constituents follow stay in the token.
         while (self.base.pos < src.len and isIdentCont(src[self.base.pos])) : (self.base.pos += 1) {}
-        return .{ .cat = if (is_real) .real else .integer, .pre = pre, .pos = start, .len = @intCast(self.base.pos - start) };
+        return self.finish(if (is_real) .real else .integer, start, pre);
     }
 };

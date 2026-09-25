@@ -691,7 +691,7 @@ fn withoutDelimiters(items: []const Sexp) []const Sexp {
 
 fn srcSpan(s: Sexp) SrcSpan {
     return switch (s) {
-        .src => |r| .{ .pos = r.pos, .len = r.len },
+        .src => |r| .{ .pos = r.pos, .len = nexis.srcLen(r) },
         .list => |l| blk: {
             // Actions like (with-meta-raw 1 3 2) reorder positional
             // children relative to source order; the compound's span is
@@ -720,7 +720,7 @@ fn expectSrcText(self: *Reader, args: []const Sexp, span: SrcSpan) ReaderError![
     if (args.len != 1) return self.fail(.unknown_reader_construct, span, "atom must wrap exactly one src");
     const a = args[0];
     return switch (a) {
-        .src => |r| self.source[r.pos..][0..r.len],
+        .src => |r| self.source[r.pos..][0..nexis.srcLen(r)],
         else => self.fail(.unknown_reader_construct, span, "atom expected .src child"),
     };
 }
@@ -1083,6 +1083,40 @@ test "parsing is linear: a list of n forms costs O(n) parser memory" {
         // A few Sexps per element; a list that copied itself on every
         // append would hold n²/2 of them.
         try std.testing.expect(p.arena.queryCapacity() < 256 * n);
+    }
+}
+
+test "a token longer than 64 KiB reads whole" {
+    const allocator = std.testing.allocator;
+    const n = 70_000;
+    const body = try allocator.alloc(u8, n);
+    defer allocator.free(body);
+    @memset(body, 'a');
+    const shapes = [_][]const u8{ "(\"{s}\")", "(x{s} 1)", "(:k{s} 1)", "(1{s} 1)" };
+    inline for (shapes, 0..) |shape, i| {
+        const src = try std.fmt.allocPrint(allocator, shape, .{body});
+        defer allocator.free(src);
+        var p = parser.Parser.init(allocator, src);
+        defer p.deinit();
+        var rd = Reader.init(allocator, src);
+        defer rd.deinit();
+        const result = rd.readProgram(try p.parseProgram());
+        if (i == 3) {
+            // The number token runs to the delimiter and is rejected whole.
+            try std.testing.expectError(error.ReaderFailure, result);
+            try std.testing.expectEqual(@as(u32, n + 1), rd.err.?.span.len);
+            continue;
+        }
+        const items = (try result)[0].datum.list;
+        const first = items[0];
+        try std.testing.expectEqual(@as(u32, @intCast(src.len - 2 - (if (i == 0) 0 else 2))), first.origin.len);
+        switch (i) {
+            0 => try std.testing.expectEqual(@as(usize, n), first.datum.string.len),
+            1 => try std.testing.expectEqual(@as(usize, n + 1), first.datum.symbol.name.len),
+            2 => try std.testing.expectEqual(@as(usize, n + 1), first.datum.keyword.name.len),
+            else => unreachable,
+        }
+        try std.testing.expectEqual(@as(u32, @intCast(src.len)), (try result)[0].origin.len);
     }
 }
 

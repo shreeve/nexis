@@ -3613,6 +3613,9 @@ test "read-string: forms as data, the first form only, errors thrown" {
     try expectOutput("(try (read-string \"(\") (catch :reader-error e :bad))", ":bad");
     try expectOutput("(try (read-string \"\") (catch :reader-error e :empty))", ":empty");
     try expectOutput("(macroexpand-1 (read-string \"(when a b)\"))", "(if a (do b) nil)");
+    // A token has no 64 KiB limit: a long string and symbol round-trip.
+    try expectOutput("(count (read-string (pr-str (apply str (repeat 70000 \"a\")))))", "70000");
+    try expectOutput("(count (name (read-string (apply str (repeat 70000 \"b\")))))", "70000");
 }
 
 // =============================================================================
