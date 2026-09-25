@@ -34,15 +34,19 @@ expected file fails its step and names the flag.
 
 ## Two build steps for two loops
 
-- **`zig build quick`** — the `unit` binary (every inline test), the
-  compile and Nextomic property tests and the `eval_pipeline`,
-  `runtime_polish` and `numbers` integration tests. The inner
-  edit/test loop.
-- **`zig build test`** (minutes) — the full suite: the `unit` binary,
-  every property test, golden verification, the Nextomic
-  corpora, the `.nx` scripts and the examples. The runtime is
-  dominated by the randomized CHAMP correctness gate. Run before
-  commits.
+- **`zig build quick`** (~30 s from a cold cache) — the `unit` binary
+  (every inline test), the compile and Nextomic property tests and
+  the `eval_pipeline`, `runtime_polish` and `numbers` integration
+  tests. The inner edit/test loop.
+- **`zig build test`** (~1 min from a cold cache) — the full suite:
+  the `unit` binary, every property and integration test, the
+  layering check, the reader and CLI goldens, the Nextomic scripts
+  and the examples. Run before commits.
+
+Each property and integration file is its own binary, so they run in
+parallel; the longest runs are the `unit` binary (its vector
+boundary tests) and the collection property suites, each well under
+a minute.
 
 ## Counts
 
