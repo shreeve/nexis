@@ -16,10 +16,10 @@
 //! construction. See `test "cross-kind: (list 1 2 3) and [1 2 3] are
 //! equal and share hashValue"` in `src/dispatch.zig`.
 //!
-//! Surface: `empty` / `fromSlice` / `conj` / `assoc` / `count` / `nth`
-//! / `isEmpty` / `hashSeq` / `equalSeq` / `Cursor` / `trace`. There is
-//! no `pop`, `subvec` or `concat`, and no small-vector inline subkind;
-//! transients wrap this module from `src/coll/transient.zig`.
+//! Surface: `empty` / `fromSlice` / `conj` / `assoc` / `pop` / `count`
+//! / `nth` / `isEmpty` / `hashSeq` / `equalSeq` / `Cursor` / `trace`.
+//! There is no `subvec` or `concat`, and no small-vector inline
+//! subkind; transients wrap this module from `src/coll/transient.zig`.
 
 const std = @import("std");
 const value = @import("../value.zig");
@@ -46,14 +46,14 @@ pub const subkind_root: u16 = 1;
 // =============================================================================
 // Body layouts
 //
-// Per VECTOR.md §3. Four conceptual subkinds (root / interior / leaf /
-// tail) are semantically distinct but NOT encoded in the HeapHeader —
-// every internal access, including `trace`, derives the kind from
-// structural context (root.shift + descent level). Only vector.zig
-// itself traverses these allocations.
+// Per VECTOR.md §2-§3. Four node roles (root / interior / leaf / tail)
+// share one heap kind and are not tagged: every internal access,
+// including `trace`, derives a node's role from structural context
+// (root.shift + descent level). Only vector.zig traverses these
+// allocations.
 // =============================================================================
 
-/// Root vector body (subkind 1). Every vector — empty, small, or
+/// Root vector body. Every vector — empty, small, or
 /// large — uses this exact 32-byte layout.
 const RootBody = extern struct {
     /// Total element count, including tail.
@@ -63,14 +63,13 @@ const RootBody = extern struct {
     /// depth-2; and so on.
     shift: u32,
     /// Root trie node pointer. `null` when `count ≤ 32` (empty trie).
-    /// Otherwise points at an interior node (if shift > 5) or a leaf
-    /// node (if shift == 5).
+    /// Otherwise an interior node, whose children are leaves when
+    /// shift == 5.
     root_node: ?*HeapHeader,
     /// Tail node pointer. `null` only when `count == 0`.
     tail_node: ?*HeapHeader,
-    /// Tail length in Values, 0..32. Stored explicitly rather than
-    /// derived from `count % 32` because the latter misreports the
-    /// boundary case where count == 32 (tail is full, not empty).
+    /// Tail length in Values, 0..32 (0 only for the empty vector).
+    /// Stored because `count % 32` misreports a full tail as empty.
     tail_len: u32,
     /// Padding to make the struct a clean 32 bytes. NEVER semantic.
     _pad: u32,
@@ -110,8 +109,8 @@ fn allocLeaf(heap: *Heap) !*HeapHeader {
     return heap.alloc(.persistent_vector, leaf_body_size);
 }
 
-/// Fresh zeroed tail node of `len` Values. `len` must be in `[0, 32]`.
-/// An empty tail is not allocated — the root's `tail_node` stays null.
+/// Fresh zeroed tail node of `len` Values, `len` in `[1, 32]`. An
+/// empty vector has no tail node: its root's `tail_node` is null.
 fn allocTail(heap: *Heap, len: usize) !*HeapHeader {
     std.debug.assert(len >= 1 and len <= branch_factor);
     const body_size = try std.math.mul(usize, len, @sizeOf(Value));
@@ -123,12 +122,6 @@ fn allocTail(heap: *Heap, len: usize) !*HeapHeader {
 // =============================================================================
 
 fn rootBody(h: *HeapHeader) *RootBody {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len == root_body_size);
-    return @ptrCast(@alignCast(body.ptr));
-}
-
-fn rootBodyConst(h: *HeapHeader) *const RootBody {
     const body = Heap.bodyBytes(h);
     std.debug.assert(body.len == root_body_size);
     return @ptrCast(@alignCast(body.ptr));
@@ -153,10 +146,6 @@ fn tailValues(h: *HeapHeader) []Value {
     std.debug.assert(count_len >= 1 and count_len <= branch_factor);
     const ptr: [*]Value = @ptrCast(@alignCast(body.ptr));
     return ptr[0..count_len];
-}
-
-fn tailValuesConst(h: *HeapHeader) []const Value {
-    return tailValues(h);
 }
 
 // =============================================================================
@@ -207,46 +196,28 @@ pub fn empty(heap: *Heap) !Value {
 }
 
 /// Append `elem` to `v`, producing a new vector. O(1) amortized.
-/// Four paths:
-///   (a) count == 0 → allocate a 1-element tail.
-///   (b) tail not full → allocate a new (tail_len+1)-length tail with
-///       old elements + appended element.
-///   (c) tail full + trie has room → push old tail into trie as a
+/// Three paths:
+///   (a) tail not full (or absent) → allocate a (tail_len+1)-length
+///       tail with the old elements + the appended element.
+///   (b) tail full + trie has room → push old tail into trie as a
 ///       leaf; start new 1-element tail.
-///   (d) tail full + trie at capacity → grow shift by 5; new root
+///   (c) tail full + trie at capacity → grow shift by 5; new root
 ///       interior node has old root in slot 0 and a freshly-built
 ///       path to the promoted leaf in slot 1; start new tail.
 pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
-    const src_h = rootHeader(v);
-    const src = rootBodyConst(src_h);
+    const src = rootBody(rootHeader(v));
 
-    // Path (a): empty vector → 1-element tail.
-    if (src.count == 0) {
-        const new_tail = try allocTail(heap, 1);
-        tailValues(new_tail)[0] = elem;
-        const new_root_h = try allocRoot(heap);
-        const new_root = rootBody(new_root_h);
-        new_root.count = 1;
-        new_root.shift = 0;
-        new_root.root_node = null;
-        new_root.tail_node = new_tail;
-        new_root.tail_len = 1;
-        return valueFromRoot(new_root_h);
-    }
-
-    // Path (b): tail has room → grow tail by 1.
+    // Path (a): tail has room → grow tail by 1.
     if (src.tail_len < branch_factor) {
-        const old_tail = tailValuesConst(src.tail_node.?);
         const new_tail = try allocTail(heap, src.tail_len + 1);
         const new_tail_values = tailValues(new_tail);
-        @memcpy(new_tail_values[0..src.tail_len], old_tail);
+        if (src.tail_node) |t| @memcpy(new_tail_values[0..src.tail_len], tailValues(t));
         new_tail_values[src.tail_len] = elem;
 
         const new_root_h = try allocRoot(heap);
         const new_root = rootBody(new_root_h);
+        new_root.* = src.*;
         new_root.count = src.count + 1;
-        new_root.shift = src.shift;
-        new_root.root_node = src.root_node;
         new_root.tail_node = new_tail;
         new_root.tail_len = src.tail_len + 1;
         return valueFromRoot(new_root_h);
@@ -302,9 +273,10 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
     //
     // GC-interaction note: this function allocates several heap
     // objects (new_tail, path clones or new interiors, new_root_h)
-    // before any of them is reachable from a user-held Value. `Heap.alloc` never triggers a collection (GC.md §7: a
-    // cycle runs only at the VM's instruction fetch), so no
-    // temporary root-stack is needed to protect the partial tree.
+    // before any of them is reachable from a user-held Value.
+    // `Heap.alloc` never triggers a collection (GC.md §7: a cycle runs
+    // only at the VM's instruction fetch), so no temporary root-stack
+    // is needed to protect the partial tree.
     if (src.root_node == null or elems_after_promotion > capacityAtShift(src.shift)) {
         const old_shift = src.shift;
         new_shift = if (src.root_node == null) branch_bits else src.shift + branch_bits;
@@ -334,7 +306,7 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
 /// through the trie. `i` must be in bounds.
 pub fn assoc(heap: *Heap, v: Value, i: usize, elem: Value) !Value {
     const src_h = rootHeader(v);
-    const src = rootBodyConst(src_h);
+    const src = rootBody(src_h);
     std.debug.assert(i < src.count);
     const new_root_h = try allocRoot(heap);
     const new_root = rootBody(new_root_h);
@@ -342,7 +314,7 @@ pub fn assoc(heap: *Heap, v: Value, i: usize, elem: Value) !Value {
     const tail_offset: usize = src.count - src.tail_len;
     if (i >= tail_offset) {
         const new_tail = try allocTail(heap, src.tail_len);
-        @memcpy(tailValues(new_tail), tailValuesConst(src.tail_node.?));
+        @memcpy(tailValues(new_tail), tailValues(src.tail_node.?));
         tailValues(new_tail)[i - tail_offset] = elem;
         new_root.tail_node = new_tail;
     } else {
@@ -372,7 +344,7 @@ fn assocPath(heap: *Heap, node: *HeapHeader, level_shift: u32, i: usize, elem: V
 /// root left with a single child is replaced by that child (the shift
 /// drops by 5). `v` must not be empty.
 pub fn pop(heap: *Heap, v: Value) !Value {
-    const src = rootBodyConst(rootHeader(v));
+    const src = rootBody(rootHeader(v));
     std.debug.assert(src.count > 0);
     if (src.count == 1) return empty(heap);
     const new_root_h = try allocRoot(heap);
@@ -381,7 +353,7 @@ pub fn pop(heap: *Heap, v: Value) !Value {
     new_root.count = src.count - 1;
     if (src.tail_len > 1) {
         const new_tail = try allocTail(heap, src.tail_len - 1);
-        @memcpy(tailValues(new_tail), tailValuesConst(src.tail_node.?)[0 .. src.tail_len - 1]);
+        @memcpy(tailValues(new_tail), tailValues(src.tail_node.?)[0 .. src.tail_len - 1]);
         new_root.tail_node = new_tail;
         new_root.tail_len = src.tail_len - 1;
         return valueFromRoot(new_root_h);
@@ -471,11 +443,11 @@ fn buildTrie(heap: *Heap, elems: []const Value, level_shift: u32) !*HeapHeader {
 // =============================================================================
 
 pub fn count(v: Value) usize {
-    return rootBodyConst(rootHeader(v)).count;
+    return rootBody(rootHeader(v)).count;
 }
 
 pub fn isEmpty(v: Value) bool {
-    return rootBodyConst(rootHeader(v)).count == 0;
+    return rootBody(rootHeader(v)).count == 0;
 }
 
 /// Element at logical index `i`. Panics in safe builds on out-of-
@@ -484,10 +456,10 @@ pub fn isEmpty(v: Value) bool {
 pub fn nth(v: Value, i: usize) Value {
     const h = rootHeader(v);
     if (std.debug.runtime_safety) {
-        const n = rootBodyConst(h).count;
+        const n = rootBody(h).count;
         if (i >= n) std.debug.panic("vector.nth: index {d} out of bounds (count {d})", .{ i, n });
     }
-    return nthFromHeader(h, i);
+    return chunkFor(rootBody(h), i)[i & branch_mask];
 }
 
 // =============================================================================
@@ -498,45 +470,29 @@ pub fn nth(v: Value, i: usize) Value {
 /// `list.hashSeq` arithmetic exactly so equal element sequences
 /// produce equal pre-mix u64 bases across list and vector.
 pub fn hashSeq(h: *HeapHeader, elementHash: *const fn (Value) u64) u64 {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(h.kind == @intFromEnum(Kind.persistent_vector));
-    }
-    const body = rootBodyConst(h);
+    std.debug.assert(h.kind == @intFromEnum(Kind.persistent_vector));
     var acc: u64 = hash_mod.ordered_init;
-    var idx: usize = 0;
-    const tail_offset: usize = body.count - body.tail_len;
-    // Trie elements first (indices 0..tail_offset), then tail.
-    while (idx < tail_offset) : (idx += 1) {
-        const elem = nthFromHeader(h, idx);
-        acc = hash_mod.combineOrdered(acc, elementHash(elem));
-    }
-    if (body.tail_node) |tn| {
-        for (tailValuesConst(tn)) |elem| {
-            acc = hash_mod.combineOrdered(acc, elementHash(elem));
-        }
-    }
-    return hash_mod.finalizeOrdered(acc, body.count);
+    var c = Cursor.fromHeader(h);
+    while (c.next()) |elem| acc = hash_mod.combineOrdered(acc, elementHash(elem));
+    return hash_mod.finalizeOrdered(acc, c.count);
 }
 
-/// Pairwise structural equality. Called by dispatch.heapEqual when
-/// both sides are kind `.persistent_vector`. Returns false on count
-/// mismatch; otherwise walks both in lock-step via index.
+/// Pairwise structural equality. Called by dispatch when both sides
+/// are kind `.persistent_vector`. Returns false on count mismatch;
+/// otherwise walks both in lock-step.
 pub fn equalSeq(
     a: *HeapHeader,
     b: *HeapHeader,
     elementEq: *const fn (Value, Value) bool,
 ) bool {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(a.kind == @intFromEnum(Kind.persistent_vector));
-        std.debug.assert(b.kind == @intFromEnum(Kind.persistent_vector));
-    }
+    std.debug.assert(a.kind == @intFromEnum(Kind.persistent_vector));
+    std.debug.assert(b.kind == @intFromEnum(Kind.persistent_vector));
     if (a == b) return true;
-    const ab = rootBodyConst(a);
-    const bb = rootBodyConst(b);
-    if (ab.count != bb.count) return false;
-    var i: usize = 0;
-    while (i < ab.count) : (i += 1) {
-        if (!elementEq(nthFromHeader(a, i), nthFromHeader(b, i))) return false;
+    var ca = Cursor.fromHeader(a);
+    var cb = Cursor.fromHeader(b);
+    if (ca.count != cb.count) return false;
+    while (ca.next()) |x| {
+        if (!elementEq(x, cb.next().?)) return false;
     }
     return true;
 }
@@ -544,24 +500,24 @@ pub fn equalSeq(
 // =============================================================================
 // GC trace (GC.md §5)
 //
-// Vector trace walks the trie (internal subkinds 2/3/4) directly via
+// Vector trace walks the trie nodes directly via
 // `visitor.markInternal`. External Value references (leaf/tail
 // elements) route through `visitor.markValue`. Internal nodes have
 // no metadata (VECTOR.md §3 invariant), so `markInternal` skips the
-// meta chain.
+// meta chain. A node reachable twice (a full tail that is also the
+// trie's last leaf) is walked once: `markInternal` reports it marked.
 // =============================================================================
 
-/// Walk the vector rooted at `h` (subkind 1). `h` itself is already
-/// marked by the collector. Walks: tail_node (internal) + its leaf
-/// values; root_node recursively (interior/leaf subkinds) + every
-/// leaf's values.
+/// Walk the vector rooted at `h`. `h` itself is already marked by the
+/// collector. Walks: tail_node + its values; root_node recursively +
+/// every leaf's values.
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    const body = rootBodyConst(h);
+    const body = rootBody(h);
     if (body.tail_node) |tn| {
         if (visitor.markInternal(tn)) {
             // Tail node body is [tail_len] Value — walk and mark
             // heap-kind children.
-            for (tailValuesConst(tn)) |elem| visitor.markValue(elem);
+            for (tailValues(tn)) |elem| visitor.markValue(elem);
         }
     }
     if (body.root_node) |rn| traceTrie(rn, body.shift, visitor);
@@ -585,27 +541,38 @@ fn traceTrie(node: *HeapHeader, shift: u32, visitor: anytype) void {
 }
 
 // =============================================================================
-// Cursor — streaming ordered iteration for cross-kind walking
+// Cursor — streaming ordered iteration
 //
-// Cross-kind `sequentialEqual` uses cursor-based walks rather than
-// `count + nth` so the pattern generalizes to lazy-seq and cons
-// without random-access. Vector's cursor uses `nth(i)` per step —
-// O(log₃₂ n) per element; it does not cache the current leaf.
+// Cross-kind `sequentialEqual` walks cursors rather than `count + nth`
+// so the pattern serves list and cons without random access. The
+// cursor holds the current leaf (or the tail), so a walk descends the
+// trie once per 32 elements: O(n) in all.
 // =============================================================================
 
 pub const Cursor = struct {
-    root: Value,
-    index: usize,
+    root: *HeapHeader,
+    count: usize,
+    index: usize = 0,
+    /// The leaf or tail holding `index` once it is loaded; its first
+    /// element is at `chunk_base`.
+    chunk: []const Value = &.{},
+    chunk_base: usize = 0,
 
     pub fn init(v: Value) Cursor {
-        std.debug.assert(v.kind() == .persistent_vector);
-        return .{ .root = v, .index = 0 };
+        return fromHeader(rootHeader(v));
+    }
+
+    fn fromHeader(h: *HeapHeader) Cursor {
+        return .{ .root = h, .count = rootBody(h).count };
     }
 
     pub fn next(self: *Cursor) ?Value {
-        const n = count(self.root);
-        if (self.index >= n) return null;
-        const v = nth(self.root, self.index);
+        if (self.index >= self.count) return null;
+        if (self.index - self.chunk_base >= self.chunk.len) {
+            self.chunk = chunkFor(rootBody(self.root), self.index);
+            self.chunk_base = self.index & ~@as(usize, branch_mask);
+        }
+        const v = self.chunk[self.index - self.chunk_base];
         self.index += 1;
         return v;
     }
@@ -674,12 +641,11 @@ fn pushLeaf(
     return cloned;
 }
 
-/// Element `i` of the vector rooted at `h`.
-fn nthFromHeader(h: *HeapHeader, i: usize) Value {
-    const body = rootBodyConst(h);
-    const tail_offset: usize = body.count - body.tail_len;
-    if (i >= tail_offset) return tailValuesConst(body.tail_node.?)[i - tail_offset];
-    return leafValues(leafFor(body, i))[i & branch_mask];
+/// The leaf or the tail holding index `i`. Both start at a multiple
+/// of 32, so `i & branch_mask` indexes into the result.
+fn chunkFor(body: *const RootBody, i: usize) []const Value {
+    if (i >= body.count - body.tail_len) return tailValues(body.tail_node.?);
+    return leafValues(leafFor(body, i));
 }
 
 /// The leaf holding index `i`, which lies in the trie
@@ -713,13 +679,13 @@ test "empty: count 0, isEmpty true, no allocations for internal nodes" {
 /// Test helper: `a` and `b` have the same root fields, the same tail
 /// elements and the same trie shape, node for node.
 fn expectSameShape(a: Value, b: Value) !void {
-    const x = rootBodyConst(rootHeader(a));
-    const y = rootBodyConst(rootHeader(b));
+    const x = rootBody(rootHeader(a));
+    const y = rootBody(rootHeader(b));
     try testing.expectEqual(x.count, y.count);
     try testing.expectEqual(x.shift, y.shift);
     try testing.expectEqual(x.tail_len, y.tail_len);
     try testing.expectEqual(x.tail_node == null, y.tail_node == null);
-    if (x.tail_node) |t| try expectSameValues(tailValuesConst(t), tailValuesConst(y.tail_node.?));
+    if (x.tail_node) |t| try expectSameValues(tailValues(t), tailValues(y.tail_node.?));
     try testing.expectEqual(x.root_node == null, y.root_node == null);
     if (x.root_node) |r| try expectSameNode(r, y.root_node.?, x.shift);
 }
@@ -869,7 +835,7 @@ test "conj at 32→33 boundary: old tail promoted to leaf, shift becomes 5" {
         v = try conj(&heap, v, value.fromFixnum(@intCast(i)).?);
     }
     try testing.expectEqual(@as(usize, 33), count(v));
-    const body = rootBodyConst(rootHeader(v));
+    const body = rootBody(rootHeader(v));
     try testing.expectEqual(@as(u32, branch_bits), body.shift);
     try testing.expect(body.root_node != null);
     try testing.expectEqual(@as(u32, 1), body.tail_len);
@@ -1034,7 +1000,7 @@ test "conj just past shift-5 leaf capacity (1024 + 1): still shift 5, tail=1" {
     while (i < 1025) : (i += 1) {
         v = try conj(&heap, v, value.fromFixnum(@intCast(i)).?);
     }
-    const body = rootBodyConst(rootHeader(v));
+    const body = rootBody(rootHeader(v));
     try testing.expectEqual(@as(u32, 1025), body.count);
     try testing.expectEqual(@as(u32, branch_bits), body.shift); // still 5
     try testing.expectEqual(@as(u32, 1), body.tail_len);
@@ -1051,7 +1017,7 @@ test "conj at the actual shift-5 → shift-10 overflow (1056 + 1 = 1057)" {
     while (i < 1057) : (i += 1) {
         v = try conj(&heap, v, value.fromFixnum(@intCast(i)).?);
     }
-    const body = rootBodyConst(rootHeader(v));
+    const body = rootBody(rootHeader(v));
     try testing.expectEqual(@as(u32, 1057), body.count);
     try testing.expectEqual(@as(u32, 2 * branch_bits), body.shift); // 10
     try testing.expectEqual(@as(u32, 1), body.tail_len);
@@ -1074,10 +1040,10 @@ test "conj across the shift-10 → shift-15 boundary (32768 … 32802)" {
     while (n < 32802) : (n += 1) {
         v = try conj(&heap, v, value.fromFixnum(@intCast(n)).?);
         try expectSameShape(try rangeVector(&heap, n + 1), v);
-        const body = rootBodyConst(rootHeader(v));
+        const body = rootBody(rootHeader(v));
         try testing.expectEqual(@as(u32, if (n + 1 > 32800) 3 * branch_bits else 2 * branch_bits), body.shift);
     }
-    const body = rootBodyConst(rootHeader(v));
+    const body = rootBody(rootHeader(v));
     try testing.expectEqual(@as(u32, 32802), body.count);
     try testing.expectEqual(@as(u32, 2), body.tail_len);
     const probe = [_]usize{ 0, 31, 1023, 1024, 32767, 32768, 32799, 32800, 32801 };

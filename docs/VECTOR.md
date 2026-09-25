@@ -5,19 +5,15 @@ Authoritative body-layout and semantic contract for the `persistent_vector` heap
 §2.6 / §3.2 (shared sequential hash domain), `docs/HEAP.md`, and `docs/LIST.md`. Those documents win on
 conflict.
 
-This is the **second sequential collection kind** and the direct
-stress test of the cross-kind sequential equality/hash story. It
-consists of:
+This is the second sequential collection kind (after `list`) and
+the direct test of the cross-kind sequential equality/hash story:
 
-1. A **streaming cursor abstraction** — sequential equality across
-   kinds is streaming ordered traversal, not random-access-by-index.
-   This is the pattern for cons / any sequential kind.
-2. A **4-subkind representation** for root / interior / leaf / tail,
-   each a distinct subkind within `kind = .persistent_vector`. This
-   cleanly separates the "exactly 32 values" leaf invariant from the
-   "0..32 values, partial" tail invariant, and gives the collector a
-   per-subkind trace dispatch.
-3. The **cross-kind property test**: `(= (list 1 2 3) [1 2 3])` and
+1. A **streaming cursor** — sequential equality across kinds is
+   streaming ordered traversal, not random access by index.
+2. A **root / interior / leaf / tail** trie representation within the
+   one heap kind `.persistent_vector`: the "exactly 32 values" leaf is
+   distinct from the "1..32 values" tail.
+3. The **cross-kind invariant**: `(= (list 1 2 3) [1 2 3])` and
    `(hash (list 1 2 3)) == (hash [1 2 3])` hold.
 
 **The module provides construction, the canonical trie/tail
@@ -47,17 +43,14 @@ transients wrap the persistent ops (`docs/TRANSIENT.md`).
   `isEmpty(v)`.
 - Per-kind dispatch: `hashSeq(h, elementHash) u64` + `equalSeq(a, b,
   elementEq) bool` — same fn-pointer signatures as list for symmetry.
-- Internal cursor: `Cursor` type + `cursorInit` + `cursorNext` for
-  streaming ordered traversal. Consumed by `dispatch.sequentialEqual`
-  to walk list↔vector pairs in lock-step.
+- Cursor: `Cursor.init(v)` + `next()` for streaming ordered
+  traversal. Consumed by `dispatch.sequentialEqual` to walk
+  list↔vector pairs in lock-step, and by `hashSeq` / `equalSeq`.
 
-**Out (each lives in a later commit):**
+**Out:**
 
-- `assoc n v` — O(log₃₂ n) path-copy update. Significant additional
-  code; independent of the architectural composition story this
-  commit is retiring.
-- `subvec`, `concat` — O(n) regardless of implementation
-  choice (PLAN §9.2); not architecturally interesting.
+- `subvec`, `concat` — built in `src/stdlib.zig` from `nth` and
+  `fromSlice` (O(n)).
 - **Transients** — `docs/TRANSIENT.md`, alongside map/set transient
   support.
 - **Small-vector-inline subkind 0** — space optimization; all vectors
@@ -68,32 +61,29 @@ transients wrap the persistent ops (`docs/TRANSIENT.md`).
 
 ---
 
-### 2. Subkind taxonomy (four subkinds within `.persistent_vector`)
+### 2. Node roles
 
 VALUE.md §2.2 names persistent_vector as kind 20 with "0 = inline
-(≤32); 1 = trie + tail." This commit extends that with two internal
-subkinds:
+(≤32); 1 = trie + tail." Every vector Value is subkind 1; subkind 0 is
+reserved for a small-vector inline form and unused.
 
-| Subkind | Name          | Role                                                       |
-|---------|---------------|------------------------------------------------------------|
-| 0       | reserved      | A small-vector inline form; unused.                        |
-| 1       | `root`        | The user-facing vector Value. Body = root metadata + pointers to tail and (optionally) root trie node. |
-| 2       | `interior`    | Internal trie node. Body = `[32]?*HeapHeader` child pointers. |
-| 3       | `leaf`        | Trie leaf node. Body = exactly `[32]Value`. Always full.   |
-| 4       | `tail`        | Tail node. Body = `[0..32]Value`. Length determined by body size. |
+A vector is built from four node roles, all allocated as
+`.persistent_vector` heap blocks. The role is **not** recorded in the
+header: every access, including the GC trace, derives it from
+structural context (the root's `shift` and the descent level).
 
-Only subkind-1 (`root`) Values ever flow through dispatch. Subkinds
-2–4 are internal allocations — the heap holds them, GC will trace
-them, but they're never wrapped into user-visible `Value`s. Each
-accessor safe-asserts the subkind of the header it receives.
+| Role       | Body                                                              |
+|------------|-------------------------------------------------------------------|
+| `root`     | The user-facing Value: 32-byte root metadata (§3).                |
+| `interior` | `[32]?*HeapHeader` child pointers, 256 bytes.                      |
+| `leaf`     | Exactly `[32]Value`, 512 bytes. Always full.                       |
+| `tail`     | `[len]Value`, `len × 16` bytes, `1 ≤ len ≤ 32`.                    |
 
-Body-size-to-count mapping per subkind:
-
-- `root`: 32 bytes (see §3).
-- `interior`: 32 × 8 = 256 bytes.
-- `leaf`: 32 × 16 = 512 bytes.
-- `tail`: `len × 16` bytes where `0 ≤ len ≤ 32`. An empty-tail vector
-  (count == 0) has no tail node at all; `tail_ptr` is null.
+Only the root ever flows through dispatch; the other nodes are never
+wrapped into user-visible Values. A leaf and a full tail share one
+layout, so one node can serve both roles: `conj` promotes a full tail
+into the trie as it stands, and `pop` makes the trie's last leaf the
+new tail. An empty vector has no tail node; `tail_node` is null.
 
 ---
 
@@ -103,7 +93,7 @@ Body-size-to-count mapping per subkind:
 const RootBody = extern struct {
     count: u32,            // total element count, including tail
     shift: u32,            // root trie shift; 0 when count ≤ 32, 5 for depth-1, 10 for depth-2, ...
-    root_node: ?*HeapHeader, // root trie node (interior or leaf); null when count ≤ 32
+    root_node: ?*HeapHeader, // root trie node (always an interior); null when count ≤ 32
     tail_node: ?*HeapHeader, // tail node; null only when count == 0
     tail_len: u32,         // 0..32
     _pad: u32,             // align to 8; NEVER semantic
@@ -122,9 +112,9 @@ element lives in the tail (e.g., `count == 5 → tail_len == 5`, not
 
 1. If `count == 0`: `shift == 0`, `root_node == null`, `tail_node == null`, `tail_len == 0`.
 2. If `0 < count ≤ 32`: `shift == 0`, `root_node == null`, `tail_node != null`, `tail_len == count`.
-3. If `count > 32`: `shift >= 5`, `root_node != null`, `tail_node != null`, `1 ≤ tail_len ≤ 32`.
+3. If `count > 32`: `shift >= 5`, `root_node != null` (an interior; its children are leaves when `shift == 5`), `tail_node != null`, `1 ≤ tail_len ≤ 32`. `shift` is the smallest multiple of 5 with `count - tail_len ≤ 32 << shift`.
 4. Count and tail-offset relationship: `tail_offset := count - tail_len`. Every element at index `i < tail_offset` lives in the trie; every element at index `i >= tail_offset` lives in the tail at offset `i - tail_offset`.
-5. Interior nodes only have non-null children in the populated prefix (canonical leftmost structure); trailing null children are fine but not required.
+5. Interior nodes have non-null children exactly in a populated prefix of their slots (canonical leftmost structure). The trie of a vector is a function of its count: `conj`, `pop` and `fromSlice` all yield the same shape for the same elements.
 6. Leaves are always exactly 32 Values. Only the tail is partial.
 
 ---
@@ -140,22 +130,18 @@ and whose `next()` returns the next element in logical order or
 ```zig
 // vector.zig
 pub const Cursor = struct {
-    root: Value,   // the vector being iterated; kind asserted .persistent_vector
-    index: usize,  // next element to return (0..count]
-
+    // root header, count, next index, and the current leaf or tail
     pub fn init(v: Value) Cursor;
     pub fn next(self: *Cursor) ?Value;
 };
 ```
 
-The vector cursor uses `nth(v, i)` per step (O(log₃₂ n) per
-call). Total list↔vector equality is O(n · log₃₂ n). An
-optimization could rewrite the cursor to track current leaf and local
-offset, reducing to O(n) amortized, without changing the public
-`Cursor.init` / `Cursor.next` shape.
+The vector cursor holds the leaf (or the tail) that the next index
+lies in, and descends the trie again only when it crosses into the
+next 32-element chunk: O(n) for a whole walk. `hashSeq` and
+`equalSeq` walk with it too.
 
-The corresponding list cursor (landing in this commit's
-`src/coll/list.zig` extension):
+The corresponding list cursor (`src/coll/list.zig`):
 
 ```zig
 // list.zig
@@ -251,8 +237,8 @@ misstep; the impl + tests must cover all of them explicitly.
   each level with current `level_shift`, child index is
   `(i >> level_shift) & 0x1F`; decrease `level_shift` by 5 until
   `level_shift == 0`, then read the leaf's element at index `i & 0x1F`.
-- **Structural invariants on leaf vs tail.** Leaves (subkind 3) are
-  always exactly 32 Values; tail (subkind 4) is the ONLY partial
+- **Structural invariants on leaf vs tail.** Leaves are
+  always exactly 32 Values; the tail is the ONLY partial
   node. Mixing these breaks the trie path arithmetic.
 - **`pop` when the tail empties.** A tail of one element pops to the
   trie's last leaf as the new 32-element tail (a leaf and a full tail
@@ -290,7 +276,7 @@ Cross-kind list↔vector via `dispatch.sequentialEqual`'s cursor walk
 (§4).
 
 The cross-kind invariant test is the single most important
-correctness artifact of this commit: if `(list 1 2 3)` and
+correctness artifact of this module: if `(list 1 2 3)` and
 `[1 2 3]` are `=` AND share `hashValue`, the sequential-category
 architecture works end-to-end. If either fails, something in the
 hash-domain mixing, the cursor walk, or the finalizeOrdered call is
@@ -305,14 +291,13 @@ The heap-kind switch in `heapHashBase` gains
 `heapEqual` switch never routes to vector because vector is
 sequential-category; `dispatch.sequentialEqual` handles it.
 
-`dispatch.sequentialEqual` is rewritten to the cursor-walk shape
-above. The existing list-list fast-path stays (O(n) via
+`dispatch.sequentialEqual` has the cursor-walk shape above. The list-list fast-path (O(n) via
 `list.equalSeq`); the new vector-vector fast-path uses
 `vector.equalSeq`. Cross-kind pairs fall through to cursor-walk.
 
-`dispatch.zig` now imports `vector` (`@import("vector")` via the
-`vector_mod` build wiring). Since dispatch is already a one-way
-terminal depending on every heap kind, this is additive.
+`dispatch.zig` imports `coll/vector.zig`; the vector module never
+imports dispatch, so hashing and comparing elements arrive as
+function-pointer callbacks.
 
 ---
 
@@ -333,38 +318,37 @@ test "cross-kind: (list 1 2 3) and [1 2 3] are = and share hashValue" {
 ```
 
 **Boundary tests at structural cliff edges.** The trie grows /
-promotes at specific counts; each must be tested for `count`, `nth`
-over all indices, `fromSlice` round-trip, `conj` progression, and
-list/vector cross-kind equality:
+promotes at specific counts; each is tested for `count`, `nth`,
+`fromSlice` round-trip, `conj` and `pop` progression (node for node
+against the shape `fromSlice` builds), and list/vector cross-kind
+equality:
 
 - 0 (empty)
 - 1 (one tail element, empty trie)
-- 31 (tail almost full)
-- 32 (tail exactly full, empty trie)
-- 33 (first trie promotion; trie has one leaf)
-- 1024 (trie depth 1 exactly full; shift = 5)
-- 1025 (trie depth 2 begins; shift grows to 10)
-- 32768 (trie depth 2 exactly full; shift = 10)
-- 32769 (trie depth 3 begins; shift grows to 15)
+- 31, 32 (tail almost full, exactly full; empty trie)
+- 33 (first trie promotion; trie has one leaf, shift 5)
+- 1056 (shift-5 trie full: 1024 in the trie + 32 in the tail)
+- 1057 (shift grows to 10)
+- 32800 (shift-10 trie full: 32768 + 32)
+- 32801 (shift grows to 15)
 
 **Property tests** (`test/prop/vector.zig`) over random sequences:
 
 - V1. `fromSlice` + `nth(i)` round-trip byte-exact over 200 random sizes.
 - V2. `conj` preserves the sequence: `fromSlice(&elems)` equals
   `elems.reduce(conj, empty)` by structure and hash.
-- V3. Cross-kind: random element sequences produce `=` and
-  `hashValue`-equal list and vector Values. 500+ iterations.
+- V3. Cross-kind: 2000 random element sequences produce `=` and
+  `hashValue`-equal list and vector Values.
 - V4. Equivalence laws on vectors: reflexive, symmetric, transitive
   `equal` over a pool of 32 random vectors.
-- V5. Bedrock `equal ⇒ hashValue equal` over 500 random vector pairs
+- V5. Bedrock `equal ⇒ hashValue equal` over 2000 random vector pairs
   built from identical sequences in different allocations.
 - V6. Cross-kind never-equal: a vector is never `=` to any
   non-sequential Value; hashes differ.
 - V7. Length discrimination: differing lengths break equality.
 - V8. Nested vectors recurse through dispatch (vector-of-vector).
-- V9. Mixed cross-kind nested: `[1 (2 3) 4]` vs `(1 [2 3] 4)` — should
-  NOT be equal because element 1 is a list in one and a vector in the
-  other (cross-kind at the element level).
+- V9. Cross-kind equality and hash at the boundary sizes above, up to
+  a three-level trie.
 
 ---
 
