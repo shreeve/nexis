@@ -2833,7 +2833,7 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     defer vm.allocator.free(path_z);
     const conn = vm.allocator.create(db_mod.Connection) catch return VmError.OutOfMemory;
     errdefer vm.allocator.destroy(conn);
-    conn.* = db_mod.open(vm.allocator, io, vm.ensureHeap(), vm.ensureInterner(), path_z.ptr, .{}) catch |err| return dbFailure(vm, err);
+    conn.* = db_mod.open(vm.allocator, vm.ensureHeap(), vm.ensureInterner(), path_z.ptr, .{}) catch |err| return dbFailure(vm, err);
     vm.db_close_callback = &dbCloseCallback;
     vm.db_connections.append(vm.allocator, @ptrCast(conn)) catch {
         db_mod.shutdown(conn);

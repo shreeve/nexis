@@ -19,7 +19,10 @@ lists what exists above them.
 ### 1. Scope
 
 **In:**
-- `Connection` — wrapper around `emdb.Env` with a stable
+- `StoreFile` — the one `emdb.Env` of a store file in the
+  process, shared by every connection and Nextomic store of the
+  file (§3.1).
+- `Connection` — a hold on a `StoreFile` with a stable
   `store_id: u128` and an `*Interner` pointer for codec
   integration.
 - `Connection.open(allocator, heap, interner, path, options)`,
@@ -80,12 +83,17 @@ reading it from the meta page on `Connection.open`. `Connection`
 exposes `storeId() u128` as a read-only accessor so downstream
 code doesn't hardwire the derivation.
 
-`open` takes a `std.Io` and resolves the path after emdb has
-opened (and so created) the file, so `x.edb`, `./x.edb` and its
-absolute spelling name one store. `store_id` is two xxHash3-64
-halves over the canonical path, the second salted with
-`"store-id"`. A platform that cannot resolve a canonical path keeps
-the path as given.
+`open` resolves the canonical path before emdb opens the file:
+the `realpath` of an existing file, and for a file not yet created
+the `realpath` of its directory joined with its name (a directory
+that does not resolve is `:db/open-failed`). emdb opens the file at
+that path, so `x.edb`, `./x.edb`, its absolute spelling and a
+symlink to it name one store and one lock file. `store_id` is two
+xxHash3-64 halves over the canonical path of the file's
+`StoreFile` (§3.1), the second salted with `"store-id"`, so every
+connection sharing the file shares its `store_id`; a hard link
+opened while the file is open takes the path the file was first
+opened by.
 
 **Parent directories.** emdb's `open()` requires the path's parent
 directory to exist. The language-surface `(db/open path)`
@@ -110,12 +118,11 @@ pub const Connection = struct {
     heap: *Heap,
     interner: *Interner,
 
-    // Owning (closed by Connection.close).
-    env: emdb.Env,
+    // Held from open() to close(); shared with every connection
+    // and Nextomic store of the file (§3.1).
+    file: *StoreFile,
     store_id_lo: u64,
     store_id_hi: u64,
-    // Canonicalized absolute path, owned. Freed in close().
-    path_owned: [:0]u8,
     // Named-tree handles resolved so far, keyed by owned copies
     // of the tree names. Freed in close().
     tree_ids: std.StringHashMapUnmanaged(emdb.TreeId),
@@ -146,7 +153,7 @@ Zig struct allocated on the caller's allocator. Multiple
 durable-refs may point to the same Connection; the Connection
 itself is not reference-counted.
 
-**Closing.** `close()` closes the env and leaves the struct in place
+**Closing.** `close()` releases the store file and leaves the struct in place
 with `open_flag` false, so a ref, transaction handle or connection
 Value that still names it reads the flag and reports the connection
 closed; a second `close()` does nothing. `close()` of a connection
@@ -162,6 +169,36 @@ returning the error, so the transaction is over either way.
 
 **Metadata attachability**: not applicable. Connections are not
 Values.
+
+#### 3.1 One environment per file
+
+emdb's writer lock is per file, per process, and waits for the
+holder. Two environments on one file in one process would each take
+it: the second writer would wait forever on the first, which the same
+thread holds, and an environment opened through another spelling of
+the path would take a lock file of its own and write beside the
+first. So a process opens each store file once. `StoreFile.acquire`
+keeps the open files in one process-wide list keyed by the file's
+`(st_dev, st_ino)`: a second `open` of the file, through any
+spelling, symlink or hard link, and Nextomic's `connect` of it
+(`docs/NEXTOMIC.md` §2), share the one `emdb.Env`, reference-counted;
+the last `close` (`StoreFile.release`) closes it. A copy of a store
+file is another file with an environment of its own.
+
+The environment has one write transaction. `beginWrite` while any
+holder of the file has it open is `error.WriterActive`
+(`:db/busy`), never a wait: a second `db/begin-write`, a
+`db/put-key!` inside a Nextomic transaction function, or a
+`transact!` inside `with-tx` on the same file (which Nextomic reports
+as `:nextomic/nested`). Read transactions run beside it.
+
+The first open of a file sets the environment's options (map size,
+allocator); later opens share it as it is. A file the process may
+read but not write opens read-only, and every write transaction on it
+is `error.TxnReadOnly` (`:db/read-only`). The runtime is
+single-threaded, so the list is a plain global; the environment lives
+on the allocator of the first open, which outlives every connection
+to the file.
 
 **File geometry is pinned.** `open` overrides the caller's
 `pageSize` with `db.page_size` (16 KiB) and `maxNamedTrees` with
@@ -245,9 +282,13 @@ pub const DbError = error{
 
 pub const Connection = struct { ... };
 
+pub const StoreFile = struct { env: emdb.Env, path: [:0]u8, ... };
+pub fn StoreFile.acquire(path: [*:0]const u8, options: emdb.EnvOptions) !*StoreFile;
+pub fn StoreFile.release(self: *StoreFile) void;
+pub fn StoreFile.beginWrite(self: *StoreFile, options: emdb.Env.WriteOptions) !*emdb.Txn;
+
 pub fn open(
     allocator: std.mem.Allocator,
-    io: std.Io,
     heap: *Heap,
     interner: *Interner,
     path: [*:0]const u8,
@@ -436,6 +477,8 @@ Pinned explicitly:
 | `putRef` / `getRef` / `delRef` on ref with `conn == null` | `error.ConnectionUnavailable` |
 | `putRef` / `getRef` / `delRef` on ref with `conn.storeId() != r.store_id` | `error.StoreMismatch` |
 | `beginWrite` / `beginRead` on a closed connection | `error.ConnectionUnavailable` |
+| `beginWrite` while any connection or Nextomic store of the file holds its write transaction | `error.WriterActive` (§3.1) |
+| `beginWrite` on a file opened read-only | `error.TxnReadOnly` |
 | `close` while a transaction is open | `error.TransactionsOpen` |
 | A second `close` | nothing |
 | Codec encode / decode error during put / get | propagated `CodecError` |
@@ -563,7 +606,9 @@ Built above these primitives (PLAN §21 Phase 4): `(with-tx ...)` /
 `(with-read-tx ...)`, `db/snapshot` / `db/release-snapshot!` /
 `with-snapshot`, `db/scan` / `db/reduce-tree`, `db/alter!`, and the
 per-connection `TreeId` cache. Datomic-style `as-of` db-values are
-Nextomic's (`docs/NEXTOMIC.md` §4). Absent:
+Nextomic's (`docs/NEXTOMIC.md` §4).
+
+Absent:
 
 - Cursors as raw Values — PLAN §15.8; `db/scan` and `db/reduce-tree`
   are the eager surface.

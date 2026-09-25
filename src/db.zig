@@ -7,7 +7,9 @@
 //! (identity-triple equality + hash).
 //!
 //! Responsibilities:
-//!   - `Connection` type wrapping `emdb.Env` with
+//!   - `StoreFile`: the one `emdb.Env` of a store file in this
+//!     process, shared by every connection and Nextomic store of it.
+//!   - `Connection` type over a `StoreFile` with
 //!     `store_id = xxHash3-128(realpath(file))`.
 //!   - `durable_ref` heap Value kind (VALUE.md §2.2 kind 26) with
 //!     self-contained identity triple (store_id, tree_name,
@@ -104,6 +106,132 @@ pub fn failureName(err: anyerror) []const u8 {
 }
 
 // =============================================================================
+// Store files (DB.md §3.1)
+// =============================================================================
+
+/// The one emdb environment of a store file in this process, shared by
+/// every `Connection` and Nextomic store of the file. emdb's writer
+/// lock is per file and waits for the holder, and it is per process:
+/// a second environment on a file this process writes would wait on
+/// itself forever, and an environment opened through another spelling
+/// of the path would take a lock file of its own and write beside the
+/// first. One environment per file makes a second writer
+/// `error.WriterActive` instead, whichever connection asks.
+///
+/// Files are told apart by `(st_dev, st_ino)`, so a symlink, a hard
+/// link or `./x` finds the file already open, and a copy is another
+/// file. The environment opens at the canonical path, so every
+/// process that names the file shares one lock file.
+///
+/// The runtime is single-threaded, so the list of open files is a
+/// plain global. The environment lives on the allocator of the first
+/// open, which must outlive every connection to the file.
+pub const StoreFile = struct {
+    env: emdb.Env,
+    /// Canonical absolute path the environment was opened at, owned.
+    path: [:0]u8,
+    dev: std.c.dev_t,
+    ino: std.c.ino_t,
+    /// Connections and stores holding the file; the last `release`
+    /// closes the environment.
+    refs: u32,
+    next: ?*StoreFile,
+
+    var open_files: ?*StoreFile = null;
+
+    /// The open file at `path`, or the file opened (or created) now
+    /// with `options`. A file this process may read but not write
+    /// opens read-only.
+    pub fn acquire(path: [*:0]const u8, options: emdb.EnvOptions) !*StoreFile {
+        const allocator = options.allocator;
+        const canonical = try canonicalPath(allocator, path);
+        errdefer allocator.free(canonical);
+        var st: std.c.Stat = undefined;
+        if (std.c.fstatat(std.c.AT.FDCWD, canonical.ptr, &st, 0) == 0) {
+            var it = open_files;
+            while (it) |f| : (it = f.next) {
+                if (f.dev == st.dev and f.ino == st.ino) {
+                    allocator.free(canonical);
+                    f.refs += 1;
+                    return f;
+                }
+            }
+        }
+        const self = try allocator.create(StoreFile);
+        errdefer allocator.destroy(self);
+        self.env = emdb.Env.open(canonical.ptr, options) catch |err| switch (err) {
+            error.OpenFailed => blk: {
+                if (!readOnlyFile(canonical.ptr)) return err;
+                var read_only = options;
+                read_only.readOnly = true;
+                break :blk emdb.Env.open(canonical.ptr, read_only) catch return err;
+            },
+            else => return err,
+        };
+        errdefer self.env.close();
+        if (std.c.fstat(self.env.inner.dataFile.fd, &st) != 0) return error.OpenFailed;
+        self.path = canonical;
+        self.dev = st.dev;
+        self.ino = st.ino;
+        self.refs = 1;
+        self.next = open_files;
+        open_files = self;
+        return self;
+    }
+
+    /// Drop one hold; the last closes the environment and frees the
+    /// file.
+    pub fn release(self: *StoreFile) void {
+        self.refs -= 1;
+        if (self.refs > 0) return;
+        var link = &open_files;
+        while (link.*) |f| : (link = &f.next) {
+            if (f == self) {
+                link.* = self.next;
+                break;
+            }
+        }
+        const allocator = self.env.options.allocator;
+        self.env.close();
+        allocator.free(self.path);
+        allocator.destroy(self);
+    }
+
+    /// The file's write transaction: `error.WriterActive` while any
+    /// holder of the file has it open, `error.TxnReadOnly` on a file
+    /// opened read-only.
+    pub fn beginWrite(self: *StoreFile, options: emdb.Env.WriteOptions) !*emdb.Txn {
+        if (self.env.options.readOnly) return error.TxnReadOnly;
+        return self.env.beginWriteWith(options);
+    }
+
+    /// A regular file this process may read but not write: the one
+    /// `OpenFailed` that opens again read-only.
+    fn readOnlyFile(path: [*:0]const u8) bool {
+        if (std.c.access(path, std.c.R_OK) != 0 or std.c.access(path, std.c.W_OK) == 0) return false;
+        // A directory reads too, and is never a store.
+        const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true });
+        if (fd >= 0) {
+            _ = std.c.close(fd);
+            return false;
+        }
+        return true;
+    }
+};
+
+/// The absolute path of `path` with every symlink resolved; for a file
+/// not yet created, its resolved directory joined with its name.
+fn canonicalPath(allocator: std.mem.Allocator, path: [*:0]const u8) ![:0]u8 {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (std.c.realpath(path, &buf)) |resolved| return allocator.dupeZ(u8, std.mem.sliceTo(resolved, 0));
+    const slice = std.mem.sliceTo(path, 0);
+    const dir_z = try allocator.dupeZ(u8, std.fs.path.dirname(slice) orelse ".");
+    defer allocator.free(dir_z);
+    const dir = std.c.realpath(dir_z.ptr, &buf) orelse return error.OpenFailed;
+    return std.fs.path.joinZ(allocator, &.{ std.mem.sliceTo(dir, 0), std.fs.path.basename(slice) });
+}
+
+// =============================================================================
 // Connection (DB.md §3)
 //
 // NOT a runtime Value kind. Plain Zig struct allocated on the
@@ -119,17 +247,14 @@ pub const Connection = struct {
     heap: *Heap,
     interner: *Interner,
 
-    /// Owning: opened in `open()`, closed in `close()`.
-    env: emdb.Env,
+    /// Held from `open()` to `close()`; shared with every other
+    /// connection and Nextomic store of the file.
+    file: *StoreFile,
 
     /// u128 store_id, split into two u64s for extern-struct-
     /// friendly storage. Derived per DB.md §2.
     store_id_lo: u64,
     store_id_hi: u64,
-
-    /// Canonicalized absolute path, owned (freed in close).
-    /// Stored for diagnostic / re-derivation purposes.
-    path_owned: [:0]u8,
 
     /// Is the env open? Set true by `open()`, false by
     /// `close()`. Used to defend against double-close + to signal
@@ -171,11 +296,10 @@ pub const max_named_trees: u32 = 128;
 /// `heap` / `interner` are non-owning references; caller
 /// guarantees their lifetimes. `options` is passed through to
 /// `emdb.Env.open` with `pageSize` and `maxNamedTrees` pinned to
-/// `page_size` / `max_named_trees`. `io` resolves the file's
-/// canonical path, which `store_id` is derived from (DB.md §2).
+/// `page_size` / `max_named_trees`; a file already open in this
+/// process is shared as it is (`StoreFile`).
 pub fn open(
     allocator: std.mem.Allocator,
-    io: std.Io,
     heap: *Heap,
     interner: *Interner,
     path: [*:0]const u8,
@@ -184,60 +308,46 @@ pub fn open(
     var env_options = options;
     env_options.pageSize = page_size;
     env_options.maxNamedTrees = max_named_trees;
-
-    var env = try emdb.Env.open(path, env_options);
-    errdefer env.close();
-
-    // The file exists once the env is open, so its canonical path
-    // resolves; a platform that cannot resolve one keeps the path
-    // as given.
-    const path_slice = std.mem.sliceTo(path, 0);
-    const path_owned = std.Io.Dir.cwd().realPathFileAlloc(io, path_slice, allocator) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => try allocator.dupeZ(u8, path_slice),
-    };
-    errdefer allocator.free(path_owned);
+    const file = try StoreFile.acquire(path, env_options);
 
     // store_id = two xxHash3-64 halves over the canonical path, the
     // second salted so the halves are independent.
-    const hash_lo = hash_mod.hashBytes(path_owned);
+    const hash_lo = hash_mod.hashBytes(file.path);
     var hasher = std.hash.XxHash3.init(hash_mod.seed);
     hasher.update("store-id");
-    hasher.update(path_owned);
+    hasher.update(file.path);
     const hash_hi = hasher.final();
 
     return Connection{
         .allocator = allocator,
         .heap = heap,
         .interner = interner,
-        .env = env,
+        .file = file,
         .store_id_lo = hash_lo,
         .store_id_hi = hash_hi,
-        .path_owned = path_owned,
         .open_flag = true,
         .tree_ids = .empty,
     };
 }
 
-/// Close the env. A closed connection stays a valid struct: refs and
-/// transaction handles that name it read `open_flag` and report it
-/// closed. A second close does nothing; a close while a transaction
-/// of the connection is open is refused, so no emdb transaction
-/// outlives its env.
+/// Close the connection. A closed connection stays a valid struct:
+/// refs and transaction handles that name it read `open_flag` and
+/// report it closed. A second close does nothing; a close while a
+/// transaction of the connection is open is refused, so no emdb
+/// transaction outlives its env.
 pub fn close(self: *Connection) DbError!void {
     if (self.open_txns != 0) return DbError.TransactionsOpen;
     shutdown(self);
 }
 
-/// Close the env whatever is still open: teardown of the whole VM,
-/// when nothing can use the connection again.
+/// Close the connection whatever is still open: teardown of the whole
+/// VM, when nothing can use the connection again.
 pub fn shutdown(self: *Connection) void {
     if (!self.open_flag) return;
-    self.env.close();
+    self.file.release();
     var names = self.tree_ids.keyIterator();
     while (names.next()) |name| self.allocator.free(name.*);
     self.tree_ids.deinit(self.allocator);
-    self.allocator.free(self.path_owned);
     self.open_flag = false;
 }
 
@@ -265,14 +375,14 @@ pub const ReadTxn = struct {
 
 pub fn beginWrite(conn: *Connection) !WriteTxn {
     if (!conn.open_flag) return DbError.ConnectionUnavailable;
-    const txn = try conn.env.beginWrite();
+    const txn = try conn.file.beginWrite(.{});
     conn.open_txns += 1;
     return .{ .conn = conn, .inner = txn };
 }
 
 pub fn beginRead(conn: *Connection) !ReadTxn {
     if (!conn.open_flag) return DbError.ConnectionUnavailable;
-    const txn = try conn.env.beginRead();
+    const txn = try conn.file.env.beginRead();
     conn.open_txns += 1;
     return .{ .conn = conn, .inner = txn };
 }
@@ -668,7 +778,7 @@ test "open / close: round-trip with a tiny file" {
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
 
     try testing.expect(conn.open_flag);
@@ -685,15 +795,126 @@ test "open: store_id comes from the canonical path, however the path is spelled"
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var a = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     const sid = a.storeId();
-    try testing.expect(std.fs.path.isAbsolute(a.path_owned));
+    try testing.expect(std.fs.path.isAbsolute(a.file.path));
     try close(&a);
     const dotted = try std.fmt.allocPrintSentinel(testing.allocator, "./{s}", .{path}, 0);
     defer testing.allocator.free(dotted);
-    var b = try open(testing.allocator, testing.io, &heap, &interner, dotted.ptr, .{ .allocator = testing.allocator });
+    var b = try open(testing.allocator, &heap, &interner, dotted.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&b);
     try testing.expectEqual(sid, b.storeId());
+}
+
+test "open: every spelling of one file shares its environment; a second writer is refused, never waited on" {
+    const path = try tmpDbPath(testing.allocator, "shared");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&a);
+    const dotted = try std.fmt.allocPrintSentinel(testing.allocator, "./{s}", .{path}, 0);
+    defer testing.allocator.free(dotted);
+    const link = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/link.emdb", .{std.fs.path.dirname(path).?}, 0);
+    defer testing.allocator.free(link);
+    try std.Io.Dir.cwd().symLink(testing.io, std.fs.path.basename(path), link, .{});
+
+    var same = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&same);
+    var b = try open(testing.allocator, &heap, &interner, dotted.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&b);
+    var c = try open(testing.allocator, &heap, &interner, link.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&c);
+    // Checked before any second write begins: on separate environments
+    // it would wait on this thread's own lock.
+    try testing.expect(same.file == a.file and b.file == a.file and c.file == a.file);
+    try testing.expectEqual(@as(u32, 4), a.file.refs);
+    try testing.expectEqual(a.storeId(), c.storeId());
+    // One lock file, beside the file the link names.
+    const link_lock = try std.fmt.allocPrintSentinel(testing.allocator, "{s}-lock", .{link}, 0);
+    defer testing.allocator.free(link_lock);
+    try testing.expect(std.c.access(link_lock.ptr, std.c.F_OK) != 0);
+
+    var w = try beginWrite(&a);
+    try testing.expectError(error.WriterActive, beginWrite(&same));
+    try testing.expectError(error.WriterActive, beginWrite(&c));
+    try put(&w, "t", "k", value.fromFixnum(1).?);
+    try commit(&w);
+
+    // The file stays open while any connection holds it.
+    try close(&a);
+    try close(&same);
+    var r = try beginRead(&c);
+    const got = try get(&r, "t", "k", synthHash, synthEq);
+    abortRead(&r);
+    try testing.expectEqual(@as(i64, 1), got.?.asFixnum());
+    var w2 = try beginWrite(&b);
+    try commit(&w2);
+}
+
+test "open: a copy of a store is another file, written beside the original" {
+    const path = try tmpDbPath(testing.allocator, "original");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&a);
+    var w = try beginWrite(&a);
+    try put(&w, "t", "k", value.fromFixnum(1).?);
+    try commit(&w);
+    const copy = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/copy.emdb", .{std.fs.path.dirname(path).?}, 0);
+    defer testing.allocator.free(copy);
+    try std.Io.Dir.cwd().copyFile(path, std.Io.Dir.cwd(), copy, testing.io, .{});
+
+    var b = try open(testing.allocator, &heap, &interner, copy.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&b);
+    try testing.expect(a.file != b.file);
+    try testing.expect(a.storeId() != b.storeId());
+    var wa = try beginWrite(&a);
+    var wb = try beginWrite(&b);
+    try put(&wa, "t", "k", value.fromFixnum(2).?);
+    try put(&wb, "t", "k", value.fromFixnum(3).?);
+    try commit(&wa);
+    try commit(&wb);
+    var ra = try beginRead(&a);
+    defer abortRead(&ra);
+    var rb = try beginRead(&b);
+    defer abortRead(&rb);
+    try testing.expectEqual(@as(i64, 2), (try get(&ra, "t", "k", synthHash, synthEq)).?.asFixnum());
+    try testing.expectEqual(@as(i64, 3), (try get(&rb, "t", "k", synthHash, synthEq)).?.asFixnum());
+}
+
+test "open: a file this process may only read opens read-only; a write is TxnReadOnly" {
+    const path = try tmpDbPath(testing.allocator, "readonly");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    {
+        var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+        defer shutdown(&a);
+        var w = try beginWrite(&a);
+        try put(&w, "t", "k", value.fromFixnum(7).?);
+        try commit(&w);
+    }
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(path.ptr, 0o444));
+    defer _ = std.c.chmod(path.ptr, 0o644);
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+    var r = try beginRead(&conn);
+    defer abortRead(&r);
+    try testing.expectEqual(@as(i64, 7), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
+    try testing.expectError(error.TxnReadOnly, beginWrite(&conn));
 }
 
 test "close: refused while a transaction is open; the connection stays a closed struct" {
@@ -705,7 +926,7 @@ test "close: refused while a transaction is open; the connection stays a closed 
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
     var rtxn = try beginRead(&conn);
     try testing.expectError(DbError.TransactionsOpen, close(&conn));
@@ -727,17 +948,17 @@ test "open: a new store has 16 KiB pages and the pinned tree capacity" {
     defer interner.deinit();
 
     // Caller-supplied geometry does not leak through.
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{
         .allocator = testing.allocator,
         .pageSize = 4096,
         .maxNamedTrees = 8,
     });
     defer shutdown(&conn);
 
-    try testing.expectEqual(page_size, conn.env.info().pageSize);
-    try testing.expectEqual(page_size, conn.env.options.pageSize);
-    try testing.expectEqual(max_named_trees, conn.env.options.maxNamedTrees);
-    try testing.expectEqual(emdb.btree.maxKeySize(page_size), conn.env.maxKeySize());
+    try testing.expectEqual(page_size, conn.file.env.info().pageSize);
+    try testing.expectEqual(page_size, conn.file.env.options.pageSize);
+    try testing.expectEqual(max_named_trees, conn.file.env.options.maxNamedTrees);
+    try testing.expectEqual(emdb.btree.maxKeySize(page_size), conn.file.env.maxKeySize());
 }
 
 test "open: failure in a missing directory releases everything it took" {
@@ -746,13 +967,13 @@ test "open: failure in a missing directory releases everything it took" {
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    // `std.testing.allocator` reports the leak if `path_owned`
+    // `std.testing.allocator` reports the leak if the canonical path
     // survives the failed open, and the double free if it is
     // released twice.
     const path: [:0]const u8 = "test_nexis_db_no_such_dir/missing/store.emdb";
     try testing.expectError(
         error.OpenFailed,
-        open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }),
+        open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }),
     );
 }
 
@@ -775,7 +996,7 @@ test "open: a file that is not an emdb store is refused without leaking" {
         try file.writeStreamingAll(io, &junk);
     }
 
-    if (open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator })) |conn| {
+    if (open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator })) |conn| {
         var opened = conn;
         shutdown(&opened);
         return error.TestUnexpectedResult;
@@ -792,7 +1013,7 @@ test "put / get / del: single-tree round-trip of a scalar" {
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
 
     var wtxn = try beginWrite(&conn);
@@ -821,7 +1042,7 @@ test "put / get: multiple named trees are independent" {
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
 
     var wtxn = try beginWrite(&conn);
@@ -847,7 +1068,7 @@ test "del: removes the key, subsequent get returns null" {
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
 
     var wtxn = try beginWrite(&conn);
@@ -874,7 +1095,7 @@ test "treeId: one handle per name, remembered across transactions, loaded once p
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
 
     // Unknown tree, no create: nothing resolved, nothing cached.
@@ -920,7 +1141,7 @@ test "treeId: a tree created by an aborted transaction reads as empty afterwards
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
 
     {
@@ -953,7 +1174,7 @@ test "put / get: container values (list, map, set) codec round-trip" {
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
 
     // List
@@ -1006,7 +1227,7 @@ test "reopen-connection readback: values survive conn close/reopen" {
 
     // Session 1: write.
     {
-        var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+        var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
         defer shutdown(&conn);
 
         var wtxn = try beginWrite(&conn);
@@ -1017,7 +1238,7 @@ test "reopen-connection readback: values survive conn close/reopen" {
 
     // Session 2: reopen + read.
     {
-        var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+        var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
         defer shutdown(&conn);
 
         var rtxn = try beginRead(&conn);
@@ -1044,7 +1265,7 @@ test "ref: identity triple populated; conn pointer attached" {
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
 
     const r = try ref(&heap, &conn, "users", "alice");
@@ -1105,7 +1326,7 @@ test "putRef / getRef / delRef: round-trip via ref" {
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
 
     const r = try ref(&heap, &conn, "users", "alice");
@@ -1139,7 +1360,7 @@ test "getRef: nullconn ref → ConnectionUnavailable" {
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
 
     // Ref constructed from bytes (no conn).
@@ -1161,7 +1382,7 @@ test "getRef: cross-store ref → StoreMismatch" {
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
 
     // Ref tagged with a DIFFERENT store_id than conn's, and a
@@ -1188,7 +1409,7 @@ test "invalid tree name / key: surfaces InvalidTreeName / InvalidKey" {
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
 
-    var conn = try open(testing.allocator, testing.io, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
 
     var wtxn = try beginWrite(&conn);

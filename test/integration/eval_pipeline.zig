@@ -2304,6 +2304,62 @@ test "db/close: a stale ref never reaches a store opened after the close" {
     try expectOutputProgram(src, "[:db-closed :from-b]");
 }
 
+/// The store file behind a `db/open` or `d/connect` connection Value.
+fn storeFileOf(v: value_mod.Value) !*nx.db.StoreFile {
+    return switch (v.kind()) {
+        .db_connection => @as(*nx.db.Connection, @ptrFromInt(v.payload)).file,
+        .nextomic_conn => @as(*nx.nextomic.Conn, @ptrCast(@alignCast(nx.nextomic_handle.connPtr(v)))).store.file,
+        else => error.TestUnexpectedResult,
+    };
+}
+
+/// Run `setup`, which defines `a` and `b` as two connections to the
+/// store `@STORE@`; check that both hold one store file; only then run
+/// `body`, whose second writer would wait forever on a second
+/// environment of the file.
+fn expectSharedWriter(name: []const u8, setup: []const u8, body: []const u8, expected: []const u8) !void {
+    var store = try SeamStore.init(name);
+    defer store.deinit();
+    const src = try store.source(setup);
+    defer testing.allocator.free(src);
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run(src);
+    try testing.expect(try storeFileOf(try program.run("a")) == try storeFileOf(try program.run("b")));
+    try harness.expectResult(&program, body, try program.run(body), expected);
+}
+
+test "db/open: two connections to one file share its writer; a second write is :db/busy" {
+    try expectSharedWriter("shared-writer",
+        \\(def a (db/open "@STORE@"))
+        \\(def b (db/open "./@STORE@"))
+    ,
+        \\(def t1 (db/begin-write a))
+        \\[(try (db/begin-write b) (catch any e e))
+        \\ (try (db/put-key! (db/ref b :t :x) 1) (catch any e e))
+        \\ (do (db/abort-write! t1) (db/put-key! (db/ref b :t :x) 2) (db/get-key (db/ref a :t :x)))
+        \\ (do (db/close a) (db/get-key (db/ref b :t :x)))]
+    , "[:db/busy :db/busy 2 2]");
+}
+
+test "db/* and Nextomic on one file: a write inside the other's transaction is refused, not waited on" {
+    try expectSharedWriter("shared-nextomic",
+        \\(def a (nextomic/connect "@STORE@"))
+        \\(nextomic/transact! a [{:db/ident :n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
+        \\(def b (db/open "@STORE@"))
+        \\(def r (db/ref b :t :k))
+    ,
+        \\[(try (nextomic/transact! a [[:db.fn/call (fn [db] (db/put-key! r 1) [])]]) (catch any e e))
+        \\ (try (with-tx [tx b] (db/put! tx r 2) (nextomic/transact! a [{:n 1}])) (catch any e e))
+        \\ (try (with-tx [tx b] (nextomic/with a [{:n 5}] (fn [db report] :x))) (catch any e e))
+        \\ (db/get-key r)
+        \\ (count (:tx-data (nextomic/transact! a [[:db.fn/call (fn [db] (when (db/get-key r) [{:n 9}]))]])))
+        \\ (do (nextomic/transact! a [{:n 3}]) (db/put-key! r 4) (db/get-key r))
+        \\ (nextomic/q '[:find ?v :where [_ :n ?v]] (nextomic/db a))]
+    , "[:db/busy :nextomic/nested :nextomic/nested nil 1 4 #{[3]}]");
+}
+
 test "db: Nextomic's nx/ trees are not reachable through db/*" {
     try expectOutputProgramWithStore("nx-trees",
         \\(do
