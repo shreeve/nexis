@@ -20,10 +20,14 @@
 const std = @import("std");
 const parser = @import("parser.zig");
 const reader = @import("reader.zig");
+const stack = @import("stack.zig");
 
 const Mode = enum { verify, update };
 
 pub fn main(init: std.process.Init) !u8 {
+    // The reader recurses on nesting; the guard turns input nested
+    // past the main thread's stack into :nesting-too-deep.
+    stack.arm(stack.main_thread_budget);
     const gpa = init.gpa;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
