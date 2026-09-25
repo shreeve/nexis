@@ -37,6 +37,11 @@ Cy
 ([ANN] [BOB] [CY] [DI] [EDWARD] [FLO])
 ([Ann 30] [Bob 26] [Cy 41] [Di 30] [Edward 55] [Flo 33])
 ([Ann :person/height 1.7] [Bob :person/height 1.8] [Cy :person/height 1.65] [Di :person/age 30] [Edward :person/age 55] [Flo :person/age 33])
+{:error :nextomic/query-syntax, :message get-else takes a cardinality-one attribute}
+{:error :nextomic/query-syntax, :message get-else takes a default that is not nil, :clause 1}
+{:error :nextomic/query-syntax, :message get-else takes a default that is not nil}
+{:error :nextomic/unknown-attribute, :attr :person/nope}
+{:error :nextomic/unknown-attribute, :attr :person/nope}
 ([Bob Bob B 3] [Cy Cy C 2] [Di Di D 2] [Edward Edward E 6] [Flo Flo F 3])
 ([Cy :green] [Cy :red] [Edward :green])
 ([[Ann 30]] [[Bob 26]] [[Cy 41]] [[Di 30]] [[Edward 55]] [[Flo 33]])
@@ -46,6 +51,7 @@ ok a nil function result drops the row
 [26 55 215 35.833333333333336 5 6]
 185
 215
+ok a sum past the fixnum range is a bignum, as + gives
 ([Ann 2] [Cy 1])
 [31.5 94.47222222222223 9.719682207882222 [55 41] [26 30]]
 30

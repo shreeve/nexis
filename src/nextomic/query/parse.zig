@@ -604,6 +604,7 @@ const Parser = struct {
             .get_else => {
                 if (predicate) return self.fail("get-else needs a binding form");
                 if (args.len != 4 or args[0] != .src) return self.fail("get-else is (get-else $ ?e :attr default)");
+                if (args[3] == .constant and args[3].constant == .nil) return self.fail("get-else takes a default that is not nil");
             },
             .get_some => {
                 if (predicate) return self.fail("get-some needs a binding form");

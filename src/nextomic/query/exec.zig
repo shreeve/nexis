@@ -39,8 +39,10 @@ const list_mod = @import("../../coll/list.zig");
 const vector_mod = @import("../../coll/vector.zig");
 const champ = @import("../../coll/champ.zig");
 const dispatch = @import("../../dispatch.zig");
+const bignum = @import("../../bignum.zig");
 const key = @import("../key.zig");
 const datom_mod = @import("../datom.zig");
+const schema_mod = @import("../schema.zig");
 const db_mod = @import("../db.zig");
 const relation = @import("../relation.zig");
 const ir = @import("ir.zig");
@@ -137,7 +139,7 @@ pub const Exec = struct {
     pub fn cellValue(self: *Exec, c: Cell) !Value {
         return switch (c) {
             .nil => value.nilValue(),
-            .int => |n| value.fromFixnum(n) orelse error.ValueType,
+            .int => |n| value.fromFixnum(n) orelse try bignum.fromI64(self.heap, n),
             .double => |d| value.fromFloat(d),
             .boolean => |b| value.fromBool(b),
             .keyword => |k| value.fromKeywordId(k),
@@ -373,9 +375,9 @@ pub const Exec = struct {
     /// must carry `:db/fulltext` at the view's basis.
     fn fulltextHits(self: *Exec, src: ?ir.Src, attr: Cell, needle: Cell) anyerror![]const []const Cell {
         const read = self.readOf(src);
-        if (attr != .keyword or needle != .str) return error.ValueType;
-        const a = (try read.db.conn.idents.idOf(read.txn, attr.keyword)) orelse return self.unknownAttribute(attr.keyword);
-        const at = (try read.attr(a)) orelse return self.unknownAttribute(attr.keyword);
+        if (needle != .str) return error.ValueType;
+        const at = try self.attrNamed(read, attr);
+        const a = at.id;
         if (!at.fulltext) {
             if (self.diag) |d| d.* = .{ .message = "attribute is not :db/fulltext", .attr = value.fromKeywordId(attr.keyword) };
             return error.TxData;
@@ -419,16 +421,37 @@ pub const Exec = struct {
         return error.UnknownAttribute;
     }
 
+    /// The attribute a keyword cell names in `read`: `UnknownAttribute`
+    /// when there is none, `ValueType` for any other cell.
+    fn attrNamed(self: *Exec, read: *Read, attr: Cell) anyerror!schema_mod.Attr {
+        if (attr != .keyword) return error.ValueType;
+        const a = (try read.db.conn.idents.idOf(read.txn, attr.keyword)) orelse return self.unknownAttribute(attr.keyword);
+        return (try read.attr(a)) orelse self.unknownAttribute(attr.keyword);
+    }
+
     /// The first value of attribute `attr` (a keyword cell) on entity
     /// `e` in source `src`, or null.
     fn firstValue(self: *Exec, src: ?ir.Src, e: Cell, attr: Cell) anyerror!?Cell {
         const read = self.readOf(src);
+        const at = try self.attrNamed(read, attr);
         const eid = e.asEid() orelse return null;
-        if (attr != .keyword) return error.ValueType;
-        const a = (try read.db.conn.idents.idOf(read.txn, attr.keyword)) orelse return null;
-        var it = try read.scan(self.arena, .eavt, .{ .e = eid, .a = a });
+        var it = try read.scan(self.arena, .eavt, .{ .e = eid, .a = at.id });
         const d = (try it.next()) orelse return null;
         return try self.valCell(read, d.v);
+    }
+
+    /// `get-else`: the attribute's value on the entity, else the
+    /// default. A card-many attribute has no one value and a nil
+    /// default binds nothing, so both are refused.
+    fn getElse(self: *Exec, src: ?ir.Src, e: Cell, attr: Cell, default: Cell) anyerror!Cell {
+        if (default == .nil) return self.syntax("get-else takes a default that is not nil");
+        if ((try self.attrNamed(self.readOf(src), attr)).many()) return self.syntax("get-else takes a cardinality-one attribute");
+        return (try self.firstValue(src, e, attr)) orelse default;
+    }
+
+    fn syntax(self: *Exec, message: []const u8) error{QuerySyntax} {
+        if (self.diag) |d| d.* = .{ .message = message };
+        return error.QuerySyntax;
     }
 
     /// What a function clause returns: a user function's value, or a
@@ -459,7 +482,7 @@ pub const Exec = struct {
             const result: Result = switch (b.call.f) {
                 .builtin => |bi| switch (bi) {
                     .ground, .untuple => .{ .cell = cells[0] },
-                    .get_else => .{ .cell = (try self.firstValue(b.call.args[0].src, cells[1], cells[2])) orelse cells[3] },
+                    .get_else => .{ .cell = try self.getElse(b.call.args[0].src, cells[1], cells[2], cells[3]) },
                     // `[attr value]` for the first attribute the entity has, else nil.
                     .get_some => blk: {
                         for (cells[2..]) |attr| {
@@ -906,11 +929,11 @@ pub const Exec = struct {
                 return Cell.fromValue(result);
             },
             .sum, .avg => {
-                var isum: i64 = 0;
+                var isum: i128 = 0;
                 var fsum: f64 = 0;
                 var is_float = false;
                 for (members) |m| switch (basis.cell(m, col)) {
-                    .int => |n| isum = std.math.add(i64, isum, n) catch return error.ValueType,
+                    .int => |n| isum += n,
                     .double => |d| {
                         is_float = true;
                         fsum += d;
@@ -919,7 +942,8 @@ pub const Exec = struct {
                 };
                 if (op == .sum) {
                     if (is_float) return .{ .double = fsum + @as(f64, @floatFromInt(isum)) };
-                    return .{ .int = isum };
+                    if (std.math.cast(i64, isum)) |n| return .{ .int = n };
+                    return .{ .vm = try self.kept(try bignum.fromI128(self.heap, isum)) };
                 }
                 const total = fsum + @as(f64, @floatFromInt(isum));
                 return .{ .double = total / @as(f64, @floatFromInt(members.len)) };
