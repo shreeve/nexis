@@ -905,10 +905,10 @@ test "hygiene: a local or Var named after a core function cannot capture host-ma
     try expectOutput("(let [count (fn [& _] 99)] ((fn ([x] :one) ([x y] :two)) 1))", ":one");
     try expectOutputProgram("(defn nth [& _] :user-nth) (let [[a b] [1 2]] [a b])", "[1 2]");
     try expectOutput("(let [= (fn [& _] false)] (case 1 1 :one :none))", ":one");
-    try expectOutput("(let [seq (fn [& _] nil)] (for [x [1 2]] x))", "[1 2]");
+    try expectOutput("(let [seq (fn [& _] nil)] (for [x [1 2]] x))", "(1 2)");
     try expectOutput("(let [get (fn [& _] :g)] (let [{a :a} {:a 1}] a))", "1");
     try expectOutput("(let [< (fn [& _] false) not (fn [& _] false)] ((fn ([x] :one) ([x & r] :var)) 1 2))", ":var");
-    try expectOutput("(let [first (fn [& _] :f) next (fn [& _] nil) conj (fn [& _] :c)] (for [x [1 2]] x))", "[1 2]");
+    try expectOutput("(let [first (fn [& _] :f) next (fn [& _] nil) conj (fn [& _] :c)] (for [x [1 2]] x))", "(1 2)");
     try expectOutput("(let [rest (fn [& _] :r)] (let [[a & r] [1 2 3]] r))", "(2 3)");
 }
 
@@ -2318,52 +2318,54 @@ test "condp: pred + expr each evaluated EXACTLY ONCE" {
 // ---- for -----------------------------------------------------
 
 test "for: single binding maps over the source" {
-    try expectOutput("(for [x [1 2 3]] (* x x))", "[1 4 9]");
-    try expectOutput("(for [x []] (* x x))", "[]");
-    try expectOutput("(for [x [42]] x)", "[42]");
+    try expectOutput("(for [x [1 2 3]] (* x x))", "(1 4 9)");
+    try expectOutput("(for [x []] (* x x))", "()");
+    try expectOutput("(for [x [42]] x)", "(42)");
+    // A seq, as in Clojure: conj prepends.
+    try expectOutput("(let [xs (for [x [1 2]] x)] [(seq? xs) (vector? xs) (conj xs 0)])", "[true false (0 1 2)]");
 }
 
 test "for: multi-binding cartesian product" {
     // Cartesian order: outermost iterates first, innermost
     // varies fastest.
-    try expectOutput("(for [x [1 2] y [10 20]] (+ x y))", "[11 21 12 22]");
+    try expectOutput("(for [x [1 2] y [10 20]] (+ x y))", "(11 21 12 22)");
     try expectOutput(
         \\(for [x [:a :b] y [1 2 3]] [x y])
-    , "[[:a 1] [:a 2] [:a 3] [:b 1] [:b 2] [:b 3]]");
+    , "([:a 1] [:a 2] [:a 3] [:b 1] [:b 2] [:b 3])");
 }
 
 test "for: :when filter" {
     // `<` is in core (not `>`); use `<` consistently in tests.
-    try expectOutput("(for [x [1 2 3 4 5] :when (< 0 x)] x)", "[1 2 3 4 5]");
-    try expectOutput("(for [x [1 2 3 4 5] :when (< 2 x)] x)", "[3 4 5]");
-    try expectOutput("(for [x [1 2 3] :when (< 99 x)] x)", "[]");
+    try expectOutput("(for [x [1 2 3 4 5] :when (< 0 x)] x)", "(1 2 3 4 5)");
+    try expectOutput("(for [x [1 2 3 4 5] :when (< 2 x)] x)", "(3 4 5)");
+    try expectOutput("(for [x [1 2 3] :when (< 99 x)] x)", "()");
 }
 
 test "for: :let modifier with destructuring-capable bindings" {
     // `:let` uses `let` (NOT `let*`) so destructuring works.
-    try expectOutput("(for [x [1 2 3] :let [y (* x 10)]] y)", "[10 20 30]");
+    try expectOutput("(for [x [1 2 3] :let [y (* x 10)]] y)", "(10 20 30)");
     // Compose :let + :when (order matters; let-bound name
     // visible to the when's predicate).
     try expectOutput(
         \\(for [x [1 2 3 4] :let [y (* x 10)] :when (< 15 y)] y)
-    , "[20 30 40]");
+    , "(20 30 40)");
     // Destructuring: bind a vector to [a b].
     try expectOutput(
         \\(for [pair [[1 :a] [2 :b]] :let [[n k] pair]] [k n])
-    , "[[:a 1] [:b 2]]");
+    , "([:a 1] [:b 2])");
 }
 
 test "for: :while ends its loop, patterns destructure, modifiers compose" {
-    try expectOutput("(for [x [1 2 3] :while (< x 3)] x)", "[1 2]");
-    try expectOutput("(for [x [1 2] y [3 4] :while (< y 4)] [x y])", "[[1 3] [2 3]]");
-    try expectOutput("(for [x [1 2] :while (< x 2) y [1 2]] [x y])", "[[1 1] [1 2]]");
-    try expectOutput("(for [x [1 2 3] :let [y (* x 10)] :when (< 10 y)] y)", "[20 30]");
-    try expectOutput("(for [x (range 5) :while (< x 3) :when (odd? x)] x)", "[1]");
-    try expectOutput("(for [x (range 10) :when (odd? x) :while (< x 6) :let [y (* x x)]] y)", "[1 9 25]");
-    try expectOutput("(for [[a b] [[1 2] [3 4]]] (+ a b))", "[3 7]");
-    try expectOutput("(for [[k v] {:a 1}] [v k])", "[[1 :a]]");
-    try expectOutput("(for [{:keys [n]} [{:n 1} {:n 2}]] n)", "[1 2]");
-    try expectOutput("(for [x nil] x)", "[]");
+    try expectOutput("(for [x [1 2 3] :while (< x 3)] x)", "(1 2)");
+    try expectOutput("(for [x [1 2] y [3 4] :while (< y 4)] [x y])", "([1 3] [2 3])");
+    try expectOutput("(for [x [1 2] :while (< x 2) y [1 2]] [x y])", "([1 1] [1 2])");
+    try expectOutput("(for [x [1 2 3] :let [y (* x 10)] :when (< 10 y)] y)", "(20 30)");
+    try expectOutput("(for [x (range 5) :while (< x 3) :when (odd? x)] x)", "(1)");
+    try expectOutput("(for [x (range 10) :when (odd? x) :while (< x 6) :let [y (* x x)]] y)", "(1 9 25)");
+    try expectOutput("(for [[a b] [[1 2] [3 4]]] (+ a b))", "(3 7)");
+    try expectOutput("(for [[k v] {:a 1}] [v k])", "([1 :a])");
+    try expectOutput("(for [{:keys [n]} [{:n 1} {:n 2}]] n)", "(1 2)");
+    try expectOutput("(for [x nil] x)", "()");
     try expectProgramError("(for [:when true x [1]] x)", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(for [x [1] :reduce +] x)", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(for [x] x)", compile.CompileError.MacroExpansionFailure);
@@ -3692,7 +3694,7 @@ test "unresolved symbols: forward references across a file keep working" {
     try expectCheckedOutput("(let [{k :k} {:k 5} [p q] [1 2]] (+ k p q))", "8");
     try expectCheckedOutput("(letfn [(ev? [n] (if (zero? n) true (od? (dec n)))) (od? [n] (if (zero? n) false (ev? (dec n))))] (ev? 4))", "true");
     try expectCheckedOutput("(try (throw :x) (catch any e (str e)))", ":x");
-    try expectCheckedOutput("(for [x [1 2] y [10 20]] (+ x y))", "[11 21 12 22]");
+    try expectCheckedOutput("(for [x [1 2] y [10 20]] (+ x y))", "(11 21 12 22)");
     try expectCheckedOutput("(def acc (atom [])) (doseq [x [1 2]] (swap! acc conj x)) @acc", "[1 2]");
     try expectCheckedOutput("(ns other) (defn f [] (g)) (defn g [] :other) (f)", ":other");
 }

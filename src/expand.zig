@@ -2013,8 +2013,9 @@ fn noMatchThrow(b: Builder, g: *Form) ExpandError!*Form {
 
 // ---- for ----------------------------------------------------
 //
-// Eager `for`: `(for [pattern src modifiers... ...] body)` builds a
-// vector. Each binding pair may be followed by `:let [bindings]`,
+// Eager `for`: `(for [pattern src modifiers... ...] body)` fills a
+// vector and returns it as a seq (a list; `()` when empty), as
+// Clojure's lazy `for` prints. Each binding pair may be followed by `:let [bindings]`,
 // `:when test` and `:while test`, in any number and order; a
 // pattern destructures through `let`. One loop per binding pair,
 // nested, carrying the vector as its accumulator:
@@ -2040,7 +2041,9 @@ fn expandFor(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) E
     if (bindings.len == 0 or bindings.len % 2 != 0) return ctx.fail(args[0].origin, "for: the binding vector needs pairs", .{});
     if (bindings[0].datum == .keyword) return ctx.fail(bindings[0].origin, "for: a modifier needs a binding before it", .{});
     const b = Builder{ .ctx = ctx, .origin = call_form.origin };
-    return forLevel(b, bindings, try b.vec(.{}), args[1]);
+    // The vector the loops fill, as a seq; `()` when empty.
+    const s = try b.gensym("nx");
+    return b.list(.{ "let*", try b.vec(.{ s, try b.list(.{ "nexis.core/seq", try forLevel(b, bindings, try b.vec(.{}), args[1]) }) }), try b.list(.{ "if", s, s, try b.list(.{}) }) });
 }
 
 /// The loop for the binding pair at the head of `bindings` (with
