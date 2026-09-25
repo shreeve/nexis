@@ -3899,6 +3899,9 @@ test "core: sequence functions" {
         .{ .src = "(iterate inc 0 5)", .expected = "(0 1 2 3 4)" },
         .{ .src = "(iterate (fn [x] (* 2 x)) 1 4)", .expected = "(1 2 4 8)" },
         .{ .src = "(iterate inc 0 0)", .expected = "()" },
+        // The count is not reserved up front: a callback that throws
+        // ends a huge count at once.
+        .{ .src = "[(try (repeatedly 9999999999999 #(throw :stop)) (catch :stop e e)) (try (iterate (fn [x] (throw :stop)) 0 9999999999999) (catch :stop e e))]", .expected = "[:stop :stop]" },
         .{ .src = "(empty? [])", .expected = "true" },
         .{ .src = "(empty? \"\")", .expected = "true" },
         .{ .src = "(not-empty [1])", .expected = "[1]" },

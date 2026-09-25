@@ -2176,17 +2176,19 @@ fn fnIterate(vm: *VM, args: []const Value) VmError!Value {
     return repeatInto(vm, try requireCount(args[2]), &producer);
 }
 
-/// The list of `n` successive `producer.next(vm)` results.
+/// The list of `n` successive `producer.next(vm)` results. The list
+/// grows as they come rather than reserving `n` slots, so a huge count
+/// fails only when memory does, and a producer that throws first
+/// throws.
 fn repeatInto(vm: *VM, n: usize, producer: anytype) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
-    results.ensureTotalCapacity(vm.allocator, n) catch return VmError.OutOfMemory;
     const scope = vm.rootScope();
     defer scope.release();
     for (0..n) |_| {
         const r = try producer.next(vm);
         try scope.push(r);
-        results.appendAssumeCapacity(r);
+        results.append(vm.allocator, r) catch return VmError.OutOfMemory;
     }
     return try buildListFromSlice(vm, results.items);
 }
