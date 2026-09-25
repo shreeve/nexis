@@ -1388,26 +1388,8 @@ fn lowerList(
     // (calls of computed values) fall through to ordinary call.
     if (items[0].datum == .symbol and items[0].datum.symbol.ns == null) {
         const name = items[0].datum.symbol.name;
-        // -- Special forms (NOT shadowable) --
-        if (std.mem.eql(u8, name, "do")) return try lowerDo(allocator, items[1..], ctx);
-        if (std.mem.eql(u8, name, "if")) return try lowerIf(allocator, items[1..], ctx);
-        if (std.mem.eql(u8, name, "quote")) return try lowerQuote(allocator, items[1..], ctx);
-        // The collection constructors syntax-quote emits: special
-        // forms, never shadowed (MACROEXPAND.md §5).
-        inline for (.{ "#%list", "#%concat", "#%vector", "#%map", "#%set" }, .{ .list, .concat, .vector, .map, .set }) |form, op| {
-            if (std.mem.eql(u8, name, form)) return try lowerColl(allocator, op, items[1..], ctx, false);
-        }
-        // Binding forms.
-        if (std.mem.eql(u8, name, "let*")) return try allocTiny(allocator, .{ .let_star = try lowerScope(allocator, items[1..], ctx) });
-        if (std.mem.eql(u8, name, "loop*")) return try allocTiny(allocator, .{ .loop_star = try lowerScope(allocator, items[1..], ctx) });
-        if (std.mem.eql(u8, name, "recur")) return try lowerRecur(allocator, items[1..], ctx);
-        if (std.mem.eql(u8, name, "fn*")) return try lowerFnStar(allocator, items[1..], ctx);
-        if (std.mem.eql(u8, name, "letfn*")) return try lowerLetFnStar(allocator, items[1..], ctx);
-        // Var forms.
-        if (std.mem.eql(u8, name, "def")) return try lowerDef(allocator, items[1..], ctx);
-        if (std.mem.eql(u8, name, "var")) return try lowerVarRef(allocator, items[1..]);
-        if (std.mem.eql(u8, name, "try")) return try lowerTry(allocator, items[1..], ctx);
-        if (std.mem.eql(u8, name, "throw")) return try lowerThrow(allocator, items[1..], ctx);
+        // Special forms are reserved: no binding shadows them.
+        if (lowerings.get(name)) |lower| return lower(allocator, items[1..], ctx);
         // -- Inlineable core fns (shadowable) --
         if (inlinedOp(name, items.len - 1)) |in| {
             if (namesCore(ctx, name)) return try lowerPrim(allocator, in, items[1..], ctx);
@@ -1420,6 +1402,49 @@ fn lowerList(
     }
     // Ordinary call: lower head as callee, rest as args.
     return try lowerCall(allocator, items, ctx);
+}
+
+/// How each special form lowers: the expander's `special_forms`
+/// (MACROEXPAND.md §5), less the four it rewrites away (`ns`,
+/// `require`, `defmacro`, `set!`), and the `#%` collection
+/// constructors syntax-quote emits.
+const lowerings = std.StaticStringMap(*const fn (std.mem.Allocator, []const *reader_mod.Form, LowerCtx) CompileError!*Tiny).initComptime(.{
+    .{ "do", &lowerDo },
+    .{ "if", &lowerIf },
+    .{ "quote", &lowerQuote },
+    .{ "let*", &lowerLetStar },
+    .{ "loop*", &lowerLoopStar },
+    .{ "recur", &lowerRecur },
+    .{ "fn*", &lowerFnStar },
+    .{ "letfn*", &lowerLetFnStar },
+    .{ "def", &lowerDef },
+    .{ "var", &lowerVarRef },
+    .{ "try", &lowerTry },
+    .{ "throw", &lowerThrow },
+    .{ "#%list", &lowerCollForm(.list) },
+    .{ "#%concat", &lowerCollForm(.concat) },
+    .{ "#%vector", &lowerCollForm(.vector) },
+    .{ "#%map", &lowerCollForm(.map) },
+    .{ "#%set", &lowerCollForm(.set) },
+});
+
+/// The special forms the expander rewrites before lowering.
+const expanded_away = [_][]const u8{ "ns", "require", "defmacro", "set!" };
+
+fn lowerLetStar(allocator: std.mem.Allocator, args: []const *reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
+    return allocTiny(allocator, .{ .let_star = try lowerScope(allocator, args, ctx) });
+}
+
+fn lowerLoopStar(allocator: std.mem.Allocator, args: []const *reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
+    return allocTiny(allocator, .{ .loop_star = try lowerScope(allocator, args, ctx) });
+}
+
+fn lowerCollForm(comptime op: vm.CollOp) fn (std.mem.Allocator, []const *reader_mod.Form, LowerCtx) CompileError!*Tiny {
+    return struct {
+        fn lower(allocator: std.mem.Allocator, args: []const *reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
+            return lowerColl(allocator, op, args, ctx, false);
+        }
+    }.lower;
 }
 
 /// `(do exprs...)`. Empty `(do)` lowers to `Tiny.do_` with an
@@ -1918,6 +1943,7 @@ fn lowerDef(
 fn lowerVarRef(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
+    _: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len != 1) return CompileError.MalformedForm;
     if (args[0].datum != .symbol) return CompileError.ExpectedSymbol;
@@ -2105,6 +2131,7 @@ pub const RuntimeHooks = struct {
             .registry = self.registry,
             .load_callback = self.load_callback,
             .value_heap = v.ensureHeap(),
+            .io = v.io,
         };
     }
 
@@ -2241,10 +2268,13 @@ pub const RuntimeHooks = struct {
         var ctx = self.context(scratch.allocator(), v);
         const origin = reader_mod.SrcSpan{ .pos = 0, .len = 0 };
         const form = expand_mod.valueToForm(&ctx, form_value, origin) catch |err|
-            return compileFailure(v, err, "UnsupportedForm", form_value);
+            return compileFailure(v, err, "UnsupportedForm", form_value, null);
         var declared = DeclaredNames.init(v.allocator);
         defer declared.deinit();
+        var detail: ?[]const u8 = null;
         const compiled = compileFormWith(scratch.allocator(), form, .{
+            .out_detail = &detail,
+            .io = v.io,
             .namespace = self.registry.current,
             .interner = self.interner,
             .host_macros = self.host_macros,
@@ -2261,7 +2291,7 @@ pub const RuntimeHooks = struct {
             // its frames are still in place above this call, so the
             // error leaves through the run loop with the full chain.
             error.RequiredFileFailed => return v.traced_error orelse vm.VmError.UncaughtThrow,
-            else => return compileFailure(v, err, @errorName(err), form_value),
+            else => return compileFailure(v, err, @errorName(err), form_value, detail),
         };
         const routine = persistent.create(vm.Routine) catch return vm.VmError.OutOfMemory;
         routine.* = compiled.toRoutine("<eval>");
@@ -2277,26 +2307,28 @@ pub const RuntimeHooks = struct {
 
     /// Out of memory stays an error; anything else `eval` could not
     /// compile throws `{:error :compile-error :message name :form
-    /// form}`, where `name` is the `CompileError` variant.
-    fn compileFailure(v: *vm.VM, err: anyerror, name: []const u8, form: value_mod.Value) vm.VmError {
+    /// form}`, where `name` is the `CompileError` variant, with
+    /// `:detail` the expander's reason when it gave one.
+    fn compileFailure(v: *vm.VM, err: anyerror, name: []const u8, form: value_mod.Value, detail: ?[]const u8) vm.VmError {
         if (err == error.OutOfMemory) return vm.VmError.OutOfMemory;
-        const champ = @import("coll/champ.zig");
-        const dispatch = @import("dispatch.zig");
+        return v.throwValue(failureMap(v, name, form, detail) catch return vm.VmError.OutOfMemory);
+    }
+
+    fn failureMap(v: *vm.VM, name: []const u8, form: value_mod.Value, detail: ?[]const u8) !value_mod.Value {
         const heap = v.ensureHeap();
         const interner = v.ensureInterner();
-        const message = string_mod.fromBytes(heap, name) catch return vm.VmError.OutOfMemory;
-        const tag = interner.internKeywordValue("compile-error") catch return vm.VmError.OutOfMemory;
-        var m = champ.mapEmpty(heap) catch return vm.VmError.OutOfMemory;
-        const entries = [_]struct { key: []const u8, value: value_mod.Value }{
-            .{ .key = "error", .value = tag },
-            .{ .key = "message", .value = message },
+        var m = try champ_mod.mapEmpty(heap);
+        const entries = [_]struct { key: []const u8, value: ?value_mod.Value }{
+            .{ .key = "error", .value = try interner.internKeywordValue("compile-error") },
+            .{ .key = "message", .value = try string_mod.fromBytes(heap, name) },
             .{ .key = "form", .value = form },
+            .{ .key = "detail", .value = if (detail) |d| try string_mod.fromBytes(heap, d) else null },
         };
         for (entries) |e| {
-            const key = interner.internKeywordValue(e.key) catch return vm.VmError.OutOfMemory;
-            m = champ.mapAssoc(heap, m, key, e.value, &dispatch.hashValue, &dispatch.equal) catch return vm.VmError.OutOfMemory;
+            const value = e.value orelse continue;
+            m = try champ_mod.mapAssoc(heap, m, try interner.internKeywordValue(e.key), value, &dispatch_mod.hashValue, &dispatch_mod.equal);
         }
-        return v.throwValue(m);
+        return m;
     }
 };
 
@@ -2314,10 +2346,14 @@ pub const CompileOptions = struct {
     /// table still expands user `defmacro`s when an interner is
     /// present.
     host_macros: ?*const expand_mod.HostMacroTable = null,
-    /// Receives the source span of an error: the symbol's own
-    /// span when lowering can locate it, otherwise the
-    /// macroexpanded form's.
+    /// Receives the source span of an error: the innermost form it
+    /// was raised at, or the symbol's own span.
     out_span: ?*?reader_mod.SrcSpan = null,
+    /// Receives why macro expansion failed, when the expander said
+    /// (`ExpandContext.failure`); the text lives on `allocator`.
+    out_detail: ?*?[]const u8 = null,
+    /// The `std.Io` a user macro's sub-VM prints through.
+    io: ?std.Io = null,
     /// Where `defmacro` closures are stored, so they outlive a
     /// per-form compile arena. The REPL and file runner pass
     /// `vm.runtime_arena.allocator()`; null uses `allocator`.
@@ -2384,26 +2420,20 @@ pub fn compileFormWith(
             .registry = opts.registry,
             .load_callback = opts.load_callback,
             .value_heap = registry_heap,
+            .io = opts.io,
         };
-        working_form = expand_mod.expandForm(&mctx, null, form) catch |err| switch (err) {
-            error.ExpansionDepthExceeded => {
-                if (out_span) |s| s.* = form.origin;
-                return CompileError.MacroDepthExceeded;
-            },
-            error.MalformedMacroCall => {
-                if (out_span) |s| s.* = form.origin;
-                return CompileError.MacroExpansionFailure;
-            },
-            error.MacroReturnedNull => {
-                if (out_span) |s| s.* = form.origin;
-                return CompileError.MacroExpansionFailure;
-            },
-            error.RequiredFileFailed => {
-                if (out_span) |s| s.* = form.origin;
-                return CompileError.RequiredFileFailed;
-            },
-            error.ControlTransferred => return CompileError.ControlTransferred,
-            error.OutOfMemory => return CompileError.OutOfMemory,
+        working_form = expand_mod.expandForm(&mctx, null, form) catch |err| {
+            // The expander records the innermost form it failed at
+            // and why (MACROEXPAND.md §6).
+            if (out_span) |s| s.* = if (mctx.failure) |f| f.span else form.origin;
+            if (opts.out_detail) |d| d.* = if (mctx.failure) |f| f.message else null;
+            return switch (err) {
+                error.ExpansionDepthExceeded => CompileError.MacroDepthExceeded,
+                error.RequiredFileFailed => CompileError.RequiredFileFailed,
+                error.ControlTransferred => CompileError.ControlTransferred,
+                error.OutOfMemory => CompileError.OutOfMemory,
+                else => CompileError.MacroExpansionFailure,
+            };
         };
     }
     // `.string` Form datums lower to `Tiny.literal` on the
@@ -3352,6 +3382,21 @@ fn runBare(arena: std.mem.Allocator, v: *vm.VM, src: []const u8) !Value {
     return v.run();
 }
 
+test "special forms: the compiler lowers every one the expander passes on" {
+    for (expand_mod.special_forms.keys()) |name| {
+        const rewritten = for (expanded_away) |away| {
+            if (std.mem.eql(u8, name, away)) break true;
+        } else false;
+        testing.expect(rewritten != lowerings.has(name)) catch |err| {
+            std.debug.print("\n  special form {s}\n", .{name});
+            return err;
+        };
+    }
+    for (lowerings.keys()) |name| {
+        try testing.expect(expand_mod.special_forms.has(name) or std.mem.startsWith(u8, name, "#%"));
+    }
+}
+
 test "compile errors: each malformed program fails with its variant" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -3415,6 +3460,26 @@ test "compile errors: each malformed program fails with its variant" {
     // Only a hand-built tree can carry an integer past the fixnum
     // range: lowering makes a wider literal a bignum.
     try testing.expectError(CompileError.IntegerOutOfFixnumRange, compileTiny(a, &.{ .int = value_mod.fixnum_max + 1 }));
+}
+
+test "compile errors: a macro failure is reported at the innermost form, with the expander's message" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var v = try vm.VM.init(testing.allocator, &stub_routine);
+    defer v.deinit();
+    var host_macros = try expand_mod.defaultMacros(testing.allocator);
+    defer host_macros.deinit(testing.allocator);
+    const src = "(do 1 (let [x] x))";
+    var span: ?reader_mod.SrcSpan = null;
+    var detail: ?[]const u8 = null;
+    try testing.expectError(CompileError.MacroExpansionFailure, compileSourceWith(arena.allocator(), src, .{
+        .interner = v.ensureInterner(),
+        .host_macros = &host_macros,
+        .out_span = &span,
+        .out_detail = &detail,
+    }));
+    try testing.expect(span.?.pos > 0);
+    try testing.expect(detail.?.len > 0);
 }
 
 test "compile errors: a macro that never stops expanding is MacroDepthExceeded" {

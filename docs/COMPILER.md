@@ -182,7 +182,10 @@ compiler relies on:
      `loop*`, `def`, `var`, `try`, `throw`, and the
      `#%` constructors) AND in operator position. Special forms
      are reserved: they are recognized regardless of lexical
-     bindings.
+     bindings. The names are the expander's `special_forms`
+     (MACROEXPAND.md §5) less the four it rewrites before
+     lowering (`ns`, `require`, `defmacro`, `set!`); a test holds
+     the two tables to that.
   2. **Inlined core fn** — a call of `+`, `-`, `*`, `/`,
      `quot`, `mod`, `<`, `<=`, `>`, `>=` or `==` with two
      operands, of `-` or `abs` with one, or of `inc` / `dec`
@@ -826,7 +829,9 @@ the binding's code is emitted rules this out.
   of the innermost form being lowered or emitted when the error
   was raised, or the symbol's own span for `UnresolvedSymbol`
   (the `LowerDiag` out-parameter); a macroexpansion error carries
-  the top-level form's. Forms a macro produced carry the macro
+  the span of the innermost form the expander failed at
+  (`ExpandContext.failure`), and its reason goes to
+  `CompileOptions.out_detail`. Forms a macro produced carry the macro
   call's span (MACROEXPAND.md §4b), so an error inside an
   expansion is reported at the call.
 
@@ -853,7 +858,8 @@ There is no secondary span, no expansion-provenance chain and
 no structured error value for compile errors the CLI reports. A
 compile error inside `eval` is not reported by the CLI: the hook
 throws the map `{:error :compile-error :message "<variant name>"
-:form <the form>}` on the calling VM, a catchable value like any
+:form <the form>}`, with `:detail` the expander's reason for a
+macro failure, on the calling VM, a catchable value like any
 other throw (MACROEXPAND.md §1.2 item 9); uncaught, it reaches
 the CLI as `UncaughtThrow` with the map as its value. The CLI
 prints
