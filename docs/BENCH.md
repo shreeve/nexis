@@ -1,301 +1,199 @@
-## BENCH.md — Benchmarking Methodology & Reporting Discipline
+## BENCH.md — Benchmark method, reporting rules and the harness
 
-This document pre-commits to the shape of every performance claim nexis
-will make about itself, especially in comparison to Clojure. The
-methodology precedes the numbers by design: the
-commitments here are strongest when they cannot be post-rationalized
-against favorable measurements.
+How nexis measures itself and what a published performance claim must
+satisfy. §1–§8 and §11 are the frozen contract for any comparison,
+especially with Clojure; §10 describes the harness, `zig build bench`.
+The numbers of record live in `docs/PERF.md` §3, once each, with their
+provenance in its §11.
 
-Derivative from `PLAN.md` §19.6 / §19.7 / §19.8 (performance Tier 1/2
-targets and perf-gate text). PLAN.md wins on conflict. §1–§9 and §11
-are the contract for a published comparison; §10 is the harness that
-produces nexis's own numbers (`zig build bench`).
-
----
-
-### 1. Three claims, four standards
-
-Every performance claim published by nexis must satisfy four
-independent standards, not three:
-
-1. **Numerical** — measured, not asserted. Wall-clock time (or
-   allocated bytes, or RSS, or whatever) from a real run, with units.
-2. **Accurate** — multiple runs with statistical reporting (§3),
-   controlled hardware (§4), documented methodology, reproducibility
-   instructions that let a third party rerun and match within noise.
-3. **Fair** — idiomatic code on every side, standard tooling, stock
-   configuration, no cherry-picking either direction. Would a
-   competent practitioner of the other language read the source and
-   say "yes, that's a reasonable way to write this"?
-4. **Relevant** — the benchmark measures something that corresponds
-   to a real user workload or a specific architectural claim nexis is
-   making. A microbenchmark that doesn't ladder up to a user-facing
-   scenario is noise.
-
-A benchmark that fails any one of these is withdrawn, not re-framed.
+Two rules come first. A performance claim rests only on measured
+numbers taken under this document, from ReleaseFast builds; a Debug
+build is never a measurement. No comparative benchmark is published
+before real same-machine numbers exist on both sides, and when one is,
+the cases where Clojure wins are published with it (§8).
 
 ---
 
-### 2. Category taxonomy — every claim pinned to a regime
+### 1. Four standards
 
-Performance does not have one number. Clojure has three legitimate
-performance regimes (cold JVM start, warmed but short-lived,
-fully-hot JIT'd steady state), and mixing them is the fastest way to
-produce a dishonest chart. nexis has its own regimes (cold-start
-VM, warm VM loop; there are no specialized ops).
+Every published claim is:
 
-Every published measurement must be tagged with exactly one category:
+1. **Numerical**: measured, with units, not asserted.
+2. **Accurate**: repeated runs with the statistics of §3, the host of
+   §4, and instructions that let a third party rerun it within noise.
+3. **Fair**: idiomatic code on each side, stock tooling and
+   configuration (§5, §6); a competent practitioner of the other
+   language would call the source a reasonable way to write it.
+4. **Relevant**: it measures a user workload or a specific
+   architectural claim.
 
-| Category | Measures | Typical tool |
+A benchmark that fails one standard is withdrawn, not reframed.
+
+---
+
+### 2. Categories
+
+Every measurement carries exactly one category, and a claim names its
+category, regime (cold, warm, steady state), input size and idiom
+tier.
+
+| Category | Measures | Tool |
 |---|---|---|
-| **Startup** | Time-to-first-expression or CLI-to-result on a fresh process | `hyperfine` |
-| **Short-lived script** | Total wall time for a small program that runs once and exits | `hyperfine` |
-| **Warm microbenchmark** | Per-operation cost after warm-up, on hot code | `criterium` (Clojure) / custom harness (nexis) |
-| **Steady-state throughput** | Operations per second on a long-running warmed workload | `criterium` (Clojure) / custom harness (nexis) |
-| **Collection construction** | Build-an-N-element collection (persistent vs transient paths reported separately) | Custom harness |
-| **Collection lookup/update** | get/assoc/conj/dissoc over various sizes | Custom harness |
-| **Memory footprint** | Peak RSS and/or allocated-bytes under a reproducible workload | OS-level (GNU `time -v` / macOS `/usr/bin/time -l`) |
-| **Database-integrated** | End-to-end workloads touching emdb / durable refs | Custom harness + hyperfine |
-| **Macrobenchmark** | Realistic user program end-to-end | `hyperfine` + shell harness |
-
-Published claims like "2–4× faster on arithmetic-heavy code" must
-specify: which category, which regime, which input size, which
-idiom tier. Headline PLAN.md numbers (§19.6) are restated with
-category labels at publication.
+| Startup | process start to first result | `hyperfine` |
+| Short-lived script | wall time of a small program run once | `hyperfine` |
+| Warm microbenchmark | per-operation cost on warmed code | the harness (§10); `criterium` for Clojure |
+| Steady-state throughput | operations per second on a long warmed workload | the harness; `criterium` |
+| Collection construction | building an N-element collection; persistent and transient paths separately | the harness |
+| Collection lookup/update | `get`, `assoc`, `conj`, `nth` across sizes | the harness |
+| Memory footprint | peak RSS or allocated bytes for a fixed workload | `/usr/bin/time -l` (macOS), GNU `time -v` |
+| Database-integrated | workloads through emdb, durable refs or Nextomic | the harness, `hyperfine` |
+| Macrobenchmark | a realistic program end to end | `hyperfine` |
 
 ---
 
-### 3. Statistics — what we report, what we don't
+### 3. Statistics
 
-- **Median**, not mean. Arithmetic mean in the presence of GC pauses
-  (Clojure) or page-fault outliers (either side) produces misleading
-  summaries.
-- **p5 / p95 / p99** alongside median. Lets readers see tail
-  behavior; lets us detect when GC pauses dominate.
-- **Minimum run count**: 30 for warm microbenchmarks, 10 for
-  startup / macro workloads (which are slower to run). For
-  `criterium`-backed Clojure microbenchmarks, use its default
-  estimation + sampling strategy.
-- **Report distribution visually** when publishing a full report —
-  box plots or violin plots, never a bar chart of a single
-  number with no error bar.
-- **Never report speedup multiples without absolute numbers.**
-  "2.3×" is unpublishable without the underlying ms or ns/op. The
-  multiplier can mask cases where both implementations are already
-  fast enough that the ratio doesn't matter.
-- **Never report means across heterogeneous workloads.** A
-  "geomean across benchmarks" table is noise without per-benchmark
-  context and hides cherry-picking.
+- The **median** is the headline, never the mean: collector pauses and
+  page faults skew means.
+- **p5, p95 and p99** accompany it, so tails show.
+- **At least 30 samples** for warm microbenchmarks; at least 10 for
+  startup and macro workloads. Clojure microbenchmarks use
+  `criterium`'s own sampling.
+- **A ratio never appears without the absolute numbers** beneath it.
+- **No means across heterogeneous benchmarks** (no geomean tables).
+- A full report shows distributions (box or violin plots), not bars
+  without error.
+- A result whose run-to-run variance exceeds 20 % is investigated and
+  rerun, or withdrawn.
 
 ---
 
-### 4. Hardware & environment
+### 4. Host
 
-Every published result documents:
-
-- CPU model (exact, e.g., "Apple M4 Pro, 12-core, 2025").
-- RAM amount and type.
-- OS + kernel version.
-- Whether the machine was idle (no other meaningful work).
-- CPU-frequency scaling setting (`performance` governor on Linux;
-  noted-and-disclaimed on macOS where user control is limited).
-- Thermal state if relevant (long-running benchmarks may throttle).
-
-Cross-machine results are not comparable. A published benchmark
-suite runs on one canonical machine; the exact machine is
-documented. Re-running on other hardware is encouraged and
-published separately with full disclosure.
+Every result records the exact CPU, RAM, OS and version, Zig version,
+optimize mode, whether the machine was idle, and the frequency-scaling
+setting where the OS exposes it. Results from different machines are
+not comparable: a report runs on one machine, and a rerun elsewhere is
+published separately with its own host. `docs/PERF.md` §11 records the
+host of every number of record.
 
 ---
 
-### 5. Clojure-side fairness — conventions we adopt
+### 5. Clojure-side fairness
 
-These are community-standard and omitting them is a credibility
-mistake:
-
-- **`criterium`** for every microbenchmark. `(require '[criterium.core :refer [quick-bench bench]])`. Non-criterium timing of Clojure microbenchmarks is rejected by default.
-- **`*warn-on-reflection*` is enabled** for every benchmark file and
-  every warning is resolved before measurement. Reflection is a
-  canonical anti-idiom; presence in a benchmark file is treated as
-  evidence of incompetence by the Clojure community regardless of
-  whether it affects the specific hot path.
-- **Primitive arithmetic explicitly tiered.** When benchmarking
-  arithmetic, publish three variants:
-  1. Idiomatic generic Clojure (boxed).
-  2. `^long` / `^double` hinted primitive Clojure.
-  3. `unchecked-*` primitive Clojure with `*unchecked-math* true`.
-  Each row in the results table names the tier. Comparing nexis's
-  tagged-fixnum path against generic boxed Clojure and implying
-  "nexis is faster than Clojure arithmetic" is explicitly forbidden.
-- **Transients are used where the community would.** Building a
-  collection via `(into [] ...)` (which uses transients internally),
-  `(persistent! (reduce conj! (transient coll) xs))`, or equivalent
-  for the fast path. Pure-persistent `conj` loops are benchmarked
-  separately and labeled as the persistent-only tier.
-- **Versions pinned.** Clojure 1.12.x on the current JDK LTS release,
-  stock server flags, no `-XX:+UseZGC` / `-XX:+UseEpsilonGC` /
-  `-Xshare:off` tweaks in the baseline. A "tuned JVM" appendix
-  with explicitly disclosed flags is optional; never the headline.
-- **Graal native-image is not used** in baseline comparisons. It's a
-  separate deployment story; if measured, it's its own row in the
-  table labeled accordingly.
+- `criterium` for every microbenchmark; `*warn-on-reflection*` on,
+  with every warning resolved.
+- Arithmetic in three tiers, each labelled: idiomatic boxed,
+  `^long`/`^double` hinted, and `unchecked-*` with
+  `*unchecked-math*`. nexis fixnums against boxed Clojure alone is not
+  a claim about Clojure arithmetic.
+- Transients where the community uses them (`into`, `persistent!`
+  over `conj!`); pure persistent loops as their own labelled tier.
+- A pinned Clojure 1.12.x on the current JDK LTS with stock flags;
+  tuned-JVM or Graal native-image runs are separate, labelled rows.
 
 ---
 
-### 6. nexis-side fairness — what we hold ourselves to
+### 6. nexis-side fairness
 
-The symmetric rules, enforced on our own side:
-
-- **Baseline benchmarks use the unspecialized VM**. Optimizations
-  (SIMD CHAMP, perfect-hash keywords, operand-specialized ops), if
-  any exist, are published as their own rows labeled as
-  optimization-tier measurements, not folded into the baseline.
-- **Idiomatic nexis code**, not hand-unrolled core-primitives
-  invocation, in any benchmark compared with another system. Stdlib
-  forms like `defn`, `->>`, `reduce` are used in benchmark code the
-  same way a nexis user would use them. The harness rows (§10) call
-  runtime primitives directly; they are nexis-only measurements of
-  those primitives and are never set against another system's
-  idiomatic code.
-- **No disabled safety paths for benchmark runs.** Everything runs
-  with the same runtime safety settings a user would run. If a
-  "release-unsafe" variant is published, it's its own row and
-  labeled.
-- **Bytecode vs JIT disclosure.** nexis has a bytecode VM with no
-  opcode specialization and no JIT (PLAN §19.6 Tier 2 names
-  specialization; Tier 3 names copy-and-patch; neither exists). Claims like "faster than Clojure's JIT steady-
-  state" are labeled explicitly — nexis's advantages come from
-  architecture (tagged values, CHAMP, xxHash3), not from execution
-  strategy. Readers shouldn't have to infer that.
+- The baseline is the VM as users run it: no disabled safety checks,
+  and any optimization-tier variant is its own labelled row.
+- Code compared with another system is idiomatic nexis (`defn`,
+  `reduce`, `->>`). The harness rows of §10 call runtime primitives
+  directly; they are nexis-only measurements and are never set against
+  another system's idiomatic code.
+- A report states that nexis runs a bytecode VM with no opcode
+  specialization and no JIT, so an advantage is read as architecture
+  (value layout, CHAMP, xxHash3, in-process storage), not execution
+  strategy.
 
 ---
 
-### 7. Reproducibility — the non-negotiable part
+### 7. Reproducibility
 
-Every published benchmark must ship with:
-
-1. **Source code checked into `test/bench/`** for both sides
-   (`bench/<name>.nx` and `bench/<name>.clj`), with a `README.md` in
-   the same directory pinning:
-   - exact command lines,
-   - input data generation (seeded),
-   - expected approximate output shape (so readers can sanity-check
-     a rerun against the published numbers).
-2. **Raw data** published alongside the report, not just summaries
-   (CSV or JSON per-run).
-3. **Exact versions**: nexis commit SHA, Clojure version, JDK build
-   number, OS version, hardware.
-4. **A "hermeticity" shell script** that runs the suite
-   end-to-end from a clean checkout; if it doesn't reproduce the
-   published numbers within p5/p95 noise on the documented hardware,
-   the report is wrong and must be corrected.
-
-Unreproducible benchmarks are withdrawn, not patched post-hoc.
+A published comparison ships the source of both sides with its exact
+command lines and seeded input generation, the raw per-run data (the
+harness's JSON, §10), the nexis commit, the Clojure and JDK versions
+and the host, and one script that reruns the suite from a clean
+checkout. A result that script does not reproduce within p5–p95 on
+the documented host is corrected or withdrawn.
 
 ---
 
-### 8. The honesty clause
+### 8. Honesty
 
-**Scenarios where Clojure wins are published, not omitted.** This is
-credibility engineering, not altruism. A report that claims universal
-victory is trusted by nobody who has shipped a language before. A
-report that says "nexis dominates cold start and script-style
-workloads; competitive-to-faster on collection work; Clojure's JIT
-wins on long-running hot numeric inner loops" is believable because it admits the
-obvious.
-
-Concretely:
-
-- At least one published benchmark per category where Clojure is
-  ahead (if any exist in that category). Manufactured symmetry is
-  worse than admitted losses; if there genuinely are no losses in a
-  category, state so explicitly rather than filler.
-- Mixed-result workloads (nexis ahead on some inputs, Clojure ahead
-  on others) get both lines plotted.
-- Worst-case numbers (p99) are shown alongside medians so readers see
-  tail behavior on both sides.
-- Any result where measurement variance is > 20% is either
-  investigated and republished or withdrawn. Don't publish noisy
-  numbers dressed up with decimals to look precise.
-
----
-
-### 9. Pre-publication review
-
-Before any comparative benchmark report is published:
-
-- **Internal review.** The report is posted as a draft in the repo
-  (PR or tagged branch) for at least 7 days with open comment
-  before release.
-- **External Clojure-community review.** At least one Clojure
-  practitioner outside the nexis team reviews the Clojure source
-  code of every benchmark and signs off that the implementation is
-  reasonable and idiomatic. A single such reviewer saying "this is
-  fair Clojure" buys far more credibility than any internal
-  discipline; omitting this step invites post-hoc dismissal.
-- **Issues raised during review are resolved before publication**,
-  not relegated to footnotes. If a reviewer objects to a specific
-  benchmark's framing and their objection is defensible, the
-  benchmark is rewritten or withdrawn.
+Where Clojure wins, the result is published. Each category of a report
+shows at least one case where Clojure leads if one exists, or says
+plainly that none was found. Mixed results show both sides, and p99
+appears beside the median for both. A report that claims to win
+everywhere is not published.
 
 ---
 
 ### 10. The harness: `zig build bench`
 
-The harness is `src/bench.zig` (Runner, Stats, table, JSON); the
-suite is `bench/main.zig` and `bench/nextomic.zig`. The numbers of
-record, each with its host, live in `docs/PERF.md` §3.
+`src/bench.zig` is the harness: `Runner` (the adaptive inner loop,
+warm-up and sampling), `Stats` (the order statistics), `writeTable`
+and `writeJson`. `bench/main.zig` is the suite and its driver;
+`bench/nextomic.zig` holds the Nextomic rows. The step builds
+`bin/nexis-bench` and runs it with the arguments after `--`. The
+runner and the runtime it drives are compiled ReleaseFast when
+`-Doptimize` is left at Debug; an explicit `-Doptimize=ReleaseSafe`,
+`ReleaseSmall` or `ReleaseFast` is used as given.
 
 ```bash
-zig build bench                                  # the whole suite, table to stdout
-zig build bench -- --filter vm,codec             # named categories only
-zig build bench -- --out run.json --note "idle"  # also the JSON, with a note
+zig build bench                                  # every category, table to stdout
+zig build bench -- --filter vm,codec             # named categories only, comma-separated
+zig build bench -- --out run.json --note "idle"  # also the JSON report, with a note
 ```
 
-The runner and the whole runtime it drives are compiled ReleaseFast
-(`-Doptimize=ReleaseSafe` or `ReleaseSmall` select those instead); a
-Debug build is never a measurement. An unknown flag or category is an
-error. JSON files are run artifacts and are not committed.
+An unknown flag or category prints the usage (or the list of
+categories) and exits 2. JSON is written only with `--out`; run files
+are artifacts and are not committed.
 
-| Harness category | §2 category | Measures |
+| Category | §2 category | Rows |
 |---|---|---|
-| `scalar` | Warm microbenchmark | fixnum and float arithmetic; hashing a fixnum, keyword, string and raw bytes |
-| `collection-construction` | Collection construction | list, vector, map and set built by N `conj`/`assoc` from empty (N = 16, 256, 4096) |
-| `transient-construction` | Collection construction | the same through transients and `persistent!` |
-| `collection-lookup-update` | Collection lookup/update | `nth`, `get` and `contains?` over prebuilt collections (N = 256, 4096) |
-| `compiler` | Warm microbenchmark | `compile_simple` reads, expands and compiles `(+ 1 2)`; the other rows run the whole pipeline per sample (VM construction, compile, run) for a one-form program |
-| `vm` | Warm microbenchmark | the dispatch loop alone: a routine compiled once, rerun on one VM |
-| `codec` | Warm microbenchmark | encode and decode of a fixnum and a 64-entry map |
-| `db-integrated` | Database-integrated | an emdb put-and-commit and a get, on a store under `$TMPDIR` |
-| `nextomic` | Database-integrated | `q` over a 200k-datom store and `pull` over 20k entities (PERF §3.7) |
+| `scalar` | Warm microbenchmark | `fixnum_add`, `float_add`, `hash_fixnum`, `hash_keyword`, `hash_string_43b`, `xxhash3_raw_172b` |
+| `collection-construction` | Collection construction | `list_cons_n`, `vector_conj_n`, `map_assoc_n`, `set_conj_n` at N = 16, 256, 4096, each invocation on a fresh heap |
+| `transient-construction` | Collection construction | `transient_vector_conjbang_n`, `transient_map_assocbang_n`, `transient_set_conjbang_n` at the same N |
+| `collection-lookup-update` | Collection lookup/update | `vector_nth_n_sequential`, `map_get_n_hit`, `set_contains_n_hit` at N = 256, 4096 |
+| `compiler` | Warm microbenchmark | `compile_simple` (read, expand, compile `(+ 1 2)`); `eval_simple_loop`, `closure_create`, `eval_arith` (VM construction, compile and run per sample) |
+| `vm` | Warm microbenchmark | `vm_loop_10k`, `vm_global_call_10k`, `vm_keyword_get_10k`: a routine compiled once, rerun on one VM |
+| `codec` | Warm microbenchmark | `codec_encode_fixnum`, `codec_decode_fixnum`, `codec_encode_map_n64`, `codec_decode_map_n64` |
+| `db-integrated` | Database-integrated | `db_put_commit_scalar`, `db_get_hit_scalar` on a fresh store under `$TMPDIR` |
+| `nextomic` | Database-integrated | six `q_*` rows over a 200k-datom store and three `pull_*` rows over 20k entities (`docs/PERF.md` §3.7) |
 
-Method (§3): a pilot doubles its repetitions until one timing spans a
-millisecond and picks `inner_reps` so a sample lasts at least 50 ms;
-10 warm-up samples are discarded and 30 kept. A sample is its elapsed
-`CLOCK_MONOTONIC` time over `inner_reps`, kept as a fraction of a
-nanosecond. The table and the JSON report min, p5, median, p95, p99,
-max (nearest rank, never interpolated), mean and stddev; ops/sec is
-derived from the median. Setup stays outside the timed body unless a
-row says it measures it (the `compiler` pipeline rows), and a body
-that allocates keeps its memory bounded (the decode rows drop their
-scratch heap every 16 MiB).
+**Method.** A pilot doubles its repetitions until one timing spans a
+millisecond, then sets `inner_reps` so one sample lasts at least 50 ms
+(one repetition when the body alone does). Ten warm-up samples are
+discarded and 30 kept. A sample is the elapsed `CLOCK_MONOTONIC` time
+over `inner_reps`, kept as a fraction of a nanosecond. Setup stays
+outside the timed body unless the row measures it (the `compiler`
+pipeline rows), and a body that allocates keeps memory bounded: the
+construction rows free their heap per invocation, the decode rows drop
+their scratch heap every 16 MiB. The heaps sit on the process
+allocator, as the runtime's do.
 
-This document does not cover benchmark-driven tuning (PLAN §19 names
-the Tier 1/2/3 wins; `docs/PERF.md` records what was measured) or
-marketing copy (PLAN §19.7 may be aspirational; a comparative report
-is where it meets measurement).
+**Output.** The table has one line per row: benchmark, category,
+parameter (N, or `-`), median, p5, p95 and ops/sec from the median.
+The JSON (`schema_version` 1) carries `generated_at_unix`, a `host`
+object (`cpu` from the build target, `os`, `ram` left empty,
+`zig_version`, `optimize_mode`, `note`) and one `results` entry per
+row with `name`, `category`, `param`, `samples`, `inner_reps`,
+`warmup_iters`, `min_ns`, `p5_ns`, `median_ns`, `p95_ns`, `p99_ns`,
+`max_ns`, `mean_ns`, `stddev_ns` and `ops_per_sec_median`. Percentiles
+are nearest-rank, never interpolated. `src/bench.zig`'s inline tests
+cover the statistics, a trivial run and JSON escaping.
 
 ---
 
-### 11. Summary sentence for any future report
+### 11. The test for a report
 
-Every comparative benchmark report nexis publishes must be
-introducable with, and survive the test of, the following sentence:
+Every comparative report must be introducible with, and survive, this
+sentence:
 
 > "We measured several clearly defined performance regimes, with
 > published source and methodology, and here is where nexis is
 > faster, where it is comparable, and where Clojure wins."
 
-If a reported result cannot be defended under that sentence, it
-does not ship. This doc exists so nothing needs to be post-
-rationalized.
+A result that cannot be defended under it does not ship.
