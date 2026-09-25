@@ -129,8 +129,9 @@ is an ordinary call. User macros shadow host macros.
    arena. Both the CLI file runner and the REPL pass one.
 6. **Form ↔ Value conversion**. Form → Value: nil, bool, int
    and bigint, real, char, string, symbol, keyword, list, vector,
-   map, set, `'x` as `(quote x)`, `@x` as `(deref x)` and `#()` as
-   the `fn*` form it stands for. A syntax-quote, unquote or
+   map, set, `'x` as `(quote x)`, `@x` as `(deref x)`, `#()` as
+   the `fn*` form it stands for and `^m x` as `x` (a symbol cannot
+   carry metadata, so a macro sees the form without it). A syntax-quote, unquote or
    unquote-splicing as a macro argument is `MalformedMacroCall`.
    Value → Form: nil, booleans, integers, reals, chars, strings,
    symbols, keywords, lists, vectors, maps and sets; a macro that
@@ -301,6 +302,7 @@ that should be expanded.
 | `ns` | `(ns NAME)` switches `ctx.registry.current` to the named namespace at expansion time, creating it (parent `nexis.core`) if unregistered; replaced by `nil`. |
 | `require` | `(require 'my.ns)` / `(require '[my.ns :as a])`, several specs per call: the file load, registry update and alias entry happen at expansion time through `ctx.load_callback`; replaced by `nil`. Only `:as` is accepted — `:refer` / `:rename` / `:exclude` are `MalformedMacroCall`. |
 | Non-symbol head | Treat as ordinary call: expand head + all args. |
+| `^meta` | On a vector, map or set literal: `(nexis.core/with-meta coll {meta})`, the map evaluated like any map literal except that a symbol under `:tag` is quoted, so `(meta ^:foo [1])` is `{:foo true}`. On anything else in expression position (a symbol, a call) it is a hint and is dropped. In every binding position (the names and patterns of `let`, `loop`, `let*`, `loop*`, `fn` and `fn*` parameters, a parameter vector itself as a return hint, `:keys` entries, `defrecord` fields, a `catch` binding) the metadata is dropped: `(defn f ^long [^String s] ...)` is `(defn f [s] ...)`. On the name of `def`, `defn` or `defmacro` it becomes the Var's metadata, `^String` as `{:tag String}` with the tag quoted. |
 
 Every sub-form is expanded exactly once, so a user macro runs once
 per call site and its side effects happen once.
@@ -409,7 +411,12 @@ sq(set #{...})       → (#%set sq(e1) ...)             ; same
 sq('x)               → (#%list 'quote sq(x))          ; `'a → (quote ns/a)
 sq(@x)               → (#%list 'nexis.core/deref sq(x))
 sq(#(...))           → sq of the fn* form it stands for
+sq(^m x)             → (#%list 'nexis.internal/#%meta sq(x) sq(m))
 ```
+
+The list a syntax-quoted `^m x` builds turns back into `^m x` when
+a macro's result becomes a form, so `` `(def ^:private ~name 1) ``
+defines a private Var although a symbol value carries no metadata.
 
 For `unquote-splicing` inside a collection: the element runs
 become `(#%concat (#%list e1 ...) X (#%list e2 ...) ...)` where
@@ -419,8 +426,7 @@ rebuilt from the resulting list with `nexis.core/vec`,
 `(nexis.core/apply nexis.core/hash-set ...)`. `coll:concat`
 accepts every seqable (nil, list, vector, map as `[k v]`
 entries, set), so `~@` splices whatever a seq function returns.
-A nested syntax-quote and `^meta` inside syntax-quote are
-`MacroExpansionFailure`.
+A nested syntax-quote is `MacroExpansionFailure`.
 
 **Qualification** (PLAN §23 #29, Clojure's rule): an unqualified
 symbol becomes `ns/name` where `ns` is the namespace whose own

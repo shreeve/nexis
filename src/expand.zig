@@ -381,10 +381,17 @@ fn expandFormDepth(
         // result is recursively re-expanded so macros nested
         // in the body still fire.
         .anon_fn => |items| try expandFormDepth(ctx, env, try anonFnForm(ctx, form, items), depth),
-        // with_meta is metadata attached to a target form; it
-        // passes through and the expander does not descend into
-        // the target.
-        .with_meta => mutCast(form),
+        // `^meta` on a collection literal attaches to the value, as
+        // `with-meta` does; on anything else (a symbol, a call) it
+        // is a hint and is dropped.
+        .with_meta => |wm| switch (wm.target.datum) {
+            .vector, .map, .set => try makeListInline(ctx, form.origin, &.{
+                try coreSym(ctx, "with-meta", form.origin),
+                try expandForm(ctx, env, wm.target),
+                try expandForm(ctx, env, try metaMapExpr(ctx, wm.meta.datum.map, wm.meta.origin)),
+            }),
+            else => try expandFormDepth(ctx, env, wm.target, depth),
+        },
         // deref `@x`: rewrite to QUALIFIED `(nexis.core/deref x)`.
         // The native `deref` is installed in `nexis.core` and
         // dispatches over `{durable_ref, var_, atom, …}` per
@@ -621,7 +628,7 @@ fn expandLetStar(
     const new_bindings = try ctx.allocator.alloc(*Form, bindings.len);
     var i: usize = 0;
     while (i < bindings.len) : (i += 2) {
-        const name_form = bindings[i];
+        const name_form = stripMeta(bindings[i]);
         if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) {
             return ctx.fail(name_form.origin, "{s}: cannot bind {s}", .{ head.datum.symbol.name, describeForm(name_form) });
         }
@@ -685,6 +692,31 @@ fn describeForm(form: *const Form) []const u8 {
     };
 }
 
+/// `form` without the `^meta` it carries: in a binding or parameter
+/// position a type hint or flag has no meaning in nexis and is
+/// dropped (PLAN §7.3).
+fn stripMeta(form: *const Form) *Form {
+    var f = form;
+    while (f.datum == .with_meta) f = f.datum.with_meta.target;
+    return mutCast(f);
+}
+
+/// The visitor that strips `^meta` from each element of a parameter
+/// or binding vector.
+const StripMeta = struct {
+    fn visit(_: StripMeta, _: *ExpandContext, form: *const Form) ExpandError!*Form {
+        return stripMeta(form);
+    }
+};
+
+/// A parameter vector with the `^meta` on it (a return hint) and on
+/// each of its elements dropped.
+fn stripParams(ctx: *ExpandContext, params: *const Form) ExpandError!*Form {
+    const vec = stripMeta(params);
+    if (vec.datum != .vector) return vec;
+    return try mapChildren(ctx, vec, StripMeta{});
+}
+
 // ---- fn* — optional self-name + param vector + body -----------------------
 
 fn expandFnStar(
@@ -709,7 +741,7 @@ fn expandFnStar(
         params_idx = 2;
     }
     if (params_idx >= items.len) return ExpandError.MalformedMacroCall;
-    const params_form = items[params_idx];
+    const params_form = try stripParams(ctx, items[params_idx]);
     if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
     const body = items[params_idx + 1 ..];
 
@@ -897,6 +929,22 @@ fn splitMetaName(ctx: *ExpandContext, form: *const Form) ExpandError!struct { na
     return .{ .name = target, .meta = meta };
 }
 
+/// The map literal `{k v ...}` of `meta_items` as an expression: a
+/// symbol under `:tag` (a type hint, `^String x`) is quoted, since
+/// it names a class nexis does not have.
+fn metaMapExpr(ctx: *ExpandContext, meta_items: []const *Form, origin: SrcSpan) ExpandError!*Form {
+    const items = try ctx.allocator.alloc(*Form, meta_items.len);
+    for (meta_items, items, 0..) |it, *out, i| {
+        const key = if (i % 2 == 1) meta_items[i - 1] else it;
+        const is_tag = key.datum == .keyword and key.datum.keyword.ns == null and std.mem.eql(u8, key.datum.keyword.name, "tag");
+        out.* = if (i % 2 == 1 and is_tag and it.datum == .symbol)
+            try makeListInline(ctx, it.origin, &.{ try makeSymbol(ctx, "quote", it.origin), mutCast(it) })
+        else
+            mutCast(it);
+    }
+    return try makeForm(ctx, .{ .map = items }, origin);
+}
+
 /// `def_form` (a `def`, which yields its Var) wrapped so the Var
 /// then carries the map built from `meta_items` (flat k v ...):
 ///   (let* [v# def_form] (nexis.core/reset-meta! v# {k v ...}) v#)
@@ -904,10 +952,7 @@ fn splitMetaName(ctx: *ExpandContext, form: *const Form) ExpandError!struct { na
 fn withVarMeta(ctx: *ExpandContext, def_form: *Form, meta_items: []const *Form, origin: reader_mod.SrcSpan) ExpandError!*Form {
     if (meta_items.len == 0) return def_form;
     const v_sym = try genTempSym(ctx, origin);
-    const map_form = try ctx.allocator.create(Form);
-    const map_items = try ctx.allocator.alloc(*Form, meta_items.len);
-    for (meta_items, 0..) |it, i| map_items[i] = mutCast(it);
-    map_form.* = .{ .datum = .{ .map = @as([]const *Form, map_items) }, .origin = origin };
+    const map_form = try metaMapExpr(ctx, meta_items, origin);
     const reset_call = try makeListInline(ctx, origin, &.{ try makeQualifiedSymbol(ctx, "nexis.core", "reset-meta!", origin), v_sym, map_form });
     const bindings = try ctx.allocator.alloc(*Form, 2);
     bindings[0] = v_sym;
@@ -988,7 +1033,7 @@ fn expandTry(
         const ci = catches[i].datum.list;
         if (ci.len < 3) return ExpandError.MalformedMacroCall;
         const matcher = ci[1];
-        const binding = ci[2];
+        const binding = stripMeta(ci[2]);
         if (binding.datum != .symbol or binding.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
 
         var handler_env: ExpandEnv = .{ .parent = env };
@@ -1640,7 +1685,10 @@ pub fn formToValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod
         },
         // `#(...)` reaches a macro as the `fn*` form it stands for.
         .anon_fn => |items| try formToValue(ctx, try anonFnForm(ctx, form, items)),
-        .syntax_quote, .unquote, .unquote_splicing, .with_meta => ctx.fail(form.origin, "{s} is not data a macro can take", .{describeForm(form)}),
+        // A symbol cannot carry metadata; a macro sees the form
+        // without it.
+        .with_meta => |wm| try formToValue(ctx, wm.target),
+        .syntax_quote, .unquote, .unquote_splicing => ctx.fail(form.origin, "{s} is not data a macro can take", .{describeForm(form)}),
     };
 }
 
@@ -1727,8 +1775,8 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: reader_mod.S
                 try items.append(ctx.allocator, head_f);
                 node = list_mod.tail(node);
             }
-            const slice = try ctx.allocator.alloc(*Form, items.items.len);
-            for (items.items, 0..) |it, i| slice[i] = it;
+            const slice = try ctx.allocator.dupe(*Form, items.items);
+            if (isMetaMarker(slice)) break :blk try makeForm(ctx, .{ .with_meta = .{ .target = slice[1], .meta = slice[2] } }, origin);
             break :blk try makeList(ctx, slice, origin);
         },
         .persistent_vector => blk: {
@@ -1944,7 +1992,7 @@ fn expandFnRename(
         params_idx = 1;
     }
     if (params_idx >= args.len) return ctx.fail(call_form.origin, "fn: expected a parameter vector", .{});
-    const params_form = args[params_idx];
+    const params_form = try stripParams(ctx, args[params_idx]);
     if (params_form.datum == .list) {
         return try buildMultiArityFn(ctx, call_form, if (name_form) |n| n else null, args[params_idx..]);
     }
@@ -2065,7 +2113,8 @@ fn expandDefnMacro(
     // Detect single-arity vs multi-arity:
     //   single: fn_args[0] is vector (params)
     //   multi:  fn_args are lists each shaped (params body...)
-    const def_form = if (fn_args[0].datum == .vector)
+    const single = stripMeta(fn_args[0]).datum == .vector;
+    const def_form = if (single)
         try buildDefSingleFn(ctx, call_form, name_form, fn_args)
     else
         try buildDefMultiFn(ctx, call_form, name_form, fn_args);
@@ -2074,11 +2123,11 @@ fn expandDefnMacro(
     // :arglists (quote ([params] ...))
     var lists: std.ArrayList(*Form) = .empty;
     defer lists.deinit(ctx.allocator);
-    if (fn_args[0].datum == .vector) {
-        try lists.append(ctx.allocator, mutCast(fn_args[0]));
+    if (single) {
+        try lists.append(ctx.allocator, try stripParams(ctx, fn_args[0]));
     } else for (fn_args) |clause| {
         if (clause.datum != .list or clause.datum.list.len == 0) return ExpandError.MalformedMacroCall;
-        try lists.append(ctx.allocator, mutCast(clause.datum.list[0]));
+        try lists.append(ctx.allocator, try stripParams(ctx, clause.datum.list[0]));
     }
     try meta_items.append(ctx.allocator, try makeKeyword(ctx, "arglists", origin));
     try meta_items.append(ctx.allocator, try makeListInline(ctx, origin, &.{ try makeSymbol(ctx, "quote", origin), try makeListInline(ctx, origin, lists.items) }));
@@ -2163,7 +2212,7 @@ fn buildMultiArityFn(
         if (af.datum != .list) return ExpandError.MalformedMacroCall;
         const items = af.datum.list;
         if (items.len < 1) return ExpandError.MalformedMacroCall;
-        const params_form = items[0];
+        const params_form = try stripParams(ctx, items[0]);
         if (params_form.datum != .vector) return ExpandError.MalformedMacroCall;
         const params = params_form.datum.vector;
         var fixed_count: usize = 0;
@@ -2353,12 +2402,13 @@ fn buildArityThen(
 /// Appends one or more `[name expr]` pairs to `out`.
 fn destructurePair(
     ctx: *ExpandContext,
-    pattern: *const Form,
+    hinted_pattern: *const Form,
     expr: *const Form,
     out: *std.ArrayList(*Form),
     origin: reader_mod.SrcSpan,
 ) ExpandError!void {
     try checkStack();
+    const pattern = stripMeta(hinted_pattern);
     switch (pattern.datum) {
         .symbol => |sym| {
             if (sym.ns != null) return ctx.fail(pattern.origin, "cannot bind the qualified symbol {s}/{s}", .{ sym.ns.?, sym.name });
@@ -2514,7 +2564,7 @@ fn destructureKeyEntry(
     out: *std.ArrayList(*Form),
     origin: reader_mod.SrcSpan,
 ) ExpandError!void {
-    const parts: reader_mod.Name = switch (entry.datum) {
+    const parts: reader_mod.Name = switch (stripMeta(entry).datum) {
         .symbol => |sym| sym,
         .keyword => |kw| if (group == .keys) kw else return ExpandError.MalformedMacroCall,
         else => return ExpandError.MalformedMacroCall,
@@ -2630,8 +2680,9 @@ fn expandLoopRename(
     const pairs = try bindingVector(ctx, call_form, call_form.datum.list);
     var has_pattern = false;
     for (pairs, 0..) |p, i| {
-        if (i % 2 == 0 and p.datum != .symbol) has_pattern = true;
+        if (i % 2 == 0 and stripMeta(p).datum != .symbol) has_pattern = true;
     }
+    // `loop*` drops the hints of hinted names.
     if (!has_pattern) return renameHead(ctx, call_form, args, "loop*");
 
     const origin = call_form.origin;
@@ -2641,8 +2692,8 @@ fn expandLoopRename(
     var i: usize = 0;
     while (i < pairs.len) : (i += 2) {
         loop_bindings[i + 1] = @constCast(pairs[i + 1]);
-        if (pairs[i].datum == .symbol) {
-            loop_bindings[i] = @constCast(pairs[i]);
+        if (stripMeta(pairs[i]).datum == .symbol) {
+            loop_bindings[i] = stripMeta(pairs[i]);
         } else {
             const g = try genTempSym(ctx, origin);
             loop_bindings[i] = g;
@@ -3283,9 +3334,10 @@ fn expandDefrecord(
     // Helper: build the keyword-vector of field names (verifies
     // each field is an unqualified symbol; emits `:fieldname`
     // keywords).
-    const field_count = fields_form.datum.vector.len;
+    const fields = try stripParams(ctx, fields_form);
+    const field_count = fields.datum.vector.len;
     var keyword_items = try ctx.allocator.alloc(*Form, field_count);
-    for (fields_form.datum.vector, 0..) |fld, i| {
+    for (fields.datum.vector, 0..) |fld, i| {
         if (fld.datum != .symbol) return ExpandError.MalformedMacroCall;
         if (fld.datum.symbol.ns != null) return ExpandError.MalformedMacroCall;
         const kw = try ctx.allocator.create(Form);
@@ -3337,7 +3389,7 @@ fn expandDefrecord(
     const ctor_body_inner: *Form = blk: {
         const empty_map = try makeEmptyMap(ctx, origin);
         var acc = empty_map;
-        for (fields_form.datum.vector) |fld| {
+        for (fields.datum.vector) |fld| {
             const sym_name = fld.datum.symbol.name;
             const kw = try ctx.allocator.create(Form);
             kw.* = .{
@@ -3361,7 +3413,7 @@ fn expandDefrecord(
     });
     // Build parameter vector [n m ...] for the constructor.
     const ctor_params = try ctx.allocator.alloc(*Form, field_count);
-    for (fields_form.datum.vector, 0..) |fld, i| {
+    for (fields.datum.vector, 0..) |fld, i| {
         ctor_params[i] = try makeSymbol(ctx, fld.datum.symbol.name, origin);
     }
     const ctor_param_vec = try makeVector(ctx, ctor_params, origin);
@@ -4071,11 +4123,28 @@ fn expandSyntaxQuotePayload(
         // `#(...)` inside syntax-quote is the `fn*` form it stands
         // for; its `%` parameters stay bare (see the symbol arm).
         .anon_fn => |items| try expandSyntaxQuotePayload(ctx, scope, call_form, try anonFnForm(ctx, payload, items)),
-        // Nested syntax-quote and metadata are unsupported:
-        // MalformedMacroCall, which the compile layer buckets as
-        // MacroExpansionFailure.
+        // `^m x` inside syntax-quote builds the list
+        // `(nexis.internal/#%meta x m)`, which a macro's result
+        // turns back into `^m x`: a symbol value cannot carry the
+        // metadata itself (`(def ^:private ~name ...)`).
+        .with_meta => |wm| try makeListInline(ctx, payload.origin, &.{
+            try makeSymbol(ctx, "#%list", payload.origin),
+            try makeListInline(ctx, payload.origin, &.{ try makeSymbol(ctx, "quote", payload.origin), try makeQualifiedSymbol(ctx, "nexis.internal", "#%meta", payload.origin) }),
+            try expandSyntaxQuotePayload(ctx, scope, call_form, wm.target),
+            try expandSyntaxQuotePayload(ctx, scope, call_form, wm.meta),
+        }),
+        // A nested syntax-quote is unsupported: MalformedMacroCall,
+        // which the compile layer buckets as MacroExpansionFailure.
         else => return ExpandError.MalformedMacroCall,
     };
+}
+
+/// Whether `items` is `(nexis.internal/#%meta target {meta})`, the
+/// list a syntax-quoted `^meta` builds.
+fn isMetaMarker(items: []const *Form) bool {
+    if (items.len != 3 or items[2].datum != .map or items[0].datum != .symbol) return false;
+    const head = items[0].datum.symbol;
+    return head.ns != null and std.mem.eql(u8, head.ns.?, "nexis.internal") and std.mem.eql(u8, head.name, "#%meta");
 }
 
 /// Symbols syntax-quote leaves unqualified besides auto-gensyms:

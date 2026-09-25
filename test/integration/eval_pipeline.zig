@@ -255,6 +255,26 @@ test "meta / with-meta / vary-meta on collections never touch equality, hash or 
     try expectOutput("[(meta \"s\") (meta 1) (meta nil) (meta :k)]", "[nil nil nil nil]");
 }
 
+test "metadata: hints in binding positions are dropped, ^meta on a collection literal is its metadata" {
+    try expectOutput("(let [^String s \"x\"] s)", "x");
+    try expectOutput("((fn [^long x ^:foo y] (+ x y)) 1 2)", "3");
+    try expectOutput("(loop [^long i 0] (if (< i 3) (recur (inc i)) i))", "3");
+    try expectOutput("(let [[^long a {:keys [^String b]}] [1 {:b 2}]] [a b])", "[1 2]");
+    try expectOutput("(try (throw :z) (catch Exception ^Object e e))", ":z");
+    try expectOutputProgram("(defn f ^long [x] x) (f 2)", "2");
+    try expectOutputProgram("(defn h ([^long a] a) (^long [a ^long b] (+ a b))) [(h 1) (h 1 2)]", "[1 3]");
+    try expectOutputProgram("(defn ^String g [] \"g\") [(g) (:tag (meta (var g)))]", "[g String]");
+    try expectOutputProgram("(defrecord R [^long x ^String y]) (:x (->R 1 \"a\"))", "1");
+    try expectOutput("(^:hint inc 1)", "2");
+    try expectOutput("[(meta ^:foo [1 2]) (meta ^{:a (+ 1 2)} {:b 2}) (meta ^:s #{})]", "[{:foo true} {:a 3} {:s true}]");
+    try expectOutput("(#(vector ^:m [%]) 1)", "[[1]]");
+    // A macro argument reaches the macro without its metadata.
+    try expectOutputProgram("(defmacro m [x] x) (m ^:foo [1])", "[1]");
+    // ^meta inside syntax-quote reaches the definition the macro writes.
+    try expectOutputProgram("(defmacro defp [n] `(def ^:private ~n 1)) (defp hidden) [hidden (:private (meta (var hidden)))]", "[1 true]");
+    try expectOutputProgram("(defmacro lethint [v] `(let [^String x# ~v] x#)) (lethint 5)", "5");
+}
+
 test "integration: defn forward reference (Var late-binding)" {
     try expectOutput("(do (defn f [] (g)) (defn g [] 99) (f))", "99");
 }
