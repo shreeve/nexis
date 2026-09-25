@@ -82,11 +82,11 @@ foo, ns/foo, set!, ->>               ;; symbol
 | `42N`, `0xFFN`, `18446744073709551616N` | the integer, as without the suffix |
 | `1abc`, `1-2`, `1.5x`, `1/2`, `1.`, `0x`, `3.14M` | `:bad-number-literal`, detail the token |
 | `"one⏎two"` | a string may span lines; the newline is part of it |
-| `"a\qb"`, `"\u{D800}"`, `"A"` | `:invalid-string-escape`, detail the escape |
+| `"a\qb"`, `"\u{D800}"`, `"\u0041"` | `:invalid-string-escape`, detail the escape |
 | `λ`, `ns.é/π`, `:ключ` | a symbol or keyword may hold any non-ASCII UTF-8 character |
 | a string, symbol or keyword that is not UTF-8 | `:invalid-utf8` |
 | `\é`, `\☃`, `\(` | one character, any UTF-8 sequence or delimiter |
-| `A`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | `:invalid-char-literal`, detail the token (`\u{HEX}` is the one escape, PLAN §23 #26) |
+| `\u0041`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | `:invalid-char-literal`, detail the token (`\u{HEX}` is the one escape, PLAN §23 #26) |
 | `foo/bar/baz`, `:foo/bar/baz` | `:invalid-symbol`, `:invalid-keyword`, detail the token |
 | `#'x`, `#"re"`, `##Inf`, `#?(...)`, `#!`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `#'x` ``): none is in the reader (PLAN §7.2) |
 | a form nested past the native stack's budget | `:nesting-too-deep` (`src/stack.zig`) |
@@ -110,7 +110,7 @@ UTF-8 sequence, or any other byte, a delimiter included), then every
 symbol constituent that follows; `\u{HEX}` runs to its `}` first. The
 reader accepts the text only when it is one character, `u{HEX}` naming
 a Unicode scalar, or a name of the named set (§5), so `\a1` and
-`A` fail whole.
+`\u0041` fail whole.
 
 **Duplicate detection.** Only literal keys and elements count:
 `{:a 1 (keyword "a") 2}` reads, since the second key is a runtime value.
