@@ -8,7 +8,7 @@
 //!   key     = attr | (attr opt+) | [attr opt+]
 //!   attr    = :ns/name | :ns/_name        reverse: entities that point
 //!                                         at this one through `name`
-//!   opt     = :limit n | :limit nil | :default v | :as k
+//!   opt     = :limit n | :limit nil | :default v | :as key
 //!   sub     = pattern | ... | depth
 //!
 //! `(limit attr n)` and `(default attr v)` are accepted as well.
@@ -175,8 +175,9 @@ const Sub = union(enum) {
 const Spec = struct {
     attr: Attr,
     reverse: bool,
-    /// VM keyword id the value is emitted under.
-    key: u32,
+    /// The key the value is emitted under: the attribute's keyword, or
+    /// what `:as` names.
+    key: Value,
     /// Null: no limit.
     limit: ?u32,
     default: ?Value,
@@ -354,8 +355,7 @@ const Parser = struct {
             } else if (k == self.k_default) {
                 spec.default = arg;
             } else if (k == self.k_as) {
-                if (arg.kind() != .keyword) return self.fail(":as needs a keyword");
-                spec.key = arg.asKeywordId();
+                spec.key = arg;
             } else return self.fail("unknown attribute option");
         }
         return spec;
@@ -389,7 +389,7 @@ const Parser = struct {
         const spec: Spec = .{
             .attr = attr,
             .reverse = reverse,
-            .key = k,
+            .key = value.fromKeywordId(k),
             .limit = default_limit,
             .default = null,
             .sub = .none,
@@ -472,7 +472,7 @@ const Puller = struct {
         var covered: std.AutoHashMapUnmanaged(u32, void) = .empty;
 
         for (pat.specs, 0..) |*s, i| {
-            const k = value.fromKeywordId(s.key);
+            const k = s.key;
             if (try self.specValue(pat, s, i, e, budget)) |v| {
                 m = try self.assoc(m, k, v);
                 any = true;
@@ -509,7 +509,7 @@ const Puller = struct {
         if (covered.contains(a)) return m;
         const attr = (try self.read.attr(a)) orelse return error.Corrupted;
         const k = (try self.read.db.conn.idents.internOf(self.read.txn, a)) orelse return error.Corrupted;
-        const spec: Spec = .{ .attr = attr, .reverse = false, .key = k, .limit = default_limit, .default = null, .sub = .none };
+        const spec: Spec = .{ .attr = attr, .reverse = false, .key = value.fromKeywordId(k), .limit = default_limit, .default = null, .sub = .none };
         const cut = if (spec.many()) @min(vals.len, default_limit) else 1;
         const v = try self.render(&wildcard_pattern, &spec, 0, &.{}, vals[0..cut]);
         return self.assoc(m, value.fromKeywordId(k), v);
@@ -938,7 +938,6 @@ test "limit, default, as, expression forms, pull-many, syntax diagnostics" {
         .{ .pattern = try fx.vec(&.{try fx.kw("p/_name")}), .message = "reverse reference on a non-ref attribute", .clause = 0 },
         .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("limit") })}), .message = "attribute options come in pairs", .clause = 0 },
         .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("limit"), try fx.str("x") })}), .message = ":limit needs a non-negative integer or nil", .clause = 0 },
-        .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("as"), Fx.int(1) })}), .message = ":as needs a keyword", .clause = 0 },
         .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("zap"), Fx.int(1) })}), .message = "unknown attribute option", .clause = 0 },
         .{ .pattern = try fx.vec(&.{ try fx.kw("p/name"), try fx.lst(&.{ try fx.sym("zap"), try fx.kw("p/tags"), Fx.int(1) }) }), .message = "unknown attribute expression", .clause = 1 },
         .{ .pattern = try fx.vec(&.{try fx.lst(&.{})}), .message = "empty attribute expression", .clause = 0 },
