@@ -2223,26 +2223,96 @@ pub const RuntimeHooks = struct {
             return failure(v, err, "macro-expansion-failure");
     }
 
-    /// The first form of `source`; the rest is ignored, as in
-    /// Clojure. Syntax-quote, unquote and `^meta` do not read as
-    /// data and are reader errors here.
+    /// The first form of `source`; whatever follows it is ignored,
+    /// as in Clojure, even text that does not read. Syntax-quote,
+    /// unquote and `^meta` do not read as data and are reader
+    /// errors here.
     fn readStringHook(user_data: *anyopaque, v: *vm.VM, source: []const u8) vm.VmError!value_mod.Value {
         const self: *RuntimeHooks = @ptrCast(@alignCast(user_data));
         var arena = std.heap.ArenaAllocator.init(v.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        var p = reader_mod.parser.parseProgram(a, source) catch |err|
+        const form = readFirstForm(a, source) catch |err|
             return failure(v, err, "reader-error");
-        defer p.parser.deinit();
-        var reader = reader_mod.Reader.init(a, source);
-        defer reader.deinit();
-        const forms = reader.readProgram(p.sexp) catch |err|
-            return failure(v, err, "reader-error");
-        if (forms.len == 0) return v.throwKeyword("reader-error");
         var ctx = self.context(a, v);
-        return expand_mod.formToValue(&ctx, forms[0]) catch |err|
+        return expand_mod.formToValue(&ctx, form) catch |err|
             return failure(v, err, "reader-error");
     }
+
+    /// The first form of `source`. When the whole text does not read
+    /// as a program, the prefixes that could end one form (at depth
+    /// 0, before a delimiter) are tried in order, the reader deciding.
+    fn readFirstForm(a: std.mem.Allocator, source: []const u8) !*reader_mod.Form {
+        if (readForms(a, source)) |forms| {
+            if (forms.len == 0) return error.ReaderFailure;
+            return forms[0];
+        } else |err| if (err == error.OutOfMemory) return err;
+        var cuts = FormEnds{ .text = source };
+        while (cuts.next()) |end| {
+            const forms = readForms(a, source[0..end]) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                continue;
+            };
+            if (forms.len == 1) return forms[0];
+        }
+        return error.ReaderFailure;
+    }
+
+    fn readForms(a: std.mem.Allocator, text: []const u8) ![]const *reader_mod.Form {
+        var p = try reader_mod.parser.parseProgram(a, text);
+        defer p.parser.deinit();
+        var reader = reader_mod.Reader.init(a, text);
+        defer reader.deinit();
+        return reader.readProgram(p.sexp);
+    }
+
+    /// Where a top-level form could end in `text`: after an atom or
+    /// a closing bracket that brings the nesting back to 0, skipping
+    /// strings, comments and character literals. Only candidates;
+    /// the reader decides.
+    const FormEnds = struct {
+        text: []const u8,
+        pos: usize = 0,
+        depth: usize = 0,
+
+        fn next(self: *FormEnds) ?usize {
+            const t = self.text;
+            while (self.pos < t.len) {
+                const c = t[self.pos];
+                self.pos += 1;
+                switch (c) {
+                    ';' => while (self.pos < t.len and t[self.pos] != '\n') : (self.pos += 1) {},
+                    '"' => {
+                        while (self.pos < t.len and t[self.pos] != '"') : (self.pos += 1) {
+                            if (t[self.pos] == '\\') self.pos += 1;
+                        }
+                        self.pos = @min(self.pos + 1, t.len);
+                        if (self.depth == 0) return self.pos;
+                    },
+                    '(', '[', '{' => self.depth += 1,
+                    ')', ']', '}' => {
+                        if (self.depth == 0) return null;
+                        self.depth -= 1;
+                        if (self.depth == 0) return self.pos;
+                    },
+                    ' ', '\t', '\n', '\r', ',' => {},
+                    else => {
+                        if (c == '\\' and self.pos < t.len) self.pos += 1;
+                        while (self.pos < t.len and !isDelimiter(t[self.pos])) : (self.pos += 1) {}
+                        if (self.depth == 0) return self.pos;
+                    },
+                }
+            }
+            return null;
+        }
+
+        fn isDelimiter(c: u8) bool {
+            return switch (c) {
+                ' ', '\t', '\n', '\r', ',', '(', ')', '[', ']', '{', '}', '"', ';' => true,
+                else => false,
+            };
+        }
+    };
 
     /// `(eval form)`: `form_value` as a Form, compiled the way the
     /// REPL compiles a line (the current namespace, this registry,

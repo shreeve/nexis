@@ -199,6 +199,10 @@ const cases = [_]Case{
     .{ .src = "(let* [x 10 y 20] `[~x ~y])", .out = "[10 20]" },
     .{ .src = "(let* [l `(g# g#)] (= (first l) (second l)))", .out = "true" },
     .{ .src = "(let* [l `(~`g# ~`g#)] (= (first l) (second l)))", .out = "false" },
+    // read-string reads the first form, whatever follows it.
+    .{ .src = "[(read-string \"1 )\") (read-string \"(+ 1 2) (\") (read-string \"1 2\") (read-string \" ; c\\n [1 2] x\")]", .out = "[1 (+ 1 2) 1 [1 2]]" },
+    .{ .src = "[(= \"a)\" (read-string \"\\\"a)\\\" (\")) (= \\) (read-string \"\\\\) (\")) (= '{:a [1]} (read-string \"{:a [1]}}\"))]", .out = "[true true true]" },
+    .{ .src = "[(try (read-string \"\") (catch any e e)) (try (read-string \")\") (catch any e e)) (try (read-string \"{:a 1 :a 2} x\") (catch any e e))]", .out = "[:reader-error :reader-error :reader-error]" },
     // Host macros the compiler relies on.
     .{ .src = "[(let [x 1 y 2] (+ x y)) ((fn [x] (+ x 1)) 41) (loop [i 0 acc 0] (if (< i 5) (recur (+ i 1) (+ acc i)) acc))]", .out = "[3 42 10]" },
     .{ .src = "[(when true 42) (when false 42) (when true 1 2 3) (when-not false 99) (when-not true 99)]", .out = "[42 nil 3 99 nil]" },
