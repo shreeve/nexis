@@ -43,6 +43,7 @@ const intern_mod = @import("intern.zig");
 const protocol_mod = @import("protocol.zig");
 const record_mod = @import("record.zig");
 const nextomic_handle = @import("nextomic/handle.zig");
+const stack_guard = @import("stack.zig");
 const Value = value_mod.Value;
 
 // =============================================================================
@@ -1609,6 +1610,10 @@ pub const VM = struct {
     /// Caller owns the lifetime of `routine`; VM owns the stack,
     /// frames, and runtime arena and frees them in `deinit`.
     pub fn init(allocator: std.mem.Allocator, routine: *const Routine) !VM {
+        // A host that runs the runtime on its own stack arms the guard
+        // first (the CLI does); otherwise assume a main thread's
+        // (docs/VM.md §13.1).
+        stack_guard.armIfUnarmed(stack_guard.main_thread_budget);
         var stack: std.ArrayList(Value) = .empty;
         errdefer stack.deinit(allocator);
         try stack.appendNTimes(allocator, value_mod.nilValue(), routine.slot_count);

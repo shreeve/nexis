@@ -10,6 +10,7 @@
 //! Imports inside one of those units are free. The build's layering
 //! check (build.zig `checkLayering`) enforces all of this.
 
+pub const stack = @import("stack.zig");
 pub const bench = @import("bench.zig");
 pub const pool = @import("pool.zig");
 pub const hash = @import("hash.zig");

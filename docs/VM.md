@@ -1079,7 +1079,8 @@ outermost `return`), `ControlTransferred` (a native's throw has been
 caught and the run loop resumes at the handler), `UncaughtThrow`
 (no handler; value in `vm.unhandled_throw`).
 
-There is no `:stack-overflow`: frame depth is unbounded.
+VM frame depth is unbounded: frames live on the heap. The native
+stack is bounded and guarded (§13.1).
 
 **What the VM records when an error leaves `run`**: the frame
 chain as it stood, in `VM.error_trace`, innermost first, one
@@ -1101,6 +1102,34 @@ with its chain. The trace is rebuilt by the next failing run. `resetAfterError` 
 what the failed run left (the frames above the top-level one,
 handlers, pending finallys, the unhandled throw) so `retargetTop`
 can run the next form; the CLI's REPL calls it after reporting.
+
+#### 13.1 Native stack guard
+
+Bytecode recursion costs no native stack, but Zig code that recurses
+once per level of nested input does: reading, expanding and lowering
+forms, equality, hashing and comparison, printing, the codec, pull,
+transaction expansion, query parsing and rule expansion, and every
+native that re-enters the VM through `callValue`. `src/stack.zig`
+guards all of it with one address, the lowest frame address a
+guarded function may run at:
+
+- `stack.check()` is the first statement of every such function and
+  fails with `error.StackOverflow` once the caller's frame lies below
+  the limit. A deep input is an error, never a fault.
+- `stack.arm(budget)` sets the limit `budget` bytes below the calling
+  frame; `stack.armIfUnarmed(budget)` does so only if nothing armed it
+  yet. `VM.init` calls `armIfUnarmed(stack.main_thread_budget)`
+  (6 MiB), which fits the 8 MiB stack of a process's main thread, the
+  one test binaries and embedders run on.
+- `bin/nexis` runs the runtime on a thread with a 1 GiB stack, a
+  virtual reservation whose pages are committed only when touched, and
+  arms the guard at that thread's entry with the stack less a 16 MiB
+  margin for unguarded leaf calls.
+
+Each layer maps the error to its own report: the VM raises
+`StackOverflow`, the reader a reader error, the compiler a compile
+error, and a codec decode of bytes nested too deep treats them as
+corrupt input.
 
 ---
 

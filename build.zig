@@ -303,6 +303,7 @@ pub fn build(b: *std.Build) void {
             .{ .file = "test/golden/cli/duplicate-key.nx", .expected = "duplicate-key.err", .stream = .stderr, .exit_code = 3 },
             .{ .verb = "disasm", .file = "examples/sum10.nx", .expected = "sum10.disasm" },
             .{ .file = "test/golden/cli/pprint.nx", .expected = "pprint.out" },
+            .{ .file = "test/golden/cli/deep-recursion.nx", .expected = "deep-recursion.out" },
         };
         for (cases) |case| {
             const expected = b.build_root.handle.readFileAlloc(

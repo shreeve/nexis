@@ -9,6 +9,8 @@ wins and the code is wrong.
 
 | Source module | Spec | Notes |
 |---|---|---|
+| `src/root.zig` | (in `build.zig` `checkLayering`) | The `nexis` module: re-exports every runtime file, declared bottom-up in layering order |
+| `src/stack.zig` | [`VM.md`](VM.md) §13.1 | Native stack guard: `check` on every recursion over input depth |
 | `src/value.zig` | [`VALUE.md`](VALUE.md) | 16-byte tagged Value layout + Kind discriminator |
 | `src/heap.zig` | [`HEAP.md`](HEAP.md) | HeapHeader format + Heap allocator wrapper |
 | `src/intern.zig` | [`INTERN.md`](INTERN.md) | Symbol + keyword interning + Name split |

@@ -1,0 +1,5 @@
+; Recursion that passes through a native (`map` calls back into the
+; VM) nests native frames on the runtime thread's stack; the CLI's
+; large runtime stack carries it far past a default main thread's.
+(defn depth [n] (if (= n 0) 0 (inc (first (map depth [(dec n)])))))
+(println (depth 5000))
