@@ -46,8 +46,7 @@ Facts about the boundary:
 - Protocol method calls have no inline cache; every call walks the
   registry (§5.5).
 - Redefining a record type or protocol with the same `(ns, name)`
-  is rejected with `:record-redefinition` / `:protocol-redefinition`
-  (§3.1).
+  registers a new one, as Clojure does (§3.1).
 - A protocol method has exactly one arity: the impl fn's own. The
   registry stores no per-method arity, and `defprotocol` ignores the
   parameter vectors in its method specs (§4.1).
@@ -117,8 +116,14 @@ Vars / atoms / etc.).
 **GC trace**: walk `fields`. The `type_id` is a `u32`, not a heap
 pointer.
 
-**Format**: `#<record type-id=N>` in both display and readable
-modes (opaque, not reader-roundtrippable).
+**Format**: `#ns.Type{:field value, ...}` in both display and
+readable modes, as Clojure prints a record (`(->P 1 "a")` in `user`
+prints `#user.P{:x 1, :y "a"}`, the value strings unquoted in display
+mode). The name comes from the interner, which
+`registerRecordType` tells each new type's `ns.Type`
+(`Interner.nameRecordType`, INTERN.md §2); a type it was never told
+prints opaquely as `#<record type-id=N>`. Not reader-roundtrippable:
+the reader has no tagged literals.
 
 #### 2.2 `Kind.protocol = 36`
 
@@ -224,12 +229,14 @@ maps). Names are owned by the registries (duped on registration).
 
 #### 3.1 Lifetime + redefinition
 
-- Defining a record type with a name that's already in
-  `record_registry` for the same `(ns, name)` → reject with
-  `:record-redefinition`. Avoids the confusing-state hazard
-  where existing instances reference an old type_id.
-- Defining a protocol with an existing `(ns, name)` → same
-  treatment: `:protocol-redefinition`.
+- Defining a record type with an existing `(ns, name)` registers
+  a new type id, as Clojure's `defrecord` makes a new class: the
+  constructors and predicate name the new type, and values built
+  before keep the old one (so they are not `=` to new ones).
+  `registerRecordType` also names the id in the interner, which is
+  how a record prints as `#ns.Type{...}`.
+- Defining a protocol with an existing `(ns, name)` registers a new
+  protocol with no impls, as Clojure's `defprotocol` does.
 - Adding impls to an existing protocol via
   `extend-protocol` / `extend-type` / `defrecord` is allowed (that's
   the whole point of those macros). Registering an impl for a
@@ -294,7 +301,7 @@ Expansion:
        (nexis.internal/#%register-record-type "my.ns/Counter" [:n]))
   ;; Positional constructor.
   (defn ->Counter [n]
-    (nexis.internal/#%make-record Counter-type-id (assoc {} :n n)))
+    (nexis.internal/#%make-record Counter-type-id {:n n}))
   ;; Map constructor.
   (defn map->Counter [m]
     (nexis.internal/#%make-record Counter-type-id m))
@@ -303,11 +310,17 @@ Expansion:
     (and (nexis.internal/#%record? x)
          (= Counter-type-id (nexis.internal/#%record-type-id x))))
   ;; Per-protocol impls registered into the protocol's method table.
+  ;; A method sees the fields as locals (below).
   (nexis.internal/#%extend-record-impl IFoo :bar Counter-type-id
-    (fn [this x] (assoc this :n (+ x (:n this)))))
+    (fn [this x] (assoc this :n (+ x n))))
   (nexis.internal/#%extend-record-impl IFoo :baz Counter-type-id
     (fn [this x y] [:counter (+ x y)])))
 ```
+
+Inside an inline method each field is a local bound to the record's
+value for it, `(nexis.core/get this :n)`, as in Clojure, unless a
+parameter of the method has the same name, which shadows it. So a
+field assoc'd onto the record is what a method sees.
 
 Clauses after the field vector are parsed in order: a bare symbol
 switches the current protocol; a list `(method [params] body...)`
@@ -452,7 +465,7 @@ After execution:
   (def Counter-type-id
        (nexis.internal/#%register-record-type "user/Counter" [:n]))
   (defn ->Counter [n]
-    (nexis.internal/#%make-record Counter-type-id (assoc {} :n n)))
+    (nexis.internal/#%make-record Counter-type-id {:n n}))
   (defn map->Counter [m]
     (nexis.internal/#%make-record Counter-type-id m))
   (defn Counter? [x]
@@ -594,8 +607,6 @@ count surfaces as that fn's `:arity-mismatch`.
 | `:no-protocol-method` | Calling a method-name not defined on the protocol; extending a method the protocol does not declare |
 | `:no-protocol-impl` | Receiver kind has no impl + no default; protocol id not in the registry |
 | `:not-a-record` | `#%record-type-id` on a non-record |
-| `:record-redefinition` | `defrecord` with an existing `(ns, name)` |
-| `:protocol-redefinition` | `defprotocol` with an existing `(ns, name)` |
 | `:invalid-argument` | `extend-protocol`/`extend-type` keyword that names no kind and no alias |
 | `:arity-mismatch` | Protocol method called with no receiver; impl fn called with the wrong number of args |
 | `:kind-mismatch` | Internal natives / `satisfies?` receiving a value of the wrong kind (non-protocol, non-keyword method name, non-map fields, ...) |

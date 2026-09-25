@@ -2238,15 +2238,7 @@ fn fnPop(vm: *VM, args: []const Value) VmError!Value {
     return switch (c.kind()) {
         .nil => value_mod.nilValue(),
         .list => if (list_mod.isEmpty(c)) VmError.IndexOutOfBounds else list_mod.tail(c),
-        .persistent_vector => blk: {
-            const n = vector_mod.count(c);
-            if (n == 0) return VmError.IndexOutOfBounds;
-            const items = vm.allocator.alloc(Value, n - 1) catch return VmError.OutOfMemory;
-            defer vm.allocator.free(items);
-            var i: usize = 0;
-            while (i < n - 1) : (i += 1) items[i] = vector_mod.nth(c, i);
-            break :blk vector_mod.fromSlice(vm.ensureHeap(), items) catch VmError.OutOfMemory;
-        },
+        .persistent_vector => if (vector_mod.count(c) == 0) VmError.IndexOutOfBounds else vector_mod.pop(vm.ensureHeap(), c) catch VmError.OutOfMemory,
         else => VmError.KindMismatch,
     };
 }
@@ -3301,6 +3293,7 @@ fn transientFailure(vm: *VM, err: anyerror) VmError {
     return switch (err) {
         error.TransientFrozen => vm.throwKeyword("transient-used-after-persistent"),
         error.OutOfMemory, error.Overflow => VmError.OutOfMemory,
+        error.IndexOutOfBounds => VmError.IndexOutOfBounds,
         else => VmError.KindMismatch,
     };
 }
@@ -3374,10 +3367,14 @@ fn fnAssocBang(vm: *VM, args: []const Value) VmError!Value {
             return t;
         },
         transient_mod.subkind_transient_vector => {
-            var v = transient_mod.persistentBang(t) catch |err| return transientFailure(vm, err);
             var i: usize = 1;
-            while (i < args.len) : (i += 2) v = try assocOne(vm, v, args[i], args[i + 1]);
-            return fnTransient(vm, &.{v});
+            while (i < args.len) : (i += 2) {
+                const k = args[i];
+                if (k.kind() != .fixnum) return VmError.KindMismatch;
+                if (k.asFixnum() < 0) return VmError.IndexOutOfBounds;
+                t = transient_mod.vectorAssocBang(heap, t, @intCast(k.asFixnum()), args[i + 1]) catch |err| return transientFailure(vm, err);
+            }
+            return t;
         },
         else => return VmError.KindMismatch,
     }
@@ -3402,8 +3399,7 @@ fn fnDisjBang(vm: *VM, args: []const Value) VmError!Value {
 /// `(pop! t)` on a transient vector: without its last element.
 fn fnPopBang(vm: *VM, args: []const Value) VmError!Value {
     if (try requireTransient(args[0]) != transient_mod.subkind_transient_vector) return VmError.KindMismatch;
-    const v = transient_mod.persistentBang(args[0]) catch |err| return transientFailure(vm, err);
-    return fnTransient(vm, &.{try fnPop(vm, &.{v})});
+    return transient_mod.vectorPopBang(vm.ensureHeap(), args[0]) catch |err| transientFailure(vm, err);
 }
 
 // =============================================================================
@@ -4107,9 +4103,7 @@ fn fnExit(vm: *VM, args: []const Value) VmError!Value {
 ///
 /// Looks up the receiver VM's namespace registry to derive the
 /// effective ns prefix (the current namespace), then calls
-/// `vm.registerRecordType`. Re-defining a record type with the
-/// same (ns, name) raises `:record-redefinition` (avoids the
-/// stale type_id hazard).
+/// `vm.registerRecordType`; redefining a type registers a new one.
 fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
     const full_name_v = args[0];
     const fields_vec = args[1];
@@ -4137,10 +4131,7 @@ fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
         field_names[i] = interner.keywordName(id);
     }
 
-    const new_id = vm.registerRecordType(ns_name, type_name, field_names) catch |err| switch (err) {
-        error.RecordRedefinition => return VmError.RecordRedefinition,
-        error.OutOfMemory => return VmError.OutOfMemory,
-    };
+    const new_id = vm.registerRecordType(ns_name, type_name, field_names) catch return VmError.OutOfMemory;
     return value_mod.fromFixnum(@intCast(new_id)) orelse VmError.ArithmeticOverflow;
 }
 
@@ -4220,10 +4211,7 @@ fn fnRegisterProtocol(vm: *VM, args: []const Value) VmError!Value {
         specs[i] = .{ .name_id = id, .name = interner.keywordName(id) };
     }
 
-    const new_id = vm.registerProtocol(ns_name, proto_name, specs) catch |err| switch (err) {
-        error.ProtocolRedefinition => return VmError.ProtocolRedefinition,
-        error.OutOfMemory => return VmError.OutOfMemory,
-    };
+    const new_id = vm.registerProtocol(ns_name, proto_name, specs) catch return VmError.OutOfMemory;
     return protocol_mod.makeProtocol(vm.ensureHeap(), new_id) catch return VmError.OutOfMemory;
 }
 

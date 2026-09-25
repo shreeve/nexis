@@ -11,6 +11,7 @@
 ([Ann apple] [Ann pear] [Bob fig] [Cy apple])
 ok a constant that names nothing matches nothing
 ok a lookup ref that names nothing matches nothing
+ok a list constant is a value, not a lookup ref, though = to one
 ok the tx position binds the transaction entity
 Cy
 ([Ann 30] [Di 30])
@@ -18,9 +19,34 @@ Cy
 ([Ann 30 4294967296] [Bob 26 4294967297])
 ([Ann])
 ([Cy 42.0])
+([Ann] [Di])
+#{[1] [2]}
+{:error :nextomic/query-syntax, :message an arg-map takes :query and :args}
+{:error :nextomic/query-syntax, :message :args is a vector of the query's inputs}
+#{[1] [2] [3]}
+([1 3] [2 3])
+6
+([3 2] [3 3])
+Cy
+{:error :nextomic/query-syntax, :message this clause reads a data source, and :in names none, :clause 0}
+{:error :nextomic/query-syntax, :message this clause reads a data source, and :in names none, :clause 0}
+{:error :nextomic/query-syntax, :message pull reads a data source, and :in names none}
+{:error :nextomic/query-syntax, :message $ names the first data source; declare it first}
+{:error :nextomic/query-syntax, :message wrong number of inputs}
+([1 2] [2 3] [3 1] [3 4])
+#{[3]}
+([Ann thirty] [Bob twenty-six] [Di thirty])
+([1] [3])
+12
+{:error :nextomic/query-syntax, :message a lookup ref needs a db source; this source is a collection, :clause 0}
+{:error :nextomic/query-syntax, :message this clause reads a db value, and its source is a collection, :clause 1}
+{:error :nextomic/query-syntax, :message this clause reads a db value, and its source is a collection}
+:nextomic/value-type
 ([Ann] [Di] [Flo])
 ([Bob] [Edward])
 ([Di] [Flo])
+([Ann false] [Bob false] [Cy true] [Di false] [Edward true] [Flo true])
+([Ann false] [Bob false] [Cy false] [Di true] [Edward false] [Flo true])
 ([Ann] [Cy] [Di] [Edward] [Flo])
 ([Ann] [Bob] [Di])
 ([Ann] [Bob] [Cy] [Di] [Edward] [Flo])
@@ -36,6 +62,11 @@ Cy
 ([ANN] [BOB] [CY] [DI] [EDWARD] [FLO])
 ([Ann 30] [Bob 26] [Cy 41] [Di 30] [Edward 55] [Flo 33])
 ([Ann :person/height 1.7] [Bob :person/height 1.8] [Cy :person/height 1.65] [Di :person/age 30] [Edward :person/age 55] [Flo :person/age 33])
+{:error :nextomic/query-syntax, :message get-else takes a cardinality-one attribute}
+{:error :nextomic/query-syntax, :message get-else takes a default that is not nil, :clause 1}
+{:error :nextomic/query-syntax, :message get-else takes a default that is not nil}
+{:error :nextomic/unknown-attribute, :attr :person/nope}
+{:error :nextomic/unknown-attribute, :attr :person/nope}
 ([Bob Bob B 3] [Cy Cy C 2] [Di Di D 2] [Edward Edward E 6] [Flo Flo F 3])
 ([Cy :green] [Cy :red] [Edward :green])
 ([[Ann 30]] [[Bob 26]] [[Cy 41]] [[Di 30]] [[Edward 55]] [[Flo 33]])
@@ -45,6 +76,7 @@ ok a nil function result drops the row
 [26 55 215 35.833333333333336 5 6]
 185
 215
+ok a sum past the fixnum range is a bignum, as + gives
 ([Ann 2] [Cy 1])
 [31.5 94.47222222222223 9.719682207882222 [55 41] [26 30]]
 30
@@ -52,6 +84,7 @@ ok a nil function result drops the row
 (3 8 5)
 :nextomic/value-type
 (:blue :green :red)
+ok keywords compare and aggregate by name, as compare orders them
 Edward
 nil
 (Bob Cy Di)
@@ -66,6 +99,10 @@ nil
 {:error :nextomic/query-syntax, :message :keys, :strs and :syms take one name per :find element}
 {:error :nextomic/unknown-attribute, :attr :nope/attr}
 :nextomic/history-view
+{:db/id 4294967298, :person/name Cy, :person/age 41}
+[{:db/id 4294967300, :person/name Ed} {:db/id 4294967300, :person/name Edward}]
+{:error :nextomic/query-syntax, :message a pull pattern variable is bound by a scalar :in input}
+{:error :nextomic/query-syntax, :message unknown data source; declare it in :in}
 ([Di] [Flo])
 ([Ann] [Cy] [Di] [Edward])
 ([Bob] [Di] [Edward] [Flo])
@@ -84,12 +121,15 @@ ok explain names a scan's source
 (Di)
 ([Ann Bob] [Ann Cy] [Ann Di] [Cy Di])
 (Bob Cy Di)
+{:error :nextomic/query-syntax, :message outranks recurses through not; a rule cannot depend on the negation of itself, :clause 1}
+{:error :nextomic/query-syntax, :message ra recurses through not; a rule cannot depend on the negation of itself, :clause 1}
 ok a repeated query and rule set are served from the caches
 ([Ann 30] [Bob 25] [Cy 41] [Di 30] [Ed 55])
 ([Flo 33])
 ([25 false] [25 true] [26 true])
 ([Ed false] [Ed true] [Edward true])
 ok explain returns the plan as text
+ok a rule call is costed by its bodies: the smaller scan runs first, then the call
 {:error :nextomic/query-syntax, :message unknown symbol in data pattern, :clause 0}
 {:error :nextomic/query-syntax, :message :find variable is not bound by :in or :where}
 {:error :nextomic/query-syntax, :message wrong number of inputs}
@@ -103,6 +143,13 @@ ok explain returns the plan as text
 {:error :nextomic/unknown-attribute, :attr :nope/attr}
 {:error :nextomic/unknown-attribute, :attr :nope/attr}
 :nextomic/value-type
+{:error :nextomic/query-syntax, :message empty :find element}
+{:error :nextomic/query-syntax, :message rule half body 1 leaves ?y unbound; every body binds every head variable, :clause 1}
+{:error :nextomic/query-syntax, :message ?zz is never bound; not-join joins on variables the clauses around it bind, :clause 1}
+{:error :nextomic/query-syntax, :message ?zz is never bound; or-join needs its required variables bound before it runs, :clause 1}
+([Ann] [Di])
+{:error :nextomic/query-syntax, :message a rule is called with the wrong number of arguments, :clause 1}
+{:error :nextomic/query-syntax, :message a rule is called with the wrong number of arguments, :clause 1}
 {:error :nextomic/query-syntax, :message unknown symbol in data pattern, :clause 0}
 :boom
 ok the store still works after a predicate threw

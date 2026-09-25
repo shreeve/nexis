@@ -10,6 +10,8 @@
 //!   V1. fromSlice + nth round-trip byte-exact over 200 random sizes.
 //!   V2. conj produces the same logical sequence as fromSlice
 //!       (equivalent via `dispatch.equal`, same hashValue).
+//!   V2b. Random conj/assoc/pop walks against a model, starting just
+//!       below each trie boundary (32, 1056, 32800) and crossing it.
 //!   V3. Cross-kind: 500 random element sequences lifted into BOTH a
 //!       list and a vector produce `dispatch.equal`-true and
 //!       hash-equal Values.
@@ -101,6 +103,60 @@ test "V2: reduce(conj, empty, elems) ≡ fromSlice(elems)" {
 
         try std.testing.expect(dispatch.equal(via_slice, via_conj));
         try std.testing.expectEqual(dispatch.hashValue(via_slice), dispatch.hashValue(via_conj));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// V2b. conj / assoc / pop against a model, across the trie boundaries
+// -----------------------------------------------------------------------------
+
+test "V2b: random conj/assoc/pop walks match a model across 32, 1056 and 32800" {
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    const gpa = debug.allocator();
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 21);
+    const r = prng.random();
+
+    // Each walk starts a few elements below a boundary and drifts
+    // across it: conj and pop twice as likely as assoc, pop never on
+    // empty. After every step the vector must equal the model element
+    // for element, and equal (and hash like) a fresh fromSlice of it.
+    const starts = [_]usize{ 0, 28, 1050, 32794 };
+    for (starts) |start| {
+        var model: std.ArrayList(Value) = .empty;
+        defer model.deinit(gpa);
+        for (0..start) |i| try model.append(gpa, value.fromFixnum(@intCast(i)).?);
+        var v = try vector_mod.fromSlice(&heap, model.items);
+        var step: usize = 0;
+        while (step < 400) : (step += 1) {
+            const pick = r.uintLessThan(u8, 5);
+            if (pick < 2 or model.items.len == 0) {
+                const e = randImmediate(r);
+                v = try vector_mod.conj(&heap, v, e);
+                try model.append(gpa, e);
+            } else if (pick < 4) {
+                v = try vector_mod.pop(&heap, v);
+                _ = model.pop();
+            } else {
+                const i = r.uintLessThan(usize, model.items.len);
+                const e = randImmediate(r);
+                v = try vector_mod.assoc(&heap, v, i, e);
+                model.items[i] = e;
+            }
+            try std.testing.expectEqual(model.items.len, vector_mod.count(v));
+            const n = model.items.len;
+            for ([_]usize{ 0, n / 2, n -| 33, n -| 1 }) |i| {
+                if (i < n) try std.testing.expect(vector_mod.nth(v, i).identicalTo(model.items[i]));
+            }
+            if (step % 50 == 0 or n < 70) {
+                const fresh = try vector_mod.fromSlice(&heap, model.items);
+                try std.testing.expect(dispatch.equal(fresh, v));
+                try std.testing.expectEqual(dispatch.hashValue(fresh), dispatch.hashValue(v));
+            }
+        }
     }
 }
 

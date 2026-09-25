@@ -174,7 +174,7 @@ pub fn elemType(v: Value) ElemType {
 }
 
 /// The element type, read from the body.
-pub fn elemTypeOf(h: *HeapHeader) ElemType {
+fn elemTypeOf(h: *HeapHeader) ElemType {
     return @enumFromInt(bodyOf(h).elem);
 }
 
@@ -230,12 +230,6 @@ pub fn f64FromValue(v: Value) ?f64 {
     };
 }
 
-/// The integer Value for `n`: a fixnum, or a bignum beyond the
-/// fixnum range.
-pub fn i64Value(heap: *Heap, n: i64) error{OutOfMemory}!Value {
-    return bignum.fromI64(heap, n) catch error.OutOfMemory;
-}
-
 // =============================================================================
 // Per-kind hash + equality (called by dispatch)
 // =============================================================================
@@ -243,9 +237,12 @@ pub fn i64Value(heap: *Heap, n: i64) error{OutOfMemory}!Value {
 /// Ordered-combine hash over the element type tag and then every
 /// element: `hash.hashI64` for `i64`, `hash.hashFloat` for `f64` (so
 /// `-0.0` and `+0.0` hash alike, as they compare). The pre-mix base;
-/// `dispatch.hashValue` applies the kind-local domain byte. Not
-/// cached: every call walks the elements.
+/// `dispatch.hashValue` applies the kind-local domain byte. A typed
+/// vector never changes, so the first call caches the hash in the
+/// header at u32 precision, as maps and strings do (HEAP.md): later
+/// calls read it back.
 pub fn hashHeader(h: *HeapHeader) u64 {
+    if (h.cachedHash()) |cached| return cached;
     const body = bodyOf(h);
     var acc: u64 = hash_mod.ordered_init;
     acc = hash_mod.combineOrdered(acc, hash_mod.hashU64(body.elem));
@@ -257,7 +254,9 @@ pub fn hashHeader(h: *HeapHeader) u64 {
             acc = hash_mod.combineOrdered(acc, hash_mod.hashFloat(x));
         },
     }
-    return hash_mod.finalizeOrdered(acc, body.len);
+    const truncated: u32 = @truncate(hash_mod.finalizeOrdered(acc, body.len));
+    if (truncated != 0) h.setCachedHash(truncated);
+    return truncated;
 }
 
 /// Structural equality: same element type, same length, every element
@@ -433,6 +432,16 @@ test "hashHeader: empty vectors of different types hash differently; length is f
     try testing.expect(hashHeader(header(ei)) != hashHeader(header(zero)));
 }
 
+test "hashHeader caches its result in the header" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const h = header(try fromI64Slice(&heap, &.{ 1, 2, 3 }));
+    try testing.expect(h.cachedHash() == null);
+    const first = hashHeader(h);
+    try testing.expectEqual(@as(?u32, @intCast(first)), h.cachedHash());
+    try testing.expectEqual(first, hashHeader(h));
+}
+
 test "format: #i64[...] and #f64[...]" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
@@ -465,8 +474,6 @@ test "element coercion: integers only for i64, any number for f64" {
     try testing.expectEqual(@as(?f64, 2.5), f64FromValue(value.fromFloat(2.5)));
     try testing.expectEqual(@as(?f64, 18446744073709551616.0), f64FromValue(huge));
     try testing.expectEqual(@as(?f64, null), f64FromValue(value.fromBool(true)));
-    try testing.expect((try i64Value(&heap, 3)).kind() == .fixnum);
-    try testing.expect((try i64Value(&heap, value.fixnum_min - 1)).kind() == .bignum);
 }
 
 test "ElemType.fromTag accepts only the implemented tags" {

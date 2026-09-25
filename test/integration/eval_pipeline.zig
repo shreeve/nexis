@@ -281,6 +281,26 @@ test "meta / with-meta / vary-meta on collections never touch equality, hash or 
     try expectOutput("[(meta \"s\") (meta 1) (meta nil) (meta :k)]", "[nil nil nil nil]");
 }
 
+test "metadata: hints in binding positions are dropped, ^meta on a collection literal is its metadata" {
+    try expectOutput("(let [^String s \"x\"] s)", "x");
+    try expectOutput("((fn [^long x ^:foo y] (+ x y)) 1 2)", "3");
+    try expectOutput("(loop [^long i 0] (if (< i 3) (recur (inc i)) i))", "3");
+    try expectOutput("(let [[^long a {:keys [^String b]}] [1 {:b 2}]] [a b])", "[1 2]");
+    try expectOutput("(try (throw :z) (catch Exception ^Object e e))", ":z");
+    try expectOutputProgram("(defn f ^long [x] x) (f 2)", "2");
+    try expectOutputProgram("(defn h ([^long a] a) (^long [a ^long b] (+ a b))) [(h 1) (h 1 2)]", "[1 3]");
+    try expectOutputProgram("(defn ^String g [] \"g\") [(g) (:tag (meta (var g)))]", "[g String]");
+    try expectOutputProgram("(defrecord R [^long x ^String y]) (:x (->R 1 \"a\"))", "1");
+    try expectOutput("(^:hint inc 1)", "2");
+    try expectOutput("[(meta ^:foo [1 2]) (meta ^{:a (+ 1 2)} {:b 2}) (meta ^:s #{})]", "[{:foo true} {:a 3} {:s true}]");
+    try expectOutput("(#(vector ^:m [%]) 1)", "[[1]]");
+    // A macro argument reaches the macro without its metadata.
+    try expectOutputProgram("(defmacro m [x] x) (m ^:foo [1])", "[1]");
+    // ^meta inside syntax-quote reaches the definition the macro writes.
+    try expectOutputProgram("(defmacro defp [n] `(def ^:private ~n 1)) (defp hidden) [hidden (:private (meta (var hidden)))]", "[1 true]");
+    try expectOutputProgram("(defmacro lethint [v] `(let [^String x# ~v] x#)) (lethint 5)", "5");
+}
+
 test "integration: defn forward reference (Var late-binding)" {
     try expectOutput("(do (defn f [] (g)) (defn g [] 99) (f))", "99");
 }
@@ -441,6 +461,27 @@ test "syntax-quote: symbols qualify to the namespace that defines them" {
     try expectOutput("(second `(a ~'b))", "b");
 }
 
+test "syntax-quote: auto-gensyms stay unique across top-level forms" {
+    try expectOutputProgram("(def p `a#) (def q `a#) (= p q)", "false");
+    // A macro's syntax-quote is expanded once, when the macro is
+    // defined, so every call of it yields the same name (Clojure's
+    // read-time rule); `gensym` gives a fresh one per call.
+    try expectOutputProgram(
+        \\(defmacro same [] `'g#)
+        \\(defmacro fresh [] (list 'quote (gensym "g")))
+        \\[(= (same) (same)) (= (fresh) (fresh))]
+    , "[true false]");
+}
+
+test "syntax-quote: a nested syntax-quote writes macro-writing macros" {
+    try expectOutputProgram("(defmacro m [x] ``(a ~~x)) (m 1)", "(user/a 1)");
+    try expectOutputProgram(
+        \\(defmacro make-adder-macro [name n] `(defmacro ~name [y#] `(+ ~y# ~~n)))
+        \\(make-adder-macro add5 5)
+        \\(add5 10)
+    , "15");
+}
+
 test "syntax-quote: a bare binding name inside syntax-quote is the Clojure mistake" {
     // `(let [x ~a] x)` qualifies `x`; a qualified name cannot be bound.
     try expectProgramError("(defmacro bad [a] `(let [x ~a] x)) (bad 1)", compile.CompileError.MacroExpansionFailure);
@@ -560,6 +601,31 @@ test "try: catch clauses match by keyword tag, in order, or rethrow" {
     try expectProgramError("((fn [x] (set! x 2)) 1)", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(loop [i 0] (set! i 2))", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(try 1 (catch any e 1) 2)", compile.CompileError.MacroExpansionFailure);
+}
+
+test "try: a class-name matcher or :default catches anything, as Exception would" {
+    try expectOutput("(try (/ 1 0) (catch ArithmeticException e :caught))", ":caught");
+    try expectOutput("(try (throw (ex-info \"boom\" {})) (catch Exception e (ex-message e)))", "boom");
+    try expectOutput("(try (throw :x) (catch Throwable e e))", ":x");
+    try expectOutput("(try (throw :x) (catch clojure.lang.ExceptionInfo e [:info e]))", "[:info :x]");
+    try expectOutput("(try (throw :x) (catch :default e [:default e]))", "[:default :x]");
+    // Clauses still run in order: a tag before a class name wins.
+    try expectOutput("(try (throw :a) (catch :a e 1) (catch Exception e 2))", "1");
+}
+
+test "fn: a :pre/:post condition map checks arguments and the result" {
+    try expectOutput("((fn [x] {:pre [(pos? x)]} (* 2 x)) 3)", "6");
+    try expectOutput("(try ((fn [x] {:pre [(pos? x) (< x 10)]} x) -1) (catch :assertion-failed e (:message e)))", "Assert failed: (pos? x)");
+    try expectOutput("(try ((fn [x] {:post [(> % 10)]} (* 2 x)) 3) (catch :assertion-failed e (:message e)))", "Assert failed: (> % 10)");
+    try expectOutputProgram("(defn f ([x] {:pre [(odd? x)]} x) ([x y] {:post [(= % 3)]} (+ x y))) [(f 1) (f 1 2) (try (f 2) (catch any e :pre))]", "[1 3 :pre]");
+    // A lone map is the body, not a condition map.
+    try expectOutput("((fn [] {:pre [false]}))", "{:pre [false]}");
+}
+
+test "condp: :>> passes the predicate's result to a function" {
+    try expectOutput("(condp some [1 2 3] #{0 6} :>> inc #{4 5 3} :>> dec #{7} 99 :none)", "2");
+    try expectOutput("(condp some [9] #{0} :>> inc :none)", ":none");
+    try expectOutput("(condp = 2 1 :one 2 :two)", ":two");
 }
 
 test "empty bodies are nil and () is the empty list" {
@@ -894,15 +960,17 @@ test "integration: sequential destructuring (let)" {
 test "integration: sequential destructuring with rest" {
     // MACROEXPAND.md §10 `let`: a vector pattern's rest is `next`,
     // nil once the source is exhausted; a fn rest parameter is the
-    // list the VM packs, nil when empty (VM.md §6), as in Clojure; a
-    // multi-arity fn's variadic arity binds `(rest args)`.
+    // list the VM packs, nil when empty (VM.md §6), as in Clojure,
+    // and so is a multi-arity fn's variadic rest, `(nthnext args n)`.
     try expectOutput("(let [[a & rest] [1 2 3 4]] rest)", "(2 3 4)");
     try expectOutput("(let [[a b & rest] [1 2 3 4 5]] rest)", "(3 4 5)");
     try expectOutput("(let [[a & r] [1 2 3]] r)", "(2 3)");
     try expectOutput("(nil? (let [[a & r] [1]] r))", "true");
     try expectOutput("(nil? (let [[a b & r] [1]] r))", "true");
     try expectOutput("((fn [& r] r))", "nil");
-    try expectOutput("((fn ([x & r] r)) 1)", "()");
+    try expectOutput("((fn ([x & r] r)) 1)", "nil");
+    try expectOutput("((fn ([x & r] r) ([] 0)) 1 2 3)", "(2 3)");
+    try expectOutput("((fn ([] 0) ([x & r] r)) 1)", "nil");
 }
 
 test "integration: sequential destructuring with :as" {
@@ -967,10 +1035,10 @@ test "hygiene: a local or Var named after a core function cannot capture host-ma
     try expectOutput("(let [count (fn [& _] 99)] ((fn ([x] :one) ([x y] :two)) 1))", ":one");
     try expectOutputProgram("(defn nth [& _] :user-nth) (let [[a b] [1 2]] [a b])", "[1 2]");
     try expectOutput("(let [= (fn [& _] false)] (case 1 1 :one :none))", ":one");
-    try expectOutput("(let [seq (fn [& _] nil)] (for [x [1 2]] x))", "[1 2]");
+    try expectOutput("(let [seq (fn [& _] nil)] (for [x [1 2]] x))", "(1 2)");
     try expectOutput("(let [get (fn [& _] :g)] (let [{a :a} {:a 1}] a))", "1");
     try expectOutput("(let [< (fn [& _] false) not (fn [& _] false)] ((fn ([x] :one) ([x & r] :var)) 1 2))", ":var");
-    try expectOutput("(let [first (fn [& _] :f) next (fn [& _] nil) conj (fn [& _] :c)] (for [x [1 2]] x))", "[1 2]");
+    try expectOutput("(let [first (fn [& _] :f) next (fn [& _] nil) conj (fn [& _] :c)] (for [x [1 2]] x))", "(1 2)");
     try expectOutput("(let [rest (fn [& _] :r)] (let [[a & r] [1 2 3]] r))", "(2 3)");
 }
 
@@ -1239,6 +1307,17 @@ test "integration: transients: transient, conj!, assoc!, dissoc!, disj!, pop!, p
     try expectOutput("(let [t (transient [])] (persistent! t) (try (conj! t 1) (catch any e e)))", ":transient-used-after-persistent");
     try expectOutput("(try (transient '(1)) (catch any e e))", ":kind-mismatch");
     try expectOutput("(persistent! (conj! (transient {}) [:k 1]))", "{:k 1}");
+    try expectOutput("(let [t (transient [1 2 3])] (identical? t (assoc! t 3 4)))", "true");
+    try expectOutput("[(try (assoc! (transient [1]) 5 :x) (catch any e e)) (try (pop! (transient [])) (catch any e e))]", "[:index-out-of-bounds :index-out-of-bounds]");
+    try expectOutput("[(pop [1 2 3]) (pop [1]) (count (reduce (fn [v _] (pop v)) (vec (range 2000)) (range 1990)))]", "[[1 2] [] 10]");
+}
+
+test "integration: a transient hashes by identity, so it can be a set member or map key (SEMANTICS §2.6)" {
+    try expectOutput(
+        \\(let [t (transient [])]
+        \\  [(= (hash t) (hash t)) (count (conj #{t} t (transient []))) (get {t 1} t)
+        \\   (= t (transient [])) (= t [])])
+    , "[true 2 1 false false]");
 }
 
 test "integration: in-ns switches the namespace the next forms compile in" {
@@ -1247,6 +1326,14 @@ test "integration: in-ns switches the namespace the next forms compile in" {
 
 test "integration: *command-line-args* is nil without arguments; read-line needs the host's stdin" {
     try expectOutput("[*command-line-args* (try (read-line) (catch any e e))]", "[nil :io-error]");
+}
+
+test "integration: =, hash, set membership and printing of data nested past the stack are :stack-overflow" {
+    try expectOutput("(let [deep (fn [] (reduce (fn [acc _] [acc]) [] (range 200000)))] [(try (= (deep) (deep)) (catch :stack-overflow e :deep)) (try (hash (deep)) (catch :stack-overflow e :deep)) (try #{(deep) (deep)} (catch :stack-overflow e :deep)) (try (pr-str (deep)) (catch :stack-overflow e :deep))])", "[:deep :deep :deep :deep]");
+}
+
+test "integration: a record prints as #ns.Type{...}; defrecord and defprotocol may be redefined" {
+    try expectOutput("(defrecord P [x y]) (def old (->P 1 \"a\")) (defrecord P [x y z]) (defprotocol A (area [s])) (defprotocol A (area [s])) [(pr-str old) (pr-str (->P 1 2 3)) (= old (map->P {:x 1 :y \"a\"}))]", "[#user.P{:x 1, :y \"a\"} #user.P{:x 1, :y 2, :z 3} false]");
 }
 
 test "integration: flatten and compare of data nested past the stack are :stack-overflow" {
@@ -1506,6 +1593,80 @@ test "integration: defmacro — user macro shadows host macro" {
     , ":user-when");
 }
 
+test "defmacro: a macro call nested in calls and host macros expands exactly once" {
+    try expectOutput(
+        \\(def counter (atom 0))
+        \\(defmacro m [] (swap! counter inc) 1)
+        \\(+ 1 (+ 1 (+ 1 (m))))
+        \\(defn g [y] (let [z (m)] (when true (-> y (+ z) (if (m) 0)))))
+        \\@counter
+    , "3");
+}
+
+test "macroexpand: the depth limit counts expansions in a row, not nesting" {
+    // 300 nested `let`s: each is one expansion at its own position.
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    for (0..300) |_| try src.appendSlice(testing.allocator, "(let [a 1] ");
+    try src.appendSlice(testing.allocator, "a");
+    for (0..300) |_| try src.append(testing.allocator, ')');
+    try expectOutput(src.items, "1");
+    // A macro whose expansion is itself, forever, still trips it.
+    try expectProgramError("(defmacro forever [] `(forever)) (forever)", compile.CompileError.MacroDepthExceeded);
+}
+
+/// Run `setup`, then expand `src` as the compiler would and expect
+/// the expansion to fail with `message` recorded against the source
+/// text `at` (MACROEXPAND.md §8).
+fn expectMacroFailure(setup: []const u8, src: []const u8, message: []const u8, at: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run(setup);
+    var arena = std.heap.ArenaAllocator.init(program.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parsed = try reader_mod.parser.parseForm(a, src);
+    defer parsed.parser.deinit();
+    var rdr = reader_mod.Reader.init(a, src);
+    defer rdr.deinit();
+    const form = try rdr.readOneForm(parsed.sexp);
+    var ctx = expand_mod.ExpandContext{
+        .allocator = a,
+        .interner = program.interner,
+        .host_macros = &program.host_macros,
+        .namespace = program.registry.current,
+        .registry = program.registry,
+        .value_heap = program.v.ensureHeap(),
+    };
+    try testing.expectError(error.MalformedMacroCall, expand_mod.expandForm(&ctx, null, form));
+    const failure = ctx.failure orelse return error.TestExpectedFailure;
+    try testing.expectEqualStrings(message, failure.message);
+    try testing.expectEqualStrings(at, src[failure.span.pos..][0..failure.span.len]);
+}
+
+test "defmacro: a failing macro call names the macro and the cause, at the call" {
+    try expectMacroFailure("(defmacro m [] (throw (ex-info \"bad macro input\" {:x 1})))", "(do 1 (m))", "macro m threw bad macro input", "(m)");
+    try expectMacroFailure("(defmacro m [] (throw :nope))", "(when true (m))", "macro m threw :nope", "(m)");
+    try expectMacroFailure("(defmacro m [a] a)", "(do (m))", "macro m takes 1 argument, got 0", "(m)");
+    try expectMacroFailure("(defmacro m [a b & c] a)", "(m 1)", "macro m takes 2 or more arguments, got 1", "(m 1)");
+    try expectMacroFailure("(defmacro m [] (first 1))", "(m)", "macro m failed: KindMismatch", "(m)");
+    try expectMacroFailure("(defn g [x] x) (defmacro m [] (g))", "(m)", "macro m failed: ArityMismatch: g takes 1 argument, got 0", "(m)");
+    try expectMacroFailure("(defmacro m [] (fn [] 1))", "(m)", "a macro returned a function, which is not a form", "(m)");
+    try expectMacroFailure("(defmacro m [a] a)", "(m (+ 1 `x))", "a syntax-quote is not data a macro can take", "`x");
+}
+
+test "defmacro: parameters destructure and overload clauses dispatch, as for defn" {
+    try expectOutputProgram("(defmacro m [[a b] & body] `(+ ~a ~b ~@body)) (m [1 2] 3)", "6");
+    try expectOutputProgram("(defmacro m ([x] x) ([x y] `(+ ~x ~y))) [(m 1) (m 1 2)]", "[1 3]");
+    try expectOutputProgram("(defmacro m [{:keys [k] :or {k 9}}] k) [(m {:k 5}) (m {})]", "[5 9]");
+    try expectOutputProgram(
+        \\(defmacro with-x [[sym init] & body] `(let [~sym ~init] ~@body))
+        \\(with-x [y 4] (* y y))
+    , "16");
+    try expectOutputProgram("(defmacro m \"doc\" {:added \"1\"} [x] x) [(m 1) (select-keys (meta (var m)) [:doc :added :arglists])]", "[1 {:doc doc, :added 1, :arglists ([x])}]");
+}
+
 test "integration: defmacro — macro can use already-defined macros in body" {
     // twice's body uses unless (a macro defined above it);
     // when outer is invoked, the macro fn body is already
@@ -1617,6 +1778,14 @@ test "integration: anon-fn — %1 %2 explicit" {
 
 test "integration: anon-fn — closure captures outer binding" {
     try expectOutput("((fn* [x] (#(+ % x) 3)) 10)", "13");
+}
+
+test "anon-fn: % is found inside maps, sets, nested vectors and @" {
+    try expectOutput("(#(do {:a %}) 1)", "{:a 1}");
+    try expectOutput("(#(do #{%}) 1)", "#{1}");
+    try expectOutput("(#(vector [%1 {:k %2}]) 1 2)", "[[1 {:k 2}]]");
+    try expectOutput("(#(inc @%) (atom 1))", "2");
+    try expectOutput("(#(do {% %2}) :k :v)", "{:k :v}");
 }
 
 test "integration: anon-fn — macro inside body re-expands" {
@@ -2048,6 +2217,19 @@ test "storage failures surface as :db/<reason> keywords inside try" {
     , "[:db/key-too-large :db/key-too-large :db/open-failed]");
 }
 
+test "a value nested past the codec's max depth is refused with a catchable error; max depth round-trips" {
+    // CODEC.md §2.7: max_depth is 4096.
+    try expectOutputProgramWithStore("seam-deep",
+        \\(do
+        \\  (def conn (db/open "@STORE@"))
+        \\  (defn nest [n] (loop [i 0 acc nil] (if (< i n) (recur (inc i) [acc]) acc)))
+        \\  [(try (do (db/put-key! (db/ref conn :t :deep) (nest 4097)) :stored)
+        \\        (catch any e (keyword? e)))
+        \\   (do (db/put-key! (db/ref conn :t :ok) (nest 4096))
+        \\       (= (nest 4096) (db/get-key (db/ref conn :t :ok))))])
+    , "[true true]");
+}
+
 test "the VM keeps running after a caught storage failure" {
     try expectOutputProgramWithStore("seam-errors-resume",
         \\(do
@@ -2177,8 +2359,8 @@ test "db/scan and db/reduce-tree read a value that spans several overflow pages"
 test "nexis.string: qualified-only (not auto-referred)" {
     // Bare `(lower-case ...)` from user namespace must NOT
     // resolve to nexis.string/lower-case. Short names reach it
-    // only through `(require ... :as ...)`; `:refer` is unsupported,
-    // so qualified calls are the only other path.
+    // only through `(require ...)` with `:refer` or `:as`, or a
+    // qualified call.
     try expectOutput("(try (lower-case \"HI\") (catch any e e))", ":unbound-var");
     try expectOutput("(nexis.string/lower-case \"HI\")", "hi");
 }
@@ -2532,52 +2714,54 @@ test "condp: pred + expr each evaluated EXACTLY ONCE" {
 // ---- for -----------------------------------------------------
 
 test "for: single binding maps over the source" {
-    try expectOutput("(for [x [1 2 3]] (* x x))", "[1 4 9]");
-    try expectOutput("(for [x []] (* x x))", "[]");
-    try expectOutput("(for [x [42]] x)", "[42]");
+    try expectOutput("(for [x [1 2 3]] (* x x))", "(1 4 9)");
+    try expectOutput("(for [x []] (* x x))", "()");
+    try expectOutput("(for [x [42]] x)", "(42)");
+    // A seq, as in Clojure: conj prepends.
+    try expectOutput("(let [xs (for [x [1 2]] x)] [(seq? xs) (vector? xs) (conj xs 0)])", "[true false (0 1 2)]");
 }
 
 test "for: multi-binding cartesian product" {
     // Cartesian order: outermost iterates first, innermost
     // varies fastest.
-    try expectOutput("(for [x [1 2] y [10 20]] (+ x y))", "[11 21 12 22]");
+    try expectOutput("(for [x [1 2] y [10 20]] (+ x y))", "(11 21 12 22)");
     try expectOutput(
         \\(for [x [:a :b] y [1 2 3]] [x y])
-    , "[[:a 1] [:a 2] [:a 3] [:b 1] [:b 2] [:b 3]]");
+    , "([:a 1] [:a 2] [:a 3] [:b 1] [:b 2] [:b 3])");
 }
 
 test "for: :when filter" {
     // `<` is in core (not `>`); use `<` consistently in tests.
-    try expectOutput("(for [x [1 2 3 4 5] :when (< 0 x)] x)", "[1 2 3 4 5]");
-    try expectOutput("(for [x [1 2 3 4 5] :when (< 2 x)] x)", "[3 4 5]");
-    try expectOutput("(for [x [1 2 3] :when (< 99 x)] x)", "[]");
+    try expectOutput("(for [x [1 2 3 4 5] :when (< 0 x)] x)", "(1 2 3 4 5)");
+    try expectOutput("(for [x [1 2 3 4 5] :when (< 2 x)] x)", "(3 4 5)");
+    try expectOutput("(for [x [1 2 3] :when (< 99 x)] x)", "()");
 }
 
 test "for: :let modifier with destructuring-capable bindings" {
     // `:let` uses `let` (NOT `let*`) so destructuring works.
-    try expectOutput("(for [x [1 2 3] :let [y (* x 10)]] y)", "[10 20 30]");
+    try expectOutput("(for [x [1 2 3] :let [y (* x 10)]] y)", "(10 20 30)");
     // Compose :let + :when (order matters; let-bound name
     // visible to the when's predicate).
     try expectOutput(
         \\(for [x [1 2 3 4] :let [y (* x 10)] :when (< 15 y)] y)
-    , "[20 30 40]");
+    , "(20 30 40)");
     // Destructuring: bind a vector to [a b].
     try expectOutput(
         \\(for [pair [[1 :a] [2 :b]] :let [[n k] pair]] [k n])
-    , "[[:a 1] [:b 2]]");
+    , "([:a 1] [:b 2])");
 }
 
 test "for: :while ends its loop, patterns destructure, modifiers compose" {
-    try expectOutput("(for [x [1 2 3] :while (< x 3)] x)", "[1 2]");
-    try expectOutput("(for [x [1 2] y [3 4] :while (< y 4)] [x y])", "[[1 3] [2 3]]");
-    try expectOutput("(for [x [1 2] :while (< x 2) y [1 2]] [x y])", "[[1 1] [1 2]]");
-    try expectOutput("(for [x [1 2 3] :let [y (* x 10)] :when (< 10 y)] y)", "[20 30]");
-    try expectOutput("(for [x (range 5) :while (< x 3) :when (odd? x)] x)", "[1]");
-    try expectOutput("(for [x (range 10) :when (odd? x) :while (< x 6) :let [y (* x x)]] y)", "[1 9 25]");
-    try expectOutput("(for [[a b] [[1 2] [3 4]]] (+ a b))", "[3 7]");
-    try expectOutput("(for [[k v] {:a 1}] [v k])", "[[1 :a]]");
-    try expectOutput("(for [{:keys [n]} [{:n 1} {:n 2}]] n)", "[1 2]");
-    try expectOutput("(for [x nil] x)", "[]");
+    try expectOutput("(for [x [1 2 3] :while (< x 3)] x)", "(1 2)");
+    try expectOutput("(for [x [1 2] y [3 4] :while (< y 4)] [x y])", "([1 3] [2 3])");
+    try expectOutput("(for [x [1 2] :while (< x 2) y [1 2]] [x y])", "([1 1] [1 2])");
+    try expectOutput("(for [x [1 2 3] :let [y (* x 10)] :when (< 10 y)] y)", "(20 30)");
+    try expectOutput("(for [x (range 5) :while (< x 3) :when (odd? x)] x)", "(1)");
+    try expectOutput("(for [x (range 10) :when (odd? x) :while (< x 6) :let [y (* x x)]] y)", "(1 9 25)");
+    try expectOutput("(for [[a b] [[1 2] [3 4]]] (+ a b))", "(3 7)");
+    try expectOutput("(for [[k v] {:a 1}] [v k])", "([1 :a])");
+    try expectOutput("(for [{:keys [n]} [{:n 1} {:n 2}]] n)", "(1 2)");
+    try expectOutput("(for [x nil] x)", "()");
     try expectProgramError("(for [:when true x [1]] x)", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(for [x [1] :reduce +] x)", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(for [x] x)", compile.CompileError.MacroExpansionFailure);
@@ -2703,6 +2887,33 @@ test "defrecord: keys + vals walk the field map" {
         \\  (defrecord Counter [n])
         \\  (count (vals (->Counter 5))))
     , "1");
+}
+
+test "defrecord: inline methods see the fields as locals; parameters shadow them" {
+    try expectOutputProgram(
+        \\(defprotocol Shape (area [s]) (scaled [s k]))
+        \\(defrecord Rect [w h] Shape (area [_] (* w h)) (scaled [this w] (* w h)))
+        \\[(area (->Rect 2 3)) (scaled (->Rect 2 3) 10)]
+    , "[6 30]");
+    // A field assoc'd onto the record is what the method sees.
+    try expectOutputProgram(
+        \\(defprotocol P (x-of [p]))
+        \\(defrecord Pt [x] P (x-of [p] x))
+        \\(x-of (assoc (->Pt 1) :x 5))
+    , "5");
+    try expectOutputProgram(
+        \\(defprotocol P (sum [p]))
+        \\(defrecord Pair [a b] P (sum [{:keys [a]}] (+ a b)))
+        \\(sum (->Pair 1 2))
+    , "3");
+}
+
+test "defprotocol: a docstring and options before the methods" {
+    try expectOutputProgram(
+        \\(defprotocol Named "Things with names." :extend-via-metadata true (nm [x] "The name."))
+        \\(extend-type :string Named (nm [s] (str "s:" s)))
+        \\(nm "a")
+    , "s:a");
 }
 
 // =============================================================================
@@ -3903,7 +4114,7 @@ test "unresolved symbols: forward references across a file keep working" {
     try expectCheckedOutput("(let [{k :k} {:k 5} [p q] [1 2]] (+ k p q))", "8");
     try expectCheckedOutput("(letfn [(ev? [n] (if (zero? n) true (od? (dec n)))) (od? [n] (if (zero? n) false (ev? (dec n))))] (ev? 4))", "true");
     try expectCheckedOutput("(try (throw :x) (catch any e (str e)))", ":x");
-    try expectCheckedOutput("(for [x [1 2] y [10 20]] (+ x y))", "[11 21 12 22]");
+    try expectCheckedOutput("(for [x [1 2] y [10 20]] (+ x y))", "(11 21 12 22)");
     try expectCheckedOutput("(def acc (atom [])) (doseq [x [1 2]] (swap! acc conj x)) @acc", "[1 2]");
     try expectCheckedOutput("(ns other) (defn f [] (g)) (defn g [] :other) (f)", ":other");
 }
@@ -4577,6 +4788,9 @@ const RequireDir = struct {
             program.registry,
             &program.host_macros,
         );
+        // The namespaces the program installed have no file.
+        var names = program.registry.map.keyIterator();
+        while (names.next()) |name| try self.loader.markLoaded(name.*);
         program.hooks.load_callback = self.callback();
     }
 
@@ -4608,6 +4822,111 @@ const RequireDir = struct {
         });
     }
 };
+
+/// Run every top-level form of `src`, as `nexis run` does, with a
+/// loader over `files` as each form's load callback, and compare the
+/// last form's printed value with `expected`.
+fn expectOutputWithFiles(files: []const [2][]const u8, src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var dir: RequireDir = undefined;
+    try dir.init(&program, files);
+    defer dir.deinit();
+    var parsed = try reader_mod.parser.parseProgram(testing.allocator, src);
+    defer parsed.parser.deinit();
+    var rdr = reader_mod.Reader.init(testing.allocator, src);
+    defer rdr.deinit();
+    var last = value_mod.nilValue();
+    for (try rdr.readProgram(parsed.sexp)) |form| {
+        const compiled = try compile.compileFormWith(program.arena.allocator(), form, .{
+            .namespace = program.registry.current,
+            .interner = program.interner,
+            .host_macros = &program.host_macros,
+            .persistent_allocator = program.v.runtime_arena.allocator(),
+            .registry = program.registry,
+            .load_callback = dir.callback(),
+        });
+        const routine = compiled.toRoutine("test-form");
+        try program.v.retargetTop(&routine);
+        last = try program.v.run();
+    }
+    try harness.expectResult(&program, src, last, expected);
+}
+
+const utilns = [2][]const u8{ "util.nx", "(ns util)\n(defn twice [x] (* 2 x))\n(def ^:private secret 1)\n(defn half [x] (quot x 2))\n" };
+
+test "ns and require: :require clauses, :as, :refer, :refer :all, :rename, flags" {
+    try expectOutputWithFiles(&.{utilns},
+        \\(ns my.app "An app." {:author "me"}
+        \\  (:refer-clojure :exclude [replace])
+        \\  (:require [util :as u :refer [twice]]
+        \\            [nexis.string :refer [upper-case join] :rename {join j}])
+        \\  (:gen-class))
+        \\(def here 1)
+        \\[(u/half 8) (twice 2) (upper-case "a") (j "-" [1 2]) my.app/here]
+    , "[4 4 A 1-2 1]");
+    try expectOutputWithFiles(&.{utilns}, "(require '[util :refer :all] :reload) [(twice 1) (half 4)]", "[2 2]");
+    // :refer :all skips private Vars.
+    try expectOutputWithFiles(&.{utilns}, "(require '[util :refer :all]) (try (eval 'secret) (catch any e :unresolved))", ":unresolved");
+    try expectOutputWithFiles(&.{utilns}, "(require '[util :as-alias ua]) (require 'util) (ua/twice 3)", "6");
+}
+
+test "require: Clojure's library namespaces name nexis's" {
+    try expectOutputWithFiles(&.{},
+        \\(ns t (:require [clojure.string :as str :refer [trim]] clojure.test))
+        \\[(str/upper-case "a") (trim " x ") (clojure.string/lower-case "B") (fn? clojure.test/is)]
+    , "[A x b true]");
+}
+
+/// Run `setup`, then expand `src` with the loader over `files` and
+/// expect a failure recorded with `message` against the source text
+/// `at`.
+fn expectRequireFailure(files: []const [2][]const u8, setup: []const u8, src: []const u8, message: []const u8, at: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run(setup);
+    var dir: RequireDir = undefined;
+    try dir.init(&program, files);
+    defer dir.deinit();
+    var arena = std.heap.ArenaAllocator.init(program.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parsed = try reader_mod.parser.parseProgram(a, src);
+    defer parsed.parser.deinit();
+    var rdr = reader_mod.Reader.init(a, src);
+    defer rdr.deinit();
+    const forms = try rdr.readProgram(parsed.sexp);
+    var failure: ?expand_mod.Failure = null;
+    for (forms) |form| {
+        var ctx = expand_mod.ExpandContext{
+            .allocator = a,
+            .interner = program.interner,
+            .host_macros = &program.host_macros,
+            .namespace = program.registry.current,
+            .registry = program.registry,
+            .load_callback = dir.callback(),
+            .value_heap = program.v.ensureHeap(),
+        };
+        _ = expand_mod.expandForm(&ctx, null, form) catch {
+            failure = ctx.failure;
+            break;
+        };
+    }
+    const f = failure orelse return error.TestExpectedFailure;
+    try testing.expectEqualStrings(message, f.message);
+    try testing.expectEqualStrings(at, src[f.span.pos..][0..f.span.len]);
+}
+
+test "ns and require: a bad spec or a missing namespace or Var is reported by name" {
+    try expectRequireFailure(&.{}, "", "(require '[nope.ns :as n])", "require: nope.ns did not load", "nope.ns");
+    try expectRequireFailure(&.{utilns}, "", "(require '[util :refer [nope]])", "require: util/nope does not exist", "nope");
+    try expectRequireFailure(&.{utilns}, "", "(require '[util :only [twice]])", "require: unknown option only", ":only");
+    try expectRequireFailure(&.{}, "", "(ns x (:import java.util.Date))", "ns: (:import ...) is not supported", "(:import java.util.Date)");
+    try expectRequireFailure(&.{utilns}, "(defn twice [] 0)", "(require '[util :refer [twice]])", "require: twice is already defined in user", "twice");
+    try expectRequireFailure(&.{utilns}, "", "(require '[util :refer [twice]]) (def twice 0)", "def: twice already refers to a Var of another namespace", "twice");
+}
 
 const throwsns = [2][]const u8{ "throwsns.nx", "(ns throwsns)\n(throw :boom)\n" };
 const badns = [2][]const u8{ "badns.nx", "(ns badns)\n(defn f [] (/ 1 0))\n(f)\n" };

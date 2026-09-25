@@ -45,7 +45,6 @@ between the two is explicit (`i64-vector` / `f64-vector` one way,
   parse error at the `#`.
 - Metadata: `with-meta` on a typed vector is `:no-metadata-on-immediate`
   (SEMANTICS §7).
-- A cached hash: `hashHeader` walks the elements on every call.
 - Metal or other off-CPU dispatch (PLAN §19.5).
 
 ---
@@ -104,7 +103,11 @@ The hash is an ordered combine (`hash.ordered_init`,
 element type tag followed by every element, `hash.hashI64` for `i64`
 and `hash.hashFloat` for `f64` (which folds signed zero), so
 `(= a b) ⇒ (= (hash a) (hash b))` holds by construction.
-`dispatch.hashValue` applies `mixKindDomain(base, 23)` on top.
+`dispatch.hashValue` applies `mixKindDomain(base, 23)` on top. The
+first `hashHeader` call caches the base in the header's hash slot at
+u32 precision (a computed zero is not cached, HEAP.md), as maps and
+strings do; a typed vector never changes, so later calls read it
+back instead of walking the elements.
 
 ---
 

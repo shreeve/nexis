@@ -40,8 +40,8 @@ synchronization primitives.
 - `swap!`/`swap-vals!` rollback-on-throw: if the user fn throws or
   control-transfers, the atom is NOT mutated. Proved by the order of
   operations (read → call → write) plus a `defer` on `in_flight`.
-- Printable representation: `#<atom 0x…>` (pointer identity, NOT the
-  contained value — avoids self-reference infinite loops).
+- Printable representation: `#<atom>` (NOT the contained value —
+  avoids self-reference infinite loops).
 
 **Absent:**
 - Validators (`:validator`), watches (`add-watch` / `remove-watch`),
@@ -62,7 +62,7 @@ synchronization primitives.
 atom = 34,    // in-memory mutable
               // cell. Payload is *HeapHeader → AtomBox in heap body.
 
-// src/atom.zig (new module):
+// src/atom.zig:
 pub const AtomBox = extern struct {
     value: Value,        // 16 bytes; current contained Value
     in_flight: u8,       // 0 or 1; re-entrancy guard
@@ -84,17 +84,13 @@ pub fn make(heap: *Heap, init: Value) !Value {
 }
 ```
 
-The header carries the standard mark bit, flags, cached hash slot, and
-optional meta pointer. `flag_has_meta` is unused for atoms (no
-`:meta` opt).
+The header carries the standard mark bit, flags, hash slot, and
+optional meta pointer; an atom uses neither the hash slot (its hash is
+its pointer, §3) nor `flag_has_meta` (no `:meta` opt).
 
 Atoms are heap kinds in the standard sense — they live on the live
 list owned by `Heap`, participate in mark-sweep, and are reclaimed in
-sweep when unreachable. They are NOT runtime-arena-staged like the
-raw-pointer-in-payload Closure/UpvalCell/Var bodies; those staged
-encodings predate the GC migration and will move to standard heap
-form later. New kinds (this one included) use the standard form
-directly.
+sweep when unreachable.
 
 ---
 
@@ -113,50 +109,12 @@ matches the runtime invariant that mutable identity values must NOT
 participate in structural equality (otherwise a value being a key in a
 map could become unequal to itself after a mutation — disaster).
 
-```zig
-// src/atom.zig:
-pub fn atomsEqual(a: *HeapHeader, b: *HeapHeader) bool {
-    return a == b;
-}
-```
-
-`dispatch.equal` adds an arm for `.atom` that delegates to
-`atom.atomsEqual`.
-
-**Hash is pointer-identity, kind-domain-mixed.** The hash domain byte
-is `@intFromEnum(Kind.atom) = 34`, placed via
-`hash.mixKindDomain(..., 34)` exactly as `durable_ref` (domain 26),
-`native_fn`, etc. do. This keeps atoms in their own hash domain
-distinct from the sequential/associative/set shared domains
-(SEMANTICS.md §3.2), so an atom and a `durable_ref` whose body bytes
-happened to hash-collide remain hash-distinct.
-
-```zig
-pub fn hashHeader(h: *HeapHeader) u32 {
-    if (h.cachedHash()) |cached| return cached;
-    var hasher = std.hash.XxHash3.init(hash_mod.seed);
-    const ptr_bytes = std.mem.toBytes(@intFromPtr(h));
-    hasher.update(&ptr_bytes);
-    const truncated: u32 = @truncate(hasher.final());
-    if (truncated != 0) h.setCachedHash(truncated);
-    return truncated;
-}
-```
-
-Caching the pointer-hash is safe BECAUSE the pointer itself never
-changes for the lifetime of the atom. Only the contained `value` can
-change; pointer-hash is invariant under value mutation. (A moving
-collector would require the atom hash to migrate to a stable
-object-identity instead of raw `@intFromPtr`; the collector is
-non-moving, `docs/GC.md`.)
-
-**`dispatch.eqCategory` mapping:**
-
-```zig
-.{ .kind = .atom, .cat = .kind_local, .domain = 34 },
-```
-
-Same shape as `durable_ref` and the other identity-valued kinds.
+An atom is an **identity kind** (`dispatch.isIdentityKind`,
+SEMANTICS.md §2.6): `dispatch.equal` answers true only for the same
+atom, and `dispatch.hashValue` hashes the pointer, mixed with the atom
+kind byte (34). The pointer never changes for the atom's lifetime (the
+collector is non-moving, `docs/GC.md`), so the hash is invariant under
+value mutation and needs no cache.
 
 ---
 
@@ -171,8 +129,8 @@ Single-arity only. Any extra args throw `:unsupported-arg`
 (validators, watches and meta keyword opts are absent; see §1).
 
 ```clojure
-(atom 0)              ; => #<atom 0x...>
-(atom :keyword-init)  ; => #<atom 0x...>
+(atom 0)              ; => #<atom>
+(atom :keyword-init)  ; => #<atom>
 (atom)                ; throws :unsupported-arg (arity)
 (atom 1 :meta {})     ; throws :unsupported-arg (no keyword opts)
 ```
@@ -286,15 +244,15 @@ Identity-based check-and-set. Returns `true` if the swap happened,
 
 ```zig
 if (body.in_flight == 1) return VmError.AtomReEntry;
-if (identicalImmediate(body.value, old)) {
+if (body.value.identicalTo(old)) {
     body.value = new;
     return value_mod.fromBool(true);
 }
 return value_mod.fromBool(false);
 ```
 
-The comparison uses `identical?` semantics (`eq.identicalImmediate`-
-shaped: bit-equality for immediates, pointer-equality for heap kinds),
+The comparison uses `identical?` semantics (`Value.identicalTo`:
+bit-equality for immediates, pointer-equality for heap kinds),
 NOT `=` (structural). This matches Clojure's
 documented "identical to oldval" CAS contract and avoids the surprise
 of value-equal-but-distinct collections matching by accident.
@@ -317,9 +275,9 @@ fn, `fnDbDeref`:
    resolve to the same call.
 2. The `.atom` arm of the `fnDbDeref` switch:
    ```zig
-   .atom => atom.deref(x),
+   .atom => atom_mod.getValue(x),
    ```
-   where `atom.deref(v: Value) Value` returns `Heap.bodyOf(AtomBox, h).value`.
+   where `getValue` returns `Heap.bodyOf(AtomBox, h).value`.
 3. The `@x` reader-macro lowering in `expand.zig` is `@x → (db/deref x)`,
    which dispatches over atoms through the same switch.
 
@@ -329,7 +287,7 @@ The `fnDbDeref` switch:
 return switch (x.kind()) {
     .durable_ref => /* existing arm: ephemeral read tx */,
     .var_        => /* existing arm: Var.root, throws :unbound-var */,
-    .atom        => atom.deref(x),
+    .atom        => atom_mod.getValue(x),
     else         => VmError.NotDerefable,
 };
 ```
@@ -342,13 +300,8 @@ Atoms are NOT serializable. Per `PLAN.md` §23 #25, the codec's
 serializable set is fixed; atoms are NOT in it (they join functions,
 Vars, transients, tx handles, error traces).
 
-`codec.encodeValue` adds an `.atom` arm that returns
-`error.Unserializable`. Nested atoms inside maps/vectors propagate the
-same error (existing recursive encoder behavior).
-
-```zig
-.atom => return error.Unserializable,
-```
+The encoder returns `error.UnserializableKind` for an atom, nested or
+not (`docs/CODEC.md` §3).
 
 User-facing surface: any `db/put!` of a value containing an atom
 throws `:unserializable`. Test pins this for direct (`(db/put! tx ref
@@ -361,8 +314,8 @@ throws `:unserializable`. Test pins this for direct (`(db/put! tx ref
 ```zig
 // src/atom.zig:
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    const body = Heap.bodyOfConst(AtomBox, h);
-    visitor.visit(body.value);
+    const body = Heap.bodyOf(AtomBox, h);
+    visitor.markValue(body.value);
 }
 ```
 
@@ -390,11 +343,10 @@ required.
 
 ### 8. Printing
 
-The `formatValue` helper in `cli.zig` adds an `.atom` arm. Output is
-opaque:
+`src/format.zig` prints an atom opaquely, in both modes:
 
 ```text
-#<atom 0x7f8a1c00a000>
+#<atom>
 ```
 
 Does NOT recurse into the contained value. Reason: an atom holding
@@ -403,9 +355,8 @@ opaque form sidesteps the issue and matches Clojure's
 `#object[clojure.lang.Atom 0x... {:status :ready, :val ...}]`-shape
 (though shorter).
 
-A future REPL command like `(pprint @a)` or `(println @a)` will format
-the contained value via the normal recursive printer, since `@a` ≡
-`(deref a)` evaluates to the contained value before printing.
+`(println @a)` prints the contained value through the normal
+recursive printer, since `@a` ≡ `(deref a)` evaluates to it first.
 
 ---
 

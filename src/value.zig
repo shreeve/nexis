@@ -52,13 +52,17 @@ pub const Kind = enum(u8) {
     persistent_set = 19,
     persistent_vector = 20,
     list = 21,
+    /// Reserved: never constructed. 22, 28 and 29 stay out of use
+    /// because kind bytes are the codec's wire tags (CODEC.md §9).
     byte_vector = 22,
     typed_vector = 23,
     function = 24,
     var_ = 25,
     durable_ref = 26,
     transient = 27,
+    /// Reserved: never constructed.
     error_ = 28,
+    /// Reserved: never constructed.
     meta_symbol = 29,
     /// Host-Zig function exposed as a first-class Value. Payload is a pointer to a STATIC
     /// `NativeFn` descriptor (no heap allocation per fn).
@@ -122,7 +126,6 @@ pub const Kind = enum(u8) {
 
     // ---- Runtime-private sentinels (never escape public API) ----
     unbound = 64,
-    undef = 65,
     /// Lazy boxing: a slot's stored Value is the `*HeapHeader` of an
     /// upvalue cell block (a heap block of this kind whose body is
     /// `vm.UpvalCell`) rather than an ordinary user value. Set by
@@ -148,29 +151,7 @@ pub const Kind = enum(u8) {
         const n: u8 = @intFromEnum(k);
         return n >= 16 and n < 64;
     }
-
-    /// Private runtime sentinel — must never appear in a user-visible
-    /// value position. Hitting this in `=` / `hash` is a runtime bug.
-    pub inline fn isSentinel(k: Kind) bool {
-        const n: u8 = @intFromEnum(k);
-        return n >= 64;
-    }
 };
-
-// =============================================================================
-// Flag bits (tag[8..15])
-// =============================================================================
-
-pub const flag_has_meta: u8 = 1 << 0;
-pub const flag_hash_cached: u8 = 1 << 1;
-pub const flag_durable: u8 = 1 << 2;
-// Bits 3..7 reserved.
-//
-// There is no `flag_interned`: the information is already carried by
-// `kind == .keyword or kind == .symbol` (plus the reserved `meta_symbol`
-// heap kind). A redundant flag creates a perpetual
-// consistency invariant to maintain for no measurable speedup. Add it
-// back only when a concrete hot path demonstrates it pays rent.
 
 // =============================================================================
 // Fixnum range constants (i48)
@@ -205,16 +186,8 @@ pub const Value = extern struct {
         return @enumFromInt(@as(u8, @truncate(self.tag)));
     }
 
-    pub inline fn flags(self: Value) u8 {
-        return @truncate(self.tag >> 8);
-    }
-
     pub inline fn subkind(self: Value) u16 {
         return @truncate(self.tag >> 16);
-    }
-
-    pub inline fn aux(self: Value) u32 {
-        return @truncate(self.tag >> 32);
     }
 
     // ---- Predicates ----
@@ -249,10 +222,8 @@ pub const Value = extern struct {
     }
 
     pub inline fn isTruthy(self: Value) bool {
-        // Only `nil` and `false` are falsy (PLAN §23 #13). Implemented
-        // as a single equality check against a packed u16 of
-        // `{kind, flags_low}` — nil and false_ sit at kinds 0 and 1
-        // so we can check against their raw kind values cheaply.
+        // Only `nil` and `false` are falsy (PLAN §23 #13); they sit at
+        // kinds 0 and 1.
         const k = @intFromEnum(self.kind());
         return k != 0 and k != 1;
     }
@@ -309,6 +280,18 @@ pub const Value = extern struct {
         return self.tag == other.tag and self.payload == other.payload;
     }
 
+    /// `=` on two values that are not heap kinds (SEMANTICS §2). Bit
+    /// equality, except that `-0.0` and `+0.0` are equal; NaN is
+    /// canonical at construction, so it is equal to itself by bits.
+    /// Two kinds are never equal: `(= 1 1.0)` is false (PLAN §23 #11).
+    /// `dispatch.equal` is the entry point for any Value.
+    pub inline fn equalImmediate(self: Value, other: Value) bool {
+        std.debug.assert(!self.kind().isHeap() and !other.kind().isHeap());
+        if (self.tag != other.tag) return false;
+        return self.payload == other.payload or
+            (self.kind() == .float and self.asFloat() == other.asFloat());
+    }
+
     // ---- Hash (immediates only; heap kinds hash in dispatch.zig) ----
 
     /// Immediate-kind semantic hash. Collapses `-0.0 / +0.0`, treats
@@ -317,15 +300,10 @@ pub const Value = extern struct {
     /// `symbol(65)` vs `char(65)`) land in disjoint regions of the
     /// 64-bit hash space.
     ///
-    /// **Partial function — heap kinds panic.** The method name carries
-    /// the contract: "immediate" = "no heap allocation underneath."
-    /// Full hashing over any Value kind goes through
-    /// `dispatch.hashValue(v)`, which routes immediates here and heap
-    /// kinds through per-kind hashers. `value.zig` stays low-level and
-    /// does not import the heap-kind modules; placing the dispatcher
-    /// here would create a circular module graph that Zig's test
-    /// runner cannot resolve when any cycle member is used as a
-    /// test-binary root.
+    /// **Partial function — heap kinds and sentinels panic.** Full
+    /// hashing over any Value goes through `dispatch.hashValue(v)`,
+    /// which routes immediates here and heap kinds through the per-kind
+    /// hashers; `value.zig` stays below the heap-kind modules.
     pub fn hashImmediate(self: Value) u64 {
         const k = self.kind();
         const kind_byte: u8 = @intFromEnum(k);
@@ -381,8 +359,8 @@ pub fn fromChar(scalar: u21) ?Value {
     };
 }
 
-/// Out-of-i48-range inputs return null; callers route those through the
-/// bignum path when it lands.
+/// Out-of-i48-range inputs return null; callers that want promotion
+/// build a bignum instead (`bignum.fromI64`).
 pub fn fromFixnum(n: i64) ?Value {
     if (!isFixnumRange(n)) return null;
     return Value{
@@ -411,8 +389,8 @@ pub fn fromKeywordId(intern_id: u32) Value {
     };
 }
 
-/// Wrap an already-interned (non-metadata-bearing) symbol id.
-/// Metadata-bearing symbols use the reserved `meta_symbol` heap kind.
+/// Wrap an already-interned symbol id. Symbols carry no metadata
+/// (SEMANTICS §7).
 pub fn fromSymbolId(intern_id: u32) Value {
     return Value{
         .tag = @intFromEnum(Kind.symbol),
@@ -541,8 +519,8 @@ test "kind predicates cover the immediate family" {
     try std.testing.expect(!Kind.nil.isHeap());
     try std.testing.expect(Kind.string.isHeap());
     try std.testing.expect(!Kind.string.isImmediate());
-    try std.testing.expect(Kind.unbound.isSentinel());
     try std.testing.expect(!Kind.unbound.isImmediate());
+    try std.testing.expect(!Kind.unbound.isHeap());
 }
 
 test "identicalTo: bit-equality over the full Value" {
@@ -575,6 +553,43 @@ test "signed zero: identical? distinguishes, = folds, hash matches =" {
     // Representation preserved at storage time.
     try std.testing.expect(pos.payload != neg.payload);
     try std.testing.expect(!pos.identicalTo(neg));
-    // Equality folds (tested in eq.zig) — hash must agree with =.
+    try std.testing.expect(pos.equalImmediate(neg));
     try std.testing.expectEqual(pos.hashImmediate(), neg.hashImmediate());
+}
+
+/// One of each immediate kind, with the edge cases of `=`: both
+/// zeros, NaN, and a keyword and a symbol sharing an intern id.
+fn immediateSamples() [16]Value {
+    return .{
+        nilValue(),       fromBool(true),   fromBool(false),
+        fromChar('a').?,  fromChar('b').?,  fromFixnum(0).?,
+        fromFixnum(1).?,  fromFixnum(-1).?, fromFloat(0.0),
+        fromFloat(-0.0),  fromFloat(1.0),   fromFloat(std.math.nan(f64)),
+        fromKeywordId(1), fromKeywordId(2), fromSymbolId(1),
+        fromSymbolId(2),
+    };
+}
+
+test "equalImmediate is an equivalence, and equal values hash equal" {
+    const samples = immediateSamples();
+    for (samples) |a| {
+        try std.testing.expect(a.equalImmediate(a));
+        for (samples) |b| {
+            try std.testing.expectEqual(a.equalImmediate(b), b.equalImmediate(a));
+            if (a.equalImmediate(b)) try std.testing.expectEqual(a.hashImmediate(), b.hashImmediate());
+            for (samples) |c| {
+                if (a.equalImmediate(b) and b.equalImmediate(c)) try std.testing.expect(a.equalImmediate(c));
+            }
+        }
+    }
+}
+
+test "equalImmediate: no cross-kind equality, NaN reflexive, the zeros fold" {
+    try std.testing.expect(!fromFixnum(1).?.equalImmediate(fromFloat(1.0)));
+    try std.testing.expect(!fromKeywordId(7).equalImmediate(fromSymbolId(7)));
+    try std.testing.expect(!fromBool(false).equalImmediate(nilValue()));
+    try std.testing.expect(!fromChar(65).?.equalImmediate(fromFixnum(65).?));
+    try std.testing.expect(fromFloat(std.math.nan(f64)).equalImmediate(fromFloat(@bitCast(@as(u64, 0x7FFF_FFFF_FFFF_FFFF)))));
+    try std.testing.expect(fromFloat(-0.0).equalImmediate(fromFloat(0.0)));
+    try std.testing.expect(!fromFloat(1.0).equalImmediate(fromFloat(-1.0)));
 }

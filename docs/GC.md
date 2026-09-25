@@ -121,11 +121,10 @@ The interner holds no heap values (symbols and keywords are
 immediates), so `Interner.trace` is a no-op seam. Open `db` and
 `nextomic` connections hold no heap values; a `durable_ref`,
 `db_read_txn`, `nextomic_db` or `nextomic_entity` handle is reachable
-from wherever the program keeps it. The Nextomic query caches hold query values by
-heap identity and are emptied after every cycle instead of being
-rooted (`vm.nextomic_query_clear`; `docs/NEXTOMIC.md` §5); with a
-query in flight the clearing waits for it to return, because the
-query borrows its parsed IR from the cache.
+from wherever the program keeps it. The Nextomic query caches keep
+their query values reachable through the Vars
+`nexis.internal/#%query-cache` and `#%rules-cache`, which are roots
+like any Var (`docs/NEXTOMIC.md` §5).
 
 **The root stack.** A cycle can run inside any `VM.callValue`, so a
 native that holds a heap Value only in a Zig local across a call
@@ -601,11 +600,19 @@ each native follows, in order of what it is holding:
    `fnDbAlter`, `fnDbReduceTree`, `fnAlterMeta` and the Nextomic
    `with` native hold only this.
 3. **Callback results kept across further callbacks** — a
-   `RootScope` pushes each one: `mapInto` (`map`, `mapv`, `mapcat`,
-   `into` through it), `sieveInto` in `keep` mode, `indexedMap`,
+   `RootScope` pushes each one: `mapInto` (`map`, `mapv`, `mapcat`),
+   `sieveInto` in `keep` mode, `indexedMap`,
    `fnReductions`, `repeatInto` (`repeatedly`, `iterate`),
    `keyExtremum`, `sortImpl` when a key fn is given, and the
-   `nextomic/q` hook for every user-function result.
+   `nextomic/q` hook for every user-function result and every heap
+   value the query pipeline builds (a tuple or full-text result bound
+   as one value, an aggregate's vector or set).
+4. **Values a native builds and keeps across callbacks** — no
+   argument reaches them: a map entry `[k v]` or a boxed
+   typed-vector element an iterator produces. Natives walk such
+   receivers with `rootedSeqIter`, which roots each element it
+   builds (`filter`, `remove`, `filterv`, `take-while`,
+   `drop-while`, `reductions`, `sort`, `sort-by`).
 
 A new native that calls back into the VM states which class it is
 in next to its `callValue`.

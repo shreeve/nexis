@@ -1236,8 +1236,6 @@ pub const VmError = error{
     /// type name that already exists in the per-VM registry.
     /// Rejected to avoid the confusing-state hazard where
     /// existing instances reference a stale type_id.
-    /// Mapped to `:record-redefinition`.
-    RecordRedefinition,
     /// Record-introspection ops expected a record
     /// receiver but got something else. Mapped to `:not-a-record`.
     NotARecord,
@@ -1250,10 +1248,6 @@ pub const VmError = error{
     /// have a method with the given name. Mapped to
     /// `:no-protocol-method`.
     NoProtocolMethod,
-    /// `defprotocol` with a name that already
-    /// exists (same `(ns, name)`). Mapped to
-    /// `:protocol-redefinition`.
-    ProtocolRedefinition,
     /// Recursion ran out of room: a call would push frame number
     /// `VM.max_frames`, or a native re-entering the VM found the
     /// native stack below the guard's limit (§13.1). Mapped to
@@ -1461,12 +1455,8 @@ pub const VM = struct {
     /// The nextomic natives' per-VM state (parsed-query caches and
     /// finished `with` scopes), created on first use and destroyed at
     /// teardown through `nextomic_query_close`. The natives own the cast.
-    /// `nextomic_query_clear` empties the caches, which hold query
-    /// values by heap identity, after every collection
-    /// (docs/NEXTOMIC.md §5).
     nextomic_query_state: ?*anyopaque = null,
     nextomic_query_close: ?*const fn (*anyopaque) void = null,
-    nextomic_query_clear: ?*const fn (*anyopaque) void = null,
     /// Zig 0.16 `std.Io` handle for filesystem ops that live
     /// below the language surface —
     /// only `(db/open path)` uses it to auto-create the
@@ -1778,12 +1768,6 @@ pub const VM = struct {
         collector.host = .{ .ctx = @ptrCast(self), .roots = &gcRoots, .trace = &gcTrace };
         _ = collector.collect(&.{});
         self.gc_cycles += 1;
-        // The query caches hold query values by heap identity
-        // (docs/NEXTOMIC.md §5); a freed value's address may be
-        // reused, so the caches empty with every cycle.
-        if (self.nextomic_query_state) |state| {
-            if (self.nextomic_query_clear) |clear| clear(state);
-        }
         const by_growth = heap.live_bytes / 100 * self.gc_growth_percent;
         self.gc_next_at = @max(self.gc_threshold, by_growth);
     }
@@ -1895,25 +1879,18 @@ pub const VM = struct {
         }
     }
 
-    /// Register a new record type
-    /// in the per-VM record registry. Returns the dense `u32`
-    /// type_id, or `RecordRedefinition` if a record type with
-    /// the same `(ns, name)` already exists. Names are duped
-    /// into `self.allocator` for stable ownership across the VM
-    /// lifetime. PROTOCOLS.md §3.1.
+    /// Register a new record type in the per-VM record registry and
+    /// name it in the interner for printing. Returns the dense `u32`
+    /// type_id. Redefining `(ns, name)` registers a new type, as
+    /// Clojure's `defrecord` makes a new class: values built before
+    /// keep the old type. Names are duped into `self.allocator` for
+    /// the VM's lifetime. PROTOCOLS.md §3.1.
     pub fn registerRecordType(
         self: *VM,
         ns_name: []const u8,
         type_name: []const u8,
         field_names: []const []const u8,
     ) !u32 {
-        for (self.record_registry.items) |existing| {
-            if (std.mem.eql(u8, existing.ns_name, ns_name) and
-                std.mem.eql(u8, existing.type_name, type_name))
-            {
-                return error.RecordRedefinition;
-            }
-        }
         const new_id: u32 = @intCast(self.record_registry.items.len);
         const ns_dup = try self.allocator.dupe(u8, ns_name);
         errdefer self.allocator.free(ns_dup);
@@ -1936,6 +1913,7 @@ pub const VM = struct {
             .type_name = name_dup,
             .field_names = fields_dup,
         });
+        try self.ensureInterner().nameRecordType(new_id, ns_name, type_name);
         return new_id;
     }
 
@@ -1952,21 +1930,14 @@ pub const VM = struct {
     /// the per-VM protocol registry. Method-spec is a slice of
     /// (interned-method-name-id, method-name-string) pairs;
     /// extend-protocol fills `impls` later. Returns the dense
-    /// `u32` protocol id. Re-defining with the same `(ns, name)`
-    /// raises `ProtocolRedefinition`.
+    /// `u32` protocol id. Redefining `(ns, name)` registers a new
+    /// protocol with no impls, as Clojure's `defprotocol` does.
     pub fn registerProtocol(
         self: *VM,
         ns_name: []const u8,
         protocol_name: []const u8,
         method_specs: []const ProtocolMethodSpec,
     ) !u32 {
-        for (self.protocol_registry.items) |existing| {
-            if (std.mem.eql(u8, existing.ns_name, ns_name) and
-                std.mem.eql(u8, existing.name, protocol_name))
-            {
-                return error.ProtocolRedefinition;
-            }
-        }
         const new_id: u32 = @intCast(self.protocol_registry.items.len);
         const ns_dup = try self.allocator.dupe(u8, ns_name);
         errdefer self.allocator.free(ns_dup);
@@ -2171,22 +2142,36 @@ pub const VM = struct {
     /// check), a protocol fn (dispatched on `args[0]`), or a lookup
     /// (`callLookup`). Anything else is `NotCallable`.
     fn callDirect(self: *VM, callee: Value, args: []const Value) VmError!Value {
-        switch (callee.kind()) {
-            .native_fn => {
+        const overflows = dispatch_mod.overflowCount();
+        const result = switch (callee.kind()) {
+            .native_fn => blk: {
                 const native = asNativeFn(callee);
                 const max: ?usize = if (native.max_arity) |m| m else null;
                 if (args.len < native.min_arity or args.len > (max orelse args.len)) {
                     return self.arityError(native.name, native.min_arity, max, args.len);
                 }
-                return native.call(self, args);
+                break :blk try native.call(self, args);
             },
-            .protocol_fn => return self.dispatchProtocolMethod(callee, args),
-            else => {
+            .protocol_fn => try self.dispatchProtocolMethod(callee, args),
+            else => blk: {
                 if (!isLookupCallable(callee.kind())) {
                     return self.fail(VmError.NotCallable, "{s} is not callable", .{kindPhrase(callee.kind())});
                 }
-                return callLookup(callee, args);
+                break :blk try callLookup(callee, args);
             },
+        };
+        try self.checkDeepData(overflows);
+        return result;
+    }
+
+    /// `=`, `hash` and printing answer `false`, `0` or `#<too deep>`
+    /// past the stack guard and count an overflow (dispatch.zig);
+    /// a call or opcode that compared or hashed across one raises the
+    /// catchable `:stack-overflow` instead of returning that answer
+    /// (SEMANTICS §2.7).
+    fn checkDeepData(self: *VM, overflows_before: u64) VmError!void {
+        if (dispatch_mod.overflowCount() != overflows_before) {
+            return self.fail(VmError.StackOverflow, "a value nests too deeply to compare, hash or print", .{});
         }
     }
 
@@ -3236,6 +3221,7 @@ pub const VM = struct {
         const heap = self.ensureHeap();
         const hash = &dispatch_mod.hashValue;
         const eql = &dispatch_mod.equal;
+        const overflows = dispatch_mod.overflowCount();
         const result: Value = switch (variant) {
             .list => list_mod.fromSlice(heap, args) catch return VmError.OutOfMemory,
             .vector => vector_mod.fromSlice(heap, args) catch return VmError.OutOfMemory,
@@ -3262,6 +3248,7 @@ pub const VM = struct {
             },
             _ => return VmError.BytecodeCorruption,
         };
+        try self.checkDeepData(overflows);
         (try self.slotPtrIn(frame, inst.c.index)).* = result;
     }
 
@@ -3551,11 +3538,9 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.IoError => "io-error",
         VmError.FileNotFound => "file-not-found",
         VmError.InvalidPath => "invalid-path",
-        VmError.RecordRedefinition => "record-redefinition",
         VmError.NotARecord => "not-a-record",
         VmError.NoProtocolImpl => "no-protocol-impl",
         VmError.NoProtocolMethod => "no-protocol-method",
-        VmError.ProtocolRedefinition => "protocol-redefinition",
         VmError.StackOverflow => "stack-overflow",
         // Unrecoverable: bytecode corruption / VM-internal /
         // OOM / already-a-user-throw / unimplemented.

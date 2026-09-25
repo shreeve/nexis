@@ -264,7 +264,7 @@ const failures = [_]Failure{
     .{ .src = "(fn* [x x] x)", .err = error.DuplicateParam },
     .{ .src = "(fn* [a & a] a)", .err = error.DuplicateParam },
     .{ .src = "(letfn* [(f [] 1) (f [] 2)] (f))", .err = error.DuplicateBinding },
-    .{ .src = "(try 1 (catch Exception e e))", .err = error.MacroExpansionFailure },
+    .{ .src = "(try 1 (catch \"Exception\" e e))", .err = error.MacroExpansionFailure },
     .{ .src = "(when)", .err = error.MacroExpansionFailure },
     .{ .src = "(cond true)", .err = error.MacroExpansionFailure },
     .{ .src = "~x", .err = error.ReaderFailure },

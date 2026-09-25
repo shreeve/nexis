@@ -30,6 +30,7 @@ ok :default fills a missing attribute
 ok :default does not replace a present one
 ok (default attr v) is the same spec
 ok :as renames the key
+ok :as takes any value as the key
 {:db/id 4294967301, :pal [{:db/id 4294967296, :person/name Ann}]}
 ok the current view sees the update
 ok as-of before the update sees the old facts
