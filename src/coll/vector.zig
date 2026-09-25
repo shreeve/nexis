@@ -711,7 +711,11 @@ fn rangeVector(heap: *Heap, n: usize) !Value {
 }
 
 test "pop: the result has the shape fromSlice builds, at every trie boundary" {
-    var heap = Heap.init(testing.allocator);
+    // Tens of thousands of nodes: a leak still fails the test, but
+    // no stack trace is captured per allocation.
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    var heap = Heap.init(debug.allocator());
     defer heap.deinit();
     const sizes = [_]usize{ 1, 2, 32, 33, 34, 64, 65, 1056, 1057, 1058, 1088, 1089, 32768, 32769, 32800, 32801, 32802 };
     for (sizes) |n| {
@@ -724,7 +728,11 @@ test "pop: the result has the shape fromSlice builds, at every trie boundary" {
 }
 
 test "pop: from 1057 down to empty, one element at a time" {
-    var heap = Heap.init(testing.allocator);
+    // Tens of thousands of nodes: a leak still fails the test, but
+    // no stack trace is captured per allocation.
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    var heap = Heap.init(debug.allocator());
     defer heap.deinit();
     var v = try rangeVector(&heap, 1057);
     var n: usize = 1057;
@@ -736,7 +744,11 @@ test "pop: from 1057 down to empty, one element at a time" {
 }
 
 test "pop then conj: the trie regrows to the same shape" {
-    var heap = Heap.init(testing.allocator);
+    // Tens of thousands of nodes: a leak still fails the test, but
+    // no stack trace is captured per allocation.
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    var heap = Heap.init(debug.allocator());
     defer heap.deinit();
     for ([_]usize{ 33, 1057, 32801 }) |n| {
         const v = try rangeVector(&heap, n);
@@ -810,7 +822,11 @@ test "assoc: replaces one element in the tail or the trie and leaves the source 
 }
 
 test "fromSlice + nth: round-trip at large size 32768 (trie depth 2 full) and 32769" {
-    var heap = Heap.init(testing.allocator);
+    // Tens of thousands of nodes: a leak still fails the test, but
+    // no stack trace is captured per allocation.
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    var heap = Heap.init(debug.allocator());
     defer heap.deinit();
     const sizes = [_]usize{ 32768, 32769 };
     for (sizes) |n| {
@@ -1033,7 +1049,11 @@ test "conj across the shift-10 → shift-15 boundary (32768 … 32802)" {
     // a 32-element tail: 32800 in all. Count 32769 fills the trie
     // exactly; count 32801 grows the shift to 15 through `newPath`.
     // Each conj from 32766 on must land on the shape fromSlice builds.
-    var heap = Heap.init(testing.allocator);
+    // Tens of thousands of nodes: a leak still fails the test, but
+    // no stack trace is captured per allocation.
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    var heap = Heap.init(debug.allocator());
     defer heap.deinit();
     var v = try rangeVector(&heap, 32766);
     var n: usize = 32766;
@@ -1051,7 +1071,11 @@ test "conj across the shift-10 → shift-15 boundary (32768 … 32802)" {
 }
 
 test "fromSlice builds the shape a conj fold builds, at every size up to 1100" {
-    var heap = Heap.init(testing.allocator);
+    // Tens of thousands of nodes: a leak still fails the test, but
+    // no stack trace is captured per allocation.
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    var heap = Heap.init(debug.allocator());
     defer heap.deinit();
     var v = try empty(&heap);
     var n: usize = 0;
