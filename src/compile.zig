@@ -711,6 +711,9 @@ const Emitter = struct {
     span_table: std.ArrayList(vm.SpanEntry) = .empty,
     /// The source every span of this routine indexes into.
     source: ?*const vm.SourceInfo = null,
+    /// Receives the span of the innermost form being compiled when
+    /// an error is raised; nested routines share their parent's.
+    diag: ?*LowerDiag = null,
 
     fn init(allocator: std.mem.Allocator) Emitter {
         return .{ .allocator = allocator };
@@ -955,17 +958,18 @@ const Emitter = struct {
         try self.code.append(self.allocator, inst);
     }
 
-    /// Current PC = next instruction offset. Used as jump targets
-    /// for forward back-patching.
-    fn currentPc(self: *const Emitter) u12 {
+    /// The pc of the next instruction, as a jump operand: jump
+    /// targets are 12-bit indexes (VM.md §4), so a target past 4095
+    /// is `JumpTargetOutOfRange` at the form that needs the jump.
+    fn nextPc(self: *const Emitter) CompileError!u12 {
         const pc = self.code.items.len;
+        if (pc > std.math.maxInt(u12)) return CompileError.JumpTargetOutOfRange;
         return @intCast(pc);
     }
 
-    /// Patch a previously-emitted jump's target operand. The
-    /// caller must have remembered the jump's PC index.
-    fn patchJumpAt(self: *Emitter, jump_pc: usize, target_pc: u12) void {
-        vm.asm_.patchJumpTarget(&self.code.items[jump_pc], target_pc);
+    /// Point the jump emitted at `jump_pc` at the next instruction.
+    fn patchJumpHere(self: *Emitter, jump_pc: usize) CompileError!void {
+        vm.asm_.patchJumpTarget(&self.code.items[jump_pc], try self.nextPc());
     }
 
     /// Emit `jump:if-false A=PLACEHOLDER B=test`. Returns the PC
@@ -983,14 +987,6 @@ const Emitter = struct {
         const pc = self.code.items.len;
         try self.emit(vm.asm_.jumpJmp(0));
         return pc;
-    }
-
-    /// Range-check `target_pc` fits in the 12-bit operand and
-    /// return the typed value.
-    fn checkJumpTarget(self: *const Emitter, target_pc: usize) CompileError!u12 {
-        _ = self;
-        if (target_pc >= 4096) return CompileError.JumpTargetOutOfRange;
-        return @intCast(target_pc);
     }
 
     /// Convert the accumulated state into an owned `Compiled`.
@@ -1047,7 +1043,7 @@ pub fn compileTinyWithNamespace(
     form: *const Tiny,
     namespace: ?*vm.Namespace,
 ) CompileError!Compiled {
-    return compileTinyWithSpans(allocator, form, namespace, false, null, null);
+    return compileTinyWithSpans(allocator, form, namespace, false, null, null, null);
 }
 
 /// `compileTinyWithNamespace` for a tree `lowerForm` built
@@ -1061,12 +1057,14 @@ pub fn compileTinyWithSpans(
     spanned: bool,
     origin: ?reader_mod.SrcSpan,
     source: ?*const vm.SourceInfo,
+    diag: ?*LowerDiag,
 ) CompileError!Compiled {
     var emitter = Emitter.init(allocator);
     emitter.namespace = namespace;
     emitter.spanned = spanned;
     emitter.current_span = origin;
     emitter.source = source;
+    emitter.diag = diag;
     errdefer emitter.deinit();
 
     // Top-level form compiles into slot 0; routine returns slot 0.
@@ -1319,6 +1317,11 @@ fn lowerFormEnv(
     form: *const reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
+    // The innermost form reports the error, unless a symbol
+    // already located it more precisely.
+    errdefer if (ctx.diag) |d| {
+        if (d.span == null) d.span = form.origin;
+    };
     const tiny = try lowerDatum(allocator, form, ctx);
     // A node lowering passes through unchanged (`(do x)` is `x`)
     // keeps the innermost form's span, the one set first.
@@ -2718,8 +2721,9 @@ pub fn compileFormWith(
         if (out_span) |s| s.* = diag.span orelse working_form.origin;
         return err;
     };
-    return compileTinyWithSpans(allocator, tiny, namespace, true, working_form.origin, opts.source) catch |err| {
-        if (out_span) |s| s.* = working_form.origin;
+    diag.span = null;
+    return compileTinyWithSpans(allocator, tiny, namespace, true, working_form.origin, opts.source, &diag) catch |err| {
+        if (out_span) |s| s.* = diag.span orelse working_form.origin;
         return err;
     };
 }
@@ -3326,6 +3330,10 @@ fn compileExpr(
         const node: *const TinyNode = @fieldParentPtr("tiny", form);
         if (node.span) |span| e.current_span = span;
     }
+    // The innermost form reports the error.
+    errdefer if (e.diag) |d| {
+        if (d.span == null) d.span = e.current_span;
+    };
     switch (form.*) {
         .nil => try e.emit(vm.asm_.loadNil(dst)),
         .bool => |b| try e.emit(if (b) vm.asm_.loadTrue(dst) else vm.asm_.loadFalse(dst)),
@@ -3826,7 +3834,7 @@ fn compileTry(
 
     // Emit try-enter with placeholder catch_pc (and
     // finally_pc when present). Patch after we know both PCs.
-    const try_enter_pc: u32 = @intCast(e.code.items.len);
+    const try_enter_pc = e.code.items.len;
     if (finally_ != null) {
         try e.emit(vm.asm_.tryEnterFinally(0, binding_slot, 0));
     } else {
@@ -3837,15 +3845,11 @@ fn compileTry(
     try compileExpr(e, body, dst, null);
 
     // Body-exit try-exit (post_pc placeholder).
-    const body_exit_pc: u32 = @intCast(e.code.items.len);
+    const body_exit_pc = e.code.items.len;
     try e.emit(vm.asm_.tryExit(0));
 
     // Catch entry.
-    const catch_pc: u32 = @intCast(e.code.items.len);
-    {
-        const enter_inst = &e.code.items[try_enter_pc];
-        enter_inst.a = vm.Operand.jump(@intCast(catch_pc));
-    }
+    e.code.items[try_enter_pc].a = vm.Operand.jump(try e.nextPc());
 
     const scope_mark = e.scope.items.len;
     defer e.scope.shrinkRetainingCapacity(scope_mark);
@@ -3854,31 +3858,23 @@ fn compileTry(
     e.scope.shrinkRetainingCapacity(scope_mark);
 
     // Catch-exit try-exit (post_pc placeholder).
-    const catch_exit_pc: u32 = @intCast(e.code.items.len);
+    const catch_exit_pc = e.code.items.len;
     try e.emit(vm.asm_.tryExit(0));
 
     // Optional finally block + finally-exit.
-    var finally_pc: u32 = 0;
     if (finally_) |fin_body| {
-        finally_pc = @intCast(e.code.items.len);
+        e.code.items[try_enter_pc].c = vm.Operand.jump(try e.nextPc());
         // Finally body sees OUTER scope (binding is out of
         // scope here — we already popped it). Result discarded
         // into finally_scratch slot.
         try compileExpr(e, fin_body, finally_scratch, null);
         try e.emit(vm.asm_.finallyExit());
-        // Patch try-enter's finally_pc operand.
-        const enter_inst = &e.code.items[try_enter_pc];
-        enter_inst.c = vm.Operand.jump(@intCast(finally_pc));
     }
 
     // post_pc = end of code. Patch both try-exits.
-    const post_pc: u32 = @intCast(e.code.items.len);
-    {
-        const body_exit = &e.code.items[body_exit_pc];
-        body_exit.a = vm.Operand.jump(@intCast(post_pc));
-        const catch_exit = &e.code.items[catch_exit_pc];
-        catch_exit.a = vm.Operand.jump(@intCast(post_pc));
-    }
+    const post_pc = try e.nextPc();
+    e.code.items[body_exit_pc].a = vm.Operand.jump(post_pc);
+    e.code.items[catch_exit_pc].a = vm.Operand.jump(post_pc);
 }
 
 /// Compile `(throw value)`. Compile value into a
@@ -3955,7 +3951,7 @@ fn compileLoopStar(
     }
 
     // 4. Mark entry PC (AFTER box-local prelude).
-    const entry_pc = try e.checkJumpTarget(e.currentPc());
+    const entry_pc = try e.nextPc();
     const loop_target = RecurTarget{
         .entry_pc = entry_pc,
         .binding_slots = binding_slots,
@@ -4145,6 +4141,7 @@ fn compileFn(
     child.source = parent.source;
     // The prelude (parameter boxing) carries the fn form's span.
     child.current_span = parent.current_span;
+    child.diag = parent.diag;
     defer child.deinit();
 
     // Inject self-name as a pre-existing capture so
@@ -4234,7 +4231,7 @@ fn compileFn(
         param_slots[params.len] = @intCast(params.len);
         captured_mask[params.len] = captured_in_body.contains(rp);
     }
-    const fn_entry_pc = try child.checkJumpTarget(child.currentPc());
+    const fn_entry_pc = try child.nextPc();
     const fn_target = RecurTarget{
         .entry_pc = fn_entry_pc,
         .binding_slots = param_slots,
@@ -4465,8 +4462,7 @@ fn compileIf(
     const end_jmp_pc = try e.emitJumpPlaceholder();
 
     // Else-label is at the current PC.
-    const else_label = try e.checkJumpTarget(e.currentPc());
-    e.patchJumpAt(if_false_pc, else_label);
+    try e.patchJumpHere(if_false_pc);
 
     // Else-arm: compile into dst (or synthesize nil if absent).
     // Tail position INHERITED.
@@ -4478,8 +4474,7 @@ fn compileIf(
 
     // End-label is at the current PC; patch the unconditional
     // jump from the end of the then-arm.
-    const end_label = try e.checkJumpTarget(e.currentPc());
-    e.patchJumpAt(end_jmp_pc, end_label);
+    try e.patchJumpHere(end_jmp_pc);
 }
 
 // =============================================================================
@@ -8715,6 +8710,47 @@ test "compile span: out_span on malformed if" {
     );
     try testing.expectError(CompileError.MacroExpansionFailure, result);
     try testing.expect(span != null);
+}
+
+/// `(do nil nil ... tail)`: `pad` nils, each one instruction, ahead
+/// of `tail`, so the code `tail` emits starts at pc `pad`.
+fn paddedSource(allocator: std.mem.Allocator, pad: usize, tail: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(allocator, "(do");
+    for (0..pad) |_| try out.appendSlice(allocator, " nil");
+    try out.print(allocator, " {s})", .{tail});
+    return out.toOwnedSlice(allocator);
+}
+
+test "routine limits: a jump past the 12-bit range is JumpTargetOutOfRange at the form that needs it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "(if true 1 2)", "(try 1 (catch any e 2))", "(try 1 (catch any e 2) (finally 3))", "(loop* [i 1] (if i (recur nil) 2))" }) |tail| {
+        const ok = try paddedSource(a, 4000, tail);
+        _ = try compileSourceWith(a, ok, .{});
+        const src = try paddedSource(a, 4100, tail);
+        var span: ?reader_mod.SrcSpan = null;
+        try testing.expectError(CompileError.JumpTargetOutOfRange, compileSourceWith(a, src, .{ .out_span = &span }));
+        try testing.expectEqual(src.len - 1 - tail.len, span.?.pos);
+    }
+}
+
+test "compile span: an error is reported at the innermost form that raised it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { src: []const u8, at: []const u8, err: CompileError }{
+        .{ .src = "(fn* [x] (let* [y 1] (+ 1 (recur 2))))", .at = "(recur 2)", .err = CompileError.RecurOutsideTail },
+        .{ .src = "(fn* [x] (do 1 (recur 1 2)))", .at = "(recur 1 2)", .err = CompileError.RecurArityMismatch },
+        .{ .src = "(do 1 (let* [x 1] (if)))", .at = "(if)", .err = CompileError.MalformedForm },
+        .{ .src = "(let* [f (fn* [a a] a)] f)", .at = "(fn* [a a] a)", .err = CompileError.DuplicateParam },
+    };
+    for (cases) |c| {
+        var span: ?reader_mod.SrcSpan = null;
+        try testing.expectError(c.err, compileSourceWith(arena.allocator(), c.src, .{ .out_span = &span }));
+        try testing.expectEqual(std.mem.indexOf(u8, c.src, c.at).?, span.?.pos);
+        try testing.expectEqual(c.at.len, span.?.len);
+    }
 }
 
 test "compile span: compileSourceFullWithMacros compiles a source string" {

@@ -55,8 +55,6 @@ here.
   `.nx.o`. Every run compiles from source.
 - No separate resolver or analyzer module; classification and
   capture analysis happen inside `lowerForm` and the `Emitter`.
-- No source-span map on routines: compile errors carry a span,
-  runtime errors do not.
 - No slot liveness analysis: slots are bump-allocated per routine
   (§4.4).
 - No profile-guided optimization, inline caches or
@@ -289,9 +287,11 @@ compiler relies on:
 
 - **Errors**: `RecurOutsideTail`, `RecurArityMismatch`,
   `SlotOverflow`, `ConstantPoolOverflow` (more than 4096
-  constants), `JumpTargetOutOfRange` (a routine longer than 4096
-  instructions — there is no extension-instruction encoding),
-  `InternalCompilerBug`.
+  constants), `JumpTargetOutOfRange` (a jump whose target lies
+  past pc 4095: jump operands are 12-bit and there is no
+  extension-instruction encoding; code past pc 4095 that nothing
+  jumps to runs), `InternalCompilerBug`. Each is reported at the
+  innermost form being compiled when it is raised (§4.6).
 
 #### 4.5 Codegen invariants
 
@@ -312,11 +312,12 @@ compiler relies on:
 #### 4.6 Spans
 
 - Every Form carries the `SrcSpan` the reader assigned.
-- A compile error is reported with the span of the Form being
-  being lowered at the point the error is raised (`LowerDiag.span`); the CLI
-  renders it as `file:line:col`, the source line and a caret.
-- Routines carry no span table; a runtime error reports no
-  source location.
+- A compile error is reported with the span of the innermost
+  Form being lowered or compiled when the error is raised, or of
+  the symbol lowering rejects (`LowerDiag.span`); the CLI renders
+  it as `file:line:col`, the source line and a caret.
+- Routines carry a span table (§8), so a runtime error reports
+  the location of the instruction that raised it.
 
 #### 4.7 Var linking
 
@@ -795,11 +796,13 @@ closure that references the binding.
   `MalformedForm`, `MacroDepthExceeded`, `MacroExpansionFailure`,
   `RequiredFileFailed`, `ControlTransferred`, `ExpectedSymbol`,
   `ExpectedVector`, `InternalCompilerBug`, `OutOfMemory`.
-- A **primary SrcSpan** in `CompileOptions.out_span`: the
-  symbol's own span when lowering can locate it (the `LowerDiag`
-  out-parameter), otherwise the macroexpanded form's. Forms a
-  macro produced carry the macro call's span (MACROEXPAND.md
-  §4b), so an error inside an expansion is reported at the call.
+- A **primary SrcSpan** in `CompileOptions.out_span`: the span
+  of the innermost form being lowered or emitted when the error
+  was raised, or the symbol's own span for `UnresolvedSymbol`
+  (the `LowerDiag` out-parameter); a macroexpansion error carries
+  the top-level form's. Forms a macro produced carry the macro
+  call's span (MACROEXPAND.md §4b), so an error inside an
+  expansion is reported at the call.
 
 Errors raised inside macro expansion are bucketed:
 `MacroDepthExceeded` for depth, `MacroExpansionFailure` for
