@@ -1052,6 +1052,67 @@ test "integration: with-out-str captures what the print functions write, nested 
     try expectOutput("[(try (with-out-str (print \"lost\") (throw :boom)) (catch :boom e e)) (with-out-str (print \"after\"))]", "[:boom after]");
 }
 
+test "integration: core.nx higher-order functions: some-fn, every-pred, memoize, trampoline, comparator, run!" {
+    try expectOutput("[((some-fn even? neg?) 3 -1) ((some-fn even?) 1 3) ((every-pred odd? pos?) 1 3) ((every-pred odd? pos?) 1 -3)]", "[true false true false]");
+    try expectOutputProgram("(def calls (atom 0)) (def f (memoize (fn [x] (swap! calls inc) (* x x)))) [(f 3) (f 3) (f 4) @calls]", "[9 9 16 2]");
+    try expectOutputProgram("(defn down [n] (if (zero? n) :done #(down (dec n)))) (trampoline down 100000)", ":done");
+    try expectOutput("(sort (comparator >) [1 3 2])", "(3 2 1)");
+    try expectOutput("(let [a (atom 0)] [(run! #(swap! a + %) [1 2 3]) @a])", "[nil 6]");
+}
+
+test "integration: core.nx sequence functions: partition-by, dedupe, take-nth, split-with, distinct?, doall, dorun, rseq, nthnext" {
+    try expectOutput("[(partition-by odd? [1 3 2 4 5]) (dedupe [1 1 2 1 1 3]) (take-nth 2 (range 7)) (split-with neg? [-1 -2 3 -4])]", "[((1 3) (2 4) (5)) (1 2 1 3) (0 2 4 6) [(-1 -2) (3 -4)]]");
+    try expectOutput("[(distinct? 1 2 3) (distinct? 1 2 1) (doall (map inc [1])) (dorun [1]) (rseq [1 2 3]) (rseq []) (nthnext [1 2 3] 2) (nthnext [1] 1)]", "[true false (2) nil (3 2 1) nil (3) nil]");
+    try expectOutput("[(ffirst [[1 2]]) (fnext [1 2 3]) (nnext [1 2 3]) (second #{9}) (third (list 1 2 3))]", "[1 2 (3) nil 3]");
+}
+
+test "integration: core.nx maps: update-vals, update-keys; atoms: reset-vals!, volatile!" {
+    try expectOutput("[(update-vals {:a 1 :b 2} inc) (update-keys {1 :a} str)]", "[{:a 2, :b 3} {1 :a}]");
+    try expectOutput("(let [a (atom 1)] [(reset-vals! a 2) @a])", "[[1 2] 2]");
+    try expectOutput("(let [v (volatile! 1)] [(vswap! v + 2) (vreset! v 9) @v (volatile? v)])", "[3 9 9 true]");
+}
+
+test "integration: core.nx predicates" {
+    try expectOutput("[(any? nil) (ident? :a) (ident? 'b) (ident? \"c\") (qualified-keyword? :a/b) (simple-keyword? :a) (qualified-symbol? 'a/b) (simple-symbol? 'a)]", "[true true true false true true true true]");
+    try expectOutput("[(int? 1) (int? 1.0) (pos-int? 1) (pos-int? 0) (nat-int? 0) (neg-int? -1) (double? 1.5) (double? 1)]", "[true false true false true true true false]");
+    try expectOutput("[(seqable? nil) (seqable? \"s\") (seqable? 1) (counted? [1]) (counted? \"s\") (record? {}) (ex-cause (ex-info \"m\" {} :c))]", "[true true false true false false :c]");
+}
+
+test "integration: char and int conversion, parse-long, parse-double, parse-boolean" {
+    try expectOutput("[(int \\A) (char 97) (int 3.9) (long \\a) (char \\b)]", "[65 a 3 97 b]");
+    try expectOutput("[(parse-long \"42\") (parse-long \"-7\") (parse-long \"4x\") (parse-long \" 1\") (parse-double \"1.5\") (parse-double \"x\") (parse-boolean \"true\") (parse-boolean \"no\")]", "[42 -7 nil nil 1.5 nil true nil]");
+    try expectOutput("(try (char -1) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (parse-long 1) (catch any e e))", ":kind-mismatch");
+}
+
+test "integration: bit operations" {
+    try expectOutput("[(bit-and 12 10) (bit-or 12 10) (bit-xor 12 10) (bit-not 0) (bit-shift-left 1 10) (bit-shift-right -16 2) (unsigned-bit-shift-right -1 60) (bit-test 5 2) (bit-set 0 3) (bit-clear 15 0) (bit-and 7 6 3)]", "[8 14 6 -1 1024 -4 15 true 8 14 2]");
+}
+
+test "integration: rand, rand-int, rand-nth, shuffle stay in range" {
+    try expectOutput("(let [xs (repeatedly 200 #(rand-int 10))] [(every? #(<= 0 % 9) xs) (every? (fn [_] (< -1 (rand) 1)) (range 50)) (contains? #{:a :b} (rand-nth [:a :b])) (sort (shuffle [3 1 2]))])", "[true true true (1 2 3)]");
+}
+
+test "integration: format with %s %d %f %x %% and widths" {
+    try expectOutput("(format \"%s-%d-%5.2f-%x-%%-%3d|%-3d|%05d\" \"a\" 42 3.14159 255 7 7 42)", "a-42- 3.14-ff-%-  7|7  |00042");
+    try expectOutput("(format \"%s %s\" [1 \"b\"] nil)", "[1 \"b\"] nil");
+    try expectOutput("(format \"%.1f %.3f %f\" 2 -0.0005 1.5)", "2.0 -0.001 1.500000");
+    try expectOutput("(try (format \"%d\" \"x\") (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (format \"%d\") (catch any e e))", ":invalid-argument");
+    try expectOutput("(with-out-str (printf \"%d+%d\" 1 2))", "1+2");
+}
+
+test "integration: transients: transient, conj!, assoc!, dissoc!, disj!, pop!, persistent!" {
+    try expectOutput("(persistent! (reduce conj! (transient []) (range 5)))", "[0 1 2 3 4]");
+    try expectOutput("(let [t (transient {:a 1})] (persistent! (dissoc! (assoc! t :b 2 :c 3) :a)))", "{:b 2, :c 3}");
+    try expectOutput("(persistent! (disj! (conj! (transient #{1}) 2 3) 1))", "#{2 3}");
+    try expectOutput("(persistent! (pop! (assoc! (transient [1 2 3]) 0 9)))", "[9 2]");
+    try expectOutput("(let [t (transient [1 2])] [(count t) (nth t 1) (get t 0) (count (transient {:a 1})) (get (transient {:a 1}) :a) (contains? (transient #{1}) 1)])", "[2 2 1 1 1 true]");
+    try expectOutput("(let [t (transient [])] (persistent! t) (try (conj! t 1) (catch any e e)))", ":transient-used-after-persistent");
+    try expectOutput("(try (transient '(1)) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(persistent! (conj! (transient {}) [:k 1]))", "{:k 1}");
+}
+
 test "integration: core.nx composite + HOFs" {
     try expectOutput("(reduce + 0 (range 10))", "45");
     try expectOutput("(count (filter odd? (range 10)))", "5");

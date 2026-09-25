@@ -513,6 +513,136 @@
        (as-> ~(first forms) ~name ~@(rest forms)))))
 
 ; ============================================================
+; More sequence and function helpers
+; ============================================================
+
+; (some-fn p & ps) → a fn true of its arguments when any predicate
+; is truthy of any of them; (every-pred p & ps) when every one is of
+; every argument.
+(defn some-fn [& ps]
+  (fn [& xs] (boolean (some (fn [p] (some p xs)) ps))))
+
+(defn every-pred [& ps]
+  (fn [& xs] (every? (fn [p] (every? p xs)) ps)))
+
+; (memoize f) → f, caching each result by its arguments.
+(defn memoize [f]
+  (let [cache (atom {})]
+    (fn [& args]
+      (let [hit (find @cache args)]
+        (if hit
+          (val hit)
+          (let [r (apply f args)]
+            (swap! cache assoc args r)
+            r))))))
+
+; (trampoline f & args) → calls f, then each fn it returns, until a
+; value that is not a fn comes back; mutual recursion without stack.
+(defn trampoline [f & args]
+  (loop [r (apply f args)]
+    (if (fn? r) (recur (r)) r)))
+
+; (comparator pred) → a comparator of two arguments from a "less
+; than" predicate.
+(defn comparator [pred]
+  (fn [a b] (cond (pred a b) -1 (pred b a) 1 true 0)))
+
+; (run! f coll) → calls f on each element for its effect; nil.
+(defn run! [f coll]
+  (reduce (fn [_ x] (f x) nil) nil coll))
+
+; Sequences are eager, so doall and dorun only return.
+(defn doall [coll] coll)
+(defn dorun [coll] nil)
+
+; (partition-by f coll) → coll split each time (f x) changes.
+(defn partition-by [f coll]
+  (loop [s (seq coll) acc [] run [] k nil]
+    (if s
+      (let [x (first s) fx (f x)]
+        (if (or (empty? run) (= fx k))
+          (recur (next s) acc (conj run x) fx)
+          (recur (next s) (conj acc (seq run)) [x] fx)))
+      (seq (if (empty? run) acc (conj acc (seq run)))))))
+
+; (dedupe coll) → coll without consecutive duplicates.
+(defn dedupe [coll]
+  (seq (reduce (fn [acc x] (if (and (seq acc) (= x (peek acc))) acc (conj acc x))) [] coll)))
+
+; (take-nth n coll) → every nth element, starting with the first.
+(defn take-nth [n coll]
+  (keep-indexed (fn [i x] (when (zero? (rem i n)) x)) coll))
+
+; (split-with pred coll) → [(take-while pred coll) (drop-while pred coll)].
+(defn split-with [pred coll]
+  [(take-while pred coll) (drop-while pred coll)])
+
+; (distinct? x & xs) → whether no two arguments are equal.
+(defn distinct? [& xs]
+  (= (count xs) (count (set xs))))
+
+; (rseq v) → v's elements last first, nil when empty.
+(defn rseq [v]
+  (seq (reverse v)))
+
+; (rand-nth coll) → a random element; (shuffle coll) → a vector of
+; coll's elements in random order.
+(defn rand-nth [coll]
+  (nth coll (rand-int (count coll))))
+
+(defn shuffle [coll]
+  (loop [v (vec coll) i (dec (count v))]
+    (if (pos? i)
+      (let [j (rand-int (inc i)) vi (nth v i)]
+        (recur (assoc v i (nth v j) j vi) (dec i)))
+      v)))
+
+; (update-vals m f) / (update-keys m f) → m with f applied to every
+; value / key.
+(defn update-vals [m f]
+  (reduce-kv (fn [acc k v] (assoc acc k (f v))) {} m))
+
+(defn update-keys [m f]
+  (reduce-kv (fn [acc k v] (assoc acc (f k) v)) {} m))
+
+; (reset-vals! a v) → [old new] after setting a to v.
+(defn reset-vals! [a v]
+  (swap-vals! a (constantly v)))
+
+; Volatiles are atoms: one isolate, one thread.
+(defn volatile! [x] (atom x))
+(defn volatile? [x] (atom? x))
+(defn vreset! [v x] (reset! v x))
+(defmacro vswap! [v f & args]
+  `(swap! ~v ~f ~@args))
+
+; ---- predicates ----
+(defn any? [_] true)
+(defn ident? [x] (or (keyword? x) (symbol? x)))
+(defn qualified-keyword? [x] (boolean (and (keyword? x) (namespace x))))
+(defn simple-keyword? [x] (and (keyword? x) (nil? (namespace x))))
+(defn qualified-symbol? [x] (boolean (and (symbol? x) (namespace x))))
+(defn simple-symbol? [x] (and (symbol? x) (nil? (namespace x))))
+(defn int? [x] (integer? x))
+(defn pos-int? [x] (and (integer? x) (pos? x)))
+(defn nat-int? [x] (and (integer? x) (not (neg? x))))
+(defn neg-int? [x] (and (integer? x) (neg? x)))
+(defn double? [x] (float? x))
+(defn seqable? [x] (or (nil? x) (coll? x) (string? x) (typed-vector? x)))
+(defn counted? [x] (or (coll? x) (typed-vector? x)))
+(defn record? [x] (nexis.internal/#%record? x))
+(defn parse-boolean [s]
+  (cond (= s "true") true (= s "false") false (string? s) nil true (throw (keyword "kind-mismatch"))))
+
+; (ex-cause e) → the cause an ex-info carries, nil for anything else.
+(defn ex-cause [e]
+  (when (map? e) (get e (keyword "cause"))))
+
+; (printf fmt & args) → prints (format fmt args...); nil.
+(defn printf [fmt & args]
+  (print (apply format fmt args)))
+
+; ============================================================
 ; Printing to a string
 ; ============================================================
 

@@ -44,6 +44,7 @@ const format_mod = @import("format.zig");
 const record_mod = @import("record.zig");
 const protocol_mod = @import("protocol.zig");
 const nextomic_mod = @import("nextomic/root.zig");
+const transient_mod = @import("coll/transient.zig");
 const loader_mod = @import("loader.zig");
 
 const Value = value_mod.Value;
@@ -179,6 +180,23 @@ const core_natives = table("", .{
     .{ "inc", 1, 1, &fnInc },
     .{ "dec", 1, 1, &fnDec },
     .{ "long", 1, 1, &fnLong },
+    .{ "int", 1, 1, &fnLong },
+    .{ "char", 1, 1, &fnChar },
+    .{ "parse-long", 1, 1, &fnParseLong },
+    .{ "parse-double", 1, 1, &fnParseDouble },
+    .{ "bit-and", 2, null, &fnBitAnd },
+    .{ "bit-or", 2, null, &fnBitOr },
+    .{ "bit-xor", 2, null, &fnBitXor },
+    .{ "bit-not", 1, 1, &fnBitNot },
+    .{ "bit-shift-left", 2, 2, &fnBitShiftLeft },
+    .{ "bit-shift-right", 2, 2, &fnBitShiftRight },
+    .{ "unsigned-bit-shift-right", 2, 2, &fnUnsignedBitShiftRight },
+    .{ "bit-test", 2, 2, &fnBitTest },
+    .{ "bit-set", 2, 2, &fnBitSet },
+    .{ "bit-clear", 2, 2, &fnBitClear },
+    .{ "rand", 0, 1, &fnRand },
+    .{ "rand-int", 1, 1, &fnRandInt },
+    .{ "format", 1, null, &fnFormat },
     .{ "double", 1, 1, &fnDouble },
     .{ "max", 1, null, &fnMax },
     .{ "min", 1, null, &fnMin },
@@ -302,6 +320,15 @@ const core_natives = table("", .{
     .{ "keys", 1, 1, &fnKeys },
     .{ "vals", 1, 1, &fnVals },
     .{ "conj", 0, null, &fnConj },
+    // Transients (docs/TRANSIENT.md): shallow, the same cost as the
+    // persistent operations; every `!` returns the transient to use.
+    .{ "transient", 1, 1, &fnTransient },
+    .{ "persistent!", 1, 1, &fnPersistentBang },
+    .{ "conj!", 0, null, &fnConjBang },
+    .{ "assoc!", 3, null, &fnAssocBang },
+    .{ "dissoc!", 2, null, &fnDissocBang },
+    .{ "disj!", 2, null, &fnDisjBang },
+    .{ "pop!", 1, 1, &fnPopBang },
     // Typed vectors (docs/TYPED_VECTOR.md §7.1).
     .{ "i64-vector", 1, 1, &fnI64Vector },
     .{ "f64-vector", 1, 1, &fnF64Vector },
@@ -597,6 +624,7 @@ fn fnCount(vm: *VM, args: []const Value) VmError!Value {
         .nextomic_entity => @intCast(champ_mod.mapCount(try nextomic_mod.natives.entityMap(vm, c))),
         .persistent_set => @intCast(champ_mod.setCount(c)),
         .string => @intCast(string_mod.codepointCount(c) catch return VmError.Utf8Error),
+        .transient => @intCast(try transientCount(vm, c)),
         else => return VmError.KindMismatch,
     };
     return value_mod.fromFixnum(n) orelse VmError.ArithmeticOverflow;
@@ -625,6 +653,7 @@ fn fnNth(vm: *VM, args: []const Value) VmError!Value {
     // default arity.
     switch (coll.kind()) {
         .nil, .list, .persistent_vector, .typed_vector, .string => {},
+        .transient => if (coll.subkind() != transient_mod.subkind_transient_vector) return VmError.KindMismatch,
         else => return VmError.KindMismatch,
     }
     const idx = idx_v.asFixnum();
@@ -651,6 +680,13 @@ fn fnNth(vm: *VM, args: []const Value) VmError!Value {
                 return VmError.IndexOutOfBounds;
             }
             break :blk vector_mod.nth(coll, u_idx);
+        },
+        .transient => blk: {
+            if (u_idx >= try transientCount(vm, coll)) {
+                if (has_default) break :blk default;
+                return VmError.IndexOutOfBounds;
+            }
+            break :blk transient_mod.vectorNthBang(coll, u_idx) catch |err| return transientFailure(vm, err);
         },
         .typed_vector => typed_vector_mod.nth(vm.ensureHeap(), coll, u_idx) catch |err| switch (err) {
             error.IndexOutOfBounds => if (has_default) default else VmError.IndexOutOfBounds,
@@ -837,9 +873,142 @@ fn fnDec(vm: *VM, args: []const Value) VmError!Value {
     return vm_mod.numSub(vm.ensureHeap(), args[0], value_mod.fromFixnum(1).?);
 }
 
-/// `(long x)`: a number as an integer, a float by its integer part.
+/// `(long x)` / `(int x)`: a number as an integer, a float by its
+/// integer part, a char as its code point.
 fn fnLong(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() == .char) return value_mod.fromFixnum(args[0].asChar()).?;
     return vm_mod.numLong(vm.ensureHeap(), args[0]);
+}
+
+/// `(char n)`: the char with code point `n`; a char is itself. A
+/// value that is no Unicode scalar is `:invalid-argument`.
+fn fnChar(_: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() == .char) return args[0];
+    const n = try requireFixnum(args[0]);
+    if (n < 0 or n > 0x10FFFF) return VmError.InvalidArgument;
+    return value_mod.fromChar(@intCast(n)) orelse VmError.InvalidArgument;
+}
+
+/// `(parse-long s)` / `(parse-double s)`: the number `s` spells in
+/// full, else nil; a non-string is `:kind-mismatch`, as in Clojure.
+fn fnParseLong(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const text = string_mod.asBytes(args[0]);
+    const digits = if (text.len > 0 and text[0] == '+') text[1..] else text;
+    if (digits.len > 0 and digits[0] == '+') return value_mod.nilValue();
+    const n = std.fmt.parseInt(i64, digits, 10) catch return value_mod.nilValue();
+    return integerValue(vm, n);
+}
+
+fn fnParseDouble(_: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const text = string_mod.asBytes(args[0]);
+    if (text.len == 0 or std.ascii.isWhitespace(text[0]) or std.ascii.isWhitespace(text[text.len - 1])) return value_mod.nilValue();
+    return value_mod.fromFloat(std.fmt.parseFloat(f64, text) catch return value_mod.nilValue());
+}
+
+/// An integer argument as an `i64`: a fixnum, or a bignum that fits.
+fn intArg(v: Value) VmError!i64 {
+    return switch (v.kind()) {
+        .fixnum => v.asFixnum(),
+        .bignum => bignum_mod.toI64(v) orelse VmError.ArithmeticOverflow,
+        else => VmError.KindMismatch,
+    };
+}
+
+/// `n` as a fixnum, or a bignum outside the fixnum range.
+fn integerValue(vm: *VM, n: i64) VmError!Value {
+    return value_mod.fromFixnum(n) orelse bignum_mod.fromI128(vm.ensureHeap(), n) catch VmError.OutOfMemory;
+}
+
+/// The bit operations are over 64-bit two's complement, as Java's
+/// `long`; a shift count uses its low six bits.
+fn bitFold(vm: *VM, args: []const Value, comptime op: enum { @"and", @"or", xor }) VmError!Value {
+    var acc = try intArg(args[0]);
+    for (args[1..]) |a| {
+        const x = try intArg(a);
+        acc = switch (op) {
+            .@"and" => acc & x,
+            .@"or" => acc | x,
+            .xor => acc ^ x,
+        };
+    }
+    return integerValue(vm, acc);
+}
+
+fn fnBitAnd(vm: *VM, args: []const Value) VmError!Value {
+    return bitFold(vm, args, .@"and");
+}
+
+fn fnBitOr(vm: *VM, args: []const Value) VmError!Value {
+    return bitFold(vm, args, .@"or");
+}
+
+fn fnBitXor(vm: *VM, args: []const Value) VmError!Value {
+    return bitFold(vm, args, .xor);
+}
+
+fn fnBitNot(vm: *VM, args: []const Value) VmError!Value {
+    return integerValue(vm, ~try intArg(args[0]));
+}
+
+fn shiftCount(v: Value) VmError!u6 {
+    return @truncate(@as(u64, @bitCast(try intArg(v))));
+}
+
+fn fnBitShiftLeft(vm: *VM, args: []const Value) VmError!Value {
+    return integerValue(vm, try intArg(args[0]) << try shiftCount(args[1]));
+}
+
+fn fnBitShiftRight(vm: *VM, args: []const Value) VmError!Value {
+    return integerValue(vm, try intArg(args[0]) >> try shiftCount(args[1]));
+}
+
+fn fnUnsignedBitShiftRight(vm: *VM, args: []const Value) VmError!Value {
+    const x: u64 = @bitCast(try intArg(args[0]));
+    return integerValue(vm, @bitCast(x >> try shiftCount(args[1])));
+}
+
+fn bitMask(v: Value) VmError!i64 {
+    return @as(i64, 1) << try shiftCount(v);
+}
+
+fn fnBitTest(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(try intArg(args[0]) & try bitMask(args[1]) != 0);
+}
+
+fn fnBitSet(vm: *VM, args: []const Value) VmError!Value {
+    return integerValue(vm, try intArg(args[0]) | try bitMask(args[1]));
+}
+
+fn fnBitClear(vm: *VM, args: []const Value) VmError!Value {
+    return integerValue(vm, try intArg(args[0]) & ~try bitMask(args[1]));
+}
+
+/// The generator behind `rand` and `rand-int`, seeded from the clock
+/// at first use. One isolate, one thread.
+var prng: ?std.Random.DefaultPrng = null;
+
+fn random(vm: *VM) std.Random {
+    if (prng == null) {
+        const now = std.Io.Clock.real.now(ioOf(vm));
+        prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(@as(i128, now.nanoseconds)))));
+    }
+    return prng.?.random();
+}
+
+/// `(rand)` → a double in [0, 1); `(rand n)` → in [0, n).
+fn fnRand(vm: *VM, args: []const Value) VmError!Value {
+    const r = random(vm).float(f64);
+    if (args.len == 0) return value_mod.fromFloat(r);
+    return value_mod.fromFloat(r * try asDouble(args[0]));
+}
+
+/// `(rand-int n)` → an integer in [0, n); n must be positive.
+fn fnRandInt(vm: *VM, args: []const Value) VmError!Value {
+    const n = try intArg(args[0]);
+    if (n <= 0) return VmError.InvalidArgument;
+    return integerValue(vm, random(vm).intRangeLessThan(i64, 0, n));
 }
 
 /// `(double x)`: a number as an f64.
@@ -1386,6 +1555,7 @@ fn fnGet(vm: *VM, args: []const Value) VmError!Value {
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
     if (args[0].kind() == .string) return (try stringIndex(args[0], args[1])) orelse default;
     if (args[0].kind() == .typed_vector) return (try typedVectorIndex(vm, args[0], args[1])) orelse default;
+    if (args[0].kind() == .transient) return (try transientLookup(vm, args[0], args[1])) orelse default;
     return vm_mod.lookup(args[0], args[1], default) catch |err| if (err == VmError.KindMismatch) default else err;
 }
 
@@ -1457,6 +1627,10 @@ fn fnContainsQ(vm: *VM, args: []const Value) VmError!Value {
             .absent => false,
         }),
         .nextomic_entity => value_mod.fromBool(try nextomic_mod.natives.entityHas(vm, coll, k)),
+        .transient => value_mod.fromBool(if (coll.subkind() == transient_mod.subkind_transient_set)
+            transient_mod.setContainsBang(coll, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err)
+        else
+            (try transientLookup(vm, coll, k)) != null),
         else => return VmError.KindMismatch,
     };
 }
@@ -3125,6 +3299,215 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     // 4. Write.
     db_mod.putRef(&h.txn, r, new_value) catch |err| return dbFailure(vm, err);
     return new_value;
+}
+
+// =============================================================================
+// Transients (docs/TRANSIENT.md)
+// =============================================================================
+//
+// The Clojure surface over `coll/transient.zig`: each `!` returns the
+// transient to use from then on, which a vector `assoc!` or `pop!`
+// replaces (the old one is frozen, as `persistent!` leaves it).
+
+fn transientFailure(vm: *VM, err: anyerror) VmError {
+    return switch (err) {
+        error.TransientFrozen => vm.throwKeyword("transient-used-after-persistent"),
+        error.OutOfMemory, error.Overflow => VmError.OutOfMemory,
+        else => VmError.KindMismatch,
+    };
+}
+
+fn requireTransient(v: Value) VmError!u16 {
+    if (v.kind() != .transient) return VmError.KindMismatch;
+    return v.subkind();
+}
+
+fn transientCount(vm: *VM, t: Value) VmError!usize {
+    return switch (try requireTransient(t)) {
+        transient_mod.subkind_transient_map => transient_mod.mapCountBang(t),
+        transient_mod.subkind_transient_set => transient_mod.setCountBang(t),
+        else => transient_mod.vectorCountBang(t),
+    } catch |err| transientFailure(vm, err);
+}
+
+/// The value at `k` in a transient map, the element `k` of a set or
+/// the element at index `k` of a vector; null when absent.
+fn transientLookup(vm: *VM, t: Value, k: Value) VmError!?Value {
+    switch (try requireTransient(t)) {
+        transient_mod.subkind_transient_map => return switch (transient_mod.mapGetBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err)) {
+            .present => |v| v,
+            .absent => null,
+        },
+        transient_mod.subkind_transient_set => return if (transient_mod.setContainsBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err)) k else null,
+        else => {
+            if (k.kind() != .fixnum or k.asFixnum() < 0 or @as(usize, @intCast(k.asFixnum())) >= try transientCount(vm, t)) return null;
+            return transient_mod.vectorNthBang(t, @intCast(k.asFixnum())) catch |err| transientFailure(vm, err);
+        },
+    }
+}
+
+/// `(transient coll)` → a transient of a vector, map or set.
+fn fnTransient(vm: *VM, args: []const Value) VmError!Value {
+    return transient_mod.transientFrom(vm.ensureHeap(), args[0]) catch |err| transientFailure(vm, err);
+}
+
+/// `(persistent! t)` → the collection, the transient frozen.
+fn fnPersistentBang(vm: *VM, args: []const Value) VmError!Value {
+    _ = try requireTransient(args[0]);
+    return transient_mod.persistentBang(args[0]) catch |err| transientFailure(vm, err);
+}
+
+/// `(conj! t x & xs)`; `(conj!)` is a transient vector, `(conj! t)` t.
+fn fnConjBang(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    if (args.len == 0) return fnTransient(vm, &.{vector_mod.empty(heap) catch return VmError.OutOfMemory});
+    var t = args[0];
+    const sub = try requireTransient(t);
+    for (args[1..]) |x| t = switch (sub) {
+        transient_mod.subkind_transient_map => blk: {
+            if (x.kind() != .persistent_vector or vector_mod.count(x) != 2) return VmError.KindMismatch;
+            break :blk transient_mod.mapAssocBang(heap, t, vector_mod.nth(x, 0), vector_mod.nth(x, 1), &dispatch_mod.hashValue, &dispatch_mod.equal);
+        },
+        transient_mod.subkind_transient_set => transient_mod.setConjBang(heap, t, x, &dispatch_mod.hashValue, &dispatch_mod.equal),
+        else => transient_mod.vectorConjBang(heap, t, x),
+    } catch |err| return transientFailure(vm, err);
+    return t;
+}
+
+/// `(assoc! t k v & kvs)` on a transient map or vector.
+fn fnAssocBang(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len % 2 != 1) return VmError.ArityMismatch;
+    const heap = vm.ensureHeap();
+    var t = args[0];
+    switch (try requireTransient(t)) {
+        transient_mod.subkind_transient_map => {
+            var i: usize = 1;
+            while (i < args.len) : (i += 2) t = transient_mod.mapAssocBang(heap, t, args[i], args[i + 1], &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
+            return t;
+        },
+        transient_mod.subkind_transient_vector => {
+            var v = transient_mod.persistentBang(t) catch |err| return transientFailure(vm, err);
+            var i: usize = 1;
+            while (i < args.len) : (i += 2) v = try assocOne(vm, v, args[i], args[i + 1]);
+            return fnTransient(vm, &.{v});
+        },
+        else => return VmError.KindMismatch,
+    }
+}
+
+/// `(dissoc! t k & ks)` on a transient map.
+fn fnDissocBang(vm: *VM, args: []const Value) VmError!Value {
+    if (try requireTransient(args[0]) != transient_mod.subkind_transient_map) return VmError.KindMismatch;
+    var t = args[0];
+    for (args[1..]) |k| t = transient_mod.mapDissocBang(vm.ensureHeap(), t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
+    return t;
+}
+
+/// `(disj! t x & xs)` on a transient set.
+fn fnDisjBang(vm: *VM, args: []const Value) VmError!Value {
+    if (try requireTransient(args[0]) != transient_mod.subkind_transient_set) return VmError.KindMismatch;
+    var t = args[0];
+    for (args[1..]) |x| t = transient_mod.setDisjBang(vm.ensureHeap(), t, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
+    return t;
+}
+
+/// `(pop! t)` on a transient vector: without its last element.
+fn fnPopBang(vm: *VM, args: []const Value) VmError!Value {
+    if (try requireTransient(args[0]) != transient_mod.subkind_transient_vector) return VmError.KindMismatch;
+    const v = transient_mod.persistentBang(args[0]) catch |err| return transientFailure(vm, err);
+    return fnTransient(vm, &.{try fnPop(vm, &.{v})});
+}
+
+// =============================================================================
+// format (a subset of Java's Formatter, as Clojure's format uses)
+// =============================================================================
+
+/// `(format fmt & args)` → `fmt` with each `%` conversion replaced by
+/// the next argument: `%s` (as `str` makes it text, nil as `nil`),
+/// `%d` (an integer), `%f` (any number; 6 decimals unless `.N`),
+/// `%x` / `%X` (an integer in hex, two's complement when negative),
+/// `%c` (a char), `%n` and `%%`. A width pads on the left, or the
+/// right with `-`; `0` pads a number with zeros. A missing argument
+/// or unknown conversion is `:invalid-argument`, an argument of the
+/// wrong kind `:kind-mismatch`.
+fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const fmt = string_mod.asBytes(args[0]);
+    var out = std.Io.Writer.Allocating.init(vm.allocator);
+    defer out.deinit();
+    var piece = std.Io.Writer.Allocating.init(vm.allocator);
+    defer piece.deinit();
+    const interner = vm.ensureInterner();
+    var next: usize = 1;
+    var i: usize = 0;
+    while (i < fmt.len) : (i += 1) {
+        if (fmt[i] != '%') {
+            out.writer.writeByte(fmt[i]) catch return VmError.OutOfMemory;
+            continue;
+        }
+        i += 1;
+        var left = false;
+        var zero = false;
+        while (i < fmt.len and (fmt[i] == '-' or fmt[i] == '0')) : (i += 1) {
+            if (fmt[i] == '-') left = true else zero = true;
+        }
+        var width: usize = 0;
+        while (i < fmt.len and std.ascii.isDigit(fmt[i])) : (i += 1) width = width * 10 + (fmt[i] - '0');
+        var precision: ?usize = null;
+        if (i < fmt.len and fmt[i] == '.') {
+            i += 1;
+            var p: usize = 0;
+            while (i < fmt.len and std.ascii.isDigit(fmt[i])) : (i += 1) p = p * 10 + (fmt[i] - '0');
+            precision = p;
+        }
+        if (i >= fmt.len) return VmError.InvalidArgument;
+        const conv = fmt[i];
+        piece.clearRetainingCapacity();
+        const w = &piece.writer;
+        switch (conv) {
+            '%' => w.writeByte('%') catch return VmError.OutOfMemory,
+            'n' => w.writeByte('\n') catch return VmError.OutOfMemory,
+            else => {
+                if (next >= args.len) return VmError.InvalidArgument;
+                const a = args[next];
+                next += 1;
+                switch (conv) {
+                    's' => if (a.isNil()) w.writeAll("nil") catch return VmError.OutOfMemory else try appendStrValue(&piece, a, interner),
+                    'd' => {
+                        if (!vm_mod.isInteger(a)) return VmError.KindMismatch;
+                        format_mod.format(a, .readable, w, interner) catch return VmError.OutOfMemory;
+                    },
+                    'f' => w.printFloat((try vm_mod.numDouble(a)).asFloat(), .{ .mode = .decimal, .precision = precision orelse 6 }) catch return VmError.OutOfMemory,
+                    'x', 'X' => {
+                        const n: u64 = @bitCast(try intArg(a));
+                        w.printInt(n, 16, if (conv == 'x') .lower else .upper, .{}) catch return VmError.OutOfMemory;
+                    },
+                    'c' => {
+                        if (a.kind() != .char) return VmError.KindMismatch;
+                        format_mod.format(a, .display, w, interner) catch return VmError.OutOfMemory;
+                    },
+                    else => return VmError.InvalidArgument,
+                }
+            },
+        }
+        const text = piece.written();
+        const pad = if (width > text.len) width - text.len else 0;
+        const numeric = conv == 'd' or conv == 'f' or conv == 'x' or conv == 'X';
+        if (left) {
+            out.writer.writeAll(text) catch return VmError.OutOfMemory;
+            out.writer.splatByteAll(' ', pad) catch return VmError.OutOfMemory;
+        } else if (zero and numeric) {
+            // Zeros go after the sign.
+            const signed = text.len > 0 and text[0] == '-';
+            if (signed) out.writer.writeByte('-') catch return VmError.OutOfMemory;
+            out.writer.splatByteAll('0', pad) catch return VmError.OutOfMemory;
+            out.writer.writeAll(if (signed) text[1..] else text) catch return VmError.OutOfMemory;
+        } else {
+            out.writer.splatByteAll(' ', pad) catch return VmError.OutOfMemory;
+            out.writer.writeAll(text) catch return VmError.OutOfMemory;
+        }
+    }
+    return string_mod.fromBytes(vm.ensureHeap(), out.written()) catch VmError.OutOfMemory;
 }
 
 // =============================================================================
