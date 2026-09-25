@@ -660,9 +660,8 @@ src/nextomic/
   excise.zig     §4 "Excision": the tree deletes and the txlog rewrite
   fulltext.zig   the tokenizer and the nx/fulltext rows: put, delete, search
   db.zig         DbValue, fold, datoms, entity, entid/ident, tx-range
-  handle.zig     heap bodies of the three value kinds; its own module
-                 `nextomic_handle` below dispatch/format/gc/vm, so their
-                 kind arms need nothing from the module above them
+  handle.zig     heap bodies of the three value kinds, which
+                 dispatch/format/gc/vm import without the rest of Nextomic
   marshal.zig    VM values to and from datom values: the entity, value and cell contracts
   relation.zig   columnar Relation
   query/ir.zig  query/parse.zig  query/plan.zig  query/exec.zig  query/rules.zig
@@ -680,8 +679,8 @@ test/integration/nextomic_entity.zig the lazy entity through the pipeline, and u
 test/nextomic/*.nx             end-to-end scripts
 ```
 
-`nextomic` is one build module above `dispatch` and `vm`, imported by
-`stdlib` only; `cli` installs it through `stdlib.installNextomic` and
+`src/nextomic/` sits above `dispatch` and `vm` in the one runtime
+module (`src/root.zig`), and only `stdlib` imports it; `cli` installs it through `stdlib.installNextomic` and
 bootstraps `stdlib/nextomic.nx` with the `nextomic` namespace current.
 Value kinds: `nextomic_conn`, `nextomic_db`, `nextomic_entity` (heap
 boxes from `handle.zig`; the connection box holds the `Conn` the VM
@@ -694,9 +693,9 @@ map). `vm.lookup` reaches the hook for `(:attr ent)` and `get`; the
 `stdlib` arms for `contains?`, `keys`, `vals`, `seq`, `count`, `empty?`
 and `into` call `natives.entityHas` and `natives.entityMap`, so every
 access is one read like any other native's. Nextomic never uses the
-`db/*` layer's per-operation tree opens or codec-encoded keys; it holds
-raw `*emdb.Txn` handles and byte keys, and uses `db.Connection` only for
-the `Env`.
+`db/*` layer's connections, tree opens or codec-encoded keys: `Store.open`
+opens its own `emdb.Env`, and Nextomic holds raw `*emdb.Txn` handles and
+byte keys over it.
 
 ---
 

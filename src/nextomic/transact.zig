@@ -3144,10 +3144,7 @@ test "a large transaction's arena stays well under a kilobyte per datom" {
     defer tx_arena.deinit();
     const r = try transactOps(tc.conn, tx_arena.allocator(), ops, .{});
     try testing.expectEqual(@as(usize, entities * per_entity + 1), r.tx_data.len);
-    const bytes = tx_arena.queryCapacity();
-    const per_datom = bytes / r.tx_data.len;
-    if (std.c.getenv("NEXTOMIC_BENCH") != null) std.debug.print("\ntransaction arena: {d} bytes for {d} datoms, {d} bytes/datom\n", .{ bytes, r.tx_data.len, per_datom });
-    try testing.expect(per_datom < 1024);
+    try testing.expect(tx_arena.queryCapacity() / r.tx_data.len < 1024);
 }
 
 test "history composed with since shows only the rows after since" {
