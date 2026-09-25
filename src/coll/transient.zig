@@ -190,6 +190,19 @@ pub fn persistentBang(t: Value) TransientError!Value {
     return innerValueForSubkind(t.subkind(), inner);
 }
 
+/// The collection a transient holds. A caller whose ops must leave no
+/// trace when it raises saves it and `restoreInner`s it on the way out.
+pub fn savedInner(t: Value) *HeapHeader {
+    std.debug.assert(t.kind() == .transient);
+    return transientBody(Heap.asHeapHeader(t)).inner_header;
+}
+
+/// Put back a collection `savedInner` returned for the same transient.
+pub fn restoreInner(t: Value, inner: *HeapHeader) void {
+    std.debug.assert(t.kind() == .transient);
+    transientBody(Heap.asHeapHeader(t)).inner_header = inner;
+}
+
 // =============================================================================
 // Public API — transient map ops (subkind 0)
 // =============================================================================

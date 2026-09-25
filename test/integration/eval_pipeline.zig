@@ -1387,6 +1387,21 @@ test "integration: a :stack-overflow caught inside a callback does not resurface
     , "[:deep [:deep false] [:deep] [:deep] 1 :deep :deep [:deep] :outer]");
 }
 
+test "integration: a transient op that raises leaves the transient as it found it" {
+    try expectOutputOverDeepData(
+        \\(let [a deep-a
+        \\      s (transient (set (range 20)))
+        \\      m (transient (zipmap (range 20) (range 20)))]
+        \\  [(try (conj! s 20 a) (catch :stack-overflow e e))
+        \\   (try (assoc! m :x 1 a 2) (catch :stack-overflow e e))
+        \\   (try (dissoc! m 0 a) (catch :stack-overflow e e))
+        \\   (try (disj! s 0 a) (catch :stack-overflow e e))
+        \\   (try (conj! m [:y 1] :not-an-entry) (catch any e e))
+        \\   (count (persistent! s))
+        \\   (let [p (persistent! m)] [(count p) (p :x) (p :y) (p 0)])])
+    , "[:stack-overflow :stack-overflow :stack-overflow :stack-overflow :kind-mismatch 20 [20 nil nil 0]]");
+}
+
 test "integration: core.nx composite + HOFs" {
     try expectOutput("(reduce + 0 (range 10))", "45");
     try expectOutput("(count (filter odd? (range 10)))", "5");

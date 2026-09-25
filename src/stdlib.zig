@@ -3321,6 +3321,30 @@ fn transientFailure(vm: *VM, err: anyerror) VmError {
     };
 }
 
+/// Leaves a transient as a raising `!` call found it (TRANSIENT.md §6):
+/// on an error, and when an op hashed or compared past the stack guard,
+/// which `callDirect` raises as `:stack-overflow` once the native
+/// returns (SEMANTICS §2.7). The ops run before a collection can happen,
+/// so the saved collection needs no root.
+const TransientUndo = struct {
+    t: Value,
+    inner: *heap_mod.HeapHeader,
+    overflows: u64,
+
+    fn begin(t: Value) TransientUndo {
+        return .{ .t = t, .inner = transient_mod.savedInner(t), .overflows = dispatch_mod.overflowCount() };
+    }
+
+    fn undo(self: TransientUndo) void {
+        transient_mod.restoreInner(self.t, self.inner);
+    }
+
+    fn keepUnlessOverflowed(self: TransientUndo) Value {
+        if (dispatch_mod.overflowCount() != self.overflows) self.undo();
+        return self.t;
+    }
+};
+
 fn requireTransient(v: Value) VmError!u16 {
     if (v.kind() != .transient) return VmError.KindMismatch;
     return v.subkind();
@@ -3365,9 +3389,11 @@ fn fnPersistentBang(vm: *VM, args: []const Value) VmError!Value {
 fn fnConjBang(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     if (args.len == 0) return fnTransient(vm, &.{vector_mod.empty(heap) catch return VmError.OutOfMemory});
-    var t = args[0];
+    const t = args[0];
     const sub = try requireTransient(t);
-    for (args[1..]) |x| t = switch (sub) {
+    const undo = TransientUndo.begin(t);
+    errdefer undo.undo();
+    for (args[1..]) |x| _ = switch (sub) {
         transient_mod.subkind_transient_map => blk: {
             if (x.kind() != .persistent_vector or vector_mod.count(x) != 2) return VmError.KindMismatch;
             break :blk transient_mod.mapAssocBang(heap, t, vector_mod.nth(x, 0), vector_mod.nth(x, 1), &dispatch_mod.hashValue, &dispatch_mod.equal);
@@ -3375,48 +3401,48 @@ fn fnConjBang(vm: *VM, args: []const Value) VmError!Value {
         transient_mod.subkind_transient_set => transient_mod.setConjBang(heap, t, x, &dispatch_mod.hashValue, &dispatch_mod.equal),
         else => transient_mod.vectorConjBang(heap, t, x),
     } catch |err| return transientFailure(vm, err);
-    return t;
+    return undo.keepUnlessOverflowed();
 }
 
 /// `(assoc! t k v & kvs)` on a transient map or vector.
 fn fnAssocBang(vm: *VM, args: []const Value) VmError!Value {
     if (args.len % 2 != 1) return VmError.ArityMismatch;
     const heap = vm.ensureHeap();
-    var t = args[0];
-    switch (try requireTransient(t)) {
-        transient_mod.subkind_transient_map => {
-            var i: usize = 1;
-            while (i < args.len) : (i += 2) t = transient_mod.mapAssocBang(heap, t, args[i], args[i + 1], &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
-            return t;
-        },
-        transient_mod.subkind_transient_vector => {
-            var i: usize = 1;
-            while (i < args.len) : (i += 2) {
-                const k = args[i];
-                if (k.kind() != .fixnum) return VmError.KindMismatch;
-                if (k.asFixnum() < 0) return VmError.IndexOutOfBounds;
-                t = transient_mod.vectorAssocBang(heap, t, @intCast(k.asFixnum()), args[i + 1]) catch |err| return transientFailure(vm, err);
-            }
-            return t;
-        },
-        else => return VmError.KindMismatch,
+    const t = args[0];
+    const sub = try requireTransient(t);
+    if (sub == transient_mod.subkind_transient_set) return VmError.KindMismatch;
+    const undo = TransientUndo.begin(t);
+    errdefer undo.undo();
+    var i: usize = 1;
+    while (i < args.len) : (i += 2) {
+        const k = args[i];
+        _ = if (sub == transient_mod.subkind_transient_map)
+            transient_mod.mapAssocBang(heap, t, k, args[i + 1], &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err)
+        else blk: {
+            if (k.kind() != .fixnum) return VmError.KindMismatch;
+            if (k.asFixnum() < 0) return VmError.IndexOutOfBounds;
+            break :blk transient_mod.vectorAssocBang(heap, t, @intCast(k.asFixnum()), args[i + 1]) catch |err| return transientFailure(vm, err);
+        };
     }
+    return undo.keepUnlessOverflowed();
 }
 
 /// `(dissoc! t k & ks)` on a transient map.
 fn fnDissocBang(vm: *VM, args: []const Value) VmError!Value {
     if (try requireTransient(args[0]) != transient_mod.subkind_transient_map) return VmError.KindMismatch;
-    var t = args[0];
-    for (args[1..]) |k| t = transient_mod.mapDissocBang(vm.ensureHeap(), t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
-    return t;
+    const undo = TransientUndo.begin(args[0]);
+    errdefer undo.undo();
+    for (args[1..]) |k| _ = transient_mod.mapDissocBang(vm.ensureHeap(), args[0], k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
+    return undo.keepUnlessOverflowed();
 }
 
 /// `(disj! t x & xs)` on a transient set.
 fn fnDisjBang(vm: *VM, args: []const Value) VmError!Value {
     if (try requireTransient(args[0]) != transient_mod.subkind_transient_set) return VmError.KindMismatch;
-    var t = args[0];
-    for (args[1..]) |x| t = transient_mod.setDisjBang(vm.ensureHeap(), t, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
-    return t;
+    const undo = TransientUndo.begin(args[0]);
+    errdefer undo.undo();
+    for (args[1..]) |x| _ = transient_mod.setDisjBang(vm.ensureHeap(), args[0], x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
+    return undo.keepUnlessOverflowed();
 }
 
 /// `(pop! t)` on a transient vector: without its last element.

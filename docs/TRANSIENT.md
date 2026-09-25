@@ -90,6 +90,12 @@ These are ordinary branches, checked in every build mode. The stdlib
 also checks the family before calling in (`transientFailure` in
 `src/stdlib.zig` maps the Zig errors).
 
+A `!` call that raises leaves the transient as it found it, whichever
+of its operands raised: the native saves the inner collection on entry
+and puts it back on an error, and when an operand hashed or compared
+past the stack guard, which the VM raises as `:stack-overflow` once the
+native returns (`docs/SEMANTICS.md` §2.7).
+
 ---
 
 ### 7. API
