@@ -4,17 +4,17 @@
     .version = "0.0.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // emdb is nexis's sibling project providing persistent B+-tree
-        // storage (PLAN §2 substrate). Path dependency on the sibling
-        // checkout. emdb.Env / emdb.Txn / emdb.Cursor are the APIs
-        // consumed via `src/db.zig`.
+        // emdb, nexis's sibling project: the persistent B+-tree storage
+        // (PLAN §2 substrate), a path dependency on the sibling checkout.
+        // src/db.zig and src/nextomic/store.zig consume its Env, Txn and
+        // Cursor.
         .emdb = .{ .path = "../emdb" },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        "stdlib",
+        "bench",
         "docs",
         "test",
         "examples",
@@ -22,7 +22,6 @@
         "README.md",
         "PLAN.md",
         "CLOJURE-REVIEW.md",
-        "LICENSE",
         "AGENTS.md",
     },
 }

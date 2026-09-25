@@ -42,10 +42,15 @@ pub fn build(b: *std.Build) void {
     // Parser generation, through the external nexus tool at ../nexus/bin/nexus.
     const nexus_bin = b.pathJoin(&.{ b.pathFromRoot(".."), "nexus", "bin", "nexus" });
     const run_nexus = b.addSystemCommand(&.{ nexus_bin, "nexis.grammar", "src/parser.zig" });
+    run_nexus.setCwd(b.path("."));
     b.step("parser", "Regenerate src/parser.zig from nexis.grammar").dependOn(&run_nexus.step);
 
     // Every inline `test` block of the runtime, in one binary.
+    // Every test binary runs from the build root, so the stores its
+    // tests create under .zig-cache/tmp/ land in the build's cache
+    // whatever directory `zig build` started in.
     const unit = b.addRunArtifact(b.addTest(.{ .name = "unit", .root_module = nexis }));
+    unit.setCwd(b.path("."));
     test_step.dependOn(&unit.step);
     quick_step.dependOn(&unit.step);
     // The Nextomic subset, compiled only when `nextomic-test` runs alone.
@@ -54,6 +59,7 @@ pub fn build(b: *std.Build) void {
         .root_module = nexis,
         .filters = &.{"nextomic"},
     }));
+    nextomic_unit.setCwd(b.path("."));
     nextomic_test_step.dependOn(&nextomic_unit.step);
 
     // Property and integration binaries: one per file, so they run in parallel.
@@ -99,6 +105,7 @@ pub fn build(b: *std.Build) void {
         module.addImport("harness", harness);
         const name = std.fs.path.stem(suite.path);
         const run = b.addRunArtifact(b.addTest(.{ .name = name, .root_module = module }));
+        run.setCwd(b.path("."));
         test_step.dependOn(&run.step);
         if (suite.quick) quick_step.dependOn(&run.step);
         if (suite.nextomic) nextomic_test_step.dependOn(&run.step);

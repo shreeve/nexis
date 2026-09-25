@@ -240,3 +240,110 @@ pub const Store = struct {
         return std.mem.replaceOwned(u8, testing.allocator, template, "@STORE@", self.path);
     }
 };
+
+/// Random values of every serializable kind, nested to a given depth:
+/// the generator the codec and db property suites share. `shape`
+/// bounds the sizes, so each suite keeps its own population.
+pub const Gen = struct {
+    heap: *nx.heap.Heap,
+    interner: *intern_mod.Interner,
+    /// Scratch for building lists.
+    allocator: std.mem.Allocator,
+    r: std.Random,
+    shape: Shape = .{},
+
+    pub const Shape = struct {
+        /// Longest keyword and symbol name.
+        name_max: usize = 10,
+        /// Exclusive bounds on each collection's count.
+        list_max: usize = 6,
+        vector_max: usize = 10,
+        map_max: usize = 8,
+        set_max: usize = 8,
+        /// Chance in ten that a node three or more levels above the
+        /// leaves is a scalar; two levels up it is 5, one level 7.
+        deep_leaf: u8 = 3,
+    };
+
+    pub const Error = std.mem.Allocator.Error || error{ InternTableFull, EmptyName, InvalidListTail, Overflow };
+
+    /// nil, a boolean, a fixnum, a char, a float, a keyword, a
+    /// symbol, a string or a bignum outside the fixnum range.
+    pub fn scalar(self: *Gen) Error!Value {
+        const r = self.r;
+        return switch (r.uintLessThan(u8, 10)) {
+            0 => value_mod.nilValue(),
+            1 => value_mod.fromBool(true),
+            2 => value_mod.fromBool(false),
+            3 => value_mod.fromFixnum(r.intRangeAtMost(i64, value_mod.fixnum_min, value_mod.fixnum_max)).?,
+            4 => blk: {
+                var c: u21 = r.intRangeAtMost(u21, 0, 0x10FFFF);
+                if (c >= 0xD800 and c <= 0xDFFF) c = 'a';
+                break :blk value_mod.fromChar(c).?;
+            },
+            5 => value_mod.fromFloat(r.float(f64)),
+            6 => blk: {
+                var buf: [32]u8 = undefined;
+                const n = r.intRangeAtMost(usize, 1, self.shape.name_max);
+                for (buf[0..n]) |*b| b.* = r.intRangeAtMost(u8, 'a', 'z');
+                break :blk try self.interner.internKeywordValue(buf[0..n]);
+            },
+            7 => blk: {
+                var buf: [32]u8 = undefined;
+                const n = r.intRangeAtMost(usize, 1, self.shape.name_max);
+                for (buf[0..n]) |*b| b.* = r.intRangeAtMost(u8, 'A', 'Z');
+                break :blk try self.interner.internSymbolValue(buf[0..n]);
+            },
+            8 => blk: {
+                var buf: [32]u8 = undefined;
+                const n = r.uintLessThan(usize, 20);
+                for (buf[0..n]) |*b| b.* = r.intRangeAtMost(u8, 32, 126);
+                break :blk try nx.string.fromBytes(self.heap, buf[0..n]);
+            },
+            9 => blk: {
+                const high: u64 = r.int(u64) | (@as(u64, 1) << 63);
+                const neg = r.boolean();
+                break :blk try nx.bignum.fromLimbs(self.heap, neg, &[_]u64{ r.int(u64), high });
+            },
+            else => unreachable,
+        };
+    }
+
+    /// A scalar, or a list, vector, map (scalar keys) or set (scalar
+    /// elements) whose values nest up to `depth` more levels.
+    pub fn container(self: *Gen, depth: u8) Error!Value {
+        if (depth == 0) return self.scalar();
+        const leaf: u8 = if (depth >= 3) self.shape.deep_leaf else if (depth == 2) 5 else 7;
+        if (self.r.uintLessThan(u8, 10) < leaf) return self.scalar();
+        const hash = &nx.dispatch.hashValue;
+        const equal = &nx.dispatch.equal;
+        switch (self.r.uintLessThan(u8, 4)) {
+            0 => {
+                const elems = try self.allocator.alloc(Value, self.r.uintLessThan(usize, self.shape.list_max));
+                defer self.allocator.free(elems);
+                for (elems) |*slot| slot.* = try self.container(depth - 1);
+                return nx.list.fromSlice(self.heap, elems);
+            },
+            1 => {
+                var v = try nx.vector.empty(self.heap);
+                for (0..self.r.uintLessThan(usize, self.shape.vector_max)) |_|
+                    v = try nx.vector.conj(self.heap, v, try self.container(depth - 1));
+                return v;
+            },
+            2 => {
+                var m = try nx.champ.mapEmpty(self.heap);
+                for (0..self.r.uintLessThan(usize, self.shape.map_max)) |_| {
+                    const key = try self.scalar();
+                    m = try nx.champ.mapAssoc(self.heap, m, key, try self.container(depth - 1), hash, equal);
+                }
+                return m;
+            },
+            else => {
+                var s = try nx.champ.setEmpty(self.heap);
+                for (0..self.r.uintLessThan(usize, self.shape.set_max)) |_|
+                    s = try nx.champ.setConj(self.heap, s, try self.scalar(), hash, equal);
+                return s;
+            },
+        }
+    }
+};

@@ -8,10 +8,11 @@
 //!   G1. Flat-root sweep: random allocations, random root subset,
 //!       after collect every root's transitive closure survives and
 //!       every other unpinned block is freed.
-//!   G2. Nested reachability graph: 50–200 random heap objects
+//!   G2. Nested reachability graph: 60 random heap objects
 //!       (strings, lists, maps, sets, vectors) nested into each
-//!       other; a random subset declared as roots; assert
-//!       liveCount == |transitively-reachable-from-roots|.
+//!       other; a random subset declared as roots; after a cycle
+//!       exactly the objects transitively reachable from the roots
+//!       survive.
 //!   G3. Idempotence: `collect` called twice back-to-back with the
 //!       same roots frees 0 blocks on the second call.
 //!   G4. Pinning: any pinned block survives regardless of root
@@ -87,7 +88,7 @@ test "G1: random flat blocks with random root subset" {
 // G2. Nested reachability graph
 // -----------------------------------------------------------------------------
 
-test "G2: nested graph — reachable closure exactly matches liveCount" {
+test "G2: nested graph — exactly the pool members reachable from the roots survive a cycle" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -175,9 +176,8 @@ test "G2: nested graph — reachable closure exactly matches liveCount" {
     // objects' INTERMEDIATE path-copy allocations (all the earlier
     // root pointers for each collection built via repeated assoc/
     // conj) are already orphans at this point; the test doesn't
-    // track them in the reachable model. That's fine — we're only
-    // asserting the FINAL reachable-from-roots pool slice survives,
-    // not a specific live count.
+    // track them in the reachable model, so the assertions below are
+    // about pool members alone, not a live count.
     var roots: std.ArrayList(*HeapHeader) = .empty;
     defer roots.deinit(gpa);
     var root_indices: std.ArrayList(usize) = .empty;
@@ -198,35 +198,29 @@ test "G2: nested graph — reachable closure exactly matches liveCount" {
     var collector = Collector.init(&heap);
     _ = collector.collect(roots.items);
 
-    // For every pool index in the rooted reachable set, the
-    // corresponding final pool Value must still be accessible. We
-    // exercise this via a structural lookup for the easy kinds:
-    //   - strings: byteLen should not segfault.
-    //   - lists: count should work.
-    //   - vectors: count should work.
-    //   - maps/sets: count should work.
-    var ri = rooted_reach.iterator();
-    while (ri.next()) |entry| {
-        const idx = entry.key_ptr.*;
-        const v = pool[idx];
-        switch (v.kind()) {
-            .string => {
-                _ = string.byteLen(v);
-            },
-            .list => {
-                _ = list_mod.count(v);
-            },
-            .persistent_vector => {
-                _ = vector_mod.count(v);
-            },
-            .persistent_map => {
-                _ = champ.mapCount(v);
-            },
-            .persistent_set => {
-                _ = champ.setCount(v);
-            },
-            else => {},
+    // Exactly the rooted-reachable pool members survive: each pool
+    // member is its own block, referenced only by later members that
+    // hold it (no two indices share a header).
+    const Live = struct {
+        set: *std.AutoHashMap(*HeapHeader, void),
+        failed: bool = false,
+        pub fn visit(self: *@This(), h: *HeapHeader) void {
+            self.set.put(h, {}) catch {
+                self.failed = true;
+            };
         }
+    };
+    var live_set = std.AutoHashMap(*HeapHeader, void).init(gpa);
+    defer live_set.deinit();
+    var live: Live = .{ .set = &live_set };
+    heap.forEachLive(&live);
+    try std.testing.expect(!live.failed);
+    for (pool, 0..) |v, idx| {
+        const survived = live_set.contains(Heap.asHeapHeader(v));
+        std.testing.expectEqual(rooted_reach.contains(idx), survived) catch |err| {
+            std.debug.print("G2: pool[{d}] ({s}) reachable={} survived={}\n", .{ idx, @tagName(v.kind()), rooted_reach.contains(idx), survived });
+            return err;
+        };
     }
 }
 

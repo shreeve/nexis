@@ -33,140 +33,13 @@ const champ = nx.champ;
 const transient = nx.transient;
 const codec = nx.codec;
 const dispatch = nx.dispatch;
+const harness = @import("harness");
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;
 const Interner = intern_mod.Interner;
 
 const prng_seed: u64 = 0x636F_6465_635F_7870; // "px_codec" LE
-
-// =============================================================================
-// Random Value generator
-//
-// Produces a random Value of any serializable kind, nested up to
-// `max_depth`. Leaf preference increases as depth grows to keep
-// the recursion bounded. Every keyword / symbol name is interned
-// into `ctx.interner` before being returned.
-// =============================================================================
-
-const Gen = struct {
-    ctx: *TestCtx,
-    r: std.Random,
-
-    fn scalar(self: *Gen) !Value {
-        const pick = self.r.uintLessThan(u8, 10);
-        return switch (pick) {
-            0 => value.nilValue(),
-            1 => value.fromBool(true),
-            2 => value.fromBool(false),
-            3 => value.fromFixnum(self.r.intRangeAtMost(i64, value.fixnum_min, value.fixnum_max)).?,
-            4 => blk: {
-                // Random char (skip surrogates).
-                var c: u21 = self.r.intRangeAtMost(u21, 0, 0x10FFFF);
-                if (c >= 0xD800 and c <= 0xDFFF) c = 'a';
-                break :blk value.fromChar(c).?;
-            },
-            5 => blk: {
-                const f = self.r.float(f64);
-                break :blk value.fromFloat(f);
-            },
-            6 => blk: {
-                // Random keyword name.
-                var buf: [32]u8 = undefined;
-                const n = self.r.intRangeAtMost(usize, 1, 10);
-                for (buf[0..n]) |*b| b.* = self.r.intRangeAtMost(u8, 'a', 'z');
-                break :blk try self.ctx.interner.internKeywordValue(buf[0..n]);
-            },
-            7 => blk: {
-                var buf: [32]u8 = undefined;
-                const n = self.r.intRangeAtMost(usize, 1, 10);
-                for (buf[0..n]) |*b| b.* = self.r.intRangeAtMost(u8, 'A', 'Z');
-                break :blk try self.ctx.interner.internSymbolValue(buf[0..n]);
-            },
-            8 => blk: {
-                // Random string.
-                var buf: [32]u8 = undefined;
-                const n = self.r.uintLessThan(usize, 20);
-                for (buf[0..n]) |*b| b.* = self.r.intRangeAtMost(u8, 32, 126);
-                break :blk try string.fromBytes(&self.ctx.heap, buf[0..n]);
-            },
-            9 => blk: {
-                // Random bignum (force out-of-fixnum range).
-                const high: u64 = self.r.int(u64) | (@as(u64, 1) << 63);
-                const neg = self.r.boolean();
-                break :blk try bignum.fromLimbs(&self.ctx.heap, neg, &[_]u64{ self.r.int(u64), high });
-            },
-            else => unreachable,
-        };
-    }
-
-    fn container(self: *Gen, depth: u8) (std.mem.Allocator.Error || error{
-        InternTableFull,
-        EmptyName,
-        InvalidListTail,
-        Overflow,
-    })!Value {
-        if (depth == 0) return try self.scalar();
-
-        // Bias toward leaves as depth decreases.
-        const leaf_prob: u8 = if (depth >= 3) 3 else if (depth == 2) 5 else 7;
-        if (self.r.uintLessThan(u8, 10) < leaf_prob) return try self.scalar();
-
-        const pick = self.r.uintLessThan(u8, 4);
-        return switch (pick) {
-            0 => try self.makeList(depth - 1),
-            1 => try self.makeVector(depth - 1),
-            2 => try self.makeMap(depth - 1),
-            3 => try self.makeSet(depth - 1),
-            else => unreachable,
-        };
-    }
-
-    fn makeList(self: *Gen, depth: u8) !Value {
-        const n = self.r.uintLessThan(usize, 6);
-        const elems = try self.ctx.allocator.alloc(Value, n);
-        defer self.ctx.allocator.free(elems);
-        for (elems) |*slot| slot.* = try self.container(depth);
-        return try list_mod.fromSlice(&self.ctx.heap, elems);
-    }
-
-    fn makeVector(self: *Gen, depth: u8) !Value {
-        const n = self.r.uintLessThan(usize, 10);
-        var v = try vector_mod.empty(&self.ctx.heap);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const e = try self.container(depth);
-            v = try vector_mod.conj(&self.ctx.heap, v, e);
-        }
-        return v;
-    }
-
-    fn makeMap(self: *Gen, depth: u8) !Value {
-        const n = self.r.uintLessThan(usize, 8);
-        var m = try champ.mapEmpty(&self.ctx.heap);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            // Keys must be hashable, so we prefer scalar keys (no
-            // transients etc., which we never generate anyway).
-            const key = try self.scalar();
-            const val = try self.container(depth);
-            m = try champ.mapAssoc(&self.ctx.heap, m, key, val, &dispatch.hashValue, &dispatch.equal);
-        }
-        return m;
-    }
-
-    fn makeSet(self: *Gen, depth: u8) !Value {
-        const n = self.r.uintLessThan(usize, 8);
-        var s = try champ.setEmpty(&self.ctx.heap);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const e = try self.scalar();
-            _ = depth; // set elements: scalars only to keep hashing deterministic
-            s = try champ.setConj(&self.ctx.heap, s, e, &dispatch.hashValue, &dispatch.equal);
-        }
-        return s;
-    }
-};
 
 // =============================================================================
 // Test context
@@ -218,7 +91,7 @@ test "C1: 100000 random Values round-trip with equal hashes" {
     defer ctx.deinit();
 
     var prng = std.Random.DefaultPrng.init(prng_seed +% 1);
-    var gen = Gen{ .ctx = &ctx, .r = prng.random() };
+    var gen = harness.Gen{ .heap = &ctx.heap, .interner = &ctx.interner, .allocator = allocator, .r = prng.random() };
 
     for (0..100_000) |_| {
         defer ctx.resetHeap();

@@ -188,7 +188,6 @@ test "K4 every AVET key of an inline value is under 256 bytes" {
     var i: usize = 0;
     while (i < pairs_per_type) : (i += 1) {
         errdefer trial(prng_seed +% 4, i);
-        errdefer trial(prng_seed +% 3, i);
         const gpa = arena.reset();
         const v: Val = switch (rand.uintLessThan(u8, 9)) {
             0 => .{ .boolean = rand.boolean() },
