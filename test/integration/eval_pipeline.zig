@@ -2449,6 +2449,21 @@ test "protocol dispatch with NO impl raises :no-protocol-impl" {
     , ":no-protocol-impl");
 }
 
+test "protocol dispatch: the integer tower is one target, fixnum or bignum" {
+    // SEMANTICS §2.2: an integer's representation is invisible, so an
+    // impl for either integer kind covers both (PROTOCOLS.md §4.3).
+    try expectOutput(
+        \\(defprotocol Twice (twice [x]))
+        \\(extend-protocol Twice :fixnum (twice [x] (* 2 x)))
+        \\[(twice 140737488355327) (twice (inc 140737488355327)) (satisfies? Twice (* 1000000000 1000000000)) (satisfies? Twice 1.5)]
+    , "[281474976710654 281474976710656 true false]");
+    try expectOutput(
+        \\(defprotocol Kind (kind-of [x]))
+        \\(extend-protocol Kind :bignum (kind-of [x] :integer) :float (kind-of [x] :float))
+        \\[(kind-of 1) (kind-of (* 1000000000 1000000000)) (kind-of 1.0)]
+    , "[:integer :integer :float]");
+}
+
 test "protocol dispatch with zero args raises :arity-mismatch" {
     // `(bar)` has no receiver to dispatch on; dispatchProtocolMethod
     // raises ArityMismatch which surfaces as the catchable

@@ -1024,7 +1024,8 @@ pub const ProtocolMethodSpec = struct {
 
 /// DispatchKey: how protocol-fn dispatch finds an impl. For
 /// records, we key on `(:record, type_id)`. For built-in kinds
-/// we key on `(:builtin, kind_byte)`. PROTOCOLS.md §3.2.
+/// we key on `(:builtin, kind_byte)`, with the integer tower one
+/// key (`canonical`). PROTOCOLS.md §3.2.
 pub const DispatchKey = struct {
     tag: Tag,
     id: u32,
@@ -1035,16 +1036,18 @@ pub const DispatchKey = struct {
     };
 
     pub fn ofValue(v: value_mod.Value) DispatchKey {
-        if (v.kind() == .record) {
-            return .{
-                .tag = .record,
-                .id = @import("record.zig").typeId(v),
-            };
+        if (v.kind() == .record) return .{ .tag = .record, .id = record_mod.typeId(v) };
+        return canonical(.{ .tag = .builtin, .id = @intFromEnum(v.kind()) });
+    }
+
+    /// The integer tower is one type (SEMANTICS §2.2): a bignum
+    /// dispatches on the fixnum's key, so an impl for either integer
+    /// kind covers every integer whatever its representation.
+    pub fn canonical(key: DispatchKey) DispatchKey {
+        if (key.tag == .builtin and key.id == @intFromEnum(value_mod.Kind.bignum)) {
+            return .{ .tag = .builtin, .id = @intFromEnum(value_mod.Kind.fixnum) };
         }
-        return .{
-            .tag = .builtin,
-            .id = @intFromEnum(v.kind()),
-        };
+        return key;
     }
 };
 
@@ -2000,7 +2003,7 @@ pub const VM = struct {
         const proto = self.protocolById(protocol_id) orelse return error.NoProtocolMethod;
         for (proto.methods.items) |*method| {
             if (method.name_id == method_name_id) {
-                try method.impls.put(self.allocator, key, impl);
+                try method.impls.put(self.allocator, key.canonical(), impl);
                 return;
             }
         }
