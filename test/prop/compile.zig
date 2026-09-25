@@ -139,6 +139,12 @@ const cases = [_]Case{
     .{ .src = "(loop* [i 0 f (fn* [] 999)] (if (< i 1) (recur (+ i 1) (fn* [] i)) (f)))", .out = "0" },
     .{ .src = "((fn* [i f] (if (< i 1) (recur (+ i 1) (fn* [] i)) (f))) 0 (fn* [] 999))", .out = "0" },
     .{ .src = "(loop* [i 0 acc []] (if (< i 3) (recur (+ i 1) (conj acc (fn* [] i))) (mapv (fn* [f] (f)) acc)))", .out = "[0 1 2]" },
+    // A recur argument's handler sees its binding's old value when a
+    // finally throws after the argument's value was computed.
+    .{ .src = "(loop [a 1 n 0] (if (< n 1) (recur (try (try 5 (finally (throw :boom))) (catch any e a)) (inc n)) a))", .out = "1" },
+    .{ .src = "(loop [a 1 n 0] (if (< n 1) (recur (try (try (throw :x) (catch any e 5) (finally (throw :boom))) (catch any e a)) (inc n)) a))", .out = "1" },
+    .{ .src = "(do (defn f [a n] (if (< n 1) (recur (try (try 5 (finally (throw :boom))) (catch any e a)) (inc n)) a)) (f 1 0))", .out = "1" },
+    .{ .src = "(loop [a 1 n 0] (if (< n 1) (recur (if (pos? a) (try (try 5 (finally (throw :boom))) (catch any e a)) 0) (inc n)) a))", .out = "1" },
     // Variadic fns and recur into them.
     .{ .src = "((fn* [a & r] a) 1 2 3)", .out = "1" },
     .{ .src = "((fn* [a & r] r) 1 2 3)", .out = "(2 3)" },
@@ -671,7 +677,10 @@ test "eval: a form's lowering is freed once its routine is compiled" {
 // (new names and names that shadow), fn* called in place or bound
 // and called twice (closures over outer names), and a counting loop*
 // whose second binding's recur argument reads both bindings
-// (parallel assignment), sometimes through a closure. Each program
+// (parallel assignment), sometimes through a closure, or whose
+// recur argument is the step itself, and a guarded expression whose
+// value an inner finally discards by throwing, so its handler's
+// value is the result. Each program
 // is built as a tree, printed as source and evaluated directly; the
 // compiled program must agree. The reference computes in i128 and
 // the VM promotes past the fixnum range, so both print the same
@@ -691,8 +700,11 @@ const Expr = union(enum) {
     /// (let* [f (fn* [param] body)] (+ (f a1) (f a2)))
     twice: struct { f: u8, param: u8, body: *const Expr, a1: *const Expr, a2: *const Expr },
     /// (loop* [i 0 j init] (if (< i k) (recur (inc i) (+ j (* i step))) j)),
-    /// the step inside ((fn* [] step)) when `closure`.
-    loop: struct { i: u8, j: u8, k: u8, init: *const Expr, step: *const Expr, closure: bool },
+    /// the step inside ((fn* [] step)) when `closure`, and the recur
+    /// argument the step itself when `replace`.
+    loop: struct { i: u8, j: u8, k: u8, init: *const Expr, step: *const Expr, closure: bool, replace: bool },
+    /// (try (try body (finally (throw 0))) (catch any e handler))
+    guard: struct { body: *const Expr, handler: *const Expr },
 };
 
 const Names = struct {
@@ -733,7 +745,7 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
         return e;
     }
     const d = depth - 1;
-    e.* = switch (rand.uintLessThan(u8, 9)) {
+    e.* = switch (rand.uintLessThan(u8, 10)) {
         0, 1 => .{ .arith = .{ .op = "+-*"[rand.uintLessThan(usize, 3)], .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d) } },
         2 => .{ .inc = try genExpr(a, rand, names, d) },
         3 => .{ .if_lt = .{
@@ -762,9 +774,23 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
                 .a2 = try genExpr(a, rand, names, d),
             } };
         },
+        8 => .{ .guard = .{ .body = try genExpr(a, rand, names, d), .handler = try genExpr(a, rand, names, d) } },
         else => blk: {
             const i = names.binder(rand);
             const j: u8 = @intCast(names.len + 60);
+            const inner = names.with(i).with(j);
+            var step = try genExpr(a, rand, inner, d);
+            if (rand.boolean()) {
+                // A guard whose handler reads the binding the step
+                // rebinds: it must see the old value.
+                const j_ref = try a.create(Expr);
+                j_ref.* = .{ .ref = j };
+                const handler = try a.create(Expr);
+                handler.* = .{ .arith = .{ .op = '+', .a = j_ref, .b = try genExpr(a, rand, inner, d) } };
+                const guard = try a.create(Expr);
+                guard.* = .{ .guard = .{ .body = step, .handler = handler } };
+                step = guard;
+            }
             break :blk .{
                 .loop = .{
                     .i = i,
@@ -772,8 +798,9 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
                     .k = rand.uintLessThan(u8, 4),
                     // Bindings are sequential: `init` sees `i`.
                     .init = try genExpr(a, rand, names.with(i), d),
-                    .step = try genExpr(a, rand, names.with(i).with(j), d),
+                    .step = step,
                     .closure = rand.boolean(),
+                    .replace = rand.boolean(),
                 },
             };
         },
@@ -834,11 +861,20 @@ fn printExpr(e: *const Expr, w: *std.Io.Writer) !void {
         .loop => |x| {
             try w.print("(loop* [v{d} 0 v{d} ", .{ x.i, x.j });
             try printExpr(x.init, w);
-            try w.print("] (if (< v{d} {d}) (recur (inc v{d}) (+ v{d} (* v{d} ", .{ x.i, x.k, x.i, x.j, x.i });
+            try w.print("] (if (< v{d} {d}) (recur (inc v{d}) ", .{ x.i, x.k, x.i });
+            if (!x.replace) try w.print("(+ v{d} (* v{d} ", .{ x.j, x.i });
             if (x.closure) try w.writeAll("((fn* [] ");
             try printExpr(x.step, w);
             if (x.closure) try w.writeAll("))");
-            try w.print("))) v{d}))", .{x.j});
+            if (!x.replace) try w.writeAll("))");
+            try w.print(") v{d}))", .{x.j});
+        },
+        .guard => |x| {
+            try w.writeAll("(try (try ");
+            try printExpr(x.body, w);
+            try w.writeAll(" (finally (throw 0))) (catch any e ");
+            try printExpr(x.handler, w);
+            try w.writeAll("))");
         },
     }
 }
@@ -901,10 +937,14 @@ fn evalExpr(a: std.mem.Allocator, e: *const Expr, env: RefEnv) !i128 {
             var j = try evalExpr(a, x.init, try env.with(a, x.i, 0));
             while (i < x.k) {
                 const step = try evalExpr(a, x.step, try (try env.with(a, x.i, i)).with(a, x.j, j));
-                j = j + i * step;
+                j = if (x.replace) step else j + i * step;
                 i += 1;
             }
             break :blk j;
+        },
+        .guard => |x| blk: {
+            _ = try evalExpr(a, x.body, env);
+            break :blk try evalExpr(a, x.handler, env);
         },
     };
 }

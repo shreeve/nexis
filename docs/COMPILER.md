@@ -216,6 +216,12 @@ constant pool, Var table, capture descriptors, span table,
   VM.md §6) or by a later `closure:make` is never inside it:
   `(let* [x 1, f (g), h (fn* [] x)] h)` keeps `x`'s cell below `(g)`'s
   block.
+- **The destination is written last.** Every form writes its result
+  slot as its last act: nothing it evaluates runs after the write, so
+  no handler inside it can see the slot half-updated. A `try` with a
+  `finally` computes its value into a temporary and moves it to the
+  destination after the finally has run (§5.10). This is what lets a
+  `recur` argument compile straight into its binding's slot (§5.6).
 - **Operands in place.** A `math` or `cmp` instruction,
   `jump:if-false`, `var:store-var` and `ctrl:throw` read a literal (as
   a constant), a local held directly in its slot, an upvalue or a Var
@@ -368,7 +374,11 @@ semantics: every argument sees the bindings as they were before the
 a))`).
 
 - An argument for an uncaptured binding that no other argument
-  mentions compiles straight into the binding's slot.
+  mentions compiles straight into the binding's slot: the slot is
+  written only as the argument's last act (§4.4), so a handler inside
+  the argument reads the old value, as in
+  `(recur (try (try 5 (finally (throw :x))) (catch any e a)) ...)`,
+  which rebinds `a` to itself.
 - Every other argument is read in place when it is a constant, an
   upvalue or a slot no rebinding overwrites, and otherwise compiles
   into a fresh temporary; the moves into the binding slots follow once
@@ -466,7 +476,10 @@ a chain of `nexis.internal/#%catch-matches?` tests (MACROEXPAND.md
   to the catch entry; a captured binding is boxed first thing.
 - The `finally` body sees the enclosing scope, not the catch binding,
   and runs on every exit path; its value is discarded. Its semantics
-  (a throw in it replaces the pending one) are VM.md §12.
+  (a throw in it replaces the pending one) are VM.md §12. The body's
+  or handler's value waits in a temporary and moves to the result
+  slot once the finally completes, so a finally that throws leaves
+  the result slot as it was (§4.4).
 - A thrown value is any value; there is no exception object.
 
 #### 5.11 `(throw expr)`
