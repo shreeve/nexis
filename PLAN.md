@@ -299,8 +299,10 @@ Each item is a commitment; changing one takes an Amendment Log entry
     categories of their own; hashes are built so the invariant holds.
 37. **CHAMP is the persistent map and set**: separate data and node
     bitmaps, canonical layout.
-38. **Performance is a first-class goal.** Claims are published only
-    with measured numbers (`docs/BENCH.md`, `docs/PERF.md`).
+38. **Performance is a first-class goal.** A performance claim is a
+    measured ReleaseFast number (`docs/PERF.md`); a comparison with
+    Clojure is published only from same-machine numbers, the cases
+    Clojure wins included (`docs/BENCH.md`).
 
 **Frozen tables owned by module docs.** These carry §23's weight; each
 lives in one place:
