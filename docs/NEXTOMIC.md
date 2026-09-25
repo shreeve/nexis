@@ -41,11 +41,21 @@ below is a public function or a committed invariant of emdb as it stands
 
 Open with `emdb.EnvOptions{ .pageSize = 16384, .maxNamedTrees = 128 }`.
 Page size is fixed for the file's life (emdb INV-M05) and sets the
-4078-byte hard key bound; the Linux default would be 4K. All twelve
-trees are opened in one bootstrap write transaction at connect and their
-`TreeId`s cached for the connection's life (`treeNames` registration is
-not thread-safe; nothing else is); a tree the file lacks is created
-then, so a store written without one gains it at open.
+4078-byte hard key bound; the Linux default would be 4K. Connect opens
+all twelve trees, reads the `sys` header and finds `:db/fulltext` in one
+read transaction, and caches the `TreeId`s for the connection's life
+(`treeNames` registration is not thread-safe; nothing else is). Only a
+store missing one of them takes a write transaction at connect: a new
+file is bootstrapped, a tree the file lacks is created, and
+`:db/fulltext` is minted (§2.4). So opening a complete store writes
+nothing, waits on no writer, and succeeds on a file the process may
+only read, where every `transact!` is `:db/read-only`.
+
+emdb's writer lock is per file and makes a second writer wait for the
+first to end. Every connection to one file in the process sees the
+others (the stores are told apart by their `uuid`), so a write through
+one while another holds the file's write transaction is
+`:nextomic/nested` rather than a wait on itself.
 
 | tree | key | value |
 |---|---|---|
@@ -575,7 +585,7 @@ sub-plans with the same output variables.
 
 | form | semantics |
 |---|---|
-| `(d/connect path)` / `(d/connect path {:sync ...})` | open or create, making the parent directories, bootstrap on first open, cache idents and schema; returns a connection. The file starts as a 256 MB mapping and grows in 64 MB steps as it fills; `:db/map-full` only when it cannot grow |
+| `(d/connect path)` / `(d/connect path {:sync ...})` | open or create, making the parent directories, bootstrap on first open, cache idents and schema; returns a connection. A complete store opens without writing, read-only when the file is (§2). The file starts as a 256 MB mapping and grows in 64 MB steps as it fills; `:db/map-full` only when it cannot grow |
 | `(d/release conn)` | close, idempotent; `:nextomic/busy` while a query, pull, `transact!` or `with` on the connection is in flight (a released connection keeps its struct, so its db-values raise `:nextomic/closed`) |
 | `(d/db conn)` | db-value at the current basis |
 | `(d/basis-t db)` | the basis |

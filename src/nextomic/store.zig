@@ -4,10 +4,13 @@
 //! Invariants:
 //!   - The environment is opened with `pageSize = 16384` and
 //!     `maxNamedTrees = 128`; the page size is fixed for the file's life.
-//!   - All twelve trees are opened in one write transaction at open and
-//!     their `TreeId`s are cached for the store's life (tree registration
-//!     is the only non-thread-safe engine call); a tree absent from the
-//!     file is created then, so a store written without one gains it.
+//!   - All twelve trees are opened at open and their `TreeId`s are
+//!     cached for the store's life (tree registration is the only
+//!     non-thread-safe engine call). A complete store opens in a read
+//!     transaction; a write transaction creates a tree absent from the
+//!     file, so a store written without one gains it.
+//!   - Two stores of one file in this process never wait on each other's
+//!     writer lock: `beginWrite` refuses while another holds it.
 //!   - `sys["t"]` is the last committed logical transaction number and
 //!     commits atomically with the datoms it counts.
 //!   - Bootstrap ids are fixed (`boot`): a store created by any build has
@@ -208,17 +211,32 @@ pub const boot = struct {
 // Store
 // =============================================================================
 
+/// Every store open in this process, linked through `Store.next_open`:
+/// the stores of one file, told apart from others by their uuid, share
+/// the engine's writer lock (`Store.beginWrite`). The runtime is
+/// single-threaded, so the list is a plain global.
+var open_stores: ?*Store = null;
+
 pub const Store = struct {
     allocator: Allocator,
     env: emdb.Env,
     trees: Trees,
     uuid: [16]u8,
     is_open: bool,
+    /// The file could only be opened for reading: every write
+    /// transaction is `error.TxnReadOnly`.
+    read_only: bool = false,
     /// The id of the `:db/fulltext` attribute in this store.
     fulltext_aid: u32,
+    /// The next store open in this process (`open_stores`).
+    next_open: ?*Store = null,
 
     /// Open or create the store at `path`. The store is heap-allocated
     /// so the environment never moves while transactions reference it.
+    /// A store that has every tree, its header and `:db/fulltext` opens
+    /// in a read transaction alone; a write transaction runs only to
+    /// create, bootstrap or complete one. A file this process may not
+    /// write opens read-only.
     pub fn open(allocator: Allocator, path: [*:0]const u8, options: Options) !*Store {
         const self = try allocator.create(Store);
         errdefer allocator.destroy(self);
@@ -226,29 +244,44 @@ pub const Store = struct {
             .allocator = allocator,
             .env = undefined,
             .trees = undefined,
-            .uuid = undefined,
+            .uuid = @splat(0),
             .is_open = false,
             .fulltext_aid = boot.fulltext,
         };
-        self.env = try emdb.Env.open(path, .{
+        var env_options: emdb.EnvOptions = .{
             .pageSize = page_size,
             .maxNamedTrees = 128,
             .mapSize = options.map_size,
             .allocator = allocator,
-        });
+        };
+        self.env = emdb.Env.open(path, env_options) catch |err| switch (err) {
+            error.OpenFailed => blk: {
+                if (!readOnlyFile(path)) return err;
+                env_options.readOnly = true;
+                self.read_only = true;
+                break :blk emdb.Env.open(path, env_options) catch return err;
+            },
+            else => return err,
+        };
         errdefer self.env.close();
 
-        const txn = try self.env.beginWrite();
-        errdefer txn.abort();
-        try self.openTrees(txn);
-        if (try self.sysGet(txn, "format")) |_| {
-            try self.readHeader(txn);
-            try self.ensureFulltextAttr(txn);
-        } else {
-            try self.bootstrap(txn, options.fulltext_attr);
+        if (!try self.openComplete()) {
+            if (self.read_only) return error.TxnReadOnly;
+            if (self.sameFileWriter()) return error.WriterActive;
+            const txn = try self.env.beginWrite();
+            errdefer txn.abort();
+            try self.openTrees(txn);
+            if (try self.sysGet(txn, "format")) |_| {
+                try self.readHeader(txn);
+                try self.ensureFulltextAttr(txn);
+            } else {
+                try self.bootstrap(txn, options.fulltext_attr);
+            }
+            try txn.commit();
         }
-        try txn.commit();
         self.is_open = true;
+        self.next_open = open_stores;
+        open_stores = self;
         return self;
     }
 
@@ -259,7 +292,56 @@ pub const Store = struct {
             self.env.close();
             self.is_open = false;
         }
+        var link = &open_stores;
+        while (link.*) |s| : (link = &s.next_open) {
+            if (s == self) {
+                link.* = self.next_open;
+                break;
+            }
+        }
         self.allocator.destroy(self);
+    }
+
+    /// A regular file this process may read but not write: the one
+    /// `OpenFailed` that opens again read-only.
+    fn readOnlyFile(path: [*:0]const u8) bool {
+        if (std.c.access(path, std.c.R_OK) != 0 or std.c.access(path, std.c.W_OK) == 0) return false;
+        // A directory reads too, and is never a store.
+        const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true });
+        if (fd >= 0) {
+            _ = std.c.close(fd);
+            return false;
+        }
+        return true;
+    }
+
+    /// Does another store of this file hold its write transaction? A
+    /// store not yet bootstrapped has no uuid and shares no file.
+    fn sameFileWriter(self: *const Store) bool {
+        var it = open_stores;
+        while (it) |s| : (it = s.next_open) {
+            if (s != self and std.mem.eql(u8, &s.uuid, &self.uuid) and s.env.inner.currentWriter != null) return true;
+        }
+        return false;
+    }
+
+    /// Open the trees, header and `:db/fulltext` id of a complete store
+    /// in a read transaction; false when anything is missing.
+    fn openComplete(self: *Store) !bool {
+        const txn = try self.env.beginRead();
+        defer txn.abort();
+        var ids: [tree_names.len]TreeId = undefined;
+        for (tree_names, 0..) |name, i| {
+            ids[i] = txn.openTree(name, false) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+        }
+        self.setTrees(ids);
+        if ((try self.sysGet(txn, "format")) == null) return false;
+        try self.readHeader(txn);
+        self.fulltext_aid = (try self.identIdByName(txn, "db/fulltext")) orelse return false;
+        return true;
     }
 
     fn openTrees(self: *Store, txn: *Txn) !void {
@@ -267,6 +349,10 @@ pub const Store = struct {
         for (tree_names, 0..) |name, i| {
             ids[i] = try txn.openTree(name, true);
         }
+        self.setTrees(ids);
+    }
+
+    fn setTrees(self: *Store, ids: [tree_names.len]TreeId) void {
         self.trees = .{
             .current = ids[0..4].*,
             .history = ids[4..8].*,
@@ -308,8 +394,14 @@ pub const Store = struct {
     }
 
     /// Begin the write transaction with all twelve trees loaded.
+    /// emdb's writer lock is per file and makes a second writer wait for
+    /// the first to end; a second store on the same file in this
+    /// single-threaded process would wait on itself forever, so a write
+    /// held through any store of the same file is `error.WriterActive`.
     pub fn beginWrite(self: *Store, sync_mode: SyncMode) !*Txn {
         if (!self.is_open) return error.Closed;
+        if (self.read_only) return error.TxnReadOnly;
+        if (self.sameFileWriter()) return error.WriterActive;
         const txn = try self.env.beginWriteWith(.{ .sync = sync_mode.override() });
         errdefer txn.abort();
         try self.loadTrees(txn);
@@ -1182,4 +1274,48 @@ test "sys counters outside their partitions are corrupt" {
     try testing.expectError(error.Corrupted, store.readNextEid(txn));
     try store.sysPutInt(txn, "aid", 4, 0);
     try testing.expectError(error.Corrupted, store.readNextAid(txn));
+}
+
+test "reopening a complete store writes nothing, so a read-only file opens" {
+    var td = try TestDir.init("store_open_read");
+    defer td.deinit();
+    const committed = blk: {
+        const store = try Store.open(testing.allocator, td.path.ptr, .{});
+        defer store.close();
+        const txn = try store.beginRead();
+        defer txn.abort();
+        break :blk txn.txnId;
+    };
+    {
+        const store = try Store.open(testing.allocator, td.path.ptr, .{});
+        defer store.close();
+        const txn = try store.beginRead();
+        defer txn.abort();
+        try testing.expectEqual(committed, txn.txnId);
+    }
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(td.path.ptr, 0o444));
+    defer _ = std.c.chmod(td.path.ptr, 0o644);
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    {
+        const txn = try store.beginRead();
+        defer txn.abort();
+        try testing.expectEqual(@as(u64, 1), try store.readT(txn));
+    }
+    try testing.expectError(error.TxnReadOnly, store.beginWrite(.none));
+}
+
+test "a second store on the same file refuses to write while the first does" {
+    var td = try TestDir.init("store_same_file");
+    defer td.deinit();
+    const a = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer a.close();
+    const b = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer b.close();
+    const txn = try a.beginWrite(.none);
+    // emdb's writer lock would wait for `a`, which this thread holds.
+    try testing.expectError(error.WriterActive, b.beginWrite(.none));
+    txn.abort();
+    const again = try b.beginWrite(.none);
+    again.abort();
 }

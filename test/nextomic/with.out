@@ -12,6 +12,7 @@ ok as-of on db-after folds the speculative rows away
 ok the committed view is untouched inside the scope
 ok transact! inside the scope is nested
 ok with inside the scope is nested
+ok a second connection to the file is nested too, not blocked
 ok with returns f's value
 ok the committed basis is unchanged
 ok the speculative entity does not exist
