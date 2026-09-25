@@ -1257,6 +1257,14 @@ test "integration: *command-line-args* is nil without arguments; read-line needs
     try expectOutput("[*command-line-args* (try (read-line) (catch any e e))]", "[nil :io-error]");
 }
 
+test "integration: =, hash, set membership and printing of data nested past the stack are :stack-overflow" {
+    try expectOutput("(let [deep (fn [] (reduce (fn [acc _] [acc]) [] (range 200000)))] [(try (= (deep) (deep)) (catch :stack-overflow e :deep)) (try (hash (deep)) (catch :stack-overflow e :deep)) (try #{(deep) (deep)} (catch :stack-overflow e :deep)) (try (pr-str (deep)) (catch :stack-overflow e :deep))])", "[:deep :deep :deep :deep]");
+}
+
+test "integration: a record prints as #ns.Type{...}; defrecord and defprotocol may be redefined" {
+    try expectOutput("(defrecord P [x y]) (def old (->P 1 \"a\")) (defrecord P [x y z]) (defprotocol A (area [s])) (defprotocol A (area [s])) [(pr-str old) (pr-str (->P 1 2 3)) (= old (map->P {:x 1 :y \"a\"}))]", "[#user.P{:x 1, :y \"a\"} #user.P{:x 1, :y 2, :z 3} false]");
+}
+
 test "integration: flatten and compare of data nested past the stack are :stack-overflow" {
     try expectOutput("(let [deep (fn [] (reduce (fn [acc _] [acc]) [] (range 200000)))] [(try (flatten (deep)) (catch :stack-overflow e :deep)) (try (compare (deep) (deep)) (catch :stack-overflow e :deep))])", "[:deep :deep]");
 }

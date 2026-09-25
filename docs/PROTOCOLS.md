@@ -46,8 +46,7 @@ Facts about the boundary:
 - Protocol method calls have no inline cache; every call walks the
   registry (§5.5).
 - Redefining a record type or protocol with the same `(ns, name)`
-  is rejected with `:record-redefinition` / `:protocol-redefinition`
-  (§3.1).
+  registers a new one, as Clojure does (§3.1).
 - A protocol method has exactly one arity: the impl fn's own. The
   registry stores no per-method arity, and `defprotocol` ignores the
   parameter vectors in its method specs (§4.1).
@@ -230,12 +229,14 @@ maps). Names are owned by the registries (duped on registration).
 
 #### 3.1 Lifetime + redefinition
 
-- Defining a record type with a name that's already in
-  `record_registry` for the same `(ns, name)` → reject with
-  `:record-redefinition`. Avoids the confusing-state hazard
-  where existing instances reference an old type_id.
-- Defining a protocol with an existing `(ns, name)` → same
-  treatment: `:protocol-redefinition`.
+- Defining a record type with an existing `(ns, name)` registers
+  a new type id, as Clojure's `defrecord` makes a new class: the
+  constructors and predicate name the new type, and values built
+  before keep the old one (so they are not `=` to new ones).
+  `registerRecordType` also names the id in the interner, which is
+  how a record prints as `#ns.Type{...}`.
+- Defining a protocol with an existing `(ns, name)` registers a new
+  protocol with no impls, as Clojure's `defprotocol` does.
 - Adding impls to an existing protocol via
   `extend-protocol` / `extend-type` / `defrecord` is allowed (that's
   the whole point of those macros). Registering an impl for a
@@ -600,8 +601,6 @@ count surfaces as that fn's `:arity-mismatch`.
 | `:no-protocol-method` | Calling a method-name not defined on the protocol; extending a method the protocol does not declare |
 | `:no-protocol-impl` | Receiver kind has no impl + no default; protocol id not in the registry |
 | `:not-a-record` | `#%record-type-id` on a non-record |
-| `:record-redefinition` | `defrecord` with an existing `(ns, name)` |
-| `:protocol-redefinition` | `defprotocol` with an existing `(ns, name)` |
 | `:invalid-argument` | `extend-protocol`/`extend-type` keyword that names no kind and no alias |
 | `:arity-mismatch` | Protocol method called with no receiver; impl fn called with the wrong number of args |
 | `:kind-mismatch` | Internal natives / `satisfies?` receiving a value of the wrong kind (non-protocol, non-keyword method name, non-map fields, ...) |

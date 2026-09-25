@@ -4107,9 +4107,7 @@ fn fnExit(vm: *VM, args: []const Value) VmError!Value {
 ///
 /// Looks up the receiver VM's namespace registry to derive the
 /// effective ns prefix (the current namespace), then calls
-/// `vm.registerRecordType`. Re-defining a record type with the
-/// same (ns, name) raises `:record-redefinition` (avoids the
-/// stale type_id hazard).
+/// `vm.registerRecordType`; redefining a type registers a new one.
 fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
     const full_name_v = args[0];
     const fields_vec = args[1];
@@ -4137,10 +4135,7 @@ fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
         field_names[i] = interner.keywordName(id);
     }
 
-    const new_id = vm.registerRecordType(ns_name, type_name, field_names) catch |err| switch (err) {
-        error.RecordRedefinition => return VmError.RecordRedefinition,
-        error.OutOfMemory => return VmError.OutOfMemory,
-    };
+    const new_id = vm.registerRecordType(ns_name, type_name, field_names) catch return VmError.OutOfMemory;
     return value_mod.fromFixnum(@intCast(new_id)) orelse VmError.ArithmeticOverflow;
 }
 
@@ -4220,10 +4215,7 @@ fn fnRegisterProtocol(vm: *VM, args: []const Value) VmError!Value {
         specs[i] = .{ .name_id = id, .name = interner.keywordName(id) };
     }
 
-    const new_id = vm.registerProtocol(ns_name, proto_name, specs) catch |err| switch (err) {
-        error.ProtocolRedefinition => return VmError.ProtocolRedefinition,
-        error.OutOfMemory => return VmError.OutOfMemory,
-    };
+    const new_id = vm.registerProtocol(ns_name, proto_name, specs) catch return VmError.OutOfMemory;
     return protocol_mod.makeProtocol(vm.ensureHeap(), new_id) catch return VmError.OutOfMemory;
 }
 

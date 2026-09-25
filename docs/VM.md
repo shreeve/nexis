@@ -1066,7 +1066,7 @@ handler is active):
 | `:not-derefable` | `deref` of a value that is not a durable ref, Var or atom |
 | `:atom-re-entry` | `swap!` re-entered on the atom it is swapping (`docs/ATOM.md`) |
 | `:utf8-error`, `:invalid-argument`, `:io-error`, `:file-not-found`, `:invalid-path` | String and I/O natives |
-| `:record-redefinition`, `:not-a-record`, `:no-protocol-impl`, `:no-protocol-method`, `:protocol-redefinition` | Records and protocols (`docs/PROTOCOLS.md`) |
+| `:not-a-record`, `:no-protocol-impl`, `:no-protocol-method` | Records and protocols (`docs/PROTOCOLS.md`) |
 | `:stack-overflow` | A call would push frame number `VM.max_frames` (default 2^20, about a million; an embedder may set it), or a native re-entering the VM (`callValue`, `runRoutine`) finds the native stack past the guard's limit (§13.1). Runaway recursion ends in well under a second instead of growing memory until the process dies; legitimate recursion a hundred thousand calls deep runs |
 
 **Not catchable** (compiler bugs or corrupt bytecode; propagate
