@@ -420,8 +420,8 @@ suite proves the rooting rules; a test sets the three fields on its
 VM to the same effect.
 
 **Safe point.** The VM checks `gcDue` at exactly one place: before
-fetching an instruction, in each of its three run loops (`run`,
-`runWithFuel`, `runUntilDepth`). The check runs at a loop's first
+fetching an instruction, in its one run loop (`VM.loop`, which
+`run`, `callValue` and `runRoutine` all drive). The check runs at a loop's first
 fetch and at every fetch that follows an instruction of a group
 that can allocate (`math`, `call`, `closure`, `coll`, `ctrl`); a
 `mov`, `cmp`, `jump` or `var` instruction cannot move the heap's
@@ -429,7 +429,7 @@ counter, so the fetch after one skips the test. Between two instructions every
 live value is in a slot, a frame, a Var, the root stack or one of
 the other roots §3 lists, so a cycle there frees nothing live. A
 cycle can therefore run inside a native only through a call back
-into the VM (`callValue` runs `runUntilDepth`), which is what the
+into the VM (`callValue` runs the loop), which is what the
 root-stack rule in §3 accounts for. `Heap.alloc` never collects: a
 native, the compiler and the `coll:*` instructions allocate as many
 blocks as they like between callbacks with no rooting. Everything

@@ -1070,8 +1070,6 @@ pub const VmError = error{
     /// BytecodeCorruption (which is about totally unrecognized
     /// encoding).
     InvalidOperandKind,
-    /// `return` executed at the outermost frame (halt).
-    Halt,
     /// Bytecode exhausted without an explicit `return`. There is
     /// no implicit `return nil` at code-end.
     BytecodeExhausted,
@@ -1368,12 +1366,6 @@ pub const RootScope = struct {
         self.vm.roots.appendSlice(self.vm.allocator, vs) catch return VmError.OutOfMemory;
     }
 
-    /// The values this scope has pushed, in order. Valid until the
-    /// next push.
-    pub fn items(self: RootScope) []const Value {
-        return self.vm.roots.items[self.base..];
-    }
-
     pub fn release(self: RootScope) void {
         self.vm.roots.shrinkRetainingCapacity(self.base);
     }
@@ -1621,14 +1613,11 @@ pub const VM = struct {
         // Interner owns hash maps allocated via self.allocator;
         // free explicitly.
         if (self.interner) |*it| it.deinit();
-        // Namespace's HashMap storage belongs to us (allocated
-        // via self.allocator). Free it explicitly. Var struct
-        // memory itself is arena-backed and gets freed below.
-        if (self.namespace) |*ns| ns.deinit();
         // Registry owns its outer HashMap + per-ns
         // HashMaps (both via self.allocator). Free explicitly;
         // Namespace structs themselves are arena-backed.
         if (self.registry) |*reg| reg.deinit();
+        if (self.namespace) |*ns| ns.deinit();
         // Close any still-open db Connections as a
         // safety net (callers should explicitly `db/close`).
         // Callback closes the emdb env AND destroys the
@@ -1689,10 +1678,7 @@ pub const VM = struct {
 
     /// Lazy-initialize a NamespaceRegistry with the
     /// conventional `nexis.core` (auto-referred) and `user`
-    /// (default current) namespaces. Callers that want
-    /// multi-namespace semantics use this instead of
-    /// `ensureNamespace`. After init, `ensureNamespace()`
-    /// returns `registry.current` automatically.
+    /// (default current) namespaces.
     pub fn ensureRegistry(self: *VM) !*NamespaceRegistry {
         if (self.registry == null) {
             self.registry = NamespaceRegistry.initEmpty(
@@ -1936,11 +1922,6 @@ pub const VM = struct {
         return id;
     }
 
-    pub fn recordTypeById(self: *const VM, id: u32) ?*const RecordTypeEntry {
-        if (id >= self.record_registry.items.len) return null;
-        return &self.record_registry.items[id];
-    }
-
     /// Register a new protocol in
     /// the per-VM protocol registry. Method-spec is a slice of
     /// (interned-method-name-id, method-name-string) pairs;
@@ -2154,7 +2135,7 @@ pub const VM = struct {
             self.stack.shrinkRetainingCapacity(base);
             return err;
         };
-        try self.runUntilDepth(depth);
+        try self.loop(depth);
         // Back at `depth` without a return: a throw went past us.
         if (!result_cell.done) return VmError.ControlTransferred;
         return result_cell.value;
@@ -2273,7 +2254,7 @@ pub const VM = struct {
             .pc = 0,
             .host_result = &result_cell,
         });
-        self.runUntilDepth(initial_depth) catch |err| {
+        self.loop(initial_depth) catch |err| {
             self.recordErrorTrace(err);
             return err;
         };
@@ -2281,46 +2262,35 @@ pub const VM = struct {
         return result_cell.value;
     }
 
-    /// Dispatch instructions until
-    /// `frames.items.len == target_depth`. Unlike `run()`, does
-    /// NOT toggle global `halted` — termination is purely
-    /// depth-based. Throws
-    /// propagate identically to `run()` (translated to user
-    /// keyword Values when a handler exists; otherwise raw
-    /// VmError bubbles back to the caller).
-    fn runUntilDepth(self: *VM, target_depth: usize) VmError!void {
+    /// The fetch-and-dispatch loop, the only one: until the VM
+    /// halts when `depth` is 0 (`run`), or until the frame chain is
+    /// back to `depth` frames (`callValue`, `runRoutine`, which
+    /// pushed the frame above it). A recoverable error becomes a
+    /// keyword throw when a handler is in force
+    /// (`handleRuntimeError`); any other error, or one with no
+    /// handler, leaves the loop with the frames as they stood. When a
+    /// throw unwinds past `depth` the loop ends without its frame's
+    /// return, which the caller detects through its result cell.
+    /// The `frame` pointer is scoped to one iteration: `step` may
+    /// grow `frames` and invalidate it.
+    fn loop(self: *VM, depth: usize) VmError!void {
         var check_gc = true;
-        while (self.frames.items.len > target_depth) {
+        while (if (depth == 0) !self.halted else self.frames.items.len > depth) {
             if (check_gc and self.gcDue()) self.collectGarbage();
-            // Fetch.
             const frame = self.currentFrame();
-            if (frame.pc >= frame.routine.code.len) {
-                return VmError.BytecodeExhausted;
-            }
+            if (frame.pc >= frame.routine.code.len) return VmError.BytecodeExhausted;
             const inst = frame.routine.code[frame.pc];
             frame.pc += 1;
             if (inst.kind == .extension) return VmError.UnimplementedOpcode;
-
-            // Dispatch with the same error-handling shape as
-            // run(): ControlTransferred continues; other errors
-            // route through handleRuntimeError.
             check_gc = self.step(frame, inst) catch |err| switch (err) {
+                // A native's throw was caught below it: frames and pc
+                // are already at the handler.
                 VmError.ControlTransferred => true,
                 else => blk: {
-                    self.handleRuntimeError(err) catch |err2| switch (err2) {
-                        // If unwindThrow popped us past our target
-                        // depth, the throw escaped — let caller
-                        // (callValue) detect via result_cell.done.
-                        VmError.UncaughtThrow => return err2,
-                        else => return err2,
-                    };
+                    try self.handleRuntimeError(err);
                     break :blk true;
                 },
             };
-            // If unwindThrow inside dispatch popped frames past
-            // target_depth without our frame's call:return
-            // firing, our caller will detect this via result_cell.
-            if (self.frames.items.len <= target_depth) return;
         }
     }
 
@@ -2359,21 +2329,9 @@ pub const VM = struct {
     /// Decode a `.cell_internal` Value to its underlying
     /// `*UpvalCell`. Returns `ExpectedCell` if the Value's kind
     /// is anything else (the `:expected-cell` runtime trap).
-    /// Callers that already validated the kind (e.g., via
-    /// a `BindingRef.cell_slot` lookup) can use
-    /// `asCellUnchecked`; user-facing handlers should use this
-    /// validating variant.
     pub fn asCell(v: Value) VmError!*UpvalCell {
         if (v.kind() != value_mod.Kind.cell_internal) return VmError.ExpectedCell;
-        return asCellUnchecked(v);
-    }
-
-    /// Unchecked variant of `asCell` for paths that have already
-    /// validated the Value's kind. Safety builds still assert.
-    pub fn asCellUnchecked(v: Value) *UpvalCell {
-        std.debug.assert(v.kind() == value_mod.Kind.cell_internal);
-        const h: *heap_mod.HeapHeader = @ptrFromInt(v.payload);
-        return heap_mod.Heap.bodyOf(UpvalCell, h);
+        return heap_mod.Heap.bodyOf(UpvalCell, @ptrFromInt(v.payload));
     }
 
     /// Pointer to the currently-executing frame. **Single-shot use
@@ -2557,12 +2515,12 @@ pub const VM = struct {
     /// `BytecodeExhausted`. Any error that leaves the run records
     /// the frame chain in `error_trace` first.
     pub fn run(self: *VM) VmError!Value {
-        const result = self.runLoop() catch |err| {
+        self.loop(0) catch |err| {
             self.recordErrorTrace(err);
             return err;
         };
         self.frames.items[0].routine = &idle_routine;
-        return result;
+        return self.result;
     }
 
     /// Where `err` left the run: every frame, innermost first, with
@@ -2615,72 +2573,6 @@ pub const VM = struct {
         self.frames.items[0].routine = &idle_routine;
     }
 
-    /// The dispatch loop. The `frame` pointer is scoped inside a
-    /// nested block so it cannot be reused after `dispatch()`, which
-    /// may grow `frames` and invalidate it.
-    fn runLoop(self: *VM) VmError!Value {
-        var check_gc = true;
-        while (!self.halted) {
-            if (check_gc and self.gcDue()) self.collectGarbage();
-            const frame = self.currentFrame();
-            if (frame.pc >= frame.routine.code.len) {
-                return VmError.BytecodeExhausted;
-            }
-            const inst = frame.routine.code[frame.pc];
-            frame.pc += 1;
-            // Extension instructions are unimplemented.
-            if (inst.kind == .extension) return VmError.UnimplementedOpcode;
-
-            check_gc = self.step(frame, inst) catch |err| switch (err) {
-                // Internal control-transfer signal from a
-                // callValue/native re-
-                // entry path. Frame + PC already adjusted by
-                // unwindThrow; just continue dispatch.
-                VmError.ControlTransferred => true,
-                else => blk: {
-                    // Recoverable VM errors get translated into
-                    // user Values
-                    // and routed through unwindThrow.
-                    try self.handleRuntimeError(err);
-                    break :blk true;
-                },
-            };
-        }
-        return self.result;
-    }
-
-    /// Run bytecode with a step budget. Returns `BytecodeExhausted`
-    /// if the routine completes within the budget without halting;
-    /// returns the result Value on normal halt. Intended for tests
-    /// that exercise potentially-pathological bytecode — using
-    /// `run()` for malformed/unimplemented opcode tests risks
-    /// hanging when the bytecode happens to decode as a
-    /// self-targeting jump. Same frame-pointer scoping discipline
-    /// as `run()`.
-    pub fn runWithFuel(self: *VM, max_steps: usize) VmError!Value {
-        var steps: usize = 0;
-        var check_gc = true;
-        while (!self.halted) : (steps += 1) {
-            if (steps >= max_steps) return VmError.BytecodeExhausted;
-            if (check_gc and self.gcDue()) self.collectGarbage();
-            const frame = self.currentFrame();
-            if (frame.pc >= frame.routine.code.len) {
-                return VmError.BytecodeExhausted;
-            }
-            const inst = frame.routine.code[frame.pc];
-            frame.pc += 1;
-            if (inst.kind == .extension) return VmError.UnimplementedOpcode;
-            check_gc = self.step(frame, inst) catch |err| switch (err) {
-                VmError.ControlTransferred => true,
-                else => blk: {
-                    try self.handleRuntimeError(err);
-                    break :blk true;
-                },
-            };
-        }
-        return self.result;
-    }
-
     /// Runtime error translation to a user-throwable Value.
     /// Recoverable errors (per VM.md
     /// §13 "Recoverable via try/catch" column) become keyword
@@ -2708,64 +2600,47 @@ pub const VM = struct {
         try self.unwindThrow(payload);
     }
 
-    /// Two-level switch dispatcher. VM.md §8's contract is
-    /// "tail-call-threaded"; this switch is semantically
-    /// equivalent (latitude per PLAN §12.5 fallback) and is not
-    /// threaded.
-    fn dispatch(self: *VM, inst: Inst) VmError!void {
-        const g = inst.groupOf();
-        switch (g) {
-            .mov => try self.execMov(self.currentFrame(), inst),
-            .call => try self.execCall(inst),
-            .math => try self.execMath(self.currentFrame(), inst),
-            .cmp => try self.execCmp(self.currentFrame(), inst),
-            .jump => try self.execJump(self.currentFrame(), inst),
-            .closure => try self.execClosure(inst),
-            .var_ => try self.execVar(self.currentFrame(), inst),
-            .coll => try self.execColl(inst),
-            .ctrl => try self.execCtrl(inst),
+    /// One instruction, fetched from `frame`: the two-level switch
+    /// of VM.md §8, on the group and then in each handler on the
+    /// variant. The groups that never allocate and never push or pop
+    /// a frame (`mov`, `cmp`, `jump`, `var`) run against `frame`
+    /// directly; `math` allocates only on the heap and runs the same
+    /// way; the others re-derive the frame. Returns whether the
+    /// instruction could have allocated, which is when the next safe
+    /// point has to test for a due collection: the heap's counter
+    /// cannot move otherwise.
+    inline fn step(self: *VM, frame: *Frame, inst: Inst) VmError!bool {
+        switch (inst.groupOf()) {
+            .mov => try self.execMov(frame, inst),
+            .cmp => try self.execCmp(frame, inst),
+            .jump => try self.execJump(frame, inst),
+            .var_ => try self.execVar(frame, inst),
+            .math => {
+                try self.execMath(frame, inst);
+                return true;
+            },
+            .call => {
+                try self.execCall(inst);
+                return true;
+            },
+            .closure => {
+                try self.execClosure(inst);
+                return true;
+            },
+            .coll => {
+                try self.execColl(inst);
+                return true;
+            },
+            .ctrl => {
+                try self.execCtrl(inst);
+                return true;
+            },
             // Known groups with no implemented variants.
             .transient, .hash, .tx, .io, .simd => return VmError.UnimplementedOpcode,
             // Unrecognized group byte — bytecode corruption.
             _ => return VmError.BytecodeCorruption,
         }
-    }
-
-    /// One instruction of the loops, fetched from `frame`. The
-    /// groups that never allocate and never push or pop a frame
-    /// (`mov`, `cmp`, `jump`, `var`) run against `frame` directly;
-    /// `math` allocates only on the heap and runs the same way;
-    /// every other group goes through `dispatch`. Returns whether
-    /// the instruction could have allocated, which is when the next
-    /// safe point has to test for a due collection: the heap's
-    /// counter cannot move otherwise.
-    inline fn step(self: *VM, frame: *Frame, inst: Inst) VmError!bool {
-        switch (inst.groupOf()) {
-            .mov => {
-                try self.execMov(frame, inst);
-                return false;
-            },
-            .cmp => {
-                try self.execCmp(frame, inst);
-                return false;
-            },
-            .jump => {
-                try self.execJump(frame, inst);
-                return false;
-            },
-            .var_ => {
-                try self.execVar(frame, inst);
-                return false;
-            },
-            .math => {
-                try self.execMath(frame, inst);
-                return true;
-            },
-            else => {
-                try self.dispatch(inst);
-                return true;
-            },
-        }
+        return false;
     }
 
     // -------------------------------------------------------------------------
@@ -3801,7 +3676,6 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.UninitializedCell,
         VmError.CallBlockOutOfRange,
         VmError.InvalidHandlerState,
-        VmError.Halt,
         VmError.ControlTransferred,
         => null,
     };
@@ -5013,9 +4887,7 @@ test "VM: known-but-not-implemented group returns UnimplementedOpcode" {
     // transient group (8) with variant 0 — a known group with no
     // implemented variants. Invariant: this test must name a
     // group the dispatcher does not implement (transient, hash,
-    // tx, io or simd). Use `runWithFuel` (not `run`) so a
-    // mistake here trips fuel exhaustion instead of hanging the
-    // suite.
+    // tx, io or simd).
     const var_op = Inst.primary(
         .transient,
         @as(Mov, @enumFromInt(0)), // variant 0 — placeholder; only the group matters
@@ -5031,7 +4903,7 @@ test "VM: known-but-not-implemented group returns UnimplementedOpcode" {
 
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
-    const res = vm.runWithFuel(100);
+    const res = vm.run();
     try testing.expectError(VmError.UnimplementedOpcode, res);
 }
 
@@ -6030,7 +5902,7 @@ test "VM jump: target with wrong operand kind surfaces InvalidOperandKind" {
     defer vm.deinit();
     // Bounded execution as a defense-in-depth measure: even if the
     // kind check were removed, this can't hang the suite.
-    const res = vm.runWithFuel(100);
+    const res = vm.run();
     try testing.expectError(VmError.InvalidOperandKind, res);
 }
 
@@ -6047,7 +5919,7 @@ test "VM jump: target == code.len traps OperandOutOfRange" {
 
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
-    const res = vm.runWithFuel(100);
+    const res = vm.run();
     try testing.expectError(VmError.OperandOutOfRange, res);
 }
 

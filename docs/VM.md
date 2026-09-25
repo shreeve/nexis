@@ -682,19 +682,19 @@ loop:
   inst = frame.routine.code[frame.pc]; frame.pc += 1
   switch inst.group:                       -- step
     .mov, .cmp, .jump, .var, .math => exec<Group>(frame, inst) -> switch variant
-    other => dispatch(inst):
-      .call    => execCall(inst)
-      ...
-      .transient, .hash, .tx, .io, .simd => UnimplementedOpcode
-      other    => BytecodeCorruption
+    .call, .closure, .coll, .ctrl  => exec<Group>(inst)        -> switch variant
+    .transient, .hash, .tx, .io, .simd => UnimplementedOpcode
+    other    => BytecodeCorruption
 ```
 
 The groups that never push or pop a frame (`mov`, `cmp`, `jump`,
 `var`, `math`) resolve their operands through the frame pointer the
-fetch took (`resolveIn`, `storeIn`, `slotPtrIn`); the others go
-through `dispatch`, whose handlers re-derive the current frame
-because a call or a native may have grown `frames`. The bounds
-checks are the same on both paths.
+fetch took (`resolveIn`, `storeIn`, `slotPtrIn`); the others
+re-derive the current frame because a call or a native may have
+grown `frames`. The bounds checks are the same on both paths.
+`run` drives the loop until the VM halts; `callValue` and
+`runRoutine` drive the same loop until the frame they pushed
+returns.
 
 **Contract**:
 - PC increment happens before handler entry: handlers see the
@@ -732,8 +732,8 @@ stack (`vm.roots`), pending `finally` throws, `vm.unhandled_throw`,
 constants) and a cell (its value).
 
 **Trigger and safe point.** `VM.gcDue` is checked at the
-instruction fetch in `run`, `runWithFuel` and `runUntilDepth`, and
-nowhere else: at a loop's first fetch and at every fetch that
+instruction fetch of `VM.loop`, the one run loop (`run`,
+`callValue` and `runRoutine` drive it), and nowhere else: at a loop's first fetch and at every fetch that
 follows an instruction of a group that can allocate (`math`,
 `call`, `closure`, `coll`, `ctrl`); the fetch after a `mov`, `cmp`,
 `jump` or `var` instruction skips the test because the heap's
@@ -1087,10 +1087,11 @@ out of `run`):
 | `InvalidHandlerState` | `try-exit` / `finally-exit` with no matching handler or continuation |
 | `OutOfMemory` | Allocation failure |
 
-**Control signals** (not errors in the user sense): `Halt` (the
-outermost `return`), `ControlTransferred` (a native's throw has been
-caught and the run loop resumes at the handler), `UncaughtThrow`
-(no handler; value in `vm.unhandled_throw`).
+**Control signals** (not errors in the user sense):
+`ControlTransferred` (a native's throw has been caught and the run
+loop resumes at the handler), `UncaughtThrow` (no handler; value in
+`vm.unhandled_throw`). The outermost `return` is no error: it sets
+`vm.halted` and `run` returns `vm.result`.
 
 Frames live on the heap, so bytecode recursion costs no native
 stack; its depth is bounded by `VM.max_frames`. The native stack is
