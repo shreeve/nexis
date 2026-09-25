@@ -926,10 +926,12 @@ fn withVarMeta(ctx: *ExpandContext, def_form: *Form, meta_items: []const *Form, 
 ///       (throw g#))))
 ///     (finally ...)?)
 ///
-/// A MATCHER is `any` (every value, no test) or a keyword TAG,
-/// which matches a thrown value equal to TAG or a map whose
-/// `:error` entry is TAG: the shape Nextomic's error maps and the
-/// no-matching-clause map already have. Clauses are tried in
+/// A MATCHER is `any` (every value, no test), a keyword TAG, which
+/// matches a thrown value equal to TAG or a map whose `:error` entry
+/// is TAG (the shape of Nextomic's error maps and the
+/// no-matching-clause map), or, for code written for Clojure, a
+/// class name (`Exception`, `Throwable`, any symbol) or `:default`,
+/// which match every value as `any` does: nexis has no classes. Clauses are tried in
 /// order; a value no clause matches is rethrown, so it unwinds
 /// through the `finally` to the enclosing `try`. With no clause at
 /// all the handler is the rethrow, which is finally-only `try`;
@@ -1003,12 +1005,13 @@ fn expandTry(
         for (ci[3..]) |h| try let_items.append(ctx.allocator, try expandForm(ctx, &handler_env, h));
         const clause_body = try makeListInline(ctx, origin, let_items.items);
 
-        const is_any = matcher.datum == .symbol and matcher.datum.symbol.ns == null and std.mem.eql(u8, matcher.datum.symbol.name, "any");
+        const is_any = matcher.datum == .symbol or
+            (matcher.datum == .keyword and matcher.datum.keyword.ns == null and std.mem.eql(u8, matcher.datum.keyword.name, "default"));
         if (is_any) {
             handler = clause_body;
             continue;
         }
-        if (matcher.datum != .keyword) return ExpandError.MalformedMacroCall;
+        if (matcher.datum != .keyword) return ctx.fail(matcher.origin, "catch: expected any, a class name or a keyword tag, not {s}", .{describeForm(matcher)});
         const test_form = try makeListInline(ctx, origin, &.{
             try makeQualifiedSymbol(ctx, "nexis.internal", "#%catch-matches?", origin),
             try makeSymbol(ctx, g_name, origin),

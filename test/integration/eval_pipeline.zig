@@ -506,6 +506,16 @@ test "try: catch clauses match by keyword tag, in order, or rethrow" {
     try expectProgramError("(try 1 (catch any e 1) 2)", compile.CompileError.MacroExpansionFailure);
 }
 
+test "try: a class-name matcher or :default catches anything, as Exception would" {
+    try expectOutput("(try (/ 1 0) (catch ArithmeticException e :caught))", ":caught");
+    try expectOutput("(try (throw (ex-info \"boom\" {})) (catch Exception e (ex-message e)))", "boom");
+    try expectOutput("(try (throw :x) (catch Throwable e e))", ":x");
+    try expectOutput("(try (throw :x) (catch clojure.lang.ExceptionInfo e [:info e]))", "[:info :x]");
+    try expectOutput("(try (throw :x) (catch :default e [:default e]))", "[:default :x]");
+    // Clauses still run in order: a tag before a class name wins.
+    try expectOutput("(try (throw :a) (catch :a e 1) (catch Exception e 2))", "1");
+}
+
 test "empty bodies are nil and () is the empty list" {
     try expectOutput("((fn []))", "nil");
     try expectOutput("(do (defn e0 []) (e0))", "nil");
