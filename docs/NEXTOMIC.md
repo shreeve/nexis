@@ -39,7 +39,8 @@ below is a public function or a committed invariant of emdb as it stands
 
 ## 2. Store layout
 
-Open with `emdb.EnvOptions{ .pageSize = 16384, .maxNamedTrees = 128 }`.
+Open with `emdb.EnvOptions{ .pageSize = 16384, .maxNamedTrees = 128 }`,
+the geometry of every nexis store (`db.page_size`, `db.max_named_trees`).
 Page size is fixed for the file's life (emdb INV-M05) and sets the
 4078-byte hard key bound; the Linux default would be 4K. Connect opens
 all twelve trees, reads the `sys` header and finds `:db/fulltext` in one
@@ -69,7 +70,7 @@ one while another holds the file's write transaction is
 | `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
 | `nx/txlog` | `[t:6]` | codec vector `[instant [e a v added] ...]`, with a trailing map `{:excised [e ...]}` on an entry an excision touched |
 | `nx/idents` | `[0x00][utf8 text]` → id, `[0x01][id:4]` → text, `[0x02][utf8 text]` → id for a name a rename retired | |
-| `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"` | see §2.3 |
+| `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"`, `"n"[a:4]` | see §2.3 |
 | `nx/fulltext` | `[a:4][token][0x00][e:6][hash128(v):16]` | empty; one row per token of each current string value of a `:db/fulltext` attribute (§5 "fulltext") |
 
 `top` = `(t << 1) | added`. `v` is always followed only by fixed-width
@@ -127,8 +128,10 @@ line with `(= 1 1.0)` being false.
 index key is an equality key, not an order key. A string or byte array
 has one tag whatever its length, so byte order equals value order
 across the threshold whenever two values differ within their first 64
-bytes; two values that agree on those 64 bytes order by hash when
-either is out of line. The decoder tells the shapes apart by the bare
+bytes. When two values agree on those 64 bytes, an out-of-line one
+sorts after the inline value that is those bytes alone and before any
+longer inline one (its `0x00 0x01` precedes every content byte), and
+two out-of-line values order by hash. The decoder tells the shapes apart by the bare
 `0x00`: an inline value ends there, an out-of-line value continues with
 the `0x01` marker and the hash (the hash is two seeded xxh3-64 lanes).
 Range predicates compare decoded values, never index keys, so they
@@ -153,6 +156,7 @@ bytes, inside emdb's 256-byte search-clue buffer.
 | `"eid"` | u48 next user entity id |
 | `"aid"` | u32 next attribute / ident id |
 | `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once |
+| `"n"` `[a:4]` | u64 count of the current datoms of attribute `a`, kept by every transaction and excision; the planner's estimate (§5) |
 
 ### 2.4 Bootstrap
 

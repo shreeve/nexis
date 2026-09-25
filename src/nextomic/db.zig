@@ -50,7 +50,6 @@ pub const SyncMode = store_mod.SyncMode;
 // Errors (§7)
 // =============================================================================
 
-/// The Nextomic error set; each maps to a `:nextomic/*` keyword.
 /// The error set of `f`, for naming a module's failures by the
 /// operations it performs.
 pub fn ErrorsOf(comptime f: anytype) type {
@@ -72,6 +71,7 @@ pub const Fault = struct {
     cas: ?struct { expected: ?Val, actual: ?Val } = null,
 };
 
+/// The Nextomic error set; each maps to a `:nextomic/*` keyword.
 pub const Error = error{
     HistoryView,
     UnknownAttribute,

@@ -2,8 +2,9 @@
 //! and the raw datom write / scan primitives (NEXTOMIC.md §2).
 //!
 //! Invariants:
-//!   - The environment is opened with `pageSize = 16384` and
-//!     `maxNamedTrees = 128`; the page size is fixed for the file's life.
+//!   - The environment is opened with the geometry every nexis store
+//!     shares (`db.page_size`, `db.max_named_trees`); the page size is
+//!     fixed for the file's life.
 //!   - All twelve trees are opened at open and their `TreeId`s are
 //!     cached for the store's life (tree registration is the only
 //!     non-thread-safe engine call). A complete store opens in a read
@@ -29,6 +30,7 @@ const std = @import("std");
 const emdb = @import("emdb");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
+const db_layer = @import("../db.zig");
 
 const Allocator = std.mem.Allocator;
 const Txn = emdb.Txn;
@@ -36,7 +38,6 @@ const TreeId = emdb.TreeId;
 const Index = key.Index;
 const Datom = datom_mod.Datom;
 
-pub const page_size: u32 = 16384;
 pub const format_version: u16 = 1;
 
 // =============================================================================
@@ -249,8 +250,8 @@ pub const Store = struct {
             .fulltext_aid = boot.fulltext,
         };
         var env_options: emdb.EnvOptions = .{
-            .pageSize = page_size,
-            .maxNamedTrees = 128,
+            .pageSize = db_layer.page_size,
+            .maxNamedTrees = db_layer.max_named_trees,
             .mapSize = options.map_size,
             .allocator = allocator,
         };
