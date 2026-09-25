@@ -39,7 +39,7 @@ here.
   current namespace and the namespace registry; `(require ...)`
   file loading lives in `src/loader.zig`.
 - Primitive core: `quote`, `if`, `do`, `let*`, `fn*`, `letfn*`,
-  `recur`, `loop*`, `def`, `defn`, `var`, `try`/`catch`/`finally`,
+  `recur`, `loop*`, `def`, `var`, `try`/`catch`/`finally`,
   `throw`, plus the internal constructors `#%list`, `#%concat`,
   `#%vector`, `#%map`, `#%set` that syntax-quote and quoted
   compound literals lower to.
@@ -49,16 +49,15 @@ here.
   end-to-end eval pipeline (`test/integration/eval_pipeline.zig`).
 
 **Absent (stated as facts):**
-- No constant folding of any kind. `(+ 1 2)` compiles to
-  `math:add`.
+- No folding of computations: `(+ 1 2)` compiles to `math:add`.
+  Only collections of constants are built at compile time
+  (§4.4).
 - No bytecode cache and no object file: nothing writes or reads
   `.nx.o`. Every run compiles from source.
 - No separate resolver or analyzer module; classification and
-  capture analysis happen inside `lowerForm` and the `Emitter`.
-- No source-span map on routines: compile errors carry a span,
-  runtime errors do not.
-- No slot liveness analysis: slots are bump-allocated per routine
-  (§4.4).
+  capture marking happen inside `lowerForm`.
+- No register allocation beyond a stack of slots: a slot is
+  freed when the form that allocated it is compiled (§4.4).
 - No profile-guided optimization, inline caches or
   operand-specialized opcodes; no ahead-of-time linker.
 
@@ -81,9 +80,10 @@ Form tree
 Expanded Form tree
    │
    ▼  lowerForm (src/compile.zig)
-Tiny IR (symbols classified, special forms recognized)
+Tiny IR (symbols classified, special forms recognized, captured
+         bindings marked)
    │
-   ▼  Emitter (src/compile.zig) — capture pre-analysis + codegen
+   ▼  Emitter (src/compile.zig) — codegen
 Bytecode routines (code + consts + var_table + capture_descs)
    │
    ▼  VM (src/vm.zig)
@@ -100,7 +100,8 @@ compiler bug, not a user error.
 
 **Invariant**: Form trees, Tiny IR and the `Compiled` routine
 records live in a compile arena owned by the caller of the
-compile entry points.
+compile entry points; `CompileOptions.routine_allocator` can put
+the routines on a longer-lived allocator than the trees.
 
 - **Lifetime, file run** (`nexis run FILE.nx`): one compile arena
   for the whole file, released together at the end.
@@ -109,12 +110,23 @@ compile entry points.
   sub-routine pointers that must outlive the line, and a line's
   definitions are called from later lines. The source bytes go
   there too (`Tiny.symbol` slices borrow from them).
+- **Lifetime, `eval`**: the Form and Tiny trees and the Emitter's
+  working storage live in a scratch arena freed when `eval`
+  returns; the routine, its constants, span table and closure
+  prototypes are compiled onto the runtime's persistent arena
+  (`CompileOptions.routine_allocator`), since a closure the form
+  returns, a Var it defines and the frame an escaping throw
+  leaves in place outlive the call. What each `eval` keeps is its
+  routine: a few hundred bytes, not the trees it came from.
 - **Runtime-heap cross-over**: literal Values that must reach
-  runtime (quoted compound collections, interned symbols and
-  keywords) are built through the heap and interner plumbed into
-  the lowering context (`LowerCtx.heap`, `LowerCtx.interner`) and
-  placed in the routine's constant pool. Without an interner,
-  quoted symbols and keywords are `UnsupportedFeature`.
+  runtime (strings, bignums, collections of constants, interned
+  symbols and keywords) are built through the heap and interner
+  plumbed into the lowering context (`LowerCtx.heap`,
+  `LowerCtx.interner`) and placed in the routine's constant pool,
+  which the collector marks for as long as a frame or a closure
+  can run the routine (VM.md §9). Nothing collects between
+  lowering a form and running it. Without an interner, quoted
+  symbols and keywords are `UnsupportedFeature`.
 - **No GC**: the compile arena is a plain bump allocator, not
   tracked by `src/gc.zig`. Freeing is the arena drop.
 
@@ -168,16 +180,28 @@ compiler relies on:
 - **Symbol classification (priority order)**:
   1. **Special form** — if the symbol is a primitive-core name
      (`quote`, `if`, `do`, `let*`, `fn*`, `letfn*`, `recur`,
-     `loop*`, `def`, `defn`, `var`, `try`, `throw`, and the
+     `loop*`, `def`, `var`, `try`, `throw`, and the
      `#%` constructors) AND in operator position. Special forms
      are reserved: they are recognized regardless of lexical
-     bindings.
-  2. **Inlined intrinsic** — `+` and `<` with exactly two
-     operands lower to `math:add` / `cmp:lt` directly, unless
-     the name is lexically shadowed (`LowerEnv`). A Var named
-     `+` does not disable the inlining: `(do (def + f) (+ 1 2))`
-     still inlines. The qualified `nexis.core/+` and
-     `nexis.core/<` with two operands inline unconditionally: a
+     bindings. The names are the expander's `special_forms`
+     (MACROEXPAND.md §5) less the four it rewrites before
+     lowering (`ns`, `require`, `defmacro`, `set!`); a test holds
+     the two tables to that.
+  2. **Inlined core fn** — a call of `+`, `-`, `*`, `/`,
+     `quot`, `mod`, `<`, `<=`, `>`, `>=` or `==` with two
+     operands, of `-` or `abs` with one, or of `inc` / `dec`
+     (`+` / `-` with a constant 1) lowers to one `math` or `cmp`
+     instruction (`Tiny.prim`), which runs the numeric-tower
+     helper the fn itself runs (VM.md §10), so results and errors
+     are the fn's. It does so when the operator means
+     `nexis.core`'s Var: it is not lexically bound
+     (`LowerEnv`), the namespace resolves it to `nexis.core`'s Var
+     rather than one it defines or refers to, and (outside
+     `nexis.core`) the file or REPL line being compiled does not
+     define it (`DeclaredNames`), so `(do (def + f) (+ 1 2))` calls
+     `f`, as Clojure does. Otherwise the call goes through the Var
+     like any other, as does any other arity. A qualified
+     `nexis.core/+` and the like inline unconditionally: a
      qualified head is never a local, and host macros emit them
      (`MACROEXPAND.md` §5).
   3. **Lexical local** — innermost binding from `let*`, `fn*`,
@@ -193,10 +217,11 @@ compiler relies on:
   6. **Current-namespace Var**: bare symbol looked up in the
      current namespace, then up its parent chain (`user`'s
      parent is `nexis.core`, so core names resolve unqualified).
-  7. **Declared-later name**: a top-level `def`/`defn` name of
-     the same file or REPL line (`DeclaredNames`, collected
-     before any form compiles) — so a form may refer to a Var a
-     later form defines.
+  7. **Declared-later name**: a name the same file or REPL line
+     defines anywhere (`def`, `defn`, `defonce`, `defmacro`,
+     `defrecord`'s names, `defprotocol` and its methods;
+     `DeclaredNames`, collected before any form compiles) — so a
+     form may refer to a Var a later form defines.
   8. **Error**: `UnresolvedSymbol` with the symbol's span.
 
 - **Additional guarantees**:
@@ -225,20 +250,24 @@ compiler relies on:
     raise `DuplicateBinding` (mutual visibility makes duplicates
     ambiguous; matches Clojure).
   - `(fn* [a b & r] body)` lowers with `rest_param = "r"`; `&`
-    is never a parameter name. `letfn*` bindings do not accept a
-    rest parameter (`UnsupportedFeature`).
+    is never a parameter name. A `letfn*` binding takes a rest
+    parameter the same way.
+  - Every binding a closure captures is marked in its Tiny node
+    as the symbol reaching it is lowered (§6.1).
   - `recur` is a marker at lowering; tail-position validation
     happens in the `Emitter` against the active `RecurTarget`.
-  - `catch` takes the matcher `any` only; any other matcher
-    symbol is `MalformedForm`.
+  - `catch` takes the matcher `any` only; any other matcher is
+    `UnsupportedFeature` (the expander lowers every surface
+    matcher onto `any`, MACROEXPAND.md §10).
 
 - **Errors**: `UnresolvedSymbol`, `DuplicateParam`,
   `DuplicateBinding`, `MalformedForm`, `ExpectedSymbol`,
   `ExpectedVector`, `UnsupportedFeature`,
-  `IntegerOutOfFixnumRange` (an integer literal outside the i48
-  fixnum range; there is no bignum literal lifting).
+  `StackOverflow`. An integer literal outside the i48 fixnum
+  range is a bignum constant; `IntegerOutOfFixnumRange` is only
+  for a hand-built `Tiny.int` outside it.
 
-#### 4.4 Emitter — capture analysis, slots, codegen
+#### 4.4 Emitter — slots, captures, codegen
 
 - **Input**: `Tiny` tree.
 - **Output**: bytecode routine per `docs/VM.md` — code + typed
@@ -246,10 +275,9 @@ compiler relies on:
   `slot_count` / `fixed_arity` / `variadic` / `upvalue_count`.
 
 - **Guarantees**:
-  - Every local binding is tagged **captured** or **not
-    captured** before its code is emitted (§6.1). A local is
-    captured iff at least one `fn*` within its scope references
-    it.
+  - Every local binding arrives tagged **captured** or **not
+    captured** by lowering (§6.1). A local is captured iff at
+    least one `fn*` within its scope references it.
   - Non-captured locals are plain frame slots at runtime.
   - Captured locals are **heap cells** (`docs/VM.md` §6): the
     `Emitter` boxes the slot at binding time (`closure:box-local`)
@@ -265,33 +293,55 @@ compiler relies on:
     operands) has none.
   - `recur` into a variadic `fn*` takes the fixed params plus one
     argument for the rest binding.
-  - Frame-slot assignment: each local and each compiler-generated
-    temporary gets a slot number from a per-routine bump
-    counter. Slots are not reused across disjoint lifetimes.
-    More than 4096 slots is `SlotOverflow`.
+  - Frame-slot assignment: slots are a stack. Each local and each
+    compiler-generated temporary takes the next free slot, and
+    every slot a form allocated is free again once the form is
+    compiled: a binding's slot lives to the end of its scope, a
+    temporary until the instruction that consumes it, a call
+    block until the call. A routine's `slot_count` is the most
+    slots live at once, and more than 4096 live at once is
+    `SlotOverflow`.
   - **Capture-cell slot liveness**: a slot holding an
     `UpvalCell*` (boxed local, or a placeholder cell for
     `letfn*` / named `fn*` self-reference) is an ordinary live
     value. If the cell is needed after a call (per the range-call
     ABI's call-clobbered region in `VM.md §6`) or by a later
     `closure:make` descriptor's `local_cell_slot` source, its
-    slot is never placed at or above any `call_base`. Concrete
+    slot is never placed at or above any `call_base`. The slot
+    stack gives this for free: a call block is allocated on top
+    of every slot live when its form is compiled. Concrete
     hazard: `(let* [x 1, f (g), h (fn [] x)] h)` — if `x`'s cell
     slot were allocated inside the call block for `(g)`, the
     subsequent `closure:make` for `h` would read garbage.
+  - Operands in place: a `math` or `cmp` instruction,
+    `jump:if-false`, `var:store-var` and `ctrl:throw` read a
+    literal (as a constant), a local held directly in its slot,
+    an upvalue or a Var where it is, instead of copying it into a
+    slot first. Evaluation stays left to right: the left operand
+    of a two-operand instruction reads a Var in place only when
+    the right one is a literal or a symbol, which run no code.
   - Literal lifting: nil, booleans and fixnums have dedicated
     `mov:*` loads or inline `Tiny` variants; every other literal
-    (symbols, keywords, quoted compound collections) is a
-    `Const.value` in the routine's constant pool.
-  - Collection literals with non-literal sub-expressions compile
-    to `coll:list` / `coll:concat` / `coll:vector` / `coll:map` /
-    `coll:set` construction code.
+    (strings, bignums, symbols, keywords) is a `Const.value` in
+    the routine's constant pool.
+  - A list, vector, map or set whose items are all constants —
+    quoted data, `[1 2 3]`, `{:a 1}`, and the `#%` constructors
+    syntax-quote emits over constants — is built once, at
+    lowering, the way the VM would build it, and is one constant
+    (PLAN §11.4): its size costs no slots and no instructions,
+    and evaluating it twice yields the same object, as in
+    Clojure. A collection with a computed item compiles to
+    `coll:list` / `coll:concat` / `coll:vector` / `coll:map` /
+    `coll:set` over a slot block.
 
 - **Errors**: `RecurOutsideTail`, `RecurArityMismatch`,
-  `SlotOverflow`, `ConstantPoolOverflow` (more than 4096
-  constants), `JumpTargetOutOfRange` (a routine longer than 4096
-  instructions — there is no extension-instruction encoding),
-  `InternalCompilerBug`.
+  `SlotOverflow` (more than 4096 slots live at once, upvalues or
+  Var-table entries in a routine), `ConstantPoolOverflow` (more
+  than 4096 constants or capture descriptors), `JumpTargetOutOfRange` (a jump whose target lies
+  past pc 4095: jump operands are 12-bit and there is no
+  extension-instruction encoding; code past pc 4095 that nothing
+  jumps to runs), `InternalCompilerBug`. Each is reported at the
+  innermost form being compiled when it is raised (§4.6).
 
 #### 4.5 Codegen invariants
 
@@ -299,9 +349,10 @@ compiler relies on:
   top-level routine for any top-level form).
 - Instructions are 64 bits. Operand indexes are 12 bits; the
   extension-instruction form is not emitted.
-- The constant pool is append-only: repeated constants within a
-  routine are not deduplicated. The var table IS deduplicated: a
-  routine that references `x` twice carries one `V#` entry.
+- The constant pool holds each Value once: identical Values (the
+  same immediate, or the same heap object) share an entry. The
+  var table is deduplicated the same way: a routine that
+  references `x` twice carries one `V#` entry.
 - Var references compile to `V#` operands bound to `*Var`
   pointers at compile time (§4.7).
 - Upvalue slots in a closure are numbered 0..N; the closure
@@ -312,11 +363,12 @@ compiler relies on:
 #### 4.6 Spans
 
 - Every Form carries the `SrcSpan` the reader assigned.
-- A compile error is reported with the span of the Form being
-  being lowered at the point the error is raised (`LowerDiag.span`); the CLI
-  renders it as `file:line:col`, the source line and a caret.
-- Routines carry no span table; a runtime error reports no
-  source location.
+- A compile error is reported with the span of the innermost
+  Form being lowered or compiled when the error is raised, or of
+  the symbol lowering rejects (`LowerDiag.span`); the CLI renders
+  it as `file:line:col`, the source line and a caret.
+- Routines carry a span table (§8), so a runtime error reports
+  the location of the instruction that raised it.
 
 #### 4.7 Var linking
 
@@ -359,22 +411,23 @@ variants are codegen details.
   (saves constant-pool entries).
 - Symbols and keywords are interned to Values and placed in the
   constant pool.
-- Compound collections lower through `#%list` / `#%vector` /
-  `#%map` / `#%set` construction (`lowerQuotePayload`) with each
-  element quoted recursively.
+- Compound collections are quoted element by element
+  (`lowerQuotePayload`), so every element is a constant and the
+  collection is one constant built at lowering (§4.4).
 - A quote inside the payload is data: `'(a 'b)` is `(a (quote b))`,
   the 2-list `formToValue` renders a quote as. Syntax-quote,
   unquote, `@x`, `#(...)` and `^meta` inside a quoted form are
   `UnsupportedFeature`.
-- Runtime: `mov:load-const` (scalars) or `coll:*` construction.
+- Runtime: `mov:load-const`.
 
 #### 5.2 `(if test then else?)`
 
-- Lower `test` into a slot.
-- `jump:if-false` to `else-label` if the result slot is
-  `false-or-nil`.
+- Lower `test` into an operand, read in place when it can be
+  (§4.4).
+- `jump:if-false` to `else-label` if the test is `false-or-nil`.
 - Emit `then` code, leaving result in the result slot.
-- `jump:jmp` to `end-label`.
+- `jump:jmp` to `end-label`, unless every path through `then`
+  ends in `recur` or `throw`.
 - `else-label`: emit `else` code (or `mov:load-nil` if
   `else` is absent).
 - `end-label`: continuation.
@@ -403,8 +456,8 @@ variants are codegen details.
   The routine is registered in the **current** routine's
   constant pool as a `Const.routine` entry; its constant-pool
   index becomes operand A of the eventual `closure:make`.
-- Capture analysis on the body identifies which enclosing-frame
-  locals the body references. For each, build a capture
+- Compiling the body resolves each enclosing-frame local it
+  references as a capture. For each, build a capture
   descriptor entry: `local_cell_slot(s)` if the captured
   binding is a local of the immediate enclosing frame,
   `inherited_upvalue(u)` if it is a capture inherited from an
@@ -412,7 +465,7 @@ variants are codegen details.
   capture-descriptor table; its index becomes operand B.
 - Emit `closure:make A=proto_const B=cap_desc C=result_slot`
   per `VM.md §6`. The result is a closure value (VALUE.md
-  kind 22).
+  kind 24, `function`).
 - The routine records `fixed_arity = params.len` and
   `variadic = rest != null`; the rest parameter is bound at slot
   `params.len` and the VM materializes the rest list at call
@@ -458,13 +511,17 @@ code; hand-written bytecode that violates this surfaces
 #### 5.6 `(recur args...)`
 
 **Common skeleton** (both captured and non-captured cases):
-- Lower each `arg` into a fresh temporary slot.
-- Move temporaries into the target's binding slots using
-  **parallel-assignment semantics** (a naive sequential move
-  corrupts arguments when the target slots alias an earlier
-  source — e.g., `(loop* [a b, b a] (recur b a))`). Evaluating
-  every argument into its own temporary before any move is what
-  provides this.
+- The arguments rebind the target's bindings with
+  **parallel-assignment semantics**: every argument sees the
+  bindings as they were before the `recur` (a naive sequential
+  move corrupts `(loop* [a 1 b 2] (recur b a))`).
+- An argument for a non-captured binding that no other argument
+  mentions is computed straight into the binding's slot: nothing
+  evaluated after it can observe the change.
+- Every other argument is read in place when it is a constant,
+  an upvalue or a slot no rebinding overwrites, and is computed
+  into a fresh temporary otherwise; the moves into the binding
+  slots follow once every argument is computed.
 - Emit `jump:jmp` to the target's entry label.
 - **Invariant**: no `call` opcode is emitted. Constant-stack
   guaranteed per PLAN §11.3.
@@ -493,14 +550,10 @@ lexical binding semantics.
 Lowering for a captured loop binding's recur step:
 
 ```
-; compute new value into a temp slot
-math:add        s_new_value, ...
-; allocate a fresh initialized cell holding the new value
-mov:move        s_tmp, s_new_value
-closure:box-local s_tmp                ; s_tmp := fresh cell
-mov:move        s_binding_slot, s_tmp  ; install fresh cell
-                                       ;   into binding slot
-jump:jmp        L_loop
+math:add          s_tmp, ...           ; the new value, in a fresh slot
+closure:box-local s_tmp                ; s_tmp := fresh cell holding it
+mov:move          s_binding_slot, s_tmp  ; install the fresh cell
+jump:jmp          L_loop
 ```
 
 The fresh cell is heap-allocated; this iteration cost is
@@ -508,8 +561,8 @@ The fresh cell is heap-allocated; this iteration cost is
 guarantee applies only to non-captured bindings. See `VM.md §11`
 for the runtime-side phrasing.
 
-`recur` does NOT use the U-store path (`store(u:N, ...)` is
-`:unsupported-write` per `VM.md §6`). The fresh-cell pattern
+`recur` does NOT use the U-store path (a store to `u:N` is
+`UnimplementedOpcode`, `VM.md §6`). The fresh-cell pattern
 above is the only mechanism.
 
 `recur` inside a `fn*` body with no enclosing `loop*` targets
@@ -569,8 +622,7 @@ liveness rule) AND across the `closure:init-cell` calls.
 corresponding `init-cell` runs would surface
 `:uninitialized-cell` at runtime. The lowering sequence above
 (allocate-all → make-all → init-all) rules this out for
-ordinary `letfn*` use. A `letfn*` binding with a rest parameter
-is `UnsupportedFeature`.
+ordinary `letfn*` use.
 
 #### 5.7 `(loop* [b1 v1 b2 v2 ...] body...)`
 
@@ -588,19 +640,18 @@ is `UnsupportedFeature`.
 - Emit `var:store-var` V#(name), result-slot. The instruction
   sets the Var's root, marks it bound and yields the Var object.
 
-#### 5.8b `(defn name [params...] body...)`
-
-Sugar for `(def name (fn* name [params...] body...))`: the
-function carries its own name as the self-name, so the body can
-recurse through the lexical name without going through the Var,
-and the Var binding makes the function reachable from outside
-the form. Forward references between `defn`s work because each
-`defn` interns its Var at compile time and call-time resolution
+`defn` is not a primitive: the host macro rewrites it to
+`(def name (fn* name [params...] body...))` (MACROEXPAND.md), so
+the body can recurse through the self-name without going through
+the Var. Forward references between definitions work because each
+`def` interns its Var at compile time and call-time resolution
 through the var table picks up whatever is bound by then.
 
-#### 5.9 `(var name)`
+#### 5.9 `(var name)`, `(var ns/name)`
 
-- Emit `var:var-object V#(name)` into a result slot.
+- Emit `var:var-object V#(name)` into a result slot. A bare
+  name resolves as a symbol does (§4.3 rules 6-7); a qualified
+  one exactly, as rule 5 resolves a qualified symbol.
 - Returns the Var object itself (not its root value); used by
   macros and tooling. Does not trap on an unbound Var.
 
@@ -642,12 +693,12 @@ matcher, or a `finally` alone, onto it (MACROEXPAND.md §10).
 ### 6. Closure and upvalue contract
 
 Captured-only boxing, descriptor-based construction, cell access
-opcodes; §6.1 gives the pre-analysis discipline that makes the
-boxing decision sound.
+opcodes; §6.1 gives the discipline that makes the boxing decision
+sound.
 
 - A local is **captured** iff any nested `fn*` body references
-  it. The classification is computed before the binding's code
-  is emitted — see §6.1.
+  it. Lowering classifies it before the binding's code is
+  emitted — see §6.1.
 - **Non-captured locals**: plain frame slots. Read / write via
   SCVU slot operands. Zero per-op overhead.
 - **Captured locals**: the bound value is wrapped in an
@@ -663,8 +714,9 @@ boxing decision sound.
     kind on existing opcodes — e.g., `mov:move s0, u:0`,
     `math:add s0, u:0, c:1`. `resolve(u:N)` dereferences the
     cell automatically.
-  - **Writes are forbidden** for captured locals. There is no
-    `set!`. The U-store path returns `:unsupported-write`; the
+  - **Writes are forbidden** for captured locals: `set!` applies
+    to dynamic Vars only, and a store to a `u:N` operand is
+    `UnimplementedOpcode`; the
     only mechanism by which a captured loop-binding cell
     "changes" across iterations is the fresh-cell-per-iteration
     pattern documented in §5.6 — which allocates a NEW cell
@@ -685,49 +737,41 @@ boxing decision sound.
   an upvalue pointer array copied from the closure; U#
   operands resolve via the callee frame's upvalue array.
 
-#### 6.1 Pre-analysis capture, binding-time boxing
+#### 6.1 Capture marking, binding-time boxing
 
-The `Emitter` does **capture pre-analysis per `let*`, `loop*`
-and `fn*`**, then emits `closure:box-local` at **binding time**
-(or function entry for captured params), making the runtime
-cell-vs-direct status of each slot **provably stable across all
-control-flow paths**.
+Lowering marks every captured binding; the `Emitter` emits
+`closure:box-local` at **binding time** (or function entry for
+captured params), making the runtime cell-vs-direct status of
+each slot **provably stable across all control-flow paths**.
 
 Boxing lazily — at the moment an inner closure first captures a
 binding — is unsound under control flow: if the inner closure is
 created in a branch (e.g., `(if false (fn* [] x) 0)`), the
 `box-local` lives in the unreachable branch, while subsequent
 same-frame reads emit `closure:get-cell` against an unboxed slot
-— an `:expected-cell` trap on a valid program. The pre-analysis
-model below rules this out.
+— an `:expected-cell` trap on a valid program. Deciding before
+the binding's code is emitted rules this out.
 
-**The pre-analysis algorithm** (per `let*` / `loop*` / `fn*`):
+1. **Marking** (in lowering): `LowerEnv` mirrors every lexical
+   scope the Emitter will have — `let*` / `loop*` bindings in
+   order, `fn*` parameters (and the rest parameter), the `fn*`
+   self-name (in the scope enclosing the body), `letfn*` names
+   and the `catch` binding — each entry recording the `fn*`
+   depth it was made at and pointing at its Tiny node's
+   `captured` flag. Lowering a symbol finds its innermost
+   binding; one made at a smaller depth than the symbol's is
+   captured, and its flag is set. One pass, O(scope depth) per
+   symbol.
 
-1. **Capture-set computation** — `freeVarsAcrossFn(body,
-   locally_bound)` walks the Tiny tree under `body`,
-   accumulating the set of names that are referenced by ANY
-   enclosed `fn*` body and that are NOT bound locally to that
-   `fn*`. The walk recurses into `fn*` bodies with that fn's
-   params (and rest param and self-name) as the inner-bound
-   set; the result percolates up to the enclosing scope. This
-   is "free vars across function boundaries" — exactly the set
-   of names the enclosing scope's bindings might have to box.
+2. **Binding-time boxing**: a `let*` / `loop*` binding, a
+   parameter or a `catch` binding that is marked is boxed with
+   `closure:box-local` as it is bound and pushed as
+   `.cell_slot(s)`; every other binding is `.direct_slot(s)`.
+   The instruction sits in straight-line code that every path
+   reaching the binding's scope runs. A marked self-name gets a
+   placeholder cell (§5.5).
 
-2. **`let*` binding-time decision**: when binding `name` at
-   slot `s`, check whether `name ∈ freeVarsAcrossFn(remaining
-   bindings + body)`. If yes, immediately emit
-   `closure:box-local s` and push the binding as `.cell_slot(s)`.
-   If no, push as `.direct_slot(s)`. The `closure:box-local`
-   instruction sits in the routine's straight-line prelude, so
-   it executes on every code path that reaches the let body.
-
-3. **`fn*` param decision**: when entering a `fn*` body, check
-   each param (and the rest param) against
-   `freeVarsAcrossFn(body)`. Box captured params at function
-   entry (immediately after argument reception); push as
-   `.cell_slot`.
-
-4. **Same-frame read dispatch** (in `compileSymbol`):
+3. **Same-frame read dispatch** (in `compileSymbol`):
 
    ```
    .direct_slot(s) → mov:move dst, slot(s)
@@ -735,44 +779,30 @@ model below rules this out.
    .upvalue(u)     → mov:move dst, u:u   (resolve(u) deref's the cell)
    ```
 
-5. **Capture from parent scope** (in `resolveOrCapture`): when
+4. **Capture from parent scope** (in `resolveOrCapture`): when
    a child Emitter resolves a name to a parent-scope binding,
-   the parent's binding is **already** `.cell_slot` if the name
-   appears in any `fn*` body within the parent's scope (which
-   includes the child being compiled). A `.direct_slot` result
-   here is a compiler bug (pre-analysis missed a capture) and is
-   reported as `InternalCompilerBug`. Repeat references to the
-   same captured name reuse one upvalue index.
+   the parent's binding is **already** `.cell_slot` (or an
+   `.upvalue` further out), because lowering marked it. A
+   `.direct_slot` result here is a compiler bug and is reported
+   as `InternalCompilerBug`. Repeat references to the same
+   captured name reuse one upvalue index.
 
-6. **`BindingRef`** is **immutable from binding time onward**.
-   There is no mid-codegen mutation of a binding's kind.
-
-   ```zig
-   pub const BindingRef = union(enum) {
-       direct_slot: u12,
-       cell_slot: u12,
-       upvalue: u12,
-   };
-   ```
+5. **`BindingRef`** (`direct_slot`, `cell_slot`, `upvalue`) is
+   **immutable from binding time onward**. There is no
+   mid-codegen mutation of a binding's kind.
 
 **Soundness invariant**:
 > A binding is `.cell_slot` iff `closure:box-local` is emitted
-> for its slot in the routine's prelude (or function entry for
-> params), which guarantees the slot holds an `UpvalCell*` on
-> every reachable runtime path. `closure:get-cell` and
-> `closure:make`'s `local_cell_slot` source can therefore use
-> strict cell-only semantics with no runtime "ensure cell"
-> dynamic check.
-
-This invariant holds because the `closure:box-local` for a
-captured binding sits in straight-line code (let-binding
-prelude or fn-entry prelude) that EVERY reachable code path
-traverses before any inner `fn*` could possibly construct a
-closure that references the binding.
+> for its slot where it is bound (or at function entry for
+> params, or at handler entry for a `catch` binding), which
+> guarantees the slot holds an `UpvalCell*` on every reachable
+> runtime path. `closure:get-cell` and `closure:make`'s
+> `local_cell_slot` source can therefore use strict cell-only
+> semantics with no runtime "ensure cell" dynamic check.
 
 **Invariants** (continuation):
-- `UpvalCell` and `Closure` are allocated from the VM's runtime
-  arena and live for the VM's lifetime (`VM.md §6`).
+- `UpvalCell` and `Closure` are allocated on the VM's heap and
+  collected like any other value (`VM.md §6`, `GC.md`).
 - Closures carry references to cells, NOT copies of cell
   contents.
 - A closure's captured-cell array is immutable after creation;
@@ -794,19 +824,28 @@ closure that references the binding.
   `RecurArityMismatch`, `UnsupportedFeature`, `ReaderFailure`,
   `MalformedForm`, `MacroDepthExceeded`, `MacroExpansionFailure`,
   `RequiredFileFailed`, `ControlTransferred`, `ExpectedSymbol`,
-  `ExpectedVector`, `InternalCompilerBug`, `OutOfMemory`.
-- A **primary SrcSpan** in `CompileOptions.out_span`: the
-  symbol's own span when lowering can locate it (the `LowerDiag`
-  out-parameter), otherwise the macroexpanded form's. Forms a
-  macro produced carry the macro call's span (MACROEXPAND.md
-  §4b), so an error inside an expansion is reported at the call.
+  `ExpectedVector`, `InternalCompilerBug`, `StackOverflow`,
+  `OutOfMemory`.
+- A **primary SrcSpan** in `CompileOptions.out_span`: the span
+  of the innermost form being lowered or emitted when the error
+  was raised, or the symbol's own span for `UnresolvedSymbol`
+  (the `LowerDiag` out-parameter); a macroexpansion error carries
+  the span of the innermost form the expander failed at
+  (`ExpandContext.failure`), and its reason goes to
+  `CompileOptions.out_detail`. Forms a macro produced carry the macro
+  call's span (MACROEXPAND.md §4b), so an error inside an
+  expansion is reported at the call.
 
 Errors raised inside macro expansion are bucketed:
 `MacroDepthExceeded` for depth, `MacroExpansionFailure` for
 everything else (a malformed macro call, a macro returning a
 non-Form, an integer literal out of range inside a macro
 argument). `MalformedForm` / `ExpectedSymbol` / `ExpectedVector`
-are lowering errors about special-form shape. Two variants are
+are lowering errors about special-form shape. `StackOverflow` is
+a form nested deeper than the native stack's budget allows
+lowering or emitting it: every recursive step of lowering, the
+Emitter and `DeclaredNames` calls `stack.check` (VM.md §13.1), so
+depth fails cleanly instead of faulting. Two variants are
 not compile errors at all but the loader's run signals passed
 through under their own names (MACROEXPAND.md §8):
 `RequiredFileFailed`, a required file's form failed at run time
@@ -820,7 +859,8 @@ There is no secondary span, no expansion-provenance chain and
 no structured error value for compile errors the CLI reports. A
 compile error inside `eval` is not reported by the CLI: the hook
 throws the map `{:error :compile-error :message "<variant name>"
-:form <the form>}` on the calling VM, a catchable value like any
+:form <the form>}`, with `:detail` the expander's reason for a
+macro failure, on the calling VM, a catchable value like any
 other throw (MACROEXPAND.md §1.2 item 9); uncaught, it reaches
 the CLI as `UncaughtThrow` with the map as its value. The CLI
 prints
@@ -870,7 +910,7 @@ routines compiled from it.
 - Lowering allocates every Tiny node as a `TinyNode{span, tiny}`
   and `lowerFormEnv` stamps the node with its Form's span; a
   node lowering synthesizes without a Form (the `do` around a
-  body, the `fn*` a `defn` stands for) has none and inherits the
+  body, the constant 1 of an inlined `inc`) has none and inherits the
   span of the form enclosing it. A hand-built `&Tiny{...}` tree
   compiles without spans (`compileTiny`).
 - The Emitter attributes every instruction it emits to the span
@@ -889,8 +929,9 @@ routines compiled from it.
   expansion resolve to the call. `Routine.spanAt(pc)` is a
   binary search; nothing reads the table while instructions
   execute (VM.md §5).
-- A `defn` routine is named after its Var (the name copied onto
-  the compile allocator), an anonymous closure `fn`.
+- A named `fn*` routine, which is what `defn` produces, carries
+  its name (copied onto the compile allocator); an anonymous
+  closure is `fn`.
 
 ---
 
@@ -903,19 +944,29 @@ Three layers:
 - `src/expand.zig`: inline tests for recursive expansion,
   fixed-point termination, syntax-quote handling, `#(...)`
   lowering, host macros, `defmacro`, error cases.
-- `src/compile.zig`: inline tests for every lowering rule,
-  capture pre-analysis (including closures in dead branches),
-  `recur` targets and their propagation, variadic parameters,
-  `letfn*`, named `fn*`, forward references, shadowing, and every
-  `CompileError` variant. A set of tests drives the `Emitter`
-  directly from hand-built `Tiny` trees and pins bytecode shape.
+- `src/compile.zig`: inline tests for what only the compiler
+  sees: the error taxonomy (a table of malformed programs, each
+  with its variant, and the span an error is reported at), the
+  shape of the bytecode (one Var-table entry per Var, one upvalue
+  per captured name, boxing of exactly the captured bindings on
+  every path, `recur` in constant stack), routine limits, the span
+  table, declared names and the stack guard.
 - `src/vm.zig`: per-opcode tests on hand-assembled bytecode.
 
 #### 9.2 Property tests
 
-- `test/prop/compile.zig`: randomized programs through the full
-  pipeline — closure capture at nesting depth up to 10,
-  syntax-quote output structurally equal to hand-built Forms.
+- `test/prop/compile.zig`: what programs evaluate to, as tables
+  run through a program booted as `bin/nexis` boots one — source
+  and printed value for every primitive-core form, binding and
+  capture shape, `recur` target, quoted literal and the host
+  macros the compiler relies on; source and error for compile and
+  run failures — and randomized programs through the full
+  pipeline: closure capture at nesting depth up to 10,
+  syntax-quote output structurally equal to hand-built Forms,
+  and random programs over arithmetic, `if`, shadowing `let*`,
+  closures called in place and twice, and counting `loop*`s whose
+  `recur` reads every binding (sometimes through a closure),
+  whose compiled result must equal a reference evaluator's.
 
 #### 9.3 Integration tests
 
@@ -947,24 +998,33 @@ Three layers:
 
 ### 10. Compilation entry points
 
-The public surface of `src/compile.zig`, from lowest to highest:
+The public surface of `src/compile.zig`:
 
-- `compileTiny` / `compileTinyWithNamespace` — `Tiny` → routine.
-- `lowerForm` — `Form` → `Tiny`.
-- `compileForm*` / `compileSource*` — Form or source bytes →
-  routine, in variants that add a namespace, an interner, a macro
-  table, an error span, a persistent allocator, a namespace
-  registry and a loader. `compileFormWith(options)` /
-  `compileSourceWith(options)` take all of these as one
-  `CompileOptions` record and are what the CLI uses.
+- `compileFormWith(allocator, form, options)` — macroexpand, lower
+  and emit one Form into a `Compiled` routine; `CompileOptions`
+  carries the namespace, interner, host macro table, error-span
+  out-parameter, persistent allocator (for `defmacro` closures),
+  namespace registry, loader, declared names and source. The CLI,
+  the loader and `eval` compile through it.
+- `compileSourceWith(allocator, source, options)` — parse and read
+  the first form of `source` (`parser.parseForm` +
+  `Reader.readOneForm`), then `compileFormWith`.
+- `compileTiny(allocator, tiny)` — a hand-built `Tiny` tree, with
+  no namespace and no span table.
 - `DeclaredNames` — the top-level names of a file or REPL line,
   collected before any of its forms compile (§4.3 rule #7).
+- `RuntimeHooks` — the compiler as `macroexpand-1`, `read-string`
+  and `eval` reach it at run time.
 
-`compileSource` runs `parser.parseForm` + `Reader.readOneForm` +
-expansion + `lowerForm` + the `Emitter`; the CLI's file runner
-parses all top-level forms first (`parser.parseProgram` +
-`Reader.readProgram`), then compiles and runs each in turn, sharing
-the VM's namespace, interner and macro table.
+`compileSourceFull`, `compileSourceFullWithMacros` and
+`compileSourceFullWithMacrosSpanPersistentRegistry` are positional
+spellings of `compileSourceWith` for `bench/main.zig` and the eval
+pipeline tests.
+
+The CLI's file runner parses all top-level forms first
+(`parser.parseProgram` + `Reader.readProgram`), then compiles and
+runs each in turn, sharing the VM's namespace, interner and macro
+table.
 
 ---
 
@@ -990,9 +1050,6 @@ the VM's namespace, interner and macro table.
 - `docs/FORMS.md` — Form schema.
 - `docs/SEMANTICS.md` — equality, hash, numeric edges
   (runtime-side; compiler must respect).
-- `docs/VALUE.md` — heap kinds; `function` is kind 22.
+- `docs/VALUE.md` — heap kinds; `function` is kind 24.
 - `docs/TOOLING.md` — what the §8 span table serves: located
   runtime errors and `nexis disasm`.
-- `../em/docs/architecture/PIPELINE.md` — em compiler pipeline
-  (template; nexis adapts for macros + closures + persistent
-  collections).
