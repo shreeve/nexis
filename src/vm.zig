@@ -1410,6 +1410,9 @@ pub const VM = struct {
     /// Cycles run so far; tests read it to prove a collection
     /// happened.
     gc_cycles: usize = 0,
+    /// The collector's gray worklist, kept between cycles so each
+    /// cycle reuses the capacity the last one grew (GC.md §4).
+    gc_gray: std.ArrayList(*heap_mod.HeapHeader) = .empty,
     /// The root stack (GC.md §3): values a native holds in Zig
     /// locals across a call back into the VM. `callValue` pushes a
     /// native callee's arguments for the call's duration; a native
@@ -1603,6 +1606,7 @@ pub const VM = struct {
         self.dyn_saves.deinit(self.allocator);
         self.dyn_frames.deinit(self.allocator);
         self.roots.deinit(self.allocator);
+        self.gc_gray.deinit(self.allocator);
         // Free handler + finally stack backing storage. Both
         // contain POD entries.
         self.handlers.deinit(self.allocator);
@@ -1766,7 +1770,9 @@ pub const VM = struct {
         const heap = self.ensureHeap();
         var collector = gc_mod.Collector.init(heap);
         collector.host = .{ .ctx = @ptrCast(self), .roots = &gcRoots, .trace = &gcTrace };
+        collector.gray = self.gc_gray;
         _ = collector.collect(&.{});
+        self.gc_gray = collector.gray;
         self.gc_cycles += 1;
         const by_growth = heap.live_bytes / 100 * self.gc_growth_percent;
         self.gc_next_at = @max(self.gc_threshold, by_growth);

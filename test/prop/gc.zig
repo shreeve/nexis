@@ -76,6 +76,7 @@ test "G1: random flat blocks with random root subset" {
         }
 
         var collector = Collector.init(&heap);
+        defer collector.deinit();
         _ = collector.collect(roots.items);
         // Every root survives; every non-root is gone. Post-sweep
         // the pointer/header is freed, so we can't touch it — but
@@ -196,6 +197,7 @@ test "G2: nested graph — exactly the pool members reachable from the roots sur
 
     // Collect.
     var collector = Collector.init(&heap);
+    defer collector.deinit();
     _ = collector.collect(roots.items);
 
     // Exactly the rooted-reachable pool members survive: each pool
@@ -237,6 +239,7 @@ test "G3: collect twice with same roots — second call frees 0 blocks" {
     _ = try string.fromBytes(&heap, "orphan");
 
     var collector = Collector.init(&heap);
+    defer collector.deinit();
     const roots = [_]*HeapHeader{ Heap.asHeapHeader(a), Heap.asHeapHeader(b) };
     const freed1 = collector.collect(&roots);
     try std.testing.expect(freed1 >= 1); // at least the orphan
@@ -269,6 +272,7 @@ test "G3b: a list of half a million cells survives a cycle intact and is freed b
     _ = try string.fromBytes(&heap, "orphan");
 
     var collector = Collector.init(&heap);
+    defer collector.deinit();
     const roots = [_]*HeapHeader{Heap.asHeapHeader(xs)};
     const freed = collector.collect(&roots);
     try std.testing.expectEqual(@as(usize, 1), freed);
@@ -311,6 +315,7 @@ test "G3c: a chain of 300,000 nested vectors, maps, atoms and meta maps survives
     _ = try string.fromBytes(&heap, "orphan");
 
     var collector = Collector.init(&heap);
+    defer collector.deinit();
     try std.testing.expect(collector.collect(&.{Heap.asHeapHeader(node)}) >= 1);
     // Walk the chain back down to the fixnum at its bottom; a swept
     // level would read freed memory.
@@ -350,6 +355,7 @@ test "G4: pinned block survives without roots; unpinning releases it" {
     _ = try string.fromBytes(&heap, "not-pinned");
 
     var collector = Collector.init(&heap);
+    defer collector.deinit();
 
     // First pass: `a` is pinned, other is orphan → other freed, `a` survives.
     const freed1 = collector.collect(&.{});
@@ -379,6 +385,7 @@ test "G5: repeated allocate-and-collect cycles do not leak" {
     defer heap.deinit();
 
     var collector = Collector.init(&heap);
+    defer collector.deinit();
 
     // 50 cycles: each cycle allocates 10 fresh strings, keeps 3
     // as roots, collects. After the last cycle, drop the last

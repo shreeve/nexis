@@ -361,6 +361,7 @@ test "L10: a collection keeps a view's vector alive through the view block alone
     const live = heap.liveCount();
 
     var collector = gc.Collector.init(&heap);
+    defer collector.deinit();
     const roots = [_]*nx.heap.HeapHeader{Heap.asHeapHeader(l)};
     try std.testing.expectEqual(@as(usize, 0), collector.collect(&roots));
     try std.testing.expectEqual(live, heap.liveCount());
