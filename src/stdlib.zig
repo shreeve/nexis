@@ -2055,21 +2055,25 @@ fn requireCount(v: Value) VmError!usize {
 }
 
 /// `(nthrest coll n)` → coll without its first n elements, as a
-/// list; O(1) past a vector's elements (a view, LIST.md §1).
+/// list; O(1) past a vector's elements (a view, LIST.md §1). As
+/// Clojure's, coll itself when n is not positive or coll is empty.
 fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireCount(args[1]);
+    const n = try requireFixnum(args[1]);
+    if (n <= 0 or args[0].isNil()) return args[0];
+    const count: usize = @intCast(n);
     switch (args[0].kind()) {
-        .list => return list_mod.drop(args[0], n),
+        .list => return list_mod.drop(args[0], count),
         .persistent_vector => {
             const v = args[0];
-            return list_mod.ofVector(vm.ensureHeap(), v, @min(n, vector_mod.count(v))) catch VmError.OutOfMemory;
+            if (vector_mod.count(v) == 0) return v;
+            return list_mod.ofVector(vm.ensureHeap(), v, @min(count, vector_mod.count(v))) catch VmError.OutOfMemory;
         },
         else => {},
     }
     var items = try collectSeq(vm, args[0]);
     defer items.deinit(vm.allocator);
-    const skip = @min(n, items.items.len);
-    return try buildListFromSlice(vm, items.items[skip..]);
+    if (items.items.len == 0) return args[0];
+    return try buildListFromSlice(vm, items.items[@min(count, items.items.len)..]);
 }
 
 /// `(split-at n coll)` → `[(take n coll) (drop n coll)]`.
@@ -2083,12 +2087,14 @@ fn fnSplitAt(vm: *VM, args: []const Value) VmError!Value {
     return vector_mod.fromSlice(vm.ensureHeap(), &.{ head, tail }) catch VmError.OutOfMemory;
 }
 
-/// `(take-last n coll)` / `(drop-last n coll)`.
+/// `(take-last n coll)` / `(drop-last n coll)`; `take-last` of
+/// nothing is nil, as Clojure's.
 fn fnTakeLast(vm: *VM, args: []const Value) VmError!Value {
     const n = try requireCount(args[0]);
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
     const keep = @min(n, items.items.len);
+    if (keep == 0) return value_mod.nilValue();
     return try buildListFromSlice(vm, items.items[items.items.len - keep ..]);
 }
 

@@ -1280,6 +1280,11 @@ test "integration: core.nx higher-order functions: some-fn, every-pred, memoize,
 
 test "integration: core.nx sequence functions: partition-by, dedupe, take-nth, split-with, distinct?, doall, dorun, rseq, nthnext" {
     try expectOutput("[(partition-by odd? [1 3 2 4 5]) (dedupe [1 1 2 1 1 3]) (take-nth 2 (range 7)) (split-with neg? [-1 -2 3 -4])]", "[((1 3) (2 4) (5)) (1 2 1 3) (0 2 4 6) [(-1 -2) (3 -4)]]");
+    // Clojure's shapes at the edges: partition-by and dedupe of nothing
+    // are (), take-last of nothing nil; nthrest that drops nothing is
+    // coll itself, while drop is always a seq.
+    try expectOutput("[(partition-by odd? []) (partition-by odd? nil) (dedupe []) (dedupe nil) (take-last 0 [1 2]) (take-last 2 nil) (take-last 2 []) (take-last 5 [1 2])]", "[() () () () nil nil nil (1 2)]");
+    try expectOutput("[(nthrest [1 2] 0) (nthrest [1 2] -1) (nthrest nil 1) (nthrest [] 1) (nthrest [1] 2) (nthrest (list 1 2) 1) (drop 0 [1 2]) (drop 0 nil) (drop 5 [1]) (drop -1 [1]) (nthnext [1 2] 0)]", "[[1 2] [1 2] nil [] () (2) (1 2) () () (1) (1 2)]");
     try expectOutput("[(distinct? 1 2 3) (distinct? 1 2 1) (doall (map inc [1])) (dorun [1]) (rseq [1 2 3]) (rseq []) (nthnext [1 2 3] 2) (nthnext [1] 1)]", "[true false (2) nil (3 2 1) nil (3) nil]");
     try expectOutput("[(ffirst [[1 2]]) (fnext [1 2 3]) (nnext [1 2 3]) (second #{9}) (third (list 1 2 3))]", "[1 2 (3) nil 3]");
 }
@@ -3888,7 +3893,7 @@ test "core: sequence functions" {
         .{ .src = "(nth '(1 2 3) 2)", .expected = "3" },
         .{ .src = "(nth [1] 5 :d)", .expected = ":d" },
         .{ .src = "(nthrest [1 2 3] 2)", .expected = "(3)" },
-        .{ .src = "(nthrest [1 2 3] 0)", .expected = "(1 2 3)" },
+        .{ .src = "(nthrest [1 2 3] 0)", .expected = "[1 2 3]" },
         .{ .src = "(reverse [1 2 3])", .expected = "(3 2 1)" },
         .{ .src = "(flatten [1 [2 [3 nil]] '(4)])", .expected = "(1 2 3 nil 4)" },
         .{ .src = "(reductions + [1 2 3])", .expected = "(1 3 6)" },

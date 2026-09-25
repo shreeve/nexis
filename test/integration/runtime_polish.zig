@@ -60,7 +60,7 @@ test "a negative n counts as zero in every counting seq fn" {
         \\ (repeat -1 :x)
         \\ (repeatedly -1 (fn* [] :x))
         \\ (iterate inc 0 -1)]
-    , "[(1 2) [() (1 2)] () (1 2) () () ()]");
+    , "[[1 2] [() (1 2)] nil (1 2) () () ()]");
 }
 
 // ---- select-keys ----

@@ -31,8 +31,10 @@
   ; reduce + cons builds the list in reverse order naturally.
   (reduce (fn* [acc x] (cons x acc)) (list) s))
 
+; (drop n coll) → a seq of coll without its first n elements, () when
+; none are left.
 (defn drop [n s]
-  (nthrest s n))
+  (or (seq (nthrest s n)) (list)))
 
 ; (nthnext coll n) → the elements after the first n, nil when none.
 (defn nthnext [coll n]
@@ -580,11 +582,11 @@
         (if (or (empty? run) (= fx k))
           (recur (next s) acc (conj run x) fx)
           (recur (next s) (conj acc (seq run)) [x] fx)))
-      (seq (if (empty? run) acc (conj acc (seq run)))))))
+      (or (seq (if (empty? run) acc (conj acc (seq run)))) (list)))))
 
 ; (dedupe coll) → coll without consecutive duplicates.
 (defn dedupe [coll]
-  (seq (reduce (fn [acc x] (if (and (seq acc) (= x (peek acc))) acc (conj acc x))) [] coll)))
+  (or (seq (reduce (fn [acc x] (if (and (seq acc) (= x (peek acc))) acc (conj acc x))) [] coll)) (list)))
 
 ; (take-nth n coll) → every nth element, starting with the first.
 (defn take-nth [n coll]
