@@ -80,16 +80,23 @@ reading it from the meta page on `Connection.open`. `Connection`
 exposes `storeId() u128` as a read-only accessor so downstream
 code doesn't hardwire the derivation.
 
+`open` takes a `std.Io` and resolves the path after emdb has
+opened (and so created) the file, so `x.edb`, `./x.edb` and its
+absolute spelling name one store. `store_id` is two xxHash3-64
+halves over the canonical path, the second salted with
+`"store-id"`. A platform that cannot resolve a canonical path keeps
+the path as given.
+
 **Parent directories.** emdb's `open()` requires the path's parent
 directory to exist. The language-surface `(db/open path)`
 (`src/stdlib.zig fnDbOpen`) and `nextomic/connect` call
 `std.Io.Dir.cwd().createDirPath(io, dirname(path))` first, so
 `(db/open "data/v1/state.edb")` works from a fresh working
-directory. The branch runs only when the VM holds a `std.Io` handle
-(the CLI sets `v.io`); the Zig test harnesses run without one and
-open paths whose directories exist. A `createDirPath` failure is
-ignored: if the directory is still unusable, emdb's own open
-surfaces `:db/open-failed`.
+directory. `db/open` uses the VM's `std.Io`, or the process-wide
+single-threaded one when the host gave the VM none. A
+`createDirPath` failure is ignored: if the directory is still
+unusable, emdb's own open surfaces `:db/open-failed`. The path is a
+string; any other argument is `:kind-mismatch`.
 
 ---
 
@@ -112,6 +119,9 @@ pub const Connection = struct {
     // Named-tree handles resolved so far, keyed by owned copies
     // of the tree names. Freed in close().
     tree_ids: std.StringHashMapUnmanaged(emdb.TreeId),
+    open_flag: bool,
+    // Transactions begun and not yet committed or aborted.
+    open_txns: u32,
 };
 ```
 
@@ -134,8 +144,21 @@ positions its cursor with `setRange` for the start bound.
 **`Connection` is NOT a runtime heap-managed Value.** It's a plain
 Zig struct allocated on the caller's allocator. Multiple
 durable-refs may point to the same Connection; the Connection
-itself is not reference-counted. Caller owns the lifetime via
-explicit `close()`.
+itself is not reference-counted.
+
+**Closing.** `close()` closes the env and leaves the struct in place
+with `open_flag` false, so a ref, transaction handle or connection
+Value that still names it reads the flag and reports the connection
+closed; a second `close()` does nothing. `close()` of a connection
+with a transaction still open returns `error.TransactionsOpen`: no
+emdb transaction outlives its env. `shutdown()` closes whatever is
+open, for teardown. The stdlib frees a `Connection` only at
+`VM.deinit`, so no address a Value holds is ever reused by a later
+`db/open` while the VM lives.
+
+**A failed commit aborts.** emdb leaves a transaction whose commit
+failed open, holding the write lock; `commit()` aborts it before
+returning the error, so the transaction is over either way.
 
 **Metadata attachability**: not applicable. Connections are not
 Values.
@@ -210,12 +233,12 @@ pub const DbError = error{
     ConnectionUnavailable,
     /// Ref's store_id doesn't match the Connection passed in.
     StoreMismatch,
-    /// Tree name is empty.
+    /// Tree name is empty or under `nx/` (§6).
     InvalidTreeName,
     /// Key is empty.
     InvalidKey,
-    /// Transaction kind mismatch (write op in read txn, etc.).
-    TransactionKindMismatch,
+    /// `close` while a transaction of the connection is open.
+    TransactionsOpen,
     // plus propagated: emdb.Error, Allocator.Error, CodecError,
     // InternError, etc.
 };
@@ -224,13 +247,15 @@ pub const Connection = struct { ... };
 
 pub fn open(
     allocator: std.mem.Allocator,
+    io: std.Io,
     heap: *Heap,
     interner: *Interner,
     path: [*:0]const u8,
     options: emdb.EnvOptions,
 ) !Connection;
 
-pub fn close(self: *Connection) void;
+pub fn close(self: *Connection) DbError!void;
+pub fn shutdown(self: *Connection) void;
 pub fn storeId(self: *const Connection) u128;
 
 // ---- Transaction wrappers ----
@@ -340,25 +365,18 @@ trees never form. `test/prop/db.zig` uses the authoritative
 dispatch callbacks and stresses full CHAMP depth through randomized
 generation.
 
-### 6. Named-tree discovery
+### 6. Named trees
 
-emdb exposes `txn.openTree(name, create)` returning a
-transaction-scoped `TreeId`. `db.zig` calls `openTree` **per operation**,
-accepting the small lookup cost in exchange for a simpler
-implementation:
+`treeId` (§3) resolves a name to emdb's `TreeId` once per connection
+and loads the tree once per transaction.
 
-```zig
-// In put/get/del:
-const tree_id = try txn.inner.openTree(tree_name, /* create */ true);
-try txn.inner.putInTree(tree_id, key_bytes, encoded_value_bytes);
-```
-
-`TreeId`s are cached per connection (`Connection.tree_ids`,
-keyed by tree name); a tree id is fixed for the life of the file, so
-no invalidation is needed.
-
-Empty tree names (length 0) and empty keys return
-`error.InvalidTreeName` / `error.InvalidKey`.
+Empty tree names and empty keys return `error.InvalidTreeName` /
+`error.InvalidKey`. So does a tree name beginning `nx/`: Nextomic
+keeps its indexes and transaction log in `nx/*` trees
+(`docs/NEXTOMIC.md` §3), and a `db/*` write there would bypass every
+Nextomic invariant. `validateTreeName` is public so `db/scan` and
+`db/reduce-tree` refuse the same names; at the language level all of
+these are `:db/invalid-key`.
 
 ---
 
@@ -417,8 +435,9 @@ Pinned explicitly:
 |---|---|
 | `putRef` / `getRef` / `delRef` on ref with `conn == null` | `error.ConnectionUnavailable` |
 | `putRef` / `getRef` / `delRef` on ref with `conn.storeId() != r.store_id` | `error.StoreMismatch` |
-| Write op in a read transaction | `error.TransactionKindMismatch` |
-| Closed connection (double-close) | undefined; caller bug |
+| `beginWrite` / `beginRead` on a closed connection | `error.ConnectionUnavailable` |
+| `close` while a transaction is open | `error.TransactionsOpen` |
+| A second `close` | nothing |
 | Codec encode / decode error during put / get | propagated `CodecError` |
 | emdb-level errors (`KeyTooLarge`, `DatabaseFull`, `TxnAborted`, etc.) | propagated `emdb.Error` |
 
@@ -432,11 +451,13 @@ get distinct names — `:db/key-too-large`, `:db/value-too-large`,
 `:db/max-trees`, `:db/not-found`, `:db/corrupted`, `:db/map-full`,
 `:db/mmap-failed`, `:db/open-failed`, `:db/page-size-mismatch`,
 `:db/busy`, `:db/txn-aborted`, `:db/read-only`, `:db/sync-failed` —
-as do the db.zig errors `:db/store-mismatch`, `:db/no-connection`
-and `:db/invalid-key`; anything else is `:db-error`, and codec
-errors are `:codec-failed`. Outside any `try` the raw `VmError`
-(`DbError` / `CodecFailed`) propagates, the rule the VM applies to
-every recoverable error.
+as do the db.zig errors `:db/store-mismatch`, `:db/no-connection`,
+`:db/invalid-key` and `:db/busy` (`TransactionsOpen`); anything else
+is `:db-error`. A value of a kind with no serialized form (a
+function, atom, record, transient, ...) is `:unserializable`; stored
+bytes that do not decode are `:codec-failed`. A ref or transaction
+of a closed connection is `:db-closed`. Outside any `try` the throw
+is uncaught, the rule the VM applies to every recoverable error.
 
 **Re-hydrating a ref** (constructing from bytes without an
 available Connection): `refFromBytes(heap, store_id, tree_name,
